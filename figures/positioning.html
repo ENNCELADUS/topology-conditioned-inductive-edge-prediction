@@ -1,0 +1,319 @@
+<title>Positioning - Topology-Conditioned Inductive Edge Prediction</title>
+<style>
+  :root {
+    --ground: #f5f7f9;
+    --surface: #ffffff;
+    --surface-2: #eef1f4;
+    --ink: #141a22;
+    --ink-soft: #46515f;
+    --ink-faint: #6b7686;
+    --hair: #dde3ea;
+    --hair-strong: #c6cfda;
+    --accent: #0e7c6b;
+    --accent-ink: #0a5a4e;
+    --accent-fill: #e4f3f0;
+    --accent-hair: #7fc9bc;
+    --warn: #a9741c;
+    --warn-fill: #f8f1e2;
+    --warn-hair: #e0c48b;
+    --shadow: 0 1px 2px rgba(20,26,34,.06), 0 8px 24px rgba(20,26,34,.06);
+    --shadow-accent: 0 2px 4px rgba(14,124,107,.14), 0 12px 32px rgba(14,124,107,.16);
+    --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0d1117;
+      --surface: #161c24;
+      --surface-2: #1d242e;
+      --ink: #e9edf3;
+      --ink-soft: #aeb8c6;
+      --ink-faint: #7f8b9c;
+      --hair: #2a323d;
+      --hair-strong: #3a4552;
+      --accent: #2fd6bf;
+      --accent-ink: #63e4d3;
+      --accent-fill: #13322e;
+      --accent-hair: #2c6f65;
+      --warn: #e0ab55;
+      --warn-fill: #2c2413;
+      --warn-hair: #6a5423;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 10px 28px rgba(0,0,0,.4);
+      --shadow-accent: 0 2px 6px rgba(0,0,0,.45), 0 14px 34px rgba(20,90,80,.35);
+    }
+  }
+  :root[data-theme="light"] {
+    --ground: #f5f7f9; --surface: #ffffff; --surface-2: #eef1f4;
+    --ink: #141a22; --ink-soft: #46515f; --ink-faint: #6b7686;
+    --hair: #dde3ea; --hair-strong: #c6cfda;
+    --accent: #0e7c6b; --accent-ink: #0a5a4e; --accent-fill: #e4f3f0; --accent-hair: #7fc9bc;
+    --warn: #a9741c; --warn-fill: #f8f1e2; --warn-hair: #e0c48b;
+    --shadow: 0 1px 2px rgba(20,26,34,.06), 0 8px 24px rgba(20,26,34,.06);
+    --shadow-accent: 0 2px 4px rgba(14,124,107,.14), 0 12px 32px rgba(14,124,107,.16);
+  }
+  :root[data-theme="dark"] {
+    --ground: #0d1117; --surface: #161c24; --surface-2: #1d242e;
+    --ink: #e9edf3; --ink-soft: #aeb8c6; --ink-faint: #7f8b9c;
+    --hair: #2a323d; --hair-strong: #3a4552;
+    --accent: #2fd6bf; --accent-ink: #63e4d3; --accent-fill: #13322e; --accent-hair: #2c6f65;
+    --warn: #e0ab55; --warn-fill: #2c2413; --warn-hair: #6a5423;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 10px 28px rgba(0,0,0,.4);
+    --shadow-accent: 0 2px 6px rgba(0,0,0,.45), 0 14px 34px rgba(20,90,80,.35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font-family: var(--font); line-height: 1.5;
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+  }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: clamp(1.5rem, 4vw, 3.5rem) clamp(1rem, 4vw, 2rem); }
+
+  .eyebrow {
+    font-family: var(--mono); font-size: .72rem; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--accent-ink); margin: 0 0 .7rem;
+  }
+  h1 {
+    font-size: clamp(1.5rem, 3.4vw, 2.25rem); line-height: 1.12; letter-spacing: -.018em;
+    margin: 0 0 .6rem; text-wrap: balance; font-weight: 680;
+  }
+  .lede {
+    margin: 0; max-width: 64ch; color: var(--ink-soft); font-size: 1.02rem;
+  }
+  .lede strong { color: var(--ink); font-weight: 620; }
+
+  section { margin-top: clamp(1.8rem, 4vw, 2.8rem); }
+  .sec-label {
+    font-family: var(--mono); font-size: .72rem; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--ink-faint); margin: 0 0 .9rem; display: flex; align-items: center; gap: .7rem;
+  }
+  .sec-label::after { content: ""; flex: 1; height: 1px; background: var(--hair); }
+
+  /* ---- 2x2 plane ---- */
+  .plane-scroll { overflow-x: auto; padding-bottom: .25rem; }
+  .plane {
+    min-width: 720px;
+    display: grid;
+    grid-template-columns: 3.1rem minmax(0,1fr) minmax(0,1fr);
+    grid-template-rows: auto minmax(0,1fr) minmax(0,1fr);
+    gap: .7rem;
+  }
+  .corner { grid-column: 1; grid-row: 1; }
+  .colhead {
+    grid-row: 1; display: flex; flex-direction: column; gap: .15rem;
+    padding: 0 .4rem .1rem; align-items: center; text-align: center;
+  }
+  .colhead .k { font-family: var(--mono); font-size: .68rem; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-faint); }
+  .colhead .v { font-weight: 640; font-size: .96rem; color: var(--ink); }
+  .colhead.is-accent .v { color: var(--accent-ink); }
+
+  .rowaxis {
+    grid-column: 1; display: flex; align-items: center; justify-content: center;
+  }
+  .rowaxis span {
+    writing-mode: vertical-rl; transform: rotate(180deg);
+    font-family: var(--mono); font-size: .68rem; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--ink-faint); white-space: nowrap;
+  }
+
+  .cell {
+    background: var(--surface); border: 1px solid var(--hair);
+    border-radius: 14px; padding: 1rem 1.05rem 1.1rem; box-shadow: var(--shadow);
+    display: flex; flex-direction: column; gap: .6rem; min-height: 172px;
+  }
+  .cell .pill {
+    align-self: flex-start; font-family: var(--mono); font-size: .66rem; letter-spacing: .06em;
+    text-transform: uppercase; padding: .2rem .5rem; border-radius: 999px;
+    border: 1px solid var(--hair-strong); color: var(--ink-faint); background: var(--surface-2);
+  }
+  .cell h3 { margin: 0; font-size: 1.04rem; font-weight: 660; letter-spacing: -.01em; line-height: 1.2; }
+  .cell p { margin: 0; font-size: .855rem; color: var(--ink-soft); }
+  .chips { display: flex; flex-wrap: wrap; gap: .32rem; margin-top: auto; }
+  .chip {
+    font-family: var(--mono); font-size: .7rem; padding: .16rem .44rem; border-radius: 6px;
+    background: var(--surface-2); color: var(--ink-soft); border: 1px solid var(--hair);
+  }
+
+  .cell.is-warn { background: var(--warn-fill); border-color: var(--warn-hair); }
+  .cell.is-warn .pill { color: var(--warn); border-color: var(--warn-hair); background: transparent; }
+
+  .cell.is-ours {
+    background: var(--accent-fill); border: 1.5px solid var(--accent);
+    box-shadow: var(--shadow-accent); position: relative;
+  }
+  .cell.is-ours h3 { color: var(--accent-ink); }
+  .cell.is-ours .pill { color: #fff; background: var(--accent); border-color: var(--accent); }
+  .cell.is-ours .chip { background: color-mix(in srgb, var(--accent) 12%, transparent); border-color: var(--accent-hair); color: var(--accent-ink); }
+  .cell.is-ours p { color: var(--ink-soft); }
+  .ours-tag {
+    position: absolute; top: -.72rem; right: .9rem;
+    font-family: var(--mono); font-size: .66rem; letter-spacing: .05em;
+    background: var(--accent); color: #fff; padding: .18rem .55rem; border-radius: 999px;
+    box-shadow: var(--shadow-accent);
+  }
+
+  /* ---- comparison table ---- */
+  .table-scroll { overflow-x: auto; border: 1px solid var(--hair); border-radius: 14px; box-shadow: var(--shadow); }
+  table { border-collapse: collapse; width: 100%; min-width: 720px; background: var(--surface); font-size: .855rem; }
+  caption { caption-side: bottom; text-align: left; color: var(--ink-faint); font-size: .78rem; padding: .7rem .9rem; }
+  th, td { text-align: left; padding: .62rem .8rem; border-bottom: 1px solid var(--hair); }
+  thead th {
+    font-family: var(--mono); font-size: .68rem; letter-spacing: .04em; text-transform: uppercase;
+    color: var(--ink-faint); font-weight: 500; background: var(--surface-2); vertical-align: bottom;
+  }
+  tbody th { font-weight: 600; color: var(--ink); white-space: nowrap; }
+  td.mark { text-align: center; font-variant-numeric: tabular-nums; font-family: var(--mono); }
+  .yes { color: var(--accent-ink); font-weight: 640; }
+  .no { color: var(--ink-faint); }
+  tr.ours-row th, tr.ours-row td { background: var(--accent-fill); }
+  tr.ours-row th { color: var(--accent-ink); }
+  tbody tr:last-child th, tbody tr:last-child td { border-bottom: none; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 1.1rem 1.6rem; margin-top: 1rem; font-size: .8rem; color: var(--ink-soft); }
+  .legend .item { display: flex; align-items: center; gap: .5rem; }
+  .swatch { width: 1rem; height: 1rem; border-radius: 4px; border: 1px solid var(--hair-strong); flex: none; }
+  .swatch.ours { background: var(--accent-fill); border-color: var(--accent); }
+  .swatch.warn { background: var(--warn-fill); border-color: var(--warn-hair); }
+  .swatch.plain { background: var(--surface); }
+
+  footer { margin-top: 2.4rem; padding-top: 1.1rem; border-top: 1px solid var(--hair); color: var(--ink-faint); font-size: .78rem; }
+  footer code { font-family: var(--mono); color: var(--ink-soft); }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">ICLR 2027 - Positioning</p>
+  <h1>Topology-Conditioned Inductive Edge Prediction</h1>
+  <p class="lede">
+    Edge prediction over <strong>unseen nodes</strong> splits along two axes: whether the model
+    needs the <strong>observed graph at inference</strong>, and whether the per-pair decision uses
+    <strong>topological structure</strong>. Existing work fills three corners. The fourth - inductive
+    <em>and</em> structure-aware - is ours: for each queried pair we build a <strong>per-query local
+    scaffold</strong> from frozen features, condition the 0/1 decision on it, and grade the assembled
+    graph with realism metrics.
+  </p>
+
+  <section>
+    <p class="sec-label">The 2x2 map</p>
+    <div class="plane-scroll">
+      <div class="plane">
+        <div class="corner"></div>
+        <div class="colhead" style="grid-column:2;">
+          <span class="k">Per-pair decision</span><span class="v">Structure-blind</span>
+        </div>
+        <div class="colhead is-accent" style="grid-column:3;">
+          <span class="k">Per-pair decision</span><span class="v">Structure-aware</span>
+        </div>
+
+        <!-- Row 1: inductive -->
+        <div class="rowaxis" style="grid-row:2;"><span>Inductive - features only - no target graph</span></div>
+
+        <div class="cell" style="grid-column:2; grid-row:2;">
+          <span class="pill">topology-blind</span>
+          <h3>Independent pairwise scoring</h3>
+          <p>Score each pair from features alone. Clean and inductive, but predictions assemble into
+             implausible networks: graph-similarity &lt; 0.5, relative_density &gt; 1, and high graph distances.</p>
+          <div class="chips">
+            <span class="chip">feature scorer</span><span class="chip">pair encoder</span><span class="chip">independent logits</span>
+          </div>
+        </div>
+
+        <div class="cell is-ours" style="grid-column:3; grid-row:2;">
+          <span class="ours-tag">this paper</span>
+          <span class="pill">our cell</span>
+          <h3>Topology-conditioned inductive edge prediction</h3>
+          <p>Retrieve candidates from frozen features, build a <strong>per-query local scaffold</strong>,
+             condition the 0/1 classifier on it. No target graph at inference; graded on edge quality
+             <em>and</em> assembled-graph realism.</p>
+          <div class="chips">
+            <span class="chip">frozen features</span><span class="chip">retrieve -> scaffold -> classify</span>
+          </div>
+        </div>
+
+        <!-- Row 2: needs graph -->
+        <div class="rowaxis" style="grid-row:3;"><span>Uses the graph at inference</span></div>
+
+        <div class="cell is-warn" style="grid-column:2; grid-row:3;">
+          <span class="pill">not strict inductive</span>
+          <h3>Feature + observed-graph hybrids</h3>
+          <p>Compute node embeddings by aggregating an observed neighborhood, then score pairs.
+             Inductive to new nodes only if that neighborhood is available at test time.</p>
+          <div class="chips">
+            <span class="chip">message passing</span><span class="chip">observed neighborhoods</span><span class="chip">node embeddings</span>
+          </div>
+        </div>
+
+        <div class="cell is-warn" style="grid-column:3; grid-row:3;">
+          <span class="pill">uses graph</span>
+          <h3>Transductive graph-native link prediction</h3>
+          <p>Strong topology signal, but the enclosing subgraph is read from the observed target graph,
+             so the strict inductive protocol is violated. Serves as an upper-bound reference.</p>
+          <div class="chips">
+            <span class="chip">subgraph LP</span><span class="chip">common-neighbor LP</span><span class="chip">graph-native LP</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="legend">
+      <div class="item"><span class="swatch ours"></span> Our cell - inductive &amp; structure-aware</div>
+      <div class="item"><span class="swatch plain"></span> Inductive but topology-blind (incumbent)</div>
+      <div class="item"><span class="swatch warn"></span> Uses the observed graph - not strict inductive</div>
+    </div>
+  </section>
+
+  <section>
+    <p class="sec-label">Why the cell is empty - five distinguishing properties</p>
+    <div class="table-scroll">
+      <table>
+        <caption>
+          Every prior family drops at least one property. Only topology-conditioned inductive edge
+          prediction holds all five: inductive, no target graph at inference, topology-conditioned,
+          a binary edge label as output, and assembled-graph realism evaluated.
+        </caption>
+        <thead>
+          <tr>
+            <th scope="col">Method family</th>
+            <th scope="col">Inductive<br>(unseen nodes)</th>
+            <th scope="col">No target graph<br>at inference</th>
+            <th scope="col">Topology-<br>conditioned</th>
+            <th scope="col">Output =<br>edge label</th>
+            <th scope="col">Graph metrics<br>evaluated</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th scope="row">Independent pairwise scorers <span style="font-weight:400;color:var(--ink-faint)">(feature-only)</span></th>
+            <td class="mark yes">yes</td><td class="mark yes">yes</td><td class="mark no">no</td><td class="mark yes">yes</td><td class="mark no">no</td>
+          </tr>
+          <tr>
+            <th scope="row">Transductive graph LP <span style="font-weight:400;color:var(--ink-faint)">(observed graph)</span></th>
+            <td class="mark no">no</td><td class="mark no">no</td><td class="mark yes">yes</td><td class="mark yes">yes</td><td class="mark no">no</td>
+          </tr>
+          <tr>
+            <th scope="row">Latent-graph / GSL <span style="font-weight:400;color:var(--ink-faint)">(learned adjacency)</span></th>
+            <td class="mark yes">yes</td><td class="mark yes">yes</td><td class="mark yes">yes</td><td class="mark no">no</td><td class="mark no">no</td>
+          </tr>
+          <tr>
+            <th scope="row">Graph-generation eval <span style="font-weight:400;color:var(--ink-faint)">(sample-level)</span></th>
+            <td class="mark yes">yes</td><td class="mark yes">yes</td><td class="mark no">no</td><td class="mark yes">yes</td><td class="mark yes">yes</td>
+          </tr>
+          <tr>
+            <th scope="row">Post-hoc / global refine <span style="font-weight:400;color:var(--ink-faint)">(global pass)</span></th>
+            <td class="mark yes">yes</td><td class="mark yes">yes</td><td class="mark yes">yes</td><td class="mark yes">yes</td><td class="mark no">no</td>
+          </tr>
+          <tr class="ours-row">
+            <th scope="row">Ours - per-query local scaffold</th>
+            <td class="mark yes">yes</td><td class="mark yes">yes</td><td class="mark yes">yes</td><td class="mark yes">yes</td><td class="mark yes">yes</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    Node features are frozen before inference; the assembled graph is graded with topology metrics
+    (<code>graph_sim</code>, <code>relative_density</code>, degree / clustering / spectral MMD).
+    "Structure-aware" = the per-pair decision is conditioned on local topology; "no target graph at
+    inference" = the strict inductive protocol.
+  </footer>
+</div>

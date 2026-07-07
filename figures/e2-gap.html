@@ -1,0 +1,201 @@
+<title>Edge Scores vs Graph Realism</title>
+<style>
+  :root {
+    --ground:#f5f7f9; --surface:#fff; --surface-2:#eef1f4;
+    --ink:#141a22; --ink-soft:#46515f; --ink-faint:#6b7686;
+    --hair:#dde3ea; --hair-strong:#c6cfda;
+    --good:#0e7c6b; --good-ink:#0a5a4e; --good-fill:#e4f3f0;
+    --bad:#c2571f; --bad-ink:#9c4417; --bad-fill:#f9ece3;
+    --grid:#e6ebf1;
+    --shadow:0 1px 2px rgba(20,26,34,.06), 0 8px 24px rgba(20,26,34,.06);
+    --font:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --ground:#0d1117; --surface:#161c24; --surface-2:#1d242e;
+      --ink:#e9edf3; --ink-soft:#aeb8c6; --ink-faint:#7f8b9c;
+      --hair:#2a323d; --hair-strong:#3a4552;
+      --good:#2fd6bf; --good-ink:#63e4d3; --good-fill:#13322e;
+      --bad:#e78a4e; --bad-ink:#f0a878; --bad-fill:#2c1d12;
+      --grid:#242c36;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 28px rgba(0,0,0,.4);
+    }
+  }
+  :root[data-theme="light"]{
+    --ground:#f5f7f9; --surface:#fff; --surface-2:#eef1f4;
+    --ink:#141a22; --ink-soft:#46515f; --ink-faint:#6b7686;
+    --hair:#dde3ea; --hair-strong:#c6cfda;
+    --good:#0e7c6b; --good-ink:#0a5a4e; --good-fill:#e4f3f0;
+    --bad:#c2571f; --bad-ink:#9c4417; --bad-fill:#f9ece3; --grid:#e6ebf1;
+    --shadow:0 1px 2px rgba(20,26,34,.06), 0 8px 24px rgba(20,26,34,.06);
+  }
+  :root[data-theme="dark"]{
+    --ground:#0d1117; --surface:#161c24; --surface-2:#1d242e;
+    --ink:#e9edf3; --ink-soft:#aeb8c6; --ink-faint:#7f8b9c;
+    --hair:#2a323d; --hair-strong:#3a4552;
+    --good:#2fd6bf; --good-ink:#63e4d3; --good-fill:#13322e;
+    --bad:#e78a4e; --bad-ink:#f0a878; --bad-fill:#2c1d12; --grid:#242c36;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 28px rgba(0,0,0,.4);
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--font);line-height:1.5;-webkit-font-smoothing:antialiased;}
+  .wrap{max-width:1000px;margin:0 auto;padding:clamp(1.5rem,4vw,3.25rem) clamp(1rem,4vw,2rem);}
+  .eyebrow{font-family:var(--mono);font-size:.72rem;letter-spacing:.16em;text-transform:uppercase;color:var(--bad-ink);margin:0 0 .6rem;}
+  h1{font-size:clamp(1.5rem,3.4vw,2.2rem);line-height:1.12;letter-spacing:-.018em;margin:0 0 .6rem;text-wrap:balance;font-weight:680;}
+  .lede{margin:0;max-width:66ch;color:var(--ink-soft);font-size:1.02rem;}
+  .lede b{color:var(--ink);font-weight:640;}
+  .lede .g{color:var(--good-ink);font-weight:660;}
+  .lede .r{color:var(--bad-ink);font-weight:660;}
+
+  .panels{display:grid;grid-template-columns:1fr;gap:1rem;margin-top:2rem;}
+  @media(min-width:760px){ .panels{grid-template-columns:1fr 1fr;} .panel.wide{grid-column:1 / -1;} }
+  .panel{background:var(--surface);border:1px solid var(--hair);border-radius:14px;padding:1.15rem 1.25rem 1.3rem;box-shadow:var(--shadow);}
+  .panel h2{margin:0 0 .2rem;font-size:.78rem;font-family:var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-faint);font-weight:500;}
+  .panel .cap{margin:.1rem 0 1.1rem;font-size:.92rem;color:var(--ink-soft);}
+  .panel .cap b{color:var(--ink);font-weight:620;}
+
+  /* bar rows */
+  .bars{display:flex;flex-direction:column;gap:.75rem;}
+  .bar-row{display:grid;grid-template-columns:6.5rem 1fr auto;align-items:center;gap:.7rem;}
+  .bar-row .lab{font-size:.86rem;color:var(--ink-soft);text-align:right;}
+  .track{position:relative;height:1.5rem;background:var(--surface-2);border-radius:6px;overflow:hidden;}
+  .fill{position:absolute;top:0;left:0;height:100%;border-radius:6px;}
+  .fill.good{background:var(--good);}
+  .fill.bad{background:var(--bad);}
+  .val{font-family:var(--mono);font-size:.82rem;font-variant-numeric:tabular-nums;color:var(--ink);min-width:3.2rem;text-align:right;}
+  .refline{position:absolute;top:-.35rem;bottom:-.35rem;width:2px;background:var(--ink-faint);opacity:.7;z-index:2;}
+  .reflabel{font-family:var(--mono);font-size:.66rem;color:var(--ink-faint);}
+  .axisnote{display:flex;justify-content:space-between;margin-top:.7rem;font-family:var(--mono);font-size:.66rem;color:var(--ink-faint);}
+
+  /* svg trend */
+  .chart{width:100%;height:auto;display:block;}
+  .chart .grid{stroke:var(--grid);stroke-width:1;}
+  .chart .ref{stroke:var(--ink-faint);stroke-width:1.5;stroke-dasharray:4 3;opacity:.8;}
+  .chart .series{fill:none;stroke:var(--bad);stroke-width:2.5;stroke-linejoin:round;stroke-linecap:round;}
+  .chart .dot{fill:var(--bad);}
+  .chart .dot.end{fill:var(--bad);stroke:var(--surface);stroke-width:2;}
+  .chart text{fill:var(--ink-faint);font-family:var(--mono);font-size:9px;}
+  .chart .axtitle{fill:var(--ink-soft);font-size:9.5px;}
+
+  .keyrow{display:flex;flex-wrap:wrap;gap:1rem 1.4rem;margin-top:1rem;font-size:.8rem;color:var(--ink-soft);}
+  .keyrow .k{display:flex;align-items:center;gap:.45rem;}
+  .sw{width:.95rem;height:.95rem;border-radius:3px;flex:none;}
+  .sw.good{background:var(--good);} .sw.bad{background:var(--bad);}
+
+  footer{margin-top:2.2rem;padding-top:1rem;border-top:1px solid var(--hair);color:var(--ink-faint);font-size:.77rem;line-height:1.55;}
+  footer code{font-family:var(--mono);color:var(--ink-soft);}
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">Topology-conditioned inductive edge prediction</p>
+  <h1>The pair-to-topology gap</h1>
+  <p class="lede">
+    A frozen <b>independent pairwise</b> edge scorer over unseen nodes reaches
+    <span class="g">AUROC 0.676 / AUPRC 0.691</span>, yet its binary edge predictions assemble into a
+    graph with <span class="r">graph-similarity 0.235</span>, far below the 0.5 plausibility
+    line, and degree / clustering / spectral distances far above ideal.
+    <b>Good edge scores do not imply a plausible network.</b>
+  </p>
+
+  <div class="panels">
+    <!-- Panel A: the contrast -->
+    <div class="panel">
+      <h2>A - Edge quality vs assembled topology</h2>
+      <p class="cap">Edge metrics clear a usable bar; graph-similarity sits <b>below the 0.5
+        plausibility line</b>. Same model, same predictions.</p>
+      <div class="bars">
+        <div class="bar-row">
+          <span class="lab">AUROC</span>
+          <div class="track"><div class="fill good" style="width:67.6%"></div><div class="refline" style="left:50%"></div></div>
+          <span class="val">0.676</span>
+        </div>
+        <div class="bar-row">
+          <span class="lab">AUPRC</span>
+          <div class="track"><div class="fill good" style="width:69.1%"></div><div class="refline" style="left:50%"></div></div>
+          <span class="val">0.691</span>
+        </div>
+        <div class="bar-row">
+          <span class="lab">graph-sim</span>
+          <div class="track"><div class="fill bad" style="width:23.5%"></div><div class="refline" style="left:50%"></div></div>
+          <span class="val">0.235</span>
+        </div>
+      </div>
+      <div class="axisnote"><span>0.0</span><span class="reflabel">0.5 plausibility line</span><span>1.0</span></div>
+      <div class="keyrow">
+        <span class="k"><span class="sw good"></span> edge-level (higher is better)</span>
+        <span class="k"><span class="sw bad"></span> graph-level (higher is better)</span>
+      </div>
+    </div>
+
+    <!-- Panel B: MMDs -->
+    <div class="panel">
+      <h2>B - Assembled-graph distances (ideal approx 0)</h2>
+      <p class="cap">Degree, clustering, and spectral <b>MMD</b> between the assembled and true
+        reference graph - all far from zero. Lower is better.</p>
+      <div class="bars">
+        <div class="bar-row">
+          <span class="lab">degree</span>
+          <div class="track"><div class="fill bad" style="width:68.7%"></div></div>
+          <span class="val">17.17</span>
+        </div>
+        <div class="bar-row">
+          <span class="lab">clustering</span>
+          <div class="track"><div class="fill bad" style="width:47.2%"></div></div>
+          <span class="val">11.81</span>
+        </div>
+        <div class="bar-row">
+          <span class="lab">spectral</span>
+          <div class="track"><div class="fill bad" style="width:88.5%"></div></div>
+          <span class="val">22.12</span>
+        </div>
+      </div>
+      <div class="axisnote"><span>ideal approx 0</span><span>normalized MMD -></span><span>25</span></div>
+    </div>
+
+    <!-- Panel C: trend -->
+    <div class="panel wide">
+      <h2>C - The gap widens as the assembled subgraph grows</h2>
+      <p class="cap">Per-bucket graph-similarity for the same frozen scorer: similarity falls
+        monotonically from <b>0.32 at 20 nodes to 0.18 at 200</b> - the assembled graph degrades exactly
+        where larger neighborhoods matter most. The dashed line marks the 0.5 plausibility level the
+        assembly never reaches.</p>
+      <svg class="chart" viewBox="0 0 400 205" role="img" aria-label="graph similarity versus node-bucket size, declining from 0.32 to 0.18">
+        <!-- gridlines y = 0, 0.25, 0.5 -->
+        <line class="grid" x1="40" y1="170" x2="390" y2="170"></line>
+        <line class="grid" x1="40" y1="95"  x2="390" y2="95"></line>
+        <line class="ref"  x1="40" y1="20"  x2="390" y2="20"></line>
+        <text x="34" y="173" text-anchor="end">0.0</text>
+        <text x="34" y="98"  text-anchor="end">0.25</text>
+        <text x="34" y="23"  text-anchor="end">0.5</text>
+        <text x="384" y="16" text-anchor="end">plausible >= 0.5</text>
+        <!-- series -->
+        <polyline class="series" points="40,74 77.8,92 115.6,94.4 153.3,93.5 191.1,100.4 228.9,107.6 266.7,106.7 304.4,106.1 342.2,104 380,116.3"></polyline>
+        <circle class="dot" cx="40" cy="74" r="3"></circle>
+        <circle class="dot" cx="77.8" cy="92" r="3"></circle>
+        <circle class="dot" cx="115.6" cy="94.4" r="3"></circle>
+        <circle class="dot" cx="153.3" cy="93.5" r="3"></circle>
+        <circle class="dot" cx="191.1" cy="100.4" r="3"></circle>
+        <circle class="dot" cx="228.9" cy="107.6" r="3"></circle>
+        <circle class="dot" cx="266.7" cy="106.7" r="3"></circle>
+        <circle class="dot" cx="304.4" cy="106.1" r="3"></circle>
+        <circle class="dot" cx="342.2" cy="104" r="3"></circle>
+        <circle class="dot end" cx="380" cy="116.3" r="4"></circle>
+        <!-- x ticks -->
+        <text x="40"  y="187" text-anchor="middle">20</text>
+        <text x="153.3" y="187" text-anchor="middle">80</text>
+        <text x="266.7" y="187" text-anchor="middle">140</text>
+        <text x="380" y="187" text-anchor="middle">200</text>
+        <text x="215" y="201" text-anchor="middle" class="axtitle">assembled subgraph size (nodes)</text>
+      </svg>
+    </div>
+  </div>
+
+  <footer>
+    Protocol: topology-conditioned inductive edge prediction over unseen nodes with frozen node
+    features. Binary edge predictions are assembled into graphs and evaluated with edge metrics plus
+    graph realism metrics. Threshold 0.5; graph-similarity &lt; 0.5 and high MMDs hold across
+    normalizations, so the gap is stated as low similarity plus high distances rather than a single
+    density direction.
+  </footer>
+</div>
