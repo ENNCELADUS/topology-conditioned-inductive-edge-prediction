@@ -335,7 +335,7 @@ global = × world size; defaults sweep ±2×):
 
 | Stream | Source | Per-rank default | Feeds |
 |---|---|---|---|
-| node stream | uniform over V_train (DistributedSampler, seed = f(s, epoch)) | B_n = 256 nodes | L_recon, L_ssl |
+| node stream | uniform over V_train (loader sharded by `accelerator.prepare`, §11.0) | B_n = 256 nodes | L_recon, L_ssl |
 | joint-pair stream | 50% E_msg edges / 50% random train pairs (§4) | B_p = 128 pairs | L_joint |
 | edge stream | E_sup positives + resampled negatives | B_e = 512 pairs (1:5 → ~85 pos) | L_edge |
 
@@ -345,7 +345,8 @@ streams cycle independently.
 
 ### 10.2 Negative sampling (training)
 
-Resampled every epoch, seeded by (seed, epoch, rank, idx): 50% uniform train-side
+Resampled every epoch, seeded by (seed, epoch, `accelerator.process_index`, idx):
+50% uniform train-side
 pairs, 50% degree-corrected (endpoint corruption of a positive with replacement
 probability ∝ deg_G_struct(v)); self-pair negatives sampled at their universe rate;
 rejection against the **global** positive set (matching the shipped negatives'
@@ -358,10 +359,12 @@ resampling cannot contaminate model selection.
 
 - **Val (every eval epoch):** `val_edges.txt` as-is; VAL-CRITERION per §8.
 - **Test edge metrics:** `test_edges.txt` as-is; run once, after freeze.
-- **Assembled-graph eval:** `candidate_test_edges.txt` sharded contiguously across
-  ranks; batch 8,192 pairs; n_s = 4 fixed CVAE seeds averaged; two passes (§9.3
-  density self-calibration); logits all-gathered to rank 0 for assembly and bucketed
-  metrics (`test_node_buckets.pkl`).
+- **Assembled-graph eval:** `candidate_test_edges.txt` served by a prepared
+  DataLoader (sharded across processes, §11.0); batch 8,192 pairs; n_s = 4 fixed CVAE
+  seeds averaged; two passes (§9.3 density self-calibration); logits + pair ids
+  collected via `accelerator.gather_for_metrics` (drops `even_batches` padding
+  duplicates); assembly and bucketed metrics (`test_node_buckets.pkl`) computed on
+  the main process.
 - Per-node Tokenize/Imagine caches rebuilt once per eval epoch for all |V| nodes
   (~10k nodes; ≈160 MB fp32 at K = 16, d_p = 256 — kept on-GPU per rank).
 
@@ -375,54 +378,103 @@ resampling cannot contaminate model selection.
   (`scipy.linear_sum_assignment` on CPU from GPU-computed costs); no cross-rank
   interaction.
 
-## 11. DDP execution design (4/8 × H20)
+## 11. DDP execution design (4/8 × H20, via HF Accelerate)
 
 Envelope: H20 = 96 GB HBM3, high memory bandwidth, modest BF16 compute. The model is
 ~10–20 M parameters and the full feature matrix is 62 MB: runs are **overhead-bound,
-not memory-bound**. Plain DDP — no FSDP/ZeRO/model sharding. BF16 autocast with fp32
-master weights; **VQ codebook EMA and Sinkhorn always fp32**; TF32 matmul on.
+not memory-bound**. Plain data parallelism — no FSDP/ZeRO/model sharding. BF16
+autocast with fp32 master weights; **VQ codebook EMA and Sinkhorn always fp32**
+(local `torch.autocast(..., enabled=False)` islands); TF32 matmul on.
+
+### 11.0 Framework binding (pinned)
+
+The distributed layer is **Hugging Face Accelerate** (`accelerate==1.13.0`, pinned in
+`pyproject.toml`; `torch==2.10.0`) wrapping `torch.nn.parallel.DistributedDataParallel`
+— raw `torchrun`/`torch.distributed` calls do not appear in pipeline code. One
+`Accelerator` per process:
+
+```python
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs, set_seed
+
+accelerator = Accelerator(
+    mixed_precision="bf16",
+    kwargs_handlers=[DistributedDataParallelKwargs(static_graph=True)],
+)
+model, optimizer, scheduler, *loaders = accelerator.prepare(
+    model, optimizer, scheduler, node_loader, joint_loader, edge_loader)
+```
+
+- `prepare()` shards each DataLoader across processes (`DataLoaderShard`);
+  `split_batches=False` (default), so **DataLoaders are constructed with the §10
+  per-rank batch sizes** and the global batch = per-rank × `num_processes` — matching
+  the world-size-invariant global-batch rule in §11.3.
+- Backward is always `accelerator.backward(loss)`; gradient accumulation, if ever
+  enabled, via `Accelerator(gradient_accumulation_steps=…)` + the
+  `accelerator.accumulate(model)` context (default: off — batches are small).
+- Rank identity: `accelerator.process_index` / `accelerator.is_main_process`; barriers
+  via `accelerator.wait_for_everyone()`; one-time cache builds (F0 pooled matrix,
+  ANN grounding pools) inside `with accelerator.main_process_first():`.
 
 ### 11.1 Two execution modes (pinned)
 
-- **Mode T (single training run):** `torchrun --standalone --nproc_per_node={4,8}`,
-  one process per GPU, NCCL. Used for the final 3-seed headline runs and the F1
+- **Mode T (single training run):**
+  `accelerate launch --num_processes {4,8} --mixed_precision bf16 <script>`, one
+  process per GPU, NCCL. Used for the final 3-seed headline runs and the F1
   token-sequence arm (where per-step compute is real).
 - **Mode S (sweeps):** HPO parity (§8: 30 configs × 3 seeds × ladder arms) runs
-  **one job per GPU** (world_size = 1) through a queue, 4/8 concurrent. For a model
-  this size sweep-parallelism dominates DDP scaling — DDP must never be *required*
-  for correctness: world_size = 1 is the reference semantics.
-- Candidate-universe inference (~2.04 M pairs × n_s = 4) shards across ranks in both
-  modes (§10.3).
+  **one job per GPU** through a queue, 4/8 concurrent. For a model this size
+  sweep-parallelism dominates DDP scaling. The same script runs unmodified with
+  `num_processes = 1` (the `Accelerator` degrades to single-process) — **single
+  process is the reference semantics**; multi-GPU may never be required for
+  correctness.
+- Candidate-universe inference (~2.04 M pairs × n_s = 4) shards across processes in
+  both modes (§10.3).
 
 ### 11.2 Synchronization points (correctness-critical)
 
-1. **VQ-EMA codebook:** per-step `all_reduce(SUM)` of per-rank cluster counts and
-   embed sums *before* the EMA update; the update is then computed identically on
-   every rank (no broadcast drift). Dead-code revival samples on rank 0 and
-   broadcasts.
-2. **Loss reduction:** per-family means over the *global* batch (per-rank sums scaled
-   by global counts); per-family gradient norms all-reduced for the §7 Kendall
-   fallback trigger.
+1. **VQ-EMA codebook:** per-step `accelerator.reduce(cluster_counts, reduction="sum")`
+   and `accelerator.reduce(embed_sums, reduction="sum")` *before* the EMA update; the
+   update is then computed identically on every process (no broadcast drift).
+   Dead-code revival samples on the main process and `accelerate.utils.broadcast`s.
+2. **Loss reduction:** DDP gradient averaging gives per-rank-mean semantics; per-family
+   losses are therefore plain per-rank means (identical expectation to global means
+   with equal per-rank batch sizes, which `prepare()` guarantees). Logged per-family
+   gradient norms go through `accelerator.reduce(…, reduction="mean")` for the §7
+   Kendall fallback trigger.
 3. **No BatchNorm anywhere** (LayerNorm only) — asserted at model build.
-4. **VAL-CRITERION / early stop:** val logits all-gathered to rank 0; the metric and
-   stop decision are computed on rank 0 and broadcast, so all ranks agree.
-5. **Curriculum stage boundaries** change the used-parameter set → re-wrap DDP at
-   each stage boundary with `static_graph=True` within a stage (never
-   `find_unused_parameters=True` in steady state).
-6. **Checkpointing (rank 0):** module state + codebook EMA buffers + optimizer +
-   sampler epoch state + all-rank RNG states (gathered); resume restores per-rank
-   RNG exactly.
+4. **VAL-CRITERION / early stop:** val logits + labels collected with
+   `accelerator.gather_for_metrics(…)` — it returns the full set on **every** process
+   and drops the duplicate samples `even_batches` padding introduces (val and
+   candidate files are not divisible by 4/8), so the metric and the stop decision are
+   computed identically on all processes; no explicit broadcast needed.
+5. **Curriculum stage boundaries** (§8) change the used-parameter set → re-`prepare()`
+   the model at each stage boundary keeping `static_graph=True` within a stage
+   (`DistributedDataParallelKwargs(find_unused_parameters=True)` is the registered
+   fallback only if re-wrapping proves brittle — never the steady-state default).
+6. **Checkpointing:** `accelerator.save_state(dir)` / `load_state(dir)` — covers
+   model (incl. codebook EMA buffers, which are module buffers), optimizer,
+   scheduler, scaler, and per-process RNG states; the negative-sampler epoch state
+   and the run-metadata record are registered via
+   `accelerator.register_for_checkpointing(…)` (they expose
+   `state_dict`/`load_state_dict`). Save calls run on all processes (Accelerate
+   handles rank gating internally).
 
 ### 11.3 Determinism under DDP (extends §8)
 
-Global seed s; per-rank sampler seeds f(s, epoch, rank); the n_s = 4 inference CVAE
-seeds are fixed constants (rank-independent, so a pair's prediction does not depend on
-which rank served it); `torch.use_deterministic_algorithms(True)` with any exceptions
-allow-listed and logged; NCCL fp32 reduction non-determinism accepted and documented
-(±ε on logged losses, not on cached predictions). Global batch sizes are configured
-world-size-invariant (per-rank sizes derived), with linear LR scaling and 500-step
-warmup, so world_size ∈ {1, 4, 8} are comparable runs; run metadata records
-world_size, per-rank sizes, and NCCL/env versions.
+`accelerate.utils.set_seed(s)` on every process at start (identical `s`: seeds
+python/NumPy/torch/CUDA; DDP wrap then broadcasts rank-0 init). Prepared DataLoaders
+use `use_seedable_sampler=True` (via `DataLoaderConfiguration`) and
+`loader.set_epoch(epoch)` each epoch; stream-level divergence across processes comes
+only from the §10.2 hash seeded by (s, epoch, `process_index`, idx). The n_s = 4
+inference CVAE seeds are fixed constants (rank-independent, so a pair's prediction
+does not depend on which process served it); `torch.use_deterministic_algorithms(True)`
+with any exceptions allow-listed and logged; NCCL fp32 reduction non-determinism
+accepted and documented (±ε on logged losses, not on cached predictions). Global
+batch sizes are configured world-size-invariant (per-rank sizes derived), with linear
+LR scaling and 500-step warmup, so `num_processes` ∈ {1, 4, 8} are comparable runs;
+run metadata records `num_processes`, per-rank sizes, and
+accelerate/torch/NCCL versions.
 
 ## 12. Change log
 
@@ -435,6 +487,11 @@ world_size, per-rank sizes, and NCCL/env versions.
   self-loop policy), §10 batch-sampler/loader contract, §11 DDP execution design
   (4/8 × H20) — user-directed additions at sign-off; §0 `d` row bound; §6 pointer
   added; former §9 change log renumbered to §12.
+- 2026-07-09: §11 rebased on **Hugging Face Accelerate** (`accelerate==1.13.0`,
+  installed) as the pinned distributed layer, per user direction — `Accelerator` +
+  `prepare()` loader sharding replace raw `torchrun`/`DistributedSampler`;
+  `reduce`/`gather_for_metrics`/`save_state`/`set_seed` bound to the sync points;
+  API verified against the Accelerate docs (Context7, 2026-07-09).
 
 **Open items before code (not blockers):** the four ego-stat target definitions
 pinned to evaluator implementations; FLOPs/latency table template (§4.7 commitment);
