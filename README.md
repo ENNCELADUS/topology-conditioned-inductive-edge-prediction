@@ -128,6 +128,8 @@ docs/
 figures/
   e2-gap.html                    edge-vs-topology contrast (open in a browser)
   positioning.html               2×2 taxonomy positioning figure
+data/
+  README.md                      neutral benchmark input/output contract (no concrete data)
 src/
   README.md                      implementation-contract stub (no code yet)
 literature/                      curated reference library (gitignored)
