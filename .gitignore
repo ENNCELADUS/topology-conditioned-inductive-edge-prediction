@@ -62,3 +62,4 @@ tensorboard/
 
 # Local literature cache
 literature/**/*.pdf
+slurm/cluster.env
