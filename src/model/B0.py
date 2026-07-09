@@ -388,10 +388,7 @@ class GridSketchFusionReadout(nn.Module):
             nn.Conv2d(in_channels, cnn_dim, kernel_size=1, bias=False),
             nn.GroupNorm(1, cnn_dim),
             nn.GELU(),
-            *[
-                _GridResidualBlock(channels=cnn_dim, dropout=cnn_dropout)
-                for _ in range(cnn_blocks)
-            ],
+            *[_GridResidualBlock(channels=cnn_dim, dropout=cnn_dropout) for _ in range(cnn_blocks)],
         )
         self.grid_proj = nn.Sequential(
             nn.LayerNorm(cnn_dim * 2),
@@ -501,8 +498,7 @@ def _parse_rich_pooling_components(value: object) -> tuple[str, ...]:
         component = item.strip().lower()
         if component not in valid_components:
             raise ValueError(
-                "model_config.rich_pooling.components contains unsupported component: "
-                f"{component}"
+                f"model_config.rich_pooling.components contains unsupported component: {component}"
             )
         if component in raw_components:
             raise ValueError(
@@ -522,6 +518,7 @@ def _parse_rich_pooling_components(value: object) -> tuple[str, ...]:
     if POOLING_GATED_COMPONENT in raw_components:
         components.append(POOLING_GATED_COMPONENT)
     return tuple(components)
+
 
 class CrossAttentionLayer(nn.Module):
     """Shared-weight bidirectional cross-attention with FFN and CLS pooling."""
@@ -792,14 +789,10 @@ class PairCrossAttention(nn.Module):
         super().__init__()
         if pair_readout_mode not in PAIR_READOUT_MODES:
             raise ValueError(
-                "model_config.pair_readout.mode must be one of: "
-                f"{', '.join(PAIR_READOUT_MODES)}"
+                f"model_config.pair_readout.mode must be one of: {', '.join(PAIR_READOUT_MODES)}"
             )
         if mixing_mode not in MIXING_MODES:
-            raise ValueError(
-                "model_config.mixing.mode must be one of: "
-                f"{', '.join(MIXING_MODES)}"
-            )
+            raise ValueError(f"model_config.mixing.mode must be one of: {', '.join(MIXING_MODES)}")
         self.pair_readout_mode = pair_readout_mode
         self.mixing_mode = mixing_mode
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
@@ -984,14 +977,9 @@ class V3_1(nn.Module):
         if not isinstance(mixing_cfg_raw, dict):
             raise ValueError("model_config.mixing must be a mapping")
         mixing_cfg = _to_mapping(mixing_cfg_raw, "model_config.mixing")
-        self.mixing_mode = str(
-            mixing_cfg.get("mode", "bidirectional_cross")
-        ).lower()
+        self.mixing_mode = str(mixing_cfg.get("mode", "bidirectional_cross")).lower()
         if self.mixing_mode not in MIXING_MODES:
-            raise ValueError(
-                "model_config.mixing.mode must be one of: "
-                f"{', '.join(MIXING_MODES)}"
-            )
+            raise ValueError(f"model_config.mixing.mode must be one of: {', '.join(MIXING_MODES)}")
         rich_pooling_cfg_raw = model_config.get("rich_pooling", {})
         if rich_pooling_cfg_raw is None:
             rich_pooling_cfg_raw = {}
@@ -1010,8 +998,7 @@ class V3_1(nn.Module):
         self.pair_readout_mode = str(pair_readout_cfg.get("mode", "rich_pooling")).lower()
         if self.pair_readout_mode not in PAIR_READOUT_MODES:
             raise ValueError(
-                "model_config.pair_readout.mode must be one of: "
-                f"{', '.join(PAIR_READOUT_MODES)}"
+                f"model_config.pair_readout.mode must be one of: {', '.join(PAIR_READOUT_MODES)}"
             )
         self.order_aggregation = str(pair_readout_cfg.get("order_aggregation", "single")).lower()
         if self.order_aggregation not in ORDER_AGGREGATION_MODES:
@@ -1164,7 +1151,6 @@ class V3_1(nn.Module):
         return output
 
 
-
 BEST_V3_1_CONFIG: dict[str, object] = {
     "input_dim": 1536,
     "d_model": 256,
@@ -1203,6 +1189,7 @@ BEST_V3_1_SELECTION: dict[str, object] = {
     "selection_metric": "test_auprc",
     "selection_value": 0.7227626490230867,
 }
+
 
 def build_best_v3_1() -> V3_1:
     """Build the selected V3.1 model variant."""
