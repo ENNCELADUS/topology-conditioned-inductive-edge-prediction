@@ -36,9 +36,9 @@ Each split-strategy directory contains:
 | `train_edges.txt` | Labeled train pairs. |
 | `val_edges.txt` | Labeled validation pairs. |
 | `test_edges.txt` | Labeled test pairs. |
-| `train_edges_ratio5_exclusive.txt` | Explicit train supervision with a 1:5 positive-to-negative ratio. |
-| `val_edges_ratio5_exclusive.txt` | Explicit validation supervision with a 1:5 positive-to-negative ratio. |
-| `test_edges_ratio5_exclusive.txt` | Explicit test supervision with a 1:5 positive-to-negative ratio. |
+| `train_edges_ratio5_exclusive.txt` | **QUARANTINED** (spec §9.3: negatives leak across the split) — never use for training, model selection, or evaluation. |
+| `val_edges_ratio5_exclusive.txt` | **QUARANTINED** — same prohibition as above. |
+| `test_edges_ratio5_exclusive.txt` | **QUARANTINED** — same prohibition as above. |
 | `candidate_test_edges.txt` | Candidate-pair universe for held-out assembled-graph evaluation. |
 | `train_graph.pkl` | Reference graph over train nodes for topology-aware supervision. |
 | `test_graph.pkl` | Held-out reference graph for final assembled-graph evaluation. |
@@ -47,6 +47,9 @@ Each split-strategy directory contains:
 ## Contract
 
 - Treat node IDs as opaque strings.
+- The `*_ratio5_exclusive.txt` files are quarantined under the strict inductive
+  protocol (`docs/06-egostitch-spec.md` §9.3): their negatives leak across the
+  node split. No loader in `src/` reads them; keep it that way.
 - Train and test nodes are disjoint under each split strategy.
 - Training, retrieval, and scaffold construction must not access held-out graph
   structure.

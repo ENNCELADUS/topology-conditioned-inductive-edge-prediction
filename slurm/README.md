@@ -24,22 +24,31 @@ slurm/sync_code.sh                 # add --with-env to also scp cluster.env
 # 2. On the cluster login node, from $CLUSTER_REPO_DIR: sanity-check the node
 slurm/submit.sh preflight
 
-# 3. Train
-slurm/submit.sh train configs/b0.yaml
+# 3. Train. The shipped configs pin `data.root: data` (relative), and the train
+# CLI has no data-root flag — so first make the repo-local `data/` resolve to
+# the cluster data root (once, in $CLUSTER_REPO_DIR):
+ln -s "$CLUSTER_DATA_ROOT" data     # or edit data.root in the config
+slurm/submit.sh train configs/b0_v31_breadth_first.yaml
+slurm/submit.sh train configs/b0_alt_breadth_first.yaml
 
-# 4. Score (optionally sharded via a Slurm array)
-slurm/submit.sh score -- score --checkpoint outputs/b0/best.pt \
-  --pairs data/benchmark_2025_neurips/breadth_first/candidate_test_edges.txt \
+# 4. Score (optionally sharded via a Slurm array). --pairs takes a SOURCE NAME
+# (candidate | test | val | file:<path.tsv>), never a raw benchmark path —
+# analysis pipelines reject artifacts whose pairs_source is not "candidate".
+slurm/submit.sh score -- score --checkpoint outputs/b0_v31/best.pt \
+  --pairs candidate \
   --data-root "$CLUSTER_DATA_ROOT" --strategy breadth_first --output scores/b0.npz
 
 # Sharded variant: pass the SAME --output to every array task. The CLI itself
 # derives each shard's filename from --output plus its --shard index (e.g.
 # --output scores/b0_v31_candidate.npz with --shard 2 writes
 # scores/b0_v31_candidate.shard-2.npz) — do not hand-shard the --output path.
-slurm/submit.sh score --array 0-3 -- score --checkpoint outputs/b0/best.pt \
-  --pairs data/benchmark_2025_neurips/breadth_first/candidate_test_edges.txt \
+# Sharding is for the v3_1 checkpoint; run the cheap b0_alt scoring unsharded.
+slurm/submit.sh score --array 0-3 -- score --checkpoint outputs/b0_v31/best.pt \
+  --pairs candidate \
   --data-root "$CLUSTER_DATA_ROOT" --strategy breadth_first \
   --output scores/b0_v31_candidate.npz
+# Wait for ALL array tasks to finish (squeue) before merging — merge validates
+# gap-free coverage and will fail loudly on a missing shard.
 slurm/submit.sh score -- merge --inputs scores/b0_v31_candidate.shard-*.npz \
   --output scores/b0_v31_candidate.npz
 
