@@ -38,9 +38,10 @@ dist/
 # Notebooks
 .ipynb_checkpoints/
 
-# Data and generated benchmark artifacts
-data/
-datasets/
+# Data and generated benchmark artifacts (repo root only — src/data etc. are code)
+/data/*
+!/data/README.md
+/datasets/
 
 # PyTorch/deep-learning runtime artifacts
 checkpoints/
