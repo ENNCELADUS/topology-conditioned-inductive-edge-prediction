@@ -251,18 +251,85 @@ survive knockouts; whether E7 shows downstream value. These are exactly the six 
 4. **Review traces** written to the session scratchpad (no `.aris/` toolchain in this
    repo); the durable record is this document.
 
-## 6. Library housekeeping notes (from the fan-out pass; no files touched)
+## 6. Library housekeeping notes (from the fan-out pass)
+
+Resolved in vault housekeeping on 2026-07-09 where noted; named-only citation lookups
+remain separate from this review record.
 
 - `literature/models/graph_structure_learning/`: SUBLIME (2201.06367) is duplicated
   across `latent_structure_learning/` and `self_supervised_structure_learning/`; DGM
   (2002.04999) has both a 2022- and a 2023-prefixed copy in
-  `latent_structure_learning/`.
+  `latent_structure_learning/`. **Resolved:** duplicate active copies archived under
+  `literature/archive/duplicates/`.
 - HoscPool PDF filename says `2022_icml_...` but the paper is CIKM 2022 — rename per
-  the library convention.
+  the library convention. **Resolved:** active filename now uses `2022_cikm_...`.
 - MGAE preprint (2201.02534) and S2GAE (WSDM 2023) are the same line of work — cite
   the version of record.
 - The local copy of TDE (2002.11949) is arXiv v4 (stamped 2025) — quote-check against
   the CVPR 2020 camera-ready if quoting text.
-- `literature/README.md` (manifest) lists `literature/data/negative_sampling_and_pu/…`
-  but `literature/data/` does not exist on disk — manifest is stale (90 PDFs listed;
-  89 found under `models/`).
+- `literature/README.md` (manifest) listed stale counts (90 PDFs listed; 89 found under
+  `models/`). **Resolved:** manifest now separates active PDFs from archived duplicates.
+
+---
+
+## 7. Addendum (2026-07-09): approval, amendments, and second-pass verification
+
+**Approval received:** revision 2.1 approved **as a design proposal, not yet an
+implementation contract**, with three required amendments — all executed:
+
+1. **G4 spec freeze delivered.** `06-egostitch-spec.md` (2026-07-09): Stitch/Harmonize
+   pseudocode with tensor shapes, OT cost and ε, confidence + cosine quantile schedule,
+   K-representable budget tolerance τ_b, gradient estimators for every hard operation,
+   two-null conditioning-dropout scheme, hub/multiplicity policy, and the full loss
+   tree with interior weights, HPO-parity budget, and determinism policy. Pending
+   review sign-off; on sign-off it becomes the implementation contract with a
+   change-log discipline.
+2. **Protocol updated.** The approved [protocol-Δ] items are merged into
+   `03-experiment-protocol.md` (updated 2026-07-09): pre-implementation gates G1–G5
+   (Oracle-first run order), ladder extensions (`B0+cal`, `B3-dist`, `B3-full`, B5,
+   DEAL/Graph2Gauss, PA-null, odds-product), trained-on vs held-out metric families
+   with ceiling/Oracle/noise-floor rows, zero-edge hard-negative construction,
+   message/supervision partition + provenance gates, Holm-corrected pre-registered
+   decision rules, E7 promoted to load-bearing, B4 → E4.11 disposition, and the scoped
+   C4 claim.
+3. **Second-pass literature verification.** The 21 papers previously cited from
+   abstracts (now full PDFs in the vault, incl. the new `kg_inductive_lineage/`
+   folder) were read by two verification shards. Result: **no mischaracterization
+   threatens the core positioning**; the proposal is updated to **revision 2.2** with
+   these corrections:
+   - *Chanpuriya ceiling semantics* (substantive): the G2 gate now uses the paper's
+     exact identities (`E[Δ] = tr(P³)/6`, `Ov·V = Σp²`) and states the ceiling as a
+     **curve over overlap** evaluated at the soft scorer's measured overlap — a
+     thresholded assembly has `Ov = 1` where the bound is vacuous; the "cannot
+     reproduce triangles without memorization" gloss is retired.
+   - Quote-backed KG-inductive taxonomy (IGMC's own "does not address the extreme
+     cold-start problem" line; NBFNet path-set definition; ULTRA's inference-graph
+     dependency), with the structure-only/features-only complementarity noted.
+   - P-GNN split from the labeling-trick family (anchor-based positional); the §5.4
+     fidelity qualifier extended to Distance Encoding.
+   - Topological Concentration citation corrected (it *undercuts* naive degree
+     strata); TC stratification and a TDS-style ego-net drift diagnostic added.
+   - O'Bray rules imported verbatim (bin-count disclosure, no ad-hoc EMD/TV kernels,
+     perturbation-validated composite); PA-null and odds-product baselines added;
+     G1 re-verifies E2 under degree-corrected negatives.
+   - GraphMAE scope qualifier (classification-side evidence only); UPNA, New Node
+     Prediction (semi-inductive), HiGGs, FLEX distinguishing sentences; FLEX's
+     dense-generation failure recorded as independent support for hard budgets.
+   - Venue statuses: Meta-Embedding (SIGIR 2019) **tag cleared**;
+     NBFNet/ULTRA/P-GNN/DE/LPFormer/O'Bray/TGB confirmed from PDFs; GraIL/IGMC local
+     PDFs are arXiv preprints (page-quote checks pending); 2310.04612, 2405.14985,
+     UPNA, FLEX are preprints; HiGGs and 2401.05468 cited as arXiv without venue.
+
+**Remaining open follow-ups (updated):**
+
+1. `/novelty-check` Phase C (Codex cross-model verification) — still pending; Codex
+   MCP was unresponsive this session (two 30-min idle timeouts).
+2. Semantic Scholar sweep — retried 2026-07-09; `SEMANTIC_SCHOLAR_API_KEY` was **not
+   visible in the agent's shell environment** (queries still 429'd unauthenticated;
+   the one batch that got through returned no relevant hits). Export the key where
+   agent Bash sessions can see it (e.g., `env` in `.claude/settings.json`) and rerun.
+3. Residual [venue-verify] items: LGD main-text task coverage (against the NeurIPS
+   camera-ready); Rendsburg "NetGAN without GAN"; Heater; DCM's in-print DGM
+   criticism; GraIL/IGMC page-level quotes; HiGGs acceptance status; acceptance
+   status of 2310.04612 / 2405.14985 / UPNA / FLEX closer to submission.
+4. G4 sign-off of `06-egostitch-spec.md`, then gates G1→G2→G3 before any model code.

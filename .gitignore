@@ -1,1 +1,2 @@
-literature/
+literature/**/*.pdf
+.DS_Store

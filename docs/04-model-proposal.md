@@ -1,7 +1,9 @@
 # Model Proposal: EgoStitch — Community-Conditioned Ego-Network Imagination with Consensus Stitching for Topology-Conditioned Inductive Edge Prediction
 
-**Status:** design proposal awaiting approval — **revision 2.1**. Companion to
-`03-experiment-protocol.md` and `02-methodology.md`.
+**Status:** **revision 2.2** — approved as a design proposal (2026-07-09), not yet an
+implementation contract; the contract activates on gate G4 sign-off of
+`06-egostitch-spec.md`. Companion to `03-experiment-protocol.md` (updated 2026-07-09
+with the approved [protocol-Δ] items) and `02-methodology.md`.
 
 **Provenance.** Revision 1 was grounded in a three-track literature review run on
 2026-07-07. Revision 2 (2026-07-08) followed a full fan-out review of the local vault
@@ -9,9 +11,11 @@
 (2026-07-08) incorporates a simulated 5-persona design review (Editor-in-Chief,
 methodology, domain, cross-disciplinary/CV, Devil's Advocate; full record in
 `05-review-report.md`) — the panel's design-stage findings are fixed in this text, and
-its experiment-stage findings are registered as pre-implementation gates (§6.0). All
-cited papers were verified against local PDFs or the arXiv API; papers found only by
-external search are marked ⊕.
+its experiment-stage findings are registered as pre-implementation gates (§6.0).
+Revision 2.2 (2026-07-09) follows full-text verification of the 21 papers previously
+cited from abstracts only (now in the vault); all corrections are listed in the 2.2
+change block below. All cited papers were verified against local PDFs or the arXiv
+API; papers found only by external search are marked ⊕.
 
 **One-line summary.** Replace the retrieved-and-thresholded scaffold with a *generated
 and harmonized* one: for each queried pair `(i, j)`, each endpoint **imagines its own
@@ -95,6 +99,52 @@ constrain the *scaffold* exactly and influence the *assembly* through shaped mar
 - **(j) Ladder and run-order changes** [DA-C5, DA-M10, EIC]: `B3-full` Ockham arm
   added; Oracle promoted to first run; E7 promoted from optional to load-bearing;
   minimum-viable-model staging milestone; pre-registered decision rules.
+
+**What changed in revision 2.2** (full-text verification of the 21 abstract-cited
+papers; two shard reports in the session record):
+
+- **(k) Ceiling semantics corrected [substantive].** Chanpuriya 2111.00048's bound is
+  a quantitative overlap–volume tradeoff with *exact* computable identities
+  (`E[Δ] = tr(P³)/6`; `Ov(P)·V(P) = Σ p²`), not a binary memorization dichotomy — and
+  a hard-thresholded assembly has overlap 1, where the bound is vacuous. Gate G2 is
+  restated as a **ceiling curve over overlap**, evaluated at the soft scorer's
+  measured overlap, with the clustering ceiling built from the exact triangle
+  numerator + the assembly's expected-degree denominator (Thm 6 is big-O only). The
+  "cannot reproduce triangles without memorization" gloss is retired.
+- **(l) Quote-backed taxonomy.** GraIL/NBFNet/ULTRA/IGMC one-liners are now grounded
+  in the papers' own text (IGMC states verbatim it "does not address the extreme
+  cold-start problem"); the KG-inductive row and ours are information-theoretic
+  complements (structure-only/features-absent vs features-only/structure-absent).
+- **(m) Family split.** P-GNN is anchor-based *absolute positional*, not a labeling
+  trick — §5.4/§5.5 wording split; the §5.4 fidelity qualifier now covers Distance
+  Encoding as well.
+- **(n) Stratification correction.** Topological Concentration (2310.04612) *undercuts*
+  naive degree strata (degree is weakly and bias-prone correlated with LP
+  performance); TC/ATC stratification added alongside degree, and a TDS-style
+  train/test ego-net drift diagnostic added to §6.4.8.
+- **(o) Ladder additions.** Mandatory **PA-null** baseline (`s_ij = k_i·k_j`, with
+  degree-heterogeneity σ reported per benchmark) and the Chanpuriya **odds-product**
+  degree-respecting edge-independent baseline; G1 re-verifies E2 under
+  degree-corrected negatives explicitly (2405.14985).
+- **(p) Metric-validation additions (O'Bray 2106.01098).** Per-statistic bin-count
+  disclosure; no ad-hoc EMD/TV kernels without justification; the "graph similarity"
+  composite must pass an expressivity/robustness perturbation check as part of its G1
+  definition.
+- **(q) Scope qualifiers.** GraphMAE's feature-target evidence is for classification
+  (its own text concedes GAEs are strong at LP) — R4 rests on the shortcut argument
+  and our ablation, with GraphMAE as representation-learning precedent (its
+  scaled-cosine + re-mask stabilizers imported); UPNA's "learns the graph generation
+  mechanism" rhetoric distinguished explicitly (independent pairwise scoring, no
+  per-query generated context, no assembled grading); New Node Prediction (2401.05468)
+  sharpened to *semi-inductive* (its isolated node links into a fully observed graph);
+  HiGGs' stage-three community stitching distinguished from per-query ego-net
+  stitching; FLEX's documented dense-generation failure recorded as independent
+  evidence for hard degree budgets.
+- **(r) Venue statuses updated** (§8): Meta-Embedding SIGIR 2019 confirmed (tag
+  cleared); NBFNet/ULTRA/P-GNN/DE/LPFormer/O'Bray/TGB confirmed from PDFs; GraIL and
+  IGMC local PDFs are arXiv preprints (camera-ready check before quoting pages);
+  2310.04612, 2405.14985, UPNA, FLEX are preprints; HiGGs and 2401.05468 cited as
+  arXiv without venue claims.
 
 ---
 
@@ -182,8 +232,10 @@ budgets. EgoStitch's answer is to inject those budgets as *evidence within each
 decision* — shaping every marginal by the same distilled priors — while acknowledging
 the structural limit that survives any locked-contract method: predictions remain
 independent across queries, so the assembled graph is an edge-independent construction
-whose realism is bounded (Chanpuriya et al. 2111.00048 ⊕; §6.0-G2 checks this bound on
-the benchmark before implementation). The CV literature reached the analogous verdict on
+whose triangle/clustering realism is bounded by an overlap–volume tradeoff, tight up to
+constants (Chanpuriya et al. 2111.00048 ⊕: `E[Δ] ≤ (√2/3)(Ov·V)^{3/2}`; §6.0-G2
+evaluates this as a ceiling *curve over overlap* on the benchmark before
+implementation). The CV literature reached the analogous verdict on
 inpainting seams: no per-unit loss fixes assembly-level implausibility without either a
 whole-assembly objective or non-independent decoding (Context Encoders 1604.07379,
 RePaint 2201.09865, MaskGIT 2202.04200) — within a single query's scaffold we *can* and
@@ -241,7 +293,7 @@ retrieved + thresholded (unsupervised echo) ≠ generated + realism-trained + ha
 | R1 | Scaffold must be trained against **real ego-network topology**, not B0's outputs | §1.1, §1.4 |
 | R2 | Neighbor proposals must be **generative**, with retrieval as optional, gated grounding | §1.2, §1.5; GAR (SIGIR 2022), Cold Brew 2111.04840, RDM 2204.11824 |
 | R3 | Scaffold construction must be **differentiable / learned end-to-end**, with every hard operation given an explicit gradient estimator | §1.3; DGM 2002.04999 (machinery); §4.5 loss tree |
-| R4 | Reconstruct neighbor **features**, not raw adjacency bits, as the primary generative target | DINOSAUR 2209.14860; GraphMAE 2205.10803 ⊕ (the same thesis inside graph SSL); Graffe 2505.04956 |
+| R4 | Reconstruct neighbor **features**, not raw adjacency bits, as the primary generative target | DINOSAUR 2209.14860; GraphMAE 2205.10803 ⊕ as representation-learning precedent only — its evidence is classification-side, and its own text concedes structure-reconstructing GAEs are strong at LP, so R4's edge-prediction justification rests on the §1.8 shortcut argument + our E4 ablation; GraphMAE's scaled-cosine error + re-mask decoding are imported as stabilizers; Graffe 2505.04956 |
 | R5 | Include a **distributional realism loss** (energy distance/MMD), not only point losses | Manenti et al. 2405.19933 (motivating theory, §1.4 caveats); NetGAN 1803.00816; Graph Gestalt 2106.15239 |
 | R6 | Carry explicit **degree budgets** and **community/block priors** into every decision; enforce the budget as a hard constraint **at the scaffold level** and measure its transmission to assembly | §1.6, §1.7; NOCD 1909.12201; EDGE 2305.04111 (degree-first factorization); MaskGAE degree decoder 2205.10053; DC-SBM (Karrer & Newman 2011) as the classical ancestor of the `d̂`+block channel |
 | R7 | Apply the **labeling trick** on the scaffold (anchor labels for `i`,`j`) — the most expressive pair-aware readout *of the generated context* (§5.4) and the theoretically grounded implementation of the queried-edge masking gate | §1.9; 2010.16103; Distance Encoding 2009.00142 ⊕ |
@@ -633,7 +685,10 @@ realism-vs-cost frontier; (iii) if a B0-prefilter cascade is the deployment mode
 assembled metrics are reported *under the cascade* — a cascade dilutes topology gains
 because most assembled edges become B0 decisions, and hiding that would be
 self-deception. Amortization claim, corrected: per-*node* work amortizes; per-*pair*
-work strictly increases over both B0 and the §0 contract.
+work strictly increases over both B0 and the §0 contract. The canonical attack to
+pre-empt [rev 2.2]: NBFNet's Table 1 reports ≈1 month of wall time for per-query
+subgraph methods (SEAL/GraIL) on a single KG test set — the paper must show the
+per-endpoint cache plus `R = 0` row keeps EgoStitch out of that regime.
 
 ---
 
@@ -679,7 +734,22 @@ assembly.
 The KG-inductive community owns the phrase "inductive link prediction"; the table's
 third row is the pre-emptive answer to "how is this not GraIL/ULTRA?" — in that setting
 structural context is *given* at inference and methods reason over it; here it does not
-exist and must be generated. The zero-edge setting is strictly harder in test-time
+exist and must be generated. Quote-backed anchors (full-text verified, rev 2.2):
+GraIL assumes "the local graph neighborhood of a particular triplet in the KG will
+contain the logical evidence needed" and uses no node attributes — a zero-edge pair
+yields an empty enclosing subgraph and no input at all; NBFNet's pair representation
+is defined over the set of observed paths `P_uv` ("generalize to entirely new graphs
+*without node features*" — for a zero-edge pair, `P_uv = ∅`); ULTRA predicts "based on
+the incomplete inference graph `G_inf`" and its first step lifts `G_inf` to a graph of
+relations, which does not exist without observed edges; IGMC states verbatim that it
+"does not address the extreme cold-start problem, as it still requires an unseen
+user-item pair's enclosing subgraph." Note the symmetry: that lineage is
+structure-only/features-absent; ours is features-only/structure-absent — the two
+regimes are information-theoretic complements, which makes "why not just run ULTRA?"
+self-answering. On the attribute-only row, UPNA's abstract claims to learn "a
+significant part of the latent graph generation mechanism"; the distinction is that
+UPNA still scores pairs independently with no per-query generated context and no
+assembled-graph grading. The zero-edge setting is strictly harder in test-time
 information and is the regime where all observed-context machinery is undefined.
 
 ### 5.3 Threat matrix (closest prior work, and the exact delta)
@@ -687,13 +757,13 @@ information and is the regime where all observed-context machinery is undefined.
 | Closest prior | What it does | Why it is not EgoStitch |
 |---|---|---|
 | **Graph Gestalt** (2106.15239) | diagnoses local link-reconstruction vs global realism divergence; fixes GVAEs with a kernel-MMD ELBO regularizer; realism co-training also improves LP | **priority on the dissociation observation — cited in the E2 framing**; transductive GVAE on an observed graph: no unseen nodes, no per-query scaffold, no generation. Neutralized structurally *and* empirically: its remedy is imported as the `B3-dist` arm and inside `B3-full` (§6.2) |
-| **Chanpuriya et al.** ⊕ (NeurIPS 2021, 2111.00048) | proves edge-independent graph models cannot reproduce triangle counts without memorization | not a competitor but the **boundary of the playing field**: it is simultaneously the strongest theoretical backbone for RQ1/E2 and the ceiling on what any locked-contract method (ours included) can repair — used in both roles (§1.6, §6.0-G2) |
+| **Chanpuriya et al.** ⊕ (NeurIPS 2021, 2111.00048) | proves `E[Δ] ≤ (√2/3)(Ov·V)^{3/2}` for any edge-independent model, tight up to constants — matching real triangle density at fixed volume forces overlap toward the memorization end of the tradeoff; exact identities `E[Δ] = tr(P³)/6`, `Ov·V = Σp²` make the bound computable for any concrete assembly matrix | not a competitor but the **boundary of the playing field**: simultaneously the strongest theoretical backbone for RQ1/E2 (their own CELL/CORA-ML experiment — ≤1,461 generated vs 2,802 real triangles — is an external companion to E2) and the ceiling on what any locked-contract method (ours included) can repair — used in both roles (§1.6, §6.0-G2). Caveat that changes the gate: overlap is *self-resampling* agreement, so a thresholded (deterministic) assembly has `Ov = 1` and a vacuous bound — the ceiling is a curve over overlap, evaluated at the soft scorer's measured `Ov(P)`; informative features legitimately raise sustainable overlap on unseen nodes, so the ceiling scales with how deterministic the feature→edge map is allowed to be |
 | **NCNC** (ICLR 2024, 2302.00890) | completes unobserved common-neighbor structure with a link predictor, then scores | transductive completion among observed nodes; no latent neighbor generation, budget, community prior, or assembled evaluation. Its incompleteness finding is *evidence for* our premise |
 | **Cold Brew** (ICLR 2022, 2111.04840) | virtual neighborhoods for zero-edge nodes = attention over existing training-node embeddings | no generated structure (no slot adjacency, no existence probabilities, no budget); node-level embeddings, not per-pair decisions; no realism objective |
 | **DEAL** (IJCAI 2020, 2007.08053) / **Graph2Gauss** ⊕ (ICLR 2018, 1707.03815) | attribute-only inductive LP; independent pairwise similarity at inference | the B0 template family (Graph2Gauss predates DEAL); no scaffold, no generation, no assembled metrics; mandatory baselines with the falsifiable prediction that they exhibit the E2 failure mode |
 | **NRI** ⊕ (ICML 2018, 1802.04687) | infers interaction graphs over entity sets from observed *trajectories*, evaluated as a graph | the canon's closest "imagine topology from features" relative; but it requires per-instance dynamical observations (trajectories) as test-time evidence, infers one latent graph per system rather than per-query context for a binary pair decision, and has no inductive zero-edge pair protocol |
 | **Latent Graph Diffusion** (NeurIPS 2024, 2402.02518) | "unifies generation and prediction": prediction = conditional generation (graph inpainting) in a whole-graph latent space | conditions on *observed test-graph adjacency* (inadmissible under our protocol); one whole-graph latent, "predict once per graph"; prediction experiments in the main text are graph regression and transductive node classification [verify against camera-ready before submission — flagged, not yet page-verified] |
-| **FLEX** ⊕ (2507.11710) | GGM for OOD link prediction: structurally-conditioned generation + adversarial co-training | generation as training-distribution alignment/augmentation for observed-graph LP — not inference-time per-query context for zero-edge nodes; no assembled-graph grading |
+| **FLEX** ⊕ (2507.11710, preprint) | GGM for OOD link prediction: SEAL-labeled k-hop subgraphs around *training* links generated by a SIGVAE, counterfactually shifted (KL-target penalty), adversarially co-training a GNN — verbatim "we apply graph generation as a data augmentation method"; GGM not invoked at inference | full-text verified: generation is train-time augmentation from *observed* neighborhoods; test queries answered by the tuned GNN on an observed (shifted) graph; Hits@K only, no assembled-graph grading. Bonus: FLEX documents that naive generated subgraphs are uniformly over-dense and fixes it with a probability threshold — independent evidence for our hard degree budgets |
 | **EDGE** (ICML 2023, 2305.04111) | degree-first factorization `p(A,d)=p(d)p(A|d)` with hard degree masking | whole-graph unconditional generation; our budget is **EDGE's principle amortized**: feature-conditional, per-endpoint, per-query, inductive, at ego scale, used as classifier evidence |
 | **TGSBM** (2601.20646) | amortized variational OSBM latents decoded into edge probabilities | encoder attends over the node's *observed edges* (+ expander edges): a zero-edge node has no attention neighborhood; transductive evaluation; block prior is the whole likelihood, not a fused channel |
 | **VQGraph** (ICLR 2024, 2308.02117) / **GFT** (NeurIPS 2024, 2411.06070) | discrete codebooks over graph structure (node-code distillation targets; computation-tree vocabulary) | recognition/distillation codebooks; VQGraph's student MLP *can* code a zero-edge node from features [R2-W5a], but neither work generates topology, supervises codes with ego-net statistics, nor addresses edge prediction — see the scoped claim in §4.1 |
@@ -702,16 +772,22 @@ information and is the regime where all observed-context machinery is undefined.
 | **MoG** (ICLR 2025, 2405.14260) | per-node ego-graph decisions re-assembled globally (sparsifier experts) | deletion of observed edges for node-level efficiency; the ego-decompose-and-reassemble skeleton exists here, so our delta rests on generation + the inductive edge protocol |
 | **GSR** (WSDM 2023, 2211.06545) | "GSL is essentially link prediction"; ego-subgraph contrastive pretraining, one-shot refinement | pretext for refining one observed global graph for node classification; transductive. Its MoCo-style multi-view edge pretraining is imported as an encoder pre-training recipe |
 | **NetGAN** (ICML 2018, 1803.00816) / **SIG-VAE** (1908.07078) | early generation-realism/LP couplings | transductive, single-graph, not per-query; NetGAN's edge-independence critique (Rendsburg et al., "NetGAN without GAN," 2020 ⊕ [cite by name]) generalizes into the Chanpuriya bound above. SIG-VAE has priority on "BP decoder → realistic statistics": cite, never claim that connection as new |
-| **LA-GNN** (ICML 2022, 2109.03856) / **GraphSMOTE** (2103.08826) / **GAR** (SIGIR 2022) + cold-start recsys (DropoutNet; Heater; MetaEmbedding [venue-verify before print]) | conditional neighbor-*feature* generation as augmentation; synthetic-node edges for class balance; cold-item embedding generation | features not structure / augmentation not inference context / single embedding not neighborhood. Cold-start recommendation *is* zero-edge bipartite edge prediction: either a bipartite benchmark joins E6 or the scope exclusion is stated explicitly [R2-W9] |
-| **New Node Prediction** ⊕ (2401.05468) | zero-shot out-of-graph all-links prediction for one isolated node | task-adjacent (one isolated node vs node-disjoint pairs); GNN architecture; no generated scaffold, no realism grading |
+| **LA-GNN** (ICML 2022, 2109.03856) / **GraphSMOTE** (2103.08826) / **GAR** (SIGIR 2022) + cold-start recsys (DropoutNet; Heater [venue-verify]; Meta-Embedding — SIGIR 2019, 1904.11547 ⊕, venue confirmed rev 2.2: a meta-learned feature→initial-ID-embedding generator for zero-history ads) | conditional neighbor-*feature* generation as augmentation; synthetic-node edges for class balance; cold-item embedding generation | features not structure / augmentation not inference context / single embedding not neighborhood. Cold-start recommendation *is* zero-edge bipartite edge prediction: either a bipartite benchmark joins E6 or the scope exclusion is stated explicitly [R2-W9] |
+| **New Node Prediction** ⊕ (2401.05468, arXiv preprint) | zero-shot out-of-graph all-links prediction for one isolated node | task-adjacent but **semi-inductive**: the isolated node is linked *into a fully observed graph* available at prediction time — unlike our node-disjoint, no-test-graph regime; no generated scaffold, no realism grading. (Its related work also records the VGNAE observation that GAE embeddings of zero-degree nodes collapse toward zero — a one-line empirical answer to "why not plain GAEs?") |
+| **HiGGs** ⊕ (2306.11412, cite as arXiv) | hierarchical large-graph generation: community-level graph sampled first, per-community subgraphs generated, then inter-community edges filled by an edge-predictive diffusion model | whole-graph *synthesis*; its stage-three "stitch sampled communities into one big graph" is the mechanical cousin of our stitching, but it stitches sampled communities to synthesize output, whereas we stitch imagined ego-nets to answer `edge(u, v)` under a no-test-graph protocol; no queries, no inductive nodes, realism graded on sampled graphs only |
 
 ### 5.4 Theory usage — scoped statements [R2-W4, DA-M13]
 
-- **Labeling trick (2010.16103):** grants the most expressive pair-aware readout *of
-  the generated context `T̂_ij`*. It does not certify that the generated context
-  carries true structural evidence — that is an empirical property of
+- **Labeling trick (2010.16103) and Distance Encoding (2009.00142):** grant the most
+  expressive pair-aware readout *of the generated context `T̂_ij`*. Both theories are
+  proven with respect to actual graph structure; neither certifies that the generated
+  context carries true structural evidence — that is an empirical property of
   `L_recon`/`L_real` fidelity, measured by the §6.4.8 diagnostics. The paper never
-  writes "provably most expressive" without this qualifier.
+  writes "provably most expressive" without this qualifier. **P-GNN (1906.04817) is a
+  separate family** — anchor-based *absolute positional* encodings, sampled
+  independently of the target pair, not a target-conditioned labeling scheme; its
+  structure-aware vs position-aware distinction also scopes what an imagined ego-net
+  can restore: local structural evidence, not global position.
 - **γ-decaying locality (SEAL 1802.09691):** applies to observed enclosing subgraphs.
   The transferred claim is conditional: *if* generated ego-nets match the true local
   distribution, then local (1-hop-stitched, K-slot) context suffices for CN/AA-type
@@ -733,7 +809,8 @@ information and is the regime where all observed-context machinery is undefined.
 
 ### 5.5 Mechanism imports (cited, none changing the novelty of the combination)
 
-Labeling trick (2010.16103) + Distance Encoding (2009.00142 ⊕) + P-GNN (1906.04817 ⊕);
+Labeling trick (2010.16103) + Distance Encoding (2009.00142 ⊕) [target-conditioned
+structural]; P-GNN (1906.04817 ⊕) [anchor-based positional — related, distinct family];
 automorphic-node motivation + sketching (2209.15486); γ-decaying locality (1802.09691,
 conditional form); NCN closure form (2302.00890); NOCD block prior (1909.12201);
 DC-SBM degree correction (Karrer & Newman 2011 ⊕); EDGE degree factorization + masking
@@ -766,9 +843,9 @@ accordingly. The analogy is used as mechanism transfer, not decoration.
 
 ## 6. Fit to the experiment protocol
 
-Items marked **[protocol-Δ]** extend `03-experiment-protocol.md` and need sign-off
-before E1/E3 runs; they are flagged here rather than edited into the locked protocol
-unilaterally.
+The **[protocol-Δ]** items below were approved and merged into
+`03-experiment-protocol.md` on 2026-07-09; the tags are retained as provenance markers
+for which protocol clauses originate here.
 
 ### 6.0 Pre-implementation gates (run before any EgoStitch code) **[protocol-Δ]**
 
@@ -784,24 +861,38 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   imbalance view [DA-m17]. *Stop condition:* if the gap substantially closes under hard
   negatives or calibrated thresholds, the motivation is dead as stated and the project
   pivots to the evaluation/benchmark paper.
-- **G2 — Edge-independence ceiling check.** Using the reference graph and cached
-  scores: compute the maximum clustering/triangle statistics attainable by an
-  edge-independent assembly at matched density and bounded overlap (Chanpuriya
-  2111.00048 machinery), i.e., the reachable frontier for *every* locked-contract
-  method. Report the ceiling next to all assembled metrics thereafter. *Stop
-  condition:* if the reference statistics are far outside the reachable set, the locked
-  per-query contract cannot express the fix; flag to the user for a locked-decision
-  discussion (assembly-time coupling would be a different paper) rather than building
-  a model that cannot succeed.
+- **G2 — Edge-independence ceiling check (rev 2.2 semantics).** Using the reference
+  graph and cached B0 scores, with Chanpuriya 2111.00048's exact identities:
+  (i) compute the assembly's operating point exactly — `V(P) = Σ p_ij`,
+  `Ov(P) = Σ p_ij² / Σ p_ij`, `E[Δ] = tr(P³)/6`; (ii) plot the **ceiling curve**
+  `E[Δ]_max(ω) = (√2/3)(ω·V)^{3/2}` over overlap ω at matched volume, with the
+  clustering ceiling from the exact triangle numerator over the assembly's
+  expected-degree denominator `Σ d̂_i(d̂_i − 1)` (Theorem 6 is big-O only — do not use
+  it directly); (iii) mark B0's measured `Ov(P_soft)` on the curve, plus the
+  minimum-required overlap to reach the reference triangle count,
+  `Ov_min = (3Δ*/√2)^{2/3} / V`; the odds-product model's convex-combination dial
+  `P̃ = (1−ω)P + ωA` sweeps the curve empirically. **Semantics:** overlap is
+  self-resampling agreement — a hard-thresholded assembly has `Ov = 1` and the bound
+  is vacuous there; the honest reading is that the ceiling constrains *stochastic,
+  calibrated* assemblies at their measured overlap, and informative features
+  legitimately raise the overlap sustainable on unseen nodes without training-graph
+  memorization. Report the curve next to all assembled metrics thereafter. *Stop
+  condition:* if the reference statistics require `Ov_min` far above what any honest
+  feature-conditioned scorer attains on unseen nodes (calibration-checked), the locked
+  per-query contract cannot express the fix; flag for a locked-decision discussion
+  (assembly-time coupling would be a different paper) rather than building a model
+  that cannot succeed.
 - **G3 — Oracle first [DA-M10].** Run the Oracle row (observed-neighborhood scaffold)
   before implementation: it calibrates whether 0.235 is poor, bounds all possible
   gains, and separates "conditioning is the missing ingredient" from "features are
   insufficient." *Stop condition:* Oracle ≈ B0 on assembled metrics ⇒ feature
   insufficiency; topology conditioning cannot help; pivot.
-- **G4 — Specification freeze.** The §4.3 algorithm box (Stitch + Harmonize pseudocode
+- **G4 — Specification freeze.** The algorithm box (Stitch + Harmonize pseudocode
   with tensor shapes, OT cost/ε, quantile schedule, budget tolerance τ_b, gradient
-  estimators) and the §4.5 loss tree with interior weights are written and reviewed
-  before implementation. *Stop condition:* none — this is a deliverable.
+  estimators) and the loss tree with interior weights are **delivered in
+  `06-egostitch-spec.md` (2026-07-09), pending review sign-off**; once signed off, the
+  spec is the implementation contract and deviations require a spec edit first.
+  *Stop condition:* none — this is a deliverable.
 - **G5 — Minimum-viable-model milestone [EIC].** Stage 1: imagination + degree budget
   + closure channel only (no codebook, no harmonization, no CVAE) vs B0/B1/B5/`B0+cal`.
   Stage 2 adds codebook + s3; Stage 3 adds harmonization + seam loss. Each stage must
@@ -843,6 +934,15 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   caveat the headline numbers share [DA-C5's asymmetry objection, accepted].
 - **DEAL** (2007.08053) and **Graph2Gauss** ⊕ (1707.03815) as external attribute-only
   baselines, with the falsifiable prediction that they reproduce the E2 failure mode.
+- **PA-null** [rev 2.2, from 2405.14985]: the preferential-attachment null
+  `s_ij = k_i·k_j` (degrees from training-side statistics/d̂), reported with each
+  benchmark's degree heterogeneity σ (log-normal fit). "Beats PA under the stated
+  negative regime" is a validity precondition for any edge-metric claim — the null
+  averages AUC 0.83 and beats half the field under uniform negatives.
+- **Odds-product** [rev 2.2, from 2111.00048 §3]: the degree-sequence-respecting
+  edge-independent baseline (`P_ij = σ(ℓ_i + ℓ_j)` fitted to the expected degree
+  sequence) — the cheapest model that honors degree budgets with zero topology
+  conditioning; also supplies the G2 overlap dial.
 - **TGSBM** (2601.20646): discussed in related work; if a feature-only-encoder
   re-implementation is feasible it strengthens the B5 family — otherwise document why
   its observed-edge encoder is protocol-inadmissible.
@@ -881,12 +981,24 @@ quality).
    models never do), plus feature-similarity hard negatives that need no graph;
    the construction is specified in the protocol, not left to implementation.
    Degree-corrected negative sampling per the implicit degree bias result ⊕
-   (2405.14985); hard-negative *training* (not only evaluation) as an arm [DA alt-4].
-2. **MMD hygiene** (2201.09871, O'Bray 2106.01098 ⊕, 2512.14241): disclose kernel
-   family and bandwidth rule per statistic; bandwidth sweeps; never aggregate MMDs
-   naively — "graph similarity" gets a published definition (gate G1) with components
-   always reported; bootstrap variance over buckets/seeds; the real-vs-real noise
-   floor as the zero line.
+   (2405.14985): evaluation negatives sampled with the positives' degree bias
+   (`p(k) ∝ k·p(k)/⟨k⟩`), and gate G1 re-verifies the E2 gap under degree-corrected
+   negatives explicitly, alongside HeaRT negatives; degree-corrected *training*
+   negatives (their finding: reduces degree overfitting) fold into the hard-negative
+   training arm [DA alt-4].
+2. **MMD hygiene** (2201.09871, O'Bray 2106.01098 ⊕, 2512.14241): disclose per
+   statistic the descriptor function, **bin count/binning rule**, kernel family, and
+   every parameter (O'Bray's Table 1: three SOTA papers used three different kernels
+   with different σ and bins — numbers are incomparable otherwise); avoid ad-hoc
+   EMD-/TV-based "kernels" unless justified; parameter sweeps over the O'Bray ranges;
+   never aggregate MMDs naively — "graph similarity" gets a published definition
+   (gate G1) **that passes an expressivity/robustness perturbation check** (metric
+   increases monotonically under controlled perturbation of real graphs; bounded
+   response to small perturbations) before it ranks anything; components always
+   reported; bootstrap variance over buckets/seeds; the real-vs-real noise floor as
+   the zero line. MMD is a *ported* two-sample statistic never validated as a GGM
+   evaluator — one more reason the discriminator probe and held-out family stay
+   headline.
 3. **Trained-on vs held-out metric split [R1-W7]:** metrics used inside `L_real`
    (degree/clustering/code-histogram/motif energy distances, GIN-space distance) are
    reported as *trained-on*; the **held-out family is headlined**: orbit/motif counts
@@ -897,9 +1009,12 @@ quality).
 4. **Discriminator probe** (2512.14241 pattern), promoted per R3: accuracy of a
    held-out classifier distinguishing assembled from real subgraphs; near-chance is a
    bandwidth-independent realism claim.
-5. **Stratified reporting:** edge metrics by degree (head/tail) and community
-   familiarity, harmonic-mean joint number, calibration (ECE/Brier on the §4.0
-   averaged probability).
+5. **Stratified reporting:** edge metrics by degree (head/tail), by **Topological
+   Concentration** (2310.04612 — added rev 2.2: TC correlates far better with LP
+   performance than degree, and some node-centric metrics carry intrinsic
+   degree-related bias, so degree strata alone mislead), and by community familiarity;
+   harmonic-mean joint number; calibration (ECE/Brier on the §4.0 averaged
+   probability).
 6. **Diagnostics:** Cold Brew FCR per benchmark (pre-registers where imagination has
    headroom — and where s1/s2 are predicted to beat s3, §4.4); supervision-starvation
    statistic (2310.04314) as a motivation figure.
@@ -910,7 +1025,10 @@ quality).
    calibration against true degrees, slot-adjacency vs true local clustering [R1-W4];
    (b) assembled degree-calibration curve (E[d̂_u] vs realized assembled degree)
    [R1-W3]; (c) imagined-ego-net diversity vs real neighbor diversity [R3-W10];
-   (d) mean grounding gate `g^k` trajectory [R1-W9].
+   (d) mean grounding gate `g^k` trajectory [R1-W9]; (e) **TDS-style ego-net drift**
+   [rev 2.2, 2310.04612's Topological Distribution Shift]: distributional distance
+   between imagined ego-net statistics for training-time vs test-time nodes — detects
+   the feature→ego-net map degrading under node-population shift.
 9. **Ceiling reporting:** every assembled-metric table carries the G2 edge-independence
    ceiling row and the G3 Oracle row, so all gains are read against the reachable
    frontier, not against zero.
@@ -976,29 +1094,39 @@ block-model marginals close most of the pair-to-topology gap") if the controls w
 ## 8. Key references (verified against local PDFs or the arXiv API; ⊕ = external-search addition; [venue-verify] = verify against version of record before print)
 
 Subgraph/structural LP: SEAL 1802.09691; labeling trick 2010.16103; Distance Encoding
-2009.00142 ⊕; P-GNN 1906.04817 ⊕; BUDDY/ELPH 2209.15486; NCN/NCNC 2302.00890; Neo-GNN
-2206.04216; HeaRT 2306.10453; LPFormer ⊕ 2310.11009; Topological Concentration ⊕
-2310.04612.
-KG-inductive lineage: GraIL ⊕ 1911.06962; NBFNet ⊕ 2106.06935; ULTRA ⊕ 2310.04562;
-IGMC ⊕ 1904.12058.
-Inductive/cold-start: DEAL 2007.08053; Graph2Gauss ⊕ 1707.03815; Cold Brew 2111.04840;
-GLNN 2110.08727; DropoutNet (NeurIPS 2017); GAR (SIGIR 2022); Heater / MetaEmbedding
-[venue-verify]; GraphSAGE 1706.02216; UPNA ⊕ 2307.08877; New Node Prediction ⊕
-2401.05468; TGN ⊕ 2006.10637; TGB ⊕ 2307.01026.
+2009.00142 ⊕ (NeurIPS 2020, PDF-confirmed); P-GNN 1906.04817 ⊕ (ICML 2019,
+PDF-confirmed; positional family, distinct from labeling tricks); BUDDY/ELPH
+2209.15486; NCN/NCNC 2302.00890; Neo-GNN 2206.04216; HeaRT 2306.10453; LPFormer ⊕
+2310.11009 (KDD 2024, ACM DOI confirmed); Topological Concentration ⊕ 2310.04612
+(preprint — venue-check before print).
+KG-inductive lineage: GraIL ⊕ 1911.06962 (ICML 2020; local PDF is the arXiv preprint —
+check page-level quotes against PMLR); NBFNet ⊕ 2106.06935 (NeurIPS 2021,
+PDF-confirmed); ULTRA ⊕ 2310.04562 (ICLR 2024, PDF-confirmed); IGMC ⊕ 1904.12058
+(ICLR 2020; local PDF is arXiv v3 — check quotes against OpenReview).
+Inductive/cold-start: DEAL 2007.08053; Graph2Gauss ⊕ 1707.03815 (ICLR 2018); Cold Brew
+2111.04840; GLNN 2110.08727; DropoutNet (NeurIPS 2017); GAR (SIGIR 2022); Heater
+[venue-verify]; Meta-Embedding ⊕ 1904.11547 (SIGIR 2019, PDF-confirmed — tag cleared);
+GraphSAGE 1706.02216; UPNA ⊕ 2307.08877 (preprint, under review — no venue); New Node
+Prediction ⊕ 2401.05468 (arXiv preprint, submitted to Information Sciences — no
+venue); TGN ⊕ 2006.10637 (cite as arXiv); TGB ⊕ 2307.01026 (NeurIPS 2023 D&B,
+PDF-confirmed).
 Structure learning: LDS 1903.11960; IDGL 2006.13009; DGM 2002.04999; SUBLIME
 2201.06367; NodeFormer 2306.08385; DCM 2305.16174; LGI-LS 2310.04314; SE-GSL
 2303.09778; GSR 2211.06545; MoG 2405.14260; Manenti et al. 2405.19933; Pro-GNN
 2005.10203; STABLE 2207.00012.
 Generation: GraphRNN 1802.08773; GDSS 2202.02514; DiGress 2209.14734; EDGE 2305.04111;
 Latent Graph Diffusion 2402.02518 [venue-verify the main-text task coverage claim];
-SID/CID 2503.21592; HiGGs ⊕ 2306.11412; FLEX ⊕ 2507.11710; NRI ⊕ 1802.04687.
-Edge-independence bound: Chanpuriya et al. ⊕ 2111.00048; Rendsburg et al. "NetGAN
-without GAN" ⊕ [venue-verify].
+SID/CID 2503.21592; HiGGs ⊕ 2306.11412 (cite as arXiv — main-track NeurIPS acceptance
+unconfirmed); FLEX ⊕ 2507.11710 (preprint, under review — full-text verified rev 2.2);
+NRI ⊕ 1802.04687 (ICML 2018, full-text verified).
+Edge-independence bound: Chanpuriya et al. ⊕ 2111.00048 (NeurIPS 2021, full-text
+verified rev 2.2 — exact identities and tightness theorems as quoted in §6.0-G2);
+Rendsburg et al. "NetGAN without GAN" ⊕ [venue-verify].
 Neighbor generation: LA-GNN 2109.03856; GraphSMOTE 2103.08826; Feature Propagation
 2111.12128.
 Community priors/codebooks: NOCD 1909.12201; Modularity-Aware GAE 2202.00961; TGSBM
 2601.20646; VQGraph 2308.02117; GFT 2411.06070; SIG-VAE 1908.07078; HoscPool
-2209.03473 (venue: CIKM 2022 — local filename says ICML; flagged for library cleanup);
+2209.03473 (venue: CIKM 2022);
 MinCutPool 1907.00481; DiffPool 1806.08804; DC-SBM: Karrer & Newman 2011 ⊕; latent
 space models: Hoff, Raftery & Handcock 2002 ⊕; ERGM goodness-of-fit: Hunter, Goodreau
 & Handcock 2008 ⊕ (classical, pre-arXiv — cite from JASA).
