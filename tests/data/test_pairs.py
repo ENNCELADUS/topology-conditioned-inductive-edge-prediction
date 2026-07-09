@@ -53,6 +53,18 @@ def _canonical(pair: tuple[str, str]) -> tuple[str, str]:
     return (u, v) if u <= v else (v, u)
 
 
+class _CountingFeatureStore(FeatureStore):
+    """``FeatureStore`` spy that counts ``load_tokens`` calls, for memoization tests."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.load_tokens_calls = 0
+
+    def load_tokens(self, node_id: str) -> torch.Tensor:
+        self.load_tokens_calls += 1
+        return super().load_tokens(node_id)
+
+
 class TestTokenPairDataset:
     def test_getitem_returns_expected_keys_and_shapes(self, tmp_path: Path) -> None:
         shapes = {"node_000001": (5, 4), "node_000002": (3, 4)}
@@ -133,6 +145,25 @@ class TestProbeLengths:
             lengths = probe_lengths(store, pairs)
 
         assert lengths == [(5, 3), (3, 7)]
+
+    def test_memoizes_loads_per_unique_node(self, tmp_path: Path) -> None:
+        shapes = {
+            "node_000001": (5, 4),
+            "node_000002": (3, 4),
+            "node_000003": (7, 4),
+        }
+        root = _write_feature_root(tmp_path, shapes, input_dim=4)
+        store = _CountingFeatureStore(root)
+        pairs = [
+            ("node_000001", "node_000002"),
+            ("node_000001", "node_000003"),
+            ("node_000002", "node_000003"),
+        ]
+
+        lengths = probe_lengths(store, pairs)
+
+        assert lengths == [(5, 3), (5, 7), (3, 7)]
+        assert store.load_tokens_calls == 3
 
 
 class TestCollateTokenPairs:
@@ -232,15 +263,23 @@ class TestLengthBucketedBatchSampler:
 
         assert sorted(seen) == list(range(len(lengths)))
 
-    def test_batch_max_length_within_bucket_boundary(self) -> None:
-        lengths = [(10, 20), (300, 100), (500, 100), (1000, 50)] * 3
+    def test_batches_never_mix_assigned_buckets(self) -> None:
+        # Spans 4 distinct buckets (128, 256, 512, 1024) so that a sampler which
+        # ignored bucket assignment (e.g. one big pool shuffled and sliced by cap)
+        # would produce batches mixing items from different buckets and fail below.
+        lengths = [(10, 20), (200, 50), (500, 50), (900, 50)] * 5
         sampler = LengthBucketedBatchSampler(lengths, token_budget=131_072, seed=0, epoch=0)
 
+        def assigned_bucket(index: int) -> int:
+            max_len = max(lengths[index])
+            return min(b for b in BUCKET_BOUNDARIES if b >= max_len)
+
         for batch in sampler:
-            batch_max = max(max(lengths[i]) for i in batch)
-            boundary = min(b for b in BUCKET_BOUNDARIES if b >= batch_max)
+            assigned = {assigned_bucket(i) for i in batch}
+            assert len(assigned) == 1, f"batch mixes buckets: {assigned}"
+            shared_boundary = next(iter(assigned))
             for i in batch:
-                assert max(lengths[i]) <= boundary
+                assert max(lengths[i]) <= shared_boundary
 
     def test_batch_size_respects_token_budget_cap(self) -> None:
         lengths = [(100, 100)] * 50

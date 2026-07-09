@@ -87,6 +87,11 @@ class TokenPairDataset(Dataset[dict[str, torch.Tensor]]):
 def probe_lengths(store: FeatureStore, pairs: Sequence[tuple[str, str]]) -> list[tuple[int, int]]:
     """Compute ``(L_a, L_b)`` per pair by lazily loading each tensor's shape.
 
+    Each unique node id is loaded at most once: a ``node_id -> length`` cache is
+    populated as nodes are first seen, so a pair list with heavy node reuse (the
+    common case — every node appears in many pairs) costs one tensor load per
+    unique node rather than one load per pair-endpoint.
+
     Args:
         store: Feature store to load raw token sequences from.
         pairs: Sequence of ``(node_a, node_b)`` id pairs.
@@ -94,14 +99,22 @@ def probe_lengths(store: FeatureStore, pairs: Sequence[tuple[str, str]]) -> list
     Returns:
         A list of ``(L_a, L_b)`` lengths, one per pair, in the same order as ``pairs``.
     """
-    lengths: list[tuple[int, int]] = []
-    for i, (node_a, node_b) in enumerate(pairs):
-        len_a = int(store.load_tokens(node_a).size(0))
-        len_b = int(store.load_tokens(node_b).size(0))
-        lengths.append((len_a, len_b))
-        if (i + 1) % 1000 == 0:
-            logger.info("probe_lengths: processed %d/%d pairs", i + 1, len(pairs))
-    return lengths
+    unique_node_count = len({node for pair in pairs for node in pair})
+    node_lengths: dict[str, int] = {}
+
+    def length_of(node_id: str) -> int:
+        cached = node_lengths.get(node_id)
+        if cached is not None:
+            return cached
+        value = int(store.load_tokens(node_id).size(0))
+        node_lengths[node_id] = value
+        if len(node_lengths) % 1000 == 0:
+            logger.info(
+                "probe_lengths: loaded %d/%d unique nodes", len(node_lengths), unique_node_count
+            )
+        return value
+
+    return [(length_of(node_a), length_of(node_b)) for node_a, node_b in pairs]
 
 
 class LengthBucketedBatchSampler(Sampler[list[int]]):
