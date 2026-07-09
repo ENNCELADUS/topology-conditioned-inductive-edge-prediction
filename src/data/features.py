@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
@@ -142,6 +143,11 @@ def build_f0_matrix(
     index = {node_id: i for i, node_id in enumerate(resolved_node_ids)}
 
     if cache_path is not None:
-        torch.save({"matrix": matrix, "node_ids": resolved_node_ids}, cache_path)
+        # Concurrent writers (e.g. Slurm array tasks sharing a default cache path) must
+        # never expose a partially-written file to readers: write to a per-process temp
+        # file in the same directory, then atomically replace.
+        tmp_path = cache_path.with_name(f"{cache_path.name}.tmp-{os.getpid()}")
+        torch.save({"matrix": matrix, "node_ids": resolved_node_ids}, tmp_path)
+        os.replace(tmp_path, cache_path)
 
     return matrix, index
