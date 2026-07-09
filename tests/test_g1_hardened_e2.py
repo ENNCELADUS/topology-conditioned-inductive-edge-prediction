@@ -14,6 +14,7 @@ import pytest
 import torch
 from src.data.features import FeatureStore
 from src.eval.composite import PerturbationCheckResult
+from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.experiments import g1_hardened_e2 as g1
 from src.score_universe import load_scores, save_scores
 
@@ -461,6 +462,221 @@ class TestSelectHardFeature:
         neg_idx = np.flatnonzero(labels == 0)
         selected = g1.select_hard_feature(neg_idx, u_idx, v_idx, _NODES, store, 31)
         assert np.all(labels[selected] == 0)
+
+
+# --------------------------------------------------------------------------- regime dispatch
+# (evaluate_regime_table / select_negative_indices): the four selector functions above are
+# each independently well tested, but the layer that wires
+# labels -> neg_idx -> regime dispatch -> compute_edge_metrics was not directly exercised.
+# Mutation testing showed changing `labels == 0` to `labels >= 0` in
+# `evaluate_regime_table` (which would let positive-labeled rows leak into every regime's
+# negative pool) passed the full suite. The tests below target exactly that wiring.
+
+
+class TestSelectNegativeIndicesDispatch:
+    def test_dispatches_to_each_regime_matching_direct_call(self, tmp_path: Path) -> None:
+        pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
+        u_idx = np.array([_NODES.index(u) for u, _ in pairs], dtype=np.int32)
+        v_idx = np.array([_NODES.index(v) for _, v in pairs], dtype=np.int32)
+        neg_idx = np.flatnonzero(labels == 0)
+        g = _make_reference_graph()
+        degree_array = g1._degree_array(g, _NODES)
+        store = FeatureStore(_write_feature_root(tmp_path))
+        f0_cache = tmp_path / "f0_cache.pt"
+        seed = 9
+        n = 6
+
+        expected_easy = g1.select_easy_uniform(neg_idx, n, seed=seed)
+        got_easy = g1.select_negative_indices(
+            "easy_uniform",
+            neg_idx=neg_idx,
+            u_idx=u_idx,
+            v_idx=v_idx,
+            node_ids=_NODES,
+            degree_array=degree_array,
+            g_simple=g,
+            store=store,
+            f0_cache=f0_cache,
+            n=n,
+            seed=seed,
+        )
+        np.testing.assert_array_equal(got_easy, expected_easy)
+
+        expected_degree = g1.select_degree_corrected(
+            neg_idx, u_idx, v_idx, degree_array, n, seed=seed
+        )
+        got_degree = g1.select_negative_indices(
+            "degree_corrected",
+            neg_idx=neg_idx,
+            u_idx=u_idx,
+            v_idx=v_idx,
+            node_ids=_NODES,
+            degree_array=degree_array,
+            g_simple=g,
+            store=store,
+            f0_cache=f0_cache,
+            n=n,
+            seed=seed,
+        )
+        np.testing.assert_array_equal(got_degree, expected_degree)
+
+        expected_heuristic = g1.select_hard_heuristic(neg_idx, u_idx, v_idx, _NODES, g, n)
+        got_heuristic = g1.select_negative_indices(
+            "hard_heuristic",
+            neg_idx=neg_idx,
+            u_idx=u_idx,
+            v_idx=v_idx,
+            node_ids=_NODES,
+            degree_array=degree_array,
+            g_simple=g,
+            store=store,
+            f0_cache=f0_cache,
+            n=n,
+            seed=seed,
+        )
+        np.testing.assert_array_equal(got_heuristic, expected_heuristic)
+
+        expected_feature = g1.select_hard_feature(
+            neg_idx, u_idx, v_idx, _NODES, store, n, cache_path=f0_cache
+        )
+        got_feature = g1.select_negative_indices(
+            "hard_feature",
+            neg_idx=neg_idx,
+            u_idx=u_idx,
+            v_idx=v_idx,
+            node_ids=_NODES,
+            degree_array=degree_array,
+            g_simple=g,
+            store=store,
+            f0_cache=f0_cache,
+            n=n,
+            seed=seed,
+        )
+        np.testing.assert_array_equal(got_feature, expected_feature)
+
+    def test_unknown_regime_raises(self) -> None:
+        pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
+        u_idx = np.array([_NODES.index(u) for u, _ in pairs], dtype=np.int32)
+        v_idx = np.array([_NODES.index(v) for _, v in pairs], dtype=np.int32)
+        neg_idx = np.flatnonzero(labels == 0)
+        g = _make_reference_graph()
+        degree_array = g1._degree_array(g, _NODES)
+        with pytest.raises(ValueError, match="unknown regime"):
+            g1.select_negative_indices(
+                "not_a_regime",
+                neg_idx=neg_idx,
+                u_idx=u_idx,
+                v_idx=v_idx,
+                node_ids=_NODES,
+                degree_array=degree_array,
+                g_simple=g,
+                store=None,
+                f0_cache=None,
+                n=3,
+                seed=0,
+            )
+
+    def test_hard_feature_without_store_raises(self) -> None:
+        pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
+        u_idx = np.array([_NODES.index(u) for u, _ in pairs], dtype=np.int32)
+        v_idx = np.array([_NODES.index(v) for _, v in pairs], dtype=np.int32)
+        neg_idx = np.flatnonzero(labels == 0)
+        g = _make_reference_graph()
+        degree_array = g1._degree_array(g, _NODES)
+        with pytest.raises(ValueError, match="FeatureStore"):
+            g1.select_negative_indices(
+                "hard_feature",
+                neg_idx=neg_idx,
+                u_idx=u_idx,
+                v_idx=v_idx,
+                node_ids=_NODES,
+                degree_array=degree_array,
+                g_simple=g,
+                store=None,
+                f0_cache=None,
+                n=3,
+                seed=0,
+            )
+
+
+class TestEvaluateRegimeTableDispatch:
+    def test_no_regime_leaks_positives_and_counts_are_exact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
+        u_idx = np.array([_NODES.index(u) for u, _ in pairs], dtype=np.int32)
+        v_idx = np.array([_NODES.index(v) for _, v in pairs], dtype=np.int32)
+        g = _make_reference_graph()
+        rng = np.random.default_rng(0)
+        probs = rng.random(len(pairs))
+        store = FeatureStore(_write_feature_root(tmp_path))
+        n_pos_true = int((labels == 1).sum())
+        n_neg_true = int((labels == 0).sum())
+
+        # Regime names/ratios pinned here to fix the call order we zip against
+        # `captured` below; if the production constants ever reorder, this
+        # assertion catches it rather than silently misaligning the zip.
+        regimes = ("easy_uniform", "degree_corrected", "hard_heuristic", "hard_feature")
+        assert regimes == g1._REGIME_NAMES
+        ratios = (1, 5)
+        assert ratios == g1._RATIOS
+
+        captured: list[np.ndarray] = []
+
+        def _spy(row_labels: np.ndarray, row_probs: np.ndarray, *, threshold: float) -> EdgeMetrics:
+            captured.append(np.array(row_labels))
+            # Call the real, directly-imported implementation (not `g1.compute_edge_metrics`,
+            # which this monkeypatch is about to shadow) so the pipeline's actual output is
+            # unaffected -- this spy only observes the labels array each regime/ratio builds.
+            return compute_edge_metrics(row_labels, row_probs, threshold=threshold)
+
+        monkeypatch.setattr(g1, "compute_edge_metrics", _spy)
+
+        table = g1.evaluate_regime_table(
+            labels=labels,
+            probs=probs,
+            u_idx=u_idx,
+            v_idx=v_idx,
+            node_ids=_NODES,
+            g_ref=g,
+            store=store,
+            f0_cache=tmp_path / "f0_cache.pt",
+            seed=11,
+        )
+
+        assert set(table.keys()) == {*regimes, "full_universe"}
+        # 4 regimes x 2 ratios + 1 unsampled full_universe call.
+        assert len(captured) == len(regimes) * len(ratios) + 1
+
+        call_iter = iter(captured)
+        for regime in regimes:
+            assert set(table[regime].keys()) == {f"ratio_{r}" for r in ratios}
+            for ratio in ratios:
+                metrics = table[regime][f"ratio_{ratio}"]
+                expected_n_neg = min(ratio * n_pos_true, n_neg_true)
+
+                # n_pos/n_neg counts are exactly right for every regime x ratio.
+                assert metrics.n_pos == n_pos_true, (regime, ratio)
+                assert metrics.n_neg == expected_n_neg, (regime, ratio)
+
+                # Row-level: pos_idx (unaffected by any negative-selection bug)
+                # always occupies the first n_pos_true slots of the array handed
+                # to compute_edge_metrics; everything after that is the regime's
+                # negative selection and must be label 0 -- i.e. no positive row
+                # was ever selected as a "negative" by the dispatch layer. This
+                # is the exact invariant a `labels == 0` -> `labels >= 0` typo
+                # in `evaluate_regime_table` would break.
+                row_labels = next(call_iter)
+                assert row_labels.shape[0] == n_pos_true + expected_n_neg
+                assert np.all(row_labels[:n_pos_true] == 1), (regime, ratio)
+                assert np.all(row_labels[n_pos_true:] == 0), (regime, ratio)
+
+        # full_universe: unsampled, covers every labeled row exactly once.
+        full_metrics = table["full_universe"]["all"]
+        assert full_metrics.n_pos == n_pos_true
+        assert full_metrics.n_neg == n_neg_true
+        full_row_labels = next(call_iter)
+        assert full_row_labels.shape[0] == n_pos_true + n_neg_true
 
 
 # --------------------------------------------------------------------------- PA-null
