@@ -698,6 +698,76 @@ def evaluate_regime_table(
     return result
 
 
+# --------------------------------------------------------------------------- self-pair edge metrics
+
+
+@dataclass(frozen=True)
+class SelfPairEdgeMetrics:
+    """Edge metrics computed over only the self-pair (``u_idx == v_idx``) rows.
+
+    Self-pairs are legal, meaningful universe rows -- a self-pair is positive iff
+    that node carries a self-loop in the reference test graph (spec Sec 9.4) --
+    but they are excluded from every regime table and from the density-matched
+    assembly quota. This is the dedicated slice reporting how well a scorer
+    separates them.
+
+    Attributes:
+        n: Number of labeled (``label in {0, 1}``) self-pair rows evaluated.
+        n_pos: Number of positive-labeled (self-loop) self-pair rows among `n`.
+        metrics: `EdgeMetrics` (as a plain dict) at threshold 0.5, or ``None`` if
+            the self-pair rows are single-class (degenerate -- AUROC/AUPRC/MCC
+            are undefined).
+        reason: ``None`` when `metrics` is present; otherwise why it could not be
+            computed.
+    """
+
+    n: int
+    n_pos: int
+    metrics: dict[str, float | int] | None
+    reason: str | None
+
+
+def compute_self_pair_edge_metrics(
+    labels: NDArray[np.int8],
+    probs: NDArray[np.float64],
+    u_idx: NDArray[np.int32],
+    v_idx: NDArray[np.int32],
+    *,
+    threshold: float = _EDGE_METRIC_THRESHOLD,
+) -> SelfPairEdgeMetrics:
+    """Compute edge metrics restricted to self-pair (``u_idx == v_idx``) rows.
+
+    Args:
+        labels: Full-universe label array (``-1`` rows are excluded, matching
+            `evaluate_regime_table`'s convention).
+        probs: Full-universe probability array for one scorer, aligned with `labels`.
+        u_idx: Full-universe ``u_idx`` array.
+        v_idx: Full-universe ``v_idx`` array.
+        threshold: Decision threshold forwarded to `compute_edge_metrics`.
+
+    Returns:
+        A `SelfPairEdgeMetrics`. `compute_edge_metrics` raises on single-class
+        labels rather than emit NaN; that exception is caught here and converted
+        into a disclosed null (`metrics=None`, `reason=str(exc)`) instead of
+        propagating.
+    """
+    self_mask = (u_idx == v_idx) & ((labels == 0) | (labels == 1))
+    self_labels = labels[self_mask].astype(np.int64)
+    self_probs = probs[self_mask]
+    n = int(self_mask.sum())
+    n_pos = int(np.sum(self_labels == 1))
+    try:
+        metrics = compute_edge_metrics(self_labels, self_probs, threshold=threshold)
+    except ValueError as exc:
+        return SelfPairEdgeMetrics(n=n, n_pos=n_pos, metrics=None, reason=str(exc))
+    metrics_dict = cast(dict[str, float | int], dataclasses.asdict(metrics))
+    return SelfPairEdgeMetrics(n=n, n_pos=n_pos, metrics=metrics_dict, reason=None)
+
+
+def _self_pair_edge_metrics_to_dict(value: SelfPairEdgeMetrics) -> dict[str, object]:
+    return dataclasses.asdict(value)
+
+
 # --------------------------------------------------------------------------- threshold sweep
 
 
@@ -769,10 +839,19 @@ def run_threshold_sweep(
     Returns:
         ``(operating_point_threshold, sweep_rows)``, `sweep_rows` sorted by
         ascending threshold.
+
+    Convention:
+        `operating_point` is density-matched on non-self-pair rows
+        (``u_idx != v_idx``) against `target_edges` (the simple, self-loop-
+        stripped reference edge count) -- self-pairs never consume quota meant
+        for real edges. Self-pairs still assemble as self-loops at that same
+        threshold (never dropped) and are reported via `compute_self_loop_stats`
+        in each `SweepRow`.
     """
     g_ref_simple = strip_self_loops(g_ref)
     target_edges = g_ref_simple.number_of_edges()
-    operating_point = density_matched_threshold(probs, target_edges)
+    non_self_mask = universe.u_idx != universe.v_idx
+    operating_point = density_matched_threshold(probs[non_self_mask], target_edges)
     grid = build_threshold_grid(probs, operating_point)
 
     pairs = list(universe.pairs())
@@ -946,6 +1025,9 @@ class G1Result:
         regime_table: Scorer key (``"b0"``, optionally ``"b0_alt"``, ``"pa_null"``)
             -> regime edge-metric table.
         assembled: Scorer key -> `AssembledRow`, JSON-encoded.
+        self_pair_edge_metrics: Scorer key -> `SelfPairEdgeMetrics`, JSON-encoded
+            (spec Sec 9.4 self/non-self split; ``"b0_alt"`` is ``None`` when no
+            B0-alt artifact was supplied).
         degree_heterogeneity_sigma: `std(log(k))` over `k >= 1` on `g_ref`.
         positive_rate: Measured positive rate over the full candidate universe.
     """
@@ -956,6 +1038,7 @@ class G1Result:
     threshold_sweep: dict[str, object]
     regime_table: dict[str, object]
     assembled: dict[str, object]
+    self_pair_edge_metrics: dict[str, object]
     degree_heterogeneity_sigma: float
     positive_rate: float
 
@@ -968,6 +1051,7 @@ class G1Result:
             "threshold_sweep": self.threshold_sweep,
             "regime_table": self.regime_table,
             "assembled": self.assembled,
+            "self_pair_edge_metrics": self.self_pair_edge_metrics,
             "degree_heterogeneity_sigma": self.degree_heterogeneity_sigma,
             "positive_rate": self.positive_rate,
         }
@@ -1209,9 +1293,35 @@ def run_g1_pipeline(
     )
     sigma = degree_heterogeneity_sigma(g_ref)
 
+    self_pair_metrics: dict[str, object] = {
+        "b0": _self_pair_edge_metrics_to_dict(
+            compute_self_pair_edge_metrics(universe.label, probs, universe.u_idx, universe.v_idx)
+        ),
+        "b0_alt": (
+            _self_pair_edge_metrics_to_dict(
+                compute_self_pair_edge_metrics(
+                    universe.label, alt_probs, universe.u_idx, universe.v_idx
+                )
+            )
+            if alt is not None and alt_probs is not None
+            else None
+        ),
+        "pa_null": _self_pair_edge_metrics_to_dict(
+            compute_self_pair_edge_metrics(
+                universe.label, pa_null_probs, universe.u_idx, universe.v_idx
+            )
+        ),
+    }
+
     nodes = list(g_ref.nodes())
     pairs = list(universe.pairs())
     target_edges = strip_self_loops(g_ref).number_of_edges()
+    # Self-pairs (u_idx == v_idx) never consume the density-matched quota: the
+    # quota is matched against target_edges, the SIMPLE (self-loop-stripped)
+    # reference edge count, so only non-self rows may count toward it. Self-pairs
+    # still assemble as self-loops at whatever threshold is chosen (see
+    # `assemble_graph`, called below with the full pair/prob arrays).
+    non_self_mask = universe.u_idx != universe.v_idx
 
     b0_threshold = op_threshold
     b0_graph = assemble_graph(pairs, probs, threshold=b0_threshold, nodes=nodes)
@@ -1230,7 +1340,7 @@ def run_g1_pipeline(
         )
     }
     if alt is not None and alt_probs is not None:
-        alt_threshold = density_matched_threshold(alt_probs, target_edges)
+        alt_threshold = density_matched_threshold(alt_probs[non_self_mask], target_edges)
         alt_graph = assemble_graph(pairs, alt_probs, threshold=alt_threshold, nodes=nodes)
         assembled["b0_alt"] = _assembled_row_to_dict(
             assemble_and_evaluate(
@@ -1247,8 +1357,17 @@ def run_g1_pipeline(
     else:
         assembled["b0_alt"] = None
 
+    # PA-null's top-N candidate pool excludes self-pairs entirely: a self-pair's
+    # score is k_i * k_i (that node's maximum possible PA-null score), so leaving
+    # self-pairs in the pool would systematically pollute the top-N ranking.
+    non_self_row_idx = np.flatnonzero(non_self_mask)
     pa_null_graph = assemble_top_n_by_score(
-        pairs, universe.u_idx, universe.v_idx, pa_null_raw, target_edges, nodes
+        [pairs[i] for i in non_self_row_idx.tolist()],
+        universe.u_idx[non_self_row_idx],
+        universe.v_idx[non_self_row_idx],
+        pa_null_raw[non_self_row_idx],
+        target_edges,
+        nodes,
     )
     assembled["pa_null"] = _assembled_row_to_dict(
         assemble_and_evaluate(
@@ -1286,10 +1405,17 @@ def run_g1_pipeline(
         "threshold_policy": (
             "operating point = density_matched_threshold(own probs, target_edges = "
             "|E(strip_self_loops(test_graph))|), computed independently per scorer "
-            "(B0, B0-alt); PA-null instead takes the exact top-target_edges pairs by "
-            "s_ij with a deterministic tie-break (no threshold). Sweep grid = operating "
-            f"point plus the {_PERCENTILES} percentiles of the scorer's own probability "
-            "distribution, deduplicated and sorted."
+            "(B0, B0-alt) and density-matched on non-self-pair rows against the "
+            "simple reference edge count; self-pairs assemble at the same threshold "
+            "and are reported in the self-loop row (SweepRow.self_loop_count / "
+            "self_loop_rate), never counted toward the quota. PA-null instead takes "
+            "the exact top-target_edges pairs by s_ij among non-self pairs only, "
+            "with a deterministic tie-break (self-pairs are excluded from PA-null's "
+            "top-N candidate pool entirely, since s_ij = k_i * k_i is a self-pair's "
+            "own maximum possible score and would otherwise dominate the ranking; "
+            "no threshold is used for PA-null). Sweep grid = operating point plus "
+            f"the {_PERCENTILES} percentiles of the scorer's own probability "
+            "distribution over all rows (self-pairs included), deduplicated and sorted."
         ),
         "seed": seed,
         "regime_construction": {
@@ -1350,6 +1476,7 @@ def run_g1_pipeline(
             ),
         },
         assembled=assembled,
+        self_pair_edge_metrics=self_pair_metrics,
         degree_heterogeneity_sigma=sigma,
         positive_rate=positive_rate,
     )
@@ -1430,9 +1557,11 @@ __all__ = [
     "build_parser",
     "build_threshold_grid",
     "calibrate_tau",
+    "SelfPairEdgeMetrics",
     "common_neighbor_and_adamic_adar",
     "compute_pa_null_scores",
     "compute_self_loop_stats",
+    "compute_self_pair_edge_metrics",
     "degree_heterogeneity_sigma",
     "evaluate_regime_table",
     "load_test_graph",

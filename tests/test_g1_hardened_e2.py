@@ -145,6 +145,42 @@ def _small_buckets(
     }
 
 
+def _planted_self_pair_adversarial_universe(
+    tmp_path: Path, *, self_pair_prob: float = 0.99
+) -> tuple[Path, nx.Graph, dict[int, list[set[str]]]]:
+    """Build a 10-node universe where every self-pair scores above every true edge.
+
+    5 disjoint positive (non-self) edges at prob 0.9, every other non-self pair at
+    prob 0.1, and every one of the 10 self-pairs at `self_pair_prob` (0.99 by
+    default) -- higher than any true edge. Used to falsify the bug where a
+    density-matched quota (or a top-N selection) computed over the full universe
+    lets self-pairs steal capacity meant for real edges.
+    """
+    nodes = [f"p{i:02d}" for i in range(10)]
+    positive_edges = [
+        (nodes[0], nodes[1]),
+        (nodes[2], nodes[3]),
+        (nodes[4], nodes[5]),
+        (nodes[6], nodes[7]),
+        (nodes[8], nodes[9]),
+    ]
+    positive_set = {_canonical(u, v) for u, v in positive_edges}
+    pairs, labels = _universe_rows(nodes, positive_edges)
+    probs = np.array(
+        [self_pair_prob if u == v else (0.9 if (u, v) in positive_set else 0.1) for u, v in pairs]
+    )
+    logits = np.array([_logit_for_prob(p) for p in probs], dtype=np.float32)
+    universe_path = tmp_path / "universe.npz"
+    _write_universe_npz(
+        universe_path, node_ids=nodes, pairs=pairs, logits=logits, labels=labels, strategy="toy"
+    )
+    g = nx.Graph()
+    g.add_nodes_from(nodes)
+    g.add_edges_from(positive_edges)
+    buckets = _small_buckets(nodes, size=5, n_samples=3, seed=11)
+    return universe_path, g, buckets
+
+
 def _write_feature_root(tmp_path: Path) -> Path:
     root = tmp_path / "features"
     embeddings_dir = root / "embeddings"
@@ -702,6 +738,44 @@ class TestComputePaNullScores:
             assert scores[i] == pytest.approx(value)
 
 
+class TestComputeSelfPairEdgeMetrics:
+    def test_exact_n_and_metrics_on_mixed_class_self_pairs(self) -> None:
+        # rows 0-2 are self-pairs (u_idx == v_idx): two positive, one negative.
+        # rows 3-4 are non-self and must be excluded from the self-pair slice.
+        u_idx = np.array([0, 1, 2, 0, 1], dtype=np.int32)
+        v_idx = np.array([0, 1, 2, 1, 2], dtype=np.int32)
+        labels = np.array([1, 1, 0, 0, 1], dtype=np.int8)
+        probs = np.array([0.9, 0.8, 0.1, 0.2, 0.7])
+        result = g1.compute_self_pair_edge_metrics(labels, probs, u_idx, v_idx)
+        assert result.n == 3
+        assert result.n_pos == 2
+        assert result.reason is None
+        assert result.metrics is not None
+        assert result.metrics["n_pos"] == 2
+        assert result.metrics["n_neg"] == 1
+
+    def test_single_class_self_pairs_returns_null_with_reason(self) -> None:
+        u_idx = np.array([0, 1, 2], dtype=np.int32)
+        v_idx = np.array([0, 1, 2], dtype=np.int32)
+        labels = np.array([1, 1, 1], dtype=np.int8)  # every self-pair positive
+        probs = np.array([0.9, 0.8, 0.95])
+        result = g1.compute_self_pair_edge_metrics(labels, probs, u_idx, v_idx)
+        assert result.n == 3
+        assert result.n_pos == 3
+        assert result.metrics is None
+        assert result.reason is not None
+        assert "single-class" in result.reason
+
+    def test_unlabeled_rows_excluded_from_n(self) -> None:
+        u_idx = np.array([0, 1, 2], dtype=np.int32)
+        v_idx = np.array([0, 1, 2], dtype=np.int32)
+        labels = np.array([1, -1, 0], dtype=np.int8)  # row 1 unlabeled
+        probs = np.array([0.9, 0.5, 0.1])
+        result = g1.compute_self_pair_edge_metrics(labels, probs, u_idx, v_idx)
+        assert result.n == 2
+        assert result.n_pos == 1
+
+
 class TestNormalizeMinMax:
     def test_normalizes_into_unit_range(self) -> None:
         scores = np.array([0.0, 3.0, 9.0])
@@ -793,8 +867,64 @@ class TestRunThresholdSweep:
         assert op_row.self_loop_count == 2
         assert op_row.self_loop_rate == pytest.approx(2 / len(nodes))
 
+    def test_self_pairs_never_consume_the_operating_point_quota(self, tmp_path: Path) -> None:
+        """Confirm the operating point ignores self-pairs entirely.
+
+        Every self-pair here scores 0.99 -- above every true edge (0.9) -- so
+        the old (buggy) full-universe threshold search would have the top
+        tie-group (10 self-pairs) alone exceed target_edges=5, collapsing the
+        operating point to "just above max" and yielding 0 realized edges.
+        """
+        universe_path, g, buckets = _planted_self_pair_adversarial_universe(tmp_path)
+        universe = load_scores(universe_path)
+        nodes = sorted(g.nodes())
+
+        from src.eval.assembly import assemble_graph
+        from src.eval.graph_metrics import MMDConfig, strip_self_loops
+
+        config = MMDConfig(degree_max=10, clustering_bins=8, spectral_bins=8)
+        op_threshold, _rows = g1.run_threshold_sweep(
+            universe=universe, probs=universe.probs(), g_ref=g, buckets=buckets, config=config
+        )
+        g_pred = assemble_graph(
+            list(universe.pairs()), universe.probs(), threshold=op_threshold, nodes=nodes
+        )
+        # Exactly the 5 true (non-self) edges assemble -- the quota is untouched
+        # by the 10 self-pairs.
+        assert strip_self_loops(g_pred).number_of_edges() == 5
+        # Self-pairs are not dropped: they still clear the (lower, correctly
+        # computed) threshold and assemble as self-loops.
+        assert nx.number_of_selfloops(g_pred) == 10
+
 
 # --------------------------------------------------------------------------- assembled rows
+
+
+class TestSelfPairsExcludedFromAssembledDensityQuota:
+    def test_assembled_b0_simple_graph_hits_relative_density_near_one(self, tmp_path: Path) -> None:
+        """Full-pipeline falsification of the reviewer-flagged bug.
+
+        With self-pairs scored above every true edge, the OLD code's B0
+        operating point collapses (see TestRunThresholdSweep's sibling test),
+        so the assembled SIMPLE graph undershoots to relative_density == 0.0
+        instead of ~1.0.
+        """
+        universe_path, g, buckets = _planted_self_pair_adversarial_universe(tmp_path)
+        data_root = _write_benchmark(tmp_path, "toy", g, buckets)
+
+        payload = g1.run_g1_pipeline(
+            universe_path=universe_path,
+            alt_universe_path=None,
+            data_root=data_root,
+            strategy="toy",
+            output_dir=tmp_path / "out",
+            seed=0,
+            skip_perturbation_check=True,
+        )
+        b0_row = _d(_d(payload["assembled"])["b0"])
+        assert b0_row["relative_density"] == pytest.approx(1.0, abs=1e-6)
+        assert b0_row["self_loops_pred"] == 10
+        assert b0_row["self_loops_ref"] == 0
 
 
 class TestAssembleTopNByScore:
@@ -809,6 +939,55 @@ class TestAssembleTopNByScore:
         assert g.has_edge("a", "a")
         assert g.has_edge("a", "b")
         assert not g.has_edge("a", "c")
+
+
+class TestPaNullTopNExcludesSelfPairs:
+    def test_hub_self_pair_never_selected_into_top_n(self, tmp_path: Path) -> None:
+        """A hub's self-pair scores higher than any real edge; it must not win.
+
+        PA-null's raw score is s_ij = k_i * k_j (no smoothing), so a hub's
+        self-pair scores k_hub^2 -- strictly the largest score in the whole
+        universe for a star graph. The old (buggy) top-N call included
+        self-pairs in its candidate pool, so this hub self-pair would have
+        stolen the #1 slot from a real hub-leaf edge. The fix restricts
+        PA-null's top-N candidate pool to non-self pairs.
+        """
+        nodes = ["hub", "l1", "l2", "l3", "l4", "l5"]
+        positive_edges = [("hub", leaf) for leaf in nodes[1:]]
+        g = nx.Graph()
+        g.add_nodes_from(nodes)
+        g.add_edges_from(positive_edges)
+
+        pairs, labels = _universe_rows(nodes, positive_edges)
+        rng = np.random.default_rng(0)
+        logits = rng.normal(size=len(pairs)).astype(np.float32)
+        universe_path = tmp_path / "universe.npz"
+        _write_universe_npz(
+            universe_path,
+            node_ids=nodes,
+            pairs=pairs,
+            logits=logits,
+            labels=labels,
+            strategy="toy",
+        )
+
+        buckets = _small_buckets(nodes, size=3, n_samples=3, seed=9)
+        data_root = _write_benchmark(tmp_path, "toy", g, buckets)
+
+        payload = g1.run_g1_pipeline(
+            universe_path=universe_path,
+            alt_universe_path=None,
+            data_root=data_root,
+            strategy="toy",
+            output_dir=tmp_path / "out",
+            seed=0,
+            skip_perturbation_check=True,
+        )
+        pa_null_row = _d(_d(payload["assembled"])["pa_null"])
+        # target_edges == 5 (the 5 hub-leaf edges); with self-pairs excluded from
+        # the candidate pool, the top-5 by PA-score is exactly those 5 edges.
+        assert pa_null_row["self_loops_pred"] == 0
+        assert pa_null_row["relative_density"] == pytest.approx(1.0, abs=1e-6)
 
 
 # --------------------------------------------------------------------------- composite gating
@@ -865,6 +1044,59 @@ class TestCompositeGating:
         assert metadata["composite_valid"] is None
         assert _d(metadata["perturbation_check"])["skipped"] is True
         assert _d(_d(payload["assembled"])["b0"])["composite"] is None
+
+
+class TestThresholdPolicyMetadata:
+    def test_mentions_non_self_pair_convention(self, tmp_path: Path) -> None:
+        g = _make_reference_graph()
+        buckets = _small_buckets(_NODES, size=5, n_samples=3, seed=8)
+        data_root = _write_benchmark(tmp_path, "toy", g, buckets)
+        universe_path = _reference_universe_path(tmp_path)
+
+        payload = g1.run_g1_pipeline(
+            universe_path=universe_path,
+            alt_universe_path=None,
+            data_root=data_root,
+            strategy="toy",
+            output_dir=tmp_path / "out",
+            seed=0,
+            skip_perturbation_check=True,
+        )
+        policy = cast(str, _d(payload["metadata"])["threshold_policy"])
+        assert "non-self-pair rows" in policy
+        assert "simple reference edge count" in policy
+        assert "self-loop row" in policy
+
+
+class TestSelfPairEdgeMetricsInPipeline:
+    def test_present_per_scorer_with_exact_n_and_null_reason_on_toy_universe(
+        self, tmp_path: Path
+    ) -> None:
+        # The 8-node toy fixture's 5 positive edges never include a self-pair, so
+        # all 8 self-pairs (n1,n1)..(n8,n8) are label-0 -- single-class -> null.
+        g = _make_reference_graph()
+        buckets = _small_buckets(_NODES, size=5, n_samples=3, seed=6)
+        data_root = _write_benchmark(tmp_path, "toy", g, buckets)
+        universe_path = _reference_universe_path(tmp_path)
+
+        payload = g1.run_g1_pipeline(
+            universe_path=universe_path,
+            alt_universe_path=None,
+            data_root=data_root,
+            strategy="toy",
+            output_dir=tmp_path / "out",
+            seed=0,
+            skip_perturbation_check=True,
+        )
+        self_pair = _d(payload["self_pair_edge_metrics"])
+        assert self_pair["b0_alt"] is None
+        for scorer in ("b0", "pa_null"):
+            entry = _d(self_pair[scorer])
+            assert entry["n"] == 8
+            assert entry["n_pos"] == 0
+            assert entry["metrics"] is None
+            assert entry["reason"] is not None
+            assert "single-class" in cast(str, entry["reason"])
 
 
 # --------------------------------------------------------------------------- markdown tables
