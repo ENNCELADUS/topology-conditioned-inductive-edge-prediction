@@ -31,8 +31,17 @@ slurm/submit.sh train configs/b0.yaml
 slurm/submit.sh score -- score --checkpoint outputs/b0/best.pt \
   --pairs data/benchmark_2025_neurips/breadth_first/candidate_test_edges.txt \
   --data-root "$CLUSTER_DATA_ROOT" --strategy breadth_first --output scores/b0.npz
-slurm/submit.sh score --array 0-3 -- score ... --output scores/b0-shard.npz
-slurm/submit.sh score -- merge --output scores/b0.npz scores/b0-shard-*.npz
+
+# Sharded variant: pass the SAME --output to every array task. The CLI itself
+# derives each shard's filename from --output plus its --shard index (e.g.
+# --output scores/b0_v31_candidate.npz with --shard 2 writes
+# scores/b0_v31_candidate.shard-2.npz) — do not hand-shard the --output path.
+slurm/submit.sh score --array 0-3 -- score --checkpoint outputs/b0/best.pt \
+  --pairs data/benchmark_2025_neurips/breadth_first/candidate_test_edges.txt \
+  --data-root "$CLUSTER_DATA_ROOT" --strategy breadth_first \
+  --output scores/b0_v31_candidate.npz
+slurm/submit.sh score -- merge --inputs scores/b0_v31_candidate.shard-*.npz \
+  --output scores/b0_v31_candidate.npz
 
 # 5. Back on your local machine: pull results down
 slurm/fetch_outputs.sh             # fetches outputs/ and scores/ by default
