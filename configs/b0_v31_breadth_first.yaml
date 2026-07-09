@@ -1,0 +1,27 @@
+# B0: V3.1 frozen pairwise scorer over raw token sequences, breadth_first split.
+model:
+  family: v3_1
+  config: {} # empty -> src.model.B0.BEST_V3_1_CONFIG
+data:
+  root: data
+  strategy: breadth_first
+  train_positives: train_plus # train_plus = all train+ | e_sup = supervision split only
+  negative_ratio: 5
+  partition_seed: 0
+  token_budget: 131072
+  batch_pairs: 1024
+  num_workers: 0
+  f0_cache: outputs/f0_cache/f0_matrix.pt
+  expected_missing_features: [node_004764, node_007050]
+optim:
+  lr: 1.0e-4
+  weight_decay: 0.01
+  epochs: 30
+  warmup_steps: 500
+  grad_clip: 1.0
+eval:
+  patience: 8
+  eval_every: 1
+seed: 47
+output_dir: outputs/b0_v31
+mixed_precision: "no" # "no" | "bf16"; sbatch config uses bf16
