@@ -1,76 +1,54 @@
-# benchmark_2025_neurips Data Contract
+# benchmark_2025_neurips Data
 
-This repository does not store concrete benchmark artifacts. The benchmark is
-defined as a neutral graph ML task interface so the paper and implementation
-remain dataset-agnostic.
+This directory contains the local artifact package for `benchmark_2025_neurips`,
+a neutral graph ML benchmark for inductive binary edge prediction.
 
-## Task
+All model-facing node IDs are opaque IDs in the form `node_000001`. The original
+source identifiers are not stored in this repository.
 
-Given two unseen nodes with frozen feature vectors, predict a binary edge label
-for the queried pair. Predictions over a held-out candidate-pair universe are
-assembled into a graph and evaluated with both edge-level and graph-level
-metrics.
-
-## Required Inputs
-
-An implementation should provide the following artifacts outside this repository:
-
-| Artifact | Format | Role |
-|---|---|---|
-| Node features | tensor or array store keyed by opaque node ID | Frozen input representation for every node used by the benchmark. |
-| Split metadata | structured file | Train, validation, and test node membership. |
-| Train pairs | tabular edge list | Labeled pairs for model fitting. |
-| Validation pairs | tabular edge list | Labeled pairs for threshold selection and early stopping. |
-| Test candidate pairs | tabular edge list | Held-out candidate universe for final edge scoring. |
-| Train reference graph | graph object or edge list | Training-only topology available for topology-aware supervision. |
-| Test reference graph | graph object or edge list | Held-out graph used only by the evaluator. |
-| Evaluation node buckets | structured file | Node subsets used for assembled-graph metrics. |
-
-Node IDs must be opaque benchmark IDs, for example `node_000001`, and must not
-encode domain-specific source identifiers.
-
-## Expected Pair File Schema
-
-Pair files use one record per line:
+## Layout
 
 ```text
-node_id_a<TAB>node_id_b<TAB>label
+benchmark_2025_neurips/
+  graph.pkl
+  positive_edges.txt
+  breadth_first/
+  depth_first/
+  random_walk/
+features/
+  frozen_node_features_1024/
+    index.json
 ```
 
-`label` is `1` for a positive edge and `0` for a negative edge. Candidate-pair
-files used only for inference may omit `label` when labels are stored separately
-for the evaluator.
+`graph.pkl` is the full reference graph for offline split construction and audit
+work. `positive_edges.txt` is the global positive edge list used by negative
+sampling and split-level consistency checks.
 
-## Model Output
+`features/frozen_node_features_1024/index.json` maps neutral node IDs to cached
+feature tensor paths. The tensor paths are left unchanged because they are
+content-addressed cache paths and do not expose source node IDs.
 
-Models should emit one score per queried pair:
+Each split-strategy directory contains:
 
-```text
-node_id_a<TAB>node_id_b<TAB>score
-```
+| File | Role |
+|---|---|
+| `split.pkl` | Node membership for the split strategy. |
+| `train_edges.txt` | Labeled train pairs. |
+| `val_edges.txt` | Labeled validation pairs. |
+| `test_edges.txt` | Labeled test pairs. |
+| `train_edges_ratio5_exclusive.txt` | Explicit train supervision with a 1:5 positive-to-negative ratio. |
+| `val_edges_ratio5_exclusive.txt` | Explicit validation supervision with a 1:5 positive-to-negative ratio. |
+| `test_edges_ratio5_exclusive.txt` | Explicit test supervision with a 1:5 positive-to-negative ratio. |
+| `candidate_test_edges.txt` | Candidate-pair universe for held-out assembled-graph evaluation. |
+| `train_graph.pkl` | Reference graph over train nodes for topology-aware supervision. |
+| `test_graph.pkl` | Held-out reference graph for final assembled-graph evaluation. |
+| `test_node_buckets.pkl` | Node buckets used for assembled-graph metrics. |
 
-`score` is a calibrated or rankable edge probability in `[0, 1]`. The evaluator
-may additionally consume a thresholded prediction column when reporting
-operating-point metrics.
+## Contract
 
-## Evaluation Outputs
-
-Every benchmark run must report:
-
-- Edge-level metrics: AUROC, AUPRC, accuracy, precision, recall, F1, MCC, and
-  calibration when probabilities are used.
-- Assembled-graph metrics: graph similarity, relative density, degree-distribution
-  MMD, clustering-coefficient MMD, and Laplacian-spectrum MMD.
-- Metadata: split name, node-feature source, scorer checkpoint, threshold policy,
-  random seed, and candidate-universe definition.
-
-## Integrity Rules
-
-- Train and test nodes must be disjoint.
-- Retrieval, scaffold construction, and training must not access held-out graph
+- Treat node IDs as opaque strings.
+- Train and test nodes are disjoint under each split strategy.
+- Training, retrieval, and scaffold construction must not access held-out graph
   structure.
-- The queried edge must be masked from any local scaffold used to score that
-  query.
-- Edge-level and assembled-graph metrics must be reported together.
-- Concrete source data, domain IDs, and domain-specific filenames should not be
-  committed to this repository.
+- Report edge-level metrics and assembled-graph metrics together.
+- Keep model-facing file and folder names domain-neutral.

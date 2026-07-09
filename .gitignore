@@ -1,2 +1,62 @@
-literature/**/*.pdf
+# OS and editor noise
 .DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local tool state
+.claude/
+.codex/
+
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtual environments and local config
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Packaging/build outputs
+build/
+dist/
+*.egg-info/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Data and generated benchmark artifacts
+data/
+datasets/
+
+# PyTorch/deep-learning runtime artifacts
+checkpoints/
+ckpts/
+outputs/
+runs/
+logs/
+wandb/
+mlruns/
+lightning_logs/
+tensorboard/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.h5
+
+# Local literature cache
+literature/**/*.pdf
