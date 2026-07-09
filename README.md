@@ -90,8 +90,12 @@ fixable by threshold tuning alone.
 
 ## The Proposed Method (EgoStitch)
 
-> **Status: awaiting approval.** Treat the architecture as a proposal, not settled design,
-> until sign-off. Spec: [`docs/04-model-proposal.md`](docs/04-model-proposal.md).
+> **Status: approved (2026-07-09).** Design proposal approved and gate G4 signed off —
+> [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) is the active implementation
+> contract (algorithm spec + benchmark/data contract + DDP execution design). Design
+> rationale: [`docs/04-model-proposal.md`](docs/04-model-proposal.md); review record:
+> [`docs/05-review-report.md`](docs/05-review-report.md). Pre-implementation gates G1–G3
+> must still pass before model code is written.
 
 For each queried pair `(i, j)`, each endpoint **imagines its own ego-network** (latent
 neighbor nodes with existence probabilities, local adjacency, and a degree budget)
@@ -120,8 +124,10 @@ CLAUDE.md                        binding constraints for agents (read this first
 docs/
   01-blueprint.md                top-level paper blueprint + locked decisions
   02-methodology.md              abstract method contract + training objective
-  03-experiment-protocol.md      run/eval contract: baselines, E1–E7, metrics  ← implementation spec
-  04-model-proposal.md           EgoStitch model  (AWAITING APPROVAL)
+  03-experiment-protocol.md      run/eval contract: baselines, E1–E7, metrics, gates G1–G5
+  04-model-proposal.md           EgoStitch model rationale  (APPROVED 2026-07-09)
+  05-review-report.md            novelty check + 5-persona review record
+  06-egostitch-spec.md           algorithm + data + DDP spec  ← implementation contract (G4 signed off)
   lit-review-plan.md             review plan, claims K1–K5, terminology guardrail
   results/
     E2-pair-to-topology-gap.md   the motivating result note
@@ -151,9 +157,10 @@ general graph-ML benchmark. Don't substitute real dataset names unless asked.
 | 1 | [`docs/01-blueprint.md`](docs/01-blueprint.md) | Paper blueprint; **§10 Locked Decisions** are fixed |
 | 2 | [`docs/02-methodology.md`](docs/02-methodology.md) | Method contract + training objective |
 | 3 | [`docs/03-experiment-protocol.md`](docs/03-experiment-protocol.md) | **Source of truth** for what to run and how to grade it |
-| 4 | [`docs/04-model-proposal.md`](docs/04-model-proposal.md) | EgoStitch (awaiting approval) |
-| 5 | [`docs/results/E2-pair-to-topology-gap.md`](docs/results/E2-pair-to-topology-gap.md) | Motivating result |
-| 6 | [`docs/lit-review-plan.md`](docs/lit-review-plan.md) | Review plan, claims, terminology guardrail |
+| 4 | [`docs/04-model-proposal.md`](docs/04-model-proposal.md) | EgoStitch rationale (approved 2026-07-09) |
+| 5 | [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) | **Implementation contract**: algorithm, data/batch contract, DDP design |
+| 6 | [`docs/results/E2-pair-to-topology-gap.md`](docs/results/E2-pair-to-topology-gap.md) | Motivating result |
+| 7 | [`docs/lit-review-plan.md`](docs/lit-review-plan.md) | Review plan, claims, terminology guardrail |
 
 When documents conflict, the more specific/later one refines the earlier — but locked
 decisions and the locked §0 method boundary override casual changes.
@@ -171,9 +178,11 @@ target test graph; the queried edge is masked/standardized inside the scaffold. 
 
 - [x] **E2 — pair-to-topology gap** established (motivating result + figure).
 - [x] **Blueprint, methodology, and experiment protocol** written and locked.
-- [ ] **EgoStitch proposal** — awaiting approval ([`docs/04-model-proposal.md`](docs/04-model-proposal.md)).
-- [ ] **Implementation** under `src/`, per the [experiment protocol](docs/03-experiment-protocol.md).
-- [ ] **Experiments** in priority order: E2 (rerun) → E1/E3 main + baselines → E4 ablations → E5 integrity gates → E6/E7 breadth.
+- [x] **EgoStitch proposal** — approved 2026-07-09; reviewed via novelty check + 5-persona panel ([`docs/05-review-report.md`](docs/05-review-report.md)).
+- [x] **G4 spec freeze** — [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) signed off (algorithm + benchmark data contract + batch sampler + DDP design).
+- [ ] **Gates G1–G3** — hardened E2 rerun, edge-independence ceiling curve, Oracle row (must pass before model code).
+- [ ] **Implementation** under `src/`, per [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) and the [experiment protocol](docs/03-experiment-protocol.md).
+- [ ] **Experiments** in priority order: E2 (hardened) → E1/E3 main + baselines → E4 ablations → E5 integrity gates → E7 (load-bearing) → E6 breadth.
 
 ## Literature
 

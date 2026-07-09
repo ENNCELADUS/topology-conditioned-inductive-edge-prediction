@@ -6,14 +6,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A **research-paper project** targeting ICLR 2027: *Topology-Conditioned Inductive
 Edge Prediction*. It contains design documents, result notes, self-contained HTML
-figures, and a curated literature library. There is **no implementation code and no
-test suite yet** — the work so far is problem framing, methodology, an experiment
-protocol, and a model proposal awaiting approval.
+figures, benchmark data artifacts, and a curated literature library. There is **no
+implementation code and no test suite yet** — the model design (EgoStitch) and its
+implementation spec were approved 2026-07-09, but pre-implementation gates G1–G3
+(hardened E2, ceiling curve, Oracle) must pass before model code is written.
 
 `README.md` is the human-facing entry point (orientation, status, structure map,
 reading order). This file (`CLAUDE.md`) holds the binding *constraints* an agent
-must respect. When implementation begins, code goes under `src/`, and
-`docs/03-experiment-protocol.md` is the contract it must implement.
+must respect. When implementation begins, code goes under `src/`;
+`docs/06-egostitch-spec.md` (algorithm + data contract + DDP design) and
+`docs/03-experiment-protocol.md` (what to run, how to grade) are the contracts it
+must implement.
 
 ## Repository layout
 
@@ -23,14 +26,21 @@ CLAUDE.md                        this file — agent guardrails
 docs/
   01-blueprint.md                top-level paper blueprint (locked decisions)
   02-methodology.md              abstract method contract + training objective
-  03-experiment-protocol.md      run/eval contract: baselines, E1–E7, metrics
-  04-model-proposal.md           EgoStitch model (AWAITING APPROVAL)
+  03-experiment-protocol.md      run/eval contract: baselines, E1–E7, metrics, gates G1–G5
+  04-model-proposal.md           EgoStitch model rationale (APPROVED 2026-07-09)
+  05-review-report.md            novelty-check + 5-persona review record
+  06-egostitch-spec.md           implementation contract (G4 signed off): algorithm,
+                                 benchmark/data contract, batch sampler, DDP design
   lit-review-plan.md             review plan, claims K1–K5, terminology guardrail
   results/
     E2-pair-to-topology-gap.md   motivating result note
 figures/
   e2-gap.html                    edge-vs-topology contrast figure
   positioning.html               2×2 taxonomy positioning figure
+data/
+  README.md                      benchmark artifact manifest (layout + usage contract)
+  benchmark_2025_neurips/        graph, splits, edge lists, eval buckets (3 strategies)
+  features/                      frozen per-node token-sequence features (~25 GB, gitignored)
 src/
   README.md                      stub: implementation contract pointer (no code yet)
 literature/                      curated reference library (gitignored, unchanged)
@@ -61,13 +71,19 @@ nodes?" If a draft starts describing graph generation as the task, it has drifte
    experiment contract: the locked per-query local-scaffold method boundary (§0),
    baseline ladder B0–B3/Oracle (§2), experiment matrix E1–E7 (§3), evaluation
    protocol, and run order. Source of truth for what to run and how to grade it.
-4. `docs/04-model-proposal.md` — **EgoStitch**, the concrete proposed model (dual
-   ego-net imagination + community codebook, replacing the retrieved-and-thresholded
-   scaffold). **Status: awaiting approval.** It adds baseline B5 and reframes the
-   original §0 scaffold as an ablation arm. Treat it as a proposal, not settled
-   design, until the user approves it.
-5. `docs/results/E2-pair-to-topology-gap.md` — the motivating result note (numbers below).
-6. `docs/lit-review-plan.md` — literature-review plan, claims K1–K5, the 2×2
+4. `docs/04-model-proposal.md` — **EgoStitch**, the concrete model (dual ego-net
+   imagination + community codebook, replacing the retrieved-and-thresholded
+   scaffold). **Status: approved 2026-07-09** (design rationale; review record in
+   `docs/05-review-report.md`). It adds baseline B5 and reframes the original §0
+   scaffold as an ablation arm.
+5. `docs/06-egostitch-spec.md` — the **implementation contract** (gate G4 signed off
+   2026-07-09): pinned algorithm/shapes/losses, §9 benchmark binding and data
+   contract (including quarantined artifacts and the self-loop policy), §10 batch
+   sampler, §11 DDP execution design. Its freeze rule is binding: code may not
+   silently deviate — edit the spec first, with a change-log line.
+6. `docs/results/E2-pair-to-topology-gap.md` — the motivating result note (numbers
+   below; provisional until gate G1).
+7. `docs/lit-review-plan.md` — literature-review plan, claims K1–K5, the 2×2
    taxonomy, and the terminology guardrail.
 
 When these conflict, the more specific/later document refines the earlier one, but

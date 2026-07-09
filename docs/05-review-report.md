@@ -332,4 +332,10 @@ implementation contract**, with three required amendments — all executed:
    camera-ready); Rendsburg "NetGAN without GAN"; Heater; DCM's in-print DGM
    criticism; GraIL/IGMC page-level quotes; HiGGs acceptance status; acceptance
    status of 2310.04612 / 2405.14985 / UPNA / FLEX closer to submission.
-4. G4 sign-off of `06-egostitch-spec.md`, then gates G1→G2→G3 before any model code.
+4. ~~G4 sign-off of `06-egostitch-spec.md`~~ — **done 2026-07-09**: the user signed
+   off G4; the spec is the active implementation contract and gained §9 (benchmark
+   binding / data contract — including quarantine of the shipped
+   `*_ratio5_exclusive.txt` negatives, which mix train- and test-side nodes, and of
+   `train_graph.pkl` as a structural-target source, since it contains every val
+   positive), §10 (batch sampler), and §11 (DDP execution design for 4/8 × H20).
+   Remaining before any model code: gates G1 → G2 → G3.

@@ -2,8 +2,10 @@
 
 **Status:** repository-local experiment plan for an abstract graph ML benchmark.
 **Updated 2026-07-09:** incorporates the approved `[protocol-Δ]` items from
-`04-model-proposal.md` revision 2.1 (approved as a design proposal; the model spec
-becomes the implementation contract only after gate G4 sign-off, see §5.0). Changes:
+`04-model-proposal.md` revision 2.1 (approved as a design proposal; **gate G4 was
+signed off later the same day — `06-egostitch-spec.md` is now the implementation
+contract**, including its §9 benchmark binding / data contract and §10–11
+batch-sampler and DDP execution design). Changes:
 pre-implementation gates G1–G5, baseline ladder extensions (`B0+cal`, `B3-dist`,
 `B3-full`, `B5`, external attribute-only baselines), trained-on vs held-out metric
 families, ceiling and Oracle reference rows, hard-negative construction for zero-edge
@@ -307,7 +309,10 @@ rule).
 3. **G3 — Oracle first.** Run the Oracle row. Stop: Oracle ≈ B0 on assembled metrics ⇒ feature
    insufficiency; conditioning cannot help; pivot.
 4. **G4 — Specification freeze.** `06-egostitch-spec.md` reviewed and signed off; it then
-   becomes the implementation contract.
+   becomes the implementation contract. **Done 2026-07-09** (sign-off recorded in the spec's
+   change log; the spec's §9 data contract additionally quarantines the shipped
+   `*_ratio5_exclusive.txt` negatives and `train_graph.pkl`-as-target — both leak across the
+   split under the strict gate).
 5. **G5 — Staged build.** Stage 1: imagination + degree budget + closure only; Stage 2: +
    codebook + s3; Stage 3: + harmonization + seam loss. Each stage must beat the previous on
    the pre-registered criteria or the added mechanism is cut.

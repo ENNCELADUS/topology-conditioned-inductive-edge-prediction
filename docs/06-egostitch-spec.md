@@ -1,15 +1,17 @@
 # EgoStitch Algorithm Specification (Gate G4 deliverable — spec freeze)
 
-**Status:** G4 spec-freeze draft for review, 2026-07-09. Companion to
-`04-model-proposal.md` (revision 2.1+); satisfies gate §6.0-G4: Stitch/Harmonize
-pseudocode with tensor shapes, OT cost and ε, confidence and quantile schedule, budget
-tolerance, gradient estimators, and the full loss tree with interior weights. Neutral
-placeholders per repository convention; no dataset names. Nothing here changes the
-model of `04-model-proposal.md` — this document pins the free parameters that document
-left symbolic.
+**Status:** **G4 signed off 2026-07-09 — this document is the active implementation
+contract.** Companion to `04-model-proposal.md` (revision 2.2); satisfies gate
+§6.0-G4: Stitch/Harmonize pseudocode with tensor shapes, OT cost and ε, confidence and
+quantile schedule, budget tolerance, gradient estimators, and the full loss tree with
+interior weights. Neutral placeholders per repository convention; no dataset names.
+Nothing here changes the model of `04-model-proposal.md` — this document pins the free
+parameters that document left symbolic. §§9–11 (added at sign-off) bind the spec to
+the local benchmark package in `data/`, define the batch-sampler / data contract, and
+fix the DDP execution design.
 
-**Freeze rule.** Once this spec is approved, implementation may not silently deviate:
-any change is an edit here first, with a one-line rationale in §9 (change log).
+**Freeze rule.** This spec is signed off: implementation may not silently deviate;
+any change is an edit here first, with a one-line rationale in §12 (change log).
 
 ---
 
@@ -17,7 +19,7 @@ any change is an edit here first, with a one-line rationale in §9 (change log).
 
 | Symbol | Meaning | Shape / default |
 |---|---|---|
-| `d` | frozen feature dim | benchmark-defined |
+| `d` | frozen feature dim (after F0 pooling, §9.2) | 1536 (benchmark package: per-node token sequence `(L, 1536)`, `L ≤ 1024`) |
 | `d_p` | projected feature space (set-decoder target space) | 256 |
 | `d_z` | code / residual dim | 64 |
 | `d_h` | decoder hidden dim | 256 |
@@ -172,6 +174,10 @@ queries, reported with every headline table.
 - Seam references: unions of message-partition ego-net pairs sampled 50/50
   adjacent/random with labels marginalized.
 - B0 provenance audit is an E5 gate precondition.
+- **Benchmark binding:** how the shipped artifacts map onto message/supervision/val,
+  which shipped files are quarantined, and the self-loop policy are fixed in §9 —
+  §9 is normative wherever the shipped artifacts differ from the abstract wording
+  above.
 
 ## 7. Loss tree (interior weights; pre-registered defaults)
 
@@ -211,12 +217,225 @@ the median for > 1k steps.
   iterations fixed, harmonization schedule deterministic given seed. One inference =
   one seed set; reported metrics average 3 seeds.
 
-## 9. Change log
+## 9. Benchmark binding and data contract
+
+Binds this spec to the artifact package `data/benchmark_2025_neurips/` +
+`data/features/frozen_node_features_1024/` (see `data/README.md` for the shipped
+layout). All numbers below were measured directly from the artifacts on 2026-07-09;
+the loader must re-verify them at build time and fail loudly on drift.
+
+### 9.1 Artifact inventory (measured)
+
+Global: `graph.pkl` = undirected `networkx` graph, **10,090 nodes / 129,861 edges, of
+which 7,769 are self-loops** (77% of nodes carry one). No node/edge attributes.
+`positive_edges.txt` = the same edge set as a TSV. Three split strategies, each with
+**8,072 train / 2,018 test nodes, node-disjoint** (test sets differ across strategies;
+pairwise overlap 547–745 nodes):
+
+| Strategy | train⁺ (sup) | val⁺ | test-graph edges (self-loops) | ρ_eval |
+|---|---|---|---|---|
+| `random_walk` | 35,288 | 8,811 | 30,257 (1,701) | 1.485e-2 |
+| `breadth_first` | 42,880 | 10,760 | 32,019 (1,891) | 1.572e-2 |
+| `depth_first` | 56,763 | 14,256 | 13,437 (1,708) | 6.60e-3 |
+
+Per strategy: `train_edges.txt` / `val_edges.txt` = balanced (~1:1) labeled pairs
+**over train-side nodes only**; negatives avoid the *global* positive set.
+`test_edges.txt` = balanced labeled pairs over test-side nodes only.
+`candidate_test_edges.txt` = the complete test-side universe: all C(2018, 2) = 2,035,153
+unordered pairs **plus all 2,018 self-pairs** (2,037,171 rows); its positives equal the
+`test_graph.pkl` edge set exactly. `test_node_buckets.pkl` = 50 node subsets at each
+size {20, 40, …, 200} for bucketed assembled-graph evaluation.
+
+Identities verified: `train_graph.pkl` edges = train⁺ ∪ val⁺ exactly (val⁺ is the
+20% complement of train⁺); train/val/test negatives ∩ global positives = ∅.
+
+**Benchmark-A/B/C ↔ strategy mapping** is recorded in the run-metadata store at G1
+time (open item: confirm which strategy produced the provisional E2 numbers).
+
+### 9.2 Feature pipeline (F0/F1)
+
+`metadata.json`: format `torch_pt_per_node`, token dim 1536, max length 1024. Each
+node's feature is a **variable-length token sequence** `(L, 1536)` (sampled: L ∈
+[67, 1001], median ≈ 394, mean ≈ 445; none at the cap; ~25 GB total across 10,193
+indexed nodes). `index.json` maps node id → content-addressed `.pt` path.
+
+- **F0 (default, frozen):** length-masked mean-pool over tokens → `x_u ∈ R^1536`.
+  Computed once at cache-build, stored as a single fp32 matrix
+  `(|V|, 1536)` (~62 MB) + row index; every rank loads the full matrix. All spec
+  modules consume `x_u`; `d = 1536`.
+- **F1 (ablation arm):** 1-layer attention pooler (learned query, `d_h`) over raw
+  token sequences, trained end-to-end; requires the length-bucketed loader path
+  (§10.4). Registered as ablation E4.11; F0 is the headline configuration.
+
+**Operative node set** `V` = `graph.pkl` nodes ∩ `index.json` keys = **10,088 of
+10,090** (`node_004764`, `node_007050` lack features; both train-side, degree 1;
+3 train pairs + 1 val pair touch them → dropped at load, counts logged). The 105
+indexed nodes absent from the graph are inert.
+
+### 9.3 Partition binding (message / supervision / val)
+
+The shipped artifacts do **not** ship the §6 message/supervision partition; it is
+derived at load, per seed:
+
+```text
+E_train⁺ := positives of train_edges.txt            (per strategy)
+E_msg    := seeded 80% of E_train⁺ ;  E_sup := the remaining 20%
+G_struct := simple graph (V_train, E_msg \ self-loops)     # ALL structural targets
+L_edge positives := E_sup (self-pairs included, §9.4)
+val_edges.txt    := model selection only (VAL-CRITERION, §8) — never a target
+```
+
+**Quarantine (binding):**
+
+1. `train_graph.pkl` **contains every val positive** — it must never be used as a
+   structural-target source (ego-nets, degrees, codebook stats, seam references,
+   critic training). Split-audit / consistency checks only. Everything structural
+   derives from `G_struct`.
+2. `*_ratio5_exclusive.txt` (all three) draw negatives from the **global** node set —
+   measured on `random_walk` train: 112,577 train–train, 56,958 cross-split, 6,905
+   test–test pairs. Cross-split pairs expose test-side node features at training
+   time: **prohibited** for training, model selection, and headline evaluation.
+   At most a clearly-labeled legacy-comparability appendix row.
+
+Density normalization (`ρ_eval/ρ_train`, §1): ρ := |E⁺| / (C(|V_side|,2) + |V_side|)
+on the matching universe. Measured full-train ρ_train (random_walk) = 1.354e-3 vs
+ρ_eval = 1.485e-2 — an **~11× train→test density shift** (mean simple degree 9.4 →
+28.3); per-seed ρ_train is computed on `E_msg` at load. Because true test density is
+**not observable** under the strict gate, the inference-time ratio is pinned as:
+
+- **default — self-calibrated, two passes:** pass 1 runs the candidate universe with
+  ratio 1 and no budget re-scale; ρ̂_eval := Σ p⁰_ij / |candidates| (model outputs
+  only — protocol-clean); pass 2 re-runs with ratio ρ̂_eval/ρ_train.
+- **diagnostic rows:** ratio = 1 (no calibration) and ratio = true test density
+  (**Oracle-family — protocol-violating, reference only**).
+
+### 9.4 Self-loop policy
+
+Self-loops are first-class labeled queries in this benchmark (13.8% of `random_walk`
+train-graph edges; 84% of test nodes carry one; they appear in supervision, val,
+test, and candidate files as `(u, u)` rows). Binding rules:
+
+1. **Structural targets on simple graphs only**: N(u), degrees, budgets d̂_u,
+   clustering/code stats, ego-net targets, and assembled-topology metrics all strip
+   self-loops.
+2. **`(u, u)` queries route through a single-ego path**: j := i; T_peer = own kept
+   slots; Π = identity on kept slots; s0 = pair_logit(u, u); s1 = self-membership
+   `lse_k(κ(h_u^k, proj(x_u)) + log π m)`; s2 from the Â_u diagonal blocks;
+   s3 unchanged; s4 on the single-ego scaffold with both anchor labels on u.
+3. **Reporting**: edge metrics overall *and* split self / non-self; assembled-graph
+   topology metrics on the simple assembled graph, plus a separate self-loop-rate row
+   (predicted vs reference, e.g. 1,701/2,018 on `random_walk`).
+
+## 10. Batch sampler and loader contract
+
+### 10.1 Streams and composite step
+
+One optimizer step consumes three independently-sampled minibatches (per rank;
+global = × world size; defaults sweep ±2×):
+
+| Stream | Source | Per-rank default | Feeds |
+|---|---|---|---|
+| node stream | uniform over V_train (DistributedSampler, seed = f(s, epoch)) | B_n = 256 nodes | L_recon, L_ssl |
+| joint-pair stream | 50% E_msg edges / 50% random train pairs (§4) | B_p = 128 pairs | L_joint |
+| edge stream | E_sup positives + resampled negatives | B_e = 512 pairs (1:5 → ~85 pos) | L_edge |
+
+Curriculum (§8) toggles streams: stage 1 node-only; stage 2 node + joint; stage 3
+all. An **epoch** = one full pass over E_sup in the edge stream; node and joint
+streams cycle independently.
+
+### 10.2 Negative sampling (training)
+
+Resampled every epoch, seeded by (seed, epoch, rank, idx): 50% uniform train-side
+pairs, 50% degree-corrected (endpoint corruption of a positive with replacement
+probability ∝ deg_G_struct(v)); self-pair negatives sampled at their universe rate;
+rejection against the **global** positive set (matching the shipped negatives'
+convention) via a per-rank hash set. Default ratio 1:5. The shipped balanced
+negatives in `train_edges.txt` / `val_edges.txt` are the **fixed** diagnostic and
+model-selection negative sets — never used for gradient updates, so train-time
+resampling cannot contaminate model selection.
+
+### 10.3 Evaluation loaders
+
+- **Val (every eval epoch):** `val_edges.txt` as-is; VAL-CRITERION per §8.
+- **Test edge metrics:** `test_edges.txt` as-is; run once, after freeze.
+- **Assembled-graph eval:** `candidate_test_edges.txt` sharded contiguously across
+  ranks; batch 8,192 pairs; n_s = 4 fixed CVAE seeds averaged; two passes (§9.3
+  density self-calibration); logits all-gathered to rank 0 for assembly and bucketed
+  metrics (`test_node_buckets.pkl`).
+- Per-node Tokenize/Imagine caches rebuilt once per eval epoch for all |V| nodes
+  (~10k nodes; ≈160 MB fp32 at K = 16, d_p = 256 — kept on-GPU per rank).
+
+### 10.4 Collate
+
+- **F0 path:** row-gather from the pooled matrix → `(B, 1536)`; no padding.
+- **F1 path:** length-bucketed batching (boundaries {128, 256, 384, 512, 768, 1024}),
+  pad-to-bucket-max with mask; token budget 131,072 tokens/rank auto-sizes the batch;
+  `num_workers = 4`, `persistent_workers`, `prefetch_factor = 4`, pinned memory.
+- Hungarian matching runs per node on K×K ≤ 16×16 cost matrices
+  (`scipy.linear_sum_assignment` on CPU from GPU-computed costs); no cross-rank
+  interaction.
+
+## 11. DDP execution design (4/8 × H20)
+
+Envelope: H20 = 96 GB HBM3, high memory bandwidth, modest BF16 compute. The model is
+~10–20 M parameters and the full feature matrix is 62 MB: runs are **overhead-bound,
+not memory-bound**. Plain DDP — no FSDP/ZeRO/model sharding. BF16 autocast with fp32
+master weights; **VQ codebook EMA and Sinkhorn always fp32**; TF32 matmul on.
+
+### 11.1 Two execution modes (pinned)
+
+- **Mode T (single training run):** `torchrun --standalone --nproc_per_node={4,8}`,
+  one process per GPU, NCCL. Used for the final 3-seed headline runs and the F1
+  token-sequence arm (where per-step compute is real).
+- **Mode S (sweeps):** HPO parity (§8: 30 configs × 3 seeds × ladder arms) runs
+  **one job per GPU** (world_size = 1) through a queue, 4/8 concurrent. For a model
+  this size sweep-parallelism dominates DDP scaling — DDP must never be *required*
+  for correctness: world_size = 1 is the reference semantics.
+- Candidate-universe inference (~2.04 M pairs × n_s = 4) shards across ranks in both
+  modes (§10.3).
+
+### 11.2 Synchronization points (correctness-critical)
+
+1. **VQ-EMA codebook:** per-step `all_reduce(SUM)` of per-rank cluster counts and
+   embed sums *before* the EMA update; the update is then computed identically on
+   every rank (no broadcast drift). Dead-code revival samples on rank 0 and
+   broadcasts.
+2. **Loss reduction:** per-family means over the *global* batch (per-rank sums scaled
+   by global counts); per-family gradient norms all-reduced for the §7 Kendall
+   fallback trigger.
+3. **No BatchNorm anywhere** (LayerNorm only) — asserted at model build.
+4. **VAL-CRITERION / early stop:** val logits all-gathered to rank 0; the metric and
+   stop decision are computed on rank 0 and broadcast, so all ranks agree.
+5. **Curriculum stage boundaries** change the used-parameter set → re-wrap DDP at
+   each stage boundary with `static_graph=True` within a stage (never
+   `find_unused_parameters=True` in steady state).
+6. **Checkpointing (rank 0):** module state + codebook EMA buffers + optimizer +
+   sampler epoch state + all-rank RNG states (gathered); resume restores per-rank
+   RNG exactly.
+
+### 11.3 Determinism under DDP (extends §8)
+
+Global seed s; per-rank sampler seeds f(s, epoch, rank); the n_s = 4 inference CVAE
+seeds are fixed constants (rank-independent, so a pair's prediction does not depend on
+which rank served it); `torch.use_deterministic_algorithms(True)` with any exceptions
+allow-listed and logged; NCCL fp32 reduction non-determinism accepted and documented
+(±ε on logged losses, not on cached predictions). Global batch sizes are configured
+world-size-invariant (per-rank sizes derived), with linear LR scaling and 500-step
+warmup, so world_size ∈ {1, 4, 8} are comparable runs; run metadata records
+world_size, per-rank sizes, and NCCL/env versions.
+
+## 12. Change log
 
 - 2026-07-09: initial freeze draft (from 04-model-proposal.md rev 2.1 §4 + panel
   findings R1-W1/W2/W6, R3-W1/W2/W4/W5/W7).
+- 2026-07-09: **G4 signed off** — spec becomes the implementation contract.
+- 2026-07-09: added §9 benchmark binding (artifact inventory, F0/F1 feature pipeline,
+  `d = 1536`, per-seed message/supervision derivation, `train_graph.pkl` and
+  `ratio5_exclusive` quarantine, measured ρ values + self-calibrated density ratio,
+  self-loop policy), §10 batch-sampler/loader contract, §11 DDP execution design
+  (4/8 × H20) — user-directed additions at sign-off; §0 `d` row bound; §6 pointer
+  added; former §9 change log renumbered to §12.
 
-**Open items before code (not blockers to reviewing this spec):** benchmark feature
-dim `d`; candidate-universe densities ρ for the budget normalization; the four
-ego-stat target definitions pinned to evaluator implementations; FLOPs/latency table
-template (§4.7 commitment).
+**Open items before code (not blockers):** the four ego-stat target definitions
+pinned to evaluator implementations; FLOPs/latency table template (§4.7 commitment);
+Benchmark-A/B/C ↔ split-strategy mapping confirmed at G1 (§9.1).

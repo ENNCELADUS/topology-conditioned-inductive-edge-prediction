@@ -1,9 +1,10 @@
 # Model Proposal: EgoStitch — Community-Conditioned Ego-Network Imagination with Consensus Stitching for Topology-Conditioned Inductive Edge Prediction
 
-**Status:** **revision 2.2** — approved as a design proposal (2026-07-09), not yet an
-implementation contract; the contract activates on gate G4 sign-off of
-`06-egostitch-spec.md`. Companion to `03-experiment-protocol.md` (updated 2026-07-09
-with the approved [protocol-Δ] items) and `02-methodology.md`.
+**Status:** **revision 2.2** — approved as a design proposal (2026-07-09); **gate G4
+signed off 2026-07-09**, so `06-egostitch-spec.md` (including its §9 benchmark
+binding and §10–11 batch-sampler/DDP contracts) is now the active implementation
+contract. Companion to `03-experiment-protocol.md` (updated 2026-07-09 with the
+approved [protocol-Δ] items) and `02-methodology.md`.
 
 **Provenance.** Revision 1 was grounded in a three-track literature review run on
 2026-07-07. Revision 2 (2026-07-08) followed a full fan-out review of the local vault
