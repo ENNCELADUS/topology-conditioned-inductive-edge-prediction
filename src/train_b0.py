@@ -610,7 +610,7 @@ class TrainResult:
 
 def _to_device(batch: Batch, device: torch.device) -> Batch:
     """Move every tensor of a batch dict to `device`."""
-    return {key: value.to(device) for key, value in batch.items()}
+    return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
 
 
 def _cpu_state_dict(accelerator: Accelerator, model: nn.Module) -> dict[str, torch.Tensor]:
@@ -947,10 +947,28 @@ def _build_negative_sampler(assembled: AssembledData) -> NegativeSampler:
     return NegativeSampler(train_universe, assembled.degrees, assembled.benchmark.positive_edges)
 
 
+def _v3_loader_options(num_workers: int) -> dict[str, object]:
+    """Return the pinned DataLoader options for raw-token V3.1 batches."""
+    options: dict[str, object] = {
+        "num_workers": num_workers,
+        "pin_memory": True,
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        options["prefetch_factor"] = 4
+    return options
+
+
 def _build_v3_1_loaders(
     cfg: Config, assembled: AssembledData
 ) -> tuple[LoaderFactory, Iterable[Batch]]:
     """Build the token-sequence train-loader factory and val loader (v3_1 path)."""
+    cached_nodes = assembled.store.preload(assembled.operative_node_ids)
+    logger.info(
+        "preloaded %d operative node tensors (%.2f GiB) into host memory",
+        cached_nodes,
+        assembled.store.cached_bytes / float(1024**3),
+    )
     store = assembled.store
     sampler = _build_negative_sampler(assembled)
     positives = assembled.training_positives
@@ -978,7 +996,7 @@ def _build_v3_1_loaders(
             val_lengths, token_budget=cfg.data.token_budget, shuffle=False
         ),
         collate_fn=collate_token_pairs,
-        num_workers=cfg.data.num_workers,
+        **cast(Any, _v3_loader_options(cfg.data.num_workers)),
     )
 
     def factory(epoch: int) -> DataLoader[Batch]:
@@ -999,7 +1017,7 @@ def _build_v3_1_loaders(
             dataset,
             batch_sampler=batch_sampler,
             collate_fn=collate_token_pairs,
-            num_workers=cfg.data.num_workers,
+            **cast(Any, _v3_loader_options(cfg.data.num_workers)),
         )
 
     return factory, val_loader

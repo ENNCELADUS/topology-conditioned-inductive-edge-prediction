@@ -63,6 +63,69 @@ class TestFeatureStore:
         with pytest.raises(KeyError, match="node_999999"):
             store.load_tokens("node_999999")
 
+    def test_preload_caches_each_tensor_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        shapes = {"node_000001": (5, 4), "node_000002": (7, 4)}
+        root = _write_feature_root(tmp_path, shapes, input_dim=4)
+        store = FeatureStore(root)
+        real_torch_load = torch.load
+        load_count = 0
+
+        def counting_load(
+            path: Path, *, map_location: str, weights_only: bool
+        ) -> object:
+            nonlocal load_count
+            load_count += 1
+            return real_torch_load(
+                path, map_location=map_location, weights_only=weights_only
+            )
+
+        monkeypatch.setattr(torch, "load", counting_load)
+
+        assert store.preload() == 2
+        node_1 = store.load_tokens("node_000001")
+        node_2 = store.load_tokens("node_000002")
+
+        assert load_count == 2
+        assert store.cached_node_count == 2
+        assert store.cached_bytes == sum(
+            tensor.numel() * tensor.element_size() for tensor in (node_1, node_2)
+        )
+        assert store.load_tokens("node_000001") is node_1
+        assert store.load_tokens("node_000002") is node_2
+
+    def test_preload_subset_does_not_load_unrelated_nodes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        shapes = {"node_000001": (5, 4), "node_000002": (7, 4)}
+        root = _write_feature_root(tmp_path, shapes, input_dim=4)
+        store = FeatureStore(root)
+        real_torch_load = torch.load
+        loaded_paths: list[Path] = []
+
+        def counting_load(
+            path: Path, *, map_location: str, weights_only: bool
+        ) -> object:
+            loaded_paths.append(path)
+            return real_torch_load(
+                path, map_location=map_location, weights_only=weights_only
+            )
+
+        monkeypatch.setattr(torch, "load", counting_load)
+
+        assert store.preload(["node_000002"]) == 1
+
+        assert loaded_paths == [root / "embeddings/node_000002.pt"]
+        assert store.cached_node_count == 1
+
+    def test_preload_unknown_node_preserves_keyerror(self, tmp_path: Path) -> None:
+        root = _write_feature_root(tmp_path, {"node_000001": (5, 4)}, input_dim=4)
+        store = FeatureStore(root)
+
+        with pytest.raises(KeyError, match="node_999999"):
+            store.preload(["node_999999"])
+
     def test_load_tokens_wrong_ndim_raises(self, tmp_path: Path) -> None:
         root = _write_feature_root(tmp_path, {"node_000001": (5, 4)}, input_dim=4)
         torch.save(torch.randn(5), root / "embeddings/node_000001.pt")

@@ -10,7 +10,7 @@ data:
   partition_seed: 0
   token_budget: 131072
   batch_pairs: 1024
-  num_workers: 0
+  num_workers: 4
   f0_cache: outputs/f0_cache/f0_matrix.pt
   expected_missing_features: [node_004764, node_007050]
 optim:

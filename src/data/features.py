@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import cast
 
@@ -47,6 +47,7 @@ class FeatureStore:
             raise ValueError("metadata.json is missing required field 'input_dim'")
         self._input_dim = int(cast(int, metadata["input_dim"]))
         self._index: dict[str, str] = json.loads((self._root / "index.json").read_text())
+        self._cache: dict[str, torch.Tensor] = {}
 
     @property
     def node_ids(self) -> frozenset[str]:
@@ -57,6 +58,40 @@ class FeatureStore:
     def input_dim(self) -> int:
         """Return the per-token feature dimensionality declared in metadata."""
         return self._input_dim
+
+    @property
+    def cached_node_count(self) -> int:
+        """Return the number of node tensors currently cached in host memory."""
+        return len(self._cache)
+
+    @property
+    def cached_bytes(self) -> int:
+        """Return the total storage size of tensors cached in host memory."""
+        return sum(tensor.numel() * tensor.element_size() for tensor in self._cache.values())
+
+    def preload(self, node_ids: Iterable[str] | None = None) -> int:
+        """Load a deterministic set of node tensors into host memory.
+
+        Args:
+            node_ids: Node ids to preload. ``None`` preloads the full feature index.
+
+        Returns:
+            The total number of cached node tensors after preloading.
+        """
+        resolved_node_ids = sorted(self._index if node_ids is None else node_ids)
+        newly_cached = 0
+        for node_id in resolved_node_ids:
+            was_cached = node_id in self._cache
+            self.load_tokens(node_id)
+            if not was_cached:
+                newly_cached += 1
+                if newly_cached % 1000 == 0:
+                    logger.info(
+                        "preload: cached %d new node tensors (%d total)",
+                        newly_cached,
+                        self.cached_node_count,
+                    )
+        return self.cached_node_count
 
     def load_tokens(self, node_id: str) -> torch.Tensor:
         """Load the raw token-sequence tensor for a single node.
@@ -74,6 +109,9 @@ class FeatureStore:
         """
         if node_id not in self._index:
             raise KeyError(node_id)
+        cached = self._cache.get(node_id)
+        if cached is not None:
+            return cached
         path = self._root / self._index[node_id]
         tensor = cast(torch.Tensor, torch.load(path, map_location="cpu", weights_only=True))
         if tensor.ndim != 2:
@@ -89,6 +127,7 @@ class FeatureStore:
             raise ValueError(
                 f"Feature tensor for {node_id!r} has dtype {tensor.dtype}, expected torch.float32"
             )
+        self._cache[node_id] = tensor
         return tensor
 
 

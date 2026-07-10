@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 import pickle
+from collections.abc import Iterable
 from pathlib import Path
+from typing import cast
+from unittest.mock import Mock
 
 import networkx as nx
 import numpy as np
 import pytest
+import src.train_b0 as train_b0_module
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,6 +25,8 @@ from src.train_b0 import (
     AssembledData,
     Config,
     TrainResult,
+    _to_device,
+    _v3_loader_options,
     apply_overrides,
     assemble_data,
     build_model,
@@ -132,6 +138,11 @@ class TestLoadConfig:
         assert cfg.seed == 47
         assert cfg.output_dir == Path("outputs/b0_alt")
         assert cfg.mixed_precision == "no"
+
+    def test_shipped_v3_1_config_uses_four_workers(self) -> None:
+        cfg = load_config(Path("configs/b0_v31_breadth_first.yaml"))
+
+        assert cfg.data.num_workers == 4
 
     def test_unknown_family_raises_clear_error(self, tmp_path: Path) -> None:
         config_path = tmp_path / "cfg.yaml"
@@ -439,6 +450,30 @@ class TestTrainLoopSyntheticF0Mlp:
         assert torch.equal(logits_reloaded, logits_original)
 
 
+class TestV31LoaderContract:
+    def test_worker_options_enable_pinned_prefetched_loading(self) -> None:
+        assert _v3_loader_options(4) == {
+            "num_workers": 4,
+            "pin_memory": True,
+            "persistent_workers": True,
+            "prefetch_factor": 4,
+        }
+        assert _v3_loader_options(0) == {
+            "num_workers": 0,
+            "pin_memory": True,
+            "persistent_workers": False,
+        }
+
+    def test_to_device_requests_non_blocking_copy(self) -> None:
+        tensor = Mock(spec=torch.Tensor)
+        device = torch.device("cpu")
+
+        moved = _to_device({"value": cast(torch.Tensor, tensor)}, device)
+
+        tensor.to.assert_called_once_with(device, non_blocking=True)
+        assert moved["value"] is tensor.to.return_value
+
+
 class _ScriptedEvalModel(nn.Module):
     """Test double: real training dynamics but fully scripted eval-mode logits.
 
@@ -726,6 +761,41 @@ def _synthetic_data_config(data_root: Path, *, expected_missing_features: list[s
         output_dir=data_root / "outputs",
         mixed_precision="no",
     )
+
+
+class TestV31LoaderConstruction:
+    def test_preloads_all_operative_nodes_before_creating_loader(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        data_root = tmp_path / "data"
+        benchmark_root = data_root / "benchmark_2025_neurips"
+        benchmark_root.mkdir(parents=True)
+        _build_synthetic_benchmark(benchmark_root, "synthetic")
+        features_root = data_root / "features" / "frozen_node_features_1024"
+        _write_feature_store(features_root, [f"node_{i:06d}" for i in range(1, 7)])
+        cfg = _synthetic_data_config(
+            data_root, expected_missing_features=["node_000007"]
+        )
+        assembled = assemble_data(cfg, verify=False)
+        events: list[tuple[object, ...]] = []
+        real_preload = assembled.store.preload
+
+        def recording_preload(node_ids: Iterable[str] | None = None) -> int:
+            assert node_ids is not None
+            events.append(("preload", tuple(node_ids)))
+            return real_preload(node_ids)
+
+        def recording_data_loader(*args: object, **kwargs: object) -> list[object]:
+            events.append(("loader",))
+            return []
+
+        monkeypatch.setattr(assembled.store, "preload", recording_preload)
+        monkeypatch.setattr(train_b0_module, "DataLoader", recording_data_loader)
+
+        train_b0_module._build_v3_1_loaders(cfg, assembled)
+
+        assert events[0] == ("preload", tuple(assembled.operative_node_ids))
+        assert events[1] == ("loader",)
 
 
 class TestAssembleDataFeatureCoverageGate:
