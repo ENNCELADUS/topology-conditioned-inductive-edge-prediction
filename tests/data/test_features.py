@@ -63,6 +63,29 @@ class TestFeatureStore:
         with pytest.raises(KeyError, match="node_999999"):
             store.load_tokens("node_999999")
 
+    def test_repeated_direct_loads_do_not_retain_non_preloaded_tensor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = _write_feature_root(tmp_path, {"node_000001": (5, 4)}, input_dim=4)
+        store = FeatureStore(root)
+        real_torch_load = torch.load
+        load_count = 0
+
+        def counting_load(path: Path, *, map_location: str, weights_only: bool) -> object:
+            nonlocal load_count
+            load_count += 1
+            return real_torch_load(path, map_location=map_location, weights_only=weights_only)
+
+        monkeypatch.setattr(torch, "load", counting_load)
+
+        first = store.load_tokens("node_000001")
+        second = store.load_tokens("node_000001")
+
+        assert load_count == 2
+        assert first is not second
+        assert store.cached_node_count == 0
+        assert store.cached_bytes == 0
+
     def test_preload_caches_each_tensor_once(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -107,9 +130,15 @@ class TestFeatureStore:
         monkeypatch.setattr(torch, "load", counting_load)
 
         assert store.preload(["node_000002"]) == 1
+        preloaded = store.load_tokens("node_000002")
+        store.load_tokens("node_000001")
 
-        assert loaded_paths == [root / "embeddings/node_000002.pt"]
+        assert loaded_paths == [
+            root / "embeddings/node_000002.pt",
+            root / "embeddings/node_000001.pt",
+        ]
         assert store.cached_node_count == 1
+        assert store.load_tokens("node_000002") is preloaded
 
     def test_preload_unknown_node_preserves_keyerror(self, tmp_path: Path) -> None:
         root = _write_feature_root(tmp_path, {"node_000001": (5, 4)}, input_dim=4)
@@ -148,6 +177,18 @@ class TestFeatureStore:
 
 
 class TestBuildF0Matrix:
+    def test_first_build_does_not_retain_raw_token_tensors(self, tmp_path: Path) -> None:
+        shapes = {"node_000001": (5, 4), "node_000002": (7, 4)}
+        root = _write_feature_root(tmp_path, shapes, input_dim=4)
+        store = FeatureStore(root)
+
+        matrix, index = build_f0_matrix(store, list(shapes))
+
+        assert matrix.shape == (2, 4)
+        assert index == {"node_000001": 0, "node_000002": 1}
+        assert store.cached_node_count == 0
+        assert store.cached_bytes == 0
+
     def test_mean_matches_manual_computation(self, tmp_path: Path) -> None:
         shapes = {"node_000001": (5, 4), "node_000002": (3, 4), "node_000003": (7, 4)}
         root = _write_feature_root(tmp_path, shapes, input_dim=4)

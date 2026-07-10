@@ -6,7 +6,7 @@ import json
 import pickle
 from collections.abc import Iterable
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest.mock import Mock
 
 import networkx as nx
@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
 from src.data.artifacts import ArtifactVerificationError
+from src.data.pairs import LengthBucketedBatchSampler
 from src.eval.edge_metrics import EdgeMetrics
 from src.model.B0 import BEST_V3_1_CONFIG, V3_1
 from src.model.b0_alt import F0PairMLP
@@ -82,6 +83,20 @@ def _write_yaml_config(path: Path, overrides: dict[str, object] | None = None) -
                 base[dotted_key] = value
     path.write_text(json.dumps(base))
     return base
+
+
+def _persistent_worker_pids(loader: object) -> set[int]:
+    iterator = cast(Any, getattr(loader, "_iterator", None))
+    assert iterator is not None
+    return {int(worker.pid) for worker in iterator._workers}
+
+
+def _shutdown_persistent_workers(loader: object) -> None:
+    typed_loader = cast(Any, loader)
+    iterator = cast(Any, getattr(typed_loader, "_iterator", None))
+    if iterator is not None:
+        iterator._shutdown_workers()
+        typed_loader._iterator = None
 
 
 def _make_synthetic_pair_dataset(
@@ -764,7 +779,7 @@ def _synthetic_data_config(data_root: Path, *, expected_missing_features: list[s
 
 
 class TestV31LoaderConstruction:
-    def test_preloads_before_both_loaders_and_wires_worker_options(
+    def test_preloads_only_operative_nodes_and_wires_both_loader_options(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from dataclasses import replace
@@ -778,38 +793,147 @@ class TestV31LoaderConstruction:
         cfg = _synthetic_data_config(data_root, expected_missing_features=["node_000007"])
         cfg = replace(cfg, data=replace(cfg.data, num_workers=4))
         assembled = assemble_data(cfg, verify=False)
-        events: list[tuple[object, ...]] = []
-        loader_kwargs: list[dict[str, object]] = []
+        requested_preloads: list[tuple[str, ...]] = []
         real_preload = assembled.store.preload
 
         def recording_preload(node_ids: Iterable[str] | None = None) -> int:
             assert node_ids is not None
-            events.append(("preload", tuple(node_ids)))
+            requested_preloads.append(tuple(node_ids))
             return real_preload(node_ids)
 
-        def recording_data_loader(*args: object, **kwargs: object) -> list[object]:
-            events.append(("loader",))
-            loader_kwargs.append(kwargs)
-            return []
-
         monkeypatch.setattr(assembled.store, "preload", recording_preload)
-        monkeypatch.setattr(train_b0_module, "DataLoader", recording_data_loader)
 
+        factory, val_loader = train_b0_module._build_v3_1_loaders(cfg, assembled)
+        train_loader = cast(Any, factory(1))
+        typed_val_loader = cast(Any, val_loader)
+
+        assert requested_preloads == [tuple(assembled.operative_node_ids)]
+        assert assembled.store.cached_node_count == len(assembled.operative_node_ids)
+        for loader in (train_loader, typed_val_loader):
+            assert loader.num_workers == 4
+            assert loader.pin_memory is True
+            assert loader.persistent_workers is True
+            assert loader.prefetch_factor == 4
+
+    def test_factory_returns_same_training_loader_after_epoch_exhaustion(
+        self, tmp_path: Path
+    ) -> None:
+        data_root = tmp_path / "data"
+        benchmark_root = data_root / "benchmark_2025_neurips"
+        benchmark_root.mkdir(parents=True)
+        _build_synthetic_benchmark(benchmark_root, "synthetic")
+        features_root = data_root / "features" / "frozen_node_features_1024"
+        _write_feature_store(features_root, [f"node_{i:06d}" for i in range(1, 7)])
+        cfg = _synthetic_data_config(data_root, expected_missing_features=["node_000007"])
+        assembled = assemble_data(cfg, verify=False)
         factory, _ = train_b0_module._build_v3_1_loaders(cfg, assembled)
-        factory(1)
 
-        assert events[0] == ("preload", tuple(assembled.operative_node_ids))
-        assert events[1:] == [("loader",), ("loader",)]
-        expected_options = {
-            "num_workers": 4,
-            "pin_memory": True,
-            "persistent_workers": True,
-            "prefetch_factor": 4,
+        first_loader = factory(1)
+        with pytest.raises(RuntimeError, match="previous iterator is exhausted"):
+            factory(2)
+        list(first_loader)
+        second_loader = factory(2)
+
+        assert second_loader is first_loader
+
+    @pytest.mark.integration
+    def test_persistent_workers_reuse_pids_and_observe_deterministic_epoch_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from dataclasses import replace
+
+        real_loader_options = train_b0_module._v3_loader_options
+
+        def bounded_fork_loader_options(num_workers: int) -> dict[str, object]:
+            options = real_loader_options(num_workers)
+            if num_workers > 0:
+                options.update({"multiprocessing_context": "fork", "timeout": 10})
+            return options
+
+        monkeypatch.setattr(train_b0_module, "_v3_loader_options", bounded_fork_loader_options)
+
+        data_root = tmp_path / "data"
+        benchmark_root = data_root / "benchmark_2025_neurips"
+        benchmark_root.mkdir(parents=True)
+        _build_synthetic_benchmark(benchmark_root, "synthetic")
+        features_root = data_root / "features" / "frozen_node_features_1024"
+        _write_feature_store(features_root, [f"node_{i:06d}" for i in range(1, 7)])
+        cfg = _synthetic_data_config(data_root, expected_missing_features=["node_000007"])
+        cfg = replace(cfg, data=replace(cfg.data, num_workers=2))
+        assembled = assemble_data(cfg, verify=False)
+        factory, _ = train_b0_module._build_v3_1_loaders(cfg, assembled)
+        loaders: list[object] = []
+
+        node_values = {
+            node_id: float(assembled.store.load_tokens(node_id)[0, 0].item())
+            for node_id in assembled.operative_node_ids
         }
-        assert [{key: kwargs[key] for key in expected_options} for kwargs in loader_kwargs] == [
-            expected_options,
-            expected_options,
-        ]
+
+        def expected_stream(epoch: int) -> list[tuple[float, float, float]]:
+            negatives = train_b0_module._build_negative_sampler(assembled).sample(
+                assembled.training_positives,
+                ratio=cfg.data.negative_ratio,
+                seed=cfg.seed,
+                epoch=epoch,
+            )
+            pairs, labels = train_b0_module._shuffled_pairs_and_labels(
+                assembled.training_positives, negatives, cfg.seed, epoch
+            )
+            lengths = [
+                (
+                    int(assembled.store.load_tokens(node_a).size(0)),
+                    int(assembled.store.load_tokens(node_b).size(0)),
+                )
+                for node_a, node_b in pairs
+            ]
+            batch_indices = LengthBucketedBatchSampler(
+                lengths,
+                token_budget=cfg.data.token_budget,
+                shuffle=True,
+                seed=cfg.seed,
+                epoch=epoch,
+            )
+            order = [index for batch in batch_indices for index in batch]
+            return [
+                (node_values[pairs[index][0]], node_values[pairs[index][1]], float(labels[index]))
+                for index in order
+            ]
+
+        def actual_stream(
+            loader: Iterable[dict[str, torch.Tensor]],
+        ) -> list[tuple[float, float, float]]:
+            stream: list[tuple[float, float, float]] = []
+            for batch in loader:
+                for row in range(batch["label"].size(0)):
+                    stream.append(
+                        (
+                            float(batch["emb_a"][row, 0, 0].item()),
+                            float(batch["emb_b"][row, 0, 0].item()),
+                            float(batch["label"][row].item()),
+                        )
+                    )
+            return stream
+
+        try:
+            epoch_1_loader = factory(1)
+            loaders.append(epoch_1_loader)
+            epoch_1_stream = actual_stream(epoch_1_loader)
+            epoch_1_pids = _persistent_worker_pids(epoch_1_loader)
+
+            epoch_2_loader = factory(2)
+            loaders.append(epoch_2_loader)
+            epoch_2_stream = actual_stream(epoch_2_loader)
+            epoch_2_pids = _persistent_worker_pids(epoch_2_loader)
+
+            assert epoch_2_loader is epoch_1_loader
+            assert len(epoch_1_pids) == 2
+            assert epoch_2_pids == epoch_1_pids
+            assert epoch_1_stream == expected_stream(1)
+            assert epoch_2_stream == expected_stream(2)
+            assert epoch_2_stream != epoch_1_stream
+        finally:
+            for loader in {id(loader): loader for loader in loaders}.values():
+                _shutdown_persistent_workers(loader)
 
 
 class TestAssembleDataFeatureCoverageGate:

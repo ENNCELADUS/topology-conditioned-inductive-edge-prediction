@@ -21,7 +21,8 @@ class FeatureStore:
 
     Reads ``metadata.json`` (format/input_dim) and ``index.json`` (node_id to relative
     path) from ``root`` at construction time. Individual node tensors are loaded lazily
-    on demand via :meth:`load_tokens`.
+    on demand via :meth:`load_tokens`; only tensors requested through :meth:`preload`
+    remain resident in the host cache.
     """
 
     def __init__(self, root: Path) -> None:
@@ -81,20 +82,23 @@ class FeatureStore:
         resolved_node_ids = sorted(self._index if node_ids is None else node_ids)
         newly_cached = 0
         for node_id in resolved_node_ids:
-            was_cached = node_id in self._cache
-            self.load_tokens(node_id)
-            if not was_cached:
-                newly_cached += 1
-                if newly_cached % 1000 == 0:
-                    logger.info(
-                        "preload: cached %d new node tensors (%d total)",
-                        newly_cached,
-                        self.cached_node_count,
-                    )
+            if node_id in self._cache:
+                continue
+            self._cache[node_id] = self._load_and_validate(node_id)
+            newly_cached += 1
+            if newly_cached % 1000 == 0:
+                logger.info(
+                    "preload: cached %d new node tensors (%d total)",
+                    newly_cached,
+                    self.cached_node_count,
+                )
         return self.cached_node_count
 
     def load_tokens(self, node_id: str) -> torch.Tensor:
         """Load the raw token-sequence tensor for a single node.
+
+        Cache hits return the explicitly preloaded tensor by identity. A cache miss is
+        validated and returned without being retained.
 
         Args:
             node_id: Opaque node id to look up.
@@ -112,6 +116,12 @@ class FeatureStore:
         cached = self._cache.get(node_id)
         if cached is not None:
             return cached
+        return self._load_and_validate(node_id)
+
+    def _load_and_validate(self, node_id: str) -> torch.Tensor:
+        """Load one indexed tensor from disk and validate the feature contract."""
+        if node_id not in self._index:
+            raise KeyError(node_id)
         path = self._root / self._index[node_id]
         tensor = cast(torch.Tensor, torch.load(path, map_location="cpu", weights_only=True))
         if tensor.ndim != 2:
@@ -127,7 +137,6 @@ class FeatureStore:
             raise ValueError(
                 f"Feature tensor for {node_id!r} has dtype {tensor.dtype}, expected torch.float32"
             )
-        self._cache[node_id] = tensor
         return tensor
 
 

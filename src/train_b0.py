@@ -39,6 +39,7 @@ from src.data.features import FeatureStore, build_f0_matrix
 from src.data.pairs import (
     LengthBucketedBatchSampler,
     NegativeSampler,
+    SharedEpochTokenPairDataset,
     TokenPairDataset,
     collate_token_pairs,
 )
@@ -959,6 +960,67 @@ def _v3_loader_options(num_workers: int) -> dict[str, object]:
     return options
 
 
+class _ReusableEpochDataLoader(DataLoader[Batch]):
+    """One DataLoader whose shared dataset is replaced only between exhausted epochs."""
+
+    def __init__(
+        self,
+        dataset: SharedEpochTokenPairDataset,
+        batch_sampler: LengthBucketedBatchSampler,
+        loader_options: dict[str, object],
+    ) -> None:
+        """Bind shared worker data and the parent-process mutable batch sampler."""
+        super().__init__(
+            dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=collate_token_pairs,
+            **cast(Any, loader_options),
+        )
+        self._epoch_dataset = dataset
+        self._epoch_batch_sampler = batch_sampler
+        self._epoch_exhausted = True
+        self._iteration_active = False
+
+    def ensure_epoch_replaceable(self) -> None:
+        """Raise unless the preceding epoch iterator reached true exhaustion."""
+        if not self._epoch_exhausted or self._iteration_active:
+            raise RuntimeError(
+                "cannot replace epoch data before the previous iterator is exhausted"
+            )
+
+    def prepare_epoch(
+        self,
+        pairs: Sequence[tuple[str, str]],
+        labels: Sequence[int],
+        lengths: Sequence[tuple[int, int]],
+        *,
+        epoch: int,
+    ) -> None:
+        """Publish one epoch after the preceding loader iterator is exhausted."""
+        self.ensure_epoch_replaceable()
+        if len(lengths) != len(self._epoch_dataset):
+            raise ValueError("epoch lengths must match the fixed dataset capacity")
+        self._epoch_dataset.replace_epoch(pairs, labels)
+        self._epoch_batch_sampler.replace_epoch(lengths, epoch=epoch)
+        self._epoch_exhausted = False
+
+    def __iter__(self) -> Iterator[Batch]:  # type: ignore[override]
+        """Yield one prepared epoch and mark it replaceable only at true exhaustion."""
+        if self._epoch_exhausted:
+            raise RuntimeError("prepare_epoch must be called before iterating the training loader")
+        if self._iteration_active:
+            raise RuntimeError("the training loader already has an active epoch iterator")
+        self._iteration_active = True
+        iterator = super().__iter__()
+        while True:
+            try:
+                yield next(iterator)
+            except StopIteration:
+                self._iteration_active = False
+                self._epoch_exhausted = True
+                return
+
+
 def _build_v3_1_loaders(
     cfg: Config, assembled: AssembledData
 ) -> tuple[LoaderFactory, Iterable[Batch]]:
@@ -999,26 +1061,39 @@ def _build_v3_1_loaders(
         **cast(Any, _v3_loader_options(cfg.data.num_workers)),
     )
 
+    epoch_size = len(positives) * (1 + cfg.data.negative_ratio)
+    train_dataset = SharedEpochTokenPairDataset(
+        assembled.operative_node_ids,
+        epoch_size,
+        store,
+    )
+    train_batch_sampler = LengthBucketedBatchSampler(
+        [(1, 1)] * epoch_size,
+        token_budget=cfg.data.token_budget,
+        shuffle=True,
+        seed=cfg.seed,
+        epoch=0,
+    )
+    train_loader = _ReusableEpochDataLoader(
+        train_dataset,
+        train_batch_sampler,
+        _v3_loader_options(cfg.data.num_workers),
+    )
+
     def factory(epoch: int) -> DataLoader[Batch]:
+        train_loader.ensure_epoch_replaceable()
         negatives = sampler.sample(
             positives, ratio=cfg.data.negative_ratio, seed=cfg.seed, epoch=epoch
         )
         pairs, labels = _shuffled_pairs_and_labels(positives, negatives, cfg.seed, epoch)
         lengths = lengths_for(pairs)
-        dataset = TokenPairDataset(pairs, labels, store, lengths=lengths)
-        batch_sampler = LengthBucketedBatchSampler(
+        train_loader.prepare_epoch(
+            pairs,
+            labels,
             lengths,
-            token_budget=cfg.data.token_budget,
-            shuffle=True,
-            seed=cfg.seed,
             epoch=epoch,
         )
-        return DataLoader(
-            dataset,
-            batch_sampler=batch_sampler,
-            collate_fn=collate_token_pairs,
-            **cast(Any, _v3_loader_options(cfg.data.num_workers)),
-        )
+        return train_loader
 
     return factory, val_loader
 

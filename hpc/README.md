@@ -55,6 +55,10 @@ The production config uses the frozen F1 loader contract:
 - `prefetch_factor: 4`
 - `pin_memory: true`
 
+Training creates one DataLoader and one persistent four-worker pool. At each exhausted
+epoch boundary, the parent process replaces only the shared endpoint-index/label rows
+and the length-bucket sampler state before reusing that same pool for the next epoch.
+
 Preload progress is logged every 1,000 new tensors, followed by a final
 `preloaded ... operative node tensors (... GiB) into host memory` message. During
 this startup pause, no step logs are expected. Once preload completes, step logs begin

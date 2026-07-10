@@ -12,6 +12,9 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Iterator, Mapping, Sequence
+from ctypes import c_float, c_int64
+from multiprocessing import RawArray
+from typing import Any
 
 import numpy as np
 import torch
@@ -82,6 +85,82 @@ class TokenPairDataset(Dataset[dict[str, torch.Tensor]]):
         if self._labels is not None:
             item["label"] = torch.tensor(float(self._labels[index]), dtype=torch.float32)
         return item
+
+
+class SharedEpochTokenPairDataset(Dataset[dict[str, torch.Tensor]]):
+    """Fixed-capacity pair dataset whose epoch rows are visible to persistent workers.
+
+    Endpoint indices and labels live in manager-free shared C arrays. The parent replaces
+    their contents only between fully exhausted DataLoader iterations; workers only read
+    them, so the bulk replacement does not require locks or per-element atomicity.
+    """
+
+    def __init__(self, node_ids: Sequence[str], capacity: int, store: FeatureStore) -> None:
+        """Allocate shared epoch storage over a fixed node-id vocabulary.
+
+        Args:
+            node_ids: Stable node-id vocabulary used by shared endpoint indices.
+            capacity: Exact number of pair rows in every epoch.
+            store: Preloaded feature store read by worker processes.
+
+        Raises:
+            ValueError: If ``node_ids`` contains duplicates or ``capacity`` is negative.
+        """
+        self._node_ids = tuple(node_ids)
+        self._node_index = {node_id: index for index, node_id in enumerate(self._node_ids)}
+        if len(self._node_index) != len(self._node_ids):
+            raise ValueError("node_ids must be unique")
+        if capacity < 0:
+            raise ValueError("capacity must be non-negative")
+        self._capacity = capacity
+        allocated = max(1, capacity)
+        self._a_indices: Any = RawArray(c_int64, allocated)
+        self._b_indices: Any = RawArray(c_int64, allocated)
+        self._labels: Any = RawArray(c_float, allocated)
+        self._store = store
+
+    def __len__(self) -> int:
+        """Return the fixed number of rows in every epoch."""
+        return self._capacity
+
+    def replace_epoch(self, pairs: Sequence[tuple[str, str]], labels: Sequence[int]) -> None:
+        """Replace all endpoint-index and label rows for the next epoch.
+
+        Args:
+            pairs: Epoch pair rows in their existing pre-sampler order.
+            labels: Binary labels aligned with ``pairs``.
+
+        Raises:
+            KeyError: If a pair endpoint is outside the fixed node vocabulary.
+            ValueError: If the epoch row count differs from the fixed capacity.
+        """
+        if len(pairs) != self._capacity or len(labels) != self._capacity:
+            raise ValueError("epoch pairs and labels must match the fixed dataset capacity")
+
+        a_indices = np.fromiter(
+            (self._node_index[node_a] for node_a, _ in pairs),
+            dtype=np.int64,
+            count=self._capacity,
+        )
+        b_indices = np.fromiter(
+            (self._node_index[node_b] for _, node_b in pairs),
+            dtype=np.int64,
+            count=self._capacity,
+        )
+        label_values = np.asarray(labels, dtype=np.float32)
+        np.frombuffer(self._a_indices, dtype=np.int64, count=self._capacity)[:] = a_indices
+        np.frombuffer(self._b_indices, dtype=np.int64, count=self._capacity)[:] = b_indices
+        np.frombuffer(self._labels, dtype=np.float32, count=self._capacity)[:] = label_values
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        """Read the current shared epoch row and load its preloaded token tensors."""
+        node_a = self._node_ids[int(self._a_indices[index])]
+        node_b = self._node_ids[int(self._b_indices[index])]
+        return {
+            "emb_a": self._store.load_tokens(node_a),
+            "emb_b": self._store.load_tokens(node_b),
+            "label": torch.tensor(float(self._labels[index]), dtype=torch.float32),
+        }
 
 
 def probe_lengths(store: FeatureStore, pairs: Sequence[tuple[str, str]]) -> list[tuple[int, int]]:
@@ -157,6 +236,16 @@ class LengthBucketedBatchSampler(Sampler[list[int]]):
         Args:
             epoch: New epoch number.
         """
+        self._epoch = epoch
+
+    def replace_epoch(self, lengths: Sequence[tuple[int, int]], *, epoch: int) -> None:
+        """Replace per-row lengths and RNG epoch before the next iteration.
+
+        Args:
+            lengths: Per-example lengths aligned with the epoch dataset rows.
+            epoch: Epoch used with the fixed base seed for bucket shuffling.
+        """
+        self._lengths = list(lengths)
         self._epoch = epoch
 
     @staticmethod
@@ -395,6 +484,7 @@ __all__ = [
     "BUCKET_BOUNDARIES",
     "LengthBucketedBatchSampler",
     "NegativeSampler",
+    "SharedEpochTokenPairDataset",
     "TokenPairDataset",
     "collate_token_pairs",
     "probe_lengths",
