@@ -764,9 +764,11 @@ def _synthetic_data_config(data_root: Path, *, expected_missing_features: list[s
 
 
 class TestV31LoaderConstruction:
-    def test_preloads_all_operative_nodes_before_creating_loader(
+    def test_preloads_before_both_loaders_and_wires_worker_options(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        from dataclasses import replace
+
         data_root = tmp_path / "data"
         benchmark_root = data_root / "benchmark_2025_neurips"
         benchmark_root.mkdir(parents=True)
@@ -776,8 +778,10 @@ class TestV31LoaderConstruction:
         cfg = _synthetic_data_config(
             data_root, expected_missing_features=["node_000007"]
         )
+        cfg = replace(cfg, data=replace(cfg.data, num_workers=4))
         assembled = assemble_data(cfg, verify=False)
         events: list[tuple[object, ...]] = []
+        loader_kwargs: list[dict[str, object]] = []
         real_preload = assembled.store.preload
 
         def recording_preload(node_ids: Iterable[str] | None = None) -> int:
@@ -787,15 +791,26 @@ class TestV31LoaderConstruction:
 
         def recording_data_loader(*args: object, **kwargs: object) -> list[object]:
             events.append(("loader",))
+            loader_kwargs.append(kwargs)
             return []
 
         monkeypatch.setattr(assembled.store, "preload", recording_preload)
         monkeypatch.setattr(train_b0_module, "DataLoader", recording_data_loader)
 
-        train_b0_module._build_v3_1_loaders(cfg, assembled)
+        factory, _ = train_b0_module._build_v3_1_loaders(cfg, assembled)
+        factory(1)
 
         assert events[0] == ("preload", tuple(assembled.operative_node_ids))
-        assert events[1] == ("loader",)
+        assert events[1:] == [("loader",), ("loader",)]
+        expected_options = {
+            "num_workers": 4,
+            "pin_memory": True,
+            "persistent_workers": True,
+            "prefetch_factor": 4,
+        }
+        assert [
+            {key: kwargs[key] for key in expected_options} for kwargs in loader_kwargs
+        ] == [expected_options, expected_options]
 
 
 class TestAssembleDataFeatureCoverageGate:
