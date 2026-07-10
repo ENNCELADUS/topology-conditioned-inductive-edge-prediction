@@ -72,14 +72,10 @@ class TestFeatureStore:
         real_torch_load = torch.load
         load_count = 0
 
-        def counting_load(
-            path: Path, *, map_location: str, weights_only: bool
-        ) -> object:
+        def counting_load(path: Path, *, map_location: str, weights_only: bool) -> object:
             nonlocal load_count
             load_count += 1
-            return real_torch_load(
-                path, map_location=map_location, weights_only=weights_only
-            )
+            return real_torch_load(path, map_location=map_location, weights_only=weights_only)
 
         monkeypatch.setattr(torch, "load", counting_load)
 
@@ -104,13 +100,9 @@ class TestFeatureStore:
         real_torch_load = torch.load
         loaded_paths: list[Path] = []
 
-        def counting_load(
-            path: Path, *, map_location: str, weights_only: bool
-        ) -> object:
+        def counting_load(path: Path, *, map_location: str, weights_only: bool) -> object:
             loaded_paths.append(path)
-            return real_torch_load(
-                path, map_location=map_location, weights_only=weights_only
-            )
+            return real_torch_load(path, map_location=map_location, weights_only=weights_only)
 
         monkeypatch.setattr(torch, "load", counting_load)
 

@@ -775,9 +775,7 @@ class TestV31LoaderConstruction:
         _build_synthetic_benchmark(benchmark_root, "synthetic")
         features_root = data_root / "features" / "frozen_node_features_1024"
         _write_feature_store(features_root, [f"node_{i:06d}" for i in range(1, 7)])
-        cfg = _synthetic_data_config(
-            data_root, expected_missing_features=["node_000007"]
-        )
+        cfg = _synthetic_data_config(data_root, expected_missing_features=["node_000007"])
         cfg = replace(cfg, data=replace(cfg.data, num_workers=4))
         assembled = assemble_data(cfg, verify=False)
         events: list[tuple[object, ...]] = []
@@ -808,9 +806,10 @@ class TestV31LoaderConstruction:
             "persistent_workers": True,
             "prefetch_factor": 4,
         }
-        assert [
-            {key: kwargs[key] for key in expected_options} for kwargs in loader_kwargs
-        ] == [expected_options, expected_options]
+        assert [{key: kwargs[key] for key in expected_options} for kwargs in loader_kwargs] == [
+            expected_options,
+            expected_options,
+        ]
 
 
 class TestAssembleDataFeatureCoverageGate:
