@@ -373,6 +373,8 @@ resampling cannot contaminate model selection.
 - **F1 path:** length-bucketed batching (boundaries {128, 256, 384, 512, 768, 1024}),
   pad-to-bucket-max with mask; token budget 131,072 tokens auto-sizes the batch;
   `num_workers = 4`, `persistent_workers`, `prefetch_factor = 4`, pinned memory.
+  Workers prefetch descriptor-only row indices; the parent process materializes padded
+  tensors from the preloaded host cache, so large batches do not traverse `/dev/shm`.
 - Hungarian matching runs per node on K×K ≤ 16×16 cost matrices
   (`scipy.linear_sum_assignment` on CPU from GPU-computed costs); no inter-process
   interaction.
@@ -477,6 +479,9 @@ Accelerate, PyTorch, and CUDA versions.
 - 2026-07-10: aligned the B0 F1 implementation to the already-frozen §10.4 loader
   contract and disabled computation of unused custom attention weights; normative
   values and experiment semantics are unchanged.
+- 2026-07-10: hardened the same F1 loader contract for the fixed container's 4 GiB
+  `/dev/shm`: worker IPC is descriptor-only and parent-process collation allocates the
+  unchanged batch in pinned host memory; sampler and model semantics are unchanged.
 
 **Open items before code (not blockers):** the four ego-stat target definitions
 pinned to evaluator implementations; FLOPs/latency table template (§4.7 commitment);

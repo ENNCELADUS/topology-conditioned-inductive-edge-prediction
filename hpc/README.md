@@ -58,6 +58,9 @@ The production config uses the frozen F1 loader contract:
 Training creates one DataLoader and one persistent four-worker pool. At each exhausted
 epoch boundary, the parent process replaces only the shared endpoint-index/label rows
 and the length-bucket sampler state before reusing that same pool for the next epoch.
+Worker IPC is descriptor-only: workers prefetch integer row ids, so padded token tensors
+never pass through the container's `/dev/shm`. The main process uses the preloaded cache
+to materialize each padded batch directly in pinned host memory before non-blocking H2D.
 
 Preload progress is logged every 1,000 new tensors, followed by a final
 `preloaded ... operative node tensors (... GiB) into host memory` message. During

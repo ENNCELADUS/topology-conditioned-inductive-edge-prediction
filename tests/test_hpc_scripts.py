@@ -116,4 +116,7 @@ def test_runbook_documents_the_v31_input_pipeline_startup_contract() -> None:
         assert option in text
     assert "no step logs" in lower_text
     assert "preload completes" in lower_text
+    assert "descriptor-only" in lower_text
+    assert "/dev/shm" in text
+    assert "main process" in lower_text
     assert "configs/b0_v31_breadth_first.yaml" in text

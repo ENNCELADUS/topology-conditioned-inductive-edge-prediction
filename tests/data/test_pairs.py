@@ -14,7 +14,9 @@ from src.data.pairs import (
     BUCKET_BOUNDARIES,
     LengthBucketedBatchSampler,
     NegativeSampler,
+    SharedEpochTokenPairDataset,
     TokenPairDataset,
+    collate_pair_indices,
     collate_token_pairs,
     probe_lengths,
 )
@@ -212,6 +214,31 @@ class TestCollateTokenPairs:
 
         with pytest.raises(ValueError, match="label"):
             collate_token_pairs(items)
+
+
+class TestDescriptorOnlyWorkerPayload:
+    def test_shared_epoch_dataset_workers_return_only_row_indices(self, tmp_path: Path) -> None:
+        shapes = {"node_000001": (5, 4), "node_000002": (3, 4)}
+        root = _write_feature_root(tmp_path, shapes, input_dim=4)
+        store = FeatureStore(root)
+        store.preload()
+        dataset = SharedEpochTokenPairDataset(
+            ["node_000001", "node_000002"],
+            capacity=1,
+            store=store,
+        )
+        dataset.replace_epoch([("node_000001", "node_000002")], [1])
+
+        worker_payload = collate_pair_indices([dataset[0]])
+
+        assert worker_payload == [0]
+        assert not any(isinstance(value, torch.Tensor) for value in worker_payload)
+
+        batch = dataset.materialize(worker_payload, pin_memory=False)
+        assert set(batch) == {"emb_a", "emb_b", "len_a", "len_b", "label"}
+        assert batch["emb_a"].shape == (1, 5, 4)
+        assert batch["emb_b"].shape == (1, 3, 4)
+        assert batch["label"].item() == 1.0
 
 
 class TestV3_1IntegrationSmoke:

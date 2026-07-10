@@ -87,12 +87,13 @@ class TokenPairDataset(Dataset[dict[str, torch.Tensor]]):
         return item
 
 
-class SharedEpochTokenPairDataset(Dataset[dict[str, torch.Tensor]]):
+class SharedEpochTokenPairDataset(Dataset[int]):
     """Fixed-capacity pair dataset whose epoch rows are visible to persistent workers.
 
     Endpoint indices and labels live in manager-free shared C arrays. The parent replaces
-    their contents only between fully exhausted DataLoader iterations; workers only read
-    them, so the bulk replacement does not require locks or per-element atomicity.
+    their contents only between fully exhausted DataLoader iterations. Workers return only
+    integer row descriptors; the parent reads the shared rows and materializes padded token
+    tensors from its preloaded feature cache, avoiding large tensor IPC through ``/dev/shm``.
     """
 
     def __init__(self, node_ids: Sequence[str], capacity: int, store: FeatureStore) -> None:
@@ -101,7 +102,7 @@ class SharedEpochTokenPairDataset(Dataset[dict[str, torch.Tensor]]):
         Args:
             node_ids: Stable node-id vocabulary used by shared endpoint indices.
             capacity: Exact number of pair rows in every epoch.
-            store: Preloaded feature store read by worker processes.
+            store: Preloaded feature store read by the parent during materialization.
 
         Raises:
             ValueError: If ``node_ids`` contains duplicates or ``capacity`` is negative.
@@ -152,15 +153,33 @@ class SharedEpochTokenPairDataset(Dataset[dict[str, torch.Tensor]]):
         np.frombuffer(self._b_indices, dtype=np.int64, count=self._capacity)[:] = b_indices
         np.frombuffer(self._labels, dtype=np.float32, count=self._capacity)[:] = label_values
 
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        """Read the current shared epoch row and load its preloaded token tensors."""
-        node_a = self._node_ids[int(self._a_indices[index])]
-        node_b = self._node_ids[int(self._b_indices[index])]
-        return {
-            "emb_a": self._store.load_tokens(node_a),
-            "emb_b": self._store.load_tokens(node_b),
-            "label": torch.tensor(float(self._labels[index]), dtype=torch.float32),
-        }
+    def __getitem__(self, index: int) -> int:
+        """Return a small row descriptor for worker prefetch and IPC."""
+        return index
+
+    def materialize(self, indices: Sequence[int], *, pin_memory: bool) -> dict[str, torch.Tensor]:
+        """Build one padded batch in the parent process from preloaded token tensors.
+
+        Args:
+            indices: Shared row indices returned by DataLoader workers.
+            pin_memory: Whether the newly allocated batch tensors use pinned host memory.
+
+        Returns:
+            The unchanged ``V3_1`` batch contract.
+        """
+        use_pinned_memory = pin_memory and torch.cuda.is_available()
+        items: list[dict[str, torch.Tensor]] = []
+        for index in indices:
+            node_a = self._node_ids[int(self._a_indices[index])]
+            node_b = self._node_ids[int(self._b_indices[index])]
+            items.append(
+                {
+                    "emb_a": self._store.load_tokens(node_a),
+                    "emb_b": self._store.load_tokens(node_b),
+                    "label": torch.tensor(float(self._labels[index]), dtype=torch.float32),
+                }
+            )
+        return collate_token_pairs(items, pin_memory=use_pinned_memory)
 
 
 def probe_lengths(store: FeatureStore, pairs: Sequence[tuple[str, str]]) -> list[tuple[int, int]]:
@@ -295,12 +314,21 @@ class LengthBucketedBatchSampler(Sampler[list[int]]):
         yield from batches
 
 
-def collate_token_pairs(items: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+def collate_pair_indices(items: list[int]) -> list[int]:
+    """Return worker-fetched row descriptors without creating tensor storage."""
+    return items
+
+
+def collate_token_pairs(
+    items: list[dict[str, torch.Tensor]], *, pin_memory: bool = False
+) -> dict[str, torch.Tensor]:
     """Collate a list of pair items into the ``V3_1`` batch contract.
 
     Args:
         items: List of per-example dicts, each with ``emb_a``/``emb_b`` (and
             optionally ``label``), as produced by :class:`TokenPairDataset`.
+        pin_memory: Allocate the collated batch in pinned host memory. This is used by
+            the V3.1 training loader only after descriptor IPC returns to the parent.
 
     Returns:
         Dict with keys exactly ``emb_a``, ``emb_b``, ``len_a``, ``len_b``, and (only if
@@ -316,32 +344,44 @@ def collate_token_pairs(items: list[dict[str, torch.Tensor]]) -> dict[str, torch
     if any(has_label) and not all(has_label):
         raise ValueError("collate_token_pairs requires all items or no items to have a label")
 
-    len_a = torch.tensor([item["emb_a"].size(0) for item in items], dtype=torch.int64)
-    len_b = torch.tensor([item["emb_b"].size(0) for item in items], dtype=torch.int64)
+    len_a = torch.tensor(
+        [item["emb_a"].size(0) for item in items],
+        dtype=torch.int64,
+        pin_memory=pin_memory,
+    )
+    len_b = torch.tensor(
+        [item["emb_b"].size(0) for item in items],
+        dtype=torch.int64,
+        pin_memory=pin_memory,
+    )
 
     batch: dict[str, torch.Tensor] = {
-        "emb_a": _pad_stack([item["emb_a"] for item in items]),
-        "emb_b": _pad_stack([item["emb_b"] for item in items]),
+        "emb_a": _pad_stack([item["emb_a"] for item in items], pin_memory=pin_memory),
+        "emb_b": _pad_stack([item["emb_b"] for item in items], pin_memory=pin_memory),
         "len_a": len_a,
         "len_b": len_b,
     }
     if all(has_label):
-        batch["label"] = torch.stack([item["label"] for item in items]).float()
+        labels = torch.empty(len(items), dtype=torch.float32, pin_memory=pin_memory)
+        for index, item in enumerate(items):
+            labels[index] = item["label"]
+        batch["label"] = labels
     return batch
 
 
-def _pad_stack(tensors: list[torch.Tensor]) -> torch.Tensor:
+def _pad_stack(tensors: list[torch.Tensor], *, pin_memory: bool = False) -> torch.Tensor:
     """Zero-pad a list of ``(L_i, D)`` tensors to a common ``(B, max_L, D)`` tensor.
 
     Args:
         tensors: List of per-example ``(L_i, D)`` tensors sharing feature dim ``D``.
+        pin_memory: Allocate the padded output in pinned host memory.
 
     Returns:
         A zero-padded ``(len(tensors), max_L, D)`` float32 tensor.
     """
     max_len = max(tensor.size(0) for tensor in tensors)
     dim = tensors[0].size(1)
-    out = torch.zeros(len(tensors), max_len, dim, dtype=torch.float32)
+    out = torch.zeros(len(tensors), max_len, dim, dtype=torch.float32, pin_memory=pin_memory)
     for i, tensor in enumerate(tensors):
         out[i, : tensor.size(0)] = tensor
     return out
@@ -486,6 +526,7 @@ __all__ = [
     "NegativeSampler",
     "SharedEpochTokenPairDataset",
     "TokenPairDataset",
+    "collate_pair_indices",
     "collate_token_pairs",
     "probe_lengths",
 ]

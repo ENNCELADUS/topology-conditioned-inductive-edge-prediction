@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pickle
 from collections.abc import Iterable
 from pathlib import Path
@@ -18,7 +19,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
 from src.data.artifacts import ArtifactVerificationError
-from src.data.pairs import LengthBucketedBatchSampler
+from src.data.pairs import (
+    LengthBucketedBatchSampler,
+    SharedEpochTokenPairDataset,
+    collate_pair_indices,
+)
 from src.eval.edge_metrics import EdgeMetrics
 from src.model.B0 import BEST_V3_1_CONFIG, V3_1
 from src.model.b0_alt import F0PairMLP
@@ -814,6 +819,41 @@ class TestV31LoaderConstruction:
             assert loader.pin_memory is True
             assert loader.persistent_workers is True
             assert loader.prefetch_factor == 4
+            assert loader.collate_fn is collate_pair_indices
+            assert isinstance(loader.dataset[0], int)
+
+    def test_train_and_val_materialize_pinned_batches_in_parent_process(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        data_root = tmp_path / "data"
+        benchmark_root = data_root / "benchmark_2025_neurips"
+        benchmark_root.mkdir(parents=True)
+        _build_synthetic_benchmark(benchmark_root, "synthetic")
+        features_root = data_root / "features" / "frozen_node_features_1024"
+        _write_feature_store(features_root, [f"node_{i:06d}" for i in range(1, 7)])
+        cfg = _synthetic_data_config(data_root, expected_missing_features=["node_000007"])
+        assembled = assemble_data(cfg, verify=False)
+        materialize_calls: list[tuple[int, bool]] = []
+        real_materialize = SharedEpochTokenPairDataset.materialize
+
+        def recording_materialize(
+            self: SharedEpochTokenPairDataset,
+            indices: list[int],
+            *,
+            pin_memory: bool,
+        ) -> dict[str, torch.Tensor]:
+            materialize_calls.append((os.getpid(), pin_memory))
+            return real_materialize(self, indices, pin_memory=False)
+
+        monkeypatch.setattr(SharedEpochTokenPairDataset, "materialize", recording_materialize)
+
+        factory, val_loader = train_b0_module._build_v3_1_loaders(cfg, assembled)
+        list(factory(1))
+        list(val_loader)
+
+        assert len(materialize_calls) >= 2
+        assert {pid for pid, _ in materialize_calls} == {os.getpid()}
+        assert all(pin_memory for _, pin_memory in materialize_calls)
 
     def test_factory_returns_same_training_loader_after_epoch_exhaustion(
         self, tmp_path: Path

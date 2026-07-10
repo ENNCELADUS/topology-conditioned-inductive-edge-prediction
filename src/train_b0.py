@@ -40,8 +40,7 @@ from src.data.pairs import (
     LengthBucketedBatchSampler,
     NegativeSampler,
     SharedEpochTokenPairDataset,
-    TokenPairDataset,
-    collate_token_pairs,
+    collate_pair_indices,
 )
 from src.data.partition import build_g_struct, derive_partition
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
@@ -960,7 +959,31 @@ def _v3_loader_options(num_workers: int) -> dict[str, object]:
     return options
 
 
-class _ReusableEpochDataLoader(DataLoader[Batch]):
+class _DescriptorDataLoader(DataLoader[Any]):
+    """Prefetch row descriptors in workers and materialize token batches in the parent."""
+
+    def __init__(
+        self,
+        dataset: SharedEpochTokenPairDataset,
+        batch_sampler: LengthBucketedBatchSampler,
+        loader_options: dict[str, object],
+    ) -> None:
+        """Bind a descriptor dataset to the pinned V3.1 loader options."""
+        super().__init__(
+            dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=collate_pair_indices,
+            **cast(Any, loader_options),
+        )
+        self._descriptor_dataset = dataset
+
+    def __iter__(self) -> Iterator[Batch]:  # type: ignore[override]
+        """Materialize each prefetched descriptor batch from the parent feature cache."""
+        for indices in super().__iter__():
+            yield self._descriptor_dataset.materialize(indices, pin_memory=self.pin_memory)
+
+
+class _ReusableEpochDataLoader(_DescriptorDataLoader):
     """One DataLoader whose shared dataset is replaced only between exhausted epochs."""
 
     def __init__(
@@ -970,12 +993,7 @@ class _ReusableEpochDataLoader(DataLoader[Batch]):
         loader_options: dict[str, object],
     ) -> None:
         """Bind shared worker data and the parent-process mutable batch sampler."""
-        super().__init__(
-            dataset,
-            batch_sampler=batch_sampler,
-            collate_fn=collate_token_pairs,
-            **cast(Any, loader_options),
-        )
+        super().__init__(dataset, batch_sampler, loader_options)
         self._epoch_dataset = dataset
         self._epoch_batch_sampler = batch_sampler
         self._epoch_exhausted = True
@@ -1051,14 +1069,16 @@ def _build_v3_1_loaders(
     val_pairs = assembled.benchmark.split.val_pairs
     val_labels = [int(label) for label in val_pairs.labels]
     val_lengths = lengths_for(val_pairs.pairs)
-    val_dataset = TokenPairDataset(val_pairs.pairs, val_labels, store, lengths=val_lengths)
-    val_loader: DataLoader[Batch] = DataLoader(
+    val_dataset = SharedEpochTokenPairDataset(
+        assembled.operative_node_ids,
+        len(val_pairs.pairs),
+        store,
+    )
+    val_dataset.replace_epoch(val_pairs.pairs, val_labels)
+    val_loader: Iterable[Batch] = _DescriptorDataLoader(
         val_dataset,
-        batch_sampler=LengthBucketedBatchSampler(
-            val_lengths, token_budget=cfg.data.token_budget, shuffle=False
-        ),
-        collate_fn=collate_token_pairs,
-        **cast(Any, _v3_loader_options(cfg.data.num_workers)),
+        LengthBucketedBatchSampler(val_lengths, token_budget=cfg.data.token_budget, shuffle=False),
+        _v3_loader_options(cfg.data.num_workers),
     )
 
     epoch_size = len(positives) * (1 + cfg.data.negative_ratio)
@@ -1080,7 +1100,7 @@ def _build_v3_1_loaders(
         _v3_loader_options(cfg.data.num_workers),
     )
 
-    def factory(epoch: int) -> DataLoader[Batch]:
+    def factory(epoch: int) -> Iterable[Batch]:
         train_loader.ensure_epoch_replaceable()
         negatives = sampler.sample(
             positives, ratio=cfg.data.negative_ratio, seed=cfg.seed, epoch=epoch
