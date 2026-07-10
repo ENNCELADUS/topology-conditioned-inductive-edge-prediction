@@ -39,6 +39,27 @@ hpc/run.sh train configs/b0_v31_breadth_first.yaml
 hpc/run.sh train configs/b0_alt_breadth_first.yaml
 ```
 
+### V3.1/F1 startup and host memory
+
+The production F1 launch is
+`hpc/run.sh train configs/b0_v31_breadth_first.yaml`. Before its DataLoader workers
+start, the process performs a one-time ~25 GiB preload of the operative raw-token
+tensors into CPU host memory. Before launching, run
+`free -h` and verify that the `available` column is at least 25 GiB, with additional
+headroom for the training process, workers, and pinned batches.
+
+The production config uses the frozen F1 loader contract:
+
+- `num_workers: 4`
+- `persistent_workers: true`
+- `prefetch_factor: 4`
+- `pin_memory: true`
+
+Preload progress is logged every 1,000 new tensors, followed by a final
+`preloaded ... operative node tensors (... GiB) into host memory` message. During
+this startup pause, no step logs are expected. Once preload completes, step logs begin
+every 50 optimizer steps; the pause does not by itself indicate a stalled run.
+
 Score the candidate universe once per checkpoint. `run.sh score` always injects
 `--device cuda --amp bf16`; the single-H20 reference run is intentionally unsharded.
 
@@ -75,5 +96,13 @@ mkdir -p outputs/logs
 nohup hpc/run.sh train configs/b0_v31_breadth_first.yaml \
   > outputs/logs/b0_v31_train.log 2>&1 &
 ```
+
+After launch, verify all of the following before leaving the run unattended:
+
+- `tail -f outputs/logs/b0_v31_train.log` shows preload progress and the final
+  `preloaded ...` summary; do not expect `epoch ... step ...` lines before that summary.
+- After preload, `epoch ... step ...` values advance rather than remaining fixed.
+- `nvidia-smi` shows the training process and nonzero GPU memory use.
+- The log contains neither `NaN` nor `Traceback`.
 
 `--max-steps` remains debug-only and must not be used for a reported experiment.

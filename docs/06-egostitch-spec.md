@@ -474,6 +474,9 @@ Accelerate, PyTorch, and CUDA versions.
   one fixed H20 container, one process, BF16, direct `hpc/run.sh` execution, and no
   Slurm/DDP/NCCL path. Accelerate remains the single-process training/checkpoint
   wrapper; the previous 4/8-H20 execution plan is superseded.
+- 2026-07-10: aligned the B0 F1 implementation to the already-frozen §10.4 loader
+  contract and disabled computation of unused custom attention weights; normative
+  values and experiment semantics are unchanged.
 
 **Open items before code (not blockers):** the four ego-stat target definitions
 pinned to evaluator implementations; FLOPs/latency table template (§4.7 commitment);

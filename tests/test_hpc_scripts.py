@@ -97,3 +97,23 @@ def test_primary_docs_reference_only_the_direct_hpc_layer() -> None:
         text = path.read_text()
         assert "slurm/" not in text.lower()
         assert "sbatch" not in text.lower()
+
+
+def test_runbook_documents_the_v31_input_pipeline_startup_contract() -> None:
+    """Operators can distinguish the expected preload pause from a stalled run."""
+    text = (HPC_DIR / "README.md").read_text()
+    lower_text = text.lower()
+
+    assert "one-time" in lower_text
+    assert "~25 gib" in lower_text
+    assert "host memory" in lower_text
+    for option in (
+        "num_workers: 4",
+        "persistent_workers: true",
+        "prefetch_factor: 4",
+        "pin_memory: true",
+    ):
+        assert option in text
+    assert "no step logs" in lower_text
+    assert "preload completes" in lower_text
+    assert "configs/b0_v31_breadth_first.yaml" in text
