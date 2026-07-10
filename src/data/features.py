@@ -143,7 +143,7 @@ def build_f0_matrix(
     index = {node_id: i for i, node_id in enumerate(resolved_node_ids)}
 
     if cache_path is not None:
-        # Concurrent writers (e.g. Slurm array tasks sharing a default cache path) must
+        # Concurrent writers (e.g. parallel shard processes sharing a default cache path) must
         # never expose a partially-written file to readers: write to a per-process temp
         # file in the same directory, then atomically replace.
         tmp_path = cache_path.with_name(f"{cache_path.name}.tmp-{os.getpid()}")

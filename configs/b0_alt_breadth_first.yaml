@@ -24,4 +24,4 @@ eval:
   eval_every: 1
 seed: 47
 output_dir: outputs/b0_alt
-mixed_precision: "no" # "no" | "bf16"; set to "bf16" for cluster GPU runs (edit here or pass a CLI override if added)
+mixed_precision: "bf16" # pinned for the single-H20 container

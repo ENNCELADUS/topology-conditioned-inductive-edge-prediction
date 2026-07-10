@@ -5,7 +5,7 @@
 `04-model-proposal.md` revision 2.1 (approved as a design proposal; **gate G4 was
 signed off later the same day — `06-egostitch-spec.md` is now the implementation
 contract**, including its §9 benchmark binding / data contract and §10–11
-batch-sampler and DDP execution design). Changes:
+batch-sampler and single-H20 execution design). Changes:
 pre-implementation gates G1–G5, baseline ladder extensions (`B0+cal`, `B3-dist`,
 `B3-full`, `B5`, external attribute-only baselines), trained-on vs held-out metric
 families, ceiling and Oracle reference rows, hard-negative construction for zero-edge

@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) and Codex when working with code in this repository.
 
 ## What this repository is
 
@@ -9,7 +9,7 @@ Edge Prediction*. It contains design documents, result notes, self-contained HTM
 figures, benchmark data artifacts, and a curated literature library. Implementation
 has now begun on the **pre-implementation gates and baselines**: `src/` holds a typed,
 tested Python package (data loaders, eval metrics, the B0/B0-alt frozen scorers, and
-the G1/G2 gate-analysis pipelines), a Slurm submission layer, and a full pytest suite.
+the G1/G2 gate-analysis pipelines), a direct single-H20 execution layer, and a full pytest suite.
 The **proposed model (EgoStitch) is not yet implemented** — gates G1–G3 (hardened E2,
 ceiling curve, Oracle) must pass before model code is written. The EgoStitch design and
 implementation spec were approved 2026-07-09.
@@ -17,7 +17,7 @@ implementation spec were approved 2026-07-09.
 `README.md` is the human-facing entry point (orientation, status, structure map,
 reading order). This file (`CLAUDE.md`) holds the binding *constraints* an agent
 must respect. Code lives under `src/`; `docs/06-egostitch-spec.md` (algorithm + data
-contract + DDP design) and `docs/03-experiment-protocol.md` (what to run, how to
+contract + single-GPU execution design) and `docs/03-experiment-protocol.md` (what to run, how to
 grade) are the contracts it must implement.
 
 ## Repository layout
@@ -34,7 +34,7 @@ docs/
   04-model-proposal.md           EgoStitch model rationale (APPROVED 2026-07-09)
   05-review-report.md            novelty-check + 5-persona review record
   06-egostitch-spec.md           implementation contract (G4 signed off): algorithm,
-                                 benchmark/data contract, batch sampler, DDP design
+                                 benchmark/data contract, batch sampler, 1×H20 design
   lit-review-plan.md             review plan, claims K1–K5, terminology guardrail
   results/E2-pair-to-topology-gap.md   motivating result note
 figures/                         e2-gap.html, positioning.html (standalone, open in browser)
@@ -53,9 +53,9 @@ src/
   score_universe.py  CLI: score pair lists -> pinned .npz scores artifact (shardable)
   experiments/ g1_hardened_e2.py, g2_ceiling.py (gate analyses over cached scores)
 configs/        b0_v31_breadth_first.yaml, b0_alt_breadth_first.yaml
-slurm/          cluster submission layer (submit.sh, *.sbatch, cluster.env — see slurm/README.md)
+hpc/            fixed 1×H20 container runner (run.sh + environment/runbook README)
 outputs/        run artifacts: checkpoints, metrics, cached score matrices (gitignored)
-tests/          pytest suite mirroring src/ (data/, eval/, experiments/, CLIs, slurm)
+tests/          pytest suite mirroring src/ (data/, eval/, experiments/, CLIs, hpc)
 literature/     curated reference library (gitignored, unchanged)
 ```
 
@@ -92,8 +92,10 @@ python -m src.experiments.g2_ceiling    --universe scores/b0_v31_candidate.npz \
     --data-root data --strategy breadth_first --output-dir outputs/g2
 ```
 
-Cluster runs go through the Slurm layer (`slurm/README.md`): fill `slurm/cluster.env`,
-then `slurm/sync_code.sh` → `slurm/submit.sh preflight` → `train_b0` / `score_universe`.
+HPC runs execute directly in the fixed 1×NVIDIA H20 container through
+`hpc/run.sh`; `hpc/README.md` pins the SSH endpoint, repository/data paths,
+Python/PyTorch/CUDA versions, and the exact `check → train → score → G1/G2` sequence.
+There is no scheduler or multi-GPU launch layer.
 
 **Tooling gotcha:** mypy is strict with `warn_unused_ignores = true`. Don't run two
 `mypy` invocations against the same `.mypy_cache` concurrently — it corrupts the cache
@@ -108,12 +110,12 @@ flow is deliberately **score-once, analyze-many**:
    package (`artifacts.py`), enforces the node-disjoint split and message/supervision
    partition (`partition.py`, spec §9.3), builds token-pair datasets with a negative
    sampler (`pairs.py`), and serves frozen per-node features (`features.py`). The 25 GB
-   feature cache is gitignored and must already exist locally / on cluster storage.
+   feature cache is gitignored and must already exist locally / in the fixed container checkout.
 2. **Train** (`src/train_b0.py`) fits a frozen B0-family scorer (`model/B0.py` V3.1, or
    `model/b0_alt.py` MLP) and writes a Task-4-format checkpoint under `outputs/`.
 3. **Score** (`src/score_universe.py`) runs a checkpoint over the candidate universe /
    val / test pairs *once* and writes a single self-contained `.npz` scores artifact
-   (shardable for cluster runs, with a `merge` subcommand).
+   (the CLI remains shardable, but the pinned single-H20 run is unsharded; `merge` remains available).
 4. **Gate analyses** (`src/experiments/`) are pure row-selections + graph math over that
    cached artifact — **no model scoring happens here**. `g1_hardened_e2.py` builds the
    hardened-E2 gate table (negative regimes, threshold/density-matched operating point,
@@ -160,7 +162,7 @@ nodes?" If a draft starts describing graph generation as the task, it has drifte
 5. `docs/06-egostitch-spec.md` — the **implementation contract** (gate G4 signed off
    2026-07-09): pinned algorithm/shapes/losses, §9 benchmark binding and data
    contract (including quarantined artifacts and the self-loop policy), §10 batch
-   sampler, §11 DDP execution design. Its freeze rule is binding: code may not
+   sampler, §11 single-H20 execution design. Its freeze rule is binding: code may not
    silently deviate — edit the spec first, with a change-log line.
 6. `docs/results/E2-pair-to-topology-gap.md` — the motivating result note (numbers
    below; provisional until gate G1).

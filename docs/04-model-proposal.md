@@ -2,7 +2,7 @@
 
 **Status:** **revision 2.2** — approved as a design proposal (2026-07-09); **gate G4
 signed off 2026-07-09**, so `06-egostitch-spec.md` (including its §9 benchmark
-binding and §10–11 batch-sampler/DDP contracts) is now the active implementation
+binding and §10–11 batch-sampler/single-H20 contracts) is now the active implementation
 contract. Companion to `03-experiment-protocol.md` (updated 2026-07-09 with the
 approved [protocol-Δ] items) and `02-methodology.md`.
 

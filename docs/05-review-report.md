@@ -337,5 +337,6 @@ implementation contract**, with three required amendments — all executed:
    binding / data contract — including quarantine of the shipped
    `*_ratio5_exclusive.txt` negatives, which mix train- and test-side nodes, and of
    `train_graph.pkl` as a structural-target source, since it contains every val
-   positive), §10 (batch sampler), and §11 (DDP execution design for 4/8 × H20).
+   positive), §10 (batch sampler), and the original §11 DDP execution design for
+   4/8 × H20 (superseded 2026-07-10 by the locked 1×H20 single-process design).
    Remaining before any model code: gates G1 → G2 → G3.

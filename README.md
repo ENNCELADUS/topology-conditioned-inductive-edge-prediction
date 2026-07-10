@@ -8,7 +8,7 @@
   <img alt="Venue" src="https://img.shields.io/badge/target-ICLR%202027-b31b1b">
   <img alt="Type" src="https://img.shields.io/badge/paper-empirical%20ML%20method-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-design%20phase-yellow">
-  <img alt="Code" src="https://img.shields.io/badge/implementation-pending-lightgrey">
+  <img alt="Code" src="https://img.shields.io/badge/implementation-baselines%20%2B%20gates-green">
 </p>
 
 <p>
@@ -26,10 +26,10 @@
 
 ## TL;DR
 
-This repository holds the design of an ICLR 2027 paper. **There is no implementation
-code yet** — it currently contains the problem framing, methodology, a self-contained
-experiment protocol, a model proposal awaiting approval, one motivating result, and a
-curated literature library.
+This repository holds the design and pre-implementation gate pipeline for an ICLR 2027
+paper. The benchmark loaders, evaluation library, B0/B0-alt baselines, score-once
+artifact pipeline, and gates G1/G2 are implemented and tested. **EgoStitch itself is not
+implemented**; gates G1–G3 must pass before model code is written.
 
 - **Task:** given two *unseen* nodes with frozen feature vectors, predict whether an
   edge exists between them (binary classification), under a strict inductive protocol
@@ -92,7 +92,7 @@ fixable by threshold tuning alone.
 
 > **Status: approved (2026-07-09).** Design proposal approved and gate G4 signed off —
 > [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) is the active implementation
-> contract (algorithm spec + benchmark/data contract + DDP execution design). Design
+> contract (algorithm spec + benchmark/data contract + single-H20 execution design). Design
 > rationale: [`docs/04-model-proposal.md`](docs/04-model-proposal.md); review record:
 > [`docs/05-review-report.md`](docs/05-review-report.md). Pre-implementation gates G1–G3
 > must still pass before model code is written.
@@ -127,7 +127,7 @@ docs/
   03-experiment-protocol.md      run/eval contract: baselines, E1–E7, metrics, gates G1–G5
   04-model-proposal.md           EgoStitch model rationale  (APPROVED 2026-07-09)
   05-review-report.md            novelty check + 5-persona review record
-  06-egostitch-spec.md           algorithm + data + DDP spec  ← implementation contract (G4 signed off)
+  06-egostitch-spec.md           algorithm + data + 1×H20 spec  ← implementation contract (G4 signed off)
   lit-review-plan.md             review plan, claims K1–K5, terminology guardrail
   results/
     E2-pair-to-topology-gap.md   the motivating result note
@@ -139,7 +139,15 @@ data/
   benchmark_2025_neurips/        graph, edge lists, split artifacts, evaluation buckets
   features/                      neutral node-feature index
 src/
-  README.md                      implementation-contract stub (no code yet)
+  data/                          verified benchmark/features + pair batching
+  eval/                          edge and assembled-graph metrics
+  model/                         frozen B0 and B0-alt scorers
+  experiments/                   implemented G1/G2 cached-score analyses
+  train_b0.py                    baseline training CLI
+  score_universe.py              score-once artifact CLI
+hpc/
+  run.sh                         direct fixed 1×H20 runner
+  README.md                      verified environment + exact experiment runbook
 literature/                      curated reference library (gitignored)
   models/                        PDFs by topic; filename YEAR_venue_short_title.pdf
   research_reports/              markdown synthesis notes
@@ -158,7 +166,7 @@ general graph-ML benchmark. Don't substitute real dataset names unless asked.
 | 2 | [`docs/02-methodology.md`](docs/02-methodology.md) | Method contract + training objective |
 | 3 | [`docs/03-experiment-protocol.md`](docs/03-experiment-protocol.md) | **Source of truth** for what to run and how to grade it |
 | 4 | [`docs/04-model-proposal.md`](docs/04-model-proposal.md) | EgoStitch rationale (approved 2026-07-09) |
-| 5 | [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) | **Implementation contract**: algorithm, data/batch contract, DDP design |
+| 5 | [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) | **Implementation contract**: algorithm, data/batch contract, 1×H20 execution |
 | 6 | [`docs/results/E2-pair-to-topology-gap.md`](docs/results/E2-pair-to-topology-gap.md) | Motivating result |
 | 7 | [`docs/lit-review-plan.md`](docs/lit-review-plan.md) | Review plan, claims, terminology guardrail |
 
@@ -179,10 +187,19 @@ target test graph; the queried edge is masked/standardized inside the scaffold. 
 - [x] **E2 — pair-to-topology gap** established (motivating result + figure).
 - [x] **Blueprint, methodology, and experiment protocol** written and locked.
 - [x] **EgoStitch proposal** — approved 2026-07-09; reviewed via novelty check + 5-persona panel ([`docs/05-review-report.md`](docs/05-review-report.md)).
-- [x] **G4 spec freeze** — [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) signed off (algorithm + benchmark data contract + batch sampler + DDP design).
+- [x] **G4 spec freeze** — [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) signed off (algorithm + benchmark data contract + batch sampler + single-H20 execution).
+- [x] **Baseline + gate pipeline** — benchmark/features, B0/B0-alt training, cached scoring, G1/G2 analyses, and tests are implemented.
 - [ ] **Gates G1–G3** — hardened E2 rerun, edge-independence ceiling curve, Oracle row (must pass before model code).
-- [ ] **Implementation** under `src/`, per [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) and the [experiment protocol](docs/03-experiment-protocol.md).
+- [ ] **EgoStitch implementation** under `src/`, per [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) and the [experiment protocol](docs/03-experiment-protocol.md).
 - [ ] **Experiments** in priority order: E2 (hardened) → E1/E3 main + baselines → E4 ablations → E5 integrity gates → E7 (load-bearing) → E6 breadth.
+
+## HPC execution
+
+The reference environment is a fixed container with one NVIDIA H20. Run
+`hpc/run.sh check`, then use the same runner for baseline training, cached scoring,
+and G1/G2. The verified host, repository/data paths, software versions, foreground
+commands, and `nohup` form are pinned in [`hpc/README.md`](hpc/README.md). There is no
+scheduler or multi-GPU launch layer.
 
 ## Literature
 

@@ -4,7 +4,7 @@ Scores node-pair lists with a frozen B0-family checkpoint (Task-4 format:
 ``{"model_state", "model_family", "model_config", ...}``) and writes the single
 self-contained ``.npz`` artifact the G1/G2 analyses consume. Pairs come from the
 candidate universe, the val/test edge files, or an arbitrary TSV
-(``u\tv[\tlabel]``). Supports contiguous row-range sharding for cluster runs
+(``u\tv[\tlabel]``). Supports optional contiguous row-range sharding
 plus a ``merge`` subcommand that validates and concatenates shard outputs.
 
 CLI::

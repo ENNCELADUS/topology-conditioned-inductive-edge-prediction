@@ -8,7 +8,7 @@ interior weights. Neutral placeholders per repository convention; no dataset nam
 Nothing here changes the model of `04-model-proposal.md` — this document pins the free
 parameters that document left symbolic. §§9–11 (added at sign-off) bind the spec to
 the local benchmark package in `data/`, define the batch-sampler / data contract, and
-fix the DDP execution design.
+fix the single-H20 execution design.
 
 **Freeze rule.** This spec is signed off: implementation may not silently deviate;
 any change is an edit here first, with a one-line rationale in §12 (change log).
@@ -330,12 +330,12 @@ test, and candidate files as `(u, u)` rows). Binding rules:
 
 ### 10.1 Streams and composite step
 
-One optimizer step consumes three independently-sampled minibatches (per rank;
-global = × world size; defaults sweep ±2×):
+One optimizer step consumes three independently-sampled minibatches in the single
+process (defaults sweep ±2×):
 
-| Stream | Source | Per-rank default | Feeds |
+| Stream | Source | Default | Feeds |
 |---|---|---|---|
-| node stream | uniform over V_train (loader sharded by `accelerator.prepare`, §11.0) | B_n = 256 nodes | L_recon, L_ssl |
+| node stream | uniform over V_train (`accelerator.prepare`, §11.0) | B_n = 256 nodes | L_recon, L_ssl |
 | joint-pair stream | 50% E_msg edges / 50% random train pairs (§4) | B_p = 128 pairs | L_joint |
 | edge stream | E_sup positives + resampled negatives | B_e = 512 pairs (1:5 → ~85 pos) | L_edge |
 
@@ -345,12 +345,12 @@ streams cycle independently.
 
 ### 10.2 Negative sampling (training)
 
-Resampled every epoch, seeded by (seed, epoch, `accelerator.process_index`, idx):
+Resampled every epoch, seeded by (seed, epoch, idx):
 50% uniform train-side
 pairs, 50% degree-corrected (endpoint corruption of a positive with replacement
 probability ∝ deg_G_struct(v)); self-pair negatives sampled at their universe rate;
 rejection against the **global** positive set (matching the shipped negatives'
-convention) via a per-rank hash set. Default ratio 1:5. The shipped balanced
+convention) via an in-process hash set. Default ratio 1:5. The shipped balanced
 negatives in `train_edges.txt` / `val_edges.txt` are the **fixed** diagnostic and
 model-selection negative sets — never used for gradient updates, so train-time
 resampling cannot contaminate model selection.
@@ -359,122 +359,100 @@ resampling cannot contaminate model selection.
 
 - **Val (every eval epoch):** `val_edges.txt` as-is; VAL-CRITERION per §8.
 - **Test edge metrics:** `test_edges.txt` as-is; run once, after freeze.
-- **Assembled-graph eval:** `candidate_test_edges.txt` served by a prepared
-  DataLoader (sharded across processes, §11.0); batch 8,192 pairs; n_s = 4 fixed CVAE
-  seeds averaged; two passes (§9.3 density self-calibration); logits + pair ids
-  collected via `accelerator.gather_for_metrics` (drops `even_batches` padding
-  duplicates); assembly and bucketed metrics (`test_node_buckets.pkl`) computed on
-  the main process.
+- **Assembled-graph eval:** `candidate_test_edges.txt` served by one prepared
+  DataLoader (single process, §11.0); batch 8,192 pairs; n_s = 4 fixed CVAE seeds
+  averaged; two passes (§9.3 density self-calibration); logits + pair ids collected
+  locally; assembly and bucketed metrics (`test_node_buckets.pkl`) computed in the
+  same process.
 - Per-node Tokenize/Imagine caches rebuilt once per eval epoch for all |V| nodes
-  (~10k nodes; ≈160 MB fp32 at K = 16, d_p = 256 — kept on-GPU per rank).
+  (~10k nodes; ≈160 MB fp32 at K = 16, d_p = 256 — kept on the H20).
 
 ### 10.4 Collate
 
 - **F0 path:** row-gather from the pooled matrix → `(B, 1536)`; no padding.
 - **F1 path:** length-bucketed batching (boundaries {128, 256, 384, 512, 768, 1024}),
-  pad-to-bucket-max with mask; token budget 131,072 tokens/rank auto-sizes the batch;
+  pad-to-bucket-max with mask; token budget 131,072 tokens auto-sizes the batch;
   `num_workers = 4`, `persistent_workers`, `prefetch_factor = 4`, pinned memory.
 - Hungarian matching runs per node on K×K ≤ 16×16 cost matrices
-  (`scipy.linear_sum_assignment` on CPU from GPU-computed costs); no cross-rank
+  (`scipy.linear_sum_assignment` on CPU from GPU-computed costs); no inter-process
   interaction.
 
-## 11. DDP execution design (4/8 × H20, via HF Accelerate)
+## 11. Single-GPU execution design (1 × H20 container, via HF Accelerate)
 
-Envelope: H20 = 96 GB HBM3, high memory bandwidth, modest BF16 compute. The model is
-~10–20 M parameters and the full feature matrix is 62 MB: runs are **overhead-bound,
-not memory-bound**. Plain data parallelism — no FSDP/ZeRO/model sharding. BF16
-autocast with fp32 master weights; **VQ codebook EMA and Sinkhorn always fp32**
-(local `torch.autocast(..., enabled=False)` islands); TF32 matmul on.
+The reference environment is the fixed container documented in `hpc/README.md`:
+one NVIDIA H20 (97,871 MiB visible), Python 3.11.15, `torch==2.10.0+cu128`, CUDA
+runtime 12.8, and `accelerate==1.13.0`. The model is ~10–20 M parameters and the full
+feature matrix is 62 MB, so the run is **overhead-bound, not memory-bound**. There is
+no DDP, NCCL, FSDP, ZeRO, or model sharding. BF16 autocast uses fp32 master weights;
+**VQ codebook EMA and Sinkhorn remain fp32** (`torch.autocast(..., enabled=False)`
+islands); TF32 matmul is on.
 
 ### 11.0 Framework binding (pinned)
 
-The distributed layer is **Hugging Face Accelerate** (`accelerate==1.13.0`, pinned in
-`pyproject.toml`; `torch==2.10.0`) wrapping `torch.nn.parallel.DistributedDataParallel`
-— raw `torchrun`/`torch.distributed` calls do not appear in pipeline code. One
-`Accelerator` per process:
+Training keeps **Hugging Face Accelerate** as the device/mixed-precision/checkpoint
+wrapper, but always with one process and one GPU. Raw `torchrun`,
+`torch.distributed`, and `accelerate launch` do not appear in the execution path:
 
 ```python
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs, set_seed
+from accelerate.utils import set_seed
 
-accelerator = Accelerator(
-    mixed_precision="bf16",
-    kwargs_handlers=[DistributedDataParallelKwargs(static_graph=True)],
-)
+accelerator = Accelerator(mixed_precision="bf16")
 model, optimizer, scheduler, *loaders = accelerator.prepare(
     model, optimizer, scheduler, node_loader, joint_loader, edge_loader)
 ```
 
-- `prepare()` shards each DataLoader across processes (`DataLoaderShard`);
-  `split_batches=False` (default), so **DataLoaders are constructed with the §10
-  per-rank batch sizes** and the global batch = per-rank × `num_processes` — matching
-  the world-size-invariant global-batch rule in §11.3.
-- Backward is always `accelerator.backward(loss)`; gradient accumulation, if ever
-  enabled, via `Accelerator(gradient_accumulation_steps=…)` + the
-  `accelerator.accumulate(model)` context (default: off — batches are small).
-- Rank identity: `accelerator.process_index` / `accelerator.is_main_process`; barriers
-  via `accelerator.wait_for_everyone()`; one-time cache builds (F0 pooled matrix,
-  ANN grounding pools) inside `with accelerator.main_process_first():`.
+- `prepare()` places the model and batches on the single H20; it does not partition a
+  logical batch across ranks. All §10 batch sizes and token budgets are per step.
+- Backward is always `accelerator.backward(loss)`; gradient accumulation, if enabled,
+  uses `Accelerator(gradient_accumulation_steps=…)` plus
+  `accelerator.accumulate(model)` (default: off).
+- One-time cache builds (F0 pooled matrix, ANN grounding pools) run once in the same
+  process. No rank identity, barriers, gather, reduce, or broadcast calls are needed.
 
-### 11.1 Two execution modes (pinned)
+### 11.1 Execution mode (pinned)
 
-- **Mode T (single training run):**
-  `accelerate launch --num_processes {4,8} --mixed_precision bf16 <script>`, one
-  process per GPU, NCCL. Used for the final 3-seed headline runs and the F1
-  token-sequence arm (where per-step compute is real).
-- **Mode S (sweeps):** HPO parity (§8: 30 configs × 3 seeds × ladder arms) runs
-  **one job per GPU** through a queue, 4/8 concurrent. For a model this size
-  sweep-parallelism dominates DDP scaling. The same script runs unmodified with
-  `num_processes = 1` (the `Accelerator` degrades to single-process) — **single
-  process is the reference semantics**; multi-GPU may never be required for
-  correctness.
-- Candidate-universe inference (~2.04 M pairs × n_s = 4) shards across processes in
-  both modes (§10.3).
+- All implemented runs start through `hpc/run.sh` inside
+  `/2023533015/topology-conditioned-inductive-edge-prediction`; the runner exports
+  `CUDA_VISIBLE_DEVICES=0` and fails unless exactly one visible GPU is `NVIDIA H20`.
+- Training configs pin `mixed_precision: "bf16"`. Cached B0 scoring pins
+  `--device cuda --amp bf16`. G1/G2 consume the resulting `.npz` artifacts without
+  rescoring.
+- A training run occupies the one GPU. The final three seeds, ladder arms, and HPO
+  configurations run serially; concurrency is not part of the reference protocol.
+- Candidate-universe inference (~2.04 M pairs × n_s = 4) is one unsharded foreground
+  process. The generic score CLI may still read/merge shards, but that is not the
+  reference H20 run.
+- Long runs may use shell-level `nohup` and log redirection exactly as documented in
+  `hpc/README.md`; this does not change the Python command or run semantics.
 
-### 11.2 Synchronization points (correctness-critical)
+### 11.2 Single-process correctness points
 
-1. **VQ-EMA codebook:** per-step `accelerator.reduce(cluster_counts, reduction="sum")`
-   and `accelerator.reduce(embed_sums, reduction="sum")` *before* the EMA update; the
-   update is then computed identically on every process (no broadcast drift).
-   Dead-code revival samples on the main process and `accelerate.utils.broadcast`s.
-2. **Loss reduction:** DDP gradient averaging gives per-rank-mean semantics; per-family
-   losses are therefore plain per-rank means (identical expectation to global means
-   with equal per-rank batch sizes, which `prepare()` guarantees). Logged per-family
-   gradient norms go through `accelerator.reduce(…, reduction="mean")` for the §7
-   Kendall fallback trigger.
+1. **VQ-EMA codebook:** `cluster_counts` and `embed_sums` update the EMA locally once
+   per step; dead-code revival samples from the seeded local generator.
+2. **Loss reduction:** per-family losses are means over the one logical batch. Logged
+   gradient norms are read locally for the §7 Kendall fallback trigger.
 3. **No BatchNorm anywhere** (LayerNorm only) — asserted at model build.
-4. **VAL-CRITERION / early stop:** val logits + labels collected with
-   `accelerator.gather_for_metrics(…)` — it returns the full set on **every** process
-   and drops the duplicate samples `even_batches` padding introduces (val and
-   candidate files are not divisible by 4/8), so the metric and the stop decision are
-   computed identically on all processes; no explicit broadcast needed.
-5. **Curriculum stage boundaries** (§8) change the used-parameter set → re-`prepare()`
-   the model at each stage boundary keeping `static_graph=True` within a stage
-   (`DistributedDataParallelKwargs(find_unused_parameters=True)` is the registered
-   fallback only if re-wrapping proves brittle — never the steady-state default).
-6. **Checkpointing:** `accelerator.save_state(dir)` / `load_state(dir)` — covers
-   model (incl. codebook EMA buffers, which are module buffers), optimizer,
-   scheduler, scaler, and per-process RNG states; the negative-sampler epoch state
-   and the run-metadata record are registered via
-   `accelerator.register_for_checkpointing(…)` (they expose
-   `state_dict`/`load_state_dict`). Save calls run on all processes (Accelerate
-   handles rank gating internally).
+4. **VAL-CRITERION / early stop:** val logits and labels are collected locally; one
+   process computes the metric and stop decision, so there is no padding duplication
+   or synchronization path.
+5. **Curriculum stage boundaries** (§8) only change the active loss/parameter set;
+   there is no DDP re-wrap or unused-parameter configuration.
+6. **Checkpointing:** `accelerator.save_state(dir)` / `load_state(dir)` covers model
+   (including codebook EMA module buffers), optimizer, scheduler, scaler, and RNG
+   state. The negative-sampler epoch state and run-metadata record remain registered
+   through `accelerator.register_for_checkpointing(…)`.
 
-### 11.3 Determinism under DDP (extends §8)
+### 11.3 Determinism on one H20 (extends §8)
 
-`accelerate.utils.set_seed(s)` on every process at start (identical `s`: seeds
-python/NumPy/torch/CUDA; DDP wrap then broadcasts rank-0 init). Prepared DataLoaders
-use `use_seedable_sampler=True` (via `DataLoaderConfiguration`) and
-`loader.set_epoch(epoch)` each epoch; stream-level divergence across processes comes
-only from the §10.2 hash seeded by (s, epoch, `process_index`, idx). The n_s = 4
-inference CVAE seeds are fixed constants (rank-independent, so a pair's prediction
-does not depend on which process served it); `torch.use_deterministic_algorithms(True)`
-with any exceptions allow-listed and logged; NCCL fp32 reduction non-determinism
-accepted and documented (±ε on logged losses, not on cached predictions). Global
-batch sizes are configured world-size-invariant (per-rank sizes derived), with linear
-LR scaling and 500-step warmup, so `num_processes` ∈ {1, 4, 8} are comparable runs;
-run metadata records `num_processes`, per-rank sizes, and
-accelerate/torch/NCCL versions.
+Call `accelerate.utils.set_seed(s)` once at startup to seed python/NumPy/torch/CUDA.
+Prepared DataLoaders use a seeded sampler and call `loader.set_epoch(epoch)` each
+epoch; the §10.2 stream hash is seeded by `(s, epoch, idx)` with no process-index term.
+The n_s = 4 inference CVAE seeds are fixed constants. Enable
+`torch.use_deterministic_algorithms(True)` with any exceptions allow-listed and
+logged. There is no NCCL reduction variance and no world-size-dependent LR or batch
+scaling. Run metadata records seed, logical batch sizes, GPU name, driver, Python,
+Accelerate, PyTorch, and CUDA versions.
 
 ## 12. Change log
 
@@ -492,6 +470,10 @@ accelerate/torch/NCCL versions.
   `prepare()` loader sharding replace raw `torchrun`/`DistributedSampler`;
   `reduce`/`gather_for_metrics`/`save_state`/`set_seed` bound to the sync points;
   API verified against the Accelerate docs (Context7, 2026-07-09).
+- 2026-07-10: §10.3–10.4 and §11 changed first to match the allocated environment:
+  one fixed H20 container, one process, BF16, direct `hpc/run.sh` execution, and no
+  Slurm/DDP/NCCL path. Accelerate remains the single-process training/checkpoint
+  wrapper; the previous 4/8-H20 execution plan is superseded.
 
 **Open items before code (not blockers):** the four ego-stat target definitions
 pinned to evaluator implementations; FLOPs/latency table template (§4.7 commitment);
