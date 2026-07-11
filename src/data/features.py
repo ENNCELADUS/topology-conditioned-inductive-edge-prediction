@@ -194,6 +194,7 @@ def build_f0_matrix(
         # Concurrent writers (e.g. parallel shard processes sharing a default cache path) must
         # never expose a partially-written file to readers: write to a per-process temp
         # file in the same directory, then atomically replace.
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = cache_path.with_name(f"{cache_path.name}.tmp-{os.getpid()}")
         torch.save({"matrix": matrix, "node_ids": resolved_node_ids}, tmp_path)
         os.replace(tmp_path, cache_path)

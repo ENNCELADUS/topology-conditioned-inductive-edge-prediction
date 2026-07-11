@@ -217,6 +217,16 @@ class TestBuildF0Matrix:
         assert torch.equal(matrix1, matrix2)
         assert index1 == index2
 
+    def test_cache_creates_parent_directory(self, tmp_path: Path) -> None:
+        shapes = {"node_000001": (5, 4), "node_000002": (3, 4)}
+        root = _write_feature_root(tmp_path, shapes, input_dim=4)
+        store = FeatureStore(root)
+        cache_path = tmp_path / "new-output-dir" / "f0_cache.pt"
+
+        build_f0_matrix(store, list(shapes), cache_path=cache_path)
+
+        assert cache_path.exists()
+
     def test_cache_wrong_order_raises(self, tmp_path: Path) -> None:
         shapes = {"node_000001": (5, 4), "node_000002": (3, 4)}
         root = _write_feature_root(tmp_path, shapes, input_dim=4)
