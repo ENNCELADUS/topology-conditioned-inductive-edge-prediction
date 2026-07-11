@@ -2,7 +2,8 @@ r"""Universe/pairs scoring CLI with sharding and the pinned scores artifact.
 
 Scores node-pair lists with a frozen B0-family checkpoint (Task-4 format:
 ``{"model_state", "model_family", "model_config", ...}``) and writes the single
-self-contained ``.npz`` artifact the G1/G2 analyses consume. Pairs come from the
+self-contained ``.npz`` artifact the G1/G2 analyses consume. It can also compute
+the frozen edge-metric bundle from a fully labeled scores artifact. Pairs come from the
 candidate universe, the val/test edge files, or an arbitrary TSV
 (``u\tv[\tlabel]``). Supports optional contiguous row-range sharding
 plus a ``merge`` subcommand that validates and concatenates shard outputs.
@@ -20,6 +21,10 @@ CLI::
     python -m src.score_universe merge \
         --inputs scores/b0_v31_candidate.shard-*.npz \
         --output scores/b0_v31_candidate.npz
+
+    python -m src.score_universe metrics \
+        --input scores/b0_v31_test.npz \
+        --output outputs/b0_v31/test_metrics.json
 
 Artifact format (pinned — do not drift):
 
@@ -42,7 +47,7 @@ import logging
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple, cast
@@ -60,6 +65,7 @@ from src.data.pairs import (
     collate_token_pairs,
     probe_lengths,
 )
+from src.eval.edge_metrics import compute_edge_metrics
 from src.model.B0 import V3_1
 
 logger = logging.getLogger(__name__)
@@ -558,6 +564,13 @@ def _score_v3_1(
     Returns:
         Shape ``(len(pairs),)`` float32 logits in input row order.
     """
+    node_ids = sorted({node_id for pair in pairs for node_id in pair})
+    cached_nodes = store.preload(node_ids)
+    logger.info(
+        "preloaded %d scoring node tensors (%.2f GiB) into host memory",
+        cached_nodes,
+        store.cached_bytes / float(1024**3),
+    )
     lengths = probe_lengths(store, pairs)
     dataset = TokenPairDataset(pairs, None, store, lengths=lengths)
     sampler = LengthBucketedBatchSampler(lengths, token_budget=token_budget, shuffle=False)
@@ -565,8 +578,10 @@ def _score_v3_1(
     out: NDArray[np.float32] = np.empty(len(pairs), dtype=np.float32)
     processed = 0
     for batch_indices in sampler:
-        batch = collate_token_pairs([dataset[i] for i in batch_indices])
-        batch = {key: tensor.to(device) for key, tensor in batch.items()}
+        batch = collate_token_pairs(
+            [dataset[i] for i in batch_indices], pin_memory=device.type == "cuda"
+        )
+        batch = {key: tensor.to(device, non_blocking=True) for key, tensor in batch.items()}
         with torch.inference_mode(), _autocast_context(device, amp):
             logits = cast(torch.Tensor, model(batch)["logits"])
         out[np.asarray(batch_indices, dtype=np.int64)] = (
@@ -662,10 +677,10 @@ def _shard_output_path(output: Path, shard: int) -> Path:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the ``score``/``merge`` argument parser."""
+    """Build the ``score``/``metrics``/``merge`` argument parser."""
     parser = argparse.ArgumentParser(
         prog="python -m src.score_universe",
-        description="Score node-pair lists with a frozen checkpoint; merge shard outputs.",
+        description="Score pair lists, compute labeled metrics, or merge shard outputs.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -691,6 +706,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("outputs/f0_cache/f0_matrix.pt"),
         help="F0 matrix cache path (f0_mlp only)",
     )
+
+    metrics = subparsers.add_parser(
+        "metrics", help="compute edge metrics from a fully labeled scores artifact"
+    )
+    metrics.add_argument("--input", type=Path, required=True, help="labeled scores .npz")
+    metrics.add_argument("--output", type=Path, required=True, help="output metrics .json")
 
     merge = subparsers.add_parser("merge", help="merge shard outputs into one artifact")
     merge.add_argument("--inputs", type=Path, nargs="+", required=True)
@@ -802,8 +823,31 @@ def _run_merge(args: argparse.Namespace) -> None:
     )
 
 
+def _run_metrics(args: argparse.Namespace) -> None:
+    """Compute and persist the frozen edge metrics for one labeled scores artifact."""
+    artifact = load_scores(args.input)
+    unique_labels = {int(label) for label in np.unique(artifact.label).tolist()}
+    if not unique_labels.issubset({0, 1}):
+        raise ValueError(
+            "metrics input must be fully labeled with only 0/1 labels; "
+            f"found {sorted(unique_labels)}"
+        )
+    metrics = compute_edge_metrics(artifact.label, artifact.probs())
+    payload: dict[str, object] = {
+        "checkpoint_id": artifact.meta["checkpoint_id"],
+        "model_family": artifact.meta["model_family"],
+        "pairs_source": artifact.meta["pairs_source"],
+        "strategy": artifact.meta["strategy"],
+        "num_rows": len(artifact.label),
+        "metrics": asdict(metrics),
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    logger.info("wrote edge metrics for %d rows to %s", len(artifact.label), args.output)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
-    """CLI entry point for the ``score`` and ``merge`` subcommands.
+    """CLI entry point for the ``score``, ``metrics``, and ``merge`` subcommands.
 
     Args:
         argv: Argument list (defaults to ``sys.argv[1:]``).
@@ -816,6 +860,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "score":
         _validate_score_args(parser, args)
         _run_score(args)
+    elif args.command == "metrics":
+        if not args.input.exists():
+            parser.error(f"scores artifact not found: {args.input}")
+        _run_metrics(args)
     else:
         _run_merge(args)
 

@@ -14,9 +14,11 @@ Usage:
   hpc/run.sh check
   hpc/run.sh train <config.yaml> [train args...]
   hpc/run.sh score <score args...>
+  hpc/run.sh metrics <metrics args...>
   hpc/run.sh merge <merge args...>
   hpc/run.sh g1 <g1 args...>
   hpc/run.sh g2 <g2 args...>
+  hpc/run.sh test-b0-v31
 
 The score command pins --device cuda --amp bf16. All commands run directly in
 the foreground on the single visible NVIDIA H20; use nohup in the calling shell
@@ -80,6 +82,9 @@ case "${COMMAND}" in
   score)
     exec "${PYTHON_BIN}" -m src.score_universe score --device cuda --amp bf16 "$@"
     ;;
+  metrics)
+    exec "${PYTHON_BIN}" -m src.score_universe metrics "$@"
+    ;;
   merge)
     exec "${PYTHON_BIN}" -m src.score_universe merge "$@"
     ;;
@@ -88,6 +93,30 @@ case "${COMMAND}" in
     ;;
   g2)
     exec "${PYTHON_BIN}" -m src.experiments.g2_ceiling "$@"
+    ;;
+  test-b0-v31)
+    [[ $# -eq 0 ]] || fail "test-b0-v31 takes no arguments"
+    CHECKPOINT="outputs/b0_v31/best.pt"
+    [[ -f "${CHECKPOINT}" ]] || fail "checkpoint not found: ${CHECKPOINT}"
+
+    "${PYTHON_BIN}" -m src.score_universe score --device cuda --amp bf16 \
+      --checkpoint "${CHECKPOINT}" \
+      --pairs test --data-root data --strategy breadth_first \
+      --output scores/b0_v31_test.npz
+    "${PYTHON_BIN}" -m src.score_universe metrics \
+      --input scores/b0_v31_test.npz \
+      --output outputs/b0_v31/test_metrics.json
+    "${PYTHON_BIN}" -m src.score_universe score --device cuda --amp bf16 \
+      --checkpoint "${CHECKPOINT}" \
+      --pairs candidate --data-root data --strategy breadth_first \
+      --output scores/b0_v31_candidate.npz
+    "${PYTHON_BIN}" -m src.experiments.g1_hardened_e2 \
+      --universe scores/b0_v31_candidate.npz \
+      --data-root data --strategy breadth_first --output-dir outputs/g1
+    "${PYTHON_BIN}" -m src.experiments.g2_ceiling \
+      --universe scores/b0_v31_candidate.npz \
+      --data-root data --strategy breadth_first --output-dir outputs/g2 \
+      --figure outputs/g2/g2_ceiling.html
     ;;
   *)
     usage >&2

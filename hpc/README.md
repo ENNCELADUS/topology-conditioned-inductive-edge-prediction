@@ -67,8 +67,38 @@ Preload progress is logged every 1,000 new tensors, followed by a final
 this startup pause, no step logs are expected. Once preload completes, step logs begin
 every 50 optimizer steps; the pause does not by itself indicate a stalled run.
 
+After the B0 V3.1 checkpoint is frozen, run its complete test contract with one command:
+
+```bash
+hpc/run.sh test-b0-v31
+```
+
+This command runs the frozen stages in order: score `test_edges.txt` and write
+`outputs/b0_v31/test_metrics.json`; score the complete `candidate_test_edges.txt`
+universe once; then run G1 assembled-graph evaluation and G2 over that same cached
+candidate artifact. Its durable outputs are:
+
+- `scores/b0_v31_test.npz`
+- `outputs/b0_v31/test_metrics.json`
+- `scores/b0_v31_candidate.npz`
+- `outputs/g1/g1_results.json` and `outputs/g1/g1_tables.md`
+- `outputs/g2/g2_results.json` and `outputs/g2/g2_ceiling.html`
+
+The command fails before evaluation if `outputs/b0_v31/best.pt` is missing. V3.1
+scoring preloads the referenced test-side token tensors into host memory once before
+inference; candidate rows do not repeatedly read feature files.
+
+For the full remote run, launch the same command disconnect-safely and record its PID:
+
+```bash
+mkdir -p outputs/logs
+nohup hpc/run.sh test-b0-v31 > outputs/logs/b0_v31_test.log 2>&1 &
+echo $! > outputs/logs/b0_v31_test.pid
+```
+
 Score the candidate universe once per checkpoint. `run.sh score` always injects
 `--device cuda --amp bf16`; the single-H20 reference run is intentionally unsharded.
+The lower-level commands below remain available for B0-alt and manual gate runs.
 
 ```bash
 hpc/run.sh score \

@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 from src import score_universe
 from src.data.artifacts import canonical_pair
+from src.data.features import FeatureStore
 
 INPUT_DIM = 4
 
@@ -253,6 +254,37 @@ def test_f0_mlp_end_to_end_preserves_order_and_labels(
 
     result_2 = run()
     np.testing.assert_array_equal(result_1.logit, result_2.logit)
+
+
+def test_v3_1_scoring_preloads_each_referenced_node_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    nodes = ["node_00", "node_01", "node_02"]
+    node_tokens = {node: torch.randn(4 + index, INPUT_DIM) for index, node in enumerate(nodes)}
+    data_root = _data_root_with_features(tmp_path, node_tokens)
+    store = FeatureStore(data_root / "features" / "frozen_node_features_1024")
+    model = score_universe.build_model("v3_1", _tiny_v3_1_config())
+    preload_calls: list[tuple[str, ...]] = []
+    real_preload = store.preload
+
+    def recording_preload(node_ids: list[str]) -> int:
+        preload_calls.append(tuple(node_ids))
+        return real_preload(node_ids)
+
+    monkeypatch.setattr(store, "preload", recording_preload)
+
+    scores = score_universe._score_v3_1(
+        model,
+        [(nodes[0], nodes[1]), (nodes[0], nodes[2]), (nodes[1], nodes[2])],
+        store,
+        device=torch.device("cpu"),
+        amp="off",
+        token_budget=1024,
+    )
+
+    assert scores.shape == (3,)
+    assert preload_calls == [tuple(nodes)]
+    assert store.cached_node_count == 3
 
 
 # ---------------------------------------------------------------------------
@@ -540,4 +572,65 @@ def test_cli_missing_checkpoint_raises_system_exit(tmp_path: Path) -> None:
                 "--device",
                 "cpu",
             ]
+        )
+
+
+def test_metrics_subcommand_writes_metrics_for_labeled_scores(tmp_path: Path) -> None:
+    scores_path = tmp_path / "test_scores.npz"
+    output_path = tmp_path / "test_metrics.json"
+    score_universe.save_scores(
+        scores_path,
+        node_ids=["n1", "n2", "n3"],
+        u_idx=np.array([0, 0, 1, 1], dtype=np.int32),
+        v_idx=np.array([1, 2, 1, 2], dtype=np.int32),
+        logit=np.array([4.0, -4.0, 3.0, -3.0], dtype=np.float32),
+        label=np.array([1, 0, 1, 0], dtype=np.int8),
+        row_start=0,
+        meta={
+            "checkpoint_id": "checkpoint-1",
+            "model_family": "v3_1",
+            "pairs_source": "test",
+            "strategy": "breadth_first",
+            "num_rows": 4,
+            "created_utc": "2026-07-11T00:00:00+00:00",
+            "torch_version": "2.10.0",
+        },
+    )
+
+    score_universe.main(["metrics", "--input", str(scores_path), "--output", str(output_path)])
+
+    payload = json.loads(output_path.read_text())
+    assert payload["checkpoint_id"] == "checkpoint-1"
+    assert payload["pairs_source"] == "test"
+    assert payload["num_rows"] == 4
+    assert payload["metrics"]["auroc"] == pytest.approx(1.0)
+    assert payload["metrics"]["auprc"] == pytest.approx(1.0)
+    assert payload["metrics"]["n_pos"] == 2
+    assert payload["metrics"]["n_neg"] == 2
+
+
+def test_metrics_subcommand_rejects_unlabeled_scores(tmp_path: Path) -> None:
+    scores_path = tmp_path / "unlabeled_scores.npz"
+    score_universe.save_scores(
+        scores_path,
+        node_ids=["n1", "n2"],
+        u_idx=np.array([0], dtype=np.int32),
+        v_idx=np.array([1], dtype=np.int32),
+        logit=np.array([0.0], dtype=np.float32),
+        label=np.array([-1], dtype=np.int8),
+        row_start=0,
+        meta={
+            "checkpoint_id": "checkpoint-1",
+            "model_family": "v3_1",
+            "pairs_source": "file:unlabeled.tsv",
+            "strategy": "breadth_first",
+            "num_rows": 1,
+            "created_utc": "2026-07-11T00:00:00+00:00",
+            "torch_version": "2.10.0",
+        },
+    )
+
+    with pytest.raises(ValueError, match="fully labeled"):
+        score_universe.main(
+            ["metrics", "--input", str(scores_path), "--output", str(tmp_path / "out.json")]
         )

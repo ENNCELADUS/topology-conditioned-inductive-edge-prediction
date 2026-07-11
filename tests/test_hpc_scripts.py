@@ -51,7 +51,7 @@ def test_help_is_available_without_the_remote_container(bash_exe: str) -> None:
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    for command in ("check", "train", "score", "merge", "g1", "g2"):
+    for command in ("check", "train", "score", "metrics", "merge", "g1", "g2", "test-b0-v31"):
         assert f"hpc/run.sh {command}" in result.stdout
 
 
@@ -76,9 +76,38 @@ def test_runner_dispatches_to_the_implemented_clis() -> None:
     text = RUNNER.read_text()
     assert "-m src.train_b0" in text
     assert "-m src.score_universe score --device cuda --amp bf16" in text
+    assert "-m src.score_universe metrics" in text
     assert "-m src.score_universe merge" in text
     assert "-m src.experiments.g1_hardened_e2" in text
     assert "-m src.experiments.g2_ceiling" in text
+
+
+def test_runner_test_b0_v31_follows_the_frozen_test_contract() -> None:
+    """The production test command covers test edges, candidate assembly, then G1/G2."""
+    text = RUNNER.read_text()
+    case_body = text.split("test-b0-v31)", maxsplit=1)[1].split(";;", maxsplit=1)[0]
+
+    required_fragments = (
+        "outputs/b0_v31/best.pt",
+        "--pairs test",
+        "scores/b0_v31_test.npz",
+        "outputs/b0_v31/test_metrics.json",
+        "--pairs candidate",
+        "scores/b0_v31_candidate.npz",
+        "outputs/g1",
+        "outputs/g2",
+        "outputs/g2/g2_ceiling.html",
+    )
+    for fragment in required_fragments:
+        assert fragment in case_body
+
+    assert case_body.index("--pairs test") < case_body.index("--pairs candidate")
+    assert case_body.index("outputs/b0_v31/test_metrics.json") < case_body.index("outputs/g1")
+    assert case_body.index("outputs/g1") < case_body.index("outputs/g2")
+
+    runbook = (HPC_DIR / "README.md").read_text()
+    assert "nohup hpc/run.sh test-b0-v31 > outputs/logs/b0_v31_test.log 2>&1 &" in runbook
+    assert "echo $! > outputs/logs/b0_v31_test.pid" in runbook
 
 
 @pytest.mark.parametrize(
