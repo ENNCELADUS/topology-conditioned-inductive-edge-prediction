@@ -180,11 +180,17 @@ prioritized in Section 5 (gates first).
   is executed after every epoch; quality is reported but is not the throughput acceptance gate
   for the first systems-optimization pass. The wall-clock gate is 60 minutes from an empty
   derived-cache path through final training artifacts.
-- **Success:** the gap survives hard negatives and calibrated thresholds with a defined
-  composite. The current cached numbers (AUROC 0.676 / AUPRC 0.691 vs graph similarity 0.235)
-  are quoted as *provisional* until this gate passes. **Stop condition:** if the gap
-  substantially closes, the motivation is dead as stated; pivot to the evaluation/benchmark
-  paper.
+- **Result (2026-07-12):** G1 passed its execution requirements. The B0 degree-corrected
+  ratio-1 row is AUROC 0.716871 / AUPRC 0.742622; the hard-heuristic row is
+  0.583741 / 0.620193; the hard-feature row is 0.406667 / 0.475048; and the full
+  candidate-universe row is 0.710776 / 0.123982. At the density-matched operating point,
+  relative density is 0.985429 and the perturbation-validated graph-similarity composite
+  is 9.64858e-10, with degree/clustering/spectral MMD² of 0.620493/0.729620/0.836370.
+  The gap therefore survives hard negatives and calibrated thresholds, although PA-null
+  beats B0 in the easy and feature-hard rows and is now a mandatory control.
+- **G2 result:** the cached soft scorer has `Ov(P)=0.654778`, while `Ov_min=0.010038`
+  at matched volume is sufficient to reach the reference triangle count; the full ceiling
+  curve and caveats are in the synced G2 artifact. **G3 (Oracle) remains pending.**
 
 ### E3: Baselines head-to-head on Benchmark-A
 
@@ -366,8 +372,8 @@ rule).
 
 ## 6. Deliverables and done criteria
 
-1. **Gate reports (G1–G3):** hardened E2 note (superseding the current provisional numbers),
-   ceiling computation, Oracle row.
+1. **Gate reports (G1–G3):** G1 hardened E2 note and G2 ceiling computation are complete;
+   the G3 Oracle row remains outstanding.
 2. **Spec freeze (G4):** signed-off `06-egostitch-spec.md`.
 3. **E1/E3 main table:** method by edge AUPRC, both assembled families, ceiling/Oracle/noise
    rows, diagnostics.

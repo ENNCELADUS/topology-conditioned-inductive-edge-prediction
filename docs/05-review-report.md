@@ -5,6 +5,13 @@ time; the design-stage findings below are applied in **revision 2.1** of that do
 see §5 for the disposition of every finding). **Reviewers are read-only:** no reviewer
 modified the manuscript; all changes were made afterward in the author role.
 
+**Post-review experiment status (2026-07-12):** gates G1 and G2 have now been run on
+the repository-local `breadth_first` artifacts. The current values and the remaining
+G3 Oracle requirement are recorded in
+[`docs/results/E2-pair-to-topology-gap.md`](results/E2-pair-to-topology-gap.md). The
+review findings below remain a historical design-stage record; current E2 numerical
+claims are recorded only in the result note.
+
 **Process.** (1) Literature basis: five parallel extraction agents over the full local
 vault (~90 PDFs + 4 synthesis reports), two arXiv API novelty-risk sweeps (32 queries,
 68 unique candidates, all verified against the arXiv export API), four web searches,
@@ -90,8 +97,8 @@ if topology gains fail to separate from `B0+cal`/`B3-dist`.** Distinct findings:
 paper carries two contributions in one envelope (task framing + heavy model) and risks
 under-serving both; placeholder benchmarks defer external validity; §6.6's predicted
 flat edge metrics mean the significance case rests entirely on E7, which was optional;
-a minimum-viable-model milestone is missing; the frozen 0.676-AUROC anchor may cap
-edge quality. Called the proposal "one of the most reviewer-anticipating
+a minimum-viable-model milestone is missing; the frozen B0 anchor may cap edge
+quality. Called the proposal "one of the most reviewer-anticipating
 pre-implementation designs I have reviewed."
 
 ### R1 — Methodology (benchmark/evaluation rigor)
@@ -147,9 +154,9 @@ category error; CRIT-2 edge-independence ceiling never checked (checkable now, o
 paper); CRIT-3 the information argument is special pleading — reframe as inductive
 bias; CRIT-4 the E2 evidence is one weak scorer, one benchmark, easy negatives, an
 undefined composite, no Oracle reference; CRIT-5 the Ockham arm (`B3-full`) is missing
-while the repository's own cached preview (topology loss alone: degree MMD 17.2→7.18)
-is deflated by a caveat the headline numbers share — textbook asymmetric evidence
-treatment; M6 the automorphic argument binds ungrounded EgoStitch equally; M7 pool
+while the evaluation plan had not yet resolved the Ockham control and was deflated by
+a caveat the headline numbers share — textbook asymmetric evidence treatment; M6 the
+automorphic argument binds ungrounded EgoStitch equally; M7 pool
 dependence treated as both flaw and feature; M8 no stakeholder needs the exact
 conjunction unless E7 lands; M9 channel collinearity → `Ours ≈ B5` prediction; M10
 Oracle must run first; M11 undefined headline composite; M12 gameable success

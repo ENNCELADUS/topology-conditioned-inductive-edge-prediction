@@ -163,8 +163,9 @@ p_ij = σ(pair_logit(i, j) + scaffold_residual(H_i, H_j))
 ### 1.1 The scaffold is B0's echo — a supervision critique, stated precisely
 
 Scaffold edges are thresholded outputs of the same frozen pairwise scorer whose
-assembled output E2 proved structurally implausible (graph similarity 0.235, degree MMD
-17.2, relative density 0.684). `T_ij` is a local patch of exactly the pathological graph
+assembled output G1 proved structurally implausible (graph similarity `9.64858e-10`,
+degree/clustering/spectral MMD² `0.620493/0.729620/0.836370`, relative density
+`0.985429`). `T_ij` is a local patch of exactly the pathological graph
 the method is supposed to fix, and systematic B0 errors — hub over-prediction,
 similarity–adjacency conflation — are inherited by the context and then "corrected" by a
 residual conditioned on those same errors.
@@ -227,7 +228,8 @@ the new design's residual pool sensitivity is measured, not assumed away.
 
 ### 1.6 A local residual cannot repair distributional failures — and the honest limit of any local fix
 
-E2's failure is distributional (relative density 0.684, degree MMD 17.2). Independent
+G1's failure is distributional (relative density 0.985429, degree MMD² 0.620493,
+clustering MMD² 0.729620, spectral MMD² 0.836370). Independent
 per-query residuals have no channel for node-level degree budgets or community-level edge
 budgets. EgoStitch's answer is to inject those budgets as *evidence within each
 decision* — shaping every marginal by the same distilled priors — while acknowledging
@@ -662,10 +664,10 @@ finding].
 
 | E2 failure (assembly-level) | Scaffold-level mechanism | Transmission to assembly | Measured by |
 |---|---|---|---|
-| Relative density 0.684 | hard K-representable budget masking in harmonization | budget-pressure features in `s3` shift marginals | degree-calibration diagnostic (E[d̂] vs realized assembled degree) |
-| Degree MMD 17.2 | cardinality tie `Σπ·m ↔ d̂` (doubly supervised) | degree-aware marginals across each node's queries | assembled degree MMD + per-node calibration curve |
-| Clustering MMD 11.8 | slot–slot adjacency + closure channel `s2` + motif-conductance code supervision | closure evidence raises/lowers triangle-completing marginals | assembled clustering MMD + edge-independence ceiling comparison |
-| Spectral MMD 22.1 | community codebook + block prior | block-consistent marginals shape mesoscale spectrum | assembled spectral MMD (held-out kernel per §6.4.2) |
+| Relative density 0.985429 | hard K-representable budget masking in harmonization | budget-pressure features in `s3` shift marginals | degree-calibration diagnostic (E[d̂] vs realized assembled degree) |
+| Degree MMD² 0.620493 | cardinality tie `Σπ·m ↔ d̂` (doubly supervised) | degree-aware marginals across each node's queries | assembled degree MMD + per-node calibration curve |
+| Clustering MMD² 0.729620 | slot–slot adjacency + closure channel `s2` + motif-conductance code supervision | closure evidence raises/lowers triangle-completing marginals | assembled clustering MMD + edge-independence ceiling comparison |
+| Spectral MMD² 0.836370 | community codebook + block prior | block-consistent marginals shape mesoscale spectrum | assembled spectral MMD (held-out kernel per §6.4.2) |
 | Pair-to-topology gap | decision conditioned on realism-trained, seam-harmonized context | better-calibrated marginals from topological supervision | joint edge+assembled table vs `B0+cal`, `B3-dist`, `B3-full`, B5 |
 
 Anti-grab-bag rule (binding): a mechanism stays in the model only if it owns a row here
@@ -711,10 +713,11 @@ before submission.
 
 The unifying structural defense, stated once and reused everywhere: **every close prior
 requires the query node's observed edges at inference; none can score a pair of
-zero-edge nodes; none grades the graph its predictions assemble into.** The E2 gap
-(AUROC 0.676 / AUPRC 0.691 vs graph similarity 0.235) is the failure mode invisible to
-all of their evaluation protocols — subject to the E2 hardening gate (§6.0-G1) before
-those numbers are quoted as final.
+zero-edge nodes; none grades the graph its predictions assemble into.** The final G1
+result is AUROC 0.716871 / AUPRC 0.742622 on degree-corrected negatives, falling to
+0.583741 / 0.620193 on hard heuristic negatives and 0.406667 / 0.475048 on hard feature
+negatives, while density-matched graph similarity is `9.64858e-10`. The failure survives
+G1, but PA-null wins in some edge regimes and remains a mandatory control.
 
 Known weakness of the claim's *shape* [EIC, DA-M21]: it is a conjunction of qualifiers,
 and conjunction-novelty weakens with each conjunct. The mitigation is §6's controls:
@@ -884,7 +887,7 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   (assembly-time coupling would be a different paper) rather than building a model
   that cannot succeed.
 - **G3 — Oracle first [DA-M10].** Run the Oracle row (observed-neighborhood scaffold)
-  before implementation: it calibrates whether 0.235 is poor, bounds all possible
+  before implementation: it calibrates whether the G1 composite `9.64858e-10` is poor, bounds all possible
   gains, and separates "conditioning is the missing ingredient" from "features are
   insufficient." *Stop condition:* Oracle ≈ B0 on assembled metrics ⇒ feature
   insufficiency; topology conditioning cannot help; pivot.

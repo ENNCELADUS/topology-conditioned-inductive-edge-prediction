@@ -29,7 +29,7 @@
 This repository holds the design and pre-implementation gate pipeline for an ICLR 2027
 paper. The benchmark loaders, evaluation library, B0/B0-alt baselines, score-once
 artifact pipeline, and gates G1/G2 are implemented and tested. **EgoStitch itself is not
-implemented**; gates G1–G3 must pass before model code is written.
+implemented**; G3 (Oracle) must still pass before model code is written.
 
 - **Task:** given two *unseen* nodes with frozen feature vectors, predict whether an
   edge exists between them (binary classification), under a strict inductive protocol
@@ -77,16 +77,17 @@ figure: [`figures/e2-gap.html`](figures/e2-gap.html).
 
 | Level | Metric | Value | Reading |
 |---|---|---:|---|
-| Edge | AUROC / AUPRC | **0.676 / 0.691** | reasonable |
-| Assembled graph | graph similarity | **0.235** | poor |
-| Assembled graph | relative density | 0.684 | sparse at this operating point |
-| Assembled graph | degree MMD | 17.2 | high (ideal ≈ 0) |
-| Assembled graph | clustering MMD | 11.8 | high (ideal ≈ 0) |
-| Assembled graph | spectral MMD | 22.1 | high (ideal ≈ 0) |
+| Edge | AUROC / AUPRC (degree-corrected, ratio-1) | **0.7169 / 0.7426** | final G1 B0 row |
+| Edge | AUROC / AUPRC (hard feature, ratio-1) | **0.4067 / 0.4750** | hard-negative stress test |
+| Assembled graph | graph similarity | **9.65e-10** | poor; composite passed perturbation check |
+| Assembled graph | relative density | 0.9854 | density-matched operating point |
+| Assembled graph | degree / clustering / spectral MMD² | 0.6205 / 0.7296 / 0.8364 | high (ideal ≈ 0) |
 
-The gap **widens with graph size** (graph similarity falls from 0.320 at 20 nodes to
-0.179 at 200), and shows up at both denser and sparser operating points — so it is not
-fixable by threshold tuning alone.
+The final G1 threshold sweep and all negative-regime rows are recorded in
+[`outputs/e2_resubmit_retry/g1/g1_tables.md`](outputs/e2_resubmit_retry/g1/g1_tables.md).
+G2 reports measured soft-score overlap 0.6548 versus the minimum 0.0100 required to
+reach the reference triangle count; G3 (Oracle) remains pending. PA-null is reported
+alongside B0 because it wins some easy and feature-hard edge regimes.
 
 ## The Proposed Method (EgoStitch)
 
@@ -94,8 +95,8 @@ fixable by threshold tuning alone.
 > [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) is the active implementation
 > contract (algorithm spec + benchmark/data contract + four-H20 execution design). Design
 > rationale: [`docs/04-model-proposal.md`](docs/04-model-proposal.md); review record:
-> [`docs/05-review-report.md`](docs/05-review-report.md). Pre-implementation gates G1–G3
-> must still pass before model code is written.
+> [`docs/05-review-report.md`](docs/05-review-report.md). Gates G1 and G2 are now complete;
+> G3 (Oracle) must still pass before model code is written.
 
 For each queried pair `(i, j)`, each endpoint **imagines its own ego-network** (latent
 neighbor nodes with existence probabilities, local adjacency, and a degree budget)
@@ -189,9 +190,10 @@ target test graph; the queried edge is masked/standardized inside the scaffold. 
 - [x] **EgoStitch proposal** — approved 2026-07-09; reviewed via novelty check + 5-persona panel ([`docs/05-review-report.md`](docs/05-review-report.md)).
 - [x] **G4 spec freeze** — [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) signed off (algorithm + benchmark data contract + batch sampler + four-H20 execution).
 - [x] **Baseline + gate pipeline** — benchmark/features, B0/B0-alt training, cached scoring, G1/G2 analyses, and tests are implemented.
-- [ ] **Gates G1–G3** — hardened E2 rerun, edge-independence ceiling curve, Oracle row (must pass before model code).
+- [x] **G1/G2 gates** — hardened E2 rerun and edge-independence ceiling curve completed; synced artifacts are under `outputs/e2_resubmit_retry/`.
+- [ ] **G3 gate** — Oracle row (must pass before model code).
 - [ ] **EgoStitch implementation** under `src/`, per [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) and the [experiment protocol](docs/03-experiment-protocol.md).
-- [ ] **Experiments** in priority order: E2 (hardened) → E1/E3 main + baselines → E4 ablations → E5 integrity gates → E7 (load-bearing) → E6 breadth.
+- [ ] **Experiments** in priority order: G3 Oracle → E1/E3 main + baselines → E4 ablations → E5 integrity gates → E7 (load-bearing) → E6 breadth.
 
 ## HPC execution
 

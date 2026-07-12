@@ -118,7 +118,7 @@ feature-tensor host-to-device copy.
 
 ### 4.1 Deterministic global batch plan
 
-The E2 legacy-reproduction arm continues to train on the fixed balanced training
+The E2 B0 arm continues to train on the fixed balanced training
 rows. At cold start, pairs, labels, endpoint IDs, lengths, and row IDs are converted
 once into compact arrays.
 

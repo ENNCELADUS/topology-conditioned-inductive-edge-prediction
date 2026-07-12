@@ -176,8 +176,8 @@ nodes?" If a draft starts describing graph generation as the task, it has drifte
    contract (including quarantined artifacts and the self-loop policy), §10 batch
    sampler, §11 four-H20 execution design. Its freeze rule is binding: code may not
    silently deviate — edit the spec first, with a change-log line.
-6. `docs/results/E2-pair-to-topology-gap.md` — the motivating result note (numbers
-   below; provisional until gate G1).
+6. `docs/results/E2-pair-to-topology-gap.md` — the motivating result note with the
+   completed G1/G2 artifacts; G3 Oracle remains pending.
 7. `docs/lit-review-plan.md` — literature-review plan, claims K1–K5, the 2×2
    taxonomy, and the terminology guardrail.
 
@@ -187,14 +187,17 @@ rather than resolving them unilaterally.
 
 ## Load-bearing facts (the E2 result)
 
-The whole motivation rests on one measured gap: the frozen B0 pairwise scorer
-reaches **AUROC 0.676 / AUPRC 0.691** yet assembles into a Benchmark-A graph with
-**graph similarity 0.235**, degree MMD 17.2, clustering MMD 11.8, spectral MMD 22.1,
-relative density 0.684. `docs/04-model-proposal.md` §4.6 maps each of these failure
-axes to a specific EgoStitch mechanism. If you touch these numbers, keep them
-consistent across `docs/results/E2-pair-to-topology-gap.md`,
-`docs/03-experiment-protocol.md`, `docs/04-model-proposal.md`, and
-`figures/e2-gap.html` — they are quoted in all four.
+The current load-bearing gap is the completed G1 result: the frozen B0 pairwise scorer
+reaches **AUROC 0.716871 / AUPRC 0.742622** on degree-corrected ratio-1 negatives,
+falls to **0.583741 / 0.620193** on hard heuristic negatives and **0.406667 / 0.475048**
+on hard feature negatives, yet its density-matched assembly has **graph similarity
+9.64858e-10**, degree/clustering/spectral MMD² **0.620493/0.729620/0.836370**, and
+relative density **0.985429**. The O'Bray perturbation check passed. G2 reports
+`Ov(P)=0.654778` versus `Ov_min=0.010038`; G3 Oracle is still pending.
+`docs/04-model-proposal.md` §4.6 maps these failure axes to specific EgoStitch
+mechanisms. Keep the current values consistent across `docs/results/E2-pair-to-topology-gap.md`,
+`docs/03-experiment-protocol.md`, `docs/04-model-proposal.md`, `README.md`, and
+`figures/e2-gap.html`.
 
 ## Naming conventions (neutral placeholders — keep them neutral)
 

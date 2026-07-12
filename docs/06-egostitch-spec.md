@@ -173,7 +173,7 @@ queries, reported with every headline table.
   (u,v) is in the batch, v is excluded from u's targets and |N(u)| decremented.
 - Seam references: unions of message-partition ego-net pairs sampled 50/50
   adjacent/random with labels marginalized.
-- B0 provenance audit is an E5 gate precondition. The E2 legacy-reproduction B0 is
+- B0 provenance audit is an E5 gate precondition. The E2 B0 scorer is
   pinned to the audited V3.1 `pair_context_gated` / `abba_max` / no-cross checkpoint
   family (`d_model = 512`, no spectral normalization) and trains from the fixed
   balanced `train_edges.txt` rows when a local retrain is required.
@@ -252,8 +252,9 @@ size {20, 40, …, 200} for bucketed assembled-graph evaluation.
 Identities verified: `train_graph.pkl` edges = train⁺ ∪ val⁺ exactly (val⁺ is the
 20% complement of train⁺); train/val/test negatives ∩ global positives = ∅.
 
-**Benchmark-A/B/C ↔ strategy mapping** is recorded in the run-metadata store at G1
-time (open item: confirm which strategy produced the provisional E2 numbers).
+**Benchmark-A/B/C ↔ strategy mapping** is recorded in the run metadata. The completed
+G1 rerun uses `Benchmark-A = breadth_first`; its artifacts are under
+`outputs/e2_resubmit_retry/`.
 
 ### 9.2 Feature pipeline (F0/F1)
 
@@ -298,7 +299,7 @@ val_edges.txt    := model selection only (VAL-CRITERION, §8) — never a target
    measured on `random_walk` train: 112,577 train–train, 56,958 cross-split, 6,905
    test–test pairs. Cross-split pairs expose test-side node features at training
    time: **prohibited** for training, model selection, and headline evaluation.
-   At most a clearly-labeled legacy-comparability appendix row.
+   At most a clearly-labeled comparability appendix row.
 
 Density normalization (`ρ_eval/ρ_train`, §1): ρ := |E⁺| / (C(|V_side|,2) + |V_side|)
 on the matching universe. Measured full-train ρ_train (random_walk) = 1.354e-3 vs
@@ -356,7 +357,7 @@ probability ∝ deg_G_struct(v)); self-pair negatives sampled at their universe 
 rejection against the **global** positive set (matching the shipped negatives'
 convention) via an in-process hash set. Default ratio 1:5. The shipped balanced
 negatives in `train_edges.txt` / `val_edges.txt` are the **fixed** diagnostic and
-model-selection negative sets for those arms. The E2 legacy-reproduction B0 is the
+model-selection negative sets for those arms. The E2 B0 scorer is the
 sole exception: it trains on the fixed balanced `train_edges.txt` pairs as shipped,
 with per-epoch order shuffling but no negative resampling.
 
@@ -414,7 +415,7 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   one fixed H20 container, one process, BF16, direct `hpc/run.sh` execution, and no
   Slurm/DDP/NCCL path. Accelerate remains the single-process training/checkpoint
   wrapper; the previous 4/8-H20 execution plan is superseded.
-- 2026-07-11: pinned the E2 legacy-reproduction B0 architecture and its fixed 1:1
+- 2026-07-11: pinned the E2 B0 architecture and its fixed 1:1
   balanced training-pair exception; EgoStitch's dynamic 1:5 edge stream is unchanged.
 - 2026-07-11: replaced the formal E2 single-H20 path with the approved 4 × H20
   Accelerate DDP packed-feature pipeline; fixed the cold-run budget at 60 minutes for

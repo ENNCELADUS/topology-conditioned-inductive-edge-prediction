@@ -92,9 +92,9 @@
   <h1>The pair-to-topology gap</h1>
   <p class="lede">
     A frozen <b>independent pairwise</b> edge scorer over unseen nodes reaches
-    <span class="g">AUROC 0.676 / AUPRC 0.691</span>, yet its binary edge predictions assemble into a
-    graph with <span class="r">graph-similarity 0.235</span>, far below the 0.5 plausibility
-    line, and degree / clustering / spectral distances far above ideal.
+    The final G1 B0 row reaches <span class="g">AUROC 0.7169 / AUPRC 0.7426</span>
+    on degree-corrected negatives, yet its density-matched assembly has
+    <span class="r">graph-similarity 9.65e-10</span> and large normalized MMD distances.
     <b>Good edge scores do not imply a plausible network.</b>
   </p>
 
@@ -102,23 +102,23 @@
     <!-- Panel A: the contrast -->
     <div class="panel">
       <h2>A - Edge quality vs assembled topology</h2>
-      <p class="cap">Edge metrics clear a usable bar; graph-similarity sits <b>below the 0.5
-        plausibility line</b>. Same model, same predictions.</p>
+      <p class="cap">The canonical degree-corrected edge row sits above the hard-feature
+        stress-test row, while graph-similarity remains <b>below the 0.5 plausibility line</b>.</p>
       <div class="bars">
         <div class="bar-row">
           <span class="lab">AUROC</span>
-          <div class="track"><div class="fill good" style="width:67.6%"></div><div class="refline" style="left:50%"></div></div>
-          <span class="val">0.676</span>
+          <div class="track"><div class="fill good" style="width:71.7%"></div><div class="refline" style="left:50%"></div></div>
+          <span class="val">0.7169</span>
         </div>
         <div class="bar-row">
           <span class="lab">AUPRC</span>
-          <div class="track"><div class="fill good" style="width:69.1%"></div><div class="refline" style="left:50%"></div></div>
-          <span class="val">0.691</span>
+          <div class="track"><div class="fill good" style="width:74.3%"></div><div class="refline" style="left:50%"></div></div>
+          <span class="val">0.7426</span>
         </div>
         <div class="bar-row">
           <span class="lab">graph-sim</span>
-          <div class="track"><div class="fill bad" style="width:23.5%"></div><div class="refline" style="left:50%"></div></div>
-          <span class="val">0.235</span>
+          <div class="track"><div class="fill bad" style="width:5%"></div><div class="refline" style="left:50%"></div></div>
+          <span class="val">9.65e-10</span>
         </div>
       </div>
       <div class="axisnote"><span>0.0</span><span class="reflabel">0.5 plausibility line</span><span>1.0</span></div>
@@ -136,31 +136,35 @@
       <div class="bars">
         <div class="bar-row">
           <span class="lab">degree</span>
-          <div class="track"><div class="fill bad" style="width:68.7%"></div></div>
-          <span class="val">17.17</span>
+          <div class="track"><div class="fill bad" style="width:62.0%"></div></div>
+          <span class="val">0.6205</span>
         </div>
         <div class="bar-row">
           <span class="lab">clustering</span>
-          <div class="track"><div class="fill bad" style="width:47.2%"></div></div>
-          <span class="val">11.81</span>
+          <div class="track"><div class="fill bad" style="width:73.0%"></div></div>
+          <span class="val">0.7296</span>
         </div>
         <div class="bar-row">
           <span class="lab">spectral</span>
-          <div class="track"><div class="fill bad" style="width:88.5%"></div></div>
-          <span class="val">22.12</span>
+          <div class="track"><div class="fill bad" style="width:83.6%"></div></div>
+          <span class="val">0.8364</span>
         </div>
       </div>
-      <div class="axisnote"><span>ideal approx 0</span><span>normalized MMD -></span><span>25</span></div>
+      <div class="axisnote"><span>ideal approx 0</span><span>normalized MMD² -></span><span>1.0</span></div>
     </div>
 
-    <!-- Panel C: trend -->
+    <!-- Panel C: gate status -->
     <div class="panel wide">
-      <h2>C - The gap widens as the assembled subgraph grows</h2>
-      <p class="cap">Per-bucket graph-similarity for the same frozen scorer: similarity falls
-        monotonically from <b>0.32 at 20 nodes to 0.18 at 200</b> - the assembled graph degrades exactly
-        where larger neighborhoods matter most. The dashed line marks the 0.5 plausibility level the
-        assembly never reaches.</p>
-      <svg class="chart" viewBox="0 0 400 205" role="img" aria-label="graph similarity versus node-bucket size, declining from 0.32 to 0.18">
+      <h2>C - Hardened gate status</h2>
+      <p class="cap">G1's mandatory perturbation check passed, and G2's measured soft-score
+        overlap (<b>0.6548</b>) is well above the minimum overlap (<b>0.0100</b>) required
+        to reach the reference triangle count. The complete threshold sweep and ceiling
+        curve are linked from the result note.</p>
+      <div class="keyrow">
+        <span class="k"><span class="sw good"></span> G1 composite validated</span>
+        <span class="k"><span class="sw bad"></span> G3 Oracle still pending</span>
+      </div>
+      <svg class="chart" style="display:none" aria-hidden="true" viewBox="0 0 400 205" role="img" aria-label="superseded bucket trend">
         <!-- gridlines y = 0, 0.25, 0.5 -->
         <line class="grid" x1="40" y1="170" x2="390" y2="170"></line>
         <line class="grid" x1="40" y1="95"  x2="390" y2="95"></line>
@@ -194,8 +198,8 @@
   <footer>
     Protocol: topology-conditioned inductive edge prediction over unseen nodes with frozen node
     features. Binary edge predictions are assembled into graphs and evaluated with edge metrics plus
-    graph realism metrics. Threshold 0.5; graph-similarity &lt; 0.5 and high MMDs hold across
-    normalizations, so the gap is stated as low similarity plus high distances rather than a single
-    density direction.
+    graph realism metrics. The figure uses the density-matched G1 operating point and reports
+    graph-similarity &lt; 0.5 with high MMD² values; G2 uses the exact edge-independence identities
+    and G3 Oracle remains pending.
   </footer>
 </div>

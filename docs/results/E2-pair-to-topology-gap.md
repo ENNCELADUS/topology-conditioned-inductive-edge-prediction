@@ -1,119 +1,108 @@
-# E2 Expectation: The Pair-to-Topology Gap
+# E2 Pair-to-Topology Gap: G1/G2 Gate Results
 
-**Experiment:** motivating result and reproduction target for the abstract graph ML benchmark.
+**Experiment:** repository-local hardened E2 on Benchmark-A (`breadth_first`).
 
-**Claim:** a strong independent pairwise scorer can achieve reasonable edge-level AUROC/AUPRC while
-assembling into a graph with poor topology. This creates the need for per-query local scaffold
-conditioning rather than independent edge scoring alone.
+**Status:** G1 and G2 completed on 2026-07-12. The final artifacts use the frozen
+V3.1 B0 scorer, checkpoint `8a8ebe823e476bed`, and the full 2,037,171-row candidate
+universe (2,035,153 non-self pairs plus 2,018 self-pairs). The mandatory O'Bray
+perturbation check passed, so the graph-similarity composite is valid for this run.
+G3 (Oracle) remains pending.
 
-**Status:** expectation corrected 2026-07-11. The correct legacy raw-scorer reference reaches
-**AUROC 0.793 / AUPRC 0.792** on the final balanced test file, but
-its assembled Benchmark-A graph still has only **graph similarity 0.337**, with relative density
-**3.134** and large degree, clustering, and spectral MMDs. This is the result the repository-local
-E2 rerun is expected to reproduce before it replaces the legacy reference.
+The final run confirms the pair-to-topology gap under the hardened protocol, but it
+also exposes an important control result: the PA-null baseline is stronger than B0 in
+some easy and feature-hard edge regimes. The claim is therefore a topology/robustness
+failure of independent scoring, not a claim that this B0 checkpoint is uniformly strong.
 
-Figure: [e2-gap.html](../../figures/e2-gap.html).
+## 1. G1 hardened-E2 result
 
----
+### Edge-level regimes
 
-## 1. What was run
+The canonical balanced degree-corrected row is reported together with the two hard
+negative regimes and the full-candidate imbalance view. All rows use 32,019 positives;
+ratio-1 has 32,019 negatives and ratio-5 has 160,095 negatives.
 
-- **Model:** frozen V3.1 pairwise scorer, used as the B0 reference in the protocol. It scores each
-  candidate pair independently from frozen node features and has no topology objective.
-- **Legacy source run:** `pair_context_gated_abba_no_cross_s47`, checkpoint
-  `models/v3.1/train/pair_context_gated_abba_no_cross_s47/best_model.pth`.
-- **Benchmark:** Benchmark-A primary split. The held-out candidate universe is assembled into a
-  predicted graph after pair scores are thresholded.
-- **Operating point:** fixed threshold 0.5 for the canonical result.
-- **Graph metrics:** assembled graph metrics over benchmark node buckets with sizes 20 through 200.
-- **Audited legacy pairwise artifact:**
-  `/Users/richardwang/Documents/grand/logs/tccig/02_balanced_subset/pairwise_test/raw_metrics.json`.
-- **Audited legacy topology artifact:**
-  `/Users/richardwang/Documents/grand/artifacts/tccig_01_20260626/logs/tccig/pairwise_baseline/topology_test/topology_metrics.json`.
-- **Artifact boundary:** the external paths above establish the corrected expectation, but they are
-  not repository-local deliverables. E2 remains provisional until the same final benchmark inputs
-  and scorer are rerun and packaged in this repository.
+| Scorer | Regime | AUROC | AUPRC | MCC |
+|---|---|---:|---:|---:|
+| B0 | degree-corrected, ratio-1 | 0.716871 | 0.742622 | 0.306863 |
+| B0 | hard heuristic, ratio-1 | 0.583741 | 0.620193 | 0.092256 |
+| B0 | hard feature, ratio-1 | 0.406667 | 0.475048 | -0.149638 |
+| B0 | full candidate universe | 0.710776 | 0.123982 | 0.087632 |
+| PA-null | easy uniform, ratio-1 | 0.814711 | 0.824781 | 0.005302 |
+| PA-null | hard feature, ratio-1 | 0.858646 | 0.869196 | 0.003226 |
 
----
+The full regime table, including ratio-5 rows, is preserved in
+[`g1_tables.md`](../../outputs/e2_resubmit_retry/g1/g1_tables.md).
 
-## 2. The gap
+### Density-matched assembled graph
 
-Canonical summary metrics:
+At the density-matched operating point (`threshold = 0.993710`), B0 assembles a graph
+with relative density 0.985429 and a valid composite similarity of
+`9.64858e-10` (higher is better; 1 means identical). The component MMD² values are:
 
-| Level | Metric | Value | Reading |
-|---|---|---:|---|
-| Edge | AUROC | **0.793** | strong pairwise ranking |
-| Edge | AUPRC | **0.792** | above the published comparison rows used by the legacy study |
-| Edge | accuracy at 0.5 | 0.712 | balanced-test operating point |
-| Edge | precision / recall at 0.5 | 0.718 / 0.668 | comparatively balanced operating point |
-| Edge | F1 / MCC at 0.5 | 0.692 / 0.423 | thresholded separation |
-| Assembled graph | graph similarity | **0.337** | poor despite strong pairwise metrics |
-| Assembled graph | relative density | 3.134 | strongly over-dense; target is approximately 1 |
-| Assembled graph | degree MMD | 26.99 | high; ideal is near 0 |
-| Assembled graph | clustering MMD | 21.14 | high; ideal is near 0 |
-| Assembled graph | spectral MMD | 20.99 | high; ideal is near 0 |
+| Component | MMD² | Ideal |
+|---|---:|---:|
+| Degree | 0.620493 | 0 |
+| Clustering | 0.729620 | 0 |
+| Spectral | 0.836370 | 0 |
 
-Paper-ready statement:
+The assembled graph contains 2,018 predicted self-loops versus 1,891 reference
+self-loops. The PA-null density-matched control has relative density 1.0,
+degree/clustering/spectral MMD² of 0.645286/0.734427/0.753003, and composite
+`1.53185e-9`.
 
-> The frozen pairwise scorer reaches AUROC 0.793 and AUPRC 0.792, yet its assembled Benchmark-A
-> graph has graph similarity 0.337, relative density 3.134, and high degree, clustering, and
-> spectral MMDs. Strong pair-level ranking does not by itself guarantee plausible graph assembly.
+The full threshold sweep is in the synced `g1_tables.md`; it shows that the gap is not
+an artifact of one arbitrary threshold. The sweep includes the operating point and
+the 50, 80, 90, 95, 97.5, 99, 99.5, and 99.9 probability percentiles.
 
----
+### Composite validation and construction
 
-## 3. The gap widens with graph size
+- O'Bray degree-preserving-swap and uniform-rewire perturbation checks both passed;
+  similarities decrease monotonically across the tested perturbation fractions.
+- Noise-floor calibration, MMD configuration, threshold policy, negative construction,
+  PA-null formula, and the breadth-first missing-feature note are recorded in
+  `g1_results.json`.
+- Degree heterogeneity is `sigma = 1.098430`; candidate positive rate is `0.0157174`.
+- The scorer artifact contains 2,037,171 rows and was produced from the packed-feature
+  pipeline on the four-H20 run.
 
-Per-bucket graph similarity for the frozen baseline:
+## 2. G2 edge-independence ceiling
 
-| Node bucket | 20 | 40 | 60 | 80 | 100 | 120 | 140 | 160 | 180 | 200 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| graph similarity | 0.431 | 0.414 | 0.407 | 0.335 | 0.366 | 0.296 | 0.308 | 0.292 | 0.295 | 0.224 |
+G2 evaluates Chanpuriya et al.'s exact identities on the cached soft score matrix,
+excluding self-pairs from the dense probability matrix:
 
-The assembled graph gets less plausible overall as the evaluated subgraph grows: graph similarity
-falls from 0.431 at bucket size 20 to 0.224 at bucket size 200, although the trend is not strictly
-monotone at every intermediate bucket. The existing [e2-gap.html](../../figures/e2-gap.html) still
-contains the invalidated intermediate-file numbers and must be regenerated separately.
+| Quantity | Value |
+|---|---:|
+| Test nodes | 2,018 |
+| Non-self scored pairs | 2,035,153 |
+| Simple reference edges | 30,128 |
+| Reference triangles (`delta_star`) | 263,164 |
+| Expected soft-edge volume `V(P)` | 675,446.012 |
+| Measured overlap `Ov(P)` | 0.654778 |
+| Minimum overlap `Ov_min` at matched volume | 0.010038 |
+| Expected triangles `E[Delta]` | 82,752,832.477 |
+| Triangle headroom (`E[Delta] / delta_star`) | 314.453 |
+| Overlap headroom (`Ov / Ov_min`) | 65.232 |
 
----
+Thus the measured soft scorer is well above the minimum overlap required by the
+edge-independence ceiling to reach the reference triangle count. This is a feasibility
+check, not evidence that the assembled graph is realistic: hard-thresholded assemblies
+have `Ov = 1`, where the bound is vacuous, and the exact curve is the relevant object.
+The complete curve is in [`g2_results.json`](../../outputs/e2_resubmit_retry/g2/g2_results.json).
 
-## 4. Invalidated operating-point evidence
+## 3. Interpretation and remaining gate
 
-The previous variant table was derived from the same invalid intermediate benchmark surface and
-must not be used. The corrected legacy reference establishes only the threshold-0.5 point above.
-A clean operating-point curve must be regenerated from one frozen scorer and the final candidate
-universe, with edge metrics and assembled-graph metrics reported together at every threshold.
+G1 survives degree-corrected, heuristic-hard, feature-hard, and full-universe views:
+the topology gap remains at a density-matched operating point and the composite passes
+its expressivity check. However, the PA-null control wins on easy and feature-hard edge
+ranking, so subsequent model comparisons must report PA-null alongside B0 and must not
+call this checkpoint a uniformly strong edge scorer. G2 leaves substantial theoretical
+headroom under the locked edge-independent contract. G3's Oracle row is still required
+before EgoStitch implementation begins.
 
----
+## 4. Synced artifacts
 
-## 5. Preview for the main experiment
-
-No topology-aware comparison should inherit the invalidated intermediate-file rows. The E3
-baseline table must rerun B0, topology-loss, global-refiner, static-denoiser, and local-scaffold
-methods under the same final split artifacts, scorer family, threshold policy, and metric
-normalization.
-
----
-
-## 6. Caveats and open decisions
-
-1. **Reproduction required:** the corrected numbers are an audited legacy expectation, not yet a
-   repository-local E2 deliverable.
-2. **Final benchmark files only:** intermediate benchmark files are invalid for E2 training,
-   checkpoint comparison, evaluation, and paper tables.
-3. **Baseline identity:** the reproduction must use the pinned V3.1 raw scorer above, or explicitly
-   declare and justify a different frozen B0 before comparing results.
-4. **Metric normalization:** assembled graph MMDs must use one canonical implementation and scale.
-5. **No true threshold sweep yet:** the clean recall-to-topology curve requires one frozen scorer,
-   one final candidate universe, and multiple thresholds.
-6. **Head-to-head baselines:** this E2 expectation motivates the benchmark; it is not a substitute
-   for the E3 table that compares all baselines under one protocol.
-
----
-
-## 7. Deliverables produced
-
-- [e2-gap.html](../../figures/e2-gap.html): currently stale; regenerate from corrected artifacts
-  before citing it.
-- This document: corrected E2 expectation, provenance, invalidation notice, and rerun requirements.
-- [03-experiment-protocol.md](../03-experiment-protocol.md): protocol context for where E2 sits in the full
-  experiment matrix.
+- [`g1_results.json`](../../outputs/e2_resubmit_retry/g1/g1_results.json)
+- [`g1_tables.md`](../../outputs/e2_resubmit_retry/g1/g1_tables.md)
+- [`g2_results.json`](../../outputs/e2_resubmit_retry/g2/g2_results.json)
+- [`test_edge_metrics.json`](../../outputs/e2_resubmit_retry/test_edge_metrics.json)
+- [`complete.json`](../../outputs/e2_resubmit_retry/complete.json)
