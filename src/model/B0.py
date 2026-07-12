@@ -561,13 +561,7 @@ class CrossAttentionLayer(nn.Module):
         key_padding_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         query_norm = self.norm_attn(query)
-        attn_out, _ = self.attn(
-            query_norm,
-            key_value,
-            key_value,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-        )
+        attn_out, _ = self.attn(query_norm, key_value, key_value, key_padding_mask=key_padding_mask)
         return query + cast(torch.Tensor, self.drop_attn(attn_out))
 
     def _ffn(self, x: torch.Tensor) -> torch.Tensor:
@@ -607,13 +601,7 @@ class CrossAttentionLayer(nn.Module):
         )
 
         cls_norm = self.norm_cls_attn(cls_token)
-        attn_cls, _ = self.attn_cls(
-            cls_norm,
-            combined,
-            combined,
-            key_padding_mask=combined_mask,
-            need_weights=False,
-        )
+        attn_cls, _ = self.attn_cls(cls_norm, combined, combined, key_padding_mask=combined_mask)
         cls_token = cls_token + self.drop_cls_attn(attn_cls)
         cls_token = cls_token + self.drop_cls_ffn(self.ff_cls(self.norm_cls_ffn(cls_token)))
 
@@ -646,13 +634,7 @@ class BlockSelfMixingLayer(nn.Module):
         padding_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         x_norm = self.norm_attn(x)
-        attn_out, _ = self.attn(
-            x_norm,
-            x_norm,
-            x_norm,
-            key_padding_mask=padding_mask,
-            need_weights=False,
-        )
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm, key_padding_mask=padding_mask)
         x = x + cast(torch.Tensor, self.drop_attn(attn_out))
         return x + cast(torch.Tensor, self.drop_ffn(self.ffn(self.norm_ffn(x))))
 

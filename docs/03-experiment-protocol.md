@@ -5,7 +5,7 @@
 `04-model-proposal.md` revision 2.1 (approved as a design proposal; **gate G4 was
 signed off later the same day — `06-egostitch-spec.md` is now the implementation
 contract**, including its §9 benchmark binding / data contract and §10–11
-batch-sampler and single-H20 execution design). Changes:
+batch-sampler and four-H20 E2 production execution design). Changes:
 pre-implementation gates G1–G5, baseline ladder extensions (`B0+cal`, `B3-dist`,
 `B3-full`, `B5`, external attribute-only baselines), trained-on vs held-out metric
 families, ceiling and Oracle reference rows, hard-negative construction for zero-edge
@@ -176,6 +176,10 @@ prioritized in Section 5 (gates first).
   "graph similarity" composite **that passes an expressivity/robustness perturbation check
   (O'Bray 2106.01098) before it ranks anything**, and the full-candidate-universe imbalance
   view.
+- **Execution acceptance:** E2 uses a fixed 30-epoch four-H20 throughput run. Validation
+  is executed after every epoch; quality is reported but is not the throughput acceptance gate
+  for the first systems-optimization pass. The wall-clock gate is 60 minutes from an empty
+  derived-cache path through final training artifacts.
 - **Success:** the gap survives hard negatives and calibrated thresholds with a defined
   composite. The current cached numbers (AUROC 0.676 / AUPRC 0.691 vs graph similarity 0.235)
   are quoted as *provisional* until this gate passes. **Stop condition:** if the gap

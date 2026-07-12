@@ -1,9 +1,9 @@
 r"""Universe/pairs scoring CLI with sharding and the pinned scores artifact.
 
 Scores node-pair lists with a frozen B0-family checkpoint (Task-4 format:
-``{"model_state", "model_family", "model_config", ...}``) and writes the single
-self-contained ``.npz`` artifact the G1/G2 analyses consume. It can also compute
-the frozen edge-metric bundle from a fully labeled scores artifact. Pairs come from the
+``{"model_state", "model_family", "model_config", ...}``, or a bare legacy state
+dict with explicit ``--model-family`` / ``--model-config`` metadata) and writes the single
+self-contained ``.npz`` artifact the G1/G2 analyses consume. Pairs come from the
 candidate universe, the val/test edge files, or an arbitrary TSV
 (``u\tv[\tlabel]``). Supports optional contiguous row-range sharding
 plus a ``merge`` subcommand that validates and concatenates shard outputs.
@@ -21,10 +21,6 @@ CLI::
     python -m src.score_universe merge \
         --inputs scores/b0_v31_candidate.shard-*.npz \
         --output scores/b0_v31_candidate.npz
-
-    python -m src.score_universe metrics \
-        --input scores/b0_v31_test.npz \
-        --output outputs/b0_v31/test_metrics.json
 
 Artifact format (pinned — do not drift):
 
@@ -47,13 +43,14 @@ import logging
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
 import numpy as np
 import torch
+import yaml  # type: ignore[import-untyped]
 from numpy.typing import NDArray
 from torch import nn
 
@@ -65,7 +62,6 @@ from src.data.pairs import (
     collate_token_pairs,
     probe_lengths,
 )
-from src.eval.edge_metrics import compute_edge_metrics
 from src.model.B0 import V3_1
 
 logger = logging.getLogger(__name__)
@@ -401,11 +397,18 @@ def _checkpoint_id(model_state: Mapping[str, torch.Tensor]) -> str:
     return hasher.hexdigest()[:16]
 
 
-def _load_checkpoint(path: Path) -> tuple[nn.Module, str, str]:
-    """Rebuild the frozen model from a Task-4-format checkpoint.
+def _load_checkpoint(
+    path: Path,
+    *,
+    model_family: str | None = None,
+    model_config: dict[str, object] | None = None,
+) -> tuple[nn.Module, str, str]:
+    """Rebuild the frozen model from a Task-4 or bare legacy checkpoint.
 
     Args:
         path: Path to a ``best.pt``/``last.pt`` checkpoint.
+        model_family: Explicit family for a bare legacy state dict.
+        model_config: Explicit constructor config for a bare legacy state dict.
 
     Returns:
         ``(model, model_family, checkpoint_id)``; the model has its weights
@@ -415,24 +418,45 @@ def _load_checkpoint(path: Path) -> tuple[nn.Module, str, str]:
         ValueError: If the checkpoint is missing pinned keys or has unexpected
             key types.
     """
-    checkpoint = cast(dict[str, object], torch.load(path, map_location="cpu", weights_only=True))
-    missing = [
-        key for key in ("model_state", "model_family", "model_config") if key not in checkpoint
-    ]
-    if missing:
-        raise ValueError(f"checkpoint {path} is missing required keys: {missing}")
-    model_family = checkpoint["model_family"]
-    if not isinstance(model_family, str):
-        raise ValueError(f"checkpoint {path}: model_family must be a string")
-    model_config = checkpoint["model_config"]
-    if not isinstance(model_config, dict):
-        raise ValueError(f"checkpoint {path}: model_config must be a dict")
-    model_state = cast(dict[str, torch.Tensor], checkpoint["model_state"])
+    checkpoint = cast(Mapping[str, object], torch.load(path, map_location="cpu", weights_only=True))
+    if all(key in checkpoint for key in ("model_state", "model_family", "model_config")):
+        embedded_family = checkpoint["model_family"]
+        if not isinstance(embedded_family, str):
+            raise ValueError(f"checkpoint {path}: model_family must be a string")
+        embedded_config = checkpoint["model_config"]
+        if not isinstance(embedded_config, dict):
+            raise ValueError(f"checkpoint {path}: model_config must be a dict")
+        model_family = embedded_family
+        model_config = cast(dict[str, object], embedded_config)
+        model_state = cast(dict[str, torch.Tensor], checkpoint["model_state"])
+    else:
+        if model_family is None or model_config is None:
+            raise ValueError(
+                f"bare legacy checkpoint {path} requires explicit model_family and model_config"
+            )
+        model_state = cast(dict[str, torch.Tensor], checkpoint)
 
-    model = build_model(model_family, cast(dict[str, object], model_config))
+    model = build_model(model_family, model_config)
     model.load_state_dict(model_state)
     model.eval()
     return model, model_family, _checkpoint_id(model_state)
+
+
+def _load_model_config(path: Path, model_family: str) -> dict[str, object]:
+    """Read ``model.config`` from a project training-config YAML file."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or not isinstance(raw.get("model"), dict):
+        raise ValueError(f"model config {path} must contain a model mapping")
+    model = cast(dict[str, object], raw["model"])
+    configured_family = model.get("family")
+    if configured_family != model_family:
+        raise ValueError(
+            f"model config {path} family {configured_family!r} does not match {model_family!r}"
+        )
+    config = model.get("config")
+    if not isinstance(config, dict):
+        raise ValueError(f"model config {path}: model.config must be a mapping")
+    return cast(dict[str, object], config)
 
 
 # ---------------------------------------------------------------------------
@@ -564,13 +588,6 @@ def _score_v3_1(
     Returns:
         Shape ``(len(pairs),)`` float32 logits in input row order.
     """
-    node_ids = sorted({node_id for pair in pairs for node_id in pair})
-    cached_nodes = store.preload(node_ids)
-    logger.info(
-        "preloaded %d scoring node tensors (%.2f GiB) into host memory",
-        cached_nodes,
-        store.cached_bytes / float(1024**3),
-    )
     lengths = probe_lengths(store, pairs)
     dataset = TokenPairDataset(pairs, None, store, lengths=lengths)
     sampler = LengthBucketedBatchSampler(lengths, token_budget=token_budget, shuffle=False)
@@ -578,10 +595,8 @@ def _score_v3_1(
     out: NDArray[np.float32] = np.empty(len(pairs), dtype=np.float32)
     processed = 0
     for batch_indices in sampler:
-        batch = collate_token_pairs(
-            [dataset[i] for i in batch_indices], pin_memory=device.type == "cuda"
-        )
-        batch = {key: tensor.to(device, non_blocking=True) for key, tensor in batch.items()}
+        batch = collate_token_pairs([dataset[i] for i in batch_indices])
+        batch = {key: tensor.to(device) for key, tensor in batch.items()}
         with torch.inference_mode(), _autocast_context(device, amp):
             logits = cast(torch.Tensor, model(batch)["logits"])
         out[np.asarray(batch_indices, dtype=np.int64)] = (
@@ -677,15 +692,25 @@ def _shard_output_path(output: Path, shard: int) -> Path:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the ``score``/``metrics``/``merge`` argument parser."""
+    """Build the ``score``/``merge`` argument parser."""
     parser = argparse.ArgumentParser(
         prog="python -m src.score_universe",
-        description="Score pair lists, compute labeled metrics, or merge shard outputs.",
+        description="Score node-pair lists with a frozen checkpoint; merge shard outputs.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     score = subparsers.add_parser("score", help="score a pair source with a frozen checkpoint")
-    score.add_argument("--checkpoint", type=Path, required=True, help="Task-4 format .pt file")
+    score.add_argument("--checkpoint", type=Path, required=True, help="checkpoint .pt/.pth file")
+    score.add_argument(
+        "--model-family",
+        choices=sorted(MODEL_BUILDERS),
+        help="model family for a bare legacy state_dict checkpoint",
+    )
+    score.add_argument(
+        "--model-config",
+        type=Path,
+        help="training YAML containing model.config for a bare legacy checkpoint",
+    )
     score.add_argument(
         "--pairs",
         required=True,
@@ -707,12 +732,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="F0 matrix cache path (f0_mlp only)",
     )
 
-    metrics = subparsers.add_parser(
-        "metrics", help="compute edge metrics from a fully labeled scores artifact"
-    )
-    metrics.add_argument("--input", type=Path, required=True, help="labeled scores .npz")
-    metrics.add_argument("--output", type=Path, required=True, help="output metrics .json")
-
     merge = subparsers.add_parser("merge", help="merge shard outputs into one artifact")
     merge.add_argument("--inputs", type=Path, nargs="+", required=True)
     merge.add_argument("--output", type=Path, required=True)
@@ -723,6 +742,10 @@ def _validate_score_args(parser: argparse.ArgumentParser, args: argparse.Namespa
     """Validate ``score`` arguments, exiting via ``parser.error`` on bad input."""
     if not args.checkpoint.exists():
         parser.error(f"checkpoint not found: {args.checkpoint}")
+    if (args.model_family is None) != (args.model_config is None):
+        parser.error("--model-family and --model-config must be given together")
+    if args.model_config is not None and not args.model_config.exists():
+        parser.error(f"model config not found: {args.model_config}")
     pairs_source: str = args.pairs
     if pairs_source not in _NAMED_PAIR_SOURCES and not pairs_source.startswith("file:"):
         parser.error(
@@ -744,7 +767,16 @@ def _run_score(args: argparse.Namespace) -> None:
     """Execute the ``score`` subcommand."""
     device = _resolve_device(args.device)
     logger.info("loading checkpoint %s (device %s)", args.checkpoint, device)
-    model, model_family, checkpoint_id = _load_checkpoint(args.checkpoint)
+    model_config = (
+        _load_model_config(args.model_config, args.model_family)
+        if args.model_config is not None
+        else None
+    )
+    model, model_family, checkpoint_id = _load_checkpoint(
+        args.checkpoint,
+        model_family=args.model_family,
+        model_config=model_config,
+    )
     model.to(device)
 
     pairs, labels = _resolve_pairs(args.pairs, args.data_root, args.strategy)
@@ -823,31 +855,8 @@ def _run_merge(args: argparse.Namespace) -> None:
     )
 
 
-def _run_metrics(args: argparse.Namespace) -> None:
-    """Compute and persist the frozen edge metrics for one labeled scores artifact."""
-    artifact = load_scores(args.input)
-    unique_labels = {int(label) for label in np.unique(artifact.label).tolist()}
-    if not unique_labels.issubset({0, 1}):
-        raise ValueError(
-            "metrics input must be fully labeled with only 0/1 labels; "
-            f"found {sorted(unique_labels)}"
-        )
-    metrics = compute_edge_metrics(artifact.label, artifact.probs())
-    payload: dict[str, object] = {
-        "checkpoint_id": artifact.meta["checkpoint_id"],
-        "model_family": artifact.meta["model_family"],
-        "pairs_source": artifact.meta["pairs_source"],
-        "strategy": artifact.meta["strategy"],
-        "num_rows": len(artifact.label),
-        "metrics": asdict(metrics),
-    }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    logger.info("wrote edge metrics for %d rows to %s", len(artifact.label), args.output)
-
-
 def main(argv: Sequence[str] | None = None) -> None:
-    """CLI entry point for the ``score``, ``metrics``, and ``merge`` subcommands.
+    """CLI entry point for the ``score`` and ``merge`` subcommands.
 
     Args:
         argv: Argument list (defaults to ``sys.argv[1:]``).
@@ -860,10 +869,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "score":
         _validate_score_args(parser, args)
         _run_score(args)
-    elif args.command == "metrics":
-        if not args.input.exists():
-            parser.error(f"scores artifact not found: {args.input}")
-        _run_metrics(args)
     else:
         _run_merge(args)
 

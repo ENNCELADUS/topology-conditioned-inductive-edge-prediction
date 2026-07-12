@@ -3,46 +3,58 @@
 from __future__ import annotations
 
 import json
-import os
 import pickle
-from collections.abc import Iterable
+from collections import Counter
+from collections.abc import Iterable, Iterator
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 from unittest.mock import Mock
 
 import networkx as nx
 import numpy as np
 import pytest
-import src.train_b0 as train_b0_module
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
 from src.data.artifacts import ArtifactVerificationError
-from src.data.pairs import (
-    LengthBucketedBatchSampler,
-    SharedEpochTokenPairDataset,
-    collate_pair_indices,
-)
+from src.data.distributed_pairs import PairBatchSpec
+from src.data.packed_features import PackedFeatureTable, build_packed_features
+from src.data.pairs import TokenPairDataset
 from src.eval.edge_metrics import EdgeMetrics
 from src.model.B0 import BEST_V3_1_CONFIG, V3_1
 from src.model.b0_alt import F0PairMLP
 from src.train_b0 import (
     AssembledData,
     Config,
+    GpuBatchIterable,
     TrainResult,
-    _to_device,
-    _v3_loader_options,
+    _all_ranks_loss_finite,
+    _build_packed_v3_1_loaders,
+    _build_v3_1_loaders,
+    _cycle_assembled_batches,
+    _evaluate_distributed,
+    _interleave_bucket_specs,
+    _run_probe_mode,
+    _run_timed_epoch_probe,
+    _validate_distributed_plan,
     apply_overrides,
     assemble_data,
+    build_ddp_accelerator,
     build_model,
+    compute_sample_warmup_steps,
     config_to_dict,
     load_config,
     parse_args,
     resolve_model_kwargs,
+    scale_ddp_mean_loss,
+    train_ddp_loop,
     train_loop,
+    validate_gathered_validation,
     write_outputs,
 )
+from torch.utils.data import DataLoader
 
 pytestmark = pytest.mark.unit
 
@@ -90,18 +102,25 @@ def _write_yaml_config(path: Path, overrides: dict[str, object] | None = None) -
     return base
 
 
-def _persistent_worker_pids(loader: object) -> set[int]:
-    iterator = cast(Any, getattr(loader, "_iterator", None))
-    assert iterator is not None
-    return {int(worker.pid) for worker in iterator._workers}
-
-
-def _shutdown_persistent_workers(loader: object) -> None:
-    typed_loader = cast(Any, loader)
-    iterator = cast(Any, getattr(typed_loader, "_iterator", None))
-    if iterator is not None:
-        iterator._shutdown_workers()
-        typed_loader._iterator = None
+def _runtime_dict() -> dict[str, object]:
+    return {
+        "world_size": 4,
+        "pack_dir": "outputs/feature_packs/b0_v31_bf16",
+        "pack_workers": 16,
+        "loader_workers_per_rank": 4,
+        "prefetch_factor": 4,
+        "token_budget_candidates": [262144, 524288, 1048576, 1572864],
+        "max_pairs_per_rank": 4096,
+        "memory_limit_gib": 85.0,
+        "total_budget_seconds": 3600,
+        "pack_budget_seconds": 300,
+        "setup_probe_budget_seconds": 300,
+        "train_eval_budget_seconds": 2820,
+        "artifact_budget_seconds": 60,
+        "reserve_seconds": 120,
+        "probe_warmup_steps": 10,
+        "probe_timed_steps": 30,
+    }
 
 
 def _make_synthetic_pair_dataset(
@@ -159,10 +178,25 @@ class TestLoadConfig:
         assert cfg.output_dir == Path("outputs/b0_alt")
         assert cfg.mixed_precision == "no"
 
-    def test_shipped_v3_1_config_uses_four_workers(self) -> None:
-        cfg = load_config(Path("configs/b0_v31_breadth_first.yaml"))
+    def test_loads_four_h20_runtime_config(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "cfg.yaml"
+        _write_yaml_config(config_path, {"runtime": _runtime_dict()})
 
-        assert cfg.data.num_workers == 4
+        cfg = load_config(config_path)
+
+        assert cfg.runtime is not None
+        assert cfg.runtime.world_size == 4
+        assert cfg.runtime.token_budget_candidates == [262144, 524288, 1048576, 1572864]
+        assert cfg.runtime.total_budget_seconds == 3600
+
+    def test_runtime_budget_must_sum_to_total(self, tmp_path: Path) -> None:
+        runtime = _runtime_dict()
+        runtime["reserve_seconds"] = 119
+        config_path = tmp_path / "cfg.yaml"
+        _write_yaml_config(config_path, {"runtime": runtime})
+
+        with pytest.raises(ValueError, match="runtime stage budgets must sum to 3600"):
+            load_config(config_path)
 
     def test_unknown_family_raises_clear_error(self, tmp_path: Path) -> None:
         config_path = tmp_path / "cfg.yaml"
@@ -470,30 +504,6 @@ class TestTrainLoopSyntheticF0Mlp:
         assert torch.equal(logits_reloaded, logits_original)
 
 
-class TestV31LoaderContract:
-    def test_worker_options_enable_pinned_prefetched_loading(self) -> None:
-        assert _v3_loader_options(4) == {
-            "num_workers": 4,
-            "pin_memory": True,
-            "persistent_workers": True,
-            "prefetch_factor": 4,
-        }
-        assert _v3_loader_options(0) == {
-            "num_workers": 0,
-            "pin_memory": True,
-            "persistent_workers": False,
-        }
-
-    def test_to_device_requests_non_blocking_copy(self) -> None:
-        tensor = Mock(spec=torch.Tensor)
-        device = torch.device("cpu")
-
-        moved = _to_device({"value": cast(torch.Tensor, tensor)}, device)
-
-        tensor.to.assert_called_once_with(device, non_blocking=True)
-        assert moved["value"] is tensor.to.return_value
-
-
 class _ScriptedEvalModel(nn.Module):
     """Test double: real training dynamics but fully scripted eval-mode logits.
 
@@ -783,199 +793,6 @@ def _synthetic_data_config(data_root: Path, *, expected_missing_features: list[s
     )
 
 
-class TestV31LoaderConstruction:
-    def test_preloads_only_operative_nodes_and_wires_both_loader_options(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from dataclasses import replace
-
-        data_root = tmp_path / "data"
-        benchmark_root = data_root / "benchmark_2025_neurips"
-        benchmark_root.mkdir(parents=True)
-        _build_synthetic_benchmark(benchmark_root, "synthetic")
-        features_root = data_root / "features" / "frozen_node_features_1024"
-        _write_feature_store(features_root, [f"node_{i:06d}" for i in range(1, 7)])
-        cfg = _synthetic_data_config(data_root, expected_missing_features=["node_000007"])
-        cfg = replace(cfg, data=replace(cfg.data, num_workers=4))
-        assembled = assemble_data(cfg, verify=False)
-        requested_preloads: list[tuple[str, ...]] = []
-        real_preload = assembled.store.preload
-
-        def recording_preload(node_ids: Iterable[str] | None = None) -> int:
-            assert node_ids is not None
-            requested_preloads.append(tuple(node_ids))
-            return real_preload(node_ids)
-
-        monkeypatch.setattr(assembled.store, "preload", recording_preload)
-
-        factory, val_loader = train_b0_module._build_v3_1_loaders(cfg, assembled)
-        train_loader = cast(Any, factory(1))
-        typed_val_loader = cast(Any, val_loader)
-
-        assert requested_preloads == [tuple(assembled.operative_node_ids)]
-        assert assembled.store.cached_node_count == len(assembled.operative_node_ids)
-        for loader in (train_loader, typed_val_loader):
-            assert loader.num_workers == 4
-            assert loader.pin_memory is True
-            assert loader.persistent_workers is True
-            assert loader.prefetch_factor == 4
-            assert loader.collate_fn is collate_pair_indices
-            assert isinstance(loader.dataset[0], int)
-
-    def test_train_and_val_materialize_pinned_batches_in_parent_process(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        data_root = tmp_path / "data"
-        benchmark_root = data_root / "benchmark_2025_neurips"
-        benchmark_root.mkdir(parents=True)
-        _build_synthetic_benchmark(benchmark_root, "synthetic")
-        features_root = data_root / "features" / "frozen_node_features_1024"
-        _write_feature_store(features_root, [f"node_{i:06d}" for i in range(1, 7)])
-        cfg = _synthetic_data_config(data_root, expected_missing_features=["node_000007"])
-        assembled = assemble_data(cfg, verify=False)
-        materialize_calls: list[tuple[int, bool]] = []
-        real_materialize = SharedEpochTokenPairDataset.materialize
-
-        def recording_materialize(
-            self: SharedEpochTokenPairDataset,
-            indices: list[int],
-            *,
-            pin_memory: bool,
-        ) -> dict[str, torch.Tensor]:
-            materialize_calls.append((os.getpid(), pin_memory))
-            return real_materialize(self, indices, pin_memory=False)
-
-        monkeypatch.setattr(SharedEpochTokenPairDataset, "materialize", recording_materialize)
-
-        factory, val_loader = train_b0_module._build_v3_1_loaders(cfg, assembled)
-        list(factory(1))
-        list(val_loader)
-
-        assert len(materialize_calls) >= 2
-        assert {pid for pid, _ in materialize_calls} == {os.getpid()}
-        assert all(pin_memory for _, pin_memory in materialize_calls)
-
-    def test_factory_returns_same_training_loader_after_epoch_exhaustion(
-        self, tmp_path: Path
-    ) -> None:
-        data_root = tmp_path / "data"
-        benchmark_root = data_root / "benchmark_2025_neurips"
-        benchmark_root.mkdir(parents=True)
-        _build_synthetic_benchmark(benchmark_root, "synthetic")
-        features_root = data_root / "features" / "frozen_node_features_1024"
-        _write_feature_store(features_root, [f"node_{i:06d}" for i in range(1, 7)])
-        cfg = _synthetic_data_config(data_root, expected_missing_features=["node_000007"])
-        assembled = assemble_data(cfg, verify=False)
-        factory, _ = train_b0_module._build_v3_1_loaders(cfg, assembled)
-
-        first_loader = factory(1)
-        with pytest.raises(RuntimeError, match="previous iterator is exhausted"):
-            factory(2)
-        list(first_loader)
-        second_loader = factory(2)
-
-        assert second_loader is first_loader
-
-    @pytest.mark.integration
-    def test_persistent_workers_reuse_pids_and_observe_deterministic_epoch_state(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from dataclasses import replace
-
-        real_loader_options = train_b0_module._v3_loader_options
-
-        def bounded_fork_loader_options(num_workers: int) -> dict[str, object]:
-            options = real_loader_options(num_workers)
-            if num_workers > 0:
-                options.update({"multiprocessing_context": "fork", "timeout": 10})
-            return options
-
-        monkeypatch.setattr(train_b0_module, "_v3_loader_options", bounded_fork_loader_options)
-
-        data_root = tmp_path / "data"
-        benchmark_root = data_root / "benchmark_2025_neurips"
-        benchmark_root.mkdir(parents=True)
-        _build_synthetic_benchmark(benchmark_root, "synthetic")
-        features_root = data_root / "features" / "frozen_node_features_1024"
-        _write_feature_store(features_root, [f"node_{i:06d}" for i in range(1, 7)])
-        cfg = _synthetic_data_config(data_root, expected_missing_features=["node_000007"])
-        cfg = replace(cfg, data=replace(cfg.data, num_workers=2))
-        assembled = assemble_data(cfg, verify=False)
-        factory, _ = train_b0_module._build_v3_1_loaders(cfg, assembled)
-        loaders: list[object] = []
-
-        node_values = {
-            node_id: float(assembled.store.load_tokens(node_id)[0, 0].item())
-            for node_id in assembled.operative_node_ids
-        }
-
-        def expected_stream(epoch: int) -> list[tuple[float, float, float]]:
-            negatives = train_b0_module._build_negative_sampler(assembled).sample(
-                assembled.training_positives,
-                ratio=cfg.data.negative_ratio,
-                seed=cfg.seed,
-                epoch=epoch,
-            )
-            pairs, labels = train_b0_module._shuffled_pairs_and_labels(
-                assembled.training_positives, negatives, cfg.seed, epoch
-            )
-            lengths = [
-                (
-                    int(assembled.store.load_tokens(node_a).size(0)),
-                    int(assembled.store.load_tokens(node_b).size(0)),
-                )
-                for node_a, node_b in pairs
-            ]
-            batch_indices = LengthBucketedBatchSampler(
-                lengths,
-                token_budget=cfg.data.token_budget,
-                shuffle=True,
-                seed=cfg.seed,
-                epoch=epoch,
-            )
-            order = [index for batch in batch_indices for index in batch]
-            return [
-                (node_values[pairs[index][0]], node_values[pairs[index][1]], float(labels[index]))
-                for index in order
-            ]
-
-        def actual_stream(
-            loader: Iterable[dict[str, torch.Tensor]],
-        ) -> list[tuple[float, float, float]]:
-            stream: list[tuple[float, float, float]] = []
-            for batch in loader:
-                for row in range(batch["label"].size(0)):
-                    stream.append(
-                        (
-                            float(batch["emb_a"][row, 0, 0].item()),
-                            float(batch["emb_b"][row, 0, 0].item()),
-                            float(batch["label"][row].item()),
-                        )
-                    )
-            return stream
-
-        try:
-            epoch_1_loader = factory(1)
-            loaders.append(epoch_1_loader)
-            epoch_1_stream = actual_stream(epoch_1_loader)
-            epoch_1_pids = _persistent_worker_pids(epoch_1_loader)
-
-            epoch_2_loader = factory(2)
-            loaders.append(epoch_2_loader)
-            epoch_2_stream = actual_stream(epoch_2_loader)
-            epoch_2_pids = _persistent_worker_pids(epoch_2_loader)
-
-            assert epoch_2_loader is epoch_1_loader
-            assert len(epoch_1_pids) == 2
-            assert epoch_2_pids == epoch_1_pids
-            assert epoch_1_stream == expected_stream(1)
-            assert epoch_2_stream == expected_stream(2)
-            assert epoch_2_stream != epoch_1_stream
-        finally:
-            for loader in {id(loader): loader for loader in loaders}.values():
-                _shutdown_persistent_workers(loader)
-
-
 class TestAssembleDataFeatureCoverageGate:
     def test_raises_when_exclude_set_does_not_match_expected(self, tmp_path: Path) -> None:
         data_root = tmp_path / "data"
@@ -1031,6 +848,756 @@ class TestAssembleDataFeatureCoverageGate:
 
         # e_sup is a strict subset of the 2 train+ positives (80/20 split of n=2 -> 1/1).
         assert len(assembled.training_positives) <= 2
+
+
+class TestV31TrainingLoader:
+    def test_each_epoch_only_reorders_fixed_train_file_pairs(self, tmp_path: Path) -> None:
+        data_root = tmp_path / "data"
+        benchmark_root = data_root / "benchmark_2025_neurips"
+        benchmark_root.mkdir(parents=True)
+        _build_synthetic_benchmark(benchmark_root, "synthetic")
+        features_root = data_root / "features" / "frozen_node_features_1024"
+        all_nodes = [f"node_{i:06d}" for i in range(1, 7)]
+        _write_feature_store(features_root, all_nodes)
+        cfg = _synthetic_data_config(data_root, expected_missing_features=["node_000007"])
+        cfg = replace(cfg, model=replace(cfg.model, family="v3_1"))
+        assembled = assemble_data(cfg, verify=False)
+
+        factory, _ = _build_v3_1_loaders(cfg, assembled)
+        expected = Counter(
+            zip(
+                assembled.benchmark.split.train_pairs.pairs,
+                assembled.benchmark.split.train_pairs.labels.tolist(),
+                strict=True,
+            )
+        )
+
+        for epoch in (0, 1):
+            loader = factory(epoch)
+            assert isinstance(loader, DataLoader)
+            dataset = loader.dataset
+            assert isinstance(dataset, TokenPairDataset)
+            assert dataset._labels is not None
+            observed = Counter(zip(dataset._pairs, dataset._labels, strict=True))
+            assert observed == expected
+            assert Counter(dataset._labels) == {0: 2, 1: 2}
+
+
+def _synthetic_v31_pack_fixture(
+    tmp_path: Path,
+) -> tuple[Config, AssembledData, Path]:
+    """Build a synthetic benchmark + feature store + packed feature table."""
+    data_root = tmp_path / "data"
+    benchmark_root = data_root / "benchmark_2025_neurips"
+    benchmark_root.mkdir(parents=True)
+    _build_synthetic_benchmark(benchmark_root, "synthetic")
+    source_root = data_root / "features" / "frozen_node_features_1024"
+    _write_feature_store(source_root, [f"node_{index:06d}" for index in range(1, 7)])
+    cfg = load_config(Path("configs/b0_v31_breadth_first.yaml"))
+    cfg = replace(
+        cfg,
+        data=replace(
+            cfg.data,
+            root=data_root,
+            strategy="synthetic",
+            expected_missing_features=["node_000007"],
+        ),
+        output_dir=tmp_path / "outputs",
+    )
+    assembled = assemble_data(cfg, verify=False)
+    pack_root = tmp_path / "pack"
+    build_packed_features(source_root, pack_root, workers=1)
+    return cfg, assembled, pack_root
+
+
+def test_sample_warmup_preserves_pair_exposure() -> None:
+    assert compute_sample_warmup_steps([10, 10], [25], baseline_steps=5) == 2
+
+
+def test_packed_loader_does_not_call_feature_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, assembled, pack_root = _synthetic_v31_pack_fixture(tmp_path)
+    table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
+    monkeypatch.setattr(
+        assembled.store,
+        "load_tokens",
+        Mock(side_effect=AssertionError("unexpected feature I/O")),
+    )
+
+    factory, val_loader, warmup_steps = _build_packed_v3_1_loaders(
+        cfg,
+        assembled,
+        table,
+        token_budget_per_rank=1024,
+        process_index=0,
+        world_size=1,
+    )
+
+    batch = next(iter(factory(1)))
+    assert set(batch) >= {"emb_a", "emb_b", "len_a", "len_b", "label"}
+    assert next(iter(val_loader))["_row_id"].numel() > 0
+    assert warmup_steps >= 1
+
+
+def test_packed_loader_multi_worker_ranks_cover_all_rows(tmp_path: Path) -> None:
+    """world_size=2 takes the production multi-worker persistent DataLoader branch."""
+    cfg, assembled, pack_root = _synthetic_v31_pack_fixture(tmp_path)
+    assert cfg.runtime is not None
+    table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
+    # All synthetic features are length 3 -> every pair lands in bucket 128, and the
+    # train (4 rows) and val (2 rows) buckets both satisfy the >= world_size planner gate.
+    expected_row_ids = list(range(len(assembled.benchmark.split.train_pairs.pairs)))
+
+    seen_row_ids: list[int] = []
+    for process_index in (0, 1):
+        factory, _, _ = _build_packed_v3_1_loaders(
+            cfg,
+            assembled,
+            table,
+            token_budget_per_rank=1024,
+            process_index=process_index,
+            world_size=2,
+        )
+        train_iterable = factory(1)
+        assert isinstance(train_iterable, GpuBatchIterable)
+        loader = train_iterable._source
+        assert isinstance(loader, DataLoader)
+        # Guard against silently regressing into the single-process unit-test branch.
+        assert loader.num_workers == cfg.runtime.loader_workers_per_rank
+        assert loader.num_workers > 0
+        assert loader.persistent_workers is True
+        assert loader.prefetch_factor == cfg.runtime.prefetch_factor
+        assert loader.batch_size is None
+        for batch in train_iterable:
+            assert set(batch) >= {"emb_a", "emb_b", "len_a", "len_b", "label", "_row_id"}
+            seen_row_ids.extend(int(row_id) for row_id in batch["_row_id"])
+
+    # Exact coverage across the two rank partitions: no missing rows, no duplicates.
+    assert sorted(seen_row_ids) == expected_row_ids
+
+
+def test_packed_loader_reuses_one_dataloader_across_epochs(tmp_path: Path) -> None:
+    cfg, assembled, pack_root = _synthetic_v31_pack_fixture(tmp_path)
+    table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
+    factory, _, _ = _build_packed_v3_1_loaders(
+        cfg,
+        assembled,
+        table,
+        token_budget_per_rank=1024,
+        process_index=0,
+        world_size=1,
+    )
+
+    epoch_one = factory(1)
+    epoch_two = factory(2)
+    assert isinstance(epoch_one, GpuBatchIterable)
+    assert isinstance(epoch_two, GpuBatchIterable)
+    assert epoch_one._source is epoch_two._source
+
+
+def test_packed_loader_persistent_workers_survive_two_epochs(tmp_path: Path) -> None:
+    cfg, assembled, pack_root = _synthetic_v31_pack_fixture(tmp_path)
+    table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
+    factory, _, _ = _build_packed_v3_1_loaders(
+        cfg,
+        assembled,
+        table,
+        token_budget_per_rank=1024,
+        process_index=0,
+        world_size=2,
+    )
+
+    epoch_one = factory(1)
+    assert isinstance(epoch_one, GpuBatchIterable)
+    loader = epoch_one._source
+    assert isinstance(loader, DataLoader)
+    list(epoch_one)
+    worker_iterator = loader._iterator
+    assert worker_iterator is not None
+
+    list(factory(2))
+    assert loader._iterator is worker_iterator
+
+
+def test_distributed_plan_rejects_duplicate_and_missing_rows() -> None:
+    plan = [
+        [PairBatchSpec(indices=(0, 0), bucket_boundary=128, global_pair_count=4)],
+        [PairBatchSpec(indices=(1, 2), bucket_boundary=128, global_pair_count=4)],
+    ]
+    with pytest.raises(ValueError, match="duplicate training plan row IDs"):
+        _validate_distributed_plan(plan, expected_row_count=4)
+
+
+def test_probe_batch_cycle_is_lazy_and_traverses_all_batches() -> None:
+    yielded: list[tuple[int, str]] = []
+    calls: list[int] = []
+
+    def factory(epoch: int) -> Iterable[dict[str, torch.Tensor]]:
+        calls.append(epoch)
+
+        def batches() -> Iterator[dict[str, torch.Tensor]]:
+            for bucket in ("short", "medium", "long"):
+                yielded.append((epoch, bucket))
+                yield {"bucket": torch.tensor(len(yielded))}
+
+        return batches()
+
+    iterator = _cycle_assembled_batches(factory)
+    next(iterator)
+    assert yielded == [(1, "short")]
+    next(iterator)
+    next(iterator)
+    next(iterator)
+    assert yielded == [
+        (1, "short"),
+        (1, "medium"),
+        (1, "long"),
+        (1, "short"),
+    ]
+    assert calls == [1, 1]
+
+
+def test_probe_plan_interleaves_all_nonempty_buckets_in_first_window() -> None:
+    first_bucket = [
+        PairBatchSpec(indices=(index,), bucket_boundary=128, global_pair_count=1)
+        for index in range(41)
+    ]
+    later_buckets = [
+        PairBatchSpec(indices=(41,), bucket_boundary=256, global_pair_count=1),
+        PairBatchSpec(indices=(42,), bucket_boundary=512, global_pair_count=1),
+    ]
+
+    ordered = _interleave_bucket_specs(first_bucket + later_buckets)
+
+    assert [spec.bucket_boundary for spec in ordered[:3]] == [128, 256, 512]
+
+
+class _ProbeLossModel(nn.Module):
+    def __init__(self, *, finite: bool, clock_reads: list[int] | None = None) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(1.0))
+        self.finite = finite
+        self.clock_reads = clock_reads
+        self.forward_clock_values: list[int] = []
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        del batch
+        if self.clock_reads is not None:
+            self.forward_clock_values.append(len(self.clock_reads))
+        multiplier = torch.tensor(1.0 if self.finite else float("nan"))
+        return {"loss": self.weight * multiplier}
+
+
+def _probe_batch(global_count: int) -> dict[str, torch.Tensor]:
+    return {
+        "label": torch.zeros(global_count),
+        "_local_pair_count": torch.tensor(global_count),
+        "_global_pair_count": torch.tensor(global_count),
+    }
+
+
+def test_probe_starts_timer_before_first_timed_forward_and_counts_exact_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = load_config(Path("configs/b0_v31_breadth_first.yaml"))
+    assert cfg.runtime is not None
+    cfg = replace(
+        cfg,
+        runtime=replace(cfg.runtime, probe_warmup_steps=1, probe_timed_steps=2),
+    )
+    clock_reads: list[int] = []
+
+    def monotonic() -> float:
+        clock_reads.append(len(clock_reads))
+        return 10.0 + 2.0 * (len(clock_reads) - 1)
+
+    monkeypatch.setattr("src.train_b0.time.monotonic", monotonic)
+    model = _ProbeLossModel(finite=True, clock_reads=clock_reads)
+    batches = [_probe_batch(count) for count in (5, 7, 11)]
+    output = tmp_path / "probe.json"
+    _run_probe_mode(
+        model,
+        lambda epoch: iter(batches),
+        cfg,
+        Accelerator(),
+        token_budget_per_rank=1024,
+        profile_output=output,
+    )
+
+    payload = json.loads(output.read_text())
+    assert model.forward_clock_values == [0, 1, 1]
+    assert payload["global_pairs_per_second"] == pytest.approx((7 + 11) / 2.0)
+
+
+def test_probe_rejects_nonfinite_loss(tmp_path: Path) -> None:
+    cfg = load_config(Path("configs/b0_v31_breadth_first.yaml"))
+    assert cfg.runtime is not None
+    cfg = replace(
+        cfg,
+        runtime=replace(cfg.runtime, probe_warmup_steps=0, probe_timed_steps=1),
+    )
+    output = tmp_path / "probe.json"
+    with pytest.raises(RuntimeError, match="non-finite probe loss"):
+        _run_probe_mode(
+            _ProbeLossModel(finite=False),
+            lambda epoch: iter([_probe_batch(2)]),
+            cfg,
+            Accelerator(),
+            token_budget_per_rank=1024,
+            profile_output=output,
+        )
+
+    assert not output.exists()
+
+
+def test_probe_emits_candidate_failure_marker_for_nonfinite_loss(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = load_config(Path("configs/b0_v31_breadth_first.yaml"))
+    assert cfg.runtime is not None
+    cfg = replace(
+        cfg,
+        runtime=replace(cfg.runtime, probe_warmup_steps=0, probe_timed_steps=1),
+    )
+
+    with pytest.raises(RuntimeError, match="non-finite probe loss"):
+        _run_probe_mode(
+            _ProbeLossModel(finite=False),
+            lambda epoch: iter([_probe_batch(2)]),
+            cfg,
+            Accelerator(),
+            token_budget_per_rank=1024,
+            profile_output=tmp_path / "probe.json",
+        )
+
+    marker = capsys.readouterr().err.strip()
+    prefix = "E2_PROBE_CANDIDATE_FAILURE:"
+    assert marker.startswith(prefix)
+    assert json.loads(marker.removeprefix(prefix)) == {
+        "kind": "nonfinite",
+        "message": "non-finite probe loss",
+    }
+
+
+def test_probe_reraises_backward_runtime_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = load_config(Path("configs/b0_v31_breadth_first.yaml"))
+    assert cfg.runtime is not None
+    cfg = replace(
+        cfg,
+        runtime=replace(cfg.runtime, probe_warmup_steps=0, probe_timed_steps=1),
+    )
+    output = tmp_path / "probe.json"
+    accelerator = Accelerator()
+    monkeypatch.setattr(
+        accelerator,
+        "backward",
+        Mock(side_effect=RuntimeError("backward collective failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="backward collective failed"):
+        _run_probe_mode(
+            _ProbeLossModel(finite=True),
+            lambda epoch: iter([_probe_batch(2)]),
+            cfg,
+            accelerator,
+            token_budget_per_rank=1024,
+            profile_output=output,
+        )
+
+    assert not output.exists()
+    assert "E2_PROBE_CANDIDATE_FAILURE:" not in capsys.readouterr().err
+
+
+def test_probe_marks_backward_oom_before_reraising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = load_config(Path("configs/b0_v31_breadth_first.yaml"))
+    assert cfg.runtime is not None
+    cfg = replace(
+        cfg,
+        runtime=replace(cfg.runtime, probe_warmup_steps=0, probe_timed_steps=1),
+    )
+    accelerator = Accelerator()
+    monkeypatch.setattr(
+        accelerator,
+        "backward",
+        Mock(side_effect=torch.OutOfMemoryError("CUDA out of memory in backward")),
+    )
+
+    with pytest.raises(torch.OutOfMemoryError, match="CUDA out of memory"):
+        _run_probe_mode(
+            _ProbeLossModel(finite=True),
+            lambda epoch: iter([_probe_batch(2)]),
+            cfg,
+            accelerator,
+            token_budget_per_rank=1024,
+            profile_output=tmp_path / "probe.json",
+        )
+
+    marker = capsys.readouterr().err.strip()
+    prefix = "E2_PROBE_CANDIDATE_FAILURE:"
+    assert marker.startswith(prefix)
+    payload = json.loads(marker.removeprefix(prefix))
+    assert payload["kind"] == "oom"
+    assert "CUDA out of memory" in payload["message"]
+
+
+class _EpochProbeClockAccelerator:
+    device = torch.device("cpu")
+
+    def __init__(self) -> None:
+        self.barriers = 0
+
+    def wait_for_everyone(self) -> None:
+        self.barriers += 1
+
+    def gather(self, tensor: torch.Tensor) -> torch.Tensor:
+        return torch.cat((tensor, torch.tensor([7.5], dtype=tensor.dtype)))
+
+
+def test_epoch_probe_barriers_before_training_and_reports_slowest_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accelerator = _EpochProbeClockAccelerator()
+    events: list[str] = []
+    clock = iter((10.0, 14.0))
+    monkeypatch.setattr("src.train_b0.time.monotonic", lambda: next(clock))
+
+    def train_once() -> str:
+        events.append(f"train-after-{accelerator.barriers}")
+        return "result"
+
+    result, elapsed = _run_timed_epoch_probe(
+        cast(Accelerator, accelerator),
+        train_once,
+    )
+
+    assert result == "result"
+    assert events == ["train-after-1"]
+    assert elapsed == pytest.approx(7.5)
+
+
+# ------------------------------------------------------- fixed-epoch DDP train/eval semantics
+
+
+def test_ddp_loss_scaling_matches_global_sample_mean() -> None:
+    local_mean = torch.tensor(2.0)
+    scaled = scale_ddp_mean_loss(local_mean, local_count=3, global_count=10, world_size=4)
+    assert scaled.item() == pytest.approx(2.4)
+
+
+def test_ddp_loss_scaling_rejects_invalid_counts() -> None:
+    with pytest.raises(ValueError, match="invalid DDP loss-scaling counts"):
+        scale_ddp_mean_loss(torch.tensor(1.0), local_count=0, global_count=4, world_size=2)
+    with pytest.raises(ValueError, match="invalid DDP loss-scaling counts"):
+        scale_ddp_mean_loss(torch.tensor(1.0), local_count=5, global_count=4, world_size=2)
+
+
+def test_build_ddp_accelerator_pins_ddp_kwargs() -> None:
+    accelerator = build_ddp_accelerator("no")
+    handler = accelerator.ddp_handler
+    assert handler is not None
+    assert handler.broadcast_buffers is False
+    assert handler.find_unused_parameters is False
+    assert handler.gradient_as_bucket_view is True
+
+
+def test_validation_rejects_duplicate_rows() -> None:
+    with pytest.raises(ValueError, match="duplicate validation row IDs"):
+        validate_gathered_validation(
+            row_ids=np.array([0, 0, 1]),
+            labels=np.array([0, 0, 1]),
+            logits=np.array([-1.0, -1.0, 1.0]),
+            expected_row_ids=np.array([0, 1]),
+        )
+
+
+def test_validation_rejects_missing_rows() -> None:
+    with pytest.raises(ValueError, match="do not cover the fixed validation set"):
+        validate_gathered_validation(
+            row_ids=np.array([0, 2]),
+            labels=np.array([1, 0]),
+            logits=np.array([1.0, -1.0]),
+            expected_row_ids=np.array([0, 1, 2]),
+        )
+
+
+def test_validation_returns_row_sorted_labels_and_logits() -> None:
+    labels, logits = validate_gathered_validation(
+        row_ids=np.array([2, 0, 1]),
+        labels=np.array([0, 1, 1]),
+        logits=np.array([0.5, -0.5, 2.0]),
+        expected_row_ids=np.array([0, 1, 2]),
+    )
+    assert labels.tolist() == [1, 1, 0]
+    assert logits.tolist() == pytest.approx([-0.5, 2.0, 0.5])
+
+
+class _StubSumReduceAccelerator:
+    """Simulate accelerate's SUM-only cross-process reduce for a 4-rank world.
+
+    ``accelerate.utils.operations._reduce_across_processes`` unconditionally
+    all-reduces with ``ReduceOp.SUM`` and only special-cases ``reduction ==
+    "mean"`` — any other reduction string silently returns the sum. This stub
+    reproduces exactly that: it adds the simulated other ranks' flag values.
+    """
+
+    device = torch.device("cpu")
+
+    def __init__(self, other_rank_flags: list[float]) -> None:
+        self._other_rank_flags = other_rank_flags
+
+    def reduce(self, tensor: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        # The guard must rely only on SUM semantics; anything else degrades to
+        # SUM inside accelerate and must not be requested.
+        assert reduction == "sum"
+        return tensor + sum(self._other_rank_flags)
+
+
+def test_finite_guard_fails_when_any_rank_nonfinite() -> None:
+    # Local loss is finite, but one simulated peer rank reports non-finite.
+    # Under the broken reduction="min" guard (which accelerate silently turns
+    # into a SUM of finite-flags), this scenario passed and backward spread the
+    # corrupt gradient to every rank.
+    accelerator = cast(Accelerator, _StubSumReduceAccelerator([1.0, 0.0, 0.0]))
+    assert _all_ranks_loss_finite(torch.tensor(0.5), accelerator) is False
+
+
+def test_finite_guard_passes_when_all_ranks_finite() -> None:
+    accelerator = cast(Accelerator, _StubSumReduceAccelerator([0.0, 0.0, 0.0]))
+    assert _all_ranks_loss_finite(torch.tensor(0.5), accelerator) is True
+
+
+def test_finite_guard_fails_on_local_nonfinite_single_process() -> None:
+    accelerator = Accelerator()
+    assert _all_ranks_loss_finite(torch.tensor(float("nan")), accelerator) is False
+    assert _all_ranks_loss_finite(torch.tensor(1.0), accelerator) is True
+
+
+class _NonMainGatherAccelerator:
+    """Single-process stand-in for a non-zero rank in distributed validation.
+
+    ``gather``/``pad_across_processes`` are identities (gather already returns
+    the full tensors on every rank in real DDP); ``is_main_process`` is False so
+    any rank-zero-only code path is skipped.
+    """
+
+    device = torch.device("cpu")
+    is_main_process = False
+    num_processes = 2
+    process_index = 1
+
+    def pad_across_processes(
+        self, tensor: torch.Tensor, dim: int = 0, pad_index: int = 0
+    ) -> torch.Tensor:
+        return tensor
+
+    def gather(self, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor
+
+
+def test_evaluate_distributed_coverage_failure_raises_on_non_main_rank() -> None:
+    # A duplicate validation row must raise the coverage ValueError on EVERY
+    # rank symmetrically. If only rank zero validated, the other ranks would
+    # block in broadcast_object_list until the NCCL watchdog killed the job.
+    model = F0PairMLP(input_dim=4, hidden_dims=(8,), dropout=0.0)
+    batch = _batch_of(_make_synthetic_pair_dataset(4))
+    batch["_row_id"] = torch.tensor([0, 0, 1, 2])  # row 0 gathered twice
+
+    accelerator = cast(Accelerator, _NonMainGatherAccelerator())
+    with pytest.raises(ValueError, match="duplicate validation row IDs"):
+        _evaluate_distributed(
+            model,
+            [batch],
+            accelerator,
+            expected_row_ids=np.arange(3, dtype=np.int64),
+        )
+
+
+def test_ddp_loop_records_counterfactual_stop_but_runs_all_epochs(tmp_path: Path) -> None:
+    config_path = tmp_path / "cfg.yaml"
+    _write_yaml_config(config_path, {"optim.epochs": 4, "eval.patience": 1})
+    cfg = load_config(config_path)
+    model = F0PairMLP(input_dim=4, hidden_dims=(8,), dropout=0.0)
+    batch = _batch_of(_make_synthetic_pair_dataset(8))
+    batch["_local_pair_count"] = torch.tensor(8)
+    batch["_global_pair_count"] = torch.tensor(8)
+    batch["_row_id"] = torch.arange(8)
+
+    def factory(epoch: int) -> list[dict[str, torch.Tensor]]:
+        assert 1 <= epoch <= 4
+        return [batch]
+
+    metrics = EdgeMetrics(
+        auroc=0.5,
+        auprc=0.5,
+        accuracy=0.5,
+        sensitivity=0.5,
+        specificity=0.5,
+        precision=0.5,
+        recall=0.5,
+        f1=0.5,
+        mcc=0.0,
+        ece=0.0,
+        brier=0.25,
+        threshold=0.5,
+        n_pos=4,
+        n_neg=4,
+    )
+    result = train_ddp_loop(
+        model,
+        factory,
+        [batch],
+        cfg,
+        Accelerator(),
+        warmup_steps=1,
+        evaluate_fn=lambda model, loader, accelerator: metrics,
+    )
+    assert result.last_epoch == 4
+    assert result.stopped_early is False
+    assert result.counterfactual_stop_epoch == 2
+    # Count epochs that actually executed (one history entry and one per-epoch
+    # profile per epoch), not the returned last_epoch constant: a hypothetical
+    # early break under fired patience must fail these.
+    assert len(result.history) == 4
+    assert [entry["epoch"] for entry in result.history] == [1, 2, 3, 4]
+    assert len(cast(list[object], result.runtime_profile["per_epoch"])) == 4
+
+
+class _BatchValueLossModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {"loss": self.weight * 0.0 + batch["loss_value"].mean()}
+
+
+def _constant_metrics() -> EdgeMetrics:
+    return EdgeMetrics(
+        auroc=0.5,
+        auprc=0.5,
+        accuracy=0.5,
+        sensitivity=0.5,
+        specificity=0.5,
+        precision=0.5,
+        recall=0.5,
+        f1=0.5,
+        mcc=0.0,
+        ece=0.0,
+        brier=0.25,
+        threshold=0.5,
+        n_pos=2,
+        n_neg=2,
+    )
+
+
+def _loss_batch(value: float, row_ids: list[int]) -> dict[str, torch.Tensor]:
+    count = len(row_ids)
+    return {
+        "loss_value": torch.full((count,), value),
+        "label": torch.zeros(count),
+        "_row_id": torch.tensor(row_ids),
+        "_local_pair_count": torch.tensor(count),
+        "_global_pair_count": torch.tensor(count),
+    }
+
+
+def test_ddp_loop_reports_global_sample_weighted_train_loss(tmp_path: Path) -> None:
+    config_path = tmp_path / "cfg.yaml"
+    _write_yaml_config(config_path, {"optim.epochs": 1})
+    cfg = load_config(config_path)
+    batches = [_loss_batch(1.0, [0]), _loss_batch(3.0, [1, 2, 3])]
+
+    result = train_ddp_loop(
+        _BatchValueLossModel(),
+        lambda epoch: batches,
+        batches,
+        cfg,
+        Accelerator(),
+        warmup_steps=1,
+        evaluate_fn=lambda model, loader, accelerator: _constant_metrics(),
+    )
+
+    assert result.history[0]["train_loss"] == pytest.approx(2.5)
+
+
+def test_ddp_loop_rejects_duplicate_and_missing_training_rows(tmp_path: Path) -> None:
+    config_path = tmp_path / "cfg.yaml"
+    _write_yaml_config(config_path, {"optim.epochs": 1})
+    cfg = load_config(config_path)
+    batch = _loss_batch(1.0, [0, 0, 2, 3])
+
+    with pytest.raises(ValueError, match="duplicate training row IDs"):
+        train_ddp_loop(
+            _BatchValueLossModel(),
+            lambda epoch: [batch],
+            [batch],
+            cfg,
+            Accelerator(),
+            warmup_steps=1,
+            evaluate_fn=lambda model, loader, accelerator: _constant_metrics(),
+        )
+
+
+def test_ddp_loop_runtime_profile_has_task12_keys(tmp_path: Path) -> None:
+    config_path = tmp_path / "cfg.yaml"
+    _write_yaml_config(config_path, {"optim.epochs": 2, "eval.patience": 8})
+    cfg = load_config(config_path)
+    model = F0PairMLP(input_dim=4, hidden_dims=(8,), dropout=0.0)
+    batch = _batch_of(_make_synthetic_pair_dataset(8))
+    batch["_local_pair_count"] = torch.tensor(8)
+    batch["_global_pair_count"] = torch.tensor(8)
+    batch["_row_id"] = torch.arange(8)
+
+    metrics = EdgeMetrics(
+        auroc=0.5,
+        auprc=0.5,
+        accuracy=0.5,
+        sensitivity=0.5,
+        specificity=0.5,
+        precision=0.5,
+        recall=0.5,
+        f1=0.5,
+        mcc=0.0,
+        ece=0.0,
+        brier=0.25,
+        threshold=0.5,
+        n_pos=4,
+        n_neg=4,
+    )
+    result = train_ddp_loop(
+        model,
+        lambda epoch: [batch],
+        [batch],
+        cfg,
+        Accelerator(),
+        warmup_steps=1,
+        evaluate_fn=lambda model, loader, accelerator: metrics,
+    )
+    profile = result.runtime_profile
+    assert set(profile) >= {
+        "epochs_completed",
+        "validations_completed",
+        "peak_memory_gib_per_rank",
+        "steady_state_data_wait_fraction",
+        "training_coverage_exact",
+        "validation_coverage_exact",
+        "feature_cache_hit_rate",
+        "per_epoch",
+        "counterfactual_stop_epoch",
+        "per_rank",
+        "global_pairs_per_second",
+        "global_tokens",
+        "global_tokens_per_second",
+        "validation_seconds",
+    }
+    assert profile["epochs_completed"] == 2
+    assert profile["validations_completed"] == 2
+    assert len(cast(list[object], profile["per_epoch"])) == 2
 
 
 # --------------------------------------------------------------------------- real-data integration

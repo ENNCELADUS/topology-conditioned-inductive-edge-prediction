@@ -1,16 +1,40 @@
 # B0: V3.1 frozen pairwise scorer over raw token sequences, breadth_first split.
 model:
   family: v3_1
-  config: {} # empty -> src.model.B0.BEST_V3_1_CONFIG
+  config:
+    input_dim: 1536
+    d_model: 512
+    encoder_layers: 3
+    cross_attn_layers: 3
+    n_heads: 8
+    mlp_head:
+      hidden_dims: [512, 256, 128]
+      dropout: 0.2
+      activation: gelu
+      norm: layernorm
+      spectral_norm: false
+    regularization:
+      dropout: 0.1
+      token_dropout: 0.1
+      cross_attention_dropout: 0.1
+      stochastic_depth: 0.1
+    rich_pooling:
+      components: [mean, attn, max, gated]
+    pair_readout:
+      mode: pair_context_gated
+      order_aggregation: abba_max
+      spectral_norm: false
+    mixing:
+      mode: none
 data:
   root: data
   strategy: breadth_first
   train_positives: train_plus # train_plus = all train+ | e_sup = supervision split only
-  negative_ratio: 5
+  negative_ratio: 1 # F0-only; V3.1 trains on fixed balanced train_edges.txt rows
   partition_seed: 0
   token_budget: 131072
   batch_pairs: 1024
-  num_workers: 4
+  num_workers: 0
   f0_cache: outputs/f0_cache/f0_matrix.pt
   expected_missing_features: [node_004764, node_007050]
 optim:
@@ -22,6 +46,23 @@ optim:
 eval:
   patience: 8
   eval_every: 1
+runtime:
+  world_size: 4
+  pack_dir: outputs/feature_packs/b0_v31_bf16
+  pack_workers: 16
+  loader_workers_per_rank: 4
+  prefetch_factor: 4
+  token_budget_candidates: [262144, 524288, 1048576, 1572864]
+  max_pairs_per_rank: 4096
+  memory_limit_gib: 85.0
+  total_budget_seconds: 3600
+  pack_budget_seconds: 300
+  setup_probe_budget_seconds: 300
+  train_eval_budget_seconds: 2820
+  artifact_budget_seconds: 60
+  reserve_seconds: 120
+  probe_warmup_steps: 10
+  probe_timed_steps: 30
 seed: 47
 output_dir: outputs/b0_v31
-mixed_precision: "bf16" # pinned for the single-H20 container
+mixed_precision: "bf16" # pinned for the four-H20 E2 target

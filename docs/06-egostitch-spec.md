@@ -8,7 +8,7 @@ interior weights. Neutral placeholders per repository convention; no dataset nam
 Nothing here changes the model of `04-model-proposal.md` — this document pins the free
 parameters that document left symbolic. §§9–11 (added at sign-off) bind the spec to
 the local benchmark package in `data/`, define the batch-sampler / data contract, and
-fix the single-H20 execution design.
+fix the four-H20 E2 production execution design.
 
 **Freeze rule.** This spec is signed off: implementation may not silently deviate;
 any change is an edit here first, with a one-line rationale in §12 (change log).
@@ -173,7 +173,10 @@ queries, reported with every headline table.
   (u,v) is in the batch, v is excluded from u's targets and |N(u)| decremented.
 - Seam references: unions of message-partition ego-net pairs sampled 50/50
   adjacent/random with labels marginalized.
-- B0 provenance audit is an E5 gate precondition.
+- B0 provenance audit is an E5 gate precondition. The E2 legacy-reproduction B0 is
+  pinned to the audited V3.1 `pair_context_gated` / `abba_max` / no-cross checkpoint
+  family (`d_model = 512`, no spectral normalization) and trains from the fixed
+  balanced `train_edges.txt` rows when a local retrain is required.
 - **Benchmark binding:** how the shipped artifacts map onto message/supervision/val,
   which shipped files are quarantined, and the self-loop policy are fixed in §9 —
   §9 is normative wherever the shipped artifacts differ from the abstract wording
@@ -345,15 +348,17 @@ streams cycle independently.
 
 ### 10.2 Negative sampling (training)
 
-Resampled every epoch, seeded by (seed, epoch, idx):
+For EgoStitch and its topology-aware training arms, negatives are resampled every
+epoch, seeded by (seed, epoch, idx):
 50% uniform train-side
 pairs, 50% degree-corrected (endpoint corruption of a positive with replacement
 probability ∝ deg_G_struct(v)); self-pair negatives sampled at their universe rate;
 rejection against the **global** positive set (matching the shipped negatives'
 convention) via an in-process hash set. Default ratio 1:5. The shipped balanced
 negatives in `train_edges.txt` / `val_edges.txt` are the **fixed** diagnostic and
-model-selection negative sets — never used for gradient updates, so train-time
-resampling cannot contaminate model selection.
+model-selection negative sets for those arms. The E2 legacy-reproduction B0 is the
+sole exception: it trains on the fixed balanced `train_edges.txt` pairs as shipped,
+with per-epoch order shuffling but no negative resampling.
 
 ### 10.3 Evaluation loaders
 
@@ -373,88 +378,21 @@ resampling cannot contaminate model selection.
 - **F1 path:** length-bucketed batching (boundaries {128, 256, 384, 512, 768, 1024}),
   pad-to-bucket-max with mask; token budget 131,072 tokens auto-sizes the batch;
   `num_workers = 4`, `persistent_workers`, `prefetch_factor = 4`, pinned memory.
-  Workers prefetch descriptor-only row indices; the parent process materializes padded
-  tensors from the preloaded host cache, so large batches do not traverse `/dev/shm`.
 - Hungarian matching runs per node on K×K ≤ 16×16 cost matrices
   (`scipy.linear_sum_assignment` on CPU from GPU-computed costs); no inter-process
   interaction.
 
-## 11. Single-GPU execution design (1 × H20 container, via HF Accelerate)
+## 11. E2 production execution design (4 × H20, Hugging Face Accelerate DDP)
 
-The reference environment is the fixed container documented in `hpc/README.md`:
-one NVIDIA H20 (97,871 MiB visible), Python 3.11.15, `torch==2.10.0+cu128`, CUDA
-runtime 12.8, and `accelerate==1.13.0`. The model is ~10–20 M parameters and the full
-feature matrix is 62 MB, so the run is **overhead-bound, not memory-bound**. There is
-no DDP, NCCL, FSDP, ZeRO, or model sharding. BF16 autocast uses fp32 master weights;
-**VQ codebook EMA and Sinkhorn remain fp32** (`torch.autocast(..., enabled=False)`
-islands); TF32 matmul is on.
+The formal E2 B0 V3.1 run uses 4 × NVIDIA H20 and is launched with
+`accelerate launch --num_processes 4`. A cold acceptance run includes first BF16
+feature-pack construction, bounded batch probes, exactly 30 epochs, validation after
+every epoch, and final artifacts. The complete interval must be at most 60 minutes.
 
-### 11.0 Framework binding (pinned)
-
-Training keeps **Hugging Face Accelerate** as the device/mixed-precision/checkpoint
-wrapper, but always with one process and one GPU. Raw `torchrun`,
-`torch.distributed`, and `accelerate launch` do not appear in the execution path:
-
-```python
-from accelerate import Accelerator
-from accelerate.utils import set_seed
-
-accelerator = Accelerator(mixed_precision="bf16")
-model, optimizer, scheduler, *loaders = accelerator.prepare(
-    model, optimizer, scheduler, node_loader, joint_loader, edge_loader)
-```
-
-- `prepare()` places the model and batches on the single H20; it does not partition a
-  logical batch across ranks. All §10 batch sizes and token budgets are per step.
-- Backward is always `accelerator.backward(loss)`; gradient accumulation, if enabled,
-  uses `Accelerator(gradient_accumulation_steps=…)` plus
-  `accelerator.accumulate(model)` (default: off).
-- One-time cache builds (F0 pooled matrix, ANN grounding pools) run once in the same
-  process. No rank identity, barriers, gather, reduce, or broadcast calls are needed.
-
-### 11.1 Execution mode (pinned)
-
-- All implemented runs start through `hpc/run.sh` inside
-  `/2023533015/topology-conditioned-inductive-edge-prediction`; the runner exports
-  `CUDA_VISIBLE_DEVICES=0` and fails unless exactly one visible GPU is `NVIDIA H20`.
-- Training configs pin `mixed_precision: "bf16"`. Cached B0 scoring pins
-  `--device cuda --amp bf16`. G1/G2 consume the resulting `.npz` artifacts without
-  rescoring.
-- A training run occupies the one GPU. The final three seeds, ladder arms, and HPO
-  configurations run serially; concurrency is not part of the reference protocol.
-- Candidate-universe inference (~2.04 M pairs × n_s = 4) is one unsharded foreground
-  process. The generic score CLI may still read/merge shards, but that is not the
-  reference H20 run.
-- Long runs may use shell-level `nohup` and log redirection exactly as documented in
-  `hpc/README.md`; this does not change the Python command or run semantics.
-
-### 11.2 Single-process correctness points
-
-1. **VQ-EMA codebook:** `cluster_counts` and `embed_sums` update the EMA locally once
-   per step; dead-code revival samples from the seeded local generator.
-2. **Loss reduction:** per-family losses are means over the one logical batch. Logged
-   gradient norms are read locally for the §7 Kendall fallback trigger.
-3. **No BatchNorm anywhere** (LayerNorm only) — asserted at model build.
-4. **VAL-CRITERION / early stop:** val logits and labels are collected locally; one
-   process computes the metric and stop decision, so there is no padding duplication
-   or synchronization path.
-5. **Curriculum stage boundaries** (§8) only change the active loss/parameter set;
-   there is no DDP re-wrap or unused-parameter configuration.
-6. **Checkpointing:** `accelerator.save_state(dir)` / `load_state(dir)` covers model
-   (including codebook EMA module buffers), optimizer, scheduler, scaler, and RNG
-   state. The negative-sampler epoch state and run-metadata record remain registered
-   through `accelerator.register_for_checkpointing(…)`.
-
-### 11.3 Determinism on one H20 (extends §8)
-
-Call `accelerate.utils.set_seed(s)` once at startup to seed python/NumPy/torch/CUDA.
-Prepared DataLoaders use a seeded sampler and call `loader.set_epoch(epoch)` each
-epoch; the §10.2 stream hash is seeded by `(s, epoch, idx)` with no process-index term.
-The n_s = 4 inference CVAE seeds are fixed constants. Enable
-`torch.use_deterministic_algorithms(True)` with any exceptions allow-listed and
-logged. There is no NCCL reduction variance and no world-size-dependent LR or batch
-scaling. Run metadata records seed, logical batch sizes, GPU name, driver, Python,
-Accelerate, PyTorch, and CUDA versions.
+Each rank owns one model/optimizer replica and one complete GPU-resident BF16 feature
+table. DataLoader workers transfer compact endpoint indices only. Training and
+validation coverage are exact; tail-batch loss is weighted by local/global pair count.
+The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
@@ -476,12 +414,12 @@ Accelerate, PyTorch, and CUDA versions.
   one fixed H20 container, one process, BF16, direct `hpc/run.sh` execution, and no
   Slurm/DDP/NCCL path. Accelerate remains the single-process training/checkpoint
   wrapper; the previous 4/8-H20 execution plan is superseded.
-- 2026-07-10: aligned the B0 F1 implementation to the already-frozen §10.4 loader
-  contract and disabled computation of unused custom attention weights; normative
-  values and experiment semantics are unchanged.
-- 2026-07-10: hardened the same F1 loader contract for the fixed container's 4 GiB
-  `/dev/shm`: worker IPC is descriptor-only and parent-process collation allocates the
-  unchanged batch in pinned host memory; sampler and model semantics are unchanged.
+- 2026-07-11: pinned the E2 legacy-reproduction B0 architecture and its fixed 1:1
+  balanced training-pair exception; EgoStitch's dynamic 1:5 edge stream is unchanged.
+- 2026-07-11: replaced the formal E2 single-H20 path with the approved 4 × H20
+  Accelerate DDP packed-feature pipeline; fixed the cold-run budget at 60 minutes for
+  30 epochs with validation after every epoch. The scorer and checkpoint contracts did
+  not change.
 
 **Open items before code (not blockers):** the four ego-stat target definitions
 pinned to evaluator implementations; FLOPs/latency table template (§4.7 commitment);

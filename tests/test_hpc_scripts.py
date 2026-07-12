@@ -1,4 +1,4 @@
-"""Static contract tests for the pinned single-H20 execution layer."""
+"""Static contract tests for the pinned HPC execution layer (four-H20 E2 training)."""
 
 import shutil
 import stat
@@ -51,63 +51,47 @@ def test_help_is_available_without_the_remote_container(bash_exe: str) -> None:
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    for command in ("check", "train", "score", "metrics", "merge", "g1", "g2", "test-b0-v31"):
+    for command in ("check", "train", "score", "merge", "g1", "g2"):
         assert f"hpc/run.sh {command}" in result.stdout
 
 
-def test_runner_pins_the_verified_single_h20_environment() -> None:
-    """The shipped runner encodes the verified container rather than placeholders."""
+def test_runner_pins_the_required_four_h20_target() -> None:
     text = RUNNER.read_text()
     for value in (
         "/2023533015/topology-conditioned-inductive-edge-prediction",
         "/2023533015/.uv/bin/uv",
         "NVIDIA H20",
-        "CUDA_VISIBLE_DEVICES=0",
+        "CUDA_VISIBLE_DEVICES=0,1,2,3",
+        "expected exactly 4 visible GPUs",
     ):
         assert value in text
-    assert "expected exactly 1 visible GPU" in text
-    assert "cluster.env" not in text
-    assert "sbatch" not in text
-    assert ".sbatch" not in text
+    assert "-m src.e2_pipeline" in text
+    assert "--num_processes 4" in (HPC_DIR / "README.md").read_text()
+
+
+def test_docs_mark_live_four_h20_acceptance_as_pending() -> None:
+    hpc = (HPC_DIR / "README.md").read_text()
+    readme = (REPO_ROOT / "README.md").read_text()
+    claude = (REPO_ROOT / "CLAUDE.md").read_text()
+    config = (REPO_ROOT / "configs" / "b0_v31_breadth_first.yaml").read_text()
+
+    pending = "live four-H20 cold-run acceptance is pending"
+    assert pending in " ".join(hpc.split())
+    assert pending in " ".join(readme.split())
+    assert pending in " ".join(claude.split())
+    assert "verified 2026-07-10" not in hpc
+    assert "The verified host" not in readme
+    assert "single-H20 container" not in config
 
 
 def test_runner_dispatches_to_the_implemented_clis() -> None:
     """Each command maps directly to one repository Python module."""
     text = RUNNER.read_text()
-    assert "-m src.train_b0" in text
+    assert "-m src.e2_pipeline" in text
     assert "-m src.score_universe score --device cuda --amp bf16" in text
-    assert "-m src.score_universe metrics" in text
     assert "-m src.score_universe merge" in text
     assert "-m src.experiments.g1_hardened_e2" in text
     assert "-m src.experiments.g2_ceiling" in text
-
-
-def test_runner_test_b0_v31_follows_the_frozen_test_contract() -> None:
-    """The production test command covers test edges, candidate assembly, then G1/G2."""
-    text = RUNNER.read_text()
-    case_body = text.split("test-b0-v31)", maxsplit=1)[1].split(";;", maxsplit=1)[0]
-
-    required_fragments = (
-        "outputs/b0_v31/best.pt",
-        "--pairs test",
-        "scores/b0_v31_test.npz",
-        "outputs/b0_v31/test_metrics.json",
-        "--pairs candidate",
-        "scores/b0_v31_candidate.npz",
-        "outputs/g1",
-        "outputs/g2",
-        "outputs/g2/g2_ceiling.html",
-    )
-    for fragment in required_fragments:
-        assert fragment in case_body
-
-    assert case_body.index("--pairs test") < case_body.index("--pairs candidate")
-    assert case_body.index("outputs/b0_v31/test_metrics.json") < case_body.index("outputs/g1")
-    assert case_body.index("outputs/g1") < case_body.index("outputs/g2")
-
-    runbook = (HPC_DIR / "README.md").read_text()
-    assert "nohup hpc/run.sh test-b0-v31 > outputs/logs/b0_v31_test.log 2>&1 &" in runbook
-    assert "echo $! > outputs/logs/b0_v31_test.pid" in runbook
 
 
 @pytest.mark.parametrize(
@@ -128,24 +112,16 @@ def test_primary_docs_reference_only_the_direct_hpc_layer() -> None:
         assert "sbatch" not in text.lower()
 
 
-def test_runbook_documents_the_v31_input_pipeline_startup_contract() -> None:
-    """Operators can distinguish the expected preload pause from a stalled run."""
-    text = (HPC_DIR / "README.md").read_text()
-    lower_text = text.lower()
+def test_frozen_specs_pin_four_h20_e2_training() -> None:
+    spec = (REPO_ROOT / "docs" / "06-egostitch-spec.md").read_text()
+    protocol = (REPO_ROOT / "docs" / "03-experiment-protocol.md").read_text()
 
-    assert "one-time" in lower_text
-    assert "~25 gib" in lower_text
-    assert "host memory" in lower_text
-    for option in (
-        "num_workers: 4",
-        "persistent_workers: true",
-        "prefetch_factor: 4",
-        "pin_memory: true",
-    ):
-        assert option in text
-    assert "no step logs" in lower_text
-    assert "preload completes" in lower_text
-    assert "descriptor-only" in lower_text
-    assert "/dev/shm" in text
-    assert "main process" in lower_text
-    assert "configs/b0_v31_breadth_first.yaml" in text
+    assert "4 × NVIDIA H20" in spec
+    assert "accelerate launch --num_processes 4" in spec
+    assert "fix the four-H20 E2 production execution design" in spec
+    assert "fix the single-H20 execution design" not in spec
+    assert "60 minutes" in spec
+    assert "30 epochs" in spec
+    assert "validation after every epoch" in spec
+    assert "fixed 30-epoch" in protocol
+    assert "quality is reported but is not the throughput acceptance gate" in protocol

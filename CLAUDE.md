@@ -9,7 +9,8 @@ Edge Prediction*. It contains design documents, result notes, self-contained HTM
 figures, benchmark data artifacts, and a curated literature library. Implementation
 has now begun on the **pre-implementation gates and baselines**: `src/` holds a typed,
 tested Python package (data loaders, eval metrics, the B0/B0-alt frozen scorers, and
-the G1/G2 gate-analysis pipelines), a direct single-H20 execution layer, and a full pytest suite.
+the G1/G2 gate-analysis pipelines), a direct HPC execution layer (formal E2/B0 training
+on four H20s; single-GPU score/gate commands), and a full pytest suite.
 The **proposed model (EgoStitch) is not yet implemented** — gates G1–G3 (hardened E2,
 ceiling curve, Oracle) must pass before model code is written. The EgoStitch design and
 implementation spec were approved 2026-07-09.
@@ -17,7 +18,7 @@ implementation spec were approved 2026-07-09.
 `README.md` is the human-facing entry point (orientation, status, structure map,
 reading order). This file (`CLAUDE.md`) holds the binding *constraints* an agent
 must respect. Code lives under `src/`; `docs/06-egostitch-spec.md` (algorithm + data
-contract + single-GPU execution design) and `docs/03-experiment-protocol.md` (what to run, how to
+contract + four-H20 execution design) and `docs/03-experiment-protocol.md` (what to run, how to
 grade) are the contracts it must implement.
 
 ## Repository layout
@@ -34,7 +35,7 @@ docs/
   04-model-proposal.md           EgoStitch model rationale (APPROVED 2026-07-09)
   05-review-report.md            novelty-check + 5-persona review record
   06-egostitch-spec.md           implementation contract (G4 signed off): algorithm,
-                                 benchmark/data contract, batch sampler, 1×H20 design
+                                 benchmark/data contract, batch sampler, 4×H20 design
   lit-review-plan.md             review plan, claims K1–K5, terminology guardrail
   results/E2-pair-to-topology-gap.md   motivating result note
 figures/                         e2-gap.html, positioning.html (standalone, open in browser)
@@ -53,7 +54,7 @@ src/
   score_universe.py  CLI: score pair lists -> pinned .npz scores artifact (shardable)
   experiments/ g1_hardened_e2.py, g2_ceiling.py (gate analyses over cached scores)
 configs/        b0_v31_breadth_first.yaml, b0_alt_breadth_first.yaml
-hpc/            fixed 1×H20 container runner (run.sh + environment/runbook README)
+hpc/            fixed 4×H20 container runner (run.sh + environment/runbook README)
 outputs/        run artifacts: checkpoints, metrics, cached score matrices (gitignored)
 tests/          pytest suite mirroring src/ (data/, eval/, experiments/, CLIs, hpc)
 literature/     curated reference library (gitignored, unchanged)
@@ -92,10 +93,17 @@ python -m src.experiments.g2_ceiling    --universe scores/b0_v31_candidate.npz \
     --data-root data --strategy breadth_first --output-dir outputs/g2
 ```
 
-HPC runs execute directly in the fixed 1×NVIDIA H20 container through
-`hpc/run.sh`; `hpc/README.md` pins the SSH endpoint, repository/data paths,
-Python/PyTorch/CUDA versions, and the exact `check → train → score → G1/G2` sequence.
-There is no scheduler or multi-GPU launch layer.
+HPC runs target the required fixed 4×NVIDIA H20 container; `hpc/README.md` pins
+the SSH endpoint, repository/data paths, Python/PyTorch/CUDA versions, and the exact
+`check → train → score → G1/G2` sequence. Formal E2 (B0 V3.1) training runs **only**
+through `hpc/run.sh train configs/b0_v31_breadth_first.yaml`, which drives
+`python -m src.e2_pipeline` (pack → probe → projection → 30-epoch DDP train via
+`accelerate launch --num_processes 4` across all 4 GPUs); direct
+`python -m src.train_b0 --max-steps N` remains debug-only. `B0-alt` keeps its
+existing direct `python -m src.train_b0 --config ...` training CLI, outside this
+E2-only optimization. `score`/`merge`/`g1`/`g2` remain single-GPU commands; there is
+no job scheduler (e.g. Slurm). The live four-H20 cold-run acceptance is pending;
+neither four-card execution nor the 60-minute budget is a verified result yet.
 
 **Tooling gotcha:** mypy is strict with `warn_unused_ignores = true`. Don't run two
 `mypy` invocations against the same `.mypy_cache` concurrently — it corrupts the cache
@@ -112,10 +120,14 @@ flow is deliberately **score-once, analyze-many**:
    sampler (`pairs.py`), and serves frozen per-node features (`features.py`). The 25 GB
    feature cache is gitignored and must already exist locally / in the fixed container checkout.
 2. **Train** (`src/train_b0.py`) fits a frozen B0-family scorer (`model/B0.py` V3.1, or
-   `model/b0_alt.py` MLP) and writes a Task-4-format checkpoint under `outputs/`.
+   `model/b0_alt.py` MLP) and writes a Task-4-format checkpoint under `outputs/`. Formal
+   E2 (B0 V3.1) training is driven by `src/e2_pipeline.py` (`hpc/run.sh train`), which
+   wraps `train_b0.py` in a pack → probe → projection → 30-epoch `accelerate launch
+   --num_processes 4` DDP run across the four H20s; B0-alt keeps its own direct
+   `train_b0.py` invocation.
 3. **Score** (`src/score_universe.py`) runs a checkpoint over the candidate universe /
    val / test pairs *once* and writes a single self-contained `.npz` scores artifact
-   (the CLI remains shardable, but the pinned single-H20 run is unsharded; `merge` remains available).
+   (the CLI remains shardable, but the pinned single-GPU run is unsharded; `merge` remains available).
 4. **Gate analyses** (`src/experiments/`) are pure row-selections + graph math over that
    cached artifact — **no model scoring happens here**. `g1_hardened_e2.py` builds the
    hardened-E2 gate table (negative regimes, threshold/density-matched operating point,
@@ -162,7 +174,7 @@ nodes?" If a draft starts describing graph generation as the task, it has drifte
 5. `docs/06-egostitch-spec.md` — the **implementation contract** (gate G4 signed off
    2026-07-09): pinned algorithm/shapes/losses, §9 benchmark binding and data
    contract (including quarantined artifacts and the self-loop policy), §10 batch
-   sampler, §11 single-H20 execution design. Its freeze rule is binding: code may not
+   sampler, §11 four-H20 execution design. Its freeze rule is binding: code may not
    silently deviate — edit the spec first, with a change-log line.
 6. `docs/results/E2-pair-to-topology-gap.md` — the motivating result note (numbers
    below; provisional until gate G1).

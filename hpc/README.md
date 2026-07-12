@@ -1,25 +1,47 @@
-# Single-H20 container runner
+# Four-H20 container runner
 
 This directory is the only HPC execution layer. It runs the implemented baseline and
 gate CLIs directly inside the pinned container; there is no Slurm scheduler, job array,
 or cluster-specific environment file.
 
-## Pinned environment (verified 2026-07-10)
+Formal E2 training (`B0`, `configs/b0_v31_breadth_first.yaml`) runs **only** through
+`hpc/run.sh train configs/b0_v31_breadth_first.yaml`, which is now the runner's single
+`train` branch and always drives the production `python -m src.e2_pipeline` entry:
+pack-or-validate the BF16 feature cache, probe candidate token budgets, project the
+fixed 30-epoch wall time, then launch one clean `accelerate launch --num_processes 4`
+DDP training run across all 4 visible NVIDIA H20 GPUs, targeting a 60-minute total
+pipeline budget. Direct `python -m src.train_b0 --max-steps N` remains debug-only
+(bounded smoke runs) and must never be used for a reported E2 experiment. `B0-alt`
+(`configs/b0_alt_breadth_first.yaml`) is outside this E2-only optimization: its config
+is not the V3.1 shape `src.e2_pipeline` expects, so it is **not** trained through
+`hpc/run.sh train` — it keeps its existing direct
+`.venv/bin/python -m src.train_b0 --config configs/b0_alt_breadth_first.yaml`
+invocation, run directly (bypassing the runner's `train` branch) inside the same
+container.
+
+## Required target environment (acceptance pending)
+
+The four-card runtime is authorized and required for formal E2 training. The live
+four-H20 cold-run acceptance is pending. The values below are the pinned target contract;
+they must not be described as performance-verified until the opt-in cold
+acceptance run completes successfully and its artifacts are retained.
 
 | Item | Fixed value |
 |---|---|
 | SSH | `ssh -p 30838 root@10.15.171.204` |
 | Repository | `/2023533015/topology-conditioned-inductive-edge-prediction` |
-| GPU | 1 × NVIDIA H20, 97,871 MiB |
+| GPU | 4 × NVIDIA H20, 97,871 MiB each |
 | NVIDIA driver | 550.144.03 |
 | Python | 3.11.15 from the repository `.venv` |
 | PyTorch / CUDA runtime | `2.10.0+cu128` / `12.8` |
 | uv | `0.11.28` at `/2023533015/.uv/bin/uv` |
 | Data | repository-local `data/` (26 GB; benchmark + frozen feature cache) |
 
-Do not store the SSH password in this repository. The runner fails before executing an
-experiment unless exactly one visible GPU is named `NVIDIA H20`, the fixed paths exist,
-and both benchmark and feature directories are present.
+Do not store the SSH password in this repository. The runner fails before executing any
+command unless exactly 4 visible GPUs are named `NVIDIA H20`, the fixed paths exist, and
+both benchmark and feature directories are present. All commands export
+`CUDA_VISIBLE_DEVICES=0,1,2,3`; `score`, `merge`, `g1`, and `g2` are single-process and
+use `cuda:0`, while `train` uses all 4 GPUs via `accelerate launch --num_processes 4`.
 
 ## Run order
 
@@ -31,74 +53,28 @@ cd /2023533015/topology-conditioned-inductive-edge-prediction
 hpc/run.sh check
 ```
 
-Train both frozen baselines. The shipped configs pin BF16 and the repository-local data
-root:
+Train both frozen baselines. `B0` runs through the four-H20 E2 production pipeline;
+`B0-alt` is outside this optimization and is trained directly, without the runner's
+`train` branch. The shipped configs pin BF16 and the repository-local data root:
 
 ```bash
-hpc/run.sh train configs/b0_v31_breadth_first.yaml
-hpc/run.sh train configs/b0_alt_breadth_first.yaml
+hpc/run.sh train configs/b0_v31_breadth_first.yaml                       # B0: four-H20 E2 pipeline
+
+.venv/bin/python -m src.train_b0 --config configs/b0_alt_breadth_first.yaml  # B0-alt: direct train_b0
 ```
 
-### V3.1/F1 startup and host memory
-
-The production F1 launch is
-`hpc/run.sh train configs/b0_v31_breadth_first.yaml`. Before its DataLoader workers
-start, the process performs a one-time ~25 GiB preload of the operative raw-token
-tensors into CPU host memory. Before launching, run
-`free -h` and verify that the `available` column is at least 25 GiB, with additional
-headroom for the training process, workers, and pinned batches.
-
-The production config uses the frozen F1 loader contract:
-
-- `num_workers: 4`
-- `persistent_workers: true`
-- `prefetch_factor: 4`
-- `pin_memory: true`
-
-Training creates one DataLoader and one persistent four-worker pool. At each exhausted
-epoch boundary, the parent process replaces only the shared endpoint-index/label rows
-and the length-bucket sampler state before reusing that same pool for the next epoch.
-Worker IPC is descriptor-only: workers prefetch integer row ids, so padded token tensors
-never pass through the container's `/dev/shm`. The main process uses the preloaded cache
-to materialize each padded batch directly in pinned host memory before non-blocking H2D.
-
-Preload progress is logged every 1,000 new tensors, followed by a final
-`preloaded ... operative node tensors (... GiB) into host memory` message. During
-this startup pause, no step logs are expected. Once preload completes, step logs begin
-every 50 optimizer steps; the pause does not by itself indicate a stalled run.
-
-After the B0 V3.1 checkpoint is frozen, run its complete test contract with one command:
-
-```bash
-hpc/run.sh test-b0-v31
-```
-
-This command runs the frozen stages in order: score `test_edges.txt` and write
-`outputs/b0_v31/test_metrics.json`; score the complete `candidate_test_edges.txt`
-universe once; then run G1 assembled-graph evaluation and G2 over that same cached
-candidate artifact. Its durable outputs are:
-
-- `scores/b0_v31_test.npz`
-- `outputs/b0_v31/test_metrics.json`
-- `scores/b0_v31_candidate.npz`
-- `outputs/g1/g1_results.json` and `outputs/g1/g1_tables.md`
-- `outputs/g2/g2_results.json` and `outputs/g2/g2_ceiling.html`
-
-The command fails before evaluation if `outputs/b0_v31/best.pt` is missing. V3.1
-scoring preloads the referenced test-side token tensors into host memory once before
-inference; candidate rows do not repeatedly read feature files.
-
-For the full remote run, launch the same command disconnect-safely and record its PID:
-
-```bash
-mkdir -p outputs/logs
-nohup hpc/run.sh test-b0-v31 > outputs/logs/b0_v31_test.log 2>&1 &
-echo $! > outputs/logs/b0_v31_test.pid
-```
+`hpc/run.sh train configs/b0_v31_breadth_first.yaml` writes, under the pipeline's
+output directory, `best.pt`, `last.pt`, `metrics.jsonl`, `run_metadata.json`,
+`profile.json` (per-stage timings and the selected token budget), and
+`artifact_manifest.json` (sha256 + byte size of the above). A successful atomic
+publication writes `complete.json` last; its `total_seconds` is the authoritative
+post-publication 60-minute acceptance time. It returns exit code `0` on
+success and `2` on a gated failure (for example, the projected 30-epoch time exceeding
+the 60-minute budget); the runner does not mask this exit code.
 
 Score the candidate universe once per checkpoint. `run.sh score` always injects
-`--device cuda --amp bf16`; the single-H20 reference run is intentionally unsharded.
-The lower-level commands below remain available for B0-alt and manual gate runs.
+`--device cuda --amp bf16`; it runs single-GPU (`cuda:0`) and the reference run is
+intentionally unsharded.
 
 ```bash
 hpc/run.sh score \
@@ -133,13 +109,5 @@ mkdir -p outputs/logs
 nohup hpc/run.sh train configs/b0_v31_breadth_first.yaml \
   > outputs/logs/b0_v31_train.log 2>&1 &
 ```
-
-After launch, verify all of the following before leaving the run unattended:
-
-- `tail -f outputs/logs/b0_v31_train.log` shows preload progress and the final
-  `preloaded ...` summary; do not expect `epoch ... step ...` lines before that summary.
-- After preload, `epoch ... step ...` values advance rather than remaining fixed.
-- `nvidia-smi` shows the training process and nonzero GPU memory use.
-- The log contains neither `NaN` nor `Traceback`.
 
 `--max-steps` remains debug-only and must not be used for a reported experiment.
