@@ -14,6 +14,9 @@ to load-bearing, and B4's disposition. The C4 framing claim is scoped throughout
 *the first **protocol-gated** joint edge + assembled-realism evaluation for **strict
 zero-edge inductive** edge prediction* (classical priority: ERGM goodness-of-fit;
 deep-learning priority on the dissociation observation: Graph Gestalt 2106.15239).
+**Updated 2026-07-13:** pinned the G3 Oracle instantiation (§5.0 G3): structural CN/AA
+oracle plus a parameter-free B0 rank-fusion blend arm, PA-null top-N assembly convention,
+per-statistic MMD-ratio headroom as the stop-rule quantity.
 
 This document defines the benchmark contract, baseline hierarchy, experiment matrix, evaluation
 protocol, caveats, and deliverables for this repository. It is intentionally self-contained:
@@ -155,7 +158,7 @@ Components:
 | **Odds-product** | Degree-respecting edge-independent baseline | `P_ij = σ(ℓ_i + ℓ_j)` fitted to the expected degree sequence (Chanpuriya 2111.00048 §3) | Cheapest degree-budget-honoring assembly with zero topology conditioning; also supplies the G2 overlap dial `P̃ = (1−ω)P + ωA` |
 | **DEAL / Graph2Gauss** | External attribute-only baselines | DEAL 2007.08053; Graph2Gauss 1707.03815 | Independent-scoring SOTA for the setting; falsifiable prediction: both exhibit the E2 failure mode |
 | **Ours** | Per-query generated local scaffold + conditioning | EgoStitch per `04-model-proposal.md` §4 / `06-egostitch-spec.md` | Conditioning the decision on generated, harmonized local topology |
-| **Oracle** | Observed-graph upper bound | Uses true held-out graph neighborhoods at evaluation time | Headroom; violates the inductive protocol; **run first (gate G3)** |
+| **Oracle** | Observed-graph upper bound | Uses true held-out graph neighborhoods at evaluation time (pinned instantiation: §5.0 G3) | Headroom; violates the inductive protocol; **run first (gate G3)** |
 
 All fair baselines share the same frozen features, splits, query sets, message/supervision
 partition, negative-sampling protocol, and an equal, pre-registered HPO budget (30 configs ×
@@ -349,6 +352,19 @@ rule).
    discussion before proceeding.
 3. **G3 — Oracle first.** Run the Oracle row. Stop: Oracle ≈ B0 on assembled metrics ⇒ feature
    insufficiency; conditioning cannot help; pivot.
+   **Pinned instantiation (2026-07-13, before implementation):** the canonical arm
+   (`oracle_topo`) orders every candidate row by common-neighbor count on
+   `strip_self_loops(test_graph)`, ties by Adamic–Adar, remaining ties by canonical pair
+   order (the hard-heuristic selector's convention); its scalar score for edge metrics is
+   the average-tie normalized rank of the `(CN, AA)` key. A secondary disclosed arm
+   (`oracle_blend`) is the parameter-free rank fusion
+   `0.5·rank01(p_B0) + 0.5·rank01(s_topo)`. Both arms assemble via the PA-null
+   top-`target_edges` convention (non-self pairs, deterministic tie-break, no threshold);
+   B0 is re-evaluated side-by-side from the same cached scores artifact, and the
+   per-statistic headroom `MMD-ratio(B0) / MMD-ratio(oracle)` is the stop-rule quantity.
+   Evaluation-side access only; the row is protocol-violating by design and never a fair
+   baseline. `hard_heuristic` regime rows for `oracle_topo` are degenerate by construction
+   (negatives are CN/AA-selected) and are disclosed as such.
 4. **G4 — Specification freeze.** `06-egostitch-spec.md` reviewed and signed off; it then
    becomes the implementation contract. **Done 2026-07-09** (sign-off recorded in the spec's
    change log; the spec's §9 data contract additionally quarantines the shipped
