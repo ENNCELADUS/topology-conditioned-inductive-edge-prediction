@@ -370,6 +370,11 @@ with per-epoch order shuffling but no negative resampling.
   averaged; two passes (§9.3 density self-calibration); logits + pair ids collected
   locally; assembly and bucketed metrics (`test_node_buckets.pkl`) computed in the
   same process.
+- The assembled evaluator uses the protocol's single canonical MMD ratio: fixed
+  Gaussian-TV (`σ=1`) raw MMD² divided by the deterministic even/odd reference
+  floor after separately averaging numerator and denominator across node-size
+  buckets. Run artifacts disclose `raw_mmd2`, `reference_mmd2`, and `mmd_ratio`;
+  only `mmd_ratio` is used in result tables and the topology composite.
 - Per-node Tokenize/Imagine caches rebuilt once per eval epoch for all |V| nodes
   (~10k nodes; ≈160 MB fp32 at K = 16, d_p = 256 — kept on the H20).
 
@@ -421,6 +426,10 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   Accelerate DDP packed-feature pipeline; fixed the cold-run budget at 60 minutes for
   30 epochs with validation after every epoch. The scorer and checkpoint contracts did
   not change.
+- 2026-07-13: replaced the assembled evaluator's L2-RBF/median-bandwidth raw MMD²
+  with the fixed-`σ=1` Gaussian-TV biased MMD² ratio defined in protocol §1;
+  removed degree clipping and bound deterministic even/odd reference splitting,
+  ratio-of-size-means aggregation, and numerator/denominator disclosure.
 
 **Open items before code (not blockers):** the four ego-stat target definitions
 pinned to evaluator implementations; FLOPs/latency table template (§4.7 commitment);

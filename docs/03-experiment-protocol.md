@@ -113,6 +113,17 @@ Components:
     family, and every parameter; avoid ad-hoc EMD-/TV-based kernels unless justified;
     parameter sweeps reported; bootstrap variance over node buckets and seeds; MMDs never
     aggregated across statistics naively (O'Bray 2106.01098; Thompson 2201.09871).
+  - *Canonical MMD definition:* each graph is mapped to a full degree histogram,
+    a 100-bin local-clustering histogram on `[0,1]`, or a 200-bin normalized-
+    Laplacian spectral histogram on `[-1e-5,2]`. Histograms are normalized by
+    `sum + 1e-6`. MMD² is the biased V-statistic under
+    `k(x,y)=exp(-(0.5·||x-y||₁)²/2)` (`σ=1`, including within-sample diagonals).
+  - *Reference normalization:* within every node-size bucket, reference samples
+    retain artifact order and are split as `samples[::2]` versus `samples[1::2]`.
+    The reported statistic is
+    `mean_size MMD²(pred_size,ref_size) / mean_size MMD²(ref_even,ref_odd)`.
+    Numerator, denominator, and ratio are all stored; the ratio is canonical and
+    lower is better. A `1e-12` denominator floor is only a numerical guard.
 - **Repository artifacts:** this protocol, [E2-pair-to-topology-gap.md](results/E2-pair-to-topology-gap.md),
   [e2-gap.html](../figures/e2-gap.html), [positioning.html](../figures/positioning.html),
   [04-model-proposal.md](04-model-proposal.md), [06-egostitch-spec.md](06-egostitch-spec.md).
