@@ -573,7 +573,7 @@ def render_tables_markdown(payload: dict[str, object]) -> str:
         for regime, keys in regime_table[scorer].items():
             for key, m in keys.items():
                 lines.append(
-                    f"| {scorer} | {regime} | {key} | {_fmt(m['n_pos'])} | {_fmt(m['n_neg'])} "
+                    f"| {scorer} | {regime} | {key} | {m['n_pos']} | {m['n_neg']} "
                     f"| {_fmt(m['auroc'])} | {_fmt(m['auprc'])} | {_fmt(m['mcc'])} |"
                 )
 
