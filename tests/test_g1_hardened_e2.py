@@ -13,9 +13,9 @@ import numpy as np
 import pytest
 import torch
 from src.data.features import FeatureStore
-from src.eval.composite import PerturbationCheckResult
+from src.eval.composite import CompositeDefinition, PerturbationCheckResult
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
-from src.eval.graph_metrics import STATISTICS
+from src.eval.graph_metrics import STATISTICS, MMDConfig
 from src.experiments import g1_hardened_e2 as g1
 from src.score_universe import load_scores, save_scores
 
@@ -197,9 +197,6 @@ def _write_feature_root(tmp_path: Path) -> Path:
         json.dumps({"format": "torch_pt_per_node", "input_dim": 2, "max_sequence_length": 8})
     )
     return root
-
-
-_SMALL_CONFIG_KWARGS: dict[str, object] = {}
 
 
 def _d(x: object) -> dict[str, Any]:
@@ -1098,9 +1095,50 @@ def test_pipeline_exposes_only_normalized_mmd_schema(tmp_path: Path) -> None:
     assert set(_d(row["mmd_ratio"])) == set(STATISTICS)
     assert set(_d(row["raw_mmd2"])) == set(STATISTICS)
     assert set(_d(row["reference_mmd2"])) == set(STATISTICS)
+    assert set(_d(row["bootstrap_mean"])) == set(STATISTICS)
+    assert set(_d(row["bootstrap_std"])) == set(STATISTICS)
     assert "aggregate_mmd2" not in row
+    for threshold_row in cast(list[dict[str, object]], _d(payload["threshold_sweep"])["rows"]):
+        assert set(_d(threshold_row["mmd_ratio"])) == set(STATISTICS)
+        assert "mmd2" not in threshold_row
     metadata = _d(payload["metadata"])
     assert metadata["metric_normalization"] == "ratio_of_size_mean_mmd2"
+    assert metadata["reference_split"] == "artifact_order_even_vs_odd_within_each_node_size"
+    assert metadata["canonical_metric"] == "mmd_ratio"
+    assert metadata["component_disclosure"] == [
+        "raw_mmd2",
+        "reference_mmd2",
+        "mmd_ratio",
+    ]
+
+
+def test_assembled_bootstrap_fields_aggregate_mmd_ratios(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ratio_summary = {
+        stat: (float(index + 1), float(index + 1) / 10)
+        for index, stat in enumerate(STATISTICS)
+    }
+
+    def _fake_bootstrap_mmd(
+        *args: object, **kwargs: object
+    ) -> dict[int, dict[str, tuple[float, float]]]:
+        return {5: ratio_summary}
+
+    monkeypatch.setattr(g1, "bootstrap_mmd", _fake_bootstrap_mmd)
+    g_ref = _make_reference_graph()
+    row = g1.assemble_and_evaluate(
+        g_pred=g_ref.copy(),
+        g_ref=g_ref,
+        buckets=_small_buckets(_NODES, size=5, n_samples=4, seed=13),
+        config=MMDConfig(),
+        seed=0,
+        definition=CompositeDefinition(),
+        composite_valid=False,
+        threshold=0.5,
+    )
+    assert row.bootstrap_mean == {stat: values[0] for stat, values in ratio_summary.items()}
+    assert row.bootstrap_std == {stat: values[1] for stat, values in ratio_summary.items()}
 
 
 # --------------------------------------------------------------------------- markdown tables

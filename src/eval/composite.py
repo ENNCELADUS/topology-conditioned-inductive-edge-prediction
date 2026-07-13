@@ -31,7 +31,7 @@ def _default_scales() -> Mapping[str, float]:
 
 @dataclass(frozen=True)
 class CompositeDefinition:
-    """Disclosed weights and scales for the graph-similarity composite score.
+    """Disclosed weights and a unit-valued compatibility field for the composite.
 
     Attributes:
         statistics: The MMD statistics combined into the composite.
@@ -176,7 +176,8 @@ def perturbation_check(
         buckets: Bucket size -> list of node sets, passed through to
             `evaluate_assembled_graph`.
         config: Shared MMD/descriptor configuration.
-        definition: Composite weights/scales.
+        definition: Composite weights plus the unit compatibility field; no
+            second calibration is applied to the already normalized MMD ratios.
         fractions: Perturbation fractions to evaluate, in increasing order.
         n_trials: Number of independent perturbation trials averaged per fraction.
         seed: Seed for the perturbation RNG.

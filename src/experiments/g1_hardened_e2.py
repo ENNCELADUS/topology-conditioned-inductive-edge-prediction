@@ -990,11 +990,11 @@ class G1Result:
 
     Attributes:
         metadata: Every disclosure required by the gate (artifact provenance,
-            benchmark strategy, MMD/composite config, calibration and
-            construction rules, seeds, and the two orchestrator-adjudication
-            notes).
+            benchmark strategy, MMD/composite config, normalization and construction
+            rules, seeds, and the two orchestrator-adjudication notes).
         noise_floor: Bucket size -> statistic -> mean noise-floor MMD^2.
-        tau: Calibrated composite scales.
+        tau: Unit-valued compatibility field; MMD ratios receive no second
+            calibration.
         threshold_sweep: Operating point plus the sweep grid rows.
         regime_table: Scorer key (``"b0"``, optionally ``"b0_alt"``, ``"pa_null"``)
             -> regime edge-metric table.
