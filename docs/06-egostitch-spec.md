@@ -319,15 +319,18 @@ Self-loops are first-class labeled queries in this benchmark (13.8% of `random_w
 train-graph edges; 84% of test nodes carry one; they appear in supervision, val,
 test, and candidate files as `(u, u)` rows). Binding rules:
 
-1. **Structural targets on simple graphs only**: N(u), degrees, budgets d̂_u,
-   clustering/code stats, ego-net targets, and assembled-topology metrics all strip
-   self-loops.
+1. **Structural-target simple-graph policy; canonical MMD exception**: N(u), degrees,
+   budgets d̂_u, training-side clustering/code stats, ego-net targets, relative
+   density, recall, and other structural targets strip self-loops. Canonical MMD
+   descriptor induced subgraphs retain self-loops exactly as in the
+   benchmark/official evaluator.
 2. **`(u, u)` queries route through a single-ego path**: j := i; T_peer = own kept
    slots; Π = identity on kept slots; s0 = pair_logit(u, u); s1 = self-membership
    `lse_k(κ(h_u^k, proj(x_u)) + log π m)`; s2 from the Â_u diagonal blocks;
    s3 unchanged; s4 on the single-ego scaffold with both anchor labels on u.
-3. **Reporting**: edge metrics overall *and* split self / non-self; assembled-graph
-   topology metrics on the simple assembled graph, plus a separate self-loop-rate row
+3. **Reporting**: edge metrics overall *and* split self / non-self; canonical MMD on
+   loop-retaining descriptor induced subgraphs; relative density, recall, and other
+   topology metrics on the simple assembled graph; plus a separate self-loop-rate row
    (predicted vs reference, e.g. 1,701/2,018 on `random_walk`).
 
 ## 10. Batch sampler and loader contract
@@ -373,8 +376,10 @@ with per-epoch order shuffling but no negative resampling.
 - The assembled evaluator uses the protocol's single canonical MMD ratio: fixed
   Gaussian-TV (`σ=1`) raw MMD² divided by the deterministic even/odd reference
   floor after separately averaging numerator and denominator across node-size
-  buckets. Run artifacts disclose `raw_mmd2`, `reference_mmd2`, and `mmd_ratio`;
-  only `mmd_ratio` is used in result tables and the topology composite.
+  buckets. Its descriptor induced subgraphs retain self-loops exactly as in the
+  benchmark/official evaluator. Run artifacts disclose `raw_mmd2`,
+  `reference_mmd2`, and `mmd_ratio`; only `mmd_ratio` is used in result tables and
+  the topology composite.
 - Per-node Tokenize/Imagine caches rebuilt once per eval epoch for all |V| nodes
   (~10k nodes; ≈160 MB fp32 at K = 16, d_p = 256 — kept on the H20).
 
@@ -429,7 +434,8 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 - 2026-07-13: replaced the assembled evaluator's L2-RBF/median-bandwidth raw MMD²
   with the fixed-`σ=1` Gaussian-TV biased MMD² ratio defined in protocol §1;
   removed degree clipping and bound deterministic even/odd reference splitting,
-  ratio-of-size-means aggregation, and numerator/denominator disclosure.
+  ratio-of-size-means aggregation, numerator/denominator disclosure, and
+  benchmark-aligned self-loop retention for canonical descriptor induced subgraphs.
 
 **Open items before code (not blockers):** the four ego-stat target definitions
 pinned to evaluator implementations; FLOPs/latency table template (§4.7 commitment);
