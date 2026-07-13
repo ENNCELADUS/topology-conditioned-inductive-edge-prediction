@@ -31,17 +31,17 @@ class TestCompositeDefinition:
 class TestGraphSimilarity:
     def test_identical_graph_similarity_is_one(self) -> None:
         definition = CompositeDefinition()
-        mmd2 = {"degree": 0.0, "clustering": 0.0, "spectral": 0.0}
-        assert graph_similarity(mmd2, definition) == pytest.approx(1.0)
+        mmd_ratio = {"degree": 0.0, "clustering": 0.0, "spectral": 0.0}
+        assert graph_similarity(mmd_ratio, definition) == pytest.approx(1.0)
 
     def test_hand_computed_value(self) -> None:
         definition = CompositeDefinition(
             weights={"degree": 1 / 3, "clustering": 1 / 3, "spectral": 1 / 3},
-            scales={"degree": 1.0, "clustering": 1.0, "spectral": 1.0},
+            scales={"degree": 0.1, "clustering": 10.0, "spectral": 100.0},
         )
-        mmd2 = {"degree": 0.1, "clustering": 0.2, "spectral": 0.3}
+        mmd_ratio = {"degree": 0.1, "clustering": 0.2, "spectral": 0.3}
         # exp(-(0.1+0.2+0.3)/3) = exp(-0.2)
-        assert graph_similarity(mmd2, definition) == pytest.approx(np.exp(-0.2))
+        assert graph_similarity(mmd_ratio, definition) == pytest.approx(np.exp(-0.2))
 
     def test_higher_mmd_gives_lower_similarity(self) -> None:
         definition = CompositeDefinition()
@@ -71,11 +71,8 @@ def _seeded_ws_graph_and_buckets() -> tuple[nx.Graph, dict[int, list[set[str]]]]
 class TestPerturbationCheck:
     def test_passes_and_similarity_decreases_with_perturbation(self) -> None:
         g_ref, buckets = _seeded_ws_graph_and_buckets()
-        config = MMDConfig(degree_max=30, clustering_bins=20, spectral_bins=20)
-        # Scales tuned smaller than the (uncalibrated) default so the composite is
-        # sensitive enough on this modest synthetic graph/bucket size to visibly
-        # separate perturbation levels; production tau_k are calibrated separately.
-        definition = CompositeDefinition(scales={"degree": 0.3, "clustering": 0.3, "spectral": 0.3})
+        config = MMDConfig()
+        definition = CompositeDefinition()
         result = perturbation_check(
             g_ref,
             buckets,
@@ -94,7 +91,7 @@ class TestPerturbationCheck:
     def test_never_mutates_reference_graph(self) -> None:
         g_ref, buckets = _seeded_ws_graph_and_buckets()
         edges_before = set(g_ref.edges())
-        config = MMDConfig(degree_max=30, clustering_bins=20, spectral_bins=20)
+        config = MMDConfig()
         definition = CompositeDefinition()
         perturbation_check(g_ref, buckets, config, definition, seed=99)
         assert set(g_ref.edges()) == edges_before

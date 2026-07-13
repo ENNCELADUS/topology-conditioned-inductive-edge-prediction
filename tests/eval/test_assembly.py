@@ -4,7 +4,7 @@ import networkx as nx
 import numpy as np
 import pytest
 from src.eval.assembly import SweepPoint, assemble_graph, density_matched_threshold, threshold_sweep
-from src.eval.graph_metrics import MMDConfig
+from src.eval.graph_metrics import STATISTICS, MMDConfig
 
 
 @pytest.mark.unit
@@ -97,7 +97,7 @@ def _seeded_graph_pairs_probs_buckets() -> tuple[
 class TestThresholdSweep:
     def test_returns_sweep_point_per_threshold(self) -> None:
         g_ref, pairs, probs, buckets = _seeded_graph_pairs_probs_buckets()
-        config = MMDConfig(degree_max=15, clustering_bins=10, spectral_bins=10)
+        config = MMDConfig()
         thresholds = [0.1, 0.3, 0.5, 0.7, 0.9]
         points = threshold_sweep(
             pairs, probs, thresholds=thresholds, g_ref=g_ref, buckets=buckets, config=config
@@ -105,10 +105,11 @@ class TestThresholdSweep:
         assert len(points) == len(thresholds)
         for point in points:
             assert isinstance(point, SweepPoint)
+            assert set(point.mmd_ratio) == set(STATISTICS)
 
     def test_relative_density_non_increasing_in_threshold(self) -> None:
         g_ref, pairs, probs, buckets = _seeded_graph_pairs_probs_buckets()
-        config = MMDConfig(degree_max=15, clustering_bins=10, spectral_bins=10)
+        config = MMDConfig()
         thresholds = [0.1, 0.3, 0.5, 0.7, 0.9]
         points = threshold_sweep(
             pairs, probs, thresholds=thresholds, g_ref=g_ref, buckets=buckets, config=config
@@ -118,7 +119,7 @@ class TestThresholdSweep:
 
     def test_recall_non_increasing_in_threshold(self) -> None:
         g_ref, pairs, probs, buckets = _seeded_graph_pairs_probs_buckets()
-        config = MMDConfig(degree_max=15, clustering_bins=10, spectral_bins=10)
+        config = MMDConfig()
         thresholds = [0.1, 0.3, 0.5, 0.7, 0.9]
         points = threshold_sweep(
             pairs, probs, thresholds=thresholds, g_ref=g_ref, buckets=buckets, config=config

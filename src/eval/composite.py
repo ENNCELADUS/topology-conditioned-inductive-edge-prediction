@@ -36,8 +36,8 @@ class CompositeDefinition:
     Attributes:
         statistics: The MMD statistics combined into the composite.
         weights: Statistic -> weight `w_k`; must sum to 1 over `statistics`.
-        scales: Statistic -> scale `tau_k > 0` (calibrated later; a temperature
-            controlling how sharply MMD^2 is penalized for that statistic).
+        scales: Legacy compatibility field retained during the ratio migration;
+            values must remain positive but do not affect the composite.
 
     Raises:
         ValueError: If the weights (restricted to `statistics`) do not sum to 1
@@ -60,20 +60,14 @@ class CompositeDefinition:
                 )
 
 
-def graph_similarity(mmd2: Mapping[str, float], definition: CompositeDefinition) -> float:
-    """Compute the graph-similarity composite: `exp(-sum_k w_k * mmd2_k / tau_k)`.
-
-    Args:
-        mmd2: Statistic -> aggregate canonical MMD^2 value.
-        definition: Weights and scales for each statistic.
-
-    Returns:
-        A similarity in `(0, 1]`; higher is better, `1.0` means identical (all
-        `mmd2` values are 0).
-    """
+def graph_similarity(
+    mmd_ratio: Mapping[str, float],
+    definition: CompositeDefinition,
+) -> float:
+    """Compute exp(-sum_k w_k * normalized_mmd_ratio_k)."""
     total = 0.0
     for stat in definition.statistics:
-        total += definition.weights[stat] * mmd2[stat] / definition.scales[stat]
+        total += definition.weights[stat] * mmd_ratio[stat]
     return float(np.exp(-total))
 
 
@@ -210,7 +204,7 @@ def perturbation_check(
             for _ in range(n_trials):
                 g_pert = perturb_fn(g_ref, frac, rng)
                 report = evaluate_assembled_graph(g_pert, g_ref, buckets, config)
-                trial_sims.append(graph_similarity(report.aggregate, definition))
+                trial_sims.append(graph_similarity(report.mmd_ratio, definition))
             sims_per_fraction.append(float(np.mean(trial_sims)))
         similarities[mode] = sims_per_fraction
 

@@ -2,7 +2,7 @@ r"""Gate G1 (hardened E2) analysis pipeline: cached-score artifacts -> gate numb
 
 Consumes a frozen B0 (and optional B0-alt) candidate-universe scores artifact
 (``src.score_universe``) plus the benchmark package (``src.data.artifacts``) and
-produces every number the G1 gate report needs: canonical MMD-scale calibration,
+produces every number the G1 gate report needs: reference-normalized MMD ratios,
 the mandatory composite perturbation check, a threshold sweep with the
 density-matched operating point, a hard/easy/degree-corrected/feature negative
 regime table (edge metrics), a preferential-attachment null row (evaluator-side
@@ -76,7 +76,6 @@ _REGIME_SEED_CODE: dict[str, int] = {
     "hard_heuristic": 3,
     "hard_feature": 4,
 }
-_TAU_FLOOR = 1e-6
 _EDGE_METRIC_THRESHOLD = 0.5
 
 _BREADTH_FIRST_ZERO_DROP_NOTE = (
@@ -244,37 +243,6 @@ def validate_alt_artifact(alt: ScoresArtifact, universe: ScoresArtifact) -> None
         errors.append("alt-universe pair order does not match the primary universe's pair order")
     if errors:
         raise ValueError("; ".join(errors))
-
-
-# --------------------------------------------------------------------------- calibration
-
-
-def calibrate_tau(
-    noise_floor_result: dict[int, dict[str, float]],
-    *,
-    statistics: tuple[str, ...] = STATISTICS,
-    floor: float = _TAU_FLOOR,
-) -> dict[str, float]:
-    """Calibrate composite scales from the real-vs-real noise floor.
-
-    ``tau_k = max(mean over bucket sizes of noise-floor MMD^2, floor)`` -- the
-    G1-owned "canonical metric normalization" (protocol Sec 6 open item).
-
-    Args:
-        noise_floor_result: Bucket size -> statistic -> mean noise-floor MMD^2
-            (the return of :func:`src.eval.graph_metrics.noise_floor`).
-        statistics: Statistics to calibrate a scale for.
-        floor: Minimum scale value (guards degenerate near-zero noise floors).
-
-    Returns:
-        Statistic -> calibrated scale `tau_k`.
-    """
-    tau: dict[str, float] = {}
-    for stat in statistics:
-        values = [noise_floor_result[size][stat] for size in noise_floor_result]
-        mean_value = float(np.mean(values)) if values else 0.0
-        tau[stat] = max(mean_value, floor)
-    return tau
 
 
 # --------------------------------------------------------------------------- shared helpers
@@ -779,7 +747,7 @@ class SweepRow:
         threshold: The assembly threshold used.
         recall: Fraction of the reference graph's edges recovered.
         relative_density: Predicted/reference simple-edge-count ratio.
-        mmd2: Statistic -> aggregate canonical MMD^2 at this threshold.
+        mmd_ratio: Statistic -> reference-normalized MMD ratio at this threshold.
         self_loop_count: Number of self-pairs `(u, u)` with `p >= threshold`.
         self_loop_rate: `self_loop_count` divided by the total number of
             self-pairs in the universe.
@@ -788,7 +756,7 @@ class SweepRow:
     threshold: float
     recall: float
     relative_density: float
-    mmd2: dict[str, float]
+    mmd_ratio: dict[str, float]
     self_loop_count: int
     self_loop_rate: float
 
@@ -866,7 +834,7 @@ def run_threshold_sweep(
                 threshold=t,
                 recall=point.recall,
                 relative_density=point.relative_density,
-                mmd2=dict(point.mmd2),
+                mmd_ratio=dict(point.mmd_ratio),
                 self_loop_count=hits,
                 self_loop_rate=rate,
             )
@@ -884,20 +852,24 @@ class AssembledRow:
     Attributes:
         threshold: Assembly threshold used (``None`` for the PA-null top-N row,
             which selects an exact edge count instead of thresholding).
-        aggregate_mmd2: Statistic -> aggregate canonical MMD^2.
+        mmd_ratio: Statistic -> reference-normalized MMD ratio.
+        raw_mmd2: Statistic -> raw MMD^2 numerator.
+        reference_mmd2: Statistic -> reference-split MMD^2 denominator.
         relative_density: Predicted/reference simple-edge-count ratio.
         self_loops_pred: Self-loop count in the assembled graph.
         self_loops_ref: Self-loop count in the reference graph.
-        bootstrap_mean: Statistic -> mean canonical MMD^2 over bootstrap resamples
+        bootstrap_mean: Statistic -> mean normalized MMD ratio over bootstrap resamples
             (averaged across bucket sizes).
-        bootstrap_std: Statistic -> std of canonical MMD^2 over bootstrap
+        bootstrap_std: Statistic -> std of normalized MMD ratio over bootstrap
             resamples (averaged across bucket sizes).
         composite: The composite similarity score, or ``None`` if the
             perturbation check has not passed (or was skipped).
     """
 
     threshold: float | None
-    aggregate_mmd2: dict[str, float]
+    mmd_ratio: dict[str, float]
+    raw_mmd2: dict[str, float]
+    reference_mmd2: dict[str, float]
     relative_density: float
     self_loops_pred: int
     self_loops_ref: int
@@ -925,7 +897,7 @@ def assemble_and_evaluate(
         buckets: Bucket size -> list of node sets.
         config: Shared MMD/descriptor configuration.
         seed: Seed for `bootstrap_mmd`.
-        definition: Calibrated composite definition.
+        definition: Composite definition with disclosed weights.
         composite_valid: Whether the perturbation check passed (gates whether the
             composite is computed at all).
         threshold: The assembly threshold used to build `g_pred` (for bookkeeping
@@ -942,10 +914,12 @@ def assemble_and_evaluate(
     bootstrap_std = {
         stat: float(np.mean([boot[size][stat][1] for size in boot])) for stat in STATISTICS
     }
-    composite = graph_similarity(report.aggregate, definition) if composite_valid else None
+    composite = graph_similarity(report.mmd_ratio, definition) if composite_valid else None
     return AssembledRow(
         threshold=threshold,
-        aggregate_mmd2=dict(report.aggregate),
+        mmd_ratio=dict(report.mmd_ratio),
+        raw_mmd2=dict(report.raw_mmd2),
+        reference_mmd2=dict(report.reference_mmd2),
         relative_density=report.relative_density,
         self_loops_pred=report.self_loops_pred,
         self_loops_ref=report.self_loops_ref,
@@ -1098,17 +1072,18 @@ def render_tables_markdown(payload: dict[str, object]) -> str:
     lines.append("## Threshold sweep")
     lines.append("")
     lines.append(
-        "| threshold | recall | rel. density | degree MMD2 | clustering MMD2 | spectral MMD2 | "
+        "| threshold | recall | rel. density | degree MMD ratio | clustering MMD ratio | "
+        "spectral MMD ratio | "
         "self-loop count | self-loop rate |"
     )
     lines.append("|---|---|---|---|---|---|---|---|")
     sweep = cast(dict[str, object], payload["threshold_sweep"])
     for row in cast(list[dict[str, object]], sweep["rows"]):
-        mmd2 = cast(dict[str, float], row["mmd2"])
+        mmd_ratio = cast(dict[str, float], row["mmd_ratio"])
         lines.append(
             f"| {_fmt(cast(float, row['threshold']))} | {_fmt(cast(float, row['recall']))} | "
-            f"{_fmt(cast(float, row['relative_density']))} | {_fmt(mmd2.get('degree'))} | "
-            f"{_fmt(mmd2.get('clustering'))} | {_fmt(mmd2.get('spectral'))} | "
+            f"{_fmt(cast(float, row['relative_density']))} | {_fmt(mmd_ratio.get('degree'))} | "
+            f"{_fmt(mmd_ratio.get('clustering'))} | {_fmt(mmd_ratio.get('spectral'))} | "
             f"{row['self_loop_count']} | {_fmt(cast(float, row['self_loop_rate']))} |"
         )
     lines.append("")
@@ -1116,7 +1091,8 @@ def render_tables_markdown(payload: dict[str, object]) -> str:
     lines.append("## Assembled-graph rows")
     lines.append("")
     lines.append(
-        "| scorer | threshold | rel. density | degree MMD2 | clustering MMD2 | spectral MMD2 | "
+        "| scorer | threshold | rel. density | degree MMD ratio | clustering MMD ratio | "
+        "spectral MMD ratio | "
         "self-loops (pred/ref) | composite |"
     )
     lines.append("|---|---|---|---|---|---|---|---|")
@@ -1125,19 +1101,43 @@ def render_tables_markdown(payload: dict[str, object]) -> str:
         if assembled_row is None:
             continue
         row_dict = cast(dict[str, object], assembled_row)
-        mmd2 = cast(dict[str, float], row_dict["aggregate_mmd2"])
+        mmd_ratio = cast(dict[str, float], row_dict["mmd_ratio"])
         lines.append(
             f"| {scorer} | {_fmt(cast(float | None, row_dict['threshold']))} | "
-            f"{_fmt(cast(float, row_dict['relative_density']))} | {_fmt(mmd2.get('degree'))} | "
-            f"{_fmt(mmd2.get('clustering'))} | {_fmt(mmd2.get('spectral'))} | "
+            f"{_fmt(cast(float, row_dict['relative_density']))} | "
+            f"{_fmt(mmd_ratio.get('degree'))} | {_fmt(mmd_ratio.get('clustering'))} | "
+            f"{_fmt(mmd_ratio.get('spectral'))} | "
             f"{row_dict['self_loops_pred']}/{row_dict['self_loops_ref']} | "
             f"{_fmt(cast(float | None, row_dict['composite']))} |"
         )
     lines.append("")
 
+    lines.append("## MMD ratio components")
+    lines.append("")
+    lines.append(
+        "| scorer | statistic | raw numerator | reference denominator | normalized ratio |"
+    )
+    lines.append("|---|---|---|---|---|")
+    for scorer, assembled_row in assembled.items():
+        if assembled_row is None:
+            continue
+        row_dict = cast(dict[str, object], assembled_row)
+        raw = cast(dict[str, float], row_dict["raw_mmd2"])
+        reference = cast(dict[str, float], row_dict["reference_mmd2"])
+        ratio = cast(dict[str, float], row_dict["mmd_ratio"])
+        for stat in STATISTICS:
+            lines.append(
+                f"| {scorer} | {stat} | {_fmt(raw[stat])} | "
+                f"{_fmt(reference[stat])} | {_fmt(ratio[stat])} |"
+            )
+    lines.append("")
+
     lines.append("## Noise floor")
     lines.append("")
-    lines.append("| bucket size | degree MMD2 | clustering MMD2 | spectral MMD2 |")
+    lines.append(
+        "| bucket size | degree reference MMD2 | clustering reference MMD2 | "
+        "spectral reference MMD2 |"
+    )
     lines.append("|---|---|---|---|")
     for size, stats in cast(dict[str, dict[str, float]], payload["noise_floor"]).items():
         lines.append(
@@ -1215,8 +1215,8 @@ def run_g1_pipeline(
     config = MMDConfig()
 
     logger.info("computing real-vs-real noise floor (seed=%d)", seed)
-    nf = noise_floor(g_ref, buckets, config, seed=seed)
-    tau = calibrate_tau(nf)
+    nf = noise_floor(g_ref, buckets, config)
+    tau = dict.fromkeys(STATISTICS, 1.0)
     definition = CompositeDefinition(scales=tau)
 
     perturbation_meta: dict[str, object]
@@ -1393,11 +1393,15 @@ def run_g1_pipeline(
         },
         "benchmark": {"benchmark_a": strategy},
         "mmd_config": dataclasses.asdict(config),
+        "metric_normalization": "ratio_of_size_mean_mmd2",
+        "reference_split": "artifact_order_even_vs_odd_within_each_node_size",
+        "canonical_metric": "mmd_ratio",
+        "component_disclosure": ["raw_mmd2", "reference_mmd2", "mmd_ratio"],
         "composite": {
             "weights": dict(definition.weights),
             "scales": dict(definition.scales),
             "calibration_rule": (
-                "tau_k = max(mean over bucket sizes of the noise-floor canonical MMD^2, 1e-6)"
+                "no second calibration: MMD ratios are already reference-normalized"
             ),
         },
         "perturbation_check": perturbation_meta,
@@ -1556,7 +1560,6 @@ __all__ = [
     "assemble_top_n_by_score",
     "build_parser",
     "build_threshold_grid",
-    "calibrate_tau",
     "SelfPairEdgeMetrics",
     "common_neighbor_and_adamic_adar",
     "compute_pa_null_scores",

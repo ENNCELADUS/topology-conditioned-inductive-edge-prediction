@@ -15,6 +15,7 @@ import torch
 from src.data.features import FeatureStore
 from src.eval.composite import PerturbationCheckResult
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
+from src.eval.graph_metrics import STATISTICS
 from src.experiments import g1_hardened_e2 as g1
 from src.score_universe import load_scores, save_scores
 
@@ -198,7 +199,7 @@ def _write_feature_root(tmp_path: Path) -> Path:
     return root
 
 
-_SMALL_CONFIG_KWARGS = {"degree_max": 8, "clustering_bins": 8, "spectral_bins": 8}
+_SMALL_CONFIG_KWARGS: dict[str, object] = {}
 
 
 def _d(x: object) -> dict[str, Any]:
@@ -306,26 +307,6 @@ class TestValidateAltArtifact:
         alt = load_scores(alt_path)
         with pytest.raises(ValueError, match="pair order"):
             g1.validate_alt_artifact(alt, universe)
-
-
-# --------------------------------------------------------------------------- calibration
-
-
-class TestCalibrateTau:
-    def test_tau_is_mean_noise_floor_over_bucket_sizes(self) -> None:
-        nf = {
-            20: {"degree": 0.1, "clustering": 0.2, "spectral": 0.05},
-            40: {"degree": 0.3, "clustering": 0.0, "spectral": 0.15},
-        }
-        tau = g1.calibrate_tau(nf)
-        assert tau["degree"] == pytest.approx(0.2)
-        assert tau["clustering"] == pytest.approx(0.1)
-        assert tau["spectral"] == pytest.approx(0.1)
-
-    def test_degenerate_zero_noise_floor_hits_floor(self) -> None:
-        nf = {20: {"degree": 0.0, "clustering": 0.0, "spectral": 0.0}}
-        tau = g1.calibrate_tau(nf)
-        assert tau == {"degree": 1e-6, "clustering": 1e-6, "spectral": 1e-6}
 
 
 # --------------------------------------------------------------------------- regime selectors
@@ -855,7 +836,7 @@ class TestRunThresholdSweep:
 
         from src.eval.graph_metrics import MMDConfig
 
-        config = MMDConfig(degree_max=12, clustering_bins=10, spectral_bins=10)
+        config = MMDConfig()
         buckets = _small_buckets(nodes, size=6, n_samples=3, seed=1)
 
         op_threshold, rows = g1.run_threshold_sweep(
@@ -882,7 +863,7 @@ class TestRunThresholdSweep:
         from src.eval.assembly import assemble_graph
         from src.eval.graph_metrics import MMDConfig, strip_self_loops
 
-        config = MMDConfig(degree_max=10, clustering_bins=8, spectral_bins=8)
+        config = MMDConfig()
         op_threshold, _rows = g1.run_threshold_sweep(
             universe=universe, probs=universe.probs(), g_ref=g, buckets=buckets, config=config
         )
@@ -1099,6 +1080,29 @@ class TestSelfPairEdgeMetricsInPipeline:
             assert "single-class" in cast(str, entry["reason"])
 
 
+def test_pipeline_exposes_only_normalized_mmd_schema(tmp_path: Path) -> None:
+    g = _make_reference_graph()
+    buckets = _small_buckets(_NODES, size=5, n_samples=4, seed=12)
+    data_root = _write_benchmark(tmp_path, "toy", g, buckets)
+    universe_path = _reference_universe_path(tmp_path)
+    payload = g1.run_g1_pipeline(
+        universe_path=universe_path,
+        alt_universe_path=None,
+        data_root=data_root,
+        strategy="toy",
+        output_dir=tmp_path / "out",
+        seed=0,
+        skip_perturbation_check=True,
+    )
+    row = _d(_d(payload["assembled"])["b0"])
+    assert set(_d(row["mmd_ratio"])) == set(STATISTICS)
+    assert set(_d(row["raw_mmd2"])) == set(STATISTICS)
+    assert set(_d(row["reference_mmd2"])) == set(STATISTICS)
+    assert "aggregate_mmd2" not in row
+    metadata = _d(payload["metadata"])
+    assert metadata["metric_normalization"] == "ratio_of_size_mean_mmd2"
+
+
 # --------------------------------------------------------------------------- markdown tables
 
 
@@ -1173,6 +1177,10 @@ class TestCliEndToEnd:
 
         tables = (out1 / "g1_tables.md").read_text()
         assert "## Regime table" in tables
+        assert "degree MMD ratio" in tables
+        assert "raw numerator" in tables
+        assert "reference denominator" in tables
+        assert "degree MMD2" not in tables
 
     def test_bad_pairs_source_fails_with_clear_message(self, tmp_path: Path) -> None:
         g = _make_reference_graph()
@@ -1226,17 +1234,17 @@ class TestCliEndToEnd:
 
 @pytest.mark.integration
 @pytest.mark.slow
-class TestRealBenchmarkNoiseFloorAndCalibration:
-    def test_noise_floor_and_tau_positive_on_real_breadth_first(self, benchmark_root: Path) -> None:
+class TestRealBenchmarkNoiseFloor:
+    def test_noise_floor_has_all_statistics_on_real_breadth_first(
+        self, benchmark_root: Path
+    ) -> None:
         from src.eval.graph_metrics import MMDConfig, noise_floor
 
         g_ref = g1.load_test_graph(benchmark_root, "breadth_first")
         buckets = g1.load_test_node_buckets(benchmark_root, "breadth_first")
         config = MMDConfig()
 
-        nf = noise_floor(g_ref, buckets, config, seed=0)
-        tau = g1.calibrate_tau(nf)
-
-        assert set(tau.keys()) == {"degree", "clustering", "spectral"}
-        for value in tau.values():
-            assert value > 0.0
+        nf = noise_floor(g_ref, buckets, config)
+        assert nf
+        for statistics in nf.values():
+            assert set(statistics) == set(STATISTICS)

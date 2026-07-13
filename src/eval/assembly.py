@@ -105,13 +105,13 @@ class SweepPoint:
         recall: Fraction of `g_ref`'s (self-loop-stripped) canonical edges that are
             also present in the assembled graph at this threshold.
         relative_density: `|E_pred_simple| / |E_ref_simple|` at this threshold.
-        mmd2: Statistic -> aggregate canonical MMD^2 at this threshold.
+        mmd_ratio: Statistic -> reference-normalized MMD ratio at this threshold.
     """
 
     threshold: float
     recall: float
     relative_density: float
-    mmd2: dict[str, float]
+    mmd_ratio: dict[str, float]
 
 
 def threshold_sweep(
@@ -158,7 +158,7 @@ def threshold_sweep(
                 threshold=float(t),
                 recall=recall,
                 relative_density=report.relative_density,
-                mmd2=dict(report.aggregate),
+                mmd_ratio=dict(report.mmd_ratio),
             )
         )
     return points
