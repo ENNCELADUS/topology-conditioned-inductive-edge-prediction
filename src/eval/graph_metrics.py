@@ -152,8 +152,7 @@ def evaluate_assembled_graph(
                 pred_descs[stat].append(pred_d[stat])
                 ref_descs[stat].append(ref_d[stat])
         per_size_raw[size] = {
-            stat: mmd_squared(pred_descs[stat], ref_descs[stat], config)
-            for stat in STATISTICS
+            stat: mmd_squared(pred_descs[stat], ref_descs[stat], config) for stat in STATISTICS
         }
         per_size_reference[size] = {
             stat: mmd_squared(ref_descs[stat][::2], ref_descs[stat][1::2], config)
@@ -200,8 +199,7 @@ def noise_floor(
             for stat in STATISTICS:
                 descs[stat].append(values[stat])
         result[size] = {
-            stat: mmd_squared(descs[stat][::2], descs[stat][1::2], config)
-            for stat in STATISTICS
+            stat: mmd_squared(descs[stat][::2], descs[stat][1::2], config) for stat in STATISTICS
         }
     return result
 
@@ -233,7 +231,6 @@ def bootstrap_mmd(
                 denominator = mmd_squared(ref_samples[::2], ref_samples[1::2], config)
                 values[stat].append(raw / max(denominator, config.reference_epsilon))
         result[size] = {
-            stat: (float(np.mean(values[stat])), float(np.std(values[stat])))
-            for stat in STATISTICS
+            stat: (float(np.mean(values[stat])), float(np.std(values[stat]))) for stat in STATISTICS
         }
     return result

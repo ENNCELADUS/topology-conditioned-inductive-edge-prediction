@@ -1116,8 +1116,7 @@ def test_assembled_bootstrap_fields_aggregate_mmd_ratios(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ratio_summary = {
-        stat: (float(index + 1), float(index + 1) / 10)
-        for index, stat in enumerate(STATISTICS)
+        stat: (float(index + 1), float(index + 1) / 10) for index, stat in enumerate(STATISTICS)
     }
 
     def _fake_bootstrap_mmd(

@@ -34,9 +34,7 @@ def _manual_mmd(samples1: list[np.ndarray], samples2: list[np.ndarray]) -> float
         return float(np.exp(-(tv**2) / 2.0))
 
     def mean_kernel(left: list[np.ndarray], right: list[np.ndarray]) -> float:
-        return float(
-            sum(kernel(x, y) for x in left for y in right) / (len(left) * len(right))
-        )
+        return float(sum(kernel(x, y) for x in left for y in right) / (len(left) * len(right)))
 
     return (
         mean_kernel(normalized1, normalized1)
@@ -72,9 +70,7 @@ class TestOfficialMmdSquared:
         ]
         expected = _manual_mmd(samples1, samples2)
         assert expected > 0.0
-        assert mmd_squared(samples1, samples2, MMDConfig()) == pytest.approx(
-            expected, abs=1e-15
-        )
+        assert mmd_squared(samples1, samples2, MMDConfig()) == pytest.approx(expected, abs=1e-15)
 
     @pytest.mark.parametrize(
         ("samples1", "samples2"),
@@ -160,9 +156,7 @@ def test_bucket_report_uses_ratio_of_aggregate_means() -> None:
 
     for stat in STATISTICS:
         raw_mean = float(np.mean([report.per_size_raw_mmd2[size][stat] for size in buckets]))
-        ref_mean = float(
-            np.mean([report.per_size_reference_mmd2[size][stat] for size in buckets])
-        )
+        ref_mean = float(np.mean([report.per_size_reference_mmd2[size][stat] for size in buckets]))
         assert report.raw_mmd2[stat] == pytest.approx(raw_mean)
         assert report.reference_mmd2[stat] == pytest.approx(ref_mean)
         assert report.mmd_ratio[stat] == pytest.approx(raw_mean / max(ref_mean, 1e-12))
@@ -229,9 +223,7 @@ class TestNoiseFloor:
 
     def test_uses_order_sensitive_even_odd_split(self) -> None:
         graph = nx.Graph()
-        graph.add_edges_from(
-            [("a", "b"), ("b", "c"), ("c", "d"), ("d", "a"), ("a", "c")]
-        )
+        graph.add_edges_from([("a", "b"), ("b", "c"), ("c", "d"), ("d", "a"), ("a", "c")])
         node_sets = [
             {"a", "b"},
             {"a", "b", "c"},
@@ -274,9 +266,7 @@ class TestBootstrapMmd:
         g_pred.remove_edges_from(list(g_pred.edges())[::3])
         seed = 29
         n_boot = 7
-        result = bootstrap_mmd(
-            g_pred, g_ref, buckets, MMDConfig(), seed=seed, n_boot=n_boot
-        )
+        result = bootstrap_mmd(g_pred, g_ref, buckets, MMDConfig(), seed=seed, n_boot=n_boot)
 
         nodes = buckets[10]
         pred_histograms = [degree_histogram(g_pred.subgraph(sample)) for sample in nodes]
@@ -307,9 +297,7 @@ class TestBootstrapMmd:
         graph = nx.Graph()
         graph.add_node("a")
         with pytest.raises(ValueError, match="requires at least two reference samples"):
-            bootstrap_mmd(
-                graph, graph, {1: node_sets}, MMDConfig(), seed=0, n_boot=1
-            )
+            bootstrap_mmd(graph, graph, {1: node_sets}, MMDConfig(), seed=0, n_boot=1)
 
 
 _HASH_SEED_SNIPPET = """
