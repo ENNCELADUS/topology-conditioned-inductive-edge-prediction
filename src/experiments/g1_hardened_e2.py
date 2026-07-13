@@ -1212,6 +1212,7 @@ def run_g1_pipeline(
         )
         validate_alt_artifact(alt, universe)
 
+    output_dir.mkdir(parents=True, exist_ok=True)
     config = MMDConfig()
 
     logger.info("computing real-vs-real noise floor (seed=%d)", seed)
@@ -1486,7 +1487,6 @@ def run_g1_pipeline(
     )
     payload = result.to_jsonable()
 
-    output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "g1_results.json").write_text(
         json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )

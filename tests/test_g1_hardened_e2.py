@@ -1112,6 +1112,48 @@ def test_pipeline_exposes_only_normalized_mmd_schema(tmp_path: Path) -> None:
     ]
 
 
+def test_pipeline_creates_output_dir_before_feature_cache_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    g = _make_reference_graph()
+    buckets = _small_buckets(_NODES, size=5, n_samples=4, seed=14)
+    data_root = _write_benchmark(tmp_path, "toy", g, buckets)
+    features_root = data_root / "features" / "frozen_node_features_1024"
+    features_root.mkdir(parents=True)
+    (features_root / "index.json").write_text(
+        json.dumps({node_id: f"unused/{node_id}.pt" for node_id in _NODES})
+    )
+    (features_root / "metadata.json").write_text(
+        json.dumps({"format": "torch_pt_per_node", "input_dim": 2, "max_sequence_length": 8})
+    )
+    output_dir = tmp_path / "missing" / "out"
+    assert not output_dir.exists()
+    cache_builds = 0
+
+    def _assert_parent_exists_before_cache_write(
+        store: FeatureStore, node_ids: list[str], *, cache_path: Path | None = None
+    ) -> tuple[torch.Tensor, dict[str, int]]:
+        nonlocal cache_builds
+        cache_builds += 1
+        assert cache_path is not None
+        assert cache_path.parent.is_dir()
+        matrix = torch.eye(len(node_ids), dtype=torch.float32)
+        return matrix, {node_id: index for index, node_id in enumerate(node_ids)}
+
+    monkeypatch.setattr(g1, "build_f0_matrix", _assert_parent_exists_before_cache_write)
+    g1.run_g1_pipeline(
+        universe_path=_reference_universe_path(tmp_path),
+        alt_universe_path=None,
+        data_root=data_root,
+        strategy="toy",
+        output_dir=output_dir,
+        seed=0,
+        skip_perturbation_check=True,
+    )
+    assert output_dir.is_dir()
+    assert cache_builds > 0
+
+
 def test_assembled_bootstrap_fields_aggregate_mmd_ratios(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
