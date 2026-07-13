@@ -2,10 +2,28 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any, cast
+
 import numpy as np
 import pytest
+from src.eval.graph_metrics import strip_self_loops
 from src.experiments import g3_oracle as g3
-from src.experiments.g1_hardened_e2 import AssembledRow
+from src.experiments.g1_hardened_e2 import (
+    AssembledRow,
+    common_neighbor_and_adamic_adar,
+    run_g1_pipeline,
+)
+from src.score_universe import load_scores
+
+from tests.test_g1_hardened_e2 import (
+    _NODES,
+    _POSITIVE_EDGES,
+    _make_reference_graph,
+    _universe_rows,
+    _write_benchmark,
+    _write_universe_npz,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -113,3 +131,159 @@ class TestComputeHeadroom:
             ).composite_ratio
             is None
         )
+
+
+# --------------------------------------------------------------------------- pipeline
+
+
+def _d(x: object) -> dict[str, Any]:
+    """Cast a JSON-payload value known to be a dict, for concise test assertions."""
+    return cast(dict[str, Any], x)
+
+
+_BUCKETS: dict[int, list[set[str]]] = {
+    4: [
+        {"n1", "n2", "n3", "n4"},
+        {"n5", "n6", "n7", "n8"},
+        {"n1", "n3", "n5", "n7"},
+        {"n2", "n4", "n6", "n8"},
+    ]
+}
+
+
+def _toy_inputs(tmp_path: Path) -> tuple[Path, Path]:
+    """Write the 8-node toy benchmark + a deterministic universe artifact."""
+    g = _make_reference_graph()
+    data_root = _write_benchmark(tmp_path, "toy", g, _BUCKETS)
+    pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
+    rng = np.random.default_rng(7)
+    logits = rng.normal(size=len(pairs)).astype(np.float32)
+    universe_path = tmp_path / "universe.npz"
+    _write_universe_npz(
+        universe_path, node_ids=_NODES, pairs=pairs, logits=logits, labels=labels, strategy="toy"
+    )
+    return universe_path, data_root
+
+
+class TestRunG3Pipeline:
+    def test_end_to_end_payload_shape(self, tmp_path: Path) -> None:
+        universe_path, data_root = _toy_inputs(tmp_path)
+        out_dir = tmp_path / "g3"
+        payload = g3.run_g3_pipeline(
+            universe_path=universe_path,
+            data_root=data_root,
+            strategy="toy",
+            output_dir=out_dir,
+            seed=0,
+            skip_perturbation_check=True,
+        )
+        assert (out_dir / "g3_results.json").exists()
+        for scorer in ("b0", "oracle_topo", "oracle_blend"):
+            assert scorer in _d(payload["regime_table"])
+            assert scorer in _d(payload["assembled"])
+            assert scorer in _d(payload["self_pair_edge_metrics"])
+        # b0 assembles by threshold; oracle arms by top-N (threshold null)
+        assembled = cast(dict[str, dict[str, object]], payload["assembled"])
+        assert assembled["b0"]["threshold"] is not None
+        assert assembled["oracle_topo"]["threshold"] is None
+        assert assembled["oracle_blend"]["threshold"] is None
+        # headroom present for both arms with all three statistics
+        headroom = cast(dict[str, dict[str, object]], payload["headroom"])
+        for arm in ("oracle_topo", "oracle_blend"):
+            ratios = cast(dict[str, object], headroom[arm]["mmd_ratio_headroom"])
+            assert set(ratios) == {"degree", "clustering", "spectral"}
+        # composite skipped => composite_valid null and no composite anywhere
+        assert _d(payload["metadata"])["composite_valid"] is None
+        assert assembled["b0"]["composite"] is None
+
+    def test_oracle_arms_assemble_no_self_loops_and_exact_edge_count(self, tmp_path: Path) -> None:
+        universe_path, data_root = _toy_inputs(tmp_path)
+        payload = g3.run_g3_pipeline(
+            universe_path=universe_path,
+            data_root=data_root,
+            strategy="toy",
+            output_dir=tmp_path / "g3",
+            seed=0,
+            skip_perturbation_check=True,
+        )
+        assembled = cast(dict[str, dict[str, object]], payload["assembled"])
+        for arm in ("oracle_topo", "oracle_blend"):
+            assert assembled[arm]["self_loops_pred"] == 0
+            # top-N assembly is exactly density-matched: 5 reference edges
+            assert assembled[arm]["relative_density"] == pytest.approx(1.0)
+
+    def test_oracle_topo_ranks_common_neighbor_pairs_first(self, tmp_path: Path) -> None:
+        # In the toy graph, (n2,n3),(n1,n2),(n1,n3),(n2,n4),(n3,n4),(n1,n5)... have CN >= 1.
+        # oracle_topo's top-5 must all be CN >= 1 pairs; scores must be the
+        # rank01_lex of the row-aligned (CN, AA) values.
+        universe_path, _data_root = _toy_inputs(tmp_path)
+        g_simple = strip_self_loops(_make_reference_graph())
+
+        universe = load_scores(universe_path)
+        cn_m, aa_m = common_neighbor_and_adamic_adar(g_simple, universe.node_ids)
+        cn_rows = cn_m[universe.u_idx, universe.v_idx]
+        aa_rows = aa_m[universe.u_idx, universe.v_idx]
+        expected = g3.rank01_lex(cn_rows, aa_rows)
+        actual = g3.oracle_topo_scores(g_simple, universe)
+        np.testing.assert_allclose(actual, expected)
+
+    def test_b0_row_reproduces_g1_pipeline(self, tmp_path: Path) -> None:
+        universe_path, data_root = _toy_inputs(tmp_path)
+        g3_payload = g3.run_g3_pipeline(
+            universe_path=universe_path,
+            data_root=data_root,
+            strategy="toy",
+            output_dir=tmp_path / "g3",
+            seed=0,
+            skip_perturbation_check=True,
+        )
+        g1_payload = run_g1_pipeline(
+            universe_path=universe_path,
+            alt_universe_path=None,
+            data_root=data_root,
+            strategy="toy",
+            output_dir=tmp_path / "g1",
+            seed=0,
+            skip_perturbation_check=True,
+        )
+        assert _d(g3_payload["assembled"])["b0"] == _d(g1_payload["assembled"])["b0"]
+        assert _d(g3_payload["regime_table"])["b0"] == _d(g1_payload["regime_table"])["b0"]
+
+    def test_byte_identical_reruns(self, tmp_path: Path) -> None:
+        universe_path, data_root = _toy_inputs(tmp_path)
+        out_a = tmp_path / "a"
+        out_b = tmp_path / "b"
+        for out in (out_a, out_b):
+            g3.run_g3_pipeline(
+                universe_path=universe_path,
+                data_root=data_root,
+                strategy="toy",
+                output_dir=out,
+                seed=0,
+                skip_perturbation_check=True,
+            )
+        assert (out_a / "g3_results.json").read_bytes() == (out_b / "g3_results.json").read_bytes()
+
+    def test_validation_rejects_non_candidate_artifact(self, tmp_path: Path) -> None:
+        g = _make_reference_graph()
+        data_root = _write_benchmark(tmp_path, "toy", g, _BUCKETS)
+        pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
+        universe_path = tmp_path / "bad.npz"
+        _write_universe_npz(
+            universe_path,
+            node_ids=_NODES,
+            pairs=pairs,
+            logits=np.zeros(len(pairs), dtype=np.float32),
+            labels=labels,
+            strategy="toy",
+            pairs_source="test",
+        )
+        with pytest.raises(ValueError, match="pairs_source"):
+            g3.run_g3_pipeline(
+                universe_path=universe_path,
+                data_root=data_root,
+                strategy="toy",
+                output_dir=tmp_path / "g3",
+                seed=0,
+                skip_perturbation_check=True,
+            )
