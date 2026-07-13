@@ -177,7 +177,8 @@ nodes?" If a draft starts describing graph generation as the task, it has drifte
    sampler, §11 four-H20 execution design. Its freeze rule is binding: code may not
    silently deviate — edit the spec first, with a change-log line.
 6. `docs/results/E2-pair-to-topology-gap.md` — the motivating result note with the
-   completed G1/G2 artifacts; G3 Oracle remains pending.
+   completed G1 B0/PA-null arm and G2 artifacts; G1 B0-alt replication and G3 Oracle
+   remain pending.
 7. `docs/lit-review-plan.md` — literature-review plan, claims K1–K5, the 2×2
    taxonomy, and the terminology guardrail.
 
@@ -187,13 +188,14 @@ rather than resolving them unilaterally.
 
 ## Load-bearing facts (the E2 result)
 
-The current load-bearing gap is the completed G1 result: the frozen B0 pairwise scorer
-reaches **AUROC 0.716871 / AUPRC 0.742622** on degree-corrected ratio-1 negatives,
-falls to **0.583741 / 0.620193** on hard heuristic negatives and **0.406667 / 0.475048**
+The current load-bearing gap is the completed G1 B0/PA-null arm: the frozen B0 pairwise scorer
+reaches **AUROC 0.705519 / AUPRC 0.730260** on degree-corrected ratio-1 negatives,
+falls to **0.583965 / 0.626649** on hard heuristic negatives and **0.569560 / 0.617475**
 on hard feature negatives, yet its density-matched assembly has **graph similarity
-9.64858e-10**, degree/clustering/spectral MMD² **0.620493/0.729620/0.836370**, and
-relative density **0.985429**. The O'Bray perturbation check passed. G2 reports
-`Ov(P)=0.654778` versus `Ov_min=0.010038`; G3 Oracle is still pending.
+5.76802e-7**, degree/clustering/spectral MMD ratios **13.0768/11.9273/18.0931**, and
+relative density **0.997710**. The O'Bray perturbation check passed. G2 reports
+`Ov(P)=0.479886` versus `Ov_min=0.054954`; G1 B0-alt replication and G3 Oracle are
+still pending.
 `docs/04-model-proposal.md` §4.6 maps these failure axes to specific EgoStitch
 mechanisms. Keep the current values consistent across `docs/results/E2-pair-to-topology-gap.md`,
 `docs/03-experiment-protocol.md`, `docs/04-model-proposal.md`, `README.md`, and

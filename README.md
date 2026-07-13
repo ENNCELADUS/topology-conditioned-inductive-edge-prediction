@@ -77,17 +77,25 @@ figure: [`figures/e2-gap.html`](figures/e2-gap.html).
 
 | Level | Metric | Value | Reading |
 |---|---|---:|---|
-| Edge | AUROC / AUPRC (degree-corrected, ratio-1) | **0.7169 / 0.7426** | final G1 B0 row |
-| Edge | AUROC / AUPRC (hard feature, ratio-1) | **0.4067 / 0.4750** | hard-negative stress test |
-| Assembled graph | graph similarity | **9.65e-10** | poor; composite passed perturbation check |
-| Assembled graph | relative density | 0.9854 | density-matched operating point |
-| Assembled graph | degree / clustering / spectral MMD² | 0.6205 / 0.7296 / 0.8364 | high (ideal ≈ 0) |
+| Edge | AUROC / AUPRC (degree-corrected, ratio-1) | **0.7055 / 0.7303** | final G1 B0 row |
+| Edge | AUROC / AUPRC (hard feature, ratio-1) | **0.5696 / 0.6175** | hard-negative stress test |
+| Assembled graph | graph similarity | **5.77e-7** | poor; composite passed perturbation check |
+| Assembled graph | relative density | 0.9977 | density-matched operating point |
+| Assembled graph | degree / clustering / spectral MMD ratio | **13.0768 / 11.9273 / 18.0931** | reference floor = 1; lower is better |
 
 The final G1 threshold sweep and all negative-regime rows are recorded in
 [`outputs/e2_resubmit_retry/g1/g1_tables.md`](outputs/e2_resubmit_retry/g1/g1_tables.md).
-G2 reports measured soft-score overlap 0.6548 versus the minimum 0.0100 required to
-reach the reference triangle count; G3 (Oracle) remains pending. PA-null is reported
+G2 reports measured soft-score overlap 0.4799 versus the minimum 0.0550 required to
+reach the reference triangle count; G1 B0-alt replication and G3 (Oracle) remain
+pending. PA-null is reported
 alongside B0 because it wins some easy and feature-hard edge regimes.
+
+The latest checkpoint-only evaluation rerun (`legacy_v31_s47_20260712T193900Z`, not a
+new formal training acceptance) reached balanced test AUROC/AUPRC **0.8052 / 0.8184**
+and its G1 degree-corrected ratio-1 row was **0.7996 / 0.8133**. Its archived assembled
+metrics predate the canonical MMD-ratio evaluator and are not quoted as current results.
+The complete isolated package is
+[`outputs/deliverables/b0_v31_legacy_s47_20260713/`](outputs/deliverables/b0_v31_legacy_s47_20260713/).
 
 ## The Proposed Method (EgoStitch)
 
@@ -95,8 +103,8 @@ alongside B0 because it wins some easy and feature-hard edge regimes.
 > [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) is the active implementation
 > contract (algorithm spec + benchmark/data contract + four-H20 execution design). Design
 > rationale: [`docs/04-model-proposal.md`](docs/04-model-proposal.md); review record:
-> [`docs/05-review-report.md`](docs/05-review-report.md). Gates G1 and G2 are now complete;
-> G3 (Oracle) must still pass before model code is written.
+> [`docs/05-review-report.md`](docs/05-review-report.md). The G1 B0/PA-null arm and G2
+> are complete; B0-alt replication and G3 (Oracle) remain before model implementation.
 
 For each queried pair `(i, j)`, each endpoint **imagines its own ego-network** (latent
 neighbor nodes with existence probabilities, local adjacency, and a degree budget)
@@ -190,7 +198,9 @@ target test graph; the queried edge is masked/standardized inside the scaffold. 
 - [x] **EgoStitch proposal** — approved 2026-07-09; reviewed via novelty check + 5-persona panel ([`docs/05-review-report.md`](docs/05-review-report.md)).
 - [x] **G4 spec freeze** — [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) signed off (algorithm + benchmark data contract + batch sampler + four-H20 execution).
 - [x] **Baseline + gate pipeline** — benchmark/features, B0/B0-alt training, cached scoring, G1/G2 analyses, and tests are implemented.
-- [x] **G1/G2 gates** — hardened E2 rerun and edge-independence ceiling curve completed; synced artifacts are under `outputs/e2_resubmit_retry/`.
+- [x] **G1 primary arm + G2** — B0/PA-null hardened E2 and the checkpoint-aligned edge-independence ceiling are complete; synced artifacts are under `outputs/e2_resubmit_retry/`.
+- [ ] **G1 B0-alt replication** — required architecture-independence arm; the current G1 artifact records `b0_alt: null`.
+- [x] **Latest legacy v3.1 evaluation rerun** — test, candidate scoring, B0-only G1, and G2 completed; artifacts are under `outputs/deliverables/b0_v31_legacy_s47_20260713/`.
 - [ ] **G3 gate** — Oracle row (must pass before model code).
 - [ ] **EgoStitch implementation** under `src/`, per [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) and the [experiment protocol](docs/03-experiment-protocol.md).
 - [ ] **Experiments** in priority order: G3 Oracle → E1/E3 main + baselines → E4 ablations → E5 integrity gates → E7 (load-bearing) → E6 breadth.

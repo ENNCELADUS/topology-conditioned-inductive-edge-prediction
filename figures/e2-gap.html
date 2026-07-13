@@ -91,11 +91,15 @@
   <p class="eyebrow">Topology-conditioned inductive edge prediction</p>
   <h1>The pair-to-topology gap</h1>
   <p class="lede">
-    A frozen <b>independent pairwise</b> edge scorer over unseen nodes reaches
-    The final G1 B0 row reaches <span class="g">AUROC 0.7169 / AUPRC 0.7426</span>
+    The final G1 row for a frozen <b>independent pairwise</b> scorer reaches
+    <span class="g">AUROC 0.7055 / AUPRC 0.7303</span>
     on degree-corrected negatives, yet its density-matched assembly has
-    <span class="r">graph-similarity 9.65e-10</span> and large normalized MMD distances.
+    <span class="r">graph-similarity 5.77e-7</span> and MMD ratios 11.9–18.1 times
+    the real-vs-real reference floor.
     <b>Good edge scores do not imply a plausible network.</b>
+    A later checkpoint-only v3.1 evaluation rerun reached balanced-test
+    <span class="g">AUROC 0.8052 / AUPRC 0.8184</span>; its retired-format assembled
+    metrics are not compared with the canonical G1 result.
   </p>
 
   <div class="panels">
@@ -107,18 +111,18 @@
       <div class="bars">
         <div class="bar-row">
           <span class="lab">AUROC</span>
-          <div class="track"><div class="fill good" style="width:71.7%"></div><div class="refline" style="left:50%"></div></div>
-          <span class="val">0.7169</span>
+          <div class="track"><div class="fill good" style="width:70.6%"></div><div class="refline" style="left:50%"></div></div>
+          <span class="val">0.7055</span>
         </div>
         <div class="bar-row">
           <span class="lab">AUPRC</span>
-          <div class="track"><div class="fill good" style="width:74.3%"></div><div class="refline" style="left:50%"></div></div>
-          <span class="val">0.7426</span>
+          <div class="track"><div class="fill good" style="width:73.0%"></div><div class="refline" style="left:50%"></div></div>
+          <span class="val">0.7303</span>
         </div>
         <div class="bar-row">
           <span class="lab">graph-sim</span>
           <div class="track"><div class="fill bad" style="width:5%"></div><div class="refline" style="left:50%"></div></div>
-          <span class="val">9.65e-10</span>
+          <span class="val">5.77e-7</span>
         </div>
       </div>
       <div class="axisnote"><span>0.0</span><span class="reflabel">0.5 plausibility line</span><span>1.0</span></div>
@@ -130,34 +134,34 @@
 
     <!-- Panel B: MMDs -->
     <div class="panel">
-      <h2>B - Assembled-graph distances (ideal approx 0)</h2>
-      <p class="cap">Degree, clustering, and spectral <b>MMD</b> between the assembled and true
-        reference graph - all far from zero. Lower is better.</p>
+      <h2>B - Reference-normalized assembled-graph distances</h2>
+      <p class="cap">Degree, clustering, and spectral <b>MMD ratios</b>. A value of 1 is the
+        real-vs-real reference floor; lower is better.</p>
       <div class="bars">
         <div class="bar-row">
           <span class="lab">degree</span>
-          <div class="track"><div class="fill bad" style="width:62.0%"></div></div>
-          <span class="val">0.6205</span>
+          <div class="track"><div class="fill bad" style="width:72.3%"></div></div>
+          <span class="val">13.0768</span>
         </div>
         <div class="bar-row">
           <span class="lab">clustering</span>
-          <div class="track"><div class="fill bad" style="width:73.0%"></div></div>
-          <span class="val">0.7296</span>
+          <div class="track"><div class="fill bad" style="width:65.9%"></div></div>
+          <span class="val">11.9273</span>
         </div>
         <div class="bar-row">
           <span class="lab">spectral</span>
-          <div class="track"><div class="fill bad" style="width:83.6%"></div></div>
-          <span class="val">0.8364</span>
+          <div class="track"><div class="fill bad" style="width:100%"></div></div>
+          <span class="val">18.0931</span>
         </div>
       </div>
-      <div class="axisnote"><span>ideal approx 0</span><span>normalized MMD² -></span><span>1.0</span></div>
+      <div class="axisnote"><span>0</span><span>MMD ratio (reference floor = 1) -></span><span>18.1</span></div>
     </div>
 
     <!-- Panel C: gate status -->
     <div class="panel wide">
       <h2>C - Hardened gate status</h2>
       <p class="cap">G1's mandatory perturbation check passed, and G2's measured soft-score
-        overlap (<b>0.6548</b>) is well above the minimum overlap (<b>0.0100</b>) required
+        overlap (<b>0.4799</b>) is well above the minimum overlap (<b>0.0550</b>) required
         to reach the reference triangle count. The complete threshold sweep and ceiling
         curve are linked from the result note.</p>
       <div class="keyrow">
@@ -199,7 +203,7 @@
     Protocol: topology-conditioned inductive edge prediction over unseen nodes with frozen node
     features. Binary edge predictions are assembled into graphs and evaluated with edge metrics plus
     graph realism metrics. The figure uses the density-matched G1 operating point and reports
-    graph-similarity &lt; 0.5 with high MMD² values; G2 uses the exact edge-independence identities
+    graph-similarity &lt; 0.5 with MMD ratios far above the real-vs-real floor; G2 uses the exact edge-independence identities
     and G3 Oracle remains pending.
   </footer>
 </div>

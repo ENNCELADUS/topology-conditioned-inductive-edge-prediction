@@ -253,8 +253,16 @@ Identities verified: `train_graph.pkl` edges = train⁺ ∪ val⁺ exactly (val�
 20% complement of train⁺); train/val/test negatives ∩ global positives = ∅.
 
 **Benchmark-A/B/C ↔ strategy mapping** is recorded in the run metadata. The completed
-G1 rerun uses `Benchmark-A = breadth_first`; its artifacts are under
-`outputs/e2_resubmit_retry/`.
+canonical-metric G1 rerun uses `Benchmark-A = breadth_first`, checkpoint
+`e092537d8cf1e208`; its HPC artifacts are mirrored under `outputs/g1_mmd_ratio/` and
+`outputs/g1/`, and replace the G1 files in the checkpoint-aligned
+`outputs/e2_resubmit_retry/` package.
+
+A later checkpoint-only `v3_1` evaluation rerun completed under
+`outputs/runs/legacy_v31_s47_20260712T193900Z/`; its curated local package is
+`outputs/deliverables/b0_v31_legacy_s47_20260713/`. Its archived assembled metrics
+predate the canonical MMD-ratio evaluator and are not current results; the rerun does
+not change the formal four-H20 training acceptance contract.
 
 ### 9.2 Feature pipeline (F0/F1)
 

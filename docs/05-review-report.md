@@ -5,9 +5,9 @@ time; the design-stage findings below are applied in **revision 2.1** of that do
 see §5 for the disposition of every finding). **Reviewers are read-only:** no reviewer
 modified the manuscript; all changes were made afterward in the author role.
 
-**Post-review experiment status (2026-07-12):** gates G1 and G2 have now been run on
-the repository-local `breadth_first` artifacts. The current values and the remaining
-G3 Oracle requirement are recorded in
+**Post-review experiment status (updated 2026-07-13):** the G1 B0/PA-null arm and G2
+have been run on the repository-local `breadth_first` artifacts. The current values and
+the remaining G1 B0-alt replication and G3 Oracle requirements are recorded in
 [`docs/results/E2-pair-to-topology-gap.md`](results/E2-pair-to-topology-gap.md). The
 review findings below remain a historical design-stage record; current E2 numerical
 claims are recorded only in the result note.

@@ -197,17 +197,31 @@ prioritized in Section 5 (gates first).
   is executed after every epoch; quality is reported but is not the throughput acceptance gate
   for the first systems-optimization pass. The wall-clock gate is 60 minutes from an empty
   derived-cache path through final training artifacts.
-- **Result (2026-07-12):** G1 passed its execution requirements. The B0 degree-corrected
-  ratio-1 row is AUROC 0.716871 / AUPRC 0.742622; the hard-heuristic row is
-  0.583741 / 0.620193; the hard-feature row is 0.406667 / 0.475048; and the full
-  candidate-universe row is 0.710776 / 0.123982. At the density-matched operating point,
-  relative density is 0.985429 and the perturbation-validated graph-similarity composite
-  is 9.64858e-10, with degree/clustering/spectral MMD² of 0.620493/0.729620/0.836370.
+- **Result (updated 2026-07-13):** the G1 B0/PA-null arm completed, but the required
+  B0-alt replication is absent (`b0_alt: null`), so G1 is not fully closed. The B0
+  degree-corrected ratio-1 row is AUROC 0.705519 / AUPRC 0.730260; the hard-heuristic
+  row is 0.583965 / 0.626649; the hard-feature row is 0.569560 / 0.617475; and the full
+  candidate-universe row is 0.690627 / 0.134302. At the density-matched operating point,
+  relative density is 0.997710 and the perturbation-validated graph-similarity composite
+  is 5.76802e-7, with degree/clustering/spectral MMD ratios of 13.0768/11.9273/18.0931.
+  The ratios use the fixed-`sigma=1` Gaussian-TV biased MMD² numerator divided by the
+  deterministic real-vs-real reference floor; `1` is that floor and lower is better.
   The gap therefore survives hard negatives and calibrated thresholds, although PA-null
   beats B0 in the easy and feature-hard rows and is now a mandatory control.
-- **G2 result:** the cached soft scorer has `Ov(P)=0.654778`, while `Ov_min=0.010038`
+- **G2 result:** the checkpoint-aligned cached soft scorer has `Ov(P)=0.479886`, while
+  `Ov_min=0.054954`
   at matched volume is sufficient to reach the reference triangle count; the full ceiling
-  curve and caveats are in the synced G2 artifact. **G3 (Oracle) remains pending.**
+  curve and caveats are in the synced G2 artifact. **G1 B0-alt replication and G3
+  (Oracle) remain pending.**
+
+**Latest checkpoint-only evaluation rerun:** the aligned legacy `v3_1` checkpoint was
+scored on the same split in run `legacy_v31_s47_20260712T193900Z` (completed 2026-07-12
+19:53:13 UTC). It reached balanced test AUROC/AUPRC `0.805170/0.818408`; its G1
+degree-corrected ratio-1 row was `0.799577/0.813319`, hard-heuristic
+`0.626746/0.663360`, and hard-feature `0.510083/0.602131`. This is an evaluation
+rerun of a supplied checkpoint, not a replacement for the formal four-H20 E2 training
+acceptance or the B0-alt/G3 requirements. Its archived assembled metrics use the retired
+evaluator and are not treated as canonical MMD-ratio results.
 
 ### E3: Baselines head-to-head on Benchmark-A
 
@@ -389,8 +403,9 @@ rule).
 
 ## 6. Deliverables and done criteria
 
-1. **Gate reports (G1–G3):** G1 hardened E2 note and G2 ceiling computation are complete;
-   the G3 Oracle row remains outstanding.
+1. **Gate reports (G1–G3):** the G1 B0/PA-null hardened-E2 result and G2 ceiling
+   computation are complete; G1 B0-alt replication and the G3 Oracle row remain
+   outstanding.
 2. **Spec freeze (G4):** signed-off `06-egostitch-spec.md`.
 3. **E1/E3 main table:** method by edge AUPRC, both assembled families, ceiling/Oracle/noise
    rows, diagnostics.
