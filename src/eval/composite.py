@@ -31,13 +31,13 @@ def _default_scales() -> Mapping[str, float]:
 
 @dataclass(frozen=True)
 class CompositeDefinition:
-    """Disclosed weights and a unit-valued compatibility field for the composite.
+    """Disclosed weights and an ignored legacy compatibility field for the composite.
 
     Attributes:
         statistics: The MMD statistics combined into the composite.
         weights: Statistic -> weight `w_k`; must sum to 1 over `statistics`.
-        scales: Legacy compatibility field retained during the ratio migration;
-            values must remain positive but do not affect the composite.
+        scales: Ignored legacy compatibility field retained during the ratio
+            migration; values must remain positive but do not affect the composite.
 
     Raises:
         ValueError: If the weights (restricted to `statistics`) do not sum to 1
@@ -176,8 +176,8 @@ def perturbation_check(
         buckets: Bucket size -> list of node sets, passed through to
             `evaluate_assembled_graph`.
         config: Shared MMD/descriptor configuration.
-        definition: Composite weights plus the unit compatibility field; no
-            second calibration is applied to the already normalized MMD ratios.
+        definition: Composite weights plus an ignored legacy compatibility field;
+            no second calibration is applied to the already normalized MMD ratios.
         fractions: Perturbation fractions to evaluate, in increasing order.
         n_trials: Number of independent perturbation trials averaged per fraction.
         seed: Seed for the perturbation RNG.
