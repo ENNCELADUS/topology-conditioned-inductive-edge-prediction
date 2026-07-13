@@ -23,13 +23,14 @@ def clustering_histogram(g: nx.Graph) -> np.ndarray:
 
 
 def laplacian_spectrum_histogram(g: nx.Graph) -> np.ndarray:
-    """Return raw counts in the official 200-bin normalized-Laplacian histogram."""
+    """Return the official 200-bin normalized-Laplacian spectral PMF."""
     try:
         eigs = eigvalsh(nx.normalized_laplacian_matrix(g).todense())
     except Exception:
         eigs = np.zeros(g.number_of_nodes())
     counts, _ = np.histogram(eigs, bins=200, range=(-1e-5, 2.0), density=False)
-    return counts.astype(float)
+    hist = counts.astype(float)
+    return hist / max(1.0, float(hist.sum()))
 
 
 @dataclass(frozen=True)
@@ -101,21 +102,20 @@ def strip_self_loops(g: nx.Graph) -> nx.Graph:
     return g2
 
 
-def _simple_subgraph(g: nx.Graph, nodes: Iterable[str]) -> nx.Graph:
-    """Return a deterministically ordered simple induced subgraph."""
+def _induced_subgraph(g: nx.Graph, nodes: Iterable[str]) -> nx.Graph:
+    """Return a deterministically ordered induced subgraph, preserving self-loops."""
     view = g.subgraph(nodes)
     out = nx.Graph()
     out.add_nodes_from(sorted(view.nodes()))
     out.add_edges_from(view.edges())
-    out.remove_edges_from(list(nx.selfloop_edges(out)))
     return out
 
 
-def _descriptors(g_simple: nx.Graph) -> dict[str, np.ndarray]:
+def _descriptors(g_subgraph: nx.Graph) -> dict[str, np.ndarray]:
     return {
-        "degree": degree_histogram(g_simple),
-        "clustering": clustering_histogram(g_simple),
-        "spectral": laplacian_spectrum_histogram(g_simple),
+        "degree": degree_histogram(g_subgraph),
+        "clustering": clustering_histogram(g_subgraph),
+        "spectral": laplacian_spectrum_histogram(g_subgraph),
     }
 
 
@@ -146,8 +146,8 @@ def evaluate_assembled_graph(
         pred_descs: dict[str, list[np.ndarray]] = {stat: [] for stat in STATISTICS}
         ref_descs: dict[str, list[np.ndarray]] = {stat: [] for stat in STATISTICS}
         for nodes in node_sets:
-            pred_d = _descriptors(_simple_subgraph(g_pred, nodes))
-            ref_d = _descriptors(_simple_subgraph(g_ref, nodes))
+            pred_d = _descriptors(_induced_subgraph(g_pred, nodes))
+            ref_d = _descriptors(_induced_subgraph(g_ref, nodes))
             for stat in STATISTICS:
                 pred_descs[stat].append(pred_d[stat])
                 ref_descs[stat].append(ref_d[stat])
@@ -196,7 +196,7 @@ def noise_floor(
             raise ValueError(f"bucket {size} requires at least two reference samples")
         descs: dict[str, list[np.ndarray]] = {stat: [] for stat in STATISTICS}
         for nodes in node_sets:
-            values = _descriptors(_simple_subgraph(g_ref, nodes))
+            values = _descriptors(_induced_subgraph(g_ref, nodes))
             for stat in STATISTICS:
                 descs[stat].append(values[stat])
         result[size] = {
@@ -221,8 +221,8 @@ def bootstrap_mmd(
     for size, node_sets in buckets.items():
         if len(node_sets) < 2:
             raise ValueError(f"bucket {size} requires at least two reference samples")
-        pred = [_descriptors(_simple_subgraph(g_pred, nodes)) for nodes in node_sets]
-        ref = [_descriptors(_simple_subgraph(g_ref, nodes)) for nodes in node_sets]
+        pred = [_descriptors(_induced_subgraph(g_pred, nodes)) for nodes in node_sets]
+        ref = [_descriptors(_induced_subgraph(g_ref, nodes)) for nodes in node_sets]
         values: dict[str, list[float]] = {stat: [] for stat in STATISTICS}
         for _ in range(n_boot):
             indices = rng.integers(0, len(node_sets), size=len(node_sets))

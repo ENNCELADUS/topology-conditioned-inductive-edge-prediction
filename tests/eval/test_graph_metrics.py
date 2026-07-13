@@ -21,6 +21,30 @@ from src.eval.graph_metrics import (
 )
 
 
+def _manual_mmd(samples1: list[np.ndarray], samples2: list[np.ndarray]) -> float:
+    """Independent Gaussian-TV biased V-stat calculation for formula tests."""
+    normalized1 = [sample / (float(sample.sum()) + 1e-6) for sample in samples1]
+    normalized2 = [sample / (float(sample.sum()) + 1e-6) for sample in samples2]
+
+    def kernel(x: np.ndarray, y: np.ndarray) -> float:
+        support = max(len(x), len(y))
+        x_padded = np.pad(x, (0, support - len(x)))
+        y_padded = np.pad(y, (0, support - len(y)))
+        tv = float(np.abs(x_padded - y_padded).sum() / 2.0)
+        return float(np.exp(-(tv**2) / 2.0))
+
+    def mean_kernel(left: list[np.ndarray], right: list[np.ndarray]) -> float:
+        return float(
+            sum(kernel(x, y) for x in left for y in right) / (len(left) * len(right))
+        )
+
+    return (
+        mean_kernel(normalized1, normalized1)
+        + mean_kernel(normalized2, normalized2)
+        - 2.0 * mean_kernel(normalized1, normalized2)
+    )
+
+
 @pytest.mark.unit
 class TestOfficialMmdSquared:
     def test_singleton_total_variation_formula(self) -> None:
@@ -39,6 +63,29 @@ class TestOfficialMmdSquared:
         b = [np.array([6.0, 2.0]), np.array([2.0, 6.0])]
         assert mmd_squared(a, b, MMDConfig()) == pytest.approx(0.0, abs=1e-12)
 
+    def test_asymmetric_multi_bin_biased_v_stat_matches_manual_formula(self) -> None:
+        samples1 = [np.array([4.0, 1.0, 0.0]), np.array([0.0, 2.0, 3.0])]
+        samples2 = [
+            np.array([1.0, 3.0]),
+            np.array([0.0, 1.0, 4.0]),
+            np.array([2.0, 0.0, 1.0, 2.0]),
+        ]
+        expected = _manual_mmd(samples1, samples2)
+        assert expected > 0.0
+        assert mmd_squared(samples1, samples2, MMDConfig()) == pytest.approx(
+            expected, abs=1e-15
+        )
+
+    @pytest.mark.parametrize(
+        ("samples1", "samples2"),
+        [([], [np.array([1.0])]), ([np.array([1.0])], [])],
+    )
+    def test_rejects_empty_sample_set(
+        self, samples1: list[np.ndarray], samples2: list[np.ndarray]
+    ) -> None:
+        with pytest.raises(ValueError, match="two non-empty sample sets"):
+            mmd_squared(samples1, samples2, MMDConfig())
+
 
 @pytest.mark.unit
 class TestOfficialDescriptors:
@@ -53,11 +100,40 @@ class TestOfficialDescriptors:
         assert hist.shape == (100,)
         assert hist[-1] == 3
 
-    def test_spectral_uses_two_hundred_raw_count_bins(self) -> None:
+    def test_spectral_uses_two_hundred_pmf_bins(self) -> None:
         graph = nx.path_graph(5)
         hist = laplacian_spectrum_histogram(graph)
         assert hist.shape == (200,)
-        assert hist.sum() == pytest.approx(graph.number_of_nodes())
+        assert hist.sum() == pytest.approx(1.0)
+
+    def test_clustering_bin_geometry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            nx,
+            "clustering",
+            lambda graph: {0: 0.0, 1: 0.009, 2: 0.01, 3: 0.999, 4: 1.0},
+        )
+        hist = clustering_histogram(nx.Graph())
+        assert hist[0] == 2
+        assert hist[1] == 1
+        assert hist[99] == 2
+        assert hist.sum() == 5
+
+    def test_spectral_bin_geometry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "src.eval.graph_metrics.eigvalsh",
+            lambda matrix: np.array([0.0, 0.005, 0.015, 1.999, 2.0]),
+        )
+        graph = nx.path_graph(5)
+        hist = laplacian_spectrum_histogram(graph)
+        assert hist[0] == pytest.approx(2.0 / 5.0)
+        assert hist[1] == pytest.approx(1.0 / 5.0)
+        assert hist[199] == pytest.approx(2.0 / 5.0)
+        assert hist.sum() == pytest.approx(1.0)
+
+    def test_empty_spectral_histogram_is_all_zero(self) -> None:
+        hist = laplacian_spectrum_histogram(nx.Graph())
+        assert hist.shape == (200,)
+        np.testing.assert_array_equal(hist, np.zeros(200))
 
 
 def _seeded_er_graph_and_buckets(
@@ -105,17 +181,27 @@ class TestEvaluateAssembledGraph:
         assert report.self_loops_pred == 0
         assert report.self_loops_ref == 0
 
-    def test_self_loops_reported_separately_and_stripped_from_topology(self) -> None:
-        g_ref, buckets = _seeded_er_graph_and_buckets()
+    def test_pred_self_loops_are_described_but_excluded_from_density(self) -> None:
+        g_ref = nx.path_graph(["a", "b", "c"])
         g_pred = g_ref.copy()
-        first_node = next(iter(g_pred.nodes()))
-        g_pred.add_edge(first_node, first_node)
+        g_pred.add_edge("a", "a")
+        buckets = {3: [{"a", "b", "c"}, {"a", "b", "c"}]}
         report = evaluate_assembled_graph(g_pred, g_ref, buckets, MMDConfig())
         assert report.self_loops_pred == 1
         assert report.self_loops_ref == 0
         assert report.relative_density == pytest.approx(1.0)
-        for stat in STATISTICS:
-            assert report.raw_mmd2[stat] == pytest.approx(0.0, abs=1e-9)
+        assert report.raw_mmd2["degree"] > 0.0
+
+    def test_reference_self_loops_are_counted_and_described(self) -> None:
+        g_pred = nx.path_graph(["a", "b", "c"])
+        g_ref = g_pred.copy()
+        g_ref.add_edge("a", "a")
+        buckets = {3: [{"a", "b", "c"}, {"a", "b", "c"}]}
+        report = evaluate_assembled_graph(g_pred, g_ref, buckets, MMDConfig())
+        assert report.self_loops_pred == 0
+        assert report.self_loops_ref == 1
+        assert report.relative_density == pytest.approx(1.0)
+        assert report.raw_mmd2["degree"] > 0.0
 
     def test_per_size_keys_match_buckets(self) -> None:
         g_ref, buckets = _seeded_er_graph_and_buckets()
@@ -141,6 +227,31 @@ class TestNoiseFloor:
         report = evaluate_assembled_graph(g_ref.copy(), g_ref, buckets, config)
         assert floor == report.per_size_reference_mmd2
 
+    def test_uses_order_sensitive_even_odd_split(self) -> None:
+        graph = nx.Graph()
+        graph.add_edges_from(
+            [("a", "b"), ("b", "c"), ("c", "d"), ("d", "a"), ("a", "c")]
+        )
+        node_sets = [
+            {"a", "b"},
+            {"a", "b", "c"},
+            {"a", "b", "c", "d"},
+            {"a", "c", "d"},
+        ]
+        histograms = [degree_histogram(graph.subgraph(nodes)) for nodes in node_sets]
+        expected_even_odd = _manual_mmd(histograms[::2], histograms[1::2])
+        contiguous_halves = _manual_mmd(histograms[:2], histograms[2:])
+        floor = noise_floor(graph, {2: node_sets}, MMDConfig())
+        assert expected_even_odd != pytest.approx(contiguous_halves)
+        assert floor[2]["degree"] == pytest.approx(expected_even_odd, abs=1e-15)
+
+    @pytest.mark.parametrize("node_sets", [[], [{"a"}]])
+    def test_rejects_fewer_than_two_samples(self, node_sets: list[set[str]]) -> None:
+        graph = nx.Graph()
+        graph.add_node("a")
+        with pytest.raises(ValueError, match="requires at least two reference samples"):
+            noise_floor(graph, {1: node_sets}, MMDConfig())
+
 
 @pytest.mark.unit
 class TestBootstrapMmd:
@@ -155,6 +266,50 @@ class TestBootstrapMmd:
                 assert isinstance(std, float)
                 assert mean == pytest.approx(0.0, abs=1e-9)
                 assert std == pytest.approx(0.0, abs=1e-9)
+
+    def test_replays_nonzero_normalized_ratio_with_fixed_rng(self) -> None:
+        g_ref, buckets = _seeded_er_graph_and_buckets(seed=17)
+        buckets = {10: buckets[10]}
+        g_pred = g_ref.copy()
+        g_pred.remove_edges_from(list(g_pred.edges())[::3])
+        seed = 29
+        n_boot = 7
+        result = bootstrap_mmd(
+            g_pred, g_ref, buckets, MMDConfig(), seed=seed, n_boot=n_boot
+        )
+
+        nodes = buckets[10]
+        pred_histograms = [degree_histogram(g_pred.subgraph(sample)) for sample in nodes]
+        ref_histograms = [degree_histogram(g_ref.subgraph(sample)) for sample in nodes]
+        rng = np.random.default_rng(seed)
+        ratios: list[float] = []
+        denominators: list[float] = []
+        raw_values: list[float] = []
+        for _ in range(n_boot):
+            indices = rng.integers(0, len(nodes), size=len(nodes))
+            pred_samples = [pred_histograms[i] for i in indices]
+            ref_samples = [ref_histograms[i] for i in indices]
+            raw = _manual_mmd(pred_samples, ref_samples)
+            denominator = _manual_mmd(ref_samples[::2], ref_samples[1::2])
+            raw_values.append(raw)
+            denominators.append(denominator)
+            ratios.append(raw / max(denominator, 1e-12))
+
+        assert all(value > 0.0 for value in raw_values)
+        assert all(value > 0.0 for value in denominators)
+        assert all(value != pytest.approx(1.0) for value in denominators)
+        assert result[10]["degree"] == pytest.approx(
+            (float(np.mean(ratios)), float(np.std(ratios))), abs=1e-15
+        )
+
+    @pytest.mark.parametrize("node_sets", [[], [{"a"}]])
+    def test_rejects_fewer_than_two_samples(self, node_sets: list[set[str]]) -> None:
+        graph = nx.Graph()
+        graph.add_node("a")
+        with pytest.raises(ValueError, match="requires at least two reference samples"):
+            bootstrap_mmd(
+                graph, graph, {1: node_sets}, MMDConfig(), seed=0, n_boot=1
+            )
 
 
 _HASH_SEED_SNIPPET = """
