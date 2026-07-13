@@ -119,8 +119,10 @@ Components:
     a 100-bin local-clustering histogram on `[0,1]`, or a 200-bin normalized-
     Laplacian spectral histogram on `[-1e-5,2]`. Descriptor induced subgraphs retain
     self-loops exactly as in the benchmark/official evaluator; self-loop counts are
-    also disclosed separately. Histograms are normalized by `sum + 1e-6`. MMD² is
-    the biased V-statistic under
+    also disclosed separately. The spectral worker first divides its 200-bin counts
+    by their own total to form a PMF; degree and clustering remain raw counts. The
+    common MMD routine then normalizes every descriptor by `sum + 1e-6`. MMD² is the
+    biased V-statistic under
     `k(x,y)=exp(-(0.5·||x-y||₁)²/2)` (`σ=1`, including within-sample diagonals).
   - *Reference normalization:* within every node-size bucket, reference samples
     retain artifact order and are split as `samples[::2]` versus `samples[1::2]`.

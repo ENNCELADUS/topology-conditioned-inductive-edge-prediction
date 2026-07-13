@@ -377,9 +377,11 @@ with per-epoch order shuffling but no negative resampling.
   Gaussian-TV (`σ=1`) raw MMD² divided by the deterministic even/odd reference
   floor after separately averaging numerator and denominator across node-size
   buckets. Its descriptor induced subgraphs retain self-loops exactly as in the
-  benchmark/official evaluator. Run artifacts disclose `raw_mmd2`,
-  `reference_mmd2`, and `mmd_ratio`; only `mmd_ratio` is used in result tables and
-  the topology composite.
+  benchmark/official evaluator. The spectral worker first converts its 200-bin
+  counts to a PMF, while degree and clustering remain raw counts; the common MMD
+  routine then applies `sum + 1e-6` normalization to all three. Run artifacts
+  disclose `raw_mmd2`, `reference_mmd2`, and `mmd_ratio`; only `mmd_ratio` is used
+  in result tables and the topology composite.
 - Per-node Tokenize/Imagine caches rebuilt once per eval epoch for all |V| nodes
   (~10k nodes; ≈160 MB fp32 at K = 16, d_p = 256 — kept on the H20).
 
@@ -435,7 +437,9 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   with the fixed-`σ=1` Gaussian-TV biased MMD² ratio defined in protocol §1;
   removed degree clipping and bound deterministic even/odd reference splitting,
   ratio-of-size-means aggregation, numerator/denominator disclosure, and
-  benchmark-aligned self-loop retention for canonical descriptor induced subgraphs.
+  benchmark-aligned self-loop retention for canonical descriptor induced subgraphs;
+  also pinned the official spectral-PMF pre-normalization before the common
+  `sum + 1e-6` normalization, with degree/clustering left as raw counts beforehand.
 
 **Open items before code (not blockers):** the four ego-stat target definitions
 pinned to evaluator implementations; FLOPs/latency table template (§4.7 commitment);
