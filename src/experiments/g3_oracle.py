@@ -24,9 +24,11 @@ fields in the payload).
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -528,5 +530,164 @@ def run_g3_pipeline(
     (output_dir / "g3_results.json").write_text(
         json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )
-    logger.info("wrote G3 results to %s", output_dir)
+    (output_dir / "g3_tables.md").write_text(render_tables_markdown(payload), encoding="utf-8")
+    logger.info("wrote G3 results and tables to %s", output_dir)
     return payload
+
+
+# --------------------------------------------------------------------------- markdown tables
+
+_SCORER_ORDER: tuple[str, ...] = ("b0", "oracle_topo", "oracle_blend")
+_ARM_ORDER: tuple[str, ...] = ("oracle_topo", "oracle_blend")
+
+
+def _fmt(value: object) -> str:
+    """Format one table cell: 6 significant digits for numbers, '' for None."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        return f"{value:.6g}"
+    return str(value)
+
+
+def render_tables_markdown(payload: dict[str, object]) -> str:
+    """Render the human-readable ``g3_tables.md`` companion for one payload.
+
+    Args:
+        payload: A `G3Result.to_jsonable` payload.
+
+    Returns:
+        The complete markdown document text.
+    """
+    regime_table = cast(dict[str, dict[str, dict[str, dict[str, object]]]], payload["regime_table"])
+    assembled = cast(dict[str, dict[str, object]], payload["assembled"])
+    headroom = cast(dict[str, dict[str, object]], payload["headroom"])
+    noise = cast(dict[str, dict[str, float]], payload["noise_floor"])
+
+    lines: list[str] = ["# G3 Oracle gate tables", "", "## Regime table", ""]
+    lines.append("| scorer | regime | key | n_pos | n_neg | AUROC | AUPRC | MCC |")
+    lines.append("|---|---|---|---|---|---|---|---|")
+    for scorer in _SCORER_ORDER:
+        for regime, keys in regime_table[scorer].items():
+            for key, m in keys.items():
+                lines.append(
+                    f"| {scorer} | {regime} | {key} | {_fmt(m['n_pos'])} | {_fmt(m['n_neg'])} "
+                    f"| {_fmt(m['auroc'])} | {_fmt(m['auprc'])} | {_fmt(m['mcc'])} |"
+                )
+
+    lines += ["", "## Assembled-graph rows", ""]
+    lines.append(
+        "| scorer | threshold | rel. density | degree MMD ratio | clustering MMD ratio "
+        "| spectral MMD ratio | self-loops (pred/ref) | composite |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|")
+    for scorer in _SCORER_ORDER:
+        row = assembled[scorer]
+        ratio = cast(dict[str, float], row["mmd_ratio"])
+        lines.append(
+            f"| {scorer} | {_fmt(row['threshold'])} | {_fmt(row['relative_density'])} "
+            f"| {_fmt(ratio['degree'])} | {_fmt(ratio['clustering'])} | {_fmt(ratio['spectral'])} "
+            f"| {row['self_loops_pred']}/{row['self_loops_ref']} | {_fmt(row['composite'])} |"
+        )
+
+    lines += ["", "## Headroom (stop-rule view)", ""]
+    lines.append(
+        "| oracle arm | degree headroom | clustering headroom | spectral headroom "
+        "| composite ratio |"
+    )
+    lines.append("|---|---|---|---|---|")
+    for arm in _ARM_ORDER:
+        ratios = cast(dict[str, object], headroom[arm]["mmd_ratio_headroom"])
+        lines.append(
+            f"| {arm} | {_fmt(ratios['degree'])} | {_fmt(ratios['clustering'])} "
+            f"| {_fmt(ratios['spectral'])} | {_fmt(headroom[arm]['composite_ratio'])} |"
+        )
+
+    lines += ["", "## MMD ratio components", ""]
+    lines.append(
+        "| scorer | statistic | raw numerator | reference denominator | normalized ratio |"
+    )
+    lines.append("|---|---|---|---|---|")
+    for scorer in _SCORER_ORDER:
+        row = assembled[scorer]
+        raw = cast(dict[str, float], row["raw_mmd2"])
+        ref = cast(dict[str, float], row["reference_mmd2"])
+        ratio = cast(dict[str, float], row["mmd_ratio"])
+        for stat in STATISTICS:
+            lines.append(
+                f"| {scorer} | {stat} | {_fmt(raw[stat])} | {_fmt(ref[stat])} "
+                f"| {_fmt(ratio[stat])} |"
+            )
+
+    lines += ["", "## Noise floor", ""]
+    lines.append(
+        "| bucket size | degree reference MMD2 | clustering reference MMD2 "
+        "| spectral reference MMD2 |"
+    )
+    lines.append("|---|---|---|---|")
+    for size in sorted(noise, key=int):
+        stats = noise[size]
+        lines.append(
+            f"| {size} | {_fmt(stats['degree'])} | {_fmt(stats['clustering'])} "
+            f"| {_fmt(stats['spectral'])} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- CLI
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the ``g3_oracle`` argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="python -m src.experiments.g3_oracle",
+        description="Gate G3 (Oracle) analysis pipeline from cached scores artifacts.",
+    )
+    parser.add_argument("--universe", type=Path, required=True, help="B0 candidate-universe .npz")
+    parser.add_argument("--data-root", type=Path, default=Path("data"))
+    parser.add_argument("--strategy", default="breadth_first")
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--skip-perturbation-check",
+        action="store_true",
+        help="DEBUG-ONLY speed flag: skip the mandatory perturbation check "
+        "(composite is then treated as unvalidated, never as passed).",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """CLI entry point.
+
+    Args:
+        argv: Argument list (defaults to ``sys.argv[1:]``).
+
+    Raises:
+        SystemExit: On argument errors (via ``parser.error``, missing input files).
+        ValueError: If the scores artifact fails validation -- surfaced as an
+            uncaught exception with a descriptive message, matching
+            `src.experiments.g1_hardened_e2.main`.
+    """
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if not args.universe.exists():
+        parser.error(f"--universe not found: {args.universe}")
+
+    run_g3_pipeline(
+        universe_path=args.universe,
+        data_root=args.data_root,
+        strategy=args.strategy,
+        output_dir=args.output_dir,
+        seed=args.seed,
+        skip_perturbation_check=args.skip_perturbation_check,
+    )
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    main()

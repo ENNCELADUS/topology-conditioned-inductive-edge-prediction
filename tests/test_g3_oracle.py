@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, cast
 
@@ -286,4 +287,69 @@ class TestRunG3Pipeline:
                 output_dir=tmp_path / "g3",
                 seed=0,
                 skip_perturbation_check=True,
+            )
+
+
+# --------------------------------------------------------------------------- tables + CLI
+
+
+class TestRenderTables:
+    def test_sections_present(self, tmp_path: Path) -> None:
+        universe_path, data_root = _toy_inputs(tmp_path)
+        payload = g3.run_g3_pipeline(
+            universe_path=universe_path,
+            data_root=data_root,
+            strategy="toy",
+            output_dir=tmp_path / "g3",
+            seed=0,
+            skip_perturbation_check=True,
+        )
+        text = g3.render_tables_markdown(payload)
+        for heading in (
+            "# G3 Oracle gate tables",
+            "## Regime table",
+            "## Assembled-graph rows",
+            "## Headroom (stop-rule view)",
+            "## MMD ratio components",
+            "## Noise floor",
+        ):
+            assert heading in text
+        for scorer in ("b0", "oracle_topo", "oracle_blend"):
+            assert scorer in text
+        # tables file is written by the pipeline itself
+        assert (tmp_path / "g3" / "g3_tables.md").read_text(encoding="utf-8") == text
+
+
+class TestCli:
+    def test_end_to_end(self, tmp_path: Path) -> None:
+        universe_path, data_root = _toy_inputs(tmp_path)
+        out_dir = tmp_path / "g3_cli"
+        g3.main(
+            [
+                "--universe",
+                str(universe_path),
+                "--data-root",
+                str(data_root),
+                "--strategy",
+                "toy",
+                "--output-dir",
+                str(out_dir),
+                "--seed",
+                "0",
+                "--skip-perturbation-check",
+            ]
+        )
+        payload = json.loads((out_dir / "g3_results.json").read_text(encoding="utf-8"))
+        assert set(payload["headroom"]) == {"oracle_topo", "oracle_blend"}
+        assert (out_dir / "g3_tables.md").exists()
+
+    def test_missing_universe_errors(self, tmp_path: Path) -> None:
+        with pytest.raises(SystemExit):
+            g3.main(
+                [
+                    "--universe",
+                    str(tmp_path / "missing.npz"),
+                    "--output-dir",
+                    str(tmp_path / "out"),
+                ]
             )
