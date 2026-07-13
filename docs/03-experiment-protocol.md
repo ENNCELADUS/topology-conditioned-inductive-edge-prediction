@@ -111,8 +111,10 @@ Components:
     (gate G3).
   - *Hygiene:* per statistic, disclose descriptor function, bin count/binning rule, kernel
     family, and every parameter; avoid ad-hoc EMD-/TV-based kernels unless justified;
-    parameter sweeps reported; bootstrap variance over node buckets and seeds; MMDs never
-    aggregated across statistics naively (O'Bray 2106.01098; Thompson 2201.09871).
+    parameter sweeps are reported only for non-canonical exploratory alternatives; the
+    canonical fixed-`σ=1` metric is not swept; bootstrap variance over node buckets and
+    seeds; MMDs never aggregated across statistics naively (O'Bray 2106.01098;
+    Thompson 2201.09871).
   - *Canonical MMD definition:* each graph is mapped to a full degree histogram,
     a 100-bin local-clustering histogram on `[0,1]`, or a 200-bin normalized-
     Laplacian spectral histogram on `[-1e-5,2]`. Histograms are normalized by
