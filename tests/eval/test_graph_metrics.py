@@ -250,45 +250,52 @@ class TestBootstrapMmd:
     def test_shape_and_identical_graph_ratio(self) -> None:
         g_ref, buckets = _seeded_er_graph_and_buckets()
         result = bootstrap_mmd(g_ref.copy(), g_ref, buckets, MMDConfig(), seed=11, n_boot=20)
-        assert set(result) == set(buckets)
-        for size in buckets:
-            for stat in STATISTICS:
-                mean, std = result[size][stat]
-                assert isinstance(mean, float)
-                assert isinstance(std, float)
-                assert mean == pytest.approx(0.0, abs=1e-9)
-                assert std == pytest.approx(0.0, abs=1e-9)
+        assert set(result) == set(STATISTICS)
+        for stat in STATISTICS:
+            mean, std = result[stat]
+            assert isinstance(mean, float)
+            assert isinstance(std, float)
+            assert mean == pytest.approx(0.0, abs=1e-9)
+            assert std == pytest.approx(0.0, abs=1e-9)
 
-    def test_replays_nonzero_normalized_ratio_with_fixed_rng(self) -> None:
+    def test_replays_ratio_of_size_means_with_fixed_rng(self) -> None:
         g_ref, buckets = _seeded_er_graph_and_buckets(seed=17)
-        buckets = {10: buckets[10]}
         g_pred = g_ref.copy()
         g_pred.remove_edges_from(list(g_pred.edges())[::3])
         seed = 29
         n_boot = 7
         result = bootstrap_mmd(g_pred, g_ref, buckets, MMDConfig(), seed=seed, n_boot=n_boot)
 
-        nodes = buckets[10]
-        pred_histograms = [degree_histogram(g_pred.subgraph(sample)) for sample in nodes]
-        ref_histograms = [degree_histogram(g_ref.subgraph(sample)) for sample in nodes]
+        histograms = {
+            size: (
+                [degree_histogram(g_pred.subgraph(sample)) for sample in node_sets],
+                [degree_histogram(g_ref.subgraph(sample)) for sample in node_sets],
+            )
+            for size, node_sets in buckets.items()
+        }
         rng = np.random.default_rng(seed)
         ratios: list[float] = []
-        denominators: list[float] = []
-        raw_values: list[float] = []
+        per_size_denominators: dict[int, list[float]] = {size: [] for size in buckets}
         for _ in range(n_boot):
-            indices = rng.integers(0, len(nodes), size=len(nodes))
-            pred_samples = [pred_histograms[i] for i in indices]
-            ref_samples = [ref_histograms[i] for i in indices]
-            raw = _manual_mmd(pred_samples, ref_samples)
-            denominator = _manual_mmd(ref_samples[::2], ref_samples[1::2])
-            raw_values.append(raw)
-            denominators.append(denominator)
-            ratios.append(raw / max(denominator, 1e-12))
+            raw_by_size: list[float] = []
+            reference_by_size: list[float] = []
+            for size, node_sets in buckets.items():
+                indices = rng.integers(0, len(node_sets), size=len(node_sets))
+                pred_histograms, ref_histograms = histograms[size]
+                pred_samples = [pred_histograms[i] for i in indices]
+                ref_samples = [ref_histograms[i] for i in indices]
+                raw_by_size.append(_manual_mmd(pred_samples, ref_samples))
+                denominator = _manual_mmd(ref_samples[::2], ref_samples[1::2])
+                reference_by_size.append(denominator)
+                per_size_denominators[size].append(denominator)
+            ratios.append(
+                float(np.mean(raw_by_size)) / max(float(np.mean(reference_by_size)), 1e-12)
+            )
 
-        assert all(value > 0.0 for value in raw_values)
-        assert all(value > 0.0 for value in denominators)
-        assert all(value != pytest.approx(1.0) for value in denominators)
-        assert result[10]["degree"] == pytest.approx(
+        denominator_means = [float(np.mean(values)) for values in per_size_denominators.values()]
+        assert all(value > 0.0 for value in denominator_means)
+        assert denominator_means[0] != pytest.approx(denominator_means[1])
+        assert result["degree"] == pytest.approx(
             (float(np.mean(ratios)), float(np.std(ratios))), abs=1e-15
         )
 

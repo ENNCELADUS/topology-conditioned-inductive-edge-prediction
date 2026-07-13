@@ -1082,12 +1082,13 @@ def test_pipeline_exposes_only_normalized_mmd_schema(tmp_path: Path) -> None:
     buckets = _small_buckets(_NODES, size=5, n_samples=4, seed=12)
     data_root = _write_benchmark(tmp_path, "toy", g, buckets)
     universe_path = _reference_universe_path(tmp_path)
+    output_dir = tmp_path / "out"
     payload = g1.run_g1_pipeline(
         universe_path=universe_path,
         alt_universe_path=None,
         data_root=data_root,
         strategy="toy",
-        output_dir=tmp_path / "out",
+        output_dir=output_dir,
         seed=0,
         skip_perturbation_check=True,
     )
@@ -1102,6 +1103,13 @@ def test_pipeline_exposes_only_normalized_mmd_schema(tmp_path: Path) -> None:
         assert set(_d(threshold_row["mmd_ratio"])) == set(STATISTICS)
         assert "mmd2" not in threshold_row
     metadata = _d(payload["metadata"])
+    assert "tau" not in payload
+    assert "scales" not in _d(metadata["composite"])
+    written_payload = cast(
+        dict[str, object], json.loads((output_dir / "g1_results.json").read_text())
+    )
+    assert "tau" not in written_payload
+    assert "scales" not in _d(_d(written_payload["metadata"])["composite"])
     assert metadata["metric_normalization"] == "ratio_of_size_mean_mmd2"
     assert metadata["reference_split"] == "artifact_order_even_vs_odd_within_each_node_size"
     assert metadata["canonical_metric"] == "mmd_ratio"
@@ -1161,10 +1169,8 @@ def test_assembled_bootstrap_fields_aggregate_mmd_ratios(
         stat: (float(index + 1), float(index + 1) / 10) for index, stat in enumerate(STATISTICS)
     }
 
-    def _fake_bootstrap_mmd(
-        *args: object, **kwargs: object
-    ) -> dict[int, dict[str, tuple[float, float]]]:
-        return {5: ratio_summary}
+    def _fake_bootstrap_mmd(*args: object, **kwargs: object) -> dict[str, tuple[float, float]]:
+        return ratio_summary
 
     monkeypatch.setattr(g1, "bootstrap_mmd", _fake_bootstrap_mmd)
     g_ref = _make_reference_graph()

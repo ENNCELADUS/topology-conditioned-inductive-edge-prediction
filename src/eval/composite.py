@@ -25,39 +25,27 @@ def _default_weights() -> Mapping[str, float]:
     return MappingProxyType({"degree": 1 / 3, "clustering": 1 / 3, "spectral": 1 / 3})
 
 
-def _default_scales() -> Mapping[str, float]:
-    return MappingProxyType({"degree": 1.0, "clustering": 1.0, "spectral": 1.0})
-
-
 @dataclass(frozen=True)
 class CompositeDefinition:
-    """Disclosed weights and an ignored legacy compatibility field for the composite.
+    """Disclosed weights for the composite.
 
     Attributes:
         statistics: The MMD statistics combined into the composite.
         weights: Statistic -> weight `w_k`; must sum to 1 over `statistics`.
-        scales: Ignored legacy compatibility field retained during the ratio
-            migration; values must remain positive but do not affect the composite.
 
     Raises:
         ValueError: If the weights (restricted to `statistics`) do not sum to 1
-            (within `1e-6`), or if any scale is not strictly positive.
+            (within `1e-6`).
     """
 
     statistics: tuple[str, ...] = ("degree", "clustering", "spectral")
     weights: Mapping[str, float] = field(default_factory=_default_weights)
-    scales: Mapping[str, float] = field(default_factory=_default_scales)
 
     def __post_init__(self) -> None:
-        """Validate that weights sum to 1 and all scales are strictly positive."""
+        """Validate that weights sum to 1."""
         total = sum(self.weights[k] for k in self.statistics)
         if abs(total - 1.0) > 1e-6:
             raise ValueError(f"CompositeDefinition weights must sum to 1, got {total}")
-        for k in self.statistics:
-            if self.scales[k] <= 0:
-                raise ValueError(
-                    f"CompositeDefinition scale for {k!r} must be > 0, got {self.scales[k]}"
-                )
 
 
 def graph_similarity(
@@ -176,8 +164,8 @@ def perturbation_check(
         buckets: Bucket size -> list of node sets, passed through to
             `evaluate_assembled_graph`.
         config: Shared MMD/descriptor configuration.
-        definition: Composite weights plus an ignored legacy compatibility field;
-            no second calibration is applied to the already normalized MMD ratios.
+        definition: Composite weights; no second calibration is applied to the
+            already normalized MMD ratios.
         fractions: Perturbation fractions to evaluate, in increasing order.
         n_trials: Number of independent perturbation trials averaged per fraction.
         seed: Seed for the perturbation RNG.

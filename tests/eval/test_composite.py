@@ -17,14 +17,11 @@ class TestCompositeDefinition:
         definition = CompositeDefinition()
         assert definition.statistics == ("degree", "clustering", "spectral")
         assert sum(definition.weights.values()) == pytest.approx(1.0)
+        assert not hasattr(definition, "scales")
 
     def test_weights_not_summing_to_one_raises(self) -> None:
         with pytest.raises(ValueError, match="weight"):
             CompositeDefinition(weights={"degree": 0.5, "clustering": 0.5, "spectral": 0.5})
-
-    def test_non_positive_scale_raises(self) -> None:
-        with pytest.raises(ValueError, match="scale"):
-            CompositeDefinition(scales={"degree": 0.0, "clustering": 1.0, "spectral": 1.0})
 
 
 @pytest.mark.unit
@@ -37,7 +34,6 @@ class TestGraphSimilarity:
     def test_hand_computed_value(self) -> None:
         definition = CompositeDefinition(
             weights={"degree": 1 / 3, "clustering": 1 / 3, "spectral": 1 / 3},
-            scales={"degree": 0.1, "clustering": 10.0, "spectral": 100.0},
         )
         mmd_ratio = {"degree": 0.1, "clustering": 0.2, "spectral": 0.3}
         # exp(-(0.1+0.2+0.3)/3) = exp(-0.2)

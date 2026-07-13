@@ -212,25 +212,39 @@ def bootstrap_mmd(
     *,
     seed: int,
     n_boot: int = 200,
-) -> dict[int, dict[str, tuple[float, float]]]:
-    """Bootstrap per-bucket normalized MMD ratios as ``(mean, std)`` pairs."""
+) -> dict[str, tuple[float, float]]:
+    """Bootstrap aggregate normalized MMD ratios as ``(mean, std)`` pairs.
+
+    Each replicate resamples within every size bucket, averages raw and reference
+    MMD2 separately across sizes, and only then forms their ratio.
+    """
     rng = np.random.default_rng(seed)
-    result: dict[int, dict[str, tuple[float, float]]] = {}
+    pred_by_size: dict[int, list[dict[str, np.ndarray]]] = {}
+    ref_by_size: dict[int, list[dict[str, np.ndarray]]] = {}
     for size, node_sets in buckets.items():
         if len(node_sets) < 2:
             raise ValueError(f"bucket {size} requires at least two reference samples")
-        pred = [_descriptors(_induced_subgraph(g_pred, nodes)) for nodes in node_sets]
-        ref = [_descriptors(_induced_subgraph(g_ref, nodes)) for nodes in node_sets]
-        values: dict[str, list[float]] = {stat: [] for stat in STATISTICS}
-        for _ in range(n_boot):
+        pred_by_size[size] = [_descriptors(_induced_subgraph(g_pred, nodes)) for nodes in node_sets]
+        ref_by_size[size] = [_descriptors(_induced_subgraph(g_ref, nodes)) for nodes in node_sets]
+
+    values: dict[str, list[float]] = {stat: [] for stat in STATISTICS}
+    for _ in range(n_boot):
+        raw_by_stat: dict[str, list[float]] = {stat: [] for stat in STATISTICS}
+        reference_by_stat: dict[str, list[float]] = {stat: [] for stat in STATISTICS}
+        for size, node_sets in buckets.items():
             indices = rng.integers(0, len(node_sets), size=len(node_sets))
             for stat in STATISTICS:
-                pred_samples = [pred[i][stat] for i in indices]
-                ref_samples = [ref[i][stat] for i in indices]
-                raw = mmd_squared(pred_samples, ref_samples, config)
-                denominator = mmd_squared(ref_samples[::2], ref_samples[1::2], config)
-                values[stat].append(raw / max(denominator, config.reference_epsilon))
-        result[size] = {
-            stat: (float(np.mean(values[stat])), float(np.std(values[stat]))) for stat in STATISTICS
-        }
-    return result
+                pred_samples = [pred_by_size[size][i][stat] for i in indices]
+                ref_samples = [ref_by_size[size][i][stat] for i in indices]
+                raw_by_stat[stat].append(mmd_squared(pred_samples, ref_samples, config))
+                reference_by_stat[stat].append(
+                    mmd_squared(ref_samples[::2], ref_samples[1::2], config)
+                )
+        for stat in STATISTICS:
+            raw_mean = float(np.mean(raw_by_stat[stat]))
+            reference_mean = float(np.mean(reference_by_stat[stat]))
+            values[stat].append(raw_mean / max(reference_mean, config.reference_epsilon))
+
+    return {
+        stat: (float(np.mean(values[stat])), float(np.std(values[stat]))) for stat in STATISTICS
+    }

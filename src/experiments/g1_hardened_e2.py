@@ -859,9 +859,9 @@ class AssembledRow:
         self_loops_pred: Self-loop count in the assembled graph.
         self_loops_ref: Self-loop count in the reference graph.
         bootstrap_mean: Statistic -> mean normalized MMD ratio over bootstrap resamples
-            (averaged across bucket sizes).
+            after aggregating raw/reference MMD2 across bucket sizes.
         bootstrap_std: Statistic -> std of normalized MMD ratio over bootstrap
-            resamples (averaged across bucket sizes).
+            resamples after aggregating raw/reference MMD2 across bucket sizes.
         composite: The composite similarity score, or ``None`` if the
             perturbation check has not passed (or was skipped).
     """
@@ -908,12 +908,8 @@ def assemble_and_evaluate(
     """
     report = evaluate_assembled_graph(g_pred, g_ref, buckets, config)
     boot = bootstrap_mmd(g_pred, g_ref, buckets, config, seed=seed)
-    bootstrap_mean = {
-        stat: float(np.mean([boot[size][stat][0] for size in boot])) for stat in STATISTICS
-    }
-    bootstrap_std = {
-        stat: float(np.mean([boot[size][stat][1] for size in boot])) for stat in STATISTICS
-    }
+    bootstrap_mean = {stat: boot[stat][0] for stat in STATISTICS}
+    bootstrap_std = {stat: boot[stat][1] for stat in STATISTICS}
     composite = graph_similarity(report.mmd_ratio, definition) if composite_valid else None
     return AssembledRow(
         threshold=threshold,
@@ -993,8 +989,6 @@ class G1Result:
             benchmark strategy, MMD/composite config, normalization and construction
             rules, seeds, and the two orchestrator-adjudication notes).
         noise_floor: Bucket size -> statistic -> mean noise-floor MMD^2.
-        tau: Unit-valued compatibility field; MMD ratios receive no second
-            calibration.
         threshold_sweep: Operating point plus the sweep grid rows.
         regime_table: Scorer key (``"b0"``, optionally ``"b0_alt"``, ``"pa_null"``)
             -> regime edge-metric table.
@@ -1008,7 +1002,6 @@ class G1Result:
 
     metadata: dict[str, object]
     noise_floor: dict[int, dict[str, float]]
-    tau: dict[str, float]
     threshold_sweep: dict[str, object]
     regime_table: dict[str, object]
     assembled: dict[str, object]
@@ -1021,7 +1014,6 @@ class G1Result:
         return {
             "metadata": self.metadata,
             "noise_floor": {str(size): dict(stats) for size, stats in self.noise_floor.items()},
-            "tau": dict(self.tau),
             "threshold_sweep": self.threshold_sweep,
             "regime_table": self.regime_table,
             "assembled": self.assembled,
@@ -1217,8 +1209,7 @@ def run_g1_pipeline(
 
     logger.info("computing real-vs-real noise floor (seed=%d)", seed)
     nf = noise_floor(g_ref, buckets, config)
-    tau = dict.fromkeys(STATISTICS, 1.0)
-    definition = CompositeDefinition(scales=tau)
+    definition = CompositeDefinition()
 
     perturbation_meta: dict[str, object]
     composite_valid: bool
@@ -1400,7 +1391,6 @@ def run_g1_pipeline(
         "component_disclosure": ["raw_mmd2", "reference_mmd2", "mmd_ratio"],
         "composite": {
             "weights": dict(definition.weights),
-            "scales": dict(definition.scales),
             "calibration_rule": (
                 "no second calibration: MMD ratios are already reference-normalized"
             ),
@@ -1459,7 +1449,6 @@ def run_g1_pipeline(
     result = G1Result(
         metadata=metadata,
         noise_floor=nf,
-        tau=tau,
         threshold_sweep={
             "operating_point": op_threshold,
             "target_edges": target_edges,
