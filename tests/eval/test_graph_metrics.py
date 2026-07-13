@@ -22,151 +22,42 @@ from src.eval.graph_metrics import (
 
 
 @pytest.mark.unit
-class TestDegreeHistogram:
-    def test_triangle_k3(self) -> None:
-        g = nx.complete_graph(3)  # all degree 2
-        hist = degree_histogram(g, max_degree=5)
-        expected = np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
-        assert hist.shape == (6,)
-        np.testing.assert_allclose(hist, expected)
+class TestOfficialMmdSquared:
+    def test_singleton_total_variation_formula(self) -> None:
+        a = [np.array([1.0, 0.0])]
+        b = [np.array([0.0, 1.0])]
+        normalized_tv = 1.0 / (1.0 + 1e-6)
+        expected = 2.0 - 2.0 * np.exp(-(normalized_tv**2) / 2.0)
+        assert mmd_squared(a, b, MMDConfig()) == pytest.approx(expected)
 
-    def test_star_graph(self) -> None:
-        g = nx.star_graph(4)  # center degree 4, four leaves degree 1
-        hist = degree_histogram(g, max_degree=5)
-        # 4 nodes at degree 1, 1 node at degree 4, out of 5 total
-        expected = np.array([0.0, 0.8, 0.0, 0.0, 0.2, 0.0])
-        np.testing.assert_allclose(hist, expected)
+    def test_identical_sets_are_zero(self) -> None:
+        samples = [np.array([3.0, 1.0]), np.array([1.0, 3.0])]
+        assert mmd_squared(samples, samples, MMDConfig()) == pytest.approx(0.0, abs=1e-12)
 
-    def test_path_graph(self) -> None:
-        g = nx.path_graph(4)  # degrees [1,2,2,1]
-        hist = degree_histogram(g, max_degree=5)
-        expected = np.array([0.0, 0.5, 0.5, 0.0, 0.0, 0.0])
-        np.testing.assert_allclose(hist, expected)
-
-    def test_degree_clipped_at_max(self) -> None:
-        g = nx.star_graph(10)  # center degree 10
-        hist = degree_histogram(g, max_degree=3)
-        assert hist.shape == (4,)
-        # center's degree 10 clips into bin 3; 10 leaves at degree 1
-        expected = np.array([0.0, 10.0 / 11.0, 0.0, 1.0 / 11.0])
-        np.testing.assert_allclose(hist, expected)
-
-    def test_empty_graph_returns_zero_vector(self) -> None:
-        g = nx.Graph()
-        hist = degree_histogram(g, max_degree=5)
-        np.testing.assert_allclose(hist, np.zeros(6))
+    def test_histograms_are_normalized_inside_mmd(self) -> None:
+        a = [np.array([3.0, 1.0]), np.array([1.0, 3.0])]
+        b = [np.array([6.0, 2.0]), np.array([2.0, 6.0])]
+        assert mmd_squared(a, b, MMDConfig()) == pytest.approx(0.0, abs=1e-12)
 
 
 @pytest.mark.unit
-class TestClusteringHistogram:
-    def test_triangle_all_closed(self) -> None:
-        g = nx.complete_graph(3)  # all clustering coefficients = 1.0
-        hist = clustering_histogram(g, bins=4)
-        expected = np.array([0.0, 0.0, 0.0, 1.0])
-        np.testing.assert_allclose(hist, expected)
+class TestOfficialDescriptors:
+    def test_degree_histogram_keeps_full_support(self) -> None:
+        hist = degree_histogram(nx.star_graph(70))
+        assert hist.shape == (71,)
+        assert hist[1] == 70
+        assert hist[70] == 1
 
-    def test_path_no_triangles(self) -> None:
-        g = nx.path_graph(4)  # all clustering coefficients = 0.0
-        hist = clustering_histogram(g, bins=4)
-        expected = np.array([1.0, 0.0, 0.0, 0.0])
-        np.testing.assert_allclose(hist, expected)
+    def test_clustering_uses_one_hundred_bins(self) -> None:
+        hist = clustering_histogram(nx.complete_graph(3))
+        assert hist.shape == (100,)
+        assert hist[-1] == 3
 
-    def test_empty_graph_returns_zero_vector(self) -> None:
-        g = nx.Graph()
-        hist = clustering_histogram(g, bins=4)
-        np.testing.assert_allclose(hist, np.zeros(4))
-
-
-@pytest.mark.unit
-class TestLaplacianSpectrumHistogram:
-    def test_triangle_k3(self) -> None:
-        # K3 normalized Laplacian eigenvalues: 0, 3/2, 3/2 (classical: 0 and n/(n-1)).
-        g = nx.complete_graph(3)
-        hist = laplacian_spectrum_histogram(g, bins=4)
-        # bins over [0,2]: [0,0.5),[0.5,1.0),[1.0,1.5),[1.5,2.0] -> 0 in bin0, both 1.5s in bin2
-        # (floating point normalized-Laplacian eigenvalues land fractionally below 1.5).
-        expected = np.array([1.0 / 3.0, 0.0, 2.0 / 3.0, 0.0])
-        np.testing.assert_allclose(hist, expected, atol=1e-9)
-
-    def test_star_graph(self) -> None:
-        # K_{1,4} normalized Laplacian eigenvalues: 0, 1, 1, 1, 2 (classical star spectrum).
-        g = nx.star_graph(4)
-        hist = laplacian_spectrum_histogram(g, bins=4)
-        expected = np.array([1.0 / 5.0, 0.0, 3.0 / 5.0, 1.0 / 5.0])
-        np.testing.assert_allclose(hist, expected, atol=1e-9)
-
-    def test_no_nodes_all_mass_in_bin_zero(self) -> None:
-        g = nx.Graph()
-        hist = laplacian_spectrum_histogram(g, bins=10)
-        expected = np.zeros(10)
-        expected[0] = 1.0
-        np.testing.assert_allclose(hist, expected)
-
-    def test_no_edges_all_mass_in_bin_zero(self) -> None:
-        g = nx.Graph()
-        g.add_nodes_from(["a", "b", "c"])
-        hist = laplacian_spectrum_histogram(g, bins=10)
-        expected = np.zeros(10)
-        expected[0] = 1.0
-        np.testing.assert_allclose(hist, expected)
-
-    def test_l1_normalized(self) -> None:
-        g = nx.erdos_renyi_graph(15, 0.3, seed=3)
-        hist = laplacian_spectrum_histogram(g, bins=20)
-        assert hist.sum() == pytest.approx(1.0)
-
-
-def _random_descriptor_population(
-    rng: np.random.Generator, n: int, dim: int, center: np.ndarray, noise: float
-) -> list[np.ndarray]:
-    """Build a list of `n` descriptor-like vectors clustered around `center`."""
-    raw = center[None, :] + rng.normal(scale=noise, size=(n, dim))
-    raw = np.clip(raw, 0.0, None)
-    raw = raw / raw.sum(axis=1, keepdims=True)
-    return list(raw)
-
-
-@pytest.mark.unit
-class TestMmdSquared:
-    def test_identical_sets_near_zero(self) -> None:
-        rng = np.random.default_rng(0)
-        a = _random_descriptor_population(rng, 10, 6, np.array([1, 2, 3, 2, 1, 0.5]), 0.1)
-        b = [row.copy() for row in a]
-        config = MMDConfig()
-        result = mmd_squared(a, b, config)
-        assert result.canonical == pytest.approx(0.0, abs=1e-12)
-        for v in result.by_scale.values():
-            assert v == pytest.approx(0.0, abs=1e-12)
-
-    def test_different_populations_exceed_ten_times_same_population_baseline(self) -> None:
-        rng = np.random.default_rng(1)
-        center_a = np.array([5.0, 1.0, 0.5, 0.2, 0.1, 0.1])
-        center_b = np.array([0.1, 0.1, 0.2, 0.5, 1.0, 5.0])
-        a1 = _random_descriptor_population(rng, 30, 6, center_a, 0.05)
-        a2 = _random_descriptor_population(rng, 30, 6, center_a, 0.05)
-        b = _random_descriptor_population(rng, 30, 6, center_b, 0.05)
-        config = MMDConfig()
-        baseline = mmd_squared(a1, a2, config).canonical
-        cross = mmd_squared(a1, b, config).canonical
-        assert baseline >= 0.0
-        assert cross > 10 * max(baseline, 1e-12)
-
-    def test_median_zero_guard(self) -> None:
-        # All vectors identical across a and b -> all pairwise distances 0 -> guard to 1.0.
-        a = [np.array([1.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0])]
-        b = [np.array([1.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0])]
-        config = MMDConfig()
-        result = mmd_squared(a, b, config)
-        assert result.median_bandwidth == pytest.approx(1.0)
-        assert result.canonical == pytest.approx(0.0, abs=1e-12)
-
-    def test_canonical_matches_scale_one(self) -> None:
-        rng = np.random.default_rng(2)
-        a = _random_descriptor_population(rng, 8, 4, np.array([1, 1, 1, 1]), 0.2)
-        b = _random_descriptor_population(rng, 8, 4, np.array([2, 1, 0.5, 0.2]), 0.2)
-        config = MMDConfig(bandwidth_scales=(1.0, 2.0))
-        result = mmd_squared(a, b, config)
-        assert result.canonical == pytest.approx(result.by_scale[1.0])
+    def test_spectral_uses_two_hundred_raw_count_bins(self) -> None:
+        graph = nx.path_graph(5)
+        hist = laplacian_spectrum_histogram(graph)
+        assert hist.shape == (200,)
+        assert hist.sum() == pytest.approx(graph.number_of_nodes())
 
 
 def _seeded_er_graph_and_buckets(
@@ -185,14 +76,31 @@ def _seeded_er_graph_and_buckets(
 
 
 @pytest.mark.unit
+def test_bucket_report_uses_ratio_of_aggregate_means() -> None:
+    g_ref, buckets = _seeded_er_graph_and_buckets()
+    g_pred = nx.Graph()
+    g_pred.add_nodes_from(g_ref.nodes())
+    report = evaluate_assembled_graph(g_pred, g_ref, buckets, MMDConfig())
+
+    for stat in STATISTICS:
+        raw_mean = float(np.mean([report.per_size_raw_mmd2[size][stat] for size in buckets]))
+        ref_mean = float(
+            np.mean([report.per_size_reference_mmd2[size][stat] for size in buckets])
+        )
+        assert report.raw_mmd2[stat] == pytest.approx(raw_mean)
+        assert report.reference_mmd2[stat] == pytest.approx(ref_mean)
+        assert report.mmd_ratio[stat] == pytest.approx(raw_mean / max(ref_mean, 1e-12))
+
+
+@pytest.mark.unit
 class TestEvaluateAssembledGraph:
     def test_identical_graphs_give_zero_mmd_and_unit_density(self) -> None:
         g_ref, buckets = _seeded_er_graph_and_buckets()
-        g_pred = g_ref.copy()
-        config = MMDConfig()
-        report = evaluate_assembled_graph(g_pred, g_ref, buckets, config)
+        report = evaluate_assembled_graph(g_ref.copy(), g_ref, buckets, MMDConfig())
         for stat in STATISTICS:
-            assert report.aggregate[stat] == pytest.approx(0.0, abs=1e-9)
+            assert report.raw_mmd2[stat] == pytest.approx(0.0, abs=1e-9)
+            assert report.mmd_ratio[stat] == pytest.approx(0.0, abs=1e-9)
+            assert report.reference_mmd2[stat] > 0.0
         assert report.relative_density == pytest.approx(1.0)
         assert report.self_loops_pred == 0
         assert report.self_loops_ref == 0
@@ -200,47 +108,46 @@ class TestEvaluateAssembledGraph:
     def test_self_loops_reported_separately_and_stripped_from_topology(self) -> None:
         g_ref, buckets = _seeded_er_graph_and_buckets()
         g_pred = g_ref.copy()
-        # Add self-loops to g_pred; they must not affect topology metrics, only the count.
         first_node = next(iter(g_pred.nodes()))
         g_pred.add_edge(first_node, first_node)
-        config = MMDConfig()
-        report = evaluate_assembled_graph(g_pred, g_ref, buckets, config)
+        report = evaluate_assembled_graph(g_pred, g_ref, buckets, MMDConfig())
         assert report.self_loops_pred == 1
         assert report.self_loops_ref == 0
         assert report.relative_density == pytest.approx(1.0)
+        for stat in STATISTICS:
+            assert report.raw_mmd2[stat] == pytest.approx(0.0, abs=1e-9)
 
     def test_per_size_keys_match_buckets(self) -> None:
         g_ref, buckets = _seeded_er_graph_and_buckets()
-        g_pred = g_ref.copy()
-        config = MMDConfig()
-        report = evaluate_assembled_graph(g_pred, g_ref, buckets, config)
-        assert set(report.per_size.keys()) == set(buckets.keys())
+        report = evaluate_assembled_graph(g_ref.copy(), g_ref, buckets, MMDConfig())
+        assert set(report.per_size_raw_mmd2) == set(buckets)
+        assert set(report.per_size_reference_mmd2) == set(buckets)
         for size in buckets:
-            assert set(report.per_size[size].keys()) == set(STATISTICS)
+            assert set(report.per_size_raw_mmd2[size]) == set(STATISTICS)
+            assert set(report.per_size_reference_mmd2[size]) == set(STATISTICS)
+
+    def test_bucket_requires_two_reference_samples(self) -> None:
+        graph = nx.path_graph(["a", "b", "c"])
+        with pytest.raises(ValueError, match="requires at least two reference samples"):
+            evaluate_assembled_graph(graph, graph, {3: [{"a", "b", "c"}]}, MMDConfig())
 
 
 @pytest.mark.unit
 class TestNoiseFloor:
-    def test_floor_is_small_but_nonzero(self) -> None:
+    def test_matches_evaluator_reference_denominator(self) -> None:
         g_ref, buckets = _seeded_er_graph_and_buckets()
         config = MMDConfig()
-        floor = noise_floor(g_ref, buckets, config, seed=7, n_splits=5)
-        assert set(floor.keys()) == set(buckets.keys())
-        for size in buckets:
-            for stat in STATISTICS:
-                value = floor[size][stat]
-                assert value >= 0.0
-                assert value < 0.5  # small relative to a clearly-different-population MMD
+        floor = noise_floor(g_ref, buckets, config)
+        report = evaluate_assembled_graph(g_ref.copy(), g_ref, buckets, config)
+        assert floor == report.per_size_reference_mmd2
 
 
 @pytest.mark.unit
 class TestBootstrapMmd:
-    def test_shape_and_type(self) -> None:
+    def test_shape_and_identical_graph_ratio(self) -> None:
         g_ref, buckets = _seeded_er_graph_and_buckets()
-        g_pred = g_ref.copy()
-        config = MMDConfig()
-        result = bootstrap_mmd(g_pred, g_ref, buckets, config, seed=11, n_boot=20)
-        assert set(result.keys()) == set(buckets.keys())
+        result = bootstrap_mmd(g_ref.copy(), g_ref, buckets, MMDConfig(), seed=11, n_boot=20)
+        assert set(result) == set(buckets)
         for size in buckets:
             for stat in STATISTICS:
                 mean, std = result[size][stat]
@@ -262,25 +169,14 @@ g_pred.remove_edges_from(list(g_pred.edges())[::7])
 rng = np.random.default_rng(7)
 nodes = list(g_ref.nodes())
 buckets = {30: [set(rng.choice(nodes, size=30, replace=False).tolist()) for _ in range(6)]}
-config = MMDConfig(degree_max=10, clustering_bins=20, spectral_bins=20)
-report = evaluate_assembled_graph(g_pred, g_ref, buckets, config)
+report = evaluate_assembled_graph(g_pred, g_ref, buckets, MMDConfig())
 for stat in ("degree", "clustering", "spectral"):
-    print(f"{stat}={report.aggregate[stat]:.17g}")
+    print(f"{stat}={report.raw_mmd2[stat]:.17g}")
 """
 
 
 @pytest.mark.unit
 class TestHashSeedDeterminism:
-    """Evaluation numbers must be bit-reproducible across Python hash randomization.
-
-    Bucket node sets are Python sets, whose iteration order varies with
-    PYTHONHASHSEED between processes. networkx subgraph views iterate the filter
-    node set when it is much smaller than the graph, which permutes the Laplacian
-    nodelist; eigenvalues then shift by ~1e-15 and can flip histogram bins when an
-    eigenvalue sits exactly on a bin edge (e.g. 1.0). The evaluation layer must
-    canonicalize node order so reported metrics do not depend on the hash seed.
-    """
-
     def test_evaluate_assembled_graph_identical_across_hash_seeds(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
         outputs = []
