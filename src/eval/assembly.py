@@ -4,7 +4,7 @@ No dependence on `src.data` or `torch` — operates on plain pair lists, numpy
 probability arrays, and `networkx.Graph`.
 """
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 import networkx as nx
@@ -94,6 +94,119 @@ def density_matched_threshold(probs: np.ndarray, target_edges: int) -> float:
     if chosen is None:
         return float(np.nextafter(np.max(probs), np.inf))
     return chosen
+
+
+def rank_matched_degree_quotas(
+    expected_degree: Mapping[str, float],
+    reference_degrees: Sequence[int],
+) -> dict[str, int]:
+    """Assign per-node degree quotas by rank-matching onto a reference multiset.
+
+    The ``B0+cal`` degree-sequence-matched assembly convention (protocol Sec 2,
+    pinned 2026-07-14): nodes are ranked by calibrated expected degree
+    (descending, ties by ascending node id for determinism) and assigned the
+    reference degree multiset sorted descending, rank for rank. Only the
+    reference degree **multiset** is granted to the baseline — the same
+    operating-point disclosure class as the density-matched edge-count quota;
+    no node-identity degree is leaked.
+
+    Args:
+        expected_degree: Node id -> calibrated expected degree
+            (``sum_v p_cal(u, v)`` over non-self universe rows).
+        reference_degrees: The reference graph's degree multiset (any order);
+            must have exactly one entry per node in `expected_degree`.
+
+    Returns:
+        Node id -> integer degree quota.
+
+    Raises:
+        ValueError: If the multiset size does not match the node count.
+    """
+    if len(reference_degrees) != len(expected_degree):
+        raise ValueError(
+            f"reference degree multiset has {len(reference_degrees)} entries "
+            f"for {len(expected_degree)} nodes"
+        )
+    nodes_ranked = sorted(expected_degree, key=lambda node: (-expected_degree[node], node))
+    degrees_ranked = sorted((int(d) for d in reference_degrees), reverse=True)
+    return dict(zip(nodes_ranked, degrees_ranked, strict=True))
+
+
+@dataclass(frozen=True)
+class QuotaAssemblyStats:
+    """Bookkeeping for one degree-quota assembly pass.
+
+    Attributes:
+        realized_edges: Number of edges the greedy pass accepted.
+        target_edges: ``floor(sum(quotas) / 2)`` — the edge count a perfect
+            quota-respecting assembly would realize.
+        shortfall: ``target_edges - realized_edges``. Greedy acceptance with no
+            back-fill can strand residual quota; the shortfall is disclosed,
+            never silently patched.
+        residual_quota: Total unconsumed quota units across all nodes.
+    """
+
+    realized_edges: int
+    target_edges: int
+    shortfall: int
+    residual_quota: int
+
+
+def assemble_degree_quota(
+    pairs: Sequence[tuple[str, str]],
+    u_idx: np.ndarray,
+    v_idx: np.ndarray,
+    scores: np.ndarray,
+    quotas: Mapping[str, int],
+    nodes: Iterable[str],
+) -> tuple[nx.Graph, QuotaAssemblyStats]:
+    """Assemble a graph greedily under per-node degree quotas.
+
+    One descending-score pass over the candidate rows (ties broken by ascending
+    canonical pair order — the G1 ``assemble_top_n_by_score`` convention): a pair
+    ``(u, v)`` is accepted iff both endpoints have residual quota, consuming one
+    unit from each. No back-fill pass; the shortfall is disclosed via
+    `QuotaAssemblyStats`. Callers pass non-self rows only — self-pairs follow the
+    density-threshold convention outside the quota system.
+
+    Args:
+        pairs: Node pairs in row order (no self-pairs).
+        u_idx: Row-aligned node-index array (tie-breaking).
+        v_idx: Row-aligned node-index array (tie-breaking).
+        scores: Row-aligned scores; higher is more edge-like.
+        quotas: Node id -> degree quota (from `rank_matched_degree_quotas`).
+        nodes: Full node universe for the returned graph.
+
+    Returns:
+        ``(graph, stats)``.
+
+    Raises:
+        ValueError: If any row is a self-pair.
+    """
+    if np.any(np.asarray(u_idx) == np.asarray(v_idx)):
+        raise ValueError("assemble_degree_quota expects non-self rows only")
+    g = nx.Graph()
+    g.add_nodes_from(nodes)
+    residual = {node: int(q) for node, q in quotas.items()}
+    target_edges = sum(residual.values()) // 2
+
+    order = np.lexsort((v_idx, u_idx, -np.asarray(scores)))
+    realized = 0
+    for i in order.tolist():
+        u, v = pairs[i]
+        if residual.get(u, 0) > 0 and residual.get(v, 0) > 0:
+            g.add_edge(u, v)
+            residual[u] -= 1
+            residual[v] -= 1
+            realized += 1
+
+    stats = QuotaAssemblyStats(
+        realized_edges=realized,
+        target_edges=target_edges,
+        shortfall=target_edges - realized,
+        residual_quota=sum(residual.values()),
+    )
+    return g, stats
 
 
 @dataclass(frozen=True)

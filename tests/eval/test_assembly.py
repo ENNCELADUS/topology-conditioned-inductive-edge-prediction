@@ -3,7 +3,14 @@
 import networkx as nx
 import numpy as np
 import pytest
-from src.eval.assembly import SweepPoint, assemble_graph, density_matched_threshold, threshold_sweep
+from src.eval.assembly import (
+    SweepPoint,
+    assemble_degree_quota,
+    assemble_graph,
+    density_matched_threshold,
+    rank_matched_degree_quotas,
+    threshold_sweep,
+)
 from src.eval.graph_metrics import STATISTICS, MMDConfig
 
 
@@ -128,3 +135,98 @@ class TestThresholdSweep:
         recalls = [p.recall for p in points]
         assert all(0.0 <= r <= 1.0 for r in recalls)
         assert all(recalls[i] >= recalls[i + 1] - 1e-9 for i in range(len(recalls) - 1))
+
+
+@pytest.mark.unit
+class TestRankMatchedDegreeQuotas:
+    def test_rank_assignment(self) -> None:
+        expected = {"a": 3.0, "b": 2.0, "c": 0.5}
+        quotas = rank_matched_degree_quotas(expected, [2, 1, 2])
+        assert quotas == {"a": 2, "b": 2, "c": 1}
+
+    def test_expected_degree_ties_break_by_node_id(self) -> None:
+        expected = {"b": 1.0, "a": 1.0}
+        quotas = rank_matched_degree_quotas(expected, [3, 1])
+        assert quotas == {"a": 3, "b": 1}
+
+    def test_multiset_size_mismatch_raises(self) -> None:
+        with pytest.raises(ValueError, match="multiset"):
+            rank_matched_degree_quotas({"a": 1.0}, [1, 2])
+
+    def test_quota_sum_equals_reference_degree_sum(self) -> None:
+        rng = np.random.default_rng(0)
+        expected = {f"n{i}": float(rng.uniform(0, 5)) for i in range(10)}
+        reference = [int(d) for d in rng.integers(0, 4, size=10)]
+        quotas = rank_matched_degree_quotas(expected, reference)
+        assert sum(quotas.values()) == sum(reference)
+
+
+@pytest.mark.unit
+class TestAssembleDegreeQuota:
+    def _rows(
+        self, pairs: list[tuple[str, str]], nodes: list[str], scores: list[float]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        position = {node: i for i, node in enumerate(nodes)}
+        u_idx = np.array([position[u] for u, _ in pairs], dtype=np.int32)
+        v_idx = np.array([position[v] for _, v in pairs], dtype=np.int32)
+        return u_idx, v_idx, np.array(scores, dtype=np.float64)
+
+    def test_greedy_respects_quotas(self) -> None:
+        nodes = ["a", "b", "c", "d"]
+        pairs = [("a", "b"), ("a", "c"), ("a", "d"), ("b", "c")]
+        u_idx, v_idx, scores = self._rows(pairs, nodes, [0.9, 0.8, 0.7, 0.6])
+        quotas = {"a": 2, "b": 1, "c": 1, "d": 0}
+        g, stats = assemble_degree_quota(pairs, u_idx, v_idx, scores, quotas, nodes)
+        # (a,b) accepted; (a,c) accepted; (a,d) blocked (a exhausted + d zero);
+        # (b,c) blocked (both exhausted).
+        assert set(map(frozenset, g.edges())) == {frozenset({"a", "b"}), frozenset({"a", "c"})}
+        assert stats.realized_edges == 2
+        assert stats.target_edges == 2
+        assert stats.shortfall == 0
+        assert stats.residual_quota == 0
+
+    def test_shortfall_disclosed_without_backfill(self) -> None:
+        nodes = ["a", "b", "c"]
+        pairs = [("a", "b")]
+        u_idx, v_idx, scores = self._rows(pairs, nodes, [0.9])
+        quotas = {"a": 1, "b": 1, "c": 2}  # c's quota can never be consumed
+        g, stats = assemble_degree_quota(pairs, u_idx, v_idx, scores, quotas, nodes)
+        assert g.number_of_edges() == 1
+        assert stats.target_edges == 2
+        assert stats.shortfall == 1
+        assert stats.residual_quota == 2
+
+    def test_score_ties_break_by_canonical_pair_order(self) -> None:
+        nodes = ["a", "b", "c"]
+        pairs = [("b", "c"), ("a", "b")]
+        u_idx, v_idx, scores = self._rows(pairs, nodes, [0.5, 0.5])
+        quotas = {"a": 1, "b": 1, "c": 1}
+        g, _ = assemble_degree_quota(pairs, u_idx, v_idx, scores, quotas, nodes)
+        # Tie at 0.5: canonical order prefers (a, b); b then exhausted for (b, c).
+        assert set(map(frozenset, g.edges())) == {frozenset({"a", "b"})}
+
+    def test_all_nodes_present_including_isolated(self) -> None:
+        nodes = ["a", "b", "z"]
+        pairs = [("a", "b")]
+        u_idx, v_idx, scores = self._rows(pairs, nodes, [0.9])
+        g, _ = assemble_degree_quota(pairs, u_idx, v_idx, scores, {"a": 1, "b": 1, "z": 0}, nodes)
+        assert set(g.nodes()) == {"a", "b", "z"}
+
+    def test_self_pair_rows_rejected(self) -> None:
+        nodes = ["a", "b"]
+        pairs = [("a", "a")]
+        u_idx, v_idx, scores = self._rows(pairs, nodes, [0.9])
+        with pytest.raises(ValueError, match="non-self"):
+            assemble_degree_quota(pairs, u_idx, v_idx, scores, {"a": 1, "b": 1}, nodes)
+
+    def test_deterministic(self) -> None:
+        rng = np.random.default_rng(0)
+        nodes = [f"n{i}" for i in range(8)]
+        pairs = [(nodes[i], nodes[j]) for i in range(8) for j in range(i + 1, 8)]
+        u_idx, v_idx, _ = self._rows(pairs, nodes, [0.0] * len(pairs))
+        scores = rng.uniform(size=len(pairs))
+        quotas = {node: int(q) for node, q in zip(nodes, rng.integers(0, 4, size=8), strict=True)}
+        g1, s1 = assemble_degree_quota(pairs, u_idx, v_idx, scores, quotas, nodes)
+        g2, s2 = assemble_degree_quota(pairs, u_idx, v_idx, scores.copy(), dict(quotas), nodes)
+        assert set(map(frozenset, g1.edges())) == set(map(frozenset, g2.edges()))
+        assert s1 == s2
