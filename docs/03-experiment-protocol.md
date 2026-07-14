@@ -400,6 +400,15 @@ rule).
 5. **G5 — Staged build.** Stage 1: imagination + degree budget + closure only; Stage 2: +
    codebook + s3; Stage 3: + harmonization + seam loss. Each stage must beat the previous on
    the pre-registered criteria or the added mechanism is cut.
+   **Stage-gate instantiation (2026-07-14, pre-implementation):** the Stage-1 gate
+   comparators are `B0` (frozen candidate-scores artifact) and `B0+cal`; B1/B5 comparison
+   rows are deferred to E3 with their implementations. Stage gates run at spec-default
+   hyperparameters × 3 seeds — the §8-spec 30-config HPO-parity budget applies to the
+   E1/E3 ladder, not to G5 stage gates. Stage-1 acceptance criteria (headroom-weighted:
+   clustering-MMD and BFS-macro GS/RD primary at matched global simple-edge RD;
+   degree-MMD non-regression and matched-AUPRC guards) are pre-registered in
+   `docs/registrations/g5_stage1_preregistration.json` before any held-out metric is
+   opened (rule §5.2.4); the Stage-1 subset itself is pinned in spec §13.
 
 ### 5.1 Priority order (after gates)
 

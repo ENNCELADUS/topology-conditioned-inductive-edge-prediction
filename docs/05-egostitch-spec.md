@@ -463,7 +463,208 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 - 2026-07-14: renamed this file `06-egostitch-spec.md` → `05-egostitch-spec.md` after
   `05-review-report.md` was retired; all references updated across docs, `src/`, and
   `tests/`. Editorial only — no normative content changed.
+- 2026-07-14: added §13 (G5 Stage-1 carve-out) — the frozen sections assume the full
+  model; §13 pins the Stage-1 subset the G5 gate builds first. One line per pin:
+  - §13.1 module subset: Tokenize-lite + Imagine + Hungarian + Stitch (Module 3a) +
+    decision head (s0, s1, s2); Stitch retained because s2 consumes Π.
+  - §13.2 codebook-free conditioning: `e_u` replaces `(z_u, r_u)` in `T_cond`, query
+    init, and the degree-budget head (no codebook exists in Stage 1).
+  - §13.3 Hungarian/Sinkhorn costs drop the code-agreement term; remaining weights
+    uniformly rescaled (×7/6, ×5/4); `deg_bucket` pinned to multiplicity log2 buckets.
+  - §13.4 hub strata: neighbor-code strata → degree-bucket strata (no codes exist).
+  - §13.5 Stage-1 loss tree: drops KL/L_VQ/L_codestats/L_entropy/L_BP/L_joint with
+    their mechanisms; L_real interior weights renormalized; Stage-1 L_gate form pinned.
+  - §13.6 the four ego-stat targets pinned to evaluator implementations, with
+    generated-side estimators (closes the former open item).
+  - §13.7 `proj`/τ_κ/attention-head pins (stop-gradient targets; collapse diagnostic).
+  - §13.8 curriculum adaptation: §8's harmonization phase drops out (20%/80%);
+    fixed-epoch execution with `counterfactual_stop_epoch` per the E2 worker convention.
+  - §13.9 self-pair single-ego path Stage-1 form: Π = I, `s2(u,u)` from Â diagonal.
+  - §13.10 s0 served from a precomputed frozen-B0 logit cache (checkpoint
+    `e092537d8cf1e208`); hard-fail on miss/mismatch; never trained through.
+  - §13.11 two-pass density self-calibration scope: pass-1 scores are the Stage-1
+    scores; ρ̂_eval logged and consumed by the degree-calibration diagnostic.
+  - §13.12 grounding pool pinned: exact top-`n_g` cosine in F0 space, own split side.
+  - §13.13 runtime budget: §11's 60-minute pin is E2/B0-specific; the EgoStitch
+    worker budget is config-driven under the same 4×H20 Accelerate DDP layout.
+  - §13.14 Stage-gate comparators: B0 and `B0+cal` (B1/B5 deferred to E3, protocol
+    edit of the same date); acceptance criteria pre-registered in
+    `docs/registrations/g5_stage1_preregistration.json`.
 
-**Open items before code (not blockers):** the four ego-stat target definitions
-pinned to evaluator implementations; FLOPs/latency table template (§4.7 commitment);
-Benchmark-A/B/C ↔ split-strategy mapping confirmed at G1 (§9.1).
+**Open items before code (not blockers):** FLOPs/latency table template (§4.7
+commitment — delivered with the G5 Stage-1 gate report). Closed 2026-07-14: the four
+ego-stat target definitions (§13.6); Benchmark-A/B/C ↔ split-strategy mapping
+(confirmed at G1: `Benchmark-A = breadth_first`, §9.1).
+
+## 13. G5 Stage-1 carve-out (normative for the Stage-1 build)
+
+Gate G5 (protocol §5.0.5) builds the model in three mechanism stages. The frozen
+sections above pin the *full* model; this section pins the **Stage-1 subset** —
+"imagination + degree budget + closure channel only (no codebook, no harmonization,
+no CVAE)" (proposal §6.0-G5). Stage 2 (+ codebook + s3) and Stage 3 (+ harmonization
++ seam loss) restore the corresponding items verbatim from §§1–8; nothing here
+changes the full model.
+
+### 13.1 Module subset
+
+Stage 1 = Tokenize-lite (§1 minus VQ, BP affiliations, code-stats head) + Imagine
+(§2, no CVAE) + Hungarian matching (§13.3) + Stitch (§3, Sinkhorn alignment only) +
+decision head over `(s0, s1, s2)`:
+
+```text
+p_ij = σ( s0 + g_θ(s1, s2) · w ),   g_θ = MLP_2(gate), w learned scalar init 0.1
+```
+
+Dropped until later stages: codebook (`z_u`, `r_u`, `stats_u`), `F_u`, CVAE (`ζ_u`),
+Harmonize (§4; `R = 0`), `s3`, `s4`. **Stitch is retained in Stage 1** because the
+closure channel `s2` consumes the alignment plan `Π` (§5). The §5 s-channel
+correlation diagnostic reports the available channels `(s0, s1, s2)`.
+
+### 13.2 Codebook-free conditioning (`e_u` substitution)
+
+With no codebook, `e_u` replaces `(z_u, r_u)` everywhere they condition:
+
+```text
+T_cond = [W_x x_u; W_e e_u]                        # 2 tokens (W_z, W_r, W_ζ dropped)
+Q_k    = W_q [proj(x_{g_k}); e_u]    for k ≤ min(K, n_g^+)
+Q_k    = q_k^base + W_q' e_u         otherwise
+d̂_u   = softplus(MLP_2(d + d_z → 1)([x_u; e_u])) · ρ_eval/ρ_train
+```
+
+Conditioning dropout (`∅_content` / `∅_all`, p = 0.1 each) is retained unchanged.
+
+### 13.3 Matching and OT costs without the code term
+
+The code-agreement terms are dropped; the remaining weights are uniformly rescaled so
+each total cost keeps its §2/§3 scale (Hungarian ×7/6, Sinkhorn ×5/4). Both
+`linear_sum_assignment` and Sinkhorn are invariant to a uniform positive rescale of
+the cost matrix — the rescale is recorded for exactness only.
+
+```text
+C_{k,v}   = (7/6)·‖h_u^k − proj(x_v)‖₂² + (7/24)·|deg_bucket(k) − deg_bucket(v)|
+          + (7/24)·overlap_penalty(k, v)
+C^Π_{kk'} = (5/4)·‖h_i^k − h_j^{k'}‖₂² + (5/16)·|π_i^k − π_j^{k'}|
+```
+
+`deg_bucket` (left symbolic in §2) is pinned: log2 multiplicity buckets
+`{[1,2), [2,4), [4,8), [8,16), [16,32]}` → integer index; `deg_bucket(k)` buckets the
+slot's predicted multiplicity `m_u^k`, `deg_bucket(v)` buckets the target's
+multiplicity label (1 for non-hub targets; stratum ratio under §13.4). Two-pass
+overlap penalty, per-step recomputation, constant-in-backward assignment, and
+denoising queries (25% of nodes, σ_noise = 0.1, fixed assignments) are retained.
+
+### 13.4 Hub strata without codes
+
+§2's neighbor-code strata become **degree-bucket strata**: neighbors of a hub node
+are stratified by `deg_G_struct` log2 bucket; proportional allocation capped at K,
+per-target multiplicity label = stratum_size / allocated_count, degree NLL keeps the
+true |N(u)| — all unchanged.
+
+### 13.5 Stage-1 loss tree
+
+```text
+L = L_edge + 0.5·L_real + 0.1·L_ssl + 1.0·L_recon          # §7 λ defaults unchanged
+L_recon = 1.0·L_feat(Hungarian, Huber) + 0.5·L_exist(BCE, ∅-balanced)
+        + 0.25·L_mult(NLL) + 0.5·L_deg(lognormal NLL)
+        + 0.5·L_slotadj(group-level BCE) + 0.25·L_gate
+        # dropped with their mechanisms: KL, L_VQ, L_codestats, L_entropy, L_BP, L_joint
+L_real  = (2/3)·ED(ego-stat vectors) + (1/3)·ED(random-GIN embeddings)
+        # seam-overlap ED deferred to Stage 3 with the seam loss; adversarial off;
+        # interior weights renormalized to sum 1
+L_ssl   unchanged (§7): 0.5·consistency(feature noise σ=0.05)
+        + 0.5·pool-resample consistency, ungrounded slots only
+```
+
+**Stage-1 `L_gate` form:** §7's partner-vs-peer BCE presupposes harmonization. Until
+Stage 3, `L_gate = BCE(g_u^k, 1[Hungarian-matched target of slot k ∈ G(u)])` — the
+gate learns whether a slot represents a retrievable (grounding-pool) neighbor.
+
+### 13.6 Ego-stat targets (pinned; closes the §12 open item)
+
+Real side, per node `u` on `G_struct` (evaluator = NetworkX implementations):
+
+```text
+t = [ deg(u);  nx.clustering(G_struct, u);  |E(ego(u))|;  nx.density(ego(u)) ]
+      # ego(u) = G_struct.subgraph(N(u) ∪ {u}), simple graph
+```
+
+Generated side (soft estimates from the Imagine heads):
+
+```text
+d̃    = Σ_k π_k m_k                       Ẽ_nn = Σ_{k<k'} Â_{kk'} π_k π_k' m_k m_k'
+t̃    = [ d̃;   Ẽ_nn / max(C(d̃, 2), 1);   d̃ + Ẽ_nn;   (d̃ + Ẽ_nn) / max(C(d̃+1, 2), 1) ]
+```
+
+`ED` = energy distance between the batch distributions of `t̃` (generated) and `t`
+(real), each coordinate standardized by the real-side batch mean/std. The random-GIN
+term: one frozen randomly-initialized 3-layer GIN (hidden 64, sum-pool, weights fixed
+at seed 0) applied to the generated soft ego-net (star edges weighted `π_k m_k`,
+slot–slot edges weighted `Â π π`; node features `[π; m; g]`, anchor one-hot on `u`)
+and to the real `G_struct` ego-net (binary edges, matching binary features); ED
+between the two embedding batches.
+
+### 13.7 Shared projection and decision-head pins
+
+`proj` = one learned linear `d → d_p`, shared by the matching cost, `L_feat`, and
+`s1`. Matching-cost and `L_feat` targets use `stop-gradient(proj(x_v))` — gradients
+reach `proj` only through the slot side and `s1`. Diagnostic: per-epoch variance of
+`proj(x)` over the node batch (representation-collapse watch). `τ_κ` in `s1`: learned
+scalar, softplus-parameterized, init 1.0. Decoder attention heads: 8.
+
+### 13.8 Curriculum adaptation
+
+§8's middle phase (+ joint harmonization) drops out of Stage 1:
+
+1. **Warm-start** (Tokenize-lite + Imagine): `L_recon` only, node stream only, 20% of
+   the epoch budget.
+2. **Full Stage-1 joint**: all §13.5 losses, node + edge streams, 80%.
+
+Execution is fixed-epoch with per-epoch validation; the VAL-CRITERION early stop is
+recorded as `counterfactual_stop_epoch` (the E2 worker convention) and `best.pt` is
+the early-stop-equivalent checkpoint (max validation edge AUPRC).
+
+### 13.9 Self-pair single-ego path (Stage-1 form)
+
+§9.4 rule 2 with the Stage-1 channels: `Π = I` on all slots (no keep-mask exists at
+`R = 0`); `s1` self-membership unchanged; `s2(u, u) = Σ_k (π_u^k)² · Â_u[k, k]`
+(the "Â diagonal blocks" reading substituted into the §5 `s2` formula).
+
+### 13.10 s0 cache (frozen B0 logits)
+
+`s0` comes from the audited frozen V3.1 checkpoint `e092537d8cf1e208` via
+precomputed logit caches: training pairs are enumerable offline because the §10.2
+negative sampler is deterministic in `(seed, epoch, rank)`; candidate/val/test pairs
+come from `score_universe` artifacts. The cache loader **fails loudly** on any
+missing pair or checkpoint-id mismatch. `s0` is never trained through.
+
+### 13.11 Two-pass density self-calibration (Stage-1 scope)
+
+Pass 1 (ratio 1) runs and logs `ρ̂_eval` per §9.3. The pass-2 rescale only affects
+`d̂`, which sits outside the Stage-1 score path (`s3` is absent), so **Stage-1
+reported scores are pass-1 scores**; `ρ̂_eval·d̂` still feeds the degree-calibration
+diagnostic. The two-pass plumbing is built now and becomes score-active in Stage 2.
+
+### 13.12 Grounding pool
+
+`G(u)` = exact top-`n_g` cosine neighbors of `x_u` in F0 space **within u's own split
+side**, self excluded (≈10k nodes — exact matmul, no ANN), computed once and
+disk-cached with a sha256 manifest.
+
+### 13.13 Runtime budget
+
+§11's 60-minute cold-run pin applies to the formal E2 B0 V3.1 run only. The
+EgoStitch worker uses the same 4 × H20 `accelerate launch --num_processes 4`
+layout, the same runtime-profile and checkpoint payload schemas, and a
+**config-driven** budget (`runtime.total_budget_seconds`; stage budgets must sum).
+This family's "feature pack" stage = the F0 pooled matrix (§9.2) + grounding-pool
+cache. The orchestrator's probe/projection gating applies against the configured
+budget.
+
+### 13.14 Stage-gate comparators and pre-registration
+
+Stage-1 gate comparators: **B0** (frozen candidate-scores artifact) and **`B0+cal`**
+(protocol §2). B1/B5 comparisons are deferred to E3 with their implementations
+(protocol edit 2026-07-14). Acceptance criteria are pre-registered in
+`docs/registrations/g5_stage1_preregistration.json`; the training worker records the
+file's sha256 in `run_metadata.json` at run start, and the gate evaluator refuses to
+open held-out metrics if the hashes disagree.

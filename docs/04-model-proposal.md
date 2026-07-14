@@ -922,6 +922,11 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   Stage 2 adds codebook + s3; Stage 3 adds harmonization + seam loss. Each stage must
   beat the previous on the pre-registered criteria or the added mechanism is cut per
   the §4.6 rule.
+  *Update 2026-07-14 (pre-implementation):* the Stage-1 gate runs against B0 and
+  `B0+cal` only — B1/B5 comparison rows are deferred to E3 with their implementations;
+  the Stage-1 subset is pinned in spec §13 and the acceptance criteria are
+  pre-registered in `docs/registrations/g5_stage1_preregistration.json`
+  (protocol §5.0.5).
 
 ### 6.1 Method rows
 
