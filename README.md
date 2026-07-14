@@ -28,8 +28,9 @@
 
 This repository holds the design and pre-implementation gate pipeline for an ICLR 2027
 paper. The benchmark loaders, evaluation library, B0/B0-alt baselines, score-once
-artifact pipeline, and gates G1/G2 are implemented and tested. **EgoStitch itself is not
-implemented**; G3 (Oracle) must still pass before model code is written.
+artifact pipeline, and gates G1–G3 are implemented and tested. **EgoStitch itself is not
+implemented**; G1 is closed with the B0-alt architecture-independence arm, and G3
+(Oracle) has passed, so the next stage is model implementation.
 
 - **Task:** given two *unseen* nodes with frozen feature vectors, predict whether an
   edge exists between them (binary classification), under a strict inductive protocol
@@ -82,20 +83,27 @@ figure: [`figures/e2-gap.html`](figures/e2-gap.html).
 | Assembled graph | graph similarity | **5.77e-7** | poor; composite passed perturbation check |
 | Assembled graph | relative density | 0.9977 | density-matched operating point |
 | Assembled graph | degree / clustering / spectral MMD ratio | **13.0768 / 11.9273 / 18.0931** | reference floor = 1; lower is better |
+| Edge (B0-alt) | AUROC / AUPRC (degree-corrected, ratio-1) | **0.6936 / 0.7325** | alternate F0-MLP architecture |
+| Assembled graph (B0-alt) | graph similarity | **2.29e-8** | architecture-independence arm |
+| Assembled graph (B0-alt) | degree / clustering / spectral MMD ratio | **15.8304 / 13.4718 / 23.4734** | gap persists and is larger |
 
-The final G1 threshold sweep and all negative-regime rows are recorded in
-[`outputs/e2_resubmit_retry/g1/g1_tables.md`](outputs/e2_resubmit_retry/g1/g1_tables.md).
+The final two-architecture G1 threshold sweep and all negative-regime rows are recorded in
+[`outputs/runs/g1_b0_b0_alt_20260713T165714Z/g1_tables.md`](outputs/runs/g1_b0_b0_alt_20260713T165714Z/g1_tables.md).
 G2 reports measured soft-score overlap 0.4799 versus the minimum 0.0550 required to
-reach the reference triangle count; G1 B0-alt replication and G3 (Oracle) remain
-pending. PA-null is reported
+reach the reference triangle count. G3's Oracle-blend arm reports MMD-ratio headroom
+1.723 / 3.885 / 1.998 for degree / clustering / spectral, with composite ratio 2425.56;
+the feature-insufficiency stop rule is not triggered. The B0-alt result closes G1's
+architecture-independence requirement. PA-null is reported
 alongside B0 because it wins some easy and feature-hard edge regimes.
 
 The latest checkpoint-only evaluation rerun (`legacy_v31_s47_20260712T193900Z`, not a
 new formal training acceptance) reached balanced test AUROC/AUPRC **0.8052 / 0.8184**
 and its G1 degree-corrected ratio-1 row was **0.7996 / 0.8133**. Its archived assembled
-metrics predate the canonical MMD-ratio evaluator and are not quoted as current results.
-The complete isolated package is
-[`outputs/deliverables/b0_v31_legacy_s47_20260713/`](outputs/deliverables/b0_v31_legacy_s47_20260713/).
+metrics were recomputed with the canonical evaluator: graph similarity **2.63e-7** and
+degree / clustering / spectral MMD ratios **13.8456 / 11.6277 / 19.9774** at relative
+density 0.9784. Thus the stronger edge scorer does not shrink the topology gap. The
+complete closeout package is
+[`outputs/deliverables/g1_closeout_20260713/`](outputs/deliverables/g1_closeout_20260713/).
 
 ## The Proposed Method (EgoStitch)
 
@@ -103,8 +111,8 @@ The complete isolated package is
 > [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) is the active implementation
 > contract (algorithm spec + benchmark/data contract + four-H20 execution design). Design
 > rationale: [`docs/04-model-proposal.md`](docs/04-model-proposal.md); review record:
-> [`docs/05-review-report.md`](docs/05-review-report.md). The G1 B0/PA-null arm and G2
-> are complete; B0-alt replication and G3 (Oracle) remain before model implementation.
+> [`docs/05-review-report.md`](docs/05-review-report.md). G1 (including B0-alt), G2, and
+> G3 (Oracle) are complete and support proceeding to implementation.
 
 For each queried pair `(i, j)`, each endpoint **imagines its own ego-network** (latent
 neighbor nodes with existence probabilities, local adjacency, and a degree budget)
@@ -151,7 +159,7 @@ src/
   data/                          verified benchmark/features + pair batching
   eval/                          edge and assembled-graph metrics
   model/                         frozen B0 and B0-alt scorers
-  experiments/                   implemented G1/G2 cached-score analyses
+  experiments/                   implemented G1/G2/G3 cached-score analyses
   train_b0.py                    baseline training CLI
   score_universe.py              score-once artifact CLI
 hpc/
@@ -197,18 +205,18 @@ target test graph; the queried edge is masked/standardized inside the scaffold. 
 - [x] **Blueprint, methodology, and experiment protocol** written and locked.
 - [x] **EgoStitch proposal** — approved 2026-07-09; reviewed via novelty check + 5-persona panel ([`docs/05-review-report.md`](docs/05-review-report.md)).
 - [x] **G4 spec freeze** — [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) signed off (algorithm + benchmark data contract + batch sampler + four-H20 execution).
-- [x] **Baseline + gate pipeline** — benchmark/features, B0/B0-alt training, cached scoring, G1/G2 analyses, and tests are implemented.
-- [x] **G1 primary arm + G2** — B0/PA-null hardened E2 and the checkpoint-aligned edge-independence ceiling are complete; synced artifacts are under `outputs/e2_resubmit_retry/`.
-- [ ] **G1 B0-alt replication** — required architecture-independence arm; the current G1 artifact records `b0_alt: null`.
-- [x] **Latest legacy v3.1 evaluation rerun** — test, candidate scoring, B0-only G1, and G2 completed; artifacts are under `outputs/deliverables/b0_v31_legacy_s47_20260713/`.
-- [ ] **G3 gate** — Oracle row (must pass before model code).
+- [x] **Baseline + gate pipeline** — benchmark/features, B0/B0-alt training, cached scoring, G1/G2/G3 analyses, and tests are implemented.
+- [x] **G1 + G2** — B0/PA-null, B0-alt architecture replication, and the checkpoint-aligned edge-independence ceiling are complete; G1 closeout artifacts are under `outputs/deliverables/g1_closeout_20260713/`.
+- [x] **Latest legacy v3.1 robustness rerun** — canonical G1 confirms that the stronger scorer preserves the topology gap; artifacts are included in `outputs/deliverables/g1_closeout_20260713/`.
+- [x] **G3 gate** — Oracle row passed; Oracle-blend shows substantial headroom over B0 and the feature-insufficiency stop rule is not triggered. Results are under [`outputs/deliverables/b0_v31_breadth_first_20260711/g3/`](outputs/deliverables/b0_v31_breadth_first_20260711/g3/).
 - [ ] **EgoStitch implementation** under `src/`, per [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) and the [experiment protocol](docs/03-experiment-protocol.md).
-- [ ] **Experiments** in priority order: G3 Oracle → E1/E3 main + baselines → E4 ablations → E5 integrity gates → E7 (load-bearing) → E6 breadth.
+- [ ] **Experiments** in priority order: EgoStitch implementation → E1/E3 main + baselines → E4 ablations → E5 integrity gates → E7 (load-bearing) → E6 breadth.
 
 ## HPC execution
 
 The required target environment is a fixed container with 4× NVIDIA H20 GPUs. Run
-`hpc/run.sh check`, then use the same runner for cached scoring and G1/G2. Formal E2
+`hpc/run.sh check`, then use the same runner for cached scoring and G1/G2; run G3 directly
+over the cached candidate universe. Formal E2
 (B0 V3.1) training runs **only** through `hpc/run.sh train
 configs/b0_v31_breadth_first.yaml`, which drives the production
 `python -m src.e2_pipeline` entry (pack → probe → projection → 30-epoch DDP train via

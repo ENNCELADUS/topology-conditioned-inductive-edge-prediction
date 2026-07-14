@@ -200,8 +200,7 @@ prioritized in Section 5 (gates first).
   is executed after every epoch; quality is reported but is not the throughput acceptance gate
   for the first systems-optimization pass. The wall-clock gate is 60 minutes from an empty
   derived-cache path through final training artifacts.
-- **Result (updated 2026-07-13):** the G1 B0/PA-null arm completed, but the required
-  B0-alt replication is absent (`b0_alt: null`), so G1 is not fully closed. The B0
+- **Result (updated 2026-07-14):** G1 is complete with B0, B0-alt, and PA-null. The B0
   degree-corrected ratio-1 row is AUROC 0.705519 / AUPRC 0.730260; the hard-heuristic
   row is 0.583965 / 0.626649; the hard-feature row is 0.569560 / 0.617475; and the full
   candidate-universe row is 0.690627 / 0.134302. At the density-matched operating point,
@@ -209,13 +208,25 @@ prioritized in Section 5 (gates first).
   is 5.76802e-7, with degree/clustering/spectral MMD ratios of 13.0768/11.9273/18.0931.
   The ratios use the fixed-`sigma=1` Gaussian-TV biased MMD² numerator divided by the
   deterministic real-vs-real reference floor; `1` is that floor and lower is better.
-  The gap therefore survives hard negatives and calibrated thresholds, although PA-null
-  beats B0 in the easy and feature-hard rows and is now a mandatory control.
+  B0-alt reaches 0.693603 / 0.732509 on the degree-corrected row, 0.576711 / 0.623517
+  on hard heuristic negatives, and 0.467864 / 0.561339 on hard feature negatives. Its
+  independently density-matched assembly has relative density 0.998739, composite
+  2.29059e-8, and degree/clustering/spectral MMD ratios 15.8304/13.4718/23.4734.
+  The gap therefore survives an alternate architecture, hard negatives, and calibrated
+  thresholds, although PA-null beats B0 in the easy and feature-hard rows and remains a
+  mandatory control.
 - **G2 result:** the checkpoint-aligned cached soft scorer has `Ov(P)=0.479886`, while
   `Ov_min=0.054954`
   at matched volume is sufficient to reach the reference triangle count; the full ceiling
-  curve and caveats are in the synced G2 artifact. **G1 B0-alt replication and G3
-  (Oracle) remain pending.**
+  curve and caveats are in the synced G2 artifact.
+- **G3 result (2026-07-13):** the B0 assembled row reproduced the canonical G1 values exactly:
+  threshold `0.794385`, relative density `0.997710`, degree/clustering/spectral MMD ratios
+  `13.0768/11.9273/18.0931`, and composite `5.76802e-7`. The pinned `oracle_topo` arm reached
+  ratios `14.1148/8.23662/16.0772` with per-statistic headroom `0.926465/1.44808/1.12539`;
+  the disclosed `oracle_blend` arm reached `7.58890/3.06980/9.05715` with headroom
+  `1.72315/3.88537/1.99767` and composite ratio `2425.56`. Oracle-blend therefore provides
+  substantial room over B0, so the feature-insufficiency stop rule is not triggered and
+  EgoStitch may proceed to implementation.
 
 **Latest checkpoint-only evaluation rerun:** the aligned legacy `v3_1` checkpoint was
 scored on the same split in run `legacy_v31_s47_20260712T193900Z` (completed 2026-07-12
@@ -223,8 +234,11 @@ scored on the same split in run `legacy_v31_s47_20260712T193900Z` (completed 202
 degree-corrected ratio-1 row was `0.799577/0.813319`, hard-heuristic
 `0.626746/0.663360`, and hard-feature `0.510083/0.602131`. This is an evaluation
 rerun of a supplied checkpoint, not a replacement for the formal four-H20 E2 training
-acceptance or the B0-alt/G3 requirements. Its archived assembled metrics use the retired
-evaluator and are not treated as canonical MMD-ratio results.
+acceptance or the canonical B0/B0-alt/G3 gate artifacts. Its archived assembled metrics use the retired
+evaluator, but the same scores were rerun through the canonical evaluator on 2026-07-13:
+relative density `0.978392`, graph similarity `2.63231e-7`, and
+degree/clustering/spectral MMD ratios `13.8456/11.6277/19.9774`. The stronger scorer
+therefore does not shrink the topology gap.
 
 ### E3: Baselines head-to-head on Benchmark-A
 
@@ -419,9 +433,8 @@ rule).
 
 ## 6. Deliverables and done criteria
 
-1. **Gate reports (G1–G3):** the G1 B0/PA-null hardened-E2 result and G2 ceiling
-   computation are complete; G1 B0-alt replication and the G3 Oracle row remain
-   outstanding.
+1. **Gate reports (G1–G3):** G1 B0/PA-null/B0-alt, the G2 ceiling computation, and
+   the G3 Oracle row are complete; the alternate architecture preserves the topology gap.
 2. **Spec freeze (G4):** signed-off `06-egostitch-spec.md`.
 3. **E1/E3 main table:** method by edge AUPRC, both assembled families, ceiling/Oracle/noise
    rows, diagnostics.
@@ -440,5 +453,5 @@ Resolved decisions (formerly open):
 - Scaffold edges are learned (generated + harmonized), not fixed from the frozen scorer;
   the frozen-scorer variant is E4.10.
 - B2-global is reported as a baseline; an "Ours-global" arm is not planned.
-- Canonical metric normalization: to be fixed by gate G1 and recorded in run metadata (the one
-  remaining open item, deliberately owned by G1).
+- Canonical metric normalization: fixed by G1 as the ratio of size-mean raw biased MMD²
+  to the deterministic real-vs-real reference MMD², and recorded in run metadata.

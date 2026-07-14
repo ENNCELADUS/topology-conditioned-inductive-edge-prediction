@@ -42,6 +42,7 @@ command unless exactly 4 visible GPUs are named `NVIDIA H20`, the fixed paths ex
 both benchmark and feature directories are present. All commands export
 `CUDA_VISIBLE_DEVICES=0,1,2,3`; `score`, `merge`, `g1`, and `g2` are single-process and
 use `cuda:0`, while `train` uses all 4 GPUs via `accelerate launch --num_processes 4`.
+G3 is a direct single-process cached-score analysis command outside `run.sh`.
 
 ## Run order
 
@@ -99,6 +100,15 @@ hpc/run.sh g1 \
 hpc/run.sh g2 \
   --universe scores/b0_v31_candidate.npz \
   --data-root data --strategy breadth_first --output-dir outputs/g2
+```
+
+Run the G3 Oracle gate directly over the cached candidate universe. It performs no model
+scoring and writes the regime, assembled-graph, and headroom tables under `outputs/g3/`:
+
+```bash
+python -m src.experiments.g3_oracle \
+  --universe outputs/deliverables/b0_v31_breadth_first_20260711/scores/candidate.npz \
+  --data-root data --strategy breadth_first --output-dir outputs/g3
 ```
 
 The commands above run in the foreground. For a disconnect-safe run, keep the same

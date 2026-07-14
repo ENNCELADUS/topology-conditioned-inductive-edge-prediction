@@ -9,11 +9,12 @@ Edge Prediction*. It contains design documents, result notes, self-contained HTM
 figures, benchmark data artifacts, and a curated literature library. Implementation
 has now begun on the **pre-implementation gates and baselines**: `src/` holds a typed,
 tested Python package (data loaders, eval metrics, the B0/B0-alt frozen scorers, and
-the G1/G2 gate-analysis pipelines), a direct HPC execution layer (formal E2/B0 training
+the G1/G2/G3 gate-analysis pipelines), a direct HPC execution layer (formal E2/B0 training
 on four H20s; single-GPU score/gate commands), and a full pytest suite.
-The **proposed model (EgoStitch) is not yet implemented** — gates G1–G3 (hardened E2,
-ceiling curve, Oracle) must pass before model code is written. The EgoStitch design and
-implementation spec were approved 2026-07-09.
+The **proposed model (EgoStitch) is not yet implemented**. Gates G1–G3 are complete:
+G1 includes the B0-alt architecture-independence arm, and G3 (Oracle) passed on
+2026-07-13. The EgoStitch design and implementation spec were approved 2026-07-09,
+so model implementation is now the next stage.
 
 `README.md` is the human-facing entry point (orientation, status, structure map,
 reading order). This file (`CLAUDE.md`) holds the binding *constraints* an agent
@@ -52,7 +53,7 @@ src/
   model/       B0.py (V3.1 scorer), b0_alt.py (F0-MLP architecture-independence arm)
   train_b0.py        CLI: train a frozen B0-family scorer
   score_universe.py  CLI: score pair lists -> pinned .npz scores artifact (shardable)
-  experiments/ g1_hardened_e2.py, g2_ceiling.py (gate analyses over cached scores)
+  experiments/ g1_hardened_e2.py, g2_ceiling.py, g3_oracle.py (gate analyses over cached scores)
 configs/        b0_v31_breadth_first.yaml, b0_alt_breadth_first.yaml
 hpc/            fixed 4×H20 container runner (run.sh + environment/runbook README)
 outputs/        run artifacts: checkpoints, metrics, cached score matrices (gitignored)
@@ -95,13 +96,15 @@ python -m src.experiments.g2_ceiling    --universe scores/b0_v31_candidate.npz \
 
 HPC runs target the required fixed 4×NVIDIA H20 container; `hpc/README.md` pins
 the SSH endpoint, repository/data paths, Python/PyTorch/CUDA versions, and the exact
-`check → train → score → G1/G2` sequence. Formal E2 (B0 V3.1) training runs **only**
+`check → train → score → G1/G2` sequence; G3 is a direct cached-score analysis command.
+Formal E2 (B0 V3.1) training runs **only**
 through `hpc/run.sh train configs/b0_v31_breadth_first.yaml`, which drives
 `python -m src.e2_pipeline` (pack → probe → projection → 30-epoch DDP train via
 `accelerate launch --num_processes 4` across all 4 GPUs); direct
 `python -m src.train_b0 --max-steps N` remains debug-only. `B0-alt` keeps its
 existing direct `python -m src.train_b0 --config ...` training CLI, outside this
-E2-only optimization. `score`/`merge`/`g1`/`g2` remain single-GPU commands; there is
+E2-only optimization. `score`/`merge`/`g1`/`g2` remain single-GPU commands; G3 is also
+single-process and CPU/memory-bound; there is
 no job scheduler (e.g. Slurm). The live four-H20 cold-run acceptance is pending;
 neither four-card execution nor the 60-minute budget is a verified result yet.
 
@@ -131,7 +134,8 @@ flow is deliberately **score-once, analyze-many**:
 4. **Gate analyses** (`src/experiments/`) are pure row-selections + graph math over that
    cached artifact — **no model scoring happens here**. `g1_hardened_e2.py` builds the
    hardened-E2 gate table (negative regimes, threshold/density-matched operating point,
-   assembled-graph rows); `g2_ceiling.py` computes the edge-independence triangle ceiling.
+   assembled-graph rows); `g2_ceiling.py` computes the edge-independence triangle ceiling;
+   `g3_oracle.py` evaluates the pinned Oracle arms and headroom stop rule.
 5. **Eval** (`src/eval/`) is the shared metric library used by all of the above:
    `edge_metrics.py` (AUROC/AUPRC…), `graph_metrics.py` (degree/clustering/spectral MMD
    on the assembled graph), `assembly.py` (assemble + threshold sweep), `composite.py`
@@ -176,9 +180,8 @@ nodes?" If a draft starts describing graph generation as the task, it has drifte
    contract (including quarantined artifacts and the self-loop policy), §10 batch
    sampler, §11 four-H20 execution design. Its freeze rule is binding: code may not
    silently deviate — edit the spec first, with a change-log line.
-6. `docs/results/E2-pair-to-topology-gap.md` — the motivating result note with the
-   completed G1 B0/PA-null arm and G2 artifacts; G1 B0-alt replication and G3 Oracle
-   remain pending.
+6. `docs/results/E2-pair-to-topology-gap.md` — the motivating result note with completed
+   G1 B0/PA-null/B0-alt, G2 ceiling, and G3 Oracle artifacts.
 7. `docs/lit-review-plan.md` — literature-review plan, claims K1–K5, the 2×2
    taxonomy, and the terminology guardrail.
 
@@ -188,14 +191,20 @@ rather than resolving them unilaterally.
 
 ## Load-bearing facts (the E2 result)
 
-The current load-bearing gap is the completed G1 B0/PA-null arm: the frozen B0 pairwise scorer
+The current load-bearing gap is the completed G1 result: the frozen B0 pairwise scorer
 reaches **AUROC 0.705519 / AUPRC 0.730260** on degree-corrected ratio-1 negatives,
 falls to **0.583965 / 0.626649** on hard heuristic negatives and **0.569560 / 0.617475**
 on hard feature negatives, yet its density-matched assembly has **graph similarity
 5.76802e-7**, degree/clustering/spectral MMD ratios **13.0768/11.9273/18.0931**, and
-relative density **0.997710**. The O'Bray perturbation check passed. G2 reports
-`Ov(P)=0.479886` versus `Ov_min=0.054954`; G1 B0-alt replication and G3 Oracle are
-still pending.
+relative density **0.997710**. B0-alt reaches **0.693603 / 0.732509** on the same
+degree-corrected row but has graph similarity **2.29059e-8** and MMD ratios
+**15.8304/13.4718/23.4734** at relative density **0.998739**, closing the required
+architecture-independence arm. The O'Bray perturbation check passed. A stronger legacy
+scorer reaches **0.799577 / 0.813319** yet retains MMD ratios
+**13.8456/11.6277/19.9774**, so higher edge quality does not close the topology gap.
+G2 reports `Ov(P)=0.479886` versus `Ov_min=0.054954`. G3 reports Oracle-blend
+MMD-ratio headroom `1.72315/3.88537/1.99767` for degree/clustering/spectral, with
+composite ratio `2425.56`; the feature-insufficiency stop rule is not triggered.
 `docs/04-model-proposal.md` §4.6 maps these failure axes to specific EgoStitch
 mechanisms. Keep the current values consistent across `docs/results/E2-pair-to-topology-gap.md`,
 `docs/03-experiment-protocol.md`, `docs/04-model-proposal.md`, `README.md`, and

@@ -98,8 +98,9 @@
     the real-vs-real reference floor.
     <b>Good edge scores do not imply a plausible network.</b>
     A later checkpoint-only v3.1 evaluation rerun reached balanced-test
-    <span class="g">AUROC 0.8052 / AUPRC 0.8184</span>; its retired-format assembled
-    metrics are not compared with the canonical G1 result.
+    <span class="g">AUROC 0.8052 / AUPRC 0.8184</span> and still produced canonical
+    MMD ratios 11.6–20.0. B0-alt independently produces ratios 13.5–23.5, closing
+    G1's architecture-independence arm.
   </p>
 
   <div class="panels">
@@ -124,6 +125,16 @@
           <div class="track"><div class="fill bad" style="width:5%"></div><div class="refline" style="left:50%"></div></div>
           <span class="val">5.77e-7</span>
         </div>
+        <div class="bar-row">
+          <span class="lab">B0-alt AUROC</span>
+          <div class="track"><div class="fill good" style="width:69.4%"></div><div class="refline" style="left:50%"></div></div>
+          <span class="val">0.6936</span>
+        </div>
+        <div class="bar-row">
+          <span class="lab">B0-alt graph-sim</span>
+          <div class="track"><div class="fill bad" style="width:5%"></div><div class="refline" style="left:50%"></div></div>
+          <span class="val">2.29e-8</span>
+        </div>
       </div>
       <div class="axisnote"><span>0.0</span><span class="reflabel">0.5 plausibility line</span><span>1.0</span></div>
       <div class="keyrow">
@@ -135,26 +146,41 @@
     <!-- Panel B: MMDs -->
     <div class="panel">
       <h2>B - Reference-normalized assembled-graph distances</h2>
-      <p class="cap">Degree, clustering, and spectral <b>MMD ratios</b>. A value of 1 is the
-        real-vs-real reference floor; lower is better.</p>
+      <p class="cap">B0 and B0-alt degree, clustering, and spectral <b>MMD ratios</b>.
+        A value of 1 is the real-vs-real reference floor; lower is better.</p>
       <div class="bars">
         <div class="bar-row">
-          <span class="lab">degree</span>
-          <div class="track"><div class="fill bad" style="width:72.3%"></div></div>
+          <span class="lab">B0 degree</span>
+          <div class="track"><div class="fill bad" style="width:55.7%"></div></div>
           <span class="val">13.0768</span>
         </div>
         <div class="bar-row">
-          <span class="lab">clustering</span>
-          <div class="track"><div class="fill bad" style="width:65.9%"></div></div>
+          <span class="lab">B0-alt degree</span>
+          <div class="track"><div class="fill bad" style="width:67.4%"></div></div>
+          <span class="val">15.8304</span>
+        </div>
+        <div class="bar-row">
+          <span class="lab">B0 clustering</span>
+          <div class="track"><div class="fill bad" style="width:50.8%"></div></div>
           <span class="val">11.9273</span>
         </div>
         <div class="bar-row">
-          <span class="lab">spectral</span>
-          <div class="track"><div class="fill bad" style="width:100%"></div></div>
+          <span class="lab">B0-alt clustering</span>
+          <div class="track"><div class="fill bad" style="width:57.4%"></div></div>
+          <span class="val">13.4718</span>
+        </div>
+        <div class="bar-row">
+          <span class="lab">B0 spectral</span>
+          <div class="track"><div class="fill bad" style="width:77.1%"></div></div>
           <span class="val">18.0931</span>
         </div>
+        <div class="bar-row">
+          <span class="lab">B0-alt spectral</span>
+          <div class="track"><div class="fill bad" style="width:100%"></div></div>
+          <span class="val">23.4734</span>
+        </div>
       </div>
-      <div class="axisnote"><span>0</span><span>MMD ratio (reference floor = 1) -></span><span>18.1</span></div>
+      <div class="axisnote"><span>0</span><span>MMD ratio (reference floor = 1) -&gt;</span><span>23.5</span></div>
     </div>
 
     <!-- Panel C: gate status -->
@@ -166,7 +192,8 @@
         curve are linked from the result note.</p>
       <div class="keyrow">
         <span class="k"><span class="sw good"></span> G1 composite validated</span>
-        <span class="k"><span class="sw bad"></span> G3 Oracle still pending</span>
+        <span class="k"><span class="sw good"></span> G1 B0-alt arm closed</span>
+        <span class="k"><span class="sw good"></span> G3 Oracle passed</span>
       </div>
       <svg class="chart" style="display:none" aria-hidden="true" viewBox="0 0 400 205" role="img" aria-label="superseded bucket trend">
         <!-- gridlines y = 0, 0.25, 0.5 -->
@@ -203,7 +230,8 @@
     Protocol: topology-conditioned inductive edge prediction over unseen nodes with frozen node
     features. Binary edge predictions are assembled into graphs and evaluated with edge metrics plus
     graph realism metrics. The figure uses the density-matched G1 operating point and reports
-    graph-similarity &lt; 0.5 with MMD ratios far above the real-vs-real floor; G2 uses the exact edge-independence identities
-    and G3 Oracle remains pending.
+    graph-similarity &lt; 0.5 with MMD ratios far above the real-vs-real floor; B0-alt and
+    the stronger legacy scorer preserve the gap, G2 uses the exact edge-independence
+    identities, and G3 Oracle-blend reports substantial headroom over B0.
   </footer>
 </div>

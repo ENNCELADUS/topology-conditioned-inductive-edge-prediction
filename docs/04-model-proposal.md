@@ -171,9 +171,11 @@ similarity–adjacency conflation — are inherited by the context and then "cor
 residual conditioned on those same errors.
 
 A separate checkpoint-only evaluation of the aligned legacy `v3_1` scorer completed in
-run `legacy_v31_s47_20260712T193900Z`. Its archived assembled metrics use the retired
-evaluator and are not quoted as current MMD-ratio results; this rerun does not replace
-the formal E2 training record or its gate requirements.
+run `legacy_v31_s47_20260712T193900Z`. A canonical evaluator rerun gives graph similarity
+`2.63231e-7` and degree/clustering/spectral MMD ratios
+`13.8456/11.6277/19.9774` despite degree-corrected AUROC/AUPRC
+`0.799577/0.813319`; stronger edge ranking therefore does not remove the topology gap.
+This checkpoint-only rerun does not replace the formal E2 training record.
 
 Stated carefully: *any* per-query scaffold — retrieved or generated — is a function of
 the same test-time inputs available to B0, so no scaffold "adds information" at test
@@ -722,7 +724,10 @@ zero-edge nodes; none grades the graph its predictions assemble into.** The fina
 result is AUROC 0.705519 / AUPRC 0.730260 on degree-corrected negatives, falling to
 0.583965 / 0.626649 on hard heuristic negatives and 0.569560 / 0.617475 on hard feature
 negatives, while density-matched graph similarity is `5.76802e-7`. The failure survives
-G1, but PA-null wins in some edge regimes and remains a mandatory control.
+G1. B0-alt independently reaches 0.693603 / 0.732509 on degree-corrected negatives but
+assembles with graph similarity `2.29059e-8` and MMD ratios
+`15.8304/13.4718/23.4734`, closing the required architecture-independence arm. PA-null
+wins in some edge regimes and remains a mandatory control.
 
 Known weakness of the claim's *shape* [EIC, DA-M21]: it is a conjunction of qualifiers,
 and conjunction-novelty weakens with each conjunct. The mitigation is §6's controls:
@@ -869,7 +874,8 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   before the number is quoted again; [DA-M11]). Also record the full-candidate-universe
   imbalance view [DA-m17]. *Stop condition:* if the gap substantially closes under hard
   negatives or calibrated thresholds, the motivation is dead as stated and the project
-  pivots to the evaluation/benchmark paper.
+  pivots to the evaluation/benchmark paper. **Result (2026-07-13): passed and closed;**
+  B0-alt preserves the topology gap under the canonical evaluator.
 - **G2 — Edge-independence ceiling check (rev 2.2 semantics).** Using the reference
   graph and cached B0 scores, with Chanpuriya 2111.00048's exact identities:
   (i) compute the assembly's operating point exactly — `V(P) = Σ p_ij`,
@@ -899,7 +905,7 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
 - **G4 — Specification freeze.** The algorithm box (Stitch + Harmonize pseudocode
   with tensor shapes, OT cost/ε, quantile schedule, budget tolerance τ_b, gradient
   estimators) and the loss tree with interior weights are **delivered in
-  `06-egostitch-spec.md` (2026-07-09), pending review sign-off**; once signed off, the
+  `06-egostitch-spec.md` and signed off (2026-07-09)**; the
   spec is the implementation contract and deviations require a spec edit first.
   *Stop condition:* none — this is a deliverable.
 - **G5 — Minimum-viable-model milestone [EIC].** Stage 1: imagination + degree budget
