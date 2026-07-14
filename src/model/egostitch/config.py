@@ -1,0 +1,148 @@
+"""Frozen configuration for the EgoStitch Stage-1 model (spec Sec 0 / Sec 13).
+
+Defaults are the spec-pinned values; every field is overridable through
+``model.config`` in the training YAML (validated in :func:`EgoStitchConfig.from_mapping`)
+so unit tests can run tiny instances. The G5 stage gate runs at these defaults
+(protocol Sec 5.0.5 instantiation).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, fields
+
+
+@dataclass(frozen=True)
+class EgoStitchConfig:
+    """Pinned Stage-1 hyperparameters.
+
+    Attributes:
+        input_dim: Frozen feature dim ``d`` (F0 mean-pool, spec Sec 9.2).
+        d_p: Projected feature space (set-decoder target space).
+        d_z: Encoder embedding dim (``e_u``; the codebook dim it replaces in
+            Stage 1, spec Sec 13.2).
+        d_h: Decoder hidden dim.
+        slots: Neighbor slots per node ``K``.
+        m_max: Max multiplicity per slot.
+        n_ground: Grounding candidates per node ``n_g``.
+        decoder_layers: Imagine decoder depth.
+        n_heads: Decoder attention heads (spec Sec 13.7).
+        sinkhorn_eps: Entropic regularizer ``eps`` (spec Sec 3).
+        sinkhorn_iters: Fixed Sinkhorn iteration count (determinism).
+        sinkhorn_tau: Unbalanced-OT KL relaxation strength ``tau_OT``.
+        denoise_fraction: Fraction of training nodes receiving denoising
+            queries (spec Sec 2).
+        denoise_sigma: Noise scale of denoising query initializations.
+        null_dropout: Probability of each conditioning-dropout null
+            (``∅_content`` / ``∅_all``, disjoint draws).
+        lambda_recon: Master loss weight of ``L_recon``.
+        lambda_real: Master loss weight of ``L_real``.
+        lambda_ssl: Master loss weight of ``L_ssl``.
+        w_feat: Interior ``L_recon`` weight of the Hungarian Huber feature loss.
+        w_exist: Interior weight of the existence BCE.
+        w_mult: Interior weight of the multiplicity NLL.
+        w_deg: Interior weight of the lognormal degree NLL.
+        w_slotadj: Interior weight of the slot-adjacency group BCE.
+        w_gate: Interior weight of the grounding-gate BCE.
+        w_egostat: Interior ``L_real`` weight of the ego-stat energy distance
+            (Stage-1 renormalized, spec Sec 13.5).
+        w_gin: Interior ``L_real`` weight of the random-GIN energy distance.
+        gin_hidden: Hidden width of the frozen random GIN (spec Sec 13.6).
+        gin_layers: Depth of the frozen random GIN.
+        ssl_noise_sigma: Feature-noise scale of the SSL consistency term.
+    """
+
+    input_dim: int = 1536
+    d_p: int = 256
+    d_z: int = 64
+    d_h: int = 256
+    slots: int = 16
+    m_max: int = 32
+    n_ground: int = 20
+    decoder_layers: int = 3
+    n_heads: int = 8
+    sinkhorn_eps: float = 0.1
+    sinkhorn_iters: int = 20
+    sinkhorn_tau: float = 1.0
+    denoise_fraction: float = 0.25
+    denoise_sigma: float = 0.1
+    null_dropout: float = 0.1
+    lambda_recon: float = 1.0
+    lambda_real: float = 0.5
+    lambda_ssl: float = 0.1
+    w_feat: float = 1.0
+    w_exist: float = 0.5
+    w_mult: float = 0.25
+    w_deg: float = 0.5
+    w_slotadj: float = 0.5
+    w_gate: float = 0.25
+    w_egostat: float = 2.0 / 3.0
+    w_gin: float = 1.0 / 3.0
+    gin_hidden: int = 64
+    gin_layers: int = 3
+    ssl_noise_sigma: float = 0.05
+
+    def __post_init__(self) -> None:
+        """Validate cross-field invariants.
+
+        Raises:
+            ValueError: On any non-positive dimension or out-of-range rate.
+        """
+        for name in (
+            "input_dim",
+            "d_p",
+            "d_z",
+            "d_h",
+            "slots",
+            "m_max",
+            "n_ground",
+            "decoder_layers",
+            "n_heads",
+            "sinkhorn_iters",
+            "gin_hidden",
+            "gin_layers",
+        ):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
+        if self.d_h % self.n_heads != 0:
+            raise ValueError(f"d_h ({self.d_h}) must be divisible by n_heads ({self.n_heads})")
+        for name in ("sinkhorn_eps", "sinkhorn_tau", "denoise_sigma", "ssl_noise_sigma"):
+            if float(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
+        for name in ("denoise_fraction", "null_dropout"):
+            value = float(getattr(self, name))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], got {value}")
+
+    @classmethod
+    def from_mapping(cls, mapping: Mapping[str, object]) -> EgoStitchConfig:
+        """Build a config from a YAML ``model.config`` mapping.
+
+        Args:
+            mapping: Field-name -> value overrides; unknown keys are rejected
+                (the train_b0 strict-config convention).
+
+        Returns:
+            The validated `EgoStitchConfig`.
+
+        Raises:
+            ValueError: On unknown keys or invalid values.
+        """
+        known = {f.name for f in fields(cls)}
+        unknown = sorted(set(mapping) - known)
+        if unknown:
+            raise ValueError(f"unknown EgoStitch config keys: {unknown}")
+        kwargs: dict[str, object] = {}
+        for f in fields(cls):
+            if f.name not in mapping:
+                continue
+            raw = mapping[f.name]
+            if f.type in ("int",):
+                if isinstance(raw, bool) or not isinstance(raw, int):
+                    raise ValueError(f"{f.name} must be an int, got {raw!r}")
+                kwargs[f.name] = int(raw)
+            else:
+                if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                    raise ValueError(f"{f.name} must be a number, got {raw!r}")
+                kwargs[f.name] = float(raw)
+        return cls(**kwargs)  # type: ignore[arg-type]
