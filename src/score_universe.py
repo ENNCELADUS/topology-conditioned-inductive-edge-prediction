@@ -346,9 +346,17 @@ def _build_f0_mlp(model_config: dict[str, object]) -> nn.Module:
     return cast(nn.Module, F0PairMLP(**cast(dict[str, Any], model_config)))
 
 
+def _build_egostitch(model_config: dict[str, object]) -> nn.Module:
+    """Build an `EgoStitchStage1` model from its checkpointed config (spec Sec 13)."""
+    from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
+
+    return EgoStitchStage1(EgoStitchConfig.from_mapping(model_config))
+
+
 MODEL_BUILDERS: dict[str, Callable[[dict[str, object]], nn.Module]] = {
     "v3_1": _build_v3_1,
     "f0_mlp": _build_f0_mlp,
+    "egostitch": _build_egostitch,
 }
 
 
@@ -661,6 +669,187 @@ def _score_f0_mlp(
     return out
 
 
+def _align_s0_logits(
+    artifact: ScoresArtifact, pairs: Sequence[tuple[str, str]]
+) -> NDArray[np.float32]:
+    """Row-align frozen-B0 logits to `pairs` by canonical pair (hard-fails on a miss).
+
+    Alignment is by pair identity, not row order, so a candidate/val/test
+    artifact covers any subset or reordering of its pairs. A missing pair is a
+    contract violation (spec Sec 13.10) and never silently imputed.
+    """
+    lookup: dict[tuple[str, str], float] = {}
+    logits = artifact.logit.astype(np.float64)
+    for row, (u, v) in enumerate(artifact.pairs()):
+        lookup[(u, v) if u <= v else (v, u)] = float(logits[row])
+    out = np.empty(len(pairs), dtype=np.float32)
+    for i, (u, v) in enumerate(pairs):
+        key = (u, v) if u <= v else (v, u)
+        if key not in lookup:
+            raise ValueError(
+                f"--b0-scores is missing pair {key}; it must cover every scored row "
+                "(spec Sec 13.10)"
+            )
+        out[i] = lookup[key]
+    return out
+
+
+def _score_egostitch(
+    model: nn.Module,
+    pairs: Sequence[tuple[str, str]],
+    store: FeatureStore,
+    *,
+    device: torch.device,
+    amp: str,
+    batch_pairs: int,
+    f0_cache: Path,
+    grounding_cache: Path | None,
+    s0_logits: NDArray[np.float32],
+) -> NDArray[np.float32]:
+    """Score pairs with an `EgoStitchStage1` model (spec Sec 10.3 / Sec 13).
+
+    Runs the cacheable per-node pass (Tokenize-lite + Imagine) once over the
+    unique endpoints, then scores pair batches from the cache: Sinkhorn stitch
+    + decision head fused with the cached frozen-B0 ``s0`` logits. Self-pairs
+    route through the single-ego path (spec Sec 13.9). Stage-1 scores are
+    pass-1 (ratio 1) scores (spec Sec 13.11).
+
+    Args:
+        model: Frozen `EgoStitchStage1`, on `device`, in ``eval()`` mode.
+        pairs: Node-id pairs in input row order.
+        store: Feature store providing per-node token sequences.
+        device: Compute device.
+        amp: ``off`` or ``bf16``.
+        batch_pairs: Pair rows per forward pass.
+        f0_cache: F0 matrix cache path (f0_mlp semantics).
+        grounding_cache: Grounding-pool cache path (derived from `f0_cache`
+            when ``None``).
+        s0_logits: Row-aligned frozen-B0 logits.
+
+    Returns:
+        Shape ``(len(pairs),)`` float32 logits in input row order.
+    """
+    from src.data.grounding import build_grounding_pool
+    from src.model.egostitch.model import EgoStitchStage1, NodeEncoding
+    from src.model.egostitch.stitch import sinkhorn_plan
+
+    assert isinstance(model, EgoStitchStage1)
+    model.set_density_ratio(1.0)  # pass-1 scores (spec Sec 13.11)
+    node_ids = sorted({node_id for pair in pairs for node_id in pair})
+    try:
+        f0_cache.parent.mkdir(parents=True, exist_ok=True)
+        matrix, index = build_f0_matrix(store, node_ids, cache_path=f0_cache)
+    except ValueError:
+        logger.warning(
+            "F0 cache at %s does not match the requested node set; recomputing without cache",
+            f0_cache,
+        )
+        matrix, index = build_f0_matrix(store, node_ids, cache_path=None)
+    if grounding_cache is None:
+        grounding_cache = f0_cache.with_name(f"{f0_cache.stem}_grounding.npz")
+    pool = build_grounding_pool(
+        np.asarray(matrix.numpy(), dtype=np.float32),
+        node_ids,
+        n_ground=model.config.n_ground,
+        cache_path=grounding_cache,
+    )
+    pool_rows = torch.tensor(
+        [[index[neighbor] for neighbor in pool[node]] for node in node_ids],
+        dtype=torch.int64,
+    )
+
+    # Cacheable per-node pass (spec Sec 10.3): one batched encode per node.
+    encode_batch = max(batch_pairs // max(model.config.slots, 1), 1)
+    h_cache: list[torch.Tensor] = []
+    pi_cache: list[torch.Tensor] = []
+    mult_cache: list[torch.Tensor] = []
+    adj_cache: list[torch.Tensor] = []
+    d_hat_cache: list[torch.Tensor] = []
+    proj_cache: list[torch.Tensor] = []
+    for start in range(0, len(node_ids), encode_batch):
+        rows = torch.arange(start, min(start + encode_batch, len(node_ids)))
+        x = matrix[rows].to(device)
+        ground_x = matrix[pool_rows[rows]].to(device)
+        with torch.inference_mode(), _autocast_context(device, amp):
+            enc: NodeEncoding = model.encode_nodes(x, ground_x)
+            proj = model.proj(x)
+        h_cache.append(enc.slots.h.float())
+        pi_cache.append(enc.slots.pi.float())
+        mult_cache.append(enc.slots.mult.float())
+        adj_cache.append(enc.slots.adj.float())
+        d_hat_cache.append(model.d_hat(enc.tok).float())
+        proj_cache.append(proj.float())
+    h_all = torch.cat(h_cache)
+    pi_all = torch.cat(pi_cache)
+    mult_all = torch.cat(mult_cache)
+    adj_all = torch.cat(adj_cache)
+    d_hat_all = torch.cat(d_hat_cache)
+    proj_all = torch.cat(proj_cache)
+
+    from src.model.egostitch.imagine import SlotSet
+
+    u_rows = torch.tensor([index[u] for u, _ in pairs], dtype=torch.int64)
+    v_rows = torch.tensor([index[v] for _, v in pairs], dtype=torch.int64)
+    is_self = u_rows == v_rows
+    out: NDArray[np.float32] = np.empty(len(pairs), dtype=np.float32)
+    filler = torch.zeros(1, dtype=torch.float32, device=device)
+
+    def _slots(rows: torch.Tensor) -> SlotSet:
+        return SlotSet(
+            h=h_all[rows],
+            pi=pi_all[rows],
+            mult=mult_all[rows],
+            gate=filler.expand(rows.shape[0], pi_all.shape[1]),
+            pointer=filler.expand(rows.shape[0], pi_all.shape[1], 1),
+            adj=adj_all[rows],
+        )
+
+    for start in range(0, len(pairs), batch_pairs):
+        end = min(start + batch_pairs, len(pairs))
+        batch_u = u_rows[start:end].to(device)
+        batch_v = v_rows[start:end].to(device)
+        batch_self = is_self[start:end].to(device)
+        s0 = torch.from_numpy(s0_logits[start:end].astype(np.float32)).to(device)
+        with torch.inference_mode(), _autocast_context(device, amp):
+            logits = torch.zeros(end - start, dtype=torch.float32, device=device)
+            sel = torch.nonzero(~batch_self, as_tuple=False).squeeze(-1)
+            if sel.numel() > 0:
+                slots_i = _slots(batch_u[sel])
+                slots_j = _slots(batch_v[sel])
+                plan = sinkhorn_plan(
+                    slots_i.h,
+                    slots_j.h,
+                    slots_i.pi,
+                    slots_j.pi,
+                    slots_i.mult,
+                    slots_j.mult,
+                    eps=model.config.sinkhorn_eps,
+                    iters=model.config.sinkhorn_iters,
+                    tau=model.config.sinkhorn_tau,
+                )
+                logits[sel] = model.decision(
+                    s0[sel],
+                    slots_i,
+                    slots_j,
+                    plan,
+                    proj_all[batch_u[sel]],
+                    proj_all[batch_v[sel]],
+                    d_hat_all[batch_u[sel]],
+                    d_hat_all[batch_v[sel]],
+                ).float()
+            sel = torch.nonzero(batch_self, as_tuple=False).squeeze(-1)
+            if sel.numel() > 0:
+                logits[sel] = model.decision.forward_self(
+                    s0[sel],
+                    _slots(batch_u[sel]),
+                    proj_all[batch_u[sel]],
+                    d_hat_all[batch_u[sel]],
+                ).float()
+        out[start:end] = logits.detach().to(torch.float32).cpu().numpy().reshape(-1)
+        _log_progress(end, len(pairs), end - start)
+    return out
+
+
 def _shard_range(num_rows: int, shard: int, num_shards: int) -> tuple[int, int]:
     """Return shard `shard`-of-`num_shards`'s contiguous ``[start, end)`` row range.
 
@@ -723,6 +912,23 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--token-budget", type=int, default=131_072, help="v3_1 tokens per batch")
     score.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
     score.add_argument("--amp", choices=["off", "bf16"], default="off")
+    score.add_argument(
+        "--b0-scores",
+        type=Path,
+        default=None,
+        help="frozen-B0 scores .npz supplying s0 (required for egostitch; spec Sec 13.10)",
+    )
+    score.add_argument(
+        "--s0-checkpoint-id",
+        default="e092537d8cf1e208",
+        help="required checkpoint_id of --b0-scores (the audited frozen B0)",
+    )
+    score.add_argument(
+        "--grounding-cache",
+        type=Path,
+        default=None,
+        help="grounding-pool cache path (egostitch only; built when absent)",
+    )
     score.add_argument("--shard", type=int, default=None, help="shard index K (with --num-shards)")
     score.add_argument("--num-shards", type=int, default=None, help="total shard count N")
     score.add_argument(
@@ -796,6 +1002,7 @@ def _run_score(args: argparse.Namespace) -> None:
     row_labels = labels[start:end]
 
     store = FeatureStore(args.data_root / _FEATURES_SUBDIR)
+    meta_extra: dict[str, object] = {}
     if model_family == "v3_1":
         logits = _score_v3_1(
             model, row_pairs, store, device=device, amp=args.amp, token_budget=args.token_budget
@@ -810,6 +1017,44 @@ def _run_score(args: argparse.Namespace) -> None:
             batch_pairs=args.batch_pairs,
             f0_cache=args.f0_cache,
         )
+    elif model_family == "egostitch":
+        if args.b0_scores is None:
+            raise ValueError(
+                "egostitch scoring requires --b0-scores (the frozen-B0 s0 cache, spec Sec 13.10)"
+            )
+        s0_artifact = load_scores(args.b0_scores)
+        actual_s0_id = s0_artifact.meta.get("checkpoint_id")
+        if actual_s0_id != args.s0_checkpoint_id:
+            raise ValueError(
+                f"--b0-scores checkpoint_id mismatch: expected {args.s0_checkpoint_id!r}, "
+                f"got {actual_s0_id!r} (spec Sec 13.10: s0 is the audited frozen B0)"
+            )
+        s0_rows = _align_s0_logits(s0_artifact, row_pairs)
+        logits = _score_egostitch(
+            model,
+            row_pairs,
+            store,
+            device=device,
+            amp=args.amp,
+            batch_pairs=args.batch_pairs,
+            f0_cache=args.f0_cache,
+            grounding_cache=args.grounding_cache,
+            s0_logits=s0_rows,
+        )
+        logits64 = logits.astype(np.float64)
+        probs = np.where(
+            logits64 >= 0,
+            1.0 / (1.0 + np.exp(-np.abs(logits64))),
+            np.exp(-np.abs(logits64)) / (1.0 + np.exp(-np.abs(logits64))),
+        )
+        meta_extra = {
+            "s0_checkpoint_id": args.s0_checkpoint_id,
+            "density_calibration": {
+                "pass": 1,
+                "rho_hat_eval": float(np.mean(probs)) if len(probs) else 0.0,
+                "note": "Stage-1 scores are pass-1 scores (spec Sec 13.11)",
+            },
+        }
     else:  # pragma: no cover - build_model already rejects unknown families
         raise ValueError(f"no scoring path for model_family {model_family!r}")
 
@@ -823,6 +1068,7 @@ def _run_score(args: argparse.Namespace) -> None:
         "num_rows": total_rows,
         "created_utc": datetime.now(UTC).isoformat(),
         "torch_version": str(torch.__version__),
+        **meta_extra,
     }
     save_scores(
         output,

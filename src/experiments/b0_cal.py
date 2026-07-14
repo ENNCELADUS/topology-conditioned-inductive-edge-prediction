@@ -438,6 +438,16 @@ def run_b0_cal_pipeline(
         "b0_cal_selfdensity": selfdensity_row,
         "b0_cal_degseq": degseq_row,
     }
+    arm_graphs = {
+        "b0": b0_graph,
+        "b0_cal_density": cal_density_graph,
+        "b0_cal_selfdensity": selfdensity_graph,
+        "b0_cal_degseq": degseq_graph,
+    }
+    # Realized non-self edge counts: the G5 gate's matched-global-RD quotas.
+    realized_non_self_edges = {
+        arm: int(strip_self_loops(graph).number_of_edges()) for arm, graph in arm_graphs.items()
+    }
     assembled: dict[str, object] = {arm: _assembled_row_to_dict(arm_rows[arm]) for arm in _ALL_ARMS}
     headroom: dict[str, object] = {
         arm: dataclasses.asdict(compute_headroom(b0_row, arm_rows[arm])) for arm in _CAL_ARMS
@@ -524,6 +534,8 @@ def run_b0_cal_pipeline(
             "null where the frozen gap is zero"
         ),
         "g3_b0_cross_check": g3_b0_check,
+        "realized_non_self_edges": realized_non_self_edges,
+        "target_edges": target_edges,
         "notes": {
             "b0_cal_density_identical_edge_set": density_identical,
             "kill_test_role": (

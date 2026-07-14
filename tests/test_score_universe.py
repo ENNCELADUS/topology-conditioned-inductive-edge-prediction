@@ -599,3 +599,156 @@ def test_cli_missing_checkpoint_raises_system_exit(tmp_path: Path) -> None:
                 "cpu",
             ]
         )
+
+
+# --------------------------------------------------------------------------- egostitch scoring
+
+
+_TINY_EGOSTITCH_CONFIG: dict[str, object] = {
+    "input_dim": INPUT_DIM,
+    "d_p": 4,
+    "d_z": 4,
+    "d_h": 8,
+    "slots": 3,
+    "m_max": 8,
+    "n_ground": 2,
+    "decoder_layers": 1,
+    "n_heads": 2,
+    "gin_hidden": 8,
+    "gin_layers": 2,
+    "sinkhorn_iters": 3,
+}
+_EGOSTITCH_NODES = [f"e{i}" for i in range(5)]
+# Includes a self-pair: it must route through the single-ego path.
+_EGOSTITCH_PAIRS = [("e0", "e1"), ("e1", "e2"), ("e0", "e3"), ("e2", "e4"), ("e3", "e3")]
+
+
+def _egostitch_setup(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    """Feature store + checkpoint + pairs TSV + covering b0-scores artifact."""
+    torch.manual_seed(0)
+    node_tokens = {node: torch.randn(3 + i, INPUT_DIM) for i, node in enumerate(_EGOSTITCH_NODES)}
+    data_root = _data_root_with_features(tmp_path, node_tokens)
+
+    model = score_universe.build_model("egostitch", dict(_TINY_EGOSTITCH_CONFIG))
+    checkpoint_path = tmp_path / "egostitch.pt"
+    _write_checkpoint(
+        checkpoint_path,
+        model=model,
+        model_family="egostitch",
+        model_config=dict(_TINY_EGOSTITCH_CONFIG),
+    )
+
+    pairs_path = tmp_path / "pairs.tsv"
+    pairs_path.write_text("".join(f"{u}\t{v}\n" for u, v in _EGOSTITCH_PAIRS))
+
+    b0_path = tmp_path / "b0_scores.npz"
+    position = {node: i for i, node in enumerate(_EGOSTITCH_NODES)}
+    score_universe.save_scores(
+        b0_path,
+        node_ids=list(_EGOSTITCH_NODES),
+        u_idx=np.array([position[u] for u, _ in _EGOSTITCH_PAIRS], dtype=np.int32),
+        v_idx=np.array([position[v] for _, v in _EGOSTITCH_PAIRS], dtype=np.int32),
+        logit=np.linspace(-1.0, 1.0, len(_EGOSTITCH_PAIRS)).astype(np.float32),
+        label=np.full(len(_EGOSTITCH_PAIRS), -1, dtype=np.int8),
+        row_start=0,
+        meta={
+            "checkpoint_id": "cafecafecafecafe",
+            "model_family": "v3_1",
+            "pairs_source": "file",
+            "strategy": "breadth_first",
+            "num_rows": len(_EGOSTITCH_PAIRS),
+            "created_utc": "2026-07-14T00:00:00+00:00",
+            "torch_version": str(torch.__version__),
+        },
+    )
+    return data_root, checkpoint_path, pairs_path, b0_path
+
+
+def _egostitch_score_args(
+    tmp_path: Path, data_root: Path, checkpoint: Path, pairs: Path, b0: Path, output: Path
+) -> list[str]:
+    return [
+        "score",
+        "--checkpoint",
+        str(checkpoint),
+        "--pairs",
+        f"file:{pairs}",
+        "--data-root",
+        str(data_root),
+        "--output",
+        str(output),
+        "--batch-pairs",
+        "3",
+        "--b0-scores",
+        str(b0),
+        "--s0-checkpoint-id",
+        "cafecafecafecafe",
+        "--f0-cache",
+        str(tmp_path / "f0_cache.pt"),
+        "--grounding-cache",
+        str(tmp_path / "grounding.npz"),
+        "--device",
+        "cpu",
+    ]
+
+
+def test_build_model_egostitch_round_trips() -> None:
+    from src.model.egostitch import EgoStitchStage1
+
+    model = score_universe.build_model("egostitch", dict(_TINY_EGOSTITCH_CONFIG))
+    assert isinstance(model, EgoStitchStage1)
+    assert model.config.slots == 3
+
+
+def test_egostitch_cli_scores_end_to_end_with_self_pair(tmp_path: Path) -> None:
+    data_root, checkpoint, pairs, b0 = _egostitch_setup(tmp_path)
+    output = tmp_path / "scores.npz"
+    score_universe.main(_egostitch_score_args(tmp_path, data_root, checkpoint, pairs, b0, output))
+    artifact = score_universe.load_scores(output)
+    assert len(artifact.logit) == len(_EGOSTITCH_PAIRS)
+    assert bool(np.isfinite(artifact.logit).all())
+    assert artifact.meta["model_family"] == "egostitch"
+    assert artifact.meta["s0_checkpoint_id"] == "cafecafecafecafe"
+    density = artifact.meta["density_calibration"]
+    assert isinstance(density, dict)
+    assert density["pass"] == 1
+    assert 0.0 <= float(density["rho_hat_eval"]) <= 1.0
+
+
+def test_egostitch_cli_is_deterministic(tmp_path: Path) -> None:
+    data_root, checkpoint, pairs, b0 = _egostitch_setup(tmp_path)
+    out_a, out_b = tmp_path / "a.npz", tmp_path / "b.npz"
+    for output in (out_a, out_b):
+        score_universe.main(
+            _egostitch_score_args(tmp_path, data_root, checkpoint, pairs, b0, output)
+        )
+    np.testing.assert_array_equal(
+        score_universe.load_scores(out_a).logit, score_universe.load_scores(out_b).logit
+    )
+
+
+def test_egostitch_cli_requires_b0_scores(tmp_path: Path) -> None:
+    data_root, checkpoint, pairs, b0 = _egostitch_setup(tmp_path)
+    args = _egostitch_score_args(tmp_path, data_root, checkpoint, pairs, b0, tmp_path / "out.npz")
+    idx = args.index("--b0-scores")
+    del args[idx : idx + 2]
+    with pytest.raises(ValueError, match="requires --b0-scores"):
+        score_universe.main(args)
+
+
+def test_egostitch_cli_rejects_s0_checkpoint_mismatch(tmp_path: Path) -> None:
+    data_root, checkpoint, pairs, b0 = _egostitch_setup(tmp_path)
+    args = _egostitch_score_args(tmp_path, data_root, checkpoint, pairs, b0, tmp_path / "out.npz")
+    args[args.index("--s0-checkpoint-id") + 1] = "0000000000000000"
+    with pytest.raises(ValueError, match="checkpoint_id mismatch"):
+        score_universe.main(args)
+
+
+def test_egostitch_cli_hard_fails_on_missing_s0_pair(tmp_path: Path) -> None:
+    data_root, checkpoint, pairs, b0 = _egostitch_setup(tmp_path)
+    # Rewrite the pairs file with a pair the b0 artifact does not cover.
+    pairs.write_text(pairs.read_text() + "e1\te4\n")
+    with pytest.raises(ValueError, match="missing pair"):
+        score_universe.main(
+            _egostitch_score_args(tmp_path, data_root, checkpoint, pairs, b0, tmp_path / "o.npz")
+        )
