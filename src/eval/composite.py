@@ -1,4 +1,4 @@
-"""Perturbation sanity check for official PRING graph similarity.
+"""Perturbation sanity check for official graph similarity.
 
 No dependence on `src.data` or `torch`.
 """
@@ -103,7 +103,7 @@ def perturbation_check(
     seed: int,
     modes: tuple[str, ...] = ("degree_preserving_swap", "uniform_rewire"),
 ) -> PerturbationCheckResult:
-    """Validate that official PRING GS decreases monotonically under perturbation.
+    """Validate that official GS decreases monotonically under perturbation.
 
     For each mode and fraction, `n_trials` independent perturbed copies of `g_ref`
     are compared back against `g_ref`; the macro-averaged per-subgraph GS is recorded.

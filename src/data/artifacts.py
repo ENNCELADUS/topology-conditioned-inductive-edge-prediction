@@ -1,7 +1,7 @@
 """Benchmark artifact loader and verification for `benchmark_2025_neurips`.
 
 Loads the repository-local artifact package (see ``data/README.md`` and
-``docs/06-egostitch-spec.md`` §9) and verifies it against the pinned constants
+``docs/05-egostitch-spec.md`` §9) and verifies it against the pinned constants
 measured on 2026-07-09. This module is intentionally dependency-light: only
 ``networkx``, ``numpy``, and the standard library. It must not import
 ``src/data/features.py`` or ``torch``.

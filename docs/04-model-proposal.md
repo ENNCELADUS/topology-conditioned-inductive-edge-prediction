@@ -1,7 +1,7 @@
 # Model Proposal: EgoStitch — Community-Conditioned Ego-Network Imagination with Consensus Stitching for Topology-Conditioned Inductive Edge Prediction
 
 **Status:** **revision 2.2** — approved as a design proposal (2026-07-09); **gate G4
-signed off 2026-07-09**, so `06-egostitch-spec.md` (including its §9 benchmark
+signed off 2026-07-09**, so `05-egostitch-spec.md` (including its §9 benchmark
 binding and §10–11 batch-sampler/single-H20 contracts) is now the active implementation
 contract. Companion to `03-experiment-protocol.md` (updated 2026-07-09 with the
 approved [protocol-Δ] items) and `02-methodology.md`.
@@ -10,9 +10,9 @@ approved [protocol-Δ] items) and `02-methodology.md`.
 2026-07-07. Revision 2 (2026-07-08) followed a full fan-out review of the local vault
 (~90 PDFs) plus targeted external novelty-risk searches on the arXiv API. Revision 2.1
 (2026-07-08) incorporates a simulated 5-persona design review (Editor-in-Chief,
-methodology, domain, cross-disciplinary/CV, Devil's Advocate; full record in
-`05-review-report.md`) — the panel's design-stage findings are fixed in this text, and
-its experiment-stage findings are registered as pre-implementation gates (§6.0).
+methodology, domain, cross-disciplinary/CV, Devil's Advocate) — the panel's
+design-stage findings are fixed in this text, and its experiment-stage findings are
+registered as pre-implementation gates (§6.0).
 Revision 2.2 (2026-07-09) follows full-text verification of the 21 papers previously
 cited from abstracts only (now in the vault); all corrections are listed in the 2.2
 change block below. All cited papers were verified against local PDFs or the arXiv
@@ -60,8 +60,9 @@ constrain the *scaffold* exactly and influence the *assembly* through shaped mar
 5. **Narrowed, qualifier-scoped novelty claims** and the §5 threat matrix.
 6. **Evaluation hardening package** (§6.4).
 
-**What changed in revision 2.1** (panel findings; reviewer tags refer to
-`05-review-report.md`):
+**What changed in revision 2.1** (panel findings; `R1`–`R4` / `DA` tags identify the
+reviewer persona that raised each one — EIC, methodology, domain, cross-disciplinary,
+Devil's Advocate):
 
 - **(a) Scaffold/assembly scope correction** [R1-W3, R3-W3, DA-C1, R2-W3 — unanimous]:
   all "hard guarantee" language is now scoped to the scaffold; assembly-level effects
@@ -129,7 +130,7 @@ papers; two shard reports in the session record):
   degree-corrected negatives explicitly (2405.14985).
 - **(p) Metric-validation additions (O'Bray 2106.01098).** Per-statistic bin-count
   disclosure; no ad-hoc EMD/TV kernels without justification; MMD-based diagnostics
-  must pass an expressivity/robustness perturbation check. Official PRING Graph
+  must pass an expressivity/robustness perturbation check. Official Graph
   Similarity and Relative Density remain separately reported metrics.
 - **(q) Scope qualifiers.** GraphMAE's feature-target evidence is for classification
   (its own text concedes GAEs are strong at LP) — R4 rests on the shortcut argument
@@ -151,9 +152,9 @@ papers; two shard reports in the session record):
 
 ## 1. Critique of the current scaffold contract
 
-> **Metric note (2026-07-14):** official PRING GS/RD were formally rerun on the frozen
+> **Metric note (2026-07-14):** official BFS-macro GS/RD were formally rerun on the frozen
 > score artifacts over all 500 fixed induced subgraphs. The final G1/G3 artifacts are
-> `outputs/deliverables/g1_pring_20260714/` and `outputs/deliverables/g3_pring_20260714/`;
+> `outputs/deliverables/g1_graph_metrics_20260714/` and `outputs/deliverables/g3_graph_metrics_20260714/`;
 > the MMD component ratios are unchanged canonical-run values.
 
 Current contract (`03-experiment-protocol.md` §0):
@@ -169,7 +170,7 @@ p_ij = σ(pair_logit(i, j) + scaffold_residual(H_i, H_j))
 
 Scaffold edges are thresholded outputs of the same frozen pairwise scorer whose
 assembled output G1 proved structurally implausible (global simple-edge RD `0.997710`,
-official PRING BFS-macro GS/RD `0.312151/0.422345`, and degree/clustering/spectral MMD ratios
+official BFS-macro GS/RD `0.312151/0.422345`, and degree/clustering/spectral MMD ratios
 `13.0768/11.9273/18.0931`). `T_ij` is a local patch of exactly the pathological graph
 the method is supposed to fix, and systematic B0 errors — hub over-prediction,
 similarity–adjacency conflation — are inherited by the context and then "corrected" by a
@@ -177,8 +178,8 @@ residual conditioned on those same errors.
 
 A separate checkpoint-only evaluation of the aligned legacy `v3_1` scorer used the frozen
 scores from run `legacy_v31_s47_20260712T193900Z`; its final evaluator artifact is
-`outputs/deliverables/legacy_g1_pring_20260714/`. The official PRING rerun gives
-global simple-edge RD `0.978392`, PRING BFS-macro GS/RD `0.381264/0.500179`, and
+`outputs/deliverables/legacy_g1_graph_metrics_20260714/`. The official metric rerun gives
+global simple-edge RD `0.978392`, BFS-macro GS/RD `0.381264/0.500179`, and
 degree/clustering/spectral MMD ratios
 `13.8456/11.6277/19.9774` despite degree-corrected AUROC/AUPRC
 `0.799577/0.813319`; stronger edge ranking therefore does not remove the topology gap.
@@ -242,7 +243,7 @@ the new design's residual pool sensitivity is measured, not assumed away.
 
 ### 1.6 A local residual cannot repair distributional failures — and the honest limit of any local fix
 
-G1's failure is distributional (global simple-edge RD `0.997710`, PRING BFS-macro
+G1's failure is distributional (global simple-edge RD `0.997710`, BFS-macro
 GS/RD `0.312151/0.422345`, and degree/clustering/spectral MMD ratios 13.0768, 11.9273,
 and 18.0931). Independent per-query residuals have no channel for node-level degree budgets or community-level edge
 budgets. EgoStitch's answer is to inject those budgets as *evidence within each
@@ -678,7 +679,7 @@ finding].
 
 | E2 failure (assembly-level) | Scaffold-level mechanism | Transmission to assembly | Measured by |
 |---|---|---|---|
-| PRING BFS-macro RD 0.422345 despite global simple-edge RD 0.997710 | hard K-representable budget masking in harmonization | budget-pressure features in `s3` shift marginals | degree-calibration diagnostic (E[d̂] vs realized assembled degree) |
+| BFS-macro RD 0.422345 despite global simple-edge RD 0.997710 | hard K-representable budget masking in harmonization | budget-pressure features in `s3` shift marginals | degree-calibration diagnostic (E[d̂] vs realized assembled degree) |
 | Degree MMD ratio 13.0768 | cardinality tie `Σπ·m ↔ d̂` (doubly supervised) | degree-aware marginals across each node's queries | assembled degree MMD + per-node calibration curve |
 | Clustering MMD ratio 11.9273 | slot–slot adjacency + closure channel `s2` + motif-conductance code supervision | closure evidence raises/lowers triangle-completing marginals | assembled clustering MMD + edge-independence ceiling comparison |
 | Spectral MMD ratio 18.0931 | community codebook + block prior | block-consistent marginals shape mesoscale spectrum | assembled spectral MMD (held-out kernel per §6.4.2) |
@@ -730,10 +731,10 @@ requires the query node's observed edges at inference; none can score a pair of
 zero-edge nodes; none grades the graph its predictions assemble into.** The final G1
 result is AUROC 0.705519 / AUPRC 0.730260 on degree-corrected negatives, falling to
 0.583965 / 0.626649 on hard heuristic negatives and 0.569560 / 0.617475 on hard feature
-negatives, while global simple-edge RD is `0.997710` but official PRING BFS-macro
+negatives, while global simple-edge RD is `0.997710` but official BFS-macro
 GS/RD are `0.312151/0.422345`. The failure survives
 G1. B0-alt independently reaches 0.693603 / 0.732509 on degree-corrected negatives but
-assembles with global simple-edge RD `0.998739`, PRING BFS-macro GS/RD
+assembles with global simple-edge RD `0.998739`, BFS-macro GS/RD
 `0.345802/0.450793`, and MMD ratios
 `15.8304/13.4718/23.4734`, closing the required architecture-independence arm. PA-null
 wins in some edge regimes and remains a mandatory control.
@@ -879,7 +880,7 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   use), one candidate universe, one canonical metric normalization, a true threshold
   sweep (recall/density-vs-MMD curves), easy *and* hard negatives, B0-alt replication,
   a real-vs-real MMD noise floor, bootstrap variance over buckets/seeds, and official
-  PRING Graph Similarity / Relative Density over the fixed induced subgraphs. Also record the full-candidate-universe
+  official Graph Similarity / Relative Density over the fixed induced subgraphs. Also record the full-candidate-universe
   imbalance view [DA-m17]. *Stop condition:* if the gap substantially closes under hard
   negatives or calibrated thresholds, the motivation is dead as stated and the project
   pivots to the evaluation/benchmark paper. **Result (2026-07-13): passed and closed;**
@@ -906,14 +907,14 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   (assembly-time coupling would be a different paper) rather than building a model
   that cannot succeed.
 - **G3 — Oracle first [DA-M10].** Run the Oracle row (observed-neighborhood scaffold)
-  before implementation: it calibrates whether the G1 PRING GS `0.312151` is poor, bounds all possible
+  before implementation: it calibrates whether the G1 BFS-macro GS `0.312151` is poor, bounds all possible
   gains, and separates "conditioning is the missing ingredient" from "features are
   insufficient." *Stop condition:* Oracle ≈ B0 on assembled metrics ⇒ feature
   insufficiency; topology conditioning cannot help; pivot.
 - **G4 — Specification freeze.** The algorithm box (Stitch + Harmonize pseudocode
   with tensor shapes, OT cost/ε, quantile schedule, budget tolerance τ_b, gradient
   estimators) and the loss tree with interior weights are **delivered in
-  `06-egostitch-spec.md` and signed off (2026-07-09)**; the
+  `05-egostitch-spec.md` and signed off (2026-07-09)**; the
   spec is the implementation contract and deviations require a spec edit first.
   *Stop condition:* none — this is a deliverable.
 - **G5 — Minimum-viable-model milestone [EIC].** Stage 1: imagination + degree budget
@@ -1017,7 +1018,7 @@ quality).
    never aggregate MMDs naively; MMD diagnostics must pass an
    **expressivity/robustness perturbation check** (metric
    increases monotonically under controlled perturbation of real graphs; bounded
-   response to small perturbations) before they rank anything. Official PRING GS/RD
+   response to small perturbations) before they rank anything. Official BFS-macro GS/RD
    are reported separately; MMD components are always
    reported; bootstrap variance over buckets/seeds; the real-vs-real noise floor as
    the zero line. MMD is a *ported* two-sample statistic never validated as a GGM
@@ -1103,7 +1104,7 @@ block-model marginals close most of the pair-to-topology gap") if the controls w
 | Channel collinearity (s1≈s0, s2≈s3 ⇒ Ours→B5) | correlation matrix + knockouts + FCR-stratified pre-registered prediction; §6.5 decision rule (ii) |
 | Gains explained by extra parameters or operating point | B1/B5/`B0+cal`/`B3-dist`/`B3-full` + randomized scaffold at matched capacity + identical-head comparison + density-matched thresholds |
 | Assembled-graph realism capped by edge independence | G2 ceiling computed first; all tables read against it; stop condition defined |
-| E2 numbers fragile (weak scorer, easy negatives, undefined composite, mixed normalization) | G1 rerun completed with hard negatives and official PRING GS/RD; current claims route only to the 2026-07-14 formal artifacts, and "strong scorer" wording remains retired [DA-m16] |
+| E2 numbers fragile (weak scorer, easy negatives, undefined composite, mixed normalization) | G1 rerun completed with hard negatives and official BFS-macro GS/RD; current claims route only to the 2026-07-14 formal artifacts, and "strong scorer" wording remains retired [DA-m16] |
 | Budget prior breaks under benchmark density shift | `d̂` normalized per candidate-universe density (§4.1); E6 checks |
 | Grounding collapse under `L_ssl` | pool-consistency applied to ungrounded slots only; mean `g^k` monitored |
 | Stochastic inference irreproducible | §4.0 determinism policy (fixed samples, averaged `p_ij`, seeds) |

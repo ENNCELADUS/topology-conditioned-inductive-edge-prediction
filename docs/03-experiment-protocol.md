@@ -3,7 +3,7 @@
 **Status:** repository-local experiment plan for an abstract graph ML benchmark.
 **Updated 2026-07-09:** incorporates the approved `[protocol-Δ]` items from
 `04-model-proposal.md` revision 2.1 (approved as a design proposal; **gate G4 was
-signed off later the same day — `06-egostitch-spec.md` is now the implementation
+signed off later the same day — `05-egostitch-spec.md` is now the implementation
 contract**, including its §9 benchmark binding / data contract and §10–11
 batch-sampler and four-H20 E2 production execution design). Changes:
 pre-implementation gates G1–G5, baseline ladder extensions (`B0+cal`, `B3-dist`,
@@ -57,7 +57,7 @@ p_ij = sigmoid(pair_logit(i, j) + scaffold_residual(H_i, H_j))
 **Disposition (2026-07-09):** this retrieved-and-thresholded instantiation is retained as
 **ablation arm E4.10** (the bridge baseline). The method under test (`Ours`) is the
 generated-and-harmonized scaffold defined in `04-model-proposal.md` §4 with the frozen
-algorithm spec in `06-egostitch-spec.md`; the *outer* boundary above (per-query local
+algorithm spec in `05-egostitch-spec.md`; the *outer* boundary above (per-query local
 context from frozen features → conditioned classifier → binary label) is unchanged and
 remains locked.
 
@@ -106,7 +106,7 @@ Components:
     path-length summaries, a learned-graph-feature distance from an encoder never used in
     training, and the discriminator probe (accuracy of a held-out classifier distinguishing
     assembled from real subgraphs; near-chance = realism).
-  - *PRING Graph Similarity / Relative Density:* for every fixed sampled node set, take the
+  - *Official Graph Similarity / Relative Density:* for every fixed sampled node set, take the
     predicted and reference induced subgraphs and compute
     `GS = 1 - ||A_pred - A_ref||_1 / (sum(A_pred) + sum(A_ref))` (equivalently edge
     Dice/F1 for an undirected simple graph) and
@@ -141,7 +141,7 @@ Components:
     lower is better. A `1e-12` denominator floor is only a numerical guard.
 - **Repository artifacts:** this protocol, [E2-pair-to-topology-gap.md](results/E2-pair-to-topology-gap.md),
   [e2-gap.html](../figures/e2-gap.html), [positioning.html](../figures/positioning.html),
-  [04-model-proposal.md](04-model-proposal.md), [06-egostitch-spec.md](06-egostitch-spec.md).
+  [04-model-proposal.md](04-model-proposal.md), [05-egostitch-spec.md](05-egostitch-spec.md).
 
 ---
 
@@ -163,7 +163,7 @@ Components:
 | **PA-null** | Preferential-attachment null | `s_ij = k_i·k_j` from training-side degree statistics, reported with each benchmark's degree heterogeneity σ (log-normal fit) | Validity precondition (2405.14985): under uniform negatives this null averages AUC 0.83; any method not clearly beating it has an uninformative edge metric |
 | **Odds-product** | Degree-respecting edge-independent baseline | `P_ij = σ(ℓ_i + ℓ_j)` fitted to the expected degree sequence (Chanpuriya 2111.00048 §3) | Cheapest degree-budget-honoring assembly with zero topology conditioning; also supplies the G2 overlap dial `P̃ = (1−ω)P + ωA` |
 | **DEAL / Graph2Gauss** | External attribute-only baselines | DEAL 2007.08053; Graph2Gauss 1707.03815 | Independent-scoring SOTA for the setting; falsifiable prediction: both exhibit the E2 failure mode |
-| **Ours** | Per-query generated local scaffold + conditioning | EgoStitch per `04-model-proposal.md` §4 / `06-egostitch-spec.md` | Conditioning the decision on generated, harmonized local topology |
+| **Ours** | Per-query generated local scaffold + conditioning | EgoStitch per `04-model-proposal.md` §4 / `05-egostitch-spec.md` | Conditioning the decision on generated, harmonized local topology |
 | **Oracle** | Observed-graph upper bound | Uses true held-out graph neighborhoods at evaluation time (pinned instantiation: §5.0 G3) | Headroom; violates the inductive protocol; **run first (gate G3)** |
 
 All fair baselines share the same frozen features, splits, query sets, message/supervision
@@ -199,7 +199,7 @@ prioritized in Section 5 (gates first).
   universe, one canonical metric normalization, a true threshold sweep (recall/density-vs-MMD
   curves), easy, hard (HeaRT-style), **and degree-corrected** (2405.14985) negatives, B0-alt
   replication, the PA-null row, real-vs-real noise floor, bootstrap variance, a defined
-  official PRING Graph Similarity and Relative Density over the fixed sampled subgraphs,
+  official Graph Similarity and Relative Density over the fixed sampled subgraphs,
   an expressivity/robustness perturbation diagnostic (O'Bray 2106.01098), and the
   full-candidate-universe imbalance view.
 - **Execution acceptance:** E2 uses a fixed 30-epoch four-H20 throughput run. Validation
@@ -207,21 +207,21 @@ prioritized in Section 5 (gates first).
   for the first systems-optimization pass. The wall-clock gate is 60 minutes from an empty
   derived-cache path through final training artifacts.
 - **Result (updated 2026-07-14):** G1 is complete with B0, B0-alt, and PA-null. Official
-  PRING GS/RD were formally rerun on the frozen score artifacts over all 500 fixed induced
-  subgraphs; the final artifact is `outputs/deliverables/g1_pring_20260714/`. The B0
+  BFS-macro GS/RD were formally rerun on the frozen score artifacts over all 500 fixed induced
+  subgraphs; the final artifact is `outputs/deliverables/g1_graph_metrics_20260714/`. The B0
   degree-corrected ratio-1 row is AUROC 0.705519 / AUPRC 0.730260; the hard-heuristic
   row is 0.583965 / 0.626649; the hard-feature row is 0.569560 / 0.617475; and the full
   candidate-universe row is 0.690627 / 0.134302. At the quota-calibrated operating point,
-  global simple-edge RD is `0.997710`, while official PRING BFS-macro GS/RD are
+  global simple-edge RD is `0.997710`, while official BFS-macro GS/RD are
   `0.312151/0.422345`, with degree/clustering/spectral MMD ratios
   `13.0768/11.9273/18.0931`.
   The ratios use the fixed-`sigma=1` Gaussian-TV biased MMD² numerator divided by the
   deterministic real-vs-real reference floor; `1` is that floor and lower is better.
   B0-alt reaches 0.693603 / 0.732509 on the degree-corrected row, 0.576711 / 0.623517
   on hard heuristic negatives, and 0.467864 / 0.561339 on hard feature negatives. Its
-  independently calibrated assembly has global simple-edge RD `0.998739`, PRING
+  independently calibrated assembly has global simple-edge RD `0.998739`,
   BFS-macro GS/RD `0.345802/0.450793`, and degree/clustering/spectral MMD ratios
-  15.8304/13.4718/23.4734. PA-null has global simple-edge RD `1.000000` and PRING
+  15.8304/13.4718/23.4734. PA-null has global simple-edge RD `1.000000` and
   BFS-macro GS/RD `0.245377/0.489125`.
   The gap therefore survives an alternate architecture, hard negatives, and calibrated
   thresholds, although PA-null beats B0 in the easy and feature-hard rows and remains a
@@ -230,12 +230,12 @@ prioritized in Section 5 (gates first).
   `Ov_min=0.054954`
   at matched volume is sufficient to reach the reference triangle count; the full ceiling
   curve and caveats are in the synced G2 artifact.
-- **G3 result (canonical PRING rerun 2026-07-14):** B0 has global simple-edge RD
-  `0.997710` and PRING BFS-macro GS/RD `0.312151/0.422345`. The pinned `oracle_topo`
-  arm has global simple-edge RD `1.000000` and PRING BFS-macro GS/RD `0.503048/0.794303`
+- **G3 result (canonical metric rerun 2026-07-14):** B0 has global simple-edge RD
+  `0.997710` and BFS-macro GS/RD `0.312151/0.422345`. The pinned `oracle_topo`
+  arm has global simple-edge RD `1.000000` and BFS-macro GS/RD `0.503048/0.794303`
   (GS ratio `1.61155`) and MMD ratios `14.1148/8.23662/16.0772`, with per-statistic
   headroom `0.926465/1.44808/1.12539`. The disclosed `oracle_blend` arm also has global
-  simple-edge RD `1.000000` and reaches PRING BFS-macro GS/RD `0.323649/0.652734` (GS ratio
+  simple-edge RD `1.000000` and reaches BFS-macro GS/RD `0.323649/0.652734` (GS ratio
   `1.03683`) with MMD ratios `7.58890/3.06980/9.05715` and headroom
   `1.72315/3.88537/1.99767`. The Oracle arms are not approximately equal
   to B0 across assembled metrics, so the feature-insufficiency stop rule is not triggered
@@ -248,7 +248,7 @@ degree-corrected ratio-1 row was `0.799577/0.813319`, hard-heuristic
 `0.626746/0.663360`, and hard-feature `0.510083/0.602131`. This is an evaluation
 rerun of a supplied checkpoint, not a replacement for the formal four-H20 E2 training
 acceptance or the canonical B0/B0-alt/G3 gate artifacts. The same scores were rerun through
-the official PRING evaluator on 2026-07-14: global simple-edge RD is `0.978392`, PRING
+the official benchmark evaluator on 2026-07-14: global simple-edge RD is `0.978392`,
 BFS-macro GS/RD are `0.381264/0.500179`, and degree/clustering/spectral MMD ratios are
 `13.8456/11.6277/19.9774`. The stronger scorer improves GS but does not close the
 topology gap.
@@ -286,7 +286,7 @@ topology gap.
 14. **Channels:** per-channel knockouts (s1/s2/s3/s4) with the s-channel correlation matrix.
 
 **Identical-head convention:** all generator comparisons (E4.6, E4.10, Oracle-scaffold) use the
-same fused decision head with the input-mapping convention of `06-egostitch-spec.md` (retrieved
+same fused decision head with the input-mapping convention of `05-egostitch-spec.md` (retrieved
 neighbors as π=1, m=1 slots; Π from identity matches), head retrained per arm under the matched
 tuning budget.
 
@@ -392,7 +392,7 @@ rule).
    Evaluation-side access only; the row is protocol-violating by design and never a fair
    baseline. `hard_heuristic` regime rows for `oracle_topo` are degenerate by construction
    (negatives are CN/AA-selected) and are disclosed as such.
-4. **G4 — Specification freeze.** `06-egostitch-spec.md` reviewed and signed off; it then
+4. **G4 — Specification freeze.** `05-egostitch-spec.md` reviewed and signed off; it then
    becomes the implementation contract. **Done 2026-07-09** (sign-off recorded in the spec's
    change log; the spec's §9 data contract additionally quarantines the shipped
    `*_ratio5_exclusive.txt` negatives and `train_graph.pkl`-as-target — both leak across the
@@ -448,7 +448,7 @@ rule).
 
 1. **Gate reports (G1–G3):** G1 B0/PA-null/B0-alt, the G2 ceiling computation, and
    the G3 Oracle row are complete; the alternate architecture preserves the topology gap.
-2. **Spec freeze (G4):** signed-off `06-egostitch-spec.md`.
+2. **Spec freeze (G4):** signed-off `05-egostitch-spec.md`.
 3. **E1/E3 main table:** method by edge AUPRC, both assembled families, ceiling/Oracle/noise
    rows, diagnostics.
 4. **E4 ablation table:** each mechanism and its edge/topology effect; the pruned submitted

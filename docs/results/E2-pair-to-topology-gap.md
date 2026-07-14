@@ -1,6 +1,6 @@
 # E2 Pair-to-Topology Gap: G1/G2/G3 Gate Results
 
-> **Metric scope (2026-07-14):** official PRING Graph Similarity (GS) and Relative
+> **Metric scope (2026-07-14):** official benchmark Graph Similarity (GS) and Relative
 > Density (RD) were formally rerun on frozen score artifacts over all 500 fixed
 > `breadth_first` induced subgraphs. MMD ratios remain canonical-run values.
 
@@ -14,8 +14,8 @@ implementation under the approved specification.
 
 | Gate | Headline evidence | Decision |
 |---|---|---|
-| G1 | B0 AUROC/AUPRC `0.705519/0.730260`; PRING BFS-macro GS/RD `0.312151/0.422345`; MMD ratios `13.0768/11.9273/18.0931` | Pair-to-topology gap supported |
-| G1 B0-alt | AUROC/AUPRC `0.693603/0.732509`; PRING BFS-macro GS/RD `0.345802/0.450793`; MMD ratios `15.8304/13.4718/23.4734` | Architecture-independence arm closed |
+| G1 | B0 AUROC/AUPRC `0.705519/0.730260`; BFS-macro GS/RD `0.312151/0.422345`; MMD ratios `13.0768/11.9273/18.0931` | Pair-to-topology gap supported |
+| G1 B0-alt | AUROC/AUPRC `0.693603/0.732509`; BFS-macro GS/RD `0.345802/0.450793`; MMD ratios `15.8304/13.4718/23.4734` | Architecture-independence arm closed |
 | G2 | `Ov(P)=0.479886`, above `Ov_min=0.054954` | Edge-independence ceiling does not force a stop |
 | G3 | Oracle-topo GS is `1.61155×` B0; Oracle-blend improves all three MMD ratios | Feature-insufficiency stop rule not triggered |
 
@@ -29,7 +29,7 @@ verified four-H20 timing evidence remains warm-cache only.
 
 ## 1. Run identity and evaluation scope
 
-The canonical PRING-aligned G1 closeout completed on 2026-07-14. B0 and B0-alt were
+The canonical benchmark-aligned G1 closeout completed on 2026-07-14. B0 and B0-alt were
 scored over the same candidate universe.
 
 | Item | B0 | B0-alt |
@@ -72,7 +72,7 @@ as uniformly strong. The G1 claim rests on the edge/topology mismatch, not on a
 leaderboard claim about this checkpoint.
 
 The ratio-5 and full regime rows are available in the final combined
-[`g1_tables.md`](../../outputs/deliverables/g1_pring_20260714/g1_tables.md).
+[`g1_tables.md`](../../outputs/deliverables/g1_graph_metrics_20260714/g1_tables.md).
 
 ### 2.2 Assembly calibration and topology
 
@@ -80,13 +80,13 @@ Two quantities called “relative density” must be kept separate:
 
 - **Global simple-edge RD** is the assembled/reference non-self edge-count ratio. It
   checks the operating-point calibration over the whole test graph.
-- **PRING BFS-macro RD** is computed on each fixed reference-derived induced subgraph,
+- **BFS-macro RD** is computed on each fixed reference-derived induced subgraph,
   then averaged over all 500 samples. It measures recovery of dense local topology.
 
 B0 and B0-alt use thresholds chosen under a non-self edge quota. Equal-score ties are
 included or excluded atomically, so realized global RD can be slightly below `1`.
 
-| Scorer | Assembly policy | Realized non-self edges | Global simple-edge RD | PRING GS | PRING BFS-macro RD |
+| Scorer | Assembly policy | Realized non-self edges | Global simple-edge RD | BFS-macro GS | BFS-macro RD |
 |---|---:|---:|---:|---:|---:|
 | B0 | threshold `0.794385` | 30,059 | 0.997710 | 0.312151 | 0.422345 |
 | B0-alt | threshold `0.679179` | 30,090 | 0.998739 | 0.345802 | 0.450793 |
@@ -113,18 +113,18 @@ The metric directions are mixed, so B0-alt supports persistence of the gap but n
 claim that every topology metric becomes worse.
 
 B0 predicts 2,018 self-loops and B0-alt predicts 2,012, versus 1,891 in the
-reference. PRING GS/RD retain these loops inside each induced subgraph; global
+reference. Official GS/RD retain these loops inside each induced subgraph; global
 simple-edge RD excludes them by definition.
 
-The formal 2026-07-14 threshold sweep reports official PRING GS/RD together with
+The formal 2026-07-14 threshold sweep reports official BFS-macro GS/RD together with
 MMD/recall at every evaluated threshold; the operating-point row above is the headline.
 
 ### 2.3 Metric provenance
 
-- Official PRING GS/RD use the fixed sampled node sets and macro-average every sample.
+- Official GS/RD use the fixed sampled node sets and macro-average every sample.
 - MMD ratios use the canonical fixed-`sigma=1` Gaussian-TV biased MMD² evaluator.
 - The historical O'Bray diagnostic validated the retired MMD-ratio composite. It is
-  MMD provenance, not part of the official PRING GS definition.
+  MMD provenance, not part of the official GS definition.
 - Degree heterogeneity is `sigma=1.098430`; candidate positive rate is `0.0157174`.
 
 ## 3. G2 edge-independence ceiling
@@ -162,7 +162,7 @@ The curve is preserved in
 G3 compares B0 with two evaluation-side Oracle arms assembled from the same candidate
 universe. Oracle arms use exact top-N non-self assembly.
 
-| Scorer | Global simple-edge RD | PRING GS | PRING BFS-macro RD | Degree MMD ratio | Clustering MMD ratio | Spectral MMD ratio |
+| Scorer | Global simple-edge RD | BFS-macro GS | BFS-macro RD | Degree MMD ratio | Clustering MMD ratio | Spectral MMD ratio |
 |---|---:|---:|---:|---:|---:|---:|
 | B0 | 0.997710 | 0.312151 | 0.422345 | 13.0768 | 11.9273 | 18.0931 |
 | Oracle-topo | 1.000000 | 0.503048 | 0.794303 | 14.1148 | 8.23662 | 16.0772 |
@@ -197,11 +197,11 @@ four-H20 training acceptance.
 | Degree-corrected AUROC | 0.705519 | 0.799577 |
 | Degree-corrected AUPRC | 0.730260 | 0.813319 |
 | Global simple-edge RD | 0.997710 | 0.978392 |
-| PRING GS | 0.312151 | 0.381264 |
-| PRING BFS-macro RD | 0.422345 | 0.500179 |
+| BFS-macro GS | 0.312151 | 0.381264 |
+| BFS-macro RD | 0.422345 | 0.500179 |
 | Degree/clustering/spectral MMD ratio | 13.0768/11.9273/18.0931 | 13.8456/11.6277/19.9774 |
 
-The stronger checkpoint improves PRING GS by `22.14%` and BFS-macro RD by `18.43%`.
+The stronger checkpoint improves BFS-macro GS by `22.14%` and BFS-macro RD by `18.43%`.
 Its MMD ratios do not consistently improve, so it narrows part of the gap without
 closing the assembled-topology failure.
 
@@ -214,18 +214,18 @@ G1 rows are `0.626746/0.663360` and `0.510083/0.602131`, respectively.
 2. **The claim remains narrow.** PA-null wins selected edge regimes, so B0 is not a
    uniformly strong scorer.
 3. **Density calibration is not topology recovery.** Global simple-edge RD is near
-   `1`, while PRING BFS-macro RD remains `0.422345` for B0.
+   `1`, while BFS-macro RD remains `0.422345` for B0.
 4. **G2 leaves theoretical room.** The soft scorer exceeds the required overlap.
 5. **G3 leaves empirical room.** Oracle gains appear on different metric axes.
 
-Future assembled-graph tables must name global simple-edge RD and PRING BFS-macro RD
+Future assembled-graph tables must name global simple-edge RD and BFS-macro RD
 separately.
 
-The PRING-migrated threshold sweep is preserved in the formal G1 artifact. Any claim
+The benchmark-aligned threshold sweep is preserved in the formal G1 artifact. Any claim
 away from the documented operating point must identify its exact threshold and recall.
 
 The next research stage is EgoStitch implementation under
-[`docs/06-egostitch-spec.md`](../06-egostitch-spec.md). Cold-start four-H20 acceptance
+[`docs/05-egostitch-spec.md`](../05-egostitch-spec.md). Cold-start four-H20 acceptance
 remains a separate systems-validation item.
 
 ## 7. Source artifacts
@@ -238,13 +238,13 @@ outputs use the retired schema and are not current result sources.
 
 - [Formal B0 candidate scores](../../outputs/deliverables/b0_v31_breadth_first_20260711/scores/candidate.npz)
 - [B0-alt candidate scores](../../outputs/runs/b0_alt_20260713T164214Z/scores/candidate.npz)
-- [Combined B0/B0-alt G1 results](../../outputs/deliverables/g1_pring_20260714/g1_results.json)
-- [Combined G1 manifest](../../outputs/deliverables/g1_pring_20260714/manifest.json)
+- [Combined B0/B0-alt G1 results](../../outputs/deliverables/g1_graph_metrics_20260714/g1_results.json)
+- [Combined G1 manifest](../../outputs/deliverables/g1_graph_metrics_20260714/manifest.json)
 - [G2 results](../../outputs/deliverables/b0_v31_breadth_first_20260711/g2/results.json)
-- [G3 results](../../outputs/deliverables/g3_pring_20260714/g3_results.json)
-- [G3 manifest](../../outputs/deliverables/g3_pring_20260714/manifest.json)
-- [Legacy G1 results](../../outputs/deliverables/legacy_g1_pring_20260714/g1_results.json)
-- [Legacy G1 manifest](../../outputs/deliverables/legacy_g1_pring_20260714/manifest.json)
+- [G3 results](../../outputs/deliverables/g3_graph_metrics_20260714/g3_results.json)
+- [G3 manifest](../../outputs/deliverables/g3_graph_metrics_20260714/manifest.json)
+- [Legacy G1 results](../../outputs/deliverables/legacy_g1_graph_metrics_20260714/g1_results.json)
+- [Legacy G1 manifest](../../outputs/deliverables/legacy_g1_graph_metrics_20260714/manifest.json)
 
 ### Provenance and robustness artifacts
 

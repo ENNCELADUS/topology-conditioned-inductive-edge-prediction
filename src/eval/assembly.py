@@ -104,8 +104,8 @@ class SweepPoint:
         threshold: The assembly threshold used.
         recall: Fraction of `g_ref`'s (self-loop-stripped) canonical edges that are
             also present in the assembled graph at this threshold.
-        graph_similarity: Official PRING per-subgraph GS macro mean.
-        relative_density: Official PRING per-subgraph RD macro mean.
+        graph_similarity: Official per-subgraph GS macro mean.
+        relative_density: Official per-subgraph RD macro mean.
         mmd_ratio: Statistic -> reference-normalized MMD ratio at this threshold.
     """
 

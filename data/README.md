@@ -48,7 +48,7 @@ Each split-strategy directory contains:
 
 - Treat node IDs as opaque strings.
 - The `*_ratio5_exclusive.txt` files are quarantined under the strict inductive
-  protocol (`docs/06-egostitch-spec.md` §9.3): their negatives leak across the
+  protocol (`docs/05-egostitch-spec.md` §9.3): their negatives leak across the
   node split. No loader in `src/` reads them; keep it that way.
 - Train and test nodes are disjoint under each split strategy.
 - Training, retrieval, and scaffold construction must not access held-out graph

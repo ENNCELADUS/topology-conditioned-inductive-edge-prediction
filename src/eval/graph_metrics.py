@@ -17,7 +17,7 @@ def _require_same_nodes(g_pred: nx.Graph, g_ref: nx.Graph) -> list[str]:
 
 
 def compute_graph_similarity(g_pred: nx.Graph, g_ref: nx.Graph) -> float:
-    """Return official PRING adjacency similarity for one graph pair."""
+    """Return official adjacency similarity for one graph pair."""
     nodes = _require_same_nodes(g_pred, g_ref)
     pred_matrix = nx.to_numpy_array(g_pred, nodelist=nodes)
     ref_matrix = nx.to_numpy_array(g_ref, nodelist=nodes)
@@ -29,7 +29,7 @@ def compute_graph_similarity(g_pred: nx.Graph, g_ref: nx.Graph) -> float:
 
 
 def compute_relative_density(g_pred: nx.Graph, g_ref: nx.Graph) -> float:
-    """Return official PRING predicted/reference density ratio for one graph pair."""
+    """Return official predicted/reference density ratio for one graph pair."""
     _require_same_nodes(g_pred, g_ref)
     pred_density = float(nx.density(g_pred))
     ref_density = float(nx.density(g_ref))

@@ -1,7 +1,7 @@
 """Message/supervision partition of train-side positives (spec §9.3).
 
 The shipped artifacts do not ship the message/supervision split described in
-`docs/06-egostitch-spec.md` §9.3; it is derived at load time, per seed, from the
+`docs/05-egostitch-spec.md` §9.3; it is derived at load time, per seed, from the
 positives of `train_edges.txt`. `G_struct` is the simple (self-loop-free) graph
 over all train nodes built from the message-edge subset only.
 """

@@ -76,7 +76,7 @@ assembling into a poor *graph*. This "pair-to-topology gap" is the reason the me
 exists. Full note: [`docs/results/E2-pair-to-topology-gap.md`](docs/results/E2-pair-to-topology-gap.md);
 figure: [`figures/e2-gap.html`](figures/e2-gap.html).
 
-> **Canonical metric rerun (2026-07-14):** GS/RD now match official PRING evaluation and were
+> **Canonical metric rerun (2026-07-14):** GS/RD now match the official benchmark evaluation and were
 > formally rerun on the frozen score artifacts over all 500 fixed induced subgraphs. The separately
 > reported MMD ratios remain the canonical-run values.
 
@@ -84,19 +84,19 @@ figure: [`figures/e2-gap.html`](figures/e2-gap.html).
 |---|---|---:|---|
 | Edge | AUROC / AUPRC (degree-corrected, ratio-1) | **0.7055 / 0.7303** | final G1 B0 row |
 | Edge | AUROC / AUPRC (hard feature, ratio-1) | **0.5696 / 0.6175** | hard-negative stress test |
-| Assembled graph | PRING BFS-macro GS / RD | **0.3122 / 0.4223** | local topology; higher GS and RD closer to 1 are better |
+| Assembled graph | BFS-macro GS / RD | **0.3122 / 0.4223** | local topology; higher GS and RD closer to 1 are better |
 | Assembled graph | global simple-edge RD | **0.9977** | whole-graph non-self edge-count calibration |
 | Assembled graph | degree / clustering / spectral MMD ratio | **13.0768 / 11.9273 / 18.0931** | reference floor = 1; lower is better |
 | Edge (B0-alt) | AUROC / AUPRC (degree-corrected, ratio-1) | **0.6936 / 0.7325** | alternate F0-MLP architecture |
-| Assembled graph (B0-alt) | PRING BFS-macro GS / RD | **0.3458 / 0.4508** | architecture-independence arm |
+| Assembled graph (B0-alt) | BFS-macro GS / RD | **0.3458 / 0.4508** | architecture-independence arm |
 | Assembled graph (B0-alt) | global simple-edge RD | **0.9987** | independently calibrated threshold |
 | Assembled graph (B0-alt) | degree / clustering / spectral MMD ratio | **15.8304 / 13.4718 / 23.4734** | gap persists and is larger |
 
 The final two-architecture G1 threshold sweep and all negative-regime rows are recorded in
-[`outputs/deliverables/g1_pring_20260714/g1_tables.md`](outputs/deliverables/g1_pring_20260714/g1_tables.md).
+[`outputs/deliverables/g1_graph_metrics_20260714/g1_tables.md`](outputs/deliverables/g1_graph_metrics_20260714/g1_tables.md).
 G2 reports measured soft-score overlap 0.4799 versus the minimum 0.0550 required to
 reach the reference triangle count. G3's Oracle-blend arm reports MMD-ratio headroom
-1.723 / 3.885 / 1.998 for degree / clustering / spectral; Oracle-topo reaches PRING GS
+1.723 / 3.885 / 1.998 for degree / clustering / spectral; Oracle-topo reaches BFS-macro GS
 0.5030, 1.612 times B0, so the feature-insufficiency stop rule is not triggered. The
 B0-alt result closes G1's architecture-independence requirement. PA-null is reported
 alongside B0 because it wins some easy and feature-hard edge regimes.
@@ -104,20 +104,19 @@ alongside B0 because it wins some easy and feature-hard edge regimes.
 The latest checkpoint-only evaluation rerun (`legacy_v31_s47_20260712T193900Z`, not a
 new formal training acceptance) reached balanced test AUROC/AUPRC **0.8052 / 0.8184**
 and its G1 degree-corrected ratio-1 row was **0.7996 / 0.8133**. Its archived assembled
-metrics were recomputed with the official evaluator: PRING BFS-macro GS/RD
+metrics were recomputed with the official evaluator: BFS-macro GS/RD
 **0.3813 / 0.5002** at global simple-edge RD **0.9784**, alongside MMD ratios
 **13.8456 / 11.6277 / 19.9774**. Thus the stronger edge scorer improves GS but does not
 close the topology gap. The complete closeout package is
-[`outputs/deliverables/legacy_g1_pring_20260714/`](outputs/deliverables/legacy_g1_pring_20260714/).
+[`outputs/deliverables/legacy_g1_graph_metrics_20260714/`](outputs/deliverables/legacy_g1_graph_metrics_20260714/).
 
 ## The Proposed Method (EgoStitch)
 
 > **Status: approved (2026-07-09).** Design proposal approved and gate G4 signed off —
-> [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) is the active implementation
+> [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) is the active implementation
 > contract (algorithm spec + benchmark/data contract + four-H20 execution design). Design
-> rationale: [`docs/04-model-proposal.md`](docs/04-model-proposal.md); review record:
-> [`docs/05-review-report.md`](docs/05-review-report.md). G1 (including B0-alt), G2, and
-> G3 (Oracle) are complete and support proceeding to implementation.
+> rationale: [`docs/04-model-proposal.md`](docs/04-model-proposal.md). G1 (including
+> B0-alt), G2, and G3 (Oracle) are complete and support proceeding to implementation.
 
 For each queried pair `(i, j)`, each endpoint **imagines its own ego-network** (latent
 neighbor nodes with existence probabilities, local adjacency, and a degree budget)
@@ -148,8 +147,7 @@ docs/
   02-methodology.md              abstract method contract + training objective
   03-experiment-protocol.md      run/eval contract: baselines, E1–E7, metrics, gates G1–G5
   04-model-proposal.md           EgoStitch model rationale  (APPROVED 2026-07-09)
-  05-review-report.md            novelty check + 5-persona review record
-  06-egostitch-spec.md           algorithm + data + 4×H20 spec  ← implementation contract (G4 signed off)
+  05-egostitch-spec.md           algorithm + data + 4×H20 spec  ← implementation contract (G4 signed off)
   lit-review-plan.md             review plan, claims K1–K5, terminology guardrail
   results/
     E2-pair-to-topology-gap.md   the motivating result note
@@ -188,7 +186,7 @@ general graph-ML benchmark. Don't substitute real dataset names unless asked.
 | 2 | [`docs/02-methodology.md`](docs/02-methodology.md) | Method contract + training objective |
 | 3 | [`docs/03-experiment-protocol.md`](docs/03-experiment-protocol.md) | **Source of truth** for what to run and how to grade it |
 | 4 | [`docs/04-model-proposal.md`](docs/04-model-proposal.md) | EgoStitch rationale (approved 2026-07-09) |
-| 5 | [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) | **Implementation contract**: algorithm, data/batch contract, four-H20 execution |
+| 5 | [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) | **Implementation contract**: algorithm, data/batch contract, four-H20 execution |
 | 6 | [`docs/results/E2-pair-to-topology-gap.md`](docs/results/E2-pair-to-topology-gap.md) | Motivating result |
 | 7 | [`docs/lit-review-plan.md`](docs/lit-review-plan.md) | Review plan, claims, terminology guardrail |
 
@@ -208,13 +206,13 @@ target test graph; the queried edge is masked/standardized inside the scaffold. 
 
 - [x] **E2 — pair-to-topology gap** established (motivating result + figure).
 - [x] **Blueprint, methodology, and experiment protocol** written and locked.
-- [x] **EgoStitch proposal** — approved 2026-07-09; reviewed via novelty check + 5-persona panel ([`docs/05-review-report.md`](docs/05-review-report.md)).
-- [x] **G4 spec freeze** — [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) signed off (algorithm + benchmark data contract + batch sampler + four-H20 execution).
+- [x] **EgoStitch proposal** — approved 2026-07-09; reviewed via novelty check + 5-persona panel.
+- [x] **G4 spec freeze** — [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) signed off (algorithm + benchmark data contract + batch sampler + four-H20 execution).
 - [x] **Baseline + gate pipeline** — benchmark/features, B0/B0-alt training, cached scoring, G1/G2/G3 analyses, and tests are implemented.
-- [x] **G1 + G2** — B0/PA-null, B0-alt architecture replication, and the checkpoint-aligned edge-independence ceiling are complete; the final PRING-aligned G1 artifacts are under [`outputs/deliverables/g1_pring_20260714/`](outputs/deliverables/g1_pring_20260714/).
-- [x] **Latest legacy v3.1 robustness rerun** — canonical G1 confirms that the stronger scorer preserves the topology gap; final artifacts are under [`outputs/deliverables/legacy_g1_pring_20260714/`](outputs/deliverables/legacy_g1_pring_20260714/).
-- [x] **G3 gate** — Oracle row passed; Oracle-blend shows substantial headroom over B0 and the feature-insufficiency stop rule is not triggered. Final artifacts are under [`outputs/deliverables/g3_pring_20260714/`](outputs/deliverables/g3_pring_20260714/).
-- [ ] **EgoStitch implementation** under `src/`, per [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) and the [experiment protocol](docs/03-experiment-protocol.md).
+- [x] **G1 + G2** — B0/PA-null, B0-alt architecture replication, and the checkpoint-aligned edge-independence ceiling are complete; the final benchmark-aligned G1 artifacts are under [`outputs/deliverables/g1_graph_metrics_20260714/`](outputs/deliverables/g1_graph_metrics_20260714/).
+- [x] **Latest legacy v3.1 robustness rerun** — canonical G1 confirms that the stronger scorer preserves the topology gap; final artifacts are under [`outputs/deliverables/legacy_g1_graph_metrics_20260714/`](outputs/deliverables/legacy_g1_graph_metrics_20260714/).
+- [x] **G3 gate** — Oracle row passed; Oracle-blend shows substantial headroom over B0 and the feature-insufficiency stop rule is not triggered. Final artifacts are under [`outputs/deliverables/g3_graph_metrics_20260714/`](outputs/deliverables/g3_graph_metrics_20260714/).
+- [ ] **EgoStitch implementation** under `src/`, per [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) and the [experiment protocol](docs/03-experiment-protocol.md).
 - [ ] **Experiments** in priority order: EgoStitch implementation → E1/E3 main + baselines → E4 ablations → E5 integrity gates → E7 (load-bearing) → E6 breadth.
 
 ## HPC execution

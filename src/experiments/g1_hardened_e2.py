@@ -3,7 +3,7 @@ r"""Gate G1 (hardened E2) analysis pipeline: cached-score artifacts -> gate numb
 Consumes a frozen B0 (and optional B0-alt) candidate-universe scores artifact
 (``src.score_universe``) plus the benchmark package (``src.data.artifacts``) and
 produces every number the G1 gate report needs: reference-normalized MMD ratios,
-official PRING GS/RD, the perturbation diagnostic, a threshold sweep with the
+official BFS-macro GS/RD, the perturbation diagnostic, a threshold sweep with the
 density-matched operating point, a hard/easy/degree-corrected/feature negative
 regime table (edge metrics), a preferential-attachment null row (evaluator-side
 diagnostic), and assembled-graph rows at the operating point. No model scoring
@@ -746,8 +746,8 @@ class SweepRow:
     Attributes:
         threshold: The assembly threshold used.
         recall: Fraction of the reference graph's edges recovered.
-        graph_similarity: Official PRING per-subgraph GS macro mean.
-        relative_density: Official PRING per-subgraph RD macro mean.
+        graph_similarity: Official per-subgraph GS macro mean.
+        relative_density: Official per-subgraph RD macro mean.
         mmd_ratio: Statistic -> reference-normalized MMD ratio at this threshold.
         self_loop_count: Number of self-pairs `(u, u)` with `p >= threshold`.
         self_loop_rate: `self_loop_count` divided by the total number of
@@ -858,8 +858,8 @@ class AssembledRow:
         mmd_ratio: Statistic -> reference-normalized MMD ratio.
         raw_mmd2: Statistic -> raw MMD^2 numerator.
         reference_mmd2: Statistic -> reference-split MMD^2 denominator.
-        graph_similarity: Official PRING per-subgraph GS macro mean.
-        relative_density: Official PRING per-subgraph RD macro mean.
+        graph_similarity: Official per-subgraph GS macro mean.
+        relative_density: Official per-subgraph RD macro mean.
         per_size_graph_similarity: Per-size lists of per-subgraph GS values.
         per_size_relative_density: Per-size lists of per-subgraph RD values.
         self_loops_pred: Self-loop count in the assembled graph.

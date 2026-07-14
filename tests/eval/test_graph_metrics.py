@@ -46,7 +46,7 @@ def _manual_mmd(samples1: list[np.ndarray], samples2: list[np.ndarray]) -> float
 
 
 @pytest.mark.unit
-class TestOfficialPringGraphMetrics:
+class TestOfficialGraphMetrics:
     def test_graph_similarity_is_edge_dice(self) -> None:
         gt = nx.Graph([("a", "b"), ("b", "c")])
         pred = nx.Graph([("a", "b"), ("a", "c")])

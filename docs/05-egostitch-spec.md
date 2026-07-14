@@ -255,12 +255,12 @@ Identities verified: `train_graph.pkl` edges = train⁺ ∪ val⁺ exactly (val�
 **Benchmark-A/B/C ↔ strategy mapping** is recorded in the run metadata. The completed
 canonical-metric G1 rerun uses `Benchmark-A = breadth_first`, checkpoint
 `e092537d8cf1e208`; its single final artifact set is
-`outputs/deliverables/g1_pring_20260714/`. The final G3 artifact set is
-`outputs/deliverables/g3_pring_20260714/`.
+`outputs/deliverables/g1_graph_metrics_20260714/`. The final G3 artifact set is
+`outputs/deliverables/g3_graph_metrics_20260714/`.
 
 A later checkpoint-only `v3_1` evaluation rerun uses the frozen score artifact under
-`outputs/runs/legacy_v31_s47_20260712T193900Z/`; its final PRING-aligned G1 artifact
-set is `outputs/deliverables/legacy_g1_pring_20260714/`. The rerun does not change the
+`outputs/runs/legacy_v31_s47_20260712T193900Z/`; its final benchmark-aligned G1 artifact
+set is `outputs/deliverables/legacy_g1_graph_metrics_20260714/`. The rerun does not change the
 formal four-H20 training acceptance contract.
 
 ### 9.2 Feature pipeline (F0/F1)
@@ -329,13 +329,13 @@ test, and candidate files as `(u, u)` rows). Binding rules:
 1. **Structural-target simple-graph policy; official evaluation exceptions**: N(u), degrees,
    budgets d̂_u, training-side clustering/code stats, ego-net targets, recall, and other
    training structural targets strip self-loops. Canonical MMD descriptors and official
-   PRING GS/RD induced subgraphs retain self-loops exactly as in the benchmark evaluator.
+   Official GS/RD induced subgraphs retain self-loops exactly as in the benchmark evaluator.
 2. **`(u, u)` queries route through a single-ego path**: j := i; T_peer = own kept
    slots; Π = identity on kept slots; s0 = pair_logit(u, u); s1 = self-membership
    `lse_k(κ(h_u^k, proj(x_u)) + log π m)`; s2 from the Â_u diagonal blocks;
    s3 unchanged; s4 on the single-ego scaffold with both anchor labels on u.
 3. **Reporting**: edge metrics overall *and* split self / non-self; canonical MMD and
-   official PRING GS/RD on loop-retaining induced subgraphs; GS/RD are computed per fixed
+   official GS/RD on loop-retaining induced subgraphs; GS/RD are computed per fixed
    sampled node set and macro-averaged over every sample across node-size buckets. Recall
    remains a simple-graph diagnostic. Report a separate self-loop-rate row (predicted vs
    reference, e.g. 1,701/2,018 on `random_walk`).
@@ -389,7 +389,7 @@ with per-epoch order shuffling but no negative resampling.
   routine then applies `sum + 1e-6` normalization to all three. Run artifacts
   disclose `raw_mmd2`, `reference_mmd2`, and `mmd_ratio`; the three MMD ratios remain
   separate metrics and are never combined into Graph Similarity.
-- Graph Similarity and Relative Density reproduce the official PRING evaluator: for each
+- Graph Similarity and Relative Density reproduce the official benchmark evaluator: for each
   fixed node set, compute adjacency edge-Dice GS and NetworkX density-ratio RD on the
   loop-retaining predicted/reference induced subgraphs, then take one unweighted mean over
   all samples in all node-size buckets. Empty/empty returns `1` for both metrics; a nonempty
@@ -454,10 +454,15 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   also pinned the official spectral-PMF pre-normalization before the common
   `sum + 1e-6` normalization, with degree/clustering left as raw counts beforehand.
 - 2026-07-14: replaced the retired MMD-ratio exponential "graph similarity" and full-graph
-  simple-edge relative density with official PRING per-induced-subgraph GS/RD and macro
+  simple-edge relative density with official benchmark per-induced-subgraph GS/RD and macro
   aggregation; bound official self-loop and zero-density behavior, kept MMD ratios as
   independent metrics, then recomputed the documented B0/B0-alt/PA-null/legacy/G3 values
   from their frozen score artifacts over all 500 fixed subgraphs.
+- 2026-07-14: anonymized the evaluator attribution and artifact directory names; formulas,
+  sampling, aggregation, self-loop behavior, and all reported values are unchanged.
+- 2026-07-14: renamed this file `06-egostitch-spec.md` → `05-egostitch-spec.md` after
+  `05-review-report.md` was retired; all references updated across docs, `src/`, and
+  `tests/`. Editorial only — no normative content changed.
 
 **Open items before code (not blockers):** the four ego-stat target definitions
 pinned to evaluator implementations; FLOPs/latency table template (§4.7 commitment);

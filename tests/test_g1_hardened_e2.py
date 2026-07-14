@@ -880,7 +880,7 @@ class TestRunThresholdSweep:
 
 class TestSelfPairsExcludedFromAssembledDensityQuota:
     def test_official_rd_exposes_nonempty_over_empty_sample(self, tmp_path: Path) -> None:
-        """The global edge quota no longer forces the reported PRING RD to one.
+        """The global edge quota no longer forces the reported BFS-macro RD to one.
 
         This adversarial fixture contains a sampled subgraph with no reference edge
         but a predicted edge, so the official per-subgraph guard yields infinity.

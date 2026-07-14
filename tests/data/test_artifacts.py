@@ -250,7 +250,7 @@ class TestLoadBenchmarkExcludeNodes:
     def test_spec_featureless_nodes_touch_zero_breadth_first_pairs(
         self, benchmark_root: Path
     ) -> None:
-        # docs/06-egostitch-spec.md §9.2 states these two globally-featureless nodes
+        # docs/05-egostitch-spec.md §9.2 states these two globally-featureless nodes
         # (node_004764, node_007050) touch "3 train pairs + 1 val pair" — but that
         # count is measured against the `random_walk` strategy, not `breadth_first`
         # (the strategy pinned for this round). Under `breadth_first` neither node

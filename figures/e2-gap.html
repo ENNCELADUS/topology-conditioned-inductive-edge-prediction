@@ -93,7 +93,7 @@
   <p class="lede">
     The final G1 row for a frozen <b>independent pairwise</b> scorer reaches
     <span class="g">AUROC 0.7055 / AUPRC 0.7303</span>
-    on degree-corrected negatives. Its assembly has global simple-edge RD 0.9977, yet official PRING
+    on degree-corrected negatives. Its assembly has global simple-edge RD 0.9977, yet official
     <span class="r">BFS-macro GS 0.3122 / RD 0.4223</span> and MMD ratios 11.9–18.1 times
     the real-vs-real reference floor.
     <b>Good edge scores do not imply a plausible network.</b>
@@ -108,7 +108,7 @@
     <div class="panel">
       <h2>A - Edge quality vs assembled topology</h2>
       <p class="cap">The canonical degree-corrected edge row sits above the hard-feature
-        stress-test row, while official PRING GS remains <b>below 0.5</b>.</p>
+        stress-test row, while official BFS-macro GS remains <b>below 0.5</b>.</p>
       <div class="bars">
         <div class="bar-row">
           <span class="lab">AUROC</span>
@@ -196,13 +196,13 @@
     <!-- Panel C: gate status -->
     <div class="panel wide">
       <h2>C - Hardened gate status</h2>
-      <p class="cap">G1's official PRING GS/RD recomputation covers all 500 fixed subgraphs,
+      <p class="cap">G1's official GS/RD recomputation covers all 500 fixed subgraphs,
         and G2's measured soft-score
         overlap (<b>0.4799</b>) is well above the minimum overlap (<b>0.0550</b>) required
         to reach the reference triangle count. The complete threshold sweep and ceiling
         curve are linked from the result note.</p>
       <div class="keyrow">
-        <span class="k"><span class="sw good"></span> G1 PRING GS/RD aligned</span>
+        <span class="k"><span class="sw good"></span> G1 BFS-macro GS/RD aligned</span>
         <span class="k"><span class="sw good"></span> G1 B0-alt arm closed</span>
         <span class="k"><span class="sw good"></span> G3 Oracle passed</span>
       </div>
@@ -240,9 +240,9 @@
   <footer>
     Protocol: topology-conditioned inductive edge prediction over unseen nodes with frozen node
     features. Binary edge predictions are assembled into graphs and evaluated with edge metrics plus
-    graph realism metrics. The figure uses the formally rerun 2026-07-14 PRING metrics at the
+    graph realism metrics. The figure uses the formally rerun 2026-07-14 benchmark metrics at the
     quota-calibrated G1 operating point and reports
-    global simple-edge RD 0.9977 but official PRING BFS-macro GS/RD 0.3122/0.4223,
+    global simple-edge RD 0.9977 but official BFS-macro GS/RD 0.3122/0.4223,
     with MMD ratios far above the
     real-vs-real floor; B0-alt and
     the stronger legacy scorer preserve the gap, G2 uses the exact edge-independence

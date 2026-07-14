@@ -1,12 +1,12 @@
 # Official MMD Ratio Evaluation Implementation Plan
 
 > **Historical implementation record:** this dated plan predates the 2026-07-14
-> migration from the MMD-ratio composite/global-density schema to official PRING GS/RD.
-> Current results live under `outputs/deliverables/*_pring_20260714/`.
+> migration from the MMD-ratio composite/global-density schema to official BFS-macro GS/RD.
+> Current results live under `outputs/deliverables/*_graph_metrics_20260714/`.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the current assembled-graph MMD implementation and output schema with the fixed-sigma Gaussian-TV, split-reference normalized MMD ratio needed to produce PRING-paper-table-scale degree, clustering, and spectral values.
+**Goal:** Replace the current assembled-graph MMD implementation and output schema with the fixed-sigma Gaussian-TV, split-reference normalized MMD ratio needed to produce benchmark-paper-table-scale degree, clustering, and spectral values.
 
 **Architecture:** `src/eval/graph_metrics.py` becomes the single source of truth for descriptor construction, raw biased MMD2, deterministic reference-floor construction, and ratio-of-aggregate normalization. The evaluator exposes the numerator, denominator, and normalized ratio, while downstream threshold sweeps, G1 rows, bootstrap summaries, metadata, and Markdown tables use the normalized ratio as the canonical metric. There is no compatibility mode and no retained L2-RBF/median-bandwidth path.
 
@@ -730,7 +730,7 @@ Expected: the commit removes the old result keys rather than retaining aliases.
 - Modify only if verification exposes a defect in Tasks 2 or 3; corrections stay within the files already listed.
 
 **Interfaces:**
-- Consumes: The completed evaluator and the read-only official Arath graph/bucket artifacts under `/Users/richardwang/Documents/grand/PRING`.
+- Consumes: The completed evaluator and the read-only official Arath graph/bucket artifacts under the external evaluator checkout.
 - Produces: Evidence that reference denominators match the independently measured scale and that the full repository remains type-, lint-, and test-clean.
 
 - [ ] **Step 1: Verify the official Arath reference denominators**
@@ -738,7 +738,7 @@ Expected: the commit removes the old result keys rather than retaining aliases.
 Run this read-only verification from the current repository:
 
 ```bash
-rtk proxy uv run python -c 'import pickle; from pathlib import Path; from src.eval.graph_metrics import MMDConfig, noise_floor; base=Path("/Users/richardwang/Documents/grand/PRING/data_process/pring_dataset/arath"); g=pickle.loads((base/"arath_test_graph.pkl").read_bytes()); files={"BFS":"arath_BFS_sampled_nodes.pkl","DFS":"arath_DFS_sampled_nodes.pkl","RW":"arath_RANDOM_WALK_sampled_nodes.pkl"}; expected={"BFS":{"degree":0.015331448015001858,"clustering":0.013107044351804676,"spectral":0.014301673896181399},"DFS":{"degree":0.002210707375096832,"clustering":0.0032868321040904203,"spectral":0.011222664293332163},"RW":{"degree":0.007537813277395444,"clustering":0.009945100977063647,"spectral":0.00986206743851339}}; import numpy as np; [(lambda buckets, name: [np.testing.assert_allclose(np.mean([floor[stat] for floor in noise_floor(g,buckets,MMDConfig()).values()]),expected[name][stat],rtol=1e-10,atol=1e-12) for stat in expected[name]])(pickle.loads((base/file).read_bytes()),name) for name,file in files.items()]; print("official Arath reference floors match")'
+rtk proxy uv run python -c 'import pickle; from pathlib import Path; from src.eval.graph_metrics import MMDConfig, noise_floor; base=Path("<external-evaluator-checkout>/data_process/benchmark_dataset/arath"); g=pickle.loads((base/"arath_test_graph.pkl").read_bytes()); files={"BFS":"arath_BFS_sampled_nodes.pkl","DFS":"arath_DFS_sampled_nodes.pkl","RW":"arath_RANDOM_WALK_sampled_nodes.pkl"}; expected={"BFS":{"degree":0.015331448015001858,"clustering":0.013107044351804676,"spectral":0.014301673896181399},"DFS":{"degree":0.002210707375096832,"clustering":0.0032868321040904203,"spectral":0.011222664293332163},"RW":{"degree":0.007537813277395444,"clustering":0.009945100977063647,"spectral":0.00986206743851339}}; import numpy as np; [(lambda buckets, name: [np.testing.assert_allclose(np.mean([floor[stat] for floor in noise_floor(g,buckets,MMDConfig()).values()]),expected[name][stat],rtol=1e-10,atol=1e-12) for stat in expected[name]])(pickle.loads((base/file).read_bytes()),name) for name,file in files.items()]; print("official Arath reference floors match")'
 ```
 
 Expected: `official Arath reference floors match`.

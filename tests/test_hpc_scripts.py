@@ -113,7 +113,7 @@ def test_primary_docs_reference_only_the_direct_hpc_layer() -> None:
 
 
 def test_frozen_specs_pin_four_h20_e2_training() -> None:
-    spec = (REPO_ROOT / "docs" / "06-egostitch-spec.md").read_text()
+    spec = (REPO_ROOT / "docs" / "05-egostitch-spec.md").read_text()
     protocol = (REPO_ROOT / "docs" / "03-experiment-protocol.md").read_text()
 
     assert "4 × NVIDIA H20" in spec
