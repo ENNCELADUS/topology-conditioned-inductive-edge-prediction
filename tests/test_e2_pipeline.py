@@ -221,6 +221,36 @@ def test_parse_pipeline_args_defaults_pack_and_output_dir_to_none(tmp_path: Path
     args = parse_pipeline_args(["--config", str(tmp_path / "cfg.yaml")])
     assert args.pack_dir is None
     assert args.output_dir is None
+    assert args.worker_module == "src.train_b0"
+
+
+def test_parse_pipeline_args_accepts_worker_module_override(tmp_path: Path) -> None:
+    args = parse_pipeline_args(
+        ["--config", str(tmp_path / "cfg.yaml"), "--worker-module", "src.train_egostitch"]
+    )
+    assert args.worker_module == "src.train_egostitch"
+
+
+def test_build_accelerate_command_worker_module(tmp_path: Path) -> None:
+    from src.e2_pipeline import build_accelerate_command
+
+    kwargs: dict[str, object] = {
+        "accelerate_bin": tmp_path / "accelerate",
+        "config_path": tmp_path / "cfg.yaml",
+        "mode": "train",
+        "pack_dir": tmp_path / "pack",
+        "output_dir": tmp_path / "out",
+        "token_budget": 256,
+        "profile_output": tmp_path / "profile.json",
+    }
+    default = build_accelerate_command(**kwargs)  # type: ignore[arg-type]
+    assert default[default.index("-m") + 1] == "src.train_b0"
+    custom = build_accelerate_command(**kwargs, worker_module="src.train_egostitch")  # type: ignore[arg-type]
+    assert custom[custom.index("-m") + 1] == "src.train_egostitch"
+    # Everything else in the pinned argv is unchanged by the override.
+    assert [x for x in custom if x != "src.train_egostitch"] == [
+        x for x in default if x != "src.train_b0"
+    ]
 
 
 # ------------------------------------------------------------------- PipelineProfile round trip

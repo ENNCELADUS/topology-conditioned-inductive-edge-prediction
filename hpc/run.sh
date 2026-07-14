@@ -26,6 +26,14 @@ pack -> probe -> projection -> 30-epoch DDP training pipeline
 E2 training run. B0-alt keeps its own direct `python -m src.train_b0` CLI,
 unaffected by this four-H20 routing.
 
+Formal EgoStitch Stage-1 training reuses the same orchestrator with the
+EgoStitch worker (config-driven budget, spec section 13.13):
+  hpc/run.sh train configs/egostitch_stage1_breadth_first.yaml \
+      --worker-module src.train_egostitch
+Its one-off s0 manifest (frozen-B0 logit cache pairs) comes from
+`python -m src.train_egostitch --config <cfg> --write-s0-manifest <tsv>`,
+scored once via `hpc/run.sh score --pairs file:<tsv> ...`.
+
 The score command pins --device cuda --amp bf16. All commands run directly in
 the foreground; score/merge/g1/g2 use a single GPU (cuda:0) while train uses
 all 4 visible NVIDIA H20 GPUs. Use nohup in the calling shell when a run must

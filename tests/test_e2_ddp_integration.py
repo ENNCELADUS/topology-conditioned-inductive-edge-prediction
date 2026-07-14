@@ -140,3 +140,30 @@ def test_cold_four_h20_run_meets_budget(tmp_path: Path) -> None:
         "complete.json",
     ):
         assert (tmp_path / "outputs" / filename).exists()
+
+
+@pytest.mark.integration
+def test_two_rank_cpu_egostitch_loop_emits_valid_profile_and_artifacts(tmp_path: Path) -> None:
+    """The EgoStitch worker's loop satisfies the orchestrator contracts under real DDP."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc_per_node=2",
+            "tests/helpers/egostitch_ddp_smoke.py",
+            "--output-dir",
+            str(tmp_path),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((tmp_path / "smoke_ok.json").read_text())
+    assert summary["world_size"] == 2
+    assert summary["epochs_completed"] == 2
+    for filename in ("best.pt", "last.pt", "metrics.jsonl", "run_metadata.json"):
+        assert (tmp_path / "run" / filename).is_file()

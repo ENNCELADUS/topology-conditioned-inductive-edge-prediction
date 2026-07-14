@@ -53,6 +53,8 @@ def test_help_is_available_without_the_remote_container(bash_exe: str) -> None:
     assert result.returncode == 0, result.stderr
     for command in ("check", "train", "score", "merge", "g1", "g2"):
         assert f"hpc/run.sh {command}" in result.stdout
+    # The EgoStitch Stage-1 worker routes through the same train entry.
+    assert "--worker-module src.train_egostitch" in result.stdout
 
 
 def test_runner_pins_the_required_four_h20_target() -> None:

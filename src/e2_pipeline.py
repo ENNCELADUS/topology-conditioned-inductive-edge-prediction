@@ -246,17 +246,22 @@ class PipelineArgs:
     """Parsed ``python -m src.e2_pipeline`` command-line arguments.
 
     Attributes:
-        config: Path to the V3.1 training YAML config; must include a
+        config: Path to the worker training YAML config; must include a
             ``runtime:`` section (see ``src.train_b0.RuntimeConfig``).
-        pack_dir: Optional override for the packed BF16 feature directory;
+        pack_dir: Optional override for the packed feature directory;
             defaults to ``cfg.runtime.pack_dir`` when omitted.
         output_dir: Optional override for the run output directory; defaults to
             ``cfg.output_dir`` when omitted.
+        worker_module: Dotted module implementing the worker contract
+            (``load_config``, ``prepare_pack``, and the ``--ddp-mode``
+            probe/epoch-probe/train CLI). Defaults to the formal E2 B0 worker;
+            ``src.train_egostitch`` selects the EgoStitch Stage-1 worker.
     """
 
     config: Path
     pack_dir: Path | None
     output_dir: Path | None
+    worker_module: str = "src.train_b0"
 
 
 class BudgetExceeded(RuntimeError):
@@ -296,24 +301,27 @@ def build_accelerate_command(
     output_dir: Path,
     token_budget: int,
     profile_output: Path,
+    worker_module: str = "src.train_b0",
 ) -> list[str]:
-    """Build the pinned ``accelerate launch -m src.train_b0`` worker command.
+    """Build the pinned ``accelerate launch -m <worker>`` worker command.
 
     Args:
         accelerate_bin: Path to the ``accelerate`` executable (same venv as the
             orchestrator's own interpreter).
-        config_path: Path to the V3.1 training YAML config.
-        mode: One of ``train_b0``'s DDP worker modes (``probe``/``epoch-probe``/
+        config_path: Path to the worker training YAML config.
+        mode: One of the worker's DDP modes (``probe``/``epoch-probe``/
             ``train``).
-        pack_dir: Packed BF16 feature directory the worker loads onto its device.
+        pack_dir: Packed feature directory the worker loads onto its device.
         output_dir: Run output directory (checkpoints/metrics for ``train``;
             passed through unconditionally so every mode sees the same override).
-        token_budget: Per-rank token budget for this worker invocation.
+        token_budget: Per-rank token budget for this worker invocation (the
+            EgoStitch worker reinterprets it as the node-batch ``B_n``).
         profile_output: Path the rank-zero worker writes its JSON profile to.
+        worker_module: Dotted worker module (default: the formal E2 B0 worker).
 
     Returns:
         The exact ``accelerate launch --num_processes 4 --mixed_precision bf16
-        -m src.train_b0 ...`` argv list.
+        -m <worker_module> ...`` argv list.
     """
     return [
         str(accelerate_bin),
@@ -323,7 +331,7 @@ def build_accelerate_command(
         "--mixed_precision",
         "bf16",
         "-m",
-        "src.train_b0",
+        worker_module,
         "--config",
         str(config_path),
         "--ddp-mode",
@@ -352,8 +360,19 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--pack-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument(
+        "--worker-module",
+        default="src.train_b0",
+        help=(
+            "worker module implementing load_config/prepare_pack and the "
+            "--ddp-mode CLI (default: src.train_b0; src.train_egostitch for "
+            "the EgoStitch Stage-1 worker)"
+        ),
+    )
     namespace = parser.parse_args(argv)
-    return PipelineArgs(namespace.config, namespace.pack_dir, namespace.output_dir)
+    return PipelineArgs(
+        namespace.config, namespace.pack_dir, namespace.output_dir, namespace.worker_module
+    )
 
 
 CommandRunner = Callable[[Sequence[str], float], subprocess.CompletedProcess[str]]
@@ -711,18 +730,17 @@ def run_pipeline(
     Returns:
         0 on success, 2 on any gated failure (see the stage in ``failure.json``).
     """
-    # Deferred import: src.train_b0 imports ProbeResult from *this* module at its
-    # own top level, so importing train_b0 back at this module's top level would
+    # Deferred import: workers import ProbeResult from *this* module at their
+    # own top level, so importing them back at this module's top level would
     # create an import cycle. A call-time import breaks it in both directions.
-    from src.data.packed_features import (
-        build_packed_features,
-        sha256_file,
-        validate_packed_manifest,
-    )
-    from src.train_b0 import load_config
+    import importlib
+
+    from src.data.packed_features import sha256_file
+
+    worker = importlib.import_module(args.worker_module)
 
     pipeline_started = time.monotonic()
-    cfg = load_config(args.config)
+    cfg = worker.load_config(args.config)
     if args.output_dir is not None:
         cfg = replace(cfg, output_dir=args.output_dir)
     if cfg.runtime is None:
@@ -746,7 +764,6 @@ def run_pipeline(
 
     # --- pack: build (cold) or strictly validate (warm) within the pack budget ---
     cold_cache = not pack_dir.exists()
-    source_root = cfg.data.root / "features" / "frozen_node_features_1024"
     pack_started = time.monotonic()
     pack_validation_path = staging_dir / "pack_validation.json"
     pack_temp_prefix = f".{pack_dir.name}.{staging_dir.name}.pack-"
@@ -759,24 +776,10 @@ def run_pipeline(
                 shutil.rmtree(path, ignore_errors=True)
 
     def pack_operation() -> None:
-        if cold_cache:
-            logger.info("pack cache cold: building %s from %s", pack_dir, source_root)
-            packed_manifest = build_packed_features(
-                source_root,
-                pack_dir,
-                workers=runtime.pack_workers,
-                temp_prefix=pack_temp_prefix,
-            )
-        else:
-            logger.info("pack cache warm: validating %s against %s", pack_dir, source_root)
-            packed_manifest = validate_packed_manifest(pack_dir, source_root)
-        _write_json_atomic(
-            pack_validation_path,
-            {
-                "pack_manifest": cast(dict[str, object], asdict(packed_manifest)),
-                "pack_identity_sha256": sha256_file(pack_dir / "manifest.json"),
-            },
+        payload = worker.prepare_pack(
+            cfg, pack_dir, cold_cache=cold_cache, temp_prefix=pack_temp_prefix
         )
+        _write_json_atomic(pack_validation_path, cast(dict[str, object], payload))
 
     try:
         stage_runner(pack_operation, float(runtime.pack_budget_seconds))
@@ -865,6 +868,7 @@ def run_pipeline(
             output_dir=staging_dir,
             token_budget=token_budget,
             profile_output=profile_output,
+            worker_module=args.worker_module,
         )
         try:
             completed = command_runner(command, remaining)
@@ -950,6 +954,7 @@ def run_pipeline(
         output_dir=staging_dir,
         token_budget=selected.token_budget,
         profile_output=epoch_profile_output,
+        worker_module=args.worker_module,
     )
     try:
         completed = command_runner(command, remaining)
@@ -1019,6 +1024,7 @@ def run_pipeline(
         output_dir=staging_dir,
         token_budget=selected.token_budget,
         profile_output=worker_profile_path,
+        worker_module=args.worker_module,
     )
     try:
         completed = command_runner(command, float(runtime.train_eval_budget_seconds))

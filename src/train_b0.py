@@ -1097,6 +1097,51 @@ def write_outputs(
     )
 
 
+def prepare_pack(
+    cfg: Config, pack_dir: Path, *, cold_cache: bool, temp_prefix: str = ""
+) -> dict[str, object]:
+    """Build (cold) or strictly validate (warm) the V3.1 BF16 feature pack.
+
+    The orchestrator's per-worker pack seam (`src.e2_pipeline.run_pipeline`
+    dispatches to ``<worker>.prepare_pack``); this implementation preserves the
+    pipeline's original inline semantics exactly.
+
+    Args:
+        cfg: The validated training config (``runtime`` must be present).
+        pack_dir: The packed-feature directory.
+        cold_cache: ``True`` builds from scratch; ``False`` validates.
+        temp_prefix: Temp-directory prefix for the cold build.
+
+    Returns:
+        ``{"pack_manifest": {...}, "pack_identity_sha256": <sha of manifest.json>}``.
+
+    Raises:
+        ValueError: If ``cfg.runtime`` is missing, or on validation drift.
+    """
+    # Call-time import: keeps the module-attribute patch seam used by the
+    # pipeline tests (src.data.packed_features.<fn>) working unchanged.
+    from src.data import packed_features
+
+    if cfg.runtime is None:
+        raise ValueError("prepare_pack requires a configured cfg.runtime")
+    source_root = cfg.data.root / "features" / "frozen_node_features_1024"
+    if cold_cache:
+        logger.info("pack cache cold: building %s from %s", pack_dir, source_root)
+        manifest = packed_features.build_packed_features(
+            source_root,
+            pack_dir,
+            workers=cfg.runtime.pack_workers,
+            temp_prefix=temp_prefix,
+        )
+    else:
+        logger.info("pack cache warm: validating %s against %s", pack_dir, source_root)
+        manifest = packed_features.validate_packed_manifest(pack_dir, source_root)
+    return {
+        "pack_manifest": cast(dict[str, object], asdict(manifest)),
+        "pack_identity_sha256": packed_features.sha256_file(pack_dir / "manifest.json"),
+    }
+
+
 # --------------------------------------------------------------------------- real-data loaders
 
 

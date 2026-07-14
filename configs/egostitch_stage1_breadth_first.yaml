@@ -1,0 +1,63 @@
+# EgoStitch Stage-1 formal training config (spec docs/05-egostitch-spec.md §13).
+# Runs through the shared orchestrator with the EgoStitch worker:
+#   hpc/run.sh train configs/egostitch_stage1_breadth_first.yaml \
+#       --worker-module src.train_egostitch
+# runtime.token_budget_candidates is reinterpreted for this family as per-rank
+# node-stream batch-size (B_n) candidates (spec §13.13); the budget below is
+# config-driven — the 60-minute pin applies to the E2 B0 run only.
+
+model:
+  family: egostitch
+  config: {}          # spec-default EgoStitchConfig (§0/§13); G5 gate runs defaults
+
+data:
+  root: data
+  strategy: breadth_first
+  train_positives: e_sup            # pinned (spec §9.3)
+  negative_ratio: 5                 # pinned (spec §10.2)
+  partition_seed: 0
+  msg_fraction: 0.8                 # pinned (spec §9.3)
+  node_batch: 256                   # B_n default (spec §10.1)
+  edge_batch: 512                   # B_e default (spec §10.1)
+  f0_cache: outputs/feature_packs/egostitch_f0/f0_matrix.pt
+  grounding_cache: outputs/feature_packs/egostitch_f0/grounding.npz
+  s0_cache: outputs/s0_cache/b0_v31_egostitch_pairs.npz
+  s0_checkpoint_id: e092537d8cf1e208   # audited frozen B0 (spec §13.10)
+  expected_missing_features:
+    - node_004764
+    - node_007050
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 0.01
+  epochs: 30
+  warmup_steps: 200
+  grad_clip: 1.0
+  warmstart_fraction: 0.2           # L_recon-only phase (spec §13.8)
+
+eval:
+  patience: 10                      # VAL-CRITERION bookkeeping (spec §8)
+  eval_every: 1
+
+seed: 0
+output_dir: outputs/egostitch_stage1
+mixed_precision: "bf16"
+preregistration: docs/registrations/g5_stage1_preregistration.json
+
+runtime:
+  world_size: 4
+  pack_dir: outputs/feature_packs/egostitch_f0
+  pack_workers: 8
+  loader_workers_per_rank: 0        # batches are built in-process (F0 row gathers)
+  prefetch_factor: 2
+  token_budget_candidates: [128, 256, 512]   # B_n candidates for this family
+  max_pairs_per_rank: 1048576
+  memory_limit_gib: 85.0
+  total_budget_seconds: 10800
+  pack_budget_seconds: 600
+  setup_probe_budget_seconds: 900
+  train_eval_budget_seconds: 8940
+  artifact_budget_seconds: 120
+  reserve_seconds: 240
+  probe_warmup_steps: 5
+  probe_timed_steps: 15
