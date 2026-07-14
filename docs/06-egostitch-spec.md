@@ -254,15 +254,14 @@ Identities verified: `train_graph.pkl` edges = train⁺ ∪ val⁺ exactly (val�
 
 **Benchmark-A/B/C ↔ strategy mapping** is recorded in the run metadata. The completed
 canonical-metric G1 rerun uses `Benchmark-A = breadth_first`, checkpoint
-`e092537d8cf1e208`; its HPC artifacts are mirrored under `outputs/g1_mmd_ratio/` and
-`outputs/g1/`, and replace the G1 files in the checkpoint-aligned
-`outputs/e2_resubmit_retry/` package.
+`e092537d8cf1e208`; its single final artifact set is
+`outputs/deliverables/g1_pring_20260714/`. The final G3 artifact set is
+`outputs/deliverables/g3_pring_20260714/`.
 
-A later checkpoint-only `v3_1` evaluation rerun completed under
-`outputs/runs/legacy_v31_s47_20260712T193900Z/`; its curated local package is
-`outputs/deliverables/b0_v31_legacy_s47_20260713/`. Its archived assembled metrics
-predate the canonical MMD-ratio evaluator and are not current results; the rerun does
-not change the formal four-H20 training acceptance contract.
+A later checkpoint-only `v3_1` evaluation rerun uses the frozen score artifact under
+`outputs/runs/legacy_v31_s47_20260712T193900Z/`; its final PRING-aligned G1 artifact
+set is `outputs/deliverables/legacy_g1_pring_20260714/`. The rerun does not change the
+formal four-H20 training acceptance contract.
 
 ### 9.2 Feature pipeline (F0/F1)
 

@@ -151,9 +151,10 @@ papers; two shard reports in the session record):
 
 ## 1. Critique of the current scaffold contract
 
-> **Metric note (2026-07-14):** official PRING GS/RD were recomputed from the frozen
-> score artifacts over all 500 fixed induced subgraphs. The MMD component ratios are
-> unchanged canonical-run values.
+> **Metric note (2026-07-14):** official PRING GS/RD were formally rerun on the frozen
+> score artifacts over all 500 fixed induced subgraphs. The final G1/G3 artifacts are
+> `outputs/deliverables/g1_pring_20260714/` and `outputs/deliverables/g3_pring_20260714/`;
+> the MMD component ratios are unchanged canonical-run values.
 
 Current contract (`03-experiment-protocol.md` §0):
 
@@ -174,8 +175,9 @@ the method is supposed to fix, and systematic B0 errors — hub over-prediction,
 similarity–adjacency conflation — are inherited by the context and then "corrected" by a
 residual conditioned on those same errors.
 
-A separate checkpoint-only evaluation of the aligned legacy `v3_1` scorer completed in
-run `legacy_v31_s47_20260712T193900Z`. An official PRING evaluator rerun gives
+A separate checkpoint-only evaluation of the aligned legacy `v3_1` scorer used the frozen
+scores from run `legacy_v31_s47_20260712T193900Z`; its final evaluator artifact is
+`outputs/deliverables/legacy_g1_pring_20260714/`. The official PRING rerun gives
 global simple-edge RD `0.978392`, PRING BFS-macro GS/RD `0.381264/0.500179`, and
 degree/clustering/spectral MMD ratios
 `13.8456/11.6277/19.9774` despite degree-corrected AUROC/AUPRC
@@ -1101,7 +1103,7 @@ block-model marginals close most of the pair-to-topology gap") if the controls w
 | Channel collinearity (s1≈s0, s2≈s3 ⇒ Ours→B5) | correlation matrix + knockouts + FCR-stratified pre-registered prediction; §6.5 decision rule (ii) |
 | Gains explained by extra parameters or operating point | B1/B5/`B0+cal`/`B3-dist`/`B3-full` + randomized scaffold at matched capacity + identical-head comparison + density-matched thresholds |
 | Assembled-graph realism capped by edge independence | G2 ceiling computed first; all tables read against it; stop condition defined |
-| E2 numbers fragile (weak scorer, easy negatives, undefined composite, mixed normalization) | gate G1 re-run before any further quoting; "strong scorer" wording retired until a strong B0 exists [DA-m16] |
+| E2 numbers fragile (weak scorer, easy negatives, undefined composite, mixed normalization) | G1 rerun completed with hard negatives and official PRING GS/RD; current claims route only to the 2026-07-14 formal artifacts, and "strong scorer" wording remains retired [DA-m16] |
 | Budget prior breaks under benchmark density shift | `d̂` normalized per candidate-universe density (§4.1); E6 checks |
 | Grounding collapse under `L_ssl` | pool-consistency applied to ungrounded slots only; mean `g^k` monitored |
 | Stochastic inference irreproducible | §4.0 determinism policy (fixed samples, averaged `p_ij`, seeds) |

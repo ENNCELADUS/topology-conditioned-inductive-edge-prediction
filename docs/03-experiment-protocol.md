@@ -207,8 +207,8 @@ prioritized in Section 5 (gates first).
   for the first systems-optimization pass. The wall-clock gate is 60 minutes from an empty
   derived-cache path through final training artifacts.
 - **Result (updated 2026-07-14):** G1 is complete with B0, B0-alt, and PA-null. Official
-  PRING GS/RD were recomputed from the frozen score artifacts over all 500 fixed induced
-  subgraphs. The B0
+  PRING GS/RD were formally rerun on the frozen score artifacts over all 500 fixed induced
+  subgraphs; the final artifact is `outputs/deliverables/g1_pring_20260714/`. The B0
   degree-corrected ratio-1 row is AUROC 0.705519 / AUPRC 0.730260; the hard-heuristic
   row is 0.583965 / 0.626649; the hard-feature row is 0.569560 / 0.617475; and the full
   candidate-universe row is 0.690627 / 0.134302. At the quota-calibrated operating point,
@@ -230,7 +230,7 @@ prioritized in Section 5 (gates first).
   `Ov_min=0.054954`
   at matched volume is sufficient to reach the reference triangle count; the full ceiling
   curve and caveats are in the synced G2 artifact.
-- **G3 result (GS/RD recomputed 2026-07-14):** B0 has global simple-edge RD
+- **G3 result (canonical PRING rerun 2026-07-14):** B0 has global simple-edge RD
   `0.997710` and PRING BFS-macro GS/RD `0.312151/0.422345`. The pinned `oracle_topo`
   arm has global simple-edge RD `1.000000` and PRING BFS-macro GS/RD `0.503048/0.794303`
   (GS ratio `1.61155`) and MMD ratios `14.1148/8.23662/16.0772`, with per-statistic

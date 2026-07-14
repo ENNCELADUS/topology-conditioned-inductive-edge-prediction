@@ -1,5 +1,9 @@
 # G3 Oracle Gate — Design Spec (approved 2026-07-13)
 
+> **Historical design record:** the composite/global-density output schema below was
+> superseded by official PRING GS/RD on 2026-07-14. It is not a current result source;
+> use `outputs/deliverables/g3_pring_20260714/`.
+
 **Deliverable:** `src/experiments/g3_oracle.py` + `tests/test_g3_oracle.py`, implementing
 the pre-implementation gate G3 ("Oracle first") of `docs/03-experiment-protocol.md` §5.0,
 plus the pinned-instantiation contract edit in docs/03 (done in the same change set,

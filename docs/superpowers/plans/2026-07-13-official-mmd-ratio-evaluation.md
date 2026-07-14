@@ -1,5 +1,9 @@
 # Official MMD Ratio Evaluation Implementation Plan
 
+> **Historical implementation record:** this dated plan predates the 2026-07-14
+> migration from the MMD-ratio composite/global-density schema to official PRING GS/RD.
+> Current results live under `outputs/deliverables/*_pring_20260714/`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the current assembled-graph MMD implementation and output schema with the fixed-sigma Gaussian-TV, split-reference normalized MMD ratio needed to produce PRING-paper-table-scale degree, clustering, and spectral values.

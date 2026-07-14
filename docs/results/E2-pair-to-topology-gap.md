@@ -1,7 +1,7 @@
 # E2 Pair-to-Topology Gap: G1/G2/G3 Gate Results
 
 > **Metric scope (2026-07-14):** official PRING Graph Similarity (GS) and Relative
-> Density (RD) were recomputed from frozen score artifacts over all 500 fixed
+> Density (RD) were formally rerun on frozen score artifacts over all 500 fixed
 > `breadth_first` induced subgraphs. MMD ratios remain canonical-run values.
 
 ## Executive summary
@@ -29,8 +29,8 @@ verified four-H20 timing evidence remains warm-cache only.
 
 ## 1. Run identity and evaluation scope
 
-The canonical G1 closeout completed on 2026-07-13. B0 and B0-alt were scored over
-the same candidate universe.
+The canonical PRING-aligned G1 closeout completed on 2026-07-14. B0 and B0-alt were
+scored over the same candidate universe.
 
 | Item | B0 | B0-alt |
 |---|---|---|
@@ -71,8 +71,8 @@ PA-null wins selected easy and feature-hard rows.
 as uniformly strong. The G1 claim rests on the edge/topology mismatch, not on a
 leaderboard claim about this checkpoint.
 
-The archived ratio-5 and full regime rows are available in the combined
-[`g1_tables.md`](../../outputs/runs/g1_b0_b0_alt_20260713T165714Z/g1_tables.md).
+The ratio-5 and full regime rows are available in the final combined
+[`g1_tables.md`](../../outputs/deliverables/g1_pring_20260714/g1_tables.md).
 
 ### 2.2 Assembly calibration and topology
 
@@ -116,8 +116,8 @@ B0 predicts 2,018 self-loops and B0-alt predicts 2,012, versus 1,891 in the
 reference. PRING GS/RD retain these loops inside each induced subgraph; global
 simple-edge RD excludes them by definition.
 
-The archived threshold sweep supports the MMD/recall operating-point analysis. Its
-GS/RD columns predate the PRING migration and are not quoted as current PRING results.
+The formal 2026-07-14 threshold sweep reports official PRING GS/RD together with
+MMD/recall at every evaluated threshold; the operating-point row above is the headline.
 
 ### 2.3 Metric provenance
 
@@ -155,7 +155,7 @@ graph is realistic. For a hard-thresholded graph, `Ov=1` and the bound becomes v
 comparison for future calibrated assemblies.
 
 The curve is preserved in
-[`g2_results.json`](../../outputs/e2_resubmit_retry/g2/g2_results.json).
+[`results.json`](../../outputs/deliverables/b0_v31_breadth_first_20260711/g2/results.json).
 
 ## 4. G3 Oracle gate
 
@@ -221,8 +221,8 @@ G1 rows are `0.626746/0.663360` and `0.510083/0.602131`, respectively.
 Future assembled-graph tables must name global simple-edge RD and PRING BFS-macro RD
 separately.
 
-The PRING-migrated threshold sweep should be rerun before making any current GS/RD
-claim away from the documented operating point.
+The PRING-migrated threshold sweep is preserved in the formal G1 artifact. Any claim
+away from the documented operating point must identify its exact threshold and recall.
 
 The next research stage is EgoStitch implementation under
 [`docs/06-egostitch-spec.md`](../06-egostitch-spec.md). Cold-start four-H20 acceptance
@@ -230,21 +230,23 @@ remains a separate systems-validation item.
 
 ## 7. Source artifacts
 
-Archived JSON and Markdown tables preserve their original 2026-07-13 output schema,
-including the retired composite. They remain immutable run provenance rather than
-current PRING GS/RD reports.
+The three 2026-07-14 directories below are the only active final evaluator artifacts.
+Each includes a manifest with input, source, and output SHA-256 values. Older evaluator
+outputs use the retired schema and are not current result sources.
 
 ### Primary artifacts
 
 - [Formal B0 candidate scores](../../outputs/deliverables/b0_v31_breadth_first_20260711/scores/candidate.npz)
 - [B0-alt candidate scores](../../outputs/runs/b0_alt_20260713T164214Z/scores/candidate.npz)
-- [Combined B0/B0-alt G1 results](../../outputs/runs/g1_b0_b0_alt_20260713T165714Z/g1_results.json)
-- [G2 results](../../outputs/e2_resubmit_retry/g2/g2_results.json)
-- [G3 results](../../outputs/deliverables/b0_v31_breadth_first_20260711/g3/g3_results.json)
+- [Combined B0/B0-alt G1 results](../../outputs/deliverables/g1_pring_20260714/g1_results.json)
+- [Combined G1 manifest](../../outputs/deliverables/g1_pring_20260714/manifest.json)
+- [G2 results](../../outputs/deliverables/b0_v31_breadth_first_20260711/g2/results.json)
+- [G3 results](../../outputs/deliverables/g3_pring_20260714/g3_results.json)
+- [G3 manifest](../../outputs/deliverables/g3_pring_20260714/manifest.json)
+- [Legacy G1 results](../../outputs/deliverables/legacy_g1_pring_20260714/g1_results.json)
+- [Legacy G1 manifest](../../outputs/deliverables/legacy_g1_pring_20260714/manifest.json)
 
 ### Provenance and robustness artifacts
 
 - [Formal B0 deliverable](../../outputs/deliverables/b0_v31_breadth_first_20260711/)
-- [G1 closeout package](../../outputs/deliverables/g1_closeout_20260713/)
 - [Legacy checkpoint rerun](../../outputs/runs/legacy_v31_s47_20260712T193900Z/)
-- [Legacy canonical G1 rerun](../../outputs/runs/legacy_v31_s47_20260712T193900Z/g1_canonical_20260713/)

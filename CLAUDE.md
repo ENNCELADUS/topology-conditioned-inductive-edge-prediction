@@ -191,9 +191,11 @@ rather than resolving them unilaterally.
 
 ## Load-bearing facts (the E2 result)
 
-**Metric recomputation note (2026-07-14):** official PRING GS/RD were recomputed from the
-frozen candidate-score artifacts over all 500 fixed induced subgraphs and macro-averaged over
-all samples. The MMD component ratios remain the recorded canonical-run values.
+**Canonical metric rerun note (2026-07-14):** official PRING GS/RD were formally rerun on
+the frozen candidate-score artifacts over all 500 fixed induced subgraphs and macro-averaged
+over all samples. Final G1, G3, and legacy artifacts live under
+`outputs/deliverables/{g1_pring_20260714,g3_pring_20260714,legacy_g1_pring_20260714}`.
+The MMD component ratios remain the recorded canonical-run values.
 
 The current load-bearing gap is the completed G1 result: the frozen B0 pairwise scorer
 reaches **AUROC 0.705519 / AUPRC 0.730260** on degree-corrected ratio-1 negatives,

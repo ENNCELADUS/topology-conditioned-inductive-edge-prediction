@@ -76,8 +76,8 @@ assembling into a poor *graph*. This "pair-to-topology gap" is the reason the me
 exists. Full note: [`docs/results/E2-pair-to-topology-gap.md`](docs/results/E2-pair-to-topology-gap.md);
 figure: [`figures/e2-gap.html`](figures/e2-gap.html).
 
-> **Metric recomputation (2026-07-14):** GS/RD now match official PRING evaluation and were
-> recomputed from the frozen score artifacts over all 500 fixed induced subgraphs. The separately
+> **Canonical metric rerun (2026-07-14):** GS/RD now match official PRING evaluation and were
+> formally rerun on the frozen score artifacts over all 500 fixed induced subgraphs. The separately
 > reported MMD ratios remain the canonical-run values.
 
 | Level | Metric | Value | Reading |
@@ -93,7 +93,7 @@ figure: [`figures/e2-gap.html`](figures/e2-gap.html).
 | Assembled graph (B0-alt) | degree / clustering / spectral MMD ratio | **15.8304 / 13.4718 / 23.4734** | gap persists and is larger |
 
 The final two-architecture G1 threshold sweep and all negative-regime rows are recorded in
-[`outputs/runs/g1_b0_b0_alt_20260713T165714Z/g1_tables.md`](outputs/runs/g1_b0_b0_alt_20260713T165714Z/g1_tables.md).
+[`outputs/deliverables/g1_pring_20260714/g1_tables.md`](outputs/deliverables/g1_pring_20260714/g1_tables.md).
 G2 reports measured soft-score overlap 0.4799 versus the minimum 0.0550 required to
 reach the reference triangle count. G3's Oracle-blend arm reports MMD-ratio headroom
 1.723 / 3.885 / 1.998 for degree / clustering / spectral; Oracle-topo reaches PRING GS
@@ -108,7 +108,7 @@ metrics were recomputed with the official evaluator: PRING BFS-macro GS/RD
 **0.3813 / 0.5002** at global simple-edge RD **0.9784**, alongside MMD ratios
 **13.8456 / 11.6277 / 19.9774**. Thus the stronger edge scorer improves GS but does not
 close the topology gap. The complete closeout package is
-[`outputs/deliverables/g1_closeout_20260713/`](outputs/deliverables/g1_closeout_20260713/).
+[`outputs/deliverables/legacy_g1_pring_20260714/`](outputs/deliverables/legacy_g1_pring_20260714/).
 
 ## The Proposed Method (EgoStitch)
 
@@ -211,9 +211,9 @@ target test graph; the queried edge is masked/standardized inside the scaffold. 
 - [x] **EgoStitch proposal** — approved 2026-07-09; reviewed via novelty check + 5-persona panel ([`docs/05-review-report.md`](docs/05-review-report.md)).
 - [x] **G4 spec freeze** — [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) signed off (algorithm + benchmark data contract + batch sampler + four-H20 execution).
 - [x] **Baseline + gate pipeline** — benchmark/features, B0/B0-alt training, cached scoring, G1/G2/G3 analyses, and tests are implemented.
-- [x] **G1 + G2** — B0/PA-null, B0-alt architecture replication, and the checkpoint-aligned edge-independence ceiling are complete; G1 closeout artifacts are under `outputs/deliverables/g1_closeout_20260713/`.
-- [x] **Latest legacy v3.1 robustness rerun** — canonical G1 confirms that the stronger scorer preserves the topology gap; artifacts are included in `outputs/deliverables/g1_closeout_20260713/`.
-- [x] **G3 gate** — Oracle row passed; Oracle-blend shows substantial headroom over B0 and the feature-insufficiency stop rule is not triggered. Results are under [`outputs/deliverables/b0_v31_breadth_first_20260711/g3/`](outputs/deliverables/b0_v31_breadth_first_20260711/g3/).
+- [x] **G1 + G2** — B0/PA-null, B0-alt architecture replication, and the checkpoint-aligned edge-independence ceiling are complete; the final PRING-aligned G1 artifacts are under [`outputs/deliverables/g1_pring_20260714/`](outputs/deliverables/g1_pring_20260714/).
+- [x] **Latest legacy v3.1 robustness rerun** — canonical G1 confirms that the stronger scorer preserves the topology gap; final artifacts are under [`outputs/deliverables/legacy_g1_pring_20260714/`](outputs/deliverables/legacy_g1_pring_20260714/).
+- [x] **G3 gate** — Oracle row passed; Oracle-blend shows substantial headroom over B0 and the feature-insufficiency stop rule is not triggered. Final artifacts are under [`outputs/deliverables/g3_pring_20260714/`](outputs/deliverables/g3_pring_20260714/).
 - [ ] **EgoStitch implementation** under `src/`, per [`docs/06-egostitch-spec.md`](docs/06-egostitch-spec.md) and the [experiment protocol](docs/03-experiment-protocol.md).
 - [ ] **Experiments** in priority order: EgoStitch implementation → E1/E3 main + baselines → E4 ablations → E5 integrity gates → E7 (load-bearing) → E6 breadth.
 
