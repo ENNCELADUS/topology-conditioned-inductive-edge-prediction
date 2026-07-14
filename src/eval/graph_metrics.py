@@ -10,6 +10,34 @@ from scipy.linalg import eigvalsh
 STATISTICS = ("degree", "clustering", "spectral")
 
 
+def _require_same_nodes(g_pred: nx.Graph, g_ref: nx.Graph) -> list[str]:
+    if set(g_pred.nodes()) != set(g_ref.nodes()):
+        raise ValueError("Graphs must have the same set of nodes")
+    return sorted(g_ref.nodes())
+
+
+def compute_graph_similarity(g_pred: nx.Graph, g_ref: nx.Graph) -> float:
+    """Return official PRING adjacency similarity for one graph pair."""
+    nodes = _require_same_nodes(g_pred, g_ref)
+    pred_matrix = nx.to_numpy_array(g_pred, nodelist=nodes)
+    ref_matrix = nx.to_numpy_array(g_ref, nodelist=nodes)
+    denominator = float(np.sum(pred_matrix) + np.sum(ref_matrix))
+    if denominator <= 0.0:
+        return 1.0
+    difference = float(np.abs(pred_matrix - ref_matrix).sum())
+    return float(1.0 - difference / denominator)
+
+
+def compute_relative_density(g_pred: nx.Graph, g_ref: nx.Graph) -> float:
+    """Return official PRING predicted/reference density ratio for one graph pair."""
+    _require_same_nodes(g_pred, g_ref)
+    pred_density = float(nx.density(g_pred))
+    ref_density = float(nx.density(g_ref))
+    if ref_density == 0.0:
+        return float("inf") if pred_density != 0.0 else 1.0
+    return pred_density / ref_density
+
+
 def degree_histogram(g: nx.Graph) -> np.ndarray:
     """Return the complete, unnormalized NetworkX degree histogram."""
     return np.asarray(nx.degree_histogram(g), dtype=float)
@@ -85,8 +113,11 @@ def mmd_squared(
 class BucketedMMDReport:
     """Raw, reference, and normalized topology metrics across size buckets."""
 
+    per_size_graph_similarity: dict[int, list[float]]
+    per_size_relative_density: dict[int, list[float]]
     per_size_raw_mmd2: dict[int, dict[str, float]]
     per_size_reference_mmd2: dict[int, dict[str, float]]
+    graph_similarity: float
     raw_mmd2: dict[str, float]
     reference_mmd2: dict[str, float]
     mmd_ratio: dict[str, float]
@@ -128,16 +159,9 @@ def evaluate_assembled_graph(
     """Evaluate predicted subgraphs and normalize MMD2 by reference variability."""
     self_loops_pred = nx.number_of_selfloops(g_pred)
     self_loops_ref = nx.number_of_selfloops(g_ref)
-    pred_simple_full = strip_self_loops(g_pred)
-    ref_simple_full = strip_self_loops(g_ref)
-    ref_edge_count = ref_simple_full.number_of_edges()
-    pred_edge_count = pred_simple_full.number_of_edges()
-    relative_density = (
-        pred_edge_count / ref_edge_count
-        if ref_edge_count > 0
-        else (0.0 if pred_edge_count == 0 else float("inf"))
-    )
 
+    per_size_graph_similarity: dict[int, list[float]] = {}
+    per_size_relative_density: dict[int, list[float]] = {}
     per_size_raw: dict[int, dict[str, float]] = {}
     per_size_reference: dict[int, dict[str, float]] = {}
     for size, node_sets in buckets.items():
@@ -145,12 +169,20 @@ def evaluate_assembled_graph(
             raise ValueError(f"bucket {size} requires at least two reference samples")
         pred_descs: dict[str, list[np.ndarray]] = {stat: [] for stat in STATISTICS}
         ref_descs: dict[str, list[np.ndarray]] = {stat: [] for stat in STATISTICS}
+        graph_similarities: list[float] = []
+        relative_densities: list[float] = []
         for nodes in node_sets:
-            pred_d = _descriptors(_induced_subgraph(g_pred, nodes))
-            ref_d = _descriptors(_induced_subgraph(g_ref, nodes))
+            pred_subgraph = _induced_subgraph(g_pred, nodes)
+            ref_subgraph = _induced_subgraph(g_ref, nodes)
+            graph_similarities.append(compute_graph_similarity(pred_subgraph, ref_subgraph))
+            relative_densities.append(compute_relative_density(pred_subgraph, ref_subgraph))
+            pred_d = _descriptors(pred_subgraph)
+            ref_d = _descriptors(ref_subgraph)
             for stat in STATISTICS:
                 pred_descs[stat].append(pred_d[stat])
                 ref_descs[stat].append(ref_d[stat])
+        per_size_graph_similarity[size] = graph_similarities
+        per_size_relative_density[size] = relative_densities
         per_size_raw[size] = {
             stat: mmd_squared(pred_descs[stat], ref_descs[stat], config) for stat in STATISTICS
         }
@@ -171,9 +203,18 @@ def evaluate_assembled_graph(
         stat: raw_mmd2[stat] / max(reference_mmd2[stat], config.reference_epsilon)
         for stat in STATISTICS
     }
+    graph_similarity = float(
+        np.mean([value for values in per_size_graph_similarity.values() for value in values])
+    )
+    relative_density = float(
+        np.mean([value for values in per_size_relative_density.values() for value in values])
+    )
     return BucketedMMDReport(
+        per_size_graph_similarity=per_size_graph_similarity,
+        per_size_relative_density=per_size_relative_density,
         per_size_raw_mmd2=per_size_raw,
         per_size_reference_mmd2=per_size_reference,
+        graph_similarity=graph_similarity,
         raw_mmd2=raw_mmd2,
         reference_mmd2=reference_mmd2,
         mmd_ratio=mmd_ratio,

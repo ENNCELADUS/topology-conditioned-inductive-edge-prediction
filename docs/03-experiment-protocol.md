@@ -106,9 +106,15 @@ Components:
     path-length summaries, a learned-graph-feature distance from an encoder never used in
     training, and the discriminator probe (accuracy of a held-out classifier distinguishing
     assembled from real subgraphs; near-chance = realism).
-  - *Composite:* "graph similarity" may be quoted only after its definition (components,
-    weights, normalization, direction) is published in the run metadata (gate G1); components
-    are always reported alongside.
+  - *PRING Graph Similarity / Relative Density:* for every fixed sampled node set, take the
+    predicted and reference induced subgraphs and compute
+    `GS = 1 - ||A_pred - A_ref||_1 / (sum(A_pred) + sum(A_ref))` (equivalently edge
+    Dice/F1 for an undirected simple graph) and
+    `RD = density(G_pred) / density(G_ref)`. Match the official evaluator's zero-density
+    guards (`GS(empty, empty) = 1`, `RD(empty, empty) = 1`, nonempty-over-empty RD = inf),
+    retain self-loops in both metrics, and report the unweighted mean over every sampled
+    subgraph across all node-size buckets. GS and RD are independent of the MMD metrics;
+    no MMD composite may be labeled "graph similarity".
   - *References:* every assembled-metric table carries (i) the real-vs-real **noise floor**
     row, (ii) the **edge-independence ceiling** row (gate G2), and (iii) the **Oracle** row
     (gate G3).
@@ -193,25 +199,30 @@ prioritized in Section 5 (gates first).
   universe, one canonical metric normalization, a true threshold sweep (recall/density-vs-MMD
   curves), easy, hard (HeaRT-style), **and degree-corrected** (2405.14985) negatives, B0-alt
   replication, the PA-null row, real-vs-real noise floor, bootstrap variance, a defined
-  "graph similarity" composite **that passes an expressivity/robustness perturbation check
-  (O'Bray 2106.01098) before it ranks anything**, and the full-candidate-universe imbalance
-  view.
+  official PRING Graph Similarity and Relative Density over the fixed sampled subgraphs,
+  an expressivity/robustness perturbation diagnostic (O'Bray 2106.01098), and the
+  full-candidate-universe imbalance view.
 - **Execution acceptance:** E2 uses a fixed 30-epoch four-H20 throughput run. Validation
   is executed after every epoch; quality is reported but is not the throughput acceptance gate
   for the first systems-optimization pass. The wall-clock gate is 60 minutes from an empty
   derived-cache path through final training artifacts.
-- **Result (updated 2026-07-14):** G1 is complete with B0, B0-alt, and PA-null. The B0
+- **Result (updated 2026-07-14):** G1 is complete with B0, B0-alt, and PA-null. Official
+  PRING GS/RD were recomputed from the frozen score artifacts over all 500 fixed induced
+  subgraphs. The B0
   degree-corrected ratio-1 row is AUROC 0.705519 / AUPRC 0.730260; the hard-heuristic
   row is 0.583965 / 0.626649; the hard-feature row is 0.569560 / 0.617475; and the full
-  candidate-universe row is 0.690627 / 0.134302. At the density-matched operating point,
-  relative density is 0.997710 and the perturbation-validated graph-similarity composite
-  is 5.76802e-7, with degree/clustering/spectral MMD ratios of 13.0768/11.9273/18.0931.
+  candidate-universe row is 0.690627 / 0.134302. At the quota-calibrated operating point,
+  global simple-edge RD is `0.997710`, while official PRING BFS-macro GS/RD are
+  `0.312151/0.422345`, with degree/clustering/spectral MMD ratios
+  `13.0768/11.9273/18.0931`.
   The ratios use the fixed-`sigma=1` Gaussian-TV biased MMD² numerator divided by the
   deterministic real-vs-real reference floor; `1` is that floor and lower is better.
   B0-alt reaches 0.693603 / 0.732509 on the degree-corrected row, 0.576711 / 0.623517
   on hard heuristic negatives, and 0.467864 / 0.561339 on hard feature negatives. Its
-  independently density-matched assembly has relative density 0.998739, composite
-  2.29059e-8, and degree/clustering/spectral MMD ratios 15.8304/13.4718/23.4734.
+  independently calibrated assembly has global simple-edge RD `0.998739`, PRING
+  BFS-macro GS/RD `0.345802/0.450793`, and degree/clustering/spectral MMD ratios
+  15.8304/13.4718/23.4734. PA-null has global simple-edge RD `1.000000` and PRING
+  BFS-macro GS/RD `0.245377/0.489125`.
   The gap therefore survives an alternate architecture, hard negatives, and calibrated
   thresholds, although PA-null beats B0 in the easy and feature-hard rows and remains a
   mandatory control.
@@ -219,14 +230,16 @@ prioritized in Section 5 (gates first).
   `Ov_min=0.054954`
   at matched volume is sufficient to reach the reference triangle count; the full ceiling
   curve and caveats are in the synced G2 artifact.
-- **G3 result (2026-07-13):** the B0 assembled row reproduced the canonical G1 values exactly:
-  threshold `0.794385`, relative density `0.997710`, degree/clustering/spectral MMD ratios
-  `13.0768/11.9273/18.0931`, and composite `5.76802e-7`. The pinned `oracle_topo` arm reached
-  ratios `14.1148/8.23662/16.0772` with per-statistic headroom `0.926465/1.44808/1.12539`;
-  the disclosed `oracle_blend` arm reached `7.58890/3.06980/9.05715` with headroom
-  `1.72315/3.88537/1.99767` and composite ratio `2425.56`. Oracle-blend therefore provides
-  substantial room over B0, so the feature-insufficiency stop rule is not triggered and
-  EgoStitch may proceed to implementation.
+- **G3 result (GS/RD recomputed 2026-07-14):** B0 has global simple-edge RD
+  `0.997710` and PRING BFS-macro GS/RD `0.312151/0.422345`. The pinned `oracle_topo`
+  arm has global simple-edge RD `1.000000` and PRING BFS-macro GS/RD `0.503048/0.794303`
+  (GS ratio `1.61155`) and MMD ratios `14.1148/8.23662/16.0772`, with per-statistic
+  headroom `0.926465/1.44808/1.12539`. The disclosed `oracle_blend` arm also has global
+  simple-edge RD `1.000000` and reaches PRING BFS-macro GS/RD `0.323649/0.652734` (GS ratio
+  `1.03683`) with MMD ratios `7.58890/3.06980/9.05715` and headroom
+  `1.72315/3.88537/1.99767`. The Oracle arms are not approximately equal
+  to B0 across assembled metrics, so the feature-insufficiency stop rule is not triggered
+  and EgoStitch may proceed to implementation.
 
 **Latest checkpoint-only evaluation rerun:** the aligned legacy `v3_1` checkpoint was
 scored on the same split in run `legacy_v31_s47_20260712T193900Z` (completed 2026-07-12
@@ -234,11 +247,11 @@ scored on the same split in run `legacy_v31_s47_20260712T193900Z` (completed 202
 degree-corrected ratio-1 row was `0.799577/0.813319`, hard-heuristic
 `0.626746/0.663360`, and hard-feature `0.510083/0.602131`. This is an evaluation
 rerun of a supplied checkpoint, not a replacement for the formal four-H20 E2 training
-acceptance or the canonical B0/B0-alt/G3 gate artifacts. Its archived assembled metrics use the retired
-evaluator, but the same scores were rerun through the canonical evaluator on 2026-07-13:
-relative density `0.978392`, graph similarity `2.63231e-7`, and
-degree/clustering/spectral MMD ratios `13.8456/11.6277/19.9774`. The stronger scorer
-therefore does not shrink the topology gap.
+acceptance or the canonical B0/B0-alt/G3 gate artifacts. The same scores were rerun through
+the official PRING evaluator on 2026-07-14: global simple-edge RD is `0.978392`, PRING
+BFS-macro GS/RD are `0.381264/0.500179`, and degree/clustering/spectral MMD ratios are
+`13.8456/11.6277/19.9774`. The stronger scorer improves GS but does not close the
+topology gap.
 
 ### E3: Baselines head-to-head on Benchmark-A
 

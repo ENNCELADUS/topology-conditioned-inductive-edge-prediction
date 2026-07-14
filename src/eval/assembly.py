@@ -104,12 +104,14 @@ class SweepPoint:
         threshold: The assembly threshold used.
         recall: Fraction of `g_ref`'s (self-loop-stripped) canonical edges that are
             also present in the assembled graph at this threshold.
-        relative_density: `|E_pred_simple| / |E_ref_simple|` at this threshold.
+        graph_similarity: Official PRING per-subgraph GS macro mean.
+        relative_density: Official PRING per-subgraph RD macro mean.
         mmd_ratio: Statistic -> reference-normalized MMD ratio at this threshold.
     """
 
     threshold: float
     recall: float
+    graph_similarity: float
     relative_density: float
     mmd_ratio: dict[str, float]
 
@@ -157,6 +159,7 @@ def threshold_sweep(
             SweepPoint(
                 threshold=float(t),
                 recall=recall,
+                graph_similarity=report.graph_similarity,
                 relative_density=report.relative_density,
                 mmd_ratio=dict(report.mmd_ratio),
             )

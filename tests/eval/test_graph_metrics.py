@@ -13,6 +13,8 @@ from src.eval.graph_metrics import (
     MMDConfig,
     bootstrap_mmd,
     clustering_histogram,
+    compute_graph_similarity,
+    compute_relative_density,
     degree_histogram,
     evaluate_assembled_graph,
     laplacian_spectrum_histogram,
@@ -41,6 +43,35 @@ def _manual_mmd(samples1: list[np.ndarray], samples2: list[np.ndarray]) -> float
         + mean_kernel(normalized2, normalized2)
         - 2.0 * mean_kernel(normalized1, normalized2)
     )
+
+
+@pytest.mark.unit
+class TestOfficialPringGraphMetrics:
+    def test_graph_similarity_is_edge_dice(self) -> None:
+        gt = nx.Graph([("a", "b"), ("b", "c")])
+        pred = nx.Graph([("a", "b"), ("a", "c")])
+        assert compute_graph_similarity(pred, gt) == pytest.approx(0.5)
+
+    def test_graph_similarity_empty_graphs_are_identical(self) -> None:
+        gt = nx.empty_graph(["a", "b"])
+        pred = gt.copy()
+        assert compute_graph_similarity(pred, gt) == pytest.approx(1.0)
+
+    def test_relative_density_matches_official_formula_and_empty_guards(self) -> None:
+        gt = nx.Graph([("a", "b"), ("b", "c")])
+        pred = nx.Graph([("a", "b")])
+        pred.add_node("c")
+        assert compute_relative_density(pred, gt) == pytest.approx(0.5)
+
+        empty = nx.empty_graph(["a", "b", "c"])
+        assert compute_relative_density(empty, empty) == pytest.approx(1.0)
+        assert compute_relative_density(gt, empty) == float("inf")
+
+    def test_requires_matching_node_sets(self) -> None:
+        with pytest.raises(ValueError, match="same set of nodes"):
+            compute_graph_similarity(nx.empty_graph(["a"]), nx.empty_graph(["b"]))
+        with pytest.raises(ValueError, match="same set of nodes"):
+            compute_relative_density(nx.empty_graph(["a"]), nx.empty_graph(["b"]))
 
 
 @pytest.mark.unit
@@ -175,27 +206,35 @@ class TestEvaluateAssembledGraph:
         assert report.self_loops_pred == 0
         assert report.self_loops_ref == 0
 
-    def test_pred_self_loops_are_described_but_excluded_from_density(self) -> None:
-        g_ref = nx.path_graph(["a", "b", "c"])
-        g_pred = g_ref.copy()
-        g_pred.add_edge("a", "a")
-        buckets = {3: [{"a", "b", "c"}, {"a", "b", "c"}]}
-        report = evaluate_assembled_graph(g_pred, g_ref, buckets, MMDConfig())
-        assert report.self_loops_pred == 1
-        assert report.self_loops_ref == 0
-        assert report.relative_density == pytest.approx(1.0)
-        assert report.raw_mmd2["degree"] > 0.0
-
-    def test_reference_self_loops_are_counted_and_described(self) -> None:
-        g_pred = nx.path_graph(["a", "b", "c"])
-        g_ref = g_pred.copy()
+    def test_self_loops_participate_in_official_graph_similarity_and_density(self) -> None:
+        g_ref = nx.empty_graph(["a", "b", "c"])
         g_ref.add_edge("a", "a")
+        g_pred = nx.empty_graph(["a", "b", "c"])
         buckets = {3: [{"a", "b", "c"}, {"a", "b", "c"}]}
         report = evaluate_assembled_graph(g_pred, g_ref, buckets, MMDConfig())
         assert report.self_loops_pred == 0
         assert report.self_loops_ref == 1
-        assert report.relative_density == pytest.approx(1.0)
+        assert report.graph_similarity == pytest.approx(0.0)
+        assert report.relative_density == pytest.approx(0.0)
         assert report.raw_mmd2["degree"] > 0.0
+
+    def test_gs_rd_are_macro_means_over_every_sample(self) -> None:
+        g_ref = nx.Graph([("a", "b"), ("b", "c"), ("c", "d")])
+        g_pred = nx.Graph([("a", "b")])
+        g_pred.add_nodes_from(g_ref.nodes())
+        buckets = {
+            2: [{"a", "b"}, {"c", "d"}],
+            3: [{"a", "b", "c"}, {"b", "c", "d"}, {"a", "c", "d"}],
+        }
+        report = evaluate_assembled_graph(g_pred, g_ref, buckets, MMDConfig())
+        expected_gs = [1.0, 0.0, 2.0 / 3.0, 0.0, 0.0]
+        expected_rd = [1.0, 0.0, 0.5, 0.0, 0.0]
+        assert report.per_size_graph_similarity[2] == pytest.approx(expected_gs[:2])
+        assert report.per_size_graph_similarity[3] == pytest.approx(expected_gs[2:])
+        assert report.per_size_relative_density[2] == pytest.approx(expected_rd[:2])
+        assert report.per_size_relative_density[3] == pytest.approx(expected_rd[2:])
+        assert report.graph_similarity == pytest.approx(np.mean(expected_gs))
+        assert report.relative_density == pytest.approx(np.mean(expected_rd))
 
     def test_per_size_keys_match_buckets(self) -> None:
         g_ref, buckets = _seeded_er_graph_and_buckets()

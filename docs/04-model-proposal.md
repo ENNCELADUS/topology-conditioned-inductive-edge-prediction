@@ -128,9 +128,9 @@ papers; two shard reports in the session record):
   degree-respecting edge-independent baseline; G1 re-verifies E2 under
   degree-corrected negatives explicitly (2405.14985).
 - **(p) Metric-validation additions (O'Bray 2106.01098).** Per-statistic bin-count
-  disclosure; no ad-hoc EMD/TV kernels without justification; the "graph similarity"
-  composite must pass an expressivity/robustness perturbation check as part of its G1
-  definition.
+  disclosure; no ad-hoc EMD/TV kernels without justification; MMD-based diagnostics
+  must pass an expressivity/robustness perturbation check. Official PRING Graph
+  Similarity and Relative Density remain separately reported metrics.
 - **(q) Scope qualifiers.** GraphMAE's feature-target evidence is for classification
   (its own text concedes GAEs are strong at LP) — R4 rests on the shortcut argument
   and our ablation, with GraphMAE as representation-learning precedent (its
@@ -151,6 +151,10 @@ papers; two shard reports in the session record):
 
 ## 1. Critique of the current scaffold contract
 
+> **Metric note (2026-07-14):** official PRING GS/RD were recomputed from the frozen
+> score artifacts over all 500 fixed induced subgraphs. The MMD component ratios are
+> unchanged canonical-run values.
+
 Current contract (`03-experiment-protocol.md` §0):
 
 ```text
@@ -163,16 +167,17 @@ p_ij = σ(pair_logit(i, j) + scaffold_residual(H_i, H_j))
 ### 1.1 The scaffold is B0's echo — a supervision critique, stated precisely
 
 Scaffold edges are thresholded outputs of the same frozen pairwise scorer whose
-assembled output G1 proved structurally implausible (graph similarity `5.76802e-7`,
-degree/clustering/spectral MMD ratios `13.0768/11.9273/18.0931`, relative density
-`0.997710`). `T_ij` is a local patch of exactly the pathological graph
+assembled output G1 proved structurally implausible (global simple-edge RD `0.997710`,
+official PRING BFS-macro GS/RD `0.312151/0.422345`, and degree/clustering/spectral MMD ratios
+`13.0768/11.9273/18.0931`). `T_ij` is a local patch of exactly the pathological graph
 the method is supposed to fix, and systematic B0 errors — hub over-prediction,
 similarity–adjacency conflation — are inherited by the context and then "corrected" by a
 residual conditioned on those same errors.
 
 A separate checkpoint-only evaluation of the aligned legacy `v3_1` scorer completed in
-run `legacy_v31_s47_20260712T193900Z`. A canonical evaluator rerun gives graph similarity
-`2.63231e-7` and degree/clustering/spectral MMD ratios
+run `legacy_v31_s47_20260712T193900Z`. An official PRING evaluator rerun gives
+global simple-edge RD `0.978392`, PRING BFS-macro GS/RD `0.381264/0.500179`, and
+degree/clustering/spectral MMD ratios
 `13.8456/11.6277/19.9774` despite degree-corrected AUROC/AUPRC
 `0.799577/0.813319`; stronger edge ranking therefore does not remove the topology gap.
 This checkpoint-only rerun does not replace the formal E2 training record.
@@ -235,9 +240,9 @@ the new design's residual pool sensitivity is measured, not assumed away.
 
 ### 1.6 A local residual cannot repair distributional failures — and the honest limit of any local fix
 
-G1's failure is distributional (relative density 0.997710; degree, clustering, and
-spectral MMD ratios 13.0768, 11.9273, and 18.0931). Independent
-per-query residuals have no channel for node-level degree budgets or community-level edge
+G1's failure is distributional (global simple-edge RD `0.997710`, PRING BFS-macro
+GS/RD `0.312151/0.422345`, and degree/clustering/spectral MMD ratios 13.0768, 11.9273,
+and 18.0931). Independent per-query residuals have no channel for node-level degree budgets or community-level edge
 budgets. EgoStitch's answer is to inject those budgets as *evidence within each
 decision* — shaping every marginal by the same distilled priors — while acknowledging
 the structural limit that survives any locked-contract method: predictions remain
@@ -671,7 +676,7 @@ finding].
 
 | E2 failure (assembly-level) | Scaffold-level mechanism | Transmission to assembly | Measured by |
 |---|---|---|---|
-| Relative density 0.997710 | hard K-representable budget masking in harmonization | budget-pressure features in `s3` shift marginals | degree-calibration diagnostic (E[d̂] vs realized assembled degree) |
+| PRING BFS-macro RD 0.422345 despite global simple-edge RD 0.997710 | hard K-representable budget masking in harmonization | budget-pressure features in `s3` shift marginals | degree-calibration diagnostic (E[d̂] vs realized assembled degree) |
 | Degree MMD ratio 13.0768 | cardinality tie `Σπ·m ↔ d̂` (doubly supervised) | degree-aware marginals across each node's queries | assembled degree MMD + per-node calibration curve |
 | Clustering MMD ratio 11.9273 | slot–slot adjacency + closure channel `s2` + motif-conductance code supervision | closure evidence raises/lowers triangle-completing marginals | assembled clustering MMD + edge-independence ceiling comparison |
 | Spectral MMD ratio 18.0931 | community codebook + block prior | block-consistent marginals shape mesoscale spectrum | assembled spectral MMD (held-out kernel per §6.4.2) |
@@ -723,9 +728,11 @@ requires the query node's observed edges at inference; none can score a pair of
 zero-edge nodes; none grades the graph its predictions assemble into.** The final G1
 result is AUROC 0.705519 / AUPRC 0.730260 on degree-corrected negatives, falling to
 0.583965 / 0.626649 on hard heuristic negatives and 0.569560 / 0.617475 on hard feature
-negatives, while density-matched graph similarity is `5.76802e-7`. The failure survives
+negatives, while global simple-edge RD is `0.997710` but official PRING BFS-macro
+GS/RD are `0.312151/0.422345`. The failure survives
 G1. B0-alt independently reaches 0.693603 / 0.732509 on degree-corrected negatives but
-assembles with graph similarity `2.29059e-8` and MMD ratios
+assembles with global simple-edge RD `0.998739`, PRING BFS-macro GS/RD
+`0.345802/0.450793`, and MMD ratios
 `15.8304/13.4718/23.4734`, closing the required architecture-independence arm. PA-null
 wins in some edge regimes and remains a mandatory control.
 
@@ -869,9 +876,8 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
 - **G1 — E2 hardening.** Re-run E2 with: one frozen scorer family (same as `Ours` will
   use), one candidate universe, one canonical metric normalization, a true threshold
   sweep (recall/density-vs-MMD curves), easy *and* hard negatives, B0-alt replication,
-  a real-vs-real MMD noise floor, bootstrap variance over buckets/seeds, and a
-  **defined** "graph similarity" composite (components + weights + direction published
-  before the number is quoted again; [DA-M11]). Also record the full-candidate-universe
+  a real-vs-real MMD noise floor, bootstrap variance over buckets/seeds, and official
+  PRING Graph Similarity / Relative Density over the fixed induced subgraphs. Also record the full-candidate-universe
   imbalance view [DA-m17]. *Stop condition:* if the gap substantially closes under hard
   negatives or calibrated thresholds, the motivation is dead as stated and the project
   pivots to the evaluation/benchmark paper. **Result (2026-07-13): passed and closed;**
@@ -898,7 +904,7 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   (assembly-time coupling would be a different paper) rather than building a model
   that cannot succeed.
 - **G3 — Oracle first [DA-M10].** Run the Oracle row (observed-neighborhood scaffold)
-  before implementation: it calibrates whether the G1 composite `5.76802e-7` is poor, bounds all possible
+  before implementation: it calibrates whether the G1 PRING GS `0.312151` is poor, bounds all possible
   gains, and separates "conditioning is the missing ingredient" from "features are
   insufficient." *Stop condition:* Oracle ≈ B0 on assembled metrics ⇒ feature
   insufficiency; topology conditioning cannot help; pivot.
@@ -1006,10 +1012,11 @@ quality).
    every parameter (O'Bray's Table 1: three SOTA papers used three different kernels
    with different σ and bins — numbers are incomparable otherwise); avoid ad-hoc
    EMD-/TV-based "kernels" unless justified; parameter sweeps over the O'Bray ranges;
-   never aggregate MMDs naively — "graph similarity" gets a published definition
-   (gate G1) **that passes an expressivity/robustness perturbation check** (metric
+   never aggregate MMDs naively; MMD diagnostics must pass an
+   **expressivity/robustness perturbation check** (metric
    increases monotonically under controlled perturbation of real graphs; bounded
-   response to small perturbations) before it ranks anything; components always
+   response to small perturbations) before they rank anything. Official PRING GS/RD
+   are reported separately; MMD components are always
    reported; bootstrap variance over buckets/seeds; the real-vs-real noise floor as
    the zero line. MMD is a *ported* two-sample statistic never validated as a GGM
    evaluator — one more reason the discriminator probe and held-out family stay

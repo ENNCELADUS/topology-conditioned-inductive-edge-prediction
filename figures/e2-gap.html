@@ -93,8 +93,8 @@
   <p class="lede">
     The final G1 row for a frozen <b>independent pairwise</b> scorer reaches
     <span class="g">AUROC 0.7055 / AUPRC 0.7303</span>
-    on degree-corrected negatives, yet its density-matched assembly has
-    <span class="r">graph-similarity 5.77e-7</span> and MMD ratios 11.9–18.1 times
+    on degree-corrected negatives. Its assembly has global simple-edge RD 0.9977, yet official PRING
+    <span class="r">BFS-macro GS 0.3122 / RD 0.4223</span> and MMD ratios 11.9–18.1 times
     the real-vs-real reference floor.
     <b>Good edge scores do not imply a plausible network.</b>
     A later checkpoint-only v3.1 evaluation rerun reached balanced-test
@@ -108,7 +108,7 @@
     <div class="panel">
       <h2>A - Edge quality vs assembled topology</h2>
       <p class="cap">The canonical degree-corrected edge row sits above the hard-feature
-        stress-test row, while graph-similarity remains <b>below the 0.5 plausibility line</b>.</p>
+        stress-test row, while official PRING GS remains <b>below 0.5</b>.</p>
       <div class="bars">
         <div class="bar-row">
           <span class="lab">AUROC</span>
@@ -121,9 +121,14 @@
           <span class="val">0.7303</span>
         </div>
         <div class="bar-row">
-          <span class="lab">graph-sim</span>
-          <div class="track"><div class="fill bad" style="width:5%"></div><div class="refline" style="left:50%"></div></div>
-          <span class="val">5.77e-7</span>
+          <span class="lab">BFS-macro GS</span>
+          <div class="track"><div class="fill bad" style="width:31.2%"></div><div class="refline" style="left:50%"></div></div>
+          <span class="val">0.3122</span>
+        </div>
+        <div class="bar-row">
+          <span class="lab">BFS-macro RD</span>
+          <div class="track"><div class="fill bad" style="width:42.2%"></div><div class="refline" style="left:50%"></div></div>
+          <span class="val">0.4223</span>
         </div>
         <div class="bar-row">
           <span class="lab">B0-alt AUROC</span>
@@ -131,12 +136,17 @@
           <span class="val">0.6936</span>
         </div>
         <div class="bar-row">
-          <span class="lab">B0-alt graph-sim</span>
-          <div class="track"><div class="fill bad" style="width:5%"></div><div class="refline" style="left:50%"></div></div>
-          <span class="val">2.29e-8</span>
+          <span class="lab">B0-alt BFS GS</span>
+          <div class="track"><div class="fill bad" style="width:34.6%"></div><div class="refline" style="left:50%"></div></div>
+          <span class="val">0.3458</span>
+        </div>
+        <div class="bar-row">
+          <span class="lab">B0-alt BFS RD</span>
+          <div class="track"><div class="fill bad" style="width:45.1%"></div><div class="refline" style="left:50%"></div></div>
+          <span class="val">0.4508</span>
         </div>
       </div>
-      <div class="axisnote"><span>0.0</span><span class="reflabel">0.5 plausibility line</span><span>1.0</span></div>
+      <div class="axisnote"><span>0.0</span><span class="reflabel">0.5 scale midpoint</span><span>1.0</span></div>
       <div class="keyrow">
         <span class="k"><span class="sw good"></span> edge-level (higher is better)</span>
         <span class="k"><span class="sw bad"></span> graph-level (higher is better)</span>
@@ -186,12 +196,13 @@
     <!-- Panel C: gate status -->
     <div class="panel wide">
       <h2>C - Hardened gate status</h2>
-      <p class="cap">G1's mandatory perturbation check passed, and G2's measured soft-score
+      <p class="cap">G1's official PRING GS/RD recomputation covers all 500 fixed subgraphs,
+        and G2's measured soft-score
         overlap (<b>0.4799</b>) is well above the minimum overlap (<b>0.0550</b>) required
         to reach the reference triangle count. The complete threshold sweep and ceiling
         curve are linked from the result note.</p>
       <div class="keyrow">
-        <span class="k"><span class="sw good"></span> G1 composite validated</span>
+        <span class="k"><span class="sw good"></span> G1 PRING GS/RD aligned</span>
         <span class="k"><span class="sw good"></span> G1 B0-alt arm closed</span>
         <span class="k"><span class="sw good"></span> G3 Oracle passed</span>
       </div>
@@ -203,7 +214,7 @@
         <text x="34" y="173" text-anchor="end">0.0</text>
         <text x="34" y="98"  text-anchor="end">0.25</text>
         <text x="34" y="23"  text-anchor="end">0.5</text>
-        <text x="384" y="16" text-anchor="end">plausible >= 0.5</text>
+        <text x="384" y="16" text-anchor="end">scale midpoint = 0.5</text>
         <!-- series -->
         <polyline class="series" points="40,74 77.8,92 115.6,94.4 153.3,93.5 191.1,100.4 228.9,107.6 266.7,106.7 304.4,106.1 342.2,104 380,116.3"></polyline>
         <circle class="dot" cx="40" cy="74" r="3"></circle>
@@ -229,8 +240,10 @@
   <footer>
     Protocol: topology-conditioned inductive edge prediction over unseen nodes with frozen node
     features. Binary edge predictions are assembled into graphs and evaluated with edge metrics plus
-    graph realism metrics. The figure uses the density-matched G1 operating point and reports
-    graph-similarity &lt; 0.5 with MMD ratios far above the real-vs-real floor; B0-alt and
+    graph realism metrics. The figure uses the quota-calibrated G1 operating point and reports
+    global simple-edge RD 0.9977 but official PRING BFS-macro GS/RD 0.3122/0.4223,
+    with MMD ratios far above the
+    real-vs-real floor; B0-alt and
     the stronger legacy scorer preserve the gap, G2 uses the exact edge-independence
     identities, and G3 Oracle-blend reports substantial headroom over B0.
   </footer>

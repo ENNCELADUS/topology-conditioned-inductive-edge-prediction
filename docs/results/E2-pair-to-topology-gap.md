@@ -1,44 +1,55 @@
 # E2 Pair-to-Topology Gap: G1/G2/G3 Gate Results
 
-**Experiment:** repository-local hardened E2 on Benchmark-A (`breadth_first`).
+> **Metric scope (2026-07-14):** official PRING Graph Similarity (GS) and Relative
+> Density (RD) were recomputed from frozen score artifacts over all 500 fixed
+> `breadth_first` induced subgraphs. MMD ratios remain canonical-run values.
 
-**Status:** G1, G2, and G3 are complete. The combined canonical G1 rerun completed on
-2026-07-13 with frozen V3.1 B0 checkpoint `e092537d8cf1e208` and F0-MLP B0-alt
-checkpoint `f3b8afc0b0781c43`, each scored over the same 2,037,171-row candidate
-universe (2,035,153 non-self pairs plus 2,018 self-pairs). The mandatory O'Bray
-perturbation check passed, so both graph-similarity composites are valid. B0-alt
-preserves—and enlarges—the density-matched topology gap, closing G1's required
-architecture-independence arm. G3 does not trigger the feature-insufficiency stop rule:
-the parameter-free Oracle blend has substantial per-statistic headroom over B0.
-EgoStitch can proceed to implementation.
+## Executive summary
 
-### Latest checkpoint-only evaluation rerun
+**Experiment:** hardened E2 on Benchmark-A (`breadth_first`).
 
-The aligned legacy checkpoint `pair_context_gated_abba_no_cross_s47_best_model_v3_1.pt`
-was evaluated separately on the same `breadth_first` split in run
-`legacy_v31_s47_20260712T193900Z`, completed 2026-07-12 19:53:13 UTC. This was a
-test+G1/G2 rerun, not a new formal four-H20 training acceptance. It produced balanced
-test AUROC/AUPRC `0.805170/0.818408`; G1 degree-corrected ratio-1
-`0.799577/0.813319`, hard-heuristic `0.626746/0.663360`, and hard-feature
-`0.510083/0.602131`; G2 reports `Ov(P)=0.579126` versus `Ov_min=0.010196`.
-Its scores were rerun through the canonical evaluator on 2026-07-13. At relative density
-`0.978392`, graph similarity is `2.63231e-7` and degree/clustering/spectral MMD ratios
-are `13.8456/11.6277/19.9774`. The stronger edge scorer therefore does not shrink the
-topology gap. The copied closeout package is
-[`outputs/deliverables/g1_closeout_20260713/`](../../outputs/deliverables/g1_closeout_20260713/).
+**Status:** G1, G2, and G3 are complete. G1 closes the architecture-independence
+requirement; neither G2 nor G3 triggers its stop rule. EgoStitch may proceed to
+implementation under the approved specification.
 
-The final run confirms the pair-to-topology gap under the hardened protocol, but it
-also exposes an important control result: the PA-null baseline is stronger than B0 in
-some easy and feature-hard edge regimes. The claim is therefore a topology/robustness
-failure of independent scoring, not a claim that this B0 checkpoint is uniformly strong.
+| Gate | Headline evidence | Decision |
+|---|---|---|
+| G1 | B0 AUROC/AUPRC `0.705519/0.730260`; PRING BFS-macro GS/RD `0.312151/0.422345`; MMD ratios `13.0768/11.9273/18.0931` | Pair-to-topology gap supported |
+| G1 B0-alt | AUROC/AUPRC `0.693603/0.732509`; PRING BFS-macro GS/RD `0.345802/0.450793`; MMD ratios `15.8304/13.4718/23.4734` | Architecture-independence arm closed |
+| G2 | `Ov(P)=0.479886`, above `Ov_min=0.054954` | Edge-independence ceiling does not force a stop |
+| G3 | Oracle-topo GS is `1.61155×` B0; Oracle-blend improves all three MMD ratios | Feature-insufficiency stop rule not triggered |
 
-## 1. G1 hardened-E2 result
+The result supports a narrow claim: independent scoring can retain reasonable edge
+ranking while failing to recover the topology of its assembled graph.
 
-### Edge-level regimes
+It does not establish that this B0 checkpoint is uniformly strong across edge regimes.
 
-The canonical balanced degree-corrected row is reported together with the two hard
-negative regimes and the full-candidate imbalance view. All rows use 32,019 positives;
-ratio-1 has 32,019 negatives and ratio-5 has 160,095 negatives.
+This is a scientific gate closeout, not a strict cold-start systems acceptance. The
+verified four-H20 timing evidence remains warm-cache only.
+
+## 1. Run identity and evaluation scope
+
+The canonical G1 closeout completed on 2026-07-13. B0 and B0-alt were scored over
+the same candidate universe.
+
+| Item | B0 | B0-alt |
+|---|---|---|
+| Model | V3.1 pairwise scorer | F0-MLP |
+| Checkpoint ID | `e092537d8cf1e208` | `f3b8afc0b0781c43` |
+| Candidate rows | 2,037,171 | 2,037,171 |
+| Non-self rows | 2,035,153 | 2,035,153 |
+| Self-pair rows | 2,018 | 2,018 |
+
+The primary report uses the canonical B0/B0-alt artifacts. The stronger legacy
+checkpoint is retained only as a separately labeled robustness analysis in Section 5.
+
+## 2. G1 hardened-E2
+
+### 2.1 Edge-level regimes
+
+The balanced degree-corrected row is reported with both hard-negative regimes and
+the imbalanced full candidate universe. Ratio-1 rows contain 32,019 positives and
+32,019 negatives.
 
 | Scorer | Regime | AUROC | AUPRC | MCC |
 |---|---|---:|---:|---:|
@@ -53,57 +64,73 @@ ratio-1 has 32,019 negatives and ratio-5 has 160,095 negatives.
 | PA-null | easy uniform, ratio-1 | 0.814711 | 0.824781 | 0.005302 |
 | PA-null | hard feature, ratio-1 | 0.858646 | 0.869196 | 0.003226 |
 
-The full regime table, including ratio-5 rows, is preserved in the combined
+**Observation:** hard negatives substantially reduce B0 and B0-alt discrimination.
+PA-null wins selected easy and feature-hard rows.
+
+**Implication:** subsequent comparisons must retain PA-null and must not describe B0
+as uniformly strong. The G1 claim rests on the edge/topology mismatch, not on a
+leaderboard claim about this checkpoint.
+
+The archived ratio-5 and full regime rows are available in the combined
 [`g1_tables.md`](../../outputs/runs/g1_b0_b0_alt_20260713T165714Z/g1_tables.md).
 
-### Density-matched assembled graph
+### 2.2 Assembly calibration and topology
 
-At the density-matched operating point (`threshold = 0.794385`), B0 assembles a graph
-with relative density 0.997710 and a valid composite similarity of
-`5.76802e-7` (higher is better; 1 means identical). The canonical topology metric is
-the ratio of the size-mean raw biased MMD² to the deterministic real-vs-real reference
-MMD². A ratio of `1` is the reference floor; lower is better.
+Two quantities called “relative density” must be kept separate:
 
-| Component | Raw MMD² | Reference MMD² | MMD ratio |
+- **Global simple-edge RD** is the assembled/reference non-self edge-count ratio. It
+  checks the operating-point calibration over the whole test graph.
+- **PRING BFS-macro RD** is computed on each fixed reference-derived induced subgraph,
+  then averaged over all 500 samples. It measures recovery of dense local topology.
+
+B0 and B0-alt use thresholds chosen under a non-self edge quota. Equal-score ties are
+included or excluded atomically, so realized global RD can be slightly below `1`.
+
+| Scorer | Assembly policy | Realized non-self edges | Global simple-edge RD | PRING GS | PRING BFS-macro RD |
+|---|---:|---:|---:|---:|---:|
+| B0 | threshold `0.794385` | 30,059 | 0.997710 | 0.312151 | 0.422345 |
+| B0-alt | threshold `0.679179` | 30,090 | 0.998739 | 0.345802 | 0.450793 |
+| PA-null | exact top-N | 30,128 | 1.000000 | 0.245377 | 0.489125 |
+
+The reference has 30,128 non-self edges. B0 is globally density calibrated but locally
+under-dense inside the reference-derived BFS subgraphs.
+
+The low local RD does not mean the full assembled graph contains only 42% as many edges.
+
+The same assemblies remain far from the real-vs-real MMD floor:
+
+| Scorer | Degree MMD ratio | Clustering MMD ratio | Spectral MMD ratio |
 |---|---:|---:|---:|
-| Degree | 0.150219 | 0.0114874 | 13.0768 |
-| Clustering | 0.139977 | 0.0117358 | 11.9273 |
-| Spectral | 0.172248 | 0.00952007 | 18.0931 |
+| B0 | 13.0768 | 11.9273 | 18.0931 |
+| B0-alt | 15.8304 | 13.4718 | 23.4734 |
+| PA-null | 30.1230 | 22.4118 | 37.8654 |
 
-B0-alt uses its independently density-matched threshold `0.679179`. Its relative
-density is `0.998739`, graph similarity is `2.29059e-8`, and all three canonical MMD
-ratios are worse than B0:
+Relative to B0, B0-alt changes degree-corrected AUROC/AUPRC by
+`-0.011917/+0.002249`. Its GS and BFS-macro RD rise by `10.78%/6.74%`, while its
+three MMD ratios worsen by `21.06%/12.95%/29.74%`.
 
-| Component | Raw MMD² | Reference MMD² | MMD ratio |
-|---|---:|---:|---:|
-| Degree | 0.181850 | 0.0114874 | 15.8304 |
-| Clustering | 0.158103 | 0.0117358 | 13.4718 |
-| Spectral | 0.223468 | 0.00952007 | 23.4734 |
+The metric directions are mixed, so B0-alt supports persistence of the gap but not a
+claim that every topology metric becomes worse.
 
-The assembled graph contains 2,018 predicted self-loops versus 1,891 reference
-self-loops. The PA-null density-matched control has relative density 1.0,
-degree/clustering/spectral MMD ratios of 30.1230/22.4118/37.8654, and composite
-`8.18897e-14`.
+B0 predicts 2,018 self-loops and B0-alt predicts 2,012, versus 1,891 in the
+reference. PRING GS/RD retain these loops inside each induced subgraph; global
+simple-edge RD excludes them by definition.
 
-The full threshold sweep is in the synced `g1_tables.md`; it shows that the gap is not
-an artifact of one arbitrary threshold. The sweep includes the operating point and
-the 50, 80, 90, 95, 97.5, 99, 99.5, and 99.9 probability percentiles.
+The archived threshold sweep supports the MMD/recall operating-point analysis. Its
+GS/RD columns predate the PRING migration and are not quoted as current PRING results.
 
-### Composite validation and construction
+### 2.3 Metric provenance
 
-- O'Bray degree-preserving-swap and uniform-rewire perturbation checks both passed;
-  similarities decrease monotonically across the tested perturbation fractions.
-- Noise-floor calibration, MMD configuration, threshold policy, negative construction,
-  PA-null formula, and the breadth-first missing-feature note are recorded in
-  `g1_results.json`.
-- Degree heterogeneity is `sigma = 1.098430`; candidate positive rate is `0.0157174`.
-- The scorer artifact contains 2,037,171 rows and was produced from the packed-feature
-  pipeline on the four-H20 run.
+- Official PRING GS/RD use the fixed sampled node sets and macro-average every sample.
+- MMD ratios use the canonical fixed-`sigma=1` Gaussian-TV biased MMD² evaluator.
+- The historical O'Bray diagnostic validated the retired MMD-ratio composite. It is
+  MMD provenance, not part of the official PRING GS definition.
+- Degree heterogeneity is `sigma=1.098430`; candidate positive rate is `0.0157174`.
 
-## 2. G2 edge-independence ceiling
+## 3. G2 edge-independence ceiling
 
-G2 evaluates Chanpuriya et al.'s exact identities on the cached soft score matrix,
-excluding self-pairs from the dense probability matrix:
+G2 evaluates the exact edge-independence identities on the cached soft score matrix.
+Self-pairs are excluded from the dense probability matrix.
 
 | Quantity | Value |
 |---|---:|
@@ -113,78 +140,111 @@ excluding self-pairs from the dense probability matrix:
 | Reference triangles (`delta_star`) | 263,164 |
 | Expected soft-edge volume `V(P)` | 123,373.982 |
 | Measured overlap `Ov(P)` | 0.479886 |
-| Minimum overlap `Ov_min` at matched volume | 0.054954 |
+| Minimum required overlap `Ov_min` | 0.054954 |
 | Expected triangles `E[Delta]` | 1,342,118.384 |
-| Triangle headroom (`E[Delta] / delta_star`) | 5.100 |
-| Overlap headroom (`Ov / Ov_min`) | 8.733 |
+| Triangle headroom `E[Delta]/delta_star` | 5.100 |
+| Overlap headroom `Ov/Ov_min` | 8.733 |
 
-Thus the measured soft scorer is well above the minimum overlap required by the
-edge-independence ceiling to reach the reference triangle count. This is a feasibility
-check, not evidence that the assembled graph is realistic: hard-thresholded assemblies
-have `Ov = 1`, where the bound is vacuous, and the exact curve is the relevant object.
-The complete curve is in [`g2_results.json`](../../outputs/e2_resubmit_retry/g2/g2_results.json).
+**Observation:** measured overlap is well above the minimum needed to reach the
+reference triangle count under the soft edge-independent ceiling.
 
-## 3. G3 Oracle gate
+**Interpretation:** this is a feasibility result, not evidence that the assembled
+graph is realistic. For a hard-thresholded graph, `Ov=1` and the bound becomes vacuous.
 
-G3 re-evaluated B0 from the same cached candidate universe and compared it with the pinned
-evaluation-side Oracle arms. The B0 assembled row reproduces the canonical G1 values exactly:
+**Decision:** G2 does not trigger a stop. The exact ceiling curve remains the relevant
+comparison for future calibrated assemblies.
 
-| scorer | threshold | relative density | degree MMD ratio | clustering MMD ratio | spectral MMD ratio | composite |
+The curve is preserved in
+[`g2_results.json`](../../outputs/e2_resubmit_retry/g2/g2_results.json).
+
+## 4. G3 Oracle gate
+
+G3 compares B0 with two evaluation-side Oracle arms assembled from the same candidate
+universe. Oracle arms use exact top-N non-self assembly.
+
+| Scorer | Global simple-edge RD | PRING GS | PRING BFS-macro RD | Degree MMD ratio | Clustering MMD ratio | Spectral MMD ratio |
 |---|---:|---:|---:|---:|---:|---:|
-| B0 | 0.794385 | 0.997710 | 13.0768 | 11.9273 | 18.0931 | 5.76802e-7 |
-| Oracle-topo | top-N | 1.000000 | 14.1148 | 8.23662 | 16.0772 | 2.73458e-6 |
-| Oracle-blend | top-N | 1.000000 | 7.58890 | 3.06980 | 9.05715 | 0.00139907 |
+| B0 | 0.997710 | 0.312151 | 0.422345 | 13.0768 | 11.9273 | 18.0931 |
+| Oracle-topo | 1.000000 | 0.503048 | 0.794303 | 14.1148 | 8.23662 | 16.0772 |
+| Oracle-blend | 1.000000 | 0.323649 | 0.652734 | 7.58890 | 3.06980 | 9.05715 |
 
-The stop-rule headroom is `MMD-ratio(B0) / MMD-ratio(Oracle)`:
+Headroom is `MMD-ratio(B0)/MMD-ratio(Oracle)` for MMD and
+`GS(Oracle)/GS(B0)` for graph similarity.
 
-| Oracle arm | degree | clustering | spectral | composite ratio |
+| Oracle arm | Degree | Clustering | Spectral | GS ratio |
 |---|---:|---:|---:|---:|
-| Oracle-topo | 0.926465 | 1.44808 | 1.12539 | 4.74093 |
-| Oracle-blend | 1.72315 | 3.88537 | 1.99767 | 2425.56 |
+| Oracle-topo | 0.926465 | 1.44808 | 1.12539 | 1.61155 |
+| Oracle-blend | 1.72315 | 3.88537 | 1.99767 | 1.03683 |
 
-Oracle-topo is mixed on degree, but Oracle-blend improves all three canonical MMD ratios and
-the composite by a large margin. Oracle is therefore not approximately equal to B0, so the G3
-feature-insufficiency stop rule is not triggered. The hard-heuristic Oracle-topo rows are
-degenerate by construction because their negatives are selected by the same CN/AA signal.
+**Observation:** Oracle-topo gives the clearest GS and local-RD improvement but is
+mixed on degree MMD. Oracle-blend improves every MMD ratio but only slightly improves GS.
 
-The complete G3 artifacts are preserved in
-[`outputs/deliverables/b0_v31_breadth_first_20260711/g3/`](../../outputs/deliverables/b0_v31_breadth_first_20260711/g3/),
-including `g3_results.json` and `g3_tables.md`.
+**Implication:** no single Oracle dominates every metric, yet the Oracle set is not
+approximately equal to B0 across assembled metrics. The feature-insufficiency stop
+rule is therefore not triggered.
 
-## 4. Interpretation and gate outcome
+Hard-heuristic Oracle-topo edge rows are degenerate because their negatives are
+selected by the same common-neighbor/Adamic-Adar signal used by the Oracle.
 
-The G1 B0 arm survives degree-corrected, heuristic-hard, feature-hard, and full-universe views:
-the topology gap remains at a density-matched operating point and the composite passes
-its expressivity check. However, the PA-null control wins on easy and feature-hard edge
-ranking, so subsequent model comparisons must report PA-null alongside B0 and must not
-call this checkpoint a uniformly strong edge scorer. G2 leaves substantial theoretical
-headroom under the locked edge-independent contract. G3 confirms that the observed B0 topology
-failure is not caused by an absence of true-topology signal: the Oracle-blend arm has clear
-room over B0. B0-alt independently reproduces the failure, with degree/clustering/spectral
-MMD ratios `15.8304/13.4718/23.4734` despite degree-corrected AUROC/AUPRC
-`0.693603/0.732509`; G1 is therefore closed under its required alternate architecture.
-Relative to B0, that is an AUROC/AUPRC change of `-0.011917/+0.002249` alongside
-degree/clustering/spectral MMD-ratio increases of `21.06%/12.95%/29.74%`. Conversely,
-the stronger legacy scorer improves AUROC/AUPRC by `+0.094058/+0.083059` but changes
-the three topology ratios by only `+5.88%/-2.51%/+10.41%`, reinforcing that better
-edge ranking does not close the assembled-topology gap.
-EgoStitch implementation can now begin under the approved spec.
+## 5. Stronger-checkpoint robustness context
 
-## 5. Synced artifacts
+The aligned legacy V3.1 checkpoint was evaluated separately in
+`legacy_v31_s47_20260712T193900Z`. It is not the primary B0 and not a new formal
+four-H20 training acceptance.
 
-- [`g1_results.json`](../../outputs/e2_resubmit_retry/g1/g1_results.json)
-- [`g1_tables.md`](../../outputs/e2_resubmit_retry/g1/g1_tables.md)
-- [`g2_results.json`](../../outputs/e2_resubmit_retry/g2/g2_results.json)
-- [`test_edge_metrics.json`](../../outputs/e2_resubmit_retry/test_edge_metrics.json)
-- [`complete.json`](../../outputs/e2_resubmit_retry/complete.json)
-- [`g3_results.json`](../../outputs/deliverables/b0_v31_breadth_first_20260711/g3/g3_results.json)
-- [`g3_tables.md`](../../outputs/deliverables/b0_v31_breadth_first_20260711/g3/g3_tables.md)
-- [Combined B0/B0-alt `g1_results.json`](../../outputs/runs/g1_b0_b0_alt_20260713T165714Z/g1_results.json)
+| Metric | Canonical B0 | Legacy checkpoint |
+|---|---:|---:|
+| Degree-corrected AUROC | 0.705519 | 0.799577 |
+| Degree-corrected AUPRC | 0.730260 | 0.813319 |
+| Global simple-edge RD | 0.997710 | 0.978392 |
+| PRING GS | 0.312151 | 0.381264 |
+| PRING BFS-macro RD | 0.422345 | 0.500179 |
+| Degree/clustering/spectral MMD ratio | 13.0768/11.9273/18.0931 | 13.8456/11.6277/19.9774 |
+
+The stronger checkpoint improves PRING GS by `22.14%` and BFS-macro RD by `18.43%`.
+Its MMD ratios do not consistently improve, so it narrows part of the gap without
+closing the assembled-topology failure.
+
+Its balanced test AUROC/AUPRC is `0.805170/0.818408`; hard-heuristic and hard-feature
+G1 rows are `0.626746/0.663360` and `0.510083/0.602131`, respectively.
+
+## 6. Conclusions and reporting requirements
+
+1. **G1 is closed.** B0-alt independently reproduces the topology failure.
+2. **The claim remains narrow.** PA-null wins selected edge regimes, so B0 is not a
+   uniformly strong scorer.
+3. **Density calibration is not topology recovery.** Global simple-edge RD is near
+   `1`, while PRING BFS-macro RD remains `0.422345` for B0.
+4. **G2 leaves theoretical room.** The soft scorer exceeds the required overlap.
+5. **G3 leaves empirical room.** Oracle gains appear on different metric axes.
+
+Future assembled-graph tables must name global simple-edge RD and PRING BFS-macro RD
+separately.
+
+The PRING-migrated threshold sweep should be rerun before making any current GS/RD
+claim away from the documented operating point.
+
+The next research stage is EgoStitch implementation under
+[`docs/06-egostitch-spec.md`](../06-egostitch-spec.md). Cold-start four-H20 acceptance
+remains a separate systems-validation item.
+
+## 7. Source artifacts
+
+Archived JSON and Markdown tables preserve their original 2026-07-13 output schema,
+including the retired composite. They remain immutable run provenance rather than
+current PRING GS/RD reports.
+
+### Primary artifacts
+
+- [Formal B0 candidate scores](../../outputs/deliverables/b0_v31_breadth_first_20260711/scores/candidate.npz)
 - [B0-alt candidate scores](../../outputs/runs/b0_alt_20260713T164214Z/scores/candidate.npz)
-- [B0-alt checkpoint metadata](../../outputs/b0_alt/run_metadata.json)
-- [G1 closeout package](../../outputs/deliverables/g1_closeout_20260713/)
+- [Combined B0/B0-alt G1 results](../../outputs/runs/g1_b0_b0_alt_20260713T165714Z/g1_results.json)
+- [G2 results](../../outputs/e2_resubmit_retry/g2/g2_results.json)
+- [G3 results](../../outputs/deliverables/b0_v31_breadth_first_20260711/g3/g3_results.json)
 
-The latest checkpoint-only rerun is preserved at
-[`outputs/runs/legacy_v31_s47_20260712T193900Z/`](../../outputs/runs/legacy_v31_s47_20260712T193900Z/);
-its classification and G2 results remain robustness context, and its canonical G1 rerun
-is under [`g1_canonical_20260713/`](../../outputs/runs/legacy_v31_s47_20260712T193900Z/g1_canonical_20260713/).
+### Provenance and robustness artifacts
+
+- [Formal B0 deliverable](../../outputs/deliverables/b0_v31_breadth_first_20260711/)
+- [G1 closeout package](../../outputs/deliverables/g1_closeout_20260713/)
+- [Legacy checkpoint rerun](../../outputs/runs/legacy_v31_s47_20260712T193900Z/)
+- [Legacy canonical G1 rerun](../../outputs/runs/legacy_v31_s47_20260712T193900Z/g1_canonical_20260713/)

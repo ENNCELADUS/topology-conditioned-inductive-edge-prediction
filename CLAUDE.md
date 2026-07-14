@@ -48,8 +48,8 @@ src/
   data/        artifacts.py (benchmark load+verify), partition.py (message/supervision
                split, spec §9.3), pairs.py (datasets, bucketed batching, neg sampler),
                features.py (frozen feature store + F0 mean-pool matrix)
-  eval/        edge_metrics.py, graph_metrics.py (assembled-graph realism/MMD),
-               assembly.py (assemble + threshold sweep), composite.py (similarity + perturbation)
+  eval/        edge_metrics.py, graph_metrics.py (PRING GS/RD + assembled-graph MMD),
+               assembly.py (assemble + threshold sweep), composite.py (perturbation diagnostic)
   model/       B0.py (V3.1 scorer), b0_alt.py (F0-MLP architecture-independence arm)
   train_b0.py        CLI: train a frozen B0-family scorer
   score_universe.py  CLI: score pair lists -> pinned .npz scores artifact (shardable)
@@ -137,9 +137,9 @@ flow is deliberately **score-once, analyze-many**:
    assembled-graph rows); `g2_ceiling.py` computes the edge-independence triangle ceiling;
    `g3_oracle.py` evaluates the pinned Oracle arms and headroom stop rule.
 5. **Eval** (`src/eval/`) is the shared metric library used by all of the above:
-   `edge_metrics.py` (AUROC/AUPRC…), `graph_metrics.py` (degree/clustering/spectral MMD
-   on the assembled graph), `assembly.py` (assemble + threshold sweep), `composite.py`
-   (graph-similarity score + its mandatory perturbation sanity check). Edge- and
+   `edge_metrics.py` (AUROC/AUPRC…), `graph_metrics.py` (official PRING GS/RD plus
+   degree/clustering/spectral MMD on the assembled graph), `assembly.py` (assemble +
+   threshold sweep), `composite.py` (MMD perturbation diagnostic). Edge- and
    graph-level metrics are always reported together (see Integrity gates).
 
 The spec's freeze rule is binding: `docs/06-egostitch-spec.md` is the contract, and code
@@ -191,20 +191,27 @@ rather than resolving them unilaterally.
 
 ## Load-bearing facts (the E2 result)
 
+**Metric recomputation note (2026-07-14):** official PRING GS/RD were recomputed from the
+frozen candidate-score artifacts over all 500 fixed induced subgraphs and macro-averaged over
+all samples. The MMD component ratios remain the recorded canonical-run values.
+
 The current load-bearing gap is the completed G1 result: the frozen B0 pairwise scorer
 reaches **AUROC 0.705519 / AUPRC 0.730260** on degree-corrected ratio-1 negatives,
 falls to **0.583965 / 0.626649** on hard heuristic negatives and **0.569560 / 0.617475**
-on hard feature negatives, yet its density-matched assembly has **graph similarity
-5.76802e-7**, degree/clustering/spectral MMD ratios **13.0768/11.9273/18.0931**, and
-relative density **0.997710**. B0-alt reaches **0.693603 / 0.732509** on the same
-degree-corrected row but has graph similarity **2.29059e-8** and MMD ratios
-**15.8304/13.4718/23.4734** at relative density **0.998739**, closing the required
-architecture-independence arm. The O'Bray perturbation check passed. A stronger legacy
-scorer reaches **0.799577 / 0.813319** yet retains MMD ratios
-**13.8456/11.6277/19.9774**, so higher edge quality does not close the topology gap.
+on hard feature negatives, yet its quota-calibrated assembly has global simple-edge RD
+**0.997710** but official PRING BFS-macro **GS/RD 0.312151/0.422345**, alongside
+degree/clustering/spectral MMD ratios **13.0768/11.9273/18.0931**. B0-alt reaches
+**0.693603 / 0.732509** on the same degree-corrected row and has global simple-edge RD
+**0.998739**, PRING BFS-macro GS/RD **0.345802/0.450793**, and MMD ratios
+**15.8304/13.4718/23.4734**, closing the required
+architecture-independence arm. A stronger legacy scorer reaches **0.799577 / 0.813319**
+yet retains MMD ratios **13.8456/11.6277/19.9774** at global simple-edge RD **0.978392**
+and PRING BFS-macro GS/RD **0.381264/0.500179**, so higher edge quality does not close
+the topology gap.
 G2 reports `Ov(P)=0.479886` versus `Ov_min=0.054954`. G3 reports Oracle-blend
-MMD-ratio headroom `1.72315/3.88537/1.99767` for degree/clustering/spectral, with
-composite ratio `2425.56`; the feature-insufficiency stop rule is not triggered.
+MMD-ratio headroom `1.72315/3.88537/1.99767` for degree/clustering/spectral; Oracle-topo
+raises graph similarity to `0.503048` (`1.61155×` B0), so the feature-insufficiency stop
+rule is not triggered.
 `docs/04-model-proposal.md` §4.6 maps these failure axes to specific EgoStitch
 mechanisms. Keep the current values consistent across `docs/results/E2-pair-to-topology-gap.md`,
 `docs/03-experiment-protocol.md`, `docs/04-model-proposal.md`, `README.md`, and

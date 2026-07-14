@@ -3,7 +3,7 @@ r"""Gate G1 (hardened E2) analysis pipeline: cached-score artifacts -> gate numb
 Consumes a frozen B0 (and optional B0-alt) candidate-universe scores artifact
 (``src.score_universe``) plus the benchmark package (``src.data.artifacts``) and
 produces every number the G1 gate report needs: reference-normalized MMD ratios,
-the mandatory composite perturbation check, a threshold sweep with the
+official PRING GS/RD, the perturbation diagnostic, a threshold sweep with the
 density-matched operating point, a hard/easy/degree-corrected/feature negative
 regime table (edge metrics), a preferential-attachment null row (evaluator-side
 diagnostic), and assembled-graph rows at the operating point. No model scoring
@@ -46,7 +46,7 @@ from scipy import sparse
 
 from src.data.features import FeatureStore, build_f0_matrix
 from src.eval.assembly import assemble_graph, density_matched_threshold, threshold_sweep
-from src.eval.composite import CompositeDefinition, graph_similarity, perturbation_check
+from src.eval.composite import perturbation_check
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.eval.graph_metrics import (
     STATISTICS,
@@ -746,7 +746,8 @@ class SweepRow:
     Attributes:
         threshold: The assembly threshold used.
         recall: Fraction of the reference graph's edges recovered.
-        relative_density: Predicted/reference simple-edge-count ratio.
+        graph_similarity: Official PRING per-subgraph GS macro mean.
+        relative_density: Official PRING per-subgraph RD macro mean.
         mmd_ratio: Statistic -> reference-normalized MMD ratio at this threshold.
         self_loop_count: Number of self-pairs `(u, u)` with `p >= threshold`.
         self_loop_rate: `self_loop_count` divided by the total number of
@@ -755,6 +756,7 @@ class SweepRow:
 
     threshold: float
     recall: float
+    graph_similarity: float
     relative_density: float
     mmd_ratio: dict[str, float]
     self_loop_count: int
@@ -833,6 +835,7 @@ def run_threshold_sweep(
             SweepRow(
                 threshold=t,
                 recall=point.recall,
+                graph_similarity=point.graph_similarity,
                 relative_density=point.relative_density,
                 mmd_ratio=dict(point.mmd_ratio),
                 self_loop_count=hits,
@@ -855,27 +858,30 @@ class AssembledRow:
         mmd_ratio: Statistic -> reference-normalized MMD ratio.
         raw_mmd2: Statistic -> raw MMD^2 numerator.
         reference_mmd2: Statistic -> reference-split MMD^2 denominator.
-        relative_density: Predicted/reference simple-edge-count ratio.
+        graph_similarity: Official PRING per-subgraph GS macro mean.
+        relative_density: Official PRING per-subgraph RD macro mean.
+        per_size_graph_similarity: Per-size lists of per-subgraph GS values.
+        per_size_relative_density: Per-size lists of per-subgraph RD values.
         self_loops_pred: Self-loop count in the assembled graph.
         self_loops_ref: Self-loop count in the reference graph.
         bootstrap_mean: Statistic -> mean normalized MMD ratio over bootstrap resamples
             after aggregating raw/reference MMD2 across bucket sizes.
         bootstrap_std: Statistic -> std of normalized MMD ratio over bootstrap
             resamples after aggregating raw/reference MMD2 across bucket sizes.
-        composite: The composite similarity score, or ``None`` if the
-            perturbation check has not passed (or was skipped).
     """
 
     threshold: float | None
     mmd_ratio: dict[str, float]
     raw_mmd2: dict[str, float]
     reference_mmd2: dict[str, float]
+    graph_similarity: float
     relative_density: float
+    per_size_graph_similarity: dict[int, list[float]]
+    per_size_relative_density: dict[int, list[float]]
     self_loops_pred: int
     self_loops_ref: int
     bootstrap_mean: dict[str, float]
     bootstrap_std: dict[str, float]
-    composite: float | None
 
 
 def assemble_and_evaluate(
@@ -885,8 +891,6 @@ def assemble_and_evaluate(
     buckets: dict[int, list[set[str]]],
     config: MMDConfig,
     seed: int,
-    definition: CompositeDefinition,
-    composite_valid: bool,
     threshold: float | None,
 ) -> AssembledRow:
     """Evaluate one already-assembled predicted graph into an `AssembledRow`.
@@ -897,9 +901,6 @@ def assemble_and_evaluate(
         buckets: Bucket size -> list of node sets.
         config: Shared MMD/descriptor configuration.
         seed: Seed for `bootstrap_mmd`.
-        definition: Composite definition with disclosed weights.
-        composite_valid: Whether the perturbation check passed (gates whether the
-            composite is computed at all).
         threshold: The assembly threshold used to build `g_pred` (for bookkeeping
             only; ``None`` for non-threshold assemblies like the PA-null top-N row).
 
@@ -910,18 +911,19 @@ def assemble_and_evaluate(
     boot = bootstrap_mmd(g_pred, g_ref, buckets, config, seed=seed)
     bootstrap_mean = {stat: boot[stat][0] for stat in STATISTICS}
     bootstrap_std = {stat: boot[stat][1] for stat in STATISTICS}
-    composite = graph_similarity(report.mmd_ratio, definition) if composite_valid else None
     return AssembledRow(
         threshold=threshold,
         mmd_ratio=dict(report.mmd_ratio),
         raw_mmd2=dict(report.raw_mmd2),
         reference_mmd2=dict(report.reference_mmd2),
+        graph_similarity=report.graph_similarity,
         relative_density=report.relative_density,
+        per_size_graph_similarity=dict(report.per_size_graph_similarity),
+        per_size_relative_density=dict(report.per_size_relative_density),
         self_loops_pred=report.self_loops_pred,
         self_loops_ref=report.self_loops_ref,
         bootstrap_mean=bootstrap_mean,
         bootstrap_std=bootstrap_std,
-        composite=composite,
     )
 
 
@@ -986,7 +988,7 @@ class G1Result:
 
     Attributes:
         metadata: Every disclosure required by the gate (artifact provenance,
-            benchmark strategy, MMD/composite config, normalization and construction
+            benchmark strategy, MMD and official GS/RD config, normalization and construction
             rules, seeds, and the two orchestrator-adjudication notes).
         noise_floor: Bucket size -> statistic -> mean noise-floor MMD^2.
         threshold_sweep: Operating point plus the sweep grid rows.
@@ -1064,16 +1066,17 @@ def render_tables_markdown(payload: dict[str, object]) -> str:
     lines.append("## Threshold sweep")
     lines.append("")
     lines.append(
-        "| threshold | recall | rel. density | degree MMD ratio | clustering MMD ratio | "
-        "spectral MMD ratio | "
+        "| threshold | recall | graph similarity | rel. density | degree MMD ratio | "
+        "clustering MMD ratio | spectral MMD ratio | "
         "self-loop count | self-loop rate |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
     sweep = cast(dict[str, object], payload["threshold_sweep"])
     for row in cast(list[dict[str, object]], sweep["rows"]):
         mmd_ratio = cast(dict[str, float], row["mmd_ratio"])
         lines.append(
             f"| {_fmt(cast(float, row['threshold']))} | {_fmt(cast(float, row['recall']))} | "
+            f"{_fmt(cast(float, row['graph_similarity']))} | "
             f"{_fmt(cast(float, row['relative_density']))} | {_fmt(mmd_ratio.get('degree'))} | "
             f"{_fmt(mmd_ratio.get('clustering'))} | {_fmt(mmd_ratio.get('spectral'))} | "
             f"{row['self_loop_count']} | {_fmt(cast(float, row['self_loop_rate']))} |"
@@ -1083,9 +1086,9 @@ def render_tables_markdown(payload: dict[str, object]) -> str:
     lines.append("## Assembled-graph rows")
     lines.append("")
     lines.append(
-        "| scorer | threshold | rel. density | degree MMD ratio | clustering MMD ratio | "
-        "spectral MMD ratio | "
-        "self-loops (pred/ref) | composite |"
+        "| scorer | threshold | graph similarity | rel. density | degree MMD ratio | "
+        "clustering MMD ratio | spectral MMD ratio | "
+        "self-loops (pred/ref) |"
     )
     lines.append("|---|---|---|---|---|---|---|---|")
     assembled = cast(dict[str, object], payload["assembled"])
@@ -1096,11 +1099,11 @@ def render_tables_markdown(payload: dict[str, object]) -> str:
         mmd_ratio = cast(dict[str, float], row_dict["mmd_ratio"])
         lines.append(
             f"| {scorer} | {_fmt(cast(float | None, row_dict['threshold']))} | "
+            f"{_fmt(cast(float, row_dict['graph_similarity']))} | "
             f"{_fmt(cast(float, row_dict['relative_density']))} | "
             f"{_fmt(mmd_ratio.get('degree'))} | {_fmt(mmd_ratio.get('clustering'))} | "
             f"{_fmt(mmd_ratio.get('spectral'))} | "
-            f"{row_dict['self_loops_pred']}/{row_dict['self_loops_ref']} | "
-            f"{_fmt(cast(float | None, row_dict['composite']))} |"
+            f"{row_dict['self_loops_pred']}/{row_dict['self_loops_ref']} |"
         )
     lines.append("")
 
@@ -1174,11 +1177,8 @@ def run_g1_pipeline(
         strategy: Benchmark split strategy (e.g. ``"breadth_first"``).
         output_dir: Directory to write ``g1_results.json`` and ``g1_tables.md`` into.
         seed: Base seed for every randomized step of the pipeline.
-        skip_perturbation_check: Debug-only speed flag. When True, the mandatory
-            O'Bray perturbation check is skipped entirely; the composite is then
-            treated as unvalidated (``composite_valid: null``, every composite
-            field ``null``) exactly like a failed check, since "skipped" is never
-            the same as "passed". Never use this for a real gate report.
+        skip_perturbation_check: Debug-only speed flag. When True, the O'Bray
+            perturbation diagnostic is skipped; official GS/RD remain defined.
 
     Returns:
         The JSON-ready results payload (also written to
@@ -1209,16 +1209,12 @@ def run_g1_pipeline(
 
     logger.info("computing real-vs-real noise floor (seed=%d)", seed)
     nf = noise_floor(g_ref, buckets, config)
-    definition = CompositeDefinition()
-
     perturbation_meta: dict[str, object]
-    composite_valid: bool
     if skip_perturbation_check:
         perturbation_meta = {"skipped": True, "passed": None, "failures": []}
-        composite_valid = False
     else:
         logger.info("running the O'Bray perturbation check (seed=%d)", seed)
-        perturbation_result = perturbation_check(g_ref, buckets, config, definition, seed=seed)
+        perturbation_result = perturbation_check(g_ref, buckets, config, seed=seed)
         perturbation_meta = {
             "skipped": False,
             "passed": perturbation_result.passed,
@@ -1226,7 +1222,6 @@ def run_g1_pipeline(
             "similarities": perturbation_result.similarities,
             "fractions": list(perturbation_result.fractions),
         }
-        composite_valid = perturbation_result.passed
 
     store: FeatureStore | None = None
     features_root = data_root / _FEATURES_SUBDIR
@@ -1325,8 +1320,6 @@ def run_g1_pipeline(
                 buckets=buckets,
                 config=config,
                 seed=seed,
-                definition=definition,
-                composite_valid=composite_valid,
                 threshold=b0_threshold,
             )
         )
@@ -1341,8 +1334,6 @@ def run_g1_pipeline(
                 buckets=buckets,
                 config=config,
                 seed=seed,
-                definition=definition,
-                composite_valid=composite_valid,
                 threshold=alt_threshold,
             )
         )
@@ -1368,8 +1359,6 @@ def run_g1_pipeline(
             buckets=buckets,
             config=config,
             seed=seed,
-            definition=definition,
-            composite_valid=composite_valid,
             threshold=None,
         )
     )
@@ -1389,14 +1378,20 @@ def run_g1_pipeline(
         "reference_split": "artifact_order_even_vs_odd_within_each_node_size",
         "canonical_metric": "mmd_ratio",
         "component_disclosure": ["raw_mmd2", "reference_mmd2", "mmd_ratio"],
-        "composite": {
-            "weights": dict(definition.weights),
-            "calibration_rule": (
-                "no second calibration: MMD ratios are already reference-normalized"
-            ),
+        "graph_similarity": {
+            "formula": "1 - L1(A_pred - A_ref) / (sum(A_pred) + sum(A_ref))",
+            "aggregation": "unweighted macro mean over every fixed sampled subgraph",
+            "self_loops": "retained",
+            "empty_empty": 1.0,
+        },
+        "relative_density": {
+            "formula": "density(G_pred) / density(G_ref)",
+            "aggregation": "unweighted macro mean over every fixed sampled subgraph",
+            "self_loops": "retained",
+            "empty_empty": 1.0,
+            "nonempty_over_empty": "inf",
         },
         "perturbation_check": perturbation_meta,
-        "composite_valid": composite_valid if not skip_perturbation_check else None,
         "threshold_policy": (
             "operating point = density_matched_threshold(own probs, target_edges = "
             "|E(strip_self_loops(test_graph))|), computed independently per scorer "
@@ -1504,8 +1499,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip-perturbation-check",
         action="store_true",
-        help="DEBUG-ONLY speed flag: skip the mandatory perturbation check "
-        "(composite is then treated as unvalidated, never as passed).",
+        help=(
+            "DEBUG-ONLY speed flag: skip the perturbation diagnostic; "
+            "official GS/RD remain defined."
+        ),
     )
     return parser
 

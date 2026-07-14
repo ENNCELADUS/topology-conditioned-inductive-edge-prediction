@@ -71,38 +71,43 @@ The positioning is a 2×2 map — the target cell is *inductive-from-features* *
 
 ## The Motivating Result (E2)
 
-A strong independent pairwise scorer (`B0`) achieves reasonable *edge-level* scores while
+A frozen independent pairwise scorer (`B0`) achieves reasonable *edge-level* scores while
 assembling into a poor *graph*. This "pair-to-topology gap" is the reason the method
 exists. Full note: [`docs/results/E2-pair-to-topology-gap.md`](docs/results/E2-pair-to-topology-gap.md);
 figure: [`figures/e2-gap.html`](figures/e2-gap.html).
+
+> **Metric recomputation (2026-07-14):** GS/RD now match official PRING evaluation and were
+> recomputed from the frozen score artifacts over all 500 fixed induced subgraphs. The separately
+> reported MMD ratios remain the canonical-run values.
 
 | Level | Metric | Value | Reading |
 |---|---|---:|---|
 | Edge | AUROC / AUPRC (degree-corrected, ratio-1) | **0.7055 / 0.7303** | final G1 B0 row |
 | Edge | AUROC / AUPRC (hard feature, ratio-1) | **0.5696 / 0.6175** | hard-negative stress test |
-| Assembled graph | graph similarity | **5.77e-7** | poor; composite passed perturbation check |
-| Assembled graph | relative density | 0.9977 | density-matched operating point |
+| Assembled graph | PRING BFS-macro GS / RD | **0.3122 / 0.4223** | local topology; higher GS and RD closer to 1 are better |
+| Assembled graph | global simple-edge RD | **0.9977** | whole-graph non-self edge-count calibration |
 | Assembled graph | degree / clustering / spectral MMD ratio | **13.0768 / 11.9273 / 18.0931** | reference floor = 1; lower is better |
 | Edge (B0-alt) | AUROC / AUPRC (degree-corrected, ratio-1) | **0.6936 / 0.7325** | alternate F0-MLP architecture |
-| Assembled graph (B0-alt) | graph similarity | **2.29e-8** | architecture-independence arm |
+| Assembled graph (B0-alt) | PRING BFS-macro GS / RD | **0.3458 / 0.4508** | architecture-independence arm |
+| Assembled graph (B0-alt) | global simple-edge RD | **0.9987** | independently calibrated threshold |
 | Assembled graph (B0-alt) | degree / clustering / spectral MMD ratio | **15.8304 / 13.4718 / 23.4734** | gap persists and is larger |
 
 The final two-architecture G1 threshold sweep and all negative-regime rows are recorded in
 [`outputs/runs/g1_b0_b0_alt_20260713T165714Z/g1_tables.md`](outputs/runs/g1_b0_b0_alt_20260713T165714Z/g1_tables.md).
 G2 reports measured soft-score overlap 0.4799 versus the minimum 0.0550 required to
 reach the reference triangle count. G3's Oracle-blend arm reports MMD-ratio headroom
-1.723 / 3.885 / 1.998 for degree / clustering / spectral, with composite ratio 2425.56;
-the feature-insufficiency stop rule is not triggered. The B0-alt result closes G1's
-architecture-independence requirement. PA-null is reported
+1.723 / 3.885 / 1.998 for degree / clustering / spectral; Oracle-topo reaches PRING GS
+0.5030, 1.612 times B0, so the feature-insufficiency stop rule is not triggered. The
+B0-alt result closes G1's architecture-independence requirement. PA-null is reported
 alongside B0 because it wins some easy and feature-hard edge regimes.
 
 The latest checkpoint-only evaluation rerun (`legacy_v31_s47_20260712T193900Z`, not a
 new formal training acceptance) reached balanced test AUROC/AUPRC **0.8052 / 0.8184**
 and its G1 degree-corrected ratio-1 row was **0.7996 / 0.8133**. Its archived assembled
-metrics were recomputed with the canonical evaluator: graph similarity **2.63e-7** and
-degree / clustering / spectral MMD ratios **13.8456 / 11.6277 / 19.9774** at relative
-density 0.9784. Thus the stronger edge scorer does not shrink the topology gap. The
-complete closeout package is
+metrics were recomputed with the official evaluator: PRING BFS-macro GS/RD
+**0.3813 / 0.5002** at global simple-edge RD **0.9784**, alongside MMD ratios
+**13.8456 / 11.6277 / 19.9774**. Thus the stronger edge scorer improves GS but does not
+close the topology gap. The complete closeout package is
 [`outputs/deliverables/g1_closeout_20260713/`](outputs/deliverables/g1_closeout_20260713/).
 
 ## The Proposed Method (EgoStitch)

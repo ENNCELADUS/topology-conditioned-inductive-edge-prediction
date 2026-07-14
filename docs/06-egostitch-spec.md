@@ -327,19 +327,19 @@ Self-loops are first-class labeled queries in this benchmark (13.8% of `random_w
 train-graph edges; 84% of test nodes carry one; they appear in supervision, val,
 test, and candidate files as `(u, u)` rows). Binding rules:
 
-1. **Structural-target simple-graph policy; canonical MMD exception**: N(u), degrees,
-   budgets d̂_u, training-side clustering/code stats, ego-net targets, relative
-   density, recall, and other structural targets strip self-loops. Canonical MMD
-   descriptor induced subgraphs retain self-loops exactly as in the
-   benchmark/official evaluator.
+1. **Structural-target simple-graph policy; official evaluation exceptions**: N(u), degrees,
+   budgets d̂_u, training-side clustering/code stats, ego-net targets, recall, and other
+   training structural targets strip self-loops. Canonical MMD descriptors and official
+   PRING GS/RD induced subgraphs retain self-loops exactly as in the benchmark evaluator.
 2. **`(u, u)` queries route through a single-ego path**: j := i; T_peer = own kept
    slots; Π = identity on kept slots; s0 = pair_logit(u, u); s1 = self-membership
    `lse_k(κ(h_u^k, proj(x_u)) + log π m)`; s2 from the Â_u diagonal blocks;
    s3 unchanged; s4 on the single-ego scaffold with both anchor labels on u.
-3. **Reporting**: edge metrics overall *and* split self / non-self; canonical MMD on
-   loop-retaining descriptor induced subgraphs; relative density, recall, and other
-   topology metrics on the simple assembled graph; plus a separate self-loop-rate row
-   (predicted vs reference, e.g. 1,701/2,018 on `random_walk`).
+3. **Reporting**: edge metrics overall *and* split self / non-self; canonical MMD and
+   official PRING GS/RD on loop-retaining induced subgraphs; GS/RD are computed per fixed
+   sampled node set and macro-averaged over every sample across node-size buckets. Recall
+   remains a simple-graph diagnostic. Report a separate self-loop-rate row (predicted vs
+   reference, e.g. 1,701/2,018 on `random_walk`).
 
 ## 10. Batch sampler and loader contract
 
@@ -388,8 +388,14 @@ with per-epoch order shuffling but no negative resampling.
   benchmark/official evaluator. The spectral worker first converts its 200-bin
   counts to a PMF, while degree and clustering remain raw counts; the common MMD
   routine then applies `sum + 1e-6` normalization to all three. Run artifacts
-  disclose `raw_mmd2`, `reference_mmd2`, and `mmd_ratio`; only `mmd_ratio` is used
-  in result tables and the topology composite.
+  disclose `raw_mmd2`, `reference_mmd2`, and `mmd_ratio`; the three MMD ratios remain
+  separate metrics and are never combined into Graph Similarity.
+- Graph Similarity and Relative Density reproduce the official PRING evaluator: for each
+  fixed node set, compute adjacency edge-Dice GS and NetworkX density-ratio RD on the
+  loop-retaining predicted/reference induced subgraphs, then take one unweighted mean over
+  all samples in all node-size buckets. Empty/empty returns `1` for both metrics; a nonempty
+  prediction over an empty reference returns infinite RD. Run artifacts disclose both
+  per-size sample lists and the macro summaries.
 - Per-node Tokenize/Imagine caches rebuilt once per eval epoch for all |V| nodes
   (~10k nodes; ≈160 MB fp32 at K = 16, d_p = 256 — kept on the H20).
 
@@ -448,6 +454,11 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   benchmark-aligned self-loop retention for canonical descriptor induced subgraphs;
   also pinned the official spectral-PMF pre-normalization before the common
   `sum + 1e-6` normalization, with degree/clustering left as raw counts beforehand.
+- 2026-07-14: replaced the retired MMD-ratio exponential "graph similarity" and full-graph
+  simple-edge relative density with official PRING per-induced-subgraph GS/RD and macro
+  aggregation; bound official self-loop and zero-density behavior, kept MMD ratios as
+  independent metrics, then recomputed the documented B0/B0-alt/PA-null/legacy/G3 values
+  from their frozen score artifacts over all 500 fixed subgraphs.
 
 **Open items before code (not blockers):** the four ego-stat target definitions
 pinned to evaluator implementations; FLOPs/latency table template (§4.7 commitment);

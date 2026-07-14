@@ -1,49 +1,10 @@
-"""Tests for src.eval.composite: graph-similarity composite and perturbation check."""
+"""Tests for the official-Graph-Similarity perturbation check."""
 
 import networkx as nx
 import numpy as np
 import pytest
-from src.eval.composite import (
-    CompositeDefinition,
-    graph_similarity,
-    perturbation_check,
-)
+from src.eval.composite import perturbation_check
 from src.eval.graph_metrics import MMDConfig
-
-
-@pytest.mark.unit
-class TestCompositeDefinition:
-    def test_default_construction_does_not_raise(self) -> None:
-        definition = CompositeDefinition()
-        assert definition.statistics == ("degree", "clustering", "spectral")
-        assert sum(definition.weights.values()) == pytest.approx(1.0)
-        assert not hasattr(definition, "scales")
-
-    def test_weights_not_summing_to_one_raises(self) -> None:
-        with pytest.raises(ValueError, match="weight"):
-            CompositeDefinition(weights={"degree": 0.5, "clustering": 0.5, "spectral": 0.5})
-
-
-@pytest.mark.unit
-class TestGraphSimilarity:
-    def test_identical_graph_similarity_is_one(self) -> None:
-        definition = CompositeDefinition()
-        mmd_ratio = {"degree": 0.0, "clustering": 0.0, "spectral": 0.0}
-        assert graph_similarity(mmd_ratio, definition) == pytest.approx(1.0)
-
-    def test_hand_computed_value(self) -> None:
-        definition = CompositeDefinition(
-            weights={"degree": 1 / 3, "clustering": 1 / 3, "spectral": 1 / 3},
-        )
-        mmd_ratio = {"degree": 0.1, "clustering": 0.2, "spectral": 0.3}
-        # exp(-(0.1+0.2+0.3)/3) = exp(-0.2)
-        assert graph_similarity(mmd_ratio, definition) == pytest.approx(np.exp(-0.2))
-
-    def test_higher_mmd_gives_lower_similarity(self) -> None:
-        definition = CompositeDefinition()
-        low = graph_similarity({"degree": 0.01, "clustering": 0.01, "spectral": 0.01}, definition)
-        high = graph_similarity({"degree": 1.0, "clustering": 1.0, "spectral": 1.0}, definition)
-        assert low > high
 
 
 def _seeded_ws_graph_and_buckets() -> tuple[nx.Graph, dict[int, list[set[str]]]]:
@@ -68,12 +29,10 @@ class TestPerturbationCheck:
     def test_passes_and_similarity_decreases_with_perturbation(self) -> None:
         g_ref, buckets = _seeded_ws_graph_and_buckets()
         config = MMDConfig()
-        definition = CompositeDefinition()
         result = perturbation_check(
             g_ref,
             buckets,
             config,
-            definition,
             n_trials=10,
             seed=99,
         )
@@ -88,6 +47,5 @@ class TestPerturbationCheck:
         g_ref, buckets = _seeded_ws_graph_and_buckets()
         edges_before = set(g_ref.edges())
         config = MMDConfig()
-        definition = CompositeDefinition()
-        perturbation_check(g_ref, buckets, config, definition, seed=99)
+        perturbation_check(g_ref, buckets, config, seed=99)
         assert set(g_ref.edges()) == edges_before

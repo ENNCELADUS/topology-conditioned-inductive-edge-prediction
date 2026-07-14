@@ -84,7 +84,7 @@ class TestRank01Lex:
 
 def _assembled_row(
     mmd_ratio: dict[str, float],
-    composite: float | None,
+    graph_similarity: float,
     threshold: float | None = None,
 ) -> AssembledRow:
     zeros = dict.fromkeys(("degree", "clustering", "spectral"), 0.0)
@@ -93,43 +93,39 @@ def _assembled_row(
         mmd_ratio=mmd_ratio,
         raw_mmd2=dict(zeros),
         reference_mmd2=dict(zeros),
+        graph_similarity=graph_similarity,
         relative_density=1.0,
+        per_size_graph_similarity={2: [graph_similarity]},
+        per_size_relative_density={2: [1.0]},
         self_loops_pred=0,
         self_loops_ref=0,
         bootstrap_mean=dict(zeros),
         bootstrap_std=dict(zeros),
-        composite=composite,
     )
 
 
 class TestComputeHeadroom:
-    def test_ratios_and_composite(self) -> None:
+    def test_ratios_and_graph_similarity(self) -> None:
         b0 = _assembled_row({"degree": 12.0, "clustering": 9.0, "spectral": 18.0}, 1e-6)
         arm = _assembled_row({"degree": 3.0, "clustering": 4.5, "spectral": 2.0}, 1e-2)
         row = g3.compute_headroom(b0, arm)
         assert row.mmd_ratio_headroom == {"degree": 4.0, "clustering": 2.0, "spectral": 9.0}
-        assert row.composite_ratio == pytest.approx(1e4)
+        assert row.graph_similarity_ratio == pytest.approx(1e4)
 
     def test_zero_arm_ratio_yields_none(self) -> None:
-        b0 = _assembled_row({"degree": 12.0, "clustering": 9.0, "spectral": 18.0}, None)
-        arm = _assembled_row({"degree": 0.0, "clustering": 4.5, "spectral": 2.0}, None)
+        b0 = _assembled_row({"degree": 12.0, "clustering": 9.0, "spectral": 18.0}, 0.5)
+        arm = _assembled_row({"degree": 0.0, "clustering": 4.5, "spectral": 2.0}, 0.75)
         row = g3.compute_headroom(b0, arm)
         assert row.mmd_ratio_headroom["degree"] is None
         assert row.mmd_ratio_headroom["clustering"] == 2.0
-        assert row.composite_ratio is None
+        assert row.graph_similarity_ratio == pytest.approx(1.5)
 
-    def test_composite_none_when_either_missing_or_b0_zero(self) -> None:
+    def test_graph_similarity_ratio_none_when_b0_zero(self) -> None:
         ratios = {"degree": 1.0, "clustering": 1.0, "spectral": 1.0}
         assert (
             g3.compute_headroom(
-                _assembled_row(ratios, None), _assembled_row(ratios, 0.5)
-            ).composite_ratio
-            is None
-        )
-        assert (
-            g3.compute_headroom(
                 _assembled_row(ratios, 0.0), _assembled_row(ratios, 0.5)
-            ).composite_ratio
+            ).graph_similarity_ratio
             is None
         )
 
@@ -193,9 +189,8 @@ class TestRunG3Pipeline:
         for arm in ("oracle_topo", "oracle_blend"):
             ratios = cast(dict[str, object], headroom[arm]["mmd_ratio_headroom"])
             assert set(ratios) == {"degree", "clustering", "spectral"}
-        # composite skipped => composite_valid null and no composite anywhere
-        assert _d(payload["metadata"])["composite_valid"] is None
-        assert assembled["b0"]["composite"] is None
+        assert _d(_d(payload["metadata"])["perturbation_check"])["skipped"] is True
+        assert 0.0 <= cast(float, assembled["b0"]["graph_similarity"]) <= 1.0
 
     def test_oracle_arms_assemble_no_self_loops_and_exact_edge_count(self, tmp_path: Path) -> None:
         universe_path, data_root = _toy_inputs(tmp_path)
@@ -210,8 +205,9 @@ class TestRunG3Pipeline:
         assembled = cast(dict[str, dict[str, object]], payload["assembled"])
         for arm in ("oracle_topo", "oracle_blend"):
             assert assembled[arm]["self_loops_pred"] == 0
-            # top-N assembly is exactly density-matched: 5 reference edges
-            assert assembled[arm]["relative_density"] == pytest.approx(1.0)
+            # Global top-N matching does not force official per-subgraph RD to one;
+            # this toy bucket includes nonempty-prediction / empty-reference cases.
+            assert assembled[arm]["relative_density"] == float("inf")
 
     def test_oracle_topo_ranks_common_neighbor_pairs_first(self, tmp_path: Path) -> None:
         # In the toy graph, (n2,n3),(n1,n2),(n1,n3),(n2,n4),(n3,n4),(n1,n5)... have CN >= 1.

@@ -106,6 +106,7 @@ class TestThresholdSweep:
         for point in points:
             assert isinstance(point, SweepPoint)
             assert set(point.mmd_ratio) == set(STATISTICS)
+            assert 0.0 <= point.graph_similarity <= 1.0
 
     def test_relative_density_non_increasing_in_threshold(self) -> None:
         g_ref, pairs, probs, buckets = _seeded_graph_pairs_probs_buckets()

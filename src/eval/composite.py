@@ -1,17 +1,11 @@
-"""Graph-similarity composite score and its mandatory perturbation sanity check.
-
-The composite must not be used to rank anything until `perturbation_check` passes
-on the relevant reference graph — that is the entire point of this module's split
-into a definition/scoring half and a validation half.
+"""Perturbation sanity check for official PRING graph similarity.
 
 No dependence on `src.data` or `torch`.
 """
 
 import logging
 import math
-from collections.abc import Mapping
-from dataclasses import dataclass, field
-from types import MappingProxyType
+from dataclasses import dataclass
 
 import networkx as nx
 import numpy as np
@@ -21,47 +15,9 @@ from src.eval.graph_metrics import MMDConfig, evaluate_assembled_graph
 logger = logging.getLogger(__name__)
 
 
-def _default_weights() -> Mapping[str, float]:
-    return MappingProxyType({"degree": 1 / 3, "clustering": 1 / 3, "spectral": 1 / 3})
-
-
-@dataclass(frozen=True)
-class CompositeDefinition:
-    """Disclosed weights for the composite.
-
-    Attributes:
-        statistics: The MMD statistics combined into the composite.
-        weights: Statistic -> weight `w_k`; must sum to 1 over `statistics`.
-
-    Raises:
-        ValueError: If the weights (restricted to `statistics`) do not sum to 1
-            (within `1e-6`).
-    """
-
-    statistics: tuple[str, ...] = ("degree", "clustering", "spectral")
-    weights: Mapping[str, float] = field(default_factory=_default_weights)
-
-    def __post_init__(self) -> None:
-        """Validate that weights sum to 1."""
-        total = sum(self.weights[k] for k in self.statistics)
-        if abs(total - 1.0) > 1e-6:
-            raise ValueError(f"CompositeDefinition weights must sum to 1, got {total}")
-
-
-def graph_similarity(
-    mmd_ratio: Mapping[str, float],
-    definition: CompositeDefinition,
-) -> float:
-    """Compute exp(-sum_k w_k * normalized_mmd_ratio_k)."""
-    total = 0.0
-    for stat in definition.statistics:
-        total += definition.weights[stat] * mmd_ratio[stat]
-    return float(np.exp(-total))
-
-
 @dataclass(frozen=True)
 class PerturbationCheckResult:
-    """Result of validating that the composite decreases under graph perturbation.
+    """Result of validating that official GS decreases under graph perturbation.
 
     Attributes:
         similarities: Perturbation mode -> similarity at each fraction (mean over
@@ -141,18 +97,17 @@ def perturbation_check(
     g_ref: nx.Graph,
     buckets: dict[int, list[set[str]]],
     config: MMDConfig,
-    definition: CompositeDefinition,
     *,
     fractions: tuple[float, ...] = (0.0, 0.05, 0.1, 0.2, 0.35, 0.5),
     n_trials: int = 3,
     seed: int,
     modes: tuple[str, ...] = ("degree_preserving_swap", "uniform_rewire"),
 ) -> PerturbationCheckResult:
-    """Validate that the composite score decreases monotonically under perturbation.
+    """Validate that official PRING GS decreases monotonically under perturbation.
 
     For each mode and fraction, `n_trials` independent perturbed copies of `g_ref`
-    are compared back against `g_ref` (bucketed MMD -> composite similarity); the
-    mean similarity across trials is recorded. `g_ref` itself is never mutated.
+    are compared back against `g_ref`; the macro-averaged per-subgraph GS is recorded.
+    `g_ref` itself is never mutated.
 
     PASS conditions (checked independently per mode; every violation is recorded):
         - The mean similarity sequence over `fractions` is non-increasing within a
@@ -164,8 +119,6 @@ def perturbation_check(
         buckets: Bucket size -> list of node sets, passed through to
             `evaluate_assembled_graph`.
         config: Shared MMD/descriptor configuration.
-        definition: Composite weights; no second calibration is applied to the
-            already normalized MMD ratios.
         fractions: Perturbation fractions to evaluate, in increasing order.
         n_trials: Number of independent perturbation trials averaged per fraction.
         seed: Seed for the perturbation RNG.
@@ -193,7 +146,7 @@ def perturbation_check(
             for _ in range(n_trials):
                 g_pert = perturb_fn(g_ref, frac, rng)
                 report = evaluate_assembled_graph(g_pert, g_ref, buckets, config)
-                trial_sims.append(graph_similarity(report.mmd_ratio, definition))
+                trial_sims.append(report.graph_similarity)
             sims_per_fraction.append(float(np.mean(trial_sims)))
         similarities[mode] = sims_per_fraction
 

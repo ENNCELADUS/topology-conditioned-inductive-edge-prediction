@@ -39,7 +39,7 @@ from numpy.typing import NDArray
 
 from src.data.features import FeatureStore
 from src.eval.assembly import assemble_graph, density_matched_threshold
-from src.eval.composite import CompositeDefinition, perturbation_check
+from src.eval.composite import perturbation_check
 from src.eval.graph_metrics import STATISTICS, MMDConfig, noise_floor, strip_self_loops
 from src.experiments.g1_hardened_e2 import (
     _BENCHMARK_SUBDIR,
@@ -158,12 +158,12 @@ class HeadroomRow:
             (``None`` where the arm ratio is exactly 0 -- disclosed, never inf).
             Values >> 1 mean the oracle assembles a far more realistic graph
             than B0 (headroom exists); ~1 triggers the G3 stop discussion.
-        composite_ratio: ``arm.composite / b0.composite`` when both composites
-            were computed and B0's is nonzero, else ``None``.
+        graph_similarity_ratio: ``arm.graph_similarity / b0.graph_similarity``
+            when B0's value is nonzero, else ``None``.
     """
 
     mmd_ratio_headroom: dict[str, float | None]
-    composite_ratio: float | None
+    graph_similarity_ratio: float | None
 
 
 def compute_headroom(b0_row: AssembledRow, arm_row: AssembledRow) -> HeadroomRow:
@@ -180,10 +180,15 @@ def compute_headroom(b0_row: AssembledRow, arm_row: AssembledRow) -> HeadroomRow
     for stat in STATISTICS:
         arm_ratio = arm_row.mmd_ratio[stat]
         ratios[stat] = None if arm_ratio == 0.0 else b0_row.mmd_ratio[stat] / arm_ratio
-    composite_ratio: float | None = None
-    if b0_row.composite is not None and arm_row.composite is not None and b0_row.composite != 0.0:
-        composite_ratio = arm_row.composite / b0_row.composite
-    return HeadroomRow(mmd_ratio_headroom=ratios, composite_ratio=composite_ratio)
+    graph_similarity_ratio = (
+        None
+        if b0_row.graph_similarity == 0.0
+        else arm_row.graph_similarity / b0_row.graph_similarity
+    )
+    return HeadroomRow(
+        mmd_ratio_headroom=ratios,
+        graph_similarity_ratio=graph_similarity_ratio,
+    )
 
 
 # --------------------------------------------------------------------------- oracle scores
@@ -220,7 +225,7 @@ class G3Result:
 
     Attributes:
         metadata: Every disclosure required by the gate (artifact provenance,
-            benchmark strategy, MMD/composite config, oracle formulas, threshold
+            benchmark strategy, MMD and official GS/RD config, oracle formulas, threshold
             policy, regime construction, seed, notes).
         noise_floor: Bucket size -> statistic -> mean noise-floor MMD^2.
         regime_table: Scorer key (``"b0"``, ``"oracle_topo"``, ``"oracle_blend"``)
@@ -279,8 +284,7 @@ def run_g3_pipeline(
             into.
         seed: Base seed for every randomized step of the pipeline.
         skip_perturbation_check: Debug-only speed flag; identical semantics to
-            G1's (skipped is never passed: ``composite_valid: null``, every
-            composite field ``null``). Never use for a real gate report.
+            G1's. Official GS/RD remain defined when the diagnostic is skipped.
 
     Returns:
         The JSON-ready results payload (also written to
@@ -305,16 +309,12 @@ def run_g3_pipeline(
 
     logger.info("computing real-vs-real noise floor (seed=%d)", seed)
     nf = noise_floor(g_ref, buckets, config)
-    definition = CompositeDefinition()
-
     perturbation_meta: dict[str, object]
-    composite_valid: bool
     if skip_perturbation_check:
         perturbation_meta = {"skipped": True, "passed": None, "failures": []}
-        composite_valid = False
     else:
         logger.info("running the O'Bray perturbation check (seed=%d)", seed)
-        perturbation_result = perturbation_check(g_ref, buckets, config, definition, seed=seed)
+        perturbation_result = perturbation_check(g_ref, buckets, config, seed=seed)
         perturbation_meta = {
             "skipped": False,
             "passed": perturbation_result.passed,
@@ -322,7 +322,6 @@ def run_g3_pipeline(
             "similarities": perturbation_result.similarities,
             "fractions": list(perturbation_result.fractions),
         }
-        composite_valid = perturbation_result.passed
 
     store: FeatureStore | None = None
     features_root = data_root / _FEATURES_SUBDIR
@@ -383,8 +382,6 @@ def run_g3_pipeline(
         buckets=buckets,
         config=config,
         seed=seed,
-        definition=definition,
-        composite_valid=composite_valid,
         threshold=b0_threshold,
     )
 
@@ -407,8 +404,6 @@ def run_g3_pipeline(
             buckets=buckets,
             config=config,
             seed=seed,
-            definition=definition,
-            composite_valid=composite_valid,
             threshold=None,
         )
 
@@ -435,14 +430,20 @@ def run_g3_pipeline(
         "reference_split": "artifact_order_even_vs_odd_within_each_node_size",
         "canonical_metric": "mmd_ratio",
         "component_disclosure": ["raw_mmd2", "reference_mmd2", "mmd_ratio"],
-        "composite": {
-            "weights": dict(definition.weights),
-            "calibration_rule": (
-                "no second calibration: MMD ratios are already reference-normalized"
-            ),
+        "graph_similarity": {
+            "formula": "1 - L1(A_pred - A_ref) / (sum(A_pred) + sum(A_ref))",
+            "aggregation": "unweighted macro mean over every fixed sampled subgraph",
+            "self_loops": "retained",
+            "empty_empty": 1.0,
+        },
+        "relative_density": {
+            "formula": "density(G_pred) / density(G_ref)",
+            "aggregation": "unweighted macro mean over every fixed sampled subgraph",
+            "self_loops": "retained",
+            "empty_empty": 1.0,
+            "nonempty_over_empty": "inf",
         },
         "perturbation_check": perturbation_meta,
-        "composite_valid": composite_valid if not skip_perturbation_check else None,
         "threshold_policy": (
             "B0 row: operating point = density_matched_threshold(own probs, "
             "target_edges = |E(strip_self_loops(test_graph))|) on non-self-pair rows; "
@@ -497,8 +498,7 @@ def run_g3_pipeline(
         },
         "headroom_definition": (
             "per statistic: mmd_ratio(B0) / mmd_ratio(oracle arm), null where the arm "
-            "ratio is 0; composite_ratio = composite(arm) / composite(B0) when both "
-            "are computed and composite(B0) is nonzero"
+            "ratio is 0; graph_similarity_ratio = GS(arm) / GS(B0), null when GS(B0) is zero"
         ),
         "notes": {
             "breadth_first_zero_drop": _BREADTH_FIRST_ZERO_DROP_NOTE,
@@ -579,30 +579,31 @@ def render_tables_markdown(payload: dict[str, object]) -> str:
 
     lines += ["", "## Assembled-graph rows", ""]
     lines.append(
-        "| scorer | threshold | rel. density | degree MMD ratio | clustering MMD ratio "
-        "| spectral MMD ratio | self-loops (pred/ref) | composite |"
+        "| scorer | threshold | graph similarity | rel. density | degree MMD ratio | "
+        "clustering MMD ratio | spectral MMD ratio | self-loops (pred/ref) |"
     )
     lines.append("|---|---|---|---|---|---|---|---|")
     for scorer in _SCORER_ORDER:
         row = assembled[scorer]
         ratio = cast(dict[str, float], row["mmd_ratio"])
         lines.append(
-            f"| {scorer} | {_fmt(row['threshold'])} | {_fmt(row['relative_density'])} "
+            f"| {scorer} | {_fmt(row['threshold'])} | {_fmt(row['graph_similarity'])} "
+            f"| {_fmt(row['relative_density'])} "
             f"| {_fmt(ratio['degree'])} | {_fmt(ratio['clustering'])} | {_fmt(ratio['spectral'])} "
-            f"| {row['self_loops_pred']}/{row['self_loops_ref']} | {_fmt(row['composite'])} |"
+            f"| {row['self_loops_pred']}/{row['self_loops_ref']} |"
         )
 
     lines += ["", "## Headroom (stop-rule view)", ""]
     lines.append(
         "| oracle arm | degree headroom | clustering headroom | spectral headroom "
-        "| composite ratio |"
+        "| graph similarity ratio |"
     )
     lines.append("|---|---|---|---|---|")
     for arm in _ARM_ORDER:
         ratios = cast(dict[str, object], headroom[arm]["mmd_ratio_headroom"])
         lines.append(
             f"| {arm} | {_fmt(ratios['degree'])} | {_fmt(ratios['clustering'])} "
-            f"| {_fmt(ratios['spectral'])} | {_fmt(headroom[arm]['composite_ratio'])} |"
+            f"| {_fmt(ratios['spectral'])} | {_fmt(headroom[arm]['graph_similarity_ratio'])} |"
         )
 
     lines += ["", "## MMD ratio components", ""]
@@ -654,8 +655,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip-perturbation-check",
         action="store_true",
-        help="DEBUG-ONLY speed flag: skip the mandatory perturbation check "
-        "(composite is then treated as unvalidated, never as passed).",
+        help=(
+            "DEBUG-ONLY speed flag: skip the perturbation diagnostic; "
+            "official GS/RD remain defined."
+        ),
     )
     return parser
 
