@@ -133,6 +133,30 @@ class TestBuildF0Matrix:
         with pytest.raises(ValueError, match="order"):
             build_f0_matrix(store, reordered, cache_path=cache_path)
 
+    def test_cache_superset_can_serve_requested_subset(self, tmp_path: Path) -> None:
+        shapes = {
+            "node_000001": (5, 4),
+            "node_000002": (3, 4),
+            "node_000003": (7, 4),
+        }
+        root = _write_feature_root(tmp_path, shapes, input_dim=4)
+        store = FeatureStore(root)
+        cache_path = tmp_path / "f0_cache.pt"
+        full_ids = list(shapes)
+        full_matrix, full_index = build_f0_matrix(store, full_ids, cache_path=cache_path)
+        requested = ["node_000003", "node_000001"]
+
+        matrix, index = build_f0_matrix(
+            store,
+            requested,
+            cache_path=cache_path,
+            allow_cache_subset=True,
+        )
+
+        expected = full_matrix[[full_index[node_id] for node_id in requested]]
+        assert torch.equal(matrix, expected)
+        assert index == {"node_000003": 0, "node_000001": 1}
+
     def test_logs_progress_every_1000_nodes(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:

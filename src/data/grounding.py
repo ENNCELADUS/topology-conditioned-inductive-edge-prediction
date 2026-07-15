@@ -10,6 +10,8 @@ an ``.npz`` validated on reload (node set + ``n_ground`` must match).
 from __future__ import annotations
 
 import logging
+import os
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -71,14 +73,17 @@ def build_grounding_pool(
 
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache_path.with_suffix(".tmp.npz")
-        np.savez_compressed(
-            tmp,
-            node_ids=np.array(list(node_ids)),
-            neighbor_idx=neighbor_idx,
-            n_ground=np.int64(n_ground),
-        )
-        tmp.replace(cache_path)
+        tmp = cache_path.with_name(f"{cache_path.stem}.tmp-{os.getpid()}-{uuid.uuid4().hex}.npz")
+        try:
+            np.savez_compressed(
+                tmp,
+                node_ids=np.array(list(node_ids)),
+                neighbor_idx=neighbor_idx,
+                n_ground=np.int64(n_ground),
+            )
+            tmp.replace(cache_path)
+        finally:
+            tmp.unlink(missing_ok=True)
         logger.info("wrote grounding cache to %s", cache_path)
 
     return {

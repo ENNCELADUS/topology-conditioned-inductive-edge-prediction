@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -64,6 +68,30 @@ class TestBuildGroundingPool:
         build_grounding_pool(_F0, _NODES, n_ground=2, cache_path=cache)
         rebuilt = build_grounding_pool(_F0, _NODES, n_ground=3, cache_path=cache)
         assert all(len(v) == 3 for v in rebuilt.values())
+
+    def test_concurrent_cache_publication_uses_unique_temp_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cache = tmp_path / "pool.npz"
+        barrier = threading.Barrier(2)
+        original_save = np.savez_compressed
+        save = cast(Callable[..., Any], original_save)
+
+        def synchronized_save(path: Path, **kwargs: object) -> None:
+            save(path, **kwargs)
+            barrier.wait(timeout=5)
+
+        monkeypatch.setattr(np, "savez_compressed", synchronized_save)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(build_grounding_pool, _F0, _NODES, n_ground=2, cache_path=cache)
+                for _ in range(2)
+            ]
+        results = [future.result() for future in futures]
+
+        assert results[0] == results[1]
+        assert build_grounding_pool(_F0, _NODES, n_ground=2, cache_path=cache) == results[0]
+        assert not list(tmp_path.glob("pool.tmp-*.npz"))
 
     def test_blockwise_matches_direct(self) -> None:
         rng = np.random.default_rng(1)

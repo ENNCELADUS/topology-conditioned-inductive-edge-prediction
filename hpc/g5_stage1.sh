@@ -10,7 +10,7 @@ readonly B0_UNIVERSE="outputs/deliverables/b0_v31_breadth_first_20260711/scores/
 readonly B0CAL_RESULTS="outputs/b0_cal/b0cal_results.json"
 readonly PREREGISTRATION="docs/registrations/g5_stage1_preregistration.json"
 readonly F0_CACHE="outputs/feature_packs/egostitch_f0/f0_matrix.pt"
-readonly GROUNDING_CACHE="outputs/feature_packs/egostitch_f0/grounding.npz"
+readonly GROUNDING_CACHE="${FORMAL_ROOT}/candidate_grounding.npz"
 readonly COST_REPORT="${FORMAL_ROOT}/cost_report.json"
 
 usage() {

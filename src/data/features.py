@@ -93,7 +93,11 @@ class FeatureStore:
 
 
 def build_f0_matrix(
-    store: FeatureStore, node_ids: Sequence[str], *, cache_path: Path | None = None
+    store: FeatureStore,
+    node_ids: Sequence[str],
+    *,
+    cache_path: Path | None = None,
+    allow_cache_subset: bool = False,
 ) -> tuple[torch.Tensor, dict[str, int]]:
     """Build the F0 mean-pooled feature matrix for a set of nodes.
 
@@ -103,6 +107,9 @@ def build_f0_matrix(
         cache_path: Optional path to a cached matrix. If it exists, it is loaded and
             validated to match ``node_ids`` exactly (order included); otherwise the
             matrix is computed and saved there (when given).
+        allow_cache_subset: When true, a cache containing a superset of
+            ``node_ids`` may be gathered into the requested order without raw
+            feature reads. The default keeps the exact-match cache contract.
 
     Returns:
         A tuple ``(matrix, index)`` where ``matrix`` is a ``(N, input_dim)`` float32
@@ -120,6 +127,16 @@ def build_f0_matrix(
             torch.load(cache_path, map_location="cpu", weights_only=True),
         )
         cached_node_ids = list(cast(list[str], cached["node_ids"]))
+        if cached_node_ids != resolved_node_ids and allow_cache_subset:
+            cached_index = {node_id: i for i, node_id in enumerate(cached_node_ids)}
+            if all(node_id in cached_index for node_id in resolved_node_ids):
+                cached_matrix = cast(torch.Tensor, cached["matrix"])
+                subset_rows = torch.tensor(
+                    [cached_index[node_id] for node_id in resolved_node_ids], dtype=torch.long
+                )
+                matrix = cached_matrix[subset_rows]
+                index = {node_id: i for i, node_id in enumerate(resolved_node_ids)}
+                return matrix, index
         if cached_node_ids != resolved_node_ids:
             raise ValueError(
                 f"Cached F0 matrix at {cache_path} has a node ordering that does not "
