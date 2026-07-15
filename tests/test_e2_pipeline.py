@@ -218,12 +218,15 @@ def test_parse_pipeline_args_parses_all_fields(tmp_path: Path) -> None:
             str(tmp_path / "pack"),
             "--output-dir",
             str(tmp_path / "out"),
+            "--seed",
+            "2",
         ]
     )
     assert args == PipelineArgs(
         config=tmp_path / "cfg.yaml",
         pack_dir=tmp_path / "pack",
         output_dir=tmp_path / "out",
+        seed=2,
     )
 
 
@@ -232,6 +235,7 @@ def test_parse_pipeline_args_defaults_pack_and_output_dir_to_none(tmp_path: Path
     assert args.pack_dir is None
     assert args.output_dir is None
     assert args.worker_module == "src.train_b0"
+    assert args.seed is None
 
 
 def test_parse_pipeline_args_accepts_worker_module_override(tmp_path: Path) -> None:
@@ -262,6 +266,22 @@ def test_build_accelerate_command_worker_module(tmp_path: Path) -> None:
     assert [x for x in custom if x != "src.train_egostitch"] == [
         x for x in default if x != "src.train_b0"
     ]
+
+
+def test_build_accelerate_command_seed_override(tmp_path: Path) -> None:
+    command = build_accelerate_command(
+        accelerate_bin=tmp_path / "accelerate",
+        config_path=tmp_path / "cfg.yaml",
+        mode="train",
+        pack_dir=tmp_path / "pack",
+        output_dir=tmp_path / "out",
+        token_budget=256,
+        profile_output=tmp_path / "profile.json",
+        world_size=2,
+        worker_module="src.train_egostitch",
+        seed=2,
+    )
+    assert command[command.index("--seed") + 1] == "2"
 
 
 # ------------------------------------------------------------------- PipelineProfile round trip

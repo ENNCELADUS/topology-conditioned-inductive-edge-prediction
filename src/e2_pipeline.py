@@ -252,6 +252,7 @@ class PipelineArgs:
             defaults to ``cfg.runtime.pack_dir`` when omitted.
         output_dir: Optional override for the run output directory; defaults to
             ``cfg.output_dir`` when omitted.
+        seed: Optional worker seed override for pre-registered multi-seed runs.
         worker_module: Dotted module implementing the worker contract
             (``load_config``, ``prepare_pack``, and the ``--ddp-mode``
             probe/epoch-probe/train CLI). Defaults to the formal E2 B0 worker;
@@ -262,6 +263,7 @@ class PipelineArgs:
     pack_dir: Path | None
     output_dir: Path | None
     worker_module: str = "src.train_b0"
+    seed: int | None = None
 
 
 class BudgetExceeded(RuntimeError):
@@ -303,6 +305,7 @@ def build_accelerate_command(
     profile_output: Path,
     world_size: int,
     worker_module: str = "src.train_b0",
+    seed: int | None = None,
 ) -> list[str]:
     """Build the pinned ``accelerate launch -m <worker>`` worker command.
 
@@ -320,12 +323,13 @@ def build_accelerate_command(
         profile_output: Path the rank-zero worker writes its JSON profile to.
         world_size: Number of visible H20 ranks to launch.
         worker_module: Dotted worker module (default: the formal E2 B0 worker).
+        seed: Optional worker seed override.
 
     Returns:
         The exact ``accelerate launch --num_processes <world_size> --mixed_precision bf16
         -m <worker_module> ...`` argv list.
     """
-    return [
+    command = [
         str(accelerate_bin),
         "launch",
         "--num_processes",
@@ -347,6 +351,9 @@ def build_accelerate_command(
         "--profile-output",
         str(profile_output),
     ]
+    if seed is not None:
+        command.extend(("--seed", str(seed)))
+    return command
 
 
 def detect_visible_gpu_count() -> int:
@@ -381,6 +388,7 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--pack-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
         "--worker-module",
         default="src.train_b0",
@@ -392,7 +400,11 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
     )
     namespace = parser.parse_args(argv)
     return PipelineArgs(
-        namespace.config, namespace.pack_dir, namespace.output_dir, namespace.worker_module
+        config=namespace.config,
+        pack_dir=namespace.pack_dir,
+        output_dir=namespace.output_dir,
+        worker_module=namespace.worker_module,
+        seed=namespace.seed,
     )
 
 
@@ -762,6 +774,8 @@ def run_pipeline(
 
     pipeline_started = time.monotonic()
     cfg = worker.load_config(args.config)
+    if args.seed is not None:
+        cfg = replace(cfg, seed=args.seed)
     if args.output_dir is not None:
         cfg = replace(cfg, output_dir=args.output_dir)
     if cfg.runtime is None:
@@ -895,6 +909,7 @@ def run_pipeline(
             profile_output=profile_output,
             world_size=runtime.world_size,
             worker_module=args.worker_module,
+            seed=args.seed,
         )
         try:
             completed = command_runner(command, remaining)
@@ -982,6 +997,7 @@ def run_pipeline(
         profile_output=epoch_profile_output,
         world_size=runtime.world_size,
         worker_module=args.worker_module,
+        seed=args.seed,
     )
     try:
         completed = command_runner(command, remaining)
@@ -1053,6 +1069,7 @@ def run_pipeline(
         profile_output=worker_profile_path,
         world_size=runtime.world_size,
         worker_module=args.worker_module,
+        seed=args.seed,
     )
     try:
         completed = command_runner(command, float(runtime.train_eval_budget_seconds))
