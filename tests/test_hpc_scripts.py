@@ -76,9 +76,7 @@ def test_docs_describe_auto_sized_h20_runtime() -> None:
     readme = (REPO_ROOT / "README.md").read_text()
     claude = (REPO_ROOT / "CLAUDE.md").read_text()
     config = (REPO_ROOT / "configs" / "b0_v31_breadth_first.yaml").read_text()
-    egostitch_config = (
-        REPO_ROOT / "configs" / "egostitch_stage1_breadth_first.yaml"
-    ).read_text()
+    egostitch_config = (REPO_ROOT / "configs" / "egostitch_stage1_breadth_first.yaml").read_text()
 
     assert "all visible NVIDIA H20" in " ".join(hpc.split())
     assert "auto-detected" in " ".join(readme.split())
@@ -107,7 +105,7 @@ def test_s0_scoring_uses_packed_auto_sharded_fast_path() -> None:
     assert "outputs/feature_packs/b0_v31_bf16" in text
     assert '--pack-dir "${S0_PACK_DIR}"' in text
     assert "--token-budget 1048576" in text
-    assert 'parallel_score \\\n' in text
+    assert "parallel_score \\\n" in text
 
 
 @pytest.mark.parametrize(

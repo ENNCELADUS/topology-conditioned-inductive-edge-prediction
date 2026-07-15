@@ -142,8 +142,10 @@ def enforce_frozen_inputs(
         entry = cast(dict[str, object] | None, frozen.get(name))
         if entry is None or "path" not in entry or "sha256" not in entry:
             raise PreregistrationMismatch(f"frozen input {name!r} is incompletely registered")
-        path = b0_universe_path if name == "b0_candidate_scores" else _registered_path(
-            preregistration_path, entry["path"]
+        path = (
+            b0_universe_path
+            if name == "b0_candidate_scores"
+            else _registered_path(preregistration_path, entry["path"])
         )
         if not path.is_file():
             raise PreregistrationMismatch(f"frozen input {name!r} not found: {path}")
@@ -224,9 +226,7 @@ def _load_required_diagnostics(
     cost = cast(dict[str, object], json.loads(cost_report_path.read_text(encoding="utf-8")))
     missing_cost = sorted(_COST_KEYS - cost.keys())
     if missing_cost or cost.get("harmonization_rounds") != 0:
-        raise ValueError(
-            f"cost report must include {_COST_KEYS} and harmonization_rounds=0"
-        )
+        raise ValueError(f"cost report must include {_COST_KEYS} and harmonization_rounds=0")
     for key in _COST_KEYS:
         row = cast(dict[str, object], cost[key])
         if "flops" not in row or "wall_seconds" not in row:
@@ -468,9 +468,7 @@ def run_g5_stage1_pipeline(
 
     # (1) Pre-registration enforcement FIRST — no scores are opened before this.
     prereg_sha = enforce_preregistration(preregistration_path, run_metadata_paths)
-    prereg = cast(
-        dict[str, object], json.loads(preregistration_path.read_text(encoding="utf-8"))
-    )
+    prereg = cast(dict[str, object], json.loads(preregistration_path.read_text(encoding="utf-8")))
     enforce_frozen_inputs(prereg, preregistration_path, b0_universe_path)
     fidelity, cost_report = _load_required_diagnostics(
         fidelity_report_paths, cost_report_path, len(egostitch_universe_paths)
@@ -568,9 +566,7 @@ def run_g5_stage1_pipeline(
         pair: float(logit) for pair, logit in zip(b0_pairs, b0_universe.logit.tolist(), strict=True)
     }
 
-    for artifact_path, metadata in zip(
-        egostitch_universe_paths, run_metadata, strict=True
-    ):
+    for artifact_path, metadata in zip(egostitch_universe_paths, run_metadata, strict=True):
         universe = load_scores(artifact_path)
         validate_universe_artifact(
             universe, strategy=strategy, n_test_nodes=n_test_nodes, label=str(artifact_path)

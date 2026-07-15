@@ -148,9 +148,7 @@ class TestGradientFlow:
         with torch.no_grad():
             enc_i = model.encode_nodes(batch["x_i"], batch["ground_i"])
             enc_j = model.encode_nodes(batch["x_j"], batch["ground_j"])
-        model.pair_logits(
-            enc_i, enc_j, batch["x_i"], batch["x_j"], batch["s0"]
-        ).sum().backward()  # type: ignore[no-untyped-call]
+        model.pair_logits(enc_i, enc_j, batch["x_i"], batch["x_j"], batch["s0"]).sum().backward()  # type: ignore[no-untyped-call]
         grad = model.proj.weight.grad
         assert grad is not None
         assert bool(torch.isfinite(grad).all())

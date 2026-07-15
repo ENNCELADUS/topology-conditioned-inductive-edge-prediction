@@ -652,9 +652,7 @@ def _score_v3_1_packed(
     max_boundary = max(
         (
             next(
-                value
-                for value in BUCKET_BOUNDARIES
-                if value >= table.manifest.nodes[index].length
+                value for value in BUCKET_BOUNDARIES if value >= table.manifest.nodes[index].length
             )
             for index in used_node_indices
         ),

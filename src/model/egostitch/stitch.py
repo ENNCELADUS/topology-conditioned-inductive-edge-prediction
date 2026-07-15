@@ -93,14 +93,16 @@ def sinkhorn_plan(
         f = torch.zeros_like(a)
         g = torch.zeros_like(b)
         for _ in range(iters):
-            f = -phi * eps * torch.logsumexp(
-                (g[:, None, :] - cost) / eps + log_b[:, None, :], dim=2
+            f = (
+                -phi
+                * eps
+                * torch.logsumexp((g[:, None, :] - cost) / eps + log_b[:, None, :], dim=2)
             )
-            g = -phi * eps * torch.logsumexp(
-                (f[:, :, None] - cost) / eps + log_a[:, :, None], dim=1
+            g = (
+                -phi
+                * eps
+                * torch.logsumexp((f[:, :, None] - cost) / eps + log_a[:, :, None], dim=1)
             )
         return torch.exp(
-            (f[:, :, None] + g[:, None, :] - cost) / eps
-            + log_a[:, :, None]
-            + log_b[:, None, :]
+            (f[:, :, None] + g[:, None, :] - cost) / eps + log_a[:, :, None] + log_b[:, None, :]
         )
