@@ -297,6 +297,31 @@ class TestEnumerateEdgeStream:
     def test_deterministic(self) -> None:
         assert self._rows(1, 0, 2) == self._rows(1, 0, 2)
 
+    def test_deterministic_across_input_order(self) -> None:
+        g = nx.Graph()
+        g.add_nodes_from(_NODES)
+        g.add_edges_from([(u, v) for u, v in _POSITIVES[:6] if u != v])
+        positives = [canonical_pair(u, v) for u, v in _POSITIVES[6:]]
+        forward = te.enumerate_edge_stream(
+            positives,
+            _toy_sampler(g),
+            negative_ratio=2,
+            seed=0,
+            epoch=1,
+            rank=0,
+            world_size=2,
+        )
+        reversed_rows = te.enumerate_edge_stream(
+            list(reversed(positives)),
+            _toy_sampler(g),
+            negative_ratio=2,
+            seed=0,
+            epoch=1,
+            rank=0,
+            world_size=2,
+        )
+        assert forward == reversed_rows
+
     def test_positive_shards_partition_e_sup(self) -> None:
         positives = {canonical_pair(u, v) for u, v in _POSITIVES[6:]}
         seen: list[tuple[str, str]] = []

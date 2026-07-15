@@ -700,9 +700,10 @@ def enumerate_edge_stream(
     Returns:
         Row list ``(u, v, label)`` for this epoch/rank.
     """
+    positives = sorted(e_sup_positives)
     rng = np.random.default_rng((seed, epoch, rank, 0xE5))
-    order = np.random.default_rng((seed, epoch, 0xE5)).permutation(len(e_sup_positives))
-    shard = [e_sup_positives[i] for i in order.tolist()][rank::world_size]
+    order = np.random.default_rng((seed, epoch, 0xE5)).permutation(len(positives))
+    shard = [positives[i] for i in order.tolist()][rank::world_size]
     negatives = sampler.sample(shard, ratio=negative_ratio, seed=seed, epoch=epoch, rank=rank)
     rows = [(u, v, 1) for u, v in shard] + [(u, v, 0) for u, v in negatives]
     perm = rng.permutation(len(rows))
