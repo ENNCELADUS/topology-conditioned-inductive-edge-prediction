@@ -53,7 +53,7 @@ from src.data.features import FeatureStore, build_f0_matrix
 from src.data.grounding import build_grounding_pool
 from src.data.pairs import NegativeSampler
 from src.data.partition import build_g_struct, derive_partition
-from src.e2_pipeline import ProbeResult
+from src.e2_pipeline import ProbeResult, detect_visible_gpu_count
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
 from src.model.egostitch.imagine import NULL_MODE_ALL, NULL_MODE_CONTENT, NULL_MODE_FULL
@@ -109,8 +109,8 @@ class EgoDataConfig:
         msg_fraction: Message share of train positives (spec 0.8).
         node_batch: Per-rank node-stream batch size ``B_n``.
         edge_batch: Per-rank edge-stream batch size ``B_e``.
-        f0_cache: F0 matrix cache path (single-process path; DDP modes use the
-            pack directory instead).
+        f0_cache: F0 matrix cache path used while building the s0 manifest;
+            DDP modes use the pack directory instead.
         grounding_cache: Grounding-pool cache path (same convention).
         s0_cache: Frozen-B0 scores ``.npz`` covering every training/val pair.
         s0_checkpoint_id: Expected ``checkpoint_id`` of `s0_cache`.
@@ -190,7 +190,6 @@ class EgoCliArgs:
     config: Path
     seed: int | None
     output_dir: Path | None
-    max_steps: int | None
     ddp_mode: str | None = None
     pack_dir: Path | None = None
     token_budget_per_rank: int | None = None
@@ -347,10 +346,10 @@ def load_config(path: Path) -> EgoConfig:
         )
         _check_no_unknown_keys(runtime_raw, runtime_keys, "runtime")
         world_size_raw = _require(runtime_raw, "world_size", "runtime.")
+        if world_size_raw != "auto":
+            raise ValueError("runtime.world_size must be 'auto' for EgoStitch Stage-1")
         runtime = RuntimeConfig(
-            world_size=(
-                0 if world_size_raw == "auto" else _as_int(world_size_raw, "runtime.world_size")
-            ),
+            world_size=0,
             pack_dir=Path(
                 _as_str(_require(runtime_raw, "pack_dir", "runtime."), "runtime.pack_dir")
             ),
@@ -407,8 +406,6 @@ def load_config(path: Path) -> EgoConfig:
                 "runtime.probe_timed_steps",
             ),
         )
-        if runtime.world_size < 0:
-            raise ValueError("runtime.world_size must be 'auto' or a positive integer")
         if not runtime.token_budget_candidates or any(
             candidate <= 0 for candidate in runtime.token_budget_candidates
         ):
@@ -475,12 +472,6 @@ def parse_args(argv: Sequence[str] | None = None) -> EgoCliArgs:
     parser.add_argument("--seed", type=int, default=None, help="Override config seed.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Override config output_dir.")
     parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=None,
-        help="DEBUG ONLY: stop after N optimizer steps (bounded smoke runs).",
-    )
-    parser.add_argument(
         "--ddp-mode",
         choices=DDP_MODES,
         default=None,
@@ -521,7 +512,6 @@ def parse_args(argv: Sequence[str] | None = None) -> EgoCliArgs:
         config=namespace.config,
         seed=namespace.seed,
         output_dir=namespace.output_dir,
-        max_steps=namespace.max_steps,
         ddp_mode=namespace.ddp_mode,
         pack_dir=namespace.pack_dir,
         token_budget_per_rank=namespace.token_budget_per_rank,
@@ -726,7 +716,7 @@ def build_s0_manifest(
     sampler: NegativeSampler,
     output_path: Path,
     *,
-    world_size: int = 4,
+    world_size: int,
 ) -> int:
     r"""Write the deduplicated pair-universe TSV the s0 cache must cover.
 
@@ -1335,7 +1325,6 @@ def train_egostitch_ddp_loop(
     accelerator: Accelerator,
     *,
     node_batch: int,
-    max_steps: int | None = None,
 ) -> EgoTrainResult:
     """Run the fixed-epoch Stage-1 training loop (any world size >= 1).
 
@@ -1348,7 +1337,6 @@ def train_egostitch_ddp_loop(
         data: The assembled data bundle.
         accelerator: The (DDP or single-process) accelerator.
         node_batch: Per-rank ``B_n`` (the orchestrator-selected candidate).
-        max_steps: DEBUG-ONLY bound on total optimizer steps.
 
     Returns:
         The `EgoTrainResult`.
@@ -1398,8 +1386,6 @@ def train_egostitch_ddp_loop(
     total_wall = 0.0
     total_data_wait = 0.0
     total_validation_seconds = 0.0
-    stop = False
-
     for epoch in range(1, cfg.optim.epochs + 1):
         epoch_started = time.monotonic()
         epoch_data_wait = 0.0
@@ -1437,9 +1423,6 @@ def train_egostitch_ddp_loop(
             epoch_local_pairs += batch.edge_rows_true
             epoch_local_tokens += batch.f0_rows_gathered
             epoch_global_pairs += batch.edge_rows_global
-            if max_steps is not None and global_step >= max_steps:
-                stop = True
-                break
 
         val_started = time.monotonic()
         metrics = _validate_epoch(model, data, accelerator, edge_batch=cfg.data.edge_batch)
@@ -1490,8 +1473,6 @@ def train_egostitch_ddp_loop(
         total_validation_seconds += validation_seconds
         total_local_pairs += epoch_local_pairs
         total_local_tokens += epoch_local_tokens
-        if stop:
-            break
 
     # ---- runtime profile (the exact orchestrator-validated schema)
     local_peak_gib = (
@@ -1595,7 +1576,7 @@ def _config_hash(cfg: EgoConfig) -> str:
     ).hexdigest()
 
 
-def write_run_start_metadata(cfg: EgoConfig, data: EgoStitchData, *, world_size: int = 1) -> None:
+def write_run_start_metadata(cfg: EgoConfig, data: EgoStitchData, *, world_size: int) -> None:
     """Bind the run to config, preregistration, and s0 before optimization."""
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     path = cfg.output_dir / "run_metadata.json"
@@ -1897,12 +1878,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     cfg = apply_overrides(load_config(args.config), args)
 
     if args.write_s0_manifest is not None:
+        world = detect_visible_gpu_count()
         data = assemble_egostitch_data(cfg, require_s0=False)
-        world = cfg.runtime.world_size if cfg.runtime is not None else 0
-        if world == 0:
-            world = torch.cuda.device_count()
-            if world < 1:
-                raise RuntimeError("runtime.world_size=auto requires at least one visible GPU")
         build_s0_manifest(
             cfg,
             data.e_sup_positives,
@@ -1917,22 +1894,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         _run_ddp_worker(cfg, args)
         return
 
-    # Single-process path (debug/smoke; formal runs go through the orchestrator).
-    if not cfg.preregistration.is_file():
-        raise ValueError(f"preregistration file not found: {cfg.preregistration}")
-    set_seed(cfg.seed)
-    accelerator = Accelerator(mixed_precision=cfg.mixed_precision)
-    data = assemble_egostitch_data(cfg)
-    model = EgoStitchStage1(EgoStitchConfig.from_mapping(cfg.model.config))
-    write_run_start_metadata(cfg, data)
-    result = train_egostitch_ddp_loop(
-        model, cfg, data, accelerator, node_batch=cfg.data.node_batch, max_steps=args.max_steps
-    )
-    write_outputs(result, cfg, data)
-    logger.info(
-        "training complete: best epoch %d val AUPRC %.4f",
-        result.best_epoch,
-        result.best_val_metrics.auprc,
+    raise ValueError(
+        "EgoStitch Stage-1 training must run through src.e2_pipeline so the visible "
+        "GPU count is auto-detected and workers are launched with Accelerate DDP"
     )
 
 

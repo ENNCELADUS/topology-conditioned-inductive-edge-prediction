@@ -1,0 +1,10 @@
+2026-07-15 13:48:56,764 INFO __main__: loading checkpoint outputs/archive/pre_e2_alignment_20260711/b0_v31/best.pt (device cuda)
+2026-07-15 13:48:59,102 INFO __main__: resolved 3364731 pairs from file:outputs/s0_cache/manifests/all_seeds.tsv
+2026-07-15 13:48:59,102 INFO __main__: shard 0/16: rows [0, 210296) -> profile_output/s0_scoring_20260715/probe_long_tb262144.shard-0.npz
+2026-07-15 13:49:05,178 INFO __main__: loaded packed feature table from outputs/feature_packs/b0_v31_bf16 in 6.050 seconds
+2026-07-15 13:49:29,757 INFO __main__: scored 50174/210296 rows
+2026-07-15 13:50:05,910 INFO __main__: scored 100106/210296 rows
+2026-07-15 13:51:18,953 INFO __main__: scored 150031/210296 rows
+2026-07-15 13:52:59,017 INFO __main__: scored 200007/210296 rows
+2026-07-15 13:53:25,662 INFO __main__: packed scoring completed 210296 rows in 983 batches over 260.367 seconds (807.7 rows/s)
+2026-07-15 13:53:25,896 INFO __main__: wrote 210296 scored rows to profile_output/s0_scoring_20260715/probe_long_tb262144.shard-0.npz

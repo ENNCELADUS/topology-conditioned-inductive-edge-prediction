@@ -27,7 +27,7 @@ to the exact count in their retained artifacts.
 
 | Item | Fixed value |
 |---|---|
-| SSH | `ssh -p 30838 root@10.15.171.204` |
+| SSH | `ssh -p 30349 root@10.15.171.204` |
 | Repository | `/2023533015/topology-conditioned-inductive-edge-prediction` |
 | GPU | 1 or more NVIDIA H20, 97,871 MiB each |
 | NVIDIA driver | 550.144.03 |
@@ -49,7 +49,7 @@ G3 is a direct single-process cached-score analysis command outside `run.sh`.
 Connect, enter the fixed checkout, and verify the container before any experiment:
 
 ```bash
-ssh -p 30838 root@10.15.171.204
+ssh -p 30349 root@10.15.171.204
 cd /2023533015/topology-conditioned-inductive-edge-prediction
 hpc/run.sh check
 ```
@@ -78,6 +78,18 @@ Score the candidate universe once per checkpoint. `run.sh score` always injects
 GPU and publishes the final output only after strict `score_universe merge` validation.
 For V3.1, pass `--pack-dir` to keep the BF16 token table GPU-resident and avoid repeated
 per-pair feature-file reads.
+
+EgoStitch Stage-1 S0 scoring has a dedicated production entry point. It pins the
+frozen-B0 checkpoint, all-seeds manifest, BF16 feature pack, and the profiled token
+budget, then automatically launches one contiguous shard on every visible H20 and
+strictly merges the shards:
+
+```bash
+hpc/run.sh s0-score
+```
+
+Do not replace this with a direct `src.score_universe` call: the unpacked path repeats
+feature-file I/O per pair and a direct call does not fan out across the visible GPUs.
 
 ```bash
 hpc/run.sh score \

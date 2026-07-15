@@ -129,6 +129,12 @@ class PackedFeatureTable:
         gathered = self.tokens[positions]
         return gathered.masked_fill(~mask.unsqueeze(2), 0), lengths
 
+    def gather_nodes(
+        self, node_indices: torch.Tensor, boundary: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather padded token sequences for arbitrary packed node indices."""
+        return self._gather_endpoint(node_indices, boundary)
+
     def assemble(self, compact: CompactPairBatch) -> dict[str, torch.Tensor]:
         """Assemble a compact pair batch into the padded ``V3_1`` contract."""
         emb_a, len_a = self._gather_endpoint(compact.node_a, compact.bucket_boundary)

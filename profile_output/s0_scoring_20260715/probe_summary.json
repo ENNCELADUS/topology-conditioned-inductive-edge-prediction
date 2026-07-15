@@ -1,0 +1,50 @@
+{
+  "hardware": {
+    "host": "10.15.171.204:30349",
+    "gpus": 2,
+    "gpu_model": "NVIDIA H20",
+    "memory_mib_per_gpu": 97871
+  },
+  "probes": [
+    {
+      "name": "packed_tb262144",
+      "rows": 210296,
+      "token_budget": 262144,
+      "batches": 983,
+      "score_seconds": 260.367,
+      "rows_per_second": 807.7,
+      "total_seconds": 276.725
+    },
+    {
+      "name": "packed_tb1048576",
+      "rows": 210296,
+      "token_budget": 1048576,
+      "batches": 248,
+      "score_seconds": 257.383,
+      "rows_per_second": 817.1,
+      "total_seconds": 274.376
+    },
+    {
+      "name": "packed_cached_encoder_fp32_tb262144",
+      "rows": 52574,
+      "unique_nodes": 8052,
+      "token_budget": 262144,
+      "batches": 244,
+      "pack_load_seconds": 6.347,
+      "encode_cache_seconds": 1.884,
+      "score_seconds": 50.965,
+      "rows_per_second": 1031.6,
+      "total_seconds": 63.929,
+      "reference_rows": 52574,
+      "max_abs_logit_diff": 0.0,
+      "mean_abs_logit_diff": 0.0,
+      "pairs_equal": true
+    }
+  ],
+  "projected_full_dual_gpu": {
+    "pair_count": 3364731,
+    "seconds_approx": 1646,
+    "minutes_approx": 27.4,
+    "speedup_over_unpacked_baseline_approx": 11.0
+  }
+}

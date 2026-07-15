@@ -80,7 +80,7 @@ def _write_config(tmp_path: Path, **overrides: object) -> Path:
 
 
 _RUNTIME: dict[str, Any] = {
-    "world_size": 4,
+    "world_size": "auto",
     "pack_dir": "outputs/pack",
     "pack_workers": 1,
     "loader_workers_per_rank": 0,
@@ -134,11 +134,10 @@ class TestLoadConfig:
         with pytest.raises(ValueError, match="e_sup"):
             te.load_config(path)
 
-    def test_accepts_explicit_world_size(self, tmp_path: Path) -> None:
+    def test_rejects_explicit_world_size(self, tmp_path: Path) -> None:
         runtime = dict(_RUNTIME, world_size=2)
-        cfg = te.load_config(_write_config(tmp_path, runtime=runtime))
-        assert cfg.runtime is not None
-        assert cfg.runtime.world_size == 2
+        with pytest.raises(ValueError, match="must be 'auto'"):
+            te.load_config(_write_config(tmp_path, runtime=runtime))
 
     def test_accepts_auto_world_size(self, tmp_path: Path) -> None:
         runtime = dict(_RUNTIME, world_size="auto")
@@ -176,6 +175,39 @@ class TestParseArgs:
         )
         assert args.write_s0_manifest == tmp_path / "s0.tsv"
         assert args.ddp_mode is None
+
+    def test_direct_training_entry_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="e2_pipeline"):
+            te.main(["--config", str(_write_config(tmp_path))])
+
+    def test_s0_manifest_uses_detected_world_size(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        detected_world_size = 3
+        data = type(
+            "ManifestData",
+            (),
+            {"e_sup_positives": [], "val_pairs": [], "sampler": object()},
+        )()
+        captured: dict[str, object] = {}
+
+        monkeypatch.setattr(te, "detect_visible_gpu_count", lambda: detected_world_size)
+        monkeypatch.setattr(te, "assemble_egostitch_data", lambda *_args, **_kwargs: data)
+
+        def fake_build(*_args: object, **kwargs: object) -> int:
+            captured.update(kwargs)
+            return 0
+
+        monkeypatch.setattr(te, "build_s0_manifest", fake_build)
+        te.main(
+            [
+                "--config",
+                str(_write_config(tmp_path)),
+                "--write-s0-manifest",
+                str(tmp_path / "s0.tsv"),
+            ]
+        )
+        assert captured["world_size"] == detected_world_size
 
 
 # --------------------------------------------------------------------------- toy data bundle
@@ -386,7 +418,7 @@ class TestTrainLoop:
 
     def test_write_outputs_payload_contract(self, tmp_path: Path) -> None:
         cfg, data, result = self._run(tmp_path)
-        te.write_run_start_metadata(cfg, data)
+        te.write_run_start_metadata(cfg, data, world_size=1)
         started = json.loads((cfg.output_dir / "run_metadata.json").read_text())
         assert started["status"] == "started"
         assert started["seed"] == cfg.seed
@@ -416,22 +448,10 @@ class TestTrainLoop:
 
     def test_preregistration_drift_after_start_refuses_finalize(self, tmp_path: Path) -> None:
         cfg, data, result = self._run(tmp_path)
-        te.write_run_start_metadata(cfg, data)
+        te.write_run_start_metadata(cfg, data, world_size=1)
         cfg.preregistration.write_text('{"registration_id": "changed"}\n')
         with pytest.raises(RuntimeError, match="changed after run start"):
             te.write_outputs(result, cfg, data)
-
-    def test_max_steps_bounds_the_run(self, tmp_path: Path) -> None:
-        torch.manual_seed(0)
-        cfg = _toy_cfg(tmp_path)
-        model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
-        data = _toy_bundle(tmp_path, model_cfg)
-        model = EgoStitchStage1(model_cfg)
-        accelerator = Accelerator(mixed_precision="no", cpu=True)
-        result = te.train_egostitch_ddp_loop(
-            model, cfg, data, accelerator, node_batch=cfg.data.node_batch, max_steps=1
-        )
-        assert len(result.history) == 1
 
     def test_batch_factory_deterministic(self, tmp_path: Path) -> None:
         cfg = _toy_cfg(tmp_path)

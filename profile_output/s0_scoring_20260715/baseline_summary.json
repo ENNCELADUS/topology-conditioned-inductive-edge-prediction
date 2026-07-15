@@ -1,0 +1,32 @@
+{
+  "run": "04_s0_score_ws2",
+  "started_at_utc": "2026-07-15T07:59:35Z",
+  "ended_at_utc": "2026-07-15T08:26:47Z",
+  "exit_code": 143,
+  "pair_count": 3364731,
+  "completed_rows": 300053,
+  "feature_probe_unique_nodes": 8070,
+  "feature_probe_seconds_approx": 236,
+  "observed_rows_per_second_approx": 185,
+  "projected_full_runtime_seconds_approx": 18188,
+  "gpu_samples": {
+    "0": {
+      "mean_utilization_percent_all": 7.49375,
+      "mean_utilization_percent_after_probe": 8.84870848708487,
+      "p95_utilization_percent_after_probe": 42.0,
+      "max_memory_mib": 6229
+    },
+    "1": {
+      "mean_utilization_percent_all": 0.0,
+      "mean_utilization_percent_after_probe": 0.0,
+      "p95_utilization_percent_after_probe": 0.0,
+      "max_memory_mib": 3
+    }
+  },
+  "diagnosis": [
+    "The unpacked scorer probes 8070 individual feature files before inference.",
+    "The unpacked dataset reloads endpoint feature files per pair.",
+    "Only one monitored GPU performed work; the second monitored GPU remained idle.",
+    "The production S0 invocation bypassed the existing packed-table and automatic multi-GPU shard paths."
+  ]
+}

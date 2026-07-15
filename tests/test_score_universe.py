@@ -7,6 +7,7 @@ All tests are synthetic: tiny fake feature roots and pair files built under
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import cast
 
@@ -15,7 +16,11 @@ import pytest
 import torch
 import torch.nn as nn
 from src import score_universe
+from src.data import packed_features
 from src.data.artifacts import canonical_pair
+from src.data.distributed_pairs import CompactPairBatch
+from src.data.packed_features import PackedFeatureTable, build_packed_features
+from src.model.B0 import V3_1
 
 INPUT_DIM = 4
 
@@ -72,6 +77,53 @@ def _write_checkpoint(
         },
         path,
     )
+
+
+def test_packed_scoring_caches_encoder_without_changing_logits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    torch.manual_seed(0)
+    model = score_universe.build_model("v3_1", _tiny_v3_1_config())
+    assert isinstance(model, V3_1)
+    model.eval()
+    feature_root = tmp_path / "features"
+    nodes = {
+        "node_00": torch.randn(3, INPUT_DIM),
+        "node_01": torch.randn(4, INPUT_DIM),
+        "node_02": torch.randn(5, INPUT_DIM),
+    }
+    _write_feature_store(feature_root, nodes)
+    pack_root = tmp_path / "pack"
+    monkeypatch.setattr(packed_features, "ProcessPoolExecutor", ThreadPoolExecutor)
+    build_packed_features(feature_root, pack_root, workers=1)
+    pairs = [("node_00", "node_01"), ("node_02", "node_00")]
+
+    table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
+    node_index = table.manifest.node_index()
+    compact = CompactPairBatch(
+        row_ids=torch.tensor([0, 1]),
+        node_a=torch.tensor([node_index[u] for u, _ in pairs]),
+        node_b=torch.tensor([node_index[v] for _, v in pairs]),
+        labels=torch.zeros(2),
+        bucket_boundary=128,
+        global_pair_count=2,
+    )
+    reference_batch = table.assemble(compact)
+    reference_batch["emb_a"] = reference_batch["emb_a"].float()
+    reference_batch["emb_b"] = reference_batch["emb_b"].float()
+    with torch.inference_mode():
+        reference = model(reference_batch)["logits"].numpy().reshape(-1)
+
+    actual = score_universe._score_v3_1_packed(
+        model,
+        pairs,
+        pack_root,
+        device=torch.device("cpu"),
+        amp="off",
+        token_budget=512,
+    )
+
+    np.testing.assert_allclose(actual, reference, rtol=0.0, atol=0.0)
 
 
 def test_load_bare_legacy_checkpoint_with_explicit_model_metadata(tmp_path: Path) -> None:

@@ -583,3 +583,20 @@ def test_packed_table_assembles_the_legacy_batch_contract(
     assert torch.equal(batch["len_b"], torch.tensor([2]))
     assert torch.count_nonzero(batch["emb_a"][0, 3:]) == 0
     assert int(batch["_row_id"][0]) == 9
+
+
+def test_packed_table_gathers_arbitrary_nodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(packed_features, "ProcessPoolExecutor", _SynchronousExecutor)
+    source_root = _write_feature_root(tmp_path / "source", {"node_a": (3, 4), "node_b": (2, 4)})
+    pack_root = tmp_path / "pack"
+    build_packed_features(source_root, pack_root, workers=1)
+    table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
+
+    tokens, lengths = table.gather_nodes(torch.tensor([1, 0]), boundary=4)
+
+    assert lengths.tolist() == [2, 3]
+    assert tokens.shape == (2, 4, 4)
+    assert torch.count_nonzero(tokens[0, 2:]) == 0
+    assert torch.count_nonzero(tokens[1, 3:]) == 0

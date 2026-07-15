@@ -13,6 +13,7 @@ usage() {
 Usage:
   hpc/run.sh check
   hpc/run.sh train <config.yaml> [train args...]
+  hpc/run.sh s0-score
   hpc/run.sh score <score args...>
   hpc/run.sh merge <merge args...>
   hpc/run.sh g1 <g1 args...>
@@ -32,7 +33,8 @@ EgoStitch worker (config-driven budget, spec section 13.13):
       --worker-module src.train_egostitch
 Its one-off s0 manifest (frozen-B0 logit cache pairs) comes from
 `python -m src.train_egostitch --config <cfg> --write-s0-manifest <tsv>`,
-scored once via `hpc/run.sh score --pairs file:<tsv> ...`.
+then `hpc/run.sh s0-score` scores it through the packed-feature, auto-sharded
+multi-GPU fast path.
 
 The score command pins --device cuda --amp bf16. With multiple visible GPUs it
 launches one contiguous shard per GPU, waits for every shard, and strictly merges
@@ -154,6 +156,24 @@ case "${COMMAND}" in
     shift
     [[ -f "${CONFIG_PATH}" ]] || fail "config not found: ${CONFIG_PATH}"
     exec "${PYTHON_BIN}" -m src.e2_pipeline --config "${CONFIG_PATH}" "$@"
+    ;;
+  s0-score)
+    [[ $# -eq 0 ]] || fail "s0-score takes no arguments"
+    readonly S0_CHECKPOINT="outputs/deliverables/b0_v31_breadth_first_20260711/model/best.pt"
+    readonly S0_MANIFEST="outputs/s0_cache/manifests/all_seeds.tsv"
+    readonly S0_PACK_DIR="outputs/feature_packs/b0_v31_bf16"
+    readonly S0_OUTPUT="outputs/s0_cache/b0_v31_egostitch_pairs.npz"
+    [[ -f "${S0_CHECKPOINT}" ]] || fail "S0 checkpoint not found: ${S0_CHECKPOINT}"
+    [[ -f "${S0_MANIFEST}" ]] || fail "S0 manifest not found: ${S0_MANIFEST}"
+    [[ -f "${S0_PACK_DIR}/manifest.json" ]] || fail "S0 feature pack not found: ${S0_PACK_DIR}"
+    parallel_score \
+      --checkpoint "${S0_CHECKPOINT}" \
+      --pairs "file:${S0_MANIFEST}" \
+      --data-root data \
+      --strategy breadth_first \
+      --pack-dir "${S0_PACK_DIR}" \
+      --token-budget 1048576 \
+      --output "${S0_OUTPUT}"
     ;;
   score)
     parallel_score "$@"

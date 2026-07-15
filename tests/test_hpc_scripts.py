@@ -51,7 +51,7 @@ def test_help_is_available_without_the_remote_container(bash_exe: str) -> None:
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    for command in ("check", "train", "score", "merge", "g1", "g2"):
+    for command in ("check", "train", "s0-score", "score", "merge", "g1", "g2"):
         assert f"hpc/run.sh {command}" in result.stdout
     # The EgoStitch Stage-1 worker routes through the same train entry.
     assert "--worker-module src.train_egostitch" in result.stdout
@@ -76,6 +76,9 @@ def test_docs_describe_auto_sized_h20_runtime() -> None:
     readme = (REPO_ROOT / "README.md").read_text()
     claude = (REPO_ROOT / "CLAUDE.md").read_text()
     config = (REPO_ROOT / "configs" / "b0_v31_breadth_first.yaml").read_text()
+    egostitch_config = (
+        REPO_ROOT / "configs" / "egostitch_stage1_breadth_first.yaml"
+    ).read_text()
 
     assert "all visible NVIDIA H20" in " ".join(hpc.split())
     assert "auto-detected" in " ".join(readme.split())
@@ -83,6 +86,7 @@ def test_docs_describe_auto_sized_h20_runtime() -> None:
     assert "verified 2026-07-10" not in hpc
     assert "The verified host" not in readme
     assert "single-H20 container" not in config
+    assert "world_size: auto" in egostitch_config
 
 
 def test_runner_dispatches_to_the_implemented_clis() -> None:
@@ -93,6 +97,17 @@ def test_runner_dispatches_to_the_implemented_clis() -> None:
     assert "-m src.score_universe merge" in text
     assert "-m src.experiments.g1_hardened_e2" in text
     assert "-m src.experiments.g2_ceiling" in text
+
+
+def test_s0_scoring_uses_packed_auto_sharded_fast_path() -> None:
+    text = RUNNER.read_text()
+
+    assert "s0-score)" in text
+    assert "outputs/s0_cache/manifests/all_seeds.tsv" in text
+    assert "outputs/feature_packs/b0_v31_bf16" in text
+    assert '--pack-dir "${S0_PACK_DIR}"' in text
+    assert "--token-budget 1048576" in text
+    assert 'parallel_score \\\n' in text
 
 
 @pytest.mark.parametrize(

@@ -46,6 +46,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any, NamedTuple, cast
 
 import numpy as np
@@ -55,7 +56,6 @@ from numpy.typing import NDArray
 from torch import nn
 
 from src.data.artifacts import canonical_pair, load_candidate_pairs
-from src.data.distributed_pairs import CompactPairBatch
 from src.data.features import FeatureStore, build_f0_matrix
 from src.data.packed_features import PackedFeatureTable
 from src.data.pairs import (
@@ -627,8 +627,16 @@ def _score_v3_1_packed(
     amp: str,
     token_budget: int,
 ) -> NDArray[np.float32]:
-    """Score V3.1 pairs from one GPU-resident packed BF16 feature table."""
+    """Score V3.1 pairs with packed features and cached per-node encodings."""
+    if not isinstance(model, V3_1):
+        raise TypeError(f"packed V3.1 scoring requires V3_1, got {type(model).__name__}")
+    load_started = perf_counter()
     table = PackedFeatureTable.from_pack(pack_dir, device)
+    logger.info(
+        "loaded packed feature table from %s in %.3f seconds",
+        pack_dir,
+        perf_counter() - load_started,
+    )
     node_index = table.manifest.node_index()
     missing = sorted({node for pair in pairs for node in pair if node not in node_index})
     if missing:
@@ -640,28 +648,93 @@ def _score_v3_1_packed(
     node_a = torch.tensor([node_index[u] for u, _ in pairs], dtype=torch.int64)
     node_b = torch.tensor([node_index[v] for _, v in pairs], dtype=torch.int64)
 
+    used_node_indices = sorted({node_index[node] for pair in pairs for node in pair})
+    max_boundary = max(
+        (
+            next(
+                value
+                for value in BUCKET_BOUNDARIES
+                if value >= table.manifest.nodes[index].length
+            )
+            for index in used_node_indices
+        ),
+        default=0,
+    )
+    # V3.1's final encoder normalization returns FP32 even under BF16 autocast.
+    # Preserve that dtype: narrowing this cache changes frozen-B0 logits.
+    cache_dtype = next(model.parameters()).dtype
+    encoded = torch.zeros(
+        (len(table.manifest.nodes), max_boundary, model.d_model),
+        dtype=cache_dtype,
+        device=device,
+    )
+    encode_started = perf_counter()
+    encoded_nodes = 0
+    previous_boundary = 0
+    for boundary in BUCKET_BOUNDARIES:
+        bucket_nodes = [
+            index
+            for index in used_node_indices
+            if previous_boundary < table.manifest.nodes[index].length <= boundary
+        ]
+        previous_boundary = boundary
+        batch_nodes = max(token_budget // boundary, 1)
+        for start in range(0, len(bucket_nodes), batch_nodes):
+            indices = torch.tensor(bucket_nodes[start : start + batch_nodes], dtype=torch.int64)
+            raw_tokens, node_lengths = table.gather_nodes(indices, boundary)
+            if amp == "off":
+                raw_tokens = raw_tokens.to(cache_dtype)
+            with torch.inference_mode(), _autocast_context(device, amp):
+                node_encoded = model.encoder(raw_tokens, node_lengths)
+            device_indices = indices.to(device)
+            encoded[device_indices, :boundary] = node_encoded.to(cache_dtype)
+            encoded_nodes += len(indices)
+    encode_seconds = perf_counter() - encode_started
+    logger.info(
+        "cached %d unique node encodings in %.3f seconds (%.1f nodes/s)",
+        encoded_nodes,
+        encode_seconds,
+        encoded_nodes / encode_seconds if encode_seconds else float("inf"),
+    )
+    packed_lengths = table.lengths
+    del table
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
     out: NDArray[np.float32] = np.empty(len(pairs), dtype=np.float32)
     processed = 0
+    batch_count = 0
+    score_started = perf_counter()
     for batch_indices in sampler:
         row_ids = torch.tensor(batch_indices, dtype=torch.int64)
         max_length = max(max(lengths[index]) for index in batch_indices)
         boundary = next(value for value in BUCKET_BOUNDARIES if value >= max_length)
-        compact = CompactPairBatch(
-            row_ids=row_ids,
-            node_a=node_a.index_select(0, row_ids),
-            node_b=node_b.index_select(0, row_ids),
-            labels=torch.zeros(len(batch_indices), dtype=torch.float32),
-            bucket_boundary=boundary,
-            global_pair_count=len(batch_indices),
-        )
-        batch = table.assemble(compact)
+        pair_a = node_a.index_select(0, row_ids).to(device)
+        pair_b = node_b.index_select(0, row_ids).to(device)
+        len_a = packed_lengths.index_select(0, pair_a)
+        len_b = packed_lengths.index_select(0, pair_b)
         with torch.inference_mode(), _autocast_context(device, amp):
-            logits = cast(torch.Tensor, model(batch)["logits"])
+            pair_repr = model._pair_representation(
+                encoded.index_select(0, pair_a)[:, :boundary],
+                encoded.index_select(0, pair_b)[:, :boundary],
+                len_a,
+                len_b,
+            )
+            logits = model.output_head(pair_repr)
         out[np.asarray(batch_indices, dtype=np.int64)] = (
             logits.detach().to(torch.float32).cpu().numpy().reshape(-1)
         )
         processed += len(batch_indices)
+        batch_count += 1
         _log_progress(processed, len(pairs), len(batch_indices))
+    score_seconds = perf_counter() - score_started
+    logger.info(
+        "packed scoring completed %d rows in %d batches over %.3f seconds (%.1f rows/s)",
+        len(pairs),
+        batch_count,
+        score_seconds,
+        len(pairs) / score_seconds if score_seconds else float("inf"),
+    )
     return out
 
 
