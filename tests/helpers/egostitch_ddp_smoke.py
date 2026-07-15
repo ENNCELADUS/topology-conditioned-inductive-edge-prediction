@@ -156,6 +156,9 @@ def main() -> None:
     model = EgoStitchStage1(model_cfg)
     accelerator = te.build_egostitch_ddp_accelerator("no")
 
+    if accelerator.is_main_process:
+        te.write_run_start_metadata(cfg, data, world_size=accelerator.num_processes)
+    accelerator.wait_for_everyone()
     result = te.train_egostitch_ddp_loop(
         model, cfg, data, accelerator, node_batch=cfg.data.node_batch
     )
