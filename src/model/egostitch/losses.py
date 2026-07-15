@@ -27,6 +27,14 @@ from src.model.egostitch.matching import Assignment
 _SIGMA_MIN = 1e-3
 
 
+def _probability_bce(
+    input: torch.Tensor, target: torch.Tensor, *, reduction: str = "mean"
+) -> torch.Tensor:
+    """Evaluate probability-space BCE in fp32 outside mixed-precision autocast."""
+    with torch.autocast(device_type=input.device.type, enabled=False):
+        return F.binary_cross_entropy(input.float(), target.float(), reduction=reduction)
+
+
 # --------------------------------------------------------------------------- reconstruction
 
 
@@ -77,7 +85,7 @@ def recon_losses(
             adj_true = target_adj[b][t_idx][:, t_idx]
             off_diag = ~torch.eye(s_idx.numel(), dtype=torch.bool, device=device)
             slotadj_terms.append(
-                F.binary_cross_entropy(
+                _probability_bce(
                     torch.clamp(adj_pred[off_diag], 1e-6, 1.0 - 1e-6), adj_true[off_diag]
                 )
             )
@@ -89,7 +97,7 @@ def recon_losses(
     mult = torch.stack(mult_terms).mean() if mult_terms else zero
     slotadj = torch.stack(slotadj_terms).mean() if slotadj_terms else zero
     if gate_logit_terms:
-        gate = F.binary_cross_entropy(
+        gate = _probability_bce(
             torch.clamp(torch.cat(gate_logit_terms), 1e-6, 1.0 - 1e-6),
             torch.cat(gate_label_terms),
         )
@@ -100,7 +108,7 @@ def recon_losses(
     # equal class weight regardless of the match rate.
     pi = torch.clamp(slots.pi, 1e-6, 1.0 - 1e-6)
     labels = matched_mask.float()
-    per_slot = F.binary_cross_entropy(pi, labels, reduction="none")
+    per_slot = _probability_bce(pi, labels, reduction="none")
     n_pos = labels.sum()
     n_neg = (1.0 - labels).sum()
     pos_term = (per_slot * labels).sum() / torch.clamp(n_pos, min=1.0)
@@ -132,7 +140,7 @@ def denoise_losses(
     if not bool(valid.any()):
         return {"feat": zero, "exist": zero}
     feat = F.smooth_l1_loss(denoise.h[valid], target_proj.detach()[valid], reduction="mean")
-    exist = F.binary_cross_entropy(
+    exist = _probability_bce(
         torch.clamp(denoise.pi[valid], 1e-6, 1.0 - 1e-6),
         torch.ones_like(denoise.pi[valid]),
     )

@@ -5,11 +5,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 from src.model.egostitch.config import EgoStitchConfig
-from src.model.egostitch.imagine import SlotSet
+from src.model.egostitch.imagine import DenoiseSlots, SlotSet
 from src.model.egostitch.losses import (
     RandomGIN,
     degree_nll,
+    denoise_losses,
     energy_distance,
     generated_ego_graph,
     generated_ego_stats,
@@ -73,6 +75,33 @@ class TestReconLosses:
         for term in out.values():
             assert bool(torch.isfinite(term))
             assert float(term) >= 0.0
+
+    def test_probability_bce_runs_outside_autocast(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        original_bce = F.binary_cross_entropy
+
+        def guarded_bce(
+            input: torch.Tensor,
+            target: torch.Tensor,
+            weight: torch.Tensor | None = None,
+            size_average: bool | None = None,
+            reduce: bool | None = None,
+            reduction: str = "mean",
+        ) -> torch.Tensor:
+            if torch.is_autocast_enabled("cpu"):
+                raise RuntimeError("probability BCE called under autocast")
+            return original_bce(input, target, weight, size_average, reduce, reduction)
+
+        monkeypatch.setattr(F, "binary_cross_entropy", guarded_bce)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            out = recon_losses(_slots(), _full_assignment(1, 4), **self._targets())
+            denoise = DenoiseSlots(
+                h=torch.randn(1, 2, 4), pi=torch.rand(1, 2), mult=torch.ones(1, 2)
+            )
+            denoise_out = denoise_losses(
+                denoise, target_proj=torch.randn(1, 2, 4), mask=torch.ones(1, 2, dtype=torch.bool)
+            )
+        assert all(bool(torch.isfinite(term)) for term in out.values())
+        assert all(bool(torch.isfinite(term)) for term in denoise_out.values())
 
     def test_perfect_slots_zero_feat_loss(self) -> None:
         targets = self._targets()
