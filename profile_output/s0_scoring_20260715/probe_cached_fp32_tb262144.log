@@ -1,8 +1,0 @@
-2026-07-15 14:13:57,323 INFO __main__: loading checkpoint outputs/archive/pre_e2_alignment_20260711/b0_v31/best.pt (device cuda)
-2026-07-15 14:13:59,409 INFO __main__: resolved 3364731 pairs from file:outputs/s0_cache/manifests/all_seeds.tsv
-2026-07-15 14:13:59,409 INFO __main__: shard 0/64: rows [0, 52574) -> profile_output/s0_scoring_20260715/probe_cached_fp32_tb262144.shard-0.npz
-2026-07-15 14:14:05,779 INFO __main__: loaded packed feature table from outputs/feature_packs/b0_v31_bf16 in 6.347 seconds
-2026-07-15 14:14:07,712 INFO __main__: cached 8052 unique node encodings in 1.884 seconds (4272.9 nodes/s)
-2026-07-15 14:14:53,478 INFO __main__: scored 50084/52574 rows
-2026-07-15 14:14:58,701 INFO __main__: packed scoring completed 52574 rows in 244 batches over 50.965 seconds (1031.6 rows/s)
-2026-07-15 14:14:58,770 INFO __main__: wrote 52574 scored rows to profile_output/s0_scoring_20260715/probe_cached_fp32_tb262144.shard-0.npz

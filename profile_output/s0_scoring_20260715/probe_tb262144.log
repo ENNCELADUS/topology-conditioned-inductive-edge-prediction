@@ -1,5 +1,0 @@
-2026-07-15 13:42:30,327 INFO __main__: loading checkpoint outputs/archive/pre_e2_alignment_20260711/b0_v31/best.pt (device cuda)
-2026-07-15 13:42:32,815 INFO __main__: resolved 3364731 pairs from file:outputs/s0_cache/manifests/all_seeds.tsv
-2026-07-15 13:42:32,815 INFO __main__: shard 0/64: rows [0, 52574) -> profile_output/s0_scoring_20260715/probe_tb262144.shard-0.npz
-2026-07-15 13:43:55,416 INFO __main__: scored 50084/52574 rows
-2026-07-15 13:44:01,940 INFO __main__: wrote 52574 scored rows to profile_output/s0_scoring_20260715/probe_tb262144.shard-0.npz

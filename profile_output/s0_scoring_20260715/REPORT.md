@@ -69,35 +69,18 @@ logits are finite, and its checkpoint ID is `e092537d8cf1e208`. Its SHA-256 is
 
 ## Part B — Profiling instrumentation changelog
 
-| File | Profiling purpose | Cleanup status |
+| Files | Profiling purpose | Final state |
 |---|---|---|
-| `src/score_universe.py` | Added pack-load, encoder-cache, and scoring timing/throughput logs. | Retain for production observability. |
-| `profile_output/s0_scoring_20260715/04_s0_score_ws2.log` | Legacy partial-run progress log. | Profiling-only; removable after acceptance. |
-| `profile_output/s0_scoring_20260715/04_s0_score_ws2.status` | Legacy run exit status and timing. | Profiling-only; removable after acceptance. |
-| `profile_output/s0_scoring_20260715/04_s0_score_ws2_gpu.csv` | Legacy per-GPU utilization and memory samples. | Profiling-only; removable after acceptance. |
-| `profile_output/s0_scoring_20260715/baseline_summary.json` | Machine-readable legacy bottleneck summary. | Profiling-only; removable after acceptance. |
-| `profile_output/s0_scoring_20260715/compare_logits.py` | Compared cached and reference packed logits. | Profiling-only; removable after acceptance. |
-| `profile_output/s0_scoring_20260715/inspect_encoder_dtype.py` | Verified V3.1 encoder output dtype under BF16 autocast. | Profiling-only; removable after acceptance. |
-| `profile_output/s0_scoring_20260715/probe_tb262144.log` | Initial unpacked/packed probe log. | Profiling-only; removable after acceptance. |
-| `profile_output/s0_scoring_20260715/probe_tb262144.time` | Initial probe wall-time record. | Profiling-only; removable after acceptance. |
-| `profile_output/s0_scoring_20260715/probe_long_tb262144.log` | Old packed path at token budget 262,144. | Profiling-only; removable after acceptance. |
-| `profile_output/s0_scoring_20260715/probe_long_tb262144.time` | Old packed 262,144 wall-time record. | Profiling-only; removable after acceptance. |
-| `profile_output/s0_scoring_20260715/probe_long_tb1048576.log` | Old packed path at token budget 1,048,576. | Profiling-only; removable after acceptance. |
-| `profile_output/s0_scoring_20260715/probe_long_tb1048576.time` | Old packed 1,048,576 wall-time record. | Profiling-only; removable after acceptance. |
-| `profile_output/s0_scoring_20260715/probe_cached_tb262144.log` | Rejected BF16 encoder-cache probe. | Profiling-only; removable after acceptance. |
-| `profile_output/s0_scoring_20260715/probe_cached_tb262144.time` | Rejected BF16 cache timing record. | Profiling-only; removable after acceptance. |
-| `profile_output/s0_scoring_20260715/probe_cached_fp32_tb262144.log` | Correct FP32 encoder-cache probe and throughput. | Profiling-only; removable after acceptance. |
-| `profile_output/s0_scoring_20260715/probe_cached_fp32_tb262144.time` | Correct FP32 cache timing record. | Profiling-only; removable after acceptance. |
-| `profile_output/s0_scoring_20260715/probe_summary.json` | Machine-readable controlled-probe summary. | Profiling-only; removable after acceptance. |
-| `profile_output/s0_scoring_20260715/full_dual_10d5436.log` | Formal runner launch and merge log. | Retain as run evidence, or remove after acceptance. |
-| `profile_output/s0_scoring_20260715/full_dual_10d5436.status` | Formal run exit status and wall time. | Retain as run evidence, or remove after acceptance. |
-| `profile_output/s0_scoring_20260715/full_dual_10d5436_shard-0.log` | Formal GPU-0 shard timing/progress log. | Retain as run evidence, or remove after acceptance. |
-| `profile_output/s0_scoring_20260715/full_dual_10d5436_shard-1.log` | Formal GPU-1 shard timing/progress log. | Retain as run evidence, or remove after acceptance. |
-| `profile_output/s0_scoring_20260715/full_run_summary.json` | Machine-readable formal result and speedup. | Retain as run evidence, or remove after acceptance. |
-| `profile_output/s0_scoring_20260715/REPORT.md` | Human-readable profile, recommendations, and changelog. | Retain as run evidence, or remove after acceptance. |
+| `src/score_universe.py` | Pack-load, encoder-cache, and scoring timing/throughput logs. | Retained for production observability. |
+| `full_dual_10d5436.log`, `full_dual_10d5436.status` | Formal dual-H20 launch, merge, exit status, and wall time. | Retained as latest-run evidence. |
+| `full_dual_10d5436_shard-0.log`, `full_dual_10d5436_shard-1.log` | Final per-GPU shard progress and throughput. | Retained as latest-run evidence. |
+| `full_run_summary.json`, `REPORT.md` | Machine-readable result and final human-readable report. | Retained as latest-run evidence. |
+| `04_s0_score_ws2.log`, `04_s0_score_ws2.status`, `04_s0_score_ws2_gpu.csv`, `baseline_summary.json` | Legacy unpacked baseline evidence. | Deleted after final-run acceptance. |
+| `compare_logits.py`, `inspect_encoder_dtype.py` | Temporary correctness and dtype probes. | Deleted after final-run acceptance. |
+| `probe_tb262144.log`, `probe_tb262144.time`, `probe_long_tb262144.log`, `probe_long_tb262144.time`, `probe_long_tb1048576.log`, `probe_long_tb1048576.time` | Legacy and packed token-budget probes. | Deleted after final-run acceptance. |
+| `probe_cached_tb262144.log`, `probe_cached_tb262144.time`, `probe_cached_fp32_tb262144.log`, `probe_cached_fp32_tb262144.time`, `probe_summary.json` | Encoder-cache probes and summary. | Deleted after final-run acceptance. |
+| `run_full_remote.sh`, `full_dual_10d5436_launcher.log`, five temporary probe `.npz` files | Failed launcher and intermediate remote artifacts. | Deleted from local/HPC work areas. |
 
-An unsuccessful temporary `run_full_remote.sh` launcher and its empty launcher
-log were created during profiling, then removed from the local and remote work
-areas. The final run used a foreground SSH command with an explicit status file.
-All remaining profiling-only scripts and raw logs can be removed after the result
-is accepted; the production timing logs in `src/score_universe.py` should remain.
+The final run used a foreground SSH command with an explicit status file. Raw
+legacy/probe artifacts have been removed; only the latest formal-run evidence and
+the low-overhead production timing logs remain.
