@@ -79,7 +79,7 @@ def _write_run_metadata(
     return path
 
 
-def _gate_inputs(tmp_path: Path, *, n_seeds: int = 2) -> dict[str, Any]:
+def _gate_inputs(tmp_path: Path, *, n_seeds: int = 3) -> dict[str, Any]:
     """Toy benchmark + b0cal payload + egostitch universes + prereg binding."""
     universe_path, val_path, data_root = _b0cal_toy_inputs(tmp_path)
     b0cal_dir = tmp_path / "b0cal"
@@ -305,10 +305,19 @@ class TestPreregistrationEnforcement:
 
 class TestRunG5Stage1Pipeline:
     def test_required_diagnostics_cannot_be_omitted(self, tmp_path: Path) -> None:
-        inputs = _gate_inputs(tmp_path, n_seeds=1)
+        inputs = _gate_inputs(tmp_path, n_seeds=3)
         inputs["fidelity_report_paths"] = []
         with pytest.raises(ValueError, match="fidelity report"):
             g5_stage1.run_g5_stage1_pipeline(output_dir=tmp_path / "gate", **inputs)
+
+    def test_single_seed_diagnostic_does_not_require_nonbinding_reports(
+        self, tmp_path: Path
+    ) -> None:
+        inputs = _gate_inputs(tmp_path, n_seeds=1)
+        inputs["fidelity_report_paths"] = []
+        inputs["cost_report_path"] = None
+        payload = g5_stage1.run_g5_stage1_pipeline(output_dir=tmp_path / "gate", **inputs)
+        assert payload["verdict"] == "diagnostic_only"
 
     def test_b0cal_lineage_mismatch_rejected(self, tmp_path: Path) -> None:
         inputs = _gate_inputs(tmp_path, n_seeds=1)
@@ -344,8 +353,8 @@ class TestRunG5Stage1Pipeline:
         guards = _d(payload["guards"])
         assert set(guards) == {"degree_mmd_non_regression", "matched_edge_auprc"}
         ego = _d(payload["egostitch"])
-        assert len(ego["assembled"]) == 2
-        assert len(ego["s0_logit_correlation"]) == 2
+        assert len(ego["assembled"]) == 3
+        assert len(ego["s0_logit_correlation"]) == 3
         # Random-logit egostitch arms should not beat the bar: verdict is cut,
         # and the pre-registered failure reading is written verbatim.
         if payload["verdict"] == "cut":
@@ -382,7 +391,21 @@ class TestRunG5Stage1Pipeline:
     def test_single_seed_caveat_disclosed(self, tmp_path: Path) -> None:
         inputs = _gate_inputs(tmp_path, n_seeds=1)
         payload = g5_stage1.run_g5_stage1_pipeline(output_dir=tmp_path / "gate", **inputs)
-        assert _d(payload["metadata"])["single_seed_caveat"] is not None
+        metadata = _d(payload["metadata"])
+        assert payload["verdict"] == "diagnostic_only"
+        assert metadata["evaluation_mode"] == "single_seed_diagnostic"
+        assert metadata["binding_verdict"] is False
+        assert metadata["single_seed_caveat"] is not None
+        assert all(value is None for value in _d(payload["holm_survives"]).values())
+        assert all(value is None for value in _d(payload["primary_pass"]).values())
+        report = (tmp_path / "gate" / "g5_stage1_tables.md").read_text()
+        assert "NON-BINDING" in report
+        assert "not a G5 pass/cut" in report
+
+    def test_two_seed_formal_shortcut_is_rejected(self, tmp_path: Path) -> None:
+        inputs = _gate_inputs(tmp_path, n_seeds=2)
+        with pytest.raises(ValueError, match="exactly three seeds"):
+            g5_stage1.run_g5_stage1_pipeline(output_dir=tmp_path / "gate", **inputs)
 
 
 class TestCli:

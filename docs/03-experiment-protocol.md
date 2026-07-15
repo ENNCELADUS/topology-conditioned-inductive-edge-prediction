@@ -416,6 +416,13 @@ rule).
    (`steady_state_data_wait_fraction > 0.05`), so Seed 2 and all held-out gate rows
    remain unrun. This is an incomplete execution state, not a G5 decision; see
    `docs/results/G5-stage1-seed0-20260715.md`.
+   **Outer orchestration (revised 2026-07-15):** each seed now completes training,
+   candidate scoring, and a clearly labeled non-binding single-seed topology
+   diagnostic before the next seed begins. The diagnostic cannot produce a G5
+   pass/cut or Holm decision. Changing the model or hyperparameters after inspecting
+   it invalidates this registration and requires a new experiment ID/pre-registration;
+   with unchanged scientific configuration, the remaining seeds may be completed and
+   only their combined three-seed report is the formal verdict.
 
 ### 5.1 Priority order (after gates)
 

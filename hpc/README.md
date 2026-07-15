@@ -86,6 +86,24 @@ seed output directory. A complete training artifact is not a G5 result: the form
 gate additionally requires all three seeds, candidate-universe scoring, fidelity
 diagnostics, and `src.experiments.g5_stage1` evaluation.
 
+The tracked outer runner completes one seed's full diagnostic path before starting
+the next seed:
+
+```bash
+hpc/g5_stage1.sh seed 0   # reuse complete training when valid; then score + diagnose
+hpc/g5_stage1.sh formal   # seed 0 full path -> seed 1 full path -> seed 2 full path -> Holm
+```
+
+Every `seed` invocation writes candidate scores under
+`outputs/egostitch_stage1/seedN/scores/` and an explicitly non-binding report under
+`seedN/topology_diagnostic/`. That report always says `diagnostic_only`; it is not a
+G5 pass/cut and suppresses Holm/pass flags. If inspection causes any model or
+hyperparameter change, stop this experiment and create a new experiment ID and
+pre-registration. If the scientific configuration is unchanged, continue the missing
+seeds; only `formal_gate/` may contain the binding three-seed verdict. The formal
+command fails closed unless each seed's required `fidelity.json` and the shared
+`cost_report.json` exist.
+
 Score the candidate universe once per checkpoint. `run.sh score` always injects
 `--device cuda --amp bf16`; on a multi-GPU node it launches one contiguous shard per
 GPU and publishes the final output only after strict `score_universe merge` validation.

@@ -500,6 +500,11 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 - 2026-07-15: editorial status update after the first formal Stage-1 execution: code
   exists, Seed 0 completed, and the three-seed gate remains incomplete. No normative
   algorithm, data, loss, or execution contract changed.
+- 2026-07-15: added §13.15 per-seed outer orchestration. Each seed now completes
+  training, candidate scoring, and an explicitly non-binding topology diagnostic
+  before the next seed starts; only the final three-seed evaluation may emit the
+  formal Holm pass/cut. Inspecting a single-seed diagnostic preserves the existing
+  registration only if the scientific configuration remains unchanged.
 
 **Open gate-report deliverable:** FLOPs/latency table template (§4.7 commitment —
 delivered with the G5 Stage-1 gate report). Stage-1 code now exists, but the formal
@@ -681,3 +686,18 @@ Stage-1 gate comparators: **B0** (frozen candidate-scores artifact) and **`B0+ca
 `docs/registrations/g5_stage1_preregistration.json`; the training worker records the
 file's sha256 in `run_metadata.json` at run start, and the gate evaluator refuses to
 open held-out metrics if the hashes disagree.
+
+### 13.15 Per-seed orchestration and diagnostic boundary
+
+The outer Stage-1 order is `train(seed s) -> candidate scoring(seed s) -> single-seed
+topology diagnostic(seed s)` for `s = 0, 1, 2`, followed by one formal three-seed
+Holm evaluation. A training or scoring failure stops later seeds but does not suppress
+the completed earlier seed's diagnostic.
+
+The single-seed report is **non-binding**: it must use `verdict = diagnostic_only`,
+must not emit Holm decisions or primary pass flags, and must never be described as a
+G5 pass/cut. If inspection leads to any model or hyperparameter change, the registered
+three-seed experiment is invalidated and continuation requires a new experiment ID and
+new pre-registration. If the scientific configuration is unchanged, the missing seeds
+may be completed and only the combined three-seed report may apply §13.14's formal
+decision rule.

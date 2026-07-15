@@ -10,6 +10,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HPC_DIR = REPO_ROOT / "hpc"
 RUNNER = HPC_DIR / "run.sh"
+G5_RUNNER = HPC_DIR / "g5_stage1.sh"
 
 
 @pytest.fixture(scope="module")
@@ -21,9 +22,13 @@ def bash_exe() -> str:
     return executable
 
 
-def test_hpc_layer_has_only_runner_and_documentation() -> None:
-    """The old scheduler layer is replaced by two directly useful files."""
-    assert sorted(path.name for path in HPC_DIR.iterdir()) == ["README.md", "run.sh"]
+def test_hpc_layer_has_only_runners_and_documentation() -> None:
+    """The old scheduler layer is replaced by direct, tracked runners."""
+    assert sorted(path.name for path in HPC_DIR.iterdir()) == [
+        "README.md",
+        "g5_stage1.sh",
+        "run.sh",
+    ]
     assert not (REPO_ROOT / "slurm").exists()
 
 
@@ -35,6 +40,19 @@ def test_runner_is_valid_executable_bash(bash_exe: str) -> None:
 
     result = subprocess.run(
         [bash_exe, "-n", str(RUNNER)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_g5_runner_is_valid_executable_bash(bash_exe: str) -> None:
+    assert G5_RUNNER.read_text().splitlines()[0] == "#!/usr/bin/env bash"
+    assert "set -euo pipefail" in G5_RUNNER.read_text()
+    assert G5_RUNNER.stat().st_mode & stat.S_IXUSR
+    result = subprocess.run(
+        [bash_exe, "-n", str(G5_RUNNER)],
         capture_output=True,
         text=True,
         check=False,
@@ -55,6 +73,30 @@ def test_help_is_available_without_the_remote_container(bash_exe: str) -> None:
         assert f"hpc/run.sh {command}" in result.stdout
     # The EgoStitch Stage-1 worker routes through the same train entry.
     assert "--worker-module src.train_egostitch" in result.stdout
+
+    g5_result = subprocess.run(
+        [bash_exe, str(G5_RUNNER), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert g5_result.returncode == 0, g5_result.stderr
+    assert "hpc/g5_stage1.sh seed <0|1|2>" in g5_result.stdout
+    assert "non-binding single-seed topology diagnostic" in g5_result.stdout
+
+
+def test_g5_runner_completes_each_seed_before_formal_holm() -> None:
+    text = G5_RUNNER.read_text()
+    run_seed_body = text[text.index("run_seed()") : text.index("run_formal()")]
+    assert run_seed_body.index("hpc/run.sh train") < run_seed_body.index("hpc/run.sh score")
+    assert run_seed_body.index("hpc/run.sh score") < run_seed_body.index(
+        "-m src.experiments.g5_stage1"
+    )
+    formal_body = text[text.index("run_formal()") :]
+    assert formal_body.index('run_seed "${seed}"') < formal_body.index(
+        '--output-dir "${FORMAL_ROOT}/formal_gate"'
+    )
+    assert "model or hyperparameter change" in text
 
 
 def test_runner_discovers_visible_h20s() -> None:

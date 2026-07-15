@@ -1,6 +1,7 @@
 r"""G5 Stage-1 gate evaluation: pre-registered EgoStitch-vs-comparator decision.
 
-Evaluates the 3-seed EgoStitch Stage-1 candidate-score artifacts against the
+Evaluates either one seed as an explicitly non-binding topology diagnostic or
+the three pre-registered EgoStitch Stage-1 seeds as the formal gate against the
 frozen comparators (B0 recomputed from its cached artifact; the B0+cal arms
 from the committed kill-test payload) under the pre-registered criteria
 (docs/registrations/g5_stage1_preregistration.json; protocol Sec 5.0.5/5.2):
@@ -14,7 +15,8 @@ from the committed kill-test payload) under the pre-registered criteria
   pre-registered nearest-threshold rule).
 - **Guards**: degree-MMD non-regression (<= 1.10x B0); matched edge AUPRC
   (degree-corrected ratio-1, within 0.02 of B0).
-- **Verdict**: ``"pass"`` or ``"cut"``; on cut the pre-registered failure
+- **Verdict**: one seed always yields ``"diagnostic_only"``; exactly three
+  seeds yield ``"pass"`` or ``"cut"`` and, on cut, the pre-registered failure
   reading is written verbatim — criteria are never edited post hoc.
 
 CLI::
@@ -451,10 +453,10 @@ def run_g5_stage1_pipeline(
         output_dir: Directory for ``g5_stage1_results.json`` / ``_tables.md``.
         seed: Evaluation seed (bootstrap resampling only; training seeds live
             in the artifacts).
-        fidelity_report_paths: Required per-seed fidelity JSONs
-            (`src.eval.ego_fidelity` outputs), embedded verbatim.
-        cost_report_path: Required FLOPs/wall-clock JSON (proposal Sec 4.7
-            R = 0 commitment), embedded verbatim.
+        fidelity_report_paths: Per-seed fidelity JSONs (`src.eval.ego_fidelity`
+            outputs), embedded verbatim and required for the formal 3-seed gate.
+        cost_report_path: FLOPs/wall-clock JSON (proposal Sec 4.7 R = 0
+            commitment), embedded verbatim and required for the formal gate.
 
     Returns:
         The JSON-ready payload (also written to disk).
@@ -463,16 +465,26 @@ def run_g5_stage1_pipeline(
         PreregistrationMismatch: Before any metric is computed, on hash drift.
         ValueError: On artifact validation failures.
     """
-    if len(egostitch_universe_paths) != len(run_metadata_paths):
+    n_runs = len(egostitch_universe_paths)
+    if n_runs != len(run_metadata_paths):
         raise ValueError("one --run-metadata per --egostitch-universe is required")
+    if n_runs not in (1, 3):
+        raise ValueError(
+            "G5 Stage-1 evaluation requires either one seed for a non-binding "
+            "diagnostic or exactly three seeds for the formal Holm verdict"
+        )
+    formal = n_runs == 3
 
     # (1) Pre-registration enforcement FIRST — no scores are opened before this.
     prereg_sha = enforce_preregistration(preregistration_path, run_metadata_paths)
     prereg = cast(dict[str, object], json.loads(preregistration_path.read_text(encoding="utf-8")))
     enforce_frozen_inputs(prereg, preregistration_path, b0_universe_path)
-    fidelity, cost_report = _load_required_diagnostics(
-        fidelity_report_paths, cost_report_path, len(egostitch_universe_paths)
-    )
+    if formal:
+        fidelity, cost_report = _load_required_diagnostics(
+            fidelity_report_paths, cost_report_path, n_runs
+        )
+    else:
+        fidelity, cost_report = [], None
     run_metadata = [
         cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
         for path in run_metadata_paths
@@ -651,15 +663,24 @@ def run_g5_stage1_pipeline(
             {name: cast(float, comparators[name]["relative_density"]) for name in _COMPARATORS},
         ),
     }
-    holm = holm_step_down({name: criteria[name].p_value for name in _PRIMARY_FAMILY}, holm_alpha)
-    primary_pass = {
-        name: bool(
-            holm[name]
-            and criteria[name].dominates_every_comparator
-            and (name != "clustering_mmd_ratio" or criteria[name].ci_excludes_zero)
+    holm: dict[str, bool | None]
+    primary_pass: dict[str, bool | None]
+    if formal:
+        formal_holm = holm_step_down(
+            {name: criteria[name].p_value for name in _PRIMARY_FAMILY}, holm_alpha
         )
-        for name in _PRIMARY_FAMILY
-    }
+        holm = dict(formal_holm)
+        primary_pass = {
+            name: bool(
+                formal_holm[name]
+                and criteria[name].dominates_every_comparator
+                and (name != "clustering_mmd_ratio" or criteria[name].ci_excludes_zero)
+            )
+            for name in _PRIMARY_FAMILY
+        }
+    else:
+        holm = dict.fromkeys(_PRIMARY_FAMILY)
+        primary_pass = dict.fromkeys(_PRIMARY_FAMILY)
 
     # (5) Guards.
     ego_degree_mean = float(np.mean([row.mmd_ratio["degree"] for row in ego_rows]))
@@ -680,14 +701,34 @@ def run_g5_stage1_pipeline(
         },
     }
 
-    verdict = "pass" if all(primary_pass.values()) and degree_guard and auprc_guard else "cut"
+    if formal:
+        verdict = (
+            "pass"
+            if all(value is True for value in primary_pass.values())
+            and degree_guard
+            and auprc_guard
+            else "cut"
+        )
+    else:
+        verdict = "diagnostic_only"
 
     payload: dict[str, object] = {
         "metadata": {
             "preregistration_sha256": prereg_sha,
             "preregistration_path": str(preregistration_path),
             "benchmark": {"benchmark_a": strategy},
-            "n_seeds": len(egostitch_universe_paths),
+            "n_seeds": n_runs,
+            "evaluation_mode": "formal_3seed" if formal else "single_seed_diagnostic",
+            "binding_verdict": formal,
+            "continuation_rule": (
+                "This single-seed output is non-binding and is not a G5 pass/cut. "
+                "Changing model or hyperparameters after inspecting it invalidates the "
+                "registered three-seed experiment and requires a new experiment ID and "
+                "pre-registration; with unchanged scientific configuration, seeds 1 and 2 "
+                "may be completed for the formal verdict."
+                if not formal
+                else None
+            ),
             "evaluation_seed": seed,
             "holm_alpha": holm_alpha,
             "matched_rd_rule": (
@@ -697,10 +738,10 @@ def run_g5_stage1_pipeline(
                 "with tie-atomic fallback and residual gap disclosed"
             ),
             "single_seed_caveat": (
-                "with one seed the between-seed variance term is 0; p-values then "
-                "lean entirely on bootstrap variance (clustering) or the SE floor "
-                "(GS/RD) and are disclosed as underpowered"
-                if len(egostitch_universe_paths) < 3
+                "Descriptive metric differences and p-values are shown only as an early "
+                "signal. Holm decisions and primary pass flags are suppressed because the "
+                "pre-registered criteria require three seeds."
+                if not formal
                 else None
             ),
             "s0_correlation_note": (
@@ -769,15 +810,27 @@ def render_tables_markdown(payload: dict[str, object]) -> str:
     comparators = cast(dict[str, dict[str, object]], payload["comparators"])
     ego = cast(dict[str, object], payload["egostitch"])
     criteria = cast(dict[str, dict[str, object]], payload["criteria"])
-    holm = cast(dict[str, bool], payload["holm_survives"])
-    primary_pass = cast(dict[str, bool], payload["primary_pass"])
+    holm = cast(dict[str, bool | None], payload["holm_survives"])
+    primary_pass = cast(dict[str, bool | None], payload["primary_pass"])
     guards = cast(dict[str, dict[str, object]], payload["guards"])
+    metadata = cast(dict[str, object], payload["metadata"])
+    formal = bool(metadata["binding_verdict"])
 
     lines: list[str] = [
-        "# G5 Stage-1 gate report",
+        "# G5 Stage-1 gate report" if formal else "# G5 Stage-1 single-seed topology diagnostic",
         "",
         f"**Verdict: `{payload['verdict']}`**",
         "",
+    ]
+    if not formal:
+        lines += [
+            "**NON-BINDING:** This is not a G5 pass/cut. The formal verdict requires ",
+            "seeds 0, 1, and 2 plus the pre-registered Holm procedure.",
+            "",
+            str(metadata["continuation_rule"]),
+            "",
+        ]
+    lines += [
         "## Assembled rows (canonical operating point)",
         "",
         "| arm | GS | BFS-macro RD | degree MMD | clustering MMD | spectral MMD |",
@@ -809,8 +862,9 @@ def render_tables_markdown(payload: dict[str, object]) -> str:
         c = criteria[name]
         lines.append(
             f"| {name} | {_fmt(c['mean_diff'])} | {_fmt(c['se'])} | {_fmt(c['p_value'])} "
-            f"| {holm[name]} | {c['dominates_every_comparator']} | {c['ci_excludes_zero']} "
-            f"| {c['best_comparator']} | **{primary_pass[name]}** |"
+            f"| {_fmt(holm[name])} | {c['dominates_every_comparator']} "
+            f"| {c['ci_excludes_zero']} | {c['best_comparator']} "
+            f"| **{_fmt(primary_pass[name])}** |"
         )
 
     lines += ["", "## Guards", "", "| guard | passed | ego mean | limit |", "|---|---|---|---|"]
@@ -855,8 +909,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strategy", default="breadth_first")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--fidelity-report", type=Path, nargs="+", required=True)
-    parser.add_argument("--cost-report", type=Path, required=True)
+    parser.add_argument(
+        "--fidelity-report",
+        type=Path,
+        nargs="+",
+        default=(),
+        help=(
+            "required per-seed reports for the formal 3-seed gate; omitted for one-seed diagnostic"
+        ),
+    )
+    parser.add_argument(
+        "--cost-report",
+        type=Path,
+        default=None,
+        help="required for the formal 3-seed gate; omitted for one-seed diagnostic",
+    )
     return parser
 
 
@@ -879,10 +946,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.b0cal_results,
         args.preregistration,
         *args.fidelity_report,
-        args.cost_report,
     ]:
         if not path.exists():
             parser.error(f"input not found: {path}")
+    if args.cost_report is not None and not args.cost_report.exists():
+        parser.error(f"input not found: {args.cost_report}")
 
     run_g5_stage1_pipeline(
         egostitch_universe_paths=args.egostitch_universe,
