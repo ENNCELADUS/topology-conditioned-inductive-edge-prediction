@@ -43,7 +43,7 @@ from typing import cast
 import numpy as np
 import torch
 import yaml  # type: ignore[import-untyped]
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 from numpy.typing import NDArray
 
@@ -77,7 +77,6 @@ from src.train_b0 import (
     _run_timed_epoch_probe,
     _state_digest,
     _write_json_rank_zero,
-    build_ddp_accelerator,
 )
 
 logger = logging.getLogger(__name__)
@@ -87,6 +86,17 @@ _FEATURES_SUBDIR = Path("features") / "frozen_node_features_1024"
 _PACK_F0_FILENAME = "f0_matrix.pt"
 _PACK_GROUNDING_FILENAME = "grounding.npz"
 _PACK_MANIFEST_FILENAME = "manifest.json"
+
+
+def build_egostitch_ddp_accelerator(mixed_precision: str) -> Accelerator:
+    """Build DDP with detection for EgoStitch's conditionally unused heads."""
+    kwargs = DistributedDataParallelKwargs(
+        broadcast_buffers=False,
+        find_unused_parameters=True,
+        gradient_as_bucket_view=True,
+    )
+    return Accelerator(mixed_precision=mixed_precision, kwargs_handlers=[kwargs])
+
 
 # Frozen audited B0 checkpoint providing s0 (spec Sec 13.10); overridable in
 # the config only for synthetic-fixture tests.
@@ -1810,7 +1820,7 @@ def _run_ddp_worker(cfg: EgoConfig, args: EgoCliArgs) -> None:
     if not cfg.preregistration.is_file():
         raise ValueError(f"preregistration file not found: {cfg.preregistration}")
 
-    accelerator = build_ddp_accelerator(cfg.mixed_precision)
+    accelerator = build_egostitch_ddp_accelerator(cfg.mixed_precision)
     set_seed(cfg.seed)
     logger.info(
         "egostitch ddp worker mode=%s rank=%d/%d device=%s",

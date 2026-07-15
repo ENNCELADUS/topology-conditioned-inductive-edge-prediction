@@ -99,6 +99,15 @@ _RUNTIME: dict[str, Any] = {
 }
 
 
+def test_ddp_accelerator_detects_conditionally_unused_parameters() -> None:
+    accelerator = te.build_egostitch_ddp_accelerator("no")
+    handler = accelerator.ddp_handler
+    assert handler is not None
+    assert handler.broadcast_buffers is False
+    assert handler.find_unused_parameters is True
+    assert handler.gradient_as_bucket_view is True
+
+
 class TestLoadConfig:
     def test_round_trip(self, tmp_path: Path) -> None:
         cfg = te.load_config(_write_config(tmp_path))
