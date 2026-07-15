@@ -45,7 +45,7 @@ mixed_precision: "bf16"
 preregistration: docs/registrations/g5_stage1_preregistration.json
 
 runtime:
-  world_size: 4
+  world_size: auto                    # all visible NVIDIA H20s
   pack_dir: outputs/feature_packs/egostitch_f0
   pack_workers: 8
   loader_workers_per_rank: 0        # batches are built in-process (F0 row gathers)

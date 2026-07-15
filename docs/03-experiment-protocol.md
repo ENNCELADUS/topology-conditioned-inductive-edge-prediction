@@ -5,7 +5,7 @@
 `04-model-proposal.md` revision 2.1 (approved as a design proposal; **gate G4 was
 signed off later the same day — `05-egostitch-spec.md` is now the implementation
 contract**, including its §9 benchmark binding / data contract and §10–11
-batch-sampler and four-H20 E2 production execution design). Changes:
+batch-sampler and auto-sized H20 E2 production execution design). Changes:
 pre-implementation gates G1–G5, baseline ladder extensions (`B0+cal`, `B3-dist`,
 `B3-full`, `B5`, external attribute-only baselines), trained-on vs held-out metric
 families, ceiling and Oracle reference rows, hard-negative construction for zero-edge
@@ -202,7 +202,8 @@ prioritized in Section 5 (gates first).
   official Graph Similarity and Relative Density over the fixed sampled subgraphs,
   an expressivity/robustness perturbation diagnostic (O'Bray 2106.01098), and the
   full-candidate-universe imbalance view.
-- **Execution acceptance:** E2 uses a fixed 30-epoch four-H20 throughput run. Validation
+- **Execution acceptance:** E2 uses a fixed 30-epoch throughput run across every H20
+  visible to the runner; the DDP world size is automatically detected. Validation
   is executed after every epoch; quality is reported but is not the throughput acceptance gate
   for the first systems-optimization pass. The wall-clock gate is 60 minutes from an empty
   derived-cache path through final training artifacts.
@@ -246,7 +247,7 @@ scored on the same split in run `legacy_v31_s47_20260712T193900Z` (completed 202
 19:53:13 UTC). It reached balanced test AUROC/AUPRC `0.805170/0.818408`; its G1
 degree-corrected ratio-1 row was `0.799577/0.813319`, hard-heuristic
 `0.626746/0.663360`, and hard-feature `0.510083/0.602131`. This is an evaluation
-rerun of a supplied checkpoint, not a replacement for the formal four-H20 E2 training
+rerun of a supplied checkpoint, not a replacement for the formal E2 training
 acceptance or the canonical B0/B0-alt/G3 gate artifacts. The same scores were rerun through
 the official benchmark evaluator on 2026-07-14: global simple-edge RD is `0.978392`,
 BFS-macro GS/RD are `0.381264/0.500179`, and degree/clustering/spectral MMD ratios are

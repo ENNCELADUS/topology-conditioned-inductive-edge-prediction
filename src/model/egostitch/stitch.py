@@ -75,23 +75,32 @@ def sinkhorn_plan(
     Returns:
         Shape ``(B, K, K)`` non-negative alignment plan.
     """
-    # fp32 island: bf16 autocast underflows the log-domain updates.
-    cost = stitch_cost(h_i, h_j, pi_i, pi_j).float()
-    a = (pi_i * m_i).float()
-    b = (pi_j * m_j).float()
-    a = a / torch.clamp(a.sum(dim=-1, keepdim=True), min=1e-8)
-    b = b / torch.clamp(b.sum(dim=-1, keepdim=True), min=1e-8)
-    log_a = stable_log(a)
-    log_b = stable_log(b)
+    # fp32 island: inputs must be promoted before either the cost or marginal
+    # products are formed; casting their bf16 results afterward is too late.
+    with torch.autocast(device_type=h_i.device.type, enabled=False):
+        h_i32, h_j32 = h_i.float(), h_j.float()
+        pi_i32, pi_j32 = pi_i.float(), pi_j.float()
+        m_i32, m_j32 = m_i.float(), m_j.float()
+        cost = stitch_cost(h_i32, h_j32, pi_i32, pi_j32)
+        a = pi_i32 * m_i32
+        b = pi_j32 * m_j32
+        a = a / torch.clamp(a.sum(dim=-1, keepdim=True), min=1e-8)
+        b = b / torch.clamp(b.sum(dim=-1, keepdim=True), min=1e-8)
+        log_a = stable_log(a)
+        log_b = stable_log(b)
 
-    phi = tau / (tau + eps)
-    f = torch.zeros_like(a)
-    g = torch.zeros_like(b)
-    for _ in range(iters):
-        # f-update: f_i = -phi * eps * logsumexp_j((g_j - C_ij)/eps + log b_j)
-        f = -phi * eps * torch.logsumexp((g[:, None, :] - cost) / eps + log_b[:, None, :], dim=2)
-        g = -phi * eps * torch.logsumexp((f[:, :, None] - cost) / eps + log_a[:, :, None], dim=1)
-    plan = torch.exp(
-        (f[:, :, None] + g[:, None, :] - cost) / eps + log_a[:, :, None] + log_b[:, None, :]
-    )
-    return plan.to(h_i.dtype)
+        phi = tau / (tau + eps)
+        f = torch.zeros_like(a)
+        g = torch.zeros_like(b)
+        for _ in range(iters):
+            f = -phi * eps * torch.logsumexp(
+                (g[:, None, :] - cost) / eps + log_b[:, None, :], dim=2
+            )
+            g = -phi * eps * torch.logsumexp(
+                (f[:, :, None] - cost) / eps + log_a[:, :, None], dim=1
+            )
+        return torch.exp(
+            (f[:, :, None] + g[:, None, :] - cost) / eps
+            + log_a[:, :, None]
+            + log_b[:, None, :]
+        )

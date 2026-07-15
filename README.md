@@ -114,7 +114,7 @@ close the topology gap. The complete closeout package is
 
 > **Status: approved (2026-07-09).** Design proposal approved and gate G4 signed off —
 > [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) is the active implementation
-> contract (algorithm spec + benchmark/data contract + four-H20 execution design). Design
+> contract (algorithm spec + benchmark/data contract + auto-sized H20 execution design). Design
 > rationale: [`docs/04-model-proposal.md`](docs/04-model-proposal.md). G1 (including
 > B0-alt), G2, and G3 (Oracle) are complete and support proceeding to implementation.
 
@@ -147,7 +147,7 @@ docs/
   02-methodology.md              abstract method contract + training objective
   03-experiment-protocol.md      run/eval contract: baselines, E1–E7, metrics, gates G1–G5
   04-model-proposal.md           EgoStitch model rationale  (APPROVED 2026-07-09)
-  05-egostitch-spec.md           algorithm + data + 4×H20 spec  ← implementation contract (G4 signed off)
+  05-egostitch-spec.md           algorithm + data + auto-sized H20 spec  ← implementation contract (G4 signed off)
   lit-review-plan.md             review plan, claims K1–K5, terminology guardrail
   results/
     E2-pair-to-topology-gap.md   the motivating result note
@@ -166,7 +166,7 @@ src/
   train_b0.py                    baseline training CLI
   score_universe.py              score-once artifact CLI
 hpc/
-  run.sh                         direct fixed 4×H20 runner
+  run.sh                         direct auto-sized H20 runner
   README.md                      required target environment + exact experiment runbook
 literature/                      curated reference library (gitignored)
   models/                        PDFs by topic; filename YEAR_venue_short_title.pdf
@@ -186,7 +186,7 @@ general graph-ML benchmark. Don't substitute real dataset names unless asked.
 | 2 | [`docs/02-methodology.md`](docs/02-methodology.md) | Method contract + training objective |
 | 3 | [`docs/03-experiment-protocol.md`](docs/03-experiment-protocol.md) | **Source of truth** for what to run and how to grade it |
 | 4 | [`docs/04-model-proposal.md`](docs/04-model-proposal.md) | EgoStitch rationale (approved 2026-07-09) |
-| 5 | [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) | **Implementation contract**: algorithm, data/batch contract, four-H20 execution |
+| 5 | [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) | **Implementation contract**: algorithm, data/batch contract, auto-sized H20 execution |
 | 6 | [`docs/results/E2-pair-to-topology-gap.md`](docs/results/E2-pair-to-topology-gap.md) | Motivating result |
 | 7 | [`docs/lit-review-plan.md`](docs/lit-review-plan.md) | Review plan, claims, terminology guardrail |
 
@@ -207,7 +207,7 @@ target test graph; the queried edge is masked/standardized inside the scaffold. 
 - [x] **E2 — pair-to-topology gap** established (motivating result + figure).
 - [x] **Blueprint, methodology, and experiment protocol** written and locked.
 - [x] **EgoStitch proposal** — approved 2026-07-09; reviewed via novelty check + 5-persona panel.
-- [x] **G4 spec freeze** — [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) signed off (algorithm + benchmark data contract + batch sampler + four-H20 execution).
+- [x] **G4 spec freeze** — [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) signed off (algorithm + benchmark data contract + batch sampler + auto-sized H20 execution).
 - [x] **Baseline + gate pipeline** — benchmark/features, B0/B0-alt training, cached scoring, G1/G2/G3 analyses, and tests are implemented.
 - [x] **G1 + G2** — B0/PA-null, B0-alt architecture replication, and the checkpoint-aligned edge-independence ceiling are complete; the final benchmark-aligned G1 artifacts are under [`outputs/deliverables/g1_graph_metrics_20260714/`](outputs/deliverables/g1_graph_metrics_20260714/).
 - [x] **Latest legacy v3.1 robustness rerun** — canonical G1 confirms that the stronger scorer preserves the topology gap; final artifacts are under [`outputs/deliverables/legacy_g1_graph_metrics_20260714/`](outputs/deliverables/legacy_g1_graph_metrics_20260714/).
@@ -217,19 +217,19 @@ target test graph; the queried edge is masked/standardized inside the scaffold. 
 
 ## HPC execution
 
-The required target environment is a fixed container with 4× NVIDIA H20 GPUs. Run
+The required target environment is a container with one or more NVIDIA H20 GPUs. Run
 `hpc/run.sh check`, then use the same runner for cached scoring and G1/G2; run G3 directly
 over the cached candidate universe. Formal E2
 (B0 V3.1) training runs **only** through `hpc/run.sh train
 configs/b0_v31_breadth_first.yaml`, which drives the production
 `python -m src.e2_pipeline` entry (pack → probe → projection → 30-epoch DDP train via
-`accelerate launch --num_processes 4` across all 4 GPUs); direct
+an auto-detected `accelerate launch --num_processes N` across all visible GPUs); direct
 `python -m src.train_b0 --max-steps N` is debug-only, and `B0-alt` keeps its own direct
 `python -m src.train_b0 --config configs/b0_alt_breadth_first.yaml` training CLI,
 outside this E2-only optimization. The host, repository/data paths, required software
 versions, and the `nohup` form are pinned in [`hpc/README.md`](hpc/README.md). The
-live four-H20 cold-run acceptance is pending, so the 60-minute target is not yet a
-verified result. There is no job scheduler (e.g. Slurm).
+GPU count is recorded with each run, so throughput evidence is interpreted against
+that exact hardware shape. There is no job scheduler (e.g. Slurm).
 
 ## Literature
 

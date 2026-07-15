@@ -47,7 +47,7 @@ eval:
   patience: 8
   eval_every: 1
 runtime:
-  world_size: 4
+  world_size: auto
   pack_dir: outputs/feature_packs/b0_v31_bf16
   pack_workers: 16
   loader_workers_per_rank: 4
@@ -65,4 +65,4 @@ runtime:
   probe_timed_steps: 30
 seed: 47
 output_dir: outputs/b0_v31
-mixed_precision: "bf16" # pinned for the four-H20 E2 target
+mixed_precision: "bf16" # pinned for the H20 E2 target

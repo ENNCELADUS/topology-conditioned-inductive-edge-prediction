@@ -75,6 +75,16 @@ class PreregistrationMismatch(RuntimeError):
     """Raised before any held-out metric is touched (prereg mechanics)."""
 
 
+@dataclass(frozen=True)
+class MatchedRdThreshold:
+    """Discrete threshold selected under the registered global-RD tolerance."""
+
+    threshold: float
+    realized_edges: int
+    rd_gap: float
+    used_fallback: bool
+
+
 def _sha256_file(path: Path) -> str:
     hasher = hashlib.sha256()
     with path.open("rb") as handle:
@@ -107,6 +117,145 @@ def enforce_preregistration(preregistration_path: Path, run_metadata_paths: Sequ
                 "(protocol Sec 5.2.4)"
             )
     return expected
+
+
+def _registered_path(preregistration_path: Path, value: object) -> Path:
+    path = Path(str(value))
+    if path.is_absolute():
+        return path
+    try:
+        repo_root = preregistration_path.resolve().parents[2]
+    except IndexError:
+        repo_root = Path.cwd()
+    return repo_root / path
+
+
+def enforce_frozen_inputs(
+    prereg: dict[str, object], preregistration_path: Path, b0_universe_path: Path
+) -> None:
+    """Verify every registered frozen input before opening held-out scores."""
+    frozen = cast(dict[str, object] | None, prereg.get("frozen_inputs"))
+    if frozen is None:
+        raise PreregistrationMismatch("preregistration has no frozen_inputs binding")
+    required = ("b0_candidate_scores", "g1_results", "g3_results")
+    for name in required:
+        entry = cast(dict[str, object] | None, frozen.get(name))
+        if entry is None or "path" not in entry or "sha256" not in entry:
+            raise PreregistrationMismatch(f"frozen input {name!r} is incompletely registered")
+        path = b0_universe_path if name == "b0_candidate_scores" else _registered_path(
+            preregistration_path, entry["path"]
+        )
+        if not path.is_file():
+            raise PreregistrationMismatch(f"frozen input {name!r} not found: {path}")
+        actual = _sha256_file(path)
+        if actual != entry["sha256"]:
+            raise PreregistrationMismatch(
+                f"frozen input {name!r} sha256 mismatch: {actual} != {entry['sha256']}"
+            )
+
+
+def select_matched_global_rd_threshold(
+    probs: np.ndarray,
+    *,
+    target_edges: int,
+    reference_edges: int,
+    tolerance: float = 0.005,
+) -> MatchedRdThreshold:
+    """Select the nearest discrete threshold satisfying the registered RD gap."""
+    if probs.size == 0:
+        threshold = 1.0
+        realized = 0
+        gap = abs(target_edges) / reference_edges if reference_edges else 0.0
+        if gap > tolerance:
+            raise ValueError("matched global simple-edge RD tolerance cannot be satisfied")
+        return MatchedRdThreshold(threshold, realized, gap, False)
+
+    canonical = density_matched_threshold(probs, target_edges)
+    candidates = [canonical, float(np.nextafter(float(np.max(probs)), math.inf))]
+    candidates.extend(float(value) for value in np.unique(probs))
+    rows: list[tuple[int, float, float]] = []
+    for threshold in candidates:
+        realized = int(np.count_nonzero(probs >= threshold))
+        gap = abs(realized - target_edges) / reference_edges if reference_edges else 0.0
+        rows.append((realized, gap, threshold))
+    realized, gap, threshold = min(
+        rows,
+        key=lambda row: (
+            row[1],
+            abs(row[2] - canonical),
+            -row[2],
+        ),
+    )
+    if gap > tolerance:
+        raise ValueError(
+            "matched global simple-edge RD tolerance cannot be satisfied by an atomic "
+            f"threshold: nearest gap={gap:.6g}, tolerance={tolerance:.6g}"
+        )
+    return MatchedRdThreshold(threshold, realized, gap, threshold != canonical)
+
+
+_FIDELITY_KEYS = {
+    "degree_calibration_curve",
+    "slot_recall_at_k_train",
+    "slot_recall_at_k_test",
+    "slot_adjacency_clustering_correlation",
+    "s_channel_correlation",
+    "self_nonself",
+    "self_loop_rate",
+    "proj_variance_trajectory",
+}
+_COST_KEYS = {"per_node_cached", "per_pair_marginal", "candidate_universe"}
+
+
+def _load_required_diagnostics(
+    fidelity_report_paths: Sequence[Path], cost_report_path: Path | None, n_runs: int
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    if len(fidelity_report_paths) != n_runs:
+        raise ValueError("one required fidelity report per egostitch universe is required")
+    if cost_report_path is None:
+        raise ValueError("the required cost report is missing")
+    fidelity: list[dict[str, object]] = []
+    for path in fidelity_report_paths:
+        report = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+        missing = sorted(_FIDELITY_KEYS - report.keys())
+        if missing:
+            raise ValueError(f"fidelity report {path} is missing keys: {missing}")
+        fidelity.append(report)
+    cost = cast(dict[str, object], json.loads(cost_report_path.read_text(encoding="utf-8")))
+    missing_cost = sorted(_COST_KEYS - cost.keys())
+    if missing_cost or cost.get("harmonization_rounds") != 0:
+        raise ValueError(
+            f"cost report must include {_COST_KEYS} and harmonization_rounds=0"
+        )
+    for key in _COST_KEYS:
+        row = cast(dict[str, object], cost[key])
+        if "flops" not in row or "wall_seconds" not in row:
+            raise ValueError(f"cost report {key!r} requires flops and wall_seconds")
+    return fidelity, cost
+
+
+def _validate_b0cal_lineage(
+    payload: dict[str, object], b0_meta: dict[str, object], b0_row: AssembledRow
+) -> None:
+    metadata = cast(dict[str, object], payload.get("metadata"))
+    artifacts = cast(dict[str, object], metadata.get("artifacts"))
+    registered_meta = cast(dict[str, object], artifacts.get("universe"))
+    for key in ("checkpoint_id", "model_family", "pairs_source", "strategy", "num_rows"):
+        if registered_meta.get(key) != b0_meta.get(key):
+            raise ValueError(
+                f"b0cal lineage mismatch for {key}: "
+                f"{registered_meta.get(key)!r} != {b0_meta.get(key)!r}"
+            )
+    b0cal_b0 = cast(dict[str, object], cast(dict[str, object], payload["assembled"])["b0"])
+    recomputed = _assembled_row_to_dict(b0_row)
+    for key in ("threshold", "graph_similarity", "relative_density"):
+        if not np.isclose(float(cast(float, b0cal_b0[key])), float(cast(float, recomputed[key]))):
+            raise ValueError(f"b0cal B0 row mismatch for {key}")
+    registered_mmd = cast(dict[str, float], b0cal_b0["mmd_ratio"])
+    recomputed_mmd = cast(dict[str, float], recomputed["mmd_ratio"])
+    for stat in ("degree", "clustering", "spectral"):
+        if not np.isclose(registered_mmd[stat], recomputed_mmd[stat]):
+            raise ValueError(f"b0cal B0 row mismatch for mmd_ratio.{stat}")
 
 
 # --------------------------------------------------------------------------- statistics
@@ -302,9 +451,9 @@ def run_g5_stage1_pipeline(
         output_dir: Directory for ``g5_stage1_results.json`` / ``_tables.md``.
         seed: Evaluation seed (bootstrap resampling only; training seeds live
             in the artifacts).
-        fidelity_report_paths: Optional per-seed fidelity JSONs
+        fidelity_report_paths: Required per-seed fidelity JSONs
             (`src.eval.ego_fidelity` outputs), embedded verbatim.
-        cost_report_path: Optional FLOPs/wall-clock JSON (proposal Sec 4.7
+        cost_report_path: Required FLOPs/wall-clock JSON (proposal Sec 4.7
             R = 0 commitment), embedded verbatim.
 
     Returns:
@@ -319,7 +468,17 @@ def run_g5_stage1_pipeline(
 
     # (1) Pre-registration enforcement FIRST — no scores are opened before this.
     prereg_sha = enforce_preregistration(preregistration_path, run_metadata_paths)
-    prereg = json.loads(preregistration_path.read_text(encoding="utf-8"))
+    prereg = cast(
+        dict[str, object], json.loads(preregistration_path.read_text(encoding="utf-8"))
+    )
+    enforce_frozen_inputs(prereg, preregistration_path, b0_universe_path)
+    fidelity, cost_report = _load_required_diagnostics(
+        fidelity_report_paths, cost_report_path, len(egostitch_universe_paths)
+    )
+    run_metadata = [
+        cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+        for path in run_metadata_paths
+    ]
     holm_alpha = float(
         cast(float, cast(dict[str, object], prereg["primary_criteria"]).get("holm_alpha", 0.05))
     )
@@ -347,6 +506,13 @@ def run_g5_stage1_pipeline(
     validate_universe_artifact(
         b0_universe, strategy=strategy, n_test_nodes=n_test_nodes, label="b0 universe"
     )
+    frozen = cast(dict[str, object], prereg["frozen_inputs"])
+    frozen_b0 = cast(dict[str, object], frozen["b0_candidate_scores"])
+    if b0_universe.meta.get("checkpoint_id") != frozen_b0.get("checkpoint_id"):
+        raise PreregistrationMismatch(
+            "frozen input B0 checkpoint_id mismatch: "
+            f"{b0_universe.meta.get('checkpoint_id')!r} != {frozen_b0.get('checkpoint_id')!r}"
+        )
     b0_probs = b0_universe.probs()
     b0_pairs = list(b0_universe.pairs())
     b0_non_self = b0_universe.u_idx != b0_universe.v_idx
@@ -374,6 +540,7 @@ def run_g5_stage1_pipeline(
     b0_auprc = b0_regimes["degree_corrected"]["ratio_1"].auprc
 
     b0cal_payload = json.loads(b0cal_results_path.read_text(encoding="utf-8"))
+    _validate_b0cal_lineage(cast(dict[str, object], b0cal_payload), b0_universe.meta, b0_row)
     b0cal_assembled = cast(dict[str, dict[str, object]], b0cal_payload["assembled"])
     realized = cast(
         dict[str, int],
@@ -395,16 +562,25 @@ def run_g5_stage1_pipeline(
     matched_gs: dict[str, list[float]] = {name: [] for name in _COMPARATORS}
     matched_rd: dict[str, list[float]] = {name: [] for name in _COMPARATORS}
     matched_rd_gap: dict[str, list[float]] = {name: [] for name in _COMPARATORS}
+    matched_rd_fallback: dict[str, list[bool]] = {name: [] for name in _COMPARATORS}
 
     b0_logit_by_pair = {
         pair: float(logit) for pair, logit in zip(b0_pairs, b0_universe.logit.tolist(), strict=True)
     }
 
-    for artifact_path in egostitch_universe_paths:
+    for artifact_path, metadata in zip(
+        egostitch_universe_paths, run_metadata, strict=True
+    ):
         universe = load_scores(artifact_path)
         validate_universe_artifact(
             universe, strategy=strategy, n_test_nodes=n_test_nodes, label=str(artifact_path)
         )
+        if universe.meta.get("model_family") != "egostitch":
+            raise ValueError(f"{artifact_path}: model_family must be 'egostitch'")
+        if metadata.get("checkpoint_id") != universe.meta.get("checkpoint_id"):
+            raise ValueError(f"{artifact_path}: run metadata checkpoint_id mismatch")
+        if metadata.get("s0_checkpoint_id") != frozen_b0.get("checkpoint_id"):
+            raise ValueError(f"{artifact_path}: run metadata s0_checkpoint_id mismatch")
         probs = universe.probs()
         pairs = list(universe.pairs())
         non_self = universe.u_idx != universe.v_idx
@@ -451,15 +627,19 @@ def run_g5_stage1_pipeline(
         # non-self edge count and GS/RD re-evaluated (no bootstrap needed).
         for name in _COMPARATORS:
             quota = realized[name]
-            matched_threshold = density_matched_threshold(probs[non_self], quota)
+            selected = select_matched_global_rd_threshold(
+                probs[non_self], target_edges=quota, reference_edges=target_edges
+            )
+            matched_threshold = selected.threshold
             matched_graph = assemble_graph(pairs, probs, threshold=matched_threshold, nodes=nodes)
             report = evaluate_assembled_graph(matched_graph, g_ref, buckets, config)
             matched_gs[name].append(report.graph_similarity)
             matched_rd[name].append(report.relative_density)
             realized_matched = strip_self_loops(matched_graph).number_of_edges()
-            matched_rd_gap[name].append(
-                abs(realized_matched - quota) / target_edges if target_edges else 0.0
-            )
+            if realized_matched != selected.realized_edges:
+                raise ValueError("matched global simple-edge RD count disagrees with assembly")
+            matched_rd_gap[name].append(selected.rd_gap)
+            matched_rd_fallback[name].append(selected.used_fallback)
 
     # (4) Primary criteria + Holm.
     criteria = {
@@ -506,13 +686,6 @@ def run_g5_stage1_pipeline(
 
     verdict = "pass" if all(primary_pass.values()) and degree_guard and auprc_guard else "cut"
 
-    fidelity = [json.loads(path.read_text(encoding="utf-8")) for path in fidelity_report_paths]
-    cost_report = (
-        json.loads(cost_report_path.read_text(encoding="utf-8"))
-        if cost_report_path is not None
-        else None
-    )
-
     payload: dict[str, object] = {
         "metadata": {
             "preregistration_sha256": prereg_sha,
@@ -523,9 +696,9 @@ def run_g5_stage1_pipeline(
             "holm_alpha": holm_alpha,
             "matched_rd_rule": (
                 "per comparator: egostitch re-assembled at "
-                "density_matched_threshold(probs, comparator realized non-self "
-                "edges) — the pre-registered nearest-threshold operating point; "
-                "the residual quota gap (tie atomicity) is disclosed per row"
+                "nearest discrete threshold to comparator realized non-self edges; "
+                "every row enforces |RD_global(ego)-RD_global(comparator)| <= 0.005, "
+                "with tie-atomic fallback and residual gap disclosed"
             ),
             "single_seed_caveat": (
                 "with one seed the between-seed variance term is 0; p-values then "
@@ -551,6 +724,7 @@ def run_g5_stage1_pipeline(
             "matched_gs": matched_gs,
             "matched_rd": matched_rd,
             "matched_rd_quota_gap": matched_rd_gap,
+            "matched_rd_used_fallback": matched_rd_fallback,
         },
         "criteria": {name: criteria[name].to_jsonable() for name in _PRIMARY_FAMILY},
         "holm_survives": holm,
@@ -685,8 +859,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strategy", default="breadth_first")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--fidelity-report", type=Path, nargs="*", default=[])
-    parser.add_argument("--cost-report", type=Path, default=None)
+    parser.add_argument("--fidelity-report", type=Path, nargs="+", required=True)
+    parser.add_argument("--cost-report", type=Path, required=True)
     return parser
 
 
@@ -708,6 +882,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.b0_universe,
         args.b0cal_results,
         args.preregistration,
+        *args.fidelity_report,
+        args.cost_report,
     ]:
         if not path.exists():
             parser.error(f"input not found: {path}")

@@ -55,8 +55,11 @@ from numpy.typing import NDArray
 from torch import nn
 
 from src.data.artifacts import canonical_pair, load_candidate_pairs
+from src.data.distributed_pairs import CompactPairBatch
 from src.data.features import FeatureStore, build_f0_matrix
+from src.data.packed_features import PackedFeatureTable
 from src.data.pairs import (
+    BUCKET_BOUNDARIES,
     LengthBucketedBatchSampler,
     TokenPairDataset,
     collate_token_pairs,
@@ -615,6 +618,53 @@ def _score_v3_1(
     return out
 
 
+def _score_v3_1_packed(
+    model: nn.Module,
+    pairs: Sequence[tuple[str, str]],
+    pack_dir: Path,
+    *,
+    device: torch.device,
+    amp: str,
+    token_budget: int,
+) -> NDArray[np.float32]:
+    """Score V3.1 pairs from one GPU-resident packed BF16 feature table."""
+    table = PackedFeatureTable.from_pack(pack_dir, device)
+    node_index = table.manifest.node_index()
+    missing = sorted({node for pair in pairs for node in pair if node not in node_index})
+    if missing:
+        raise ValueError(f"packed feature table is missing {len(missing)} nodes: {missing[:5]}")
+
+    lengths_by_node = {record.node_id: record.length for record in table.manifest.nodes}
+    lengths = [(lengths_by_node[u], lengths_by_node[v]) for u, v in pairs]
+    sampler = LengthBucketedBatchSampler(lengths, token_budget=token_budget, shuffle=False)
+    node_a = torch.tensor([node_index[u] for u, _ in pairs], dtype=torch.int64)
+    node_b = torch.tensor([node_index[v] for _, v in pairs], dtype=torch.int64)
+
+    out: NDArray[np.float32] = np.empty(len(pairs), dtype=np.float32)
+    processed = 0
+    for batch_indices in sampler:
+        row_ids = torch.tensor(batch_indices, dtype=torch.int64)
+        max_length = max(max(lengths[index]) for index in batch_indices)
+        boundary = next(value for value in BUCKET_BOUNDARIES if value >= max_length)
+        compact = CompactPairBatch(
+            row_ids=row_ids,
+            node_a=node_a.index_select(0, row_ids),
+            node_b=node_b.index_select(0, row_ids),
+            labels=torch.zeros(len(batch_indices), dtype=torch.float32),
+            bucket_boundary=boundary,
+            global_pair_count=len(batch_indices),
+        )
+        batch = table.assemble(compact)
+        with torch.inference_mode(), _autocast_context(device, amp):
+            logits = cast(torch.Tensor, model(batch)["logits"])
+        out[np.asarray(batch_indices, dtype=np.int64)] = (
+            logits.detach().to(torch.float32).cpu().numpy().reshape(-1)
+        )
+        processed += len(batch_indices)
+        _log_progress(processed, len(pairs), len(batch_indices))
+    return out
+
+
 def _score_f0_mlp(
     model: nn.Module,
     pairs: Sequence[tuple[str, str]],
@@ -910,6 +960,12 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--output", type=Path, required=True, help="output .npz path")
     score.add_argument("--batch-pairs", type=int, default=8192, help="f0_mlp rows per batch")
     score.add_argument("--token-budget", type=int, default=131_072, help="v3_1 tokens per batch")
+    score.add_argument(
+        "--pack-dir",
+        type=Path,
+        default=None,
+        help="GPU-resident packed BF16 feature directory for v3_1 scoring",
+    )
     score.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
     score.add_argument("--amp", choices=["off", "bf16"], default="off")
     score.add_argument(
@@ -1004,9 +1060,24 @@ def _run_score(args: argparse.Namespace) -> None:
     store = FeatureStore(args.data_root / _FEATURES_SUBDIR)
     meta_extra: dict[str, object] = {}
     if model_family == "v3_1":
-        logits = _score_v3_1(
-            model, row_pairs, store, device=device, amp=args.amp, token_budget=args.token_budget
-        )
+        if args.pack_dir is None:
+            logits = _score_v3_1(
+                model,
+                row_pairs,
+                store,
+                device=device,
+                amp=args.amp,
+                token_budget=args.token_budget,
+            )
+        else:
+            logits = _score_v3_1_packed(
+                model,
+                row_pairs,
+                args.pack_dir,
+                device=device,
+                amp=args.amp,
+                token_budget=args.token_budget,
+            )
     elif model_family == "f0_mlp":
         logits = _score_f0_mlp(
             model,

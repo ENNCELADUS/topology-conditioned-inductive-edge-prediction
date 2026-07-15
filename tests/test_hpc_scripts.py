@@ -1,4 +1,4 @@
-"""Static contract tests for the pinned HPC execution layer (four-H20 E2 training)."""
+"""Static contract tests for the auto-sized H20 execution layer."""
 
 import shutil
 import stat
@@ -57,30 +57,29 @@ def test_help_is_available_without_the_remote_container(bash_exe: str) -> None:
     assert "--worker-module src.train_egostitch" in result.stdout
 
 
-def test_runner_pins_the_required_four_h20_target() -> None:
+def test_runner_discovers_visible_h20s() -> None:
     text = RUNNER.read_text()
     for value in (
         "/2023533015/topology-conditioned-inductive-edge-prediction",
         "/2023533015/.uv/bin/uv",
         "NVIDIA H20",
-        "CUDA_VISIBLE_DEVICES=0,1,2,3",
-        "expected exactly 4 visible GPUs",
+        "expected at least one visible GPU",
+        'CUDA_VISIBLE_DEVICES="${GPU_IDS}"',
     ):
         assert value in text
     assert "-m src.e2_pipeline" in text
-    assert "--num_processes 4" in (HPC_DIR / "README.md").read_text()
+    assert "automatically" in (HPC_DIR / "README.md").read_text()
 
 
-def test_docs_mark_live_four_h20_acceptance_as_pending() -> None:
+def test_docs_describe_auto_sized_h20_runtime() -> None:
     hpc = (HPC_DIR / "README.md").read_text()
     readme = (REPO_ROOT / "README.md").read_text()
     claude = (REPO_ROOT / "CLAUDE.md").read_text()
     config = (REPO_ROOT / "configs" / "b0_v31_breadth_first.yaml").read_text()
 
-    pending = "live four-H20 cold-run acceptance is pending"
-    assert pending in " ".join(hpc.split())
-    assert pending in " ".join(readme.split())
-    assert pending in " ".join(claude.split())
+    assert "all visible NVIDIA H20" in " ".join(hpc.split())
+    assert "auto-detected" in " ".join(readme.split())
+    assert "auto-detected" in " ".join(claude.split())
     assert "verified 2026-07-10" not in hpc
     assert "The verified host" not in readme
     assert "single-H20 container" not in config
@@ -114,14 +113,13 @@ def test_primary_docs_reference_only_the_direct_hpc_layer() -> None:
         assert "sbatch" not in text.lower()
 
 
-def test_frozen_specs_pin_four_h20_e2_training() -> None:
+def test_specs_pin_auto_sized_h20_e2_training() -> None:
     spec = (REPO_ROOT / "docs" / "05-egostitch-spec.md").read_text()
     protocol = (REPO_ROOT / "docs" / "03-experiment-protocol.md").read_text()
 
-    assert "4 × NVIDIA H20" in spec
-    assert "accelerate launch --num_processes 4" in spec
-    assert "fix the four-H20 E2 production execution design" in spec
-    assert "fix the single-H20 execution design" not in spec
+    assert "all visible NVIDIA H20" in spec
+    assert "automatically detected" in spec
+    assert "GPU-count-independent H20 execution design" in spec
     assert "60 minutes" in spec
     assert "30 epochs" in spec
     assert "validation after every epoch" in spec

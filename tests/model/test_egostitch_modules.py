@@ -168,6 +168,15 @@ class TestImagineDecoder:
 
 
 class TestSinkhornPlan:
+    def test_bfloat16_inputs_return_fp32_plan(self) -> None:
+        h_i = torch.randn(2, 4, 3, dtype=torch.bfloat16)
+        h_j = torch.randn(2, 4, 3, dtype=torch.bfloat16)
+        pi = torch.rand(2, 4, dtype=torch.bfloat16)
+        mult = torch.ones(2, 4, dtype=torch.bfloat16)
+        plan = sinkhorn_plan(h_i, h_j, pi, pi, mult, mult, iters=3)
+        assert plan.dtype == torch.float32
+        assert bool(torch.isfinite(plan).all())
+
     def test_one_hot_pi_concentrates_on_matching_slots(self) -> None:
         # Side i has one live slot (index 0), side j one live slot (index 1):
         # the plan's mass must concentrate on the (0, 1) cell.

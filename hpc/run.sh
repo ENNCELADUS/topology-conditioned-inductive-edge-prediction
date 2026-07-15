@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Direct runner for the pinned four-H20 container instance.
+# Direct runner for H20 container instances with automatic GPU discovery.
 set -euo pipefail
 
 readonly EXPECTED_REPO_ROOT="/2023533015/topology-conditioned-inductive-edge-prediction"
@@ -20,11 +20,11 @@ Usage:
 
 The train command is the only formal E2 entry: it runs the full
 pack -> probe -> projection -> 30-epoch DDP training pipeline
-(`python -m src.e2_pipeline`) across all 4 visible NVIDIA H20 GPUs via
-`accelerate launch --num_processes 4`. Direct `python -m src.train_b0
+(`python -m src.e2_pipeline`) across all visible NVIDIA H20 GPUs via an
+automatically sized `accelerate launch`. Direct `python -m src.train_b0
 --max-steps N` remains debug-only (bounded smoke runs); it is never a formal
 E2 training run. B0-alt keeps its own direct `python -m src.train_b0` CLI,
-unaffected by this four-H20 routing.
+unaffected by this distributed routing.
 
 Formal EgoStitch Stage-1 training reuses the same orchestrator with the
 EgoStitch worker (config-driven budget, spec section 13.13):
@@ -34,9 +34,10 @@ Its one-off s0 manifest (frozen-B0 logit cache pairs) comes from
 `python -m src.train_egostitch --config <cfg> --write-s0-manifest <tsv>`,
 scored once via `hpc/run.sh score --pairs file:<tsv> ...`.
 
-The score command pins --device cuda --amp bf16. All commands run directly in
-the foreground; score/merge/g1/g2 use a single GPU (cuda:0) while train uses
-all 4 visible NVIDIA H20 GPUs. Use nohup in the calling shell when a run must
+The score command pins --device cuda --amp bf16. With multiple visible GPUs it
+launches one contiguous shard per GPU, waits for every shard, and strictly merges
+them into the requested output. merge/g1/g2 remain single-process while train uses
+all visible NVIDIA H20 GPUs. Use nohup in the calling shell when a run must
 survive disconnects.
 EOF
 }
@@ -62,14 +63,72 @@ assert_runtime() {
   command -v nvidia-smi >/dev/null 2>&1 || fail "nvidia-smi is unavailable"
 
   mapfile -t gpu_names < <(nvidia-smi --query-gpu=name --format=csv,noheader)
-  [[ "${#gpu_names[@]}" -eq 4 ]] || fail "expected exactly 4 visible GPUs, found ${#gpu_names[@]}"
+  [[ "${#gpu_names[@]}" -ge 1 ]] || fail "expected at least one visible GPU"
   for gpu_name in "${gpu_names[@]}"; do
     [[ "${gpu_name}" == "${EXPECTED_GPU_NAME}" ]] || \
       fail "expected all GPUs to be ${EXPECTED_GPU_NAME}, found ${gpu_name}"
   done
+  GPU_COUNT="${#gpu_names[@]}"
+  GPU_IDS="$(seq -s, 0 "$((GPU_COUNT - 1))")"
+  export GPU_COUNT GPU_IDS CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 }
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+parallel_score() {
+  local -a score_args=("$@")
+  local output=""
+  local arg_index
+  for ((arg_index = 0; arg_index < ${#score_args[@]}; arg_index++)); do
+    case "${score_args[arg_index]}" in
+      --output)
+        ((arg_index + 1 < ${#score_args[@]})) || fail "--output requires a path"
+        output="${score_args[arg_index + 1]}"
+        ;;
+      --shard|--num-shards)
+        fail "hpc/run.sh score owns sharding; do not pass ${score_args[arg_index]}"
+        ;;
+    esac
+  done
+  [[ -n "${output}" ]] || fail "score requires --output"
+  [[ "${output}" == *.npz ]] || fail "score output must end in .npz"
+
+  if [[ "${GPU_COUNT}" -eq 1 ]]; then
+    exec "${PYTHON_BIN}" -m src.score_universe score --device cuda --amp bf16 \
+      "${score_args[@]}"
+  fi
+
+  local stem="${output%.npz}"
+  local gpu
+  local rc=0
+  local -a pids=()
+  local -a shard_inputs=()
+  for ((gpu = 0; gpu < GPU_COUNT; gpu++)); do
+    shard_inputs+=("${stem}.shard-${gpu}.npz")
+    echo "launching score shard ${gpu}/${GPU_COUNT} on physical GPU ${gpu}"
+    CUDA_VISIBLE_DEVICES="${gpu}" "${PYTHON_BIN}" -m src.score_universe score \
+      --device cuda --amp bf16 "${score_args[@]}" --shard "${gpu}" \
+      --num-shards "${GPU_COUNT}" >"${stem}.shard-${gpu}.log" 2>&1 &
+    pids+=("$!")
+  done
+
+  trap 'for pid in "${pids[@]}"; do kill -TERM "${pid}" 2>/dev/null || true; done' INT TERM
+  for ((gpu = 0; gpu < GPU_COUNT; gpu++)); do
+    if ! wait "${pids[gpu]}"; then
+      echo "ERROR: score shard ${gpu}/${GPU_COUNT} failed; see ${stem}.shard-${gpu}.log" >&2
+      rc=1
+      break
+    fi
+  done
+  if [[ "${rc}" -ne 0 ]]; then
+    for pid in "${pids[@]}"; do
+      kill -TERM "${pid}" 2>/dev/null || true
+    done
+    wait || true
+    return "${rc}"
+  fi
+  trap - INT TERM
+  "${PYTHON_BIN}" -m src.score_universe merge --inputs "${shard_inputs[@]}" --output "${output}"
+}
+
 export PYTHONUNBUFFERED=1
 export UV_CACHE_DIR="/2023533015/.uv/cache"
 
@@ -82,7 +141,7 @@ case "${COMMAND}" in
     "${UV_BIN}" --version
     nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader
     "${PYTHON_BIN}" -c \
-      'import torch; assert torch.cuda.device_count() == 4; assert all(torch.cuda.get_device_name(i) == "NVIDIA H20" for i in range(4)); print(f"python/torch/cuda={torch.__version__}/{torch.version.cuda}; gpus={[torch.cuda.get_device_name(i) for i in range(4)]}")'
+      'import os, torch; n=int(os.environ["GPU_COUNT"]); assert torch.cuda.device_count() == n; assert all(torch.cuda.get_device_name(i) == "NVIDIA H20" for i in range(n)); print(f"python/torch/cuda={torch.__version__}/{torch.version.cuda}; gpus={[torch.cuda.get_device_name(i) for i in range(n)]}")'
     "${PYTHON_BIN}" -c \
       'from pathlib import Path; from src.data.artifacts import verify_benchmark; print(verify_benchmark(Path("data/benchmark_2025_neurips"), "breadth_first"))'
     "${PYTHON_BIN}" -c \
@@ -97,7 +156,7 @@ case "${COMMAND}" in
     exec "${PYTHON_BIN}" -m src.e2_pipeline --config "${CONFIG_PATH}" "$@"
     ;;
   score)
-    exec "${PYTHON_BIN}" -m src.score_universe score --device cuda --amp bf16 "$@"
+    parallel_score "$@"
     ;;
   merge)
     exec "${PYTHON_BIN}" -m src.score_universe merge "$@"

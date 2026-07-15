@@ -8,7 +8,7 @@ interior weights. Neutral placeholders per repository convention; no dataset nam
 Nothing here changes the model of `04-model-proposal.md` — this document pins the free
 parameters that document left symbolic. §§9–11 (added at sign-off) bind the spec to
 the local benchmark package in `data/`, define the batch-sampler / data contract, and
-fix the four-H20 E2 production execution design.
+fix the GPU-count-independent H20 execution design.
 
 **Freeze rule.** This spec is signed off: implementation may not silently deviate;
 any change is an edit here first, with a one-line rationale in §12 (change log).
@@ -261,7 +261,7 @@ canonical-metric G1 rerun uses `Benchmark-A = breadth_first`, checkpoint
 A later checkpoint-only `v3_1` evaluation rerun uses the frozen score artifact under
 `outputs/runs/legacy_v31_s47_20260712T193900Z/`; its final benchmark-aligned G1 artifact
 set is `outputs/deliverables/legacy_g1_graph_metrics_20260714/`. The rerun does not change the
-formal four-H20 training acceptance contract.
+formal E2 training acceptance contract.
 
 ### 9.2 Feature pipeline (F0/F1)
 
@@ -408,10 +408,11 @@ with per-epoch order shuffling but no negative resampling.
   (`scipy.linear_sum_assignment` on CPU from GPU-computed costs); no inter-process
   interaction.
 
-## 11. E2 production execution design (4 × H20, Hugging Face Accelerate DDP)
+## 11. E2 production execution design (auto-sized H20, Hugging Face Accelerate DDP)
 
-The formal E2 B0 V3.1 run uses 4 × NVIDIA H20 and is launched with
-`accelerate launch --num_processes 4`. A cold acceptance run includes first BF16
+The formal E2 B0 V3.1 run uses all visible NVIDIA H20 GPUs. The runner validates
+that at least one H20 is visible, automatically detects the count `N`, exports those
+devices, and launches `accelerate launch --num_processes N`. A cold acceptance run includes first BF16
 feature-pack construction, bounded batch probes, exactly 30 epochs, validation after
 every epoch, and final artifacts. The complete interval must be at most 60 minutes.
 
@@ -446,6 +447,12 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   Accelerate DDP packed-feature pipeline; fixed the cold-run budget at 60 minutes for
   30 epochs with validation after every epoch. The scorer and checkpoint contracts did
   not change.
+- 2026-07-15: replaced the fixed four-card runtime with automatic visible-H20
+  discovery so the same DDP contract can run on any positive H20 count; per-rank
+  batches, exact coverage, profiling, and configured budgets are unchanged.
+- 2026-07-15: scoring now uses one contiguous shard per visible GPU and strict merge;
+  V3.1 may consume the validated packed BF16 feature table to remove repeated raw
+  feature I/O without changing pair order, logits, or the scores-artifact contract.
 - 2026-07-13: replaced the assembled evaluator's L2-RBF/median-bandwidth raw MMD²
   with the fixed-`σ=1` Gaussian-TV biased MMD² ratio defined in protocol §1;
   removed degree clipping and bound deterministic even/odd reference splitting,
@@ -486,7 +493,7 @@ The checkpoint payload consumed by `score_universe` is unchanged.
     scores; ρ̂_eval logged and consumed by the degree-calibration diagnostic.
   - §13.12 grounding pool pinned: exact top-`n_g` cosine in F0 space, own split side.
   - §13.13 runtime budget: §11's 60-minute pin is E2/B0-specific; the EgoStitch
-    worker budget is config-driven under the same 4×H20 Accelerate DDP layout.
+    worker budget is config-driven under the same auto-sized H20 Accelerate DDP layout.
   - §13.14 Stage-gate comparators: B0 and `B0+cal` (B1/B5 deferred to E3, protocol
     edit of the same date); acceptance criteria pre-registered in
     `docs/registrations/g5_stage1_preregistration.json`.
@@ -636,6 +643,8 @@ precomputed logit caches: training pairs are enumerable offline because the §10
 negative sampler is deterministic in `(seed, epoch, rank)`; candidate/val/test pairs
 come from `score_universe` artifacts. The cache loader **fails loudly** on any
 missing pair or checkpoint-id mismatch. `s0` is never trained through.
+Scoring may use contiguous multi-GPU shards and the validated packed BF16 feature
+table; strict merge restores the original manifest row order and metadata contract.
 
 ### 13.11 Two-pass density self-calibration (Stage-1 scope)
 
@@ -653,8 +662,8 @@ disk-cached with a sha256 manifest.
 ### 13.13 Runtime budget
 
 §11's 60-minute cold-run pin applies to the formal E2 B0 V3.1 run only. The
-EgoStitch worker uses the same 4 × H20 `accelerate launch --num_processes 4`
-layout, the same runtime-profile and checkpoint payload schemas, and a
+EgoStitch worker uses the same automatically detected H20 count and
+`accelerate launch --num_processes N` layout, the same runtime-profile and checkpoint payload schemas, and a
 **config-driven** budget (`runtime.total_budget_seconds`; stage budgets must sum).
 This family's "feature pack" stage = the F0 pooled matrix (§9.2) + grounding-pool
 cache. The orchestrator's probe/projection gating applies against the configured

@@ -19,6 +19,7 @@ from src.e2_pipeline import (
     _publish_staged,
     _rollback_publication,
     build_accelerate_command,
+    detect_visible_gpu_count,
     enforce_projection,
     main,
     parse_pipeline_args,
@@ -116,7 +117,7 @@ def test_failure_json_is_atomic_and_structured(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- command building
 
 
-def test_accelerate_command_pins_four_processes(tmp_path: Path) -> None:
+def test_accelerate_command_uses_resolved_world_size(tmp_path: Path) -> None:
     command = build_accelerate_command(
         accelerate_bin=Path("/venv/bin/accelerate"),
         config_path=Path("configs/b0_v31_breadth_first.yaml"),
@@ -125,8 +126,9 @@ def test_accelerate_command_pins_four_processes(tmp_path: Path) -> None:
         output_dir=tmp_path / "outputs",
         token_budget=524288,
         profile_output=tmp_path / "probe.json",
+        world_size=2,
     )
-    assert command[:4] == ["/venv/bin/accelerate", "launch", "--num_processes", "4"]
+    assert command[:4] == ["/venv/bin/accelerate", "launch", "--num_processes", "2"]
     assert command[-2:] == ["--profile-output", str(tmp_path / "probe.json")]
 
 
@@ -141,6 +143,7 @@ def test_accelerate_command_plumbs_mode_pack_dir_output_dir_and_token_budget(
         output_dir=tmp_path / "outputs",
         token_budget=1048576,
         profile_output=tmp_path / "profile.json",
+        world_size=3,
     )
     assert command[command.index("--mixed_precision") + 1] == "bf16"
     assert command[command.index("-m") + 1] == "src.train_b0"
@@ -149,6 +152,13 @@ def test_accelerate_command_plumbs_mode_pack_dir_output_dir_and_token_budget(
     assert command[command.index("--pack-dir") + 1] == str(tmp_path / "pack")
     assert command[command.index("--output-dir") + 1] == str(tmp_path / "outputs")
     assert command[command.index("--token-budget-per-rank") + 1] == "1048576"
+
+
+def test_detect_visible_gpu_count_uses_cuda_visible_devices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1,3")
+    assert detect_visible_gpu_count() == 2
 
 
 def test_run_command_timeout_kills_the_whole_process_group(tmp_path: Path) -> None:
@@ -242,6 +252,7 @@ def test_build_accelerate_command_worker_module(tmp_path: Path) -> None:
         "output_dir": tmp_path / "out",
         "token_budget": 256,
         "profile_output": tmp_path / "profile.json",
+        "world_size": 2,
     }
     default = build_accelerate_command(**kwargs)  # type: ignore[arg-type]
     assert default[default.index("-m") + 1] == "src.train_b0"

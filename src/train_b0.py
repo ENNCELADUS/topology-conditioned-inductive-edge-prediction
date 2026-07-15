@@ -159,7 +159,11 @@ class EvalConfig:
 
 @dataclass(frozen=True)
 class RuntimeConfig:
-    """Frozen four-H20 runtime and wall-clock budget contract for formal E2 training."""
+    """Runtime and wall-clock budget contract for formal distributed training.
+
+    ``world_size == 0`` means that the orchestrator must use every visible H20.
+    Positive values remain supported for explicit reproducibility checks.
+    """
 
     world_size: int
     pack_dir: Path
@@ -212,7 +216,7 @@ class CliArgs:
         seed: Optional seed override (wins over the config).
         output_dir: Optional output-dir override (wins over the config).
         max_steps: DEBUG ONLY — stop after this many optimizer steps.
-        ddp_mode: Internal four-H20 worker mode (``probe``/``epoch-probe``/``train``)
+        ddp_mode: Internal multi-H20 worker mode (``probe``/``epoch-probe``/``train``)
             launched by ``accelerate launch``; ``None`` selects the legacy
             single-process path. Requires ``pack_dir``, ``token_budget_per_rank``,
             and ``profile_output`` when set.
@@ -418,9 +422,10 @@ def load_config(path: Path) -> Config:
             "probe_timed_steps",
         )
         _check_no_unknown_keys(runtime_raw, runtime_keys, "runtime")
+        world_size_raw = _require(runtime_raw, "world_size", "runtime.")
         runtime = RuntimeConfig(
-            world_size=_as_int(
-                _require(runtime_raw, "world_size", "runtime."), "runtime.world_size"
+            world_size=(
+                0 if world_size_raw == "auto" else _as_int(world_size_raw, "runtime.world_size")
             ),
             pack_dir=Path(
                 _as_str(_require(runtime_raw, "pack_dir", "runtime."), "runtime.pack_dir")
@@ -489,8 +494,8 @@ def load_config(path: Path) -> Config:
             + runtime.artifact_budget_seconds
             + runtime.reserve_seconds
         )
-        if runtime.world_size != 4:
-            raise ValueError("runtime.world_size must be 4 for formal E2 training")
+        if runtime.world_size < 0:
+            raise ValueError("runtime.world_size must be 'auto' or a positive integer")
         if stage_total != runtime.total_budget_seconds:
             raise ValueError(
                 f"runtime stage budgets must sum to {runtime.total_budget_seconds}; "
@@ -537,7 +542,7 @@ def parse_args(argv: Sequence[str] | None = None) -> CliArgs:
         "--ddp-mode",
         choices=DDP_MODES,
         default=None,
-        help="internal four-H20 worker mode (launched by accelerate launch).",
+        help="internal multi-H20 worker mode (launched by accelerate launch).",
     )
     parser.add_argument(
         "--pack-dir",
@@ -1624,7 +1629,7 @@ def _build_packed_v3_1_loaders(
 
 
 def build_ddp_accelerator(mixed_precision: str) -> Accelerator:
-    """Build the four-H20 DDP accelerator with the pinned communication settings.
+    """Build the multi-H20 DDP accelerator with the pinned communication settings.
 
     Args:
         mixed_precision: ``"no"`` or ``"bf16"`` (the formal E2 run pins ``"bf16"``).

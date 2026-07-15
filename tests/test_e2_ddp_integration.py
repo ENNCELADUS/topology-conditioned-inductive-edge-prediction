@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # name to a virtual address it intercepts), which breaks the c10d rendezvous TCPStore.
 # Export PET_LOCAL_ADDR=localhost before running pytest — torchrun's env override for
 # --local-addr — to force the rendezvous onto loopback. Not needed on the fixed
-# four-H20 container.
+# H20 container.
 @pytest.mark.integration
 def test_two_rank_cpu_plan_has_exact_global_coverage(tmp_path: Path) -> None:
     result = subprocess.run(
@@ -98,7 +98,7 @@ def test_two_rank_cpu_runs_real_ddp_train_eval_and_rank_zero_outputs(tmp_path: P
 @pytest.mark.slow
 @pytest.mark.skipif(
     os.environ.get("RUN_E2_H20_ACCEPTANCE") != "1",
-    reason="set RUN_E2_H20_ACCEPTANCE=1 only on the fixed four-H20 container",
+    reason="set RUN_E2_H20_ACCEPTANCE=1 only on an H20 container",
 )
 def test_cold_four_h20_run_meets_budget(tmp_path: Path) -> None:
     result = subprocess.run(

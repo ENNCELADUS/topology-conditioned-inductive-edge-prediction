@@ -1,4 +1,4 @@
-r"""EgoStitch Stage-1 training worker (spec Sec 13; 4xH20 execution per Sec 11/13.13).
+r"""EgoStitch Stage-1 training worker (spec Sec 13; auto-sized H20 DDP).
 
 Drop-in worker for the `src.e2_pipeline` orchestrator: implements the same
 ``--ddp-mode {probe,epoch-probe,train}`` CLI contract, runtime-profile schema,
@@ -10,7 +10,7 @@ reinterpreted for this family as the per-rank node-stream batch size ``B_n``
 
 Launch (formal):
 
-    accelerate launch --num_processes 4 --mixed_precision bf16 \
+    accelerate launch --num_processes <visible-H20-count> --mixed_precision bf16 \
         -m src.train_egostitch --config configs/egostitch_stage1_breadth_first.yaml \
         --ddp-mode train --pack-dir <pack> --output-dir <out> \
         --token-budget-per-rank 256 --profile-output <profile.json>
@@ -346,9 +346,10 @@ def load_config(path: Path) -> EgoConfig:
             "probe_timed_steps",
         )
         _check_no_unknown_keys(runtime_raw, runtime_keys, "runtime")
+        world_size_raw = _require(runtime_raw, "world_size", "runtime.")
         runtime = RuntimeConfig(
-            world_size=_as_int(
-                _require(runtime_raw, "world_size", "runtime."), "runtime.world_size"
+            world_size=(
+                0 if world_size_raw == "auto" else _as_int(world_size_raw, "runtime.world_size")
             ),
             pack_dir=Path(
                 _as_str(_require(runtime_raw, "pack_dir", "runtime."), "runtime.pack_dir")
@@ -406,8 +407,8 @@ def load_config(path: Path) -> EgoConfig:
                 "runtime.probe_timed_steps",
             ),
         )
-        if runtime.world_size != 4:
-            raise ValueError("runtime.world_size must be 4 on the fixed four-H20 target")
+        if runtime.world_size < 0:
+            raise ValueError("runtime.world_size must be 'auto' or a positive integer")
         if not runtime.token_budget_candidates or any(
             candidate <= 0 for candidate in runtime.token_budget_candidates
         ):
@@ -483,7 +484,7 @@ def parse_args(argv: Sequence[str] | None = None) -> EgoCliArgs:
         "--ddp-mode",
         choices=DDP_MODES,
         default=None,
-        help="internal four-H20 worker mode (launched by accelerate launch).",
+        help="internal multi-H20 worker mode (launched by accelerate launch).",
     )
     parser.add_argument("--pack-dir", type=Path, default=None)
     parser.add_argument(
@@ -834,6 +835,7 @@ def assemble_egostitch_data(
 
     operative = sorted(set(benchmark.graph.nodes()) - set(cfg.data.expected_missing_features))
     f0_cache = (pack_dir / _PACK_F0_FILENAME) if pack_dir is not None else cfg.data.f0_cache
+    f0_cache.parent.mkdir(parents=True, exist_ok=True)
     matrix, node_index = build_f0_matrix(store, operative, cache_path=f0_cache)
 
     train_nodes = sorted(set(benchmark.split.train_nodes) & set(operative))
@@ -1587,6 +1589,33 @@ def train_egostitch_ddp_loop(
 # --------------------------------------------------------------------------- artifacts
 
 
+def _config_hash(cfg: EgoConfig) -> str:
+    return hashlib.sha256(
+        json.dumps(config_to_dict(cfg), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def write_run_start_metadata(cfg: EgoConfig, data: EgoStitchData, *, world_size: int = 1) -> None:
+    """Bind the run to config, preregistration, and s0 before optimization."""
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    path = cfg.output_dir / "run_metadata.json"
+    if path.exists():
+        raise FileExistsError(f"run-start metadata already exists: {path}")
+    metadata = {
+        "status": "started",
+        "started_at": datetime.now(UTC).isoformat(),
+        "config_hash": _config_hash(cfg),
+        "preregistration_sha256": _sha256_file(cfg.preregistration),
+        "seed": cfg.seed,
+        "world_size": world_size,
+        "s0_checkpoint_id": cfg.data.s0_checkpoint_id,
+        "partition_seed": cfg.data.partition_seed,
+        "rho_train": data.rho_train,
+        "positives_mode": cfg.data.train_positives,
+    }
+    path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+
 def write_outputs(result: EgoTrainResult, cfg: EgoConfig, data: EgoStitchData) -> None:
     """Write the pinned Task-4 artifacts + the pre-registration binding.
 
@@ -1596,8 +1625,18 @@ def write_outputs(result: EgoTrainResult, cfg: EgoConfig, data: EgoStitchData) -
     the measured ``rho_train``.
     """
     output_dir = cfg.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
     config_dict = config_to_dict(cfg)
+    metadata_path = output_dir / "run_metadata.json"
+    if not metadata_path.is_file():
+        raise RuntimeError("run-start metadata is missing; refuse post-hoc preregistration binding")
+    run_metadata = cast(dict[str, object], json.loads(metadata_path.read_text(encoding="utf-8")))
+    current_prereg_sha = _sha256_file(cfg.preregistration)
+    if run_metadata.get("preregistration_sha256") != current_prereg_sha:
+        raise RuntimeError(
+            "preregistration changed after run start; refusing to finalize artifacts"
+        )
+    if run_metadata.get("config_hash") != _config_hash(cfg):
+        raise RuntimeError("configuration changed after run start; refusing to finalize artifacts")
 
     def payload(
         state: dict[str, torch.Tensor], epoch: int, metrics: EdgeMetrics
@@ -1624,22 +1663,15 @@ def write_outputs(result: EgoTrainResult, cfg: EgoConfig, data: EgoStitchData) -
         for entry in result.history:
             handle.write(json.dumps({**entry, "epoch": int(entry["epoch"])}) + "\n")
 
-    run_metadata = {
-        "config_hash": hashlib.sha256(
-            json.dumps(config_dict, sort_keys=True).encode("utf-8")
-        ).hexdigest(),
-        "checkpoint_id": _state_digest(result.best_state_dict)[:16],
-        "torch_version": str(torch.__version__),
-        "timestamp": datetime.now(UTC).isoformat(),
-        "preregistration_sha256": _sha256_file(cfg.preregistration),
-        "s0_checkpoint_id": cfg.data.s0_checkpoint_id,
-        "partition_seed": cfg.data.partition_seed,
-        "rho_train": data.rho_train,
-        "positives_mode": cfg.data.train_positives,
-    }
-    (output_dir / "run_metadata.json").write_text(
-        json.dumps(run_metadata, indent=2) + "\n", encoding="utf-8"
+    run_metadata.update(
+        {
+            "status": "complete",
+            "checkpoint_id": _state_digest(result.best_state_dict)[:16],
+            "torch_version": str(torch.__version__),
+            "timestamp": datetime.now(UTC).isoformat(),
+        }
     )
+    metadata_path.write_text(json.dumps(run_metadata, indent=2) + "\n", encoding="utf-8")
     logger.info(
         "wrote artifacts to %s (checkpoint_id %s)", output_dir, run_metadata["checkpoint_id"]
     )
@@ -1836,6 +1868,9 @@ def _run_ddp_worker(cfg: EgoConfig, args: EgoCliArgs) -> None:
         logger.info("epoch-probe complete: %.2fs", elapsed)
         return
 
+    if accelerator.is_main_process:
+        write_run_start_metadata(cfg, data, world_size=accelerator.num_processes)
+    accelerator.wait_for_everyone()
     result = train_egostitch_ddp_loop(model, cfg, data, accelerator, node_batch=node_batch)
     if accelerator.is_main_process:
         write_outputs(result, cfg, data)
@@ -1863,7 +1898,11 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.write_s0_manifest is not None:
         data = assemble_egostitch_data(cfg, require_s0=False)
-        world = cfg.runtime.world_size if cfg.runtime is not None else 4
+        world = cfg.runtime.world_size if cfg.runtime is not None else 0
+        if world == 0:
+            world = torch.cuda.device_count()
+            if world < 1:
+                raise RuntimeError("runtime.world_size=auto requires at least one visible GPU")
         build_s0_manifest(
             cfg,
             data.e_sup_positives,
@@ -1885,6 +1924,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     accelerator = Accelerator(mixed_precision=cfg.mixed_precision)
     data = assemble_egostitch_data(cfg)
     model = EgoStitchStage1(EgoStitchConfig.from_mapping(cfg.model.config))
+    write_run_start_metadata(cfg, data)
     result = train_egostitch_ddp_loop(
         model, cfg, data, accelerator, node_batch=cfg.data.node_batch, max_steps=args.max_steps
     )

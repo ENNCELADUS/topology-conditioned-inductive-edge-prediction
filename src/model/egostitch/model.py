@@ -161,8 +161,8 @@ class EgoStitchStage1(nn.Module):
             iters=self.config.sinkhorn_iters,
             tau=self.config.sinkhorn_tau,
         )
-        proj_i = self.proj(x_i).detach()
-        proj_j = self.proj(x_j).detach()
+        proj_i = self.proj(x_i)
+        proj_j = self.proj(x_j)
         logits: torch.Tensor = self.decision(
             s0,
             enc_i.slots,
@@ -177,7 +177,7 @@ class EgoStitchStage1(nn.Module):
 
     def self_logits(self, enc: NodeEncoding, x: torch.Tensor, s0: torch.Tensor) -> torch.Tensor:
         """Single-ego logits for ``(u, u)`` queries (spec Sec 13.9)."""
-        return self.decision.forward_self(s0, enc.slots, self.proj(x).detach(), self.d_hat(enc.tok))
+        return self.decision.forward_self(s0, enc.slots, self.proj(x), self.d_hat(enc.tok))
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Score one pair batch (the repository forward contract).

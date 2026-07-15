@@ -134,10 +134,17 @@ class TestLoadConfig:
         with pytest.raises(ValueError, match="e_sup"):
             te.load_config(path)
 
-    def test_rejects_wrong_world_size(self, tmp_path: Path) -> None:
+    def test_accepts_explicit_world_size(self, tmp_path: Path) -> None:
         runtime = dict(_RUNTIME, world_size=2)
-        with pytest.raises(ValueError, match="world_size"):
-            te.load_config(_write_config(tmp_path, runtime=runtime))
+        cfg = te.load_config(_write_config(tmp_path, runtime=runtime))
+        assert cfg.runtime is not None
+        assert cfg.runtime.world_size == 2
+
+    def test_accepts_auto_world_size(self, tmp_path: Path) -> None:
+        runtime = dict(_RUNTIME, world_size="auto")
+        cfg = te.load_config(_write_config(tmp_path, runtime=runtime))
+        assert cfg.runtime is not None
+        assert cfg.runtime.world_size == 0
 
     def test_rejects_empty_candidates(self, tmp_path: Path) -> None:
         runtime = dict(_RUNTIME, token_budget_candidates=[])
@@ -379,6 +386,11 @@ class TestTrainLoop:
 
     def test_write_outputs_payload_contract(self, tmp_path: Path) -> None:
         cfg, data, result = self._run(tmp_path)
+        te.write_run_start_metadata(cfg, data)
+        started = json.loads((cfg.output_dir / "run_metadata.json").read_text())
+        assert started["status"] == "started"
+        assert started["seed"] == cfg.seed
+        assert started["world_size"] == 1
         te.write_outputs(result, cfg, data)
         payload = torch.load(cfg.output_dir / "best.pt", weights_only=False)
         assert set(payload) == {
@@ -396,9 +408,18 @@ class TestTrainLoop:
         ]
         assert [row["epoch"] for row in rows] == [1, 2]
         metadata = json.loads((cfg.output_dir / "run_metadata.json").read_text())
+        assert metadata["status"] == "complete"
+        assert metadata["started_at"] == started["started_at"]
         assert metadata["preregistration_sha256"] == te._sha256_file(cfg.preregistration)
         assert metadata["s0_checkpoint_id"] == "deadbeefcafefeed"
         assert metadata["rho_train"] == data.rho_train
+
+    def test_preregistration_drift_after_start_refuses_finalize(self, tmp_path: Path) -> None:
+        cfg, data, result = self._run(tmp_path)
+        te.write_run_start_metadata(cfg, data)
+        cfg.preregistration.write_text('{"registration_id": "changed"}\n')
+        with pytest.raises(RuntimeError, match="changed after run start"):
+            te.write_outputs(result, cfg, data)
 
     def test_max_steps_bounds_the_run(self, tmp_path: Path) -> None:
         torch.manual_seed(0)

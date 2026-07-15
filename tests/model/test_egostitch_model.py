@@ -140,6 +140,22 @@ class TestNodeLosses:
 
 
 class TestGradientFlow:
+    def test_pair_score_backpropagates_through_projection(self) -> None:
+        model = _model()
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(name.startswith("imagine.proj."))
+        batch = _pair_batch()
+        with torch.no_grad():
+            enc_i = model.encode_nodes(batch["x_i"], batch["ground_i"])
+            enc_j = model.encode_nodes(batch["x_j"], batch["ground_j"])
+        model.pair_logits(
+            enc_i, enc_j, batch["x_i"], batch["x_j"], batch["s0"]
+        ).sum().backward()  # type: ignore[no-untyped-call]
+        grad = model.proj.weight.grad
+        assert grad is not None
+        assert bool(torch.isfinite(grad).all())
+        assert bool(torch.count_nonzero(grad))
+
     def test_every_trainable_parameter_receives_gradient(self) -> None:
         model = _model()
         node = _node_batch()

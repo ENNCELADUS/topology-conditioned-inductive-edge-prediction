@@ -186,6 +186,17 @@ class TestLoadConfig:
 
         assert cfg.runtime is not None
         assert cfg.runtime.world_size == 4
+
+    def test_loads_auto_world_size_runtime_config(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "cfg.yaml"
+        runtime = _runtime_dict()
+        runtime["world_size"] = "auto"
+        _write_yaml_config(config_path, {"runtime": runtime})
+
+        cfg = load_config(config_path)
+
+        assert cfg.runtime is not None
+        assert cfg.runtime.world_size == 0
         assert cfg.runtime.token_budget_candidates == [262144, 524288, 1048576, 1572864]
         assert cfg.runtime.total_budget_seconds == 3600
 

@@ -35,16 +35,47 @@ _PREREG = {
 }
 
 
-def _write_prereg(tmp_path: Path) -> Path:
+def _write_prereg(tmp_path: Path, b0_path: Path | None = None) -> Path:
     path = tmp_path / "prereg.json"
-    path.write_text(json.dumps(_PREREG, sort_keys=True, indent=2) + "\n")
+    payload = dict(_PREREG)
+    if b0_path is not None:
+        g1_path = tmp_path / "g1_results.json"
+        g3_path = tmp_path / "g3_results.json"
+        g1_path.write_text("{}\n")
+        g3_path.write_text("{}\n")
+        payload["frozen_inputs"] = {
+            "b0_candidate_scores": {
+                "path": str(b0_path),
+                "sha256": hashlib.sha256(b0_path.read_bytes()).hexdigest(),
+                "checkpoint_id": "deadbeefcafefeed",
+            },
+            "g1_results": {
+                "path": str(g1_path),
+                "sha256": hashlib.sha256(g1_path.read_bytes()).hexdigest(),
+            },
+            "g3_results": {
+                "path": str(g3_path),
+                "sha256": hashlib.sha256(g3_path.read_bytes()).hexdigest(),
+            },
+        }
+    path.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n")
     return path
 
 
-def _write_run_metadata(tmp_path: Path, name: str, prereg_path: Path) -> Path:
+def _write_run_metadata(
+    tmp_path: Path, name: str, prereg_path: Path, checkpoint_id: str = "abc"
+) -> Path:
     sha = hashlib.sha256(prereg_path.read_bytes()).hexdigest()
     path = tmp_path / name
-    path.write_text(json.dumps({"preregistration_sha256": sha, "checkpoint_id": "abc"}))
+    path.write_text(
+        json.dumps(
+            {
+                "preregistration_sha256": sha,
+                "checkpoint_id": checkpoint_id,
+                "s0_checkpoint_id": "deadbeefcafefeed",
+            }
+        )
+    )
     return path
 
 
@@ -61,7 +92,7 @@ def _gate_inputs(tmp_path: Path, *, n_seeds: int = 2) -> dict[str, Any]:
         seed=0,
         skip_perturbation_check=True,
     )
-    prereg_path = _write_prereg(tmp_path)
+    prereg_path = _write_prereg(tmp_path, universe_path)
 
     pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
     ego_paths: list[Path] = []
@@ -81,7 +112,39 @@ def _gate_inputs(tmp_path: Path, *, n_seeds: int = 2) -> dict[str, Any]:
             checkpoint_id=f"e60{s}",
         )
         ego_paths.append(path)
-        metadata_paths.append(_write_run_metadata(tmp_path, f"run_metadata_{s}.json", prereg_path))
+        metadata_paths.append(
+            _write_run_metadata(tmp_path, f"run_metadata_{s}.json", prereg_path, f"e60{s}")
+        )
+
+    fidelity_paths: list[Path] = []
+    for s in range(n_seeds):
+        path = tmp_path / f"fidelity_{s}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "degree_calibration_curve": [],
+                    "slot_recall_at_k_train": {},
+                    "slot_recall_at_k_test": {},
+                    "slot_adjacency_clustering_correlation": {},
+                    "s_channel_correlation": {},
+                    "self_nonself": {},
+                    "self_loop_rate": 0.0,
+                    "proj_variance_trajectory": [],
+                }
+            )
+        )
+        fidelity_paths.append(path)
+    cost_path = tmp_path / "cost.json"
+    cost_path.write_text(
+        json.dumps(
+            {
+                "per_node_cached": {"flops": 1.0, "wall_seconds": 1.0},
+                "per_pair_marginal": {"flops": 1.0, "wall_seconds": 1.0},
+                "candidate_universe": {"flops": 1.0, "wall_seconds": 1.0},
+                "harmonization_rounds": 0,
+            }
+        )
+    )
 
     return {
         "egostitch_universe_paths": ego_paths,
@@ -91,6 +154,8 @@ def _gate_inputs(tmp_path: Path, *, n_seeds: int = 2) -> dict[str, Any]:
         "preregistration_path": prereg_path,
         "data_root": data_root,
         "strategy": "toy",
+        "fidelity_report_paths": fidelity_paths,
+        "cost_report_path": cost_path,
     }
 
 
@@ -114,6 +179,21 @@ class TestHolmStepDown:
 
     def test_single_member(self) -> None:
         assert g5_stage1.holm_step_down({"only": 0.04}, 0.05) == {"only": True}
+
+
+class TestMatchedGlobalRdThreshold:
+    def test_tied_scores_within_registered_tolerance(self) -> None:
+        selected = g5_stage1.select_matched_global_rd_threshold(
+            np.array([0.9, 0.8, 0.8, 0.1]), target_edges=2, reference_edges=300
+        )
+        assert selected.realized_edges == 1
+        assert selected.rd_gap == pytest.approx(1.0 / 300.0)
+
+    def test_refuses_atomic_tie_outside_registered_tolerance(self) -> None:
+        with pytest.raises(ValueError, match="matched global simple-edge RD"):
+            g5_stage1.select_matched_global_rd_threshold(
+                np.array([0.9, 0.8, 0.8, 0.1]), target_edges=2, reference_edges=100
+            )
 
 
 def _row(clustering: float, boot_std: float = 0.0, degree: float = 10.0) -> AssembledRow:
@@ -182,6 +262,12 @@ class TestMatchedRdCriterion:
 
 
 class TestPreregistrationEnforcement:
+    def test_frozen_b0_hash_drift_refused_before_metrics(self, tmp_path: Path) -> None:
+        inputs = _gate_inputs(tmp_path, n_seeds=1)
+        Path(inputs["b0_universe_path"]).write_bytes(b"drift")
+        with pytest.raises(g5_stage1.PreregistrationMismatch, match="frozen input"):
+            g5_stage1.run_g5_stage1_pipeline(output_dir=tmp_path / "gate", **inputs)
+
     def test_mismatch_refuses_before_metrics(self, tmp_path: Path) -> None:
         inputs = _gate_inputs(tmp_path, n_seeds=1)
         bad = tmp_path / "bad_metadata.json"
@@ -218,6 +304,21 @@ class TestPreregistrationEnforcement:
 
 
 class TestRunG5Stage1Pipeline:
+    def test_required_diagnostics_cannot_be_omitted(self, tmp_path: Path) -> None:
+        inputs = _gate_inputs(tmp_path, n_seeds=1)
+        inputs["fidelity_report_paths"] = []
+        with pytest.raises(ValueError, match="fidelity report"):
+            g5_stage1.run_g5_stage1_pipeline(output_dir=tmp_path / "gate", **inputs)
+
+    def test_b0cal_lineage_mismatch_rejected(self, tmp_path: Path) -> None:
+        inputs = _gate_inputs(tmp_path, n_seeds=1)
+        path = Path(inputs["b0cal_results_path"])
+        payload = json.loads(path.read_text())
+        payload["metadata"]["artifacts"]["universe"]["checkpoint_id"] = "wrong"
+        path.write_text(json.dumps(payload))
+        with pytest.raises(ValueError, match="b0cal lineage mismatch"):
+            g5_stage1.run_g5_stage1_pipeline(output_dir=tmp_path / "gate", **inputs)
+
     def test_end_to_end_payload_shape(self, tmp_path: Path) -> None:
         inputs = _gate_inputs(tmp_path)
         out_dir = tmp_path / "gate"

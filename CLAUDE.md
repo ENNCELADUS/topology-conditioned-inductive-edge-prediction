@@ -19,7 +19,7 @@ so model implementation is now the next stage.
 `README.md` is the human-facing entry point (orientation, status, structure map,
 reading order). This file (`CLAUDE.md`) holds the binding *constraints* an agent
 must respect. Code lives under `src/`; `docs/05-egostitch-spec.md` (algorithm + data
-contract + four-H20 execution design) and `docs/03-experiment-protocol.md` (what to run, how to
+contract + auto-sized H20 execution design) and `docs/03-experiment-protocol.md` (what to run, how to
 grade) are the contracts it must implement.
 
 ## Repository layout
@@ -35,7 +35,7 @@ docs/
   03-experiment-protocol.md      run/eval contract: baselines, E1–E7, metrics, gates G1–G5
   04-model-proposal.md           EgoStitch model rationale (APPROVED 2026-07-09)
   05-egostitch-spec.md           implementation contract (G4 signed off): algorithm,
-                                 benchmark/data contract, batch sampler, 4×H20 design
+                                 benchmark/data contract, batch sampler, auto-sized H20 design
   lit-review-plan.md             review plan, claims K1–K5, terminology guardrail
   results/E2-pair-to-topology-gap.md   motivating result note
 figures/                         e2-gap.html, positioning.html (standalone, open in browser)
@@ -54,7 +54,7 @@ src/
   score_universe.py  CLI: score pair lists -> pinned .npz scores artifact (shardable)
   experiments/ g1_hardened_e2.py, g2_ceiling.py, g3_oracle.py (gate analyses over cached scores)
 configs/        b0_v31_breadth_first.yaml, b0_alt_breadth_first.yaml
-hpc/            fixed 4×H20 container runner (run.sh + environment/runbook README)
+hpc/            auto-sized H20 container runner (run.sh + environment/runbook README)
 outputs/        run artifacts: checkpoints, metrics, cached score matrices (gitignored)
 tests/          pytest suite mirroring src/ (data/, eval/, experiments/, CLIs, hpc)
 literature/     curated reference library (gitignored, unchanged)
@@ -93,19 +93,19 @@ python -m src.experiments.g2_ceiling    --universe scores/b0_v31_candidate.npz \
     --data-root data --strategy breadth_first --output-dir outputs/g2
 ```
 
-HPC runs target the required fixed 4×NVIDIA H20 container; `hpc/README.md` pins
+HPC runs target containers with one or more NVIDIA H20 GPUs; `hpc/README.md` pins
 the SSH endpoint, repository/data paths, Python/PyTorch/CUDA versions, and the exact
 `check → train → score → G1/G2` sequence; G3 is a direct cached-score analysis command.
 Formal E2 (B0 V3.1) training runs **only**
 through `hpc/run.sh train configs/b0_v31_breadth_first.yaml`, which drives
 `python -m src.e2_pipeline` (pack → probe → projection → 30-epoch DDP train via
-`accelerate launch --num_processes 4` across all 4 GPUs); direct
+an auto-detected `accelerate launch` across all visible GPUs); direct
 `python -m src.train_b0 --max-steps N` remains debug-only. `B0-alt` keeps its
 existing direct `python -m src.train_b0 --config ...` training CLI, outside this
 E2-only optimization. `score`/`merge`/`g1`/`g2` remain single-GPU commands; G3 is also
 single-process and CPU/memory-bound; there is
-no job scheduler (e.g. Slurm). The live four-H20 cold-run acceptance is pending;
-neither four-card execution nor the 60-minute budget is a verified result yet.
+no job scheduler (e.g. Slurm). Every run records its detected world size; throughput
+claims are hardware-shape-specific.
 
 **Tooling gotcha:** mypy is strict with `warn_unused_ignores = true`. Don't run two
 `mypy` invocations against the same `.mypy_cache` concurrently — it corrupts the cache
@@ -125,7 +125,7 @@ flow is deliberately **score-once, analyze-many**:
    `model/b0_alt.py` MLP) and writes a Task-4-format checkpoint under `outputs/`. Formal
    E2 (B0 V3.1) training is driven by `src/e2_pipeline.py` (`hpc/run.sh train`), which
    wraps `train_b0.py` in a pack → probe → projection → 30-epoch `accelerate launch
-   --num_processes 4` DDP run across the four H20s; B0-alt keeps its own direct
+   --num_processes N` DDP run across all visible H20s; B0-alt keeps its own direct
    `train_b0.py` invocation.
 3. **Score** (`src/score_universe.py`) runs a checkpoint over the candidate universe /
    val / test pairs *once* and writes a single self-contained `.npz` scores artifact
@@ -176,7 +176,7 @@ nodes?" If a draft starts describing graph generation as the task, it has drifte
 5. `docs/05-egostitch-spec.md` — the **implementation contract** (gate G4 signed off
    2026-07-09): pinned algorithm/shapes/losses, §9 benchmark binding and data
    contract (including quarantined artifacts and the self-loop policy), §10 batch
-   sampler, §11 four-H20 execution design. Its freeze rule is binding: code may not
+   sampler, §11 auto-sized H20 execution design. Its freeze rule is binding: code may not
    silently deviate — edit the spec first, with a change-log line.
 6. `docs/results/E2-pair-to-topology-gap.md` — the motivating result note with completed
    G1 B0/PA-null/B0-alt, G2 ceiling, and G3 Oracle artifacts.

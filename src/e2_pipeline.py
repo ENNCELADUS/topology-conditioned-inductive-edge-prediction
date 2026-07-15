@@ -8,7 +8,7 @@ Provides pure dataclasses and functions for:
 - write_failure(): atomic failure JSON artifact writer
 
 And the production orchestrator (``python -m src.e2_pipeline``) that drives the
-cold four-H20 run end to end: pack-or-validate the BF16 feature cache, launch one
+cold multi-H20 run end to end: pack-or-validate the BF16 feature cache, launch one
 fresh ``accelerate launch`` probe process group per candidate token budget, select
 the fastest valid one, launch one ``epoch-probe``, gate formal training on the
 projected 30-epoch wall time, launch one clean ``train`` process group, merge the
@@ -301,6 +301,7 @@ def build_accelerate_command(
     output_dir: Path,
     token_budget: int,
     profile_output: Path,
+    world_size: int,
     worker_module: str = "src.train_b0",
 ) -> list[str]:
     """Build the pinned ``accelerate launch -m <worker>`` worker command.
@@ -317,17 +318,18 @@ def build_accelerate_command(
         token_budget: Per-rank token budget for this worker invocation (the
             EgoStitch worker reinterprets it as the node-batch ``B_n``).
         profile_output: Path the rank-zero worker writes its JSON profile to.
+        world_size: Number of visible H20 ranks to launch.
         worker_module: Dotted worker module (default: the formal E2 B0 worker).
 
     Returns:
-        The exact ``accelerate launch --num_processes 4 --mixed_precision bf16
+        The exact ``accelerate launch --num_processes <world_size> --mixed_precision bf16
         -m <worker_module> ...`` argv list.
     """
     return [
         str(accelerate_bin),
         "launch",
         "--num_processes",
-        "4",
+        str(world_size),
         "--mixed_precision",
         "bf16",
         "-m",
@@ -345,6 +347,25 @@ def build_accelerate_command(
         "--profile-output",
         str(profile_output),
     ]
+
+
+def detect_visible_gpu_count() -> int:
+    """Return the number of GPUs visible to the current process."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None:
+        devices = [item.strip() for item in visible.split(",") if item.strip()]
+        if devices and devices != ["-1"]:
+            return len(devices)
+    completed = subprocess.run(
+        ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    count = len([line for line in completed.stdout.splitlines() if line.strip()])
+    if count < 1:
+        raise RuntimeError("no visible GPUs found for distributed training")
+    return count
 
 
 def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
@@ -746,6 +767,9 @@ def run_pipeline(
     if cfg.runtime is None:
         raise ValueError("the E2 pipeline requires a config with a 'runtime:' section")
     runtime = cfg.runtime
+    if runtime.world_size == 0:
+        runtime = replace(runtime, world_size=detect_visible_gpu_count())
+        cfg = replace(cfg, runtime=runtime)
     output_dir = cfg.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     staging_dir = Path(tempfile.mkdtemp(prefix=".e2-run-", dir=output_dir))
@@ -823,6 +847,7 @@ def run_pipeline(
             "projected_total_seconds": projected_total_seconds,
             "pack_manifest": pack_manifest_payload,
             "pack_identity_sha256": pack_identity_sha256,
+            "world_size": runtime.world_size,
         }
         if epoch_probe is not None:
             payload["epoch_probe"] = dict(epoch_probe)
@@ -868,6 +893,7 @@ def run_pipeline(
             output_dir=staging_dir,
             token_budget=token_budget,
             profile_output=profile_output,
+            world_size=runtime.world_size,
             worker_module=args.worker_module,
         )
         try:
@@ -954,6 +980,7 @@ def run_pipeline(
         output_dir=staging_dir,
         token_budget=selected.token_budget,
         profile_output=epoch_profile_output,
+        world_size=runtime.world_size,
         worker_module=args.worker_module,
     )
     try:
@@ -1024,6 +1051,7 @@ def run_pipeline(
         output_dir=staging_dir,
         token_budget=selected.token_budget,
         profile_output=worker_profile_path,
+        world_size=runtime.world_size,
         worker_module=args.worker_module,
     )
     try:
