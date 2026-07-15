@@ -861,7 +861,9 @@ def _score_egostitch(
     node_ids = sorted({node_id for pair in pairs for node_id in pair})
     try:
         f0_cache.parent.mkdir(parents=True, exist_ok=True)
-        matrix, index = build_f0_matrix(store, node_ids, cache_path=f0_cache)
+        matrix, index = build_f0_matrix(
+            store, node_ids, cache_path=f0_cache, allow_cache_subset=True
+        )
     except ValueError:
         logger.warning(
             "F0 cache at %s does not match the requested node set; recomputing without cache",
