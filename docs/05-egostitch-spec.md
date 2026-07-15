@@ -497,9 +497,13 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   - §13.14 Stage-gate comparators: B0 and `B0+cal` (B1/B5 deferred to E3, protocol
     edit of the same date); acceptance criteria pre-registered in
     `docs/registrations/g5_stage1_preregistration.json`.
+- 2026-07-15: editorial status update after the first formal Stage-1 execution: code
+  exists, Seed 0 completed, and the three-seed gate remains incomplete. No normative
+  algorithm, data, loss, or execution contract changed.
 
-**Open items before code (not blockers):** FLOPs/latency table template (§4.7
-commitment — delivered with the G5 Stage-1 gate report). Closed 2026-07-14: the four
+**Open gate-report deliverable:** FLOPs/latency table template (§4.7 commitment —
+delivered with the G5 Stage-1 gate report). Stage-1 code now exists, but the formal
+three-seed gate is incomplete. Closed 2026-07-14: the four
 ego-stat target definitions (§13.6); Benchmark-A/B/C ↔ split-strategy mapping
 (confirmed at G1: `Benchmark-A = breadth_first`, §9.1).
 

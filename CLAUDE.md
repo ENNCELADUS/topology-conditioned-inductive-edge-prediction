@@ -6,15 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) and Codex when worki
 
 A **research-paper project** targeting ICLR 2027: *Topology-Conditioned Inductive
 Edge Prediction*. It contains design documents, result notes, self-contained HTML
-figures, benchmark data artifacts, and a curated literature library. Implementation
-has now begun on the **pre-implementation gates and baselines**: `src/` holds a typed,
-tested Python package (data loaders, eval metrics, the B0/B0-alt frozen scorers, and
-the G1/G2/G3 gate-analysis pipelines), a direct HPC execution layer (formal E2/B0 training
-on four H20s; single-GPU score/gate commands), and a full pytest suite.
-The **proposed model (EgoStitch) is not yet implemented**. Gates G1–G3 are complete:
-G1 includes the B0-alt architecture-independence arm, and G3 (Oracle) passed on
-2026-07-13. The EgoStitch design and implementation spec were approved 2026-07-09,
-so model implementation is now the next stage.
+figures, benchmark data artifacts, and a curated literature library. `src/` holds a
+typed, tested Python package covering the benchmark/evaluation stack, B0/B0-alt,
+G1–G3, and the pre-registered **EgoStitch Stage-1 implementation**. The direct HPC
+layer auto-detects all visible H20s for formal E2 and EgoStitch DDP execution.
+Gates G1–G3 are complete; G5 Stage 1 is not. Its formal run produced one valid Seed-0
+training artifact on 2026-07-15, then Seed 1 stopped at the artifact performance gate
+and Seed 2 did not run. Do not report a G5 verdict until all three seeds, held-out
+scoring, fidelity diagnostics, and pre-registered gate evaluation are complete.
 
 `README.md` is the human-facing entry point (orientation, status, structure map,
 reading order). This file (`CLAUDE.md`) holds the binding *constraints* an agent
@@ -38,6 +37,7 @@ docs/
                                  benchmark/data contract, batch sampler, auto-sized H20 design
   lit-review-plan.md             review plan, claims K1–K5, terminology guardrail
   results/E2-pair-to-topology-gap.md   motivating result note
+  results/G5-stage1-seed0-20260715.md  completed Seed-0 training result; gate incomplete
 figures/                         e2-gap.html, positioning.html (standalone, open in browser)
 data/
   README.md                      benchmark artifact manifest (layout + usage contract)
@@ -49,11 +49,12 @@ src/
                features.py (frozen feature store + F0 mean-pool matrix)
   eval/        edge_metrics.py, graph_metrics.py (official BFS-macro GS/RD + assembled-graph MMD),
                assembly.py (assemble + threshold sweep), composite.py (perturbation diagnostic)
-  model/       B0.py (V3.1 scorer), b0_alt.py (F0-MLP architecture-independence arm)
+  model/       B0.py, b0_alt.py, egostitch/ (Stage-1 model/loss/decision modules)
   train_b0.py        CLI: train a frozen B0-family scorer
+  train_egostitch.py auto-sized Accelerate DDP worker for formal EgoStitch training
   score_universe.py  CLI: score pair lists -> pinned .npz scores artifact (shardable)
-  experiments/ g1_hardened_e2.py, g2_ceiling.py, g3_oracle.py (gate analyses over cached scores)
-configs/        b0_v31_breadth_first.yaml, b0_alt_breadth_first.yaml
+  experiments/ G1/G2/G3 analyses, b0_cal.py, g5_stage1.py
+configs/        B0/B0-alt and egostitch_stage1_breadth_first.yaml
 hpc/            auto-sized H20 container runner (run.sh + environment/runbook README)
 outputs/        run artifacts: checkpoints, metrics, cached score matrices (gitignored)
 tests/          pytest suite mirroring src/ (data/, eval/, experiments/, CLIs, hpc)
@@ -74,7 +75,7 @@ uv run ruff check . && uv run ruff format --check .   # lint + format check
 uv run mypy src tests            # strict type check
 ```
 
-The four research CLIs are `python -m` modules — run under `uv run` (or
+Research CLIs are `python -m` modules — run under `uv run` (or
 `.venv/bin/python`, which avoids the rtk proxy garbling `uv run` output locally):
 
 ```bash
@@ -102,8 +103,9 @@ through `hpc/run.sh train configs/b0_v31_breadth_first.yaml`, which drives
 an auto-detected `accelerate launch` across all visible GPUs); direct
 `python -m src.train_b0 --max-steps N` remains debug-only. `B0-alt` keeps its
 existing direct `python -m src.train_b0 --config ...` training CLI, outside this
-E2-only optimization. `score`/`merge`/`g1`/`g2` remain single-GPU commands; G3 is also
-single-process and CPU/memory-bound; there is
+E2-only optimization. EgoStitch Stage-1 uses the same orchestrator with the EgoStitch
+worker and an auto-detected Accelerate world size. `merge`/`g1`/`g2` remain
+single-process; G3 is also single-process and CPU/memory-bound; there is
 no job scheduler (e.g. Slurm). Every run records its detected world size; throughput
 claims are hardware-shape-specific.
 
@@ -113,8 +115,8 @@ and surfaces phantom `unused-ignore` errors; re-run cold before believing them.
 
 ## Code architecture (the implemented pipeline)
 
-The code implements the **baseline + gate** half of the protocol, not EgoStitch. The
-flow is deliberately **score-once, analyze-many**:
+The code implements the baseline/gate stack and EgoStitch Stage 1. The evaluation flow
+remains deliberately **score-once, analyze-many**:
 
 1. **Data** (`src/data/`) loads and *verifies* the frozen `benchmark_2025_neurips`
    package (`artifacts.py`), enforces the node-disjoint split and message/supervision
@@ -127,15 +129,20 @@ flow is deliberately **score-once, analyze-many**:
    wraps `train_b0.py` in a pack → probe → projection → 30-epoch `accelerate launch
    --num_processes N` DDP run across all visible H20s; B0-alt keeps its own direct
    `train_b0.py` invocation.
-3. **Score** (`src/score_universe.py`) runs a checkpoint over the candidate universe /
+3. **EgoStitch Stage 1** (`src/model/egostitch/`, `src/train_egostitch.py`) implements
+   Tokenize-lite, imagination, matching, stitching, the `(s0,s1,s2)` decision head,
+   the frozen-S0 contract, pre-registered losses, auto-sized DDP training, and formal
+   artifact publication. `src/experiments/g5_stage1.py` performs the Stage-1 gate.
+4. **Score** (`src/score_universe.py`) runs a checkpoint over the candidate universe /
    val / test pairs *once* and writes a single self-contained `.npz` scores artifact
-   (the CLI remains shardable, but the pinned single-GPU run is unsharded; `merge` remains available).
-4. **Gate analyses** (`src/experiments/`) are pure row-selections + graph math over that
+   (the CLI is shardable and strict merge restores manifest order; the HPC runner uses
+   one contiguous shard per visible GPU).
+5. **Gate analyses** (`src/experiments/`) are pure row-selections + graph math over that
    cached artifact — **no model scoring happens here**. `g1_hardened_e2.py` builds the
    hardened-E2 gate table (negative regimes, threshold/density-matched operating point,
    assembled-graph rows); `g2_ceiling.py` computes the edge-independence triangle ceiling;
    `g3_oracle.py` evaluates the pinned Oracle arms and headroom stop rule.
-5. **Eval** (`src/eval/`) is the shared metric library used by all of the above:
+6. **Eval** (`src/eval/`) is the shared metric library used by all of the above:
    `edge_metrics.py` (AUROC/AUPRC…), `graph_metrics.py` (official BFS-macro GS/RD plus
    degree/clustering/spectral MMD on the assembled graph), `assembly.py` (assemble +
    threshold sweep), `composite.py` (MMD perturbation diagnostic). Edge- and
@@ -180,7 +187,9 @@ nodes?" If a draft starts describing graph generation as the task, it has drifte
    silently deviate — edit the spec first, with a change-log line.
 6. `docs/results/E2-pair-to-topology-gap.md` — the motivating result note with completed
    G1 B0/PA-null/B0-alt, G2 ceiling, and G3 Oracle artifacts.
-7. `docs/lit-review-plan.md` — literature-review plan, claims K1–K5, the 2×2
+7. `docs/results/G5-stage1-seed0-20260715.md` — completed Seed-0 training evidence and
+   the explicit boundary that the three-seed G5 gate remains incomplete.
+8. `docs/lit-review-plan.md` — literature-review plan, claims K1–K5, the 2×2
    taxonomy, and the terminology guardrail.
 
 When these conflict, the more specific/later document refines the earlier one, but
@@ -216,6 +225,17 @@ rule is not triggered.
 mechanisms. Keep the current values consistent across `docs/results/E2-pair-to-topology-gap.md`,
 `docs/03-experiment-protocol.md`, `docs/04-model-proposal.md`, `README.md`, and
 `figures/e2-gap.html`.
+
+## Current G5 Stage-1 evidence boundary
+
+The only completed formal EgoStitch training result is Seed 0 at commit `31afbe6`:
+2 × H20, `world_size=2`, 30 epochs, best epoch 14, validation AUROC/AUPRC
+`0.945766/0.951966`, and total time `807.389 s`. Its training curve is nearly flat
+(AUPRC range `0.951582–0.951966`), so it does not by itself establish a learned gain
+over frozen S0. Seed 1 failed only the artifact performance check
+(`steady_state_data_wait_fraction > 0.05`); Seed 2 did not run. These are training
+artifacts, not held-out candidate-universe or assembled-graph results. Never call G5
+passed or failed from Seed 0 alone.
 
 ## Naming conventions (neutral placeholders — keep them neutral)
 

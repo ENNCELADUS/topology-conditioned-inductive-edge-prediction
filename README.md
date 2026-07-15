@@ -7,8 +7,8 @@
 <p>
   <img alt="Venue" src="https://img.shields.io/badge/target-ICLR%202027-b31b1b">
   <img alt="Type" src="https://img.shields.io/badge/paper-empirical%20ML%20method-blue">
-  <img alt="Status" src="https://img.shields.io/badge/status-design%20phase-yellow">
-  <img alt="Code" src="https://img.shields.io/badge/implementation-baselines%20%2B%20gates-green">
+  <img alt="Status" src="https://img.shields.io/badge/status-G5%20Stage--1-yellow">
+  <img alt="Code" src="https://img.shields.io/badge/implementation-EgoStitch%20Stage--1-green">
 </p>
 
 <p>
@@ -26,11 +26,12 @@
 
 ## TL;DR
 
-This repository holds the design and pre-implementation gate pipeline for an ICLR 2027
+This repository holds the implementation and experiment pipeline for an ICLR 2027
 paper. The benchmark loaders, evaluation library, B0/B0-alt baselines, score-once
-artifact pipeline, and gates G1–G3 are implemented and tested. **EgoStitch itself is not
-implemented**; G1 is closed with the B0-alt architecture-independence arm, and G3
-(Oracle) has passed, so the next stage is model implementation.
+artifact pipeline, gates G1–G3, and the pre-registered EgoStitch Stage-1 model are
+implemented and tested. The formal G5 Stage-1 run is **incomplete**: Seed 0 completed,
+Seed 1 stopped at the artifact performance gate, and Seed 2 was not run. Consequently,
+there is no three-seed G5 verdict yet.
 
 - **Task:** given two *unseen* nodes with frozen feature vectors, predict whether an
   edge exists between them (binary classification), under a strict inductive protocol
@@ -112,11 +113,12 @@ close the topology gap. The complete closeout package is
 
 ## The Proposed Method (EgoStitch)
 
-> **Status: approved (2026-07-09).** Design proposal approved and gate G4 signed off —
+> **Status: Stage-1 implemented; formal gate incomplete (2026-07-15).** Design proposal approved and gate G4 signed off —
 > [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) is the active implementation
 > contract (algorithm spec + benchmark/data contract + auto-sized H20 execution design). Design
 > rationale: [`docs/04-model-proposal.md`](docs/04-model-proposal.md). G1 (including
-> B0-alt), G2, and G3 (Oracle) are complete and support proceeding to implementation.
+> B0-alt), G2, and G3 (Oracle) are complete. The Stage-1 implementation now awaits a
+> complete three-seed run and the pre-registered held-out gate evaluation.
 
 For each queried pair `(i, j)`, each endpoint **imagines its own ego-network** (latent
 neighbor nodes with existence probabilities, local adjacency, and a degree budget)
@@ -151,6 +153,7 @@ docs/
   lit-review-plan.md             review plan, claims K1–K5, terminology guardrail
   results/
     E2-pair-to-topology-gap.md   the motivating result note
+    G5-stage1-seed0-20260715.md  completed Seed-0 training result; no G5 verdict
 figures/
   e2-gap.html                    edge-vs-topology contrast (open in a browser)
   positioning.html               2×2 taxonomy positioning figure
@@ -161,9 +164,10 @@ data/
 src/
   data/                          verified benchmark/features + pair batching
   eval/                          edge and assembled-graph metrics
-  model/                         frozen B0 and B0-alt scorers
-  experiments/                   implemented G1/G2/G3 cached-score analyses
+  model/                         frozen B0/B0-alt scorers + EgoStitch Stage-1 modules
+  experiments/                   G1/G2/G3 analyses + pre-registered G5 Stage-1 gate
   train_b0.py                    baseline training CLI
+  train_egostitch.py             auto-sized DDP EgoStitch training worker
   score_universe.py              score-once artifact CLI
 hpc/
   run.sh                         direct auto-sized H20 runner
@@ -188,7 +192,8 @@ general graph-ML benchmark. Don't substitute real dataset names unless asked.
 | 4 | [`docs/04-model-proposal.md`](docs/04-model-proposal.md) | EgoStitch rationale (approved 2026-07-09) |
 | 5 | [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) | **Implementation contract**: algorithm, data/batch contract, auto-sized H20 execution |
 | 6 | [`docs/results/E2-pair-to-topology-gap.md`](docs/results/E2-pair-to-topology-gap.md) | Motivating result |
-| 7 | [`docs/lit-review-plan.md`](docs/lit-review-plan.md) | Review plan, claims, terminology guardrail |
+| 7 | [`docs/results/G5-stage1-seed0-20260715.md`](docs/results/G5-stage1-seed0-20260715.md) | Completed Seed-0 training result; G5 remains incomplete |
+| 8 | [`docs/lit-review-plan.md`](docs/lit-review-plan.md) | Review plan, claims, terminology guardrail |
 
 When documents conflict, the more specific/later one refines the earlier — but locked
 decisions and the locked §0 method boundary override casual changes.
@@ -212,8 +217,9 @@ target test graph; the queried edge is masked/standardized inside the scaffold. 
 - [x] **G1 + G2** — B0/PA-null, B0-alt architecture replication, and the checkpoint-aligned edge-independence ceiling are complete; the final benchmark-aligned G1 artifacts are under [`outputs/deliverables/g1_graph_metrics_20260714/`](outputs/deliverables/g1_graph_metrics_20260714/).
 - [x] **Latest legacy v3.1 robustness rerun** — canonical G1 confirms that the stronger scorer preserves the topology gap; final artifacts are under [`outputs/deliverables/legacy_g1_graph_metrics_20260714/`](outputs/deliverables/legacy_g1_graph_metrics_20260714/).
 - [x] **G3 gate** — Oracle row passed; Oracle-blend shows substantial headroom over B0 and the feature-insufficiency stop rule is not triggered. Final artifacts are under [`outputs/deliverables/g3_graph_metrics_20260714/`](outputs/deliverables/g3_graph_metrics_20260714/).
-- [ ] **EgoStitch implementation** under `src/`, per [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) and the [experiment protocol](docs/03-experiment-protocol.md).
-- [ ] **Experiments** in priority order: EgoStitch implementation → E1/E3 main + baselines → E4 ablations → E5 integrity gates → E7 (load-bearing) → E6 breadth.
+- [x] **EgoStitch Stage-1 implementation** — model, losses, data targets, auto-sized DDP worker, scoring, fidelity diagnostics, calibrated comparator, G5 runner, and tests are implemented under `src/`.
+- [ ] **G5 Stage-1 formal gate** — Seed 0 completed on 2 × H20 (`AUPRC 0.951966`, `AUROC 0.945766` at epoch 14); Seed 1 stopped at the pre-registered artifact performance gate and Seed 2 did not run. See [`docs/results/G5-stage1-seed0-20260715.md`](docs/results/G5-stage1-seed0-20260715.md). This is not a G5 pass/fail result.
+- [ ] **Experiments** in priority order: complete the G5 Stage-1 three-seed run and held-out gate → accepted later G5 stages → E1/E3 main + baselines → E4 ablations → E5 integrity gates → E7 (load-bearing) → E6 breadth.
 
 ## HPC execution
 
@@ -230,6 +236,11 @@ outside this E2-only optimization. The host, repository/data paths, required sof
 versions, and the `nohup` form are pinned in [`hpc/README.md`](hpc/README.md). The
 GPU count is recorded with each run, so throughput evidence is interpreted against
 that exact hardware shape. There is no job scheduler (e.g. Slurm).
+
+Formal EgoStitch Stage-1 training uses the same auto-detected multi-GPU orchestrator
+with `configs/egostitch_stage1_breadth_first.yaml` and `src.train_egostitch`; it must
+not be replaced by a hard-coded single-GPU launch. The validated Seed-0 run used two
+visible H20s (`world_size=2`).
 
 ## Literature
 

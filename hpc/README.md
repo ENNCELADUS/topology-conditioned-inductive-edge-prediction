@@ -73,6 +73,19 @@ post-publication 60-minute acceptance time. It returns exit code `0` on
 success and `2` on a gated failure (for example, the projected 30-epoch time exceeding
 the 60-minute budget); the runner does not mask this exit code.
 
+Formal EgoStitch Stage-1 training uses the same auto-detected DDP orchestrator and all
+visible H20s, but its config-driven budget and worker module:
+
+```bash
+hpc/run.sh train configs/egostitch_stage1_breadth_first.yaml \
+  --worker-module src.train_egostitch
+```
+
+It publishes the same atomic checkpoint/profile/manifest contract under the requested
+seed output directory. A complete training artifact is not a G5 result: the formal
+gate additionally requires all three seeds, candidate-universe scoring, fidelity
+diagnostics, and `src.experiments.g5_stage1` evaluation.
+
 Score the candidate universe once per checkpoint. `run.sh score` always injects
 `--device cuda --amp bf16`; on a multi-GPU node it launches one contiguous shard per
 GPU and publishes the final output only after strict `score_universe merge` validation.

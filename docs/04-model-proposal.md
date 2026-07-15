@@ -2,9 +2,10 @@
 
 **Status:** **revision 2.2** — approved as a design proposal (2026-07-09); **gate G4
 signed off 2026-07-09**, so `05-egostitch-spec.md` (including its §9 benchmark
-binding and §10–11 batch-sampler/single-H20 contracts) is now the active implementation
+binding and §10–11 batch-sampler/auto-sized H20 contracts) is the active implementation
 contract. Companion to `03-experiment-protocol.md` (updated 2026-07-09 with the
-approved [protocol-Δ] items) and `02-methodology.md`.
+approved [protocol-Δ] items) and `02-methodology.md`. EgoStitch Stage 1 is implemented;
+its formal three-seed G5 evaluation remains incomplete as of 2026-07-15.
 
 **Provenance.** Revision 1 was grounded in a three-track literature review run on
 2026-07-07. Revision 2 (2026-07-08) followed a full fan-out review of the local vault
@@ -927,6 +928,10 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   the Stage-1 subset is pinned in spec §13 and the acceptance criteria are
   pre-registered in `docs/registrations/g5_stage1_preregistration.json`
   (protocol §5.0.5).
+  *Execution update 2026-07-15:* Seed 0 completed formal training (best validation
+  AUROC/AUPRC `0.945766/0.951966`); Seed 1 stopped at the artifact performance gate
+  and Seed 2 was not run. Candidate scoring, fidelity, assembled-graph evaluation,
+  and the three-seed decision remain pending. This is not a G5 result.
 
 ### 6.1 Method rows
 

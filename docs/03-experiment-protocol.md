@@ -240,7 +240,7 @@ prioritized in Section 5 (gates first).
   `1.03683`) with MMD ratios `7.58890/3.06980/9.05715` and headroom
   `1.72315/3.88537/1.99767`. The Oracle arms are not approximately equal
   to B0 across assembled metrics, so the feature-insufficiency stop rule is not triggered
-  and EgoStitch may proceed to implementation.
+  and cleared the prerequisite for EgoStitch implementation.
 
 **Latest checkpoint-only evaluation rerun:** the aligned legacy `v3_1` checkpoint was
 scored on the same split in run `legacy_v31_s47_20260712T193900Z` (completed 2026-07-12
@@ -410,6 +410,12 @@ rule).
    degree-MMD non-regression and matched-AUPRC guards) are pre-registered in
    `docs/registrations/g5_stage1_preregistration.json` before any held-out metric is
    opened (rule §5.2.4); the Stage-1 subset itself is pinned in spec §13.
+   **Execution status (2026-07-15):** Stage-1 code and its formal auto-sized DDP path
+   are implemented. Seed 0 completed on 2 × H20 with best validation AUROC/AUPRC
+   `0.945766/0.951966` at epoch 14. Seed 1 stopped at the artifact performance gate
+   (`steady_state_data_wait_fraction > 0.05`), so Seed 2 and all held-out gate rows
+   remain unrun. This is an incomplete execution state, not a G5 decision; see
+   `docs/results/G5-stage1-seed0-20260715.md`.
 
 ### 5.1 Priority order (after gates)
 
