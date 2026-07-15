@@ -37,7 +37,6 @@ from src.data.ego_targets import EgoTargetBuilder  # noqa: E402
 from src.data.pairs import NegativeSampler  # noqa: E402
 from src.e2_pipeline import _validate_worker_profile  # noqa: E402
 from src.model.egostitch import EgoStitchConfig, EgoStitchStage1  # noqa: E402
-from src.train_b0 import build_ddp_accelerator  # noqa: E402
 
 _NODES = [f"n{i}" for i in range(8)]
 _POSITIVES = [
@@ -155,7 +154,7 @@ def main() -> None:
     model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
     data = _toy_bundle(model_cfg)
     model = EgoStitchStage1(model_cfg)
-    accelerator = build_ddp_accelerator("no")
+    accelerator = te.build_egostitch_ddp_accelerator("no")
 
     result = te.train_egostitch_ddp_loop(
         model, cfg, data, accelerator, node_batch=cfg.data.node_batch
