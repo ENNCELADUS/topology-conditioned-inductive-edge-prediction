@@ -88,14 +88,18 @@ _PACK_GROUNDING_FILENAME = "grounding.npz"
 _PACK_MANIFEST_FILENAME = "manifest.json"
 
 
-def build_egostitch_ddp_accelerator(mixed_precision: str) -> Accelerator:
-    """Build DDP with detection for EgoStitch's conditionally unused heads."""
-    kwargs = DistributedDataParallelKwargs(
+def _egostitch_ddp_kwargs() -> DistributedDataParallelKwargs:
+    """Return DDP settings for EgoStitch's conditionally unused heads."""
+    return DistributedDataParallelKwargs(
         broadcast_buffers=False,
         find_unused_parameters=True,
         gradient_as_bucket_view=True,
     )
-    return Accelerator(mixed_precision=mixed_precision, kwargs_handlers=[kwargs])
+
+
+def build_egostitch_ddp_accelerator(mixed_precision: str) -> Accelerator:
+    """Build the EgoStitch distributed accelerator."""
+    return Accelerator(mixed_precision=mixed_precision, kwargs_handlers=[_egostitch_ddp_kwargs()])
 
 
 # Frozen audited B0 checkpoint providing s0 (spec Sec 13.10); overridable in

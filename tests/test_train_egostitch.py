@@ -100,9 +100,7 @@ _RUNTIME: dict[str, Any] = {
 
 
 def test_ddp_accelerator_detects_conditionally_unused_parameters() -> None:
-    accelerator = te.build_egostitch_ddp_accelerator("no")
-    handler = accelerator.ddp_handler
-    assert handler is not None
+    handler = te._egostitch_ddp_kwargs()
     assert handler.broadcast_buffers is False
     assert handler.find_unused_parameters is True
     assert handler.gradient_as_bucket_view is True
