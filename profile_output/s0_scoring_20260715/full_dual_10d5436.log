@@ -1,0 +1,5 @@
+started_at=2026-07-15T14:38:09+00:00
+commit=10d54360a427663dc852296f99eb1a298f8491a6
+launching score shard 0/2 on physical GPU 0
+launching score shard 1/2 on physical GPU 1
+2026-07-15 15:09:02,193 INFO __main__: merged 2 shard files (3364731 rows) into outputs/s0_cache/b0_v31_egostitch_pairs.npz

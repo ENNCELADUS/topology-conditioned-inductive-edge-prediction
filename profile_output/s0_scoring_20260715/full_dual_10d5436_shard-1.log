@@ -1,0 +1,40 @@
+2026-07-15 14:38:15,750 INFO __main__: loading checkpoint outputs/deliverables/b0_v31_breadth_first_20260711/model/best.pt (device cuda)
+2026-07-15 14:38:18,355 INFO __main__: resolved 3364731 pairs from file:outputs/s0_cache/manifests/all_seeds.tsv
+2026-07-15 14:38:18,355 INFO __main__: shard 1/2: rows [1682366, 3364731) -> outputs/s0_cache/b0_v31_egostitch_pairs.shard-1.npz
+2026-07-15 14:38:25,054 INFO __main__: loaded packed feature table from outputs/feature_packs/b0_v31_bf16 in 6.661 seconds
+2026-07-15 14:38:30,114 INFO __main__: cached 6001 unique node encodings in 3.914 seconds (1533.2 nodes/s)
+2026-07-15 14:38:41,680 INFO __main__: scored 51583/1682365 rows
+2026-07-15 14:38:52,378 INFO __main__: scored 100735/1682365 rows
+2026-07-15 14:39:06,769 INFO __main__: scored 150171/1682365 rows
+2026-07-15 14:39:27,333 INFO __main__: scored 200676/1682365 rows
+2026-07-15 14:39:47,902 INFO __main__: scored 251181/1682365 rows
+2026-07-15 14:40:07,898 INFO __main__: scored 300321/1682365 rows
+2026-07-15 14:40:28,444 INFO __main__: scored 350826/1682365 rows
+2026-07-15 14:40:48,989 INFO __main__: scored 401331/1682365 rows
+2026-07-15 14:41:18,644 INFO __main__: scored 450696/1682365 rows
+2026-07-15 14:41:50,417 INFO __main__: scored 500872/1682365 rows
+2026-07-15 14:42:21,573 INFO __main__: scored 550024/1682365 rows
+2026-07-15 14:42:53,358 INFO __main__: scored 600200/1682365 rows
+2026-07-15 14:43:25,149 INFO __main__: scored 650376/1682365 rows
+2026-07-15 14:43:56,932 INFO __main__: scored 700552/1682365 rows
+2026-07-15 14:44:28,721 INFO __main__: scored 750728/1682365 rows
+2026-07-15 14:45:21,828 INFO __main__: scored 800069/1682365 rows
+2026-07-15 14:46:26,728 INFO __main__: scored 850537/1682365 rows
+2026-07-15 14:47:30,643 INFO __main__: scored 900323/1682365 rows
+2026-07-15 14:48:34,571 INFO __main__: scored 950109/1682365 rows
+2026-07-15 14:49:39,454 INFO __main__: scored 1000577/1682365 rows
+2026-07-15 14:50:43,431 INFO __main__: scored 1050363/1682365 rows
+2026-07-15 14:51:47,339 INFO __main__: scored 1100149/1682365 rows
+2026-07-15 14:52:52,166 INFO __main__: scored 1150617/1682365 rows
+2026-07-15 14:53:56,116 INFO __main__: scored 1200403/1682365 rows
+2026-07-15 14:55:00,104 INFO __main__: scored 1250189/1682365 rows
+2026-07-15 14:56:04,930 INFO __main__: scored 1300657/1682365 rows
+2026-07-15 14:57:19,709 INFO __main__: scored 1350501/1682365 rows
+2026-07-15 14:59:03,407 INFO __main__: scored 1400165/1682365 rows
+2026-07-15 15:00:47,910 INFO __main__: scored 1450341/1682365 rows
+2026-07-15 15:02:31,364 INFO __main__: scored 1500005/1682365 rows
+2026-07-15 15:04:15,836 INFO __main__: scored 1550181/1682365 rows
+2026-07-15 15:06:00,267 INFO __main__: scored 1600357/1682365 rows
+2026-07-15 15:07:43,673 INFO __main__: scored 1650021/1682365 rows
+2026-07-15 15:08:51,030 INFO __main__: packed scoring completed 1682365 rows in 2129 batches over 1820.576 seconds (924.1 rows/s)
+2026-07-15 15:08:52,768 INFO __main__: wrote 1682365 scored rows to outputs/s0_cache/b0_v31_egostitch_pairs.shard-1.npz
