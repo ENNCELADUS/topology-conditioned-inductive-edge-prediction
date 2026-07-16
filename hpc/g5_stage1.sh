@@ -88,7 +88,7 @@ training_is_current() {
 s0_candidate_is_current() {
   [[ -s "${S0_CANDIDATE}" ]] || return 1
   "${PYTHON_BIN}" -c \
-    'import sys,numpy as np; from pathlib import Path; from src.score_universe import load_scores; a=load_scores(Path(sys.argv[1])); p=a.meta.get("score_precision",{}); ok=a.meta.get("model_family")=="v3_1" and a.meta.get("checkpoint_id")==sys.argv[2] and a.meta.get("pairs_source")=="candidate" and a.meta.get("strategy")=="breadth_first" and p.get("encode_autocast")=="off" and p.get("logit_storage_dtype")=="float32" and a.logit.dtype==np.float32; raise SystemExit(0 if ok else 1)' \
+    'import sys,numpy as np; from pathlib import Path; from src.score_universe import load_scores; a=load_scores(Path(sys.argv[1])); p=a.meta.get("score_precision",{}); ok=a.meta.get("model_family")=="v3_1" and a.meta.get("checkpoint_id")==sys.argv[2] and a.meta.get("pairs_source")=="candidate" and a.meta.get("strategy")=="breadth_first" and p.get("encode_autocast")=="bf16" and p.get("pair_autocast")=="off" and p.get("logit_storage_dtype")=="float32" and a.logit.dtype==np.float32; raise SystemExit(0 if ok else 1)' \
     "${S0_CANDIDATE}" e092537d8cf1e208
 }
 
@@ -106,7 +106,8 @@ run_s0_candidate() {
     --strategy breadth_first \
     --pack-dir "${B0_PACK_DIR}" \
     --token-budget 1048576 \
-    --amp off \
+    --amp bf16 \
+    --pair-amp off \
     --output "${S0_CANDIDATE}"
   s0_candidate_is_current || fail "fresh-fp32 s0 candidate artifact failed validation"
 }

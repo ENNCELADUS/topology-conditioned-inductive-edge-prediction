@@ -745,6 +745,7 @@ def _score_v3_1_packed(
     *,
     device: torch.device,
     amp: str,
+    pair_amp: str | None = None,
     token_budget: int,
 ) -> NDArray[np.float32]:
     """Score V3.1 pairs with packed features and cached per-node encodings."""
@@ -831,7 +832,7 @@ def _score_v3_1_packed(
         pair_b = node_b.index_select(0, row_ids).to(device)
         len_a = packed_lengths.index_select(0, pair_a)
         len_b = packed_lengths.index_select(0, pair_b)
-        with torch.inference_mode(), _autocast_context(device, amp):
+        with torch.inference_mode(), _autocast_context(device, pair_amp or amp):
             pair_repr = model._pair_representation(
                 encoded.index_select(0, pair_a)[:, :boundary],
                 encoded.index_select(0, pair_b)[:, :boundary],
@@ -1176,6 +1177,12 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
     score.add_argument("--amp", choices=["off", "bf16"], default="off")
     score.add_argument(
+        "--pair-amp",
+        choices=["off", "bf16"],
+        default=None,
+        help="optional pair-head autocast override for packed v3_1 scoring",
+    )
+    score.add_argument(
         "--b0-scores",
         type=Path,
         default=None,
@@ -1268,6 +1275,7 @@ def _run_score(args: argparse.Namespace) -> None:
     meta_extra: dict[str, object] = {
         "score_precision": {
             "encode_autocast": args.amp,
+            "pair_autocast": args.pair_amp or args.amp,
             "logit_storage_dtype": "float32",
         }
     }
@@ -1289,6 +1297,7 @@ def _run_score(args: argparse.Namespace) -> None:
                 args.pack_dir,
                 device=device,
                 amp=args.amp,
+                pair_amp=args.pair_amp or args.amp,
                 token_budget=args.token_budget,
             )
     elif model_family == "f0_mlp":

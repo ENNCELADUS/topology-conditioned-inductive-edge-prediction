@@ -102,7 +102,8 @@ required `fidelity.json` and shared `cost_report.json`, and fails closed if any 
 or registered diagnostic is missing.
 
 Score the candidate universe once per checkpoint. `run.sh score` defaults to
-`--device cuda --amp bf16` (the formal frozen-`s0` pass overrides AMP to `off`); on a
+`--device cuda --amp bf16` (the formal frozen-`s0` pass keeps bf16 node encoding but
+sets `--pair-amp off` for fp32 pair logits); on a
 multi-GPU node it launches one contiguous shard per
 GPU and publishes the final output only after strict `score_universe merge` validation.
 For V3.1, pass `--pack-dir` to keep the BF16 token table GPU-resident and avoid repeated
