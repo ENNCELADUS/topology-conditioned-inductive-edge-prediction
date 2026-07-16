@@ -106,6 +106,7 @@ def test_g5_formal_runner_builds_every_registered_gate_input() -> None:
     assert '--checkpoint "${B0_CHECKPOINT}"' in text
     assert "--amp bf16" in text
     assert "--pair-amp off" in text
+    assert "--token-budget 262144" in text
     assert '--s0-universe "${S0_CANDIDATE}"' in formal_body
     assert formal_body.index("run_diagnostics") < formal_body.index(
         "-m src.experiments.g5_stage1"

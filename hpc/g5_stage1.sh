@@ -105,7 +105,7 @@ run_s0_candidate() {
     --data-root data \
     --strategy breadth_first \
     --pack-dir "${B0_PACK_DIR}" \
-    --token-budget 1048576 \
+    --token-budget 262144 \
     --amp bf16 \
     --pair-amp off \
     --output "${S0_CANDIDATE}"
