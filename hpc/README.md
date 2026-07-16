@@ -89,18 +89,21 @@ diagnostics, the shared cost report, and `src.experiments.g5_stage1` evaluation.
 The tracked outer runner completes the fixed seed before opening the screening gate:
 
 ```bash
-hpc/g5_stage1.sh seed 0   # reuse complete training when valid; then score
-hpc/g5_stage1.sh formal   # Seed 0 train/score -> required diagnostics -> screening gate
+hpc/g5_stage1.sh seed 0   # validate/reuse training -> fresh-fp32 s0 -> candidate score
+hpc/g5_stage1.sh formal   # seed pipeline -> generate diagnostics/cost -> screening gate
 ```
 
 Every `seed` invocation writes candidate scores under
 `outputs/egostitch_stage1/seedN/scores/`. Only `formal_gate/` may contain the binding
 single-seed Stage-1 screening verdict. Inferential and Holm fields are not applicable;
-the screen does not replace E1/E3's multi-seed inference. The formal command fails
-closed unless Seed 0's required `fidelity.json` and the shared `cost_report.json` exist.
+the screen does not replace E1/E3's multi-seed inference. The runner hashes the fresh
+fp32 `s0` candidate artifact into the EgoStitch score provenance, generates Seed 0's
+required `fidelity.json` and shared `cost_report.json`, and fails closed if any identity
+or registered diagnostic is missing.
 
-Score the candidate universe once per checkpoint. `run.sh score` always injects
-`--device cuda --amp bf16`; on a multi-GPU node it launches one contiguous shard per
+Score the candidate universe once per checkpoint. `run.sh score` defaults to
+`--device cuda --amp bf16` (the formal frozen-`s0` pass overrides AMP to `off`); on a
+multi-GPU node it launches one contiguous shard per
 GPU and publishes the final output only after strict `score_universe merge` validation.
 For V3.1, pass `--pack-dir` to keep the BF16 token table GPU-resident and avoid repeated
 per-pair feature-file reads.

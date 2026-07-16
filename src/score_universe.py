@@ -412,13 +412,26 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
         u_parts.append(mapping[shard.u_idx] if len(shard.u_idx) else shard.u_idx)
         v_parts.append(mapping[shard.v_idx] if len(shard.v_idx) else shard.v_idx)
 
+    merged_meta = dict(reference.meta)
+    profiles = [shard.meta.get("score_profile") for shard in ordered]
+    if all(isinstance(profile, dict) for profile in profiles):
+        typed_profiles = cast(list[dict[str, object]], profiles)
+        merged_meta["score_profile"] = {
+            "wall_seconds": max(
+                float(cast(float, profile["wall_seconds"])) for profile in typed_profiles
+            ),
+            "rows": sum(int(cast(int, profile["rows"])) for profile in typed_profiles),
+            "unique_nodes": len(node_ids),
+            "measurement": "max_concurrent_shard_compute_wall_seconds",
+        }
+
     return ScoresArtifact(
         node_ids=node_ids,
         u_idx=np.concatenate(u_parts) if u_parts else np.empty(0, dtype=np.int32),
         v_idx=np.concatenate(v_parts) if v_parts else np.empty(0, dtype=np.int32),
         logit=np.concatenate([shard.logit for shard in ordered]),
         label=np.concatenate([shard.label for shard in ordered]),
-        meta=dict(reference.meta),
+        meta=merged_meta,
     )
 
 
@@ -504,6 +517,15 @@ def _checkpoint_id(model_state: Mapping[str, torch.Tensor]) -> str:
         hasher.update(str(tensor.dtype).encode("utf-8"))
         hasher.update(tensor.numpy(force=True).tobytes())
     return hasher.hexdigest()[:16]
+
+
+def _file_sha256(path: Path) -> str:
+    """Return the SHA-256 of an input artifact used for score provenance."""
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def _load_checkpoint(
@@ -1243,7 +1265,13 @@ def _run_score(args: argparse.Namespace) -> None:
     row_labels = labels[start:end]
 
     store = FeatureStore(args.data_root / _FEATURES_SUBDIR)
-    meta_extra: dict[str, object] = {}
+    meta_extra: dict[str, object] = {
+        "score_precision": {
+            "encode_autocast": args.amp,
+            "logit_storage_dtype": "float32",
+        }
+    }
+    score_started = perf_counter()
     if model_family == "v3_1":
         if args.pack_dir is None:
             logits = _score_v3_1(
@@ -1305,6 +1333,7 @@ def _run_score(args: argparse.Namespace) -> None:
         )
         meta_extra = {
             "s0_checkpoint_id": args.s0_checkpoint_id,
+            "s0_artifact_sha256": _file_sha256(args.b0_scores),
             "score_precision": {
                 "contract": _EGOSTITCH_PAIR_PRECISION_CONTRACT,
                 "encode_autocast": args.amp,
@@ -1321,7 +1350,14 @@ def _run_score(args: argparse.Namespace) -> None:
     else:  # pragma: no cover - build_model already rejects unknown families
         raise ValueError(f"no scoring path for model_family {model_family!r}")
 
+    score_wall_seconds = perf_counter() - score_started
     node_ids = sorted({node_id for pair in row_pairs for node_id in pair})
+    meta_extra["score_profile"] = {
+        "wall_seconds": score_wall_seconds,
+        "rows": len(row_pairs),
+        "unique_nodes": len(node_ids),
+        "measurement": "single_process_compute_wall_seconds",
+    }
     node_position = {node_id: i for i, node_id in enumerate(node_ids)}
     meta: dict[str, object] = {
         "checkpoint_id": checkpoint_id,

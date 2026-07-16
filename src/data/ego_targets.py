@@ -123,6 +123,11 @@ class EgoTargetBuilder:
         }
         self._ego_stats: dict[str, tuple[float, float, float, float]] = {}
 
+    @property
+    def graph(self) -> nx.Graph:
+        """Return the protocol-clean message graph used to build all targets."""
+        return self._g
+
     def _node_ego_stats(self, node: str) -> tuple[float, float, float, float]:
         """The pinned real-side ego-stat 4-vector (spec Sec 13.6), cached."""
         cached = self._ego_stats.get(node)

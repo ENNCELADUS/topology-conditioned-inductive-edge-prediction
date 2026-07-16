@@ -97,6 +97,30 @@ def test_g5_runner_completes_fixed_seed_before_screening_gate() -> None:
     assert "Holm-corrected inference" in text
 
 
+def test_g5_formal_runner_builds_every_registered_gate_input() -> None:
+    """Formal orchestration must produce diagnostics and fresh fp32 s0 scores."""
+    text = G5_RUNNER.read_text()
+    formal_body = text[text.index("run_formal()") :]
+
+    assert "src.experiments.g5_stage1_diagnostics" in text
+    assert '--checkpoint "${B0_CHECKPOINT}"' in text
+    assert "--amp off" in text
+    assert '--s0-universe "${S0_CANDIDATE}"' in formal_body
+    assert formal_body.index("run_diagnostics") < formal_body.index(
+        "-m src.experiments.g5_stage1"
+    )
+
+
+def test_g5_seed_reuse_is_bound_to_registration_config_and_commit() -> None:
+    text = G5_RUNNER.read_text()
+    training_check = text[text.index("training_is_current()") : text.index("run_seed()")]
+
+    assert "preregistration_sha256" in training_check
+    assert "config_hash" in training_check
+    assert "source_commit" in training_check
+    assert "state=complete stage=candidate_score" in text
+
+
 def test_g5_runner_rejects_candidate_without_precision_provenance_before_reuse() -> None:
     text = G5_RUNNER.read_text()
     candidate_check = text[text.index("candidate_is_current()") : text.index("run_seed()")]

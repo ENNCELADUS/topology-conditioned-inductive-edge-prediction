@@ -599,6 +599,41 @@ def test_merge_mismatched_checkpoint_id_raises_clear_error(tmp_path: Path) -> No
         score_universe.merge_scores([shard0, shard1])
 
 
+def test_merge_aggregates_concurrent_score_profiles(tmp_path: Path) -> None:
+    shard0 = tmp_path / "s0.npz"
+    shard1 = tmp_path / "s1.npz"
+    _write_fake_shard(shard0, row_start=0, num_rows=4, n_rows=2)
+    _write_fake_shard(shard1, row_start=2, num_rows=4, n_rows=2)
+    for path, wall in ((shard0, 3.0), (shard1, 5.0)):
+        raw = score_universe._load_shard(path)
+        meta = dict(raw.meta)
+        meta["score_profile"] = {
+            "wall_seconds": wall,
+            "rows": 2,
+            "unique_nodes": len(raw.node_ids),
+            "measurement": "single_process_compute_wall_seconds",
+        }
+        score_universe.save_scores(
+            path,
+            node_ids=raw.node_ids,
+            u_idx=raw.u_idx,
+            v_idx=raw.v_idx,
+            logit=raw.logit,
+            label=raw.label,
+            row_start=raw.row_start,
+            meta=meta,
+        )
+
+    merged = score_universe.merge_scores([shard0, shard1])
+
+    assert merged.meta["score_profile"] == {
+        "wall_seconds": 5.0,
+        "rows": 4,
+        "unique_nodes": len(merged.node_ids),
+        "measurement": "max_concurrent_shard_compute_wall_seconds",
+    }
+
+
 # ---------------------------------------------------------------------------
 # CLI arg errors
 # ---------------------------------------------------------------------------
