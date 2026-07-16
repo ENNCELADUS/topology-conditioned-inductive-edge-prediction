@@ -534,6 +534,11 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   a conjunctive scoring-time dead-residual validity gate, and the validation-AUPRC
   near-tie fidelity tie-break. These are bound to a new single-seed experiment ID;
   §10.2 sampling and all Stage-1 success criteria are unchanged.
+- 2026-07-16: added §14 (approved successor headline — e2e stitched-topology-
+  conditioned pair encoder, proposal §4.4 rev 3.0). §§1–13 remain the binding
+  contract for the pending frozen-s0 screening run and its code; §14 records the
+  successor architecture and its landing conditions. No §5/§13 semantics change in
+  this edit.
 
 **Open gate-report deliverable:** FLOPs/latency table template (§4.7 commitment —
 delivered with the G5 Stage-1 gate report). Stage-1 code now exists; the replacement
@@ -796,3 +801,72 @@ three registered death signals hold: residual/s0 standard-deviation ratio `< 1e-
 Spearman correlation with s0 `> 0.9999`, and top-1% overlap `> 0.9999`. This conjunctive
 validity rule prevents a genuinely pair-varying but safely small residual from being
 turned into a post-hoc outcome switch. It is a run-validity gate, not a success metric.
+
+## 14. Approved successor headline: E2E stitched-topology-conditioned pair encoder (2026-07-16)
+
+**Scope and precedence.** This section records the approved rev-3.0 headline
+architecture (proposal §4.4; full decision trail and pins in
+`docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md`).
+**§§1–13 remain the binding implementation contract** for the pending frozen-s0
+Stage-1 screening run and for all code on `main` today. §14 becomes normative for
+implementation only after that screen publishes, at which point §5/§13 are rewritten
+to it (with change-log lines) and a fresh Stage-1 registration is bound. Until then,
+no code may implement §14 into the formal pipeline.
+
+### 14.1 Architecture summary
+
+```text
+z_pair = Trunk(tok_i, tok_j)      # V3.1-class pair encoder, trained from scratch:
+                                  # raw token sequences → Siamese encoder → pair
+                                  # cross-attention → pair_context_gated / abba_max
+c_topo = STE(T̂_ij)                # structure-only stitched-topology encoder over
+                                  # {star edges, Â_i, Â_j, Π}; node inputs = 4-type
+                                  # anchor labels, π, m, soft degrees (NO h, NO g,
+                                  # NO grounded-identity-match); 2–3 edge-weighted MP
+                                  # layers (promoted s4 lineage); token-level output
+c_cont = ContentTokens(S_i, S_j)  # separate pathway: [h; π; g; grounded-identity-
+                                  # match] per slot + membership signal (former s1)
+inject: in the last N_inj ∈ {1, 2} pair-cross-attention blocks (default 1), the CLS
+        token cross-attends to c_topo and (separately) c_cont through zero-initialized
+        tanh gates, per direction (AB / BA, swapped anchor labels) BEFORE abba_max;
+        AB/BA share STE and attention parameters; branch masks are per pair, shared
+        across directions
+p_ij  = σ(head(z'_pair))
+```
+
+### 14.2 Null taxonomy (three mutually exclusive head nulls; checkpoint-exact)
+
+| Null | Skips | Yields |
+|---|---|---|
+| `∅_all_head` | STE + topology XAttn + content XAttn | pair-only `f_logit` |
+| `∅_topo_head` | STE + topology XAttn | pair + content |
+| `∅_content_head` | content XAttn | pair + topology |
+
+Training realizes nulls as per-pair multiplicative masks (probabilities
+`p_topo = p_cont = 0.15` default, sweep 0.1–0.2, plus `p = 0` arms); evaluation uses
+batch-level hard bypasses; residual sublayer form makes the two numerically identical
+(required unit test), as is `p(i,j) = p(j,i)` under every null. The `_head` namespace
+is disjoint from the §2 conditioning-dropout `∅_content` / `∅_all` (decoder nulls).
+All four logits (full + three nulls) are published per scored pair; the §13.16 fp32
+pair-pass pin extends to trunk, STE, gates, and head
+(`egostitch_e2e_pair_fp32_v1`); §13.17 liveness signals re-register against the
+within-checkpoint `f_logit` (no frozen-s0 comparator artifact); the §13.10 s0 logit
+cache is retired for this family.
+
+### 14.3 Landing conditions (all required before a binding e2e run)
+
+1. Frozen-s0 screen published (its outcome is the successor's motivating arm).
+2. §5/§13 rewritten to §14 with change-log lines; §13.18-style pins for defaults
+   (`ste_layers = 3`, `ste_dim = 128`, `xattn_heads = 8`, `n_inj` default 1 sweep
+   {1, 2}).
+3. Fresh registration with the five-arm Stage-1 scope (full, `B0-e2e`/f-only,
+   pair+topology, within-pair `Â`/`Π` shuffle, `p = 0`), the four-logit decomposition
+   report, the representation-probe protocol (degree / ego density / clustering +
+   degree-partialled + Π-consistency, frozen-encoder linear probes on held-out
+   message-partition nodes), the pathway-attribution decision rule, and a measured
+   H20 cost re-estimate (the 673 s / 2.04 GiB frozen-s0 Stage-1 profile does not
+   extrapolate; budget class is the E2 B0 run).
+4. Implementation plan:
+   `docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md`
+   (B0.py untouched; conditioned trunk subclass; train-mask ≡ eval-bypass and
+   symmetry tests as acceptance criteria).

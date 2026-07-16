@@ -115,28 +115,34 @@ close the topology gap. The complete closeout package is
 
 ## The Proposed Method (EgoStitch)
 
-> **Status: Stage-1 implemented; replacement screening gate incomplete (2026-07-16).** Design proposal approved and gate G4 signed off —
+> **Status: Stage-1 (frozen-s0 form) implemented; replacement screening gate incomplete;
+> headline revised to rev 3.0 (2026-07-16).** Design proposal approved and gate G4 signed off —
 > [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) is the active implementation
-> contract (algorithm spec + benchmark/data contract + auto-sized H20 execution design). Design
-> rationale: [`docs/04-model-proposal.md`](docs/04-model-proposal.md). G1 (including
-> B0-alt), G2, and G3 (Oracle) are complete. The Stage-1 implementation now awaits a
+> contract (algorithm spec + benchmark/data contract + auto-sized H20 execution design); its
+> §14 records the approved e2e successor headline. Design
+> rationale: [`docs/04-model-proposal.md`](docs/04-model-proposal.md) (rev 3.0). G1 (including
+> B0-alt), G2, and G3 (Oracle) are complete. The frozen-s0 Stage-1 screen still awaits a
 > fixed-Seed-0 run bound to the replacement registration plus fidelity/cost diagnostics
-> and the held-out screening evaluation.
+> and the held-out screening evaluation; its outcome motivates the e2e successor build.
 
 For each queried pair `(i, j)`, each endpoint **imagines its own ego-network** (latent
 neighbor nodes with existence probabilities, local adjacency, and a degree budget)
 conditioned on its frozen features and a learned **community codebook**. The two imagined
-ego-nets are **stitched** into a local scaffold `T̂_ij`, and the edge decision fuses four
-evidence channels: the node-intrinsic pairwise logit, membership, closure, and
-community/capacity. Each channel maps to a specific E2 failure axis it is meant to repair
-(degree budgets → density/degree; slot–slot adjacency + closure → clustering; community
-codebook → spectrum).
+ego-nets are **stitched** into a local scaffold `T̂_ij`. Since rev 3.0 the edge decision
+is **end-to-end**: a from-scratch pair encoder over the two endpoints' raw token
+sequences is *conditioned on the scaffold* — a structure-only **stitched-topology
+encoder** (anchor labels, existence, multiplicity, degrees, and the scaffold's edge
+structure; no content embeddings) produces token-level topology states that enter the
+pair encoder through zero-initialized gated cross-attention, with content evidence on a
+separate, independently ablatable pathway. No pretrained frozen classifier appears
+anywhere in the model; the same checkpoint emits a pair-only logit, pair+content,
+pair+topology, and the full logit for attribution.
 
 ```text
 step 1  community coding      z_u, F_u, d̂_u       = Tokenize(x_u)            (per node, cached)
 step 2  ego-net imagination   S_u = {(h_u^k, π_u^k)} = Imagine(x_u, z_u, G(u)) (per node, cached)
 step 3  stitch                T̂_ij = Stitch(S_i, S_j, {i, j})                 (per pair)
-step 4  decide                p_ij = σ(pair_logit(i,j) + g·Fuse(s1,s2,s3,s4)) (per pair)
+step 4  encode + decide       t = STE(T̂_ij);  p_ij = σ(head(Trunk(tok_i, tok_j | t, c_content)))
 ```
 
 Training objective (maps onto the methodology plan's four terms):
@@ -220,9 +226,10 @@ target test graph; the queried edge is masked/standardized inside the scaffold. 
 - [x] **G1 + G2** — B0/PA-null, B0-alt architecture replication, and the checkpoint-aligned edge-independence ceiling are complete; the final benchmark-aligned G1 artifacts are under [`outputs/deliverables/g1_graph_metrics_20260714/`](outputs/deliverables/g1_graph_metrics_20260714/).
 - [x] **Latest legacy v3.1 robustness rerun** — canonical G1 confirms that the stronger scorer preserves the topology gap; final artifacts are under [`outputs/deliverables/legacy_g1_graph_metrics_20260714/`](outputs/deliverables/legacy_g1_graph_metrics_20260714/).
 - [x] **G3 gate** — Oracle row passed; Oracle-blend shows substantial headroom over B0 and the feature-insufficiency stop rule is not triggered. Final artifacts are under [`outputs/deliverables/g3_graph_metrics_20260714/`](outputs/deliverables/g3_graph_metrics_20260714/).
-- [x] **EgoStitch Stage-1 implementation** — model, losses, data targets, auto-sized DDP worker, scoring, fidelity diagnostics, calibrated comparator, G5 runner, and tests are implemented under `src/`.
+- [x] **EgoStitch Stage-1 implementation (frozen-s0 form)** — model, losses, data targets, auto-sized DDP worker, scoring, fidelity diagnostics, calibrated comparator, G5 runner, and tests are implemented under `src/`.
+- [x] **E2E headline redesign (rev 3.0)** — approved 2026-07-16 after two user-as-reviewer rounds + a vault/arXiv novelty sweep: stitched-topology-conditioned pair encoder (no frozen anchor). Design record: [`docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md`](docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md); implementation summary: spec §14; plan (execution gated on the frozen-s0 screen): [`docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md`](docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md).
 - [ ] **G5 Stage-1 screening gate** — the latest exact-quota Seed-0 run completed training, candidate scoring, and a diagnostic-only topology evaluation under the superseded registration. The replacement one-seed screen still needs a newly bound run plus fidelity/cost reports. See [`docs/results/G5-stage1-seed0-20260715.md`](docs/results/G5-stage1-seed0-20260715.md); the existing artifact is not retroactively a G5 pass/cut.
-- [ ] **Experiments** in priority order: complete the replacement G5 Stage-1 single-seed screen → accepted later G5 stages → E1/E3 multi-seed main + baselines → E4 ablations → E5 integrity gates → E7 (load-bearing) → E6 breadth.
+- [ ] **Experiments** in priority order: complete the replacement frozen-s0 Stage-1 single-seed screen (motivating arm) → land spec §14 + fresh registration → e2e conditioned-encoder Stage-1 five-arm screen → accepted later G5 stages → E1/E3 multi-seed main + baselines → E4 ablations (incl. E4.15–E4.17 attribution/structure/conditioning-depth) → E5 integrity gates → E7 (load-bearing) → E6 breadth.
 
 ## HPC execution
 

@@ -1,11 +1,21 @@
 # Model Proposal: EgoStitch — Community-Conditioned Ego-Network Imagination with Consensus Stitching for Topology-Conditioned Inductive Edge Prediction
 
-**Status:** **revision 2.2** — approved as a design proposal (2026-07-09); **gate G4
-signed off 2026-07-09**, so `05-egostitch-spec.md` (including its §9 benchmark
+**Status:** **revision 3.0** — approved as a design proposal (2026-07-09; **gate G4
+signed off 2026-07-09**), so `05-egostitch-spec.md` (including its §9 benchmark
 binding and §10–11 batch-sampler/auto-sized H20 contracts) is the active implementation
 contract. Companion to `03-experiment-protocol.md` (updated 2026-07-09 with the
-approved [protocol-Δ] items) and `02-methodology.md`. EgoStitch Stage 1 is implemented;
-its replacement one-seed engineering screening gate remains incomplete as of 2026-07-16.
+approved [protocol-Δ] items) and `02-methodology.md`. EgoStitch Stage 1 (frozen-s0
+form) is implemented; its replacement one-seed engineering screening gate remains
+incomplete as of 2026-07-16.
+**Revision 3.0 (2026-07-16):** the §4.4 decision mechanism is replaced — the frozen-B0
+`s0` anchor and logit-level gated-residual fusion give way to an **end-to-end
+stitched-topology-conditioned pair encoder** (jointly trained V3.1-class trunk,
+structure-only stitched-topology encoder, zero-init tanh-gated cross-attention, and a
+three-null decomposition). Design record and decision trail:
+`docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md` (rev 3).
+Spec §§1–13 remain binding for the pending frozen-s0 screening run; the successor
+implementation contract is summarized in spec §14 and lands in full (§5/§13 rewrite +
+replacement registration) after that screen publishes.
 
 **Provenance.** Revision 1 was grounded in a three-track literature review run on
 2026-07-07. Revision 2 (2026-07-08) followed a full fan-out review of the local vault
@@ -389,12 +399,14 @@ generation. Classically: a feature-conditioned degree-corrected SBM (Karrer & Ne
 ### 4.0 Contract compliance
 
 ```text
-inputs:  queried pair (i, j), frozen features X, optional ANN candidate pools G(i), G(j)
+inputs:  queried pair (i, j), frozen features X (raw token sequences + pooled x_u),
+         optional ANN candidate pools G(i), G(j)
 step 1:  community coding      z_u, r_u, F_u, d̂_u    = Tokenize(x_u)              (per node, cached)
 step 2:  ego-net imagination   S_u = {(h_u^k, π_u^k)} = Imagine(x_u, z_u, r_u, G(u)) (per node, cached)
 step 3a: stitch                T̂⁰_ij = Stitch(S_i, S_j, {i, j})                   (per pair)
 step 3b: consensus             T̂_ij  = Harmonize(T̂⁰_ij | d̂_i, d̂_j, R rounds)     (per pair, trained module)
-step 4:  decide                p_ij = σ(pair_logit(i,j) + g·Fuse(s1, s2, s3, s4))  (per pair)
+step 4:  encode + decide       t = STE(T̂_ij)   # structure-only token states (§4.4)
+         p_ij = σ(head(Trunk(tok_i, tok_j | t, c_content)))                       (per pair; rev 3.0)
 ```
 
 The per-query local scaffold boundary is unchanged: `T̂_ij` is a local topological
@@ -585,43 +597,97 @@ runs in the training forward pass (matched to inference, R12) after generator
 warm-start. A half-page algorithm box with tensor shapes is a deliverable of gate
 §6.0-G4 before implementation.
 
-### 4.4 Module 4 — Decision head (fusion of evidence channels)
+### 4.4 Module 4 — Stitched-topology-conditioned pair encoder **[rev 3.0, 2026-07-16]**
 
-- `s0` **node-intrinsic:** frozen `pair_logit(i, j)` (B0-compatible anchor, unchanged;
-  freezing a trusted hypothesis while adapting evidence around it follows SHOT
-  2002.08546).
-- `s1` **membership:** likelihood of the partner under each imagined neighborhood —
-  `logsumexp_k [κ(h_i^k, proj(x_j)) + log π_i^k]`, symmetrized (analysis-by-synthesis
-  at set level; diffusion-classifier pattern 2303.16203, amortized; one fused channel,
-  never the head).
-- `s2` **closure:** soft common-neighbor mass
-  `CN̂_ij = Σ_{k,k'} Π_{kk'} π_i^k π_j^{k'}` (multiplicity-weighted) plus an
-  Adamic–Adar-weighted variant — the SEAL/NCN structural signal (1802.09691,
-  2302.00890) computed on *imagined, harmonized* neighborhoods. (BUDDY-style sketches
-  2209.15486 are the O(1) fallback at scale.)
-- `s3` **community/capacity:** block rate `1 − exp(−F_i·F_j)`, degree budgets
-  `d̂_i, d̂_j`, and within-scaffold budget-pressure features (total imagined neighbor
-  mass `Σ π·m` relative to `d̂`, post-harmonization) — Approach C embedded. All
-  features are computed inside the single query's scaffold; no state crosses queries.
-- `s4` **scaffold readout:** 2–3 layer edge-weighted GNN over anchor-labeled `T̂_ij`
-  (R7), readout `MLP(H_i, H_j, H_T)`, plus DiGress-style auxiliary structural/spectral
-  features of the scaffold fed to the fusion layer.
+The rev-2.2 head — frozen B0 `pair_logit` anchor plus logit-level gated-residual
+fusion of scalar channels `s1..s4` — is replaced. Motivations: (i) the frozen
+anchor made the model read as an extension of an existing scorer, and the Seed-0
+exact-quota diagnostic showed the anchored residual collapsing onto B0 (s0-logit
+correlation ≈ 1.0, assembled metrics indistinguishable); (ii) logit-level late
+fusion is weak methodological novelty for a paper titled *topology-conditioned*.
+The full decision trail, reviewer rounds, and literature sweeps are recorded in
+`docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md`.
+
+**Architecture (end-to-end; no pretrained checkpoint anywhere in the model):**
 
 ```text
-p_ij = σ( s0 + g_θ(s1, s2, s3, s4) · w )
+z_pair = Trunk(tok_i, tok_j)          # V3.1-class pair encoder trained FROM SCRATCH:
+                                      # raw token sequences → Siamese encoder → pair
+                                      # cross-attention → pair_context_gated / abba_max
+c_topo = STE(T̂_ij)                    # structure-only stitched-topology encoder:
+                                      # 2–3 layer edge-weighted MP over the scaffold
+                                      # (star edges, Â_i, Â_j, Π; 4-type anchor labels,
+                                      # π, m, soft degrees — NO h, NO g), token-level output
+c_cont = ContentTokens(S_i, S_j)      # separate pathway: slot content h, (π, g) tags,
+                                      # grounded-identity-match, membership signal
+conditioning: in the last N_inj ∈ {1,2} trunk pair-cross-attention blocks, the CLS
+              token cross-attends to c_topo and (separately gated) c_cont through
+              zero-initialized tanh gates, per direction (AB / BA with swapped anchor
+              labels) BEFORE abba_max; AB/BA share STE and attention parameters
+p_ij = σ( head(z'_pair) )
 ```
 
-Gated residual fusion keeps B0 anchoring per the protocol and makes channel ablations
-clean. **Channel-collinearity risk is pre-registered** [DA-M9, R3-W10]: s1 may
-degenerate into learned pairwise similarity (≈ s0) and s2 into community similarity
-(≈ s3) if imagination mode-seeks; the s1–s4 correlation matrix on validation queries is
-a required diagnostic, the per-channel knockouts are headline ablations, and the
-pre-registered prediction is that **s1/s2 add value precisely on low-FCR benchmarks and
-tail-degree strata** (Cold Brew FCR, §6.4.9) — if they do not, the honest conclusion is
-`Ours → B5` and §6.5's decision rules apply. **Anti-shortcut controls:** the
-`∅_content` counterfactual contrast (§4.2) is reported as an E5 integrity control
-(TDE 2002.11949; Neural Motifs 1711.06640 documents context-prior shortcuts in
-graph-structured prediction).
+**Three-null decomposition (checkpoint-exact; all gates residual and zero-init):**
+`∅_all_head` (skip STE + both attentions) yields the pair-only `f_logit`;
+`∅_topo_head` yields pair+content; `∅_content_head` yields pair+topology. All four
+logits come from one checkpoint and are reported with every headline table; training
+uses per-pair multiplicative branch masks (Modality-Dropout lineage 2005.13616 ⊕;
+branch-competition analysis Huang et al. ICML 2022 ⊕ — mechanism novelty not claimed),
+evaluation uses hard bypasses, and their exact equality is a required unit test, as is
+`p(i,j) = p(j,i)` under every null.
+
+**Channel mapping (rev 2.2 → rev 3.0):**
+
+| rev 2.2 channel | rev 3.0 role |
+|---|---|
+| `s0` frozen anchor | retired from the headline; the jointly-trained trunk's `f_logit` is the node-intrinsic evidence. The **frozen-s0 variant is retained as an ablation arm**, where the SHOT frozen-hypothesis reading (2002.08546) now exclusively lives |
+| `s1` membership | content pathway (`c_cont`) input — pair/content compatibility, deliberately excluded from the topology claim |
+| `s2` closure (SEAL/NCN signal 1802.09691, 2302.00890; BUDDY fallback 2209.15486) | registered diagnostic + representation-probe target (alignment consistency); the STE sees the same `Π, π, m` structure and may learn it |
+| `s3` community/capacity | Stage-2 structural inputs to the STE (`F_u` block features, `d̂` budget-pressure), unchanged in spirit |
+| `s4` scaffold GNN readout | **promoted into the STE**: same edge-weighted-GNN lineage, token-level states instead of a pooled scalar, now the headline conditioning source |
+
+**Attribution is pre-registered** [supersedes the DA-M9/R3-W10 collinearity block]:
+(i) *pathway attribution* — the topology-representation claim must survive
+content-pathway removal (pair+topology retains a registered share of the full-model
+gain over the matched `B0-e2e` arm), else the honest conclusion is content-side
+information; (ii) *structure specificity* — a battery of edge-shuffle,
+edge-removal-to-DeepSets, cross-pair scaffold shuffle, matched-capacity
+non-message-passing, and **degree-preserving rewiring** controls (the decisive answer
+to "is the STE encoding topology or a continuous latent code disguised as a graph",
+given π/m/Â/Π are all feature-derived); (iii) *representation evidence* — frozen-STE
+linear probes to real degree / ego density / clustering / `Π`-consistency on held-out
+message-partition nodes, **with degree-partialled variants** (degree bias dominates LP
+signals: 2405.14985, 2310.04612); (iv) the pre-registered prediction that topology
+conditioning adds value precisely on low-FCR benchmarks and tail-degree strata
+(Cold Brew FCR, §6.4.9) stands unchanged — if it does not, `Ours → B5` and §6.5's
+decision rules apply. **Anti-shortcut controls:** the `∅_content`
+generator-conditioning contrast (§4.2 — a different mechanism from the `_head` nulls
+above) remains an E5 integrity control (TDE 2002.11949; Neural Motifs 1711.06640).
+
+**Novelty scoping (binding for the paper text; 2026-07-16 sweep, local vault +
+verified external arXiv).** The claim is **novel overall composition** — never
+per-component unprecedentedness, and never "first to generate structural context for
+unseen nodes" (Leap ⊕ 2503.03331 already grafts predicted edges for inductive LP):
+
+> *Dual imagined ego-nets are differentiably aligned and stitched into a generated
+> local scaffold whose structure-only token representation conditions a queried-edge
+> pair encoder under the strict zero-edge inductive protocol.*
+
+Component ancestry (each reported as ancestry / prior usage / difference): set-decoder
+imagination (DETR 2005.12872 — detection queries → neighbor slots with existence,
+multiplicity, adjacency); anchor labeling (labeling trick 2010.16103 — observed
+subgraphs → generated slots); OT alignment (GOAT ⊕ 2111.05366, SLOTAlign ⊕ 2301.12721
+— align two *observed* graphs as the end task → internal differentiable stitch of two
+*imagined* ego-nets, the most distinctive element); zero-init gated cross-attention
+(Flamingo ⊕ 2204.14198 — modality injection into a frozen LLM → structure-token
+injection into a from-scratch pair encoder with a checkpoint-exact bypass); graph-token
+conditioning (GraphToken ⊕ 2402.05862, GraphGPT ⊕ 2310.13023 — LLM reasoning → binary
+edge logit; CAM tokens ⊕ 2405.19375 — cross-attentive modulation for linkset
+prediction over *observed* tokens, so cross-attention itself is not claimed);
+FiLM-style modulation (GNN-FiLM 1906.12192). The SEAL family (1802.09691, 2010.16103,
+2302.00890, 2209.15486) reads observed subgraphs — the defining protocol delta. No
+exact match for the composition was identified in the reviewed corpus; a limited
+search cannot prove absence.
 
 ### 4.5 Training objective (maps 1:1 onto the locked objective)
 
@@ -937,6 +1003,14 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   deterministic point-estimate dominance. The inspected artifact is not retroactively
   rebound; a new-hash run plus fidelity/cost reports is required for the screening verdict.
   E1/E3 retain multi-seed Holm inference.
+  *Headline revision 2026-07-16 (rev 3.0):* the pending frozen-s0 screen keeps its
+  registered contract unchanged and becomes the motivating arm for the §4.4 e2e
+  redesign. The **next** binding Stage-1 build is the stitched-topology-conditioned
+  pair encoder with a five-arm screen scope — full model, matched `B0-e2e`/f-only,
+  pair+topology (`∅_content_head` permanent), one structure-destroyed control
+  (within-pair `Â`/`Π` shuffle), and branch-dropout `p = 0` — everything else (E2E
+  `B3-full`/`B5`, conditioning-depth rungs, the remaining structure battery) is E1/E3
+  scope. Landing sequence and registration requirements: design doc §8 and spec §14.
 
 ### 6.1 Method rows
 
@@ -944,6 +1018,11 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
 - **Current design becomes an ablation:** generator off + grounding on + thresholded
   scorer edges reproduces the §0 contract exactly — register as ablation arm
   `E4.10: retrieved-thresholded scaffold` (also the natural bridge baseline).
+- **Frozen-s0 EgoStitch becomes an ablation [rev 3.0]:** the rev-2.2 anchored
+  residual head (frozen B0 `s0` + gated scalar fusion) is retained as an E4 arm; the
+  matched-training pairwise-only control is `B0-e2e` (trunk with all conditioning
+  permanently bypassed under identical data/negatives/schedule/optimizer/seed/HPO) —
+  canonical B0 and `B0-e2e` are distinct rows and are never conflated.
 - **B4 disposition [R1-W11-i]:** blueprint/methodology B4 (latent-topology model
   without queried-edge conditioning) is subsumed by the E4 "generation-only, no edge
   supervision" arm (methodology ablation 9), now explicitly registered as `E4.11`;
@@ -1085,14 +1164,17 @@ quality).
 - **Pre-registered decision rules [DA-M12]:** (i) if `Ours` does not beat `B3-full`
   and `B0+cal` on the *held-out* assembled-metric family at matched edge AUPRC, the
   generative apparatus is declared not load-bearing and the paper pivots to the
-  benchmark/`B3-full` story; (ii) if s1/s2 knockouts cost nothing on every benchmark
-  and stratum, `Ours → B5` is declared; (iii) multiple-comparison control (Holm) over
+  benchmark/`B3-full` story; (ii) if the topology-pathway knockout (`∅_content_head`
+  vs `∅_all_head` attribution) and the closure diagnostics cost nothing on every
+  benchmark and stratum, `Ours → B5` is declared; (iii) multiple-comparison control (Holm) over
   the assembled-metric family replaces "3 of 5 metrics" language; (iv) all rules and
   thresholds are frozen in the protocol before E1/E3 held-out metrics are opened.
 
 ### 6.6 Predicted headline — and its failure reading
 
-Prediction: B0-level or better edge AUPRC (anchored `s0`), with the **held-out**
+Prediction: B0-level or better edge AUPRC (the jointly-trained trunk's `f_logit`
+floor, reported via the four-logit decomposition against the matched `B0-e2e` arm),
+with the **held-out**
 assembled-metric family improved over B0, `B0+cal`, `B3-dist`, and `B3-full` by the
 §4.6 mechanisms, within the G2 ceiling and read against the G3 Oracle headroom. E7
 (downstream graph utility) is **promoted to load-bearing** [EIC, DA-M8]: the claim
@@ -1116,7 +1198,8 @@ block-model marginals close most of the pair-to-topology gap") if the controls w
 | Imagined neighbors leak the queried label | label-agnostic generation; endpoint removed from targets; message/supervision partition; `∅_content` counterfactual reported |
 | s3 train-time quasi-oracle (structural targets contain supervision edges) | message-edge partition (R9) + leave-one-out corrections; E5 gate |
 | Community prior shortcut (context overrides pair) | gated fusion + counterfactual control; hard negatives |
-| Channel collinearity (s1≈s0, s2≈s3 ⇒ Ours→B5) | correlation matrix + knockouts + FCR-stratified pre-registered prediction; §6.5 decision rule (ii) |
+| Content pathway carries the win / topology gates stay dead [rev 3.0] | pathway-attribution rule (§4.4) is a headline requirement; gate-magnitude + per-branch gradient telemetry; branch dropout; FCR-stratified pre-registered prediction; §6.5 decision rule (ii) |
+| STE encodes a latent code disguised as a graph (π/m/Â/Π are feature-derived) [rev 3.0] | degree-preserving rewiring is the decisive control; edge-shuffle / DeepSets-reduction / matched-capacity-no-MP battery; degree-partialled representation probes |
 | Gains explained by extra parameters or operating point | B1/B5/`B0+cal`/`B3-dist`/`B3-full` + randomized scaffold at matched capacity + identical-head comparison + density-matched thresholds |
 | Assembled-graph realism capped by edge independence | G2 ceiling computed first; all tables read against it; stop condition defined |
 | E2 numbers fragile (weak scorer, easy negatives, undefined composite, mixed normalization) | G1 rerun completed with hard negatives and official BFS-macro GS/RD; current claims route only to the 2026-07-14 formal artifacts, and "strong scorer" wording remains retired [DA-m16] |
@@ -1186,3 +1269,13 @@ DSPN 1906.06565; PoinTr 2108.08839; VQ-VAE 1711.00937; VQGAN 2012.09841; RAC
 sentence at most); DIAMOND 2405.12399.
 Domain adaptation (mechanism sources): DANN 1505.07818; MCD 1712.02560; SHOT
 2002.08546.
+E2E conditioning & alignment (rev 3.0 additions; IDs verified against arXiv abstract
+pages 2026-07-16, ⊕ external-search, [venue-verify] before print): Leap ⊕ 2503.03331
+[venue-verify]; CAM tokens ⊕ 2405.19375 [venue-verify]; GOAT ⊕ 2111.05366
+[venue-verify]; SLOTAlign ⊕ 2301.12721 [venue-verify]; GraphToken ⊕ 2402.05862
+[venue-verify]; GraphGPT ⊕ 2310.13023 [venue-verify]; Flamingo ⊕ 2204.14198 (NeurIPS
+2022 [venue-verify]); GNN-FiLM ⊕ 1906.12192 (ICML 2019 [venue-verify]); subgraph-VGAE
+prediction ⊕ 2408.04053 [venue-verify]; Top-N set/graph generation ⊕ 2110.02096
+[venue-verify]; NodeDup ⊕ 2402.09711 [venue-verify]; Modality Dropout ⊕ 2005.13616
+[venue-verify]; modality competition Huang et al. ⊕ (ICML 2022, PMLR v162
+[venue-verify]).

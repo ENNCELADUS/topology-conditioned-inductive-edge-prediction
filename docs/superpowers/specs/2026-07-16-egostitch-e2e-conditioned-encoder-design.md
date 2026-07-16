@@ -1,11 +1,14 @@
 # EgoStitch E2E Redesign: Stitched-Topology-Conditioned Pair Encoder
 
 **Date:** 2026-07-16 (rev 2, same day — after the second user-as-reviewer round)
-**Status:** PENDING — this design lands only **after** the currently registered
-frozen-s0 Stage-1 screening run completes and publishes. Until then, no edits to
-`docs/03/04/05`, `configs/`, or `docs/registrations/` derive from this note; the
-pending screening registration binds to the current spec state and must not be
-edited out from under the run.
+**Status:** APPROVED (user-as-reviewer verdict 2026-07-16: Minor Revision passed,
+corrections applied in rev 3). **Research-doc landing executed 2026-07-16 by explicit
+user instruction:** proposal §4.4 (rev 3.0 headline), protocol §0 disposition +
+`B0-e2e` row + E4.15–E4.17, spec §14 (successor summary; §§1–13 untouched), and the
+README now carry this design. **Still gated on the frozen-s0 screen publishing:**
+all implementation (plan Phases 1–5), the full §5/§13 spec rewrite, the new config,
+and the replacement registration. The pending screening registration continues to
+bind to spec §§1–13 unchanged.
 
 **Rev 2 delta:** the rev-1 headline (pooled topology context `c` fused by a
 zero-init low-rank adapter) was assessed by the user-as-reviewer as readable as

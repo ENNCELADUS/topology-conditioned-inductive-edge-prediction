@@ -61,12 +61,23 @@ algorithm spec in `05-egostitch-spec.md`; the *outer* boundary above (per-query 
 context from frozen features → conditioned classifier → binary label) is unchanged and
 remains locked.
 
+**Disposition (2026-07-16, rev 3.0):** the headline decision mechanism is the
+**end-to-end stitched-topology-conditioned pair encoder** (`04-model-proposal.md`
+§4.4 rev 3.0): a jointly-trained V3.1-class pair encoder conditioned on a
+structure-only stitched-topology encoder via zero-init gated cross-attention, with the
+three-null (`∅_all_head` / `∅_topo_head` / `∅_content_head`) four-logit decomposition.
+The frozen pairwise scorer **loses its `s0`-anchor role**; it remains the B0 baseline
+and the E4.10 proposer. The rev-2.2 anchored-residual head is retained as an ablation
+arm. The *outer* §0 boundary is again unchanged and remains locked. The pending
+frozen-s0 Stage-1 screening registration keeps its own contract (§5.0.5); the
+successor's spec/registration land after that screen publishes (spec §14).
+
 Components:
 
 | Component | Status under the contract |
 |---|---|
 | Frozen feature encoder | Reuse as frozen node features `x_i`; never fine-tune in the core protocol. |
-| Frozen pairwise scorer | Reuse as B0, as the `s0` anchor, and (E4.10 only) as the edge-weight/candidate proposer. Provenance audited (§E5). |
+| Frozen pairwise scorer | Reuse as B0 and (E4.10 only) as the edge-weight/candidate proposer. Provenance audited (§E5). *(2026-07-16: the `s0`-anchor role is retired with the rev-3.0 headline; it survives only inside the frozen-s0 ablation arm.)* |
 | Scaffold construction | The method under test: generated + harmonized (`Ours`); retrieved + thresholded (E4.10). |
 | Scaffold encoder plus fused decision head | Reuse as the scaffold-conditioned classifier head; identical-head convention for generator comparisons (§3 E4). |
 | Global generated graph encoding | Report only as a baseline or ablation on the locality axis. |
@@ -151,6 +162,7 @@ Components:
 |---|---|---|---|
 | **B0** | Independent pairwise scorer | Frozen pairwise scorer over `(x_i, x_j)` | Topology-blind edge prediction |
 | **B0-alt** | Second pairwise scorer | Alternate pairwise architecture trained under the same split | Architecture-independence of the gap |
+| **B0-e2e** | Matched-training pairwise-only arm (rev 3.0) | `Ours`'s trunk with all conditioning permanently bypassed (`∅_all_head`), trained under exactly the `Ours` data/negatives/edge-active-steps/optimizer/seed/HPO | The honest pairwise control for the e2e head: separates training-regime effects from conditioning effects. Never conflated with canonical B0 (different data regime: `e_sup`/1:5/lr 3e-4/seed 0 vs `train_plus`/1:1/lr 1e-4/seed 47) |
 | **B0+cal** | B0 + calibrated assembly | Temperature/Platt calibration + density- and degree-sequence-matched thresholding of B0 scores | Whether trivial assembly calibration recovers the topology gains. Also applied on top of `Ours` as a diagnostic |
 | **B1** | Retrieval, no generated adjacency | Retrieve neighbors around `i` and `j`, pool features, use no scaffold edges | Value of adjacency vs retrieval alone |
 | **B2-global** | Global post-hoc refiner | Build one generated graph from pairwise scores, encode globally, decode each pair | Global context vs local context |
@@ -278,6 +290,8 @@ topology gap.
 8. **Loss terms:** edge-only; + statistic distances; + GIN-space; + seam term; full objective;
    `L_ssl` on/off; CVAE knockout (deterministic decoder).
 9. **Residual anchor weight:** vary how strongly the fused residual can move the frozen score.
+   *(2026-07-16: applies to the frozen-s0 ablation arm only — the rev-3.0 headline has no
+   residual anchor.)*
 10. **Retrieved-thresholded scaffold (E4.10):** the original §0 instantiation — bridge baseline.
 11. **Generation-only (E4.11):** no queried-edge supervision (subsumes blueprint B4).
 12. **Harmonization:** `R = 0` vs rounds sweep; mask-schedule sweep; slot-agreement trajectory;
@@ -285,6 +299,22 @@ topology gap.
 13. **Grounding:** grounded vs ungrounded (headline arm); grounding-only vs imagination-only;
     conditioning-dropout rates for both nulls with counterfactual contrasts reported.
 14. **Channels:** per-channel knockouts (s1/s2/s3/s4) with the s-channel correlation matrix.
+    *(2026-07-16: for the rev-3.0 headline this becomes E4.15–E4.17; the channel form
+    survives in the frozen-s0 arm.)*
+15. **Pathway attribution (rev 3.0, headline requirement):** pair+topology
+    (`∅_content_head` permanent) vs pair+content (`∅_topo_head` permanent) vs matched
+    `B0-e2e` (`∅_all_head` permanent); four-logit decomposition (full, `f_logit`,
+    pair+content, pair+topology) reported with every headline table; branch-dropout
+    `p = 0` and swept-rate arms.
+16. **Structure specificity (rev 3.0):** (a) within-pair `Â`/`Π` shuffle; (b) all scaffold
+    edges removed (STE degenerates to DeepSets); (c) cross-pair scaffold shuffle;
+    (d) matched-capacity randomized context; (e) **degree-preserving rewiring / weight
+    permutation** (preserves node count, per-edge-type mass, per-node soft degree, weight
+    distribution; destroys higher-order connectivity — the decisive control); (f)
+    capacity-matched non-message-passing token bottleneck.
+17. **Conditioning depth (rev 3.0):** none (`B0-e2e`) → logit-FiLM → pooled low-rank
+    adapter → STE + gated cross-attention (headline); plus `N_inj ∈ {1,2}` and
+    cls-token-only vs token-level injection variants.
 
 **Identical-head convention:** all generator comparisons (E4.6, E4.10, Oracle-scaffold) use the
 same fused decision head with the input-mapping convention of `05-egostitch-spec.md` (retrieved
@@ -440,6 +470,20 @@ rule).
    the completed artifact retains its old registration hash and remains diagnostic-only.
    A binding one-seed screening run requires the replacement experiment ID and run
    metadata pinned before training begins.
+   **Headline-model revision (2026-07-16, rev 3.0):** the pending frozen-s0 screening
+   contract above is unchanged and remains the binding contract for the already-pinned
+   frozen-s0 run — its outcome is the motivating arm for the successor. The **next**
+   Stage-1 build after that screen publishes is the e2e stitched-topology-conditioned
+   pair encoder (`04-model-proposal.md` §4.4 rev 3.0; implementation summary spec §14;
+   decision trail `docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md`),
+   screened under a fresh registration with a deliberately small five-arm scope: full
+   model, matched `B0-e2e`/f-only, pair+topology (`∅_content_head` permanent), one
+   structure-destroyed control (within-pair `Â`/`Π` shuffle), and branch-dropout
+   `p = 0`. E2E `B3-full`/`B5`, the conditioning-depth ladder (E4.17), and the
+   remaining structure battery (E4.16 b–f) are E1/E3 scope. The e2e screen's
+   registration must additionally pin the four-logit decomposition report, the
+   representation-probe protocol (including degree-partialled probes), the
+   within-checkpoint `f_logit` liveness reference, and a measured H20 cost re-estimate.
 
 ### 5.1 Priority order (after gates)
 
