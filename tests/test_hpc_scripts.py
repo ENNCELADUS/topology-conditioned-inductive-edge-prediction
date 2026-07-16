@@ -82,21 +82,19 @@ def test_help_is_available_without_the_remote_container(bash_exe: str) -> None:
     )
     assert g5_result.returncode == 0, g5_result.stderr
     assert "hpc/g5_stage1.sh seed <0|1|2>" in g5_result.stdout
-    assert "non-binding single-seed topology diagnostic" in g5_result.stdout
+    assert "single-seed Stage-1 screening gate" in g5_result.stdout
 
 
-def test_g5_runner_completes_each_seed_before_formal_holm() -> None:
+def test_g5_runner_completes_fixed_seed_before_screening_gate() -> None:
     text = G5_RUNNER.read_text()
     run_seed_body = text[text.index("run_seed()") : text.index("run_formal()")]
     assert run_seed_body.index("hpc/run.sh train") < run_seed_body.index("hpc/run.sh score")
-    assert run_seed_body.index("hpc/run.sh score") < run_seed_body.index(
-        "-m src.experiments.g5_stage1"
-    )
+    assert "-m src.experiments.g5_stage1" not in run_seed_body
     formal_body = text[text.index("run_formal()") :]
-    assert formal_body.index('run_seed "${seed}"') < formal_body.index(
+    assert formal_body.index("run_seed 0") < formal_body.index(
         '--output-dir "${FORMAL_ROOT}/formal_gate"'
     )
-    assert "model or hyperparameter change" in text
+    assert "Holm-corrected inference" in text
 
 
 def test_g5_runner_rejects_candidate_without_precision_provenance_before_reuse() -> None:

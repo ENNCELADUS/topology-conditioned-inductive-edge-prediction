@@ -10,7 +10,8 @@
 
 **Status:** G1, G2, and G3 are complete. G1 closes the architecture-independence
 requirement; neither G2 nor G3 triggers its stop rule. EgoStitch Stage 1 was subsequently
-implemented under the approved specification; its three-seed G5 evaluation is incomplete.
+implemented under the approved specification; its replacement one-seed engineering
+screening gate is incomplete.
 
 | Gate | Headline evidence | Decision |
 |---|---|---|
@@ -224,10 +225,11 @@ separately.
 The benchmark-aligned threshold sweep is preserved in the formal G1 artifact. Any claim
 away from the documented operating point must identify its exact threshold and recall.
 
-The next research stage is completion of the pre-registered G5 Stage-1 three-seed run
-and held-out gate under [`docs/05-egostitch-spec.md`](../05-egostitch-spec.md). The
-completed Seed-0 training result is recorded separately in
-[`G5-stage1-seed0-20260715.md`](G5-stage1-seed0-20260715.md); it is not a G5 verdict.
+The next research stage is completion of the replacement G5 Stage-1 fixed-one-seed
+screening run and held-out gate under [`docs/05-egostitch-spec.md`](../05-egostitch-spec.md).
+The retained Seed-0 result is recorded separately in
+[`G5-stage1-seed0-20260715.md`](G5-stage1-seed0-20260715.md); its superseded registration
+hash means it is not retroactively a G5 verdict.
 
 ## 7. Source artifacts
 

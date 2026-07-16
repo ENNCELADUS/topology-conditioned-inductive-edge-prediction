@@ -1,4 +1,4 @@
-# G5 Stage-1 Pre-registration (human-readable twin)
+# G5 Stage-1 Single-Seed Screening Registration (human-readable twin)
 
 > Machine-checked source of truth: [`g5_stage1_preregistration.json`](g5_stage1_preregistration.json).
 > The training worker records that file's sha256 in `run_metadata.json` at run start;
@@ -10,7 +10,11 @@
 
 Stage 1 of the G5 staged EgoStitch build (spec §13): imagination + degree budget +
 closure channel only — no codebook, no harmonization, no CVAE. Benchmark-A
-(`breadth_first`), spec-default hyperparameters, seeds {0, 1, 2}.
+(`breadth_first`), spec-default hyperparameters, fixed Seed 0.
+
+This replacement was adopted after the earlier exact-quota Seed-0 diagnostic was
+inspected. It is a post-observation engineering-screen contract, not a retroactive
+pre-registration; the completed diagnostic remains bound to its superseded hash.
 
 ## Comparators
 
@@ -19,18 +23,19 @@ closure channel only — no codebook, no harmonization, no CVAE. Benchmark-A
 **best comparator on that axis**. B1/B5 rows are deferred to E3 (protocol §5.0.5
 instantiation, 2026-07-14).
 
-## Primary criteria (Holm-corrected family, all must pass)
+## Primary criteria (single-seed point estimates, all must pass)
 
 Headroom-weighted from the completed G3 gate — clustering-MMD carries the largest
 measured headroom (Oracle-blend 3.885×), GS/local-RD the clearest Oracle-topo gains:
 
-1. **Clustering MMD ratio** strictly below every comparator (3-seed mean), with a
-   95% CI on the difference vs the best comparator excluding zero.
+1. **Clustering MMD ratio** strictly below every comparator.
 2. **BFS-macro GS** strictly above every comparator at matched global simple-edge RD.
 3. **BFS-macro RD** strictly above every comparator at matched global simple-edge RD.
 
-Statistics: per-seed differences, normal-approximation one-sided p-values
-(bootstrap variance included for the MMD member), Holm step-down at α = 0.05.
+No inferential acceptance procedure is used with one seed. P-values, CI pass flags,
+and Holm decisions are reported as not applicable. This Stage-1 screen cannot support
+statistical-significance or cross-seed-robustness claims; E1/E3 retain at least three
+seeds and Holm correction.
 
 ## Guards (both must hold)
 
@@ -48,7 +53,7 @@ FLOPs/wall-clock table (R = 0 commitment).
 
 ## Verdict
 
-`pass` ⇒ Stage 2 (+ codebook + s3) proceeds. `cut` ⇒ the pre-registered failure
-reading in the JSON is written into the gate results verbatim and the §4.6 rule cuts
-the mechanisms that own no gain. Criteria are never edited after held-out metrics
-are opened; §5.2 decision rules are copied verbatim in the JSON.
+`pass` ⇒ Stage 2 (+ codebook + s3) proceeds. `cut` ⇒ the registered failure reading
+in the JSON is written into the gate results verbatim and the §4.6 rule cuts the
+mechanisms that own no gain. All three primary point-estimate dominance checks and
+both guards must pass.

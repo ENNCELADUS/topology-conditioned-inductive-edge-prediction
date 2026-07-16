@@ -83,26 +83,21 @@ hpc/run.sh train configs/egostitch_stage1_breadth_first.yaml \
 
 It publishes the same atomic checkpoint/profile/manifest contract under the requested
 seed output directory. A complete training artifact is not a G5 result: the formal
-gate additionally requires all three seeds, candidate-universe scoring, fidelity
-diagnostics, and `src.experiments.g5_stage1` evaluation.
+gate additionally requires the fixed Seed 0 candidate-universe scoring, fidelity
+diagnostics, the shared cost report, and `src.experiments.g5_stage1` evaluation.
 
-The tracked outer runner completes one seed's full diagnostic path before starting
-the next seed:
+The tracked outer runner completes the fixed seed before opening the screening gate:
 
 ```bash
-hpc/g5_stage1.sh seed 0   # reuse complete training when valid; then score + diagnose
-hpc/g5_stage1.sh formal   # seed 0 full path -> seed 1 full path -> seed 2 full path -> Holm
+hpc/g5_stage1.sh seed 0   # reuse complete training when valid; then score
+hpc/g5_stage1.sh formal   # Seed 0 train/score -> required diagnostics -> screening gate
 ```
 
 Every `seed` invocation writes candidate scores under
-`outputs/egostitch_stage1/seedN/scores/` and an explicitly non-binding report under
-`seedN/topology_diagnostic/`. That report always says `diagnostic_only`; it is not a
-G5 pass/cut and suppresses Holm/pass flags. If inspection causes any model or
-hyperparameter change, stop this experiment and create a new experiment ID and
-pre-registration. If the scientific configuration is unchanged, continue the missing
-seeds; only `formal_gate/` may contain the binding three-seed verdict. The formal
-command fails closed unless each seed's required `fidelity.json` and the shared
-`cost_report.json` exist.
+`outputs/egostitch_stage1/seedN/scores/`. Only `formal_gate/` may contain the binding
+single-seed Stage-1 screening verdict. Inferential and Holm fields are not applicable;
+the screen does not replace E1/E3's multi-seed inference. The formal command fails
+closed unless Seed 0's required `fidelity.json` and the shared `cost_report.json` exist.
 
 Score the candidate universe once per checkpoint. `run.sh score` always injects
 `--device cuda --amp bf16`; on a multi-GPU node it launches one contiguous shard per

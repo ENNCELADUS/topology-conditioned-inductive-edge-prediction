@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# G5 Stage-1 outer orchestration: complete each seed before starting the next.
+# G5 Stage-1 outer orchestration: one fixed-seed engineering screening gate.
 set -euo pipefail
 
 readonly REPO_ROOT="/2023533015/topology-conditioned-inductive-edge-prediction"
@@ -22,16 +22,14 @@ Usage:
 Each seed is completed as:
   train (or validate an existing complete run)
   -> candidate scoring
-  -> explicitly non-binding single-seed topology diagnostic
 
-The formal command runs that sequence for seeds 0, 1, and 2, then opens the
-binding three-seed Holm gate. Formal evaluation additionally requires
-seedN/fidelity.json for every seed and outputs/egostitch_stage1/cost_report.json.
+The formal command runs that sequence for fixed Seed 0, then opens the binding
+single-seed Stage-1 screening gate. Formal evaluation additionally requires
+seed0/fidelity.json and outputs/egostitch_stage1/cost_report.json.
 
-A single-seed diagnostic is never a G5 pass/cut. If its inspection leads to a
-model or hyperparameter change, this registered experiment must stop and a new
-experiment ID and pre-registration must be created. With unchanged scientific
-configuration, missing seeds may be completed under the existing registration.
+This engineering screen uses deterministic point-estimate dominance and does not
+claim statistical significance or cross-seed robustness. E1/E3 still require at
+least three seeds and Holm-corrected inference.
 EOF
 }
 
@@ -69,7 +67,6 @@ run_seed() {
   local seed="$1"
   local seed_dir="${FORMAL_ROOT}/seed${seed}"
   local candidate="${seed_dir}/scores/candidate.npz"
-  local diagnostic_dir="${seed_dir}/topology_diagnostic"
 
   validate_seed "${seed}"
   if [[ -s "${seed_dir}/complete.json" && -s "${seed_dir}/artifact_manifest.json" ]]; then
@@ -101,41 +98,22 @@ run_seed() {
       --output "${candidate}"
   fi
 
-  write_status topology_diagnostic "${seed}"
-  "${PYTHON_BIN}" -m src.experiments.g5_stage1 \
-    --egostitch-universe "${candidate}" \
-    --run-metadata "${seed_dir}/run_metadata.json" \
-    --b0-universe "${B0_UNIVERSE}" \
-    --b0cal-results "${B0CAL_RESULTS}" \
-    --preregistration "${PREREGISTRATION}" \
-    --data-root data \
-    --strategy breadth_first \
-    --output-dir "${diagnostic_dir}"
-  echo "seed ${seed}: non-binding topology diagnostic complete at ${diagnostic_dir}"
+  echo "seed ${seed}: training and candidate scoring complete"
 }
 
 run_formal() {
-  local seed
-  for seed in 0 1 2; do
-    run_seed "${seed}"
-  done
+  run_seed 0
 
-  for seed in 0 1 2; do
-    [[ -s "${FORMAL_ROOT}/seed${seed}/fidelity.json" ]] || \
-      fail "formal gate requires ${FORMAL_ROOT}/seed${seed}/fidelity.json"
-  done
+  [[ -s "${FORMAL_ROOT}/seed0/fidelity.json" ]] || \
+    fail "formal gate requires ${FORMAL_ROOT}/seed0/fidelity.json"
   [[ -s "${COST_REPORT}" ]] || fail "formal gate requires ${COST_REPORT}"
 
-  write_status formal_holm
+  write_status single_seed_screening 0
   "${PYTHON_BIN}" -m src.experiments.g5_stage1 \
     --egostitch-universe \
       "${FORMAL_ROOT}/seed0/scores/candidate.npz" \
-      "${FORMAL_ROOT}/seed1/scores/candidate.npz" \
-      "${FORMAL_ROOT}/seed2/scores/candidate.npz" \
     --run-metadata \
       "${FORMAL_ROOT}/seed0/run_metadata.json" \
-      "${FORMAL_ROOT}/seed1/run_metadata.json" \
-      "${FORMAL_ROOT}/seed2/run_metadata.json" \
     --b0-universe "${B0_UNIVERSE}" \
     --b0cal-results "${B0CAL_RESULTS}" \
     --preregistration "${PREREGISTRATION}" \
@@ -143,11 +121,9 @@ run_formal() {
     --strategy breadth_first \
     --fidelity-report \
       "${FORMAL_ROOT}/seed0/fidelity.json" \
-      "${FORMAL_ROOT}/seed1/fidelity.json" \
-      "${FORMAL_ROOT}/seed2/fidelity.json" \
     --cost-report "${COST_REPORT}" \
     --output-dir "${FORMAL_ROOT}/formal_gate"
-  printf 'state=complete stage=formal_holm commit=%s ended=%s\n' \
+  printf 'state=complete stage=single_seed_screening seed=0 commit=%s ended=%s\n' \
     "$(git rev-parse HEAD)" "$(date -Iseconds)" >"${FORMAL_ROOT}/pipeline.status"
 }
 

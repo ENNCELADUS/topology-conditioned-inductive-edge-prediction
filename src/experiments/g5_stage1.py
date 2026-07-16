@@ -1,29 +1,28 @@
-r"""G5 Stage-1 gate evaluation: pre-registered EgoStitch-vs-comparator decision.
+r"""G5 Stage-1 gate evaluation: registered EgoStitch-vs-comparator screen.
 
-Evaluates either one seed as an explicitly non-binding topology diagnostic or
-the three pre-registered EgoStitch Stage-1 seeds as the formal gate against the
-frozen comparators (B0 recomputed from its cached artifact; the B0+cal arms
-from the committed kill-test payload) under the pre-registered criteria
+Evaluates one fixed EgoStitch Stage-1 seed as a binding engineering screening
+gate against the frozen comparators (B0 recomputed from its cached artifact;
+the B0+cal arms from the committed kill-test payload) under the registered criteria
 (docs/registrations/g5_stage1_preregistration.json; protocol Sec 5.0.5/5.2):
 
 - **Enforcement first**: the pre-registration file's sha256 must equal the
   ``preregistration_sha256`` recorded in every training run's
   ``run_metadata.json`` — held-out metrics are never opened on a mismatch.
-- **Primary family** (Holm at the pre-registered alpha, all must pass):
-  clustering-MMD ratio at the canonical G1 operating point; BFS-macro GS and
-  RD at matched global simple-edge RD (per-comparator deterministic exact-quota
-  re-assembly).
+- **Primary family** (single-seed point-estimate dominance, all must pass):
+  clustering-MMD ratio at the canonical G1 operating point; BFS-macro GS and RD
+  at matched global simple-edge RD (per-comparator deterministic exact-quota
+  re-assembly). Inferential and Holm fields are not applicable at Stage 1.
 - **Guards**: degree-MMD non-regression (<= 1.10x B0); matched edge AUPRC
   (degree-corrected ratio-1, within 0.02 of B0).
-- **Verdict**: one seed always yields ``"diagnostic_only"``; exactly three
-  seeds yield ``"pass"`` or ``"cut"`` and, on cut, the pre-registered failure
-  reading is written verbatim — criteria are never edited post hoc.
+- **Verdict**: the fixed seed yields ``"pass"`` or ``"cut"`` and, on cut, the
+  registered failure reading is written verbatim. This engineering screen does
+  not establish statistical significance or cross-seed robustness.
 
 CLI::
 
     python -m src.experiments.g5_stage1 \
-        --egostitch-universe s0.npz s1.npz s2.npz \
-        --run-metadata run0/run_metadata.json run1/... run2/... \
+        --egostitch-universe s0.npz \
+        --run-metadata run0/run_metadata.json \
         --b0-universe scores/b0_v31_candidate.npz \
         --b0cal-results outputs/b0_cal/b0cal_results.json \
         --preregistration docs/registrations/g5_stage1_preregistration.json \
@@ -491,7 +490,7 @@ def run_g5_stage1_pipeline(
         seed: Evaluation seed (bootstrap resampling only; training seeds live
             in the artifacts).
         fidelity_report_paths: Per-seed fidelity JSONs (`src.eval.ego_fidelity`
-            outputs), embedded verbatim and required for the formal 3-seed gate.
+            outputs), embedded verbatim and required for the binding gate.
         cost_report_path: FLOPs/wall-clock JSON (proposal Sec 4.7 R = 0
             commitment), embedded verbatim and required for the formal gate.
 
@@ -505,30 +504,36 @@ def run_g5_stage1_pipeline(
     n_runs = len(egostitch_universe_paths)
     if n_runs != len(run_metadata_paths):
         raise ValueError("one --run-metadata per --egostitch-universe is required")
-    if n_runs not in (1, 3):
-        raise ValueError(
-            "G5 Stage-1 evaluation requires either one seed for a non-binding "
-            "diagnostic or exactly three seeds for the formal Holm verdict"
-        )
-    formal = n_runs == 3
 
     # (1) Pre-registration enforcement FIRST — no scores are opened before this.
     prereg_sha = enforce_preregistration(preregistration_path, run_metadata_paths)
     prereg = cast(dict[str, object], json.loads(preregistration_path.read_text(encoding="utf-8")))
     enforce_frozen_inputs(prereg, preregistration_path, b0_universe_path)
-    if formal:
-        fidelity, cost_report = _load_required_diagnostics(
-            fidelity_report_paths, cost_report_path, n_runs
+    registered_seeds = cast(list[int], prereg.get("seeds"))
+    if registered_seeds != [0]:
+        raise ValueError("G5 Stage-1 registration must pin exactly seeds: [0]")
+    if n_runs != len(registered_seeds):
+        raise ValueError(
+            f"G5 Stage-1 registration requires {len(registered_seeds)} seed artifact(s); "
+            f"received {n_runs}"
         )
-    else:
-        fidelity, cost_report = [], None
+    primary_config = cast(dict[str, object], prereg["primary_criteria"])
+    decision_procedure = primary_config.get("decision_procedure")
+    if decision_procedure != "single_seed_point_estimate_dominance":
+        raise ValueError("unsupported G5 Stage-1 decision_procedure")
+    fidelity, cost_report = _load_required_diagnostics(
+        fidelity_report_paths, cost_report_path, n_runs
+    )
     run_metadata = [
         cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
         for path in run_metadata_paths
     ]
-    holm_alpha = float(
-        cast(float, cast(dict[str, object], prereg["primary_criteria"]).get("holm_alpha", 0.05))
-    )
+    for expected_seed, metadata in zip(registered_seeds, run_metadata, strict=True):
+        if metadata.get("seed") not in (None, expected_seed):
+            raise ValueError(
+                f"run metadata seed {metadata.get('seed')!r} does not match "
+                f"registered seed {expected_seed}"
+            )
 
     benchmark_root = data_root / _BENCHMARK_SUBDIR
     g_ref = load_test_graph(benchmark_root, strategy)
@@ -701,7 +706,8 @@ def run_g5_stage1_pipeline(
             matched_rd_selected_from_tie[name].append(selected.selected_from_boundary_tie)
             matched_rd_split_boundary_tie[name].append(selected.split_boundary_tie)
 
-    # (4) Primary criteria + Holm.
+    # (4) Primary criteria. Stage 1 is a one-seed engineering screen, so
+    # inferential fields and Holm decisions are deliberately not applicable.
     criteria = {
         "clustering_mmd_ratio": clustering_criterion(ego_rows, comparators),
         "bfs_macro_gs": matched_rd_criterion(
@@ -715,24 +721,10 @@ def run_g5_stage1_pipeline(
             {name: cast(float, comparators[name]["relative_density"]) for name in _COMPARATORS},
         ),
     }
-    holm: dict[str, bool | None]
-    primary_pass: dict[str, bool | None]
-    if formal:
-        formal_holm = holm_step_down(
-            {name: criteria[name].p_value for name in _PRIMARY_FAMILY}, holm_alpha
-        )
-        holm = dict(formal_holm)
-        primary_pass = {
-            name: bool(
-                formal_holm[name]
-                and criteria[name].dominates_every_comparator
-                and (name != "clustering_mmd_ratio" or criteria[name].ci_excludes_zero)
-            )
-            for name in _PRIMARY_FAMILY
-        }
-    else:
-        holm = dict.fromkeys(_PRIMARY_FAMILY)
-        primary_pass = dict.fromkeys(_PRIMARY_FAMILY)
+    holm: dict[str, bool | None] = dict.fromkeys(_PRIMARY_FAMILY)
+    primary_pass: dict[str, bool | None] = {
+        name: criteria[name].dominates_every_comparator for name in _PRIMARY_FAMILY
+    }
 
     # (5) Guards.
     ego_degree_mean = float(np.mean([row.mmd_ratio["degree"] for row in ego_rows]))
@@ -753,16 +745,16 @@ def run_g5_stage1_pipeline(
         },
     }
 
-    if formal:
-        verdict = (
-            "pass"
-            if all(value is True for value in primary_pass.values())
-            and degree_guard
-            and auprc_guard
-            else "cut"
-        )
-    else:
-        verdict = "diagnostic_only"
+    verdict = (
+        "pass"
+        if all(value is True for value in primary_pass.values()) and degree_guard and auprc_guard
+        else "cut"
+    )
+    criteria_payload = {name: criteria[name].to_jsonable() for name in _PRIMARY_FAMILY}
+    for row in criteria_payload.values():
+        row["se"] = None
+        row["p_value"] = None
+        row["ci_excludes_zero"] = None
 
     payload: dict[str, object] = {
         "metadata": {
@@ -770,19 +762,11 @@ def run_g5_stage1_pipeline(
             "preregistration_path": str(preregistration_path),
             "benchmark": {"benchmark_a": strategy},
             "n_seeds": n_runs,
-            "evaluation_mode": "formal_3seed" if formal else "single_seed_diagnostic",
-            "binding_verdict": formal,
-            "continuation_rule": (
-                "This single-seed output is non-binding and is not a G5 pass/cut. "
-                "Changing model or hyperparameters after inspecting it invalidates the "
-                "registered three-seed experiment and requires a new experiment ID and "
-                "pre-registration; with unchanged scientific configuration, seeds 1 and 2 "
-                "may be completed for the formal verdict."
-                if not formal
-                else None
-            ),
+            "evaluation_mode": "single_seed_screening",
+            "binding_verdict": True,
+            "decision_procedure": decision_procedure,
             "evaluation_seed": seed,
-            "holm_alpha": holm_alpha,
+            "holm_alpha": None,
             "matched_rd_rule": (
                 "per comparator: egostitch realizes the comparator's exact non-self "
                 "edge quota by descending pass-1 score; only the boundary-score tie "
@@ -790,11 +774,10 @@ def run_g5_stage1_pipeline(
                 "every row enforces |RD_global(ego)-RD_global(comparator)| <= 0.005"
             ),
             "single_seed_caveat": (
-                "Descriptive metric differences and p-values are shown only as an early "
-                "signal. Holm decisions and primary pass flags are suppressed because the "
-                "pre-registered criteria require three seeds."
-                if not formal
-                else None
+                "This binding Stage-1 engineering screen uses one fixed training seed and "
+                "deterministic point-estimate dominance. It does not establish statistical "
+                "significance or cross-seed robustness and does not replace E1/E3's "
+                "at-least-three-seed Holm procedure."
             ),
             "s0_correlation_note": (
                 "corr(egostitch logit, frozen-B0 logit) per seed; the full "
@@ -818,7 +801,7 @@ def run_g5_stage1_pipeline(
             "matched_rd_selected_from_boundary_tie": matched_rd_selected_from_tie,
             "matched_rd_split_boundary_tie": matched_rd_split_boundary_tie,
         },
-        "criteria": {name: criteria[name].to_jsonable() for name in _PRIMARY_FAMILY},
+        "criteria": criteria_payload,
         "holm_survives": holm,
         "primary_pass": primary_pass,
         "guards": guards,
@@ -868,23 +851,16 @@ def render_tables_markdown(payload: dict[str, object]) -> str:
     holm = cast(dict[str, bool | None], payload["holm_survives"])
     primary_pass = cast(dict[str, bool | None], payload["primary_pass"])
     guards = cast(dict[str, dict[str, object]], payload["guards"])
-    metadata = cast(dict[str, object], payload["metadata"])
-    formal = bool(metadata["binding_verdict"])
-
     lines: list[str] = [
-        "# G5 Stage-1 gate report" if formal else "# G5 Stage-1 single-seed topology diagnostic",
+        "# G5 Stage-1 single-seed screening gate report",
         "",
         f"**Verdict: `{payload['verdict']}`**",
         "",
+        "**Scope:** Binding Stage-1 engineering screen for one fixed seed; this report ",
+        "does not claim statistical significance or cross-seed robustness and does not ",
+        "replace the E1/E3 multi-seed Holm evaluation.",
+        "",
     ]
-    if not formal:
-        lines += [
-            "**NON-BINDING:** This is not a G5 pass/cut. The formal verdict requires ",
-            "seeds 0, 1, and 2 plus the pre-registered Holm procedure.",
-            "",
-            str(metadata["continuation_rule"]),
-            "",
-        ]
     lines += [
         "## Assembled rows (canonical operating point)",
         "",
@@ -908,7 +884,7 @@ def render_tables_markdown(payload: dict[str, object]) -> str:
 
     lines += [
         "",
-        "## Pre-registered decision table",
+        "## Registered decision table",
         "",
         "| criterion | mean diff | SE | p | Holm | dominance | CI excl. 0 | bar | pass |",
         "|---|---|---|---|---|---|---|---|---|",
@@ -969,15 +945,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         nargs="+",
         default=(),
-        help=(
-            "required per-seed reports for the formal 3-seed gate; omitted for one-seed diagnostic"
-        ),
+        help=("required per-seed fidelity report for the binding Stage-1 screen"),
     )
     parser.add_argument(
         "--cost-report",
         type=Path,
         default=None,
-        help="required for the formal 3-seed gate; omitted for one-seed diagnostic",
+        help="required cost report for the binding Stage-1 screen",
     )
     return parser
 

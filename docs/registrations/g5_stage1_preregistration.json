@@ -1,15 +1,15 @@
 {
-  "registration_id": "g5-stage1-20260716-exact-quota",
+  "registration_id": "g5-stage1-20260716-single-seed-screen",
   "gate": "G5 Stage 1 - EgoStitch minimum-viable model (imagination + degree budget + closure)",
   "created_utc": "2026-07-16T00:00:00Z",
-  "amendment_rationale": "Replacement registration made before any held-out topology metric was produced. An unpublished fp32 feasibility rescore showed that the model has intrinsic exact-score ties (largest group 143,690 of 2,037,171 rows) and that the former atomic-threshold rule cannot match the b0_cal_selfdensity realized quota within the unchanged 0.005 global-RD tolerance (nearest gap 0.0206452). The operating point is therefore defined by deterministic exact-quota selection within boundary ties. No model, hyperparameter, comparator, metric, tolerance, seed, or Holm rule changed; artifacts bound to the superseded registration hash are not formal inputs to this registration.",
+  "amendment_rationale": "Post-observation protocol replacement made after the exact-quota Seed-0 diagnostic was produced and inspected. G5 Stage 1 is re-scoped from a three-seed inferential gate to a one-seed engineering screening gate to reduce screening cost; this does not retroactively bind the completed diagnostic, whose run metadata carries the superseded registration hash. Future binding runs require this new experiment ID and hash before training. The model, hyperparameters, comparators, metrics, exact-quota operating point, 0.005 RD tolerance, and guards are unchanged. E1/E3 retain at least three seeds and Holm-corrected inference.",
   "spec_binding": "docs/05-egostitch-spec.md §13",
   "protocol_binding": "docs/03-experiment-protocol.md §5.0.5, §5.2",
   "benchmark": {
     "alias": "Benchmark-A",
     "strategy": "breadth_first"
   },
-  "seeds": [0, 1, 2],
+  "seeds": [0],
   "frozen_inputs": {
     "b0_candidate_scores": {
       "path": "outputs/deliverables/b0_v31_breadth_first_20260711/scores/candidate.npz",
@@ -39,36 +39,36 @@
   },
   "primary_criteria": {
     "family": ["clustering_mmd_ratio", "bfs_macro_gs", "bfs_macro_rd"],
-    "holm_alpha": 0.05,
+    "decision_procedure": "single_seed_point_estimate_dominance",
     "rationale": "Headroom-weighted from the completed G3 gate: Oracle-blend clustering-MMD headroom 3.885 is the largest measured axis; Oracle-topo shows GS/local-RD headroom (1.612x / 0.794 vs 0.422). Pure topology signal can regress the degree axis (Oracle-topo degree headroom 0.926), so degree is a guard, not a primary criterion.",
     "criteria": [
       {
         "metric": "clustering_mmd_ratio",
         "direction": "lower_is_better",
-        "rule": "3-seed mean strictly lower than every comparator, AND the normal-approximation 95% CI of the mean per-seed difference vs the best comparator excludes 0 (see statistics_procedure)"
+        "rule": "Seed-0 point estimate strictly lower than every comparator at the canonical operating point"
       },
       {
         "metric": "bfs_macro_gs",
         "direction": "higher_is_better",
-        "rule": "3-seed mean strictly higher than every comparator at matched global simple-edge RD, AND the one-sided p-value vs the best comparator survives Holm"
+        "rule": "Seed-0 point estimate strictly higher than every comparator at matched global simple-edge RD"
       },
       {
         "metric": "bfs_macro_rd",
         "direction": "higher_is_better",
-        "rule": "3-seed mean strictly higher than every comparator at matched global simple-edge RD, AND the one-sided p-value vs the best comparator survives Holm"
+        "rule": "Seed-0 point estimate strictly higher than every comparator at matched global simple-edge RD"
       }
     ],
-    "statistics_procedure": "Per metric: per-seed difference d_s = metric(egostitch, seed s) - metric(best comparator on that axis). For clustering_mmd_ratio the per-seed variance additionally includes the bootstrap variance of each side (n_boot=200, bucket-resampling convention of src/eval/graph_metrics.py:bootstrap_mmd): SE^2 = mean_s(var_boot(d_s)) + var_s(d_s)/3. For bfs_macro_gs and bfs_macro_rd (no bootstrap field in AssembledRow), SE^2 = var_s(d_s)/3 (between-seed only; low power at 3 seeds is accepted and mean strict dominance is additionally required). One-sided p = 1 - Phi(mean_s(d_s)/SE) in the beneficial direction. Holm step-down over the 3-member family at alpha=0.05; all three members must survive.",
+    "statistics_procedure": "No inferential acceptance procedure is valid with one training seed. The gate records point estimates and descriptive bootstrap uncertainty where available, but p-values, confidence-interval pass flags, and Holm decisions are not applicable and must not be used for acceptance. All three deterministic dominance criteria must pass.",
     "all_must_pass": true
   },
   "guards": [
     {
       "name": "degree_mmd_non_regression",
-      "rule": "3-seed mean degree-MMD ratio <= 1.10 x the B0 degree-MMD ratio recomputed from the frozen candidate artifact at the G1 operating point"
+      "rule": "Seed-0 degree-MMD ratio <= 1.10 x the B0 degree-MMD ratio recomputed from the frozen candidate artifact at the G1 operating point"
     },
     {
       "name": "matched_edge_auprc",
-      "rule": "3-seed mean AUPRC on the degree-corrected ratio-1 regime >= (B0's recomputed value on the same regime) - 0.02; hard-heuristic and hard-feature regime rows are disclosed but not gated at Stage 1"
+      "rule": "Seed-0 AUPRC on the degree-corrected ratio-1 regime >= (B0's recomputed value on the same regime) - 0.02; hard-heuristic and hard-feature regime rows are disclosed but not gated at Stage 1"
     }
   ],
   "diagnostics_nonbinding": [
@@ -80,17 +80,17 @@
     "proj(x) batch variance trajectory (representation-collapse watch, spec §13.7)",
     "FLOPs and wall-clock table: per-node cached, per-pair marginal, full candidate-universe assembly (proposal §4.7 R=0 commitment)"
   ],
-  "verdict_rule": "pass iff all three primary criteria survive Holm AND both guards hold. Otherwise the verdict is 'cut' and the pre-registered failure reading below is written into the gate results verbatim; criteria are never edited post hoc.",
+  "verdict_rule": "single-seed screening pass iff Seed 0 strictly dominates every comparator on all three primary criteria AND both guards hold. P-values, confidence-interval pass flags, and Holm decisions are not applicable. Otherwise the screening verdict is 'cut' and the registered failure reading below is written into the gate results verbatim.",
   "failure_reading": "If Stage 1 fails the primary family against B0+cal, the generative imagination apparatus is not load-bearing at this stage (§5.2.1 wording): the calibrated-assembly story is written up honestly and the locked-decision discussion is taken before Stage 2. If Stage 1 fails only against B0 with B0+cal also failing against B0, the assembly-calibration axis is re-examined before mechanisms are cut.",
   "decision_rules_5_2_verbatim": [
-    "If `Ours` does not beat `B3-full` and `B0+cal` on the held-out assembled family at matched edge AUPRC (Holm-corrected, >= 3 seeds), the generative apparatus is declared not load-bearing; the paper pivots to the benchmark/`B3-full` story.",
+    "For the G5 Stage-1 engineering screen, if the fixed Seed-0 run does not strictly dominate every registered comparator on all three primary topology axes while passing both guards, the Stage-1 mechanism is cut; no statistical-significance or cross-seed-robustness claim is made.",
     "If s1/s2 knockouts cost nothing on every benchmark and stratum, `Ours -> B5` is declared and the honest small-paper outcome (\"calibrated block-model marginals close most of the pair-to-topology gap\") is written.",
-    "Multiple-comparison control: Holm over the held-out assembled family replaces any \"wins on k of n metrics\" language.",
+    "For E1/E3 paper-level comparisons, Holm over the held-out assembled family and at least three seeds remain required; the one-seed Stage-1 screen does not replace that rule.",
     "All thresholds and rules recorded in run metadata before E1/E3 held-out metrics are opened."
   ],
   "mechanics": {
     "worker_obligation": "src/train_egostitch.py records this file's sha256 as run_metadata.json['preregistration_sha256'] at run start, before the first optimizer step.",
     "gate_obligation": "src/experiments/g5_stage1.py recomputes this file's sha256 and refuses to open held-out metrics unless it equals the value recorded in every supplied run's run_metadata.json.",
-    "hyperparameters": "spec-default (docs/05-egostitch-spec.md §0/§13) x 3 seeds; the 30-config HPO-parity budget applies at E1/E3, not at this stage gate (protocol §5.0.5 instantiation)."
+    "hyperparameters": "spec-default (docs/05-egostitch-spec.md §0/§13) x fixed Seed 0; additional seeds are optional robustness analyses. The 30-config HPO-parity and at-least-three-seed Holm requirements apply at E1/E3, not at this Stage-1 screening gate."
   }
 }

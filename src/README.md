@@ -11,8 +11,9 @@ G1–G3 analyses, and the pre-registered EgoStitch Stage-1 model and gate.
 - `train_b0.py` / `train_egostitch.py`: baseline and auto-sized DDP training workers.
 - `score_universe.py`: shardable scoring and strict artifact merge.
 
-The current formal G5 Stage-1 run has one completed seed and no three-seed verdict;
-see [`docs/results/G5-stage1-seed0-20260715.md`](../docs/results/G5-stage1-seed0-20260715.md).
+The retained Seed-0 diagnostic was produced under a superseded registration and is not
+a current G5 verdict. The replacement Stage-1 gate is a one-fixed-seed engineering
+screen; see [`docs/results/G5-stage1-seed0-20260715.md`](../docs/results/G5-stage1-seed0-20260715.md).
 The binding contracts remain [`CLAUDE.md`](../CLAUDE.md), the
 [experiment protocol](../docs/03-experiment-protocol.md), and the
 [EgoStitch specification](../docs/05-egostitch-spec.md).

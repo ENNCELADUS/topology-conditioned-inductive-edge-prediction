@@ -29,9 +29,11 @@
 This repository holds the implementation and experiment pipeline for an ICLR 2027
 paper. The benchmark loaders, evaluation library, B0/B0-alt baselines, score-once
 artifact pipeline, gates G1–G3, and the pre-registered EgoStitch Stage-1 model are
-implemented and tested. The formal G5 Stage-1 run is **incomplete**: Seed 0 completed,
-Seed 1 stopped at the artifact performance gate, and Seed 2 was not run. Consequently,
-there is no three-seed G5 verdict yet.
+implemented and tested. A 2026-07-16 Seed-0 topology diagnostic completed under the
+superseded three-seed registration and showed essentially no change from frozen B0;
+it remains diagnostic-only. G5 Stage 1 is now a one-fixed-seed engineering screen,
+but no run has yet been bound to the replacement registration with its required
+fidelity and cost reports, so there is no current G5 Stage-1 verdict.
 
 - **Task:** given two *unseen* nodes with frozen feature vectors, predict whether an
   edge exists between them (binary classification), under a strict inductive protocol
@@ -113,12 +115,13 @@ close the topology gap. The complete closeout package is
 
 ## The Proposed Method (EgoStitch)
 
-> **Status: Stage-1 implemented; formal gate incomplete (2026-07-15).** Design proposal approved and gate G4 signed off —
+> **Status: Stage-1 implemented; replacement screening gate incomplete (2026-07-16).** Design proposal approved and gate G4 signed off —
 > [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) is the active implementation
 > contract (algorithm spec + benchmark/data contract + auto-sized H20 execution design). Design
 > rationale: [`docs/04-model-proposal.md`](docs/04-model-proposal.md). G1 (including
 > B0-alt), G2, and G3 (Oracle) are complete. The Stage-1 implementation now awaits a
-> complete three-seed run and the pre-registered held-out gate evaluation.
+> fixed-Seed-0 run bound to the replacement registration plus fidelity/cost diagnostics
+> and the held-out screening evaluation.
 
 For each queried pair `(i, j)`, each endpoint **imagines its own ego-network** (latent
 neighbor nodes with existence probabilities, local adjacency, and a degree budget)
@@ -218,8 +221,8 @@ target test graph; the queried edge is masked/standardized inside the scaffold. 
 - [x] **Latest legacy v3.1 robustness rerun** — canonical G1 confirms that the stronger scorer preserves the topology gap; final artifacts are under [`outputs/deliverables/legacy_g1_graph_metrics_20260714/`](outputs/deliverables/legacy_g1_graph_metrics_20260714/).
 - [x] **G3 gate** — Oracle row passed; Oracle-blend shows substantial headroom over B0 and the feature-insufficiency stop rule is not triggered. Final artifacts are under [`outputs/deliverables/g3_graph_metrics_20260714/`](outputs/deliverables/g3_graph_metrics_20260714/).
 - [x] **EgoStitch Stage-1 implementation** — model, losses, data targets, auto-sized DDP worker, scoring, fidelity diagnostics, calibrated comparator, G5 runner, and tests are implemented under `src/`.
-- [ ] **G5 Stage-1 formal gate** — Seed 0 completed on 2 × H20 (`AUPRC 0.951966`, `AUROC 0.945766` at epoch 14); Seed 1 stopped at the pre-registered artifact performance gate and Seed 2 did not run. See [`docs/results/G5-stage1-seed0-20260715.md`](docs/results/G5-stage1-seed0-20260715.md). This is not a G5 pass/fail result.
-- [ ] **Experiments** in priority order: complete the G5 Stage-1 three-seed run and held-out gate → accepted later G5 stages → E1/E3 main + baselines → E4 ablations → E5 integrity gates → E7 (load-bearing) → E6 breadth.
+- [ ] **G5 Stage-1 screening gate** — the latest exact-quota Seed-0 run completed training, candidate scoring, and a diagnostic-only topology evaluation under the superseded registration. The replacement one-seed screen still needs a newly bound run plus fidelity/cost reports. See [`docs/results/G5-stage1-seed0-20260715.md`](docs/results/G5-stage1-seed0-20260715.md); the existing artifact is not retroactively a G5 pass/cut.
+- [ ] **Experiments** in priority order: complete the replacement G5 Stage-1 single-seed screen → accepted later G5 stages → E1/E3 multi-seed main + baselines → E4 ablations → E5 integrity gates → E7 (load-bearing) → E6 breadth.
 
 ## HPC execution
 

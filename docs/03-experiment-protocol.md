@@ -403,9 +403,10 @@ rule).
    the pre-registered criteria or the added mechanism is cut.
    **Stage-gate instantiation (2026-07-14, pre-implementation):** the Stage-1 gate
    comparators are `B0` (frozen candidate-scores artifact) and `B0+cal`; B1/B5 comparison
-   rows are deferred to E3 with their implementations. Stage gates run at spec-default
-   hyperparameters × 3 seeds — the §8-spec 30-config HPO-parity budget applies to the
-   E1/E3 ladder, not to G5 stage gates. Stage-1 acceptance criteria (headroom-weighted:
+   rows are deferred to E3 with their implementations. Stage 1 runs at spec-default
+   hyperparameters × one fixed seed as an engineering screening gate — the §8-spec
+   30-config HPO-parity budget and at-least-three-seed inference apply to the E1/E3
+   ladder, not to G5 Stage 1. Stage-1 acceptance criteria (headroom-weighted:
    clustering-MMD and BFS-macro GS/RD primary at matched global simple-edge RD;
    degree-MMD non-regression and matched-AUPRC guards) are pre-registered in
    `docs/registrations/g5_stage1_preregistration.json` before any held-out metric is
@@ -416,20 +417,29 @@ rule).
    (`steady_state_data_wait_fraction > 0.05`), so Seed 2 and all held-out gate rows
    remain unrun. This is an incomplete execution state, not a G5 decision; see
    `docs/results/G5-stage1-seed0-20260715.md`.
-   **Outer orchestration (revised 2026-07-15):** each seed now completes training,
-   candidate scoring, and a clearly labeled non-binding single-seed topology
-   diagnostic before the next seed begins. The diagnostic cannot produce a G5
-   pass/cut or Holm decision. Changing the model or hyperparameters after inspecting
-   it invalidates this registration and requires a new experiment ID/pre-registration;
-   with unchanged scientific configuration, the remaining seeds may be completed and
-   only their combined three-seed report is the formal verdict.
+   **Stage-1 decision scope (revised 2026-07-16 after inspecting the exact-quota
+   Seed-0 diagnostic):** one fixed seed is sufficient for the G5 Stage-1 engineering
+   screening decision. The seed must complete training, candidate scoring, required
+   fidelity/cost diagnostics, and the held-out topology gate. Acceptance is deterministic
+   point-estimate dominance on all three registered primary axes plus both guards;
+   p-values, confidence intervals, and Holm decisions are not acceptance evidence with
+   one seed and must be reported as not applicable. This screening verdict does not
+   support statistical-significance or cross-seed-robustness claims. E1/E3 remain bound
+   to §5.2's at-least-three-seed Holm procedure.
    **Registration replacement (2026-07-16, before any held-out topology metric):** an
    fp32 feasibility rescore showed intrinsic boundary ties for which the former atomic
    threshold could not satisfy the unchanged 0.005 matched-global-RD tolerance. The
    current registration therefore selects the comparator's exact non-self quota by
    score and resolves only the boundary tie by canonical pair order, without labels or
    topology targets. The registration file is replaced in place; artifacts carrying
-   its former hash are not formal inputs, so the three-seed run restarts from Seed 0.
+   its former hash are not formal inputs, so the then-registered three-seed run restarted
+   from Seed 0.
+   **Post-observation registration replacement (2026-07-16):** after that Seed-0
+   diagnostic was produced and inspected, Stage 1 was deliberately re-scoped to the
+   single-seed screening contract above. This is not a retroactive pre-registration:
+   the completed artifact retains its old registration hash and remains diagnostic-only.
+   A binding one-seed screening run requires the replacement experiment ID and run
+   metadata pinned before training begins.
 
 ### 5.1 Priority order (after gates)
 

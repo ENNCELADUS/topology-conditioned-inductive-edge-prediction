@@ -10,10 +10,12 @@ figures, benchmark data artifacts, and a curated literature library. `src/` hold
 typed, tested Python package covering the benchmark/evaluation stack, B0/B0-alt,
 G1–G3, and the pre-registered **EgoStitch Stage-1 implementation**. The direct HPC
 layer auto-detects all visible H20s for formal E2 and EgoStitch DDP execution.
-Gates G1–G3 are complete; G5 Stage 1 is not. Its formal run produced one valid Seed-0
-training artifact on 2026-07-15, then Seed 1 stopped at the artifact performance gate
-and Seed 2 did not run. Do not report a G5 verdict until all three seeds, held-out
-scoring, fidelity diagnostics, and pre-registered gate evaluation are complete.
+Gates G1–G3 are complete; G5 Stage 1 is not. A Seed-0 topology diagnostic completed
+on 2026-07-16 under a superseded three-seed registration and remains diagnostic-only.
+The current Stage-1 contract is a one-fixed-seed engineering screen. Do not report a
+G5 Stage-1 verdict until a run is bound to the replacement registration before training
+and completes held-out scoring, fidelity/cost diagnostics, and the registered gate.
+This screen does not replace E1/E3's at-least-three-seed Holm inference.
 
 `README.md` is the human-facing entry point (orientation, status, structure map,
 reading order). This file (`CLAUDE.md`) holds the binding *constraints* an agent
@@ -187,8 +189,9 @@ nodes?" If a draft starts describing graph generation as the task, it has drifte
    silently deviate — edit the spec first, with a change-log line.
 6. `docs/results/E2-pair-to-topology-gap.md` — the motivating result note with completed
    G1 B0/PA-null/B0-alt, G2 ceiling, and G3 Oracle artifacts.
-7. `docs/results/G5-stage1-seed0-20260715.md` — completed Seed-0 training evidence and
-   the explicit boundary that the three-seed G5 gate remains incomplete.
+7. `docs/results/G5-stage1-seed0-20260715.md` — retained Seed-0 training evidence and
+   the explicit boundary that the artifact is not retroactively bound to the replacement
+   single-seed screening registration.
 8. `docs/lit-review-plan.md` — literature-review plan, claims K1–K5, the 2×2
    taxonomy, and the terminology guardrail.
 
@@ -228,14 +231,17 @@ mechanisms. Keep the current values consistent across `docs/results/E2-pair-to-t
 
 ## Current G5 Stage-1 evidence boundary
 
-The only completed formal EgoStitch training result is Seed 0 at commit `31afbe6`:
-2 × H20, `world_size=2`, 30 epochs, best epoch 14, validation AUROC/AUPRC
-`0.945766/0.951966`, and total time `807.389 s`. Its training curve is nearly flat
-(AUPRC range `0.951582–0.951966`), so it does not by itself establish a learned gain
-over frozen S0. Seed 1 failed only the artifact performance check
-(`steady_state_data_wait_fraction > 0.05`); Seed 2 did not run. These are training
-artifacts, not held-out candidate-universe or assembled-graph results. Never call G5
-passed or failed from Seed 0 alone.
+The latest retained exact-quota Seed-0 run is at commit `3556627`: 2 × H20,
+`world_size=2`, 30 epochs, checkpoint `54f3c0ad8f5dfc18`, 2,037,171 candidate rows,
+and a completed single-seed topology diagnostic. Its assembled metrics are effectively
+identical to frozen B0 (EgoStitch/B0 BFS-macro GS `0.312149/0.312151`, RD
+`0.422358/0.422345`; s0-logit correlation is effectively 1.0). The diagnostic verdict
+is `diagnostic_only` because its run metadata is bound to superseded registration hash
+`a2f10051...`; it cannot be retroactively treated as the replacement single-seed
+screening verdict. The current gate requires a newly bound fixed-Seed-0 run plus
+candidate scoring, fidelity/cost diagnostics, and registered evaluation. Never claim
+statistical significance or cross-seed robustness from the Stage-1 one-seed screen;
+E1/E3 remain multi-seed Holm evaluations.
 
 ## Naming conventions (neutral placeholders — keep them neutral)
 

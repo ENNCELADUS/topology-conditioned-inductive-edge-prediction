@@ -518,10 +518,18 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   canonical pair order to realize the comparator's exact non-self quota. Model,
   hyperparameters, comparators, metrics, seeds, tolerance, and Holm rules are unchanged;
   artifacts bound to the prior registration hash are not formal inputs.
+- 2026-07-16: after the exact-quota Seed-0 diagnostic was inspected, re-scoped G5
+  Stage 1 from a three-seed inferential gate to a one-seed engineering screening gate.
+  This is a post-observation protocol amendment, not a retroactive pre-registration:
+  the completed Seed-0 artifact remains bound to its original registration hash and is
+  retained only as diagnostic evidence. Future binding Stage-1 runs use a new experiment
+  ID and the replacement single-seed decision contract in §13.15. E1/E3 still require
+  at least three seeds and Holm-corrected inference.
 
 **Open gate-report deliverable:** FLOPs/latency table template (§4.7 commitment —
-delivered with the G5 Stage-1 gate report). Stage-1 code now exists, but the formal
-three-seed gate is incomplete. Closed 2026-07-14: the four
+delivered with the G5 Stage-1 gate report). Stage-1 code now exists; the replacement
+one-seed screening gate remains incomplete until a run is bound to its new registration
+and supplies the required fidelity and cost reports. Closed 2026-07-14: the four
 ego-stat target definitions (§13.6); Benchmark-A/B/C ↔ split-strategy mapping
 (confirmed at G1: `Benchmark-A = breadth_first`, §9.1).
 
@@ -710,20 +718,28 @@ registered check `|RD_global(ego) - RD_global(comparator)| <= 0.005` must still 
 and the realized quota, boundary score, boundary-tie size, and tie-split count are
 recorded.
 
-### 13.15 Per-seed orchestration and diagnostic boundary
+### 13.15 Single-seed Stage-1 screening contract
 
-The outer Stage-1 order is `train(seed s) -> candidate scoring(seed s) -> single-seed
-topology diagnostic(seed s)` for `s = 0, 1, 2`, followed by one formal three-seed
-Holm evaluation. A training or scoring failure stops later seeds but does not suppress
-the completed earlier seed's diagnostic.
+G5 Stage 1 is an **engineering screening gate**, not the paper's final inferential
+comparison. One fixed training seed is sufficient. The binding outer order is
+`train(seed 0) -> candidate scoring(seed 0) -> fidelity/cost diagnostics -> Stage-1
+gate(seed 0)`. Additional seeds are optional robustness analyses and are not required
+to advance to Stage 2. E1/E3 retain the protocol's at-least-three-seed and Holm-corrected
+requirements for paper-level claims.
 
-The single-seed report is **non-binding**: it must use `verdict = diagnostic_only`,
-must not emit Holm decisions or primary pass flags, and must never be described as a
-G5 pass/cut. If inspection leads to any model or hyperparameter change, the registered
-three-seed experiment is invalidated and continuation requires a new experiment ID and
-new pre-registration. If the scientific configuration is unchanged, the missing seeds
-may be completed and only the combined three-seed report may apply §13.14's formal
-decision rule.
+The Stage-1 primary rule is deterministic point-estimate dominance at the registered
+operating points: Seed 0 must be strictly better than every registered comparator on
+each of clustering-MMD ratio (lower), BFS-macro GS (higher), and BFS-macro RD (higher),
+and both non-regression guards must pass. All three primary criteria are required.
+With one training seed, between-seed variance, confidence intervals, p-values, and Holm
+decisions are not valid acceptance evidence and must be emitted as `null`/not applicable.
+The report must label the verdict as a single-seed screening decision and must not claim
+statistical significance, robustness across seeds, or an E1/E3 result.
+
+This contract was adopted after inspecting the earlier exact-quota Seed-0 diagnostic.
+That artifact cannot be rebound retroactively: its old registration hash remains part of
+its provenance, and any binding run under this contract requires a new experiment ID and
+run metadata pinned to the replacement registration before training starts.
 
 ### 13.16 Score precision (pair-pass fp32 pin)
 

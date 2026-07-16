@@ -5,7 +5,7 @@ signed off 2026-07-09**, so `05-egostitch-spec.md` (including its §9 benchmark
 binding and §10–11 batch-sampler/auto-sized H20 contracts) is the active implementation
 contract. Companion to `03-experiment-protocol.md` (updated 2026-07-09 with the
 approved [protocol-Δ] items) and `02-methodology.md`. EgoStitch Stage 1 is implemented;
-its formal three-seed G5 evaluation remains incomplete as of 2026-07-15.
+its replacement one-seed engineering screening gate remains incomplete as of 2026-07-16.
 
 **Provenance.** Revision 1 was grounded in a three-track literature review run on
 2026-07-07. Revision 2 (2026-07-08) followed a full fan-out review of the local vault
@@ -931,7 +931,12 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   *Execution update 2026-07-15:* Seed 0 completed formal training (best validation
   AUROC/AUPRC `0.945766/0.951966`); Seed 1 stopped at the artifact performance gate
   and Seed 2 was not run. Candidate scoring, fidelity, assembled-graph evaluation,
-  and the three-seed decision remain pending. This is not a G5 result.
+  and the then-required three-seed decision remained pending. This was not a G5 result.
+  *Protocol update 2026-07-16:* after inspecting the later exact-quota Seed-0
+  diagnostic, Stage 1 was re-scoped to a fixed-one-seed engineering screen using
+  deterministic point-estimate dominance. The inspected artifact is not retroactively
+  rebound; a new-hash run plus fidelity/cost reports is required for the screening verdict.
+  E1/E3 retain multi-seed Holm inference.
 
 ### 6.1 Method rows
 
