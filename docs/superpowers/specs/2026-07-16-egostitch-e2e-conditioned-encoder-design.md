@@ -73,21 +73,26 @@ conflict; it does not resolve it unilaterally.
 T̂_ij:  V̂ = {i, j} ∪ S_i ∪ S_j                       (stitched scaffold, ≈ 2K+2 nodes)
        edges = star(u→slots, weight π·m)  ∪  intra-side slot–slot Â_i, Â_j
              ∪ cross-side alignment edges Π
-       labels = target-relative anchor labels (R7): endpoint-i / endpoint-j /
-                slot-of-i / slot-of-j / grounded-identity-match
+       labels = target-relative anchor labels (R7), 4 types: endpoint-i /
+                endpoint-j / slot-of-i / slot-of-j
+                (grounded-identity-match is EXCLUDED from the structural label
+                set — it derives from grounding/pointer information, which
+                belongs to the content pathway; see §3.2)
 ```
 
 ### 3.2 Two token sets (the attribution split)
 
 - **`c_topo` — structure-only tokens (the headline pathway).** STE node inputs are
-  *exclusively structural*: anchor label, existence `π`, multiplicity `m`, and soft
-  degree features (weighted incident mass per edge type). Edge inputs: edge type
-  (star / `Â` / `Π`) and weight. **No slot content embeddings `h`, no grounding
-  gate `g`** — nothing feature-derived beyond what the generator turned into
-  structure.
+  *exclusively structural*: the 4-type anchor label, existence `π`, multiplicity
+  `m`, and soft degree features (weighted incident mass per edge type). Edge
+  inputs: edge type (star / `Â` / `Π`) and weight. **No slot content embeddings
+  `h`, no grounding gate `g`, and no grounded-identity-match label** — grounding
+  is content evidence, and leaving its identity-match label in the structural set
+  would let reviewers argue content leaks back into `c_topo`.
 - **`c_content` — content tokens (separate, ablatable).** Slot content embeddings
-  `h` tagged with `(π, g)`, grounding/pointer features, and the membership signal
-  (the former `s1`). This pathway may help; the paper's claim may not rest on it.
+  `h` tagged with `(π, g)`, grounding/pointer features including the
+  grounded-identity-match label, and the membership signal (the former `s1`).
+  This pathway may help; the paper's claim may not rest on it.
 
 ### 3.3 Stitched-topology encoder (STE)
 
@@ -98,14 +103,32 @@ topology representation; the former `s4` scalar channel is retired at landing.
 
 ### 3.4 Conditioning (zero-init gated cross-attention, direction-symmetric)
 
+Mapped to the actual V3.1 implementation: each `CrossAttentionLayer`
+(`src/model/B0.py:523`) maintains and updates `(h_a, h_b, cls_token)`. The
+Stage-1 pin is the simplest sufficient injection:
+
 ```text
-for the AB stream (anchor labels: source=i, target=j) and BA stream (labels swapped):
-    in each of the last N trunk blocks:
-        h ← h + tanh(g_topo) · XAttn(h, {t_v}^{dir})        # STE tokens, that labeling
-        h ← h + tanh(g_cont) · XAttn(h, {c_content}^{dir})  # separate gate & pathway
+for each direction stream (AB: anchor labels source=i, target=j; BA: swapped):
+    after each of the final N_inj pair-cross-attention blocks:
+        cls ← cls + tanh(g_topo) · XAttn(q=cls, kv={t_v}^{dir})       # STE tokens
+        cls ← cls + tanh(g_cont) · XAttn(q=cls, kv={c_content}^{dir}) # separate gate
 z'_AB, z'_BA → abba_max → head → p_ij = σ(head(z'))
 ```
 
+Pins (all registered):
+
+- **Queries: `cls_token` only** (Stage-1 default). `h_a`/`h_b` token-level
+  injection is a registered deeper variant, not the screen headline.
+- **Injection point: after** the pair-cross-attention block, for the final
+  `N_inj` blocks; default `N_inj = 1`, sweep `{1, 2}`.
+- **Parameter sharing:** AB and BA share the same STE and XAttn parameters;
+  only the anchor labeling swaps.
+- **Branch masks are per pair, shared across AB/BA** — otherwise `abba_max`
+  would mix conditioned and unconditioned streams and break the decomposition.
+- **Required unit test:** `p(i,j) = p(j,i)` (exact within fp tolerance) for the
+  full model and for every null condition of §3.5; exact wiring into
+  `PairContextGatedReadout` is an implementation-plan item with this test as
+  the acceptance criterion.
 - **Endpoint-exchange symmetry is constructed, not assumed:** conditioning is
   applied per direction *before* `abba_max`; the STE runs per labeling (cheap —
   ~2K+2 tokens). Pooled-`c` symmetry assumptions are explicitly disallowed.
@@ -114,14 +137,33 @@ z'_AB, z'_BA → abba_max → head → p_ij = σ(head(z'))
   `g_topo, g_cont` are zero-initialized: at init the model computes exactly the
   pair-only function.
 
-### 3.5 Hard null bypass (checkpoint-exact recovery)
+### 3.5 Null taxonomy (three mutually exclusive head nulls; checkpoint-exact)
 
-`∅_topology` **structurally skips** the STE and both cross-attention sublayers —
-not "gates zeroed," but the sublayers not executed; since they are residual
-(`h + tanh(g)·XAttn`), the skip is an exact identity at any checkpoint. The same
-checkpoint therefore emits `f_logit` (pair-only), `topology_delta = logit −
-f_logit`, and, via `∅_content` (skip content pathway only), the topology-only
-conditioned logit. All three are reported for every headline table.
+The rev-2 draft used one overloaded `∅_topology`; that is replaced by three
+mutually exclusive null conditions (the `_head` suffix also resolves the naming
+collision with the proposal §4.2 `∅_content` *generator-conditioning* dropout,
+which is a different, unchanged mechanism):
+
+| Null | Skips | Yields |
+|---|---|---|
+| `∅_all_head` | STE + topology XAttn + content XAttn | checkpoint-exact pair-only `f_logit` |
+| `∅_topo_head` | STE + topology XAttn only | pair + content logit |
+| `∅_content_head` | content XAttn only | pair + topology logit |
+
+Because every conditioning sublayer is residual (`cls + tanh(g)·XAttn`), a
+skipped sublayer is an exact identity at any checkpoint, so all four logits
+(full, and the three nulls) come from the **same checkpoint** with no separate
+comparator artifact.
+
+**Training-time vs evaluation-time nulls are defined separately:**
+
+- *Training* uses **per-sample multiplicative branch masks** — the sublayer runs
+  for the whole batch and its residual update is zeroed for masked samples.
+  For a residual sublayer this is numerically identical to the bypass (only
+  wasted FLOPs differ), so mixed batches never require per-sample control flow.
+- *Evaluation* uses **batch-level hard bypasses** — the skipped sublayers (and
+  the STE, when unused by every sample) are literally not executed. A required
+  unit test asserts train-mask ≡ eval-bypass logit equality per null condition.
 
 ### 3.6 Conditioning-depth ladder (study axis)
 
@@ -142,18 +184,19 @@ the pair encoder is a measured axis.
 - **Curriculum:** trunk, STE, and gates train exactly when `L_edge` is active —
   i.e. not during the `L_recon`-only warm-start — so the pairwise trunk and the
   topology pathway enter joint training together.
-- **Trained nulls, per pair:** `∅_topology` (hard bypass, probability `p_topo`)
-  and `∅_content` (content pathway skip, probability `p_cont`), both registered
-  (defaults 0.1–0.2, swept, plus `p = 0` arms), keeping every reported
-  decomposition in-distribution and calibrated. Because the null path *is* the
-  trunk, the topology side never has to relearn class prior or calibration.
-  Terminology: **branch dropout**; precedents cited, novelty not claimed for the
-  mechanism: Modality Dropout (arXiv 2005.13616); modality competition in joint
-  multimodal training (Huang et al., ICML 2022). No TDE claim attaches here; the
-  TDE-style `∅_content` generator-conditioning contrast in proposal §4.2 is a
-  separate, unchanged control (naming disambiguation required at landing: the
-  proposal's `∅_content` conditions the *decoder*; this note's `∅_content` gates
-  the *head pathway* — landing text must rename one of them).
+- **Trained nulls, per pair (per-sample masks, §3.5):** the topology pathway is
+  masked with probability `p_topo` (applying `∅_topo_head`) and the content
+  pathway independently with `p_cont` (applying `∅_content_head`); their joint
+  event realizes `∅_all_head`, so all three §3.5 null conditions are trained and
+  in-distribution. Both probabilities registered (defaults 0.1–0.2, swept, plus
+  `p = 0` arms); each pair's mask is shared across the AB/BA streams (§3.4).
+  Because the null path *is* the trunk, the topology side never has to relearn
+  class prior or calibration. Terminology: **branch dropout**; precedents cited,
+  novelty not claimed for the mechanism: Modality Dropout (arXiv 2005.13616);
+  modality competition in joint multimodal training (Huang et al., ICML 2022).
+  No TDE claim attaches here; the TDE-style `∅_content`
+  generator-conditioning dropout in proposal §4.2 is a different, unchanged
+  mechanism — the `_head` suffix keeps the two namespaces disjoint.
 
 ## 5. Controls and ablation ladder (registered minimum)
 
@@ -165,10 +208,9 @@ seed 0 with `L_edge` active for only the post-warm-start 80% of budget
 Three distinct objects:
 
 - **B0-canonical** — the existing frozen external baseline (unchanged).
-- **B0-e2e / f-only** — the trunk with both conditioning pathways permanently
-  bypassed, trained under **exactly** the Ours
-  data/negatives/edge-active-steps/optimizer/seed/HPO. The matched control;
-  "–topology = B0-e2e" is the only claim made.
+- **B0-e2e / f-only** — the trunk trained with `∅_all_head` permanent, under
+  **exactly** the Ours data/negatives/edge-active-steps/optimizer/seed/HPO. The
+  matched control; "–topology = B0-e2e" is the only claim made.
 - **Exact-B0 reproduction** — trunk trained standalone under the canonical B0
   recipe; implementation sanity check only, never a paper arm.
 
@@ -186,19 +228,37 @@ Ladder (identical-head convention, matched budgets):
    b. identical tokens, all scaffold edges removed — STE degenerates to DeepSets;
    c. cross-pair topology shuffle (scaffold structure swapped between random
       pairs, endpoint tokens kept);
-   d. same-capacity randomized-context arm (rev-1 arm 6, retained).
-7. **Pathway attribution:** topology-pathway-only (`∅_content` permanent) vs
-   content-pathway-only (`∅_topology` permanent). **Headline requirement:** the
+   d. same-capacity randomized-context arm (rev-1 arm 6, retained);
+   e. **degree-preserving rewiring / weight permutation** — preserve node count,
+      per-edge-type mass, per-node soft degree, and the weight distribution
+      while destroying higher-order connectivity. The decisive answer to "is
+      the STE encoding topology, or a continuous latent code disguised as a
+      graph?" — a/b/c perturb degree too; only e isolates structure beyond
+      degree;
+   f. capacity-matched non-topological bottleneck — tokens of identical
+      dimensionality and parameter count, no adjacency and no message passing
+      (the parameter-matched sharpening of b).
+7. **Pathway attribution:** pair + topology (`∅_content_head` permanent) vs
+   pair + content (`∅_topo_head` permanent). **Headline requirement:** the
    topology-representation claim must survive content-pathway removal — the
    registered decision rule (set at registration time) requires the
-   topology-only arm to retain a defined share of the full-model gain over
+   pair+topology arm to retain a defined share of the full-model gain over
    B0-e2e; otherwise the honest conclusion is content-side information.
 8. No-direct-pair-context arm (head sees only conditioning tokens; *not* called
    "topology-only" — slots still derive from endpoint features)
 9. Branch dropout: `p = 0` and the registered sweep, for both pathways
 10. Conditioning-depth rungs: logit-FiLM; pooled low-rank adapter (rev-1)
-11. Per-checkpoint decomposition, every headline table: `f_logit`,
-    `topology_delta`, topology-only logit, fused logit
+11. Per-checkpoint decomposition, every headline table: all four §3.5 logits —
+    full, `f_logit` (`∅_all_head`), pair+content (`∅_topo_head`), pair+topology
+    (`∅_content_head`) — plus `topology_delta = full − pair+content` and
+    `content_delta = full − pair+topology`
+
+**Stage-1 screen scope (single-seed engineering screen — deliberately small):**
+arms 1 (full), 2 (B0-e2e), 7 pair+topology (`∅_content_head` permanent), one
+structure-destroyed control (6a, the simplest to implement correctly at screen
+time), and 9 `p = 0`. Everything else — E2E B3-full, E2E B5, the
+conditioning-depth rungs, the remaining structure battery including 6e/6f, and
+the full shuffle set — is reserved for the formal multi-seed E1/E3 experiments.
 
 ## 6. Instrumentation, reporting, registration corrections
 
@@ -262,15 +322,18 @@ Ladder (identical-head convention, matched budgets):
    (no new lambda), §8 (curriculum), §13.1 (Stage-1 head — Stitch is already
    retained in Stage 1, so the STE is Stage-1-runnable), §13.10 (retired),
    §13.16 (fp32 scope extension), §13.17 (re-registered liveness reference,
-   thresholds, gate/probe telemetry), naming disambiguation for the two
-   `∅_content` mechanisms.
+   thresholds, gate/probe telemetry). The head-null names adopt the §3.5
+   `_head`-suffixed taxonomy verbatim, keeping them disjoint from the proposal
+   §4.2 `∅_content` generator-conditioning dropout.
 3. `docs/03-experiment-protocol.md`: dated §0 component-table disposition (frozen
    pairwise scorer loses the `s0`-anchor role; keeps B0-baseline and
    E4.10-proposer roles); baseline table gains B0-e2e and the E2E B3-full/B5
    instantiations; E4 gains the structure-specificity battery.
-4. New Stage-1 screening registration binding the e2e architecture, including the
-   §5 arms in Stage-1 scope, the §6 probe protocol and thresholds, and the
-   pathway-attribution decision rule.
+4. New Stage-1 screening registration binding the e2e architecture, scoped to
+   the **Stage-1 minimum arm set pinned in §5** (full, B0-e2e, pair+topology,
+   structure control 6a, `p = 0`) — not the full ladder — plus the §6 probe
+   protocol and thresholds and the pathway-attribution decision rule. The
+   remaining arms enter the E1/E3 registrations.
 
 ## 9. Risks
 
@@ -279,7 +342,7 @@ Ladder (identical-head convention, matched budgets):
 | Topology gates stay dead (branch never used) | Gate-magnitude telemetry; branch dropout; conditioning-depth rungs isolate where signal dies |
 | Live branch ≠ topology content (covert channel) | Structure-specificity battery (arm 6) + E2E B3-full (arm 3) are the deciding controls |
 | **Content pathway carries the win** | Pathway attribution (arm 7) is a headline requirement with a registered decision rule, not an optional ablation |
-| STE uses tokens but ignores structure | Arms 6a/6b (edge shuffle / edge removal → DeepSets) decide; representation probes give direct evidence |
+| STE uses tokens but ignores structure ("a latent code disguised as a graph" — π, m, Â, Π are all feature-derived) | Arm 6e (degree-preserving rewiring) is the decisive control; 6a/6b/6f support; degree-partialled representation probes give direct evidence |
 | Edge-metric floor: joint model under B0-canonical AUPRC | B0-e2e matched arm separates regime effects from architecture effects; protocol dual-metric reporting unchanged |
 | Cost blowout on token-stream training/scoring | §7 re-estimate gate before registration; budget class re-anchored to E2 pin |
 | HPO fairness challenge | Trial-count vs compute parity distinction registered; GPU-hours per arm reported |
@@ -296,8 +359,12 @@ quoted as fact in `docs/04-model-proposal.md` §8 at landing time.
 
 ### 10.1 Direct-anticipation verdicts
 
-- **(i) Encoder over *generated* local topology conditioning a pair scorer — not
-  anticipated.** Nearest: Leap (2503.03331) grafts MLP-predicted edges onto the
+- **(i) Encoder over *generated* local topology conditioning a pair scorer — no
+  exact match identified in the reviewed corpus.** Nearest: Leap (2503.03331)
+  proposes inductive topology augmentation — so the paper must **never** claim
+  "the first method to generate structural context for unseen nodes"; the
+  distinction rests on *two* unseen endpoints, self-contained ego-nets, and
+  OT-based stitching. Leap grafts MLP-predicted edges onto the
   *observed* graph via real anchor nodes; NCNC (2302.00890) *completes*
   common-neighbor structure over the observed adjacency; FLEX (2507.11710)
   generates link-subgraphs as training augmentation, not per-query inference
@@ -307,31 +374,40 @@ quoted as fact in `docs/04-model-proposal.md` §8 at landing time.
   under a zero-edge protocol and encodes it with a structure-only encoder to
   condition a separate pair encoder.
 - **(ii) Gated cross-attention from graph-structure tokens into a pair encoder —
-  not anticipated.** Nearest: CAM tokens (2405.19375, cross-attentive modulation
+  no exact match identified in the reviewed corpus; cross-attention itself is
+  NOT claimable as an independent contribution.** Nearest: CAM tokens
+  (2405.19375, cross-attentive modulation
   for linkset prediction — but over *observed* node/edge tokens, no zero-init
   gate, no pair-only bypass); GraphToken (2402.05862) and GraphGPT (2310.13023)
   condition a *pretrained LLM* for reasoning, not a binary edge logit; Flamingo
   (2204.14198) is the zero-init tanh-gate lineage (method-transfer source, not
   anticipation); GNN-FiLM (1906.12192) modulates messages on the observed graph.
-- **(iii) OT-stitching of two *generated* ego-nets — not anticipated; the most
-  defensibly novel element.** Nearest: GOAT (2111.05366) and SLOTAlign
+- **(iii) OT-stitching of two *generated* ego-nets — no exact match identified
+  in the reviewed corpus; the most defensibly novel element.** Nearest: GOAT
+  (2111.05366) and SLOTAlign
   (2301.12721) OT-align two *observed* graphs where alignment is the end task;
   no found work aligns two independently imagined ego-neighborhoods as an
   internal differentiable step feeding an edge decision.
 
 ### 10.2 Claim discipline (binding for the proposal rev)
 
+A limited literature search cannot prove no prior work exists, so the claim is
+**novel overall composition**, never per-component unprecedentedness. The
+registered contribution statement:
+
+> *Dual imagined ego-nets are differentiably aligned and stitched into a
+> generated local scaffold whose structure-only token representation conditions
+> a queried-edge pair encoder under the strict zero-edge inductive protocol.*
+
 Every ingredient has named ancestry — DETR set decoding (2005.12872), the
 labeling trick (2010.16103), entropic OT matching, Flamingo-style zero-init
-gating, FiLM/graph-token conditioning — so the claimed contribution is the
-**combination under the strict zero-edge inductive protocol**: imagining both
-endpoints' ego-nets from frozen features, OT-stitching them, and conditioning a
-from-scratch pair encoder on the stitched scaffold's structure-only token
-representation with a checkpoint-exact pair-only bypass. The proposal rev must
-name and distinguish Leap and CAM tokens explicitly (the two closest works on
-axes (i) and (ii)), alongside the SEAL/labeling-trick family (1802.09691,
-2010.16103, 2302.00890, 2209.15486) whose defining delta is that they read
-observed subgraphs.
+gating (2204.14198), FiLM/graph-token conditioning — and the proposal rev must
+carry a per-component table reporting, for each mechanism: **ancestry** (where
+it comes from), **prior usage** (what it was used for), and **difference**
+(what this work changes). The proposal rev must name and distinguish Leap and
+CAM tokens explicitly (the two closest works on axes (i) and (ii)), alongside
+the SEAL/labeling-trick family (1802.09691, 2010.16103, 2302.00890, 2209.15486)
+whose defining delta is that they read observed subgraphs.
 
 ### 10.3 Adversarial evidence the paper must own (not hide)
 
