@@ -84,7 +84,7 @@ def _write_universe_npz(
     position = {node_id: i for i, node_id in enumerate(node_ids)}
     u_idx = np.array([position[u] for u, _ in pairs], dtype=np.int32)
     v_idx = np.array([position[v] for _, v in pairs], dtype=np.int32)
-    meta = {
+    meta: dict[str, object] = {
         "checkpoint_id": checkpoint_id,
         "model_family": model_family,
         "pairs_source": pairs_source,
@@ -93,6 +93,14 @@ def _write_universe_npz(
         "created_utc": "2026-07-09T00:00:00+00:00",
         "torch_version": "2.10.0",
     }
+    if model_family == "egostitch":
+        meta["score_precision"] = {
+            "contract": "egostitch_pair_fp32_v1",
+            "encode_autocast": "off",
+            "pair_compute_dtype": "float32",
+            "pair_autocast": False,
+            "logit_storage_dtype": "float32",
+        }
     save_scores(
         path,
         node_ids=node_ids,

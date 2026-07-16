@@ -423,6 +423,13 @@ rule).
    it invalidates this registration and requires a new experiment ID/pre-registration;
    with unchanged scientific configuration, the remaining seeds may be completed and
    only their combined three-seed report is the formal verdict.
+   **Registration replacement (2026-07-16, before any held-out topology metric):** an
+   fp32 feasibility rescore showed intrinsic boundary ties for which the former atomic
+   threshold could not satisfy the unchanged 0.005 matched-global-RD tolerance. The
+   current registration therefore selects the comparator's exact non-self quota by
+   score and resolves only the boundary tie by canonical pair order, without labels or
+   topology targets. The registration file is replaced in place; artifacts carrying
+   its former hash are not formal inputs, so the three-seed run restarts from Seed 0.
 
 ### 5.1 Priority order (after gates)
 

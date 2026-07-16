@@ -11,8 +11,8 @@ from the committed kill-test payload) under the pre-registered criteria
   ``run_metadata.json`` — held-out metrics are never opened on a mismatch.
 - **Primary family** (Holm at the pre-registered alpha, all must pass):
   clustering-MMD ratio at the canonical G1 operating point; BFS-macro GS and
-  RD at matched global simple-edge RD (per-comparator quota re-assembly, the
-  pre-registered nearest-threshold rule).
+  RD at matched global simple-edge RD (per-comparator deterministic exact-quota
+  re-assembly).
 - **Guards**: degree-MMD non-regression (<= 1.10x B0); matched edge AUPRC
   (degree-corrected ratio-1, within 0.02 of B0).
 - **Verdict**: one seed always yields ``"diagnostic_only"``; exactly three
@@ -44,7 +44,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+import networkx as nx
 import numpy as np
+from numpy.typing import NDArray
 
 from src.data.features import FeatureStore
 from src.eval.assembly import assemble_graph, density_matched_threshold
@@ -78,13 +80,20 @@ class PreregistrationMismatch(RuntimeError):
 
 
 @dataclass(frozen=True)
-class MatchedRdThreshold:
-    """Discrete threshold selected under the registered global-RD tolerance."""
+class MatchedRdSelection:
+    """Registered exact-quota selection for one matched-global-RD row."""
 
-    threshold: float
+    selected_rows: NDArray[np.int64]
+    boundary_score: float
     realized_edges: int
     rd_gap: float
-    used_fallback: bool
+    boundary_tie_size: int
+    selected_from_boundary_tie: int
+
+    @property
+    def split_boundary_tie(self) -> bool:
+        """Whether the quota includes only part of the boundary-score tie."""
+        return 0 < self.selected_from_boundary_tie < self.boundary_tie_size
 
 
 def _sha256_file(path: Path) -> str:
@@ -158,44 +167,72 @@ def enforce_frozen_inputs(
             )
 
 
-def select_matched_global_rd_threshold(
+def select_matched_global_rd_rows(
     probs: np.ndarray,
+    u_idx: NDArray[np.int32],
+    v_idx: NDArray[np.int32],
     *,
     target_edges: int,
     reference_edges: int,
     tolerance: float = 0.005,
-) -> MatchedRdThreshold:
-    """Select the nearest discrete threshold satisfying the registered RD gap."""
-    if probs.size == 0:
-        threshold = 1.0
-        realized = 0
-        gap = abs(target_edges) / reference_edges if reference_edges else 0.0
-        if gap > tolerance:
-            raise ValueError("matched global simple-edge RD tolerance cannot be satisfied")
-        return MatchedRdThreshold(threshold, realized, gap, False)
+) -> MatchedRdSelection:
+    """Select an exact non-self quota with the registered canonical tie-break."""
+    if not (len(probs) == len(u_idx) == len(v_idx)):
+        raise ValueError("probs, u_idx, and v_idx must have identical lengths")
+    non_self_rows = np.flatnonzero(u_idx != v_idx).astype(np.int64, copy=False)
+    if not 0 <= target_edges <= len(non_self_rows):
+        raise ValueError(
+            f"matched global simple-edge quota {target_edges} is outside [0, {len(non_self_rows)}]"
+        )
 
-    canonical = density_matched_threshold(probs, target_edges)
-    candidates = [canonical, float(np.nextafter(float(np.max(probs)), math.inf))]
-    candidates.extend(float(value) for value in np.unique(probs))
-    rows: list[tuple[int, float, float]] = []
-    for threshold in candidates:
-        realized = int(np.count_nonzero(probs >= threshold))
-        gap = abs(realized - target_edges) / reference_edges if reference_edges else 0.0
-        rows.append((realized, gap, threshold))
-    realized, gap, threshold = min(
-        rows,
-        key=lambda row: (
-            row[1],
-            abs(row[2] - canonical),
-            -row[2],
-        ),
-    )
+    non_self_probs = probs[non_self_rows]
+    canonical_u = np.minimum(u_idx[non_self_rows], v_idx[non_self_rows])
+    canonical_v = np.maximum(u_idx[non_self_rows], v_idx[non_self_rows])
+    order = np.lexsort((canonical_v, canonical_u, -non_self_probs))
+    selected_rows = non_self_rows[order[:target_edges]]
+
+    if target_edges == 0:
+        boundary_score = math.inf
+        boundary_tie_size = 0
+        selected_from_boundary_tie = 0
+    else:
+        boundary_score = float(probs[selected_rows[-1]])
+        boundary_tie_size = int(np.count_nonzero(non_self_probs == boundary_score))
+        selected_from_boundary_tie = int(np.count_nonzero(probs[selected_rows] == boundary_score))
+
+    realized = len(selected_rows)
+    gap = abs(realized - target_edges) / reference_edges if reference_edges else 0.0
     if gap > tolerance:
         raise ValueError(
-            "matched global simple-edge RD tolerance cannot be satisfied by an atomic "
-            f"threshold: nearest gap={gap:.6g}, tolerance={tolerance:.6g}"
+            "matched global simple-edge RD tolerance was violated after exact-quota "
+            f"selection: gap={gap:.6g}, tolerance={tolerance:.6g}"
         )
-    return MatchedRdThreshold(threshold, realized, gap, threshold != canonical)
+    return MatchedRdSelection(
+        selected_rows=selected_rows,
+        boundary_score=boundary_score,
+        realized_edges=realized,
+        rd_gap=gap,
+        boundary_tie_size=boundary_tie_size,
+        selected_from_boundary_tie=selected_from_boundary_tie,
+    )
+
+
+def assemble_matched_global_rd_graph(
+    pairs: Sequence[tuple[str, str]],
+    probs: np.ndarray,
+    u_idx: NDArray[np.int32],
+    v_idx: NDArray[np.int32],
+    selection: MatchedRdSelection,
+    nodes: Sequence[str],
+) -> nx.Graph:
+    """Assemble exact-quota non-self rows and self-pairs at the boundary score."""
+    selected = np.zeros(len(pairs), dtype=np.bool_)
+    selected[selection.selected_rows] = True
+    selected |= (u_idx == v_idx) & (probs >= selection.boundary_score)
+    graph = nx.Graph()
+    graph.add_nodes_from(nodes)
+    graph.add_edges_from(pair for pair, keep in zip(pairs, selected.tolist(), strict=True) if keep)
+    return graph
 
 
 _FIDELITY_KEYS = {
@@ -572,7 +609,10 @@ def run_g5_stage1_pipeline(
     matched_gs: dict[str, list[float]] = {name: [] for name in _COMPARATORS}
     matched_rd: dict[str, list[float]] = {name: [] for name in _COMPARATORS}
     matched_rd_gap: dict[str, list[float]] = {name: [] for name in _COMPARATORS}
-    matched_rd_fallback: dict[str, list[bool]] = {name: [] for name in _COMPARATORS}
+    matched_rd_boundary_score: dict[str, list[float]] = {name: [] for name in _COMPARATORS}
+    matched_rd_boundary_tie_size: dict[str, list[int]] = {name: [] for name in _COMPARATORS}
+    matched_rd_selected_from_tie: dict[str, list[int]] = {name: [] for name in _COMPARATORS}
+    matched_rd_split_boundary_tie: dict[str, list[bool]] = {name: [] for name in _COMPARATORS}
 
     b0_logit_by_pair = {
         pair: float(logit) for pair, logit in zip(b0_pairs, b0_universe.logit.tolist(), strict=True)
@@ -630,16 +670,25 @@ def run_g5_stage1_pipeline(
             float(np.corrcoef(universe.logit.astype(np.float64), aligned_b0)[0, 1])
         )
 
-        # Matched-global-RD rows (pre-registered nearest-threshold rule): the
-        # egostitch assembly is re-quota'd to each comparator's realized
-        # non-self edge count and GS/RD re-evaluated (no bootstrap needed).
+        # Matched-global-RD rows: realize each comparator's exact non-self
+        # quota; only the boundary-score tie uses canonical pair order.
         for name in _COMPARATORS:
             quota = realized[name]
-            selected = select_matched_global_rd_threshold(
-                probs[non_self], target_edges=quota, reference_edges=target_edges
+            selected = select_matched_global_rd_rows(
+                probs,
+                universe.u_idx,
+                universe.v_idx,
+                target_edges=quota,
+                reference_edges=target_edges,
             )
-            matched_threshold = selected.threshold
-            matched_graph = assemble_graph(pairs, probs, threshold=matched_threshold, nodes=nodes)
+            matched_graph = assemble_matched_global_rd_graph(
+                pairs,
+                probs,
+                universe.u_idx,
+                universe.v_idx,
+                selected,
+                nodes,
+            )
             report = evaluate_assembled_graph(matched_graph, g_ref, buckets, config)
             matched_gs[name].append(report.graph_similarity)
             matched_rd[name].append(report.relative_density)
@@ -647,7 +696,10 @@ def run_g5_stage1_pipeline(
             if realized_matched != selected.realized_edges:
                 raise ValueError("matched global simple-edge RD count disagrees with assembly")
             matched_rd_gap[name].append(selected.rd_gap)
-            matched_rd_fallback[name].append(selected.used_fallback)
+            matched_rd_boundary_score[name].append(selected.boundary_score)
+            matched_rd_boundary_tie_size[name].append(selected.boundary_tie_size)
+            matched_rd_selected_from_tie[name].append(selected.selected_from_boundary_tie)
+            matched_rd_split_boundary_tie[name].append(selected.split_boundary_tie)
 
     # (4) Primary criteria + Holm.
     criteria = {
@@ -732,10 +784,10 @@ def run_g5_stage1_pipeline(
             "evaluation_seed": seed,
             "holm_alpha": holm_alpha,
             "matched_rd_rule": (
-                "per comparator: egostitch re-assembled at "
-                "nearest discrete threshold to comparator realized non-self edges; "
-                "every row enforces |RD_global(ego)-RD_global(comparator)| <= 0.005, "
-                "with tie-atomic fallback and residual gap disclosed"
+                "per comparator: egostitch realizes the comparator's exact non-self "
+                "edge quota by descending pass-1 score; only the boundary-score tie "
+                "is split by canonical pair order; self-pairs use the boundary score; "
+                "every row enforces |RD_global(ego)-RD_global(comparator)| <= 0.005"
             ),
             "single_seed_caveat": (
                 "Descriptive metric differences and p-values are shown only as an early "
@@ -761,7 +813,10 @@ def run_g5_stage1_pipeline(
             "matched_gs": matched_gs,
             "matched_rd": matched_rd,
             "matched_rd_quota_gap": matched_rd_gap,
-            "matched_rd_used_fallback": matched_rd_fallback,
+            "matched_rd_boundary_score": matched_rd_boundary_score,
+            "matched_rd_boundary_tie_size": matched_rd_boundary_tie_size,
+            "matched_rd_selected_from_boundary_tie": matched_rd_selected_from_tie,
+            "matched_rd_split_boundary_tie": matched_rd_split_boundary_tie,
         },
         "criteria": {name: criteria[name].to_jsonable() for name in _PRIMARY_FAMILY},
         "holm_survives": holm,

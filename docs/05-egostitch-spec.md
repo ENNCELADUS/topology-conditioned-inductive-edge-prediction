@@ -506,17 +506,18 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   formal Holm pass/cut. Inspecting a single-seed diagnostic preserves the existing
   registration only if the scientific configuration remains unchanged.
 - 2026-07-16: added §13.16 (score precision pin). The 2026-07-15 Seed-0 candidate
-  scoring run (checkpoint `54f3c0ad8f5dfc18`) ran its per-pair pass under BF16
-  autocast, quantizing published logits to the BF16 grid (2,669 unique values across
-  2,037,171 candidate pairs, largest tied group 259,477); this made the registered
-  matched-global-RD tolerance (0.005, atomic thresholds) infeasible — nearest
-  achievable gap 0.0206452 — an evaluation-feasibility failure before any held-out
-  topology metric was produced. Scoring precision is now pinned: BF16 autocast is
-  encode-only (cacheable per-node pass), the per-pair pass computes in fp32, and
-  artifact validation gains a score-resolution guard. This is a measurement-precision
-  fix made before any held-out topology metric was observed; model, hyperparameters,
-  and the registered tolerance are unchanged. Seed-0 candidate scoring will be
-  re-run from the unchanged frozen checkpoint.
+  artifact (checkpoint `54f3c0ad8f5dfc18`) was scored with BF16 autocast in the
+  per-pair pass and is invalidated. BF16 autocast is now encode-only, the pair pass is
+  fp32, and EgoStitch artifacts carry an explicit precision contract plus descriptive
+  resolution diagnostics.
+- 2026-07-16: replaced the Stage-1 registration before any held-out topology metric
+  was produced. An unpublished fp32 feasibility rescore still contained intrinsic
+  exact-score ties (largest group 143,690 / 2,037,171 rows); under atomic thresholds,
+  the nearest `b0_cal_selfdensity` matched-global-RD gap remained 0.0206452, above the
+  unchanged 0.005 tolerance. §13.14 now resolves only a boundary tie by deterministic
+  canonical pair order to realize the comparator's exact non-self quota. Model,
+  hyperparameters, comparators, metrics, seeds, tolerance, and Holm rules are unchanged;
+  artifacts bound to the prior registration hash are not formal inputs.
 
 **Open gate-report deliverable:** FLOPs/latency table template (§4.7 commitment —
 delivered with the G5 Stage-1 gate report). Stage-1 code now exists, but the formal
@@ -699,6 +700,16 @@ Stage-1 gate comparators: **B0** (frozen candidate-scores artifact) and **`B0+ca
 file's sha256 in `run_metadata.json` at run start, and the gate evaluator refuses to
 open held-out metrics if the hashes disagree.
 
+For each matched-global-simple-edge-RD comparator row, EgoStitch non-self candidate
+pairs are ordered by descending pass-1 score. Only rows tied at the quota boundary
+are ordered by ascending canonical pair order `(min node index, max node index)`;
+labels and topology targets are never consulted. Exactly the comparator's realized
+non-self edge count is assembled. Self-pairs remain outside that quota and are
+assembled when their score is at least the selected boundary score. The unchanged
+registered check `|RD_global(ego) - RD_global(comparator)| <= 0.005` must still hold
+and the realized quota, boundary score, boundary-tie size, and tie-split count are
+recorded.
+
 ### 13.15 Per-seed orchestration and diagnostic boundary
 
 The outer Stage-1 order is `train(seed s) -> candidate scoring(seed s) -> single-seed
@@ -722,7 +733,9 @@ before reuse, so no BF16-grid truncation propagates downstream. The **per-pair**
 score pass — Stitch (§3, §13.3), the `(s0, s1, s2)` decision head (§13.1), and the s0
 fusion (§13.10), including the §13.9 self-pair single-ego path — computes with
 autocast **disabled**, in fp32: published artifact logits must carry full fp32
-resolution and must not sit on a reduced-precision grid. `score_universe` artifact
-validation fails loudly if an artifact's unique-logit count is degenerately low
-relative to its pair count (score-resolution guard), rather than allowing a
-quantized artifact to reach gate evaluation silently.
+resolution. Every EgoStitch scores artifact records the contract
+`egostitch_pair_fp32_v1`, pair compute dtype `float32`, and pair autocast disabled;
+writers, shard merging, orchestration reuse, and gate evaluation fail closed if this
+provenance is absent or inconsistent. Unique-logit count/fraction and reduced-precision
+round-trip fractions are recorded as descriptive diagnostics only: legitimate model
+ties must not be rejected solely because the unique-logit fraction is low.

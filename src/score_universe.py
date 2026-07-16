@@ -31,7 +31,9 @@ Artifact format (pinned — do not drift):
 - ``label``: int8, ``-1`` when unlabeled.
 - ``row_start``: int64 scalar (0 for unsharded/merged; shard offset for shards).
 - ``meta``: 0-d JSON string array with keys ``checkpoint_id``, ``model_family``,
-  ``pairs_source``, ``strategy``, ``num_rows``, ``created_utc``, ``torch_version``.
+  ``pairs_source``, ``strategy``, ``num_rows``, ``created_utc``, ``torch_version``;
+  EgoStitch artifacts additionally pin pair-pass precision provenance and
+  descriptive score-resolution diagnostics.
 """
 
 from __future__ import annotations
@@ -82,6 +84,7 @@ _META_KEYS = (
     "torch_version",
 )
 _NAMED_PAIR_SOURCES = ("candidate", "test", "val")
+_EGOSTITCH_PAIR_PRECISION_CONTRACT = "egostitch_pair_fp32_v1"
 
 
 # ---------------------------------------------------------------------------
@@ -138,50 +141,84 @@ class _Shard(NamedTuple):
     meta: dict[str, object]
 
 
-# A bf16-quantized fp32 logit column collapses onto the bf16 ulp grid (spacing
-# 0.03125 at |logit| in [4,8)), so a large artifact scored under a stray
-# autocast context has far fewer unique logit values than rows. This floor and
-# fraction are calibrated against the 2026-07-15 Seed-0 bug (2,669 unique
-# logits across 2,037,171 rows) while staying well clear of legitimate small
-# fixtures/toy artifacts, which may have few unique values by construction.
-_MIN_RESOLUTION_ROWS = 10_000
-_MIN_RESOLUTION_UNIQUE_FRACTION = 0.01
+def score_resolution_diagnostics(logit: NDArray[np.float32]) -> dict[str, int | float]:
+    """Return descriptive resolution diagnostics without judging model ties."""
+    values = np.asarray(logit, dtype=np.float32)
+    n = len(values)
+    if n == 0:
+        return {
+            "n_rows": 0,
+            "n_unique": 0,
+            "unique_fraction": 0.0,
+            "bf16_grid_fraction": 0.0,
+            "fp16_grid_fraction": 0.0,
+        }
+    bits = values.view(np.uint32)
+    n_unique = int(np.unique(values).shape[0])
+    with np.errstate(over="ignore", invalid="ignore"):
+        fp16_roundtrip = values.astype(np.float16).astype(np.float32)
+    return {
+        "n_rows": n,
+        "n_unique": n_unique,
+        "unique_fraction": float(n_unique / n),
+        "bf16_grid_fraction": float(np.mean((bits & np.uint32(0xFFFF)) == 0)),
+        "fp16_grid_fraction": float(np.mean(fp16_roundtrip == values)),
+    }
 
 
-def validate_score_resolution(
+def validate_score_precision(
     logit: NDArray[np.float32],
     *,
+    meta: Mapping[str, object],
     label: str,
-    min_rows: int = _MIN_RESOLUTION_ROWS,
-    min_unique_fraction: float = _MIN_RESOLUTION_UNIQUE_FRACTION,
+    require_diagnostics: bool = True,
 ) -> None:
-    """Fail closed on a reduced-precision (e.g. bf16-quantized) logit column.
-
-    Applies only at or above `min_rows` rows: small fixtures/toy artifacts
-    legitimately have few unique values and must not false-positive here.
+    """Validate EgoStitch pair-pass fp32 provenance and stored diagnostics.
 
     Args:
-        logit: The scores artifact's (or shard's) logit column.
-        label: Human-readable artifact label used in the error message
-            (e.g. the output path).
-        min_rows: Row-count floor below which the check is skipped.
-        min_unique_fraction: Minimum required ratio of unique logit values to
-            rows at or above `min_rows` rows.
+        logit: The scores artifact's logit column.
+        meta: Parsed artifact metadata.
+        label: Human-readable artifact label used in errors.
+        require_diagnostics: Require the persisted descriptive diagnostics.
 
     Raises:
-        ValueError: If ``len(logit) >= min_rows`` and the unique-value count
-            is below ``min_unique_fraction * len(logit)``.
+        ValueError: If an EgoStitch artifact lacks or contradicts the pinned
+            pair-pass fp32 contract, or its stored diagnostics are inconsistent.
     """
-    n = len(logit)
-    if n < min_rows:
+    if meta.get("model_family") != "egostitch":
         return
-    n_unique = int(np.unique(logit).shape[0])
-    if n_unique < min_unique_fraction * n:
+    precision = meta.get("score_precision")
+    if not isinstance(precision, dict):
         raise ValueError(
-            f"{label}: only {n_unique} unique logit values across {n} rows "
-            f"(< {min_unique_fraction:.0%} of rows); this artifact was likely scored "
-            "under reduced-precision (e.g. bf16 autocast) arithmetic that collapsed "
-            "the logit grid — rescore in fp32 before this artifact can be used"
+            f"{label}: EgoStitch artifact is missing score_precision provenance; "
+            "rescore with the pair-pass fp32 contract"
+        )
+    expected = {
+        "contract": _EGOSTITCH_PAIR_PRECISION_CONTRACT,
+        "pair_compute_dtype": "float32",
+        "pair_autocast": False,
+        "logit_storage_dtype": "float32",
+    }
+    mismatches = {
+        key: (precision.get(key), value)
+        for key, value in expected.items()
+        if precision.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(f"{label}: invalid EgoStitch score_precision provenance: {mismatches}")
+    if precision.get("encode_autocast") not in {"off", "bf16"}:
+        raise ValueError(f"{label}: score_precision.encode_autocast must be 'off' or 'bf16'")
+    if np.asarray(logit).dtype != np.float32:
+        raise ValueError(f"{label}: EgoStitch logits must be stored as float32")
+
+    if not require_diagnostics:
+        return
+    recorded = meta.get("score_resolution")
+    actual = score_resolution_diagnostics(logit)
+    if recorded != actual:
+        raise ValueError(
+            f"{label}: score_resolution diagnostics are missing or inconsistent; "
+            f"recorded={recorded!r}, actual={actual!r}"
         )
 
 
@@ -206,15 +243,12 @@ def save_scores(
         logit: Shape ``(n,)`` float32 raw model logits.
         label: Shape ``(n,)`` int8 labels (``-1`` for unlabeled rows).
         row_start: Row offset of this artifact in the full input (0 unless sharded).
-        meta: Metadata dict; must contain exactly the pinned keys and be
-            JSON-serializable.
+        meta: Metadata dict; must contain the pinned keys and be JSON-serializable.
 
     Raises:
         ValueError: If array lengths disagree, indices fall outside `node_ids`,
-            `row_start` is negative, `meta` is missing pinned keys, or `logit`
-            fails the score-resolution guard (`validate_score_resolution`) —
-            this applies to every artifact written here, including individual
-            shards at or above the guard's row floor.
+            `row_start` is negative, `meta` is missing pinned keys, or an
+            EgoStitch artifact violates the pair-pass fp32 provenance contract.
     """
     n = len(logit)
     if not (len(u_idx) == len(v_idx) == len(label) == n):
@@ -234,7 +268,13 @@ def save_scores(
     missing = [key for key in _META_KEYS if key not in meta]
     if missing:
         raise ValueError(f"meta is missing required keys: {missing}")
-    validate_score_resolution(logit, label=str(path))
+    stored_meta = dict(meta)
+    if stored_meta.get("model_family") == "egostitch":
+        validate_score_precision(
+            logit, meta=stored_meta, label=str(path), require_diagnostics=False
+        )
+        stored_meta["score_resolution"] = score_resolution_diagnostics(logit)
+        validate_score_precision(logit, meta=stored_meta, label=str(path))
 
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -245,7 +285,7 @@ def save_scores(
         logit=logit.astype(np.float32, copy=False),
         label=label.astype(np.int8, copy=False),
         row_start=np.int64(row_start),
-        meta=np.array(json.dumps(meta, sort_keys=True)),
+        meta=np.array(json.dumps(stored_meta, sort_keys=True)),
     )
 
 
@@ -323,7 +363,14 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
     shards = [_load_shard(path) for path in inputs]
 
     reference = shards[0]
-    for key in ("checkpoint_id", "model_family", "pairs_source", "strategy", "num_rows"):
+    for key in (
+        "checkpoint_id",
+        "model_family",
+        "pairs_source",
+        "strategy",
+        "num_rows",
+        "score_precision",
+    ):
         values = {str(shard.meta.get(key)) for shard in shards}
         if len(values) > 1:
             raise ValueError(
@@ -1258,6 +1305,13 @@ def _run_score(args: argparse.Namespace) -> None:
         )
         meta_extra = {
             "s0_checkpoint_id": args.s0_checkpoint_id,
+            "score_precision": {
+                "contract": _EGOSTITCH_PAIR_PRECISION_CONTRACT,
+                "encode_autocast": args.amp,
+                "pair_compute_dtype": "float32",
+                "pair_autocast": False,
+                "logit_storage_dtype": "float32",
+            },
             "density_calibration": {
                 "pass": 1,
                 "rho_hat_eval": float(np.mean(probs)) if len(probs) else 0.0,
@@ -1337,7 +1391,8 @@ __all__ = [
     "main",
     "merge_scores",
     "save_scores",
-    "validate_score_resolution",
+    "score_resolution_diagnostics",
+    "validate_score_precision",
 ]
 
 

@@ -61,7 +61,7 @@ candidate_is_current() {
   local metadata="$2"
   [[ -s "${candidate}" && -s "${metadata}" ]] || return 1
   "${PYTHON_BIN}" -c \
-    'import json,sys; from pathlib import Path; from src.score_universe import load_scores,validate_score_resolution; a=load_scores(Path(sys.argv[1])); validate_score_resolution(a.logit,label=sys.argv[1]); m=json.loads(Path(sys.argv[2]).read_text()); raise SystemExit(0 if a.meta.get("model_family") == "egostitch" and a.meta.get("checkpoint_id") == m.get("checkpoint_id") else 1)' \
+    'import json,sys; from pathlib import Path; from src.score_universe import load_scores,validate_score_precision; a=load_scores(Path(sys.argv[1])); validate_score_precision(a.logit,meta=a.meta,label=sys.argv[1]); m=json.loads(Path(sys.argv[2]).read_text()); raise SystemExit(0 if a.meta.get("model_family") == "egostitch" and a.meta.get("checkpoint_id") == m.get("checkpoint_id") else 1)' \
     "${candidate}" "${metadata}"
 }
 

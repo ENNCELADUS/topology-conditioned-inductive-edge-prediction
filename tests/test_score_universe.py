@@ -762,6 +762,17 @@ def test_egostitch_cli_scores_end_to_end_with_self_pair(tmp_path: Path) -> None:
     assert bool(np.isfinite(artifact.logit).all())
     assert artifact.meta["model_family"] == "egostitch"
     assert artifact.meta["s0_checkpoint_id"] == "cafecafecafecafe"
+    assert artifact.meta["score_precision"] == {
+        "contract": "egostitch_pair_fp32_v1",
+        "encode_autocast": "off",
+        "pair_compute_dtype": "float32",
+        "pair_autocast": False,
+        "logit_storage_dtype": "float32",
+    }
+    resolution = artifact.meta["score_resolution"]
+    assert isinstance(resolution, dict)
+    assert resolution["n_rows"] == len(_EGOSTITCH_PAIRS)
+    assert resolution["n_unique"] == int(np.unique(artifact.logit).size)
     density = artifact.meta["density_calibration"]
     assert isinstance(density, dict)
     assert density["pass"] == 1
@@ -859,56 +870,93 @@ def test_score_egostitch_pair_pass_is_fp32_even_under_bf16_amp(tmp_path: Path) -
 
 
 # ---------------------------------------------------------------------------
-# validate_score_resolution guard (spec Sec 13.16)
+# pair-pass precision provenance (spec Sec 13.16)
 # ---------------------------------------------------------------------------
 
 
-def test_validate_score_resolution_raises_on_degenerate_large_artifact() -> None:
-    n_rows = 10_000
-    values = np.linspace(-1.0, 1.0, 16, dtype=np.float32)
-    logit = np.tile(values, n_rows // len(values) + 1)[:n_rows].astype(np.float32)
-
-    with pytest.raises(ValueError, match="unique logit values"):
-        score_universe.validate_score_resolution(logit, label="degenerate-artifact")
-
-
-def test_validate_score_resolution_passes_on_healthy_large_artifact() -> None:
-    rng = np.random.default_rng(0)
-    logit = rng.normal(size=10_000).astype(np.float32)
-
-    score_universe.validate_score_resolution(logit, label="healthy-artifact")  # must not raise
-
-
-def test_validate_score_resolution_does_not_false_positive_on_small_artifact() -> None:
-    n_rows = 500
-    values = np.array([-1.0, -0.5, 0.0, 0.5, 1.0], dtype=np.float32)
-    logit = np.tile(values, n_rows // len(values) + 1)[:n_rows].astype(np.float32)
-
-    # Below the row floor: a handful of unique values must not false-positive.
-    score_universe.validate_score_resolution(logit, label="small-artifact")
+def _egostitch_precision_meta(n_rows: int) -> dict[str, object]:
+    return {
+        "checkpoint_id": "abc123abc123abcd",
+        "model_family": "egostitch",
+        "pairs_source": "candidate",
+        "strategy": "breadth_first",
+        "num_rows": n_rows,
+        "created_utc": "2026-07-16T00:00:00+00:00",
+        "torch_version": str(torch.__version__),
+        "score_precision": {
+            "contract": "egostitch_pair_fp32_v1",
+            "encode_autocast": "bf16",
+            "pair_compute_dtype": "float32",
+            "pair_autocast": False,
+            "logit_storage_dtype": "float32",
+        },
+    }
 
 
-def test_save_scores_raises_on_degenerate_large_logit_column(tmp_path: Path) -> None:
-    n_rows = 10_000
-    values = np.linspace(-1.0, 1.0, 16, dtype=np.float32)
-    logit = np.tile(values, n_rows // len(values) + 1)[:n_rows].astype(np.float32)
-
-    with pytest.raises(ValueError, match="unique logit values"):
+def test_save_scores_rejects_egostitch_without_precision_provenance(tmp_path: Path) -> None:
+    meta = _egostitch_precision_meta(2)
+    del meta["score_precision"]
+    with pytest.raises(ValueError, match="missing score_precision provenance"):
         score_universe.save_scores(
-            tmp_path / "degenerate.npz",
+            tmp_path / "missing-precision.npz",
             node_ids=["node_a", "node_b"],
-            u_idx=np.zeros(n_rows, dtype=np.int32),
-            v_idx=np.ones(n_rows, dtype=np.int32),
-            logit=logit,
-            label=np.full(n_rows, -1, dtype=np.int8),
+            u_idx=np.array([0, 0], dtype=np.int32),
+            v_idx=np.array([1, 1], dtype=np.int32),
+            logit=np.array([0.0, 1.0], dtype=np.float32),
+            label=np.full(2, -1, dtype=np.int8),
             row_start=0,
-            meta={
-                "checkpoint_id": "abc123abc123abcd",
-                "model_family": "v3_1",
-                "pairs_source": "candidate",
-                "strategy": "breadth_first",
-                "num_rows": n_rows,
-                "created_utc": "2026-07-09T00:00:00+00:00",
-                "torch_version": torch.__version__,
-            },
+            meta=meta,
         )
+
+
+def test_save_scores_accepts_legitimate_low_unique_egostitch_logits(tmp_path: Path) -> None:
+    n_rows = 10_000
+    values = np.linspace(-1.0, 1.0, 16, dtype=np.float32)
+    logit = np.tile(values, n_rows // len(values) + 1)[:n_rows].astype(np.float32)
+    output = tmp_path / "low-unique.npz"
+    score_universe.save_scores(
+        output,
+        node_ids=["node_a", "node_b"],
+        u_idx=np.zeros(n_rows, dtype=np.int32),
+        v_idx=np.ones(n_rows, dtype=np.int32),
+        logit=logit,
+        label=np.full(n_rows, -1, dtype=np.int8),
+        row_start=0,
+        meta=_egostitch_precision_meta(n_rows),
+    )
+    artifact = score_universe.load_scores(output)
+    score_universe.validate_score_precision(artifact.logit, meta=artifact.meta, label=str(output))
+    resolution = artifact.meta["score_resolution"]
+    assert isinstance(resolution, dict)
+    assert resolution["n_unique"] == 16
+    assert resolution["unique_fraction"] == pytest.approx(0.0016)
+
+
+def test_merge_recomputes_egostitch_resolution_diagnostics(tmp_path: Path) -> None:
+    shard_paths = [tmp_path / "s0.npz", tmp_path / "s1.npz"]
+    for shard, values in enumerate(
+        (
+            np.array([0.1, 0.2], dtype=np.float32),
+            np.array([0.2, 0.3], dtype=np.float32),
+        )
+    ):
+        meta = _egostitch_precision_meta(4)
+        score_universe.save_scores(
+            shard_paths[shard],
+            node_ids=["node_a", "node_b"],
+            u_idx=np.zeros(2, dtype=np.int32),
+            v_idx=np.ones(2, dtype=np.int32),
+            logit=values,
+            label=np.full(2, -1, dtype=np.int8),
+            row_start=2 * shard,
+            meta=meta,
+        )
+
+    output = tmp_path / "merged.npz"
+    score_universe.main(
+        ["merge", "--inputs", *[str(path) for path in shard_paths], "--output", str(output)]
+    )
+    merged = score_universe.load_scores(output)
+    assert merged.meta["score_resolution"] == score_universe.score_resolution_diagnostics(
+        merged.logit
+    )

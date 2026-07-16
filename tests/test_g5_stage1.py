@@ -181,19 +181,35 @@ class TestHolmStepDown:
         assert g5_stage1.holm_step_down({"only": 0.04}, 0.05) == {"only": True}
 
 
-class TestMatchedGlobalRdThreshold:
-    def test_tied_scores_within_registered_tolerance(self) -> None:
-        selected = g5_stage1.select_matched_global_rd_threshold(
-            np.array([0.9, 0.8, 0.8, 0.1]), target_edges=2, reference_edges=300
+class TestMatchedGlobalRdExactQuota:
+    def test_splits_boundary_tie_by_canonical_pair_order(self) -> None:
+        selected = g5_stage1.select_matched_global_rd_rows(
+            np.array([0.9, 0.8, 0.8, 0.1]),
+            np.array([0, 1, 0, 2], dtype=np.int32),
+            np.array([3, 3, 2, 3], dtype=np.int32),
+            target_edges=2,
+            reference_edges=100,
         )
-        assert selected.realized_edges == 1
-        assert selected.rd_gap == pytest.approx(1.0 / 300.0)
+        np.testing.assert_array_equal(selected.selected_rows, np.array([0, 2]))
+        assert selected.realized_edges == 2
+        assert selected.rd_gap == 0.0
+        assert selected.boundary_score == pytest.approx(0.8)
+        assert selected.boundary_tie_size == 2
+        assert selected.selected_from_boundary_tie == 1
+        assert selected.split_boundary_tie is True
 
-    def test_refuses_atomic_tie_outside_registered_tolerance(self) -> None:
-        with pytest.raises(ValueError, match="matched global simple-edge RD"):
-            g5_stage1.select_matched_global_rd_threshold(
-                np.array([0.9, 0.8, 0.8, 0.1]), target_edges=2, reference_edges=100
-            )
+    def test_self_pairs_use_boundary_score_but_do_not_consume_quota(self) -> None:
+        probs = np.array([0.9, 0.8, 0.9, 0.7])
+        u_idx = np.array([0, 1, 0, 2], dtype=np.int32)
+        v_idx = np.array([3, 3, 0, 2], dtype=np.int32)
+        pairs = [("a", "d"), ("b", "d"), ("a", "a"), ("c", "c")]
+        selected = g5_stage1.select_matched_global_rd_rows(
+            probs, u_idx, v_idx, target_edges=1, reference_edges=100
+        )
+        graph = g5_stage1.assemble_matched_global_rd_graph(
+            pairs, probs, u_idx, v_idx, selected, ["a", "b", "c", "d"]
+        )
+        assert set(graph.edges()) == {("a", "a"), ("a", "d")}
 
 
 def _row(clustering: float, boot_std: float = 0.0, degree: float = 10.0) -> AssembledRow:

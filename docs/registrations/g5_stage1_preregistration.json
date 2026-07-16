@@ -1,7 +1,8 @@
 {
-  "registration_id": "g5-stage1-20260714",
+  "registration_id": "g5-stage1-20260716-exact-quota",
   "gate": "G5 Stage 1 - EgoStitch minimum-viable model (imagination + degree budget + closure)",
-  "created_utc": "2026-07-14T00:00:00Z",
+  "created_utc": "2026-07-16T00:00:00Z",
+  "amendment_rationale": "Replacement registration made before any held-out topology metric was produced. An unpublished fp32 feasibility rescore showed that the model has intrinsic exact-score ties (largest group 143,690 of 2,037,171 rows) and that the former atomic-threshold rule cannot match the b0_cal_selfdensity realized quota within the unchanged 0.005 global-RD tolerance (nearest gap 0.0206452). The operating point is therefore defined by deterministic exact-quota selection within boundary ties. No model, hyperparameter, comparator, metric, tolerance, seed, or Holm rule changed; artifacts bound to the superseded registration hash are not formal inputs to this registration.",
   "spec_binding": "docs/05-egostitch-spec.md §13",
   "protocol_binding": "docs/03-experiment-protocol.md §5.0.5, §5.2",
   "benchmark": {
@@ -33,8 +34,8 @@
   "comparator_note": "B1/B5 comparison rows are deferred to E3 with their implementations (protocol §5.0.5 instantiation, 2026-07-14). The Stage-1 bar on every axis is the best comparator on that axis (max over B0 and all B0+cal arms). All comparator rows are recomputed by the gate module from the frozen candidate-scores artifact and the committed b0_cal results; values are never copied from result notes.",
   "operating_point": {
     "assembly": "density-matched threshold on non-self candidate rows against target_edges = |E(strip_self_loops(test_graph))| with atomic tie handling (G1 convention); self-pairs assembled at the same threshold",
-    "matched_global_rd": "a comparison at matched global simple-edge RD requires |RD_global(egostitch) - RD_global(comparator)| <= 0.005; if the density-matched operating point violates this for any comparator, the nearest sweep threshold satisfying it is used and disclosed",
-    "scores": "Stage-1 scores are pass-1 (ratio-1) scores per spec §13.11"
+    "matched_global_rd": "for each comparator, select exactly its realized non-self edge count from EgoStitch candidate rows by descending pass-1 score; split only the boundary score tie by ascending canonical pair order (min node index, max node index), without labels or topology targets; assemble self-pairs whose score is at least the selected boundary score; require and disclose |RD_global(egostitch) - RD_global(comparator)| <= 0.005 (the exact-quota construction gives zero gap for a valid quota)",
+    "scores": "Stage-1 scores are pass-1 (ratio-1) scores per spec §13.11; EgoStitch artifacts must declare the §13.16 pair-pass-fp32 precision contract and record descriptive score-resolution diagnostics"
   },
   "primary_criteria": {
     "family": ["clustering_mmd_ratio", "bfs_macro_gs", "bfs_macro_rd"],
