@@ -505,6 +505,18 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   before the next seed starts; only the final three-seed evaluation may emit the
   formal Holm pass/cut. Inspecting a single-seed diagnostic preserves the existing
   registration only if the scientific configuration remains unchanged.
+- 2026-07-16: added §13.16 (score precision pin). The 2026-07-15 Seed-0 candidate
+  scoring run (checkpoint `54f3c0ad8f5dfc18`) ran its per-pair pass under BF16
+  autocast, quantizing published logits to the BF16 grid (2,669 unique values across
+  2,037,171 candidate pairs, largest tied group 259,477); this made the registered
+  matched-global-RD tolerance (0.005, atomic thresholds) infeasible — nearest
+  achievable gap 0.0206452 — an evaluation-feasibility failure before any held-out
+  topology metric was produced. Scoring precision is now pinned: BF16 autocast is
+  encode-only (cacheable per-node pass), the per-pair pass computes in fp32, and
+  artifact validation gains a score-resolution guard. This is a measurement-precision
+  fix made before any held-out topology metric was observed; model, hyperparameters,
+  and the registered tolerance are unchanged. Seed-0 candidate scoring will be
+  re-run from the unchanged frozen checkpoint.
 
 **Open gate-report deliverable:** FLOPs/latency table template (§4.7 commitment —
 delivered with the G5 Stage-1 gate report). Stage-1 code now exists, but the formal
@@ -701,3 +713,16 @@ three-seed experiment is invalidated and continuation requires a new experiment 
 new pre-registration. If the scientific configuration is unchanged, the missing seeds
 may be completed and only the combined three-seed report may apply §13.14's formal
 decision rule.
+
+### 13.16 Score precision (pair-pass fp32 pin)
+
+BF16 autocast is permitted **only** for the cacheable per-node encode pass
+(Tokenize-lite + Imagine, §13.1–§13.2); its outputs are cached as fp32 (`.float()`)
+before reuse, so no BF16-grid truncation propagates downstream. The **per-pair**
+score pass — Stitch (§3, §13.3), the `(s0, s1, s2)` decision head (§13.1), and the s0
+fusion (§13.10), including the §13.9 self-pair single-ego path — computes with
+autocast **disabled**, in fp32: published artifact logits must carry full fp32
+resolution and must not sit on a reduced-precision grid. `score_universe` artifact
+validation fails loudly if an artifact's unique-logit count is degenerately low
+relative to its pair count (score-resolution guard), rather than allowing a
+quantized artifact to reach gate evaluation silently.

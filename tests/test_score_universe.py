@@ -19,6 +19,7 @@ from src import score_universe
 from src.data import packed_features
 from src.data.artifacts import canonical_pair
 from src.data.distributed_pairs import CompactPairBatch
+from src.data.features import FeatureStore
 from src.data.packed_features import PackedFeatureTable, build_packed_features
 from src.model.B0 import V3_1
 
@@ -803,4 +804,111 @@ def test_egostitch_cli_hard_fails_on_missing_s0_pair(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="missing pair"):
         score_universe.main(
             _egostitch_score_args(tmp_path, data_root, checkpoint, pairs, b0, tmp_path / "o.npz")
+        )
+
+
+# ---------------------------------------------------------------------------
+# egostitch pair pass is fp32 even under bf16 amp (spec Sec 13.16)
+# ---------------------------------------------------------------------------
+
+
+def test_score_egostitch_pair_pass_is_fp32_even_under_bf16_amp(tmp_path: Path) -> None:
+    """The bf16-autocast regression: only the per-node encode pass may use bf16.
+
+    Before the fix, the pair-scoring loop (Sinkhorn stitch + decision head) ran
+    inside the same `bf16` autocast context, so every logit landed on the bf16
+    ulp grid regardless of the fp32 output dtype. This reproduces that bug's
+    exact trigger (`--amp bf16` on CPU) and asserts full fp32 resolution.
+    """
+    torch.manual_seed(0)
+    n_nodes = 16
+    nodes = [f"e{i}" for i in range(n_nodes)]
+    node_tokens = {node: torch.randn(3 + (i % 5), INPUT_DIM) for i, node in enumerate(nodes)}
+    data_root = _data_root_with_features(tmp_path, node_tokens)
+    store = FeatureStore(data_root / "features" / "frozen_node_features_1024")
+
+    model = score_universe.build_model("egostitch", dict(_TINY_EGOSTITCH_CONFIG))
+    model.eval()
+
+    rng = np.random.default_rng(1)
+    n_pairs = 60
+    u_idx = rng.integers(0, n_nodes, size=n_pairs)
+    v_idx = (u_idx + rng.integers(1, n_nodes, size=n_pairs)) % n_nodes
+    v_idx[::5] = u_idx[::5]
+    pairs = [(nodes[int(u)], nodes[int(v)]) for u, v in zip(u_idx, v_idx, strict=True)]
+    s0_logits = rng.normal(size=n_pairs).astype(np.float32)
+
+    logits = score_universe._score_egostitch(
+        model,
+        pairs,
+        store,
+        device=torch.device("cpu"),
+        amp="bf16",
+        batch_pairs=5,
+        f0_cache=tmp_path / "f0_cache.pt",
+        grounding_cache=tmp_path / "grounding.npz",
+        s0_logits=s0_logits,
+    )
+
+    assert np.all(np.isfinite(logits))
+    bf16_roundtrip = torch.from_numpy(logits).to(torch.bfloat16).to(torch.float32).numpy()
+    is_self = u_idx == v_idx
+    assert np.any(logits[~is_self] != bf16_roundtrip[~is_self])
+    assert np.any(logits[is_self] != bf16_roundtrip[is_self])
+    assert np.unique(logits).size == n_pairs
+
+
+# ---------------------------------------------------------------------------
+# validate_score_resolution guard (spec Sec 13.16)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_score_resolution_raises_on_degenerate_large_artifact() -> None:
+    n_rows = 10_000
+    values = np.linspace(-1.0, 1.0, 16, dtype=np.float32)
+    logit = np.tile(values, n_rows // len(values) + 1)[:n_rows].astype(np.float32)
+
+    with pytest.raises(ValueError, match="unique logit values"):
+        score_universe.validate_score_resolution(logit, label="degenerate-artifact")
+
+
+def test_validate_score_resolution_passes_on_healthy_large_artifact() -> None:
+    rng = np.random.default_rng(0)
+    logit = rng.normal(size=10_000).astype(np.float32)
+
+    score_universe.validate_score_resolution(logit, label="healthy-artifact")  # must not raise
+
+
+def test_validate_score_resolution_does_not_false_positive_on_small_artifact() -> None:
+    n_rows = 500
+    values = np.array([-1.0, -0.5, 0.0, 0.5, 1.0], dtype=np.float32)
+    logit = np.tile(values, n_rows // len(values) + 1)[:n_rows].astype(np.float32)
+
+    # Below the row floor: a handful of unique values must not false-positive.
+    score_universe.validate_score_resolution(logit, label="small-artifact")
+
+
+def test_save_scores_raises_on_degenerate_large_logit_column(tmp_path: Path) -> None:
+    n_rows = 10_000
+    values = np.linspace(-1.0, 1.0, 16, dtype=np.float32)
+    logit = np.tile(values, n_rows // len(values) + 1)[:n_rows].astype(np.float32)
+
+    with pytest.raises(ValueError, match="unique logit values"):
+        score_universe.save_scores(
+            tmp_path / "degenerate.npz",
+            node_ids=["node_a", "node_b"],
+            u_idx=np.zeros(n_rows, dtype=np.int32),
+            v_idx=np.ones(n_rows, dtype=np.int32),
+            logit=logit,
+            label=np.full(n_rows, -1, dtype=np.int8),
+            row_start=0,
+            meta={
+                "checkpoint_id": "abc123abc123abcd",
+                "model_family": "v3_1",
+                "pairs_source": "candidate",
+                "strategy": "breadth_first",
+                "num_rows": n_rows,
+                "created_utc": "2026-07-09T00:00:00+00:00",
+                "torch_version": torch.__version__,
+            },
         )

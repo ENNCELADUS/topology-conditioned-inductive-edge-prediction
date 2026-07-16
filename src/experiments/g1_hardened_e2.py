@@ -56,7 +56,7 @@ from src.eval.graph_metrics import (
     noise_floor,
     strip_self_loops,
 )
-from src.score_universe import ScoresArtifact, load_scores
+from src.score_universe import ScoresArtifact, load_scores, validate_score_resolution
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +167,8 @@ def validate_universe_artifact(
     Raises:
         ValueError: If ``meta["pairs_source"] != "candidate"``, ``meta["strategy"]``
             does not match `strategy`, the row count does not equal the expected
-            candidate-universe size, or any label is outside ``{0, 1}``.
+            candidate-universe size, any label is outside ``{0, 1}``, or the logit
+            column fails the score-resolution guard (spec Sec 13.16).
     """
     errors: list[str] = []
 
@@ -191,6 +192,13 @@ def validate_universe_artifact(
     bad_labels = labels_present - {0, 1}
     if bad_labels:
         errors.append(f"{label}: label values outside {{0,1}} found: {sorted(bad_labels)}")
+
+    # Score-resolution guard (spec Sec 13.16): a reduced-precision logit column
+    # must fail at gate time too, not only on the save_scores write path.
+    try:
+        validate_score_resolution(artifact.logit, label=label)
+    except ValueError as exc:
+        errors.append(str(exc))
 
     if errors:
         raise ValueError("; ".join(errors))

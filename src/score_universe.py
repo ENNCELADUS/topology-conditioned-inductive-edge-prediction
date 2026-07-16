@@ -138,6 +138,53 @@ class _Shard(NamedTuple):
     meta: dict[str, object]
 
 
+# A bf16-quantized fp32 logit column collapses onto the bf16 ulp grid (spacing
+# 0.03125 at |logit| in [4,8)), so a large artifact scored under a stray
+# autocast context has far fewer unique logit values than rows. This floor and
+# fraction are calibrated against the 2026-07-15 Seed-0 bug (2,669 unique
+# logits across 2,037,171 rows) while staying well clear of legitimate small
+# fixtures/toy artifacts, which may have few unique values by construction.
+_MIN_RESOLUTION_ROWS = 10_000
+_MIN_RESOLUTION_UNIQUE_FRACTION = 0.01
+
+
+def validate_score_resolution(
+    logit: NDArray[np.float32],
+    *,
+    label: str,
+    min_rows: int = _MIN_RESOLUTION_ROWS,
+    min_unique_fraction: float = _MIN_RESOLUTION_UNIQUE_FRACTION,
+) -> None:
+    """Fail closed on a reduced-precision (e.g. bf16-quantized) logit column.
+
+    Applies only at or above `min_rows` rows: small fixtures/toy artifacts
+    legitimately have few unique values and must not false-positive here.
+
+    Args:
+        logit: The scores artifact's (or shard's) logit column.
+        label: Human-readable artifact label used in the error message
+            (e.g. the output path).
+        min_rows: Row-count floor below which the check is skipped.
+        min_unique_fraction: Minimum required ratio of unique logit values to
+            rows at or above `min_rows` rows.
+
+    Raises:
+        ValueError: If ``len(logit) >= min_rows`` and the unique-value count
+            is below ``min_unique_fraction * len(logit)``.
+    """
+    n = len(logit)
+    if n < min_rows:
+        return
+    n_unique = int(np.unique(logit).shape[0])
+    if n_unique < min_unique_fraction * n:
+        raise ValueError(
+            f"{label}: only {n_unique} unique logit values across {n} rows "
+            f"(< {min_unique_fraction:.0%} of rows); this artifact was likely scored "
+            "under reduced-precision (e.g. bf16 autocast) arithmetic that collapsed "
+            "the logit grid — rescore in fp32 before this artifact can be used"
+        )
+
+
 def save_scores(
     path: Path,
     *,
@@ -164,7 +211,10 @@ def save_scores(
 
     Raises:
         ValueError: If array lengths disagree, indices fall outside `node_ids`,
-            `row_start` is negative, or `meta` is missing pinned keys.
+            `row_start` is negative, `meta` is missing pinned keys, or `logit`
+            fails the score-resolution guard (`validate_score_resolution`) —
+            this applies to every artifact written here, including individual
+            shards at or above the guard's row floor.
     """
     n = len(logit)
     if not (len(u_idx) == len(v_idx) == len(label) == n):
@@ -184,6 +234,7 @@ def save_scores(
     missing = [key for key in _META_KEYS if key not in meta]
     if missing:
         raise ValueError(f"meta is missing required keys: {missing}")
+    validate_score_resolution(logit, label=str(path))
 
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -835,14 +886,18 @@ def _score_egostitch(
     unique endpoints, then scores pair batches from the cache: Sinkhorn stitch
     + decision head fused with the cached frozen-B0 ``s0`` logits. Self-pairs
     route through the single-ego path (spec Sec 13.9). Stage-1 scores are
-    pass-1 (ratio 1) scores (spec Sec 13.11).
+    pass-1 (ratio 1) scores (spec Sec 13.11). The per-pair pass (Sinkhorn
+    stitch, decision head, self-pair single-ego branch) always runs in fp32,
+    regardless of `amp` (spec Sec 13.16 score-precision pin); only the
+    per-node encode pass honors `amp`.
 
     Args:
         model: Frozen `EgoStitchStage1`, on `device`, in ``eval()`` mode.
         pairs: Node-id pairs in input row order.
         store: Feature store providing per-node token sequences.
         device: Compute device.
-        amp: ``off`` or ``bf16``.
+        amp: ``off`` or ``bf16``; applies only to the per-node encode pass.
+            The per-pair scoring pass always runs in fp32 (see above).
         batch_pairs: Pair rows per forward pass.
         f0_cache: F0 matrix cache path (f0_mlp semantics).
         grounding_cache: Grounding-pool cache path (derived from `f0_cache`
@@ -935,7 +990,15 @@ def _score_egostitch(
         batch_v = v_rows[start:end].to(device)
         batch_self = is_self[start:end].to(device)
         s0 = torch.from_numpy(s0_logits[start:end].astype(np.float32)).to(device)
-        with torch.inference_mode(), _autocast_context(device, amp):
+        # Pair pass always runs fp32 regardless of `amp` (spec Sec 13.16
+        # score-precision pin): under bf16 autocast the Sinkhorn stitch and
+        # decision head (both branches below) emit bfloat16 values, and
+        # assigning them into `logits` silently preserves the bf16 ulp grid
+        # (spacing 0.03125 at |logit| in [4,8)) even though `logits` itself is
+        # fp32. Inputs here are already fp32 (`h_all`/`pi_all`/`mult_all`/
+        # `adj_all`/`proj_all`/`d_hat_all` are `.float()`-cast above; `s0` is
+        # fp32), so disabling autocast is behavior-correcting, not a refactor.
+        with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=False):
             logits = torch.zeros(end - start, dtype=torch.float32, device=device)
             sel = torch.nonzero(~batch_self, as_tuple=False).squeeze(-1)
             if sel.numel() > 0:
@@ -1274,6 +1337,7 @@ __all__ = [
     "main",
     "merge_scores",
     "save_scores",
+    "validate_score_resolution",
 ]
 
 
