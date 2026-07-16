@@ -99,6 +99,12 @@ def test_g5_runner_completes_each_seed_before_formal_holm() -> None:
     assert "model or hyperparameter change" in text
 
 
+def test_g5_runner_rejects_stale_low_resolution_candidate_before_reuse() -> None:
+    text = G5_RUNNER.read_text()
+    candidate_check = text[text.index("candidate_is_current()") : text.index("run_seed()")]
+    assert "validate_score_resolution" in candidate_check
+
+
 def test_runner_discovers_visible_h20s() -> None:
     text = RUNNER.read_text()
     for value in (
