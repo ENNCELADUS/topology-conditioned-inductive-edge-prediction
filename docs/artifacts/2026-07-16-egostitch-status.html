@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Document</title>
+<style>
+/* house.css — shared style for html-doc research documents.
+   Inlined into every generated file by scripts/build_doc.py.
+   No external fonts, no CDN: everything here works offline from file://. */
+
+:root {
+  --bg: #fbfaf8;
+  --surface: #ffffff;
+  --surface-2: #f4f2ee;
+  --ink: #1c1b19;
+  --ink-2: #514e49;
+  --ink-3: #8a857d;
+  --rule: #e2ded7;
+  --rule-2: #cfc9c0;
+  --accent: #9a3412;
+  --accent-soft: #fdf0e9;
+  --include: #15803d;
+  --include-soft: #eaf6ee;
+  --reject: #b91c1c;
+  --reject-soft: #fbeeee;
+  --serif: "Source Serif Pro", "Iowan Old Style", Charter, "Songti SC", Georgia, serif;
+  --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  --radius: 6px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161513;
+    --surface: #1e1d1a;
+    --surface-2: #26241f;
+    --ink: #eceae6;
+    --ink-2: #b3aea5;
+    --ink-3: #837d73;
+    --rule: #322f2a;
+    --rule-2: #43403a;
+    --accent: #f0834f;
+    --accent-soft: #2e2018;
+    --include: #4ade80;
+    --include-soft: #17281c;
+    --reject: #f87171;
+    --reject-soft: #2b1818;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap { max-width: 1120px; margin: 0 auto; padding: 32px 24px 96px; }
+
+/* ---------- masthead ---------- */
+
+.masthead { border-bottom: 2px solid var(--ink); padding-bottom: 14px; margin-bottom: 28px; }
+.eyebrow {
+  font-size: 11px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--accent); margin-bottom: 6px;
+}
+.masthead h1 { font-family: var(--serif); font-size: 34px; line-height: 1.15; margin: 0 0 8px; font-weight: 600; }
+.dek { color: var(--ink-2); font-size: 15px; max-width: 68ch; margin: 0; }
+.meta { margin-top: 12px; font-size: 12px; color: var(--ink-3); font-family: var(--mono); }
+
+/* ---------- the decision box: every doc leads with this ---------- */
+
+.decision {
+  background: var(--accent-soft);
+  border: 1px solid var(--rule-2);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  margin-bottom: 28px;
+}
+.decision h2 { margin: 0 0 6px; font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+.decision p { margin: 0; font-size: 16px; font-family: var(--serif); }
+
+/* ---------- structure ---------- */
+
+section { margin-bottom: 40px; scroll-margin-top: 20px; }
+h2.sec {
+  font-size: 12px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--ink-3); border-bottom: 1px solid var(--rule); padding-bottom: 6px; margin: 0 0 16px;
+}
+h3 { font-family: var(--serif); font-size: 19px; margin: 0 0 8px; font-weight: 600; }
+p { margin: 0 0 12px; }
+a { color: var(--accent); text-underline-offset: 2px; }
+code { font-family: var(--mono); font-size: .88em; background: var(--surface-2); padding: 1px 5px; border-radius: 3px; }
+
+/* ---------- cards ---------- */
+
+.grid { display: grid; gap: 14px; }
+.grid.cols-2 { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.grid.cols-3 { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+.card.included { border-color: var(--include); background: var(--include-soft); }
+.card.rejected { border-color: var(--rule); background: var(--reject-soft); opacity: .72; }
+
+/* ---------- tables ---------- */
+
+.table-scroll { overflow-x: auto; border: 1px solid var(--rule); border-radius: var(--radius); background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+thead th {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--surface-2); color: var(--ink-2);
+  font-size: 11px; letter-spacing: .06em; text-transform: uppercase; font-weight: 600;
+  border-bottom: 1px solid var(--rule-2);
+}
+th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+th.sortable:hover { color: var(--ink); }
+th.sortable::after { content: " ↕"; opacity: .3; }
+th.sortable[data-dir="asc"]::after { content: " ↑"; opacity: 1; color: var(--accent); }
+th.sortable[data-dir="desc"]::after { content: " ↓"; opacity: 1; color: var(--accent); }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr.included { background: var(--include-soft); }
+tbody tr.rejected { background: var(--reject-soft); color: var(--ink-3); }
+tbody tr.rejected .title { text-decoration: line-through; }
+
+/* ---------- controls ---------- */
+
+.controls {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  margin-bottom: 14px; padding: 12px; background: var(--surface); border: 1px solid var(--rule);
+  border-radius: var(--radius);
+}
+input[type="search"], input[type="text"], select {
+  font: inherit; font-size: 13px; color: var(--ink);
+  background: var(--bg); border: 1px solid var(--rule-2); border-radius: 4px; padding: 6px 9px;
+}
+input[type="search"] { min-width: 220px; flex: 1; }
+input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.chip {
+  font-size: 11px; font-family: var(--mono); padding: 2px 7px; border-radius: 20px;
+  background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--rule); white-space: nowrap;
+}
+.chip.gap { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+
+/* tri-state include / reject toggle */
+.tri { display: inline-flex; border: 1px solid var(--rule-2); border-radius: 4px; overflow: hidden; }
+.tri button {
+  font: inherit; font-size: 12px; line-height: 1; padding: 5px 8px; cursor: pointer;
+  background: var(--surface); color: var(--ink-3); border: none; border-right: 1px solid var(--rule-2);
+}
+.tri button:last-child { border-right: none; }
+.tri button:hover { background: var(--surface-2); color: var(--ink); }
+.tri button[aria-pressed="true"][data-state="include"] { background: var(--include); color: #fff; }
+.tri button[aria-pressed="true"][data-state="reject"] { background: var(--reject); color: #fff; }
+
+.reason { display: none; margin-top: 6px; }
+tr.rejected .reason, .card.rejected .reason { display: block; }
+.reason input { width: 100%; font-size: 12px; border-color: var(--reject); }
+
+.notewrap { display: none; margin-top: 6px; }
+tr.included .notewrap, .card.included .notewrap { display: block; }
+.notewrap input { width: 100%; font-size: 12px; border-color: var(--include); }
+
+/* ---------- the roundtrip bar ---------- */
+
+.rtbar {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
+  display: flex; gap: 14px; align-items: center; justify-content: space-between;
+  padding: 10px 20px;
+  background: var(--surface); border-top: 1px solid var(--rule-2);
+  box-shadow: 0 -2px 14px rgba(0,0,0,.06);
+  font-size: 13px;
+}
+.rtbar .tally { font-family: var(--mono); color: var(--ink-2); }
+.rtbar .tally b { color: var(--include); }
+.rtbar .tally i { color: var(--reject); font-style: normal; }
+.rtbar .hint { color: var(--ink-3); font-size: 12px; }
+.copy-btn {
+  font: inherit; font-weight: 600; font-size: 13px; cursor: pointer;
+  background: var(--ink); color: var(--bg); border: none; border-radius: 5px; padding: 9px 16px;
+}
+.copy-btn:hover { background: var(--accent); }
+.copy-btn.done { background: var(--include); }
+
+/* ---------- svg figures ---------- */
+
+figure { margin: 0 0 16px; padding: 14px; background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius); overflow-x: auto; }
+figure svg { display: block; max-width: 100%; height: auto; }
+figcaption { margin-top: 10px; font-size: 12px; color: var(--ink-3); }
+.svg-label { font-family: var(--sans); font-size: 10px; fill: var(--ink-3); }
+.svg-cell { fill: var(--accent); }
+
+.empty { padding: 28px; text-align: center; color: var(--ink-3); font-style: italic; }
+
+@media (max-width: 640px) {
+  .wrap { padding: 20px 14px 100px; }
+  .masthead h1 { font-size: 26px; }
+  .rtbar { flex-wrap: wrap; gap: 8px; }
+  .rtbar .hint { display: none; }
+}
+
+@media print {
+  .rtbar, .controls, .tri { display: none; }
+  body { background: #fff; }
+  tr.rejected, .card.rejected { display: none; }
+}
+
+.body-copy { font-family: var(--serif); font-size: 16.5px; line-height: 1.62; }
+.body-copy ul, .body-copy ol { padding-left: 22px; }
+.body-copy table { margin: 8px 0; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+
+<script type="application/json" id="doc-data">
+{
+  "doc": "egostitch-status",
+  "title": "EgoStitch — Research Status & Experiment Plan",
+  "eyebrow": "Status tracker · Topology-Conditioned Inductive Edge Prediction · ICLR 2027",
+  "dek": "Where every gate, experiment, and model stage stands as of 2026-07-16, after the rev-3.0 headline landing (e2e stitched-topology-conditioned pair encoder). Sources: docs/03-experiment-protocol.md, docs/04-model-proposal.md (rev 3.0), docs/05-egostitch-spec.md §13–§14, docs/results/, docs/superpowers/specs + plans.",
+  "sections": [
+    {
+      "heading": "The research logic",
+      "html": "<style>.pill{display:inline-block;padding:1px 9px;border-radius:999px;font-size:11.5px;letter-spacing:.04em;white-space:nowrap;border:1px solid}.p-done{color:var(--include);border-color:var(--include);background:var(--include-soft)}.p-act{color:var(--accent);border-color:var(--accent);background:var(--accent-soft)}.p-pend{color:var(--ink-3);border-color:var(--rule-2)}.p-diag{color:var(--reject);border-color:var(--reject);background:var(--reject-soft)}td .pill{margin-right:2px}.num{font-variant-numeric:tabular-nums}.hint{color:var(--ink-2);font-size:13.5px}.ev{color:var(--ink-3);font-size:12.5px}.ev code{font-size:12px}</style><p><strong>Thesis:</strong> inductive edge prediction is <em>topology-conditioned binary classification</em> — not independent pairwise scoring, not graph generation. Generated local topology is always intermediate context; the final output is the 0/1 label for a queried pair <code>(u,&thinsp;v)</code> of unseen nodes, and predictions are additionally graded after assembly into a graph.</p><p>The plan is a chain of <strong>falsifiable checkpoints</strong>: first prove the problem exists and is fixable (gates G1–G3), freeze the model contract (G4), build the model in stages where every mechanism must pay for itself or be cut (G5), and only then run the paper's experiment matrix (E1–E7). Edge-level and assembled-graph metrics are always reported together — single-metric-family claims are banned (protocol §E5).</p><figure><svg viewBox='0 0 1060 168' width='100%' role='img' aria-label='Pipeline of gates and experiments'><defs><marker id='arr' viewBox='0 0 8 8' refX='7' refY='4' markerWidth='7' markerHeight='7' orient='auto'><path d='M0 0 L8 4 L0 8 z' fill='var(--rule-2)'/></marker></defs><g font-family='inherit' font-size='13' text-anchor='middle'><g><rect x='8' y='34' width='78' height='52' rx='8' fill='var(--include-soft)' stroke='var(--include)'/><text x='47' y='56' fill='var(--ink)'>G1</text><text x='47' y='74' fill='var(--ink-2)' font-size='10.5'>gap hardened</text></g><line x1='86' y1='60' x2='104' y2='60' stroke='var(--rule-2)' stroke-width='1.5' marker-end='url(#arr)'/><g><rect x='106' y='34' width='78' height='52' rx='8' fill='var(--include-soft)' stroke='var(--include)'/><text x='145' y='56' fill='var(--ink)'>G2</text><text x='145' y='74' fill='var(--ink-2)' font-size='10.5'>ceiling</text></g><line x1='184' y1='60' x2='202' y2='60' stroke='var(--rule-2)' stroke-width='1.5' marker-end='url(#arr)'/><g><rect x='204' y='34' width='78' height='52' rx='8' fill='var(--include-soft)' stroke='var(--include)'/><text x='243' y='56' fill='var(--ink)'>G3</text><text x='243' y='74' fill='var(--ink-2)' font-size='10.5'>oracle headroom</text></g><line x1='282' y1='60' x2='300' y2='60' stroke='var(--rule-2)' stroke-width='1.5' marker-end='url(#arr)'/><g><rect x='302' y='34' width='78' height='52' rx='8' fill='var(--include-soft)' stroke='var(--include)'/><text x='341' y='56' fill='var(--ink)'>G4</text><text x='341' y='74' fill='var(--ink-2)' font-size='10.5'>spec freeze</text></g><line x1='380' y1='60' x2='398' y2='60' stroke='var(--rule-2)' stroke-width='1.5' marker-end='url(#arr)'/><g><rect x='400' y='16' width='268' height='94' rx='10' fill='none' stroke='var(--rule-2)' stroke-dasharray='4 4'/><text x='534' y='34' fill='var(--ink-3)' font-size='11'>G5 · staged build (each stage must earn its keep)</text><rect x='412' y='44' width='76' height='52' rx='8' fill='var(--accent-soft)' stroke='var(--accent)'/><text x='450' y='66' fill='var(--ink)'>Stage 1</text><text x='450' y='84' fill='var(--ink-2)' font-size='10.5'>s0-scr → e2e</text><line x1='488' y1='70' x2='500' y2='70' stroke='var(--rule-2)' stroke-width='1.5' marker-end='url(#arr)'/><rect x='502' y='44' width='76' height='52' rx='8' fill='var(--surface-2)' stroke='var(--rule-2)'/><text x='540' y='66' fill='var(--ink-2)'>Stage 2</text><text x='540' y='84' fill='var(--ink-3)' font-size='10.5'>+codebook +s3</text><line x1='578' y1='70' x2='590' y2='70' stroke='var(--rule-2)' stroke-width='1.5' marker-end='url(#arr)'/><rect x='592' y='44' width='68' height='52' rx='8' fill='var(--surface-2)' stroke='var(--rule-2)'/><text x='626' y='66' fill='var(--ink-2)'>Stage 3</text><text x='626' y='84' fill='var(--ink-3)' font-size='10.5'>+harmonize</text></g><line x1='668' y1='60' x2='688' y2='60' stroke='var(--rule-2)' stroke-width='1.5' marker-end='url(#arr)'/><g><rect x='690' y='34' width='86' height='52' rx='8' fill='var(--surface-2)' stroke='var(--rule-2)'/><text x='733' y='56' fill='var(--ink-2)'>E1 · E3</text><text x='733' y='74' fill='var(--ink-3)' font-size='10.5'>main + ladder</text></g><line x1='776' y1='60' x2='794' y2='60' stroke='var(--rule-2)' stroke-width='1.5' marker-end='url(#arr)'/><g><rect x='796' y='34' width='70' height='52' rx='8' fill='var(--surface-2)' stroke='var(--rule-2)'/><text x='831' y='56' fill='var(--ink-2)'>E4</text><text x='831' y='74' fill='var(--ink-3)' font-size='10.5'>ablations</text></g><line x1='866' y1='60' x2='884' y2='60' stroke='var(--rule-2)' stroke-width='1.5' marker-end='url(#arr)'/><g><rect x='886' y='34' width='82' height='52' rx='8' fill='var(--surface-2)' stroke='var(--rule-2)'/><text x='927' y='56' fill='var(--ink-2)'>E5 · E7</text><text x='927' y='74' fill='var(--ink-3)' font-size='10.5'>integrity · utility</text></g><line x1='968' y1='60' x2='986' y2='60' stroke='var(--rule-2)' stroke-width='1.5' marker-end='url(#arr)'/><g><rect x='988' y='34' width='64' height='52' rx='8' fill='var(--surface-2)' stroke='var(--rule-2)'/><text x='1020' y='56' fill='var(--ink-2)'>E6</text><text x='1020' y='74' fill='var(--ink-3)' font-size='10.5'>transfer</text></g><g font-size='11' text-anchor='start'><rect x='8' y='134' width='12' height='12' rx='3' fill='var(--include-soft)' stroke='var(--include)'/><text x='26' y='144' fill='var(--ink-2)'>complete</text><rect x='100' y='134' width='12' height='12' rx='3' fill='var(--accent-soft)' stroke='var(--accent)'/><text x='118' y='144' fill='var(--ink-2)'>active</text><rect x='176' y='134' width='12' height='12' rx='3' fill='var(--surface-2)' stroke='var(--rule-2)'/><text x='194' y='144' fill='var(--ink-2)'>pending</text></g></g></svg><figcaption>Run order per protocol §5: gates block model work; E2 was delivered by the gates; E7 runs with (not after) breadth.</figcaption></figure>"
+    },
+    {
+      "heading": "Pre-implementation gates G1–G5",
+      "html": "<div class='table-scroll'><table><thead><tr><th>Gate</th><th>Question it answers</th><th>Status</th><th>Key result</th><th>Stop rule / consequence</th></tr></thead><tbody><tr><td><strong>G1</strong> — hardened E2</td><td>Does the pair-to-topology gap survive hard negatives, threshold sweeps, and a second architecture?</td><td><span class='pill p-done'>DONE 2026-07-14</span></td><td class='num'>B0: AUPRC 0.730 (degree-corrected) falling to 0.617–0.627 on hard negatives; assembly at global RD 0.9977 has BFS-macro GS/RD <strong>0.312/0.422</strong>, MMD ratios <strong>13.08/11.93/18.09</strong>. B0-alt replicates (GS 0.346); a stronger legacy scorer (AUPRC 0.813) still fails (GS 0.381).<div class='ev'><code>outputs/deliverables/g1_graph_metrics_20260714/</code> · <code>docs/results/E2-pair-to-topology-gap.md</code></div></td><td>Gap closes ⇒ pivot to evaluation paper. <em>Not triggered.</em></td></tr><tr><td><strong>G2</strong> — independence ceiling</td><td>Could <em>any</em> edge-independent scorer reach realistic triangle counts?</td><td><span class='pill p-done'>DONE</span></td><td class='num'>Ov(P) = 0.4799 vs required Ov<sub>min</sub> = 0.0550 — no impossibility.<div class='ev'><code>outputs/deliverables/b0_v31_breadth_first_20260711/g2/results.json</code></div></td><td>Ov<sub>min</sub> unreachable ⇒ locked-decision discussion. <em>Not triggered.</em></td></tr><tr><td><strong>G3</strong> — oracle first</td><td>If a scorer could see test topology, would assembled metrics improve? (feature-insufficiency check)</td><td><span class='pill p-done'>DONE 2026-07-14</span></td><td class='num'>oracle_topo GS 0.5030 = <strong>1.61×</strong> B0; oracle_blend MMD headroom <strong>1.72/3.89/2.00</strong> (deg/clust/spec) — clustering is the biggest prize.<div class='ev'><code>outputs/deliverables/g3_graph_metrics_20260714/g3_results.json</code></div></td><td>Oracle ≈ B0 ⇒ conditioning cannot help; pivot. <em>Not triggered — EgoStitch approved.</em></td></tr><tr><td><strong>G4</strong> — spec freeze</td><td>Is the implementation contract pinned before code?</td><td><span class='pill p-done'>SIGNED OFF 2026-07-09</span></td><td>Spec pins algorithm/shapes/losses, §9 data contract (quarantined leaky artifacts, self-loop policy), §10 batch sampler, §11 auto-sized H20 DDP.<div class='ev'><code>docs/05-egostitch-spec.md</code> (freeze rule: edit spec first, then code)</div></td><td>Code may never silently deviate from the spec.</td></tr><tr><td><strong>G5</strong> — staged build</td><td>Does each EgoStitch mechanism earn its place?</td><td><span class='pill p-act'>STAGE 1 ACTIVE</span></td><td>Stage-1 (frozen-s0 form) code complete and formally trained once (Seed 0); the run is <strong>diagnostic-only</strong>. Headline revised 2026-07-16 (rev 3.0) to the e2e conditioned encoder; the pending frozen-s0 screen keeps its registered contract as the motivating arm — see the Stage-1 section below.<div class='ev'><code>docs/05-egostitch-spec.md §13, §14</code> · <code>docs/registrations/g5_stage1_preregistration.json</code></div></td><td>A stage that fails its gate ⇒ the added mechanism is cut.</td></tr></tbody></table></div>"
+    },
+    {
+      "heading": "The model — EgoStitch and its build stages",
+      "html": "<p>Full EgoStitch (<code>Ours</code>, proposal <strong>rev 3.0</strong>, 2026-07-16): <strong>① topology tokenizer</strong> with a community codebook → <strong>② ego-network imagination</strong> (generate each endpoint's plausible neighborhood — intermediate context, never the output) → <strong>③ stitching + consensus harmonization</strong> of the two imagined ego-nets → <strong>④ stitched-topology-conditioned pair encoder</strong>: <code>p<sub>ij</sub> = σ(head(Trunk(tok<sub>i</sub>, tok<sub>j</sub> | STE(T̂<sub>ij</sub>), c<sub>content</sub>)))</code> — a from-scratch V3.1-class pair encoder whose CLS token cross-attends, through <strong>zero-initialized tanh gates</strong> and per direction before abba-max, to a <strong>structure-only stitched-topology encoder</strong> (4-type anchor labels, π, m, soft degrees, and the scaffold's star/Â/Π edge structure — no content embeddings, no grounding) and, on a separate independently-ablatable gate, to a content pathway. <strong>No pretrained frozen classifier appears anywhere in the model.</strong> Three mutually exclusive head nulls (<code>∅_all_head</code> / <code>∅_topo_head</code> / <code>∅_content_head</code>) make the same checkpoint emit four logits — full, pair-only <code>f_logit</code>, pair+content, pair+topology — so attribution is a checkpoint property. The rev-2.2 head (frozen B0 anchor + gated scalar residual over s1–s4) is <strong>retired to an ablation arm</strong> after the Seed-0 diagnostic showed it collapsing onto B0 and two design-review rounds scored logit-level late fusion 2–3/10 on innovation.</p><div class='table-scroll'><table><thead><tr><th>Evidence</th><th>rev 2.2 role → rev 3.0 role</th><th>Enters at</th></tr></thead><tbody><tr><td><code>s0</code> → <code>f_logit</code></td><td>Frozen B0 anchor (never trained through) → the jointly-trained trunk's own pair-only logit, recovered exactly from the same checkpoint via <code>∅_all_head</code>; the frozen-s0 head survives only as an ablation arm</td><td><span class='pill p-act'>Stage 1</span></td></tr><tr><td><code>s1</code> → content pathway</td><td>Membership likelihood → content tokens (slot embeddings, grounding, identity-match) behind the separately-gated cross-attention pathway — deliberately excluded from the topology claim</td><td><span class='pill p-act'>Stage 1</span></td></tr><tr><td><code>s2</code> → diagnostics</td><td>Closure mass on the Sinkhorn-aligned imagined ego-nets → registered diagnostic + representation-probe target (Π-consistency); the STE sees the same structure</td><td><span class='pill p-act'>Stage 1</span></td></tr><tr><td><code>s3</code> → STE inputs</td><td>Community / capacity — block rate <code>1−exp(−F<sub>i</sub>·F<sub>j</sub>)</code>, degree budgets, budget pressure → Stage-2 structural inputs to the STE</td><td><span class='pill p-pend'>Stage 2</span></td></tr><tr><td><code>s4</code> → <strong>STE</strong></td><td>Scaffold GNN readout → <strong>promoted</strong>: same edge-weighted-GNN lineage over anchor-labeled <code>T̂<sub>ij</sub></code>, token-level states instead of a pooled scalar — now the headline conditioning source</td><td><span class='pill p-act'>Stage 1 (e2e)</span></td></tr></tbody></table></div><div class='table-scroll'><table><thead><tr><th>Stage</th><th>Adds</th><th>Gate it must pass</th><th>Status</th></tr></thead><tbody><tr><td><strong>Stage 1</strong></td><td><em>Phase A — frozen-s0 screen (pending, registered contract unchanged):</em> Tokenize-lite + imagination + Hungarian matching + Sinkhorn stitch; head over (s0, s1, s2) (spec §13.1). Its outcome is the motivating arm for the successor. <em>Phase B — e2e screen (next binding build, after Phase A publishes; spec §14.3):</em> the rev-3.0 model — trunk + STE + gated cross-attention — under a fresh <strong>five-arm</strong> registration: full, matched <code>B0-e2e</code>/f-only, pair+topology, within-pair Â/Π-shuffle control, branch-dropout p=0.</td><td>Phase A: one-fixed-seed screen vs <code>B0</code> and <code>B0+cal</code> — deterministic point dominance on <strong>clustering-MMD + BFS-macro GS/RD</strong> at matched global simple-edge RD, degree-MMD and matched-AUPRC guards; no significance claims from one seed (spec §13.15). Phase B additionally pins: four-logit decomposition, within-checkpoint <code>f_logit</code> liveness, representation probes (incl. degree-partialled), pathway-attribution rule, measured H20 cost re-estimate.</td><td><span class='pill p-act'>ACTIVE</span></td></tr><tr><td><strong>Stage 2</strong></td><td>+ community codebook (VQ, BP affiliations, code stats) + <code>s3</code></td><td>Must beat Stage 1 on the pre-registered criteria or the codebook is cut.</td><td><span class='pill p-pend'>PENDING</span></td></tr><tr><td><strong>Stage 3</strong></td><td>+ consensus harmonization (R&gt;0) + seam realism loss (+ <code>s4</code> readout on the harmonized scaffold)</td><td>Must beat Stage 2 or harmonization is cut.</td><td><span class='pill p-pend'>PENDING</span></td></tr></tbody></table></div><p class='hint'><strong>The final model is adaptive by design.</strong> Training objective is locked: <code>L = L_edge + λ_real·L_real + λ_ssl·L_ssl + λ_recon·L_recon</code>. Pre-registered off-ramps: if the pathway attribution (pair+topology vs <code>B0-e2e</code>) and the structure-specificity battery (incl. degree-preserving rewiring) show no value anywhere, the honest outcome is <code>Ours → B5</code> (neural-SBM residual) and the small-paper story (protocol §5.2.2); any mechanism owning no gain in E4 is cut from the submitted model (proposal §4.6). E1/E3 inference always requires ≥3 seeds with Holm correction — only the G5 screen is single-seed.</p>"
+    },
+    {
+      "heading": "Experiment matrix E1–E7",
+      "html": "<div class='table-scroll'><table><thead><tr><th>Exp</th><th>Goal (the claim it exists to test)</th><th>Compared against</th><th>Status</th></tr></thead><tbody><tr><td><strong>E1</strong> — main result</td><td><code>Ours</code> matches B0 on edge AUPRC <em>and</em> improves held-out assembled topology beyond what calibration and loss shaping achieve; RD moves toward 1. Holm-corrected, ≥3 seeds.</td><td>B0, B0+cal, B3-dist, B3-full, B5, B2-global</td><td><span class='pill p-pend'>AWAITS G5</span></td></tr><tr><td><strong>E2</strong> — pair-to-topology gap</td><td>An independent pairwise scorer assembles into an implausible graph, and no mundane explanation (threshold, negatives, normalization, architecture) rescues it. The motivating result.</td><td>B0, B0-alt, PA-null, noise floor</td><td><span class='pill p-done'>COMPLETE 2026-07-14</span></td></tr><tr><td><strong>E3</strong> — head-to-head ladder</td><td><code>Ours</code> sits on the Pareto frontier of edge AUPRC × assembled realism under one protocol; no cheaper family (calibration, retrieval, global/static refinement, topology losses) matches it.</td><td>B0, B0-alt, B0+cal, B1, B2-global, B2-static, B3(-dist/-full), B5, DEAL/Graph2Gauss, Oracle</td><td><span class='pill p-pend'>AWAITS G5</span></td></tr><tr><td><strong>E4</strong> — mechanism ablations</td><td>Attribute the gain: 17 arms incl. randomized/retrieved scaffolds, generator swap, harmonization rounds, loss-term ladder, grounding contrasts, and (rev 3.0) <strong>E4.15</strong> pathway attribution / four-logit decomposition, <strong>E4.16</strong> structure-specificity battery (edge shuffle, DeepSets reduction, cross-pair shuffle, degree-preserving rewiring, capacity-matched no-MP bottleneck), <strong>E4.17</strong> conditioning depth (none → logit-FiLM → pooled adapter → STE+x-attn) — identical-head convention throughout. Whatever owns no gain is cut.</td><td>internal arms</td><td><span class='pill p-pend'>AFTER E1/E3</span></td></tr><tr><td><strong>E5</strong> — integrity &amp; leakage gates</td><td>Claims survive node-disjointness, message/supervision partition, B0 provenance, hard negatives, memorization and context-prior controls. The strict protocol is itself a contribution.</td><td>—</td><td><span class='pill p-pend'>PARTIAL</span> <span class='hint'>(enforced in code/data contract; formal gate rows unrun)</span></td></tr><tr><td><strong>E6</strong> — generalization</td><td>Gains are not Benchmark-A-specific: repeat E1 on Benchmark-B/C and alternate splits; report any degradation rather than hide it.</td><td>same ladder</td><td><span class='pill p-pend'>PENDING</span></td></tr><tr><td><strong>E7</strong> — downstream utility <strong>(load-bearing)</strong></td><td>A topology-realistic predicted graph is <em>useful</em>: community detection, label propagation, retrieval probes on the assembled graphs. If this fails, all assembled-realism claims are downgraded everywhere.</td><td>B0, B0+cal, B3-full, B2-global, Ours</td><td><span class='pill p-pend'>PENDING</span></td></tr></tbody></table></div><p class='hint'>Priority order after gates (protocol §5.1): E1+E3 → E4 → E5 → E7 (alongside) → E6.</p>"
+    },
+    {
+      "heading": "Current focus — G5 Stage 1, blow by blow",
+      "html": "<div class='table-scroll'><table><thead><tr><th>Date</th><th>Event</th><th>Standing</th></tr></thead><tbody><tr><td class='num'>2026-07-14</td><td>Stage-1 implementation complete: model package, worker, orchestrator, scoring, gate analysis; pre-registration committed.<div class='ev'>branch <code>g5/stage1</code> · <code>src/model/egostitch/</code>, <code>src/train_egostitch.py</code>, <code>src/experiments/g5_stage1.py</code></div></td><td><span class='pill p-done'>DONE</span></td></tr><tr><td class='num'>2026-07-15</td><td>Formal Seed-0 training: 2×H20, world_size 2, 30 epochs, 807 s pipeline; best val AUROC/AUPRC <span class='num'>0.945766/0.951966</span> (epoch 14). Seed 1 stopped at the artifact performance gate (data-wait &gt; 0.05); the then-current 3-seed contract was later superseded.<div class='ev'>checkpoint <code>54f3c0ad8f5dfc18</code> · <code>docs/results/G5-stage1-seed0-20260715.md</code> · commit <code>31afbe6</code></div></td><td><span class='pill p-done'>TRAINED</span></td></tr><tr><td class='num'>2026-07-16</td><td><strong>bf16 scoring incident:</strong> candidate scoring under <code>--amp bf16</code> quantized logits to 2,669 unique values; the matched-RD gate failed closed (gap 0.0206 &gt; tol 0.005) before any held-out metric opened. Fix: fp32 pair pass + score-resolution guard (spec §13.16).<div class='ev'>commits <code>fcaf24d</code>, <code>0219e4b</code></div></td><td><span class='pill p-done'>FIXED</span></td></tr><tr><td class='num'>2026-07-16</td><td><strong>Exact-quota diagnostic:</strong> EgoStitch ≡ B0 — BFS-macro GS <span class='num'>0.312149 vs 0.312151</span>, RD <span class='num'>0.422358 vs 0.422345</span>, s0-logit correlation ≈ 1.0. Verdict <code>diagnostic_only</code>: bound to the superseded registration hash; not a screening verdict.<div class='ev'>commit <code>3556627</code> · <code>outputs/egostitch_stage1/seed0/</code></div></td><td><span class='pill p-diag'>DIAGNOSTIC ONLY</span></td></tr><tr><td class='num'>2026-07-16</td><td><strong>Root cause isolated:</strong> the <code>s1</code> membership kernel took squared distances over unnormalized 256-d projections (row norm ~3.6×10³), driving s1 to ~−1.2×10⁷ and saturating the 3-input gate to a constant residual (−0.3613 on all 2,037,171 candidate rows). The head learned only an intercept (<code>w</code> 0.1→0.1064); the training distribution (s0-saturated: epoch-1 recon-only val AUPRC already 0.9516) and unmeasured recon-dominant gradients provided no recovery pressure.<div class='ev'><code>src/model/egostitch/decision.py</code> · <code>seed0/metrics.jsonl</code></div></td><td><span class='pill p-done'>UNDERSTOOD</span></td></tr><tr><td class='num'>2026-07-16</td><td><strong>Repair revision pinned in spec:</strong> L2-normalized kernel operands (raw <code>proj(x)</code> unchanged for matching/recon); per-family gradient-norm logging + deterministic Kendall trigger (was a spec-compliance gap); per-epoch channel/rank-mobility fidelity series; probe-time s1 scale abort; scoring-time dead-residual validity gate; val-AUPRC near-tie fidelity tie-break. Stage 1 re-scoped to a single-seed screening contract under a new experiment ID.<div class='ev'><code>docs/05-egostitch-spec.md</code> change-log 2026-07-16, §13.15 · commit <code>f714987</code></div></td><td><span class='pill p-done'>PINNED</span></td></tr><tr><td class='num'>2026-07-16</td><td><strong>E2E headline redesign approved (rev 3.0):</strong> the frozen-s0 anchored head is replaced by the stitched-topology-conditioned pair encoder after two design-review rounds (logit late fusion 2–3/10 → pooled adapter 5.5–6/10 → STE + gated cross-attention 8/10, Minor Revision passed) and a local-vault + external-arXiv novelty sweep (no exact match identified in the reviewed corpus; OT-stitching of two <em>generated</em> ego-nets is the most distinctive element). Three-null taxonomy, cls-token injection pin, grounding-label move, five-arm screen scope, and a 15-task implementation plan are committed; implementation is gated on the frozen-s0 screen.<div class='ev'><code>docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md</code> · <code>docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md</code> · commits <code>2be872a</code>…<code>e6de7d8</code></div></td><td><span class='pill p-done'>APPROVED</span></td></tr><tr><td class='num'>2026-07-16</td><td><strong>Research docs landed:</strong> proposal → rev 3.0 (§4.0 contract box, §4.4 conditioned encoder + channel mapping + novelty scoping, §6.x, §8 refs); protocol → §0 disposition (s0-anchor role retired), <code>B0-e2e</code> baseline row, E4.15–17, §5.0.5 headline-revision paragraph; spec → new §14 successor summary (<strong>§§1–13 unchanged</strong> — still binding for the pending frozen-s0 screen); README updated.<div class='ev'>commit <code>c0e2144</code></div></td><td><span class='pill p-done'>DONE</span></td></tr><tr><td class='num'>next</td><td><strong>Binding frozen-s0 screening run (user-owned, HPC; contract unchanged — now the motivating arm):</strong> fp32 re-score of the B0 candidate/val artifacts and s0 cache (the B0 deliverable also sits on the bf16 grid) → new Seed-0 training bound to the replacement registration <em>before</em> training → fp32 candidate scoring with both guards → fidelity/cost report → registered Stage-1 gate. <strong>Then</strong> (spec §14.3): §5/§13 rewritten to the e2e successor, fresh five-arm registration (four-logit decomposition, degree-partialled probes, within-checkpoint <code>f_logit</code> liveness, measured H20 cost re-estimate, pathway-attribution rule), and the e2e Stage-1 screen executed via the committed 15-task plan.<div class='ev'><code>hpc/run.sh</code> · <code>hpc/README.md</code> · <code>docs/05-egostitch-spec.md §14</code></div></td><td><span class='pill p-act'>PENDING</span></td></tr></tbody></table></div><p class='hint'>Evidence boundary: never claim statistical significance or cross-seed robustness from the Stage-1 one-seed screen; E1/E3 remain ≥3-seed Holm evaluations. The Seed-0 artifact cannot be retroactively rebound to the replacement registration.</p>"
+    },
+    {
+      "heading": "Reading order & provenance",
+      "html": "<div class='table-scroll'><table><thead><tr><th>Document</th><th>Role</th></tr></thead><tbody><tr><td><code>docs/01-blueprint.md</code></td><td>Paper blueprint; §10 locked decisions are fixed constraints.</td></tr><tr><td><code>docs/02-methodology.md</code></td><td>Abstract method contract + the locked training objective.</td></tr><tr><td><code>docs/03-experiment-protocol.md</code></td><td>Source of truth for what to run and how to grade: baselines, E1–E7, gates, decision rules (§5.2).</td></tr><tr><td><code>docs/04-model-proposal.md</code></td><td>EgoStitch rationale (approved 2026-07-09; <strong>headline rev 3.0, 2026-07-16</strong>); §4.4 is the conditioned encoder; §4.6 maps failure axes to mechanisms; §8 verified references.</td></tr><tr><td><code>docs/05-egostitch-spec.md</code></td><td>Binding implementation contract (G4); §13 is the Stage-1 carve-out (still binding for the pending frozen-s0 screen); <strong>§14 records the e2e successor</strong>; freeze rule: spec first, then code.</td></tr><tr><td><code>docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md</code></td><td>Rev-3.0 redesign record: decision trail, reviewer rounds, novelty sweep, null taxonomy and injection pins.</td></tr><tr><td><code>docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md</code></td><td>15-task implementation plan for the e2e build (execution gated on the frozen-s0 screen).</td></tr><tr><td><code>docs/results/E2-pair-to-topology-gap.md</code></td><td>Completed G1/G2/G3 result note (canonical metric rerun 2026-07-14).</td></tr><tr><td><code>docs/results/G5-stage1-seed0-20260715.md</code></td><td>Seed-0 training evidence and its explicit registration boundary.</td></tr></tbody></table></div><p class='ev'>This page is generated from the repository's markdown notes and must stay consistent with them; regenerate rather than hand-edit. Snapshot date 2026-07-16 (rev-3.0 headline landing), HEAD <code>c0e2144</code>.</p>"
+    }
+  ],
+  "artifact": "freeform",
+  "generated": "2026-07-16 · updated after the rev-3.0 headline landing (c0e2144)"
+}
+</script>
+
+<div class="wrap">
+  <header class="masthead">
+    <div class="eyebrow" id="eyebrow"></div>
+    <h1 id="title"></h1>
+    <p class="dek" id="dek"></p>
+    <div class="meta" id="meta"></div>
+  </header>
+
+  <div class="decision" id="decision-box">
+    <h2>The decision on this page</h2>
+    <p id="decision"></p>
+  </div>
+
+  <div id="content"></div>
+
+  <section id="items-sec">
+    <h2 class="sec" id="items-heading">Choose</h2>
+    <div class="grid cols-2" id="items"></div>
+  </section>
+</div>
+
+<div class="rtbar" id="rtbar">
+  <span class="tally" data-rt-tally></span>
+  <span class="hint">Your choices here paste back into Claude as JSON.</span>
+  <button class="copy-btn" data-rt-copy>Copy result ↓</button>
+</div>
+
+<script>
+/* roundtrip.js — selection state + "Copy result" for html-doc documents.
+ *
+ * The whole point of this file: what you decide while reading the document has
+ * to get back into Claude's context. It does that by serializing your choices
+ * into one fixed JSON envelope you paste into the chat.
+ *
+ * Contract — the document marks things up, this script does the rest:
+ *
+ *   data-rt-item="<id>"        on a <tr> or .card — one selectable thing
+ *     button[data-state=include|reject]   tri-state toggle inside that item
+ *     [data-rt-reason]                    reason input, shown once rejected
+ *     [data-rt-note]                      free-text note on that item
+ *   data-rt-param="<key>"      any input/select — a document-level parameter
+ *
+ * Envelope (identical across every template, so paste-back never needs guessing):
+ *
+ *   { artifact, doc, generated, selection: [id],
+ *     rejected: [{id, reason}], params: {k: v}, notes: {id: text} }
+ *
+ * State survives reload via localStorage, keyed by doc id. No network, no server.
+ */
+(function (global) {
+  'use strict';
+
+  var Roundtrip = {
+    artifact: 'freeform',
+    doc: 'untitled',
+    items: {},   // id -> 'include' | 'reject' | null
+    reasons: {}, // id -> string
+    notes: {},   // id -> string
+    onchange: null
+  };
+
+  function storageKey() { return 'html-doc:' + Roundtrip.artifact + ':' + Roundtrip.doc; }
+
+  function save() {
+    try {
+      localStorage.setItem(storageKey(), JSON.stringify({
+        items: Roundtrip.items, reasons: Roundtrip.reasons, notes: Roundtrip.notes
+      }));
+    } catch (e) { /* private browsing / disabled storage — state just won't persist */ }
+  }
+
+  function restore() {
+    try {
+      var raw = localStorage.getItem(storageKey());
+      if (!raw) return;
+      var s = JSON.parse(raw);
+      Roundtrip.items = s.items || {};
+      Roundtrip.reasons = s.reasons || {};
+      Roundtrip.notes = s.notes || {};
+    } catch (e) { /* corrupt or unavailable — start clean */ }
+  }
+
+  /** Current state as the canonical envelope. */
+  Roundtrip.envelope = function () {
+    var selection = [], rejected = [], params = {}, notes = {};
+
+    Object.keys(Roundtrip.items).forEach(function (id) {
+      var st = Roundtrip.items[id];
+      if (st === 'include') selection.push(id);
+      else if (st === 'reject') {
+        rejected.push({ id: id, reason: (Roundtrip.reasons[id] || '').trim() || null });
+      }
+    });
+
+    document.querySelectorAll('[data-rt-param]').forEach(function (el) {
+      var key = el.getAttribute('data-rt-param');
+      var val;
+      if (el.type === 'checkbox') val = el.checked;
+      else if (el.type === 'number' || el.type === 'range') val = Number(el.value);
+      else val = el.value;
+      params[key] = val;
+    });
+
+    Object.keys(Roundtrip.notes).forEach(function (id) {
+      var t = (Roundtrip.notes[id] || '').trim();
+      if (t) notes[id] = t;
+    });
+
+    return {
+      artifact: Roundtrip.artifact,
+      doc: Roundtrip.doc,
+      generated: new Date().toISOString(),
+      selection: selection,
+      rejected: rejected,
+      params: params,
+      notes: notes
+    };
+  };
+
+  /** Every element carrying this item id. Matched by attribute value rather than
+   *  by building a selector, so an id containing a quote or a colon can't break it. */
+  Roundtrip.elementsFor = function (id) {
+    return Array.prototype.filter.call(
+      document.querySelectorAll('[data-rt-item]'),
+      function (el) { return el.getAttribute('data-rt-item') === id; }
+    );
+  };
+
+  /** Paint an item's row/card to match its state. */
+  function paint(id) {
+    var st = Roundtrip.items[id] || null;
+    Roundtrip.elementsFor(id).forEach(function (el) {
+      el.classList.toggle('included', st === 'include');
+      el.classList.toggle('rejected', st === 'reject');
+      el.querySelectorAll('button[data-state]').forEach(function (b) {
+        b.setAttribute('aria-pressed', String(b.getAttribute('data-state') === st));
+      });
+      var reason = el.querySelector('[data-rt-reason]');
+      if (reason) reason.value = Roundtrip.reasons[id] || '';
+      var note = el.querySelector('[data-rt-note]');
+      if (note) note.value = Roundtrip.notes[id] || '';
+    });
+  }
+
+  /* onchange fires only when the *selection* changes — never on a repaint.
+   * A repaint that fired onchange would recurse without end for any document
+   * whose onchange re-renders its list (litreview does, to re-run its filter). */
+  function tally(fireChange) {
+    var inc = 0, rej = 0, total = document.querySelectorAll('[data-rt-item]').length;
+    Object.keys(Roundtrip.items).forEach(function (id) {
+      if (Roundtrip.items[id] === 'include') inc++;
+      else if (Roundtrip.items[id] === 'reject') rej++;
+    });
+    var el = document.querySelector('[data-rt-tally]');
+    if (el) {
+      el.innerHTML = '<b>' + inc + ' included</b> · <i>' + rej + ' rejected</i> · ' +
+        (total - inc - rej) + ' undecided';
+    }
+    if (fireChange && typeof Roundtrip.onchange === 'function') Roundtrip.onchange(inc, rej, total);
+  }
+
+  /** Set an item's state; passing the state it already has clears it. */
+  Roundtrip.set = function (id, state) {
+    Roundtrip.items[id] = (Roundtrip.items[id] === state) ? null : state;
+    if (Roundtrip.items[id] !== 'reject') delete Roundtrip.reasons[id];
+    save(); paint(id); tally(true);
+  };
+
+  /** Copy the envelope to the clipboard. Falls back to execCommand, which is what
+   *  actually fires when the async clipboard API is blocked on file:// origins. */
+  Roundtrip.copy = function (btn) {
+    var text = JSON.stringify(Roundtrip.envelope(), null, 2);
+
+    var ok = function () {
+      if (!btn) return;
+      var old = btn.textContent;
+      btn.textContent = '✓ Copied — paste into Claude';
+      btn.classList.add('done');
+      setTimeout(function () { btn.textContent = old; btn.classList.remove('done'); }, 2200);
+    };
+    var fallback = function () {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+      document.body.appendChild(ta);
+      ta.select();
+      var done = false;
+      try { done = document.execCommand('copy'); } catch (e) { done = false; }
+      document.body.removeChild(ta);
+      if (done) ok();
+      else global.prompt('Copy this JSON and paste it into Claude:', text);
+    };
+
+    if (global.navigator && navigator.clipboard && global.isSecureContext) {
+      navigator.clipboard.writeText(text).then(ok, fallback);
+    } else {
+      fallback();
+    }
+  };
+
+  /** Wire up the document. Call once, after the items exist in the DOM. */
+  Roundtrip.init = function (opts) {
+    Roundtrip.artifact = opts.artifact || Roundtrip.artifact;
+    Roundtrip.doc = opts.doc || Roundtrip.doc;
+    restore();
+
+    document.addEventListener('click', function (e) {
+      var btn = e.target.closest('button[data-state]');
+      if (!btn) return;
+      var item = btn.closest('[data-rt-item]');
+      if (!item) return;
+      Roundtrip.set(item.getAttribute('data-rt-item'), btn.getAttribute('data-state'));
+    });
+
+    document.addEventListener('input', function (e) {
+      var item = e.target.closest('[data-rt-item]');
+      if (item && e.target.hasAttribute('data-rt-reason')) {
+        Roundtrip.reasons[item.getAttribute('data-rt-item')] = e.target.value;
+        save();
+      } else if (item && e.target.hasAttribute('data-rt-note')) {
+        Roundtrip.notes[item.getAttribute('data-rt-item')] = e.target.value;
+        save();
+      } else if (e.target.hasAttribute('data-rt-param')) {
+        var out = document.querySelector('[data-rt-param-out="' + e.target.getAttribute('data-rt-param') + '"]');
+        if (out) out.textContent = e.target.value;
+        save();
+      }
+    });
+
+    var copyBtn = document.querySelector('[data-rt-copy]');
+    if (copyBtn) copyBtn.addEventListener('click', function () { Roundtrip.copy(copyBtn); });
+
+    Roundtrip.repaint();
+  };
+
+  /** Re-apply state to the DOM. Call after re-rendering a list (sort, filter). */
+  Roundtrip.repaint = function () {
+    document.querySelectorAll('[data-rt-item]').forEach(function (el) {
+      paint(el.getAttribute('data-rt-item'));
+    });
+    document.querySelectorAll('[data-rt-param]').forEach(function (el) {
+      var out = document.querySelector('[data-rt-param-out="' + el.getAttribute('data-rt-param') + '"]');
+      if (out) out.textContent = el.value;
+    });
+    tally(false);
+  };
+
+  global.Roundtrip = Roundtrip;
+})(window);
+
+</script>
+
+<script>
+(function () {
+  'use strict';
+  var DATA = JSON.parse(document.getElementById('doc-data').textContent);
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function text(id, v) { var el = document.getElementById(id); if (el) el.textContent = v || ''; }
+
+  text('eyebrow', DATA.eyebrow || '');
+  text('title', DATA.title);
+  text('dek', DATA.dek);
+  text('meta', 'generated ' + (DATA.generated || ''));
+  document.title = DATA.title || 'Document';
+
+  if (DATA.decision) text('decision', DATA.decision);
+  else document.getElementById('decision-box').hidden = true;
+
+  /* Sections carry authored HTML. Claude writes this file, so the markup is
+     trusted the same way the rest of the template is — that is precisely what
+     buys the SVG, the tables and the layout that Markdown cannot express. */
+  document.getElementById('content').innerHTML = (DATA.sections || []).map(function (s) {
+    return '<section>' +
+      (s.heading ? '<h2 class="sec">' + esc(s.heading) + '</h2>' : '') +
+      '<div class="body-copy">' + (s.html || '') + '</div>' +
+    '</section>';
+  }).join('');
+
+  var items = DATA.items || [];
+  if (!items.length) {
+    document.getElementById('items-sec').hidden = true;
+    document.getElementById('rtbar').hidden = true;   // read-only doc: no bar to nag with
+  } else {
+    text('items-heading', DATA.items_heading || 'Choose');
+    document.getElementById('items').innerHTML = items.map(function (it) {
+      return '' +
+      '<div class="card" data-rt-item="' + esc(it.id) + '">' +
+        '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start">' +
+          '<div><code>' + esc(it.id) + '</code><h3 style="margin:6px 0 4px">' + esc(it.name) + '</h3></div>' +
+          '<span class="tri">' +
+            '<button data-state="include" aria-pressed="false" title="Yes">✓</button>' +
+            '<button data-state="reject" aria-pressed="false" title="No">✗</button>' +
+          '</span>' +
+        '</div>' +
+        (it.desc ? '<p style="color:var(--ink-2);font-size:14px;margin:0 0 8px">' + esc(it.desc) + '</p>' : '') +
+        (it.tags || []).map(function (t) { return '<span class="chip">' + esc(t) + '</span> '; }).join('') +
+        '<div class="reason"><input data-rt-reason type="text" placeholder="Why not?"></div>' +
+        '<div class="notewrap"><input data-rt-note type="text" placeholder="Note…"></div>' +
+      '</div>';
+    }).join('');
+  }
+
+  Roundtrip.init({ artifact: 'freeform', doc: DATA.doc || 'doc' });
+})();
+</script>
+</body>
+</html>
