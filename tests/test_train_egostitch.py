@@ -63,6 +63,14 @@ def _config_mapping(tmp_path: Path, **overrides: object) -> dict[str, Any]:
             "grad_clip": 1.0,
             "warmstart_fraction": 0.25,
         },
+        "diagnostics": {
+            "gradient_probe_interval": 1,
+            "gradient_imbalance_ratio": 10.0,
+            "gradient_imbalance_steps": 2,
+            "probe_s1_abs_mean_max": 1000.0,
+            "selection_auprc_tolerance": 1e-4,
+            "topk_fraction": 0.25,
+        },
         "eval": {"patience": 2, "eval_every": 1},
         "seed": 0,
         "output_dir": str(tmp_path / "out"),
@@ -112,6 +120,8 @@ class TestLoadConfig:
         assert cfg.model.family == "egostitch"
         assert cfg.data.train_positives == "e_sup"
         assert cfg.optim.warmstart_fraction == 0.25
+        assert cfg.diagnostics.gradient_probe_interval == 1
+        assert cfg.diagnostics.gradient_imbalance_steps == 2
         assert cfg.preregistration == tmp_path / "prereg.json"
         assert cfg.runtime is None
 
@@ -422,6 +432,19 @@ class TestEpochStepPlan:
         assert te._step_global_count(rows, 2, 6) == 0
 
 
+class TestRegisteredDiagnostics:
+    def test_gradient_imbalance_activates_only_after_persistence(self) -> None:
+        monitor = te._GradientImbalanceMonitor(ratio=10.0, required_steps=100, interval=50)
+        norms = {"edge": 100.0, "recon": 1.0, "real": 1.0, "ssl": 1.0}
+        assert monitor.update(50, norms) is False
+        assert monitor.update(100, norms) is True
+        assert monitor.activated_step == 100
+
+    def test_probe_scale_guard_fails_on_synthetic_broken_kernel(self) -> None:
+        with pytest.raises(RuntimeError, match="pathological Stage-1 membership scale"):
+            te._enforce_probe_s1_scale(1.2e7, 1.0e3)
+
+
 # --------------------------------------------------------------------------- loop smoke
 
 
@@ -440,8 +463,11 @@ class TestTrainLoop:
 
     def test_history_and_profile_contract(self, tmp_path: Path) -> None:
         cfg, _, result = self._run(tmp_path)
-        assert [int(row["epoch"]) for row in result.history] == [1, 2]
+        assert [int(cast(float, row["epoch"])) for row in result.history] == [1, 2]
         assert all("auprc" in row and "loss_total" in row for row in result.history)
+        assert all("fidelity" in row for row in result.history)
+        assert any(row["gradient_norm_probes"] for row in result.history)
+        assert "kendall_fallback" in result.runtime_profile
         # The orchestrator-validated schema accepts this profile verbatim.
         profile = _validate_worker_profile(
             result.runtime_profile, epochs=cfg.optim.epochs, world_size=1, memory_limit_gib=85.0
@@ -471,6 +497,7 @@ class TestTrainLoop:
             json.loads(line) for line in (cfg.output_dir / "metrics.jsonl").read_text().splitlines()
         ]
         assert [row["epoch"] for row in rows] == [1, 2]
+        assert all("fidelity" in row and "gradient_norm_probes" in row for row in rows)
         metadata = json.loads((cfg.output_dir / "run_metadata.json").read_text())
         assert metadata["status"] == "complete"
         assert metadata["started_at"] == started["started_at"]

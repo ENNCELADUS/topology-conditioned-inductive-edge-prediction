@@ -35,6 +35,7 @@ import logging
 import math
 import time
 from collections.abc import Iterator, Sequence
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,6 +47,7 @@ import yaml  # type: ignore[import-untyped]
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 from numpy.typing import NDArray
+from scipy.stats import kendalltau
 
 from src.data.artifacts import Benchmark, canonical_pair, load_benchmark
 from src.data.ego_targets import EgoTargetBuilder, EgoTargets
@@ -57,7 +59,7 @@ from src.e2_pipeline import ProbeResult, detect_visible_gpu_count
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
 from src.model.egostitch.imagine import NULL_MODE_ALL, NULL_MODE_CONTENT, NULL_MODE_FULL
-from src.model.egostitch.losses import stage1_total
+from src.model.egostitch.losses import stage1_family_tensors, stage1_total
 from src.score_universe import ScoresArtifact, load_scores
 from src.train_b0 import (
     DDP_MODES,
@@ -169,6 +171,18 @@ class EgoOptimConfig:
 
 
 @dataclass(frozen=True)
+class EgoDiagnosticsConfig:
+    """Registered training-fidelity and loss-balance diagnostics."""
+
+    gradient_probe_interval: int
+    gradient_imbalance_ratio: float
+    gradient_imbalance_steps: int
+    probe_s1_abs_mean_max: float
+    selection_auprc_tolerance: float
+    topk_fraction: float
+
+
+@dataclass(frozen=True)
 class EgoConfig:
     """The full validated EgoStitch worker configuration.
 
@@ -189,6 +203,7 @@ class EgoConfig:
     model: ModelConfig
     data: EgoDataConfig
     optim: EgoOptimConfig
+    diagnostics: EgoDiagnosticsConfig
     eval: EvalConfig
     seed: int
     output_dir: Path
@@ -230,6 +245,7 @@ def load_config(path: Path) -> EgoConfig:
             "model",
             "data",
             "optim",
+            "diagnostics",
             "eval",
             "seed",
             "output_dir",
@@ -325,6 +341,53 @@ def load_config(path: Path) -> EgoConfig:
     )
     if optim.epochs <= 0:
         raise ValueError("optim.epochs must be positive")
+
+    diagnostics_raw = _as_mapping(_require(raw, "diagnostics", ""), "diagnostics")
+    diagnostic_keys = (
+        "gradient_probe_interval",
+        "gradient_imbalance_ratio",
+        "gradient_imbalance_steps",
+        "probe_s1_abs_mean_max",
+        "selection_auprc_tolerance",
+        "topk_fraction",
+    )
+    _check_no_unknown_keys(diagnostics_raw, diagnostic_keys, "diagnostics")
+    diagnostics = EgoDiagnosticsConfig(
+        gradient_probe_interval=_as_int(
+            _require(diagnostics_raw, "gradient_probe_interval", "diagnostics."),
+            "diagnostics.gradient_probe_interval",
+        ),
+        gradient_imbalance_ratio=_as_float(
+            _require(diagnostics_raw, "gradient_imbalance_ratio", "diagnostics."),
+            "diagnostics.gradient_imbalance_ratio",
+        ),
+        gradient_imbalance_steps=_as_int(
+            _require(diagnostics_raw, "gradient_imbalance_steps", "diagnostics."),
+            "diagnostics.gradient_imbalance_steps",
+        ),
+        probe_s1_abs_mean_max=_as_float(
+            _require(diagnostics_raw, "probe_s1_abs_mean_max", "diagnostics."),
+            "diagnostics.probe_s1_abs_mean_max",
+        ),
+        selection_auprc_tolerance=_as_float(
+            _require(diagnostics_raw, "selection_auprc_tolerance", "diagnostics."),
+            "diagnostics.selection_auprc_tolerance",
+        ),
+        topk_fraction=_as_float(
+            _require(diagnostics_raw, "topk_fraction", "diagnostics."),
+            "diagnostics.topk_fraction",
+        ),
+    )
+    if diagnostics.gradient_probe_interval <= 0 or diagnostics.gradient_imbalance_steps <= 0:
+        raise ValueError("diagnostic gradient intervals must be positive")
+    if diagnostics.gradient_imbalance_ratio <= 1.0:
+        raise ValueError("diagnostics.gradient_imbalance_ratio must exceed 1")
+    if diagnostics.probe_s1_abs_mean_max <= 0:
+        raise ValueError("diagnostics.probe_s1_abs_mean_max must be positive")
+    if diagnostics.selection_auprc_tolerance < 0:
+        raise ValueError("diagnostics.selection_auprc_tolerance must be non-negative")
+    if not 0.0 < diagnostics.topk_fraction <= 1.0:
+        raise ValueError("diagnostics.topk_fraction must be in (0, 1]")
 
     eval_raw = _as_mapping(_require(raw, "eval", ""), "eval")
     _check_no_unknown_keys(eval_raw, ("patience", "eval_every"), "eval")
@@ -444,6 +507,7 @@ def load_config(path: Path) -> EgoConfig:
         model=model,
         data=data,
         optim=optim,
+        diagnostics=diagnostics,
         eval=eval_cfg,
         seed=_as_int(_require(raw, "seed", ""), "seed"),
         output_dir=Path(_as_str(_require(raw, "output_dir", ""), "output_dir")),
@@ -1145,14 +1209,27 @@ class _CompositeStep(torch.nn.Module):
     carries gradient during warm-start.
     """
 
+    kendall_active: torch.Tensor
+
     def __init__(self, model: EgoStitchStage1, world_size: int) -> None:
         super().__init__()
         self.model = model
         self.world_size = world_size
+        self.kendall_log_vars = torch.nn.ParameterDict(
+            {name: torch.nn.Parameter(torch.zeros(())) for name in ("edge", "recon", "real", "ssl")}
+        )
+        self.register_buffer("kendall_active", torch.tensor(False), persistent=True)
 
-    def _edge_logits(self, edge: dict[str, torch.Tensor]) -> torch.Tensor:
+    def activate_kendall(self) -> None:
+        """Enable the pre-instantiated registered uncertainty weights."""
+        self.kendall_active[...] = True
+
+    def _edge_outputs(self, edge: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         is_self = edge["is_self"]
-        logits = edge["s0"].new_zeros(edge["s0"].shape)
+        outputs = {
+            name: edge["s0"].new_zeros(edge["s0"].shape)
+            for name in ("logits", "residual", "s1", "s2", "s2_aa")
+        }
         non_self = ~is_self
         if bool(non_self.any()):
             idx = torch.nonzero(non_self, as_tuple=False).squeeze(-1)
@@ -1163,7 +1240,9 @@ class _CompositeStep(torch.nn.Module):
                 "ground_j": edge["ground_j"][idx],
                 "s0": edge["s0"][idx],
             }
-            logits = logits.index_put((idx,), self.model(batch)["logits"])
+            sub_out = self.model(batch)
+            for name in outputs:
+                outputs[name] = outputs[name].index_put((idx,), sub_out[name])
         if bool(is_self.any()):
             idx = torch.nonzero(is_self, as_tuple=False).squeeze(-1)
             batch = {
@@ -1171,8 +1250,10 @@ class _CompositeStep(torch.nn.Module):
                 "ground_i": edge["ground_i"][idx],
                 "s0": edge["s0"][idx],
             }
-            logits = logits.index_put((idx,), self.model(batch)["logits"])
-        return logits
+            sub_out = self.model(batch)
+            for name in outputs:
+                outputs[name] = outputs[name].index_put((idx,), sub_out[name])
+        return outputs
 
     def forward(self, batch: dict[str, object]) -> dict[str, object]:
         node = cast(dict[str, torch.Tensor], batch["node"])
@@ -1199,7 +1280,8 @@ class _CompositeStep(torch.nn.Module):
             node["x"], node["ground_x"], node["ground_resampled"], noise=node["ssl_noise"]
         )
 
-        logits = self._edge_logits(edge)
+        edge_outputs = self._edge_outputs(edge)
+        logits = edge_outputs["logits"]
         per_row = torch.nn.functional.binary_cross_entropy_with_logits(
             logits, edge["label"], reduction="none"
         )
@@ -1218,7 +1300,37 @@ class _CompositeStep(torch.nn.Module):
             ssl_noise=ssl["noise"] * joint_weight,
             ssl_pool=ssl["pool"] * joint_weight,
         )
-        return {"loss": total, "parts": parts}
+        families = stage1_family_tensors(
+            self.model.config,
+            edge=edge_loss * joint_weight,
+            recon=losses.recon,
+            deg=losses.deg,
+            real_egostat=losses.real_egostat * joint_weight,
+            real_gin=losses.real_gin * joint_weight,
+            ssl_noise=ssl["noise"] * joint_weight,
+            ssl_pool=ssl["pool"] * joint_weight,
+        )
+        if bool(self.kendall_active):
+            total = torch.stack(
+                tuple(
+                    torch.exp(-self.kendall_log_vars[name]) * family + self.kendall_log_vars[name]
+                    for name, family in families.items()
+                )
+            ).sum()
+        else:
+            total = total + 0.0 * torch.stack(tuple(self.kendall_log_vars.values())).sum()
+        result: dict[str, object] = {
+            "loss": total,
+            "parts": parts,
+        }
+        if bool(batch.get("collect_diagnostics", False)):
+            result["families"] = families
+            result["channel_stats"] = {
+                f"{name}_{stat}": float(getattr(edge_outputs[name].detach().float(), stat)())
+                for name in ("s1", "s2", "s2_aa", "residual")
+                for stat in ("mean", "std")
+            }
+        return result
 
 
 def _to_device(value: object, device: torch.device) -> object:
@@ -1230,7 +1342,107 @@ def _to_device(value: object, device: torch.device) -> object:
     return value
 
 
+def _detached_clone(value: object) -> object:
+    """Clone a nested payload so the gradient probe is fixed across steps."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().clone()
+    if isinstance(value, dict):
+        return {key: _detached_clone(item) for key, item in value.items()}
+    return value
+
+
+def _family_gradient_norms(
+    model: EgoStitchStage1, families: dict[str, torch.Tensor]
+) -> dict[str, float]:
+    """Measure family-specific global L2 norms with isolated retained-graph backwards."""
+    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    norms: dict[str, float] = {}
+    for index, (name, family) in enumerate(families.items()):
+        model.zero_grad(set_to_none=True)
+        family.backward(  # type: ignore[no-untyped-call]
+            retain_graph=index < len(families) - 1
+        )
+        squared = family.new_zeros((), dtype=torch.float32)
+        for parameter in parameters:
+            if parameter.grad is not None:
+                squared = squared + parameter.grad.detach().float().square().sum()
+        norms[name] = float(torch.sqrt(squared))
+    model.zero_grad(set_to_none=True)
+    return norms
+
+
+@dataclass
+class _GradientImbalanceMonitor:
+    """Track persistence of a registered high-family gradient imbalance."""
+
+    ratio: float
+    required_steps: int
+    interval: int
+    streak_steps: int = 0
+    activated_step: int | None = None
+
+    def update(self, step: int, norms: dict[str, float]) -> bool:
+        values = np.asarray(list(norms.values()), dtype=np.float64)
+        median = float(np.median(values))
+        imbalanced = bool(values.max(initial=0.0) > self.ratio * max(median, 1e-30))
+        self.streak_steps = self.streak_steps + self.interval if imbalanced else 0
+        if self.activated_step is None and self.streak_steps >= self.required_steps:
+            self.activated_step = step
+            return True
+        return False
+
+
+def _enforce_probe_s1_scale(s1_abs_mean: float, limit: float) -> None:
+    """Reject a membership channel that has returned to the saturated scale."""
+    if s1_abs_mean > limit:
+        raise RuntimeError(
+            "pathological Stage-1 membership scale: "
+            f"|mean(s1)|={s1_abs_mean:.6g} exceeds registered limit {limit:.6g}"
+        )
+
+
 # --------------------------------------------------------------------------- validation
+
+
+@dataclass(frozen=True)
+class _ValidationResult:
+    metrics: EdgeMetrics
+    fidelity: dict[str, float]
+
+
+def _fidelity_summary(
+    s0: np.ndarray,
+    logits: np.ndarray,
+    channels: dict[str, np.ndarray],
+    *,
+    topk_fraction: float,
+) -> dict[str, float]:
+    """Compute the registered pair-ranking fidelity series for one epoch."""
+    residual = logits - s0
+    s0_std = float(np.std(s0))
+    residual_std = float(np.std(residual))
+    tau_result = kendalltau(s0, logits)
+    tau = float(tau_result.statistic)
+    if not np.isfinite(tau):
+        tau = 1.0 if np.array_equal(s0, logits) else 0.0
+    topk = max(1, min(len(s0), int(round(len(s0) * topk_fraction))))
+    row_ids = np.arange(len(s0), dtype=np.int64)
+    s0_top = set(np.lexsort((row_ids, -s0))[:topk].tolist())
+    logit_top = set(np.lexsort((row_ids, -logits))[:topk].tolist())
+    return {
+        "s0_std": s0_std,
+        "s1_mean": float(np.mean(channels["s1"])),
+        "s1_std": float(np.std(channels["s1"])),
+        "s2_mean": float(np.mean(channels["s2"])),
+        "s2_std": float(np.std(channels["s2"])),
+        "s2_aa_mean": float(np.mean(channels["s2_aa"])),
+        "s2_aa_std": float(np.std(channels["s2_aa"])),
+        "residual_std": residual_std,
+        "residual_s0_std_ratio": residual_std / max(s0_std, 1e-30),
+        "kendall_tau_vs_s0": tau,
+        "rank_mobility": 1.0 - tau,
+        "topk_overlap": len(s0_top & logit_top) / topk,
+    }
 
 
 def _validate_epoch(
@@ -1239,7 +1451,8 @@ def _validate_epoch(
     accelerator: Accelerator,
     *,
     edge_batch: int,
-) -> EdgeMetrics | None:
+    topk_fraction: float,
+) -> _ValidationResult | None:
     """Score the validation pairs with exact distributed coverage.
 
     Rows are rank-strided and padded to a common shard length; the main rank
@@ -1254,7 +1467,7 @@ def _validate_epoch(
     while len(shard_rows) < shard_len:
         shard_rows.append(shard_rows[0] if shard_rows else 0)
 
-    logits_out: list[torch.Tensor] = []
+    values_out: list[torch.Tensor] = []
     with torch.no_grad():
         for start in range(0, shard_len, edge_batch):
             chunk = shard_rows[start : start + edge_batch]
@@ -1274,38 +1487,66 @@ def _validate_epoch(
                 "is_self": is_self,
             }
             batch = cast(dict[str, torch.Tensor], _to_device(batch, accelerator.device))
-            logits = batch["s0"].new_zeros(batch["s0"].shape)
+            outputs = {
+                name: batch["s0"].new_zeros(batch["s0"].shape)
+                for name in ("logits", "s1", "s2", "s2_aa")
+            }
             non_self = ~batch["is_self"]
             if bool(non_self.any()):
                 sel = torch.nonzero(non_self, as_tuple=False).squeeze(-1)
                 keys = ("x_i", "x_j", "ground_i", "ground_j", "s0")
                 sub = {k: batch[k][sel] for k in keys}
-                logits = logits.index_put((sel,), model(sub)["logits"])
+                sub_out = model(sub)
+                for name in outputs:
+                    outputs[name] = outputs[name].index_put((sel,), sub_out[name])
             if bool(batch["is_self"].any()):
                 sel = torch.nonzero(batch["is_self"], as_tuple=False).squeeze(-1)
                 sub = {k: batch[k][sel] for k in ("x_i", "ground_i", "s0")}
-                logits = logits.index_put((sel,), model(sub)["logits"])
-            logits_out.append(logits.float())
+                sub_out = model(sub)
+                for name in outputs:
+                    outputs[name] = outputs[name].index_put((sel,), sub_out[name])
+            values_out.append(
+                torch.stack(
+                    [
+                        outputs["logits"].float(),
+                        batch["s0"].float(),
+                        outputs["s1"].float(),
+                        outputs["s2"].float(),
+                        outputs["s2_aa"].float(),
+                    ],
+                    dim=-1,
+                )
+            )
 
-    local_logits = (
-        torch.cat(logits_out) if logits_out else torch.zeros(0, device=accelerator.device)
+    local_values = (
+        torch.cat(values_out) if values_out else torch.zeros((0, 5), device=accelerator.device)
     )
     local_rows = torch.tensor(shard_rows, dtype=torch.long, device=accelerator.device)
-    gathered_logits = accelerator.gather(local_logits)
+    gathered_values = accelerator.gather(local_values)
     gathered_rows = accelerator.gather(local_rows)
     model.train()
     if not accelerator.is_main_process:
         return None
     rows_np = gathered_rows.cpu().numpy()
-    logits_np = gathered_logits.cpu().numpy()
-    seen: dict[int, float] = {}
-    for row, logit in zip(rows_np.tolist(), logits_np.tolist(), strict=True):
-        seen.setdefault(int(row), float(logit))
+    values_np = gathered_values.cpu().numpy()
+    seen: dict[int, list[float]] = {}
+    for row, values in zip(rows_np.tolist(), values_np.tolist(), strict=True):
+        seen.setdefault(int(row), [float(value) for value in values])
     if len(seen) != n_val:
         raise RuntimeError(f"validation coverage broken: {len(seen)} of {n_val} rows scored")
-    ordered = np.array([seen[i] for i in range(n_val)], dtype=np.float64)
-    probs = 1.0 / (1.0 + np.exp(-ordered))
-    return compute_edge_metrics(data.val_labels.astype(np.int64), probs)
+    ordered = np.asarray([seen[i] for i in range(n_val)], dtype=np.float64)
+    logits_np = ordered[:, 0]
+    probs = 1.0 / (1.0 + np.exp(-logits_np))
+    fidelity = _fidelity_summary(
+        ordered[:, 1],
+        logits_np,
+        {"s1": ordered[:, 2], "s2": ordered[:, 3], "s2_aa": ordered[:, 4]},
+        topk_fraction=topk_fraction,
+    )
+    return _ValidationResult(
+        metrics=compute_edge_metrics(data.val_labels.astype(np.int64), probs),
+        fidelity=fidelity,
+    )
 
 
 # --------------------------------------------------------------------------- training loop
@@ -1321,9 +1562,10 @@ class EgoTrainResult:
     last_state_dict: dict[str, torch.Tensor]
     last_epoch: int
     last_val_metrics: EdgeMetrics
-    history: list[dict[str, float]]
+    history: list[dict[str, object]]
     counterfactual_stop_epoch: int | None
     runtime_profile: dict[str, object]
+    kendall_state: dict[str, object]
 
 
 def _cpu_state_dict(accelerator: Accelerator, wrapped: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -1387,15 +1629,23 @@ def train_egostitch_ddp_loop(
     if use_cuda:
         torch.cuda.reset_peak_memory_stats(accelerator.device)
 
-    history: list[dict[str, float]] = []
+    history: list[dict[str, object]] = []
     per_epoch_profiles: list[dict[str, object]] = []
     best_metrics: EdgeMetrics | None = None
     best_state: dict[str, torch.Tensor] = {}
     best_epoch = 0
+    best_fidelity_ratio = -math.inf
     evals_since_improvement = 0
     counterfactual_stop_epoch: int | None = None
     last_metrics: EdgeMetrics | None = None
     global_step = 0
+    fixed_gradient_probe: dict[str, object] | None = None
+    imbalance_monitor = _GradientImbalanceMonitor(
+        ratio=cfg.diagnostics.gradient_imbalance_ratio,
+        required_steps=cfg.diagnostics.gradient_imbalance_steps,
+        interval=cfg.diagnostics.gradient_probe_interval,
+    )
+    gradient_norm_series: list[dict[str, object]] = []
     total_local_pairs = 0
     total_local_tokens = 0
     total_wall = 0.0
@@ -1410,6 +1660,7 @@ def train_egostitch_ddp_loop(
         epoch_steps = 0
         batches = factory.epoch_batches(epoch, rows_per_rank=rows_per_rank, steps=steps_per_epoch)
         parts: dict[str, float] = {}
+        epoch_gradient_probes: list[dict[str, object]] = []
         for batch in batches:
             fetch_started = time.monotonic()
             joint_weight = 0.0 if global_step < warmstart_steps else 1.0
@@ -1419,6 +1670,9 @@ def train_egostitch_ddp_loop(
                 "joint_weight": torch.tensor(joint_weight, device=accelerator.device),
                 "edge_rows_global": batch.edge_rows_global,
             }
+            if joint_weight > 0.0 and fixed_gradient_probe is None:
+                fixed_gradient_probe = cast(dict[str, object], _detached_clone(payload))
+                fixed_gradient_probe["collect_diagnostics"] = True
             epoch_data_wait += time.monotonic() - fetch_started
 
             out = wrapped(payload)
@@ -1434,24 +1688,78 @@ def train_egostitch_ddp_loop(
 
             parts = cast(dict[str, float], out["parts"])
             global_step += 1
+            if (
+                fixed_gradient_probe is not None
+                and global_step % cfg.diagnostics.gradient_probe_interval == 0
+            ):
+                sync_context = wrapped.no_sync() if hasattr(wrapped, "no_sync") else nullcontext()
+                with sync_context:
+                    probe_out = wrapped(fixed_gradient_probe)
+                    local_norms = _family_gradient_norms(
+                        accelerator.unwrap_model(wrapped).model,
+                        cast(dict[str, torch.Tensor], probe_out["families"]),
+                    )
+                names = ("edge", "recon", "real", "ssl")
+                local_vector = torch.tensor(
+                    [local_norms[name] for name in names],
+                    device=accelerator.device,
+                    dtype=torch.float64,
+                )
+                gathered_norms = accelerator.gather(local_vector).reshape(-1, len(names))
+                aggregate = torch.sqrt(torch.mean(gathered_norms.square(), dim=0)).cpu().numpy()
+                norms = {
+                    name: float(value)
+                    for name, value in zip(names, aggregate.tolist(), strict=True)
+                }
+                activated_now = imbalance_monitor.update(global_step, norms)
+                if activated_now:
+                    accelerator.unwrap_model(wrapped).activate_kendall()
+                probe_record: dict[str, object] = {
+                    "step": global_step,
+                    **{f"grad_norm_{name}": value for name, value in norms.items()},
+                    "imbalance_streak_steps": imbalance_monitor.streak_steps,
+                    "kendall_activated_now": activated_now,
+                    "kendall_active": imbalance_monitor.activated_step is not None,
+                }
+                epoch_gradient_probes.append(probe_record)
+                gradient_norm_series.append(probe_record)
             epoch_steps += 1
             epoch_local_pairs += batch.edge_rows_true
             epoch_local_tokens += batch.f0_rows_gathered
             epoch_global_pairs += batch.edge_rows_global
 
         val_started = time.monotonic()
-        metrics = _validate_epoch(model, data, accelerator, edge_batch=cfg.data.edge_batch)
+        validation = _validate_epoch(
+            model,
+            data,
+            accelerator,
+            edge_batch=cfg.data.edge_batch,
+            topk_fraction=cfg.diagnostics.topk_fraction,
+        )
         validation_seconds = time.monotonic() - val_started
         epoch_wall = time.monotonic() - epoch_started
 
         if accelerator.is_main_process:
-            assert metrics is not None
+            assert validation is not None
+            metrics = validation.metrics
+            fidelity = validation.fidelity
             last_metrics = metrics
-            improved = best_metrics is None or metrics.auprc > best_metrics.auprc
+            fidelity_ratio = fidelity["residual_s0_std_ratio"]
+            improved = best_metrics is None or metrics.auprc > (
+                best_metrics.auprc + cfg.diagnostics.selection_auprc_tolerance
+            )
+            if (
+                best_metrics is not None
+                and abs(metrics.auprc - best_metrics.auprc)
+                <= cfg.diagnostics.selection_auprc_tolerance
+                and fidelity_ratio > best_fidelity_ratio
+            ):
+                improved = True
             if improved:
                 best_metrics = metrics
                 best_epoch = epoch
                 best_state = _cpu_state_dict(accelerator, wrapped)
+                best_fidelity_ratio = fidelity_ratio
                 evals_since_improvement = 0
             else:
                 evals_since_improvement += 1
@@ -1466,6 +1774,9 @@ def train_egostitch_ddp_loop(
                     "auroc": metrics.auroc,
                     "auprc": metrics.auprc,
                     "lr": float(optimizer.param_groups[0]["lr"]),
+                    "fidelity": fidelity,
+                    "gradient_norm_probes": epoch_gradient_probes,
+                    "kendall_active": imbalance_monitor.activated_step is not None,
                     **{f"loss_{name}": value for name, value in parts.items()},
                 }
             )
@@ -1541,6 +1852,12 @@ def train_egostitch_ddp_loop(
         "global_tokens_per_second": global_tokens / slowest_wall if slowest_wall > 0 else 0.0,
         "validation_seconds": total_validation_seconds,
         "per_epoch": per_epoch_profiles,
+        "gradient_norm_series": gradient_norm_series,
+        "kendall_fallback": {
+            "active": imbalance_monitor.activated_step is not None,
+            "activated_step": imbalance_monitor.activated_step,
+            "imbalance_streak_steps": imbalance_monitor.streak_steps,
+        },
     }
 
     if accelerator.is_main_process:
@@ -1579,6 +1896,14 @@ def train_egostitch_ddp_loop(
         history=history,
         counterfactual_stop_epoch=counterfactual_stop_epoch,
         runtime_profile=runtime_profile,
+        kendall_state={
+            "active": imbalance_monitor.activated_step is not None,
+            "activated_step": imbalance_monitor.activated_step,
+            "log_variances": {
+                name: float(value.detach().cpu())
+                for name, value in accelerator.unwrap_model(wrapped).kendall_log_vars.items()
+            },
+        },
     )
 
 
@@ -1657,12 +1982,18 @@ def write_outputs(result: EgoTrainResult, cfg: EgoConfig, data: EgoStitchData) -
     )
     with (output_dir / "metrics.jsonl").open("w", encoding="utf-8") as handle:
         for entry in result.history:
-            handle.write(json.dumps({**entry, "epoch": int(entry["epoch"])}) + "\n")
+            handle.write(json.dumps({**entry, "epoch": int(cast(float, entry["epoch"]))}) + "\n")
 
     run_metadata.update(
         {
             "status": "complete",
             "checkpoint_id": _state_digest(result.best_state_dict)[:16],
+            "kendall_fallback": result.kendall_state,
+            "training_diagnostics": {
+                "fidelity_series": [entry["fidelity"] for entry in result.history],
+                "gradient_norm_series": result.runtime_profile["gradient_norm_series"],
+                "kendall_fallback": result.runtime_profile["kendall_fallback"],
+            },
             "torch_version": str(torch.__version__),
             "timestamp": datetime.now(UTC).isoformat(),
         }
@@ -1741,13 +2072,19 @@ def _run_probe_mode(
             "edge": _to_device(batch.edge, accelerator.device),
             "joint_weight": torch.tensor(1.0, device=accelerator.device),
             "edge_rows_global": batch.edge_rows_global,
+            "collect_diagnostics": step == 0,
         }
         loss: torch.Tensor | None = None
         local_failure: tuple[str, str] | None = None
+        s1_abs_mean: float | None = None
         try:
-            loss = cast(torch.Tensor, wrapped(payload)["loss"])
+            probe_out = wrapped(payload)
+            loss = cast(torch.Tensor, probe_out["loss"])
             if not bool(torch.isfinite(loss).all()):
                 local_failure = ("nonfinite", "non-finite probe loss")
+            if step == 0:
+                channel_stats = cast(dict[str, float], probe_out["channel_stats"])
+                s1_abs_mean = abs(channel_stats["s1_mean"])
         except RuntimeError as error:
             if not _is_oom_error(error):
                 raise
@@ -1766,6 +2103,16 @@ def _run_probe_mode(
             kind, message = local_failure or ("oom", "probe candidate failed on another rank")
             _emit_probe_candidate_failure(kind, message)
             raise RuntimeError(message)
+        if step == 0:
+            assert s1_abs_mean is not None
+            global_s1_abs_mean = float(
+                accelerator.gather(
+                    torch.tensor([s1_abs_mean], device=accelerator.device, dtype=torch.float64)
+                )
+                .max()
+                .item()
+            )
+            _enforce_probe_s1_scale(global_s1_abs_mean, cfg.diagnostics.probe_s1_abs_mean_max)
         if loss is None:  # pragma: no cover - collective failure raises above
             raise RuntimeError("probe forward produced no loss")
         optimizer.zero_grad()

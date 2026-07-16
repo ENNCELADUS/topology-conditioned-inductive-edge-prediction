@@ -153,7 +153,8 @@ critic trained with its own BCE, gradients not propagated into h (detached input
 
 ```text
 s0 = pair_logit(i, j)                                    # frozen B0
-s1 = ½[ lse_k(κ(h_i^k, proj(x_j)) + log π_i^k m_i^k) + (i↔j) ],  κ = −‖·‖₂²/τ_κ
+s1 = ½[ lse_k(κ(h_i^k, proj(x_j)) + log π_i^k m_i^k) + (i↔j) ],
+κ(a,b) = −‖normalize₂(a) − normalize₂(b)‖₂²/τ_κ
 s2 = Σ_{kk'} Π_{kk'} π_i^k π_j^{k'}  and AA variant Σ Π π π / log(1+deĝ)
 s3 = [1 − exp(−F_i·F_j);  d̂_i;  d̂_j;  Σπm/B_i;  Σπm/B_j]        # post-harmonization
 s4 = MLP_2([H_i; H_j; H_T; spec(T̂)])   from a 3-layer edge-weighted GNN over T̂_ij
@@ -525,6 +526,14 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   retained only as diagnostic evidence. Future binding Stage-1 runs use a new experiment
   ID and the replacement single-seed decision contract in §13.15. E1/E3 still require
   at least three seeds and Holm-corrected inference.
+- 2026-07-16: Stage-1 diagnostic repair revision. The `s1` membership kernel now
+  L2-normalizes only its slot and projected-feature operands before squared distance;
+  raw `proj(x)` remains unchanged for matching and reconstruction. Added the already
+  registered per-family gradient-norm measurement and deterministic Kendall trigger,
+  fixed per-epoch channel/rank-mobility fidelity series, probe-time `s1` scale abort,
+  a conjunctive scoring-time dead-residual validity gate, and the validation-AUPRC
+  near-tie fidelity tie-break. These are bound to a new single-seed experiment ID;
+  §10.2 sampling and all Stage-1 success criteria are unchanged.
 
 **Open gate-report deliverable:** FLOPs/latency table template (§4.7 commitment —
 delivered with the G5 Stage-1 gate report). Stage-1 code now exists; the replacement
@@ -646,7 +655,10 @@ between the two embedding batches.
 `s1`. Matching-cost and `L_feat` targets use `stop-gradient(proj(x_v))` — gradients
 reach `proj` only through the slot side and `s1`. Diagnostic: per-epoch variance of
 `proj(x)` over the node batch (representation-collapse watch). `τ_κ` in `s1`: learned
-scalar, softplus-parameterized, init 1.0. Decoder attention heads: 8.
+scalar, softplus-parameterized, init 1.0. Inside the `s1` membership kernel only,
+both `h^k` and `proj(x_other)` are statelessly L2-normalized before squared distance.
+No batch/running statistics are permitted, and raw `proj(x)` semantics remain intact
+for Stitch/matching, node losses, and reconstruction targets. Decoder attention heads: 8.
 
 ### 13.8 Curriculum adaptation
 
@@ -658,7 +670,10 @@ scalar, softplus-parameterized, init 1.0. Decoder attention heads: 8.
 
 Execution is fixed-epoch with per-epoch validation; the VAL-CRITERION early stop is
 recorded as `counterfactual_stop_epoch` (the E2 worker convention) and `best.pt` is
-the early-stop-equivalent checkpoint (max validation edge AUPRC).
+the early-stop-equivalent checkpoint. Validation edge AUPRC remains primary; when two
+epochs differ by at most `1e-4`, the larger validation residual/s0 standard-deviation
+ratio is the deterministic tie-break. This fidelity tie-break is checkpoint selection
+only and is not a Stage-1 success criterion.
 
 ### 13.9 Self-pair single-ego path (Stage-1 form)
 
@@ -755,3 +770,29 @@ writers, shard merging, orchestration reuse, and gate evaluation fail closed if 
 provenance is absent or inconsistent. Unique-logit count/fraction and reduced-precision
 round-trip fractions are recorded as descriptive diagnostics only: legitimate model
 ties must not be rejected solely because the unique-logit fraction is low.
+
+### 13.17 Registered training/fidelity instrumentation
+
+The worker instantiates all four Kendall log-variance parameters before DDP/optimizer
+construction. After warm-start, every 50 steps it replays one fixed probe batch under
+`no_sync`, performs separate retained-graph gradient measurements for the weighted
+`L_edge`, `L_recon`, `L_real`, and `L_ssl` families, and records their global L2 norms
+in the epoch's `metrics.jsonl` row. If the largest family norm exceeds 10× the family
+median continuously for 1,000 optimization steps, Kendall uncertainty weighting is
+activated on every rank; activation step and learned log variances are recorded.
+
+The first runtime probe records `s1/s2/s2_aa/residual` mean and standard deviation and
+aborts when `|mean(s1)| > 1000`. Every validation epoch records the three channel scales,
+residual standard deviation, residual/s0 standard-deviation ratio, Kendall tau/rank
+mobility versus s0, and top-k overlap on a fixed 1% validation slice. These series and
+the Kendall state are embedded in `run_metadata.json` and are required by the G5 gate.
+
+Before topology evaluation, the gate aligns the EgoStitch candidate artifact with a
+fresh fp32 frozen-s0 candidate artifact scored from checkpoint `e092537d8cf1e208`.
+This input is separate from the historical canonical B0 comparator artifact, whose
+quantization must not masquerade as residual variance. The gate fails the run as a dead
+residual only when all
+three registered death signals hold: residual/s0 standard-deviation ratio `< 1e-5`,
+Spearman correlation with s0 `> 0.9999`, and top-1% overlap `> 0.9999`. This conjunctive
+validity rule prevents a genuinely pair-varying but safely small residual from being
+turned into a post-hoc outcome switch. It is a run-validity gate, not a success metric.

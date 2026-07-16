@@ -35,6 +35,14 @@ optim:
   grad_clip: 1.0
   warmstart_fraction: 0.2           # L_recon-only phase (spec §13.8)
 
+diagnostics:
+  gradient_probe_interval: 50       # fixed probe batch, weighted family norms
+  gradient_imbalance_ratio: 10.0    # registered Kendall trigger
+  gradient_imbalance_steps: 1000    # persistence before activation
+  probe_s1_abs_mean_max: 1000.0     # fail fast on kernel-scale recurrence
+  selection_auprc_tolerance: 1.0e-4 # fidelity tie-break only inside this band
+  topk_fraction: 0.01               # fixed validation ranking-mobility slice
+
 eval:
   patience: 10                      # VAL-CRITERION bookkeeping (spec §8)
   eval_every: 1

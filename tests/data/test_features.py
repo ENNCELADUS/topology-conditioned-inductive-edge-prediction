@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -157,13 +158,10 @@ class TestBuildF0Matrix:
         assert torch.equal(matrix, expected)
         assert index == {"node_000003": 0, "node_000001": 1}
 
-    def test_logs_progress_every_1000_nodes(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        shapes = {f"node_{i:06d}": (2, 4) for i in range(1, 1001)}
-        root = _write_feature_root(tmp_path, shapes, input_dim=4)
-        store = FeatureStore(root)
-        node_ids = list(shapes)
+    def test_logs_progress_every_1000_nodes(self, caplog: pytest.LogCaptureFixture) -> None:
+        node_ids = [f"node_{i:06d}" for i in range(1, 1001)]
+        store = Mock(spec=FeatureStore)
+        store.load_tokens.return_value = torch.zeros(1, 1)
         with caplog.at_level(logging.INFO):
             build_f0_matrix(store, node_ids)
         assert any("1000" in record.message for record in caplog.records)

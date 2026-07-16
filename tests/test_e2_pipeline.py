@@ -2,12 +2,13 @@ import hashlib
 import json
 import subprocess
 import sys
-import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import cast
 
 import pytest
+import src.data.packed_features as packed_features
 import torch
 from src.data.packed_features import build_packed_features
 from src.e2_pipeline import (
@@ -31,6 +32,23 @@ from src.e2_pipeline import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _avoid_pack_process_pool_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pipeline unit tests need pack semantics, not OS process startup."""
+    monkeypatch.setattr(packed_features, "ProcessPoolExecutor", ThreadPoolExecutor)
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 def test_publication_revokes_and_restores_the_old_completion_sentinel_first(
@@ -511,11 +529,12 @@ def _make_fake_runner(
     train_runtime_profile: dict[str, object] | None = None,
     fail_mode: str | None = None,
     timeout_mode: str | None = None,
-    sleep_seconds_by_mode: dict[str, float] | None = None,
+    advance_seconds_by_mode: dict[str, float] | None = None,
+    clock: _FakeClock | None = None,
 ) -> Callable[[Sequence[str], float], subprocess.CompletedProcess[str]]:
     resolved_probes = probe_by_budget or _default_probe_results()
     resolved_train_profile: dict[str, object] = train_runtime_profile or _valid_worker_profile()
-    resolved_sleeps = sleep_seconds_by_mode or {}
+    resolved_advances = advance_seconds_by_mode or {}
 
     def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
         command_list = list(command)
@@ -526,9 +545,10 @@ def _make_fake_runner(
 
         if timeout_mode == mode:
             raise subprocess.TimeoutExpired(cmd=command_list, timeout=timeout)
-        sleep_for = resolved_sleeps.get(mode)
-        if sleep_for:
-            time.sleep(sleep_for)
+        advance_by = resolved_advances.get(mode)
+        if advance_by:
+            assert clock is not None
+            clock.advance(advance_by)
         if fail_mode == mode:
             return subprocess.CompletedProcess(command_list, returncode=1, stdout="", stderr="boom")
 
@@ -866,7 +886,9 @@ class TestRunPipelineFailures:
         assert not created[0].exists()
         assert json.loads((output_dir / "failure.json").read_text())["stage"] == "pack"
 
-    def test_prior_canonical_survives_total_budget_failure(self, tmp_path: Path) -> None:
+    def test_prior_canonical_survives_total_budget_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         args, output_dir = self._base_args_and_config(
             tmp_path,
             pack_budget_seconds=1,
@@ -877,12 +899,16 @@ class TestRunPipelineFailures:
             total_budget_seconds=3,
         )
         before = self._seed_canonical(output_dir)
+        clock = _FakeClock()
+        monkeypatch.setattr("src.e2_pipeline.time.monotonic", clock.monotonic)
 
         assert (
             run_pipeline(
                 args,
                 command_runner=_make_fake_runner(
-                    epoch_seconds=0.001, sleep_seconds_by_mode={"train": 3.2}
+                    epoch_seconds=0.001,
+                    advance_seconds_by_mode={"train": 3.2},
+                    clock=clock,
                 ),
             )
             == 2
@@ -1175,7 +1201,7 @@ class TestRunPipelineFailures:
         assert failure["stage"] == "probe"
 
     def test_setup_probe_budget_exhausted_between_probes_and_epoch_probe_returns_2(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # The deadline is shared across the whole setup/probe stage: each of the 4
         # candidate probes eats into it, so it can run out strictly *after* the
@@ -1183,10 +1209,14 @@ class TestRunPipelineFailures:
         args, output_dir = self._base_args_and_config(
             tmp_path, setup_probe_budget_seconds=2, total_budget_seconds=32
         )
+        clock = _FakeClock()
+        monkeypatch.setattr("src.e2_pipeline.time.monotonic", clock.monotonic)
 
         exit_code = run_pipeline(
             args,
-            command_runner=_make_fake_runner(sleep_seconds_by_mode={"probe": 0.55}),
+            command_runner=_make_fake_runner(
+                advance_seconds_by_mode={"probe": 0.55}, clock=clock
+            ),
         )
 
         assert exit_code == 2
@@ -1298,7 +1328,7 @@ class TestRunPipelineFailures:
         assert json.loads((output_dir / "failure.json").read_text())["stage"] == "artifacts"
 
     def test_total_elapsed_over_budget_after_artifacts_writes_failure_and_returns_2(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         args, output_dir = self._base_args_and_config(
             tmp_path,
@@ -1309,11 +1339,15 @@ class TestRunPipelineFailures:
             reserve_seconds=0,
             total_budget_seconds=3,
         )
+        clock = _FakeClock()
+        monkeypatch.setattr("src.e2_pipeline.time.monotonic", clock.monotonic)
 
         exit_code = run_pipeline(
             args,
             command_runner=_make_fake_runner(
-                epoch_seconds=0.001, sleep_seconds_by_mode={"train": 3.2}
+                epoch_seconds=0.001,
+                advance_seconds_by_mode={"train": 3.2},
+                clock=clock,
             ),
         )
 

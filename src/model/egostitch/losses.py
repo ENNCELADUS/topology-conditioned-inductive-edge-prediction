@@ -370,6 +370,36 @@ def ssl_consistency(
 # --------------------------------------------------------------------------- totals
 
 
+def stage1_family_tensors(
+    config: EgoStitchConfig,
+    *,
+    edge: torch.Tensor,
+    recon: dict[str, torch.Tensor],
+    deg: torch.Tensor,
+    real_egostat: torch.Tensor,
+    real_gin: torch.Tensor,
+    ssl_noise: torch.Tensor,
+    ssl_pool: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Return the four *weighted* loss-family tensors used by the optimizer."""
+    l_recon = (
+        config.w_feat * recon["feat"]
+        + config.w_exist * recon["exist"]
+        + config.w_mult * recon["mult"]
+        + config.w_deg * deg
+        + config.w_slotadj * recon["slotadj"]
+        + config.w_gate * recon["gate"]
+    )
+    l_real = config.w_egostat * real_egostat + config.w_gin * real_gin
+    l_ssl = 0.5 * ssl_noise + 0.5 * ssl_pool
+    return {
+        "edge": edge,
+        "recon": config.lambda_recon * l_recon,
+        "real": config.lambda_real * l_real,
+        "ssl": config.lambda_ssl * l_ssl,
+    }
+
+
 def stage1_total(
     config: EgoStitchConfig,
     *,
@@ -407,12 +437,17 @@ def stage1_total(
     )
     l_real = config.w_egostat * real_egostat + config.w_gin * real_gin
     l_ssl = 0.5 * ssl_noise + 0.5 * ssl_pool
-    total = (
-        edge
-        + config.lambda_real * l_real
-        + config.lambda_ssl * l_ssl
-        + config.lambda_recon * l_recon
+    families = stage1_family_tensors(
+        config,
+        edge=edge,
+        recon=recon,
+        deg=deg,
+        real_egostat=real_egostat,
+        real_gin=real_gin,
+        ssl_noise=ssl_noise,
+        ssl_pool=ssl_pool,
     )
+    total = torch.stack(tuple(families.values())).sum()
     parts = {
         "edge": float(edge.detach()),
         "recon": float(l_recon.detach()),

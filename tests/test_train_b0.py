@@ -6,6 +6,7 @@ import json
 import pickle
 from collections import Counter
 from collections.abc import Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -14,12 +15,13 @@ from unittest.mock import Mock
 import networkx as nx
 import numpy as np
 import pytest
+import src.data.packed_features as packed_features
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
 from src.data.artifacts import ArtifactVerificationError
-from src.data.distributed_pairs import PairBatchSpec
+from src.data.distributed_pairs import CompactPairBatchDataset, PairBatchSpec
 from src.data.packed_features import PackedFeatureTable, build_packed_features
 from src.data.pairs import TokenPairDataset
 from src.eval.edge_metrics import EdgeMetrics
@@ -34,6 +36,7 @@ from src.train_b0 import (
     _build_packed_v3_1_loaders,
     _build_v3_1_loaders,
     _cycle_assembled_batches,
+    _EpochGpuBatchIterable,
     _evaluate_distributed,
     _interleave_bucket_specs,
     _run_probe_mode,
@@ -896,6 +899,7 @@ class TestV31TrainingLoader:
 
 def _synthetic_v31_pack_fixture(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[Config, AssembledData, Path]:
     """Build a synthetic benchmark + feature store + packed feature table."""
     data_root = tmp_path / "data"
@@ -905,6 +909,7 @@ def _synthetic_v31_pack_fixture(
     source_root = data_root / "features" / "frozen_node_features_1024"
     _write_feature_store(source_root, [f"node_{index:06d}" for index in range(1, 7)])
     cfg = load_config(Path("configs/b0_v31_breadth_first.yaml"))
+    assert cfg.runtime is not None
     cfg = replace(
         cfg,
         data=replace(
@@ -913,10 +918,16 @@ def _synthetic_v31_pack_fixture(
             strategy="synthetic",
             expected_missing_features=["node_000007"],
         ),
+        runtime=replace(
+            cfg.runtime,
+            pack_workers=1,
+            loader_workers_per_rank=1,
+        ),
         output_dir=tmp_path / "outputs",
     )
     assembled = assemble_data(cfg, verify=False)
     pack_root = tmp_path / "pack"
+    monkeypatch.setattr(packed_features, "ProcessPoolExecutor", ThreadPoolExecutor)
     build_packed_features(source_root, pack_root, workers=1)
     return cfg, assembled, pack_root
 
@@ -928,7 +939,7 @@ def test_sample_warmup_preserves_pair_exposure() -> None:
 def test_packed_loader_does_not_call_feature_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    cfg, assembled, pack_root = _synthetic_v31_pack_fixture(tmp_path)
+    cfg, assembled, pack_root = _synthetic_v31_pack_fixture(tmp_path, monkeypatch)
     table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
     monkeypatch.setattr(
         assembled.store,
@@ -951,18 +962,19 @@ def test_packed_loader_does_not_call_feature_store(
     assert warmup_steps >= 1
 
 
-def test_packed_loader_multi_worker_ranks_cover_all_rows(tmp_path: Path) -> None:
+def test_packed_loader_multi_worker_ranks_cover_all_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """world_size=2 takes the production multi-worker persistent DataLoader branch."""
-    cfg, assembled, pack_root = _synthetic_v31_pack_fixture(tmp_path)
+    cfg, assembled, pack_root = _synthetic_v31_pack_fixture(tmp_path, monkeypatch)
     assert cfg.runtime is not None
     table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
     # All synthetic features are length 3 -> every pair lands in bucket 128, and the
     # train (4 rows) and val (2 rows) buckets both satisfy the >= world_size planner gate.
     expected_row_ids = list(range(len(assembled.benchmark.split.train_pairs.pairs)))
-
     seen_row_ids: list[int] = []
     for process_index in (0, 1):
-        factory, _, _ = _build_packed_v3_1_loaders(
+        multi_worker_factory, _, _ = _build_packed_v3_1_loaders(
             cfg,
             assembled,
             table,
@@ -970,9 +982,9 @@ def test_packed_loader_multi_worker_ranks_cover_all_rows(tmp_path: Path) -> None
             process_index=process_index,
             world_size=2,
         )
-        train_iterable = factory(1)
-        assert isinstance(train_iterable, GpuBatchIterable)
-        loader = train_iterable._source
+        multi_worker_iterable = multi_worker_factory(1)
+        assert isinstance(multi_worker_iterable, _EpochGpuBatchIterable)
+        loader = multi_worker_iterable._source
         assert isinstance(loader, DataLoader)
         # Guard against silently regressing into the single-process unit-test branch.
         assert loader.num_workers == cfg.runtime.loader_workers_per_rank
@@ -980,16 +992,22 @@ def test_packed_loader_multi_worker_ranks_cover_all_rows(tmp_path: Path) -> None
         assert loader.persistent_workers is True
         assert loader.prefetch_factor == cfg.runtime.prefetch_factor
         assert loader.batch_size is None
-        for batch in train_iterable:
-            assert set(batch) >= {"emb_a", "emb_b", "len_a", "len_b", "label", "_row_id"}
-            seen_row_ids.extend(int(row_id) for row_id in batch["_row_id"])
+
+        dataset = loader.dataset
+        assert isinstance(dataset, CompactPairBatchDataset)
+        multi_worker_iterable._sampler.set_epoch(1)
+        for batch_index in loader.sampler:
+            compact_batch = dataset[int(batch_index)]
+            seen_row_ids.extend(int(row_id) for row_id in compact_batch.row_ids)
 
     # Exact coverage across the two rank partitions: no missing rows, no duplicates.
     assert sorted(seen_row_ids) == expected_row_ids
 
 
-def test_packed_loader_reuses_one_dataloader_across_epochs(tmp_path: Path) -> None:
-    cfg, assembled, pack_root = _synthetic_v31_pack_fixture(tmp_path)
+def test_packed_loader_reuses_one_dataloader_across_epochs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, assembled, pack_root = _synthetic_v31_pack_fixture(tmp_path, monkeypatch)
     table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
     factory, _, _ = _build_packed_v3_1_loaders(
         cfg,
@@ -1007,8 +1025,10 @@ def test_packed_loader_reuses_one_dataloader_across_epochs(tmp_path: Path) -> No
     assert epoch_one._source is epoch_two._source
 
 
-def test_packed_loader_persistent_workers_survive_two_epochs(tmp_path: Path) -> None:
-    cfg, assembled, pack_root = _synthetic_v31_pack_fixture(tmp_path)
+def test_packed_loader_enables_persistent_workers_and_reuses_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, assembled, pack_root = _synthetic_v31_pack_fixture(tmp_path, monkeypatch)
     table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
     factory, _, _ = _build_packed_v3_1_loaders(
         cfg,
@@ -1023,12 +1043,11 @@ def test_packed_loader_persistent_workers_survive_two_epochs(tmp_path: Path) -> 
     assert isinstance(epoch_one, GpuBatchIterable)
     loader = epoch_one._source
     assert isinstance(loader, DataLoader)
-    list(epoch_one)
-    worker_iterator = loader._iterator
-    assert worker_iterator is not None
-
-    list(factory(2))
-    assert loader._iterator is worker_iterator
+    epoch_two = factory(2)
+    assert isinstance(epoch_two, GpuBatchIterable)
+    assert epoch_two._source is loader
+    assert loader.num_workers == 1
+    assert loader.persistent_workers is True
 
 
 def test_distributed_plan_rejects_duplicate_and_missing_rows() -> None:

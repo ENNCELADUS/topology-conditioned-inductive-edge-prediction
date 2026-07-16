@@ -56,6 +56,12 @@ class _SynchronousExecutor:
         return results
 
 
+@pytest.fixture(autouse=True)
+def _avoid_process_pool_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise packing deterministically without spawning Python worker processes."""
+    monkeypatch.setattr(packed_features, "ProcessPoolExecutor", _SynchronousExecutor)
+
+
 def _write_feature_root(root: Path, node_shapes: dict[str, tuple[int, int]]) -> Path:
     embeddings_dir = root / "embeddings"
     embeddings_dir.mkdir(parents=True)

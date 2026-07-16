@@ -52,8 +52,10 @@ class DecisionHead(nn.Module):
         return F.softplus(self.tau_kappa_raw)
 
     def _membership(self, slots: SlotSet, other_proj: torch.Tensor) -> torch.Tensor:
-        """One side of ``s1``: ``lse_k(kappa(h^k, proj(x_other)) + log pi m)``."""
-        diff = slots.h - other_proj[:, None, :]
+        """One side of ``s1`` using the scale-safe cosine-distance kernel."""
+        slot_direction = F.normalize(slots.h, p=2.0, dim=-1)
+        other_direction = F.normalize(other_proj, p=2.0, dim=-1)
+        diff = slot_direction - other_direction[:, None, :]
         kappa = -(diff**2).sum(dim=-1) / self.tau_kappa
         return torch.logsumexp(kappa + stable_log(slots.pi * slots.mult), dim=-1)
 
@@ -144,9 +146,18 @@ class DecisionHead(nn.Module):
         Returns:
             Shape ``(B,)`` self-loop logits.
         """
+        channels = self.self_channels(slots, proj, d_hat)
+        return self.fuse(s0, channels)
+
+    def self_channels(
+        self,
+        slots: SlotSet,
+        proj: torch.Tensor,
+        d_hat: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Return the three decision channels for the registered self path."""
         s1 = self._membership(slots, proj)
         diag = torch.diagonal(slots.adj, dim1=-2, dim2=-1)
         s2 = (slots.pi**2 * diag).sum(dim=-1)
         damping = torch.clamp(torch.log1p(d_hat), min=1e-3)
-        channels = {"s1": s1, "s2": s2, "s2_aa": s2 / damping}
-        return self.fuse(s0, channels)
+        return {"s1": s1, "s2": s2, "s2_aa": s2 / damping}

@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 from src.experiments import b0_cal, g5_stage1
 from src.experiments.g1_hardened_e2 import AssembledRow
+from src.score_universe import ScoresArtifact
 
 from tests.test_b0_cal import _toy_inputs as _b0cal_toy_inputs
 from tests.test_g1_hardened_e2 import (
@@ -33,6 +34,12 @@ _PREREG = {
     "primary_criteria": {"decision_procedure": "single_seed_point_estimate_dominance"},
     "failure_reading": "pre-registered failure reading text (verbatim)",
     "decision_rules_5_2_verbatim": ["rule one", "rule two"],
+    "fidelity_validity_gate": {
+        "min_residual_std_ratio": 1e-5,
+        "max_spearman": 0.9999,
+        "max_topk_overlap": 0.9999,
+        "topk_fraction": 0.25,
+    },
 }
 
 
@@ -74,6 +81,11 @@ def _write_run_metadata(
                 "preregistration_sha256": sha,
                 "checkpoint_id": checkpoint_id,
                 "s0_checkpoint_id": "deadbeefcafefeed",
+                "training_diagnostics": {
+                    "fidelity_series": [{"residual_std": 0.1}],
+                    "gradient_norm_series": [{"step": 50, "grad_norm_edge": 1.0}],
+                    "kendall_fallback": {"active": False},
+                },
             }
         )
     )
@@ -149,6 +161,7 @@ def _gate_inputs(tmp_path: Path, *, n_seeds: int = 1) -> dict[str, Any]:
 
     return {
         "egostitch_universe_paths": ego_paths,
+        "s0_universe_paths": [universe_path] * n_seeds,
         "run_metadata_paths": metadata_paths,
         "b0_universe_path": universe_path,
         "b0cal_results_path": b0cal_dir / "b0cal_results.json",
@@ -211,6 +224,45 @@ class TestMatchedGlobalRdExactQuota:
             pairs, probs, u_idx, v_idx, selected, ["a", "b", "c", "d"]
         )
         assert set(graph.edges()) == {("a", "a"), ("a", "d")}
+
+
+class TestDeadResidualGuard:
+    @staticmethod
+    def _artifact(logits: np.ndarray) -> ScoresArtifact:
+        return ScoresArtifact(
+            node_ids=["a", "b", "c"],
+            u_idx=np.array([0, 0, 1], dtype=np.int32),
+            v_idx=np.array([0, 1, 2], dtype=np.int32),
+            logit=logits.astype(np.float32),
+            label=np.array([0, 1, 0], dtype=np.int8),
+            meta={},
+        )
+
+    def test_rejects_pair_invariant_residual(self) -> None:
+        s0 = self._artifact(np.array([-1.0, 0.0, 1.0]))
+        ego = self._artifact(np.array([-1.25, -0.25, 0.75]))
+        with pytest.raises(ValueError, match="dead residual"):
+            g5_stage1.validate_dead_residual(
+                ego,
+                s0,
+                min_residual_std_ratio=1e-5,
+                max_spearman=0.9999,
+                max_topk_overlap=0.9999,
+                topk_fraction=1 / 3,
+            )
+
+    def test_accepts_alive_residual_even_when_small(self) -> None:
+        s0 = self._artifact(np.array([-1.0, 0.0, 1.0]))
+        ego = self._artifact(np.array([-0.99, -0.02, 1.03]))
+        report = g5_stage1.validate_dead_residual(
+            ego,
+            s0,
+            min_residual_std_ratio=1e-5,
+            max_spearman=0.9999,
+            max_topk_overlap=0.9999,
+            topk_fraction=1 / 3,
+        )
+        assert report["residual_std"] > 0
 
 
 def _row(clustering: float, boot_std: float = 0.0, degree: float = 10.0) -> AssembledRow:

@@ -1,8 +1,8 @@
 {
-  "registration_id": "g5-stage1-20260716-single-seed-screen",
+  "registration_id": "g5-stage1-20260716-membership-normalized-screen-v2",
   "gate": "G5 Stage 1 - EgoStitch minimum-viable model (imagination + degree budget + closure)",
   "created_utc": "2026-07-16T00:00:00Z",
-  "amendment_rationale": "Post-observation protocol replacement made after the exact-quota Seed-0 diagnostic was produced and inspected. G5 Stage 1 is re-scoped from a three-seed inferential gate to a one-seed engineering screening gate to reduce screening cost; this does not retroactively bind the completed diagnostic, whose run metadata carries the superseded registration hash. Future binding runs require this new experiment ID and hash before training. The model, hyperparameters, comparators, metrics, exact-quota operating point, 0.005 RD tolerance, and guards are unchanged. E1/E3 retain at least three seeds and Holm-corrected inference.",
+  "amendment_rationale": "Post-diagnostic repair registration. The retained Seed-0 artifact showed a pair-invariant residual caused first by s1 membership-kernel scale collapse, with the s0-saturated training distribution providing no recovery pressure; loss-family competition was not measured because the registered gradient instrumentation was absent. This revision L2-normalizes only the s1 kernel operands, implements the pre-existing gradient-norm/Kendall fallback contract, registers channel/rank-mobility fidelity series and a conjunctive dead-residual validity gate, and adds a validation-AUPRC near-tie fidelity tie-break. It does not retroactively bind the completed diagnostic. The sampler, comparators, topology metrics, exact-quota operating point, 0.005 RD tolerance, guards, and single-seed engineering-screen success rule are unchanged; hard-negative exposure remains contingent on a later registration only if this screen has alive channels but no topology movement.",
   "spec_binding": "docs/05-egostitch-spec.md §13",
   "protocol_binding": "docs/03-experiment-protocol.md §5.0.5, §5.2",
   "benchmark": {
@@ -36,6 +36,19 @@
     "assembly": "density-matched threshold on non-self candidate rows against target_edges = |E(strip_self_loops(test_graph))| with atomic tie handling (G1 convention); self-pairs assembled at the same threshold",
     "matched_global_rd": "for each comparator, select exactly its realized non-self edge count from EgoStitch candidate rows by descending pass-1 score; split only the boundary score tie by ascending canonical pair order (min node index, max node index), without labels or topology targets; assemble self-pairs whose score is at least the selected boundary score; require and disclose |RD_global(egostitch) - RD_global(comparator)| <= 0.005 (the exact-quota construction gives zero gap for a valid quota)",
     "scores": "Stage-1 scores are pass-1 (ratio-1) scores per spec §13.11; EgoStitch artifacts must declare the §13.16 pair-pass-fp32 precision contract and record descriptive score-resolution diagnostics"
+  },
+  "fidelity_validity_gate": {
+    "rule": "Before topology metrics, fail as a dead residual only if all three registered conditions hold after exact pair alignment to frozen s0; this is run validity, not a success criterion.",
+    "min_residual_std_ratio": 1e-5,
+    "max_spearman": 0.9999,
+    "max_topk_overlap": 0.9999,
+    "topk_fraction": 0.01
+  },
+  "s0_candidate_contract": {
+    "checkpoint_id": "e092537d8cf1e208",
+    "pairs_source": "candidate",
+    "strategy": "breadth_first",
+    "precision": "fresh fp32 score-universe artifact from the audited frozen B0 checkpoint; it is supplied separately from the historical canonical comparator artifact and must have exact pair-universe alignment with the EgoStitch candidate artifact"
   },
   "primary_criteria": {
     "family": ["clustering_mmd_ratio", "bfs_macro_gs", "bfs_macro_rd"],
@@ -78,6 +91,8 @@
     "s-channel correlation matrix over (s0, s1, s2) on validation queries",
     "self/non-self edge-metric split and self-loop-rate row (spec §9.4.3)",
     "proj(x) batch variance trajectory (representation-collapse watch, spec §13.7)",
+    "per-epoch s1/s2/s2_aa scale, residual scale, residual/s0 ratio, Kendall rank mobility, and fixed top-1% overlap",
+    "weighted per-family gradient-norm series every 50 steps plus Kendall trigger/activation state",
     "FLOPs and wall-clock table: per-node cached, per-pair marginal, full candidate-universe assembly (proposal §4.7 R=0 commitment)"
   ],
   "verdict_rule": "single-seed screening pass iff Seed 0 strictly dominates every comparator on all three primary criteria AND both guards hold. P-values, confidence-interval pass flags, and Holm decisions are not applicable. Otherwise the screening verdict is 'cut' and the registered failure reading below is written into the gate results verbatim.",
@@ -90,7 +105,9 @@
   ],
   "mechanics": {
     "worker_obligation": "src/train_egostitch.py records this file's sha256 as run_metadata.json['preregistration_sha256'] at run start, before the first optimizer step.",
-    "gate_obligation": "src/experiments/g5_stage1.py recomputes this file's sha256 and refuses to open held-out metrics unless it equals the value recorded in every supplied run's run_metadata.json.",
-    "hyperparameters": "spec-default (docs/05-egostitch-spec.md §0/§13) x fixed Seed 0; additional seeds are optional robustness analyses. The 30-config HPO-parity and at-least-three-seed Holm requirements apply at E1/E3, not at this Stage-1 screening gate."
+    "gate_obligation": "src/experiments/g5_stage1.py recomputes this file's sha256 and refuses to open held-out metrics unless it equals the value recorded in every supplied run's run_metadata.json. The dead-residual check consumes a separately supplied fresh-fp32 s0 candidate artifact from the registered B0 checkpoint, not the historical quantized comparator deliverable.",
+    "hyperparameters": "spec-default (docs/05-egostitch-spec.md §0/§13) x fixed Seed 0; additional seeds are optional robustness analyses. The 30-config HPO-parity and at-least-three-seed Holm requirements apply at E1/E3, not at this Stage-1 screening gate.",
+    "training_diagnostics": "Fixed probe batch after warm-start; weighted L_edge/L_recon/L_real/L_ssl global L2 gradient norms every 50 steps; activate pre-instantiated Kendall weights only after >10x median persists for 1000 steps. Probe abort |mean(s1)| > 1000. Validation AUPRC is primary checkpoint selection; inside absolute tolerance 1e-4, larger residual/s0 std ratio breaks the tie.",
+    "p4_exclusion": "No hard heuristic/feature negatives and no hard-negative checkpoint criterion are added in this revision. Such exposure requires a later spec/registration amendment only if channels are alive but topology remains unchanged."
   }
 }

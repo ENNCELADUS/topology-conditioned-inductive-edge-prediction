@@ -12,6 +12,17 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _low_thread_env() -> dict[str, str]:
+    """Prevent two CPU ranks from each creating a full BLAS/OpenMP thread pool."""
+    return {
+        **os.environ,
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "VECLIB_MAXIMUM_THREADS": "1",
+    }
+
+
 # Troubleshooting: if `torch.distributed.run --standalone` below hangs for minutes or
 # fails with `torch.distributed.DistNetworkError: Failed to recv, got 0 bytes`, a
 # VPN/security client is likely hijacking hostname resolution (resolving this host's
@@ -33,6 +44,7 @@ def test_two_rank_cpu_plan_has_exact_global_coverage(tmp_path: Path) -> None:
             str(tmp_path),
         ],
         cwd=REPO_ROOT,
+        env=_low_thread_env(),
         capture_output=True,
         text=True,
         check=False,
@@ -61,6 +73,7 @@ def test_two_rank_cpu_runs_real_ddp_train_eval_and_rank_zero_outputs(tmp_path: P
             str(tmp_path),
         ],
         cwd=REPO_ROOT,
+        env=_low_thread_env(),
         capture_output=True,
         text=True,
         check=False,
@@ -157,6 +170,7 @@ def test_two_rank_cpu_egostitch_loop_emits_valid_profile_and_artifacts(tmp_path:
             str(tmp_path),
         ],
         cwd=REPO_ROOT,
+        env=_low_thread_env(),
         capture_output=True,
         text=True,
         check=False,

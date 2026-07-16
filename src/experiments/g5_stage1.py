@@ -22,6 +22,7 @@ CLI::
 
     python -m src.experiments.g5_stage1 \
         --egostitch-universe s0.npz \
+        --s0-universe b0_fp32_candidate.npz \
         --run-metadata run0/run_metadata.json \
         --b0-universe scores/b0_v31_candidate.npz \
         --b0cal-results outputs/b0_cal/b0cal_results.json \
@@ -46,6 +47,7 @@ from typing import cast
 import networkx as nx
 import numpy as np
 from numpy.typing import NDArray
+from scipy.stats import spearmanr
 
 from src.data.features import FeatureStore
 from src.eval.assembly import assemble_graph, density_matched_threshold
@@ -64,7 +66,7 @@ from src.experiments.g1_hardened_e2 import (
     load_test_node_buckets,
     validate_universe_artifact,
 )
-from src.score_universe import load_scores
+from src.score_universe import ScoresArtifact, load_scores
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +236,53 @@ def assemble_matched_global_rd_graph(
     return graph
 
 
+def validate_dead_residual(
+    egostitch: ScoresArtifact,
+    s0: ScoresArtifact,
+    *,
+    min_residual_std_ratio: float,
+    max_spearman: float,
+    max_topk_overlap: float,
+    topk_fraction: float,
+) -> dict[str, float]:
+    """Fail closed when scale, rank, and top-k evidence all identify a dead residual."""
+    s0_by_pair = {
+        pair: float(logit) for pair, logit in zip(s0.pairs(), s0.logit.tolist(), strict=True)
+    }
+    pairs = list(egostitch.pairs())
+    if len(s0_by_pair) != len(pairs) or any(pair not in s0_by_pair for pair in pairs):
+        raise ValueError("dead-residual validation requires identical pair universes")
+    aligned_s0 = np.asarray([s0_by_pair[pair] for pair in pairs], dtype=np.float64)
+    logits = egostitch.logit.astype(np.float64)
+    residual = logits - aligned_s0
+    s0_std = float(np.std(aligned_s0))
+    residual_std = float(np.std(residual))
+    residual_ratio = residual_std / max(s0_std, 1e-30)
+    correlation = float(spearmanr(aligned_s0, logits).statistic)
+    if not np.isfinite(correlation):
+        correlation = 1.0 if np.array_equal(aligned_s0, logits) else 0.0
+    topk = max(1, min(len(pairs), int(round(len(pairs) * topk_fraction))))
+    row_ids = np.arange(len(pairs), dtype=np.int64)
+    s0_top = set(np.lexsort((row_ids, -aligned_s0))[:topk].tolist())
+    ego_top = set(np.lexsort((row_ids, -logits))[:topk].tolist())
+    overlap = len(s0_top & ego_top) / topk
+    report = {
+        "s0_std": s0_std,
+        "residual_std": residual_std,
+        "residual_s0_std_ratio": residual_ratio,
+        "spearman_vs_s0": correlation,
+        "topk_overlap_vs_s0": overlap,
+        "topk_fraction": topk_fraction,
+    }
+    if (
+        residual_ratio < min_residual_std_ratio
+        and correlation > max_spearman
+        and overlap > max_topk_overlap
+    ):
+        raise ValueError(f"dead residual fidelity gate failed: {report}")
+    return report
+
+
 _FIDELITY_KEYS = {
     "degree_calibration_curve",
     "slot_recall_at_k_train",
@@ -270,6 +319,23 @@ def _load_required_diagnostics(
         if "flops" not in row or "wall_seconds" not in row:
             raise ValueError(f"cost report {key!r} requires flops and wall_seconds")
     return fidelity, cost
+
+
+def _training_diagnostics(run_metadata: Sequence[dict[str, object]]) -> list[dict[str, object]]:
+    """Validate the registered training-side series embedded in run metadata."""
+    required = {"fidelity_series", "gradient_norm_series", "kendall_fallback"}
+    reports: list[dict[str, object]] = []
+    for index, metadata in enumerate(run_metadata):
+        report = cast(dict[str, object] | None, metadata.get("training_diagnostics"))
+        if report is None or required - report.keys():
+            missing = sorted(required - (report.keys() if report is not None else set()))
+            raise ValueError(f"run metadata {index} is missing training diagnostics: {missing}")
+        if not cast(list[object], report["fidelity_series"]):
+            raise ValueError(f"run metadata {index} has an empty fidelity series")
+        if not cast(list[object], report["gradient_norm_series"]):
+            raise ValueError(f"run metadata {index} has an empty gradient-norm series")
+        reports.append(report)
+    return reports
 
 
 def _validate_b0cal_lineage(
@@ -463,6 +529,7 @@ def matched_rd_criterion(
 def run_g5_stage1_pipeline(
     *,
     egostitch_universe_paths: Sequence[Path],
+    s0_universe_paths: Sequence[Path] = (),
     run_metadata_paths: Sequence[Path],
     b0_universe_path: Path,
     b0cal_results_path: Path,
@@ -478,6 +545,9 @@ def run_g5_stage1_pipeline(
 
     Args:
         egostitch_universe_paths: One candidate-scores ``.npz`` per training seed.
+        s0_universe_paths: Matching fp32 frozen-B0 candidate artifacts used to
+            compute each scored residual. These are distinct from the canonical
+            comparator artifact when that historical deliverable is quantized.
         run_metadata_paths: The matching ``run_metadata.json`` per seed
             (pre-registration binding), aligned with `egostitch_universe_paths`.
         b0_universe_path: The frozen B0 candidate-scores artifact.
@@ -509,6 +579,8 @@ def run_g5_stage1_pipeline(
     prereg_sha = enforce_preregistration(preregistration_path, run_metadata_paths)
     prereg = cast(dict[str, object], json.loads(preregistration_path.read_text(encoding="utf-8")))
     enforce_frozen_inputs(prereg, preregistration_path, b0_universe_path)
+    if len(s0_universe_paths) != n_runs:
+        raise ValueError("one --s0-universe per --egostitch-universe is required")
     registered_seeds = cast(list[int], prereg.get("seeds"))
     if registered_seeds != [0]:
         raise ValueError("G5 Stage-1 registration must pin exactly seeds: [0]")
@@ -521,6 +593,9 @@ def run_g5_stage1_pipeline(
     decision_procedure = primary_config.get("decision_procedure")
     if decision_procedure != "single_seed_point_estimate_dominance":
         raise ValueError("unsupported G5 Stage-1 decision_procedure")
+    dead_residual_config = cast(dict[str, object] | None, prereg.get("fidelity_validity_gate"))
+    if dead_residual_config is None:
+        raise ValueError("preregistration is missing fidelity_validity_gate")
     fidelity, cost_report = _load_required_diagnostics(
         fidelity_report_paths, cost_report_path, n_runs
     )
@@ -528,6 +603,7 @@ def run_g5_stage1_pipeline(
         cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
         for path in run_metadata_paths
     ]
+    training_diagnostics = _training_diagnostics(run_metadata)
     for expected_seed, metadata in zip(registered_seeds, run_metadata, strict=True):
         if metadata.get("seed") not in (None, expected_seed):
             raise ValueError(
@@ -611,6 +687,7 @@ def run_g5_stage1_pipeline(
     ego_self_pair: list[dict[str, object]] = []
     ego_auprcs: list[float] = []
     s0_correlations: list[float] = []
+    dead_residual_reports: list[dict[str, float]] = []
     matched_gs: dict[str, list[float]] = {name: [] for name in _COMPARATORS}
     matched_rd: dict[str, list[float]] = {name: [] for name in _COMPARATORS}
     matched_rd_gap: dict[str, list[float]] = {name: [] for name in _COMPARATORS}
@@ -623,10 +700,16 @@ def run_g5_stage1_pipeline(
         pair: float(logit) for pair, logit in zip(b0_pairs, b0_universe.logit.tolist(), strict=True)
     }
 
-    for artifact_path, metadata in zip(egostitch_universe_paths, run_metadata, strict=True):
+    for artifact_path, s0_path, metadata in zip(
+        egostitch_universe_paths, s0_universe_paths, run_metadata, strict=True
+    ):
         universe = load_scores(artifact_path)
+        s0_universe = load_scores(s0_path)
         validate_universe_artifact(
             universe, strategy=strategy, n_test_nodes=n_test_nodes, label=str(artifact_path)
+        )
+        validate_universe_artifact(
+            s0_universe, strategy=strategy, n_test_nodes=n_test_nodes, label=str(s0_path)
         )
         if universe.meta.get("model_family") != "egostitch":
             raise ValueError(f"{artifact_path}: model_family must be 'egostitch'")
@@ -634,6 +717,18 @@ def run_g5_stage1_pipeline(
             raise ValueError(f"{artifact_path}: run metadata checkpoint_id mismatch")
         if metadata.get("s0_checkpoint_id") != frozen_b0.get("checkpoint_id"):
             raise ValueError(f"{artifact_path}: run metadata s0_checkpoint_id mismatch")
+        if s0_universe.meta.get("checkpoint_id") != frozen_b0.get("checkpoint_id"):
+            raise ValueError(f"{s0_path}: s0 checkpoint_id mismatch")
+        dead_residual_reports.append(
+            validate_dead_residual(
+                universe,
+                s0_universe,
+                min_residual_std_ratio=cast(float, dead_residual_config["min_residual_std_ratio"]),
+                max_spearman=cast(float, dead_residual_config["max_spearman"]),
+                max_topk_overlap=cast(float, dead_residual_config["max_topk_overlap"]),
+                topk_fraction=cast(float, dead_residual_config["topk_fraction"]),
+            )
+        )
         probs = universe.probs()
         pairs = list(universe.pairs())
         non_self = universe.u_idx != universe.v_idx
@@ -793,6 +888,7 @@ def run_g5_stage1_pipeline(
             "self_pair_edge_metrics": ego_self_pair,
             "degree_corrected_auprc": ego_auprcs,
             "s0_logit_correlation": s0_correlations,
+            "dead_residual_fidelity": dead_residual_reports,
             "matched_gs": matched_gs,
             "matched_rd": matched_rd,
             "matched_rd_quota_gap": matched_rd_gap,
@@ -809,6 +905,7 @@ def run_g5_stage1_pipeline(
         "failure_reading": (cast(str, prereg["failure_reading"]) if verdict == "cut" else None),
         "decision_rules_5_2_verbatim": prereg.get("decision_rules_5_2_verbatim"),
         "fidelity_reports": fidelity,
+        "training_diagnostics": training_diagnostics,
         "cost_report": cost_report,
     }
 
@@ -933,6 +1030,13 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="the matching run_metadata.json per seed (prereg binding)",
     )
+    parser.add_argument(
+        "--s0-universe",
+        type=Path,
+        nargs="+",
+        required=True,
+        help="matching fp32 frozen-B0 candidate artifact per EgoStitch seed",
+    )
     parser.add_argument("--b0-universe", type=Path, required=True)
     parser.add_argument("--b0cal-results", type=Path, required=True)
     parser.add_argument("--preregistration", type=Path, required=True)
@@ -971,6 +1075,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     for path in [
         *args.egostitch_universe,
         *args.run_metadata,
+        *args.s0_universe,
         args.b0_universe,
         args.b0cal_results,
         args.preregistration,
@@ -983,6 +1088,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     run_g5_stage1_pipeline(
         egostitch_universe_paths=args.egostitch_universe,
+        s0_universe_paths=args.s0_universe,
         run_metadata_paths=args.run_metadata,
         b0_universe_path=args.b0_universe,
         b0cal_results_path=args.b0cal_results,

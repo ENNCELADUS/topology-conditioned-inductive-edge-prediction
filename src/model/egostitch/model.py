@@ -150,6 +150,18 @@ class EgoStitchStage1(nn.Module):
         Returns:
             Shape ``(B,)`` edge logits.
         """
+        logits, _ = self.pair_outputs(enc_i, enc_j, x_i, x_j, s0)
+        return logits
+
+    def pair_outputs(
+        self,
+        enc_i: NodeEncoding,
+        enc_j: NodeEncoding,
+        x_i: torch.Tensor,
+        x_j: torch.Tensor,
+        s0: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return fused logits and the three Stage-1 channels for diagnostics."""
         plan = sinkhorn_plan(
             enc_i.slots.h,
             enc_j.slots.h,
@@ -163,8 +175,7 @@ class EgoStitchStage1(nn.Module):
         )
         proj_i = self.proj(x_i)
         proj_j = self.proj(x_j)
-        logits: torch.Tensor = self.decision(
-            s0,
+        channels = self.decision.channels(
             enc_i.slots,
             enc_j.slots,
             plan,
@@ -173,11 +184,19 @@ class EgoStitchStage1(nn.Module):
             self.d_hat(enc_i.tok),
             self.d_hat(enc_j.tok),
         )
-        return logits
+        return self.decision.fuse(s0, channels), channels
 
     def self_logits(self, enc: NodeEncoding, x: torch.Tensor, s0: torch.Tensor) -> torch.Tensor:
         """Single-ego logits for ``(u, u)`` queries (spec Sec 13.9)."""
-        return self.decision.forward_self(s0, enc.slots, self.proj(x), self.d_hat(enc.tok))
+        logits, _ = self.self_outputs(enc, x, s0)
+        return logits
+
+    def self_outputs(
+        self, enc: NodeEncoding, x: torch.Tensor, s0: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return self-pair logits and channels without a second imagination pass."""
+        channels = self.decision.self_channels(enc.slots, self.proj(x), self.d_hat(enc.tok))
+        return self.decision.fuse(s0, channels), channels
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Score one pair batch (the repository forward contract).
@@ -197,11 +216,15 @@ class EgoStitchStage1(nn.Module):
         if "x_j" in batch:
             enc_i = self.encode_nodes(batch["x_i"], batch["ground_i"])
             enc_j = self.encode_nodes(batch["x_j"], batch["ground_j"])
-            logits = self.pair_logits(enc_i, enc_j, batch["x_i"], batch["x_j"], s0)
+            logits, channels = self.pair_outputs(enc_i, enc_j, batch["x_i"], batch["x_j"], s0)
         else:
             enc = self.encode_nodes(batch["x_i"], batch["ground_i"])
-            logits = self.self_logits(enc, batch["x_i"], s0)
-        out: dict[str, torch.Tensor] = {"logits": logits}
+            logits, channels = self.self_outputs(enc, batch["x_i"], s0)
+        out: dict[str, torch.Tensor] = {
+            "logits": logits,
+            "residual": logits - s0,
+            **channels,
+        }
         if "label" in batch:
             out["loss"] = F.binary_cross_entropy_with_logits(logits, batch["label"].float())
         return out
