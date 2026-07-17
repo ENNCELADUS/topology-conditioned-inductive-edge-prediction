@@ -1,0 +1,74 @@
+# EgoStitch E2E Stage-1 formal training config (spec docs/05-egostitch-spec.md
+# §5/§13 as rewritten 2026-07-17, defaults §13.18).
+#   hpc/run.sh train configs/egostitch_e2e_breadth_first.yaml \
+#       --worker-module src.train_egostitch
+
+model:
+  family: egostitch_e2e
+  config:
+    ste_layers: 3
+    ste_dim: 128
+    xattn_heads: 8
+    n_inj: 1
+    p_topo: 0.0
+    p_cont: 0.0
+    permanent_null: none
+
+data:
+  root: data
+  strategy: breadth_first
+  train_positives: e_sup            # pinned (spec §9.3)
+  negative_ratio: 5                 # pinned (spec §10.2)
+  partition_seed: 0
+  msg_fraction: 0.8                 # pinned (spec §9.3)
+  node_batch: 256                   # B_n default (spec §10.1)
+  edge_batch: 512                   # B_e default (spec §10.1)
+  f0_cache: outputs/feature_packs/egostitch_f0/f0_matrix.pt
+  grounding_cache: outputs/feature_packs/egostitch_f0/grounding.npz
+  pack_dir: outputs/feature_packs/egostitch_e2e_tokens   # raw-token pack (spec §13.18 family; no s0 cache — §13.10 retired)
+  expected_missing_features:
+    - node_004764
+    - node_007050
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 0.01
+  epochs: 30
+  warmup_steps: 200
+  grad_clip: 1.0
+  warmstart_fraction: 0.2           # L_recon-only phase (spec §13.8)
+
+diagnostics:
+  gradient_probe_interval: 50       # fixed probe batch, weighted family norms
+  gradient_imbalance_ratio: 10.0    # registered Kendall trigger
+  gradient_imbalance_steps: 1000    # persistence before activation
+  probe_s1_abs_mean_max: 1000.0     # fail fast on kernel-scale recurrence
+  selection_auprc_tolerance: 1.0e-4 # tie-break: larger std(full-f_logit)/std(f_logit), spec §13.8
+  topk_fraction: 0.01               # fixed validation ranking-mobility slice
+
+eval:
+  patience: 10                      # VAL-CRITERION bookkeeping (spec §8)
+  eval_every: 1
+
+seed: 0
+output_dir: outputs/egostitch_e2e_stage1/p0
+mixed_precision: "bf16"
+preregistration: docs/registrations/g5_e2e_stage1_preregistration.json
+
+runtime:
+  world_size: auto                    # all visible NVIDIA H20s
+  pack_dir: outputs/feature_packs/egostitch_f0
+  pack_workers: 8
+  loader_workers_per_rank: 0        # batches are built in-process
+  prefetch_factor: 2
+  token_budget_candidates: [128, 256, 512]   # B_n candidates for this family
+  max_pairs_per_rank: 1048576
+  memory_limit_gib: 85.0
+  total_budget_seconds: 14400       # PROVISIONAL — replaced by measured profile before binding
+  pack_budget_seconds: 1200
+  setup_probe_budget_seconds: 900
+  train_eval_budget_seconds: 11700
+  artifact_budget_seconds: 120
+  reserve_seconds: 480
+  probe_warmup_steps: 5
+  probe_timed_steps: 15
