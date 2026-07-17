@@ -146,3 +146,65 @@ class EgoStitchConfig:
                     raise ValueError(f"{f.name} must be a number, got {raw!r}")
                 kwargs[f.name] = float(raw)
         return cls(**kwargs)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class E2EConfig:
+    """Rev-3.0 end-to-end conditioned-encoder hyperparameters (design rev 3).
+
+    The internal Stage-1 generator keeps its own pinned `EgoStitchConfig`
+    defaults (spec Sec 13); these fields size only the pair-encoder trunk and
+    its topo/content conditioning pathways (design rev 3 Sec 3.4-3.5).
+
+    Attributes:
+        d_model: Pair-trunk hidden width.
+        encoder_layers: `SiameseEncoder` depth (per-item token encoder).
+        cross_attn_layers: `ConditionedPairCrossAttention` depth.
+        n_heads: Attention heads for the item encoder and pair trunk.
+        n_inj: Trailing trunk layers receiving gated topo/content injection.
+        ste_dim: Stitched-topology encoder hidden width.
+        ste_layers: Stitched-topology encoder depth.
+        xattn_heads: Gated cross-attention heads (topo/content pathways).
+        p_topo: Training-time branch-dropout rate for the topo pathway.
+        p_cont: Training-time branch-dropout rate for the content pathway.
+    """
+
+    d_model: int = 512
+    encoder_layers: int = 3
+    cross_attn_layers: int = 3
+    n_heads: int = 8
+    n_inj: int = 1
+    ste_dim: int = 128
+    ste_layers: int = 3
+    xattn_heads: int = 8
+    p_topo: float = 0.15
+    p_cont: float = 0.15
+
+    def __post_init__(self) -> None:
+        """Validate cross-field invariants.
+
+        Raises:
+            ValueError: On any non-positive dimension or out-of-range rate.
+        """
+        for name in (
+            "d_model",
+            "encoder_layers",
+            "cross_attn_layers",
+            "n_heads",
+            "n_inj",
+            "ste_dim",
+            "ste_layers",
+            "xattn_heads",
+        ):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
+        if self.d_model % self.n_heads != 0:
+            raise ValueError(
+                f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})"
+            )
+        if not 1 <= self.n_inj <= self.cross_attn_layers:
+            raise ValueError(f"n_inj must be in [1, cross_attn_layers], got {self.n_inj}")
+        for name in ("p_topo", "p_cont"):
+            value = float(getattr(self, name))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], got {value}")
