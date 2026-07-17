@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -28,6 +29,9 @@ from src.data.packed_features import (
 from src.data.pairs import NegativeSampler
 from src.e2_pipeline import _validate_worker_profile
 from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
+from src.model.egostitch.conditioning import GatedCrossAttention
+from src.model.egostitch.config import E2EConfig
+from src.model.egostitch.e2e_model import EgoStitchE2E
 from src.train_b0 import ModelConfig
 
 pytestmark = pytest.mark.unit
@@ -45,6 +49,19 @@ _TINY_MODEL: dict[str, object] = {
     "gin_hidden": 8,
     "gin_layers": 2,
     "sinkhorn_iters": 3,
+}
+
+_E2E_TINY_MODEL: dict[str, object] = {
+    "d_model": 16,
+    "encoder_layers": 1,
+    "cross_attn_layers": 1,
+    "n_heads": 2,
+    "n_inj": 1,
+    "ste_dim": 8,
+    "ste_layers": 1,
+    "xattn_heads": 2,
+    "p_topo": 0.15,
+    "p_cont": 0.15,
 }
 
 
@@ -202,6 +219,24 @@ class TestLoadConfig:
         path.write_text(yaml.safe_dump(mapping))
         cfg = te.load_config(path)
         assert cfg.data.pack_dir == tmp_path / "token_pack"
+
+    def test_accepts_egostitch_e2e_family(self, tmp_path: Path) -> None:
+        mapping = _config_mapping(tmp_path)
+        mapping["model"] = {"family": "egostitch_e2e", "config": dict(_E2E_TINY_MODEL)}
+        mapping["data"]["pack_dir"] = str(tmp_path / "token_pack")
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.safe_dump(mapping))
+        cfg = te.load_config(path)
+        assert cfg.model.family == "egostitch_e2e"
+        assert cfg.model.config == _E2E_TINY_MODEL
+
+    def test_egostitch_e2e_family_rejects_stage1_only_keys(self, tmp_path: Path) -> None:
+        mapping = _config_mapping(tmp_path)
+        mapping["model"] = {"family": "egostitch_e2e", "config": {"slots": 4}}
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.safe_dump(mapping))
+        with pytest.raises(ValueError, match="unknown E2E config keys"):
+            te.load_config(path)
 
 
 class TestParseArgs:
@@ -560,11 +595,15 @@ class TestTrainLoop:
 _TOKEN_DIM = 1536
 
 
-def _write_tiny_token_pack(pack_dir: Path, nodes: list[str]) -> None:
+def _write_tiny_token_pack(pack_dir: Path, nodes: list[str], *, min_length: int = 2) -> None:
     """Write a minimal raw-token pack (same reader `_BatchFactory` consumes).
 
     Every node gets a distinct token-sequence length so pair identity and
     order can be recovered unambiguously from the returned ``len_a``/``len_b``.
+    ``min_length`` (default 2, matching the original fixture) is bumped to 3
+    by callers that run the sequences through a real `PairCrossAttention`-
+    family forward pass, which requires at least one inner token strictly
+    between the BOS/EOS positions (`src/model/B0.py`'s `inner_token_mask`).
     """
     pack_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(1)
@@ -573,7 +612,7 @@ def _write_tiny_token_pack(pack_dir: Path, nodes: list[str]) -> None:
     offset = 0
     with shard_path.open("wb") as handle:
         for i, node in enumerate(nodes):
-            length = 2 + i
+            length = min_length + i
             tensor = torch.from_numpy(rng.normal(size=(length, _TOKEN_DIM)).astype(np.float32))
             raw = tensor.to(torch.bfloat16).contiguous().view(torch.uint16)
             handle.write(raw.numpy().tobytes())
@@ -664,6 +703,142 @@ class TestBatchFactoryE2E:
         e2e_cfg = replace(cfg, model=ModelConfig(family="egostitch_e2e", config={}))
         with pytest.raises(ValueError, match="pack_dir"):
             te._BatchFactory(e2e_cfg, model_cfg, data, node_batch=4, rank=0, world_size=1)
+
+
+class TestCompositeStepE2E:
+    """One CPU optimization step through `_CompositeStep`, family egostitch_e2e."""
+
+    def _batch_and_model(self, tmp_path: Path) -> tuple[te._CompositeBatch, EgoStitchE2E]:
+        # EgoStitchE2E's internal generator always uses the full spec-default
+        # EgoStitchConfig() (input_dim=1536, slots=16, ...), never a value
+        # parsed from E2EConfig -- the toy bundle must match that, not the
+        # tiny per-field dict the frozen-s0 family tests use.
+        model_cfg = EgoStitchConfig()
+        cfg = _toy_cfg(tmp_path)
+        data = _toy_bundle(tmp_path, model_cfg)
+        pack_dir = tmp_path / "token_pack"
+        _write_tiny_token_pack(pack_dir, _NODES, min_length=3)
+        e2e_cfg = replace(
+            cfg,
+            model=ModelConfig(family="egostitch_e2e", config=dict(_E2E_TINY_MODEL)),
+            data=replace(cfg.data, pack_dir=pack_dir),
+        )
+        rows, steps = te._epoch_step_plan(
+            len(data.e_sup_positives),
+            negative_ratio=e2e_cfg.data.negative_ratio,
+            edge_batch=e2e_cfg.data.edge_batch,
+            world_size=1,
+        )
+        factory = te._BatchFactory(e2e_cfg, model_cfg, data, node_batch=4, rank=0, world_size=1)
+        batch = next(iter(factory.epoch_batches(1, rows_per_rank=rows, steps=steps)))
+        model = EgoStitchE2E(E2EConfig.from_mapping(e2e_cfg.model.config))
+        return batch, model
+
+    def _payload(
+        self,
+        batch: te._CompositeBatch,
+        *,
+        joint_weight: float,
+        collect_diagnostics: bool = False,
+    ) -> dict[str, object]:
+        return {
+            "node": batch.node,
+            "edge": batch.edge,
+            "joint_weight": torch.tensor(joint_weight),
+            "edge_rows_global": batch.edge_rows_global,
+            "seed": 0,
+            "epoch": 1,
+            "step": 0,
+            "collect_diagnostics": collect_diagnostics,
+        }
+
+    def _gates(self, model: EgoStitchE2E) -> tuple[GatedCrossAttention, GatedCrossAttention]:
+        topo_gate = model.trunk.topo_xattn[0]
+        cont_gate = model.trunk.cont_xattn[0]
+        assert isinstance(topo_gate, GatedCrossAttention)
+        assert isinstance(cont_gate, GatedCrossAttention)
+        return topo_gate, cont_gate
+
+    @staticmethod
+    def _bf16_autocast() -> torch.autocast:
+        # The packed-token store is bf16-only (src/data/packed_features.py);
+        # a real run consumes it under Accelerate's bf16 autocast (the
+        # `mixed_precision: bf16` worker config) -- reproduced explicitly here
+        # since this test drives `_CompositeStep` directly, without an
+        # `Accelerator` wrapping it.
+        return torch.autocast(device_type="cpu", dtype=torch.bfloat16)
+
+    def test_loss_finite_and_gates_dead_during_warmstart(self, tmp_path: Path) -> None:
+        torch.manual_seed(0)
+        batch, model = self._batch_and_model(tmp_path)
+        composite = te._CompositeStep(model, world_size=1)
+        topo_gate, cont_gate = self._gates(model)
+
+        with self._bf16_autocast():
+            out = composite(self._payload(batch, joint_weight=0.0))
+        loss = cast(torch.Tensor, out["loss"])
+        assert bool(torch.isfinite(loss))
+        loss.backward()  # type: ignore[no-untyped-call]
+
+        # joint_weight=0 zeros L_edge (and therefore trunk/STE/gates) during
+        # warm-start; the gate either never enters the graph (None) or enters
+        # multiplied by an exact zero (design Sec 4, spec Sec 13.8's reused
+        # curriculum).
+        for gate in (topo_gate.gate, cont_gate.gate):
+            assert gate.grad is None or float(gate.grad) == pytest.approx(0.0)
+
+    def test_gates_receive_gradient_after_warmstart(self, tmp_path: Path) -> None:
+        torch.manual_seed(0)
+        batch, model = self._batch_and_model(tmp_path)
+        composite = te._CompositeStep(model, world_size=1)
+        topo_gate, cont_gate = self._gates(model)
+
+        with self._bf16_autocast():
+            out = composite(self._payload(batch, joint_weight=1.0))
+        loss = cast(torch.Tensor, out["loss"])
+        assert bool(torch.isfinite(loss))
+        loss.backward()  # type: ignore[no-untyped-call]
+
+        assert topo_gate.gate.grad is not None
+        assert cont_gate.gate.grad is not None
+        total_abs_grad = float(topo_gate.gate.grad.abs()) + float(cont_gate.gate.grad.abs())
+        assert total_abs_grad > 0.0
+
+    def test_telemetry_keys_present_in_metrics_row(self, tmp_path: Path) -> None:
+        torch.manual_seed(0)
+        batch, model = self._batch_and_model(tmp_path)
+        composite = te._CompositeStep(model, world_size=1)
+
+        with self._bf16_autocast():
+            out = composite(self._payload(batch, joint_weight=1.0, collect_diagnostics=True))
+        assert bool(torch.isfinite(cast(torch.Tensor, out["loss"])))
+
+        for key in ("gate_topo_tanh", "gate_cont_tanh"):
+            assert key in out
+            values = cast(list[float], out[key])
+            assert len(values) == model.cfg.n_inj
+            assert all(math.isfinite(value) for value in values)
+
+        families = cast(dict[str, torch.Tensor], out["families"])
+        with self._bf16_autocast():
+            grad_rms = te._e2e_submodule_gradient_rms(model, families["edge"])
+        metrics_row: dict[str, object] = {**out, **grad_rms}
+        for key in ("grad_rms_trunk", "grad_rms_ste", "grad_rms_content"):
+            assert key in metrics_row
+            assert math.isfinite(cast(float, metrics_row[key]))
+
+        with self._bf16_autocast():
+            metrics_row["topology_delta_std"] = te._e2e_topology_delta_std(
+                model, te._e2e_edge_view(batch.edge)
+            )
+        assert math.isfinite(cast(float, metrics_row["topology_delta_std"]))
+
+    def test_dead_decision_head_excluded_from_trainable_parameters(self, tmp_path: Path) -> None:
+        _, model = self._batch_and_model(tmp_path)
+        trainable_ids = {id(p) for p in te._e2e_trainable_parameters(model)}
+        decision_ids = {id(p) for p in model.generator.decision.parameters()}
+        assert decision_ids.isdisjoint(trainable_ids)
+        assert any(id(p) in trainable_ids for p in model.trunk.parameters())
 
 
 class TestPreparePack:

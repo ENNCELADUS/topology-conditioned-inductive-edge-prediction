@@ -208,3 +208,36 @@ class E2EConfig:
             value = float(getattr(self, name))
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1], got {value}")
+
+    @classmethod
+    def from_mapping(cls, mapping: Mapping[str, object]) -> E2EConfig:
+        """Build a config from a YAML ``model.config`` mapping.
+
+        Args:
+            mapping: Field-name -> value overrides; unknown keys are rejected
+                (the train_b0 strict-config convention).
+
+        Returns:
+            The validated `E2EConfig`.
+
+        Raises:
+            ValueError: On unknown keys or invalid values.
+        """
+        known = {f.name for f in fields(cls)}
+        unknown = sorted(set(mapping) - known)
+        if unknown:
+            raise ValueError(f"unknown E2E config keys: {unknown}")
+        kwargs: dict[str, object] = {}
+        for f in fields(cls):
+            if f.name not in mapping:
+                continue
+            raw = mapping[f.name]
+            if f.type in ("int",):
+                if isinstance(raw, bool) or not isinstance(raw, int):
+                    raise ValueError(f"{f.name} must be an int, got {raw!r}")
+                kwargs[f.name] = int(raw)
+            else:
+                if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                    raise ValueError(f"{f.name} must be a number, got {raw!r}")
+                kwargs[f.name] = float(raw)
+        return cls(**kwargs)  # type: ignore[arg-type]
