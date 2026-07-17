@@ -670,14 +670,21 @@ def _five_arm_inputs(tmp_path: Path) -> dict[str, Any]:
             pair_content=pair_content,
             pair_topology=pair_topology,
             labels=labels,
-            checkpoint_id=f"ckpt_{name}",
+            checkpoint_id=("ckpt_full" if name == "structure_control_6a" else f"ckpt_{name}"),
         )
         arm_paths[name] = path
 
     run_metadata_paths: dict[str, Path] = {}
     for name in ("full", "b0_e2e_f_only", "pair_topology", "p0"):
         meta_path = tmp_path / f"{name}_run_metadata.json"
-        meta_path.write_text(json.dumps({"preregistration_sha256": "a" * 64}))
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "preregistration_sha256": "a" * 64,
+                    "checkpoint_id": f"ckpt_{name}",
+                }
+            )
+        )
         run_metadata_paths[name] = meta_path
 
     return {
@@ -698,10 +705,12 @@ class TestBuildE2EArmSummary:
         assert payload["registration_sha256"] == "a" * 64
         for name in g5_stage1._E2E_ARMS:
             row = _d(arms[name])
-            assert row["checkpoint_id"] == f"ckpt_{name}"
+            expected_checkpoint = "ckpt_full" if name == "structure_control_6a" else f"ckpt_{name}"
+            assert row["checkpoint_id"] == expected_checkpoint
             assert "graph_similarity" in _d(row["assembled"])
-        # structure_control_6a never had its own run_metadata entry.
-        assert _d(arms["structure_control_6a"])["registration_sha256"] is None
+        # structure_control_6a has no run_metadata record, but inherits the
+        # full arm's registered checkpoint/hash provenance.
+        assert _d(arms["structure_control_6a"])["registration_sha256"] == "a" * 64
         assert _d(arms["full"])["registration_sha256"] == "a" * 64
         liveness = _d(payload["liveness"])
         assert liveness["residual_std"] > 0
@@ -725,6 +734,60 @@ class TestBuildE2EArmSummary:
             k: v for k, v in inputs["arm_universe_paths"].items() if k != "full"
         }
         with pytest.raises(ValueError, match="'full' arm is required"):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_requires_exact_five_arm_set(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        inputs["arm_universe_paths"] = dict(inputs["arm_universe_paths"])
+        inputs["arm_universe_paths"].pop("p0")
+        with pytest.raises(ValueError, match="exactly the five registered arms"):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_requires_all_four_formal_run_metadata_records(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        inputs["run_metadata_paths"] = dict(inputs["run_metadata_paths"])
+        inputs["run_metadata_paths"].pop("p0")
+        with pytest.raises(ValueError, match="exactly the four formal"):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    @pytest.mark.parametrize("registration", [None, ""])
+    def test_requires_nonempty_shared_registration_hash(
+        self, tmp_path: Path, registration: str | None
+    ) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        metadata_path = _d(inputs["run_metadata_paths"])["p0"]
+        payload = {"checkpoint_id": "ckpt_p0"}
+        if registration is not None:
+            payload["preregistration_sha256"] = registration
+        metadata_path.write_text(json.dumps(payload))
+        with pytest.raises(ValueError, match="non-empty preregistration_sha256"):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_rejects_formal_artifact_checkpoint_mismatch(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        metadata_path = _d(inputs["run_metadata_paths"])["pair_topology"]
+        metadata_path.write_text(
+            json.dumps({"preregistration_sha256": "a" * 64, "checkpoint_id": "wrong"})
+        )
+        with pytest.raises(ValueError, match="checkpoint_id mismatch"):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_requires_6a_to_use_full_scoring_checkpoint(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
+        rng = np.random.default_rng(123)
+        _write_e2e_universe_npz(
+            _d(inputs["arm_universe_paths"])["structure_control_6a"],
+            node_ids=_NODES,
+            pairs=pairs,
+            full=rng.normal(size=len(pairs)),
+            f_logit=rng.normal(size=len(pairs)),
+            pair_content=rng.normal(size=len(pairs)),
+            pair_topology=rng.normal(size=len(pairs)),
+            labels=labels,
+            checkpoint_id="ckpt_not_full",
+        )
+        with pytest.raises(ValueError, match="structure_control_6a checkpoint_id"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
     def test_registration_hash_mismatch_rejected(self, tmp_path: Path) -> None:

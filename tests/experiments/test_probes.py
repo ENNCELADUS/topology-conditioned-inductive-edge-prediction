@@ -82,6 +82,43 @@ class TestDegreePartialledR2:
         r2 = probes.degree_partialled_r2(states, targets, degrees)
         assert abs(r2) < 0.2
 
+    def test_nuisance_residuals_are_fit_within_each_fold(self) -> None:
+        """Held-out targets must not influence the degree nuisance fit."""
+        rng = np.random.default_rng(266)
+        n = 10
+        degrees = rng.uniform(-3.0, 3.0, size=n)
+        states = np.column_stack([degrees**2, rng.normal(size=n)])
+        targets = 0.4 * degrees + 0.7 * states[:, 0] + rng.normal(scale=0.2, size=n)
+
+        order = np.random.default_rng(0).permutation(n)
+        folds = [fold.astype(np.int64) for fold in np.array_split(order, 5)]
+        predictions = np.empty(n)
+        residual_targets = np.empty(n)
+        for fold_idx, test_idx in enumerate(folds):
+            train_idx = np.concatenate([folds[j] for j in range(5) if j != fold_idx])
+            train_design = np.column_stack([np.ones(len(train_idx)), degrees[train_idx]])
+            test_design = np.column_stack([np.ones(len(test_idx)), degrees[test_idx]])
+            state_coefficients, *_ = np.linalg.lstsq(train_design, states[train_idx], rcond=None)
+            target_coefficients, *_ = np.linalg.lstsq(train_design, targets[train_idx], rcond=None)
+            train_states = states[train_idx] - train_design @ state_coefficients
+            test_states = states[test_idx] - test_design @ state_coefficients
+            train_targets = targets[train_idx] - train_design @ target_coefficients
+            test_targets = targets[test_idx] - test_design @ target_coefficients
+            mean_states = train_states.mean(axis=0)
+            mean_target = train_targets.mean()
+            centered_states = train_states - mean_states
+            weights = np.linalg.solve(
+                centered_states.T @ centered_states + 1e-3 * np.eye(states.shape[1]),
+                centered_states.T @ (train_targets - mean_target),
+            )
+            predictions[test_idx] = (test_states - mean_states) @ weights + mean_target
+            residual_targets[test_idx] = test_targets
+
+        expected = 1.0 - float(np.sum((residual_targets - predictions) ** 2)) / float(
+            np.sum((residual_targets - residual_targets.mean()) ** 2)
+        )
+        assert probes.degree_partialled_r2(states, targets, degrees) == pytest.approx(expected)
+
 
 class TestProbeTargets:
     """Hand-verified spec Sec 13.6 targets on a triangle-plus-pendant graph."""

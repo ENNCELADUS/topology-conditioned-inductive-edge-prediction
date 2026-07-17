@@ -1007,9 +1007,15 @@ _E2E_ARMS: tuple[str, ...] = (
     "structure_control_6a",
     "p0",
 )
+_E2E_FORMAL_ARMS: tuple[str, ...] = (
+    "full",
+    "b0_e2e_f_only",
+    "pair_topology",
+    "p0",
+)
 
 
-def _e2e_registration_sha256(run_metadata: Mapping[str, Mapping[str, object]]) -> str | None:
+def _e2e_registration_sha256(run_metadata: Mapping[str, Mapping[str, object]]) -> str:
     """Return the single registration hash shared by every provided run metadata.
 
     Args:
@@ -1018,21 +1024,28 @@ def _e2e_registration_sha256(run_metadata: Mapping[str, Mapping[str, object]]) -
             control over the ``full`` checkpoint, not its own training run).
 
     Returns:
-        The common ``preregistration_sha256`` value, or ``None`` if no
-        metadata was provided.
+        The non-empty common ``preregistration_sha256`` value.
 
     Raises:
-        ValueError: If two arms' metadata disagree on `preregistration_sha256`.
+        ValueError: If the metadata records are not exactly the four formal
+            arms, a registration hash is missing/empty, or hashes disagree.
     """
-    hashes: dict[str, object] = {
+    expected = set(_E2E_FORMAL_ARMS)
+    provided = set(run_metadata)
+    if provided != expected:
+        raise ValueError(
+            "e2e summary requires exactly the four formal run metadata records "
+            f"{sorted(expected)}, got {sorted(provided)}"
+        )
+    hashes = {
         name: metadata.get("preregistration_sha256") for name, metadata in run_metadata.items()
     }
-    distinct = {value for value in hashes.values() if value is not None}
-    if len(distinct) > 1:
+    if any(not isinstance(value, str) or not value for value in hashes.values()):
+        raise ValueError(f"e2e run metadata require a non-empty preregistration_sha256: {hashes}")
+    distinct = {cast(str, value) for value in hashes.values()}
+    if len(distinct) != 1:
         raise ValueError(f"e2e arm run metadata disagree on preregistration_sha256: {hashes}")
-    if not distinct:
-        return None
-    return cast(str, next(iter(distinct)))
+    return next(iter(distinct))
 
 
 def _validate_e2e_universe_shape(
@@ -1088,7 +1101,7 @@ def _validate_e2e_universe_shape(
 def build_e2e_arm_summary(
     *,
     arm_universe_paths: Mapping[str, Path],
-    run_metadata_paths: Mapping[str, Path] | None = None,
+    run_metadata_paths: Mapping[str, Path],
     data_root: Path,
     strategy: str,
     liveness_config: Mapping[str, float],
@@ -1114,9 +1127,9 @@ def build_e2e_arm_summary(
     procedure that is exp-Task 7's scope.
 
     Args:
-        arm_universe_paths: Arm name (subset of ``full``, ``b0_e2e_f_only``,
-            ``pair_topology``, ``structure_control_6a``, ``p0``) -> its scored
-            ``.npz`` artifact. ``full`` is required.
+        arm_universe_paths: Exact registered five-arm mapping (``full``,
+            ``b0_e2e_f_only``, ``pair_topology``, ``structure_control_6a``,
+            ``p0``) -> its scored ``.npz`` artifact.
         run_metadata_paths: Formal-run arm name -> its ``run_metadata.json``.
             ``structure_control_6a`` never has an entry.
         data_root: Directory containing the benchmark package.
@@ -1128,27 +1141,33 @@ def build_e2e_arm_summary(
         seed: Bootstrap/evaluation seed for the assembled-graph metrics.
 
     Returns:
-        A JSON-ready payload: ``registration_sha256`` (the single hash shared
-        by every provided run metadata, or ``None``), a per-arm
+        A JSON-ready payload: ``registration_sha256`` (the non-empty single
+        hash shared by the four formal run metadata records), a per-arm
         ``checkpoint_id`` / ``registration_sha256`` / ``assembled`` /
         ``degree_corrected_auprc`` row, and the ``full`` arm's
         within-checkpoint ``liveness`` report.
 
     Raises:
-        ValueError: On an unrecognized arm name, a missing ``full`` arm,
-            disagreeing registration hashes across arms, an artifact whose
-            ``model_family`` is not ``egostitch_e2e``, or an artifact that
-            fails its candidate-universe shape check or `validate_artifact_precision`.
+        ValueError: On an invalid five-arm composition, invalid formal-run
+            metadata/hash provenance, mismatched scoring checkpoint identities,
+            an artifact whose ``model_family`` is not ``egostitch_e2e``, or an
+            artifact that fails its candidate-universe shape check or
+            `validate_artifact_precision`.
     """
     unknown = set(arm_universe_paths) - set(_E2E_ARMS)
     if unknown:
         raise ValueError(f"unrecognized e2e arm(s): {sorted(unknown)}")
     if "full" not in arm_universe_paths:
         raise ValueError("the 'full' arm is required to build the e2e arm summary")
+    if set(arm_universe_paths) != set(_E2E_ARMS):
+        raise ValueError(
+            "e2e summary requires exactly the five registered arms "
+            f"{list(_E2E_ARMS)}, got {sorted(arm_universe_paths)}"
+        )
 
     run_metadata: dict[str, dict[str, object]] = {
         name: cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
-        for name, path in (run_metadata_paths or {}).items()
+        for name, path in run_metadata_paths.items()
     }
     registration_sha256 = _e2e_registration_sha256(run_metadata)
 
@@ -1177,6 +1196,18 @@ def build_e2e_arm_summary(
         if artifact.meta.get("model_family") != "egostitch_e2e":
             raise ValueError(f"{label}: model_family must be 'egostitch_e2e'")
         validate_artifact_precision(artifact, label=label)
+        if name in _E2E_FORMAL_ARMS:
+            metadata_checkpoint = run_metadata[name].get("checkpoint_id")
+            artifact_checkpoint = artifact.meta.get("checkpoint_id")
+            if (
+                not isinstance(metadata_checkpoint, str)
+                or not metadata_checkpoint
+                or artifact_checkpoint != metadata_checkpoint
+            ):
+                raise ValueError(
+                    f"{label}: run metadata checkpoint_id mismatch: "
+                    f"{metadata_checkpoint!r} != {artifact_checkpoint!r}"
+                )
         artifacts[name] = artifact
 
         probs = artifact.probs()
@@ -1205,10 +1236,18 @@ def build_e2e_arm_summary(
         )
         rows[name] = {
             "checkpoint_id": artifact.meta.get("checkpoint_id"),
-            "registration_sha256": run_metadata.get(name, {}).get("preregistration_sha256"),
+            "registration_sha256": registration_sha256,
             "assembled": _assembled_row_to_dict(assembled),
             "degree_corrected_auprc": regimes["degree_corrected"]["ratio_1"].auprc,
         }
+
+    full_checkpoint = artifacts["full"].meta.get("checkpoint_id")
+    control_checkpoint = artifacts["structure_control_6a"].meta.get("checkpoint_id")
+    if control_checkpoint != full_checkpoint:
+        raise ValueError(
+            "structure_control_6a checkpoint_id must match full scoring checkpoint: "
+            f"{control_checkpoint!r} != {full_checkpoint!r}"
+        )
 
     liveness = validate_dead_residual_within_checkpoint(
         artifacts["full"],

@@ -146,13 +146,20 @@ def linear_probe_r2(
     return 1.0 - ss_res / ss_tot
 
 
-def _partial_out(values: NDArray[np.float64], degrees: NDArray[np.float64]) -> NDArray[np.float64]:
-    """OLS-residualize `values` (1-D or 2-D, one row per sample) against `degrees`."""
-    design = np.column_stack([np.ones_like(degrees), degrees])
-    coefficients, *_ = np.linalg.lstsq(design, values, rcond=None)
-    fitted: NDArray[np.float64] = design @ coefficients
-    residual: NDArray[np.float64] = values - fitted
-    return residual
+def _partial_out_train_test(
+    train_values: NDArray[np.float64],
+    test_values: NDArray[np.float64],
+    train_degrees: NDArray[np.float64],
+    test_degrees: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Residualize train/test values with a degree fit learned on train rows only."""
+    train_design = np.column_stack([np.ones_like(train_degrees), train_degrees])
+    test_design = np.column_stack([np.ones_like(test_degrees), test_degrees])
+    coefficients, *_ = np.linalg.lstsq(train_design, train_values, rcond=None)
+    return (
+        train_values - train_design @ coefficients,
+        test_values - test_design @ coefficients,
+    )
 
 
 def degree_partialled_r2(
@@ -183,9 +190,27 @@ def degree_partialled_r2(
     degrees64 = np.asarray(degrees, dtype=np.float64).reshape(-1)
     states64 = _as_2d(np.asarray(states, dtype=np.float64))
     targets64 = np.asarray(targets, dtype=np.float64).reshape(-1)
-    target_residual = _partial_out(targets64, degrees64)
-    state_residual = _partial_out(states64, degrees64)
-    return linear_probe_r2(state_residual, target_residual, lam=lam, n_folds=n_folds, seed=seed)
+    n = states64.shape[0]
+    if n < n_folds:
+        raise ValueError(f"degree_partialled_r2 requires at least {n_folds} samples, got {n}")
+    folds = _kfold_indices(n, n_folds, seed)
+    predictions = np.empty(n, dtype=np.float64)
+    residual_targets = np.empty(n, dtype=np.float64)
+    for i, test_idx in enumerate(folds):
+        train_idx = np.concatenate([folds[j] for j in range(n_folds) if j != i])
+        train_states, test_states = _partial_out_train_test(
+            states64[train_idx], states64[test_idx], degrees64[train_idx], degrees64[test_idx]
+        )
+        train_targets, test_targets = _partial_out_train_test(
+            targets64[train_idx], targets64[test_idx], degrees64[train_idx], degrees64[test_idx]
+        )
+        predictions[test_idx] = _ridge_fit_predict(train_states, train_targets, test_states, lam)
+        residual_targets[test_idx] = test_targets
+    ss_res = float(np.sum((residual_targets - predictions) ** 2))
+    ss_tot = float(np.sum((residual_targets - residual_targets.mean()) ** 2))
+    if ss_tot < _MIN_VARIANCE:
+        return 0.0
+    return 1.0 - ss_res / ss_tot
 
 
 __all__ = ["degree_partialled_r2", "linear_probe_r2", "probe_targets"]
