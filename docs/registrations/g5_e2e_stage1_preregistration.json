@@ -19,26 +19,31 @@
   "arms": {
     "full": {
       "training": "configs/egostitch_e2e_breadth_first.yaml",
-      "scored_array": "logits"
+      "scored_array": "logits",
+      "scoring_provenance": {"scaffold_control": "none", "permanent_null": "none", "primary_logit": "full"}
     },
     "b0_e2e_f_only": {
       "training": "configs/egostitch_e2e_f_only_breadth_first.yaml",
       "scored_array": "logits",
-      "note": "permanent ∅_all_head; the matched pairwise-only control - the only arm '-topology' claims compare against"
+      "note": "permanent ∅_all_head; the matched pairwise-only control - the only arm '-topology' claims compare against",
+      "scoring_provenance": {"scaffold_control": "none", "permanent_null": "all_head", "primary_logit": "f_logit"}
     },
     "pair_topology": {
       "training": "configs/egostitch_e2e_pair_topology_breadth_first.yaml",
       "scored_array": "logits",
-      "note": "permanent ∅_content_head, separately trained; THE registered attribution arm. The full checkpoint's eval-bypass pair_topology array is a nonbinding diagnostic only."
+      "note": "permanent ∅_content_head, separately trained; THE registered attribution arm. The full checkpoint's eval-bypass pair_topology array is a nonbinding diagnostic only.",
+      "scoring_provenance": {"scaffold_control": "none", "permanent_null": "content_head", "primary_logit": "pair_topology"}
     },
     "structure_control_6a": {
       "training": "none (full checkpoint)",
       "scoring": "scaffold control shuffle_within_pair, stable-hash keyed (spec §13.18, keying canonical_pair_v1), control seed 0",
-      "scored_array": "logits"
+      "scored_array": "logits",
+      "scoring_provenance": {"scaffold_control": "shuffle_within_pair", "seed": 0, "keying": "canonical_pair_v1", "permanent_null": "none", "primary_logit": "full", "checkpoint_arm": "full"}
     },
     "p0": {
       "training": "configs/egostitch_e2e_p0_breadth_first.yaml",
-      "scored_array": "logits"
+      "scored_array": "logits",
+      "scoring_provenance": {"scaffold_control": "none", "permanent_null": "none", "primary_logit": "full"}
     }
   },
   "comparators": ["b0", "b0_cal_density", "b0_cal_selfdensity", "b0_cal_degseq"],
@@ -56,7 +61,21 @@
     "g3_results": {
       "path": "outputs/deliverables/g3_graph_metrics_20260714/g3_results.json",
       "sha256": "e7fbc8e4e7f76ffe1f50123ac8e96c776cded79406e01e638539a3f835b79c24"
+    },
+    "candidate_manifest": {
+      "path": "data/benchmark_2025_neurips/breadth_first/candidate_test_edges.txt",
+      "sha256": "bd8015bd9e65159785bad3d3934a9294b0116cb334e1cf29e8aa0e8fa0e90e42",
+      "identity_rule": "every scored pair and label must match this file row-for-row"
+    },
+    "b0cal_results": {
+      "path": "outputs/deliverables/b0_cal_20260714/b0cal_results.json",
+      "sha256": "REQUIRED-BEFORE-BINDING"
     }
+  },
+  "evaluator": {
+    "seed": 0,
+    "fixed_subgraphs": 500,
+    "rule": "the formal gate rejects every evaluator seed other than 0"
   },
   "operating_point": {
     "canonical": "density-matched threshold on non-self candidate rows against target_edges = |E(strip_self_loops(test))| (predecessor definition, unchanged)",
@@ -115,7 +134,7 @@
       "consequence": "run-validity failure; gate fails closed before held-out topology metrics"
     },
     "four_logit_decomposition": "full / f_logit / pair_content / pair_topology published per scored pair for the full and p0 checkpoints, fp32, provenance egostitch_e2e_pair_fp32_v1, resolution guard per array; DIAGNOSTIC decomposition - the registered attribution arm is the separately trained pair_topology run",
-    "checkpoint_selection": "validation AUPRC primary; within selection_auprc_tolerance 1e-4, prefer the larger within-checkpoint std(full - f_logit)/std(f_logit) (spec §13.8 as re-registered)"
+    "checkpoint_selection": "validation AUPRC primary; within selection_auprc_tolerance 1e-4, prefer the larger within-checkpoint std(full - f_logit)/std(f_logit) on the first max(1, ceil(0.01*N_val)) frozen validation-manifest rows (spec §13.8 as re-registered)"
   },
   "diagnostics_nonbinding": [
     "same-checkpoint decomposition deltas: topology_delta = full - pair_content, content_delta = full - pair_topology(bypass), and bypass-vs-trained pair_topology divergence",
@@ -123,6 +142,16 @@
     "gate tanh magnitudes and per-family gradient norms over training",
     "p0-vs-full four-logit divergence (branch-dropout effect size)"
   ],
+  "probe_artifact": {
+    "required_gate_input": true,
+    "format": "egostitch_e2e_probe_v1",
+    "producer": "python -m src.experiments.probes produce-e2e",
+    "expected_path": "outputs/egostitch_e2e_stage1/full/probes/e2e_probe_v1.npz",
+    "node_selection": "all operative train nodes, sorted id order",
+    "pair_selection": "the 4096 non-self E_msg pairs with smallest sha256('min(u,v)|max(u,v)'), or all if fewer",
+    "targets": ["degree", "ego_density", "clustering", "ego_density_degree_partialled", "clustering_degree_partialled", "pi_shared_neighbor_consistency"],
+    "verdict_effect": "none (required output evidence, nonbinding)"
+  },
   "cost_report": {
     "requirement": "measured H20 profile REQUIRED-BEFORE-BINDING: per-step wall, peak memory, 30-epoch extrapolation per arm (x4 arms), candidate scoring latency (x5 passes); the frozen-s0 673 s / 2.04 GiB profile explicitly does not extrapolate",
     "measured": "REQUIRED-BEFORE-BINDING"
@@ -131,7 +160,7 @@
   "failure_reading": "If the full arm fails the primary family against the B0+cal comparator set, the topology-conditioned encoder does not beat calibrated independent scoring at this stage; the result is written up honestly and the locked-decision discussion is taken before any Stage-2 mechanism or E1 registration. If the primaries pass but pathway attribution fails, the honest conclusion is content-side information. If the primaries pass but the structure-control condition fails, the honest conclusion is that shuffled relational connectivity was not necessary beyond the retained topology-derived node features - not that the gain is non-topological.",
   "mechanics": {
     "worker_obligation": "src/train_egostitch.py records this file's sha256 as run_metadata.json['preregistration_sha256'] at start; it refuses formal (non --max-steps) runs unless status == BINDING; --max-steps debug runs accept DRAFT but write only to *_debug output directories and produce no held-out artifacts",
-    "gate_obligation": "src/experiments/g5_stage1.py requires status == BINDING, recomputes this file's sha256, and refuses held-out metrics unless it matches ALL FOUR formal run metadatas (full, f_only, pair_topology, p0)",
+    "gate_obligation": "src/experiments/g5_stage1.py requires status == BINDING, a real b0cal_results digest in place of REQUIRED-BEFORE-BINDING, evaluator seed 0, exact frozen candidate pair/label identity, exact per-arm scoring provenance, the provenance-bound probe artifact, and this file's sha256 matching ALL FOUR formal run metadatas (full, f_only, pair_topology, p0)",
     "hyperparameters": "spec §13.18 defaults x fixed Seed 0; no sweeps inside this screen",
     "p4_exclusion": "no hard heuristic/feature negatives and no hard-negative checkpoint criterion are added in this revision"
   }

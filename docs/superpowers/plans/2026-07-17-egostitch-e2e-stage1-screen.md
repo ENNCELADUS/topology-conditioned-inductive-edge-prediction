@@ -853,9 +853,18 @@ additionally records
   Task 7).
 - Produces: the binding five-arm screening verdict and its documentation.
 
-- [ ] **Step 1: Run the gate** (single-process, local):
+- [ ] **Step 1: Produce the required nonbinding probe artifact, then run the
+  gate** (single-process; the producer may run on the scoring host and the gate
+  locally after copy-back):
 
 ```bash
+.venv/bin/python -m src.experiments.probes produce-e2e \
+    --checkpoint outputs/egostitch_e2e_stage1/full/best.pt \
+    --run-metadata outputs/egostitch_e2e_stage1/full/run_metadata.json \
+    --preregistration docs/registrations/g5_e2e_stage1_preregistration.json \
+    --data-root data --strategy breadth_first \
+    --output outputs/egostitch_e2e_stage1/full/probes/e2e_probe_v1.npz
+
 .venv/bin/python -m src.experiments.g5_stage1 \
     --mode e2e \
     --full-universe    outputs/egostitch_e2e_stage1/full/scores/candidate.npz \
@@ -869,6 +878,7 @@ additionally records
                    outputs/egostitch_e2e_stage1/p0/run_metadata.json \
     --b0-universe outputs/deliverables/b0_v31_breadth_first_20260711/scores/candidate.npz \
     --b0cal-results outputs/deliverables/b0_cal_20260714 \
+    --probe-artifact outputs/egostitch_e2e_stage1/full/probes/e2e_probe_v1.npz \
     --preregistration docs/registrations/g5_e2e_stage1_preregistration.json \
     --output-dir outputs/egostitch_e2e_stage1/formal_gate
 ```

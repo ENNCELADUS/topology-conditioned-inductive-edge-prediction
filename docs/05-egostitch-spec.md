@@ -177,10 +177,14 @@ p_ij = σ( head( Trunk(tok_i, tok_j | STE(T̂_ij), c_content) ) )
   the only query**, injected after the final `n_inj ∈ {1, 2}` pair-cross-attention
   blocks (default 1). The AB and BA directions share STE and cross-attention
   parameters before `abba_max`.
-- **`c_content` (separate ablatable pathway):** s1-style grounding summaries plus
-  the grounded-identity-match flag, through its own zero-init gated
-  cross-attention. The topology-representation claim must survive removal of this
-  pathway (protocol E4.15).
+- **`c_content` (separate ablatable pathway):** each side's slot token appends the
+  former-s1 counterpart-membership value
+  `q_u^k = -||norm(h_u^k)-norm(proj(x_other))||^2/tau_kappa + log(pi_u^k m_u^k)`
+  (learned positive `tau_kappa`, shared historical projection), plus the
+  grounded-identity-match flag, through its own zero-init gated cross-attention.
+  `q` is content/compatibility evidence and is forbidden from `c_topo`. The
+  topology-representation claim must survive removal of this pathway (protocol
+  E4.15).
 - **Three mutually exclusive head nulls** (train = per-pair multiplicative masks at
   `p_topo`/`p_cont`, eval = batch-level hard bypass; the residual sublayer form
   makes the two numerically identical — required unit test; `p(i,j) = p(j,i)` under
@@ -391,10 +395,13 @@ test, and candidate files as `(u, u)` rows). Binding rules:
    budgets d̂_u, training-side clustering/code stats, ego-net targets, recall, and other
    training structural targets strip self-loops. Canonical MMD descriptors and official
    Official GS/RD induced subgraphs retain self-loops exactly as in the benchmark evaluator.
-2. **`(u, u)` queries route through a single-ego path**: j := i; T_peer = own kept
-   slots; Π = identity on kept slots; s0 = pair_logit(u, u); s1 = self-membership
-   `lse_k(κ(h_u^k, proj(x_u)) + log π m)`; s2 from the Â_u diagonal blocks;
-   s3 unchanged; s4 on the single-ego scaffold with both anchor labels on u.
+2. **`(u, u)` queries route through a single-ego path**: j := i; encode and imagine
+   `u` exactly once, reuse that one ego state for both directional views, set
+   `T_peer` to its own slots, and set `Π = I_K` exactly (no Sinkhorn call). The
+   E2E raw-token trunk likewise encodes `u` once. Historical channels retain
+   `s0 = pair_logit(u, u)`, self-membership
+   `lse_k(κ(h_u^k, proj(x_u)) + log π m)`, `s2` from the Â_u diagonal blocks,
+   unchanged `s3`, and the single-ego scaffold with both anchor labels on `u`.
 3. **Reporting**: edge metrics overall *and* split self / non-self; canonical MMD and
    official GS/RD on loop-retaining induced subgraphs; GS/RD are computed per fixed
    sampled node set and macro-averaged over every sample across node-size buckets. Recall
@@ -629,6 +636,13 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   train-time-only (node-stream batches with real ego-net targets) and
   undefined for edge-stream endpoints and unseen nodes at inference, so
   wiring it there would violate the inductive protocol.
+- 2026-07-17: final whole-branch audit closure for the DRAFT E2E screen. Pinned
+  the dual-pack cold/warm contract; exact formal score-arm and candidate-row
+  provenance; single-ego self-pair execution; the per-slot former-s1 membership
+  channel in `c_content`; shared-state four-logit scoring; the global validation
+  slice; fixed-replay submodule-gradient telemetry; and the deterministic,
+  provenance-bound nonbinding probe artifact. These details close implementation
+  gaps without changing any Stage-1 verdict inequality or binding the registration.
 
 **Closed gate-report deliverable (2026-07-17):** the frozen-s0 Stage-1 gate report,
 fidelity diagnostics, and measured FLOPs/latency report are complete. The binding
@@ -778,7 +792,10 @@ the early-stop-equivalent checkpoint. Validation edge AUPRC remains primary; whe
 epochs differ by at most `1e-4`, the fidelity tie-break selects deterministically.
 **Family `egostitch_e2e` (re-registered 2026-07-17):** with `s0` retired, the
 tie-break statistic is the **within-checkpoint** `std(full − f_logit)/std(f_logit)`
-on the fixed validation slice — the larger value wins (liveness-preferring, same
+on the fixed global validation slice: the first
+`max(1, ceil(0.01 * N_val))` rows in the frozen validation-manifest order. Every
+rank/world-size configuration evaluates those exact identities; local rank shards
+or edge-batch boundaries may not choose the slice. The larger value wins (liveness-preferring, same
 direction as the retired residual/s0 rule, which remains the recorded rule for the
 historical frozen-s0 family). This fidelity tie-break is checkpoint selection only
 and is not a Stage-1 success criterion.
@@ -823,9 +840,14 @@ disk-cached with a sha256 manifest.
 EgoStitch worker uses the same automatically detected H20 count and
 `accelerate launch --num_processes N` layout, the same runtime-profile and checkpoint payload schemas, and a
 **config-driven** budget (`runtime.total_budget_seconds`; stage budgets must sum).
-This family's "feature pack" stage = the F0 pooled matrix (§9.2) + grounding-pool
-cache. The orchestrator's probe/projection gating applies against the configured
-budget.
+This family's generic pack stage has **two required, independently cold/warm
+validated packs**: (1) the F0 pooled matrix + grounding-pool cache at
+`runtime.pack_dir`; and (2) the raw-token BF16 pack at `data.pack_dir`. A cold run
+builds either missing pack before probes; a warm run validates both against the
+same frozen source feature manifests. Both manifest payloads and both manifest
+SHA-256 identities are embedded in pipeline/run evidence. A worker may not reach
+probe/train with only one pack present. The orchestrator's probe/projection gating
+applies against the configured budget.
 
 ### 13.14 Stage-gate comparators and pre-registration
 
@@ -888,7 +910,11 @@ ties must not be rejected solely because the unique-logit fraction is low.
 Stitch, the STE, both gated cross-attention pathways, the trunk pair-cross-attention
 blocks, and the head — i.e. everything from cached per-node encodes to all **four**
 published logits (full, `f_logit`, pair+content, pair+topology). The per-node encode
-pass may stay BF16 with fp32-cached outputs, unchanged. Artifacts for this family
+pass may stay BF16 with fp32-cached outputs, unchanged. Candidate scoring encodes
+each unique node once, caches the raw-token encoder state and generated ego state as
+fp32, builds Stitch/STE/content pair context once per pair batch, and evaluates the
+four hard-bypass heads from that shared context; four complete generator/Stitch/STE
+forwards are prohibited. Artifacts for this family
 record the contract string `egostitch_e2e_pair_fp32_v1`; the resolution guard
 applies to each of the four arrays independently. `egostitch_pair_fp32_v1` remains
 the recorded contract for historical frozen-s0 artifacts.
@@ -914,9 +940,27 @@ the Kendall state are embedded in `run_metadata.json` and are required by the G5
 alignment step exist for this family. The residual is `full − f_logit`; the ratio
 denominator is `std(f_logit)`. Telemetry rows additionally record `gate_topo_tanh`
 and `gate_cont_tanh` (per injected block), `grad_rms_trunk` / `grad_rms_ste` /
-`grad_rms_content`, and a per-epoch `topology_delta_std` on the fixed validation
-slice. The channel-scale series of this section read the available quantities
+`grad_rms_content`, and a per-epoch `topology_delta_std` on §13.8's fixed global
+validation slice. The three gradient-RMS values are measured from the fixed
+post-warm-start replay batch and its weighted `L_edge` tensor inside the same
+`no_sync` retained-graph probe as the family norms, RMS-aggregated across ranks,
+persisted in metrics/run metadata, and required (numeric, at least one probe row)
+by the formal gate. The channel-scale series of this section read the available quantities
 (`f_logit`, pathway deltas) in place of `s1/s2/residual-vs-s0`.
+
+The required nonbinding representation evidence is a deterministic
+`egostitch_e2e_probe_v1` artifact generated from the selected full checkpoint
+after scoring and consumed by the gate. It is bound to checkpoint id,
+registration SHA-256, config hash, Seed 0, partition Seed 0, and `G_struct`. Node
+rows are every operative train node in sorted id order; pair rows are the 4,096
+non-self `E_msg` pairs with smallest `sha256("min(u,v)|max(u,v)")` (or all rows
+when fewer exist). It carries mean-pooled STE states and evaluator targets for
+degree, ego density, and clustering. The gate reports five-fold ridge R2
+(`lambda=1e-3`) for all three, degree-partialled R2 for ego density and
+clustering, and Pi/shared-neighbor consistency: alignment-plan mass landing on
+equal grounded identities that are real common neighbors, divided by total
+plan mass (mean/std and nonzero fraction). These diagnostics never change the
+registered verdict.
 
 For the historical frozen-s0 family: before topology evaluation, the gate aligns
 the EgoStitch candidate artifact with a
@@ -956,6 +1000,16 @@ makes the control **invariant to batching, scoring order, GPU count, and shard
 boundaries**, and identical across the AB/BA passes (preserving
 `p(i,j) = p(j,i)`). Artifacts record
 `scaffold_control=shuffle_within_pair,seed=<seed>,keying=canonical_pair_v1`.
+
+**Formal score-arm and candidate bindings:** every E2E gate artifact must match
+the frozen `candidate_test_edges.txt` pair and label arrays row-for-row, not only
+its count. Exact scoring semantics are: `full` = control `none`, permanent null
+`none`, primary `full`; `structure_control_6a` = `shuffle_within_pair`, seed 0,
+`canonical_pair_v1`, permanent null `none`, primary `full`, and the full
+checkpoint; `b0_e2e_f_only` = control `none`, permanent null `all_head`, primary
+`f_logit`; `pair_topology` = control `none`, permanent null `content_head`,
+primary `pair_topology`; `p0` = control `none`, permanent null `none`, primary
+`full`. The gate fails closed on any field, checkpoint, row, or label mutation.
 
 **Registration-status enforcement (machine-checked):** a formal training run (no
 `--max-steps`) requires the referenced registration file to carry
@@ -1020,7 +1074,7 @@ c_topo = STE(T̂_ij)                # structure-only stitched-topology encoder o
                                   # NO grounded-identity-match); 2–3 edge-weighted MP
                                   # layers (promoted s4 lineage); token-level output
 c_cont = ContentTokens(S_i, S_j)  # separate pathway: [h; π; g; grounded-identity-
-                                  # match] per slot + membership signal (former s1)
+                                  # match; counterpart-membership] per slot
 inject: in the last N_inj ∈ {1, 2} pair-cross-attention blocks (default 1), the CLS
         token cross-attends to c_topo and (separately) c_cont through zero-initialized
         tanh gates, per direction (AB / BA, swapped anchor labels) BEFORE abba_max;
@@ -1028,6 +1082,10 @@ inject: in the last N_inj ∈ {1, 2} pair-cross-attention blocks (default 1), th
         across directions
 p_ij  = σ(head(z'_pair))
 ```
+
+Scaffold/content construction fails closed unless both sides have equal slot
+counts, `Π` is exactly `(B,K,K)`, every matched/membership array is exactly
+`(B,K)`, and all tensors share the same batch size.
 
 ### 14.2 Null taxonomy (three mutually exclusive head nulls; checkpoint-exact)
 

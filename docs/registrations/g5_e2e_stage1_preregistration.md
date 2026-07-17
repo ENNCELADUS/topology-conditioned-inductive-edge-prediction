@@ -31,13 +31,26 @@ below quantifies evaluator sampling stability at the fixed seed — nothing more
 The full checkpoint's eval-bypass four-logit decomposition (including its
 `pair_topology` array) is a **nonbinding diagnostic**.
 
+Every scored artifact must match the frozen candidate manifest pair and label
+arrays row-for-row. Exact provenance is: full = control `none`, permanent null
+`none`, primary `full`; 6a = `shuffle_within_pair`, seed 0,
+`canonical_pair_v1`, permanent null `none`, primary `full`, full checkpoint;
+f-only = control `none`, permanent null `all_head`, primary `f_logit`;
+pair-topology = control `none`, permanent null `content_head`, primary
+`pair_topology`; p0 = control `none`, permanent null `none`, primary `full`.
+
 ## Comparators and frozen inputs
 
 Comparators: `b0`, `b0_cal_density`, `b0_cal_selfdensity`, `b0_cal_degseq`
 (carried over; `b0_cal_selfdensity` is the empirically strongest arm of the
 frozen-s0 screen and remains the bar). Frozen inputs (sha-pinned in the JSON): the
 B0 candidate scores artifact (`c5873caa…`, checkpoint `e092537d8cf1e208`), the G1
-results (`668129a7…`), and the G3 results (`e7fbc8e4…`).
+results (`668129a7…`), the G3 results (`e7fbc8e4…`), and the exact candidate
+manifest (`bd8015bd…`). The calibrated-comparator payload is expected at
+`outputs/deliverables/b0_cal_20260714/b0cal_results.json`; its SHA remains
+`REQUIRED-BEFORE-BINDING` because that local deliverable is absent. Binding and
+formal gate evaluation fail closed until a real digest replaces the marker.
+The formal evaluator seed is exactly 0.
 
 ## Operating points
 
@@ -92,6 +105,7 @@ Holm decisions are reported as not applicable.
   `egostitch_e2e_pair_fp32_v1`, resolution guard per array — diagnostic only.
 - **Checkpoint selection:** validation AUPRC primary; within tolerance 1e-4,
   prefer the larger within-checkpoint `std(full − f_logit)/std(f_logit)`
+  on the first `max(1, ceil(0.01*N_val))` frozen validation-manifest rows
   (spec §13.8 as re-registered).
 
 ## Nonbinding diagnostics
@@ -101,6 +115,13 @@ bypass-vs-trained pair_topology divergence); linear probes on frozen STE token
 states (R² to degree / ego-density / clustering; ridge λ = 1e-3, 5-fold; plus
 degree-partialled variants and Π-consistency); gate tanh magnitudes and per-family
 gradient norms; p0-vs-full four-logit divergence.
+
+The gate requires a provenance-bound `egostitch_e2e_probe_v1` artifact produced
+after scoring from the selected full checkpoint. It uses all operative train
+nodes in sorted order and the 4,096 hash-smallest non-self `E_msg` pairs (or all
+when fewer), and reports degree / ego-density / clustering ridge R², the
+degree-partialled density and clustering variants, and Π/shared-neighbor
+consistency. This evidence is required output but remains nonbinding.
 
 ## Cost report
 
@@ -134,8 +155,9 @@ retained topology-derived node features — not that the gain is non-topological
   accept DRAFT but write only to `*_debug` output directories and produce no
   held-out artifacts.
 - **Gate:** `src/experiments/g5_stage1.py` requires `status == BINDING`,
-  recomputes this file's sha256, and refuses held-out metrics unless it matches
-  **all four** formal run metadatas (full, f_only, pair_topology, p0).
+  a real calibrated-comparator digest, evaluator seed 0, exact candidate and arm
+  provenance, the probe artifact, and this file's sha256 matching **all four**
+  formal run metadatas (full, f_only, pair_topology, p0).
 - **Hyperparameters:** spec §13.18 defaults × fixed Seed 0; no sweeps inside this
   screen.
 - **P4 exclusion:** no hard heuristic/feature negatives and no hard-negative
