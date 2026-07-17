@@ -41,6 +41,51 @@ from src.model.egostitch.stitch import sinkhorn_plan
 from src.model.egostitch.trunk import ConditionedPairCrossAttention
 
 
+def grounded_identity_match(
+    pointer_a: torch.Tensor,
+    gate_a: torch.Tensor,
+    ids_a: torch.Tensor,
+    pointer_b: torch.Tensor,
+    gate_b: torch.Tensor,
+    ids_b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Grounded-identity-match binary flags (spec Sec 13.18 pinned definition).
+
+    Slot `k` of endpoint a (resp. `k'` of endpoint b) is grounded-identity-
+    matched iff (1) its own gate exceeds 0.5, (2) its pointer argmax selects a
+    grounding-pool candidate with some global node id `c`, and (3) the OTHER
+    endpoint has at least one slot with gate > 0.5 whose pointer argmax
+    selects that same global id `c`. Symmetric across AB/BA by construction:
+    the underlying shared-candidate relation (matching global ids between a
+    gated slot on each side) is undirected.
+
+    Args:
+        pointer_a: Shape ``(B, K, n_g)`` side-a pointer softmax over its
+            grounding pool.
+        gate_a: Shape ``(B, K)`` side-a grounding-gate probabilities.
+        ids_a: Shape ``(B, n_g)`` int64 global node ids of side-a's grounding
+            pool candidates (indexed by `pointer_a`'s last dimension).
+        pointer_b: Shape ``(B, K, n_g)`` side-b pointer softmax.
+        gate_b: Shape ``(B, K)`` side-b grounding-gate probabilities.
+        ids_b: Shape ``(B, n_g)`` int64 global node ids of side-b's grounding
+            pool candidates.
+
+    Returns:
+        ``(matched_a, matched_b)``, each shape ``(B, K)`` binary floats in
+        ``{0.0, 1.0}``.
+    """
+    gated_a = gate_a > 0.5
+    gated_b = gate_b > 0.5
+    sel_id_a = torch.gather(ids_a, 1, pointer_a.argmax(dim=-1))
+    sel_id_b = torch.gather(ids_b, 1, pointer_b.argmax(dim=-1))
+    shared = sel_id_a[:, :, None] == sel_id_b[:, None, :]  # (B, K, K); [b, k, k']
+    other_gated_for_a = (shared & gated_b[:, None, :]).any(dim=-1)  # (B, K), indexed by k
+    other_gated_for_b = (shared & gated_a[:, :, None]).any(dim=1)  # (B, K), indexed by k'
+    matched_a = (gated_a & other_gated_for_a).float()
+    matched_b = (gated_b & other_gated_for_b).float()
+    return matched_a, matched_b
+
+
 class EgoStitchE2E(nn.Module):
     """The rev-3.0 end-to-end topology-conditioned pair encoder.
 
@@ -94,17 +139,19 @@ class EgoStitchE2E(nn.Module):
         )
 
     def _ground(self, x: torch.Tensor) -> torch.Tensor:
-        """Placeholder grounding-candidate pool for the generator.
+        """Degenerate fallback grounding-candidate pool for the generator.
 
         WARNING: every row of the returned pool is an identical copy of `x`,
         so every primary slot query in `ImagineDecoder._build_queries` is also
         identical (with spec defaults, slots=16 <= n_ground=20, this holds for
         ALL primary slots) -- `encode_nodes` therefore emits structurally
         collapsed, non-diverse slots per node, not merely reduced-fidelity
-        ones. Real grounding-candidate retrieval arrives with the Phase-4
-        worker integration (Task 13); until then, any full-pipeline output
-        has degenerate topology and must not be read as evidence of
-        meaningful topology generation.
+        ones. This path engages ONLY when the batch omits the ``ground_a``/
+        ``ground_b`` keys (e.g. the tiny unit fixtures in
+        ``tests/model/test_egostitch_e2e_model.py``). Every worker/scorer
+        entry point (``src.score_universe._score_egostitch_e2e``) always
+        supplies real grounding-pool candidates (spec Sec 13.12; tested), so
+        production full-pipeline output never takes this branch.
 
         Args:
             x: Shape ``(B, d)`` per-node features.
@@ -121,13 +168,23 @@ class EgoStitchE2E(nn.Module):
         """Build the topo (AB/BA) and content conditioning tokens.
 
         Args:
-            batch: Batch dict with ``x_a``/``x_b`` per-node feature tensors.
+            batch: Batch dict with ``x_a``/``x_b`` per-node feature tensors,
+                and optionally ``ground_a``/``ground_b`` (real grounding-pool
+                features, ``(B, n_g, d)``) and ``ground_id_a``/``ground_id_b``
+                (their global node ids, ``(B, n_g)`` int64). Missing feature
+                keys fall back to the degenerate `_ground` placeholder;
+                missing id keys fall back to zero matched flags (see
+                `_ground` and `grounded_identity_match`).
 
         Returns:
             ``(topo_ab, topo_ba, cont)`` conditioning token tensors.
         """
-        enc_a = self.generator.encode_nodes(batch["x_a"], self._ground(batch["x_a"]))
-        enc_b = self.generator.encode_nodes(batch["x_b"], self._ground(batch["x_b"]))
+        ground_a = batch.get("ground_a")
+        ground_b = batch.get("ground_b")
+        ground_x_a = ground_a if ground_a is not None else self._ground(batch["x_a"])
+        ground_x_b = ground_b if ground_b is not None else self._ground(batch["x_b"])
+        enc_a = self.generator.encode_nodes(batch["x_a"], ground_x_a)
+        enc_b = self.generator.encode_nodes(batch["x_b"], ground_x_b)
         slots_a, slots_b = enc_a.slots, enc_b.slots
         plan = sinkhorn_plan(
             slots_a.h,
@@ -143,10 +200,22 @@ class EgoStitchE2E(nn.Module):
         scaffold = build_scaffold(slots_a, slots_b, plan)
         topo_ab: torch.Tensor = self.ste(scaffold)
         topo_ba: torch.Tensor = self.ste(swap_direction(scaffold))
-        # Grounded-identity-match signal: wired to the pointer-match output
-        # in a later task; zeros are a neutral (AB/BA-symmetric) placeholder.
-        matched_a = torch.zeros_like(slots_a.pi)
-        matched_b = torch.zeros_like(slots_b.pi)
+        ground_id_a = batch.get("ground_id_a")
+        ground_id_b = batch.get("ground_id_b")
+        if ground_id_a is not None and ground_id_b is not None:
+            matched_a, matched_b = grounded_identity_match(
+                slots_a.pointer,
+                slots_a.gate,
+                ground_id_a,
+                slots_b.pointer,
+                slots_b.gate,
+                ground_id_b,
+            )
+        else:
+            # Neutral (AB/BA-symmetric) placeholder when ids are unavailable
+            # (mirrors the `_ground` degenerate path — tiny unit fixtures only).
+            matched_a = torch.zeros_like(slots_a.pi)
+            matched_b = torch.zeros_like(slots_b.pi)
         cont: torch.Tensor = self.content_proj(
             build_content_tokens(slots_a, slots_b, matched_a, matched_b)
         )

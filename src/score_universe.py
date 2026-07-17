@@ -1378,6 +1378,7 @@ def _score_egostitch_e2e(
     device: torch.device,
     token_budget: int,
     f0_cache: Path,
+    grounding_cache: Path | None = None,
 ) -> dict[str, NDArray[np.float32]]:
     """Score pairs with an `EgoStitchE2E` model's four-logit decomposition.
 
@@ -1391,6 +1392,17 @@ def _score_egostitch_e2e(
     (extended here as ``egostitch_e2e_pair_fp32_v1``) pins to fp32 — autocast
     is always disabled for this family, regardless of any future `--amp` wiring.
 
+    Each batch is assembled with real grounding-pool candidates (spec Sec
+    13.12), reusing the same `build_f0_matrix`/`build_grounding_pool` loader
+    the Stage-1 `_score_egostitch` path uses: ``ground_a``/``ground_b`` carry
+    the pool's F0 features and ``ground_id_a``/``ground_id_b`` carry the
+    pool's global node ids (matrix-row indices into the shared, run-scoped
+    `node_ids` vocabulary — consistent across both endpoints and batches, so
+    `EgoStitchE2E`'s grounded-identity-match flag can compare them for
+    equality). This always exercises the non-degenerate grounding path in
+    `EgoStitchE2E._context`; the placeholder `_ground`/zero-matched-flags path
+    is reserved for tiny unit fixtures that omit these batch keys.
+
     Args:
         model: Frozen `EgoStitchE2E`, on `device`, in `eval()` mode.
         pairs: Node-id pairs in input row order.
@@ -1399,12 +1411,15 @@ def _score_egostitch_e2e(
         token_budget: Approximate per-batch token budget for the bucketed sampler.
         f0_cache: F0 matrix cache path providing the mean-pooled `x_a`/`x_b`
             generator inputs (f0_mlp/egostitch semantics).
+        grounding_cache: Grounding-pool cache path (derived from `f0_cache`
+            when ``None``, mirroring `_score_egostitch`).
 
     Returns:
         Dict with keys ``full``, ``f_logit``, ``pair_content``, and
         ``pair_topology``, each a shape ``(len(pairs),)`` float32 array in
         input row order.
     """
+    from src.data.grounding import build_grounding_pool
     from src.model.egostitch.e2e_model import EgoStitchE2E
 
     assert isinstance(model, EgoStitchE2E)
@@ -1425,6 +1440,25 @@ def _score_egostitch_e2e(
         )
         matrix, index = build_f0_matrix(store, node_ids, cache_path=None)
 
+    if grounding_cache is None:
+        grounding_cache = f0_cache.with_name(f"{f0_cache.stem}_grounding.npz")
+    # The e2e generator's own-split n_ground default (spec Sec 13) assumes a
+    # real candidate-universe scale (thousands of nodes); clamp to what this
+    # call's node set can actually support so tiny fixtures (few endpoints)
+    # remain valid `build_grounding_pool` calls without changing production
+    # behavior, where len(node_ids) - 1 always exceeds the spec default.
+    n_ground = min(model.generator_cfg.n_ground, len(node_ids) - 1)
+    pool = build_grounding_pool(
+        np.asarray(matrix.numpy(), dtype=np.float32),
+        node_ids,
+        n_ground=n_ground,
+        cache_path=grounding_cache,
+    )
+    pool_rows = torch.tensor(
+        [[index[neighbor] for neighbor in pool[node]] for node in node_ids],
+        dtype=torch.int64,
+    )
+
     out: dict[str, NDArray[np.float32]] = {
         key: np.empty(len(pairs), dtype=np.float32) for key in _EGOSTITCH_E2E_ARRAY_KEYS
     }
@@ -1436,6 +1470,10 @@ def _score_egostitch_e2e(
         v_rows = torch.tensor([index[pairs[i][1]] for i in batch_indices], dtype=torch.int64)
         batch["x_a"] = matrix.index_select(0, u_rows).to(device)
         batch["x_b"] = matrix.index_select(0, v_rows).to(device)
+        batch["ground_a"] = matrix[pool_rows[u_rows]].to(device)
+        batch["ground_b"] = matrix[pool_rows[v_rows]].to(device)
+        batch["ground_id_a"] = pool_rows[u_rows].to(device)
+        batch["ground_id_b"] = pool_rows[v_rows].to(device)
         # The full decompose call is the pair pass (see docstring above): it
         # always runs fp32, regardless of any autocast the caller might be
         # under (spec Sec 13.16 extension).
@@ -1708,6 +1746,7 @@ def _run_score(args: argparse.Namespace) -> None:
             device=device,
             token_budget=args.token_budget,
             f0_cache=args.f0_cache,
+            grounding_cache=args.grounding_cache,
         )
         logits = decomposed["full"]
         f_logit = decomposed["f_logit"]

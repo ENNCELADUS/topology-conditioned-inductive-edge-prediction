@@ -1240,3 +1240,53 @@ def test_validate_score_precision_old_idiom_on_e2e_artifact_points_to_new_entry_
         score_universe.validate_score_precision(
             artifact.logit, meta=artifact.meta, label=str(output)
         )
+
+
+# --------------------------------------------------------------------------- Task 13b:
+# grounded-identity-match real grounding wiring in the e2e scorer
+
+
+def test_egostitch_e2e_scorer_supplies_grounding_batch_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_score_egostitch_e2e` assembles real grounding-pool batch keys per pair.
+
+    Spies on `EgoStitchE2E.decompose` to capture the batch dict actually
+    passed to it (rather than re-deriving grounding pools independently),
+    asserting the non-degenerate ``ground_a``/``ground_b``/``ground_id_a``/
+    ``ground_id_b`` keys are present with the expected shapes/dtypes for
+    every scored batch — i.e. the scorer always exercises `EgoStitchE2E`'s
+    real-grounding path and never falls through to its placeholder `_ground`.
+    """
+    from src.model.egostitch.config import EgoStitchConfig
+    from src.model.egostitch.e2e_model import EgoStitchE2E
+
+    data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
+    output = tmp_path / "scores.npz"
+
+    captured_batches: list[dict[str, torch.Tensor]] = []
+    original_decompose = EgoStitchE2E.decompose
+
+    def _spy_decompose(
+        self: EgoStitchE2E, batch: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        captured_batches.append(batch)
+        return original_decompose(self, batch)
+
+    monkeypatch.setattr(EgoStitchE2E, "decompose", _spy_decompose)
+
+    score_universe.main(_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, output))
+
+    assert captured_batches, "decompose was never called"
+    node_universe = len({node for pair in _E2E_PAIRS for node in pair})
+    expected_n_ground = min(EgoStitchConfig().n_ground, node_universe - 1)
+    for batch in captured_batches:
+        for key in ("ground_a", "ground_b", "ground_id_a", "ground_id_b"):
+            assert key in batch, f"missing grounding key {key!r}"
+        rows = batch["x_a"].shape[0]
+        assert batch["ground_a"].shape == (rows, expected_n_ground, _E2E_NODE_DIM)
+        assert batch["ground_b"].shape == (rows, expected_n_ground, _E2E_NODE_DIM)
+        assert batch["ground_id_a"].shape == (rows, expected_n_ground)
+        assert batch["ground_id_b"].shape == (rows, expected_n_ground)
+        assert batch["ground_id_a"].dtype == torch.int64
+        assert batch["ground_id_b"].dtype == torch.int64

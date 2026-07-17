@@ -620,6 +620,14 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   stable-hash `shuffle_within_pair` scaffold control, and machine-enforced
   registration-status rules. Satisfies §14.3(2); the formal e2e run remains gated
   on a BINDING registration (§14.3(3–5)).
+- 2026-07-17: pinned the §13.18/§14.1 grounded-identity-match flag to a
+  three-clause definition (own gate `> 0.5`; pointer-argmax global-node-id
+  equality across endpoints; own-split grounding pools only, no Hungarian/
+  target-graph access) and superseded the implementation plan's
+  Hungarian/`L_gate`-matching phrasing for this label: that quantity is
+  train-time-only (node-stream batches with real ego-net targets) and
+  undefined for edge-stream endpoints and unseen nodes at inference, so
+  wiring it there would violate the inductive protocol.
 
 **Closed gate-report deliverable (2026-07-17):** the frozen-s0 Stage-1 gate report,
 fidelity diagnostics, and measured FLOPs/latency report are complete. The binding
@@ -956,6 +964,27 @@ held-out artifacts. The G5 gate requires `status: BINDING` and a registration
 sha256 that matches the `preregistration_sha256` of **every** consumed formal run
 metadata. Amending a BINDING registration requires a new versioned registration
 file (predecessor convention).
+
+**Grounded-identity-match flag (e2e content tokens, pinned 2026-07-17):** for a
+pair `(i, j)`, slot `k` of endpoint `u ∈ {i, j}` is grounded-identity-matched
+**iff** (1) `gate_u^k > 0.5` (the slot is grounded — the same 0.5 threshold §4's
+grounded-slot re-mask rule uses); AND (2) `argmax` of slot `k`'s grounding
+pointer selects a grounding-pool candidate with global node id `c`; AND (3) the
+**other** endpoint has at least one slot `k'` with `gate > 0.5` whose pointer
+argmax selects the **same** global node id `c`. The flag is a binary float
+`{0.0, 1.0}` per slot, shape `(B, K)` per side — the `matched_src`/`matched_dst`
+inputs to `build_content_tokens` (§14.1 `c_cont`). It is symmetric across AB/BA
+by construction (the shared-candidate relation is undirected), computable at
+inference for any node (grounding pools are drawn from the own-split-side F0
+space, §13.12 — no target-graph access, no labels), and is classic
+shared-neighbor **content** evidence (§14.1). Superseded: the implementation
+plan's phrasing wiring this label to "the pointer argmax landing on a
+grounding candidate that Hungarian-matched the same target — reuse the
+matching output already computed for `L_gate`" is an authoring error.
+Hungarian assignments exist only for node-stream training batches with real
+ego-net targets; they are undefined for edge-stream endpoints and for unseen
+nodes at inference, so wiring them at inference would violate the inductive
+protocol (CLAUDE.md Integrity gates).
 
 ## 14. Approved successor headline: E2E stitched-topology-conditioned pair encoder (2026-07-16)
 
