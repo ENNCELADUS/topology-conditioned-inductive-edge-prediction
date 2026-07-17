@@ -244,8 +244,10 @@ class TestE2EProbeArtifact:
                     "status": "DRAFT",
                     "probe_artifact": {
                         "format": "egostitch_e2e_probe_v1",
+                        "source_arm": "full",
                         "expected_path": str(tmp_path / "probe.npz"),
                     },
+                    "arms": {"full": {"training": str(tmp_path / "full.yaml")}},
                 }
             ),
             encoding="utf-8",
@@ -272,8 +274,10 @@ class TestE2EProbeArtifact:
                     "status": "BINDING",
                     "probe_artifact": {
                         "format": "egostitch_e2e_probe_v1",
+                        "source_arm": "full",
                         "expected_path": str(output),
                     },
+                    "arms": {"full": {"training": str(tmp_path / "full.yaml")}},
                 }
             ),
             encoding="utf-8",
@@ -294,6 +298,52 @@ class TestE2EProbeArtifact:
         )
 
         with pytest.raises(ValueError, match="completed formal full arm"):
+            probes.produce_e2e_probe_artifact(
+                checkpoint_path=tmp_path / "best.pt",
+                run_metadata_path=metadata,
+                preregistration_path=registration,
+                data_root=tmp_path / "data",
+                strategy="breadth_first",
+                output_path=output,
+            )
+
+    def test_producer_rejects_completed_p0_source(self, tmp_path: Path) -> None:
+        output = tmp_path / "probe.npz"
+        full_config = tmp_path / "full.yaml"
+        registration = tmp_path / "registration.json"
+        registration.write_text(
+            json.dumps(
+                {
+                    "status": "BINDING",
+                    "probe_artifact": {
+                        "format": "egostitch_e2e_probe_v1",
+                        "source_arm": "full",
+                        "expected_path": str(output),
+                    },
+                    "arms": {"full": {"training": str(full_config)}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        registration_sha = hashlib.sha256(registration.read_bytes()).hexdigest()
+        metadata = tmp_path / "run_metadata.json"
+        metadata.write_text(
+            json.dumps(
+                {
+                    "preregistration_sha256": registration_sha,
+                    "run_kind": "formal",
+                    "status": "complete",
+                    "formal_artifacts_published": True,
+                    "permanent_null": "none",
+                    "seed": 0,
+                    "partition_seed": 0,
+                    "config_path": str(tmp_path / "p0.yaml"),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="registered full-arm config path"):
             probes.produce_e2e_probe_artifact(
                 checkpoint_path=tmp_path / "best.pt",
                 run_metadata_path=metadata,

@@ -20,7 +20,8 @@ from src import score_universe
 from src.data import packed_features
 from src.data.artifacts import canonical_pair
 from src.data.distributed_pairs import CompactPairBatch
-from src.data.features import FeatureStore
+from src.data.features import FeatureStore, build_f0_matrix
+from src.data.grounding import build_grounding_pool
 from src.data.packed_features import PackedFeatureTable, build_packed_features
 from src.model.B0 import V3_1
 from src.model.egostitch.conditioning import GatedCrossAttention
@@ -1022,7 +1023,7 @@ _TINY_E2E_CONFIG: dict[str, object] = {
 # feature store backing these tests must use that exact node-token dimension.
 _E2E_NODE_DIM = 1536
 _E2E_NODES = [f"n{i}" for i in range(4)]
-# Includes repeated endpoints and a self pair to exercise the single-ego path.
+# Repeated endpoints exercise cache reuse; dedicated tests add self-pair rows.
 _E2E_PAIRS = [("n0", "n1"), ("n1", "n2"), ("n0", "n2")]
 
 
@@ -1374,6 +1375,80 @@ def test_egostitch_e2e_scoring_caches_unique_nodes_and_reuses_pair_context(
     assert encoded_rows == len({node for pair in many_pairs for node in pair})
     assert 0 < context_calls < len(many_pairs)
     assert head_calls == 4 * context_calls
+
+
+def test_egostitch_e2e_cached_scoring_matches_uncached_decomposition(tmp_path: Path) -> None:
+    """CPU cache/crop/repad scoring matches a direct production decomposition."""
+    data_root, checkpoint, _ = _egostitch_e2e_setup(tmp_path)
+    _enable_e2e_conditioning_gates(checkpoint)
+    pairs = [("n0", "n3"), ("n3", "n3"), ("n1", "n2"), ("n0", "n0")]
+    pairs_path = tmp_path / "mixed-self.tsv"
+    pairs_path.write_text("".join(f"{u}\t{v}\n" for u, v in pairs))
+    output = tmp_path / "cached-equivalence.npz"
+    score_universe.main(
+        _egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs_path, output)
+    )
+    cached = score_universe.load_scores(output)
+
+    payload = cast(dict[str, object], torch.load(checkpoint, map_location="cpu"))
+    model = score_universe.build_model(
+        "egostitch_e2e", cast(dict[str, object], payload["model_config"])
+    )
+    assert isinstance(model, EgoStitchE2E)
+    model.load_state_dict(cast(dict[str, torch.Tensor], payload["model_state"]))
+    model.eval()
+    store = FeatureStore(data_root / "features" / "frozen_node_features_1024")
+    node_ids = sorted({node for pair in pairs for node in pair})
+    matrix, index = build_f0_matrix(store, node_ids, cache_path=None)
+    n_ground = min(model.generator_cfg.n_ground, len(node_ids) - 1)
+    grounding = build_grounding_pool(
+        np.asarray(matrix.numpy(), dtype=np.float32),
+        node_ids,
+        n_ground=n_ground,
+        cache_path=tmp_path / "direct-grounding.npz",
+    )
+    pool_rows = torch.tensor(
+        [[index[neighbor] for neighbor in grounding[node]] for node in node_ids],
+        dtype=torch.long,
+    )
+    rows_a = torch.tensor([index[u] for u, _ in pairs], dtype=torch.long)
+    rows_b = torch.tensor([index[v] for _, v in pairs], dtype=torch.long)
+    tokens_a = [store.load_tokens(u) for u, _ in pairs]
+    tokens_b = [store.load_tokens(v) for _, v in pairs]
+    batch = {
+        "emb_a": torch.nn.utils.rnn.pad_sequence(tokens_a, batch_first=True),
+        "emb_b": torch.nn.utils.rnn.pad_sequence(tokens_b, batch_first=True),
+        "len_a": torch.tensor([len(tokens) for tokens in tokens_a], dtype=torch.long),
+        "len_b": torch.tensor([len(tokens) for tokens in tokens_b], dtype=torch.long),
+        "x_a": matrix.index_select(0, rows_a),
+        "x_b": matrix.index_select(0, rows_b),
+        "ground_a": matrix[pool_rows[rows_a]],
+        "ground_b": matrix[pool_rows[rows_b]],
+        "ground_id_a": pool_rows[rows_a],
+        "ground_id_b": pool_rows[rows_b],
+        "is_self": torch.tensor([u == v for u, v in pairs], dtype=torch.bool),
+    }
+    with torch.inference_mode(), torch.autocast(device_type="cpu", enabled=False):
+        direct = model.decompose(batch)
+
+    assert cached.f_logit is not None
+    assert cached.pair_content is not None
+    assert cached.pair_topology is not None
+    cached_arrays = {
+        "full": cached.logit,
+        "f_logit": cached.f_logit,
+        "pair_content": cached.pair_content,
+        "pair_topology": cached.pair_topology,
+    }
+    assert not np.array_equal(cached_arrays["full"], cached_arrays["f_logit"])
+    for name, expected in direct.items():
+        actual = cached_arrays[name]
+        np.testing.assert_allclose(
+            actual,
+            expected.detach().float().numpy(),
+            rtol=1e-5,
+            atol=2e-6,
+        )
 
 
 def test_merge_rejects_conflicting_scaffold_control_provenance(tmp_path: Path) -> None:

@@ -444,6 +444,17 @@ def produce_e2e_probe_artifact(
         raise ValueError("E2E probe producer requires a BINDING preregistration")
     if probe_registration is None or probe_registration.get("format") != _E2E_PROBE_FORMAT:
         raise ValueError("preregistration does not bind the E2E probe artifact format")
+    if probe_registration.get("source_arm") != "full":
+        raise ValueError("preregistration does not bind the E2E probe source to the full arm")
+    arms = registration_payload.get("arms")
+    if not isinstance(arms, Mapping):
+        raise ValueError("preregistration does not define formal arms")
+    full_arm = arms.get("full")
+    if not isinstance(full_arm, Mapping) or not isinstance(full_arm.get("training"), str):
+        raise ValueError("preregistration does not bind arms.full.training")
+    registered_config = Path(cast(str, full_arm["training"]))
+    if not registered_config.is_absolute():
+        registered_config = preregistration_path.resolve().parents[2] / registered_config
     expected_output = Path(str(probe_registration.get("expected_path")))
     if not expected_output.is_absolute():
         expected_output = preregistration_path.resolve().parents[2] / expected_output
@@ -463,9 +474,20 @@ def produce_e2e_probe_artifact(
     if run_metadata.get("seed") != 0 or run_metadata.get("partition_seed") != 0:
         raise ValueError("E2E probe producer requires Seed 0 and partition Seed 0")
     config_path = Path(str(run_metadata.get("config_path")))
+    if config_path.resolve() != registered_config.resolve():
+        raise ValueError("E2E probe producer requires the registered full-arm config path")
     cfg = te.load_config(config_path)
     if cfg.model.family != "egostitch_e2e":
         raise ValueError("E2E probe producer requires model family egostitch_e2e")
+    formal_model_cfg = E2EConfig.from_mapping(cfg.model.config)
+    if (
+        formal_model_cfg.permanent_null != "none"
+        or formal_model_cfg.p_topo != 0.15
+        or formal_model_cfg.p_cont != 0.15
+    ):
+        raise ValueError(
+            "E2E probe producer requires full-arm permanent_null=none and p_topo=p_cont=0.15"
+        )
     if cfg.data.root.resolve() != data_root.resolve() or cfg.data.strategy != strategy:
         raise ValueError("probe CLI data root/strategy do not match the formal config")
     config_hash = te._config_hash(cfg)

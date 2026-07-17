@@ -644,6 +644,9 @@ class PreregistrationNotBinding(RuntimeError):
     """Raised when a formal worker run is not backed by a BINDING registration."""
 
 
+_REQUIRED_BEFORE_BINDING = "REQUIRED-BEFORE-BINDING"
+
+
 @dataclass(frozen=True)
 class PreregistrationSnapshot:
     """One immutable registration payload and its digest."""
@@ -677,10 +680,16 @@ def prepare_ddp_run_config(
     snapshot = _preregistration_snapshot(cfg.preregistration)
     status = snapshot.payload.get("status")
     if max_steps is None:
-        if cfg.model.family == _EGOSTITCH_E2E_FAMILY and status != "BINDING":
-            raise PreregistrationNotBinding(
-                "formal egostitch_e2e runs require preregistration status == 'BINDING'"
-            )
+        if cfg.model.family == _EGOSTITCH_E2E_FAMILY:
+            if status != "BINDING":
+                raise PreregistrationNotBinding(
+                    "formal egostitch_e2e runs require preregistration status == 'BINDING'"
+                )
+            if _REQUIRED_BEFORE_BINDING in json.dumps(snapshot.payload, sort_keys=True):
+                raise PreregistrationNotBinding(
+                    "formal egostitch_e2e runs require every "
+                    "REQUIRED-BEFORE-BINDING marker to be resolved"
+                )
         return cfg, False, snapshot
     if max_steps <= 0:
         raise ValueError("--max-steps must be positive")

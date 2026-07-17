@@ -390,6 +390,38 @@ class TestRegistrationRunMode:
         with pytest.raises(te.PreregistrationNotBinding, match="status == 'BINDING'"):
             te.prepare_ddp_run_config(e2e_cfg, max_steps=None)
 
+    def test_formal_e2e_worker_refuses_unresolved_binding_marker(self, tmp_path: Path) -> None:
+        cfg = _toy_cfg(tmp_path)
+        cfg.preregistration.write_text(
+            json.dumps(
+                {
+                    "status": "BINDING",
+                    "frozen_inputs": {"b0cal_results": {"sha256": "REQUIRED-BEFORE-BINDING"}},
+                }
+            )
+        )
+        e2e_cfg = replace(cfg, model=replace(cfg.model, family="egostitch_e2e"))
+
+        with pytest.raises(te.PreregistrationNotBinding, match="marker to be resolved"):
+            te.prepare_ddp_run_config(e2e_cfg, max_steps=None)
+
+    def test_formal_e2e_worker_accepts_resolved_binding_registration(self, tmp_path: Path) -> None:
+        cfg = _toy_cfg(tmp_path)
+        cfg.preregistration.write_text(
+            json.dumps(
+                {
+                    "status": "BINDING",
+                    "frozen_inputs": {"b0cal_results": {"sha256": "a" * 64}},
+                    "cost_report": {"measured": {"profile_sha256": "b" * 64}},
+                }
+            )
+        )
+        e2e_cfg = replace(cfg, model=replace(cfg.model, family="egostitch_e2e"))
+
+        prepared, is_debug, _ = te.prepare_ddp_run_config(e2e_cfg, max_steps=None)
+        assert prepared == e2e_cfg
+        assert is_debug is False
+
     def test_debug_worker_redirects_and_marks_nonformal(self, tmp_path: Path) -> None:
         cfg = _toy_cfg(tmp_path)
 
