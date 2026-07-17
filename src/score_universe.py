@@ -72,6 +72,7 @@ from src.data.pairs import (
     probe_lengths,
 )
 from src.model.B0 import V3_1
+from src.model.egostitch.scaffold import ScaffoldTokens
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,45 @@ _NAMED_PAIR_SOURCES = ("candidate", "test", "val")
 _EGOSTITCH_PAIR_PRECISION_CONTRACT = "egostitch_pair_fp32_v1"
 _EGOSTITCH_E2E_PAIR_PRECISION_CONTRACT = "egostitch_e2e_pair_fp32_v1"
 _EGOSTITCH_E2E_ARRAY_KEYS = ("full", "f_logit", "pair_content", "pair_topology")
+_SCAFFOLD_CONTROL_NONE = "none"
+_SCAFFOLD_CONTROL_SHUFFLE = "shuffle_within_pair"
+_SCAFFOLD_CONTROL_SEED = 0
+
+
+def _stable_slot_permutation(node_u: str, node_v: str, side: str, slots: int) -> torch.Tensor:
+    """Return the canonical-pair-keyed CPU slot permutation for one endpoint side."""
+    src, dst = sorted((node_u, node_v))
+    digest = hashlib.blake2b(f"{src}|{dst}|{side}|{_SCAFFOLD_CONTROL_SEED}".encode()).digest()
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int.from_bytes(digest[:8], byteorder="little", signed=False))
+    return torch.randperm(slots, generator=generator)
+
+
+def _shuffle_scaffold_within_pair(
+    scaffold: ScaffoldTokens, pairs: Sequence[tuple[str, str]]
+) -> ScaffoldTokens:
+    """Permute only scaffold adjacency slot axes with canonical-pair stable hashes."""
+    batch_size, _edge_types, vertices, _ = scaffold.adj.shape
+    if batch_size != len(pairs):
+        raise ValueError("scaffold-control pair count must equal the scaffold batch size")
+    slots = (vertices - 2) // 2
+    adj = scaffold.adj.clone()
+    for row, (node_u, node_v) in enumerate(pairs):
+        perm_src = _stable_slot_permutation(node_u, node_v, "src", slots)
+        perm_dst = _stable_slot_permutation(node_u, node_v, "dst", slots)
+        # `src`/`dst` in the stable-hash key are canonical endpoint labels;
+        # map them back to this forward pass's local a/b ordering so AB and BA
+        # receive the same endpoint-specific permutations.
+        perm_a, perm_b = (perm_src, perm_dst) if node_u <= node_v else (perm_dst, perm_src)
+        node_order = torch.cat(
+            (
+                torch.arange(2, dtype=torch.long),
+                2 + perm_a,
+                2 + slots + perm_b,
+            )
+        ).to(scaffold.adj.device)
+        adj[row] = scaffold.adj[row].index_select(1, node_order).index_select(2, node_order)
+    return ScaffoldTokens(feats=scaffold.feats, adj=adj)
 
 
 # ---------------------------------------------------------------------------
@@ -1379,6 +1419,8 @@ def _score_egostitch_e2e(
     token_budget: int,
     f0_cache: Path,
     grounding_cache: Path | None = None,
+    scaffold_control: str = _SCAFFOLD_CONTROL_NONE,
+    universe_pairs: Sequence[tuple[str, str]] | None = None,
 ) -> dict[str, NDArray[np.float32]]:
     """Score pairs with an `EgoStitchE2E` model's four-logit decomposition.
 
@@ -1413,6 +1455,9 @@ def _score_egostitch_e2e(
             generator inputs (f0_mlp/egostitch semantics).
         grounding_cache: Grounding-pool cache path (derived from `f0_cache`
             when ``None``, mirroring `_score_egostitch`).
+        scaffold_control: Optional registered within-pair scaffold perturbation.
+        universe_pairs: Full input universe used to keep grounding pools stable
+            when this scorer receives a contiguous shard.
 
     Returns:
         Dict with keys ``full``, ``f_logit``, ``pair_content``, and
@@ -1423,11 +1468,16 @@ def _score_egostitch_e2e(
     from src.model.egostitch.e2e_model import EgoStitchE2E
 
     assert isinstance(model, EgoStitchE2E)
+    if scaffold_control not in (_SCAFFOLD_CONTROL_NONE, _SCAFFOLD_CONTROL_SHUFFLE):
+        raise ValueError(f"unknown scaffold control: {scaffold_control!r}")
     lengths = probe_lengths(store, pairs)
     dataset = TokenPairDataset(pairs, None, store, lengths=lengths)
     sampler = LengthBucketedBatchSampler(lengths, token_budget=token_budget, shuffle=False)
 
-    node_ids = sorted({node_id for pair in pairs for node_id in pair})
+    # Grounding candidates must come from the full scored universe, not this
+    # process's shard, so control (and ordinary e2e) logits are shard-invariant.
+    node_universe = universe_pairs if universe_pairs is not None else pairs
+    node_ids = sorted({node_id for pair in node_universe for node_id in pair})
     try:
         f0_cache.parent.mkdir(parents=True, exist_ok=True)
         matrix, index = build_f0_matrix(
@@ -1474,27 +1524,54 @@ def _score_egostitch_e2e(
         key: np.empty(len(pairs), dtype=np.float32) for key in _EGOSTITCH_E2E_ARRAY_KEYS
     }
     processed = 0
-    for batch_indices in sampler:
-        batch = collate_token_pairs([dataset[i] for i in batch_indices])
-        batch = {key: tensor.to(device) for key, tensor in batch.items()}
-        u_rows = torch.tensor([index[pairs[i][0]] for i in batch_indices], dtype=torch.int64)
-        v_rows = torch.tensor([index[pairs[i][1]] for i in batch_indices], dtype=torch.int64)
-        batch["x_a"] = matrix.index_select(0, u_rows).to(device)
-        batch["x_b"] = matrix.index_select(0, v_rows).to(device)
-        batch["ground_a"] = matrix[pool_rows[u_rows]].to(device)
-        batch["ground_b"] = matrix[pool_rows[v_rows]].to(device)
-        batch["ground_id_a"] = pool_rows[u_rows].to(device)
-        batch["ground_id_b"] = pool_rows[v_rows].to(device)
-        # The full decompose call is the pair pass (see docstring above): it
-        # always runs fp32, regardless of any autocast the caller might be
-        # under (spec Sec 13.16 extension).
-        with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=False):
-            decomposed = model.decompose(batch)
-        rows = np.asarray(batch_indices, dtype=np.int64)
-        for key in _EGOSTITCH_E2E_ARRAY_KEYS:
-            out[key][rows] = decomposed[key].detach().to(torch.float32).cpu().numpy().reshape(-1)
-        processed += len(batch_indices)
-        _log_progress(processed, len(pairs), len(batch_indices))
+    for sampled_indices in sampler:
+        # The registered control is deliberately scored one pair at a time:
+        # fused kernels can otherwise make a last-bit batch-shape difference,
+        # violating its batching/sharding-invariance contract.
+        batches = (
+            ([row] for row in sampled_indices)
+            if scaffold_control == _SCAFFOLD_CONTROL_SHUFFLE
+            else (sampled_indices,)
+        )
+        for batch_indices in batches:
+            batch = collate_token_pairs([dataset[i] for i in batch_indices])
+            batch = {key: tensor.to(device) for key, tensor in batch.items()}
+            u_rows = torch.tensor([index[pairs[i][0]] for i in batch_indices], dtype=torch.int64)
+            v_rows = torch.tensor([index[pairs[i][1]] for i in batch_indices], dtype=torch.int64)
+            batch["x_a"] = matrix.index_select(0, u_rows).to(device)
+            batch["x_b"] = matrix.index_select(0, v_rows).to(device)
+            batch["ground_a"] = matrix[pool_rows[u_rows]].to(device)
+            batch["ground_b"] = matrix[pool_rows[v_rows]].to(device)
+            batch["ground_id_a"] = pool_rows[u_rows].to(device)
+            batch["ground_id_b"] = pool_rows[v_rows].to(device)
+            # The full decompose call is the pair pass (see docstring above): it
+            # always runs fp32, regardless of any autocast the caller might be
+            # under (spec Sec 13.16 extension).
+            hook: torch.utils.hooks.RemovableHandle | None = None
+            if scaffold_control == _SCAFFOLD_CONTROL_SHUFFLE:
+                batch_pairs = [pairs[row] for row in batch_indices]
+
+                def _shuffle_before_ste(
+                    _module: nn.Module,
+                    inputs: tuple[ScaffoldTokens, ...],
+                    controlled_pairs: Sequence[tuple[str, str]] = batch_pairs,
+                ) -> tuple[ScaffoldTokens, ...]:
+                    return (_shuffle_scaffold_within_pair(inputs[0], controlled_pairs),)
+
+                hook = model.ste.register_forward_pre_hook(_shuffle_before_ste)
+            try:
+                with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=False):
+                    decomposed = model.decompose(batch)
+            finally:
+                if hook is not None:
+                    hook.remove()
+            rows = np.asarray(batch_indices, dtype=np.int64)
+            for key in _EGOSTITCH_E2E_ARRAY_KEYS:
+                out[key][rows] = (
+                    decomposed[key].detach().to(torch.float32).cpu().numpy().reshape(-1)
+                )
+            processed += len(batch_indices)
+            _log_progress(processed, len(pairs), len(batch_indices))
     return out
 
 
@@ -1589,6 +1666,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="grounding-pool cache path (egostitch only; built when absent)",
     )
+    score.add_argument(
+        "--scaffold-control",
+        choices=[_SCAFFOLD_CONTROL_NONE, _SCAFFOLD_CONTROL_SHUFFLE],
+        default=_SCAFFOLD_CONTROL_NONE,
+        help="egostitch_e2e scoring-time scaffold control",
+    )
     score.add_argument("--shard", type=int, default=None, help="shard index K (with --num-shards)")
     score.add_argument("--num-shards", type=int, default=None, help="total shard count N")
     score.add_argument(
@@ -1643,6 +1726,8 @@ def _run_score(args: argparse.Namespace) -> None:
         model_family=args.model_family,
         model_config=model_config,
     )
+    if args.scaffold_control != _SCAFFOLD_CONTROL_NONE and model_family != "egostitch_e2e":
+        raise ValueError("--scaffold-control is supported only for model_family 'egostitch_e2e'")
     model.to(device)
 
     pairs, labels = _resolve_pairs(args.pairs, args.data_root, args.strategy)
@@ -1758,6 +1843,8 @@ def _run_score(args: argparse.Namespace) -> None:
             token_budget=args.token_budget,
             f0_cache=args.f0_cache,
             grounding_cache=args.grounding_cache,
+            scaffold_control=args.scaffold_control,
+            universe_pairs=pairs,
         )
         logits = decomposed["full"]
         f_logit = decomposed["f_logit"]
@@ -1769,6 +1856,11 @@ def _run_score(args: argparse.Namespace) -> None:
                 "pair_compute_dtype": "float32",
                 "pair_autocast": False,
                 "logit_storage_dtype": "float32",
+            },
+            "scaffold_control": {
+                "mode": args.scaffold_control,
+                "seed": _SCAFFOLD_CONTROL_SEED,
+                "keying": "canonical_pair_v1",
             },
         }
     else:  # pragma: no cover - build_model already rejects unknown families

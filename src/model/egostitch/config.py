@@ -179,6 +179,7 @@ class E2EConfig:
     xattn_heads: int = 8
     p_topo: float = 0.15
     p_cont: float = 0.15
+    permanent_null: str = "none"
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants.
@@ -208,6 +209,11 @@ class E2EConfig:
             value = float(getattr(self, name))
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1], got {value}")
+        if self.permanent_null not in ("none", "all_head", "content_head"):
+            raise ValueError(
+                "permanent_null must be one of 'none', 'all_head', or 'content_head', "
+                f"got {self.permanent_null!r}"
+            )
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object]) -> E2EConfig:
@@ -232,7 +238,11 @@ class E2EConfig:
             if f.name not in mapping:
                 continue
             raw = mapping[f.name]
-            if f.type in ("int",):
+            if f.name == "permanent_null":
+                if not isinstance(raw, str):
+                    raise ValueError(f"{f.name} must be a string, got {raw!r}")
+                kwargs[f.name] = raw
+            elif f.type in ("int",):
                 if isinstance(raw, bool) or not isinstance(raw, int):
                     raise ValueError(f"{f.name} must be an int, got {raw!r}")
                 kwargs[f.name] = int(raw)

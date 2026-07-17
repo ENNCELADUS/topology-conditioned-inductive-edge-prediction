@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -29,7 +30,7 @@ from src.data.packed_features import (
 from src.data.pairs import NegativeSampler
 from src.e2_pipeline import _validate_worker_profile
 from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
-from src.model.egostitch.conditioning import GatedCrossAttention
+from src.model.egostitch.conditioning import GatedCrossAttention, HeadNullMasks
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.e2e_model import EgoStitchE2E
 from src.train_b0 import ModelConfig
@@ -237,6 +238,12 @@ class TestLoadConfig:
         path.write_text(yaml.safe_dump(mapping))
         with pytest.raises(ValueError, match="unknown E2E config keys"):
             te.load_config(path)
+
+    def test_e2e_permanent_null_accepts_only_registered_values(self) -> None:
+        for value in ("none", "all_head", "content_head"):
+            assert E2EConfig.from_mapping({"permanent_null": value}).permanent_null == value
+        with pytest.raises(ValueError, match="permanent_null"):
+            E2EConfig.from_mapping({"permanent_null": "topo_head"})
 
 
 class TestParseArgs:
@@ -817,6 +824,39 @@ class TestCompositeStepE2E:
         assert cont_gate.gate.grad is not None
         total_abs_grad = float(topo_gate.gate.grad.abs()) + float(cont_gate.gate.grad.abs())
         assert total_abs_grad > 0.0
+
+    def test_permanent_null_matches_eval_bypass(self, tmp_path: Path) -> None:
+        """The training mask is exactly the corresponding hard eval bypass."""
+        batch, model = self._batch_and_model(tmp_path)
+        model.eval()
+        batch.edge["emb_a"] = batch.edge["emb_a"].float()
+        batch.edge["emb_b"] = batch.edge["emb_b"].float()
+        edge_view = te._e2e_edge_view(batch.edge)
+        for null, key in (("all_head", "f_logit"), ("content_head", "pair_topology")):
+            model.cfg = replace(model.cfg, permanent_null=null)
+            expected = model.decompose(edge_view)[key]
+            seen: list[torch.Tensor] = []
+            original = model.forward
+
+            def _capture(
+                payload: dict[str, torch.Tensor],
+                *,
+                masks: HeadNullMasks | None = None,
+                _original: Callable[..., dict[str, torch.Tensor]] = original,
+                _seen: list[torch.Tensor] = seen,
+            ) -> dict[str, torch.Tensor]:
+                output = _original(payload, masks=masks)
+                _seen.append(output["logits"])
+                return output
+
+            monkeypatch = pytest.MonkeyPatch()
+            monkeypatch.setattr(model, "forward", _capture)
+            try:
+                te._CompositeStep(model, world_size=1)(self._payload(batch, joint_weight=1.0))
+            finally:
+                monkeypatch.undo()
+            assert len(seen) == 1
+            torch.testing.assert_close(seen[0], expected)
 
     def test_telemetry_keys_present_in_metrics_row(self, tmp_path: Path) -> None:
         torch.manual_seed(0)

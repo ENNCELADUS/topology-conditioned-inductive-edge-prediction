@@ -59,7 +59,11 @@ from src.data.partition import build_g_struct, derive_partition
 from src.e2_pipeline import ProbeResult, detect_visible_gpu_count
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
-from src.model.egostitch.conditioning import GatedCrossAttention, sample_branch_masks
+from src.model.egostitch.conditioning import (
+    GatedCrossAttention,
+    masks_for_null,
+    sample_branch_masks,
+)
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.e2e_model import EgoStitchE2E
 from src.model.egostitch.imagine import NULL_MODE_ALL, NULL_MODE_CONTENT, NULL_MODE_FULL
@@ -1432,13 +1436,20 @@ class _CompositeStep(torch.nn.Module):
             seed = cast(int, batch["seed"])
             epoch = cast(int, batch["epoch"])
             step = cast(int, batch["step"])
-            branch_masks = sample_branch_masks(
-                edge["label"].shape[0],
-                self.model.cfg.p_topo,
-                self.model.cfg.p_cont,
-                generator=_seeded_generator(seed, epoch, step),
-                device=edge["label"].device,
-            )
+            if self.model.cfg.permanent_null == "none":
+                branch_masks = sample_branch_masks(
+                    edge["label"].shape[0],
+                    self.model.cfg.p_topo,
+                    self.model.cfg.p_cont,
+                    generator=_seeded_generator(seed, epoch, step),
+                    device=edge["label"].device,
+                )
+            else:
+                branch_masks = masks_for_null(
+                    self.model.cfg.permanent_null,
+                    edge["label"].shape[0],
+                    edge["label"].device,
+                )
             logits = self.model(_e2e_edge_view(edge), masks=branch_masks)["logits"]
             if collect_diagnostics:
                 extra.update(_e2e_gate_tanh(self.model))
@@ -1820,8 +1831,17 @@ def _validate_epoch(
                 # so autocast must be requested explicitly here too (spec Sec
                 # 13.16 extension: per-node encode may stay bf16; this repeats
                 # that same contract at validation time).
+                masks = (
+                    None
+                    if model.cfg.permanent_null == "none"
+                    else masks_for_null(
+                        model.cfg.permanent_null,
+                        e2e_batch["x_a"].shape[0],
+                        accelerator.device,
+                    )
+                )
                 with accelerator.autocast():
-                    full_logits = model(e2e_batch, masks=None)["logits"]
+                    full_logits = model(e2e_batch, masks=masks)["logits"]
                 values_out.append(full_logits.float().unsqueeze(-1))
                 if start == 0:
                     first_chunk_batch = e2e_batch
@@ -2343,6 +2363,7 @@ def write_run_start_metadata(cfg: EgoConfig, data: EgoStitchData, *, world_size:
         "partition_seed": cfg.data.partition_seed,
         "rho_train": data.rho_train,
         "positives_mode": cfg.data.train_positives,
+        "permanent_null": cfg.model.config.get("permanent_null", "none"),
     }
     path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 

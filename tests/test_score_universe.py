@@ -22,6 +22,8 @@ from src.data.distributed_pairs import CompactPairBatch
 from src.data.features import FeatureStore
 from src.data.packed_features import PackedFeatureTable, build_packed_features
 from src.model.B0 import V3_1
+from src.model.egostitch.conditioning import GatedCrossAttention
+from src.model.egostitch.e2e_model import EgoStitchE2E
 
 INPUT_DIM = 4
 
@@ -1129,6 +1131,95 @@ def test_egostitch_e2e_cli_is_deterministic(tmp_path: Path) -> None:
     np.testing.assert_array_equal(a.logit, b.logit)
     assert a.f_logit is not None and b.f_logit is not None
     np.testing.assert_array_equal(a.f_logit, b.f_logit)
+
+
+def _enable_e2e_conditioning_gates(checkpoint: Path) -> None:
+    """Make the synthetic checkpoint sensitive to topology perturbations."""
+    payload = torch.load(checkpoint, weights_only=False)
+    model = score_universe.build_model("egostitch_e2e", dict(_TINY_E2E_CONFIG))
+    assert isinstance(model, EgoStitchE2E)
+    model.load_state_dict(payload["model_state"])
+    for module in [*model.trunk.topo_xattn, *model.trunk.cont_xattn]:
+        assert isinstance(module, GatedCrossAttention)
+        module.gate.data.fill_(1.0)
+    payload["model_state"] = model.state_dict()
+    torch.save(payload, checkpoint)
+
+
+def test_egostitch_e2e_scaffold_shuffle_bites_and_is_deterministic(tmp_path: Path) -> None:
+    data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
+    _enable_e2e_conditioning_gates(checkpoint)
+    base, shuffled_a, shuffled_b = tmp_path / "base.npz", tmp_path / "a.npz", tmp_path / "b.npz"
+    score_universe.main(_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, base))
+    for output in (shuffled_a, shuffled_b):
+        score_universe.main(
+            [
+                *_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, output),
+                "--scaffold-control",
+                "shuffle_within_pair",
+            ]
+        )
+    base_scores = score_universe.load_scores(base)
+    a, b = score_universe.load_scores(shuffled_a), score_universe.load_scores(shuffled_b)
+    assert not np.allclose(base_scores.logit, a.logit)
+    np.testing.assert_array_equal(a.logit, b.logit)
+    assert a.meta["scaffold_control"] == {
+        "mode": "shuffle_within_pair",
+        "seed": 0,
+        "keying": "canonical_pair_v1",
+    }
+
+
+def test_egostitch_e2e_scaffold_shuffle_is_ab_ba_and_shard_invariant(tmp_path: Path) -> None:
+    data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
+    _enable_e2e_conditioning_gates(checkpoint)
+    reversed_pairs = tmp_path / "reversed.tsv"
+    reversed_pairs.write_text("".join(f"{v}\t{u}\n" for u, v in _E2E_PAIRS))
+    forward, reverse = tmp_path / "forward.npz", tmp_path / "reverse.npz"
+    score_universe.main(
+        [
+            *_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, forward),
+            "--scaffold-control",
+            "shuffle_within_pair",
+        ]
+    )
+    score_universe.main(
+        [
+            *_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, reversed_pairs, reverse),
+            "--scaffold-control",
+            "shuffle_within_pair",
+        ]
+    )
+    np.testing.assert_array_equal(
+        score_universe.load_scores(forward).logit, score_universe.load_scores(reverse).logit
+    )
+
+    sharded = tmp_path / "sharded.npz"
+    for shard in range(3):
+        score_universe.main(
+            [
+                *_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, sharded),
+                "--scaffold-control",
+                "shuffle_within_pair",
+                "--shard",
+                str(shard),
+                "--num-shards",
+                "3",
+            ]
+        )
+    merged = tmp_path / "merged.npz"
+    score_universe.main(
+        [
+            "merge",
+            "--inputs",
+            *(str(sharded.with_name(f"sharded.shard-{i}.npz")) for i in range(3)),
+            "--output",
+            str(merged),
+        ]
+    )
+    np.testing.assert_array_equal(
+        score_universe.load_scores(forward).logit, score_universe.load_scores(merged).logit
+    )
 
 
 def test_egostitch_e2e_merge_preserves_four_arrays_in_manifest_order(tmp_path: Path) -> None:
