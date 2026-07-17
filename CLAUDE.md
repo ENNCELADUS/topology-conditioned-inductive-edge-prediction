@@ -10,12 +10,12 @@ figures, benchmark data artifacts, and a curated literature library. `src/` hold
 typed, tested Python package covering the benchmark/evaluation stack, B0/B0-alt,
 G1–G3, and the pre-registered **EgoStitch Stage-1 implementation**. The direct HPC
 layer auto-detects all visible H20s for formal E2 and EgoStitch DDP execution.
-Gates G1–G3 are complete; G5 Stage 1 is not. A Seed-0 topology diagnostic completed
-on 2026-07-16 under a superseded three-seed registration and remains diagnostic-only.
-The current Stage-1 contract is a one-fixed-seed engineering screen. Do not report a
-G5 Stage-1 verdict until a run is bound to the replacement registration before training
-and completes held-out scoring, fidelity/cost diagnostics, and the registered gate.
-This screen does not replace E1/E3's at-least-three-seed Holm inference.
+Gates G1–G3 and the frozen-s0 G5 Stage-1 screen are complete. The replacement
+fixed-Seed-0 run was bound before training, completed held-out fp32 scoring plus
+fidelity/cost diagnostics, and produced the binding engineering verdict `cut` on
+2026-07-16. The frozen-s0 scalar head is now a motivating result and ablation rung;
+the active G5 build line is the approved rev-3.0 end-to-end conditioned encoder.
+This one-seed screen does not replace E1/E3's at-least-three-seed Holm inference.
 
 `README.md` is the human-facing entry point (orientation, status, structure map,
 reading order). This file (`CLAUDE.md`) holds the binding *constraints* an agent
@@ -39,7 +39,8 @@ docs/
                                  benchmark/data contract, batch sampler, auto-sized H20 design
   lit-review-plan.md             review plan, claims K1–K5, terminology guardrail
   results/E2-pair-to-topology-gap.md   motivating result note
-  results/G5-stage1-seed0-20260715.md  completed Seed-0 training result; gate incomplete
+  results/G5-stage1-seed0-20260715.md  historical superseded-registration run
+  results/G5-stage1-seed0-20260717.md  binding frozen-s0 screen (`cut`)
 figures/                         e2-gap.html, positioning.html (standalone, open in browser)
 data/
   README.md                      benchmark artifact manifest (layout + usage contract)
@@ -189,10 +190,11 @@ nodes?" If a draft starts describing graph generation as the task, it has drifte
    silently deviate — edit the spec first, with a change-log line.
 6. `docs/results/E2-pair-to-topology-gap.md` — the motivating result note with completed
    G1 B0/PA-null/B0-alt, G2 ceiling, and G3 Oracle artifacts.
-7. `docs/results/G5-stage1-seed0-20260715.md` — retained Seed-0 training evidence and
-   the explicit boundary that the artifact is not retroactively bound to the replacement
-   single-seed screening registration.
-8. `docs/lit-review-plan.md` — literature-review plan, claims K1–K5, the 2×2
+7. `docs/results/G5-stage1-seed0-20260717.md` — binding frozen-s0 Stage-1 verdict,
+   registered metrics, fidelity/cost evidence, and diagnostic `last.pt` interpretation.
+8. `docs/results/G5-stage1-seed0-20260715.md` — historical training evidence and
+   the explicit boundary that the artifact is not retroactively bound.
+9. `docs/lit-review-plan.md` — literature-review plan, claims K1–K5, the 2×2
    taxonomy, and the terminology guardrail.
 
 When these conflict, the more specific/later document refines the earlier one, but
@@ -231,17 +233,22 @@ mechanisms. Keep the current values consistent across `docs/results/E2-pair-to-t
 
 ## Current G5 Stage-1 evidence boundary
 
-The latest retained exact-quota Seed-0 run is at commit `3556627`: 2 × H20,
-`world_size=2`, 30 epochs, checkpoint `54f3c0ad8f5dfc18`, 2,037,171 candidate rows,
-and a completed single-seed topology diagnostic. Its assembled metrics are effectively
-identical to frozen B0 (EgoStitch/B0 BFS-macro GS `0.312149/0.312151`, RD
-`0.422358/0.422345`; s0-logit correlation is effectively 1.0). The diagnostic verdict
-is `diagnostic_only` because its run metadata is bound to superseded registration hash
-`a2f10051...`; it cannot be retroactively treated as the replacement single-seed
-screening verdict. The current gate requires a newly bound fixed-Seed-0 run plus
-candidate scoring, fidelity/cost diagnostics, and registered evaluation. Never claim
-statistical significance or cross-seed robustness from the Stage-1 one-seed screen;
-E1/E3 remain multi-seed Holm evaluations.
+The binding frozen-s0 run is commit `60745f2`: fixed Seed 0, 2 × H20,
+`world_size=2`, 30 epochs, selected checkpoint `56b91c17fa8d3b86` (epoch 1),
+registration hash `97e61a7d...`, and 2,037,171 fp32 candidate rows. EgoStitch/B0
+BFS-macro GS is `0.312438/0.312151`, RD is `0.422503/0.422345`, and MMD ratios are
+`13.0415/11.8556/18.0916` versus B0's `13.0768/11.9273/18.0931`. Both guards pass,
+but clustering-MMD and matched BFS-macro GS/RD all fail strict dominance against
+`b0_cal_selfdensity`; the binding verdict is `cut`.
+
+Epoch-30 `last.pt` was subsequently scored under the same evaluator as an explicitly
+diagnostic-only checkpoint-selection audit. It raises GS to `0.320038` and passes the
+matched-GS criterion, but still fails matched RD and clustering-MMD while degree and
+spectral MMD regress. It does not replace the formal `best.pt` verdict. The older
+`3556627` run remains historical diagnostic evidence only. Never claim statistical
+significance or cross-seed robustness from the one-seed screen; E1/E3 remain
+multi-seed Holm evaluations. The locked disposition is frozen-s0 → motivating arm +
+ablation; rev 3.0 → active G5 build line.
 
 ## Naming conventions (neutral placeholders — keep them neutral)
 

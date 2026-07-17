@@ -4,18 +4,18 @@
 signed off 2026-07-09**), so `05-egostitch-spec.md` (including its §9 benchmark
 binding and §10–11 batch-sampler/auto-sized H20 contracts) is the active implementation
 contract. Companion to `03-experiment-protocol.md` (updated 2026-07-09 with the
-approved [protocol-Δ] items) and `02-methodology.md`. EgoStitch Stage 1 (frozen-s0
-form) is implemented; its replacement one-seed engineering screening gate remains
-incomplete as of 2026-07-16.
+approved [protocol-Δ] items) and `02-methodology.md`. The frozen-s0 EgoStitch
+Stage-1 screen completed on 2026-07-17 with the binding verdict `cut`; revision 3.0
+is now the active G5 build line.
 **Revision 3.0 (2026-07-16):** the §4.4 decision mechanism is replaced — the frozen-B0
 `s0` anchor and logit-level gated-residual fusion give way to an **end-to-end
 stitched-topology-conditioned pair encoder** (jointly trained V3.1-class trunk,
 structure-only stitched-topology encoder, zero-init tanh-gated cross-attention, and a
 three-null decomposition). Design record and decision trail:
 `docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md` (rev 3).
-Spec §§1–13 remain binding for the pending frozen-s0 screening run; the successor
-implementation contract is summarized in spec §14 and lands in full (§5/§13 rewrite +
-replacement registration) after that screen publishes.
+Spec §§1–13 remain the historical contract for the completed frozen-s0 run and its
+retained implementation. The successor contract is summarized in spec §14; its Phase-0
+§5/§13 rewrite and fresh registration are now unblocked but are not yet normative.
 
 **Provenance.** Revision 1 was grounded in a three-track literature review run on
 2026-07-07. Revision 2 (2026-07-08) followed a full fan-out review of the local vault
@@ -1011,6 +1011,14 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   (within-pair `Â`/`Π` shuffle), and branch-dropout `p = 0` — everything else (E2E
   `B3-full`/`B5`, conditioning-depth rungs, the remaining structure battery) is E1/E3
   scope. Landing sequence and registration requirements: design doc §8 and spec §14.
+  *Binding result 2026-07-17:* the replacement fixed-Seed-0 frozen-s0 screen
+  completed and returned `cut`: all three topology-dominance criteria failed while
+  both guards passed. The selected epoch-1 checkpoint stayed near S0; a diagnostic
+  epoch-30 checkpoint moved ranking and passed matched GS, but still failed matched
+  RD/clustering and worsened degree/spectral MMD. Per the registered failure reading,
+  frozen-s0 scalar fusion is retired to motivating-arm + ablation status. The rev-3.0
+  conditioned encoder is now the active G5 build line; see
+  `docs/results/G5-stage1-seed0-20260717.md`.
 
 ### 6.1 Method rows
 

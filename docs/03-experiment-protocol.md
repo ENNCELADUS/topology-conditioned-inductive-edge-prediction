@@ -484,6 +484,18 @@ rule).
    registration must additionally pin the four-logit decomposition report, the
    representation-probe protocol (including degree-partialled probes), the
    within-checkpoint `f_logit` liveness reference, and a measured H20 cost re-estimate.
+   **Binding frozen-s0 result and disposition (2026-07-17):** the replacement
+   fixed-Seed-0 run (commit `60745f2`, checkpoint `56b91c17fa8d3b86`, registration
+   `97e61a7d...`) completed all required artifacts and returned `cut`. Both guards
+   passed, but clustering-MMD and matched BFS-macro GS/RD each failed strict
+   dominance against `b0_cal_selfdensity`. A diagnostic epoch-30 evaluation later
+   passed matched GS but still failed matched RD/clustering and regressed degree and
+   spectral MMD; it does not replace the binding checkpoint. The locked disposition
+   is therefore: frozen-s0 scalar fusion becomes a motivating result and E4 ablation
+   rung; the rev-3.0 e2e conditioned encoder becomes the active G5 build line. This
+   closes the frozen-s0 screen and satisfies spec §14.3(1), without binding the
+   successor registration or weakening E1/E3's multi-seed inference rules. Full
+   result: `docs/results/G5-stage1-seed0-20260717.md`.
 
 ### 5.1 Priority order (after gates)
 

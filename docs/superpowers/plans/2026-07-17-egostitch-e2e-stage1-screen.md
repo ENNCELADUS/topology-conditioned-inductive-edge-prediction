@@ -1,0 +1,743 @@
+# EgoStitch E2E Stage-1 Screen — Experiment Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
+> (recommended) or superpowers:executing-plans to implement this plan task-by-task.
+> Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Take the rev-3.0 stitched-topology-conditioned pair encoder from the
+frozen-s0 `cut` closeout to a **binding five-arm single-seed Stage-1 screening
+verdict** (pass ⇒ Stage-2/E1 preparation; cut ⇒ registered failure reading).
+
+**Architecture:** Three layers executed in order. (A) *Governance landing* —
+commit the staged frozen-s0 closeout, rewrite spec §5/§13 to §14 under the
+freeze rule, create configs and a DRAFT registration. (B) *Code* — execute the
+committed implementation plan
+`docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md`
+Tasks 5–15, plus two arm-support extensions defined here (permanent-null
+training override; 6a shuffle scoring control). (C) *Runtime* — HPC profile
+smoke → measured cost table → user confirms two registration defaults → BIND →
+three formal training runs → four scoring passes → gate → result note.
+
+**Tech Stack:** uv / Python 3.11, PyTorch 2.10.0+cu128, Accelerate DDP
+auto-sized over visible NVIDIA H20s via `hpc/run.sh`, numpy/networkx gate
+analyses, pytest + ruff + strict mypy.
+
+## Global Constraints
+
+- **Freeze rule:** `docs/05-egostitch-spec.md` is the contract. Every code
+  deviation lands in the spec *first*, with a dated change-log line (spec §12).
+- **Registration before training:** the formal runs record
+  `run_metadata.json['preregistration_sha256']` at start;
+  `src/experiments/g5_stage1.py` refuses held-out metrics on mismatch. The
+  registration is bound (status `BINDING`, sha fixed) **before** any formal
+  training. Profile smokes use `--max-steps` (debug-only) and never produce
+  held-out metrics.
+- **Two user-confirmed defaults** (may not be bound without explicit user
+  sign-off, design doc §5 arm 7 / plan Task 4): pathway-attribution share
+  `≥ 25%` and structure-control margin `0.005`.
+- **Single fixed seed 0.** This screen supports no statistical-significance or
+  cross-seed-robustness claims; E1/E3 retain ≥ 3 seeds + Holm.
+- **fp32 pair pass** for all published logits (spec §13.16, provenance
+  `egostitch_e2e_pair_fp32_v1`); `validate_score_resolution` guard per array.
+- **Edge-level and assembled-graph metrics are always reported together.**
+- `src/model/B0.py` is never modified.
+- Neutral placeholder naming (Benchmark-A, B0, B0-e2e, …) in all docs.
+- Formal training/scoring runs only on the HPC container via `hpc/run.sh`
+  (user-owned); local machine runs tests and analyses only.
+- Local gotchas: use `.venv/bin/python -m …` (rtk proxy garbles `uv run`
+  output); never run two mypy invocations concurrently; two documented
+  pre-existing local test failures (`tests/test_b0_attention.py` torch-version,
+  `tests/test_e2_ddp_integration.py` rendezvous) are container-only issues.
+
+## Current state (2026-07-17, verified against the working tree)
+
+- Frozen-s0 screen **complete**: binding verdict `cut` (checkpoint
+  `56b91c17fa8d3b86`, registration `97e61a7d…`, gate artifacts under
+  `outputs/egostitch_stage1/formal_gate/`). Guards passed; all three primary
+  dominance checks failed vs `b0_cal_selfdensity`; residual dead within-numerics
+  (s0 correlation 0.999979, residual/s0 std ratio 8.0e-4).
+- Closeout docs are **staged but uncommitted**: 9 modified files +
+  `docs/results/G5-stage1-seed0-20260717.md` +
+  `docs/artifacts/2026-07-17-egostitch-status.html` (both untracked).
+- Spec §14.3(1) satisfied; §5/§13 **not yet rewritten**; no e2e config, no e2e
+  registration, no e2e code.
+- The committed implementation plan (Tasks 1–15) exists at
+  `docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md`;
+  its Tasks 2–3 (protocol disposition, proposal rev) are already landed
+  (commit `c0e2144` + the staged closeout). Its Task 1 → this plan's Task 2;
+  its Task 4 → this plan's Tasks 3–4 (extended: three configs, full
+  registration skeleton, deferred binding).
+
+## The five registered arms (design doc §5, Stage-1 scope)
+
+| # | Arm | Training run | Scored artifact |
+|---|-----|--------------|-----------------|
+| 1 | `full` (STE + gated x-attn headline) | run A (`egostitch_e2e_breadth_first.yaml`) | run A four-logit `candidate.npz` — array `logits` |
+| 2 | `b0_e2e_f_only` (matched pairwise-only) | run B (`…_f_only.yaml`, `permanent_null: all_head`) | run B `candidate.npz` |
+| 3 | `pair_topology` (`∅_content_head` eval bypass) | — (run A checkpoint) | run A artifact — array `pair_topology` |
+| 4 | `structure_control_6a` (within-pair Â/Π shuffle) | — (run A checkpoint) | separate scoring pass with `--scaffold-control shuffle_within_pair` |
+| 5 | `p0` (branch dropout off) | run C (`…_p0.yaml`, `p_topo=p_cont=0`) | run C four-logit `candidate.npz` |
+
+Three training runs, four scoring passes, one gate invocation.
+
+---
+
+### Task 1: Verify and commit the staged frozen-s0 closeout
+
+**Files:**
+- Commit (already modified): `CLAUDE.md`, `README.md`,
+  `docs/03-experiment-protocol.md`, `docs/04-model-proposal.md`,
+  `docs/05-egostitch-spec.md`, `docs/results/E2-pair-to-topology-gap.md`,
+  `docs/results/G5-stage1-seed0-20260715.md`,
+  `docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md`,
+  `docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md`
+- Commit (untracked): `docs/results/G5-stage1-seed0-20260717.md`,
+  `docs/artifacts/2026-07-17-egostitch-status.html`
+
+**Interfaces:**
+- Produces: a clean tree whose HEAD records the binding `cut` verdict and the
+  locked disposition (frozen-s0 → motivating arm + E4 ablation rung; rev-3.0 →
+  active G5 build line). Every later task builds on this commit.
+
+- [ ] **Step 1: Verify result-note numbers against the gate artifact**
+
+```bash
+.venv/bin/python - <<'EOF'
+import json, re
+r = json.load(open('outputs/egostitch_stage1/formal_gate/g5_stage1_results.json'))
+note = open('docs/results/G5-stage1-seed0-20260717.md').read()
+checks = {
+    'verdict cut': r['verdict'] == 'cut' and 'cut' in note,
+    'checkpoint': '56b91c17fa8d3b86' in note,
+    'prereg sha': r['metadata']['preregistration_sha256'][:8] in note,
+    'clustering diff': f"{r['criteria']['clustering_mmd_ratio']['mean_diff']:.4f}"[:6].lstrip('-') in note.replace('−','-'),
+    'auprc guard': f"{r['guards']['matched_edge_auprc']['ego_mean']:.6f}" in note,
+}
+print(checks); assert all(checks.values())
+EOF
+```
+Expected: all five checks `True`.
+
+- [ ] **Step 2: Cross-file consistency grep** — the run identity must be cited
+  identically everywhere:
+
+```bash
+grep -rn '56b91c17fa8d3b86\|97e61a7d' CLAUDE.md README.md docs/03-experiment-protocol.md docs/05-egostitch-spec.md docs/results/G5-stage1-seed0-20260717.md | sort
+```
+Expected: every hit uses checkpoint `56b91c17fa8d3b86` and registration prefix
+`97e61a7d`; no file still describes the gate as "incomplete" or "pending".
+
+- [ ] **Step 3: Review the full staged diff** (`git diff`) — confirm it contains
+  only closeout/disposition edits, no spec §5/§13 semantic changes (those belong
+  to Task 2 with change-log lines).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add -A
+git commit -m "docs(results): close frozen-s0 Stage-1 screen — binding cut verdict, locked disposition to rev-3.0 e2e"
+```
+
+---
+
+### Task 2: Spec §5/§13 rewrite to §14 (freeze-rule landing)
+
+Executes committed implementation-plan **Task 1** — reproduced here with the
+full section list so this plan is self-contained.
+
+**Files:**
+- Modify: `docs/05-egostitch-spec.md` (§5, §7, §8, §13.1, §13.10, §13.16,
+  §13.17; new §13.18; §12 change-log)
+
+**Interfaces:**
+- Consumes: design doc §§3–6
+  (`docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md`)
+  as source text; spec §14 as the normative summary being expanded.
+- Produces: the normative sections that Tasks 5–6 of this plan (and committed
+  plan Tasks 5–15) implement against. After this task, §14.3(2) is satisfied.
+
+- [ ] **Step 1: §5 rewrite** — decision head for family `egostitch_e2e`:
+  from-scratch V3.1-class trunk on raw token pairs; STE over the stitched
+  scaffold (structure-only tokens: 4-type anchor labels endpoint-i/endpoint-j/
+  slot-of-i/slot-of-j, π, m, soft degrees — **no** `h`, no `g`, no
+  grounded-identity-match); zero-init tanh-gated cross-attention, cls_token
+  queries only, injected after the final `n_inj ∈ {1, 2}` pair-cross-attention
+  blocks, AB/BA share STE+XAttn parameters before `abba_max`; separate
+  `c_content` pathway (s1 grounding summaries + identity-match flag); the three
+  `_head`-suffixed nulls exactly as §14.2 (train = per-pair multiplicative
+  masks, eval = batch-level hard bypass, numerically identical — required unit
+  test; `p(i,j) = p(j,i)` under every null).
+- [ ] **Step 2: §7 note** — no new loss lambda; `L = L_edge + λ_real·L_real +
+  λ_ssl·L_ssl + λ_recon·L_recon` unchanged (locked objective).
+- [ ] **Step 3: §8 curriculum** — warm-start fraction keeps `L_edge` (and
+  trunk/STE/gates) inactive; branch-dropout probabilities constant afterwards.
+- [ ] **Step 4: §13.1** — Stage-1 mechanism set for this family: Tokenize-lite,
+  imagination, matching, stitching (Stitch already Stage-1), **STE + gated
+  cross-attention head**; codebook/s3 remain Stage-2, harmonization Stage-3.
+- [ ] **Step 5: §13.10** — mark **retired for family `egostitch_e2e`** (no s0
+  cache, no `s0_checkpoint_id`); historical for the frozen-s0 family.
+- [ ] **Step 6: §13.16** — extend the fp32 pin: pair pass covers trunk, STE,
+  gates, and head; provenance string `egostitch_e2e_pair_fp32_v1`; per-node
+  encode may stay bf16.
+- [ ] **Step 7: §13.17** — re-register liveness against the **within-checkpoint
+  `f_logit`** (no frozen-s0 comparator artifact, no alignment step). Death rule
+  stays conjunctive with the registered thresholds: residual std ratio
+  `std(full − f_logit)/std(f_logit) < 1e-05` AND `Spearman(full, f_logit) >
+  0.9999` AND top-1% overlap `> 0.9999`. Telemetry gains `gate_topo_tanh`,
+  `gate_cont_tanh`, `grad_rms_trunk/ste/content`, per-epoch
+  `topology_delta_std` on a fixed validation slice.
+- [ ] **Step 8: new §13.18** — pinned defaults: `ste_layers = 3`,
+  `ste_dim = 128`, `xattn_heads = 8`, `n_inj = 1` (sweep `{1, 2}` reserved for
+  E1/E3), `p_topo = p_cont = 0.15` (sweep 0.1–0.2 reserved; `p = 0` is a
+  Stage-1 arm). Plus the two runtime overrides this plan adds:
+  `model.config.permanent_null ∈ {none, all_head}` (training-time permanent
+  bypass for the B0-e2e arm) and the scoring-time scaffold control
+  `shuffle_within_pair` (Task 6).
+- [ ] **Step 9: §12 change-log** — one dated line per section touched
+  (2026-07-17), each naming the design doc as source.
+- [ ] **Step 10: Consistency check** — `grep -n 'permanent_null\|shuffle_within_pair\|13.18' docs/05-egostitch-spec.md`
+  shows all three; §14.3 item 2 annotated "Satisfied 2026-07-17".
+- [ ] **Step 11: Commit**
+
+```bash
+git add docs/05-egostitch-spec.md
+git commit -m "docs(spec): rewrite §5/§13 to the rev-3.0 e2e head; retire §13.10; extend §13.16; re-register §13.17; add §13.18 pins"
+```
+
+---
+
+### Task 3: Three e2e configs
+
+**Files:**
+- Create: `configs/egostitch_e2e_breadth_first.yaml`
+- Create: `configs/egostitch_e2e_f_only_breadth_first.yaml`
+- Create: `configs/egostitch_e2e_p0_breadth_first.yaml`
+
+**Interfaces:**
+- Consumes: `configs/egostitch_stage1_breadth_first.yaml` (base recipe — data,
+  optimizer, diagnostics, runtime budget machinery all carry over).
+- Produces: configs consumed by `hpc/run.sh train … --worker-module
+  src.train_egostitch`; keys `model.family: egostitch_e2e`,
+  `model.config.{ste_layers,ste_dim,xattn_heads,n_inj,p_topo,p_cont,
+  permanent_null}`, `data.pack_dir` (raw-token pack, committed plan Task 12).
+
+- [ ] **Step 1: Write the main config**
+
+```yaml
+# EgoStitch E2E Stage-1 formal training config (spec docs/05-egostitch-spec.md
+# §5/§13 as rewritten 2026-07-17, defaults §13.18).
+#   hpc/run.sh train configs/egostitch_e2e_breadth_first.yaml \
+#       --worker-module src.train_egostitch
+
+model:
+  family: egostitch_e2e
+  config:
+    ste_layers: 3
+    ste_dim: 128
+    xattn_heads: 8
+    n_inj: 1
+    p_topo: 0.15
+    p_cont: 0.15
+    permanent_null: none
+
+data:
+  root: data
+  strategy: breadth_first
+  train_positives: e_sup            # pinned (spec §9.3)
+  negative_ratio: 5                 # pinned (spec §10.2)
+  partition_seed: 0
+  msg_fraction: 0.8                 # pinned (spec §9.3)
+  node_batch: 256
+  edge_batch: 512
+  f0_cache: outputs/feature_packs/egostitch_f0/f0_matrix.pt
+  grounding_cache: outputs/feature_packs/egostitch_f0/grounding.npz
+  pack_dir: outputs/feature_packs/egostitch_e2e_tokens   # raw-token pack (plan Task 12)
+  expected_missing_features:
+    - node_004764
+    - node_007050
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 0.01
+  epochs: 30
+  warmup_steps: 200
+  grad_clip: 1.0
+  warmstart_fraction: 0.2           # L_recon-only phase (spec §13.8)
+
+diagnostics:
+  gradient_probe_interval: 50
+  gradient_imbalance_ratio: 10.0
+  gradient_imbalance_steps: 1000
+  probe_s1_abs_mean_max: 1000.0
+  selection_auprc_tolerance: 1.0e-4
+  topk_fraction: 0.01
+
+eval:
+  patience: 10
+  eval_every: 1
+
+seed: 0
+output_dir: outputs/egostitch_e2e_stage1/full
+mixed_precision: "bf16"
+preregistration: docs/registrations/g5_e2e_stage1_preregistration.json
+
+runtime:
+  world_size: auto
+  pack_dir: outputs/feature_packs/egostitch_f0
+  pack_workers: 8
+  loader_workers_per_rank: 0
+  prefetch_factor: 2
+  token_budget_candidates: [128, 256, 512]
+  max_pairs_per_rank: 1048576
+  memory_limit_gib: 85.0
+  total_budget_seconds: 14400       # PROVISIONAL — replaced by Task 7 measured profile
+  pack_budget_seconds: 1200
+  setup_probe_budget_seconds: 900
+  train_eval_budget_seconds: 11700
+  artifact_budget_seconds: 120
+  reserve_seconds: 480
+  probe_warmup_steps: 5
+  probe_timed_steps: 15
+```
+
+Note `data.s0_cache` / `data.s0_checkpoint_id` are **absent** (§13.10 retired
+for this family).
+
+- [ ] **Step 2: Write the two variants** by copying the main config and editing
+  exactly these lines:
+  - `…_f_only_breadth_first.yaml`: `permanent_null: all_head`,
+    `output_dir: outputs/egostitch_e2e_stage1/f_only`
+  - `…_p0_breadth_first.yaml`: `p_topo: 0.0`, `p_cont: 0.0`,
+    `output_dir: outputs/egostitch_e2e_stage1/p0`
+- [ ] **Step 3: Verify the variants differ only where intended**
+
+```bash
+diff configs/egostitch_e2e_breadth_first.yaml configs/egostitch_e2e_f_only_breadth_first.yaml
+diff configs/egostitch_e2e_breadth_first.yaml configs/egostitch_e2e_p0_breadth_first.yaml
+```
+Expected: exactly 2 changed lines for f_only; exactly 3 for p0.
+
+- [ ] **Step 4: All three parse**
+
+```bash
+.venv/bin/python -c "import yaml,glob; [yaml.safe_load(open(p)) for p in glob.glob('configs/egostitch_e2e*.yaml')]; print('OK')"
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add configs/egostitch_e2e_breadth_first.yaml configs/egostitch_e2e_f_only_breadth_first.yaml configs/egostitch_e2e_p0_breadth_first.yaml
+git commit -m "feat(g5-e2e): Stage-1 screen configs (full / f_only / p0)"
+```
+
+---
+
+### Task 4: DRAFT registration (not binding until Task 8)
+
+**Files:**
+- Create: `docs/registrations/g5_e2e_stage1_preregistration.json`
+- Create: `docs/registrations/g5_e2e_stage1_preregistration.md` (prose mirror
+  of the JSON, same structure as `g5_stage1_preregistration.md`)
+
+**Interfaces:**
+- Consumes: the frozen-s0 registration
+  (`docs/registrations/g5_stage1_preregistration.json`) as the structural
+  template; the completed screen's comparator values.
+- Produces: the registration the worker sha-binds and the gate verifies.
+  Status field starts `DRAFT`; Task 8 flips it to `BINDING`.
+
+- [ ] **Step 1: Write the JSON.** Structure (values are final unless marked):
+
+```json
+{
+  "registration_id": "g5-e2e-stage1-20260717-conditioned-encoder-screen-v1",
+  "status": "DRAFT",
+  "gate": "G5 Stage 1 - EgoStitch E2E stitched-topology-conditioned pair encoder",
+  "created_utc": "2026-07-17T00:00:00Z",
+  "spec_binding": "docs/05-egostitch-spec.md §5/§13 (2026-07-17 rewrite) + §14",
+  "protocol_binding": "docs/03-experiment-protocol.md §5.0.5, §5.2, E4.15-E4.17",
+  "predecessor": {
+    "registration": "g5-stage1-20260716-membership-normalized-screen-v2",
+    "sha256": "97e61a7de006a3279d67e3adf1f7f1c663a7a739cf2682febfc0ca3219d0c446",
+    "verdict": "cut",
+    "result": "docs/results/G5-stage1-seed0-20260717.md"
+  },
+  "benchmark": { "alias": "Benchmark-A", "strategy": "breadth_first" },
+  "seeds": [0],
+  "arms": {
+    "full": { "training": "configs/egostitch_e2e_breadth_first.yaml", "scored_array": "logits" },
+    "b0_e2e_f_only": { "training": "configs/egostitch_e2e_f_only_breadth_first.yaml", "scored_array": "logits", "note": "permanent ∅_all_head; the matched pairwise-only control — the only arm '-topology' claims compare against" },
+    "pair_topology": { "training": "none (full checkpoint, eval-time ∅_content_head bypass)", "scored_array": "pair_topology" },
+    "structure_control_6a": { "training": "none (full checkpoint)", "scoring": "scaffold control shuffle_within_pair, deterministic seed 0", "scored_array": "logits" },
+    "p0": { "training": "configs/egostitch_e2e_p0_breadth_first.yaml", "scored_array": "logits" }
+  },
+  "comparators": ["b0", "b0_cal_density", "b0_cal_selfdensity", "b0_cal_degseq"],
+  "comparator_note": "carried over from the frozen-s0 screen; b0_cal_selfdensity is the empirically strongest arm there and remains the bar",
+  "frozen_inputs": {
+    "b0_candidate_scores": { "path": "outputs/deliverables/b0_v31_breadth_first_20260711/scores/candidate.npz", "sha256": "c5873caa3fece651d1155fd725e04f26a432ceee59d8e78dcda5f4acd687a95d", "checkpoint_id": "e092537d8cf1e208" },
+    "g1_results": { "path": "outputs/deliverables/g1_graph_metrics_20260714/g1_results.json", "sha256": "668129a7c300d87682250382a36ef854c1f301c21d078b261f2b0fe2ae9d1ca4" },
+    "g3_results": { "path": "outputs/deliverables/g3_graph_metrics_20260714/g3_results.json", "sha256": "e7fbc8e4e7f76ffe1f50123ac8e96c776cded79406e01e638539a3f835b79c24" }
+  },
+  "operating_point": "identical to predecessor: canonical density-matched threshold + per-comparator matched-RD exact quota by descending pass-1 score",
+  "primary_criteria": {
+    "family": ["clustering_mmd_ratio", "bfs_macro_gs", "bfs_macro_rd"],
+    "decision_procedure": "single_seed_point_estimate_dominance",
+    "applies_to_arm": "full",
+    "rule": "Seed-0 full-arm point estimate strictly dominates every comparator on all three, canonical + matched operating points as in the predecessor",
+    "all_must_pass": true,
+    "statistics_procedure": "No inferential acceptance procedure with one seed; p/CI/Holm reported as not applicable"
+  },
+  "guards": [
+    { "name": "degree_mmd_non_regression", "rule": "full-arm degree-MMD ratio <= 1.10 x B0's recomputed from the frozen candidate artifact" },
+    { "name": "matched_edge_auprc", "rule": "full-arm degree-corrected candidate AUPRC >= B0's - 0.02; B0-e2e AUPRC reported alongside as the matched (nonbinding) reference" }
+  ],
+  "e2e_rules": {
+    "pathway_attribution": {
+      "metric": "clustering_mmd_ratio at the canonical operating point",
+      "definition": "G_full = clu(b0_e2e_f_only) - clu(full); G_pt = clu(b0_e2e_f_only) - clu(pair_topology)",
+      "rule": "applies iff primaries pass and G_full > 0: require G_pt >= 0.25 * G_full",
+      "reading_on_fail": "the gain is content-side; the topology-representation claim is withdrawn from the headline",
+      "user_confirmed": "REQUIRED-BEFORE-BINDING"
+    },
+    "structure_control_margin": {
+      "rule": "clu(structure_control_6a) - clu(full) > 0.005",
+      "reading_on_fail": "the conditioning gain is not structure-specific (continuous-latent-code alarm); the STE claim is not supported",
+      "user_confirmed": "REQUIRED-BEFORE-BINDING"
+    },
+    "liveness_within_checkpoint": {
+      "reference": "f_logit of the same checkpoint (spec §13.17 as re-registered)",
+      "death_rule": "conjunctive: min_residual_std_ratio 1e-05 AND max_spearman 0.9999 AND max_topk_overlap 0.9999 at topk_fraction 0.01",
+      "consequence": "run-validity failure; gate fails closed before held-out topology metrics"
+    },
+    "four_logit_decomposition": "full / f_logit / pair_content / pair_topology published per scored pair, fp32, provenance egostitch_e2e_pair_fp32_v1, resolution guard per array"
+  },
+  "diagnostics_nonbinding": [
+    "linear probes on frozen STE token states: R2 to degree / ego-density / clustering (ridge lambda 1e-3, 5-fold), plus degree-partialled variants and Pi-consistency",
+    "topology_delta = full - pair_content and content_delta = full - pair_topology summary stats",
+    "gate tanh magnitudes and per-family gradient norms over training",
+    "p0-vs-full four-logit divergence (branch-dropout effect size)"
+  ],
+  "cost_report": {
+    "requirement": "measured H20 profile REQUIRED-BEFORE-BINDING (Task 7): per-step wall, peak memory, 30-epoch extrapolation per arm, candidate scoring latency; the frozen-s0 673 s / 2.04 GiB profile explicitly does not extrapolate",
+    "measured": "REQUIRED-BEFORE-BINDING"
+  },
+  "failure_reading": "If the full arm fails the primary family against the B0+cal comparator set, the topology-conditioned encoder does not beat calibrated independent scoring at this stage; the result is written up honestly and the locked-decision discussion is taken before any Stage-2 mechanism or E1 registration. If the primaries pass but pathway attribution fails, the honest conclusion is content-side information. If the primaries pass but the 6a margin fails, the honest conclusion is a non-structure-specific capacity effect.",
+  "mechanics": {
+    "worker_obligation": "src/train_egostitch.py records this file's sha256 as run_metadata.json['preregistration_sha256'] at start",
+    "gate_obligation": "src/experiments/g5_stage1.py recomputes this file's sha256 and refuses held-out metrics unless it matches all three run metadatas",
+    "hyperparameters": "spec §13.18 defaults x fixed Seed 0; no sweeps inside this screen",
+    "p4_exclusion": "no hard heuristic/feature negatives and no hard-negative checkpoint criterion in this revision"
+  }
+}
+```
+
+The two `REQUIRED-BEFORE-BINDING` markers are the registration's own binding
+protocol, resolved in Tasks 7–8 — they are the only permitted unknowns.
+
+- [ ] **Step 2: Write the md mirror** (same sections in prose, one heading per
+  top-level key, verdict rule and failure readings verbatim).
+- [ ] **Step 3: Validate**
+
+```bash
+.venv/bin/python -c "import json; json.load(open('docs/registrations/g5_e2e_stage1_preregistration.json')); print('OK')"
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add docs/registrations/g5_e2e_stage1_preregistration.json docs/registrations/g5_e2e_stage1_preregistration.md
+git commit -m "docs(prereg): DRAFT e2e Stage-1 five-arm screening registration"
+```
+
+---
+
+### Task 5: Code — execute the committed implementation plan, Tasks 5–15
+
+**Files:** exactly those listed per-task in
+`docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md`
+(Phases 1–5). That plan contains the complete TDD code for every task; open it
+and execute Tasks 5–15 in order. Do **not** re-derive interfaces from memory.
+
+**Interfaces (what this plan relies on afterwards):**
+- `EgoStitchE2E.decompose(batch) -> dict` with keys
+  `{"full", "f_logit", "pair_content", "pair_topology"}` (Task 11).
+- Family `egostitch_e2e` trainable via `hpc/run.sh train … --worker-module
+  src.train_egostitch` with branch dropout + gate telemetry (Tasks 12–13).
+- `score_universe` writes four fp32 arrays + provenance
+  `egostitch_e2e_pair_fp32_v1` (Task 14).
+- `g5_stage1.py` computes within-checkpoint liveness, probes
+  (`src/experiments/probes.py`), and the 5-arm summary (Task 15).
+
+- [ ] **Step 1:** Execute Tasks 5–11 (model package: masks, gated x-attn,
+  scaffold builder, STE, content tokens, conditioned trunk, `EgoStitchE2E`).
+  Checkpoint after each task's commit: its test file passes.
+- [ ] **Step 2:** Mid-phase gate: `uv run pytest tests/model -v && uv run mypy src`
+  → clean.
+- [ ] **Step 3:** Execute Tasks 12–15 (worker, scoring, gate).
+- [ ] **Step 4:** Full local gate:
+
+```bash
+uv run pytest && uv run ruff check . && uv run ruff format --check . && uv run mypy src tests
+```
+Expected: green except the two documented pre-existing local failures
+(`test_b0_attention.py`, `test_e2_ddp_integration.py`).
+
+- [ ] **Step 5:** End-to-end synthetic smoke — tiny model, synthetic batch:
+  assert the four decomposed logits are finite, `full == f_logit` at init
+  (zero gates), and `p(i,j) == p(j,i)` under every null (these asserts exist as
+  unit tests from Tasks 6/11/14; run them explicitly):
+
+```bash
+uv run pytest tests/model/test_egostitch_e2e.py tests/test_score_universe.py -v
+```
+
+- [ ] **Step 6: Commit** any straggler formatting; branch merge per
+  superpowers:finishing-a-development-branch if working on a feature branch.
+
+---
+
+### Task 6: Arm support — permanent-null training override + 6a scoring control
+
+These two switches are needed by arms 2 and 4 and are **not** in the committed
+plan; they extend its Tasks 13 and 14. Spec cover: §13.18 (Task 2 Step 8).
+
+**Files:**
+- Modify: `src/model/egostitch/config.py` (add `permanent_null: str = "none"`),
+  `src/train_egostitch.py` (honor it in the loss/mask path),
+  `src/score_universe.py` (add `--scaffold-control` CLI flag)
+- Test: `tests/test_train_egostitch.py`, `tests/test_score_universe.py` (append)
+
+**Interfaces:**
+- Consumes: `masks_for_null(NULL_ALL_HEAD)` (committed plan Task 5),
+  `ScaffoldTokens` / `build_scaffold` (Task 7), `swap_direction` (Task 7).
+- Produces: config key `model.config.permanent_null ∈ {"none", "all_head"}` —
+  when `"all_head"`, every train/eval batch uses the `∅_all_head` hard mask
+  (trunk never receives conditioning; this **is** the B0-e2e arm);
+  `score_universe … --scaffold-control shuffle_within_pair` — for every pair,
+  permute the slot-index rows/cols of `Â_i`, `Â_j` and `Π` with a
+  `numpy.random.default_rng(0)`-seeded permutation **per pair** (slot tokens
+  and their features untouched; design §5 arm 6a), recorded in artifact
+  provenance as `scaffold_control=shuffle_within_pair`.
+
+- [ ] **Step 1: Failing tests**
+
+```python
+def test_permanent_all_head_null_matches_bypass(tiny_e2e_setup):
+    # training step with permanent_null="all_head" produces logits identical
+    # to the eval-time NULL_ALL_HEAD bypass on the same weights/batch
+    model, batch = tiny_e2e_setup
+    trained_logits = forward_with_config(model, batch, permanent_null="all_head")
+    bypass_logits = model.decompose(batch)["f_logit"]
+    torch.testing.assert_close(trained_logits, bypass_logits)
+
+def test_scaffold_shuffle_changes_scores_and_is_deterministic(tiny_e2e_setup_nonzero_gates):
+    model, pairs = tiny_e2e_setup_nonzero_gates
+    base = score_pairs(model, pairs)
+    shuf1 = score_pairs(model, pairs, scaffold_control="shuffle_within_pair")
+    shuf2 = score_pairs(model, pairs, scaffold_control="shuffle_within_pair")
+    assert not np.allclose(base, shuf1)        # gates non-zero => control bites
+    np.testing.assert_allclose(shuf1, shuf2)   # deterministic seed
+```
+
+- [ ] **Step 2:** Run → FAIL (`permanent_null` unknown key; unknown CLI flag).
+- [ ] **Step 3:** Implement both switches (config plumb-through; scoring-path
+  permutation applied to `ScaffoldTokens.adj` before the STE, identically on
+  the AB and BA directions so `p(i,j) = p(j,i)` is preserved).
+- [ ] **Step 4:** Run the two test files → PASS; `uv run mypy src` clean.
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/model/egostitch/config.py src/train_egostitch.py src/score_universe.py tests/test_train_egostitch.py tests/test_score_universe.py
+git commit -m "feat(g5-e2e): permanent-null training override + within-pair scaffold-shuffle scoring control"
+```
+
+---
+
+### Task 7: HPC profile smoke → measured cost table (USER-OWNED runtime)
+
+No formal artifacts; `--max-steps` debug runs only. Purpose: the registration's
+`cost_report.measured` block.
+
+**Interfaces:**
+- Consumes: Task 3 configs, Task 5/6 code deployed to the container checkout.
+- Produces: measured numbers pasted into
+  `docs/registrations/g5_e2e_stage1_preregistration.json → cost_report.measured`.
+
+- [ ] **Step 1:** Sync the container checkout to the Task-6 commit; run the
+  container test gate per `hpc/README.md` (`check` step).
+- [ ] **Step 2:** Build the raw-token pack once:
+  `hpc/run.sh train configs/egostitch_e2e_breadth_first.yaml --worker-module src.train_egostitch --max-steps 1`
+  (pack phase runs to completion; training stops immediately). Verify
+  `outputs/feature_packs/egostitch_e2e_tokens` exists.
+- [ ] **Step 3:** Bounded profile run:
+  `… --max-steps 50`. Record from `profile.json` / logs: per-step wall (mean of
+  timed steps), peak GPU memory, detected world size, selected `B_n`.
+- [ ] **Step 4:** Extrapolate: `steps_per_epoch × 30 × per-step wall` per
+  training arm (× 3 arms); compare against `runtime.total_budget_seconds`
+  (14400 provisional) and adjust the three configs if the measurement demands
+  it (config edit + commit, allowed — registration is still DRAFT).
+- [ ] **Step 5:** Scoring latency probe: score a 10k-row pair file fp32
+  (`hpc/run.sh score --checkpoint <smoke ckpt> --pairs file:<10k tsv> --output /tmp/probe.npz`),
+  record rows/s → extrapolated 2,037,171-row wall per artifact (× 4 passes).
+- [ ] **Step 6 (optional sanity check, never a paper arm):** exact-B0
+  reproduction smoke — trunk standalone under the canonical B0 recipe,
+  `--max-steps 200`; assert loss decreases and no NaN. Design §5 explicitly
+  scopes this as an implementation sanity check only.
+- [ ] **Step 7:** Paste the measured table into the registration JSON + md
+  (replacing `cost_report.measured`), commit:
+
+```bash
+git add docs/registrations/g5_e2e_stage1_preregistration.json docs/registrations/g5_e2e_stage1_preregistration.md configs/
+git commit -m "docs(prereg): measured H20 cost profile for the e2e screen"
+```
+
+---
+
+### Task 8: Bind the registration (USER decision point — hard stop)
+
+**Interfaces:**
+- Produces: `status: BINDING`, fixed sha256; after this commit the registration
+  file may not change (amendments require a new versioned registration, as with
+  the frozen-s0 predecessor).
+
+- [ ] **Step 1:** Present the two defaults to the user for explicit
+  confirmation (do not proceed on silence):
+  1. pathway-attribution share: `G_pt ≥ 0.25 × G_full` on clustering-MMD at the
+     canonical operating point;
+  2. structure-control margin: `clu(6a) − clu(full) > 0.005` (note to user: the
+     0.005 constant is carried from the matched-RD tolerance; a
+     bootstrap-std-scaled margin is the plausible alternative).
+- [ ] **Step 2:** Apply the user's confirmed values; set
+  `"status": "BINDING"`, remove both `REQUIRED-BEFORE-BINDING` markers.
+- [ ] **Step 3:** Commit, then record the binding sha:
+
+```bash
+git add docs/registrations/g5_e2e_stage1_preregistration.json docs/registrations/g5_e2e_stage1_preregistration.md
+git commit -m "docs(prereg): BIND e2e Stage-1 screening registration (user-confirmed attribution share + control margin)"
+shasum -a 256 docs/registrations/g5_e2e_stage1_preregistration.json
+```
+
+Expected: the sha printed here must reappear verbatim in all three formal
+`run_metadata.json` files (Task 9) and in the gate output (Task 10).
+
+---
+
+### Task 9: Formal runs and scoring (USER-OWNED, HPC)
+
+**Interfaces:**
+- Consumes: bound registration (Task 8), synced container checkout at the
+  binding commit.
+- Produces: three run directories under `outputs/egostitch_e2e_stage1/` and
+  four candidate-score artifacts, all sha-bound to the registration.
+
+- [ ] **Step 1: Train the three arms** (order-independent; run sequentially or
+  as GPU availability allows):
+
+```bash
+hpc/run.sh train configs/egostitch_e2e_breadth_first.yaml        --worker-module src.train_egostitch
+hpc/run.sh train configs/egostitch_e2e_f_only_breadth_first.yaml --worker-module src.train_egostitch
+hpc/run.sh train configs/egostitch_e2e_p0_breadth_first.yaml     --worker-module src.train_egostitch
+```
+Verify per run: `complete.json` status complete;
+`run_metadata.json['preregistration_sha256']` equals the Task-8 sha; §13.17
+telemetry series present (gate tanh, grad RMS, topology_delta_std).
+
+- [ ] **Step 2: Score four artifacts** (all fp32 pair pass; four-logit arrays
+  for the e2e family are automatic per Task 14):
+
+```bash
+hpc/run.sh score --checkpoint outputs/egostitch_e2e_stage1/full/best.pt   --pairs candidate --output outputs/egostitch_e2e_stage1/full/scores/candidate.npz
+hpc/run.sh score --checkpoint outputs/egostitch_e2e_stage1/full/best.pt   --pairs candidate --scaffold-control shuffle_within_pair --output outputs/egostitch_e2e_stage1/full/scores/candidate_6a.npz
+hpc/run.sh score --checkpoint outputs/egostitch_e2e_stage1/f_only/best.pt --pairs candidate --output outputs/egostitch_e2e_stage1/f_only/scores/candidate.npz
+hpc/run.sh score --checkpoint outputs/egostitch_e2e_stage1/p0/best.pt     --pairs candidate --output outputs/egostitch_e2e_stage1/p0/scores/candidate.npz
+```
+Verify per artifact: `validate_score_resolution` passed (loud failure
+otherwise), provenance `egostitch_e2e_pair_fp32_v1`, the 6a artifact
+additionally records `scaffold_control=shuffle_within_pair`.
+
+- [ ] **Step 3:** Pull the four artifacts + three run dirs back to the local
+  checkout (rsync; paths mirror the container's).
+
+---
+
+### Task 10: Gate, verdict, result note, doc sync
+
+**Files:**
+- Create: `docs/results/G5-e2e-stage1-seed0-<date>.md`
+- Modify: `README.md`, `CLAUDE.md`, `docs/03-experiment-protocol.md` (§5.0.5
+  status), `docs/artifacts/2026-07-17-egostitch-status.html` (or successor)
+
+**Interfaces:**
+- Consumes: Task 9 artifacts, Task 15 gate CLI.
+- Produces: the binding five-arm screening verdict and its documentation.
+
+- [ ] **Step 1: Run the gate** (single-process, local):
+
+```bash
+.venv/bin/python -m src.experiments.g5_stage1 \
+    --mode e2e \
+    --full-universe    outputs/egostitch_e2e_stage1/full/scores/candidate.npz \
+    --control-universe outputs/egostitch_e2e_stage1/full/scores/candidate_6a.npz \
+    --fonly-universe   outputs/egostitch_e2e_stage1/f_only/scores/candidate.npz \
+    --p0-universe      outputs/egostitch_e2e_stage1/p0/scores/candidate.npz \
+    --run-metadata outputs/egostitch_e2e_stage1/full/run_metadata.json \
+                   outputs/egostitch_e2e_stage1/f_only/run_metadata.json \
+                   outputs/egostitch_e2e_stage1/p0/run_metadata.json \
+    --b0-universe outputs/deliverables/b0_v31_breadth_first_20260711/scores/candidate.npz \
+    --b0cal-results outputs/deliverables/b0_cal_20260714 \
+    --preregistration docs/registrations/g5_e2e_stage1_preregistration.json \
+    --output-dir outputs/egostitch_e2e_stage1/formal_gate
+```
+(Exact flag names come from Task 15's implementation; if they differ, the gate
+`--help` is authoritative — but the *inputs* above are the registered set and
+may not shrink.)
+Expected outputs: `g5_e2e_stage1_results.json` + `g5_e2e_stage1_tables.md` with
+the 5-arm summary, four-logit decomposition, liveness verdict, probe table,
+pathway-attribution and 6a-margin rules evaluated, and `verdict: pass|cut`.
+
+- [ ] **Step 2: Liveness first.** If the within-checkpoint death rule fired,
+  the run is invalid (fail-closed): no held-out claims; diagnose via gate-tanh
+  telemetry before any rerun discussion. Do not reinterpret a dead run as a
+  verdict.
+- [ ] **Step 3: Write the result note** with the same skeleton as
+  `docs/results/G5-stage1-seed0-20260717.md`: verdict + scope caveat, run
+  identity table (×3 runs), 5-arm assembled table, registered decision table,
+  guards, pathway attribution, 6a margin, probe table, cost table, and the
+  verbatim registered reading for whichever branch fired.
+- [ ] **Step 4: Doc sync** — README status block, CLAUDE.md load-bearing
+  facts/evidence boundary, protocol §5.0.5 status line, status HTML. Keep the
+  numbers identical across all of them.
+- [ ] **Step 5: Commit**
+
+```bash
+git add -A
+git commit -m "docs(results): e2e Stage-1 five-arm screen — <pass|cut> verdict + doc sync"
+```
+
+- [ ] **Step 6: Next-step branch (record, don't act):**
+  - `pass` → Stage-2 planning (codebook + s3 as STE inputs) and the E1/E3
+    multi-seed registrations (remaining ladder arms: B3-full, B5, depth rungs,
+    6b–6f including degree-preserving rewiring).
+  - `cut` → the registered failure reading verbatim; locked-decision discussion
+    with the user before any successor design work.
+
+---
+
+## Self-review notes
+
+- **Spec coverage:** design §8 landing items — (1) proposal rev ✔ landed
+  `c0e2144`; (2) spec §5/§13 rewrite → Task 2; (3) protocol disposition ✔
+  staged, committed by Task 1; (4) five-arm registration → Tasks 4/8. Spec
+  §14.3 conditions map to Tasks 1 (result ✔), 2 (rewrite), 4+8 (registration),
+  5–6 (code), 7 (cost). Design §5 Stage-1 scope: all five arms have a training
+  and scoring path (arms table); reserved arms explicitly excluded from the
+  registration.
+- **Interface consistency:** `permanent_null` (Tasks 2/3/4/6/9),
+  `shuffle_within_pair` (Tasks 2/4/6/9), four-logit array names
+  `logits/f_logit/pair_content/pair_topology` (Tasks 4/5/9/10) — single
+  spelling throughout; liveness thresholds (1e-05 / 0.9999 / 0.9999 / 0.01)
+  identical in Task 2, Task 4, and the predecessor registration.
+- **Known unknowns, by design:** measured cost numbers (Task 7), the two
+  user-confirmed defaults (Task 8), gate CLI flag spellings (Task 15 of the
+  committed plan defines them; Task 10 defers to `--help` without shrinking the
+  registered input set).

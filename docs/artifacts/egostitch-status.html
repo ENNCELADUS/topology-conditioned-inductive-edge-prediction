@@ -1,0 +1,573 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Document</title>
+<style>
+/* house.css — shared style for html-doc research documents.
+   Inlined into every generated file by scripts/build_doc.py.
+   No external fonts, no CDN: everything here works offline from file://. */
+
+:root {
+  --bg: #fbfaf8;
+  --surface: #ffffff;
+  --surface-2: #f4f2ee;
+  --ink: #1c1b19;
+  --ink-2: #514e49;
+  --ink-3: #8a857d;
+  --rule: #e2ded7;
+  --rule-2: #cfc9c0;
+  --accent: #9a3412;
+  --accent-soft: #fdf0e9;
+  --include: #15803d;
+  --include-soft: #eaf6ee;
+  --reject: #b91c1c;
+  --reject-soft: #fbeeee;
+  --serif: "Source Serif Pro", "Iowan Old Style", Charter, "Songti SC", Georgia, serif;
+  --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  --radius: 6px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161513;
+    --surface: #1e1d1a;
+    --surface-2: #26241f;
+    --ink: #eceae6;
+    --ink-2: #b3aea5;
+    --ink-3: #837d73;
+    --rule: #322f2a;
+    --rule-2: #43403a;
+    --accent: #f0834f;
+    --accent-soft: #2e2018;
+    --include: #4ade80;
+    --include-soft: #17281c;
+    --reject: #f87171;
+    --reject-soft: #2b1818;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap { max-width: 1120px; margin: 0 auto; padding: 32px 24px 96px; }
+
+/* ---------- masthead ---------- */
+
+.masthead { border-bottom: 2px solid var(--ink); padding-bottom: 14px; margin-bottom: 28px; }
+.eyebrow {
+  font-size: 11px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--accent); margin-bottom: 6px;
+}
+.masthead h1 { font-family: var(--serif); font-size: 34px; line-height: 1.15; margin: 0 0 8px; font-weight: 600; }
+.dek { color: var(--ink-2); font-size: 15px; max-width: 68ch; margin: 0; }
+.meta { margin-top: 12px; font-size: 12px; color: var(--ink-3); font-family: var(--mono); }
+
+/* ---------- the decision box: every doc leads with this ---------- */
+
+.decision {
+  background: var(--accent-soft);
+  border: 1px solid var(--rule-2);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  margin-bottom: 28px;
+}
+.decision h2 { margin: 0 0 6px; font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+.decision p { margin: 0; font-size: 16px; font-family: var(--serif); }
+
+/* ---------- structure ---------- */
+
+section { margin-bottom: 40px; scroll-margin-top: 20px; }
+h2.sec {
+  font-size: 12px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--ink-3); border-bottom: 1px solid var(--rule); padding-bottom: 6px; margin: 0 0 16px;
+}
+h3 { font-family: var(--serif); font-size: 19px; margin: 0 0 8px; font-weight: 600; }
+p { margin: 0 0 12px; }
+a { color: var(--accent); text-underline-offset: 2px; }
+code { font-family: var(--mono); font-size: .88em; background: var(--surface-2); padding: 1px 5px; border-radius: 3px; }
+
+/* ---------- cards ---------- */
+
+.grid { display: grid; gap: 14px; }
+.grid.cols-2 { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.grid.cols-3 { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+.card.included { border-color: var(--include); background: var(--include-soft); }
+.card.rejected { border-color: var(--rule); background: var(--reject-soft); opacity: .72; }
+
+/* ---------- tables ---------- */
+
+.table-scroll { overflow-x: auto; border: 1px solid var(--rule); border-radius: var(--radius); background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+thead th {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--surface-2); color: var(--ink-2);
+  font-size: 11px; letter-spacing: .06em; text-transform: uppercase; font-weight: 600;
+  border-bottom: 1px solid var(--rule-2);
+}
+th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+th.sortable:hover { color: var(--ink); }
+th.sortable::after { content: " ↕"; opacity: .3; }
+th.sortable[data-dir="asc"]::after { content: " ↑"; opacity: 1; color: var(--accent); }
+th.sortable[data-dir="desc"]::after { content: " ↓"; opacity: 1; color: var(--accent); }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr.included { background: var(--include-soft); }
+tbody tr.rejected { background: var(--reject-soft); color: var(--ink-3); }
+tbody tr.rejected .title { text-decoration: line-through; }
+
+/* ---------- controls ---------- */
+
+.controls {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  margin-bottom: 14px; padding: 12px; background: var(--surface); border: 1px solid var(--rule);
+  border-radius: var(--radius);
+}
+input[type="search"], input[type="text"], select {
+  font: inherit; font-size: 13px; color: var(--ink);
+  background: var(--bg); border: 1px solid var(--rule-2); border-radius: 4px; padding: 6px 9px;
+}
+input[type="search"] { min-width: 220px; flex: 1; }
+input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.chip {
+  font-size: 11px; font-family: var(--mono); padding: 2px 7px; border-radius: 20px;
+  background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--rule); white-space: nowrap;
+}
+.chip.gap { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+
+/* tri-state include / reject toggle */
+.tri { display: inline-flex; border: 1px solid var(--rule-2); border-radius: 4px; overflow: hidden; }
+.tri button {
+  font: inherit; font-size: 12px; line-height: 1; padding: 5px 8px; cursor: pointer;
+  background: var(--surface); color: var(--ink-3); border: none; border-right: 1px solid var(--rule-2);
+}
+.tri button:last-child { border-right: none; }
+.tri button:hover { background: var(--surface-2); color: var(--ink); }
+.tri button[aria-pressed="true"][data-state="include"] { background: var(--include); color: #fff; }
+.tri button[aria-pressed="true"][data-state="reject"] { background: var(--reject); color: #fff; }
+
+.reason { display: none; margin-top: 6px; }
+tr.rejected .reason, .card.rejected .reason { display: block; }
+.reason input { width: 100%; font-size: 12px; border-color: var(--reject); }
+
+.notewrap { display: none; margin-top: 6px; }
+tr.included .notewrap, .card.included .notewrap { display: block; }
+.notewrap input { width: 100%; font-size: 12px; border-color: var(--include); }
+
+/* ---------- the roundtrip bar ---------- */
+
+.rtbar {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
+  display: flex; gap: 14px; align-items: center; justify-content: space-between;
+  padding: 10px 20px;
+  background: var(--surface); border-top: 1px solid var(--rule-2);
+  box-shadow: 0 -2px 14px rgba(0,0,0,.06);
+  font-size: 13px;
+}
+.rtbar .tally { font-family: var(--mono); color: var(--ink-2); }
+.rtbar .tally b { color: var(--include); }
+.rtbar .tally i { color: var(--reject); font-style: normal; }
+.rtbar .hint { color: var(--ink-3); font-size: 12px; }
+.copy-btn {
+  font: inherit; font-weight: 600; font-size: 13px; cursor: pointer;
+  background: var(--ink); color: var(--bg); border: none; border-radius: 5px; padding: 9px 16px;
+}
+.copy-btn:hover { background: var(--accent); }
+.copy-btn.done { background: var(--include); }
+
+/* ---------- svg figures ---------- */
+
+figure { margin: 0 0 16px; padding: 14px; background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius); overflow-x: auto; }
+figure svg { display: block; max-width: 100%; height: auto; }
+figcaption { margin-top: 10px; font-size: 12px; color: var(--ink-3); }
+.svg-label { font-family: var(--sans); font-size: 10px; fill: var(--ink-3); }
+.svg-cell { fill: var(--accent); }
+
+.empty { padding: 28px; text-align: center; color: var(--ink-3); font-style: italic; }
+
+@media (max-width: 640px) {
+  .wrap { padding: 20px 14px 100px; }
+  .masthead h1 { font-size: 26px; }
+  .rtbar { flex-wrap: wrap; gap: 8px; }
+  .rtbar .hint { display: none; }
+}
+
+@media print {
+  .rtbar, .controls, .tri { display: none; }
+  body { background: #fff; }
+  tr.rejected, .card.rejected { display: none; }
+}
+
+.body-copy { font-family: var(--serif); font-size: 16.5px; line-height: 1.62; }
+.body-copy ul, .body-copy ol { padding-left: 22px; }
+.body-copy table { margin: 8px 0; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+
+<script type="application/json" id="doc-data">
+{
+  "doc": "egostitch-stage1-closeout-2026-07-17",
+  "title": "EgoStitch G5 Stage-1 closeout",
+  "eyebrow": "Binding engineering screen · 2026-07-17",
+  "dek": "Frozen-s0 scalar fusion is cut; the rev-3.0 representation-level conditioned encoder becomes the active G5 build line.",
+  "sections": [
+    {
+      "heading": "Decision",
+      "html": "<div class='card rejected'><h3>Binding verdict: cut</h3><p>The fixed Seed-0 run at commit <code>60745f2</code> completed training, 2,037,171-row fp32 scoring, fidelity/cost diagnostics, and the registered gate. Both guards passed; clustering-MMD and matched BFS-macro GS/RD all failed strict dominance against <code>b0_cal_selfdensity</code>.</p><p><strong>Disposition:</strong> frozen-s0 <code>(s0,s1,s2)</code> scalar fusion is retained as a motivating result and ablation rung. The approved rev-3.0 stitched-topology-conditioned pair encoder is now the active G5 build line.</p></div>"
+    },
+    {
+      "heading": "Formal result",
+      "html": "<div class='table-scroll'><table><thead><tr><th>Arm</th><th>GS</th><th>BFS-macro RD</th><th>Degree MMD</th><th>Clustering MMD</th><th>Spectral MMD</th><th>Non-self edges</th></tr></thead><tbody><tr><td>B0</td><td>0.312151</td><td>0.422345</td><td>13.0768</td><td>11.9273</td><td>18.0931</td><td>30,059</td></tr><tr><td>B0+cal self-density</td><td>0.347100</td><td>1.718872</td><td>10.1085</td><td>10.1994</td><td>5.4743</td><td>274,898</td></tr><tr><td>EgoStitch, canonical quota</td><td>0.312438</td><td>0.422503</td><td>13.0415</td><td>11.8556</td><td>18.0916</td><td>30,059</td></tr><tr><td>EgoStitch at self-density quota</td><td>0.346948</td><td>1.717802</td><td>—</td><td>—</td><td>—</td><td>274,898</td></tr></tbody></table></div><p class='hint'>Registered differences versus the best comparator: clustering-MMD −1.656249; matched GS −0.000152; matched RD −0.001070. All fail. Matched edge AUPRC is 0.732468 versus B0 0.730260; degree MMD 13.0415 is below the 14.3845 guard limit. Both guards pass.</p>"
+    },
+    {
+      "heading": "What the repaired run establishes",
+      "html": "<div class='grid cols-2'><div class='card'><h3>Numerics repaired</h3><p><code>s1</code> is O(1) at epoch 1 (2.19 ± 0.058), and candidate logits are stored at full fp32 resolution. The old BF16-grid and constant-membership explanations are closed.</p></div><div class='card'><h3>Selection blind spot</h3><p>The registered AUPRC-first rule selected reconstruction-only epoch 1: validation AUPRC 0.952522 before <code>L_edge</code> activates. The formal residual/S0 std ratio is 7.95×10⁻4 and Spearman vs S0 is 0.999937.</p></div><div class='card'><h3>Measured gradient competition</h3><p>Median gradient norms: edge 0.0375, reconstruction 20.64, realism 66.28, SSL 0.00367. The Kendall trigger stayed off because two high families raised the median; low-side edge starvation was not its registered trigger.</p></div><div class='card'><h3>Weak imagination fidelity</h3><p>Slot recall@k is zero on train and test; clustering correlation is weak, and realized degree stays roughly flat while expected-degree deciles rise. The topology apparatus is not load-bearing under this contract.</p></div></div>"
+    },
+    {
+      "heading": "Epoch-30 diagnostic-only audit",
+      "html": "<p><code>last.pt</code> was scored after the formal verdict under the same evaluator. It is not a second binding result.</p><div class='table-scroll'><table><thead><tr><th>Metric</th><th>best.pt</th><th>last.pt diagnostic</th><th>Difference</th></tr></thead><tbody><tr><td>GS</td><td>0.312438</td><td>0.320038</td><td>+0.007600</td></tr><tr><td>BFS-macro RD</td><td>0.422503</td><td>0.426381</td><td>+0.003877</td></tr><tr><td>Degree MMD</td><td>13.0415</td><td>13.3117</td><td>+0.2702, worse</td></tr><tr><td>Clustering MMD</td><td>11.8556</td><td>11.8294</td><td>−0.0262, better</td></tr><tr><td>Spectral MMD</td><td>18.0916</td><td>18.5334</td><td>+0.4418, worse</td></tr><tr><td>Hard-feature AUPRC</td><td>0.617985</td><td>0.634104</td><td>+0.016120</td></tr><tr><td>Residual/S0 std ratio</td><td>0.000795</td><td>0.139816</td><td>ranking is live</td></tr></tbody></table></div><p class='hint'>The diagnostic checkpoint passes matched GS but still fails matched RD and clustering-MMD. Selection suppresses real learned signal, but changing selection alone does not reverse the cut.</p>"
+    },
+    {
+      "heading": "Successor landing state",
+      "html": "<div class='table-scroll'><table><thead><tr><th>Landing condition</th><th>Status</th><th>Boundary</th></tr></thead><tbody><tr><td>Frozen-s0 screen published</td><td><span class='chip'>SATISFIED</span></td><td>Binding <code>cut</code>; result note published.</td></tr><tr><td>Rewrite §5/§13 to rev 3.0</td><td><span class='chip'>NEXT</span></td><td>Must carry change-log lines; no silent implementation drift.</td></tr><tr><td>Fresh five-arm registration</td><td><span class='chip'>PENDING</span></td><td>Four-logit report, probes, <code>f_logit</code> liveness, attribution rule, measured H20 cost. Unresolved defaults remain unbound.</td></tr><tr><td>E2E implementation and screen</td><td><span class='chip'>PENDING</span></td><td>Runs only after Phase 0 lands; B0.py remains untouched.</td></tr></tbody></table></div><p><strong>Evidence boundary:</strong> the frozen-s0 result is a one-seed engineering screen. It supports a mechanism cut, not significance or cross-seed robustness. E1/E3 remain ≥3-seed Holm evaluations.</p><p class='ev'><code>docs/results/G5-stage1-seed0-20260717.md</code> · <code>outputs/egostitch_stage1/formal_gate/</code> · checkpoint <code>56b91c17fa8d3b86</code> · registration <code>97e61a7d…</code></p>"
+    }
+  ],
+  "artifact": "freeform",
+  "generated": "2026-07-17 04:27 EDT"
+}
+</script>
+
+<div class="wrap">
+  <header class="masthead">
+    <div class="eyebrow" id="eyebrow"></div>
+    <h1 id="title"></h1>
+    <p class="dek" id="dek"></p>
+    <div class="meta" id="meta"></div>
+  </header>
+
+  <div class="decision" id="decision-box">
+    <h2>The decision on this page</h2>
+    <p id="decision"></p>
+  </div>
+
+  <div id="content"></div>
+
+  <section id="items-sec">
+    <h2 class="sec" id="items-heading">Choose</h2>
+    <div class="grid cols-2" id="items"></div>
+  </section>
+</div>
+
+<div class="rtbar" id="rtbar">
+  <span class="tally" data-rt-tally></span>
+  <span class="hint">Your choices here paste back into Claude as JSON.</span>
+  <button class="copy-btn" data-rt-copy>Copy result ↓</button>
+</div>
+
+<script>
+/* roundtrip.js — selection state + "Copy result" for html-doc documents.
+ *
+ * The whole point of this file: what you decide while reading the document has
+ * to get back into Claude's context. It does that by serializing your choices
+ * into one fixed JSON envelope you paste into the chat.
+ *
+ * Contract — the document marks things up, this script does the rest:
+ *
+ *   data-rt-item="<id>"        on a <tr> or .card — one selectable thing
+ *     button[data-state=include|reject]   tri-state toggle inside that item
+ *     [data-rt-reason]                    reason input, shown once rejected
+ *     [data-rt-note]                      free-text note on that item
+ *   data-rt-param="<key>"      any input/select — a document-level parameter
+ *
+ * Envelope (identical across every template, so paste-back never needs guessing):
+ *
+ *   { artifact, doc, generated, selection: [id],
+ *     rejected: [{id, reason}], params: {k: v}, notes: {id: text} }
+ *
+ * State survives reload via localStorage, keyed by doc id. No network, no server.
+ */
+(function (global) {
+  'use strict';
+
+  var Roundtrip = {
+    artifact: 'freeform',
+    doc: 'untitled',
+    items: {},   // id -> 'include' | 'reject' | null
+    reasons: {}, // id -> string
+    notes: {},   // id -> string
+    onchange: null
+  };
+
+  function storageKey() { return 'html-doc:' + Roundtrip.artifact + ':' + Roundtrip.doc; }
+
+  function save() {
+    try {
+      localStorage.setItem(storageKey(), JSON.stringify({
+        items: Roundtrip.items, reasons: Roundtrip.reasons, notes: Roundtrip.notes
+      }));
+    } catch (e) { /* private browsing / disabled storage — state just won't persist */ }
+  }
+
+  function restore() {
+    try {
+      var raw = localStorage.getItem(storageKey());
+      if (!raw) return;
+      var s = JSON.parse(raw);
+      Roundtrip.items = s.items || {};
+      Roundtrip.reasons = s.reasons || {};
+      Roundtrip.notes = s.notes || {};
+    } catch (e) { /* corrupt or unavailable — start clean */ }
+  }
+
+  /** Current state as the canonical envelope. */
+  Roundtrip.envelope = function () {
+    var selection = [], rejected = [], params = {}, notes = {};
+
+    Object.keys(Roundtrip.items).forEach(function (id) {
+      var st = Roundtrip.items[id];
+      if (st === 'include') selection.push(id);
+      else if (st === 'reject') {
+        rejected.push({ id: id, reason: (Roundtrip.reasons[id] || '').trim() || null });
+      }
+    });
+
+    document.querySelectorAll('[data-rt-param]').forEach(function (el) {
+      var key = el.getAttribute('data-rt-param');
+      var val;
+      if (el.type === 'checkbox') val = el.checked;
+      else if (el.type === 'number' || el.type === 'range') val = Number(el.value);
+      else val = el.value;
+      params[key] = val;
+    });
+
+    Object.keys(Roundtrip.notes).forEach(function (id) {
+      var t = (Roundtrip.notes[id] || '').trim();
+      if (t) notes[id] = t;
+    });
+
+    return {
+      artifact: Roundtrip.artifact,
+      doc: Roundtrip.doc,
+      generated: new Date().toISOString(),
+      selection: selection,
+      rejected: rejected,
+      params: params,
+      notes: notes
+    };
+  };
+
+  /** Every element carrying this item id. Matched by attribute value rather than
+   *  by building a selector, so an id containing a quote or a colon can't break it. */
+  Roundtrip.elementsFor = function (id) {
+    return Array.prototype.filter.call(
+      document.querySelectorAll('[data-rt-item]'),
+      function (el) { return el.getAttribute('data-rt-item') === id; }
+    );
+  };
+
+  /** Paint an item's row/card to match its state. */
+  function paint(id) {
+    var st = Roundtrip.items[id] || null;
+    Roundtrip.elementsFor(id).forEach(function (el) {
+      el.classList.toggle('included', st === 'include');
+      el.classList.toggle('rejected', st === 'reject');
+      el.querySelectorAll('button[data-state]').forEach(function (b) {
+        b.setAttribute('aria-pressed', String(b.getAttribute('data-state') === st));
+      });
+      var reason = el.querySelector('[data-rt-reason]');
+      if (reason) reason.value = Roundtrip.reasons[id] || '';
+      var note = el.querySelector('[data-rt-note]');
+      if (note) note.value = Roundtrip.notes[id] || '';
+    });
+  }
+
+  /* onchange fires only when the *selection* changes — never on a repaint.
+   * A repaint that fired onchange would recurse without end for any document
+   * whose onchange re-renders its list (litreview does, to re-run its filter). */
+  function tally(fireChange) {
+    var inc = 0, rej = 0, total = document.querySelectorAll('[data-rt-item]').length;
+    Object.keys(Roundtrip.items).forEach(function (id) {
+      if (Roundtrip.items[id] === 'include') inc++;
+      else if (Roundtrip.items[id] === 'reject') rej++;
+    });
+    var el = document.querySelector('[data-rt-tally]');
+    if (el) {
+      el.innerHTML = '<b>' + inc + ' included</b> · <i>' + rej + ' rejected</i> · ' +
+        (total - inc - rej) + ' undecided';
+    }
+    if (fireChange && typeof Roundtrip.onchange === 'function') Roundtrip.onchange(inc, rej, total);
+  }
+
+  /** Set an item's state; passing the state it already has clears it. */
+  Roundtrip.set = function (id, state) {
+    Roundtrip.items[id] = (Roundtrip.items[id] === state) ? null : state;
+    if (Roundtrip.items[id] !== 'reject') delete Roundtrip.reasons[id];
+    save(); paint(id); tally(true);
+  };
+
+  /** Copy the envelope to the clipboard. Falls back to execCommand, which is what
+   *  actually fires when the async clipboard API is blocked on file:// origins. */
+  Roundtrip.copy = function (btn) {
+    var text = JSON.stringify(Roundtrip.envelope(), null, 2);
+
+    var ok = function () {
+      if (!btn) return;
+      var old = btn.textContent;
+      btn.textContent = '✓ Copied — paste into Claude';
+      btn.classList.add('done');
+      setTimeout(function () { btn.textContent = old; btn.classList.remove('done'); }, 2200);
+    };
+    var fallback = function () {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+      document.body.appendChild(ta);
+      ta.select();
+      var done = false;
+      try { done = document.execCommand('copy'); } catch (e) { done = false; }
+      document.body.removeChild(ta);
+      if (done) ok();
+      else global.prompt('Copy this JSON and paste it into Claude:', text);
+    };
+
+    if (global.navigator && navigator.clipboard && global.isSecureContext) {
+      navigator.clipboard.writeText(text).then(ok, fallback);
+    } else {
+      fallback();
+    }
+  };
+
+  /** Wire up the document. Call once, after the items exist in the DOM. */
+  Roundtrip.init = function (opts) {
+    Roundtrip.artifact = opts.artifact || Roundtrip.artifact;
+    Roundtrip.doc = opts.doc || Roundtrip.doc;
+    restore();
+
+    document.addEventListener('click', function (e) {
+      var btn = e.target.closest('button[data-state]');
+      if (!btn) return;
+      var item = btn.closest('[data-rt-item]');
+      if (!item) return;
+      Roundtrip.set(item.getAttribute('data-rt-item'), btn.getAttribute('data-state'));
+    });
+
+    document.addEventListener('input', function (e) {
+      var item = e.target.closest('[data-rt-item]');
+      if (item && e.target.hasAttribute('data-rt-reason')) {
+        Roundtrip.reasons[item.getAttribute('data-rt-item')] = e.target.value;
+        save();
+      } else if (item && e.target.hasAttribute('data-rt-note')) {
+        Roundtrip.notes[item.getAttribute('data-rt-item')] = e.target.value;
+        save();
+      } else if (e.target.hasAttribute('data-rt-param')) {
+        var out = document.querySelector('[data-rt-param-out="' + e.target.getAttribute('data-rt-param') + '"]');
+        if (out) out.textContent = e.target.value;
+        save();
+      }
+    });
+
+    var copyBtn = document.querySelector('[data-rt-copy]');
+    if (copyBtn) copyBtn.addEventListener('click', function () { Roundtrip.copy(copyBtn); });
+
+    Roundtrip.repaint();
+  };
+
+  /** Re-apply state to the DOM. Call after re-rendering a list (sort, filter). */
+  Roundtrip.repaint = function () {
+    document.querySelectorAll('[data-rt-item]').forEach(function (el) {
+      paint(el.getAttribute('data-rt-item'));
+    });
+    document.querySelectorAll('[data-rt-param]').forEach(function (el) {
+      var out = document.querySelector('[data-rt-param-out="' + el.getAttribute('data-rt-param') + '"]');
+      if (out) out.textContent = el.value;
+    });
+    tally(false);
+  };
+
+  global.Roundtrip = Roundtrip;
+})(window);
+
+</script>
+
+<script>
+(function () {
+  'use strict';
+  var DATA = JSON.parse(document.getElementById('doc-data').textContent);
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function text(id, v) { var el = document.getElementById(id); if (el) el.textContent = v || ''; }
+
+  text('eyebrow', DATA.eyebrow || '');
+  text('title', DATA.title);
+  text('dek', DATA.dek);
+  text('meta', 'generated ' + (DATA.generated || ''));
+  document.title = DATA.title || 'Document';
+
+  if (DATA.decision) text('decision', DATA.decision);
+  else document.getElementById('decision-box').hidden = true;
+
+  /* Sections carry authored HTML. Claude writes this file, so the markup is
+     trusted the same way the rest of the template is — that is precisely what
+     buys the SVG, the tables and the layout that Markdown cannot express. */
+  document.getElementById('content').innerHTML = (DATA.sections || []).map(function (s) {
+    return '<section>' +
+      (s.heading ? '<h2 class="sec">' + esc(s.heading) + '</h2>' : '') +
+      '<div class="body-copy">' + (s.html || '') + '</div>' +
+    '</section>';
+  }).join('');
+
+  var items = DATA.items || [];
+  if (!items.length) {
+    document.getElementById('items-sec').hidden = true;
+    document.getElementById('rtbar').hidden = true;   // read-only doc: no bar to nag with
+  } else {
+    text('items-heading', DATA.items_heading || 'Choose');
+    document.getElementById('items').innerHTML = items.map(function (it) {
+      return '' +
+      '<div class="card" data-rt-item="' + esc(it.id) + '">' +
+        '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start">' +
+          '<div><code>' + esc(it.id) + '</code><h3 style="margin:6px 0 4px">' + esc(it.name) + '</h3></div>' +
+          '<span class="tri">' +
+            '<button data-state="include" aria-pressed="false" title="Yes">✓</button>' +
+            '<button data-state="reject" aria-pressed="false" title="No">✗</button>' +
+          '</span>' +
+        '</div>' +
+        (it.desc ? '<p style="color:var(--ink-2);font-size:14px;margin:0 0 8px">' + esc(it.desc) + '</p>' : '') +
+        (it.tags || []).map(function (t) { return '<span class="chip">' + esc(t) + '</span> '; }).join('') +
+        '<div class="reason"><input data-rt-reason type="text" placeholder="Why not?"></div>' +
+        '<div class="notewrap"><input data-rt-note type="text" placeholder="Note…"></div>' +
+      '</div>';
+    }).join('');
+  }
+
+  Roundtrip.init({ artifact: 'freeform', doc: DATA.doc || 'doc' });
+})();
+</script>
+</body>
+</html>

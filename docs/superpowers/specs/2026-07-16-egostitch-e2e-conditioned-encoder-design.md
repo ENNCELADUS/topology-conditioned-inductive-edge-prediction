@@ -5,10 +5,11 @@
 corrections applied in rev 3). **Research-doc landing executed 2026-07-16 by explicit
 user instruction:** proposal §4.4 (rev 3.0 headline), protocol §0 disposition +
 `B0-e2e` row + E4.15–E4.17, spec §14 (successor summary; §§1–13 untouched), and the
-README now carry this design. **Still gated on the frozen-s0 screen publishing:**
-all implementation (plan Phases 1–5), the full §5/§13 spec rewrite, the new config,
-and the replacement registration. The pending screening registration continues to
-bind to spec §§1–13 unchanged.
+README now carry this design. **The frozen-s0 publication gate was satisfied on
+2026-07-17 by the binding `cut` verdict.** Phase 0 (the full §5/§13 spec rewrite,
+new config, and fresh registration) is unblocked; implementation Phases 1–5 remain
+unauthorized until that normative landing is complete. Spec §§1–13 continue to
+describe the retained frozen-s0 implementation, not the successor build.
 
 **Rev 2 delta:** the rev-1 headline (pooled topology context `c` fused by a
 zero-init low-rank adapter) was assessed by the user-as-reviewer as readable as
@@ -313,7 +314,11 @@ the full shuffle set — is reserved for the formal multi-seed E1/E3 experiments
   frozen-B0 logit cache (spec §13.10), the fresh-frozen-s0 comparator scoring
   step in the gate, and the separate `s4` scalar channel (absorbed by the STE).
 
-## 8. Landing sequence (after the frozen-s0 screen publishes)
+## 8. Landing sequence (frozen-s0 prerequisite satisfied 2026-07-17)
+
+The replacement frozen-s0 screen published a binding `cut` verdict; see
+`docs/results/G5-stage1-seed0-20260717.md`. The sequence below is therefore
+unblocked, but its fresh registration and unresolved defaults remain prospective.
 
 1. `docs/04-model-proposal.md` rev: §4.4 rewritten from anchored late fusion to
    the stitched-topology-conditioned encoder; §4.4's `s4` promoted into the STE;

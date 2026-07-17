@@ -20,11 +20,12 @@ strict, ruff. Tests mirror `src/` under `tests/`.
 
 ## Global Constraints
 
-- **GOVERNANCE GATE (Phase 0):** Phase 0 tasks (docs/spec/protocol/registration/
-  config) are **BLOCKED until the currently registered frozen-s0 Stage-1 screen
-  completes and publishes.** Per the spec freeze rule ("edit the spec first, then
-  the code"), Phases 1–5 execute only **after** Phase 0. Nothing in this plan
-  edits `docs/03/04/05`, `configs/`, or `docs/registrations/` before the gate lifts.
+- **GOVERNANCE GATE (Phase 0): LIFTED 2026-07-17.** The registered frozen-s0
+  Stage-1 screen published a binding `cut` verdict; see
+  `docs/results/G5-stage1-seed0-20260717.md`. Phase 0 may now perform the explicit
+  spec/protocol/config rewrite. Per the freeze rule ("edit the spec first, then the
+  code"), Phases 1–5 still execute only **after** Phase 0, and no successor formal
+  run may start before its fresh registration and unresolved defaults are bound.
 - All work on branch `g5/e2e-encoder`, branched from `main`.
 - `src/model/B0.py` is the audited B0 family: **do not modify it** (provenance
   audit, protocol §E5). All trunk changes live in `src/model/egostitch/`.
@@ -47,7 +48,7 @@ strict, ruff. Tests mirror `src/` under `tests/`.
 
 ---
 
-## Phase 0 — Landing gate: docs, config, registration (BLOCKED until screen publishes)
+## Phase 0 — Landing gate: docs, config, registration (UNBLOCKED 2026-07-17)
 
 ### Task 1: Spec edits (docs/05-egostitch-spec.md)
 

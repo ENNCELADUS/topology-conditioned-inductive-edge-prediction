@@ -7,7 +7,7 @@
 <p>
   <img alt="Venue" src="https://img.shields.io/badge/target-ICLR%202027-b31b1b">
   <img alt="Type" src="https://img.shields.io/badge/paper-empirical%20ML%20method-blue">
-  <img alt="Status" src="https://img.shields.io/badge/status-G5%20Stage--1-yellow">
+  <img alt="Status" src="https://img.shields.io/badge/status-G5%20rev--3.0%20build-orange">
   <img alt="Code" src="https://img.shields.io/badge/implementation-EgoStitch%20Stage--1-green">
 </p>
 
@@ -28,12 +28,14 @@
 
 This repository holds the implementation and experiment pipeline for an ICLR 2027
 paper. The benchmark loaders, evaluation library, B0/B0-alt baselines, score-once
-artifact pipeline, gates G1–G3, and the pre-registered EgoStitch Stage-1 model are
-implemented and tested. A 2026-07-16 Seed-0 topology diagnostic completed under the
-superseded three-seed registration and showed essentially no change from frozen B0;
-it remains diagnostic-only. G5 Stage 1 is now a one-fixed-seed engineering screen,
-but no run has yet been bound to the replacement registration with its required
-fidelity and cost reports, so there is no current G5 Stage-1 verdict.
+artifact pipeline, gates G1–G3, and the frozen-s0 EgoStitch Stage-1 model are
+implemented and tested. The replacement fixed-Seed-0 screen completed on 2026-07-16
+under its bound registration and produced a formal **`cut`** verdict: both guards
+passed, but EgoStitch failed all three required topology-dominance checks against
+the calibrated-B0 ladder. The frozen-s0 scalar head is now a motivating result and
+ablation rung; the active G5 build line is the approved rev-3.0 end-to-end
+stitched-topology-conditioned pair encoder. This one-seed engineering decision does
+not replace E1/E3's multi-seed Holm inference.
 
 - **Task:** given two *unseen* nodes with frozen feature vectors, predict whether an
   edge exists between them (binary classification), under a strict inductive protocol
@@ -115,15 +117,16 @@ close the topology gap. The complete closeout package is
 
 ## The Proposed Method (EgoStitch)
 
-> **Status: Stage-1 (frozen-s0 form) implemented; replacement screening gate incomplete;
-> headline revised to rev 3.0 (2026-07-16).** Design proposal approved and gate G4 signed off —
+> **Status: frozen-s0 Stage-1 formally cut; rev-3.0 successor build unblocked
+> (2026-07-17).** Design proposal approved and gate G4 signed off —
 > [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) is the active implementation
 > contract (algorithm spec + benchmark/data contract + auto-sized H20 execution design); its
 > §14 records the approved e2e successor headline. Design
 > rationale: [`docs/04-model-proposal.md`](docs/04-model-proposal.md) (rev 3.0). G1 (including
-> B0-alt), G2, and G3 (Oracle) are complete. The frozen-s0 Stage-1 screen still awaits a
-> fixed-Seed-0 run bound to the replacement registration plus fidelity/cost diagnostics
-> and the held-out screening evaluation; its outcome motivates the e2e successor build.
+> B0-alt), G2, and G3 (Oracle) are complete. The binding frozen-s0 result is recorded in
+> [`docs/results/G5-stage1-seed0-20260717.md`](docs/results/G5-stage1-seed0-20260717.md):
+> matched edge AUPRC and degree-MMD guards pass, while clustering-MMD and matched
+> BFS-macro GS/RD all fail. The rev-3.0 e2e screen now becomes the next G5 build.
 
 For each queried pair `(i, j)`, each endpoint **imagines its own ego-network** (latent
 neighbor nodes with existence probabilities, local adjacency, and a degree budget)
@@ -162,7 +165,8 @@ docs/
   lit-review-plan.md             review plan, claims K1–K5, terminology guardrail
   results/
     E2-pair-to-topology-gap.md   the motivating result note
-    G5-stage1-seed0-20260715.md  completed Seed-0 training result; no G5 verdict
+    G5-stage1-seed0-20260715.md  superseded-registration training record
+    G5-stage1-seed0-20260717.md  binding frozen-s0 screen (`cut`) + last.pt diagnostic
 figures/
   e2-gap.html                    edge-vs-topology contrast (open in a browser)
   positioning.html               2×2 taxonomy positioning figure
@@ -201,8 +205,9 @@ general graph-ML benchmark. Don't substitute real dataset names unless asked.
 | 4 | [`docs/04-model-proposal.md`](docs/04-model-proposal.md) | EgoStitch rationale (approved 2026-07-09) |
 | 5 | [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) | **Implementation contract**: algorithm, data/batch contract, auto-sized H20 execution |
 | 6 | [`docs/results/E2-pair-to-topology-gap.md`](docs/results/E2-pair-to-topology-gap.md) | Motivating result |
-| 7 | [`docs/results/G5-stage1-seed0-20260715.md`](docs/results/G5-stage1-seed0-20260715.md) | Completed Seed-0 training result; G5 remains incomplete |
-| 8 | [`docs/lit-review-plan.md`](docs/lit-review-plan.md) | Review plan, claims, terminology guardrail |
+| 7 | [`docs/results/G5-stage1-seed0-20260717.md`](docs/results/G5-stage1-seed0-20260717.md) | Binding frozen-s0 Stage-1 result (`cut`) and diagnostic interpretation |
+| 8 | [`docs/results/G5-stage1-seed0-20260715.md`](docs/results/G5-stage1-seed0-20260715.md) | Historical superseded-registration training record |
+| 9 | [`docs/lit-review-plan.md`](docs/lit-review-plan.md) | Review plan, claims, terminology guardrail |
 
 When documents conflict, the more specific/later one refines the earlier — but locked
 decisions and the locked §0 method boundary override casual changes.
@@ -227,9 +232,10 @@ target test graph; the queried edge is masked/standardized inside the scaffold. 
 - [x] **Latest legacy v3.1 robustness rerun** — canonical G1 confirms that the stronger scorer preserves the topology gap; final artifacts are under [`outputs/deliverables/legacy_g1_graph_metrics_20260714/`](outputs/deliverables/legacy_g1_graph_metrics_20260714/).
 - [x] **G3 gate** — Oracle row passed; Oracle-blend shows substantial headroom over B0 and the feature-insufficiency stop rule is not triggered. Final artifacts are under [`outputs/deliverables/g3_graph_metrics_20260714/`](outputs/deliverables/g3_graph_metrics_20260714/).
 - [x] **EgoStitch Stage-1 implementation (frozen-s0 form)** — model, losses, data targets, auto-sized DDP worker, scoring, fidelity diagnostics, calibrated comparator, G5 runner, and tests are implemented under `src/`.
-- [x] **E2E headline redesign (rev 3.0)** — approved 2026-07-16 after two user-as-reviewer rounds + a vault/arXiv novelty sweep: stitched-topology-conditioned pair encoder (no frozen anchor). Design record: [`docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md`](docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md); implementation summary: spec §14; plan (execution gated on the frozen-s0 screen): [`docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md`](docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md).
-- [ ] **G5 Stage-1 screening gate** — the latest exact-quota Seed-0 run completed training, candidate scoring, and a diagnostic-only topology evaluation under the superseded registration. The replacement one-seed screen still needs a newly bound run plus fidelity/cost reports. See [`docs/results/G5-stage1-seed0-20260715.md`](docs/results/G5-stage1-seed0-20260715.md); the existing artifact is not retroactively a G5 pass/cut.
-- [ ] **Experiments** in priority order: complete the replacement frozen-s0 Stage-1 single-seed screen (motivating arm) → land spec §14 + fresh registration → e2e conditioned-encoder Stage-1 five-arm screen → accepted later G5 stages → E1/E3 multi-seed main + baselines → E4 ablations (incl. E4.15–E4.17 attribution/structure/conditioning-depth) → E5 integrity gates → E7 (load-bearing) → E6 breadth.
+- [x] **E2E headline redesign (rev 3.0)** — approved 2026-07-16 after two user-as-reviewer rounds + a vault/arXiv novelty sweep: stitched-topology-conditioned pair encoder (no frozen anchor). Design record: [`docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md`](docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md); implementation summary: spec §14; Phase 0 is unblocked by the completed frozen-s0 screen: [`docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md`](docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md).
+- [x] **G5 frozen-s0 Stage-1 screening gate** — binding fixed-Seed-0 verdict `cut`: all three primary topology-dominance checks fail and both guards pass. The selected warm-start checkpoint is near S0; a diagnostic `last.pt` rerun proves later joint training moves ranking and passes matched GS, but still fails matched RD/clustering and regresses degree/spectral MMD. See the [result note](docs/results/G5-stage1-seed0-20260717.md) and [presentation-only status snapshot](docs/artifacts/2026-07-17-egostitch-status.html).
+- [x] **Locked-decision disposition** — frozen-s0 scalar fusion is retired to motivating-arm + ablation status; rev 3.0 is the active G5 build line. Successor landing condition §14.3(1) is satisfied.
+- [ ] **Experiments** in priority order: complete the rev-3.0 Phase-0 spec/protocol/config work and fresh five-arm registration → e2e conditioned-encoder Stage-1 screen → accepted later G5 stages → E1/E3 multi-seed main + baselines → E4 ablations (incl. E4.15–E4.17 attribution/structure/conditioning-depth) → E5 integrity gates → E7 (load-bearing) → E6 breadth.
 
 ## HPC execution
 

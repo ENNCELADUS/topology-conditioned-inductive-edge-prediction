@@ -9,9 +9,9 @@
 **Experiment:** hardened E2 on Benchmark-A (`breadth_first`).
 
 **Status:** G1, G2, and G3 are complete. G1 closes the architecture-independence
-requirement; neither G2 nor G3 triggers its stop rule. EgoStitch Stage 1 was subsequently
-implemented under the approved specification; its replacement one-seed engineering
-screening gate is incomplete.
+requirement; neither G2 nor G3 triggers its stop rule. The subsequent frozen-s0
+EgoStitch Stage-1 one-seed engineering screen is also complete with binding verdict
+`cut`; rev 3.0 is now the active G5 build line.
 
 | Gate | Headline evidence | Decision |
 |---|---|---|
@@ -225,11 +225,13 @@ separately.
 The benchmark-aligned threshold sweep is preserved in the formal G1 artifact. Any claim
 away from the documented operating point must identify its exact threshold and recall.
 
-The next research stage is completion of the replacement G5 Stage-1 fixed-one-seed
-screening run and held-out gate under [`docs/05-egostitch-spec.md`](../05-egostitch-spec.md).
-The retained Seed-0 result is recorded separately in
-[`G5-stage1-seed0-20260715.md`](G5-stage1-seed0-20260715.md); its superseded registration
-hash means it is not retroactively a G5 verdict.
+The replacement G5 frozen-s0 Stage-1 screen is complete with binding verdict `cut`:
+both guards pass and all three topology-dominance criteria fail. The locked
+disposition is frozen-s0 scalar fusion → motivating arm + ablation, with the rev-3.0
+e2e conditioned encoder taking over the active G5 build line. See
+[`G5-stage1-seed0-20260717.md`](G5-stage1-seed0-20260717.md). The older
+[`G5-stage1-seed0-20260715.md`](G5-stage1-seed0-20260715.md) remains a historical
+superseded-registration record and is not retroactively promoted.
 
 ## 7. Source artifacts
 

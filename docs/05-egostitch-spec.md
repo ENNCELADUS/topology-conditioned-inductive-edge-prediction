@@ -539,11 +539,16 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   contract for the pending frozen-s0 screening run and its code; §14 records the
   successor architecture and its landing conditions. No §5/§13 semantics change in
   this edit.
+- 2026-07-17: result-status closeout only. The replacement fixed-Seed-0 frozen-s0
+  screen completed under registration `97e61a7d...` and returned binding verdict
+  `cut`: all three primary dominance criteria failed and both guards passed. The
+  locked disposition is frozen-s0 scalar fusion → motivating arm + ablation, and
+  rev-3.0 e2e conditioning → active G5 build line. This satisfies §14.3(1) but does
+  not yet rewrite §5/§13, bind successor defaults, or authorize a formal e2e run.
 
-**Open gate-report deliverable:** FLOPs/latency table template (§4.7 commitment —
-delivered with the G5 Stage-1 gate report). Stage-1 code now exists; the replacement
-one-seed screening gate remains incomplete until a run is bound to its new registration
-and supplies the required fidelity and cost reports. Closed 2026-07-14: the four
+**Closed gate-report deliverable (2026-07-17):** the frozen-s0 Stage-1 gate report,
+fidelity diagnostics, and measured FLOPs/latency report are complete. The binding
+verdict is `cut`; see `docs/results/G5-stage1-seed0-20260717.md`. Closed 2026-07-14: the four
 ego-stat target definitions (§13.6); Benchmark-A/B/C ↔ split-strategy mapping
 (confirmed at G1: `Benchmark-A = breadth_first`, §9.1).
 
@@ -807,11 +812,12 @@ turned into a post-hoc outcome switch. It is a run-validity gate, not a success 
 **Scope and precedence.** This section records the approved rev-3.0 headline
 architecture (proposal §4.4; full decision trail and pins in
 `docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md`).
-**§§1–13 remain the binding implementation contract** for the pending frozen-s0
-Stage-1 screening run and for all code on `main` today. §14 becomes normative for
-implementation only after that screen publishes, at which point §5/§13 are rewritten
-to it (with change-log lines) and a fresh Stage-1 registration is bound. Until then,
-no code may implement §14 into the formal pipeline.
+**§§1–13 remain the historical binding contract** for the completed frozen-s0
+Stage-1 screen and its retained implementation on `main`. That screen published a
+binding `cut` verdict on 2026-07-17, satisfying §14.3(1). §14 becomes normative for
+implementation only when §5/§13 are rewritten to it with change-log lines and a fresh
+Stage-1 registration is bound. The closeout result alone does not silently mutate the
+formal pipeline.
 
 ### 14.1 Architecture summary
 
@@ -856,6 +862,8 @@ cache is retired for this family.
 ### 14.3 Landing conditions (all required before a binding e2e run)
 
 1. Frozen-s0 screen published (its outcome is the successor's motivating arm).
+   **Satisfied 2026-07-17:** binding verdict `cut`; result note
+   `docs/results/G5-stage1-seed0-20260717.md`.
 2. §5/§13 rewritten to §14 with change-log lines; §13.18-style pins for defaults
    (`ste_layers = 3`, `ste_dim = 128`, `xattn_heads = 8`, `n_inj` default 1 sweep
    {1, 2}).
