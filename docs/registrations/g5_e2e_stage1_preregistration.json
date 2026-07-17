@@ -1,0 +1,138 @@
+{
+  "registration_id": "g5-e2e-stage1-20260717-conditioned-encoder-screen-v1",
+  "status": "DRAFT",
+  "gate": "G5 Stage 1 - EgoStitch E2E stitched-topology-conditioned pair encoder",
+  "created_utc": "2026-07-17T00:00:00Z",
+  "spec_binding": "docs/05-egostitch-spec.md §5/§13 (2026-07-17 rewrite, incl. §13.18) + §14",
+  "protocol_binding": "docs/03-experiment-protocol.md §5.0.5, §5.2, E4.15-E4.17",
+  "predecessor": {
+    "registration": "g5-stage1-20260716-membership-normalized-screen-v2",
+    "sha256": "97e61a7de006a3279d67e3adf1f7f1c663a7a739cf2682febfc0ca3219d0c446",
+    "verdict": "cut",
+    "result": "docs/results/G5-stage1-seed0-20260717.md"
+  },
+  "benchmark": {
+    "alias": "Benchmark-A",
+    "strategy": "breadth_first"
+  },
+  "seeds": [0],
+  "arms": {
+    "full": {
+      "training": "configs/egostitch_e2e_breadth_first.yaml",
+      "scored_array": "logits"
+    },
+    "b0_e2e_f_only": {
+      "training": "configs/egostitch_e2e_f_only_breadth_first.yaml",
+      "scored_array": "logits",
+      "note": "permanent ∅_all_head; the matched pairwise-only control - the only arm '-topology' claims compare against"
+    },
+    "pair_topology": {
+      "training": "configs/egostitch_e2e_pair_topology_breadth_first.yaml",
+      "scored_array": "logits",
+      "note": "permanent ∅_content_head, separately trained; THE registered attribution arm. The full checkpoint's eval-bypass pair_topology array is a nonbinding diagnostic only."
+    },
+    "structure_control_6a": {
+      "training": "none (full checkpoint)",
+      "scoring": "scaffold control shuffle_within_pair, stable-hash keyed (spec §13.18, keying canonical_pair_v1), control seed 0",
+      "scored_array": "logits"
+    },
+    "p0": {
+      "training": "configs/egostitch_e2e_p0_breadth_first.yaml",
+      "scored_array": "logits"
+    }
+  },
+  "comparators": ["b0", "b0_cal_density", "b0_cal_selfdensity", "b0_cal_degseq"],
+  "comparator_note": "carried over from the frozen-s0 screen; b0_cal_selfdensity is the empirically strongest arm there and remains the bar",
+  "frozen_inputs": {
+    "b0_candidate_scores": {
+      "path": "outputs/deliverables/b0_v31_breadth_first_20260711/scores/candidate.npz",
+      "sha256": "c5873caa3fece651d1155fd725e04f26a432ceee59d8e78dcda5f4acd687a95d",
+      "checkpoint_id": "e092537d8cf1e208"
+    },
+    "g1_results": {
+      "path": "outputs/deliverables/g1_graph_metrics_20260714/g1_results.json",
+      "sha256": "668129a7c300d87682250382a36ef854c1f301c21d078b261f2b0fe2ae9d1ca4"
+    },
+    "g3_results": {
+      "path": "outputs/deliverables/g3_graph_metrics_20260714/g3_results.json",
+      "sha256": "e7fbc8e4e7f76ffe1f50123ac8e96c776cded79406e01e638539a3f835b79c24"
+    }
+  },
+  "operating_point": {
+    "canonical": "density-matched threshold on non-self candidate rows against target_edges = |E(strip_self_loops(test))| (predecessor definition, unchanged)",
+    "matched": "per comparator: the evaluated arm realizes the comparator's exact non-self edge quota by descending pass-1 score (predecessor matched-global-RD rule, unchanged)"
+  },
+  "primary_criteria": {
+    "decision_procedure": "single_seed_point_estimate_dominance",
+    "applies_to_arm": "full",
+    "criteria": [
+      {
+        "metric": "clustering_mmd_ratio",
+        "direction": "lower_is_better",
+        "rule": "strictly lower than every comparator at the canonical operating point"
+      },
+      {
+        "metric": "bfs_macro_gs",
+        "direction": "higher_is_better",
+        "rule": "strictly higher than each comparator at that comparator's exact matched-global-RD quota"
+      },
+      {
+        "metric": "bfs_macro_rd",
+        "direction": "higher_is_better",
+        "rule": "strictly higher than each comparator at that same matched quota"
+      }
+    ],
+    "all_must_pass": true,
+    "statistics_procedure": "No inferential acceptance procedure with one seed; p-values, CI pass flags, and Holm decisions are reported as not applicable"
+  },
+  "guards": [
+    {
+      "name": "degree_mmd_non_regression",
+      "rule": "full-arm degree-MMD ratio <= 1.10 x the B0 degree-MMD ratio recomputed from the frozen candidate artifact"
+    },
+    {
+      "name": "matched_edge_auprc",
+      "rule": "full-arm degree-corrected candidate AUPRC >= B0's - 0.02; B0-e2e AUPRC reported alongside as the matched (nonbinding) reference"
+    }
+  ],
+  "e2e_rules": {
+    "pathway_attribution": {
+      "metric": "clustering_mmd_ratio at the canonical operating point",
+      "definition": "G_full = clu(b0_e2e_f_only) - clu(full); G_pt = clu(b0_e2e_f_only) - clu(pair_topology [separately trained arm])",
+      "rule": "applies iff primaries pass and G_full > 0: require G_pt >= 0.25 * G_full",
+      "reading_on_fail": "the gain is content-side; the topology-representation claim is withdrawn from the headline",
+      "user_confirmed": "2026-07-17 review (accepted, on the separately trained arm)"
+    },
+    "structure_control_condition": {
+      "rule": "paired bootstrap over the 500 fixed evaluation subgraphs: shared resample indices across the two arms, B = 1000 replicates, bootstrap seed 0; require the lower bound of the two-sided 95% interval (2.5th percentile) of clu(structure_control_6a) - clu(full) to exceed 0",
+      "scope": "quantifies evaluator sampling stability at the fixed training seed; explicitly NOT cross-seed or inferential evidence",
+      "reading_on_fail": "the shuffled relational connectivity was not necessary beyond the retained topology-derived node features (slot tokens keep pi, m, soft degrees); this does NOT prove the whole gain is non-topological - it bounds which part of the topology pathway is load-bearing",
+      "user_confirmed": "2026-07-17 review (replaces the rejected fixed 0.005 margin)"
+    },
+    "liveness_within_checkpoint": {
+      "reference": "f_logit of the same checkpoint (spec §13.17 as re-registered)",
+      "death_rule": "conjunctive: min_residual_std_ratio 1e-05 AND max_spearman 0.9999 AND max_topk_overlap 0.9999 at topk_fraction 0.01, residual = full - f_logit, denominator std(f_logit)",
+      "consequence": "run-validity failure; gate fails closed before held-out topology metrics"
+    },
+    "four_logit_decomposition": "full / f_logit / pair_content / pair_topology published per scored pair for the full and p0 checkpoints, fp32, provenance egostitch_e2e_pair_fp32_v1, resolution guard per array; DIAGNOSTIC decomposition - the registered attribution arm is the separately trained pair_topology run",
+    "checkpoint_selection": "validation AUPRC primary; within selection_auprc_tolerance 1e-4, prefer the larger within-checkpoint std(full - f_logit)/std(f_logit) (spec §13.8 as re-registered)"
+  },
+  "diagnostics_nonbinding": [
+    "same-checkpoint decomposition deltas: topology_delta = full - pair_content, content_delta = full - pair_topology(bypass), and bypass-vs-trained pair_topology divergence",
+    "linear probes on frozen STE token states: R2 to degree / ego-density / clustering (ridge lambda 1e-3, 5-fold), plus degree-partialled variants and Pi-consistency",
+    "gate tanh magnitudes and per-family gradient norms over training",
+    "p0-vs-full four-logit divergence (branch-dropout effect size)"
+  ],
+  "cost_report": {
+    "requirement": "measured H20 profile REQUIRED-BEFORE-BINDING: per-step wall, peak memory, 30-epoch extrapolation per arm (x4 arms), candidate scoring latency (x5 passes); the frozen-s0 673 s / 2.04 GiB profile explicitly does not extrapolate",
+    "measured": "REQUIRED-BEFORE-BINDING"
+  },
+  "verdict_rule": "single-seed screening pass iff the full arm strictly dominates every comparator on all three primary criteria at the registered operating points, both guards pass, liveness passes, and both e2e_rules decision conditions pass",
+  "failure_reading": "If the full arm fails the primary family against the B0+cal comparator set, the topology-conditioned encoder does not beat calibrated independent scoring at this stage; the result is written up honestly and the locked-decision discussion is taken before any Stage-2 mechanism or E1 registration. If the primaries pass but pathway attribution fails, the honest conclusion is content-side information. If the primaries pass but the structure-control condition fails, the honest conclusion is that shuffled relational connectivity was not necessary beyond the retained topology-derived node features - not that the gain is non-topological.",
+  "mechanics": {
+    "worker_obligation": "src/train_egostitch.py records this file's sha256 as run_metadata.json['preregistration_sha256'] at start; it refuses formal (non --max-steps) runs unless status == BINDING; --max-steps debug runs accept DRAFT but write only to *_debug output directories and produce no held-out artifacts",
+    "gate_obligation": "src/experiments/g5_stage1.py requires status == BINDING, recomputes this file's sha256, and refuses held-out metrics unless it matches ALL FOUR formal run metadatas (full, f_only, pair_topology, p0)",
+    "hyperparameters": "spec §13.18 defaults x fixed Seed 0; no sweeps inside this screen",
+    "p4_exclusion": "no hard heuristic/feature negatives and no hard-negative checkpoint criterion are added in this revision"
+  }
+}
