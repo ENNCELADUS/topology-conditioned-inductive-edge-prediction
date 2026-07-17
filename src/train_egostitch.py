@@ -34,7 +34,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -659,7 +659,19 @@ def prepare_pack(
         ValueError: On warm-cache validation drift.
     """
     del temp_prefix
-    model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
+    # Family `egostitch_e2e` (spec Sec 13.18): `cfg.model.config` validates
+    # against `E2EConfig`, not `EgoStitchConfig` -- it sizes only the pair
+    # trunk/conditioning pathways. The internal Stage-1 generator this pack
+    # feeds (F0 matrix + grounding pool) always uses the pinned spec-default
+    # `EgoStitchConfig()` (`e2e_model.py`'s `generator_cfg`), never a value
+    # parsed from `cfg.model.config` -- so `n_ground` must come from there too.
+    is_e2e = cfg.model.family == _EGOSTITCH_E2E_FAMILY
+    if is_e2e:
+        E2EConfig.from_mapping(cfg.model.config)  # validate eagerly, fail loudly
+        n_ground = EgoStitchConfig().n_ground
+    else:
+        model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
+        n_ground = model_cfg.n_ground
     manifest_path = pack_dir / _PACK_MANIFEST_FILENAME
     if cold_cache:
         pack_dir.mkdir(parents=True, exist_ok=True)
@@ -674,15 +686,15 @@ def prepare_pack(
         build_grounding_pool(
             train_rows,
             train_nodes,
-            n_ground=model_cfg.n_ground,
+            n_ground=n_ground,
             cache_path=pack_dir / _PACK_GROUNDING_FILENAME,
         )
         manifest = {
-            "family": "egostitch",
+            "family": cfg.model.family,
             "strategy": cfg.data.strategy,
             "n_operative_nodes": len(operative),
             "n_train_nodes": len(train_nodes),
-            "n_ground": model_cfg.n_ground,
+            "n_ground": n_ground,
             "files": {
                 name: _sha256_file(pack_dir / name)
                 for name in (_PACK_F0_FILENAME, _PACK_GROUNDING_FILENAME)
@@ -698,7 +710,7 @@ def prepare_pack(
                 raise ValueError(f"pack file {name} drifted: {actual} != {expected}")
         if manifest.get("strategy") != cfg.data.strategy:
             raise ValueError("pack manifest strategy does not match the config")
-        if manifest.get("n_ground") != model_cfg.n_ground:
+        if manifest.get("n_ground") != n_ground:
             raise ValueError("pack manifest n_ground does not match the model config")
     return {
         "pack_manifest": manifest,
@@ -910,12 +922,24 @@ def assemble_egostitch_data(
         pack_dir: DDP pack directory (its F0/grounding caches win); ``None``
             uses ``cfg.data.f0_cache`` / ``cfg.data.grounding_cache``.
         require_s0: Load and validate the s0 cache (disabled only for the
-            ``--write-s0-manifest`` path, which exists to create it).
+            ``--write-s0-manifest`` path, which exists to create it). Ignored
+            (always treated as ``False``) for family `egostitch_e2e`, which
+            retired the s0 channel entirely (spec Sec 13.10): its node stream
+            still needs the same `EgoTargetBuilder`/grounding-pool machinery
+            as the frozen-s0 family (delegated, unchanged, to the internal
+            trainable generator), sized off the generator's own pinned
+            `EgoStitchConfig()` defaults rather than ``cfg.model.config``
+            (which validates as `E2EConfig` for this family).
 
     Returns:
         The `EgoStitchData` bundle.
     """
-    model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
+    is_e2e = cfg.model.family == _EGOSTITCH_E2E_FAMILY
+    if is_e2e:
+        E2EConfig.from_mapping(cfg.model.config)  # validate eagerly, fail loudly
+        generator_cfg = EgoStitchConfig()
+    else:
+        generator_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
     benchmark = _load_benchmark_for(cfg)
     store = FeatureStore(cfg.data.root / _FEATURES_SUBDIR)
 
@@ -946,7 +970,7 @@ def assemble_egostitch_data(
         matrix.numpy()[[node_index[node] for node in train_nodes]], dtype=np.float32
     )
     pool = build_grounding_pool(
-        train_rows, train_nodes, n_ground=model_cfg.n_ground, cache_path=grounding_cache
+        train_rows, train_nodes, n_ground=generator_cfg.n_ground, cache_path=grounding_cache
     )
     grounding_index = np.array(
         [[node_index[neighbor] for neighbor in pool[node]] for node in train_nodes],
@@ -958,14 +982,14 @@ def assemble_egostitch_data(
         np.asarray(matrix.numpy(), dtype=np.float32),
         node_index,
         pool,
-        slots=model_cfg.slots,
+        slots=generator_cfg.slots,
     )
     degrees = {node: int(g_struct.degree(node)) if node in g_struct else 0 for node in train_nodes}
     sampler = NegativeSampler(train_nodes, degrees, benchmark.positive_edges)
 
-    if require_s0:
+    if require_s0 and not is_e2e:
         s0 = S0Cache.from_path(cfg.data.s0_cache, expected_checkpoint_id=cfg.data.s0_checkpoint_id)
-    else:  # manifest-writing path only
+    else:  # manifest-writing path, or family egostitch_e2e (s0 retired)
         s0 = S0Cache.__new__(S0Cache)
         s0._logits = {}
 
@@ -1039,6 +1063,41 @@ class _CompositeBatch:
 _EGOSTITCH_E2E_FAMILY = "egostitch_e2e"
 
 
+def _gather_token_streams(
+    table: PackedFeatureTable,
+    index: Mapping[str, int],
+    endpoints_a: Sequence[str],
+    endpoints_b: Sequence[str],
+) -> dict[str, torch.Tensor]:
+    """Gather raw token streams for both pair endpoints (spec Sec 13.18).
+
+    Both endpoints are gathered to a shared padded length ``T`` (the max true
+    token length across every node in this batch), matching the packed-
+    feature reader the B0 V3.1 loader consumes
+    (:class:`~src.data.packed_features.PackedFeatureTable`). Shared by
+    `_BatchFactory` (training edge batches) and `_validate_epoch` (family
+    `egostitch_e2e` validation batches) so both build the identical contract.
+
+    Args:
+        table: The loaded packed-token store.
+        index: Node id -> row in `table`.
+        endpoints_a: The ``u`` node of each padded row.
+        endpoints_b: The ``v`` node of each padded row.
+
+    Returns:
+        ``{"emb_a", "emb_b", "len_a", "len_b"}`` CPU tensors.
+    """
+    idx_a = torch.tensor([index[node] for node in endpoints_a], dtype=torch.long)
+    idx_b = torch.tensor([index[node] for node in endpoints_b], dtype=torch.long)
+    boundary = max(
+        max(table.manifest.nodes[i].length for i in idx_a.tolist()),
+        max(table.manifest.nodes[i].length for i in idx_b.tolist()),
+    )
+    emb_a, len_a = table.gather_nodes(idx_a, boundary)
+    emb_b, len_b = table.gather_nodes(idx_b, boundary)
+    return {"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b}
+
+
 class _BatchFactory:
     """Deterministic composite-batch construction for one rank."""
 
@@ -1089,9 +1148,21 @@ class _BatchFactory:
             self._node_cursor += take
         return nodes
 
-    def _ground_rows(self, nodes: Sequence[str]) -> torch.Tensor:
+    def _ground_pool_rows(self, nodes: Sequence[str]) -> torch.Tensor:
+        """Grounding-pool candidate rows into `self._data.f0` for `nodes`.
+
+        These are the "global node id" values `egostitch_e2e`'s
+        `ground_id_a`/`ground_id_b` batch keys carry (spec Sec 13.18): the
+        same index space `x_i`/`x_j` are drawn from (both are rows into
+        `self._data.f0`), so a grounding-pool candidate shared by both pair
+        endpoints compares equal across sides, matching
+        `src.score_universe._score_egostitch_e2e`'s `pool_rows` convention.
+        """
         rows = self._data.grounding_index[[self._data.train_pos[n] for n in nodes]]
-        return self._data.f0[torch.from_numpy(rows)]
+        return torch.from_numpy(rows)
+
+    def _ground_rows(self, nodes: Sequence[str]) -> torch.Tensor:
+        return self._data.f0[self._ground_pool_rows(nodes)]
 
     def _node_tensors(
         self, nodes: Sequence[str], targets: EgoTargets, *, epoch: int, step: int
@@ -1154,32 +1225,11 @@ class _BatchFactory:
     def _token_streams(
         self, endpoints_a: Sequence[str], endpoints_b: Sequence[str]
     ) -> dict[str, torch.Tensor]:
-        """Gather raw token streams for both pair endpoints (spec Sec 13.18).
-
-        Both endpoints are gathered to a shared padded length ``T`` (the max
-        true token length across every node in this edge batch), matching the
-        packed-feature reader the B0 V3.1 loader consumes
-        (:class:`~src.data.packed_features.PackedFeatureTable`).
-
-        Args:
-            endpoints_a: The ``u`` node of each padded row.
-            endpoints_b: The ``v`` node of each padded row.
-
-        Returns:
-            ``{"emb_a", "emb_b", "len_a", "len_b"}`` CPU tensors.
-        """
+        """Gather raw token streams for both pair endpoints (spec Sec 13.18)."""
         table = self._token_table
         index = self._token_node_index
         assert table is not None and index is not None  # family-gated by the caller
-        idx_a = torch.tensor([index[node] for node in endpoints_a], dtype=torch.long)
-        idx_b = torch.tensor([index[node] for node in endpoints_b], dtype=torch.long)
-        boundary = max(
-            max(table.manifest.nodes[i].length for i in idx_a.tolist()),
-            max(table.manifest.nodes[i].length for i in idx_b.tolist()),
-        )
-        emb_a, len_a = table.gather_nodes(idx_a, boundary)
-        emb_b, len_b = table.gather_nodes(idx_b, boundary)
-        return {"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b}
+        return _gather_token_streams(table, index, endpoints_a, endpoints_b)
 
     def _edge_tensors(
         self, rows: Sequence[tuple[str, str, int]], *, pad_to: int
@@ -1206,7 +1256,14 @@ class _BatchFactory:
             ),
         }
         if self._token_table is not None:
-            edge.update(self._token_streams([u for u, _, _ in padded], [v for _, v, _ in padded]))
+            endpoints_u = [u for u, _, _ in padded]
+            endpoints_v = [v for _, v, _ in padded]
+            edge.update(self._token_streams(endpoints_u, endpoints_v))
+            # Same-index-space grounding ids for both endpoints (spec Sec
+            # 13.18): required by `EgoStitchE2E`'s grounded-identity-match
+            # flag, which compares `ground_id_a`/`ground_id_b` for equality.
+            edge["ground_id_i"] = self._ground_pool_rows(endpoints_u)
+            edge["ground_id_j"] = self._ground_pool_rows(endpoints_v)
         else:
             s0 = (
                 self._data.s0.lookup([(u, v) for u, v, _ in padded])
@@ -1461,7 +1518,7 @@ def _detached_clone(value: object) -> object:
 
 
 def _family_gradient_norms(
-    model: EgoStitchStage1, families: dict[str, torch.Tensor]
+    model: EgoStitchStage1 | EgoStitchE2E, families: dict[str, torch.Tensor]
 ) -> dict[str, float]:
     """Measure family-specific global L2 norms with isolated retained-graph backwards."""
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
@@ -1483,8 +1540,16 @@ def _family_gradient_norms(
 def _e2e_edge_view(edge: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Translate the worker's edge-tensor keys to `EgoStitchE2E`'s batch contract.
 
-    Maps ``x_i``/``x_j`` to ``x_a``/``x_b``; ``emb_a``/``emb_b``/``len_a``/
-    ``len_b`` already match and pass through unchanged.
+    Maps ``x_i``/``x_j`` to ``x_a``/``x_b`` and ``ground_i``/``ground_j``/
+    ``ground_id_i``/``ground_id_j`` to ``ground_a``/``ground_b``/
+    ``ground_id_a``/``ground_id_b`` (spec Sec 13.18: the real grounding-
+    candidate features and their same-index-space global ids, required for
+    `EgoStitchE2E`'s grounded-identity-match flag to engage instead of its
+    degenerate placeholder path); ``emb_a``/``emb_b``/``len_a``/``len_b``
+    already match and pass through unchanged. `_BatchFactory._edge_tensors`
+    always populates ``ground_i``/``ground_j``/``ground_id_i``/``ground_id_j``
+    for this family (Task 12/this task), so every key below is always present
+    at the one call site (`_CompositeStep.forward`'s `egostitch_e2e` branch).
     """
     return {
         "emb_a": edge["emb_a"],
@@ -1493,6 +1558,10 @@ def _e2e_edge_view(edge: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         "len_b": edge["len_b"],
         "x_a": edge["x_i"],
         "x_b": edge["x_j"],
+        "ground_a": edge["ground_i"],
+        "ground_b": edge["ground_j"],
+        "ground_id_a": edge["ground_id_i"],
+        "ground_id_b": edge["ground_id_j"],
     }
 
 
@@ -1550,20 +1619,24 @@ def _e2e_submodule_gradient_rms(model: EgoStitchE2E, loss: torch.Tensor) -> dict
     return rms
 
 
-def _e2e_topology_delta_std(model: EgoStitchE2E, batch: dict[str, torch.Tensor]) -> float:
+def _e2e_topology_delta_std(
+    model: EgoStitchE2E, batch: dict[str, torch.Tensor]
+) -> dict[str, float]:
     """Std of ``full - f_logit`` over one batch (design Sec 14, spec Sec 13.17).
 
     Registered name: ``topology_delta_std``, intended as a per-epoch signal on
     a fixed validation slice; this function measures the quantity for
     whatever batch it is given, so the caller controls the "fixed validation
-    slice, once per epoch" cadence.
+    slice, once per epoch" cadence. Returns a keyed dict (rather than a bare
+    float) to match the shape of its sibling telemetry helpers
+    (`_e2e_gate_tanh`, `_e2e_submodule_gradient_rms`), so a caller can
+    `dict.update(...)` it directly into a metrics row.
     """
     with torch.no_grad():
         decomposed = model.decompose(batch)
     delta = (decomposed["full"] - decomposed["f_logit"]).detach()
-    if delta.numel() < 2:
-        return 0.0
-    return float(torch.std(delta))
+    value = 0.0 if delta.numel() < 2 else float(torch.std(delta))
+    return {"topology_delta_std": value}
 
 
 def _e2e_trainable_parameters(model: EgoStitchE2E) -> list[torch.nn.Parameter]:
@@ -1663,20 +1736,61 @@ def _fidelity_summary(
     }
 
 
+def _e2e_validation_batch(
+    data: EgoStitchData,
+    token_table: PackedFeatureTable,
+    token_node_index: Mapping[str, int],
+    rows: Sequence[tuple[str, str, int]],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Build one `egostitch_e2e` validation batch (real grounding, no `s0`)."""
+    endpoints_u = [u for u, _, _ in rows]
+    endpoints_v = [v for _, v, _ in rows]
+    idx_i = torch.tensor([data.node_index[u] for u in endpoints_u], dtype=torch.long)
+    idx_j = torch.tensor([data.node_index[v] for v in endpoints_v], dtype=torch.long)
+    pool_rows_u = data.grounding_index[[data.train_pos[u] for u in endpoints_u]]
+    pool_rows_v = data.grounding_index[[data.train_pos[v] for v in endpoints_v]]
+    batch = _gather_token_streams(token_table, token_node_index, endpoints_u, endpoints_v)
+    batch["x_a"] = data.f0[idx_i]
+    batch["x_b"] = data.f0[idx_j]
+    batch["ground_a"] = data.f0[torch.from_numpy(pool_rows_u)]
+    batch["ground_b"] = data.f0[torch.from_numpy(pool_rows_v)]
+    batch["ground_id_a"] = torch.from_numpy(pool_rows_u)
+    batch["ground_id_b"] = torch.from_numpy(pool_rows_v)
+    return cast(dict[str, torch.Tensor], _to_device(batch, device))
+
+
 def _validate_epoch(
-    model: EgoStitchStage1,
+    model: EgoStitchStage1 | EgoStitchE2E,
     data: EgoStitchData,
     accelerator: Accelerator,
     *,
     edge_batch: int,
     topk_fraction: float,
+    token_table: PackedFeatureTable | None = None,
+    token_node_index: Mapping[str, int] | None = None,
 ) -> _ValidationResult | None:
     """Score the validation pairs with exact distributed coverage.
 
     Rows are rank-strided and padded to a common shard length; the main rank
     deduplicates gathered row ids and computes the metrics (``None`` on other
     ranks).
+
+    Family `egostitch_e2e` (spec Sec 13.17 re-registration): every validation
+    pair is scored through the model's full (all-pathways-active, eval-mode
+    -- no branch dropout) logit arm; there is no `s0` fusion and no self/
+    non-self split (a self pair is simply ``x_a == x_b``/``emb_a == emb_b``,
+    handled internally by `EgoStitchE2E.forward`). `token_table`/
+    `token_node_index` (the packed raw-token store `_BatchFactory` already
+    loaded) are required for this family to build the ``emb_a``/``emb_b``
+    batch keys. The per-epoch `topology_delta_std` telemetry (spec Sec
+    13.17) and its checkpoint-selection tie-break ratio (spec Sec 13.8) are
+    computed once, via `_e2e_topology_delta_std`, on rank 0's first
+    validation chunk -- a genuinely *fixed* slice, since neither
+    `data.val_pairs`'s order nor the sharding parameters change across
+    epochs.
     """
+    is_e2e = isinstance(model, EgoStitchE2E)
     model.eval()
     n_val = len(data.val_pairs)
     rank, world = accelerator.process_index, accelerator.num_processes
@@ -1686,13 +1800,36 @@ def _validate_epoch(
         shard_rows.append(shard_rows[0] if shard_rows else 0)
 
     values_out: list[torch.Tensor] = []
+    first_chunk_batch: dict[str, torch.Tensor] | None = None
     with torch.no_grad():
         for start in range(0, shard_len, edge_batch):
             chunk = shard_rows[start : start + edge_batch]
             rows = [(*data.val_pairs[i], int(data.val_labels[i])) for i in chunk]
-            s0 = data.s0.lookup([(u, v) for u, v, _ in rows])
+
+            if isinstance(model, EgoStitchE2E):
+                assert token_table is not None and token_node_index is not None, (
+                    "family egostitch_e2e requires token_table/token_node_index"
+                )
+                e2e_batch = _e2e_validation_batch(
+                    data, token_table, token_node_index, rows, accelerator.device
+                )
+                # The packed token store is bf16-only (src/data/packed_features.py);
+                # `accelerator.prepare()` autocasts the training-step forward
+                # (`wrapped(...)`) automatically, but this call goes straight
+                # to the unwrapped model (matching the frozen-s0 branch below),
+                # so autocast must be requested explicitly here too (spec Sec
+                # 13.16 extension: per-node encode may stay bf16; this repeats
+                # that same contract at validation time).
+                with accelerator.autocast():
+                    full_logits = model(e2e_batch, masks=None)["logits"]
+                values_out.append(full_logits.float().unsqueeze(-1))
+                if start == 0:
+                    first_chunk_batch = e2e_batch
+                continue
+
             idx_i = torch.tensor([data.node_index[u] for u, _, _ in rows], dtype=torch.long)
             idx_j = torch.tensor([data.node_index[v] for _, v, _ in rows], dtype=torch.long)
+            s0 = data.s0.lookup([(u, v) for u, v, _ in rows])
             pool_rows = data.grounding_index[[data.train_pos[u] for u, _, _ in rows]]
             pool_rows_j = data.grounding_index[[data.train_pos[v] for _, v, _ in rows]]
             is_self = torch.tensor([u == v for u, v, _ in rows], dtype=torch.bool)
@@ -1736,8 +1873,9 @@ def _validate_epoch(
                 )
             )
 
+    n_cols = 1 if is_e2e else 5
     local_values = (
-        torch.cat(values_out) if values_out else torch.zeros((0, 5), device=accelerator.device)
+        torch.cat(values_out) if values_out else torch.zeros((0, n_cols), device=accelerator.device)
     )
     local_rows = torch.tensor(shard_rows, dtype=torch.long, device=accelerator.device)
     gathered_values = accelerator.gather(local_values)
@@ -1755,12 +1893,28 @@ def _validate_epoch(
     ordered = np.asarray([seen[i] for i in range(n_val)], dtype=np.float64)
     logits_np = ordered[:, 0]
     probs = 1.0 / (1.0 + np.exp(-logits_np))
-    fidelity = _fidelity_summary(
-        ordered[:, 1],
-        logits_np,
-        {"s1": ordered[:, 2], "s2": ordered[:, 3], "s2_aa": ordered[:, 4]},
-        topk_fraction=topk_fraction,
-    )
+
+    if isinstance(model, EgoStitchE2E):
+        assert first_chunk_batch is not None
+        with accelerator.autocast():
+            topology_summary = _e2e_topology_delta_std(model, first_chunk_batch)
+            with torch.no_grad():
+                first_decomposed = model.decompose(first_chunk_batch)
+        f_logit_std = float(np.std(first_decomposed["f_logit"].detach().float().cpu().numpy()))
+        fidelity: dict[str, float] = {
+            **topology_summary,
+            "f_logit_std": f_logit_std,
+            "topology_delta_ratio": (
+                topology_summary["topology_delta_std"] / max(f_logit_std, 1e-30)
+            ),
+        }
+    else:
+        fidelity = _fidelity_summary(
+            ordered[:, 1],
+            logits_np,
+            {"s1": ordered[:, 2], "s2": ordered[:, 3], "s2_aa": ordered[:, 4]},
+            topk_fraction=topk_fraction,
+        )
     return _ValidationResult(
         metrics=compute_edge_metrics(data.val_labels.astype(np.int64), probs),
         fidelity=fidelity,
@@ -1794,7 +1948,7 @@ def _cpu_state_dict(accelerator: Accelerator, wrapped: torch.nn.Module) -> dict[
 
 
 def train_egostitch_ddp_loop(
-    model: EgoStitchStage1,
+    model: EgoStitchStage1 | EgoStitchE2E,
     cfg: EgoConfig,
     data: EgoStitchData,
     accelerator: Accelerator,
@@ -1806,8 +1960,17 @@ def train_egostitch_ddp_loop(
     Emits the exact runtime-profile schema the orchestrator validates and the
     Task-4 checkpoint state via `EgoTrainResult`.
 
+    Family `egostitch_e2e` (design rev 3): `model` is an `EgoStitchE2E`
+    instead of a frozen-s0 `EgoStitchStage1`. The optimizer is built over
+    `_e2e_trainable_parameters(model)` (excludes the dead, never-called
+    `DecisionHead`); there is no ``set_density_ratio``/two-pass calibration
+    for this family (that mechanism belongs to `generator.decision`, itself
+    unused). Everything else -- Accelerate wiring, the warm-start/joint-
+    weight curriculum, the budget guard, and the Sec 13.17 gradient-probe
+    emission cadence -- is reused unchanged.
+
     Args:
-        model: The Stage-1 model (pass-1 density ratio applied here).
+        model: The Stage-1 (pass-1 density ratio applied here) or e2e model.
         cfg: The validated worker config.
         data: The assembled data bundle.
         accelerator: The (DDP or single-process) accelerator.
@@ -1816,15 +1979,21 @@ def train_egostitch_ddp_loop(
     Returns:
         The `EgoTrainResult`.
     """
-    model_cfg = model.config
-    model.set_density_ratio(1.0)  # pass-1 scores are the Stage-1 scores (Sec 13.11)
+    is_e2e = isinstance(model, EgoStitchE2E)
+    model_cfg = model.generator_cfg if isinstance(model, EgoStitchE2E) else model.config
+    if isinstance(model, EgoStitchStage1):
+        model.set_density_ratio(1.0)  # pass-1 scores are the Stage-1 scores (Sec 13.11)
     world = accelerator.num_processes
     rank = accelerator.process_index
     use_cuda = accelerator.device.type == "cuda"
 
     composite = _CompositeStep(model, world)
+    if isinstance(model, EgoStitchE2E):
+        optimizer_parameters: list[torch.nn.Parameter] = _e2e_trainable_parameters(model)
+    else:
+        optimizer_parameters = list(composite.parameters())
     optimizer = torch.optim.AdamW(
-        composite.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
+        optimizer_parameters, lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
     )
     warmup = max(cfg.optim.warmup_steps, 1)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -1879,7 +2048,7 @@ def train_egostitch_ddp_loop(
         batches = factory.epoch_batches(epoch, rows_per_rank=rows_per_rank, steps=steps_per_epoch)
         parts: dict[str, float] = {}
         epoch_gradient_probes: list[dict[str, object]] = []
-        for batch in batches:
+        for step_in_epoch, batch in enumerate(batches):
             fetch_started = time.monotonic()
             joint_weight = 0.0 if global_step < warmstart_steps else 1.0
             payload: dict[str, object] = {
@@ -1888,6 +2057,14 @@ def train_egostitch_ddp_loop(
                 "joint_weight": torch.tensor(joint_weight, device=accelerator.device),
                 "edge_rows_global": batch.edge_rows_global,
             }
+            if is_e2e:
+                # `_CompositeStep.forward`'s e2e branch seeds per-step branch-
+                # dropout masks from this triple (`_seeded_generator(seed,
+                # epoch, step)`), the same convention `_BatchFactory` used
+                # internally to build this exact batch.
+                payload["seed"] = cfg.seed
+                payload["epoch"] = epoch
+                payload["step"] = step_in_epoch
             if joint_weight > 0.0 and fixed_gradient_probe is None:
                 fixed_gradient_probe = cast(dict[str, object], _detached_clone(payload))
                 fixed_gradient_probe["collect_diagnostics"] = True
@@ -1939,6 +2116,13 @@ def train_egostitch_ddp_loop(
                     "kendall_activated_now": activated_now,
                     "kendall_active": imbalance_monitor.activated_step is not None,
                 }
+                # Family egostitch_e2e (spec Sec 13.17 re-registration): the
+                # gate-tanh readouts are pure parameter reads already computed
+                # by `_CompositeStep.forward`'s `collect_diagnostics` branch --
+                # no extra backward needed, just surface them on this row too.
+                for gate_key in ("gate_topo_tanh", "gate_cont_tanh"):
+                    if gate_key in probe_out:
+                        probe_record[gate_key] = probe_out[gate_key]
                 epoch_gradient_probes.append(probe_record)
                 gradient_norm_series.append(probe_record)
             epoch_steps += 1
@@ -1953,6 +2137,8 @@ def train_egostitch_ddp_loop(
             accelerator,
             edge_batch=cfg.data.edge_batch,
             topk_fraction=cfg.diagnostics.topk_fraction,
+            token_table=factory._token_table,
+            token_node_index=factory._token_node_index,
         )
         validation_seconds = time.monotonic() - val_started
         epoch_wall = time.monotonic() - epoch_started
@@ -1962,7 +2148,13 @@ def train_egostitch_ddp_loop(
             metrics = validation.metrics
             fidelity = validation.fidelity
             last_metrics = metrics
-            fidelity_ratio = fidelity["residual_s0_std_ratio"]
+            # Sec 13.8 checkpoint-selection tie-break: family egostitch_e2e
+            # (s0 retired) uses std(full - f_logit)/std(f_logit) in place of
+            # the historical residual/s0 ratio -- same direction (larger
+            # value wins), same tolerance/tie-break mechanics below.
+            fidelity_ratio = (
+                fidelity["topology_delta_ratio"] if is_e2e else fidelity["residual_s0_std_ratio"]
+            )
             improved = best_metrics is None or metrics.auprc > (
                 best_metrics.auprc + cfg.diagnostics.selection_auprc_tolerance
             )
@@ -2226,7 +2418,7 @@ def write_outputs(result: EgoTrainResult, cfg: EgoConfig, data: EgoStitchData) -
 
 
 def _run_probe_mode(
-    model: EgoStitchStage1,
+    model: EgoStitchStage1 | EgoStitchE2E,
     cfg: EgoConfig,
     data: EgoStitchData,
     accelerator: Accelerator,
@@ -2238,16 +2430,23 @@ def _run_probe_mode(
     runtime = cfg.runtime
     if runtime is None:
         raise ValueError("probe mode requires a configured cfg.runtime")
-    model.set_density_ratio(1.0)
+    is_e2e = isinstance(model, EgoStitchE2E)
+    if isinstance(model, EgoStitchStage1):
+        model.set_density_ratio(1.0)
+    model_cfg = model.generator_cfg if isinstance(model, EgoStitchE2E) else model.config
     world = accelerator.num_processes
     composite = _CompositeStep(model, world)
+    if isinstance(model, EgoStitchE2E):
+        optimizer_parameters: list[torch.nn.Parameter] = _e2e_trainable_parameters(model)
+    else:
+        optimizer_parameters = list(composite.parameters())
     optimizer = torch.optim.AdamW(
-        composite.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
+        optimizer_parameters, lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
     )
     wrapped, optimizer = accelerator.prepare(composite, optimizer)
     factory = _BatchFactory(
         cfg,
-        model.config,
+        model_cfg,
         data,
         node_batch=node_batch,
         rank=accelerator.process_index,
@@ -2292,6 +2491,14 @@ def _run_probe_mode(
             "edge_rows_global": batch.edge_rows_global,
             "collect_diagnostics": step == 0,
         }
+        if is_e2e:
+            # Mirrors `batch_iterator`'s own epoch/step-within-epoch cycling
+            # (`factory.epoch_batches(epoch, ...)` yields exactly
+            # `steps_per_epoch` batches per epoch), so this matches the
+            # seeding `_BatchFactory` used internally for this same batch.
+            payload["seed"] = cfg.seed
+            payload["epoch"] = step // steps_per_epoch + 1
+            payload["step"] = step % steps_per_epoch
         loss: torch.Tensor | None = None
         local_failure: tuple[str, str] | None = None
         s1_abs_mean: float | None = None
@@ -2300,7 +2507,12 @@ def _run_probe_mode(
             loss = cast(torch.Tensor, probe_out["loss"])
             if not bool(torch.isfinite(loss).all()):
                 local_failure = ("nonfinite", "non-finite probe loss")
-            if step == 0:
+            # Family egostitch_e2e has no s1/s2 channels (spec Sec 13.17
+            # re-registration retires this frozen-s0-specific guard for that
+            # family; its liveness telemetry is `_e2e_gate_tanh`/
+            # `topology_delta_std`, checked per-epoch in `_validate_epoch`
+            # instead of at probe time).
+            if step == 0 and not is_e2e:
                 channel_stats = cast(dict[str, float], probe_out["channel_stats"])
                 s1_abs_mean = abs(channel_stats["s1_mean"])
         except RuntimeError as error:
@@ -2321,7 +2533,7 @@ def _run_probe_mode(
             kind, message = local_failure or ("oom", "probe candidate failed on another rank")
             _emit_probe_candidate_failure(kind, message)
             raise RuntimeError(message)
-        if step == 0:
+        if step == 0 and not is_e2e:
             assert s1_abs_mean is not None
             global_s1_abs_mean = float(
                 accelerator.gather(
@@ -2399,7 +2611,11 @@ def _run_ddp_worker(cfg: EgoConfig, args: EgoCliArgs) -> None:
         accelerator.device,
     )
     data = assemble_egostitch_data(cfg, pack_dir=args.pack_dir)
-    model = EgoStitchStage1(EgoStitchConfig.from_mapping(cfg.model.config))
+    model: EgoStitchStage1 | EgoStitchE2E
+    if cfg.model.family == _EGOSTITCH_E2E_FAMILY:
+        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+    else:
+        model = EgoStitchStage1(EgoStitchConfig.from_mapping(cfg.model.config))
     node_batch = args.token_budget_per_rank
 
     if args.ddp_mode == "probe":

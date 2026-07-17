@@ -15,7 +15,7 @@ import torch
 import yaml  # type: ignore[import-untyped]
 from accelerate import Accelerator
 from src import train_egostitch as te
-from src.data.artifacts import canonical_pair
+from src.data.artifacts import Benchmark, LabeledPairs, SplitArtifacts, canonical_pair
 from src.data.ego_targets import EgoTargetBuilder
 from src.data.packed_features import (
     PACK_FORMAT,
@@ -696,6 +696,20 @@ class TestBatchFactoryE2E:
         torch.testing.assert_close(batch.edge["len_b"], expected_len_b)
         assert batch.edge["emb_a"].shape[1] == expected_boundary
 
+        # Task 13c: same-index-space grounding ids for both endpoints (spec
+        # Sec 13.18) -- required by EgoStitchE2E's grounded-identity-match
+        # flag, which compares ground_id_a/ground_id_b for equality.
+        assert batch.edge["ground_id_i"].shape == (edge_batch, model_cfg.n_ground)
+        assert batch.edge["ground_id_j"].shape == (edge_batch, model_cfg.n_ground)
+        assert batch.edge["ground_id_i"].dtype == torch.int64
+        expected_ids_i = data.grounding_index[[data.train_pos[u] for u, _, _ in expected_chunk]]
+        expected_ids_j = data.grounding_index[[data.train_pos[v] for _, v, _ in expected_chunk]]
+        np.testing.assert_array_equal(batch.edge["ground_id_i"].numpy(), expected_ids_i)
+        np.testing.assert_array_equal(batch.edge["ground_id_j"].numpy(), expected_ids_j)
+        # Same index space x_i/x_j are drawn from: gathering data.f0 at these
+        # ids must reproduce the already-asserted ground_i/ground_j features.
+        torch.testing.assert_close(data.f0[batch.edge["ground_id_i"]], batch.edge["ground_i"])
+
     def test_requires_pack_dir(self, tmp_path: Path) -> None:
         cfg = _toy_cfg(tmp_path)
         model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
@@ -828,9 +842,7 @@ class TestCompositeStepE2E:
             assert math.isfinite(cast(float, metrics_row[key]))
 
         with self._bf16_autocast():
-            metrics_row["topology_delta_std"] = te._e2e_topology_delta_std(
-                model, te._e2e_edge_view(batch.edge)
-            )
+            metrics_row.update(te._e2e_topology_delta_std(model, te._e2e_edge_view(batch.edge)))
         assert math.isfinite(cast(float, metrics_row["topology_delta_std"]))
 
     def test_dead_decision_head_excluded_from_trainable_parameters(self, tmp_path: Path) -> None:
@@ -839,6 +851,121 @@ class TestCompositeStepE2E:
         decision_ids = {id(p) for p in model.generator.decision.parameters()}
         assert decision_ids.isdisjoint(trainable_ids)
         assert any(id(p) in trainable_ids for p in model.trunk.parameters())
+
+    def test_real_grounding_path_engages_not_placeholder(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Assert the edge stream carries real grounding, not the placeholder.
+
+        Task 13c: the model's degenerate `_ground` fallback (`e2e_model.py`'s
+        documented placeholder) only engages when the batch omits
+        `ground_a`/`ground_b` -- it must not be hit here.
+        """
+        batch, model = self._batch_and_model(tmp_path)
+        view = te._e2e_edge_view(batch.edge)
+        for key in ("ground_a", "ground_b", "ground_id_a", "ground_id_b"):
+            assert key in view
+
+        placeholder_calls: list[int] = []
+        original_ground = EgoStitchE2E._ground
+
+        def _spy_ground(self: EgoStitchE2E, x: torch.Tensor) -> torch.Tensor:
+            placeholder_calls.append(1)
+            return original_ground(self, x)
+
+        monkeypatch.setattr(EgoStitchE2E, "_ground", _spy_ground)
+        composite = te._CompositeStep(model, world_size=1)
+        with self._bf16_autocast():
+            out = composite(self._payload(batch, joint_weight=1.0))
+        assert bool(torch.isfinite(cast(torch.Tensor, out["loss"])))
+        assert placeholder_calls == []
+
+
+class TestTrainLoopE2E:
+    """Full `train_egostitch_ddp_loop` run, family egostitch_e2e (Task 13c).
+
+    Uses ``mixed_precision="no"`` (matching the `AcceleratorState` process-
+    global singleton `TestTrainLoop` already initializes in this same test
+    process -- accelerate hard-rejects a later `Accelerator(...)` call that
+    requests a different `mixed_precision`) and reproduces the packed token
+    store's bf16 requirement with an explicit `torch.autocast` wrapped around
+    the call instead, exactly the same substitution `TestCompositeStepE2E`'s
+    `_bf16_autocast()` already uses to drive `_CompositeStep` directly.
+    """
+
+    @staticmethod
+    def _bf16_autocast() -> torch.autocast:
+        return torch.autocast(device_type="cpu", dtype=torch.bfloat16)
+
+    def _e2e_setup(
+        self, tmp_path: Path
+    ) -> tuple[te.EgoConfig, te.EgoStitchData, EgoStitchE2E, Accelerator]:
+        torch.manual_seed(0)
+        model_cfg = EgoStitchConfig()
+        cfg = _toy_cfg(tmp_path)
+        data = _toy_bundle(tmp_path, model_cfg)
+        pack_dir = tmp_path / "token_pack"
+        _write_tiny_token_pack(pack_dir, _NODES, min_length=3)
+        e2e_cfg = replace(
+            cfg,
+            model=ModelConfig(family="egostitch_e2e", config=dict(_E2E_TINY_MODEL)),
+            data=replace(cfg.data, pack_dir=pack_dir),
+            optim=replace(cfg.optim, epochs=2),
+        )
+        model = EgoStitchE2E(E2EConfig.from_mapping(e2e_cfg.model.config))
+        accelerator = Accelerator(mixed_precision="no", cpu=True)
+        return e2e_cfg, data, model, accelerator
+
+    def _run(self, tmp_path: Path) -> tuple[te.EgoConfig, te.EgoStitchData, te.EgoTrainResult]:
+        e2e_cfg, data, model, accelerator = self._e2e_setup(tmp_path)
+        with self._bf16_autocast():
+            result = te.train_egostitch_ddp_loop(
+                model, e2e_cfg, data, accelerator, node_batch=e2e_cfg.data.node_batch
+            )
+        return e2e_cfg, data, result
+
+    def test_finishes_with_auprc_and_topology_delta_std_telemetry(self, tmp_path: Path) -> None:
+        cfg, _, result = self._run(tmp_path)
+        assert [int(cast(float, row["epoch"])) for row in result.history] == list(
+            range(1, cfg.optim.epochs + 1)
+        )
+        for row in result.history:
+            assert "auprc" in row
+            assert math.isfinite(cast(float, row["auprc"]))
+            fidelity = cast(dict[str, float], row["fidelity"])
+            assert math.isfinite(fidelity["topology_delta_std"])
+            assert math.isfinite(fidelity["topology_delta_ratio"])
+
+    def test_checkpoint_round_trip_restores_e2e_config(self, tmp_path: Path) -> None:
+        cfg, data, result = self._run(tmp_path)
+        te.write_run_start_metadata(cfg, data, world_size=1)
+        te.write_outputs(result, cfg, data)
+        payload = torch.load(cfg.output_dir / "best.pt", weights_only=False)
+        assert payload["model_family"] == "egostitch_e2e"
+        restored = E2EConfig.from_mapping(cast(dict[str, object], payload["model_config"]))
+        assert restored == E2EConfig.from_mapping(cfg.model.config)
+
+    def test_optimizer_parameter_set_equals_e2e_trainable_parameters(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        e2e_cfg, data, model, accelerator = self._e2e_setup(tmp_path)
+        captured_param_ids: set[int] = set()
+        original_adamw = torch.optim.AdamW
+
+        def _spy_adamw(params: object, **kwargs: object) -> torch.optim.AdamW:
+            materialized = list(cast(Any, params))
+            captured_param_ids.update(id(p) for p in materialized)
+            return original_adamw(materialized, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(torch.optim, "AdamW", _spy_adamw)
+        with self._bf16_autocast():
+            te.train_egostitch_ddp_loop(
+                model, e2e_cfg, data, accelerator, node_batch=e2e_cfg.data.node_batch
+            )
+        expected_ids = {id(p) for p in te._e2e_trainable_parameters(model)}
+        assert captured_param_ids == expected_ids
+        decision_ids = {id(p) for p in model.generator.decision.parameters()}
+        assert captured_param_ids.isdisjoint(decision_ids)
 
 
 class TestPreparePack:
@@ -868,3 +995,148 @@ class TestPreparePack:
         (pack_dir / te._PACK_F0_FILENAME).write_bytes(b"corrupted")
         with pytest.raises(ValueError, match="drifted"):
             te.prepare_pack(cfg, pack_dir, cold_cache=False)
+
+
+# --------------------------------------------------------------------------- e2e full pipeline
+#
+# Family `egostitch_e2e` forces the internal generator's pinned n_ground=20
+# (`EgoStitchConfig()`'s spec default, not configurable via `E2EConfig`), and
+# `build_grounding_pool` requires `n_ground <= len(train_nodes) - 1` -- so this
+# fixture needs strictly more nodes than the 8-node `_NODES` toy universe used
+# elsewhere in this file.
+
+_E2E_PIPELINE_NODES = [f"g{i}" for i in range(25)]
+
+
+def _e2e_pipeline_benchmark() -> Benchmark:
+    """Build a self-contained `Benchmark` for the e2e pipeline fixture.
+
+    All 25 nodes sit on the train side (a cycle graph), built directly as
+    dataclasses -- no disk I/O, so tests that only need
+    `prepare_pack`/`assemble_egostitch_data`'s own logic (not
+    `load_benchmark`'s file parsing) can monkeypatch `_load_benchmark_for`
+    with it directly.
+    """
+    nodes = _E2E_PIPELINE_NODES
+    graph = nx.Graph()
+    graph.add_nodes_from(nodes)
+    edges = [(nodes[i], nodes[(i + 1) % len(nodes)]) for i in range(len(nodes))]
+    graph.add_edges_from(edges)
+    positive_edges = frozenset(canonical_pair(u, v) for u, v in edges)
+    pairs_sorted = sorted(canonical_pair(u, v) for u, v in edges)
+    train_pairs = LabeledPairs(pairs=pairs_sorted, labels=np.ones(len(pairs_sorted), dtype=np.int8))
+    val_pairs = LabeledPairs(
+        pairs=[canonical_pair(nodes[0], nodes[5]), canonical_pair(nodes[1], nodes[6])],
+        labels=np.array([1, 0], dtype=np.int8),
+    )
+    split = SplitArtifacts(
+        strategy="toy",
+        train_nodes=frozenset(nodes),
+        test_nodes=frozenset(),
+        train_pairs=train_pairs,
+        val_pairs=val_pairs,
+        test_pairs=LabeledPairs(pairs=[], labels=np.array([], dtype=np.int8)),
+        train_graph=graph.copy(),
+        test_graph=nx.Graph(),
+        buckets={},
+    )
+    return Benchmark(root=Path("unused"), graph=graph, positive_edges=positive_edges, split=split)
+
+
+def _write_e2e_feature_root(tmp_path: Path, nodes: list[str], *, input_dim: int = 1536) -> None:
+    """Write a real, minimal, disk-backed `FeatureStore` root for `nodes`.
+
+    Written under ``tmp_path / "data" / "features" / "frozen_node_features_1024"``,
+    the exact location `_FEATURES_SUBDIR` resolves against `cfg.data.root`.
+    """
+    root = tmp_path / "data" / "features" / "frozen_node_features_1024"
+    embeddings_dir = root / "embeddings"
+    embeddings_dir.mkdir(parents=True)
+    rng = np.random.default_rng(3)
+    index: dict[str, str] = {}
+    for node in nodes:
+        tensor = torch.from_numpy(rng.normal(size=(3, input_dim)).astype(np.float32))
+        rel = f"embeddings/{node}.pt"
+        torch.save(tensor, root / rel)
+        index[node] = rel
+    (root / "index.json").write_text(json.dumps(index))
+    (root / "metadata.json").write_text(
+        json.dumps(
+            {"format": "torch_pt_per_node", "input_dim": input_dim, "max_sequence_length": 1024}
+        )
+    )
+
+
+class TestPrepareAndAssembleE2E:
+    """config load -> prepare_pack -> assemble_egostitch_data, family egostitch_e2e."""
+
+    def _e2e_cfg(self, tmp_path: Path) -> te.EgoConfig:
+        cfg = _toy_cfg(tmp_path)
+        return replace(cfg, model=ModelConfig(family="egostitch_e2e", config={}))
+
+    def test_prepare_pack_uses_generator_pinned_n_ground(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_e2e_feature_root(tmp_path, _E2E_PIPELINE_NODES)
+        benchmark = _e2e_pipeline_benchmark()
+        monkeypatch.setattr(te, "_load_benchmark_for", lambda cfg: benchmark)
+        e2e_cfg = self._e2e_cfg(tmp_path)
+        pack_dir = tmp_path / "pack"
+
+        payload = te.prepare_pack(e2e_cfg, pack_dir, cold_cache=True)
+        manifest = cast(dict[str, object], payload["pack_manifest"])
+        assert manifest["family"] == "egostitch_e2e"
+        assert manifest["n_ground"] == EgoStitchConfig().n_ground
+
+        # Warm-path re-validation must agree with the same pinned n_ground.
+        rebuilt = te.prepare_pack(e2e_cfg, pack_dir, cold_cache=False)
+        assert cast(dict[str, object], rebuilt["pack_manifest"])["n_ground"] == (
+            EgoStitchConfig().n_ground
+        )
+
+    def test_prepare_pack_rejects_stage1_only_config_keys(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_e2e_feature_root(tmp_path, _E2E_PIPELINE_NODES)
+        benchmark = _e2e_pipeline_benchmark()
+        monkeypatch.setattr(te, "_load_benchmark_for", lambda cfg: benchmark)
+        cfg = _toy_cfg(tmp_path)
+        e2e_cfg = replace(cfg, model=ModelConfig(family="egostitch_e2e", config={"slots": 4}))
+        with pytest.raises(ValueError, match="unknown E2E config keys"):
+            te.prepare_pack(e2e_cfg, tmp_path / "pack", cold_cache=True)
+
+    def test_assemble_skips_s0_and_produces_e2e_batches(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_e2e_feature_root(tmp_path, _E2E_PIPELINE_NODES)
+        benchmark = _e2e_pipeline_benchmark()
+        monkeypatch.setattr(te, "_load_benchmark_for", lambda cfg: benchmark)
+        e2e_cfg = self._e2e_cfg(tmp_path)
+        pack_dir = tmp_path / "pack"
+
+        # require_s0 defaults True; family egostitch_e2e must still skip it
+        # (spec Sec 13.10: s0 retired for this family).
+        data = te.assemble_egostitch_data(e2e_cfg, pack_dir=pack_dir)
+        assert len(data.s0) == 0
+        assert data.grounding_index.shape == (
+            len(_E2E_PIPELINE_NODES),
+            EgoStitchConfig().n_ground,
+        )
+
+        token_pack_dir = tmp_path / "token_pack"
+        _write_tiny_token_pack(token_pack_dir, _E2E_PIPELINE_NODES, min_length=3)
+        e2e_cfg_with_pack = replace(e2e_cfg, data=replace(e2e_cfg.data, pack_dir=token_pack_dir))
+        model_cfg = EgoStitchConfig()
+        rows, steps = te._epoch_step_plan(
+            len(data.e_sup_positives),
+            negative_ratio=e2e_cfg_with_pack.data.negative_ratio,
+            edge_batch=e2e_cfg_with_pack.data.edge_batch,
+            world_size=1,
+        )
+        factory = te._BatchFactory(
+            e2e_cfg_with_pack, model_cfg, data, node_batch=4, rank=0, world_size=1
+        )
+        batch = next(iter(factory.epoch_batches(1, rows_per_rank=rows, steps=steps)))
+        for key in ("emb_a", "emb_b", "len_a", "len_b", "ground_id_i", "ground_id_j"):
+            assert key in batch.edge
+        assert "s0" not in batch.edge
