@@ -16,8 +16,11 @@ retraining per arm.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from src.model.B0 import MLPHead, SiameseEncoder
 from src.model.egostitch.conditioning import (
@@ -29,6 +32,8 @@ from src.model.egostitch.conditioning import (
     masks_for_null,
 )
 from src.model.egostitch.config import E2EConfig, EgoStitchConfig
+from src.model.egostitch.imagine import SlotSet
+from src.model.egostitch.layers import stable_log
 from src.model.egostitch.model import EgoStitchStage1
 from src.model.egostitch.scaffold import (
     ContentProjector,
@@ -39,6 +44,40 @@ from src.model.egostitch.scaffold import (
 from src.model.egostitch.ste import STEncoder
 from src.model.egostitch.stitch import sinkhorn_plan
 from src.model.egostitch.trunk import ConditionedPairCrossAttention
+
+
+class E2ENodeState(NamedTuple):
+    """Cacheable per-node trunk and imagination state."""
+
+    encoded: torch.Tensor
+    length: torch.Tensor
+    slots: SlotSet
+    projected_x: torch.Tensor
+    ground_ids: torch.Tensor | None
+
+
+class E2EPairContext(NamedTuple):
+    """One shared pair context consumed by every hard-bypass head."""
+
+    encoded_a: torch.Tensor
+    encoded_b: torch.Tensor
+    len_a: torch.Tensor
+    len_b: torch.Tensor
+    topo_ab: torch.Tensor | None
+    topo_ba: torch.Tensor | None
+    cont: torch.Tensor | None
+    plan: torch.Tensor | None
+
+
+def counterpart_membership(
+    slots: SlotSet, other_proj: torch.Tensor, tau_kappa: torch.Tensor
+) -> torch.Tensor:
+    """Per-slot former-s1 compatibility with the counterpart endpoint."""
+    slot_direction = F.normalize(slots.h, p=2.0, dim=-1)
+    other_direction = F.normalize(other_proj, p=2.0, dim=-1)
+    kappa = -(slot_direction - other_direction[:, None, :]).square().sum(dim=-1)
+    kappa = kappa / tau_kappa
+    return kappa + stable_log(slots.pi * slots.mult)
 
 
 def grounded_identity_match(
@@ -162,64 +201,181 @@ class EgoStitchE2E(nn.Module):
         ground: torch.Tensor = x.unsqueeze(1).expand(-1, self.generator_cfg.n_ground, -1)
         return ground
 
-    def _context(
-        self, batch: dict[str, torch.Tensor]
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build the topo (AB/BA) and content conditioning tokens.
+    @staticmethod
+    def _select_slots(slots: SlotSet, rows: torch.Tensor) -> SlotSet:
+        """Index every tensor in one slot bundle by batch row."""
+        return SlotSet(*(value.index_select(0, rows) for value in slots))
 
-        Args:
-            batch: Batch dict with ``x_a``/``x_b`` per-node feature tensors,
-                and optionally ``ground_a``/``ground_b`` (real grounding-pool
-                features, ``(B, n_g, d)``) and ``ground_id_a``/``ground_id_b``
-                (their global node ids, ``(B, n_g)`` int64). Missing feature
-                keys fall back to the degenerate `_ground` placeholder;
-                missing id keys fall back to zero matched flags (see
-                `_ground` and `grounded_identity_match`).
+    @staticmethod
+    def _merge_slots(base: SlotSet, replacement: SlotSet, rows: torch.Tensor) -> SlotSet:
+        """Replace selected batch rows while preserving autograd to both inputs."""
+        return SlotSet(*(a.index_copy(0, rows, b) for a, b in zip(base, replacement, strict=True)))
 
-        Returns:
-            ``(topo_ab, topo_ba, cont)`` conditioning token tensors.
-        """
-        ground_a = batch.get("ground_a")
-        ground_b = batch.get("ground_b")
-        ground_x_a = ground_a if ground_a is not None else self._ground(batch["x_a"])
-        ground_x_b = ground_b if ground_b is not None else self._ground(batch["x_b"])
-        enc_a = self.generator.encode_nodes(batch["x_a"], ground_x_a)
-        enc_b = self.generator.encode_nodes(batch["x_b"], ground_x_b)
-        slots_a, slots_b = enc_a.slots, enc_b.slots
-        plan = sinkhorn_plan(
-            slots_a.h,
-            slots_b.h,
-            slots_a.pi,
-            slots_b.pi,
-            slots_a.mult,
-            slots_b.mult,
-            eps=self.generator_cfg.sinkhorn_eps,
-            iters=self.generator_cfg.sinkhorn_iters,
-            tau=self.generator_cfg.sinkhorn_tau,
+    def encode_node_state(
+        self,
+        emb: torch.Tensor,
+        length: torch.Tensor,
+        x: torch.Tensor,
+        ground: torch.Tensor | None = None,
+        ground_ids: torch.Tensor | None = None,
+    ) -> E2ENodeState:
+        """Run the cacheable raw-token and generator pass for one node batch."""
+        ground_x = ground if ground is not None else self._ground(x)
+        generated = self.generator.encode_nodes(x, ground_x)
+        return E2ENodeState(
+            encoded=self.encoder(emb, length),
+            length=length,
+            slots=generated.slots,
+            projected_x=self.generator.imagine.proj(x),
+            ground_ids=ground_ids,
         )
-        scaffold = build_scaffold(slots_a, slots_b, plan)
-        topo_ab: torch.Tensor = self.ste(scaffold)
-        topo_ba: torch.Tensor = self.ste(swap_direction(scaffold))
-        ground_id_a = batch.get("ground_id_a")
-        ground_id_b = batch.get("ground_id_b")
-        if ground_id_a is not None and ground_id_b is not None:
-            matched_a, matched_b = grounded_identity_match(
-                slots_a.pointer,
-                slots_a.gate,
-                ground_id_a,
-                slots_b.pointer,
-                slots_b.gate,
-                ground_id_b,
-            )
+
+    def _merge_node_states(
+        self, base: E2ENodeState, replacement: E2ENodeState, rows: torch.Tensor
+    ) -> E2ENodeState:
+        """Use `base` for self rows and `replacement` for non-self rows."""
+        width = max(base.encoded.size(1), replacement.encoded.size(1))
+        encoded_base = F.pad(base.encoded, (0, 0, 0, width - base.encoded.size(1)))
+        encoded_replacement = F.pad(
+            replacement.encoded, (0, 0, 0, width - replacement.encoded.size(1))
+        )
+        if base.ground_ids is None or replacement.ground_ids is None:
+            ground_ids = None
         else:
-            # Neutral (AB/BA-symmetric) placeholder when ids are unavailable
-            # (mirrors the `_ground` degenerate path — tiny unit fixtures only).
-            matched_a = torch.zeros_like(slots_a.pi)
-            matched_b = torch.zeros_like(slots_b.pi)
-        cont: torch.Tensor = self.content_proj(
-            build_content_tokens(slots_a, slots_b, matched_a, matched_b)
+            ground_ids = base.ground_ids.index_copy(0, rows, replacement.ground_ids)
+        return E2ENodeState(
+            encoded=encoded_base.index_copy(0, rows, encoded_replacement),
+            length=base.length.index_copy(0, rows, replacement.length),
+            slots=self._merge_slots(base.slots, replacement.slots, rows),
+            projected_x=base.projected_x.index_copy(0, rows, replacement.projected_x),
+            ground_ids=ground_ids,
         )
-        return topo_ab, topo_ba, cont
+
+    def _pair_node_states(
+        self, batch: dict[str, torch.Tensor]
+    ) -> tuple[E2ENodeState, E2ENodeState, torch.Tensor]:
+        """Encode pair endpoints, using exactly one encode for every self row."""
+        batch_size = batch["emb_a"].size(0)
+        is_self = batch.get(
+            "is_self", torch.zeros(batch_size, dtype=torch.bool, device=batch["emb_a"].device)
+        )
+        state_a = self.encode_node_state(
+            batch["emb_a"],
+            batch["len_a"],
+            batch["x_a"],
+            batch.get("ground_a"),
+            batch.get("ground_id_a"),
+        )
+        non_self = torch.nonzero(~is_self, as_tuple=False).squeeze(-1)
+        if non_self.numel() == 0:
+            return state_a, state_a, is_self
+        state_b_non_self = self.encode_node_state(
+            batch["emb_b"].index_select(0, non_self),
+            batch["len_b"].index_select(0, non_self),
+            batch["x_b"].index_select(0, non_self),
+            (batch["ground_b"].index_select(0, non_self) if "ground_b" in batch else None),
+            (batch["ground_id_b"].index_select(0, non_self) if "ground_id_b" in batch else None),
+        )
+        if non_self.numel() == batch_size:
+            return state_a, state_b_non_self, is_self
+        return state_a, self._merge_node_states(state_a, state_b_non_self, non_self), is_self
+
+    def build_pair_context_from_states(
+        self,
+        state_a: E2ENodeState,
+        state_b: E2ENodeState,
+        is_self: torch.Tensor,
+        *,
+        need_topo: bool = True,
+        need_cont: bool = True,
+    ) -> E2EPairContext:
+        """Build Stitch/STE/content once from cacheable endpoint states."""
+        slots_a, slots_b = state_a.slots, state_b.slots
+        batch_size, slots = slots_a.pi.shape
+        if is_self.shape != (batch_size,):
+            raise ValueError(f"is_self shape must be {(batch_size,)}, got {tuple(is_self.shape)}")
+        plan: torch.Tensor | None = None
+        topo_ab: torch.Tensor | None = None
+        topo_ba: torch.Tensor | None = None
+        if need_topo:
+            plan = slots_a.pi.new_zeros((batch_size, slots, slots))
+            self_rows = torch.nonzero(is_self, as_tuple=False).squeeze(-1)
+            if self_rows.numel() > 0:
+                identity = torch.eye(slots, device=plan.device, dtype=plan.dtype)
+                plan = plan.index_copy(0, self_rows, identity.expand(self_rows.numel(), -1, -1))
+            non_self = torch.nonzero(~is_self, as_tuple=False).squeeze(-1)
+            if non_self.numel() > 0:
+                selected_a = self._select_slots(slots_a, non_self)
+                selected_b = self._select_slots(slots_b, non_self)
+                non_self_plan = sinkhorn_plan(
+                    selected_a.h,
+                    selected_b.h,
+                    selected_a.pi,
+                    selected_b.pi,
+                    selected_a.mult,
+                    selected_b.mult,
+                    eps=self.generator_cfg.sinkhorn_eps,
+                    iters=self.generator_cfg.sinkhorn_iters,
+                    tau=self.generator_cfg.sinkhorn_tau,
+                )
+                plan = plan.index_copy(0, non_self, non_self_plan)
+            scaffold = build_scaffold(slots_a, slots_b, plan)
+            topo_ab = self.ste(scaffold)
+            topo_ba = self.ste(swap_direction(scaffold))
+
+        cont: torch.Tensor | None = None
+        if need_cont:
+            if state_a.ground_ids is not None and state_b.ground_ids is not None:
+                matched_a, matched_b = grounded_identity_match(
+                    slots_a.pointer,
+                    slots_a.gate,
+                    state_a.ground_ids,
+                    slots_b.pointer,
+                    slots_b.gate,
+                    state_b.ground_ids,
+                )
+            else:
+                matched_a = torch.zeros_like(slots_a.pi)
+                matched_b = torch.zeros_like(slots_b.pi)
+            membership_a = counterpart_membership(
+                slots_a, state_b.projected_x, self.generator.decision.tau_kappa
+            )
+            membership_b = counterpart_membership(
+                slots_b, state_a.projected_x, self.generator.decision.tau_kappa
+            )
+            cont = self.content_proj(
+                build_content_tokens(
+                    slots_a,
+                    slots_b,
+                    matched_a,
+                    matched_b,
+                    membership_a,
+                    membership_b,
+                )
+            )
+        return E2EPairContext(
+            encoded_a=state_a.encoded,
+            encoded_b=state_b.encoded,
+            len_a=state_a.length,
+            len_b=state_b.length,
+            topo_ab=topo_ab,
+            topo_ba=topo_ba,
+            cont=cont,
+            plan=plan,
+        )
+
+    def build_pair_context(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        need_topo: bool = True,
+        need_cont: bool = True,
+    ) -> E2EPairContext:
+        """Encode endpoints and build one reusable pair context."""
+        state_a, state_b, is_self = self._pair_node_states(batch)
+        return self.build_pair_context_from_states(
+            state_a, state_b, is_self, need_topo=need_topo, need_cont=need_cont
+        )
 
     @torch.no_grad()
     def probe_states(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -242,8 +398,46 @@ class EgoStitchE2E(nn.Module):
         Returns:
             Shape ``(B, V, d_model)`` AB-direction STE token states.
         """
-        topo_ab, _topo_ba, _cont = self._context(batch)
-        return topo_ab
+        context = self.build_pair_context(batch, need_topo=True, need_cont=False)
+        assert context.topo_ab is not None
+        return context.topo_ab
+
+    def score_pair_context(
+        self, context: E2EPairContext, *, masks: HeadNullMasks | None = None
+    ) -> torch.Tensor:
+        """Evaluate one hard-bypass head from a shared pair context."""
+        batch_size = context.encoded_a.size(0)
+        device = context.encoded_a.device
+        if masks is None:
+            masks = masks_for_null(NULL_NONE, batch_size, device)
+        need_topo = bool(masks.topo.any())
+        need_cont = bool(masks.cont.any())
+        if need_topo and (context.topo_ab is None or context.topo_ba is None):
+            raise ValueError("pair context does not contain topology tokens")
+        if need_cont and context.cont is None:
+            raise ValueError("pair context does not contain content tokens")
+        feat_ab = self.trunk(
+            context.encoded_a,
+            context.encoded_b,
+            context.len_a,
+            context.len_b,
+            topo_tokens=context.topo_ab if need_topo else None,
+            cont_tokens=context.cont if need_cont else None,
+            topo_active=masks.topo if need_topo else None,
+            cont_active=masks.cont if need_cont else None,
+        )
+        feat_ba = self.trunk(
+            context.encoded_b,
+            context.encoded_a,
+            context.len_b,
+            context.len_a,
+            topo_tokens=context.topo_ba if need_topo else None,
+            cont_tokens=context.cont if need_cont else None,
+            topo_active=masks.topo if need_topo else None,
+            cont_active=masks.cont if need_cont else None,
+        )
+        feat = torch.max(torch.stack([feat_ab, feat_ba], dim=-1), dim=-1).values
+        return self.head(feat).squeeze(-1)
 
     def forward(
         self, batch: dict[str, torch.Tensor], *, masks: HeadNullMasks | None = None
@@ -266,36 +460,8 @@ class EgoStitchE2E(nn.Module):
             masks = masks_for_null(NULL_NONE, batch_size, device)
         need_topo = bool(masks.topo.any())
         need_cont = bool(masks.cont.any())
-        topo_ab: torch.Tensor | None = None
-        topo_ba: torch.Tensor | None = None
-        cont: torch.Tensor | None = None
-        if need_topo or need_cont:
-            topo_ab, topo_ba, cont = self._context(batch)
-        h_a = self.encoder(batch["emb_a"], batch["len_a"])
-        h_b = self.encoder(batch["emb_b"], batch["len_b"])
-        feat_ab = self.trunk(
-            h_a,
-            h_b,
-            batch["len_a"],
-            batch["len_b"],
-            topo_tokens=topo_ab if need_topo else None,
-            cont_tokens=cont if need_cont else None,
-            topo_active=masks.topo if need_topo else None,
-            cont_active=masks.cont if need_cont else None,
-        )
-        feat_ba = self.trunk(
-            h_b,
-            h_a,
-            batch["len_b"],
-            batch["len_a"],
-            topo_tokens=topo_ba if need_topo else None,
-            cont_tokens=cont if need_cont else None,
-            topo_active=masks.topo if need_topo else None,
-            cont_active=masks.cont if need_cont else None,
-        )
-        feat: torch.Tensor = torch.max(torch.stack([feat_ab, feat_ba], dim=-1), dim=-1).values
-        logits: torch.Tensor = self.head(feat).squeeze(-1)
-        return {"logits": logits}
+        context = self.build_pair_context(batch, need_topo=need_topo, need_cont=need_cont)
+        return {"logits": self.score_pair_context(context, masks=masks)}
 
     def decompose(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Compute the four-logit decomposition via eval-time hard bypasses.
@@ -306,18 +472,23 @@ class EgoStitchE2E(nn.Module):
         Returns:
             ``{"full", "f_logit", "pair_content", "pair_topology"}`` logits.
         """
-        batch_size = batch["emb_a"].size(0)
-        device = batch["emb_a"].device
         with torch.no_grad():
-            return {
-                "full": self(batch, masks=None)["logits"],
-                "f_logit": self(batch, masks=masks_for_null(NULL_ALL_HEAD, batch_size, device))[
-                    "logits"
-                ],
-                "pair_content": self(
-                    batch, masks=masks_for_null(NULL_TOPO_HEAD, batch_size, device)
-                )["logits"],
-                "pair_topology": self(
-                    batch, masks=masks_for_null(NULL_CONTENT_HEAD, batch_size, device)
-                )["logits"],
-            }
+            context = self.build_pair_context(batch)
+            return self.decompose_pair_context(context)
+
+    def decompose_pair_context(self, context: E2EPairContext) -> dict[str, torch.Tensor]:
+        """Evaluate all four logits without rebuilding node or pair state."""
+        batch_size = context.encoded_a.size(0)
+        device = context.encoded_a.device
+        return {
+            "full": self.score_pair_context(context),
+            "f_logit": self.score_pair_context(
+                context, masks=masks_for_null(NULL_ALL_HEAD, batch_size, device)
+            ),
+            "pair_content": self.score_pair_context(
+                context, masks=masks_for_null(NULL_TOPO_HEAD, batch_size, device)
+            ),
+            "pair_topology": self.score_pair_context(
+                context, masks=masks_for_null(NULL_CONTENT_HEAD, batch_size, device)
+            ),
+        }

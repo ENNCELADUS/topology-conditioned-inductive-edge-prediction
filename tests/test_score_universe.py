@@ -23,7 +23,7 @@ from src.data.features import FeatureStore
 from src.data.packed_features import PackedFeatureTable, build_packed_features
 from src.model.B0 import V3_1
 from src.model.egostitch.conditioning import GatedCrossAttention
-from src.model.egostitch.e2e_model import EgoStitchE2E
+from src.model.egostitch.e2e_model import E2ENodeState, E2EPairContext, EgoStitchE2E
 
 INPUT_DIM = 4
 
@@ -1021,8 +1021,7 @@ _TINY_E2E_CONFIG: dict[str, object] = {
 # feature store backing these tests must use that exact node-token dimension.
 _E2E_NODE_DIM = 1536
 _E2E_NODES = [f"n{i}" for i in range(4)]
-# Includes a repeated-node pair (n0/n0 reused as n0-n1 and n0-n2) but no
-# self-pair: EgoStitchE2E's forward has no special self-pair routing.
+# Includes repeated endpoints and a self pair to exercise the single-ego path.
 _E2E_PAIRS = [("n0", "n1"), ("n1", "n2"), ("n0", "n2")]
 
 
@@ -1311,13 +1310,13 @@ def test_egostitch_e2e_scaffold_shuffle_uses_multi_pair_batches(
     many_pairs = _E2E_PAIRS * 8
     pairs.write_text("".join(f"{u}\t{v}\n" for u, v in many_pairs))
     calls: list[int] = []
-    original = EgoStitchE2E.decompose
+    original = EgoStitchE2E.decompose_pair_context
 
-    def _spy(self: EgoStitchE2E, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        calls.append(batch["x_a"].shape[0])
-        return original(self, batch)
+    def _spy(self: EgoStitchE2E, context: E2EPairContext) -> dict[str, torch.Tensor]:
+        calls.append(context.encoded_a.shape[0])
+        return original(self, context)
 
-    monkeypatch.setattr(EgoStitchE2E, "decompose", _spy)
+    monkeypatch.setattr(EgoStitchE2E, "decompose_pair_context", _spy)
     score_universe.main(
         [
             *_egostitch_e2e_score_args(
@@ -1329,6 +1328,49 @@ def test_egostitch_e2e_scaffold_shuffle_uses_multi_pair_batches(
     )
     assert max(calls) > 1
     assert len(calls) < len(many_pairs)
+
+
+def test_egostitch_e2e_scoring_caches_unique_nodes_and_reuses_pair_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root, checkpoint, _ = _egostitch_e2e_setup(tmp_path)
+    pairs_path = tmp_path / "many-cache.tsv"
+    many_pairs = (_E2E_PAIRS + [("n0", "n0")]) * 12
+    pairs_path.write_text("".join(f"{u}\t{v}\n" for u, v in many_pairs))
+
+    encoded_rows = 0
+    context_calls = 0
+    head_calls = 0
+    original_encode = EgoStitchE2E.encode_node_state
+    original_context = EgoStitchE2E.build_pair_context_from_states
+    original_head = EgoStitchE2E.score_pair_context
+
+    def encode_spy(self: EgoStitchE2E, *args: object, **kwargs: object) -> E2ENodeState:
+        nonlocal encoded_rows
+        encoded_rows += cast(torch.Tensor, args[0]).shape[0]
+        return original_encode(self, *args, **kwargs)
+
+    def context_spy(self: EgoStitchE2E, *args: object, **kwargs: object) -> E2EPairContext:
+        nonlocal context_calls
+        context_calls += 1
+        return original_context(self, *args, **kwargs)
+
+    def head_spy(self: EgoStitchE2E, *args: object, **kwargs: object) -> torch.Tensor:
+        nonlocal head_calls
+        head_calls += 1
+        return original_head(self, *args, **kwargs)
+
+    monkeypatch.setattr(EgoStitchE2E, "encode_node_state", encode_spy)
+    monkeypatch.setattr(EgoStitchE2E, "build_pair_context_from_states", context_spy)
+    monkeypatch.setattr(EgoStitchE2E, "score_pair_context", head_spy)
+    score_universe.main(
+        _egostitch_e2e_score_args(
+            tmp_path, data_root, checkpoint, pairs_path, tmp_path / "cached.npz"
+        )
+    )
+    assert encoded_rows == len({node for pair in many_pairs for node in pair})
+    assert 0 < context_calls < len(many_pairs)
+    assert head_calls == 4 * context_calls
 
 
 def test_merge_rejects_conflicting_scaffold_control_provenance(tmp_path: Path) -> None:
@@ -1532,8 +1574,7 @@ def test_egostitch_e2e_scorer_supplies_grounding_batch_keys(
 ) -> None:
     """`_score_egostitch_e2e` assembles real grounding-pool batch keys per pair.
 
-    Spies on `EgoStitchE2E.decompose` to capture the batch dict actually
-    passed to it (rather than re-deriving grounding pools independently),
+    Spies on `EgoStitchE2E.encode_node_state` to capture the node-cache inputs,
     asserting the non-degenerate ``ground_a``/``ground_b``/``ground_id_a``/
     ``ground_id_b`` keys are present with the expected shapes/dtypes for
     every scored batch — i.e. the scorer always exercises `EgoStitchE2E`'s
@@ -1545,32 +1586,33 @@ def test_egostitch_e2e_scorer_supplies_grounding_batch_keys(
     data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
     output = tmp_path / "scores.npz"
 
-    captured_batches: list[dict[str, torch.Tensor]] = []
-    original_decompose = EgoStitchE2E.decompose
+    captured: list[tuple[torch.Tensor, torch.Tensor | None]] = []
+    original_encode = EgoStitchE2E.encode_node_state
 
-    def _spy_decompose(
-        self: EgoStitchE2E, batch: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        captured_batches.append(batch)
-        return original_decompose(self, batch)
+    def _spy_encode(
+        self: EgoStitchE2E,
+        emb: torch.Tensor,
+        length: torch.Tensor,
+        x: torch.Tensor,
+        ground: torch.Tensor | None = None,
+        ground_ids: torch.Tensor | None = None,
+    ) -> E2ENodeState:
+        captured.append((ground, ground_ids))
+        return original_encode(self, emb, length, x, ground, ground_ids)
 
-    monkeypatch.setattr(EgoStitchE2E, "decompose", _spy_decompose)
+    monkeypatch.setattr(EgoStitchE2E, "encode_node_state", _spy_encode)
 
     score_universe.main(_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, output))
 
-    assert captured_batches, "decompose was never called"
+    assert captured, "node cache was never encoded"
     node_universe = len({node for pair in _E2E_PAIRS for node in pair})
     expected_n_ground = min(EgoStitchConfig().n_ground, node_universe - 1)
-    for batch in captured_batches:
-        for key in ("ground_a", "ground_b", "ground_id_a", "ground_id_b"):
-            assert key in batch, f"missing grounding key {key!r}"
-        rows = batch["x_a"].shape[0]
-        assert batch["ground_a"].shape == (rows, expected_n_ground, _E2E_NODE_DIM)
-        assert batch["ground_b"].shape == (rows, expected_n_ground, _E2E_NODE_DIM)
-        assert batch["ground_id_a"].shape == (rows, expected_n_ground)
-        assert batch["ground_id_b"].shape == (rows, expected_n_ground)
-        assert batch["ground_id_a"].dtype == torch.int64
-        assert batch["ground_id_b"].dtype == torch.int64
+    for ground, ground_ids in captured:
+        assert ground is not None and ground_ids is not None
+        rows = ground.shape[0]
+        assert ground.shape == (rows, expected_n_ground, _E2E_NODE_DIM)
+        assert ground_ids.shape == (rows, expected_n_ground)
+        assert ground_ids.dtype == torch.int64
 
 
 # --------------------------------------------------------------------------- Task 13b review

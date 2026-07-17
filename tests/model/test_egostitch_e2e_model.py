@@ -1,5 +1,6 @@
 """E2E model property tests (design rev 3 §3.4–§3.5 acceptance criteria)."""
 
+import pytest
 import torch
 from src.model.egostitch.conditioning import (
     NULL_ALL_HEAD,
@@ -9,7 +10,13 @@ from src.model.egostitch.conditioning import (
     masks_for_null,
 )
 from src.model.egostitch.config import E2EConfig
-from src.model.egostitch.e2e_model import EgoStitchE2E, grounded_identity_match
+from src.model.egostitch.e2e_model import (
+    E2EPairContext,
+    EgoStitchE2E,
+    counterpart_membership,
+    grounded_identity_match,
+)
+from src.model.egostitch.model import NodeEncoding
 
 
 def _tiny_model_and_batch() -> tuple[EgoStitchE2E, dict[str, torch.Tensor]]:
@@ -228,6 +235,117 @@ def test_probe_states_reflects_probe_node_features() -> None:
 def test_probe_states_accepts_self_pair_batch() -> None:
     """`probe_states` runs on a self-pair batch (spec Sec 13.9 single-ego path)."""
     model, batch = _tiny_model_and_batch()
+    batch["emb_b"] = batch["emb_a"]
+    batch["len_b"] = batch["len_a"]
     batch["x_b"] = batch["x_a"]
+    batch["is_self"] = torch.ones(batch["x_a"].size(0), dtype=torch.bool)
     states = model.probe_states(batch)
     assert states.shape[0] == batch["x_a"].size(0)
+
+
+def test_counterpart_membership_matches_pinned_formula_and_is_scale_safe() -> None:
+    slots = model_slots = (
+        _tiny_model_and_batch()[0]
+        .generator.encode_nodes(torch.randn(2, 1536), torch.randn(2, 20, 1536))
+        .slots
+    )
+    other = torch.randn(2, 256)
+    tau = torch.tensor(1.7)
+    actual = counterpart_membership(slots, other, tau)
+    expected = -(
+        torch.nn.functional.normalize(slots.h, dim=-1)
+        - torch.nn.functional.normalize(other, dim=-1)[:, None]
+    ).square().sum(dim=-1) / tau + torch.log((slots.pi * slots.mult).clamp_min(1e-8))
+    assert torch.allclose(actual, expected)
+    scaled = counterpart_membership(model_slots._replace(h=model_slots.h * 11.0), other * 7.0, tau)
+    assert torch.allclose(actual, scaled)
+
+
+def test_decompose_builds_pair_context_once_and_matches_explicit_heads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, batch = _tiny_model_and_batch_with_grounding()
+    with torch.no_grad():
+        model.trunk.topo_xattn[0].gate.fill_(0.4)
+        model.trunk.cont_xattn[0].gate.fill_(0.4)
+    calls = 0
+    original = model.build_pair_context
+
+    def counted(batch_arg: dict[str, torch.Tensor]) -> E2EPairContext:
+        nonlocal calls
+        calls += 1
+        return original(batch_arg)
+
+    monkeypatch.setattr(model, "build_pair_context", counted)
+    decomposed = model.decompose(batch)
+    assert calls == 1
+    context = original(batch)
+    expected = {
+        "full": model.score_pair_context(context),
+        "f_logit": model.score_pair_context(
+            context, masks=masks_for_null(NULL_ALL_HEAD, 4, torch.device("cpu"))
+        ),
+        "pair_content": model.score_pair_context(
+            context, masks=masks_for_null(NULL_TOPO_HEAD, 4, torch.device("cpu"))
+        ),
+        "pair_topology": model.score_pair_context(
+            context, masks=masks_for_null(NULL_CONTENT_HEAD, 4, torch.device("cpu"))
+        ),
+    }
+    for key, value in expected.items():
+        assert torch.allclose(decomposed[key], value, atol=1e-6)
+
+
+def test_self_pairs_encode_one_ego_and_use_exact_identity_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, batch = _tiny_model_and_batch_with_grounding()
+    batch["emb_b"] = batch["emb_a"]
+    batch["len_b"] = batch["len_a"]
+    batch["x_b"] = batch["x_a"]
+    batch["ground_b"] = batch["ground_a"]
+    batch["ground_id_b"] = batch["ground_id_a"]
+    batch["is_self"] = torch.ones(4, dtype=torch.bool)
+
+    encode_calls = 0
+    original_encode = model.generator.encode_nodes
+
+    def counted_encode(*args: torch.Tensor, **kwargs: torch.Tensor) -> NodeEncoding:
+        nonlocal encode_calls
+        encode_calls += 1
+        return original_encode(*args, **kwargs)
+
+    monkeypatch.setattr(model.generator, "encode_nodes", counted_encode)
+
+    import src.model.egostitch.e2e_model as e2e_module
+
+    sinkhorn_calls = 0
+    original_sinkhorn = e2e_module.sinkhorn_plan
+
+    def counted_sinkhorn(*args: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        nonlocal sinkhorn_calls
+        sinkhorn_calls += 1
+        return original_sinkhorn(*args, **kwargs)
+
+    monkeypatch.setattr(e2e_module, "sinkhorn_plan", counted_sinkhorn)
+    context = model.build_pair_context(batch)
+    assert encode_calls == 1
+    assert sinkhorn_calls == 0
+    expected = torch.eye(model.generator_cfg.slots).expand(4, -1, -1)
+    assert torch.equal(context.plan, expected)
+
+
+def test_membership_is_content_only_and_content_null_ablates_it() -> None:
+    model, batch = _tiny_model_and_batch_with_grounding()
+    with torch.no_grad():
+        model.trunk.cont_xattn[0].gate.fill_(0.7)
+    context = model.build_pair_context(batch)
+    changed = context._replace(cont=context.cont + torch.randn_like(context.cont))
+    full_a = model.score_pair_context(context)
+    full_b = model.score_pair_context(changed)
+    assert not torch.allclose(full_a, full_b)
+    mask = masks_for_null(NULL_CONTENT_HEAD, 4, torch.device("cpu"))
+    null_a = model.score_pair_context(context, masks=mask)
+    null_b = model.score_pair_context(changed, masks=mask)
+    assert torch.equal(null_a, null_b)
+    assert torch.equal(context.topo_ab, changed.topo_ab)

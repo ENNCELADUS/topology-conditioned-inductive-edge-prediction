@@ -1637,6 +1637,7 @@ def _e2e_edge_view(edge: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         "ground_b": edge["ground_j"],
         "ground_id_a": edge["ground_id_i"],
         "ground_id_b": edge["ground_id_j"],
+        "is_self": edge["is_self"],
     }
 
 
@@ -1739,7 +1740,13 @@ def _e2e_trainable_parameters(model: EgoStitchE2E) -> list[torch.nn.Parameter]:
     (`requires_grad=False`, spec Sec 13.6), so it is excluded here too, for a
     different reason (never trainable, not merely unused).
     """
-    decision_ids = {id(parameter) for parameter in model.generator.decision.parameters()}
+    # The retired scalar gate/w stay dead, but tau_kappa is now the live
+    # counterpart-membership temperature in c_content (spec Sec 5/13.17).
+    decision_ids = {
+        id(parameter)
+        for name, parameter in model.generator.decision.named_parameters()
+        if name != "tau_kappa_raw"
+    }
     return [
         parameter
         for parameter in model.parameters()
@@ -1842,6 +1849,7 @@ def _e2e_validation_batch(
     batch["ground_b"] = data.f0[torch.from_numpy(pool_rows_v)]
     batch["ground_id_a"] = torch.from_numpy(pool_rows_u)
     batch["ground_id_b"] = torch.from_numpy(pool_rows_v)
+    batch["is_self"] = torch.tensor([u == v for u, v, _ in rows], dtype=torch.bool)
     return cast(dict[str, torch.Tensor], _to_device(batch, device))
 
 

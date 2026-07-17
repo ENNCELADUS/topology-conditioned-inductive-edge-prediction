@@ -1492,15 +1492,11 @@ def _score_egostitch_e2e(
 ) -> dict[str, NDArray[np.float32]]:
     """Score pairs with an `EgoStitchE2E` model's four-logit decomposition.
 
-    Runs `model.decompose` (design rev 3 Sec 3.5 eval-time hard bypasses) over
-    length-bucketed pair batches, mirroring `_score_v3_1`'s token-stream
-    batching. Unlike the frozen-s0 Stage-1 path (`_score_egostitch`), this
-    model has no separate cacheable per-node pass exposed at the scoring-CLI
-    level: one `decompose` call folds imagination, Sinkhorn stitching, the
-    stitched-topology encoder, and the conditioned pair trunk together, so the
-    whole call is the "pair pass" that the spec Sec 13.16 fp32 contract
-    (extended here as ``egostitch_e2e_pair_fp32_v1``) pins to fp32 — autocast
-    is always disabled for this family, regardless of any future `--amp` wiring.
+    Encodes each unique node exactly once, caches its raw-token/generator state
+    on CPU, then builds one shared pair context per pair batch and applies the
+    four hard-bypass heads to that context. The complete cache and pair passes
+    are pinned to fp32 by ``egostitch_e2e_pair_fp32_v1``; autocast is always
+    disabled for this family, regardless of any future `--amp` wiring.
 
     Each batch is assembled with real grounding-pool candidates (spec Sec
     13.12), reusing the same `build_f0_matrix`/`build_grounding_pool` loader
@@ -1534,7 +1530,8 @@ def _score_egostitch_e2e(
         input row order.
     """
     from src.data.grounding import build_grounding_pool
-    from src.model.egostitch.e2e_model import EgoStitchE2E
+    from src.model.egostitch.e2e_model import E2ENodeState, EgoStitchE2E
+    from src.model.egostitch.imagine import SlotSet
 
     assert isinstance(model, EgoStitchE2E)
     if scaffold_control not in (_SCAFFOLD_CONTROL_NONE, _SCAFFOLD_CONTROL_SHUFFLE):
@@ -1587,6 +1584,95 @@ def _score_egostitch_e2e(
         dtype=torch.int64,
     )
 
+    # Probe lengths once, then run the expensive raw-token encoder and
+    # imagination generator exactly once per unique node. Cache rows on CPU so
+    # the production candidate universe does not retain every token state on
+    # device; pair batches transfer only their endpoint rows back to `device`.
+    node_lengths = {
+        node_id: length[0]
+        for node_id, length in zip(
+            node_ids,
+            probe_lengths(store, [(node_id, node_id) for node_id in node_ids]),
+            strict=True,
+        )
+    }
+    buckets: dict[int, list[str]] = {}
+    for node_id in node_ids:
+        length = node_lengths[node_id]
+        boundary = next((value for value in BUCKET_BOUNDARIES if length <= value), length)
+        buckets.setdefault(boundary, []).append(node_id)
+
+    node_cache: dict[str, E2ENodeState] = {}
+    with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=False):
+        for boundary in sorted(buckets):
+            batch_size = max(1, token_budget // max(1, boundary))
+            bucket_nodes = buckets[boundary]
+            for start in range(0, len(bucket_nodes), batch_size):
+                batch_nodes = bucket_nodes[start : start + batch_size]
+                tokens = [store.load_tokens(node_id) for node_id in batch_nodes]
+                lengths = torch.tensor(
+                    [token.size(0) for token in tokens], dtype=torch.int64, device=device
+                )
+                embeddings = torch.nn.utils.rnn.pad_sequence(tokens, batch_first=True).to(device)
+                rows = torch.tensor([index[node_id] for node_id in batch_nodes], dtype=torch.long)
+                state = model.encode_node_state(
+                    embeddings,
+                    lengths,
+                    matrix.index_select(0, rows).to(device),
+                    matrix[pool_rows[rows]].to(device),
+                    pool_rows[rows].to(device),
+                )
+                for position, node_id in enumerate(batch_nodes):
+                    true_length = int(lengths[position].item())
+                    ground_ids = (
+                        None
+                        if state.ground_ids is None
+                        else state.ground_ids[position : position + 1].detach().cpu()
+                    )
+                    node_cache[node_id] = E2ENodeState(
+                        encoded=state.encoded[position : position + 1, :true_length]
+                        .detach()
+                        .float()
+                        .cpu(),
+                        length=state.length[position : position + 1].detach().cpu(),
+                        slots=SlotSet(
+                            *(
+                                value[position : position + 1].detach().float().cpu()
+                                for value in state.slots
+                            )
+                        ),
+                        projected_x=state.projected_x[position : position + 1]
+                        .detach()
+                        .float()
+                        .cpu(),
+                        ground_ids=ground_ids,
+                    )
+
+    def _stack_cached(nodes: Sequence[str]) -> E2ENodeState:
+        states = [node_cache[node_id] for node_id in nodes]
+        encoded = torch.nn.utils.rnn.pad_sequence(
+            [state.encoded.squeeze(0) for state in states], batch_first=True
+        ).to(device)
+        ground_ids: torch.Tensor | None
+        if all(state.ground_ids is not None for state in states):
+            ground_ids = torch.cat(
+                [cast(torch.Tensor, state.ground_ids) for state in states], dim=0
+            ).to(device)
+        else:
+            ground_ids = None
+        return E2ENodeState(
+            encoded=encoded,
+            length=torch.cat([state.length for state in states], dim=0).to(device),
+            slots=SlotSet(
+                *(
+                    torch.cat(values, dim=0).to(device)
+                    for values in zip(*(state.slots for state in states), strict=True)
+                )
+            ),
+            projected_x=torch.cat([state.projected_x for state in states], dim=0).to(device),
+            ground_ids=ground_ids,
+        )
+
     out: dict[str, NDArray[np.float32]] = {
         key: np.empty(len(pairs), dtype=np.float32) for key in _EGOSTITCH_E2E_ARRAY_KEYS
     }
@@ -1598,7 +1684,6 @@ def _score_egostitch_e2e(
         all_lengths = probe_lengths(store, node_universe)
         max_length = max((max(length) for length in all_lengths), default=1)
         block_size = min(len(node_universe), max(1, token_budget // (2 * max_length)))
-        dataset = TokenPairDataset(node_universe, None, store, lengths=all_lengths)
         row_end = row_start + len(pairs)
         batch_specs: list[tuple[list[int], list[tuple[int, int]]]] = []
         control_order = sorted(
@@ -1620,7 +1705,6 @@ def _score_egostitch_e2e(
         batch_pair_source = node_universe
     else:
         lengths = probe_lengths(store, pairs)
-        dataset = TokenPairDataset(pairs, None, store, lengths=lengths)
         sampler = LengthBucketedBatchSampler(lengths, token_budget=token_budget, shuffle=False)
         batch_specs = [
             (indices, [(index, position) for position, index in enumerate(indices)])
@@ -1629,23 +1713,16 @@ def _score_egostitch_e2e(
         batch_pair_source = pairs
 
     for batch_indices, output_rows in batch_specs:
-        batch = collate_token_pairs([dataset[index] for index in batch_indices])
-        batch = {key: tensor.to(device) for key, tensor in batch.items()}
-        u_rows = torch.tensor(
-            [index[batch_pair_source[i][0]] for i in batch_indices], dtype=torch.int64
+        batch_pairs = [batch_pair_source[row] for row in batch_indices]
+        state_a = _stack_cached([pair[0] for pair in batch_pairs])
+        state_b = _stack_cached([pair[1] for pair in batch_pairs])
+        is_self = torch.tensor(
+            [node_u == node_v for node_u, node_v in batch_pairs],
+            dtype=torch.bool,
+            device=device,
         )
-        v_rows = torch.tensor(
-            [index[batch_pair_source[i][1]] for i in batch_indices], dtype=torch.int64
-        )
-        batch["x_a"] = matrix.index_select(0, u_rows).to(device)
-        batch["x_b"] = matrix.index_select(0, v_rows).to(device)
-        batch["ground_a"] = matrix[pool_rows[u_rows]].to(device)
-        batch["ground_b"] = matrix[pool_rows[v_rows]].to(device)
-        batch["ground_id_a"] = pool_rows[u_rows].to(device)
-        batch["ground_id_b"] = pool_rows[v_rows].to(device)
         hook: torch.utils.hooks.RemovableHandle | None = None
         if scaffold_control == _SCAFFOLD_CONTROL_SHUFFLE:
-            batch_pairs = [batch_pair_source[row] for row in batch_indices]
 
             def _shuffle_before_ste(
                 _module: nn.Module,
@@ -1657,7 +1734,8 @@ def _score_egostitch_e2e(
             hook = model.ste.register_forward_pre_hook(_shuffle_before_ste)
         try:
             with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=False):
-                decomposed = model.decompose(batch)
+                context = model.build_pair_context_from_states(state_a, state_b, is_self)
+                decomposed = model.decompose_pair_context(context)
         finally:
             if hook is not None:
                 hook.remove()

@@ -43,6 +43,13 @@ def build_scaffold(slots_src: SlotSet, slots_dst: SlotSet, plan: torch.Tensor) -
         The structure-only ``ScaffoldTokens`` (no slot content, no grounding).
     """
     b, k = slots_src.pi.shape
+    if slots_dst.pi.shape != (b, k):
+        raise ValueError(
+            "scaffold sides require equal slot counts and batch size: "
+            f"{tuple(slots_src.pi.shape)} != {tuple(slots_dst.pi.shape)}"
+        )
+    if plan.shape != (b, k, k):
+        raise ValueError(f"plan shape must be {(b, k, k)}, got {tuple(plan.shape)}")
     v = 2 + 2 * k
     device, dtype = slots_src.pi.device, slots_src.pi.dtype
 
@@ -99,8 +106,10 @@ def build_content_tokens(
     slots_dst: SlotSet,
     matched_src: torch.Tensor,
     matched_dst: torch.Tensor,
+    membership_src: torch.Tensor,
+    membership_dst: torch.Tensor,
 ) -> torch.Tensor:
-    """Content-pathway tokens: ``[h; pi; gate; grounded-identity-match]``.
+    """Content tokens: ``[h; pi; gate; identity-match; membership]``.
 
     Args:
         slots_src: Source-side generated slot set (spec Sec 2 heads).
@@ -110,18 +119,50 @@ def build_content_tokens(
             labels per rev 3).
         matched_dst: Shape ``(B, K)`` grounded-identity-match signal in
             ``[0, 1]`` for the destination-side slots.
+        membership_src: Shape ``(B, K)`` counterpart-membership compatibility
+            for source-side slots (former-s1 per-slot signal).
+        membership_dst: Shape ``(B, K)`` counterpart-membership compatibility
+            for destination-side slots.
 
     Returns:
-        Shape ``(B, 2K, d_p + 3)`` content tokens, src slots first.
+        Shape ``(B, 2K, d_p + 4)`` content tokens, src slots first.
     """
+    b, k = slots_src.pi.shape
+    if slots_dst.pi.shape != (b, k):
+        raise ValueError(
+            "content sides require equal slot counts and batch size: "
+            f"{tuple(slots_src.pi.shape)} != {tuple(slots_dst.pi.shape)}"
+        )
+    named = {
+        "matched_src": matched_src,
+        "matched_dst": matched_dst,
+        "membership_src": membership_src,
+        "membership_dst": membership_dst,
+    }
+    for name, value in named.items():
+        if value.shape != (b, k):
+            raise ValueError(f"{name} shape must be {(b, k)}, got {tuple(value.shape)}")
 
-    def side(s: SlotSet, matched: torch.Tensor) -> torch.Tensor:
+    def side(s: SlotSet, matched: torch.Tensor, membership: torch.Tensor) -> torch.Tensor:
         out: torch.Tensor = torch.cat(
-            [s.h, s.pi[..., None], s.gate[..., None], matched[..., None]], dim=-1
+            [
+                s.h,
+                s.pi[..., None],
+                s.gate[..., None],
+                matched[..., None],
+                membership[..., None],
+            ],
+            dim=-1,
         )
         return out
 
-    return torch.cat([side(slots_src, matched_src), side(slots_dst, matched_dst)], dim=1)
+    return torch.cat(
+        [
+            side(slots_src, matched_src, membership_src),
+            side(slots_dst, matched_dst, membership_dst),
+        ],
+        dim=1,
+    )
 
 
 class ContentProjector(nn.Module):
@@ -132,14 +173,14 @@ class ContentProjector(nn.Module):
 
         Args:
             d_p: Slot content embedding dimension (pre-projection width less
-                the 3 scalar channels).
+                the 4 scalar channels).
             d_model: Trunk model width to project into.
         """
         super().__init__()
-        self.proj = nn.Linear(d_p + 3, d_model)
+        self.proj = nn.Linear(d_p + 4, d_model)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Project content tokens ``(B, 2K, d_p + 3)`` to ``(B, 2K, d_model)``.
+        """Project content tokens ``(B, 2K, d_p + 4)`` to ``(B, 2K, d_model)``.
 
         Args:
             tokens: Content tokens produced by :func:`build_content_tokens`.
