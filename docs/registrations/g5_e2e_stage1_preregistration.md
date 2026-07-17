@@ -117,9 +117,11 @@ degree-partialled variants and Π-consistency); gate tanh magnitudes and per-fam
 gradient norms; p0-vs-full four-logit divergence.
 
 The gate requires a provenance-bound `egostitch_e2e_probe_v1` artifact produced
-after scoring from the selected full checkpoint. It uses all operative train
-nodes in sorted order and the 4,096 hash-smallest non-self `E_msg` pairs (or all
-when fewer), and reports degree / ego-density / clustering ridge R², the
+after scoring from the selected full checkpoint. The producer requires the
+registered `arms.full.training` config with `permanent_null = none` and
+`p_topo = p_cont = 0.15`, so the p0 checkpoint cannot be substituted. It uses
+all operative train nodes in sorted order and the 4,096 hash-smallest non-self
+`E_msg` pairs (or all when fewer), and reports degree / ego-density / clustering ridge R², the
 degree-partialled density and clustering variants, and Π/shared-neighbor
 consistency. This evidence is required output but remains nonbinding.
 
@@ -151,9 +153,10 @@ retained topology-derived node features — not that the gain is non-topological
 
 - **Worker:** `src/train_egostitch.py` records this file's sha256 as
   `run_metadata.json['preregistration_sha256']` at start; refuses formal
-  (non-`--max-steps`) runs unless `status == BINDING`; `--max-steps` debug runs
-  accept DRAFT but write only to `*_debug` output directories and produce no
-  held-out artifacts.
+  (non-`--max-steps`) runs unless `status == BINDING` and no
+  `REQUIRED-BEFORE-BINDING` marker remains anywhere; `--max-steps` debug runs
+  accept DRAFT/unresolved markers but write only to `*_debug` output directories
+  and produce no held-out artifacts.
 - **Gate:** `src/experiments/g5_stage1.py` requires `status == BINDING`,
   a real calibrated-comparator digest, evaluator seed 0, exact candidate and arm
   provenance, the probe artifact, and this file's sha256 matching **all four**

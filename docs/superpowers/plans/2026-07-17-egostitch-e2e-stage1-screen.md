@@ -882,6 +882,10 @@ additionally records
     --preregistration docs/registrations/g5_e2e_stage1_preregistration.json \
     --output-dir outputs/egostitch_e2e_stage1/formal_gate
 ```
+The probe producer fails closed unless the metadata/config identify the registered
+full arm (`arms.full.training`, `permanent_null = none`,
+`p_topo = p_cont = 0.15`); p0 is not an interchangeable source.
+
 (Exact flag names come from Task 15's implementation; if they differ, the gate
 `--help` is authoritative — but the *inputs* above are the registered set and
 may not shrink.)

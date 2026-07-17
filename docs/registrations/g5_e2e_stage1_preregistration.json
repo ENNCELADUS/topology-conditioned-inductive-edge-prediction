@@ -146,6 +146,8 @@
     "required_gate_input": true,
     "format": "egostitch_e2e_probe_v1",
     "producer": "python -m src.experiments.probes produce-e2e",
+    "source_arm": "full",
+    "source_binding": "arms.full.training with permanent_null=none and p_topo=p_cont=0.15; p0 is rejected",
     "expected_path": "outputs/egostitch_e2e_stage1/full/probes/e2e_probe_v1.npz",
     "node_selection": "all operative train nodes, sorted id order",
     "pair_selection": "the 4096 non-self E_msg pairs with smallest sha256('min(u,v)|max(u,v)'), or all if fewer",
@@ -159,7 +161,7 @@
   "verdict_rule": "single-seed screening pass iff the full arm strictly dominates every comparator on all three primary criteria at the registered operating points, both guards pass, liveness passes, and both e2e_rules decision conditions pass",
   "failure_reading": "If the full arm fails the primary family against the B0+cal comparator set, the topology-conditioned encoder does not beat calibrated independent scoring at this stage; the result is written up honestly and the locked-decision discussion is taken before any Stage-2 mechanism or E1 registration. If the primaries pass but pathway attribution fails, the honest conclusion is content-side information. If the primaries pass but the structure-control condition fails, the honest conclusion is that shuffled relational connectivity was not necessary beyond the retained topology-derived node features - not that the gain is non-topological.",
   "mechanics": {
-    "worker_obligation": "src/train_egostitch.py records this file's sha256 as run_metadata.json['preregistration_sha256'] at start; it refuses formal (non --max-steps) runs unless status == BINDING; --max-steps debug runs accept DRAFT but write only to *_debug output directories and produce no held-out artifacts",
+    "worker_obligation": "src/train_egostitch.py records this file's sha256 as run_metadata.json['preregistration_sha256'] at start; it refuses formal (non --max-steps) runs unless status == BINDING and no REQUIRED-BEFORE-BINDING marker remains anywhere; --max-steps debug runs accept DRAFT/unresolved markers but write only to *_debug output directories and produce no held-out artifacts",
     "gate_obligation": "src/experiments/g5_stage1.py requires status == BINDING, a real b0cal_results digest in place of REQUIRED-BEFORE-BINDING, evaluator seed 0, exact frozen candidate pair/label identity, exact per-arm scoring provenance, the provenance-bound probe artifact, and this file's sha256 matching ALL FOUR formal run metadatas (full, f_only, pair_topology, p0)",
     "hyperparameters": "spec §13.18 defaults x fixed Seed 0; no sweeps inside this screen",
     "p4_exclusion": "no hard heuristic/feature negatives and no hard-negative checkpoint criterion are added in this revision"

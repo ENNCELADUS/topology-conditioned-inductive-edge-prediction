@@ -643,6 +643,13 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   slice; fixed-replay submodule-gradient telemetry; and the deterministic,
   provenance-bound nonbinding probe artifact. These details close implementation
   gaps without changing any Stage-1 verdict inequality or binding the registration.
+- 2026-07-17: final adversarial closure for the DRAFT E2E screen. Formal worker
+  preflight now rejects any registration that still contains a
+  `REQUIRED-BEFORE-BINDING` marker; the probe producer is bound specifically to
+  the registered full-arm config and `p_topo = p_cont = 0.15`; and cached
+  four-logit scoring is required to match the uncached production decomposition
+  on mixed-length/self-pair batches. No verdict inequality or registration status
+  changes in this edit.
 
 **Closed gate-report deliverable (2026-07-17):** the frozen-s0 Stage-1 gate report,
 fidelity diagnostics, and measured FLOPs/latency report are complete. The binding
@@ -914,7 +921,9 @@ pass may stay BF16 with fp32-cached outputs, unchanged. Candidate scoring encode
 each unique node once, caches the raw-token encoder state and generated ego state as
 fp32, builds Stitch/STE/content pair context once per pair batch, and evaluates the
 four hard-bypass heads from that shared context; four complete generator/Stitch/STE
-forwards are prohibited. Artifacts for this family
+forwards are prohibited. The cached path must reproduce an uncached production
+`decompose` pass within explicit fp32 tolerance for mixed token lengths and self
+pairs. Artifacts for this family
 record the contract string `egostitch_e2e_pair_fp32_v1`; the resolution guard
 applies to each of the four arrays independently. `egostitch_pair_fp32_v1` remains
 the recorded contract for historical frozen-s0 artifacts.
@@ -950,8 +959,11 @@ by the formal gate. The channel-scale series of this section read the available 
 
 The required nonbinding representation evidence is a deterministic
 `egostitch_e2e_probe_v1` artifact generated from the selected full checkpoint
-after scoring and consumed by the gate. It is bound to checkpoint id,
-registration SHA-256, config hash, Seed 0, partition Seed 0, and `G_struct`. Node
+after scoring and consumed by the gate. The producer accepts only the registered
+`arms.full.training` config, with `permanent_null = none` and the full-arm
+`p_topo = p_cont = 0.15`; the p0 arm is invalid even though it also has no
+permanent null. It is bound to checkpoint id, registration SHA-256, config hash,
+Seed 0, partition Seed 0, and `G_struct`. Node
 rows are every operative train node in sorted id order; pair rows are the 4,096
 non-self `E_msg` pairs with smallest `sha256("min(u,v)|max(u,v)")` (or all rows
 when fewer exist). It carries mean-pooled STE states and evaluator targets for
@@ -1013,9 +1025,11 @@ primary `pair_topology`; `p0` = control `none`, permanent null `none`, primary
 
 **Registration-status enforcement (machine-checked):** a formal training run (no
 `--max-steps`) requires the referenced registration file to carry
-`status: BINDING`; the worker fails closed otherwise. `--max-steps` debug runs
-accept `DRAFT` but are redirected to `*_debug` output directories and never write
-held-out artifacts. The G5 gate requires `status: BINDING` and a registration
+`status: BINDING` **and contain no `REQUIRED-BEFORE-BINDING` marker anywhere**;
+the worker fails closed otherwise before DDP work starts. `--max-steps` debug runs
+accept `DRAFT`/unresolved markers but are redirected to `*_debug` output
+directories and never write held-out artifacts. The G5 gate requires
+`status: BINDING` and a registration
 sha256 that matches the `preregistration_sha256` of **every** consumed formal run
 metadata. Amending a BINDING registration requires a new versioned registration
 file (predecessor convention).
