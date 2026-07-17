@@ -221,6 +221,30 @@ class EgoStitchE2E(nn.Module):
         )
         return topo_ab, topo_ba, cont
 
+    @torch.no_grad()
+    def probe_states(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Export STE token states for a fixed probe batch (read-only diagnostic).
+
+        Runs only the Stage-1 generator + Stitch + STE pathway used to build
+        the ``topo_ab`` conditioning tensor `_context` computes internally for
+        `forward` — no trunk, no head, no gradient. Intended for the
+        registered representation-probe protocol (`src.experiments.probes`,
+        spec Sec 14.3(3)): callers typically pass a batch of self-pairs
+        (``x_a == x_b``, the Sec 13.9 single-ego path) so each row's tokens
+        describe one probe node's own generated ego-net, then reduce over the
+        token axis (e.g. mean-pool) before probing.
+
+        Args:
+            batch: Pair batch with the `_context` keys (``x_a``/``x_b`` and
+                optionally ``ground_a``/``ground_b``/``ground_id_a``/
+                ``ground_id_b``).
+
+        Returns:
+            Shape ``(B, V, d_model)`` AB-direction STE token states.
+        """
+        topo_ab, _topo_ba, _cont = self._context(batch)
+        return topo_ab
+
     def forward(
         self, batch: dict[str, torch.Tensor], *, masks: HeadNullMasks | None = None
     ) -> dict[str, torch.Tensor]:

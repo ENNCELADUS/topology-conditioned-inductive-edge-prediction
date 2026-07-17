@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from src.experiments import b0_cal, g5_stage1
 from src.experiments.g1_hardened_e2 import AssembledRow
-from src.score_universe import ScoresArtifact
+from src.score_universe import ScoresArtifact, save_scores
 
 from tests.test_b0_cal import _toy_inputs as _b0cal_toy_inputs
 from tests.test_g1_hardened_e2 import (
@@ -497,3 +497,259 @@ class TestCli:
                     str(tmp_path / "out"),
                 ]
             )
+
+
+# --------------------------------------------------------------------------- e2e family:
+# within-checkpoint liveness + five-arm summary (Task 15)
+
+
+class TestWithinCheckpointLivenessGuard:
+    @staticmethod
+    def _artifact(full: np.ndarray, f_logit: np.ndarray) -> ScoresArtifact:
+        n = len(full)
+        return ScoresArtifact(
+            node_ids=[f"n{i}" for i in range(n)],
+            u_idx=np.arange(n, dtype=np.int32),
+            v_idx=np.arange(n, dtype=np.int32),
+            logit=full.astype(np.float32),
+            label=np.zeros(n, dtype=np.int8),
+            meta={"model_family": "egostitch_e2e"},
+            f_logit=f_logit.astype(np.float32),
+        )
+
+    def test_fires_when_full_equals_f_logit(self) -> None:
+        f_logit = np.array([-1.0, 0.0, 1.0, 2.0, 3.0])
+        artifact = self._artifact(f_logit.copy(), f_logit)
+        with pytest.raises(ValueError, match="dead residual"):
+            g5_stage1.validate_dead_residual_within_checkpoint(
+                artifact,
+                min_residual_std_ratio=1e-5,
+                max_spearman=0.9999,
+                max_topk_overlap=0.9999,
+                topk_fraction=0.01,
+            )
+
+    def test_fires_on_pair_invariant_residual(self) -> None:
+        # A tiny constant offset scales the residual so small that the
+        # conjunctive rule still fires, mirroring the frozen-s0 dead-residual
+        # test: the residual must genuinely vary with the pair, not merely be
+        # small in magnitude.
+        f_logit = np.linspace(-2.0, 2.0, 200)
+        full = f_logit + 1e-9
+        artifact = self._artifact(full, f_logit)
+        with pytest.raises(ValueError, match="dead residual"):
+            g5_stage1.validate_dead_residual_within_checkpoint(
+                artifact,
+                min_residual_std_ratio=1e-5,
+                max_spearman=0.9999,
+                max_topk_overlap=0.9999,
+                topk_fraction=0.01,
+            )
+
+    def test_does_not_fire_on_decorrelated_full(self) -> None:
+        rng = np.random.default_rng(0)
+        f_logit = rng.normal(size=200)
+        full = rng.normal(size=200)  # independent of f_logit -> genuinely alive residual
+        artifact = self._artifact(full, f_logit)
+        report = g5_stage1.validate_dead_residual_within_checkpoint(
+            artifact,
+            min_residual_std_ratio=1e-5,
+            max_spearman=0.9999,
+            max_topk_overlap=0.9999,
+            topk_fraction=0.01,
+        )
+        assert report["residual_std"] > 0
+
+    def test_accepts_alive_residual_even_when_small(self) -> None:
+        f_logit = np.array([-1.0, 0.0, 1.0])
+        full = np.array([-0.99, -0.02, 1.03])
+        artifact = self._artifact(full, f_logit)
+        report = g5_stage1.validate_dead_residual_within_checkpoint(
+            artifact,
+            min_residual_std_ratio=1e-5,
+            max_spearman=0.9999,
+            max_topk_overlap=0.9999,
+            topk_fraction=1 / 3,
+        )
+        assert report["residual_std"] > 0
+
+    def test_requires_f_logit_array(self) -> None:
+        artifact = ScoresArtifact(
+            node_ids=["a"],
+            u_idx=np.array([0], dtype=np.int32),
+            v_idx=np.array([0], dtype=np.int32),
+            logit=np.array([0.0], dtype=np.float32),
+            label=np.array([0], dtype=np.int8),
+            meta={},
+        )
+        with pytest.raises(ValueError, match="f_logit"):
+            g5_stage1.validate_dead_residual_within_checkpoint(
+                artifact,
+                min_residual_std_ratio=1e-5,
+                max_spearman=0.9999,
+                max_topk_overlap=0.9999,
+                topk_fraction=0.01,
+            )
+
+
+def _write_e2e_universe_npz(
+    path: Path,
+    *,
+    node_ids: list[str],
+    pairs: list[tuple[str, str]],
+    full: np.ndarray,
+    f_logit: np.ndarray,
+    pair_content: np.ndarray,
+    pair_topology: np.ndarray,
+    labels: np.ndarray,
+    strategy: str = "toy",
+    checkpoint_id: str = "e2e0",
+) -> None:
+    """Write a toy family-``egostitch_e2e`` four-array scores artifact."""
+    position = {node_id: i for i, node_id in enumerate(node_ids)}
+    u_idx = np.array([position[u] for u, _ in pairs], dtype=np.int32)
+    v_idx = np.array([position[v] for _, v in pairs], dtype=np.int32)
+    meta: dict[str, object] = {
+        "checkpoint_id": checkpoint_id,
+        "model_family": "egostitch_e2e",
+        "pairs_source": "candidate",
+        "strategy": strategy,
+        "num_rows": len(pairs),
+        "created_utc": "2026-07-17T00:00:00+00:00",
+        "torch_version": "2.10.0",
+        "score_precision": {
+            "contract": "egostitch_e2e_pair_fp32_v1",
+            "encode_autocast": "off",
+            "pair_compute_dtype": "float32",
+            "pair_autocast": False,
+            "logit_storage_dtype": "float32",
+        },
+    }
+    save_scores(
+        path,
+        node_ids=node_ids,
+        u_idx=u_idx,
+        v_idx=v_idx,
+        logit=full.astype(np.float32),
+        label=labels.astype(np.int8),
+        row_start=0,
+        meta=meta,
+        f_logit=f_logit.astype(np.float32),
+        pair_content=pair_content.astype(np.float32),
+        pair_topology=pair_topology.astype(np.float32),
+    )
+
+
+_E2E_LIVENESS_CONFIG = {
+    "min_residual_std_ratio": 1e-5,
+    "max_spearman": 0.9999,
+    "max_topk_overlap": 0.9999,
+    "topk_fraction": 0.01,
+}
+
+
+def _five_arm_inputs(tmp_path: Path) -> dict[str, Any]:
+    """Toy benchmark + five egostitch_e2e arm universes + per-arm run metadata."""
+    _b0_universe_path, _val_path, data_root = _b0cal_toy_inputs(tmp_path)
+    pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
+    rng = np.random.default_rng(42)
+    full = rng.normal(size=len(pairs))
+    f_logit = rng.normal(size=len(pairs))  # independent of `full` -> alive residual
+    pair_content = rng.normal(size=len(pairs))
+    pair_topology = rng.normal(size=len(pairs))
+
+    arm_paths: dict[str, Path] = {}
+    for name in g5_stage1._E2E_ARMS:
+        path = tmp_path / f"{name}.npz"
+        _write_e2e_universe_npz(
+            path,
+            node_ids=_NODES,
+            pairs=pairs,
+            full=full,
+            f_logit=f_logit,
+            pair_content=pair_content,
+            pair_topology=pair_topology,
+            labels=labels,
+            checkpoint_id=f"ckpt_{name}",
+        )
+        arm_paths[name] = path
+
+    run_metadata_paths: dict[str, Path] = {}
+    for name in ("full", "b0_e2e_f_only", "pair_topology", "p0"):
+        meta_path = tmp_path / f"{name}_run_metadata.json"
+        meta_path.write_text(json.dumps({"preregistration_sha256": "a" * 64}))
+        run_metadata_paths[name] = meta_path
+
+    return {
+        "arm_universe_paths": arm_paths,
+        "run_metadata_paths": run_metadata_paths,
+        "data_root": data_root,
+        "strategy": "toy",
+    }
+
+
+class TestBuildE2EArmSummary:
+    def test_all_five_arms_reported(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        payload = g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+        arms = _d(payload["arms"])
+        assert set(arms) == set(g5_stage1._E2E_ARMS)
+        assert payload["registration_sha256"] == "a" * 64
+        for name in g5_stage1._E2E_ARMS:
+            row = _d(arms[name])
+            assert row["checkpoint_id"] == f"ckpt_{name}"
+            assert "graph_similarity" in _d(row["assembled"])
+        # structure_control_6a never had its own run_metadata entry.
+        assert _d(arms["structure_control_6a"])["registration_sha256"] is None
+        assert _d(arms["full"])["registration_sha256"] == "a" * 64
+        liveness = _d(payload["liveness"])
+        assert liveness["residual_std"] > 0
+
+    def test_byte_identical_reruns(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        first = g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+        second = g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+        assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
+
+    def test_rejects_unknown_arm(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        inputs["arm_universe_paths"] = dict(inputs["arm_universe_paths"])
+        inputs["arm_universe_paths"]["bogus"] = inputs["arm_universe_paths"]["full"]
+        with pytest.raises(ValueError, match="unrecognized"):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_requires_full_arm(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        inputs["arm_universe_paths"] = {
+            k: v for k, v in inputs["arm_universe_paths"].items() if k != "full"
+        }
+        with pytest.raises(ValueError, match="'full' arm is required"):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_registration_hash_mismatch_rejected(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        bad_meta = tmp_path / "bad_meta.json"
+        bad_meta.write_text(json.dumps({"preregistration_sha256": "b" * 64}))
+        inputs["run_metadata_paths"] = dict(inputs["run_metadata_paths"])
+        inputs["run_metadata_paths"]["p0"] = bad_meta
+        with pytest.raises(ValueError, match="disagree"):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_rejects_wrong_model_family(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        wrong_path = tmp_path / "wrong_family.npz"
+        pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
+        _write_universe_npz(
+            wrong_path,
+            node_ids=_NODES,
+            pairs=pairs,
+            logits=np.zeros(len(pairs), dtype=np.float32),
+            labels=labels,
+            strategy="toy",
+            model_family="v3_1",
+        )
+        inputs["arm_universe_paths"] = dict(inputs["arm_universe_paths"])
+        inputs["arm_universe_paths"]["p0"] = wrong_path
+        with pytest.raises(ValueError, match="model_family"):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)

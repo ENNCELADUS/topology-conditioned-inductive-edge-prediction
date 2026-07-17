@@ -197,3 +197,37 @@ def test_matched_flags_swap_sides_swaps_outputs() -> None:
     )
     assert torch.equal(matched_a, matched_a_swapped)
     assert torch.equal(matched_b, matched_b_swapped)
+
+
+# --------------------------------------------------------------------------- Task 15:
+# `probe_states` — read-only STE token-state export for representation probes
+
+
+def test_probe_states_returns_ste_token_states() -> None:
+    """`probe_states` exports the STE token states that condition the trunk."""
+    model, batch = _tiny_model_and_batch()
+    states = model.probe_states(batch)
+    b = batch["x_a"].size(0)
+    assert states.shape[0] == b
+    assert states.shape[-1] == model.cfg.d_model
+    assert states.requires_grad is False
+    again = model.probe_states(batch)
+    assert torch.equal(states, again)  # deterministic in eval mode (no dropout)
+
+
+def test_probe_states_reflects_probe_node_features() -> None:
+    """Changing the probe node's own features changes its exported token states."""
+    model, batch = _tiny_model_and_batch()
+    baseline = model.probe_states(batch)
+    perturbed = dict(batch)
+    perturbed["x_a"] = torch.randn_like(batch["x_a"])
+    changed = model.probe_states(perturbed)
+    assert not torch.allclose(baseline, changed)
+
+
+def test_probe_states_accepts_self_pair_batch() -> None:
+    """`probe_states` runs on a self-pair batch (spec Sec 13.9 single-ego path)."""
+    model, batch = _tiny_model_and_batch()
+    batch["x_b"] = batch["x_a"]
+    states = model.probe_states(batch)
+    assert states.shape[0] == batch["x_a"].size(0)

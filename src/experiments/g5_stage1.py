@@ -39,7 +39,7 @@ import hashlib
 import json
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -58,6 +58,7 @@ from src.experiments.g1_hardened_e2 import (
     AssembledRow,
     _assembled_row_to_dict,
     _edge_metrics_table_to_dict,
+    _expected_candidate_rows,
     _self_pair_edge_metrics_to_dict,
     assemble_and_evaluate,
     compute_self_pair_edge_metrics,
@@ -66,7 +67,7 @@ from src.experiments.g1_hardened_e2 import (
     load_test_node_buckets,
     validate_universe_artifact,
 )
-from src.score_universe import ScoresArtifact, load_scores
+from src.score_universe import ScoresArtifact, load_scores, validate_artifact_precision
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +281,84 @@ def validate_dead_residual(
         and overlap > max_topk_overlap
     ):
         raise ValueError(f"dead residual fidelity gate failed: {report}")
+    return report
+
+
+def validate_dead_residual_within_checkpoint(
+    artifact: ScoresArtifact,
+    *,
+    min_residual_std_ratio: float,
+    max_spearman: float,
+    max_topk_overlap: float,
+    topk_fraction: float,
+) -> dict[str, float]:
+    """Fail closed when a checkpoint's own topology/content pathway carries no signal.
+
+    Family ``egostitch_e2e`` liveness (spec Sec 13.17/13.8, re-registered
+    2026-07-17) references the **within-checkpoint** ``f_logit`` arm of the
+    SAME scored artifact instead of a fresh frozen-s0 comparator: ``full`` and
+    ``f_logit`` already share row order by construction (one artifact, one
+    scoring pass over the same pair universe), so no cross-artifact pair
+    alignment step exists or is needed for this family — contrast
+    :func:`validate_dead_residual`, which aligns two distinct artifacts for
+    the historical frozen-s0 family.
+
+    Args:
+        artifact: A loaded ``egostitch_e2e`` scores artifact; its ``f_logit``
+            array must be present.
+        min_residual_std_ratio: Registered lower bound on
+            ``std(full - f_logit) / std(f_logit)``.
+        max_spearman: Registered upper bound on ``Spearman(full, f_logit)``.
+        max_topk_overlap: Registered upper bound on the top-``topk_fraction``
+            overlap between ``full`` and ``f_logit``.
+        topk_fraction: Top fraction used for the overlap signal (spec pins
+            ``0.01`` for this family).
+
+    Returns:
+        A diagnostics dict (std ratio, correlation, overlap, and their raw
+        ingredients).
+
+    Raises:
+        ValueError: If `artifact.f_logit` is absent, or if all three death
+            signals hold conjunctively (residual/`f_logit` standard-deviation
+            ratio below `min_residual_std_ratio`, Spearman correlation with
+            `f_logit` above `max_spearman`, and top-k overlap with `f_logit`
+            above `max_topk_overlap`).
+    """
+    if artifact.f_logit is None:
+        raise ValueError(
+            "within-checkpoint liveness requires an artifact with an f_logit array "
+            "(family egostitch_e2e)"
+        )
+    full = artifact.logit.astype(np.float64)
+    f_logit = artifact.f_logit.astype(np.float64)
+    residual = full - f_logit
+    f_logit_std = float(np.std(f_logit))
+    residual_std = float(np.std(residual))
+    residual_ratio = residual_std / max(f_logit_std, 1e-30)
+    correlation = float(spearmanr(f_logit, full).statistic)
+    if not np.isfinite(correlation):
+        correlation = 1.0 if np.array_equal(f_logit, full) else 0.0
+    n = len(full)
+    topk = max(1, min(n, int(round(n * topk_fraction))))
+    row_ids = np.arange(n, dtype=np.int64)
+    f_top = set(np.lexsort((row_ids, -f_logit))[:topk].tolist())
+    full_top = set(np.lexsort((row_ids, -full))[:topk].tolist())
+    overlap = len(f_top & full_top) / topk
+    report = {
+        "f_logit_std": f_logit_std,
+        "residual_std": residual_std,
+        "residual_f_logit_std_ratio": residual_ratio,
+        "spearman_vs_f_logit": correlation,
+        "topk_overlap_vs_f_logit": overlap,
+        "topk_fraction": topk_fraction,
+    }
+    if (
+        residual_ratio < min_residual_std_ratio
+        and correlation > max_spearman
+        and overlap > max_topk_overlap
+    ):
+        raise ValueError(f"within-checkpoint dead residual fidelity gate failed: {report}")
     return report
 
 
@@ -919,6 +998,233 @@ def run_g5_stage1_pipeline(
     return payload
 
 
+# --------------------------------------------------------------------------- e2e five-arm summary
+
+_E2E_ARMS: tuple[str, ...] = (
+    "full",
+    "b0_e2e_f_only",
+    "pair_topology",
+    "structure_control_6a",
+    "p0",
+)
+
+
+def _e2e_registration_sha256(run_metadata: Mapping[str, Mapping[str, object]]) -> str | None:
+    """Return the single registration hash shared by every provided run metadata.
+
+    Args:
+        run_metadata: Formal-run arm name -> its parsed ``run_metadata.json``.
+            ``structure_control_6a`` never has an entry (it is a scoring-time
+            control over the ``full`` checkpoint, not its own training run).
+
+    Returns:
+        The common ``preregistration_sha256`` value, or ``None`` if no
+        metadata was provided.
+
+    Raises:
+        ValueError: If two arms' metadata disagree on `preregistration_sha256`.
+    """
+    hashes: dict[str, object] = {
+        name: metadata.get("preregistration_sha256") for name, metadata in run_metadata.items()
+    }
+    distinct = {value for value in hashes.values() if value is not None}
+    if len(distinct) > 1:
+        raise ValueError(f"e2e arm run metadata disagree on preregistration_sha256: {hashes}")
+    if not distinct:
+        return None
+    return cast(str, next(iter(distinct)))
+
+
+def _validate_e2e_universe_shape(
+    artifact: ScoresArtifact, *, strategy: str, n_test_nodes: int, label: str
+) -> None:
+    """Structural candidate-universe checks for family ``egostitch_e2e`` artifacts.
+
+    Mirrors :func:`src.experiments.g1_hardened_e2.validate_universe_artifact`'s
+    non-precision checks (``pairs_source``/``strategy``/row-count/label-domain)
+    WITHOUT its internal ``validate_score_precision(artifact.logit, meta=...)``
+    call: that raw idiom always reports the ``f_logit``/``pair_content``/
+    ``pair_topology`` arrays as "missing" for this family, because it never
+    forwards them as ``extra_arrays`` (the exact footgun
+    :func:`validate_artifact_precision` exists to avoid — Task 14 review
+    finding). Precision is validated separately, via
+    :func:`validate_artifact_precision`, in :func:`build_e2e_arm_summary`.
+
+    Args:
+        artifact: The loaded scores artifact.
+        strategy: Expected split strategy name.
+        n_test_nodes: Number of test nodes the candidate universe is defined
+            over (used to derive the expected row count ``C(n, 2) + n``).
+        label: Human-readable artifact label used in error messages.
+
+    Raises:
+        ValueError: If ``meta["pairs_source"] != "candidate"``,
+            ``meta["strategy"]`` does not match `strategy`, the row count does
+            not equal the expected candidate-universe size, or any label is
+            outside ``{0, 1}``.
+    """
+    errors: list[str] = []
+    pairs_source = artifact.meta.get("pairs_source")
+    if pairs_source != "candidate":
+        errors.append(f"{label}: pairs_source expected 'candidate', got {pairs_source!r}")
+    meta_strategy = artifact.meta.get("strategy")
+    if meta_strategy != strategy:
+        errors.append(f"{label}: strategy expected {strategy!r}, got {meta_strategy!r}")
+    expected_rows = _expected_candidate_rows(n_test_nodes)
+    n_rows = len(artifact.logit)
+    if n_rows != expected_rows:
+        errors.append(
+            f"{label}: row count expected {expected_rows} "
+            f"(C({n_test_nodes},2)+{n_test_nodes}), got {n_rows}"
+        )
+    labels_present = set(np.unique(artifact.label).tolist())
+    bad_labels = labels_present - {0, 1}
+    if bad_labels:
+        errors.append(f"{label}: label values outside {{0,1}} found: {sorted(bad_labels)}")
+    if errors:
+        raise ValueError("; ".join(errors))
+
+
+def build_e2e_arm_summary(
+    *,
+    arm_universe_paths: Mapping[str, Path],
+    run_metadata_paths: Mapping[str, Path] | None = None,
+    data_root: Path,
+    strategy: str,
+    liveness_config: Mapping[str, float],
+    seed: int = 0,
+) -> dict[str, object]:
+    """Build the registered five-arm ``egostitch_e2e`` Stage-1 summary table.
+
+    Loads and validates every arm's scores artifact through
+    :func:`validate_artifact_precision` (the artifact-aware entry point — never
+    the raw ``validate_score_precision(artifact.logit, meta=...)`` idiom, which
+    silently drops the ``f_logit``/``pair_content``/``pair_topology`` arrays),
+    then reports each arm's canonical-operating-point assembled metrics plus
+    the ``full`` arm's within-checkpoint liveness report. This is a
+    self-contained entry point distinct from :func:`run_g5_stage1_pipeline`
+    (which remains the historical frozen-s0 family gate, unmodified): every
+    arm artifact and every formal run's metadata is loaded and validated in
+    one place here, so a later registration-``BINDING``-status enforcement
+    hook (exp-Task 7's scope) slots in without touching the per-arm metric
+    computation below. This function does not itself compute the registered
+    pathway-attribution or structure-control decision rules (spec Sec 14,
+    ``e2e_rules``) — those consume this table's per-arm ``clustering_mmd_ratio``
+    values plus (for the structure-control condition) a paired-bootstrap
+    procedure that is exp-Task 7's scope.
+
+    Args:
+        arm_universe_paths: Arm name (subset of ``full``, ``b0_e2e_f_only``,
+            ``pair_topology``, ``structure_control_6a``, ``p0``) -> its scored
+            ``.npz`` artifact. ``full`` is required.
+        run_metadata_paths: Formal-run arm name -> its ``run_metadata.json``.
+            ``structure_control_6a`` never has an entry.
+        data_root: Directory containing the benchmark package.
+        strategy: Benchmark split strategy.
+        liveness_config: The registered ``min_residual_std_ratio`` /
+            ``max_spearman`` / ``max_topk_overlap`` / ``topk_fraction``
+            liveness thresholds (spec Sec 13.17, re-registered for family
+            ``egostitch_e2e``).
+        seed: Bootstrap/evaluation seed for the assembled-graph metrics.
+
+    Returns:
+        A JSON-ready payload: ``registration_sha256`` (the single hash shared
+        by every provided run metadata, or ``None``), a per-arm
+        ``checkpoint_id`` / ``registration_sha256`` / ``assembled`` /
+        ``degree_corrected_auprc`` row, and the ``full`` arm's
+        within-checkpoint ``liveness`` report.
+
+    Raises:
+        ValueError: On an unrecognized arm name, a missing ``full`` arm,
+            disagreeing registration hashes across arms, an artifact whose
+            ``model_family`` is not ``egostitch_e2e``, or an artifact that
+            fails its candidate-universe shape check or `validate_artifact_precision`.
+    """
+    unknown = set(arm_universe_paths) - set(_E2E_ARMS)
+    if unknown:
+        raise ValueError(f"unrecognized e2e arm(s): {sorted(unknown)}")
+    if "full" not in arm_universe_paths:
+        raise ValueError("the 'full' arm is required to build the e2e arm summary")
+
+    run_metadata: dict[str, dict[str, object]] = {
+        name: cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+        for name, path in (run_metadata_paths or {}).items()
+    }
+    registration_sha256 = _e2e_registration_sha256(run_metadata)
+
+    benchmark_root = data_root / _BENCHMARK_SUBDIR
+    g_ref = load_test_graph(benchmark_root, strategy)
+    buckets = load_test_node_buckets(benchmark_root, strategy)
+    n_test_nodes = g_ref.number_of_nodes()
+    target_edges = strip_self_loops(g_ref).number_of_edges()
+    nodes = list(g_ref.nodes())
+    config = MMDConfig()
+
+    store: FeatureStore | None = None
+    features_root = data_root / _FEATURES_SUBDIR
+    if (features_root / "index.json").exists():
+        store = FeatureStore(features_root)
+    f0_cache = arm_universe_paths["full"].parent / "e2e_arm_summary_f0_cache.pt"
+
+    artifacts: dict[str, ScoresArtifact] = {}
+    rows: dict[str, dict[str, object]] = {}
+    for name, path in arm_universe_paths.items():
+        label = f"{name} ({path})"
+        artifact = load_scores(path)
+        _validate_e2e_universe_shape(
+            artifact, strategy=strategy, n_test_nodes=n_test_nodes, label=label
+        )
+        if artifact.meta.get("model_family") != "egostitch_e2e":
+            raise ValueError(f"{label}: model_family must be 'egostitch_e2e'")
+        validate_artifact_precision(artifact, label=label)
+        artifacts[name] = artifact
+
+        probs = artifact.probs()
+        pairs = list(artifact.pairs())
+        non_self = artifact.u_idx != artifact.v_idx
+        threshold = density_matched_threshold(probs[non_self], target_edges)
+        graph = assemble_graph(pairs, probs, threshold=threshold, nodes=nodes)
+        assembled = assemble_and_evaluate(
+            g_pred=graph,
+            g_ref=g_ref,
+            buckets=buckets,
+            config=config,
+            seed=seed,
+            threshold=threshold,
+        )
+        regimes = evaluate_regime_table(
+            labels=artifact.label,
+            probs=probs,
+            u_idx=artifact.u_idx,
+            v_idx=artifact.v_idx,
+            node_ids=artifact.node_ids,
+            g_ref=g_ref,
+            store=store,
+            f0_cache=f0_cache,
+            seed=seed,
+        )
+        rows[name] = {
+            "checkpoint_id": artifact.meta.get("checkpoint_id"),
+            "registration_sha256": run_metadata.get(name, {}).get("preregistration_sha256"),
+            "assembled": _assembled_row_to_dict(assembled),
+            "degree_corrected_auprc": regimes["degree_corrected"]["ratio_1"].auprc,
+        }
+
+    liveness = validate_dead_residual_within_checkpoint(
+        artifacts["full"],
+        min_residual_std_ratio=liveness_config["min_residual_std_ratio"],
+        max_spearman=liveness_config["max_spearman"],
+        max_topk_overlap=liveness_config["max_topk_overlap"],
+        topk_fraction=liveness_config["topk_fraction"],
+    )
+
+    return {
+        "registration_sha256": registration_sha256,
+        "arms": rows,
+        "liveness": liveness,
+    }
+
+
 # --------------------------------------------------------------------------- markdown tables
 
 
@@ -1111,10 +1417,12 @@ if __name__ == "__main__":
 __all__ = [
     "CriterionResult",
     "PreregistrationMismatch",
+    "build_e2e_arm_summary",
     "clustering_criterion",
     "enforce_preregistration",
     "holm_step_down",
     "matched_rd_criterion",
     "render_tables_markdown",
     "run_g5_stage1_pipeline",
+    "validate_dead_residual_within_checkpoint",
 ]
