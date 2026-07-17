@@ -1138,7 +1138,49 @@ def test_egostitch_e2e_permanent_null_publishes_active_primary_logit(tmp_path: P
         active = getattr(artifact, active_key)
         assert active is not None
         np.testing.assert_array_equal(artifact.logit, active)
+        assert artifact.full_logit is not None
+        assert not np.array_equal(artifact.logit, artifact.full_logit)
+        resolution = cast(dict[str, object], artifact.meta["score_resolution"])
+        assert resolution["full"] == score_universe.score_resolution_diagnostics(
+            artifact.full_logit
+        )
+        score_universe.validate_artifact_precision(artifact)
         assert artifact.meta["permanent_null"] == permanent_null
+
+
+@pytest.mark.parametrize("permanent_null", ["all_head", "content_head"])
+def test_egostitch_e2e_null_arm_merge_preserves_true_full_logit(
+    tmp_path: Path, permanent_null: str
+) -> None:
+    """Null-arm shards retain the distinct true full arm through merge/load."""
+    config = {**_TINY_E2E_CONFIG, "permanent_null": permanent_null}
+    data_root, checkpoint, pairs = _egostitch_e2e_setup(
+        tmp_path / permanent_null, model_config=config
+    )
+    _enable_e2e_conditioning_gates(checkpoint)
+    output = tmp_path / f"{permanent_null}.npz"
+    for shard in range(2):
+        score_universe.main(
+            [
+                *_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, output),
+                "--shard",
+                str(shard),
+                "--num-shards",
+                "2",
+            ]
+        )
+    shard_paths = [
+        output.with_name(f"{output.stem}.shard-{shard}{output.suffix}") for shard in range(2)
+    ]
+    merged_path = tmp_path / f"{permanent_null}-merged.npz"
+    score_universe.main(
+        ["merge", "--inputs", *(str(path) for path in shard_paths), "--output", str(merged_path)]
+    )
+
+    merged = score_universe.load_scores(merged_path)
+    assert merged.full_logit is not None
+    assert not np.array_equal(merged.logit, merged.full_logit)
+    score_universe.validate_artifact_precision(merged)
 
 
 def test_egostitch_e2e_cli_is_deterministic(tmp_path: Path) -> None:
@@ -1242,6 +1284,23 @@ def test_egostitch_e2e_scaffold_shuffle_is_ab_ba_and_shard_invariant(tmp_path: P
         score_universe.load_scores(forward).logit, score_universe.load_scores(merged).logit
     )
 
+    reordered_pairs = tmp_path / "reordered.tsv"
+    reordered = [_E2E_PAIRS[2], _E2E_PAIRS[0], _E2E_PAIRS[1]]
+    reordered_pairs.write_text("".join(f"{u}\t{v}\n" for u, v in reordered))
+    reordered_output = tmp_path / "reordered.npz"
+    score_universe.main(
+        [
+            *_egostitch_e2e_score_args(
+                tmp_path, data_root, checkpoint, reordered_pairs, reordered_output
+            ),
+            "--scaffold-control",
+            "shuffle_within_pair",
+        ]
+    )
+    ordered_scores = dict(zip(_E2E_PAIRS, score_universe.load_scores(forward).logit, strict=True))
+    restored = np.asarray([ordered_scores[pair] for pair in reordered], dtype=np.float32)
+    np.testing.assert_array_equal(score_universe.load_scores(reordered_output).logit, restored)
+
 
 def test_egostitch_e2e_scaffold_shuffle_uses_multi_pair_batches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1292,6 +1351,8 @@ def test_merge_rejects_conflicting_scaffold_control_provenance(tmp_path: Path) -
             "seed": 0,
             "keying": "canonical_pair_v1",
         },
+        "permanent_null": "none",
+        "primary_logit": "full",
     }
 
     def write_shard(path: Path, row_start: int, control: dict[str, object]) -> None:
@@ -1321,6 +1382,33 @@ def test_merge_rejects_conflicting_scaffold_control_provenance(tmp_path: Path) -
         right = tmp_path / f"{suffix}.npz"
         write_shard(right, 1, control)
         with pytest.raises(ValueError, match="scaffold_control"):
+            score_universe.merge_scores([left, right])
+
+    for key, value in (("permanent_null", "all_head"), ("primary_logit", "f_logit")):
+        right = tmp_path / f"{key}.npz"
+        write_shard(right, 1, cast(dict[str, object], base_meta["scaffold_control"]))
+        with np.load(right, allow_pickle=False) as data:
+            meta = json.loads(str(data["meta"][()]))
+            meta[key] = value
+            if key == "permanent_null":
+                meta["primary_logit"] = "f_logit"
+            else:
+                meta["permanent_null"] = "all_head"
+            score_universe.save_scores(
+                right,
+                node_ids=[str(node) for node in data["node_ids"].tolist()],
+                u_idx=data["u_idx"],
+                v_idx=data["v_idx"],
+                logit=data["logit"],
+                label=data["label"],
+                row_start=int(data["row_start"][()]),
+                meta=meta,
+                f_logit=data["f_logit"],
+                pair_content=data["pair_content"],
+                pair_topology=data["pair_topology"],
+                full_logit=data["logit"],
+            )
+        with pytest.raises(ValueError, match=key):
             score_universe.merge_scores([left, right])
 
 

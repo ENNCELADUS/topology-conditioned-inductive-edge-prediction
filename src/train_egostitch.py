@@ -1798,18 +1798,16 @@ def _validate_epoch(
     ranks).
 
     Family `egostitch_e2e` (spec Sec 13.17 re-registration): every validation
-    pair is scored through the model's full (all-pathways-active, eval-mode
-    -- no branch dropout) logit arm; there is no `s0` fusion and no self/
-    non-self split (a self pair is simply ``x_a == x_b``/``emb_a == emb_b``,
-    handled internally by `EgoStitchE2E.forward`). `token_table`/
-    `token_node_index` (the packed raw-token store `_BatchFactory` already
-    loaded) are required for this family to build the ``emb_a``/``emb_b``
-    batch keys. The per-epoch `topology_delta_std` telemetry (spec Sec
-    13.17) and its checkpoint-selection tie-break ratio (spec Sec 13.8) are
-    computed once, via `_e2e_topology_delta_std`, on rank 0's first
-    validation chunk -- a genuinely *fixed* slice, since neither
-    `data.val_pairs`'s order nor the sharding parameters change across
-    epochs.
+    pair is scored through the configured permanent-null arm in eval mode (no
+    branch dropout); the ``none`` arm is the true full decomposition. There is
+    no `s0` fusion and no self/non-self split (a self pair is simply
+    ``x_a == x_b``/``emb_a == emb_b``, handled internally by
+    `EgoStitchE2E.forward`). `token_table`/`token_node_index` (the packed
+    raw-token store `_BatchFactory` already loaded) are required for this
+    family to build the ``emb_a``/``emb_b`` batch keys. The per-epoch
+    `topology_delta_std` telemetry and checkpoint-selection tie-break apply
+    only to the full ``none`` arm; permanent-null arms select by active-arm
+    AUPRC without that topology tie-break.
     """
     is_e2e = isinstance(model, EgoStitchE2E)
     model.eval()
