@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import cast
@@ -234,3 +235,70 @@ class TestE2EProbeArtifact:
         assert probes.select_probe_pairs(graph, limit=2) == probes.select_probe_pairs(
             graph.copy(), limit=2
         )
+
+    def test_producer_rejects_draft_registration(self, tmp_path: Path) -> None:
+        registration = tmp_path / "registration.json"
+        registration.write_text(
+            json.dumps(
+                {
+                    "status": "DRAFT",
+                    "probe_artifact": {
+                        "format": "egostitch_e2e_probe_v1",
+                        "expected_path": str(tmp_path / "probe.npz"),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        metadata = tmp_path / "run_metadata.json"
+        metadata.write_text("{}", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="BINDING preregistration"):
+            probes.produce_e2e_probe_artifact(
+                checkpoint_path=tmp_path / "best.pt",
+                run_metadata_path=metadata,
+                preregistration_path=registration,
+                data_root=tmp_path / "data",
+                strategy="breadth_first",
+                output_path=tmp_path / "probe.npz",
+            )
+
+    def test_producer_rejects_nonformal_or_incomplete_source(self, tmp_path: Path) -> None:
+        output = tmp_path / "probe.npz"
+        registration = tmp_path / "registration.json"
+        registration.write_text(
+            json.dumps(
+                {
+                    "status": "BINDING",
+                    "probe_artifact": {
+                        "format": "egostitch_e2e_probe_v1",
+                        "expected_path": str(output),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        registration_sha = hashlib.sha256(registration.read_bytes()).hexdigest()
+        metadata = tmp_path / "run_metadata.json"
+        metadata.write_text(
+            json.dumps(
+                {
+                    "preregistration_sha256": registration_sha,
+                    "run_kind": "formal",
+                    "status": "running",
+                    "formal_artifacts_published": False,
+                    "permanent_null": "none",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="completed formal full arm"):
+            probes.produce_e2e_probe_artifact(
+                checkpoint_path=tmp_path / "best.pt",
+                run_metadata_path=metadata,
+                preregistration_path=registration,
+                data_root=tmp_path / "data",
+                strategy="breadth_first",
+                output_path=output,
+            )

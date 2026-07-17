@@ -440,6 +440,8 @@ def produce_e2e_probe_artifact(
     probe_registration = cast(
         Mapping[str, object] | None, registration_payload.get("probe_artifact")
     )
+    if registration_payload.get("status") != "BINDING":
+        raise ValueError("E2E probe producer requires a BINDING preregistration")
     if probe_registration is None or probe_registration.get("format") != _E2E_PROBE_FORMAT:
         raise ValueError("preregistration does not bind the E2E probe artifact format")
     expected_output = Path(str(probe_registration.get("expected_path")))
@@ -451,6 +453,13 @@ def produce_e2e_probe_artifact(
         )
     if run_metadata.get("preregistration_sha256") != registration_sha:
         raise ValueError("probe run metadata does not match preregistration SHA-256")
+    if (
+        run_metadata.get("run_kind") != "formal"
+        or run_metadata.get("status") != "complete"
+        or run_metadata.get("formal_artifacts_published") is not True
+        or run_metadata.get("permanent_null") != "none"
+    ):
+        raise ValueError("E2E probe producer requires the completed formal full arm")
     if run_metadata.get("seed") != 0 or run_metadata.get("partition_seed") != 0:
         raise ValueError("E2E probe producer requires Seed 0 and partition Seed 0")
     config_path = Path(str(run_metadata.get("config_path")))
