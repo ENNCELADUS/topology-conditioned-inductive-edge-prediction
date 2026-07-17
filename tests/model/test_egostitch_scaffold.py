@@ -6,7 +6,9 @@ from src.model.egostitch.scaffold import (
     EDGE_TYPES,
     FEAT_DIM,
     N_ANCHOR_TYPES,
+    ContentProjector,
     ScaffoldTokens,
+    build_content_tokens,
     build_scaffold,
     swap_direction,
 )
@@ -77,3 +79,21 @@ def test_swap_direction_is_involution_and_relabels() -> None:
     assert torch.equal(rev.adj, fwd.adj)
     back = swap_direction(rev)
     assert torch.equal(back.feats, fwd.feats) and torch.equal(back.adj, fwd.adj)
+
+
+def test_content_tokens_shape_and_content_sensitivity() -> None:
+    si, sj = _slots(seed=0), _slots(seed=1)
+    matched = torch.zeros(2, 4)
+    out = build_content_tokens(si, sj, matched, matched)
+    assert out.shape == (2, 8, 8 + 3)
+    si_b = si._replace(h=torch.randn_like(si.h))
+    out_b = build_content_tokens(si_b, sj, matched, matched)
+    assert not torch.equal(out, out_b)
+
+
+def test_content_projector_shape() -> None:
+    torch.manual_seed(0)
+    proj = ContentProjector(d_p=8, d_model=64)
+    si, sj = _slots(seed=0), _slots(seed=1)
+    tokens = build_content_tokens(si, sj, torch.zeros(2, 4), torch.zeros(2, 4))
+    assert proj(tokens).shape == (2, 8, 64)

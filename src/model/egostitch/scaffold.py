@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import NamedTuple
 
 import torch
+from torch import nn
 
 from src.model.egostitch.imagine import SlotSet
 
@@ -91,3 +92,60 @@ def swap_direction(tokens: ScaffoldTokens) -> ScaffoldTokens:
     feats = tokens.feats.clone()
     feats[..., :N_ANCHOR_TYPES] = tokens.feats[..., perm]
     return ScaffoldTokens(feats=feats, adj=tokens.adj)
+
+
+def build_content_tokens(
+    slots_src: SlotSet,
+    slots_dst: SlotSet,
+    matched_src: torch.Tensor,
+    matched_dst: torch.Tensor,
+) -> torch.Tensor:
+    """Content-pathway tokens: ``[h; pi; gate; grounded-identity-match]``.
+
+    Args:
+        slots_src: Source-side generated slot set (spec Sec 2 heads).
+        slots_dst: Destination-side generated slot set.
+        matched_src: Shape ``(B, K)`` grounded-identity-match signal in
+            ``[0, 1]`` for the source-side slots (moved here from the anchor
+            labels per rev 3).
+        matched_dst: Shape ``(B, K)`` grounded-identity-match signal in
+            ``[0, 1]`` for the destination-side slots.
+
+    Returns:
+        Shape ``(B, 2K, d_p + 3)`` content tokens, src slots first.
+    """
+
+    def side(s: SlotSet, matched: torch.Tensor) -> torch.Tensor:
+        out: torch.Tensor = torch.cat(
+            [s.h, s.pi[..., None], s.gate[..., None], matched[..., None]], dim=-1
+        )
+        return out
+
+    return torch.cat([side(slots_src, matched_src), side(slots_dst, matched_dst)], dim=1)
+
+
+class ContentProjector(nn.Module):
+    """Linear projection of content tokens into the trunk width."""
+
+    def __init__(self, d_p: int, d_model: int) -> None:
+        """Build the content-token linear projection.
+
+        Args:
+            d_p: Slot content embedding dimension (pre-projection width less
+                the 3 scalar channels).
+            d_model: Trunk model width to project into.
+        """
+        super().__init__()
+        self.proj = nn.Linear(d_p + 3, d_model)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Project content tokens ``(B, 2K, d_p + 3)`` to ``(B, 2K, d_model)``.
+
+        Args:
+            tokens: Content tokens produced by :func:`build_content_tokens`.
+
+        Returns:
+            Shape ``(B, 2K, d_model)`` projected tokens.
+        """
+        out: torch.Tensor = self.proj(tokens)
+        return out
