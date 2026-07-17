@@ -96,10 +96,15 @@ class EgoStitchE2E(nn.Module):
     def _ground(self, x: torch.Tensor) -> torch.Tensor:
         """Placeholder grounding-candidate pool for the generator.
 
-        The data/worker integration phase wires real retrieved
-        grounding-candidate features into the batch; until then this is a
-        deterministic, side-consistent stand-in (self-referential features)
-        so `encode_nodes` has a well-defined `ground_x` to consume.
+        WARNING: every row of the returned pool is an identical copy of `x`,
+        so every primary slot query in `ImagineDecoder._build_queries` is also
+        identical (with spec defaults, slots=16 <= n_ground=20, this holds for
+        ALL primary slots) -- `encode_nodes` therefore emits structurally
+        collapsed, non-diverse slots per node, not merely reduced-fidelity
+        ones. Real grounding-candidate retrieval arrives with the Phase-4
+        worker integration (Task 13); until then, any full-pipeline output
+        has degenerate topology and must not be read as evidence of
+        meaningful topology generation.
 
         Args:
             x: Shape ``(B, d)`` per-node features.
