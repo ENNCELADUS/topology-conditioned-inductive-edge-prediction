@@ -367,7 +367,7 @@ class TestRegistrationRunMode:
         self, tmp_path: Path
     ) -> None:
         cfg = _toy_cfg(tmp_path)
-        formal_cfg, is_debug = te.prepare_ddp_run_config(cfg, max_steps=None)
+        formal_cfg, is_debug, _ = te.prepare_ddp_run_config(cfg, max_steps=None)
         assert formal_cfg == cfg
         assert is_debug is False
 
@@ -382,7 +382,7 @@ class TestRegistrationRunMode:
     def test_debug_worker_redirects_and_marks_nonformal(self, tmp_path: Path) -> None:
         cfg = _toy_cfg(tmp_path)
 
-        debug_cfg, is_debug = te.prepare_ddp_run_config(cfg, max_steps=5)
+        debug_cfg, is_debug, _ = te.prepare_ddp_run_config(cfg, max_steps=5)
 
         assert is_debug is True
         assert debug_cfg.output_dir == tmp_path / "out_debug"
@@ -396,7 +396,7 @@ class TestRegistrationRunMode:
 
     def test_orchestrator_selected_debug_root_is_not_redirected_again(self, tmp_path: Path) -> None:
         cfg = _toy_cfg(tmp_path)
-        prepared, is_debug = te.prepare_ddp_run_config(
+        prepared, is_debug, _ = te.prepare_ddp_run_config(
             replace(cfg, output_dir=tmp_path / "out_debug"), max_steps=1
         )
         assert is_debug is True
@@ -613,12 +613,12 @@ class TestTrainLoop:
 
     def test_preregistration_snapshot_survives_later_file_replacement(self, tmp_path: Path) -> None:
         cfg, data, result = self._run(tmp_path)
-        te.write_run_start_metadata(cfg, data, world_size=1)
-        started = json.loads((cfg.output_dir / "run_metadata.json").read_text())
+        snapshot = te._preregistration_snapshot(cfg.preregistration)
         cfg.preregistration.write_text('{"registration_id": "changed"}\n')
+        te.write_run_start_metadata(cfg, data, world_size=1, preregistration_sha256=snapshot.sha256)
         te.write_outputs(result, cfg, data)
         completed = json.loads((cfg.output_dir / "run_metadata.json").read_text())
-        assert completed["preregistration_sha256"] == started["preregistration_sha256"]
+        assert completed["preregistration_sha256"] == snapshot.sha256
 
     def test_batch_factory_deterministic(self, tmp_path: Path) -> None:
         cfg = _toy_cfg(tmp_path)

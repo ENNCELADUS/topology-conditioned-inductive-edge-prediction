@@ -178,10 +178,13 @@ def enforce_preregistration(preregistration_path: Path, run_metadata_paths: Sequ
 
 
 def enforce_e2e_preregistration(
-    preregistration_path: Path, run_metadata_paths: Sequence[Path]
+    preregistration_path: Path,
+    run_metadata_paths: Sequence[Path],
+    *,
+    snapshot: tuple[dict[str, object], str] | None = None,
 ) -> str:
     """Apply the rev-3 E2E-only BINDING status contract."""
-    prereg, expected = _preregistration_snapshot(preregistration_path)
+    prereg, expected = snapshot or _preregistration_snapshot(preregistration_path)
     if prereg.get("status") != "BINDING":
         raise PreregistrationNotBinding(
             "held-out E2E G5 metrics require preregistration status == 'BINDING'"
@@ -1177,7 +1180,12 @@ def _e2e_registration_sha256(run_metadata: Mapping[str, Mapping[str, object]]) -
     return next(iter(distinct))
 
 
-def _enforce_e2e_formal_metadata(run_metadata: Mapping[str, Mapping[str, object]]) -> None:
+def _enforce_e2e_formal_metadata(
+    run_metadata: Mapping[str, Mapping[str, object]],
+    *,
+    preregistration: Mapping[str, object],
+    preregistration_path: Path,
+) -> None:
     """Reject anything except completed, explicitly formal E2E arm metadata."""
     expected_semantics: dict[str, tuple[str, float, float]] = {
         "full": ("none", 0.15, 0.15),
@@ -1186,6 +1194,13 @@ def _enforce_e2e_formal_metadata(run_metadata: Mapping[str, Mapping[str, object]
         "p0": ("none", 0.0, 0.0),
     }
     checkpoints: set[str] = set()
+    arms = cast(Mapping[str, Mapping[str, object]], preregistration.get("arms"))
+    if set(arms) != set(_E2E_ARMS):
+        raise RegistrationShaMismatch("registration must bind exactly the five E2E arms")
+    benchmark = cast(Mapping[str, object], preregistration.get("benchmark"))
+    registered_strategy = benchmark.get("strategy")
+    from src.train_egostitch import _config_hash, load_config
+
     for arm, metadata in run_metadata.items():
         if metadata.get("run_kind") != "formal":
             raise RegistrationShaMismatch(f"{arm}: run metadata must declare run_kind 'formal'")
@@ -1206,6 +1221,24 @@ def _enforce_e2e_formal_metadata(run_metadata: Mapping[str, Mapping[str, object]
             raise RegistrationShaMismatch(f"{arm}: permanent_null does not match registered arm")
         if metadata.get("p_topo") != p_topo or metadata.get("p_cont") != p_cont:
             raise RegistrationShaMismatch(f"{arm}: branch dropout does not match registered arm")
+        if metadata.get("seed") != 0:
+            raise RegistrationShaMismatch(f"{arm}: formal E2E seed must be 0")
+        if metadata.get("strategy") != registered_strategy:
+            raise RegistrationShaMismatch(f"{arm}: strategy does not match registration")
+        if metadata.get("partition_seed") != 0:
+            raise RegistrationShaMismatch(f"{arm}: formal E2E partition_seed must be 0")
+        training = arms[arm].get("training")
+        expected_config_path = _registered_path(preregistration_path, training).resolve()
+        config_path = metadata.get("config_path")
+        if not isinstance(config_path, str) or Path(config_path).resolve() != expected_config_path:
+            raise RegistrationShaMismatch(
+                f"{arm}: config_path does not match registered arm config"
+            )
+        expected_config_hash = _config_hash(load_config(expected_config_path))
+        if metadata.get("config_hash") != expected_config_hash:
+            raise RegistrationShaMismatch(
+                f"{arm}: config_hash does not match registered arm config"
+            )
 
 
 def _validate_e2e_universe_shape(
@@ -1300,6 +1333,7 @@ def build_e2e_arm_summary(
     strategy: str,
     liveness_config: Mapping[str, float],
     seed: int = 0,
+    preregistration_snapshot: tuple[dict[str, object], str] | None = None,
 ) -> dict[str, object]:
     """Build the registered five-arm ``egostitch_e2e`` Stage-1 summary table.
 
@@ -1335,6 +1369,8 @@ def build_e2e_arm_summary(
             liveness thresholds (spec Sec 13.17, re-registered for family
             ``egostitch_e2e``).
         seed: Bootstrap/evaluation seed for the assembled-graph metrics.
+        preregistration_snapshot: Optional already-captured immutable registration
+            payload and SHA-256, used by the enclosing formal gate.
 
     Returns:
         A JSON-ready payload: ``registration_sha256`` (the non-empty single
@@ -1368,9 +1404,15 @@ def build_e2e_arm_summary(
         name: cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
         for name, path in run_metadata_paths.items()
     }
-    _enforce_e2e_formal_metadata(run_metadata)
+    snapshot = preregistration_snapshot or _preregistration_snapshot(preregistration_path)
+    preregistration, _ = snapshot
     bound_registration_sha256 = enforce_e2e_preregistration(
-        preregistration_path, list(run_metadata_paths.values())
+        preregistration_path, list(run_metadata_paths.values()), snapshot=snapshot
+    )
+    _enforce_e2e_formal_metadata(
+        run_metadata,
+        preregistration=preregistration,
+        preregistration_path=preregistration_path,
     )
     registration_sha256 = _e2e_registration_sha256(run_metadata)
     if registration_sha256 != bound_registration_sha256:  # pragma: no cover - enforced above
@@ -1390,6 +1432,9 @@ def build_e2e_arm_summary(
     )
 
     benchmark_root = data_root / _BENCHMARK_SUBDIR
+    registered_strategy = cast(Mapping[str, object], preregistration["benchmark"]).get("strategy")
+    if strategy != registered_strategy:
+        raise RegistrationShaMismatch("E2E gate strategy must match registration")
     g_ref = load_test_graph(benchmark_root, strategy)
     buckets = load_test_node_buckets(benchmark_root, strategy)
     if strategy == "breadth_first" and sum(len(node_sets) for node_sets in buckets.values()) != 500:
@@ -1525,7 +1570,10 @@ def run_g5_e2e_stage1_pipeline(
     # A rejected run must not leave an older verdict looking authoritative.
     for filename in ("g5_e2e_stage1_results.json", "g5_e2e_stage1_tables.md"):
         (output_dir / filename).unlink(missing_ok=True)
-    prereg, _ = _preregistration_snapshot(preregistration_path)
+    preregistration_snapshot = _preregistration_snapshot(preregistration_path)
+    prereg, _ = preregistration_snapshot
+    if cast(Mapping[str, object], prereg["benchmark"]).get("strategy") != "breadth_first":
+        raise RegistrationShaMismatch("formal E2E gate requires registered breadth_first strategy")
     enforce_frozen_inputs(prereg, preregistration_path, b0_universe_path)
     summary = build_e2e_arm_summary(
         arm_universe_paths=arm_universe_paths,
@@ -1535,6 +1583,7 @@ def run_g5_e2e_stage1_pipeline(
         strategy=strategy,
         liveness_config=_E2E_LIVENESS_CONFIG,
         seed=seed,
+        preregistration_snapshot=preregistration_snapshot,
     )
 
     benchmark_root = data_root / _BENCHMARK_SUBDIR

@@ -326,7 +326,11 @@ def load_config(path: Path) -> EgoConfig:
         grounding_cache=Path(
             _as_str(_require(data_raw, "grounding_cache", "data."), "data.grounding_cache")
         ),
-        s0_cache=Path(_as_str(_require(data_raw, "s0_cache", "data."), "data.s0_cache")),
+        s0_cache=(
+            Path(_as_str(_require(data_raw, "s0_cache", "data."), "data.s0_cache"))
+            if family == "egostitch"
+            else Path("")
+        ),
         s0_checkpoint_id=_as_str(
             data_raw.get("s0_checkpoint_id", DEFAULT_S0_CHECKPOINT_ID), "data.s0_checkpoint_id"
         ),
@@ -640,16 +644,28 @@ class PreregistrationNotBinding(RuntimeError):
     """Raised when a formal worker run is not backed by a BINDING registration."""
 
 
-def _preregistration_snapshot(path: Path) -> tuple[dict[str, object], str]:
+@dataclass(frozen=True)
+class PreregistrationSnapshot:
+    """One immutable registration payload and its digest."""
+
+    payload: dict[str, object]
+    sha256: str
+
+
+def _preregistration_snapshot(path: Path) -> PreregistrationSnapshot:
     """Parse and hash one immutable registration byte snapshot."""
     raw = path.read_bytes()
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise ValueError("preregistration must be a JSON object")
-    return cast(dict[str, object], payload), hashlib.sha256(raw).hexdigest()
+    return PreregistrationSnapshot(
+        cast(dict[str, object], payload), hashlib.sha256(raw).hexdigest()
+    )
 
 
-def prepare_ddp_run_config(cfg: EgoConfig, *, max_steps: int | None) -> tuple[EgoConfig, bool]:
+def prepare_ddp_run_config(
+    cfg: EgoConfig, *, max_steps: int | None
+) -> tuple[EgoConfig, bool, PreregistrationSnapshot]:
     """Enforce the formal/debug registration boundary before DDP work starts.
 
     A bounded run is never allowed to use the configured formal output directory.
@@ -658,14 +674,14 @@ def prepare_ddp_run_config(cfg: EgoConfig, *, max_steps: int | None) -> tuple[Eg
     """
     if not cfg.preregistration.is_file():
         raise ValueError(f"preregistration file not found: {cfg.preregistration}")
-    prereg, _ = _preregistration_snapshot(cfg.preregistration)
-    status = prereg.get("status")
+    snapshot = _preregistration_snapshot(cfg.preregistration)
+    status = snapshot.payload.get("status")
     if max_steps is None:
         if cfg.model.family == _EGOSTITCH_E2E_FAMILY and status != "BINDING":
             raise PreregistrationNotBinding(
                 "formal egostitch_e2e runs require preregistration status == 'BINDING'"
             )
-        return cfg, False
+        return cfg, False, snapshot
     if max_steps <= 0:
         raise ValueError("--max-steps must be positive")
     debug_dir = (
@@ -673,7 +689,7 @@ def prepare_ddp_run_config(cfg: EgoConfig, *, max_steps: int | None) -> tuple[Eg
         if cfg.output_dir.name.endswith("_debug")
         else cfg.output_dir.with_name(f"{cfg.output_dir.name}_debug")
     )
-    return replace(cfg, output_dir=debug_dir), True
+    return replace(cfg, output_dir=debug_dir), True, snapshot
 
 
 # --------------------------------------------------------------------------- pack stage
@@ -2427,6 +2443,8 @@ def write_run_start_metadata(
     world_size: int,
     debug: bool = False,
     preregistration_sha256: str | None = None,
+    registered_config_hash: str | None = None,
+    config_path: Path | None = None,
 ) -> None:
     """Bind the run to config, preregistration, and s0 before optimization."""
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
@@ -2438,20 +2456,22 @@ def write_run_start_metadata(
         "run_kind": "debug" if debug else "formal",
         "formal_artifacts_published": False,
         "started_at": datetime.now(UTC).isoformat(),
-        "config_hash": _config_hash(cfg),
+        "config_hash": registered_config_hash or _config_hash(cfg),
         "preregistration_sha256": preregistration_sha256
         if preregistration_sha256 is not None
-        else _preregistration_snapshot(cfg.preregistration)[1],
+        else _preregistration_snapshot(cfg.preregistration).sha256,
         "seed": cfg.seed,
         "world_size": world_size,
         "s0_checkpoint_id": cfg.data.s0_checkpoint_id,
         "partition_seed": cfg.data.partition_seed,
+        "strategy": cfg.data.strategy,
         "rho_train": data.rho_train,
         "positives_mode": cfg.data.train_positives,
         "permanent_null": cfg.model.config.get("permanent_null", "none"),
         "model_family": cfg.model.family,
         "p_topo": cfg.model.config.get("p_topo", 0.0),
         "p_cont": cfg.model.config.get("p_cont", 0.0),
+        "config_path": str(config_path.resolve()) if config_path is not None else None,
     }
     path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
@@ -2474,8 +2494,8 @@ def write_outputs(
     run_metadata = cast(dict[str, object], json.loads(metadata_path.read_text(encoding="utf-8")))
     if not isinstance(run_metadata.get("preregistration_sha256"), str):
         raise RuntimeError("run-start metadata is missing preregistration binding")
-    if run_metadata.get("config_hash") != _config_hash(cfg):
-        raise RuntimeError("configuration changed after run start; refusing to finalize artifacts")
+    if not isinstance(run_metadata.get("config_hash"), str):
+        raise RuntimeError("run-start metadata is missing configuration binding")
     if run_metadata.get("run_kind") != ("debug" if debug else "formal"):
         raise RuntimeError("run kind changed after run start; refusing to finalize artifacts")
 
@@ -2703,10 +2723,11 @@ def _run_probe_mode(
     logger.info("probe complete: %s", probe.to_dict())
 
 
-def _run_ddp_worker(cfg: EgoConfig, args: EgoCliArgs) -> None:
+def _run_ddp_worker(
+    cfg: EgoConfig, args: EgoCliArgs, *, registered_config_hash: str | None = None
+) -> None:
     """Dispatch an ``accelerate launch`` worker to the requested DDP mode."""
-    cfg, _is_debug = prepare_ddp_run_config(cfg, max_steps=args.max_steps)
-    _, preregistration_sha256 = _preregistration_snapshot(cfg.preregistration)
+    cfg, _is_debug, preregistration = prepare_ddp_run_config(cfg, max_steps=args.max_steps)
     if args.pack_dir is None or args.token_budget_per_rank is None or args.profile_output is None:
         raise ValueError(
             "DDP worker modes require --pack-dir, --token-budget-per-rank, and --profile-output"
@@ -2769,7 +2790,9 @@ def _run_ddp_worker(cfg: EgoConfig, args: EgoCliArgs) -> None:
             data,
             world_size=accelerator.num_processes,
             debug=args.max_steps is not None,
-            preregistration_sha256=preregistration_sha256,
+            preregistration_sha256=preregistration.sha256,
+            registered_config_hash=registered_config_hash,
+            config_path=args.config,
         )
     accelerator.wait_for_everyone()
     result = train_egostitch_ddp_loop(
@@ -2797,7 +2820,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     args = parse_args(argv)
-    cfg = apply_overrides(load_config(args.config), args)
+    loaded_cfg = load_config(args.config)
+    cfg = apply_overrides(loaded_cfg, args)
 
     if args.write_s0_manifest is not None:
         world = detect_visible_gpu_count()
@@ -2813,7 +2837,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     if args.ddp_mode is not None:
-        _run_ddp_worker(cfg, args)
+        _run_ddp_worker(cfg, args, registered_config_hash=_config_hash(loaded_cfg))
         return
 
     raise ValueError(

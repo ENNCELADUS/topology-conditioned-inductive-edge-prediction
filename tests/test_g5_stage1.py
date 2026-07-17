@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import numpy as np
 import pytest
+from src import train_egostitch as te
 from src.experiments import b0_cal, g5_stage1
 from src.experiments.g1_hardened_e2 import AssembledRow
 from src.score_universe import ScoresArtifact, save_scores
@@ -677,6 +678,20 @@ def _five_arm_inputs(tmp_path: Path) -> dict[str, Any]:
         arm_paths[name] = path
 
     preregistration_path = _write_prereg(tmp_path, b0_universe_path)
+    config_root = Path(__file__).resolve().parents[1] / "configs"
+    arm_config_paths = {
+        "full": config_root / "egostitch_e2e_breadth_first.yaml",
+        "b0_e2e_f_only": config_root / "egostitch_e2e_f_only_breadth_first.yaml",
+        "pair_topology": config_root / "egostitch_e2e_pair_topology_breadth_first.yaml",
+        "p0": config_root / "egostitch_e2e_p0_breadth_first.yaml",
+    }
+    preregistration = json.loads(preregistration_path.read_text())
+    preregistration["benchmark"] = {"strategy": "toy"}
+    preregistration["arms"] = {
+        **{name: {"training": str(path)} for name, path in arm_config_paths.items()},
+        "structure_control_6a": {"training": "none (full checkpoint)"},
+    }
+    preregistration_path.write_text(json.dumps(preregistration, sort_keys=True, indent=2) + "\n")
     preregistration_sha256 = hashlib.sha256(preregistration_path.read_bytes()).hexdigest()
     run_metadata_paths: dict[str, Path] = {}
     for name in ("full", "b0_e2e_f_only", "pair_topology", "p0"):
@@ -699,6 +714,11 @@ def _five_arm_inputs(tmp_path: Path) -> dict[str, Any]:
                     "permanent_null": permanent_null,
                     "p_topo": p_topo,
                     "p_cont": p_cont,
+                    "seed": 0,
+                    "strategy": "toy",
+                    "partition_seed": 0,
+                    "config_path": str(arm_config_paths[name].resolve()),
+                    "config_hash": te._config_hash(te.load_config(arm_config_paths[name])),
                 }
             )
         )
@@ -840,7 +860,7 @@ class TestBuildE2EArmSummary:
         metadata.update({"run_kind": "debug", "formal_artifacts_published": False})
         metadata_path.write_text(json.dumps(metadata))
 
-        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="run_kind 'formal'"):
+        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="debug/non-formal"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
     def test_requires_completed_formal_run_metadata(self, tmp_path: Path) -> None:
@@ -868,6 +888,49 @@ class TestBuildE2EArmSummary:
         path.write_text(json.dumps(metadata))
         with pytest.raises(g5_stage1.RegistrationShaMismatch, match="branch dropout"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    @pytest.mark.parametrize(
+        ("field", "value", "match"),
+        [
+            ("seed", 1, "seed must be 0"),
+            ("strategy", "alternate", "strategy does not match"),
+            ("partition_seed", 1, "partition_seed must be 0"),
+            ("config_hash", "0" * 64, "config_hash does not match"),
+        ],
+    )
+    def test_rejects_wrong_registered_run_identity(
+        self, tmp_path: Path, field: str, value: object, match: str
+    ) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        path = _d(inputs)["run_metadata_paths"]["full"]
+        metadata = json.loads(path.read_text())
+        metadata[field] = value
+        path.write_text(json.dumps(metadata))
+        with pytest.raises(g5_stage1.RegistrationShaMismatch, match=match):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_rejects_wrong_registered_config_path(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        path = _d(inputs)["run_metadata_paths"]["full"]
+        metadata = json.loads(path.read_text())
+        metadata["config_path"] = json.loads(_d(inputs)["run_metadata_paths"]["p0"].read_text())[
+            "config_path"
+        ]
+        path.write_text(json.dumps(metadata))
+        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="config_path"):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_captured_registration_snapshot_is_not_reopened(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        preregistration_path = _d(inputs)["preregistration_path"]
+        snapshot = g5_stage1._preregistration_snapshot(preregistration_path)
+        preregistration_path.write_text(json.dumps({"status": "DRAFT"}))
+        payload = g5_stage1.build_e2e_arm_summary(
+            liveness_config=_E2E_LIVENESS_CONFIG,
+            preregistration_snapshot=snapshot,
+            **inputs,
+        )
+        assert payload["registration_sha256"] == snapshot[1]
 
 
 class TestPairedBootstrap:
