@@ -151,6 +151,55 @@ critic trained with its own BCE, gradients not propagated into h (detached input
 
 ## 5. Module 4 — Decision head (per pair)
 
+**Rev 3.0 headline (family `egostitch_e2e`, normative since 2026-07-17):** the
+decision head is a from-scratch V3.1-class pair encoder conditioned on the stitched
+topology — no frozen B0 anchor, no `s0`:
+
+```text
+p_ij = σ( head( Trunk(tok_i, tok_j | STE(T̂_ij), c_content) ) )
+```
+
+- **Trunk:** Siamese token encoder + pair cross-attention over the raw token
+  sequences `(tok_i, tok_j)` — the audited V3.1 architecture family
+  (`pair_context_gated` blocks maintaining `(h_a, h_b, cls_token)`, feature-wise
+  `abba_max` over the AB and BA passes) — trained from scratch under the Ours regime.
+- **STE (stitched-topology encoder):** structure-only tokens over the stitched
+  scaffold `T̂_ij`. Token features: 4-type anchor labels (endpoint-i / endpoint-j /
+  slot-of-i / slot-of-j), `π`, `m`, soft degrees — **no** slot content `h`, no
+  grounding embeddings `g`, no grounded-identity-match flag. Edge weights: star
+  edges `π·m`, intra-side `Â_i`/`Â_j` weighted by `π` outer products, and the
+  alignment plan `Π`. `ste_layers` edge-weighted message-passing layers
+  (defaults §13.18); **token-level output** — one conditioning token per slot and
+  per endpoint (the promoted `s4` lineage: the pooled scalar summary is replaced
+  by tokens).
+- **Conditioning:** zero-initialized tanh-gated cross-attention
+  (`cls ← cls + active · tanh(gate) · XAttn(LN(cls), tokens)`); the **cls_token is
+  the only query**, injected after the final `n_inj ∈ {1, 2}` pair-cross-attention
+  blocks (default 1). The AB and BA directions share STE and cross-attention
+  parameters before `abba_max`.
+- **`c_content` (separate ablatable pathway):** s1-style grounding summaries plus
+  the grounded-identity-match flag, through its own zero-init gated
+  cross-attention. The topology-representation claim must survive removal of this
+  pathway (protocol E4.15).
+- **Three mutually exclusive head nulls** (train = per-pair multiplicative masks at
+  `p_topo`/`p_cont`, eval = batch-level hard bypass; the residual sublayer form
+  makes the two numerically identical — required unit test; `p(i,j) = p(j,i)` under
+  every null): `∅_all_head` (skip both pathways → pair-only `f_logit`),
+  `∅_topo_head` (skip STE + topology x-attn → pair+content), `∅_content_head`
+  (skip content x-attn → pair+topology). The `_head` namespace is disjoint from
+  the §2 conditioning-dropout decoder nulls.
+- **Four logits published per scored pair:** full, `f_logit`, pair+content,
+  pair+topology (§13.16 fp32 pin applies to all four).
+
+Channel disposition (rev 2.2 → 3.0): `s4` is promoted into the STE; `s1` feeds
+`c_content`; `s0` is retired (§13.10); `s2` remains a training-side diagnostic and
+probe target; `s3` remains a Stage-2 STE input.
+
+**Retired anchored head** (frozen-s0 family `egostitch`; motivating result and E4
+ablation arm only — binding `cut` verdict 2026-07-17,
+`docs/results/G5-stage1-seed0-20260717.md`):
+
+```text
 ```text
 s0 = pair_logit(i, j)                                    # frozen B0
 s1 = ½[ lse_k(κ(h_i^k, proj(x_j)) + log π_i^k m_i^k) + (i↔j) ],
@@ -161,9 +210,12 @@ s4 = MLP_2([H_i; H_j; H_T; spec(T̂)])   from a 3-layer edge-weighted GNN over T
      (anchor-labeled; spec(T̂) = [λ_2, λ_max, triangle count, density] of T̂)
 p_ij = σ( s0 + g_θ(s1..s4) · w ),   g_θ = MLP_2(gate), w learned scalar init 0.1
 ```
+```
 
-Required diagnostic: Pearson/Spearman correlation matrix of (s0..s4) on validation
-queries, reported with every headline table.
+Required diagnostic: the four-logit decomposition table (plus
+`topology_delta = full − pair+content` and `content_delta = full − pair+topology`
+summary statistics) with every headline table; the retired arm keeps its channel
+correlation matrix on its available channels `(s0..s4)`.
 
 ## 6. Data partitions and leakage rules
 
@@ -208,12 +260,20 @@ Balancing: fixed weights above; gradient-norm per family logged; uncertainty-wei
 (Kendall) is the registered fallback if any family's gradient norm drifts > 10× from
 the median for > 1k steps.
 
+**Family `egostitch_e2e` (2026-07-17):** the conditioned encoder introduces **no new
+loss lambda** — the locked objective is unchanged. `L_edge = BCE` applies to the
+**full** logits computed under the per-pair §5 branch masks; trunk, STE, gates, and
+head receive gradient only through `L_edge`.
+
 ## 8. Training schedule, HPO parity, determinism
 
 1. **Warm-start** (Modules 1–2): `L_recon` only, 20% of budget.
 2. **+ Joint harmonization task**: add `L_joint`, 20%.
 3. **Full joint**: all losses, 60%; early stopping on validation edge AUPRC
    (VAL-CRITERION), patience 10 evals.
+   For family `egostitch_e2e`, the warm-start phase keeps `L_edge` — and therefore
+   the trunk, STE, and gated cross-attention — inactive; the §5 branch-dropout
+   probabilities are constant after warm-start (Stage-1 form: §13.8).
 - **HPO parity:** every ladder method (B0…B5, `B3-full`, `Ours`) gets the same tuning
   budget: 30 configs × 3 seeds, random search over its declared grid, frozen and
   recorded in the run-metadata store before held-out metrics are opened.
@@ -545,6 +605,21 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   locked disposition is frozen-s0 scalar fusion → motivating arm + ablation, and
   rev-3.0 e2e conditioning → active G5 build line. This satisfies §14.3(1) but does
   not yet rewrite §5/§13, bind successor defaults, or authorize a formal e2e run.
+- 2026-07-17: **§5/§13 rewritten to §14** (source:
+  `docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md`
+  §§3–6; experiment plan `docs/superpowers/plans/2026-07-17-egostitch-e2e-stage1-screen.md`
+  rev 2). §5: rev-3.0 conditioned-encoder head is normative for family
+  `egostitch_e2e`; anchored head retired to the frozen-s0 ablation arm. §7: no new
+  lambda. §8/§13.8: e2e curriculum note; checkpoint-selection fidelity tie-break
+  re-registered within-checkpoint as `std(full − f_logit)/std(f_logit)` (retained,
+  not removed). §13.1: e2e Stage-1 mechanism set (STE + gated cross-attention).
+  §13.10: retired for the e2e family. §13.16: fp32 scope extended
+  (`egostitch_e2e_pair_fp32_v1`, four arrays). §13.17: liveness re-registered
+  against the within-checkpoint `f_logit`, thresholds unchanged; gate/grad/delta
+  telemetry added. New §13.18: pinned defaults, `permanent_null` overrides,
+  stable-hash `shuffle_within_pair` scaffold control, and machine-enforced
+  registration-status rules. Satisfies §14.3(2); the formal e2e run remains gated
+  on a BINDING registration (§14.3(3–5)).
 
 **Closed gate-report deliverable (2026-07-17):** the frozen-s0 Stage-1 gate report,
 fidelity diagnostics, and measured FLOPs/latency report are complete. The binding
@@ -563,7 +638,17 @@ changes the full model.
 
 ### 13.1 Module subset
 
-Stage 1 = Tokenize-lite (§1 minus VQ, BP affiliations, code-stats head) + Imagine
+**Active family `egostitch_e2e` (normative since 2026-07-17):** Stage 1 =
+Tokenize-lite (§1 minus VQ, BP affiliations, code-stats head) + Imagine (§2, no
+CVAE) + Hungarian matching (§13.3) + Stitch (§3, Sinkhorn alignment only) + the §5
+rev-3.0 head: from-scratch trunk + STE + zero-init gated cross-attention +
+`c_content` pathway + three head nulls. The STE is Stage-1-runnable because Stitch
+is retained in Stage 1. Codebook/`s3` remain Stage 2; Harmonize/seam loss remain
+Stage 3; those stages then feed the STE (Stage 2: `s3`-derived structural inputs;
+Stage 3: the harmonized scaffold).
+
+**Retired frozen-s0 family `egostitch`** (historical contract for the completed
+screen and the E4 ablation arm): Stage 1 = Tokenize-lite (§1 minus VQ, BP affiliations, code-stats head) + Imagine
 (§2, no CVAE) + Hungarian matching (§13.3) + Stitch (§3, Sinkhorn alignment only) +
 decision head over `(s0, s1, s2)`:
 
@@ -681,9 +766,13 @@ for Stitch/matching, node losses, and reconstruction targets. Decoder attention 
 Execution is fixed-epoch with per-epoch validation; the VAL-CRITERION early stop is
 recorded as `counterfactual_stop_epoch` (the E2 worker convention) and `best.pt` is
 the early-stop-equivalent checkpoint. Validation edge AUPRC remains primary; when two
-epochs differ by at most `1e-4`, the larger validation residual/s0 standard-deviation
-ratio is the deterministic tie-break. This fidelity tie-break is checkpoint selection
-only and is not a Stage-1 success criterion.
+epochs differ by at most `1e-4`, the fidelity tie-break selects deterministically.
+**Family `egostitch_e2e` (re-registered 2026-07-17):** with `s0` retired, the
+tie-break statistic is the **within-checkpoint** `std(full − f_logit)/std(f_logit)`
+on the fixed validation slice — the larger value wins (liveness-preferring, same
+direction as the retired residual/s0 rule, which remains the recorded rule for the
+historical frozen-s0 family). This fidelity tie-break is checkpoint selection only
+and is not a Stage-1 success criterion.
 
 ### 13.9 Self-pair single-ego path (Stage-1 form)
 
@@ -691,7 +780,12 @@ only and is not a Stage-1 success criterion.
 `R = 0`); `s1` self-membership unchanged; `s2(u, u) = Σ_k (π_u^k)² · Â_u[k, k]`
 (the "Â diagonal blocks" reading substituted into the §5 `s2` formula).
 
-### 13.10 s0 cache (frozen B0 logits)
+### 13.10 s0 cache (frozen B0 logits) — RETIRED for family `egostitch_e2e`
+
+**2026-07-17:** the active e2e family has no `s0` channel: configs carry no
+`data.s0_cache` and no `data.s0_checkpoint_id`, and the worker skips cache loading
+for this family. The remainder of this section is the historical contract for the
+frozen-s0 family artifacts and the E4 ablation arm.
 
 `s0` comes from the audited frozen V3.1 checkpoint `e092537d8cf1e208` via
 precomputed logit caches: training pairs are enumerable offline because the §10.2
@@ -781,6 +875,15 @@ provenance is absent or inconsistent. Unique-logit count/fraction and reduced-pr
 round-trip fractions are recorded as descriptive diagnostics only: legitimate model
 ties must not be rejected solely because the unique-logit fraction is low.
 
+**Family `egostitch_e2e` (extension, 2026-07-17):** the per-pair fp32 scope covers
+Stitch, the STE, both gated cross-attention pathways, the trunk pair-cross-attention
+blocks, and the head — i.e. everything from cached per-node encodes to all **four**
+published logits (full, `f_logit`, pair+content, pair+topology). The per-node encode
+pass may stay BF16 with fp32-cached outputs, unchanged. Artifacts for this family
+record the contract string `egostitch_e2e_pair_fp32_v1`; the resolution guard
+applies to each of the four arrays independently. `egostitch_pair_fp32_v1` remains
+the recorded contract for historical frozen-s0 artifacts.
+
 ### 13.17 Registered training/fidelity instrumentation
 
 The worker instantiates all four Kendall log-variance parameters before DDP/optimizer
@@ -797,7 +900,17 @@ residual standard deviation, residual/s0 standard-deviation ratio, Kendall tau/r
 mobility versus s0, and top-k overlap on a fixed 1% validation slice. These series and
 the Kendall state are embedded in `run_metadata.json` and are required by the G5 gate.
 
-Before topology evaluation, the gate aligns the EgoStitch candidate artifact with a
+**Family `egostitch_e2e` (re-registered 2026-07-17):** liveness references the
+**within-checkpoint `f_logit`** — no fresh frozen-s0 comparator artifact and no
+alignment step exist for this family. The residual is `full − f_logit`; the ratio
+denominator is `std(f_logit)`. Telemetry rows additionally record `gate_topo_tanh`
+and `gate_cont_tanh` (per injected block), `grad_rms_trunk` / `grad_rms_ste` /
+`grad_rms_content`, and a per-epoch `topology_delta_std` on the fixed validation
+slice. The channel-scale series of this section read the available quantities
+(`f_logit`, pathway deltas) in place of `s1/s2/residual-vs-s0`.
+
+For the historical frozen-s0 family: before topology evaluation, the gate aligns
+the EgoStitch candidate artifact with a
 fresh fp32 frozen-s0 candidate artifact scored from checkpoint `e092537d8cf1e208`.
 This input is separate from the historical canonical B0 comparator artifact, whose
 quantization must not masquerade as residual variance. The gate fails the run as a dead
@@ -807,6 +920,43 @@ Spearman correlation with s0 `> 0.9999`, and top-1% overlap `> 0.9999`. This con
 validity rule prevents a genuinely pair-varying but safely small residual from being
 turned into a post-hoc outcome switch. It is a run-validity gate, not a success metric.
 
+
+### 13.18 E2E family pins (defaults, overrides, controls, enforcement)
+
+Registered defaults for family `egostitch_e2e` (fixed for the Stage-1 screen; the
+named sweeps are reserved for E1/E3):
+
+- `ste_layers = 3`, `ste_dim = 128`, `xattn_heads = 8`;
+- `n_inj = 1` (sweep `{1, 2}` reserved);
+- `p_topo = p_cont = 0.15` (sweep `0.1–0.2` reserved; `p = 0` is a Stage-1 arm).
+
+**Permanent-null training override:** `model.config.permanent_null ∈ {none,
+all_head, content_head}`. A non-`none` value applies the corresponding §5 hard
+mask to **every** training and evaluation batch: `all_head` trains the matched
+pairwise-only `B0-e2e` arm; `content_head` trains the pair+topology attribution
+arm. The override must be recorded in `run_metadata.json`.
+
+**Scaffold structure control (`shuffle_within_pair`, scoring-time):** for every
+scored pair, two slot-index permutations — one for the source side, one for the
+destination side — are drawn from generators seeded by a stable hash
+`blake2b("{min(u,v)}|{max(u,v)}|{side}|{seed}")` with `side ∈ {src, dst}` assigned
+by canonical order (src = min-id endpoint). The permutations are applied to the
+slot rows/columns of `Â_src`, `Â_dst`, and the matching axes of `Π` before the
+STE; slot token features are untouched. Keying on the canonical unordered pair
+makes the control **invariant to batching, scoring order, GPU count, and shard
+boundaries**, and identical across the AB/BA passes (preserving
+`p(i,j) = p(j,i)`). Artifacts record
+`scaffold_control=shuffle_within_pair,seed=<seed>,keying=canonical_pair_v1`.
+
+**Registration-status enforcement (machine-checked):** a formal training run (no
+`--max-steps`) requires the referenced registration file to carry
+`status: BINDING`; the worker fails closed otherwise. `--max-steps` debug runs
+accept `DRAFT` but are redirected to `*_debug` output directories and never write
+held-out artifacts. The G5 gate requires `status: BINDING` and a registration
+sha256 that matches the `preregistration_sha256` of **every** consumed formal run
+metadata. Amending a BINDING registration requires a new versioned registration
+file (predecessor convention).
+
 ## 14. Approved successor headline: E2E stitched-topology-conditioned pair encoder (2026-07-16)
 
 **Scope and precedence.** This section records the approved rev-3.0 headline
@@ -814,10 +964,11 @@ architecture (proposal §4.4; full decision trail and pins in
 `docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md`).
 **§§1–13 remain the historical binding contract** for the completed frozen-s0
 Stage-1 screen and its retained implementation on `main`. That screen published a
-binding `cut` verdict on 2026-07-17, satisfying §14.3(1). §14 becomes normative for
-implementation only when §5/§13 are rewritten to it with change-log lines and a fresh
-Stage-1 registration is bound. The closeout result alone does not silently mutate the
-formal pipeline.
+binding `cut` verdict on 2026-07-17, satisfying §14.3(1). **§5/§13 were rewritten to §14 on
+2026-07-17** (change-log entry above): §14 plus the rewritten §5/§13 are now the
+normative implementation contract for family `egostitch_e2e`. A formal e2e run
+additionally requires a fresh Stage-1 registration with `status: BINDING`
+(§13.18 enforcement); the rewrite alone authorizes implementation, not execution.
 
 ### 14.1 Architecture summary
 
@@ -867,6 +1018,9 @@ cache is retired for this family.
 2. §5/§13 rewritten to §14 with change-log lines; §13.18-style pins for defaults
    (`ste_layers = 3`, `ste_dim = 128`, `xattn_heads = 8`, `n_inj` default 1 sweep
    {1, 2}).
+   **Satisfied 2026-07-17:** §5/§13 rewritten (change-log entry); §13.18 landed
+   with the defaults, `permanent_null` overrides, `shuffle_within_pair` control,
+   and registration-status enforcement.
 3. Fresh registration with the five-arm Stage-1 scope (full, `B0-e2e`/f-only,
    pair+topology, within-pair `Â`/`Π` shuffle, `p = 0`), the four-logit decomposition
    report, the representation-probe protocol (degree / ego density / clustering +
