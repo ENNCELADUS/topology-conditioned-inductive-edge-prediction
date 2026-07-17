@@ -53,6 +53,7 @@ from src.data.artifacts import Benchmark, canonical_pair, load_benchmark
 from src.data.ego_targets import EgoTargetBuilder, EgoTargets
 from src.data.features import FeatureStore, build_f0_matrix
 from src.data.grounding import build_grounding_pool
+from src.data.packed_features import PackedFeatureTable
 from src.data.pairs import NegativeSampler
 from src.data.partition import build_g_struct, derive_partition
 from src.e2_pipeline import ProbeResult, detect_visible_gpu_count
@@ -131,6 +132,9 @@ class EgoDataConfig:
         s0_cache: Frozen-B0 scores ``.npz`` covering every training/val pair.
         s0_checkpoint_id: Expected ``checkpoint_id`` of `s0_cache`.
         expected_missing_features: Exact graph nodes expected to lack features.
+        pack_dir: Raw-token pack directory (spec Sec 13.18 family only; the
+            same packed-feature store the B0 V3.1 loader consumes). ``None``
+            for the frozen-s0 ``egostitch`` family, which has no token stream.
     """
 
     root: Path
@@ -146,6 +150,7 @@ class EgoDataConfig:
     s0_cache: Path
     s0_checkpoint_id: str
     expected_missing_features: list[str]
+    pack_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -280,6 +285,7 @@ def load_config(path: Path) -> EgoConfig:
         "s0_cache",
         "s0_checkpoint_id",
         "expected_missing_features",
+        "pack_dir",
     )
     _check_no_unknown_keys(data_raw, data_keys, "data")
     train_positives = _as_str(
@@ -313,6 +319,9 @@ def load_config(path: Path) -> EgoConfig:
         ),
         expected_missing_features=_as_str_list(
             data_raw.get("expected_missing_features", []), "data.expected_missing_features"
+        ),
+        pack_dir=(
+            Path(_as_str(data_raw["pack_dir"], "data.pack_dir")) if "pack_dir" in data_raw else None
         ),
     )
     if data.node_batch <= 0 or data.edge_batch <= 0:
@@ -1019,6 +1028,9 @@ class _CompositeBatch:
     f0_rows_gathered: int
 
 
+_EGOSTITCH_E2E_FAMILY = "egostitch_e2e"
+
+
 class _BatchFactory:
     """Deterministic composite-batch construction for one rank."""
 
@@ -1041,6 +1053,13 @@ class _BatchFactory:
         self._node_cursor = 0
         self._node_cycle = 0
         self._node_order = self._shuffled_nodes(0)
+        self._token_table: PackedFeatureTable | None = None
+        self._token_node_index: dict[str, int] | None = None
+        if cfg.model.family == _EGOSTITCH_E2E_FAMILY:
+            if cfg.data.pack_dir is None:
+                raise ValueError("data.pack_dir is required when model.family == 'egostitch_e2e'")
+            self._token_table = PackedFeatureTable.from_pack(cfg.data.pack_dir, torch.device("cpu"))
+            self._token_node_index = self._token_table.manifest.node_index()
 
     # ---- node stream (cycles independently, spec Sec 10.1)
 
@@ -1124,6 +1143,36 @@ class _BatchFactory:
             "ground_resampled": ground_resampled,
         }
 
+    def _token_streams(
+        self, endpoints_a: Sequence[str], endpoints_b: Sequence[str]
+    ) -> dict[str, torch.Tensor]:
+        """Gather raw token streams for both pair endpoints (spec Sec 13.18).
+
+        Both endpoints are gathered to a shared padded length ``T`` (the max
+        true token length across every node in this edge batch), matching the
+        packed-feature reader the B0 V3.1 loader consumes
+        (:class:`~src.data.packed_features.PackedFeatureTable`).
+
+        Args:
+            endpoints_a: The ``u`` node of each padded row.
+            endpoints_b: The ``v`` node of each padded row.
+
+        Returns:
+            ``{"emb_a", "emb_b", "len_a", "len_b"}`` CPU tensors.
+        """
+        table = self._token_table
+        index = self._token_node_index
+        assert table is not None and index is not None  # family-gated by the caller
+        idx_a = torch.tensor([index[node] for node in endpoints_a], dtype=torch.long)
+        idx_b = torch.tensor([index[node] for node in endpoints_b], dtype=torch.long)
+        boundary = max(
+            max(table.manifest.nodes[i].length for i in idx_a.tolist()),
+            max(table.manifest.nodes[i].length for i in idx_b.tolist()),
+        )
+        emb_a, len_a = table.gather_nodes(idx_a, boundary)
+        emb_b, len_b = table.gather_nodes(idx_b, boundary)
+        return {"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b}
+
     def _edge_tensors(
         self, rows: Sequence[tuple[str, str, int]], *, pad_to: int
     ) -> tuple[dict[str, torch.Tensor], int]:
@@ -1134,29 +1183,30 @@ class _BatchFactory:
             padded = [filler]
         while len(padded) < pad_to:
             padded.append(padded[0])
-        s0 = (
-            self._data.s0.lookup([(u, v) for u, v, _ in padded])
-            if true_rows > 0
-            else np.zeros(len(padded), dtype=np.float32)
-        )
         idx_i = torch.tensor([self._data.node_index[u] for u, _, _ in padded], dtype=torch.long)
         idx_j = torch.tensor([self._data.node_index[v] for _, v, _ in padded], dtype=torch.long)
-        return (
-            {
-                "x_i": self._data.f0[idx_i],
-                "x_j": self._data.f0[idx_j],
-                "ground_i": self._ground_rows([u for u, _, _ in padded]),
-                "ground_j": self._ground_rows([v for _, v, _ in padded]),
-                "s0": torch.from_numpy(s0),
-                "label": torch.tensor([lab for _, _, lab in padded], dtype=torch.float32),
-                "is_self": torch.tensor([u == v for u, v, _ in padded], dtype=torch.bool),
-                "edge_mask": torch.tensor(
-                    [1.0 if i < true_rows else 0.0 for i in range(len(padded))],
-                    dtype=torch.float32,
-                ),
-            },
-            true_rows,
-        )
+        edge: dict[str, torch.Tensor] = {
+            "x_i": self._data.f0[idx_i],
+            "x_j": self._data.f0[idx_j],
+            "ground_i": self._ground_rows([u for u, _, _ in padded]),
+            "ground_j": self._ground_rows([v for _, v, _ in padded]),
+            "label": torch.tensor([lab for _, _, lab in padded], dtype=torch.float32),
+            "is_self": torch.tensor([u == v for u, v, _ in padded], dtype=torch.bool),
+            "edge_mask": torch.tensor(
+                [1.0 if i < true_rows else 0.0 for i in range(len(padded))],
+                dtype=torch.float32,
+            ),
+        }
+        if self._token_table is not None:
+            edge.update(self._token_streams([u for u, _, _ in padded], [v for _, v, _ in padded]))
+        else:
+            s0 = (
+                self._data.s0.lookup([(u, v) for u, v, _ in padded])
+                if true_rows > 0
+                else np.zeros(len(padded), dtype=np.float32)
+            )
+            edge["s0"] = torch.from_numpy(s0)
+        return edge, true_rows
 
     def epoch_batches(
         self, epoch: int, *, rows_per_rank: Sequence[int], steps: int

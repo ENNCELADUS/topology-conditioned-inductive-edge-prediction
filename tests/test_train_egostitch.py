@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -15,9 +16,19 @@ from accelerate import Accelerator
 from src import train_egostitch as te
 from src.data.artifacts import canonical_pair
 from src.data.ego_targets import EgoTargetBuilder
+from src.data.packed_features import (
+    PACK_FORMAT,
+    PackedFeatureManifest,
+    PackedFeatureTable,
+    PackedNodeRecord,
+    PackedShardRecord,
+    sha256_file,
+    write_packed_manifest,
+)
 from src.data.pairs import NegativeSampler
 from src.e2_pipeline import _validate_worker_profile
 from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
+from src.train_b0 import ModelConfig
 
 pytestmark = pytest.mark.unit
 
@@ -179,6 +190,18 @@ class TestLoadConfig:
         path.write_text(yaml.safe_dump(mapping))
         with pytest.raises(ValueError, match="preregistration"):
             te.load_config(path)
+
+    def test_pack_dir_defaults_to_none(self, tmp_path: Path) -> None:
+        cfg = te.load_config(_write_config(tmp_path))
+        assert cfg.data.pack_dir is None
+
+    def test_accepts_pack_dir(self, tmp_path: Path) -> None:
+        mapping = _config_mapping(tmp_path)
+        mapping["data"]["pack_dir"] = str(tmp_path / "token_pack")
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.safe_dump(mapping))
+        cfg = te.load_config(path)
+        assert cfg.data.pack_dir == tmp_path / "token_pack"
 
 
 class TestParseArgs:
@@ -532,6 +555,115 @@ class TestTrainLoop:
         torch.testing.assert_close(a.edge["s0"], b.edge["s0"])
         torch.testing.assert_close(a.node["null_mode"], b.node["null_mode"])
         assert a.edge_rows_global == b.edge_rows_global
+
+
+_TOKEN_DIM = 1536
+
+
+def _write_tiny_token_pack(pack_dir: Path, nodes: list[str]) -> None:
+    """Write a minimal raw-token pack (same reader `_BatchFactory` consumes).
+
+    Every node gets a distinct token-sequence length so pair identity and
+    order can be recovered unambiguously from the returned ``len_a``/``len_b``.
+    """
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(1)
+    shard_path = pack_dir / "shard-000.bin"
+    records: list[PackedNodeRecord] = []
+    offset = 0
+    with shard_path.open("wb") as handle:
+        for i, node in enumerate(nodes):
+            length = 2 + i
+            tensor = torch.from_numpy(rng.normal(size=(length, _TOKEN_DIM)).astype(np.float32))
+            raw = tensor.to(torch.bfloat16).contiguous().view(torch.uint16)
+            handle.write(raw.numpy().tobytes())
+            records.append(PackedNodeRecord(node, 0, offset, offset, length))
+            offset += length
+    manifest = PackedFeatureManifest(
+        format=PACK_FORMAT,
+        input_dim=_TOKEN_DIM,
+        dtype="bfloat16",
+        source_metadata_sha256="0" * 64,
+        source_index_sha256="0" * 64,
+        nodes=tuple(records),
+        shards=(
+            PackedShardRecord(
+                filename="shard-000.bin",
+                num_tokens=offset,
+                byte_size=shard_path.stat().st_size,
+                sha256=sha256_file(shard_path),
+            ),
+        ),
+        pack_workers=1,
+        build_seconds=0.0,
+    )
+    write_packed_manifest(pack_dir, manifest)
+
+
+class TestBatchFactoryE2E:
+    def test_edge_batch_carries_token_streams_in_stream_order(self, tmp_path: Path) -> None:
+        cfg = _toy_cfg(tmp_path)
+        model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
+        data = _toy_bundle(tmp_path, model_cfg)
+        pack_dir = tmp_path / "token_pack"
+        _write_tiny_token_pack(pack_dir, _NODES)
+        e2e_cfg = replace(
+            cfg,
+            model=ModelConfig(family="egostitch_e2e", config={}),
+            data=replace(cfg.data, pack_dir=pack_dir),
+        )
+        rows, steps = te._epoch_step_plan(
+            len(data.e_sup_positives),
+            negative_ratio=e2e_cfg.data.negative_ratio,
+            edge_batch=e2e_cfg.data.edge_batch,
+            world_size=1,
+        )
+
+        factory = te._BatchFactory(e2e_cfg, model_cfg, data, node_batch=4, rank=0, world_size=1)
+        batch = next(iter(factory.epoch_batches(1, rows_per_rank=rows, steps=steps)))
+
+        edge_batch = e2e_cfg.data.edge_batch
+        assert batch.edge["emb_a"].shape == (edge_batch, batch.edge["emb_a"].shape[1], _TOKEN_DIM)
+        assert batch.edge["emb_b"].shape == batch.edge["emb_a"].shape
+        assert batch.edge["len_a"].shape == (edge_batch,)
+        assert batch.edge["len_b"].shape == (edge_batch,)
+        assert "s0" not in batch.edge
+        # F0/grounding tensors stay in the batch: imagination still needs them.
+        assert batch.edge["x_i"].shape == (edge_batch, model_cfg.input_dim)
+        assert batch.edge["ground_i"].shape[0] == edge_batch
+
+        expected_rows = te.enumerate_edge_stream(
+            data.e_sup_positives,
+            data.sampler,
+            negative_ratio=e2e_cfg.data.negative_ratio,
+            seed=e2e_cfg.seed,
+            epoch=1,
+            rank=0,
+            world_size=1,
+        )
+        expected_chunk = expected_rows[:edge_batch]
+        table = PackedFeatureTable.from_pack(pack_dir, torch.device("cpu"))
+        index = table.manifest.node_index()
+        expected_len_a = torch.tensor(
+            [table.manifest.nodes[index[u]].length for u, _, _ in expected_chunk],
+            dtype=torch.long,
+        )
+        expected_len_b = torch.tensor(
+            [table.manifest.nodes[index[v]].length for _, v, _ in expected_chunk],
+            dtype=torch.long,
+        )
+        expected_boundary = max(int(expected_len_a.max()), int(expected_len_b.max()))
+        torch.testing.assert_close(batch.edge["len_a"], expected_len_a)
+        torch.testing.assert_close(batch.edge["len_b"], expected_len_b)
+        assert batch.edge["emb_a"].shape[1] == expected_boundary
+
+    def test_requires_pack_dir(self, tmp_path: Path) -> None:
+        cfg = _toy_cfg(tmp_path)
+        model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
+        data = _toy_bundle(tmp_path, model_cfg)
+        e2e_cfg = replace(cfg, model=ModelConfig(family="egostitch_e2e", config={}))
+        with pytest.raises(ValueError, match="pack_dir"):
+            te._BatchFactory(e2e_cfg, model_cfg, data, node_batch=4, rank=0, world_size=1)
 
 
 class TestPreparePack:
