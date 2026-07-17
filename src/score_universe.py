@@ -258,6 +258,44 @@ def validate_score_precision(
         )
 
 
+def validate_artifact_precision(artifact: ScoresArtifact, *, label: str = "artifact") -> None:
+    """Validate a loaded `ScoresArtifact`'s EgoStitch pair-pass fp32 provenance.
+
+    Thin, family-agnostic wrapper over :func:`validate_score_precision`: it
+    derives ``extra_arrays`` from the artifact's own ``f_logit``/``pair_content``/
+    ``pair_topology`` fields, so a caller that only has a `ScoresArtifact` (and
+    does not know in advance whether its family is ``egostitch_e2e``,
+    ``egostitch``, or a plain B0-family scorer) can validate it directly, the
+    same way :func:`load_scores` returns it. Non-``egostitch_e2e`` artifacts
+    simply pass an empty ``extra_arrays`` mapping, matching
+    :func:`validate_score_precision`'s existing behavior for those families.
+
+    Args:
+        artifact: The loaded scores artifact (from :func:`load_scores` or
+            :func:`merge_scores`).
+        label: Human-readable artifact label used in errors.
+
+    Raises:
+        ValueError: If an EgoStitch or EgoStitch-E2E artifact lacks or
+            contradicts its pinned pair-pass fp32 contract, is missing one of
+            the four decomposition arrays, or its stored diagnostics are
+            inconsistent.
+    """
+    extra_arrays: dict[str, NDArray[np.float32]] = {}
+    if artifact.f_logit is not None:
+        extra_arrays["f_logit"] = artifact.f_logit
+    if artifact.pair_content is not None:
+        extra_arrays["pair_content"] = artifact.pair_content
+    if artifact.pair_topology is not None:
+        extra_arrays["pair_topology"] = artifact.pair_topology
+    validate_score_precision(
+        artifact.logit,
+        meta=artifact.meta,
+        label=label,
+        extra_arrays=extra_arrays,
+    )
+
+
 def _validate_egostitch_e2e_precision(
     logit: NDArray[np.float32],
     *,
@@ -304,7 +342,15 @@ def _validate_egostitch_e2e_precision(
     arrays: dict[str, NDArray[np.float32]] = {"full": logit, **extra_arrays}
     missing = [key for key in _EGOSTITCH_E2E_ARRAY_KEYS if key not in arrays]
     if missing:
-        raise ValueError(f"{label}: EgoStitch-E2E artifact is missing arrays: {missing}")
+        raise ValueError(
+            f"{label}: EgoStitch-E2E artifact is missing arrays: {missing}. "
+            "These arrays may already be present on the loaded ScoresArtifact "
+            "(as f_logit/pair_content/pair_topology) even though this call did "
+            "not pass them as extra_arrays; callers that only have a "
+            "ScoresArtifact should use validate_artifact_precision(artifact, "
+            "label=...) instead of calling validate_score_precision(logit, ...) "
+            "directly."
+        )
     non_float32 = [
         key for key in _EGOSTITCH_E2E_ARRAY_KEYS if np.asarray(arrays[key]).dtype != np.float32
     ]
@@ -1762,6 +1808,7 @@ __all__ = [
     "merge_scores",
     "save_scores",
     "score_resolution_diagnostics",
+    "validate_artifact_precision",
     "validate_score_precision",
 ]
 

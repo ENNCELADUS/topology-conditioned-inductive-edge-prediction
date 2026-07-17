@@ -1181,3 +1181,62 @@ def test_egostitch_e2e_merge_preserves_four_arrays_in_manifest_order(tmp_path: P
         assert merged.f_logit[m_row] == pytest.approx(unsharded.f_logit[u_row])
         assert merged.pair_content[m_row] == pytest.approx(unsharded.pair_content[u_row])
         assert merged.pair_topology[m_row] == pytest.approx(unsharded.pair_topology[u_row])
+
+
+# --------------------------------------------------------------------------- artifact-aware
+# score-precision validation entry point (Task-14 review follow-up)
+
+
+def test_validate_artifact_precision_passes_on_well_formed_e2e_artifact(tmp_path: Path) -> None:
+    """A caller with only a `ScoresArtifact` (no separate extra_arrays) validates cleanly."""
+    data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
+    output = tmp_path / "scores.npz"
+    score_universe.main(_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, output))
+
+    artifact = score_universe.load_scores(output)
+    score_universe.validate_artifact_precision(artifact, label=str(output))
+
+
+def test_validate_artifact_precision_raises_on_corrupted_e2e_artifact(tmp_path: Path) -> None:
+    """A genuinely broken decomposition array (wrong dtype) is still caught."""
+    data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
+    output = tmp_path / "scores.npz"
+    score_universe.main(_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, output))
+
+    artifact = score_universe.load_scores(output)
+    assert artifact.pair_content is not None
+    corrupted = score_universe.ScoresArtifact(
+        node_ids=artifact.node_ids,
+        u_idx=artifact.u_idx,
+        v_idx=artifact.v_idx,
+        logit=artifact.logit,
+        label=artifact.label,
+        meta=artifact.meta,
+        f_logit=artifact.f_logit,
+        pair_content=artifact.pair_content.astype(np.float64),  # dtype broken on purpose
+        pair_topology=artifact.pair_topology,
+    )
+    with pytest.raises(ValueError, match="must be stored as float32"):
+        score_universe.validate_artifact_precision(corrupted, label="corrupted")
+
+
+def test_validate_score_precision_old_idiom_on_e2e_artifact_points_to_new_entry_point(
+    tmp_path: Path,
+) -> None:
+    """The old generic idiom on an egostitch_e2e artifact still raises, with a pointer.
+
+    `validate_score_precision(artifact.logit, ...)` (as used by
+    `src.experiments.g1_hardened_e2` for B0-family artifacts) still raises for an
+    egostitch_e2e artifact — the four-array contract can't be checked without the
+    extra arrays — but the error now points callers at validate_artifact_precision
+    instead of reading as a false "artifact is missing arrays" report.
+    """
+    data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
+    output = tmp_path / "scores.npz"
+    score_universe.main(_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, output))
+
+    artifact = score_universe.load_scores(output)
+    with pytest.raises(ValueError, match="validate_artifact_precision"):
+        score_universe.validate_score_precision(
+            artifact.logit, meta=artifact.meta, label=str(output)
+        )
