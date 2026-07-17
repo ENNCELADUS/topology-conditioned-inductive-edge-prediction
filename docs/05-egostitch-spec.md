@@ -621,9 +621,10 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   registration-status rules. Satisfies §14.3(2); the formal e2e run remains gated
   on a BINDING registration (§14.3(3–5)).
 - 2026-07-17: pinned the §13.18/§14.1 grounded-identity-match flag to a
-  three-clause definition (own gate `> 0.5`; pointer-argmax global-node-id
-  equality across endpoints; own-split grounding pools only, no Hungarian/
-  target-graph access) and superseded the implementation plan's
+  three-clause definition (own gate `> 0.5`; pointer-argmax equality across
+  endpoints within a shared node-identity space that need only be consistent
+  within one run, not a persistent global id; own-split grounding pools only,
+  no Hungarian/target-graph access) and superseded the implementation plan's
   Hungarian/`L_gate`-matching phrasing for this label: that quantity is
   train-time-only (node-stream batches with real ego-net targets) and
   undefined for edge-stream endpoints and unseen nodes at inference, so
@@ -969,9 +970,17 @@ file (predecessor convention).
 pair `(i, j)`, slot `k` of endpoint `u ∈ {i, j}` is grounded-identity-matched
 **iff** (1) `gate_u^k > 0.5` (the slot is grounded — the same 0.5 threshold §4's
 grounded-slot re-mask rule uses); AND (2) `argmax` of slot `k`'s grounding
-pointer selects a grounding-pool candidate with global node id `c`; AND (3) the
-**other** endpoint has at least one slot `k'` with `gate > 0.5` whose pointer
-argmax selects the **same** global node id `c`. The flag is a binary float
+pointer selects a grounding-pool candidate with identity `c`, drawn from a
+shared node-identity space that is consistent across both endpoints of a batch
+within one run; AND (3) the **other** endpoint has at least one slot `k'` with
+`gate > 0.5` whose pointer argmax selects that **same** identity `c` within
+that shared space. This shared node-identity space is an abstract requirement
+of the definition, not a claim of a persistent global id: the scoring-path
+realization (`src/score_universe.py`'s `_score_egostitch_e2e`) is the
+run-scoped F0-matrix row index (the `pool_rows` convention), rebuilt fresh on
+every scoring invocation — these row indices are **not** comparable across
+runs or across the train/score boundary, and the definition requires only
+within-call (within-batch-construction) consistency. The flag is a binary float
 `{0.0, 1.0}` per slot, shape `(B, K)` per side — the `matched_src`/`matched_dst`
 inputs to `build_content_tokens` (§14.1 `c_cont`). It is symmetric across AB/BA
 by construction (the shared-candidate relation is undirected), computable at

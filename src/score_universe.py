@@ -1447,7 +1447,18 @@ def _score_egostitch_e2e(
     # call's node set can actually support so tiny fixtures (few endpoints)
     # remain valid `build_grounding_pool` calls without changing production
     # behavior, where len(node_ids) - 1 always exceeds the spec default.
-    n_ground = min(model.generator_cfg.n_ground, len(node_ids) - 1)
+    registered_n_ground = model.generator_cfg.n_ground
+    n_ground = min(registered_n_ground, len(node_ids) - 1)
+    if n_ground < registered_n_ground:
+        logger.warning(
+            "n_ground clamped from registered %d to %d for this scoring call's "
+            "universe of %d node(s); effective grounding-pool size is smaller "
+            "than the registered default (expected only for small universes, "
+            "not production scoring runs)",
+            registered_n_ground,
+            n_ground,
+            len(node_ids),
+        )
     pool = build_grounding_pool(
         np.asarray(matrix.numpy(), dtype=np.float32),
         node_ids,

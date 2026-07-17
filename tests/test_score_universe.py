@@ -1290,3 +1290,42 @@ def test_egostitch_e2e_scorer_supplies_grounding_batch_keys(
         assert batch["ground_id_b"].shape == (rows, expected_n_ground)
         assert batch["ground_id_a"].dtype == torch.int64
         assert batch["ground_id_b"].dtype == torch.int64
+
+
+# --------------------------------------------------------------------------- Task 13b review
+# follow-up: silent n_ground clamp on small universes
+
+
+def test_egostitch_e2e_scorer_warns_on_n_ground_clamp(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`_score_egostitch_e2e` warns when the registered `n_ground` gets clamped.
+
+    The tiny 3-node fixture (`_E2E_PAIRS` over `{n0, n1, n2}`) can only support
+    `len(node_ids) - 1 == 2` grounding candidates, while `EgoStitchE2E`'s
+    internal Stage-1 generator always registers `EgoStitchConfig().n_ground ==
+    20` (`_build_egostitch_e2e` ignores `model_config` for the generator).
+    Every call here silently clamps 20 -> 2; that must now be logged, stating
+    both the registered and effective values.
+    """
+    from src.model.egostitch.config import EgoStitchConfig
+
+    data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
+    output = tmp_path / "scores.npz"
+
+    with caplog.at_level("WARNING", logger="src.score_universe"):
+        score_universe.main(
+            _egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, output)
+        )
+
+    node_universe = len({node for pair in _E2E_PAIRS for node in pair})
+    registered_n_ground = EgoStitchConfig().n_ground
+    expected_n_ground = min(registered_n_ground, node_universe - 1)
+    assert expected_n_ground < registered_n_ground, "fixture must actually trigger the clamp"
+
+    clamp_records = [r for r in caplog.records if "n_ground clamped" in r.getMessage()]
+    assert clamp_records, f"expected an n_ground-clamp warning; got records: {caplog.records}"
+    message = clamp_records[0].getMessage()
+    assert str(registered_n_ground) in message
+    assert str(expected_n_ground) in message
+    assert str(node_universe) in message

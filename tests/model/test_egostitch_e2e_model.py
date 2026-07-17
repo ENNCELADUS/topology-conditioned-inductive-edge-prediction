@@ -165,3 +165,35 @@ def test_f_logit_invariant_to_grounding() -> None:
     dec_b = model.decompose(batch2)
     # f_logit nulls both topo and content pathways, so grounding never reaches the trunk.
     assert torch.allclose(dec_a["f_logit"], dec_b["f_logit"], atol=1e-6)
+
+
+# --------------------------------------------------------------------------- Task 13b review
+# follow-up: direct AB/BA-swap unit assertion on the pure helper
+
+
+def test_matched_flags_swap_sides_swaps_outputs() -> None:
+    """Swapping which endpoint is passed as `a`/`b` swaps the matched outputs.
+
+    Direct check of spec Sec 13.18's "symmetric across AB/BA by construction"
+    claim on the pure `grounded_identity_match` helper itself: calling it with
+    the two endpoints' (pointer, gate, ids) arguments swapped must return the
+    same pair of per-slot flags with `matched_a`/`matched_b` themselves
+    swapped. Reuses the fixture from `test_matched_flags_shared_candidate`.
+    """
+    ids_a = torch.tensor([[10, 11], [10, 11], [10, 11], [10, 11]], dtype=torch.long)
+    ids_b = torch.tensor([[10, 11], [20, 21], [10, 11], [10, 11]], dtype=torch.long)
+    pointer_a = torch.zeros(4, 1, 2)
+    pointer_a[:, :, 0] = 1.0
+    pointer_b = torch.zeros(4, 1, 2)
+    pointer_b[:, :, 0] = 1.0
+    gate_a = torch.tensor([[0.9], [0.9], [0.3], [0.9]])
+    gate_b = torch.tensor([[0.9], [0.9], [0.9], [0.3]])
+
+    matched_a, matched_b = grounded_identity_match(
+        pointer_a, gate_a, ids_a, pointer_b, gate_b, ids_b
+    )
+    matched_b_swapped, matched_a_swapped = grounded_identity_match(
+        pointer_b, gate_b, ids_b, pointer_a, gate_a, ids_a
+    )
+    assert torch.equal(matched_a, matched_a_swapped)
+    assert torch.equal(matched_b, matched_b_swapped)
