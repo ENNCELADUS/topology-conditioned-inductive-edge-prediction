@@ -70,3 +70,22 @@ DONE.
 Verification after review fixes: focused Task-7 tests excluding only the documented
 sandbox process-group timeout check passed; ruff check/format, diff check, and
 isolated strict mypy all passed.
+
+## Re-review round 2 addendum (2026-07-17)
+
+- The worker captures one immutable `PreregistrationSnapshot` during preparation
+  and carries its parsed payload/SHA through DDP execution and final metadata;
+  the E2E gate similarly passes one captured payload/SHA through frozen-input,
+  status, arm-provenance, and metric evaluation without reopening registration.
+- Every formal E2E arm is bound to Seed 0, its registered strategy and partition
+  seed, and the exact registered config path plus the worker's canonical config
+  hash. The production E2E gate additionally requires registered
+  `breadth_first`, which makes the fixed-500 evaluator assertion unconditional
+  for formal evaluation.
+- Regression coverage includes replacement after snapshot capture, wrong seed,
+  strategy, partition seed, config hash, and alternate registered-arm config path.
+- Final provenance-hardening code commit: `22c70899f8f09dd815344a880cd96c33c09533e4`.
+
+Final verification: covering worker/gate/pipeline suites (excluding only the
+documented sandbox process-group timeout), Task-6 E2E/scaffold-control regressions,
+ruff check/format, diff check, and isolated strict mypy passed.
