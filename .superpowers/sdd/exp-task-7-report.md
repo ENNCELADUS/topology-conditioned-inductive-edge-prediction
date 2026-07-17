@@ -2,7 +2,7 @@
 
 ## Status
 
-DONE pending commit SHA insertion.
+DONE.
 
 ## RED evidence
 
@@ -46,4 +46,4 @@ DONE pending commit SHA insertion.
 
 ## Commit
 
-`PENDING` — `feat(g5-e2e): machine-enforced BINDING status + paired-bootstrap structure-control condition`
+`74cd63e` — `feat(g5-e2e): machine-enforced BINDING status + paired-bootstrap structure-control condition`
