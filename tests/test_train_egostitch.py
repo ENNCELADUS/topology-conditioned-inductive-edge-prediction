@@ -362,6 +362,29 @@ def _toy_cfg(tmp_path: Path) -> te.EgoConfig:
     return te.load_config(_write_config(tmp_path))
 
 
+class TestRegistrationRunMode:
+    def test_formal_worker_refuses_draft_registration(self, tmp_path: Path) -> None:
+        cfg = _toy_cfg(tmp_path)
+
+        with pytest.raises(te.PreregistrationNotBinding, match="status == 'BINDING'"):
+            te.prepare_ddp_run_config(cfg, max_steps=None)
+
+    def test_debug_worker_redirects_and_marks_nonformal(self, tmp_path: Path) -> None:
+        cfg = _toy_cfg(tmp_path)
+
+        debug_cfg, is_debug = te.prepare_ddp_run_config(cfg, max_steps=5)
+
+        assert is_debug is True
+        assert debug_cfg.output_dir == tmp_path / "out_debug"
+        assert debug_cfg.output_dir != cfg.output_dir
+        data = _toy_bundle(tmp_path, EgoStitchConfig.from_mapping(cfg.model.config))
+        te.write_run_start_metadata(debug_cfg, data, world_size=1, debug=True)
+        metadata = json.loads((debug_cfg.output_dir / "run_metadata.json").read_text())
+        assert metadata["run_kind"] == "debug"
+        assert metadata["formal_artifacts_published"] is False
+        assert not (cfg.output_dir / "run_metadata.json").exists()
+
+
 # --------------------------------------------------------------------------- streams
 
 

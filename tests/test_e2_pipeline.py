@@ -263,6 +263,25 @@ def test_parse_pipeline_args_accepts_worker_module_override(tmp_path: Path) -> N
     assert args.worker_module == "src.train_egostitch"
 
 
+def test_pipeline_forwards_debug_max_steps_to_worker(tmp_path: Path) -> None:
+    args = parse_pipeline_args(["--config", str(tmp_path / "cfg.yaml"), "--max-steps", "5"])
+    assert args.max_steps == 5
+
+    command = build_accelerate_command(
+        accelerate_bin=tmp_path / "accelerate",
+        config_path=args.config,
+        mode="train",
+        pack_dir=tmp_path / "pack",
+        output_dir=tmp_path / "out",
+        token_budget=256,
+        profile_output=tmp_path / "profile.json",
+        world_size=2,
+        max_steps=args.max_steps,
+    )
+
+    assert command[command.index("--max-steps") + 1] == "5"
+
+
 def test_build_accelerate_command_worker_module(tmp_path: Path) -> None:
     from src.e2_pipeline import build_accelerate_command
 
@@ -1214,9 +1233,7 @@ class TestRunPipelineFailures:
 
         exit_code = run_pipeline(
             args,
-            command_runner=_make_fake_runner(
-                advance_seconds_by_mode={"probe": 0.55}, clock=clock
-            ),
+            command_runner=_make_fake_runner(advance_seconds_by_mode={"probe": 0.55}, clock=clock),
         )
 
         assert exit_code == 2

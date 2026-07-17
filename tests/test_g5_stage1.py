@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -30,6 +31,7 @@ def _d(x: object) -> dict[str, Any]:
 
 _PREREG = {
     "registration_id": "toy-prereg",
+    "status": "BINDING",
     "seeds": [0],
     "primary_criteria": {"decision_procedure": "single_seed_point_estimate_dominance"},
     "failure_reading": "pre-registered failure reading text (verbatim)",
@@ -650,7 +652,7 @@ _E2E_LIVENESS_CONFIG = {
 
 def _five_arm_inputs(tmp_path: Path) -> dict[str, Any]:
     """Toy benchmark + five egostitch_e2e arm universes + per-arm run metadata."""
-    _b0_universe_path, _val_path, data_root = _b0cal_toy_inputs(tmp_path)
+    b0_universe_path, _val_path, data_root = _b0cal_toy_inputs(tmp_path)
     pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
     rng = np.random.default_rng(42)
     full = rng.normal(size=len(pairs))
@@ -674,14 +676,19 @@ def _five_arm_inputs(tmp_path: Path) -> dict[str, Any]:
         )
         arm_paths[name] = path
 
+    preregistration_path = _write_prereg(tmp_path, b0_universe_path)
+    preregistration_sha256 = hashlib.sha256(preregistration_path.read_bytes()).hexdigest()
     run_metadata_paths: dict[str, Path] = {}
     for name in ("full", "b0_e2e_f_only", "pair_topology", "p0"):
         meta_path = tmp_path / f"{name}_run_metadata.json"
         meta_path.write_text(
             json.dumps(
                 {
-                    "preregistration_sha256": "a" * 64,
+                    "preregistration_sha256": preregistration_sha256,
                     "checkpoint_id": f"ckpt_{name}",
+                    "run_kind": "formal",
+                    "formal_artifacts_published": True,
+                    "status": "complete",
                 }
             )
         )
@@ -690,6 +697,7 @@ def _five_arm_inputs(tmp_path: Path) -> dict[str, Any]:
     return {
         "arm_universe_paths": arm_paths,
         "run_metadata_paths": run_metadata_paths,
+        "preregistration_path": preregistration_path,
         "data_root": data_root,
         "strategy": "toy",
     }
@@ -702,7 +710,8 @@ class TestBuildE2EArmSummary:
 
         arms = _d(payload["arms"])
         assert set(arms) == set(g5_stage1._E2E_ARMS)
-        assert payload["registration_sha256"] == "a" * 64
+        expected_sha = hashlib.sha256(_d(inputs)["preregistration_path"].read_bytes()).hexdigest()
+        assert payload["registration_sha256"] == expected_sha
         for name in g5_stage1._E2E_ARMS:
             row = _d(arms[name])
             expected_checkpoint = "ckpt_full" if name == "structure_control_6a" else f"ckpt_{name}"
@@ -710,10 +719,14 @@ class TestBuildE2EArmSummary:
             assert "graph_similarity" in _d(row["assembled"])
         # structure_control_6a has no run_metadata record, but inherits the
         # full arm's registered checkpoint/hash provenance.
-        assert _d(arms["structure_control_6a"])["registration_sha256"] == "a" * 64
-        assert _d(arms["full"])["registration_sha256"] == "a" * 64
+        assert _d(arms["structure_control_6a"])["registration_sha256"] == expected_sha
+        assert _d(arms["full"])["registration_sha256"] == expected_sha
         liveness = _d(payload["liveness"])
         assert liveness["residual_std"] > 0
+        structure_control = _d(payload["structure_control"])
+        assert structure_control["n_boot"] == 1000
+        assert structure_control["seed"] == 0
+        assert structure_control["passed"] is (structure_control["lower_bound"] > 0.0)
 
     def test_byte_identical_reruns(self, tmp_path: Path) -> None:
         inputs = _five_arm_inputs(tmp_path)
@@ -756,7 +769,12 @@ class TestBuildE2EArmSummary:
     ) -> None:
         inputs = _five_arm_inputs(tmp_path)
         metadata_path = _d(inputs["run_metadata_paths"])["p0"]
-        payload = {"checkpoint_id": "ckpt_p0"}
+        payload = {
+            "checkpoint_id": "ckpt_p0",
+            "run_kind": "formal",
+            "formal_artifacts_published": True,
+            "status": "complete",
+        }
         if registration is not None:
             payload["preregistration_sha256"] = registration
         metadata_path.write_text(json.dumps(payload))
@@ -767,7 +785,17 @@ class TestBuildE2EArmSummary:
         inputs = _five_arm_inputs(tmp_path)
         metadata_path = _d(inputs["run_metadata_paths"])["pair_topology"]
         metadata_path.write_text(
-            json.dumps({"preregistration_sha256": "a" * 64, "checkpoint_id": "wrong"})
+            json.dumps(
+                {
+                    "preregistration_sha256": hashlib.sha256(
+                        _d(inputs)["preregistration_path"].read_bytes()
+                    ).hexdigest(),
+                    "checkpoint_id": "wrong",
+                    "run_kind": "formal",
+                    "formal_artifacts_published": True,
+                    "status": "complete",
+                }
+            )
         )
         with pytest.raises(ValueError, match="checkpoint_id mismatch"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
@@ -793,11 +821,108 @@ class TestBuildE2EArmSummary:
     def test_registration_hash_mismatch_rejected(self, tmp_path: Path) -> None:
         inputs = _five_arm_inputs(tmp_path)
         bad_meta = tmp_path / "bad_meta.json"
-        bad_meta.write_text(json.dumps({"preregistration_sha256": "b" * 64}))
+        bad_meta.write_text(
+            json.dumps(
+                {
+                    "preregistration_sha256": "b" * 64,
+                    "checkpoint_id": "ckpt_p0",
+                    "run_kind": "formal",
+                    "formal_artifacts_published": True,
+                    "status": "complete",
+                }
+            )
+        )
         inputs["run_metadata_paths"] = dict(inputs["run_metadata_paths"])
         inputs["run_metadata_paths"]["p0"] = bad_meta
-        with pytest.raises(ValueError, match="disagree"):
+        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="does not match"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_requires_binding_registration_status(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        preregistration_path = _d(inputs)["preregistration_path"]
+        preregistration_path.write_text(json.dumps({"status": "DRAFT"}))
+
+        with pytest.raises(g5_stage1.PreregistrationNotBinding, match="status == 'BINDING'"):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_rejects_debug_run_metadata(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        metadata_path = _d(inputs)["run_metadata_paths"]["full"]
+        metadata = json.loads(metadata_path.read_text())
+        metadata.update({"run_kind": "debug", "formal_artifacts_published": False})
+        metadata_path.write_text(json.dumps(metadata))
+
+        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="run_kind 'formal'"):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_requires_completed_formal_run_metadata(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        metadata_path = _d(inputs)["run_metadata_paths"]["full"]
+        metadata = json.loads(metadata_path.read_text())
+        metadata.pop("formal_artifacts_published")
+        metadata_path.write_text(json.dumps(metadata))
+
+        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="exactly true"):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+
+class TestPairedBootstrap:
+    def test_lower_bound_is_paired_and_deterministic(self) -> None:
+        rng = np.random.default_rng(1)
+        base = rng.normal(0.0, 1.0, 500)
+        clearly_higher = base + 1.0
+        mean_stat = cast(Callable[[object], float], np.mean)
+
+        lower_bound = g5_stage1.paired_bootstrap_lower_bound(mean_stat, clearly_higher, base)
+
+        assert lower_bound > 0.0
+        assert lower_bound == g5_stage1.paired_bootstrap_lower_bound(
+            mean_stat, clearly_higher, base
+        )
+        null_lower_bound = g5_stage1.paired_bootstrap_lower_bound(mean_stat, base + 0.001, base)
+        assert null_lower_bound < 0.0 or abs(null_lower_bound) < 0.1
+
+
+class TestE2EGateCli:
+    def test_mode_e2e_forwards_exact_five_arm_contract(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        captured: dict[str, object] = {}
+
+        def _fake_run(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return {}
+
+        monkeypatch.setattr(g5_stage1, "run_g5_e2e_stage1_pipeline", _fake_run)
+        g5_stage1.main(
+            [
+                "--mode",
+                "e2e",
+                "--full-universe",
+                str(_d(inputs)["arm_universe_paths"]["full"]),
+                "--control-universe",
+                str(_d(inputs)["arm_universe_paths"]["structure_control_6a"]),
+                "--fonly-universe",
+                str(_d(inputs)["arm_universe_paths"]["b0_e2e_f_only"]),
+                "--pt-universe",
+                str(_d(inputs)["arm_universe_paths"]["pair_topology"]),
+                "--p0-universe",
+                str(_d(inputs)["arm_universe_paths"]["p0"]),
+                "--run-metadata",
+                *[str(path) for path in _d(inputs)["run_metadata_paths"].values()],
+                "--b0-universe",
+                str(tmp_path / "b0.npz"),
+                "--b0cal-results",
+                str(tmp_path / "b0cal.json"),
+                "--preregistration",
+                str(_d(inputs)["preregistration_path"]),
+                "--output-dir",
+                str(tmp_path / "gate"),
+            ]
+        )
+        assert set(_d(captured["arm_universe_paths"])) == set(g5_stage1._E2E_ARMS)
+        assert set(_d(captured["run_metadata_paths"])) == set(g5_stage1._E2E_FORMAL_ARMS)
 
     def test_rejects_wrong_model_family(self, tmp_path: Path) -> None:
         inputs = _five_arm_inputs(tmp_path)

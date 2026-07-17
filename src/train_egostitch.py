@@ -231,6 +231,7 @@ class EgoCliArgs:
     config: Path
     seed: int | None
     output_dir: Path | None
+    max_steps: int | None = None
     ddp_mode: str | None = None
     pack_dir: Path | None = None
     token_budget_per_rank: int | None = None
@@ -571,6 +572,12 @@ def parse_args(argv: Sequence[str] | None = None) -> EgoCliArgs:
     parser.add_argument("--seed", type=int, default=None, help="Override config seed.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Override config output_dir.")
     parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="DEBUG ONLY: stop after N optimizer steps and publish only debug artifacts.",
+    )
+    parser.add_argument(
         "--ddp-mode",
         choices=DDP_MODES,
         default=None,
@@ -611,6 +618,7 @@ def parse_args(argv: Sequence[str] | None = None) -> EgoCliArgs:
         config=namespace.config,
         seed=namespace.seed,
         output_dir=namespace.output_dir,
+        max_steps=namespace.max_steps,
         ddp_mode=namespace.ddp_mode,
         pack_dir=namespace.pack_dir,
         token_budget_per_rank=namespace.token_budget_per_rank,
@@ -626,6 +634,35 @@ def apply_overrides(cfg: EgoConfig, args: EgoCliArgs) -> EgoConfig:
     if args.output_dir is not None:
         cfg = replace(cfg, output_dir=args.output_dir)
     return cfg
+
+
+class PreregistrationNotBinding(RuntimeError):
+    """Raised when a formal worker run is not backed by a BINDING registration."""
+
+
+def prepare_ddp_run_config(cfg: EgoConfig, *, max_steps: int | None) -> tuple[EgoConfig, bool]:
+    """Enforce the formal/debug registration boundary before DDP work starts.
+
+    A bounded run is never allowed to use the configured formal output directory.
+    Its checkpoints may support local smoke checks, but its metadata explicitly
+    marks them non-formal so the gate cannot publish held-out results from them.
+    """
+    if not cfg.preregistration.is_file():
+        raise ValueError(f"preregistration file not found: {cfg.preregistration}")
+    prereg = json.loads(cfg.preregistration.read_text(encoding="utf-8"))
+    status = prereg.get("status") if isinstance(prereg, dict) else None
+    if max_steps is None:
+        if status != "BINDING":
+            raise PreregistrationNotBinding(
+                "formal EgoStitch runs require preregistration status == 'BINDING'"
+            )
+        return cfg, False
+    if max_steps <= 0:
+        raise ValueError("--max-steps must be positive")
+    debug_dir = cfg.output_dir.with_name(f"{cfg.output_dir.name}_debug")
+    if debug_dir == cfg.output_dir:  # pragma: no cover - Path guarantees a new basename
+        raise RuntimeError("debug output directory must differ from the formal output directory")
+    return replace(cfg, output_dir=debug_dir), True
 
 
 # --------------------------------------------------------------------------- pack stage
@@ -1985,6 +2022,7 @@ def train_egostitch_ddp_loop(
     accelerator: Accelerator,
     *,
     node_batch: int,
+    max_steps: int | None = None,
 ) -> EgoTrainResult:
     """Run the fixed-epoch Stage-1 training loop (any world size >= 1).
 
@@ -2006,6 +2044,7 @@ def train_egostitch_ddp_loop(
         data: The assembled data bundle.
         accelerator: The (DDP or single-process) accelerator.
         node_batch: Per-rank ``B_n`` (the orchestrator-selected candidate).
+        max_steps: DEBUG ONLY bounded optimizer-step limit.
 
     Returns:
         The `EgoTrainResult`.
@@ -2071,6 +2110,7 @@ def train_egostitch_ddp_loop(
     total_wall = 0.0
     total_data_wait = 0.0
     total_validation_seconds = 0.0
+    reached_max_steps = False
     for epoch in range(1, cfg.optim.epochs + 1):
         epoch_started = time.monotonic()
         epoch_data_wait = 0.0
@@ -2162,6 +2202,10 @@ def train_egostitch_ddp_loop(
             epoch_local_pairs += batch.edge_rows_true
             epoch_local_tokens += batch.f0_rows_gathered
             epoch_global_pairs += batch.edge_rows_global
+            if max_steps is not None and global_step >= max_steps:
+                reached_max_steps = True
+                logger.warning("--max-steps %d reached (debug); stopping training", max_steps)
+                break
 
         val_started = time.monotonic()
         validation = _validate_epoch(
@@ -2246,6 +2290,8 @@ def train_egostitch_ddp_loop(
         total_validation_seconds += validation_seconds
         total_local_pairs += epoch_local_pairs
         total_local_tokens += epoch_local_tokens
+        if reached_max_steps:
+            break
 
     # ---- runtime profile (the exact orchestrator-validated schema)
     local_peak_gib = (
@@ -2363,7 +2409,9 @@ def _config_hash(cfg: EgoConfig) -> str:
     ).hexdigest()
 
 
-def write_run_start_metadata(cfg: EgoConfig, data: EgoStitchData, *, world_size: int) -> None:
+def write_run_start_metadata(
+    cfg: EgoConfig, data: EgoStitchData, *, world_size: int, debug: bool = False
+) -> None:
     """Bind the run to config, preregistration, and s0 before optimization."""
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     path = cfg.output_dir / "run_metadata.json"
@@ -2371,6 +2419,8 @@ def write_run_start_metadata(cfg: EgoConfig, data: EgoStitchData, *, world_size:
         raise FileExistsError(f"run-start metadata already exists: {path}")
     metadata = {
         "status": "started",
+        "run_kind": "debug" if debug else "formal",
+        "formal_artifacts_published": False,
         "started_at": datetime.now(UTC).isoformat(),
         "config_hash": _config_hash(cfg),
         "preregistration_sha256": _sha256_file(cfg.preregistration),
@@ -2385,7 +2435,9 @@ def write_run_start_metadata(cfg: EgoConfig, data: EgoStitchData, *, world_size:
     path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
 
-def write_outputs(result: EgoTrainResult, cfg: EgoConfig, data: EgoStitchData) -> None:
+def write_outputs(
+    result: EgoTrainResult, cfg: EgoConfig, data: EgoStitchData, *, debug: bool = False
+) -> None:
     """Write the pinned Task-4 artifacts + the pre-registration binding.
 
     ``best.pt``/``last.pt`` carry exactly the seven pinned payload keys;
@@ -2406,6 +2458,8 @@ def write_outputs(result: EgoTrainResult, cfg: EgoConfig, data: EgoStitchData) -
         )
     if run_metadata.get("config_hash") != _config_hash(cfg):
         raise RuntimeError("configuration changed after run start; refusing to finalize artifacts")
+    if run_metadata.get("run_kind") != ("debug" if debug else "formal"):
+        raise RuntimeError("run kind changed after run start; refusing to finalize artifacts")
 
     def payload(
         state: dict[str, torch.Tensor], epoch: int, metrics: EdgeMetrics
@@ -2434,7 +2488,8 @@ def write_outputs(result: EgoTrainResult, cfg: EgoConfig, data: EgoStitchData) -
 
     run_metadata.update(
         {
-            "status": "complete",
+            "status": "debug_complete" if debug else "complete",
+            "formal_artifacts_published": not debug,
             "checkpoint_id": _state_digest(result.best_state_dict)[:16],
             "kendall_fallback": result.kendall_state,
             "training_diagnostics": {
@@ -2632,6 +2687,7 @@ def _run_probe_mode(
 
 def _run_ddp_worker(cfg: EgoConfig, args: EgoCliArgs) -> None:
     """Dispatch an ``accelerate launch`` worker to the requested DDP mode."""
+    cfg, _is_debug = prepare_ddp_run_config(cfg, max_steps=args.max_steps)
     if args.pack_dir is None or args.token_budget_per_rank is None or args.profile_output is None:
         raise ValueError(
             "DDP worker modes require --pack-dir, --token-budget-per-rank, and --profile-output"
@@ -2684,11 +2740,18 @@ def _run_ddp_worker(cfg: EgoConfig, args: EgoCliArgs) -> None:
         return
 
     if accelerator.is_main_process:
-        write_run_start_metadata(cfg, data, world_size=accelerator.num_processes)
+        write_run_start_metadata(
+            cfg,
+            data,
+            world_size=accelerator.num_processes,
+            debug=args.max_steps is not None,
+        )
     accelerator.wait_for_everyone()
-    result = train_egostitch_ddp_loop(model, cfg, data, accelerator, node_batch=node_batch)
+    result = train_egostitch_ddp_loop(
+        model, cfg, data, accelerator, node_batch=node_batch, max_steps=args.max_steps
+    )
     if accelerator.is_main_process:
-        write_outputs(result, cfg, data)
+        write_outputs(result, cfg, data, debug=args.max_steps is not None)
     _write_json_rank_zero(accelerator, args.profile_output, result.runtime_profile)
     logger.info(
         "egostitch ddp train complete: best epoch %d val AUPRC %.4f (counterfactual_stop_epoch=%s)",

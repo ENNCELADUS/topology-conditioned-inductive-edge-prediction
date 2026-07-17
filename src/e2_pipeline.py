@@ -253,6 +253,7 @@ class PipelineArgs:
         output_dir: Optional override for the run output directory; defaults to
             ``cfg.output_dir`` when omitted.
         seed: Optional worker seed override for pre-registered multi-seed runs.
+        max_steps: Optional DEBUG-ONLY bounded worker-step limit.
         worker_module: Dotted module implementing the worker contract
             (``load_config``, ``prepare_pack``, and the ``--ddp-mode``
             probe/epoch-probe/train CLI). Defaults to the formal E2 B0 worker;
@@ -264,6 +265,7 @@ class PipelineArgs:
     output_dir: Path | None
     worker_module: str = "src.train_b0"
     seed: int | None = None
+    max_steps: int | None = None
 
 
 class BudgetExceeded(RuntimeError):
@@ -306,6 +308,7 @@ def build_accelerate_command(
     world_size: int,
     worker_module: str = "src.train_b0",
     seed: int | None = None,
+    max_steps: int | None = None,
 ) -> list[str]:
     """Build the pinned ``accelerate launch -m <worker>`` worker command.
 
@@ -324,6 +327,7 @@ def build_accelerate_command(
         world_size: Number of visible H20 ranks to launch.
         worker_module: Dotted worker module (default: the formal E2 B0 worker).
         seed: Optional worker seed override.
+        max_steps: Optional DEBUG-ONLY bounded worker-step limit.
 
     Returns:
         The exact ``accelerate launch --num_processes <world_size> --mixed_precision bf16
@@ -353,6 +357,8 @@ def build_accelerate_command(
     ]
     if seed is not None:
         command.extend(("--seed", str(seed)))
+    if max_steps is not None:
+        command.extend(("--max-steps", str(max_steps)))
     return command
 
 
@@ -389,6 +395,7 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
     parser.add_argument("--pack-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument(
         "--worker-module",
         default="src.train_b0",
@@ -405,6 +412,7 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
         output_dir=namespace.output_dir,
         worker_module=namespace.worker_module,
         seed=namespace.seed,
+        max_steps=namespace.max_steps,
     )
 
 
@@ -910,6 +918,7 @@ def run_pipeline(
             world_size=runtime.world_size,
             worker_module=args.worker_module,
             seed=args.seed,
+            max_steps=args.max_steps,
         )
         try:
             completed = command_runner(command, remaining)
@@ -998,6 +1007,7 @@ def run_pipeline(
         world_size=runtime.world_size,
         worker_module=args.worker_module,
         seed=args.seed,
+        max_steps=args.max_steps,
     )
     try:
         completed = command_runner(command, remaining)
@@ -1070,6 +1080,7 @@ def run_pipeline(
         world_size=runtime.world_size,
         worker_module=args.worker_module,
         seed=args.seed,
+        max_steps=args.max_steps,
     )
     try:
         completed = command_runner(command, float(runtime.train_eval_budget_seconds))

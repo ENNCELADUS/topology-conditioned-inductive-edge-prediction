@@ -39,7 +39,7 @@ import hashlib
 import json
 import logging
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -51,7 +51,14 @@ from scipy.stats import spearmanr
 
 from src.data.features import FeatureStore
 from src.eval.assembly import assemble_graph, density_matched_threshold
-from src.eval.graph_metrics import MMDConfig, evaluate_assembled_graph, strip_self_loops
+from src.eval.graph_metrics import (
+    MMDConfig,
+    _descriptors,
+    _induced_subgraph,
+    evaluate_assembled_graph,
+    mmd_squared,
+    strip_self_loops,
+)
 from src.experiments.g1_hardened_e2 import (
     _BENCHMARK_SUBDIR,
     _FEATURES_SUBDIR,
@@ -79,6 +86,14 @@ _SE_FLOOR = 1e-12
 
 class PreregistrationMismatch(RuntimeError):
     """Raised before any held-out metric is touched (prereg mechanics)."""
+
+
+class PreregistrationNotBinding(PreregistrationMismatch):
+    """Raised when a gate is offered a non-binding registration."""
+
+
+class RegistrationShaMismatch(PreregistrationMismatch, ValueError):
+    """Raised when formal metadata is not bound to the supplied registration."""
 
 
 @dataclass(frozen=True)
@@ -119,17 +134,87 @@ def enforce_preregistration(preregistration_path: Path, run_metadata_paths: Sequ
     Raises:
         PreregistrationMismatch: On any absent or non-matching hash.
     """
+    prereg = json.loads(preregistration_path.read_text(encoding="utf-8"))
+    if not isinstance(prereg, dict) or prereg.get("status") != "BINDING":
+        raise PreregistrationNotBinding(
+            "held-out G5 metrics require preregistration status == 'BINDING'"
+        )
     expected = _sha256_file(preregistration_path)
     for path in run_metadata_paths:
         metadata = json.loads(path.read_text(encoding="utf-8"))
         recorded = metadata.get("preregistration_sha256")
+        if not isinstance(recorded, str) or not recorded:
+            raise RegistrationShaMismatch(
+                f"{path}: formal run metadata requires a non-empty preregistration_sha256"
+            )
         if recorded != expected:
-            raise PreregistrationMismatch(
+            raise RegistrationShaMismatch(
                 f"{path}: preregistration_sha256 {recorded!r} does not match "
                 f"{preregistration_path} ({expected}); held-out metrics stay closed "
                 "(protocol Sec 5.2.4)"
             )
+        if (
+            metadata.get("run_kind") == "debug"
+            or metadata.get("formal_artifacts_published") is False
+        ):
+            raise RegistrationShaMismatch(
+                f"{path}: debug/non-formal run metadata cannot publish held-out metrics"
+            )
     return expected
+
+
+def paired_bootstrap_lower_bound(
+    stat_fn: Callable[[object], float],
+    samples_a: object,
+    samples_b: object,
+    *,
+    n_boot: int = 1000,
+    seed: int = 0,
+    alpha: float = 0.05,
+) -> float:
+    """Return the paired two-sided lower bootstrap bound for ``stat(a) - stat(b)``.
+
+    The same single RNG stream generates every index vector, and each vector is
+    applied to both arms. Mapping inputs preserve the evaluator's size-bucket
+    grouping while resampling each bucket independently.
+    """
+    if n_boot <= 0:
+        raise ValueError("n_boot must be positive")
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must lie strictly between 0 and 1")
+    if isinstance(samples_a, Mapping) != isinstance(samples_b, Mapping):
+        raise ValueError("paired bootstrap inputs must have matching structures")
+    rng = np.random.default_rng(seed)
+    differences: list[float] = []
+    if isinstance(samples_a, Mapping):
+        if not isinstance(samples_b, Mapping) or set(samples_a) != set(samples_b):
+            raise ValueError("paired bootstrap bucket keys must match")
+        bucketed_a = cast(Mapping[object, Sequence[object]], samples_a)
+        bucketed_b = cast(Mapping[object, Sequence[object]], samples_b)
+        for key in bucketed_a:
+            if len(bucketed_a[key]) != len(bucketed_b[key]) or not bucketed_a[key]:
+                raise ValueError("paired bootstrap buckets must be non-empty and aligned")
+        for _ in range(n_boot):
+            resampled_a: dict[object, list[object]] = {}
+            resampled_b: dict[object, list[object]] = {}
+            for key in bucketed_a:
+                indices = rng.integers(0, len(bucketed_a[key]), size=len(bucketed_a[key]))
+                resampled_a[key] = [bucketed_a[key][index] for index in indices]
+                resampled_b[key] = [bucketed_b[key][index] for index in indices]
+            differences.append(float(stat_fn(resampled_a) - stat_fn(resampled_b)))
+    else:
+        if isinstance(samples_b, Mapping):
+            raise ValueError("paired bootstrap samples must be non-empty and aligned")
+        sequence_a = cast(Sequence[object], samples_a)
+        sequence_b = cast(Sequence[object], samples_b)
+        if len(sequence_a) != len(sequence_b) or len(sequence_a) == 0:
+            raise ValueError("paired bootstrap samples must be non-empty and aligned")
+        for _ in range(n_boot):
+            indices = rng.integers(0, len(sequence_a), size=len(sequence_a))
+            resampled_sequence_a = [sequence_a[index] for index in indices]
+            resampled_sequence_b = [sequence_b[index] for index in indices]
+            differences.append(float(stat_fn(resampled_sequence_a) - stat_fn(resampled_sequence_b)))
+    return float(np.quantile(np.asarray(differences, dtype=np.float64), alpha / 2.0))
 
 
 def _registered_path(preregistration_path: Path, value: object) -> Path:
@@ -1044,8 +1129,21 @@ def _e2e_registration_sha256(run_metadata: Mapping[str, Mapping[str, object]]) -
         raise ValueError(f"e2e run metadata require a non-empty preregistration_sha256: {hashes}")
     distinct = {cast(str, value) for value in hashes.values()}
     if len(distinct) != 1:
-        raise ValueError(f"e2e arm run metadata disagree on preregistration_sha256: {hashes}")
+        raise RegistrationShaMismatch(
+            f"e2e arm run metadata disagree on preregistration_sha256: {hashes}"
+        )
     return next(iter(distinct))
+
+
+def _enforce_e2e_formal_metadata(run_metadata: Mapping[str, Mapping[str, object]]) -> None:
+    """Reject anything except completed, explicitly formal E2E arm metadata."""
+    for arm, metadata in run_metadata.items():
+        if metadata.get("run_kind") != "formal":
+            raise RegistrationShaMismatch(f"{arm}: run metadata must declare run_kind 'formal'")
+        if metadata.get("formal_artifacts_published") is not True:
+            raise RegistrationShaMismatch(f"{arm}: formal_artifacts_published must be exactly true")
+        if metadata.get("status") != "complete":
+            raise RegistrationShaMismatch(f"{arm}: formal run metadata status must be 'complete'")
 
 
 def _validate_e2e_universe_shape(
@@ -1098,10 +1196,44 @@ def _validate_e2e_universe_shape(
         raise ValueError("; ".join(errors))
 
 
+def _clustering_mmd_samples(
+    g_pred: nx.Graph, g_ref: nx.Graph, buckets: Mapping[int, Sequence[set[str]]]
+) -> dict[int, list[tuple[NDArray[np.float64], NDArray[np.float64]]]]:
+    """Capture one clustering descriptor pair per fixed evaluator subgraph."""
+    return {
+        size: [
+            (
+                _descriptors(_induced_subgraph(g_pred, nodes))["clustering"],
+                _descriptors(_induced_subgraph(g_ref, nodes))["clustering"],
+            )
+            for nodes in node_sets
+        ]
+        for size, node_sets in buckets.items()
+    }
+
+
+def _clustering_mmd_ratio(
+    samples: Sequence[object] | Mapping[object, Sequence[object]], config: MMDConfig
+) -> float:
+    """Recompute the canonical clustering-MMD ratio from fixed-subgraph descriptors."""
+    if not isinstance(samples, Mapping):
+        raise TypeError("clustering MMD bootstrap samples must remain bucketed")
+    raw: list[float] = []
+    reference: list[float] = []
+    for values in samples.values():
+        pairs = cast(Sequence[tuple[NDArray[np.float64], NDArray[np.float64]]], values)
+        pred = [pair[0] for pair in pairs]
+        ref = [pair[1] for pair in pairs]
+        raw.append(mmd_squared(pred, ref, config))
+        reference.append(mmd_squared(ref[::2], ref[1::2], config))
+    return float(np.mean(raw) / max(float(np.mean(reference)), config.reference_epsilon))
+
+
 def build_e2e_arm_summary(
     *,
     arm_universe_paths: Mapping[str, Path],
     run_metadata_paths: Mapping[str, Path],
+    preregistration_path: Path,
     data_root: Path,
     strategy: str,
     liveness_config: Mapping[str, float],
@@ -1132,6 +1264,8 @@ def build_e2e_arm_summary(
             ``p0``) -> its scored ``.npz`` artifact.
         run_metadata_paths: Formal-run arm name -> its ``run_metadata.json``.
             ``structure_control_6a`` never has an entry.
+        preregistration_path: Binding registration whose sha must be present
+            in every one of the four formal metadata records.
         data_root: Directory containing the benchmark package.
         strategy: Benchmark split strategy.
         liveness_config: The registered ``min_residual_std_ratio`` /
@@ -1169,7 +1303,26 @@ def build_e2e_arm_summary(
         name: cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
         for name, path in run_metadata_paths.items()
     }
+    _enforce_e2e_formal_metadata(run_metadata)
+    bound_registration_sha256 = enforce_preregistration(
+        preregistration_path, list(run_metadata_paths.values())
+    )
     registration_sha256 = _e2e_registration_sha256(run_metadata)
+    if registration_sha256 != bound_registration_sha256:  # pragma: no cover - enforced above
+        raise RegistrationShaMismatch("formal e2e metadata disagree with the binding registration")
+
+    # Run validity is evaluated before any held-out assembled topology metric.
+    full_artifact = load_scores(arm_universe_paths["full"])
+    if full_artifact.meta.get("model_family") != "egostitch_e2e":
+        raise ValueError("full artifact: model_family must be 'egostitch_e2e'")
+    validate_artifact_precision(full_artifact, label="full artifact")
+    liveness = validate_dead_residual_within_checkpoint(
+        full_artifact,
+        min_residual_std_ratio=liveness_config["min_residual_std_ratio"],
+        max_spearman=liveness_config["max_spearman"],
+        max_topk_overlap=liveness_config["max_topk_overlap"],
+        topk_fraction=liveness_config["topk_fraction"],
+    )
 
     benchmark_root = data_root / _BENCHMARK_SUBDIR
     g_ref = load_test_graph(benchmark_root, strategy)
@@ -1187,6 +1340,9 @@ def build_e2e_arm_summary(
 
     artifacts: dict[str, ScoresArtifact] = {}
     rows: dict[str, dict[str, object]] = {}
+    clustering_samples: dict[
+        str, dict[int, list[tuple[NDArray[np.float64], NDArray[np.float64]]]]
+    ] = {}
     for name, path in arm_universe_paths.items():
         label = f"{name} ({path})"
         artifact = load_scores(path)
@@ -1215,6 +1371,7 @@ def build_e2e_arm_summary(
         non_self = artifact.u_idx != artifact.v_idx
         threshold = density_matched_threshold(probs[non_self], target_edges)
         graph = assemble_graph(pairs, probs, threshold=threshold, nodes=nodes)
+        clustering_samples[name] = _clustering_mmd_samples(graph, g_ref, buckets)
         assembled = assemble_and_evaluate(
             g_pred=graph,
             g_ref=g_ref,
@@ -1249,19 +1406,232 @@ def build_e2e_arm_summary(
             f"{control_checkpoint!r} != {full_checkpoint!r}"
         )
 
-    liveness = validate_dead_residual_within_checkpoint(
-        artifacts["full"],
-        min_residual_std_ratio=liveness_config["min_residual_std_ratio"],
-        max_spearman=liveness_config["max_spearman"],
-        max_topk_overlap=liveness_config["max_topk_overlap"],
-        topk_fraction=liveness_config["topk_fraction"],
+    lower_bound = paired_bootstrap_lower_bound(
+        lambda samples: _clustering_mmd_ratio(
+            cast(Sequence[object] | Mapping[object, Sequence[object]], samples), config
+        ),
+        clustering_samples["structure_control_6a"],
+        clustering_samples["full"],
+        n_boot=1000,
+        seed=0,
+        alpha=0.05,
     )
 
     return {
         "registration_sha256": registration_sha256,
         "arms": rows,
         "liveness": liveness,
+        "structure_control": {
+            "metric": "clustering_mmd_ratio",
+            "lower_bound": lower_bound,
+            "passed": lower_bound > 0.0,
+            "n_boot": 1000,
+            "seed": 0,
+            "alpha": 0.05,
+            "scope": "fixed-seed evaluator-stability evidence; not cross-seed or inferential",
+        },
     }
+
+
+_E2E_LIVENESS_CONFIG: dict[str, float] = {
+    "min_residual_std_ratio": 1e-5,
+    "max_spearman": 0.9999,
+    "max_topk_overlap": 0.9999,
+    "topk_fraction": 0.01,
+}
+
+
+def run_g5_e2e_stage1_pipeline(
+    *,
+    arm_universe_paths: Mapping[str, Path],
+    run_metadata_paths: Mapping[str, Path],
+    b0_universe_path: Path,
+    b0cal_results_path: Path,
+    preregistration_path: Path,
+    data_root: Path,
+    strategy: str,
+    output_dir: Path,
+    seed: int = 0,
+) -> dict[str, object]:
+    """Run the binding E2E five-arm G5 gate and write its verdict artifacts."""
+    prereg = cast(dict[str, object], json.loads(preregistration_path.read_text(encoding="utf-8")))
+    enforce_frozen_inputs(prereg, preregistration_path, b0_universe_path)
+    summary = build_e2e_arm_summary(
+        arm_universe_paths=arm_universe_paths,
+        run_metadata_paths=run_metadata_paths,
+        preregistration_path=preregistration_path,
+        data_root=data_root,
+        strategy=strategy,
+        liveness_config=_E2E_LIVENESS_CONFIG,
+        seed=seed,
+    )
+
+    benchmark_root = data_root / _BENCHMARK_SUBDIR
+    g_ref = load_test_graph(benchmark_root, strategy)
+    buckets = load_test_node_buckets(benchmark_root, strategy)
+    nodes = list(g_ref.nodes())
+    target_edges = strip_self_loops(g_ref).number_of_edges()
+    n_test_nodes = g_ref.number_of_nodes()
+    config = MMDConfig()
+    b0_universe = load_scores(b0_universe_path)
+    validate_universe_artifact(
+        b0_universe, strategy=strategy, n_test_nodes=n_test_nodes, label="b0 universe"
+    )
+    frozen = cast(dict[str, object], prereg["frozen_inputs"])
+    frozen_b0 = cast(dict[str, object], frozen["b0_candidate_scores"])
+    if b0_universe.meta.get("checkpoint_id") != frozen_b0.get("checkpoint_id"):
+        raise PreregistrationMismatch("frozen input B0 checkpoint_id mismatch")
+    b0_probs = b0_universe.probs()
+    b0_pairs = list(b0_universe.pairs())
+    b0_non_self = b0_universe.u_idx != b0_universe.v_idx
+    b0_threshold = density_matched_threshold(b0_probs[b0_non_self], target_edges)
+    b0_graph = assemble_graph(b0_pairs, b0_probs, threshold=b0_threshold, nodes=nodes)
+    b0_row = assemble_and_evaluate(
+        g_pred=b0_graph,
+        g_ref=g_ref,
+        buckets=buckets,
+        config=config,
+        seed=seed,
+        threshold=b0_threshold,
+    )
+    b0cal_payload = cast(
+        dict[str, object], json.loads(b0cal_results_path.read_text(encoding="utf-8"))
+    )
+    _validate_b0cal_lineage(b0cal_payload, b0_universe.meta, b0_row)
+    b0cal_assembled = cast(dict[str, dict[str, object]], b0cal_payload["assembled"])
+    comparators = {name: dict(b0cal_assembled[name]) for name in _COMPARATORS if name != "b0"}
+    comparators["b0"] = _assembled_row_to_dict(b0_row)
+    realized = cast(
+        dict[str, int],
+        cast(dict[str, object], b0cal_payload["metadata"])["realized_non_self_edges"],
+    )
+    realized = dict(realized)
+    realized["b0"] = int(strip_self_loops(b0_graph).number_of_edges())
+
+    full_artifact = load_scores(arm_universe_paths["full"])
+    full_probs = full_artifact.probs()
+    full_pairs = list(full_artifact.pairs())
+    full_matched: dict[str, dict[str, float]] = {}
+    for name in _COMPARATORS:
+        selected = select_matched_global_rd_rows(
+            full_probs,
+            full_artifact.u_idx,
+            full_artifact.v_idx,
+            target_edges=realized[name],
+            reference_edges=target_edges,
+        )
+        graph = assemble_matched_global_rd_graph(
+            full_pairs,
+            full_probs,
+            full_artifact.u_idx,
+            full_artifact.v_idx,
+            selected,
+            nodes,
+        )
+        report = evaluate_assembled_graph(graph, g_ref, buckets, config)
+        full_matched[name] = {
+            "bfs_macro_gs": report.graph_similarity,
+            "bfs_macro_rd": report.relative_density,
+        }
+
+    arms = cast(dict[str, dict[str, object]], summary["arms"])
+    full = arms["full"]
+    full_assembled = cast(dict[str, object], full["assembled"])
+    full_mmd = cast(dict[str, float], full_assembled["mmd_ratio"])
+    clustering_pass = all(
+        full_mmd["clustering"] < cast(dict[str, float], row["mmd_ratio"])["clustering"]
+        for row in comparators.values()
+    )
+    gs_pass = all(
+        full_matched[name]["bfs_macro_gs"] > cast(float, comparators[name]["graph_similarity"])
+        for name in _COMPARATORS
+    )
+    rd_pass = all(
+        full_matched[name]["bfs_macro_rd"] > cast(float, comparators[name]["relative_density"])
+        for name in _COMPARATORS
+    )
+    primary_pass = {
+        "clustering_mmd_ratio": clustering_pass,
+        "bfs_macro_gs": gs_pass,
+        "bfs_macro_rd": rd_pass,
+    }
+    b0_regimes = evaluate_regime_table(
+        labels=b0_universe.label,
+        probs=b0_probs,
+        u_idx=b0_universe.u_idx,
+        v_idx=b0_universe.v_idx,
+        node_ids=b0_universe.node_ids,
+        g_ref=g_ref,
+        store=None,
+        f0_cache=output_dir / "e2e_gate_f0_cache.pt",
+        seed=seed,
+    )
+    b0_auprc = b0_regimes["degree_corrected"]["ratio_1"].auprc
+    guards = {
+        "degree_mmd_non_regression": full_mmd["degree"] <= 1.10 * b0_row.mmd_ratio["degree"],
+        "matched_edge_auprc": cast(float, full["degree_corrected_auprc"]) >= b0_auprc - 0.02,
+    }
+    f_only = arms["b0_e2e_f_only"]
+    pair_topology = arms["pair_topology"]
+    f_only_clu = cast(dict[str, float], cast(dict[str, object], f_only["assembled"])["mmd_ratio"])[
+        "clustering"
+    ]
+    pair_topology_clu = cast(
+        dict[str, float], cast(dict[str, object], pair_topology["assembled"])["mmd_ratio"]
+    )["clustering"]
+    gain_full = f_only_clu - full_mmd["clustering"]
+    gain_pair_topology = f_only_clu - pair_topology_clu
+    primary_all = all(primary_pass.values())
+    pathway_applies = primary_all and gain_full > 0.0
+    pathway_pass = not pathway_applies or gain_pair_topology >= 0.25 * gain_full
+    structure_control = cast(dict[str, object], summary["structure_control"])
+    structure_pass = cast(bool, structure_control["passed"])
+    verdict = (
+        "pass"
+        if primary_all and all(guards.values()) and pathway_pass and structure_pass
+        else "cut"
+    )
+    payload: dict[str, object] = {
+        "metadata": {
+            "registration_sha256": summary["registration_sha256"],
+            "evaluation_mode": "single_seed_e2e_screening",
+            "single_seed_caveat": (
+                "Fixed-seed evaluator-stability evidence only; not significance or cross-seed "
+                "robustness."
+            ),
+        },
+        "arms": arms,
+        "comparators": comparators,
+        "full_matched": full_matched,
+        "primary_pass": primary_pass,
+        "guards": guards,
+        "liveness": summary["liveness"],
+        "pathway_attribution": {
+            "applies": pathway_applies,
+            "gain_full": gain_full,
+            "gain_pair_topology": gain_pair_topology,
+            "passed": pathway_pass,
+        },
+        "structure_control": structure_control,
+        "verdict": verdict,
+        "failure_reading": prereg["failure_reading"] if verdict == "cut" else None,
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "g5_e2e_stage1_results.json").write_text(
+        json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    (output_dir / "g5_e2e_stage1_tables.md").write_text(
+        "# G5 E2E Stage-1 gate\n\n"
+        f"**Verdict: `{verdict}`**\n\n"
+        "Fixed-seed evaluator-stability evidence only; not significance or cross-seed "
+        "robustness.\n\n"
+        f"- Primary pass: `{primary_pass}`\n"
+        f"- Guards: `{guards}`\n"
+        f"- Pathway attribution: `{payload['pathway_attribution']}`\n"
+        f"- Structure control: `{structure_control}`\n",
+        encoding="utf-8",
+    )
+    return payload
 
 
 # --------------------------------------------------------------------------- markdown tables
@@ -1361,33 +1731,34 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m src.experiments.g5_stage1",
         description="Pre-registered G5 Stage-1 gate evaluation.",
     )
+    parser.add_argument("--mode", choices=("frozen_s0", "e2e"), default="frozen_s0")
     parser.add_argument(
         "--egostitch-universe",
         type=Path,
         nargs="+",
-        required=True,
+        default=(),
         help="one candidate-scores .npz per training seed",
     )
     parser.add_argument(
         "--run-metadata",
         type=Path,
         nargs="+",
-        required=True,
+        default=(),
         help="the matching run_metadata.json per seed (prereg binding)",
     )
     parser.add_argument(
         "--s0-universe",
         type=Path,
         nargs="+",
-        required=True,
+        default=(),
         help="matching fp32 frozen-B0 candidate artifact per EgoStitch seed",
     )
-    parser.add_argument("--b0-universe", type=Path, required=True)
-    parser.add_argument("--b0cal-results", type=Path, required=True)
-    parser.add_argument("--preregistration", type=Path, required=True)
+    parser.add_argument("--b0-universe", type=Path)
+    parser.add_argument("--b0cal-results", type=Path)
+    parser.add_argument("--preregistration", type=Path)
     parser.add_argument("--data-root", type=Path, default=Path("data"))
     parser.add_argument("--strategy", default="breadth_first")
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--fidelity-report",
@@ -1396,6 +1767,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=(),
         help=("required per-seed fidelity report for the binding Stage-1 screen"),
     )
+    parser.add_argument("--full-universe", type=Path)
+    parser.add_argument("--control-universe", type=Path)
+    parser.add_argument("--fonly-universe", type=Path)
+    parser.add_argument("--pt-universe", type=Path)
+    parser.add_argument("--p0-universe", type=Path)
     parser.add_argument(
         "--cost-report",
         type=Path,
@@ -1417,13 +1793,60 @@ def main(argv: Sequence[str] | None = None) -> None:
     """
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.mode == "e2e":
+        arm_paths = {
+            "full": args.full_universe,
+            "structure_control_6a": args.control_universe,
+            "b0_e2e_f_only": args.fonly_universe,
+            "pair_topology": args.pt_universe,
+            "p0": args.p0_universe,
+        }
+        required = {
+            **arm_paths,
+            "b0_universe": args.b0_universe,
+            "b0cal_results": args.b0cal_results,
+            "preregistration": args.preregistration,
+            "output_dir": args.output_dir,
+        }
+        missing = [name for name, path in required.items() if path is None]
+        if missing:
+            parser.error(f"--mode e2e requires: {', '.join(missing)}")
+        if len(args.run_metadata) != 4:
+            parser.error("--mode e2e requires exactly four --run-metadata paths")
+        for path in [*cast(dict[str, Path], arm_paths).values(), *args.run_metadata]:
+            if not path.exists():
+                parser.error(f"input not found: {path}")
+        run_g5_e2e_stage1_pipeline(
+            arm_universe_paths=cast(dict[str, Path], arm_paths),
+            run_metadata_paths=dict(zip(_E2E_FORMAL_ARMS, args.run_metadata, strict=True)),
+            b0_universe_path=cast(Path, args.b0_universe),
+            b0cal_results_path=cast(Path, args.b0cal_results),
+            preregistration_path=cast(Path, args.preregistration),
+            data_root=args.data_root,
+            strategy=args.strategy,
+            output_dir=cast(Path, args.output_dir),
+            seed=args.seed,
+        )
+        return
+    frozen_required = {
+        "egostitch_universe": args.egostitch_universe,
+        "run_metadata": args.run_metadata,
+        "s0_universe": args.s0_universe,
+        "b0_universe": args.b0_universe,
+        "b0cal_results": args.b0cal_results,
+        "preregistration": args.preregistration,
+        "output_dir": args.output_dir,
+    }
+    missing_frozen = [name for name, value in frozen_required.items() if not value]
+    if missing_frozen:
+        parser.error(f"--mode frozen_s0 requires: {', '.join(missing_frozen)}")
     for path in [
         *args.egostitch_universe,
         *args.run_metadata,
         *args.s0_universe,
-        args.b0_universe,
-        args.b0cal_results,
-        args.preregistration,
+        cast(Path, args.b0_universe),
+        cast(Path, args.b0cal_results),
+        cast(Path, args.preregistration),
         *args.fidelity_report,
     ]:
         if not path.exists():
@@ -1435,12 +1858,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         egostitch_universe_paths=args.egostitch_universe,
         s0_universe_paths=args.s0_universe,
         run_metadata_paths=args.run_metadata,
-        b0_universe_path=args.b0_universe,
-        b0cal_results_path=args.b0cal_results,
-        preregistration_path=args.preregistration,
+        b0_universe_path=cast(Path, args.b0_universe),
+        b0cal_results_path=cast(Path, args.b0cal_results),
+        preregistration_path=cast(Path, args.preregistration),
         data_root=args.data_root,
         strategy=args.strategy,
-        output_dir=args.output_dir,
+        output_dir=cast(Path, args.output_dir),
         seed=args.seed,
         fidelity_report_paths=args.fidelity_report,
         cost_report_path=args.cost_report,
@@ -1455,13 +1878,17 @@ if __name__ == "__main__":
 # Referenced for reuse by tests and companion tooling.
 __all__ = [
     "CriterionResult",
+    "PreregistrationNotBinding",
     "PreregistrationMismatch",
+    "RegistrationShaMismatch",
     "build_e2e_arm_summary",
     "clustering_criterion",
     "enforce_preregistration",
     "holm_step_down",
     "matched_rd_criterion",
+    "paired_bootstrap_lower_bound",
     "render_tables_markdown",
     "run_g5_stage1_pipeline",
+    "run_g5_e2e_stage1_pipeline",
     "validate_dead_residual_within_checkpoint",
 ]
