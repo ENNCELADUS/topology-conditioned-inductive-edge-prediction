@@ -703,6 +703,15 @@ def _sha256_file(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def required_pack_paths(cfg: EgoConfig, pack_dir: Path) -> tuple[Path, ...]:
+    """Return every cache directory the generic pack stage must supervise."""
+    if cfg.model.family != _EGOSTITCH_E2E_FAMILY:
+        return (pack_dir,)
+    if cfg.data.pack_dir is None:
+        raise ValueError("data.pack_dir is required when model.family == 'egostitch_e2e'")
+    return (pack_dir, cfg.data.pack_dir)
+
+
 def prepare_pack(
     cfg: EgoConfig, pack_dir: Path, *, cold_cache: bool, temp_prefix: str = ""
 ) -> dict[str, object]:
@@ -726,7 +735,9 @@ def prepare_pack(
     Raises:
         ValueError: On warm-cache validation drift.
     """
-    del temp_prefix
+    # Call-time import preserves the pack builder/validator monkeypatch seam.
+    from src.data import packed_features
+
     # Family `egostitch_e2e` (spec Sec 13.18): `cfg.model.config` validates
     # against `E2EConfig`, not `EgoStitchConfig` -- it sizes only the pair
     # trunk/conditioning pathways. The internal Stage-1 generator this pack
@@ -741,7 +752,10 @@ def prepare_pack(
         model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
         n_ground = model_cfg.n_ground
     manifest_path = pack_dir / _PACK_MANIFEST_FILENAME
-    if cold_cache:
+    f0_cold = not pack_dir.exists()
+    if not cold_cache and f0_cold:
+        raise ValueError(f"warm F0/grounding pack is missing: {pack_dir}")
+    if f0_cold:
         pack_dir.mkdir(parents=True, exist_ok=True)
         store = FeatureStore(cfg.data.root / _FEATURES_SUBDIR)
         benchmark = _load_benchmark_for(cfg)
@@ -780,9 +794,43 @@ def prepare_pack(
             raise ValueError("pack manifest strategy does not match the config")
         if manifest.get("n_ground") != n_ground:
             raise ValueError("pack manifest n_ground does not match the model config")
+    f0_identity = _sha256_file(manifest_path)
+    packs: dict[str, object] = {
+        "f0_grounding": {
+            "path": str(pack_dir),
+            "manifest": manifest,
+            "identity_sha256": f0_identity,
+            "cold": f0_cold,
+        }
+    }
+    if is_e2e:
+        if cfg.data.pack_dir is None:
+            raise ValueError("data.pack_dir is required when model.family == 'egostitch_e2e'")
+        raw_pack_dir = cfg.data.pack_dir
+        raw_cold = not raw_pack_dir.exists()
+        if not cold_cache and raw_cold:
+            raise ValueError(f"warm raw-token pack is missing: {raw_pack_dir}")
+        source_root = cfg.data.root / _FEATURES_SUBDIR
+        if raw_cold:
+            raw_manifest = packed_features.build_packed_features(
+                source_root,
+                raw_pack_dir,
+                workers=cfg.runtime.pack_workers if cfg.runtime is not None else 1,
+                temp_prefix=temp_prefix or None,
+            )
+        else:
+            raw_manifest = packed_features.validate_packed_manifest(raw_pack_dir, source_root)
+        raw_identity = packed_features.sha256_file(raw_pack_dir / "manifest.json")
+        packs["raw_tokens"] = {
+            "path": str(raw_pack_dir),
+            "manifest": asdict(raw_manifest),
+            "identity_sha256": raw_identity,
+            "cold": raw_cold,
+        }
     return {
         "pack_manifest": manifest,
-        "pack_identity_sha256": _sha256_file(manifest_path),
+        "pack_identity_sha256": f0_identity,
+        "packs": packs,
     }
 
 
@@ -1853,6 +1901,13 @@ def _e2e_validation_batch(
     return cast(dict[str, torch.Tensor], _to_device(batch, device))
 
 
+def _e2e_validation_slice_rows(n_val: int) -> tuple[int, ...]:
+    """Frozen global rows used by the E2E checkpoint-selection tie-break."""
+    if n_val <= 0:
+        return ()
+    return tuple(range(max(1, math.ceil(0.01 * n_val))))
+
+
 def _validate_epoch(
     model: EgoStitchStage1 | EgoStitchE2E,
     data: EgoStitchData,
@@ -1891,7 +1946,6 @@ def _validate_epoch(
         shard_rows.append(shard_rows[0] if shard_rows else 0)
 
     values_out: list[torch.Tensor] = []
-    first_chunk_batch: dict[str, torch.Tensor] | None = None
     with torch.no_grad():
         for start in range(0, shard_len, edge_batch):
             chunk = shard_rows[start : start + edge_batch]
@@ -1923,8 +1977,6 @@ def _validate_epoch(
                 with accelerator.autocast():
                     full_logits = model(e2e_batch, masks=masks)["logits"]
                 values_out.append(full_logits.float().unsqueeze(-1))
-                if start == 0:
-                    first_chunk_batch = e2e_batch
                 continue
 
             idx_i = torch.tensor([data.node_index[u] for u, _, _ in rows], dtype=torch.long)
@@ -1995,12 +2047,24 @@ def _validate_epoch(
     probs = 1.0 / (1.0 + np.exp(-logits_np))
 
     if isinstance(model, EgoStitchE2E):
-        assert first_chunk_batch is not None
         if model.cfg.permanent_null == "none":
-            with accelerator.autocast():
-                topology_summary = _e2e_topology_delta_std(model, first_chunk_batch)
-                with torch.no_grad():
-                    first_decomposed = model.decompose(first_chunk_batch)
+            assert token_table is not None and token_node_index is not None
+            fixed_rows = [
+                (*data.val_pairs[index], int(data.val_labels[index]))
+                for index in _e2e_validation_slice_rows(n_val)
+            ]
+            fixed_batch = _e2e_validation_batch(
+                data,
+                token_table,
+                token_node_index,
+                fixed_rows,
+                accelerator.device,
+            )
+            model.eval()
+            with accelerator.autocast(), torch.no_grad():
+                topology_summary = _e2e_topology_delta_std(model, fixed_batch)
+                first_decomposed = model.decompose(fixed_batch)
+            model.train()
             f_logit_std = float(np.std(first_decomposed["f_logit"].detach().float().cpu().numpy()))
             fidelity = {
                 **topology_summary,
@@ -2198,8 +2262,17 @@ def train_egostitch_ddp_loop(
                 sync_context = wrapped.no_sync() if hasattr(wrapped, "no_sync") else nullcontext()
                 with sync_context:
                     probe_out = wrapped(fixed_gradient_probe)
+                    probe_model = accelerator.unwrap_model(wrapped).model
+                    local_submodule_rms = (
+                        _e2e_submodule_gradient_rms(
+                            probe_model,
+                            cast(dict[str, torch.Tensor], probe_out["families"])["edge"],
+                        )
+                        if isinstance(probe_model, EgoStitchE2E)
+                        else {}
+                    )
                     local_norms = _family_gradient_norms(
-                        accelerator.unwrap_model(wrapped).model,
+                        probe_model,
                         cast(dict[str, torch.Tensor], probe_out["families"]),
                     )
                 names = ("edge", "recon", "real", "ssl")
@@ -2214,6 +2287,22 @@ def train_egostitch_ddp_loop(
                     name: float(value)
                     for name, value in zip(names, aggregate.tolist(), strict=True)
                 }
+                submodule_rms: dict[str, float] = {}
+                if local_submodule_rms:
+                    rms_names = ("grad_rms_trunk", "grad_rms_ste", "grad_rms_content")
+                    local_rms_vector = torch.tensor(
+                        [local_submodule_rms[name] for name in rms_names],
+                        device=accelerator.device,
+                        dtype=torch.float64,
+                    )
+                    gathered_rms = accelerator.gather(local_rms_vector).reshape(-1, len(rms_names))
+                    aggregate_rms = (
+                        torch.sqrt(torch.mean(gathered_rms.square(), dim=0)).cpu().numpy()
+                    )
+                    submodule_rms = {
+                        name: float(value)
+                        for name, value in zip(rms_names, aggregate_rms.tolist(), strict=True)
+                    }
                 activated_now = imbalance_monitor.update(global_step, norms)
                 if activated_now:
                     accelerator.unwrap_model(wrapped).activate_kendall()
@@ -2223,6 +2312,7 @@ def train_egostitch_ddp_loop(
                     "imbalance_streak_steps": imbalance_monitor.streak_steps,
                     "kendall_activated_now": activated_now,
                     "kendall_active": imbalance_monitor.activated_step is not None,
+                    **submodule_rms,
                 }
                 # Family egostitch_e2e (spec Sec 13.17 re-registration): the
                 # gate-tanh readouts are pure parameter reads already computed

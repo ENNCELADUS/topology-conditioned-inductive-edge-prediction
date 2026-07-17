@@ -1,9 +1,11 @@
 import hashlib
+import importlib
 import json
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from pathlib import Path
 from typing import cast
 
@@ -589,6 +591,92 @@ def _make_fake_runner(
 
 
 class TestRunPipelineSuccess:
+    def test_generic_pack_stage_builds_and_reuses_all_worker_pack_paths(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A dual-pack worker gets one supervised cold/warm orchestration boundary."""
+        from src import train_b0
+
+        data_root = tmp_path / "data"
+        source_root = _write_feature_root(
+            data_root / "features" / "frozen_node_features_1024", {"node_a": (3, 4)}
+        )
+        primary_pack = tmp_path / "f0-pack"
+        raw_pack = data_root / "raw-token-pack"
+        output_dir = tmp_path / "out"
+        config_path = tmp_path / "cfg.yaml"
+        _write_pipeline_config(
+            config_path,
+            _pipeline_config_dict(
+                data_root=data_root, pack_dir=primary_pack, output_dir=output_dir
+            ),
+        )
+
+        def required_pack_paths(_cfg: object, pack_dir: Path) -> tuple[Path, Path]:
+            return pack_dir, raw_pack
+
+        def prepare_pack(
+            cfg: object, pack_dir: Path, *, cold_cache: bool, temp_prefix: str
+        ) -> dict[str, object]:
+            primary_cold = not pack_dir.exists()
+            primary = train_b0.prepare_pack(
+                cast(train_b0.Config, cfg),
+                pack_dir,
+                cold_cache=primary_cold,
+                temp_prefix=temp_prefix,
+            )
+            raw_cold = not raw_pack.exists()
+            if raw_cold:
+                raw_manifest = packed_features.build_packed_features(
+                    source_root, raw_pack, workers=1, temp_prefix=temp_prefix
+                )
+            else:
+                raw_manifest = packed_features.validate_packed_manifest(raw_pack, source_root)
+            return {
+                **primary,
+                "packs": {
+                    "primary": {"cold": primary_cold},
+                    "raw_tokens": {
+                        "cold": raw_cold,
+                        "manifest": asdict(raw_manifest),
+                        "identity_sha256": packed_features.sha256_file(raw_pack / "manifest.json"),
+                    },
+                },
+            }
+
+        class DualWorker:
+            pass
+
+        DualWorker.load_config = staticmethod(train_b0.load_config)  # type: ignore[attr-defined]
+        DualWorker.prepare_pack = staticmethod(prepare_pack)  # type: ignore[attr-defined]
+        DualWorker.required_pack_paths = staticmethod(  # type: ignore[attr-defined]
+            required_pack_paths
+        )
+
+        original_import = importlib.import_module
+        monkeypatch.setattr(
+            importlib,
+            "import_module",
+            lambda name: DualWorker if name == "fake.dual_worker" else original_import(name),
+        )
+        args = PipelineArgs(
+            config=config_path,
+            pack_dir=None,
+            output_dir=None,
+            worker_module="fake.dual_worker",
+        )
+
+        assert run_pipeline(args, command_runner=_make_fake_runner()) == 0
+        cold_profile = json.loads((output_dir / "profile.json").read_text())
+        assert cold_profile["cold_cache"] is True
+        assert cold_profile["pack_evidence"]["raw_tokens"]["cold"] is True
+        assert (raw_pack / "manifest.json").is_file()
+
+        assert run_pipeline(args, command_runner=_make_fake_runner()) == 0
+        warm_profile = json.loads((output_dir / "profile.json").read_text())
+        assert warm_profile["cold_cache"] is False
+        assert warm_profile["pack_evidence"]["raw_tokens"]["cold"] is False
+
     def test_bounded_debug_pipeline_completes_in_debug_root_only(self, tmp_path: Path) -> None:
         data_root = tmp_path / "data"
         _write_feature_root(

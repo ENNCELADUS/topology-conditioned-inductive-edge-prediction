@@ -826,17 +826,24 @@ def run_pipeline(
     stage_seconds: dict[str, float] = {}
 
     # --- pack: build (cold) or strictly validate (warm) within the pack budget ---
-    cold_cache = not pack_dir.exists()
+    required_pack_paths = getattr(worker, "required_pack_paths", None)
+    pack_paths = (
+        tuple(required_pack_paths(cfg, pack_dir)) if callable(required_pack_paths) else (pack_dir,)
+    )
+    if not pack_paths or any(not isinstance(path, Path) for path in pack_paths):
+        return fail(stage="pack", message="worker returned invalid required pack paths")
+    cold_cache = any(not path.exists() for path in pack_paths)
     pack_started = time.monotonic()
     pack_validation_path = staging_dir / "pack_validation.json"
     pack_temp_prefix = f".{pack_dir.name}.{staging_dir.name}.pack-"
 
     def cleanup_owned_pack_temps() -> None:
-        if not pack_dir.parent.exists():
-            return
-        for path in pack_dir.parent.glob(f"{pack_temp_prefix}*"):
-            if path.is_dir():
-                shutil.rmtree(path, ignore_errors=True)
+        for parent in {path.parent for path in pack_paths}:
+            if not parent.exists():
+                continue
+            for path in parent.glob(f"{pack_temp_prefix}*"):
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
 
     def pack_operation() -> None:
         payload = worker.prepare_pack(
@@ -868,6 +875,7 @@ def run_pipeline(
     except Exception as error:
         return fail(stage="pack", message=f"pack validation result failed: {error}")
     pack_validation_path.unlink(missing_ok=True)
+    pack_evidence = cast(dict[str, object], pack_validation.get("packs", {}))
 
     profile_path = staging_dir / "profile.json"
     probe_results: list[ProbeResult] = []
@@ -886,6 +894,7 @@ def run_pipeline(
             "projected_total_seconds": projected_total_seconds,
             "pack_manifest": pack_manifest_payload,
             "pack_identity_sha256": pack_identity_sha256,
+            "pack_evidence": pack_evidence,
             "world_size": runtime.world_size,
         }
         if epoch_probe is not None:

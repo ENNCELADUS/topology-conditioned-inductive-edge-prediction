@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -141,6 +142,16 @@ def test_ddp_accelerator_detects_conditionally_unused_parameters() -> None:
     assert handler.broadcast_buffers is False
     assert handler.find_unused_parameters is True
     assert handler.gradient_as_bucket_view is True
+
+
+@pytest.mark.parametrize(
+    ("n_val", "expected"),
+    [(0, ()), (1, (0,)), (99, (0,)), (100, (0,)), (101, (0, 1)), (250, (0, 1, 2))],
+)
+def test_e2e_validation_slice_uses_fixed_global_manifest_rows(
+    n_val: int, expected: tuple[int, ...]
+) -> None:
+    assert te._e2e_validation_slice_rows(n_val) == expected
 
 
 class TestLoadConfig:
@@ -905,6 +916,10 @@ class TestCompositeStepE2E:
         torch.manual_seed(0)
         batch, model = self._batch_and_model(tmp_path)
         composite = te._CompositeStep(model, world_size=1)
+        topo_gate, cont_gate = self._gates(model)
+        with torch.no_grad():
+            topo_gate.gate.fill_(0.25)
+            cont_gate.gate.fill_(0.25)
 
         with self._bf16_autocast():
             out = composite(self._payload(batch, joint_weight=1.0, collect_diagnostics=True))
@@ -923,6 +938,7 @@ class TestCompositeStepE2E:
         for key in ("grad_rms_trunk", "grad_rms_ste", "grad_rms_content"):
             assert key in metrics_row
             assert math.isfinite(cast(float, metrics_row[key]))
+            assert cast(float, metrics_row[key]) > 0.0
 
         with self._bf16_autocast():
             metrics_row.update(te._e2e_topology_delta_std(model, te._e2e_edge_view(batch.edge)))
@@ -1219,11 +1235,18 @@ class TestPrepareAndAssembleE2E:
 
     def _e2e_cfg(self, tmp_path: Path) -> te.EgoConfig:
         cfg = _toy_cfg(tmp_path)
-        return replace(cfg, model=ModelConfig(family="egostitch_e2e", config={}))
+        return replace(
+            cfg,
+            model=ModelConfig(family="egostitch_e2e", config={}),
+            data=replace(cfg.data, pack_dir=tmp_path / "raw-token-pack"),
+        )
 
     def test_prepare_pack_uses_generator_pinned_n_ground(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        import src.data.packed_features as packed_features
+
+        monkeypatch.setattr(packed_features, "ProcessPoolExecutor", ThreadPoolExecutor)
         _write_e2e_feature_root(tmp_path, _E2E_PIPELINE_NODES)
         benchmark = _e2e_pipeline_benchmark()
         monkeypatch.setattr(te, "_load_benchmark_for", lambda cfg: benchmark)
@@ -1234,11 +1257,26 @@ class TestPrepareAndAssembleE2E:
         manifest = cast(dict[str, object], payload["pack_manifest"])
         assert manifest["family"] == "egostitch_e2e"
         assert manifest["n_ground"] == EgoStitchConfig().n_ground
+        packs = cast(dict[str, dict[str, object]], payload["packs"])
+        assert set(packs) == {"f0_grounding", "raw_tokens"}
+        assert packs["f0_grounding"]["cold"] is True
+        assert packs["raw_tokens"]["cold"] is True
+        assert (cast(Path, e2e_cfg.data.pack_dir) / "manifest.json").is_file()
+        assert te.required_pack_paths(e2e_cfg, pack_dir) == (
+            pack_dir,
+            e2e_cfg.data.pack_dir,
+        )
 
         # Warm-path re-validation must agree with the same pinned n_ground.
         rebuilt = te.prepare_pack(e2e_cfg, pack_dir, cold_cache=False)
         assert cast(dict[str, object], rebuilt["pack_manifest"])["n_ground"] == (
             EgoStitchConfig().n_ground
+        )
+        rebuilt_packs = cast(dict[str, dict[str, object]], rebuilt["packs"])
+        assert rebuilt_packs["f0_grounding"]["cold"] is False
+        assert rebuilt_packs["raw_tokens"]["cold"] is False
+        assert (
+            rebuilt_packs["raw_tokens"]["identity_sha256"] == packs["raw_tokens"]["identity_sha256"]
         )
 
     def test_prepare_pack_rejects_stage1_only_config_keys(
