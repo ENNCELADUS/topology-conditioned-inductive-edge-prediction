@@ -1142,7 +1142,7 @@ class TestTrainLoopE2E:
             assert bool((~seen[0].cont).all()) == (permanent_null in ("all_head", "content_head"))
             assert validation.fidelity["selection_tiebreak"] == 0.0
 
-    def test_optimizer_parameter_set_equals_e2e_trainable_parameters(
+    def test_optimizer_includes_e2e_trainables_and_kendall_parameters(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         e2e_cfg, data, model, accelerator = self._e2e_setup(tmp_path)
@@ -1160,11 +1160,38 @@ class TestTrainLoopE2E:
                 model, e2e_cfg, data, accelerator, node_batch=e2e_cfg.data.node_batch
             )
         expected_ids = {id(p) for p in te._e2e_trainable_parameters(model)}
-        assert captured_param_ids == expected_ids
+        assert expected_ids <= captured_param_ids
+        assert len(captured_param_ids - expected_ids) == 4
         decision_ids = {
             name: id(parameter) for name, parameter in model.generator.decision.named_parameters()
         }
         assert captured_param_ids & set(decision_ids.values()) == {decision_ids["tau_kappa_raw"]}
+
+    def test_kendall_weights_update_after_imbalance_activation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        e2e_cfg, data, model, accelerator = self._e2e_setup(tmp_path)
+        e2e_cfg = replace(e2e_cfg, optim=replace(e2e_cfg.optim, warmstart_fraction=0.0))
+
+        def _activate_once(
+            monitor: te._GradientImbalanceMonitor, step: int, norms: dict[str, float]
+        ) -> bool:
+            del norms
+            if monitor.activated_step is not None:
+                return False
+            monitor.activated_step = step
+            return True
+
+        monkeypatch.setattr(te._GradientImbalanceMonitor, "update", _activate_once)
+        with self._bf16_autocast():
+            result = te.train_egostitch_ddp_loop(
+                model, e2e_cfg, data, accelerator, node_batch=e2e_cfg.data.node_batch
+            )
+
+        assert result.kendall_state["active"] is True
+        log_variances = cast(dict[str, float], result.kendall_state["log_variances"])
+        assert set(log_variances) == {"edge", "recon", "real", "ssl"}
+        assert any(abs(value) > 0.0 for value in log_variances.values())
 
 
 class TestPreparePack:

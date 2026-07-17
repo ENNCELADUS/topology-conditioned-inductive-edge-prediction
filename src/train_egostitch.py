@@ -1811,6 +1811,16 @@ def _e2e_trainable_parameters(model: EgoStitchE2E) -> list[torch.nn.Parameter]:
     ]
 
 
+def _e2e_optimizer_parameters(
+    model: EgoStitchE2E, composite: _CompositeStep
+) -> list[torch.nn.Parameter]:
+    """Return live E2E model parameters plus the registered Kendall weights."""
+    return [
+        *_e2e_trainable_parameters(model),
+        *composite.kendall_log_vars.parameters(),
+    ]
+
+
 @dataclass
 class _GradientImbalanceMonitor:
     """Track persistence of a registered high-family gradient imbalance."""
@@ -2139,8 +2149,9 @@ def train_egostitch_ddp_loop(
 
     Family `egostitch_e2e` (design rev 3): `model` is an `EgoStitchE2E`
     instead of a frozen-s0 `EgoStitchStage1`. The optimizer is built over
-    `_e2e_trainable_parameters(model)` (excludes the dead, never-called
-    `DecisionHead`); there is no ``set_density_ratio``/two-pass calibration
+    `_e2e_optimizer_parameters(model, composite)` (excludes the dead,
+    never-called `DecisionHead` while retaining the registered Kendall
+    log-variance weights); there is no ``set_density_ratio``/two-pass calibration
     for this family (that mechanism belongs to `generator.decision`, itself
     unused). Everything else -- Accelerate wiring, the warm-start/joint-
     weight curriculum, the budget guard, and the Sec 13.17 gradient-probe
@@ -2169,7 +2180,7 @@ def train_egostitch_ddp_loop(
 
     composite = _CompositeStep(model, world)
     if isinstance(model, EgoStitchE2E):
-        optimizer_parameters: list[torch.nn.Parameter] = _e2e_trainable_parameters(model)
+        optimizer_parameters: list[torch.nn.Parameter] = _e2e_optimizer_parameters(model, composite)
     else:
         optimizer_parameters = list(composite.parameters())
     optimizer = torch.optim.AdamW(
@@ -2675,7 +2686,7 @@ def _run_probe_mode(
     world = accelerator.num_processes
     composite = _CompositeStep(model, world)
     if isinstance(model, EgoStitchE2E):
-        optimizer_parameters: list[torch.nn.Parameter] = _e2e_trainable_parameters(model)
+        optimizer_parameters: list[torch.nn.Parameter] = _e2e_optimizer_parameters(model, composite)
     else:
         optimizer_parameters = list(composite.parameters())
     optimizer = torch.optim.AdamW(
