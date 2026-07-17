@@ -589,6 +589,42 @@ def _make_fake_runner(
 
 
 class TestRunPipelineSuccess:
+    def test_bounded_debug_pipeline_completes_in_debug_root_only(self, tmp_path: Path) -> None:
+        data_root = tmp_path / "data"
+        _write_feature_root(
+            data_root / "features" / "frozen_node_features_1024", {"node_a": (3, 4)}
+        )
+        formal_output = tmp_path / "out"
+        config_path = tmp_path / "cfg.yaml"
+        _write_pipeline_config(
+            config_path,
+            _pipeline_config_dict(
+                data_root=data_root, pack_dir=tmp_path / "pack", output_dir=formal_output
+            ),
+        )
+        profile = _valid_worker_profile()
+        profile["epochs_completed"] = 1
+        profile["validations_completed"] = 1
+        profile["per_epoch"] = cast(list[object], profile["per_epoch"])[:1]
+
+        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            result = _make_fake_runner(train_runtime_profile=profile)(command, timeout)
+            if _arg_value(command, "--ddp-mode") == "train":
+                out = Path(_arg_value(command, "--output-dir"))
+                best = torch.load(out / "best.pt", weights_only=False)
+                torch.save(best, out / "last.pt")
+                (out / "metrics.jsonl").write_text('{"epoch": 1, "val_auroc": 0.7}\n')
+            return result
+
+        assert (
+            run_pipeline(PipelineArgs(config_path, None, None, max_steps=1), command_runner=runner)
+            == 0
+        )
+        debug_output = tmp_path / "out_debug"
+        assert (debug_output / "debug_complete.json").is_file()
+        assert json.loads((debug_output / "profile.json").read_text())["run_kind"] == "debug"
+        assert not formal_output.exists()
+
     def test_cold_cache_full_run_writes_merged_profile_and_manifest(self, tmp_path: Path) -> None:
         data_root = tmp_path / "data"
         _write_feature_root(

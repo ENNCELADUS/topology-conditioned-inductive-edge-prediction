@@ -543,7 +543,12 @@ def _positive_int(value: object, *, field: str) -> int:
 
 
 def _validate_worker_profile(
-    data: object, *, epochs: int, world_size: int, memory_limit_gib: float
+    data: object,
+    *,
+    epochs: int,
+    world_size: int,
+    memory_limit_gib: float,
+    allow_partial: bool = False,
 ) -> dict[str, object]:
     """Validate the formal worker's complete runtime-profile contract."""
     if not isinstance(data, dict):
@@ -565,7 +570,7 @@ def _validate_worker_profile(
         value = data[key]
         if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(f"{key} must be an integer")
-        if value != epochs:
+        if value != epochs and not (allow_partial and 1 <= value <= epochs):
             raise ValueError(f"{key} must equal configured epochs ({epochs})")
     for key in ("training_coverage_exact", "validation_coverage_exact"):
         if data[key] is not True:
@@ -586,8 +591,9 @@ def _validate_worker_profile(
     if wait_fraction > 0.05:
         raise ValueError("steady_state_data_wait_fraction exceeds 0.05")
     per_epoch = data["per_epoch"]
-    if not isinstance(per_epoch, list) or len(per_epoch) != epochs:
-        raise ValueError(f"per_epoch must contain exactly {epochs} entries")
+    expected_epochs = cast(int, data["epochs_completed"])
+    if not isinstance(per_epoch, list) or len(per_epoch) != expected_epochs:
+        raise ValueError(f"per_epoch must contain exactly {expected_epochs} entries")
     duration_fields = (
         "wall_seconds",
         "data_wait_seconds",
@@ -612,7 +618,7 @@ def _validate_worker_profile(
     counterfactual = data.get("counterfactual_stop_epoch")
     if counterfactual is not None:
         stop_epoch = _positive_int(counterfactual, field="counterfactual_stop_epoch")
-        if stop_epoch > epochs:
+        if stop_epoch > expected_epochs:
             raise ValueError("counterfactual_stop_epoch exceeds configured epochs")
     per_rank = data.get("per_rank")
     if per_rank is not None:
@@ -652,7 +658,9 @@ _PUBLISHED_FILENAMES = (
 )
 
 
-def _validate_staged_artifacts(staging_dir: Path, *, epochs: int, model_family: str) -> None:
+def _validate_staged_artifacts(
+    staging_dir: Path, *, epochs: int, model_family: str, allow_partial: bool = False
+) -> None:
     """Load and validate every formal worker artifact before hashing it."""
     import torch
 
@@ -786,13 +794,22 @@ def run_pipeline(
         cfg = replace(cfg, seed=args.seed)
     if args.output_dir is not None:
         cfg = replace(cfg, output_dir=args.output_dir)
+    if args.max_steps is not None and args.max_steps <= 0:
+        raise ValueError("--max-steps must be positive")
     if cfg.runtime is None:
         raise ValueError("the E2 pipeline requires a config with a 'runtime:' section")
     runtime = cfg.runtime
     if runtime.world_size == 0:
         runtime = replace(runtime, world_size=detect_visible_gpu_count())
         cfg = replace(cfg, runtime=runtime)
-    output_dir = cfg.output_dir
+    debug_run = args.max_steps is not None
+    formal_output_dir = cfg.output_dir
+    output_dir = (
+        formal_output_dir.with_name(f"{formal_output_dir.name}_debug")
+        if debug_run
+        else formal_output_dir
+    )
+    cfg = replace(cfg, output_dir=output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     staging_dir = Path(tempfile.mkdtemp(prefix=".e2-run-", dir=output_dir))
     pack_dir = args.pack_dir if args.pack_dir is not None else runtime.pack_dir
@@ -912,7 +929,7 @@ def run_pipeline(
             config_path=args.config,
             mode="probe",
             pack_dir=pack_dir,
-            output_dir=staging_dir,
+            output_dir=output_dir if debug_run else staging_dir,
             token_budget=token_budget,
             profile_output=profile_output,
             world_size=runtime.world_size,
@@ -1001,7 +1018,7 @@ def run_pipeline(
         config_path=args.config,
         mode="epoch-probe",
         pack_dir=pack_dir,
-        output_dir=staging_dir,
+        output_dir=output_dir if debug_run else staging_dir,
         token_budget=selected.token_budget,
         profile_output=epoch_profile_output,
         world_size=runtime.world_size,
@@ -1045,7 +1062,7 @@ def run_pipeline(
         pack_seconds=stage_seconds["pack"],
         setup_probe_seconds=stage_seconds["setup_probe"],
         epoch_seconds=epoch_seconds,
-        epochs=cfg.optim.epochs,
+        epochs=1 if debug_run else cfg.optim.epochs,
         artifact_seconds=float(runtime.artifact_budget_seconds),
     )
     evidence_profile = write_evidence(
@@ -1074,7 +1091,7 @@ def run_pipeline(
         config_path=args.config,
         mode="train",
         pack_dir=pack_dir,
-        output_dir=staging_dir,
+        output_dir=output_dir if debug_run else staging_dir,
         token_budget=selected.token_budget,
         profile_output=worker_profile_path,
         world_size=runtime.world_size,
@@ -1108,11 +1125,14 @@ def run_pipeline(
             epochs=cfg.optim.epochs,
             world_size=runtime.world_size,
             memory_limit_gib=runtime.memory_limit_gib,
+            allow_partial=debug_run,
         )
+        completed_epochs = cast(int, worker_runtime_profile["epochs_completed"])
         _validate_staged_artifacts(
-            staging_dir,
-            epochs=cfg.optim.epochs,
+            output_dir if debug_run else staging_dir,
+            epochs=completed_epochs if debug_run else cfg.optim.epochs,
             model_family=cfg.model.family,
+            allow_partial=debug_run,
         )
     except Exception as error:
         _write_json_atomic(profile_path, evidence_profile)
@@ -1126,6 +1146,13 @@ def run_pipeline(
         **worker_runtime_profile,
         **evidence_profile,
     }
+    if debug_run:
+        final_profile["run_kind"] = "debug"
+        final_profile["formal_artifacts_published"] = False
+        _write_json_atomic(output_dir / "profile.json", final_profile)
+        _write_json_atomic(output_dir / "debug_complete.json", {"status": "debug_complete"})
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        return 0
     _write_json_atomic(profile_path, final_profile)
     artifacts_started = time.monotonic()
 

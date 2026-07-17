@@ -47,3 +47,26 @@ DONE.
 ## Commit
 
 `74cd63e` — `feat(g5-e2e): machine-enforced BINDING status + paired-bootstrap structure-control condition`
+
+## Review-fix addendum (2026-07-17)
+
+- Corrected the debug path: `e2_pipeline --max-steps N` chooses `<formal>_debug`
+  before execution, sends all DDP modes there, accepts the bounded completed-epoch
+  scope, and leaves the formal output root untouched. A real fake-worker
+  `run_pipeline` regression now completes that path and verifies debug-only output.
+- Restored historical frozen-s0 registration compatibility: BINDING is an E2E-only
+  status rule; the real no-status frozen-s0 registration shape remains valid.
+- E2E now binds four distinct formal metadata files and checkpoint identities, and
+  validates the registered `permanent_null` / `p_topo` / `p_cont` semantics for
+  full, F-only, pair-topology, and P0. Worker metadata records these fields.
+- Registration JSON is parsed and hashed from one byte snapshot. The captured hash
+  is carried through worker finalization, preventing mixed-version status/SHA use.
+- B0-cal accepts the Task-11 deliverable directory only when it resolves exactly
+  one `b0cal_results.json`; E2E publication stages both verdict files and swaps the
+  directory atomically after clearing stale authoritative files on a failed attempt.
+- The formal breadth-first bootstrap path asserts its fixed evaluator has exactly
+  500 induced subgraphs before resampling.
+
+Verification after review fixes: focused Task-7 tests excluding only the documented
+sandbox process-group timeout check passed; ruff check/format, diff check, and
+isolated strict mypy all passed.

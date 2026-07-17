@@ -363,11 +363,21 @@ def _toy_cfg(tmp_path: Path) -> te.EgoConfig:
 
 
 class TestRegistrationRunMode:
-    def test_formal_worker_refuses_draft_registration(self, tmp_path: Path) -> None:
+    def test_historical_frozen_s0_worker_accepts_registration_without_status(
+        self, tmp_path: Path
+    ) -> None:
         cfg = _toy_cfg(tmp_path)
+        formal_cfg, is_debug = te.prepare_ddp_run_config(cfg, max_steps=None)
+        assert formal_cfg == cfg
+        assert is_debug is False
 
+    def test_formal_e2e_worker_refuses_registration_without_binding_status(
+        self, tmp_path: Path
+    ) -> None:
+        cfg = _toy_cfg(tmp_path)
+        e2e_cfg = replace(cfg, model=replace(cfg.model, family="egostitch_e2e"))
         with pytest.raises(te.PreregistrationNotBinding, match="status == 'BINDING'"):
-            te.prepare_ddp_run_config(cfg, max_steps=None)
+            te.prepare_ddp_run_config(e2e_cfg, max_steps=None)
 
     def test_debug_worker_redirects_and_marks_nonformal(self, tmp_path: Path) -> None:
         cfg = _toy_cfg(tmp_path)
@@ -383,6 +393,14 @@ class TestRegistrationRunMode:
         assert metadata["run_kind"] == "debug"
         assert metadata["formal_artifacts_published"] is False
         assert not (cfg.output_dir / "run_metadata.json").exists()
+
+    def test_orchestrator_selected_debug_root_is_not_redirected_again(self, tmp_path: Path) -> None:
+        cfg = _toy_cfg(tmp_path)
+        prepared, is_debug = te.prepare_ddp_run_config(
+            replace(cfg, output_dir=tmp_path / "out_debug"), max_steps=1
+        )
+        assert is_debug is True
+        assert prepared.output_dir == tmp_path / "out_debug"
 
 
 # --------------------------------------------------------------------------- streams
@@ -593,12 +611,14 @@ class TestTrainLoop:
         assert metadata["s0_checkpoint_id"] == "deadbeefcafefeed"
         assert metadata["rho_train"] == data.rho_train
 
-    def test_preregistration_drift_after_start_refuses_finalize(self, tmp_path: Path) -> None:
+    def test_preregistration_snapshot_survives_later_file_replacement(self, tmp_path: Path) -> None:
         cfg, data, result = self._run(tmp_path)
         te.write_run_start_metadata(cfg, data, world_size=1)
+        started = json.loads((cfg.output_dir / "run_metadata.json").read_text())
         cfg.preregistration.write_text('{"registration_id": "changed"}\n')
-        with pytest.raises(RuntimeError, match="changed after run start"):
-            te.write_outputs(result, cfg, data)
+        te.write_outputs(result, cfg, data)
+        completed = json.loads((cfg.output_dir / "run_metadata.json").read_text())
+        assert completed["preregistration_sha256"] == started["preregistration_sha256"]
 
     def test_batch_factory_deterministic(self, tmp_path: Path) -> None:
         cfg = _toy_cfg(tmp_path)

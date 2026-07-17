@@ -39,6 +39,9 @@ import hashlib
 import json
 import logging
 import math
+import os
+import shutil
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -121,25 +124,19 @@ def _sha256_file(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def enforce_preregistration(preregistration_path: Path, run_metadata_paths: Sequence[Path]) -> str:
-    """Refuse to open held-out metrics unless every run pinned this prereg file.
+def _preregistration_snapshot(path: Path) -> tuple[dict[str, object], str]:
+    """Parse and hash the same immutable registration bytes."""
+    raw = path.read_bytes()
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise PreregistrationMismatch("preregistration must be a JSON object")
+    return cast(dict[str, object], payload), hashlib.sha256(raw).hexdigest()
 
-    Args:
-        preregistration_path: The committed pre-registration JSON.
-        run_metadata_paths: One ``run_metadata.json`` per training seed.
 
-    Returns:
-        The pre-registration file's sha256 (recorded in the gate payload).
-
-    Raises:
-        PreregistrationMismatch: On any absent or non-matching hash.
-    """
-    prereg = json.loads(preregistration_path.read_text(encoding="utf-8"))
-    if not isinstance(prereg, dict) or prereg.get("status") != "BINDING":
-        raise PreregistrationNotBinding(
-            "held-out G5 metrics require preregistration status == 'BINDING'"
-        )
-    expected = _sha256_file(preregistration_path)
+def _enforce_metadata_registration_hash(
+    preregistration_path: Path, run_metadata_paths: Sequence[Path], expected: str
+) -> str:
+    """Validate metadata against an already-captured registration hash."""
     for path in run_metadata_paths:
         metadata = json.loads(path.read_text(encoding="utf-8"))
         recorded = metadata.get("preregistration_sha256")
@@ -161,6 +158,35 @@ def enforce_preregistration(preregistration_path: Path, run_metadata_paths: Sequ
                 f"{path}: debug/non-formal run metadata cannot publish held-out metrics"
             )
     return expected
+
+
+def enforce_preregistration(preregistration_path: Path, run_metadata_paths: Sequence[Path]) -> str:
+    """Refuse to open held-out metrics unless every run pinned this prereg file.
+
+    Args:
+        preregistration_path: The committed pre-registration JSON.
+        run_metadata_paths: One ``run_metadata.json`` per training seed.
+
+    Returns:
+        The pre-registration file's sha256 (recorded in the gate payload).
+
+    Raises:
+        PreregistrationMismatch: On any absent or non-matching hash.
+    """
+    _, expected = _preregistration_snapshot(preregistration_path)
+    return _enforce_metadata_registration_hash(preregistration_path, run_metadata_paths, expected)
+
+
+def enforce_e2e_preregistration(
+    preregistration_path: Path, run_metadata_paths: Sequence[Path]
+) -> str:
+    """Apply the rev-3 E2E-only BINDING status contract."""
+    prereg, expected = _preregistration_snapshot(preregistration_path)
+    if prereg.get("status") != "BINDING":
+        raise PreregistrationNotBinding(
+            "held-out E2E G5 metrics require preregistration status == 'BINDING'"
+        )
+    return _enforce_metadata_registration_hash(preregistration_path, run_metadata_paths, expected)
 
 
 def paired_bootstrap_lower_bound(
@@ -526,6 +552,21 @@ def _validate_b0cal_lineage(
             raise ValueError(f"b0cal B0 row mismatch for mmd_ratio.{stat}")
 
 
+def _resolve_b0cal_results_path(path: Path) -> Path:
+    """Accept the Task-11 deliverable directory or one explicit JSON file."""
+    if path.is_file():
+        return path
+    if not path.is_dir():
+        raise ValueError(f"b0cal results input does not exist: {path}")
+    candidates = sorted(path.rglob("b0cal_results.json"))
+    if len(candidates) != 1:
+        raise ValueError(
+            "b0cal results directory requires exactly one b0cal_results.json, "
+            f"found {len(candidates)}"
+        )
+    return candidates[0]
+
+
 # --------------------------------------------------------------------------- statistics
 
 
@@ -831,6 +872,7 @@ def run_g5_stage1_pipeline(
     )
     b0_auprc = b0_regimes["degree_corrected"]["ratio_1"].auprc
 
+    b0cal_results_path = _resolve_b0cal_results_path(b0cal_results_path)
     b0cal_payload = json.loads(b0cal_results_path.read_text(encoding="utf-8"))
     _validate_b0cal_lineage(cast(dict[str, object], b0cal_payload), b0_universe.meta, b0_row)
     b0cal_assembled = cast(dict[str, dict[str, object]], b0cal_payload["assembled"])
@@ -1137,6 +1179,13 @@ def _e2e_registration_sha256(run_metadata: Mapping[str, Mapping[str, object]]) -
 
 def _enforce_e2e_formal_metadata(run_metadata: Mapping[str, Mapping[str, object]]) -> None:
     """Reject anything except completed, explicitly formal E2E arm metadata."""
+    expected_semantics: dict[str, tuple[str, float, float]] = {
+        "full": ("none", 0.15, 0.15),
+        "b0_e2e_f_only": ("all_head", 0.15, 0.15),
+        "pair_topology": ("content_head", 0.15, 0.15),
+        "p0": ("none", 0.0, 0.0),
+    }
+    checkpoints: set[str] = set()
     for arm, metadata in run_metadata.items():
         if metadata.get("run_kind") != "formal":
             raise RegistrationShaMismatch(f"{arm}: run metadata must declare run_kind 'formal'")
@@ -1144,6 +1193,19 @@ def _enforce_e2e_formal_metadata(run_metadata: Mapping[str, Mapping[str, object]
             raise RegistrationShaMismatch(f"{arm}: formal_artifacts_published must be exactly true")
         if metadata.get("status") != "complete":
             raise RegistrationShaMismatch(f"{arm}: formal run metadata status must be 'complete'")
+        checkpoint = metadata.get("checkpoint_id")
+        if not isinstance(checkpoint, str) or not checkpoint:
+            raise RegistrationShaMismatch(f"{arm}: run metadata needs a checkpoint_id")
+        if checkpoint in checkpoints:
+            raise RegistrationShaMismatch("formal E2E arms must use distinct checkpoint_id values")
+        checkpoints.add(checkpoint)
+        permanent_null, p_topo, p_cont = expected_semantics[arm]
+        if metadata.get("model_family") != "egostitch_e2e":
+            raise RegistrationShaMismatch(f"{arm}: model_family must be 'egostitch_e2e'")
+        if metadata.get("permanent_null") != permanent_null:
+            raise RegistrationShaMismatch(f"{arm}: permanent_null does not match registered arm")
+        if metadata.get("p_topo") != p_topo or metadata.get("p_cont") != p_cont:
+            raise RegistrationShaMismatch(f"{arm}: branch dropout does not match registered arm")
 
 
 def _validate_e2e_universe_shape(
@@ -1299,12 +1361,15 @@ def build_e2e_arm_summary(
             f"{list(_E2E_ARMS)}, got {sorted(arm_universe_paths)}"
         )
 
+    resolved_metadata_paths = [path.resolve() for path in run_metadata_paths.values()]
+    if len(set(resolved_metadata_paths)) != len(resolved_metadata_paths):
+        raise RegistrationShaMismatch("formal E2E arms require distinct run metadata files")
     run_metadata: dict[str, dict[str, object]] = {
         name: cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
         for name, path in run_metadata_paths.items()
     }
     _enforce_e2e_formal_metadata(run_metadata)
-    bound_registration_sha256 = enforce_preregistration(
+    bound_registration_sha256 = enforce_e2e_preregistration(
         preregistration_path, list(run_metadata_paths.values())
     )
     registration_sha256 = _e2e_registration_sha256(run_metadata)
@@ -1327,6 +1392,8 @@ def build_e2e_arm_summary(
     benchmark_root = data_root / _BENCHMARK_SUBDIR
     g_ref = load_test_graph(benchmark_root, strategy)
     buckets = load_test_node_buckets(benchmark_root, strategy)
+    if strategy == "breadth_first" and sum(len(node_sets) for node_sets in buckets.values()) != 500:
+        raise ValueError("registered fixed evaluator must contain exactly 500 subgraphs")
     n_test_nodes = g_ref.number_of_nodes()
     target_edges = strip_self_loops(g_ref).number_of_edges()
     nodes = list(g_ref.nodes())
@@ -1454,7 +1521,11 @@ def run_g5_e2e_stage1_pipeline(
     seed: int = 0,
 ) -> dict[str, object]:
     """Run the binding E2E five-arm G5 gate and write its verdict artifacts."""
-    prereg = cast(dict[str, object], json.loads(preregistration_path.read_text(encoding="utf-8")))
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    # A rejected run must not leave an older verdict looking authoritative.
+    for filename in ("g5_e2e_stage1_results.json", "g5_e2e_stage1_tables.md"):
+        (output_dir / filename).unlink(missing_ok=True)
+    prereg, _ = _preregistration_snapshot(preregistration_path)
     enforce_frozen_inputs(prereg, preregistration_path, b0_universe_path)
     summary = build_e2e_arm_summary(
         arm_universe_paths=arm_universe_paths,
@@ -1494,6 +1565,7 @@ def run_g5_e2e_stage1_pipeline(
         seed=seed,
         threshold=b0_threshold,
     )
+    b0cal_results_path = _resolve_b0cal_results_path(b0cal_results_path)
     b0cal_payload = cast(
         dict[str, object], json.loads(b0cal_results_path.read_text(encoding="utf-8"))
     )
@@ -1563,7 +1635,7 @@ def run_g5_e2e_stage1_pipeline(
         node_ids=b0_universe.node_ids,
         g_ref=g_ref,
         store=None,
-        f0_cache=output_dir / "e2e_gate_f0_cache.pt",
+        f0_cache=output_dir.parent / f".{output_dir.name}.e2e_gate_f0_cache.pt",
         seed=seed,
     )
     b0_auprc = b0_regimes["degree_corrected"]["ratio_1"].auprc
@@ -1616,11 +1688,11 @@ def run_g5_e2e_stage1_pipeline(
         "verdict": verdict,
         "failure_reading": prereg["failure_reading"] if verdict == "cut" else None,
     }
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "g5_e2e_stage1_results.json").write_text(
+    staging_dir = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.stage-", dir=output_dir.parent))
+    (staging_dir / "g5_e2e_stage1_results.json").write_text(
         json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )
-    (output_dir / "g5_e2e_stage1_tables.md").write_text(
+    (staging_dir / "g5_e2e_stage1_tables.md").write_text(
         "# G5 E2E Stage-1 gate\n\n"
         f"**Verdict: `{verdict}`**\n\n"
         "Fixed-seed evaluator-stability evidence only; not significance or cross-seed "
@@ -1631,6 +1703,18 @@ def run_g5_e2e_stage1_pipeline(
         f"- Structure control: `{structure_control}`\n",
         encoding="utf-8",
     )
+    backup_dir = output_dir.with_name(f".{output_dir.name}.previous")
+    shutil.rmtree(backup_dir, ignore_errors=True)
+    try:
+        if output_dir.exists():
+            os.replace(output_dir, backup_dir)
+        os.replace(staging_dir, output_dir)
+    except BaseException:
+        if not output_dir.exists() and backup_dir.exists():
+            os.replace(backup_dir, output_dir)
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+    shutil.rmtree(backup_dir, ignore_errors=True)
     return payload
 
 
