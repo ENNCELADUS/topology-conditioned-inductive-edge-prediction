@@ -1650,6 +1650,16 @@ def _e2e_topology_delta_std(
     return {"topology_delta_std": value}
 
 
+def _e2e_null_arm_tiebreak(logits: np.ndarray) -> dict[str, float]:
+    """Return null-arm validation diagnostics without excluded-pathway selection.
+
+    Permanent-null arms choose checkpoints by their active validation AUPRC;
+    their tie-break is pinned to zero so an excluded pathway cannot affect the
+    selected checkpoint.
+    """
+    return {"active_logit_std": float(np.std(logits)), "selection_tiebreak": 0.0}
+
+
 def _e2e_trainable_parameters(model: EgoStitchE2E) -> list[torch.nn.Parameter]:
     """Trainable parameters for family `egostitch_e2e`, excluding dead ones.
 
@@ -1916,18 +1926,21 @@ def _validate_epoch(
 
     if isinstance(model, EgoStitchE2E):
         assert first_chunk_batch is not None
-        with accelerator.autocast():
-            topology_summary = _e2e_topology_delta_std(model, first_chunk_batch)
-            with torch.no_grad():
-                first_decomposed = model.decompose(first_chunk_batch)
-        f_logit_std = float(np.std(first_decomposed["f_logit"].detach().float().cpu().numpy()))
-        fidelity: dict[str, float] = {
-            **topology_summary,
-            "f_logit_std": f_logit_std,
-            "topology_delta_ratio": (
-                topology_summary["topology_delta_std"] / max(f_logit_std, 1e-30)
-            ),
-        }
+        if model.cfg.permanent_null == "none":
+            with accelerator.autocast():
+                topology_summary = _e2e_topology_delta_std(model, first_chunk_batch)
+                with torch.no_grad():
+                    first_decomposed = model.decompose(first_chunk_batch)
+            f_logit_std = float(np.std(first_decomposed["f_logit"].detach().float().cpu().numpy()))
+            fidelity = {
+                **topology_summary,
+                "f_logit_std": f_logit_std,
+                "topology_delta_ratio": (
+                    topology_summary["topology_delta_std"] / max(f_logit_std, 1e-30)
+                ),
+            }
+        else:
+            fidelity = _e2e_null_arm_tiebreak(logits_np)
     else:
         fidelity = _fidelity_summary(
             ordered[:, 1],
@@ -2000,6 +2013,8 @@ def train_egostitch_ddp_loop(
         The `EgoTrainResult`.
     """
     is_e2e = isinstance(model, EgoStitchE2E)
+    e2e_permanent_null = cfg.model.config.get("permanent_null", "none")
+    assert isinstance(e2e_permanent_null, str)
     model_cfg = model.generator_cfg if isinstance(model, EgoStitchE2E) else model.config
     if isinstance(model, EgoStitchStage1):
         model.set_density_ratio(1.0)  # pass-1 scores are the Stage-1 scores (Sec 13.11)
@@ -2173,7 +2188,11 @@ def train_egostitch_ddp_loop(
             # the historical residual/s0 ratio -- same direction (larger
             # value wins), same tolerance/tie-break mechanics below.
             fidelity_ratio = (
-                fidelity["topology_delta_ratio"] if is_e2e else fidelity["residual_s0_std_ratio"]
+                fidelity["topology_delta_ratio"]
+                if is_e2e and e2e_permanent_null == "none"
+                else fidelity["selection_tiebreak"]
+                if is_e2e
+                else fidelity["residual_s0_std_ratio"]
             )
             improved = best_metrics is None or metrics.auprc > (
                 best_metrics.auprc + cfg.diagnostics.selection_auprc_tolerance

@@ -985,6 +985,70 @@ class TestTrainLoopE2E:
         restored = E2EConfig.from_mapping(cast(dict[str, object], payload["model_config"]))
         assert restored == E2EConfig.from_mapping(cfg.model.config)
 
+    def test_validation_uses_permanent_null_active_arm(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for permanent_null in ("all_head", "content_head"):
+            arm_path = tmp_path / permanent_null
+            arm_path.mkdir()
+            e2e_cfg, data, model, accelerator = self._e2e_setup(arm_path)
+            e2e_cfg = replace(
+                e2e_cfg,
+                model=ModelConfig(
+                    family="egostitch_e2e",
+                    config={**_E2E_TINY_MODEL, "permanent_null": permanent_null},
+                ),
+            )
+            model = EgoStitchE2E(E2EConfig.from_mapping(e2e_cfg.model.config))
+            factory = te._BatchFactory(
+                e2e_cfg,
+                model.generator_cfg,
+                data,
+                node_batch=e2e_cfg.data.node_batch,
+                rank=0,
+                world_size=1,
+            )
+            rows, steps = te._epoch_step_plan(
+                len(data.e_sup_positives),
+                negative_ratio=e2e_cfg.data.negative_ratio,
+                edge_batch=e2e_cfg.data.edge_batch,
+                world_size=1,
+            )
+            next(iter(factory.epoch_batches(1, rows_per_rank=rows, steps=steps)))
+            seen: list[HeadNullMasks | None] = []
+            original = EgoStitchE2E.forward
+
+            def _spy(
+                self: EgoStitchE2E,
+                batch: dict[str, torch.Tensor],
+                *,
+                masks: HeadNullMasks | None = None,
+                _seen: list[HeadNullMasks | None] = seen,
+                _original: Callable[..., dict[str, torch.Tensor]] = original,
+            ) -> dict[str, torch.Tensor]:
+                _seen.append(masks)
+                return _original(self, batch, masks=masks)
+
+            monkeypatch.setattr(EgoStitchE2E, "forward", _spy)
+            try:
+                with self._bf16_autocast():
+                    validation = te._validate_epoch(
+                        model,
+                        data,
+                        accelerator,
+                        edge_batch=e2e_cfg.data.edge_batch,
+                        topk_fraction=e2e_cfg.diagnostics.topk_fraction,
+                        token_table=factory._token_table,
+                        token_node_index=factory._token_node_index,
+                    )
+            finally:
+                monkeypatch.undo()
+            assert validation is not None
+            assert seen and seen[0] is not None
+            assert bool((~seen[0].topo).all()) == (permanent_null == "all_head")
+            assert bool((~seen[0].cont).all()) == (permanent_null in ("all_head", "content_head"))
+            assert validation.fidelity["selection_tiebreak"] == 0.0
+
     def test_optimizer_parameter_set_equals_e2e_trainable_parameters(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

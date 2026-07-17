@@ -1026,19 +1026,22 @@ _E2E_NODES = [f"n{i}" for i in range(4)]
 _E2E_PAIRS = [("n0", "n1"), ("n1", "n2"), ("n0", "n2")]
 
 
-def _egostitch_e2e_setup(tmp_path: Path) -> tuple[Path, Path, Path]:
+def _egostitch_e2e_setup(
+    tmp_path: Path, *, model_config: dict[str, object] | None = None
+) -> tuple[Path, Path, Path]:
     """Feature store + checkpoint + pairs TSV for the `egostitch_e2e` family."""
     torch.manual_seed(0)
     node_tokens = {node: torch.randn(3 + i, _E2E_NODE_DIM) for i, node in enumerate(_E2E_NODES)}
     data_root = _data_root_with_features(tmp_path, node_tokens, input_dim=_E2E_NODE_DIM)
 
-    model = score_universe.build_model("egostitch_e2e", dict(_TINY_E2E_CONFIG))
+    config = dict(_TINY_E2E_CONFIG if model_config is None else model_config)
+    model = score_universe.build_model("egostitch_e2e", config)
     checkpoint_path = tmp_path / "egostitch_e2e.pt"
     _write_checkpoint(
         checkpoint_path,
         model=model,
         model_family="egostitch_e2e",
-        model_config=dict(_TINY_E2E_CONFIG),
+        model_config=config,
     )
 
     pairs_path = tmp_path / "pairs.tsv"
@@ -1118,6 +1121,24 @@ def test_egostitch_e2e_cli_scores_four_logit_decomposition(tmp_path: Path) -> No
     np.testing.assert_array_equal(artifact.logit, artifact.f_logit)
     np.testing.assert_array_equal(artifact.logit, artifact.pair_content)
     np.testing.assert_array_equal(artifact.logit, artifact.pair_topology)
+
+
+def test_egostitch_e2e_permanent_null_publishes_active_primary_logit(tmp_path: Path) -> None:
+    for permanent_null, active_key in (("all_head", "f_logit"), ("content_head", "pair_topology")):
+        config = {**_TINY_E2E_CONFIG, "permanent_null": permanent_null}
+        data_root, checkpoint, pairs = _egostitch_e2e_setup(
+            tmp_path / permanent_null, model_config=config
+        )
+        _enable_e2e_conditioning_gates(checkpoint)
+        output = tmp_path / f"{permanent_null}.npz"
+        score_universe.main(
+            _egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, output)
+        )
+        artifact = score_universe.load_scores(output)
+        active = getattr(artifact, active_key)
+        assert active is not None
+        np.testing.assert_array_equal(artifact.logit, active)
+        assert artifact.meta["permanent_null"] == permanent_null
 
 
 def test_egostitch_e2e_cli_is_deterministic(tmp_path: Path) -> None:
@@ -1220,6 +1241,87 @@ def test_egostitch_e2e_scaffold_shuffle_is_ab_ba_and_shard_invariant(tmp_path: P
     np.testing.assert_array_equal(
         score_universe.load_scores(forward).logit, score_universe.load_scores(merged).logit
     )
+
+
+def test_egostitch_e2e_scaffold_shuffle_uses_multi_pair_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root, checkpoint, _ = _egostitch_e2e_setup(tmp_path)
+    _enable_e2e_conditioning_gates(checkpoint)
+    pairs = tmp_path / "many.tsv"
+    many_pairs = _E2E_PAIRS * 8
+    pairs.write_text("".join(f"{u}\t{v}\n" for u, v in many_pairs))
+    calls: list[int] = []
+    original = EgoStitchE2E.decompose
+
+    def _spy(self: EgoStitchE2E, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        calls.append(batch["x_a"].shape[0])
+        return original(self, batch)
+
+    monkeypatch.setattr(EgoStitchE2E, "decompose", _spy)
+    score_universe.main(
+        [
+            *_egostitch_e2e_score_args(
+                tmp_path, data_root, checkpoint, pairs, tmp_path / "many.npz"
+            ),
+            "--scaffold-control",
+            "shuffle_within_pair",
+        ]
+    )
+    assert max(calls) > 1
+    assert len(calls) < len(many_pairs)
+
+
+def test_merge_rejects_conflicting_scaffold_control_provenance(tmp_path: Path) -> None:
+    base_meta = {
+        "checkpoint_id": "abc123abc123abcd",
+        "model_family": "egostitch_e2e",
+        "pairs_source": "candidate",
+        "strategy": "breadth_first",
+        "num_rows": 2,
+        "created_utc": "2026-07-17T00:00:00+00:00",
+        "torch_version": str(torch.__version__),
+        "score_precision": {
+            "contract": "egostitch_e2e_pair_fp32_v1",
+            "pair_compute_dtype": "float32",
+            "pair_autocast": False,
+            "logit_storage_dtype": "float32",
+        },
+        "scaffold_control": {
+            "mode": "shuffle_within_pair",
+            "seed": 0,
+            "keying": "canonical_pair_v1",
+        },
+    }
+
+    def write_shard(path: Path, row_start: int, control: dict[str, object]) -> None:
+        meta = {**base_meta, "scaffold_control": control}
+        values = np.array([float(row_start)], dtype=np.float32)
+        score_universe.save_scores(
+            path,
+            node_ids=["a", "b"],
+            u_idx=np.array([0], dtype=np.int32),
+            v_idx=np.array([1], dtype=np.int32),
+            logit=values,
+            label=np.full(1, -1, dtype=np.int8),
+            row_start=row_start,
+            meta=meta,
+            f_logit=values,
+            pair_content=values,
+            pair_topology=values,
+        )
+
+    left = tmp_path / "left.npz"
+    write_shard(left, 0, cast(dict[str, object], base_meta["scaffold_control"]))
+    for suffix, control in (
+        ("mode", {"mode": "none", "seed": 0, "keying": "canonical_pair_v1"}),
+        ("seed", {"mode": "shuffle_within_pair", "seed": 1, "keying": "canonical_pair_v1"}),
+        ("keying", {"mode": "shuffle_within_pair", "seed": 0, "keying": "other"}),
+    ):
+        right = tmp_path / f"{suffix}.npz"
+        write_shard(right, 1, control)
+        with pytest.raises(ValueError, match="scaffold_control"):
+            score_universe.merge_scores([left, right])
 
 
 def test_egostitch_e2e_merge_preserves_four_arrays_in_manifest_order(tmp_path: Path) -> None:
