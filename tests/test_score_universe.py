@@ -26,7 +26,9 @@ from src.model.B0 import V3_1
 INPUT_DIM = 4
 
 
-def _write_feature_store(root: Path, node_tokens: dict[str, torch.Tensor]) -> None:
+def _write_feature_store(
+    root: Path, node_tokens: dict[str, torch.Tensor], *, input_dim: int = INPUT_DIM
+) -> None:
     """Write a synthetic FeatureStore package (metadata.json/index.json/embeddings)."""
     embeddings_dir = root / "embeddings"
     embeddings_dir.mkdir(parents=True, exist_ok=True)
@@ -37,17 +39,19 @@ def _write_feature_store(root: Path, node_tokens: dict[str, torch.Tensor]) -> No
         index[node_id] = rel_path
     (root / "metadata.json").write_text(
         json.dumps(
-            {"format": "torch_pt_per_node", "input_dim": INPUT_DIM, "max_sequence_length": 1024}
+            {"format": "torch_pt_per_node", "input_dim": input_dim, "max_sequence_length": 1024}
         )
     )
     (root / "index.json").write_text(json.dumps(index))
 
 
-def _data_root_with_features(tmp_path: Path, node_tokens: dict[str, torch.Tensor]) -> Path:
+def _data_root_with_features(
+    tmp_path: Path, node_tokens: dict[str, torch.Tensor], *, input_dim: int = INPUT_DIM
+) -> Path:
     """Build a `<data_root>/features/frozen_node_features_1024/` package under tmp_path."""
     data_root = tmp_path / "data"
     features_root = data_root / "features" / "frozen_node_features_1024"
-    _write_feature_store(features_root, node_tokens)
+    _write_feature_store(features_root, node_tokens, input_dim=input_dim)
     return data_root
 
 
@@ -995,3 +999,185 @@ def test_merge_recomputes_egostitch_resolution_diagnostics(tmp_path: Path) -> No
     assert merged.meta["score_resolution"] == score_universe.score_resolution_diagnostics(
         merged.logit
     )
+
+
+# --------------------------------------------------------------------------- egostitch_e2e scoring
+# (design rev 3 four-logit decomposition; Task 14)
+
+_TINY_E2E_CONFIG: dict[str, object] = {
+    "d_model": 32,
+    "encoder_layers": 1,
+    "cross_attn_layers": 2,
+    "n_heads": 4,
+    "n_inj": 1,
+    "ste_dim": 16,
+    "ste_layers": 2,
+    "xattn_heads": 4,
+}
+# EgoStitchE2E's internal Stage-1 generator keeps its own pinned spec default
+# (EgoStitchConfig().input_dim, spec Sec 13) regardless of E2EConfig, so the
+# feature store backing these tests must use that exact node-token dimension.
+_E2E_NODE_DIM = 1536
+_E2E_NODES = [f"n{i}" for i in range(4)]
+# Includes a repeated-node pair (n0/n0 reused as n0-n1 and n0-n2) but no
+# self-pair: EgoStitchE2E's forward has no special self-pair routing.
+_E2E_PAIRS = [("n0", "n1"), ("n1", "n2"), ("n0", "n2")]
+
+
+def _egostitch_e2e_setup(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Feature store + checkpoint + pairs TSV for the `egostitch_e2e` family."""
+    torch.manual_seed(0)
+    node_tokens = {node: torch.randn(3 + i, _E2E_NODE_DIM) for i, node in enumerate(_E2E_NODES)}
+    data_root = _data_root_with_features(tmp_path, node_tokens, input_dim=_E2E_NODE_DIM)
+
+    model = score_universe.build_model("egostitch_e2e", dict(_TINY_E2E_CONFIG))
+    checkpoint_path = tmp_path / "egostitch_e2e.pt"
+    _write_checkpoint(
+        checkpoint_path,
+        model=model,
+        model_family="egostitch_e2e",
+        model_config=dict(_TINY_E2E_CONFIG),
+    )
+
+    pairs_path = tmp_path / "pairs.tsv"
+    pairs_path.write_text("".join(f"{u}\t{v}\n" for u, v in _E2E_PAIRS))
+    return data_root, checkpoint_path, pairs_path
+
+
+def _egostitch_e2e_score_args(
+    tmp_path: Path, data_root: Path, checkpoint: Path, pairs: Path, output: Path
+) -> list[str]:
+    return [
+        "score",
+        "--checkpoint",
+        str(checkpoint),
+        "--pairs",
+        f"file:{pairs}",
+        "--data-root",
+        str(data_root),
+        "--output",
+        str(output),
+        "--token-budget",
+        "8192",
+        "--f0-cache",
+        str(tmp_path / "f0_cache.pt"),
+        "--device",
+        "cpu",
+    ]
+
+
+def test_build_model_egostitch_e2e_round_trips() -> None:
+    from src.model.egostitch.e2e_model import EgoStitchE2E
+
+    model = score_universe.build_model("egostitch_e2e", dict(_TINY_E2E_CONFIG))
+    assert isinstance(model, EgoStitchE2E)
+    assert model.cfg.d_model == 32
+
+
+def test_egostitch_e2e_cli_scores_four_logit_decomposition(tmp_path: Path) -> None:
+    data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
+    output = tmp_path / "scores.npz"
+    score_universe.main(_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, output))
+
+    artifact = score_universe.load_scores(output)
+    assert artifact.meta["model_family"] == "egostitch_e2e"
+    assert len(artifact.logit) == len(_E2E_PAIRS)
+    assert artifact.logit.dtype == np.float32
+    assert artifact.f_logit is not None
+    assert artifact.pair_content is not None
+    assert artifact.pair_topology is not None
+    for arr in (artifact.f_logit, artifact.pair_content, artifact.pair_topology):
+        assert arr.dtype == np.float32
+        assert arr.shape == artifact.logit.shape
+        assert bool(np.isfinite(arr).all())
+
+    assert artifact.meta["score_precision"] == {
+        "contract": "egostitch_e2e_pair_fp32_v1",
+        "pair_compute_dtype": "float32",
+        "pair_autocast": False,
+        "logit_storage_dtype": "float32",
+    }
+
+    resolution = artifact.meta["score_resolution"]
+    assert isinstance(resolution, dict)
+    assert set(resolution) == {"full", "f_logit", "pair_content", "pair_topology"}
+    for name, arr in (
+        ("full", artifact.logit),
+        ("f_logit", artifact.f_logit),
+        ("pair_content", artifact.pair_content),
+        ("pair_topology", artifact.pair_topology),
+    ):
+        assert resolution[name] == score_universe.score_resolution_diagnostics(arr)
+
+    # Zero-init sanity check (design rev 3 Sec 3.4/3.5): GatedCrossAttention's
+    # gate parameter starts at exactly zero, so the topo/content pathways are
+    # an exact-identity bypass regardless of which one a given arm nulls out.
+    # All four logits must therefore be bit-for-bit identical at init.
+    np.testing.assert_array_equal(artifact.logit, artifact.f_logit)
+    np.testing.assert_array_equal(artifact.logit, artifact.pair_content)
+    np.testing.assert_array_equal(artifact.logit, artifact.pair_topology)
+
+
+def test_egostitch_e2e_cli_is_deterministic(tmp_path: Path) -> None:
+    data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
+    out_a, out_b = tmp_path / "a.npz", tmp_path / "b.npz"
+    for output in (out_a, out_b):
+        score_universe.main(
+            _egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, output)
+        )
+    a, b = score_universe.load_scores(out_a), score_universe.load_scores(out_b)
+    np.testing.assert_array_equal(a.logit, b.logit)
+    assert a.f_logit is not None and b.f_logit is not None
+    np.testing.assert_array_equal(a.f_logit, b.f_logit)
+
+
+def test_egostitch_e2e_merge_preserves_four_arrays_in_manifest_order(tmp_path: Path) -> None:
+    data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
+    output = tmp_path / "scores.npz"
+    for shard in range(2):
+        score_universe.main(
+            [
+                *_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, output),
+                "--shard",
+                str(shard),
+                "--num-shards",
+                "2",
+            ]
+        )
+    shard_paths = [
+        output.with_name(f"{output.stem}.shard-{shard}{output.suffix}") for shard in range(2)
+    ]
+    merged_path = tmp_path / "merged.npz"
+    score_universe.main(
+        ["merge", "--inputs", *(str(path) for path in shard_paths), "--output", str(merged_path)]
+    )
+
+    unsharded_path = tmp_path / "unsharded.npz"
+    score_universe.main(
+        _egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, unsharded_path)
+    )
+
+    merged = score_universe.load_scores(merged_path)
+    unsharded = score_universe.load_scores(unsharded_path)
+    assert merged.f_logit is not None
+    assert merged.pair_content is not None
+    assert merged.pair_topology is not None
+    assert unsharded.f_logit is not None
+    assert unsharded.pair_content is not None
+    assert unsharded.pair_topology is not None
+    assert len(merged.f_logit) == len(_E2E_PAIRS)
+    assert len(merged.pair_content) == len(_E2E_PAIRS)
+    assert len(merged.pair_topology) == len(_E2E_PAIRS)
+
+    # Merged rows are remapped onto the sorted node-id union but otherwise keep
+    # each row's own quadruple aligned; comparing by pair identity against the
+    # unsharded run confirms manifest order (row <-> quadruple) is preserved.
+    merged_index = {pair: row for row, pair in enumerate(merged.pairs())}
+    unsharded_index = {pair: row for row, pair in enumerate(unsharded.pairs())}
+    assert set(merged_index) == set(unsharded_index) == set(_E2E_PAIRS)
+    for pair in _E2E_PAIRS:
+        m_row, u_row = merged_index[pair], unsharded_index[pair]
+        assert merged.logit[m_row] == pytest.approx(unsharded.logit[u_row])
+        assert merged.f_logit[m_row] == pytest.approx(unsharded.f_logit[u_row])
+        assert merged.pair_content[m_row] == pytest.approx(unsharded.pair_content[u_row])
+        assert merged.pair_topology[m_row] == pytest.approx(unsharded.pair_topology[u_row])

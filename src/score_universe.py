@@ -34,6 +34,10 @@ Artifact format (pinned — do not drift):
   ``pairs_source``, ``strategy``, ``num_rows``, ``created_utc``, ``torch_version``;
   EgoStitch artifacts additionally pin pair-pass precision provenance and
   descriptive score-resolution diagnostics.
+- ``f_logit``/``pair_content``/``pair_topology``: float32 arrays present only for
+  family ``egostitch_e2e`` (design rev 3 four-logit decomposition); for that
+  family ``logit`` holds the ``full`` arm and ``meta["score_resolution"]`` is a
+  dict keyed by ``full``/``f_logit``/``pair_content``/``pair_topology``.
 """
 
 from __future__ import annotations
@@ -85,6 +89,8 @@ _META_KEYS = (
 )
 _NAMED_PAIR_SOURCES = ("candidate", "test", "val")
 _EGOSTITCH_PAIR_PRECISION_CONTRACT = "egostitch_pair_fp32_v1"
+_EGOSTITCH_E2E_PAIR_PRECISION_CONTRACT = "egostitch_e2e_pair_fp32_v1"
+_EGOSTITCH_E2E_ARRAY_KEYS = ("full", "f_logit", "pair_content", "pair_topology")
 
 
 # ---------------------------------------------------------------------------
@@ -100,9 +106,16 @@ class ScoresArtifact:
         node_ids: Unique node-id strings, sorted ascending.
         u_idx: Shape ``(n,)`` int32 indices into `node_ids`, in input row order.
         v_idx: Shape ``(n,)`` int32 indices into `node_ids`, aligned with `u_idx`.
-        logit: Shape ``(n,)`` float32 raw model logits (not sigmoid).
+        logit: Shape ``(n,)`` float32 raw model logits (not sigmoid). For family
+            ``egostitch_e2e`` this is the ``full`` arm.
         label: Shape ``(n,)`` int8 labels; ``-1`` where the input row was unlabeled.
         meta: Parsed artifact metadata (the pinned seven keys).
+        f_logit: Shape ``(n,)`` float32 ``egostitch_e2e`` frozen-topology arm;
+            ``None`` for every other family or artifact vintage.
+        pair_content: Shape ``(n,)`` float32 ``egostitch_e2e`` content-only arm;
+            ``None`` for every other family or artifact vintage.
+        pair_topology: Shape ``(n,)`` float32 ``egostitch_e2e`` topology-only arm;
+            ``None`` for every other family or artifact vintage.
     """
 
     node_ids: list[str]
@@ -111,6 +124,9 @@ class ScoresArtifact:
     logit: NDArray[np.float32]
     label: NDArray[np.int8]
     meta: dict[str, object]
+    f_logit: NDArray[np.float32] | None = None
+    pair_content: NDArray[np.float32] | None = None
+    pair_topology: NDArray[np.float32] | None = None
 
     def pairs(self) -> Iterator[tuple[str, str]]:
         """Yield the ``(u, v)`` node-id pair of each row, in artifact row order."""
@@ -139,6 +155,9 @@ class _Shard(NamedTuple):
     label: NDArray[np.int8]
     row_start: int
     meta: dict[str, object]
+    f_logit: NDArray[np.float32] | None = None
+    pair_content: NDArray[np.float32] | None = None
+    pair_topology: NDArray[np.float32] | None = None
 
 
 def score_resolution_diagnostics(logit: NDArray[np.float32]) -> dict[str, int | float]:
@@ -172,20 +191,37 @@ def validate_score_precision(
     meta: Mapping[str, object],
     label: str,
     require_diagnostics: bool = True,
+    extra_arrays: Mapping[str, NDArray[np.float32]] | None = None,
 ) -> None:
     """Validate EgoStitch pair-pass fp32 provenance and stored diagnostics.
 
     Args:
-        logit: The scores artifact's logit column.
+        logit: The scores artifact's logit column (the ``full`` arm for family
+            ``egostitch_e2e``).
         meta: Parsed artifact metadata.
         label: Human-readable artifact label used in errors.
         require_diagnostics: Require the persisted descriptive diagnostics.
+        extra_arrays: For family ``egostitch_e2e`` only: the ``f_logit``,
+            ``pair_content``, and ``pair_topology`` arrays keyed by name.
+            Ignored for every other family.
 
     Raises:
-        ValueError: If an EgoStitch artifact lacks or contradicts the pinned
-            pair-pass fp32 contract, or its stored diagnostics are inconsistent.
+        ValueError: If an EgoStitch or EgoStitch-E2E artifact lacks or
+            contradicts its pinned pair-pass fp32 contract, is missing one of
+            the four decomposition arrays, or its stored diagnostics are
+            inconsistent.
     """
-    if meta.get("model_family") != "egostitch":
+    family = meta.get("model_family")
+    if family == "egostitch_e2e":
+        _validate_egostitch_e2e_precision(
+            logit,
+            meta=meta,
+            label=label,
+            require_diagnostics=require_diagnostics,
+            extra_arrays=extra_arrays or {},
+        )
+        return
+    if family != "egostitch":
         return
     precision = meta.get("score_precision")
     if not isinstance(precision, dict):
@@ -222,6 +258,75 @@ def validate_score_precision(
         )
 
 
+def _validate_egostitch_e2e_precision(
+    logit: NDArray[np.float32],
+    *,
+    meta: Mapping[str, object],
+    label: str,
+    require_diagnostics: bool,
+    extra_arrays: Mapping[str, NDArray[np.float32]],
+) -> None:
+    """Validate the ``egostitch_e2e`` four-array pair-pass fp32 contract.
+
+    Args:
+        logit: The ``full`` arm array.
+        meta: Parsed artifact metadata.
+        label: Human-readable artifact label used in errors.
+        require_diagnostics: Require the persisted per-array descriptive diagnostics.
+        extra_arrays: The ``f_logit``/``pair_content``/``pair_topology`` arrays.
+
+    Raises:
+        ValueError: If the artifact lacks or contradicts the pinned
+            ``egostitch_e2e_pair_fp32_v1`` contract, is missing one of the four
+            decomposition arrays, or its stored per-array diagnostics are
+            inconsistent.
+    """
+    precision = meta.get("score_precision")
+    if not isinstance(precision, dict):
+        raise ValueError(
+            f"{label}: EgoStitch-E2E artifact is missing score_precision provenance; "
+            "rescore with the pair-pass fp32 contract"
+        )
+    expected = {
+        "contract": _EGOSTITCH_E2E_PAIR_PRECISION_CONTRACT,
+        "pair_compute_dtype": "float32",
+        "pair_autocast": False,
+        "logit_storage_dtype": "float32",
+    }
+    mismatches = {
+        key: (precision.get(key), value)
+        for key, value in expected.items()
+        if precision.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(f"{label}: invalid EgoStitch-E2E score_precision provenance: {mismatches}")
+
+    arrays: dict[str, NDArray[np.float32]] = {"full": logit, **extra_arrays}
+    missing = [key for key in _EGOSTITCH_E2E_ARRAY_KEYS if key not in arrays]
+    if missing:
+        raise ValueError(f"{label}: EgoStitch-E2E artifact is missing arrays: {missing}")
+    non_float32 = [
+        key for key in _EGOSTITCH_E2E_ARRAY_KEYS if np.asarray(arrays[key]).dtype != np.float32
+    ]
+    if non_float32:
+        raise ValueError(f"{label}: EgoStitch-E2E arrays must be stored as float32: {non_float32}")
+
+    if not require_diagnostics:
+        return
+    recorded = meta.get("score_resolution")
+    if not isinstance(recorded, dict):
+        raise ValueError(
+            f"{label}: score_resolution diagnostics are missing or not a per-array mapping"
+        )
+    for key in _EGOSTITCH_E2E_ARRAY_KEYS:
+        actual = score_resolution_diagnostics(arrays[key])
+        if recorded.get(key) != actual:
+            raise ValueError(
+                f"{label}: score_resolution[{key!r}] diagnostics are missing or inconsistent; "
+                f"recorded={recorded.get(key)!r}, actual={actual!r}"
+            )
+
+
 def save_scores(
     path: Path,
     *,
@@ -232,6 +337,9 @@ def save_scores(
     label: NDArray[np.int8],
     row_start: int,
     meta: dict[str, object],
+    f_logit: NDArray[np.float32] | None = None,
+    pair_content: NDArray[np.float32] | None = None,
+    pair_topology: NDArray[np.float32] | None = None,
 ) -> None:
     """Write a scores artifact in the pinned ``.npz`` format.
 
@@ -240,15 +348,24 @@ def save_scores(
         node_ids: Unique node-id strings, sorted ascending.
         u_idx: Shape ``(n,)`` int32 indices into `node_ids`.
         v_idx: Shape ``(n,)`` int32 indices into `node_ids`.
-        logit: Shape ``(n,)`` float32 raw model logits.
+        logit: Shape ``(n,)`` float32 raw model logits (the ``full`` arm for
+            family ``egostitch_e2e``).
         label: Shape ``(n,)`` int8 labels (``-1`` for unlabeled rows).
         row_start: Row offset of this artifact in the full input (0 unless sharded).
         meta: Metadata dict; must contain the pinned keys and be JSON-serializable.
+        f_logit: For family ``egostitch_e2e`` only: the frozen-topology arm,
+            shape ``(n,)`` float32. Required (with `pair_content` and
+            `pair_topology`) when `meta`'s ``model_family`` is
+            ``egostitch_e2e``; ignored otherwise.
+        pair_content: For family ``egostitch_e2e`` only: the content-only arm.
+        pair_topology: For family ``egostitch_e2e`` only: the topology-only arm.
 
     Raises:
         ValueError: If array lengths disagree, indices fall outside `node_ids`,
-            `row_start` is negative, `meta` is missing pinned keys, or an
-            EgoStitch artifact violates the pair-pass fp32 provenance contract.
+            `row_start` is negative, `meta` is missing pinned keys, an
+            EgoStitch artifact violates the pair-pass fp32 provenance contract,
+            or an ``egostitch_e2e`` artifact is missing one of the three extra
+            decomposition arrays.
     """
     n = len(logit)
     if not (len(u_idx) == len(v_idx) == len(label) == n):
@@ -256,6 +373,13 @@ def save_scores(
             "u_idx, v_idx, logit, and label must have identical lengths; got "
             f"{len(u_idx)}, {len(v_idx)}, {n}, {len(label)}"
         )
+    for name, arr in (
+        ("f_logit", f_logit),
+        ("pair_content", pair_content),
+        ("pair_topology", pair_topology),
+    ):
+        if arr is not None and len(arr) != n:
+            raise ValueError(f"{name} must have length {n}, got {len(arr)}")
     if n > 0 and (
         int(u_idx.min()) < 0
         or int(v_idx.min()) < 0
@@ -269,24 +393,68 @@ def save_scores(
     if missing:
         raise ValueError(f"meta is missing required keys: {missing}")
     stored_meta = dict(meta)
-    if stored_meta.get("model_family") == "egostitch":
+    family = stored_meta.get("model_family")
+    if family == "egostitch":
         validate_score_precision(
             logit, meta=stored_meta, label=str(path), require_diagnostics=False
         )
         stored_meta["score_resolution"] = score_resolution_diagnostics(logit)
         validate_score_precision(logit, meta=stored_meta, label=str(path))
+    elif family == "egostitch_e2e":
+        if f_logit is None or pair_content is None or pair_topology is None:
+            raise ValueError(
+                f"{path}: egostitch_e2e artifacts require f_logit, pair_content, "
+                "and pair_topology arrays"
+            )
+        extra_arrays = {
+            "f_logit": f_logit,
+            "pair_content": pair_content,
+            "pair_topology": pair_topology,
+        }
+        validate_score_precision(
+            logit,
+            meta=stored_meta,
+            label=str(path),
+            require_diagnostics=False,
+            extra_arrays=extra_arrays,
+        )
+        stored_meta["score_resolution"] = {
+            key: score_resolution_diagnostics(arr)
+            for key, arr in {"full": logit, **extra_arrays}.items()
+        }
+        validate_score_precision(
+            logit, meta=stored_meta, label=str(path), extra_arrays=extra_arrays
+        )
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        path,
-        node_ids=np.array(list(node_ids), dtype=np.str_),
-        u_idx=u_idx.astype(np.int32, copy=False),
-        v_idx=v_idx.astype(np.int32, copy=False),
-        logit=logit.astype(np.float32, copy=False),
-        label=label.astype(np.int8, copy=False),
-        row_start=np.int64(row_start),
-        meta=np.array(json.dumps(stored_meta, sort_keys=True)),
-    )
+    if f_logit is None and pair_content is None and pair_topology is None:
+        np.savez_compressed(
+            path,
+            node_ids=np.array(list(node_ids), dtype=np.str_),
+            u_idx=u_idx.astype(np.int32, copy=False),
+            v_idx=v_idx.astype(np.int32, copy=False),
+            logit=logit.astype(np.float32, copy=False),
+            label=label.astype(np.int8, copy=False),
+            row_start=np.int64(row_start),
+            meta=np.array(json.dumps(stored_meta, sort_keys=True)),
+        )
+    else:
+        # egostitch_e2e (the only family reaching here): all three are required
+        # by the family branch above, so this is always a full quadruple.
+        assert f_logit is not None and pair_content is not None and pair_topology is not None
+        np.savez_compressed(
+            path,
+            node_ids=np.array(list(node_ids), dtype=np.str_),
+            u_idx=u_idx.astype(np.int32, copy=False),
+            v_idx=v_idx.astype(np.int32, copy=False),
+            logit=logit.astype(np.float32, copy=False),
+            label=label.astype(np.int8, copy=False),
+            row_start=np.int64(row_start),
+            meta=np.array(json.dumps(stored_meta, sort_keys=True)),
+            f_logit=f_logit.astype(np.float32, copy=False),
+            pair_content=pair_content.astype(np.float32, copy=False),
+            pair_topology=pair_topology.astype(np.float32, copy=False),
+        )
 
 
 def _load_shard(path: Path) -> _Shard:
@@ -306,6 +474,17 @@ def _load_shard(path: Path) -> _Shard:
         label: NDArray[np.int8] = data["label"].astype(np.int8, copy=False)
         row_start = int(data["row_start"][()])
         meta = cast(dict[str, object], json.loads(str(data["meta"][()])))
+        f_logit: NDArray[np.float32] | None = (
+            data["f_logit"].astype(np.float32, copy=False) if "f_logit" in data else None
+        )
+        pair_content: NDArray[np.float32] | None = (
+            data["pair_content"].astype(np.float32, copy=False) if "pair_content" in data else None
+        )
+        pair_topology: NDArray[np.float32] | None = (
+            data["pair_topology"].astype(np.float32, copy=False)
+            if "pair_topology" in data
+            else None
+        )
     return _Shard(
         path=path,
         node_ids=node_ids,
@@ -315,6 +494,9 @@ def _load_shard(path: Path) -> _Shard:
         label=label,
         row_start=row_start,
         meta=meta,
+        f_logit=f_logit,
+        pair_content=pair_content,
+        pair_topology=pair_topology,
     )
 
 
@@ -336,6 +518,9 @@ def load_scores(path: Path) -> ScoresArtifact:
         logit=shard.logit,
         label=shard.label,
         meta=shard.meta,
+        f_logit=shard.f_logit,
+        pair_content=shard.pair_content,
+        pair_topology=shard.pair_topology,
     )
 
 
@@ -425,6 +610,17 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
             "measurement": "max_concurrent_shard_compute_wall_seconds",
         }
 
+    extra: dict[str, NDArray[np.float32]] = {}
+    if reference.meta.get("model_family") == "egostitch_e2e":
+        for name in ("f_logit", "pair_content", "pair_topology"):
+            parts = [getattr(shard, name) for shard in ordered]
+            if any(part is None for part in parts):
+                raise ValueError(
+                    f"egostitch_e2e merge requires {name!r} in every shard "
+                    f"(files: {[str(shard.path) for shard in ordered]})"
+                )
+            extra[name] = np.concatenate(cast(list[NDArray[np.float32]], parts))
+
     return ScoresArtifact(
         node_ids=node_ids,
         u_idx=np.concatenate(u_parts) if u_parts else np.empty(0, dtype=np.int32),
@@ -432,6 +628,9 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
         logit=np.concatenate([shard.logit for shard in ordered]),
         label=np.concatenate([shard.label for shard in ordered]),
         meta=merged_meta,
+        f_logit=extra.get("f_logit"),
+        pair_content=extra.get("pair_content"),
+        pair_topology=extra.get("pair_topology"),
     )
 
 
@@ -467,10 +666,27 @@ def _build_egostitch(model_config: dict[str, object]) -> nn.Module:
     return EgoStitchStage1(EgoStitchConfig.from_mapping(model_config))
 
 
+def _build_egostitch_e2e(model_config: dict[str, object]) -> nn.Module:
+    """Build an `EgoStitchE2E` model from its checkpointed config (design rev 3).
+
+    The internal Stage-1 generator keeps its own pinned spec defaults
+    (``EgoStitchConfig()``, spec Sec 13) regardless of `model_config`; only the
+    pair-trunk/conditioning fields in `E2EConfig` are checkpoint-configurable
+    (design rev 3 Sec 3.4-3.5).
+    """
+    from src.model.egostitch.config import E2EConfig
+    from src.model.egostitch.e2e_model import EgoStitchE2E
+
+    # Checkpointed configs are inherently dynamic (parsed from a .pt payload),
+    # so the kwargs unpack goes through Any deliberately (mirrors _build_f0_mlp).
+    return EgoStitchE2E(E2EConfig(**cast(dict[str, Any], model_config)))
+
+
 MODEL_BUILDERS: dict[str, Callable[[dict[str, object]], nn.Module]] = {
     "v3_1": _build_v3_1,
     "f0_mlp": _build_f0_mlp,
     "egostitch": _build_egostitch,
+    "egostitch_e2e": _build_egostitch_e2e,
 }
 
 
@@ -1108,6 +1324,85 @@ def _score_egostitch(
     return out
 
 
+def _score_egostitch_e2e(
+    model: nn.Module,
+    pairs: Sequence[tuple[str, str]],
+    store: FeatureStore,
+    *,
+    device: torch.device,
+    token_budget: int,
+    f0_cache: Path,
+) -> dict[str, NDArray[np.float32]]:
+    """Score pairs with an `EgoStitchE2E` model's four-logit decomposition.
+
+    Runs `model.decompose` (design rev 3 Sec 3.5 eval-time hard bypasses) over
+    length-bucketed pair batches, mirroring `_score_v3_1`'s token-stream
+    batching. Unlike the frozen-s0 Stage-1 path (`_score_egostitch`), this
+    model has no separate cacheable per-node pass exposed at the scoring-CLI
+    level: one `decompose` call folds imagination, Sinkhorn stitching, the
+    stitched-topology encoder, and the conditioned pair trunk together, so the
+    whole call is the "pair pass" that the spec Sec 13.16 fp32 contract
+    (extended here as ``egostitch_e2e_pair_fp32_v1``) pins to fp32 — autocast
+    is always disabled for this family, regardless of any future `--amp` wiring.
+
+    Args:
+        model: Frozen `EgoStitchE2E`, on `device`, in `eval()` mode.
+        pairs: Node-id pairs in input row order.
+        store: Feature store providing per-node token sequences.
+        device: Compute device.
+        token_budget: Approximate per-batch token budget for the bucketed sampler.
+        f0_cache: F0 matrix cache path providing the mean-pooled `x_a`/`x_b`
+            generator inputs (f0_mlp/egostitch semantics).
+
+    Returns:
+        Dict with keys ``full``, ``f_logit``, ``pair_content``, and
+        ``pair_topology``, each a shape ``(len(pairs),)`` float32 array in
+        input row order.
+    """
+    from src.model.egostitch.e2e_model import EgoStitchE2E
+
+    assert isinstance(model, EgoStitchE2E)
+    lengths = probe_lengths(store, pairs)
+    dataset = TokenPairDataset(pairs, None, store, lengths=lengths)
+    sampler = LengthBucketedBatchSampler(lengths, token_budget=token_budget, shuffle=False)
+
+    node_ids = sorted({node_id for pair in pairs for node_id in pair})
+    try:
+        f0_cache.parent.mkdir(parents=True, exist_ok=True)
+        matrix, index = build_f0_matrix(
+            store, node_ids, cache_path=f0_cache, allow_cache_subset=True
+        )
+    except ValueError:
+        logger.warning(
+            "F0 cache at %s does not match the requested node set; recomputing without cache",
+            f0_cache,
+        )
+        matrix, index = build_f0_matrix(store, node_ids, cache_path=None)
+
+    out: dict[str, NDArray[np.float32]] = {
+        key: np.empty(len(pairs), dtype=np.float32) for key in _EGOSTITCH_E2E_ARRAY_KEYS
+    }
+    processed = 0
+    for batch_indices in sampler:
+        batch = collate_token_pairs([dataset[i] for i in batch_indices])
+        batch = {key: tensor.to(device) for key, tensor in batch.items()}
+        u_rows = torch.tensor([index[pairs[i][0]] for i in batch_indices], dtype=torch.int64)
+        v_rows = torch.tensor([index[pairs[i][1]] for i in batch_indices], dtype=torch.int64)
+        batch["x_a"] = matrix.index_select(0, u_rows).to(device)
+        batch["x_b"] = matrix.index_select(0, v_rows).to(device)
+        # The full decompose call is the pair pass (see docstring above): it
+        # always runs fp32, regardless of any autocast the caller might be
+        # under (spec Sec 13.16 extension).
+        with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=False):
+            decomposed = model.decompose(batch)
+        rows = np.asarray(batch_indices, dtype=np.int64)
+        for key in _EGOSTITCH_E2E_ARRAY_KEYS:
+            out[key][rows] = decomposed[key].detach().to(torch.float32).cpu().numpy().reshape(-1)
+        processed += len(batch_indices)
+        _log_progress(processed, len(pairs), len(batch_indices))
+    return out
+
+
 def _shard_range(num_rows: int, shard: int, num_shards: int) -> tuple[int, int]:
     """Return shard `shard`-of-`num_shards`'s contiguous ``[start, end)`` row range.
 
@@ -1279,6 +1574,9 @@ def _run_score(args: argparse.Namespace) -> None:
             "logit_storage_dtype": "float32",
         }
     }
+    f_logit: NDArray[np.float32] | None = None
+    pair_content: NDArray[np.float32] | None = None
+    pair_topology: NDArray[np.float32] | None = None
     score_started = perf_counter()
     if model_family == "v3_1":
         if args.pack_dir is None:
@@ -1356,6 +1654,27 @@ def _run_score(args: argparse.Namespace) -> None:
                 "note": "Stage-1 scores are pass-1 scores (spec Sec 13.11)",
             },
         }
+    elif model_family == "egostitch_e2e":
+        decomposed = _score_egostitch_e2e(
+            model,
+            row_pairs,
+            store,
+            device=device,
+            token_budget=args.token_budget,
+            f0_cache=args.f0_cache,
+        )
+        logits = decomposed["full"]
+        f_logit = decomposed["f_logit"]
+        pair_content = decomposed["pair_content"]
+        pair_topology = decomposed["pair_topology"]
+        meta_extra = {
+            "score_precision": {
+                "contract": _EGOSTITCH_E2E_PAIR_PRECISION_CONTRACT,
+                "pair_compute_dtype": "float32",
+                "pair_autocast": False,
+                "logit_storage_dtype": "float32",
+            },
+        }
     else:  # pragma: no cover - build_model already rejects unknown families
         raise ValueError(f"no scoring path for model_family {model_family!r}")
 
@@ -1387,6 +1706,9 @@ def _run_score(args: argparse.Namespace) -> None:
         label=row_labels,
         row_start=start,
         meta=meta,
+        f_logit=f_logit,
+        pair_content=pair_content,
+        pair_topology=pair_topology,
     )
     logger.info("wrote %d scored rows to %s", len(row_pairs), output)
 
@@ -1403,6 +1725,9 @@ def _run_merge(args: argparse.Namespace) -> None:
         label=merged.label,
         row_start=0,
         meta=merged.meta,
+        f_logit=merged.f_logit,
+        pair_content=merged.pair_content,
+        pair_topology=merged.pair_topology,
     )
     logger.info(
         "merged %d shard files (%d rows) into %s", len(args.inputs), len(merged.logit), args.output
