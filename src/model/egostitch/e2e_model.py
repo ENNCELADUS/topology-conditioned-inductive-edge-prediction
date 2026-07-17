@@ -437,7 +437,8 @@ class EgoStitchE2E(nn.Module):
             cont_active=masks.cont if need_cont else None,
         )
         feat = torch.max(torch.stack([feat_ab, feat_ba], dim=-1), dim=-1).values
-        return self.head(feat).squeeze(-1)
+        logits: torch.Tensor = self.head(feat).squeeze(-1)
+        return logits
 
     def forward(
         self, batch: dict[str, torch.Tensor], *, masks: HeadNullMasks | None = None

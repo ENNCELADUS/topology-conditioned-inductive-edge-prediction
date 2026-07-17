@@ -1,5 +1,8 @@
 """E2E model property tests (design rev 3 §3.4–§3.5 acceptance criteria)."""
 
+from collections.abc import Callable
+from typing import cast
+
 import pytest
 import torch
 from src.model.egostitch.conditioning import (
@@ -266,8 +269,8 @@ def test_decompose_builds_pair_context_once_and_matches_explicit_heads(
 ) -> None:
     model, batch = _tiny_model_and_batch_with_grounding()
     with torch.no_grad():
-        model.trunk.topo_xattn[0].gate.fill_(0.4)
-        model.trunk.cont_xattn[0].gate.fill_(0.4)
+        cast(GatedCrossAttention, model.trunk.topo_xattn[0]).gate.data.fill_(0.4)
+        cast(GatedCrossAttention, model.trunk.cont_xattn[0]).gate.data.fill_(0.4)
     calls = 0
     original = model.build_pair_context
 
@@ -320,7 +323,10 @@ def test_self_pairs_encode_one_ego_and_use_exact_identity_plan(
     import src.model.egostitch.e2e_model as e2e_module
 
     sinkhorn_calls = 0
-    original_sinkhorn = e2e_module.sinkhorn_plan
+    original_sinkhorn = cast(
+        Callable[..., torch.Tensor],
+        e2e_module.sinkhorn_plan,  # type: ignore[attr-defined]
+    )
 
     def counted_sinkhorn(*args: torch.Tensor, **kwargs: object) -> torch.Tensor:
         nonlocal sinkhorn_calls
@@ -332,14 +338,16 @@ def test_self_pairs_encode_one_ego_and_use_exact_identity_plan(
     assert encode_calls == 1
     assert sinkhorn_calls == 0
     expected = torch.eye(model.generator_cfg.slots).expand(4, -1, -1)
+    assert context.plan is not None
     assert torch.equal(context.plan, expected)
 
 
 def test_membership_is_content_only_and_content_null_ablates_it() -> None:
     model, batch = _tiny_model_and_batch_with_grounding()
     with torch.no_grad():
-        model.trunk.cont_xattn[0].gate.fill_(0.7)
+        cast(GatedCrossAttention, model.trunk.cont_xattn[0]).gate.data.fill_(0.7)
     context = model.build_pair_context(batch)
+    assert context.cont is not None
     changed = context._replace(cont=context.cont + torch.randn_like(context.cont))
     full_a = model.score_pair_context(context)
     full_b = model.score_pair_context(changed)
@@ -348,4 +356,5 @@ def test_membership_is_content_only_and_content_null_ablates_it() -> None:
     null_a = model.score_pair_context(context, masks=mask)
     null_b = model.score_pair_context(changed, masks=mask)
     assert torch.equal(null_a, null_b)
+    assert context.topo_ab is not None and changed.topo_ab is not None
     assert torch.equal(context.topo_ab, changed.topo_ab)

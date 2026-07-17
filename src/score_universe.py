@@ -574,8 +574,9 @@ def save_scores(
             meta=np.array(json.dumps(stored_meta, sort_keys=True)),
         )
     else:
-        # egostitch_e2e (the only family reaching here): all three are required
-        # by the family branch above, so this is always a full quadruple.
+        # egostitch_e2e (the only family reaching here): all three companion
+        # arrays are required; the true full arm is either `logit` or the
+        # explicit `full_logit` array when a permanent null is primary.
         assert f_logit is not None and pair_content is not None and pair_topology is not None
         arrays: dict[str, Any] = {
             "node_ids": np.array(list(node_ids), dtype=np.str_),
@@ -1704,8 +1705,8 @@ def _score_egostitch_e2e(
             batch_specs.append((indices, output_rows))
         batch_pair_source = node_universe
     else:
-        lengths = probe_lengths(store, pairs)
-        sampler = LengthBucketedBatchSampler(lengths, token_budget=token_budget, shuffle=False)
+        pair_lengths = probe_lengths(store, pairs)
+        sampler = LengthBucketedBatchSampler(pair_lengths, token_budget=token_budget, shuffle=False)
         batch_specs = [
             (indices, [(index, position) for position, index in enumerate(indices)])
             for indices in sampler

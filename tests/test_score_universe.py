@@ -7,6 +7,7 @@ All tests are synthetic: tiny fake feature roots and pair files built under
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import cast
@@ -1341,9 +1342,11 @@ def test_egostitch_e2e_scoring_caches_unique_nodes_and_reuses_pair_context(
     encoded_rows = 0
     context_calls = 0
     head_calls = 0
-    original_encode = EgoStitchE2E.encode_node_state
-    original_context = EgoStitchE2E.build_pair_context_from_states
-    original_head = EgoStitchE2E.score_pair_context
+    original_encode = cast(Callable[..., E2ENodeState], EgoStitchE2E.encode_node_state)
+    original_context = cast(
+        Callable[..., E2EPairContext], EgoStitchE2E.build_pair_context_from_states
+    )
+    original_head = cast(Callable[..., torch.Tensor], EgoStitchE2E.score_pair_context)
 
     def encode_spy(self: EgoStitchE2E, *args: object, **kwargs: object) -> E2ENodeState:
         nonlocal encoded_rows
@@ -1586,7 +1589,7 @@ def test_egostitch_e2e_scorer_supplies_grounding_batch_keys(
     data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
     output = tmp_path / "scores.npz"
 
-    captured: list[tuple[torch.Tensor, torch.Tensor | None]] = []
+    captured: list[tuple[torch.Tensor | None, torch.Tensor | None]] = []
     original_encode = EgoStitchE2E.encode_node_state
 
     def _spy_encode(

@@ -40,6 +40,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
@@ -52,6 +53,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.stats import spearmanr
 
+from src.data.artifacts import load_candidate_pairs
 from src.data.features import FeatureStore
 from src.eval.assembly import assemble_graph, density_matched_threshold
 from src.eval.graph_metrics import (
@@ -77,6 +79,7 @@ from src.experiments.g1_hardened_e2 import (
     load_test_node_buckets,
     validate_universe_artifact,
 )
+from src.experiments.probes import evaluate_e2e_probe_artifact
 from src.score_universe import ScoresArtifact, load_scores, validate_artifact_precision
 
 logger = logging.getLogger(__name__)
@@ -189,7 +192,22 @@ def enforce_e2e_preregistration(
         raise PreregistrationNotBinding(
             "held-out E2E G5 metrics require preregistration status == 'BINDING'"
         )
+    frozen = cast(Mapping[str, object] | None, prereg.get("frozen_inputs"))
+    b0cal = cast(Mapping[str, object] | None, frozen.get("b0cal_results") if frozen else None)
+    digest = b0cal.get("sha256") if b0cal else None
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise PreregistrationMismatch(
+            "BINDING E2E registration requires a real b0cal_results sha256; "
+            "REQUIRED-BEFORE-BINDING is not a digest"
+        )
     return _enforce_metadata_registration_hash(preregistration_path, run_metadata_paths, expected)
+
+
+def _enforce_e2e_evaluator_seed(prereg: Mapping[str, object], seed: int) -> None:
+    """Reject any formal evaluator stream except the registered seed zero."""
+    evaluator = cast(Mapping[str, object] | None, prereg.get("evaluator"))
+    if evaluator is None or evaluator.get("seed") != 0 or seed != 0:
+        raise RegistrationShaMismatch("formal E2E gate requires registered evaluator seed 0")
 
 
 def paired_bootstrap_lower_bound(
@@ -281,6 +299,32 @@ def enforce_frozen_inputs(
             raise PreregistrationMismatch(
                 f"frozen input {name!r} sha256 mismatch: {actual} != {entry['sha256']}"
             )
+
+
+def enforce_e2e_frozen_inputs(
+    prereg: dict[str, object],
+    preregistration_path: Path,
+    b0_universe_path: Path,
+    b0cal_results_path: Path,
+) -> Path:
+    """Verify the E2E comparator payload's exact path/digest in addition to legacy inputs."""
+    enforce_frozen_inputs(prereg, preregistration_path, b0_universe_path)
+    frozen = cast(dict[str, object], prereg.get("frozen_inputs"))
+    entry = cast(dict[str, object] | None, frozen.get("b0cal_results"))
+    if entry is None or "path" not in entry or "sha256" not in entry:
+        raise PreregistrationMismatch("frozen input 'b0cal_results' is incompletely registered")
+    resolved = _resolve_b0cal_results_path(b0cal_results_path).resolve()
+    expected_path = _registered_path(preregistration_path, entry["path"]).resolve()
+    if resolved != expected_path:
+        raise PreregistrationMismatch(
+            f"frozen b0cal_results path mismatch: {resolved} != {expected_path}"
+        )
+    actual = _sha256_file(resolved)
+    if actual != entry["sha256"]:
+        raise PreregistrationMismatch(
+            f"frozen input 'b0cal_results' sha256 mismatch: {actual} != {entry['sha256']}"
+        )
+    return resolved
 
 
 def select_matched_global_rd_rows(
@@ -514,7 +558,9 @@ def _load_required_diagnostics(
     return fidelity, cost
 
 
-def _training_diagnostics(run_metadata: Sequence[dict[str, object]]) -> list[dict[str, object]]:
+def _training_diagnostics(
+    run_metadata: Sequence[dict[str, object]], *, require_e2e_submodule_rms: bool = False
+) -> list[dict[str, object]]:
     """Validate the registered training-side series embedded in run metadata."""
     required = {"fidelity_series", "gradient_norm_series", "kendall_fallback"}
     reports: list[dict[str, object]] = []
@@ -527,6 +573,27 @@ def _training_diagnostics(run_metadata: Sequence[dict[str, object]]) -> list[dic
             raise ValueError(f"run metadata {index} has an empty fidelity series")
         if not cast(list[object], report["gradient_norm_series"]):
             raise ValueError(f"run metadata {index} has an empty gradient-norm series")
+        if require_e2e_submodule_rms:
+            rms_keys = {"grad_rms_trunk", "grad_rms_ste", "grad_rms_content"}
+            for row_index, raw_row in enumerate(
+                cast(list[dict[str, object]], report["gradient_norm_series"])
+            ):
+                missing_rms = rms_keys - raw_row.keys()
+                if missing_rms:
+                    raise ValueError(
+                        f"run metadata {index} gradient row {row_index} is missing "
+                        f"submodule RMS telemetry: {sorted(missing_rms)}"
+                    )
+                if any(
+                    not isinstance(raw_row[key], (int, float))
+                    or not math.isfinite(float(cast(float, raw_row[key])))
+                    or float(cast(float, raw_row[key])) < 0.0
+                    for key in rms_keys
+                ):
+                    raise ValueError(
+                        f"run metadata {index} gradient row {row_index} has invalid "
+                        "submodule RMS telemetry"
+                    )
         reports.append(report)
     return reports
 
@@ -1291,6 +1358,71 @@ def _validate_e2e_universe_shape(
         raise ValueError("; ".join(errors))
 
 
+def _validate_e2e_scoring_provenance(
+    name: str,
+    artifact: ScoresArtifact,
+    registered_arm: Mapping[str, object],
+) -> None:
+    """Bind one score artifact to the registered training/control semantics."""
+    expected = cast(Mapping[str, object] | None, registered_arm.get("scoring_provenance"))
+    if expected is None:
+        raise RegistrationShaMismatch(f"{name}: registration has no scoring_provenance")
+    expected_control = {
+        "mode": expected.get("scaffold_control"),
+        "seed": 0,
+        "keying": "canonical_pair_v1",
+    }
+    actual_control = artifact.meta.get("scaffold_control")
+    if actual_control != expected_control:
+        raise RegistrationShaMismatch(
+            f"{name}: scaffold_control provenance mismatch: "
+            f"{actual_control!r} != {expected_control!r}"
+        )
+    for key in ("permanent_null", "primary_logit"):
+        if artifact.meta.get(key) != expected.get(key):
+            raise RegistrationShaMismatch(
+                f"{name}: {key} provenance mismatch: "
+                f"{artifact.meta.get(key)!r} != {expected.get(key)!r}"
+            )
+    if name == "structure_control_6a":
+        if expected.get("seed") != 0 or expected.get("keying") != "canonical_pair_v1":
+            raise RegistrationShaMismatch(
+                "structure_control_6a registration must pin seed 0/canonical_pair_v1"
+            )
+        if expected.get("checkpoint_arm") != "full":
+            raise RegistrationShaMismatch(
+                "structure_control_6a registration must pin checkpoint_arm 'full'"
+            )
+
+
+def _registered_candidate_manifest(
+    preregistration: Mapping[str, object],
+    preregistration_path: Path,
+    benchmark_root: Path,
+    strategy: str,
+) -> tuple[list[tuple[str, str]], NDArray[np.int8]]:
+    """Load and hash-check the exact registered candidate pair/label manifest."""
+    frozen = cast(Mapping[str, object], preregistration.get("frozen_inputs"))
+    entry = cast(Mapping[str, object] | None, frozen.get("candidate_manifest"))
+    if entry is None or "path" not in entry or "sha256" not in entry:
+        raise PreregistrationMismatch("frozen candidate_manifest is incompletely registered")
+    registered_path = _registered_path(preregistration_path, entry["path"]).resolve()
+    benchmark_path = (benchmark_root / strategy / "candidate_test_edges.txt").resolve()
+    if registered_path != benchmark_path:
+        raise PreregistrationMismatch(
+            f"candidate_manifest path mismatch: {registered_path} != {benchmark_path}"
+        )
+    if not registered_path.is_file():
+        raise PreregistrationMismatch(f"candidate_manifest not found: {registered_path}")
+    actual_sha = _sha256_file(registered_path)
+    if actual_sha != entry["sha256"]:
+        raise PreregistrationMismatch(
+            f"candidate_manifest sha256 mismatch: {actual_sha} != {entry['sha256']}"
+        )
+    candidate = load_candidate_pairs(benchmark_root, strategy)
+    return candidate.pairs, candidate.labels
+
+
 def _clustering_mmd_samples(
     g_pred: nx.Graph, g_ref: nx.Graph, buckets: Mapping[int, Sequence[set[str]]]
 ) -> dict[int, list[tuple[NDArray[np.float64], NDArray[np.float64]]]]:
@@ -1322,6 +1454,132 @@ def _clustering_mmd_ratio(
         raw.append(mmd_squared(pred, ref, config))
         reference.append(mmd_squared(ref[::2], ref[1::2], config))
     return float(np.mean(raw) / max(float(np.mean(reference)), config.reference_epsilon))
+
+
+def _array_summary(values: NDArray[np.float32] | NDArray[np.float64]) -> dict[str, float]:
+    """Deterministic descriptive row for one aligned logit/delta array."""
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "mean": float(np.mean(array)),
+        "std": float(np.std(array)),
+        "q05": float(np.quantile(array, 0.05)),
+        "q50": float(np.quantile(array, 0.50)),
+        "q95": float(np.quantile(array, 0.95)),
+        "min": float(np.min(array)),
+        "max": float(np.max(array)),
+    }
+
+
+def _artifact_four_logits(artifact: ScoresArtifact) -> dict[str, NDArray[np.float32]]:
+    """Return the true aligned four-logit arrays regardless of active primary arm."""
+    primary = artifact.meta.get("primary_logit")
+    full = artifact.logit if primary == "full" else artifact.full_logit
+    if (
+        full is None
+        or artifact.f_logit is None
+        or artifact.pair_content is None
+        or artifact.pair_topology is None
+    ):
+        raise ValueError("E2E artifact is missing its complete four-logit decomposition")
+    return {
+        "full": full,
+        "f_logit": artifact.f_logit,
+        "pair_content": artifact.pair_content,
+        "pair_topology": artifact.pair_topology,
+    }
+
+
+def _e2e_decomposition_summary(
+    artifacts: Mapping[str, ScoresArtifact],
+) -> dict[str, object]:
+    """Complete per-arm four-logit and registered aligned-delta evidence."""
+    arrays = {name: _artifact_four_logits(artifact) for name, artifact in artifacts.items()}
+    arm_rows: dict[str, object] = {}
+    for name, values in arrays.items():
+        arm_rows[name] = {
+            "four_logits": {key: _array_summary(array) for key, array in values.items()},
+            "deltas": {
+                "full_minus_f_logit": _array_summary(values["full"] - values["f_logit"]),
+                "topology_delta_full_minus_pair_content": _array_summary(
+                    values["full"] - values["pair_content"]
+                ),
+                "content_delta_full_minus_pair_topology": _array_summary(
+                    values["full"] - values["pair_topology"]
+                ),
+            },
+        }
+    full = arrays["full"]
+    p0 = arrays["p0"]
+    return {
+        "arms": arm_rows,
+        "cross_arm": {
+            "full_bypass_vs_trained_pair_topology": _array_summary(
+                full["pair_topology"] - artifacts["pair_topology"].logit
+            ),
+            "p0_minus_full": {key: _array_summary(p0[key] - full[key]) for key in full},
+        },
+    }
+
+
+def _evaluate_registered_e2e_probe(
+    *,
+    probe_artifact_path: Path,
+    preregistration: Mapping[str, object],
+    preregistration_path: Path,
+    run_metadata_path: Path,
+    data_root: Path,
+    strategy: str,
+) -> dict[str, object]:
+    """Rebuild G_struct identities and consume the required probe artifact."""
+    from src import train_egostitch as te
+    from src.data.partition import build_g_struct, derive_partition
+
+    registration = cast(Mapping[str, object] | None, preregistration.get("probe_artifact"))
+    if registration is None or registration.get("format") != "egostitch_e2e_probe_v1":
+        raise PreregistrationMismatch("registration is missing the E2E probe artifact contract")
+    expected_path = _registered_path(
+        preregistration_path, registration.get("expected_path")
+    ).resolve()
+    if probe_artifact_path.resolve() != expected_path:
+        raise PreregistrationMismatch(
+            f"E2E probe artifact path mismatch: {probe_artifact_path.resolve()} != {expected_path}"
+        )
+    metadata = cast(dict[str, object], json.loads(run_metadata_path.read_text(encoding="utf-8")))
+    config_path = Path(str(metadata.get("config_path")))
+    cfg = te.load_config(config_path)
+    if cfg.data.root.resolve() != data_root.resolve() or cfg.data.strategy != strategy:
+        raise RegistrationShaMismatch("full-arm config data identity does not match gate inputs")
+    benchmark = te._load_benchmark_for(cfg)
+    operative = sorted(set(benchmark.graph.nodes()) - set(cfg.data.expected_missing_features))
+    train_nodes = sorted(set(benchmark.split.train_nodes) & set(operative))
+    train_positives = [
+        pair
+        for pair, label in zip(
+            benchmark.split.train_pairs.pairs,
+            benchmark.split.train_pairs.labels,
+            strict=True,
+        )
+        if label == 1
+    ]
+    partition = derive_partition(
+        train_positives,
+        seed=cfg.data.partition_seed,
+        msg_fraction=cfg.data.msg_fraction,
+    )
+    graph = build_g_struct(train_nodes, partition.e_msg)
+    return evaluate_e2e_probe_artifact(
+        probe_artifact_path,
+        graph=graph,
+        train_nodes=train_nodes,
+        expected_metadata={
+            "checkpoint_id": metadata.get("checkpoint_id"),
+            "registration_sha256": metadata.get("preregistration_sha256"),
+            "config_hash": metadata.get("config_hash"),
+            "seed": 0,
+            "partition_seed": 0,
+            "strategy": strategy,
+        },
+    )
 
 
 def build_e2e_arm_summary(
@@ -1409,12 +1667,16 @@ def build_e2e_arm_summary(
     bound_registration_sha256 = enforce_e2e_preregistration(
         preregistration_path, list(run_metadata_paths.values()), snapshot=snapshot
     )
+    registration_sha256 = _e2e_registration_sha256(run_metadata)
     _enforce_e2e_formal_metadata(
         run_metadata,
         preregistration=preregistration,
         preregistration_path=preregistration_path,
     )
-    registration_sha256 = _e2e_registration_sha256(run_metadata)
+    training_diagnostics = _training_diagnostics(
+        [run_metadata[name] for name in _E2E_FORMAL_ARMS],
+        require_e2e_submodule_rms=True,
+    )
     if registration_sha256 != bound_registration_sha256:  # pragma: no cover - enforced above
         raise RegistrationShaMismatch("formal e2e metadata disagree with the binding registration")
 
@@ -1443,6 +1705,10 @@ def build_e2e_arm_summary(
     target_edges = strip_self_loops(g_ref).number_of_edges()
     nodes = list(g_ref.nodes())
     config = MMDConfig()
+    candidate_pairs, candidate_labels = _registered_candidate_manifest(
+        preregistration, preregistration_path, benchmark_root, strategy
+    )
+    registered_arms = cast(Mapping[str, Mapping[str, object]], preregistration["arms"])
 
     store: FeatureStore | None = None
     features_root = data_root / _FEATURES_SUBDIR
@@ -1464,6 +1730,13 @@ def build_e2e_arm_summary(
         if artifact.meta.get("model_family") != "egostitch_e2e":
             raise ValueError(f"{label}: model_family must be 'egostitch_e2e'")
         validate_artifact_precision(artifact, label=label)
+        _validate_e2e_scoring_provenance(name, artifact, registered_arms[name])
+        if list(artifact.pairs()) != candidate_pairs:
+            raise RegistrationShaMismatch(
+                f"{label}: candidate pair identity/order does not match frozen manifest"
+            )
+        if not np.array_equal(artifact.label, candidate_labels):
+            raise RegistrationShaMismatch(f"{label}: candidate labels do not match frozen manifest")
         if name in _E2E_FORMAL_ARMS:
             metadata_checkpoint = run_metadata[name].get("checkpoint_id")
             artifact_checkpoint = artifact.meta.get("checkpoint_id")
@@ -1528,10 +1801,13 @@ def build_e2e_arm_summary(
         seed=0,
         alpha=0.05,
     )
+    decomposition = _e2e_decomposition_summary(artifacts)
 
     return {
         "registration_sha256": registration_sha256,
         "arms": rows,
+        "training_diagnostics": dict(zip(_E2E_FORMAL_ARMS, training_diagnostics, strict=True)),
+        "decomposition": decomposition,
         "liveness": liveness,
         "structure_control": {
             "metric": "clustering_mmd_ratio",
@@ -1553,12 +1829,90 @@ _E2E_LIVENESS_CONFIG: dict[str, float] = {
 }
 
 
+def render_e2e_tables_markdown(payload: Mapping[str, object]) -> str:
+    """Render the complete five-arm, decomposition, and probe evidence tables."""
+    arms = cast(Mapping[str, Mapping[str, object]], payload["arms"])
+    lines = [
+        "# G5 E2E Stage-1 gate",
+        "",
+        f"**Verdict: `{payload['verdict']}`**",
+        "",
+        "Fixed-seed evaluator-stability evidence only; not significance or cross-seed robustness.",
+        "",
+        "## Five-arm summary",
+        "",
+        "| arm | checkpoint | GS | BFS-macro RD | degree MMD | clustering MMD | "
+        "spectral MMD | degree-corrected AUPRC |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for name in _E2E_ARMS:
+        row = arms[name]
+        assembled = cast(Mapping[str, object], row["assembled"])
+        mmd = cast(Mapping[str, float], assembled["mmd_ratio"])
+        lines.append(
+            f"| {name} | {row['checkpoint_id']} | {_fmt(assembled['graph_similarity'])} "
+            f"| {_fmt(assembled['relative_density'])} | {_fmt(mmd['degree'])} "
+            f"| {_fmt(mmd['clustering'])} | {_fmt(mmd['spectral'])} "
+            f"| {_fmt(row['degree_corrected_auprc'])} |"
+        )
+    decomposition = cast(Mapping[str, object], payload["decomposition"])
+    decomposition_arms = cast(Mapping[str, Mapping[str, object]], decomposition["arms"])
+    lines += [
+        "",
+        "## Four-logit decomposition deltas",
+        "",
+        "| arm | full-f mean | full-f std | topology delta mean | topology delta std | "
+        "content delta mean | content delta std |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for name in _E2E_ARMS:
+        deltas = cast(Mapping[str, Mapping[str, float]], decomposition_arms[name]["deltas"])
+        f_delta = deltas["full_minus_f_logit"]
+        topo = deltas["topology_delta_full_minus_pair_content"]
+        content = deltas["content_delta_full_minus_pair_topology"]
+        lines.append(
+            f"| {name} | {_fmt(f_delta['mean'])} | {_fmt(f_delta['std'])} "
+            f"| {_fmt(topo['mean'])} | {_fmt(topo['std'])} "
+            f"| {_fmt(content['mean'])} | {_fmt(content['std'])} |"
+        )
+    probes = cast(Mapping[str, object], payload["probes"])
+    probe_r2 = cast(Mapping[str, float], probes["linear_probe_r2"])
+    partial = cast(Mapping[str, float], probes["degree_partialled_r2"])
+    lines += [
+        "",
+        "## Representation probes (nonbinding)",
+        "",
+        "| target | ridge R2 | degree-partialled R2 |",
+        "|---|---:|---:|",
+    ]
+    for target in ("degree", "ego_density", "clustering"):
+        lines.append(f"| {target} | {_fmt(probe_r2[target])} | {_fmt(partial.get(target))} |")
+    pi = cast(Mapping[str, object], probes["pi_shared_neighbor_consistency"])
+    lines += [
+        "",
+        "| Pi/shared-neighbor consistency | mean | std | nonzero fraction | n pairs |",
+        "|---|---:|---:|---:|---:|",
+        f"| registered E_msg selection | {_fmt(pi['mean'])} | {_fmt(pi['std'])} "
+        f"| {_fmt(pi['nonzero_fraction'])} | {_fmt(pi['n_pairs'])} |",
+        "",
+        "## Decision checks",
+        "",
+        f"- Primary pass: `{payload['primary_pass']}`",
+        f"- Guards: `{payload['guards']}`",
+        f"- Pathway attribution: `{payload['pathway_attribution']}`",
+        f"- Structure control: `{payload['structure_control']}`",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def run_g5_e2e_stage1_pipeline(
     *,
     arm_universe_paths: Mapping[str, Path],
     run_metadata_paths: Mapping[str, Path],
     b0_universe_path: Path,
     b0cal_results_path: Path,
+    probe_artifact_path: Path,
     preregistration_path: Path,
     data_root: Path,
     strategy: str,
@@ -1574,7 +1928,21 @@ def run_g5_e2e_stage1_pipeline(
     prereg, _ = preregistration_snapshot
     if cast(Mapping[str, object], prereg["benchmark"]).get("strategy") != "breadth_first":
         raise RegistrationShaMismatch("formal E2E gate requires registered breadth_first strategy")
-    enforce_frozen_inputs(prereg, preregistration_path, b0_universe_path)
+    _enforce_e2e_evaluator_seed(prereg, seed)
+    b0cal_results_path = enforce_e2e_frozen_inputs(
+        prereg,
+        preregistration_path,
+        b0_universe_path,
+        b0cal_results_path,
+    )
+    probes = _evaluate_registered_e2e_probe(
+        probe_artifact_path=probe_artifact_path,
+        preregistration=prereg,
+        preregistration_path=preregistration_path,
+        run_metadata_path=run_metadata_paths["full"],
+        data_root=data_root,
+        strategy=strategy,
+    )
     summary = build_e2e_arm_summary(
         arm_universe_paths=arm_universe_paths,
         run_metadata_paths=run_metadata_paths,
@@ -1614,7 +1982,6 @@ def run_g5_e2e_stage1_pipeline(
         seed=seed,
         threshold=b0_threshold,
     )
-    b0cal_results_path = _resolve_b0cal_results_path(b0cal_results_path)
     b0cal_payload = cast(
         dict[str, object], json.loads(b0cal_results_path.read_text(encoding="utf-8"))
     )
@@ -1727,6 +2094,8 @@ def run_g5_e2e_stage1_pipeline(
         "primary_pass": primary_pass,
         "guards": guards,
         "liveness": summary["liveness"],
+        "decomposition": summary["decomposition"],
+        "probes": probes,
         "pathway_attribution": {
             "applies": pathway_applies,
             "gain_full": gain_full,
@@ -1742,14 +2111,7 @@ def run_g5_e2e_stage1_pipeline(
         json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )
     (staging_dir / "g5_e2e_stage1_tables.md").write_text(
-        "# G5 E2E Stage-1 gate\n\n"
-        f"**Verdict: `{verdict}`**\n\n"
-        "Fixed-seed evaluator-stability evidence only; not significance or cross-seed "
-        "robustness.\n\n"
-        f"- Primary pass: `{primary_pass}`\n"
-        f"- Guards: `{guards}`\n"
-        f"- Pathway attribution: `{payload['pathway_attribution']}`\n"
-        f"- Structure control: `{structure_control}`\n",
+        render_e2e_tables_markdown(payload),
         encoding="utf-8",
     )
     backup_dir = output_dir.with_name(f".{output_dir.name}.previous")
@@ -1905,6 +2267,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fonly-universe", type=Path)
     parser.add_argument("--pt-universe", type=Path)
     parser.add_argument("--p0-universe", type=Path)
+    parser.add_argument("--probe-artifact", type=Path)
     parser.add_argument(
         "--cost-report",
         type=Path,
@@ -1938,6 +2301,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             **arm_paths,
             "b0_universe": args.b0_universe,
             "b0cal_results": args.b0cal_results,
+            "probe_artifact": args.probe_artifact,
             "preregistration": args.preregistration,
             "output_dir": args.output_dir,
         }
@@ -1946,7 +2310,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             parser.error(f"--mode e2e requires: {', '.join(missing)}")
         if len(args.run_metadata) != 4:
             parser.error("--mode e2e requires exactly four --run-metadata paths")
-        for path in [*cast(dict[str, Path], arm_paths).values(), *args.run_metadata]:
+        for path in [
+            *cast(dict[str, Path], arm_paths).values(),
+            *args.run_metadata,
+            cast(Path, args.b0_universe),
+            cast(Path, args.b0cal_results),
+            cast(Path, args.probe_artifact),
+            cast(Path, args.preregistration),
+        ]:
             if not path.exists():
                 parser.error(f"input not found: {path}")
         run_g5_e2e_stage1_pipeline(
@@ -1954,6 +2325,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             run_metadata_paths=dict(zip(_E2E_FORMAL_ARMS, args.run_metadata, strict=True)),
             b0_universe_path=cast(Path, args.b0_universe),
             b0cal_results_path=cast(Path, args.b0cal_results),
+            probe_artifact_path=cast(Path, args.probe_artifact),
             preregistration_path=cast(Path, args.preregistration),
             data_root=args.data_root,
             strategy=args.strategy,

@@ -13,7 +13,7 @@ import pytest
 from src import train_egostitch as te
 from src.experiments import b0_cal, g5_stage1
 from src.experiments.g1_hardened_e2 import AssembledRow
-from src.score_universe import ScoresArtifact, save_scores
+from src.score_universe import ScoresArtifact, load_scores, save_scores
 
 from tests.test_b0_cal import _toy_inputs as _b0cal_toy_inputs
 from tests.test_g1_hardened_e2 import (
@@ -68,6 +68,22 @@ def _write_prereg(tmp_path: Path, b0_path: Path | None = None) -> Path:
                 "path": str(g3_path),
                 "sha256": hashlib.sha256(g3_path.read_bytes()).hexdigest(),
             },
+        }
+        candidate_path = (
+            tmp_path / "data" / "benchmark_2025_neurips" / "toy" / "candidate_test_edges.txt"
+        )
+        if candidate_path.is_file():
+            _d(payload["frozen_inputs"])["candidate_manifest"] = {
+                "path": str(candidate_path),
+                "sha256": hashlib.sha256(candidate_path.read_bytes()).hexdigest(),
+            }
+        b0cal_path = tmp_path / "b0cal" / "b0cal_results.json"
+        if not b0cal_path.is_file():
+            b0cal_path.parent.mkdir(exist_ok=True)
+            b0cal_path.write_text("{}\n")
+        _d(payload["frozen_inputs"])["b0cal_results"] = {
+            "path": str(b0cal_path),
+            "sha256": hashlib.sha256(b0cal_path.read_bytes()).hexdigest(),
         }
     path.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n")
     return path
@@ -607,6 +623,9 @@ def _write_e2e_universe_npz(
     labels: np.ndarray,
     strategy: str = "toy",
     checkpoint_id: str = "e2e0",
+    scaffold_control: str = "none",
+    permanent_null: str = "none",
+    primary_logit: str = "full",
 ) -> None:
     """Write a toy family-``egostitch_e2e`` four-array scores artifact."""
     position = {node_id: i for i, node_id in enumerate(node_ids)}
@@ -627,20 +646,68 @@ def _write_e2e_universe_npz(
             "pair_autocast": False,
             "logit_storage_dtype": "float32",
         },
+        "scaffold_control": {
+            "mode": scaffold_control,
+            "seed": 0,
+            "keying": "canonical_pair_v1",
+        },
+        "permanent_null": permanent_null,
+        "primary_logit": primary_logit,
+    }
+    arrays = {
+        "full": full,
+        "f_logit": f_logit,
+        "pair_content": pair_content,
+        "pair_topology": pair_topology,
     }
     save_scores(
         path,
         node_ids=node_ids,
         u_idx=u_idx,
         v_idx=v_idx,
-        logit=full.astype(np.float32),
+        logit=arrays[primary_logit].astype(np.float32),
         label=labels.astype(np.int8),
         row_start=0,
         meta=meta,
         f_logit=f_logit.astype(np.float32),
         pair_content=pair_content.astype(np.float32),
         pair_topology=pair_topology.astype(np.float32),
+        full_logit=full.astype(np.float32) if primary_logit != "full" else None,
     )
+
+
+def _rewrite_e2e_artifact(
+    path: Path,
+    *,
+    meta: dict[str, object] | None = None,
+    pairs: list[tuple[str, str]] | None = None,
+    labels: np.ndarray | None = None,
+) -> None:
+    artifact = load_scores(path)
+    resolved_pairs = pairs if pairs is not None else list(artifact.pairs())
+    node_ids = list(artifact.node_ids)
+    position = {node_id: i for i, node_id in enumerate(node_ids)}
+    u_idx = np.asarray([position[node_u] for node_u, _ in resolved_pairs], dtype=np.int32)
+    v_idx = np.asarray([position[node_v] for _, node_v in resolved_pairs], dtype=np.int32)
+    save_scores(
+        path,
+        node_ids=node_ids,
+        u_idx=u_idx,
+        v_idx=v_idx,
+        logit=artifact.logit,
+        label=artifact.label if labels is None else labels,
+        row_start=0,
+        meta=artifact.meta,
+        f_logit=artifact.f_logit,
+        pair_content=artifact.pair_content,
+        pair_topology=artifact.pair_topology,
+        full_logit=artifact.full_logit,
+    )
+    if meta is not None:
+        with np.load(path, allow_pickle=False) as archive:
+            arrays = {key: archive[key] for key in archive.files}
+        arrays["meta"] = np.array(json.dumps(meta, sort_keys=True))
+        np.savez_compressed(path, **arrays)
 
 
 _E2E_LIVENESS_CONFIG = {
@@ -660,9 +727,23 @@ def _five_arm_inputs(tmp_path: Path) -> dict[str, Any]:
     f_logit = rng.normal(size=len(pairs))  # independent of `full` -> alive residual
     pair_content = rng.normal(size=len(pairs))
     pair_topology = rng.normal(size=len(pairs))
+    candidate_path = data_root / "benchmark_2025_neurips" / "toy" / "candidate_test_edges.txt"
+    candidate_path.write_text(
+        "".join(
+            f"{node_u}\t{node_v}\t{int(label)}\n"
+            for (node_u, node_v), label in zip(pairs, labels, strict=True)
+        )
+    )
 
     arm_paths: dict[str, Path] = {}
     for name in g5_stage1._E2E_ARMS:
+        provenance = {
+            "full": ("none", "none", "full"),
+            "b0_e2e_f_only": ("none", "all_head", "f_logit"),
+            "pair_topology": ("none", "content_head", "pair_topology"),
+            "structure_control_6a": ("shuffle_within_pair", "none", "full"),
+            "p0": ("none", "none", "full"),
+        }[name]
         path = tmp_path / f"{name}.npz"
         _write_e2e_universe_npz(
             path,
@@ -674,6 +755,9 @@ def _five_arm_inputs(tmp_path: Path) -> dict[str, Any]:
             pair_topology=pair_topology,
             labels=labels,
             checkpoint_id=("ckpt_full" if name == "structure_control_6a" else f"ckpt_{name}"),
+            scaffold_control=provenance[0],
+            permanent_null=provenance[1],
+            primary_logit=provenance[2],
         )
         arm_paths[name] = path
 
@@ -688,9 +772,45 @@ def _five_arm_inputs(tmp_path: Path) -> dict[str, Any]:
     preregistration = json.loads(preregistration_path.read_text())
     preregistration["benchmark"] = {"strategy": "toy"}
     preregistration["arms"] = {
-        **{name: {"training": str(path)} for name, path in arm_config_paths.items()},
-        "structure_control_6a": {"training": "none (full checkpoint)"},
+        **{
+            name: {
+                "training": str(path),
+                "scoring_provenance": {
+                    "scaffold_control": {
+                        "full": "none",
+                        "b0_e2e_f_only": "none",
+                        "pair_topology": "none",
+                        "p0": "none",
+                    }[name],
+                    "permanent_null": {
+                        "full": "none",
+                        "b0_e2e_f_only": "all_head",
+                        "pair_topology": "content_head",
+                        "p0": "none",
+                    }[name],
+                    "primary_logit": {
+                        "full": "full",
+                        "b0_e2e_f_only": "f_logit",
+                        "pair_topology": "pair_topology",
+                        "p0": "full",
+                    }[name],
+                },
+            }
+            for name, path in arm_config_paths.items()
+        },
+        "structure_control_6a": {
+            "training": "none (full checkpoint)",
+            "scoring_provenance": {
+                "scaffold_control": "shuffle_within_pair",
+                "seed": 0,
+                "keying": "canonical_pair_v1",
+                "permanent_null": "none",
+                "primary_logit": "full",
+                "checkpoint_arm": "full",
+            },
+        },
     }
+    preregistration["evaluator"] = {"seed": 0}
     preregistration_path.write_text(json.dumps(preregistration, sort_keys=True, indent=2) + "\n")
     preregistration_sha256 = hashlib.sha256(preregistration_path.read_bytes()).hexdigest()
     run_metadata_paths: dict[str, Path] = {}
@@ -719,6 +839,18 @@ def _five_arm_inputs(tmp_path: Path) -> dict[str, Any]:
                     "partition_seed": 0,
                     "config_path": str(arm_config_paths[name].resolve()),
                     "config_hash": te._config_hash(te.load_config(arm_config_paths[name])),
+                    "training_diagnostics": {
+                        "fidelity_series": [{"topology_delta_std": 0.1}],
+                        "gradient_norm_series": [
+                            {
+                                "step": 1,
+                                "grad_rms_trunk": 0.1,
+                                "grad_rms_ste": 0.1,
+                                "grad_rms_content": 0.1,
+                            }
+                        ],
+                        "kendall_fallback": {"active": False},
+                    },
                 }
             )
         )
@@ -757,6 +889,14 @@ class TestBuildE2EArmSummary:
         assert structure_control["n_boot"] == 1000
         assert structure_control["seed"] == 0
         assert structure_control["passed"] is (structure_control["lower_bound"] > 0.0)
+        decomposition = _d(payload["decomposition"])
+        assert set(_d(decomposition["arms"])) == set(g5_stage1._E2E_ARMS)
+        full_deltas = _d(_d(_d(decomposition["arms"])["full"])["deltas"])
+        assert set(full_deltas) == {
+            "full_minus_f_logit",
+            "topology_delta_full_minus_pair_content",
+            "content_delta_full_minus_pair_topology",
+        }
 
     def test_byte_identical_reruns(self, tmp_path: Path) -> None:
         inputs = _five_arm_inputs(tmp_path)
@@ -830,6 +970,7 @@ class TestBuildE2EArmSummary:
             pair_topology=rng.normal(size=len(pairs)),
             labels=labels,
             checkpoint_id="ckpt_not_full",
+            scaffold_control="shuffle_within_pair",
         )
         with pytest.raises(ValueError, match="structure_control_6a checkpoint_id"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
@@ -932,6 +1073,111 @@ class TestBuildE2EArmSummary:
         )
         assert payload["registration_sha256"] == snapshot[1]
 
+    @pytest.mark.parametrize(
+        ("arm", "field", "value", "match"),
+        [
+            ("full", "permanent_null", "all_head", "permanent_null"),
+            ("p0", "primary_logit", "pair_topology", "primary_logit"),
+            ("structure_control_6a", "control_seed", 1, "scaffold_control"),
+            ("structure_control_6a", "control_keying", "wrong", "scaffold_control"),
+            ("full", "control_mode", "shuffle_within_pair", "scaffold_control"),
+        ],
+    )
+    def test_rejects_each_mutated_score_provenance_field(
+        self,
+        tmp_path: Path,
+        arm: str,
+        field: str,
+        value: object,
+        match: str,
+    ) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        path = _d(inputs["arm_universe_paths"])[arm]
+        artifact = load_scores(path)
+        meta = dict(artifact.meta)
+        if field.startswith("control_"):
+            control = dict(cast(dict[str, object], meta["scaffold_control"]))
+            control[field.removeprefix("control_")] = value
+            meta["scaffold_control"] = control
+        else:
+            meta[field] = value
+        _rewrite_e2e_artifact(path, meta=meta)
+        with pytest.raises((ValueError, g5_stage1.RegistrationShaMismatch), match=match):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_rejects_candidate_pair_order_swap(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        path = _d(inputs["arm_universe_paths"])["p0"]
+        artifact = load_scores(path)
+        pairs = list(artifact.pairs())
+        pairs[0], pairs[1] = pairs[1], pairs[0]
+        labels = artifact.label.copy()
+        labels[[0, 1]] = labels[[1, 0]]
+        _rewrite_e2e_artifact(path, pairs=pairs, labels=labels)
+        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="pair identity/order"):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_rejects_candidate_label_mutation(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        path = _d(inputs["arm_universe_paths"])["p0"]
+        artifact = load_scores(path)
+        labels = artifact.label.copy()
+        labels[0] = 1 - labels[0]
+        _rewrite_e2e_artifact(path, labels=labels)
+        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="candidate labels"):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_binding_registration_rejects_b0cal_marker(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        preregistration_path = _d(inputs)["preregistration_path"]
+        registration = json.loads(preregistration_path.read_text())
+        registration["frozen_inputs"]["b0cal_results"]["sha256"] = "REQUIRED-BEFORE-BINDING"
+        preregistration_path.write_text(json.dumps(registration))
+        with pytest.raises(g5_stage1.PreregistrationMismatch, match="real b0cal_results"):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_missing_submodule_rms_telemetry_fails_closed(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        metadata_path = _d(inputs["run_metadata_paths"])["full"]
+        metadata = json.loads(metadata_path.read_text())
+        del metadata["training_diagnostics"]["gradient_norm_series"][0]["grad_rms_content"]
+        metadata_path.write_text(json.dumps(metadata))
+        with pytest.raises(ValueError, match="submodule RMS telemetry"):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_formal_evaluator_seed_must_be_zero(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        preregistration = json.loads(_d(inputs)["preregistration_path"].read_text())
+        g5_stage1._enforce_e2e_evaluator_seed(preregistration, 0)
+        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="seed 0"):
+            g5_stage1._enforce_e2e_evaluator_seed(preregistration, 1)
+
+    def test_b0cal_comparator_path_and_digest_are_exact(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        preregistration_path = _d(inputs)["preregistration_path"]
+        preregistration = json.loads(preregistration_path.read_text())
+        frozen = preregistration["frozen_inputs"]
+        b0_path = Path(frozen["b0_candidate_scores"]["path"])
+        b0cal_path = Path(frozen["b0cal_results"]["path"])
+        assert (
+            g5_stage1.enforce_e2e_frozen_inputs(
+                preregistration, preregistration_path, b0_path, b0cal_path
+            )
+            == b0cal_path.resolve()
+        )
+
+        copy = tmp_path / "copied_b0cal_results.json"
+        copy.write_bytes(b0cal_path.read_bytes())
+        with pytest.raises(g5_stage1.PreregistrationMismatch, match="path mismatch"):
+            g5_stage1.enforce_e2e_frozen_inputs(
+                preregistration, preregistration_path, b0_path, copy
+            )
+        b0cal_path.write_text('{"mutated": true}\n')
+        with pytest.raises(g5_stage1.PreregistrationMismatch, match="sha256 mismatch"):
+            g5_stage1.enforce_e2e_frozen_inputs(
+                preregistration, preregistration_path, b0_path, b0cal_path
+            )
+
 
 class TestPairedBootstrap:
     def test_b0cal_directory_resolves_one_committed_payload(self, tmp_path: Path) -> None:
@@ -967,6 +1213,11 @@ class TestE2EGateCli:
     ) -> None:
         inputs = _five_arm_inputs(tmp_path)
         captured: dict[str, object] = {}
+        b0_path = tmp_path / "b0.npz"
+        b0cal_path = tmp_path / "b0cal.json"
+        probe_path = tmp_path / "probe.npz"
+        for path in (b0_path, b0cal_path, probe_path):
+            path.write_bytes(b"placeholder")
 
         def _fake_run(**kwargs: object) -> dict[str, object]:
             captured.update(kwargs)
@@ -990,9 +1241,11 @@ class TestE2EGateCli:
                 "--run-metadata",
                 *[str(path) for path in _d(inputs)["run_metadata_paths"].values()],
                 "--b0-universe",
-                str(tmp_path / "b0.npz"),
+                str(b0_path),
                 "--b0cal-results",
-                str(tmp_path / "b0cal.json"),
+                str(b0cal_path),
+                "--probe-artifact",
+                str(probe_path),
                 "--preregistration",
                 str(_d(inputs)["preregistration_path"]),
                 "--output-dir",
@@ -1001,6 +1254,7 @@ class TestE2EGateCli:
         )
         assert set(_d(captured["arm_universe_paths"])) == set(g5_stage1._E2E_ARMS)
         assert set(_d(captured["run_metadata_paths"])) == set(g5_stage1._E2E_FORMAL_ARMS)
+        assert captured["probe_artifact_path"] == probe_path
 
     def test_rejects_wrong_model_family(self, tmp_path: Path) -> None:
         inputs = _five_arm_inputs(tmp_path)

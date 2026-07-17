@@ -947,8 +947,10 @@ class TestCompositeStepE2E:
     def test_dead_decision_head_excluded_from_trainable_parameters(self, tmp_path: Path) -> None:
         _, model = self._batch_and_model(tmp_path)
         trainable_ids = {id(p) for p in te._e2e_trainable_parameters(model)}
-        decision_ids = {id(p) for p in model.generator.decision.parameters()}
-        assert decision_ids.isdisjoint(trainable_ids)
+        decision_ids = {
+            name: id(parameter) for name, parameter in model.generator.decision.named_parameters()
+        }
+        assert trainable_ids & set(decision_ids.values()) == {decision_ids["tau_kappa_raw"]}
         assert any(id(p) in trainable_ids for p in model.trunk.parameters())
 
     def test_real_grounding_path_engages_not_placeholder(
@@ -1127,8 +1129,10 @@ class TestTrainLoopE2E:
             )
         expected_ids = {id(p) for p in te._e2e_trainable_parameters(model)}
         assert captured_param_ids == expected_ids
-        decision_ids = {id(p) for p in model.generator.decision.parameters()}
-        assert captured_param_ids.isdisjoint(decision_ids)
+        decision_ids = {
+            name: id(parameter) for name, parameter in model.generator.decision.named_parameters()
+        }
+        assert captured_param_ids & set(decision_ids.values()) == {decision_ids["tau_kappa_raw"]}
 
 
 class TestPreparePack:

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from typing import cast
+
 import networkx as nx
 import numpy as np
 import pytest
@@ -152,3 +156,81 @@ class TestProbeTargets:
     def test_missing_node_rejected(self) -> None:
         with pytest.raises(ValueError, match="missing"):
             probes.probe_targets(self._graph(), ["a", "zzz"])
+
+
+class TestE2EProbeArtifact:
+    @staticmethod
+    def _write(tmp_path: Path) -> tuple[Path, nx.Graph, list[str], dict[str, object]]:
+        graph = nx.cycle_graph(12)
+        graph = nx.relabel_nodes(graph, {node: f"n{node:02d}" for node in graph})
+        nodes = sorted(graph.nodes())
+        targets = probes.probe_targets(graph, nodes)
+        rng = np.random.default_rng(9)
+        states = np.column_stack(
+            [targets["degree"], targets["ego_density"], targets["clustering"], rng.normal(size=12)]
+        ).astype(np.float32)
+        pairs = probes.select_probe_pairs(graph)
+        metadata: dict[str, object] = {
+            "checkpoint_id": "abc123",
+            "registration_sha256": "a" * 64,
+            "config_hash": "b" * 64,
+            "seed": 0,
+            "partition_seed": 0,
+            "strategy": "toy",
+            "g_struct_sha256": probes.g_struct_sha256(graph),
+        }
+        path = tmp_path / "probe.npz"
+        probes.write_e2e_probe_artifact(
+            path,
+            metadata=metadata,
+            node_ids=nodes,
+            states=states,
+            targets={name: targets[name] for name in ("degree", "ego_density", "clustering")},
+            pair_ids=pairs,
+            pi_consistency=np.linspace(0.0, 1.0, len(pairs), dtype=np.float64),
+        )
+        return path, graph, nodes, metadata
+
+    def test_consumer_reports_all_registered_targets(self, tmp_path: Path) -> None:
+        path, graph, nodes, metadata = self._write(tmp_path)
+        report = probes.evaluate_e2e_probe_artifact(
+            path, graph=graph, train_nodes=nodes, expected_metadata=metadata
+        )
+        assert set(cast(dict[str, float], report["linear_probe_r2"])) == {
+            "degree",
+            "ego_density",
+            "clustering",
+        }
+        assert set(cast(dict[str, float], report["degree_partialled_r2"])) == {
+            "ego_density",
+            "clustering",
+        }
+        pi = cast(dict[str, float | int], report["pi_shared_neighbor_consistency"])
+        assert pi["n_pairs"] == len(probes.select_probe_pairs(graph))
+        assert 0.0 <= pi["nonzero_fraction"] <= 1.0
+
+    def test_consumer_rejects_provenance_or_target_drift(self, tmp_path: Path) -> None:
+        path, graph, nodes, metadata = self._write(tmp_path)
+        wrong = {**metadata, "checkpoint_id": "wrong"}
+        with pytest.raises(ValueError, match="checkpoint_id"):
+            probes.evaluate_e2e_probe_artifact(
+                path, graph=graph, train_nodes=nodes, expected_metadata=wrong
+            )
+
+        with np.load(path, allow_pickle=False) as archive:
+            arrays = {key: archive[key] for key in archive.files}
+        arrays["degree"] = arrays["degree"].copy()
+        arrays["degree"][0] += 1.0
+        arrays["meta"] = np.array(json.dumps(json.loads(str(arrays["meta"].item()))))
+        np.savez_compressed(path, **arrays)
+        with pytest.raises(ValueError, match="target 'degree'"):
+            probes.evaluate_e2e_probe_artifact(
+                path, graph=graph, train_nodes=nodes, expected_metadata=metadata
+            )
+
+    def test_pair_selection_is_hash_deterministic(self) -> None:
+        graph = nx.Graph()
+        graph.add_edges_from([("b", "a"), ("c", "a"), ("d", "a")])
+        assert probes.select_probe_pairs(graph, limit=2) == probes.select_probe_pairs(
+            graph.copy(), limit=2
+        )
