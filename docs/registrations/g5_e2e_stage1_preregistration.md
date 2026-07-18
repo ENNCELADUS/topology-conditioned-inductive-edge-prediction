@@ -201,10 +201,10 @@ retained topology-derived node features — not that the gain is non-topological
 
 - **Worker:** `src/train_egostitch.py` records this file's sha256 as
   `run_metadata.json['preregistration_sha256']` at start; refuses formal
-  (non-`--max-steps`) runs unless `status == BINDING` and the literal
-  `REQUIRED-BEFORE-BINDING` marker is absent anywhere; `--max-steps` debug runs
-  accept DRAFT/unresolved markers but write only to `*_debug` output directories
-  and produce no held-out artifacts.
+  (non-`--max-steps`) runs unless `status == BINDING` and the worker's
+  pre-binding sentinel is absent from the serialized registration;
+  `--max-steps` debug runs accept DRAFT/unresolved markers but write only to
+  `*_debug` output directories and produce no held-out artifacts.
 - **Gate:** `src/experiments/g5_stage1.py` requires `status == BINDING`,
   the calibrated-comparator digest above, evaluator seed 0, exact candidate and
   arm provenance, the probe artifact, and this file's sha256 matching **all

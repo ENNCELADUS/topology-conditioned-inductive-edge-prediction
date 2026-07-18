@@ -422,6 +422,17 @@ class TestRegistrationRunMode:
         assert prepared == e2e_cfg
         assert is_debug is False
 
+    def test_tracked_binding_registration_is_formal_worker_accepted(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        cfg = te.load_config(root / "configs/egostitch_e2e_breadth_first.yaml")
+        cfg = replace(cfg, preregistration=root / cfg.preregistration)
+
+        prepared, is_debug, snapshot = te.prepare_ddp_run_config(cfg, max_steps=None)
+
+        assert prepared == cfg
+        assert is_debug is False
+        assert snapshot.payload["status"] == "BINDING"
+
     def test_debug_worker_redirects_and_marks_nonformal(self, tmp_path: Path) -> None:
         cfg = _toy_cfg(tmp_path)
 
