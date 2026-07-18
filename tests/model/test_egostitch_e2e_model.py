@@ -19,6 +19,7 @@ from src.model.egostitch.e2e_model import (
     counterpart_membership,
     grounded_identity_match,
 )
+from src.model.egostitch.imagine import SlotSet
 from src.model.egostitch.model import NodeEncoding
 
 
@@ -340,6 +341,40 @@ def test_self_pairs_encode_one_ego_and_use_exact_identity_plan(
     expected = torch.eye(model.generator_cfg.slots).expand(4, -1, -1)
     assert context.plan is not None
     assert torch.equal(context.plan, expected)
+
+
+def test_bf16_autocast_combines_self_and_sinkhorn_plans_in_fp32() -> None:
+    """The fp32 Sinkhorn island owns the assembled plan dtype under autocast."""
+    model, batch = _tiny_model_and_batch_with_grounding()
+    is_self = torch.tensor([True, False, True, False])
+    state_a = model.encode_node_state(
+        batch["emb_a"],
+        batch["len_a"],
+        batch["x_a"],
+        batch["ground_a"],
+        batch["ground_id_a"],
+    )
+    state_b = model.encode_node_state(
+        batch["emb_b"],
+        batch["len_b"],
+        batch["x_b"],
+        batch["ground_b"],
+        batch["ground_id_b"],
+    )
+    state_a = state_a._replace(
+        slots=SlotSet(*(value.to(torch.bfloat16) for value in state_a.slots))
+    )
+    state_b = state_b._replace(
+        slots=SlotSet(*(value.to(torch.bfloat16) for value in state_b.slots))
+    )
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        context = model.build_pair_context_from_states(state_a, state_b, is_self, need_cont=False)
+
+    assert context.plan is not None
+    assert context.plan.dtype == torch.float32
+    expected_identity = torch.eye(model.generator_cfg.slots)
+    assert torch.equal(context.plan[is_self], expected_identity.expand(2, -1, -1))
 
 
 def test_membership_is_content_only_and_content_null_ablates_it() -> None:

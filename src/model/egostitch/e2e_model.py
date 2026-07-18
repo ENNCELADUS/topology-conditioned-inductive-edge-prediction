@@ -298,7 +298,8 @@ class EgoStitchE2E(nn.Module):
         topo_ab: torch.Tensor | None = None
         topo_ba: torch.Tensor | None = None
         if need_topo:
-            plan = slots_a.pi.new_zeros((batch_size, slots, slots))
+            # Sinkhorn is an fp32 island, so its assembled destination must also be fp32.
+            plan = slots_a.pi.new_zeros((batch_size, slots, slots), dtype=torch.float32)
             self_rows = torch.nonzero(is_self, as_tuple=False).squeeze(-1)
             if self_rows.numel() > 0:
                 identity = torch.eye(slots, device=plan.device, dtype=plan.dtype)
