@@ -64,10 +64,10 @@ runtime:
   token_budget_candidates: [128, 256, 512]   # B_n candidates for this family
   max_pairs_per_rank: 1048576
   memory_limit_gib: 85.0
-  total_budget_seconds: 14400       # PROVISIONAL — replaced by measured profile before binding
+  total_budget_seconds: 29700       # measured H20 profile budget: 27000 train/eval + 2700 other stages
   pack_budget_seconds: 1200
   setup_probe_budget_seconds: 900
-  train_eval_budget_seconds: 11700
+  train_eval_budget_seconds: 27000
   artifact_budget_seconds: 120
   reserve_seconds: 480
   probe_warmup_steps: 5

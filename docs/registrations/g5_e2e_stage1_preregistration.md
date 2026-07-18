@@ -1,9 +1,10 @@
 # G5 E2E Stage-1 Screening Pre-registration (prose mirror)
 
 **Registration ID:** `g5-e2e-stage1-20260717-conditioned-encoder-screen-v1`
-**Status:** `DRAFT` — becomes `BINDING` only after the measured H20 cost profile is
-inserted and the user signs off the complete document. Formal training and the gate
-machine-reject anything except `BINDING` (spec §13.18).
+**Status:** `DRAFT` — the measured H20 cost profile and comparator digest are now
+inserted, but this becomes `BINDING` only after the user signs off the complete
+document. Formal training and the gate machine-reject anything except `BINDING`
+(spec §13.18).
 **Bindings:** spec `docs/05-egostitch-spec.md` §5/§13 (2026-07-17 rewrite, incl.
 §13.18) + §14; protocol `docs/03-experiment-protocol.md` §5.0.5, §5.2, E4.15–E4.17.
 **Predecessor:** `g5-stage1-20260716-membership-normalized-screen-v2`
@@ -46,11 +47,16 @@ Comparators: `b0`, `b0_cal_density`, `b0_cal_selfdensity`, `b0_cal_degseq`
 frozen-s0 screen and remains the bar). Frozen inputs (sha-pinned in the JSON): the
 B0 candidate scores artifact (`c5873caa…`, checkpoint `e092537d8cf1e208`), the G1
 results (`668129a7…`), the G3 results (`e7fbc8e4…`), and the exact candidate
-manifest (`bd8015bd…`). The calibrated-comparator payload is expected at
-`outputs/deliverables/b0_cal_20260714/b0cal_results.json`; its SHA remains
-`REQUIRED-BEFORE-BINDING` because that local deliverable is absent. Binding and
-formal gate evaluation fail closed until a real digest replaces the marker.
-The formal evaluator seed is exactly 0.
+manifest (`bd8015bd…`). The calibrated-comparator payload is pinned at
+`outputs/deliverables/b0_cal_20260714/b0cal_results.json` with SHA-256
+`833bcf2dcfb13c1d125a3a3b6325c02f0739a7c0092126091049516f1f5b2638`. It was
+curated from `outputs/b0_cal/b0cal_results.json` in the H20 checkout
+`/2023533015/topology-conditioned-inductive-edge-prediction` at commit
+`944e0689b1daa5355390dd27e4bf78449ba9052d`; lineage verifies checkpoint
+`e092537d8cf1e208`, model family `v3_1`, 2,037,171 candidate rows, strategy
+`breadth_first`, and a matched G3 B0 threshold cross-check. The curated
+deliverable directory contains exactly one `b0cal_results.json`. The formal
+evaluator seed is exactly 0.
 
 ## Operating points
 
@@ -127,9 +133,52 @@ consistency. This evidence is required output but remains nonbinding.
 
 ## Cost report
 
-Measured H20 profile is **REQUIRED-BEFORE-BINDING**: per-step wall, peak memory,
-30-epoch extrapolation per arm (×4), candidate scoring latency (×5 passes). The
-frozen-s0 673 s / 2.04 GiB profile explicitly does not extrapolate.
+Measured on the H20 checkout
+`/2023533015/topology-conditioned-inductive-edge-prediction` at commit
+`944e0689b1daa5355390dd27e4bf78449ba9052d` on 2 × NVIDIA H20. The debug profile is
+`outputs/egostitch_e2e_stage1/full_debug/profile.json` with SHA-256
+`63311e05ab4c826822d24900524ac0016939e44623e52c47f11bcf6d816a59d9`; it is
+`run_kind: debug` and published no formal artifacts.
+
+| Quantity | Measured / projected value |
+|---|---:|
+| Selected `B_n` | 128 |
+| Edge batch | 128 |
+| Peak GPU memory | 65.265579 GiB / 85 GiB guard |
+| Slowest-rank 50-step wall | 291.490505 s |
+| Validation wall in probe | 142.941941 s |
+| Mean training-step wall | 2.970971 s |
+| `E_sup` positives / negative ratio | 8,576 / 5 |
+| Global rows per epoch | 51,456 |
+| Steps per epoch | 201 |
+| Train+validation wall per epoch | 740.107168 s |
+| 30-epoch train+validation wall per arm | 22,203.215037 s (6.167560 h) |
+| Warm-pack wall | 13.558853 s |
+| Setup/probe wall | 603.028104 s |
+| Artifact allowance | 120 s |
+| Complete projected pipeline per arm | 22,939.801994 s (6.372167 h) |
+| Complete projected pipeline, 4 arms sequential | 91,759.207977 s (25.488669 h) |
+
+The configured conservative measured per-arm runtime budget is
+`train_eval_budget_seconds: 27000` and `total_budget_seconds: 29700`; the other
+budget components sum to 2,700 s, so the total remains exact. This leaves
+6,760.198006 s of per-arm margin against the measured complete-pipeline
+projection.
+
+The fp32 scoring probe is
+`outputs/egostitch_e2e_stage1/full_debug/probe_10k_fp32_944e068.npz` with SHA-256
+`8fd490d36ba71391bbcada172eda630bb0f12f4b3488c2f02fa70c07f474d869`; its pair
+manifest SHA-256 is
+`c64f221da33cbd399f9b4962b18d771e8603d7eba58d3885253d5f693ba5af74`. The probe
+scored 10,000 rows over 1,926 unique nodes, with max concurrent shard compute wall
+696.322164 s and end-to-end runner wall 710.621 s. The registered compute-wall
+throughput convention gives 14.361169 rows/s, so the plan-required linear estimate
+for 2,037,171 rows is 141,852.731937 s (39.403537 h) per artifact and
+709,263.659684 s (197.017683 h) for five passes. This is deliberately conservative:
+the 10k probe includes a near-full unique-node scan (1,926 nodes) that is largely
+fixed cost rather than row-linear pair work. All four arrays are fp32, the precision
+contract is `egostitch_e2e_pair_fp32_v1`, pair autocast is false, and the
+resolution guard passed.
 
 ## Verdict rule
 
@@ -153,14 +202,14 @@ retained topology-derived node features — not that the gain is non-topological
 
 - **Worker:** `src/train_egostitch.py` records this file's sha256 as
   `run_metadata.json['preregistration_sha256']` at start; refuses formal
-  (non-`--max-steps`) runs unless `status == BINDING` and no
-  `REQUIRED-BEFORE-BINDING` marker remains anywhere; `--max-steps` debug runs
+  (non-`--max-steps`) runs unless `status == BINDING` and all pre-binding
+  markers have been resolved; `--max-steps` debug runs
   accept DRAFT/unresolved markers but write only to `*_debug` output directories
   and produce no held-out artifacts.
 - **Gate:** `src/experiments/g5_stage1.py` requires `status == BINDING`,
-  a real calibrated-comparator digest, evaluator seed 0, exact candidate and arm
-  provenance, the probe artifact, and this file's sha256 matching **all four**
-  formal run metadatas (full, f_only, pair_topology, p0).
+  the calibrated-comparator digest above, evaluator seed 0, exact candidate and
+  arm provenance, the probe artifact, and this file's sha256 matching **all
+  four** formal run metadatas (full, f_only, pair_topology, p0).
 - **Hyperparameters:** spec §13.18 defaults × fixed Seed 0; no sweeps inside this
   screen.
 - **P4 exclusion:** no hard heuristic/feature negatives and no hard-negative

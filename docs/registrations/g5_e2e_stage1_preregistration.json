@@ -69,7 +69,19 @@
     },
     "b0cal_results": {
       "path": "outputs/deliverables/b0_cal_20260714/b0cal_results.json",
-      "sha256": "REQUIRED-BEFORE-BINDING"
+      "sha256": "833bcf2dcfb13c1d125a3a3b6325c02f0739a7c0092126091049516f1f5b2638",
+      "source_path": "outputs/b0_cal/b0cal_results.json",
+      "source_sha256": "833bcf2dcfb13c1d125a3a3b6325c02f0739a7c0092126091049516f1f5b2638",
+      "lineage": {
+        "remote_checkout": "/2023533015/topology-conditioned-inductive-edge-prediction",
+        "commit": "944e0689b1daa5355390dd27e4bf78449ba9052d",
+        "checkpoint_id": "e092537d8cf1e208",
+        "model_family": "v3_1",
+        "candidate_rows": 2037171,
+        "strategy": "breadth_first",
+        "g3_b0_threshold_cross_check": "matched",
+        "curation": "copied to outputs/deliverables/b0_cal_20260714/b0cal_results.json; directory contains exactly one b0cal_results.json"
+      }
     }
   },
   "evaluator": {
@@ -155,14 +167,76 @@
     "verdict_effect": "none (required output evidence, nonbinding)"
   },
   "cost_report": {
-    "requirement": "measured H20 profile REQUIRED-BEFORE-BINDING: per-step wall, peak memory, 30-epoch extrapolation per arm (x4 arms), candidate scoring latency (x5 passes); the frozen-s0 673 s / 2.04 GiB profile explicitly does not extrapolate",
-    "measured": "REQUIRED-BEFORE-BINDING"
+    "requirement": "measured H20 profile: per-step wall, peak memory, 30-epoch extrapolation per arm (x4 arms), candidate scoring latency (x5 passes); the frozen-s0 673 s / 2.04 GiB profile explicitly does not extrapolate",
+    "measured": {
+      "remote_checkout": "/2023533015/topology-conditioned-inductive-edge-prediction",
+      "commit": "944e0689b1daa5355390dd27e4bf78449ba9052d",
+      "hardware": "2 x NVIDIA H20",
+      "training_profile": {
+        "path": "outputs/egostitch_e2e_stage1/full_debug/profile.json",
+        "sha256": "63311e05ab4c826822d24900524ac0016939e44623e52c47f11bcf6d816a59d9",
+        "run_kind": "debug",
+        "formal_artifacts_published": false,
+        "world_size": 2,
+        "selected_node_batch": 128,
+        "edge_batch": 128,
+        "peak_memory_gib_max": 65.26557922363281,
+        "memory_guard_gib": 85.0,
+        "slowest_rank_50_step_wall_seconds": 291.4905052445829,
+        "validation_wall_seconds": 142.9419414550066,
+        "mean_training_step_wall_seconds": 2.9709712757915256,
+        "e_sup_positives": 8576,
+        "negative_ratio": 5,
+        "global_rows_per_epoch": 51456,
+        "steps_per_epoch": 201,
+        "projected_train_validation_wall_per_epoch_seconds": 740.1071678891033,
+        "projected_30_epoch_train_validation_wall_per_arm_seconds": 22203.215036673097,
+        "projected_30_epoch_train_validation_wall_per_arm_hours": 6.1675597324091935,
+        "measured_warm_pack_wall_seconds": 13.558853030204773,
+        "setup_probe_wall_seconds": 603.0281044580042,
+        "artifact_allowance_seconds": 120.0,
+        "projected_complete_pipeline_per_arm_seconds": 22939.801994161306,
+        "projected_complete_pipeline_per_arm_hours": 6.372167220600363,
+        "projected_four_arm_complete_pipeline_seconds": 91759.20797664522,
+        "projected_four_arm_complete_pipeline_hours": 25.488668882401452
+      },
+      "scoring_profile": {
+        "path": "outputs/egostitch_e2e_stage1/full_debug/probe_10k_fp32_944e068.npz",
+        "sha256": "8fd490d36ba71391bbcada172eda630bb0f12f4b3488c2f02fa70c07f474d869",
+        "pair_manifest_sha256": "c64f221da33cbd399f9b4962b18d771e8603d7eba58d3885253d5f693ba5af74",
+        "rows": 10000,
+        "unique_nodes": 1926,
+        "max_concurrent_shard_compute_wall_seconds": 696.3221641033888,
+        "end_to_end_runner_wall_seconds": 710.621,
+        "registered_compute_throughput_rows_per_second": 14.361168602002472,
+        "candidate_rows": 2037171,
+        "linear_extrapolated_wall_per_artifact_seconds": 141852.73193686648,
+        "linear_extrapolated_wall_per_artifact_hours": 39.40353664912958,
+        "five_pass_linear_extrapolated_wall_seconds": 709263.6596843323,
+        "five_pass_linear_extrapolated_wall_hours": 197.01768324564787,
+        "precision": "fp32",
+        "provenance": "egostitch_e2e_pair_fp32_v1",
+        "pair_autocast": false,
+        "resolution_guard": "passed",
+        "linear_estimate_caveat": "Plan-required linear estimate; conservative because the 10k probe includes a near-full unique-node scan (1,926 nodes) that is largely fixed cost rather than row-linear pair work."
+      },
+      "budget": {
+        "per_arm_train_eval_budget_seconds": 27000,
+        "other_components_seconds": 2700,
+        "total_budget_seconds": 29700,
+        "per_arm_projected_complete_pipeline_seconds": 22939.801994161306,
+        "per_arm_budget_margin_seconds": 6760.198005838694,
+        "formal_training_arms": 4,
+        "scoring_passes": 5,
+        "budget_status": "per-arm training budget is conservative for measured train/eval; scoring estimate is recorded for planning and is not folded into per-arm training timeout"
+      }
+    }
   },
   "verdict_rule": "single-seed screening pass iff the full arm strictly dominates every comparator on all three primary criteria at the registered operating points, both guards pass, liveness passes, and both e2e_rules decision conditions pass",
   "failure_reading": "If the full arm fails the primary family against the B0+cal comparator set, the topology-conditioned encoder does not beat calibrated independent scoring at this stage; the result is written up honestly and the locked-decision discussion is taken before any Stage-2 mechanism or E1 registration. If the primaries pass but pathway attribution fails, the honest conclusion is content-side information. If the primaries pass but the structure-control condition fails, the honest conclusion is that shuffled relational connectivity was not necessary beyond the retained topology-derived node features - not that the gain is non-topological.",
   "mechanics": {
-    "worker_obligation": "src/train_egostitch.py records this file's sha256 as run_metadata.json['preregistration_sha256'] at start; it refuses formal (non --max-steps) runs unless status == BINDING and no REQUIRED-BEFORE-BINDING marker remains anywhere; --max-steps debug runs accept DRAFT/unresolved markers but write only to *_debug output directories and produce no held-out artifacts",
-    "gate_obligation": "src/experiments/g5_stage1.py requires status == BINDING, a real b0cal_results digest in place of REQUIRED-BEFORE-BINDING, evaluator seed 0, exact frozen candidate pair/label identity, exact per-arm scoring provenance, the provenance-bound probe artifact, and this file's sha256 matching ALL FOUR formal run metadatas (full, f_only, pair_topology, p0)",
+    "worker_obligation": "src/train_egostitch.py records this file's sha256 as run_metadata.json['preregistration_sha256'] at start; it refuses formal (non --max-steps) runs unless status == BINDING and all pre-binding markers have been resolved; --max-steps debug runs accept DRAFT/unresolved markers but write only to *_debug output directories and produce no held-out artifacts",
+    "gate_obligation": "src/experiments/g5_stage1.py requires status == BINDING, a real b0cal_results digest, evaluator seed 0, exact frozen candidate pair/label identity, exact per-arm scoring provenance, the provenance-bound probe artifact, and this file's sha256 matching ALL FOUR formal run metadatas (full, f_only, pair_topology, p0)",
     "hyperparameters": "spec §13.18 defaults x fixed Seed 0; no sweeps inside this screen",
     "p4_exclusion": "no hard heuristic/feature negatives and no hard-negative checkpoint criterion are added in this revision"
   }
