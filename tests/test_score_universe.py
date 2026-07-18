@@ -1573,15 +1573,21 @@ def test_egostitch_e2e_merge_preserves_four_arrays_in_manifest_order(tmp_path: P
     # Merged rows are remapped onto the sorted node-id union but otherwise keep
     # each row's own quadruple aligned; comparing by pair identity against the
     # unsharded run confirms manifest order (row <-> quadruple) is preserved.
+    # Ordinary sharded scoring may use different pair-batch shapes, so compare
+    # within the same explicit fp32 tolerance as cached-vs-direct decomposition.
     merged_index = {pair: row for row, pair in enumerate(merged.pairs())}
     unsharded_index = {pair: row for row, pair in enumerate(unsharded.pairs())}
     assert set(merged_index) == set(unsharded_index) == set(_E2E_PAIRS)
     for pair in _E2E_PAIRS:
         m_row, u_row = merged_index[pair], unsharded_index[pair]
-        assert merged.logit[m_row] == pytest.approx(unsharded.logit[u_row])
-        assert merged.f_logit[m_row] == pytest.approx(unsharded.f_logit[u_row])
-        assert merged.pair_content[m_row] == pytest.approx(unsharded.pair_content[u_row])
-        assert merged.pair_topology[m_row] == pytest.approx(unsharded.pair_topology[u_row])
+        assert merged.logit[m_row] == pytest.approx(unsharded.logit[u_row], rel=1e-5, abs=2e-6)
+        assert merged.f_logit[m_row] == pytest.approx(unsharded.f_logit[u_row], rel=1e-5, abs=2e-6)
+        assert merged.pair_content[m_row] == pytest.approx(
+            unsharded.pair_content[u_row], rel=1e-5, abs=2e-6
+        )
+        assert merged.pair_topology[m_row] == pytest.approx(
+            unsharded.pair_topology[u_row], rel=1e-5, abs=2e-6
+        )
 
 
 # --------------------------------------------------------------------------- artifact-aware
