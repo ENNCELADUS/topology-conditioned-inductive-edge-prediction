@@ -1,10 +1,9 @@
 # G5 E2E Stage-1 Screening Pre-registration (prose mirror)
 
 **Registration ID:** `g5-e2e-stage1-20260717-conditioned-encoder-screen-v1`
-**Status:** `DRAFT` — the measured H20 cost profile and comparator digest are now
-inserted, but this becomes `BINDING` only after the user signs off the complete
-document. Formal training and the gate machine-reject anything except `BINDING`
-(spec §13.18).
+**Status:** `BINDING` — approved by the user on 2026-07-18 after review of the
+complete registration, measured H20 cost profile, and comparator digest. Formal
+training and the gate machine-reject anything except `BINDING` (spec §13.18).
 **Bindings:** spec `docs/05-egostitch-spec.md` §5/§13 (2026-07-17 rewrite, incl.
 §13.18) + §14; protocol `docs/03-experiment-protocol.md` §5.0.5, §5.2, E4.15–E4.17.
 **Predecessor:** `g5-stage1-20260716-membership-normalized-screen-v2`

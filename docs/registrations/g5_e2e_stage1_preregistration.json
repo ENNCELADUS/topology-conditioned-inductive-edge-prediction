@@ -1,6 +1,6 @@
 {
   "registration_id": "g5-e2e-stage1-20260717-conditioned-encoder-screen-v1",
-  "status": "DRAFT",
+  "status": "BINDING",
   "gate": "G5 Stage 1 - EgoStitch E2E stitched-topology-conditioned pair encoder",
   "created_utc": "2026-07-17T00:00:00Z",
   "spec_binding": "docs/05-egostitch-spec.md §5/§13 (2026-07-17 rewrite, incl. §13.18) + §14",
