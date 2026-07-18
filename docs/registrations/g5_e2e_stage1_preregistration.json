@@ -1,6 +1,7 @@
 {
   "registration_id": "g5-e2e-stage1-20260717-conditioned-encoder-screen-v1",
   "status": "BINDING",
+  "binding_amendment": "2026-07-18 user-authorized pre-training systems amendment: after no checkpoint or held-out result was produced, setup_probe_budget_seconds increased from 900 to 1500 and total_budget_seconds from 29700 to 30300 so the registered full-epoch probe can finish; model, data, seed, training, scoring, and verdict contracts are unchanged",
   "gate": "G5 Stage 1 - EgoStitch E2E stitched-topology-conditioned pair encoder",
   "created_utc": "2026-07-17T00:00:00Z",
   "spec_binding": "docs/05-egostitch-spec.md §5/§13 (2026-07-17 rewrite, incl. §13.18) + §14",
@@ -222,10 +223,10 @@
       },
       "budget": {
         "per_arm_train_eval_budget_seconds": 27000,
-        "other_components_seconds": 2700,
-        "total_budget_seconds": 29700,
+        "other_components_seconds": 3300,
+        "total_budget_seconds": 30300,
         "per_arm_projected_complete_pipeline_seconds": 22939.801994161306,
-        "per_arm_budget_margin_seconds": 6760.198005838694,
+        "per_arm_budget_margin_seconds": 7360.198005838694,
         "formal_training_arms": 4,
         "scoring_passes": 5,
         "budget_status": "per-arm training budget is conservative for measured train/eval; scoring estimate is recorded for planning and is not folded into per-arm training timeout"

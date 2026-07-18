@@ -4,6 +4,11 @@
 **Status:** `BINDING` — approved by the user on 2026-07-18 after review of the
 complete registration, measured H20 cost profile, and comparator digest. Formal
 training and the gate machine-reject anything except `BINDING` (spec §13.18).
+**Systems amendment:** user-authorized on 2026-07-18 after the first formal
+attempt stopped in `epoch_probe` before producing any checkpoint or held-out
+result. `setup_probe_budget_seconds` increased from 900 to 1,500 and
+`total_budget_seconds` from 29,700 to 30,300; every model, data, seed, training,
+scoring, and verdict contract is unchanged.
 **Bindings:** spec `docs/05-egostitch-spec.md` §5/§13 (2026-07-17 rewrite, incl.
 §13.18) + §14; protocol `docs/03-experiment-protocol.md` §5.0.5, §5.2, E4.15–E4.17.
 **Predecessor:** `g5-stage1-20260716-membership-normalized-screen-v2`
@@ -159,9 +164,9 @@ Measured on the H20 checkout
 | Complete projected pipeline, 4 arms sequential | 91,759.207977 s (25.488669 h) |
 
 The configured conservative measured per-arm runtime budget is
-`train_eval_budget_seconds: 27000` and `total_budget_seconds: 29700`; the other
-budget components sum to 2,700 s, so the total remains exact. This leaves
-6,760.198006 s of per-arm margin against the measured complete-pipeline
+`train_eval_budget_seconds: 27000` and `total_budget_seconds: 30300`; the other
+budget components sum to 3,300 s, so the total remains exact. This leaves
+7,360.198006 s of per-arm margin against the measured complete-pipeline
 projection.
 
 The fp32 scoring probe is
