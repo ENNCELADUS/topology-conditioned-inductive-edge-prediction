@@ -22,7 +22,7 @@ data:
   partition_seed: 0
   msg_fraction: 0.8                 # pinned (spec §9.3)
   node_batch: 256                   # B_n default (spec §10.1)
-  edge_batch: 512                   # B_e default (spec §10.1)
+  edge_batch: 128                   # packed-token E2E B_e (measured H20-safe; spec §10.1)
   f0_cache: outputs/feature_packs/egostitch_f0/f0_matrix.pt
   grounding_cache: outputs/feature_packs/egostitch_f0/grounding.npz
   pack_dir: outputs/feature_packs/egostitch_e2e_tokens   # raw-token pack (spec §13.18 family; no s0 cache — §13.10 retired)

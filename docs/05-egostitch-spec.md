@@ -419,7 +419,7 @@ process (defaults sweep ±2×):
 |---|---|---|---|
 | node stream | uniform over V_train (`accelerator.prepare`, §11.0) | B_n = 256 nodes | L_recon, L_ssl |
 | joint-pair stream | 50% E_msg edges / 50% random train pairs (§4) | B_p = 128 pairs | L_joint |
-| edge stream | E_sup positives + resampled negatives | B_e = 512 pairs (1:5 → ~85 pos) | L_edge |
+| edge stream | E_sup positives + resampled negatives | frozen-s0: B_e = 512 pairs/rank; packed-token E2E: B_e = 128 pairs/rank (both 1:5) | L_edge |
 
 Curriculum (§8) toggles streams: stage 1 node-only; stage 2 node + joint; stage 3
 all. An **epoch** = one full pass over E_sup in the edge stream; node and joint
@@ -491,6 +491,10 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-18: §10.1 pins packed-token E2E `B_e = 128` per rank after the Task-8 two-H20
+  profile measured 63.86 GiB peak below the 85 GiB guard; the inherited
+  `B_e = 512` deterministically exhausted a 95 GiB H20 and remains the
+  frozen-s0/F0 default.
 - 2026-07-09: initial freeze draft (from 04-model-proposal.md rev 2.1 §4 + panel
   findings R1-W1/W2/W6, R3-W1/W2/W4/W5/W7).
 - 2026-07-09: **G4 signed off** — spec becomes the implementation contract.

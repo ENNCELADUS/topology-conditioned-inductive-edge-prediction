@@ -289,7 +289,7 @@ data:
   partition_seed: 0
   msg_fraction: 0.8                 # pinned (spec §9.3)
   node_batch: 256
-  edge_batch: 512
+  edge_batch: 128                 # Task-8 measured H20-safe packed-token batch
   f0_cache: outputs/feature_packs/egostitch_f0/f0_matrix.pt
   grounding_cache: outputs/feature_packs/egostitch_f0/grounding.npz
   pack_dir: outputs/feature_packs/egostitch_e2e_tokens   # raw-token pack (plan Task 12)
