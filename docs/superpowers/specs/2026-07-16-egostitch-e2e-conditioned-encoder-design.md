@@ -1,5 +1,13 @@
 # EgoStitch E2E Redesign: Stitched-Topology-Conditioned Pair Encoder
 
+> **2026-07-19 training-contract disposition:** the architecture and attribution
+> design in this note remain approved, but its reconstruction-only warm-start wording
+> is historical v1. For the prospective stability-screen v2, normative spec §13.19
+> trains the pair trunk/head with `L_edge(f_logit)` from step 0, hard-bypasses
+> topology/content until a conditioning ramp, and uses post-ramp arm-specific
+> eligibility. The v2 registration must remain DRAFT until its qualification contract
+> binds.
+
 **Date:** 2026-07-16 (rev 2, same day — after the second user-as-reviewer round)
 **Status:** APPROVED (user-as-reviewer verdict 2026-07-16: Minor Revision passed,
 corrections applied in rev 3). **Research-doc landing executed 2026-07-16 by explicit

@@ -1,5 +1,12 @@
 # EgoStitch E2E Stage-1 Screen — Experiment Plan
 
+> **2026-07-19 disposition:** this is the historical v1 screen plan. The v1 full arm
+> completed only its engineering training pipeline and was training-invalid; it did
+> not produce a G5 verdict. Prospective v2 execution is governed by spec §13.19 and
+> the v2 DRAFT registration: qualify without test inputs, bind, train `full`, stop if
+> invalid, then train the remaining arms; aborted runs publish failure metadata only,
+> never `complete.json` or score artifacts.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task.
 > Steps use checkbox (`- [ ]`) syntax for tracking.

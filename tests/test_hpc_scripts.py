@@ -28,6 +28,7 @@ def test_hpc_layer_has_only_runners_and_documentation() -> None:
         "README.md",
         "g5_stage1.sh",
         "run.sh",
+        "v2_qualification.sh",
     ]
     assert not (REPO_ROOT / "slurm").exists()
 

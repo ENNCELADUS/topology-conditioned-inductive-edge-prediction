@@ -1,0 +1,353 @@
+"""V2 fail-closed scoring provenance and four-array publication tests."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+from src import score_universe
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_v2_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
+    config = tmp_path / "full.yaml"
+    config.write_text("model:\n  family: egostitch_e2e\n", encoding="utf-8")
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"selected checkpoint")
+    digest_record = {"path": "evidence.json", "sha256": "1" * 64}
+    registration = {
+        "status": "BINDING",
+        "arms": {
+            "full": {"training": str(config)},
+            "b0_e2e_f_only": {"training": "f.yaml"},
+            "pair_topology": {"training": "pt.yaml"},
+            "p0": {"training": "p0.yaml"},
+        },
+        "binding_evidence": {
+            "schema_version": "egostitch_e2e_binding_evidence_v1",
+            "implementation": {"commit": "a" * 40},
+            "configs": {
+                "full": {"path": str(config), "sha256": _sha256(config)},
+                "b0_e2e_f_only": {"path": "f.yaml", "sha256": "2" * 64},
+                "pair_topology": {"path": "pt.yaml", "sha256": "3" * 64},
+                "p0": {"path": "p0.yaml", "sha256": "4" * 64},
+            },
+            "parameter_group_manifests": digest_record,
+            "packs_and_validation_manifests": digest_record,
+            "qualification_attempts": [digest_record],
+            "boundary_access_audit": digest_record,
+            "runtime_and_peak_memory": {"runtime_seconds": 1.0, "peak_memory_bytes": 1},
+            "checkpoint_policy_version": "v2",
+        },
+    }
+    registration_path = tmp_path / "registration.json"
+    registration_path.write_text(json.dumps(registration), encoding="utf-8")
+    checkpoint_id = "0123456789abcdef"
+    metadata = {
+        "arm": "full",
+        "run_kind": "formal",
+        "status": "complete",
+        "formal_artifacts_published": True,
+        "selected_checkpoint_eligible": True,
+        "model_family": "egostitch_e2e",
+        "config_path": str(config.resolve()),
+        "config_sha256": _sha256(config),
+        "preregistration_sha256": _sha256(registration_path),
+        "implementation_commit": "a" * 40,
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_sha256": _sha256(checkpoint),
+    }
+    metadata_path = tmp_path / "run_metadata.json"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    return registration_path, metadata_path, checkpoint, checkpoint_id
+
+
+def test_v2_formal_scoring_provenance_accepts_exact_binding(tmp_path: Path) -> None:
+    registration, metadata, checkpoint, checkpoint_id = _write_v2_provenance(tmp_path)
+
+    provenance = score_universe._validate_e2e_scoring_provenance(
+        registration_path=registration,
+        run_metadata_path=metadata,
+        checkpoint_path=checkpoint,
+        checkpoint_id=checkpoint_id,
+    )
+
+    assert provenance["arm"] == "full"
+    assert provenance["registration_sha256"] == _sha256(registration)
+    assert provenance["checkpoint_sha256"] == _sha256(checkpoint)
+    assert provenance["selected_checkpoint_eligible"] is True
+
+
+@pytest.mark.parametrize(
+    ("target", "field", "value", "match"),
+    [
+        ("registration", "status", "DRAFT", "status 'BINDING'"),
+        ("metadata", "run_kind", "debug", "debug/non-formal"),
+        ("metadata", "status", "started", "complete formal"),
+        ("metadata", "selected_checkpoint_eligible", False, "eligible selected"),
+        ("metadata", "implementation_commit", "b" * 40, "implementation_commit"),
+        ("metadata", "checkpoint_sha256", "b" * 64, "checkpoint_sha256"),
+    ],
+)
+def test_v2_provenance_rejects_invalid_run_before_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    field: str,
+    value: object,
+    match: str,
+) -> None:
+    registration, metadata, checkpoint, checkpoint_id = _write_v2_provenance(tmp_path)
+    path = registration if target == "registration" else metadata
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload[field] = value
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    if target == "registration":
+        run = json.loads(metadata.read_text(encoding="utf-8"))
+        run["preregistration_sha256"] = _sha256(registration)
+        metadata.write_text(json.dumps(run), encoding="utf-8")
+
+    monkeypatch.setattr(
+        score_universe,
+        "_load_checkpoint",
+        lambda *_args, **_kwargs: (torch.nn.Linear(1, 1), "egostitch_e2e", checkpoint_id),
+    )
+    output = tmp_path / "forbidden.npz"
+    with pytest.raises(ValueError, match=match):
+        score_universe.main(
+            [
+                "score",
+                "--checkpoint",
+                str(checkpoint),
+                "--pairs",
+                "candidate",
+                "--output",
+                str(output),
+                "--preregistration",
+                str(registration),
+                "--run-metadata",
+                str(metadata),
+            ]
+        )
+    assert not output.exists()
+
+
+def test_v2_rejects_required_marker_and_bad_config_digest(tmp_path: Path) -> None:
+    registration, metadata, checkpoint, checkpoint_id = _write_v2_provenance(tmp_path)
+    payload = json.loads(registration.read_text(encoding="utf-8"))
+    payload["required_before_binding"] = ["REQUIRED-BEFORE-BINDING: rehearsal"]
+    registration.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="REQUIRED-BEFORE-BINDING"):
+        score_universe._validate_e2e_scoring_provenance(
+            registration_path=registration,
+            run_metadata_path=metadata,
+            checkpoint_path=checkpoint,
+            checkpoint_id=checkpoint_id,
+        )
+
+    registration, metadata, checkpoint, checkpoint_id = _write_v2_provenance(tmp_path)
+    payload = json.loads(registration.read_text(encoding="utf-8"))
+    payload["binding_evidence"]["configs"]["full"]["sha256"] = "f" * 64
+    registration.write_text(json.dumps(payload), encoding="utf-8")
+    run = json.loads(metadata.read_text(encoding="utf-8"))
+    run["preregistration_sha256"] = _sha256(registration)
+    run["config_sha256"] = "f" * 64
+    metadata.write_text(json.dumps(run), encoding="utf-8")
+    with pytest.raises(ValueError, match="registered config digest mismatch"):
+        score_universe._validate_e2e_scoring_provenance(
+            registration_path=registration,
+            run_metadata_path=metadata,
+            checkpoint_path=checkpoint,
+            checkpoint_id=checkpoint_id,
+        )
+
+
+def test_file_alias_of_candidate_manifest_still_requires_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _registration, _metadata, checkpoint, checkpoint_id = _write_v2_provenance(tmp_path)
+    candidate = (
+        tmp_path
+        / "data"
+        / "benchmark_2025_neurips"
+        / "breadth_first"
+        / "candidate_test_edges.txt"
+    )
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text("a\tb\n", encoding="utf-8")
+    alias = tmp_path / "copied-candidate.tsv"
+    alias.write_bytes(candidate.read_bytes() + b"\n")
+    monkeypatch.setattr(
+        score_universe,
+        "_load_checkpoint",
+        lambda *_args, **_kwargs: (torch.nn.Linear(1, 1), "egostitch_e2e", checkpoint_id),
+    )
+    output = tmp_path / "forbidden.npz"
+
+    with pytest.raises(ValueError, match="requires --preregistration"):
+        score_universe.main(
+            [
+                "score",
+                "--checkpoint",
+                str(checkpoint),
+                "--pairs",
+                f"file:{alias}",
+                "--data-root",
+                str(tmp_path / "data"),
+                "--output",
+                str(output),
+            ]
+        )
+    assert not output.exists()
+
+
+def test_candidate_scoring_requires_all_four_arm_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registration, metadata, checkpoint, checkpoint_id = _write_v2_provenance(tmp_path)
+    monkeypatch.setattr(
+        score_universe,
+        "_load_checkpoint",
+        lambda *_args, **_kwargs: (torch.nn.Linear(1, 1), "egostitch_e2e", checkpoint_id),
+    )
+    output = tmp_path / "forbidden.npz"
+    with pytest.raises(ValueError, match="exactly four arm metadata"):
+        score_universe.main(
+            [
+                "score",
+                "--checkpoint",
+                str(checkpoint),
+                "--pairs",
+                "candidate",
+                "--output",
+                str(output),
+                "--preregistration",
+                str(registration),
+                "--run-metadata",
+                str(metadata),
+            ]
+        )
+    assert not output.exists()
+
+
+def test_e2e_artifact_physically_stores_all_four_decomposition_arrays(tmp_path: Path) -> None:
+    output = tmp_path / "scores.npz"
+    values = np.array([0.1, 0.2], dtype=np.float32)
+    meta: dict[str, object] = {
+        "checkpoint_id": "checkpoint",
+        "model_family": "egostitch_e2e",
+        "pairs_source": "candidate",
+        "strategy": "toy",
+        "num_rows": 2,
+        "created_utc": "2026-07-19T00:00:00Z",
+        "torch_version": "test",
+        "permanent_null": "none",
+        "primary_logit": "full",
+        "score_precision": {
+            "contract": "egostitch_e2e_pair_fp32_v1",
+            "pair_compute_dtype": "float32",
+            "pair_autocast": False,
+            "logit_storage_dtype": "float32",
+        },
+    }
+    score_universe.save_scores(
+        output,
+        node_ids=["a", "b"],
+        u_idx=np.array([0, 0], dtype=np.int32),
+        v_idx=np.array([1, 1], dtype=np.int32),
+        logit=values,
+        label=np.array([-1, -1], dtype=np.int8),
+        row_start=0,
+        meta=meta,
+        f_logit=values + 1,
+        pair_content=values + 2,
+        pair_topology=values + 3,
+    )
+
+    with np.load(output, allow_pickle=False) as artifact:
+        assert {"full", "f_logit", "pair_content", "pair_topology"} <= set(artifact.files)
+        np.testing.assert_array_equal(artifact["full"], artifact["logit"])
+
+
+def test_loader_accepts_v1_e2e_artifact_without_explicit_full_array(tmp_path: Path) -> None:
+    output = tmp_path / "legacy-v1.npz"
+    values = np.array([0.1], dtype=np.float32)
+    resolution = score_universe.score_resolution_diagnostics(values)
+    meta = {
+        "checkpoint_id": "checkpoint",
+        "model_family": "egostitch_e2e",
+        "pairs_source": "candidate",
+        "strategy": "toy",
+        "num_rows": 1,
+        "created_utc": "2026-07-19T00:00:00Z",
+        "torch_version": "test",
+        "permanent_null": "none",
+        "primary_logit": "full",
+        "score_precision": {
+            "contract": "egostitch_e2e_pair_fp32_v1",
+            "pair_compute_dtype": "float32",
+            "pair_autocast": False,
+            "logit_storage_dtype": "float32",
+        },
+        "score_resolution": dict.fromkeys(
+            ("full", "f_logit", "pair_content", "pair_topology"), resolution
+        ),
+    }
+    np.savez_compressed(
+        output,
+        node_ids=np.array(["a", "b"]),
+        u_idx=np.array([0], dtype=np.int32),
+        v_idx=np.array([1], dtype=np.int32),
+        logit=values,
+        label=np.array([-1], dtype=np.int8),
+        row_start=np.int64(0),
+        meta=np.array(json.dumps(meta)),
+        f_logit=values,
+        pair_content=values,
+        pair_topology=values,
+    )
+
+    artifact = score_universe.load_scores(output)
+    assert artifact.full_logit is None
+    score_universe.validate_artifact_precision(artifact)
+
+
+def test_formal_v2_loader_rejects_missing_or_contradictory_full_array(tmp_path: Path) -> None:
+    output = tmp_path / "malformed-v2.npz"
+    values = np.array([0.1], dtype=np.float32)
+    resolution = score_universe.score_resolution_diagnostics(values)
+    meta = {
+        "model_family": "egostitch_e2e",
+        "primary_logit": "full",
+        "formal_scoring_provenance": {"registration_sha256": "a" * 64},
+        "score_resolution": dict.fromkeys(
+            ("full", "f_logit", "pair_content", "pair_topology"), resolution
+        ),
+    }
+    common = {
+        "node_ids": np.array(["a", "b"]),
+        "u_idx": np.array([0], dtype=np.int32),
+        "v_idx": np.array([1], dtype=np.int32),
+        "logit": values,
+        "label": np.array([-1], dtype=np.int8),
+        "row_start": np.int64(0),
+        "meta": np.array(json.dumps(meta)),
+        "f_logit": values,
+        "pair_content": values,
+        "pair_topology": values,
+    }
+    np.savez_compressed(output, **common)
+    with pytest.raises(ValueError, match="missing full"):
+        score_universe.load_scores(output)
+
+    np.savez_compressed(output, **common, full=values + 1)
+    with pytest.raises(ValueError, match="contradicts primary logit"):
+        score_universe.load_scores(output)

@@ -33,13 +33,14 @@ import hashlib
 import json
 import logging
 import math
+import pickle
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import numpy as np
 import torch
@@ -53,6 +54,7 @@ from src.data.artifacts import Benchmark, canonical_pair, load_benchmark
 from src.data.ego_targets import EgoTargetBuilder, EgoTargets
 from src.data.features import FeatureStore, build_f0_matrix
 from src.data.grounding import build_grounding_pool
+from src.data.internal_holdout import InternalHoldoutPartition, derive_internal_holdout
 from src.data.packed_features import PackedFeatureTable
 from src.data.pairs import NegativeSampler
 from src.data.partition import build_g_struct, derive_partition
@@ -195,6 +197,37 @@ class EgoDiagnosticsConfig:
 
 
 @dataclass(frozen=True)
+class EgoStitchV2Config:
+    """Strict §13.19 stability-screen training controls.
+
+    The section is optional so historical v1 configurations retain their
+    exact behavior.  When present, all scientific values are validated
+    against the v2 registration rather than treated as tunable defaults.
+    """
+
+    positive_weight: float = 5.0
+    phase_a_fraction: float = 0.2
+    phase_b_fraction: float = 0.1
+    lr_peak: float = 1e-4
+    min_lr: float = 1e-5
+    warmup_steps: int = 500
+    betas: tuple[float, float] = (0.9, 0.999)
+    eps: float = 1e-8
+    clip_norm: float = 1.0
+    clip_immediate_abort: float = 1e-3
+    clip_persistent_threshold: float = 0.1
+    clip_persistent_steps: int = 10
+    family_ratio_abort: float = 50.0
+    family_ratio_probes: int = 4
+    collapse_fraction: float = 0.25
+    collapse_floor: float = 1e-4
+    collapse_validations: int = 2
+    selection_auprc_tolerance: float = 0.02
+    selection_mmd_tolerance: float = 1e-6
+    residual_ratio_min: float = 1e-3
+
+
+@dataclass(frozen=True)
 class EgoConfig:
     """The full validated EgoStitch worker configuration.
 
@@ -222,6 +255,8 @@ class EgoConfig:
     mixed_precision: str
     preregistration: Path
     runtime: RuntimeConfig | None = None
+    stability_v2: EgoStitchV2Config | None = None
+    v2_run_kind: Literal["overfit", "rehearsal", "formal"] | None = None
 
 
 @dataclass(frozen=True)
@@ -237,6 +272,7 @@ class EgoCliArgs:
     token_budget_per_rank: int | None = None
     profile_output: Path | None = None
     write_s0_manifest: Path | None = None
+    v2_run_kind: Literal["overfit", "rehearsal", "formal"] | None = None
 
 
 def load_config(path: Path) -> EgoConfig:
@@ -265,6 +301,7 @@ def load_config(path: Path) -> EgoConfig:
             "mixed_precision",
             "preregistration",
             "runtime",
+            "stability_v2",
         ),
         "",
     )
@@ -529,6 +566,101 @@ def load_config(path: Path) -> EgoConfig:
                 f"got {stage_total}"
             )
 
+    stability_v2: EgoStitchV2Config | None = None
+    if raw.get("stability_v2") is not None:
+        if family != _EGOSTITCH_E2E_FAMILY:
+            raise ValueError("stability_v2 is only valid for model.family='egostitch_e2e'")
+        v2_raw = _as_mapping(raw["stability_v2"], "stability_v2")
+        v2_keys = tuple(EgoStitchV2Config.__dataclass_fields__)
+        _check_no_unknown_keys(v2_raw, v2_keys, "stability_v2")
+        betas_raw = v2_raw.get("betas", [0.9, 0.999])
+        if not isinstance(betas_raw, list) or len(betas_raw) != 2:
+            raise ValueError("stability_v2.betas must be a two-element list")
+        stability_v2 = EgoStitchV2Config(
+            positive_weight=_as_float(
+                v2_raw.get("positive_weight", 5.0), "stability_v2.positive_weight"
+            ),
+            phase_a_fraction=_as_float(
+                v2_raw.get("phase_a_fraction", 0.2), "stability_v2.phase_a_fraction"
+            ),
+            phase_b_fraction=_as_float(
+                v2_raw.get("phase_b_fraction", 0.1), "stability_v2.phase_b_fraction"
+            ),
+            lr_peak=_as_float(v2_raw.get("lr_peak", 1e-4), "stability_v2.lr_peak"),
+            min_lr=_as_float(v2_raw.get("min_lr", 1e-5), "stability_v2.min_lr"),
+            warmup_steps=_as_int(v2_raw.get("warmup_steps", 500), "stability_v2.warmup_steps"),
+            betas=(
+                _as_float(betas_raw[0], "stability_v2.betas[0]"),
+                _as_float(betas_raw[1], "stability_v2.betas[1]"),
+            ),
+            eps=_as_float(v2_raw.get("eps", 1e-8), "stability_v2.eps"),
+            clip_norm=_as_float(v2_raw.get("clip_norm", 1.0), "stability_v2.clip_norm"),
+            clip_immediate_abort=_as_float(
+                v2_raw.get("clip_immediate_abort", 1e-3), "stability_v2.clip_immediate_abort"
+            ),
+            clip_persistent_threshold=_as_float(
+                v2_raw.get("clip_persistent_threshold", 0.1),
+                "stability_v2.clip_persistent_threshold",
+            ),
+            clip_persistent_steps=_as_int(
+                v2_raw.get("clip_persistent_steps", 10), "stability_v2.clip_persistent_steps"
+            ),
+            family_ratio_abort=_as_float(
+                v2_raw.get("family_ratio_abort", 50.0), "stability_v2.family_ratio_abort"
+            ),
+            family_ratio_probes=_as_int(
+                v2_raw.get("family_ratio_probes", 4), "stability_v2.family_ratio_probes"
+            ),
+            collapse_fraction=_as_float(
+                v2_raw.get("collapse_fraction", 0.25), "stability_v2.collapse_fraction"
+            ),
+            collapse_floor=_as_float(
+                v2_raw.get("collapse_floor", 1e-4), "stability_v2.collapse_floor"
+            ),
+            collapse_validations=_as_int(
+                v2_raw.get("collapse_validations", 2), "stability_v2.collapse_validations"
+            ),
+            selection_auprc_tolerance=_as_float(
+                v2_raw.get("selection_auprc_tolerance", 0.02),
+                "stability_v2.selection_auprc_tolerance",
+            ),
+            selection_mmd_tolerance=_as_float(
+                v2_raw.get("selection_mmd_tolerance", 1e-6), "stability_v2.selection_mmd_tolerance"
+            ),
+            residual_ratio_min=_as_float(
+                v2_raw.get("residual_ratio_min", 1e-3), "stability_v2.residual_ratio_min"
+            ),
+        )
+        registered_v2 = EgoStitchV2Config()
+        if stability_v2 != registered_v2:
+            raise ValueError(
+                "stability_v2 values must exactly match the DRAFT v2 registration; "
+                f"got {stability_v2!r}"
+            )
+        if data.negative_ratio != 5:
+            raise ValueError("stability_v2 requires data.negative_ratio=5")
+        if (
+            optim.lr != 1e-4
+            or optim.weight_decay != 0.01
+            or optim.warmup_steps != 500
+            or optim.epochs != 30
+            or optim.grad_clip != 1.0
+            or optim.warmstart_fraction != 0.2
+        ):
+            raise ValueError("stability_v2 requires the registered optimizer and 30-epoch schedule")
+        resolved_e2e = E2EConfig.from_mapping(model_kwargs)
+        if resolved_e2e.p_topo != 0.15 or resolved_e2e.p_cont != 0.15:
+            raise ValueError("stability_v2 requires p_topo=p_cont=0.15")
+        if mixed_precision != "bf16" or eval_cfg.eval_every != 1:
+            raise ValueError("stability_v2 requires mixed_precision=bf16 and eval.eval_every=1")
+        if (
+            diagnostics.gradient_probe_interval != 50
+            or diagnostics.gradient_imbalance_ratio != 50.0
+            or diagnostics.gradient_imbalance_steps != 200
+            or diagnostics.selection_auprc_tolerance != 0.02
+        ):
+            raise ValueError("stability_v2 diagnostics do not match the registered guard cadence")
+
     return EgoConfig(
         model=model,
         data=data,
@@ -540,12 +672,15 @@ def load_config(path: Path) -> EgoConfig:
         mixed_precision=mixed_precision,
         preregistration=Path(_as_str(_require(raw, "preregistration", ""), "preregistration")),
         runtime=runtime,
+        stability_v2=stability_v2,
+        v2_run_kind=None,
     )
 
 
 def config_to_dict(cfg: EgoConfig) -> dict[str, object]:
     """Return a JSON-serializable dict of the full config (checkpoint payload)."""
     payload = asdict(cfg)
+    payload.pop("v2_run_kind", None)  # execution context is not scientific config
 
     def _stringify(value: object) -> object:
         if isinstance(value, Path):
@@ -557,6 +692,340 @@ def config_to_dict(cfg: EgoConfig) -> dict[str, object]:
         return value
 
     return cast(dict[str, object], _stringify(payload))
+
+
+# --------------------------------------------------------- v2 stability primitives
+
+
+V2PhaseName = Literal["A", "B", "C"]
+V2ArmName = Literal["full", "p0", "b0_e2e_f_only", "pair_topology"]
+
+
+@dataclass(frozen=True)
+class V2PhaseState:
+    """Zero-based optimizer-step state for the §13.19 curriculum."""
+
+    phase: V2PhaseName
+    alpha: float
+    pair_only: bool
+    real_ssl_scale: float
+
+
+def v2_phase_boundaries(total_steps: int) -> tuple[int, int]:
+    """Return the exclusive Phase-A and Phase-B end steps."""
+    if total_steps <= 0:
+        raise ValueError("total_steps must be positive")
+    phase_a_end = math.ceil(0.2 * total_steps)
+    return phase_a_end, phase_a_end + math.ceil(0.1 * total_steps)
+
+
+def v2_phase_state(step: int, total_steps: int) -> V2PhaseState:
+    """Resolve the exact A/B/C behavior for one zero-based optimizer step."""
+    if not 0 <= step < total_steps:
+        raise ValueError(f"step must be in [0, {total_steps}), got {step}")
+    phase_a_end, phase_b_end = v2_phase_boundaries(total_steps)
+    if step < phase_a_end:
+        return V2PhaseState("A", 0.0, True, 0.0)
+    if step < phase_b_end:
+        ramp_steps = phase_b_end - phase_a_end
+        alpha = min(1.0, max(0.0, (step - phase_a_end + 1) / ramp_steps))
+        return V2PhaseState("B", alpha, False, alpha)
+    return V2PhaseState("C", 1.0, False, 1.0)
+
+
+def v2_first_eligible_epoch(total_steps: int, steps_per_epoch: int) -> int:
+    """First 1-based epoch ending after one complete Phase-C epoch."""
+    if steps_per_epoch <= 0:
+        raise ValueError("steps_per_epoch must be positive")
+    _, phase_b_end = v2_phase_boundaries(total_steps)
+    return math.ceil((phase_b_end + steps_per_epoch) / steps_per_epoch)
+
+
+def v2_weighted_bce_with_logits(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    real_row_mask: torch.Tensor,
+    *,
+    world_size: int = 1,
+    all_reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    positive_weight: float = 5.0,
+) -> torch.Tensor:
+    """Exact padding-aware global weighted BCE under DDP gradient averaging.
+
+    ``all_reduce_sum`` is injectable so equivalence tests need no process
+    group.  It receives the detached local effective-weight denominator.
+    """
+    if logits.shape != labels.shape or logits.shape != real_row_mask.shape:
+        raise ValueError("logits, labels, and real_row_mask must have identical shapes")
+    if world_size <= 0 or positive_weight <= 0:
+        raise ValueError("world_size and positive_weight must be positive")
+    logits_fp32 = logits.float()
+    labels_fp32 = labels.float()
+    mask_fp32 = real_row_mask.float()
+    weights = 5.0 * labels_fp32 + (1.0 - labels_fp32)
+    if positive_weight != 5.0:
+        weights = positive_weight * labels_fp32 + (1.0 - labels_fp32)
+    local_denominator = (mask_fp32 * weights).sum().detach()
+    if all_reduce_sum is not None:
+        denominator = all_reduce_sum(local_denominator)
+    elif torch.distributed.is_available() and torch.distributed.is_initialized():
+        denominator = local_denominator.clone()
+        torch.distributed.all_reduce(denominator, op=torch.distributed.ReduceOp.SUM)
+    else:
+        denominator = local_denominator
+    if not bool(torch.isfinite(denominator)) or float(denominator) <= 0.0:
+        raise RuntimeError("global weighted-BCE denominator must be finite and positive")
+    per_row = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits_fp32, labels_fp32, reduction="none"
+    )
+    return world_size * (mask_fp32 * weights * per_row).sum() / denominator
+
+
+@dataclass(frozen=True)
+class V2ParameterGroups:
+    """Disjoint/exhaustive neural optimizer groups and their stable manifest."""
+
+    groups: dict[str, tuple[torch.nn.Parameter, ...]]
+    names: dict[str, tuple[str, ...]]
+    sha256: dict[str, str]
+
+
+def build_v2_parameter_groups(
+    model: EgoStitchE2E, composite: _CompositeStep | None = None
+) -> V2ParameterGroups:
+    """Build the three registered groups and freeze/exclude Kendall scalars."""
+    if composite is not None:
+        for parameter in composite.kendall_log_vars.parameters():
+            parameter.requires_grad_(False)
+    for name, parameter in model.generator.decision.named_parameters():
+        if name != "tau_kappa_raw":
+            parameter.requires_grad_(False)
+    live_ids = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+    grouped: dict[str, list[tuple[str, torch.nn.Parameter]]] = {
+        "pair_encoder_head": [],
+        "generator": [],
+        "topology_content_conditioning": [],
+    }
+    conditioning_prefixes = (
+        "ste.",
+        "content_proj.",
+        "trunk.topo_xattn.",
+        "trunk.cont_xattn.",
+    )
+    for name, parameter in model.named_parameters():
+        if id(parameter) not in live_ids:
+            continue
+        if name.startswith("generator."):
+            group = "generator"
+        elif name.startswith(conditioning_prefixes):
+            group = "topology_content_conditioning"
+        else:
+            group = "pair_encoder_head"
+        grouped[group].append((name, parameter))
+
+    all_ids = [id(parameter) for rows in grouped.values() for _, parameter in rows]
+    if len(all_ids) != len(set(all_ids)) or set(all_ids) != live_ids:
+        raise RuntimeError("v2 optimizer groups must be disjoint and exhaustive")
+    names = {group: tuple(sorted(name for name, _ in rows)) for group, rows in grouped.items()}
+    parameters = {
+        group: tuple(parameter for _, parameter in sorted(rows, key=lambda row: row[0]))
+        for group, rows in grouped.items()
+    }
+    if any(not rows for rows in parameters.values()):
+        raise RuntimeError("every v2 optimizer group must contain trainable parameters")
+    hashes = {
+        group: hashlib.sha256(("\n".join(group_names) + "\n").encode()).hexdigest()
+        for group, group_names in names.items()
+    }
+    return V2ParameterGroups(parameters, names, hashes)
+
+
+@dataclass(frozen=True)
+class V2GradientGroupRecord:
+    """One pre-clip optimizer-group guard measurement."""
+
+    active: bool
+    norm: float | None
+    clip_coefficient: float | None
+    nonfinite_elements: int
+
+
+def v2_check_and_clip_gradients(
+    groups: Mapping[str, Sequence[torch.nn.Parameter]],
+    active_groups: set[str],
+    *,
+    max_norm: float = 1.0,
+) -> dict[str, V2GradientGroupRecord]:
+    """Fail closed on group gradients and independently clip active groups."""
+    if max_norm <= 0:
+        raise ValueError("max_norm must be positive")
+    unknown = active_groups - set(groups)
+    if unknown:
+        raise ValueError(f"unknown active optimizer groups: {sorted(unknown)}")
+    records: dict[str, V2GradientGroupRecord] = {}
+    for name, parameters in groups.items():
+        all_grads = [parameter.grad for parameter in parameters if parameter.grad is not None]
+        all_nonfinite = sum(int((~torch.isfinite(grad)).sum().item()) for grad in all_grads)
+        if name not in active_groups:
+            if all_nonfinite:
+                raise RuntimeError(f"non-finite gradient in inactive v2 group {name!r}")
+            records[name] = V2GradientGroupRecord(False, None, None, all_nonfinite)
+            continue
+        grads = all_grads
+        nonfinite = all_nonfinite
+        squared_terms = [grad.detach().double().square().sum() for grad in grads]
+        squared = (
+            torch.stack(squared_terms).sum()
+            if squared_terms
+            else torch.zeros((), dtype=torch.float64)
+        )
+        norm = float(torch.sqrt(squared).item())
+        if nonfinite or not math.isfinite(norm):
+            raise RuntimeError(f"non-finite gradient in active v2 group {name!r}")
+        if norm == 0.0:
+            raise RuntimeError(f"zero gradient norm in active v2 group {name!r}")
+        coefficient = min(1.0, max_norm / (norm + 1e-12))
+        for grad in grads:
+            grad.mul_(coefficient)
+        records[name] = V2GradientGroupRecord(True, norm, coefficient, nonfinite)
+    return records
+
+
+def v2_assert_replicated_squared_norms(
+    gathered_by_group: Mapping[str, torch.Tensor], *, rtol: float = 1e-7, atol: float = 1e-12
+) -> None:
+    """Assert each group's fp64 squared norm is identical across DDP ranks."""
+    for name, gathered in gathered_by_group.items():
+        values = gathered.detach().double().reshape(-1)
+        if values.numel() == 0 or not bool(torch.isfinite(values).all()):
+            raise RuntimeError(f"invalid gathered squared norms for v2 group {name!r}")
+        reference = values[0].expand_as(values)
+        if not bool(torch.allclose(values, reference, rtol=rtol, atol=atol)):
+            raise RuntimeError(f"DDP gradient norms differ across ranks for v2 group {name!r}")
+
+
+@dataclass
+class V2ClipGuard:
+    """Stateful §13.19 immediate and persistent clip-coefficient guard."""
+
+    immediate_threshold: float = 1e-3
+    persistent_threshold: float = 0.1
+    persistent_steps: int = 10
+    streaks: dict[str, int] | None = None
+
+    def update(self, records: Mapping[str, V2GradientGroupRecord]) -> None:
+        """Advance one optimizer step and raise immediately on a violation."""
+        if self.streaks is None:
+            self.streaks = {}
+        for name, record in records.items():
+            if not record.active:
+                self.streaks[name] = 0
+                continue
+            coefficient = record.clip_coefficient
+            if coefficient is None or not math.isfinite(coefficient):
+                raise RuntimeError(f"invalid clip coefficient for active v2 group {name!r}")
+            if coefficient < self.immediate_threshold:
+                raise RuntimeError(f"extreme clipping in active v2 group {name!r}")
+            self.streaks[name] = (
+                self.streaks.get(name, 0) + 1 if coefficient < self.persistent_threshold else 0
+            )
+            if self.streaks[name] >= self.persistent_steps:
+                raise RuntimeError(f"persistent clipping in active v2 group {name!r}")
+
+
+def v2_assert_finite_optimizer_state(
+    groups: Mapping[str, Sequence[torch.nn.Parameter]], optimizer: torch.optim.Optimizer
+) -> None:
+    """Reject any non-finite post-step parameter or optimizer-state tensor."""
+    for name, parameters in groups.items():
+        for parameter in parameters:
+            if not bool(torch.isfinite(parameter).all()):
+                raise RuntimeError(f"non-finite parameter in v2 group {name!r}")
+            for value in optimizer.state.get(parameter, {}).values():
+                if isinstance(value, torch.Tensor) and not bool(torch.isfinite(value).all()):
+                    raise RuntimeError(f"non-finite optimizer state in v2 group {name!r}")
+
+
+@dataclass(frozen=True)
+class V2CheckpointRecord:
+    """Train-side evidence used by the fail-closed v2 selector."""
+
+    epoch: int
+    phase: V2PhaseName
+    full_joint_epochs_completed: int
+    guards_passed: bool
+    auprc: float
+    prevalence: float
+    active_logit_std: float
+    clustering_mmd: float
+    brier: float
+    warm_reference_std: float | None = None
+    warm_reference_auprc: float | None = None
+    residual_ratio: float | None = None
+    topology_gradient_norm: float | None = None
+
+
+def v2_checkpoint_eligible(record: V2CheckpointRecord, arm: V2ArmName) -> bool:
+    """Apply the arm-specific §13.19.3 rules without any fallback."""
+    values = (
+        record.auprc,
+        record.prevalence,
+        record.active_logit_std,
+        record.clustering_mmd,
+        record.brier,
+    )
+    if (
+        record.phase != "C"
+        or record.full_joint_epochs_completed < 1
+        or not record.guards_passed
+        or not all(math.isfinite(value) for value in values)
+    ):
+        return False
+    if arm == "b0_e2e_f_only":
+        return record.active_logit_std >= 1e-4 and record.auprc >= record.prevalence + 0.02
+    if arm == "pair_topology":
+        norm = record.topology_gradient_norm
+        return (
+            record.active_logit_std >= 1e-4
+            and record.auprc >= record.prevalence + 0.02
+            and norm is not None
+            and math.isfinite(norm)
+            and norm >= 1e-8
+        )
+    warm_std = record.warm_reference_std
+    warm_auprc = record.warm_reference_auprc
+    residual = record.residual_ratio
+    return (
+        warm_std is not None
+        and warm_auprc is not None
+        and residual is not None
+        and all(math.isfinite(value) for value in (warm_std, warm_auprc, residual))
+        and warm_std >= 1e-4
+        and record.active_logit_std >= max(0.25 * warm_std, 1e-4)
+        and warm_auprc >= record.prevalence + 0.02
+        and record.auprc >= warm_auprc - 0.02
+        and residual >= 1e-3
+    )
+
+
+def select_v2_checkpoint(
+    records: Sequence[V2CheckpointRecord],
+    arm: V2ArmName,
+    *,
+    auprc_tolerance: float = 0.02,
+    mmd_tolerance: float = 1e-6,
+) -> V2CheckpointRecord | None:
+    """Select topology-aware best eligible checkpoint, or ``None`` invalid."""
+    eligible = [record for record in records if v2_checkpoint_eligible(record, arm)]
+    if not eligible:
+        return None
+    best_auprc = max(record.auprc for record in eligible)
+    candidates = [record for record in eligible if record.auprc >= best_auprc - auprc_tolerance]
+    best_mmd = min(record.clustering_mmd for record in candidates)
+    candidates = [
+        record for record in candidates if record.clustering_mmd <= best_mmd + mmd_tolerance
+    ]
+    return min(candidates, key=lambda record: (record.brier, record.epoch))
 
 
 def parse_args(argv: Sequence[str] | None = None) -> EgoCliArgs:
@@ -596,6 +1065,12 @@ def parse_args(argv: Sequence[str] | None = None) -> EgoCliArgs:
     )
     parser.add_argument("--profile-output", type=Path, default=None)
     parser.add_argument(
+        "--v2-run-kind",
+        choices=("overfit", "rehearsal", "formal"),
+        default=None,
+        help="v2 execution context; defaults to formal and does not alter the config hash",
+    )
+    parser.add_argument(
         "--write-s0-manifest",
         type=Path,
         default=None,
@@ -628,6 +1103,7 @@ def parse_args(argv: Sequence[str] | None = None) -> EgoCliArgs:
         token_budget_per_rank=namespace.token_budget_per_rank,
         profile_output=namespace.profile_output,
         write_s0_manifest=namespace.write_s0_manifest,
+        v2_run_kind=namespace.v2_run_kind,
     )
 
 
@@ -637,6 +1113,10 @@ def apply_overrides(cfg: EgoConfig, args: EgoCliArgs) -> EgoConfig:
         cfg = replace(cfg, seed=args.seed)
     if args.output_dir is not None:
         cfg = replace(cfg, output_dir=args.output_dir)
+    if args.v2_run_kind is not None:
+        if cfg.stability_v2 is None:
+            raise ValueError("--v2-run-kind requires a stability_v2 config section")
+        cfg = replace(cfg, v2_run_kind=args.v2_run_kind)
     return cfg
 
 
@@ -679,6 +1159,21 @@ def prepare_ddp_run_config(
         raise ValueError(f"preregistration file not found: {cfg.preregistration}")
     snapshot = _preregistration_snapshot(cfg.preregistration)
     status = snapshot.payload.get("status")
+    if cfg.stability_v2 is not None:
+        run_kind = cfg.v2_run_kind or "formal"
+        if run_kind == "overfit":
+            raise RuntimeError(
+                "v2 overfit execution is fail-closed until the registered fixed 510-row "
+                "manifest/cycling loop is implemented; --max-steps cannot substitute for it"
+            )
+        if run_kind == "rehearsal":
+            if max_steps is not None:
+                raise ValueError(
+                    "v2 rehearsal must run the complete schedule; --max-steps forbidden"
+                )
+            return cfg, False, snapshot
+        if max_steps is not None:
+            raise ValueError("v2 formal runs forbid --max-steps")
     if max_steps is None:
         if cfg.model.family == _EGOSTITCH_E2E_FAMILY:
             if status != "BINDING":
@@ -1032,6 +1527,198 @@ class EgoStitchData:
     sampler: NegativeSampler
     s0: S0Cache
     rho_train: float
+    internal_holdout: InternalHoldoutPartition | None = None
+    validation_role: Literal["V_qual", "V_select"] | None = None
+    access_audit: dict[str, object] | None = None
+
+
+def _read_v2_labeled_pairs(path: Path) -> tuple[list[tuple[str, str]], NDArray[np.int8]]:
+    """Read only one explicitly allowed train-side labeled-pair file."""
+    pairs: list[tuple[str, str]] = []
+    labels: list[int] = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            u, v, raw_label = line.rstrip("\n").split("\t")
+            label = int(raw_label)
+            if label not in (0, 1):
+                raise ValueError(f"non-binary label in {path}: {label}")
+            pairs.append(canonical_pair(u, v))
+            labels.append(label)
+    return pairs, np.asarray(labels, dtype=np.int8)
+
+
+def _sha256_pairs(pairs: Sequence[tuple[str, str]]) -> str:
+    return hashlib.sha256("".join(f"{u}\t{v}\n" for u, v in sorted(pairs)).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class V2OverfitManifest:
+    """The fixed rank/world-size-invariant 510-row qualification manifest."""
+
+    rows: tuple[tuple[str, str, int], ...]
+    sha256: str
+
+
+def build_v2_overfit_manifest(cfg: EgoConfig, data: EgoStitchData) -> V2OverfitManifest:
+    """Select 85 hash-smallest positives and 425 registered negatives once."""
+    if cfg.stability_v2 is None:
+        raise ValueError("v2 overfit manifest requires stability_v2")
+    if len(data.e_sup_positives) < 85:
+        raise ValueError("v2 overfit manifest requires at least 85 V_fit supervision positives")
+
+    def pair_hash(pair: tuple[str, str]) -> tuple[bytes, tuple[str, str]]:
+        u, v = canonical_pair(*pair)
+        return hashlib.sha256(f"{u}\t{v}".encode()).digest(), (u, v)
+
+    positives = sorted(data.e_sup_positives, key=pair_hash)[:85]
+    negatives = data.sampler.sample(positives, ratio=5, seed=cfg.seed, epoch=0, rank=0)
+    rows = tuple([(u, v, 1) for u, v in positives] + [(u, v, 0) for u, v in negatives])
+    if len(rows) != 510 or sum(label for _, _, label in rows) != 85:
+        raise RuntimeError("registered v2 overfit manifest cardinality is broken")
+    digest = hashlib.sha256(
+        "".join(f"{u}\t{v}\t{label}\n" for u, v, label in rows).encode()
+    ).hexdigest()
+    return V2OverfitManifest(rows=rows, sha256=digest)
+
+
+def v2_overfit_rank_rows(
+    manifest: V2OverfitManifest, *, rank: int, world_size: int
+) -> tuple[tuple[str, str, int], ...]:
+    """Shard a prebuilt overfit manifest without changing its identity."""
+    if world_size <= 0 or not 0 <= rank < world_size:
+        raise ValueError("invalid rank/world_size")
+    return manifest.rows[rank::world_size]
+
+
+def _assemble_v2_data(
+    cfg: EgoConfig,
+    generator_cfg: EgoStitchConfig,
+    *,
+    pack_dir: Path | None,
+) -> EgoStitchData:
+    """Assemble V2 from train-side files only, with role-isolated holdouts."""
+    strategy_dir = cfg.data.root / _BENCHMARK_SUBDIR / cfg.data.strategy
+    split_path = strategy_dir / "split.pkl"
+    with split_path.open("rb") as handle:
+        split_payload = pickle.load(handle)  # noqa: S301 - repository benchmark artifact
+    if not isinstance(split_payload, dict) or "train" not in split_payload:
+        raise ValueError("split.pkl must contain a train node collection")
+    train_nodes_all = sorted(
+        set(cast(Sequence[str], split_payload["train"]))
+        - set(cfg.data.expected_missing_features)
+    )
+    train_pairs, train_labels = _read_v2_labeled_pairs(strategy_dir / "train_edges.txt")
+    positives = [
+        pair for pair, label in zip(train_pairs, train_labels, strict=True) if int(label) == 1
+    ]
+    partition = derive_partition(
+        positives, seed=cfg.data.partition_seed, msg_fraction=cfg.data.msg_fraction
+    )
+    holdout = derive_internal_holdout(
+        train_nodes_all,
+        partition.e_msg,
+        partition.e_sup,
+    )
+    run_kind = cfg.v2_run_kind or "formal"
+    role: Literal["V_qual", "V_select"] = "V_qual" if run_kind != "formal" else "V_select"
+    validation = holdout.qual_manifest if role == "V_qual" else holdout.select_manifest
+    allowed_nodes = sorted(set(holdout.v_fit) | set(validation.nodes))
+
+    store = FeatureStore(cfg.data.root / _FEATURES_SUBDIR)
+    f0_cache = (pack_dir / _PACK_F0_FILENAME) if pack_dir is not None else cfg.data.f0_cache
+    f0_cache.parent.mkdir(parents=True, exist_ok=True)
+    matrix, node_index = build_f0_matrix(
+        store,
+        allowed_nodes,
+        cache_path=f0_cache,
+        allow_cache_subset=True,
+    )
+    fit_nodes = sorted(holdout.v_fit)
+    fit_rows = np.asarray(
+        matrix.numpy()[[node_index[node] for node in fit_nodes]], dtype=np.float32
+    )
+    grounding_cache = (
+        (pack_dir / _PACK_GROUNDING_FILENAME) if pack_dir is not None else cfg.data.grounding_cache
+    )
+    pool = build_grounding_pool(
+        fit_rows,
+        fit_nodes,
+        n_ground=generator_cfg.n_ground,
+        cache_path=grounding_cache,
+    )
+    grounding_index = np.asarray(
+        [[node_index[neighbor] for neighbor in pool[node]] for node in fit_nodes], dtype=np.int64
+    )
+    g_fit = holdout.build_g_fit()
+    target_builder = EgoTargetBuilder(
+        g_fit,
+        np.asarray(matrix.numpy(), dtype=np.float32),
+        node_index,
+        pool,
+        slots=generator_cfg.slots,
+    )
+    degrees = {node: int(g_fit.degree(node)) for node in fit_nodes}
+    rejection_positives = set(partition.e_msg) | set(partition.e_sup)
+    val_path = strategy_dir / "val_edges.txt"
+    validation_positive_membership_used = val_path.is_file()
+    if validation_positive_membership_used:
+        val_pairs, val_labels = _read_v2_labeled_pairs(val_path)
+        rejection_positives.update(
+            pair for pair, label in zip(val_pairs, val_labels, strict=True) if int(label) == 1
+        )
+    sampler = NegativeSampler(fit_nodes, degrees, frozenset(rejection_positives))
+    n_fit = len(fit_nodes)
+    rho_train = g_fit.number_of_edges() / (math.comb(n_fit, 2) + n_fit)
+    forbidden = ("candidate_test_edges.txt", "test_edges.txt", "test_graph.pkl")
+    forbidden_files_absent = {name: not (strategy_dir / name).exists() for name in forbidden}
+    audit: dict[str, object] = {
+        "run_kind": run_kind,
+        "validation_role": role,
+        "training_feature_nodes_sha256": hashlib.sha256(
+            "".join(f"{node}\n" for node in fit_nodes).encode()
+        ).hexdigest(),
+        "validation_feature_nodes_sha256": validation.nodes_sha256,
+        "training_structural_target_sha256": _sha256_pairs(sorted(holdout.e_msg_fit)),
+        "training_supervision_sha256": _sha256_pairs(sorted(holdout.e_sup_fit)),
+        "training_endpoints_within_v_fit": True,
+        "structural_target_equals_e_msg_fit": {
+            canonical_pair(u, v) for u, v in g_fit.edges()
+        }
+        == set(holdout.e_msg_fit),
+        "validation_positive_membership_used_for_negative_rejection_only": (
+            validation_positive_membership_used
+        ),
+        "forbidden_files_absent": forbidden_files_absent,
+        "quarantine_counts": asdict(holdout.quarantine_counts),
+        "overlap_proof": asdict(holdout.overlap_proof),
+    }
+    present_forbidden = [name for name, absent in forbidden_files_absent.items() if not absent]
+    if present_forbidden:
+        raise RuntimeError(
+            "v2 train/qualification data root contains forbidden held-out files: "
+            + ", ".join(sorted(present_forbidden))
+        )
+    s0 = S0Cache.__new__(S0Cache)
+    s0._logits = {}
+    return EgoStitchData(
+        train_nodes=fit_nodes,
+        e_sup_positives=sorted(holdout.e_sup_fit),
+        val_pairs=list(validation.pairs),
+        val_labels=np.asarray(validation.labels, dtype=np.int8),
+        f0=matrix,
+        node_index=node_index,
+        grounding_index=grounding_index,
+        train_pos={node: i for i, node in enumerate(fit_nodes)},
+        target_builder=target_builder,
+        sampler=sampler,
+        s0=s0,
+        rho_train=rho_train,
+        internal_holdout=holdout,
+        validation_role=role,
+        access_audit=audit,
+    )
 
 
 def assemble_egostitch_data(
@@ -1065,6 +1752,8 @@ def assemble_egostitch_data(
         generator_cfg = EgoStitchConfig()
     else:
         generator_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
+    if cfg.stability_v2 is not None:
+        return _assemble_v2_data(cfg, generator_cfg, pack_dir=pack_dir)
     benchmark = _load_benchmark_for(cfg)
     store = FeatureStore(cfg.data.root / _FEATURES_SUBDIR)
 
@@ -2168,6 +2857,11 @@ def train_egostitch_ddp_loop(
     Returns:
         The `EgoTrainResult`.
     """
+    if cfg.stability_v2 is not None:
+        raise RuntimeError(
+            "stability_v2 training is fail-closed: the phase-specific f_logit/full "
+            "forward paths and validation-manifest loop are not yet integrated"
+        )
     is_e2e = isinstance(model, EgoStitchE2E)
     e2e_permanent_null = cfg.model.config.get("permanent_null", "none")
     assert isinstance(e2e_permanent_null, str)
@@ -2846,6 +3540,11 @@ def _run_ddp_worker(
 ) -> None:
     """Dispatch an ``accelerate launch`` worker to the requested DDP mode."""
     cfg, _is_debug, preregistration = prepare_ddp_run_config(cfg, max_steps=args.max_steps)
+    if cfg.stability_v2 is not None:
+        raise RuntimeError(
+            "stability_v2 execution is fail-closed before data assembly: V_fit training and "
+            "V_qual/V_select role-specific validation are not yet integrated"
+        )
     if args.pack_dir is None or args.token_budget_per_rank is None or args.profile_output is None:
         raise ValueError(
             "DDP worker modes require --pack-dir, --token-budget-per-rank, and --profile-output"

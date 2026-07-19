@@ -1,5 +1,11 @@
 # EgoStitch E2E Stitched-Topology-Conditioned Pair Encoder — Implementation Plan
 
+> **2026-07-19 disposition:** this plan records the v1 implementation landing. Its
+> `L_edge`-inactive warm-start and v1 config/registration commands are superseded for
+> the prospective v2 screen by normative spec §13.19 and
+> `docs/registrations/g5_e2e_stage1_preregistration_v2.json`. Do not execute those v1
+> training steps as a v2 formal run.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Implement the e2e EgoStitch redesign — a from-scratch V3.1 pair encoder

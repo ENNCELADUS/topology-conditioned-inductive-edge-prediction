@@ -1,0 +1,344 @@
+{
+  "registration_id": "g5-e2e-stage1-20260719-conditioned-encoder-stability-screen-v2",
+  "status": "DRAFT",
+  "created_utc": "2026-07-19T00:00:00Z",
+  "gate": "G5 Stage 1 - EgoStitch E2E stable conditioned-encoder screen",
+  "spec_binding": "docs/05-egostitch-spec.md §5, §13.16-§13.19, and §14",
+  "protocol_binding": "docs/03-experiment-protocol.md §5 G5 and §5.2",
+  "version_boundary": "Prospective post-v1 replacement. The v1 BINDING file and artifacts are immutable; this v2 registration is informed only by v1 train/validation diagnostics and no v1 candidate-score or held-out G5 gate result existed.",
+  "predecessor": {
+    "registration": "g5-e2e-stage1-20260717-conditioned-encoder-screen-v1",
+    "path": "docs/registrations/g5_e2e_stage1_preregistration.json",
+    "sha256": "f118dcb6ccb0a2db9531b404a04711f01aa1581f4b52d10cc597d0c12059c734",
+    "execution_boundary": "full-arm training pipeline completed; remaining arms, candidate scoring, and formal G5 gate were not run",
+    "observed_training_failure": "selected checkpoint was a reconstruction-only warm-start epoch; later joint training exhibited collapsed validation logits and non-finite fixed-probe edge-family gradients"
+  },
+  "benchmark": {
+    "alias": "Benchmark-A",
+    "strategy": "breadth_first"
+  },
+  "seeds": [0],
+  "scope": "single-seed engineering screen only; no statistical-significance or cross-seed-robustness claim",
+  "claims": {
+    "primary": "A numerically valid E2E topology-conditioned encoder improves assembled-graph topology over calibrated independent scoring without more than the registered 0.02 AUPRC degradation.",
+    "supporting": "The topology pathway, rather than only pair/content capacity, contributes materially to any observed clustering-MMD gain.",
+    "anti_claim": "A random, collapsed, warm-start-only, or numerically unstable checkpoint cannot count as evidence for or against the architecture."
+  },
+  "arms": {
+    "full": {
+      "training": "configs/egostitch_e2e_stability_v2_breadth_first.yaml",
+      "scored_array": "logit",
+      "artifact_arrays": ["full", "f_logit", "pair_content", "pair_topology"],
+      "scoring_provenance": {
+        "scaffold_control": "none",
+        "permanent_null": "none",
+        "primary_logit": "full"
+      }
+    },
+    "b0_e2e_f_only": {
+      "training": "configs/egostitch_e2e_stability_v2_f_only_breadth_first.yaml",
+      "scored_array": "logit",
+      "artifact_arrays": ["full", "f_logit", "pair_content", "pair_topology"],
+      "scoring_provenance": {
+        "scaffold_control": "none",
+        "permanent_null": "all_head",
+        "primary_logit": "f_logit"
+      }
+    },
+    "pair_topology": {
+      "training": "configs/egostitch_e2e_stability_v2_pair_topology_breadth_first.yaml",
+      "scored_array": "logit",
+      "artifact_arrays": ["full", "f_logit", "pair_content", "pair_topology"],
+      "scoring_provenance": {
+        "scaffold_control": "none",
+        "permanent_null": "content_head",
+        "primary_logit": "pair_topology"
+      }
+    },
+    "structure_control_6a": {
+      "training": "none (selected full checkpoint)",
+      "scored_array": "logit",
+      "artifact_arrays": ["full", "f_logit", "pair_content", "pair_topology"],
+      "scoring_provenance": {
+        "scaffold_control": "shuffle_within_pair",
+        "seed": 0,
+        "keying": "canonical_pair_v1",
+        "permanent_null": "none",
+        "primary_logit": "full",
+        "checkpoint_arm": "full"
+      }
+    },
+    "p0": {
+      "training": "configs/egostitch_e2e_stability_v2_p0_breadth_first.yaml",
+      "scored_array": "logit",
+      "artifact_arrays": ["full", "f_logit", "pair_content", "pair_topology"],
+      "training_overrides": {"p_topo": 0.0, "p_cont": 0.0},
+      "scoring_provenance": {
+        "scaffold_control": "none",
+        "permanent_null": "none",
+        "primary_logit": "full"
+      }
+    }
+  },
+  "training_contract": {
+    "epochs": 30,
+    "mixed_precision": "bf16 with fp32 Sinkhorn, gated-residual accumulation, logits, BCE, and finite checks",
+    "edge_sampler": {
+      "positives": "e_sup",
+      "negative_ratio": 5,
+      "positive_weight": 5.0,
+      "normalization": "sum of effective per-row weights over the exact global DDP batch"
+    },
+    "optimizer_groups": {
+      "pair_encoder_head": {"peak_lr": 0.0001, "warmup_steps": 500, "schedule": "linear warmup then cosine to 1e-5 at T", "grad_clip_l2": 1.0},
+      "generator": {"peak_lr": 0.0001, "warmup_steps": 500, "schedule": "linear warmup then cosine to 1e-5 at T", "grad_clip_l2": 1.0},
+      "topology_content_conditioning": {"peak_lr": 0.0001, "schedule": "base cosine schedule multiplied by alpha; zero in Phase A", "grad_clip_l2": 1.0},
+      "membership": "disjoint and exhaustive sorted parameter-name manifests with SHA-256 in run metadata",
+      "loss_balance_scalars": {"dynamic_kendall": false, "frozen": true, "in_optimizer": false}
+    },
+    "optimizer": {"name": "AdamW", "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01},
+    "step_order": "scaled backward -> BF16 unscale -> DDP reduction -> fp64 norm and finite check -> per-group clip -> optimizer step -> parameter and optimizer-state finite check",
+    "curriculum": [
+      {
+        "name": "dual_track_warmstart",
+        "fraction": 0.2,
+        "objective": "L_recon plus class-balanced L_edge(f_logit); topology/content hard-bypassed; L_real and L_ssl off"
+      },
+      {
+        "name": "conditioning_ramp",
+        "fraction": 0.1,
+        "alpha": "clip((step - ramp_start + 1) / ceil(0.10 * total_steps), 0, 1)",
+        "objective": "full-logit L_edge and L_recon at full weight; conditioning-group LR and L_real/L_ssl weights multiplied by alpha"
+      },
+      {
+        "name": "full_joint",
+        "fraction": 0.7,
+        "objective": "complete §13.5 objective and registered branch masks at full weight"
+      }
+    ],
+    "branch_dropout": {"p_topo": 0.15, "p_cont": 0.15},
+    "weighted_bce_ddp": "m_i=real-row mask (zero on DDP padding); w_i=5*y_i+(1-y_i); D=all_reduce_sum(sum_local m_i*w_i); rank loss=world_size*sum_local(m_i*w_i*BCE_i)/D; exact with tail batches",
+    "calibration_reporting": ["unweighted validation BCE", "Brier score", "ECE"],
+    "precision_differential": {"full_and_f_logit_atol": 0.00001, "full_and_f_logit_rtol": 0.001, "residual_relative_l2_max": 0.001, "residual_correlation_min": 0.999, "zero_residual_rounding_forbidden": true}
+  },
+  "stability_guards": {
+    "measurement": "each step: replicated DDP-averaged per-group norm from fp64 local sum with cross-rank equality assertion; fixed replay every 50 steps: isolated active-family x shared-group norms",
+    "immediate_abort": [
+      "non-finite loss or logit",
+      "non-finite parameter or optimizer state",
+      "non-finite gradient element, optimizer-group norm, family norm, or submodule RMS",
+      "any optimizer-group clip coefficient below 1e-3"
+    ],
+    "persistent_abort": [
+      "any optimizer-group clip coefficient below 0.1 for 10 consecutive steps",
+      "within a shared optimizer group, max active-family norm divided by median active-family norm above 50 for four consecutive fixed probes after alpha reaches 1; inactive/null families excluded",
+      "fixed stability-split pair-logit std below max(0.25 times warm-start-end reference, 1e-4) for two consecutive validations"
+    ],
+    "reference_validity": "warm-start-end pair-logit std is measured after the final Phase-A update in eval mode and must be finite and >=1e-4",
+    "binding_margin": "healthy rehearsal: clip coefficient p1>0.12, minimum>0.0012, longest consecutive run below 0.1 is <10 steps; per-group family-ratio p99<40",
+    "abort_consequence": "synchronous invalid run; publish failure metadata only; no best.pt, complete.json, candidate score, or gate input",
+    "last_checkpoint": "diagnostic-only under failure-specific directory; never eligible for formal scoring"
+  },
+  "checkpoint_selection": {
+    "first_eligible_time": "after the conditioning ramp and one complete full-joint epoch",
+    "validation_contract": {
+      "split_rule": "after E_msg derivation, create V_qual as deterministic 256-node BFS from largest G_msg component with seed/frontier hash prefix g5-v2-qual|; remove it and create V_select identically with g5-v2-select|; component ties use sorted node-id tuple; V_fit is the remainder; train only on induced E_msg[V_fit] and E_sup pairs inside V_fit; quarantine cross-partition edges",
+      "aggregation": "complete global manifest after exact DDP gather; fp32 average_precision_score on binary labels",
+      "warm_reference": "measure after final Phase-A update on applicable complete pair manifest; rehearsal may open only V_qual, first bound run opens untouched V_select; runtime collapse uses fixed applicable slice",
+      "fit_manifest": "REQUIRED-BEFORE-BINDING: V_fit, E_msg[V_fit], E_sup[V_fit], quarantined cross-bucket counts, and SHA-256 values",
+      "qualification_manifest": "REQUIRED-BEFORE-BINDING: V_qual, complete non-self pairs, labels and gold graph from E_msg[V_qual] only, prevalence, exact-gold-density assembly, metric config, and SHA-256 values",
+      "checkpoint_manifest": "REQUIRED-BEFORE-BINDING: untouched V_select counterpart with the same fields plus zero node/label-edge overlap proof",
+      "forbidden_gold_sources": ["train_graph.pkl", "val_edges.txt", "E_sup"],
+      "topology_metric": "raw biased squared MMD between the single exact-gold-density predicted-graph and gold-graph clustering-coefficient histograms, using pinned existing histogram bins and RBF-kernel configuration; not the external multi-reference normalized MMD ratio; checkpoint selection only, never external held-out evidence"
+    },
+    "full_and_p0_eligibility": [
+      "all finite and gradient guards pass for the epoch",
+      "std(f_logit) >= max(0.25 * warm_reference_std, 1e-4)",
+      "warm-reference AUPRC >= label prevalence + 0.02",
+      "validation AUPRC(full) >= warm-reference AUPRC(f_logit) - 0.02",
+      "std(full - f_logit) / max(std(f_logit), 1e-12) >= 1e-3"
+    ],
+    "liveness_preflight": "registered conjunctive rule is still recorded; residual eligibility already excludes its <1e-5 death branch",
+    "f_only_eligibility": "finite/gradient guards; std(f_logit)>=1e-4; AUPRC(f_logit)>=label prevalence+0.02",
+    "pair_topology_eligibility": "finite/gradient guards; std(pair_topology)>=1e-4; AUPRC(pair_topology)>=label prevalence+0.02; active topology-conditioning fixed-replay gradient norm >=1e-8",
+    "selection": "among eligible epochs within 0.02 AUPRC of the best eligible epoch for that arm, minimize train-side validation clustering MMD",
+    "tie_tolerance_mmd": 0.000001,
+    "tie_break": "lower unweighted validation Brier score, then earlier epoch",
+    "forbidden": [
+      "warm-start or ramp checkpoint selection",
+      "fallback to epoch 1",
+      "fallback to last.pt",
+      "fallback to a checkpoint that violates any eligibility condition"
+    ]
+  },
+  "prebinding_qualification": {
+    "heldout_access": "forbidden; train and validation only",
+    "overfit_test": {
+      "rows": 510,
+      "steps": 2000,
+      "selection": "85 E_sup[V_fit] positives with smallest sha256(canonical_pair) and 425 deterministic registered-sampler negatives with both endpoints in V_fit, fixed Seed 0; canonical-pair manifest created once before sharding and invariant to rank/world size; cycle fixed rows",
+      "phase_steps": {"dual_track_warmstart": 400, "conditioning_ramp": 200, "full_joint": 1400},
+      "requirements": [
+        "train AUPRC >= 0.95",
+        "std(full-f_logit)/max(std(f_logit),1e-12) >= 1e-3 after conditioning ramp",
+        "all stability guards pass"
+      ]
+    },
+    "full_arm_rehearsal": "exact 30-epoch full-arm config on 2 x H20 using only qualification pair/topology manifests; eligible post-ramp checkpoint required; checkpoint-selection manifests remain unread; no stability guard may fire",
+    "attempt_policy": "at most three disclosed full-arm rehearsal attempts; first pass freezes implementation/config; fourth attempt or any later scientific/optimization change requires v3",
+    "precision_test": "end-ramp and selected checkpoints, eval mode, same replay identities and hard masks; BF16+fp32 islands versus pure fp32 at registered elementwise and residual-vector tolerances",
+    "boundary_audit": "qualification data root omits candidate/test manifests and test_graph.pkl; grounding universes are separately hashed as train=V_fit, rehearsal=V_qual, formal internal selection=V_select, external=test side; access log proves training endpoints subset V_fit, no V_qual/V_select/V_test feature row is read by a training step, G_fit digest equals loop-stripped E_msg[V_fit], heldout E_msg[V_qual]/E_msg[V_select] and E_sup/validation positives never enter topology-training targets, and no candidate/test score or assembly; global-positive rejection may use validation-positive membership only to prevent false negatives and is identical across arms",
+    "required_binding_evidence": [
+      "implementation commit",
+      "exact config paths and SHA-256 values for all four training arms",
+      "optimizer parameter-name manifests and SHA-256 values",
+      "pack and validation-manifest identities",
+      "overfit and full-arm rehearsal artifact SHA-256 values",
+      "all qualification attempt config/result SHA-256 values and boundary access log",
+      "measured runtime and peak memory",
+      "selected checkpoint policy fields in run metadata"
+    ]
+  },
+  "execution_order": [
+    "qualify and bind v2 without held-out access",
+    "train full arm",
+    "run full-arm checkpoint-eligibility and validation liveness preflight",
+    "stop the experiment if full is invalid",
+    "train b0_e2e_f_only, pair_topology, and p0",
+    "require eligible checkpoints and matching registration/config hashes for every arm",
+    "score all registered candidate artifacts",
+    "produce the representation probe and run the formal G5 evaluator"
+  ],
+  "comparators": ["b0", "b0_cal_density", "b0_cal_selfdensity", "b0_cal_degseq"],
+  "comparator_note": "carried over from the frozen-s0 screen; b0_cal_selfdensity is the empirically strongest arm there and remains the bar",
+  "frozen_inputs": {
+    "b0_candidate_scores": {
+      "path": "outputs/deliverables/b0_v31_breadth_first_20260711/scores/candidate.npz",
+      "sha256": "c5873caa3fece651d1155fd725e04f26a432ceee59d8e78dcda5f4acd687a95d",
+      "checkpoint_id": "e092537d8cf1e208"
+    },
+    "g1_results": {
+      "path": "outputs/deliverables/g1_graph_metrics_20260714/g1_results.json",
+      "sha256": "668129a7c300d87682250382a36ef854c1f301c21d078b261f2b0fe2ae9d1ca4"
+    },
+    "g3_results": {
+      "path": "outputs/deliverables/g3_graph_metrics_20260714/g3_results.json",
+      "sha256": "e7fbc8e4e7f76ffe1f50123ac8e96c776cded79406e01e638539a3f835b79c24"
+    },
+    "candidate_manifest": {
+      "path": "data/benchmark_2025_neurips/breadth_first/candidate_test_edges.txt",
+      "sha256": "bd8015bd9e65159785bad3d3934a9294b0116cb334e1cf29e8aa0e8fa0e90e42",
+      "identity_rule": "every scored artifact must match row count, canonical pair order, labels, self-pair mask, and manifest SHA-256 exactly"
+    },
+    "b0cal_results": {
+      "path": "outputs/deliverables/b0_cal_20260714/b0cal_results.json",
+      "sha256": "833bcf2dcfb13c1d125a3a3b6325c02f0739a7c0092126091049516f1f5b2638",
+      "lineage": "REQUIRED-BEFORE-BINDING: restore immutable local deliverable and pin source checkout, commit, checkpoint, and row-count lineage"
+    }
+  },
+  "evaluator": {"seed": 0, "fixed_subgraphs": 500},
+  "operating_point": {
+    "canonical": "density-matched threshold on non-self candidate rows against target_edges = |E(strip_self_loops(test))|",
+    "matched": "per comparator, realize its exact non-self edge quota by descending pass-1 score with the registered deterministic boundary tie-break"
+  },
+  "primary_criteria": {
+    "applies_to_arm": "full",
+    "all_must_pass": true,
+    "criteria": [
+      "clustering-MMD ratio strictly lower than every comparator at the canonical operating point",
+      "BFS-macro GS strictly higher than every comparator at that comparator's matched-global-RD quota",
+      "BFS-macro RD strictly higher than every comparator at the same matched quota"
+    ]
+  },
+  "guards": [
+    "full-arm degree-MMD ratio <= 1.10 times B0",
+    "full-arm degree-corrected candidate AUPRC >= B0 - 0.02"
+  ],
+  "e2e_rules": {
+    "pathway_attribution": {
+      "metric": "clustering_mmd_ratio at the canonical operating point",
+      "definition": "G_full=clu(b0_e2e_f_only)-clu(full); G_pt=clu(b0_e2e_f_only)-clu(pair_topology separately trained arm)",
+      "rule": "formal pass requires G_full > 0 and G_pt >= 0.25 * G_full",
+      "reading_on_fail": "if G_full<=0, no gain is established relative to matched f-only; if G_full>0 but the share fails, topology contribution is insufficient and the headline is withdrawn"
+    },
+    "structure_control_condition": {
+      "rule": "paired bootstrap over 500 fixed evaluation subgraphs with shared resample indices, B=1000, seed=0; require 2.5th percentile of clu(structure_control_6a)-clu(full) > 0",
+      "scope": "fixed-training-seed evaluator sampling stability only, not cross-seed inference",
+      "reading_on_fail": "the registered control did not establish that intact relational connectivity is necessary beyond retained topology-derived node features"
+    },
+    "liveness_within_checkpoint": {
+      "reference": "f_logit of the same checkpoint",
+      "death_rule": "residual ratio <1e-5 AND Spearman(full,f_logit)>0.9999 AND top-1% overlap>0.9999",
+      "consequence": "run-validity failure before held-out topology metrics"
+    },
+    "four_logit_decomposition": "full, f_logit, pair_content, and pair_topology per scored pair for every scored arm/artifact, fp32, provenance egostitch_e2e_pair_fp32_v1, per-array resolution guard; diagnostic only"
+  },
+  "diagnostics_nonbinding": [
+    "same-checkpoint topology/content decomposition deltas",
+    "linear probes on frozen STE token states with degree-partialled variants and Pi consistency",
+    "gate tanh magnitudes, optimizer-group norms, family-by-shared-group norms, and gradient cosines",
+    "p0-vs-full four-logit divergence and unweighted BCE/Brier/ECE"
+  ],
+  "probe_artifact": {
+    "required_gate_input": true,
+    "format": "egostitch_e2e_probe_v1",
+    "producer": "python -m src.experiments.probes produce-e2e",
+    "source_arm": "full",
+    "source_binding": "arms.full.training with permanent_null=none and p_topo=p_cont=0.15; p0 is rejected",
+    "expected_path": "outputs/egostitch_e2e_stage1_v2/full/probes/e2e_probe_v1.npz",
+    "node_selection": "all operative train nodes, sorted id order",
+    "pair_selection": "4096 non-self E_msg pairs with smallest sha256(canonical_pair), or all if fewer",
+    "targets": ["degree", "ego_density", "clustering", "ego_density_degree_partialled", "clustering_degree_partialled", "pi_shared_neighbor_consistency"],
+    "verdict_effect": "none (required output evidence, nonbinding)"
+  },
+  "cost_report": {
+    "requirement": "measured 2 x H20 v2 profile: step wall, peak memory, exact 30-epoch full-arm runtime, per-arm projection, and five-pass candidate scoring estimate",
+    "predecessor_observation": {"scope": "v1 planning context only; not v2 qualification", "full_arm_train_pipeline_seconds": 23234.77, "v1_debug_peak_memory_gib_max": 65.26557922363281},
+    "v2_measured": "REQUIRED-BEFORE-BINDING: structured paths, SHA-256 values, hardware, runtime, peak memory, and budget margins"
+  },
+  "verdict_rule": "pass iff every training arm is valid, full passes all primary criteria and both guards, liveness passes, G_full>0, attribution share passes, and structure control passes; training invalid precedes scientific verdict, otherwise failures are multi-label cut reasons",
+  "failure_reading": {
+    "training_invalid": "The registered optimization process did not produce a numerically valid and eligible checkpoint; no architecture-level held-out conclusion is permitted.",
+    "primary_fail": "The stable topology-conditioned encoder does not beat calibrated independent scoring at this stage.",
+    "guard_fail": "The model exceeded the registered edge-ranking degradation or degree-MMD guard.",
+    "attribution_fail": "No gain over matched f-only was established, or the topology share was insufficient; withdraw the topology-representation headline.",
+    "structure_control_fail": "The registered control did not establish that intact relational connectivity is necessary beyond retained topology-derived node features at this fixed seed.",
+    "classification_order": "training_invalid first and no scientific verdict; otherwise report every applicable primary_fail, guard_fail, attribution_fail, and structure_control_fail label and return cut if any is present"
+  },
+  "binding_evidence": {
+    "schema_version": "REQUIRED-BEFORE-BINDING",
+    "implementation": {"commit": "REQUIRED-BEFORE-BINDING"},
+    "configs": {"full": "REQUIRED-BEFORE-BINDING", "b0_e2e_f_only": "REQUIRED-BEFORE-BINDING", "pair_topology": "REQUIRED-BEFORE-BINDING", "p0": "REQUIRED-BEFORE-BINDING"},
+    "parameter_group_manifests": "REQUIRED-BEFORE-BINDING",
+    "packs_and_validation_manifests": "REQUIRED-BEFORE-BINDING",
+    "qualification_attempts": "REQUIRED-BEFORE-BINDING",
+    "boundary_access_audit": "REQUIRED-BEFORE-BINDING",
+    "runtime_and_peak_memory": "REQUIRED-BEFORE-BINDING",
+    "checkpoint_policy_version": "REQUIRED-BEFORE-BINDING"
+  },
+  "binding_acceptance_tests": [
+    "phase boundaries, complete coverage, world-size invariance, and first-eligible timing",
+    "1-GPU/2-GPU weighted-BCE gradient equivalence including tail batch",
+    "parameter-group disjointness/exhaustiveness and frozen Kendall scalars",
+    "synchronous abort and no success artifacts for injected finite/clip/collapse failures",
+    "arm-specific checkpoint eligibility, topology-aware selection, deterministic tie-break, and no fallback",
+    "precision replay at end-ramp and selected checkpoints",
+    "file/node access audit and candidate scorer provenance rejection"
+  ],
+  "required_before_binding": [
+    "REQUIRED-BEFORE-BINDING: implement and test every docs/05-egostitch-spec.md §13.19 training, precision, finite-check, checkpoint-eligibility, and publication rule",
+    "REQUIRED-BEFORE-BINDING: enforce the DRAFT/debug candidate/test scoring prohibition and validate structured binding_evidence before DDP",
+    "REQUIRED-BEFORE-BINDING: create the four v2 config files and pin their SHA-256 values",
+    "REQUIRED-BEFORE-BINDING: create and hash disjoint validation and train-side topology-selection manifests",
+    "REQUIRED-BEFORE-BINDING: complete the deterministic overfit test and 2 x H20 full-arm train/validation rehearsal in a no-test-mounted data root",
+    "REQUIRED-BEFORE-BINDING: record implementation commit, parameter groups, packs, validation manifests, every qualification attempt, access audit, artifact digests, measured runtime, and peak memory",
+    "REQUIRED-BEFORE-BINDING: independent review confirms JSON/prose parity and no v1 artifact is relabeled as v2 evidence"
+  ],
+  "mechanics": {
+    "formal_worker": "before DDP, reject status other than BINDING, any REQUIRED-BEFORE-BINDING marker, invalid binding_evidence schema, missing artifact, non-64-hex digest, live hash mismatch, config path not equal to arms.<arm>.training, or parameter/pack/qualification mismatch",
+    "debug_worker": "DRAFT accepted only with explicit debug mode; outputs isolated and forbidden as held-out/gate inputs",
+    "candidate_scorer": "egostitch_e2e candidate/test scoring requires registration path, run metadata, BINDING status, formal+complete+eligible status, and exact registration/config/checkpoint hashes; DRAFT/debug is train/validation-only",
+    "gate": "requires this registration SHA-256 and exact config SHA-256 in every formal run metadata plus the provenance-bound probe artifact",
+    "amendment": "any post-binding optimizer, schedule, precision, guard, eligibility, scientific, or frozen-input change requires a new versioned registration"
+  }
+}

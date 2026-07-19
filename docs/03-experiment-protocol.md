@@ -496,6 +496,19 @@ rule).
    closes the frozen-s0 screen and satisfies spec §14.3(1), without binding the
    successor registration or weakening E1/E3's multi-seed inference rules. Full
    result: `docs/results/G5-stage1-seed0-20260717.md`.
+   **E2E v1 training outcome and prospective replacement (2026-07-19):** the
+   registered v1 `full` arm completed its engineering training pipeline, but its
+   validation-selected checkpoint came from the reconstruction-only warm-start; the
+   subsequent joint phase showed collapsed validation logits and non-finite fixed-probe
+   edge-family gradients. No v1 candidate scores, remaining arms, or held-out G5 gate
+   result were produced, so this is a training-validity failure rather than a G5
+   scientific verdict. The v1 BINDING registration remains immutable. A versioned v2
+   DRAFT replacement is governed by spec §13.19: train/validation-only qualification,
+   post-ramp arm-specific checkpoint eligibility, node-disjoint internal `E_msg`
+   topology holdouts for model selection under an AUPRC tolerance, fail-fast numerical guards, and a
+   full-arm-first stop rule must be satisfied before v2 can be bound or any held-out
+   scoring begins. DRAFT/debug artifacts are forbidden from candidate/test scoring,
+   not merely from the final gate.
 
 ### 5.1 Priority order (after gates)
 

@@ -254,6 +254,8 @@ class PipelineArgs:
             ``cfg.output_dir`` when omitted.
         seed: Optional worker seed override for pre-registered multi-seed runs.
         max_steps: Optional DEBUG-ONLY bounded worker-step limit.
+        v2_run_kind: Optional EgoStitch-v2 execution context forwarded to the
+            worker; one of ``overfit``, ``rehearsal``, or ``formal``.
         worker_module: Dotted module implementing the worker contract
             (``load_config``, ``prepare_pack``, and the ``--ddp-mode``
             probe/epoch-probe/train CLI). Defaults to the formal E2 B0 worker;
@@ -266,6 +268,7 @@ class PipelineArgs:
     worker_module: str = "src.train_b0"
     seed: int | None = None
     max_steps: int | None = None
+    v2_run_kind: str | None = None
 
 
 class BudgetExceeded(RuntimeError):
@@ -309,6 +312,7 @@ def build_accelerate_command(
     worker_module: str = "src.train_b0",
     seed: int | None = None,
     max_steps: int | None = None,
+    v2_run_kind: str | None = None,
 ) -> list[str]:
     """Build the pinned ``accelerate launch -m <worker>`` worker command.
 
@@ -328,6 +332,8 @@ def build_accelerate_command(
         worker_module: Dotted worker module (default: the formal E2 B0 worker).
         seed: Optional worker seed override.
         max_steps: Optional DEBUG-ONLY bounded worker-step limit.
+        v2_run_kind: Optional EgoStitch-v2 execution context forwarded unchanged
+            to the worker.
 
     Returns:
         The exact ``accelerate launch --num_processes <world_size> --mixed_precision bf16
@@ -359,6 +365,8 @@ def build_accelerate_command(
         command.extend(("--seed", str(seed)))
     if max_steps is not None:
         command.extend(("--max-steps", str(max_steps)))
+    if v2_run_kind is not None:
+        command.extend(("--v2-run-kind", v2_run_kind))
     return command
 
 
@@ -397,6 +405,12 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument(
+        "--v2-run-kind",
+        choices=("overfit", "rehearsal", "formal"),
+        default=None,
+        help="EgoStitch v2 execution context; forwarded unchanged to the worker",
+    )
+    parser.add_argument(
         "--worker-module",
         default="src.train_b0",
         help=(
@@ -413,6 +427,7 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
         worker_module=namespace.worker_module,
         seed=namespace.seed,
         max_steps=namespace.max_steps,
+        v2_run_kind=namespace.v2_run_kind,
     )
 
 
@@ -794,6 +809,10 @@ def run_pipeline(
         cfg = replace(cfg, seed=args.seed)
     if args.output_dir is not None:
         cfg = replace(cfg, output_dir=args.output_dir)
+    if args.v2_run_kind is not None:
+        if not hasattr(cfg, "v2_run_kind"):
+            raise ValueError("--v2-run-kind is only supported by a v2-aware worker")
+        cfg = replace(cfg, v2_run_kind=args.v2_run_kind)
     if args.max_steps is not None and args.max_steps <= 0:
         raise ValueError("--max-steps must be positive")
     if cfg.runtime is None:
@@ -945,6 +964,7 @@ def run_pipeline(
             worker_module=args.worker_module,
             seed=args.seed,
             max_steps=args.max_steps,
+            v2_run_kind=args.v2_run_kind,
         )
         try:
             completed = command_runner(command, remaining)
@@ -1034,6 +1054,7 @@ def run_pipeline(
         worker_module=args.worker_module,
         seed=args.seed,
         max_steps=args.max_steps,
+        v2_run_kind=args.v2_run_kind,
     )
     try:
         completed = command_runner(command, remaining)
@@ -1107,6 +1128,7 @@ def run_pipeline(
         worker_module=args.worker_module,
         seed=args.seed,
         max_steps=args.max_steps,
+        v2_run_kind=args.v2_run_kind,
     )
     try:
         completed = command_runner(command, float(runtime.train_eval_budget_seconds))
