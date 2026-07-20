@@ -33,12 +33,13 @@ from src.model.egostitch.conditioning import (
 )
 from src.model.egostitch.config import E2EConfig, EgoStitchConfig
 from src.model.egostitch.imagine import SlotSet
-from src.model.egostitch.layers import stable_log
 from src.model.egostitch.model import EgoStitchStage1
 from src.model.egostitch.scaffold import (
     ContentProjector,
     build_content_tokens,
     build_scaffold,
+    counterpart_membership,
+    grounded_identity_match,
     swap_direction,
 )
 from src.model.egostitch.ste import STEncoder
@@ -67,62 +68,6 @@ class E2EPairContext(NamedTuple):
     topo_ba: torch.Tensor | None
     cont: torch.Tensor | None
     plan: torch.Tensor | None
-
-
-def counterpart_membership(
-    slots: SlotSet, other_proj: torch.Tensor, tau_kappa: torch.Tensor
-) -> torch.Tensor:
-    """Per-slot former-s1 compatibility with the counterpart endpoint."""
-    slot_direction = F.normalize(slots.h, p=2.0, dim=-1)
-    other_direction = F.normalize(other_proj, p=2.0, dim=-1)
-    kappa = -(slot_direction - other_direction[:, None, :]).square().sum(dim=-1)
-    kappa = kappa / tau_kappa
-    return kappa + stable_log(slots.pi * slots.mult)
-
-
-def grounded_identity_match(
-    pointer_a: torch.Tensor,
-    gate_a: torch.Tensor,
-    ids_a: torch.Tensor,
-    pointer_b: torch.Tensor,
-    gate_b: torch.Tensor,
-    ids_b: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Grounded-identity-match binary flags (spec Sec 13.18 pinned definition).
-
-    Slot `k` of endpoint a (resp. `k'` of endpoint b) is grounded-identity-
-    matched iff (1) its own gate exceeds 0.5, (2) its pointer argmax selects a
-    grounding-pool candidate with some global node id `c`, and (3) the OTHER
-    endpoint has at least one slot with gate > 0.5 whose pointer argmax
-    selects that same global id `c`. Symmetric across AB/BA by construction:
-    the underlying shared-candidate relation (matching global ids between a
-    gated slot on each side) is undirected.
-
-    Args:
-        pointer_a: Shape ``(B, K, n_g)`` side-a pointer softmax over its
-            grounding pool.
-        gate_a: Shape ``(B, K)`` side-a grounding-gate probabilities.
-        ids_a: Shape ``(B, n_g)`` int64 global node ids of side-a's grounding
-            pool candidates (indexed by `pointer_a`'s last dimension).
-        pointer_b: Shape ``(B, K, n_g)`` side-b pointer softmax.
-        gate_b: Shape ``(B, K)`` side-b grounding-gate probabilities.
-        ids_b: Shape ``(B, n_g)`` int64 global node ids of side-b's grounding
-            pool candidates.
-
-    Returns:
-        ``(matched_a, matched_b)``, each shape ``(B, K)`` binary floats in
-        ``{0.0, 1.0}``.
-    """
-    gated_a = gate_a > 0.5
-    gated_b = gate_b > 0.5
-    sel_id_a = torch.gather(ids_a, 1, pointer_a.argmax(dim=-1))
-    sel_id_b = torch.gather(ids_b, 1, pointer_b.argmax(dim=-1))
-    shared = sel_id_a[:, :, None] == sel_id_b[:, None, :]  # (B, K, K); [b, k, k']
-    other_gated_for_a = (shared & gated_b[:, None, :]).any(dim=-1)  # (B, K), indexed by k
-    other_gated_for_b = (shared & gated_a[:, :, None]).any(dim=1)  # (B, K), indexed by k'
-    matched_a = (gated_a & other_gated_for_a).float()
-    matched_b = (gated_b & other_gated_for_b).float()
-    return matched_a, matched_b
 
 
 class EgoStitchE2E(nn.Module):
@@ -177,30 +122,6 @@ class EgoStitchE2E(nn.Module):
             norm="layernorm",
         )
 
-    def _ground(self, x: torch.Tensor) -> torch.Tensor:
-        """Degenerate fallback grounding-candidate pool for the generator.
-
-        WARNING: every row of the returned pool is an identical copy of `x`,
-        so every primary slot query in `ImagineDecoder._build_queries` is also
-        identical (with spec defaults, slots=16 <= n_ground=20, this holds for
-        ALL primary slots) -- `encode_nodes` therefore emits structurally
-        collapsed, non-diverse slots per node, not merely reduced-fidelity
-        ones. This path engages ONLY when the batch omits the ``ground_a``/
-        ``ground_b`` keys (e.g. the tiny unit fixtures in
-        ``tests/model/test_egostitch_e2e_model.py``). Every worker/scorer
-        entry point (``src.score_universe._score_egostitch_e2e``) always
-        supplies real grounding-pool candidates (spec Sec 13.12; tested), so
-        production full-pipeline output never takes this branch.
-
-        Args:
-            x: Shape ``(B, d)`` per-node features.
-
-        Returns:
-            Shape ``(B, n_ground, d)`` grounding-candidate features.
-        """
-        ground: torch.Tensor = x.unsqueeze(1).expand(-1, self.generator_cfg.n_ground, -1)
-        return ground
-
     @staticmethod
     def _select_slots(slots: SlotSet, rows: torch.Tensor) -> SlotSet:
         """Index every tensor in one slot bundle by batch row."""
@@ -216,12 +137,11 @@ class EgoStitchE2E(nn.Module):
         emb: torch.Tensor,
         length: torch.Tensor,
         x: torch.Tensor,
-        ground: torch.Tensor | None = None,
+        ground: torch.Tensor,
         ground_ids: torch.Tensor | None = None,
     ) -> E2ENodeState:
         """Run the cacheable raw-token and generator pass for one node batch."""
-        ground_x = ground if ground is not None else self._ground(x)
-        generated = self.generator.encode_nodes(x, ground_x)
+        generated = self.generator.encode_nodes(x, ground)
         return E2ENodeState(
             encoded=self.encoder(emb, length),
             length=length,
@@ -255,6 +175,9 @@ class EgoStitchE2E(nn.Module):
         self, batch: dict[str, torch.Tensor]
     ) -> tuple[E2ENodeState, E2ENodeState, torch.Tensor]:
         """Encode pair endpoints, using exactly one encode for every self row."""
+        missing = {"ground_a", "ground_b"} - batch.keys()
+        if missing:
+            raise ValueError(f"EgoStitchE2E requires real grounding tensors: {sorted(missing)}")
         batch_size = batch["emb_a"].size(0)
         is_self = batch.get(
             "is_self", torch.zeros(batch_size, dtype=torch.bool, device=batch["emb_a"].device)
@@ -263,7 +186,7 @@ class EgoStitchE2E(nn.Module):
             batch["emb_a"],
             batch["len_a"],
             batch["x_a"],
-            batch.get("ground_a"),
+            batch["ground_a"],
             batch.get("ground_id_a"),
         )
         non_self = torch.nonzero(~is_self, as_tuple=False).squeeze(-1)
@@ -273,7 +196,7 @@ class EgoStitchE2E(nn.Module):
             batch["emb_b"].index_select(0, non_self),
             batch["len_b"].index_select(0, non_self),
             batch["x_b"].index_select(0, non_self),
-            (batch["ground_b"].index_select(0, non_self) if "ground_b" in batch else None),
+            batch["ground_b"].index_select(0, non_self),
             (batch["ground_id_b"].index_select(0, non_self) if "ground_id_b" in batch else None),
         )
         if non_self.numel() == batch_size:
@@ -392,9 +315,8 @@ class EgoStitchE2E(nn.Module):
         token axis (e.g. mean-pool) before probing.
 
         Args:
-            batch: Pair batch with the `_context` keys (``x_a``/``x_b`` and
-                optionally ``ground_a``/``ground_b``/``ground_id_a``/
-                ``ground_id_b``).
+            batch: Pair batch with endpoint features plus required
+                ``ground_a``/``ground_b`` tensors. Grounding ids are optional.
 
         Returns:
             Shape ``(B, V, d_model)`` AB-direction STE token states.

@@ -1659,10 +1659,9 @@ def test_egostitch_e2e_scorer_supplies_grounding_batch_keys(
     """`_score_egostitch_e2e` assembles real grounding-pool batch keys per pair.
 
     Spies on `EgoStitchE2E.encode_node_state` to capture the node-cache inputs,
-    asserting the non-degenerate ``ground_a``/``ground_b``/``ground_id_a``/
-    ``ground_id_b`` keys are present with the expected shapes/dtypes for
-    every scored batch — i.e. the scorer always exercises `EgoStitchE2E`'s
-    real-grounding path and never falls through to its placeholder `_ground`.
+    asserting the required ``ground_a``/``ground_b`` tensors and optional
+    ``ground_id_a``/``ground_id_b`` identifiers are present with the expected
+    shapes and dtypes for every scored batch.
     """
     from src.model.egostitch.config import EgoStitchConfig
     from src.model.egostitch.e2e_model import EgoStitchE2E
@@ -1678,7 +1677,7 @@ def test_egostitch_e2e_scorer_supplies_grounding_batch_keys(
         emb: torch.Tensor,
         length: torch.Tensor,
         x: torch.Tensor,
-        ground: torch.Tensor | None = None,
+        ground: torch.Tensor,
         ground_ids: torch.Tensor | None = None,
     ) -> E2ENodeState:
         captured.append((ground, ground_ids))

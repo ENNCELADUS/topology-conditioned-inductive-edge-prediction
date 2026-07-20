@@ -13,8 +13,10 @@ from typing import NamedTuple
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from src.model.egostitch.imagine import SlotSet
+from src.model.egostitch.layers import stable_log
 
 N_ANCHOR_TYPES = 4
 FEAT_DIM = 9
@@ -28,6 +30,35 @@ class ScaffoldTokens(NamedTuple):
 
     feats: torch.Tensor
     adj: torch.Tensor
+
+
+def counterpart_membership(
+    slots: SlotSet, other_proj: torch.Tensor, tau_kappa: torch.Tensor
+) -> torch.Tensor:
+    """Return each slot's compatibility with the counterpart endpoint."""
+    slot_direction = F.normalize(slots.h, p=2.0, dim=-1)
+    other_direction = F.normalize(other_proj, p=2.0, dim=-1)
+    distance = (slot_direction - other_direction[:, None, :]).square().sum(dim=-1)
+    return -distance / tau_kappa + stable_log(slots.pi * slots.mult)
+
+
+def grounded_identity_match(
+    pointer_a: torch.Tensor,
+    gate_a: torch.Tensor,
+    ids_a: torch.Tensor,
+    pointer_b: torch.Tensor,
+    gate_b: torch.Tensor,
+    ids_b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return symmetric flags for gated slots selecting a shared node id."""
+    gated_a = gate_a > 0.5
+    gated_b = gate_b > 0.5
+    selected_a = torch.gather(ids_a, 1, pointer_a.argmax(dim=-1))
+    selected_b = torch.gather(ids_b, 1, pointer_b.argmax(dim=-1))
+    shared = selected_a[:, :, None] == selected_b[:, None, :]
+    matched_a = gated_a & (shared & gated_b[:, None, :]).any(dim=-1)
+    matched_b = gated_b & (shared & gated_a[:, :, None]).any(dim=1)
+    return matched_a.float(), matched_b.float()
 
 
 def build_scaffold(slots_src: SlotSet, slots_dst: SlotSet, plan: torch.Tensor) -> ScaffoldTokens:

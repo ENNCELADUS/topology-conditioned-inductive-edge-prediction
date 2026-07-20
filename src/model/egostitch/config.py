@@ -10,6 +10,40 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
+from typing import Any, TypeVar, cast
+
+_ConfigT = TypeVar("_ConfigT")
+
+
+def _from_mapping(
+    cls: type[_ConfigT],
+    mapping: Mapping[str, object],
+    *,
+    label: str,
+    string_fields: frozenset[str] = frozenset(),
+) -> _ConfigT:
+    """Build one strict numeric dataclass config from a YAML mapping."""
+    config_fields = {field.name: field for field in fields(cast(Any, cls))}
+    unknown = sorted(set(mapping) - config_fields.keys())
+    if unknown:
+        raise ValueError(f"unknown {label} config keys: {unknown}")
+
+    kwargs: dict[str, object] = {}
+    for name, raw in mapping.items():
+        field = config_fields[name]
+        if name in string_fields:
+            if not isinstance(raw, str):
+                raise ValueError(f"{name} must be a string, got {raw!r}")
+            kwargs[name] = raw
+        elif field.type == "int":
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                raise ValueError(f"{name} must be an int, got {raw!r}")
+            kwargs[name] = raw
+        else:
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                raise ValueError(f"{name} must be a number, got {raw!r}")
+            kwargs[name] = float(raw)
+    return cls(**kwargs)
 
 
 @dataclass(frozen=True)
@@ -128,24 +162,7 @@ class EgoStitchConfig:
         Raises:
             ValueError: On unknown keys or invalid values.
         """
-        known = {f.name for f in fields(cls)}
-        unknown = sorted(set(mapping) - known)
-        if unknown:
-            raise ValueError(f"unknown EgoStitch config keys: {unknown}")
-        kwargs: dict[str, object] = {}
-        for f in fields(cls):
-            if f.name not in mapping:
-                continue
-            raw = mapping[f.name]
-            if f.type in ("int",):
-                if isinstance(raw, bool) or not isinstance(raw, int):
-                    raise ValueError(f"{f.name} must be an int, got {raw!r}")
-                kwargs[f.name] = int(raw)
-            else:
-                if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-                    raise ValueError(f"{f.name} must be a number, got {raw!r}")
-                kwargs[f.name] = float(raw)
-        return cls(**kwargs)  # type: ignore[arg-type]
+        return _from_mapping(cls, mapping, label="EgoStitch")
 
 
 @dataclass(frozen=True)
@@ -229,25 +246,4 @@ class E2EConfig:
         Raises:
             ValueError: On unknown keys or invalid values.
         """
-        known = {f.name for f in fields(cls)}
-        unknown = sorted(set(mapping) - known)
-        if unknown:
-            raise ValueError(f"unknown E2E config keys: {unknown}")
-        kwargs: dict[str, object] = {}
-        for f in fields(cls):
-            if f.name not in mapping:
-                continue
-            raw = mapping[f.name]
-            if f.name == "permanent_null":
-                if not isinstance(raw, str):
-                    raise ValueError(f"{f.name} must be a string, got {raw!r}")
-                kwargs[f.name] = raw
-            elif f.type in ("int",):
-                if isinstance(raw, bool) or not isinstance(raw, int):
-                    raise ValueError(f"{f.name} must be an int, got {raw!r}")
-                kwargs[f.name] = int(raw)
-            else:
-                if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-                    raise ValueError(f"{f.name} must be a number, got {raw!r}")
-                kwargs[f.name] = float(raw)
-        return cls(**kwargs)  # type: ignore[arg-type]
+        return _from_mapping(cls, mapping, label="E2E", string_fields=frozenset({"permanent_null"}))

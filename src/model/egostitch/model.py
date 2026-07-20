@@ -130,29 +130,6 @@ class EgoStitchStage1(nn.Module):
 
     # ------------------------------------------------------------------ scoring
 
-    def pair_logits(
-        self,
-        enc_i: NodeEncoding,
-        enc_j: NodeEncoding,
-        x_i: torch.Tensor,
-        x_j: torch.Tensor,
-        s0: torch.Tensor,
-    ) -> torch.Tensor:
-        """Fused logits for aligned non-self pair encodings.
-
-        Args:
-            enc_i: Side-i node encodings.
-            enc_j: Side-j node encodings.
-            x_i: Shape ``(B, d)`` side-i features (for the ``s1`` projection).
-            x_j: Shape ``(B, d)`` side-j features.
-            s0: Shape ``(B,)`` cached frozen-B0 logits.
-
-        Returns:
-            Shape ``(B,)`` edge logits.
-        """
-        logits, _ = self.pair_outputs(enc_i, enc_j, x_i, x_j, s0)
-        return logits
-
     def pair_outputs(
         self,
         enc_i: NodeEncoding,
@@ -185,11 +162,6 @@ class EgoStitchStage1(nn.Module):
             self.d_hat(enc_j.tok),
         )
         return self.decision.fuse(s0, channels), channels
-
-    def self_logits(self, enc: NodeEncoding, x: torch.Tensor, s0: torch.Tensor) -> torch.Tensor:
-        """Single-ego logits for ``(u, u)`` queries (spec Sec 13.9)."""
-        logits, _ = self.self_outputs(enc, x, s0)
-        return logits
 
     def self_outputs(
         self, enc: NodeEncoding, x: torch.Tensor, s0: torch.Tensor
