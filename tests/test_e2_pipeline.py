@@ -1134,6 +1134,8 @@ class TestRunPipelineFailures:
         )
 
         assert json.loads((output_dir / "failure.json").read_text())["stage"] == "artifacts"
+        failed_profile = json.loads((output_dir / "failed_run_profile.json").read_text())
+        assert failed_profile["rejected_worker_profile"] == profile
         assert not (output_dir / "artifact_manifest.json").exists()
         assert not (output_dir / "complete.json").exists()
 

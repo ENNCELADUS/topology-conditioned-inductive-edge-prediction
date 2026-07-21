@@ -512,6 +512,16 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-21: wired the registered V2 runtime `prefetch_factor=2` into the manual
+  packed-token batch factory with one bounded deterministic producer thread per
+  rank. Batch order, canonical overfit rows, padding, seeds, tensor values, losses,
+  and optimizer steps are unchanged; `steady_state_data_wait_fraction` now measures
+  only time the host training loop is blocked waiting for the next prefetched CPU
+  batch. If artifact validation rejects a completed JSON-object worker profile, that
+  parsed profile is retained with the failure evidence instead of being deleted with
+  the staging directory. This is a qualification-infrastructure/in-memory-reuse fix
+  under the still-DRAFT V2 amendment, not a scientific-contract change.
+
 - 2026-07-21: corrected two additional consolidation trajectory regressions before
   binding. A fresh four-H20 check and a two-H20 control both showed generator clipping
   from the first Phase-A steps, ruling out world-size sharding; code/history comparison

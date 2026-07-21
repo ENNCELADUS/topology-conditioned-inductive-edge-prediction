@@ -36,12 +36,15 @@ import math
 import pickle
 import subprocess
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections import deque
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
+from itertools import islice
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, TypeVar, cast
 
 import networkx as nx
 import numpy as np
@@ -2213,6 +2216,37 @@ class _CompositeBatch:
     f0_rows_gathered: int
 
 
+_BatchT = TypeVar("_BatchT")
+
+
+def _prefetch_batches(batches: Iterator[_BatchT], *, depth: int) -> Generator[_BatchT, None, None]:
+    """Build bounded deterministic CPU batches ahead of GPU consumption."""
+    if depth <= 0:
+        yield from batches
+        return
+
+    iterator = iter(batches)
+
+    def read_next() -> _BatchT:
+        return next(iterator)
+
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="egostitch-batch")
+    futures: deque[Future[_BatchT]] = deque(executor.submit(read_next) for _ in range(depth))
+    try:
+        while futures:
+            future = futures.popleft()
+            try:
+                batch = future.result()
+            except StopIteration:
+                return
+            futures.append(executor.submit(read_next))
+            yield batch
+    finally:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
 _EGOSTITCH_E2E_FAMILY = "egostitch_e2e"
 
 
@@ -3679,6 +3713,7 @@ def _train_e2e_stability_loop(
     total_data_wait = 0.0
     total_validation_seconds = 0.0
     global_step = 0
+    prefetch_depth = cfg.runtime.prefetch_factor if cfg.runtime is not None else 1
 
     for epoch, epoch_steps in enumerate(epoch_step_counts, start=1):
         epoch_started = time.monotonic()
@@ -3690,7 +3725,7 @@ def _train_e2e_stability_loop(
         epoch_probes: list[dict[str, object]] = []
         if run_kind == "overfit":
             assert overfit_manifest is not None
-            batches = iter(
+            batch_source = iter(
                 factory.fixed_row_batches(
                     manifest=overfit_manifest,
                     steps=epoch_steps,
@@ -3698,165 +3733,173 @@ def _train_e2e_stability_loop(
                 )
             )
         else:
-            batches = iter(
+            batch_source = iter(
                 factory.epoch_batches(epoch, rows_per_rank=rows_per_rank, steps=epoch_steps)
             )
-        for _step_in_epoch in range(epoch_steps):
-            fetch_started = time.monotonic()
-            batch = next(batches)
-            epoch_data_wait += time.monotonic() - fetch_started
-            phase = e2e_phase_state(global_step, schedule_total_steps)
-            base_lr = _e2e_base_lr(global_step, schedule_total_steps, training)
-            for group in optimizer.param_groups:
-                group["lr"] = (
-                    base_lr * phase.alpha
-                    if group.get("name") == "topology_content_conditioning"
-                    else base_lr
-                )
-            payload = _e2e_training_payload(
-                batch,
-                cfg,
-                phase,
-                epoch=1 if run_kind == "overfit" else epoch,
-                step=global_step,
-                device=accelerator.device,
-            )
-            if fixed_replay is None:
-                fixed_replay = cast(dict[str, object], _detached_clone(payload))
-            optimizer.zero_grad(set_to_none=True)
-            out = cast(dict[str, object], wrapped(payload))
-            loss = cast(torch.Tensor, out["loss"])
-            local_bad = not bool(torch.isfinite(loss).all())
-            bad_ranks = accelerator.reduce(
-                torch.tensor(int(local_bad), device=accelerator.device), reduction="sum"
-            )
-            if int(bad_ranks.item()) > 0:
-                raise RuntimeError(f"non-finite E2E loss at optimizer step {global_step}")
-            accelerator.backward(loss)
-            active_groups = _e2e_active_groups(phase, arm)
-            gathered_squared = _e2e_group_squared_norms(parameter_groups.groups, accelerator)
-            e2e_assert_replicated_squared_norms(gathered_squared)
-            gradient_records = e2e_check_and_clip_gradients(
-                parameter_groups.groups,
-                active_groups,
-                max_norm={
-                    "pair_encoder_head": training.pair_encoder_clip_norm,
-                    "generator": training.generator_clip_norm,
-                    "topology_content_conditioning": training.clip_norm,
-                },
-            )
-            gradient_row: dict[str, object] = {
-                "step": global_step + 1,
-                "phase": phase.phase,
-                "alpha": phase.alpha,
-                "optimizer_group_gradients": {
-                    name: asdict(record) for name, record in gradient_records.items()
-                },
-            }
-            if accelerator.is_main_process:
-                optimizer_step_gradients.append(gradient_row)
-            clip_guard.update(
-                gradient_records,
-                step=global_step + 1,
-                phase=phase.phase,
-                enforce_persistent=not profile_only,
-            )
-            optimizer.step()
-            post_step_failure = 0
-            try:
-                e2e_assert_finite_optimizer_state(parameter_groups.groups, optimizer)
-            except RuntimeError:
-                post_step_failure = 1
-            failed = accelerator.reduce(
-                torch.tensor(post_step_failure, device=accelerator.device), reduction="sum"
-            )
-            if int(failed.item()) > 0:
-                raise RuntimeError("non-finite E2E parameter or optimizer state after step")
-            epoch_parts = cast(dict[str, float], out["parts"])
-            global_step += 1
-
-            if not profile_only and global_step % cfg.diagnostics.gradient_probe_interval == 0:
-                assert fixed_replay is not None
-                probe_payload = cast(dict[str, object], _detached_clone(fixed_replay))
-                probe_payload["pair_only"] = phase.pair_only
-                probe_payload["real_ssl_scale"] = torch.tensor(
-                    phase.real_ssl_scale, device=accelerator.device
-                )
-                family_norms, submodule_rms = _e2e_family_probe(
-                    wrapped,
-                    probe_payload,
-                    parameter_groups.groups,
+        batches = _prefetch_batches(batch_source, depth=prefetch_depth)
+        try:
+            for _step_in_epoch in range(epoch_steps):
+                fetch_started = time.monotonic()
+                batch = next(batches)
+                epoch_data_wait += time.monotonic() - fetch_started
+                phase = e2e_phase_state(global_step, schedule_total_steps)
+                base_lr = _e2e_base_lr(global_step, schedule_total_steps, training)
+                for group in optimizer.param_groups:
+                    group["lr"] = (
+                        base_lr * phase.alpha
+                        if group.get("name") == "topology_content_conditioning"
+                        else base_lr
+                    )
+                payload = _e2e_training_payload(
+                    batch,
+                    cfg,
                     phase,
-                    arm,
-                    accelerator,
+                    epoch=1 if run_kind == "overfit" else epoch,
+                    step=global_step,
+                    device=accelerator.device,
                 )
-                ratios = ratio_guard.update(family_norms, enabled=phase.alpha == 1.0)
-                latest_topology_norm = family_norms["topology_content_conditioning"].get("edge")
-                probe_record: dict[str, object] = {
-                    "step": global_step,
+                if fixed_replay is None:
+                    fixed_replay = cast(dict[str, object], _detached_clone(payload))
+                optimizer.zero_grad(set_to_none=True)
+                out = cast(dict[str, object], wrapped(payload))
+                loss = cast(torch.Tensor, out["loss"])
+                local_bad = not bool(torch.isfinite(loss).all())
+                bad_ranks = accelerator.reduce(
+                    torch.tensor(int(local_bad), device=accelerator.device), reduction="sum"
+                )
+                if int(bad_ranks.item()) > 0:
+                    raise RuntimeError(f"non-finite E2E loss at optimizer step {global_step}")
+                accelerator.backward(loss)
+                active_groups = _e2e_active_groups(phase, arm)
+                gathered_squared = _e2e_group_squared_norms(parameter_groups.groups, accelerator)
+                e2e_assert_replicated_squared_norms(gathered_squared)
+                gradient_records = e2e_check_and_clip_gradients(
+                    parameter_groups.groups,
+                    active_groups,
+                    max_norm={
+                        "pair_encoder_head": training.pair_encoder_clip_norm,
+                        "generator": training.generator_clip_norm,
+                        "topology_content_conditioning": training.clip_norm,
+                    },
+                )
+                gradient_row: dict[str, object] = {
+                    "step": global_step + 1,
                     "phase": phase.phase,
                     "alpha": phase.alpha,
                     "optimizer_group_gradients": {
                         name: asdict(record) for name, record in gradient_records.items()
                     },
-                    "family_group_norms": family_norms,
-                    "family_group_ratios": ratios,
-                    "submodule_gradient_rms": submodule_rms,
-                    **_e2e_gate_tanh(cast(EgoStitchE2E, accelerator.unwrap_model(wrapped).model)),
                 }
-                epoch_probes.append(probe_record)
-                gradient_norm_series.append(probe_record)
-
-            if not profile_only and global_step == phase_a_end:
-                warm = _validate_epoch(
-                    model,
-                    data,
-                    accelerator,
-                    edge_batch=cfg.data.edge_batch,
-                    topk_fraction=cfg.diagnostics.topk_fraction,
-                    token_table=factory._token_table,
-                    token_node_index=factory._token_node_index,
-                )
-                warm_failure = 0
                 if accelerator.is_main_process:
-                    assert warm is not None
-                    warm_reference_std = warm.fidelity["f_logit_std"]
-                    warm_reference_auprc = warm.fidelity["f_logit_auprc"]
-                    if not math.isfinite(warm_reference_std) or warm_reference_std < 1e-4:
-                        warm_failure = 1
+                    optimizer_step_gradients.append(gradient_row)
+                clip_guard.update(
+                    gradient_records,
+                    step=global_step + 1,
+                    phase=phase.phase,
+                    enforce_persistent=not profile_only,
+                )
+                optimizer.step()
+                post_step_failure = 0
+                try:
+                    e2e_assert_finite_optimizer_state(parameter_groups.groups, optimizer)
+                except RuntimeError:
+                    post_step_failure = 1
                 failed = accelerator.reduce(
-                    torch.tensor(warm_failure, device=accelerator.device), reduction="sum"
+                    torch.tensor(post_step_failure, device=accelerator.device), reduction="sum"
                 )
                 if int(failed.item()) > 0:
-                    raise RuntimeError("invalid E2E warm-reference logit standard deviation")
-            if (
-                not profile_only
-                and global_step == phase_b_end
-                and arm == "full"
-                and run_kind != "overfit"
-            ):
-                assert fixed_replay is not None
-                precision_failure = 0
-                if accelerator.is_main_process:
-                    try:
-                        inner_model = cast(_CompositeStep, accelerator.unwrap_model(wrapped)).model
-                        assert isinstance(inner_model, EgoStitchE2E)
-                        end_ramp_precision = _e2e_precision_differential(
-                            inner_model,
-                            cast(dict[str, torch.Tensor], fixed_replay["edge"]),
-                            accelerator,
-                        )
-                    except RuntimeError:
-                        precision_failure = 1
-                failed = accelerator.reduce(
-                    torch.tensor(precision_failure, device=accelerator.device), reduction="sum"
-                )
-                if int(failed.item()) > 0:
-                    raise RuntimeError("end-ramp E2E precision differential failed")
+                    raise RuntimeError("non-finite E2E parameter or optimizer state after step")
+                epoch_parts = cast(dict[str, float], out["parts"])
+                global_step += 1
 
-            epoch_local_pairs += batch.edge_rows_true
-            epoch_local_tokens += batch.f0_rows_gathered
-            epoch_global_pairs += batch.edge_rows_global
+                if not profile_only and global_step % cfg.diagnostics.gradient_probe_interval == 0:
+                    assert fixed_replay is not None
+                    probe_payload = cast(dict[str, object], _detached_clone(fixed_replay))
+                    probe_payload["pair_only"] = phase.pair_only
+                    probe_payload["real_ssl_scale"] = torch.tensor(
+                        phase.real_ssl_scale, device=accelerator.device
+                    )
+                    family_norms, submodule_rms = _e2e_family_probe(
+                        wrapped,
+                        probe_payload,
+                        parameter_groups.groups,
+                        phase,
+                        arm,
+                        accelerator,
+                    )
+                    ratios = ratio_guard.update(family_norms, enabled=phase.alpha == 1.0)
+                    latest_topology_norm = family_norms["topology_content_conditioning"].get("edge")
+                    probe_record: dict[str, object] = {
+                        "step": global_step,
+                        "phase": phase.phase,
+                        "alpha": phase.alpha,
+                        "optimizer_group_gradients": {
+                            name: asdict(record) for name, record in gradient_records.items()
+                        },
+                        "family_group_norms": family_norms,
+                        "family_group_ratios": ratios,
+                        "submodule_gradient_rms": submodule_rms,
+                        **_e2e_gate_tanh(
+                            cast(EgoStitchE2E, accelerator.unwrap_model(wrapped).model)
+                        ),
+                    }
+                    epoch_probes.append(probe_record)
+                    gradient_norm_series.append(probe_record)
+
+                if not profile_only and global_step == phase_a_end:
+                    warm = _validate_epoch(
+                        model,
+                        data,
+                        accelerator,
+                        edge_batch=cfg.data.edge_batch,
+                        topk_fraction=cfg.diagnostics.topk_fraction,
+                        token_table=factory._token_table,
+                        token_node_index=factory._token_node_index,
+                    )
+                    warm_failure = 0
+                    if accelerator.is_main_process:
+                        assert warm is not None
+                        warm_reference_std = warm.fidelity["f_logit_std"]
+                        warm_reference_auprc = warm.fidelity["f_logit_auprc"]
+                        if not math.isfinite(warm_reference_std) or warm_reference_std < 1e-4:
+                            warm_failure = 1
+                    failed = accelerator.reduce(
+                        torch.tensor(warm_failure, device=accelerator.device), reduction="sum"
+                    )
+                    if int(failed.item()) > 0:
+                        raise RuntimeError("invalid E2E warm-reference logit standard deviation")
+                if (
+                    not profile_only
+                    and global_step == phase_b_end
+                    and arm == "full"
+                    and run_kind != "overfit"
+                ):
+                    assert fixed_replay is not None
+                    precision_failure = 0
+                    if accelerator.is_main_process:
+                        try:
+                            inner_model = cast(
+                                _CompositeStep, accelerator.unwrap_model(wrapped)
+                            ).model
+                            assert isinstance(inner_model, EgoStitchE2E)
+                            end_ramp_precision = _e2e_precision_differential(
+                                inner_model,
+                                cast(dict[str, torch.Tensor], fixed_replay["edge"]),
+                                accelerator,
+                            )
+                        except RuntimeError:
+                            precision_failure = 1
+                    failed = accelerator.reduce(
+                        torch.tensor(precision_failure, device=accelerator.device), reduction="sum"
+                    )
+                    if int(failed.item()) > 0:
+                        raise RuntimeError("end-ramp E2E precision differential failed")
+
+                epoch_local_pairs += batch.edge_rows_true
+                epoch_local_tokens += batch.f0_rows_gathered
+                epoch_global_pairs += batch.edge_rows_global
+        finally:
+            batches.close()
 
         validation_started = time.monotonic()
         validation = _validate_epoch(
@@ -4910,99 +4953,110 @@ def _run_probe_mode(
         torch.cuda.reset_peak_memory_stats(accelerator.device)
 
     warmup, timed = runtime.probe_warmup_steps, runtime.probe_timed_steps
-    iterator = batch_iterator()
+    probe_steps = warmup + timed
+    probe_batches = iter(islice(batch_iterator(), probe_steps))
+    iterator = (
+        _prefetch_batches(probe_batches, depth=runtime.prefetch_factor) if is_e2e else probe_batches
+    )
     timed_global_pairs = 0
     timed_start: float | None = None
     failure: str | None = None
-    for step in range(warmup + timed):
-        if step == warmup:
-            accelerator.wait_for_everyone()
-            if use_cuda:
-                torch.cuda.synchronize(accelerator.device)
-            timed_start = time.monotonic()
-        batch = next(iterator)
-        payload: dict[str, object] = {
-            "node": _to_device(batch.node, accelerator.device),
-            "edge": _to_device(batch.edge, accelerator.device),
-            "joint_weight": torch.tensor(1.0, device=accelerator.device),
-            "edge_rows_global": batch.edge_rows_global,
-            "collect_diagnostics": step == 0,
-        }
-        if is_e2e:
-            # Mirrors `batch_iterator`'s own epoch/step-within-epoch cycling
-            # (`factory.epoch_batches(epoch, ...)` yields exactly
-            # `steps_per_epoch` batches per epoch), so this matches the
-            # seeding `_BatchFactory` used internally for this same batch.
-            payload["seed"] = cfg.seed
-            payload["epoch"] = step // steps_per_epoch + 1
-            payload["step"] = step % steps_per_epoch
-            if cfg.training is not None:
-                payload["pair_only"] = False
-                payload["real_ssl_scale"] = torch.tensor(1.0, device=accelerator.device)
-        loss: torch.Tensor | None = None
-        local_failure: tuple[str, str] | None = None
-        s1_abs_mean: float | None = None
-        try:
-            probe_out = wrapped(payload)
-            loss = cast(torch.Tensor, probe_out["loss"])
-            if not bool(torch.isfinite(loss).all()):
-                local_failure = ("nonfinite", "non-finite probe loss")
-            # Family egostitch_e2e has no s1/s2 channels (spec Sec 13.17
-            # re-registration retires this frozen-s0-specific guard for that
-            # family; its liveness telemetry is `_e2e_gate_tanh`/
-            # `topology_delta_std`, checked per-epoch in `_validate_epoch`
-            # instead of at probe time).
-            if step == 0 and not is_e2e:
-                channel_stats = cast(dict[str, float], probe_out["channel_stats"])
-                s1_abs_mean = abs(channel_stats["s1_mean"])
-        except RuntimeError as error:
-            if not _is_oom_error(error):
-                raise
-            local_failure = ("oom", str(error))
-        failed_ranks = accelerator.reduce(
-            torch.tensor(
-                1 if local_failure is not None else 0,
-                device=accelerator.device,
-                dtype=torch.int64,
-            ),
-            reduction="sum",
-        )
-        if int(failed_ranks.item()) > 0:
-            if use_cuda and local_failure is not None:
-                torch.cuda.empty_cache()
-            kind, message = local_failure or ("oom", "probe candidate failed on another rank")
-            _emit_probe_candidate_failure(kind, message)
-            raise RuntimeError(message)
-        if step == 0 and not is_e2e:
-            assert s1_abs_mean is not None
-            global_s1_abs_mean = float(
-                accelerator.gather(
-                    torch.tensor([s1_abs_mean], device=accelerator.device, dtype=torch.float64)
-                )
-                .max()
-                .item()
+    local_elapsed = 0.0
+    try:
+        for step in range(probe_steps):
+            if step == warmup:
+                accelerator.wait_for_everyone()
+                if use_cuda:
+                    torch.cuda.synchronize(accelerator.device)
+                timed_start = time.monotonic()
+            batch = next(iterator)
+            payload: dict[str, object] = {
+                "node": _to_device(batch.node, accelerator.device),
+                "edge": _to_device(batch.edge, accelerator.device),
+                "joint_weight": torch.tensor(1.0, device=accelerator.device),
+                "edge_rows_global": batch.edge_rows_global,
+                "collect_diagnostics": step == 0,
+            }
+            if is_e2e:
+                # Mirrors `batch_iterator`'s own epoch/step-within-epoch cycling
+                # (`factory.epoch_batches(epoch, ...)` yields exactly
+                # `steps_per_epoch` batches per epoch), so this matches the
+                # seeding `_BatchFactory` used internally for this same batch.
+                payload["seed"] = cfg.seed
+                payload["epoch"] = step // steps_per_epoch + 1
+                payload["step"] = step % steps_per_epoch
+                if cfg.training is not None:
+                    payload["pair_only"] = False
+                    payload["real_ssl_scale"] = torch.tensor(1.0, device=accelerator.device)
+            loss: torch.Tensor | None = None
+            local_failure: tuple[str, str] | None = None
+            s1_abs_mean: float | None = None
+            try:
+                probe_out = wrapped(payload)
+                loss = cast(torch.Tensor, probe_out["loss"])
+                if not bool(torch.isfinite(loss).all()):
+                    local_failure = ("nonfinite", "non-finite probe loss")
+                # Family egostitch_e2e has no s1/s2 channels (spec Sec 13.17
+                # re-registration retires this frozen-s0-specific guard for that
+                # family; its liveness telemetry is `_e2e_gate_tanh`/
+                # `topology_delta_std`, checked per-epoch in `_validate_epoch`
+                # instead of at probe time).
+                if step == 0 and not is_e2e:
+                    channel_stats = cast(dict[str, float], probe_out["channel_stats"])
+                    s1_abs_mean = abs(channel_stats["s1_mean"])
+            except RuntimeError as error:
+                if not _is_oom_error(error):
+                    raise
+                local_failure = ("oom", str(error))
+            failed_ranks = accelerator.reduce(
+                torch.tensor(
+                    1 if local_failure is not None else 0,
+                    device=accelerator.device,
+                    dtype=torch.int64,
+                ),
+                reduction="sum",
             )
-            _enforce_probe_s1_scale(global_s1_abs_mean, cfg.diagnostics.probe_s1_abs_mean_max)
-        if loss is None:  # pragma: no cover - collective failure raises above
-            raise RuntimeError("probe forward produced no loss")
-        optimizer.zero_grad()
-        # DDP collectives may be in flight past this point: exceptions must
-        # escape immediately (deferring them can deadlock the other ranks).
-        try:
-            accelerator.backward(loss)
-            if cfg.optim.grad_clip > 0:
-                accelerator.clip_grad_norm_(wrapped.parameters(), cfg.optim.grad_clip)
-            optimizer.step()
-        except RuntimeError as error:
-            if _is_oom_error(error):
-                _emit_probe_candidate_failure("oom", str(error))
-            raise
-        if step >= warmup:
-            timed_global_pairs += batch.edge_rows_global
-    if use_cuda:
-        torch.cuda.synchronize(accelerator.device)
-
-    local_elapsed = time.monotonic() - timed_start if timed_start is not None else 0.0
+            if int(failed_ranks.item()) > 0:
+                if use_cuda and local_failure is not None:
+                    torch.cuda.empty_cache()
+                kind, message = local_failure or (
+                    "oom",
+                    "probe candidate failed on another rank",
+                )
+                _emit_probe_candidate_failure(kind, message)
+                raise RuntimeError(message)
+            if step == 0 and not is_e2e:
+                assert s1_abs_mean is not None
+                global_s1_abs_mean = float(
+                    accelerator.gather(
+                        torch.tensor([s1_abs_mean], device=accelerator.device, dtype=torch.float64)
+                    )
+                    .max()
+                    .item()
+                )
+                _enforce_probe_s1_scale(global_s1_abs_mean, cfg.diagnostics.probe_s1_abs_mean_max)
+            if loss is None:  # pragma: no cover - collective failure raises above
+                raise RuntimeError("probe forward produced no loss")
+            optimizer.zero_grad()
+            # DDP collectives may be in flight past this point: exceptions must
+            # escape immediately (deferring them can deadlock the other ranks).
+            try:
+                accelerator.backward(loss)
+                if cfg.optim.grad_clip > 0:
+                    accelerator.clip_grad_norm_(wrapped.parameters(), cfg.optim.grad_clip)
+                optimizer.step()
+            except RuntimeError as error:
+                if _is_oom_error(error):
+                    _emit_probe_candidate_failure("oom", str(error))
+                raise
+            if step >= warmup:
+                timed_global_pairs += batch.edge_rows_global
+        if use_cuda:
+            torch.cuda.synchronize(accelerator.device)
+        local_elapsed = time.monotonic() - timed_start if timed_start is not None else 0.0
+    finally:
+        if is_e2e:
+            cast(Generator[_CompositeBatch, None, None], iterator).close()
     elapsed = float(
         accelerator.gather(
             torch.tensor([local_elapsed], device=accelerator.device, dtype=torch.float64)

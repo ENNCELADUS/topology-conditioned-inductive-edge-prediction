@@ -638,7 +638,7 @@ def _validate_worker_profile(
         data["steady_state_data_wait_fraction"], field="steady_state_data_wait_fraction"
     )
     if wait_fraction > 0.05:
-        raise ValueError("steady_state_data_wait_fraction exceeds 0.05")
+        raise ValueError(f"steady_state_data_wait_fraction {wait_fraction:.6f} exceeds 0.05")
     per_epoch = data["per_epoch"]
     expected_epochs = cast(int, data["epochs_completed"])
     if not isinstance(per_epoch, list) or len(per_epoch) != expected_epochs:
@@ -1195,6 +1195,7 @@ def run_pipeline(
     stage_seconds["train"] = time.monotonic() - train_started
 
     # --- merge the worker runtime profile with pipeline-level fields ---
+    worker_data: object | None = None
     try:
         worker_data = json.loads(worker_profile_path.read_text(encoding="utf-8"))
         worker_runtime_profile = _validate_worker_profile(
@@ -1212,7 +1213,10 @@ def run_pipeline(
             allow_partial=debug_run,
         )
     except Exception as error:
-        _write_json_atomic(profile_path, evidence_profile)
+        rejected_profile = {**evidence_profile}
+        if isinstance(worker_data, dict):
+            rejected_profile["rejected_worker_profile"] = worker_data
+        _write_json_atomic(profile_path, rejected_profile)
         return fail(
             stage="artifacts",
             message=f"worker profile is missing or malformed: {error}",

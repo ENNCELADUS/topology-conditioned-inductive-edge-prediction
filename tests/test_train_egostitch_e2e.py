@@ -162,6 +162,91 @@ class TestBatchFactoryE2E:
         with pytest.raises(ValueError, match="pack_dir"):
             te._BatchFactory(e2e_cfg, model_cfg, data, node_batch=4, rank=0, world_size=1)
 
+    def test_prefetch_preserves_real_epoch_and_overfit_batches(self, tmp_path: Path) -> None:
+        cfg = _toy_cfg(tmp_path)
+        model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
+        data = _toy_bundle(tmp_path, model_cfg)
+        pack_dir = tmp_path / "token_pack"
+        _write_tiny_token_pack(pack_dir, _NODES)
+        e2e_cfg = replace(
+            cfg,
+            model=ModelConfig(family="egostitch_e2e", config={}),
+            data=replace(cfg.data, pack_dir=pack_dir),
+        )
+        rows_per_rank, epoch_steps = te._epoch_step_plan(
+            len(data.e_sup_positives),
+            negative_ratio=e2e_cfg.data.negative_ratio,
+            edge_batch=e2e_cfg.data.edge_batch,
+            world_size=2,
+        )
+        manifest_rows = tuple(
+            (
+                _NODES[index % len(_NODES)],
+                _NODES[(index + 1) % len(_NODES)],
+                index % 2,
+            )
+            for index in range(10)
+        )
+        manifest = te.OverfitManifest(rows=manifest_rows, sha256="a" * 64)
+
+        def assert_batches_equal(
+            direct: list[te._CompositeBatch], prefetched: list[te._CompositeBatch]
+        ) -> None:
+            assert len(direct) == len(prefetched)
+            for expected, actual in zip(direct, prefetched, strict=True):
+                assert actual.edge_rows_true == expected.edge_rows_true
+                assert actual.edge_rows_global == expected.edge_rows_global
+                assert actual.f0_rows_gathered == expected.f0_rows_gathered
+                assert actual.node.keys() == expected.node.keys()
+                assert actual.edge.keys() == expected.edge.keys()
+                for name in expected.node:
+                    assert torch.equal(actual.node[name], expected.node[name])
+                for name in expected.edge:
+                    assert torch.equal(actual.edge[name], expected.edge[name])
+
+        for rank in range(2):
+            for mode in ("epoch", "overfit"):
+                direct_factory = te._BatchFactory(
+                    e2e_cfg, model_cfg, data, node_batch=4, rank=rank, world_size=2
+                )
+                if mode == "epoch":
+                    direct_source = direct_factory.epoch_batches(
+                        1, rows_per_rank=rows_per_rank, steps=epoch_steps
+                    )
+                else:
+                    direct_source = direct_factory.fixed_row_batches(
+                        manifest=manifest, steps=3, step_offset=5
+                    )
+                direct = list(direct_source)
+                direct_state = (
+                    direct_factory._node_cursor,
+                    direct_factory._node_cycle,
+                    direct_factory.training_nodes_read,
+                    direct_factory.training_f0_rows_read,
+                )
+
+                prefetch_factory = te._BatchFactory(
+                    e2e_cfg, model_cfg, data, node_batch=4, rank=rank, world_size=2
+                )
+                if mode == "epoch":
+                    prefetch_source = prefetch_factory.epoch_batches(
+                        1, rows_per_rank=rows_per_rank, steps=epoch_steps
+                    )
+                else:
+                    prefetch_source = prefetch_factory.fixed_row_batches(
+                        manifest=manifest, steps=3, step_offset=5
+                    )
+                prefetched = list(te._prefetch_batches(iter(prefetch_source), depth=2))
+                prefetch_state = (
+                    prefetch_factory._node_cursor,
+                    prefetch_factory._node_cycle,
+                    prefetch_factory.training_nodes_read,
+                    prefetch_factory.training_f0_rows_read,
+                )
+
+                assert_batches_equal(direct, prefetched)
+                assert prefetch_state == direct_state
+
 
 class TestE2ECompositeStep:
     """One CPU optimizer forward through the active §13.19 composite."""

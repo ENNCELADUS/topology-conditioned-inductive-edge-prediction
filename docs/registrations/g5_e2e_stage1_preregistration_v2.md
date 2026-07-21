@@ -49,6 +49,13 @@ amendment, not a claim that attempt 003 was prospectively registered in its corr
 form. Any change outside this list, a fourth full-arm rehearsal attempt, or any post-binding change
 requires a new versioned registration.
 
+The registered `prefetch_factor=2` is therefore applied to the manual packed-token
+batch iterator with one bounded deterministic producer thread per rank. This overlaps
+unchanged CPU batch construction with GPU execution; it does not change batch order,
+rows, padding, seeds, tensor values, losses, or optimizer steps. Rejected completed
+JSON-object worker profiles are also retained as failure evidence so the measured
+bottleneck is auditable.
+
 The consolidation port briefly omitted the already-calibrated V2 group-specific
 ceilings and therefore serialized `1.0/1.0/1.0`. This DRAFT correction restores the
 pair-encoder/generator/topology ceilings `3.0/3.0/1.0` actually executed by the

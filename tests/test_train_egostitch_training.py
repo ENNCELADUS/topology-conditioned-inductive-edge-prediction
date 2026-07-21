@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -351,6 +353,64 @@ def test_fixed_overfit_batches_preserve_global_rows_and_four_rank_padding(
         rank: int(np.random.default_rng((cfg.seed, 0, 1, rank, 0x7A)).integers(0, 2**31))
         for rank in range(4)
     }
+
+
+def test_prefetch_batches_builds_ahead_without_reordering() -> None:
+    second_started = threading.Event()
+    release_second = threading.Event()
+
+    def source() -> Iterator[int]:
+        yield 1
+        second_started.set()
+        assert release_second.wait(timeout=1.0)
+        yield 2
+
+    batches = te._prefetch_batches(source(), depth=2)
+    try:
+        assert next(batches) == 1
+        assert second_started.wait(timeout=1.0)
+        release_second.set()
+        assert next(batches) == 2
+        with pytest.raises(StopIteration):
+            next(batches)
+    finally:
+        release_second.set()
+        batches.close()
+
+
+def test_prefetch_batches_shutdowns_after_consumer_abort() -> None:
+    second_started = threading.Event()
+    release_second = threading.Event()
+
+    def source() -> Iterator[int]:
+        yield 1
+        second_started.set()
+        assert release_second.wait(timeout=1.0)
+        yield 2
+
+    batches = te._prefetch_batches(source(), depth=2)
+    try:
+        assert next(batches) == 1
+        assert second_started.wait(timeout=1.0)
+    finally:
+        release_second.set()
+        batches.close()
+
+    assert not any(thread.name.startswith("egostitch-batch") for thread in threading.enumerate())
+
+
+def test_prefetch_batches_propagates_producer_error_and_shutdowns() -> None:
+    def source() -> Iterator[int]:
+        yield 1
+        raise ValueError("batch construction failed")
+
+    batches = te._prefetch_batches(source(), depth=2)
+    assert next(batches) == 1
+    with pytest.raises(ValueError, match="batch construction failed"):
+        next(batches)
+    batches.close()
+
+    assert not any(thread.name.startswith("egostitch-batch") for thread in threading.enumerate())
 
 
 def test_e2e_lr_and_active_groups_follow_registered_phase_contract() -> None:
