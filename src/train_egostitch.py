@@ -3643,11 +3643,10 @@ def _train_e2e_stability_loop(
             fetch_started = time.monotonic()
             batch = next(batches)
             epoch_data_wait += time.monotonic() - fetch_started
-            phase = (
-                E2EPhaseState("C", 1.0, False, 1.0)
-                if profile_only
-                else e2e_phase_state(global_step, total_steps)
-            )
+            # The one-epoch probe compresses the production schedule but must
+            # preserve its A -> B -> C order; starting a fresh model in Phase C
+            # exercises an invalid objective and can trip the gradient guard.
+            phase = e2e_phase_state(global_step, total_steps)
             base_lr = _e2e_base_lr(global_step, total_steps, training)
             for group in optimizer.param_groups:
                 group["lr"] = (
@@ -3823,11 +3822,7 @@ def _train_e2e_stability_loop(
                 collapse_streak = collapse_streak + 1 if fidelity["f_logit_std"] < threshold else 0
                 if collapse_streak >= training.collapse_validations:
                     collapse_failure = 1
-            phase = (
-                E2EPhaseState("C", 1.0, False, 1.0)
-                if profile_only
-                else e2e_phase_state(global_step - 1, total_steps)
-            )
+            phase = e2e_phase_state(global_step - 1, total_steps)
             full_joint_epochs = max(0, epoch - first_eligible_epoch + 1)
             record = E2ECheckpointRecord(
                 epoch=epoch,

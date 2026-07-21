@@ -512,6 +512,12 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-21: corrected the consolidated one-epoch runtime probe to preserve the
+  registered Phase A/B/C order in its compressed representative schedule. The
+  prior `profile_only` path forced Phase C from random initialization and caused
+  the attempt-005 Stage-2 epoch probe to trip the generator-gradient guard; the
+  production 2,000-step/30-epoch schedules and guard thresholds are unchanged.
+
 - 2026-07-21: corrected a consolidation-port omission that collapsed the
   registered V2 per-group clip ceilings from `3.0/3.0/1.0` to `1.0/1.0/1.0`.
   Restored `3.0` for pair-encoder/head and generator and retained `1.0` for

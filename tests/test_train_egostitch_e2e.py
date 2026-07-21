@@ -315,14 +315,26 @@ class TestE2ECompositeStep:
             len(result.runtime_profile["optimizer_step_gradients"])
             == result.runtime_profile["total_optimizer_steps"]
         )
-        first_step = result.runtime_profile["optimizer_step_gradients"][0]
-        gradients = first_step["optimizer_group_gradients"]
+        optimizer_steps = result.runtime_profile["optimizer_step_gradients"]
+        phases = [step["phase"] for step in optimizer_steps]
+        assert phases[0] == "A"
+        phase_a_end, phase_b_end = te.e2e_phase_boundaries(len(phases))
+        assert {phase: phases.count(phase) for phase in ("A", "B", "C")} == {
+            "A": phase_a_end,
+            "B": phase_b_end - phase_a_end,
+            "C": len(phases) - phase_b_end,
+        }
+        assert phases == sorted(phases, key={"A": 0, "B": 1, "C": 2}.__getitem__)
         for group, ceiling in (
             ("pair_encoder_head", 3.0),
             ("generator", 3.0),
             ("topology_content_conditioning", 1.0),
         ):
-            record = gradients[group]
+            record = next(
+                step["optimizer_group_gradients"][group]
+                for step in optimizer_steps
+                if step["optimizer_group_gradients"][group]["active"]
+            )
             assert record["clip_coefficient"] == pytest.approx(
                 min(1.0, ceiling / (record["norm"] + 1e-12))
             )
