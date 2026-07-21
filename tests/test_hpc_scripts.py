@@ -27,8 +27,8 @@ def test_hpc_layer_has_only_runners_and_documentation() -> None:
     assert sorted(path.name for path in HPC_DIR.iterdir()) == [
         "README.md",
         "g5_stage1.sh",
+        "qualification.sh",
         "run.sh",
-        "v2_qualification.sh",
     ]
     assert not (REPO_ROOT / "slurm").exists()
 
@@ -109,9 +109,7 @@ def test_g5_formal_runner_builds_every_registered_gate_input() -> None:
     assert "--pair-amp off" in text
     assert "--token-budget 262144" in text
     assert '--s0-universe "${S0_CANDIDATE}"' in formal_body
-    assert formal_body.index("run_diagnostics") < formal_body.index(
-        "-m src.experiments.g5_stage1"
-    )
+    assert formal_body.index("run_diagnostics") < formal_body.index("-m src.experiments.g5_stage1")
 
 
 def test_g5_seed_reuse_is_bound_to_registration_config_and_commit() -> None:
@@ -169,6 +167,7 @@ def test_runner_dispatches_to_the_implemented_clis() -> None:
     assert "-m src.score_universe merge" in text
     assert "-m src.experiments.g1_hardened_e2" in text
     assert "-m src.experiments.g2_ceiling" in text
+    assert 'tests/test_e2_ddp_integration.py -m "integration and not slow"' in text
 
 
 def test_s0_scoring_uses_packed_auto_sharded_fast_path() -> None:

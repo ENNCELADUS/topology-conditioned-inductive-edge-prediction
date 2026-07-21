@@ -619,12 +619,11 @@ def _load_shard(path: Path) -> _Shard:
         label: NDArray[np.int8] = data["label"].astype(np.int8, copy=False)
         row_start = int(data["row_start"][()])
         meta = cast(dict[str, object], json.loads(str(data["meta"][()])))
-        formal_e2e_v2 = (
-            meta.get("model_family") == "egostitch_e2e"
-            and isinstance(meta.get("formal_scoring_provenance"), dict)
+        formal_e2e_v2 = meta.get("model_family") == "egostitch_e2e" and isinstance(
+            meta.get("formal_scoring_provenance"), dict
         )
         if formal_e2e_v2 and "full" not in data:
-            raise ValueError(f"{path}: formal v2 egostitch_e2e artifact is missing full")
+            raise ValueError(f"{path}: formal egostitch_e2e artifact is missing full")
         f_logit: NDArray[np.float32] | None = (
             data["f_logit"].astype(np.float32, copy=False) if "f_logit" in data else None
         )
@@ -638,7 +637,7 @@ def _load_shard(path: Path) -> _Shard:
         )
         primary_logit = meta.get("primary_logit", "full")
         if formal_e2e_v2 and primary_logit == "full" and not np.array_equal(data["full"], logit):
-            raise ValueError(f"{path}: formal v2 full array contradicts primary logit")
+            raise ValueError(f"{path}: formal E2E full array contradicts primary logit")
         if "full" in data and primary_logit != "full":
             full_logit = data["full"].astype(np.float32, copy=False)
         elif "full_logit" in data:
@@ -933,8 +932,10 @@ def _registered_path(registration_path: Path, value: object) -> Path:
 
 def _is_sha256(value: object) -> bool:
     """Return whether `value` is a lowercase-or-uppercase 64-hex digest."""
-    return isinstance(value, str) and len(value) == 64 and all(
-        character in "0123456789abcdefABCDEF" for character in value
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdefABCDEF" for character in value)
     )
 
 
@@ -993,7 +994,7 @@ def _validate_e2e_scoring_provenance(
     checkpoint_path: Path,
     checkpoint_id: str,
 ) -> dict[str, object]:
-    """Validate the v2 formal-run provenance required before held-out scoring.
+    """Validate the E2E formal-run provenance required before held-out scoring.
 
     The check is intentionally independent of the candidate/test inputs.  A
     failure therefore occurs before either manifest is opened and before an
@@ -1010,8 +1011,7 @@ def _validate_e2e_scoring_provenance(
         raise ValueError("registration binding_evidence must be an object")
     if evidence.get("schema_version") != _EGOSTITCH_E2E_BINDING_SCHEMA:
         raise ValueError(
-            "binding_evidence.schema_version must be "
-            f"{_EGOSTITCH_E2E_BINDING_SCHEMA!r}"
+            f"binding_evidence.schema_version must be {_EGOSTITCH_E2E_BINDING_SCHEMA!r}"
         )
     implementation = evidence.get("implementation")
     if not isinstance(implementation, dict):
@@ -2174,7 +2174,7 @@ def _run_score(args: argparse.Namespace) -> None:
             )
         # Preserve the old singular option only as an early fail-closed check,
         # so a caller cannot hide malformed selected-run metadata behind a
-        # later all-arm readiness error. Formal v2 scoring still requires the
+        # later all-arm readiness error. Formal E2E scoring still requires the
         # complete four-arm mapping below.
         if args.run_metadata is not None:
             _validate_e2e_scoring_provenance(

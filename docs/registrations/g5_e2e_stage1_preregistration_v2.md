@@ -27,17 +27,39 @@ requirements. A random, collapsed, warm-start-only, or numerically unstable
 checkpoint is classified as an invalid training run, not evidence for or against the
 architecture.
 
+### Disclosed qualification-infrastructure amendment — 2026-07-21
+
+DRAFT rehearsal attempt 003 used two H20s. Its token-budget probes measured about
+`80.46`, `75.81`, and `70.44` pairs/s for candidates `128`, `256`, and `512`; the
+subsequent single-epoch probe had only `1,823.6` seconds left and was stopped by the
+watchdog before completing an epoch. It produced no eligible checkpoint or scientific
+result and remains one of the three allowed rehearsal attempts.
+
+Because the first full-arm rehearsal attempt (qualification attempt 003) exposed a
+launcher/time-accounting defect rather than a
+model result, this still-DRAFT registration is explicitly amended before binding to
+permit only the following failure-recovery changes: auto-detect and use every visible
+H20 for the full-arm rehearsal; rebalance the unchanged total runtime budget; remove
+slower token-budget candidates while retaining measured candidate `128`; correct
+batch-construction timing; and make semantically equivalent in-memory reuse changes
+whose outputs are locked by exact regression tests. Model, loss, optimizer, schedule,
+precision, data roles, sampler, guards, checkpoint eligibility and selection, gates,
+and verdict rules remain frozen. This is a disclosed post-attempt infrastructure
+amendment, not a claim that attempt 003 was prospectively registered in its corrected
+form. Any change outside this list, a fourth full-arm rehearsal attempt, or any post-binding change
+requires a new versioned registration.
+
 ## Arms and frozen evaluation contract
 
 The scientific comparison remains unchanged:
 
 | Arm | Proposed v2 training config | Primary logit in `logits` artifact |
 |---|---|---|
-| `full` | `egostitch_e2e_stability_v2_breadth_first.yaml` | `full` |
-| `b0_e2e_f_only` | `…_stability_v2_f_only_…` | `f_logit` |
-| `pair_topology` | `…_stability_v2_pair_topology_…` | `pair_topology` |
+| `full` | `egostitch_e2e_breadth_first.yaml` | `full` |
+| `b0_e2e_f_only` | `…_training_f_only_…` | `f_logit` |
+| `pair_topology` | `…_training_pair_topology_…` | `pair_topology` |
 | `structure_control_6a` | selected full checkpoint + `shuffle_within_pair` | `full` |
-| `p0` | `…_stability_v2_p0_…` | `full` |
+| `p0` | `…_training_p0_…` | `full` |
 
 The comparator set, frozen candidate/B0 digests, operating points, five-arm
 provenance, four-logit fp32 decomposition, representation probe, primary criteria,
@@ -173,9 +195,11 @@ Before changing this registration to `BINDING`:
    created once before sharding and is rank/world-size invariant. It must reach train
    AUPRC `>=0.95`, residual ratio `>=1e-3` after the ramp, and pass every applicable
    stability guard.
-2. The exact full-arm 30-epoch config must complete on 2×H20 using only the
-   qualification pair/topology manifests and select an eligible post-ramp checkpoint;
-   the formal checkpoint-selection manifests remain unread.
+2. The exact full-arm 30-epoch config must complete using every auto-detected visible
+   H20 (four on the current target host), matching the formal launch style, using only
+   the qualification pair/topology manifests and selecting an eligible post-ramp
+   checkpoint. The detected world size is recorded and the formal
+   checkpoint-selection manifests remain unread.
 3. At end-ramp and the selected checkpoint, the same eval-mode replay and hard masks
    must compare BF16+fp32 islands with pure fp32. Full/f-only meet the elementwise
    tolerance; residual relative L2 is `<=1e-3`, correlation is `>=0.999`, and neither
@@ -200,9 +224,11 @@ The clipping and family-ratio thresholds cannot bind from intuition alone: a pas
 rehearsal requires clip-coefficient `p1>0.12`, minimum `>0.0012`, and fewer than ten
 consecutive steps below `0.1`, plus family-ratio `p99<40`. At most three full-arm
 rehearsal attempts are allowed and every attempt is
-retained. The first pass freezes implementation/config; a fourth attempt or any later
-optimizer/schedule/precision/guard/scientific change requires v3. No candidate/test
-artifact may be read during qualification.
+retained. Except for the disclosed 2026-07-21 failure-recovery amendment above, the
+first full-arm rehearsal pass freezes implementation/config; a fourth full-arm
+rehearsal attempt or any later change outside
+that amendment requires v3. No candidate/test artifact may be read during
+qualification.
 
 ## Cost-aware formal execution order
 
@@ -251,8 +277,8 @@ structure-control failure is reported, and any such label yields `cut`.
   evidence before DDP startup.
 - Create and hash all four v2 training configs.
 - Create and hash the disjoint validation and train-side topology-selection manifests.
-- Complete the deterministic overfit test and 2×H20 full-arm rehearsal in a data root
-  where candidate/test inputs are not mounted.
+- Complete the deterministic overfit test and auto-detected all-visible-H20 full-arm
+  rehearsal in a data root where candidate/test inputs are not mounted.
 - Record implementation, optimizer-group, profile, pack, validation, access-audit,
   config, and every qualification-attempt digest.
 - Complete independent JSON/prose and provenance review.

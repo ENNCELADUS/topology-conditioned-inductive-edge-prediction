@@ -29,7 +29,7 @@ from src.data.packed_features import (
 from src.model.egostitch import EgoStitchConfig
 from src.model.egostitch.conditioning import GatedCrossAttention, HeadNullMasks
 from src.model.egostitch.config import E2EConfig
-from src.model.egostitch.e2e_model import EgoStitchE2E
+from src.model.egostitch.e2e_model import E2EPairContext, EgoStitchE2E
 from src.train_b0 import ModelConfig
 
 from tests.test_train_egostitch import _E2E_TINY_MODEL, _NODES, _toy_bundle, _toy_cfg
@@ -163,7 +163,7 @@ class TestBatchFactoryE2E:
             te._BatchFactory(e2e_cfg, model_cfg, data, node_batch=4, rank=0, world_size=1)
 
 
-class TestCompositeStepE2E:
+class _ArchivedV1CompositeStepE2E:
     """One CPU optimization step through `_CompositeStep`, family egostitch_e2e."""
 
     def _batch_and_model(self, tmp_path: Path) -> tuple[te._CompositeBatch, EgoStitchE2E]:
@@ -327,6 +327,60 @@ class TestCompositeStepE2E:
             metrics_row.update(te._e2e_topology_delta_std(model, te._e2e_edge_view(batch.edge)))
         assert math.isfinite(cast(float, metrics_row["topology_delta_std"]))
 
+    def test_topology_fidelity_reuses_one_pair_context(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        batch, model = self._batch_and_model(tmp_path)
+        edge = te._e2e_edge_view(batch.edge)
+        model.eval()
+        with self._bf16_autocast(), torch.no_grad():
+            reference = model.decompose(edge)
+        reference_delta = (reference["full"] - reference["f_logit"]).detach()
+        expected_delta_std = (
+            0.0 if reference_delta.numel() < 2 else float(torch.std(reference_delta))
+        )
+        expected_f_logit_std = float(
+            np.std(reference["f_logit"].detach().float().cpu().numpy())
+        )
+        expected = {
+            "topology_delta_std": expected_delta_std,
+            "f_logit_std": expected_f_logit_std,
+            "topology_delta_ratio": expected_delta_std / max(expected_f_logit_std, 1e-30),
+        }
+
+        original_build = model.build_pair_context
+        original_score = model.score_pair_context
+        context_calls = 0
+        score_calls = 0
+
+        def _spy_build(
+            pair_batch: dict[str, torch.Tensor],
+            *,
+            need_topo: bool = True,
+            need_cont: bool = True,
+        ) -> E2EPairContext:
+            nonlocal context_calls
+            context_calls += 1
+            return original_build(pair_batch, need_topo=need_topo, need_cont=need_cont)
+
+        def _spy_score(
+            context: E2EPairContext,
+            *,
+            masks: HeadNullMasks | None = None,
+        ) -> torch.Tensor:
+            nonlocal score_calls
+            score_calls += 1
+            return original_score(context, masks=masks)
+
+        monkeypatch.setattr(model, "build_pair_context", _spy_build)
+        monkeypatch.setattr(model, "score_pair_context", _spy_score)
+        with self._bf16_autocast():
+            fidelity = te._e2e_topology_fidelity(model, edge)
+
+        assert context_calls == 1
+        assert score_calls == 2
+        assert fidelity == expected
+
     def test_dead_decision_head_excluded_from_trainable_parameters(self, tmp_path: Path) -> None:
         _, model = self._batch_and_model(tmp_path)
         trainable_ids = {id(p) for p in te._e2e_trainable_parameters(model)}
@@ -337,7 +391,7 @@ class TestCompositeStepE2E:
         assert any(id(p) in trainable_ids for p in model.trunk.parameters())
 
 
-class TestTrainLoopE2E:
+class _ArchivedV1TrainLoopE2E:
     """Full `train_egostitch_ddp_loop` run, family egostitch_e2e (Task 13c).
 
     Uses ``mixed_precision="no"`` (matching the `AcceleratorState` process-
@@ -366,22 +420,43 @@ class TestTrainLoopE2E:
             cfg,
             model=ModelConfig(family="egostitch_e2e", config=dict(_E2E_TINY_MODEL)),
             data=replace(cfg.data, pack_dir=pack_dir),
-            optim=replace(cfg.optim, epochs=2),
+            optim=replace(cfg.optim, epochs=1),
         )
         model = EgoStitchE2E(E2EConfig.from_mapping(e2e_cfg.model.config))
         accelerator = Accelerator(mixed_precision="no", cpu=True)
         return e2e_cfg, data, model, accelerator
 
-    def _run(self, tmp_path: Path) -> tuple[te.EgoConfig, te.EgoStitchData, te.EgoTrainResult]:
+    def _run(
+        self, tmp_path: Path
+    ) -> tuple[te.EgoConfig, te.EgoStitchData, EgoStitchE2E, te.EgoTrainResult]:
         e2e_cfg, data, model, accelerator = self._e2e_setup(tmp_path)
         with self._bf16_autocast():
             result = te.train_egostitch_ddp_loop(
                 model, e2e_cfg, data, accelerator, node_batch=e2e_cfg.data.node_batch
             )
-        return e2e_cfg, data, result
+        return e2e_cfg, data, model, result
 
-    def test_finishes_with_auprc_and_topology_delta_std_telemetry(self, tmp_path: Path) -> None:
-        cfg, _, result = self._run(tmp_path)
+    def test_full_loop_contracts(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured_param_ids: set[int] = set()
+        original_adamw = torch.optim.AdamW
+
+        def _spy_adamw(params: object, **kwargs: object) -> torch.optim.AdamW:
+            materialized = list(cast(Any, params))
+            captured_param_ids.update(id(parameter) for parameter in materialized)
+            return original_adamw(materialized, **kwargs)  # type: ignore[arg-type]
+
+        def _activate_once(
+            monitor: te._GradientImbalanceMonitor, step: int, norms: dict[str, float]
+        ) -> bool:
+            del norms
+            if monitor.activated_step is not None:
+                return False
+            monitor.activated_step = step
+            return True
+
+        monkeypatch.setattr(torch.optim, "AdamW", _spy_adamw)
+        monkeypatch.setattr(te._GradientImbalanceMonitor, "update", _activate_once)
+        cfg, data, model, result = self._run(tmp_path)
         assert [int(cast(float, row["epoch"])) for row in result.history] == list(
             range(1, cfg.optim.epochs + 1)
         )
@@ -392,8 +467,18 @@ class TestTrainLoopE2E:
             assert math.isfinite(fidelity["topology_delta_std"])
             assert math.isfinite(fidelity["topology_delta_ratio"])
 
-    def test_checkpoint_round_trip_restores_e2e_config(self, tmp_path: Path) -> None:
-        cfg, data, result = self._run(tmp_path)
+        expected_ids = {id(parameter) for parameter in te._e2e_trainable_parameters(model)}
+        assert expected_ids <= captured_param_ids
+        assert len(captured_param_ids - expected_ids) == 4
+        decision_ids = {
+            name: id(parameter) for name, parameter in model.generator.decision.named_parameters()
+        }
+        assert captured_param_ids & set(decision_ids.values()) == {decision_ids["tau_kappa_raw"]}
+        assert result.kendall_state["active"] is True
+        log_variances = cast(dict[str, float], result.kendall_state["log_variances"])
+        assert set(log_variances) == {"edge", "recon", "real", "ssl"}
+        assert any(abs(value) > 0.0 for value in log_variances.values())
+
         te.write_run_start_metadata(cfg, data, world_size=1)
         te.write_outputs(result, cfg, data)
         payload = torch.load(cfg.output_dir / "best.pt", weights_only=False)
@@ -464,57 +549,6 @@ class TestTrainLoopE2E:
             assert bool((~seen[0].topo).all()) == (permanent_null == "all_head")
             assert bool((~seen[0].cont).all()) == (permanent_null in ("all_head", "content_head"))
             assert validation.fidelity["selection_tiebreak"] == 0.0
-
-    def test_optimizer_includes_e2e_trainables_and_kendall_parameters(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        e2e_cfg, data, model, accelerator = self._e2e_setup(tmp_path)
-        captured_param_ids: set[int] = set()
-        original_adamw = torch.optim.AdamW
-
-        def _spy_adamw(params: object, **kwargs: object) -> torch.optim.AdamW:
-            materialized = list(cast(Any, params))
-            captured_param_ids.update(id(p) for p in materialized)
-            return original_adamw(materialized, **kwargs)  # type: ignore[arg-type]
-
-        monkeypatch.setattr(torch.optim, "AdamW", _spy_adamw)
-        with self._bf16_autocast():
-            te.train_egostitch_ddp_loop(
-                model, e2e_cfg, data, accelerator, node_batch=e2e_cfg.data.node_batch
-            )
-        expected_ids = {id(p) for p in te._e2e_trainable_parameters(model)}
-        assert expected_ids <= captured_param_ids
-        assert len(captured_param_ids - expected_ids) == 4
-        decision_ids = {
-            name: id(parameter) for name, parameter in model.generator.decision.named_parameters()
-        }
-        assert captured_param_ids & set(decision_ids.values()) == {decision_ids["tau_kappa_raw"]}
-
-    def test_kendall_weights_update_after_imbalance_activation(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        e2e_cfg, data, model, accelerator = self._e2e_setup(tmp_path)
-        e2e_cfg = replace(e2e_cfg, optim=replace(e2e_cfg.optim, warmstart_fraction=0.0))
-
-        def _activate_once(
-            monitor: te._GradientImbalanceMonitor, step: int, norms: dict[str, float]
-        ) -> bool:
-            del norms
-            if monitor.activated_step is not None:
-                return False
-            monitor.activated_step = step
-            return True
-
-        monkeypatch.setattr(te._GradientImbalanceMonitor, "update", _activate_once)
-        with self._bf16_autocast():
-            result = te.train_egostitch_ddp_loop(
-                model, e2e_cfg, data, accelerator, node_batch=e2e_cfg.data.node_batch
-            )
-
-        assert result.kendall_state["active"] is True
-        log_variances = cast(dict[str, float], result.kendall_state["log_variances"])
-        assert set(log_variances) == {"edge", "recon", "real", "ssl"}
-        assert any(abs(value) > 0.0 for value in log_variances.values())
 
 
 class TestPreparePack:

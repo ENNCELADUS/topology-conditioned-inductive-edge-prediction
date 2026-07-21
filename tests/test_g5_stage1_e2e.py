@@ -273,7 +273,7 @@ def _five_arm_inputs(tmp_path: Path) -> dict[str, Any]:
     arm_config_paths = {
         "full": config_root / "egostitch_e2e_breadth_first.yaml",
         "b0_e2e_f_only": config_root / "egostitch_e2e_f_only_breadth_first.yaml",
-        "pair_topology": config_root / "egostitch_e2e_pair_topology_breadth_first.yaml",
+        "pair_topology": (config_root / "egostitch_e2e_pair_topology_breadth_first.yaml"),
         "p0": config_root / "egostitch_e2e_p0_breadth_first.yaml",
     }
     preregistration = json.loads(preregistration_path.read_text())
@@ -373,7 +373,7 @@ def _five_arm_inputs(tmp_path: Path) -> dict[str, Any]:
 
 
 class TestBuildE2EArmSummary:
-    def test_all_five_arms_reported(self, tmp_path: Path) -> None:
+    def test_all_five_arms_reported_and_rerun_is_deterministic(self, tmp_path: Path) -> None:
         inputs = _five_arm_inputs(tmp_path)
         payload = g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
@@ -404,12 +404,8 @@ class TestBuildE2EArmSummary:
             "topology_delta_full_minus_pair_content",
             "content_delta_full_minus_pair_topology",
         }
-
-    def test_byte_identical_reruns(self, tmp_path: Path) -> None:
-        inputs = _five_arm_inputs(tmp_path)
-        first = g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-        second = g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-        assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
+        rerun = g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+        assert json.dumps(payload, sort_keys=True) == json.dumps(rerun, sort_keys=True)
 
     def test_rejects_unknown_arm(self, tmp_path: Path) -> None:
         inputs = _five_arm_inputs(tmp_path)

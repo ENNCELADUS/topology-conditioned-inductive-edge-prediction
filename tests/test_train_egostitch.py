@@ -217,15 +217,15 @@ class TestLoadConfig:
         cfg = te.load_config(path)
         assert cfg.data.pack_dir == tmp_path / "token_pack"
 
-    def test_accepts_egostitch_e2e_family(self, tmp_path: Path) -> None:
+    def test_rejects_legacy_egostitch_e2e_without_v2_contract(self, tmp_path: Path) -> None:
         mapping = _config_mapping(tmp_path)
         mapping["model"] = {"family": "egostitch_e2e", "config": dict(_E2E_TINY_MODEL)}
         mapping["data"]["pack_dir"] = str(tmp_path / "token_pack")
+        del mapping["optim"]["warmstart_fraction"]
         path = tmp_path / "config.yaml"
         path.write_text(yaml.safe_dump(mapping))
-        cfg = te.load_config(path)
-        assert cfg.model.family == "egostitch_e2e"
-        assert cfg.model.config == _E2E_TINY_MODEL
+        with pytest.raises(ValueError, match="legacy egostitch_e2e v1 execution"):
+            te.load_config(path)
 
     def test_egostitch_e2e_family_rejects_stage1_only_keys(self, tmp_path: Path) -> None:
         mapping = _config_mapping(tmp_path)
@@ -407,16 +407,11 @@ class TestRegistrationRunMode:
         assert prepared == e2e_cfg
         assert is_debug is False
 
-    def test_tracked_binding_registration_is_formal_worker_accepted(self) -> None:
+    def test_active_e2e_config_uses_current_training_contract(self) -> None:
         root = Path(__file__).resolve().parents[1]
         cfg = te.load_config(root / "configs/egostitch_e2e_breadth_first.yaml")
-        cfg = replace(cfg, preregistration=root / cfg.preregistration)
-
-        prepared, is_debug, snapshot = te.prepare_ddp_run_config(cfg, max_steps=None)
-
-        assert prepared == cfg
-        assert is_debug is False
-        assert snapshot.payload["status"] == "BINDING"
+        assert cfg.model.family == "egostitch_e2e"
+        assert cfg.training == te.EgoStitchTrainingConfig()
 
     def test_debug_worker_redirects_and_marks_nonformal(self, tmp_path: Path) -> None:
         cfg = _toy_cfg(tmp_path)

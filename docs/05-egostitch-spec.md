@@ -512,6 +512,22 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-21: after disclosed DRAFT rehearsal attempt 003 exhausted its remaining
+  `1,823.6` s epoch-probe allowance on two H20s without completing an epoch or
+  producing an eligible checkpoint/scientific result, amended the still-DRAFT v2
+  qualification infrastructure before binding. The full-arm rehearsal changes from a fixed two-H20
+  launch to all visible auto-detected H20s, matching the formal launcher shape on the
+  current four-H20 host. Retained v1 artifacts attributed about 573 s per epoch to
+  training plus unmeasured Python batch construction and 145 s to validation on two
+  H20s; the old timer began after batch construction, so it cannot distinguish those
+  costs. The v2 runtime pins the fastest measured two-H20 candidate, the H20-safe
+  per-rank batch 128, removes redundant larger-batch probes, and records batch
+  construction in timing telemetry; semantically equivalent reuse is protected by
+  exact regression tests. Attempt 003 remains counted, the total budget and all
+  scientific choices remain frozen, and the corrected four-H20 profile remains
+  required. The registration discloses this post-attempt failure-recovery amendment;
+  it does not relabel attempt 003 as prospectively corrected.
+
 - 2026-07-19: clarified the prospective v2 internal topology selector as single-graph
   raw clustering `MMD^2` with pinned histogram/kernel hashes, not the external
   multi-reference normalized MMD ratio. This resolves an implementation ambiguity
@@ -1294,8 +1310,10 @@ following without candidate/test scoring:
 2. **Single-arm stability rehearsal:** the exact full-arm config completes the full
    schedule using only the stability/qualification pair and topology manifests,
    selects an eligible post-ramp checkpoint, triggers no §13.19.2 guard, and records
-   finite norms/clip coefficients on both H20 ranks. The checkpoint-selection
-   manifests remain unread until the first formal bound run.
+   finite norms/clip coefficients on every rank. The launcher auto-detects and uses all
+   visible H20s, matching the formal launch style (four H20s on the current target
+   host), and records the detected world size. The checkpoint-selection manifests
+   remain unread until the first formal bound run.
 3. **Precision differential:** at the end-ramp and selected checkpoints, the same
    fixed replay batch is evaluated in eval mode with identical hard masks under
    BF16+fp32-islands and pure fp32. Full and `f_logit` meet the registered elementwise
@@ -1319,7 +1337,8 @@ following without candidate/test scoring:
    requires v3.
 
 These qualification artifacts may tune no held-out/test quantity. Qualification may
-use at most three disclosed full-arm rehearsal attempts; a fourth attempt or any
+use at most three disclosed full-arm rehearsal attempts; a fourth full-arm rehearsal
+attempt or any
 change after the first pass requires v3. Any change to optimizer/schedule/precision,
 candidate grid, success inequalities, or frozen inputs after binding requires a new
 registration version.

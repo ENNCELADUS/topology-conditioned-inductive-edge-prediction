@@ -1,4 +1,4 @@
-"""V2 fail-closed scoring provenance and four-array publication tests."""
+"""E2E fail-closed scoring provenance and four-array publication tests."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _write_v2_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
+def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     config = tmp_path / "full.yaml"
     config.write_text("model:\n  family: egostitch_e2e\n", encoding="utf-8")
     checkpoint = tmp_path / "best.pt"
@@ -69,8 +69,8 @@ def _write_v2_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     return registration_path, metadata_path, checkpoint, checkpoint_id
 
 
-def test_v2_formal_scoring_provenance_accepts_exact_binding(tmp_path: Path) -> None:
-    registration, metadata, checkpoint, checkpoint_id = _write_v2_provenance(tmp_path)
+def test_e2e_formal_scoring_provenance_accepts_exact_binding(tmp_path: Path) -> None:
+    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
 
     provenance = score_universe._validate_e2e_scoring_provenance(
         registration_path=registration,
@@ -96,7 +96,7 @@ def test_v2_formal_scoring_provenance_accepts_exact_binding(tmp_path: Path) -> N
         ("metadata", "checkpoint_sha256", "b" * 64, "checkpoint_sha256"),
     ],
 )
-def test_v2_provenance_rejects_invalid_run_before_output(
+def test_e2e_provenance_rejects_invalid_run_before_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     target: str,
@@ -104,7 +104,7 @@ def test_v2_provenance_rejects_invalid_run_before_output(
     value: object,
     match: str,
 ) -> None:
-    registration, metadata, checkpoint, checkpoint_id = _write_v2_provenance(tmp_path)
+    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
     path = registration if target == "registration" else metadata
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload[field] = value
@@ -139,8 +139,8 @@ def test_v2_provenance_rejects_invalid_run_before_output(
     assert not output.exists()
 
 
-def test_v2_rejects_required_marker_and_bad_config_digest(tmp_path: Path) -> None:
-    registration, metadata, checkpoint, checkpoint_id = _write_v2_provenance(tmp_path)
+def test_e2e_rejects_required_marker_and_bad_config_digest(tmp_path: Path) -> None:
+    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
     payload = json.loads(registration.read_text(encoding="utf-8"))
     payload["required_before_binding"] = ["REQUIRED-BEFORE-BINDING: rehearsal"]
     registration.write_text(json.dumps(payload), encoding="utf-8")
@@ -153,7 +153,7 @@ def test_v2_rejects_required_marker_and_bad_config_digest(tmp_path: Path) -> Non
             checkpoint_id=checkpoint_id,
         )
 
-    registration, metadata, checkpoint, checkpoint_id = _write_v2_provenance(tmp_path)
+    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
     payload = json.loads(registration.read_text(encoding="utf-8"))
     payload["binding_evidence"]["configs"]["full"]["sha256"] = "f" * 64
     registration.write_text(json.dumps(payload), encoding="utf-8")
@@ -173,13 +173,9 @@ def test_v2_rejects_required_marker_and_bad_config_digest(tmp_path: Path) -> Non
 def test_file_alias_of_candidate_manifest_still_requires_provenance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _registration, _metadata, checkpoint, checkpoint_id = _write_v2_provenance(tmp_path)
+    _registration, _metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
     candidate = (
-        tmp_path
-        / "data"
-        / "benchmark_2025_neurips"
-        / "breadth_first"
-        / "candidate_test_edges.txt"
+        tmp_path / "data" / "benchmark_2025_neurips" / "breadth_first" / "candidate_test_edges.txt"
     )
     candidate.parent.mkdir(parents=True)
     candidate.write_text("a\tb\n", encoding="utf-8")
@@ -212,7 +208,7 @@ def test_file_alias_of_candidate_manifest_still_requires_provenance(
 def test_candidate_scoring_requires_all_four_arm_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    registration, metadata, checkpoint, checkpoint_id = _write_v2_provenance(tmp_path)
+    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
     monkeypatch.setattr(
         score_universe,
         "_load_checkpoint",
@@ -321,7 +317,7 @@ def test_loader_accepts_v1_e2e_artifact_without_explicit_full_array(tmp_path: Pa
 
 
 def test_formal_v2_loader_rejects_missing_or_contradictory_full_array(tmp_path: Path) -> None:
-    output = tmp_path / "malformed-v2.npz"
+    output = tmp_path / "malformed-e2e.npz"
     values = np.array([0.1], dtype=np.float32)
     resolution = score_universe.score_resolution_diagnostics(values)
     meta = {

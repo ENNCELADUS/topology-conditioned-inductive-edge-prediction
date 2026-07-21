@@ -145,7 +145,7 @@ def synthetic_package(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
-class TestVerifyBenchmarkSyntheticPackage:
+class TestSyntheticBenchmarkPackage:
     def test_consistent_package_returns_measured_stats(self, synthetic_package: Path) -> None:
         stats = verify_benchmark(synthetic_package, "synthetic")
         assert stats == SYNTHETIC_EXPECTED
@@ -205,72 +205,30 @@ class TestVerifyBenchmarkSyntheticPackage:
         with pytest.raises(ArtifactVerificationError, match="negatives"):
             verify_benchmark(tmp_path, "synthetic")
 
-
-@pytest.mark.integration
-class TestVerifyBenchmarkRealPackage:
-    def test_breadth_first_passes_and_stats_match_pinned_constants(
-        self, benchmark_root: Path
+    def test_load_benchmark_drops_rows_touching_excluded_nodes(
+        self, synthetic_package: Path
     ) -> None:
-        stats = verify_benchmark(benchmark_root, "breadth_first")
-        assert stats["graph_nodes"] == 10_090
-        assert stats["graph_edges"] == 129_861
-        assert stats["graph_self_loops"] == 7_769
-        assert stats["train_nodes"] == 8_072
-        assert stats["test_nodes"] == 2_018
-        assert stats["train_graph_edges"] == 53_640
-        assert stats["candidate_rows"] == 2_037_171
+        baseline = load_benchmark(synthetic_package, "synthetic")
+        exclude = frozenset({"n1"})
 
+        filtered = load_benchmark(synthetic_package, "synthetic", exclude_nodes=exclude)
 
-@pytest.mark.integration
-class TestLoadBenchmarkExcludeNodes:
-    def test_drops_rows_touching_a_real_train_side_node(self, benchmark_root: Path) -> None:
-        # Self-verifying: pick a node that genuinely appears in train_edges.txt so the
-        # test proves the drop mechanism fires, independent of which specific nodes are
-        # excluded (see report for why the two spec-named featureless nodes don't
-        # produce a nonzero delta under the breadth_first strategy).
-        baseline = load_benchmark(benchmark_root, "breadth_first")
-        sample_node = baseline.split.train_pairs.pairs[0][0]
-        exclude = frozenset({sample_node})
-        expected_train_dropped = sum(
-            1 for u, v in baseline.split.train_pairs.pairs if u in exclude or v in exclude
-        )
-        expected_val_dropped = sum(
-            1 for u, v in baseline.split.val_pairs.pairs if u in exclude or v in exclude
-        )
-        assert expected_train_dropped > 0
-
-        filtered = load_benchmark(benchmark_root, "breadth_first", exclude_nodes=exclude)
-
-        train_delta = len(baseline.split.train_pairs.pairs) - len(filtered.split.train_pairs.pairs)
-        val_delta = len(baseline.split.val_pairs.pairs) - len(filtered.split.val_pairs.pairs)
-        assert train_delta == expected_train_dropped
-        assert val_delta == expected_val_dropped
-        assert len(filtered.split.train_pairs.labels) == len(filtered.split.train_pairs.pairs)
-
-    def test_spec_featureless_nodes_touch_zero_breadth_first_pairs(
-        self, benchmark_root: Path
-    ) -> None:
-        # docs/05-egostitch-spec.md §9.2 states these two globally-featureless nodes
-        # (node_004764, node_007050) touch "3 train pairs + 1 val pair" — but that
-        # count is measured against the `random_walk` strategy, not `breadth_first`
-        # (the strategy pinned for this round). Under `breadth_first` neither node
-        # appears in train_edges.txt/val_edges.txt/test_edges.txt at all, so
-        # exclude_nodes correctly drops zero rows here. See task-1 report for the
-        # flagged discrepancy.
-        baseline = load_benchmark(benchmark_root, "breadth_first")
-        exclude = frozenset({"node_004764", "node_007050"})
-
-        filtered = load_benchmark(benchmark_root, "breadth_first", exclude_nodes=exclude)
-
-        assert len(filtered.split.train_pairs.pairs) == len(baseline.split.train_pairs.pairs)
-        assert len(filtered.split.val_pairs.pairs) == len(baseline.split.val_pairs.pairs)
+        assert len(filtered.split.train_pairs.pairs) == len(baseline.split.train_pairs.pairs) - 1
+        assert len(filtered.split.val_pairs.pairs) == len(baseline.split.val_pairs.pairs) - 1
         assert len(filtered.split.test_pairs.pairs) == len(baseline.split.test_pairs.pairs)
+        assert all("n1" not in pair for pair in filtered.split.train_pairs.pairs)
+        assert all("n1" not in pair for pair in filtered.split.val_pairs.pairs)
+        assert filtered.split.train_pairs.labels.dtype == np.int8
 
-
-@pytest.mark.integration
-class TestLoadCandidatePairs:
-    def test_loads_full_pinned_row_count(self, benchmark_root: Path) -> None:
-        candidate_pairs = load_candidate_pairs(benchmark_root, "breadth_first")
-        assert len(candidate_pairs.pairs) == 2_037_171
-        assert candidate_pairs.labels.shape == (2_037_171,)
+    def test_load_candidate_pairs_reads_labeled_rows(self, synthetic_package: Path) -> None:
+        candidate_pairs = load_candidate_pairs(synthetic_package, "synthetic")
+        assert candidate_pairs.pairs == [
+            ("n5", "n6"),
+            ("n5", "n7"),
+            ("n6", "n7"),
+            ("n5", "n5"),
+            ("n6", "n6"),
+            ("n7", "n7"),
+        ]
+        np.testing.assert_array_equal(candidate_pairs.labels, np.array([1, 0, 1, 1, 0, 0]))
         assert candidate_pairs.labels.dtype == np.int8

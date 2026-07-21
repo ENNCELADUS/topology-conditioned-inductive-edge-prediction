@@ -1,4 +1,4 @@
-"""Prospective-v2 internal topology holdouts (spec §§9.3 and 13.19).
+"""Current E2E internal topology holdouts (spec §§9.3 and 13.19).
 
 The holdouts are derived solely from the seeded message graph.  This module also
 materializes the complete, non-self pair/label universes used by qualification
@@ -52,7 +52,7 @@ class QuarantineCounts:
 
 @dataclass(frozen=True)
 class OverlapProof:
-    """Explicit overlap counts required by the v2 pre-binding audit."""
+    """Explicit overlap counts required by the pre-binding audit."""
 
     node: dict[str, int]
     label_edge: dict[str, int]
@@ -157,9 +157,7 @@ def derive_internal_holdout(
     e_msg_fit = frozenset((u, v) for u, v in message if u in v_fit and v in v_fit)
     e_sup_fit = frozenset((u, v) for u, v in supervision if u in v_fit and v in v_fit)
     e_msg_qual = frozenset((u, v) for u, v in message if u in v_qual and v in v_qual)
-    e_msg_select = frozenset(
-        (u, v) for u, v in message if u in v_select and v in v_select
-    )
+    e_msg_select = frozenset((u, v) for u, v in message if u in v_select and v in v_select)
 
     partitions = {"fit": v_fit, "qual": v_qual, "select": v_select}
     quarantine = QuarantineCounts(

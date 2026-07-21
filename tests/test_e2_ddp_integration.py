@@ -11,6 +11,11 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+pytestmark = pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="CPU DDP contracts run through hpc/run.sh check on Linux",
+)
+
 
 def _low_thread_env() -> dict[str, str]:
     """Prevent two CPU ranks from each creating a full BLAS/OpenMP thread pool."""
@@ -48,6 +53,7 @@ def test_two_rank_cpu_plan_has_exact_global_coverage(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
     assert result.returncode == 0, result.stderr
     rows = []
@@ -174,6 +180,7 @@ def test_two_rank_cpu_egostitch_loop_emits_valid_profile_and_artifacts(tmp_path:
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
     assert result.returncode == 0, result.stderr
     summary = json.loads((tmp_path / "smoke_ok.json").read_text())

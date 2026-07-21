@@ -54,6 +54,9 @@ cd /2023533015/topology-conditioned-inductive-edge-prediction
 hpc/run.sh check
 ```
 
+The check runs the lightweight suite plus the three CPU DDP smoke contracts on Linux;
+the four-H20 cold-run acceptance test remains an explicit opt-in.
+
 Train both frozen baselines. `B0` runs through the auto-sized H20 E2 production pipeline;
 `B0-alt` is outside this optimization and is trained directly, without the runner's
 `train` branch. The shipped configs pin BF16 and the repository-local data root:

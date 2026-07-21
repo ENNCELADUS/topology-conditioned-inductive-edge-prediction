@@ -284,16 +284,16 @@ def test_pipeline_forwards_debug_max_steps_to_worker(tmp_path: Path) -> None:
     assert command[command.index("--max-steps") + 1] == "5"
 
 
-def test_pipeline_forwards_v2_run_kind_to_worker(tmp_path: Path) -> None:
+def test_pipeline_forwards_run_kind_to_worker(tmp_path: Path) -> None:
     args = parse_pipeline_args(
         [
             "--config",
             str(tmp_path / "cfg.yaml"),
-            "--v2-run-kind",
+            "--run-kind",
             "rehearsal",
         ]
     )
-    assert args.v2_run_kind == "rehearsal"
+    assert args.run_kind == "rehearsal"
 
     command = build_accelerate_command(
         accelerate_bin=tmp_path / "accelerate",
@@ -305,10 +305,10 @@ def test_pipeline_forwards_v2_run_kind_to_worker(tmp_path: Path) -> None:
         profile_output=tmp_path / "profile.json",
         world_size=2,
         worker_module="src.train_egostitch",
-        v2_run_kind=args.v2_run_kind,
+        run_kind=args.run_kind,
     )
 
-    assert command[command.index("--v2-run-kind") + 1] == "rehearsal"
+    assert command[command.index("--run-kind") + 1] == "rehearsal"
 
 
 def test_build_accelerate_command_worker_module(tmp_path: Path) -> None:

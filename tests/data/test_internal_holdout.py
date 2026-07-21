@@ -1,4 +1,4 @@
-"""Tests for the prospective-v2 internal topology holdout."""
+"""Tests for the current internal topology holdout."""
 
 from __future__ import annotations
 

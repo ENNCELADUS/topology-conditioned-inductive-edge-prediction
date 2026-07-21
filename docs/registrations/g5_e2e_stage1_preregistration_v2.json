@@ -26,7 +26,7 @@
   },
   "arms": {
     "full": {
-      "training": "configs/egostitch_e2e_stability_v2_breadth_first.yaml",
+      "training": "configs/egostitch_e2e_breadth_first.yaml",
       "scored_array": "logit",
       "artifact_arrays": ["full", "f_logit", "pair_content", "pair_topology"],
       "scoring_provenance": {
@@ -36,7 +36,7 @@
       }
     },
     "b0_e2e_f_only": {
-      "training": "configs/egostitch_e2e_stability_v2_f_only_breadth_first.yaml",
+      "training": "configs/egostitch_e2e_f_only_breadth_first.yaml",
       "scored_array": "logit",
       "artifact_arrays": ["full", "f_logit", "pair_content", "pair_topology"],
       "scoring_provenance": {
@@ -46,7 +46,7 @@
       }
     },
     "pair_topology": {
-      "training": "configs/egostitch_e2e_stability_v2_pair_topology_breadth_first.yaml",
+      "training": "configs/egostitch_e2e_pair_topology_breadth_first.yaml",
       "scored_array": "logit",
       "artifact_arrays": ["full", "f_logit", "pair_content", "pair_topology"],
       "scoring_provenance": {
@@ -69,7 +69,7 @@
       }
     },
     "p0": {
-      "training": "configs/egostitch_e2e_stability_v2_p0_breadth_first.yaml",
+      "training": "configs/egostitch_e2e_p0_breadth_first.yaml",
       "scored_array": "logit",
       "artifact_arrays": ["full", "f_logit", "pair_content", "pair_topology"],
       "training_overrides": {"p_topo": 0.0, "p_cont": 0.0},
@@ -184,8 +184,21 @@
         "all stability guards pass"
       ]
     },
-    "full_arm_rehearsal": "exact 30-epoch full-arm config on 2 x H20 using only qualification pair/topology manifests; eligible post-ramp checkpoint required; checkpoint-selection manifests remain unread; no stability guard may fire",
-    "attempt_policy": "at most three disclosed full-arm rehearsal attempts; first pass freezes implementation/config; fourth attempt or any later scientific/optimization change requires v3",
+    "full_arm_rehearsal": "exact 30-epoch full-arm config using every auto-detected visible H20, four on the current target host and matching the formal launch style, using only qualification pair/topology manifests; detected world size recorded; eligible post-ramp checkpoint required; checkpoint-selection manifests remain unread; no stability guard may fire",
+    "attempt_policy": "at most three disclosed full-arm rehearsal attempts; qualification attempt 003 is the first full-arm rehearsal attempt and remains counted; except for the explicitly disclosed 2026-07-21 failure-recovery amendment, the first full-arm rehearsal pass freezes implementation/config; a fourth full-arm rehearsal attempt or any change outside that amendment requires v3",
+    "infrastructure_amendment_20260721": {
+      "status": "post-attempt DRAFT amendment before binding; not retroactive preregistration",
+      "trigger": "attempt 003 used 2 x H20; token-budget probes 128/256/512 measured approximately 80.46/75.81/70.44 pairs/s; the epoch probe was watchdog-terminated with 1823.6 seconds remaining before completing an epoch; no eligible checkpoint or scientific result was produced",
+      "permitted_changes": [
+        "auto-detect and use every visible H20 for the full-arm rehearsal",
+        "rebalance the unchanged total runtime budget",
+        "remove slower token-budget candidates while retaining measured candidate 128",
+        "correct batch-construction timing",
+        "semantically equivalent in-memory reuse changes locked by exact regression tests"
+      ],
+      "unchanged": "model, loss, optimizer, schedule, precision, data roles, sampler, guards, checkpoint eligibility and selection, gates, and verdict rules",
+      "next_version_trigger": "any change outside the permitted list, a fourth full-arm rehearsal attempt, or any post-binding change"
+    },
     "precision_test": "end-ramp and selected checkpoints, eval mode, same replay identities and hard masks; BF16+fp32 islands versus pure fp32 at registered elementwise and residual-vector tolerances",
     "boundary_audit": "qualification data root omits candidate/test manifests and test_graph.pkl; grounding universes are separately hashed as train=V_fit, rehearsal=V_qual, formal internal selection=V_select, external=test side; access log proves training endpoints subset V_fit, no V_qual/V_select/V_test feature row is read by a training step, G_fit digest equals loop-stripped E_msg[V_fit], heldout E_msg[V_qual]/E_msg[V_select] and E_sup/validation positives never enter topology-training targets, and no candidate/test score or assembly; global-positive rejection may use validation-positive membership only to prevent false negatives and is identical across arms",
     "required_binding_evidence": [
@@ -285,16 +298,16 @@
     "producer": "python -m src.experiments.probes produce-e2e",
     "source_arm": "full",
     "source_binding": "arms.full.training with permanent_null=none and p_topo=p_cont=0.15; p0 is rejected",
-    "expected_path": "outputs/egostitch_e2e_stage1_v2/full/probes/e2e_probe_v1.npz",
+    "expected_path": "outputs/egostitch_e2e_stage1/full/probes/e2e_probe_v1.npz",
     "node_selection": "all operative train nodes, sorted id order",
     "pair_selection": "4096 non-self E_msg pairs with smallest sha256(canonical_pair), or all if fewer",
     "targets": ["degree", "ego_density", "clustering", "ego_density_degree_partialled", "clustering_degree_partialled", "pi_shared_neighbor_consistency"],
     "verdict_effect": "none (required output evidence, nonbinding)"
   },
   "cost_report": {
-    "requirement": "measured 2 x H20 v2 profile: step wall, peak memory, exact 30-epoch full-arm runtime, per-arm projection, and five-pass candidate scoring estimate",
+    "requirement": "measured auto-detected visible-H20 v2 profile: detected world size, step wall, peak memory, exact 30-epoch full-arm runtime, per-arm projection, and five-pass candidate scoring estimate",
     "predecessor_observation": {"scope": "v1 planning context only; not v2 qualification", "full_arm_train_pipeline_seconds": 23234.77, "v1_debug_peak_memory_gib_max": 65.26557922363281},
-    "v2_measured": "REQUIRED-BEFORE-BINDING: structured paths, SHA-256 values, hardware, runtime, peak memory, and budget margins"
+    "measured_profile": "REQUIRED-BEFORE-BINDING: structured paths, SHA-256 values, hardware, runtime, peak memory, and budget margins"
   },
   "verdict_rule": "pass iff every training arm is valid, full passes all primary criteria and both guards, liveness passes, G_full>0, attribution share passes, and structure control passes; training invalid precedes scientific verdict, otherwise failures are multi-label cut reasons",
   "failure_reading": {
@@ -330,7 +343,7 @@
     "REQUIRED-BEFORE-BINDING: enforce the DRAFT/debug candidate/test scoring prohibition and validate structured binding_evidence before DDP",
     "REQUIRED-BEFORE-BINDING: create the four v2 config files and pin their SHA-256 values",
     "REQUIRED-BEFORE-BINDING: create and hash disjoint validation and train-side topology-selection manifests",
-    "REQUIRED-BEFORE-BINDING: complete the deterministic overfit test and 2 x H20 full-arm train/validation rehearsal in a no-test-mounted data root",
+    "REQUIRED-BEFORE-BINDING: complete the deterministic overfit test and auto-detected all-visible-H20 full-arm train/validation rehearsal in a no-test-mounted data root",
     "REQUIRED-BEFORE-BINDING: record implementation commit, parameter groups, packs, validation manifests, every qualification attempt, access audit, artifact digests, measured runtime, and peak memory",
     "REQUIRED-BEFORE-BINDING: independent review confirms JSON/prose parity and no v1 artifact is relabeled as v2 evidence"
   ],

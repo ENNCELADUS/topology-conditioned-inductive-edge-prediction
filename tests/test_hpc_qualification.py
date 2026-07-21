@@ -1,4 +1,4 @@
-"""Contracts for the fail-closed EgoStitch v2 launch surface."""
+"""Contracts for the fail-closed EgoStitch qualification surface."""
 
 import shutil
 import stat
@@ -9,13 +9,13 @@ import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-RUNNER = REPO_ROOT / "hpc" / "v2_qualification.sh"
+RUNNER = REPO_ROOT / "hpc" / "qualification.sh"
 CONFIG_DIR = REPO_ROOT / "configs"
 CONFIGS = {
-    "full": CONFIG_DIR / "egostitch_e2e_stability_v2_breadth_first.yaml",
-    "f_only": CONFIG_DIR / "egostitch_e2e_stability_v2_f_only_breadth_first.yaml",
-    "pair_topology": CONFIG_DIR / "egostitch_e2e_stability_v2_pair_topology_breadth_first.yaml",
-    "p0": CONFIG_DIR / "egostitch_e2e_stability_v2_p0_breadth_first.yaml",
+    "full": CONFIG_DIR / "egostitch_e2e_breadth_first.yaml",
+    "f_only": CONFIG_DIR / "egostitch_e2e_f_only_breadth_first.yaml",
+    "pair_topology": CONFIG_DIR / "egostitch_e2e_pair_topology_breadth_first.yaml",
+    "p0": CONFIG_DIR / "egostitch_e2e_p0_breadth_first.yaml",
 }
 
 
@@ -33,7 +33,7 @@ def _load_config(path: Path) -> dict[str, object]:
     return payload
 
 
-def test_v2_configs_are_exact_registered_arms() -> None:
+def test_e2e_configs_are_exact_registered_arms() -> None:
     configs = {name: _load_config(path) for name, path in CONFIGS.items()}
     expected = {
         "full": ("none", 0.15, 0.15, "full"),
@@ -54,19 +54,19 @@ def test_v2_configs_are_exact_registered_arms() -> None:
         assert str(config["output_dir"]).endswith(f"/{output_leaf}")
 
 
-def test_v2_configs_pin_stability_contract_and_v2_registration() -> None:
+def test_e2e_configs_pin_training_contract_and_registration() -> None:
     common: dict[str, object] | None = None
     for path in CONFIGS.values():
         config = _load_config(path)
-        stability = config["stability_v2"]
-        assert isinstance(stability, dict)
-        assert stability["positive_weight"] == 5.0
-        assert stability["phase_a_fraction"] == 0.2
-        assert stability["phase_b_fraction"] == 0.1
-        assert stability["lr_peak"] == 1.0e-4
-        assert stability["min_lr"] == 1.0e-5
-        assert stability["warmup_steps"] == 500
-        assert stability["residual_ratio_min"] == 1.0e-3
+        training = config["training"]
+        assert isinstance(training, dict)
+        assert training["positive_weight"] == 5.0
+        assert training["phase_a_fraction"] == 0.2
+        assert training["phase_b_fraction"] == 0.1
+        assert training["lr_peak"] == 1.0e-4
+        assert training["min_lr"] == 1.0e-5
+        assert training["warmup_steps"] == 500
+        assert training["residual_ratio_min"] == 1.0e-3
         assert config["preregistration"] == (
             "docs/registrations/g5_e2e_stage1_preregistration_v2.json"
         )
@@ -77,13 +77,17 @@ def test_v2_configs_pin_stability_contract_and_v2_registration() -> None:
         runtime = config["runtime"]
         assert isinstance(runtime, dict)
         assert runtime["world_size"] == "auto"
+        assert runtime["token_budget_candidates"] == [128]
+        assert runtime["setup_probe_budget_seconds"] == 2100
+        assert runtime["train_eval_budget_seconds"] == 26400
+        assert runtime["total_budget_seconds"] == 30300
         if common is None:
-            common = stability
+            common = training
         else:
-            assert stability == common
+            assert training == common
 
 
-def test_v2_runner_is_executable_strict_bash(bash_exe: str) -> None:
+def test_e2e_runner_is_executable_strict_bash(bash_exe: str) -> None:
     text = RUNNER.read_text()
     assert text.splitlines()[0] == "#!/usr/bin/env bash"
     assert "set -euo pipefail" in text
@@ -97,7 +101,7 @@ def test_v2_runner_is_executable_strict_bash(bash_exe: str) -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_v2_runner_help_is_local_and_distinguishes_gpu_contexts(bash_exe: str) -> None:
+def test_e2e_runner_help_is_local_and_distinguishes_gpu_contexts(bash_exe: str) -> None:
     result = subprocess.run(
         [bash_exe, str(RUNNER), "--help"],
         capture_output=True,
@@ -105,12 +109,13 @@ def test_v2_runner_help_is_local_and_distinguishes_gpu_contexts(bash_exe: str) -
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert "exactly 2 visible NVIDIA H20s" in result.stdout
+    assert "registered 2,000-step overfit uses 2 H20s" in result.stdout
+    assert "rehearsal auto-detects and uses every visible H20" in result.stdout
     assert "exactly 4 visible NVIDIA H20s" in result.stdout
-    assert "sanity -> registered 2,000-step overfit -> full-arm rehearsal" in result.stdout
+    assert "sanity -> overfit -> rehearsal" in result.stdout
 
 
-def test_v2_runner_is_fail_closed_and_never_auto_binds() -> None:
+def test_e2e_runner_is_fail_closed_and_never_auto_binds() -> None:
     text = RUNNER.read_text()
     qualification = text[text.index("run_qualification()") : text.index("formal_config()")]
     assert qualification.index("stage 1/3: sanity") < qualification.index(
@@ -119,8 +124,11 @@ def test_v2_runner_is_fail_closed_and_never_auto_binds() -> None:
     assert qualification.index("stage 2/3: registered 2,000-step overfit") < (
         qualification.index("stage 3/3: exact full-arm rehearsal")
     )
-    assert "--v2-run-kind overfit" in qualification
-    assert "--v2-run-kind rehearsal" in qualification
+    assert "--run-kind overfit" in qualification
+    assert "--run-kind rehearsal" in qualification
+    assert qualification.index("select_all_visible_h20s") < qualification.index(
+        "--run-kind rehearsal"
+    )
     assert "--max-steps" not in qualification
     assert "candidate_test_edges.txt" in text
     assert "test_edges.txt" in text
@@ -129,17 +137,16 @@ def test_v2_runner_is_fail_closed_and_never_auto_binds() -> None:
     assert "registration_sha256" in text
     assert "registration remains DRAFT" in text
     assert "sed -i" not in text
-    assert "status\": \"BINDING" not in text
+    assert 'status": "BINDING' not in text
 
 
 def test_formal_path_requires_binding_no_markers_and_four_gpus() -> None:
     text = RUNNER.read_text()
     formal = text[text.index("run_formal()") :]
-    assert (
-        'assert_gpu_selection "${FORMAL_GPU_COUNT}" "${FORMAL_GPU_IDS}"' in formal
-    )
+    assert "select_all_visible_h20s" in formal
+    assert '"${DETECTED_GPU_COUNT}" -eq "${FORMAL_GPU_COUNT}"' in formal
     assert "assert_formal_registration" in formal
     assert "assert_full_preflight" in formal
     assert 'if [[ "${arm}" != "full" ]]' in formal
-    assert "--v2-run-kind formal" in formal
+    assert "--run-kind formal" in formal
     assert "REQUIRED-BEFORE-BINDING" in text

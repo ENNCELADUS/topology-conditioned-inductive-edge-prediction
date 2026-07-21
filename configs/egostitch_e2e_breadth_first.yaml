@@ -1,7 +1,8 @@
-# EgoStitch E2E Stage-1 formal training config (spec docs/05-egostitch-spec.md
-# §5/§13 as rewritten 2026-07-17, defaults §13.18).
-#   hpc/run.sh train configs/egostitch_e2e_breadth_first.yaml \
-#       --worker-module src.train_egostitch
+# EgoStitch E2E stability-screen full arm (spec §13.19).
+# The pre-binding rehearsal auto-detects and uses every visible H20, matching the
+# formal launch style. After the registration is BINDING, formal training still
+# requires the registered four-H20 shape; world_size remains auto so Accelerate
+# matches the devices selected by the launcher.
 
 model:
   family: egostitch_e2e
@@ -17,57 +18,78 @@ model:
 data:
   root: data
   strategy: breadth_first
-  train_positives: e_sup            # pinned (spec §9.3)
-  negative_ratio: 5                 # pinned (spec §10.2)
+  train_positives: e_sup
+  negative_ratio: 5
   partition_seed: 0
-  msg_fraction: 0.8                 # pinned (spec §9.3)
-  node_batch: 256                   # B_n default (spec §10.1)
-  edge_batch: 128                   # packed-token E2E B_e (measured H20-safe; spec §10.1)
+  msg_fraction: 0.8
+  node_batch: 256
+  edge_batch: 128
   f0_cache: outputs/feature_packs/egostitch_f0/f0_matrix.pt
   grounding_cache: outputs/feature_packs/egostitch_f0/grounding.npz
-  pack_dir: outputs/feature_packs/egostitch_e2e_tokens   # raw-token pack (spec §13.18 family; no s0 cache — §13.10 retired)
+  pack_dir: outputs/feature_packs/egostitch_e2e_tokens
   expected_missing_features:
     - node_004764
     - node_007050
 
 optim:
-  lr: 3.0e-4
+  lr: 1.0e-4
   weight_decay: 0.01
   epochs: 30
-  warmup_steps: 200
+  warmup_steps: 500
   grad_clip: 1.0
-  warmstart_fraction: 0.2           # L_recon-only phase (spec §13.8)
+
+training:
+  positive_weight: 5.0
+  phase_a_fraction: 0.2
+  phase_b_fraction: 0.1
+  lr_peak: 1.0e-4
+  min_lr: 1.0e-5
+  warmup_steps: 500
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  clip_norm: 1.0
+  clip_immediate_abort: 1.0e-3
+  clip_persistent_threshold: 0.1
+  clip_persistent_steps: 10
+  family_ratio_abort: 50.0
+  family_ratio_probes: 4
+  collapse_fraction: 0.25
+  collapse_floor: 1.0e-4
+  collapse_validations: 2
+  selection_auprc_tolerance: 0.02
+  selection_mmd_tolerance: 1.0e-6
+  residual_ratio_min: 1.0e-3
 
 diagnostics:
-  gradient_probe_interval: 50       # fixed probe batch, weighted family norms
-  gradient_imbalance_ratio: 10.0    # registered Kendall trigger
-  gradient_imbalance_steps: 1000    # persistence before activation
-  probe_s1_abs_mean_max: 1000.0     # fail fast on kernel-scale recurrence
-  selection_auprc_tolerance: 1.0e-4 # tie-break: larger std(full-f_logit)/std(f_logit), spec §13.8
-  topk_fraction: 0.01               # fixed validation ranking-mobility slice
+  gradient_probe_interval: 50
+  gradient_imbalance_ratio: 50.0
+  gradient_imbalance_steps: 200
+  probe_s1_abs_mean_max: 1000.0
+  selection_auprc_tolerance: 0.02
+  topk_fraction: 0.01
 
 eval:
-  patience: 10                      # VAL-CRITERION bookkeeping (spec §8)
+  patience: 10
   eval_every: 1
 
 seed: 0
 output_dir: outputs/egostitch_e2e_stage1/full
 mixed_precision: "bf16"
-preregistration: docs/registrations/g5_e2e_stage1_preregistration.json
+preregistration: docs/registrations/g5_e2e_stage1_preregistration_v2.json
 
 runtime:
-  world_size: auto                    # all visible NVIDIA H20s
+  world_size: auto
   pack_dir: outputs/feature_packs/egostitch_f0
   pack_workers: 8
-  loader_workers_per_rank: 0        # batches are built in-process
+  loader_workers_per_rank: 0
   prefetch_factor: 2
-  token_budget_candidates: [128, 256, 512]   # B_n candidates for this family
+  token_budget_candidates: [128]
   max_pairs_per_rank: 1048576
   memory_limit_gib: 85.0
-  total_budget_seconds: 30300       # measured H20 profile budget: 27000 train/eval + 3300 other stages
+  total_budget_seconds: 30300
   pack_budget_seconds: 1200
-  setup_probe_budget_seconds: 1500
-  train_eval_budget_seconds: 27000
+  setup_probe_budget_seconds: 2100
+  train_eval_budget_seconds: 26400
   artifact_budget_seconds: 120
   reserve_seconds: 480
   probe_warmup_steps: 5

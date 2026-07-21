@@ -1,4 +1,4 @@
-"""Unit contract for the prospective EgoStitch §13.19 v2 trainer."""
+"""Unit contract for the EgoStitch §13.19 training protocol."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from src.model.egostitch.e2e_model import EgoStitchE2E
 pytestmark = pytest.mark.unit
 
 
-def _v2_config(tmp_path: Path) -> Path:
+def _training_config(tmp_path: Path) -> Path:
     preregistration = tmp_path / "prereg.json"
     preregistration.write_text(json.dumps({"status": "DRAFT"}), encoding="utf-8")
     mapping = {
@@ -39,7 +39,6 @@ def _v2_config(tmp_path: Path) -> Path:
             "epochs": 30,
             "warmup_steps": 500,
             "grad_clip": 1.0,
-            "warmstart_fraction": 0.2,
         },
         "diagnostics": {
             "gradient_probe_interval": 50,
@@ -54,31 +53,31 @@ def _v2_config(tmp_path: Path) -> Path:
         "output_dir": str(tmp_path / "out"),
         "mixed_precision": "bf16",
         "preregistration": str(preregistration),
-        "stability_v2": {},
+        "training": {},
     }
-    path = tmp_path / "v2.yaml"
+    path = tmp_path / "training.yaml"
     path.write_text(yaml.safe_dump(mapping), encoding="utf-8")
     return path
 
 
-def test_v2_config_schema_is_strict_and_preserves_run_kind(tmp_path: Path) -> None:
-    cfg = te.load_config(_v2_config(tmp_path))
-    assert cfg.stability_v2 == te.EgoStitchV2Config()
+def test_e2e_config_schema_is_strict_and_preserves_run_kind(tmp_path: Path) -> None:
+    cfg = te.load_config(_training_config(tmp_path))
+    assert cfg.training == te.EgoStitchTrainingConfig()
 
-    raw = yaml.safe_load(_v2_config(tmp_path).read_text(encoding="utf-8"))
-    raw["stability_v2"]["positive_weight"] = 4.0
+    raw = yaml.safe_load(_training_config(tmp_path).read_text(encoding="utf-8"))
+    raw["training"]["positive_weight"] = 4.0
     bad = tmp_path / "bad.yaml"
     bad.write_text(yaml.safe_dump(raw), encoding="utf-8")
     with pytest.raises(ValueError, match="exactly match"):
         te.load_config(bad)
 
 
-def test_v2_run_kinds_fail_closed(tmp_path: Path) -> None:
-    loaded = te.load_config(_v2_config(tmp_path))
+def test_run_kinds_fail_closed(tmp_path: Path) -> None:
+    loaded = te.load_config(_training_config(tmp_path))
     overfit = te.apply_overrides(
         loaded,
         te.EgoCliArgs(
-            config=tmp_path / "v2.yaml", seed=None, output_dir=None, v2_run_kind="overfit"
+            config=tmp_path / "training.yaml", seed=None, output_dir=None, run_kind="overfit"
         ),
     )
     with pytest.raises(RuntimeError, match="fixed 510-row"):
@@ -87,7 +86,7 @@ def test_v2_run_kinds_fail_closed(tmp_path: Path) -> None:
     rehearsal = te.apply_overrides(
         loaded,
         te.EgoCliArgs(
-            config=tmp_path / "v2.yaml", seed=None, output_dir=None, v2_run_kind="rehearsal"
+            config=tmp_path / "training.yaml", seed=None, output_dir=None, run_kind="rehearsal"
         ),
     )
     with pytest.raises(ValueError, match="complete schedule"):
@@ -98,20 +97,20 @@ def test_v2_run_kinds_fail_closed(tmp_path: Path) -> None:
         te.prepare_ddp_run_config(formal, max_steps=None)
 
 
-def test_v2_three_phase_boundaries_and_first_eligibility() -> None:
-    assert te.v2_phase_boundaries(2000) == (400, 600)
-    assert te.v2_phase_state(399, 2000) == te.V2PhaseState("A", 0.0, True, 0.0)
-    assert te.v2_phase_state(400, 2000).alpha == pytest.approx(1 / 200)
-    assert te.v2_phase_state(599, 2000) == te.V2PhaseState("B", 1.0, False, 1.0)
-    assert te.v2_phase_state(600, 2000) == te.V2PhaseState("C", 1.0, False, 1.0)
-    assert te.v2_first_eligible_epoch(3000, 100) == 10
+def test_e2e_three_phase_boundaries_and_first_eligibility() -> None:
+    assert te.e2e_phase_boundaries(2000) == (400, 600)
+    assert te.e2e_phase_state(399, 2000) == te.E2EPhaseState("A", 0.0, True, 0.0)
+    assert te.e2e_phase_state(400, 2000).alpha == pytest.approx(1 / 200)
+    assert te.e2e_phase_state(599, 2000) == te.E2EPhaseState("B", 1.0, False, 1.0)
+    assert te.e2e_phase_state(600, 2000) == te.E2EPhaseState("C", 1.0, False, 1.0)
+    assert te.e2e_first_eligible_epoch(3000, 100) == 10
 
 
-def test_v2_weighted_bce_matches_one_and_two_rank_gradients_with_padding() -> None:
+def test_e2e_weighted_bce_matches_one_and_two_rank_gradients_with_padding() -> None:
     labels = torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
     logits = torch.linspace(-0.3, 0.3, len(labels), requires_grad=True)
     mask = torch.ones_like(labels)
-    full_loss = te.v2_weighted_bce_with_logits(logits, labels, mask)
+    full_loss = te.e2e_weighted_bce_with_logits(logits, labels, mask)
     (full_grad,) = torch.autograd.grad(full_loss, logits)
 
     global_denominator = torch.tensor(15.0)
@@ -122,7 +121,7 @@ def test_v2_weighted_bce_matches_one_and_two_rank_gradients_with_padding() -> No
     ):
         rank_logits = logits.detach()[indices].clone().requires_grad_()
         rank_labels = labels[indices]
-        rank_loss = te.v2_weighted_bce_with_logits(
+        rank_loss = te.e2e_weighted_bce_with_logits(
             rank_logits,
             rank_labels,
             torch.tensor(rank_mask),
@@ -139,7 +138,7 @@ def test_v2_weighted_bce_matches_one_and_two_rank_gradients_with_padding() -> No
     torch.testing.assert_close(reconstructed, full_grad)
 
     zero_logits = torch.zeros(6, requires_grad=True)
-    balanced = te.v2_weighted_bce_with_logits(
+    balanced = te.e2e_weighted_bce_with_logits(
         zero_logits, torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]), torch.ones(6)
     )
     (zero_grad,) = torch.autograd.grad(balanced, zero_logits)
@@ -147,7 +146,7 @@ def test_v2_weighted_bce_matches_one_and_two_rank_gradients_with_padding() -> No
 
     features = torch.linspace(-1.0, 1.0, len(labels))
     full_weight = torch.tensor(0.2, requires_grad=True)
-    full_parameter_loss = te.v2_weighted_bce_with_logits(full_weight * features, labels, mask)
+    full_parameter_loss = te.e2e_weighted_bce_with_logits(full_weight * features, labels, mask)
     (full_parameter_grad,) = torch.autograd.grad(full_parameter_loss, full_weight)
     rank_parameter_grads = []
     for indices, rank_mask in (
@@ -155,7 +154,7 @@ def test_v2_weighted_bce_matches_one_and_two_rank_gradients_with_padding() -> No
         ([1, 3, 5, 5], [1.0, 1.0, 1.0, 0.0]),
     ):
         rank_weight = full_weight.detach().clone().requires_grad_()
-        rank_loss = te.v2_weighted_bce_with_logits(
+        rank_loss = te.e2e_weighted_bce_with_logits(
             rank_weight * features[indices],
             labels[indices],
             torch.tensor(rank_mask),
@@ -166,7 +165,7 @@ def test_v2_weighted_bce_matches_one_and_two_rank_gradients_with_padding() -> No
     torch.testing.assert_close(torch.stack(rank_parameter_grads).mean(), full_parameter_grad)
 
 
-def test_v2_parameter_groups_are_disjoint_exhaustive_and_exclude_kendall() -> None:
+def test_e2e_parameter_groups_are_disjoint_exhaustive_and_exclude_kendall() -> None:
     model = EgoStitchE2E(
         E2EConfig(
             d_model=16,
@@ -179,8 +178,7 @@ def test_v2_parameter_groups_are_disjoint_exhaustive_and_exclude_kendall() -> No
             xattn_heads=2,
         )
     )
-    composite = te._CompositeStep(model, world_size=1)
-    manifest = te.build_v2_parameter_groups(model, composite)
+    manifest = te.build_e2e_parameter_groups(model)
     ids = [id(parameter) for group in manifest.groups.values() for parameter in group]
     assert len(ids) == len(set(ids)) == len(te._e2e_trainable_parameters(model))
     assert set(manifest.groups) == {
@@ -188,16 +186,15 @@ def test_v2_parameter_groups_are_disjoint_exhaustive_and_exclude_kendall() -> No
         "generator",
         "topology_content_conditioning",
     }
-    assert all(not parameter.requires_grad for parameter in composite.kendall_log_vars.values())
     assert all(len(digest) == 64 for digest in manifest.sha256.values())
 
 
-def test_v2_per_group_gradient_guards_clip_and_fail_closed() -> None:
+def test_e2e_per_group_gradient_guards_clip_and_fail_closed() -> None:
     first = torch.nn.Parameter(torch.tensor([3.0]))
     second = torch.nn.Parameter(torch.tensor([4.0]))
     first.grad = torch.tensor([3.0])
     second.grad = torch.tensor([4.0])
-    records = te.v2_check_and_clip_gradients({"active": (first, second)}, {"active"})
+    records = te.e2e_check_and_clip_gradients({"active": (first, second)}, {"active"})
     assert records["active"].norm == pytest.approx(5.0)
     assert records["active"].clip_coefficient == pytest.approx(0.2)
     assert torch.linalg.vector_norm(torch.stack([first.grad[0], second.grad[0]])) == pytest.approx(
@@ -206,21 +203,21 @@ def test_v2_per_group_gradient_guards_clip_and_fail_closed() -> None:
 
     first.grad = torch.tensor([float("nan")])
     with pytest.raises(RuntimeError, match="non-finite gradient"):
-        te.v2_check_and_clip_gradients({"active": (first,)}, {"active"})
+        te.e2e_check_and_clip_gradients({"active": (first,)}, {"active"})
 
-    guard = te.V2ClipGuard(persistent_steps=2)
-    clipped = te.V2GradientGroupRecord(True, 20.0, 0.05, 0)
+    guard = te.E2EClipGuard(persistent_steps=2)
+    clipped = te.E2EGradientGroupRecord(True, 20.0, 0.05, 0)
     guard.update({"active": clipped})
     with pytest.raises(RuntimeError, match="persistent clipping"):
         guard.update({"active": clipped})
 
-    te.v2_assert_replicated_squared_norms({"active": torch.tensor([4.0, 4.0])})
+    te.e2e_assert_replicated_squared_norms({"active": torch.tensor([4.0, 4.0])})
     with pytest.raises(RuntimeError, match="differ across ranks"):
-        te.v2_assert_replicated_squared_norms({"active": torch.tensor([4.0, 5.0])})
+        te.e2e_assert_replicated_squared_norms({"active": torch.tensor([4.0, 5.0])})
 
 
-def _record(epoch: int, *, mmd: float, brier: float, auprc: float = 0.6) -> te.V2CheckpointRecord:
-    return te.V2CheckpointRecord(
+def _record(epoch: int, *, mmd: float, brier: float, auprc: float = 0.6) -> te.E2ECheckpointRecord:
+    return te.E2ECheckpointRecord(
         epoch=epoch,
         phase="C",
         full_joint_epochs_completed=epoch,
@@ -236,12 +233,12 @@ def _record(epoch: int, *, mmd: float, brier: float, auprc: float = 0.6) -> te.V
     )
 
 
-def test_v2_eligibility_and_topology_aware_selection_are_fail_closed() -> None:
-    warm = te.V2CheckpointRecord(**{**_record(1, mmd=0.1, brier=0.1).__dict__, "phase": "A"})
-    assert not te.v2_checkpoint_eligible(warm, "full")
-    assert te.select_v2_checkpoint([warm], "full") is None
+def test_e2e_eligibility_and_topology_aware_selection_are_fail_closed() -> None:
+    warm = te.E2ECheckpointRecord(**{**_record(1, mmd=0.1, brier=0.1).__dict__, "phase": "A"})
+    assert not te.e2e_checkpoint_eligible(warm, "full")
+    assert te.select_e2e_checkpoint([warm], "full") is None
 
-    selected = te.select_v2_checkpoint(
+    selected = te.select_e2e_checkpoint(
         [
             _record(2, mmd=0.4, brier=0.1, auprc=0.62),
             _record(3, mmd=0.2, brier=0.3, auprc=0.60),

@@ -149,6 +149,7 @@ case "${COMMAND}" in
     "${PYTHON_BIN}" -c \
       'from pathlib import Path; from src.data.features import FeatureStore; shape = tuple(FeatureStore(Path("data/features/frozen_node_features_1024")).load_tokens("node_000001").shape); print(f"feature_shape={shape}"); assert shape == (123, 1536)'
     "${PYTHON_BIN}" -m pytest -q -m "not integration"
+    "${PYTHON_BIN}" -m pytest -q tests/test_e2_ddp_integration.py -m "integration and not slow"
     ;;
   train)
     [[ $# -ge 1 ]] || fail "train requires a config path"
