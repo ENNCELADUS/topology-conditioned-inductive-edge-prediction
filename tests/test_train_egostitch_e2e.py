@@ -298,6 +298,27 @@ class TestE2ECompositeStep:
             return table
 
         monkeypatch.setattr(PackedFeatureTable, "from_pack", classmethod(_float_cpu_pack))
+        guard_persistence: list[bool] = []
+        original_guard_update = te.E2EClipGuard.update
+
+        def _count_guard_calls(
+            guard: te.E2EClipGuard,
+            records: dict[str, te.E2EGradientGroupRecord],
+            *,
+            step: int | None = None,
+            phase: te.E2EPhaseName | None = None,
+            enforce_persistent: bool = True,
+        ) -> None:
+            guard_persistence.append(enforce_persistent)
+            original_guard_update(
+                guard,
+                records,
+                step=step,
+                phase=phase,
+                enforce_persistent=enforce_persistent,
+            )
+
+        monkeypatch.setattr(te.E2EClipGuard, "update", _count_guard_calls)
         accelerator = Accelerator(cpu=True)
 
         result = te._train_e2e_stability_loop(
@@ -344,6 +365,7 @@ class TestE2ECompositeStep:
         assert result.runtime_profile["validation_coverage_exact"] is True
         assert result.runtime_profile["training_coverage_exact"] is True
         assert result.best_epoch == e2e_cfg.optim.epochs
+        assert guard_persistence == [False] * len(optimizer_steps)
 
     def test_permanent_null_matches_eval_bypass(self, tmp_path: Path) -> None:
         """The training mask is exactly the corresponding hard eval bypass."""

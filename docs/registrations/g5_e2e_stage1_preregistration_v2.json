@@ -195,9 +195,12 @@
         "rebalance the unchanged total runtime budget",
         "remove slower token-budget candidates while retaining measured candidate 128",
         "correct batch-construction timing",
-        "semantically equivalent in-memory reuse changes locked by exact regression tests"
+        "semantically equivalent in-memory reuse changes locked by exact regression tests",
+        "restore the registered world-size-invariant overfit trajectory after consolidation drift: select each canonical global 128-row window before rank sharding and key reconstruction targets to fixed overfit epoch 0 plus global step and rank",
+        "keep timing-only epoch probes subject to finite, zero-gradient, clipping, post-step-state, and immediate catastrophic-clipping checks while reserving the ten-step persistence abort for the real registered execution",
+        "add failure-only gradient telemetry for exact step, phase, norm, coefficient, streak, and recent records without changing thresholds or optimizer behavior"
       ],
-      "unchanged": "model, loss, optimizer, schedule, precision, data roles, sampler, guards, checkpoint eligibility and selection, gates, and verdict rules",
+      "unchanged": "model, loss, optimizer, production phase schedule, precision, data roles, sampler, production guard thresholds and enforcement, checkpoint eligibility and selection, gates, and verdict rules",
       "next_version_trigger": "any change outside the permitted list, a fourth full-arm rehearsal attempt, or any post-binding change"
     },
     "precision_test": "end-ramp and selected checkpoints, eval mode, same replay identities and hard masks; BF16+fp32 islands versus pure fp32 at registered elementwise and residual-vector tolerances",
@@ -332,6 +335,7 @@
   },
   "binding_acceptance_tests": [
     "phase boundaries, complete coverage, world-size invariance, and first-eligible timing",
+    "four-rank overfit canonical-global-row reconstruction, padded-mask weighting, fixed target RNG, and production-guard enforcement",
     "1-GPU/2-GPU weighted-BCE gradient equivalence including tail batch",
     "parameter-group disjointness/exhaustiveness and frozen Kendall scalars",
     "synchronous abort and no success artifacts for injected finite/clip/collapse failures",

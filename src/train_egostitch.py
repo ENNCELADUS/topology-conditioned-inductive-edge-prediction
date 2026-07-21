@@ -952,25 +952,55 @@ class E2EClipGuard:
     persistent_threshold: float = 0.1
     persistent_steps: int = 10
     streaks: dict[str, int] | None = None
+    recent: dict[str, list[dict[str, object]]] | None = None
 
-    def update(self, records: Mapping[str, E2EGradientGroupRecord]) -> None:
+    def update(
+        self,
+        records: Mapping[str, E2EGradientGroupRecord],
+        *,
+        step: int | None = None,
+        phase: E2EPhaseName | None = None,
+        enforce_persistent: bool = True,
+    ) -> None:
         """Advance one optimizer step and raise immediately on a violation."""
         if self.streaks is None:
             self.streaks = {}
+        if self.recent is None:
+            self.recent = {}
         for name, record in records.items():
             if not record.active:
                 self.streaks[name] = 0
+                self.recent[name] = []
                 continue
             coefficient = record.clip_coefficient
             if coefficient is None or not math.isfinite(coefficient):
                 raise RuntimeError(f"invalid clip coefficient for active E2E group {name!r}")
-            if coefficient < self.immediate_threshold:
-                raise RuntimeError(f"extreme clipping in active E2E group {name!r}")
+            trail = self.recent.setdefault(name, [])
+            trail.append(
+                {
+                    "step": step,
+                    "phase": phase,
+                    "norm": record.norm,
+                    "coefficient": coefficient,
+                    "nonfinite_elements": record.nonfinite_elements,
+                }
+            )
+            del trail[: -self.persistent_steps]
+            context = f"step={step} phase={phase} norm={record.norm} coefficient={coefficient}"
+            recent = json.dumps(trail, sort_keys=True)
             self.streaks[name] = (
                 self.streaks.get(name, 0) + 1 if coefficient < self.persistent_threshold else 0
             )
-            if self.streaks[name] >= self.persistent_steps:
-                raise RuntimeError(f"persistent clipping in active E2E group {name!r}")
+            if coefficient < self.immediate_threshold:
+                raise RuntimeError(
+                    f"extreme clipping in active E2E group {name!r}; "
+                    f"{context} streak={self.streaks[name]} recent={recent}"
+                )
+            if enforce_persistent and self.streaks[name] >= self.persistent_steps:
+                raise RuntimeError(
+                    f"persistent clipping in active E2E group {name!r}; "
+                    f"{context} streak={self.streaks[name]} recent={recent}"
+                )
 
 
 def e2e_assert_finite_optimizer_state(
@@ -1797,6 +1827,39 @@ class OverfitManifest:
     sha256: str
 
 
+def e2e_overfit_step_rows(
+    manifest: OverfitManifest, *, step: int, batch_size: int
+) -> tuple[tuple[str, str, int], ...]:
+    """Select one canonical global overfit row window before DDP sharding."""
+    if step < 0 or batch_size <= 0 or not manifest.rows:
+        raise ValueError("overfit step, batch size, and manifest must be valid")
+    start = step * batch_size
+    return tuple(manifest.rows[(start + index) % len(manifest.rows)] for index in range(batch_size))
+
+
+def e2e_overfit_rank_step_rows(
+    manifest: OverfitManifest,
+    *,
+    step: int,
+    global_batch_size: int,
+    rank: int,
+    world_size: int,
+) -> tuple[tuple[str, str, int], ...]:
+    """Rank-stride one canonical global overfit batch without changing its rows."""
+    if world_size <= 0 or not 0 <= rank < world_size:
+        raise ValueError("invalid rank/world_size")
+    return e2e_overfit_step_rows(manifest, step=step, batch_size=global_batch_size)[
+        rank::world_size
+    ]
+
+
+def e2e_overfit_target_seed(*, seed: int, step: int, rank: int) -> tuple[int, int, int, int, int]:
+    """Return the reporting-epoch-invariant reconstruction-target seed."""
+    if step < 0 or rank < 0:
+        raise ValueError("overfit step and rank must be non-negative")
+    return seed, 0, step, rank, 0x7A
+
+
 def build_overfit_manifest(cfg: EgoConfig, data: EgoStitchData) -> OverfitManifest:
     """Select 85 hash-smallest positives and 425 registered negatives once."""
     if cfg.training is None:
@@ -1817,15 +1880,6 @@ def build_overfit_manifest(cfg: EgoConfig, data: EgoStitchData) -> OverfitManife
         "".join(f"{u}\t{v}\t{label}\n" for u, v, label in rows).encode()
     ).hexdigest()
     return OverfitManifest(rows=rows, sha256=digest)
-
-
-def overfit_rank_rows(
-    manifest: OverfitManifest, *, rank: int, world_size: int
-) -> tuple[tuple[str, str, int], ...]:
-    """Shard a prebuilt overfit manifest without changing its identity."""
-    if world_size <= 0 or not 0 <= rank < world_size:
-        raise ValueError("invalid rank/world_size")
-    return manifest.rows[rank::world_size]
 
 
 def _assemble_e2e_data(
@@ -2438,27 +2492,32 @@ class _BatchFactory:
 
     def fixed_row_batches(
         self,
-        epoch: int,
         *,
-        rows: Sequence[tuple[str, str, int]],
+        manifest: OverfitManifest,
         steps: int,
         step_offset: int,
     ) -> Iterator[_CompositeBatch]:
-        """Cycle one prebuilt rank-local overfit shard for an exact step count."""
-        if not rows:
-            raise ValueError("fixed overfit rank shard must be non-empty")
+        """Cycle canonical global overfit rows, then shard each step by rank."""
         edge_batch = self._cfg.data.edge_batch
         for local_step in range(steps):
             global_step = step_offset + local_step
+            global_rows = e2e_overfit_step_rows(manifest, step=global_step, batch_size=edge_batch)
+            local_rows = e2e_overfit_rank_step_rows(
+                manifest,
+                step=global_step,
+                global_batch_size=edge_batch,
+                rank=self._rank,
+                world_size=self._world,
+            )
             nodes = self._next_nodes()
             targets = self._data.target_builder.build(
                 nodes,
-                np.random.default_rng((self._cfg.seed, epoch, global_step, self._rank, 0x7A)),
+                np.random.default_rng(
+                    e2e_overfit_target_seed(seed=self._cfg.seed, step=global_step, rank=self._rank)
+                ),
             )
-            node = self._node_tensors(nodes, targets, epoch=epoch, step=global_step)
-            start = global_step * edge_batch
-            chunk = [rows[(start + index) % len(rows)] for index in range(edge_batch)]
-            edge, true_rows = self._edge_tensors(chunk, pad_to=edge_batch)
+            node = self._node_tensors(nodes, targets, epoch=0, step=global_step)
+            edge, true_rows = self._edge_tensors(local_rows, pad_to=edge_batch)
             f0_rows = (
                 node["x"].shape[0]
                 + node["ground_x"].shape[0] * node["ground_x"].shape[1]
@@ -2469,7 +2528,7 @@ class _BatchFactory:
                 node=node,
                 edge=edge,
                 edge_rows_true=true_rows,
-                edge_rows_global=edge_batch * self._world,
+                edge_rows_global=len(global_rows),
                 f0_rows_gathered=f0_rows,
             )
 
@@ -3553,7 +3612,7 @@ def _train_e2e_stability_loop(
         manifest = data.overfit_manifest
         if manifest is None:
             raise RuntimeError("overfit execution is missing the registered 510-row manifest")
-        local_fixed_rows = overfit_rank_rows(manifest, rank=rank, world_size=world)
+        overfit_manifest: OverfitManifest | None = manifest
         # The orchestrator's epoch probe measures one representative reporting
         # epoch and projects all 30. The real overfit run still executes the
         # complete registered 2,000-step schedule below.
@@ -3564,7 +3623,7 @@ def _train_e2e_stability_loop(
         steps_per_epoch = 0
         total_steps = sum(epoch_step_counts)
     else:
-        local_fixed_rows = ()
+        overfit_manifest = None
         rows_per_rank, steps_per_epoch = _epoch_step_plan(
             len(data.e_sup_positives),
             negative_ratio=cfg.data.negative_ratio,
@@ -3627,10 +3686,10 @@ def _train_e2e_stability_loop(
         epoch_parts: dict[str, float] = {}
         epoch_probes: list[dict[str, object]] = []
         if run_kind == "overfit":
+            assert overfit_manifest is not None
             batches = iter(
                 factory.fixed_row_batches(
-                    epoch,
-                    rows=local_fixed_rows,
+                    manifest=overfit_manifest,
                     steps=epoch_steps,
                     step_offset=global_step,
                 )
@@ -3658,7 +3717,7 @@ def _train_e2e_stability_loop(
                 batch,
                 cfg,
                 phase,
-                epoch=epoch,
+                epoch=1 if run_kind == "overfit" else epoch,
                 step=global_step,
                 device=accelerator.device,
             )
@@ -3686,18 +3745,22 @@ def _train_e2e_stability_loop(
                     "topology_content_conditioning": training.clip_norm,
                 },
             )
-            clip_guard.update(gradient_records)
+            gradient_row: dict[str, object] = {
+                "step": global_step + 1,
+                "phase": phase.phase,
+                "alpha": phase.alpha,
+                "optimizer_group_gradients": {
+                    name: asdict(record) for name, record in gradient_records.items()
+                },
+            }
             if accelerator.is_main_process:
-                optimizer_step_gradients.append(
-                    {
-                        "step": global_step + 1,
-                        "phase": phase.phase,
-                        "alpha": phase.alpha,
-                        "optimizer_group_gradients": {
-                            name: asdict(record) for name, record in gradient_records.items()
-                        },
-                    }
-                )
+                optimizer_step_gradients.append(gradient_row)
+            clip_guard.update(
+                gradient_records,
+                step=global_step + 1,
+                phase=phase.phase,
+                enforce_persistent=not profile_only,
+            )
             optimizer.step()
             post_step_failure = 0
             try:

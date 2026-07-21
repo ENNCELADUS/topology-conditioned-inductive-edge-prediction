@@ -512,6 +512,17 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-21: restored the registered V2 overfit trajectory semantics lost in
+  consolidation: each optimizer step selects one canonical global 128-row window
+  before rank sharding, and reconstruction-target randomness is keyed to fixed
+  overfit epoch 0 plus the global optimizer step. The timing-only epoch probe still
+  performs finite checks, clipping, gradient recording, post-step checks, and the
+  immediate catastrophic-clipping abort, but the ten-step persistence abort is
+  enforced only by the real 2,000-step/30-epoch execution, as in the qualifying V2
+  implementation. Guard failures now retain the exact step,
+  phase, norm, coefficient, streak, and recent records. Model, loss, optimizer,
+  phase schedule, clip ceilings, and abort thresholds are unchanged.
+
 - 2026-07-21: corrected the consolidated one-epoch runtime probe to preserve the
   registered Phase A/B/C order in its compressed representative schedule. The
   prior `profile_only` path forced Phase C from random initialization and caused

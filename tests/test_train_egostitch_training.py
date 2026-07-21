@@ -6,7 +6,9 @@ import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
+import numpy as np
 import pytest
 import torch
 import yaml  # type: ignore[import-untyped]
@@ -238,6 +240,109 @@ def test_e2e_three_phase_boundaries_and_first_eligibility() -> None:
     assert te.e2e_first_eligible_epoch(3000, 100) == 10
 
 
+def test_overfit_rows_and_target_seed_are_world_size_invariant() -> None:
+    rows = tuple((f"n{i}", f"n{i + 1}", i % 2) for i in range(10))
+    manifest = te.OverfitManifest(rows=rows, sha256="a" * 64)
+    expected = te.e2e_overfit_step_rows(manifest, step=1, batch_size=6)
+    assert expected == rows[6:] + rows[:2]
+
+    for world_size in (1, 2, 4):
+        shards = [
+            te.e2e_overfit_rank_step_rows(
+                manifest,
+                step=1,
+                global_batch_size=6,
+                rank=rank,
+                world_size=world_size,
+            )
+            for rank in range(world_size)
+        ]
+        recovered = tuple(
+            shards[index % world_size][index // world_size] for index in range(len(expected))
+        )
+        assert recovered == expected
+
+    assert te.e2e_overfit_target_seed(seed=7, step=11, rank=3) == (7, 0, 11, 3, 0x7A)
+
+
+def test_fixed_overfit_batches_preserve_global_rows_and_four_rank_padding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = te.load_config(_training_config(tmp_path))
+    rows = tuple((f"n{i}", f"n{i + 1}", i % 2) for i in range(10))
+    manifest = te.OverfitManifest(rows=rows, sha256="a" * 64)
+    seen_rows: dict[int, tuple[tuple[str, str, int], ...]] = {}
+    seen_node_epochs: dict[int, int] = {}
+    seen_rng_draws: dict[int, int] = {}
+
+    class _TargetBuilder:
+        def __init__(self, rank: int) -> None:
+            self.rank = rank
+
+        def build(self, nodes: list[str], rng: np.random.Generator) -> None:
+            del nodes
+            seen_rng_draws[self.rank] = int(rng.integers(0, 2**31))
+
+    def _next_nodes(factory: te._BatchFactory) -> list[str]:
+        del factory
+        return ["n0"]
+
+    def _node_tensors(
+        factory: te._BatchFactory,
+        nodes: list[str],
+        targets: None,
+        *,
+        epoch: int,
+        step: int,
+    ) -> dict[str, torch.Tensor]:
+        del nodes, targets, step
+        seen_node_epochs[factory._rank] = epoch
+        return {
+            "x": torch.zeros(1, 1),
+            "ground_x": torch.zeros(1, 1, 1),
+            "target_features": torch.zeros(1, 1, 1),
+        }
+
+    def _edge_tensors(
+        factory: te._BatchFactory,
+        local_rows: tuple[tuple[str, str, int], ...],
+        *,
+        pad_to: int,
+    ) -> tuple[dict[str, torch.Tensor], int]:
+        seen_rows[factory._rank] = local_rows
+        labels = [label for _, _, label in local_rows]
+        return {
+            "x_i": torch.zeros(pad_to, 1),
+            "label": torch.tensor(labels + [0] * (pad_to - len(labels))),
+            "edge_mask": torch.tensor([1] * len(labels) + [0] * (pad_to - len(labels))),
+        }, len(local_rows)
+
+    monkeypatch.setattr(te._BatchFactory, "_next_nodes", _next_nodes)
+    monkeypatch.setattr(te._BatchFactory, "_node_tensors", _node_tensors)
+    monkeypatch.setattr(te._BatchFactory, "_edge_tensors", _edge_tensors)
+
+    batches: list[te._CompositeBatch] = []
+    for rank in range(4):
+        factory = object.__new__(te._BatchFactory)
+        factory._cfg = cfg
+        factory._rank = rank
+        factory._world = 4
+        factory._data = cast(te.EgoStitchData, SimpleNamespace(target_builder=_TargetBuilder(rank)))
+        batches.append(next(factory.fixed_row_batches(manifest=manifest, steps=1, step_offset=1)))
+
+    expected = te.e2e_overfit_step_rows(manifest, step=1, batch_size=cfg.data.edge_batch)
+    recovered = tuple(seen_rows[index % 4][index // 4] for index in range(cfg.data.edge_batch))
+    assert recovered == expected
+    assert all(batch.edge_rows_global == cfg.data.edge_batch for batch in batches)
+    assert [batch.edge_rows_true for batch in batches] == [2, 2, 1, 1]
+    assert [int(batch.edge["edge_mask"].sum()) for batch in batches] == [2, 2, 1, 1]
+    assert seen_node_epochs == dict.fromkeys(range(4), 0)
+    assert seen_rng_draws == {
+        rank: int(np.random.default_rng((cfg.seed, 0, 1, rank, 0x7A)).integers(0, 2**31))
+        for rank in range(4)
+    }
+
+
 def test_e2e_lr_and_active_groups_follow_registered_phase_contract() -> None:
     config = te.EgoStitchTrainingConfig()
     assert te._e2e_base_lr(0, 2000, config) == pytest.approx(2e-7)
@@ -417,9 +522,25 @@ def test_e2e_per_group_gradient_guards_clip_and_fail_closed() -> None:
 
     guard = te.E2EClipGuard(persistent_steps=2)
     clipped = te.E2EGradientGroupRecord(True, 20.0, 0.05, 0)
-    guard.update({"active": clipped})
+    guard.update({"active": clipped}, step=11, phase="A")
+    with pytest.raises(RuntimeError, match="persistent clipping") as error:
+        guard.update({"active": clipped}, step=12, phase="A")
+    message = str(error.value)
+    assert "step=12" in message
+    assert "phase=A" in message
+    assert "norm=20.0" in message
+    assert "coefficient=0.05" in message
+    assert '"step": 11' in message
+    assert '"step": 12' in message
+
+    probe_guard = te.E2EClipGuard(persistent_steps=2)
+    probe_guard.update({"active": clipped}, enforce_persistent=False)
+    probe_guard.update({"active": clipped}, enforce_persistent=False)
     with pytest.raises(RuntimeError, match="persistent clipping"):
-        guard.update({"active": clipped})
+        probe_guard.update({"active": clipped})
+    extreme = te.E2EGradientGroupRecord(True, 4000.0, 0.00075, 0)
+    with pytest.raises(RuntimeError, match="extreme clipping"):
+        te.E2EClipGuard().update({"active": extreme}, enforce_persistent=False)
 
     te.e2e_assert_replicated_squared_norms({"active": torch.tensor([4.0, 4.0])})
     with pytest.raises(RuntimeError, match="differ across ranks"):
