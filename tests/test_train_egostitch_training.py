@@ -395,6 +395,22 @@ def test_e2e_per_group_gradient_guards_clip_and_fail_closed() -> None:
         1.0
     )
 
+    generator = torch.nn.Parameter(torch.tensor([0.0]))
+    generator.grad = torch.tensor([1545.4539013796064])
+    calibrated = te.e2e_check_and_clip_gradients(
+        {"generator": (generator,)},
+        {"generator"},
+        max_norm={"generator": 3.0},
+    )
+    assert calibrated["generator"].clip_coefficient == pytest.approx(3.0 / 1545.4539013796064)
+    te.E2EClipGuard().update(calibrated)
+    with pytest.raises(ValueError, match="max_norm mapping"):
+        te.e2e_check_and_clip_gradients({"generator": (generator,)}, {"generator"}, max_norm={})
+    with pytest.raises(ValueError, match="max_norm mapping"):
+        te.e2e_check_and_clip_gradients(
+            {"generator": (generator,)}, {"generator"}, max_norm={"generator": 0.0}
+        )
+
     first.grad = torch.tensor([float("nan")])
     with pytest.raises(RuntimeError, match="non-finite gradient"):
         te.e2e_check_and_clip_gradients({"active": (first,)}, {"active"})

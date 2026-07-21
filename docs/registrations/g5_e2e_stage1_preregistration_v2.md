@@ -49,6 +49,11 @@ amendment, not a claim that attempt 003 was prospectively registered in its corr
 form. Any change outside this list, a fourth full-arm rehearsal attempt, or any post-binding change
 requires a new versioned registration.
 
+The consolidation port briefly omitted the already-calibrated V2 group-specific
+ceilings and therefore serialized `1.0/1.0/1.0`. This DRAFT correction restores the
+pair-encoder/generator/topology ceilings `3.0/3.0/1.0` actually executed by the
+successful attempt-003 overfit. The clip-coefficient abort thresholds remain unchanged.
+
 ## Arms and frozen evaluation contract
 
 The scientific comparison remains unchanged:
@@ -102,7 +107,8 @@ run metadata. Kendall scalars are frozen outside the optimizer. AdamW uses
 `betas=(0.9,0.999)`, `eps=1e-8`, and weight decay `0.01`. Neural groups use peak LR
 `1e-4`; pair/generator use a 500-step linear warm-up followed by cosine decay to
 `1e-5`, while conditioning multiplies that base schedule by Phase-B `alpha`. Each
-group is independently clipped to L2 norm `1.0` after BF16 unscale and DDP reduction.
+pair-encoder/head and generator groups are independently clipped to L2 norm `3.0`;
+topology/content conditioning is clipped to `1.0` after BF16 unscale and DDP reduction.
 
 For weighted BCE, each rank backpropagates
 `world_size × sum_local(m_i w_i BCE_i) / all_reduce_sum(sum_local m_i w_i)`, with

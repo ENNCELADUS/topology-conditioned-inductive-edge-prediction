@@ -90,8 +90,8 @@
       "normalization": "sum of effective per-row weights over the exact global DDP batch"
     },
     "optimizer_groups": {
-      "pair_encoder_head": {"peak_lr": 0.0001, "warmup_steps": 500, "schedule": "linear warmup then cosine to 1e-5 at T", "grad_clip_l2": 1.0},
-      "generator": {"peak_lr": 0.0001, "warmup_steps": 500, "schedule": "linear warmup then cosine to 1e-5 at T", "grad_clip_l2": 1.0},
+      "pair_encoder_head": {"peak_lr": 0.0001, "warmup_steps": 500, "schedule": "linear warmup then cosine to 1e-5 at T", "grad_clip_l2": 3.0},
+      "generator": {"peak_lr": 0.0001, "warmup_steps": 500, "schedule": "linear warmup then cosine to 1e-5 at T", "grad_clip_l2": 3.0},
       "topology_content_conditioning": {"peak_lr": 0.0001, "schedule": "base cosine schedule multiplied by alpha; zero in Phase A", "grad_clip_l2": 1.0},
       "membership": "disjoint and exhaustive sorted parameter-name manifests with SHA-256 in run metadata",
       "loss_balance_scalars": {"dynamic_kendall": false, "frozen": true, "in_optimizer": false}

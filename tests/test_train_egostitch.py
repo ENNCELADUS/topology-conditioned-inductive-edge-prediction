@@ -412,6 +412,14 @@ class TestRegistrationRunMode:
         cfg = te.load_config(root / "configs/egostitch_e2e_breadth_first.yaml")
         assert cfg.model.family == "egostitch_e2e"
         assert cfg.training == te.EgoStitchTrainingConfig()
+        assert cfg.training.pair_encoder_clip_norm == 3.0
+        assert cfg.training.generator_clip_norm == 3.0
+        assert cfg.training.clip_norm == 1.0
+        registration = json.loads(cfg.preregistration.read_text(encoding="utf-8"))
+        registered_groups = registration["training_contract"]["optimizer_groups"]
+        assert registered_groups["pair_encoder_head"]["grad_clip_l2"] == 3.0
+        assert registered_groups["generator"]["grad_clip_l2"] == 3.0
+        assert registered_groups["topology_content_conditioning"]["grad_clip_l2"] == 1.0
 
     def test_debug_worker_redirects_and_marks_nonformal(self, tmp_path: Path) -> None:
         cfg = _toy_cfg(tmp_path)

@@ -315,6 +315,17 @@ class TestE2ECompositeStep:
             len(result.runtime_profile["optimizer_step_gradients"])
             == result.runtime_profile["total_optimizer_steps"]
         )
+        first_step = result.runtime_profile["optimizer_step_gradients"][0]
+        gradients = first_step["optimizer_group_gradients"]
+        for group, ceiling in (
+            ("pair_encoder_head", 3.0),
+            ("generator", 3.0),
+            ("topology_content_conditioning", 1.0),
+        ):
+            record = gradients[group]
+            assert record["clip_coefficient"] == pytest.approx(
+                min(1.0, ceiling / (record["norm"] + 1e-12))
+            )
         assert (
             result.runtime_profile["observed_training_access"][0]["all_nodes_within_v_fit"] is True
         )

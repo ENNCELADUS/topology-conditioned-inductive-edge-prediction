@@ -219,6 +219,8 @@ class EgoStitchTrainingConfig:
     betas: tuple[float, float] = (0.9, 0.999)
     eps: float = 1e-8
     clip_norm: float = 1.0
+    pair_encoder_clip_norm: float = 3.0
+    generator_clip_norm: float = 3.0
     clip_immediate_abort: float = 1e-3
     clip_persistent_threshold: float = 0.1
     clip_persistent_steps: int = 10
@@ -601,6 +603,14 @@ def load_config(path: Path) -> EgoConfig:
             ),
             eps=_as_float(training_raw.get("eps", 1e-8), "training.eps"),
             clip_norm=_as_float(training_raw.get("clip_norm", 1.0), "training.clip_norm"),
+            pair_encoder_clip_norm=_as_float(
+                training_raw.get("pair_encoder_clip_norm", 3.0),
+                "training.pair_encoder_clip_norm",
+            ),
+            generator_clip_norm=_as_float(
+                training_raw.get("generator_clip_norm", 3.0),
+                "training.generator_clip_norm",
+            ),
             clip_immediate_abort=_as_float(
                 training_raw.get("clip_immediate_abort", 1e-3), "training.clip_immediate_abort"
             ),
@@ -878,11 +888,17 @@ def e2e_check_and_clip_gradients(
     groups: Mapping[str, Sequence[torch.nn.Parameter]],
     active_groups: set[str],
     *,
-    max_norm: float = 1.0,
+    max_norm: float | Mapping[str, float] = 1.0,
 ) -> dict[str, E2EGradientGroupRecord]:
     """Fail closed on group gradients and independently clip active groups."""
-    if max_norm <= 0:
-        raise ValueError("max_norm must be positive")
+    if isinstance(max_norm, Mapping):
+        if set(max_norm) != set(groups) or any(value <= 0 for value in max_norm.values()):
+            raise ValueError("max_norm mapping must cover every group with positive values")
+        max_norms = dict(max_norm)
+    else:
+        if max_norm <= 0:
+            raise ValueError("max_norm must be positive")
+        max_norms = dict.fromkeys(groups, max_norm)
     unknown = active_groups - set(groups)
     if unknown:
         raise ValueError(f"unknown active optimizer groups: {sorted(unknown)}")
@@ -908,7 +924,7 @@ def e2e_check_and_clip_gradients(
             raise RuntimeError(f"non-finite gradient in active E2E group {name!r}")
         if norm == 0.0:
             raise RuntimeError(f"zero gradient norm in active E2E group {name!r}")
-        coefficient = min(1.0, max_norm / (norm + 1e-12))
+        coefficient = min(1.0, max_norms[name] / (norm + 1e-12))
         for grad in grads:
             grad.mul_(coefficient)
         records[name] = E2EGradientGroupRecord(True, norm, coefficient, nonfinite)
@@ -1537,9 +1553,7 @@ def prepare_pack(
                     temp_prefix=temp_prefix or None,
                 )
             else:
-                raw_manifest = packed_features.validate_packed_manifest(
-                    raw_pack_dir, source_root
-                )
+                raw_manifest = packed_features.validate_packed_manifest(raw_pack_dir, source_root)
         raw_identity = packed_features.sha256_file(raw_pack_dir / "manifest.json")
         assert raw_manifest is not None
         packs["raw_tokens"] = {
@@ -3667,7 +3681,11 @@ def _train_e2e_stability_loop(
             gradient_records = e2e_check_and_clip_gradients(
                 parameter_groups.groups,
                 active_groups,
-                max_norm=training.clip_norm,
+                max_norm={
+                    "pair_encoder_head": training.pair_encoder_clip_norm,
+                    "generator": training.generator_clip_norm,
+                    "topology_content_conditioning": training.clip_norm,
+                },
             )
             clip_guard.update(gradient_records)
             if accelerator.is_main_process:

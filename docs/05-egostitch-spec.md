@@ -512,6 +512,13 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-21: corrected a consolidation-port omission that collapsed the
+  registered V2 per-group clip ceilings from `3.0/3.0/1.0` to `1.0/1.0/1.0`.
+  Restored `3.0` for pair-encoder/head and generator and retained `1.0` for
+  topology/content conditioning; the `<1e-3` immediate and `<0.1` persistent
+  abort thresholds are unchanged. This restores the settings executed by the
+  attempt-003 V2 overfit and its pre-bound healthy-margin calibration.
+
 - 2026-07-21: aligned the still-DRAFT v2 Stage-2 overfit launcher with Stage 3 and
   formal execution by auto-detecting and using every visible H20 (four on the current
   target host). The fixed manifest, 2,000 steps, phase schedule, objectives, and
@@ -1179,7 +1186,8 @@ variance scalars are frozen outside the optimizer. The v2 optimizer is AdamW wit
 `1e-4` for each neural group. Pair and generator groups use a 500-step linear warm-up
 from the first optimizer step, then cosine decay to `1e-5` at step `T`; conditioning
 uses `lr_conditioning(t) = lr_base(t) * alpha_t`, with `alpha=0` in Phase A and `1`
-in Phase C. Each group is clipped independently to global L2 norm `1.0` in the fixed order
+in Phase C. The pair-encoder/head and generator groups are clipped independently to
+global L2 norm `3.0`; topology/content conditioning is clipped to `1.0`, in the fixed order
 `scaled backward -> BF16 unscale -> DDP gradient reduction -> fp64 norm/finite check
 -> clip -> optimizer step -> parameter/optimizer-state finite check`. The scheduler
 is step-based and its phase boundaries are unaffected by world size.
@@ -1206,7 +1214,9 @@ non-finite element count. Standard replicated DDP is required. For group `G`, ea
 rank accumulates `S_G = sum_{p in G} sum(g_p^2)` in fp64 after DDP reduction,
 all-gathers `S_G` to assert cross-rank equality, and records
 `norm_G = sqrt(mean_ranks(S_G))`; summing identical replicated norms across ranks is
-forbidden. `clip_G = min(1, 1/(norm_G + 1e-12))`. A group that is
+forbidden. `clip_G = min(1, c_G/(norm_G + 1e-12))`, where `c_G=3` for the
+pair-encoder/head and generator groups and `c_G=1` for topology/content conditioning.
+A group that is
 inactive by the phase/arm contract is recorded as inactive and excluded from clip
 thresholds; an active group with zero norm is invalid. After the optimizer step, all
 parameters and optimizer-state tensors are checked.
