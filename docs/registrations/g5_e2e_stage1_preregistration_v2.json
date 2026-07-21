@@ -82,6 +82,8 @@
   },
   "training_contract": {
     "epochs": 30,
+    "generator_feature_standardization": "inside the active v2 E2E generator only, raw cached F0 is standardized per row immediately before every trainable generator path with LayerNorm(d, elementwise_affine=false, eps=1e-5); node, grounding, reconstruction-target, denoising-target, and shared-projection inputs use the same transform; raw-token pair encoding and cosine grounding-pool construction remain raw; historical frozen-s0 Stage-1 checkpoints retain raw-F0 behavior; no optimizer parameters are added",
+    "runtime_probe": "execute one reporting epoch as the exact prefix of the production 2,000-step or 30-epoch schedule, using the production T for phases and learning rates; do not compress Phase A/B/C into the sampled epoch; project each epoch as max(measured prefix wall time, measured prefix non-compute time plus full-joint compute time derived from the selected candidate probe throughput)",
     "mixed_precision": "bf16 with fp32 Sinkhorn, gated-residual accumulation, logits, BCE, and finite checks",
     "edge_sampler": {
       "positives": "e_sup",
@@ -197,10 +199,12 @@
         "correct batch-construction timing",
         "semantically equivalent in-memory reuse changes locked by exact regression tests",
         "restore the registered world-size-invariant overfit trajectory after consolidation drift: select each canonical global 128-row window before rank sharding and key reconstruction targets to fixed overfit epoch 0 plus global step and rank",
+        "restore inside the active v2 E2E generator only the stateless per-row F0 LayerNorm used by the prior V2 overfit before every trainable generator path; it has no affine parameters, leaves optimizer-group manifests unchanged, and does not alter historical frozen-s0 Stage-1 checkpoint semantics",
+        "make the one-epoch timing probe follow the exact prefix of the production phase/LR schedule using production T, rather than compressing A/B/C into the sampled epoch, while projecting later-phase cost from the selected candidate probe's full-joint throughput",
         "keep timing-only epoch probes subject to finite, zero-gradient, clipping, post-step-state, and immediate catastrophic-clipping checks while reserving the ten-step persistence abort for the real registered execution",
         "add failure-only gradient telemetry for exact step, phase, norm, coefficient, streak, and recent records without changing thresholds or optimizer behavior"
       ],
-      "unchanged": "model, loss, optimizer, production phase schedule, precision, data roles, sampler, production guard thresholds and enforcement, checkpoint eligibility and selection, gates, and verdict rules",
+      "unchanged": "topology-conditioned architecture, losses after the restored V2 generator standardization, optimizer, production phase schedule, precision, data roles, sampler, production guard thresholds and enforcement, checkpoint eligibility and selection, gates, and verdict rules",
       "next_version_trigger": "any change outside the permitted list, a fourth full-arm rehearsal attempt, or any post-binding change"
     },
     "precision_test": "end-ramp and selected checkpoints, eval mode, same replay identities and hard masks; BF16+fp32 islands versus pure fp32 at registered elementwise and residual-vector tolerances",

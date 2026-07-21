@@ -240,6 +240,16 @@ def test_e2e_three_phase_boundaries_and_first_eligibility() -> None:
     assert te.e2e_first_eligible_epoch(3000, 100) == 10
 
 
+def test_overfit_profile_is_the_first_production_epoch_not_a_compressed_schedule() -> None:
+    production = te.e2e_overfit_epoch_step_counts(30)
+    sampled = te.e2e_overfit_epoch_step_counts(30, profile_only=True)
+
+    assert sampled == production[:1]
+    assert all(
+        te.e2e_phase_state(step, sum(production)).phase == "A" for step in range(sum(sampled))
+    )
+
+
 def test_overfit_rows_and_target_seed_are_world_size_invariant() -> None:
     rows = tuple((f"n{i}", f"n{i + 1}", i % 2) for i in range(10))
     manifest = te.OverfitManifest(rows=rows, sha256="a" * 64)

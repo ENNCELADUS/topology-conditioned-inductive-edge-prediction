@@ -512,6 +512,20 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-21: corrected two additional consolidation trajectory regressions before
+  binding. A fresh four-H20 check and a two-H20 control both showed generator clipping
+  from the first Phase-A steps, ruling out world-size sharding; code/history comparison
+  isolated removal of the parameter-free per-row F0 standardization used by the prior
+  V2 overfit. Restored that exact stateless transform only inside the active V2 E2E
+  generator, without adding optimizer parameters or changing historical frozen-s0
+  checkpoint semantics. The one-epoch timing probe now evaluates the first epoch
+  under the production schedule's `T` and phase boundaries instead of compressing
+  A/B/C into the sampled epoch. Its runtime projection conservatively combines the
+  measured prefix overhead with the selected candidate probe's full-joint compute
+  throughput, and never projects below the measured prefix. The earlier same-date
+  compressed-probe change is superseded; production losses, optimizer,
+  2,000-step/30-epoch schedules, and guard thresholds remain unchanged.
+
 - 2026-07-21: restored the registered V2 overfit trajectory semantics lost in
   consolidation: each optimizer step selects one canonical global 128-row window
   before rank sharding, and reconstruction-target randomness is keyed to fixed
@@ -528,6 +542,8 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   prior `profile_only` path forced Phase C from random initialization and caused
   the attempt-005 Stage-2 epoch probe to trip the generator-gradient guard; the
   production 2,000-step/30-epoch schedules and guard thresholds are unchanged.
+  Superseded by the later 2026-07-21 production-prefix correction above after the
+  compressed transition itself was shown to distort the gradient trajectory.
 
 - 2026-07-21: corrected a consolidation-port omission that collapsed the
   registered V2 per-group clip ceilings from `3.0/3.0/1.0` to `1.0/1.0/1.0`.
@@ -1208,6 +1224,16 @@ global L2 norm `3.0`; topology/content conditioning is clipped to `1.0`, in the 
 `scaled backward -> BF16 unscale -> DDP gradient reduction -> fp64 norm/finite check
 -> clip -> optimizer step -> parameter/optimizer-state finite check`. The scheduler
 is step-based and its phase boundaries are unaffected by world size.
+
+The cached F0 matrix remains the raw fp32 mean pool defined in §9.2. Inside the active
+V2 E2E model only, immediately before every trainable generator path, each F0 row is
+standardized by a stateless
+`LayerNorm(d, elementwise_affine=False, eps=1e-5)`. The same transform is used for
+node features, grounding candidates, reconstruction targets, denoising targets, and
+the generator's shared `d -> d_p` projection; the raw-token pair encoder and cosine
+grounding-pool construction are unchanged. Historical frozen-s0 Stage-1 checkpoints
+retain their original raw-F0 behavior. Because the V2 transform has no parameters,
+the registered optimizer-group name manifests are unchanged.
 
 For a global DDP edge batch, let `m_i` be the real-row mask (zero on DDP padding),
 `w_i = 5 y_i + (1-y_i)`, and `D = all_reduce_sum(sum_local m_i w_i)`. Each rank

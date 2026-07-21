@@ -1632,7 +1632,7 @@ def _score_egostitch(
         ground_x = matrix[pool_rows[rows]].to(device)
         with torch.inference_mode(), _autocast_context(device, amp):
             enc: NodeEncoding = model.encode_nodes(x, ground_x)
-            proj = model.proj(x)
+            proj = model.project_features(x)
         h_cache.append(enc.slots.h.float())
         pi_cache.append(enc.slots.pi.float())
         mult_cache.append(enc.slots.mult.float())

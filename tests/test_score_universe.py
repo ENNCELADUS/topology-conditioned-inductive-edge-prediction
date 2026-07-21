@@ -794,6 +794,59 @@ def test_build_model_egostitch_round_trips() -> None:
     model = score_universe.build_model("egostitch", dict(_TINY_EGOSTITCH_CONFIG))
     assert isinstance(model, EgoStitchStage1)
     assert model.config.slots == 3
+    assert isinstance(model.feature_norm, nn.Identity)
+
+
+def test_legacy_egostitch_cached_scoring_matches_direct_forward(tmp_path: Path) -> None:
+    data_root, _, _, _ = _egostitch_setup(tmp_path)
+    store = FeatureStore(data_root / "features" / "frozen_node_features_1024")
+    model = score_universe.build_model("egostitch", dict(_TINY_EGOSTITCH_CONFIG))
+    model.eval()
+    pairs = list(_EGOSTITCH_PAIRS)
+    s0 = np.linspace(-1.0, 1.0, len(pairs), dtype=np.float32)
+    cached = score_universe._score_egostitch(
+        model,
+        pairs,
+        store,
+        device=torch.device("cpu"),
+        amp="off",
+        batch_pairs=3,
+        f0_cache=tmp_path / "legacy-f0.pt",
+        grounding_cache=tmp_path / "legacy-grounding.npz",
+        s0_logits=s0,
+    )
+
+    node_ids = sorted({node for pair in pairs for node in pair})
+    matrix, index = build_f0_matrix(store, node_ids, cache_path=None)
+    grounding = build_grounding_pool(
+        np.asarray(matrix.numpy(), dtype=np.float32),
+        node_ids,
+        n_ground=model.config.n_ground,
+        cache_path=None,
+    )
+    pool_rows = torch.tensor(
+        [[index[neighbor] for neighbor in grounding[node]] for node in node_ids],
+        dtype=torch.long,
+    )
+    direct: list[float] = []
+    with torch.inference_mode():
+        for row, (u, v) in enumerate(pairs):
+            u_row, v_row = index[u], index[v]
+            batch = {
+                "x_i": matrix[u_row].unsqueeze(0),
+                "ground_i": matrix[pool_rows[u_row]].unsqueeze(0),
+                "s0": torch.tensor([s0[row]]),
+            }
+            if u != v:
+                batch.update(
+                    {
+                        "x_j": matrix[v_row].unsqueeze(0),
+                        "ground_j": matrix[pool_rows[v_row]].unsqueeze(0),
+                    }
+                )
+            direct.append(float(model(batch)["logits"].item()))
+
+    np.testing.assert_allclose(cached, np.asarray(direct, dtype=np.float32), rtol=1e-5, atol=2e-6)
 
 
 def test_egostitch_cli_scores_end_to_end_with_self_pair(tmp_path: Path) -> None:

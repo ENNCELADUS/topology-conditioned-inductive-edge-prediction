@@ -86,7 +86,7 @@ def _encode_nodes(
         ground_x = matrix[grounding_rows[local]].to(device)
         with torch.inference_mode(), _autocast_context(device, amp):
             enc = model.encode_nodes(x, ground_x)
-            projected = model.proj(x)
+            projected = model.project_features(x)
         values = {
             "h": enc.slots.h,
             "pi": enc.slots.pi,
@@ -228,13 +228,11 @@ def _projection_variance(
     loaded, family, _ = _load_checkpoint(checkpoint)
     if family != "egostitch" or not isinstance(loaded, EgoStitchStage1):
         raise ValueError(f"{checkpoint} is not an EgoStitch checkpoint")
-    payload = cast(
-        dict[str, object], torch.load(checkpoint, map_location="cpu", weights_only=True)
-    )
+    payload = cast(dict[str, object], torch.load(checkpoint, map_location="cpu", weights_only=True))
     epoch = int(cast(int, payload["epoch"]))
     loaded.to(device)
     with torch.inference_mode():
-        projected = loaded.proj(matrix[rows].to(device)).float()
+        projected = loaded.project_features(matrix[rows].to(device)).float()
     return {
         "checkpoint": checkpoint.name,
         "epoch": epoch,

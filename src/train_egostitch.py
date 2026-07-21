@@ -3613,15 +3613,13 @@ def _train_e2e_stability_loop(
         if manifest is None:
             raise RuntimeError("overfit execution is missing the registered 510-row manifest")
         overfit_manifest: OverfitManifest | None = manifest
-        # The orchestrator's epoch probe measures one representative reporting
-        # epoch and projects all 30. The real overfit run still executes the
-        # complete registered 2,000-step schedule below.
-        epoch_step_counts = list(
-            e2e_overfit_epoch_step_counts(cfg.optim.epochs, profile_only=profile_only)
+        production_epoch_step_counts = list(e2e_overfit_epoch_step_counts(cfg.optim.epochs))
+        epoch_step_counts = (
+            production_epoch_step_counts[:1] if profile_only else production_epoch_step_counts
         )
         rows_per_rank: list[int] = []
         steps_per_epoch = 0
-        total_steps = sum(epoch_step_counts)
+        schedule_total_steps = sum(production_epoch_step_counts)
     else:
         overfit_manifest = None
         rows_per_rank, steps_per_epoch = _epoch_step_plan(
@@ -3630,12 +3628,16 @@ def _train_e2e_stability_loop(
             edge_batch=cfg.data.edge_batch,
             world_size=world,
         )
-        epoch_step_counts = [steps_per_epoch] * cfg.optim.epochs
-        total_steps = steps_per_epoch * cfg.optim.epochs
-    phase_a_end, phase_b_end = e2e_phase_boundaries(total_steps)
+        production_epoch_step_counts = [steps_per_epoch] * cfg.optim.epochs
+        epoch_step_counts = (
+            production_epoch_step_counts[:1] if profile_only else production_epoch_step_counts
+        )
+        schedule_total_steps = steps_per_epoch * cfg.optim.epochs
+    executed_steps = sum(epoch_step_counts)
+    phase_a_end, phase_b_end = e2e_phase_boundaries(schedule_total_steps)
     first_eligible_epoch = e2e_first_eligible_epoch(
-        total_steps,
-        steps_per_epoch if run_kind != "overfit" else max(epoch_step_counts),
+        schedule_total_steps,
+        steps_per_epoch if run_kind != "overfit" else max(production_epoch_step_counts),
     )
 
     if use_cuda:
@@ -3702,11 +3704,8 @@ def _train_e2e_stability_loop(
             fetch_started = time.monotonic()
             batch = next(batches)
             epoch_data_wait += time.monotonic() - fetch_started
-            # The one-epoch probe compresses the production schedule but must
-            # preserve its A -> B -> C order; starting a fresh model in Phase C
-            # exercises an invalid objective and can trip the gradient guard.
-            phase = e2e_phase_state(global_step, total_steps)
-            base_lr = _e2e_base_lr(global_step, total_steps, training)
+            phase = e2e_phase_state(global_step, schedule_total_steps)
+            base_lr = _e2e_base_lr(global_step, schedule_total_steps, training)
             for group in optimizer.param_groups:
                 group["lr"] = (
                     base_lr * phase.alpha
@@ -3885,7 +3884,7 @@ def _train_e2e_stability_loop(
                 collapse_streak = collapse_streak + 1 if fidelity["f_logit_std"] < threshold else 0
                 if collapse_streak >= training.collapse_validations:
                     collapse_failure = 1
-            phase = e2e_phase_state(global_step - 1, total_steps)
+            phase = e2e_phase_state(global_step - 1, schedule_total_steps)
             full_joint_epochs = max(0, epoch - first_eligible_epoch + 1)
             record = E2ECheckpointRecord(
                 epoch=epoch,
@@ -3945,8 +3944,8 @@ def _train_e2e_stability_loop(
         total_data_wait += epoch_data_wait
         total_validation_seconds += validation_seconds
 
-    if global_step != total_steps:
-        raise RuntimeError(f"E2E schedule coverage broken: {global_step} != {total_steps}")
+    if global_step != executed_steps:
+        raise RuntimeError(f"E2E execution coverage broken: {global_step} != {executed_steps}")
     last_state = _cpu_state_dict(accelerator, wrapped) if accelerator.is_main_process else {}
     selected_epoch_local = 0
     best_state: dict[str, torch.Tensor] = {}
@@ -4096,8 +4095,8 @@ def _train_e2e_stability_loop(
             {
                 "rank": index,
                 "pairs": int(row[0]),
-                "batches": total_steps,
-                "steps": total_steps,
+                "batches": executed_steps,
+                "steps": executed_steps,
                 "tokens": int(row[1]),
                 "train_wall_seconds": float(row[2]),
                 "data_wait_seconds": float(row[3]),
@@ -4118,7 +4117,8 @@ def _train_e2e_stability_loop(
         "kendall_fallback": {"active": False, "activated_step": None, "imbalance_streak_steps": 0},
         "run_kind": run_kind,
         "arm": arm,
-        "total_optimizer_steps": total_steps,
+        "total_optimizer_steps": executed_steps,
+        "schedule_total_optimizer_steps": schedule_total_steps,
         "phase_boundaries": {"phase_a_end": phase_a_end, "phase_b_end": phase_b_end},
         "parameter_groups": {
             "names": parameter_groups.names,
@@ -5075,15 +5075,12 @@ def _run_ddp_worker(
         return
 
     if args.ddp_mode == "epoch-probe":
-        one_epoch_cfg = (
-            cfg if cfg.run_kind == "overfit" else replace(cfg, optim=replace(cfg.optim, epochs=1))
-        )
         result, elapsed = _run_timed_epoch_probe(
             accelerator,
             lambda: (
                 _train_e2e_stability_loop(
                     model,
-                    one_epoch_cfg,
+                    cfg,
                     data,
                     accelerator,
                     node_batch=node_batch,
@@ -5092,7 +5089,7 @@ def _run_ddp_worker(
                 if isinstance(model, EgoStitchE2E) and cfg.training is not None
                 else train_egostitch_ddp_loop(
                     model,
-                    one_epoch_cfg,
+                    replace(cfg, optim=replace(cfg.optim, epochs=1)),
                     data,
                     accelerator,
                     node_batch=node_batch,

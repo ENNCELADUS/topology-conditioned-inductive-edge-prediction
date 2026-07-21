@@ -92,7 +92,7 @@ class EgoStitchE2E(nn.Module):
         self.generator_cfg = EgoStitchConfig()
         self.input_dim = self.generator_cfg.input_dim  # frozen feature dim (spec Sec 0 table)
         self.node_feature_dim = self.generator_cfg.input_dim
-        self.generator = EgoStitchStage1(self.generator_cfg)
+        self.generator = EgoStitchStage1(self.generator_cfg, standardize_features=True)
         self.encoder = SiameseEncoder(
             input_dim=self.input_dim,
             d_model=cfg.d_model,
@@ -146,7 +146,7 @@ class EgoStitchE2E(nn.Module):
             encoded=self.encoder(emb, length),
             length=length,
             slots=generated.slots,
-            projected_x=self.generator.imagine.proj(x),
+            projected_x=self.generator.project_features(x),
             ground_ids=ground_ids,
         )
 

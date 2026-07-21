@@ -11,7 +11,7 @@ scorer runs it once per node, then scores pair batches from the cache.
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 import torch
 import torch.nn as nn
@@ -71,14 +71,21 @@ class EgoStitchStage1(nn.Module):
 
     name = "egostitch"
 
-    def __init__(self, config: EgoStitchConfig) -> None:
+    def __init__(self, config: EgoStitchConfig, *, standardize_features: bool = False) -> None:
         """Build every Stage-1 module.
 
         Args:
             config: The pinned Stage-1 configuration.
+            standardize_features: Apply the v2 E2E stateless F0 transform. The
+                legacy frozen-s0 model keeps its historical raw-F0 semantics.
         """
         super().__init__()
         self.config = config
+        self.feature_norm: nn.Module = (
+            nn.LayerNorm(config.input_dim, elementwise_affine=False)
+            if standardize_features
+            else nn.Identity()
+        )
         self.tokenize = TokenizeLite(config)
         self.imagine = ImagineDecoder(config)
         self.decision = DecisionHead(config)
@@ -90,6 +97,14 @@ class EgoStitchStage1(nn.Module):
     def proj(self) -> nn.Linear:
         """The shared ``d -> d_p`` projection (spec Sec 13.7)."""
         return self.imagine.proj
+
+    def normalize_features(self, features: torch.Tensor) -> torch.Tensor:
+        """Apply the registered stateless per-row F0 standardization."""
+        return cast(torch.Tensor, self.feature_norm(features))
+
+    def project_features(self, features: torch.Tensor) -> torch.Tensor:
+        """Apply the shared projection to standardized frozen F0 features."""
+        return cast(torch.Tensor, self.proj(self.normalize_features(features)))
 
     def set_density_ratio(self, ratio: float) -> None:
         """Pin the density normalization ``rho_eval / rho_train``."""
@@ -122,6 +137,8 @@ class EgoStitchStage1(nn.Module):
         Returns:
             The `NodeEncoding` bundle.
         """
+        x = self.normalize_features(x)
+        ground_x = self.normalize_features(ground_x)
         tok = self.tokenize(x)
         slots, denoise = self.imagine(
             x, tok.e, ground_x, null_mode=null_mode, extra_proj=extra_proj
@@ -150,8 +167,8 @@ class EgoStitchStage1(nn.Module):
             iters=self.config.sinkhorn_iters,
             tau=self.config.sinkhorn_tau,
         )
-        proj_i = self.proj(x_i)
-        proj_j = self.proj(x_j)
+        proj_i = self.project_features(x_i)
+        proj_j = self.project_features(x_j)
         channels = self.decision.channels(
             enc_i.slots,
             enc_j.slots,
@@ -167,7 +184,9 @@ class EgoStitchStage1(nn.Module):
         self, enc: NodeEncoding, x: torch.Tensor, s0: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Return self-pair logits and channels without a second imagination pass."""
-        channels = self.decision.self_channels(enc.slots, self.proj(x), self.d_hat(enc.tok))
+        channels = self.decision.self_channels(
+            enc.slots, self.project_features(x), self.d_hat(enc.tok)
+        )
         return self.decision.fuse(s0, channels), channels
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -247,12 +266,12 @@ class EgoStitchStage1(nn.Module):
         if denoise_features is not None:
             if denoise_mask is None or denoise_noise is None:
                 raise ValueError("denoise_features requires denoise_mask and denoise_noise")
-            denoise_target = self.proj(denoise_features).detach()
+            denoise_target = self.project_features(denoise_features).detach()
             extra_proj = denoise_target + denoise_noise
 
         enc = self.encode_nodes(x, ground_x, null_mode=null_mode, extra_proj=extra_proj)
 
-        target_proj = self.proj(target_features).detach()
+        target_proj = self.project_features(target_features).detach()
         assignment = match_slots(
             enc.slots,
             target_proj=target_proj,

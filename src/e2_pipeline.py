@@ -198,6 +198,40 @@ def project_total_seconds(
     return pack_seconds + setup_probe_seconds + epoch_seconds * epochs + artifact_seconds
 
 
+def conservative_e2e_epoch_seconds(
+    *,
+    measured_epoch_seconds: object,
+    runtime_profile: object,
+    full_joint_pairs_per_second: object,
+) -> float:
+    """Project an E2E epoch using measured overhead plus full-joint compute.
+
+    The epoch probe follows the exact production prefix and therefore measures
+    Phase-A gradient behavior. Candidate probes execute the more expensive full
+    joint objective. Combining those two observations prevents the Phase-A
+    prefix from understating later Phase-B/C compute.
+    """
+    measured = _positive_finite_seconds(measured_epoch_seconds, field="measured_epoch_seconds")
+    throughput = _positive_finite_seconds(
+        full_joint_pairs_per_second, field="full_joint_pairs_per_second"
+    )
+    if not isinstance(runtime_profile, dict):
+        raise TypeError("runtime_profile must be an object")
+    per_epoch = runtime_profile.get("per_epoch")
+    if not isinstance(per_epoch, list) or len(per_epoch) != 1:
+        raise ValueError("runtime_profile.per_epoch must contain exactly one epoch")
+    epoch = per_epoch[0]
+    if not isinstance(epoch, dict):
+        raise TypeError("runtime_profile.per_epoch[0] must be an object")
+    global_pairs = _positive_finite_seconds(epoch.get("global_pairs"), field="global_pairs")
+    prefix_compute = _finite_number(epoch.get("compute_seconds"), field="compute_seconds")
+    if prefix_compute > measured:
+        raise ValueError("compute_seconds cannot exceed measured_epoch_seconds")
+    non_compute = measured - prefix_compute
+    full_joint_compute = global_pairs / throughput
+    return max(measured, non_compute + full_joint_compute)
+
+
 def write_failure(
     output_dir: Path,
     *,
@@ -1079,6 +1113,18 @@ def run_pipeline(
         epoch_seconds = _positive_finite_seconds(
             epoch_probe_data["epoch_seconds"], field="epoch_seconds"
         )
+        projection_epoch_seconds = epoch_seconds
+        if cfg.model.family == "egostitch_e2e":
+            projection_epoch_seconds = conservative_e2e_epoch_seconds(
+                measured_epoch_seconds=epoch_seconds,
+                runtime_profile=epoch_probe_data.get("runtime_profile"),
+                full_joint_pairs_per_second=selected.global_pairs_per_second,
+            )
+            epoch_probe_data["projection_epoch_seconds"] = projection_epoch_seconds
+            epoch_probe_data["projection_basis"] = (
+                "max(measured_production_prefix, measured_non_compute_plus_"
+                "full_joint_candidate_compute)"
+            )
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
         write_evidence(selected_token_budget=selected.token_budget)
         return fail(
@@ -1091,7 +1137,7 @@ def run_pipeline(
     projected_total_seconds = project_total_seconds(
         pack_seconds=stage_seconds["pack"],
         setup_probe_seconds=stage_seconds["setup_probe"],
-        epoch_seconds=epoch_seconds,
+        epoch_seconds=projection_epoch_seconds,
         epochs=1 if debug_run else cfg.optim.epochs,
         artifact_seconds=float(runtime.artifact_budget_seconds),
     )

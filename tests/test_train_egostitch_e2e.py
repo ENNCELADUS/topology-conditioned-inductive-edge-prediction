@@ -338,14 +338,22 @@ class TestE2ECompositeStep:
         )
         optimizer_steps = result.runtime_profile["optimizer_step_gradients"]
         phases = [step["phase"] for step in optimizer_steps]
-        assert phases[0] == "A"
-        phase_a_end, phase_b_end = te.e2e_phase_boundaries(len(phases))
-        assert {phase: phases.count(phase) for phase in ("A", "B", "C")} == {
-            "A": phase_a_end,
-            "B": phase_b_end - phase_a_end,
-            "C": len(phases) - phase_b_end,
+        _, steps_per_epoch = te._epoch_step_plan(
+            len(data.e_sup_positives),
+            negative_ratio=e2e_cfg.data.negative_ratio,
+            edge_batch=e2e_cfg.data.edge_batch,
+            world_size=1,
+        )
+        schedule_steps = steps_per_epoch * e2e_cfg.optim.epochs
+        assert phases == [
+            te.e2e_phase_state(step, schedule_steps).phase for step in range(len(phases))
+        ]
+        assert len(phases) == steps_per_epoch
+        assert result.runtime_profile["schedule_total_optimizer_steps"] == schedule_steps
+        assert result.runtime_profile["phase_boundaries"] == {
+            "phase_a_end": te.e2e_phase_boundaries(schedule_steps)[0],
+            "phase_b_end": te.e2e_phase_boundaries(schedule_steps)[1],
         }
-        assert phases == sorted(phases, key={"A": 0, "B": 1, "C": 2}.__getitem__)
         for group, ceiling in (
             ("pair_encoder_head", 3.0),
             ("generator", 3.0),
@@ -364,7 +372,7 @@ class TestE2ECompositeStep:
         )
         assert result.runtime_profile["validation_coverage_exact"] is True
         assert result.runtime_profile["training_coverage_exact"] is True
-        assert result.best_epoch == e2e_cfg.optim.epochs
+        assert result.best_epoch == 1
         assert guard_persistence == [False] * len(optimizer_steps)
 
     def test_permanent_null_matches_eval_bypass(self, tmp_path: Path) -> None:

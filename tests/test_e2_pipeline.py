@@ -5,7 +5,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import cast
 
@@ -22,6 +22,7 @@ from src.e2_pipeline import (
     _publish_staged,
     _rollback_publication,
     build_accelerate_command,
+    conservative_e2e_epoch_seconds,
     detect_visible_gpu_count,
     enforce_projection,
     main,
@@ -124,6 +125,16 @@ def test_projection_includes_all_thirty_epochs() -> None:
         artifact_seconds=60.0,
     )
     assert projected == pytest.approx(3240.0)
+
+
+def test_e2e_projection_combines_prefix_overhead_with_full_joint_compute() -> None:
+    projected = conservative_e2e_epoch_seconds(
+        measured_epoch_seconds=100.0,
+        runtime_profile={"per_epoch": [{"global_pairs": 1000, "compute_seconds": 20.0}]},
+        full_joint_pairs_per_second=5.0,
+    )
+
+    assert projected == pytest.approx(280.0)
 
 
 def test_failure_json_is_atomic_and_structured(tmp_path: Path) -> None:
@@ -574,6 +585,7 @@ def _make_fake_runner(
     *,
     probe_by_budget: dict[int, ProbeResult] | None = None,
     epoch_seconds: object = 5.0,
+    epoch_runtime_profile: object | None = None,
     train_runtime_profile: dict[str, object] | None = None,
     fail_mode: str | None = None,
     timeout_mode: str | None = None,
@@ -604,7 +616,12 @@ def _make_fake_runner(
             profile_output.write_text(json.dumps(resolved_probes[token_budget].to_dict()))
         elif mode == "epoch-probe":
             profile_output.write_text(
-                json.dumps({"epoch_seconds": epoch_seconds, "runtime_profile": {}})
+                json.dumps(
+                    {
+                        "epoch_seconds": epoch_seconds,
+                        "runtime_profile": epoch_runtime_profile or {},
+                    }
+                )
             )
         elif mode == "train":
             _write_train_outputs(out_dir)
@@ -1447,6 +1464,35 @@ class TestRunPipelineFailures:
         assert len(profile["probe_results"]) == 4
         assert profile["stage_seconds"]["pack"] >= 0
         assert profile["epoch_probe"]["epoch_seconds"] == 1000.0
+
+    def test_e2e_projection_uses_full_joint_candidate_throughput(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src import train_b0
+
+        args, output_dir = self._base_args_and_config(tmp_path)
+        original_load_config = train_b0.load_config
+
+        def load_e2e_config(path: Path) -> train_b0.Config:
+            cfg = original_load_config(path)
+            return replace(cfg, model=replace(cfg.model, family="egostitch_e2e"))
+
+        monkeypatch.setattr(train_b0, "load_config", load_e2e_config)
+        probes = {
+            budget: ProbeResult(budget, True, 5.0, 40.0, None) for budget in _RUNTIME_TOKEN_BUDGETS
+        }
+        runner = _make_fake_runner(
+            probe_by_budget=probes,
+            epoch_seconds=5.0,
+            epoch_runtime_profile={"per_epoch": [{"global_pairs": 1000, "compute_seconds": 1.0}]},
+        )
+
+        assert run_pipeline(args, command_runner=runner) == 2
+        failure = json.loads((output_dir / "failure.json").read_text())
+        profile = json.loads((output_dir / "failed_run_profile.json").read_text())
+        assert failure["stage"] == "projection"
+        assert profile["epoch_probe"]["projection_epoch_seconds"] == pytest.approx(204.0)
+        assert profile["projected_total_seconds"] > 400.0
 
     def test_train_subprocess_failure_writes_failure_and_returns_2(self, tmp_path: Path) -> None:
         args, output_dir = self._base_args_and_config(tmp_path)

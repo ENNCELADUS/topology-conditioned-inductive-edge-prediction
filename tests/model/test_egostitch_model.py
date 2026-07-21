@@ -66,6 +66,26 @@ def _node_batch(batch: int = 4, *, seed: int = 1) -> dict[str, torch.Tensor]:
 
 
 class TestForwardContract:
+    def test_legacy_generator_keeps_raw_feature_semantics(self) -> None:
+        model = _model()
+        x = 25.0 + 7.0 * torch.randn(3, _TINY.input_dim)
+
+        torch.testing.assert_close(model.normalize_features(x), x)
+        torch.testing.assert_close(model.project_features(x), model.proj(x))
+
+    def test_e2e_generator_inputs_use_stateless_per_row_normalization(self) -> None:
+        model = EgoStitchStage1(_TINY, standardize_features=True)
+        x = 25.0 + 7.0 * torch.randn(3, _TINY.input_dim)
+
+        normalized = model.normalize_features(x)
+
+        torch.testing.assert_close(normalized.mean(dim=-1), torch.zeros(3), atol=1e-6, rtol=0.0)
+        torch.testing.assert_close(
+            normalized.var(dim=-1, unbiased=False), torch.ones(3), atol=1e-5, rtol=0.0
+        )
+        assert tuple(model.feature_norm.parameters()) == ()
+        torch.testing.assert_close(model.project_features(x), model.proj(normalized))
+
     def test_pair_batch_logits_and_loss(self) -> None:
         model = _model()
         out = model(_pair_batch())
