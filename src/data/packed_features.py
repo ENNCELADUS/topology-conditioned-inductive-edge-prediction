@@ -159,14 +159,18 @@ class _ShardJob:
     temp_root: Path
     input_dim: int
     entries: Sequence[tuple[str, str]]
+    f0_node_ids: frozenset[str] = frozenset()
 
 
 def _write_shard(
     job: _ShardJob,
-) -> tuple[PackedShardRecord, Sequence[PackedNodeRecord]]:
+) -> tuple[PackedShardRecord, Sequence[PackedNodeRecord], Sequence[str], torch.Tensor | None]:
     shard_path = job.temp_root / f"shard-{job.shard_index:03d}.bin"
     records: list[PackedNodeRecord] = []
+    f0_node_ids: list[str] = []
+    f0_rows: list[torch.Tensor] = []
     token_offset = 0
+    digest = hashlib.sha256()
     with shard_path.open("wb") as handle:
         for node_id, relative_path in job.entries:
             tensor = cast(
@@ -181,8 +185,13 @@ def _write_shard(
                 raise ValueError(f"feature {node_id} does not match input_dim={job.input_dim}")
             if tensor.dtype != torch.float32:
                 raise ValueError(f"feature {node_id} must be float32")
+            if node_id in job.f0_node_ids:
+                f0_node_ids.append(node_id)
+                f0_rows.append(tensor.mean(dim=0))
             bf16 = tensor.to(torch.bfloat16).contiguous().view(torch.uint16)
-            handle.write(bf16.numpy().tobytes())
+            payload = bf16.numpy().tobytes()
+            handle.write(payload)
+            digest.update(payload)
             records.append(
                 PackedNodeRecord(
                     node_id,
@@ -197,9 +206,10 @@ def _write_shard(
         filename=shard_path.name,
         num_tokens=token_offset,
         byte_size=shard_path.stat().st_size,
-        sha256=sha256_file(shard_path),
+        sha256=digest.hexdigest(),
     )
-    return shard, tuple(records)
+    f0_matrix = torch.stack(f0_rows).float() if f0_rows else None
+    return shard, tuple(records), tuple(f0_node_ids), f0_matrix
 
 
 def build_packed_features(
@@ -208,12 +218,21 @@ def build_packed_features(
     workers: int,
     *,
     temp_prefix: str | None = None,
+    f0_node_ids: Sequence[str] | None = None,
+    f0_cache_path: Path | None = None,
 ) -> PackedFeatureManifest:
-    """Pack per-node float32 tensors into validated BF16 shards atomically."""
+    """Pack per-node float32 tensors into validated BF16 shards atomically.
+
+    When ``f0_node_ids`` and ``f0_cache_path`` are supplied, the workers also
+    retain the exact float32 means from their one source-tensor load and publish
+    the standard F0 cache without reopening the per-node ``.pt`` files.
+    """
     if workers < 1:
         raise ValueError("workers must be at least 1")
     if pack_root.exists():
         raise FileExistsError(f"packed feature directory already exists: {pack_root}")
+    if (f0_node_ids is None) != (f0_cache_path is None):
+        raise ValueError("f0_node_ids and f0_cache_path must be supplied together")
     resolved_temp_prefix = temp_prefix or f".{pack_root.name}.tmp-"
     if not resolved_temp_prefix or Path(resolved_temp_prefix).name != resolved_temp_prefix:
         raise ValueError("temp_prefix must be a non-empty filename prefix")
@@ -230,6 +249,15 @@ def build_packed_features(
     )
     input_dim = cast(int, metadata["input_dim"])
     entries = tuple(index.items())
+    resolved_f0_node_ids = tuple(f0_node_ids or ())
+    if len(resolved_f0_node_ids) != len(set(resolved_f0_node_ids)):
+        raise ValueError("f0_node_ids must not contain duplicates")
+    missing_f0_nodes = set(resolved_f0_node_ids) - set(index)
+    if missing_f0_nodes:
+        raise ValueError(
+            f"F0 nodes are missing from the source index: {sorted(missing_f0_nodes)!r}"
+        )
+    requested_f0_nodes = frozenset(resolved_f0_node_ids)
     job_count = min(workers, len(entries))
     base_size, extra = divmod(len(entries), job_count) if job_count else (0, 0)
 
@@ -248,6 +276,7 @@ def build_packed_features(
                     temp_root=temp_root,
                     input_dim=input_dim,
                     entries=entries[start : start + size],
+                    f0_node_ids=requested_f0_nodes,
                 )
             )
             start += size
@@ -259,10 +288,26 @@ def build_packed_features(
         shards = tuple(result[0] for result in results)
         nodes: list[PackedNodeRecord] = []
         global_offset = 0
-        for _, records in results:
+        for _, records, _, _ in results:
             for record in records:
                 nodes.append(replace(record, global_offset=global_offset))
                 global_offset += record.length
+
+        f0_matrix: torch.Tensor | None = None
+        if resolved_f0_node_ids:
+            f0_by_node: dict[str, torch.Tensor] = {}
+            for _, _, result_node_ids, result_matrix in results:
+                if result_matrix is None:
+                    continue
+                if len(result_node_ids) != result_matrix.size(0):
+                    raise ValueError("packed F0 worker result has inconsistent row metadata")
+                f0_by_node.update(
+                    (node_id, result_matrix[row_index])
+                    for row_index, node_id in enumerate(result_node_ids)
+                )
+            f0_matrix = torch.stack(
+                [f0_by_node[node_id] for node_id in resolved_f0_node_ids]
+            ).float()
 
         manifest = PackedFeatureManifest(
             format=PACK_FORMAT,
@@ -276,8 +321,21 @@ def build_packed_features(
             build_seconds=time.monotonic() - started,
         )
         write_packed_manifest(temp_root, manifest)
-        validate_packed_manifest(temp_root, source_root)
+        validate_packed_manifest(temp_root, source_root, verify_shard_sha256=False)
         temp_root.rename(pack_root)
+        if f0_cache_path is not None and f0_matrix is not None:
+            temporary_f0_path = f0_cache_path.with_name(f"{f0_cache_path.name}.tmp-{os.getpid()}")
+            try:
+                f0_cache_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {"matrix": f0_matrix, "node_ids": list(resolved_f0_node_ids)},
+                    temporary_f0_path,
+                )
+                os.replace(temporary_f0_path, f0_cache_path)
+            except BaseException:
+                temporary_f0_path.unlink(missing_ok=True)
+                shutil.rmtree(pack_root, ignore_errors=True)
+                raise
         return manifest
     except BaseException:
         shutil.rmtree(temp_root, ignore_errors=True)
@@ -410,7 +468,12 @@ def _validated_source_index(source_root: Path, value: object) -> dict[str, str]:
     return validated
 
 
-def validate_packed_manifest(pack_root: Path, source_root: Path | None) -> PackedFeatureManifest:
+def validate_packed_manifest(
+    pack_root: Path,
+    source_root: Path | None,
+    *,
+    verify_shard_sha256: bool = True,
+) -> PackedFeatureManifest:
     """Load and strictly validate a packed manifest and its referenced files.
 
     When ``source_root`` is given, its metadata and index hashes must also match the
@@ -486,9 +549,10 @@ def validate_packed_manifest(pack_root: Path, source_root: Path | None) -> Packe
                 f"Packed shard size mismatch for {shard.filename!r}: "
                 f"found {actual_size}, expected {shard.byte_size}"
             )
-        actual_sha256 = sha256_file(shard_path)
-        if actual_sha256 != shard.sha256:
-            raise ValueError(f"Packed shard checksum mismatch for {shard.filename!r}")
+        if verify_shard_sha256:
+            actual_sha256 = sha256_file(shard_path)
+            if actual_sha256 != shard.sha256:
+                raise ValueError(f"Packed shard checksum mismatch for {shard.filename!r}")
 
     if expected_global_offset != sum(shard.num_tokens for shard in manifest.shards):
         raise ValueError("Packed feature global token total does not match shard totals")

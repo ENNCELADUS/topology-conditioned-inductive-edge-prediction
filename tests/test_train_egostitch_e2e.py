@@ -728,6 +728,15 @@ class TestPrepareAndAssembleE2E:
         _write_e2e_feature_root(tmp_path, _E2E_PIPELINE_NODES)
         benchmark = _e2e_pipeline_benchmark()
         monkeypatch.setattr(te, "_load_benchmark_for", lambda cfg: benchmark)
+        original_load = torch.load
+        source_load_counts: dict[str, int] = {}
+
+        def counting_load(path: Path, *, map_location: str, weights_only: bool) -> object:
+            if path.suffix == ".pt" and path.parent.name == "embeddings":
+                source_load_counts[path.name] = source_load_counts.get(path.name, 0) + 1
+            return original_load(path, map_location=map_location, weights_only=weights_only)
+
+        monkeypatch.setattr(torch, "load", counting_load)
         e2e_cfg = self._e2e_cfg(tmp_path)
         pack_dir = tmp_path / "pack"
 
@@ -739,6 +748,7 @@ class TestPrepareAndAssembleE2E:
         assert set(packs) == {"f0_grounding", "raw_tokens"}
         assert packs["f0_grounding"]["cold"] is True
         assert packs["raw_tokens"]["cold"] is True
+        assert source_load_counts == {f"{node}.pt": 1 for node in _E2E_PIPELINE_NODES}
         assert (cast(Path, e2e_cfg.data.pack_dir) / "manifest.json").is_file()
         assert te.required_pack_paths(e2e_cfg, pack_dir) == (
             pack_dir,

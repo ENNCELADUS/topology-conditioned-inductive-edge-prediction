@@ -26,7 +26,12 @@ from src.data.packed_features import (
 
 pytestmark = pytest.mark.unit
 
-_ShardResult = tuple[PackedShardRecord, Sequence[PackedNodeRecord]]
+_ShardResult = tuple[
+    PackedShardRecord,
+    Sequence[PackedNodeRecord],
+    Sequence[str],
+    torch.Tensor | None,
+]
 
 
 class _SynchronousExecutor:
@@ -444,9 +449,84 @@ def test_build_loads_each_source_feature_once(
     monkeypatch.setattr(packed_features, "ProcessPoolExecutor", _SynchronousExecutor)
     monkeypatch.setattr(torch, "load", counting_load)
 
-    build_packed_features(source_root, tmp_path / "pack", workers=2)
+    f0_cache_path = tmp_path / "f0_matrix.pt"
+    build_packed_features(
+        source_root,
+        tmp_path / "pack",
+        workers=2,
+        f0_node_ids=("node_c", "node_a"),
+        f0_cache_path=f0_cache_path,
+    )
 
     assert load_counts == {"node_a.pt": 1, "node_b.pt": 1, "node_c.pt": 1}
+    cached = cast(
+        dict[str, object], torch.load(f0_cache_path, map_location="cpu", weights_only=True)
+    )
+    assert cached["node_ids"] == ["node_c", "node_a"]
+    expected = torch.stack(
+        [
+            original_load(
+                source_root / "embeddings/node_c.pt", map_location="cpu", weights_only=True
+            ).mean(dim=0),
+            original_load(
+                source_root / "embeddings/node_a.pt", map_location="cpu", weights_only=True
+            ).mean(dim=0),
+        ]
+    )
+    assert torch.equal(cast(torch.Tensor, cached["matrix"]), expected)
+
+
+def test_fresh_build_does_not_reread_shards_for_sha256(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = _write_feature_root(
+        tmp_path / "source", {"node_a": (3, 4), "node_b": (2, 4)}
+    )
+    original_sha256_file = packed_features.sha256_file
+    shard_hash_reads: list[str] = []
+
+    def counting_sha256_file(path: Path) -> str:
+        if path.name.startswith("shard-"):
+            shard_hash_reads.append(path.name)
+        return original_sha256_file(path)
+
+    monkeypatch.setattr(packed_features, "sha256_file", counting_sha256_file)
+
+    manifest = build_packed_features(source_root, tmp_path / "pack", workers=2)
+
+    assert shard_hash_reads == []
+    for shard in manifest.shards:
+        assert shard.sha256 == original_sha256_file(tmp_path / "pack" / shard.filename)
+
+
+def test_failed_f0_publication_removes_new_raw_pack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = _write_feature_root(tmp_path / "source", {"node_a": (3, 4)})
+    pack_root = tmp_path / "pack"
+    f0_cache_path = tmp_path / "missing-parent" / "f0_matrix.pt"
+    original_mkdir = Path.mkdir
+
+    def failing_mkdir(
+        path: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False
+    ) -> None:
+        if path == f0_cache_path.parent:
+            raise OSError("injected F0 parent failure")
+        original_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", failing_mkdir)
+
+    with pytest.raises(OSError, match="injected F0 parent failure"):
+        build_packed_features(
+            source_root,
+            pack_root,
+            workers=1,
+            f0_node_ids=("node_a",),
+            f0_cache_path=f0_cache_path,
+        )
+
+    assert not pack_root.exists()
+    assert not f0_cache_path.exists()
 
 
 @pytest.mark.parametrize(

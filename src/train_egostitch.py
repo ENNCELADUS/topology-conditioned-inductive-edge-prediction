@@ -57,7 +57,7 @@ from src.data.ego_targets import EgoTargetBuilder, EgoTargets
 from src.data.features import FeatureStore, build_f0_matrix
 from src.data.grounding import build_grounding_pool
 from src.data.internal_holdout import InternalHoldoutPartition, derive_internal_holdout
-from src.data.packed_features import PackedFeatureTable
+from src.data.packed_features import PackedFeatureManifest, PackedFeatureTable
 from src.data.pairs import NegativeSampler
 from src.data.partition import build_g_struct, derive_partition
 from src.e2_pipeline import ProbeResult, detect_visible_gpu_count
@@ -1407,6 +1407,13 @@ def prepare_pack(
     run_kind = cfg.run_kind or "formal"
     role = None if run_kind == "overfit" else ("V_qual" if run_kind == "rehearsal" else "V_select")
     f0_cold = not pack_dir.exists()
+    raw_manifest: PackedFeatureManifest | None = None
+    raw_pack_dir = cfg.data.pack_dir if is_e2e else None
+    raw_cold = bool(raw_pack_dir is not None and not raw_pack_dir.exists())
+    if is_e2e and raw_pack_dir is None:
+        raise ValueError("data.pack_dir is required when model.family == 'egostitch_e2e'")
+    if not cold_cache and raw_cold:
+        raise ValueError(f"warm raw-token pack is missing: {raw_pack_dir}")
     if not cold_cache and f0_cold:
         raise ValueError(f"warm F0/grounding pack is missing: {pack_dir}")
     if f0_cold:
@@ -1450,6 +1457,16 @@ def prepare_pack(
             )
             train_nodes = sorted(set(benchmark.split.train_nodes) & set(operative))
             validation_nodes = ()
+        if is_e2e and raw_cold:
+            assert raw_pack_dir is not None
+            raw_manifest = packed_features.build_packed_features(
+                cfg.data.root / _FEATURES_SUBDIR,
+                raw_pack_dir,
+                workers=cfg.runtime.pack_workers if cfg.runtime is not None else 1,
+                temp_prefix=temp_prefix or None,
+                f0_node_ids=operative,
+                f0_cache_path=pack_dir / _PACK_F0_FILENAME,
+            )
         matrix, index = build_f0_matrix(store, operative, cache_path=pack_dir / _PACK_F0_FILENAME)
         train_rows = np.asarray(
             matrix.numpy()[[index[node] for node in train_nodes]], dtype=np.float32
@@ -1509,23 +1526,22 @@ def prepare_pack(
         }
     }
     if is_e2e:
-        if cfg.data.pack_dir is None:
-            raise ValueError("data.pack_dir is required when model.family == 'egostitch_e2e'")
-        raw_pack_dir = cfg.data.pack_dir
-        raw_cold = not raw_pack_dir.exists()
-        if not cold_cache and raw_cold:
-            raise ValueError(f"warm raw-token pack is missing: {raw_pack_dir}")
+        assert raw_pack_dir is not None
         source_root = cfg.data.root / _FEATURES_SUBDIR
-        if raw_cold:
-            raw_manifest = packed_features.build_packed_features(
-                source_root,
-                raw_pack_dir,
-                workers=cfg.runtime.pack_workers if cfg.runtime is not None else 1,
-                temp_prefix=temp_prefix or None,
-            )
-        else:
-            raw_manifest = packed_features.validate_packed_manifest(raw_pack_dir, source_root)
+        if raw_manifest is None:
+            if raw_cold:
+                raw_manifest = packed_features.build_packed_features(
+                    source_root,
+                    raw_pack_dir,
+                    workers=cfg.runtime.pack_workers if cfg.runtime is not None else 1,
+                    temp_prefix=temp_prefix or None,
+                )
+            else:
+                raw_manifest = packed_features.validate_packed_manifest(
+                    raw_pack_dir, source_root
+                )
         raw_identity = packed_features.sha256_file(raw_pack_dir / "manifest.json")
+        assert raw_manifest is not None
         packs["raw_tokens"] = {
             "path": str(raw_pack_dir),
             "manifest": asdict(raw_manifest),

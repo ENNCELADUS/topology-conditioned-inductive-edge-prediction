@@ -813,11 +813,20 @@ class TestRunPipelineSuccess:
         inside_stage = False
         validation_calls = 0
 
-        def checked_validate(pack_root: Path, source_root: Path | None) -> object:
+        def checked_validate(
+            pack_root: Path,
+            source_root: Path | None,
+            *,
+            verify_shard_sha256: bool = True,
+        ) -> object:
             nonlocal validation_calls
             validation_calls += 1
             assert inside_stage, "full pack validation escaped the supervised pack stage"
-            return original_validate(pack_root, source_root)
+            return original_validate(
+                pack_root,
+                source_root,
+                verify_shard_sha256=verify_shard_sha256,
+            )
 
         def supervised(operation: Callable[[], None], _timeout: float) -> None:
             nonlocal inside_stage
