@@ -3457,9 +3457,10 @@ def _e2e_family_probe(
         expected["topology_content_conditioning"].add("edge")
     result: dict[str, dict[str, float]] = {group: {} for group in groups}
     submodule_rms: dict[str, float] = {}
+    probe_payload = {**payload, "collect_diagnostics": True}
     for family in families:
         wrapped.zero_grad(set_to_none=True)
-        probe_out = cast(dict[str, object], wrapped(payload))
+        probe_out = cast(dict[str, object], wrapped(probe_payload))
         family_loss = cast(dict[str, torch.Tensor], probe_out["families"])[family]
         accelerator.backward(family_loss)
         gathered = _e2e_group_squared_norms(groups, accelerator)

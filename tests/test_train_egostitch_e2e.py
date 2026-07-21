@@ -264,6 +264,37 @@ class TestE2ECompositeStep:
         total_abs_grad = float(topo_gate.gate.grad.abs()) + float(cont_gate.gate.grad.abs())
         assert total_abs_grad > 0.0
 
+    def test_family_probe_requests_family_tensors_from_standard_payload(
+        self, tmp_path: Path
+    ) -> None:
+        """The step-50 replay must work when the training payload disables diagnostics."""
+        torch.manual_seed(0)
+        batch, model = self._batch_and_model(tmp_path)
+        composite = te._CompositeStep(model, world_size=1)
+        groups = te.build_e2e_parameter_groups(model).groups
+        payload = self._payload(batch, joint_weight=0.0, collect_diagnostics=False)
+        accelerator = Accelerator(cpu=True)
+
+        with self._bf16_autocast():
+            family_norms, submodule_rms = te._e2e_family_probe(
+                composite,
+                payload,
+                groups,
+                te.e2e_phase_state(0, 100),
+                "full",
+                accelerator,
+            )
+
+        assert set(family_norms["pair_encoder_head"]) == {"edge"}
+        assert set(family_norms["generator"]) == {"recon"}
+        assert family_norms["topology_content_conditioning"] == {}
+        assert set(submodule_rms) == {
+            "grad_rms_trunk",
+            "grad_rms_ste",
+            "grad_rms_content",
+        }
+        assert payload["collect_diagnostics"] is False
+
     def test_profile_loop_executes_real_optimizer_and_validation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
