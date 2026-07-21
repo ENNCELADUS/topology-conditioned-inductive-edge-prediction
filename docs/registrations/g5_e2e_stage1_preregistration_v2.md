@@ -39,7 +39,7 @@ Because the first full-arm rehearsal attempt (qualification attempt 003) exposed
 launcher/time-accounting defect rather than a
 model result, this still-DRAFT registration is explicitly amended before binding to
 permit only the following failure-recovery changes: auto-detect and use every visible
-H20 for the full-arm rehearsal; rebalance the unchanged total runtime budget; remove
+H20 for the overfit test and full-arm rehearsal; rebalance the unchanged total runtime budget; remove
 slower token-budget candidates while retaining measured candidate `128`; correct
 batch-construction timing; and make semantically equivalent in-memory reuse changes
 whose outputs are locked by exact regression tests. Model, loss, optimizer, schedule,
@@ -192,9 +192,11 @@ Before changing this registration to `BINDING`:
 1. A deterministic 510-row 1:5 overfit set—85 smallest-hash `E_sup[V_fit]` positives
    and 425 registered-sampler negatives with both endpoints in `V_fit`—is cycled for exactly 2,000 optimizer steps under
    the formal weighting/schedule (Phase A/B/C=`400/200/1400`). Its pair manifest is
-   created once before sharding and is rank/world-size invariant. It must reach train
-   AUPRC `>=0.95`, residual ratio `>=1e-3` after the ramp, and pass every applicable
-   stability guard.
+   created once before sharding and is rank/world-size invariant. It uses every
+   auto-detected visible H20 (four on the current target host), matching the
+   rehearsal/formal launch style, and records the detected world size. It must reach
+   train AUPRC `>=0.95`, residual ratio `>=1e-3` after the ramp, and pass every
+   applicable stability guard.
 2. The exact full-arm 30-epoch config must complete using every auto-detected visible
    H20 (four on the current target host), matching the formal launch style, using only
    the qualification pair/topology manifests and selecting an eligible post-ramp
@@ -277,8 +279,8 @@ structure-control failure is reported, and any such label yields `cut`.
   evidence before DDP startup.
 - Create and hash all four v2 training configs.
 - Create and hash the disjoint validation and train-side topology-selection manifests.
-- Complete the deterministic overfit test and auto-detected all-visible-H20 full-arm
-  rehearsal in a data root where candidate/test inputs are not mounted.
+- Complete the deterministic overfit test and full-arm rehearsal with auto-detected
+  all-visible-H20 execution in a data root where candidate/test inputs are not mounted.
 - Record implementation, optimizer-group, profile, pack, validation, access-audit,
   config, and every qualification-attempt digest.
 - Complete independent JSON/prose and provenance review.

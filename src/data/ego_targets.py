@@ -16,7 +16,7 @@ degree NLL keeps the true ``|N(u)|``.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 
 import networkx as nx
@@ -122,6 +122,11 @@ class EgoTargetBuilder:
             node: sorted(g_struct.neighbors(node)) for node in g_struct.nodes()
         }
         self._ego_stats: dict[str, tuple[float, float, float, float]] = {}
+        self._feature_read_observer: Callable[[Sequence[str]], None] | None = None
+
+    def set_feature_read_observer(self, observer: Callable[[Sequence[str]], None] | None) -> None:
+        """Observe the exact target-node feature identities read by ``build``."""
+        self._feature_read_observer = observer
 
     @property
     def graph(self) -> nx.Graph:
@@ -188,6 +193,8 @@ class EgoTargetBuilder:
 
         for b, node in enumerate(node_ids):
             selected, labels = self._select_targets(node, rng)
+            if self._feature_read_observer is not None:
+                self._feature_read_observer(selected)
             degree[b] = float(len(self._neighbors.get(node, [])))
             ego_stats[b] = self._node_ego_stats(node)
             pool = self._pool.get(node, set())

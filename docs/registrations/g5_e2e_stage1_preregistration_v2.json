@@ -177,6 +177,7 @@
       "rows": 510,
       "steps": 2000,
       "selection": "85 E_sup[V_fit] positives with smallest sha256(canonical_pair) and 425 deterministic registered-sampler negatives with both endpoints in V_fit, fixed Seed 0; canonical-pair manifest created once before sharding and invariant to rank/world size; cycle fixed rows",
+      "hardware": "every auto-detected visible H20, four on the current target host, matching rehearsal/formal launch style; detected world size recorded",
       "phase_steps": {"dual_track_warmstart": 400, "conditioning_ramp": 200, "full_joint": 1400},
       "requirements": [
         "train AUPRC >= 0.95",
@@ -190,7 +191,7 @@
       "status": "post-attempt DRAFT amendment before binding; not retroactive preregistration",
       "trigger": "attempt 003 used 2 x H20; token-budget probes 128/256/512 measured approximately 80.46/75.81/70.44 pairs/s; the epoch probe was watchdog-terminated with 1823.6 seconds remaining before completing an epoch; no eligible checkpoint or scientific result was produced",
       "permitted_changes": [
-        "auto-detect and use every visible H20 for the full-arm rehearsal",
+        "auto-detect and use every visible H20 for the overfit test and full-arm rehearsal",
         "rebalance the unchanged total runtime budget",
         "remove slower token-budget candidates while retaining measured candidate 128",
         "correct batch-construction timing",
@@ -343,7 +344,7 @@
     "REQUIRED-BEFORE-BINDING: enforce the DRAFT/debug candidate/test scoring prohibition and validate structured binding_evidence before DDP",
     "REQUIRED-BEFORE-BINDING: create the four v2 config files and pin their SHA-256 values",
     "REQUIRED-BEFORE-BINDING: create and hash disjoint validation and train-side topology-selection manifests",
-    "REQUIRED-BEFORE-BINDING: complete the deterministic overfit test and auto-detected all-visible-H20 full-arm train/validation rehearsal in a no-test-mounted data root",
+    "REQUIRED-BEFORE-BINDING: complete the deterministic overfit test and full-arm train/validation rehearsal with auto-detected all-visible-H20 execution in a no-test-mounted data root",
     "REQUIRED-BEFORE-BINDING: record implementation commit, parameter groups, packs, validation manifests, every qualification attempt, access audit, artifact digests, measured runtime, and peak memory",
     "REQUIRED-BEFORE-BINDING: independent review confirms JSON/prose parity and no v1 artifact is relabeled as v2 evidence"
   ],

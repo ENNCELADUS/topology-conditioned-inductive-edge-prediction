@@ -512,6 +512,11 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-21: aligned the still-DRAFT v2 Stage-2 overfit launcher with Stage 3 and
+  formal execution by auto-detecting and using every visible H20 (four on the current
+  target host). The fixed manifest, 2,000 steps, phase schedule, objectives, and
+  qualification thresholds are unchanged.
+
 - 2026-07-21: after disclosed DRAFT rehearsal attempt 003 exhausted its remaining
   `1,823.6` s epoch-probe allowance on two H20s without completing an epoch or
   producing an eligible checkpoint/scientific result, amended the still-DRAFT v2
@@ -1305,7 +1310,9 @@ following without candidate/test scoring:
    425 deterministic registered-sampler negatives with both endpoints in `V_fit`) is cycled for exactly 2,000 optimizer
    steps (`T_overfit=2000`: Phase A/B/C = `400/200/1400`) under the formal weighting
    and schedule. Its canonical-pair manifest is generated once before sharding and is
-   invariant to rank/world size. It reaches train AUPRC `>= 0.95` and
+   invariant to rank/world size. The launcher auto-detects and uses all visible H20s
+   (four on the current target host), matching the rehearsal/formal launch style, and
+   records the detected world size. It reaches train AUPRC `>= 0.95` and
    reaches full-vs-f-only residual ratio `>= 1e-3` after the conditioning ramp.
 2. **Single-arm stability rehearsal:** the exact full-arm config completes the full
    schedule using only the stability/qualification pair and topology manifests,

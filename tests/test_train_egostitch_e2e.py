@@ -163,8 +163,8 @@ class TestBatchFactoryE2E:
             te._BatchFactory(e2e_cfg, model_cfg, data, node_batch=4, rank=0, world_size=1)
 
 
-class _ArchivedV1CompositeStepE2E:
-    """One CPU optimization step through `_CompositeStep`, family egostitch_e2e."""
+class TestE2ECompositeStep:
+    """One CPU optimizer forward through the active §13.19 composite."""
 
     def _batch_and_model(self, tmp_path: Path) -> tuple[te._CompositeBatch, EgoStitchE2E]:
         # EgoStitchE2E's internal generator always uses the full spec-default
@@ -203,6 +203,8 @@ class _ArchivedV1CompositeStepE2E:
             "node": batch.node,
             "edge": batch.edge,
             "joint_weight": torch.tensor(joint_weight),
+            "pair_only": joint_weight == 0.0,
+            "real_ssl_scale": torch.tensor(joint_weight),
             "edge_rows_global": batch.edge_rows_global,
             "seed": 0,
             "epoch": 1,
@@ -261,6 +263,64 @@ class _ArchivedV1CompositeStepE2E:
         assert cont_gate.gate.grad is not None
         total_abs_grad = float(topo_gate.gate.grad.abs()) + float(cont_gate.gate.grad.abs())
         assert total_abs_grad > 0.0
+
+    def test_profile_loop_executes_real_optimizer_and_validation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Exercise the activated trainer, not only its loss helper."""
+        torch.manual_seed(0)
+        batch, model = self._batch_and_model(tmp_path)
+        cfg = _toy_cfg(tmp_path)
+        registered = te.load_config(
+            Path(__file__).resolve().parents[1] / "configs/egostitch_e2e_breadth_first.yaml"
+        )
+        assert registered.training is not None
+        pack_dir = tmp_path / "token_pack"
+        e2e_cfg = replace(
+            cfg,
+            model=ModelConfig(family="egostitch_e2e", config=dict(_E2E_TINY_MODEL)),
+            data=replace(cfg.data, pack_dir=pack_dir),
+            training=replace(
+                registered.training,
+                clip_immediate_abort=1e-12,
+                clip_persistent_threshold=0.0,
+            ),
+            run_kind="rehearsal",
+        )
+        data = _toy_bundle(tmp_path, EgoStitchConfig())
+        original_from_pack = PackedFeatureTable.from_pack.__func__
+
+        def _float_cpu_pack(
+            cls: type[PackedFeatureTable], root: Path, device: torch.device
+        ) -> PackedFeatureTable:
+            table = original_from_pack(cls, root, device)
+            table.tokens = table.tokens.float()
+            return table
+
+        monkeypatch.setattr(PackedFeatureTable, "from_pack", classmethod(_float_cpu_pack))
+        accelerator = Accelerator(cpu=True)
+
+        result = te._train_e2e_stability_loop(
+            model,
+            e2e_cfg,
+            data,
+            accelerator,
+            node_batch=4,
+            profile_only=True,
+        )
+
+        assert result.runtime_profile is not None
+        assert result.runtime_profile["total_optimizer_steps"] > 0
+        assert (
+            len(result.runtime_profile["optimizer_step_gradients"])
+            == result.runtime_profile["total_optimizer_steps"]
+        )
+        assert (
+            result.runtime_profile["observed_training_access"][0]["all_nodes_within_v_fit"] is True
+        )
+        assert result.runtime_profile["validation_coverage_exact"] is True
+        assert result.runtime_profile["training_coverage_exact"] is True
+        assert result.best_epoch == e2e_cfg.optim.epochs
 
     def test_permanent_null_matches_eval_bypass(self, tmp_path: Path) -> None:
         """The training mask is exactly the corresponding hard eval bypass."""
@@ -339,9 +399,7 @@ class _ArchivedV1CompositeStepE2E:
         expected_delta_std = (
             0.0 if reference_delta.numel() < 2 else float(torch.std(reference_delta))
         )
-        expected_f_logit_std = float(
-            np.std(reference["f_logit"].detach().float().cpu().numpy())
-        )
+        expected_f_logit_std = float(np.std(reference["f_logit"].detach().float().cpu().numpy()))
         expected = {
             "topology_delta_std": expected_delta_std,
             "f_logit_std": expected_f_logit_std,

@@ -27,7 +27,7 @@ to the exact count in their retained artifacts.
 
 | Item | Fixed value |
 |---|---|
-| SSH | `ssh -p 30349 root@10.15.171.204` |
+| SSH | `ssh -p 30838 root@10.15.171.204` |
 | Repository | `/2023533015/topology-conditioned-inductive-edge-prediction` |
 | GPU | 1 or more NVIDIA H20, 97,871 MiB each |
 | NVIDIA driver | 550.144.03 |
@@ -49,13 +49,36 @@ G3 is a direct single-process cached-score analysis command outside `run.sh`.
 Connect, enter the fixed checkout, and verify the container before any experiment:
 
 ```bash
-ssh -p 30349 root@10.15.171.204
+ssh -p 30838 root@10.15.171.204
 cd /2023533015/topology-conditioned-inductive-edge-prediction
 hpc/run.sh check
 ```
 
 The check runs the lightweight suite plus the three CPU DDP smoke contracts on Linux;
 the four-H20 cold-run acceptance test remains an explicit opt-in.
+
+EgoStitch e2e v2 has a separate fail-closed qualification entry point. Its Stage 2
+overfit test uses the registered fixed 510-row stream for exactly 2,000 steps on
+every auto-detected visible H20 (four on the current target host), matching Stage 3
+and the formal launch topology. Stage 3 runs the exact 30-epoch full-arm rehearsal
+against `V_qual` without opening `V_select`. Qualification must run from an isolated
+root in which candidate, test, and `V_select` artifacts are absent. Its basename must
+include the retained attempt number (`attempt003` through `attempt005`); an existing
+attempt directory is never replaced:
+
+```bash
+EGOSTITCH_QUALIFICATION_ROOT=/path/to/isolated/qualification-attempt005 \
+  hpc/qualification.sh qualify
+```
+
+The launcher runs its v2 trainer/conditioning tests before either GPU stage and uses
+separate `V_fit` and `V_qual` feature packs. It never substitutes `--max-steps`, never
+promotes the DRAFT registration, and stops immediately on a failed stage. Formal arm
+training remains unavailable until the registration is resolved and marked BINDING:
+
+```bash
+hpc/qualification.sh formal full
+```
 
 Train both frozen baselines. `B0` runs through the auto-sized H20 E2 production pipeline;
 `B0-alt` is outside this optimization and is trained directly, without the runner's

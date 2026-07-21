@@ -109,8 +109,8 @@ def test_e2e_runner_help_is_local_and_distinguishes_gpu_contexts(bash_exe: str) 
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert "registered 2,000-step overfit uses 2 H20s" in result.stdout
-    assert "rehearsal auto-detects and uses every visible H20" in result.stdout
+    assert "2,000-step overfit and full-arm" in result.stdout
+    assert "rehearsal auto-detect and use every visible H20" in result.stdout
     assert "exactly 4 visible NVIDIA H20s" in result.stdout
     assert "sanity -> overfit -> rehearsal" in result.stdout
 
@@ -127,9 +127,24 @@ def test_e2e_runner_is_fail_closed_and_never_auto_binds() -> None:
     assert "--run-kind overfit" in qualification
     assert "--run-kind rehearsal" in qualification
     assert qualification.index("select_all_visible_h20s") < qualification.index(
+        "--run-kind overfit"
+    )
+    assert qualification.index("select_all_visible_h20s") < qualification.index(
         "--run-kind rehearsal"
     )
+    assert "OVERFIT_GPU_COUNT" not in text
+    assert "OVERFIT_GPU_IDS" not in text
+    assert "assert_gpu_selection" not in text
+    assert "egostitch_e2e_v_fit" in qualification
+    assert "egostitch_e2e_v_qual" in qualification
+    assert "attempt_number" in qualification
+    assert "10#${attempt_number} >= 3 && 10#${attempt_number} <= 5" in qualification
+    assert "attempt-${attempt_number}" in qualification
+    assert "cannot be replaced" in qualification
     assert "--max-steps" not in qualification
+    assert "tests/test_train_egostitch_training.py" in qualification
+    assert "tests/test_train_egostitch_e2e.py" in qualification
+    assert "tests/model/test_egostitch_conditioning.py" in qualification
     assert "candidate_test_edges.txt" in text
     assert "test_edges.txt" in text
     assert "v_select" in text.lower()
@@ -147,6 +162,8 @@ def test_formal_path_requires_binding_no_markers_and_four_gpus() -> None:
     assert '"${DETECTED_GPU_COUNT}" -eq "${FORMAL_GPU_COUNT}"' in formal
     assert "assert_formal_registration" in formal
     assert "assert_full_preflight" in formal
+    assert "selected_checkpoint_eligible" in text
     assert 'if [[ "${arm}" != "full" ]]' in formal
     assert "--run-kind formal" in formal
+    assert "egostitch_e2e_v_select" in formal
     assert "REQUIRED-BEFORE-BINDING" in text

@@ -97,5 +97,8 @@ class GatedCrossAttention(nn.Module):
             key_padding_mask=key_padding_mask,
             need_weights=False,
         )
-        scale = active.to(cls.dtype).view(-1, 1, 1)
-        return cls + scale * torch.tanh(self.gate) * attn_out
+        with torch.autocast(device_type=cls.device.type, enabled=False):
+            cls32 = cls.float()
+            residual = torch.tanh(self.gate.float()) * attn_out.float()
+            updated = cls32 + residual
+            return torch.where(active.view(-1, 1, 1), updated, cls32)

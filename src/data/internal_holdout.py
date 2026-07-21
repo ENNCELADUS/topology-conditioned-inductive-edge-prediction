@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import itertools
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 
 import networkx as nx
@@ -247,7 +248,7 @@ def _cross_partition_counts(
     return counts
 
 
-def _pairwise_overlap_counts(parts: dict[str, frozenset[object]]) -> dict[str, int]:
+def _pairwise_overlap_counts(parts: Mapping[str, AbstractSet[object]]) -> dict[str, int]:
     names = tuple(sorted(parts))
     return {
         f"{left}__{right}": len(parts[left] & parts[right])
