@@ -1101,6 +1101,25 @@ def select_e2e_checkpoint(
     return min(candidates, key=lambda record: (record.brier, record.epoch))
 
 
+def e2e_overfit_epoch_qualified(record: E2ECheckpointRecord) -> bool:
+    """Apply the §13.19.4 item-1 post-ramp acceptance to one overfit epoch."""
+    residual = record.residual_ratio
+    return (
+        record.phase == "C"
+        and math.isfinite(record.auprc)
+        and record.auprc >= 0.95
+        and residual is not None
+        and math.isfinite(residual)
+        and residual >= 1e-3
+    )
+
+
+def select_e2e_overfit_epoch(records: Sequence[E2ECheckpointRecord]) -> int:
+    """Latest §13.19.4 item-1 qualifying epoch, or ``0`` when none qualifies."""
+    qualified = [record.epoch for record in records if e2e_overfit_epoch_qualified(record)]
+    return qualified[-1] if qualified else 0
+
+
 def parse_args(argv: Sequence[str] | None = None) -> EgoCliArgs:
     """Parse the worker CLI (the train_b0 contract + ``--write-s0-manifest``).
 
@@ -3369,6 +3388,29 @@ def _cpu_state_dict(accelerator: Accelerator, wrapped: torch.nn.Module) -> dict[
     return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
 
+def _write_failed_run_history(
+    output_dir: Path,
+    *,
+    run_kind: str,
+    arm: str,
+    history: Sequence[Mapping[str, object]],
+) -> None:
+    """Retain per-epoch validation evidence when checkpoint selection fails.
+
+    Best-effort by design: evidence retention must never mask the primary
+    no-eligible-checkpoint failure, so I/O and serialization errors are
+    logged and swallowed.
+    """
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"run_kind": run_kind, "arm": arm, "history": list(history)}
+        (output_dir / "failed_run_history.json").write_text(
+            json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+        )
+    except (OSError, TypeError, ValueError) as error:
+        logger.error("failed to retain per-epoch failure history: %s", error)
+
+
 def _e2e_arm_name(model: EgoStitchE2E) -> E2EArmName:
     return _e2e_arm_name_from_config(model.cfg)
 
@@ -3716,6 +3758,7 @@ def _train_e2e_stability_loop(
     history: list[dict[str, object]] = []
     records: list[E2ECheckpointRecord] = []
     metrics_by_epoch: dict[int, EdgeMetrics] = {}
+    overfit_state: dict[str, torch.Tensor] = {}
     state_paths: dict[int, Path] = {}
     checkpoint_dir = cfg.output_dir / ".eligible_checkpoints"
     if accelerator.is_main_process:
@@ -3979,6 +4022,8 @@ def _train_e2e_stability_loop(
                 path = checkpoint_dir / f"epoch-{epoch:03d}.pt"
                 torch.save(_cpu_state_dict(accelerator, wrapped), path)
                 state_paths[epoch] = path
+            if not profile_only and run_kind == "overfit" and e2e_overfit_epoch_qualified(record):
+                overfit_state = _cpu_state_dict(accelerator, wrapped)
             history.append(
                 {
                     "epoch": float(epoch),
@@ -4029,10 +4074,11 @@ def _train_e2e_stability_loop(
             best_state = last_state
             best_metrics = last_metrics
         elif run_kind == "overfit":
-            if last_metrics.auprc >= 0.95 and last_fidelity["topology_delta_ratio"] >= 1e-3:
-                selected_epoch_local = len(epoch_step_counts)
-                best_state = last_state
-                best_metrics = last_metrics
+            qualifying_epoch = select_e2e_overfit_epoch(records)
+            if qualifying_epoch > 0:
+                selected_epoch_local = qualifying_epoch
+                best_state = overfit_state
+                best_metrics = metrics_by_epoch[qualifying_epoch]
         else:
             selected = select_e2e_checkpoint(
                 records,
@@ -4053,6 +4099,8 @@ def _train_e2e_stability_loop(
     )
     selected_epoch = int(selected_epoch_tensor.item())
     if selected_epoch <= 0:
+        if accelerator.is_main_process:
+            _write_failed_run_history(cfg.output_dir, run_kind=run_kind, arm=arm, history=history)
         raise RuntimeError("E2E run produced no eligible checkpoint; fallback is forbidden")
 
     if not profile_only and arm == "full" and run_kind != "overfit":

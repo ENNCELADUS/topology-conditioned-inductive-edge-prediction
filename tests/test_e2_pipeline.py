@@ -903,6 +903,54 @@ class TestRunPipelineSuccess:
         assert (output_dir / "best.pt").read_text() == "stale"
         assert (output_dir / "complete.json").read_text() == "stale"
 
+    def test_failed_train_rescues_worker_history_evidence(self, tmp_path: Path) -> None:
+        """A worker-side failed_run_history.json survives staging-dir teardown."""
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        base_runner = _make_fake_runner()
+
+        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            command_list = list(command)
+            if _arg_value(command_list, "--ddp-mode") == "train":
+                staging = Path(_arg_value(command_list, "--output-dir"))
+                (staging / "failed_run_history.json").write_text('{"history": []}')
+                return subprocess.CompletedProcess(command_list, 1, "", "no eligible checkpoint")
+            return base_runner(command, timeout)
+
+        assert run_pipeline(args, command_runner=runner) == 2
+        assert json.loads((output_dir / "failure.json").read_text())["stage"] == "train"
+        assert json.loads((output_dir / "failed_run_history.json").read_text()) == {"history": []}
+
+    def test_failed_rerun_without_new_history_removes_stale_history(self, tmp_path: Path) -> None:
+        """A pre-train failure must not leave a prior run's history as evidence."""
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        output_dir.mkdir()
+        (output_dir / "failed_run_history.json").write_text('{"history": ["stale"]}')
+
+        assert run_pipeline(args, command_runner=_make_fake_runner(fail_mode="probe")) == 2
+        assert json.loads((output_dir / "failure.json").read_text())["stage"] == "probe"
+        assert not (output_dir / "failed_run_history.json").exists()
+
+    def test_successful_rerun_removes_stale_history_evidence(self, tmp_path: Path) -> None:
+        data_root = tmp_path / "data"
+        _write_feature_root(
+            data_root / "features" / "frozen_node_features_1024", {"node_a": (3, 4)}
+        )
+        pack_dir = tmp_path / "pack"
+        output_dir = tmp_path / "out"
+        output_dir.mkdir()
+        (output_dir / "failed_run_history.json").write_text('{"history": []}')
+        config_path = tmp_path / "cfg.yaml"
+        _write_pipeline_config(
+            config_path,
+            _pipeline_config_dict(data_root=data_root, pack_dir=pack_dir, output_dir=output_dir),
+        )
+
+        assert (
+            run_pipeline(PipelineArgs(config_path, None, None), command_runner=_make_fake_runner())
+            == 0
+        )
+        assert not (output_dir / "failed_run_history.json").exists()
+
     def test_successful_rerun_removes_stale_failure_marker(self, tmp_path: Path) -> None:
         data_root = tmp_path / "data"
         _write_feature_root(

@@ -872,6 +872,14 @@ def run_pipeline(
         if staged_profile.is_file():
             with suppress(OSError):
                 os.replace(staged_profile, output_dir / "failed_run_profile.json")
+        staged_history = staging_dir / "failed_run_history.json"
+        if staged_history.is_file():
+            with suppress(OSError):
+                os.replace(staged_history, output_dir / "failed_run_history.json")
+        else:
+            # A failure before training produces no history; a prior run's
+            # retained history must not masquerade as this failure's evidence.
+            (output_dir / "failed_run_history.json").unlink(missing_ok=True)
         write_failure(output_dir, stage=stage, message=message, extra=extra)
         shutil.rmtree(staging_dir, ignore_errors=True)
         return 2
@@ -1303,6 +1311,7 @@ def run_pipeline(
         return fail(stage="publication", message=f"canonical publication failed: {error}")
     (output_dir / "failure.json").unlink(missing_ok=True)
     (output_dir / "failed_run_profile.json").unlink(missing_ok=True)
+    (output_dir / "failed_run_history.json").unlink(missing_ok=True)
     total_elapsed = time.monotonic() - pipeline_started
     if total_elapsed > runtime.total_budget_seconds:
         _rollback_publication(output_dir, backup_dir, published)

@@ -1004,3 +1004,119 @@ class TestPrepareAndAssembleE2E:
         for key in ("emb_a", "emb_b", "len_a", "len_b", "ground_id_i", "ground_id_j"):
             assert key in batch.edge
         assert "s0" not in batch.edge
+
+
+class TestOverfitAcceptance:
+    """§13.19.4 item-1 post-ramp overfit acceptance (spec change-log 2026-07-22)."""
+
+    # The retained passing attempt-005 V_fit trajectory (metrics.jsonl,
+    # 2026-07-21): AUPRC saturates at 1.0 from epoch 7; Phase-C residual
+    # ratios oscillate around the 1e-3 floor.
+    _RETAINED = (
+        (1, "A", 0.348471, 0.0),
+        (2, "A", 0.559022, 0.0),
+        (3, "A", 0.720202, 0.0),
+        (4, "A", 0.908526, 0.0),
+        (5, "A", 0.990429, 0.0),
+        (6, "B", 0.999725, 0.000520600),
+        (7, "B", 1.0, 0.000901622),
+        (8, "B", 1.0, 0.000668134),
+        (9, "C", 1.0, 0.001495493),
+        (10, "C", 1.0, 0.001216008),
+        (11, "C", 1.0, 0.001083565),
+        (12, "C", 1.0, 0.001181883),
+        (13, "C", 1.0, 0.000997061),
+        (14, "C", 1.0, 0.001157461),
+        (15, "C", 1.0, 0.000979123),
+        (16, "C", 1.0, 0.001140527),
+        (17, "C", 1.0, 0.001179883),
+        (18, "C", 1.0, 0.001072686),
+        (19, "C", 1.0, 0.000954866),
+        (20, "C", 1.0, 0.001165148),
+        (21, "C", 1.0, 0.001060615),
+        (22, "C", 1.0, 0.000946267),
+        (23, "C", 1.0, 0.001054033),
+        (24, "C", 1.0, 0.001412919),
+        (25, "C", 1.0, 0.001370386),
+        (26, "C", 1.0, 0.001328335),
+        (27, "C", 1.0, 0.001241188),
+        (28, "C", 1.0, 0.001282460),
+        (29, "C", 1.0, 0.000992638),
+        (30, "C", 1.0, 0.001278644),
+    )
+
+    @staticmethod
+    def _record(
+        epoch: int, phase: te.E2EPhaseName, auprc: float, residual: float | None
+    ) -> te.E2ECheckpointRecord:
+        return te.E2ECheckpointRecord(
+            epoch=epoch,
+            phase=phase,
+            full_joint_epochs_completed=max(0, epoch - 9),
+            guards_passed=True,
+            auprc=auprc,
+            prevalence=1.0 / 6.0,
+            active_logit_std=1.0,
+            clustering_mmd=0.0,
+            brier=0.0,
+            residual_ratio=residual,
+        )
+
+    def _retained_records(self) -> list[te.E2ECheckpointRecord]:
+        return [
+            self._record(epoch, cast(te.E2EPhaseName, phase), auprc, residual)
+            for epoch, phase, auprc, residual in self._RETAINED
+        ]
+
+    def test_pre_ramp_epochs_never_qualify(self) -> None:
+        assert not te.e2e_overfit_epoch_qualified(self._record(5, "A", 1.0, 0.01))
+        assert not te.e2e_overfit_epoch_qualified(self._record(7, "B", 1.0, 0.01))
+
+    def test_phase_c_requires_both_registered_inequalities(self) -> None:
+        assert te.e2e_overfit_epoch_qualified(self._record(9, "C", 0.95, 1e-3))
+        assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", 0.949, 1e-3))
+        assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", 1.0, 0.000999))
+        assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", 1.0, None))
+        assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", float("nan"), 1e-3))
+        assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", 1.0, float("nan")))
+
+    def test_retained_passing_trajectory_selects_the_same_final_epoch(self) -> None:
+        """The run that passed the old final-epoch rule selects the identical epoch."""
+        assert te.select_e2e_overfit_epoch(self._retained_records()) == 30
+
+    def test_knife_edge_final_epoch_no_longer_invalidates_the_run(self) -> None:
+        """A benign trajectory shift ending below the floor keeps a qualifying epoch.
+
+        This is the exact attempt-005 failure mode: swapping the last two
+        retained epochs puts the final residual (0.000992638) under 1e-3, which
+        the old final-epoch-only rule rejected outright.
+        """
+        records = self._retained_records()
+        records[-2], records[-1] = (
+            self._record(29, "C", 1.0, 0.001278644),
+            self._record(30, "C", 1.0, 0.000992638),
+        )
+        assert te.select_e2e_overfit_epoch(records) == 29
+
+    def test_no_qualifying_epoch_returns_zero(self) -> None:
+        records = [self._record(epoch, "C", 1.0, 5e-4) for epoch in range(9, 31)]
+        assert te.select_e2e_overfit_epoch(records) == 0
+        assert te.select_e2e_overfit_epoch([]) == 0
+
+    def test_failed_selection_history_is_retained(self, tmp_path: Path) -> None:
+        history: list[dict[str, object]] = [
+            {"epoch": 1.0, "auprc": 0.5, "fidelity": {"topology_delta_ratio": 0.0}}
+        ]
+        te._write_failed_run_history(
+            tmp_path / "out", run_kind="overfit", arm="full", history=history
+        )
+        payload = json.loads((tmp_path / "out" / "failed_run_history.json").read_text())
+        assert payload["run_kind"] == "overfit"
+        assert payload["arm"] == "full"
+        assert payload["history"] == history
+
+    def test_failed_selection_history_write_never_masks_the_failure(self, tmp_path: Path) -> None:
+        blocked = tmp_path / "blocked"
+        blocked.write_text("a file where the output directory should be")
+        te._write_failed_run_history(blocked, run_kind="overfit", arm="full", history=[])
+        assert blocked.is_file()

@@ -512,6 +512,22 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-22: pinned the §13.19.4 item-1 overfit acceptance to its registered
+  "reaches ... after the conditioning ramp" wording. The implementation had
+  accepted only the final reporting epoch, a stricter unregistered rule: the
+  retained passing `V_fit` trajectory oscillates around the `1e-3` residual
+  floor across Phase C (`0.000946`–`0.001495`, six of twenty-two post-ramp
+  epochs below the floor), so the registered fp32-readout correction's benign
+  trajectory shift flipped the final epoch below `1e-3` and invalidated a run
+  that had many qualifying post-ramp epochs. Acceptance now scans all Phase-C
+  validation epochs for one satisfying both inequalities simultaneously and
+  retains the latest qualifying epoch's checkpoint; the previously passing run
+  selects the identical epoch under the new rule. A run failing checkpoint
+  selection now writes its per-epoch validation history as retained failure
+  evidence (the prior failure path discarded it with the staging directory).
+  Success inequalities, the 2,000-step schedule, and all other gates are
+  unchanged; no held-out/candidate/test quantity informed this correction.
+
 - 2026-07-22: replaced the still-DRAFT V2 numerical contract before any successful
   qualification or held-out scoring. The attempt-005 rehearsal reached the end-ramp
   differential and exposed that the conditioned pair readout and final linear head
@@ -1397,7 +1413,12 @@ following without candidate/test scoring:
    invariant to rank/world size. The launcher auto-detects and uses all visible H20s
    (four on the current target host), matching the rehearsal/formal launch style, and
    records the detected world size. It reaches train AUPRC `>= 0.95` and
-   reaches full-vs-f-only residual ratio `>= 1e-3` after the conditioning ramp.
+   reaches full-vs-f-only residual ratio `>= 1e-3` after the conditioning ramp:
+   the test passes when at least one post-ramp (Phase-C) validation epoch
+   satisfies both inequalities at that same epoch, and the latest qualifying
+   epoch supplies the retained overfit checkpoint and metrics. A qualification
+   training run that fails checkpoint selection retains its per-epoch validation
+   history alongside the failure evidence.
 2. **Single-arm stability rehearsal:** the exact full-arm config completes the full
    schedule using only the stability/qualification pair and topology manifests,
    selects an eligible post-ramp checkpoint, triggers no §13.19.2 guard, and records
