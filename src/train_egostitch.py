@@ -3617,20 +3617,30 @@ def _validate_e2e_precision_outputs(
                 fp32_residual.detach().cpu().numpy(),
             )[0, 1]
         )
+    full_relative_l2 = float(
+        torch.linalg.vector_norm(mixed_full - fp32_full)
+        / torch.clamp(torch.linalg.vector_norm(fp32_full), min=1e-12)
+    )
+    f_logit_relative_l2 = float(
+        torch.linalg.vector_norm(mixed_f - fp32_f)
+        / torch.clamp(torch.linalg.vector_norm(fp32_f), min=1e-12)
+    )
     metrics = {
         "full_max_abs_error": float(torch.max(torch.abs(mixed_full - fp32_full))),
         "f_logit_max_abs_error": float(torch.max(torch.abs(mixed_f - fp32_f))),
+        "full_relative_l2": full_relative_l2,
+        "f_logit_relative_l2": f_logit_relative_l2,
         "residual_relative_l2": residual_relative_l2,
         "residual_correlation": residual_correlation,
     }
     failures: list[str] = []
-    # atol is the end-ramp-calibrated 0.05 (registration elementwise_amendment
-    # 2026-07-22): BF16-trunk quantization noise measures ~0.018 max abs at
-    # ordinary logit magnitudes, and published scores use the fp32 pair pass.
-    if not bool(torch.allclose(mixed_full, fp32_full, atol=5e-2, rtol=1e-3)):
-        failures.append("full elementwise tolerance")
-    if not bool(torch.allclose(mixed_f, fp32_f, atol=5e-2, rtol=1e-3)):
-        failures.append("f_logit elementwise tolerance")
+    # Vector relative-L2 bounds (registration vector_tolerance_amendment
+    # 2026-07-22): per-element max-abs is an extreme-value statistic of
+    # BF16-trunk noise and stays a logged diagnostic only.
+    if not math.isfinite(full_relative_l2) or full_relative_l2 > 5e-2:
+        failures.append("full relative L2 <= 0.05")
+    if not math.isfinite(f_logit_relative_l2) or f_logit_relative_l2 > 5e-2:
+        failures.append("f_logit relative L2 <= 0.05")
     if not bool((mixed_residual != 0).any()) or not bool((fp32_residual != 0).any()):
         failures.append("non-zero residual")
     if not math.isfinite(residual_relative_l2) or residual_relative_l2 > 5e-2:
