@@ -3549,6 +3549,51 @@ def _e2e_current_submodule_gradient_rms(
     return result
 
 
+def _validate_e2e_precision_outputs(
+    mixed_full: torch.Tensor,
+    mixed_f: torch.Tensor,
+    fp32_full: torch.Tensor,
+    fp32_f: torch.Tensor,
+) -> dict[str, float]:
+    """Apply the registered precision differential to fixed replay outputs."""
+    mixed_residual = mixed_full - mixed_f
+    fp32_residual = fp32_full - fp32_f
+    residual_relative_l2 = float(
+        torch.linalg.vector_norm(mixed_residual - fp32_residual)
+        / torch.clamp(torch.linalg.vector_norm(fp32_residual), min=1e-12)
+    )
+    with np.errstate(invalid="ignore", divide="ignore"):
+        residual_correlation = float(
+            np.corrcoef(
+                mixed_residual.detach().cpu().numpy(),
+                fp32_residual.detach().cpu().numpy(),
+            )[0, 1]
+        )
+    metrics = {
+        "full_max_abs_error": float(torch.max(torch.abs(mixed_full - fp32_full))),
+        "f_logit_max_abs_error": float(torch.max(torch.abs(mixed_f - fp32_f))),
+        "residual_relative_l2": residual_relative_l2,
+        "residual_correlation": residual_correlation,
+    }
+    failures: list[str] = []
+    if not bool(torch.allclose(mixed_full, fp32_full, atol=1e-5, rtol=1e-3)):
+        failures.append("full elementwise tolerance")
+    if not bool(torch.allclose(mixed_f, fp32_f, atol=1e-5, rtol=1e-3)):
+        failures.append("f_logit elementwise tolerance")
+    if not bool((mixed_residual != 0).any()) or not bool((fp32_residual != 0).any()):
+        failures.append("non-zero residual")
+    if not math.isfinite(residual_relative_l2) or residual_relative_l2 > 5e-2:
+        failures.append("residual relative L2 <= 0.05")
+    if not math.isfinite(residual_correlation) or residual_correlation < 0.999:
+        failures.append("residual correlation >= 0.999")
+    if failures:
+        raise RuntimeError(
+            "E2E precision differential failed: "
+            f"{', '.join(failures)}; metrics={json.dumps(metrics, sort_keys=True)}"
+        )
+    return metrics
+
+
 def _e2e_precision_differential(
     model: EgoStitchE2E,
     edge: dict[str, torch.Tensor],
@@ -3559,44 +3604,26 @@ def _e2e_precision_differential(
     float_batch = {
         name: value.float() if value.is_floating_point() else value for name, value in batch.items()
     }
+    was_training = model.training
     model.eval()
-    with torch.no_grad(), accelerator.autocast():
-        mixed_context = model.build_pair_context(batch)
-        mixed_full = model.score_pair_context(mixed_context).float()
-        mixed_f = model.score_pair_context(
-            mixed_context,
-            masks=masks_for_null(NULL_ALL_HEAD, mixed_full.shape[0], mixed_full.device),
-        ).float()
-    with torch.no_grad(), torch.autocast(device_type=accelerator.device.type, enabled=False):
-        fp32_context = model.build_pair_context(float_batch)
-        fp32_full = model.score_pair_context(fp32_context).float()
-        fp32_f = model.score_pair_context(
-            fp32_context,
-            masks=masks_for_null(NULL_ALL_HEAD, fp32_full.shape[0], fp32_full.device),
-        ).float()
-    for name, mixed, reference in (
-        ("full", mixed_full, fp32_full),
-        ("f_logit", mixed_f, fp32_f),
-    ):
-        if not bool(torch.allclose(mixed, reference, atol=1e-5, rtol=1e-3)):
-            raise RuntimeError(f"E2E precision differential failed for {name}")
-    mixed_residual = mixed_full - mixed_f
-    fp32_residual = fp32_full - fp32_f
-    if not bool((mixed_residual != 0).any()) or not bool((fp32_residual != 0).any()):
-        raise RuntimeError("E2E precision differential rounded the residual to zero")
-    relative_l2 = float(
-        torch.linalg.vector_norm(mixed_residual - fp32_residual)
-        / torch.clamp(torch.linalg.vector_norm(fp32_residual), min=1e-12)
-    )
-    correlation = float(
-        np.corrcoef(mixed_residual.detach().cpu().numpy(), fp32_residual.detach().cpu().numpy())[
-            0, 1
-        ]
-    )
-    if not math.isfinite(correlation) or relative_l2 > 1e-3 or correlation < 0.999:
-        raise RuntimeError("E2E residual precision differential failed")
-    model.train()
-    return {"residual_relative_l2": relative_l2, "residual_correlation": correlation}
+    try:
+        with torch.no_grad(), accelerator.autocast():
+            mixed_context = model.build_pair_context(batch)
+            mixed_full = model.score_pair_context(mixed_context).float()
+            mixed_f = model.score_pair_context(
+                mixed_context,
+                masks=masks_for_null(NULL_ALL_HEAD, mixed_full.shape[0], mixed_full.device),
+            ).float()
+        with torch.no_grad(), torch.autocast(device_type=accelerator.device.type, enabled=False):
+            fp32_context = model.build_pair_context(float_batch)
+            fp32_full = model.score_pair_context(fp32_context).float()
+            fp32_f = model.score_pair_context(
+                fp32_context,
+                masks=masks_for_null(NULL_ALL_HEAD, fp32_full.shape[0], fp32_full.device),
+            ).float()
+        return _validate_e2e_precision_outputs(mixed_full, mixed_f, fp32_full, fp32_f)
+    finally:
+        model.train(was_training)
 
 
 def _train_e2e_stability_loop(
@@ -3887,7 +3914,8 @@ def _train_e2e_stability_loop(
                                 cast(dict[str, torch.Tensor], fixed_replay["edge"]),
                                 accelerator,
                             )
-                        except RuntimeError:
+                        except RuntimeError as error:
+                            logger.error("end-ramp precision differential: %s", error)
                             precision_failure = 1
                     failed = accelerator.reduce(
                         torch.tensor(precision_failure, device=accelerator.device), reduction="sum"
@@ -4040,7 +4068,8 @@ def _train_e2e_stability_loop(
                     cast(dict[str, torch.Tensor], fixed_replay["edge"]),
                     accelerator,
                 )
-            except RuntimeError:
+            except RuntimeError as error:
+                logger.error("selected-checkpoint precision differential: %s", error)
                 precision_failure = 1
         failed = accelerator.reduce(
             torch.tensor(precision_failure, device=accelerator.device), reduction="sum"

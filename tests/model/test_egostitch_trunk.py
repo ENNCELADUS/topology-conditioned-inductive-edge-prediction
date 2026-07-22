@@ -67,6 +67,33 @@ def test_open_gate_conditions_output() -> None:
     assert not torch.allclose(out_on, out_off)
 
 
+def test_conditioned_pair_readout_is_fp32_under_bf16_autocast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cond = ConditionedPairCrossAttention(n_inj=1, xattn_heads=4, **_KW).eval()
+    h_a, h_b, la, lb = _inputs()
+    observed: list[tuple[torch.dtype, torch.dtype, torch.dtype, torch.dtype]] = []
+    original_forward = cond.pair_context_readout.forward
+
+    def capture_readout(
+        readout_a: torch.Tensor,
+        readout_b: torch.Tensor,
+        cls_vec: torch.Tensor,
+        mask_a: torch.Tensor,
+        mask_b: torch.Tensor,
+    ) -> torch.Tensor:
+        output = original_forward(readout_a, readout_b, cls_vec, mask_a, mask_b)
+        observed.append((readout_a.dtype, readout_b.dtype, cls_vec.dtype, output.dtype))
+        return output
+
+    monkeypatch.setattr(cond.pair_context_readout, "forward", capture_readout)
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        output = cond(h_a, h_b, la, lb)
+
+    assert observed == [(torch.float32, torch.float32, torch.float32, torch.float32)]
+    assert output.dtype == torch.float32
+
+
 def test_malformed_inputs_raise_valueerror_like_parent() -> None:
     torch.manual_seed(1)
     cond = ConditionedPairCrossAttention(n_inj=1, xattn_heads=4, **_KW).eval()

@@ -360,7 +360,11 @@ class EgoStitchE2E(nn.Module):
             cont_active=masks.cont if need_cont else None,
         )
         feat = torch.max(torch.stack([feat_ab, feat_ba], dim=-1), dim=-1).values
-        logits: torch.Tensor = self.head(feat).squeeze(-1)
+        # The registered mixed-precision contract keeps logits in fp32. Casting
+        # after the head is too late: autocast has already quantized the linear
+        # outputs, which can destroy the small full-minus-f-only residual.
+        with torch.autocast(device_type=feat.device.type, enabled=False):
+            logits: torch.Tensor = self.head(feat.float()).squeeze(-1)
         return logits
 
     def forward(

@@ -312,6 +312,27 @@ def test_bf16_autocast_combines_self_and_sinkhorn_plans_in_fp32() -> None:
     assert torch.equal(context.plan[is_self], expected_identity.expand(2, -1, -1))
 
 
+def test_bf16_autocast_returns_registered_fp32_readout_and_logits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The registered BF16 path keeps the pair readout and logits in fp32."""
+    model, batch = _tiny_model_and_batch()
+    head_input_dtypes: list[torch.dtype] = []
+    original_forward = model.head.forward
+
+    def capture_head_input(feat: torch.Tensor) -> torch.Tensor:
+        head_input_dtypes.append(feat.dtype)
+        return original_forward(feat)
+
+    monkeypatch.setattr(model.head, "forward", capture_head_input)
+
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        output = model(batch)["logits"]
+
+    assert head_input_dtypes == [torch.float32]
+    assert output.dtype == torch.float32
+
+
 def test_membership_is_content_only_and_content_null_ablates_it() -> None:
     model, batch = _tiny_model_and_batch()
     with torch.no_grad():

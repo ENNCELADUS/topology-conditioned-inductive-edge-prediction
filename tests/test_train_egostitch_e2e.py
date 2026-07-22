@@ -349,6 +349,28 @@ class TestE2ECompositeStep:
         total_abs_grad = float(topo_gate.gate.grad.abs()) + float(cont_gate.gate.grad.abs())
         assert total_abs_grad > 0.0
 
+    def test_registered_precision_differential_thresholds(self) -> None:
+        fp32_f = torch.full((3,), 100.0)
+        fp32_residual = torch.tensor([0.1, 0.2, 0.3])
+        fp32_full = fp32_f + fp32_residual
+
+        metrics = te._validate_e2e_precision_outputs(
+            fp32_f + fp32_residual * 1.04,
+            fp32_f,
+            fp32_full,
+            fp32_f,
+        )
+        assert metrics["residual_relative_l2"] == pytest.approx(0.04, abs=1e-4)
+        assert metrics["residual_correlation"] >= 0.999
+
+        with pytest.raises(RuntimeError, match=r"residual relative L2 <= 0.05.*metrics="):
+            te._validate_e2e_precision_outputs(
+                fp32_f + fp32_residual * 1.06,
+                fp32_f,
+                fp32_full,
+                fp32_f,
+            )
+
     def test_family_probe_requests_family_tensors_from_standard_payload(
         self, tmp_path: Path
     ) -> None:
