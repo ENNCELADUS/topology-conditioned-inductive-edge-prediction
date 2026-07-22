@@ -82,6 +82,13 @@ evidence but do not count against the replacement's at-most-three full-arm rehea
 allowance. Any fourth replacement rehearsal, change after its first pass, or
 post-binding change requires a new versioned registration.
 
+The first four-H20 acceptance probe of the corrected fp32 readout measured `96.6 GiB`
+peak memory and `285.04 s` for the production-prefix epoch because autograd retained
+that island's activations. Training therefore activation-checkpoints only the same
+fp32 readout and recomputes it during backward; evaluation remains direct. Exact
+output/gradient tests lock numerical equivalence, so this is an implementation-memory
+correction rather than a model, loss, optimizer, schedule, or guard change.
+
 ## Arms and frozen evaluation contract
 
 The scientific comparison remains unchanged:

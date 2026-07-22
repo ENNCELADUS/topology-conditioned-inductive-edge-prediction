@@ -525,6 +525,12 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   are unchanged. No held-out/candidate/test quantity informed this correction. All
   failed attempts remain retained as engineering evidence, and this replacement has
   its own at-most-three full-arm qualification allowance because no prior V2 passed.
+  The first four-H20 acceptance probe of the corrected island then measured
+  `96.6 GiB` peak memory and `285.04 s` for the production-prefix epoch because
+  autograd retained the fp32 readout activations. The training path therefore
+  activation-checkpoints only that same fp32 readout and recomputes it during
+  backward; evaluation remains direct. This changes neither forward values nor the
+  registered numerical checks and must pass exact output/gradient regression tests.
 
 - 2026-07-21: wired the registered V2 runtime `prefetch_factor=2` into the manual
   packed-token batch factory with one bounded deterministic producer thread per

@@ -1,12 +1,15 @@
 """Tests: conditioned trunk equals audited PairCrossAttention under bypass."""
 
-from typing import Any
+from collections.abc import Callable
+from copy import deepcopy
+from typing import Any, cast
 
 import pytest
 import torch
 from src.model.B0 import PairCrossAttention
 from src.model.egostitch.conditioning import GatedCrossAttention
 from src.model.egostitch.trunk import ConditionedPairCrossAttention
+from torch.utils import checkpoint as checkpoint_module
 
 _KW: dict[str, Any] = {
     "d_model": 32,
@@ -92,6 +95,69 @@ def test_conditioned_pair_readout_is_fp32_under_bf16_autocast(
 
     assert observed == [(torch.float32, torch.float32, torch.float32, torch.float32)]
     assert output.dtype == torch.float32
+
+
+def test_training_checkpoints_fp32_readout_without_changing_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    production_kw = dict(_KW)
+    production_kw["dropout"] = 0.1
+    checkpointed = ConditionedPairCrossAttention(n_inj=1, xattn_heads=4, **production_kw)
+    direct = deepcopy(checkpointed)
+    h_a, h_b, la, lb = _inputs()
+    checkpointed_a = h_a.detach().clone().requires_grad_(True)
+    checkpointed_b = h_b.detach().clone().requires_grad_(True)
+    direct_a = h_a.detach().clone().requires_grad_(True)
+    direct_b = h_b.detach().clone().requires_grad_(True)
+    checkpoint_calls = 0
+    original_checkpoint = checkpoint_module.checkpoint
+
+    def counted_checkpoint(
+        function: Callable[..., torch.Tensor],
+        *args: torch.Tensor,
+        use_reentrant: bool,
+    ) -> torch.Tensor:
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        return cast(
+            torch.Tensor,
+            original_checkpoint(function, *args, use_reentrant=use_reentrant),
+        )
+
+    monkeypatch.setattr(checkpoint_module, "checkpoint", counted_checkpoint)
+    torch.manual_seed(7)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        checkpointed_output = checkpointed(checkpointed_a, checkpointed_b, la, lb)
+    checkpointed_output.square().sum().backward()
+    assert checkpoint_calls == 1
+
+    def direct_call(
+        function: Callable[..., torch.Tensor],
+        *args: torch.Tensor,
+        use_reentrant: bool,
+    ) -> torch.Tensor:
+        del use_reentrant
+        return function(*args)
+
+    monkeypatch.setattr(checkpoint_module, "checkpoint", direct_call)
+    torch.manual_seed(7)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        direct_output = direct(direct_a, direct_b, la, lb)
+    direct_output.square().sum().backward()
+
+    assert torch.equal(checkpointed_output, direct_output)
+    assert checkpointed_a.grad is not None and direct_a.grad is not None
+    assert checkpointed_b.grad is not None and direct_b.grad is not None
+    assert torch.equal(checkpointed_a.grad, direct_a.grad)
+    assert torch.equal(checkpointed_b.grad, direct_b.grad)
+    for (checkpointed_name, checkpointed_parameter), (direct_name, direct_parameter) in zip(
+        checkpointed.named_parameters(), direct.named_parameters(), strict=True
+    ):
+        assert checkpointed_name == direct_name
+        if checkpointed_parameter.grad is None or direct_parameter.grad is None:
+            assert checkpointed_parameter.grad is None and direct_parameter.grad is None
+            continue
+        assert torch.equal(checkpointed_parameter.grad, direct_parameter.grad), checkpointed_name
 
 
 def test_malformed_inputs_raise_valueerror_like_parent() -> None:

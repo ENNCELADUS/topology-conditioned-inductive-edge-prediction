@@ -11,6 +11,7 @@ from typing import cast
 
 import torch
 from torch import nn
+from torch.utils import checkpoint as checkpoint_module
 
 from src.model.B0 import PairCrossAttention, _build_padding_mask
 from src.model.egostitch.conditioning import GatedCrossAttention
@@ -95,13 +96,31 @@ class ConditionedPairCrossAttention(PairCrossAttention):
             # Full and hard-null heads differ only through the conditioned cls
             # stream. Keep their final pair readout in fp32 so BF16 does not
             # quantize away that small, scientifically load-bearing residual.
-            with torch.autocast(device_type=cls_vec.device.type, enabled=False):
+            def fp32_readout(
+                readout_a: torch.Tensor,
+                readout_b: torch.Tensor,
+                readout_cls: torch.Tensor,
+            ) -> torch.Tensor:
+                with torch.autocast(device_type=readout_cls.device.type, enabled=False):
+                    return cast(
+                        torch.Tensor,
+                        self.pair_context_readout(
+                            readout_a.float(),
+                            readout_b.float(),
+                            readout_cls.float(),
+                            mask_a,
+                            mask_b,
+                        ),
+                    )
+
+            if self.training and torch.is_grad_enabled():
                 return cast(
                     torch.Tensor,
-                    self.pair_context_readout(
-                        h_a.float(), h_b.float(), cls_vec.float(), mask_a, mask_b
+                    checkpoint_module.checkpoint(
+                        fp32_readout, h_a, h_b, cls_vec, use_reentrant=False
                     ),
                 )
+            return fp32_readout(h_a, h_b, cls_vec)
         base_repr = self._rich_pooling_readout(h_a, h_b, cls_vec, mask_a, mask_b)
         if self.pair_readout_mode == "grid_sketch_fusion":
             return cast(

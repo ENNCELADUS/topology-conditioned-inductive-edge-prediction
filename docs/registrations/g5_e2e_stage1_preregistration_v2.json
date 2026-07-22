@@ -215,7 +215,8 @@
       "permitted_changes": [
         "execute the final conditioned pair readout and final linear logits head in fp32 islands",
         "replace the previously untested residual relative-L2 ceiling 0.001 with the V_fit-calibrated ceiling 0.05",
-        "emit complete differential metrics in failure logs and restore the caller's prior train/eval mode on both pass and failure"
+        "emit complete differential metrics in failure logs and restore the caller's prior train/eval mode on both pass and failure",
+        "activation-checkpoint only the same fp32 conditioned pair readout during gradient-enabled training after the first corrected four-H20 probe measured 96.6 GiB peak memory and 285.04 seconds; recompute during backward and keep evaluation direct, with exact output and gradient equivalence"
       ],
       "unchanged": "full/f_logit elementwise tolerances, residual correlation floor 0.999, non-zero residual rule, architecture, losses, optimizer, production schedule, data roles, sampler, other guards, checkpoint eligibility and selection, gates, and verdict rules",
       "attempt_reset": "earlier failed V2 attempts remain retained as engineering evidence; because no V2 passed, this replacement starts a new at-most-three full-arm rehearsal allowance",
