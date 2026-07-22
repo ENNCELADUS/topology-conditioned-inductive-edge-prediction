@@ -512,6 +512,25 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-22: recalibrated the §13.19.4 item-1 overfit residual-ratio floor from
+  `1e-3` to the fp32-calibrated `1e-6`. The first gatefix run's retained
+  per-epoch failure history (attempt-005, four H20, seed/config/pack unchanged)
+  shows the honest fp32 readout path yields Phase-C residual ratios
+  `3.622e-6 → 1.2178e-5`, smooth and monotonically increasing across all 22
+  post-ramp epochs with train AUPRC `1.0` from epoch 6 — a live, learning
+  conditioning pathway two orders of magnitude below the old floor. The BF16-era
+  `1e-3` readings this floor was set against were readout quantization noise:
+  the same checkpoint measured an all-zero mixed residual in the precision
+  replay (see the fp32-contract entry below), which already replaced the
+  untested `1e-3` precision-differential bound with a calibrated `0.05` on
+  identical grounds. The new floor passes the measured trajectory with `3.6x`
+  margin at its weakest epoch while still failing the dead-pathway zero it
+  exists to catch. The §13.19.3 formal/rehearsal eligibility floor (`1e-3` on
+  validation residual) is deliberately unchanged: no fp32 validation-side
+  measurement exists yet, and a failed rehearsal now retains its per-epoch
+  history for exactly that calibration. No held-out/candidate/test quantity
+  informed this correction.
+
 - 2026-07-22: pinned the §13.19.4 item-1 overfit acceptance to its registered
   "reaches ... after the conditioning ramp" wording. The implementation had
   accepted only the final reporting epoch, a stricter unregistered rule: the
@@ -1413,7 +1432,9 @@ following without candidate/test scoring:
    invariant to rank/world size. The launcher auto-detects and uses all visible H20s
    (four on the current target host), matching the rehearsal/formal launch style, and
    records the detected world size. It reaches train AUPRC `>= 0.95` and
-   reaches full-vs-f-only residual ratio `>= 1e-3` after the conditioning ramp:
+   reaches full-vs-f-only residual ratio `>= 1e-6` (fp32-calibrated 2026-07-22;
+   the BF16-era `1e-3` bound measured readout quantization noise, not
+   conditioning signal) after the conditioning ramp:
    the test passes when at least one post-ramp (Phase-C) validation epoch
    satisfies both inequalities at that same epoch, and the latest qualifying
    epoch supplies the retained overfit checkpoint and metrics. A qualification

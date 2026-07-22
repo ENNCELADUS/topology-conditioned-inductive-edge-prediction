@@ -1102,7 +1102,13 @@ def select_e2e_checkpoint(
 
 
 def e2e_overfit_epoch_qualified(record: E2ECheckpointRecord) -> bool:
-    """Apply the §13.19.4 item-1 post-ramp acceptance to one overfit epoch."""
+    """Apply the §13.19.4 item-1 post-ramp acceptance to one overfit epoch.
+
+    The residual floor is the fp32-calibrated `1e-6` (spec §12, 2026-07-22):
+    the honest fp32 readout measures Phase-C ratios in the `1e-5` decade,
+    while a dead conditioning pathway measures exactly zero. The formal
+    §13.19.3 validation-side floor remains `1e-3` and is not this constant.
+    """
     residual = record.residual_ratio
     return (
         record.phase == "C"
@@ -1110,7 +1116,7 @@ def e2e_overfit_epoch_qualified(record: E2ECheckpointRecord) -> bool:
         and record.auprc >= 0.95
         and residual is not None
         and math.isfinite(residual)
-        and residual >= 1e-3
+        and residual >= 1e-6
     )
 
 

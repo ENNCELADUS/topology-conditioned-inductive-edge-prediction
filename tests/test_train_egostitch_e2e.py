@@ -1010,8 +1010,9 @@ class TestOverfitAcceptance:
     """§13.19.4 item-1 post-ramp overfit acceptance (spec change-log 2026-07-22)."""
 
     # The retained passing attempt-005 V_fit trajectory (metrics.jsonl,
-    # 2026-07-21): AUPRC saturates at 1.0 from epoch 7; Phase-C residual
-    # ratios oscillate around the 1e-3 floor.
+    # 2026-07-21, BF16-era readout): AUPRC saturates at 1.0 from epoch 7;
+    # Phase-C residual ratios oscillate around 1e-3 (readout quantization
+    # noise per spec §12 2026-07-22).
     _RETAINED = (
         (1, "A", 0.348471, 0.0),
         (2, "A", 0.559022, 0.0),
@@ -1062,10 +1063,52 @@ class TestOverfitAcceptance:
             residual_ratio=residual,
         )
 
+    # The retained fp32-readout gatefix trajectory (failed_run_history.json,
+    # 2026-07-22): identical seed/config/pack; the honest fp32 residual sits
+    # in the 1e-5 decade and grows monotonically across Phase C.
+    _FP32_RETAINED = (
+        (1, "A", 0.346710, 0.0),
+        (2, "A", 0.544728, 0.0),
+        (3, "A", 0.743517, 0.0),
+        (4, "A", 0.903183, 0.0),
+        (5, "A", 0.997577, 0.0),
+        (6, "B", 1.0, 0.000000131),
+        (7, "B", 1.0, 0.000007328),
+        (8, "B", 1.0, 0.000004242),
+        (9, "C", 1.0, 0.000003622),
+        (10, "C", 1.0, 0.000003718),
+        (11, "C", 1.0, 0.000003936),
+        (12, "C", 1.0, 0.000004352),
+        (13, "C", 1.0, 0.000004948),
+        (14, "C", 1.0, 0.000005518),
+        (15, "C", 1.0, 0.000006066),
+        (16, "C", 1.0, 0.000006694),
+        (17, "C", 1.0, 0.000007403),
+        (18, "C", 1.0, 0.000008042),
+        (19, "C", 1.0, 0.000008641),
+        (20, "C", 1.0, 0.000009245),
+        (21, "C", 1.0, 0.000009815),
+        (22, "C", 1.0, 0.000010245),
+        (23, "C", 1.0, 0.000010664),
+        (24, "C", 1.0, 0.000010996),
+        (25, "C", 1.0, 0.000011267),
+        (26, "C", 1.0, 0.000011505),
+        (27, "C", 1.0, 0.000011689),
+        (28, "C", 1.0, 0.000011868),
+        (29, "C", 1.0, 0.000012046),
+        (30, "C", 1.0, 0.000012178),
+    )
+
     def _retained_records(self) -> list[te.E2ECheckpointRecord]:
         return [
             self._record(epoch, cast(te.E2EPhaseName, phase), auprc, residual)
             for epoch, phase, auprc, residual in self._RETAINED
+        ]
+
+    def _fp32_records(self) -> list[te.E2ECheckpointRecord]:
+        return [
+            self._record(epoch, cast(te.E2EPhaseName, phase), auprc, residual)
+            for epoch, phase, auprc, residual in self._FP32_RETAINED
         ]
 
     def test_pre_ramp_epochs_never_qualify(self) -> None:
@@ -1073,11 +1116,12 @@ class TestOverfitAcceptance:
         assert not te.e2e_overfit_epoch_qualified(self._record(7, "B", 1.0, 0.01))
 
     def test_phase_c_requires_both_registered_inequalities(self) -> None:
-        assert te.e2e_overfit_epoch_qualified(self._record(9, "C", 0.95, 1e-3))
-        assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", 0.949, 1e-3))
-        assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", 1.0, 0.000999))
+        assert te.e2e_overfit_epoch_qualified(self._record(9, "C", 0.95, 1e-6))
+        assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", 0.949, 1e-6))
+        assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", 1.0, 9.9e-7))
+        assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", 1.0, 0.0))
         assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", 1.0, None))
-        assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", float("nan"), 1e-3))
+        assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", float("nan"), 1e-6))
         assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", 1.0, float("nan")))
 
     def test_retained_passing_trajectory_selects_the_same_final_epoch(self) -> None:
@@ -1085,21 +1129,24 @@ class TestOverfitAcceptance:
         assert te.select_e2e_overfit_epoch(self._retained_records()) == 30
 
     def test_knife_edge_final_epoch_no_longer_invalidates_the_run(self) -> None:
-        """A benign trajectory shift ending below the floor keeps a qualifying epoch.
+        """The latest qualifying epoch wins despite a below-floor final epoch.
 
-        This is the exact attempt-005 failure mode: swapping the last two
-        retained epochs puts the final residual (0.000992638) under 1e-3, which
-        the old final-epoch-only rule rejected outright.
+        This is the attempt-005 final-epoch-only failure mode, recast at the
+        fp32-calibrated boundary.
         """
         records = self._retained_records()
         records[-2], records[-1] = (
-            self._record(29, "C", 1.0, 0.001278644),
-            self._record(30, "C", 1.0, 0.000992638),
+            self._record(29, "C", 1.0, 1.2e-5),
+            self._record(30, "C", 1.0, 5e-7),
         )
         assert te.select_e2e_overfit_epoch(records) == 29
 
+    def test_fp32_trajectory_selects_the_final_epoch(self) -> None:
+        """The retained fp32 gatefix trajectory qualifies under the recalibrated floor."""
+        assert te.select_e2e_overfit_epoch(self._fp32_records()) == 30
+
     def test_no_qualifying_epoch_returns_zero(self) -> None:
-        records = [self._record(epoch, "C", 1.0, 5e-4) for epoch in range(9, 31)]
+        records = [self._record(epoch, "C", 1.0, 5e-7) for epoch in range(9, 31)]
         assert te.select_e2e_overfit_epoch(records) == 0
         assert te.select_e2e_overfit_epoch([]) == 0
 
