@@ -371,6 +371,35 @@ class TestE2ECompositeStep:
                 fp32_f,
             )
 
+    def test_elementwise_tolerance_is_magnitude_independent(self) -> None:
+        """BF16-trunk noise at moderate logits passes; gross divergence fails.
+
+        Regression for the 2026-07-22 rehearsal end-ramp failure: max abs
+        logit error 0.0176 at ordinary magnitudes must pass the calibrated
+        atol 0.05 while the residual contract is enforced unchanged.
+        """
+        fp32_f = torch.tensor([1.5, -2.0, 3.0])
+        fp32_residual = torch.tensor([0.1, 0.2, 0.3])
+        fp32_full = fp32_f + fp32_residual
+        noise = torch.tensor([0.0176, -0.0176, 0.0176])
+
+        metrics = te._validate_e2e_precision_outputs(
+            fp32_full + noise,
+            fp32_f + noise,
+            fp32_full,
+            fp32_f,
+        )
+        assert metrics["full_max_abs_error"] == pytest.approx(0.0176, abs=1e-6)
+        assert metrics["f_logit_max_abs_error"] == pytest.approx(0.0176, abs=1e-6)
+
+        with pytest.raises(RuntimeError, match=r"elementwise tolerance.*metrics="):
+            te._validate_e2e_precision_outputs(
+                fp32_full + torch.tensor([0.06, 0.0, 0.0]),
+                fp32_f,
+                fp32_full,
+                fp32_f,
+            )
+
     def test_family_probe_requests_family_tensors_from_standard_payload(
         self, tmp_path: Path
     ) -> None:

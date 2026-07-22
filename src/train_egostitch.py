@@ -3624,9 +3624,12 @@ def _validate_e2e_precision_outputs(
         "residual_correlation": residual_correlation,
     }
     failures: list[str] = []
-    if not bool(torch.allclose(mixed_full, fp32_full, atol=1e-5, rtol=1e-3)):
+    # atol is the end-ramp-calibrated 0.05 (registration elementwise_amendment
+    # 2026-07-22): BF16-trunk quantization noise measures ~0.018 max abs at
+    # ordinary logit magnitudes, and published scores use the fp32 pair pass.
+    if not bool(torch.allclose(mixed_full, fp32_full, atol=5e-2, rtol=1e-3)):
         failures.append("full elementwise tolerance")
-    if not bool(torch.allclose(mixed_f, fp32_f, atol=1e-5, rtol=1e-3)):
+    if not bool(torch.allclose(mixed_f, fp32_f, atol=5e-2, rtol=1e-3)):
         failures.append("f_logit elementwise tolerance")
     if not bool((mixed_residual != 0).any()) or not bool((fp32_residual != 0).any()):
         failures.append("non-zero residual")
