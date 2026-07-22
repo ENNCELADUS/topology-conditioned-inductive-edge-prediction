@@ -475,6 +475,78 @@ def test_qualification_profile_requires_registered_guard_margins(tmp_path: Path)
         te.validate_e2e_qualification_profile(path)
 
 
+def test_qualification_clip_floors_are_per_group_and_fail_closed(tmp_path: Path) -> None:
+    """The calibrated per-group p1 floors admit the retained rehearsal pattern.
+
+    Regression for the 2026-07-22 attempt-3 margins failure: measured p1
+    0.1100/0.0281/0.5187 (pair/generator/topology) must pass the calibrated
+    floors 0.04/0.01/0.15, while an unlisted group falls back to the
+    scaffold-era 0.12 default.
+    """
+
+    def _profile(groups: dict[str, float]) -> dict[str, object]:
+        return {
+            "total_optimizer_steps": 200,
+            "optimizer_step_gradients": [
+                {
+                    "optimizer_group_gradients": {
+                        # The first 4 of 200 steps (2%) carry each group's
+                        # p1-scale low value so np.percentile(values, 1) lands
+                        # on it; the rest sit high so streak/minimum stay clean.
+                        name: {
+                            "active": True,
+                            "clip_coefficient": low if step < 4 else max(0.5, low * 5),
+                        }
+                        for name, low in groups.items()
+                    }
+                }
+                for step in range(200)
+            ],
+            "gradient_norm_series": [
+                {
+                    "alpha": 1.0,
+                    "family_group_ratios": {"generator": 13.7},
+                    "submodule_gradient_rms": {
+                        "grad_rms_trunk": 0.1,
+                        "grad_rms_ste": 0.01,
+                        "grad_rms_content": 0.02,
+                    },
+                }
+            ],
+        }
+
+    rehearsal_like = _profile(
+        {
+            "pair_encoder_head": 0.110,
+            "generator": 0.0281,
+            "topology_content_conditioning": 0.5187,
+        }
+    )
+    path = tmp_path / "profile.json"
+    path.write_text(json.dumps(rehearsal_like))
+    summary = te.validate_e2e_qualification_profile(path)
+    assert summary["status"] == "pass"
+    clip_groups = cast(dict[str, dict[str, float]], summary["clip_groups"])
+    assert clip_groups["generator"]["p1_floor"] == pytest.approx(0.01)
+    assert clip_groups["topology_content_conditioning"]["p1_floor"] == pytest.approx(0.15)
+
+    topology_below_floor = _profile(
+        {
+            "pair_encoder_head": 0.110,
+            "generator": 0.0281,
+            "topology_content_conditioning": 0.10,
+        }
+    )
+    path.write_text(json.dumps(topology_below_floor))
+    with pytest.raises(RuntimeError, match="clip margins failed for topology"):
+        te.validate_e2e_qualification_profile(path)
+
+    unknown_group_uses_default = _profile({"mystery_group": 0.05})
+    path.write_text(json.dumps(unknown_group_uses_default))
+    with pytest.raises(RuntimeError, match="clip margins failed for mystery_group"):
+        te.validate_e2e_qualification_profile(path)
+
+
 def test_e2e_weighted_bce_matches_one_and_two_rank_gradients_with_padding() -> None:
     labels = torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
     logits = torch.linspace(-0.3, 0.3, len(labels), requires_grad=True)

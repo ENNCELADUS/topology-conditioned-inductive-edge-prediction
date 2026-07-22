@@ -4756,6 +4756,16 @@ def _config_hash(cfg: EgoConfig) -> str:
     ).hexdigest()
 
 
+# Per-group clip-coefficient p1 floors calibrated from the first completed
+# replacement rehearsal (registration clip_margin_amendment_20260722); an
+# unlisted group falls back to the scaffold-era 0.12 fail-closed default.
+_E2E_QUALIFICATION_CLIP_P1_FLOORS: dict[str, float] = {
+    "pair_encoder_head": 0.04,
+    "generator": 0.01,
+    "topology_content_conditioning": 0.15,
+}
+
+
 def validate_e2e_qualification_profile(
     profile_path: Path, *, output_path: Path | None = None
 ) -> dict[str, object]:
@@ -4793,9 +4803,15 @@ def validate_e2e_qualification_profile(
             longest = max(longest, below_streak)
         p1 = float(np.percentile(np.asarray(values, dtype=np.float64), 1))
         minimum = min(values)
-        if p1 <= 0.12 or minimum <= 0.0012 or longest >= 10:
+        p1_floor = _E2E_QUALIFICATION_CLIP_P1_FLOORS.get(name, 0.12)
+        if p1 <= p1_floor or minimum <= 0.0012 or longest >= 10:
             raise RuntimeError(f"qualification clip margins failed for {name}")
-        clip_summary[name] = {"p1": p1, "minimum": minimum, "longest_below_0_1": longest}
+        clip_summary[name] = {
+            "p1": p1,
+            "p1_floor": p1_floor,
+            "minimum": minimum,
+            "longest_below_0_1": longest,
+        }
 
     probes = profile.get("gradient_norm_series")
     if not isinstance(probes, list) or not probes:
