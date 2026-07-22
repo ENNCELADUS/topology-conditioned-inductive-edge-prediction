@@ -347,3 +347,62 @@ def test_formal_v2_loader_rejects_missing_or_contradictory_full_array(tmp_path: 
     np.savez_compressed(output, **common, full=values + 1)
     with pytest.raises(ValueError, match="contradicts primary logit"):
         score_universe.load_scores(output)
+
+
+class TestHeldoutPairSourceGuard:
+    """`_is_heldout_pair_source` must catch semantically equivalent aliases."""
+
+    @staticmethod
+    def _benchmark(tmp_path: Path) -> Path:
+        benchmark_dir = tmp_path / "data" / "benchmark_2025_neurips" / "breadth_first"
+        benchmark_dir.mkdir(parents=True)
+        (benchmark_dir / "candidate_test_edges.txt").write_text(
+            "a\tb\t1\nc\td\t0\ne\tf\t1\n", encoding="utf-8"
+        )
+        (benchmark_dir / "test_edges.txt").write_text("g\th\t1\ni\tj\t0\n", encoding="utf-8")
+        return tmp_path / "data"
+
+    def _check(self, tmp_path: Path, supplied: Path) -> bool:
+        return score_universe._is_heldout_pair_source(
+            f"file:{supplied}", self._benchmark(tmp_path), "breadth_first"
+        )
+
+    def test_named_sources_are_heldout(self, tmp_path: Path) -> None:
+        data_root = self._benchmark(tmp_path)
+        for name in ("candidate", "test"):
+            assert score_universe._is_heldout_pair_source(name, data_root, "breadth_first")
+
+    def test_exact_copy_is_heldout(self, tmp_path: Path) -> None:
+        supplied = tmp_path / "copy.txt"
+        supplied.write_text("a\tb\t1\nc\td\t0\ne\tf\t1\n", encoding="utf-8")
+        assert self._check(tmp_path, supplied)
+
+    def test_reordered_copy_is_heldout(self, tmp_path: Path) -> None:
+        supplied = tmp_path / "reordered.txt"
+        supplied.write_text("e\tf\t1\na\tb\t1\nc\td\t0\n", encoding="utf-8")
+        assert self._check(tmp_path, supplied)
+
+    def test_label_stripped_copy_is_heldout(self, tmp_path: Path) -> None:
+        supplied = tmp_path / "unlabeled.txt"
+        supplied.write_text("a\tb\nc\td\ne\tf\n", encoding="utf-8")
+        assert self._check(tmp_path, supplied)
+
+    def test_endpoint_swapped_copy_is_heldout(self, tmp_path: Path) -> None:
+        supplied = tmp_path / "swapped.txt"
+        supplied.write_text("b\ta\t1\nd\tc\t0\nf\te\t1\n", encoding="utf-8")
+        assert self._check(tmp_path, supplied)
+
+    def test_reordered_unlabeled_test_manifest_is_heldout(self, tmp_path: Path) -> None:
+        supplied = tmp_path / "test_alias.txt"
+        supplied.write_text("j\ti\ng\th\n", encoding="utf-8")
+        assert self._check(tmp_path, supplied)
+
+    def test_unrelated_pairs_are_not_heldout(self, tmp_path: Path) -> None:
+        supplied = tmp_path / "other.txt"
+        supplied.write_text("x\ty\t1\nz\tw\t0\n", encoding="utf-8")
+        assert not self._check(tmp_path, supplied)
+
+    def test_proper_subset_is_not_equal_multiset(self, tmp_path: Path) -> None:
+        supplied = tmp_path / "subset.txt"
+        supplied.write_text("a\tb\t1\nc\td\t0\n", encoding="utf-8")
+        assert not self._check(tmp_path, supplied)

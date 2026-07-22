@@ -48,6 +48,7 @@ import hashlib
 import json
 import logging
 import math
+from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -1126,14 +1127,17 @@ def _is_heldout_pair_source(pairs_source: str, data_root: Path, strategy: str) -
     if not supplied.is_file():
         return False
     supplied_sha256 = _file_sha256(supplied)
+    supplied_multiset: Counter[tuple[str, str]] | None = None
     for path in heldout_paths:
         if not path.is_file():
             continue
         if _file_sha256(path) == supplied_sha256:
             return True
-        supplied_pairs, supplied_labels = _read_pairs_tsv(supplied)
-        heldout_pairs, heldout_labels = _read_pairs_tsv(path)
-        if supplied_pairs == heldout_pairs and np.array_equal(supplied_labels, heldout_labels):
+        # Canonical-pair multiset comparison: a reordered, label-stripped, or
+        # endpoint-swapped copy of a held-out manifest is still held-out.
+        if supplied_multiset is None:
+            supplied_multiset = Counter(_read_pairs_tsv(supplied)[0])
+        if supplied_multiset == Counter(_read_pairs_tsv(path)[0]):
             return True
     return False
 
