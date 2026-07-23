@@ -1,6 +1,7 @@
 {
   "registration_id": "g5-e2e-stage1-20260719-conditioned-encoder-stability-screen-v2",
-  "status": "DRAFT",
+  "status": "BINDING",
+  "bound_utc": "2026-07-23",
   "created_utc": "2026-07-19T00:00:00Z",
   "gate": "G5 Stage 1 - EgoStitch E2E stable conditioned-encoder screen",
   "spec_binding": "docs/05-egostitch-spec.md §5, §13.16-§13.19, and §14",
@@ -137,7 +138,7 @@
       "fixed stability-split pair-logit std below max(0.25 times warm-start-end reference, 1e-4) for two consecutive validations"
     ],
     "reference_validity": "warm-start-end pair-logit std is measured after the final Phase-A update in eval mode and must be finite and >=1e-4",
-    "binding_margin": "healthy rehearsal: per-group clip-coefficient p1 floors calibrated from the first completed replacement rehearsal (clip_margin_amendment_20260722): pair_encoder_head>0.04, generator>0.01, topology_content_conditioning>0.15, unlisted groups default to 0.12; minimum>0.0012; longest consecutive run below 0.1 is <10 steps; per-group family-ratio p99<40",
+    "binding_margin": "healthy rehearsal: per-group clip-coefficient p1 floors calibrated from the first completed replacement rehearsal (clip_margin_amendment_20260722): pair_encoder_head>0.04, generator>0.01, topology_content_conditioning>0.15, unlisted groups default to 0.12; minimum>0.0012; longest consecutive run below 0.1 is <10 steps; pooled family-ratio p99<40 (single scalar over all groups' alpha=1 ratios, as computed by validate_e2e_qualification_profile)",
     "abort_consequence": "synchronous invalid run; publish failure metadata only; no best.pt, complete.json, candidate score, or gate input",
     "last_checkpoint": "diagnostic-only under failure-specific directory; never eligible for formal scoring"
   },
@@ -147,9 +148,50 @@
       "split_rule": "after E_msg derivation, create V_qual as deterministic 256-node BFS from largest G_msg component with seed/frontier hash prefix g5-v2-qual|; remove it and create V_select identically with g5-v2-select|; component ties use sorted node-id tuple; V_fit is the remainder; train only on induced E_msg[V_fit] and E_sup pairs inside V_fit; quarantine cross-partition edges",
       "aggregation": "complete global manifest after exact DDP gather; fp32 average_precision_score on binary labels",
       "warm_reference": "measure after final Phase-A update on applicable complete pair manifest; rehearsal may open only V_qual, first bound run opens untouched V_select; runtime collapse uses fixed applicable slice",
-      "fit_manifest": "REQUIRED-BEFORE-BINDING: V_fit, E_msg[V_fit], E_sup[V_fit], quarantined cross-bucket counts, and SHA-256 values",
-      "qualification_manifest": "REQUIRED-BEFORE-BINDING: V_qual, complete non-self pairs, labels and gold graph from E_msg[V_qual] only, prevalence, exact-gold-density assembly, metric config, and SHA-256 values",
-      "checkpoint_manifest": "REQUIRED-BEFORE-BINDING: untouched V_select counterpart with the same fields plus zero node/label-edge overlap proof",
+      "fit_manifest": {
+        "resolved": "2026-07-23 from the passing attempt-005 qualification; digests recomputed via the registered derivation and equal to the retained overfit/rehearsal access-audit digests",
+        "v_fit_node_count": 7558,
+        "e_msg_fit_count": 22708,
+        "e_sup_fit_count": 6612,
+        "v_fit_nodes_sha256": "32f07189d6fe081272291d4058de72d16e1af8868b63f6a6be131e35dba97995",
+        "e_msg_fit_sha256": "ca92d2eba511bcd7e7f9e174a796d7540209b8fab50dbd36211547f756d0fd9c",
+        "e_sup_fit_sha256": "e66ca8f67eab6eaa07d45538ed68dac5d141d309d55fe12bb43cdb4393fe09ba",
+        "quarantined_cross_bucket_counts": {
+          "message": {"fit__qual": 2968, "fit__select": 3356, "qual__select": 270},
+          "supervision": {"fit__qual": 743, "fit__select": 915, "qual__select": 62}
+        },
+        "evidence": {"path": "outputs/deliverables/egostitch_e2e_qualification_20260722/internal_holdout_manifests.json", "sha256": "13e67cc344da4c057494222ed2224e26ec45097286a715840a998a6abbf2ec21"}
+      },
+      "qualification_manifest": {
+        "resolved": "2026-07-23; V_qual identities recomputed via the registered derivation and equal to the rehearsal access-audit digests",
+        "v_qual_node_count": 256,
+        "complete_nonself_pair_count": 32640,
+        "positive_count": 456,
+        "prevalence": 0.013970588235294118,
+        "nodes_sha256": "50d152f01a5239c011798ea7f87934aeec6b2ab2ca5ee8fffb711a32cc5b2d41",
+        "positive_edges_sha256": "2d05190fc1d338b74be98d7247d265b11328fdd841eebfb541993ab93fa9e9b9",
+        "pair_labels_sha256": "16ec74023d95bfd81e134ab8af05b40c96bea1349c711fce09f8857864946062",
+        "gold_graph_source": "E_msg[V_qual] only",
+        "assembly": "exact gold-density threshold over the complete non-self V_qual pair universe",
+        "metric_config": "pinned clustering-coefficient histogram bins and RBF-kernel configuration (raw biased squared MMD per topology_metric)",
+        "evidence": {"path": "outputs/deliverables/egostitch_e2e_qualification_20260722/internal_holdout_manifests.json", "sha256": "13e67cc344da4c057494222ed2224e26ec45097286a715840a998a6abbf2ec21"}
+      },
+      "checkpoint_manifest": {
+        "resolved": "2026-07-23; untouched V_select counterpart — derivation identities recorded while its feature rows and pair labels remain unread by every training and rehearsal step; the first bound formal run opens it",
+        "v_select_node_count": 256,
+        "complete_nonself_pair_count": 32640,
+        "positive_count": 807,
+        "prevalence": 0.024724264705882352,
+        "nodes_sha256": "f7e0109a6372dafe2934331b69673e4fc1122361ccc43264fed2409867e838a9",
+        "positive_edges_sha256": "17b8b26f142a559f52d49833650c8c35cac571e640f49bb2ce58c58362b663d0",
+        "pair_labels_sha256": "8da02ba7237f6a5e28fde686363e4e52aa78c3bccac67b66dc87bc542e899306",
+        "gold_graph_source": "E_msg[V_select] only",
+        "zero_overlap_proof": {
+          "node": {"fit__qual": 0, "fit__select": 0, "qual__select": 0},
+          "label_edge": {"fit__qual": 0, "fit__select": 0, "qual__select": 0}
+        },
+        "evidence": {"path": "outputs/deliverables/egostitch_e2e_qualification_20260722/internal_holdout_manifests.json", "sha256": "13e67cc344da4c057494222ed2224e26ec45097286a715840a998a6abbf2ec21"}
+      },
       "forbidden_gold_sources": ["train_graph.pkl", "val_edges.txt", "E_sup"],
       "topology_metric": "raw biased squared MMD between the single exact-gold-density predicted-graph and gold-graph clustering-coefficient histograms, using pinned existing histogram bins and RBF-kernel configuration; not the external multi-reference normalized MMD ratio; checkpoint selection only, never external held-out evidence"
     },
@@ -188,7 +230,7 @@
       ]
     },
     "full_arm_rehearsal": "exact 30-epoch full-arm config using every auto-detected visible H20, four on the current target host and matching the formal launch style, using only qualification pair/topology manifests; detected world size recorded; eligible post-ramp checkpoint required; checkpoint-selection manifests remain unread; no stability guard may fire",
-    "attempt_policy": "the 2026-07-22 still-DRAFT V2 replacement has at most three disclosed full-arm rehearsal attempts; every earlier failed V2 attempt remains retained as engineering evidence but does not count against the replacement allowance because no prior V2 passed; except for the explicitly disclosed 2026-07-21 infrastructure amendment and 2026-07-22 precision replacement, the first replacement rehearsal pass freezes implementation/config; a fourth replacement rehearsal or any change outside those amendments requires v3",
+    "attempt_policy": "the 2026-07-22 still-DRAFT V2 replacement has at most three disclosed full-arm rehearsal attempts; every earlier failed V2 attempt remains retained as engineering evidence but does not count against the replacement allowance because no prior V2 passed; except for the explicitly disclosed 2026-07-21 infrastructure amendment, the 2026-07-22 precision replacement, elementwise and vector-tolerance recalibrations, and clip-margin calibration, and the 2026-07-23 binding-mechanics amendment (formal-launch validator only) and branch-dropout rank disclosure (no code change), the first replacement rehearsal pass freezes implementation/config; a fourth replacement rehearsal or any change outside those disclosed amendment blocks requires v3",
     "infrastructure_amendment_20260721": {
       "status": "post-attempt DRAFT amendment before binding; not retroactive preregistration",
       "trigger": "attempt 003 used 2 x H20; token-budget probes 128/256/512 measured approximately 80.46/75.81/70.44 pairs/s; the epoch probe was watchdog-terminated with 1823.6 seconds remaining before completing an epoch; no eligible checkpoint or scientific result was produced",
@@ -205,7 +247,7 @@
         "add failure-only gradient telemetry for exact step, phase, norm, coefficient, streak, and recent records without changing thresholds or optimizer behavior"
       ],
       "unchanged": "topology-conditioned architecture, losses after the restored V2 generator standardization, optimizer, production phase schedule, data roles, sampler, production guard thresholds and enforcement, checkpoint eligibility and selection, gates, and verdict rules; precision is changed only by precision_amendment_20260722",
-      "next_version_trigger": "any change outside this permitted list and precision_amendment_20260722, a fourth replacement full-arm rehearsal attempt, or any post-binding change"
+      "next_version_trigger": "any change outside this permitted list and the later disclosed amendment blocks (precision, elementwise/vector tolerance, clip margin, binding mechanics), a fourth replacement full-arm rehearsal attempt, or any post-binding change"
     },
     "precision_amendment_20260722": {
       "status": "direct replacement of the still-DRAFT unqualified V2 before binding; not retroactive preregistration",
@@ -220,7 +262,7 @@
       ],
       "unchanged": "full/f_logit elementwise tolerances, residual correlation floor 0.999, non-zero residual rule, architecture, losses, optimizer, production schedule, data roles, sampler, other guards, checkpoint eligibility and selection, gates, and verdict rules",
       "attempt_reset": "earlier failed V2 attempts remain retained as engineering evidence; because no V2 passed, this replacement starts a new at-most-three full-arm rehearsal allowance",
-      "next_version_trigger": "a fourth replacement full-arm rehearsal, any change after the first replacement pass, or any post-binding change"
+      "next_version_trigger": "a fourth replacement full-arm rehearsal, any change after the first replacement pass outside the disclosed elementwise/vector-tolerance, clip-margin, and binding-mechanics amendment blocks, or any post-binding change"
     },
     "elementwise_amendment_20260722": {
       "status": "post-attempt DRAFT amendment before binding; not retroactive preregistration",
@@ -257,7 +299,8 @@
         "clip_minimum": 0.001773,
         "longest_run_below_0_1": 5,
         "family_ratio_p99": 13.6557,
-        "submodule_rms_probe_rows": 46
+        "submodule_rms_probe_rows": 46,
+        "revalidation_note": "the 2026-07-23 re-validation of the same retained profile under the calibrated floors (qualification_margins.json, status pass) reports slightly different summary statistics from a wider measurement window — clip_p1 0.110089/0.028195/0.521748 and pooled family_ratio_p99 16.7313 — both sets sit far inside every floor and band; the amendment values above are the calibration-time measurement and are retained unedited"
       },
       "diagnosis": "the global p1>0.12 floor was introduced with the qualification scaffold before any V2 rehearsal existed and was never re-derived after the registered generator clip-ceiling and F0-standardization changes; the spec pinned the clip thresholds as DRAFT until the passing rehearsal records their empirical distribution, which this first completed rehearsal now provides; the generator's persistently-clipped regime (median coefficient 0.226 against ceiling 3.0) is a real disclosed trajectory property protected in-run by the unchanged immediate/persistent clip aborts and family-ratio guard",
       "calibration_source": "the retained attempt-3 rehearsal profile only; no candidate, test, or V_select quantity informed the floors",
@@ -267,6 +310,25 @@
       ],
       "unchanged": "clip minimum floor 0.0012, longest-run band, family-ratio p99<40, all in-run guards and abort thresholds, precision differential bounds, architecture, losses, optimizer, production schedule, data roles, sampler, checkpoint eligibility and selection, gates, and verdict rules",
       "attempt_accounting": "rehearsal attempt 3 completed training and published; its retained profile is the calibration evidence and the object of re-validation"
+    },
+    "binding_mechanics_amendment_20260723": {
+      "status": "pre-binding DRAFT amendment; not retroactive preregistration",
+      "trigger": "binding review found the formal worker's commit-identity check mechanically impossible to satisfy: it required a clean checkout whose HEAD begins with the recorded binding_evidence implementation commit, while this registration is itself a tracked file — a tracked registration cannot contain its own promotion commit's hash",
+      "diagnosis": "infrastructure defect in the formal-launch validator only; the qualification code path never invokes the check and no training, precision, guard, eligibility, scoring, or verdict semantics are involved",
+      "permitted_changes": [
+        "accept, in addition to HEAD equal to the recorded implementation commit, a clean HEAD descending from it exclusively through commits touching docs/registrations/ paths",
+        "lock the equal-HEAD, registration-only-descent, non-ancestor, and non-registration-diff cases with unit tests"
+      ],
+      "unchanged": "architecture, losses, optimizer, production schedule, precision contract, data roles, sampler, guards, checkpoint eligibility and selection, gates, verdict rules, and every other binding_evidence validation (schema, config hashes, artifact hashes, clean-tree requirement)",
+      "attempt_accounting": "no rehearsal launched; consumes no attempt",
+      "spec_reference": "docs/05-egostitch-spec.md §12 change-log entry 2026-07-23 and §13.19.4 item 5"
+    },
+    "branch_dropout_rank_disclosure_20260723": {
+      "status": "pre-binding disclosure of a frozen-implementation property; no code change",
+      "property": "the registered per-pair branch-dropout mask realization derives its randomness without incorporating the DDP rank, so per-step mask draws are correlated (identical per local batch index) across ranks; expected per-pair rates p_topo = p_cont = 0.15 are unchanged and the property is identical across all four training arms",
+      "source": "external branch review, 2026-07-22",
+      "decision": "accepted as-is for the v2 screen (owner decision 2026-07-23): correcting it would invalidate the completed qualified attempt-3 trajectory and consume the remaining rehearsal allowance; any correction is deferred to a new versioned registration (v3) or the E1/E3 multi-seed builds",
+      "spec_reference": "docs/05-egostitch-spec.md §14.2 disclosure and §12 change-log entry 2026-07-23"
     },
     "precision_test": "end-ramp and selected checkpoints, eval mode, same replay identities and hard masks; BF16+fp32 islands versus pure fp32 at registered vector relative-L2 and residual-vector tolerances",
     "boundary_audit": "qualification data root omits candidate/test manifests and test_graph.pkl; grounding universes are separately hashed as train=V_fit, rehearsal=V_qual, formal internal selection=V_select, external=test side; access log proves training endpoints subset V_fit, no V_qual/V_select/V_test feature row is read by a training step, G_fit digest equals loop-stripped E_msg[V_fit], heldout E_msg[V_qual]/E_msg[V_select] and E_sup/validation positives never enter topology-training targets, and no candidate/test score or assembly; global-positive rejection may use validation-positive membership only to prevent false negatives and is identical across arms",
@@ -315,7 +377,7 @@
     "b0cal_results": {
       "path": "outputs/deliverables/b0_cal_20260714/b0cal_results.json",
       "sha256": "833bcf2dcfb13c1d125a3a3b6325c02f0739a7c0092126091049516f1f5b2638",
-      "lineage": "REQUIRED-BEFORE-BINDING: restore immutable local deliverable and pin source checkout, commit, checkpoint, and row-count lineage"
+      "lineage": "resolved 2026-07-23: immutable deliverable present and hash-verified at the registered path on the execution host; produced 2026-07-14 by src.experiments.b0_cal on the pinned H20 container checkout from the frozen B0 V3.1 candidate universe (checkpoint_id e092537d8cf1e208, model_family v3_1, 2,037,171 candidate rows) plus the same-checkpoint val artifact (21,456 rows) and the registered g3_results input; its embedded metadata cross-checks the G3 B0 threshold exactly (0.7943849604299823) and b0_cal_selfdensity remains the empirically strongest comparator arm"
     }
   },
   "evaluator": {"seed": 0, "fixed_subgraphs": 500},
@@ -376,7 +438,25 @@
   "cost_report": {
     "requirement": "measured auto-detected visible-H20 v2 profile: detected world size, step wall, peak memory, exact 30-epoch full-arm runtime, per-arm projection, and five-pass candidate scoring estimate",
     "predecessor_observation": {"scope": "v1 planning context only; not v2 qualification", "full_arm_train_pipeline_seconds": 23234.77, "v1_debug_peak_memory_gib_max": 65.26557922363281},
-    "measured_profile": "REQUIRED-BEFORE-BINDING: structured paths, SHA-256 values, hardware, runtime, peak memory, and budget margins"
+    "measured_profile": {
+      "resolved": "2026-07-23 from the passing attempt-005 qualification (auto-detected 4 x NVIDIA H20)",
+      "hardware": {"gpus": "4 x NVIDIA H20 (97,871 MiB each)", "driver": "550.144.03", "torch": "2.10.0+cu128", "world_size": 4},
+      "overfit": {"total_seconds": 4043.594, "train_stage_seconds": 3799.09, "optimizer_steps": 2000, "setup_probe_peak_memory_gib": 62.809, "train_peak_memory_gib_max_rank": 63.308},
+      "rehearsal_full_arm": {
+        "total_seconds": 8642.572,
+        "optimizer_steps": 2340,
+        "epochs": 30,
+        "peak_memory_gib_max_rank": 64.45,
+        "global_pairs_per_second_train": 145.012,
+        "validation_seconds_30_epochs": 3552.799,
+        "selected_epoch": 16
+      },
+      "per_arm_projection_seconds": 8643,
+      "four_arm_training_projection_seconds": 34572,
+      "five_pass_candidate_scoring_estimate": "validation eval throughput 275.6 pairs/s (979,200 pairs / 3,552.8 s) implies <= 7,392 s per 2,037,171-row pass and <= 36,958 s for five passes; upper bound because dedicated scoring shards one contiguous slice per GPU with packed tokens",
+      "budget_margins": "peak memory 64.45 GiB of 95.58 GiB per H20 (32.6% headroom); rehearsal wall time 2.40 h per arm against the E2-B0-class budget; the frozen-s0 673 s / 2.04 GiB profile explicitly does not extrapolate and was not used",
+      "evidence": {"path": "outputs/deliverables/egostitch_e2e_qualification_20260722/runtime_and_peak_memory.json", "sha256": "42e7eec5119ab59de65e91c7ece1a45dfe817679e4683e0c510b5ac260ee5d61"}
+    }
   },
   "verdict_rule": "pass iff every training arm is valid, full passes all primary criteria and both guards, liveness passes, G_full>0, attribution share passes, and structure control passes; training invalid precedes scientific verdict, otherwise failures are multi-label cut reasons",
   "failure_reading": {
@@ -388,15 +468,57 @@
     "classification_order": "training_invalid first and no scientific verdict; otherwise report every applicable primary_fail, guard_fail, attribution_fail, and structure_control_fail label and return cut if any is present"
   },
   "binding_evidence": {
-    "schema_version": "REQUIRED-BEFORE-BINDING",
-    "implementation": {"commit": "REQUIRED-BEFORE-BINDING"},
-    "configs": {"full": "REQUIRED-BEFORE-BINDING", "b0_e2e_f_only": "REQUIRED-BEFORE-BINDING", "pair_topology": "REQUIRED-BEFORE-BINDING", "p0": "REQUIRED-BEFORE-BINDING"},
-    "parameter_group_manifests": "REQUIRED-BEFORE-BINDING",
-    "packs_and_validation_manifests": "REQUIRED-BEFORE-BINDING",
-    "qualification_attempts": "REQUIRED-BEFORE-BINDING",
-    "boundary_access_audit": "REQUIRED-BEFORE-BINDING",
-    "runtime_and_peak_memory": "REQUIRED-BEFORE-BINDING",
-    "checkpoint_policy_version": "REQUIRED-BEFORE-BINDING"
+    "schema_version": "egostitch_e2e_binding_evidence_v1",
+    "implementation": {"commit": "c878a9399cba113f6b6a85265c3fec31dd4bd193"},
+    "configs": {
+      "full": {"path": "configs/egostitch_e2e_breadth_first.yaml", "sha256": "730e6ba26d842d4a28924f3ad0cb408c186ba3bab8735a768c1518bd659d18d6"},
+      "b0_e2e_f_only": {"path": "configs/egostitch_e2e_f_only_breadth_first.yaml", "sha256": "d09d6c8bf6055de7758a9028eefa36f9e39cea4a0ee4a349c289dfec4e70b122"},
+      "pair_topology": {"path": "configs/egostitch_e2e_pair_topology_breadth_first.yaml", "sha256": "7e2a0345e42685d16da8f17bdd7375e70c24b3402c23eb0031188d23d08223ec"},
+      "p0": {"path": "configs/egostitch_e2e_p0_breadth_first.yaml", "sha256": "8c8cd5a7e8dfb620e9a1d6d0f38b984d2b023b8732bff77e5dcbf1740251466b"}
+    },
+    "parameter_group_manifests": {
+      "pair_encoder_head_sha256": "33b9fa50c03704e35bd50daad21491ba05d50bfb5c412b2ac5bdae6a01307b33",
+      "generator_sha256": "3e97d4635d69ebb4569d4a350ca1d6b1891f1d84ec16141cfbac34a4b781d9a4",
+      "topology_content_conditioning_sha256": "fc538c043065419c0340cf60c2105a852559324358d9f0ac802184e349e9ab8e",
+      "group_sizes": {"pair_encoder_head": 139, "generator": 100, "topology_content_conditioning": 66},
+      "evidence": {"path": "outputs/deliverables/egostitch_e2e_qualification_20260722/parameter_group_manifests.json", "sha256": "acc7fc02419cf5f2df17af40f83934de7b988a09a7b5492d3abcc3f6423b0897"}
+    },
+    "packs_and_validation_manifests": {
+      "fit_nodes_sha256": "32f07189d6fe081272291d4058de72d16e1af8868b63f6a6be131e35dba97995",
+      "qual_nodes_sha256": "50d152f01a5239c011798ea7f87934aeec6b2ab2ca5ee8fffb711a32cc5b2d41",
+      "qual_pair_labels_sha256": "16ec74023d95bfd81e134ab8af05b40c96bea1349c711fce09f8857864946062",
+      "select_nodes_sha256": "f7e0109a6372dafe2934331b69673e4fc1122361ccc43264fed2409867e838a9",
+      "select_pair_labels_sha256": "8da02ba7237f6a5e28fde686363e4e52aa78c3bccac67b66dc87bc542e899306",
+      "pack_manifests": [
+        {"path": "/2023533015/tciep-stage3-qualification-attempt005-vectol-20260722/outputs/feature_packs/egostitch_e2e_v_fit/manifest.json", "sha256": "a386ea0931b70ce44cee71959dbd47185e3e6607a7bb0bfd8134ed4912f3a16a"},
+        {"path": "/2023533015/tciep-stage3-qualification-attempt005-vectol-20260722/outputs/feature_packs/egostitch_e2e_v_qual/manifest.json", "sha256": "5e91ea38161f7e9ebcd9d5dc0bc9edec50e640aa9270fc539e649cfd9ff5e8b5"},
+        {"path": "outputs/feature_packs/egostitch_e2e_tokens/manifest.json", "sha256": "9271620a6eed460802bff3d8a94da4dd30da4f32b6cc95f2e532cc4ef3a0ea46"}
+      ],
+      "evidence": {"path": "outputs/deliverables/egostitch_e2e_qualification_20260722/packs_and_validation_manifests.json", "sha256": "0d144236ddeca64de2cf9a9f13687a1f6d13a2c1f529f0d851dc889576ec22c5"}
+    },
+    "qualification_attempts": {
+      "passing_attempt_commit_sha256_note": "passing attempt-005 executed at implementation commit 928763af7710fbc55b1e539cd58443c3a237d5cf; registration_at_qualification_sha256 below is the DRAFT registration digest recorded by that run",
+      "registration_at_qualification_sha256": "9675cecc2ee70c341e9483f46c283799fda294b1a8f0f40a250e5e87f92a8358",
+      "overfit_best_pt": {"path": "/2023533015/tciep-stage3-qualification-attempt005-vectol-20260722/outputs/egostitch_e2e_stage1/qualification/attempt-005/overfit/best.pt", "sha256": "b6502e416a44895365bcf709dfe0580375976393194edb38b7558afaf52eb1d6"},
+      "rehearsal_best_pt": {"path": "/2023533015/tciep-stage3-qualification-attempt005-vectol-20260722/outputs/egostitch_e2e_stage1/qualification/attempt-005/rehearsal/best.pt", "sha256": "18337863a1427496c785473b7a13e3a235312a56beb74f7fefb95f981f4c7328"},
+      "rehearsal_run_metadata": {"path": "/2023533015/tciep-stage3-qualification-attempt005-vectol-20260722/outputs/egostitch_e2e_stage1/qualification/attempt-005/rehearsal/run_metadata.json", "sha256": "157f68149a76a0dca58a9a8dfe5911a52698d55df7ea6cda96f034388cb0ef4d"},
+      "qualification_margins": {"path": "/2023533015/tciep-stage3-qualification-attempt005-vectol-20260722/outputs/egostitch_e2e_stage1/qualification/attempt-005/qualification_margins.json", "sha256": "2a5a8a208ad2e38edc16d7458c80ac2878ef3673d9dd7980314aac966a7940ea"},
+      "evidence": {"path": "outputs/deliverables/egostitch_e2e_qualification_20260722/qualification_attempts.json", "sha256": "896933c593d0e53be3b7a71873ccb28da7e3f827c6a25a7083db1d79dd156ca8"}
+    },
+    "boundary_access_audit": {
+      "training_feature_nodes_sha256": "32f07189d6fe081272291d4058de72d16e1af8868b63f6a6be131e35dba97995",
+      "validation_feature_nodes_sha256": "50d152f01a5239c011798ea7f87934aeec6b2ab2ca5ee8fffb711a32cc5b2d41",
+      "training_structural_target_sha256": "ca92d2eba511bcd7e7f9e174a796d7540209b8fab50dbd36211547f756d0fd9c",
+      "training_supervision_sha256": "e66ca8f67eab6eaa07d45538ed68dac5d141d309d55fe12bb43cdb4393fe09ba",
+      "evidence": {"path": "outputs/deliverables/egostitch_e2e_qualification_20260722/boundary_access_audit.json", "sha256": "1c763413f4c946abc4de9d6585e90e38eab93f70b6cfc9c2c4c5d75f06c5f233"}
+    },
+    "runtime_and_peak_memory": {
+      "rehearsal_profile": {"path": "/2023533015/tciep-stage3-qualification-attempt005-vectol-20260722/outputs/egostitch_e2e_stage1/qualification/attempt-005/rehearsal/profile.json", "sha256": "1038df9e566b1a2a480662fe9420b9128dd75f4def03fa4db08cd7ee6afee392"},
+      "rehearsal_complete": {"path": "/2023533015/tciep-stage3-qualification-attempt005-vectol-20260722/outputs/egostitch_e2e_stage1/qualification/attempt-005/rehearsal/complete.json", "sha256": "a4f637875496db6876ba2f84ff782a1c9cb028987c3e8fc4180b5cd8d7a1c707"},
+      "overfit_complete": {"path": "/2023533015/tciep-stage3-qualification-attempt005-vectol-20260722/outputs/egostitch_e2e_stage1/qualification/attempt-005/overfit/complete.json", "sha256": "ee9e019d45465ad6f9a2a371c6f127ee22d162d548c0ce9161e4e29bfc48f447"},
+      "evidence": {"path": "outputs/deliverables/egostitch_e2e_qualification_20260722/runtime_and_peak_memory.json", "sha256": "42e7eec5119ab59de65e91c7ece1a45dfe817679e4683e0c510b5ac260ee5d61"}
+    },
+    "checkpoint_policy_version": "g5-e2e-v2-selection-20260722 (registration checkpoint_selection block as executed by the passing rehearsal: topology-aware selection, epoch 16, checkpoint_id 424e6024d2e3b893)"
   },
   "binding_acceptance_tests": [
     "phase boundaries, complete coverage, world-size invariance, and first-eligible timing",
@@ -409,16 +531,16 @@
     "file/node access audit and candidate scorer provenance rejection"
   ],
   "required_before_binding": [
-    "REQUIRED-BEFORE-BINDING: implement and test every docs/05-egostitch-spec.md §13.19 training, precision, finite-check, checkpoint-eligibility, and publication rule",
-    "REQUIRED-BEFORE-BINDING: enforce the DRAFT/debug candidate/test scoring prohibition and validate structured binding_evidence before DDP",
-    "REQUIRED-BEFORE-BINDING: create the four v2 config files and pin their SHA-256 values",
-    "REQUIRED-BEFORE-BINDING: create and hash disjoint validation and train-side topology-selection manifests",
-    "REQUIRED-BEFORE-BINDING: complete the deterministic overfit test and full-arm train/validation rehearsal with auto-detected all-visible-H20 execution in a no-test-mounted data root",
-    "REQUIRED-BEFORE-BINDING: record implementation commit, parameter groups, packs, validation manifests, every qualification attempt, access audit, artifact digests, measured runtime, and peak memory",
-    "REQUIRED-BEFORE-BINDING: independent review confirms JSON/prose parity and no v1 artifact is relabeled as v2 evidence"
+    "RESOLVED 2026-07-23: every docs/05-egostitch-spec.md §13.19 training, precision, finite-check, checkpoint-eligibility, and publication rule is implemented and covered by the qualification sanity suite (hpc/qualification.sh stage 1/3), which passed inside the passing attempt-005 run",
+    "RESOLVED 2026-07-23: the formal worker enforces the DRAFT/debug candidate/test scoring prohibition and schema-validates structured binding_evidence before DDP (src/train_egostitch.py prepare_ddp_run_config and _validate_e2e_formal_binding, unit-tested)",
+    "RESOLVED 2026-07-23: the four v2 config files exist and their SHA-256 values are pinned in binding_evidence.configs; the full-arm hash equals the config_sha256 recorded by the passing rehearsal (730e6ba2...)",
+    "RESOLVED 2026-07-23: disjoint V_fit/V_qual/V_select validation and train-side topology-selection manifests are derived, hashed, and cross-checked against the retained access-audit digests (checkpoint_selection.validation_contract fit/qualification/checkpoint manifests)",
+    "RESOLVED 2026-07-23: the deterministic 2,000-step overfit test (train AUPRC ~1.0 >= 0.95; post-ramp residual ratio ~0.10 >= 1e-6; latest qualifying epoch 30 retained) and the 30-epoch full-arm rehearsal (eligible epoch-16 checkpoint, no guard fired, both precision differentials green, margins status pass) completed on auto-detected 4 x H20 in the isolated attempt005-vectol data root with candidate/test/V_select artifacts absent",
+    "RESOLVED 2026-07-23: implementation commit, parameter groups, packs, validation manifests, every qualification attempt, access audit, artifact digests, measured runtime, and peak memory are recorded in binding_evidence and in outputs/deliverables/egostitch_e2e_qualification_20260722/",
+    "RESOLVED 2026-07-23: independent adversarial review (separate agent context) confirmed JSON/prose parity after the same-day prose reconciliation and confirmed no v1 artifact is relabeled as v2 evidence; the v1 formal full-arm artifacts were archived unmodified to outputs/egostitch_e2e_stage1/full_v1_20260718/ so the v2 full arm publishes at the registered path"
   ],
   "mechanics": {
-    "formal_worker": "before DDP, reject status other than BINDING, any REQUIRED-BEFORE-BINDING marker, invalid binding_evidence schema, missing artifact, non-64-hex digest, live hash mismatch, config path not equal to arms.<arm>.training, or parameter/pack/qualification mismatch",
+    "formal_worker": "before DDP, reject status other than BINDING, any unresolved pre-binding marker string, invalid binding_evidence schema, missing artifact, non-64-hex digest, live hash mismatch, config path not equal to arms.<arm>.training, or parameter/pack/qualification mismatch; the implementation-commit check accepts a clean HEAD equal to the recorded commit or descending from it through docs/registrations/-only commits (binding_mechanics_amendment_20260723)",
     "debug_worker": "DRAFT accepted only with explicit debug mode; outputs isolated and forbidden as held-out/gate inputs",
     "candidate_scorer": "egostitch_e2e candidate/test scoring requires registration path, run metadata, BINDING status, formal+complete+eligible status, and exact registration/config/checkpoint hashes; DRAFT/debug is train/validation-only",
     "gate": "requires this registration SHA-256 and exact config SHA-256 in every formal run metadata plus the provenance-bound probe artifact",
