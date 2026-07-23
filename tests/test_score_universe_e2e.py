@@ -234,6 +234,50 @@ def test_candidate_scoring_requires_all_four_arm_metadata(
     assert not output.exists()
 
 
+def test_arm_checkpoint_path_falls_back_to_metadata_sibling_best_pt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
+    monkeypatch.setattr(
+        score_universe,
+        "_load_checkpoint",
+        lambda *_args, **_kwargs: (torch.nn.Linear(1, 1), "egostitch_e2e", checkpoint_id),
+    )
+    other_dir = tmp_path / "f_only"
+    other_dir.mkdir()
+    other_metadata = other_dir / "run_metadata.json"
+    other_metadata.write_text(
+        json.dumps({"arm": "b0_e2e_f_only", "checkpoint_id": "feedfeedfeedfeed"}),
+        encoding="utf-8",
+    )
+    output = tmp_path / "forbidden.npz"
+    common = [
+        "score",
+        "--checkpoint",
+        str(checkpoint),
+        "--pairs",
+        "candidate",
+        "--output",
+        str(output),
+        "--preregistration",
+        str(registration),
+        "--arm-run-metadata",
+        f"b0_e2e_f_only={other_metadata}",
+        "--arm-run-metadata",
+        f"full={metadata}",
+        "--arm-run-metadata",
+        f"pair_topology={metadata}",
+        "--arm-run-metadata",
+        f"p0={metadata}",
+    ]
+    with pytest.raises(ValueError, match="selected checkpoint not found"):
+        score_universe.main(common)
+    (other_dir / "best.pt").write_bytes(b"other arm checkpoint")
+    with pytest.raises(ValueError, match="scoring rejects debug/non-formal runs"):
+        score_universe.main(common)
+    assert not output.exists()
+
+
 def test_e2e_artifact_physically_stores_all_four_decomposition_arrays(tmp_path: Path) -> None:
     output = tmp_path / "scores.npz"
     values = np.array([0.1, 0.2], dtype=np.float32)

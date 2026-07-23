@@ -2212,9 +2212,15 @@ def _run_score(args: argparse.Namespace) -> None:
                 arm_checkpoint_path = args.checkpoint
             else:
                 raw_checkpoint_path = metadata.get("selected_checkpoint_path")
-                if not isinstance(raw_checkpoint_path, str):
-                    raise ValueError(f"{arm}: run metadata is missing selected_checkpoint_path")
-                arm_checkpoint_path = Path(raw_checkpoint_path)
+                if isinstance(raw_checkpoint_path, str):
+                    arm_checkpoint_path = Path(raw_checkpoint_path)
+                else:
+                    # The worker publishes best.pt beside run_metadata.json and
+                    # records no path field; identity is enforced by the
+                    # checkpoint_sha256 comparison inside the provenance check.
+                    arm_checkpoint_path = metadata_path.parent / "best.pt"
+                if not arm_checkpoint_path.is_file():
+                    raise ValueError(f"{arm}: selected checkpoint not found: {arm_checkpoint_path}")
             provenances[arm] = _validate_e2e_scoring_provenance(
                 registration_path=args.preregistration,
                 run_metadata_path=metadata_path,

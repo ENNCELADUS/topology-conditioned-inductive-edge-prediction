@@ -512,6 +512,16 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-23: candidate-scorer locator fix in the §13.19.5 formal scoring entry
+  point. The four-arm provenance check required a `selected_checkpoint_path`
+  field that the formal worker never writes; the scorer now falls back to the
+  published layout (`best.pt` beside each arm's `run_metadata.json`) when the
+  field is absent. Checkpoint identity remains enforced by the unchanged
+  `checkpoint_sha256` comparison, so the path is a locator only; no training,
+  eligibility, precision, or verdict semantics change and the BINDING
+  registration file is untouched (its digest is already embedded in all four
+  formal run metadata records). Locked by a unit test covering the
+  missing-sibling failure and the fallback-located path.
 - 2026-07-23: binding-mechanics amendment to the §13.19.4 item-5 formal
   commit-identity check. As implemented, the formal worker required a clean
   checkout whose HEAD begins with the recorded `binding_evidence`
