@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -123,6 +123,34 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
 
     assert binding["arm"] == "full"
     assert binding["config_sha256"] == te._sha256_file(config_path)
+
+    def fake_run_descent(diff_paths: str, ancestor_rc: int) -> Callable[..., SimpleNamespace]:
+        def runner(command: list[str], **_: object) -> SimpleNamespace:
+            if "rev-parse" in command:
+                return SimpleNamespace(stdout="b" * 40 + "\n", returncode=0)
+            if "merge-base" in command:
+                return SimpleNamespace(stdout="", returncode=ancestor_rc)
+            if "diff" in command:
+                return SimpleNamespace(stdout=diff_paths, returncode=0)
+            return SimpleNamespace(stdout="", returncode=0)
+
+        return runner
+
+    monkeypatch.setattr(
+        "src.train_egostitch.subprocess.run",
+        fake_run_descent("docs/registrations/g5_e2e_stage1_preregistration_v2.json\n", 0),
+    )
+    assert te._validate_e2e_formal_binding(cfg, snapshot, config_path)["arm"] == "full"
+    monkeypatch.setattr(
+        "src.train_egostitch.subprocess.run",
+        fake_run_descent("docs/registrations/x.json\nsrc/train_b0.py\n", 0),
+    )
+    with pytest.raises(te.PreregistrationNotBinding, match="clean live checkout"):
+        te._validate_e2e_formal_binding(cfg, snapshot, config_path)
+    monkeypatch.setattr("src.train_egostitch.subprocess.run", fake_run_descent("", 1))
+    with pytest.raises(te.PreregistrationNotBinding, match="clean live checkout"):
+        te._validate_e2e_formal_binding(cfg, snapshot, config_path)
+    monkeypatch.setattr("src.train_egostitch.subprocess.run", fake_run)
     artifact.unlink()
     with pytest.raises(te.PreregistrationNotBinding, match="missing or hash-mismatched"):
         te._validate_e2e_formal_binding(cfg, snapshot, config_path)

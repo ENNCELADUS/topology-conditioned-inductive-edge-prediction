@@ -1280,6 +1280,38 @@ def _validate_binding_digest_section(value: object, label: str, repo_root: Path)
             )
 
 
+_REGISTRATION_DOCS_PREFIX = "docs/registrations/"
+
+
+def _head_matches_implementation_commit(commit: str, live_commit: str, repo_root: Path) -> bool:
+    """Accept HEAD == commit, or registration-document-only descent from it.
+
+    A tracked registration cannot contain its own promotion commit hash
+    (binding-mechanics amendment 2026-07-23), so the binding commit is allowed
+    to sit on top of the recorded implementation commit as long as every path
+    it touches lives under ``docs/registrations/``.
+    """
+    if live_commit.startswith(commit):
+        return True
+    is_ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if is_ancestor.returncode != 0:
+        return False
+    changed_paths = subprocess.run(
+        ["git", "diff", "--name-only", f"{commit}..HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    return all(path.startswith(_REGISTRATION_DOCS_PREFIX) for path in changed_paths if path.strip())
+
+
 def _validate_e2e_formal_binding(
     cfg: EgoConfig, snapshot: PreregistrationSnapshot, config_path: Path
 ) -> dict[str, str]:
@@ -1345,7 +1377,7 @@ def _validate_e2e_formal_binding(
         capture_output=True,
         text=True,
     ).stdout.strip()
-    if tracked_changes or not live_commit.startswith(commit):
+    if tracked_changes or not _head_matches_implementation_commit(commit, live_commit, repo_root):
         raise PreregistrationNotBinding(
             "binding_evidence implementation commit does not match a clean live checkout"
         )

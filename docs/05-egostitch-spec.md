@@ -512,6 +512,30 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-23: binding-mechanics amendment to the §13.19.4 item-5 formal
+  commit-identity check. As implemented, the formal worker required a clean
+  checkout whose HEAD begins with the recorded `binding_evidence`
+  implementation commit, while the registration is itself a tracked file — a
+  registration cannot contain its own promotion commit's hash, so binding was
+  mechanically impossible as written. The check now also accepts a clean HEAD
+  that descends from the recorded implementation commit exclusively through
+  commits touching `docs/registrations/` paths. This preserves the check's
+  intent (the executing code is exactly the qualification-frozen
+  implementation) and changes no training, precision, guard, eligibility,
+  scoring, or verdict semantics; the qualification code path never invokes it.
+  Locked by unit tests covering the equal-HEAD, registration-only-descent,
+  non-ancestor, and non-registration-diff cases.
+- 2026-07-23: disclosed branch-dropout mask correlation across DDP ranks for
+  the frozen V2 trajectory. The registered per-pair `∅`-mask realization
+  derives its dropout randomness without incorporating the DDP rank, so the
+  per-step mask draws are correlated (identical per local batch index) across
+  ranks; the expected per-pair mask rates `p_topo = p_cont = 0.15` are
+  unchanged and the property is identical across all four training arms. This
+  is a disclosed implementation property of the qualified attempt-3 trajectory
+  (external branch review, 2026-07-22), accepted as-is for the v2 screen:
+  correcting it would invalidate the completed rehearsal and consume the
+  remaining attempt allowance, so any fix is deferred to a future versioned
+  registration (v3) or the E1/E3 multi-seed builds.
 - 2026-07-22: calibrated the §13.19.2 clip-margin bands from the first completed
   replacement rehearsal. Rehearsal attempt 3 completed the full 30-epoch
   schedule and published its artifacts with every in-run gate green: no
@@ -1551,7 +1575,10 @@ following without candidate/test scoring:
    validation-manifest hashes, every qualification attempt, selected checkpoint
    policy version, measured runtime, and peak memory. The first passing attempt
    freezes implementation/config; any later scientific or optimization change
-   requires v3.
+   requires v3. The recorded implementation commit is the last commit touching
+   anything outside `docs/registrations/`; a formal launch verifies a clean
+   checkout whose HEAD either equals that commit or descends from it through
+   registration-document-only commits (binding-mechanics amendment 2026-07-23).
 
 These qualification artifacts may tune no held-out/test quantity. The 2026-07-22
 still-DRAFT replacement has at most three disclosed full-arm rehearsal attempts; all
@@ -1645,7 +1672,12 @@ counts, `Π` is exactly `(B,K,K)`, every matched/membership array is exactly
 Training realizes nulls as per-pair multiplicative masks (probabilities
 `p_topo = p_cont = 0.15` default, sweep 0.1–0.2, plus `p = 0` arms); evaluation uses
 batch-level hard bypasses; residual sublayer form makes the two numerically identical
-(required unit test), as is `p(i,j) = p(j,i)` under every null. The `_head` namespace
+(required unit test), as is `p(i,j) = p(j,i)` under every null. Disclosed
+2026-07-23: the frozen V2 mask realization derives its dropout randomness
+without the DDP rank, so per-step mask draws are correlated across ranks
+(identical per local batch index); expected rates are unchanged, the property
+is identical across arms, and any correction is deferred to a future versioned
+registration (§12 change log). The `_head` namespace
 is disjoint from the §2 conditioning-dropout `∅_content` / `∅_all` (decoder nulls).
 All four logits (full + three nulls) are published per scored pair; the §13.16 fp32
 pair-pass pin extends to trunk, STE, gates, and head
