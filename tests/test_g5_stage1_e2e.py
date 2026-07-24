@@ -648,6 +648,18 @@ class TestBuildE2EArmSummary:
         with pytest.raises(ValueError, match="submodule RMS telemetry"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
+    def test_nested_worker_submodule_rms_shape_is_accepted(self, tmp_path: Path) -> None:
+        inputs = _five_arm_inputs(tmp_path)
+        for metadata_path in _d(inputs["run_metadata_paths"]).values():
+            metadata = json.loads(metadata_path.read_text())
+            row = metadata["training_diagnostics"]["gradient_norm_series"][0]
+            nested = {
+                key: row.pop(key) for key in ("grad_rms_trunk", "grad_rms_ste", "grad_rms_content")
+            }
+            row["submodule_gradient_rms"] = nested
+            metadata_path.write_text(json.dumps(metadata))
+        g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
     def test_formal_evaluator_seed_must_be_zero(self, tmp_path: Path) -> None:
         inputs = _five_arm_inputs(tmp_path)
         preregistration = json.loads(_d(inputs)["preregistration_path"].read_text())

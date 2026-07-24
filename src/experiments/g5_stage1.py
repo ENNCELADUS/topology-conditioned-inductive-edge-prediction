@@ -578,16 +578,21 @@ def _training_diagnostics(
             for row_index, raw_row in enumerate(
                 cast(list[dict[str, object]], report["gradient_norm_series"])
             ):
-                missing_rms = rms_keys - raw_row.keys()
+                # The worker publishes the registered spec §13.17 names nested
+                # under `submodule_gradient_rms`; accept that shape alongside
+                # flat rows.
+                nested = raw_row.get("submodule_gradient_rms")
+                source = cast(dict[str, object], nested) if isinstance(nested, dict) else raw_row
+                missing_rms = rms_keys - source.keys()
                 if missing_rms:
                     raise ValueError(
                         f"run metadata {index} gradient row {row_index} is missing "
                         f"submodule RMS telemetry: {sorted(missing_rms)}"
                     )
                 if any(
-                    not isinstance(raw_row[key], (int, float))
-                    or not math.isfinite(float(cast(float, raw_row[key])))
-                    or float(cast(float, raw_row[key])) < 0.0
+                    not isinstance(source[key], (int, float))
+                    or not math.isfinite(float(cast(float, source[key])))
+                    or float(cast(float, source[key])) < 0.0
                     for key in rms_keys
                 ):
                     raise ValueError(

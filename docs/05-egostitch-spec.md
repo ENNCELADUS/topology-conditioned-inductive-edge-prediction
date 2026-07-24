@@ -512,6 +512,13 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-24: gate-side telemetry shape fix. The §13.17 registered names
+  `grad_rms_trunk`/`grad_rms_ste`/`grad_rms_content` are published by the
+  worker nested under `submodule_gradient_rms` per fixed-replay gradient row;
+  the e2e gate validator expected them flat and failed closed on the completed
+  formal metadata. The validator now accepts the published nested shape (flat
+  rows remain accepted); registered names, values, and validity rules are
+  unchanged, and no published artifact was modified.
 - 2026-07-24: probe-producer identity fix for the registered §14.3 probe
   artifact. The producer reused the worker's internal-holdout training view
   (V_fit nodes over `G_fit`), while the registration and the gate's
