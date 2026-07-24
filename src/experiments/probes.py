@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -371,6 +372,16 @@ def evaluate_e2e_probe_artifact(
     }
 
 
+@dataclass(frozen=True)
+class _ProbeBundle:
+    """Frozen-store view read by probe batches (duck-types ``EgoStitchData``)."""
+
+    node_index: dict[str, int]
+    f0: torch.Tensor
+    grounding_index: NDArray[np.int64]
+    train_pos: dict[str, int]
+
+
 def _probe_batch(
     data: object,
     table: object,
@@ -502,14 +513,70 @@ def produce_e2e_probe_artifact(
     model.load_state_dict(state)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device).eval()
-    pack_dir = cfg.runtime.pack_dir if cfg.runtime is not None else None
-    data = te.assemble_egostitch_data(cfg, pack_dir=pack_dir)
     if cfg.data.pack_dir is None:
         raise ValueError("E2E probe producer requires data.pack_dir")
     table = PackedFeatureTable.from_pack(cfg.data.pack_dir, torch.device("cpu"))
     token_index = table.manifest.node_index()
-    graph = data.target_builder.graph
-    nodes = sorted(data.train_nodes)
+
+    # Registered probe identities (registration `probe_artifact`): all operative
+    # train nodes over the full-E_msg `G_struct`, matching the gate's own
+    # reconstruction — not the worker's internal-holdout training view. Each
+    # node grounds in its spec §13.12 role universe (V_fit / V_qual / V_select).
+    from src.data.features import FeatureStore, build_f0_matrix
+    from src.data.grounding import build_grounding_pool
+    from src.data.internal_holdout import derive_internal_holdout
+    from src.data.partition import build_g_struct, derive_partition
+    from src.model.egostitch.config import EgoStitchConfig
+
+    benchmark = te._load_benchmark_for(cfg)
+    operative = sorted(set(benchmark.graph.nodes()) - set(cfg.data.expected_missing_features))
+    nodes = sorted(set(benchmark.split.train_nodes) & set(operative))
+    train_positives = [
+        pair
+        for pair, label in zip(
+            benchmark.split.train_pairs.pairs,
+            benchmark.split.train_pairs.labels,
+            strict=True,
+        )
+        if label == 1
+    ]
+    partition = derive_partition(
+        train_positives, seed=cfg.data.partition_seed, msg_fraction=cfg.data.msg_fraction
+    )
+    graph = build_g_struct(nodes, partition.e_msg)
+    missing_tokens = [node for node in nodes if node not in token_index]
+    if missing_tokens:
+        raise ValueError(f"token pack is missing {len(missing_tokens)} probe nodes")
+    holdout = derive_internal_holdout(nodes, partition.e_msg, partition.e_sup)
+    store = FeatureStore(cfg.data.root / te._FEATURES_SUBDIR)
+    cache_dir = output_path.parent
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    matrix, node_index = build_f0_matrix(
+        store, nodes, cache_path=cache_dir / "probe_f0.pt", allow_cache_subset=True
+    )
+    n_ground = EgoStitchConfig().n_ground
+    matrix_np = matrix.numpy()
+    grounding_rows: dict[str, list[int]] = {}
+    role_universes = (
+        (sorted(holdout.v_fit), "probe_grounding_fit.npz"),
+        (sorted(holdout.v_qual), "probe_grounding_qual.npz"),
+        (sorted(holdout.v_select), "probe_grounding_select.npz"),
+    )
+    for role_nodes, cache_name in role_universes:
+        role_rows = np.asarray(
+            matrix_np[[node_index[node] for node in role_nodes]], dtype=np.float32
+        )
+        pool = build_grounding_pool(
+            role_rows, role_nodes, n_ground=n_ground, cache_path=cache_dir / cache_name
+        )
+        for node in role_nodes:
+            grounding_rows[node] = [node_index[neighbor] for neighbor in pool[node]]
+    data = _ProbeBundle(
+        node_index=node_index,
+        f0=matrix,
+        grounding_index=np.asarray([grounding_rows[node] for node in nodes], dtype=np.int64),
+        train_pos={node: position for position, node in enumerate(nodes)},
+    )
     batch_size = max(1, cfg.data.edge_batch)
     state_rows: list[NDArray[np.float32]] = []
     with torch.inference_mode():

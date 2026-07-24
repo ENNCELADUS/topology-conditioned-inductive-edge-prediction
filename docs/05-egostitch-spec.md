@@ -512,6 +512,17 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-24: probe-producer identity fix for the registered §14.3 probe
+  artifact. The producer reused the worker's internal-holdout training view
+  (V_fit nodes over `G_fit`), while the registration and the gate's
+  reconstruction pin the probe to all operative train nodes over the
+  full-`E_msg` `G_struct` — the gate correctly failed closed on the mismatch
+  before any probe metric was computed. The producer now derives the
+  registered identities exactly as the gate does and grounds each node in its
+  §13.12 role universe (`V_fit`/`V_qual`/`V_select`), with private derived
+  caches under the probe output directory. The probe artifact remains
+  nonbinding diagnostic evidence (`verdict_effect: none`); no training,
+  scoring, eligibility, or verdict semantics change.
 - 2026-07-23: candidate-scorer locator fix in the §13.19.5 formal scoring entry
   point. The four-arm provenance check required a `selected_checkpoint_path`
   field that the formal worker never writes; the scorer now falls back to the
