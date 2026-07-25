@@ -22,8 +22,10 @@ casual changes — **flag conflicts, don't resolve them unilaterally**.
   diagnostic-only artifacts, what claims a one-seed screen may make. **Load before
   touching `docs/registrations/`, running a formal arm, or writing up any result.**
 - `.claude/skills/hpc-execution/` — `hpc/run.sh`, `g5_stage1.sh`, `qualification.sh`,
-  world-size auto-detection, and the config keys that change meaning per model family.
-  **Load before any training/scoring/gate command.**
+  the auto-detected H20 world size, and the config keys that change meaning per model
+  family. **Load before any training/scoring/gate command.**
+- After finishing a wave, run this command `/codex:review --wait` to ask a codex 
+  reviewer to review the implementation.
 
 ## The core thesis (do not let it drift)
 
