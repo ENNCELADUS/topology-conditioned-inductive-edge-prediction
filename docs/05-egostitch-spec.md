@@ -512,6 +512,16 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-25 (third entry): §14.4.2 scaffold format corrected from FEAT_DIM
+  10 to **11**. The rev-3.1 scaffold adds both a fourth edge type (closure)
+  and a per-slot closed-wedge feature `t_k`, but the degree slice is one
+  channel per edge type (`adj.sum(-1)`, `scaffold.py:114`), so EDGE_TYPES
+  3 → 4 by itself widens `feats[:, :, 6:9]` to `6:10` and consumes the tenth
+  channel — leaving no index for `t_k`. FEAT_DIM 10 was therefore
+  arithmetically impossible; the same miscount appears in the r6 design
+  trail §D1/D2. Owner-confirmed 2026-07-25 during implementation: keep both
+  features, layout `[onehot4(anchor); π; mult; deg×4; t_k]` with `t_k` at
+  index 10. No other §14.4 value changes.
 - 2026-07-25 (second entry): §14.4.8 collapse-abort refinement from the
   measured container P0.1/P0.3 autopsy of checkpoint `a471010f57e495f0`
   (`outputs/p0_audit_20260725/p0_autopsy_results.json`): the Π row-entropy
@@ -1838,12 +1848,18 @@ edge decision (`docs/lit-review-plan.md` §5).
   test asserts gradient reaches `head_pointer`.
 - **`SlotSet` exposes `adj_logits`**; `L_slotadj` becomes `BCEWithLogits` on
   `adj_logits / τ_adj` with registered `τ_adj < 1`.
-- **Scaffold**: FEAT_DIM 9 → 10 — new per-slot closed-wedge feature
+- **Scaffold**: FEAT_DIM 9 → **11** — new per-slot closed-wedge feature
   `t_k = [Π Â̊_other Π^T]_{kk}` on zero-diagonal `Â̊ = Â − diag(Â)`.
   EDGE_TYPES 3 → 4 — closure block `C = ½(Â̊_src Π + Π Â̊_dst)` at
-  `adj[CLOSE, s_src, s_dst] = C` (transpose opposite); the degree-feature
-  slice widens to 6:10. Required test: **rebuild-symmetry** — the `(j, i)`
-  scaffold built with `Π^T` equals the side-permuted `(i, j)` scaffold.
+  `adj[CLOSE, s_src, s_dst] = C` (transpose opposite). Channel layout:
+  `[onehot4(anchor); π; mult; deg×EDGE_TYPES; t_k]` — the degree slice is
+  mechanically one channel per edge type (`adj.sum(-1)`,
+  `scaffold.py:114`), so it widens 6:9 → **6:10** and `t_k` occupies index
+  **10**. (FEAT_DIM 10 was a miscount: the widened degree slice alone
+  consumes the tenth channel, leaving no index for `t_k`. Owner-confirmed
+  2026-07-25 — see the §12 third entry.) Required test:
+  **rebuild-symmetry** — the `(j, i)` scaffold built with `Π^T` equals the
+  side-permuted `(i, j)` scaffold.
 - **Centered gated conditioning** (supersedes the §14.1 inject equation for
   rev-3.1): `cls ← cls + active · tanh(g) · (XAttn(...) − μ)`; μ is the mean
   over pathway-active, real (`edge_mask = 1`) rows, all-reduced across ranks;

@@ -248,7 +248,7 @@ touching `score_universe`'s scoring path beyond the call-site signature update.
 
 # Wave B — Scaffold, controls, soft matching (WS4, WS3, Fixes D, B2)
 
-## Task 2: Scaffold closure channel — FEAT_DIM 9→10, EDGE_TYPES 3→4
+## Task 2: Scaffold closure channel — FEAT_DIM 9→11, EDGE_TYPES 3→4
 
 **Spec:** §14.4.2 (scaffold bullet). **Files:** `src/model/egostitch/scaffold.py`,
 `src/model/egostitch/ste.py`, tests under `tests/model/`.
@@ -262,7 +262,22 @@ normalization never touched `feats` (`ste.py:46-47`). Only *closure* is missing.
 
 **Implement (functions of `{star, Â, Π}` only — no content, no grounding):**
 
-1. **D1 — per-slot closed-wedge feature**, FEAT_DIM 9 → 10:
+**Channel layout (owner-confirmed 2026-07-25; spec §14.4.2 + §12 third entry).**
+FEAT_DIM 9 → **11**, not 10. The degree slice is mechanically one channel per edge
+type (`adj.sum(-1)`, `scaffold.py:114`), so EDGE_TYPES 3 → 4 by itself widens
+`feats[:, :, 6:9]` to `6:10` and consumes the tenth channel — leaving no index for
+`t_k`. Final layout:
+
+```
+idx 0-3   onehot4(anchor)      SRC, DST, SLOT_SRC, SLOT_DST
+idx 4     pi
+idx 5     mult
+idx 6-9   deg per edge type    star, intra, align, CLOSE
+idx 10    t_k                  closed-wedge mass
+          FEAT_DIM = 11, EDGE_TYPES = 4
+```
+
+1. **D1 — per-slot closed-wedge feature** at index 10:
    `t_k = [Π Â̊_other Π^T]_{kk}`, computed on the **zero-diagonal**
    `Â̊ = Â − diag(Â)`. The zero-diagonal is load-bearing: `sigmoid(h·h^T)` has a
    large diagonal, and `Σ_l Π[k,l]²·Â[l,l]` is alignment-concentration — another
