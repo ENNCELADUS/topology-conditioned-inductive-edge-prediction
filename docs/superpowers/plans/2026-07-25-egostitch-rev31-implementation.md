@@ -36,6 +36,17 @@ things are; verify against the source before editing.
    §14.4, **stop and report** — do not resolve it yourself. Do not edit any file
    under `docs/registrations/` except where a task explicitly says so, and never
    edit a `status: BINDING` registration.
+1b. **Files SHA-pinned by a BINDING registration are immutable.**
+   `docs/registrations/g5_e2e_stage1_preregistration_v2.json` (`status: BINDING`)
+   pins `binding_evidence.configs.*.sha256` for all four v2 arm configs:
+   `configs/egostitch_e2e_breadth_first.yaml`,
+   `configs/egostitch_e2e_f_only_breadth_first.yaml`,
+   `configs/egostitch_e2e_pair_topology_breadth_first.yaml`,
+   `configs/egostitch_e2e_p0_breadth_first.yaml`.
+   Editing any of them changes its digest and makes
+   `_validate_e2e_formal_binding` reject the registered arm — and silently mutates
+   the historical v2 arm's semantics. **Every rev-3.1 config is a NEW v3 file**
+   (Task 11), never an edit to a v2 file.
 2. Do not run training, scoring, gates, or `hpc/*.sh`. Unit/integration tests only.
 3. Every mechanism keeps the terminology guardrail: generated/stitched topology is
    *intermediate context* for predicting `edge(u, v)`. Nothing here is a
@@ -125,8 +136,9 @@ throughout. Outer `λ_recon` is untouched.
 
 | Constant | Value | Provenance |
 |---|---|---|
-| `n_ground` (rev-3.1 default) | `50` | §14.4.4 |
-| `n_ground` (`cosine_pool` arm) | `20` | §14.4.6 |
+| `n_ground` (rev-3.1 `full` and all v3 arms except `cosine_pool`) | `50`, set **explicitly** in each v3 config | §14.4.4 |
+| `n_ground` (`cosine_pool` arm) | `20`, set explicitly | §14.4.6 |
+| `E2EConfig.n_ground` dataclass default | `20` — the legacy value, so an absent key never silently reinterprets a v2 config or a pre-rev-3.1 checkpoint | derived (see below) |
 | slot-recall ceiling @ top-50 | `0.13952495387963418` | P0.2 |
 | slot-recall ceiling @ top-20 | `0.10728125418065595` | P0.2 |
 | G3 gate 1 threshold @ n_g=50 | `0.0698` (= 0.5 × ceiling) | §14.4.7 + P0.2 |
@@ -142,6 +154,18 @@ throughout. Outer `λ_recon` is untouched.
 `τ_adj` and the `L_gate` pos-weight are **calibration-time values that the v3
 registration must freeze**. Expose both as config fields with the defaults above;
 never hard-code them at a call site.
+
+**Why the `n_ground` dataclass default is 20, not 50** (Codex review of Wave A, two
+P1 findings): checkpoints store `model_config` verbatim
+(`train_egostitch.py:4986`), and every pre-rev-3.1 e2e checkpoint — including the
+completed rev-3.0 run behind `docs/results/G5-e2e-stage1-seed0-20260724.md` — has no
+`n_ground` key, because the field did not exist. The v2 arm configs have no key
+either, and they are SHA-pinned (constraint 1b). A dataclass default of 50 would
+silently re-resolve both to 50, changing the grounding pool the scorer builds from
+`model.generator_cfg.n_ground`. Defaulting to 20 makes "absent ⇒ 20" uniformly true
+for checkpoints and configs alike, needs no special-case load logic, and leaves the
+v2 digests intact. The registered rev-3.1 value of 50 is carried by each v3 config
+file explicitly, which is where §14.4.4 binds it.
 
 ---
 
@@ -165,9 +189,11 @@ stale grounding cache is currently **overwritten in place** after a warning
 
 1. `n_ground` becomes settable per arm. `E2EConfig` currently has **no** `n_ground`
    field and always forces the pinned `EgoStitchConfig().n_ground`
-   (`train_egostitch.py:1499-1511`). Add the field, default `50`, plumbed from YAML
-   so the `cosine_pool` arm can pin `20`. Update
-   `configs/egostitch_e2e_breadth_first.yaml` to state `n_ground: 50` explicitly.
+   (`train_egostitch.py:1499-1511`). Add the field, default **`20`** (see the
+   constants block for why the default is the legacy value, not 50), plumbed from
+   YAML so each v3 config can state its value explicitly. **Do not edit any v2 arm
+   config** — they are SHA-pinned by the BINDING v2 registration (constraint 1b).
+   The v3 config files that carry `n_ground: 50` are created in Task 11.
 2. Add `pool_method_hash` to the cache `.npz` schema. It is a SHA-256 over a
    canonical, order-stable serialization of exactly:
    - method id — the literal string `cosine_topk_v1`
@@ -205,7 +231,15 @@ stale grounding cache is currently **overwritten in place** after a warning
   produce different `pool_method_hash` values and cannot share a cache.
 - Own-split-side legality: the pool for a node contains only nodes from that node's
   own role universe.
-- `E2EConfig(n_ground=20)` round-trips through YAML and reaches the pool builder.
+- `E2EConfig(n_ground=50)` round-trips through YAML and reaches the pool builder.
+- **Legacy resolution**: a stored `model_config` (or a v2 config mapping) with no
+  `n_ground` key resolves to `20`, never `50`; a mapping stating `n_ground: 50`
+  resolves to `50`.
+- **v2 digests intact**: the four SHA-pinned v2 arm configs listed in constraint 1b
+  hash to the values recorded in
+  `docs/registrations/g5_e2e_stage1_preregistration_v2.json`'s
+  `binding_evidence.configs.*.sha256`. Assert this in a test — it is the guard that
+  keeps a frozen BINDING arm loadable.
 
 **Out of scope:** any reranker (measured and rejected, §7.1.2); regenerating caches;
 touching `score_universe`'s scoring path beyond the call-site signature update.
@@ -653,6 +687,8 @@ with grounding quality — it reads 0 whenever the gates are shut, regardless of
 
 **Spec:** §14.4.6. **Files:** `src/train_egostitch.py`, `src/score_universe.py`,
 `src/experiments/g5_stage1.py`, `configs/`, tests.
+**Order:** Task 12 runs **before** this task — the v3 config files' `preregistration:`
+field must point at a draft registration that already exists.
 
 **Why this exists:** formal-arm validation is duplicated across the stack and each
 site rejects unknown arms, so a partial migration fails closed in the worst place —
@@ -672,11 +708,17 @@ mid-screen. Three independent definitions exist today: `train_egostitch.py:1227`
    Also migrate the worker's binding-evidence/config checks
    (`train_egostitch.py:1315-1388`) and the scoring CLI's arm/provenance/permanent-null
    enforcement (`score_universe.py:991-1110`, `:2155-2439`).
-2. New arm configs: `configs/egostitch_e2e_cosine_pool_breadth_first.yaml` (identical
-   to `full` except `n_ground: 20`) and
-   `configs/egostitch_e2e_no_l_rel_breadth_first.yaml` (identical to `full` except
-   `w_rel: 0`). Follow the existing per-arm config conventions exactly, including
-   `output_dir`.
+2. **A complete new v3 config set — six files, none of them edits to a v2 config**
+   (constraint 1b: the four v2 arm configs are SHA-pinned by the BINDING v2
+   registration and must hash unchanged):
+   `configs/egostitch_e2e_v3_full_breadth_first.yaml`,
+   `..._v3_f_only_...`, `..._v3_pair_topology_...`, `..._v3_p0_...`,
+   `..._v3_cosine_pool_...`, `..._v3_no_l_rel_...`.
+   Each states `n_ground` explicitly — `50` everywhere except `cosine_pool`, which
+   states `20`. `no_l_rel` sets `w_rel: 0`; every other field matches `full`.
+   `preregistration:` points at the Task 12 v3 draft, and `output_dir` follows the
+   existing per-arm convention under a v3 root. Add a test asserting each v3 config
+   differs from `full` in exactly its one intended field.
 3. Bump the scores-`.npz` meta version and **reject** older versions.
 4. Each arm's checkpoint provenance and scoring semantics (trained vs
    scoring-control) must be representable in run metadata.
