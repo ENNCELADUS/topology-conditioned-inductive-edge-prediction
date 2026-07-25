@@ -41,6 +41,7 @@ docs/
   results/E2-pair-to-topology-gap.md   motivating result note
   results/G5-stage1-seed0-20260715.md  historical superseded-registration run
   results/G5-stage1-seed0-20260717.md  binding frozen-s0 screen (`cut`)
+  results/G5-e2e-stage1-seed0-20260724.md  binding rev-3.0 e2e Stage-1 screen (`cut`)
 figures/                         e2-gap.html, positioning.html (standalone, open in browser)
 data/
   README.md                      benchmark artifact manifest (layout + usage contract)
@@ -192,10 +193,13 @@ nodes?" If a draft starts describing graph generation as the task, it has drifte
    G1 B0/PA-null/B0-alt, G2 ceiling, and G3 Oracle artifacts.
 7. `docs/results/G5-stage1-seed0-20260717.md` — binding frozen-s0 Stage-1 verdict,
    registered metrics, fidelity/cost evidence, and diagnostic `last.pt` interpretation.
-8. `docs/results/G5-stage1-seed0-20260715.md` — historical training evidence and
+8. `docs/results/G5-e2e-stage1-seed0-20260724.md` — binding rev-3.0 e2e Stage-1 screen
+   verdict `cut` (multi-label), the five-arm table, decision checks, probes, and
+   campaign disclosures; disposition pending an owner-side locked-decision discussion.
+9. `docs/results/G5-stage1-seed0-20260715.md` — historical training evidence and
    the explicit boundary that the artifact is not retroactively bound.
-9. `docs/lit-review-plan.md` — literature-review plan, claims K1–K5, the 2×2
-   taxonomy, and the terminology guardrail.
+10. `docs/lit-review-plan.md` — literature-review plan, claims K1–K5, the 2×2
+    taxonomy, and the terminology guardrail.
 
 When these conflict, the more specific/later document refines the earlier one, but
 locked decisions and the locked §0 contract override casual changes — flag conflicts
@@ -249,6 +253,33 @@ spectral MMD regress. It does not replace the formal `best.pt` verdict. The olde
 significance or cross-seed robustness from the one-seed screen; E1/E3 remain
 multi-seed Holm evaluations. The locked disposition is frozen-s0 → motivating arm +
 ablation; rev 3.0 → active G5 build line.
+
+**E2E Stage-1 screen (rev-3.0, 2026-07-24):** the registered five-arm v2 screen
+(registration `g5-e2e-stage1-20260719-conditioned-encoder-stability-screen-v2`,
+binding SHA-256 `7937d8bb5a600219c607ad09ae42e2ef99c63c409dc60322bc63aab763170fdf`,
+implementation commit `c878a9399cba113f6b6a85265c3fec31dd4bd193`) completed training,
+held-out fp32 candidate scoring, and the formal gate on 2026-07-24 (seed 0,
+`world_size=4`, 4 × H20) with binding verdict `cut` (multi-label). Training was
+**valid**: the within-checkpoint liveness death rule did not fire (residual std
+`0.111118`, residual/`f_logit` std ratio `0.0390165`, Spearman vs `f_logit`
+`0.9996438`, top-1% overlap `0.9881700`). Given valid training, four labels apply:
+primary fails on clustering-MMD and BFS-macro RD (only BFS-macro GS passes); the
+matched edge-AUPRC guard fails (`full` `0.705903` vs floor `0.710260` = B0
+`0.730260` − 0.02, though the degree-MMD guard passes); pathway attribution
+establishes no gain (`G_full = clu(b0_e2e_f_only) − clu(full) = 11.7718 − 11.9698 =
+−0.1980648`, so the registered reading withdraws the topology-representation
+headline); and the structure-destruction control fails (paired-bootstrap lower bound
+`0.0`; the `structure_control_6a` shuffle arm is identical to `full` to six decimals).
+`full` reaches BFS-macro GS/RD `0.316899/0.424244`, MMD `13.8037/11.9698/19.2278`,
+AUPRC `0.705903`; `b0_e2e_f_only` reaches AUPRC `0.728873` (near B0) and BFS-macro GS
+`0.326127` (exceeds B0); representation probes show degree R² `0.381877` versus
+clustering `0.061810`/`0.021433` (partialled) and Π/shared-neighbor consistency `0`
+over all 4,096 registered pairs — the conditioning pathway is numerically alive but
+carries degree-like, non-relational signal. Full result:
+`docs/results/G5-e2e-stage1-seed0-20260724.md`. Never claim statistical significance
+or cross-seed robustness from this one-seed screen. The disposition of the rev-3.0
+build line is an owner-side locked-decision discussion — not decided by this screen,
+this note, or any agent.
 
 ## Naming conventions (neutral placeholders — keep them neutral)
 

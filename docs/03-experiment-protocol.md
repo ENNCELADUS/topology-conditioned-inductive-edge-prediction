@@ -509,6 +509,22 @@ rule).
    full-arm-first stop rule must be satisfied before v2 can be bound or any held-out
    scoring begins. DRAFT/debug artifacts are forbidden from candidate/test scoring,
    not merely from the final gate.
+   **E2E v2 binding and verdict (2026-07-23/2026-07-24):** the v2 replacement
+   qualified and bound under registration
+   `g5-e2e-stage1-20260719-conditioned-encoder-stability-screen-v2` (binding SHA-256
+   `7937d8bb...`, implementation commit `c878a939...`) on 2026-07-23 after satisfying
+   spec §13.19's qualification requirements. All four registered arms
+   (`full`/`b0_e2e_f_only`/`pair_topology`/`p0`, plus the `structure_control_6a`
+   shuffle control over `full`'s checkpoint) trained 2026-07-23/2026-07-24 on 4 × H20
+   (`world_size=4`). Training was valid — the within-checkpoint liveness death rule
+   did not fire — and the formal gate published 2026-07-24 23:51 UTC with verdict
+   `cut` (multi-label): of the three primary criteria only BFS-macro GS passed, the
+   matched-AUPRC guard failed, pathway attribution established no gain
+   (`G_full = clu(b0_e2e_f_only) - clu(full) = -0.1980648`), and the
+   structure-destruction control's paired-bootstrap lower bound was `0.0` (fail).
+   This closes the e2e Stage-1 screen; the rev-3.0 build line's disposition is an
+   owner-side locked-decision discussion and is not resolved by this screen. Full
+   result: `docs/results/G5-e2e-stage1-seed0-20260724.md`.
 
 ### 5.1 Priority order (after gates)
 
