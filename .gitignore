@@ -6,8 +6,9 @@ Thumbs.db
 .idea/
 .vscode/
 
-# Local tool state
-.claude/
+# Local tool state (project skills are shared; local settings are not)
+.claude/*
+!.claude/skills/
 .codex/
 .superpowers/
 .worktrees/
