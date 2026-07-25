@@ -174,8 +174,8 @@ class E2EConfig:
     its topo/content conditioning pathways (design rev 3 Sec 3.4-3.5) -- with
     one exception: `n_ground` supersedes the generator's own pinned value for
     this family (spec Sec 14.4.4), since grounding-pool size is a per-arm
-    dial (`full` etc. use the rev-3.1 default 50; the `cosine_pool` ablation
-    arm pins 20).
+    dial (rev-3.1 `full` etc. explicitly pin 50; the `cosine_pool` ablation
+    arm and legacy configs use 20).
 
     Attributes:
         d_model: Pair-trunk hidden width.
@@ -204,7 +204,7 @@ class E2EConfig:
     p_topo: float = 0.15
     p_cont: float = 0.15
     permanent_null: str = "none"
-    n_ground: int = 50
+    n_ground: int = 20
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants.
