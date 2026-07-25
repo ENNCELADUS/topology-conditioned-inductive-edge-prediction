@@ -24,8 +24,6 @@ casual changes — **flag conflicts, don't resolve them unilaterally**.
 - `.claude/skills/hpc-execution/` — `hpc/run.sh`, `g5_stage1.sh`, `qualification.sh`,
   world-size auto-detection, and the config keys that change meaning per model family.
   **Load before any training/scoring/gate command.**
-- `.claude/skills/local-dev-loop/` — pytest/ruff/mypy quirks and the synthetic-fixture
-  rule. **Load before writing tests or trusting a green suite.**
 
 ## The core thesis (do not let it drift)
 
