@@ -890,13 +890,15 @@ class TestPreparePack:
 
 # --------------------------------------------------------------------------- e2e full pipeline
 #
-# Family `egostitch_e2e` forces the internal generator's pinned n_ground=20
-# (`EgoStitchConfig()`'s spec default, not configurable via `E2EConfig`), and
-# `build_grounding_pool` requires `n_ground <= len(train_nodes) - 1` -- so this
-# fixture needs strictly more nodes than the 8-node `_NODES` toy universe used
-# elsewhere in this file.
+# Family `egostitch_e2e` sources `n_ground` from `E2EConfig` (spec Sec 14.4.4;
+# it supersedes the internal generator's own pinned `EgoStitchConfig` default
+# for this family). This fixture pins it explicitly to the pre-rev-3.1
+# default (20) rather than the new rev-3.1 default (50), so `n_ground` stays
+# comfortably below `build_grounding_pool`'s `n_ground <= len(train_nodes) -
+# 1` bound without needing more than the 25-node pipeline universe.
 
 _E2E_PIPELINE_NODES = [f"g{i}" for i in range(25)]
+_E2E_PIPELINE_N_GROUND = 20
 
 
 def _e2e_pipeline_benchmark() -> Benchmark:
@@ -965,11 +967,13 @@ class TestPrepareAndAssembleE2E:
         cfg = _toy_cfg(tmp_path)
         return replace(
             cfg,
-            model=ModelConfig(family="egostitch_e2e", config={}),
+            model=ModelConfig(
+                family="egostitch_e2e", config={"n_ground": _E2E_PIPELINE_N_GROUND}
+            ),
             data=replace(cfg.data, pack_dir=tmp_path / "raw-token-pack"),
         )
 
-    def test_prepare_pack_uses_generator_pinned_n_ground(
+    def test_prepare_pack_uses_e2e_config_n_ground(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import src.data.packed_features as packed_features
@@ -993,7 +997,7 @@ class TestPrepareAndAssembleE2E:
         payload = te.prepare_pack(e2e_cfg, pack_dir, cold_cache=True)
         manifest = cast(dict[str, object], payload["pack_manifest"])
         assert manifest["family"] == "egostitch_e2e"
-        assert manifest["n_ground"] == EgoStitchConfig().n_ground
+        assert manifest["n_ground"] == _E2E_PIPELINE_N_GROUND
         packs = cast(dict[str, dict[str, object]], payload["packs"])
         assert set(packs) == {"f0_grounding", "raw_tokens"}
         assert packs["f0_grounding"]["cold"] is True
@@ -1005,10 +1009,10 @@ class TestPrepareAndAssembleE2E:
             e2e_cfg.data.pack_dir,
         )
 
-        # Warm-path re-validation must agree with the same pinned n_ground.
+        # Warm-path re-validation must agree with the same configured n_ground.
         rebuilt = te.prepare_pack(e2e_cfg, pack_dir, cold_cache=False)
         assert cast(dict[str, object], rebuilt["pack_manifest"])["n_ground"] == (
-            EgoStitchConfig().n_ground
+            _E2E_PIPELINE_N_GROUND
         )
         rebuilt_packs = cast(dict[str, dict[str, object]], rebuilt["packs"])
         assert rebuilt_packs["f0_grounding"]["cold"] is False
@@ -1043,7 +1047,7 @@ class TestPrepareAndAssembleE2E:
         assert len(data.s0) == 0
         assert data.grounding_index.shape == (
             len(_E2E_PIPELINE_NODES),
-            EgoStitchConfig().n_ground,
+            _E2E_PIPELINE_N_GROUND,
         )
 
         token_pack_dir = tmp_path / "token_pack"

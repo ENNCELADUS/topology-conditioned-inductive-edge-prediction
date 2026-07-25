@@ -526,7 +526,6 @@ def produce_e2e_probe_artifact(
     from src.data.grounding import build_grounding_pool
     from src.data.internal_holdout import derive_internal_holdout
     from src.data.partition import build_g_struct, derive_partition
-    from src.model.egostitch.config import EgoStitchConfig
 
     benchmark = te._load_benchmark_for(cfg)
     operative = sorted(set(benchmark.graph.nodes()) - set(cfg.data.expected_missing_features))
@@ -554,20 +553,26 @@ def produce_e2e_probe_artifact(
     matrix, node_index = build_f0_matrix(
         store, nodes, cache_path=cache_dir / "probe_f0.pt", allow_cache_subset=True
     )
-    n_ground = EgoStitchConfig().n_ground
+    # Sourced from the loaded checkpoint's own generator_cfg (spec Sec 14.4.4:
+    # n_ground is per-arm, not the pinned EgoStitchConfig() spec default).
+    n_ground = model.generator_cfg.n_ground
     matrix_np = matrix.numpy()
     grounding_rows: dict[str, list[int]] = {}
     role_universes = (
-        (sorted(holdout.v_fit), "probe_grounding_fit.npz"),
-        (sorted(holdout.v_qual), "probe_grounding_qual.npz"),
-        (sorted(holdout.v_select), "probe_grounding_select.npz"),
+        (sorted(holdout.v_fit), "probe_grounding_fit.npz", "V_fit"),
+        (sorted(holdout.v_qual), "probe_grounding_qual.npz", "V_qual"),
+        (sorted(holdout.v_select), "probe_grounding_select.npz", "V_select"),
     )
-    for role_nodes, cache_name in role_universes:
+    for role_nodes, cache_name, role_universe in role_universes:
         role_rows = np.asarray(
             matrix_np[[node_index[node] for node in role_nodes]], dtype=np.float32
         )
         pool = build_grounding_pool(
-            role_rows, role_nodes, n_ground=n_ground, cache_path=cache_dir / cache_name
+            role_rows,
+            role_nodes,
+            n_ground=n_ground,
+            role_universe=role_universe,
+            cache_path=cache_dir / cache_name,
         )
         for node in role_nodes:
             grounding_rows[node] = [node_index[neighbor] for neighbor in pool[node]]

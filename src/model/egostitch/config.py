@@ -171,7 +171,11 @@ class E2EConfig:
 
     The internal Stage-1 generator keeps its own pinned `EgoStitchConfig`
     defaults (spec Sec 13); these fields size only the pair-encoder trunk and
-    its topo/content conditioning pathways (design rev 3 Sec 3.4-3.5).
+    its topo/content conditioning pathways (design rev 3 Sec 3.4-3.5) -- with
+    one exception: `n_ground` supersedes the generator's own pinned value for
+    this family (spec Sec 14.4.4), since grounding-pool size is a per-arm
+    dial (`full` etc. use the rev-3.1 default 50; the `cosine_pool` ablation
+    arm pins 20).
 
     Attributes:
         d_model: Pair-trunk hidden width.
@@ -184,6 +188,9 @@ class E2EConfig:
         xattn_heads: Gated cross-attention heads (topo/content pathways).
         p_topo: Training-time branch-dropout rate for the topo pathway.
         p_cont: Training-time branch-dropout rate for the content pathway.
+        n_ground: Grounding candidates per node `n_g` (spec Sec 14.4.4;
+            supersedes the internal generator's own pinned `EgoStitchConfig`
+            default for this family).
     """
 
     d_model: int = 512
@@ -197,6 +204,7 @@ class E2EConfig:
     p_topo: float = 0.15
     p_cont: float = 0.15
     permanent_null: str = "none"
+    n_ground: int = 50
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants.
@@ -213,6 +221,7 @@ class E2EConfig:
             "ste_dim",
             "ste_layers",
             "xattn_heads",
+            "n_ground",
         ):
             if int(getattr(self, name)) <= 0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")

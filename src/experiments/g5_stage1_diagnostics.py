@@ -291,7 +291,11 @@ def generate_reports(args: argparse.Namespace) -> tuple[dict[str, object], dict[
         data.f0[[data.node_index[node] for node in test_nodes]].numpy(), dtype=np.float32
     )
     test_pool = build_grounding_pool(
-        test_matrix, test_nodes, n_ground=model.config.n_ground, cache_path=None
+        test_matrix,
+        test_nodes,
+        n_ground=model.config.n_ground,
+        role_universe="test",
+        cache_path=None,
     )
     test_ground = torch.tensor(
         [[data.node_index[neighbor] for neighbor in test_pool[node]] for node in test_nodes],

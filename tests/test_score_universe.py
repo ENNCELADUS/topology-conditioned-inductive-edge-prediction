@@ -822,6 +822,7 @@ def test_legacy_egostitch_cached_scoring_matches_direct_forward(tmp_path: Path) 
         np.asarray(matrix.numpy(), dtype=np.float32),
         node_ids,
         n_ground=model.config.n_ground,
+        role_universe="test",
         cache_path=None,
     )
     pool_rows = torch.tensor(
@@ -1458,6 +1459,7 @@ def test_egostitch_e2e_cached_scoring_matches_uncached_decomposition(tmp_path: P
         np.asarray(matrix.numpy(), dtype=np.float32),
         node_ids,
         n_ground=n_ground,
+        role_universe="test",
         cache_path=tmp_path / "direct-grounding.npz",
     )
     pool_rows = torch.tensor(
@@ -1716,7 +1718,7 @@ def test_egostitch_e2e_scorer_supplies_grounding_batch_keys(
     ``ground_id_a``/``ground_id_b`` identifiers are present with the expected
     shapes and dtypes for every scored batch.
     """
-    from src.model.egostitch.config import EgoStitchConfig
+    from src.model.egostitch.config import E2EConfig
     from src.model.egostitch.e2e_model import EgoStitchE2E
 
     data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
@@ -1742,7 +1744,11 @@ def test_egostitch_e2e_scorer_supplies_grounding_batch_keys(
 
     assert captured, "node cache was never encoded"
     node_universe = len({node for pair in _E2E_PAIRS for node in pair})
-    expected_n_ground = min(EgoStitchConfig().n_ground, node_universe - 1)
+    # `_egostitch_e2e_setup` builds the checkpoint from `_TINY_E2E_CONFIG`,
+    # which does not override `n_ground` -- so the registered value is
+    # `E2EConfig()`'s rev-3.1 default (spec Sec 14.4.4), not the internal
+    # generator's own pinned `EgoStitchConfig()` default.
+    expected_n_ground = min(E2EConfig().n_ground, node_universe - 1)
     for ground, ground_ids in captured:
         assert ground is not None and ground_ids is not None
         rows = ground.shape[0]
@@ -1762,12 +1768,13 @@ def test_egostitch_e2e_scorer_warns_on_n_ground_clamp(
 
     The tiny 3-node fixture (`_E2E_PAIRS` over `{n0, n1, n2}`) can only support
     `len(node_ids) - 1 == 2` grounding candidates, while `EgoStitchE2E`'s
-    internal Stage-1 generator always registers `EgoStitchConfig().n_ground ==
-    20` (`_build_egostitch_e2e` ignores `model_config` for the generator).
-    Every call here silently clamps 20 -> 2; that must now be logged, stating
-    both the registered and effective values.
+    `generator_cfg.n_ground` registers `E2EConfig()`'s rev-3.1 default (spec
+    Sec 14.4.4; `_egostitch_e2e_setup`'s `_TINY_E2E_CONFIG` does not override
+    it). Every call here silently clamps the registered default down to 2;
+    that must now be logged, stating both the registered and effective
+    values.
     """
-    from src.model.egostitch.config import EgoStitchConfig
+    from src.model.egostitch.config import E2EConfig
 
     data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
     output = tmp_path / "scores.npz"
@@ -1778,7 +1785,7 @@ def test_egostitch_e2e_scorer_warns_on_n_ground_clamp(
         )
 
     node_universe = len({node for pair in _E2E_PAIRS for node in pair})
-    registered_n_ground = EgoStitchConfig().n_ground
+    registered_n_ground = E2EConfig().n_ground
     expected_n_ground = min(registered_n_ground, node_universe - 1)
     assert expected_n_ground < registered_n_ground, "fixture must actually trigger the clamp"
 

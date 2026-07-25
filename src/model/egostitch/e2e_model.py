@@ -16,6 +16,7 @@ retraining per arm.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import NamedTuple
 
 import torch
@@ -88,8 +89,10 @@ class EgoStitchE2E(nn.Module):
         super().__init__()
         self.cfg = cfg
         # Stage-1 generator keeps its own pinned spec defaults (spec Sec 13);
-        # E2EConfig sizes only the trunk and its conditioning pathways.
-        self.generator_cfg = EgoStitchConfig()
+        # E2EConfig sizes only the trunk and its conditioning pathways --
+        # except n_ground, which supersedes the generator's pinned default
+        # for this family (spec Sec 14.4.4, per-arm grounding-pool size).
+        self.generator_cfg = replace(EgoStitchConfig(), n_ground=cfg.n_ground)
         self.input_dim = self.generator_cfg.input_dim  # frozen feature dim (spec Sec 0 table)
         self.node_feature_dim = self.generator_cfg.input_dim
         self.generator = EgoStitchStage1(self.generator_cfg, standardize_features=True)

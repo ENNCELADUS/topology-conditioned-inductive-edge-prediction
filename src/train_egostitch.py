@@ -1498,14 +1498,14 @@ def prepare_pack(
 
     # Family `egostitch_e2e` (spec Sec 13.18): `cfg.model.config` validates
     # against `E2EConfig`, not `EgoStitchConfig` -- it sizes only the pair
-    # trunk/conditioning pathways. The internal Stage-1 generator this pack
-    # feeds (F0 matrix + grounding pool) always uses the pinned spec-default
-    # `EgoStitchConfig()` (`e2e_model.py`'s `generator_cfg`), never a value
-    # parsed from `cfg.model.config` -- so `n_ground` must come from there too.
+    # trunk/conditioning pathways, except `n_ground`, which supersedes the
+    # internal Stage-1 generator's pinned `EgoStitchConfig` default for this
+    # family (spec Sec 14.4.4: per-arm grounding-pool size, e.g. `full` uses
+    # the rev-3.1 default 50, `cosine_pool` pins 20).
     is_e2e = cfg.model.family == _EGOSTITCH_E2E_FAMILY
     if is_e2e:
-        E2EConfig.from_mapping(cfg.model.config)  # validate eagerly, fail loudly
-        n_ground = EgoStitchConfig().n_ground
+        e2e_model_cfg = E2EConfig.from_mapping(cfg.model.config)  # validate eagerly, fail loudly
+        n_ground = e2e_model_cfg.n_ground
     else:
         model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
         n_ground = model_cfg.n_ground
@@ -1581,10 +1581,12 @@ def prepare_pack(
             train_rows,
             train_nodes,
             n_ground=n_ground,
+            role_universe="V_fit",
             cache_path=pack_dir / _PACK_GROUNDING_FILENAME,
         )
         files = [_PACK_F0_FILENAME, _PACK_GROUNDING_FILENAME]
         if validation_nodes:
+            assert role is not None
             validation_rows = np.asarray(
                 matrix.numpy()[[index[node] for node in validation_nodes]], dtype=np.float32
             )
@@ -1592,6 +1594,7 @@ def prepare_pack(
                 validation_rows,
                 validation_nodes,
                 n_ground=n_ground,
+                role_universe=role,
                 cache_path=pack_dir / _PACK_VALIDATION_GROUNDING_FILENAME,
             )
             files.append(_PACK_VALIDATION_GROUNDING_FILENAME)
@@ -2001,6 +2004,7 @@ def _assemble_e2e_data(
         fit_rows,
         fit_nodes,
         n_ground=generator_cfg.n_ground,
+        role_universe="V_fit",
         cache_path=grounding_cache,
     )
     grounding_index = np.asarray(
@@ -2026,6 +2030,7 @@ def _assemble_e2e_data(
             validation_rows,
             validation_nodes,
             n_ground=generator_cfg.n_ground,
+            role_universe=role,
             cache_path=validation_cache,
         )
         validation_grounding_index = np.asarray(
@@ -2140,15 +2145,17 @@ def assemble_egostitch_data(
             as the frozen-s0 family (delegated, unchanged, to the internal
             trainable generator), sized off the generator's own pinned
             `EgoStitchConfig()` defaults rather than ``cfg.model.config``
-            (which validates as `E2EConfig` for this family).
+            (which validates as `E2EConfig` for this family) -- except
+            `n_ground`, which supersedes the pinned default for this family
+            (spec Sec 14.4.4).
 
     Returns:
         The `EgoStitchData` bundle.
     """
     is_e2e = cfg.model.family == _EGOSTITCH_E2E_FAMILY
     if is_e2e:
-        E2EConfig.from_mapping(cfg.model.config)  # validate eagerly, fail loudly
-        generator_cfg = EgoStitchConfig()
+        e2e_model_cfg = E2EConfig.from_mapping(cfg.model.config)  # validate eagerly, fail loudly
+        generator_cfg = replace(EgoStitchConfig(), n_ground=e2e_model_cfg.n_ground)
     else:
         generator_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
     if cfg.training is not None:
@@ -2183,7 +2190,11 @@ def assemble_egostitch_data(
         matrix.numpy()[[node_index[node] for node in train_nodes]], dtype=np.float32
     )
     pool = build_grounding_pool(
-        train_rows, train_nodes, n_ground=generator_cfg.n_ground, cache_path=grounding_cache
+        train_rows,
+        train_nodes,
+        n_ground=generator_cfg.n_ground,
+        role_universe="V_fit",
+        cache_path=grounding_cache,
     )
     grounding_index = np.array(
         [[node_index[neighbor] for neighbor in pool[node]] for node in train_nodes],

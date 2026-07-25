@@ -845,9 +845,11 @@ def _build_egostitch_e2e(model_config: dict[str, object]) -> nn.Module:
     """Build an `EgoStitchE2E` model from its checkpointed config (design rev 3).
 
     The internal Stage-1 generator keeps its own pinned spec defaults
-    (``EgoStitchConfig()``, spec Sec 13) regardless of `model_config`; only the
-    pair-trunk/conditioning fields in `E2EConfig` are checkpoint-configurable
-    (design rev 3 Sec 3.4-3.5).
+    (``EgoStitchConfig()``, spec Sec 13) regardless of `model_config`, except
+    `n_ground`, which is checkpoint-configurable via `E2EConfig` and
+    supersedes the generator's pinned default for this family (spec Sec
+    14.4.4). The remaining pair-trunk/conditioning fields in `E2EConfig` are
+    likewise checkpoint-configurable (design rev 3 Sec 3.4-3.5).
     """
     from src.model.egostitch.config import E2EConfig
     from src.model.egostitch.e2e_model import EgoStitchE2E
@@ -1615,6 +1617,7 @@ def _score_egostitch(
         np.asarray(matrix.numpy(), dtype=np.float32),
         node_ids,
         n_ground=model.config.n_ground,
+        role_universe="test",
         cache_path=grounding_cache,
     )
     pool_rows = torch.tensor(
@@ -1822,6 +1825,7 @@ def _score_egostitch_e2e(
         np.asarray(matrix.numpy(), dtype=np.float32),
         node_ids,
         n_ground=n_ground,
+        role_universe="test",
         cache_path=grounding_cache,
     )
     pool_rows = torch.tensor(
