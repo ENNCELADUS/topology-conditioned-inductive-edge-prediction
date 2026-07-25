@@ -42,6 +42,18 @@ class STEncoder(nn.Module):
 
     def forward(self, scaffold: ScaffoldTokens) -> torch.Tensor:
         """Encode scaffold tokens to ``(B, V, d_model)`` conditioning states."""
+        if scaffold.feats.ndim != 3 or scaffold.feats.shape[-1] != FEAT_DIM:
+            raise ValueError(
+                f"scaffold feature channel count must be {FEAT_DIM}, "
+                f"got shape {tuple(scaffold.feats.shape)}"
+            )
+        b, v, _ = scaffold.feats.shape
+        expected_adj = (b, EDGE_TYPES, v, v)
+        if scaffold.adj.shape != expected_adj:
+            raise ValueError(
+                f"scaffold edge-type adjacency shape must be {expected_adj}, "
+                f"got {tuple(scaffold.adj.shape)}"
+            )
         # normalize adjacency rows so hub scaffolds do not blow up activations
         deg = scaffold.adj.sum(dim=-1, keepdim=True).clamp(min=1.0)
         adj = scaffold.adj / deg

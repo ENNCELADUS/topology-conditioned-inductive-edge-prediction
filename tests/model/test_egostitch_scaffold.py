@@ -34,6 +34,8 @@ def test_scaffold_shapes_and_layout() -> None:
     plan = torch.rand(2, 4, 4)
     out = build_scaffold(si, sj, plan)
     assert isinstance(out, ScaffoldTokens)
+    assert FEAT_DIM == 11
+    assert EDGE_TYPES == 4
     v = 2 + 2 * 4
     assert out.feats.shape == (2, v, FEAT_DIM)
     assert out.adj.shape == (2, EDGE_TYPES, v, v)
@@ -42,6 +44,108 @@ def test_scaffold_shapes_and_layout() -> None:
     assert torch.equal(onehot.sum(-1), torch.ones(2, v))
     assert bool(onehot[:, 0, 0].all()) and bool(onehot[:, 1, 1].all())
     assert bool(onehot[:, 2 : 2 + 4, 2].all()) and bool(onehot[:, 2 + 4 :, 3].all())
+    assert torch.allclose(out.feats[..., 6:10], out.adj.sum(dim=-1).permute(0, 2, 1))
+
+
+def test_scaffold_rebuild_symmetry() -> None:
+    assert (FEAT_DIM, EDGE_TYPES) == (11, 4)
+    si, sj = _slots(seed=0), _slots(seed=1)
+    plan = torch.rand(2, 4, 4)
+    ij = build_scaffold(si, sj, plan)
+    ji = build_scaffold(sj, si, plan.transpose(1, 2))
+    side_perm = torch.tensor([1, 0, 6, 7, 8, 9, 2, 3, 4, 5])
+    anchor_perm = torch.tensor([1, 0, 3, 2])
+    expected_feats = ij.feats[:, side_perm].clone()
+    expected_feats[..., :N_ANCHOR_TYPES] = expected_feats[..., anchor_perm]
+    expected_adj = ij.adj[:, :, side_perm][:, :, :, side_perm]
+    assert torch.allclose(ji.feats, expected_feats, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(ji.adj, expected_adj, atol=1e-6, rtol=1e-6)
+
+
+def test_closed_wedge_feature_ignores_adjacency_diagonal() -> None:
+    si, sj = _slots(b=1, k=3, seed=0), _slots(b=1, k=3, seed=1)
+    plan = torch.tensor([[[0.2, 0.3, 0.5], [0.6, 0.1, 0.3], [0.4, 0.4, 0.2]]])
+    diagonal_only_i = si._replace(adj=torch.diag_embed(torch.tensor([[2.0, 3.0, 4.0]])))
+    diagonal_only_j = sj._replace(adj=torch.diag_embed(torch.tensor([[5.0, 6.0, 7.0]])))
+    zero_off_diag = build_scaffold(diagonal_only_i, diagonal_only_j, plan)
+    assert torch.equal(zero_off_diag.feats[..., 10], torch.zeros(1, 8))
+
+    baseline = build_scaffold(si, sj, plan)
+    adj_i_zero = si.adj - torch.diag_embed(torch.diagonal(si.adj, dim1=-2, dim2=-1))
+    adj_j_zero = sj.adj - torch.diag_embed(torch.diagonal(sj.adj, dim1=-2, dim2=-1))
+    expected_i = torch.diagonal(plan @ adj_j_zero @ plan.transpose(1, 2), dim1=-2, dim2=-1)
+    expected_j = torch.diagonal(plan.transpose(1, 2) @ adj_i_zero @ plan, dim1=-2, dim2=-1)
+    assert torch.allclose(baseline.feats[:, 2:5, 10], expected_i, atol=1e-6)
+    assert torch.allclose(baseline.feats[:, 5:8, 10], expected_j, atol=1e-6)
+    changed_i = si._replace(
+        adj=si.adj + torch.diag_embed(torch.tensor([[10.0, 20.0, 30.0]]))
+    )
+    changed_j = sj._replace(
+        adj=sj.adj + torch.diag_embed(torch.tensor([[40.0, 50.0, 60.0]]))
+    )
+    changed = build_scaffold(changed_i, changed_j, plan)
+    assert torch.allclose(changed.feats[..., 10], baseline.feats[..., 10], atol=1e-6)
+
+
+def test_closure_edge_matches_hand_built_three_slot_example() -> None:
+    si, sj = _slots(b=1, k=3, seed=0), _slots(b=1, k=3, seed=1)
+    si = si._replace(
+        adj=torch.tensor([[[9.0, 1.0, 2.0], [1.0, 8.0, 3.0], [2.0, 3.0, 7.0]]])
+    )
+    sj = sj._replace(
+        adj=torch.tensor([[[6.0, 4.0, 5.0], [4.0, 5.0, 6.0], [5.0, 6.0, 4.0]]])
+    )
+    plan = torch.diag_embed(torch.tensor([[1.0, 2.0, 3.0]]))
+    out = build_scaffold(si, sj, plan)
+    expected = torch.tensor([[[0.0, 3.0, 5.5], [4.5, 0.0, 10.5], [8.5, 12.0, 0.0]]])
+    assert torch.allclose(out.adj[:, 3, 2:5, 5:8], expected, atol=1e-6)
+    assert torch.allclose(out.adj[:, 3, 5:8, 2:5], expected.transpose(1, 2), atol=1e-6)
+
+
+def test_closure_fp32_island_preserves_values_and_gradients_under_bf16() -> None:
+    si, sj = _slots(b=1, k=3, seed=0), _slots(b=1, k=3, seed=1)
+    adj_i = si.adj.to(torch.bfloat16).detach().requires_grad_()
+    adj_j = sj.adj.to(torch.bfloat16).detach().requires_grad_()
+    plan = (
+        torch.tensor([[[0.2, 0.3, 0.5], [0.6, 0.1, 0.3], [0.4, 0.4, 0.2]]])
+        .to(torch.bfloat16)
+        .requires_grad_()
+    )
+    si = si._replace(
+        pi=si.pi.to(torch.bfloat16),
+        mult=si.mult.to(torch.bfloat16),
+        adj=adj_i,
+    )
+    sj = sj._replace(
+        pi=sj.pi.to(torch.bfloat16),
+        mult=sj.mult.to(torch.bfloat16),
+        adj=adj_j,
+    )
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = build_scaffold(si, sj, plan)
+
+    assert out.feats.dtype == torch.float32
+    assert out.adj.dtype == torch.float32
+    plan32, adj_i32, adj_j32 = plan.float(), adj_i.float(), adj_j.float()
+    adj_i_zero = adj_i32 - torch.diag_embed(torch.diagonal(adj_i32, dim1=-2, dim2=-1))
+    adj_j_zero = adj_j32 - torch.diag_embed(torch.diagonal(adj_j32, dim1=-2, dim2=-1))
+    expected_c = 0.5 * (adj_i_zero @ plan32 + plan32 @ adj_j_zero)
+    expected_t_i = torch.diagonal(
+        plan32 @ adj_j_zero @ plan32.transpose(1, 2), dim1=-2, dim2=-1
+    )
+    expected_t_j = torch.diagonal(
+        plan32.transpose(1, 2) @ adj_i_zero @ plan32, dim1=-2, dim2=-1
+    )
+    assert torch.allclose(out.adj[:, 3, 2:5, 5:8], expected_c, atol=1e-6)
+    assert torch.allclose(out.feats[:, 2:5, 10], expected_t_i, atol=1e-6)
+    assert torch.allclose(out.feats[:, 5:8, 10], expected_t_j, atol=1e-6)
+
+    (out.adj[:, 3].sum() + out.feats[..., 10].sum()).backward()
+    for grad in (plan.grad, adj_i.grad, adj_j.grad):
+        assert grad is not None
+        assert bool(torch.isfinite(grad).all())
+        assert bool((grad != 0).any())
 
 
 def test_scaffold_contains_no_content_features() -> None:

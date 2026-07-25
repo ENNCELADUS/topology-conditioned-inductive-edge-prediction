@@ -1,8 +1,9 @@
 """Structure-only stitched scaffold (design rev 3 §3.1–§3.2).
 
 Node order: [endpoint_src, endpoint_dst, slots_src(K), slots_dst(K)].
-Node features (FEAT_DIM=9): [onehot4(anchor); pi; mult; deg_star; deg_intra;
-deg_align]. Edge types (EDGE_TYPES=3): star / intra-side slot-slot / alignment.
+Node features (FEAT_DIM=11): [onehot4(anchor); pi; mult; deg_star; deg_intra;
+deg_align; deg_close; closed-wedge mass]. Edge types (EDGE_TYPES=4):
+star / intra-side slot-slot / alignment / closure.
 Deliberately EXCLUDED: slot content h, grounding gate g, pointer, and the
 grounded-identity-match label — those belong to the content pathway.
 """
@@ -19,9 +20,9 @@ from src.model.egostitch.imagine import SlotSet
 from src.model.egostitch.layers import stable_log
 
 N_ANCHOR_TYPES = 4
-FEAT_DIM = 9
-EDGE_TYPES = 3
-_STAR, _INTRA, _ALIGN = 0, 1, 2
+FEAT_DIM = 11
+EDGE_TYPES = 4
+_STAR, _INTRA, _ALIGN, _CLOSE = 0, 1, 2, 3
 _SRC, _DST, _SLOT_SRC, _SLOT_DST = 0, 1, 2, 3
 
 
@@ -82,37 +83,69 @@ def build_scaffold(slots_src: SlotSet, slots_dst: SlotSet, plan: torch.Tensor) -
     if plan.shape != (b, k, k):
         raise ValueError(f"plan shape must be {(b, k, k)}, got {tuple(plan.shape)}")
     v = 2 + 2 * k
-    device, dtype = slots_src.pi.device, slots_src.pi.dtype
+    device = slots_src.pi.device
 
-    adj = torch.zeros(b, EDGE_TYPES, v, v, device=device, dtype=dtype)
-    s_src = slice(2, 2 + k)
-    s_dst = slice(2 + k, v)
+    # fp32 island: promote before forming adjacency products, closed wedges,
+    # or closure blocks; casting bf16 products afterward is too late.
+    with torch.autocast(device_type=device.type, enabled=False):
+        pi_src, pi_dst = slots_src.pi.float(), slots_dst.pi.float()
+        mult_src, mult_dst = slots_src.mult.float(), slots_dst.mult.float()
+        slot_adj_src, slot_adj_dst = slots_src.adj.float(), slots_dst.adj.float()
+        plan32 = plan.float()
+        adj = torch.zeros(b, EDGE_TYPES, v, v, device=device, dtype=torch.float32)
+        s_src = slice(2, 2 + k)
+        s_dst = slice(2 + k, v)
 
-    star_src = slots_src.pi * slots_src.mult
-    star_dst = slots_dst.pi * slots_dst.mult
-    adj[:, _STAR, 0, s_src] = star_src
-    adj[:, _STAR, s_src, 0] = star_src
-    adj[:, _STAR, 1, s_dst] = star_dst
-    adj[:, _STAR, s_dst, 1] = star_dst
+        star_src = pi_src * mult_src
+        star_dst = pi_dst * mult_dst
+        adj[:, _STAR, 0, s_src] = star_src
+        adj[:, _STAR, s_src, 0] = star_src
+        adj[:, _STAR, 1, s_dst] = star_dst
+        adj[:, _STAR, s_dst, 1] = star_dst
 
-    intra_src = slots_src.adj * slots_src.pi[:, :, None] * slots_src.pi[:, None, :]
-    intra_dst = slots_dst.adj * slots_dst.pi[:, :, None] * slots_dst.pi[:, None, :]
-    adj[:, _INTRA, s_src, s_src] = intra_src
-    adj[:, _INTRA, s_dst, s_dst] = intra_dst
+        intra_src = slot_adj_src * pi_src[:, :, None] * pi_src[:, None, :]
+        intra_dst = slot_adj_dst * pi_dst[:, :, None] * pi_dst[:, None, :]
+        adj[:, _INTRA, s_src, s_src] = intra_src
+        adj[:, _INTRA, s_dst, s_dst] = intra_dst
 
-    adj[:, _ALIGN, s_src, s_dst] = plan
-    adj[:, _ALIGN, s_dst, s_src] = plan.transpose(1, 2)
+        adj[:, _ALIGN, s_src, s_dst] = plan32
+        adj[:, _ALIGN, s_dst, s_src] = plan32.transpose(1, 2)
 
-    feats = torch.zeros(b, v, FEAT_DIM, device=device, dtype=dtype)
-    feats[:, 0, _SRC] = 1.0
-    feats[:, 1, _DST] = 1.0
-    feats[:, s_src, _SLOT_SRC] = 1.0
-    feats[:, s_dst, _SLOT_DST] = 1.0
-    ones = torch.ones(b, 1, device=device, dtype=dtype)
-    feats[:, :, 4] = torch.cat([ones, ones, slots_src.pi, slots_dst.pi], dim=1)
-    feats[:, :, 5] = torch.cat([ones, ones, slots_src.mult, slots_dst.mult], dim=1)
-    feats[:, :, 6:9] = adj.sum(dim=-1).permute(0, 2, 1)
-    return ScaffoldTokens(feats=feats, adj=adj)
+        adj_src_zero = slot_adj_src - torch.diag_embed(
+            torch.diagonal(slot_adj_src, dim1=-2, dim2=-1)
+        )
+        adj_dst_zero = slot_adj_dst - torch.diag_embed(
+            torch.diagonal(slot_adj_dst, dim1=-2, dim2=-1)
+        )
+        closure = 0.5 * (
+            torch.bmm(adj_src_zero, plan32) + torch.bmm(plan32, adj_dst_zero)
+        )
+        adj[:, _CLOSE, s_src, s_dst] = closure
+        adj[:, _CLOSE, s_dst, s_src] = closure.transpose(1, 2)
+
+        t_src = torch.diagonal(
+            torch.bmm(torch.bmm(plan32, adj_dst_zero), plan32.transpose(1, 2)),
+            dim1=-2,
+            dim2=-1,
+        )
+        t_dst = torch.diagonal(
+            torch.bmm(torch.bmm(plan32.transpose(1, 2), adj_src_zero), plan32),
+            dim1=-2,
+            dim2=-1,
+        )
+
+        feats = torch.zeros(b, v, FEAT_DIM, device=device, dtype=torch.float32)
+        feats[:, 0, _SRC] = 1.0
+        feats[:, 1, _DST] = 1.0
+        feats[:, s_src, _SLOT_SRC] = 1.0
+        feats[:, s_dst, _SLOT_DST] = 1.0
+        ones = torch.ones(b, 1, device=device, dtype=torch.float32)
+        feats[:, :, 4] = torch.cat([ones, ones, pi_src, pi_dst], dim=1)
+        feats[:, :, 5] = torch.cat([ones, ones, mult_src, mult_dst], dim=1)
+        feats[:, :, 6:10] = adj.sum(dim=-1).permute(0, 2, 1)
+        feats[:, s_src, 10] = t_src
+        feats[:, s_dst, 10] = t_dst
+        return ScaffoldTokens(feats=feats, adj=adj)
 
 
 def swap_direction(tokens: ScaffoldTokens) -> ScaffoldTokens:

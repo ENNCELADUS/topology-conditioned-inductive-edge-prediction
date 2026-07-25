@@ -1,7 +1,8 @@
 """Tests for the stitched-topology encoder (design rev 3 §3.3)."""
 
+import pytest
 import torch
-from src.model.egostitch.scaffold import ScaffoldTokens, build_scaffold
+from src.model.egostitch.scaffold import EDGE_TYPES, FEAT_DIM, ScaffoldTokens, build_scaffold
 from src.model.egostitch.ste import STEncoder
 
 from tests.model.test_egostitch_scaffold import _slots
@@ -37,3 +38,18 @@ def test_ste_is_structure_sensitive() -> None:
     sc = _scaffold()
     rewired = ScaffoldTokens(feats=sc.feats, adj=sc.adj.flip(dims=[2]))
     assert not torch.allclose(enc(sc), enc(rewired), atol=1e-4)
+
+
+@pytest.mark.parametrize(
+    ("feats", "adj", "message"),
+    [
+        (torch.zeros(2, 10, FEAT_DIM - 1), torch.zeros(2, EDGE_TYPES, 10, 10), "feature"),
+        (torch.zeros(2, 10, FEAT_DIM), torch.zeros(2, EDGE_TYPES - 1, 10, 10), "edge"),
+    ],
+)
+def test_ste_shape_contract_fails_closed(
+    feats: torch.Tensor, adj: torch.Tensor, message: str
+) -> None:
+    enc = STEncoder(d_model=64, ste_dim=32, n_layers=2)
+    with pytest.raises(ValueError, match=message):
+        enc(ScaffoldTokens(feats=feats, adj=adj))
