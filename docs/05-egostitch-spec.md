@@ -512,6 +512,34 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-25 (second entry): §14.4.8 collapse-abort refinement from the
+  measured container P0.1/P0.3 autopsy of checkpoint `a471010f57e495f0`
+  (`outputs/p0_audit_20260725/p0_autopsy_results.json`): the Π row-entropy
+  arm was measured blind to full collapse (0.624 normalized on a fully
+  collapsed plan, because the `π·m` marginals concentrate rows) and is
+  replaced by a rank-1 marginal-residual criterion; the `h`-cosine arm is
+  unchanged (measured 0.9997 vs the 0.95 trigger — it catches the v2
+  collapse outright). Autopsy also confirms: pointer exactly uniform
+  (max prob 0.052 ≈ 1/n_g, entropy 0.9999), gate never above 0.5 anywhere
+  (mean 0.088), Â off-diagonal constant 0.5014 ± 0.0004.
+- 2026-07-25: added §14.4 — the rev-3.1 relational-repair contract for the
+  next `egostitch_e2e` build (owner-delegated decisions, design trail
+  `docs/superpowers/specs/2026-07-25-egostitch-e2e-relational-repair-design.md`
+  r5; P0 audits at `outputs/p0_audit_20260725/`). New `L_recon` components
+  (`L_ptr`/`L_align`/`L_div`/`L_rel`) with a masked all-reduced reduction
+  contract and node-identity-keyed target sampling; soft matched flags;
+  logit-space `L_slotadj` via `SlotSet.adj_logits`; scaffold closure channel
+  (FEAT_DIM 10, EDGE_TYPES 4); centered gated conditioning (supersedes the
+  §14.1 inject equation for rev-3.1); joint-entry curriculum (supersedes
+  §13.19.1 Phase-A `pair_only` for rev-3.1); grounding `n_g = 50` with the
+  widened `pool_method_hash` cache manifest (supersedes the §13.12 value for
+  this family; the measured P0.2 curve rejected the reranker and left
+  protocol §0 untouched); 6a-v3/6e-v1 controls; the eight-arm v3 screen
+  schema with full provenance migration and artifact version bumps;
+  Π-consistency v2; and the two-stage V_fit-calibrate → V_qual-rehearsal
+  qualification gates. Authorizes implementation only; execution requires a
+  fresh BINDING v3 registration. The completed v2 screen's record (§13.19,
+  five-arm schema, `n_g = 20`) is unchanged as history.
 - 2026-07-24: gate-side telemetry shape fix. The §13.17 registered names
   `grad_rms_trunk`/`grad_rms_ste`/`grad_rms_content` are published by the
   worker nested under `submodule_gradient_rms` per fixed-replay gradient row;
@@ -1144,6 +1172,13 @@ hashed: training/overfit=`V_fit`, rehearsal=`V_qual`, formal internal selection=
 `V_select`, and external scoring=the original test side. A cache for one universe may
 not serve another. In particular, rehearsal may not read or encode a `V_select` row.
 
+**Rev-3.1 (2026-07-25, §14.4.4):** for the rev-3.1 build, `n_g = 50` (the
+measured P0.2 ceiling curve; the reranker alternative was measured and
+rejected) and the cache manifest binds `pool_method_hash` = H(method id,
+`n_g`, shortlist M when present, ordered F0/source-feature-pack digest,
+role-universe identity); loaders fail closed on any mismatch. `n_g = 20`
+remains the recorded contract of the completed v2 screen.
+
 ### 13.13 Runtime budget
 
 §11's 60-minute cold-run pin applies to the formal E2 B0 V3.1 run only. The
@@ -1372,6 +1407,12 @@ nodes at inference, so wiring them at inference would violate the inductive
 protocol (CLAUDE.md Integrity gates).
 
 ### 13.19 E2E stability-screen replacement (v2; prospective)
+
+**Scope note (2026-07-25):** §13.19 remains the completed v2 screen's binding
+record. For the rev-3.1 build, §14.4 supersedes §13.19.1's Phase-A
+`pair_only` curriculum and extends §13.19.4 with the two-stage
+calibrate/rehearse qualification gates (§14.4.7); every other §13.19 guard,
+eligibility, and binding rule carries forward unless §14.4 states otherwise.
 
 **Evidence and version boundary.** The v1 `full` arm completed the engineering
 `pack -> probe -> train -> publish` pipeline, but the selected checkpoint came from
@@ -1735,3 +1776,159 @@ cache is retired for this family.
    `docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md`
    (B0.py untouched; conditioned trunk subclass; train-mask ≡ eval-bypass and
    symmetry tests as acceptance criteria).
+
+### 14.4 Rev-3.1 relational repair (2026-07-25; normative for the next e2e build)
+
+**Provenance and scope.** Decisions were owner-delegated on 2026-07-25 and are
+recorded, with full rationale and the four-round review trail, in
+`docs/superpowers/specs/2026-07-25-egostitch-e2e-relational-repair-design.md`
+(r5). Phase-0 audit evidence is archived under `outputs/p0_audit_20260725/`
+(local P0.2/P0.4; container P0.1/P0.3). This section **authorizes
+implementation only**; execution requires a fresh v3 registration with
+`status: BINDING` (§13.18 enforcement). §13.19 remains the completed v2
+screen's binding record; §14.4 supersedes it for rev-3.1 only where stated.
+All generated/stitched structure remains intermediate context for the binary
+edge decision (`docs/lit-review-plan.md` §5).
+
+#### 14.4.1 Loss components (fold into `L_recon`; outer objective unchanged)
+
+`L_recon` (rev-3.1, family `egostitch_e2e`) `= 1.0·L_feat + 0.5·L_exist +
+0.25·L_mult + 0.5·L_deg + 0.5·L_slotadj + 0.25·L_gate + 0.25·L_ptr +
+0.5·L_align + 0.1·L_div + 0.25·L_rel`.
+
+- **`L_ptr`**: `CE(pointer_k, pool_index(t_k))` over Hungarian-matched slots
+  whose target is in the pool; all other slots masked.
+- **`L_align`** (edge-stream positive pairs only): teacher cells
+  `S = {(k, l) : target_id_a(match(k)) = target_id_b(match(l))}` from the two
+  endpoints' Hungarian matchings (K-capped; P0.4 measured `P(|S|>0) = 0.663`,
+  `E[|S|] = 2.12` — the uncapped fallback is not used);
+  `L_align = −(1/|S|) Σ_{(k,l)∈S} ½·[log(Π[k,l]/Σ_{l'}Π[k,l']) +
+  log(Π[k,l]/Σ_{k'}Π[k',l])]`; pairs with `S = ∅` skipped. Row/column-
+  conditional only — the Sinkhorn marginals are not a gradient target.
+- **`L_div`**: `mean max(0, cos(h_k, h_l) − τ_div)²` over slot pairs with at
+  most one Hungarian-matched slot; `τ_div = 0.5` initial.
+- **`L_rel`**: a 2-layer head on the STE AB-direction pair state (mean over
+  scaffold tokens) predicts `log1p(common-neighbor count)` and neighborhood
+  Jaccard, computed from the training message graph **independently for every
+  pair, positive and negative** (a sampled non-edge with common neighbors
+  receives its true nonzero targets — required regression motif). Huber loss.
+  The head is excluded from every scored logit; `L_rel` is its own telemetry
+  family; its removal is the formal `no_l_rel` arm.
+- **`L_gate`**: pos-weighted BCE; weight is a registered constant from the
+  measured in-pool rate.
+- **Anneal**: per-component factors 1.0 → 0.25 across the edge-active phase
+  for `{L_feat, L_exist, L_mult, L_deg}` only; every other component stays at
+  weight 1.0 throughout. Outer `λ_recon` unchanged.
+- **Reduction contract** (§13.19.1-class): `L_rel`/`L_align` are
+  `edge_mask`-weighted (for `L_align`: positive-and-real-row-weighted) global
+  means with an all-reduced real-row denominator. Required test:
+  per-parameter gradient and loss equality at world sizes 1 vs 2 with unequal
+  tails and padded filler rows.
+- **Target sampling**: edge-stream ego-target subsets are keyed
+  `rng(blake2b(node_id) ⊕ (seed, epoch))` — never rank, step, or pair — so a
+  node's target subset is epoch-fixed across pairs, ranks, and directions.
+  `L_rel` targets use no RNG. The invariance contract is per-pair; negative
+  stream composition remains `(seed, epoch, rank)`-drawn as in v2.
+
+#### 14.4.2 Architecture deltas
+
+- **Soft matched flags**: with shared-id indicator `I[g_a, g_b]`,
+  `M = p_a I p_b^T`, `matched_a[k] = gate_a[k] · max_l(M[k,l] · gate_b[l])`
+  (BA uses `M^T`). Train and eval use the identical soft form; a required
+  test asserts gradient reaches `head_pointer`.
+- **`SlotSet` exposes `adj_logits`**; `L_slotadj` becomes `BCEWithLogits` on
+  `adj_logits / τ_adj` with registered `τ_adj < 1`.
+- **Scaffold**: FEAT_DIM 9 → 10 — new per-slot closed-wedge feature
+  `t_k = [Π Â̊_other Π^T]_{kk}` on zero-diagonal `Â̊ = Â − diag(Â)`.
+  EDGE_TYPES 3 → 4 — closure block `C = ½(Â̊_src Π + Π Â̊_dst)` at
+  `adj[CLOSE, s_src, s_dst] = C` (transpose opposite); the degree-feature
+  slice widens to 6:10. Required test: **rebuild-symmetry** — the `(j, i)`
+  scaffold built with `Π^T` equals the side-permuted `(i, j)` scaffold.
+- **Centered gated conditioning** (supersedes the §14.1 inject equation for
+  rev-3.1): `cls ← cls + active · tanh(g) · (XAttn(...) − μ)`; μ is the mean
+  over pathway-active, real (`edge_mask = 1`) rows, all-reduced across ranks;
+  eval uses a synchronized EMA stored in the checkpoint. Inactive rows keep
+  the exact-identity bypass, preserving the §14.2 checkpoint-exact null
+  taxonomy.
+
+#### 14.4.3 Curriculum
+
+Warm-start remains reconstruction-only (no `L_edge`). From the **first
+edge-active step**, the trunk, STE, gates, and both conditioning pathways
+train jointly — the v2 Phase-A `pair_only` head start is removed (supersedes
+§13.19.1 for rev-3.1). Branch dropout `p_topo = p_cont = 0.15` unchanged.
+
+#### 14.4.4 Grounding (supersedes the §13.12 value for this family)
+
+`n_g = 50`, exact top-`n_g` cosine within the node's §13.12 role universe.
+No reranker: the measured P0.2 curve (e_sup pair ceilings 0.095 / 0.134 /
+0.179 for cosine top-20/50/100; B0-alt rerank ≈ cosine at 2.5× pool size)
+fired the registered stop rule, and the delegated resolution re-scoped the
+grounded-identity chain to a **secondary** channel — every claim about it
+carries its measured ceiling (≈ 0.134 of e_sup positives at `n_g = 50`).
+Pool caches bind `pool_method_hash = H(method id, n_g, shortlist M when
+present, ordered F0/source-feature-pack digest, role-universe identity)`;
+loaders fail closed on any mismatch (regression tests: stale-method and
+mutated-features-same-ids).
+
+#### 14.4.5 Structure controls
+
+- **6a-v3**: within-pair slot-axis permutations of `Â_src`, `Â_dst`, `Π`
+  applied at scaffold-build input (v2 blake2b canonical-pair keying), then a
+  full scaffold rebuild so every derived channel (incl. `t_k`, `C`, 6:10)
+  recomputes from the shuffled structure.
+- **6e-v1**: canonical-pair-keyed checkerboard swaps — `N_swap = 8·K²` keyed
+  draws; each selects rows `(i, k)` and columns `(j, l)` and transfers
+  `δ = u · min(w_il, w_kj)` (keyed `u ∈ (0,1)`): `w_ij, w_kl += δ`;
+  `w_il, w_kj −= δ` — applied to `Â̊_src`, `Â̊_dst` (symmetrized) and `Π`,
+  then scaffold rebuild. Every row/column sum and the total mass are exactly
+  preserved; higher-order connectivity is destroyed. Required tests: marginal
+  preservation to fp32 tolerance; cross-process determinism; non-inertness on
+  a random non-collapsed model.
+
+#### 14.4.6 v3 screen schema (eight arms)
+
+Six trained checkpoints — `full`, `b0_e2e_f_only`, `pair_topology`, `p0`,
+`cosine_pool` (identical to `full` except status-quo `n_g = 20` cosine
+pools), `no_l_rel` (identical to `full` except `w_rel = 0`) — plus two
+scoring-time controls over `full`'s checkpoint: `6a-v3`, `6e-v1`. Every
+formal-arm constant, binding-evidence validator, scoring CLI/provenance enum,
+run-metadata schema field, and test fixture migrates to this schema and
+fails closed on the v2 five-arm shape. Artifact version bumps:
+`egostitch_e2e_probe_v2`; the scores-`.npz` meta version increments; old
+versions are rejected.
+
+#### 14.4.7 Probes and two-stage qualification (extends §13.19.4)
+
+Probes: **Π-consistency v2** = plan mass on double-Hungarian same-identity
+cells / total plan mass (pool-independent; v1 retained with its honest
+grounding-chain scope); per-run slot recall@`n_g`; shared-neighbor-count R²
+from STE pair states; the four slot-dispersion statistics (π std, mean
+pairwise `h` cosine, `Â` off-diagonal std, `Π` row entropy).
+
+Qualification: **calibration exclusively on `V_fit`** (`G_fit` quantities);
+thresholds frozen into the draft v3 registration together with the
+implementation; then a **single `V_qual` rehearsal** evaluates the frozen
+gates prospectively (≤3 attempts total; `V_select` sealed until the bound
+run). Frozen gates: (1) slot recall ≥ 0.5 × the pool's measured recall
+ceiling; (2) Π-consistency v2 > 0.05; (3) degree-partialled clustering probe
+R² ≥ 0.10; (4) the 6a-v3 control moves clustering-MMD beyond the evaluator's
+bootstrap noise floor; (5) the matched edge-AUPRC guard passes. Any failure
+blocks binding.
+
+#### 14.4.8 Telemetry and abort rules
+
+- **Collapse abort** (§13.19.2-class): mean pairwise `h` cosine > 0.95, or
+  the Π rank-1 marginal residual `‖Π − r c^T / m‖_F / ‖Π‖_F < 0.05` (with
+  `r`/`c` Π's row/column sums and `m` its total mass — "the plan carries
+  nothing beyond its marginals"), for 2 consecutive validations after
+  conditioning activates ⇒ `training_invalid(slot_collapse)`.
+  Calibration basis (P0.1, measured on the collapsed v2 checkpoint
+  `a471010f57e495f0`): mean pairwise `h` cosine `0.9997`; Â off-diagonal
+  `0.5014 ± 0.0004` (constant); π std across slots `0.042`. A Π
+  **row-entropy** criterion was measured to be blind to full collapse
+  (normalized row entropy `0.624`, because the `π·m` marginals concentrate
+  rows regardless of cost-blindness) and is therefore not used.
+- **Degree-decorrelation telemetry**: per-validation correlation of
+  `full − f_logit` with endpoint degree, reported in every headline table
+  (telemetry-only, no verdict effect).

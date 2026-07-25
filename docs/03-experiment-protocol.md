@@ -525,6 +525,19 @@ rule).
    This closes the e2e Stage-1 screen; the rev-3.0 build line's disposition is an
    owner-side locked-decision discussion and is not resolved by this screen. Full
    result: `docs/results/G5-e2e-stage1-seed0-20260724.md`.
+   **Rev-3.1 relational repair (2026-07-25):** the disposition discussion resolved
+   under owner delegation: the rev-3.0 build line proceeds as the rev-3.1 repair
+   (spec §14.4; decision trail
+   `docs/superpowers/specs/2026-07-25-egostitch-e2e-relational-repair-design.md` r5,
+   P0 audits `outputs/p0_audit_20260725/`). Its screen is a fresh v3 registration
+   with an **eight-arm** scope — six trained arms (full, `B0-e2e`/f-only,
+   pair+topology, `p = 0`, `cosine_pool`, `no_l_rel`) plus two scoring-time
+   controls over the full checkpoint (within-pair rebuild-form shuffle 6a-v3 and
+   degree-preserving rewiring 6e-v1) — with two-stage `V_fit`-calibrated /
+   `V_qual`-rehearsed qualification gates frozen before binding. The frozen
+   pairwise scorer's §0 role is **unchanged** (the measured grounding-pool audit
+   eliminated the candidate-proposer reuse), and this paragraph does not bind the
+   v3 registration or weaken E1/E3's multi-seed inference rules.
 
 ### 5.1 Priority order (after gates)
 
