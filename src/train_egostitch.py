@@ -3920,9 +3920,10 @@ def _e2e_base_lr(step: int, total_steps: int, config: EgoStitchTrainingConfig) -
     return config.min_lr + (config.lr_peak - config.min_lr) * cosine
 
 
-def _e2e_active_groups(phase: E2EPhaseState, arm: E2EArmName) -> set[str]:
-    del arm
-    groups = {"generator", "topology_content_conditioning"}
+def _e2e_active_groups(phase: E2EPhaseState, model: EgoStitchE2E) -> set[str]:
+    groups = {"generator"}
+    if model.rel_head is not None or phase.edge_active:
+        groups.add("topology_content_conditioning")
     if phase.edge_active:
         groups.add("pair_encoder_head")
     return groups
@@ -4019,6 +4020,8 @@ def _e2e_family_probe(
     accelerator: Accelerator,
 ) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
     """Isolated synchronized family backwards on one immutable replay batch."""
+    inner = cast(_CompositeStep, accelerator.unwrap_model(wrapped)).model
+    assert isinstance(inner, EgoStitchE2E)
     families = ["recon"]
     if phase.edge_active:
         families.insert(0, "edge")
@@ -4027,7 +4030,7 @@ def _e2e_family_probe(
     expected: dict[str, set[str]] = {
         "pair_encoder_head": {"edge"} if phase.edge_active else set(),
         "generator": {"recon"} | ({"real", "ssl"} if phase.real_ssl_scale > 0.0 else set()),
-        "topology_content_conditioning": {"recon"},
+        "topology_content_conditioning": {"recon"} if inner.rel_head is not None else set(),
     }
     if phase.edge_active and arm != "b0_e2e_f_only":
         expected["generator"].add("edge")
@@ -4035,8 +4038,6 @@ def _e2e_family_probe(
     result: dict[str, dict[str, float]] = {group: {} for group in groups}
     submodule_rms: dict[str, float] = {}
     probe_payload = {**payload, "collect_diagnostics": True}
-    inner = cast(_CompositeStep, accelerator.unwrap_model(wrapped)).model
-    assert isinstance(inner, EgoStitchE2E)
     ema_snapshot = [
         (buffer, buffer.detach().clone())
         for name, buffer in inner.named_buffers()
@@ -4367,7 +4368,7 @@ def _train_e2e_stability_loop(
                 if int(bad_ranks.item()) > 0:
                     raise RuntimeError(f"non-finite E2E loss at optimizer step {global_step}")
                 accelerator.backward(loss)
-                active_groups = _e2e_active_groups(phase, arm)
+                active_groups = _e2e_active_groups(phase, model)
                 gathered_squared = _e2e_group_squared_norms(parameter_groups.groups, accelerator)
                 e2e_assert_replicated_squared_norms(gathered_squared)
                 gradient_records = e2e_check_and_clip_gradients(

@@ -448,7 +448,9 @@ class TestBatchFactoryE2E:
 class TestE2ECompositeStep:
     """One CPU optimizer forward through the active §13.19 composite."""
 
-    def _batch_and_model(self, tmp_path: Path) -> tuple[te._CompositeBatch, EgoStitchE2E]:
+    def _batch_and_model(
+        self, tmp_path: Path, *, w_rel: float | None = None
+    ) -> tuple[te._CompositeBatch, EgoStitchE2E]:
         # EgoStitchE2E's internal generator always uses the full spec-default
         # EgoStitchConfig() (input_dim=1536, slots=16, ...), never a value
         # parsed from E2EConfig -- the toy bundle must match that, not the
@@ -471,7 +473,10 @@ class TestE2ECompositeStep:
         )
         factory = te._BatchFactory(e2e_cfg, model_cfg, data, node_batch=4, rank=0, world_size=1)
         batch = next(iter(factory.epoch_batches(1, rows_per_rank=rows, steps=steps)))
-        model = EgoStitchE2E(E2EConfig.from_mapping(e2e_cfg.model.config))
+        model_config = dict(e2e_cfg.model.config)
+        if w_rel is not None:
+            model_config["w_rel"] = w_rel
+        model = EgoStitchE2E(E2EConfig.from_mapping(model_config))
         return batch, model
 
     def _payload(
@@ -621,6 +626,102 @@ class TestE2ECompositeStep:
                 strict=True,
             )
         )
+
+    def test_no_rel_head_survives_warmstart_step_and_family_probe(
+        self, tmp_path: Path
+    ) -> None:
+        torch.manual_seed(0)
+        batch, model = self._batch_and_model(tmp_path, w_rel=0.0)
+        assert model.rel_head is None
+        composite = te._CompositeStep(model, world_size=1)
+        parameter_groups = te.build_e2e_parameter_groups(model)
+        phase = te.E2EPhaseState("A", 0.0, False, 0.0)
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": parameters, "lr": 1e-3}
+                for parameters in parameter_groups.groups.values()
+            ]
+        )
+
+        with self._bf16_autocast():
+            out = composite(self._payload(batch, joint_weight=0.0))
+        cast(torch.Tensor, out["loss"]).backward()  # type: ignore[no-untyped-call]
+        active_groups = te._e2e_active_groups(phase, model)
+        assert active_groups == {"generator"}
+        records = te.e2e_check_and_clip_gradients(
+            parameter_groups.groups,
+            active_groups,
+        )
+        assert records["generator"].active
+        assert not records["topology_content_conditioning"].active
+        optimizer.step()
+
+        accelerator = Accelerator(cpu=True)
+        with self._bf16_autocast():
+            family_norms, submodule_rms = te._e2e_family_probe(
+                composite,
+                self._payload(batch, joint_weight=0.0),
+                parameter_groups.groups,
+                phase,
+                "no_l_rel",
+                accelerator,
+            )
+        assert set(family_norms["generator"]) == {"recon"}
+        assert family_norms["topology_content_conditioning"] == {}
+        assert submodule_rms == {}
+
+    def test_no_rel_head_conditioning_liveness_resumes_when_edge_active(
+        self, tmp_path: Path
+    ) -> None:
+        torch.manual_seed(0)
+        batch, model = self._batch_and_model(tmp_path, w_rel=0.0)
+        composite = te._CompositeStep(model, world_size=1)
+        parameter_groups = te.build_e2e_parameter_groups(model)
+        phase = te.E2EPhaseState("B", 0.1, True, 0.0)
+
+        with self._bf16_autocast():
+            out = composite(self._payload(batch, joint_weight=1.0))
+        cast(torch.Tensor, out["loss"]).backward()  # type: ignore[no-untyped-call]
+        active_groups = te._e2e_active_groups(phase, model)
+        assert "topology_content_conditioning" in active_groups
+        records = te.e2e_check_and_clip_gradients(
+            parameter_groups.groups,
+            active_groups,
+        )
+        assert records["topology_content_conditioning"].active
+        for parameter in parameter_groups.groups["topology_content_conditioning"]:
+            parameter.grad = None
+        with pytest.raises(
+            RuntimeError,
+            match="zero gradient norm in active E2E group 'topology_content_conditioning'",
+        ):
+            te.e2e_check_and_clip_gradients(parameter_groups.groups, active_groups)
+
+    def test_rel_head_keeps_conditioning_liveness_guard_active_in_both_phases(
+        self, tmp_path: Path
+    ) -> None:
+        _, model = self._batch_and_model(tmp_path, w_rel=0.25)
+        assert model.rel_head is not None
+        parameter_groups = te.build_e2e_parameter_groups(model)
+        phases = (
+            te.E2EPhaseState("A", 0.0, False, 0.0),
+            te.E2EPhaseState("B", 0.1, True, 0.0),
+        )
+        for phase in phases:
+            active_groups = te._e2e_active_groups(phase, model)
+            assert "topology_content_conditioning" in active_groups
+            with pytest.raises(
+                RuntimeError,
+                match="zero gradient norm in active E2E group 'topology_content_conditioning'",
+            ):
+                te.e2e_check_and_clip_gradients(
+                    {
+                        "topology_content_conditioning": parameter_groups.groups[
+                            "topology_content_conditioning"
+                        ]
+                    },
+                    {"topology_content_conditioning"},
+                )
 
     def test_gates_receive_gradient_after_warmstart(self, tmp_path: Path) -> None:
         torch.manual_seed(0)

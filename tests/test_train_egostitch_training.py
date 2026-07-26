@@ -586,27 +586,23 @@ def test_prefetch_batches_propagates_producer_error_and_shutdowns() -> None:
 
 def test_e2e_lr_and_active_groups_follow_registered_phase_contract() -> None:
     config = te.EgoStitchTrainingConfig()
+    full_model = EgoStitchE2E(E2EConfig(w_rel=0.25))
     assert te._e2e_base_lr(0, 2000, config) == pytest.approx(2e-7)
     assert te._e2e_base_lr(499, 2000, config) == pytest.approx(1e-4)
     assert te._e2e_base_lr(1999, 2000, config) == pytest.approx(1e-5)
     phase_a = te.E2EPhaseState("A", 0.0, False, 0.0)
     first_edge = te.e2e_phase_state(400, 2000)
     phase_c = te.E2EPhaseState("C", 1.0, True, 1.0)
-    assert te._e2e_active_groups(phase_a, "full") == {
+    assert te._e2e_active_groups(phase_a, full_model) == {
         "generator",
         "topology_content_conditioning",
     }
-    assert te._e2e_active_groups(first_edge, "full") == {
+    assert te._e2e_active_groups(first_edge, full_model) == {
         "pair_encoder_head",
         "generator",
         "topology_content_conditioning",
     }
-    assert te._e2e_active_groups(phase_c, "full") == {
-        "pair_encoder_head",
-        "generator",
-        "topology_content_conditioning",
-    }
-    assert te._e2e_active_groups(phase_c, "b0_e2e_f_only") == {
+    assert te._e2e_active_groups(phase_c, full_model) == {
         "pair_encoder_head",
         "generator",
         "topology_content_conditioning",
