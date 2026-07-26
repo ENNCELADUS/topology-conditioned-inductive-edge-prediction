@@ -95,7 +95,17 @@ _EGOSTITCH_PAIR_PRECISION_CONTRACT = "egostitch_pair_fp32_v1"
 _EGOSTITCH_E2E_PAIR_PRECISION_CONTRACT = "egostitch_e2e_pair_fp32_v1"
 _EGOSTITCH_E2E_ARRAY_KEYS = ("full", "f_logit", "pair_content", "pair_topology")
 _EGOSTITCH_E2E_BINDING_SCHEMA = "egostitch_e2e_binding_evidence_v1"
-_EGOSTITCH_E2E_FORMAL_ARMS = ("full", "b0_e2e_f_only", "pair_topology", "p0")
+_EGOSTITCH_E2E_FORMAL_ARMS = (
+    "full",
+    "b0_e2e_f_only",
+    "pair_topology",
+    "p0",
+    "cosine_pool",
+    "no_l_rel",
+)
+_EGOSTITCH_E2E_CONTROL_ARMS = ("structure_control_6a_v3", "structure_control_6e_v1")
+_EGOSTITCH_E2E_ARMS = _EGOSTITCH_E2E_FORMAL_ARMS + _EGOSTITCH_E2E_CONTROL_ARMS
+_SCORES_META_VERSION = "egostitch_e2e_scores_v3"
 _SCAFFOLD_CONTROL_NONE = "none"
 _SCAFFOLD_CONTROL_SHUFFLE_V3 = "shuffle_within_pair_v3"
 _SCAFFOLD_CONTROL_REWIRE_V1 = "rewire_checkerboard_v1"
@@ -509,6 +519,7 @@ def save_scores(
         stored_meta["score_resolution"] = score_resolution_diagnostics(logit)
         validate_score_precision(logit, meta=stored_meta, label=str(path))
     elif family == "egostitch_e2e":
+        stored_meta["scores_meta_version"] = _SCORES_META_VERSION
         if f_logit is None or pair_content is None or pair_topology is None:
             raise ValueError(
                 f"{path}: egostitch_e2e artifacts require f_logit, pair_content, "
@@ -595,10 +606,13 @@ def _load_shard(path: Path) -> _Shard:
         label: NDArray[np.int8] = data["label"].astype(np.int8, copy=False)
         row_start = int(data["row_start"][()])
         meta = cast(dict[str, object], json.loads(str(data["meta"][()])))
-        formal_e2e_v2 = meta.get("model_family") == "egostitch_e2e" and isinstance(
-            meta.get("formal_scoring_provenance"), dict
-        )
-        if formal_e2e_v2 and "full" not in data:
+        current_e2e = meta.get("model_family") == "egostitch_e2e"
+        if current_e2e and meta.get("scores_meta_version") != _SCORES_META_VERSION:
+            raise ValueError(
+                f"{path}: scores_meta_version must be {_SCORES_META_VERSION!r}; "
+                f"got {meta.get('scores_meta_version')!r}"
+            )
+        if current_e2e and "full" not in data:
             raise ValueError(f"{path}: formal egostitch_e2e artifact is missing full")
         f_logit: NDArray[np.float32] | None = (
             data["f_logit"].astype(np.float32, copy=False) if "f_logit" in data else None
@@ -612,7 +626,7 @@ def _load_shard(path: Path) -> _Shard:
             else None
         )
         primary_logit = meta.get("primary_logit", "full")
-        if formal_e2e_v2 and primary_logit == "full" and not np.array_equal(data["full"], logit):
+        if current_e2e and primary_logit == "full" and not np.array_equal(data["full"], logit):
             raise ValueError(f"{path}: formal E2E full array contradicts primary logit")
         if "full" in data and primary_logit != "full":
             full_logit = data["full"].astype(np.float32, copy=False)
@@ -696,6 +710,11 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
         "scaffold_control",
         "permanent_null",
         "primary_logit",
+        "scores_meta_version",
+        "scoring_arm",
+        "arm_kind",
+        "checkpoint_arm",
+        "scoring_semantics",
         "formal_scoring_provenance",
     ):
         values = {str(shard.meta.get(key)) for shard in shards}
@@ -1003,8 +1022,42 @@ def _validate_e2e_scoring_provenance(
     configs = evidence.get("configs")
     if not isinstance(configs, dict) or set(configs) != set(_EGOSTITCH_E2E_FORMAL_ARMS):
         raise ValueError(
-            "binding_evidence.configs must contain exactly the four formal training arms"
+            "binding_evidence.configs must contain exactly the six trained checkpoint arms"
         )
+    registered_arms = registration.get("arms")
+    if not isinstance(registered_arms, dict) or set(registered_arms) != set(
+        _EGOSTITCH_E2E_ARMS
+    ):
+        raise ValueError(
+            "registration arms must contain the exact six-trained-plus-two-control schema"
+        )
+    for trained_arm in _EGOSTITCH_E2E_FORMAL_ARMS:
+        entry = registered_arms.get(trained_arm)
+        if (
+            not isinstance(entry, dict)
+            or entry.get("kind") != "trained_checkpoint"
+            or not isinstance(entry.get("training"), str)
+            or not isinstance(entry.get("scoring_provenance"), dict)
+        ):
+            raise ValueError(f"registration arms.{trained_arm} must be a trained_checkpoint")
+    control_modes = {
+        "structure_control_6a_v3": _SCAFFOLD_CONTROL_SHUFFLE_V3,
+        "structure_control_6e_v1": _SCAFFOLD_CONTROL_REWIRE_V1,
+    }
+    for control_arm, control_mode in control_modes.items():
+        entry = registered_arms.get(control_arm)
+        scoring_semantics = entry.get("scoring_provenance") if isinstance(entry, dict) else None
+        if (
+            not isinstance(entry, dict)
+            or entry.get("kind") != "scoring_time_control"
+            or entry.get("checkpoint_arm") != "full"
+            or not isinstance(scoring_semantics, dict)
+            or scoring_semantics.get("scaffold_control") != control_mode
+            or scoring_semantics.get("checkpoint_arm") != "full"
+        ):
+            raise ValueError(
+                f"registration arms.{control_arm} must be a scoring_time_control over full"
+            )
     for section in (
         "parameter_group_manifests",
         "packs_and_validation_manifests",
@@ -1034,12 +1087,17 @@ def _validate_e2e_scoring_provenance(
 
     arm = metadata.get("arm")
     if arm not in _EGOSTITCH_E2E_FORMAL_ARMS:
-        raise ValueError("run metadata arm must name one of the four formal training arms")
+        raise ValueError("run metadata arm must name one of the six trained checkpoint arms")
     arm_name = cast(str, arm)
-    registered_arms = registration.get("arms")
-    if not isinstance(registered_arms, dict) or not isinstance(registered_arms.get(arm_name), dict):
-        raise ValueError(f"registration is missing arms.{arm_name}")
-    registered_training = cast(dict[str, object], registered_arms[arm_name]).get("training")
+    registered_arm = cast(dict[str, object], registered_arms[arm_name])
+    if metadata.get("arm_kind") != "trained_checkpoint":
+        raise ValueError("run metadata arm_kind must be 'trained_checkpoint'")
+    if metadata.get("checkpoint_arm") != arm_name:
+        raise ValueError("run metadata checkpoint_arm must match its trained arm")
+    scoring_semantics = registered_arm.get("scoring_provenance")
+    if metadata.get("scoring_semantics") != scoring_semantics:
+        raise ValueError("run metadata scoring_semantics do not match registration")
+    registered_training = registered_arm.get("training")
     config_evidence = configs[arm_name]
     if not isinstance(config_evidence, dict) or set(config_evidence) != {"path", "sha256"}:
         raise ValueError(
@@ -1077,6 +1135,9 @@ def _validate_e2e_scoring_provenance(
 
     return {
         "arm": arm_name,
+        "arm_kind": "trained_checkpoint",
+        "checkpoint_arm": arm_name,
+        "scoring_semantics": scoring_semantics,
         "registration_sha256": registration_sha256,
         "run_metadata_sha256": _file_sha256(run_metadata_path),
         "config_path": str(config_path.resolve()),
@@ -2037,7 +2098,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="ARM=PATH",
-        help="repeat for all four formal arms before egostitch_e2e candidate/test scoring",
+        help="repeat for all six trained arms before egostitch_e2e candidate/test scoring",
     )
     score.add_argument(
         "--model-family",
@@ -2092,7 +2153,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     score.add_argument(
         "--scaffold-control",
-        choices=[_SCAFFOLD_CONTROL_NONE, _SCAFFOLD_CONTROL_SHUFFLE_V2],
+        choices=[
+            _SCAFFOLD_CONTROL_NONE,
+            _SCAFFOLD_CONTROL_SHUFFLE_V3,
+            _SCAFFOLD_CONTROL_REWIRE_V1,
+            _SCAFFOLD_CONTROL_SHUFFLE_V2,
+        ],
         default=_SCAFFOLD_CONTROL_NONE,
         help="egostitch_e2e scoring-time scaffold control",
     )
@@ -2159,16 +2225,17 @@ def _run_score(args: argparse.Namespace) -> None:
         args.pairs, args.data_root, args.strategy
     )
     scoring_provenance: dict[str, object] | None = None
+    scoring_arm: str | None = None
     if heldout_e2e:
         if args.preregistration is None:
             raise ValueError(
                 "egostitch_e2e candidate/test scoring requires --preregistration and all "
-                "four --arm-run-metadata ARM=PATH entries"
+                "six --arm-run-metadata ARM=PATH entries"
             )
         # Preserve the old singular option only as an early fail-closed check,
         # so a caller cannot hide malformed selected-run metadata behind a
         # later all-arm readiness error. Formal E2E scoring still requires the
-        # complete four-arm mapping below.
+        # complete six-arm mapping below.
         if args.run_metadata is not None:
             _validate_e2e_scoring_provenance(
                 registration_path=args.preregistration,
@@ -2186,7 +2253,7 @@ def _run_score(args: argparse.Namespace) -> None:
             arm_paths[arm] = Path(raw_path)
         if set(arm_paths) != set(_EGOSTITCH_E2E_FORMAL_ARMS):
             raise ValueError(
-                "egostitch_e2e candidate/test scoring requires exactly four arm metadata "
+                "egostitch_e2e candidate/test scoring requires exactly six arm metadata "
                 f"records: {list(_EGOSTITCH_E2E_FORMAL_ARMS)}"
             )
         provenances: dict[str, dict[str, object]] = {}
@@ -2225,10 +2292,22 @@ def _run_score(args: argparse.Namespace) -> None:
         if len(matching_arms) != 1:
             raise ValueError("selected checkpoint must match exactly one formal arm metadata")
         selected_arm = matching_arms[0]
-        if args.scaffold_control == _SCAFFOLD_CONTROL_SHUFFLE_V2 and selected_arm != "full":
-            raise ValueError("structure_control_6a scoring requires the full-arm checkpoint")
+        scoring_arm = {
+            _SCAFFOLD_CONTROL_NONE: selected_arm,
+            _SCAFFOLD_CONTROL_SHUFFLE_V3: "structure_control_6a_v3",
+            _SCAFFOLD_CONTROL_REWIRE_V1: "structure_control_6e_v1",
+        }[args.scaffold_control]
+        if scoring_arm in _EGOSTITCH_E2E_CONTROL_ARMS and selected_arm != "full":
+            raise ValueError(f"{scoring_arm} scoring requires the full-arm checkpoint")
+        registration = _load_json_object(args.preregistration, label="registration")
+        registered_arms = cast(dict[str, dict[str, object]], registration["arms"])
+        scoring_entry = registered_arms[scoring_arm]
         scoring_provenance = {
             **provenances[selected_arm],
+            "scoring_arm": scoring_arm,
+            "arm_kind": scoring_entry["kind"],
+            "checkpoint_arm": selected_arm,
+            "scoring_semantics": scoring_entry["scoring_provenance"],
             "all_formal_arms": {
                 arm: {
                     "run_metadata_sha256": provenance["run_metadata_sha256"],
@@ -2389,6 +2468,10 @@ def _run_score(args: argparse.Namespace) -> None:
         }
         if scoring_provenance is not None:
             meta_extra["formal_scoring_provenance"] = scoring_provenance
+            meta_extra["scoring_arm"] = scoring_arm
+            meta_extra["arm_kind"] = scoring_provenance["arm_kind"]
+            meta_extra["checkpoint_arm"] = scoring_provenance["checkpoint_arm"]
+            meta_extra["scoring_semantics"] = scoring_provenance["scoring_semantics"]
     else:  # pragma: no cover - build_model already rejects unknown families
         raise ValueError(f"no scoring path for model_family {model_family!r}")
 

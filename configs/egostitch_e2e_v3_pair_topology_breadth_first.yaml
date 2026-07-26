@@ -1,0 +1,95 @@
+# EgoStitch E2E rev-3.1 pair+topology arm (spec §14.4.6).
+
+model:
+  family: egostitch_e2e
+  config:
+    ste_layers: 3
+    ste_dim: 128
+    xattn_heads: 8
+    n_inj: 1
+    p_topo: 0.15
+    p_cont: 0.15
+    permanent_null: content_head
+    n_ground: 50
+
+data:
+  root: data
+  strategy: breadth_first
+  train_positives: e_sup
+  negative_ratio: 5
+  partition_seed: 0
+  msg_fraction: 0.8
+  node_batch: 256
+  edge_batch: 128
+  f0_cache: outputs/feature_packs/egostitch_f0/f0_matrix.pt
+  grounding_cache: outputs/feature_packs/egostitch_f0/grounding.npz
+  pack_dir: outputs/feature_packs/egostitch_e2e_tokens
+  expected_missing_features:
+    - node_004764
+    - node_007050
+
+optim:
+  lr: 1.0e-4
+  weight_decay: 0.01
+  epochs: 30
+  warmup_steps: 500
+  grad_clip: 1.0
+
+training:
+  positive_weight: 5.0
+  phase_a_fraction: 0.2
+  phase_b_fraction: 0.1
+  lr_peak: 1.0e-4
+  min_lr: 1.0e-5
+  warmup_steps: 500
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  clip_norm: 1.0
+  pair_encoder_clip_norm: 3.0
+  generator_clip_norm: 3.0
+  clip_immediate_abort: 1.0e-3
+  clip_persistent_threshold: 0.1
+  clip_persistent_steps: 10
+  family_ratio_abort: 50.0
+  family_ratio_probes: 4
+  collapse_fraction: 0.25
+  collapse_floor: 1.0e-4
+  collapse_validations: 2
+  selection_auprc_tolerance: 0.02
+  selection_mmd_tolerance: 1.0e-6
+  residual_ratio_min: 1.0e-3
+
+diagnostics:
+  gradient_probe_interval: 50
+  gradient_imbalance_ratio: 50.0
+  gradient_imbalance_steps: 200
+  probe_s1_abs_mean_max: 1000.0
+  selection_auprc_tolerance: 0.02
+  topk_fraction: 0.01
+
+eval:
+  patience: 10
+  eval_every: 1
+
+seed: 0
+output_dir: outputs/egostitch_e2e_stage1_v3/pair_topology
+mixed_precision: "bf16"
+preregistration: docs/registrations/g5_e2e_stage1_preregistration_v3.json
+
+runtime:
+  world_size: auto
+  pack_dir: outputs/feature_packs/egostitch_f0
+  pack_workers: 8
+  loader_workers_per_rank: 0
+  prefetch_factor: 2
+  token_budget_candidates: [128]
+  max_pairs_per_rank: 1048576
+  memory_limit_gib: 85.0
+  total_budget_seconds: 30300
+  pack_budget_seconds: 1200
+  setup_probe_budget_seconds: 2100
+  train_eval_budget_seconds: 26400
+  artifact_budget_seconds: 120
+  reserve_seconds: 480
+  probe_warmup_steps: 5
+  probe_timed_steps: 15

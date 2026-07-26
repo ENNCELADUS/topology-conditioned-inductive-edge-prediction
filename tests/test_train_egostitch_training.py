@@ -83,13 +83,15 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root = Path(__file__).resolve().parents[1]
-    config_path = root / "configs/egostitch_e2e_breadth_first.yaml"
+    config_path = root / "configs/egostitch_e2e_v3_full_breadth_first.yaml"
     cfg = te.load_config(config_path)
     arm_paths = {
-        "full": "configs/egostitch_e2e_breadth_first.yaml",
-        "b0_e2e_f_only": "configs/egostitch_e2e_f_only_breadth_first.yaml",
-        "pair_topology": "configs/egostitch_e2e_pair_topology_breadth_first.yaml",
-        "p0": "configs/egostitch_e2e_p0_breadth_first.yaml",
+        "full": "configs/egostitch_e2e_v3_full_breadth_first.yaml",
+        "b0_e2e_f_only": "configs/egostitch_e2e_v3_f_only_breadth_first.yaml",
+        "pair_topology": "configs/egostitch_e2e_v3_pair_topology_breadth_first.yaml",
+        "p0": "configs/egostitch_e2e_v3_p0_breadth_first.yaml",
+        "cosine_pool": "configs/egostitch_e2e_v3_cosine_pool_breadth_first.yaml",
+        "no_l_rel": "configs/egostitch_e2e_v3_no_l_rel_breadth_first.yaml",
     }
     artifact = tmp_path / "binding-artifact.json"
     artifact.write_text('{"status":"pass"}\n')
@@ -110,7 +112,22 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
     }
     snapshot = te.PreregistrationSnapshot(
         {
-            "arms": {arm: {"training": path} for arm, path in arm_paths.items()},
+            "arms": {
+                **{
+                    arm: {"kind": "trained_checkpoint", "training": path}
+                    for arm, path in arm_paths.items()
+                },
+                "structure_control_6a_v3": {
+                    "kind": "scoring_time_control",
+                    "training": None,
+                    "checkpoint_arm": "full",
+                },
+                "structure_control_6e_v1": {
+                    "kind": "scoring_time_control",
+                    "training": None,
+                    "checkpoint_arm": "full",
+                },
+            },
             "binding_evidence": evidence,
         },
         "f" * 64,
@@ -124,6 +141,32 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
 
     assert binding["arm"] == "full"
     assert binding["config_sha256"] == te._sha256_file(config_path)
+
+    v2_configs = cast(dict[str, object], evidence["configs"])
+    evidence["configs"] = {
+        name: entry for name, entry in v2_configs.items() if name not in {"cosine_pool", "no_l_rel"}
+    }
+    with pytest.raises(te.PreregistrationNotBinding, match="six trained"):
+        te._validate_e2e_formal_binding(cfg, snapshot, config_path)
+    evidence["configs"] = {**v2_configs, "unknown": v2_configs["full"]}
+    with pytest.raises(te.PreregistrationNotBinding, match="six trained"):
+        te._validate_e2e_formal_binding(cfg, snapshot, config_path)
+    evidence["configs"] = v2_configs
+
+    registered_arms = cast(dict[str, object], snapshot.payload["arms"])
+    snapshot.payload["arms"] = {
+        **{
+            name: registered_arms[name]
+            for name in ("full", "b0_e2e_f_only", "pair_topology", "p0")
+        },
+        "structure_control_6a": registered_arms["structure_control_6a_v3"],
+    }
+    with pytest.raises(te.PreregistrationNotBinding, match="six-trained-plus-two-control"):
+        te._validate_e2e_formal_binding(cfg, snapshot, config_path)
+    snapshot.payload["arms"] = {**registered_arms, "unknown": registered_arms["full"]}
+    with pytest.raises(te.PreregistrationNotBinding, match="six-trained-plus-two-control"):
+        te._validate_e2e_formal_binding(cfg, snapshot, config_path)
+    snapshot.payload["arms"] = registered_arms
 
     def fake_run_descent(diff_paths: str, ancestor_rc: int) -> Callable[..., SimpleNamespace]:
         def runner(command: list[str], **_: object) -> SimpleNamespace:
@@ -167,7 +210,7 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
 
 def test_formal_output_metadata_matches_scorer_contract(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
-    config_path = root / "configs/egostitch_e2e_breadth_first.yaml"
+    config_path = root / "configs/egostitch_e2e_v3_full_breadth_first.yaml"
     cfg = replace(
         te.load_config(config_path),
         output_dir=tmp_path / "formal",
@@ -223,6 +266,13 @@ def test_formal_output_metadata_matches_scorer_contract(tmp_path: Path) -> None:
     metadata = json.loads((cfg.output_dir / "run_metadata.json").read_text())
     assert metadata["selected_checkpoint_eligible"] is True
     assert metadata["arm"] == "full"
+    assert metadata["arm_kind"] == "trained_checkpoint"
+    assert metadata["checkpoint_arm"] == "full"
+    assert metadata["scoring_semantics"] == {
+        "scaffold_control": "none",
+        "permanent_null": "none",
+        "primary_logit": "full",
+    }
     assert metadata["config_sha256"] == te._sha256_file(config_path)
     assert metadata["implementation_commit"] == "a" * 40
     assert metadata["checkpoint_sha256"] == te._sha256_file(cfg.output_dir / "best.pt")

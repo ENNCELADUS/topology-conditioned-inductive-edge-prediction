@@ -737,7 +737,14 @@ def config_to_dict(cfg: EgoConfig) -> dict[str, object]:
 
 
 E2EPhaseName = Literal["A", "B", "C"]
-E2EArmName = Literal["full", "p0", "b0_e2e_f_only", "pair_topology"]
+E2EArmName = Literal[
+    "full",
+    "b0_e2e_f_only",
+    "pair_topology",
+    "p0",
+    "cosine_pool",
+    "no_l_rel",
+]
 
 
 @dataclass(frozen=True)
@@ -1375,7 +1382,16 @@ class PreregistrationNotBinding(RuntimeError):
 
 _REQUIRED_BEFORE_BINDING = "REQUIRED-BEFORE-BINDING"
 _E2E_BINDING_SCHEMA = "egostitch_e2e_binding_evidence_v1"
-_E2E_FORMAL_ARMS = {"full", "b0_e2e_f_only", "pair_topology", "p0"}
+_E2E_FORMAL_ARMS: tuple[E2EArmName, ...] = (
+    "full",
+    "b0_e2e_f_only",
+    "pair_topology",
+    "p0",
+    "cosine_pool",
+    "no_l_rel",
+)
+_E2E_CONTROL_ARMS = ("structure_control_6a_v3", "structure_control_6e_v1")
+_E2E_ARMS = _E2E_FORMAL_ARMS + _E2E_CONTROL_ARMS
 
 
 @dataclass(frozen=True)
@@ -1479,8 +1495,31 @@ def _validate_e2e_formal_binding(
     ):
         raise PreregistrationNotBinding("binding_evidence implementation commit is invalid")
     configs = evidence.get("configs")
-    if not isinstance(configs, Mapping) or set(configs) != _E2E_FORMAL_ARMS:
-        raise PreregistrationNotBinding("binding_evidence configs must cover four formal arms")
+    if not isinstance(configs, Mapping) or set(configs) != set(_E2E_FORMAL_ARMS):
+        raise PreregistrationNotBinding(
+            "binding_evidence configs must cover exactly the six trained checkpoint arms"
+        )
+    registered_arms = snapshot.payload.get("arms")
+    if not isinstance(registered_arms, Mapping) or set(registered_arms) != set(_E2E_ARMS):
+        raise PreregistrationNotBinding(
+            "registration arms must contain the exact six-trained-plus-two-control schema"
+        )
+    for trained_arm in _E2E_FORMAL_ARMS:
+        entry = registered_arms.get(trained_arm)
+        if not isinstance(entry, Mapping) or entry.get("kind") != "trained_checkpoint":
+            raise PreregistrationNotBinding(
+                f"registration arms.{trained_arm} must be a trained_checkpoint"
+            )
+    for control_arm in _E2E_CONTROL_ARMS:
+        entry = registered_arms.get(control_arm)
+        if (
+            not isinstance(entry, Mapping)
+            or entry.get("kind") != "scoring_time_control"
+            or entry.get("checkpoint_arm") != "full"
+        ):
+            raise PreregistrationNotBinding(
+                f"registration arms.{control_arm} must be a scoring_time_control over full"
+            )
     repo_root = cfg.preregistration.resolve().parents[2]
     for label in (
         "parameter_group_manifests",
@@ -1494,7 +1533,6 @@ def _validate_e2e_formal_binding(
         raise PreregistrationNotBinding("binding_evidence checkpoint policy is missing")
 
     arm = _e2e_arm_name_from_config(E2EConfig.from_mapping(cfg.model.config))
-    registered_arms = snapshot.payload.get("arms")
     registered_arm = registered_arms.get(arm) if isinstance(registered_arms, Mapping) else None
     registered_training = (
         registered_arm.get("training") if isinstance(registered_arm, Mapping) else None
@@ -3850,7 +3888,24 @@ def _e2e_arm_name_from_config(config: E2EConfig) -> E2EArmName:
         return "pair_topology"
     if config.p_topo == 0.0 and config.p_cont == 0.0:
         return "p0"
+    if config.w_rel == 0.0:
+        return "no_l_rel"
+    if config.n_ground == 20:
+        return "cosine_pool"
     return "full"
+
+
+def _e2e_trained_scoring_semantics(config: E2EConfig) -> dict[str, str]:
+    """Describe how one trained checkpoint is scored under spec Sec 14.4.6."""
+    return {
+        "scaffold_control": "none",
+        "permanent_null": config.permanent_null,
+        "primary_logit": {
+            "none": "full",
+            "all_head": "f_logit",
+            "content_head": "pair_topology",
+        }[config.permanent_null],
+    }
 
 
 def _e2e_base_lr(step: int, total_steps: int, config: EgoStitchTrainingConfig) -> float:
@@ -5345,6 +5400,12 @@ def write_run_start_metadata(
     if path.exists():
         raise FileExistsError(f"run-start metadata already exists: {path}")
     run_kind = "debug" if debug else (cfg.run_kind or "formal")
+    e2e_config = (
+        E2EConfig.from_mapping(cfg.model.config)
+        if cfg.training is not None and cfg.model.family == _EGOSTITCH_E2E_FAMILY
+        else None
+    )
+    arm = _e2e_arm_name_from_config(e2e_config) if e2e_config is not None else None
     metadata = {
         "status": "started",
         "run_kind": run_kind,
@@ -5367,10 +5428,11 @@ def write_run_start_metadata(
         "p_cont": cfg.model.config.get("p_cont", 0.0),
         "config_path": str(config_path.resolve()) if config_path is not None else None,
         "config_sha256": _sha256_file(config_path) if config_path is not None else None,
-        "arm": (
-            _e2e_arm_name_from_config(E2EConfig.from_mapping(cfg.model.config))
-            if cfg.training is not None
-            else None
+        "arm": arm,
+        "arm_kind": "trained_checkpoint" if arm is not None else None,
+        "checkpoint_arm": arm,
+        "scoring_semantics": (
+            _e2e_trained_scoring_semantics(e2e_config) if e2e_config is not None else None
         ),
         "implementation_commit": (
             formal_binding.get("implementation_commit") if formal_binding is not None else None

@@ -17,27 +17,69 @@ def _sha256(path: Path) -> str:
 
 
 def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
-    config = tmp_path / "full.yaml"
-    config.write_text("model:\n  family: egostitch_e2e\n", encoding="utf-8")
+    configs: dict[str, Path] = {}
+    for arm in score_universe._EGOSTITCH_E2E_FORMAL_ARMS:
+        config = tmp_path / f"{arm}.yaml"
+        config.write_text("model:\n  family: egostitch_e2e\n", encoding="utf-8")
+        configs[arm] = config
+    config = configs["full"]
     checkpoint = tmp_path / "best.pt"
     checkpoint.write_bytes(b"selected checkpoint")
     digest_record = {"path": "evidence.json", "sha256": "1" * 64}
     registration = {
         "status": "BINDING",
         "arms": {
-            "full": {"training": str(config)},
-            "b0_e2e_f_only": {"training": "f.yaml"},
-            "pair_topology": {"training": "pt.yaml"},
-            "p0": {"training": "p0.yaml"},
+            **{
+                arm: {
+                    "kind": "trained_checkpoint",
+                    "training": str(path),
+                    "scoring_provenance": {
+                        "scaffold_control": "none",
+                        "permanent_null": {
+                            "b0_e2e_f_only": "all_head",
+                            "pair_topology": "content_head",
+                        }.get(arm, "none"),
+                        "primary_logit": {
+                            "b0_e2e_f_only": "f_logit",
+                            "pair_topology": "pair_topology",
+                        }.get(arm, "full"),
+                    },
+                }
+                for arm, path in configs.items()
+            },
+            "structure_control_6a_v3": {
+                "kind": "scoring_time_control",
+                "training": None,
+                "checkpoint_arm": "full",
+                "scoring_provenance": {
+                    "scaffold_control": "shuffle_within_pair_v3",
+                    "seed": 0,
+                    "keying": "canonical_pair_v1",
+                    "permanent_null": "none",
+                    "primary_logit": "full",
+                    "checkpoint_arm": "full",
+                },
+            },
+            "structure_control_6e_v1": {
+                "kind": "scoring_time_control",
+                "training": None,
+                "checkpoint_arm": "full",
+                "scoring_provenance": {
+                    "scaffold_control": "rewire_checkerboard_v1",
+                    "seed": 0,
+                    "keying": "canonical_pair_v1",
+                    "permanent_null": "none",
+                    "primary_logit": "full",
+                    "checkpoint_arm": "full",
+                },
+            },
         },
         "binding_evidence": {
             "schema_version": "egostitch_e2e_binding_evidence_v1",
             "implementation": {"commit": "a" * 40},
             "configs": {
-                "full": {"path": str(config), "sha256": _sha256(config)},
-                "b0_e2e_f_only": {"path": "f.yaml", "sha256": "2" * 64},
-                "pair_topology": {"path": "pt.yaml", "sha256": "3" * 64},
-                "p0": {"path": "p0.yaml", "sha256": "4" * 64},
+                arm: {"path": str(path), "sha256": _sha256(path)}
+                for arm, path in configs.items()
             },
             "parameter_group_manifests": digest_record,
             "packs_and_validation_manifests": digest_record,
@@ -52,6 +94,13 @@ def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     checkpoint_id = "0123456789abcdef"
     metadata = {
         "arm": "full",
+        "arm_kind": "trained_checkpoint",
+        "checkpoint_arm": "full",
+        "scoring_semantics": {
+            "scaffold_control": "none",
+            "permanent_null": "none",
+            "primary_logit": "full",
+        },
         "run_kind": "formal",
         "status": "complete",
         "formal_artifacts_published": True,
@@ -83,6 +132,39 @@ def test_e2e_formal_scoring_provenance_accepts_exact_binding(tmp_path: Path) -> 
     assert provenance["registration_sha256"] == _sha256(registration)
     assert provenance["checkpoint_sha256"] == _sha256(checkpoint)
     assert provenance["selected_checkpoint_eligible"] is True
+
+
+@pytest.mark.parametrize("extra_arm", [None, "unknown"])
+def test_e2e_formal_scoring_provenance_rejects_non_v3_arm_packages(
+    tmp_path: Path, extra_arm: str | None
+) -> None:
+    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
+    payload = json.loads(registration.read_text(encoding="utf-8"))
+    payload["arms"].pop("cosine_pool")
+    payload["arms"].pop("no_l_rel")
+    payload["arms"]["structure_control_6a"] = payload["arms"].pop(
+        "structure_control_6a_v3"
+    )
+    payload["arms"].pop("structure_control_6e_v1")
+    payload["binding_evidence"]["configs"].pop("cosine_pool")
+    payload["binding_evidence"]["configs"].pop("no_l_rel")
+    if extra_arm is not None:
+        payload["arms"][extra_arm] = payload["arms"]["full"]
+        payload["binding_evidence"]["configs"][extra_arm] = payload["binding_evidence"][
+            "configs"
+        ]["full"]
+    registration.write_text(json.dumps(payload), encoding="utf-8")
+    run = json.loads(metadata.read_text(encoding="utf-8"))
+    run["preregistration_sha256"] = _sha256(registration)
+    metadata.write_text(json.dumps(run), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="six trained"):
+        score_universe._validate_e2e_scoring_provenance(
+            registration_path=registration,
+            run_metadata_path=metadata,
+            checkpoint_path=checkpoint,
+            checkpoint_id=checkpoint_id,
+        )
 
 
 @pytest.mark.parametrize(
@@ -205,7 +287,7 @@ def test_file_alias_of_candidate_manifest_still_requires_provenance(
     assert not output.exists()
 
 
-def test_candidate_scoring_requires_all_four_arm_metadata(
+def test_candidate_scoring_requires_all_six_arm_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
@@ -215,7 +297,7 @@ def test_candidate_scoring_requires_all_four_arm_metadata(
         lambda *_args, **_kwargs: (torch.nn.Linear(1, 1), "egostitch_e2e", checkpoint_id),
     )
     output = tmp_path / "forbidden.npz"
-    with pytest.raises(ValueError, match="exactly four arm metadata"):
+    with pytest.raises(ValueError, match="exactly six arm metadata"):
         score_universe.main(
             [
                 "score",
@@ -269,6 +351,10 @@ def test_arm_checkpoint_path_falls_back_to_metadata_sibling_best_pt(
         f"pair_topology={metadata}",
         "--arm-run-metadata",
         f"p0={metadata}",
+        "--arm-run-metadata",
+        f"cosine_pool={metadata}",
+        "--arm-run-metadata",
+        f"no_l_rel={metadata}",
     ]
     with pytest.raises(ValueError, match="selected checkpoint not found"):
         score_universe.main(common)
@@ -317,7 +403,7 @@ def test_e2e_artifact_physically_stores_all_four_decomposition_arrays(tmp_path: 
         np.testing.assert_array_equal(artifact["full"], artifact["logit"])
 
 
-def test_loader_accepts_v1_e2e_artifact_without_explicit_full_array(tmp_path: Path) -> None:
+def test_loader_rejects_v1_e2e_artifact_without_meta_version(tmp_path: Path) -> None:
     output = tmp_path / "legacy-v1.npz"
     values = np.array([0.1], dtype=np.float32)
     resolution = score_universe.score_resolution_diagnostics(values)
@@ -355,9 +441,8 @@ def test_loader_accepts_v1_e2e_artifact_without_explicit_full_array(tmp_path: Pa
         pair_topology=values,
     )
 
-    artifact = score_universe.load_scores(output)
-    assert artifact.full_logit is None
-    score_universe.validate_artifact_precision(artifact)
+    with pytest.raises(ValueError, match="scores_meta_version"):
+        score_universe.load_scores(output)
 
 
 def test_formal_v2_loader_rejects_missing_or_contradictory_full_array(tmp_path: Path) -> None:
@@ -366,6 +451,7 @@ def test_formal_v2_loader_rejects_missing_or_contradictory_full_array(tmp_path: 
     resolution = score_universe.score_resolution_diagnostics(values)
     meta = {
         "model_family": "egostitch_e2e",
+        "scores_meta_version": score_universe._SCORES_META_VERSION,
         "primary_logit": "full",
         "formal_scoring_provenance": {"registration_sha256": "a" * 64},
         "score_resolution": dict.fromkeys(

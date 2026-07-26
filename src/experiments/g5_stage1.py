@@ -200,7 +200,118 @@ def enforce_e2e_preregistration(
             "BINDING E2E registration requires a real b0cal_results sha256; "
             "REQUIRED-BEFORE-BINDING is not a digest"
         )
+    _validate_e2e_binding_evidence(prereg, preregistration_path)
     return _enforce_metadata_registration_hash(preregistration_path, run_metadata_paths, expected)
+
+
+def _contains_required_before_binding(value: object) -> bool:
+    if isinstance(value, str):
+        return "REQUIRED-BEFORE-BINDING" in value
+    if isinstance(value, Mapping):
+        return any(_contains_required_before_binding(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_required_before_binding(item) for item in value)
+    return False
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value) is not None
+
+
+def _validate_e2e_binding_section(
+    section: object, *, label: str, preregistration_path: Path
+) -> None:
+    if not isinstance(section, (Mapping, list)) or not section:
+        raise PreregistrationMismatch(f"binding_evidence.{label} must be structured")
+    digests: list[object] = []
+    artifacts: list[tuple[Path, str]] = []
+
+    def collect(item: object) -> None:
+        if isinstance(item, Mapping):
+            path_value = item.get("path")
+            digest_value = item.get("sha256")
+            if isinstance(path_value, str) and _is_sha256(digest_value):
+                artifacts.append(
+                    (
+                        _registered_path(preregistration_path, path_value),
+                        cast(str, digest_value),
+                    )
+                )
+            for key, nested in item.items():
+                if str(key).endswith("sha256"):
+                    digests.append(nested)
+                collect(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                collect(nested)
+
+    collect(section)
+    if not digests or any(not _is_sha256(digest) for digest in digests) or not artifacts:
+        raise PreregistrationMismatch(
+            f"binding_evidence.{label} requires path-bound SHA-256 evidence"
+        )
+    for path, digest in artifacts:
+        if not path.is_file() or _sha256_file(path) != digest:
+            raise PreregistrationMismatch(
+                f"binding_evidence.{label} artifact is missing or hash-mismatched: {path}"
+            )
+
+
+def _validate_e2e_binding_evidence(
+    preregistration: Mapping[str, object], preregistration_path: Path
+) -> None:
+    """Fail closed unless the gate sees the complete rev-3.1 binding package."""
+    if _contains_required_before_binding(preregistration):
+        raise PreregistrationMismatch(
+            "BINDING registration still contains REQUIRED-BEFORE-BINDING markers"
+        )
+    evidence = preregistration.get("binding_evidence")
+    if not isinstance(evidence, Mapping) or evidence.get(
+        "schema_version"
+    ) != "egostitch_e2e_binding_evidence_v1":
+        raise PreregistrationMismatch("registration requires valid binding_evidence schema")
+    implementation = evidence.get("implementation")
+    commit = implementation.get("commit") if isinstance(implementation, Mapping) else None
+    if not isinstance(commit, str) or not 7 <= len(commit) <= 64 or any(
+        character not in "0123456789abcdefABCDEF" for character in commit
+    ):
+        raise PreregistrationMismatch("binding_evidence implementation commit is invalid")
+    configs = evidence.get("configs")
+    arms = preregistration.get("arms")
+    if not isinstance(configs, Mapping) or set(configs) != set(_E2E_FORMAL_ARMS):
+        raise PreregistrationMismatch(
+            "binding_evidence.configs must contain exactly the six trained checkpoint arms"
+        )
+    if not isinstance(arms, Mapping):
+        raise PreregistrationMismatch("registration arms must be an object")
+    for arm in _E2E_FORMAL_ARMS:
+        arm_entry = arms.get(arm)
+        config_entry = configs.get(arm)
+        if (
+            not isinstance(arm_entry, Mapping)
+            or not isinstance(config_entry, Mapping)
+            or set(config_entry) != {"path", "sha256"}
+            or config_entry.get("path") != arm_entry.get("training")
+            or not _is_sha256(config_entry.get("sha256"))
+        ):
+            raise PreregistrationMismatch(f"binding_evidence config entry is invalid for {arm}")
+        config_path = _registered_path(preregistration_path, config_entry["path"])
+        if not config_path.is_file() or _sha256_file(config_path) != config_entry["sha256"]:
+            raise PreregistrationMismatch(
+                f"binding_evidence config artifact is missing or hash-mismatched for {arm}"
+            )
+    for label in (
+        "parameter_group_manifests",
+        "packs_and_validation_manifests",
+        "qualification_attempts",
+        "boundary_access_audit",
+        "runtime_and_peak_memory",
+    ):
+        _validate_e2e_binding_section(
+            evidence.get(label), label=label, preregistration_path=preregistration_path
+        )
+    if not isinstance(evidence.get("checkpoint_policy_version"), str):
+        raise PreregistrationMismatch("binding_evidence checkpoint policy is missing")
 
 
 def _enforce_e2e_evaluator_seed(prereg: Mapping[str, object], seed: int) -> None:
@@ -1200,20 +1311,29 @@ def run_g5_stage1_pipeline(
     return payload
 
 
-# --------------------------------------------------------------------------- e2e five-arm summary
+# --------------------------------------------------------------------------- e2e eight-arm summary
 
 _E2E_ARMS: tuple[str, ...] = (
     "full",
     "b0_e2e_f_only",
     "pair_topology",
-    "structure_control_6a",
     "p0",
+    "cosine_pool",
+    "no_l_rel",
+    "structure_control_6a_v3",
+    "structure_control_6e_v1",
 )
 _E2E_FORMAL_ARMS: tuple[str, ...] = (
     "full",
     "b0_e2e_f_only",
     "pair_topology",
     "p0",
+    "cosine_pool",
+    "no_l_rel",
+)
+_E2E_CONTROL_ARMS: tuple[str, ...] = (
+    "structure_control_6a_v3",
+    "structure_control_6e_v1",
 )
 
 
@@ -1222,21 +1342,21 @@ def _e2e_registration_sha256(run_metadata: Mapping[str, Mapping[str, object]]) -
 
     Args:
         run_metadata: Formal-run arm name -> its parsed ``run_metadata.json``.
-            ``structure_control_6a`` never has an entry (it is a scoring-time
-            control over the ``full`` checkpoint, not its own training run).
+            Scoring-time controls never have entries because both reuse the
+            ``full`` checkpoint.
 
     Returns:
         The non-empty common ``preregistration_sha256`` value.
 
     Raises:
-        ValueError: If the metadata records are not exactly the four formal
+        ValueError: If the metadata records are not exactly the six trained
             arms, a registration hash is missing/empty, or hashes disagree.
     """
     expected = set(_E2E_FORMAL_ARMS)
     provided = set(run_metadata)
     if provided != expected:
         raise ValueError(
-            "e2e summary requires exactly the four formal run metadata records "
+            "e2e summary requires exactly the six trained run metadata records "
             f"{sorted(expected)}, got {sorted(provided)}"
         )
     hashes = {
@@ -1264,22 +1384,74 @@ def _enforce_e2e_formal_metadata(
         "b0_e2e_f_only": ("all_head", 0.15, 0.15),
         "pair_topology": ("content_head", 0.15, 0.15),
         "p0": ("none", 0.0, 0.0),
+        "cosine_pool": ("none", 0.15, 0.15),
+        "no_l_rel": ("none", 0.15, 0.15),
     }
     checkpoints: set[str] = set()
     arms = cast(Mapping[str, Mapping[str, object]], preregistration.get("arms"))
+    evidence = cast(Mapping[str, object], preregistration.get("binding_evidence"))
+    implementation = cast(Mapping[str, object], evidence.get("implementation"))
+    config_evidence = cast(Mapping[str, Mapping[str, object]], evidence.get("configs"))
     if set(arms) != set(_E2E_ARMS):
-        raise RegistrationShaMismatch("registration must bind exactly the five E2E arms")
+        raise RegistrationShaMismatch(
+            "registration must bind the exact six-trained-plus-two-control E2E schema"
+        )
+    control_modes = {
+        "structure_control_6a_v3": "shuffle_within_pair_v3",
+        "structure_control_6e_v1": "rewire_checkerboard_v1",
+    }
+    for control_arm, control_mode in control_modes.items():
+        control_entry = arms[control_arm]
+        scoring_semantics = control_entry.get("scoring_provenance")
+        if (
+            control_entry.get("kind") != "scoring_time_control"
+            or control_entry.get("checkpoint_arm") != "full"
+            or not isinstance(scoring_semantics, Mapping)
+            or scoring_semantics.get("scaffold_control") != control_mode
+            or scoring_semantics.get("checkpoint_arm") != "full"
+        ):
+            raise RegistrationShaMismatch(
+                f"{control_arm}: registration must bind its full-checkpoint control semantics"
+            )
     benchmark = cast(Mapping[str, object], preregistration.get("benchmark"))
     registered_strategy = benchmark.get("strategy")
-    from src.train_egostitch import _config_hash, load_config
+    from src.model.egostitch.config import E2EConfig
+    from src.train_egostitch import _config_hash, _e2e_arm_name_from_config, load_config
 
     for arm, metadata in run_metadata.items():
+        registered_arm = arms[arm]
+        if registered_arm.get("kind") != "trained_checkpoint":
+            raise RegistrationShaMismatch(f"{arm}: registration kind must be trained_checkpoint")
+        if metadata.get("arm") != arm:
+            raise RegistrationShaMismatch(f"{arm}: run metadata arm does not match package key")
+        if metadata.get("arm_kind") != "trained_checkpoint":
+            raise RegistrationShaMismatch(f"{arm}: arm_kind must be trained_checkpoint")
+        if metadata.get("checkpoint_arm") != arm:
+            raise RegistrationShaMismatch(f"{arm}: checkpoint_arm must match the trained arm")
+        if metadata.get("scoring_semantics") != registered_arm.get("scoring_provenance"):
+            raise RegistrationShaMismatch(
+                f"{arm}: scoring_semantics do not match registered scoring provenance"
+            )
         if metadata.get("run_kind") != "formal":
             raise RegistrationShaMismatch(f"{arm}: run metadata must declare run_kind 'formal'")
         if metadata.get("formal_artifacts_published") is not True:
             raise RegistrationShaMismatch(f"{arm}: formal_artifacts_published must be exactly true")
         if metadata.get("status") != "complete":
             raise RegistrationShaMismatch(f"{arm}: formal run metadata status must be 'complete'")
+        if metadata.get("selected_checkpoint_eligible") is not True:
+            raise RegistrationShaMismatch(
+                f"{arm}: selected_checkpoint_eligible must be exactly true"
+            )
+        if not _is_sha256(metadata.get("checkpoint_sha256")):
+            raise RegistrationShaMismatch(f"{arm}: checkpoint_sha256 must be 64-hex")
+        if metadata.get("implementation_commit") != implementation.get("commit"):
+            raise RegistrationShaMismatch(
+                f"{arm}: implementation_commit does not match binding evidence"
+            )
+        if metadata.get("config_sha256") != config_evidence[arm].get("sha256"):
+            raise RegistrationShaMismatch(
+                f"{arm}: config_sha256 does not match binding evidence"
+            )
         checkpoint = metadata.get("checkpoint_id")
         if not isinstance(checkpoint, str) or not checkpoint:
             raise RegistrationShaMismatch(f"{arm}: run metadata needs a checkpoint_id")
@@ -1310,6 +1482,14 @@ def _enforce_e2e_formal_metadata(
         if metadata.get("config_hash") != expected_config_hash:
             raise RegistrationShaMismatch(
                 f"{arm}: config_hash does not match registered arm config"
+            )
+        resolved_config = load_config(expected_config_path)
+        resolved_arm = _e2e_arm_name_from_config(
+            E2EConfig.from_mapping(resolved_config.model.config)
+        )
+        if resolved_arm != arm:
+            raise RegistrationShaMismatch(
+                f"{arm}: registered config resolves to trained arm {resolved_arm!r}"
             )
 
 
@@ -1367,11 +1547,34 @@ def _validate_e2e_scoring_provenance(
     name: str,
     artifact: ScoresArtifact,
     registered_arm: Mapping[str, object],
+    *,
+    run_metadata: Mapping[str, Mapping[str, object]],
+    run_metadata_paths: Mapping[str, Path],
+    preregistration: Mapping[str, object],
+    preregistration_path: Path,
+    registration_sha256: str,
 ) -> None:
     """Bind one score artifact to the registered training/control semantics."""
     expected = cast(Mapping[str, object] | None, registered_arm.get("scoring_provenance"))
     if expected is None:
         raise RegistrationShaMismatch(f"{name}: registration has no scoring_provenance")
+    expected_kind = registered_arm.get("kind")
+    expected_checkpoint_arm = (
+        registered_arm.get("checkpoint_arm")
+        if expected_kind == "scoring_time_control"
+        else name
+    )
+    for key, expected_value in (
+        ("scoring_arm", name),
+        ("arm_kind", expected_kind),
+        ("checkpoint_arm", expected_checkpoint_arm),
+        ("scoring_semantics", expected),
+    ):
+        if artifact.meta.get(key) != expected_value:
+            raise RegistrationShaMismatch(
+                f"{name}: {key} provenance mismatch: "
+                f"{artifact.meta.get(key)!r} != {expected_value!r}"
+            )
     expected_control = {
         "mode": expected.get("scaffold_control"),
         "seed": 0,
@@ -1389,15 +1592,45 @@ def _validate_e2e_scoring_provenance(
                 f"{name}: {key} provenance mismatch: "
                 f"{artifact.meta.get(key)!r} != {expected.get(key)!r}"
             )
-    if name == "structure_control_6a":
+    if name in _E2E_CONTROL_ARMS:
         if expected.get("seed") != 0 or expected.get("keying") != "canonical_pair_v1":
             raise RegistrationShaMismatch(
-                "structure_control_6a registration must pin seed 0/canonical_pair_v1"
+                f"{name} registration must pin seed 0/canonical_pair_v1"
             )
         if expected.get("checkpoint_arm") != "full":
             raise RegistrationShaMismatch(
-                "structure_control_6a registration must pin checkpoint_arm 'full'"
+                f"{name} registration must pin checkpoint_arm 'full'"
             )
+    source_arm = cast(str, expected_checkpoint_arm)
+    metadata = run_metadata[source_arm]
+    metadata_path = run_metadata_paths[source_arm]
+    registered_arms = cast(Mapping[str, Mapping[str, object]], preregistration["arms"])
+    source_registration = registered_arms[source_arm]
+    evidence = cast(Mapping[str, object], preregistration["binding_evidence"])
+    config_evidence_by_arm = cast(Mapping[str, Mapping[str, object]], evidence["configs"])
+    config_evidence = config_evidence_by_arm[source_arm]
+    formal = artifact.meta.get("formal_scoring_provenance")
+    expected_formal = {
+        "arm": source_arm,
+        "arm_kind": "trained_checkpoint",
+        "checkpoint_arm": source_arm,
+        "scoring_semantics": source_registration.get("scoring_provenance"),
+        "registration_sha256": registration_sha256,
+        "run_metadata_sha256": _sha256_file(metadata_path),
+        "config_path": str(
+            _registered_path(preregistration_path, source_registration.get("training")).resolve()
+        ),
+        "config_sha256": config_evidence.get("sha256"),
+        "checkpoint_sha256": metadata.get("checkpoint_sha256"),
+        "implementation_commit": cast(Mapping[str, object], evidence["implementation"]).get(
+            "commit"
+        ),
+        "selected_checkpoint_eligible": True,
+    }
+    if formal != expected_formal:
+        raise RegistrationShaMismatch(
+            f"{name}: formal_scoring_provenance mismatch: {formal!r} != {expected_formal!r}"
+        )
 
 
 def _registered_candidate_manifest(
@@ -1598,7 +1831,7 @@ def build_e2e_arm_summary(
     seed: int = 0,
     preregistration_snapshot: tuple[dict[str, object], str] | None = None,
 ) -> dict[str, object]:
-    """Build the registered five-arm ``egostitch_e2e`` Stage-1 summary table.
+    """Build the registered eight-arm ``egostitch_e2e`` Stage-1 summary table.
 
     Loads and validates every arm's scores artifact through
     :func:`validate_artifact_precision` (the artifact-aware entry point — never
@@ -1618,13 +1851,12 @@ def build_e2e_arm_summary(
     procedure that is exp-Task 7's scope.
 
     Args:
-        arm_universe_paths: Exact registered five-arm mapping (``full``,
-            ``b0_e2e_f_only``, ``pair_topology``, ``structure_control_6a``,
-            ``p0``) -> its scored ``.npz`` artifact.
+        arm_universe_paths: Exact registered six-trained-plus-two-control
+            mapping to scored ``.npz`` artifacts.
         run_metadata_paths: Formal-run arm name -> its ``run_metadata.json``.
-            ``structure_control_6a`` never has an entry.
+            Scoring-time controls never have entries.
         preregistration_path: Binding registration whose sha must be present
-            in every one of the four formal metadata records.
+            in every one of the six trained-arm metadata records.
         data_root: Directory containing the benchmark package.
         strategy: Benchmark split strategy.
         liveness_config: The registered ``min_residual_std_ratio`` /
@@ -1637,13 +1869,13 @@ def build_e2e_arm_summary(
 
     Returns:
         A JSON-ready payload: ``registration_sha256`` (the non-empty single
-        hash shared by the four formal run metadata records), a per-arm
+        hash shared by the six trained run metadata records), a per-arm
         ``checkpoint_id`` / ``registration_sha256`` / ``assembled`` /
         ``degree_corrected_auprc`` row, and the ``full`` arm's
         within-checkpoint ``liveness`` report.
 
     Raises:
-        ValueError: On an invalid five-arm composition, invalid formal-run
+        ValueError: On an invalid eight-arm composition, invalid formal-run
             metadata/hash provenance, mismatched scoring checkpoint identities,
             an artifact whose ``model_family`` is not ``egostitch_e2e``, or an
             artifact that fails its candidate-universe shape check or
@@ -1656,7 +1888,7 @@ def build_e2e_arm_summary(
         raise ValueError("the 'full' arm is required to build the e2e arm summary")
     if set(arm_universe_paths) != set(_E2E_ARMS):
         raise ValueError(
-            "e2e summary requires exactly the five registered arms "
+            "e2e summary requires exactly the eight registered arms "
             f"{list(_E2E_ARMS)}, got {sorted(arm_universe_paths)}"
         )
 
@@ -1735,25 +1967,30 @@ def build_e2e_arm_summary(
         if artifact.meta.get("model_family") != "egostitch_e2e":
             raise ValueError(f"{label}: model_family must be 'egostitch_e2e'")
         validate_artifact_precision(artifact, label=label)
-        _validate_e2e_scoring_provenance(name, artifact, registered_arms[name])
+        expected_checkpoint_arm = "full" if name in _E2E_CONTROL_ARMS else name
+        metadata_checkpoint = run_metadata[expected_checkpoint_arm].get("checkpoint_id")
+        artifact_checkpoint = artifact.meta.get("checkpoint_id")
+        if artifact_checkpoint != metadata_checkpoint:
+            raise ValueError(
+                f"{name} checkpoint_id mismatch: "
+                f"{metadata_checkpoint!r} != {artifact_checkpoint!r}"
+            )
+        _validate_e2e_scoring_provenance(
+            name,
+            artifact,
+            registered_arms[name],
+            run_metadata=run_metadata,
+            run_metadata_paths=run_metadata_paths,
+            preregistration=preregistration,
+            preregistration_path=preregistration_path,
+            registration_sha256=registration_sha256,
+        )
         if list(artifact.pairs()) != candidate_pairs:
             raise RegistrationShaMismatch(
                 f"{label}: candidate pair identity/order does not match frozen manifest"
             )
         if not np.array_equal(artifact.label, candidate_labels):
             raise RegistrationShaMismatch(f"{label}: candidate labels do not match frozen manifest")
-        if name in _E2E_FORMAL_ARMS:
-            metadata_checkpoint = run_metadata[name].get("checkpoint_id")
-            artifact_checkpoint = artifact.meta.get("checkpoint_id")
-            if (
-                not isinstance(metadata_checkpoint, str)
-                or not metadata_checkpoint
-                or artifact_checkpoint != metadata_checkpoint
-            ):
-                raise ValueError(
-                    f"{label}: run metadata checkpoint_id mismatch: "
-                    f"{metadata_checkpoint!r} != {artifact_checkpoint!r}"
-                )
         artifacts[name] = artifact
 
         probs = artifact.probs()
@@ -1789,18 +2026,19 @@ def build_e2e_arm_summary(
         }
 
     full_checkpoint = artifacts["full"].meta.get("checkpoint_id")
-    control_checkpoint = artifacts["structure_control_6a"].meta.get("checkpoint_id")
-    if control_checkpoint != full_checkpoint:
-        raise ValueError(
-            "structure_control_6a checkpoint_id must match full scoring checkpoint: "
-            f"{control_checkpoint!r} != {full_checkpoint!r}"
-        )
+    for control_name in _E2E_CONTROL_ARMS:
+        control_checkpoint = artifacts[control_name].meta.get("checkpoint_id")
+        if control_checkpoint != full_checkpoint:
+            raise ValueError(
+                f"{control_name} checkpoint_id must match full scoring checkpoint: "
+                f"{control_checkpoint!r} != {full_checkpoint!r}"
+            )
 
     lower_bound = paired_bootstrap_lower_bound(
         lambda samples: _clustering_mmd_ratio(
             cast(Sequence[object] | Mapping[object, Sequence[object]], samples), config
         ),
-        clustering_samples["structure_control_6a"],
+        clustering_samples["structure_control_6a_v3"],
         clustering_samples["full"],
         n_boot=1000,
         seed=0,
@@ -1835,7 +2073,7 @@ _E2E_LIVENESS_CONFIG: dict[str, float] = {
 
 
 def render_e2e_tables_markdown(payload: Mapping[str, object]) -> str:
-    """Render the complete five-arm, decomposition, and probe evidence tables."""
+    """Render the complete eight-arm, decomposition, and probe evidence tables."""
     arms = cast(Mapping[str, Mapping[str, object]], payload["arms"])
     lines = [
         "# G5 E2E Stage-1 gate",
@@ -1844,7 +2082,7 @@ def render_e2e_tables_markdown(payload: Mapping[str, object]) -> str:
         "",
         "Fixed-seed evaluator-stability evidence only; not significance or cross-seed robustness.",
         "",
-        "## Five-arm summary",
+        "## Eight-arm summary",
         "",
         "| arm | checkpoint | GS | BFS-macro RD | degree MMD | clustering MMD | "
         "spectral MMD | degree-corrected AUPRC |",
@@ -1924,7 +2162,7 @@ def run_g5_e2e_stage1_pipeline(
     output_dir: Path,
     seed: int = 0,
 ) -> dict[str, object]:
-    """Run the binding E2E five-arm G5 gate and write its verdict artifacts."""
+    """Run the binding E2E eight-arm G5 gate and write its verdict artifacts."""
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     # A rejected run must not leave an older verdict looking authoritative.
     for filename in ("g5_e2e_stage1_results.json", "g5_e2e_stage1_tables.md"):
@@ -2268,10 +2506,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=("required per-seed fidelity report for the binding Stage-1 screen"),
     )
     parser.add_argument("--full-universe", type=Path)
-    parser.add_argument("--control-universe", type=Path)
+    parser.add_argument("--control-6a-universe", type=Path)
+    parser.add_argument("--control-6e-universe", type=Path)
     parser.add_argument("--fonly-universe", type=Path)
     parser.add_argument("--pt-universe", type=Path)
     parser.add_argument("--p0-universe", type=Path)
+    parser.add_argument("--cosine-pool-universe", type=Path)
+    parser.add_argument("--no-l-rel-universe", type=Path)
     parser.add_argument("--probe-artifact", type=Path)
     parser.add_argument(
         "--cost-report",
@@ -2297,10 +2538,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.mode == "e2e":
         arm_paths = {
             "full": args.full_universe,
-            "structure_control_6a": args.control_universe,
             "b0_e2e_f_only": args.fonly_universe,
             "pair_topology": args.pt_universe,
             "p0": args.p0_universe,
+            "cosine_pool": args.cosine_pool_universe,
+            "no_l_rel": args.no_l_rel_universe,
+            "structure_control_6a_v3": args.control_6a_universe,
+            "structure_control_6e_v1": args.control_6e_universe,
         }
         required = {
             **arm_paths,
@@ -2313,8 +2557,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         missing = [name for name, path in required.items() if path is None]
         if missing:
             parser.error(f"--mode e2e requires: {', '.join(missing)}")
-        if len(args.run_metadata) != 4:
-            parser.error("--mode e2e requires exactly four --run-metadata paths")
+        if len(args.run_metadata) != 6:
+            parser.error("--mode e2e requires exactly six --run-metadata paths")
         for path in [
             *cast(dict[str, Path], arm_paths).values(),
             *args.run_metadata,
