@@ -3743,27 +3743,37 @@ def _e2e_family_probe(
     result: dict[str, dict[str, float]] = {group: {} for group in groups}
     submodule_rms: dict[str, float] = {}
     probe_payload = {**payload, "collect_diagnostics": True}
-    for family in families:
+    inner = cast(_CompositeStep, accelerator.unwrap_model(wrapped)).model
+    assert isinstance(inner, EgoStitchE2E)
+    ema_snapshot = [
+        (buffer, buffer.detach().clone())
+        for name, buffer in inner.named_buffers()
+        if name.endswith(("ema_mu", "ema_updates"))
+    ]
+    try:
+        for family in families:
+            wrapped.zero_grad(set_to_none=True)
+            probe_out = cast(dict[str, object], wrapped(probe_payload))
+            family_loss = cast(dict[str, torch.Tensor], probe_out["families"])[family]
+            accelerator.backward(family_loss)
+            gathered = _e2e_group_squared_norms(groups, accelerator)
+            e2e_assert_replicated_squared_norms(gathered)
+            if family == "edge":
+                submodule_rms = _e2e_current_submodule_gradient_rms(inner, accelerator)
+            for group, family_names in expected.items():
+                if family not in family_names:
+                    continue
+                norm = float(torch.sqrt(gathered[group].double().mean()).item())
+                if not math.isfinite(norm) or norm <= 0.0:
+                    raise RuntimeError(
+                        f"invalid E2E fixed-replay norm for family {family!r}, group {group!r}"
+                    )
+                result[group][family] = norm
+    finally:
+        with torch.no_grad():
+            for buffer, value in ema_snapshot:
+                buffer.copy_(value)
         wrapped.zero_grad(set_to_none=True)
-        probe_out = cast(dict[str, object], wrapped(probe_payload))
-        family_loss = cast(dict[str, torch.Tensor], probe_out["families"])[family]
-        accelerator.backward(family_loss)
-        gathered = _e2e_group_squared_norms(groups, accelerator)
-        e2e_assert_replicated_squared_norms(gathered)
-        if family == "edge":
-            inner = cast(_CompositeStep, accelerator.unwrap_model(wrapped)).model
-            assert isinstance(inner, EgoStitchE2E)
-            submodule_rms = _e2e_current_submodule_gradient_rms(inner, accelerator)
-        for group, family_names in expected.items():
-            if family not in family_names:
-                continue
-            norm = float(torch.sqrt(gathered[group].double().mean()).item())
-            if not math.isfinite(norm) or norm <= 0.0:
-                raise RuntimeError(
-                    f"invalid E2E fixed-replay norm for family {family!r}, group {group!r}"
-                )
-            result[group][family] = norm
-    wrapped.zero_grad(set_to_none=True)
     return result, submodule_rms
 
 

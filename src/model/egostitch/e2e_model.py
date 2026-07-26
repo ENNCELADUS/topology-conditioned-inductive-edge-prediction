@@ -20,6 +20,7 @@ from dataclasses import replace
 from typing import NamedTuple
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
@@ -449,15 +450,20 @@ class EgoStitchE2E(nn.Module):
         return context.topo_ab
 
     def score_pair_context(
-        self, context: E2EPairContext, *, masks: HeadNullMasks | None = None
+        self,
+        context: E2EPairContext,
+        *,
+        masks: HeadNullMasks | None = None,
+        edge_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Evaluate one hard-bypass head from a shared pair context."""
         batch_size = context.encoded_a.size(0)
         device = context.encoded_a.device
         if masks is None:
             masks = masks_for_null(NULL_NONE, batch_size, device)
-        need_topo = bool(masks.topo.any())
-        need_cont = bool(masks.cont.any())
+        distributed_training = self.training and dist.is_available() and dist.is_initialized()
+        need_topo = bool(masks.topo.any()) or distributed_training
+        need_cont = bool(masks.cont.any()) or distributed_training
         if need_topo and (context.topo_ab is None or context.topo_ba is None):
             raise ValueError("pair context does not contain topology tokens")
         if need_cont and context.cont is None:
@@ -471,6 +477,7 @@ class EgoStitchE2E(nn.Module):
             cont_tokens=context.cont if need_cont else None,
             topo_active=masks.topo if need_topo else None,
             cont_active=masks.cont if need_cont else None,
+            edge_mask=edge_mask,
         )
         feat_ba = self.trunk(
             context.encoded_b,
@@ -481,6 +488,7 @@ class EgoStitchE2E(nn.Module):
             cont_tokens=context.cont if need_cont else None,
             topo_active=masks.topo if need_topo else None,
             cont_active=masks.cont if need_cont else None,
+            edge_mask=edge_mask,
         )
         feat = torch.max(torch.stack([feat_ab, feat_ba], dim=-1), dim=-1).values
         # The registered mixed-precision contract keeps logits in fp32. Casting
@@ -510,8 +518,9 @@ class EgoStitchE2E(nn.Module):
         if masks is None:
             masks = masks_for_null(NULL_NONE, batch_size, device)
         has_relational_targets = "rel_target" in batch
-        need_topo = bool(masks.topo.any()) or has_relational_targets
-        need_cont = bool(masks.cont.any())
+        distributed_training = self.training and dist.is_available() and dist.is_initialized()
+        need_topo = bool(masks.topo.any()) or has_relational_targets or distributed_training
+        need_cont = bool(masks.cont.any()) or distributed_training
         state_a, state_b, is_self = self._pair_node_states(batch)
         context = self.build_pair_context_from_states(
             state_a,
@@ -520,7 +529,13 @@ class EgoStitchE2E(nn.Module):
             need_topo=need_topo,
             need_cont=need_cont,
         )
-        output = {"logits": self.score_pair_context(context, masks=masks)}
+        output = {
+            "logits": self.score_pair_context(
+                context,
+                masks=masks,
+                edge_mask=batch.get("edge_mask"),
+            )
+        }
         if has_relational_targets:
             output.update(self._training_relational_losses(batch, state_a, state_b, context))
         return output

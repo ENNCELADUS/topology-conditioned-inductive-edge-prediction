@@ -150,6 +150,7 @@ throughout. Outer `λ_recon` is untouched.
 | `τ_div` | `0.5` | §14.4.1 |
 | `τ_adj` | `0.5` (implementation default; `< 1` is the spec constraint) | §14.4.2 |
 | ego-target cap `K` | `16` | §14.4.1 / `ego_targets.py` |
+| conditioning μ EMA decay | `0.99` (implementation default; spec does not bind it) | Task 8 |
 
 `τ_adj` and the `L_gate` pos-weight are **calibration-time values that the v3
 registration must freeze**. Expose both as config fields with the defaults above;

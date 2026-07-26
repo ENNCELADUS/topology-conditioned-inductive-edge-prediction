@@ -51,6 +51,7 @@ class ConditionedPairCrossAttention(PairCrossAttention):
         cont_tokens: torch.Tensor | None = None,
         topo_active: torch.Tensor | None = None,
         cont_active: torch.Tensor | None = None,
+        edge_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the pair trunk with optional gated topo/content cls conditioning.
 
@@ -67,6 +68,8 @@ class ConditionedPairCrossAttention(PairCrossAttention):
                 pathway per-sample; required alongside ``topo_tokens``.
             cont_active: Optional ``(batch,)`` bool mask gating the content
                 pathway per-sample; required alongside ``cont_tokens``.
+            edge_mask: Optional ``(batch,)`` real-row mask used to exclude DDP
+                filler rows from conditioning means.
 
         Returns:
             Fused pair representation ``(batch, d_model)``.
@@ -88,9 +91,13 @@ class ConditionedPairCrossAttention(PairCrossAttention):
             inj = idx - (n_layers - self.n_inj)
             if inj >= 0:
                 if topo_tokens is not None and topo_active is not None:
-                    cls_token = self.topo_xattn[inj](cls_token, topo_tokens, None, topo_active)
+                    cls_token = self.topo_xattn[inj](
+                        cls_token, topo_tokens, None, topo_active, edge_mask
+                    )
                 if cont_tokens is not None and cont_active is not None:
-                    cls_token = self.cont_xattn[inj](cls_token, cont_tokens, None, cont_active)
+                    cls_token = self.cont_xattn[inj](
+                        cls_token, cont_tokens, None, cont_active, edge_mask
+                    )
         cls_vec = cls_token.squeeze(1)
         if self.pair_readout_mode == "pair_context_gated":
             # Full and hard-null heads differ only through the conditioned cls

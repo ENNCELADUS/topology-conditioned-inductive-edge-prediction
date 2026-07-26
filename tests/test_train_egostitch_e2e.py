@@ -657,6 +657,41 @@ class TestE2ECompositeStep:
         }
         assert payload["collect_diagnostics"] is False
 
+    def test_family_probe_does_not_mutate_conditioning_ema(self, tmp_path: Path) -> None:
+        torch.manual_seed(0)
+        batch, model = self._batch_and_model(tmp_path)
+        composite = te._CompositeStep(model, world_size=1)
+        groups = te.build_e2e_parameter_groups(model).groups
+        payload = self._payload(batch, joint_weight=1.0, collect_diagnostics=False)
+        accelerator = Accelerator(cpu=True)
+        with torch.no_grad():
+            for module in model.modules():
+                if isinstance(module, GatedCrossAttention):
+                    module.gate.fill_(0.7)
+        ema_before = {
+            name: buffer.clone()
+            for name, buffer in model.named_buffers()
+            if name.endswith(("ema_mu", "ema_updates"))
+        }
+
+        with self._bf16_autocast():
+            te._e2e_family_probe(
+                composite,
+                payload,
+                groups,
+                te.e2e_phase_state(50, 100),
+                "full",
+                accelerator,
+            )
+
+        ema_after = {
+            name: buffer
+            for name, buffer in model.named_buffers()
+            if name.endswith(("ema_mu", "ema_updates"))
+        }
+        assert ema_after.keys() == ema_before.keys()
+        assert all(torch.equal(ema_after[name], value) for name, value in ema_before.items())
+
     def test_profile_loop_executes_real_optimizer_and_validation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
