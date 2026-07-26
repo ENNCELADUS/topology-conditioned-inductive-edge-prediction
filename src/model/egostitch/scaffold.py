@@ -308,15 +308,22 @@ def grounded_identity_match(
     gate_b: torch.Tensor,
     ids_b: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return symmetric flags for gated slots selecting a shared node id."""
-    gated_a = gate_a > 0.5
-    gated_b = gate_b > 0.5
-    selected_a = torch.gather(ids_a, 1, pointer_a.argmax(dim=-1))
-    selected_b = torch.gather(ids_b, 1, pointer_b.argmax(dim=-1))
-    shared = selected_a[:, :, None] == selected_b[:, None, :]
-    matched_a = gated_a & (shared & gated_b[:, None, :]).any(dim=-1)
-    matched_b = gated_b & (shared & gated_a[:, :, None]).any(dim=1)
-    return matched_a.float(), matched_b.float()
+    """Return the differentiable soft matched flags from spec §14.4.2.
+
+    Disjoint grounding pools make the shared-id indicator zero, so both
+    outputs and their pointer/gate gradients are exactly zero rather than NaN.
+    With near-uniform untrained pointers, ``M`` is approximately
+    ``|pool overlap| / n_g²`` and the ``L_edge``-through-content gradient to
+    the pointer vanishes at initialization. B2 only repairs the gradient
+    plumbing; ``L_ptr`` and the pos-weighted ``L_gate`` do the training work.
+    """
+    shared_ids = (ids_a[:, :, None] == ids_b[:, None, :]).to(pointer_a.dtype)
+    match_probability = torch.einsum(
+        "bkg,bgh,blh->bkl", pointer_a, shared_ids, pointer_b
+    )
+    matched_a = gate_a * (match_probability * gate_b[:, None, :]).amax(dim=-1)
+    matched_b = gate_b * (match_probability * gate_a[:, :, None]).amax(dim=1)
+    return matched_a, matched_b
 
 
 def build_scaffold(

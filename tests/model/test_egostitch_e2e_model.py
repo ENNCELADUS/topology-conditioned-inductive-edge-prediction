@@ -19,7 +19,9 @@ from src.model.egostitch.model import NodeEncoding
 from src.model.egostitch.scaffold import counterpart_membership, grounded_identity_match
 
 
-def _tiny_model_and_batch() -> tuple[EgoStitchE2E, dict[str, torch.Tensor]]:
+def _tiny_model_and_batch(
+    *, p_topo: float = 0.15, p_cont: float = 0.15
+) -> tuple[EgoStitchE2E, dict[str, torch.Tensor]]:
     torch.manual_seed(0)
     cfg = E2EConfig(
         d_model=32,
@@ -30,6 +32,8 @@ def _tiny_model_and_batch() -> tuple[EgoStitchE2E, dict[str, torch.Tensor]]:
         ste_dim=16,
         ste_layers=2,
         xattn_heads=4,
+        p_topo=p_topo,
+        p_cont=p_cont,
     )
     model = EgoStitchE2E(cfg).eval()
     b, t, d_in = 4, 6, model.input_dim
@@ -51,6 +55,7 @@ def _tiny_model_and_batch() -> tuple[EgoStitchE2E, dict[str, torch.Tensor]]:
 
 def test_pair_symmetry_all_conditions() -> None:
     model, batch = _tiny_model_and_batch()
+    batch["ground_id_b"] = batch["ground_id_a"].roll(shifts=1, dims=1)
     topo_xattn, cont_xattn = model.trunk.topo_xattn[0], model.trunk.cont_xattn[0]
     assert isinstance(topo_xattn, GatedCrossAttention)
     assert isinstance(cont_xattn, GatedCrossAttention)
@@ -72,9 +77,32 @@ def test_pair_symmetry_all_conditions() -> None:
         out_ji = model(swapped, masks=masks)["logits"]
         assert torch.allclose(out_ij, out_ji, atol=1e-5), f"asymmetry under {null}"
 
+    p0_model, p0_batch = _tiny_model_and_batch(p_topo=0.0, p_cont=0.0)
+    p0_batch["ground_id_b"] = p0_batch["ground_id_a"].roll(shifts=1, dims=1)
+    p0_topo_xattn = p0_model.trunk.topo_xattn[0]
+    p0_cont_xattn = p0_model.trunk.cont_xattn[0]
+    assert isinstance(p0_topo_xattn, GatedCrossAttention)
+    assert isinstance(p0_cont_xattn, GatedCrossAttention)
+    with torch.no_grad():
+        p0_topo_xattn.gate.fill_(0.4)
+        p0_cont_xattn.gate.fill_(0.4)
+    p0_swapped = dict(p0_batch)
+    for key_a, key_b in (
+        ("emb_a", "emb_b"),
+        ("len_a", "len_b"),
+        ("x_a", "x_b"),
+        ("ground_a", "ground_b"),
+        ("ground_id_a", "ground_id_b"),
+    ):
+        p0_swapped[key_a], p0_swapped[key_b] = p0_batch[key_b], p0_batch[key_a]
+    assert torch.allclose(
+        p0_model(p0_batch)["logits"], p0_model(p0_swapped)["logits"], atol=1e-5
+    ), "asymmetry under p0"
+
 
 def test_train_mask_equals_eval_bypass() -> None:
     model, batch = _tiny_model_and_batch()
+    batch["ground_id_b"] = batch["ground_id_a"].roll(shifts=1, dims=1)
     topo_xattn, cont_xattn = model.trunk.topo_xattn[0], model.trunk.cont_xattn[0]
     assert isinstance(topo_xattn, GatedCrossAttention)
     assert isinstance(cont_xattn, GatedCrossAttention)
@@ -109,27 +137,92 @@ def test_missing_grounding_fails_closed() -> None:
 
 
 def test_matched_flags_shared_candidate() -> None:
-    """Identity matching is symmetric and requires shared ids plus open gates."""
+    """Soft identity matching is symmetric and requires shared pool ids."""
     ids_a = torch.tensor([[10, 11], [10, 11], [10, 11], [10, 11]], dtype=torch.long)
-    ids_b = torch.tensor([[10, 11], [20, 21], [10, 11], [10, 11]], dtype=torch.long)
-    # Single slot per side; pointer argmax always lands on grounding-pool index 0.
+    ids_b = torch.tensor([[20, 10], [20, 21], [20, 10], [20, 10]], dtype=torch.long)
+    # Single slot per side; the shared id is at different pool positions.
     pointer_a = torch.zeros(4, 1, 2)
     pointer_a[:, :, 0] = 1.0
     pointer_b = torch.zeros(4, 1, 2)
-    pointer_b[:, :, 0] = 1.0
+    pointer_b[:, :, 1] = 1.0
     gate_a = torch.tensor([[0.9], [0.9], [0.3], [0.9]])
     gate_b = torch.tensor([[0.9], [0.9], [0.9], [0.3]])
 
     matched_a, matched_b = grounded_identity_match(
         pointer_a, gate_a, ids_a, pointer_b, gate_b, ids_b
     )
-    assert torch.equal(matched_a, torch.tensor([[1.0], [0.0], [0.0], [0.0]]))
-    assert torch.equal(matched_b, torch.tensor([[1.0], [0.0], [0.0], [0.0]]))
+    expected = torch.tensor([[0.81], [0.0], [0.27], [0.27]])
+    assert torch.allclose(matched_a, expected)
+    assert torch.allclose(matched_b, expected)
     matched_b_swapped, matched_a_swapped = grounded_identity_match(
         pointer_b, gate_b, ids_b, pointer_a, gate_a, ids_a
     )
     assert torch.equal(matched_a, matched_a_swapped)
     assert torch.equal(matched_b, matched_b_swapped)
+
+
+def test_matched_flags_gradient_reaches_head_pointer() -> None:
+    """An overlapping grounding pool carries matched-flag gradient to the pointer head."""
+    model, batch = _tiny_model_and_batch()
+    slots_a = model.generator.encode_nodes(batch["x_a"][:1], batch["ground_a"][:1]).slots
+    slots_b = model.generator.encode_nodes(batch["x_b"][:1], batch["ground_b"][:1]).slots
+    ids_a = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
+    ids_b = torch.tensor([[21, 10, 22, 23, 24]], dtype=torch.long)
+
+    matched_a, _ = grounded_identity_match(
+        slots_a.pointer,
+        slots_a.gate,
+        ids_a,
+        slots_b.pointer,
+        slots_b.gate,
+        ids_b,
+    )
+    matched_a.sum().backward()
+
+    pointer_parameters = tuple(model.generator.imagine.head_pointer.parameters())
+    assert pointer_parameters
+    for parameter in pointer_parameters:
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert torch.count_nonzero(parameter.grad) > 0
+
+
+def test_matched_flags_maximizes_probability_gate_product() -> None:
+    """The counterpart slot maximizes ``M[k,l] * gate_b[l]`` as one product."""
+    pointer_a = torch.tensor([[[1.0, 0.0]]])
+    pointer_b = torch.tensor([[[0.1, 0.9], [0.4, 0.6]]])
+    gate_a = torch.tensor([[0.8]])
+    gate_b = torch.tensor([[0.1, 0.9]])
+    ids_a = torch.tensor([[10, 11]], dtype=torch.long)
+    ids_b = torch.tensor([[11, 10]], dtype=torch.long)
+
+    matched_a, _ = grounded_identity_match(
+        pointer_a, gate_a, ids_a, pointer_b, gate_b, ids_b
+    )
+
+    assert torch.allclose(matched_a, torch.tensor([[0.432]]))
+
+
+def test_matched_flags_disjoint_pools_are_exact_zero_with_zero_gradient() -> None:
+    """Disjoint grounding pools produce exact zeros, including through backward."""
+    pointer_a = torch.softmax(torch.randn(1, 2, 3), dim=-1).requires_grad_()
+    pointer_b = torch.softmax(torch.randn(1, 2, 3), dim=-1).requires_grad_()
+    gate_a = torch.sigmoid(torch.randn(1, 2)).requires_grad_()
+    gate_b = torch.sigmoid(torch.randn(1, 2)).requires_grad_()
+    ids_a = torch.tensor([[10, 11, 12]], dtype=torch.long)
+    ids_b = torch.tensor([[20, 21, 22]], dtype=torch.long)
+
+    matched_a, matched_b = grounded_identity_match(
+        pointer_a, gate_a, ids_a, pointer_b, gate_b, ids_b
+    )
+    assert torch.equal(matched_a, torch.zeros_like(matched_a))
+    assert torch.equal(matched_b, torch.zeros_like(matched_b))
+
+    (matched_a.sum() + matched_b.sum()).backward()
+    for tensor in (pointer_a, pointer_b, gate_a, gate_b):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+        assert torch.count_nonzero(tensor.grad) == 0
 
 
 def test_f_logit_invariant_to_grounding() -> None:
