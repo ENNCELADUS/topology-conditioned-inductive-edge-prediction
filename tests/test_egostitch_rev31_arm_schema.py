@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from itertools import combinations
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import yaml
 from src import score_universe, train_egostitch
 from src.experiments import g5_stage1
 from src.model.egostitch.config import E2EConfig
@@ -86,6 +88,34 @@ def test_v3_configs_load_and_have_only_registered_arm_differences() -> None:
         )
         output_arm = "f_only" if arm == "b0_e2e_f_only" else arm
         assert config.output_dir == Path(f"outputs/egostitch_e2e_stage1_v3/{output_arm}")
+
+
+def test_v3_grounding_packs_are_isolated_by_pool_size() -> None:
+    config_paths = sorted(
+        (REPO_ROOT / "configs").glob("egostitch_e2e_v3_*_breadth_first.yaml")
+    )
+    assert set(config_paths) == set(V3_CONFIGS.values())
+    configs = []
+    for path in config_paths:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+        configs.append(
+            (
+                path.name,
+                payload["model"]["config"]["n_ground"],
+                payload["runtime"]["pack_dir"],
+                payload["data"]["grounding_cache"],
+                payload["data"]["f0_cache"],
+                payload["data"]["pack_dir"],
+            )
+        )
+
+    for left, right in combinations(configs, 2):
+        if left[1] != right[1]:
+            assert left[2] != right[2], f"runtime pack collision: {left[0]} and {right[0]}"
+            assert left[3] != right[3], f"grounding cache collision: {left[0]} and {right[0]}"
+
+    assert len({config[4] for config in configs}) == 1
+    assert len({config[5] for config in configs}) == 1
 
 
 def test_arm_classifier_distinguishes_all_six_trained_checkpoints() -> None:

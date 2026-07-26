@@ -22,7 +22,7 @@ data:
   node_batch: 256
   edge_batch: 128
   f0_cache: outputs/feature_packs/egostitch_f0/f0_matrix.pt
-  grounding_cache: outputs/feature_packs/egostitch_f0/grounding.npz
+  grounding_cache: outputs/feature_packs/egostitch_f0_top20/grounding.npz
   pack_dir: outputs/feature_packs/egostitch_e2e_tokens
   expected_missing_features:
     - node_004764
@@ -78,7 +78,7 @@ preregistration: docs/registrations/g5_e2e_stage1_preregistration_v3.json
 
 runtime:
   world_size: auto
-  pack_dir: outputs/feature_packs/egostitch_f0
+  pack_dir: outputs/feature_packs/egostitch_f0_top20
   pack_workers: 8
   loader_workers_per_rank: 0
   prefetch_factor: 2

@@ -1612,9 +1612,9 @@ def _validate_e2e_scoring_provenance(
     formal = artifact.meta.get("formal_scoring_provenance")
     expected_formal = {
         "arm": source_arm,
-        "arm_kind": "trained_checkpoint",
-        "checkpoint_arm": source_arm,
-        "scoring_semantics": source_registration.get("scoring_provenance"),
+        "arm_kind": expected_kind,
+        "checkpoint_arm": expected_checkpoint_arm,
+        "scoring_semantics": expected,
         "registration_sha256": registration_sha256,
         "run_metadata_sha256": _sha256_file(metadata_path),
         "config_path": str(
@@ -1626,6 +1626,16 @@ def _validate_e2e_scoring_provenance(
             "commit"
         ),
         "selected_checkpoint_eligible": True,
+        "scoring_arm": name,
+        "all_formal_arms": {
+            arm: {
+                "run_metadata_sha256": _sha256_file(run_metadata_paths[arm]),
+                "checkpoint_sha256": run_metadata[arm].get("checkpoint_sha256"),
+                "config_sha256": config_evidence_by_arm[arm].get("sha256"),
+                "selected_checkpoint_eligible": True,
+            }
+            for arm in _E2E_FORMAL_ARMS
+        },
     }
     if formal != expected_formal:
         raise RegistrationShaMismatch(

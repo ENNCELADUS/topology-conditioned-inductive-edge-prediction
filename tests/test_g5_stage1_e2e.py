@@ -242,6 +242,14 @@ def _refresh_formal_run_metadata_hashes(inputs: dict[str, Any]) -> None:
         provenance["run_metadata_sha256"] = hashlib.sha256(
             metadata_paths[source_arm].read_bytes()
         ).hexdigest()
+        all_formal_arms = dict(_d(provenance["all_formal_arms"]))
+        for arm, metadata_path in metadata_paths.items():
+            arm_provenance = dict(_d(all_formal_arms[arm]))
+            arm_provenance["run_metadata_sha256"] = hashlib.sha256(
+                metadata_path.read_bytes()
+            ).hexdigest()
+            all_formal_arms[arm] = arm_provenance
+        provenance["all_formal_arms"] = all_formal_arms
         meta["formal_scoring_provenance"] = provenance
         _rewrite_e2e_artifact(artifact_path, meta=meta)
 
@@ -481,13 +489,14 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
         source_arm = "full" if name in g5_stage1._E2E_CONTROL_ARMS else name
         metadata_path = run_metadata_paths[source_arm]
         metadata = json.loads(metadata_path.read_text())
+        scoring_registration = preregistration["arms"][name]
         artifact = load_scores(artifact_path)
         artifact_meta = dict(artifact.meta)
         artifact_meta["formal_scoring_provenance"] = {
             "arm": source_arm,
-            "arm_kind": "trained_checkpoint",
+            "arm_kind": scoring_registration["kind"],
             "checkpoint_arm": source_arm,
-            "scoring_semantics": preregistration["arms"][source_arm]["scoring_provenance"],
+            "scoring_semantics": scoring_registration["scoring_provenance"],
             "registration_sha256": preregistration_sha256,
             "run_metadata_sha256": hashlib.sha256(metadata_path.read_bytes()).hexdigest(),
             "config_path": str(arm_config_paths[source_arm].resolve()),
@@ -495,6 +504,22 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
             "checkpoint_sha256": metadata["checkpoint_sha256"],
             "implementation_commit": implementation_commit,
             "selected_checkpoint_eligible": True,
+            "scoring_arm": name,
+            "all_formal_arms": {
+                arm: {
+                    "run_metadata_sha256": hashlib.sha256(
+                        run_metadata_paths[arm].read_bytes()
+                    ).hexdigest(),
+                    "checkpoint_sha256": json.loads(
+                        run_metadata_paths[arm].read_text()
+                    )["checkpoint_sha256"],
+                    "config_sha256": preregistration["binding_evidence"]["configs"][arm][
+                        "sha256"
+                    ],
+                    "selected_checkpoint_eligible": True,
+                }
+                for arm in g5_stage1._E2E_FORMAL_ARMS
+            },
         }
         _rewrite_e2e_artifact(artifact_path, meta=artifact_meta)
 
@@ -632,6 +657,7 @@ class TestBuildE2EArmSummary:
         payload = json.loads(metadata_path.read_text())
         payload["checkpoint_id"] = "wrong"
         metadata_path.write_text(json.dumps(payload))
+        _refresh_formal_run_metadata_hashes(inputs)
         with pytest.raises(ValueError, match="checkpoint_id mismatch"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 

@@ -10,6 +10,8 @@ import numpy as np
 import pytest
 import torch
 from src import score_universe
+from src.experiments import g5_stage1
+from src.model.egostitch.e2e_model import EgoStitchE2E
 
 
 def _sha256(path: Path) -> str:
@@ -118,6 +120,64 @@ def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     return registration_path, metadata_path, checkpoint, checkpoint_id
 
 
+def _write_all_e2e_provenance(
+    tmp_path: Path,
+) -> tuple[Path, dict[str, Path], dict[str, Path], dict[str, str]]:
+    registration_path, _metadata, _checkpoint, _checkpoint_id = _write_e2e_provenance(
+        tmp_path
+    )
+    registration = json.loads(registration_path.read_text(encoding="utf-8"))
+    registration_sha256 = _sha256(registration_path)
+    metadata_paths: dict[str, Path] = {}
+    checkpoint_paths: dict[str, Path] = {}
+    checkpoint_ids: dict[str, str] = {}
+    for index, arm in enumerate(score_universe._EGOSTITCH_E2E_FORMAL_ARMS):
+        arm_dir = tmp_path / arm
+        arm_dir.mkdir(exist_ok=True)
+        checkpoint_path = arm_dir / "best.pt"
+        checkpoint_path.write_bytes(f"checkpoint:{arm}".encode())
+        checkpoint_id = f"{index + 1:016x}"
+        arm_registration = registration["arms"][arm]
+        config_path = Path(arm_registration["training"])
+        scoring_semantics = arm_registration["scoring_provenance"]
+        metadata_path = arm_dir / "run_metadata.json"
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "arm": arm,
+                    "arm_kind": "trained_checkpoint",
+                    "checkpoint_arm": arm,
+                    "scoring_semantics": scoring_semantics,
+                    "run_kind": "formal",
+                    "status": "complete",
+                    "formal_artifacts_published": True,
+                    "selected_checkpoint_eligible": True,
+                    "model_family": "egostitch_e2e",
+                    "config_path": str(config_path.resolve()),
+                    "config_sha256": _sha256(config_path),
+                    "preregistration_sha256": registration_sha256,
+                    "implementation_commit": "a" * 40,
+                    "checkpoint_id": checkpoint_id,
+                    "checkpoint_sha256": _sha256(checkpoint_path),
+                    "selected_checkpoint_path": str(checkpoint_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+        metadata_paths[arm] = metadata_path
+        checkpoint_paths[arm] = checkpoint_path
+        checkpoint_ids[arm] = checkpoint_id
+    return registration_path, metadata_paths, checkpoint_paths, checkpoint_ids
+
+
+class _ScoringStub(EgoStitchE2E):
+    """Minimal type-correct model for exercising the real score producer."""
+
+    def __init__(self) -> None:
+        torch.nn.Module.__init__(self)
+        self.cfg = type("Cfg", (), {"permanent_null": "none"})()
+
+
 def test_e2e_formal_scoring_provenance_accepts_exact_binding(tmp_path: Path) -> None:
     registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
 
@@ -132,6 +192,88 @@ def test_e2e_formal_scoring_provenance_accepts_exact_binding(tmp_path: Path) -> 
     assert provenance["registration_sha256"] == _sha256(registration)
     assert provenance["checkpoint_sha256"] == _sha256(checkpoint)
     assert provenance["selected_checkpoint_eligible"] is True
+
+
+@pytest.mark.parametrize(
+    ("scoring_arm", "checkpoint_arm", "scaffold_control"),
+    [
+        ("cosine_pool", "cosine_pool", "none"),
+        ("structure_control_6a_v3", "full", "shuffle_within_pair_v3"),
+    ],
+)
+def test_real_scorer_provenance_is_accepted_by_g5_validator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scoring_arm: str,
+    checkpoint_arm: str,
+    scaffold_control: str,
+) -> None:
+    registration_path, metadata_paths, checkpoint_paths, checkpoint_ids = (
+        _write_all_e2e_provenance(tmp_path)
+    )
+    monkeypatch.setattr(
+        score_universe,
+        "_load_checkpoint",
+        lambda *_args, **_kwargs: (
+            _ScoringStub(),
+            "egostitch_e2e",
+            checkpoint_ids[checkpoint_arm],
+        ),
+    )
+    monkeypatch.setattr(
+        score_universe,
+        "_resolve_pairs",
+        lambda *_args, **_kwargs: ([('a', 'b')], np.array([1], dtype=np.int8)),
+    )
+    monkeypatch.setattr(score_universe, "FeatureStore", lambda *_args, **_kwargs: object())
+    values = np.array([0.25], dtype=np.float32)
+    monkeypatch.setattr(
+        score_universe,
+        "_score_egostitch_e2e",
+        lambda *_args, **_kwargs: {
+            "full": values,
+            "f_logit": values,
+            "pair_content": values,
+            "pair_topology": values,
+        },
+    )
+    output_path = tmp_path / f"{scoring_arm}.npz"
+    cli = [
+        "score",
+        "--checkpoint",
+        str(checkpoint_paths[checkpoint_arm]),
+        "--pairs",
+        "candidate",
+        "--output",
+        str(output_path),
+        "--preregistration",
+        str(registration_path),
+        "--scaffold-control",
+        scaffold_control,
+        "--device",
+        "cpu",
+    ]
+    for arm, metadata_path in metadata_paths.items():
+        cli.extend(["--arm-run-metadata", f"{arm}={metadata_path}"])
+
+    score_universe.main(cli)
+
+    artifact = score_universe.load_scores(output_path)
+    preregistration = json.loads(registration_path.read_text(encoding="utf-8"))
+    run_metadata = {
+        arm: json.loads(path.read_text(encoding="utf-8"))
+        for arm, path in metadata_paths.items()
+    }
+    g5_stage1._validate_e2e_scoring_provenance(
+        scoring_arm,
+        artifact,
+        preregistration["arms"][scoring_arm],
+        run_metadata=run_metadata,
+        run_metadata_paths=metadata_paths,
+        preregistration=preregistration,
+        preregistration_path=registration_path,
+        registration_sha256=_sha256(registration_path),
+    )
 
 
 @pytest.mark.parametrize("extra_arm", [None, "unknown"])
