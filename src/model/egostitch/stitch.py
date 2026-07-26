@@ -41,7 +41,7 @@ def stitch_cost(
     return _W_FEAT * feat + _W_PI * pi_gap
 
 
-def sinkhorn_plan(
+def sinkhorn_log_plan(
     h_i: torch.Tensor,
     h_j: torch.Tensor,
     pi_i: torch.Tensor,
@@ -53,13 +53,15 @@ def sinkhorn_plan(
     iters: int = 20,
     tau: float = 1.0,
 ) -> torch.Tensor:
-    """Compute the unbalanced-OT alignment plan ``Pi`` (spec Sec 3).
+    """Compute ``log(Pi)`` for the unbalanced-OT alignment plan (spec Sec 3).
 
     Marginals ``a ∝ pi_i·m_i`` and ``b ∝ pi_j·m_j`` are normalized to unit
     mass and clamped at ``1e-8``. KL relaxation with strength `tau` gives the
     standard damped log-domain updates (damping ``phi = tau / (tau + eps)``);
-    the plan is ``exp((f + g - C) / eps + log a + log b)`` — slots may be
-    unmatched. Fixed `iters` iterations; fully differentiable (unrolled).
+    ``log(Pi) = (f + g - C) / eps + log a + log b`` — slots may be unmatched.
+    Fixed `iters` iterations; fully differentiable (unrolled). Exposing this
+    quantity lets conditional losses remain live when ``exp(log(Pi))``
+    underflows in fp32.
 
     Args:
         h_i: Shape ``(B, K, d_p)`` side-i slot embeddings.
@@ -73,7 +75,7 @@ def sinkhorn_plan(
         tau: Unbalanced KL relaxation strength.
 
     Returns:
-        Shape ``(B, K, K)`` non-negative alignment plan.
+        Shape ``(B, K, K)`` log-domain alignment plan.
     """
     # fp32 island: inputs must be promoted before either the cost or marginal
     # products are formed; casting their bf16 results afterward is too late.
@@ -103,6 +105,36 @@ def sinkhorn_plan(
                 * eps
                 * torch.logsumexp((f[:, :, None] - cost) / eps + log_a[:, :, None], dim=1)
             )
-        return torch.exp(
-            (f[:, :, None] + g[:, None, :] - cost) / eps + log_a[:, :, None] + log_b[:, None, :]
+        return (
+            (f[:, :, None] + g[:, None, :] - cost) / eps
+            + log_a[:, :, None]
+            + log_b[:, None, :]
         )
+
+
+def sinkhorn_plan(
+    h_i: torch.Tensor,
+    h_j: torch.Tensor,
+    pi_i: torch.Tensor,
+    pi_j: torch.Tensor,
+    m_i: torch.Tensor,
+    m_j: torch.Tensor,
+    *,
+    eps: float = 0.1,
+    iters: int = 20,
+    tau: float = 1.0,
+) -> torch.Tensor:
+    """Compute the fp32 unbalanced-OT alignment plan ``Pi`` (spec Sec 3)."""
+    return torch.exp(
+        sinkhorn_log_plan(
+            h_i,
+            h_j,
+            pi_i,
+            pi_j,
+            m_i,
+            m_j,
+            eps=eps,
+            iters=iters,
+            tau=tau,
+        )
+    )

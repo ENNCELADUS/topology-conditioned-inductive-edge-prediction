@@ -374,7 +374,7 @@ def test_self_pairs_encode_one_ego_and_use_exact_identity_plan(
     sinkhorn_calls = 0
     original_sinkhorn = cast(
         Callable[..., torch.Tensor],
-        e2e_module.sinkhorn_plan,  # type: ignore[attr-defined]
+        e2e_module.sinkhorn_log_plan,
     )
 
     def counted_sinkhorn(*args: torch.Tensor, **kwargs: object) -> torch.Tensor:
@@ -382,7 +382,7 @@ def test_self_pairs_encode_one_ego_and_use_exact_identity_plan(
         sinkhorn_calls += 1
         return original_sinkhorn(*args, **kwargs)
 
-    monkeypatch.setattr(e2e_module, "sinkhorn_plan", counted_sinkhorn)
+    monkeypatch.setattr(e2e_module, "sinkhorn_log_plan", counted_sinkhorn)
     context = model.build_pair_context(batch)
     assert encode_calls == 1
     assert sinkhorn_calls == 0
@@ -421,6 +421,8 @@ def test_bf16_autocast_combines_self_and_sinkhorn_plans_in_fp32() -> None:
 
     assert context.plan is not None
     assert context.plan.dtype == torch.float32
+    assert context.log_plan is not None
+    assert context.log_plan.dtype == torch.float32
     expected_identity = torch.eye(model.generator_cfg.slots)
     assert torch.equal(context.plan[is_self], expected_identity.expand(2, -1, -1))
 

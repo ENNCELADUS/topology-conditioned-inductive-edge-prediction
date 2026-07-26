@@ -6,6 +6,7 @@ import networkx as nx
 import numpy as np
 import pytest
 import torch
+from src.model.egostitch.config import EgoStitchConfig
 from src.model.egostitch.imagine import SlotSet
 from src.model.egostitch.losses import (
     alignment_loss,
@@ -13,7 +14,8 @@ from src.model.egostitch.losses import (
     relational_loss,
 )
 from src.model.egostitch.matching import Assignment, match_slots
-from src.model.egostitch.stitch import sinkhorn_plan
+from src.model.egostitch.model import EgoStitchStage1
+from src.model.egostitch.stitch import sinkhorn_log_plan
 from src.train_egostitch import relational_pair_targets
 from torch import nn
 
@@ -93,7 +95,7 @@ def test_teacher_cells_follow_same_real_shared_neighbor_on_hand_built_graph() ->
 
     plan = torch.full((1, 2, 2), 0.25, requires_grad=True)
     skipped = alignment_loss(
-        plan,
+        torch.log(plan),
         no_shared,
         positive_real_mask=torch.ones(1),
     )
@@ -112,12 +114,12 @@ def test_alignment_loss_and_gradients_are_ab_ba_invariant() -> None:
     teacher_ab = torch.zeros(1, 3, 3, dtype=torch.bool)
     teacher_ab[0, 0, 1] = True
     teacher_ab[0, 2, 2] = True
-    loss_ab = alignment_loss(plan_ab, teacher_ab, positive_real_mask=torch.ones(1))
+    loss_ab = alignment_loss(torch.log(plan_ab), teacher_ab, positive_real_mask=torch.ones(1))
     (grad_ab,) = torch.autograd.grad(loss_ab, plan_ab)
 
     plan_ba = plan_ab.detach().transpose(1, 2).clone().requires_grad_()
     loss_ba = alignment_loss(
-        plan_ba,
+        torch.log(plan_ba),
         teacher_ab.transpose(1, 2),
         positive_real_mask=torch.ones(1),
     )
@@ -127,12 +129,60 @@ def test_alignment_loss_and_gradients_are_ab_ba_invariant() -> None:
     torch.testing.assert_close(grad_ab, grad_ba.transpose(1, 2), rtol=0.0, atol=1e-6)
 
 
+def test_default_fresh_slots_have_live_alignment_loss_and_gradients() -> None:
+    torch.manual_seed(20260726)
+    config = EgoStitchConfig()
+    model = EgoStitchStage1(config)
+    state_a = model.encode_nodes(
+        torch.randn(1, config.input_dim),
+        torch.randn(1, config.n_ground, config.input_dim),
+    )
+    state_b = model.encode_nodes(
+        torch.randn(1, config.input_dim),
+        torch.randn(1, config.n_ground, config.input_dim),
+    )
+    state_a.slots.h.retain_grad()
+    state_b.slots.h.retain_grad()
+    log_plan = sinkhorn_log_plan(
+        state_a.slots.h,
+        state_b.slots.h,
+        state_a.slots.pi,
+        state_b.slots.pi,
+        state_a.slots.mult,
+        state_b.slots.mult,
+        eps=config.sinkhorn_eps,
+        iters=config.sinkhorn_iters,
+        tau=config.sinkhorn_tau,
+    )
+    shared_assignment = Assignment(
+        [np.array([0], dtype=np.int64)],
+        [np.array([0], dtype=np.int64)],
+    )
+    teacher = alignment_teacher_cells(
+        shared_assignment,
+        shared_assignment,
+        target_ids_a=torch.tensor([[7]]),
+        target_ids_b=torch.tensor([[7]]),
+        slots=config.slots,
+    )
+    assert bool(teacher.any())
+
+    loss = alignment_loss(log_plan, teacher, positive_real_mask=torch.ones(1))
+    loss.backward()
+
+    assert float(loss.detach()) > 0.0
+    assert state_a.slots.h.grad is not None
+    assert state_b.slots.h.grad is not None
+    assert bool((state_a.slots.h.grad != 0).any())
+    assert bool((state_b.slots.h.grad != 0).any())
+
+
 def test_masked_alignment_reduction_ignores_duplicated_filler_rows() -> None:
     plan = torch.tensor([[[0.6, 0.1], [0.2, 0.1]]])
     teacher = torch.tensor([[[True, False], [False, False]]])
-    single = alignment_loss(plan, teacher, positive_real_mask=torch.ones(1))
+    single = alignment_loss(torch.log(plan), teacher, positive_real_mask=torch.ones(1))
     padded = alignment_loss(
-        torch.cat([plan, plan * 0.01], dim=0),
+        torch.log(torch.cat([plan, plan * 0.01], dim=0)),
         torch.cat([teacher, teacher], dim=0),
         positive_real_mask=torch.tensor([1.0, 0.0]),
     )
@@ -159,8 +209,8 @@ class _ToyRelationalParameters(nn.Module):
         pi_a = torch.tensor([[0.8, 0.6]], dtype=torch.float32).expand(len(pair_ids), -1)
         pi_b = torch.tensor([[0.7, 0.9]], dtype=torch.float32).expand(len(pair_ids), -1)
         mult = torch.ones(len(pair_ids), 2)
-        plans_ab = sinkhorn_plan(h_a, h_b, pi_a, pi_b, mult, mult, iters=8)
-        plans_ba = sinkhorn_plan(h_b, h_a, pi_b, pi_a, mult, mult, iters=8)
+        plans_ab = sinkhorn_log_plan(h_a, h_b, pi_a, pi_b, mult, mult, iters=8)
+        plans_ba = sinkhorn_log_plan(h_b, h_a, pi_b, pi_a, mult, mult, iters=8)
         return torch.where(ba_mask.view(-1, 1, 1), plans_ba, plans_ab)
 
 

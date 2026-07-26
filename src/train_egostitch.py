@@ -2958,6 +2958,11 @@ class _CompositeStep(torch.nn.Module):
 
         total, parts = stage1_total(
             generator.config,
+            family=(
+                "egostitch_e2e"
+                if isinstance(self.model, EgoStitchE2E)
+                else "egostitch"
+            ),
             edge=edge_loss if isinstance(self.model, EgoStitchE2E) else edge_loss * joint_weight,
             recon=losses.recon,
             deg=losses.deg,
@@ -2984,6 +2989,11 @@ class _CompositeStep(torch.nn.Module):
         )
         families = stage1_family_tensors(
             generator.config,
+            family=(
+                "egostitch_e2e"
+                if isinstance(self.model, EgoStitchE2E)
+                else "egostitch"
+            ),
             edge=edge_loss if isinstance(self.model, EgoStitchE2E) else edge_loss * joint_weight,
             recon=losses.recon,
             deg=losses.deg,

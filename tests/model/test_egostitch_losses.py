@@ -80,11 +80,49 @@ class TestReconLosses:
 
     def test_all_terms_present_and_finite(self) -> None:
         slots = _slots()
-        out = recon_losses(slots, _full_assignment(1, 4), config=_TINY, **self._targets())
+        out = recon_losses(
+            slots,
+            _full_assignment(1, 4),
+            config=_TINY,
+            family="egostitch_e2e",
+            **self._targets(),
+        )
         assert set(out) == {"feat", "exist", "mult", "slotadj", "gate", "ptr", "div"}
         for term in out.values():
             assert bool(torch.isfinite(term))
             assert float(term) >= 0.0
+
+    def test_legacy_family_preserves_pre_rev31_reconstruction(self) -> None:
+        slots = _slots(k=3)
+        targets = self._targets(t=2)
+        targets["target_in_pool"] = torch.tensor([[True, False]])
+        targets["target_pool_index"] = torch.tensor([[1, -1]])
+        assignment = Assignment(
+            [np.array([0, 1], dtype=np.int64)],
+            [np.array([0, 1], dtype=np.int64)],
+        )
+
+        out = recon_losses(
+            slots,
+            assignment,
+            config=_TINY,
+            family="egostitch",
+            **targets,
+        )
+
+        off_diag = ~torch.eye(2, dtype=torch.bool)
+        expected_slotadj = F.binary_cross_entropy(
+            slots.adj[0, :2, :2][off_diag].clamp(1e-6, 1.0 - 1e-6),
+            targets["target_adj"][0, :2, :2][off_diag],
+        )
+        expected_gate = F.binary_cross_entropy(
+            slots.gate[0, :2].clamp(1e-6, 1.0 - 1e-6),
+            targets["target_in_pool"][0].float(),
+        )
+        torch.testing.assert_close(out["slotadj"], expected_slotadj)
+        torch.testing.assert_close(out["gate"], expected_gate)
+        assert float(out["ptr"]) == 0.0
+        assert float(out["div"]) == 0.0
 
     def test_probability_bce_runs_outside_autocast(self, monkeypatch: pytest.MonkeyPatch) -> None:
         original_bce = F.binary_cross_entropy
@@ -103,7 +141,13 @@ class TestReconLosses:
 
         monkeypatch.setattr(F, "binary_cross_entropy", guarded_bce)
         with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-            out = recon_losses(_slots(), _full_assignment(1, 4), config=_TINY, **self._targets())
+            out = recon_losses(
+                _slots(),
+                _full_assignment(1, 4),
+                config=_TINY,
+                family="egostitch_e2e",
+                **self._targets(),
+            )
             denoise = DenoiseSlots(
                 h=torch.randn(1, 2, 4), pi=torch.rand(1, 2), mult=torch.ones(1, 2)
             )
@@ -117,7 +161,13 @@ class TestReconLosses:
         targets = self._targets()
         slots = _slots()
         slots = slots._replace(h=targets["target_proj"].clone(), mult=torch.ones(1, 4))
-        out = recon_losses(slots, _full_assignment(1, 4), config=_TINY, **targets)
+        out = recon_losses(
+            slots,
+            _full_assignment(1, 4),
+            config=_TINY,
+            family="egostitch_e2e",
+            **targets,
+        )
         assert float(out["feat"]) == pytest.approx(0.0, abs=1e-9)
         assert float(out["mult"]) == pytest.approx(0.0, abs=1e-9)
 
@@ -127,13 +177,25 @@ class TestReconLosses:
         pi = torch.tensor([[0.999, 0.001, 0.001, 0.001]])
         slots = slots._replace(pi=pi)
         assignment = Assignment([np.array([0], dtype=np.int64)], [np.array([0], dtype=np.int64)])
-        out = recon_losses(slots, assignment, config=_TINY, **self._targets())
+        out = recon_losses(
+            slots,
+            assignment,
+            config=_TINY,
+            family="egostitch_e2e",
+            **self._targets(),
+        )
         assert float(out["exist"]) < 0.01
 
     def test_empty_assignment_yields_zero_matched_terms(self) -> None:
         slots = _slots()
         assignment = Assignment([np.empty(0, dtype=np.int64)], [np.empty(0, dtype=np.int64)])
-        out = recon_losses(slots, assignment, config=_TINY, **self._targets())
+        out = recon_losses(
+            slots,
+            assignment,
+            config=_TINY,
+            family="egostitch_e2e",
+            **self._targets(),
+        )
         assert float(out["feat"]) == 0.0
         assert float(out["mult"]) == 0.0
         assert float(out["gate"]) == 0.0
@@ -152,6 +214,7 @@ class TestReconLosses:
             target_in_pool=targets["target_in_pool"],
             target_pool_index=targets["target_pool_index"],
             config=_TINY,
+            family="egostitch_e2e",
         )
         out["feat"].backward()  # type: ignore[no-untyped-call]
         assert h.grad is not None
@@ -167,7 +230,13 @@ class TestReconLosses:
             "target_in_pool": torch.zeros(1, 2, dtype=torch.bool),
             "target_pool_index": torch.full((1, 2), -1),
         }
-        out = recon_losses(slots, _full_assignment(1, 2), config=_TINY, **targets)
+        out = recon_losses(
+            slots,
+            _full_assignment(1, 2),
+            config=_TINY,
+            family="egostitch_e2e",
+            **targets,
+        )
         expected = F.binary_cross_entropy_with_logits(
             torch.tensor([0.8, 0.8]) / _TINY.tau_adj, torch.ones(2)
         )
@@ -190,7 +259,13 @@ class TestReconLosses:
         targets = self._targets()
         targets["target_in_pool"] = torch.tensor([[True, False, False, False]])
         targets["target_pool_index"] = torch.tensor([[0, -1, -1, -1]])
-        out = recon_losses(slots, _full_assignment(1, 4), config=config, **targets)
+        out = recon_losses(
+            slots,
+            _full_assignment(1, 4),
+            config=config,
+            family="egostitch_e2e",
+            **targets,
+        )
         labels = targets["target_in_pool"].float()
         expected = -(
             pos_weight * labels * torch.log(gate) + (1.0 - labels) * torch.log1p(-gate)
@@ -207,7 +282,11 @@ class TestReconLosses:
         targets = self._targets()
         one_match = Assignment([np.array([0])], [np.array([0])])
         below = recon_losses(
-            _slots()._replace(h=orthogonal), one_match, config=_TINY, **targets
+            _slots()._replace(h=orthogonal),
+            one_match,
+            config=_TINY,
+            family="egostitch_e2e",
+            **targets,
         )["div"]
         assert float(below) == 0.0
 
@@ -215,18 +294,30 @@ class TestReconLosses:
         similar[0, 1] = similar[0, 0]
         unmatched = Assignment([np.empty(0, dtype=np.int64)], [np.empty(0, dtype=np.int64)])
         above = recon_losses(
-            _slots()._replace(h=similar), unmatched, config=_TINY, **targets
+            _slots()._replace(h=similar),
+            unmatched,
+            config=_TINY,
+            family="egostitch_e2e",
+            **targets,
         )["div"]
         assert float(above) > 0.0
 
         two_matches = Assignment([np.array([0, 1])], [np.array([0, 1])])
         excluded = recon_losses(
-            _slots()._replace(h=similar), two_matches, config=_TINY, **targets
+            _slots()._replace(h=similar),
+            two_matches,
+            config=_TINY,
+            family="egostitch_e2e",
+            **targets,
         )["div"]
         assert float(excluded) == 0.0
 
         matched_unmatched = recon_losses(
-            _slots()._replace(h=similar), one_match, config=_TINY, **targets
+            _slots()._replace(h=similar),
+            one_match,
+            config=_TINY,
+            family="egostitch_e2e",
+            **targets,
         )["div"]
         assert float(matched_unmatched) > 0.0
 
@@ -240,24 +331,46 @@ class TestReconLosses:
             "target_in_pool": torch.zeros(1, 2, dtype=torch.bool),
             "target_pool_index": torch.full((1, 2), -1),
         }
-        masked = recon_losses(slots, _full_assignment(1, 2), config=_TINY, **targets)["ptr"]
+        masked = recon_losses(
+            slots,
+            _full_assignment(1, 2),
+            config=_TINY,
+            family="egostitch_e2e",
+            **targets,
+        )["ptr"]
         assert bool(torch.isfinite(masked))
         assert float(masked) == 0.0
 
         targets["target_in_pool"][0, 0] = True
         targets["target_pool_index"][0, 0] = 1
         supervised = recon_losses(
-            slots, _full_assignment(1, 2), config=_TINY, **targets
+            slots,
+            _full_assignment(1, 2),
+            config=_TINY,
+            family="egostitch_e2e",
+            **targets,
         )["ptr"]
         torch.testing.assert_close(supervised, -torch.log(torch.tensor(0.7)))
 
         partial = Assignment([np.array([0])], [np.array([0])])
         targets["target_in_pool"][:] = True
         targets["target_pool_index"][:] = torch.tensor([[1, 0]])
-        first = recon_losses(slots, partial, config=_TINY, **targets)["ptr"]
+        first = recon_losses(
+            slots,
+            partial,
+            config=_TINY,
+            family="egostitch_e2e",
+            **targets,
+        )["ptr"]
         changed_unmatched = slots._replace(pointer=pointer.clone())
         changed_unmatched.pointer[0, 1] = torch.tensor([0.99, 0.005, 0.005])
-        second = recon_losses(changed_unmatched, partial, config=_TINY, **targets)["ptr"]
+        second = recon_losses(
+            changed_unmatched,
+            partial,
+            config=_TINY,
+            family="egostitch_e2e",
+            **targets,
+        )["ptr"]
         torch.testing.assert_close(first, -torch.log(torch.tensor(0.7)))
         torch.testing.assert_close(second, first)
 
@@ -273,7 +386,13 @@ class TestReconLosses:
         targets = self._targets()
         targets["target_in_pool"] = torch.tensor([[True, False, False, False]])
         targets["target_pool_index"] = torch.tensor([[1, -1, -1, -1]])
-        out = recon_losses(slots, _full_assignment(1, 4), config=_TINY, **targets)
+        out = recon_losses(
+            slots,
+            _full_assignment(1, 4),
+            config=_TINY,
+            family="egostitch_e2e",
+            **targets,
+        )
         out["ptr"].backward()  # type: ignore[no-untyped-call]
         assert decoder.head_pointer.weight.grad is not None
         assert bool((decoder.head_pointer.weight.grad != 0).any())
@@ -414,6 +533,7 @@ class TestStage1Total:
         }
         total, _ = stage1_total(
             EgoStitchConfig(),
+            family="egostitch_e2e",
             edge=zero,
             recon=recon,
             deg=torch.tensor(float(component == "deg")),
@@ -451,7 +571,7 @@ class TestStage1Total:
         }
         one = torch.tensor(1.0)
         align = alignment_loss(
-            torch.full((1, 2, 2), 0.25),
+            torch.log(torch.full((1, 2, 2), 0.25)),
             torch.tensor([[[True, False], [False, False]]]),
             positive_real_mask=torch.ones(1),
         )
@@ -473,6 +593,7 @@ class TestStage1Total:
         }
         total, parts = stage1_total(
             config,
+            family="egostitch_e2e",
             edge=one,
             recon=recon,
             deg=one,
@@ -489,6 +610,33 @@ class TestStage1Total:
         assert parts["recon_rel"] == pytest.approx(float(rel))
         assert parts["real"] == pytest.approx(1.0)
         assert parts["total"] == pytest.approx(expected_total)
+
+    def test_legacy_total_ignores_rev31_components(self) -> None:
+        zero = torch.tensor(0.0)
+        recon = {
+            "feat": zero,
+            "exist": zero,
+            "mult": zero,
+            "slotadj": zero,
+            "gate": zero,
+            "ptr": torch.tensor(3.0),
+            "align": torch.tensor(4.0),
+            "div": torch.tensor(5.0),
+            "rel": torch.tensor(6.0),
+        }
+        total, parts = stage1_total(
+            EgoStitchConfig(),
+            family="egostitch",
+            edge=zero,
+            recon=recon,
+            deg=zero,
+            real_egostat=zero,
+            real_gin=zero,
+            ssl_noise=zero,
+            ssl_pool=zero,
+        )
+        assert float(total) == 0.0
+        assert parts["recon"] == 0.0
 
     def test_parts_are_floats(self) -> None:
         zero = torch.tensor(0.0)

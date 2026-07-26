@@ -51,7 +51,7 @@ from src.model.egostitch.scaffold import (
     swap_direction,
 )
 from src.model.egostitch.ste import STEncoder
-from src.model.egostitch.stitch import sinkhorn_plan
+from src.model.egostitch.stitch import sinkhorn_log_plan
 from src.model.egostitch.trunk import ConditionedPairCrossAttention
 
 
@@ -76,6 +76,7 @@ class E2EPairContext(NamedTuple):
     topo_ba: torch.Tensor | None
     cont: torch.Tensor | None
     plan: torch.Tensor | None
+    log_plan: torch.Tensor | None
 
 
 class EgoStitchE2E(nn.Module):
@@ -108,7 +109,11 @@ class EgoStitchE2E(nn.Module):
         )
         self.input_dim = self.generator_cfg.input_dim  # frozen feature dim (spec Sec 0 table)
         self.node_feature_dim = self.generator_cfg.input_dim
-        self.generator = EgoStitchStage1(self.generator_cfg, standardize_features=True)
+        self.generator = EgoStitchStage1(
+            self.generator_cfg,
+            standardize_features=True,
+            loss_family="egostitch_e2e",
+        )
         self.encoder = SiameseEncoder(
             input_dim=self.input_dim,
             d_model=cfg.d_model,
@@ -243,20 +248,39 @@ class EgoStitchE2E(nn.Module):
         if is_self.shape != (batch_size,):
             raise ValueError(f"is_self shape must be {(batch_size,)}, got {tuple(is_self.shape)}")
         plan: torch.Tensor | None = None
+        log_plan: torch.Tensor | None = None
         topo_ab: torch.Tensor | None = None
         topo_ba: torch.Tensor | None = None
         if need_topo:
             # Sinkhorn is an fp32 island, so its assembled destination must also be fp32.
             plan = slots_a.pi.new_zeros((batch_size, slots, slots), dtype=torch.float32)
+            log_plan = slots_a.pi.new_full(
+                (batch_size, slots, slots),
+                -torch.inf,
+                dtype=torch.float32,
+            )
             self_rows = torch.nonzero(is_self, as_tuple=False).squeeze(-1)
             if self_rows.numel() > 0:
                 identity = torch.eye(slots, device=plan.device, dtype=plan.dtype)
                 plan = plan.index_copy(0, self_rows, identity.expand(self_rows.numel(), -1, -1))
+                log_identity = torch.diag_embed(
+                    torch.zeros(
+                        self_rows.numel(),
+                        slots,
+                        device=log_plan.device,
+                        dtype=log_plan.dtype,
+                    )
+                )
+                log_identity = log_identity.masked_fill(
+                    ~torch.eye(slots, device=log_plan.device, dtype=torch.bool).unsqueeze(0),
+                    -torch.inf,
+                )
+                log_plan = log_plan.index_copy(0, self_rows, log_identity)
             non_self = torch.nonzero(~is_self, as_tuple=False).squeeze(-1)
             if non_self.numel() > 0:
                 selected_a = self._select_slots(slots_a, non_self)
                 selected_b = self._select_slots(slots_b, non_self)
-                non_self_plan = sinkhorn_plan(
+                non_self_log_plan = sinkhorn_log_plan(
                     selected_a.h,
                     selected_b.h,
                     selected_a.pi,
@@ -267,7 +291,9 @@ class EgoStitchE2E(nn.Module):
                     iters=self.generator_cfg.sinkhorn_iters,
                     tau=self.generator_cfg.sinkhorn_tau,
                 )
+                non_self_plan = torch.exp(non_self_log_plan)
                 plan = plan.index_copy(0, non_self, non_self_plan)
+                log_plan = log_plan.index_copy(0, non_self, non_self_log_plan)
             scaffold = build_scaffold(
                 slots_a,
                 slots_b,
@@ -316,6 +342,7 @@ class EgoStitchE2E(nn.Module):
             topo_ba=topo_ba,
             cont=cont,
             plan=plan,
+            log_plan=log_plan,
         )
 
     def build_pair_context(
@@ -350,8 +377,8 @@ class EgoStitchE2E(nn.Module):
         context: E2EPairContext,
     ) -> dict[str, torch.Tensor]:
         """Compute Task-7 train-only losses without entering any scored logit."""
-        if context.plan is None:
-            raise RuntimeError("Task-7 alignment requires a Sinkhorn plan")
+        if context.plan is None or context.log_plan is None:
+            raise RuntimeError("Task-7 alignment requires Sinkhorn plan and log-plan tensors")
         target_proj_a = self.generator.project_features(batch["target_features_a"]).detach()
         target_proj_b = self.generator.project_features(batch["target_features_b"]).detach()
         assignment_a = match_slots(
@@ -389,7 +416,7 @@ class EgoStitchE2E(nn.Module):
         )
         return {
             "align_loss": alignment_loss(
-                context.plan,
+                context.log_plan,
                 teacher_cells,
                 positive_real_mask=positive_real_mask,
                 world_size=world_size,

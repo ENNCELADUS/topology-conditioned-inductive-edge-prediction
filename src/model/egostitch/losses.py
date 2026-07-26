@@ -2,9 +2,10 @@
 
 ``L = L_edge + 0.5·L_real + 0.1·L_ssl + 1.0·L_recon`` with
 
-``L_recon = 1.0·L_feat + 0.5·L_exist + 0.25·L_mult + 0.5·L_deg
-+ 0.5·L_slotadj + 0.25·L_gate + 0.25·L_ptr + 0.5·L_align
-+ 0.1·L_div + 0.25·L_rel``
+``L_recon(egostitch) = 1.0·L_feat + 0.5·L_exist + 0.25·L_mult
++ 0.5·L_deg + 0.5·L_slotadj + 0.25·L_gate``
+``L_recon(egostitch_e2e) = L_recon(egostitch) + 0.25·L_ptr
++ 0.5·L_align + 0.1·L_div + 0.25·L_rel``
 ``L_real  = (2/3)·ED(ego stats) + (1/3)·ED(random-GIN embeddings)``
 ``L_ssl   = 0.5·feature-noise consistency + 0.5·pool-resample consistency``
 
@@ -17,6 +18,7 @@ are stop-gradient (spec Sec 13.7).
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -28,6 +30,7 @@ from src.model.egostitch.layers import stable_log
 from src.model.egostitch.matching import Assignment
 
 _SIGMA_MIN = 1e-3
+LossFamily = Literal["egostitch", "egostitch_e2e"]
 
 
 def _masked_global_mean(
@@ -101,7 +104,7 @@ def alignment_teacher_cells(
 
 
 def alignment_loss(
-    plan: torch.Tensor,
+    log_plan: torch.Tensor,
     teacher_cells: torch.Tensor,
     *,
     positive_real_mask: torch.Tensor,
@@ -109,24 +112,25 @@ def alignment_loss(
     all_reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Row/column-conditional `L_align` over teacher-bearing positive rows."""
-    if plan.ndim != 3 or plan.shape[-1] != plan.shape[-2]:
-        raise ValueError("plan must have shape (B, K, K)")
-    if teacher_cells.shape != plan.shape or teacher_cells.dtype != torch.bool:
-        raise ValueError("teacher_cells must be a boolean tensor matching plan")
-    if positive_real_mask.shape != plan.shape[:1]:
+    if log_plan.ndim != 3 or log_plan.shape[-1] != log_plan.shape[-2]:
+        raise ValueError("log_plan must have shape (B, K, K)")
+    if teacher_cells.shape != log_plan.shape or teacher_cells.dtype != torch.bool:
+        raise ValueError("teacher_cells must be a boolean tensor matching log_plan")
+    if positive_real_mask.shape != log_plan.shape[:1]:
         raise ValueError("positive_real_mask must have shape (B,)")
-    with torch.autocast(device_type=plan.device.type, enabled=False):
-        plan_fp32 = plan.float()
-        log_plan = stable_log(plan_fp32)
-        log_row_mass = stable_log(plan_fp32.sum(dim=2, keepdim=True))
-        log_col_mass = stable_log(plan_fp32.sum(dim=1, keepdim=True))
+    with torch.autocast(device_type=log_plan.device.type, enabled=False):
+        log_plan_fp32 = log_plan.float()
+        log_row_mass = torch.logsumexp(log_plan_fp32, dim=2, keepdim=True)
+        log_col_mass = torch.logsumexp(log_plan_fp32, dim=1, keepdim=True)
         conditional = 0.5 * (
-            log_plan - log_row_mass + log_plan - log_col_mass
+            log_plan_fp32 - log_row_mass + log_plan_fp32 - log_col_mass
         )
         teacher_fp32 = teacher_cells.float()
         teacher_count = teacher_fp32.sum(dim=(1, 2))
         per_row = -(
-            (conditional * teacher_fp32).sum(dim=(1, 2))
+            torch.where(teacher_cells, conditional, torch.zeros_like(conditional)).sum(
+                dim=(1, 2)
+            )
             / teacher_count.clamp_min(1.0)
         )
         effective_mask = (
@@ -197,6 +201,7 @@ def recon_losses(
     target_in_pool: torch.Tensor,
     target_pool_index: torch.Tensor,
     config: EgoStitchConfig,
+    family: LossFamily = "egostitch",
 ) -> dict[str, torch.Tensor]:
     """Matched-slot reconstruction losses (spec Sec 13.5 and Sec 14.4.1).
 
@@ -211,6 +216,7 @@ def recon_losses(
         target_pool_index: Shape ``(B, T)`` ordered indices into ``G(u)``, or
             ``-1`` for out-of-pool targets/padding (``L_ptr`` supervision).
         config: Supplies the registered temperatures and gate positive weight.
+        family: Selects the frozen Stage-1 or rev-3.1 E2E decomposition.
 
     Returns:
         Seven scalar component tensors through Task 5 of the rev-3.1 repair.
@@ -237,36 +243,49 @@ def recon_losses(
         log_gap = torch.log(slots.mult[b, s_idx]) - stable_log(target_mult[b, t_idx])
         mult_terms.append(0.5 * (log_gap**2).mean())
         if s_idx.numel() >= 2:
-            adj_pred = slots.adj_logits[b][s_idx][:, s_idx]
             adj_true = target_adj[b][t_idx][:, t_idx]
             off_diag = ~torch.eye(s_idx.numel(), dtype=torch.bool, device=device)
-            with torch.autocast(device_type=adj_pred.device.type, enabled=False):
-                slotadj = F.binary_cross_entropy_with_logits(
-                    adj_pred[off_diag].float() / config.tau_adj,
-                    adj_true[off_diag].float(),
+            if family == "egostitch_e2e":
+                adj_pred = slots.adj_logits[b][s_idx][:, s_idx]
+                with torch.autocast(device_type=adj_pred.device.type, enabled=False):
+                    slotadj = F.binary_cross_entropy_with_logits(
+                        adj_pred[off_diag].float() / config.tau_adj,
+                        adj_true[off_diag].float(),
+                    )
+            else:
+                adj_pred = slots.adj[b][s_idx][:, s_idx]
+                slotadj = _probability_bce(
+                    torch.clamp(adj_pred[off_diag], 1e-6, 1.0 - 1e-6),
+                    adj_true[off_diag],
                 )
             slotadj_terms.append(slotadj)
         gate_logit_terms.append(slots.gate[b, s_idx])
         gate_label_terms.append(target_in_pool[b, t_idx].float())
-        pointer_valid = target_in_pool[b, t_idx]
-        if bool(pointer_valid.any()):
-            pointer_terms.append(slots.pointer[b, s_idx[pointer_valid]])
-            pointer_label_terms.append(target_pool_index[b, t_idx[pointer_valid]])
+        if family == "egostitch_e2e":
+            pointer_valid = target_in_pool[b, t_idx]
+            if bool(pointer_valid.any()):
+                pointer_terms.append(slots.pointer[b, s_idx[pointer_valid]])
+                pointer_label_terms.append(target_pool_index[b, t_idx[pointer_valid]])
 
     zero = slots.h.sum() * 0.0
     feat = torch.stack(feat_terms).mean() if feat_terms else zero
     mult = torch.stack(mult_terms).mean() if mult_terms else zero
     slotadj = torch.stack(slotadj_terms).mean() if slotadj_terms else zero
-    if gate_logit_terms:
+    if gate_logit_terms and family == "egostitch_e2e":
         gate = _positive_weighted_probability_bce(
             torch.cat(gate_logit_terms),
             torch.cat(gate_label_terms),
             pos_weight=config.l_gate_pos_weight,
         )
+    elif gate_logit_terms:
+        gate = _probability_bce(
+            torch.clamp(torch.cat(gate_logit_terms), 1e-6, 1.0 - 1e-6),
+            torch.cat(gate_label_terms),
+        )
     else:
         gate = zero
 
-    if pointer_terms:
+    if family == "egostitch_e2e" and pointer_terms:
         pointer = torch.cat(pointer_terms)
         pointer_labels = torch.cat(pointer_label_terms).long()
         if bool(((pointer_labels < 0) | (pointer_labels >= pointer.shape[-1])).any()):
@@ -289,17 +308,20 @@ def recon_losses(
     neg_term = (per_slot * (1.0 - labels)).sum() / torch.clamp(n_neg, min=1.0)
     exist = 0.5 * pos_term + 0.5 * neg_term
 
-    with torch.autocast(device_type=slots.h.device.type, enabled=False):
-        normalized = F.normalize(slots.h.float(), dim=-1)
-        cosine = torch.bmm(normalized, normalized.transpose(1, 2))
-        distinct = ~torch.eye(
-            slots.h.shape[1], dtype=torch.bool, device=slots.h.device
-        ).unsqueeze(0)
-        eligible = distinct & ~(matched_mask[:, :, None] & matched_mask[:, None, :])
-        if bool(eligible.any()):
-            div = torch.relu(cosine[eligible] - config.tau_div).square().mean()
-        else:
-            div = slots.h.float().sum() * 0.0
+    if family == "egostitch_e2e":
+        with torch.autocast(device_type=slots.h.device.type, enabled=False):
+            normalized = F.normalize(slots.h.float(), dim=-1)
+            cosine = torch.bmm(normalized, normalized.transpose(1, 2))
+            distinct = ~torch.eye(
+                slots.h.shape[1], dtype=torch.bool, device=slots.h.device
+            ).unsqueeze(0)
+            eligible = distinct & ~(matched_mask[:, :, None] & matched_mask[:, None, :])
+            if bool(eligible.any()):
+                div = torch.relu(cosine[eligible] - config.tau_div).square().mean()
+            else:
+                div = slots.h.float().sum() * 0.0
+    else:
+        div = slots.h.sum() * 0.0
 
     return {
         "feat": feat,
@@ -567,6 +589,7 @@ def ssl_consistency(
 def stage1_family_tensors(
     config: EgoStitchConfig,
     *,
+    family: LossFamily = "egostitch",
     edge: torch.Tensor,
     recon: dict[str, torch.Tensor],
     deg: torch.Tensor,
@@ -584,11 +607,15 @@ def stage1_family_tensors(
         + config.w_deg * deg
         + config.w_slotadj * recon["slotadj"]
         + config.w_gate * recon["gate"]
-        + config.w_ptr * recon["ptr"]
-        + config.w_align * recon.get("align", zero)
-        + config.w_div * recon["div"]
-        + config.w_rel * recon.get("rel", zero)
     )
+    if family == "egostitch_e2e":
+        l_recon = (
+            l_recon
+            + config.w_ptr * recon["ptr"]
+            + config.w_align * recon.get("align", zero)
+            + config.w_div * recon["div"]
+            + config.w_rel * recon.get("rel", zero)
+        )
     l_real = config.w_egostat * real_egostat + config.w_gin * real_gin
     l_ssl = 0.5 * ssl_noise + 0.5 * ssl_pool
     return {
@@ -602,6 +629,7 @@ def stage1_family_tensors(
 def stage1_total(
     config: EgoStitchConfig,
     *,
+    family: LossFamily = "egostitch",
     edge: torch.Tensor,
     recon: dict[str, torch.Tensor],
     deg: torch.Tensor,
@@ -614,6 +642,7 @@ def stage1_total(
 
     Args:
         config: Supplies every master and interior weight.
+        family: Selects the frozen Stage-1 or rev-3.1 E2E decomposition.
         edge: ``L_edge`` (BCE over the edge stream).
         recon: The `recon_losses` dict (denoise terms folded in by the caller).
         deg: The lognormal degree NLL.
@@ -636,15 +665,20 @@ def stage1_total(
         + config.w_deg * deg
         + config.w_slotadj * recon["slotadj"]
         + config.w_gate * recon["gate"]
-        + config.w_ptr * recon["ptr"]
-        + config.w_align * align
-        + config.w_div * recon["div"]
-        + config.w_rel * rel
     )
+    if family == "egostitch_e2e":
+        l_recon = (
+            l_recon
+            + config.w_ptr * recon["ptr"]
+            + config.w_align * align
+            + config.w_div * recon["div"]
+            + config.w_rel * rel
+        )
     l_real = config.w_egostat * real_egostat + config.w_gin * real_gin
     l_ssl = 0.5 * ssl_noise + 0.5 * ssl_pool
     families = stage1_family_tensors(
         config,
+        family=family,
         edge=edge,
         recon=recon,
         deg=deg,

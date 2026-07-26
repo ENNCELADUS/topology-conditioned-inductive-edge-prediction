@@ -21,6 +21,7 @@ from src.model.egostitch.config import EgoStitchConfig
 from src.model.egostitch.decision import DecisionHead
 from src.model.egostitch.imagine import DenoiseSlots, ImagineDecoder, SlotSet
 from src.model.egostitch.losses import (
+    LossFamily,
     RandomGIN,
     degree_nll,
     denoise_losses,
@@ -71,16 +72,24 @@ class EgoStitchStage1(nn.Module):
 
     name = "egostitch"
 
-    def __init__(self, config: EgoStitchConfig, *, standardize_features: bool = False) -> None:
+    def __init__(
+        self,
+        config: EgoStitchConfig,
+        *,
+        standardize_features: bool = False,
+        loss_family: LossFamily = "egostitch",
+    ) -> None:
         """Build every Stage-1 module.
 
         Args:
             config: The pinned Stage-1 configuration.
             standardize_features: Apply the v2 E2E stateless F0 transform. The
                 legacy frozen-s0 model keeps its historical raw-F0 semantics.
+            loss_family: Select the frozen Stage-1 or rev-3.1 E2E loss path.
         """
         super().__init__()
         self.config = config
+        self.loss_family = loss_family
         self.feature_norm: nn.Module = (
             nn.LayerNorm(config.input_dim, elementwise_affine=False)
             if standardize_features
@@ -291,6 +300,7 @@ class EgoStitchStage1(nn.Module):
             target_in_pool=target_in_pool,
             target_pool_index=target_pool_index,
             config=self.config,
+            family=self.loss_family,
         )
         if enc.denoise is not None and denoise_target is not None and denoise_mask is not None:
             extra = denoise_losses(enc.denoise, target_proj=denoise_target, mask=denoise_mask)

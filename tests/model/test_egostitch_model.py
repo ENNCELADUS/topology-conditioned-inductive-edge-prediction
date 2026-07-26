@@ -27,8 +27,9 @@ _TINY = EgoStitchConfig(
     sinkhorn_iters=5,
 )
 
-# The frozen random GIN legitimately receives no gradient.
-_NO_GRAD_PREFIXES = ("random_gin",)
+# The frozen random GIN and the rev-3.1-only pointer head legitimately receive
+# no gradient under the standalone family's frozen Section-13 objective.
+_NO_GRAD_PREFIXES = ("random_gin", "imagine.head_pointer")
 
 
 def _model(seed: int = 0) -> EgoStitchStage1:
