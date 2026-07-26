@@ -336,11 +336,19 @@ algorithm is not registrable, which is why 6e was deferred in v2.
 3. **6e-v1**: canonical-pair-keyed **checkerboard swaps**. `N_swap = 8·K²` keyed
    draws; each selects rows `(i, k)` and columns `(j, l)` and transfers
    `δ = u · min(w_il, w_kj)` with keyed `u ∈ (0, 1)`:
-   `w_ij += δ; w_kl += δ; w_il −= δ; w_kj −= δ`. Applied to `Â̊_src`, `Â̊_dst`
-   (symmetrized) and `Π`, then scaffold rebuild. Every row sum, column sum, and the
-   total mass are preserved exactly — per-node, per-edge-type soft degree is
-   invariant — while higher-order connectivity is destroyed. That is precisely 6e's
-   registered purpose: isolating structure beyond degree.
+   `w_ij += δ; w_kl += δ; w_il −= δ; w_kj −= δ`. Draws are restricted to
+   **off-diagonal** cells so `Â̊`'s zero diagonal survives.
+   **Swap space (owner-confirmed 2026-07-25; spec §14.4.5 + §12 fourth entry).**
+   Swap the **π-weighted** slot adjacency `W = π_k · Â̊[k,l] · π_l` (both sides,
+   symmetrized) and map back `Â̊' = W' / (π_k π_l)`; swap `Π` directly. The binding
+   invariant is **model-visible degree** — the rebuilt scaffold's `STAR`, `INTRA`,
+   and `ALIGN` degree channels are preserved to fp32 tolerance. Swapping raw `Â̊`
+   preserves only pre-rebuild marginals: `build_scaffold` forms INTRA as
+   `Â̊ ⊙ π π^T`, so under nonuniform `π` the rebuilt INTRA degree drifts (measured
+   max 0.383) and degree leaks into a control whose whole purpose is isolating
+   structure *beyond* degree. `CLOSE` is **expected to move** and is not an
+   invariant — closure mass is higher-order by construction and is exactly what 6e
+   destroys. Then scaffold rebuild.
 4. Control identifiers, pinned: `_SCAFFOLD_CONTROL_SHUFFLE_V3 = "shuffle_within_pair_v3"`,
    `_SCAFFOLD_CONTROL_REWIRE_V1 = "rewire_checkerboard_v1"`, alongside the existing
    `"none"`. The v2 `"shuffle_within_pair"` value is superseded — reject it with a
@@ -348,9 +356,15 @@ algorithm is not registrable, which is why 6e was deferred in v2.
 
 **Acceptance tests:**
 
-- 6e-v1 marginal preservation: row sums, column sums, and total mass preserved to
-  fp32 tolerance on random inputs, for `Â̊_src`, `Â̊_dst`, `Π`.
-- 6e-v1 symmetry: the symmetrized `Â̊` blocks stay symmetric after swaps.
+- 6e-v1 **rebuilt-degree** preservation: the rebuilt scaffold's `STAR`, `INTRA`, and
+  `ALIGN` degree channels (`feats[:, :, 6:9]`) are preserved to fp32 tolerance on
+  random non-uniform `π`. Assert `CLOSE` **does** move — it is the higher-order
+  channel the control destroys, and a test that froze it would enshrine the wrong
+  invariant.
+- 6e-v1 symmetry: the symmetrized `Â̊` blocks stay symmetric after swaps, and the
+  zero diagonal is retained (off-diagonal-only draws).
+- 6e-v1 is vectorized: no per-swap Python loop over `N_swap = 8·K²` per pair. This
+  runs inside a million-pair scoring pass; a scalar triple loop is not viable.
 - Cross-process determinism: the same pair key yields identical perturbed tensors in
   a fresh process (subprocess or re-seeded fixture), and different pairs differ.
 - **Non-inertness (the F12 regression test)**: on a random *non-collapsed* model,

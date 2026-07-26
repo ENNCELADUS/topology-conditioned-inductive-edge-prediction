@@ -512,6 +512,20 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-25 (fourth entry): §14.4.5 6e-v1 swap space corrected from the raw
+  `(Â̊_src, Â̊_dst, Π)` tensors to the **π-weighted** slot adjacency, with the
+  binding invariant restated as the rebuilt scaffold's `STAR`/`INTRA`/`ALIGN`
+  degree channels. Found during implementation: `build_scaffold` forms INTRA
+  as `Â̊ ⊙ π π^T` and CLOSURE from matrix products, so preserving raw
+  marginals does not preserve what the model actually sees — a deterministic
+  probe measured rebuilt-degree drift of `[STAR 0, INTRA 0.383, ALIGN 3.6e-7,
+  CLOSE 1.651]`. Leaving degree in a degree-preserving control would let a
+  reviewer attribute part of any 6e metric move to changed degree rather than
+  destroyed higher-order connectivity, defeating the control's registered
+  purpose. `CLOSE` is explicitly **not** an invariant (closure mass is the
+  higher-order signal being destroyed), and draws are restricted to
+  off-diagonal cells so `Â̊`'s zero diagonal survives. Owner-confirmed
+  2026-07-25. 6a-v3 is unchanged.
 - 2026-07-25 (third entry): §14.4.2 scaffold format corrected from FEAT_DIM
   10 to **11**. The rev-3.1 scaffold adds both a fourth edge type (closure)
   and a per-slot closed-wedge feature `t_k`, but the degree slice is one
@@ -1896,11 +1910,27 @@ mutated-features-same-ids).
 - **6e-v1**: canonical-pair-keyed checkerboard swaps — `N_swap = 8·K²` keyed
   draws; each selects rows `(i, k)` and columns `(j, l)` and transfers
   `δ = u · min(w_il, w_kj)` (keyed `u ∈ (0,1)`): `w_ij, w_kl += δ`;
-  `w_il, w_kj −= δ` — applied to `Â̊_src`, `Â̊_dst` (symmetrized) and `Π`,
-  then scaffold rebuild. Every row/column sum and the total mass are exactly
-  preserved; higher-order connectivity is destroyed. Required tests: marginal
-  preservation to fp32 tolerance; cross-process determinism; non-inertness on
-  a random non-collapsed model.
+  `w_il, w_kj −= δ`. Draws are restricted to **off-diagonal** cells, so the
+  zero-diagonal contract of `Â̊` survives the perturbation.
+  **Swap space (owner-confirmed 2026-07-25; see the §12 fourth entry).** The
+  swaps are applied to the **π-weighted** slot-adjacency `W = π_k · Â̊[k,l] ·
+  π_l` (for both sides, symmetrized), mapped back as `Â̊' = W' / (π_k π_l)`,
+  and to `Π` directly. The binding invariant is **model-visible degree**: the
+  rebuilt scaffold's `STAR`, `INTRA`, and `ALIGN` degree channels are
+  preserved to fp32 tolerance. Swapping raw `Â̊` instead preserves only the
+  pre-rebuild marginals — `build_scaffold` forms INTRA as `Â̊ ⊙ π π^T`, so
+  under nonuniform `π` the rebuilt INTRA degree drifts (measured max 0.383)
+  and degree leaks into a control whose registered purpose is isolating
+  structure *beyond* degree.
+  The `CLOSE` degree channel is **expected to move** and is not an invariant:
+  closure mass is higher-order by construction and is precisely the structure
+  6e exists to destroy. Preserving every rebuilt channel simultaneously is
+  over-constrained (INTRA needs π-weighted marginals; CLOSURE would need
+  `r`- and `d`-weighted marginals at the same time).
+  Then scaffold rebuild. Required tests: preservation of the rebuilt
+  `STAR`/`INTRA`/`ALIGN` degree channels to fp32 tolerance; zero diagonal
+  retained; cross-process determinism; non-inertness on a random
+  non-collapsed model.
 
 #### 14.4.6 v3 screen schema (eight arms)
 
