@@ -79,7 +79,7 @@ from src.experiments.g1_hardened_e2 import (
     load_test_node_buckets,
     validate_universe_artifact,
 )
-from src.experiments.probes import evaluate_e2e_probe_artifact
+from src.experiments.probes import E2E_PROBE_FORMAT, evaluate_e2e_probe_artifact
 from src.score_universe import ScoresArtifact, load_scores, validate_artifact_precision
 
 logger = logging.getLogger(__name__)
@@ -1783,8 +1783,17 @@ def _evaluate_registered_e2e_probe(
     from src.data.partition import build_g_struct, derive_partition
 
     registration = cast(Mapping[str, object] | None, preregistration.get("probe_artifact"))
-    if registration is None or registration.get("format") != "egostitch_e2e_probe_v1":
-        raise PreregistrationMismatch("registration is missing the E2E probe artifact contract")
+    if registration is None:
+        raise PreregistrationMismatch(
+            f"registration requires probe format {E2E_PROBE_FORMAT!r}; "
+            "got None; older probe versions are rejected"
+        )
+    registered_format = registration.get("format")
+    if registered_format != E2E_PROBE_FORMAT:
+        raise PreregistrationMismatch(
+            f"registration requires probe format {E2E_PROBE_FORMAT!r}; "
+            f"got {registered_format!r}; older probe versions are rejected"
+        )
     expected_path = _registered_path(
         preregistration_path, registration.get("expected_path")
     ).resolve()

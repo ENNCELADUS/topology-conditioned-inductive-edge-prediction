@@ -35,7 +35,7 @@ from numpy.typing import NDArray
 _RIDGE_LAMBDA = 1e-3
 _N_FOLDS = 5
 _MIN_VARIANCE = 1e-10
-_E2E_PROBE_FORMAT = "egostitch_e2e_probe_v2"
+E2E_PROBE_FORMAT = "egostitch_e2e_probe_v2"
 _E2E_PROBE_V1_FORMAT = "egostitch_e2e_probe_v1"
 _E2E_PAIR_LIMIT = 4096
 E2EProbeScope = Literal["formal_train", "calibration_fit", "qualification_qual"]
@@ -473,7 +473,7 @@ def write_e2e_probe_artifact(
     n_ground_value = metadata.get("n_ground")
     if not isinstance(n_ground_value, int) or n_ground_value <= 0:
         raise ValueError("probe metadata n_ground must be a positive integer")
-    payload_meta = {**metadata, "format": _E2E_PROBE_FORMAT}
+    payload_meta = {**metadata, "format": E2E_PROBE_FORMAT}
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         path,
@@ -528,15 +528,15 @@ def evaluate_e2e_probe_artifact(
             raise ValueError("E2E probe artifact is missing metadata")
         metadata = cast(dict[str, object], json.loads(str(archive["meta"].item())))
         actual_format = metadata.get("format")
-        if actual_format != _E2E_PROBE_FORMAT:
+        if actual_format != E2E_PROBE_FORMAT:
             if actual_format == _E2E_PROBE_V1_FORMAT:
                 raise ValueError(
                     f"E2E probe artifact format {_E2E_PROBE_V1_FORMAT!r} is not supported; "
-                    f"expected {_E2E_PROBE_FORMAT!r}"
+                    f"expected {E2E_PROBE_FORMAT!r}"
                 )
             raise ValueError(
                 f"E2E probe artifact format {actual_format!r} is not supported; "
-                f"expected {_E2E_PROBE_FORMAT!r}"
+                f"expected {E2E_PROBE_FORMAT!r}"
             )
         if set(archive.files) != required_arrays:
             raise ValueError(
@@ -760,9 +760,9 @@ def produce_e2e_probe_artifact(
     if registered_format == _E2E_PROBE_V1_FORMAT:
         raise ValueError(
             f"E2E probe artifact format {_E2E_PROBE_V1_FORMAT!r} is not supported; "
-            f"expected {_E2E_PROBE_FORMAT!r}"
+            f"expected {E2E_PROBE_FORMAT!r}"
         )
-    if probe_registration is None or registered_format != _E2E_PROBE_FORMAT:
+    if probe_registration is None or registered_format != E2E_PROBE_FORMAT:
         raise ValueError("preregistration does not bind the E2E probe artifact format")
     if probe_registration.get("source_arm") != "full":
         raise ValueError("preregistration does not bind the E2E probe source to the full arm")
@@ -1153,6 +1153,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 
 __all__ = [
+    "E2E_PROBE_FORMAT",
     "E2E_PROBE_SCOPES",
     "degree_partialled_r2",
     "evaluate_e2e_probe_artifact",

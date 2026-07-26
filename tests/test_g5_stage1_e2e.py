@@ -4,15 +4,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import pickle
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
 import pytest
+import torch
 from src import train_egostitch as te
-from src.experiments import g5_stage1
+from src.data import internal_holdout
+from src.experiments import g5_stage1, probes
+from src.model.egostitch.config import E2EConfig
+from src.model.egostitch.e2e_model import EgoStitchE2E
 from src.score_universe import ScoresArtifact, load_scores, save_scores
+from src.train_b0 import ModelConfig, _state_digest
 
 from tests.test_b0_cal import _toy_inputs as _b0cal_toy_inputs
 from tests.test_g1_hardened_e2 import (
@@ -22,6 +30,13 @@ from tests.test_g1_hardened_e2 import (
     _write_universe_npz,
 )
 from tests.test_g5_stage1 import _d, _write_prereg
+from tests.test_score_universe import _write_feature_store
+from tests.test_train_egostitch import _E2E_TINY_MODEL, _toy_cfg
+from tests.test_train_egostitch_e2e import (
+    _E2E_PIPELINE_NODES,
+    _e2e_pipeline_benchmark,
+    _write_tiny_token_pack,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -260,6 +275,192 @@ _E2E_LIVENESS_CONFIG = {
     "max_topk_overlap": 0.9999,
     "topk_fraction": 0.01,
 }
+
+
+def test_real_probe_producer_artifact_is_accepted_by_g5_evaluator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the production probe writer and the gate consumer as one contract."""
+    benchmark = _e2e_pipeline_benchmark()
+    nodes = list(_E2E_PIPELINE_NODES)
+    data_root = tmp_path / "data"
+    strategy_dir = data_root / te._BENCHMARK_SUBDIR / "toy"
+    strategy_dir.mkdir(parents=True)
+    with (strategy_dir / "split.pkl").open("wb") as handle:
+        pickle.dump({"train": nodes, "test": []}, handle)
+    train_pairs = list(benchmark.split.train_pairs.pairs)
+    (strategy_dir / "train_edges.txt").write_text(
+        "".join(f"{node_u}\t{node_v}\t1\n" for node_u, node_v in train_pairs),
+        encoding="utf-8",
+    )
+
+    torch.manual_seed(0)
+    node_tokens = {
+        node: torch.randn(3 + (index % 3), 1536)
+        for index, node in enumerate(nodes)
+    }
+    _write_feature_store(
+        data_root / te._FEATURES_SUBDIR,
+        node_tokens,
+        input_dim=1536,
+    )
+    token_pack = tmp_path / "token-pack"
+    _write_tiny_token_pack(token_pack, nodes, min_length=3)
+
+    model_config = {**_E2E_TINY_MODEL, "n_ground": 3}
+    base_cfg = _toy_cfg(tmp_path)
+    cfg = replace(
+        base_cfg,
+        model=ModelConfig(family="egostitch_e2e", config=model_config),
+        data=replace(
+            base_cfg.data,
+            root=data_root,
+            strategy="toy",
+            pack_dir=token_pack,
+            edge_batch=8,
+            expected_missing_features=(),
+        ),
+    )
+    config_path = tmp_path / "config.yaml"
+    probe_path = tmp_path / "probe.npz"
+    registration_path = cfg.preregistration
+    registration = {
+        "status": "BINDING",
+        "probe_artifact": {
+            "format": "egostitch_e2e_probe_v2",
+            "source_arm": "full",
+            "expected_path": str(probe_path),
+        },
+        "arms": {
+            "full": {
+                "training": str(config_path),
+            }
+        },
+    }
+    registration_path.write_text(
+        json.dumps(registration, sort_keys=True),
+        encoding="utf-8",
+    )
+    registration_sha = hashlib.sha256(registration_path.read_bytes()).hexdigest()
+
+    model = EgoStitchE2E(E2EConfig.from_mapping(model_config))
+    checkpoint_path = tmp_path / "best.pt"
+    state = model.state_dict()
+    torch.save(
+        {
+            "model_state": state,
+            "model_family": "egostitch_e2e",
+            "model_config": model_config,
+            "epoch": 0,
+            "val_metrics": {},
+            "seed": 0,
+            "config": {},
+        },
+        checkpoint_path,
+    )
+    run_metadata_path = tmp_path / "run_metadata.json"
+    run_metadata_path.write_text(
+        json.dumps(
+            {
+                "preregistration_sha256": registration_sha,
+                "run_kind": "formal",
+                "status": "complete",
+                "formal_artifacts_published": True,
+                "permanent_null": "none",
+                "seed": 0,
+                "partition_seed": 0,
+                "config_path": str(config_path),
+                "config_hash": te._config_hash(cfg),
+                "checkpoint_id": _state_digest(state)[:16],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(te, "load_config", lambda _path: cfg)
+    monkeypatch.setattr(te, "_load_benchmark_for", lambda _cfg: benchmark)
+    def tiny_internal_holdout(
+        train_nodes: list[str],
+        e_msg: frozenset[tuple[str, str]],
+        _e_sup: frozenset[tuple[str, str]],
+    ) -> SimpleNamespace:
+        v_fit = frozenset(train_nodes[:9])
+        v_qual = frozenset(train_nodes[9:17])
+        v_select = frozenset(train_nodes[17:])
+
+        def induced(nodes_subset: frozenset[str]) -> frozenset[tuple[str, str]]:
+            return frozenset(
+                (node_u, node_v)
+                for node_u, node_v in e_msg
+                if node_u in nodes_subset and node_v in nodes_subset
+            )
+
+        return SimpleNamespace(
+            v_fit=v_fit,
+            v_qual=v_qual,
+            v_select=v_select,
+            e_msg_fit=induced(v_fit),
+            qual_manifest=SimpleNamespace(positive_edges=induced(v_qual)),
+        )
+
+    monkeypatch.setattr(
+        internal_holdout,
+        "derive_internal_holdout",
+        tiny_internal_holdout,
+    )
+    original_select_probe_pairs = probes.select_probe_pairs
+    monkeypatch.setattr(
+        probes,
+        "select_probe_pairs",
+        lambda graph, limit=1000: original_select_probe_pairs(graph, limit=8),
+    )
+
+    probes.produce_e2e_probe_artifact(
+        checkpoint_path=checkpoint_path,
+        run_metadata_path=run_metadata_path,
+        preregistration_path=registration_path,
+        data_root=data_root,
+        strategy="toy",
+        output_path=probe_path,
+        scope="formal_train",
+    )
+    with np.load(probe_path, allow_pickle=False) as archive:
+        produced_metadata = json.loads(str(archive["meta"].item()))
+    assert produced_metadata["format"] == "egostitch_e2e_probe_v2"
+
+    report = g5_stage1._evaluate_registered_e2e_probe(
+        probe_artifact_path=probe_path,
+        preregistration=registration,
+        preregistration_path=registration_path,
+        run_metadata_path=run_metadata_path,
+        data_root=data_root,
+        strategy="toy",
+    )
+    assert cast(dict[str, object], report["metadata"])["format"] == (
+        "egostitch_e2e_probe_v2"
+    )
+
+
+def test_g5_evaluator_rejects_v1_probe_registration(tmp_path: Path) -> None:
+    with pytest.raises(
+        g5_stage1.PreregistrationMismatch,
+        match="egostitch_e2e_probe_v2.*egostitch_e2e_probe_v1.*rejected",
+    ):
+        g5_stage1._evaluate_registered_e2e_probe(
+            probe_artifact_path=tmp_path / "probe-v1.npz",
+            preregistration={
+                "probe_artifact": {
+                    "format": "egostitch_e2e_probe_v1",
+                    "expected_path": str(tmp_path / "probe-v1.npz"),
+                }
+            },
+            preregistration_path=tmp_path / "registration.json",
+            run_metadata_path=tmp_path / "run_metadata.json",
+            data_root=tmp_path / "data",
+            strategy="toy",
+        )
 
 
 def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
