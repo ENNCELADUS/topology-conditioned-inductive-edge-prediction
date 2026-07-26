@@ -12,11 +12,10 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable, Sequence
-from typing import NamedTuple, cast
+from typing import NamedTuple
 
 import torch
 from torch import nn
-from torch._higher_order_ops import scan
 from torch.nn import functional as F
 
 from src.model.egostitch.imagine import SlotSet
@@ -133,7 +132,7 @@ def _checkerboard_rewire(
     def transfer(
         flat: torch.Tensor,
         draw: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         indices, unit = draw
         row_i, row_k, column_j, column_l = indices.unbind(dim=-1)
         donor_il = matrix_offsets + row_i * slots + column_l
@@ -149,11 +148,12 @@ def _checkerboard_rewire(
             dim=-1,
         ).flatten()
         update_values = torch.stack((delta, delta, -delta, -delta), dim=-1).flatten()
-        updated = flat.scatter_add(0, update_indices, update_values)
-        return updated, torch.empty(0, device=flat.device, dtype=flat.dtype)
+        return flat.scatter_add(0, update_indices, update_values)
 
-    rewired, _ = scan(transfer, matrices.flatten(), (draw_indices, round_units))
-    return cast(torch.Tensor, rewired).reshape_as(matrices)
+    flat = matrices.flatten()
+    for indices, unit in zip(draw_indices, round_units, strict=True):
+        flat = transfer(flat, (indices, unit))
+    return flat.reshape_as(matrices)
 
 
 def make_scaffold_input_perturbation(

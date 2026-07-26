@@ -5,7 +5,6 @@ import subprocess
 import sys
 
 import pytest
-import src.model.egostitch.scaffold as scaffold_module
 import torch
 from src.model.egostitch.imagine import SlotSet
 from src.model.egostitch.scaffold import (
@@ -21,6 +20,7 @@ from src.model.egostitch.scaffold import (
     swap_direction,
 )
 from src.model.egostitch.ste import STEncoder
+from torch.profiler import ProfilerActivity, profile
 
 
 def _slots(b: int = 2, k: int = 4, d_p: int = 8, seed: int = 0) -> SlotSet:
@@ -233,30 +233,24 @@ def test_rewire_checkerboard_keeps_adjacency_symmetric_with_zero_diagonal() -> N
     assert rewired_plan.min().item() >= -torch.finfo(torch.float32).eps
 
 
-def test_rewire_checkerboard_vectorizes_cell_disjoint_draws(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    scan_shapes: list[tuple[torch.Size, torch.Size, int]] = []
-    original_scan = scaffold_module.scan
-
-    def scan_spy(
-        combine_fn: object,
-        init: torch.Tensor,
-        xs: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        draw_indices, units = xs
-        scan_shapes.append(
-            (draw_indices.shape, units.shape, int(torch.count_nonzero(units).item()))
-        )
-        return original_scan(combine_fn, init, xs)
-
-    monkeypatch.setattr(scaffold_module, "scan", scan_spy)
+def test_rewire_checkerboard_vectorizes_cell_disjoint_draws() -> None:
     generator = torch.Generator().manual_seed(16)
-    _checkerboard_rewire(torch.rand(1, 16, 16, generator=generator), [generator])
+    with profile(
+        activities=[ProfilerActivity.CPU], record_shapes=True, acc_events=True
+    ) as profiler:
+        _checkerboard_rewire(torch.rand(1, 16, 16, generator=generator), [generator])
 
     # K=16: 2,048 keyed swaps become 37 sequential rounds of up to 56
-    # cell-disjoint transfers, rather than 2,048 scalar scan/Python steps.
-    assert scan_shapes == [(torch.Size([37, 1, 56, 4]), torch.Size([37, 1, 56]), 2048)]
+    # cell-disjoint transfers, rather than 2,048 scalar Python steps. Each
+    # round performs one vectorized scatter over 56 four-cell updates.
+    scatter_events = [
+        event
+        for event in profiler.key_averages(group_by_input_shape=True)
+        if event.key == "aten::scatter_add"
+    ]
+    assert len(scatter_events) == 1
+    assert scatter_events[0].count == 37
+    assert scatter_events[0].input_shapes == [[256], [], [224], [224]]
 
 
 def test_scaffold_controls_are_cross_process_deterministic_and_pair_keyed() -> None:
