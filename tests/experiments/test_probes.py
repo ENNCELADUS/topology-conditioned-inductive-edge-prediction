@@ -461,14 +461,15 @@ class TestE2EProbeArtifact:
                 scope="formal_train",
             )
 
-    @pytest.mark.parametrize("scope", ["calibration_fit", "qualification_qual"])
-    def test_prebinding_scope_accepts_draft_and_separate_output(
-        self,
+    @staticmethod
+    def _write_prebinding_producer_inputs(
         tmp_path: Path,
-        scope: probes.E2EProbeScope,
-    ) -> None:
+        *,
+        run_kind: str,
+        validation_role: object = ...,
+        status: str = "complete",
+    ) -> tuple[Path, Path, Path, Path]:
         formal_output = tmp_path / "formal-probe.npz"
-        prebinding_output = tmp_path / f"{scope}-probe.npz"
         full_config = tmp_path / "missing-full.yaml"
         registration = tmp_path / "registration.json"
         registration.write_text(
@@ -486,21 +487,30 @@ class TestE2EProbeArtifact:
             encoding="utf-8",
         )
         registration_sha = hashlib.sha256(registration.read_bytes()).hexdigest()
+        metadata_payload: dict[str, object] = {
+            "preregistration_sha256": registration_sha,
+            "run_kind": run_kind,
+            "status": status,
+            "formal_artifacts_published": False,
+            "permanent_null": "none",
+            "seed": 0,
+            "partition_seed": 0,
+            "config_path": str(full_config),
+        }
+        if validation_role is not ...:
+            metadata_payload["validation_role"] = validation_role
         metadata = tmp_path / "run_metadata.json"
-        metadata.write_text(
-            json.dumps(
-                {
-                    "preregistration_sha256": registration_sha,
-                    "run_kind": "rehearsal",
-                    "status": "complete",
-                    "formal_artifacts_published": False,
-                    "permanent_null": "none",
-                    "seed": 0,
-                    "partition_seed": 0,
-                    "config_path": str(full_config),
-                }
-            ),
-            encoding="utf-8",
+        metadata.write_text(json.dumps(metadata_payload), encoding="utf-8")
+        return registration, metadata, full_config, formal_output
+
+    def test_calibration_fit_accepts_explicit_v_fit_only_source(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        registration, metadata, _, _ = self._write_prebinding_producer_inputs(
+            tmp_path,
+            run_kind="overfit",
+            validation_role=None,
         )
 
         with pytest.raises(FileNotFoundError):
@@ -510,8 +520,91 @@ class TestE2EProbeArtifact:
                 preregistration_path=registration,
                 data_root=tmp_path / "data",
                 strategy="breadth_first",
-                output_path=prebinding_output,
-                scope=scope,
+                output_path=tmp_path / "calibration-fit-probe.npz",
+                scope="calibration_fit",
+            )
+
+    def test_qualification_scope_accepts_rehearsal_and_separate_output(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        registration, metadata, _, _ = self._write_prebinding_producer_inputs(
+            tmp_path,
+            run_kind="rehearsal",
+            validation_role="V_qual",
+        )
+
+        with pytest.raises(FileNotFoundError):
+            probes.produce_e2e_probe_artifact(
+                checkpoint_path=tmp_path / "best.pt",
+                run_metadata_path=metadata,
+                preregistration_path=registration,
+                data_root=tmp_path / "data",
+                strategy="breadth_first",
+                output_path=tmp_path / "qualification-qual-probe.npz",
+                scope="qualification_qual",
+            )
+
+    @pytest.mark.parametrize(
+        ("run_kind", "validation_role", "touched_universe", "status"),
+        [
+            ("rehearsal", "V_qual", "V_qual", "complete"),
+            ("debug", "V_select", "V_select", "debug_complete"),
+        ],
+    )
+    def test_calibration_fit_rejects_checkpoint_that_touched_sealed_universe(
+        self,
+        tmp_path: Path,
+        run_kind: str,
+        validation_role: str,
+        touched_universe: str,
+        status: str,
+    ) -> None:
+        registration, metadata, _, _ = self._write_prebinding_producer_inputs(
+            tmp_path,
+            run_kind=run_kind,
+            validation_role=validation_role,
+            status=status,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=rf"13\.19\.4.*{touched_universe}",
+        ):
+            probes.produce_e2e_probe_artifact(
+                checkpoint_path=tmp_path / "best.pt",
+                run_metadata_path=metadata,
+                preregistration_path=registration,
+                data_root=tmp_path / "data",
+                strategy="breadth_first",
+                output_path=tmp_path / "calibration-fit-probe.npz",
+                scope="calibration_fit",
+            )
+
+    @pytest.mark.parametrize("validation_role", [..., "unexpected"])
+    def test_calibration_fit_rejects_missing_or_unrecognized_validation_role(
+        self,
+        tmp_path: Path,
+        validation_role: object,
+    ) -> None:
+        registration, metadata, _, _ = self._write_prebinding_producer_inputs(
+            tmp_path,
+            run_kind="overfit",
+            validation_role=validation_role,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=r"13\.19\.4.*cannot establish V_fit-only provenance",
+        ):
+            probes.produce_e2e_probe_artifact(
+                checkpoint_path=tmp_path / "best.pt",
+                run_metadata_path=metadata,
+                preregistration_path=registration,
+                data_root=tmp_path / "data",
+                strategy="breadth_first",
+                output_path=tmp_path / "calibration-fit-probe.npz",
+                scope="calibration_fit",
             )
 
     def test_producer_rejects_nonformal_or_incomplete_source(self, tmp_path: Path) -> None:

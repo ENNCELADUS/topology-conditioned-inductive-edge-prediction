@@ -795,12 +795,35 @@ def produce_e2e_probe_artifact(
             or run_metadata.get("permanent_null") != "none"
         ):
             raise ValueError("E2E probe producer requires the completed formal full arm")
+    elif scope == "calibration_fit":
+        run_kind = run_metadata.get("run_kind")
+        if run_kind == "rehearsal":
+            raise ValueError(
+                "section 13.19.4 requires calibration_fit probes from a V_fit-only "
+                "checkpoint; the rehearsal checkpoint already touched V_qual"
+            )
+        if run_kind in {"debug", "formal"}:
+            raise ValueError(
+                "section 13.19.4 requires calibration_fit probes from a V_fit-only "
+                f"checkpoint; the {run_kind} checkpoint already touched V_select"
+            )
+        if "validation_role" not in run_metadata or run_metadata["validation_role"] is not None:
+            raise ValueError(
+                "section 13.19.4 cannot establish V_fit-only provenance for the "
+                "calibration_fit checkpoint: validation_role must be explicitly null"
+            )
+        if (
+            run_kind != "overfit"
+            or run_metadata.get("status") != "complete"
+            or run_metadata.get("formal_artifacts_published") is not False
+            or run_metadata.get("permanent_null") != "none"
+        ):
+            raise ValueError(
+                "calibration_fit probe production requires a completed unpublished "
+                "V_fit-only overfit full-arm run under section 13.19.4"
+            )
     else:
-        allowed_run_kinds = (
-            {"debug", "rehearsal"}
-            if scope == "calibration_fit"
-            else {"rehearsal"}
-        )
+        allowed_run_kinds = {"rehearsal"}
         if (
             run_metadata.get("run_kind") not in allowed_run_kinds
             or run_metadata.get("status") not in {"complete", "debug_complete"}

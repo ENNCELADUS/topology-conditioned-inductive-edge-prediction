@@ -326,6 +326,7 @@
     "required_gate_input": true,
     "format": "egostitch_e2e_probe_v2",
     "source_arm": "full",
+    "expected_path": "outputs/egostitch_e2e_stage1_v3/full/probes/e2e_probe_v2.npz",
     "formal_scope": "all operative train nodes over train-side G_struct",
     "prebinding_scopes": {
       "calibration": "G_fit only",

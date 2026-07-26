@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
+from typing import Never
 
 import pytest
 from src import score_universe, train_egostitch
-from src.experiments import g5_stage1
+from src.experiments import g5_stage1, probes
 
 pytestmark = pytest.mark.unit
 
@@ -65,6 +67,65 @@ def test_v3_registration_parses_as_a_nonbinding_draft() -> None:
         "docs/registrations/g5_e2e_stage1_preregistration_v2.json"
     )
     assert predecessor["status"] == "BINDING"
+
+
+def test_v3_registration_formal_probe_path_is_producer_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registration = _registration()
+    probe_artifact = registration["probe_artifact"]
+    assert isinstance(probe_artifact, dict)
+    expected_path = probe_artifact.get("expected_path")
+    assert expected_path == (
+        "outputs/egostitch_e2e_stage1_v3/full/probes/e2e_probe_v2.npz"
+    )
+
+    # Exercise the draft exactly as it would behave after binding, without
+    # mutating the governing registration or filling any binding placeholders.
+    bound_copy = {**registration, "status": "BINDING"}
+    registration_path = tmp_path / "docs/registrations/registration.json"
+    registration_path.parent.mkdir(parents=True)
+    registration_path.write_text(json.dumps(bound_copy), encoding="utf-8")
+    registration_sha = hashlib.sha256(registration_path.read_bytes()).hexdigest()
+    full_arm = registration["arms"]["full"]
+    assert isinstance(full_arm, dict)
+    registered_config = tmp_path / str(full_arm["training"])
+    metadata_path = tmp_path / "run_metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "preregistration_sha256": registration_sha,
+                "run_kind": "formal",
+                "status": "complete",
+                "formal_artifacts_published": True,
+                "permanent_null": "none",
+                "seed": 0,
+                "partition_seed": 0,
+                "config_path": str(registered_config),
+            }
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / str(expected_path)
+
+    class ProbePathAccepted(Exception):
+        pass
+
+    def stop_after_path_validation(_: Path) -> Never:
+        raise ProbePathAccepted
+
+    monkeypatch.setattr(train_egostitch, "load_config", stop_after_path_validation)
+    with pytest.raises(ProbePathAccepted):
+        probes.produce_e2e_probe_artifact(
+            checkpoint_path=tmp_path / "best.pt",
+            run_metadata_path=metadata_path,
+            preregistration_path=registration_path,
+            data_root=tmp_path / "data",
+            strategy="breadth_first",
+            output_path=output_path,
+            scope="formal_train",
+        )
 
 
 def test_v3_registration_freezes_rev31_contract() -> None:
