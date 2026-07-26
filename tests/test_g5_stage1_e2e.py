@@ -11,12 +11,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import networkx as nx
 import numpy as np
 import pytest
 import torch
 from src import train_egostitch as te
 from src.data import internal_holdout
-from src.experiments import g5_stage1, probes
+from src.experiments import b0_cal, g5_stage1, probes
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.e2e_model import EgoStitchE2E
 from src.score_universe import ScoresArtifact, load_scores, save_scores
@@ -249,11 +250,19 @@ def _refresh_formal_run_metadata_hashes(inputs: dict[str, Any]) -> None:
     """Model rescoring after a semantically valid run-metadata fixture rewrite."""
     arm_paths = _d(inputs["arm_universe_paths"])
     metadata_paths = _d(inputs["run_metadata_paths"])
+    registration_sha256 = hashlib.sha256(
+        cast(Path, inputs["preregistration_path"]).read_bytes()
+    ).hexdigest()
+    for metadata_path in metadata_paths.values():
+        metadata = json.loads(metadata_path.read_text())
+        metadata["preregistration_sha256"] = registration_sha256
+        metadata_path.write_text(json.dumps(metadata))
     for name, artifact_path in arm_paths.items():
         source_arm = "full" if name in g5_stage1._E2E_CONTROL_ARMS else name
         artifact = load_scores(artifact_path)
         meta = dict(artifact.meta)
         provenance = dict(_d(meta["formal_scoring_provenance"]))
+        provenance["registration_sha256"] = registration_sha256
         provenance["run_metadata_sha256"] = hashlib.sha256(
             metadata_paths[source_arm].read_bytes()
         ).hexdigest()
@@ -733,6 +742,78 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
     }
 
 
+def _probe_v2_report(tmp_path: Path) -> tuple[Path, dict[str, object]]:
+    """Write and evaluate a real probe-v2 artifact for gate-renderer tests."""
+    graph = nx.cycle_graph(12)
+    graph = nx.relabel_nodes(graph, {node: f"n{node:02d}" for node in graph})
+    nodes = sorted(graph.nodes())
+    targets = probes.probe_targets(graph, nodes)
+    pairs = probes.select_probe_pairs(graph)
+    n_pairs = len(pairs)
+    rng = np.random.default_rng(17)
+    metadata: dict[str, object] = {
+        "checkpoint_id": "probe-checkpoint",
+        "registration_sha256": "a" * 64,
+        "config_hash": "b" * 64,
+        "seed": 0,
+        "partition_seed": 0,
+        "strategy": "toy",
+        "g_struct_sha256": probes.g_struct_sha256(graph),
+        "scope": "formal_train",
+        "n_ground": 50,
+    }
+    path = tmp_path / "probe-v2.npz"
+    probes.write_e2e_probe_artifact(
+        path,
+        metadata=metadata,
+        node_ids=nodes,
+        states=rng.normal(size=(len(nodes), 4)).astype(np.float32),
+        targets={name: targets[name] for name in ("degree", "ego_density", "clustering")},
+        pair_ids=pairs,
+        pair_states=rng.normal(size=(n_pairs, 4)).astype(np.float32),
+        pi_consistency_v1=np.linspace(0.0, 0.5, n_pairs, dtype=np.float64),
+        pi_consistency_v2=np.linspace(0.2, 0.8, n_pairs, dtype=np.float64),
+        slot_recall=np.linspace(0.05, 0.25, len(nodes), dtype=np.float64),
+        shared_neighbor_count=np.asarray(
+            [
+                len(set(graph.neighbors(node_u)) & set(graph.neighbors(node_v)))
+                for node_u, node_v in pairs
+            ],
+            dtype=np.float64,
+        ),
+        dispersion={
+            "pi_slot_std": np.full(n_pairs, 0.11),
+            "h_pairwise_cosine_mean": np.full(n_pairs, 0.22),
+            "adj_offdiag_std": np.full(n_pairs, 0.33),
+            "plan_row_entropy": np.full(n_pairs, 0.44),
+        },
+    )
+    report = probes.evaluate_e2e_probe_artifact(
+        path,
+        graph=graph,
+        train_nodes=nodes,
+        expected_metadata=metadata,
+    )
+    return path, report
+
+
+def _markdown_table(markdown: str, heading: str) -> dict[str, dict[str, str]]:
+    """Parse one rendered Markdown table, keyed by its first column."""
+    lines = markdown.splitlines()
+    heading_index = lines.index(heading)
+    header_index = next(
+        index for index in range(heading_index + 1, len(lines)) if lines[index].startswith("|")
+    )
+    headers = [cell.strip() for cell in lines[header_index].strip("|").split("|")]
+    rows: dict[str, dict[str, str]] = {}
+    for line in lines[header_index + 2 :]:
+        if not line.startswith("|"):
+            break
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        rows[cells[0]] = dict(zip(headers, cells, strict=True))
+    return rows
+
+
 class TestBuildE2EArmSummary:
     def test_requires_complete_binding_evidence(self, tmp_path: Path) -> None:
         inputs = _eight_arm_inputs(tmp_path)
@@ -1107,6 +1188,178 @@ class TestBuildE2EArmSummary:
             g5_stage1.enforce_e2e_frozen_inputs(
                 preregistration, preregistration_path, b0_path, b0cal_path
             )
+
+
+def test_formal_gate_reports_rev31_telemetry_without_changing_verdict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real gate writer must headline all nonbinding rev-3.1 telemetry."""
+    inputs = _eight_arm_inputs(tmp_path)
+    preregistration_path = cast(Path, inputs["preregistration_path"])
+    registration = json.loads(preregistration_path.read_text())
+    frozen = _d(registration["frozen_inputs"])
+    b0_universe_path = Path(cast(str, _d(frozen["b0_candidate_scores"])["path"]))
+    b0cal_output_dir = tmp_path / "b0cal"
+    b0_cal.run_b0_cal_pipeline(
+        universe_path=b0_universe_path,
+        val_scores_path=tmp_path / "val.npz",
+        data_root=cast(Path, inputs["data_root"]),
+        strategy="toy",
+        output_dir=b0cal_output_dir,
+        seed=0,
+        skip_perturbation_check=True,
+    )
+    b0cal_results_path = b0cal_output_dir / "b0cal_results.json"
+    _d(frozen["b0cal_results"])["sha256"] = hashlib.sha256(
+        b0cal_results_path.read_bytes()
+    ).hexdigest()
+    preregistration_path.write_text(json.dumps(registration, sort_keys=True, indent=2) + "\n")
+
+    expected_correlations: dict[str, float] = {}
+    for index, (arm, metadata_path) in enumerate(
+        _d(inputs["run_metadata_paths"]).items(), start=1
+    ):
+        metadata = json.loads(metadata_path.read_text())
+        correlation = index / 10
+        metadata["training_diagnostics"]["fidelity_series"][0][
+            "topology_delta_degree_correlation"
+        ] = correlation
+        metadata_path.write_text(json.dumps(metadata))
+        expected_correlations[arm] = correlation
+    _refresh_formal_run_metadata_hashes(inputs)
+
+    summary = g5_stage1.build_e2e_arm_summary(
+        liveness_config=_E2E_LIVENESS_CONFIG,
+        **inputs,
+    )
+    probe_path, probe_report = _probe_v2_report(tmp_path)
+    current_summary = summary
+
+    def _summary(**_kwargs: object) -> dict[str, object]:
+        return current_summary
+
+    monkeypatch.setattr(g5_stage1, "build_e2e_arm_summary", _summary)
+    monkeypatch.setattr(
+        g5_stage1,
+        "_evaluate_registered_e2e_probe",
+        lambda **_kwargs: probe_report,
+    )
+    gate_registration = cast(dict[str, object], json.loads(json.dumps(registration)))
+    gate_registration["benchmark"] = {"strategy": "breadth_first"}
+    monkeypatch.setattr(
+        g5_stage1,
+        "_preregistration_snapshot",
+        lambda _path: (
+            gate_registration,
+            hashlib.sha256(preregistration_path.read_bytes()).hexdigest(),
+        ),
+    )
+    b0_row = g5_stage1.AssembledRow(
+        threshold=0.5,
+        mmd_ratio={"degree": 1.0, "clustering": 1.0, "spectral": 1.0},
+        raw_mmd2={"degree": 1.0, "clustering": 1.0, "spectral": 1.0},
+        reference_mmd2={"degree": 1.0, "clustering": 1.0, "spectral": 1.0},
+        graph_similarity=0.5,
+        relative_density=0.5,
+        per_size_graph_similarity={},
+        per_size_relative_density={},
+        self_loops_pred=0,
+        self_loops_ref=0,
+        bootstrap_mean={"degree": 1.0, "clustering": 1.0, "spectral": 1.0},
+        bootstrap_std={"degree": 0.0, "clustering": 0.0, "spectral": 0.0},
+    )
+    monkeypatch.setattr(g5_stage1, "assemble_and_evaluate", lambda **_kwargs: b0_row)
+    monkeypatch.setattr(g5_stage1, "_validate_b0cal_lineage", lambda *_args: None)
+    monkeypatch.setattr(
+        g5_stage1,
+        "evaluate_assembled_graph",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            graph_similarity=0.5,
+            relative_density=0.5,
+        ),
+    )
+    monkeypatch.setattr(
+        g5_stage1,
+        "evaluate_regime_table",
+        lambda **_kwargs: {
+            "degree_corrected": {"ratio_1": SimpleNamespace(auprc=0.5)}
+        },
+    )
+
+    def run_gate(output_dir: Path) -> dict[str, object]:
+        return g5_stage1.run_g5_e2e_stage1_pipeline(
+            arm_universe_paths=_d(inputs["arm_universe_paths"]),
+            run_metadata_paths=_d(inputs["run_metadata_paths"]),
+            b0_universe_path=b0_universe_path,
+            b0cal_results_path=b0cal_results_path,
+            probe_artifact_path=probe_path,
+            preregistration_path=preregistration_path,
+            data_root=cast(Path, inputs["data_root"]),
+            strategy="toy",
+            output_dir=output_dir,
+        )
+
+    reported_dir = tmp_path / "reported-gate"
+    reported = run_gate(reported_dir)
+    reported_json = json.loads(
+        (reported_dir / "g5_e2e_stage1_results.json").read_text()
+    )
+    reported_markdown = (reported_dir / "g5_e2e_stage1_tables.md").read_text()
+
+    diagnostics = _d(reported_json["training_diagnostics"])
+    for arm, expected in expected_correlations.items():
+        fidelity = cast(list[dict[str, object]], _d(diagnostics[arm])["fidelity_series"])
+        assert fidelity[0]["topology_delta_degree_correlation"] == expected
+
+    probe_json = _d(reported_json["probes"])
+    assert isinstance(probe_json["shared_neighbor_count_r2"], float)
+    assert "pi_consistency_v2" in probe_json
+    assert "slot_recall_at_n_ground" in probe_json
+    assert set(_d(probe_json["dispersion"])) == {
+        "pi_slot_std",
+        "h_pairwise_cosine_mean",
+        "adj_offdiag_std",
+        "plan_row_entropy",
+    }
+
+    degree_rows = _markdown_table(reported_markdown, "## Degree-decorrelation telemetry")
+    for arm, expected in expected_correlations.items():
+        assert degree_rows[arm]["corr(full-f_logit, endpoint degree)"] == g5_stage1._fmt(
+            expected
+        )
+
+    probe_rows = _markdown_table(reported_markdown, "## Registered probe-v2 evidence")
+    expected_probe_rows = {
+        "pi_consistency_v2",
+        "slot_recall_at_n_ground",
+        "shared_neighbor_count_r2",
+        "pi_slot_std",
+        "h_pairwise_cosine_mean",
+        "adj_offdiag_std",
+        "plan_row_entropy",
+    }
+    assert expected_probe_rows <= probe_rows.keys()
+    assert probe_rows["pi_consistency_v2"]["value"] == g5_stage1._fmt(
+        _d(probe_json["pi_consistency_v2"])["mean"]
+    )
+    assert probe_rows["slot_recall_at_n_ground"]["value"] == g5_stage1._fmt(
+        _d(probe_json["slot_recall_at_n_ground"])["mean"]
+    )
+    assert probe_rows["shared_neighbor_count_r2"]["value"] == g5_stage1._fmt(
+        probe_json["shared_neighbor_count_r2"]
+    )
+    for name, values in _d(probe_json["dispersion"]).items():
+        assert probe_rows[name]["value"] == g5_stage1._fmt(_d(values)["mean"])
+
+    current_summary = cast(dict[str, object], json.loads(json.dumps(summary)))
+    for diagnostics_report in _d(current_summary["training_diagnostics"]).values():
+        for row in cast(
+            list[dict[str, object]], _d(diagnostics_report)["fidelity_series"]
+        ):
+            row.pop("topology_delta_degree_correlation", None)
+    without_telemetry = run_gate(tmp_path / "gate-without-telemetry")
+    assert without_telemetry["verdict"] == reported["verdict"]
 
 
 class TestPairedBootstrap:

@@ -2117,6 +2117,29 @@ def render_e2e_tables_markdown(payload: Mapping[str, object]) -> str:
             f"| {_fmt(mmd['clustering'])} | {_fmt(mmd['spectral'])} "
             f"| {_fmt(row['degree_corrected_auprc'])} |"
         )
+    training_diagnostics = cast(
+        Mapping[str, Mapping[str, object]], payload.get("training_diagnostics", {})
+    )
+    lines += [
+        "",
+        "## Degree-decorrelation telemetry",
+        "",
+        "| arm | validation | corr(full-f_logit, endpoint degree) |",
+        "|---|---:|---:|",
+    ]
+    for name in _E2E_FORMAL_ARMS:
+        report = training_diagnostics.get(name, {})
+        fidelity_series = cast(
+            Sequence[Mapping[str, object]], report.get("fidelity_series", ())
+        )
+        if not fidelity_series:
+            lines.append(f"| {name} |  |  |")
+            continue
+        for validation, row in enumerate(fidelity_series, start=1):
+            lines.append(
+                f"| {name} | {validation} "
+                f"| {_fmt(row.get('topology_delta_degree_correlation'))} |"
+            )
     decomposition = cast(Mapping[str, object], payload["decomposition"])
     decomposition_arms = cast(Mapping[str, Mapping[str, object]], decomposition["arms"])
     lines += [
@@ -2156,6 +2179,42 @@ def render_e2e_tables_markdown(payload: Mapping[str, object]) -> str:
         "|---|---:|---:|---:|---:|",
         f"| registered E_msg selection | {_fmt(pi['mean'])} | {_fmt(pi['std'])} "
         f"| {_fmt(pi['nonzero_fraction'])} | {_fmt(pi['n_pairs'])} |",
+        "",
+        "## Registered probe-v2 evidence",
+        "",
+        "| quantity | value | std | nonzero fraction | n | context |",
+        "|---|---:|---:|---:|---:|---|",
+    ]
+    pi_v2 = cast(Mapping[str, object], probes["pi_consistency_v2"])
+    lines.append(
+        f"| pi_consistency_v2 | {_fmt(pi_v2['mean'])} | {_fmt(pi_v2['std'])} "
+        f"| {_fmt(pi_v2['nonzero_fraction'])} | {_fmt(pi_v2['n'])} "
+        f"| n_pairs={_fmt(pi_v2['n_pairs'])} |"
+    )
+    slot_recall = cast(Mapping[str, object], probes["slot_recall_at_n_ground"])
+    lines.append(
+        f"| slot_recall_at_n_ground | {_fmt(slot_recall['mean'])} "
+        f"| {_fmt(slot_recall['std'])} | {_fmt(slot_recall['nonzero_fraction'])} "
+        f"| {_fmt(slot_recall['n'])} | n_ground={_fmt(slot_recall['n_ground'])}; "
+        f"n_nodes={_fmt(slot_recall['n_nodes'])} |"
+    )
+    lines.append(
+        f"| shared_neighbor_count_r2 | {_fmt(probes['shared_neighbor_count_r2'])} "
+        "|  |  |  | pair-state ridge R2 |"
+    )
+    dispersion = cast(Mapping[str, Mapping[str, object]], probes["dispersion"])
+    for name in (
+        "pi_slot_std",
+        "h_pairwise_cosine_mean",
+        "adj_offdiag_std",
+        "plan_row_entropy",
+    ):
+        row = dispersion[name]
+        lines.append(
+            f"| {name} | {_fmt(row['mean'])} | {_fmt(row['std'])} "
+            f"| {_fmt(row['nonzero_fraction'])} | {_fmt(row['n'])} | pair dispersion |"
+        )
+    lines += [
         "",
         "## Decision checks",
         "",
@@ -2356,6 +2415,7 @@ def run_g5_e2e_stage1_pipeline(
         "primary_pass": primary_pass,
         "guards": guards,
         "liveness": summary["liveness"],
+        "training_diagnostics": summary["training_diagnostics"],
         "decomposition": summary["decomposition"],
         "probes": probes,
         "pathway_attribution": {
