@@ -594,6 +594,7 @@ class TestE2ECompositeStep:
                         1e-3,
                         te.E2EPhaseState("A", 0.0, False, 0.0),
                         name,
+                        {"generator", "topology_content_conditioning"},
                     ),
                 }
                 for name in parameter_groups.groups
@@ -669,6 +670,55 @@ class TestE2ECompositeStep:
         assert set(family_norms["generator"]) == {"recon"}
         assert family_norms["topology_content_conditioning"] == {}
         assert submodule_rms == {}
+
+    @pytest.mark.parametrize(
+        ("w_rel", "phase", "joint_weight", "expect_update"),
+        [
+            (0.0, te.E2EPhaseState("A", 0.0, False, 0.0), 0.0, False),
+            (0.25, te.E2EPhaseState("A", 0.0, False, 0.0), 0.0, True),
+            (0.0, te.E2EPhaseState("B", 0.1, True, 0.0), 1.0, True),
+        ],
+    )
+    def test_topology_content_optimizer_updates_only_when_active(
+        self,
+        tmp_path: Path,
+        w_rel: float,
+        phase: te.E2EPhaseState,
+        joint_weight: float,
+        expect_update: bool,
+    ) -> None:
+        torch.manual_seed(0)
+        batch, model = self._batch_and_model(tmp_path, w_rel=w_rel)
+        composite = te._CompositeStep(model, world_size=1)
+        parameter_groups = te.build_e2e_parameter_groups(model)
+        optimizer = torch.optim.AdamW(
+            [
+                {
+                    "params": parameters,
+                    "lr": te._e2e_optimizer_group_lr(
+                        1e-3,
+                        phase,
+                        name,
+                        te._e2e_active_groups(phase, model),
+                    ),
+                }
+                for name, parameters in parameter_groups.groups.items()
+            ],
+            weight_decay=0.01,
+        )
+
+        with self._bf16_autocast():
+            out = composite(self._payload(batch, joint_weight=joint_weight))
+        cast(torch.Tensor, out["loss"]).backward()  # type: ignore[no-untyped-call]
+        topology_parameters = parameter_groups.groups["topology_content_conditioning"]
+        before = [parameter.detach().clone() for parameter in topology_parameters]
+        optimizer.step()
+
+        changed = [
+            not torch.equal(previous, parameter)
+            for previous, parameter in zip(before, topology_parameters, strict=True)
+        ]
+        assert any(changed) if expect_update else not any(changed)
 
     def test_no_rel_head_conditioning_liveness_resumes_when_edge_active(
         self, tmp_path: Path

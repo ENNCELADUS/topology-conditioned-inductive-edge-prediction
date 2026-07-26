@@ -153,7 +153,7 @@ def test_load_bare_legacy_checkpoint_with_explicit_model_metadata(tmp_path: Path
         torch.testing.assert_close(loaded_model.state_dict()[name], expected)
 
 
-def test_load_pre_rev31_e2e_checkpoint_without_relational_head(tmp_path: Path) -> None:
+def test_load_e2e_checkpoint_with_current_scaffold_without_relational_head(tmp_path: Path) -> None:
     legacy_config = dict(_TINY_E2E_CONFIG)
     legacy_config["w_rel"] = 0.0
     source_model = score_universe.build_model("egostitch_e2e", legacy_config)
@@ -175,6 +175,52 @@ def test_load_pre_rev31_e2e_checkpoint_without_relational_head(tmp_path: Path) -
     assert checkpoint_id == score_universe._checkpoint_id(source_model.state_dict())
     for name, expected in source_model.state_dict().items():
         torch.testing.assert_close(loaded_model.state_dict()[name], expected)
+
+
+def test_load_pre_rev31_e2e_checkpoint_rejects_legacy_scaffold_shape(tmp_path: Path) -> None:
+    legacy_config = dict(_TINY_E2E_CONFIG)
+    legacy_config["w_rel"] = 0.0
+    source_model = score_universe.build_model("egostitch_e2e", legacy_config)
+    legacy_state = dict(source_model.state_dict())
+    legacy_state["ste.embed.weight"] = legacy_state["ste.embed.weight"][:, :9].clone()
+    for layer in range(cast(int, legacy_config["ste_layers"])):
+        legacy_state.pop(f"ste.layers.{layer}.msg.3.weight")
+        legacy_state.pop(f"ste.layers.{layer}.msg.3.bias")
+    checkpoint_config = dict(legacy_config)
+    checkpoint_config.pop("w_rel")
+    checkpoint_path = tmp_path / "pre-rev31-e2e.pt"
+    torch.save(
+        {
+            "model_state": legacy_state,
+            "model_family": "egostitch_e2e",
+            "model_config": checkpoint_config,
+        },
+        checkpoint_path,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "rev-3\\.1 scaffold change.*FEAT_DIM 9 to 11.*EDGE_TYPES 3 to 4.*"
+            "spec section 14\\.4\\.2.*pre-rev-3\\.1 e2e checkpoints are not loadable.*"
+            "pre-rev-3\\.1 commit"
+        ),
+    ):
+        score_universe._load_checkpoint(checkpoint_path)
+
+
+def test_default_e2e_grounding_cache_path_is_namespaced_by_pool_configuration(
+    tmp_path: Path,
+) -> None:
+    f0_cache = tmp_path / "f0_matrix.pt"
+    full = score_universe._default_grounding_cache_path(f0_cache, n_ground=50)
+    cosine_pool = score_universe._default_grounding_cache_path(f0_cache, n_ground=20)
+    same_pool = score_universe._default_grounding_cache_path(f0_cache, n_ground=50)
+
+    assert full != cosine_pool
+    assert full == same_pool
+    assert "cosine_topk_v1" in full.name
+    assert "n50" in full.name
 
 
 def test_cli_scores_bare_legacy_checkpoint_with_explicit_model_config(tmp_path: Path) -> None:

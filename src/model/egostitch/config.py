@@ -20,14 +20,12 @@ def e2e_checkpoint_config(
     *,
     has_rel_head: bool,
 ) -> dict[str, object]:
-    """Normalize an E2E checkpoint config across the rev-3.1 head addition.
+    """Normalize an E2E checkpoint config across the rev-3.1 head addition only.
 
-    Checkpoints written before rev-3.1 have neither relational-head parameters
-    nor a ``w_rel`` key.  Reconstruct those checkpoints with the head disabled
-    so strict state loading preserves their historical architecture.  During
-    the migration, checkpoints built from a config that omitted the new key can
-    still contain the default head; the state keys disambiguate that case.
-    Explicit checkpoint values are always left unchanged.
+    Checkpoints with the current rev-3.1 scaffold can omit ``w_rel`` while
+    lacking relational-head parameters. Reconstruct those with the head
+    disabled. This does not make the incompatible pre-rev-3.1 scaffold
+    (FEAT_DIM 9 / EDGE_TYPES 3) loadable under rev-3.1 code.
     """
     normalized = dict(mapping)
     normalized.setdefault("w_rel", E2EConfig.w_rel if has_rel_head else 0.0)

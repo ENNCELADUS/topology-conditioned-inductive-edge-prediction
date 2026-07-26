@@ -46,7 +46,7 @@ _BLOCK = 1024
 # Pinned method id (spec Sec 14.4.4): exact top-n_g cosine, no reranker. A
 # future two-stage method gets its own id here rather than colliding with
 # this one.
-_METHOD_ID = "cosine_topk_v1"
+POOL_METHOD_ID = "cosine_topk_v1"
 
 
 def _feature_pack_digest(f0_matrix: NDArray[np.float32], node_ids: Sequence[str]) -> str:
@@ -79,7 +79,7 @@ def _pool_method_hash(
     an encoded absence), the ordered F0/feature-pack digest, and the
     role-universe identity.
     """
-    rows = [f"method\t{_METHOD_ID}\n", f"n_ground\t{n_ground}\n"]
+    rows = [f"method\t{POOL_METHOD_ID}\n", f"n_ground\t{n_ground}\n"]
     if shortlist_m is not None:
         rows.append(f"M\t{shortlist_m}\n")
     rows.append(f"feature_digest\t{feature_digest}\n")

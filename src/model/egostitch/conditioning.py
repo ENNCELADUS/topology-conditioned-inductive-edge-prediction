@@ -103,7 +103,7 @@ class GatedCrossAttention(nn.Module):
         unexpected_keys: list[str],
         error_msgs: list[str],
     ) -> None:
-        """Keep pre-rev-3.1 checkpoints loadable with their uncentered zero mu."""
+        """Fill absent EMA buffers for checkpoints using the current scaffold shape."""
         del local_metadata, strict, missing_keys, unexpected_keys, error_msgs
         assert module is self
         state_dict.setdefault(f"{prefix}ema_mu", self.ema_mu.detach().clone())

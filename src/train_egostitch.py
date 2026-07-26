@@ -3933,9 +3933,10 @@ def _e2e_optimizer_group_lr(
     base_lr: float,
     phase: E2EPhaseState,
     group_name: object,
+    active_groups: set[str],
 ) -> float:
     """Keep repair modules live in Phase A, then preserve the joint-entry ramp."""
-    if group_name == "pair_encoder_head" and not phase.edge_active:
+    if group_name not in active_groups:
         return 0.0
     if group_name == "topology_content_conditioning" and phase.edge_active:
         return base_lr * phase.alpha
@@ -4340,12 +4341,14 @@ def _train_e2e_stability_loop(
                 batch = next(batches)
                 epoch_data_wait += time.monotonic() - fetch_started
                 phase = e2e_phase_state(global_step, schedule_total_steps)
+                active_groups = _e2e_active_groups(phase, model)
                 base_lr = _e2e_base_lr(global_step, schedule_total_steps, training)
                 for group in optimizer.param_groups:
                     group["lr"] = _e2e_optimizer_group_lr(
                         base_lr,
                         phase,
                         group.get("name"),
+                        active_groups,
                     )
                 payload = _e2e_training_payload(
                     batch,
@@ -4368,7 +4371,6 @@ def _train_e2e_stability_loop(
                 if int(bad_ranks.item()) > 0:
                     raise RuntimeError(f"non-finite E2E loss at optimizer step {global_step}")
                 accelerator.backward(loss)
-                active_groups = _e2e_active_groups(phase, model)
                 gathered_squared = _e2e_group_squared_norms(parameter_groups.groups, accelerator)
                 e2e_assert_replicated_squared_norms(gathered_squared)
                 gradient_records = e2e_check_and_clip_gradients(

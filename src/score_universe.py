@@ -65,6 +65,7 @@ from torch import nn
 
 from src.data.artifacts import canonical_pair, load_candidate_pairs
 from src.data.features import FeatureStore, build_f0_matrix
+from src.data.grounding import POOL_METHOD_ID
 from src.data.packed_features import PackedFeatureTable
 from src.data.pairs import (
     BUCKET_BOUNDARIES,
@@ -129,6 +130,18 @@ def _reject_superseded_scaffold_control(scaffold_control: str) -> None:
             "'shuffle_within_pair' is superseded by the rebuild-form control; "
             "see docs/05-egostitch-spec.md §14.4.5"
         )
+
+
+def _default_grounding_cache_path(
+    f0_cache: Path,
+    *,
+    n_ground: int,
+    method_id: str = POOL_METHOD_ID,
+) -> Path:
+    """Namespace a derived grounding cache by its pool method and size."""
+    return f0_cache.with_name(
+        f"{f0_cache.stem}_grounding_{method_id}_n{n_ground}.npz"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1222,6 +1235,18 @@ def _load_checkpoint(
     if model_family == "egostitch_e2e":
         from src.model.egostitch.config import e2e_checkpoint_config
 
+        scaffold_embed = model_state.get("ste.embed.weight")
+        if (
+            isinstance(scaffold_embed, torch.Tensor)
+            and scaffold_embed.ndim == 2
+            and scaffold_embed.shape[1] == 9
+        ):
+            raise ValueError(
+                f"checkpoint {path}: the rev-3.1 scaffold change expanded FEAT_DIM 9 to 11 "
+                "and EDGE_TYPES 3 to 4 (spec section 14.4.2); pre-rev-3.1 e2e checkpoints "
+                "are not loadable under rev-3.1 code and must be scored from a "
+                "pre-rev-3.1 commit"
+            )
         model_config = e2e_checkpoint_config(
             model_config,
             has_rel_head=any(key.startswith("rel_head.") for key in model_state),
@@ -1852,14 +1877,17 @@ def _score_egostitch_e2e(
         )
         matrix, index = build_f0_matrix(store, node_ids, cache_path=None)
 
+    registered_n_ground = model.generator_cfg.n_ground
     if grounding_cache is None:
-        grounding_cache = f0_cache.with_name(f"{f0_cache.stem}_grounding.npz")
+        grounding_cache = _default_grounding_cache_path(
+            f0_cache,
+            n_ground=registered_n_ground,
+        )
     # The e2e generator's own-split n_ground default (spec Sec 13) assumes a
     # real candidate-universe scale (thousands of nodes); clamp to what this
     # call's node set can actually support so tiny fixtures (few endpoints)
     # remain valid `build_grounding_pool` calls without changing production
     # behavior, where len(node_ids) - 1 always exceeds the spec default.
-    registered_n_ground = model.generator_cfg.n_ground
     n_ground = min(registered_n_ground, len(node_ids) - 1)
     if n_ground < registered_n_ground:
         logger.warning(
