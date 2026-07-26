@@ -19,6 +19,43 @@ from src.model.egostitch.model import NodeEncoding
 from src.model.egostitch.scaffold import counterpart_membership, grounded_identity_match
 
 
+class _DirectionalConstantAttention(torch.nn.Module):
+    """Return fixed AB/BA outputs under separate or joint trunk execution."""
+
+    def __init__(self, batch_size: int, ab: float, ba: float) -> None:
+        super().__init__()
+        self.batch_size = batch_size
+        self.ab = ab
+        self.ba = ba
+        self.calls = 0
+
+    def reset(self) -> None:
+        self.calls = 0
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        key_padding_mask: torch.Tensor | None,
+        need_weights: bool,
+    ) -> tuple[torch.Tensor, None]:
+        del key, value, key_padding_mask, need_weights
+        if query.size(0) == 2 * self.batch_size:
+            output = torch.cat(
+                (
+                    torch.full_like(query[: self.batch_size], self.ab),
+                    torch.full_like(query[self.batch_size :], self.ba),
+                )
+            )
+        else:
+            constant = self.ab if self.calls % 2 == 0 else self.ba
+            output = torch.full_like(query, constant)
+        self.calls += 1
+        return output, None
+
+
 def _tiny_model_and_batch(
     *, p_topo: float = 0.15, p_cont: float = 0.15
 ) -> tuple[EgoStitchE2E, dict[str, torch.Tensor]]:
@@ -51,6 +88,100 @@ def _tiny_model_and_batch(
         "ground_id_b": torch.randint(0, 1000, (b, n_ground), dtype=torch.long),
     }
     return model, batch
+
+
+def _topology_injections(
+    model: EgoStitchE2E,
+    context: E2EPairContext,
+    attention: _DirectionalConstantAttention,
+    *,
+    training: bool,
+    edge_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Capture the AB-then-BA residuals emitted by the shared topology layer."""
+    layer = cast(GatedCrossAttention, model.trunk.topo_xattn[0])
+    layer.attn = attention
+    attention.reset()
+    model.eval()
+    layer.train(training)
+    captures: list[torch.Tensor] = []
+
+    def _capture(
+        module: torch.nn.Module,
+        args: tuple[torch.Tensor, ...],
+        output: torch.Tensor,
+    ) -> None:
+        del module
+        captures.append((output - args[0].float()).detach())
+
+    handle = layer.register_forward_hook(_capture)
+    try:
+        model.score_pair_context(
+            context,
+            masks=masks_for_null(
+                NULL_CONTENT_HEAD,
+                context.encoded_a.size(0),
+                context.encoded_a.device,
+            ),
+            edge_mask=edge_mask,
+        )
+    finally:
+        handle.remove()
+    return torch.cat(captures)
+
+
+def test_shared_direction_centering_matches_training_and_evaluation() -> None:
+    """A shared AB∪BA mean removes the old evaluation-only calibration offset."""
+    model, batch = _tiny_model_and_batch()
+    context = model.build_pair_context(batch)
+    attention = _DirectionalConstantAttention(batch_size=4, ab=1.0, ba=3.0)
+    layer = cast(GatedCrossAttention, model.trunk.topo_xattn[0])
+    with torch.no_grad():
+        layer.gate.fill_(0.7)
+
+    training = _topology_injections(model, context, attention, training=True)
+    evaluation = _topology_injections(model, context, attention, training=False)
+
+    assert bool(torch.count_nonzero(training[:4]))
+    assert bool(torch.count_nonzero(training[4:]))
+    assert torch.equal(evaluation, training)
+
+
+def test_globally_constant_direction_pathway_is_zero_in_train_and_eval() -> None:
+    """A constant shared calibration knob contributes exactly no residual."""
+    model, batch = _tiny_model_and_batch()
+    context = model.build_pair_context(batch)
+    attention = _DirectionalConstantAttention(batch_size=4, ab=2.0, ba=2.0)
+    layer = cast(GatedCrossAttention, model.trunk.topo_xattn[0])
+    with torch.no_grad():
+        layer.gate.fill_(0.7)
+
+    training = _topology_injections(model, context, attention, training=True)
+    evaluation = _topology_injections(model, context, attention, training=False)
+
+    assert torch.equal(training, torch.zeros_like(training))
+    assert torch.equal(evaluation, torch.zeros_like(evaluation))
+    assert int(layer.ema_updates.item()) == 1
+
+
+def test_symmetric_trunk_updates_one_shared_ema_once_per_step() -> None:
+    """Every conditioning layer consumes one AB∪BA statistic per model step."""
+    model, batch = _tiny_model_and_batch()
+    context = model.build_pair_context(batch)
+    edge_mask = torch.tensor([True, True, False, False])
+    layers = (
+        cast(GatedCrossAttention, model.trunk.topo_xattn[0]),
+        cast(GatedCrossAttention, model.trunk.cont_xattn[0]),
+    )
+    for layer in layers:
+        layer.attn = _DirectionalConstantAttention(batch_size=4, ab=1.0, ba=3.0)
+
+    model.train()
+    model.score_pair_context(context, edge_mask=edge_mask)
+
+    for layer in layers:
+        assert int(layer.ema_updates.item()) == 1
+        assert torch.equal(layer.ema_mu, torch.full_like(layer.ema_mu, 2.0))
 
 
 def test_pair_symmetry_all_conditions() -> None:

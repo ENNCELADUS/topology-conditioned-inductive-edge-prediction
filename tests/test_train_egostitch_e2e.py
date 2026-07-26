@@ -29,6 +29,7 @@ from src.data.packed_features import (
 )
 from src.data.pairs import NegativeSampler
 from src.model.egostitch import EgoStitchConfig
+from src.model.egostitch import e2e_model as e2e_module
 from src.model.egostitch.conditioning import GatedCrossAttention, HeadNullMasks
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.e2e_model import E2EPairContext, EgoStitchE2E
@@ -509,25 +510,117 @@ class TestE2ECompositeStep:
         # `Accelerator` wrapping it.
         return torch.autocast(device_type="cpu", dtype=torch.bfloat16)
 
-    def test_loss_finite_and_gates_dead_during_warmstart(self, tmp_path: Path) -> None:
+    def test_warmstart_preserves_relational_losses_and_gradients(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         torch.manual_seed(0)
         batch, model = self._batch_and_model(tmp_path)
+        teacher_row = int(
+            torch.nonzero(
+                batch.edge["edge_mask"].bool() & ~batch.edge["is_self"],
+                as_tuple=False,
+            )[0].item()
+        )
+        batch.edge["label"][teacher_row] = 1.0
         composite = te._CompositeStep(model, world_size=1)
-        topo_gate, cont_gate = self._gates(model)
+        captured_log_plans: list[torch.Tensor] = []
+        captured_teacher_cells: list[torch.Tensor] = []
+        original_sinkhorn = e2e_module.sinkhorn_log_plan
+        original_teacher_cells = e2e_module.alignment_teacher_cells
+
+        def _retaining_sinkhorn(*args: object, **kwargs: object) -> torch.Tensor:
+            log_plan = original_sinkhorn(*args, **kwargs)
+            log_plan.retain_grad()
+            captured_log_plans.append(log_plan)
+            return log_plan
+
+        def _teacher_bearing_cells(*args: object, **kwargs: object) -> torch.Tensor:
+            cells = original_teacher_cells(*args, **kwargs).clone()
+            cells[teacher_row] = True
+            captured_teacher_cells.append(cells)
+            return cells
+
+        monkeypatch.setattr(e2e_module, "sinkhorn_log_plan", _retaining_sinkhorn)
+        monkeypatch.setattr(
+            e2e_module, "alignment_teacher_cells", _teacher_bearing_cells
+        )
 
         with self._bf16_autocast():
             out = composite(self._payload(batch, joint_weight=0.0))
         loss = cast(torch.Tensor, out["loss"])
+        parts = cast(dict[str, float], out["parts"])
         assert bool(torch.isfinite(loss))
-        assert cast(dict[str, float], out["parts"])["edge"] == 0.0
+        assert captured_teacher_cells
+        assert bool(captured_teacher_cells[0][teacher_row, 0, 0])
+        assert parts["edge"] == 0.0
+        assert parts["recon_align"] > 0.0
+        assert parts["recon_rel"] > 0.0
         loss.backward()  # type: ignore[no-untyped-call]
 
-        # joint_weight=0 zeros L_edge (and therefore trunk/STE/gates) during
-        # warm-start; the gate either never enters the graph (None) or enters
-        # multiplied by an exact zero (design Sec 4, spec Sec 13.8's reused
-        # curriculum).
-        for gate in (topo_gate.gate, cont_gate.gate):
-            assert gate.grad is None or float(gate.grad) == pytest.approx(0.0)
+        ste_gradients = [
+            parameter.grad
+            for parameter in model.ste.parameters()
+            if parameter.requires_grad
+        ]
+        assert ste_gradients
+        assert all(gradient is not None for gradient in ste_gradients)
+        assert any(
+            bool(torch.count_nonzero(cast(torch.Tensor, gradient)))
+            for gradient in ste_gradients
+        )
+        assert captured_log_plans
+        assert all(log_plan.grad is not None for log_plan in captured_log_plans)
+        assert any(
+            bool(torch.count_nonzero(cast(torch.Tensor, log_plan.grad)))
+            for log_plan in captured_log_plans
+        )
+        missing_from_graph = [
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad and parameter.grad is None
+        ]
+        assert missing_from_graph == []
+        parameter_groups = te.build_e2e_parameter_groups(model)
+        optimizer = torch.optim.AdamW(
+            [
+                {
+                    "params": parameter_groups.groups[name],
+                    "lr": te._e2e_optimizer_group_lr(
+                        1e-3,
+                        te.E2EPhaseState("A", 0.0, False, 0.0),
+                        name,
+                    ),
+                }
+                for name in parameter_groups.groups
+            ],
+            weight_decay=0.01,
+        )
+        ste_before = [parameter.detach().clone() for parameter in model.ste.parameters()]
+        assert model.rel_head is not None
+        rel_before = [
+            parameter.detach().clone() for parameter in model.rel_head.parameters()
+        ]
+        pair_before = [
+            parameter.detach().clone()
+            for parameter in parameter_groups.groups["pair_encoder_head"]
+        ]
+        optimizer.step()
+        assert any(
+            not torch.equal(before, after)
+            for before, after in zip(ste_before, model.ste.parameters(), strict=True)
+        )
+        assert any(
+            not torch.equal(before, after)
+            for before, after in zip(rel_before, model.rel_head.parameters(), strict=True)
+        )
+        assert all(
+            torch.equal(before, after)
+            for before, after in zip(
+                pair_before,
+                parameter_groups.groups["pair_encoder_head"],
+                strict=True,
+            )
+        )
 
     def test_gates_receive_gradient_after_warmstart(self, tmp_path: Path) -> None:
         torch.manual_seed(0)
@@ -650,7 +743,8 @@ class TestE2ECompositeStep:
 
         assert family_norms["pair_encoder_head"] == {}
         assert set(family_norms["generator"]) == {"recon"}
-        assert family_norms["topology_content_conditioning"] == {}
+        assert set(family_norms["topology_content_conditioning"]) == {"recon"}
+        assert family_norms["topology_content_conditioning"]["recon"] > 0.0
         assert submodule_rms == {}
         assert payload["collect_diagnostics"] is False
 

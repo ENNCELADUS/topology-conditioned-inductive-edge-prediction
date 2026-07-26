@@ -542,7 +542,10 @@ def test_e2e_lr_and_active_groups_follow_registered_phase_contract() -> None:
     phase_a = te.E2EPhaseState("A", 0.0, False, 0.0)
     first_edge = te.e2e_phase_state(400, 2000)
     phase_c = te.E2EPhaseState("C", 1.0, True, 1.0)
-    assert te._e2e_active_groups(phase_a, "full") == {"generator"}
+    assert te._e2e_active_groups(phase_a, "full") == {
+        "generator",
+        "topology_content_conditioning",
+    }
     assert te._e2e_active_groups(first_edge, "full") == {
         "pair_encoder_head",
         "generator",
@@ -556,7 +559,16 @@ def test_e2e_lr_and_active_groups_follow_registered_phase_contract() -> None:
     assert te._e2e_active_groups(phase_c, "b0_e2e_f_only") == {
         "pair_encoder_head",
         "generator",
+        "topology_content_conditioning",
     }
+    assert te._e2e_optimizer_group_lr(1e-4, phase_a, "topology_content_conditioning") == (
+        1e-4
+    )
+    assert te._e2e_optimizer_group_lr(
+        1e-4, first_edge, "topology_content_conditioning"
+    ) == pytest.approx(1e-4 * first_edge.alpha)
+    assert te._e2e_optimizer_group_lr(1e-4, phase_a, "pair_encoder_head") == 0.0
+    assert te._e2e_optimizer_group_lr(1e-4, first_edge, "pair_encoder_head") == 1e-4
 
 
 def test_qualification_profile_requires_registered_guard_margins(tmp_path: Path) -> None:

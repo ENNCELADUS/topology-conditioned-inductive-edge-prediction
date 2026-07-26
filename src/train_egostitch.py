@@ -108,18 +108,31 @@ _PACK_VALIDATION_GROUNDING_FILENAME = "grounding_validation.npz"
 _PACK_MANIFEST_FILENAME = "manifest.json"
 
 
-def _egostitch_ddp_kwargs() -> DistributedDataParallelKwargs:
+def _egostitch_ddp_kwargs(
+    *, find_unused_parameters: bool = True
+) -> DistributedDataParallelKwargs:
     """Return DDP settings for EgoStitch's conditionally unused heads."""
     return DistributedDataParallelKwargs(
         broadcast_buffers=False,
-        find_unused_parameters=True,
+        find_unused_parameters=find_unused_parameters,
         gradient_as_bucket_view=True,
     )
 
 
-def build_egostitch_ddp_accelerator(mixed_precision: str) -> Accelerator:
+def build_egostitch_ddp_accelerator(
+    mixed_precision: str,
+    *,
+    find_unused_parameters: bool = True,
+) -> Accelerator:
     """Build the EgoStitch distributed accelerator."""
-    return Accelerator(mixed_precision=mixed_precision, kwargs_handlers=[_egostitch_ddp_kwargs()])
+    return Accelerator(
+        mixed_precision=mixed_precision,
+        kwargs_handlers=[
+            _egostitch_ddp_kwargs(
+                find_unused_parameters=find_unused_parameters
+            )
+        ],
+    )
 
 
 # Frozen audited B0 checkpoint providing s0 (spec Sec 13.10); overridable in
@@ -2897,23 +2910,20 @@ class _BatchFactory:
 class _CompositeStep(torch.nn.Module):
     """One-forward composite step so DDP sees a single forward per backward.
 
-    The warm-start curriculum (spec Sec 13.8) is applied as a 0/1 weight on the
-    non-``L_recon`` families: every stream still runs (constant step shape for
-    the projection gate; all parameters stay in the autograd graph, as required
-    by ``find_unused_parameters=False``), but only ``L_recon`` (+ degree NLL)
-    carries gradient during warm-start.
+    The warm-start curriculum keeps every stream running with a constant
+    autograd shape but suppresses ``L_edge``, ``L_real``, and ``L_ssl``.
+    ``L_recon`` remains fully active, including the rev-3.1 ``L_align`` and
+    ``L_rel`` edge-stream components.
 
     Family `egostitch_e2e` (design rev 3, spec Sec 14): ``model`` is an
     `EgoStitchE2E` instead of a frozen-s0 `EgoStitchStage1`. The node stream
     (``L_recon``/``L_real``/``L_ssl``) is delegated to the internal, still
     trainable `EgoStitchE2E.generator`, unchanged from Stage 1. The edge stream
-    (``L_edge``) instead runs the full `EgoStitchE2E.forward` under per-step
-    seeded branch-dropout masks (`sample_branch_masks`, design Sec 4): the
-    curriculum reuses the exact same ``joint_weight`` 0/1 gate on the ``edge``
-    family, so the trunk/STE/gated cross-attention pathways -- which receive
-    gradient *only* through ``L_edge`` -- train exactly when the pairwise
-    trunk does (design Sec 4's stated intent), with zero gradient during
-    warm-start.
+    runs the full `EgoStitchE2E.forward` under per-step seeded branch-dropout
+    masks (`sample_branch_masks`, design Sec 4). During warm-start the
+    zero-anchored logits retain the pair trunk and conditioning pathways in the
+    graph, while ``L_align`` and ``L_rel`` train the plan, STE, and relational
+    head as reconstruction terms.
     """
 
     kendall_active: torch.Tensor
@@ -3053,22 +3063,15 @@ class _CompositeStep(torch.nn.Module):
                     ),
                 }
             )
-            if edge_active:
-                edge_output = self.model(edge_view, masks=branch_masks)
-                logits = edge_output["logits"]
-                losses = losses._replace(
-                    recon={
-                        **losses.recon,
-                        "align": edge_output["align_loss"],
-                        "rel": edge_output["rel_loss"],
-                    }
-                )
-            else:
-                logits = edge["label"].new_zeros(edge["label"].shape)
-                zero = losses.recon["feat"] * 0.0
-                losses = losses._replace(
-                    recon={**losses.recon, "align": zero, "rel": zero}
-                )
+            edge_output = self.model(edge_view, masks=branch_masks)
+            logits = edge_output["logits"]
+            losses = losses._replace(
+                recon={
+                    **losses.recon,
+                    "align": edge_output["align_loss"],
+                    "rel": edge_output["rel_loss"],
+                }
+            )
             if collect_diagnostics:
                 extra.update(_e2e_gate_tanh(self.model))
         else:
@@ -3090,7 +3093,7 @@ class _CompositeStep(torch.nn.Module):
                     world_size=self.world_size,
                 )
                 if edge_active
-                else losses.recon["feat"] * 0.0
+                else logits.sum() * 0.0
             )
         else:
             per_row = torch.nn.functional.binary_cross_entropy_with_logits(
@@ -3168,6 +3171,19 @@ class _CompositeStep(torch.nn.Module):
                 batch.get("recon_factors") if isinstance(self.model, EgoStitchE2E) else None,
             ),
         )
+        if isinstance(self.model, EgoStitchE2E):
+            parameter_anchor = 0.0 * torch.stack(
+                tuple(
+                    parameter.sum()
+                    for parameter in self.model.parameters()
+                    if parameter.requires_grad
+                )
+            ).sum()
+            total = total + parameter_anchor
+            families = {
+                name: family + parameter_anchor
+                for name, family in families.items()
+            }
         if isinstance(self.model, EgoStitchE2E):
             pass
         elif bool(self.kendall_active):
@@ -3850,12 +3866,24 @@ def _e2e_base_lr(step: int, total_steps: int, config: EgoStitchTrainingConfig) -
 
 
 def _e2e_active_groups(phase: E2EPhaseState, arm: E2EArmName) -> set[str]:
-    groups = {"generator"}
+    del arm
+    groups = {"generator", "topology_content_conditioning"}
     if phase.edge_active:
         groups.add("pair_encoder_head")
-    if phase.edge_active and arm != "b0_e2e_f_only":
-        groups.add("topology_content_conditioning")
     return groups
+
+
+def _e2e_optimizer_group_lr(
+    base_lr: float,
+    phase: E2EPhaseState,
+    group_name: object,
+) -> float:
+    """Keep repair modules live in Phase A, then preserve the joint-entry ramp."""
+    if group_name == "pair_encoder_head" and not phase.edge_active:
+        return 0.0
+    if group_name == "topology_content_conditioning" and phase.edge_active:
+        return base_lr * phase.alpha
+    return base_lr
 
 
 def _e2e_training_payload(
@@ -3944,7 +3972,7 @@ def _e2e_family_probe(
     expected: dict[str, set[str]] = {
         "pair_encoder_head": {"edge"} if phase.edge_active else set(),
         "generator": {"recon"} | ({"real", "ssl"} if phase.real_ssl_scale > 0.0 else set()),
-        "topology_content_conditioning": set(),
+        "topology_content_conditioning": {"recon"},
     }
     if phase.edge_active and arm != "b0_e2e_f_only":
         expected["generator"].add("edge")
@@ -4258,10 +4286,10 @@ def _train_e2e_stability_loop(
                 phase = e2e_phase_state(global_step, schedule_total_steps)
                 base_lr = _e2e_base_lr(global_step, schedule_total_steps, training)
                 for group in optimizer.param_groups:
-                    group["lr"] = (
-                        base_lr * phase.alpha
-                        if group.get("name") == "topology_content_conditioning"
-                        else base_lr
+                    group["lr"] = _e2e_optimizer_group_lr(
+                        base_lr,
+                        phase,
+                        group.get("name"),
                     )
                 payload = _e2e_training_payload(
                     batch,
@@ -5654,7 +5682,10 @@ def _run_ddp_worker(
     if cfg.training is not None and (cfg.run_kind or "formal") == "formal":
         formal_binding = _validate_e2e_formal_binding(cfg, preregistration, args.config)
 
-    accelerator = build_egostitch_ddp_accelerator(cfg.mixed_precision)
+    accelerator = build_egostitch_ddp_accelerator(
+        cfg.mixed_precision,
+        find_unused_parameters=cfg.model.family != "egostitch_e2e",
+    )
     set_seed(cfg.seed)
     logger.info(
         "egostitch ddp worker mode=%s rank=%d/%d device=%s",

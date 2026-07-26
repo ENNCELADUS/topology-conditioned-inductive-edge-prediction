@@ -59,8 +59,12 @@ class GatedCrossAttention(nn.Module):
     """Centered tanh-gated cross-attention residual sublayer (spec §14.4.2).
 
     ``cls <- cls + active * tanh(gate) * (XAttn(...) - mu)``. Training ``mu`` is
-    the synchronized mean over active, real rows; evaluation uses its frozen
-    checkpointed EMA. Inactive rows retain the checkpoint-exact identity bypass.
+    the synchronized mean over active, real rows from the joint AB/BA batch;
+    evaluation uses its frozen checkpointed EMA. With one shared ``mu``, an
+    individual direction may inject a nonzero residual when the AB and BA means
+    differ. Training and evaluation nevertheless agree, and a pathway constant
+    across both directions contributes exactly nothing. Inactive rows retain the
+    checkpoint-exact identity bypass.
     """
 
     ema_mu: torch.Tensor

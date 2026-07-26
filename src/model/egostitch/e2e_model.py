@@ -457,7 +457,12 @@ class EgoStitchE2E(nn.Module):
         masks: HeadNullMasks | None = None,
         edge_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Evaluate one hard-bypass head from a shared pair context."""
+        """Evaluate one hard-bypass head from a shared pair context.
+
+        AB and BA are one trunk batch so every conditioning layer centers both
+        directions with one synchronized statistic and updates its single EMA
+        exactly once.
+        """
         batch_size = context.encoded_a.size(0)
         device = context.encoded_a.device
         if masks is None:
@@ -469,28 +474,35 @@ class EgoStitchE2E(nn.Module):
             raise ValueError("pair context does not contain topology tokens")
         if need_cont and context.cont is None:
             raise ValueError("pair context does not contain content tokens")
-        feat_ab = self.trunk(
+        topo_tokens = None
+        if need_topo:
+            assert context.topo_ab is not None and context.topo_ba is not None
+            topo_tokens = torch.cat((context.topo_ab, context.topo_ba))
+        cont_tokens = None
+        if need_cont:
+            assert context.cont is not None
+            cont_tokens = torch.cat((context.cont, context.cont))
+        max_tokens = max(context.encoded_a.size(1), context.encoded_b.size(1))
+        encoded_a = F.pad(
             context.encoded_a,
-            context.encoded_b,
-            context.len_a,
-            context.len_b,
-            topo_tokens=context.topo_ab if need_topo else None,
-            cont_tokens=context.cont if need_cont else None,
-            topo_active=masks.topo if need_topo else None,
-            cont_active=masks.cont if need_cont else None,
-            edge_mask=edge_mask,
+            (0, 0, 0, max_tokens - context.encoded_a.size(1)),
         )
-        feat_ba = self.trunk(
+        encoded_b = F.pad(
             context.encoded_b,
-            context.encoded_a,
-            context.len_b,
-            context.len_a,
-            topo_tokens=context.topo_ba if need_topo else None,
-            cont_tokens=context.cont if need_cont else None,
-            topo_active=masks.topo if need_topo else None,
-            cont_active=masks.cont if need_cont else None,
-            edge_mask=edge_mask,
+            (0, 0, 0, max_tokens - context.encoded_b.size(1)),
         )
+        pair_features = self.trunk(
+            torch.cat((encoded_a, encoded_b)),
+            torch.cat((encoded_b, encoded_a)),
+            torch.cat((context.len_a, context.len_b)),
+            torch.cat((context.len_b, context.len_a)),
+            topo_tokens=topo_tokens,
+            cont_tokens=cont_tokens,
+            topo_active=torch.cat((masks.topo, masks.topo)) if need_topo else None,
+            cont_active=torch.cat((masks.cont, masks.cont)) if need_cont else None,
+            edge_mask=torch.cat((edge_mask, edge_mask)) if edge_mask is not None else None,
+        )
+        feat_ab, feat_ba = pair_features.chunk(2)
         feat = torch.max(torch.stack([feat_ab, feat_ba], dim=-1), dim=-1).values
         # The registered mixed-precision contract keeps logits in fp32. Casting
         # after the head is too late: autocast has already quantized the linear

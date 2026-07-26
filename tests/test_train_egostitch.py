@@ -133,6 +133,10 @@ def test_ddp_accelerator_detects_conditionally_unused_parameters() -> None:
     assert handler.broadcast_buffers is False
     assert handler.find_unused_parameters is True
     assert handler.gradient_as_bucket_view is True
+    assert (
+        te._egostitch_ddp_kwargs(find_unused_parameters=False).find_unused_parameters
+        is False
+    )
 
 
 @pytest.mark.parametrize(
