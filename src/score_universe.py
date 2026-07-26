@@ -973,27 +973,96 @@ def _contains_required_marker(value: object) -> bool:
     return False
 
 
-def _validate_digest_section(value: object, *, label: str) -> None:
-    """Require a non-empty structured evidence section with valid SHA-256 fields."""
+def _validate_digest_section(
+    value: object, *, label: str, registration_path: Path
+) -> None:
+    """Resolve and hash every path-bound artifact in one binding-evidence section."""
     if not isinstance(value, (Mapping, list)) or not value:
         raise ValueError(f"binding_evidence.{label} must be a non-empty object or list")
     digests: list[object] = []
+    artifacts: list[tuple[str, object, object]] = []
 
-    def collect(item: object) -> None:
+    def collect(item: object, *, entry: str) -> None:
         if isinstance(item, Mapping):
+            if "path" in item:
+                artifacts.append((entry, item.get("path"), item.get("sha256")))
             for key, nested in item.items():
                 if str(key).endswith("sha256"):
                     digests.append(nested)
-                collect(nested)
+                collect(nested, entry=f"{entry}.{key}")
         elif isinstance(item, list):
-            for nested in item:
-                collect(nested)
+            for index, nested in enumerate(item):
+                collect(nested, entry=f"{entry}[{index}]")
 
-    collect(value)
+    collect(value, entry=f"binding_evidence.{label}")
     if not digests:
         raise ValueError(f"binding_evidence.{label} must contain a SHA-256 digest")
     if any(not _is_sha256(digest) for digest in digests):
         raise ValueError(f"binding_evidence.{label} contains a non-64-hex SHA-256 digest")
+    if not artifacts:
+        raise ValueError(f"binding_evidence.{label} must contain path-bound SHA-256 evidence")
+
+    for entry, path_value, expected_value in artifacts:
+        if not _is_sha256(expected_value):
+            raise ValueError(f"{entry} must pair path with a 64-hex SHA-256 digest")
+        expected = cast(str, expected_value)
+        path = _registered_path(
+            registration_path,
+            path_value,
+            key=f"{entry}.path",
+            scope="binding evidence validation before held-out scoring",
+        )
+        if not path.is_file():
+            raise ValueError(
+                f"{entry} digest verification failed: path={path}, "
+                f"expected={expected}, found=<missing>"
+            )
+        try:
+            found = _file_sha256(path)
+        except OSError as error:
+            raise ValueError(
+                f"{entry} digest verification failed: path={path}, "
+                f"expected={expected}, found=<unreadable: {error}>"
+            ) from error
+        if found != expected:
+            raise ValueError(
+                f"{entry} digest verification failed: path={path}, "
+                f"expected={expected}, found={found}"
+            )
+
+
+def _validate_binding_artifact_digests(
+    evidence: Mapping[str, object], *, registration_path: Path
+) -> None:
+    """Hash the complete path-bound binding package before held-out pair access."""
+    for section in (
+        "configs",
+        "parameter_group_manifests",
+        "packs_and_validation_manifests",
+        "qualification_attempts",
+        "boundary_access_audit",
+        "runtime_and_peak_memory",
+    ):
+        _validate_digest_section(
+            evidence.get(section), label=section, registration_path=registration_path
+        )
+
+
+def _preflight_binding_artifacts_before_pair_access(registration_path: Path) -> None:
+    """Fail closed on binding artifacts without opening a candidate/test pair source."""
+    registration = _load_json_object(registration_path, label="registration")
+    if registration.get("status") != "BINDING":
+        raise ValueError("egostitch_e2e candidate/test scoring requires status 'BINDING'")
+    if _contains_required_marker(registration):
+        raise ValueError("BINDING registration still contains REQUIRED-BEFORE-BINDING markers")
+    evidence = registration.get("binding_evidence")
+    if not isinstance(evidence, dict):
+        raise ValueError("registration binding_evidence must be an object")
+    if evidence.get("schema_version") != _EGOSTITCH_E2E_BINDING_SCHEMA:
+        raise ValueError(
+            f"binding_evidence.schema_version must be {_EGOSTITCH_E2E_BINDING_SCHEMA!r}"
+        )
+    _validate_binding_artifact_digests(evidence, registration_path=registration_path)
 
 
 def _load_json_object(path: Path, *, label: str) -> dict[str, object]:
@@ -1013,6 +1082,7 @@ def _validate_e2e_scoring_provenance(
     run_metadata_path: Path,
     checkpoint_path: Path,
     checkpoint_id: str,
+    validate_binding_artifacts: bool = True,
 ) -> dict[str, object]:
     """Validate the E2E formal-run provenance required before held-out scoring.
 
@@ -1081,16 +1151,8 @@ def _validate_e2e_scoring_provenance(
             raise ValueError(
                 f"registration arms.{control_arm} must be a scoring_time_control over full"
             )
-    for section in (
-        "parameter_group_manifests",
-        "packs_and_validation_manifests",
-        "qualification_attempts",
-        "boundary_access_audit",
-    ):
-        _validate_digest_section(evidence.get(section), label=section)
-    runtime = evidence.get("runtime_and_peak_memory")
-    if not isinstance(runtime, dict) or not runtime:
-        raise ValueError("binding_evidence.runtime_and_peak_memory must be a non-empty object")
+    if validate_binding_artifacts:
+        _validate_binding_artifact_digests(evidence, registration_path=registration_path)
     policy_version = evidence.get("checkpoint_policy_version")
     if not isinstance(policy_version, str) or not policy_version:
         raise ValueError("binding_evidence.checkpoint_policy_version must be a non-empty string")
@@ -2264,6 +2326,18 @@ def _run_score(args: argparse.Namespace) -> None:
         model_family=args.model_family,
         model_config=model_config,
     )
+    binding_artifacts_validated = False
+    potentially_heldout_e2e = model_family == "egostitch_e2e" and (
+        args.pairs in {"candidate", "test"} or args.pairs.startswith("file:")
+    )
+    if potentially_heldout_e2e:
+        if args.preregistration is None:
+            raise ValueError(
+                "egostitch_e2e candidate/test or file scoring requires --preregistration "
+                "before pair access"
+            )
+        _preflight_binding_artifacts_before_pair_access(args.preregistration)
+        binding_artifacts_validated = True
     heldout_e2e = model_family == "egostitch_e2e" and _is_heldout_pair_source(
         args.pairs, args.data_root, args.strategy
     )
@@ -2285,6 +2359,7 @@ def _run_score(args: argparse.Namespace) -> None:
                 run_metadata_path=args.run_metadata,
                 checkpoint_path=args.checkpoint,
                 checkpoint_id=checkpoint_id,
+                validate_binding_artifacts=not binding_artifacts_validated,
             )
         arm_paths: dict[str, Path] = {}
         for item in args.arm_run_metadata:
@@ -2325,6 +2400,7 @@ def _run_score(args: argparse.Namespace) -> None:
                 run_metadata_path=metadata_path,
                 checkpoint_path=arm_checkpoint_path,
                 checkpoint_id=arm_checkpoint_id,
+                validate_binding_artifacts=not binding_artifacts_validated,
             )
         matching_arms = [
             arm

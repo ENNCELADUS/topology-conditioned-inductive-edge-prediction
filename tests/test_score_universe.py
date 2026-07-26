@@ -1177,6 +1177,30 @@ def _egostitch_e2e_setup(
 def _egostitch_e2e_score_args(
     tmp_path: Path, data_root: Path, checkpoint: Path, pairs: Path, output: Path
 ) -> list[str]:
+    evidence_artifact = tmp_path / "synthetic-file-score-evidence.json"
+    evidence_artifact.write_text('{"scope": "synthetic-nonheldout"}\n', encoding="utf-8")
+    evidence_record = {
+        "path": str(evidence_artifact),
+        "sha256": score_universe._file_sha256(evidence_artifact),
+    }
+    preregistration = tmp_path / "synthetic-file-score-preregistration.json"
+    preregistration.write_text(
+        json.dumps(
+            {
+                "status": "BINDING",
+                "binding_evidence": {
+                    "schema_version": "egostitch_e2e_binding_evidence_v1",
+                    "configs": {"synthetic": evidence_record},
+                    "parameter_group_manifests": evidence_record,
+                    "packs_and_validation_manifests": evidence_record,
+                    "qualification_attempts": evidence_record,
+                    "boundary_access_audit": evidence_record,
+                    "runtime_and_peak_memory": evidence_record,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     return [
         "score",
         "--checkpoint",
@@ -1187,6 +1211,8 @@ def _egostitch_e2e_score_args(
         str(data_root),
         "--output",
         str(output),
+        "--preregistration",
+        str(preregistration),
         "--token-budget",
         "8192",
         "--f0-cache",
