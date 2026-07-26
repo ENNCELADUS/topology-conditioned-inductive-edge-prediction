@@ -928,9 +928,19 @@ def _file_sha256(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def _registered_path(registration_path: Path, value: object) -> Path:
+def _registered_path(
+    registration_path: Path,
+    value: object,
+    *,
+    key: str,
+    scope: str,
+) -> Path:
     """Resolve a repository-relative path stored in a registration."""
-    path = Path(str(value))
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            f"registration key {key!r} must be a non-empty path for scope {scope!r}"
+        )
+    path = Path(value)
     if path.is_absolute():
         return path
     try:
@@ -1123,7 +1133,12 @@ def _validate_e2e_scoring_provenance(
     config_sha256 = config_evidence.get("sha256")
     if not _is_sha256(config_sha256):
         raise ValueError(f"binding_evidence config SHA-256 for {arm_name} is not 64-hex")
-    config_path = _registered_path(registration_path, registered_training)
+    config_path = _registered_path(
+        registration_path,
+        registered_training,
+        key=f"arms.{arm_name}.training",
+        scope="formal scoring provenance",
+    )
     if not config_path.is_file() or _file_sha256(config_path) != config_sha256:
         raise ValueError(f"registered config digest mismatch for {arm_name}: {config_path}")
     metadata_config_path = metadata.get("config_path")

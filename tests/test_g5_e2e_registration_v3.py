@@ -128,6 +128,121 @@ def test_v3_registration_formal_probe_path_is_producer_accepted(
         )
 
 
+@pytest.mark.parametrize(
+    ("include_expected_path", "expected_path"),
+    [
+        pytest.param(False, None, id="absent"),
+        pytest.param(True, None, id="null"),
+        pytest.param(True, "", id="empty"),
+    ],
+)
+def test_probe_producer_rejects_missing_expected_path(
+    tmp_path: Path,
+    include_expected_path: bool,
+    expected_path: object,
+) -> None:
+    probe_artifact: dict[str, object] = {
+        "format": "egostitch_e2e_probe_v2",
+        "source_arm": "full",
+    }
+    if include_expected_path:
+        probe_artifact["expected_path"] = expected_path
+    registration_path = tmp_path / "docs/registrations/registration.json"
+    registration_path.parent.mkdir(parents=True)
+    registration_path.write_text(
+        json.dumps(
+            {
+                "status": "BINDING",
+                "probe_artifact": probe_artifact,
+                "arms": {"full": {"training": str(tmp_path / "full.yaml")}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    metadata_path = tmp_path / "run_metadata.json"
+    metadata_path.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match=r"probe_artifact\.expected_path.*formal_train",
+    ):
+        probes.produce_e2e_probe_artifact(
+            checkpoint_path=tmp_path / "best.pt",
+            run_metadata_path=metadata_path,
+            preregistration_path=registration_path,
+            data_root=tmp_path / "data",
+            strategy="breadth_first",
+            output_path=tmp_path / "probe.npz",
+            scope="formal_train",
+        )
+
+
+@pytest.mark.parametrize("registered_training", [None, "", " "])
+def test_probe_producer_rejects_invalid_registered_training(
+    tmp_path: Path,
+    registered_training: object,
+) -> None:
+    registration_path = tmp_path / "docs/registrations/registration.json"
+    registration_path.parent.mkdir(parents=True)
+    registration_path.write_text(
+        json.dumps(
+            {
+                "status": "BINDING",
+                "probe_artifact": {
+                    "format": "egostitch_e2e_probe_v2",
+                    "source_arm": "full",
+                    "expected_path": str(tmp_path / "probe.npz"),
+                },
+                "arms": {"full": {"training": registered_training}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    metadata_path = tmp_path / "run_metadata.json"
+    metadata_path.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match=r"arms\.full\.training.*formal_train",
+    ):
+        probes.produce_e2e_probe_artifact(
+            checkpoint_path=tmp_path / "best.pt",
+            run_metadata_path=metadata_path,
+            preregistration_path=registration_path,
+            data_root=tmp_path / "data",
+            strategy="breadth_first",
+            output_path=tmp_path / "probe.npz",
+            scope="formal_train",
+        )
+
+
+@pytest.mark.parametrize("value", [None, "", " "])
+def test_shared_registration_path_resolvers_reject_invalid_values(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    with pytest.raises(
+        g5_stage1.PreregistrationMismatch,
+        match=r"probe_artifact\.expected_path.*E2E probe evaluation",
+    ):
+        g5_stage1._registered_path(
+            tmp_path / "registration.json",
+            value,
+            key="probe_artifact.expected_path",
+            scope="E2E probe evaluation",
+        )
+    with pytest.raises(
+        ValueError,
+        match=r"arms\.full\.training.*formal scoring provenance",
+    ):
+        score_universe._registered_path(
+            tmp_path / "registration.json",
+            value,
+            key="arms.full.training",
+            scope="formal scoring provenance",
+        )
+
+
 def test_v3_registration_freezes_rev31_contract() -> None:
     registration = _registration()
     arms = registration["arms"]

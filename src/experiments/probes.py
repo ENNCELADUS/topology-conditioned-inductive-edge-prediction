@@ -770,12 +770,22 @@ def produce_e2e_probe_artifact(
     if not isinstance(arms, Mapping):
         raise ValueError("preregistration does not define formal arms")
     full_arm = arms.get("full")
-    if not isinstance(full_arm, Mapping) or not isinstance(full_arm.get("training"), str):
-        raise ValueError("preregistration does not bind arms.full.training")
-    registered_config = Path(cast(str, full_arm["training"]))
+    registered_training = full_arm.get("training") if isinstance(full_arm, Mapping) else None
+    if not isinstance(registered_training, str) or not registered_training.strip():
+        raise ValueError(
+            f"registration key 'arms.full.training' must be a non-empty path "
+            f"for probe scope {scope!r}"
+        )
+    registered_config = Path(registered_training)
     if not registered_config.is_absolute():
         registered_config = preregistration_path.resolve().parents[2] / registered_config
-    expected_output = Path(str(probe_registration.get("expected_path")))
+    registered_output = probe_registration.get("expected_path")
+    if not isinstance(registered_output, str) or not registered_output.strip():
+        raise ValueError(
+            f"registration key 'probe_artifact.expected_path' must be a non-empty path "
+            f"for probe scope {scope!r}"
+        )
+    expected_output = Path(registered_output)
     if not expected_output.is_absolute():
         expected_output = preregistration_path.resolve().parents[2] / expected_output
     if scope == "formal_train":

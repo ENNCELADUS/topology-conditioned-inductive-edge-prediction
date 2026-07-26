@@ -233,7 +233,12 @@ def _validate_e2e_binding_section(
             if isinstance(path_value, str) and _is_sha256(digest_value):
                 artifacts.append(
                     (
-                        _registered_path(preregistration_path, path_value),
+                        _registered_path(
+                            preregistration_path,
+                            path_value,
+                            key=f"binding_evidence.{label}.path",
+                            scope="binding evidence validation",
+                        ),
                         cast(str, digest_value),
                     )
                 )
@@ -295,7 +300,12 @@ def _validate_e2e_binding_evidence(
             or not _is_sha256(config_entry.get("sha256"))
         ):
             raise PreregistrationMismatch(f"binding_evidence config entry is invalid for {arm}")
-        config_path = _registered_path(preregistration_path, config_entry["path"])
+        config_path = _registered_path(
+            preregistration_path,
+            config_entry["path"],
+            key=f"binding_evidence.configs.{arm}.path",
+            scope="binding evidence validation",
+        )
         if not config_path.is_file() or _sha256_file(config_path) != config_entry["sha256"]:
             raise PreregistrationMismatch(
                 f"binding_evidence config artifact is missing or hash-mismatched for {arm}"
@@ -375,8 +385,18 @@ def paired_bootstrap_lower_bound(
     return float(np.quantile(np.asarray(differences, dtype=np.float64), alpha / 2.0))
 
 
-def _registered_path(preregistration_path: Path, value: object) -> Path:
-    path = Path(str(value))
+def _registered_path(
+    preregistration_path: Path,
+    value: object,
+    *,
+    key: str,
+    scope: str,
+) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise PreregistrationMismatch(
+            f"registration key {key!r} must be a non-empty path for scope {scope!r}"
+        )
+    path = Path(value)
     if path.is_absolute():
         return path
     try:
@@ -401,7 +421,12 @@ def enforce_frozen_inputs(
         path = (
             b0_universe_path
             if name == "b0_candidate_scores"
-            else _registered_path(preregistration_path, entry["path"])
+            else _registered_path(
+                preregistration_path,
+                entry["path"],
+                key=f"frozen_inputs.{name}.path",
+                scope="frozen input validation",
+            )
         )
         if not path.is_file():
             raise PreregistrationMismatch(f"frozen input {name!r} not found: {path}")
@@ -425,7 +450,12 @@ def enforce_e2e_frozen_inputs(
     if entry is None or "path" not in entry or "sha256" not in entry:
         raise PreregistrationMismatch("frozen input 'b0cal_results' is incompletely registered")
     resolved = _resolve_b0cal_results_path(b0cal_results_path).resolve()
-    expected_path = _registered_path(preregistration_path, entry["path"]).resolve()
+    expected_path = _registered_path(
+        preregistration_path,
+        entry["path"],
+        key="frozen_inputs.b0cal_results.path",
+        scope="frozen input validation",
+    ).resolve()
     if resolved != expected_path:
         raise PreregistrationMismatch(
             f"frozen b0cal_results path mismatch: {resolved} != {expected_path}"
@@ -1472,7 +1502,12 @@ def _enforce_e2e_formal_metadata(
         if metadata.get("partition_seed") != 0:
             raise RegistrationShaMismatch(f"{arm}: formal E2E partition_seed must be 0")
         training = arms[arm].get("training")
-        expected_config_path = _registered_path(preregistration_path, training).resolve()
+        expected_config_path = _registered_path(
+            preregistration_path,
+            training,
+            key=f"arms.{arm}.training",
+            scope="formal metadata validation",
+        ).resolve()
         config_path = metadata.get("config_path")
         if not isinstance(config_path, str) or Path(config_path).resolve() != expected_config_path:
             raise RegistrationShaMismatch(
@@ -1618,7 +1653,12 @@ def _validate_e2e_scoring_provenance(
         "registration_sha256": registration_sha256,
         "run_metadata_sha256": _sha256_file(metadata_path),
         "config_path": str(
-            _registered_path(preregistration_path, source_registration.get("training")).resolve()
+            _registered_path(
+                preregistration_path,
+                source_registration.get("training"),
+                key=f"arms.{source_arm}.training",
+                scope=f"{name} scoring provenance",
+            ).resolve()
         ),
         "config_sha256": config_evidence.get("sha256"),
         "checkpoint_sha256": metadata.get("checkpoint_sha256"),
@@ -1654,7 +1694,12 @@ def _registered_candidate_manifest(
     entry = cast(Mapping[str, object] | None, frozen.get("candidate_manifest"))
     if entry is None or "path" not in entry or "sha256" not in entry:
         raise PreregistrationMismatch("frozen candidate_manifest is incompletely registered")
-    registered_path = _registered_path(preregistration_path, entry["path"]).resolve()
+    registered_path = _registered_path(
+        preregistration_path,
+        entry["path"],
+        key="frozen_inputs.candidate_manifest.path",
+        scope="candidate manifest validation",
+    ).resolve()
     benchmark_path = (benchmark_root / strategy / "candidate_test_edges.txt").resolve()
     if registered_path != benchmark_path:
         raise PreregistrationMismatch(
@@ -1795,7 +1840,10 @@ def _evaluate_registered_e2e_probe(
             f"got {registered_format!r}; older probe versions are rejected"
         )
     expected_path = _registered_path(
-        preregistration_path, registration.get("expected_path")
+        preregistration_path,
+        registration.get("expected_path"),
+        key="probe_artifact.expected_path",
+        scope="E2E probe evaluation",
     ).resolve()
     if probe_artifact_path.resolve() != expected_path:
         raise PreregistrationMismatch(
