@@ -116,6 +116,16 @@ class TestEgoTargetBuilder:
         # n6's single target is n7; pool of n6 = first 3 non-self nodes (n0..n2).
         assert bool(out.mask[0, 0])
         assert not bool(out.in_pool[0, 0])
+        assert int(out.pool_index[0, 0]) == -1
+
+    def test_in_pool_target_carries_ordered_pool_index(self) -> None:
+        graph = _toy_graph()
+        f0 = np.random.default_rng(0).normal(size=(len(_NODES), 6)).astype(np.float32)
+        index = {node: i for i, node in enumerate(_NODES)}
+        builder = EgoTargetBuilder(graph, f0, index, {"n6": ["n0", "n7"]}, slots=4)
+        out = builder.build(["n6"], np.random.default_rng(0))
+        assert bool(out.in_pool[0, 0])
+        assert int(out.pool_index[0, 0]) == 1
 
     def test_rejects_self_loops(self) -> None:
         g = _toy_graph()

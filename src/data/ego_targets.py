@@ -37,6 +37,8 @@ class EgoTargets(NamedTuple):
         mask: Shape ``(B, K)`` bool target validity.
         degree: Shape ``(B,)`` float32 true simple degrees ``|N(u)|``.
         in_pool: Shape ``(B, K)`` bool — target is in the node's grounding pool.
+        pool_index: Shape ``(B, K)`` int64 — target index in the node's ordered
+            grounding pool, or ``-1`` when the target is out of pool/padding.
         ego_stats: Shape ``(B, 4)`` float32 real-side ego-stat vectors
             (spec Sec 13.6: degree, local clustering, ego edge count,
             ego density — NetworkX implementations on ``G_struct``).
@@ -48,6 +50,7 @@ class EgoTargets(NamedTuple):
     mask: torch.Tensor
     degree: torch.Tensor
     in_pool: torch.Tensor
+    pool_index: torch.Tensor
     ego_stats: torch.Tensor
 
 
@@ -116,7 +119,10 @@ class EgoTargetBuilder:
         self._g = g_struct
         self._f0 = f0_matrix
         self._index = dict(node_index)
-        self._pool = {node: set(members) for node, members in grounding_pool.items()}
+        self._pool = {
+            node: {member: index for index, member in enumerate(members)}
+            for node, members in grounding_pool.items()
+        }
         self._slots = int(slots)
         self._neighbors: dict[str, list[str]] = {
             node: sorted(g_struct.neighbors(node)) for node in g_struct.nodes()
@@ -189,6 +195,7 @@ class EgoTargetBuilder:
         mask = np.zeros((batch, k), dtype=bool)
         degree = np.zeros(batch, dtype=np.float32)
         in_pool = np.zeros((batch, k), dtype=bool)
+        pool_index = np.full((batch, k), -1, dtype=np.int64)
         ego_stats = np.zeros((batch, 4), dtype=np.float32)
 
         for b, node in enumerate(node_ids):
@@ -197,12 +204,14 @@ class EgoTargetBuilder:
                 self._feature_read_observer(selected)
             degree[b] = float(len(self._neighbors.get(node, [])))
             ego_stats[b] = self._node_ego_stats(node)
-            pool = self._pool.get(node, set())
+            pool: dict[str, int] = self._pool.get(node, {})
             for t, (v, label) in enumerate(zip(selected, labels, strict=True)):
                 features[b, t] = self._f0[self._index[v]]
                 mult[b, t] = label
                 mask[b, t] = True
-                in_pool[b, t] = v in pool
+                if v in pool:
+                    in_pool[b, t] = True
+                    pool_index[b, t] = pool[v]
             for t1 in range(len(selected)):
                 for t2 in range(t1 + 1, len(selected)):
                     if self._g.has_edge(selected[t1], selected[t2]):
@@ -216,5 +225,6 @@ class EgoTargetBuilder:
             mask=torch.from_numpy(mask),
             degree=torch.from_numpy(degree),
             in_pool=torch.from_numpy(in_pool),
+            pool_index=torch.from_numpy(pool_index),
             ego_stats=torch.from_numpy(ego_stats),
         )

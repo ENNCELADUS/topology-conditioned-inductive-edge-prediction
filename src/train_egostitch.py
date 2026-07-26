@@ -2145,9 +2145,9 @@ def assemble_egostitch_data(
             as the frozen-s0 family (delegated, unchanged, to the internal
             trainable generator), sized off the generator's own pinned
             `EgoStitchConfig()` defaults rather than ``cfg.model.config``
-            (which validates as `E2EConfig` for this family) -- except
-            `n_ground`, which supersedes the pinned default for this family
-            (spec Sec 14.4.4).
+            (which validates as `E2EConfig` for this family) -- except the
+            registered rev-3.1 grounding/loss-calibration fields, which
+            supersede the generator defaults for this family.
 
     Returns:
         The `EgoStitchData` bundle.
@@ -2155,7 +2155,13 @@ def assemble_egostitch_data(
     is_e2e = cfg.model.family == _EGOSTITCH_E2E_FAMILY
     if is_e2e:
         e2e_model_cfg = E2EConfig.from_mapping(cfg.model.config)  # validate eagerly, fail loudly
-        generator_cfg = replace(EgoStitchConfig(), n_ground=e2e_model_cfg.n_ground)
+        generator_cfg = replace(
+            EgoStitchConfig(),
+            n_ground=e2e_model_cfg.n_ground,
+            tau_adj=e2e_model_cfg.tau_adj,
+            tau_div=e2e_model_cfg.tau_div,
+            l_gate_pos_weight=e2e_model_cfg.l_gate_pos_weight,
+        )
     else:
         generator_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
     if cfg.training is not None:
@@ -2492,6 +2498,7 @@ class _BatchFactory:
             "target_adj": targets.adj,
             "target_mask": targets.mask,
             "target_in_pool": targets.in_pool,
+            "target_pool_index": targets.pool_index,
             "true_degree": targets.degree,
             "real_ego_stats": targets.ego_stats,
             "null_mode": null_mode,
@@ -2742,6 +2749,7 @@ class _CompositeStep(torch.nn.Module):
             target_adj=node["target_adj"],
             target_mask=node["target_mask"],
             target_in_pool=node["target_in_pool"],
+            target_pool_index=node["target_pool_index"],
             true_degree=node["true_degree"],
             real_ego_stats=node["real_ego_stats"],
             null_mode=node["null_mode"],

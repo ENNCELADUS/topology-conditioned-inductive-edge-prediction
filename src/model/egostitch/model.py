@@ -232,6 +232,7 @@ class EgoStitchStage1(nn.Module):
         target_adj: torch.Tensor,
         target_mask: torch.Tensor,
         target_in_pool: torch.Tensor,
+        target_pool_index: torch.Tensor,
         true_degree: torch.Tensor,
         real_ego_stats: torch.Tensor,
         null_mode: torch.Tensor | None = None,
@@ -249,6 +250,8 @@ class EgoStitchStage1(nn.Module):
             target_adj: Shape ``(B, T, T)`` adjacency among targets.
             target_mask: Shape ``(B, T)`` target validity mask.
             target_in_pool: Shape ``(B, T)`` grounding-pool membership.
+            target_pool_index: Shape ``(B, T)`` ordered grounding-pool indices,
+                with ``-1`` for out-of-pool targets and padding.
             true_degree: Shape ``(B,)`` true simple degrees.
             real_ego_stats: Shape ``(B, 4)`` real-side ego-stat vectors
                 (spec Sec 13.6, computed by the target builder on G_struct).
@@ -286,6 +289,8 @@ class EgoStitchStage1(nn.Module):
             target_mult=target_mult,
             target_adj=target_adj,
             target_in_pool=target_in_pool,
+            target_pool_index=target_pool_index,
+            config=self.config,
         )
         if enc.denoise is not None and denoise_target is not None and denoise_mask is not None:
             extra = denoise_losses(enc.denoise, target_proj=denoise_target, mask=denoise_mask)

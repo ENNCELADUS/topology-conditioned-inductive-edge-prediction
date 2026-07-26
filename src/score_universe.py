@@ -820,11 +820,11 @@ def _build_egostitch_e2e(model_config: dict[str, object]) -> nn.Module:
     """Build an `EgoStitchE2E` model from its checkpointed config (design rev 3).
 
     The internal Stage-1 generator keeps its own pinned spec defaults
-    (``EgoStitchConfig()``, spec Sec 13) regardless of `model_config`, except
-    `n_ground`, which is checkpoint-configurable via `E2EConfig` and
-    supersedes the generator's pinned default for this family (spec Sec
-    14.4.4). The remaining pair-trunk/conditioning fields in `E2EConfig` are
-    likewise checkpoint-configurable (design rev 3 Sec 3.4-3.5).
+    (``EgoStitchConfig()``, spec Sec 13) except for `n_ground` and the rev-3.1
+    calibration fields `tau_adj`, `tau_div`, and `l_gate_pos_weight`, which
+    are checkpoint-configurable via `E2EConfig` (spec Sec 14.4.1-14.4.4).
+    The remaining pair-trunk/conditioning fields in `E2EConfig` are likewise
+    checkpoint-configurable (design rev 3 Sec 3.4-3.5).
     """
     from src.model.egostitch.config import E2EConfig
     from src.model.egostitch.e2e_model import EgoStitchE2E
@@ -1637,13 +1637,15 @@ def _score_egostitch(
     filler = torch.zeros(1, dtype=torch.float32, device=device)
 
     def _slots(rows: torch.Tensor) -> SlotSet:
+        adj = adj_all[rows]
         return SlotSet(
             h=h_all[rows],
             pi=pi_all[rows],
             mult=mult_all[rows],
             gate=filler.expand(rows.shape[0], pi_all.shape[1]),
             pointer=filler.expand(rows.shape[0], pi_all.shape[1], 1),
-            adj=adj_all[rows],
+            adj=adj,
+            adj_logits=torch.logit(adj.clamp(1e-6, 1.0 - 1e-6)),
         )
 
     for start in range(0, len(pairs), batch_pairs):

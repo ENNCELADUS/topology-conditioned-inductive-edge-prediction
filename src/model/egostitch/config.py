@@ -78,6 +78,16 @@ class EgoStitchConfig:
         w_deg: Interior weight of the lognormal degree NLL.
         w_slotadj: Interior weight of the slot-adjacency group BCE.
         w_gate: Interior weight of the grounding-gate BCE.
+        w_ptr: Interior weight of the grounding-pointer CE.
+        w_align: Interior weight of the Task-7 Sinkhorn alignment loss.
+        w_div: Interior weight of the slot-diversity loss.
+        w_rel: Interior weight of the Task-7 relational prediction loss.
+        tau_adj: Temperature for logit-space slot-adjacency BCE; must be in
+            ``(0, 1)`` (spec Sec 14.4.2).
+        tau_div: Maximum unpenalized cosine similarity between eligible slots.
+        l_gate_pos_weight: Positive-class weight for ``L_gate``. The default
+            ``6.17`` is ``(1 - 0.1395) / 0.1395``, derived from the P0.2
+            measured top-50 slot-recall ceiling (spec Sec 14.4.1).
         w_egostat: Interior ``L_real`` weight of the ego-stat energy distance
             (Stage-1 renormalized, spec Sec 13.5).
         w_gin: Interior ``L_real`` weight of the random-GIN energy distance.
@@ -110,6 +120,13 @@ class EgoStitchConfig:
     w_deg: float = 0.5
     w_slotadj: float = 0.5
     w_gate: float = 0.25
+    w_ptr: float = 0.25
+    w_align: float = 0.5
+    w_div: float = 0.1
+    w_rel: float = 0.25
+    tau_adj: float = 0.5
+    tau_div: float = 0.5
+    l_gate_pos_weight: float = 6.17
     w_egostat: float = 2.0 / 3.0
     w_gin: float = 1.0 / 3.0
     gin_hidden: int = 64
@@ -143,6 +160,14 @@ class EgoStitchConfig:
         for name in ("sinkhorn_eps", "sinkhorn_tau", "denoise_sigma", "ssl_noise_sigma"):
             if float(getattr(self, name)) <= 0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
+        if not 0.0 < self.tau_adj < 1.0:
+            raise ValueError(f"tau_adj must be in (0, 1), got {self.tau_adj}")
+        if not -1.0 <= self.tau_div <= 1.0:
+            raise ValueError(f"tau_div must be in [-1, 1], got {self.tau_div}")
+        if self.l_gate_pos_weight <= 0.0:
+            raise ValueError(
+                f"l_gate_pos_weight must be positive, got {self.l_gate_pos_weight}"
+            )
         for name in ("denoise_fraction", "null_dropout"):
             value = float(getattr(self, name))
             if not 0.0 <= value <= 1.0:
@@ -172,10 +197,10 @@ class E2EConfig:
     The internal Stage-1 generator keeps its own pinned `EgoStitchConfig`
     defaults (spec Sec 13); these fields size only the pair-encoder trunk and
     its topo/content conditioning pathways (design rev 3 Sec 3.4-3.5) -- with
-    one exception: `n_ground` supersedes the generator's own pinned value for
-    this family (spec Sec 14.4.4), since grounding-pool size is a per-arm
-    dial (rev-3.1 `full` etc. explicitly pin 50; the `cosine_pool` ablation
-    arm and legacy configs use 20).
+    the rev-3.1 grounding and loss-calibration fields below supersede the
+    generator's own pinned values for this family, so a v3 registration and
+    checkpoint carry them explicitly while absent legacy keys retain their
+    historical defaults.
 
     Attributes:
         d_model: Pair-trunk hidden width.
@@ -191,6 +216,10 @@ class E2EConfig:
         n_ground: Grounding candidates per node `n_g` (spec Sec 14.4.4;
             supersedes the internal generator's own pinned `EgoStitchConfig`
             default for this family).
+        tau_adj: Registered slot-adjacency temperature (spec Sec 14.4.2).
+        tau_div: Registered slot-diversity threshold (spec Sec 14.4.1).
+        l_gate_pos_weight: Registered positive-class weight for ``L_gate``
+            (spec Sec 14.4.1).
     """
 
     d_model: int = 512
@@ -205,6 +234,9 @@ class E2EConfig:
     p_cont: float = 0.15
     permanent_null: str = "none"
     n_ground: int = 20
+    tau_adj: float = 0.5
+    tau_div: float = 0.5
+    l_gate_pos_weight: float = 6.17
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants.
@@ -235,6 +267,14 @@ class E2EConfig:
             value = float(getattr(self, name))
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1], got {value}")
+        if not 0.0 < self.tau_adj < 1.0:
+            raise ValueError(f"tau_adj must be in (0, 1), got {self.tau_adj}")
+        if not -1.0 <= self.tau_div <= 1.0:
+            raise ValueError(f"tau_div must be in [-1, 1], got {self.tau_div}")
+        if self.l_gate_pos_weight <= 0.0:
+            raise ValueError(
+                f"l_gate_pos_weight must be positive, got {self.l_gate_pos_weight}"
+            )
         if self.permanent_null not in ("none", "all_head", "content_head"):
             raise ValueError(
                 "permanent_null must be one of 'none', 'all_head', or 'content_head', "

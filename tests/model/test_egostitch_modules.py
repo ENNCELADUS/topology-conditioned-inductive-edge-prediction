@@ -6,7 +6,7 @@ import math
 
 import pytest
 import torch
-from src.model.egostitch.config import EgoStitchConfig
+from src.model.egostitch.config import E2EConfig, EgoStitchConfig
 from src.model.egostitch.decision import DecisionHead
 from src.model.egostitch.imagine import (
     NULL_MODE_ALL,
@@ -55,6 +55,9 @@ class TestConfig:
         assert config.lambda_recon == 1.0
         assert config.lambda_real == 0.5
         assert config.lambda_ssl == 0.1
+        assert config.tau_adj == 0.5
+        assert config.tau_div == 0.5
+        assert config.l_gate_pos_weight == 6.17
         assert config.w_egostat == pytest.approx(2.0 / 3.0)
         assert config.w_gin == pytest.approx(1.0 / 3.0)
 
@@ -76,6 +79,22 @@ class TestConfig:
             EgoStitchConfig(null_dropout=1.5)
         with pytest.raises(ValueError, match="must be an int"):
             EgoStitchConfig.from_mapping({"slots": 8.5})
+
+    @pytest.mark.parametrize("tau_adj", [1.0, 1.5])
+    def test_tau_adj_must_be_strictly_less_than_one(self, tau_adj: float) -> None:
+        with pytest.raises(ValueError, match="tau_adj must be in \\(0, 1\\)"):
+            EgoStitchConfig(tau_adj=tau_adj)
+
+    def test_e2e_repair_calibration_fields_propagate_to_generator(self) -> None:
+        from src.model.egostitch.e2e_model import EgoStitchE2E
+
+        config = E2EConfig.from_mapping(
+            {"tau_adj": 0.4, "tau_div": 0.3, "l_gate_pos_weight": 5.0}
+        )
+        model = EgoStitchE2E(config)
+        assert model.generator_cfg.tau_adj == 0.4
+        assert model.generator_cfg.tau_div == 0.3
+        assert model.generator_cfg.l_gate_pos_weight == 5.0
 
 
 class TestTokenizeLite:
@@ -121,11 +140,13 @@ class TestImagineDecoder:
         assert slots.gate.shape == (b, k)
         assert slots.pointer.shape == (b, k, n_g)
         assert slots.adj.shape == (b, k, k)
+        assert slots.adj_logits.shape == (b, k, k)
         assert bool(((slots.pi >= 0) & (slots.pi <= 1)).all())
         assert bool(((slots.gate >= 0) & (slots.gate <= 1)).all())
         assert bool((slots.mult >= 1).all())
         assert bool((slots.mult <= _TINY.m_max).all())
         assert bool(((slots.adj >= 0) & (slots.adj <= 1)).all())
+        torch.testing.assert_close(slots.adj, torch.sigmoid(slots.adj_logits))
 
     def test_adjacency_symmetric(self) -> None:
         slots = self._decode(seed=2)
@@ -236,13 +257,15 @@ class TestDecisionHead:
         gen = torch.Generator().manual_seed(seed)
         k, d_p, n_g = _TINY.slots, _TINY.d_p, _TINY.n_ground
         adj_raw = torch.rand(batch, k, k, generator=gen)
+        adj = 0.5 * (adj_raw + adj_raw.transpose(1, 2))
         return SlotSet(
             h=torch.randn(batch, k, d_p, generator=gen),
             pi=torch.rand(batch, k, generator=gen),
             mult=1.0 + torch.rand(batch, k, generator=gen),
             gate=torch.rand(batch, k, generator=gen),
             pointer=torch.softmax(torch.randn(batch, k, n_g, generator=gen), dim=-1),
-            adj=0.5 * (adj_raw + adj_raw.transpose(1, 2)),
+            adj=adj,
+            adj_logits=torch.logit(adj.clamp(1e-6, 1.0 - 1e-6)),
         )
 
     def test_tau_kappa_initializes_to_one(self) -> None:
@@ -288,6 +311,7 @@ class TestDecisionHead:
             gate=torch.full((batch, slots_n), 0.5),
             pointer=torch.full((batch, slots_n, config.n_ground), 1.0 / config.n_ground),
             adj=torch.zeros(batch, slots_n, slots_n),
+            adj_logits=torch.full((batch, slots_n, slots_n), -20.0),
         )
         other = 225.0 * torch.randn(batch, config.d_p, generator=gen)
 

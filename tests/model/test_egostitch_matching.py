@@ -22,13 +22,15 @@ def _slot_set(
     h: torch.Tensor, *, mult: torch.Tensor | None = None, adj: torch.Tensor | None = None
 ) -> SlotSet:
     b, k, _ = h.shape
+    adjacency = torch.zeros(b, k, k) if adj is None else adj
     return SlotSet(
         h=h,
         pi=torch.full((b, k), 0.5),
         mult=torch.ones(b, k) if mult is None else mult,
         gate=torch.zeros(b, k),
         pointer=torch.full((b, k, 1), 1.0),
-        adj=torch.zeros(b, k, k) if adj is None else adj,
+        adj=adjacency,
+        adj_logits=torch.logit(adjacency.clamp(1e-6, 1.0 - 1e-6)),
     )
 
 

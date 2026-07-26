@@ -90,10 +90,15 @@ class EgoStitchE2E(nn.Module):
         super().__init__()
         self.cfg = cfg
         # Stage-1 generator keeps its own pinned spec defaults (spec Sec 13);
-        # E2EConfig sizes only the trunk and its conditioning pathways --
-        # except n_ground, which supersedes the generator's pinned default
-        # for this family (spec Sec 14.4.4, per-arm grounding-pool size).
-        self.generator_cfg = replace(EgoStitchConfig(), n_ground=cfg.n_ground)
+        # E2EConfig sizes the trunk and carries the registered rev-3.1
+        # grounding/loss calibration fields into the internal generator.
+        self.generator_cfg = replace(
+            EgoStitchConfig(),
+            n_ground=cfg.n_ground,
+            tau_adj=cfg.tau_adj,
+            tau_div=cfg.tau_div,
+            l_gate_pos_weight=cfg.l_gate_pos_weight,
+        )
         self.input_dim = self.generator_cfg.input_dim  # frozen feature dim (spec Sec 0 table)
         self.node_feature_dim = self.generator_cfg.input_dim
         self.generator = EgoStitchStage1(self.generator_cfg, standardize_features=True)

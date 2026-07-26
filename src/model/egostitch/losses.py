@@ -1,9 +1,10 @@
-"""Stage-1 loss tree (spec Sec 7 subset, pinned in Sec 13.5-13.6).
+"""Stage-1 loss tree (spec Sec 7 subset, Sec 13.5-13.6 and Sec 14.4.1).
 
 ``L = L_edge + 0.5·L_real + 0.1·L_ssl + 1.0·L_recon`` with
 
 ``L_recon = 1.0·L_feat + 0.5·L_exist + 0.25·L_mult + 0.5·L_deg
-+ 0.5·L_slotadj + 0.25·L_gate``
++ 0.5·L_slotadj + 0.25·L_gate + 0.25·L_ptr + 0.5·L_align
++ 0.1·L_div + 0.25·L_rel``
 ``L_real  = (2/3)·ED(ego stats) + (1/3)·ED(random-GIN embeddings)``
 ``L_ssl   = 0.5·feature-noise consistency + 0.5·pool-resample consistency``
 
@@ -35,6 +36,19 @@ def _probability_bce(
         return F.binary_cross_entropy(input.float(), target.float(), reduction=reduction)
 
 
+def _positive_weighted_probability_bce(
+    input: torch.Tensor, target: torch.Tensor, *, pos_weight: float
+) -> torch.Tensor:
+    """Evaluate positive-class-weighted probability BCE in an fp32 island."""
+    with torch.autocast(device_type=input.device.type, enabled=False):
+        probability = input.float().clamp(1e-6, 1.0 - 1e-6)
+        labels = target.float()
+        return -(
+            pos_weight * labels * torch.log(probability)
+            + (1.0 - labels) * torch.log1p(-probability)
+        ).mean()
+
+
 # --------------------------------------------------------------------------- reconstruction
 
 
@@ -46,8 +60,10 @@ def recon_losses(
     target_mult: torch.Tensor,
     target_adj: torch.Tensor,
     target_in_pool: torch.Tensor,
+    target_pool_index: torch.Tensor,
+    config: EgoStitchConfig,
 ) -> dict[str, torch.Tensor]:
-    """Matched-slot reconstruction losses (spec Sec 13.5).
+    """Matched-slot reconstruction losses (spec Sec 13.5 and Sec 14.4.1).
 
     Args:
         slots: The generated slot set.
@@ -57,9 +73,12 @@ def recon_losses(
         target_adj: Shape ``(B, T, T)`` adjacency among targets.
         target_in_pool: Shape ``(B, T)`` booleans — target is in the node's
             grounding pool ``G(u)`` (Stage-1 ``L_gate`` supervision).
+        target_pool_index: Shape ``(B, T)`` ordered indices into ``G(u)``, or
+            ``-1`` for out-of-pool targets/padding (``L_ptr`` supervision).
+        config: Supplies the registered temperatures and gate positive weight.
 
     Returns:
-        ``{"feat", "exist", "mult", "slotadj", "gate"}`` scalar loss tensors.
+        Seven scalar component tensors through Task 5 of the rev-3.1 repair.
     """
     device = slots.h.device
     feat_terms: list[torch.Tensor] = []
@@ -67,6 +86,8 @@ def recon_losses(
     slotadj_terms: list[torch.Tensor] = []
     gate_logit_terms: list[torch.Tensor] = []
     gate_label_terms: list[torch.Tensor] = []
+    pointer_terms: list[torch.Tensor] = []
+    pointer_label_terms: list[torch.Tensor] = []
     matched_mask = torch.zeros_like(slots.pi, dtype=torch.bool)
 
     for b in range(len(assignment)):
@@ -81,28 +102,46 @@ def recon_losses(
         log_gap = torch.log(slots.mult[b, s_idx]) - stable_log(target_mult[b, t_idx])
         mult_terms.append(0.5 * (log_gap**2).mean())
         if s_idx.numel() >= 2:
-            adj_pred = slots.adj[b][s_idx][:, s_idx]
+            adj_pred = slots.adj_logits[b][s_idx][:, s_idx]
             adj_true = target_adj[b][t_idx][:, t_idx]
             off_diag = ~torch.eye(s_idx.numel(), dtype=torch.bool, device=device)
-            slotadj_terms.append(
-                _probability_bce(
-                    torch.clamp(adj_pred[off_diag], 1e-6, 1.0 - 1e-6), adj_true[off_diag]
+            with torch.autocast(device_type=adj_pred.device.type, enabled=False):
+                slotadj = F.binary_cross_entropy_with_logits(
+                    adj_pred[off_diag].float() / config.tau_adj,
+                    adj_true[off_diag].float(),
                 )
-            )
+            slotadj_terms.append(slotadj)
         gate_logit_terms.append(slots.gate[b, s_idx])
         gate_label_terms.append(target_in_pool[b, t_idx].float())
+        pointer_valid = target_in_pool[b, t_idx]
+        if bool(pointer_valid.any()):
+            pointer_terms.append(slots.pointer[b, s_idx[pointer_valid]])
+            pointer_label_terms.append(target_pool_index[b, t_idx[pointer_valid]])
 
     zero = slots.h.sum() * 0.0
     feat = torch.stack(feat_terms).mean() if feat_terms else zero
     mult = torch.stack(mult_terms).mean() if mult_terms else zero
     slotadj = torch.stack(slotadj_terms).mean() if slotadj_terms else zero
     if gate_logit_terms:
-        gate = _probability_bce(
-            torch.clamp(torch.cat(gate_logit_terms), 1e-6, 1.0 - 1e-6),
+        gate = _positive_weighted_probability_bce(
+            torch.cat(gate_logit_terms),
             torch.cat(gate_label_terms),
+            pos_weight=config.l_gate_pos_weight,
         )
     else:
         gate = zero
+
+    if pointer_terms:
+        pointer = torch.cat(pointer_terms)
+        pointer_labels = torch.cat(pointer_label_terms).long()
+        if bool(((pointer_labels < 0) | (pointer_labels >= pointer.shape[-1])).any()):
+            raise ValueError("in-pool target has invalid grounding-pool index")
+        with torch.autocast(device_type=pointer.device.type, enabled=False):
+            ptr = F.nll_loss(
+                torch.log(pointer.float().clamp(min=1e-8)), pointer_labels, reduction="mean"
+            )
+    else:
+        ptr = slots.pointer.sum() * 0.0
 
     # Existence BCE, ∅-balanced: matched and unmatched slots contribute with
     # equal class weight regardless of the match rate.
@@ -115,7 +154,27 @@ def recon_losses(
     neg_term = (per_slot * (1.0 - labels)).sum() / torch.clamp(n_neg, min=1.0)
     exist = 0.5 * pos_term + 0.5 * neg_term
 
-    return {"feat": feat, "exist": exist, "mult": mult, "slotadj": slotadj, "gate": gate}
+    with torch.autocast(device_type=slots.h.device.type, enabled=False):
+        normalized = F.normalize(slots.h.float(), dim=-1)
+        cosine = torch.bmm(normalized, normalized.transpose(1, 2))
+        distinct = ~torch.eye(
+            slots.h.shape[1], dtype=torch.bool, device=slots.h.device
+        ).unsqueeze(0)
+        eligible = distinct & ~(matched_mask[:, :, None] & matched_mask[:, None, :])
+        if bool(eligible.any()):
+            div = torch.relu(cosine[eligible] - config.tau_div).square().mean()
+        else:
+            div = slots.h.float().sum() * 0.0
+
+    return {
+        "feat": feat,
+        "exist": exist,
+        "mult": mult,
+        "slotadj": slotadj,
+        "gate": gate,
+        "ptr": ptr,
+        "div": div,
+    }
 
 
 def denoise_losses(
@@ -382,6 +441,7 @@ def stage1_family_tensors(
     ssl_pool: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
     """Return the four *weighted* loss-family tensors used by the optimizer."""
+    zero = edge * 0.0
     l_recon = (
         config.w_feat * recon["feat"]
         + config.w_exist * recon["exist"]
@@ -389,6 +449,10 @@ def stage1_family_tensors(
         + config.w_deg * deg
         + config.w_slotadj * recon["slotadj"]
         + config.w_gate * recon["gate"]
+        + config.w_ptr * recon["ptr"]
+        + config.w_align * recon.get("align", zero)
+        + config.w_div * recon["div"]
+        + config.w_rel * recon.get("rel", zero)
     )
     l_real = config.w_egostat * real_egostat + config.w_gin * real_gin
     l_ssl = 0.5 * ssl_noise + 0.5 * ssl_pool
@@ -411,7 +475,7 @@ def stage1_total(
     ssl_noise: torch.Tensor,
     ssl_pool: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Combine the Stage-1 loss families with the pinned weights (spec Sec 13.5).
+    """Combine loss families with the pinned weights (spec Sec 13.5 / Sec 14.4.1).
 
     Args:
         config: Supplies every master and interior weight.
@@ -427,6 +491,9 @@ def stage1_total(
         ``(total, per-family floats)`` — the float dict is for logging
         (gradient-norm-per-family monitoring is the trainer's job).
     """
+    zero = edge * 0.0
+    align = recon.get("align", zero)
+    rel = recon.get("rel", zero)
     l_recon = (
         config.w_feat * recon["feat"]
         + config.w_exist * recon["exist"]
@@ -434,6 +501,10 @@ def stage1_total(
         + config.w_deg * deg
         + config.w_slotadj * recon["slotadj"]
         + config.w_gate * recon["gate"]
+        + config.w_ptr * recon["ptr"]
+        + config.w_align * align
+        + config.w_div * recon["div"]
+        + config.w_rel * rel
     )
     l_real = config.w_egostat * real_egostat + config.w_gin * real_gin
     l_ssl = 0.5 * ssl_noise + 0.5 * ssl_pool
@@ -457,6 +528,10 @@ def stage1_total(
         "recon_deg": float(deg.detach()),
         "recon_slotadj": float(recon["slotadj"].detach()),
         "recon_gate": float(recon["gate"].detach()),
+        "recon_ptr": float(recon["ptr"].detach()),
+        "recon_align": float(align.detach()),
+        "recon_div": float(recon["div"].detach()),
+        "recon_rel": float(rel.detach()),
         "real": float(l_real.detach()),
         "real_egostat": float(real_egostat.detach()),
         "real_gin": float(real_gin.detach()),

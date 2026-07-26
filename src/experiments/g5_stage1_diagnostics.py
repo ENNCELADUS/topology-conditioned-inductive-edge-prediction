@@ -106,6 +106,7 @@ def _encode_nodes(
 def _slots(cache: NodeCache, rows: torch.Tensor, device: torch.device) -> SlotSet:
     h = cache.h[rows].to(device)
     pi = cache.pi[rows].to(device)
+    adj = cache.adj[rows].to(device)
     filler = torch.zeros_like(pi)
     return SlotSet(
         h=h,
@@ -113,7 +114,8 @@ def _slots(cache: NodeCache, rows: torch.Tensor, device: torch.device) -> SlotSe
         mult=cache.mult[rows].to(device),
         gate=filler,
         pointer=filler.unsqueeze(-1),
-        adj=cache.adj[rows].to(device),
+        adj=adj,
+        adj_logits=torch.logit(adj.clamp(1e-6, 1.0 - 1e-6)),
     )
 
 

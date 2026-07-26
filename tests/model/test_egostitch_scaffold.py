@@ -35,6 +35,7 @@ def _slots(b: int = 2, k: int = 4, d_p: int = 8, seed: int = 0) -> SlotSet:
         gate=torch.rand(b, k, generator=g),
         pointer=torch.rand(b, k, 3, generator=g),
         adj=adj,
+        adj_logits=torch.logit(adj.clamp(1e-6, 1.0 - 1e-6)),
     )
 
 

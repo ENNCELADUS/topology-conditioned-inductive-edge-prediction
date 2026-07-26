@@ -27,9 +27,8 @@ _TINY = EgoStitchConfig(
     sinkhorn_iters=5,
 )
 
-# Heads with no Stage-1 loss consumer (pointer grounds slot identity for the
-# Stage-3 scaffold) and the frozen random GIN legitimately receive no gradient.
-_NO_GRAD_PREFIXES = ("imagine.head_pointer", "random_gin")
+# The frozen random GIN legitimately receives no gradient.
+_NO_GRAD_PREFIXES = ("random_gin",)
 
 
 def _model(seed: int = 0) -> EgoStitchStage1:
@@ -52,6 +51,7 @@ def _pair_batch(batch: int = 3, *, seed: int = 0) -> dict[str, torch.Tensor]:
 def _node_batch(batch: int = 4, *, seed: int = 1) -> dict[str, torch.Tensor]:
     gen = torch.Generator().manual_seed(seed)
     t = _TINY.slots
+    target_in_pool = torch.rand(batch, t, generator=gen) > 0.5
     return {
         "x": torch.randn(batch, _TINY.input_dim, generator=gen),
         "ground_x": torch.randn(batch, _TINY.n_ground, _TINY.input_dim, generator=gen),
@@ -59,7 +59,12 @@ def _node_batch(batch: int = 4, *, seed: int = 1) -> dict[str, torch.Tensor]:
         "target_mult": 1.0 + torch.rand(batch, t, generator=gen),
         "target_adj": (torch.rand(batch, t, t, generator=gen) > 0.5).float(),
         "target_mask": torch.ones(batch, t, dtype=torch.bool),
-        "target_in_pool": torch.rand(batch, t, generator=gen) > 0.5,
+        "target_in_pool": target_in_pool,
+        "target_pool_index": torch.where(
+            target_in_pool,
+            torch.arange(t).remainder(_TINY.n_ground).expand(batch, -1),
+            torch.full((batch, t), -1),
+        ),
         "true_degree": torch.randint(1, 6, (batch,), generator=gen).float(),
         "real_ego_stats": torch.rand(batch, 4, generator=gen),
     }
@@ -132,6 +137,7 @@ class TestNodeLosses:
             target_adj=node["target_adj"],
             target_mask=node["target_mask"],
             target_in_pool=node["target_in_pool"],
+            target_pool_index=node["target_pool_index"],
             true_degree=node["true_degree"],
             real_ego_stats=node["real_ego_stats"],
         )
@@ -153,6 +159,7 @@ class TestNodeLosses:
                 target_adj=node["target_adj"],
                 target_mask=node["target_mask"],
                 target_in_pool=node["target_in_pool"],
+                target_pool_index=node["target_pool_index"],
                 true_degree=node["true_degree"],
                 real_ego_stats=node["real_ego_stats"],
                 denoise_features=node["target_features"][:, :2],
@@ -193,6 +200,7 @@ class TestGradientFlow:
             target_adj=node["target_adj"],
             target_mask=node["target_mask"],
             target_in_pool=node["target_in_pool"],
+            target_pool_index=node["target_pool_index"],
             true_degree=node["true_degree"],
             real_ego_stats=node["real_ego_stats"],
             null_mode=null_mode,

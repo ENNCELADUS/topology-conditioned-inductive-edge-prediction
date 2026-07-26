@@ -43,13 +43,15 @@ _TINY = EgoStitchConfig(
 def _slots(batch: int = 1, k: int = 4, d_p: int = 4, *, seed: int = 0) -> SlotSet:
     gen = torch.Generator().manual_seed(seed)
     adj_raw = torch.rand(batch, k, k, generator=gen)
+    adj = 0.5 * (adj_raw + adj_raw.transpose(1, 2))
     return SlotSet(
         h=torch.randn(batch, k, d_p, generator=gen),
         pi=torch.rand(batch, k, generator=gen),
         mult=1.0 + torch.rand(batch, k, generator=gen),
         gate=torch.rand(batch, k, generator=gen),
-        pointer=torch.softmax(torch.randn(batch, k, 2, generator=gen), dim=-1),
-        adj=0.5 * (adj_raw + adj_raw.transpose(1, 2)),
+        pointer=torch.softmax(torch.randn(batch, k, 3, generator=gen), dim=-1),
+        adj=adj,
+        adj_logits=torch.logit(adj.clamp(1e-6, 1.0 - 1e-6)),
     )
 
 
@@ -61,17 +63,23 @@ def _full_assignment(batch: int, n: int) -> Assignment:
 class TestReconLosses:
     def _targets(self, batch: int = 1, t: int = 4, d_p: int = 4) -> dict[str, torch.Tensor]:
         gen = torch.Generator().manual_seed(1)
+        in_pool = torch.rand(batch, t, generator=gen) > 0.5
         return {
             "target_proj": torch.randn(batch, t, d_p, generator=gen),
             "target_mult": torch.ones(batch, t),
             "target_adj": (torch.rand(batch, t, t, generator=gen) > 0.5).float(),
-            "target_in_pool": torch.rand(batch, t, generator=gen) > 0.5,
+            "target_in_pool": in_pool,
+            "target_pool_index": torch.where(
+                in_pool,
+                torch.arange(t).remainder(_TINY.n_ground).expand(batch, -1),
+                torch.full((batch, t), -1),
+            ),
         }
 
     def test_all_terms_present_and_finite(self) -> None:
         slots = _slots()
-        out = recon_losses(slots, _full_assignment(1, 4), **self._targets())
-        assert set(out) == {"feat", "exist", "mult", "slotadj", "gate"}
+        out = recon_losses(slots, _full_assignment(1, 4), config=_TINY, **self._targets())
+        assert set(out) == {"feat", "exist", "mult", "slotadj", "gate", "ptr", "div"}
         for term in out.values():
             assert bool(torch.isfinite(term))
             assert float(term) >= 0.0
@@ -93,7 +101,7 @@ class TestReconLosses:
 
         monkeypatch.setattr(F, "binary_cross_entropy", guarded_bce)
         with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-            out = recon_losses(_slots(), _full_assignment(1, 4), **self._targets())
+            out = recon_losses(_slots(), _full_assignment(1, 4), config=_TINY, **self._targets())
             denoise = DenoiseSlots(
                 h=torch.randn(1, 2, 4), pi=torch.rand(1, 2), mult=torch.ones(1, 2)
             )
@@ -107,7 +115,7 @@ class TestReconLosses:
         targets = self._targets()
         slots = _slots()
         slots = slots._replace(h=targets["target_proj"].clone(), mult=torch.ones(1, 4))
-        out = recon_losses(slots, _full_assignment(1, 4), **targets)
+        out = recon_losses(slots, _full_assignment(1, 4), config=_TINY, **targets)
         assert float(out["feat"]) == pytest.approx(0.0, abs=1e-9)
         assert float(out["mult"]) == pytest.approx(0.0, abs=1e-9)
 
@@ -117,13 +125,13 @@ class TestReconLosses:
         pi = torch.tensor([[0.999, 0.001, 0.001, 0.001]])
         slots = slots._replace(pi=pi)
         assignment = Assignment([np.array([0], dtype=np.int64)], [np.array([0], dtype=np.int64)])
-        out = recon_losses(slots, assignment, **self._targets())
+        out = recon_losses(slots, assignment, config=_TINY, **self._targets())
         assert float(out["exist"]) < 0.01
 
     def test_empty_assignment_yields_zero_matched_terms(self) -> None:
         slots = _slots()
         assignment = Assignment([np.empty(0, dtype=np.int64)], [np.empty(0, dtype=np.int64)])
-        out = recon_losses(slots, assignment, **self._targets())
+        out = recon_losses(slots, assignment, config=_TINY, **self._targets())
         assert float(out["feat"]) == 0.0
         assert float(out["mult"]) == 0.0
         assert float(out["gate"]) == 0.0
@@ -140,10 +148,133 @@ class TestReconLosses:
             target_mult=targets["target_mult"],
             target_adj=targets["target_adj"],
             target_in_pool=targets["target_in_pool"],
+            target_pool_index=targets["target_pool_index"],
+            config=_TINY,
         )
         out["feat"].backward()  # type: ignore[no-untyped-call]
         assert h.grad is not None
         assert target_proj.grad is None  # stop-gradient targets (spec Sec 13.7)
+
+    def test_slotadj_uses_temperature_scaled_logits(self) -> None:
+        logits = torch.tensor([[[0.0, 0.8], [0.8, 0.0]]])
+        slots = _slots(k=2)._replace(adj=torch.sigmoid(logits), adj_logits=logits)
+        targets = {
+            "target_proj": torch.zeros(1, 2, 4),
+            "target_mult": torch.ones(1, 2),
+            "target_adj": torch.tensor([[[0.0, 1.0], [1.0, 0.0]]]),
+            "target_in_pool": torch.zeros(1, 2, dtype=torch.bool),
+            "target_pool_index": torch.full((1, 2), -1),
+        }
+        out = recon_losses(slots, _full_assignment(1, 2), config=_TINY, **targets)
+        expected = F.binary_cross_entropy_with_logits(
+            torch.tensor([0.8, 0.8]) / _TINY.tau_adj, torch.ones(2)
+        )
+        torch.testing.assert_close(out["slotadj"], expected)
+
+    @pytest.mark.parametrize("pos_weight", [6.17, 1.0])
+    def test_gate_pos_weight_matches_hand_computation(self, pos_weight: float) -> None:
+        config = EgoStitchConfig(
+            input_dim=8,
+            d_p=4,
+            d_z=4,
+            d_h=8,
+            slots=4,
+            n_ground=3,
+            n_heads=2,
+            l_gate_pos_weight=pos_weight,
+        )
+        gate = torch.tensor([[0.8, 0.2, 0.1, 0.3]])
+        slots = _slots()._replace(gate=gate)
+        targets = self._targets()
+        targets["target_in_pool"] = torch.tensor([[True, False, False, False]])
+        targets["target_pool_index"] = torch.tensor([[0, -1, -1, -1]])
+        out = recon_losses(slots, _full_assignment(1, 4), config=config, **targets)
+        labels = targets["target_in_pool"].float()
+        expected = -(
+            pos_weight * labels * torch.log(gate) + (1.0 - labels) * torch.log1p(-gate)
+        ).mean()
+        torch.testing.assert_close(out["gate"], expected)
+        if pos_weight == 1.0:
+            torch.testing.assert_close(out["gate"], F.binary_cross_entropy(gate, labels))
+
+    def test_diversity_threshold_and_matched_pair_exclusion(self) -> None:
+        orthogonal = torch.tensor(
+            [[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0],
+              [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]]
+        )
+        targets = self._targets()
+        one_match = Assignment([np.array([0])], [np.array([0])])
+        below = recon_losses(
+            _slots()._replace(h=orthogonal), one_match, config=_TINY, **targets
+        )["div"]
+        assert float(below) == 0.0
+
+        similar = orthogonal.clone()
+        similar[0, 1] = similar[0, 0]
+        unmatched = Assignment([np.empty(0, dtype=np.int64)], [np.empty(0, dtype=np.int64)])
+        above = recon_losses(
+            _slots()._replace(h=similar), unmatched, config=_TINY, **targets
+        )["div"]
+        assert float(above) > 0.0
+
+        two_matches = Assignment([np.array([0, 1])], [np.array([0, 1])])
+        excluded = recon_losses(
+            _slots()._replace(h=similar), two_matches, config=_TINY, **targets
+        )["div"]
+        assert float(excluded) == 0.0
+
+        matched_unmatched = recon_losses(
+            _slots()._replace(h=similar), one_match, config=_TINY, **targets
+        )["div"]
+        assert float(matched_unmatched) > 0.0
+
+    def test_pointer_masks_out_of_pool_and_matches_hand_ce(self) -> None:
+        pointer = torch.tensor([[[0.1, 0.7, 0.2], [0.4, 0.5, 0.1]]])
+        slots = _slots(k=2)._replace(pointer=pointer)
+        targets = {
+            "target_proj": torch.zeros(1, 2, 4),
+            "target_mult": torch.ones(1, 2),
+            "target_adj": torch.zeros(1, 2, 2),
+            "target_in_pool": torch.zeros(1, 2, dtype=torch.bool),
+            "target_pool_index": torch.full((1, 2), -1),
+        }
+        masked = recon_losses(slots, _full_assignment(1, 2), config=_TINY, **targets)["ptr"]
+        assert bool(torch.isfinite(masked))
+        assert float(masked) == 0.0
+
+        targets["target_in_pool"][0, 0] = True
+        targets["target_pool_index"][0, 0] = 1
+        supervised = recon_losses(
+            slots, _full_assignment(1, 2), config=_TINY, **targets
+        )["ptr"]
+        torch.testing.assert_close(supervised, -torch.log(torch.tensor(0.7)))
+
+        partial = Assignment([np.array([0])], [np.array([0])])
+        targets["target_in_pool"][:] = True
+        targets["target_pool_index"][:] = torch.tensor([[1, 0]])
+        first = recon_losses(slots, partial, config=_TINY, **targets)["ptr"]
+        changed_unmatched = slots._replace(pointer=pointer.clone())
+        changed_unmatched.pointer[0, 1] = torch.tensor([0.99, 0.005, 0.005])
+        second = recon_losses(changed_unmatched, partial, config=_TINY, **targets)["ptr"]
+        torch.testing.assert_close(first, -torch.log(torch.tensor(0.7)))
+        torch.testing.assert_close(second, first)
+
+    def test_pointer_loss_reaches_pointer_head(self) -> None:
+        torch.manual_seed(7)
+        from src.model.egostitch.imagine import ImagineDecoder
+
+        decoder = ImagineDecoder(_TINY)
+        x = torch.randn(1, _TINY.input_dim)
+        e = torch.randn(1, _TINY.d_z)
+        ground = torch.randn(1, _TINY.n_ground, _TINY.input_dim)
+        slots, _ = decoder(x, e, ground)
+        targets = self._targets()
+        targets["target_in_pool"] = torch.tensor([[True, False, False, False]])
+        targets["target_pool_index"] = torch.tensor([[1, -1, -1, -1]])
+        out = recon_losses(slots, _full_assignment(1, 4), config=_TINY, **targets)
+        out["ptr"].backward()  # type: ignore[no-untyped-call]
+        assert decoder.head_pointer.weight.grad is not None
+        assert bool((decoder.head_pointer.weight.grad != 0).any())
 
 
 class TestDegreeNll:
@@ -193,6 +324,7 @@ class TestGeneratedEgoStats:
             gate=torch.zeros(1, 2),
             pointer=torch.full((1, 2, 1), 1.0),
             adj=adj,
+            adj_logits=torch.logit(adj.clamp(1e-6, 1.0 - 1e-6)),
         )
         stats = generated_ego_stats(slots)
         d_soft = 1.0 * 2.0 + 0.5 * 4.0  # 4.0
@@ -255,11 +387,80 @@ class TestSslConsistency:
 
 
 class TestStage1Total:
-    def test_pinned_weights(self) -> None:
-        one = torch.tensor(1.0)
-        recon = {"feat": one, "exist": one, "mult": one, "slotadj": one, "gate": one}
-        total, parts = stage1_total(
+    @pytest.mark.parametrize(
+        ("component", "expected"),
+        [
+            ("feat", 1.0),
+            ("exist", 0.5),
+            ("mult", 0.25),
+            ("deg", 0.5),
+            ("slotadj", 0.5),
+            ("gate", 0.25),
+            ("ptr", 0.25),
+            ("align", 0.5),
+            ("div", 0.1),
+            ("rel", 0.25),
+        ],
+    )
+    def test_each_recon_component_uses_its_pinned_weight(
+        self, component: str, expected: float
+    ) -> None:
+        zero = torch.tensor(0.0)
+        recon = {
+            name: torch.tensor(float(name == component))
+            for name in ("feat", "exist", "mult", "slotadj", "gate", "ptr", "align", "div", "rel")
+        }
+        total, _ = stage1_total(
             EgoStitchConfig(),
+            edge=zero,
+            recon=recon,
+            deg=torch.tensor(float(component == "deg")),
+            real_egostat=zero,
+            real_gin=zero,
+            ssl_noise=zero,
+            ssl_pool=zero,
+        )
+        assert float(total) == pytest.approx(expected)
+
+    def test_pinned_weights(self) -> None:
+        config = EgoStitchConfig()
+        assert {
+            "L_feat": config.w_feat,
+            "L_exist": config.w_exist,
+            "L_mult": config.w_mult,
+            "L_deg": config.w_deg,
+            "L_slotadj": config.w_slotadj,
+            "L_gate": config.w_gate,
+            "L_ptr": config.w_ptr,
+            "L_align": config.w_align,
+            "L_div": config.w_div,
+            "L_rel": config.w_rel,
+        } == {
+            "L_feat": 1.0,
+            "L_exist": 0.5,
+            "L_mult": 0.25,
+            "L_deg": 0.5,
+            "L_slotadj": 0.5,
+            "L_gate": 0.25,
+            "L_ptr": 0.25,
+            "L_align": 0.5,
+            "L_div": 0.1,
+            "L_rel": 0.25,
+        }
+        one = torch.tensor(1.0)
+        recon = {
+            "feat": one,
+            "exist": one,
+            "mult": one,
+            "slotadj": one,
+            "gate": one,
+            "ptr": one,
+            "align": one,
+            "div": one,
+            "rel": one,
+        }
+        total, parts = stage1_total(
+            config,
             edge=one,
             recon=recon,
             deg=one,
@@ -268,25 +469,54 @@ class TestStage1Total:
             ssl_noise=one,
             ssl_pool=one,
         )
-        # L_recon = 1 + 0.5 + 0.25 + 0.5 + 0.5 + 0.25 = 3.0 (deg folded at 0.5)
+        # Exact spec table: all ten components sum to 4.1 at unit inputs.
         # L_real = 2/3 + 1/3 = 1.0 ; L_ssl = 1.0
-        # total = 1 + 0.5*1 + 0.1*1 + 1.0*3.0 = 4.6
-        assert float(total) == pytest.approx(4.6)
-        assert parts["recon"] == pytest.approx(3.0)
+        # total = 1 + 0.5*1 + 0.1*1 + 1.0*4.1 = 5.7
+        assert float(total) == pytest.approx(5.7)
+        assert parts["recon"] == pytest.approx(4.1)
         assert parts["real"] == pytest.approx(1.0)
-        assert parts["total"] == pytest.approx(4.6)
+        assert parts["total"] == pytest.approx(5.7)
 
     def test_parts_are_floats(self) -> None:
         zero = torch.tensor(0.0)
-        recon = {"feat": zero, "exist": zero, "mult": zero, "slotadj": zero, "gate": zero}
+        recon = {
+            name: torch.tensor(float(index))
+            for index, name in enumerate(
+                ("feat", "exist", "mult", "slotadj", "gate", "ptr", "align", "div", "rel"),
+                start=1,
+            )
+        }
+        deg = torch.tensor(10.0)
         _, parts = stage1_total(
             _TINY,
             edge=zero,
             recon=recon,
-            deg=zero,
+            deg=deg,
             real_egostat=zero,
             real_gin=zero,
             ssl_noise=zero,
             ssl_pool=zero,
         )
+        assert set(parts) == {
+            "edge",
+            "recon",
+            "recon_feat",
+            "recon_exist",
+            "recon_mult",
+            "recon_deg",
+            "recon_slotadj",
+            "recon_gate",
+            "recon_ptr",
+            "recon_align",
+            "recon_div",
+            "recon_rel",
+            "real",
+            "real_egostat",
+            "real_gin",
+            "ssl",
+            "total",
+        }
+        for name, value in recon.items():
+            assert parts[f"recon_{name}"] == float(value)
+        assert parts["recon_deg"] == float(deg)
         assert all(isinstance(v, float) for v in parts.values())

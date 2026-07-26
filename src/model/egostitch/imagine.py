@@ -33,6 +33,7 @@ class SlotSet(NamedTuple):
         gate: Shape ``(B, K)`` grounding-gate probabilities in ``[0, 1]``.
         pointer: Shape ``(B, K, n_g)`` pointer softmax over grounding candidates.
         adj: Shape ``(B, K, K)`` symmetric slot-slot adjacency in ``[0, 1]``.
+        adj_logits: Shape ``(B, K, K)`` pre-sigmoid adjacency logits.
     """
 
     h: torch.Tensor
@@ -41,6 +42,7 @@ class SlotSet(NamedTuple):
     gate: torch.Tensor
     pointer: torch.Tensor
     adj: torch.Tensor
+    adj_logits: torch.Tensor
 
 
 class DenoiseSlots(NamedTuple):
@@ -220,7 +222,15 @@ class ImagineDecoder(nn.Module):
         )
         adj = torch.sigmoid(adj_logits)
 
-        slots = SlotSet(h=h, pi=pi, mult=mult, gate=gate, pointer=pointer, adj=adj)
+        slots = SlotSet(
+            h=h,
+            pi=pi,
+            mult=mult,
+            gate=gate,
+            pointer=pointer,
+            adj=adj,
+            adj_logits=adj_logits,
+        )
 
         denoise: DenoiseSlots | None = None
         if extra_proj is not None:
