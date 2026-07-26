@@ -484,7 +484,7 @@ class TestE2ECompositeStep:
             "node": batch.node,
             "edge": batch.edge,
             "joint_weight": torch.tensor(joint_weight),
-            "pair_only": joint_weight == 0.0,
+            "edge_active": joint_weight != 0.0,
             "real_ssl_scale": torch.tensor(joint_weight),
             "edge_rows_global": batch.edge_rows_global,
             "seed": 0,
@@ -519,6 +519,7 @@ class TestE2ECompositeStep:
             out = composite(self._payload(batch, joint_weight=0.0))
         loss = cast(torch.Tensor, out["loss"])
         assert bool(torch.isfinite(loss))
+        assert cast(dict[str, float], out["parts"])["edge"] == 0.0
         loss.backward()  # type: ignore[no-untyped-call]
 
         # joint_weight=0 zeros L_edge (and therefore trunk/STE/gates) during
@@ -647,14 +648,10 @@ class TestE2ECompositeStep:
                 accelerator,
             )
 
-        assert set(family_norms["pair_encoder_head"]) == {"edge"}
+        assert family_norms["pair_encoder_head"] == {}
         assert set(family_norms["generator"]) == {"recon"}
         assert family_norms["topology_content_conditioning"] == {}
-        assert set(submodule_rms) == {
-            "grad_rms_trunk",
-            "grad_rms_ste",
-            "grad_rms_content",
-        }
+        assert submodule_rms == {}
         assert payload["collect_diagnostics"] is False
 
     def test_family_probe_does_not_mutate_conditioning_ema(self, tmp_path: Path) -> None:
@@ -800,6 +797,17 @@ class TestE2ECompositeStep:
         )
         assert result.runtime_profile["validation_coverage_exact"] is True
         assert result.runtime_profile["training_coverage_exact"] is True
+        validation_record = cast(dict[str, float], result.history[0]["fidelity"])
+        for key in (
+            "pi_slot_std",
+            "h_pairwise_cosine_mean",
+            "adj_offdiag_std",
+            "plan_row_entropy",
+            "plan_rank1_marginal_residual",
+            "topology_delta_degree_correlation",
+        ):
+            assert key in validation_record
+            assert math.isfinite(validation_record[key])
         assert result.best_epoch == 1
         assert guard_persistence == [False] * len(optimizer_steps)
 

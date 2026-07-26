@@ -729,11 +729,11 @@ E2EArmName = Literal["full", "p0", "b0_e2e_f_only", "pair_topology"]
 
 @dataclass(frozen=True)
 class E2EPhaseState:
-    """Zero-based optimizer-step state for the §13.19 curriculum."""
+    """Zero-based optimizer-step state for the rev-3.1 §14.4.3 curriculum."""
 
     phase: E2EPhaseName
     alpha: float
-    pair_only: bool
+    edge_active: bool
     real_ssl_scale: float
 
 
@@ -751,12 +751,149 @@ def e2e_phase_state(step: int, total_steps: int) -> E2EPhaseState:
         raise ValueError(f"step must be in [0, {total_steps}), got {step}")
     phase_a_end, phase_b_end = e2e_phase_boundaries(total_steps)
     if step < phase_a_end:
-        return E2EPhaseState("A", 0.0, True, 0.0)
+        return E2EPhaseState("A", 0.0, False, 0.0)
     if step < phase_b_end:
         ramp_steps = phase_b_end - phase_a_end
         alpha = min(1.0, max(0.0, (step - phase_a_end + 1) / ramp_steps))
-        return E2EPhaseState("B", alpha, False, alpha)
-    return E2EPhaseState("C", 1.0, False, 1.0)
+        return E2EPhaseState("B", alpha, True, alpha)
+    return E2EPhaseState("C", 1.0, True, 1.0)
+
+
+_E2E_RECON_COMPONENTS = (
+    "feat",
+    "exist",
+    "mult",
+    "deg",
+    "slotadj",
+    "gate",
+    "ptr",
+    "align",
+    "div",
+    "rel",
+)
+_E2E_FIDELITY_COMPONENTS = frozenset({"feat", "exist", "mult", "deg"})
+
+
+def e2e_recon_component_factors(step: int, total_steps: int) -> dict[str, float]:
+    """Return the §14.4.1 per-component reconstruction anneal factors."""
+    if not 0 <= step < total_steps:
+        raise ValueError(f"step must be in [0, {total_steps}), got {step}")
+    edge_start, _ = e2e_phase_boundaries(total_steps)
+    edge_steps = total_steps - edge_start
+    if step < edge_start or edge_steps <= 1:
+        fidelity_factor = 1.0
+    else:
+        progress = (step - edge_start) / (edge_steps - 1)
+        fidelity_factor = 1.0 - 0.75 * progress
+    return {
+        name: fidelity_factor if name in _E2E_FIDELITY_COMPONENTS else 1.0
+        for name in _E2E_RECON_COMPONENTS
+    }
+
+
+def _e2e_dispersion_rows(
+    pi: torch.Tensor,
+    h: torch.Tensor,
+    adj: torch.Tensor,
+    plan: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Compute per-row rev-3.1 collapse telemetry in fp32."""
+    if pi.ndim != 2 or h.ndim != 3 or adj.ndim != 3 or plan.ndim != 3:
+        raise ValueError("dispersion inputs must have shapes (B,K), (B,K,D), (B,K,K), (B,K,K)")
+    batch, slots = pi.shape
+    if h.shape[:2] != (batch, slots) or adj.shape != (batch, slots, slots):
+        raise ValueError("slot dispersion tensor shapes disagree")
+    if plan.shape[1:] != (slots, slots):
+        raise ValueError("plan slot dimensions disagree with node slots")
+    with torch.autocast(device_type=pi.device.type, enabled=False):
+        pi32 = pi.float()
+        h32 = torch.nn.functional.normalize(h.float(), dim=-1)
+        adj32 = adj.float()
+        plan32 = plan.float()
+        upper = torch.triu_indices(slots, slots, offset=1, device=pi.device)
+        cosine = torch.bmm(h32, h32.transpose(1, 2))[:, upper[0], upper[1]].mean(dim=-1)
+        adj_std = adj32[:, upper[0], upper[1]].std(dim=-1)
+        mass = plan32.sum(dim=(1, 2), keepdim=True).clamp_min(1e-30)
+        row_mass = plan32.sum(dim=-1)
+        column_mass = plan32.sum(dim=-2)
+        rank1 = row_mass[:, :, None] * column_mass[:, None, :] / mass
+        residual = torch.linalg.vector_norm(plan32 - rank1, dim=(1, 2)) / torch.linalg.vector_norm(
+            plan32, dim=(1, 2)
+        ).clamp_min(1e-30)
+        row_probability = plan32 / row_mass[:, :, None].clamp_min(1e-30)
+        row_entropy = -(
+            row_probability * row_probability.clamp_min(1e-30).log()
+        ).sum(dim=-1).mean(dim=-1) / math.log(slots)
+    return {
+        "pi_slot_std": pi32.std(dim=-1),
+        "h_pairwise_cosine_mean": cosine,
+        "adj_offdiag_std": adj_std,
+        "plan_row_entropy": row_entropy,
+        "plan_rank1_marginal_residual": residual,
+    }
+
+
+def e2e_dispersion_statistics(
+    pi: torch.Tensor,
+    h: torch.Tensor,
+    adj: torch.Tensor,
+    plan: torch.Tensor,
+) -> dict[str, float]:
+    """Aggregate rev-3.1 validation dispersion telemetry."""
+    rows = _e2e_dispersion_rows(pi, h, adj, plan)
+    return {name: float(value.mean()) for name, value in rows.items()}
+
+
+@dataclass
+class E2ESlotCollapseGuard:
+    """Two-validation §14.4.8 slot-collapse death guard."""
+
+    streak: int = 0
+
+    def update(self, telemetry: Mapping[str, float], *, conditioning_active: bool) -> None:
+        """Raise the registered invalid-run label after two active bad validations."""
+        if not conditioning_active:
+            self.streak = 0
+            return
+        collapsed = (
+            telemetry["h_pairwise_cosine_mean"] > 0.95
+            or telemetry["plan_rank1_marginal_residual"] < 0.05
+        )
+        self.streak = self.streak + 1 if collapsed else 0
+        if self.streak >= 2:
+            raise RuntimeError("training_invalid(slot_collapse)")
+
+
+def e2e_degree_decorrelation_telemetry(
+    endpoint_degree: NDArray[np.float64],
+    topology_delta: NDArray[np.float64],
+) -> dict[str, float]:
+    """Correlation watchdog for the full-minus-f_logit validation residual."""
+    if endpoint_degree.shape != topology_delta.shape:
+        raise ValueError("endpoint degree and topology delta shapes must match")
+    if endpoint_degree.size < 2 or np.std(endpoint_degree) == 0 or np.std(topology_delta) == 0:
+        correlation = 0.0
+    else:
+        correlation = float(np.corrcoef(endpoint_degree, topology_delta)[0, 1])
+    return {"topology_delta_degree_correlation": correlation}
+
+
+def _e2e_validation_endpoint_degrees(data: EgoStitchData) -> NDArray[np.float64]:
+    """Return degree sums from the validation role's own structural graph."""
+    if data.validation_nodes:
+        graph = nx.Graph()
+        graph.add_nodes_from(data.validation_nodes)
+        graph.add_edges_from(data.validation_positive_edges)
+    else:
+        graph = data.target_builder.graph
+    return np.asarray(
+        [
+            float(graph.degree(u) if u in graph else 0)
+            + float(graph.degree(v) if v in graph else 0)
+            for u, v in data.val_pairs
+        ],
+        dtype=np.float64,
+    )
 
 
 def e2e_first_eligible_epoch(total_steps: int, steps_per_epoch: int) -> int:
@@ -2875,18 +3012,12 @@ class _CompositeStep(torch.nn.Module):
 
         extra: dict[str, object] = {}
         if isinstance(self.model, EgoStitchE2E):
-            pair_only = bool(batch.get("pair_only", False))
+            edge_active = bool(batch.get("edge_active", True))
             real_ssl_scale = cast(torch.Tensor, batch["real_ssl_scale"])
             seed = cast(int, batch["seed"])
             epoch = cast(int, batch["epoch"])
             step = cast(int, batch["step"])
-            if pair_only:
-                branch_masks = masks_for_null(
-                    NULL_ALL_HEAD,
-                    edge["label"].shape[0],
-                    edge["label"].device,
-                )
-            elif self.model.cfg.permanent_null == "none":
+            if self.model.cfg.permanent_null == "none":
                 branch_masks = sample_branch_masks(
                     edge["label"].shape[0],
                     self.model.cfg.p_topo,
@@ -2922,15 +3053,22 @@ class _CompositeStep(torch.nn.Module):
                     ),
                 }
             )
-            edge_output = self.model(edge_view, masks=branch_masks)
-            logits = edge_output["logits"]
-            losses = losses._replace(
-                recon={
-                    **losses.recon,
-                    "align": edge_output["align_loss"],
-                    "rel": edge_output["rel_loss"],
-                }
-            )
+            if edge_active:
+                edge_output = self.model(edge_view, masks=branch_masks)
+                logits = edge_output["logits"]
+                losses = losses._replace(
+                    recon={
+                        **losses.recon,
+                        "align": edge_output["align_loss"],
+                        "rel": edge_output["rel_loss"],
+                    }
+                )
+            else:
+                logits = edge["label"].new_zeros(edge["label"].shape)
+                zero = losses.recon["feat"] * 0.0
+                losses = losses._replace(
+                    recon={**losses.recon, "align": zero, "rel": zero}
+                )
             if collect_diagnostics:
                 extra.update(_e2e_gate_tanh(self.model))
         else:
@@ -2944,11 +3082,15 @@ class _CompositeStep(torch.nn.Module):
                 }
 
         if isinstance(self.model, EgoStitchE2E):
-            edge_loss = e2e_weighted_bce_with_logits(
-                logits,
-                edge["label"],
-                edge["edge_mask"],
-                world_size=self.world_size,
+            edge_loss = (
+                e2e_weighted_bce_with_logits(
+                    logits,
+                    edge["label"],
+                    edge["edge_mask"],
+                    world_size=self.world_size,
+                )
+                if edge_active
+                else losses.recon["feat"] * 0.0
             )
         else:
             per_row = torch.nn.functional.binary_cross_entropy_with_logits(
@@ -2986,6 +3128,10 @@ class _CompositeStep(torch.nn.Module):
                 if isinstance(self.model, EgoStitchE2E)
                 else ssl["pool"] * joint_weight
             ),
+            recon_factors=cast(
+                Mapping[str, float] | None,
+                batch.get("recon_factors") if isinstance(self.model, EgoStitchE2E) else None,
+            ),
         )
         families = stage1_family_tensors(
             generator.config,
@@ -3016,6 +3162,10 @@ class _CompositeStep(torch.nn.Module):
                 ssl["pool"] * real_ssl_scale
                 if isinstance(self.model, EgoStitchE2E)
                 else ssl["pool"] * joint_weight
+            ),
+            recon_factors=cast(
+                Mapping[str, float] | None,
+                batch.get("recon_factors") if isinstance(self.model, EgoStitchE2E) else None,
             ),
         )
         if isinstance(self.model, EgoStitchE2E):
@@ -3451,7 +3601,8 @@ def _validate_epoch(
                     )
                 )
                 with accelerator.autocast():
-                    context = model.build_pair_context(e2e_batch)
+                    state_a, state_b, is_self = model._pair_node_states(e2e_batch)
+                    context = model.build_pair_context_from_states(state_a, state_b, is_self)
                     full_logits = model.score_pair_context(context)
                     f_logits = model.score_pair_context(
                         context,
@@ -3466,9 +3617,43 @@ def _validate_epoch(
                         if masks is None
                         else model.score_pair_context(context, masks=masks)
                     )
+                assert context.plan is not None
+                dispersion_a = _e2e_dispersion_rows(
+                    state_a.slots.pi,
+                    state_a.slots.h,
+                    state_a.slots.adj,
+                    context.plan,
+                )
+                dispersion_b = _e2e_dispersion_rows(
+                    state_b.slots.pi,
+                    state_b.slots.h,
+                    state_b.slots.adj,
+                    context.plan,
+                )
+                dispersion_rows = {
+                    name: (
+                        0.5 * (dispersion_a[name] + dispersion_b[name])
+                        if name
+                        in {"pi_slot_std", "h_pairwise_cosine_mean", "adj_offdiag_std"}
+                        else dispersion_a[name]
+                    )
+                    for name in dispersion_a
+                }
+                for name in ("plan_row_entropy", "plan_rank1_marginal_residual"):
+                    dispersion_rows[name] = dispersion_rows[name].masked_fill(is_self, torch.nan)
                 values_out.append(
                     torch.stack(
-                        [active_logits.float(), full_logits.float(), f_logits.float()], dim=-1
+                        [
+                            active_logits.float(),
+                            full_logits.float(),
+                            f_logits.float(),
+                            dispersion_rows["pi_slot_std"],
+                            dispersion_rows["h_pairwise_cosine_mean"],
+                            dispersion_rows["adj_offdiag_std"],
+                            dispersion_rows["plan_row_entropy"],
+                            dispersion_rows["plan_rank1_marginal_residual"],
+                        ],
+                        dim=-1,
                     )
                 )
                 continue
@@ -3519,7 +3704,7 @@ def _validate_epoch(
                 )
             )
 
-    n_cols = 3 if is_e2e else 5
+    n_cols = 8 if is_e2e else 5
     local_values = (
         torch.cat(values_out) if values_out else torch.zeros((0, n_cols), device=accelerator.device)
     )
@@ -3548,6 +3733,22 @@ def _validate_epoch(
         f_probs = 1.0 / (1.0 + np.exp(-f_np))
         f_metrics = compute_edge_metrics(data.val_labels.astype(np.int64), f_probs)
         active_std = float(np.std(logits_np))
+        dispersion_names = (
+            "pi_slot_std",
+            "h_pairwise_cosine_mean",
+            "adj_offdiag_std",
+            "plan_row_entropy",
+            "plan_rank1_marginal_residual",
+        )
+        dispersion_summary = {
+            name: (
+                float(np.mean(values[np.isfinite(values)]))
+                if bool(np.isfinite(values).any())
+                else 0.0
+            )
+            for name, values in zip(dispersion_names, ordered[:, 3:].T, strict=True)
+        }
+        endpoint_degree = _e2e_validation_endpoint_degrees(data)
         fidelity = {
             "active_logit_std": active_std,
             "f_logit_std": f_std,
@@ -3557,6 +3758,8 @@ def _validate_epoch(
             "selection_tiebreak": 0.0,
             "clustering_mmd": _validation_clustering_mmd(data, logits_np),
             "prevalence": float(np.mean(data.val_labels)),
+            **dispersion_summary,
+            **e2e_degree_decorrelation_telemetry(endpoint_degree, full_np - f_np),
         }
     else:
         fidelity = _fidelity_summary(
@@ -3647,8 +3850,10 @@ def _e2e_base_lr(step: int, total_steps: int, config: EgoStitchTrainingConfig) -
 
 
 def _e2e_active_groups(phase: E2EPhaseState, arm: E2EArmName) -> set[str]:
-    groups = {"pair_encoder_head", "generator"}
-    if not phase.pair_only and arm != "b0_e2e_f_only":
+    groups = {"generator"}
+    if phase.edge_active:
+        groups.add("pair_encoder_head")
+    if phase.edge_active and arm != "b0_e2e_f_only":
         groups.add("topology_content_conditioning")
     return groups
 
@@ -3660,13 +3865,15 @@ def _e2e_training_payload(
     *,
     epoch: int,
     step: int,
+    total_steps: int,
     device: torch.device,
 ) -> dict[str, object]:
     return {
         "node": _to_device(batch.node, device),
         "edge": _to_device(batch.edge, device),
         "edge_rows_global": batch.edge_rows_global,
-        "pair_only": phase.pair_only,
+        "edge_active": phase.edge_active,
+        "recon_factors": e2e_recon_component_factors(step, total_steps),
         "real_ssl_scale": torch.tensor(phase.real_ssl_scale, device=device),
         "seed": cfg.seed,
         "epoch": epoch,
@@ -3729,15 +3936,17 @@ def _e2e_family_probe(
     accelerator: Accelerator,
 ) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
     """Isolated synchronized family backwards on one immutable replay batch."""
-    families = ["edge", "recon"]
+    families = ["recon"]
+    if phase.edge_active:
+        families.insert(0, "edge")
     if phase.real_ssl_scale > 0.0:
         families.extend(("real", "ssl"))
     expected: dict[str, set[str]] = {
-        "pair_encoder_head": {"edge"},
+        "pair_encoder_head": {"edge"} if phase.edge_active else set(),
         "generator": {"recon"} | ({"real", "ssl"} if phase.real_ssl_scale > 0.0 else set()),
         "topology_content_conditioning": set(),
     }
-    if not phase.pair_only and arm != "b0_e2e_f_only":
+    if phase.edge_active and arm != "b0_e2e_f_only":
         expected["generator"].add("edge")
         expected["topology_content_conditioning"].add("edge")
     result: dict[str, dict[str, float]] = {group: {} for group in groups}
@@ -3909,7 +4118,7 @@ def _train_e2e_stability_loop(
     node_batch: int,
     profile_only: bool = False,
 ) -> EgoTrainResult:
-    """Execute the registered §13.19 Stage-2/3 curriculum and selector."""
+    """Execute the rev-3.1 §14.4 curriculum, death guards, and selector."""
     training = cfg.training
     if training is None:
         raise ValueError("E2E stability training requires cfg.training")
@@ -4000,6 +4209,7 @@ def _train_e2e_stability_loop(
     warm_reference_std: float | None = None
     warm_reference_auprc: float | None = None
     collapse_streak = 0
+    slot_collapse_guard = E2ESlotCollapseGuard()
     last_metrics: EdgeMetrics | None = None
     last_fidelity: dict[str, float] | None = None
     fixed_replay: dict[str, object] | None = None
@@ -4059,6 +4269,7 @@ def _train_e2e_stability_loop(
                     phase,
                     epoch=1 if run_kind == "overfit" else epoch,
                     step=global_step,
+                    total_steps=schedule_total_steps,
                     device=accelerator.device,
                 )
                 if fixed_replay is None:
@@ -4118,7 +4329,10 @@ def _train_e2e_stability_loop(
                 if not profile_only and global_step % cfg.diagnostics.gradient_probe_interval == 0:
                     assert fixed_replay is not None
                     probe_payload = cast(dict[str, object], _detached_clone(fixed_replay))
-                    probe_payload["pair_only"] = phase.pair_only
+                    probe_payload["edge_active"] = phase.edge_active
+                    probe_payload["recon_factors"] = e2e_recon_component_factors(
+                        global_step - 1, schedule_total_steps
+                    )
                     probe_payload["real_ssl_scale"] = torch.tensor(
                         phase.real_ssl_scale, device=accelerator.device
                     )
@@ -4218,6 +4432,7 @@ def _train_e2e_stability_loop(
         validation_seconds = time.monotonic() - validation_started
         epoch_wall = time.monotonic() - epoch_started
         collapse_failure = 0
+        slot_collapse_failure = 0
         if accelerator.is_main_process:
             assert validation is not None
             metrics = validation.metrics
@@ -4233,6 +4448,13 @@ def _train_e2e_stability_loop(
                 if collapse_streak >= training.collapse_validations:
                     collapse_failure = 1
             phase = e2e_phase_state(global_step - 1, schedule_total_steps)
+            try:
+                slot_collapse_guard.update(
+                    fidelity,
+                    conditioning_active=phase.edge_active and arm != "b0_e2e_f_only",
+                )
+            except RuntimeError:
+                slot_collapse_failure = 1
             full_joint_epochs = max(0, epoch - first_eligible_epoch + 1)
             record = E2ECheckpointRecord(
                 epoch=epoch,
@@ -4270,6 +4492,11 @@ def _train_e2e_stability_loop(
                     **{f"loss_{name}": value for name, value in epoch_parts.items()},
                 }
             )
+        failed = accelerator.reduce(
+            torch.tensor(slot_collapse_failure, device=accelerator.device), reduction="sum"
+        )
+        if int(failed.item()) > 0:
+            raise RuntimeError("training_invalid(slot_collapse)")
         failed = accelerator.reduce(
             torch.tensor(collapse_failure, device=accelerator.device), reduction="sum"
         )
@@ -5312,7 +5539,7 @@ def _run_probe_mode(
                 payload["epoch"] = step // steps_per_epoch + 1
                 payload["step"] = step % steps_per_epoch
                 if cfg.training is not None:
-                    payload["pair_only"] = False
+                    payload["edge_active"] = True
                     payload["real_ssl_scale"] = torch.tensor(1.0, device=accelerator.device)
             loss: torch.Tensor | None = None
             local_failure: tuple[str, str] | None = None

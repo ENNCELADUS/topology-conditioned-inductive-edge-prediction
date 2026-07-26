@@ -239,6 +239,8 @@ class E2EConfig:
         tau_div: Registered slot-diversity threshold (spec Sec 14.4.1).
         l_gate_pos_weight: Registered positive-class weight for ``L_gate``
             (spec Sec 14.4.1).
+        conditioning_ema_decay: Decay for the synchronized conditioning-center
+            EMA stored in rev-3.1 checkpoints (spec Sec 14.4.2).
         w_rel: Interior ``L_recon`` weight for the discarded-at-inference
             relational head; ``0`` defines the formal ``no_l_rel`` arm.
     """
@@ -258,6 +260,7 @@ class E2EConfig:
     tau_adj: float = 0.5
     tau_div: float = 0.5
     l_gate_pos_weight: float = 6.17
+    conditioning_ema_decay: float = 0.99
     w_rel: float = 0.25
 
     def __post_init__(self) -> None:
@@ -296,6 +299,11 @@ class E2EConfig:
         if self.l_gate_pos_weight <= 0.0:
             raise ValueError(
                 f"l_gate_pos_weight must be positive, got {self.l_gate_pos_weight}"
+            )
+        if not 0.0 < self.conditioning_ema_decay < 1.0:
+            raise ValueError(
+                "conditioning_ema_decay must be in (0, 1), "
+                f"got {self.conditioning_ema_decay}"
             )
         if self.w_rel < 0.0:
             raise ValueError(f"w_rel must be non-negative, got {self.w_rel}")

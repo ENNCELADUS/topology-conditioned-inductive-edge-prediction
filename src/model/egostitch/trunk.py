@@ -26,6 +26,7 @@ class ConditionedPairCrossAttention(PairCrossAttention):
         n_inj: int = 1,
         xattn_heads: int = 8,
         xattn_dropout: float = 0.0,
+        conditioning_ema_decay: float = 0.99,
         d_model: int,
         **kwargs: object,
     ) -> None:
@@ -34,10 +35,22 @@ class ConditionedPairCrossAttention(PairCrossAttention):
             raise ValueError("n_inj must be in [1, n_layers]")
         self.n_inj = n_inj
         self.topo_xattn = nn.ModuleList(
-            GatedCrossAttention(d_model, xattn_heads, xattn_dropout) for _ in range(n_inj)
+            GatedCrossAttention(
+                d_model,
+                xattn_heads,
+                xattn_dropout,
+                ema_decay=conditioning_ema_decay,
+            )
+            for _ in range(n_inj)
         )
         self.cont_xattn = nn.ModuleList(
-            GatedCrossAttention(d_model, xattn_heads, xattn_dropout) for _ in range(n_inj)
+            GatedCrossAttention(
+                d_model,
+                xattn_heads,
+                xattn_dropout,
+                ema_decay=conditioning_ema_decay,
+            )
+            for _ in range(n_inj)
         )
 
     def forward(

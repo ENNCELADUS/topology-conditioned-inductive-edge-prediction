@@ -132,6 +132,7 @@ class EgoStitchE2E(nn.Module):
             mixing_mode="bidirectional_cross",
             n_inj=cfg.n_inj,
             xattn_heads=cfg.xattn_heads,
+            conditioning_ema_decay=cfg.conditioning_ema_decay,
         )
         self.ste = STEncoder(cfg.d_model, cfg.ste_dim, cfg.ste_layers)
         self.content_proj = ContentProjector(d_p=self.generator_cfg.d_p, d_model=cfg.d_model)

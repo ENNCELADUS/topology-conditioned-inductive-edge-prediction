@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
+import networkx as nx
 import numpy as np
 import pytest
 import torch
@@ -263,11 +264,91 @@ def test_e2e_three_phase_boundaries_and_first_eligibility() -> None:
     assert epoch_steps[20:] == (66,) * 10
     assert te.e2e_overfit_epoch_step_counts(30, profile_only=True) == (67,)
     assert te.e2e_phase_boundaries(2000) == (400, 600)
-    assert te.e2e_phase_state(399, 2000) == te.E2EPhaseState("A", 0.0, True, 0.0)
-    assert te.e2e_phase_state(400, 2000).alpha == pytest.approx(1 / 200)
-    assert te.e2e_phase_state(599, 2000) == te.E2EPhaseState("B", 1.0, False, 1.0)
-    assert te.e2e_phase_state(600, 2000) == te.E2EPhaseState("C", 1.0, False, 1.0)
+    warm = te.e2e_phase_state(399, 2000)
+    first_edge = te.e2e_phase_state(400, 2000)
+    assert warm == te.E2EPhaseState("A", 0.0, False, 0.0)
+    assert not warm.edge_active
+    assert first_edge.alpha == pytest.approx(1 / 200)
+    assert first_edge.edge_active
+    assert te.e2e_phase_state(599, 2000) == te.E2EPhaseState("B", 1.0, True, 1.0)
+    assert te.e2e_phase_state(600, 2000) == te.E2EPhaseState("C", 1.0, True, 1.0)
+    assert "pair_only" not in te.E2EPhaseState.__dataclass_fields__
     assert te.e2e_first_eligible_epoch(3000, 100) == 10
+
+
+def test_e2e_recon_anneal_factors_are_component_specific_by_name() -> None:
+    factors = te.e2e_recon_component_factors(1999, 2000)
+    assert factors == {
+        "feat": 0.25,
+        "exist": 0.25,
+        "mult": 0.25,
+        "deg": 0.25,
+        "slotadj": 1.0,
+        "gate": 1.0,
+        "ptr": 1.0,
+        "align": 1.0,
+        "div": 1.0,
+        "rel": 1.0,
+    }
+
+
+def test_slot_collapse_guard_uses_two_active_consecutive_validations_per_arm() -> None:
+    healthy = {
+        "h_pairwise_cosine_mean": 0.2,
+        "plan_rank1_marginal_residual": 0.4,
+    }
+    cosine_collapse = {**healthy, "h_pairwise_cosine_mean": 0.96}
+    plan_collapse = {**healthy, "plan_rank1_marginal_residual": 0.04}
+
+    for collapsed in (cosine_collapse, plan_collapse):
+        guard = te.E2ESlotCollapseGuard()
+        guard.update(collapsed, conditioning_active=False)
+        guard.update(collapsed, conditioning_active=False)
+        guard.update(collapsed, conditioning_active=True)
+        with pytest.raises(RuntimeError, match=r"training_invalid\(slot_collapse\)"):
+            guard.update(collapsed, conditioning_active=True)
+
+    guard = te.E2ESlotCollapseGuard()
+    for _ in range(4):
+        guard.update(healthy, conditioning_active=True)
+
+
+def test_rank1_plan_abort_is_not_blinded_by_concentrated_row_entropy() -> None:
+    row_marginal = torch.tensor([0.74, 0.08666667, 0.08666667, 0.08666667])
+    column_marginal = row_marginal.clone()
+    plan = torch.outer(row_marginal, column_marginal).unsqueeze(0)
+    pi = row_marginal.unsqueeze(0)
+    h = torch.eye(4).unsqueeze(0)
+    adj = torch.eye(4).unsqueeze(0)
+    telemetry = te.e2e_dispersion_statistics(pi, h, adj, plan)
+
+    assert telemetry["plan_row_entropy"] == pytest.approx(0.624, abs=0.01)
+    assert telemetry["plan_rank1_marginal_residual"] < 0.05
+    guard = te.E2ESlotCollapseGuard()
+    guard.update(telemetry, conditioning_active=True)
+    with pytest.raises(RuntimeError, match=r"training_invalid\(slot_collapse\)"):
+        guard.update(telemetry, conditioning_active=True)
+
+
+def test_degree_decorrelation_telemetry_uses_expected_validation_key() -> None:
+    record = te.e2e_degree_decorrelation_telemetry(
+        np.array([3.0, 1.0, 4.0, 2.0]),
+        np.array([0.3, 0.1, 0.4, 0.2]),
+    )
+    assert record == {"topology_delta_degree_correlation": pytest.approx(1.0)}
+
+
+def test_degree_telemetry_uses_validation_role_topology() -> None:
+    data = cast(
+        te.EgoStitchData,
+        SimpleNamespace(
+            validation_nodes=("a", "b", "c"),
+            validation_positive_edges=(("a", "b"), ("a", "c")),
+            val_pairs=[("a", "b"), ("b", "c")],
+            target_builder=SimpleNamespace(graph=nx.Graph()),
+        ),
+    )
+    np.testing.assert_array_equal(te._e2e_validation_endpoint_degrees(data), [3.0, 2.0])
 
 
 def test_overfit_profile_is_the_first_production_epoch_not_a_compressed_schedule() -> None:
@@ -458,11 +539,14 @@ def test_e2e_lr_and_active_groups_follow_registered_phase_contract() -> None:
     assert te._e2e_base_lr(0, 2000, config) == pytest.approx(2e-7)
     assert te._e2e_base_lr(499, 2000, config) == pytest.approx(1e-4)
     assert te._e2e_base_lr(1999, 2000, config) == pytest.approx(1e-5)
-    phase_a = te.E2EPhaseState("A", 0.0, True, 0.0)
-    phase_c = te.E2EPhaseState("C", 1.0, False, 1.0)
-    assert te._e2e_active_groups(phase_a, "full") == {
+    phase_a = te.E2EPhaseState("A", 0.0, False, 0.0)
+    first_edge = te.e2e_phase_state(400, 2000)
+    phase_c = te.E2EPhaseState("C", 1.0, True, 1.0)
+    assert te._e2e_active_groups(phase_a, "full") == {"generator"}
+    assert te._e2e_active_groups(first_edge, "full") == {
         "pair_encoder_head",
         "generator",
+        "topology_content_conditioning",
     }
     assert te._e2e_active_groups(phase_c, "full") == {
         "pair_encoder_head",

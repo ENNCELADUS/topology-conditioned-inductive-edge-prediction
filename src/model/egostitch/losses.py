@@ -17,7 +17,7 @@ are stop-gradient (spec Sec 13.7).
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Literal
 
 import torch
@@ -586,6 +586,56 @@ def ssl_consistency(
 # --------------------------------------------------------------------------- totals
 
 
+_RECON_COMPONENT_NAMES = (
+    "feat",
+    "exist",
+    "mult",
+    "deg",
+    "slotadj",
+    "gate",
+    "ptr",
+    "align",
+    "div",
+    "rel",
+)
+
+
+def _recon_total(
+    config: EgoStitchConfig,
+    *,
+    family: LossFamily,
+    recon: Mapping[str, torch.Tensor],
+    deg: torch.Tensor,
+    zero: torch.Tensor,
+    recon_factors: Mapping[str, float] | None,
+) -> torch.Tensor:
+    """Apply rev-3.1 schedule factors inside the reconstruction decomposition."""
+    factors = dict.fromkeys(_RECON_COMPONENT_NAMES, 1.0)
+    if family == "egostitch_e2e" and recon_factors is not None:
+        if set(recon_factors) != set(_RECON_COMPONENT_NAMES):
+            raise ValueError(
+                "recon_factors must name exactly the ten L_recon components"
+            )
+        factors.update({name: float(value) for name, value in recon_factors.items()})
+    l_recon = (
+        factors["feat"] * config.w_feat * recon["feat"]
+        + factors["exist"] * config.w_exist * recon["exist"]
+        + factors["mult"] * config.w_mult * recon["mult"]
+        + factors["deg"] * config.w_deg * deg
+        + factors["slotadj"] * config.w_slotadj * recon["slotadj"]
+        + factors["gate"] * config.w_gate * recon["gate"]
+    )
+    if family == "egostitch_e2e":
+        l_recon = (
+            l_recon
+            + factors["ptr"] * config.w_ptr * recon["ptr"]
+            + factors["align"] * config.w_align * recon.get("align", zero)
+            + factors["div"] * config.w_div * recon["div"]
+            + factors["rel"] * config.w_rel * recon.get("rel", zero)
+        )
+    return l_recon
+
+
 def stage1_family_tensors(
     config: EgoStitchConfig,
     *,
@@ -597,25 +647,18 @@ def stage1_family_tensors(
     real_gin: torch.Tensor,
     ssl_noise: torch.Tensor,
     ssl_pool: torch.Tensor,
+    recon_factors: Mapping[str, float] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Return the four *weighted* loss-family tensors used by the optimizer."""
     zero = edge * 0.0
-    l_recon = (
-        config.w_feat * recon["feat"]
-        + config.w_exist * recon["exist"]
-        + config.w_mult * recon["mult"]
-        + config.w_deg * deg
-        + config.w_slotadj * recon["slotadj"]
-        + config.w_gate * recon["gate"]
+    l_recon = _recon_total(
+        config,
+        family=family,
+        recon=recon,
+        deg=deg,
+        zero=zero,
+        recon_factors=recon_factors,
     )
-    if family == "egostitch_e2e":
-        l_recon = (
-            l_recon
-            + config.w_ptr * recon["ptr"]
-            + config.w_align * recon.get("align", zero)
-            + config.w_div * recon["div"]
-            + config.w_rel * recon.get("rel", zero)
-        )
     l_real = config.w_egostat * real_egostat + config.w_gin * real_gin
     l_ssl = 0.5 * ssl_noise + 0.5 * ssl_pool
     return {
@@ -637,6 +680,7 @@ def stage1_total(
     real_gin: torch.Tensor,
     ssl_noise: torch.Tensor,
     ssl_pool: torch.Tensor,
+    recon_factors: Mapping[str, float] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Combine loss families with the pinned weights (spec Sec 13.5 / Sec 14.4.1).
 
@@ -650,6 +694,8 @@ def stage1_total(
         real_gin: Random-GIN energy distance.
         ssl_noise: Feature-noise consistency.
         ssl_pool: Pool-resample consistency.
+        recon_factors: Optional named rev-3.1 schedule factors applied inside
+            ``L_recon``; ignored for the standalone ``egostitch`` family.
 
     Returns:
         ``(total, per-family floats)`` — the float dict is for logging
@@ -658,22 +704,14 @@ def stage1_total(
     zero = edge * 0.0
     align = recon.get("align", zero)
     rel = recon.get("rel", zero)
-    l_recon = (
-        config.w_feat * recon["feat"]
-        + config.w_exist * recon["exist"]
-        + config.w_mult * recon["mult"]
-        + config.w_deg * deg
-        + config.w_slotadj * recon["slotadj"]
-        + config.w_gate * recon["gate"]
+    l_recon = _recon_total(
+        config,
+        family=family,
+        recon=recon,
+        deg=deg,
+        zero=zero,
+        recon_factors=recon_factors,
     )
-    if family == "egostitch_e2e":
-        l_recon = (
-            l_recon
-            + config.w_ptr * recon["ptr"]
-            + config.w_align * align
-            + config.w_div * recon["div"]
-            + config.w_rel * rel
-        )
     l_real = config.w_egostat * real_egostat + config.w_gin * real_gin
     l_ssl = 0.5 * ssl_noise + 0.5 * ssl_pool
     families = stage1_family_tensors(
@@ -686,6 +724,7 @@ def stage1_total(
         real_gin=real_gin,
         ssl_noise=ssl_noise,
         ssl_pool=ssl_pool,
+        recon_factors=recon_factors,
     )
     total = torch.stack(tuple(families.values())).sum()
     parts = {

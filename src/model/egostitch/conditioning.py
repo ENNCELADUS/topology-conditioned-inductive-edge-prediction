@@ -21,7 +21,6 @@ NULL_ALL_HEAD = "all_head"
 NULL_TOPO_HEAD = "topo_head"
 NULL_CONTENT_HEAD = "content_head"
 _KNOWN_NULLS = (NULL_NONE, NULL_ALL_HEAD, NULL_TOPO_HEAD, NULL_CONTENT_HEAD)
-_EMA_DECAY = 0.99
 
 
 class HeadNullMasks(NamedTuple):
@@ -67,8 +66,18 @@ class GatedCrossAttention(nn.Module):
     ema_mu: torch.Tensor
     ema_updates: torch.Tensor
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        dropout: float,
+        *,
+        ema_decay: float = 0.99,
+    ) -> None:
         super().__init__()
+        if not 0.0 < ema_decay < 1.0:
+            raise ValueError(f"ema_decay must be in (0, 1), got {ema_decay}")
+        self.ema_decay = float(ema_decay)
         self.norm_q = nn.LayerNorm(d_model)
         self.norm_kv = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
@@ -135,7 +144,9 @@ class GatedCrossAttention(nn.Module):
             if int(self.ema_updates.item()) == 0:
                 self.ema_mu.copy_(mu.detach())
             else:
-                self.ema_mu.mul_(_EMA_DECAY).add_(mu.detach(), alpha=1.0 - _EMA_DECAY)
+                self.ema_mu.mul_(self.ema_decay).add_(
+                    mu.detach(), alpha=1.0 - self.ema_decay
+                )
             self.ema_updates.add_(1)
 
     def forward(

@@ -638,6 +638,38 @@ class TestStage1Total:
         assert float(total) == 0.0
         assert parts["recon"] == 0.0
 
+    def test_e2e_component_factors_do_not_anneal_repair_losses(self) -> None:
+        one = torch.tensor(1.0)
+        recon = dict.fromkeys(
+            ("feat", "exist", "mult", "slotadj", "gate", "ptr", "align", "div", "rel"),
+            one,
+        )
+        factors = {
+            "feat": 0.25,
+            "exist": 0.25,
+            "mult": 0.25,
+            "deg": 0.25,
+            "slotadj": 1.0,
+            "gate": 1.0,
+            "ptr": 1.0,
+            "align": 1.0,
+            "div": 1.0,
+            "rel": 1.0,
+        }
+        _, parts = stage1_total(
+            EgoStitchConfig(),
+            family="egostitch_e2e",
+            edge=torch.tensor(0.0),
+            recon=recon,
+            deg=one,
+            real_egostat=torch.tensor(0.0),
+            real_gin=torch.tensor(0.0),
+            ssl_noise=torch.tensor(0.0),
+            ssl_pool=torch.tensor(0.0),
+            recon_factors=factors,
+        )
+        assert parts["recon"] == pytest.approx(2.4125)
+
     def test_parts_are_floats(self) -> None:
         zero = torch.tensor(0.0)
         recon = {
