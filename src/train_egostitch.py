@@ -2275,6 +2275,23 @@ def _seeded_generator(*parts: int) -> torch.Generator:
     return gen
 
 
+def _edge_target_rng(node_id: str, *, seed: int, epoch: int) -> np.random.Generator:
+    """Return the rev-3.1 node/epoch-keyed ego-target RNG (spec Sec 14.4.1).
+
+    The 128-bit BLAKE2b node-identity key is XORed with the ordered
+    ``(seed, epoch)`` pair packed as two unsigned 64-bit integers. Rank, step,
+    pair identity, and endpoint direction are deliberately absent.
+    """
+    if not 0 <= seed < 2**64 or not 0 <= epoch < 2**64:
+        raise ValueError("edge-target seed and epoch must fit unsigned 64-bit integers")
+    node_key = int.from_bytes(
+        hashlib.blake2b(node_id.encode("utf-8"), digest_size=16).digest(),
+        "little",
+    )
+    seed_epoch_key = (seed << 64) | epoch
+    return np.random.default_rng(node_key ^ seed_epoch_key)
+
+
 @dataclass
 class _CompositeBatch:
     """One composite optimizer-step batch (CPU tensors; moved by the caller).
@@ -2519,9 +2536,59 @@ class _BatchFactory:
         self._record_training_nodes((*endpoints_a, *endpoints_b))
         return _gather_token_streams(table, index, endpoints_a, endpoints_b)
 
+    def _edge_target_tensors(
+        self,
+        rows: Sequence[tuple[str, str, int]],
+        *,
+        true_rows: int,
+        epoch: int,
+    ) -> dict[str, torch.Tensor]:
+        """Build positive-real-row endpoint targets keyed only by node and epoch."""
+        batch = len(rows)
+        slots = self._model_cfg.slots
+        input_dim = self._model_cfg.input_dim
+        targets: dict[str, torch.Tensor] = {}
+        for side in ("i", "j"):
+            targets[f"target_features_{side}"] = torch.zeros(
+                batch, slots, input_dim, dtype=torch.float32
+            )
+            targets[f"target_mult_{side}"] = torch.zeros(batch, slots, dtype=torch.float32)
+            targets[f"target_adj_{side}"] = torch.zeros(
+                batch, slots, slots, dtype=torch.float32
+            )
+            targets[f"target_mask_{side}"] = torch.zeros(batch, slots, dtype=torch.bool)
+            targets[f"target_node_index_{side}"] = torch.full(
+                (batch, slots), -1, dtype=torch.long
+            )
+
+        cached: dict[str, EgoTargets] = {}
+        for row_index, (node_i, node_j, label) in enumerate(rows):
+            if row_index >= true_rows or label != 1:
+                continue
+            for side, node_id in (("i", node_i), ("j", node_j)):
+                node_targets = cached.get(node_id)
+                if node_targets is None:
+                    node_targets = self._data.target_builder.build(
+                        [node_id],
+                        _edge_target_rng(node_id, seed=self._cfg.seed, epoch=epoch),
+                    )
+                    cached[node_id] = node_targets
+                targets[f"target_features_{side}"][row_index] = node_targets.features[0]
+                targets[f"target_mult_{side}"][row_index] = node_targets.mult[0]
+                targets[f"target_adj_{side}"][row_index] = node_targets.adj[0]
+                targets[f"target_mask_{side}"][row_index] = node_targets.mask[0]
+                targets[f"target_node_index_{side}"][row_index] = node_targets.node_index[0]
+        return targets
+
     def _edge_tensors(
-        self, rows: Sequence[tuple[str, str, int]], *, pad_to: int
+        self,
+        rows: Sequence[tuple[str, str, int]],
+        *,
+        pad_to: int,
+        epoch: int,
+        step: int,
     ) -> tuple[dict[str, torch.Tensor], int]:
+        del step  # Rev-3.1 target sampling is explicitly step-independent.
         true_rows = len(rows)
         padded: list[tuple[str, str, int]] = list(rows)
         if true_rows == 0:
@@ -2553,6 +2620,7 @@ class _BatchFactory:
             # flag, which compares `ground_id_a`/`ground_id_b` for equality.
             edge["ground_id_i"] = self._ground_pool_rows(endpoints_u)
             edge["ground_id_j"] = self._ground_pool_rows(endpoints_v)
+            edge.update(self._edge_target_tensors(padded, true_rows=true_rows, epoch=epoch))
         else:
             s0 = (
                 self._data.s0.lookup([(u, v) for u, v, _ in padded])
@@ -2583,13 +2651,23 @@ class _BatchFactory:
             )
             node = self._node_tensors(nodes, targets, epoch=epoch, step=step)
             chunk = edge_rows[step * edge_batch : (step + 1) * edge_batch]
-            edge, true_rows = self._edge_tensors(chunk, pad_to=edge_batch)
+            edge, true_rows = self._edge_tensors(
+                chunk,
+                pad_to=edge_batch,
+                epoch=epoch,
+                step=step,
+            )
             global_count = _step_global_count(rows_per_rank, step, edge_batch)
             f0_rows = (
                 node["x"].shape[0]
                 + node["ground_x"].shape[0] * node["ground_x"].shape[1]
                 + node["target_features"].shape[0] * node["target_features"].shape[1]
                 + 4 * edge["x_i"].shape[0]  # x_i, x_j and both grounding gathers
+                + sum(
+                    edge[name].shape[0] * edge[name].shape[1]
+                    for name in ("target_features_i", "target_features_j")
+                    if name in edge
+                )
             )
             yield _CompositeBatch(
                 node=node,
@@ -2603,6 +2681,7 @@ class _BatchFactory:
         self,
         *,
         manifest: OverfitManifest,
+        epoch: int,
         steps: int,
         step_offset: int,
     ) -> Iterator[_CompositeBatch]:
@@ -2626,12 +2705,22 @@ class _BatchFactory:
                 ),
             )
             node = self._node_tensors(nodes, targets, epoch=0, step=global_step)
-            edge, true_rows = self._edge_tensors(local_rows, pad_to=edge_batch)
+            edge, true_rows = self._edge_tensors(
+                local_rows,
+                pad_to=edge_batch,
+                epoch=epoch,
+                step=global_step,
+            )
             f0_rows = (
                 node["x"].shape[0]
                 + node["ground_x"].shape[0] * node["ground_x"].shape[1]
                 + node["target_features"].shape[0] * node["target_features"].shape[1]
                 + 4 * edge["x_i"].shape[0]
+                + sum(
+                    edge[name].shape[0] * edge[name].shape[1]
+                    for name in ("target_features_i", "target_features_j")
+                    if name in edge
+                )
             )
             yield _CompositeBatch(
                 node=node,
@@ -3868,6 +3957,7 @@ def _train_e2e_stability_loop(
             batch_source = iter(
                 factory.fixed_row_batches(
                     manifest=overfit_manifest,
+                    epoch=epoch,
                     steps=epoch_steps,
                     step_offset=global_step,
                 )

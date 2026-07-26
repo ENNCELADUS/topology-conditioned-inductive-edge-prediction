@@ -348,7 +348,10 @@ def test_fixed_overfit_batches_preserve_global_rows_and_four_rank_padding(
         local_rows: tuple[tuple[str, str, int], ...],
         *,
         pad_to: int,
+        epoch: int,
+        step: int,
     ) -> tuple[dict[str, torch.Tensor], int]:
+        del epoch, step
         seen_rows[factory._rank] = local_rows
         labels = [label for _, _, label in local_rows]
         return {
@@ -368,7 +371,16 @@ def test_fixed_overfit_batches_preserve_global_rows_and_four_rank_padding(
         factory._rank = rank
         factory._world = 4
         factory._data = cast(te.EgoStitchData, SimpleNamespace(target_builder=_TargetBuilder(rank)))
-        batches.append(next(factory.fixed_row_batches(manifest=manifest, steps=1, step_offset=1)))
+        batches.append(
+            next(
+                factory.fixed_row_batches(
+                    manifest=manifest,
+                    epoch=1,
+                    steps=1,
+                    step_offset=1,
+                )
+            )
+        )
 
     expected = te.e2e_overfit_step_rows(manifest, step=1, batch_size=cfg.data.edge_batch)
     recovered = tuple(seen_rows[index % 4][index // 4] for index in range(cfg.data.edge_batch))

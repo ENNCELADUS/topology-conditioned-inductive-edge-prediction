@@ -17,6 +17,7 @@ import torch
 from accelerate import Accelerator
 from src import train_egostitch as te
 from src.data.artifacts import Benchmark, LabeledPairs, SplitArtifacts, canonical_pair
+from src.data.ego_targets import EgoTargetBuilder
 from src.data.packed_features import (
     PACK_FORMAT,
     PackedFeatureManifest,
@@ -26,6 +27,7 @@ from src.data.packed_features import (
     sha256_file,
     write_packed_manifest,
 )
+from src.data.pairs import NegativeSampler
 from src.model.egostitch import EgoStitchConfig
 from src.model.egostitch.conditioning import GatedCrossAttention, HeadNullMasks
 from src.model.egostitch.config import E2EConfig
@@ -84,6 +86,175 @@ def _write_tiny_token_pack(pack_dir: Path, nodes: list[str], *, min_length: int 
 
 
 class TestBatchFactoryE2E:
+    @staticmethod
+    def _target_factory(
+        tmp_path: Path, *, rank: int = 0, world_size: int = 1
+    ) -> tuple[te._BatchFactory, EgoStitchConfig]:
+        model_cfg = EgoStitchConfig()
+        nodes = [f"target-node-{index:02d}" for index in range(34)]
+        node_index = {node: index for index, node in enumerate(nodes)}
+        rng = np.random.default_rng(71)
+        f0 = rng.normal(size=(len(nodes), model_cfg.input_dim)).astype(np.float32)
+        graph = nx.Graph()
+        graph.add_nodes_from(nodes)
+        graph.add_edges_from((nodes[0], node) for node in nodes[1:])
+        pool = {
+            node: [candidate for candidate in nodes if candidate != node][
+                : model_cfg.n_ground
+            ]
+            for node in nodes
+        }
+        grounding_index = np.array(
+            [[node_index[candidate] for candidate in pool[node]] for node in nodes],
+            dtype=np.int64,
+        )
+        degrees = {node: int(graph.degree(node)) for node in nodes}
+        sampler = NegativeSampler(nodes, degrees, frozenset(graph.edges()))
+        s0 = te.S0Cache.__new__(te.S0Cache)
+        s0._logits = {}
+        data = te.EgoStitchData(
+            train_nodes=nodes,
+            e_sup_positives=[(nodes[0], nodes[1]), (nodes[0], nodes[2])],
+            val_pairs=[],
+            val_labels=np.empty(0, dtype=np.int8),
+            f0=torch.from_numpy(f0),
+            node_index=node_index,
+            grounding_index=grounding_index,
+            train_pos={node: index for index, node in enumerate(nodes)},
+            target_builder=EgoTargetBuilder(
+                graph,
+                f0,
+                node_index,
+                pool,
+                slots=model_cfg.slots,
+            ),
+            sampler=sampler,
+            s0=s0,
+            rho_train=float(graph.number_of_edges() / (len(nodes) * (len(nodes) - 1) / 2)),
+        )
+        pack_dir = tmp_path / f"target-pack-{rank}"
+        _write_tiny_token_pack(pack_dir, nodes)
+        cfg = _toy_cfg(tmp_path)
+        e2e_cfg = replace(
+            cfg,
+            model=ModelConfig(family="egostitch_e2e", config={}),
+            data=replace(cfg.data, pack_dir=pack_dir),
+        )
+        return (
+            te._BatchFactory(
+                e2e_cfg,
+                model_cfg,
+                data,
+                node_batch=4,
+                rank=rank,
+                world_size=world_size,
+            ),
+            model_cfg,
+        )
+
+    def test_edge_targets_are_node_epoch_keyed_across_pairs_directions_and_ranks(
+        self, tmp_path: Path
+    ) -> None:
+        factory, _ = self._target_factory(tmp_path)
+        node = "target-node-00"
+        first, _ = factory._edge_tensors(
+            [(node, "target-node-01", 1), ("target-node-02", node, 1)],
+            pad_to=2,
+            epoch=3,
+            step=1,
+        )
+        later, _ = factory._edge_tensors(
+            [("target-node-03", node, 1), (node, "target-node-04", 1)],
+            pad_to=2,
+            epoch=3,
+            step=99,
+        )
+        other_rank_factory, _ = self._target_factory(tmp_path, rank=3, world_size=4)
+        other_rank, _ = other_rank_factory._edge_tensors(
+            [(node, "target-node-05", 1)],
+            pad_to=1,
+            epoch=3,
+            step=17,
+        )
+
+        expected = first["target_features_i"][0]
+        torch.testing.assert_close(first["target_features_j"][1], expected)
+        torch.testing.assert_close(later["target_features_j"][0], expected)
+        torch.testing.assert_close(later["target_features_i"][1], expected)
+        torch.testing.assert_close(other_rank["target_features_i"][0], expected)
+        assert torch.equal(first["target_mask_i"][0], first["target_mask_j"][1])
+        assert torch.equal(later["target_mask_j"][0], first["target_mask_i"][0])
+        assert torch.equal(first["target_node_index_i"][0], first["target_node_index_j"][1])
+        assert torch.equal(later["target_node_index_j"][0], first["target_node_index_i"][0])
+        assert torch.equal(other_rank["target_node_index_i"][0], first["target_node_index_i"][0])
+
+        next_epoch, _ = factory._edge_tensors(
+            [(node, "target-node-01", 1)],
+            pad_to=1,
+            epoch=4,
+            step=1,
+        )
+        assert not torch.equal(next_epoch["target_features_i"][0], expected)
+
+    def test_edge_targets_cap_mask_and_exclude_negative_or_filler_rows(
+        self, tmp_path: Path
+    ) -> None:
+        factory, model_cfg = self._target_factory(tmp_path)
+        edge, true_rows = factory._edge_tensors(
+            [
+                ("target-node-00", "target-node-01", 1),
+                ("target-node-02", "target-node-03", 0),
+            ],
+            pad_to=4,
+            epoch=2,
+            step=8,
+        )
+
+        assert true_rows == 2
+        assert edge["target_mask_i"].shape == (4, 16)
+        assert edge["target_features_i"].shape == (4, 16, model_cfg.input_dim)
+        assert int(edge["target_mask_i"][0].sum()) == 16
+        assert int(edge["target_mask_j"][0].sum()) == 1
+        assert not edge["target_mask_j"][0, 1:].any()
+        assert torch.count_nonzero(edge["target_features_j"][0, 1:]) == 0
+        for name in (
+            "target_mask_i",
+            "target_mask_j",
+            "target_mult_i",
+            "target_mult_j",
+            "target_adj_i",
+            "target_adj_j",
+            "target_features_i",
+            "target_features_j",
+        ):
+            assert torch.count_nonzero(edge[name][1:]) == 0
+        assert (edge["target_node_index_i"][0, edge["target_mask_i"][0]] >= 0).all()
+        assert (edge["target_node_index_j"][0, edge["target_mask_j"][0]] >= 0).all()
+        assert (edge["target_node_index_i"][0, ~edge["target_mask_i"][0]] == -1).all()
+        assert (edge["target_node_index_j"][0, ~edge["target_mask_j"][0]] == -1).all()
+        assert (edge["target_node_index_i"][1:] == -1).all()
+        assert (edge["target_node_index_j"][1:] == -1).all()
+
+    def test_edge_target_memory_manifest_counts_both_dense_endpoint_gathers(
+        self, tmp_path: Path
+    ) -> None:
+        factory, model_cfg = self._target_factory(tmp_path)
+        rows_per_rank, steps = te._epoch_step_plan(
+            len(factory._data.e_sup_positives),
+            negative_ratio=factory._cfg.data.negative_ratio,
+            edge_batch=factory._cfg.data.edge_batch,
+            world_size=1,
+        )
+        batch = next(factory.epoch_batches(1, rows_per_rank=rows_per_rank, steps=steps))
+        old_total = (
+            batch.node["x"].shape[0]
+            + batch.node["ground_x"].shape[0] * batch.node["ground_x"].shape[1]
+            + batch.node["target_features"].shape[0] * batch.node["target_features"].shape[1]
+            + 4 * batch.edge["x_i"].shape[0]
+        )
+        expected_delta = 2 * batch.edge["x_i"].shape[0] * model_cfg.slots
+        assert batch.f0_rows_gathered == old_total + expected_delta
+
     def test_edge_batch_carries_token_streams_in_stream_order(self, tmp_path: Path) -> None:
         cfg = _toy_cfg(tmp_path)
         model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
@@ -215,7 +386,7 @@ class TestBatchFactoryE2E:
                     )
                 else:
                     direct_source = direct_factory.fixed_row_batches(
-                        manifest=manifest, steps=3, step_offset=5
+                        manifest=manifest, epoch=1, steps=3, step_offset=5
                     )
                 direct = list(direct_source)
                 direct_state = (
@@ -234,7 +405,7 @@ class TestBatchFactoryE2E:
                     )
                 else:
                     prefetch_source = prefetch_factory.fixed_row_batches(
-                        manifest=manifest, steps=3, step_offset=5
+                        manifest=manifest, epoch=1, steps=3, step_offset=5
                     )
                 prefetched = list(te._prefetch_batches(iter(prefetch_source), depth=2))
                 prefetch_state = (

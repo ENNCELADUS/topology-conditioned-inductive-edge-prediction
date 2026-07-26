@@ -39,6 +39,9 @@ class EgoTargets(NamedTuple):
         in_pool: Shape ``(B, K)`` bool — target is in the node's grounding pool.
         pool_index: Shape ``(B, K)`` int64 — target index in the node's ordered
             grounding pool, or ``-1`` when the target is out of pool/padding.
+        node_index: Shape ``(B, K)`` int64 — target node's global F0 row, or
+            ``-1`` for padding. This is the identity contract used by
+            edge-stream shared-target supervision (spec Sec 14.4.1).
         ego_stats: Shape ``(B, 4)`` float32 real-side ego-stat vectors
             (spec Sec 13.6: degree, local clustering, ego edge count,
             ego density — NetworkX implementations on ``G_struct``).
@@ -51,6 +54,7 @@ class EgoTargets(NamedTuple):
     degree: torch.Tensor
     in_pool: torch.Tensor
     pool_index: torch.Tensor
+    node_index: torch.Tensor
     ego_stats: torch.Tensor
 
 
@@ -196,6 +200,7 @@ class EgoTargetBuilder:
         degree = np.zeros(batch, dtype=np.float32)
         in_pool = np.zeros((batch, k), dtype=bool)
         pool_index = np.full((batch, k), -1, dtype=np.int64)
+        target_node_index = np.full((batch, k), -1, dtype=np.int64)
         ego_stats = np.zeros((batch, 4), dtype=np.float32)
 
         for b, node in enumerate(node_ids):
@@ -209,6 +214,7 @@ class EgoTargetBuilder:
                 features[b, t] = self._f0[self._index[v]]
                 mult[b, t] = label
                 mask[b, t] = True
+                target_node_index[b, t] = self._index[v]
                 if v in pool:
                     in_pool[b, t] = True
                     pool_index[b, t] = pool[v]
@@ -226,5 +232,6 @@ class EgoTargetBuilder:
             degree=torch.from_numpy(degree),
             in_pool=torch.from_numpy(in_pool),
             pool_index=torch.from_numpy(pool_index),
+            node_index=torch.from_numpy(target_node_index),
             ego_stats=torch.from_numpy(ego_stats),
         )
