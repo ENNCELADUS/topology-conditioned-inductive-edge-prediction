@@ -512,6 +512,19 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-25 (fifth entry): §14.4.5 6e-v1 transfer gains a
+  **recipient-capacity cap**, `δ = u · min(w_il, w_kj, c_ij − w_ij,
+  c_kl − w_kl)` with `c_ij = π_i π_j`. Found by Codex review of the fourth
+  entry's π-weighted swap space: mapping back `Â̊' = W'/(π_i π_j)` can drive
+  a cell orders of magnitude above 1 when the recipient's capacity is smaller
+  than the donor's, violating §2's `Â ∈ [0,1]` sigmoid contract, and
+  `build_scaffold` then propagates the out-of-domain value into `CLOSE` and
+  `t_k` — letting the 6e arm be driven by artificial scale explosion instead
+  of rewiring beyond degree. §2 is the earlier, foundational contract and
+  governs; the cap is the minimal edit satisfying both, and since the
+  checkerboard pattern preserves every marginal for *any* `δ`, capping costs
+  no invariant. Required test: rewired `Â̊` stays within `[0, 1]` under
+  adversarially non-uniform `π` including near-zero entries.
 - 2026-07-25 (fourth entry): §14.4.5 6e-v1 swap space corrected from the raw
   `(Â̊_src, Â̊_dst, Π)` tensors to the **π-weighted** slot adjacency, with the
   binding invariant restated as the rebuilt scaffold's `STAR`/`INTRA`/`ALIGN`
@@ -1909,9 +1922,19 @@ mutated-features-same-ids).
   recomputes from the shuffled structure.
 - **6e-v1**: canonical-pair-keyed checkerboard swaps — `N_swap = 8·K²` keyed
   draws; each selects rows `(i, k)` and columns `(j, l)` and transfers
-  `δ = u · min(w_il, w_kj)` (keyed `u ∈ (0,1)`): `w_ij, w_kl += δ`;
-  `w_il, w_kj −= δ`. Draws are restricted to **off-diagonal** cells, so the
-  zero-diagonal contract of `Â̊` survives the perturbation.
+  `δ = u · min(w_il, w_kj, c_ij − w_ij, c_kl − w_kl)` (keyed `u ∈ (0,1)`):
+  `w_ij, w_kl += δ`; `w_il, w_kj −= δ`. Draws are restricted to
+  **off-diagonal** cells, so the zero-diagonal contract of `Â̊` survives the
+  perturbation.
+  The last two terms are the **recipient-capacity cap** (owner-flagged
+  2026-07-25; see the §12 fifth entry): in the π-weighted space below, cell
+  `(i,j)` has capacity `c_ij = π_i π_j`, because `Â̊ ∈ [0,1]` by §2. Without
+  the cap, mapping back `Â̊' = W'/(π_i π_j)` can push a cell far above 1
+  whenever the recipient's `π_i π_j` capacity is smaller than the donor's,
+  and `build_scaffold` then propagates that out-of-domain value into `CLOSE`
+  and `t_k` — so the 6e arm would be driven by scale explosion rather than by
+  rewiring beyond degree. Every marginal is preserved for *any* `δ` (the
+  checkerboard pattern is balanced), so the cap costs nothing.
   **Swap space (owner-confirmed 2026-07-25; see the §12 fourth entry).** The
   swaps are applied to the **π-weighted** slot-adjacency `W = π_k · Â̊[k,l] ·
   π_l` (for both sides, symmetrized), mapped back as `Â̊' = W' / (π_k π_l)`,

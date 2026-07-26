@@ -363,6 +363,11 @@ algorithm is not registrable, which is why 6e was deferred in v2.
   invariant.
 - 6e-v1 symmetry: the symmetrized `Â̊` blocks stay symmetric after swaps, and the
   zero diagonal is retained (off-diagonal-only draws).
+- 6e-v1 **domain validity**: the rewired `Â̊` stays within `[0, 1]` under
+  adversarially non-uniform `π`, including near-zero entries. Transfers are capped by
+  recipient capacity `c_ij = π_i π_j` (spec §14.4.5 + §12 fifth entry) — without it
+  the map-back `W'/(π_i π_j)` explodes and `CLOSE`/`t_k` inherit the blow-up, so the
+  control would measure scale rather than structure.
 - 6e-v1 is vectorized: no per-swap Python loop over `N_swap = 8·K²` per pair. This
   runs inside a million-pair scoring pass; a scalar triple loop is not viable.
 - Cross-process determinism: the same pair key yields identical perturbed tensors in

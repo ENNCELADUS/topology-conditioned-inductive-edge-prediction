@@ -16,16 +16,32 @@ not *execution* (§14). Authority order: `01-blueprint` → `02-methodology` →
 Later refines earlier, but blueprint §10 Locked Decisions and protocol §0 override
 casual changes — **flag conflicts, don't resolve them unilaterally**.
 
-## Skills — load before acting
+## After each implementation wave
 
-- `.claude/skills/formal-run-protocol/` — pre-registration binding, BINDING vs
-  diagnostic-only artifacts, what claims a one-seed screen may make. **Load before
-  touching `docs/registrations/`, running a formal arm, or writing up any result.**
-- `.claude/skills/hpc-execution/` — `hpc/run.sh`, `g5_stage1.sh`, `qualification.sh`,
-  the auto-detected H20 world size, and the config keys that change meaning per model
-  family. **Load before any training/scoring/gate command.**
-- After finishing a wave, run this command `/codex:review --wait` to ask a codex 
-  reviewer to review the implementation.
+**You run the review, not the user.** Background it to a file and read the findings
+when it finishes — output runs to ~200 KB, so never let it land in context:
+
+```bash
+CH=<scratch>/codex-home; mkdir -p "$CH"; cp ~/.codex/auth.json "$CH/"
+printf 'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "high"\napproval_policy = "never"\nsandbox_mode = "workspace-write"\n' > "$CH/config.toml"
+CODEX_HOME="$CH" codex review --base <WAVE_BASE_SHA> > <wave>-review.txt 2>&1
+```
+
+`/codex:review` is `disable-model-invocation`, but that blocks only the slash command
+— the `codex` CLI beneath it is yours to run.
+
+Runtime, for any training/scoring/gate command: the world size is **auto-detected**
+from all visible NVIDIA H20 devices (`hpc/run.sh`, `g5_stage1.sh`,
+`qualification.sh`), and config keys change meaning per model family.
+
+**`-c 'mcp_servers={}'` does NOT disable MCP** — `-c` merges into the config, so the
+`[mcp_servers.*]` sub-tables in `~/.codex/config.toml` survive it. Verified 2026-07-25:
+a review launched with that override still started `gitnexus/detect_changes` and hung
+there with zero output growth, which is the same failure that killed two Phase B
+reviews. A clean `CODEX_HOME` (no `[mcp_servers]` table at all) is the fix; it also
+carries model and effort, so no `-c` flags are needed. `--effort` is not a valid flag
+either — `review` takes only `--base/--scope/--model/--cwd`, and a stray value is
+parsed as focus text, which is rejected.
 
 ## The core thesis (do not let it drift)
 
