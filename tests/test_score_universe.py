@@ -1264,107 +1264,100 @@ def _enable_e2e_conditioning_gates(checkpoint: Path) -> None:
     torch.save(payload, checkpoint)
 
 
-def test_egostitch_e2e_scaffold_shuffle_bites_and_is_deterministic(tmp_path: Path) -> None:
+def _direct_e2e_control_scores(
+    tmp_path: Path,
+    data_root: Path,
+    checkpoint: Path,
+    pairs: list[tuple[str, str]],
+    *,
+    control: str,
+    universe_pairs: list[tuple[str, str]] | None = None,
+    row_start: int = 0,
+) -> dict[str, np.ndarray]:
+    payload = torch.load(checkpoint, weights_only=False)
+    model = score_universe.build_model("egostitch_e2e", dict(_TINY_E2E_CONFIG))
+    assert isinstance(model, EgoStitchE2E)
+    model.load_state_dict(payload["model_state"])
+    model.eval()
+    store = FeatureStore(data_root / "features" / "frozen_node_features_1024")
+    return score_universe._score_egostitch_e2e(
+        model,
+        pairs,
+        store,
+        device=torch.device("cpu"),
+        token_budget=4096,
+        f0_cache=tmp_path / "direct-f0.npz",
+        grounding_cache=tmp_path / "direct-grounding.npz",
+        scaffold_control=control,
+        universe_pairs=universe_pairs,
+        row_start=row_start,
+    )
+
+
+def test_egostitch_e2e_rejects_superseded_v2_scaffold_shuffle(tmp_path: Path) -> None:
     data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
-    _enable_e2e_conditioning_gates(checkpoint)
-    base, shuffled_a, shuffled_b = tmp_path / "base.npz", tmp_path / "a.npz", tmp_path / "b.npz"
-    score_universe.main(_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, base))
-    for output in (shuffled_a, shuffled_b):
+    with pytest.raises(ValueError, match="14\\.4\\.5"):
         score_universe.main(
             [
-                *_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, output),
+                *_egostitch_e2e_score_args(
+                    tmp_path, data_root, checkpoint, pairs, tmp_path / "rejected.npz"
+                ),
                 "--scaffold-control",
                 "shuffle_within_pair",
             ]
         )
-    base_scores = score_universe.load_scores(base)
-    a, b = score_universe.load_scores(shuffled_a), score_universe.load_scores(shuffled_b)
-    assert not np.allclose(base_scores.logit, a.logit)
-    np.testing.assert_array_equal(a.logit, b.logit)
-    assert a.meta["scaffold_control"] == {
-        "mode": "shuffle_within_pair",
-        "seed": 0,
-        "keying": "canonical_pair_v1",
-    }
 
 
-def test_egostitch_e2e_scaffold_shuffle_is_ab_ba_and_shard_invariant(tmp_path: Path) -> None:
-    data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
-    _enable_e2e_conditioning_gates(checkpoint)
-    reversed_pairs = tmp_path / "reversed.tsv"
-    reversed_pairs.write_text("".join(f"{v}\t{u}\n" for u, v in _E2E_PAIRS))
-    forward, reverse = tmp_path / "forward.npz", tmp_path / "reverse.npz"
-    score_universe.main(
-        [
-            *_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, forward),
-            "--scaffold-control",
-            "shuffle_within_pair",
-        ]
-    )
-    score_universe.main(
-        [
-            *_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, reversed_pairs, reverse),
-            "--scaffold-control",
-            "shuffle_within_pair",
-        ]
-    )
-    np.testing.assert_array_equal(
-        score_universe.load_scores(forward).logit, score_universe.load_scores(reverse).logit
-    )
-
-    sharded = tmp_path / "sharded.npz"
-    for shard in range(3):
-        score_universe.main(
-            [
-                *_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, sharded),
-                "--scaffold-control",
-                "shuffle_within_pair",
-                "--shard",
-                str(shard),
-                "--num-shards",
-                "3",
-            ]
-        )
-    merged = tmp_path / "merged.npz"
-    score_universe.main(
-        [
-            "merge",
-            "--inputs",
-            *(str(sharded.with_name(f"sharded.shard-{i}.npz")) for i in range(3)),
-            "--output",
-            str(merged),
-        ]
-    )
-    np.testing.assert_array_equal(
-        score_universe.load_scores(forward).logit, score_universe.load_scores(merged).logit
-    )
-
-    reordered_pairs = tmp_path / "reordered.tsv"
-    reordered = [_E2E_PAIRS[2], _E2E_PAIRS[0], _E2E_PAIRS[1]]
-    reordered_pairs.write_text("".join(f"{u}\t{v}\n" for u, v in reordered))
-    reordered_output = tmp_path / "reordered.npz"
-    score_universe.main(
-        [
-            *_egostitch_e2e_score_args(
-                tmp_path, data_root, checkpoint, reordered_pairs, reordered_output
-            ),
-            "--scaffold-control",
-            "shuffle_within_pair",
-        ]
-    )
-    ordered_scores = dict(zip(_E2E_PAIRS, score_universe.load_scores(forward).logit, strict=True))
-    restored = np.asarray([ordered_scores[pair] for pair in reordered], dtype=np.float32)
-    np.testing.assert_array_equal(score_universe.load_scores(reordered_output).logit, restored)
-
-
-def test_egostitch_e2e_scaffold_shuffle_uses_multi_pair_batches(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("control", ["shuffle_within_pair_v3", "rewire_checkerboard_v1"])
+def test_egostitch_e2e_scaffold_control_is_ab_ba_and_shard_invariant(
+    tmp_path: Path, control: str
 ) -> None:
     data_root, checkpoint, _ = _egostitch_e2e_setup(tmp_path)
     _enable_e2e_conditioning_gates(checkpoint)
-    pairs = tmp_path / "many.tsv"
+    forward = _direct_e2e_control_scores(
+        tmp_path, data_root, checkpoint, _E2E_PAIRS, control=control
+    )
+    reversed_pairs = [(v, u) for u, v in _E2E_PAIRS]
+    reverse = _direct_e2e_control_scores(
+        tmp_path, data_root, checkpoint, reversed_pairs, control=control
+    )
+    np.testing.assert_allclose(
+        forward["full"],
+        reverse["full"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+    shards: list[np.ndarray] = []
+    for shard in range(3):
+        shard_scores = _direct_e2e_control_scores(
+            tmp_path,
+            data_root,
+            checkpoint,
+            [_E2E_PAIRS[shard]],
+            control=control,
+            universe_pairs=_E2E_PAIRS,
+            row_start=shard,
+        )
+        shards.append(shard_scores["full"])
+    np.testing.assert_array_equal(forward["full"], np.concatenate(shards))
+
+    reordered = [_E2E_PAIRS[2], _E2E_PAIRS[0], _E2E_PAIRS[1]]
+    reordered_scores = _direct_e2e_control_scores(
+        tmp_path, data_root, checkpoint, reordered, control=control
+    )
+    ordered_scores = dict(zip(_E2E_PAIRS, forward["full"], strict=True))
+    restored = np.asarray([ordered_scores[pair] for pair in reordered], dtype=np.float32)
+    np.testing.assert_array_equal(reordered_scores["full"], restored)
+
+
+@pytest.mark.parametrize("control", ["shuffle_within_pair_v3", "rewire_checkerboard_v1"])
+def test_egostitch_e2e_scaffold_control_uses_multi_pair_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control: str
+) -> None:
+    data_root, checkpoint, _ = _egostitch_e2e_setup(tmp_path)
+    _enable_e2e_conditioning_gates(checkpoint)
     many_pairs = _E2E_PAIRS * 8
-    pairs.write_text("".join(f"{u}\t{v}\n" for u, v in many_pairs))
     calls: list[int] = []
     original = EgoStitchE2E.decompose_pair_context
 
@@ -1373,14 +1366,12 @@ def test_egostitch_e2e_scaffold_shuffle_uses_multi_pair_batches(
         return original(self, context)
 
     monkeypatch.setattr(EgoStitchE2E, "decompose_pair_context", _spy)
-    score_universe.main(
-        [
-            *_egostitch_e2e_score_args(
-                tmp_path, data_root, checkpoint, pairs, tmp_path / "many.npz"
-            ),
-            "--scaffold-control",
-            "shuffle_within_pair",
-        ]
+    _direct_e2e_control_scores(
+        tmp_path,
+        data_root,
+        checkpoint,
+        many_pairs,
+        control=control,
     )
     assert max(calls) > 1
     assert len(calls) < len(many_pairs)

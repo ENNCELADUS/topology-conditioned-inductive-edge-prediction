@@ -1,4 +1,4 @@
-"""Structure-only stitched scaffold (design rev 3 §3.1–§3.2).
+"""Structure-only stitched scaffold (design rev 3 §3.1–§3.2, spec §14.4.5).
 
 Node order: [endpoint_src, endpoint_dst, slots_src(K), slots_dst(K)].
 Node features (FEAT_DIM=11): [onehot4(anchor); pi; mult; deg_star; deg_intra;
@@ -10,10 +10,13 @@ grounded-identity-match label — those belong to the content pathway.
 
 from __future__ import annotations
 
-from typing import NamedTuple
+import hashlib
+from collections.abc import Callable, Sequence
+from typing import NamedTuple, cast
 
 import torch
 from torch import nn
+from torch._higher_order_ops import scan
 from torch.nn import functional as F
 
 from src.model.egostitch.imagine import SlotSet
@@ -24,6 +27,12 @@ FEAT_DIM = 11
 EDGE_TYPES = 4
 _STAR, _INTRA, _ALIGN, _CLOSE = 0, 1, 2, 3
 _SRC, _DST, _SLOT_SRC, _SLOT_DST = 0, 1, 2, 3
+_CONTROL_SEED = 0
+
+ScaffoldInputPerturbation = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+]
 
 
 class ScaffoldTokens(NamedTuple):
@@ -31,6 +40,224 @@ class ScaffoldTokens(NamedTuple):
 
     feats: torch.Tensor
     adj: torch.Tensor
+
+
+def _stable_control_generator(
+    node_u: str, node_v: str, side: str, *, seed: int = _CONTROL_SEED
+) -> torch.Generator:
+    """Return the v2 canonical-pair-keyed CPU generator."""
+    src, dst = sorted((node_u, node_v))
+    digest = hashlib.blake2b(f"{src}|{dst}|{side}|{seed}".encode()).digest()
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int.from_bytes(digest[:8], byteorder="little", signed=False))
+    return generator
+
+
+def _stable_slot_permutation(
+    node_u: str, node_v: str, side: str, slots: int
+) -> torch.Tensor:
+    """Return the v2 canonical-pair-keyed slot permutation."""
+    return torch.randperm(
+        slots,
+        generator=_stable_control_generator(node_u, node_v, side),
+    )
+
+
+def _checkerboard_rewire(
+    matrices: torch.Tensor,
+    generators: Sequence[torch.Generator],
+) -> torch.Tensor:
+    """Apply keyed checkerboard transfers to a matrix batch without Python swap loops."""
+    matrix_count, slots, width = matrices.shape
+    if width != slots:
+        raise ValueError(f"checkerboard inputs must be square, got {tuple(matrices.shape)}")
+    if len(generators) != matrix_count:
+        raise ValueError("checkerboard generator count must equal the matrix batch size")
+    if slots < 4:
+        raise ValueError("off-diagonal checkerboard swaps require at least four slots")
+
+    swap_count = 8 * slots * slots
+    pair_count = slots // 2
+    draws_per_round = pair_count * (pair_count - 1)
+    round_count = (swap_count + draws_per_round - 1) // draws_per_round
+    row_pair, column_pair = torch.where(
+        ~torch.eye(pair_count, dtype=torch.bool)
+    )
+    # Each round partitions slots into disjoint pairs and assigns every row
+    # pair to every other column pair. The resulting 2x2 blocks contain only
+    # off-diagonal cells and do not overlap, so all draws in a round are safe
+    # to apply concurrently. Only the much smaller round axis is sequential.
+    paired_slots = torch.stack(
+        [
+            torch.rand((round_count, slots), generator=generator)
+            .argsort(dim=-1)[:, : 2 * pair_count]
+            .reshape(round_count, pair_count, 2)
+            for generator in generators
+        ],
+        dim=1,
+    )
+    draw_indices = torch.stack(
+        (
+            paired_slots[:, :, row_pair, 0],
+            paired_slots[:, :, row_pair, 1],
+            paired_slots[:, :, column_pair, 0],
+            paired_slots[:, :, column_pair, 1],
+        ),
+        dim=-1,
+    ).to(device=matrices.device)
+    units = torch.stack(
+        [
+            torch.rand((swap_count,), generator=generator).clamp(
+                min=torch.finfo(torch.float32).eps,
+                max=1.0 - torch.finfo(torch.float32).eps,
+            )
+            for generator in generators
+        ],
+        dim=0,
+    )
+    padded_units = torch.zeros(
+        matrix_count,
+        round_count * draws_per_round,
+        dtype=units.dtype,
+    )
+    padded_units[:, :swap_count] = units
+    round_units = (
+        padded_units.reshape(matrix_count, round_count, draws_per_round)
+        .transpose(0, 1)
+        .to(device=matrices.device, dtype=matrices.dtype)
+    )
+    matrix_offsets = (
+        torch.arange(matrix_count, device=matrices.device)[:, None] * slots * slots
+    )
+
+    def transfer(
+        flat: torch.Tensor,
+        draw: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        indices, unit = draw
+        row_i, row_k, column_j, column_l = indices.unbind(dim=-1)
+        donor_il = matrix_offsets + row_i * slots + column_l
+        donor_kj = matrix_offsets + row_k * slots + column_j
+        delta = unit * torch.minimum(flat[donor_il], flat[donor_kj])
+        update_indices = torch.stack(
+            (
+                matrix_offsets + row_i * slots + column_j,
+                matrix_offsets + row_k * slots + column_l,
+                donor_il,
+                donor_kj,
+            ),
+            dim=-1,
+        ).flatten()
+        update_values = torch.stack((delta, delta, -delta, -delta), dim=-1).flatten()
+        updated = flat.scatter_add(0, update_indices, update_values)
+        return updated, torch.empty(0, device=flat.device, dtype=flat.dtype)
+
+    rewired, _ = scan(transfer, matrices.flatten(), (draw_indices, round_units))
+    return cast(torch.Tensor, rewired).reshape_as(matrices)
+
+
+def make_scaffold_input_perturbation(
+    mode: str,
+    pairs: Sequence[tuple[str, str]],
+) -> ScaffoldInputPerturbation:
+    """Build a deterministic §14.4.5 perturbation applied before scaffold assembly."""
+    controlled_pairs = tuple(pairs)
+
+    def perturb(
+        adj_src: torch.Tensor,
+        adj_dst: torch.Tensor,
+        plan: torch.Tensor,
+        pi_src: torch.Tensor,
+        pi_dst: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, slots, _ = adj_src.shape
+        expected = (batch_size, slots, slots)
+        if adj_src.shape != expected or adj_dst.shape != expected or plan.shape != expected:
+            raise ValueError(
+                "scaffold-control inputs must have matching square shapes: "
+                f"{tuple(adj_src.shape)}, {tuple(adj_dst.shape)}, {tuple(plan.shape)}"
+            )
+        if len(controlled_pairs) != batch_size:
+            raise ValueError("scaffold-control pair count must equal the scaffold batch size")
+        if pi_src.shape != (batch_size, slots) or pi_dst.shape != (batch_size, slots):
+            raise ValueError("scaffold-control pi shapes must match the adjacency batch")
+
+        canonical_src = torch.tensor(
+            [node_u <= node_v for node_u, node_v in controlled_pairs],
+            device=adj_src.device,
+            dtype=torch.bool,
+        )
+        if mode == "shuffle_within_pair_v3":
+            canonical_permutations = [
+                (
+                    _stable_slot_permutation(node_u, node_v, "src", slots),
+                    _stable_slot_permutation(node_u, node_v, "dst", slots),
+                )
+                for node_u, node_v in controlled_pairs
+            ]
+            perm_src = torch.stack(
+                [
+                    src_perm if is_src else dst_perm
+                    for (src_perm, dst_perm), is_src in zip(
+                        canonical_permutations, canonical_src.cpu().tolist(), strict=True
+                    )
+                ]
+            ).to(adj_src.device)
+            perm_dst = torch.stack(
+                [
+                    dst_perm if is_src else src_perm
+                    for (src_perm, dst_perm), is_src in zip(
+                        canonical_permutations, canonical_src.cpu().tolist(), strict=True
+                    )
+                ]
+            ).to(adj_src.device)
+            rows = torch.arange(batch_size, device=adj_src.device)[:, None, None]
+            return (
+                adj_src[rows, perm_src[:, :, None], perm_src[:, None, :]],
+                adj_dst[rows, perm_dst[:, :, None], perm_dst[:, None, :]],
+                plan[rows, perm_src[:, :, None], perm_dst[:, None, :]],
+            )
+        if mode != "rewire_checkerboard_v1":
+            raise ValueError(f"unknown scaffold input perturbation: {mode!r}")
+
+        zero_src = adj_src - torch.diag_embed(torch.diagonal(adj_src, dim1=-2, dim2=-1))
+        zero_dst = adj_dst - torch.diag_embed(torch.diagonal(adj_dst, dim1=-2, dim2=-1))
+        weight_src = pi_src[:, :, None] * pi_src[:, None, :]
+        weight_dst = pi_dst[:, :, None] * pi_dst[:, None, :]
+        weighted_src = zero_src * weight_src
+        weighted_dst = zero_dst * weight_dst
+        canonical_plan = torch.where(canonical_src[:, None, None], plan, plan.transpose(1, 2))
+        src_generators = [
+            _stable_control_generator(node_u, node_v, "src" if node_u <= node_v else "dst")
+            for node_u, node_v in controlled_pairs
+        ]
+        dst_generators = [
+            _stable_control_generator(node_u, node_v, "dst" if node_u <= node_v else "src")
+            for node_u, node_v in controlled_pairs
+        ]
+        plan_generators = [
+            _stable_control_generator(node_u, node_v, "plan")
+            for node_u, node_v in controlled_pairs
+        ]
+        rewired = _checkerboard_rewire(
+            torch.cat((weighted_src, weighted_dst, canonical_plan), dim=0),
+            (*src_generators, *dst_generators, *plan_generators),
+        )
+        rewired_src = rewired[:batch_size]
+        rewired_dst = rewired[batch_size : 2 * batch_size]
+        rewired_plan = rewired[2 * batch_size :]
+        rewired_src = 0.5 * (rewired_src + rewired_src.transpose(1, 2))
+        rewired_dst = 0.5 * (rewired_dst + rewired_dst.transpose(1, 2))
+        perturbed_src = torch.where(weight_src > 0, rewired_src / weight_src, 0.0)
+        perturbed_dst = torch.where(weight_dst > 0, rewired_dst / weight_dst, 0.0)
+        perturbed_plan = torch.where(
+            canonical_src[:, None, None],
+            rewired_plan,
+            rewired_plan.transpose(1, 2),
+        )
+        return perturbed_src, perturbed_dst, perturbed_plan
+
+    return perturb
 
 
 def counterpart_membership(
@@ -62,7 +289,13 @@ def grounded_identity_match(
     return matched_a.float(), matched_b.float()
 
 
-def build_scaffold(slots_src: SlotSet, slots_dst: SlotSet, plan: torch.Tensor) -> ScaffoldTokens:
+def build_scaffold(
+    slots_src: SlotSet,
+    slots_dst: SlotSet,
+    plan: torch.Tensor,
+    *,
+    perturbation: ScaffoldInputPerturbation | None = None,
+) -> ScaffoldTokens:
     """Assemble the stitched scaffold from two slot sets and the OT plan.
 
     Args:
@@ -70,6 +303,9 @@ def build_scaffold(slots_src: SlotSet, slots_dst: SlotSet, plan: torch.Tensor) -
         slots_dst: Destination-side generated slot set.
         plan: Shape ``(B, K, K)`` alignment plan from
             :func:`src.model.egostitch.stitch.sinkhorn_plan`.
+        perturbation: Optional deterministic transform of
+            ``(adj_src, adj_dst, plan)`` applied before any scaffold channels
+            are derived, per spec §14.4.5.
 
     Returns:
         The structure-only ``ScaffoldTokens`` (no slot content, no grounding).
@@ -91,7 +327,21 @@ def build_scaffold(slots_src: SlotSet, slots_dst: SlotSet, plan: torch.Tensor) -
         pi_src, pi_dst = slots_src.pi.float(), slots_dst.pi.float()
         mult_src, mult_dst = slots_src.mult.float(), slots_dst.mult.float()
         slot_adj_src, slot_adj_dst = slots_src.adj.float(), slots_dst.adj.float()
+        slot_adj_src = slot_adj_src - torch.diag_embed(
+            torch.diagonal(slot_adj_src, dim1=-2, dim2=-1)
+        )
+        slot_adj_dst = slot_adj_dst - torch.diag_embed(
+            torch.diagonal(slot_adj_dst, dim1=-2, dim2=-1)
+        )
         plan32 = plan.float()
+        if perturbation is not None:
+            slot_adj_src, slot_adj_dst, plan32 = perturbation(
+                slot_adj_src,
+                slot_adj_dst,
+                plan32,
+                pi_src,
+                pi_dst,
+            )
         adj = torch.zeros(b, EDGE_TYPES, v, v, device=device, dtype=torch.float32)
         s_src = slice(2, 2 + k)
         s_dst = slice(2 + k, v)
@@ -111,12 +361,8 @@ def build_scaffold(slots_src: SlotSet, slots_dst: SlotSet, plan: torch.Tensor) -
         adj[:, _ALIGN, s_src, s_dst] = plan32
         adj[:, _ALIGN, s_dst, s_src] = plan32.transpose(1, 2)
 
-        adj_src_zero = slot_adj_src - torch.diag_embed(
-            torch.diagonal(slot_adj_src, dim1=-2, dim2=-1)
-        )
-        adj_dst_zero = slot_adj_dst - torch.diag_embed(
-            torch.diagonal(slot_adj_dst, dim1=-2, dim2=-1)
-        )
+        adj_src_zero = slot_adj_src
+        adj_dst_zero = slot_adj_dst
         closure = 0.5 * (
             torch.bmm(adj_src_zero, plan32) + torch.bmm(plan32, adj_dst_zero)
         )

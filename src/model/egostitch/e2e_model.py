@@ -37,6 +37,7 @@ from src.model.egostitch.imagine import SlotSet
 from src.model.egostitch.model import EgoStitchStage1
 from src.model.egostitch.scaffold import (
     ContentProjector,
+    ScaffoldInputPerturbation,
     build_content_tokens,
     build_scaffold,
     counterpart_membership,
@@ -214,6 +215,7 @@ class EgoStitchE2E(nn.Module):
         *,
         need_topo: bool = True,
         need_cont: bool = True,
+        scaffold_input_perturbation: ScaffoldInputPerturbation | None = None,
     ) -> E2EPairContext:
         """Build Stitch/STE/content once from cacheable endpoint states."""
         slots_a, slots_b = state_a.slots, state_b.slots
@@ -246,7 +248,12 @@ class EgoStitchE2E(nn.Module):
                     tau=self.generator_cfg.sinkhorn_tau,
                 )
                 plan = plan.index_copy(0, non_self, non_self_plan)
-            scaffold = build_scaffold(slots_a, slots_b, plan)
+            scaffold = build_scaffold(
+                slots_a,
+                slots_b,
+                plan,
+                perturbation=scaffold_input_perturbation,
+            )
             topo_ab = self.ste(scaffold)
             topo_ba = self.ste(swap_direction(scaffold))
 

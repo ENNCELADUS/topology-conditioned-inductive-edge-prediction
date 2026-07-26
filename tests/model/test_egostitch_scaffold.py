@@ -1,6 +1,11 @@
 """Tests for the structure-only stitched scaffold (design rev 3 §3.1–§3.2)."""
 
+import json
+import subprocess
+import sys
+
 import pytest
+import src.model.egostitch.scaffold as scaffold_module
 import torch
 from src.model.egostitch.imagine import SlotSet
 from src.model.egostitch.scaffold import (
@@ -9,10 +14,13 @@ from src.model.egostitch.scaffold import (
     N_ANCHOR_TYPES,
     ContentProjector,
     ScaffoldTokens,
+    _checkerboard_rewire,
     build_content_tokens,
     build_scaffold,
+    make_scaffold_input_perturbation,
     swap_direction,
 )
+from src.model.egostitch.ste import STEncoder
 
 
 def _slots(b: int = 2, k: int = 4, d_p: int = 8, seed: int = 0) -> SlotSet:
@@ -184,6 +192,152 @@ def test_swap_direction_is_involution_and_relabels() -> None:
     assert torch.equal(rev.adj, fwd.adj)
     back = swap_direction(rev)
     assert torch.equal(back.feats, fwd.feats) and torch.equal(back.adj, fwd.adj)
+
+
+def test_rewire_checkerboard_preserves_rebuilt_visible_degrees_and_moves_close() -> None:
+    si, sj = _slots(b=2, k=4, seed=10), _slots(b=2, k=4, seed=11)
+    plan = torch.rand(2, 4, 4, generator=torch.Generator().manual_seed(12))
+    baseline = build_scaffold(si, sj, plan)
+    controlled = build_scaffold(
+        si,
+        sj,
+        plan,
+        perturbation=make_scaffold_input_perturbation(
+            "rewire_checkerboard_v1", [("node-a", "node-b"), ("node-c", "node-d")]
+        ),
+    )
+
+    assert torch.allclose(
+        controlled.feats[..., 6:9],
+        baseline.feats[..., 6:9],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch.max(torch.abs(controlled.feats[..., 9] - baseline.feats[..., 9])).item() > 1e-4
+
+
+def test_rewire_checkerboard_keeps_adjacency_symmetric_with_zero_diagonal() -> None:
+    si, sj = _slots(b=2, k=4, seed=13), _slots(b=2, k=4, seed=14)
+    plan = torch.rand(2, 4, 4, generator=torch.Generator().manual_seed(15))
+    rewired_i, rewired_j, rewired_plan = make_scaffold_input_perturbation(
+        "rewire_checkerboard_v1", [("node-a", "node-b"), ("node-c", "node-d")]
+    )(si.adj, sj.adj, plan, si.pi, sj.pi)
+
+    for rewired in (rewired_i, rewired_j):
+        assert torch.allclose(rewired, rewired.transpose(1, 2), atol=1e-6, rtol=1e-6)
+        assert rewired.min().item() >= -torch.finfo(torch.float32).eps
+        assert torch.equal(
+            torch.diagonal(rewired, dim1=-2, dim2=-1),
+            torch.zeros_like(si.pi),
+        )
+    assert rewired_plan.min().item() >= -torch.finfo(torch.float32).eps
+
+
+def test_rewire_checkerboard_vectorizes_cell_disjoint_draws(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_shapes: list[tuple[torch.Size, torch.Size, int]] = []
+    original_scan = scaffold_module.scan
+
+    def scan_spy(
+        combine_fn: object,
+        init: torch.Tensor,
+        xs: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        draw_indices, units = xs
+        scan_shapes.append(
+            (draw_indices.shape, units.shape, int(torch.count_nonzero(units).item()))
+        )
+        return original_scan(combine_fn, init, xs)
+
+    monkeypatch.setattr(scaffold_module, "scan", scan_spy)
+    generator = torch.Generator().manual_seed(16)
+    _checkerboard_rewire(torch.rand(1, 16, 16, generator=generator), [generator])
+
+    # K=16: 2,048 keyed swaps become 37 sequential rounds of up to 56
+    # cell-disjoint transfers, rather than 2,048 scalar scan/Python steps.
+    assert scan_shapes == [(torch.Size([37, 1, 56, 4]), torch.Size([37, 1, 56]), 2048)]
+
+
+def test_scaffold_controls_are_cross_process_deterministic_and_pair_keyed() -> None:
+    code = """
+import json
+import torch
+from src.model.egostitch.scaffold import make_scaffold_input_perturbation
+
+adj = torch.tensor([[
+    [0.0, 0.2, 0.7, 0.4],
+    [0.2, 0.0, 0.4, 0.8],
+    [0.7, 0.4, 0.0, 0.3],
+    [0.4, 0.8, 0.3, 0.0],
+]])
+plan = torch.tensor([[
+    [0.1, 0.2, 0.3, 0.4],
+    [0.4, 0.5, 0.6, 0.7],
+    [0.7, 0.8, 0.9, 1.0],
+    [0.3, 0.5, 0.7, 0.9],
+]])
+pi = torch.tensor([[0.1, 0.2, 0.3, 0.4]])
+out = {}
+for mode in ("shuffle_within_pair_v3", "rewire_checkerboard_v1"):
+    values = make_scaffold_input_perturbation(mode, [("node-a", "node-b")])(
+        adj, adj, plan, pi, pi
+    )
+    other = make_scaffold_input_perturbation(mode, [("node-a", "node-c")])(
+        adj, adj, plan, pi, pi
+    )
+    out[mode] = {
+        "same_pair": [value.tolist() for value in values],
+        "other_pair": [value.tolist() for value in other],
+    }
+print(json.dumps(out, sort_keys=True))
+"""
+    first = subprocess.run(
+        [sys.executable, "-c", code], check=True, capture_output=True, text=True
+    ).stdout
+    second = subprocess.run(
+        [sys.executable, "-c", code], check=True, capture_output=True, text=True
+    ).stdout
+    assert json.loads(first) == json.loads(second)
+    payload = json.loads(first)
+    for mode in ("shuffle_within_pair_v3", "rewire_checkerboard_v1"):
+        assert payload[mode]["same_pair"] != payload[mode]["other_pair"]
+
+
+@pytest.mark.parametrize("mode", ["shuffle_within_pair_v3", "rewire_checkerboard_v1"])
+def test_scaffold_control_measurably_moves_noncollapsed_ste_output(mode: str) -> None:
+    torch.manual_seed(21)
+    si, sj = _slots(b=2, k=4, seed=22), _slots(b=2, k=4, seed=23)
+    plan = torch.rand(2, 4, 4)
+    ste = STEncoder(d_model=16, ste_dim=8, n_layers=2).eval()
+    baseline = ste(build_scaffold(si, sj, plan))
+    controlled = ste(
+        build_scaffold(
+            si,
+            sj,
+            plan,
+            perturbation=make_scaffold_input_perturbation(
+                mode, [("node-a", "node-b"), ("node-c", "node-d")]
+            ),
+        )
+    )
+    assert torch.max(torch.abs(controlled - baseline)).item() > 1e-6
+
+
+def test_shuffle_v3_rebuilds_closed_wedge_and_degree_features() -> None:
+    si, sj = _slots(b=2, k=4, seed=31), _slots(b=2, k=4, seed=32)
+    plan = torch.rand(2, 4, 4, generator=torch.Generator().manual_seed(33))
+    baseline = build_scaffold(si, sj, plan)
+    controlled = build_scaffold(
+        si,
+        sj,
+        plan,
+        perturbation=make_scaffold_input_perturbation(
+            "shuffle_within_pair_v3", [("node-a", "node-b"), ("node-c", "node-d")]
+        ),
+    )
+    assert not torch.equal(controlled.feats[..., 6:10], baseline.feats[..., 6:10])
+    assert not torch.equal(controlled.feats[..., 10], baseline.feats[..., 10])
 
 
 def test_content_tokens_shape_and_content_sensitivity() -> None:

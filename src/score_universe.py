@@ -74,7 +74,7 @@ from src.data.pairs import (
     probe_lengths,
 )
 from src.model.B0 import V3_1
-from src.model.egostitch.scaffold import ScaffoldTokens
+from src.model.egostitch.scaffold import make_scaffold_input_perturbation
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +97,9 @@ _EGOSTITCH_E2E_ARRAY_KEYS = ("full", "f_logit", "pair_content", "pair_topology")
 _EGOSTITCH_E2E_BINDING_SCHEMA = "egostitch_e2e_binding_evidence_v1"
 _EGOSTITCH_E2E_FORMAL_ARMS = ("full", "b0_e2e_f_only", "pair_topology", "p0")
 _SCAFFOLD_CONTROL_NONE = "none"
-_SCAFFOLD_CONTROL_SHUFFLE = "shuffle_within_pair"
+_SCAFFOLD_CONTROL_SHUFFLE_V3 = "shuffle_within_pair_v3"
+_SCAFFOLD_CONTROL_REWIRE_V1 = "rewire_checkerboard_v1"
+_SCAFFOLD_CONTROL_SHUFFLE_V2 = "shuffle_within_pair"
 _SCAFFOLD_CONTROL_SEED = 0
 
 
@@ -110,40 +112,13 @@ def _e2e_primary_logit_key(permanent_null: str) -> str:
     }[permanent_null]
 
 
-def _stable_slot_permutation(node_u: str, node_v: str, side: str, slots: int) -> torch.Tensor:
-    """Return the canonical-pair-keyed CPU slot permutation for one endpoint side."""
-    src, dst = sorted((node_u, node_v))
-    digest = hashlib.blake2b(f"{src}|{dst}|{side}|{_SCAFFOLD_CONTROL_SEED}".encode()).digest()
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(int.from_bytes(digest[:8], byteorder="little", signed=False))
-    return torch.randperm(slots, generator=generator)
-
-
-def _shuffle_scaffold_within_pair(
-    scaffold: ScaffoldTokens, pairs: Sequence[tuple[str, str]]
-) -> ScaffoldTokens:
-    """Permute only scaffold adjacency slot axes with canonical-pair stable hashes."""
-    batch_size, _edge_types, vertices, _ = scaffold.adj.shape
-    if batch_size != len(pairs):
-        raise ValueError("scaffold-control pair count must equal the scaffold batch size")
-    slots = (vertices - 2) // 2
-    adj = scaffold.adj.clone()
-    for row, (node_u, node_v) in enumerate(pairs):
-        perm_src = _stable_slot_permutation(node_u, node_v, "src", slots)
-        perm_dst = _stable_slot_permutation(node_u, node_v, "dst", slots)
-        # `src`/`dst` in the stable-hash key are canonical endpoint labels;
-        # map them back to this forward pass's local a/b ordering so AB and BA
-        # receive the same endpoint-specific permutations.
-        perm_a, perm_b = (perm_src, perm_dst) if node_u <= node_v else (perm_dst, perm_src)
-        node_order = torch.cat(
-            (
-                torch.arange(2, dtype=torch.long),
-                2 + perm_a,
-                2 + slots + perm_b,
-            )
-        ).to(scaffold.adj.device)
-        adj[row] = scaffold.adj[row].index_select(1, node_order).index_select(2, node_order)
-    return ScaffoldTokens(feats=scaffold.feats, adj=adj)
+def _reject_superseded_scaffold_control(scaffold_control: str) -> None:
+    """Reject the v2 adj-only control with the governing rev-3.1 contract."""
+    if scaffold_control == _SCAFFOLD_CONTROL_SHUFFLE_V2:
+        raise ValueError(
+            "'shuffle_within_pair' is superseded by the rebuild-form control; "
+            "see docs/05-egostitch-spec.md §14.4.5"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1782,7 +1757,12 @@ def _score_egostitch_e2e(
     from src.model.egostitch.imagine import SlotSet
 
     assert isinstance(model, EgoStitchE2E)
-    if scaffold_control not in (_SCAFFOLD_CONTROL_NONE, _SCAFFOLD_CONTROL_SHUFFLE):
+    _reject_superseded_scaffold_control(scaffold_control)
+    active_controls = (
+        _SCAFFOLD_CONTROL_SHUFFLE_V3,
+        _SCAFFOLD_CONTROL_REWIRE_V1,
+    )
+    if scaffold_control not in (_SCAFFOLD_CONTROL_NONE, *active_controls):
         raise ValueError(f"unknown scaffold control: {scaffold_control!r}")
     # Grounding candidates must come from the full scored universe, not this
     # process's shard, so control (and ordinary e2e) logits are shard-invariant.
@@ -1926,7 +1906,7 @@ def _score_egostitch_e2e(
         key: np.empty(len(pairs), dtype=np.float32) for key in _EGOSTITCH_E2E_ARRAY_KEYS
     }
     processed = 0
-    if scaffold_control == _SCAFFOLD_CONTROL_SHUFFLE:
+    if scaffold_control in active_controls:
         # Every shard reconstructs identical global, fixed-size padded blocks
         # and retains only its own rows. This keeps bit-exact shard invariance
         # without one pair-pass per row; a shard recomputes only boundary blocks.
@@ -1970,24 +1950,19 @@ def _score_egostitch_e2e(
             dtype=torch.bool,
             device=device,
         )
-        hook: torch.utils.hooks.RemovableHandle | None = None
-        if scaffold_control == _SCAFFOLD_CONTROL_SHUFFLE:
-
-            def _shuffle_before_ste(
-                _module: nn.Module,
-                inputs: tuple[ScaffoldTokens, ...],
-                controlled_pairs: Sequence[tuple[str, str]] = batch_pairs,
-            ) -> tuple[ScaffoldTokens, ...]:
-                return (_shuffle_scaffold_within_pair(inputs[0], controlled_pairs),)
-
-            hook = model.ste.register_forward_pre_hook(_shuffle_before_ste)
-        try:
-            with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=False):
-                context = model.build_pair_context_from_states(state_a, state_b, is_self)
-                decomposed = model.decompose_pair_context(context)
-        finally:
-            if hook is not None:
-                hook.remove()
+        perturbation = (
+            None
+            if scaffold_control == _SCAFFOLD_CONTROL_NONE
+            else make_scaffold_input_perturbation(scaffold_control, batch_pairs)
+        )
+        with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=False):
+            context = model.build_pair_context_from_states(
+                state_a,
+                state_b,
+                is_self,
+                scaffold_input_perturbation=perturbation,
+            )
+            decomposed = model.decompose_pair_context(context)
         for output_row, batch_position in output_rows:
             for key in _EGOSTITCH_E2E_ARRAY_KEYS:
                 out[key][output_row] = decomposed[key][batch_position].detach().float().cpu().item()
@@ -2108,7 +2083,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     score.add_argument(
         "--scaffold-control",
-        choices=[_SCAFFOLD_CONTROL_NONE, _SCAFFOLD_CONTROL_SHUFFLE],
+        choices=[_SCAFFOLD_CONTROL_NONE, _SCAFFOLD_CONTROL_SHUFFLE_V2],
         default=_SCAFFOLD_CONTROL_NONE,
         help="egostitch_e2e scoring-time scaffold control",
     )
@@ -2158,6 +2133,7 @@ def _validate_score_args(parser: argparse.ArgumentParser, args: argparse.Namespa
 
 def _run_score(args: argparse.Namespace) -> None:
     """Execute the ``score`` subcommand."""
+    _reject_superseded_scaffold_control(args.scaffold_control)
     device = _resolve_device(args.device)
     logger.info("loading checkpoint %s (device %s)", args.checkpoint, device)
     model_config = (
@@ -2240,7 +2216,7 @@ def _run_score(args: argparse.Namespace) -> None:
         if len(matching_arms) != 1:
             raise ValueError("selected checkpoint must match exactly one formal arm metadata")
         selected_arm = matching_arms[0]
-        if args.scaffold_control == _SCAFFOLD_CONTROL_SHUFFLE and selected_arm != "full":
+        if args.scaffold_control == _SCAFFOLD_CONTROL_SHUFFLE_V2 and selected_arm != "full":
             raise ValueError("structure_control_6a scoring requires the full-arm checkpoint")
         scoring_provenance = {
             **provenances[selected_arm],
