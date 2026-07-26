@@ -14,6 +14,7 @@ from src.model.egostitch.scaffold import (
     ContentProjector,
     ScaffoldTokens,
     _checkerboard_rewire,
+    _stable_control_generator,
     build_content_tokens,
     build_scaffold,
     make_scaffold_input_perturbation,
@@ -231,6 +232,44 @@ def test_rewire_checkerboard_keeps_adjacency_symmetric_with_zero_diagonal() -> N
             torch.zeros_like(si.pi),
         )
     assert rewired_plan.min().item() >= -torch.finfo(torch.float32).eps
+
+
+def test_rewire_checkerboard_caps_adversarial_nonuniform_pi_adjacency() -> None:
+    adj = torch.tensor(
+        [
+            [
+                [0.0, 0.9, 0.8, 0.7],
+                [0.9, 0.0, 0.6, 0.5],
+                [0.8, 0.6, 0.0, 0.4],
+                [0.7, 0.5, 0.4, 0.0],
+            ]
+        ]
+    )
+    pi_src = torch.tensor([[1e-6, 1e-4, 0.5, 1.0]])
+    pi_dst = torch.tensor([[1.0, 0.5, 1e-4, 1e-6]])
+    plan = torch.full((1, 4, 4), 0.1)
+
+    # The former donor-only formula demonstrably maps weighted mass far outside
+    # SlotSet.adj's [0, 1] domain for this near-zero, non-uniform pi.
+    capacity_src = pi_src[:, :, None] * pi_src[:, None, :]
+    uncapped_weighted = _checkerboard_rewire(
+        adj * capacity_src,
+        [_stable_control_generator("node-a", "node-b", "src")],
+    )
+    uncapped_adj = torch.where(
+        capacity_src > 0,
+        uncapped_weighted / capacity_src,
+        0.0,
+    )
+    assert uncapped_adj.max().item() == pytest.approx(76.18724060058594)
+    assert uncapped_adj.max().item() > 1.0
+
+    rewired_src, rewired_dst, _ = make_scaffold_input_perturbation(
+        "rewire_checkerboard_v1", [("node-a", "node-b")]
+    )(adj, adj, plan, pi_src, pi_dst)
+    for rewired in (rewired_src, rewired_dst):
+        assert rewired.min().item() >= 0.0
+        assert rewired.max().item() <= 1.0
 
 
 def test_rewire_checkerboard_vectorizes_cell_disjoint_draws() -> None:

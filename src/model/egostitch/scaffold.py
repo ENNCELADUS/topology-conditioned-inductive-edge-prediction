@@ -65,6 +65,7 @@ def _stable_slot_permutation(
 def _checkerboard_rewire(
     matrices: torch.Tensor,
     generators: Sequence[torch.Generator],
+    capacities: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply keyed checkerboard transfers to a matrix batch without Python swap loops."""
     matrix_count, slots, width = matrices.shape
@@ -72,6 +73,8 @@ def _checkerboard_rewire(
         raise ValueError(f"checkerboard inputs must be square, got {tuple(matrices.shape)}")
     if len(generators) != matrix_count:
         raise ValueError("checkerboard generator count must equal the matrix batch size")
+    if capacities is not None and capacities.shape != matrices.shape:
+        raise ValueError("checkerboard capacities must match the matrix batch shape")
     if slots < 4:
         raise ValueError("off-diagonal checkerboard swaps require at least four slots")
 
@@ -132,16 +135,34 @@ def _checkerboard_rewire(
     def transfer(
         flat: torch.Tensor,
         draw: tuple[torch.Tensor, torch.Tensor],
+        flat_capacities: torch.Tensor | None,
     ) -> torch.Tensor:
         indices, unit = draw
         row_i, row_k, column_j, column_l = indices.unbind(dim=-1)
+        recipient_ij = matrix_offsets + row_i * slots + column_j
+        recipient_kl = matrix_offsets + row_k * slots + column_l
         donor_il = matrix_offsets + row_i * slots + column_l
         donor_kj = matrix_offsets + row_k * slots + column_j
-        delta = unit * torch.minimum(flat[donor_il], flat[donor_kj])
+        bounds = torch.stack((flat[donor_il], flat[donor_kj]), dim=-1)
+        if flat_capacities is not None:
+            bounds = torch.cat(
+                (
+                    bounds,
+                    torch.stack(
+                        (
+                            flat_capacities[recipient_ij] - flat[recipient_ij],
+                            flat_capacities[recipient_kl] - flat[recipient_kl],
+                        ),
+                        dim=-1,
+                    ).clamp_min(0.0),
+                ),
+                dim=-1,
+            )
+        delta = unit * bounds.amin(dim=-1)
         update_indices = torch.stack(
             (
-                matrix_offsets + row_i * slots + column_j,
-                matrix_offsets + row_k * slots + column_l,
+                recipient_ij,
+                recipient_kl,
                 donor_il,
                 donor_kj,
             ),
@@ -151,8 +172,9 @@ def _checkerboard_rewire(
         return flat.scatter_add(0, update_indices, update_values)
 
     flat = matrices.flatten()
+    flat_capacities = capacities.flatten() if capacities is not None else None
     for indices, unit in zip(draw_indices, round_units, strict=True):
-        flat = transfer(flat, (indices, unit))
+        flat = transfer(flat, (indices, unit), flat_capacities)
     return flat.reshape_as(matrices)
 
 
@@ -242,6 +264,14 @@ def make_scaffold_input_perturbation(
         rewired = _checkerboard_rewire(
             torch.cat((weighted_src, weighted_dst, canonical_plan), dim=0),
             (*src_generators, *dst_generators, *plan_generators),
+            torch.cat(
+                (
+                    weight_src,
+                    weight_dst,
+                    torch.full_like(canonical_plan, torch.inf),
+                ),
+                dim=0,
+            ),
         )
         rewired_src = rewired[:batch_size]
         rewired_dst = rewired[batch_size : 2 * batch_size]
