@@ -1,4 +1,4 @@
-"""Closed-form ridge-regression representation probes (spec Sec 14.3(3)).
+"""Registered EgoStitch representation probes (spec Sec 14.3(3), Sec 14.4.7).
 
 Diagnostics-only linear probes over frozen encoder states (STE token states,
 in the registered representation-probe protocol): out-of-fold ``R^2`` from a
@@ -10,7 +10,10 @@ away for free (registration ``diagnostics_nonbinding``: "linear probes on
 frozen STE token states: R2 to degree / ego-density / clustering (ridge
 lambda 1e-3, 5-fold), plus degree-partialled variants and Pi-consistency").
 
-Both probes are diagnostics only — they never gate the Stage-1 verdict.
+The rev-3.1 artifact additionally records direct alignment, grounding-pool
+recall, relational-state, and slot-dispersion measurements. Structural targets
+are always explicitly scoped to train-side ``E_msg``; no default can select a
+sealed universe.
 """
 
 from __future__ import annotations
@@ -18,10 +21,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+import pickle
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import networkx as nx
 import numpy as np
@@ -31,8 +35,172 @@ from numpy.typing import NDArray
 _RIDGE_LAMBDA = 1e-3
 _N_FOLDS = 5
 _MIN_VARIANCE = 1e-10
-_E2E_PROBE_FORMAT = "egostitch_e2e_probe_v1"
+_E2E_PROBE_FORMAT = "egostitch_e2e_probe_v2"
+_E2E_PROBE_V1_FORMAT = "egostitch_e2e_probe_v1"
 _E2E_PAIR_LIMIT = 4096
+E2EProbeScope = Literal["formal_train", "calibration_fit", "qualification_qual"]
+E2E_PROBE_SCOPES: tuple[E2EProbeScope, ...] = (
+    "formal_train",
+    "calibration_fit",
+    "qualification_qual",
+)
+_DISPERSION_NAMES = (
+    "pi_slot_std",
+    "h_pairwise_cosine_mean",
+    "adj_offdiag_std",
+    "plan_row_entropy",
+)
+
+
+def _probe_feature_nodes(
+    scope: E2EProbeScope,
+    formal_nodes: Sequence[str],
+    *,
+    v_fit: Iterable[str],
+    v_qual: Iterable[str],
+) -> list[str]:
+    """Resolve the only feature identities a probe scope may materialize."""
+    if scope == "formal_train":
+        return list(formal_nodes)
+    if scope == "calibration_fit":
+        return sorted(v_fit)
+    if scope == "qualification_qual":
+        return sorted(v_qual)
+    raise ValueError(f"unsupported E2E probe scope {scope!r}")
+
+
+def _load_train_side_probe_inputs(
+    strategy_dir: Path,
+    *,
+    expected_missing_features: Sequence[str],
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Load probe identities/positives without opening any test-side artifact."""
+    from src.train_egostitch import _read_labeled_pairs
+
+    with (strategy_dir / "split.pkl").open("rb") as handle:
+        split_payload = pickle.load(handle)  # noqa: S301 - repository benchmark artifact
+    if not isinstance(split_payload, dict) or "train" not in split_payload:
+        raise ValueError("split.pkl must contain a train node collection")
+    train_nodes = sorted(
+        set(cast(Sequence[str], split_payload["train"]))
+        - set(expected_missing_features)
+    )
+    train_pairs, train_labels = _read_labeled_pairs(strategy_dir / "train_edges.txt")
+    positives = [
+        pair
+        for pair, label in zip(train_pairs, train_labels, strict=True)
+        if int(label) == 1
+    ]
+    return train_nodes, positives
+
+
+def _build_probe_scope_graph(
+    scope: E2EProbeScope,
+    nodes: Sequence[str],
+    *,
+    formal_e_msg: Iterable[tuple[str, str]],
+    fit_e_msg: Iterable[tuple[str, str]],
+    qual_e_msg: Iterable[tuple[str, str]],
+) -> nx.Graph:
+    """Build only the explicit train-side message graph authorized by ``scope``."""
+    from src.data.partition import build_g_struct
+
+    if scope == "formal_train":
+        edges = formal_e_msg
+    elif scope == "calibration_fit":
+        edges = fit_e_msg
+    elif scope == "qualification_qual":
+        edges = qual_e_msg
+    else:
+        raise ValueError(f"unsupported E2E probe scope {scope!r}")
+    return build_g_struct(nodes, edges)
+
+
+def _validate_pi_consistency_inputs(
+    plan: torch.Tensor,
+    cells: torch.Tensor,
+) -> None:
+    """Validate the common plan/cell shape contract for both consistency probes."""
+    if plan.ndim != 3 or plan.shape[-1] != plan.shape[-2]:
+        raise ValueError("Pi consistency plan must have shape (B, K, K)")
+    if cells.shape != plan.shape or cells.dtype != torch.bool:
+        raise ValueError("Pi consistency cells must be boolean and match the plan")
+    if not bool(torch.isfinite(plan).all()) or bool((plan < 0).any()):
+        raise ValueError("Pi consistency plan must be finite and nonnegative")
+
+
+def pi_grounding_chain_consistency_v1(
+    plan: torch.Tensor,
+    same_real_grounded_identity: torch.Tensor,
+    *,
+    gate_a: torch.Tensor,
+    gate_b: torch.Tensor,
+) -> torch.Tensor:
+    """Measure the complete pointer/gate/grounding chain, not alignment alone.
+
+    ``same_real_grounded_identity`` is true where the two pointer argmaxes
+    select the same real shared-neighbor identity. The gate threshold is then
+    applied here. Consequently this continuity probe is structurally zero when
+    either endpoint's gates are shut, regardless of the quality of ``Pi``.
+    """
+    _validate_pi_consistency_inputs(plan, same_real_grounded_identity)
+    expected_gate_shape = plan.shape[:2]
+    if gate_a.shape != expected_gate_shape or gate_b.shape != expected_gate_shape:
+        raise ValueError("Pi-consistency v1 gates must have shape (B, K)")
+    with torch.autocast(device_type=plan.device.type, enabled=False):
+        plan32 = plan.float()
+        grounded = (gate_a[:, :, None] > 0.5) & (gate_b[:, None, :] > 0.5)
+        eligible = same_real_grounded_identity & grounded
+        return (plan32 * eligible.float()).sum(dim=(1, 2)) / plan32.sum(
+            dim=(1, 2)
+        ).clamp_min(1e-30)
+
+
+def pi_alignment_consistency_v2(
+    plan: torch.Tensor,
+    same_identity_teacher_cells: torch.Tensor,
+) -> torch.Tensor:
+    """Measure alignment directly as ``Pi`` mass on the exact ``L_align`` set ``S``."""
+    _validate_pi_consistency_inputs(plan, same_identity_teacher_cells)
+    with torch.autocast(device_type=plan.device.type, enabled=False):
+        plan32 = plan.float()
+        return (plan32 * same_identity_teacher_cells.float()).sum(
+            dim=(1, 2)
+        ) / plan32.sum(dim=(1, 2)).clamp_min(1e-30)
+
+
+def slot_recall_at_n_ground(
+    graph: nx.Graph,
+    nodes: Sequence[str],
+    grounding_pool: Mapping[str, Sequence[str]],
+    selected_slots: Mapping[str, Sequence[str]],
+) -> NDArray[np.float64]:
+    """Return grounded-slot recall rows within each node's own ``n_g`` pool.
+
+    Each row is the fraction of true scoped neighbors recovered by at least one
+    gate-active pointer-selected slot. Selected identities must belong to that
+    node's supplied grounding pool, making the P0.2 pool recall an explicit
+    ceiling. Isolates are excluded from the mean.
+    """
+    missing_graph = [node for node in nodes if node not in graph]
+    if missing_graph:
+        raise ValueError(f"slot-recall nodes missing from scoped graph: {missing_graph[:5]}")
+    missing_pool = [node for node in nodes if node not in grounding_pool]
+    if missing_pool:
+        raise ValueError(f"slot-recall nodes missing grounding pools: {missing_pool[:5]}")
+    missing_slots = [node for node in nodes if node not in selected_slots]
+    if missing_slots:
+        raise ValueError(f"slot-recall nodes missing selected slots: {missing_slots[:5]}")
+    rows: list[float] = []
+    for node in nodes:
+        neighbors = {str(neighbor) for neighbor in graph.neighbors(node) if neighbor != node}
+        pool = set(grounding_pool[node])
+        selected = set(selected_slots[node])
+        if not selected <= pool:
+            raise ValueError(f"selected slot identity falls outside {node!r}'s grounding pool")
+        if neighbors:
+            rows.append(len(neighbors & selected) / len(neighbors))
+    return np.asarray(rows, dtype=np.float64)
 
 
 def probe_targets(graph: nx.Graph, nodes: Sequence[str]) -> dict[str, NDArray[np.float64]]:
@@ -254,23 +422,57 @@ def write_e2e_probe_artifact(
     states: NDArray[np.float32],
     targets: Mapping[str, NDArray[np.float64]],
     pair_ids: Sequence[tuple[str, str]],
-    pi_consistency: NDArray[np.float64],
+    pair_states: NDArray[np.float32],
+    pi_consistency_v1: NDArray[np.float64],
+    pi_consistency_v2: NDArray[np.float64],
+    slot_recall: NDArray[np.float64],
+    shared_neighbor_count: NDArray[np.float64],
+    dispersion: Mapping[str, NDArray[np.float64]],
 ) -> None:
-    """Write one validated provenance-bound E2E probe artifact."""
+    """Write one validated provenance-bound rev-3.1 E2E probe artifact."""
     n_nodes = len(node_ids)
+    n_pairs = len(pair_ids)
     required_targets = {"degree", "ego_density", "clustering"}
     if set(targets) != required_targets:
         raise ValueError(f"probe targets must be exactly {sorted(required_targets)}")
     if states.ndim != 2 or states.shape[0] != n_nodes:
         raise ValueError("probe states must have shape (n_nodes, d_state)")
+    if pair_states.ndim != 2 or pair_states.shape[0] != n_pairs:
+        raise ValueError("probe pair states must have shape (n_pairs, d_state)")
     if any(np.asarray(targets[name]).shape != (n_nodes,) for name in required_targets):
         raise ValueError("every probe target must have shape (n_nodes,)")
-    if len(pair_ids) != len(pi_consistency):
-        raise ValueError("probe pair identities and Pi consistency must align")
-    if not np.isfinite(states).all() or not np.isfinite(pi_consistency).all():
+    pair_arrays: dict[str, NDArray[np.float64]] = {
+        "Pi consistency v1": np.asarray(pi_consistency_v1, dtype=np.float64),
+        "Pi consistency v2": np.asarray(pi_consistency_v2, dtype=np.float64),
+        "shared-neighbor count": np.asarray(shared_neighbor_count, dtype=np.float64),
+        **{
+            name: np.asarray(values, dtype=np.float64)
+            for name, values in dispersion.items()
+        },
+    }
+    if set(dispersion) != set(_DISPERSION_NAMES):
+        raise ValueError(f"probe dispersion must be exactly {sorted(_DISPERSION_NAMES)}")
+    if any(values.shape != (n_pairs,) for values in pair_arrays.values()):
+        raise ValueError("every pair probe must align with probe pair identities")
+    if slot_recall.ndim != 1 or len(slot_recall) > n_nodes:
+        raise ValueError("slot recall must be one-dimensional and cannot exceed node count")
+    if (
+        not np.isfinite(states).all()
+        or not np.isfinite(pair_states).all()
+        or not np.isfinite(slot_recall).all()
+        or any(not np.isfinite(values).all() for values in pair_arrays.values())
+    ):
         raise ValueError("probe artifact contains non-finite values")
-    if np.any((pi_consistency < 0.0) | (pi_consistency > 1.0)):
-        raise ValueError("Pi consistency values must lie in [0, 1]")
+    for values in (pi_consistency_v1, pi_consistency_v2, slot_recall):
+        if np.any((values < 0.0) | (values > 1.0)):
+            raise ValueError("Pi consistency and slot recall values must lie in [0, 1]")
+    if np.any(shared_neighbor_count < 0.0):
+        raise ValueError("shared-neighbor counts must be nonnegative")
+    if metadata.get("scope") not in E2E_PROBE_SCOPES:
+        raise ValueError(f"probe metadata scope must be one of {E2E_PROBE_SCOPES}")
+    n_ground_value = metadata.get("n_ground")
+    if not isinstance(n_ground_value, int) or n_ground_value <= 0:
+        raise ValueError("probe metadata n_ground must be a positive integer")
     payload_meta = {**metadata, "format": _E2E_PROBE_FORMAT}
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -283,7 +485,17 @@ def write_e2e_probe_artifact(
         clustering=np.asarray(targets["clustering"], dtype=np.float64),
         pair_u=np.asarray([pair[0] for pair in pair_ids], dtype=np.str_),
         pair_v=np.asarray([pair[1] for pair in pair_ids], dtype=np.str_),
-        pi_shared_neighbor_consistency=np.asarray(pi_consistency, dtype=np.float64),
+        pair_states=np.asarray(pair_states, dtype=np.float32),
+        pi_shared_neighbor_consistency=np.asarray(pi_consistency_v1, dtype=np.float64),
+        pi_consistency_v2=np.asarray(pi_consistency_v2, dtype=np.float64),
+        slot_recall_at_n_ground=np.asarray(slot_recall, dtype=np.float64),
+        shared_neighbor_count=np.asarray(shared_neighbor_count, dtype=np.float64),
+        pi_slot_std=np.asarray(dispersion["pi_slot_std"], dtype=np.float64),
+        h_pairwise_cosine_mean=np.asarray(
+            dispersion["h_pairwise_cosine_mean"], dtype=np.float64
+        ),
+        adj_offdiag_std=np.asarray(dispersion["adj_offdiag_std"], dtype=np.float64),
+        plan_row_entropy=np.asarray(dispersion["plan_row_entropy"], dtype=np.float64),
     )
 
 
@@ -304,17 +516,36 @@ def evaluate_e2e_probe_artifact(
         "clustering",
         "pair_u",
         "pair_v",
+        "pair_states",
         "pi_shared_neighbor_consistency",
+        "pi_consistency_v2",
+        "slot_recall_at_n_ground",
+        "shared_neighbor_count",
+        *_DISPERSION_NAMES,
     }
     with np.load(path, allow_pickle=False) as archive:
+        if "meta" not in archive.files:
+            raise ValueError("E2E probe artifact is missing metadata")
+        metadata = cast(dict[str, object], json.loads(str(archive["meta"].item())))
+        actual_format = metadata.get("format")
+        if actual_format != _E2E_PROBE_FORMAT:
+            if actual_format == _E2E_PROBE_V1_FORMAT:
+                raise ValueError(
+                    f"E2E probe artifact format {_E2E_PROBE_V1_FORMAT!r} is not supported; "
+                    f"expected {_E2E_PROBE_FORMAT!r}"
+                )
+            raise ValueError(
+                f"E2E probe artifact format {actual_format!r} is not supported; "
+                f"expected {_E2E_PROBE_FORMAT!r}"
+            )
         if set(archive.files) != required_arrays:
             raise ValueError(
                 f"E2E probe arrays must be exactly {sorted(required_arrays)}, "
                 f"got {sorted(archive.files)}"
             )
-        metadata = cast(dict[str, object], json.loads(str(archive["meta"].item())))
         node_ids = archive["node_ids"].astype(str).tolist()
         states = np.asarray(archive["states"], dtype=np.float64)
+        pair_states = np.asarray(archive["pair_states"], dtype=np.float64)
         stored_targets = {
             name: np.asarray(archive[name], dtype=np.float64)
             for name in ("degree", "ego_density", "clustering")
@@ -326,9 +557,18 @@ def evaluate_e2e_probe_artifact(
                 strict=True,
             )
         )
-        pi_values = np.asarray(archive["pi_shared_neighbor_consistency"], dtype=np.float64)
-    if metadata.get("format") != _E2E_PROBE_FORMAT:
-        raise ValueError("unsupported E2E probe artifact format")
+        pi_v1 = np.asarray(archive["pi_shared_neighbor_consistency"], dtype=np.float64)
+        pi_v2 = np.asarray(archive["pi_consistency_v2"], dtype=np.float64)
+        slot_recall = np.asarray(archive["slot_recall_at_n_ground"], dtype=np.float64)
+        shared_neighbor_count = np.asarray(archive["shared_neighbor_count"], dtype=np.float64)
+        dispersion = {
+            name: np.asarray(archive[name], dtype=np.float64) for name in _DISPERSION_NAMES
+        }
+    if metadata.get("scope") not in E2E_PROBE_SCOPES:
+        raise ValueError("E2E probe metadata has an unsupported structural scope")
+    n_ground_value = metadata.get("n_ground")
+    if not isinstance(n_ground_value, int) or n_ground_value <= 0:
+        raise ValueError("E2E probe metadata has an invalid n_ground")
     for key, expected in expected_metadata.items():
         if metadata.get(key) != expected:
             raise ValueError(
@@ -346,13 +586,45 @@ def evaluate_e2e_probe_artifact(
     for name in stored_targets:
         if not np.array_equal(stored_targets[name], expected_targets[name]):
             raise ValueError(f"E2E probe target {name!r} does not match G_struct")
+    expected_shared = np.asarray(
+        [
+            len(set(graph.neighbors(node_u)) & set(graph.neighbors(node_v)))
+            for node_u, node_v in expected_pairs
+        ],
+        dtype=np.float64,
+    )
+    if not np.array_equal(shared_neighbor_count, expected_shared):
+        raise ValueError("E2E probe shared-neighbor counts do not match G_struct")
     if states.ndim != 2 or states.shape[0] != len(expected_nodes):
         raise ValueError("E2E probe state shape does not match node identities")
-    if pi_values.shape != (len(expected_pairs),):
-        raise ValueError("E2E probe Pi consistency shape does not match pair identities")
-    if not np.isfinite(states).all() or not np.isfinite(pi_values).all():
+    if pair_states.ndim != 2 or pair_states.shape[0] != len(expected_pairs):
+        raise ValueError("E2E pair-state shape does not match pair identities")
+    pair_arrays = {
+        "Pi consistency v1": pi_v1,
+        "Pi consistency v2": pi_v2,
+        "shared-neighbor count": shared_neighbor_count,
+        **dispersion,
+    }
+    n_recall_nodes = sum(graph.degree(node) > 0 for node in expected_nodes)
+    if slot_recall.shape != (n_recall_nodes,):
+        raise ValueError("E2E slot-recall shape does not match non-isolated node identities")
+    if any(values.shape != (len(expected_pairs),) for values in pair_arrays.values()):
+        raise ValueError("E2E pair-probe shape does not match pair identities")
+    finite_arrays = [states, pair_states, slot_recall, *pair_arrays.values()]
+    if any(not np.isfinite(values).all() for values in finite_arrays):
         raise ValueError("E2E probe artifact contains non-finite values")
+    if any(np.any((values < 0.0) | (values > 1.0)) for values in (pi_v1, pi_v2, slot_recall)):
+        raise ValueError("E2E Pi consistency and slot recall values must lie in [0, 1]")
     degree = stored_targets["degree"]
+
+    def summary(values: NDArray[np.float64]) -> dict[str, float | int]:
+        return {
+            "mean": float(np.mean(values)) if len(values) else 0.0,
+            "std": float(np.std(values)) if len(values) else 0.0,
+            "nonzero_fraction": float(np.mean(values > 0.0)) if len(values) else 0.0,
+            "n": len(values),
+        }
+
     return {
         "metadata": metadata,
         "linear_probe_r2": {
@@ -363,12 +635,25 @@ def evaluate_e2e_probe_artifact(
             name: degree_partialled_r2(states, stored_targets[name], degree, seed=0)
             for name in ("ego_density", "clustering")
         },
-        "pi_shared_neighbor_consistency": {
-            "mean": float(np.mean(pi_values)) if len(pi_values) else 0.0,
-            "std": float(np.std(pi_values)) if len(pi_values) else 0.0,
-            "nonzero_fraction": float(np.mean(pi_values > 0.0)) if len(pi_values) else 0.0,
-            "n_pairs": len(pi_values),
+        "shared_neighbor_count_r2": linear_probe_r2(
+            pair_states,
+            shared_neighbor_count,
+            seed=0,
+        ),
+        "slot_recall_at_n_ground": {
+            **summary(slot_recall),
+            "n_ground": n_ground_value,
+            "n_nodes": len(slot_recall),
         },
+        "pi_shared_neighbor_consistency": {
+            **summary(pi_v1),
+            "n_pairs": len(pi_v1),
+        },
+        "pi_consistency_v2": {
+            **summary(pi_v2),
+            "n_pairs": len(pi_v2),
+        },
+        "dispersion": {name: summary(values) for name, values in dispersion.items()},
     }
 
 
@@ -432,14 +717,26 @@ def produce_e2e_probe_artifact(
     data_root: Path,
     strategy: str,
     output_path: Path,
+    scope: E2EProbeScope,
 ) -> None:
-    """Produce the registered full-checkpoint STE/Pi evidence artifact."""
+    """Produce the registered full-checkpoint STE/Pi evidence artifact.
+
+    ``scope`` is deliberately required. ``formal_train`` uses the full
+    operative train-side ``G_struct``; pre-binding ``calibration_fit`` and
+    ``qualification_qual`` resolve only to ``G_fit`` and ``E_msg[V_qual]``.
+    There is no ``V_select`` option.
+    """
     from src import train_egostitch as te
+    from src.data.ego_targets import EgoTargetBuilder, EgoTargets
     from src.data.packed_features import PackedFeatureTable
     from src.model.egostitch.config import E2EConfig, e2e_checkpoint_config
     from src.model.egostitch.e2e_model import EgoStitchE2E
+    from src.model.egostitch.losses import alignment_teacher_cells
+    from src.model.egostitch.matching import match_slots
     from src.train_b0 import _state_digest
 
+    if scope not in E2E_PROBE_SCOPES:
+        raise ValueError(f"unsupported E2E probe scope {scope!r}; expected {E2E_PROBE_SCOPES}")
     run_metadata = cast(
         dict[str, object], json.loads(run_metadata_path.read_text(encoding="utf-8"))
     )
@@ -451,9 +748,21 @@ def produce_e2e_probe_artifact(
     probe_registration = cast(
         Mapping[str, object] | None, registration_payload.get("probe_artifact")
     )
-    if registration_payload.get("status") != "BINDING":
-        raise ValueError("E2E probe producer requires a BINDING preregistration")
-    if probe_registration is None or probe_registration.get("format") != _E2E_PROBE_FORMAT:
+    registration_status = registration_payload.get("status")
+    if scope == "formal_train":
+        if registration_status != "BINDING":
+            raise ValueError("formal E2E probe production requires a BINDING preregistration")
+    elif registration_status != "DRAFT":
+        raise ValueError("pre-binding E2E probes require a DRAFT preregistration")
+    registered_format = (
+        probe_registration.get("format") if probe_registration is not None else None
+    )
+    if registered_format == _E2E_PROBE_V1_FORMAT:
+        raise ValueError(
+            f"E2E probe artifact format {_E2E_PROBE_V1_FORMAT!r} is not supported; "
+            f"expected {_E2E_PROBE_FORMAT!r}"
+        )
+    if probe_registration is None or registered_format != _E2E_PROBE_FORMAT:
         raise ValueError("preregistration does not bind the E2E probe artifact format")
     if probe_registration.get("source_arm") != "full":
         raise ValueError("preregistration does not bind the E2E probe source to the full arm")
@@ -469,19 +778,39 @@ def produce_e2e_probe_artifact(
     expected_output = Path(str(probe_registration.get("expected_path")))
     if not expected_output.is_absolute():
         expected_output = preregistration_path.resolve().parents[2] / expected_output
-    if output_path.resolve() != expected_output.resolve():
-        raise ValueError(
-            f"probe output path does not match registration: {output_path} != {expected_output}"
-        )
+    if scope == "formal_train":
+        if output_path.resolve() != expected_output.resolve():
+            raise ValueError(
+                f"probe output path does not match registration: {output_path} != {expected_output}"
+            )
+    elif output_path.resolve() == expected_output.resolve():
+        raise ValueError("pre-binding probe output must not overwrite the registered formal path")
     if run_metadata.get("preregistration_sha256") != registration_sha:
         raise ValueError("probe run metadata does not match preregistration SHA-256")
-    if (
-        run_metadata.get("run_kind") != "formal"
-        or run_metadata.get("status") != "complete"
-        or run_metadata.get("formal_artifacts_published") is not True
-        or run_metadata.get("permanent_null") != "none"
-    ):
-        raise ValueError("E2E probe producer requires the completed formal full arm")
+    if scope == "formal_train":
+        if (
+            run_metadata.get("run_kind") != "formal"
+            or run_metadata.get("status") != "complete"
+            or run_metadata.get("formal_artifacts_published") is not True
+            or run_metadata.get("permanent_null") != "none"
+        ):
+            raise ValueError("E2E probe producer requires the completed formal full arm")
+    else:
+        allowed_run_kinds = (
+            {"debug", "rehearsal"}
+            if scope == "calibration_fit"
+            else {"rehearsal"}
+        )
+        if (
+            run_metadata.get("run_kind") not in allowed_run_kinds
+            or run_metadata.get("status") not in {"complete", "debug_complete"}
+            or run_metadata.get("formal_artifacts_published") is not False
+            or run_metadata.get("permanent_null") != "none"
+        ):
+            raise ValueError(
+                f"{scope} probe production requires a completed unpublished "
+                f"{sorted(allowed_run_kinds)} full-arm run"
+            )
     if run_metadata.get("seed") != 0 or run_metadata.get("partition_seed") != 0:
         raise ValueError("E2E probe producer requires Seed 0 and partition Seed 0")
     config_path = Path(str(run_metadata.get("config_path")))
@@ -522,51 +851,69 @@ def produce_e2e_probe_artifact(
     table = PackedFeatureTable.from_pack(cfg.data.pack_dir, torch.device("cpu"))
     token_index = table.manifest.node_index()
 
-    # Registered probe identities (registration `probe_artifact`): all operative
-    # train nodes over the full-E_msg `G_struct`, matching the gate's own
-    # reconstruction — not the worker's internal-holdout training view. Each
-    # node grounds in its spec §13.12 role universe (V_fit / V_qual / V_select).
+    # The formal artifact is pinned to all operative train nodes over full
+    # train-side E_msg. Pre-binding scopes are explicit induced universes:
+    # G_fit for calibration and E_msg[V_qual] for rehearsal. V_select is not
+    # representable here.
     from src.data.features import FeatureStore, build_f0_matrix
     from src.data.grounding import build_grounding_pool
     from src.data.internal_holdout import derive_internal_holdout
-    from src.data.partition import build_g_struct, derive_partition
+    from src.data.partition import derive_partition
 
-    benchmark = te._load_benchmark_for(cfg)
-    operative = sorted(set(benchmark.graph.nodes()) - set(cfg.data.expected_missing_features))
-    nodes = sorted(set(benchmark.split.train_nodes) & set(operative))
-    train_positives = [
-        pair
-        for pair, label in zip(
-            benchmark.split.train_pairs.pairs,
-            benchmark.split.train_pairs.labels,
-            strict=True,
-        )
-        if label == 1
-    ]
+    strategy_dir = cfg.data.root / te._BENCHMARK_SUBDIR / cfg.data.strategy
+    formal_nodes, train_positives = _load_train_side_probe_inputs(
+        strategy_dir,
+        expected_missing_features=cfg.data.expected_missing_features,
+    )
     partition = derive_partition(
         train_positives, seed=cfg.data.partition_seed, msg_fraction=cfg.data.msg_fraction
     )
-    graph = build_g_struct(nodes, partition.e_msg)
+    holdout = derive_internal_holdout(formal_nodes, partition.e_msg, partition.e_sup)
+    role_universes: tuple[tuple[list[str], str, str], ...]
+    nodes = _probe_feature_nodes(
+        scope,
+        formal_nodes,
+        v_fit=holdout.v_fit,
+        v_qual=holdout.v_qual,
+    )
+    graph = _build_probe_scope_graph(
+        scope,
+        nodes,
+        formal_e_msg=partition.e_msg,
+        fit_e_msg=holdout.e_msg_fit,
+        qual_e_msg=holdout.qual_manifest.positive_edges,
+    )
     missing_tokens = [node for node in nodes if node not in token_index]
     if missing_tokens:
         raise ValueError(f"token pack is missing {len(missing_tokens)} probe nodes")
-    holdout = derive_internal_holdout(nodes, partition.e_msg, partition.e_sup)
     store = FeatureStore(cfg.data.root / te._FEATURES_SUBDIR)
     cache_dir = output_path.parent
     cache_dir.mkdir(parents=True, exist_ok=True)
+    f0_cache_name = (
+        "probe_f0.pt" if scope == "formal_train" else f"probe_f0_{scope}.pt"
+    )
     matrix, node_index = build_f0_matrix(
-        store, nodes, cache_path=cache_dir / "probe_f0.pt", allow_cache_subset=True
+        store,
+        nodes,
+        cache_path=cache_dir / f0_cache_name,
+        allow_cache_subset=True,
     )
     # Sourced from the loaded checkpoint's own generator_cfg (spec Sec 14.4.4:
     # n_ground is per-arm, not the pinned EgoStitchConfig() spec default).
     n_ground = model.generator_cfg.n_ground
     matrix_np = matrix.numpy()
     grounding_rows: dict[str, list[int]] = {}
-    role_universes = (
-        (sorted(holdout.v_fit), "probe_grounding_fit.npz", "V_fit"),
-        (sorted(holdout.v_qual), "probe_grounding_qual.npz", "V_qual"),
-        (sorted(holdout.v_select), "probe_grounding_select.npz", "V_select"),
-    )
+    grounding_pool: dict[str, list[str]] = {}
+    if scope == "formal_train":
+        role_universes = (
+            (sorted(holdout.v_fit), "probe_grounding_fit.npz", "V_fit"),
+            (sorted(holdout.v_qual), "probe_grounding_qual.npz", "V_qual"),
+            (sorted(holdout.v_select), "probe_grounding_select.npz", "V_select"),
+        )
+    elif scope == "calibration_fit":
+        role_universes = ((nodes, "probe_grounding_fit.npz", "V_fit"),)
+    else:
+        role_universes = ((nodes, "probe_grounding_qual.npz", "V_qual"),)
     for role_nodes, cache_name, role_universe in role_universes:
         role_rows = np.asarray(
             matrix_np[[node_index[node] for node in role_nodes]], dtype=np.float32
@@ -579,6 +926,7 @@ def produce_e2e_probe_artifact(
             cache_path=cache_dir / cache_name,
         )
         for node in role_nodes:
+            grounding_pool[node] = list(pool[node])
             grounding_rows[node] = [node_index[neighbor] for neighbor in pool[node]]
     data = _ProbeBundle(
         node_index=node_index,
@@ -588,24 +936,82 @@ def produce_e2e_probe_artifact(
     )
     batch_size = max(1, cfg.data.edge_batch)
     state_rows: list[NDArray[np.float32]] = []
+    selected_slots: dict[str, list[str]] = {}
+    inverse_index = {row: node for node, row in node_index.items()}
     with torch.inference_mode():
         for start in range(0, len(nodes), batch_size):
             batch_nodes = nodes[start : start + batch_size]
             batch = _probe_batch(data, table, token_index, batch_nodes, batch_nodes, device)
-            state_rows.append(model.probe_states(batch).mean(dim=1).float().cpu().numpy())
+            state_a, state_b, is_self = model._pair_node_states(batch)
+            context = model.build_pair_context_from_states(
+                state_a,
+                state_b,
+                is_self,
+                need_topo=True,
+                need_cont=False,
+            )
+            assert context.topo_ab is not None
+            assert state_a.ground_ids is not None
+            state_rows.append(context.topo_ab.mean(dim=1).float().cpu().numpy())
+            selected_ids = torch.gather(
+                state_a.ground_ids,
+                1,
+                state_a.slots.pointer.argmax(dim=-1),
+            )
+            active = state_a.slots.gate > 0.5
+            for row, node in enumerate(batch_nodes):
+                selected_slots[node] = [
+                    inverse_index[int(identity)]
+                    for identity in selected_ids[row, active[row]].cpu().tolist()
+                ]
+
+    target_builder = EgoTargetBuilder(
+        graph,
+        matrix_np,
+        node_index,
+        grounding_pool,
+        slots=model.generator_cfg.slots,
+    )
+    checkpoint_epoch = cast(int, payload["epoch"])
+
+    def batch_targets(batch_nodes: Sequence[str]) -> EgoTargets:
+        """Build the exact node/epoch-keyed matching targets used by ``L_align``."""
+        rows = [
+            target_builder.build(
+                [node],
+                te._edge_target_rng(node, seed=0, epoch=checkpoint_epoch),
+            )
+            for node in batch_nodes
+        ]
+        return EgoTargets(
+            features=torch.cat([row.features for row in rows], dim=0).to(device),
+            mult=torch.cat([row.mult for row in rows], dim=0).to(device),
+            adj=torch.cat([row.adj for row in rows], dim=0).to(device),
+            mask=torch.cat([row.mask for row in rows], dim=0).to(device),
+            degree=torch.cat([row.degree for row in rows], dim=0).to(device),
+            in_pool=torch.cat([row.in_pool for row in rows], dim=0).to(device),
+            pool_index=torch.cat([row.pool_index for row in rows], dim=0).to(device),
+            node_index=torch.cat([row.node_index for row in rows], dim=0).to(device),
+            ego_stats=torch.cat([row.ego_stats for row in rows], dim=0).to(device),
+        )
 
     pairs = select_probe_pairs(graph)
-    inverse_index = {row: node for node, row in data.node_index.items()}
-    consistency: list[float] = []
+    consistency_v1: list[float] = []
+    consistency_v2: list[float] = []
+    pair_state_rows: list[NDArray[np.float32]] = []
+    shared_neighbor_counts: list[float] = []
+    dispersion_rows: dict[str, list[float]] = {name: [] for name in _DISPERSION_NAMES}
     with torch.inference_mode():
         for start in range(0, len(pairs), batch_size):
             batch_pairs = pairs[start : start + batch_size]
+            endpoints_a = [pair[0] for pair in batch_pairs]
+            endpoints_b = [pair[1] for pair in batch_pairs]
             batch = _probe_batch(
                 data,
                 table,
                 token_index,
-                [pair[0] for pair in batch_pairs],
-                [pair[1] for pair in batch_pairs],
+                endpoints_a,
+                endpoints_b,
                 device,
             )
             state_a, state_b, is_self = model._pair_node_states(batch)
@@ -613,7 +1019,52 @@ def produce_e2e_probe_artifact(
                 state_a, state_b, is_self, need_topo=True, need_cont=False
             )
             assert context.plan is not None
+            assert context.topo_ab is not None
             assert state_a.ground_ids is not None and state_b.ground_ids is not None
+            pair_state_rows.append(context.topo_ab.float().mean(dim=1).cpu().numpy())
+            targets_a = batch_targets(endpoints_a)
+            targets_b = batch_targets(endpoints_b)
+            assignment_a = match_slots(
+                state_a.slots,
+                target_proj=model.generator.project_features(targets_a.features).detach(),
+                target_mult=targets_a.mult,
+                target_adj=targets_a.adj,
+                target_mask=targets_a.mask,
+            )
+            assignment_b = match_slots(
+                state_b.slots,
+                target_proj=model.generator.project_features(targets_b.features).detach(),
+                target_mult=targets_b.mult,
+                target_adj=targets_b.adj,
+                target_mask=targets_b.mask,
+            )
+            teacher_cells = alignment_teacher_cells(
+                assignment_a,
+                assignment_b,
+                target_ids_a=targets_a.node_index,
+                target_ids_b=targets_b.node_index,
+                slots=model.generator_cfg.slots,
+            )
+            batch_v2 = pi_alignment_consistency_v2(context.plan, teacher_cells)
+            dispersion_a = te._e2e_dispersion_rows(
+                state_a.slots.pi,
+                state_a.slots.h,
+                state_a.slots.adj,
+                context.plan,
+            )
+            dispersion_b = te._e2e_dispersion_rows(
+                state_b.slots.pi,
+                state_b.slots.h,
+                state_b.slots.adj,
+                context.plan,
+            )
+            for name in _DISPERSION_NAMES:
+                values = (
+                    0.5 * (dispersion_a[name] + dispersion_b[name])
+                    if name != "plan_row_entropy"
+                    else dispersion_a[name]
+                )
+                dispersion_rows[name].extend(values.float().cpu().tolist())
             selected_a = torch.gather(state_a.ground_ids, 1, state_a.slots.pointer.argmax(dim=-1))
             selected_b = torch.gather(state_b.ground_ids, 1, state_b.slots.pointer.argmax(dim=-1))
             for row, (node_u, node_v) in enumerate(batch_pairs):
@@ -622,19 +1073,20 @@ def produce_e2e_probe_artifact(
                 ids_a = selected_a[row]
                 ids_b = selected_b[row]
                 equal = ids_a[:, None] == ids_b[None, :]
-                grounded = (state_a.slots.gate[row, :, None] > 0.5) & (
-                    state_b.slots.gate[row, None, :] > 0.5
-                )
                 real_common = torch.zeros_like(equal)
                 for slot_a in range(equal.size(0)):
                     identity = int(ids_a[slot_a].item())
-                    if identity in common_rows and inverse_index.get(identity) in common:
+                    if identity in common_rows:
                         real_common[slot_a] = equal[slot_a]
-                mask = equal & grounded & real_common
-                plan = context.plan[row]
-                consistency.append(
-                    float((plan * mask).sum().float() / plan.sum().float().clamp_min(1e-30))
+                v1 = pi_grounding_chain_consistency_v1(
+                    context.plan[row : row + 1],
+                    (equal & real_common)[None],
+                    gate_a=state_a.slots.gate[row : row + 1],
+                    gate_b=state_b.slots.gate[row : row + 1],
                 )
+                consistency_v1.append(float(v1[0]))
+                consistency_v2.append(float(batch_v2[row]))
+                shared_neighbor_counts.append(float(len(common)))
     targets = probe_targets(graph, nodes)
     write_e2e_probe_artifact(
         output_path,
@@ -646,12 +1098,27 @@ def produce_e2e_probe_artifact(
             "partition_seed": 0,
             "strategy": strategy,
             "g_struct_sha256": g_struct_sha256(graph),
+            "scope": scope,
+            "n_ground": n_ground,
         },
         node_ids=nodes,
         states=np.concatenate(state_rows, axis=0),
         targets={name: targets[name] for name in ("degree", "ego_density", "clustering")},
         pair_ids=pairs,
-        pi_consistency=np.asarray(consistency, dtype=np.float64),
+        pair_states=np.concatenate(pair_state_rows, axis=0),
+        pi_consistency_v1=np.asarray(consistency_v1, dtype=np.float64),
+        pi_consistency_v2=np.asarray(consistency_v2, dtype=np.float64),
+        slot_recall=slot_recall_at_n_ground(
+            graph,
+            nodes,
+            grounding_pool,
+            selected_slots,
+        ),
+        shared_neighbor_count=np.asarray(shared_neighbor_counts, dtype=np.float64),
+        dispersion={
+            name: np.asarray(values, dtype=np.float64)
+            for name, values in dispersion_rows.items()
+        },
     )
 
 
@@ -666,6 +1133,7 @@ def build_parser() -> argparse.ArgumentParser:
     produce.add_argument("--data-root", type=Path, required=True)
     produce.add_argument("--strategy", required=True)
     produce.add_argument("--output", type=Path, required=True)
+    produce.add_argument("--scope", choices=E2E_PROBE_SCOPES, required=True)
     return parser
 
 
@@ -680,16 +1148,21 @@ def main(argv: Sequence[str] | None = None) -> None:
             data_root=args.data_root,
             strategy=args.strategy,
             output_path=args.output,
+            scope=args.scope,
         )
 
 
 __all__ = [
+    "E2E_PROBE_SCOPES",
     "degree_partialled_r2",
     "evaluate_e2e_probe_artifact",
     "g_struct_sha256",
     "linear_probe_r2",
+    "pi_alignment_consistency_v2",
+    "pi_grounding_chain_consistency_v1",
     "probe_targets",
     "select_probe_pairs",
+    "slot_recall_at_n_ground",
     "write_e2e_probe_artifact",
 ]
 

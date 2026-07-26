@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
+import pickle
 from pathlib import Path
 from typing import cast
 
 import networkx as nx
 import numpy as np
 import pytest
+import torch
 from src.experiments import probes
 
 pytestmark = pytest.mark.unit
@@ -159,6 +162,145 @@ class TestProbeTargets:
             probes.probe_targets(self._graph(), ["a", "zzz"])
 
 
+class TestPiConsistency:
+    def test_v2_measures_mass_on_same_identity_teacher_cells(self) -> None:
+        same_identity = torch.zeros(1, 3, 3, dtype=torch.bool)
+        same_identity[0, 0, 1] = True
+        same_identity[0, 2, 2] = True
+        concentrated = torch.zeros(1, 3, 3)
+        concentrated[0, 0, 1] = 0.4
+        concentrated[0, 2, 2] = 0.6
+        uniform = torch.full((1, 3, 3), 1.0 / 9.0)
+
+        torch.testing.assert_close(
+            probes.pi_alignment_consistency_v2(concentrated, same_identity),
+            torch.ones(1),
+        )
+        torch.testing.assert_close(
+            probes.pi_alignment_consistency_v2(uniform, same_identity),
+            torch.tensor([2.0 / 9.0]),
+        )
+
+    def test_v2_stays_nonzero_when_shut_gates_force_v1_to_zero(self) -> None:
+        plan = torch.full((1, 2, 2), 0.25)
+        same_identity = torch.tensor([[[True, False], [False, False]]])
+        shut_gates = torch.zeros(1, 2)
+
+        v1 = probes.pi_grounding_chain_consistency_v1(
+            plan,
+            same_identity,
+            gate_a=shut_gates,
+            gate_b=shut_gates,
+        )
+        v2 = probes.pi_alignment_consistency_v2(plan, same_identity)
+
+        torch.testing.assert_close(v1, torch.zeros(1))
+        torch.testing.assert_close(v2, torch.tensor([0.25]))
+
+
+def test_slot_recall_at_n_ground_matches_hand_built_pool() -> None:
+    graph = nx.Graph([("a", "b"), ("a", "c"), ("b", "c"), ("c", "d")])
+    pool = {
+        "a": ["b", "x"],  # 1 / 2
+        "b": ["a", "c"],  # 2 / 2
+        "c": ["a", "x"],  # 1 / 3
+        "d": ["x", "y"],  # 0 / 1
+    }
+    selected = {
+        "a": ["b"],
+        "b": ["a", "c"],
+        "c": ["a"],
+        "d": [],
+    }
+    rows = probes.slot_recall_at_n_ground(
+        graph,
+        ["a", "b", "c", "d"],
+        pool,
+        selected,
+    )
+    np.testing.assert_allclose(rows, [0.5, 1.0, 1.0 / 3.0, 0.0])
+    assert float(np.mean(rows)) == pytest.approx(11.0 / 24.0)
+
+
+def test_probe_scope_is_required_and_v_select_is_not_exposed() -> None:
+    signature = inspect.signature(probes.produce_e2e_probe_artifact)
+    assert signature.parameters["scope"].default is inspect.Parameter.empty
+    assert "v_select" not in probes.E2E_PROBE_SCOPES
+
+
+def test_prebinding_scope_feature_reads_exclude_sealed_nodes() -> None:
+    formal_nodes = ["fit-a", "fit-b", "qual-a", "select-a"]
+    fit_nodes = frozenset({"fit-a", "fit-b"})
+    qual_nodes = frozenset({"qual-a"})
+    assert probes._probe_feature_nodes(
+        "calibration_fit",
+        formal_nodes,
+        v_fit=fit_nodes,
+        v_qual=qual_nodes,
+    ) == ["fit-a", "fit-b"]
+    assert probes._probe_feature_nodes(
+        "qualification_qual",
+        formal_nodes,
+        v_fit=fit_nodes,
+        v_qual=qual_nodes,
+    ) == ["qual-a"]
+    assert probes._probe_feature_nodes(
+        "formal_train",
+        formal_nodes,
+        v_fit=fit_nodes,
+        v_qual=qual_nodes,
+    ) == formal_nodes
+
+
+def test_probe_scope_graph_uses_exact_fit_and_qualification_edges() -> None:
+    formal_edges = frozenset(
+        {
+            ("fit-a", "fit-b"),
+            ("qual-a", "qual-b"),
+            ("select-a", "select-b"),
+            ("fit-a", "qual-a"),
+        }
+    )
+    fit_graph = probes._build_probe_scope_graph(
+        "calibration_fit",
+        ["fit-a", "fit-b"],
+        formal_e_msg=formal_edges,
+        fit_e_msg=frozenset({("fit-a", "fit-b")}),
+        qual_e_msg=frozenset({("qual-a", "qual-b")}),
+    )
+    qual_graph = probes._build_probe_scope_graph(
+        "qualification_qual",
+        ["qual-a", "qual-b"],
+        formal_e_msg=formal_edges,
+        fit_e_msg=frozenset({("fit-a", "fit-b")}),
+        qual_e_msg=frozenset({("qual-a", "qual-b")}),
+    )
+    assert set(fit_graph.nodes) == {"fit-a", "fit-b"}
+    assert set(fit_graph.edges) == {("fit-a", "fit-b")}
+    assert set(qual_graph.nodes) == {"qual-a", "qual-b"}
+    assert set(qual_graph.edges) == {("qual-a", "qual-b")}
+
+
+def test_train_side_probe_loader_never_requires_test_artifacts(tmp_path: Path) -> None:
+    strategy_dir = tmp_path / "breadth_first"
+    strategy_dir.mkdir()
+    with (strategy_dir / "split.pkl").open("wb") as handle:
+        pickle.dump({"train": ["a", "b", "c"], "test": ["sealed-test"]}, handle)
+    (strategy_dir / "train_edges.txt").write_text(
+        "a\tb\t1\nb\tc\t0\na\tc\t1\n",
+        encoding="utf-8",
+    )
+
+    nodes, positives = probes._load_train_side_probe_inputs(
+        strategy_dir,
+        expected_missing_features=(),
+    )
+    assert nodes == ["a", "b", "c"]
+    assert positives == [("a", "b"), ("a", "c")]
+    assert not (strategy_dir / "test_graph.pkl").exists()
+    assert not (strategy_dir / "test_edges.txt").exists()
+
+
 class TestE2EProbeArtifact:
     @staticmethod
     def _write(tmp_path: Path) -> tuple[Path, nx.Graph, list[str], dict[str, object]]:
@@ -179,8 +321,11 @@ class TestE2EProbeArtifact:
             "partition_seed": 0,
             "strategy": "toy",
             "g_struct_sha256": probes.g_struct_sha256(graph),
+            "scope": "formal_train",
+            "n_ground": 2,
         }
         path = tmp_path / "probe.npz"
+        n_pairs = len(pairs)
         probes.write_e2e_probe_artifact(
             path,
             metadata=metadata,
@@ -188,7 +333,23 @@ class TestE2EProbeArtifact:
             states=states,
             targets={name: targets[name] for name in ("degree", "ego_density", "clustering")},
             pair_ids=pairs,
-            pi_consistency=np.linspace(0.0, 1.0, len(pairs), dtype=np.float64),
+            pair_states=rng.normal(size=(n_pairs, 4)).astype(np.float32),
+            pi_consistency_v1=np.linspace(0.0, 1.0, n_pairs, dtype=np.float64),
+            pi_consistency_v2=np.linspace(1.0, 0.0, n_pairs, dtype=np.float64),
+            slot_recall=np.linspace(0.0, 1.0, len(nodes), dtype=np.float64),
+            shared_neighbor_count=np.asarray(
+                [
+                    len(set(graph.neighbors(node_u)) & set(graph.neighbors(node_v)))
+                    for node_u, node_v in pairs
+                ],
+                dtype=np.float64,
+            ),
+            dispersion={
+                "pi_slot_std": np.full(n_pairs, 0.1),
+                "h_pairwise_cosine_mean": np.full(n_pairs, 0.2),
+                "adj_offdiag_std": np.full(n_pairs, 0.3),
+                "plan_row_entropy": np.full(n_pairs, 0.4),
+            },
         )
         return path, graph, nodes, metadata
 
@@ -209,6 +370,18 @@ class TestE2EProbeArtifact:
         pi = cast(dict[str, float | int], report["pi_shared_neighbor_consistency"])
         assert pi["n_pairs"] == len(probes.select_probe_pairs(graph))
         assert 0.0 <= pi["nonzero_fraction"] <= 1.0
+        pi_v2 = cast(dict[str, float | int], report["pi_consistency_v2"])
+        assert pi_v2["n_pairs"] == len(probes.select_probe_pairs(graph))
+        assert isinstance(report["shared_neighbor_count_r2"], float)
+        slot_recall = cast(dict[str, float | int], report["slot_recall_at_n_ground"])
+        assert slot_recall["n_ground"] == 2
+        assert slot_recall["n_nodes"] == len(nodes)
+        assert set(cast(dict[str, object], report["dispersion"])) == {
+            "pi_slot_std",
+            "h_pairwise_cosine_mean",
+            "adj_offdiag_std",
+            "plan_row_entropy",
+        }
 
     def test_consumer_rejects_provenance_or_target_drift(self, tmp_path: Path) -> None:
         path, graph, nodes, metadata = self._write(tmp_path)
@@ -229,6 +402,28 @@ class TestE2EProbeArtifact:
                 path, graph=graph, train_nodes=nodes, expected_metadata=metadata
             )
 
+    def test_consumer_rejects_v1_artifact_with_clear_version_error(
+        self, tmp_path: Path
+    ) -> None:
+        path, graph, nodes, metadata = self._write(tmp_path)
+        with np.load(path, allow_pickle=False) as archive:
+            arrays = {key: archive[key] for key in archive.files}
+        payload = json.loads(str(arrays["meta"].item()))
+        payload["format"] = "egostitch_e2e_probe_v1"
+        arrays["meta"] = np.array(json.dumps(payload, sort_keys=True))
+        np.savez_compressed(path, **arrays)
+
+        with pytest.raises(
+            ValueError,
+            match="egostitch_e2e_probe_v1.*not supported.*egostitch_e2e_probe_v2",
+        ):
+            probes.evaluate_e2e_probe_artifact(
+                path,
+                graph=graph,
+                train_nodes=nodes,
+                expected_metadata=metadata,
+            )
+
     def test_pair_selection_is_hash_deterministic(self) -> None:
         graph = nx.Graph()
         graph.add_edges_from([("b", "a"), ("c", "a"), ("d", "a")])
@@ -243,7 +438,7 @@ class TestE2EProbeArtifact:
                 {
                     "status": "DRAFT",
                     "probe_artifact": {
-                        "format": "egostitch_e2e_probe_v1",
+                        "format": "egostitch_e2e_probe_v2",
                         "source_arm": "full",
                         "expected_path": str(tmp_path / "probe.npz"),
                     },
@@ -263,6 +458,60 @@ class TestE2EProbeArtifact:
                 data_root=tmp_path / "data",
                 strategy="breadth_first",
                 output_path=tmp_path / "probe.npz",
+                scope="formal_train",
+            )
+
+    @pytest.mark.parametrize("scope", ["calibration_fit", "qualification_qual"])
+    def test_prebinding_scope_accepts_draft_and_separate_output(
+        self,
+        tmp_path: Path,
+        scope: probes.E2EProbeScope,
+    ) -> None:
+        formal_output = tmp_path / "formal-probe.npz"
+        prebinding_output = tmp_path / f"{scope}-probe.npz"
+        full_config = tmp_path / "missing-full.yaml"
+        registration = tmp_path / "registration.json"
+        registration.write_text(
+            json.dumps(
+                {
+                    "status": "DRAFT",
+                    "probe_artifact": {
+                        "format": "egostitch_e2e_probe_v2",
+                        "source_arm": "full",
+                        "expected_path": str(formal_output),
+                    },
+                    "arms": {"full": {"training": str(full_config)}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        registration_sha = hashlib.sha256(registration.read_bytes()).hexdigest()
+        metadata = tmp_path / "run_metadata.json"
+        metadata.write_text(
+            json.dumps(
+                {
+                    "preregistration_sha256": registration_sha,
+                    "run_kind": "rehearsal",
+                    "status": "complete",
+                    "formal_artifacts_published": False,
+                    "permanent_null": "none",
+                    "seed": 0,
+                    "partition_seed": 0,
+                    "config_path": str(full_config),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(FileNotFoundError):
+            probes.produce_e2e_probe_artifact(
+                checkpoint_path=tmp_path / "best.pt",
+                run_metadata_path=metadata,
+                preregistration_path=registration,
+                data_root=tmp_path / "data",
+                strategy="breadth_first",
+                output_path=prebinding_output,
+                scope=scope,
             )
 
     def test_producer_rejects_nonformal_or_incomplete_source(self, tmp_path: Path) -> None:
@@ -273,7 +522,7 @@ class TestE2EProbeArtifact:
                 {
                     "status": "BINDING",
                     "probe_artifact": {
-                        "format": "egostitch_e2e_probe_v1",
+                        "format": "egostitch_e2e_probe_v2",
                         "source_arm": "full",
                         "expected_path": str(output),
                     },
@@ -305,6 +554,7 @@ class TestE2EProbeArtifact:
                 data_root=tmp_path / "data",
                 strategy="breadth_first",
                 output_path=output,
+                scope="formal_train",
             )
 
     def test_producer_rejects_completed_p0_source(self, tmp_path: Path) -> None:
@@ -316,7 +566,7 @@ class TestE2EProbeArtifact:
                 {
                     "status": "BINDING",
                     "probe_artifact": {
-                        "format": "egostitch_e2e_probe_v1",
+                        "format": "egostitch_e2e_probe_v2",
                         "source_arm": "full",
                         "expected_path": str(output),
                     },
@@ -351,4 +601,5 @@ class TestE2EProbeArtifact:
                 data_root=tmp_path / "data",
                 strategy="breadth_first",
                 output_path=output,
+                scope="formal_train",
             )
