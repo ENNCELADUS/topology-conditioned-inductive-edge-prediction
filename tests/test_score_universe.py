@@ -153,6 +153,30 @@ def test_load_bare_legacy_checkpoint_with_explicit_model_metadata(tmp_path: Path
         torch.testing.assert_close(loaded_model.state_dict()[name], expected)
 
 
+def test_load_pre_rev31_e2e_checkpoint_without_relational_head(tmp_path: Path) -> None:
+    legacy_config = dict(_TINY_E2E_CONFIG)
+    legacy_config["w_rel"] = 0.0
+    source_model = score_universe.build_model("egostitch_e2e", legacy_config)
+    checkpoint_config = dict(legacy_config)
+    checkpoint_config.pop("w_rel")
+    checkpoint_path = tmp_path / "pre-rev31-e2e.pt"
+    _write_checkpoint(
+        checkpoint_path,
+        model=source_model,
+        model_family="egostitch_e2e",
+        model_config=checkpoint_config,
+    )
+
+    loaded_model, model_family, checkpoint_id = score_universe._load_checkpoint(checkpoint_path)
+
+    assert model_family == "egostitch_e2e"
+    assert isinstance(loaded_model, EgoStitchE2E)
+    assert loaded_model.rel_head is None
+    assert checkpoint_id == score_universe._checkpoint_id(source_model.state_dict())
+    for name, expected in source_model.state_dict().items():
+        torch.testing.assert_close(loaded_model.state_dict()[name], expected)
+
+
 def test_cli_scores_bare_legacy_checkpoint_with_explicit_model_config(tmp_path: Path) -> None:
     model_config = _tiny_v3_1_config()
     source_model = score_universe.build_model("v3_1", model_config)

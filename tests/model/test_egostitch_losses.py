@@ -10,6 +10,7 @@ from src.model.egostitch.config import EgoStitchConfig
 from src.model.egostitch.imagine import DenoiseSlots, SlotSet
 from src.model.egostitch.losses import (
     RandomGIN,
+    alignment_loss,
     degree_nll,
     denoise_losses,
     energy_distance,
@@ -17,6 +18,7 @@ from src.model.egostitch.losses import (
     generated_ego_stats,
     real_ego_graph,
     recon_losses,
+    relational_loss,
     ssl_consistency,
     stage1_total,
     standardized_energy_distance,
@@ -448,6 +450,16 @@ class TestStage1Total:
             "L_rel": 0.25,
         }
         one = torch.tensor(1.0)
+        align = alignment_loss(
+            torch.full((1, 2, 2), 0.25),
+            torch.tensor([[[True, False], [False, False]]]),
+            positive_real_mask=torch.ones(1),
+        )
+        rel = relational_loss(
+            torch.zeros(1, 2),
+            torch.ones(1, 2),
+            torch.ones(1),
+        )
         recon = {
             "feat": one,
             "exist": one,
@@ -455,9 +467,9 @@ class TestStage1Total:
             "slotadj": one,
             "gate": one,
             "ptr": one,
-            "align": one,
+            "align": align,
             "div": one,
-            "rel": one,
+            "rel": rel,
         }
         total, parts = stage1_total(
             config,
@@ -469,13 +481,14 @@ class TestStage1Total:
             ssl_noise=one,
             ssl_pool=one,
         )
-        # Exact spec table: all ten components sum to 4.1 at unit inputs.
-        # L_real = 2/3 + 1/3 = 1.0 ; L_ssl = 1.0
-        # total = 1 + 0.5*1 + 0.1*1 + 1.0*4.1 = 5.7
-        assert float(total) == pytest.approx(5.7)
-        assert parts["recon"] == pytest.approx(4.1)
+        expected_recon = 3.35 + 0.5 * float(align) + 0.25 * float(rel)
+        expected_total = 1.0 + 0.5 + 0.1 + expected_recon
+        assert float(total) == pytest.approx(expected_total)
+        assert parts["recon"] == pytest.approx(expected_recon)
+        assert parts["recon_align"] == pytest.approx(float(align))
+        assert parts["recon_rel"] == pytest.approx(float(rel))
         assert parts["real"] == pytest.approx(1.0)
-        assert parts["total"] == pytest.approx(5.7)
+        assert parts["total"] == pytest.approx(expected_total)
 
     def test_parts_are_floats(self) -> None:
         zero = torch.tensor(0.0)

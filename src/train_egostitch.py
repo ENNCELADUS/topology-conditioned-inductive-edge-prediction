@@ -845,6 +845,7 @@ def build_e2e_parameter_groups(model: EgoStitchE2E) -> E2EParameterGroups:
     }
     conditioning_prefixes = (
         "ste.",
+        "rel_head.",
         "content_proj.",
         "trunk.topo_xattn.",
         "trunk.cont_xattn.",
@@ -2292,6 +2293,24 @@ def _edge_target_rng(node_id: str, *, seed: int, epoch: int) -> np.random.Genera
     return np.random.default_rng(node_key ^ seed_epoch_key)
 
 
+def relational_pair_targets(
+    graph: nx.Graph,
+    rows: Sequence[tuple[str, str, int]],
+) -> torch.Tensor:
+    """Compute `L_rel` targets from `G_fit` for every positive or negative pair."""
+    targets = torch.zeros(len(rows), 2, dtype=torch.float32)
+    for row, (node_u, node_v, _) in enumerate(rows):
+        if node_u not in graph or node_v not in graph:
+            raise ValueError("relational target pair contains a node outside G_fit")
+        neighbors_u = set(graph.neighbors(node_u))
+        neighbors_v = set(graph.neighbors(node_v))
+        common = len(neighbors_u & neighbors_v)
+        union = len(neighbors_u | neighbors_v)
+        targets[row, 0] = math.log1p(common)
+        targets[row, 1] = common / union if union > 0 else 0.0
+    return targets
+
+
 @dataclass
 class _CompositeBatch:
     """One composite optimizer-step batch (CPU tensors; moved by the caller).
@@ -2621,6 +2640,10 @@ class _BatchFactory:
             edge["ground_id_i"] = self._ground_pool_rows(endpoints_u)
             edge["ground_id_j"] = self._ground_pool_rows(endpoints_v)
             edge.update(self._edge_target_tensors(padded, true_rows=true_rows, epoch=epoch))
+            edge["rel_target"] = relational_pair_targets(
+                self._data.target_builder.graph,
+                padded,
+            )
         else:
             s0 = (
                 self._data.s0.lookup([(u, v) for u, v, _ in padded])
@@ -2877,7 +2900,37 @@ class _CompositeStep(torch.nn.Module):
                     edge["label"].shape[0],
                     edge["label"].device,
                 )
-            logits = self.model(_e2e_edge_view(edge), masks=branch_masks)["logits"]
+            edge_view = _e2e_edge_view(edge)
+            edge_view.update(
+                {
+                    "target_features_a": edge["target_features_i"],
+                    "target_features_b": edge["target_features_j"],
+                    "target_mult_a": edge["target_mult_i"],
+                    "target_mult_b": edge["target_mult_j"],
+                    "target_adj_a": edge["target_adj_i"],
+                    "target_adj_b": edge["target_adj_j"],
+                    "target_mask_a": edge["target_mask_i"],
+                    "target_mask_b": edge["target_mask_j"],
+                    "target_node_index_a": edge["target_node_index_i"],
+                    "target_node_index_b": edge["target_node_index_j"],
+                    "rel_target": edge["rel_target"],
+                    "edge_mask": edge["edge_mask"],
+                    "label": edge["label"],
+                    "loss_world_size": torch.tensor(
+                        self.world_size,
+                        device=edge["label"].device,
+                    ),
+                }
+            )
+            edge_output = self.model(edge_view, masks=branch_masks)
+            logits = edge_output["logits"]
+            losses = losses._replace(
+                recon={
+                    **losses.recon,
+                    "align": edge_output["align_loss"],
+                    "rel": edge_output["rel_loss"],
+                }
+            )
             if collect_diagnostics:
                 extra.update(_e2e_gate_tanh(self.model))
         else:

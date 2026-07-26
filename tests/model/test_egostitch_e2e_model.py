@@ -238,6 +238,26 @@ def test_f_logit_invariant_to_grounding() -> None:
     assert torch.allclose(dec_a["f_logit"], dec_b["f_logit"], atol=1e-6)
 
 
+def test_relational_head_is_absent_from_every_scored_logit() -> None:
+    model, batch = _tiny_model_and_batch()
+    before = {name: value.clone() for name, value in model.decompose(batch).items()}
+    assert model.rel_head is not None
+    model.rel_head = None
+    after = model.decompose(batch)
+    assert before.keys() == after.keys()
+    for name in before:
+        assert torch.equal(before[name], after[name]), name
+
+
+def test_w_rel_config_wires_formal_no_l_rel_arm() -> None:
+    model = EgoStitchE2E(E2EConfig(w_rel=0.0))
+    assert model.cfg.w_rel == 0.0
+    assert model.generator.config.w_rel == 0.0
+    assert model.rel_head is None
+    with pytest.raises(ValueError, match="w_rel"):
+        E2EConfig(w_rel=-0.01)
+
+
 # --------------------------------------------------------------------------- Task 15:
 # `probe_states` — read-only STE token-state export for representation probes
 

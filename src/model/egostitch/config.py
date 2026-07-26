@@ -15,6 +15,25 @@ from typing import Any, TypeVar, cast
 _ConfigT = TypeVar("_ConfigT")
 
 
+def e2e_checkpoint_config(
+    mapping: Mapping[str, object],
+    *,
+    has_rel_head: bool,
+) -> dict[str, object]:
+    """Normalize an E2E checkpoint config across the rev-3.1 head addition.
+
+    Checkpoints written before rev-3.1 have neither relational-head parameters
+    nor a ``w_rel`` key.  Reconstruct those checkpoints with the head disabled
+    so strict state loading preserves their historical architecture.  During
+    the migration, checkpoints built from a config that omitted the new key can
+    still contain the default head; the state keys disambiguate that case.
+    Explicit checkpoint values are always left unchanged.
+    """
+    normalized = dict(mapping)
+    normalized.setdefault("w_rel", E2EConfig.w_rel if has_rel_head else 0.0)
+    return normalized
+
+
 def _from_mapping(
     cls: type[_ConfigT],
     mapping: Mapping[str, object],
@@ -220,6 +239,8 @@ class E2EConfig:
         tau_div: Registered slot-diversity threshold (spec Sec 14.4.1).
         l_gate_pos_weight: Registered positive-class weight for ``L_gate``
             (spec Sec 14.4.1).
+        w_rel: Interior ``L_recon`` weight for the discarded-at-inference
+            relational head; ``0`` defines the formal ``no_l_rel`` arm.
     """
 
     d_model: int = 512
@@ -237,6 +258,7 @@ class E2EConfig:
     tau_adj: float = 0.5
     tau_div: float = 0.5
     l_gate_pos_weight: float = 6.17
+    w_rel: float = 0.25
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants.
@@ -275,6 +297,8 @@ class E2EConfig:
             raise ValueError(
                 f"l_gate_pos_weight must be positive, got {self.l_gate_pos_weight}"
             )
+        if self.w_rel < 0.0:
+            raise ValueError(f"w_rel must be non-negative, got {self.w_rel}")
         if self.permanent_null not in ("none", "all_head", "content_head"):
             raise ValueError(
                 "permanent_null must be one of 'none', 'all_head', or 'content_head', "

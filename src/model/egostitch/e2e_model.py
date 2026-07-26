@@ -34,6 +34,12 @@ from src.model.egostitch.conditioning import (
 )
 from src.model.egostitch.config import E2EConfig, EgoStitchConfig
 from src.model.egostitch.imagine import SlotSet
+from src.model.egostitch.losses import (
+    alignment_loss,
+    alignment_teacher_cells,
+    relational_loss,
+)
+from src.model.egostitch.matching import match_slots
 from src.model.egostitch.model import EgoStitchStage1
 from src.model.egostitch.scaffold import (
     ContentProjector,
@@ -98,6 +104,7 @@ class EgoStitchE2E(nn.Module):
             tau_adj=cfg.tau_adj,
             tau_div=cfg.tau_div,
             l_gate_pos_weight=cfg.l_gate_pos_weight,
+            w_rel=cfg.w_rel,
         )
         self.input_dim = self.generator_cfg.input_dim  # frozen feature dim (spec Sec 0 table)
         self.node_feature_dim = self.generator_cfg.input_dim
@@ -130,6 +137,14 @@ class EgoStitchE2E(nn.Module):
             activation="gelu",
             norm="layernorm",
         )
+        self.rel_head: nn.Sequential | None = None
+        if cfg.w_rel > 0.0:
+            rel_hidden = max(1, cfg.d_model // 2)
+            self.rel_head = nn.Sequential(
+                nn.Linear(cfg.d_model, rel_hidden),
+                nn.GELU(),
+                nn.Linear(rel_hidden, 2),
+            )
 
     @staticmethod
     def _select_slots(slots: SlotSet, rows: torch.Tensor) -> SlotSet:
@@ -316,6 +331,72 @@ class EgoStitchE2E(nn.Module):
             state_a, state_b, is_self, need_topo=need_topo, need_cont=need_cont
         )
 
+    def relational_predictions(self, context: E2EPairContext) -> torch.Tensor:
+        """Predict train-only relational targets from the AB STE state."""
+        if context.topo_ab is None:
+            raise ValueError("relational predictions require AB-direction STE tokens")
+        if self.rel_head is None:
+            raise RuntimeError("relational head is absent when w_rel == 0")
+        with torch.autocast(device_type=context.topo_ab.device.type, enabled=False):
+            pair_state = context.topo_ab.float().mean(dim=1)
+            prediction: torch.Tensor = self.rel_head(pair_state)
+            return prediction
+
+    def _training_relational_losses(
+        self,
+        batch: dict[str, torch.Tensor],
+        state_a: E2ENodeState,
+        state_b: E2ENodeState,
+        context: E2EPairContext,
+    ) -> dict[str, torch.Tensor]:
+        """Compute Task-7 train-only losses without entering any scored logit."""
+        if context.plan is None:
+            raise RuntimeError("Task-7 alignment requires a Sinkhorn plan")
+        target_proj_a = self.generator.project_features(batch["target_features_a"]).detach()
+        target_proj_b = self.generator.project_features(batch["target_features_b"]).detach()
+        assignment_a = match_slots(
+            state_a.slots,
+            target_proj=target_proj_a,
+            target_mult=batch["target_mult_a"],
+            target_adj=batch["target_adj_a"],
+            target_mask=batch["target_mask_a"],
+        )
+        assignment_b = match_slots(
+            state_b.slots,
+            target_proj=target_proj_b,
+            target_mult=batch["target_mult_b"],
+            target_adj=batch["target_adj_b"],
+            target_mask=batch["target_mask_b"],
+        )
+        teacher_cells = alignment_teacher_cells(
+            assignment_a,
+            assignment_b,
+            target_ids_a=batch["target_node_index_a"],
+            target_ids_b=batch["target_node_index_b"],
+            slots=self.generator.config.slots,
+        )
+        world_size = int(batch["loss_world_size"].item())
+        positive_real_mask = batch["edge_mask"] * (batch["label"] == 1).float()
+        rel = (
+            relational_loss(
+                self.relational_predictions(context),
+                batch["rel_target"],
+                batch["edge_mask"],
+                world_size=world_size,
+            )
+            if self.rel_head is not None
+            else context.plan.sum() * 0.0
+        )
+        return {
+            "align_loss": alignment_loss(
+                context.plan,
+                teacher_cells,
+                positive_real_mask=positive_real_mask,
+                world_size=world_size,
+            ),
+            "rel_loss": rel,
+        }
+
     @torch.no_grad()
     def probe_states(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Export STE token states for a fixed probe batch (read-only diagnostic).
@@ -401,10 +482,21 @@ class EgoStitchE2E(nn.Module):
         device = batch["emb_a"].device
         if masks is None:
             masks = masks_for_null(NULL_NONE, batch_size, device)
-        need_topo = bool(masks.topo.any())
+        has_relational_targets = "rel_target" in batch
+        need_topo = bool(masks.topo.any()) or has_relational_targets
         need_cont = bool(masks.cont.any())
-        context = self.build_pair_context(batch, need_topo=need_topo, need_cont=need_cont)
-        return {"logits": self.score_pair_context(context, masks=masks)}
+        state_a, state_b, is_self = self._pair_node_states(batch)
+        context = self.build_pair_context_from_states(
+            state_a,
+            state_b,
+            is_self,
+            need_topo=need_topo,
+            need_cont=need_cont,
+        )
+        output = {"logits": self.score_pair_context(context, masks=masks)}
+        if has_relational_targets:
+            output.update(self._training_relational_losses(batch, state_a, state_b, context))
+        return output
 
     def decompose(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Compute the four-logit decomposition via eval-time hard bypasses.

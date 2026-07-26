@@ -16,6 +16,8 @@ are stop-gradient (spec Sec 13.7).
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,6 +28,139 @@ from src.model.egostitch.layers import stable_log
 from src.model.egostitch.matching import Assignment
 
 _SIGMA_MIN = 1e-3
+
+
+def _masked_global_mean(
+    per_row: torch.Tensor,
+    real_row_mask: torch.Tensor,
+    *,
+    world_size: int = 1,
+    all_reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Return a padding-aware global mean with DDP-gradient scaling.
+
+    The all-reduced denominator excludes `_edge_tensors` filler rows. Multiplying
+    the local numerator by ``world_size`` compensates for DDP's subsequent
+    gradient average, matching the §13.19.1 reduction class.
+    """
+    if per_row.ndim != 1 or per_row.shape != real_row_mask.shape:
+        raise ValueError("per_row and real_row_mask must be identical rank-1 tensors")
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    with torch.autocast(device_type=per_row.device.type, enabled=False):
+        values = per_row.float()
+        mask = real_row_mask.float()
+        local_denominator = mask.sum().detach()
+        if all_reduce_sum is not None:
+            denominator = all_reduce_sum(local_denominator)
+        elif torch.distributed.is_available() and torch.distributed.is_initialized():
+            denominator = local_denominator.clone()
+            torch.distributed.all_reduce(denominator, op=torch.distributed.ReduceOp.SUM)
+        else:
+            denominator = local_denominator
+        if not bool(torch.isfinite(denominator)):
+            raise RuntimeError("global masked-mean denominator must be finite")
+        if float(denominator) <= 0.0:
+            return values.sum() * 0.0
+        return world_size * (values * mask).sum() / denominator
+
+
+def alignment_teacher_cells(
+    assignment_a: Assignment,
+    assignment_b: Assignment,
+    *,
+    target_ids_a: torch.Tensor,
+    target_ids_b: torch.Tensor,
+    slots: int,
+) -> torch.Tensor:
+    """Build teacher cells from endpoint Hungarian matches (spec §14.4.1).
+
+    A cell is true exactly when its two matched slots were generated from the
+    same real target-neighbor identity. Grounding pools are deliberately absent.
+    """
+    if target_ids_a.ndim != 2 or target_ids_b.ndim != 2:
+        raise ValueError("target id tensors must have shape (B, T)")
+    batch = target_ids_a.shape[0]
+    if target_ids_b.shape[0] != batch or len(assignment_a) != batch or len(assignment_b) != batch:
+        raise ValueError("assignments and target id tensors must share a batch dimension")
+    if slots <= 0:
+        raise ValueError("slots must be positive")
+    cells = torch.zeros(batch, slots, slots, dtype=torch.bool, device=target_ids_a.device)
+    for row in range(batch):
+        slot_a = torch.from_numpy(assignment_a.slot_idx[row]).to(target_ids_a.device)
+        slot_b = torch.from_numpy(assignment_b.slot_idx[row]).to(target_ids_a.device)
+        target_a = torch.from_numpy(assignment_a.target_idx[row]).to(target_ids_a.device)
+        target_b = torch.from_numpy(assignment_b.target_idx[row]).to(target_ids_a.device)
+        if slot_a.numel() == 0 or slot_b.numel() == 0:
+            continue
+        ids_a = target_ids_a[row, target_a]
+        ids_b = target_ids_b[row, target_b]
+        shared = (ids_a[:, None] == ids_b[None, :]) & (ids_a[:, None] >= 0)
+        cells[row][slot_a[:, None], slot_b[None, :]] = shared
+    return cells
+
+
+def alignment_loss(
+    plan: torch.Tensor,
+    teacher_cells: torch.Tensor,
+    *,
+    positive_real_mask: torch.Tensor,
+    world_size: int = 1,
+    all_reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Row/column-conditional `L_align` over teacher-bearing positive rows."""
+    if plan.ndim != 3 or plan.shape[-1] != plan.shape[-2]:
+        raise ValueError("plan must have shape (B, K, K)")
+    if teacher_cells.shape != plan.shape or teacher_cells.dtype != torch.bool:
+        raise ValueError("teacher_cells must be a boolean tensor matching plan")
+    if positive_real_mask.shape != plan.shape[:1]:
+        raise ValueError("positive_real_mask must have shape (B,)")
+    with torch.autocast(device_type=plan.device.type, enabled=False):
+        plan_fp32 = plan.float()
+        log_plan = stable_log(plan_fp32)
+        log_row_mass = stable_log(plan_fp32.sum(dim=2, keepdim=True))
+        log_col_mass = stable_log(plan_fp32.sum(dim=1, keepdim=True))
+        conditional = 0.5 * (
+            log_plan - log_row_mass + log_plan - log_col_mass
+        )
+        teacher_fp32 = teacher_cells.float()
+        teacher_count = teacher_fp32.sum(dim=(1, 2))
+        per_row = -(
+            (conditional * teacher_fp32).sum(dim=(1, 2))
+            / teacher_count.clamp_min(1.0)
+        )
+        effective_mask = (
+            positive_real_mask.float() * (teacher_count > 0).float()
+        )
+        return _masked_global_mean(
+            per_row,
+            effective_mask,
+            world_size=world_size,
+            all_reduce_sum=all_reduce_sum,
+        )
+
+
+def relational_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    real_row_mask: torch.Tensor,
+    *,
+    world_size: int = 1,
+    all_reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Huber `L_rel` for both relational targets on every real edge-stream row."""
+    if prediction.shape != target.shape or prediction.ndim != 2 or prediction.shape[1] != 2:
+        raise ValueError("prediction and target must both have shape (B, 2)")
+    with torch.autocast(device_type=prediction.device.type, enabled=False):
+        per_row = F.smooth_l1_loss(
+            prediction.float(), target.float(), reduction="none"
+        ).mean(dim=1)
+        return _masked_global_mean(
+            per_row,
+            real_row_mask,
+            world_size=world_size,
+            all_reduce_sum=all_reduce_sum,
+        )
 
 
 def _probability_bce(

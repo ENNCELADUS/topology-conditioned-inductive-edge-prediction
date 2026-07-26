@@ -436,7 +436,7 @@ def produce_e2e_probe_artifact(
     """Produce the registered full-checkpoint STE/Pi evidence artifact."""
     from src import train_egostitch as te
     from src.data.packed_features import PackedFeatureTable
-    from src.model.egostitch.config import E2EConfig
+    from src.model.egostitch.config import E2EConfig, e2e_checkpoint_config
     from src.model.egostitch.e2e_model import EgoStitchE2E
     from src.train_b0 import _state_digest
 
@@ -509,7 +509,11 @@ def produce_e2e_probe_artifact(
     checkpoint_id = _state_digest(state)[:16]
     if run_metadata.get("checkpoint_id") != checkpoint_id:
         raise ValueError("probe checkpoint does not match selected formal checkpoint_id")
-    model = EgoStitchE2E(E2EConfig.from_mapping(cast(dict[str, object], payload["model_config"])))
+    checkpoint_model_cfg = e2e_checkpoint_config(
+        cast(dict[str, object], payload["model_config"]),
+        has_rel_head=any(key.startswith("rel_head.") for key in state),
+    )
+    model = EgoStitchE2E(E2EConfig.from_mapping(checkpoint_model_cfg))
     model.load_state_dict(state)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device).eval()

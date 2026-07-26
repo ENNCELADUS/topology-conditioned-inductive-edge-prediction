@@ -1158,6 +1158,13 @@ def _load_checkpoint(
             )
         model_state = cast(dict[str, torch.Tensor], checkpoint)
 
+    if model_family == "egostitch_e2e":
+        from src.model.egostitch.config import e2e_checkpoint_config
+
+        model_config = e2e_checkpoint_config(
+            model_config,
+            has_rel_head=any(key.startswith("rel_head.") for key in model_state),
+        )
     model = build_model(model_family, model_config)
     model.load_state_dict(model_state)
     model.eval()

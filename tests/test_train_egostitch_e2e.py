@@ -235,6 +235,31 @@ class TestBatchFactoryE2E:
         assert (edge["target_node_index_i"][1:] == -1).all()
         assert (edge["target_node_index_j"][1:] == -1).all()
 
+    def test_nonedge_shared_neighbor_has_nonzero_relational_targets(
+        self, tmp_path: Path
+    ) -> None:
+        factory, _ = self._target_factory(tmp_path)
+        # Leaves 01 and 02 are a non-edge but share hub 00.
+        edge, _ = factory._edge_tensors(
+            [("target-node-01", "target-node-02", 0)],
+            pad_to=2,
+            epoch=1,
+            step=1,
+        )
+        expected = torch.tensor([math.log1p(1.0), 1.0])
+        torch.testing.assert_close(edge["rel_target"][0], expected)
+        assert torch.count_nonzero(edge["rel_target"][0]) == 2
+        assert torch.equal(edge["rel_target"][1], expected)
+        assert edge["edge_mask"].tolist() == [1.0, 0.0]
+        other_rank_factory, _ = self._target_factory(tmp_path, rank=1, world_size=2)
+        reversed_edge, _ = other_rank_factory._edge_tensors(
+            [("target-node-02", "target-node-01", 0)],
+            pad_to=1,
+            epoch=7,
+            step=99,
+        )
+        assert torch.equal(reversed_edge["rel_target"][0], edge["rel_target"][0])
+
     def test_edge_target_memory_manifest_counts_both_dense_endpoint_gathers(
         self, tmp_path: Path
     ) -> None:
@@ -788,6 +813,11 @@ class TestE2ECompositeStep:
         with self._bf16_autocast():
             out = composite(self._payload(batch, joint_weight=1.0, collect_diagnostics=True))
         assert bool(torch.isfinite(cast(torch.Tensor, out["loss"])))
+        parts = cast(dict[str, float], out["parts"])
+        assert "recon_align" in parts
+        assert "recon_rel" in parts
+        assert math.isfinite(parts["recon_align"])
+        assert math.isfinite(parts["recon_rel"])
 
         for key in ("gate_topo_tanh", "gate_cont_tanh"):
             assert key in out
