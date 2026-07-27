@@ -4587,6 +4587,23 @@ def _train_e2e_stability_loop(
                 )
             except RuntimeError:
                 slot_collapse_failure = 1
+            # `history` is written only when the run completes, and the
+            # registered `training_invalid(slot_collapse)` label carries no
+            # numbers -- so a collapse otherwise leaves no record of which
+            # condition fired. Degenerate slots (`h_pairwise_cosine_mean`) and a
+            # rank-1 transport plan (`plan_rank1_marginal_residual`) are
+            # different failures with different fixes, and the guard needs two
+            # consecutive validations to trip, so the trajectory matters as much
+            # as the final value.
+            logger.log(
+                logging.ERROR if slot_collapse_failure else logging.INFO,
+                "e2e slot telemetry epoch=%d h_pairwise_cosine_mean=%.6f "
+                "plan_rank1_marginal_residual=%.6f streak=%d",
+                epoch,
+                fidelity.get("h_pairwise_cosine_mean", float("nan")),
+                fidelity.get("plan_rank1_marginal_residual", float("nan")),
+                slot_collapse_guard.streak,
+            )
             full_joint_epochs = max(0, epoch - first_eligible_epoch + 1)
             record = E2ECheckpointRecord(
                 epoch=epoch,
@@ -5591,7 +5608,7 @@ def write_outputs(
 
 def _probe_family_peak(
     wrapped: torch.nn.Module,
-    payload: dict[str, object],
+    replay_payload: dict[str, object],
     model: EgoStitchE2E,
     groups: Mapping[str, Sequence[torch.nn.Parameter]],
     accelerator: Accelerator,
@@ -5614,7 +5631,11 @@ def _probe_family_peak(
     """
     phase = E2EPhaseState("C", 1.0, True, 1.0)
     family_payload: dict[str, object] = {
-        **payload,
+        # Production deep-clones `fixed_replay` for every probe rather than
+        # aliasing it (the replay batch has to stay immutable across 2,000
+        # steps), so the resident replay and this clone are two separate
+        # batches on the device. Aliasing here would under-measure by one.
+        **cast(dict[str, object], _detached_clone(replay_payload)),
         "edge_active": True,
         "real_ssl_scale": torch.tensor(1.0, device=accelerator.device),
         # Step 0 of a 1-step schedule sits before the edge ramp, so every
@@ -5716,7 +5737,7 @@ def _run_probe_mode(
     timed_start: float | None = None
     failure: str | None = None
     local_elapsed = 0.0
-    family_payload: dict[str, object] | None = None
+    replay_payload: dict[str, object] | None = None
     try:
         for step in range(probe_steps):
             if step == warmup:
@@ -5743,10 +5764,15 @@ def _run_probe_mode(
                 if cfg.training is not None:
                     payload["edge_active"] = True
                     payload["real_ssl_scale"] = torch.tensor(1.0, device=accelerator.device)
-                # Held past the loop for `_probe_family_peak`; the same object,
-                # so this costs nothing beyond keeping the last batch resident --
-                # which is exactly what the training loop holds at probe time.
-                family_payload = payload
+                if replay_payload is None:
+                    # Mirror production residency and batch identity.
+                    # `_train_e2e_stability_loop` clones the *first* payload into
+                    # `fixed_replay` and keeps it on the device for the whole
+                    # run, so every ordinary step holds two full batches, not
+                    # one. Capture it once: e2e edge tensors pad to each batch's
+                    # own maximum endpoint length, so the last probe batch is not
+                    # the batch production actually replays.
+                    replay_payload = cast(dict[str, object], _detached_clone(payload))
             loss: torch.Tensor | None = None
             local_failure: tuple[str, str] | None = None
             s1_abs_mean: float | None = None
@@ -5823,9 +5849,13 @@ def _run_probe_mode(
         .max()
         .item()
     )
-    if e2e_groups is not None and family_payload is not None and failure is None:
+    if e2e_groups is not None and replay_payload is not None and failure is None:
+        # The training loop drops the step's own payload before its family probe,
+        # so production holds the replay plus one clone of it -- not a third
+        # batch. Release the last timed batch to measure that same residency.
+        del payload
         _probe_family_peak(
-            wrapped, family_payload, cast(EgoStitchE2E, model), e2e_groups, accelerator
+            wrapped, replay_payload, cast(EgoStitchE2E, model), e2e_groups, accelerator
         )
     local_peak_gib = (
         torch.cuda.max_memory_allocated(accelerator.device) / (1024**3) if use_cuda else 0.0

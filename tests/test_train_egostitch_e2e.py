@@ -1124,6 +1124,80 @@ class TestE2ECompositeStep:
         assert require_live_gradients is False
         assert json.loads(profile_output.read_text())["valid"] is True
 
+    def test_budget_probe_replays_the_first_batch_and_clones_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The folded-in probe must reproduce production's replay residency.
+
+        `_train_e2e_stability_loop` clones the *first* payload into
+        `fixed_replay`, keeps it device-resident for the whole run, and
+        deep-clones it again for every probe -- so production holds two full
+        batches where an aliased last-batch payload would hold one. E2E edge
+        tensors also pad to each batch's own maximum endpoint length, so the
+        last probe batch is not the batch production replays. Getting either
+        wrong makes the guard admit a candidate whose real run still OOMs.
+        """
+        torch.manual_seed(0)
+        e2e_cfg, data, model = self._probe_mode_inputs(tmp_path, monkeypatch)
+        step_labels: list[torch.Tensor] = []
+        original_forward = te._CompositeStep.forward
+
+        def _spy_forward(
+            inner: te._CompositeStep, batch: dict[str, object]
+        ) -> dict[str, object]:
+            step_labels.append(cast(dict[str, torch.Tensor], batch["edge"])["label"])
+            return cast(dict[str, object], original_forward(inner, batch))
+
+        monkeypatch.setattr(te._CompositeStep, "forward", _spy_forward)
+        seen: list[dict[str, object]] = []
+        timed_forwards: list[int] = []
+        original_probe = te._e2e_family_probe
+
+        def _record(
+            wrapped: torch.nn.Module,
+            payload: dict[str, object],
+            groups: Mapping[str, Sequence[torch.nn.Parameter]],
+            phase: te.E2EPhaseState,
+            arm: te.E2EArmName,
+            accelerator: Accelerator,
+            *,
+            require_live_gradients: bool = True,
+        ) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
+            seen.append(payload)
+            # The probe's own forwards land in `step_labels` too; mark where the
+            # timed loop stopped so they are not compared against themselves.
+            timed_forwards.append(len(step_labels))
+            return original_probe(
+                wrapped,
+                payload,
+                groups,
+                phase,
+                arm,
+                accelerator,
+                require_live_gradients=require_live_gradients,
+            )
+
+        monkeypatch.setattr(te, "_e2e_family_probe", _record)
+
+        te._run_probe_mode(
+            model,
+            e2e_cfg,
+            data,
+            Accelerator(cpu=True),
+            node_batch=4,
+            profile_output=tmp_path / "probe.json",
+        )
+
+        assert len(seen) == 1
+        timed = step_labels[: timed_forwards[0]]
+        assert len(timed) >= 2, "need more than one timed step for this to bite"
+        probe_label = cast(dict[str, torch.Tensor], seen[0]["edge"])["label"]
+        # A clone, not an alias: production's replay and its per-probe clone are
+        # two separate batches on the device.
+        assert all(probe_label is not label for label in timed)
+        # And it is the *first* batch, the one production pins as `fixed_replay`.
+        assert torch.equal(probe_label, timed[0])
+
     def test_budget_probe_reports_a_family_probe_oom_as_a_candidate_failure(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
