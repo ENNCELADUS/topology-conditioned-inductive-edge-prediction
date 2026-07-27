@@ -4028,8 +4028,17 @@ def _e2e_family_probe(
     phase: E2EPhaseState,
     arm: E2EArmName,
     accelerator: Accelerator,
+    *,
+    require_live_gradients: bool = True,
 ) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
-    """Isolated synchronized family backwards on one immutable replay batch."""
+    """Isolated synchronized family backwards on one immutable replay batch.
+
+    `require_live_gradients` may only be cleared by a caller that measures
+    allocation rather than reading the norms -- see `_probe_family_peak`. It
+    relaxes the "every expected group received gradient" check and nothing else;
+    finiteness stays enforced. A zero norm is a real dead-path signal during
+    training, but at budget-probe time it is an artifact of step-0 init.
+    """
     inner = cast(_CompositeStep, accelerator.unwrap_model(wrapped)).model
     assert isinstance(inner, EgoStitchE2E)
     families = ["recon"]
@@ -4058,7 +4067,19 @@ def _e2e_family_probe(
             wrapped.zero_grad(set_to_none=True)
             probe_out = cast(dict[str, object], wrapped(probe_payload))
             family_loss = cast(dict[str, torch.Tensor], probe_out["families"])[family]
+            # Release the forward's other outputs before the backward. The
+            # `families` dict holds one loss tensor per family, and each pins the
+            # autograd graph reachable from it: keeping the dict alive keeps the
+            # three *unselected* families' subgraphs (for an "edge" backward,
+            # that is the whole generator node stream) resident for the rest of
+            # the loop, and keeps this entire forward resident across the *next*
+            # family's forward. That double-buffering is the probe's real memory
+            # cost, and it is pure waste -- nothing here reads the other
+            # families, and each family already gets its own fresh forward, so no
+            # gradient value depends on when these references are dropped.
+            del probe_out
             accelerator.backward(family_loss)
+            del family_loss
             gathered = _e2e_group_squared_norms(groups, accelerator)
             e2e_assert_replicated_squared_norms(gathered)
             if family == "edge":
@@ -4067,7 +4088,7 @@ def _e2e_family_probe(
                 if family not in family_names:
                     continue
                 norm = float(torch.sqrt(gathered[group].double().mean()).item())
-                if not math.isfinite(norm) or norm <= 0.0:
+                if not math.isfinite(norm) or (require_live_gradients and norm <= 0.0):
                     raise RuntimeError(
                         f"invalid E2E fixed-replay norm for family {family!r}, group {group!r}"
                     )
@@ -4420,6 +4441,15 @@ def _train_e2e_stability_loop(
                     raise RuntimeError("non-finite E2E parameter or optimizer state after step")
                 epoch_parts = cast(dict[str, float], out["parts"])
                 global_step += 1
+
+                # `parts` are plain floats (`stage1_total`), so nothing below
+                # reads this step's forward output, its loss, or its device
+                # payload. Dropping them here matters because the family probe
+                # runs up to four more full forward/backward passes before the
+                # next step rebinds these names -- holding a spare training batch
+                # and the step's output handles across those passes is memory the
+                # probe cannot use.
+                del out, loss, gathered_squared, payload
 
                 if not profile_only and global_step % cfg.diagnostics.gradient_probe_interval == 0:
                     assert fixed_replay is not None
@@ -5559,6 +5589,63 @@ def write_outputs(
 # --------------------------------------------------------------------------- DDP worker modes
 
 
+def _probe_family_peak(
+    wrapped: torch.nn.Module,
+    payload: dict[str, object],
+    model: EgoStitchE2E,
+    groups: Mapping[str, Sequence[torch.nn.Parameter]],
+    accelerator: Accelerator,
+) -> None:
+    """Fold the diagnostic family probe into the measured candidate peak.
+
+    `_train_e2e_stability_loop` runs `_e2e_family_probe` every
+    `diagnostics.gradient_probe_interval` optimizer steps, and that probe -- up
+    to four *additional* full forward/backward passes over one batch -- is where
+    training actually peaks. The timed loop in `_run_probe_mode` only ever
+    executes plain steps, so a candidate admitted on its peak is admitted on a
+    number training never reaches: that is how a 67.1 GiB prediction passed an
+    85.0 GiB `memory_limit_gib` and then allocated 92.7 GiB mid-run. Running one
+    family probe here -- after the timing window has closed, so throughput is
+    unaffected -- is what makes `memory_limit_gib` bind on the real peak.
+
+    Phase C is deliberate: it is the only phase that activates all four families
+    at once (edge + recon + real + ssl), so it measures the worst case the
+    curriculum reaches rather than an average one.
+    """
+    phase = E2EPhaseState("C", 1.0, True, 1.0)
+    family_payload: dict[str, object] = {
+        **payload,
+        "edge_active": True,
+        "real_ssl_scale": torch.tensor(1.0, device=accelerator.device),
+        # Step 0 of a 1-step schedule sits before the edge ramp, so every
+        # component keeps factor 1.0 -- the most active, highest-memory setting.
+        "recon_factors": e2e_recon_component_factors(0, 1),
+    }
+    try:
+        _e2e_family_probe(
+            wrapped,
+            family_payload,
+            groups,
+            phase,
+            _e2e_arm_name(model),
+            accelerator,
+            # This model is freshly initialized, and every
+            # `GatedCrossAttention.gate` starts at exactly zero
+            # (`conditioning.py`), so `tanh(gate) == 0` severs the
+            # edge -> generator path by construction and that group's edge norm
+            # is legitimately 0.0. The training-time probe never sees that
+            # state -- it first fires at `gradient_probe_interval`, long after
+            # the gate has moved -- so the liveness check would fail a candidate
+            # for a property of step 0. Allocation is identical either way, and
+            # allocation is the only thing this call measures.
+            require_live_gradients=False,
+        )
+    except RuntimeError as error:
+        if _is_oom_error(error):
+            _emit_probe_candidate_failure("oom", str(error))
+        raise
+
+
 def _run_probe_mode(
     model: EgoStitchStage1 | EgoStitchE2E,
     cfg: EgoConfig,
@@ -5578,7 +5665,12 @@ def _run_probe_mode(
     model_cfg = model.generator_cfg if isinstance(model, EgoStitchE2E) else model.config
     world = accelerator.num_processes
     composite = _CompositeStep(model, world)
+    e2e_groups: dict[str, tuple[torch.nn.Parameter, ...]] | None = None
     if isinstance(model, EgoStitchE2E):
+        # Must precede `accelerator.prepare`: this call is what freezes the dead
+        # `DecisionHead` parameters, and DDP builds its reducer from the
+        # `requires_grad` set it sees at wrap time.
+        e2e_groups = build_e2e_parameter_groups(model).groups
         optimizer_parameters: list[torch.nn.Parameter] = _e2e_optimizer_parameters(model, composite)
     else:
         optimizer_parameters = list(composite.parameters())
@@ -5624,6 +5716,7 @@ def _run_probe_mode(
     timed_start: float | None = None
     failure: str | None = None
     local_elapsed = 0.0
+    family_payload: dict[str, object] | None = None
     try:
         for step in range(probe_steps):
             if step == warmup:
@@ -5650,6 +5743,10 @@ def _run_probe_mode(
                 if cfg.training is not None:
                     payload["edge_active"] = True
                     payload["real_ssl_scale"] = torch.tensor(1.0, device=accelerator.device)
+                # Held past the loop for `_probe_family_peak`; the same object,
+                # so this costs nothing beyond keeping the last batch resident --
+                # which is exactly what the training loop holds at probe time.
+                family_payload = payload
             loss: torch.Tensor | None = None
             local_failure: tuple[str, str] | None = None
             s1_abs_mean: float | None = None
@@ -5726,6 +5823,10 @@ def _run_probe_mode(
         .max()
         .item()
     )
+    if e2e_groups is not None and family_payload is not None and failure is None:
+        _probe_family_peak(
+            wrapped, family_payload, cast(EgoStitchE2E, model), e2e_groups, accelerator
+        )
     local_peak_gib = (
         torch.cuda.max_memory_allocated(accelerator.device) / (1024**3) if use_cuda else 0.0
     )

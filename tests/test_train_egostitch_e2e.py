@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import math
-from collections.abc import Callable
+import weakref
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -499,6 +501,20 @@ class TestE2ECompositeStep:
             "collect_diagnostics": collect_diagnostics,
         }
 
+    @staticmethod
+    def _float_the_packed_store(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Float the bf16-only packed store for CPU runs without autocast."""
+        original_from_pack = PackedFeatureTable.from_pack.__func__
+
+        def _float_cpu_pack(
+            cls: type[PackedFeatureTable], root: Path, device: torch.device
+        ) -> PackedFeatureTable:
+            table = original_from_pack(cls, root, device)
+            table.tokens = table.tokens.float()
+            return table
+
+        monkeypatch.setattr(PackedFeatureTable, "from_pack", classmethod(_float_cpu_pack))
+
     def _gates(self, model: EgoStitchE2E) -> tuple[GatedCrossAttention, GatedCrossAttention]:
         topo_gate = model.trunk.topo_xattn[0]
         cont_gate = model.trunk.cont_xattn[0]
@@ -934,6 +950,204 @@ class TestE2ECompositeStep:
         assert ema_after.keys() == ema_before.keys()
         assert all(torch.equal(ema_after[name], value) for name, value in ema_before.items())
 
+    def test_family_probe_releases_each_forward_before_the_next(self, tmp_path: Path) -> None:
+        """The probe's four passes must not double-buffer their autograd graphs.
+
+        Every family gets its own full forward, and the returned ``families``
+        dict pins the graph reachable from *each* family in it -- so holding one
+        pass's dict across the next pass keeps two full forwards resident, plus
+        the three subgraphs that pass never reads. That double-buffering, not the
+        plain training step, is what made this probe the run's memory peak.
+        """
+        torch.manual_seed(0)
+        batch, model = self._batch_and_model(tmp_path)
+        composite = te._CompositeStep(model, world_size=1)
+        groups = te.build_e2e_parameter_groups(model).groups
+        payload = self._payload(batch, joint_weight=1.0, collect_diagnostics=False)
+        accelerator = Accelerator(cpu=True)
+        # A step-0 model has every `gate` at zero, which severs the
+        # edge -> generator path and trips the probe's own liveness check before
+        # it reaches a second family. Open the gates so all four families run,
+        # which is the state the training-time probe actually observes.
+        with torch.no_grad():
+            for module in model.modules():
+                if isinstance(module, GatedCrossAttention):
+                    module.gate.fill_(0.7)
+
+        class _ReleaseSpy(torch.nn.Module):
+            def __init__(self, inner: te._CompositeStep) -> None:
+                super().__init__()
+                self.inner = inner
+                self.model = inner.model
+                self.previous: dict[str, weakref.ReferenceType[torch.Tensor]] = {}
+                self.survivors: list[str] = []
+                self.forwards = 0
+
+            def forward(self, values: dict[str, object]) -> dict[str, object]:
+                gc.collect()
+                self.survivors.extend(
+                    name for name, ref in self.previous.items() if ref() is not None
+                )
+                out = cast(dict[str, object], self.inner(values))
+                families = cast(dict[str, torch.Tensor], out.get("families", {}))
+                self.previous = {
+                    name: weakref.ref(tensor) for name, tensor in families.items()
+                }
+                self.forwards += 1
+                return out
+
+        spy = _ReleaseSpy(composite)
+        with self._bf16_autocast():
+            te._e2e_family_probe(
+                spy,
+                payload,
+                groups,
+                te.e2e_phase_state(50, 100),
+                "full",
+                accelerator,
+            )
+
+        # Phase C activates edge + recon + real + ssl, so there is more than one
+        # forward for the previous one to have been held across.
+        assert spy.forwards == 4
+        assert spy.survivors == []
+
+    def test_family_probe_still_fails_a_dead_group_by_default(self, tmp_path: Path) -> None:
+        """The budget probe's relaxation must stay opt-in.
+
+        A step-0 model has every `gate` at zero, so `tanh(gate) == 0` severs the
+        edge -> generator path -- exactly the dead-path shape the training-time
+        probe has to abort on. `require_live_gradients` defaults to True so that
+        only `_probe_family_peak`, which reads no norms, ever sees it relaxed.
+        """
+        torch.manual_seed(0)
+        batch, model = self._batch_and_model(tmp_path)
+        composite = te._CompositeStep(model, world_size=1)
+        groups = te.build_e2e_parameter_groups(model).groups
+        payload = self._payload(batch, joint_weight=1.0, collect_diagnostics=False)
+        accelerator = Accelerator(cpu=True)
+
+        with (
+            self._bf16_autocast(),
+            pytest.raises(RuntimeError, match="invalid E2E fixed-replay norm"),
+        ):
+            te._e2e_family_probe(
+                composite,
+                payload,
+                groups,
+                te.e2e_phase_state(50, 100),
+                "full",
+                accelerator,
+            )
+
+    def _probe_mode_inputs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[te.EgoConfig, te.EgoStitchData, EgoStitchE2E]:
+        # `_run_probe_mode` drives the model without Accelerate's bf16
+        # autocast on CPU, so the bf16-only packed store must be floated first.
+        self._float_the_packed_store(monkeypatch)
+        cfg = _toy_cfg(tmp_path)
+        registered = te.load_config(
+            Path(__file__).resolve().parents[1] / "configs/egostitch_e2e_breadth_first.yaml"
+        )
+        assert registered.training is not None
+        assert registered.runtime is not None
+        pack_dir = tmp_path / "token_pack"
+        _write_tiny_token_pack(pack_dir, _NODES, min_length=3)
+        e2e_cfg = replace(
+            cfg,
+            model=ModelConfig(family="egostitch_e2e", config=dict(_E2E_TINY_MODEL)),
+            data=replace(cfg.data, pack_dir=pack_dir),
+            runtime=replace(registered.runtime, probe_warmup_steps=1, probe_timed_steps=1),
+            training=registered.training,
+        )
+        data = _toy_bundle(tmp_path, EgoStitchConfig())
+        model = EgoStitchE2E(E2EConfig.from_mapping(dict(_E2E_TINY_MODEL)))
+        return e2e_cfg, data, model
+
+    def test_budget_probe_measures_the_family_probe_peak(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`memory_limit_gib` must be compared against a peak that includes the probe.
+
+        `_run_probe_mode`'s timed loop only executes plain optimizer steps, but
+        training additionally runs `_e2e_family_probe` every
+        `gradient_probe_interval` steps -- up to four more full forward/backward
+        passes. A candidate admitted on the plain-step peak is admitted on a
+        number the run never reaches, which is how a 67.1 GiB prediction cleared
+        an 85.0 GiB limit and then allocated 92.7 GiB.
+        """
+        torch.manual_seed(0)
+        e2e_cfg, data, model = self._probe_mode_inputs(tmp_path, monkeypatch)
+        seen: list[tuple[te.E2EPhaseState, dict[str, object], bool]] = []
+        original = te._e2e_family_probe
+
+        def _record(
+            wrapped: torch.nn.Module,
+            payload: dict[str, object],
+            groups: Mapping[str, Sequence[torch.nn.Parameter]],
+            phase: te.E2EPhaseState,
+            arm: te.E2EArmName,
+            accelerator: Accelerator,
+            *,
+            require_live_gradients: bool = True,
+        ) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
+            seen.append((phase, payload, require_live_gradients))
+            return original(
+                wrapped,
+                payload,
+                groups,
+                phase,
+                arm,
+                accelerator,
+                require_live_gradients=require_live_gradients,
+            )
+
+        monkeypatch.setattr(te, "_e2e_family_probe", _record)
+        profile_output = tmp_path / "probe.json"
+
+        te._run_probe_mode(
+            model,
+            e2e_cfg,
+            data,
+            Accelerator(cpu=True),
+            node_batch=4,
+            profile_output=profile_output,
+        )
+
+        assert len(seen) == 1, "the budget probe must fold in exactly one family probe"
+        phase, payload, require_live_gradients = seen[0]
+        # Phase C is the worst case: every family is live at once.
+        assert (phase.alpha, phase.edge_active, phase.real_ssl_scale) == (1.0, True, 1.0)
+        assert payload["edge_active"] is True
+        # Step-0 gates are zero, so liveness is relaxed -- allocation is not.
+        assert require_live_gradients is False
+        assert json.loads(profile_output.read_text())["valid"] is True
+
+    def test_budget_probe_reports_a_family_probe_oom_as_a_candidate_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """An OOM in the folded-in probe must fail the candidate, not the whole sweep."""
+        torch.manual_seed(0)
+        e2e_cfg, data, model = self._probe_mode_inputs(tmp_path, monkeypatch)
+
+        def _oom(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("CUDA out of memory. Tried to allocate 952.00 MiB")
+
+        monkeypatch.setattr(te, "_e2e_family_probe", _oom)
+
+        with pytest.raises(RuntimeError, match="out of memory"):
+            te._run_probe_mode(
+                model,
+                e2e_cfg,
+                data,
+                Accelerator(cpu=True),
+                node_batch=4,
+                profile_output=tmp_path / "probe.json",
+            )
+
+        assert "E2_PROBE_CANDIDATE_FAILURE" in capsys.readouterr().err
+
     def test_profile_loop_executes_real_optimizer_and_validation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -958,16 +1172,7 @@ class TestE2ECompositeStep:
             run_kind="rehearsal",
         )
         data = _toy_bundle(tmp_path, EgoStitchConfig())
-        original_from_pack = PackedFeatureTable.from_pack.__func__
-
-        def _float_cpu_pack(
-            cls: type[PackedFeatureTable], root: Path, device: torch.device
-        ) -> PackedFeatureTable:
-            table = original_from_pack(cls, root, device)
-            table.tokens = table.tokens.float()
-            return table
-
-        monkeypatch.setattr(PackedFeatureTable, "from_pack", classmethod(_float_cpu_pack))
+        self._float_the_packed_store(monkeypatch)
         guard_persistence: list[bool] = []
         original_guard_update = te.E2EClipGuard.update
 
