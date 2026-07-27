@@ -29,6 +29,13 @@ def bash_exe() -> str:
     return executable
 
 
+def _strip_comments(block: str) -> str:
+    """Drop comment lines so prose cannot satisfy a behavioural assertion."""
+    return "\n".join(
+        line for line in block.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
 def _load_config(path: Path) -> dict[str, object]:
     payload = yaml.safe_load(path.read_text())
     assert isinstance(payload, dict)
@@ -291,6 +298,24 @@ def test_registration_drift_is_allowlisted_not_ignored() -> None:
     text = RUNNER.read_text()
     assert "canonical-digest" in text
     assert "registration_canonical_sha256" in text
+    # Calibration derives the eligible set from the live markers and records it;
+    # rehearsal replays that record rather than re-deriving (which would yield
+    # the empty set once the thresholds are numbers).
+    assert "freeze_eligible_gate_ids" in text
+    calibration_side = _strip_comments(
+        text[
+            text.index("write_calibration_freeze_manifest()") : text.index("run_calibration()")
+        ]
+    )
+    assert "--freeze-eligible" not in calibration_side
+    rehearsal_side = _strip_comments(
+        text[
+            text.index("assert_implementation_frozen()") : text.index(
+                "write_calibration_freeze_manifest()"
+            )
+        ]
+    )
+    assert "--freeze-eligible" in rehearsal_side
     guard = text[
         text.index("assert_implementation_frozen()") : text.index(
             "write_calibration_freeze_manifest()"

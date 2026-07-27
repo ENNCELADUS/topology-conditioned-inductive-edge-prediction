@@ -139,9 +139,25 @@ assert_implementation_frozen() {
   local config_abs="${QUALIFICATION_ROOT}/${FULL_CONFIG}"
   [[ -s "${calibration_manifest}" ]] || \
     fail "rehearsal requires the calibration freeze manifest: ${calibration_manifest}"
+  # Replay the eligible set recorded at calibration. Passing it explicitly is
+  # what keeps the already-fixed G3.1-G3.3 thresholds inside the digest: only
+  # the ids that were genuinely unresolved back then may move.
+  local eligible_args
+  eligible_args="$("${PYTHON_BIN}" -c '
+import json, shlex, sys
+from pathlib import Path
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+ids = manifest.get("freeze_eligible_gate_ids")
+if not isinstance(ids, list):
+    raise SystemExit("calibration manifest lacks freeze_eligible_gate_ids")
+print(" ".join(shlex.quote("--freeze-eligible=%s" % i) for i in ids))
+' "${calibration_manifest}")" || \
+    fail "could not read the freeze-eligible gate set from the calibration manifest"
   local live_digest
-  live_digest="$("${PYTHON_BIN}" -m src.experiments.prebinding_gates canonical-digest \
-    --preregistration "${QUALIFICATION_ROOT}/${PREREGISTRATION}")" || \
+  # shellcheck disable=SC2086 -- eligible_args is a shell-quoted flag list
+  live_digest="$(eval "${PYTHON_BIN}" -m src.experiments.prebinding_gates canonical-digest \
+    --preregistration "${QUALIFICATION_ROOT}/${PREREGISTRATION}" ${eligible_args} \
+    | "${PYTHON_BIN}" -c 'import json,sys; print(json.load(sys.stdin)["digest"])')" || \
     fail "could not compute the canonical registration digest"
   cd "${REPO_ROOT}"
   local live_commit
@@ -186,6 +202,10 @@ write_calibration_freeze_manifest() {
   local output_abs="${QUALIFICATION_ROOT}/$1"
   local config_abs="${QUALIFICATION_ROOT}/${FULL_CONFIG}"
   local registration_abs="${QUALIFICATION_ROOT}/${PREREGISTRATION}"
+  # No --freeze-eligible here: at calibration the markers are still present, so
+  # the eligible set is derived from them and recorded for the rehearsal to
+  # replay. Re-deriving it at rehearsal would yield the empty set, because by
+  # then those thresholds are ordinary numbers.
   local canonical
   canonical="$("${PYTHON_BIN}" -m src.experiments.prebinding_gates canonical-digest \
     --preregistration "${registration_abs}")" || \
@@ -196,15 +216,17 @@ write_calibration_freeze_manifest() {
   "${PYTHON_BIN}" -c '
 import hashlib, json, sys
 from pathlib import Path
-output, commit, config_path, registration_path, canonical = (
+output, commit, config_path, registration_path, canonical_json = (
     Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4]), sys.argv[5]
 )
+canonical = json.loads(canonical_json)
 output.parent.mkdir(parents=True, exist_ok=True)
 output.write_text(json.dumps({
     "implementation_commit": commit,
     "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
     "registration_sha256": hashlib.sha256(registration_path.read_bytes()).hexdigest(),
-    "registration_canonical_sha256": canonical,
+    "registration_canonical_sha256": canonical["digest"],
+    "freeze_eligible_gate_ids": canonical["freeze_eligible_gate_ids"],
 }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 ' "${output_abs}" "${live_commit}" "${config_abs}" "${registration_abs}" "${canonical}" || \
     fail "could not write the calibration freeze manifest"

@@ -165,23 +165,46 @@ def _assert_exact_gate_schema(gates: Sequence[Mapping[str, object]]) -> None:
 _THRESHOLD_SENTINEL = "<threshold-frozen-between-stages>"
 
 
-def canonical_registration_digest(registration: Mapping[str, object]) -> str:
-    """Digest the registration with only the permitted threshold edits masked.
+def unresolved_gate_ids(registration: Mapping[str, object]) -> list[str]:
+    """Gate ids whose threshold is still a REQUIRED-BEFORE-BINDING marker.
 
-    Freezing calibrated thresholds into the DRAFT is the one change allowed
-    between calibration and rehearsal, so the raw file digest cannot be compared.
-    Ignoring registration drift *entirely* is the opposite error: a gate operator
-    flipped from ``>`` to ``>=``, or a protocol field rewritten, would then pass
-    unnoticed and could change the prospective verdict. Masking just
-    ``prebinding_qualification.gates[*].threshold`` pins everything else.
+    Evaluated against the *calibration-time* registration, this is exactly the
+    set the owner is permitted to fill in before the rehearsal.
     """
+    return [
+        cast(str, gate["id"])
+        for gate in load_prebinding_gates(registration)
+        if _is_unresolved(gate.get("threshold"))
+    ]
+
+
+def canonical_registration_digest(
+    registration: Mapping[str, object], *, freeze_eligible_ids: Sequence[str]
+) -> str:
+    """Digest the registration with only the freeze-eligible thresholds masked.
+
+    Freezing the GPU-calibrated thresholds into the DRAFT is the one change
+    allowed between calibration and rehearsal, so the raw file digest cannot be
+    compared. Ignoring registration drift *entirely* is the opposite error: a
+    gate operator flipped from ``>`` to ``>=``, or a rewritten protocol field,
+    would pass unnoticed.
+
+    Masking *every* threshold is a subtler version of the same mistake. G3.1-G3.3
+    are already fixed numbers before calibration begins; if their thresholds were
+    masked too, weakening G3.1 from 0.0698 after calibration would leave the
+    digest unchanged and the rehearsal would run against a gate nobody
+    registered. Only the ids that were genuinely unresolved at calibration time
+    are masked — and that set is recorded in the freeze manifest, not inferred
+    again at rehearsal, when those thresholds are numbers like any other.
+    """
+    eligible = set(freeze_eligible_ids)
     masked = json.loads(json.dumps(registration))
     qualification = masked.get("prebinding_qualification")
     if isinstance(qualification, dict):
         gates = qualification.get("gates")
         if isinstance(gates, list):
             for gate in gates:
-                if isinstance(gate, dict) and "threshold" in gate:
+                if isinstance(gate, dict) and gate.get("id") in eligible:
                     gate["threshold"] = _THRESHOLD_SENTINEL
     payload = json.dumps(masked, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -418,6 +441,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the registration digest with permitted threshold edits masked",
     )
     digest.add_argument("--preregistration", type=Path, required=True)
+    digest.add_argument(
+        "--freeze-eligible",
+        action="append",
+        default=None,
+        metavar="GATE_ID",
+        help=(
+            "gate id whose threshold may change across the freeze; omit at "
+            "calibration to derive the set from the unresolved markers"
+        ),
+    )
     return parser
 
 
@@ -430,7 +463,26 @@ def main(argv: Sequence[str] | None = None) -> None:
         registration = cast(
             dict[str, object], json.loads(args.preregistration.read_text(encoding="utf-8"))
         )
-        sys.stdout.write(canonical_registration_digest(registration) + "\n")
+        # Derived at calibration (when the markers are still present) and echoed
+        # so the caller can record it; supplied verbatim from that record at
+        # rehearsal, when the same thresholds are ordinary numbers.
+        eligible = (
+            unresolved_gate_ids(registration)
+            if args.freeze_eligible is None
+            else list(args.freeze_eligible)
+        )
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "digest": canonical_registration_digest(
+                        registration, freeze_eligible_ids=eligible
+                    ),
+                    "freeze_eligible_gate_ids": sorted(eligible),
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
         return
     if args.command == "check-implementable":
         registration = cast(

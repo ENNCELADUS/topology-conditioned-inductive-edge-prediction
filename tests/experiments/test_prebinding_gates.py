@@ -307,47 +307,65 @@ class TestVerdictEnforcement:
 
 
 class TestCanonicalRegistrationDigest:
+    ELIGIBLE = ("G3.4", "G3.5")
+
+    def _digest(self, registration: dict[str, Any]) -> str:
+        return pg.canonical_registration_digest(
+            registration, freeze_eligible_ids=self.ELIGIBLE
+        )
+
+    def test_eligible_set_is_derived_from_the_unresolved_markers(self) -> None:
+        assert pg.unresolved_gate_ids(_registration()) == ["G3.4", "G3.5"]
+
     def test_threshold_freeze_does_not_change_the_digest(self) -> None:
         before = _registration()
         after = _registration()
         for gate in after["prebinding_qualification"]["gates"]:
-            if gate["id"] in {"G3.4", "G3.5"}:
+            if gate["id"] in set(self.ELIGIBLE):
                 gate["threshold"] = 0.0123
-        assert pg.canonical_registration_digest(before) == (
-            pg.canonical_registration_digest(after)
-        )
+        assert self._digest(before) == self._digest(after)
+
+    def test_weakening_an_already_fixed_threshold_changes_the_digest(self) -> None:
+        # G3.1-G3.3 are numbers before calibration begins. Masking them too
+        # would let G3.1 be weakened from 0.0698 after calibration while the
+        # freeze check still passed.
+        for index, gate_id in enumerate(("G3.1", "G3.2", "G3.3")):
+            before = _registration()
+            after = _registration()
+            after["prebinding_qualification"]["gates"][index]["threshold"] = 0.0
+            assert self._digest(before) != self._digest(after), gate_id
 
     def test_flipped_gate_operator_changes_the_digest(self) -> None:
         before = _registration()
         after = _registration()
         after["prebinding_qualification"]["gates"][1]["operator"] = ">="
-        assert pg.canonical_registration_digest(before) != (
-            pg.canonical_registration_digest(after)
-        )
+        assert self._digest(before) != self._digest(after)
 
     def test_rewritten_protocol_field_changes_the_digest(self) -> None:
         before = _registration()
         after = _registration()
         after["prebinding_qualification"]["protocol"] = {"v_qual_rehearsals": 99}
-        assert pg.canonical_registration_digest(before) != (
-            pg.canonical_registration_digest(after)
-        )
+        assert self._digest(before) != self._digest(after)
 
     def test_unrelated_registration_edit_changes_the_digest(self) -> None:
         before = _registration()
         after = _registration()
         after["grounding"]["n_ground"] = 20
-        assert pg.canonical_registration_digest(before) != (
-            pg.canonical_registration_digest(after)
-        )
+        assert self._digest(before) != self._digest(after)
 
     def test_digest_is_stable_across_key_order(self) -> None:
         registration = _registration()
         reordered = json.loads(json.dumps(registration))
         reordered["prebinding_qualification"] = reordered.pop("prebinding_qualification")
-        assert pg.canonical_registration_digest(registration) == (
-            pg.canonical_registration_digest(reordered)
-        )
+        assert self._digest(registration) == self._digest(reordered)
+
+    def test_empty_eligible_set_pins_every_threshold(self) -> None:
+        before = _registration()
+        after = _registration()
+        after["prebinding_qualification"]["gates"][3]["threshold"] = 0.5
+        assert pg.canonical_registration_digest(
+            before, freeze_eligible_ids=()
+        ) != pg.canonical_registration_digest(after, freeze_eligible_ids=())
 
 
 class TestUnimplementedGates:
