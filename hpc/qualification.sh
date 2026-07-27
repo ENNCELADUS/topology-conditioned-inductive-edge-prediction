@@ -84,6 +84,44 @@ if unresolved:
     fail "rehearsal refuses unresolved gate thresholds; freeze them from calibration first"
 }
 
+# A frozen threshold is necessary but not sufficient: a rehearsal that cannot
+# evaluate every registered gate is not a qualification, and V_qual is spent the
+# moment it starts. Checked here rather than read off the report afterwards.
+assert_prebinding_gates_implementable() {
+  "${PYTHON_BIN}" -m src.experiments.prebinding_gates check-implementable \
+    --preregistration "${PREREGISTRATION}" || \
+    fail "rehearsal refuses gates with no executable evaluator; implement them first"
+}
+
+# The registration permits exactly one prospective V_qual rehearsal
+# (prebinding_qualification.protocol.v_qual_rehearsals). The attempt roots are
+# separate directories, so a per-root guard would let attempt002 open V_qual
+# again after attempt001 already did. The ledger lives under REPO_ROOT, which is
+# the one path every attempt shares, and is written *before* V_qual is opened so
+# an interrupted rehearsal still counts as spent.
+readonly REHEARSAL_LEDGER="${REPO_ROOT}/outputs/egostitch_e2e_stage1_v3/qualification/v_qual_rehearsal_ledger.json"
+
+assert_single_v_qual_rehearsal() {
+  local attempt="$1"
+  [[ ! -e "${REHEARSAL_LEDGER}" ]] || \
+    fail "the single registered V_qual rehearsal is already spent: ${REHEARSAL_LEDGER}"
+  mkdir -p "$(dirname "${REHEARSAL_LEDGER}")"
+  "${PYTHON_BIN}" -c '
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+if path.exists():
+    raise SystemExit("rehearsal ledger appeared concurrently: %s" % path)
+path.write_text(json.dumps({
+    "attempt": sys.argv[2],
+    "qualification_root": sys.argv[3],
+    "registration_sha256": sys.argv[4],
+}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+' "${REHEARSAL_LEDGER}" "${attempt}" "${QUALIFICATION_ROOT}" "${REGISTRATION_SHA256_BEFORE}" || \
+    fail "could not record the V_qual rehearsal ledger"
+  echo "recorded the single V_qual rehearsal: ${REHEARSAL_LEDGER}"
+}
+
 select_all_visible_h20s() {
   command -v nvidia-smi >/dev/null 2>&1 || fail "nvidia-smi is unavailable"
   mapfile -t gpu_rows < <(
@@ -156,7 +194,8 @@ enter_qualification_attempt() {
   REGISTRATION_SHA256_BEFORE="$(registration_sha256)"
   export REGISTRATION_SHA256_BEFORE
   ATTEMPT_DIR="${attempt_dir}"
-  export ATTEMPT_DIR
+  ATTEMPT_NUMBER="${attempt_number}"
+  export ATTEMPT_DIR ATTEMPT_NUMBER
 }
 
 run_sanity_suite() {
@@ -221,8 +260,11 @@ run_calibration() {
 
 run_rehearsal() {
   enter_qualification_attempt rehearsal
+  # All three preconditions are checked before a single V_qual row is read.
   assert_prebinding_gates_frozen
+  assert_prebinding_gates_implementable
   trap assert_registration_unchanged EXIT
+  assert_single_v_qual_rehearsal "${ATTEMPT_NUMBER}"
 
   echo "rehearsal stage 1/3: exact full-arm rehearsal on V_qual"
   select_all_visible_h20s

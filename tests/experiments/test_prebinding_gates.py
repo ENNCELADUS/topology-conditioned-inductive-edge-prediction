@@ -246,6 +246,65 @@ class TestEntryPointGuards:
             )
 
 
+class TestVerdictEnforcement:
+    def test_failing_rehearsal_report_stops_the_process(self, tmp_path: Path) -> None:
+        report = _report(slot_recall=0.0, pi_v2=0.0, clustering_r2=0.0)
+        with pytest.raises(SystemExit, match="did not pass"):
+            pg.enforce_verdict(
+                report, scope="qualification_qual", output_path=tmp_path / "gates.json"
+            )
+
+    def test_incomplete_rehearsal_report_stops_the_process(self, tmp_path: Path) -> None:
+        # Every evaluated gate passes, but G3.4/G3.5 are incomplete: a rehearsal
+        # that could not judge all five gates is not a qualification.
+        report = _report(slot_recall=0.99, pi_v2=0.99, clustering_r2=0.99)
+        assert report["n_incomplete"] == 2
+        with pytest.raises(SystemExit, match="did not pass"):
+            pg.enforce_verdict(
+                report, scope="qualification_qual", output_path=tmp_path / "gates.json"
+            )
+
+    def test_calibration_never_fails_on_an_incomplete_report(self, tmp_path: Path) -> None:
+        # Calibration exists to run while thresholds are unresolved.
+        report = _report(slot_recall=0.0, pi_v2=0.0, clustering_r2=0.0)
+        pg.enforce_verdict(
+            report, scope="calibration_fit", output_path=tmp_path / "gates.json"
+        )
+
+
+class TestUnimplementedGates:
+    def test_reports_the_two_scoring_gates(self) -> None:
+        assert pg.unimplemented_gates(_registration()) == ["G3.4", "G3.5"]
+
+    def test_empty_when_every_registered_gate_has_an_evaluator(self) -> None:
+        registration = _registration()
+        gates = registration["prebinding_qualification"]["gates"]
+        registration["prebinding_qualification"]["gates"] = gates[:3]
+        assert pg.unimplemented_gates(registration) == []
+
+    def test_frozen_thresholds_do_not_make_a_gate_implementable(self) -> None:
+        # The review's P1: freezing G3.4/G3.5 must not be mistaken for
+        # implementing them, or the rehearsal spends V_qual and only then
+        # discovers it cannot judge those gates.
+        registration = _registration()
+        for gate in registration["prebinding_qualification"]["gates"]:
+            if gate["id"] in {"G3.4", "G3.5"}:
+                gate["threshold"] = 0.01
+        assert pg.unimplemented_gates(registration) == ["G3.4", "G3.5"]
+
+    def test_live_v3_registration_is_not_yet_implementable(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        registration = json.loads(
+            (
+                repo_root
+                / "docs"
+                / "registrations"
+                / "g5_e2e_stage1_preregistration_v3.json"
+            ).read_text()
+        )
+        assert pg.unimplemented_gates(registration) == ["G3.4", "G3.5"]
+
+
 def test_live_v3_registration_yields_three_evaluable_and_two_blocked() -> None:
     """The shipped v3 draft must parse, and must not certify anything today."""
     repo_root = Path(__file__).resolve().parents[2]

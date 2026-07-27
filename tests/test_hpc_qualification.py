@@ -191,10 +191,42 @@ def test_rehearsal_refuses_unresolved_gate_thresholds() -> None:
         "--run-kind rehearsal"
     )
     guard = text[
-        text.index("assert_prebinding_gates_frozen()") : text.index("select_all_visible_h20s()")
+        text.index("assert_prebinding_gates_frozen()") : text.index(
+            "assert_prebinding_gates_implementable()"
+        )
     ]
     assert "prebinding_qualification" in guard
     assert "REQUIRED-BEFORE-BINDING" in guard
+
+
+def test_rehearsal_refuses_gates_that_have_no_evaluator() -> None:
+    # A frozen threshold is not the same as an implemented gate; V_qual is spent
+    # the moment the rehearsal starts, so this must precede it.
+    text = RUNNER.read_text()
+    rehearsal = text[text.index("run_rehearsal()") : text.index("formal_config()")]
+    assert rehearsal.index("assert_prebinding_gates_implementable") < rehearsal.index(
+        "--run-kind rehearsal"
+    )
+    assert "check-implementable" in text
+
+
+def test_single_v_qual_rehearsal_is_enforced_across_attempts() -> None:
+    text = RUNNER.read_text()
+    rehearsal = text[text.index("run_rehearsal()") : text.index("formal_config()")]
+    # The ledger must be recorded before V_qual is opened, so an interrupted
+    # rehearsal still counts as spent.
+    assert rehearsal.index("assert_single_v_qual_rehearsal") < rehearsal.index(
+        "--run-kind rehearsal"
+    )
+    # It must live under REPO_ROOT: the attempt roots are separate directories,
+    # so a per-root guard would let attempt002 open V_qual again.
+    ledger = text[text.index("REHEARSAL_LEDGER=") : text.index("select_all_visible_h20s()")]
+    assert "${REPO_ROOT}" in ledger
+    assert "already spent" in ledger
+    # Calibration must not touch the ledger.
+    calibration = text[text.index("run_calibration()") : text.index("run_rehearsal()")]
+    assert "REHEARSAL_LEDGER" not in calibration
+    assert "assert_single_v_qual_rehearsal" not in calibration
 
 
 def test_both_prebinding_stages_evaluate_the_registered_gates() -> None:

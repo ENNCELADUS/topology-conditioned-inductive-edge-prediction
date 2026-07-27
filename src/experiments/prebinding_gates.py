@@ -123,6 +123,22 @@ def load_prebinding_gates(registration: Mapping[str, object]) -> list[Mapping[st
     return parsed
 
 
+def unimplemented_gates(registration: Mapping[str, object]) -> list[str]:
+    """Return registered gate ids this module cannot evaluate.
+
+    A rehearsal that cannot evaluate every registered gate is not a
+    qualification, and V_qual is spent the moment the rehearsal starts — so this
+    must be checkable *before* the run, not discovered from the report after.
+    Freezing G3.4/G3.5's thresholds is necessary but not sufficient: their inputs
+    also have to become reachable.
+    """
+    return [
+        cast(str, gate["id"])
+        for gate in load_prebinding_gates(registration)
+        if gate["name"] not in _PROBE_GATE_PATHS
+    ]
+
+
 def _registered_n_ground(
     registration: Mapping[str, object], gates: Sequence[Mapping[str, object]]
 ) -> int:
@@ -287,6 +303,30 @@ def build_gate_report(
     }
 
 
+def enforce_verdict(
+    report: Mapping[str, object], *, scope: E2EProbeScope, output_path: Path
+) -> None:
+    """Fail the process when a rehearsal report is not a clean pass.
+
+    A rehearsal is a verdict, so a non-passing report must stop the caller.
+    Writing the JSON and exiting 0 would let ``set -e`` sail past a failed gate,
+    let the launcher announce a completed rehearsal, and leave a report a
+    binding-evidence validator could later accept by hash without ever reading
+    its verdict.
+
+    Calibration is a *measurement* stage whose entire purpose is to run while
+    thresholds are still unresolved, so it never fails here — its report is
+    input to the owner's freeze decision, not a judgement.
+    """
+    if scope != "qualification_qual":
+        return
+    if not report["passed"]:
+        raise SystemExit(
+            f"pre-binding gates did not pass: {output_path} "
+            f"({report['n_evaluated']} evaluated, {report['n_incomplete']} incomplete)"
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the pre-binding gate evaluator CLI."""
     parser = argparse.ArgumentParser(prog="python -m src.experiments.prebinding_gates")
@@ -304,6 +344,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--scope", choices=("calibration_fit", "qualification_qual"), required=True
     )
     evaluate.add_argument("--output", type=Path, required=True)
+    implementable = subparsers.add_parser(
+        "check-implementable",
+        help="exit nonzero unless every registered gate has an evaluator",
+    )
+    implementable.add_argument("--preregistration", type=Path, required=True)
     return parser
 
 
@@ -312,6 +357,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     from src.train_egostitch import load_config
 
     args = build_parser().parse_args(argv)
+    if args.command == "check-implementable":
+        registration = cast(
+            dict[str, object], json.loads(args.preregistration.read_text(encoding="utf-8"))
+        )
+        missing = unimplemented_gates(registration)
+        if missing:
+            raise SystemExit(
+                "no executable evaluator for registered gate(s): "
+                + ", ".join(missing)
+            )
+        return
     if args.command != "evaluate":
         return
     # Derived from the config rather than repeated on the command line:
@@ -332,6 +388,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     args.output.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    enforce_verdict(report, scope=args.scope, output_path=args.output)
 
 
 if __name__ == "__main__":
