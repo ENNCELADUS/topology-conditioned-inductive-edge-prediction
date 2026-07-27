@@ -491,6 +491,12 @@ esac
 [[ -x "${UV_BIN}" ]] || fail "uv not found at ${UV_BIN}"
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+# rev-3.1's working set is close to the H20's 95 GiB: the 2026-07-27 calibration
+# OOM'd on an idle card with 89.51 GiB allocated and a further 4.15 GiB reserved
+# but unallocated, failing an 856 MiB request. Expandable segments reclaim that
+# fragmentation. This changes allocator behaviour only, never numerics, so it is
+# set for every stage rather than tuned per run.
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 
 case "${1:-}" in
   calibrate)
