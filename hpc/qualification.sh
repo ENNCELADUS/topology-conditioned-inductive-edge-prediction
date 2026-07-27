@@ -131,7 +131,12 @@ except FileExistsError:
 # sole V_qual attempt could be spent on a different implementation than the one
 # that produced its thresholds.
 assert_implementation_frozen() {
-  local calibration_manifest="$1"
+  # Resolved against QUALIFICATION_ROOT *before* any cd: these paths are relative
+  # to the isolated root, and the config/registration actually consumed by the
+  # qualification commands are the isolated root's copies, not the repository's.
+  # Hashing the repository copies would certify files the run never read.
+  local calibration_manifest="${QUALIFICATION_ROOT}/$1"
+  local config_abs="${QUALIFICATION_ROOT}/${FULL_CONFIG}"
   [[ -s "${calibration_manifest}" ]] || \
     fail "rehearsal requires the calibration freeze manifest: ${calibration_manifest}"
   cd "${REPO_ROOT}"
@@ -161,8 +166,8 @@ if manifest.get("config_sha256") != digest:
 if problems:
     sys.stderr.write("\n".join(problems) + "\n")
     raise SystemExit(1)
-' "${calibration_manifest}" "${live_commit}" "${FULL_CONFIG}" || \
-    fail "implementation/config/registration drifted since calibration; re-calibrate before rehearsing"
+' "${calibration_manifest}" "${live_commit}" "${config_abs}" || \
+    fail "implementation/config drifted since calibration; re-calibrate before rehearsing"
   cd "${QUALIFICATION_ROOT}"
   echo "implementation freeze verified against ${calibration_manifest}"
 }
@@ -170,7 +175,11 @@ if problems:
 # Written at the end of calibration so the rehearsal has something to compare
 # against. Records what produced the thresholds, not what will consume them.
 write_calibration_freeze_manifest() {
-  local output="$1"
+  # Absolute, resolved before the cd, for the same reason as
+  # assert_implementation_frozen: record what this run actually consumed.
+  local output_abs="${QUALIFICATION_ROOT}/$1"
+  local config_abs="${QUALIFICATION_ROOT}/${FULL_CONFIG}"
+  local registration_abs="${QUALIFICATION_ROOT}/${PREREGISTRATION}"
   cd "${REPO_ROOT}"
   local live_commit
   live_commit="$(git rev-parse HEAD)"
@@ -184,10 +193,10 @@ output.write_text(json.dumps({
     "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
     "registration_sha256": hashlib.sha256(registration_path.read_bytes()).hexdigest(),
 }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-' "${QUALIFICATION_ROOT}/${output}" "${live_commit}" "${FULL_CONFIG}" "${PREREGISTRATION}" || \
+' "${output_abs}" "${live_commit}" "${config_abs}" "${registration_abs}" || \
     fail "could not write the calibration freeze manifest"
   cd "${QUALIFICATION_ROOT}"
-  echo "recorded the calibration freeze manifest: ${output}"
+  echo "recorded the calibration freeze manifest: ${output_abs}"
 }
 
 select_all_visible_h20s() {
@@ -330,16 +339,18 @@ run_calibration() {
 
 run_rehearsal() {
   enter_qualification_attempt rehearsal
-  # Every precondition is checked before a single V_qual row is read, and the
-  # ledger is claimed last so a rejected rehearsal does not burn the one attempt.
+  # Every precondition — including the hardware preflight — is checked before
+  # the ledger is claimed, so a rehearsal rejected for any reason does not burn
+  # the one attempt. The claim itself stays immediately before the command that
+  # opens V_qual, so an interrupted rehearsal still counts as spent.
   assert_prebinding_gates_frozen
   assert_prebinding_gates_implementable
   assert_implementation_frozen "${ATTEMPT_DIR}/calibration_freeze.json"
   trap assert_registration_unchanged EXIT
-  assert_single_v_qual_rehearsal "${ATTEMPT_NUMBER}"
+  select_all_visible_h20s
 
   echo "rehearsal stage 1/3: exact full-arm rehearsal on V_qual"
-  select_all_visible_h20s
+  assert_single_v_qual_rehearsal "${ATTEMPT_NUMBER}"
   "${PYTHON_BIN}" -m src.e2_pipeline --config "${FULL_CONFIG}" \
     --worker-module src.train_egostitch \
     --run-kind rehearsal \

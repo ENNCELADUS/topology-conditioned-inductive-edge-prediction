@@ -256,6 +256,34 @@ def test_calibration_records_the_freeze_manifest() -> None:
     )
 
 
+def test_hardware_preflight_precedes_the_ledger_claim() -> None:
+    # A missing nvidia-smi or a non-H20 device must not permanently consume the
+    # single rehearsal allowance when no V_qual row was ever opened.
+    text = RUNNER.read_text()
+    rehearsal = text[text.index("run_rehearsal()") : text.index("formal_config()")]
+    assert rehearsal.index("select_all_visible_h20s") < rehearsal.index(
+        "assert_single_v_qual_rehearsal"
+    )
+
+
+def test_freeze_paths_are_resolved_against_the_isolated_root() -> None:
+    # Both functions cd to REPO_ROOT to read git, but the files the run actually
+    # consumes live under QUALIFICATION_ROOT; relative paths would resolve to the
+    # repository copies (or not at all).
+    text = RUNNER.read_text()
+    verify = text[
+        text.index("assert_implementation_frozen()") : text.index(
+            "write_calibration_freeze_manifest()"
+        )
+    ]
+    write = text[
+        text.index("write_calibration_freeze_manifest()") : text.index("run_calibration()")
+    ]
+    for block in (verify, write):
+        assert '${QUALIFICATION_ROOT}/' in block
+        assert block.index('${QUALIFICATION_ROOT}/') < block.index('cd "${REPO_ROOT}"')
+
+
 def test_single_v_qual_rehearsal_is_enforced_across_attempts() -> None:
     text = RUNNER.read_text()
     rehearsal = text[text.index("run_rehearsal()") : text.index("formal_config()")]
