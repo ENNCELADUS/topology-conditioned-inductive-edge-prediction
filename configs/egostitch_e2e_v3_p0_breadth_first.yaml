@@ -82,7 +82,7 @@ runtime:
   pack_workers: 8
   loader_workers_per_rank: 0
   prefetch_factor: 2
-  token_budget_candidates: [128]
+  token_budget_candidates: [64]
   max_pairs_per_rank: 1048576
   memory_limit_gib: 85.0
   total_budget_seconds: 30300

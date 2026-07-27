@@ -3,12 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Document</title>
+<title>EgoStitch rev-3.1</title>
 <style>
-/* house.css — shared style for html-doc research documents.
-   Inlined into every generated file by scripts/build_doc.py.
-   No external fonts, no CDN: everything here works offline from file://. */
-
 :root {
   --bg: #fbfaf8;
   --surface: #ffffff;
@@ -22,8 +18,6 @@
   --accent-soft: #fdf0e9;
   --include: #15803d;
   --include-soft: #eaf6ee;
-  --reject: #b91c1c;
-  --reject-soft: #fbeeee;
   --serif: "Source Serif Pro", "Iowan Old Style", Charter, "Songti SC", Georgia, serif;
   --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
@@ -44,8 +38,6 @@
     --accent-soft: #2e2018;
     --include: #4ade80;
     --include-soft: #17281c;
-    --reject: #f87171;
-    --reject-soft: #2b1818;
   }
 }
 
@@ -61,513 +53,271 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-.wrap { max-width: 1120px; margin: 0 auto; padding: 32px 24px 96px; }
-
-/* ---------- masthead ---------- */
-
+.wrap { max-width: 1120px; margin: 0 auto; padding: 32px 24px 72px; }
 .masthead { border-bottom: 2px solid var(--ink); padding-bottom: 14px; margin-bottom: 28px; }
-.eyebrow {
-  font-size: 11px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase;
-  color: var(--accent); margin-bottom: 6px;
+.masthead h1 {
+  font-family: var(--serif);
+  font-size: 34px;
+  line-height: 1.15;
+  margin: 0;
+  font-weight: 600;
 }
-.masthead h1 { font-family: var(--serif); font-size: 34px; line-height: 1.15; margin: 0 0 8px; font-weight: 600; }
-.dek { color: var(--ink-2); font-size: 15px; max-width: 68ch; margin: 0; }
-.meta { margin-top: 12px; font-size: 12px; color: var(--ink-3); font-family: var(--mono); }
-
-/* ---------- the decision box: every doc leads with this ---------- */
-
-.decision {
-  background: var(--accent-soft);
-  border: 1px solid var(--rule-2);
-  border-left: 3px solid var(--accent);
-  border-radius: var(--radius);
-  padding: 16px 18px;
-  margin-bottom: 28px;
-}
-.decision h2 { margin: 0 0 6px; font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
-.decision p { margin: 0; font-size: 16px; font-family: var(--serif); }
-
-/* ---------- structure ---------- */
 
 section { margin-bottom: 40px; scroll-margin-top: 20px; }
 h2.sec {
-  font-size: 12px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
-  color: var(--ink-3); border-bottom: 1px solid var(--rule); padding-bottom: 6px; margin: 0 0 16px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 6px;
+  margin: 0 0 16px;
 }
 h3 { font-family: var(--serif); font-size: 19px; margin: 0 0 8px; font-weight: 600; }
 p { margin: 0 0 12px; }
+p:last-child { margin-bottom: 0; }
 a { color: var(--accent); text-underline-offset: 2px; }
-code { font-family: var(--mono); font-size: .88em; background: var(--surface-2); padding: 1px 5px; border-radius: 3px; }
-
-/* ---------- cards ---------- */
+code {
+  font-family: var(--mono);
+  font-size: .88em;
+  background: var(--surface-2);
+  padding: 1px 5px;
+  border-radius: 3px;
+}
 
 .grid { display: grid; gap: 14px; }
 .grid.cols-2 { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
-.grid.cols-3 { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
-
 .card {
   background: var(--surface);
   border: 1px solid var(--rule);
   border-radius: var(--radius);
   padding: 14px 16px;
 }
-.card.included { border-color: var(--include); background: var(--include-soft); }
-.card.rejected { border-color: var(--rule); background: var(--reject-soft); opacity: .72; }
+.card.active { border-left: 3px solid var(--include); background: var(--include-soft); }
+.card.note { border-left: 3px solid var(--accent); background: var(--accent-soft); }
+.body-copy { font-family: var(--serif); font-size: 16.5px; line-height: 1.62; }
+.body-copy ul { margin: 8px 0 0; padding-left: 22px; }
 
-/* ---------- tables ---------- */
+.equation {
+  margin: 0 0 14px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  color: var(--ink);
+  font: 13px/1.65 var(--mono);
+  white-space: pre;
+}
+.hint { color: var(--ink-3); font-size: 12px; }
+.chip {
+  display: inline-block;
+  font-size: 11px;
+  font-family: var(--mono);
+  padding: 2px 7px;
+  border-radius: 20px;
+  background: var(--surface-2);
+  color: var(--ink-2);
+  border: 1px solid var(--rule);
+  white-space: nowrap;
+}
+.chip.active { background: var(--include-soft); color: var(--include); border-color: var(--include); }
+.chip.pending { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
 
-.table-scroll { overflow-x: auto; border: 1px solid var(--rule); border-radius: var(--radius); background: var(--surface); }
+.table-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
 table { border-collapse: collapse; width: 100%; font-size: 14px; }
 th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--rule); vertical-align: top; }
 thead th {
-  position: sticky; top: 0; z-index: 2;
-  background: var(--surface-2); color: var(--ink-2);
-  font-size: 11px; letter-spacing: .06em; text-transform: uppercase; font-weight: 600;
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-size: 11px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  font-weight: 600;
   border-bottom: 1px solid var(--rule-2);
 }
-th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
-th.sortable:hover { color: var(--ink); }
-th.sortable::after { content: " ↕"; opacity: .3; }
-th.sortable[data-dir="asc"]::after { content: " ↑"; opacity: 1; color: var(--accent); }
-th.sortable[data-dir="desc"]::after { content: " ↓"; opacity: 1; color: var(--accent); }
 tbody tr:last-child td { border-bottom: none; }
-tbody tr.included { background: var(--include-soft); }
-tbody tr.rejected { background: var(--reject-soft); color: var(--ink-3); }
-tbody tr.rejected .title { text-decoration: line-through; }
-
-/* ---------- controls ---------- */
-
-.controls {
-  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
-  margin-bottom: 14px; padding: 12px; background: var(--surface); border: 1px solid var(--rule);
-  border-radius: var(--radius);
-}
-input[type="search"], input[type="text"], select {
-  font: inherit; font-size: 13px; color: var(--ink);
-  background: var(--bg); border: 1px solid var(--rule-2); border-radius: 4px; padding: 6px 9px;
-}
-input[type="search"] { min-width: 220px; flex: 1; }
-input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-
-.chip {
-  font-size: 11px; font-family: var(--mono); padding: 2px 7px; border-radius: 20px;
-  background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--rule); white-space: nowrap;
-}
-.chip.gap { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
-
-/* tri-state include / reject toggle */
-.tri { display: inline-flex; border: 1px solid var(--rule-2); border-radius: 4px; overflow: hidden; }
-.tri button {
-  font: inherit; font-size: 12px; line-height: 1; padding: 5px 8px; cursor: pointer;
-  background: var(--surface); color: var(--ink-3); border: none; border-right: 1px solid var(--rule-2);
-}
-.tri button:last-child { border-right: none; }
-.tri button:hover { background: var(--surface-2); color: var(--ink); }
-.tri button[aria-pressed="true"][data-state="include"] { background: var(--include); color: #fff; }
-.tri button[aria-pressed="true"][data-state="reject"] { background: var(--reject); color: #fff; }
-
-.reason { display: none; margin-top: 6px; }
-tr.rejected .reason, .card.rejected .reason { display: block; }
-.reason input { width: 100%; font-size: 12px; border-color: var(--reject); }
-
-.notewrap { display: none; margin-top: 6px; }
-tr.included .notewrap, .card.included .notewrap { display: block; }
-.notewrap input { width: 100%; font-size: 12px; border-color: var(--include); }
-
-/* ---------- the roundtrip bar ---------- */
-
-.rtbar {
-  position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
-  display: flex; gap: 14px; align-items: center; justify-content: space-between;
-  padding: 10px 20px;
-  background: var(--surface); border-top: 1px solid var(--rule-2);
-  box-shadow: 0 -2px 14px rgba(0,0,0,.06);
-  font-size: 13px;
-}
-.rtbar .tally { font-family: var(--mono); color: var(--ink-2); }
-.rtbar .tally b { color: var(--include); }
-.rtbar .tally i { color: var(--reject); font-style: normal; }
-.rtbar .hint { color: var(--ink-3); font-size: 12px; }
-.copy-btn {
-  font: inherit; font-weight: 600; font-size: 13px; cursor: pointer;
-  background: var(--ink); color: var(--bg); border: none; border-radius: 5px; padding: 9px 16px;
-}
-.copy-btn:hover { background: var(--accent); }
-.copy-btn.done { background: var(--include); }
-
-/* ---------- svg figures ---------- */
-
-figure { margin: 0 0 16px; padding: 14px; background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius); overflow-x: auto; }
-figure svg { display: block; max-width: 100%; height: auto; }
-figcaption { margin-top: 10px; font-size: 12px; color: var(--ink-3); }
-.svg-label { font-family: var(--sans); font-size: 10px; fill: var(--ink-3); }
-.svg-cell { fill: var(--accent); }
-
-.empty { padding: 28px; text-align: center; color: var(--ink-3); font-style: italic; }
 
 @media (max-width: 640px) {
-  .wrap { padding: 20px 14px 100px; }
+  .wrap { padding: 20px 14px 56px; }
   .masthead h1 { font-size: 26px; }
-  .rtbar { flex-wrap: wrap; gap: 8px; }
-  .rtbar .hint { display: none; }
 }
 
 @media print {
-  .rtbar, .controls, .tri { display: none; }
   body { background: #fff; }
-  tr.rejected, .card.rejected { display: none; }
+  .wrap { max-width: none; padding: 0; }
 }
-
-.body-copy { font-family: var(--serif); font-size: 16.5px; line-height: 1.62; }
-.body-copy ul, .body-copy ol { padding-left: 22px; }
-.body-copy table { margin: 8px 0; }
-[hidden] { display: none !important; }
 </style>
 </head>
 <body>
-
-<script type="application/json" id="doc-data">
-{
-  "doc": "egostitch-stage1-closeout-2026-07-17",
-  "title": "EgoStitch G5 Stage-1 closeout",
-  "eyebrow": "Binding engineering screen · 2026-07-17",
-  "dek": "Frozen-s0 scalar fusion is cut; the rev-3.0 representation-level conditioned encoder becomes the active G5 build line.",
-  "sections": [
-    {
-      "heading": "Decision",
-      "html": "<div class='card rejected'><h3>Binding verdict: cut</h3><p>The fixed Seed-0 run at commit <code>60745f2</code> completed training, 2,037,171-row fp32 scoring, fidelity/cost diagnostics, and the registered gate. Both guards passed; clustering-MMD and matched BFS-macro GS/RD all failed strict dominance against <code>b0_cal_selfdensity</code>.</p><p><strong>Disposition:</strong> frozen-s0 <code>(s0,s1,s2)</code> scalar fusion is retained as a motivating result and ablation rung. The approved rev-3.0 stitched-topology-conditioned pair encoder is now the active G5 build line.</p></div>"
-    },
-    {
-      "heading": "Formal result",
-      "html": "<div class='table-scroll'><table><thead><tr><th>Arm</th><th>GS</th><th>BFS-macro RD</th><th>Degree MMD</th><th>Clustering MMD</th><th>Spectral MMD</th><th>Non-self edges</th></tr></thead><tbody><tr><td>B0</td><td>0.312151</td><td>0.422345</td><td>13.0768</td><td>11.9273</td><td>18.0931</td><td>30,059</td></tr><tr><td>B0+cal self-density</td><td>0.347100</td><td>1.718872</td><td>10.1085</td><td>10.1994</td><td>5.4743</td><td>274,898</td></tr><tr><td>EgoStitch, canonical quota</td><td>0.312438</td><td>0.422503</td><td>13.0415</td><td>11.8556</td><td>18.0916</td><td>30,059</td></tr><tr><td>EgoStitch at self-density quota</td><td>0.346948</td><td>1.717802</td><td>—</td><td>—</td><td>—</td><td>274,898</td></tr></tbody></table></div><p class='hint'>Registered differences versus the best comparator: clustering-MMD −1.656249; matched GS −0.000152; matched RD −0.001070. All fail. Matched edge AUPRC is 0.732468 versus B0 0.730260; degree MMD 13.0415 is below the 14.3845 guard limit. Both guards pass.</p>"
-    },
-    {
-      "heading": "What the repaired run establishes",
-      "html": "<div class='grid cols-2'><div class='card'><h3>Numerics repaired</h3><p><code>s1</code> is O(1) at epoch 1 (2.19 ± 0.058), and candidate logits are stored at full fp32 resolution. The old BF16-grid and constant-membership explanations are closed.</p></div><div class='card'><h3>Selection blind spot</h3><p>The registered AUPRC-first rule selected reconstruction-only epoch 1: validation AUPRC 0.952522 before <code>L_edge</code> activates. The formal residual/S0 std ratio is 7.95×10⁻4 and Spearman vs S0 is 0.999937.</p></div><div class='card'><h3>Measured gradient competition</h3><p>Median gradient norms: edge 0.0375, reconstruction 20.64, realism 66.28, SSL 0.00367. The Kendall trigger stayed off because two high families raised the median; low-side edge starvation was not its registered trigger.</p></div><div class='card'><h3>Weak imagination fidelity</h3><p>Slot recall@k is zero on train and test; clustering correlation is weak, and realized degree stays roughly flat while expected-degree deciles rise. The topology apparatus is not load-bearing under this contract.</p></div></div>"
-    },
-    {
-      "heading": "Epoch-30 diagnostic-only audit",
-      "html": "<p><code>last.pt</code> was scored after the formal verdict under the same evaluator. It is not a second binding result.</p><div class='table-scroll'><table><thead><tr><th>Metric</th><th>best.pt</th><th>last.pt diagnostic</th><th>Difference</th></tr></thead><tbody><tr><td>GS</td><td>0.312438</td><td>0.320038</td><td>+0.007600</td></tr><tr><td>BFS-macro RD</td><td>0.422503</td><td>0.426381</td><td>+0.003877</td></tr><tr><td>Degree MMD</td><td>13.0415</td><td>13.3117</td><td>+0.2702, worse</td></tr><tr><td>Clustering MMD</td><td>11.8556</td><td>11.8294</td><td>−0.0262, better</td></tr><tr><td>Spectral MMD</td><td>18.0916</td><td>18.5334</td><td>+0.4418, worse</td></tr><tr><td>Hard-feature AUPRC</td><td>0.617985</td><td>0.634104</td><td>+0.016120</td></tr><tr><td>Residual/S0 std ratio</td><td>0.000795</td><td>0.139816</td><td>ranking is live</td></tr></tbody></table></div><p class='hint'>The diagnostic checkpoint passes matched GS but still fails matched RD and clustering-MMD. Selection suppresses real learned signal, but changing selection alone does not reverse the cut.</p>"
-    },
-    {
-      "heading": "Successor landing state",
-      "html": "<div class='table-scroll'><table><thead><tr><th>Landing condition</th><th>Status</th><th>Boundary</th></tr></thead><tbody><tr><td>Frozen-s0 screen published</td><td><span class='chip'>SATISFIED</span></td><td>Binding <code>cut</code>; result note published.</td></tr><tr><td>Rewrite §5/§13 to rev 3.0</td><td><span class='chip'>NEXT</span></td><td>Must carry change-log lines; no silent implementation drift.</td></tr><tr><td>Fresh five-arm registration</td><td><span class='chip'>PENDING</span></td><td>Four-logit report, probes, <code>f_logit</code> liveness, attribution rule, measured H20 cost. Unresolved defaults remain unbound.</td></tr><tr><td>E2E implementation and screen</td><td><span class='chip'>PENDING</span></td><td>Runs only after Phase 0 lands; B0.py remains untouched.</td></tr></tbody></table></div><p><strong>Evidence boundary:</strong> the frozen-s0 result is a one-seed engineering screen. It supports a mechanism cut, not significance or cross-seed robustness. E1/E3 remain ≥3-seed Holm evaluations.</p><p class='ev'><code>docs/results/G5-stage1-seed0-20260717.md</code> · <code>outputs/egostitch_stage1/formal_gate/</code> · checkpoint <code>56b91c17fa8d3b86</code> · registration <code>97e61a7d…</code></p>"
-    }
-  ],
-  "artifact": "freeform",
-  "generated": "2026-07-17 04:27 EDT"
-}
-</script>
-
-<div class="wrap">
+<main class="wrap">
   <header class="masthead">
-    <div class="eyebrow" id="eyebrow"></div>
-    <h1 id="title"></h1>
-    <p class="dek" id="dek"></p>
-    <div class="meta" id="meta"></div>
+    <h1>EgoStitch rev-3.1</h1>
   </header>
 
-  <div class="decision" id="decision-box">
-    <h2>The decision on this page</h2>
-    <p id="decision"></p>
-  </div>
-
-  <div id="content"></div>
-
-  <section id="items-sec">
-    <h2 class="sec" id="items-heading">Choose</h2>
-    <div class="grid cols-2" id="items"></div>
+  <section>
+    <h2 class="sec">Current status</h2>
+    <div class="card active body-copy">
+      <p><span class="chip active">ACTIVE</span> Rev-3.1 implementation and pre-binding qualification work are in progress. The v3 registration remains <code>DRAFT</code>: G3.4 and G3.5 still require <code>V_fit</code>-only GPU calibration, and neither the prospective <code>V_qual</code> rehearsal nor formal execution is authorized until those thresholds and the implementation are frozen.</p>
+    </div>
   </section>
-</div>
 
-<div class="rtbar" id="rtbar">
-  <span class="tally" data-rt-tally></span>
-  <span class="hint">Your choices here paste back into Claude as JSON.</span>
-  <button class="copy-btn" data-rt-copy>Copy result ↓</button>
-</div>
+  <section>
+    <h2 class="sec">Core method</h2>
+    <pre class="equation">S_u = Imagine(TokenizeLite(x_u), G(u)) = {(h_u^k, π_u^k, m_u^k, g_u^k, Â_u)}_{k=1..K}
+C^Π_kl = (5/4)‖h_i^k − h_j^l‖² + (5/16)|π_i^k − π_j^l|;   Π = Sinkhorn(C^Π)
+T̂_ij = Scaffold(S_i, S_j, Π; STAR, INTRA, ALIGN, CLOSE)
+c_topo = STE(T̂_ij);   c_cont = ContentTokens(S_i, S_j);   z_pair = Trunk(tok_i, tok_j)
+z′ = z_pair + active_topo·tanh(g_topo)(XAttn(z_pair,c_topo)−μ_topo)
+             + active_cont·tanh(g_cont)(XAttn(z_pair,c_cont)−μ_cont)
+p(edge(i,j)=1) = σ(head(abba_max(z′_AB, z′_BA)))</pre>
+    <div class="grid cols-2 body-copy">
+      <div class="card">
+        <h3>1 · Tokenize-lite and ego-slot imagination</h3>
+        <p>Each unseen endpoint is encoded from its frozen node features and decoded into <code>K</code> soft neighbor slots carrying content <code>h</code>, existence <code>π</code>, multiplicity <code>m</code>, grounding confidence <code>g</code>, and slot adjacency <code>Â</code>. Exact top-50 cosine retrieval supplies a secondary grounding vocabulary; it is not treated as observed topology.</p>
+        <p>The learned-query, fixed-cardinality set decoder and bipartite set supervision descend from <a href="https://arxiv.org/abs/2005.12872">DETR (Carion et al., 2020)</a>; EgoStitch changes object queries into imagined neighbor slots and adds existence, multiplicity, and adjacency heads.</p>
+      </div>
 
-<script>
-/* roundtrip.js — selection state + "Copy result" for html-doc documents.
- *
- * The whole point of this file: what you decide while reading the document has
- * to get back into Claude's context. It does that by serializing your choices
- * into one fixed JSON envelope you paste into the chat.
- *
- * Contract — the document marks things up, this script does the rest:
- *
- *   data-rt-item="<id>"        on a <tr> or .card — one selectable thing
- *     button[data-state=include|reject]   tri-state toggle inside that item
- *     [data-rt-reason]                    reason input, shown once rejected
- *     [data-rt-note]                      free-text note on that item
- *   data-rt-param="<key>"      any input/select — a document-level parameter
- *
- * Envelope (identical across every template, so paste-back never needs guessing):
- *
- *   { artifact, doc, generated, selection: [id],
- *     rejected: [{id, reason}], params: {k: v}, notes: {id: text} }
- *
- * State survives reload via localStorage, keyed by doc id. No network, no server.
- */
-(function (global) {
-  'use strict';
+      <div class="card">
+        <h3>2 · Hungarian slot supervision</h3>
+        <p>Predicted slots are matched to training-message neighbors with a compound feature, degree-bucket, and overlap cost. Matched slots receive feature and existence targets; unmatched slots are trained toward absence. Target sampling is keyed by biological node identity, seed, and epoch so the same node receives the same target subset across pairs, directions, and ranks.</p>
+        <p>The one-to-one assignment is the set-prediction mechanism used by <a href="https://arxiv.org/abs/2005.12872">DETR (Carion et al., 2020)</a>; here it supervises an unordered ego network rather than a detected-object set.</p>
+      </div>
 
-  var Roundtrip = {
-    artifact: 'freeform',
-    doc: 'untitled',
-    items: {},   // id -> 'include' | 'reject' | null
-    reasons: {}, // id -> string
-    notes: {},   // id -> string
-    onchange: null
-  };
+      <div class="card">
+        <h3>3 · Sinkhorn alignment and stitched scaffold</h3>
+        <p>A differentiable transport plan <code>Π</code> aligns the two imagined slot sets. The pair scaffold retains both endpoint anchors and both slot sets, then adds star edges, within-ego adjacency, cross-ego alignment, and a closure edge type. The closed-wedge feature <code>t_k=[ΠÂ̊_otherΠᵀ]_{kk}</code> exposes higher-order overlap without importing an observed test graph.</p>
+        <p>Entropic transport follows <a href="https://arxiv.org/abs/1306.0895">Sinkhorn distances (Cuturi, 2013)</a>. <a href="https://arxiv.org/abs/2111.05366">GOAT (Saad-Eldin et al., 2021)</a> and <a href="https://arxiv.org/abs/2301.12721">SLOTAlign (Tang et al., 2023)</a> align observed graphs as the task; EgoStitch uses transport internally to stitch two generated ego networks before edge classification.</p>
+      </div>
 
-  function storageKey() { return 'html-doc:' + Roundtrip.artifact + ':' + Roundtrip.doc; }
+      <div class="card">
+        <h3>4 · Structure-only scaffold encoder</h3>
+        <p>The STE applies three edge-weighted message-passing layers to structural scaffold tokens. Its inputs contain anchor labels, <code>π</code>, <code>m</code>, per-edge-type soft degrees, and closed-wedge mass—never slot content <code>h</code>, grounded identity, or the pair label.</p>
+        <p>The local-subgraph principle follows <a href="https://arxiv.org/abs/1802.09691">SEAL (Zhang and Chen, 2018)</a>, while shared-neighbor structure is motivated by <a href="https://arxiv.org/abs/2302.00890">NCN (Wang et al., 2023)</a>. EgoStitch’s protocol difference is that the encoded subgraph is generated from endpoint features rather than extracted from an observed test graph.</p>
+      </div>
 
-  function save() {
-    try {
-      localStorage.setItem(storageKey(), JSON.stringify({
-        items: Roundtrip.items, reasons: Roundtrip.reasons, notes: Roundtrip.notes
-      }));
-    } catch (e) { /* private browsing / disabled storage — state just won't persist */ }
-  }
+      <div class="card">
+        <h3>5 · Separate content pathway</h3>
+        <p>Slot content, soft existence, grounding confidence, matched-identity probability, and counterpart-membership remain in <code>c_cont</code>. Keeping this pathway separate from the STE makes a topology-only null measurable instead of allowing content to masquerade as structure.</p>
+        <p>This graph-to-token interface is related to <a href="https://arxiv.org/abs/2402.05862">GraphToken (Perozzi et al., 2024)</a>; EgoStitch uses separate generated-structure and slot-content token streams to condition a binary pair classifier.</p>
+      </div>
 
-  function restore() {
-    try {
-      var raw = localStorage.getItem(storageKey());
-      if (!raw) return;
-      var s = JSON.parse(raw);
-      Roundtrip.items = s.items || {};
-      Roundtrip.reasons = s.reasons || {};
-      Roundtrip.notes = s.notes || {};
-    } catch (e) { /* corrupt or unavailable — start clean */ }
-  }
+      <div class="card">
+        <h3>6 · Centered gated pair conditioning</h3>
+        <p>A from-scratch Siamese pair trunk receives topology and content through separate cross-attention residuals in its last pair block. Each residual is centered by a synchronized active-row mean and scaled by a zero-initialized <code>tanh</code> gate, so a pathway must learn pair-varying evidence rather than a constant offset.</p>
+        <p>Zero-initialized gated cross-attention follows the fusion pattern of <a href="https://arxiv.org/abs/2204.14198">Flamingo (Alayrac et al., 2022)</a>; EgoStitch injects generated graph context into a from-scratch symmetric edge classifier rather than images into a frozen language model.</p>
+      </div>
 
-  /** Current state as the canonical envelope. */
-  Roundtrip.envelope = function () {
-    var selection = [], rejected = [], params = {}, notes = {};
+      <div class="card">
+        <h3>7 · Checkpoint-exact pathway nulls</h3>
+        <p>The same checkpoint publishes <code>full</code>, pair-only <code>f_logit</code>, pair-plus-content, and pair-plus-topology logits. Training drops topology and content branches independently with probability <code>0.15</code>; evaluation uses exact hard bypasses, and every null preserves <code>p(i,j)=p(j,i)</code>.</p>
+        <p>The branch-training idea follows <a href="https://arxiv.org/abs/2005.13616">modality dropout (Abdelaziz et al., 2020)</a>; here it supports within-checkpoint mechanism attribution rather than missing-modality robustness alone.</p>
+      </div>
 
-    Object.keys(Roundtrip.items).forEach(function (id) {
-      var st = Roundtrip.items[id];
-      if (st === 'include') selection.push(id);
-      else if (st === 'reject') {
-        rejected.push({ id: id, reason: (Roundtrip.reasons[id] || '').trim() || null });
-      }
-    });
+      <div class="card">
+        <h3>8 · Relational repair objectives</h3>
+        <p><code>L_ptr</code> grounds eligible slots, <code>L_align</code> rewards double-Hungarian same-identity transport cells, <code>L_div</code> prevents unmatched-slot collapse, and logit-space <code>L_slotadj</code> sharpens adjacency learning. An STE-only auxiliary head predicts <code>log1p</code> common-neighbor count and neighborhood Jaccard for every positive and negative training pair, then is discarded before scoring.</p>
+        <p>The relational targets use the common-neighbor signal formalized for neural link prediction by <a href="https://arxiv.org/abs/2302.00890">NCN (Wang et al., 2023)</a>; EgoStitch uses them only as train-side pressure on a generated-scaffold representation.</p>
+      </div>
+    </div>
+  </section>
 
-    document.querySelectorAll('[data-rt-param]').forEach(function (el) {
-      var key = el.getAttribute('data-rt-param');
-      var val;
-      if (el.type === 'checkbox') val = el.checked;
-      else if (el.type === 'number' || el.type === 'range') val = Number(el.value);
-      else val = el.value;
-      params[key] = val;
-    });
+  <section>
+    <h2 class="sec">Training objective</h2>
+    <pre class="equation">L = L_edge + 0.5 L_real + 0.1 L_ssl + 1.0 L_recon
 
-    Object.keys(Roundtrip.notes).forEach(function (id) {
-      var t = (Roundtrip.notes[id] || '').trim();
-      if (t) notes[id] = t;
-    });
+L_recon = 1.0 L_feat + 0.5 L_exist + 0.25 L_mult + 0.5 L_deg
+        + 0.5 L_slotadj + 0.25 L_gate + 0.25 L_ptr
+        + 0.5 L_align + 0.1 L_div + 0.25 L_rel</pre>
+    <div class="card body-copy">
+      <p><code>L_edge</code> is the binary queried-pair objective. <code>L_real</code> matches generated and real train-side ego statistics and random-GIN embeddings; <code>L_ssl</code> enforces feature-noise and pool-resampling consistency. Only <code>L_feat</code>, <code>L_exist</code>, <code>L_mult</code>, and <code>L_deg</code> anneal from 1.0 to 0.25 during the edge-active phase; the relational repair terms remain fully weighted.</p>
+    </div>
+  </section>
 
-    return {
-      artifact: Roundtrip.artifact,
-      doc: Roundtrip.doc,
-      generated: new Date().toISOString(),
-      selection: selection,
-      rejected: rejected,
-      params: params,
-      notes: notes
-    };
-  };
+  <section>
+    <h2 class="sec">G3 · Pre-binding diagnosis</h2>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Gate</th><th>Measurement</th><th>Exact criterion</th><th>Current binding state</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>G3.1</code></td>
+            <td>Full-arm slot recall at <code>n_ground=50</code></td>
+            <td><code>≥ 0.0698</code>, half the measured top-50 ceiling <code>0.13952495387963418</code></td>
+            <td><span class="chip active">FROZEN</span></td>
+          </tr>
+          <tr>
+            <td><code>G3.2</code></td>
+            <td><code>Π</code>-consistency v2: transport mass on double-Hungarian same-identity cells / total mass</td>
+            <td><code>&gt; 0.05</code></td>
+            <td><span class="chip active">FROZEN</span></td>
+          </tr>
+          <tr>
+            <td><code>G3.3</code></td>
+            <td>Degree-partialled clustering probe <code>R²</code> from frozen STE states</td>
+            <td><code>≥ 0.10</code></td>
+            <td><span class="chip active">FROZEN</span></td>
+          </tr>
+          <tr>
+            <td><code>G3.4</code></td>
+            <td><code>clustering-MMD(6a-v3) − clustering-MMD(full)</code></td>
+            <td>Must exceed the evaluator bootstrap noise floor</td>
+            <td><span class="chip pending">V_fit CALIBRATION REQUIRED</span></td>
+          </tr>
+          <tr>
+            <td><code>G3.5</code></td>
+            <td>Matched edge-AUPRC of <code>full</code> relative to the registered matched reference</td>
+            <td>Must pass the frozen matched edge-AUPRC guard</td>
+            <td><span class="chip pending">V_fit CALIBRATION REQUIRED</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="hint">G3.4 and G3.5 deliberately have no invented number: both thresholds must be measured on <code>V_fit</code>, frozen before any <code>V_qual</code> access, and then evaluated prospectively.</p>
 
-  /** Every element carrying this item id. Matched by attribute value rather than
-   *  by building a selector, so an id containing a quote or a colon can't break it. */
-  Roundtrip.elementsFor = function (id) {
-    return Array.prototype.filter.call(
-      document.querySelectorAll('[data-rt-item]'),
-      function (el) { return el.getAttribute('data-rt-item') === id; }
-    );
-  };
+    <div class="grid cols-2 body-copy" style="margin-top:14px">
+      <div class="card">
+        <h3>Qualification sequence</h3>
+        <p><code>V_fit</code> calibration → freeze thresholds and implementation → one prospective <code>V_qual</code> rehearsal, with at most three disclosed attempts. Any failed G3 gate blocks binding. <code>V_select</code> remains sealed until the first bound formal run.</p>
+      </div>
+      <div class="card note">
+        <h3>Collapse abort</h3>
+        <p>After conditioning activates, abort as <code>training_invalid(slot_collapse)</code> if mean pairwise slot-<code>h</code> cosine is <code>&gt; 0.95</code> or <code>‖Π−rcᵀ/m‖F / ‖Π‖F &lt; 0.05</code> for two consecutive validations.</p>
+      </div>
+    </div>
+  </section>
 
-  /** Paint an item's row/card to match its state. */
-  function paint(id) {
-    var st = Roundtrip.items[id] || null;
-    Roundtrip.elementsFor(id).forEach(function (el) {
-      el.classList.toggle('included', st === 'include');
-      el.classList.toggle('rejected', st === 'reject');
-      el.querySelectorAll('button[data-state]').forEach(function (b) {
-        b.setAttribute('aria-pressed', String(b.getAttribute('data-state') === st));
-      });
-      var reason = el.querySelector('[data-rt-reason]');
-      if (reason) reason.value = Roundtrip.reasons[id] || '';
-      var note = el.querySelector('[data-rt-note]');
-      if (note) note.value = Roundtrip.notes[id] || '';
-    });
-  }
-
-  /* onchange fires only when the *selection* changes — never on a repaint.
-   * A repaint that fired onchange would recurse without end for any document
-   * whose onchange re-renders its list (litreview does, to re-run its filter). */
-  function tally(fireChange) {
-    var inc = 0, rej = 0, total = document.querySelectorAll('[data-rt-item]').length;
-    Object.keys(Roundtrip.items).forEach(function (id) {
-      if (Roundtrip.items[id] === 'include') inc++;
-      else if (Roundtrip.items[id] === 'reject') rej++;
-    });
-    var el = document.querySelector('[data-rt-tally]');
-    if (el) {
-      el.innerHTML = '<b>' + inc + ' included</b> · <i>' + rej + ' rejected</i> · ' +
-        (total - inc - rej) + ' undecided';
-    }
-    if (fireChange && typeof Roundtrip.onchange === 'function') Roundtrip.onchange(inc, rej, total);
-  }
-
-  /** Set an item's state; passing the state it already has clears it. */
-  Roundtrip.set = function (id, state) {
-    Roundtrip.items[id] = (Roundtrip.items[id] === state) ? null : state;
-    if (Roundtrip.items[id] !== 'reject') delete Roundtrip.reasons[id];
-    save(); paint(id); tally(true);
-  };
-
-  /** Copy the envelope to the clipboard. Falls back to execCommand, which is what
-   *  actually fires when the async clipboard API is blocked on file:// origins. */
-  Roundtrip.copy = function (btn) {
-    var text = JSON.stringify(Roundtrip.envelope(), null, 2);
-
-    var ok = function () {
-      if (!btn) return;
-      var old = btn.textContent;
-      btn.textContent = '✓ Copied — paste into Claude';
-      btn.classList.add('done');
-      setTimeout(function () { btn.textContent = old; btn.classList.remove('done'); }, 2200);
-    };
-    var fallback = function () {
-      var ta = document.createElement('textarea');
-      ta.value = text;
-      ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
-      document.body.appendChild(ta);
-      ta.select();
-      var done = false;
-      try { done = document.execCommand('copy'); } catch (e) { done = false; }
-      document.body.removeChild(ta);
-      if (done) ok();
-      else global.prompt('Copy this JSON and paste it into Claude:', text);
-    };
-
-    if (global.navigator && navigator.clipboard && global.isSecureContext) {
-      navigator.clipboard.writeText(text).then(ok, fallback);
-    } else {
-      fallback();
-    }
-  };
-
-  /** Wire up the document. Call once, after the items exist in the DOM. */
-  Roundtrip.init = function (opts) {
-    Roundtrip.artifact = opts.artifact || Roundtrip.artifact;
-    Roundtrip.doc = opts.doc || Roundtrip.doc;
-    restore();
-
-    document.addEventListener('click', function (e) {
-      var btn = e.target.closest('button[data-state]');
-      if (!btn) return;
-      var item = btn.closest('[data-rt-item]');
-      if (!item) return;
-      Roundtrip.set(item.getAttribute('data-rt-item'), btn.getAttribute('data-state'));
-    });
-
-    document.addEventListener('input', function (e) {
-      var item = e.target.closest('[data-rt-item]');
-      if (item && e.target.hasAttribute('data-rt-reason')) {
-        Roundtrip.reasons[item.getAttribute('data-rt-item')] = e.target.value;
-        save();
-      } else if (item && e.target.hasAttribute('data-rt-note')) {
-        Roundtrip.notes[item.getAttribute('data-rt-item')] = e.target.value;
-        save();
-      } else if (e.target.hasAttribute('data-rt-param')) {
-        var out = document.querySelector('[data-rt-param-out="' + e.target.getAttribute('data-rt-param') + '"]');
-        if (out) out.textContent = e.target.value;
-        save();
-      }
-    });
-
-    var copyBtn = document.querySelector('[data-rt-copy]');
-    if (copyBtn) copyBtn.addEventListener('click', function () { Roundtrip.copy(copyBtn); });
-
-    Roundtrip.repaint();
-  };
-
-  /** Re-apply state to the DOM. Call after re-rendering a list (sort, filter). */
-  Roundtrip.repaint = function () {
-    document.querySelectorAll('[data-rt-item]').forEach(function (el) {
-      paint(el.getAttribute('data-rt-item'));
-    });
-    document.querySelectorAll('[data-rt-param]').forEach(function (el) {
-      var out = document.querySelector('[data-rt-param-out="' + el.getAttribute('data-rt-param') + '"]');
-      if (out) out.textContent = el.value;
-    });
-    tally(false);
-  };
-
-  global.Roundtrip = Roundtrip;
-})(window);
-
-</script>
-
-<script>
-(function () {
-  'use strict';
-  var DATA = JSON.parse(document.getElementById('doc-data').textContent);
-
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-    });
-  }
-  function text(id, v) { var el = document.getElementById(id); if (el) el.textContent = v || ''; }
-
-  text('eyebrow', DATA.eyebrow || '');
-  text('title', DATA.title);
-  text('dek', DATA.dek);
-  text('meta', 'generated ' + (DATA.generated || ''));
-  document.title = DATA.title || 'Document';
-
-  if (DATA.decision) text('decision', DATA.decision);
-  else document.getElementById('decision-box').hidden = true;
-
-  /* Sections carry authored HTML. Claude writes this file, so the markup is
-     trusted the same way the rest of the template is — that is precisely what
-     buys the SVG, the tables and the layout that Markdown cannot express. */
-  document.getElementById('content').innerHTML = (DATA.sections || []).map(function (s) {
-    return '<section>' +
-      (s.heading ? '<h2 class="sec">' + esc(s.heading) + '</h2>' : '') +
-      '<div class="body-copy">' + (s.html || '') + '</div>' +
-    '</section>';
-  }).join('');
-
-  var items = DATA.items || [];
-  if (!items.length) {
-    document.getElementById('items-sec').hidden = true;
-    document.getElementById('rtbar').hidden = true;   // read-only doc: no bar to nag with
-  } else {
-    text('items-heading', DATA.items_heading || 'Choose');
-    document.getElementById('items').innerHTML = items.map(function (it) {
-      return '' +
-      '<div class="card" data-rt-item="' + esc(it.id) + '">' +
-        '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start">' +
-          '<div><code>' + esc(it.id) + '</code><h3 style="margin:6px 0 4px">' + esc(it.name) + '</h3></div>' +
-          '<span class="tri">' +
-            '<button data-state="include" aria-pressed="false" title="Yes">✓</button>' +
-            '<button data-state="reject" aria-pressed="false" title="No">✗</button>' +
-          '</span>' +
-        '</div>' +
-        (it.desc ? '<p style="color:var(--ink-2);font-size:14px;margin:0 0 8px">' + esc(it.desc) + '</p>' : '') +
-        (it.tags || []).map(function (t) { return '<span class="chip">' + esc(t) + '</span> '; }).join('') +
-        '<div class="reason"><input data-rt-reason type="text" placeholder="Why not?"></div>' +
-        '<div class="notewrap"><input data-rt-note type="text" placeholder="Note…"></div>' +
-      '</div>';
-    }).join('');
-  }
-
-  Roundtrip.init({ artifact: 'freeform', doc: DATA.doc || 'doc' });
-})();
-</script>
+  <section>
+    <h2 class="sec">G4 · Eight-arm mechanism screen</h2>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Arm</th><th>Type</th><th>Difference from full</th><th>Diagnostic question</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>full</code></td><td>Trained</td><td>Complete rev-3.1 model; <code>n_ground=50</code>, <code>w_rel=0.25</code></td><td>Does the complete conditioned encoder carry useful relational topology?</td></tr>
+          <tr><td><code>b0_e2e_f_only</code></td><td>Trained null</td><td>Permanent all-head bypass; score <code>f_logit</code></td><td>What does the from-scratch pair trunk achieve without generated context?</td></tr>
+          <tr><td><code>pair_topology</code></td><td>Trained null</td><td>Permanent content-head bypass</td><td>Does the topology pathway work without slot-content evidence?</td></tr>
+          <tr><td><code>p0</code></td><td>Trained ablation</td><td><code>p_topo=p_cont=0</code></td><td>Is branch dropout necessary to keep both pathways usable?</td></tr>
+          <tr><td><code>cosine_pool</code></td><td>Trained ablation</td><td>Status-quo cosine grounding with <code>n_ground=20</code></td><td>Does the wider grounding vocabulary matter?</td></tr>
+          <tr><td><code>no_l_rel</code></td><td>Trained ablation</td><td><code>w_rel=0</code>; relational head otherwise absent from scoring in every arm</td><td>Does train-side relational pressure create the useful STE representation?</td></tr>
+          <tr><td><code>6a-v3</code></td><td>Scoring control</td><td>Permute slot axes of <code>Â_src</code>, <code>Â_dst</code>, and <code>Π</code>, then rebuild the scaffold</td><td>Is the model sensitive to the binding between slots and relational structure?</td></tr>
+          <tr><td><code>6e-v1</code></td><td>Scoring control</td><td>Checkerboard-rewire <code>π</code>-weighted slot adjacency and <code>Π</code> directly; preserve rebuilt STAR/INTRA/ALIGN degrees while allowing CLOSE degree to move</td><td>Does the model use higher-order connectivity beyond the preserved soft-degree channels?</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="card body-copy" style="margin-top:14px">
+      <p><strong>After G3:</strong> if all five qualification gates pass, the owner may replace every unresolved marker and bind an immutable v3 registration. Formal execution then runs <code>full</code> first on the previously sealed <code>V_select</code>; only an eligible, live, registration-matched full checkpoint unlocks the other five trained arms. The two controls reuse <code>full</code>'s checkpoint. The screen remains fixed-Seed-0 engineering evidence, not significance or cross-seed robustness.</p>
+    </div>
+  </section>
+</main>
 </body>
 </html>

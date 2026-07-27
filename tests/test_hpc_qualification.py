@@ -96,7 +96,11 @@ def test_e2e_configs_pin_training_contract_and_registration() -> None:
         runtime = config["runtime"]
         assert isinstance(runtime, dict)
         assert runtime["world_size"] == "auto"
-        assert runtime["token_budget_candidates"] == [128]
+        # Halved from v2's 128 on 2026-07-27: rev-3.1's working set reached
+        # 92.71 GiB allocated at 128 and OOM'd a 95 GiB H20 even with
+        # fragmentation eliminated. For EgoStitch this key is the per-rank
+        # node-stream batch B_n, not a token count.
+        assert runtime["token_budget_candidates"] == [64]
         assert runtime["setup_probe_budget_seconds"] == 2100
         assert runtime["train_eval_budget_seconds"] == 26400
         assert runtime["total_budget_seconds"] == 30300
