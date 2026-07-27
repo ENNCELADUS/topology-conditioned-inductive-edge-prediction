@@ -210,6 +210,52 @@ def test_rehearsal_refuses_gates_that_have_no_evaluator() -> None:
     assert "check-implementable" in text
 
 
+def test_rehearsal_ledger_is_claimed_atomically() -> None:
+    # A check-then-act guard lets two concurrent rehearsals both pass and open
+    # V_qual twice; exclusive create is the atomic primitive.
+    text = RUNNER.read_text()
+    ledger = text[
+        text.index("assert_single_v_qual_rehearsal()") : text.index(
+            "assert_implementation_frozen()"
+        )
+    ]
+    assert 'open(path, "x"' in ledger
+    assert "FileExistsError" in ledger
+    assert "already spent" in ledger
+
+
+def test_rehearsal_verifies_the_implementation_freeze() -> None:
+    text = RUNNER.read_text()
+    rehearsal = text[text.index("run_rehearsal()") : text.index("formal_config()")]
+    # Must precede both the ledger claim and any V_qual access.
+    assert rehearsal.index("assert_implementation_frozen") < rehearsal.index(
+        "assert_single_v_qual_rehearsal"
+    )
+    assert rehearsal.index("assert_implementation_frozen") < rehearsal.index(
+        "--run-kind rehearsal"
+    )
+    guard = text[
+        text.index("assert_implementation_frozen()") : text.index(
+            "write_calibration_freeze_manifest()"
+        )
+    ]
+    assert "implementation_commit" in guard
+    assert "config_sha256" in guard
+    assert "git status --porcelain" in guard
+    # The registration digest must NOT be compared: freezing the calibrated
+    # thresholds into the DRAFT is exactly what happens between the stages.
+    assert "registration digest drifted" not in guard
+
+
+def test_calibration_records_the_freeze_manifest() -> None:
+    text = RUNNER.read_text()
+    calibration = text[text.index("run_calibration()") : text.index("run_rehearsal()")]
+    assert "write_calibration_freeze_manifest" in calibration
+    assert calibration.index("evaluate_stage_gates") < calibration.index(
+        "write_calibration_freeze_manifest"
+    )
+
+
 def test_single_v_qual_rehearsal_is_enforced_across_attempts() -> None:
     text = RUNNER.read_text()
     rehearsal = text[text.index("run_rehearsal()") : text.index("formal_config()")]

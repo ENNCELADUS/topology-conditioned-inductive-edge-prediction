@@ -103,23 +103,91 @@ readonly REHEARSAL_LEDGER="${REPO_ROOT}/outputs/egostitch_e2e_stage1_v3/qualific
 
 assert_single_v_qual_rehearsal() {
   local attempt="$1"
-  [[ ! -e "${REHEARSAL_LEDGER}" ]] || \
-    fail "the single registered V_qual rehearsal is already spent: ${REHEARSAL_LEDGER}"
   mkdir -p "$(dirname "${REHEARSAL_LEDGER}")"
+  # Exclusive create, not exists-then-write: two rehearsals racing would both
+  # pass a check-then-act guard and open V_qual twice. open(..., "x") is the
+  # atomic primitive; the loser gets FileExistsError and stops here.
   "${PYTHON_BIN}" -c '
 import json, sys
-from pathlib import Path
-path = Path(sys.argv[1])
-if path.exists():
-    raise SystemExit("rehearsal ledger appeared concurrently: %s" % path)
-path.write_text(json.dumps({
-    "attempt": sys.argv[2],
-    "qualification_root": sys.argv[3],
-    "registration_sha256": sys.argv[4],
-}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+path, attempt, root, sha = sys.argv[1:5]
+payload = json.dumps(
+    {"attempt": attempt, "qualification_root": root, "registration_sha256": sha},
+    indent=2,
+    sort_keys=True,
+) + "\n"
+try:
+    with open(path, "x", encoding="utf-8") as handle:
+        handle.write(payload)
+except FileExistsError:
+    raise SystemExit("the single registered V_qual rehearsal is already spent: %s" % path)
 ' "${REHEARSAL_LEDGER}" "${attempt}" "${QUALIFICATION_ROOT}" "${REGISTRATION_SHA256_BEFORE}" || \
-    fail "could not record the V_qual rehearsal ledger"
+    fail "refusing to open V_qual: ${REHEARSAL_LEDGER}"
   echo "recorded the single V_qual rehearsal: ${REHEARSAL_LEDGER}"
+}
+
+# prebinding_qualification.protocol.threshold_freeze freezes *registration
+# content and implementation* before qualification. Checking only the thresholds
+# would let source or config drift between calibration and rehearsal, so the
+# sole V_qual attempt could be spent on a different implementation than the one
+# that produced its thresholds.
+assert_implementation_frozen() {
+  local calibration_manifest="$1"
+  [[ -s "${calibration_manifest}" ]] || \
+    fail "rehearsal requires the calibration freeze manifest: ${calibration_manifest}"
+  cd "${REPO_ROOT}"
+  local live_commit
+  live_commit="$(git rev-parse HEAD)"
+  [[ -z "$(git status --porcelain)" ]] || \
+    fail "rehearsal requires a clean checkout; the working tree has uncommitted changes"
+  "${PYTHON_BIN}" -c '
+import hashlib, json, sys
+from pathlib import Path
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+live_commit, config_path = sys.argv[2], Path(sys.argv[3])
+problems = []
+if manifest.get("implementation_commit") != live_commit:
+    problems.append(
+        "implementation commit drifted: calibration=%s live=%s"
+        % (manifest.get("implementation_commit"), live_commit)
+    )
+# The registration digest is deliberately NOT compared: freezing the calibrated
+# thresholds into the DRAFT is exactly what happens between the two stages, so
+# requiring equality here would make the rehearsal unreachable. Immutability
+# *during* each stage is enforced separately by assert_registration_unchanged.
+digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
+if manifest.get("config_sha256") != digest:
+    problems.append("config digest drifted: calibration=%s live=%s"
+                    % (manifest.get("config_sha256"), digest))
+if problems:
+    sys.stderr.write("\n".join(problems) + "\n")
+    raise SystemExit(1)
+' "${calibration_manifest}" "${live_commit}" "${FULL_CONFIG}" || \
+    fail "implementation/config/registration drifted since calibration; re-calibrate before rehearsing"
+  cd "${QUALIFICATION_ROOT}"
+  echo "implementation freeze verified against ${calibration_manifest}"
+}
+
+# Written at the end of calibration so the rehearsal has something to compare
+# against. Records what produced the thresholds, not what will consume them.
+write_calibration_freeze_manifest() {
+  local output="$1"
+  cd "${REPO_ROOT}"
+  local live_commit
+  live_commit="$(git rev-parse HEAD)"
+  "${PYTHON_BIN}" -c '
+import hashlib, json, sys
+from pathlib import Path
+output, commit, config_path, registration_path = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4])
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(json.dumps({
+    "implementation_commit": commit,
+    "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+    "registration_sha256": hashlib.sha256(registration_path.read_bytes()).hexdigest(),
+}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+' "${QUALIFICATION_ROOT}/${output}" "${live_commit}" "${FULL_CONFIG}" "${PREREGISTRATION}" || \
+    fail "could not write the calibration freeze manifest"
+  cd "${QUALIFICATION_ROOT}"
+  echo "recorded the calibration freeze manifest: ${output}"
 }
 
 select_all_visible_h20s() {
@@ -254,15 +322,19 @@ run_calibration() {
 
   echo "calibration stage 3/3: probes and pre-binding gates on V_fit"
   evaluate_stage_gates "${ATTEMPT_DIR}/calibration" calibration_fit
+  write_calibration_freeze_manifest "${ATTEMPT_DIR}/calibration_freeze.json"
+  assert_registration_unchanged
   echo "calibration completed; registration remains DRAFT"
   echo "measurements: ${ATTEMPT_DIR}/calibration/prebinding_gates.json"
 }
 
 run_rehearsal() {
   enter_qualification_attempt rehearsal
-  # All three preconditions are checked before a single V_qual row is read.
+  # Every precondition is checked before a single V_qual row is read, and the
+  # ledger is claimed last so a rejected rehearsal does not burn the one attempt.
   assert_prebinding_gates_frozen
   assert_prebinding_gates_implementable
+  assert_implementation_frozen "${ATTEMPT_DIR}/calibration_freeze.json"
   trap assert_registration_unchanged EXIT
   assert_single_v_qual_rehearsal "${ATTEMPT_NUMBER}"
 

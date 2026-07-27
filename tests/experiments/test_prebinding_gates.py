@@ -147,12 +147,12 @@ class TestUnreachableGates:
 
 
 class TestFailClosed:
-    def test_unknown_gate_name_raises_rather_than_being_skipped(self) -> None:
+    def test_unknown_gate_is_rejected_by_the_schema(self) -> None:
         registration = _registration()
         registration["prebinding_qualification"]["gates"].append(
             {"id": "G3.6", "name": "some_future_gate", "operator": ">", "threshold": 1.0}
         )
-        with pytest.raises(pg.GateEvaluationError, match="no evaluator"):
+        with pytest.raises(pg.GateEvaluationError, match="unexpected="):
             pg.build_gate_report(
                 registration,
                 _evaluation(slot_recall=0.12, pi_v2=0.2, clustering_r2=0.3),
@@ -187,6 +187,40 @@ class TestFailClosed:
             pg.load_prebinding_gates({"prebinding_qualification": {"gates": []}})
         with pytest.raises(pg.GateEvaluationError, match="prebinding_qualification"):
             pg.load_prebinding_gates({})
+
+    def test_dropped_gate_shrinks_nothing_and_raises(self) -> None:
+        # A freeze edit that deletes a gate must fail, not quietly leave a
+        # four-gate report that can still report complete/passed.
+        registration = _registration()
+        del registration["prebinding_qualification"]["gates"][4]
+        with pytest.raises(pg.GateEvaluationError, match="missing="):
+            pg.load_prebinding_gates(registration)
+
+    def test_duplicated_gate_raises(self) -> None:
+        registration = _registration()
+        gates = registration["prebinding_qualification"]["gates"]
+        gates[4] = dict(gates[0])
+        with pytest.raises(pg.GateEvaluationError, match="duplicate"):
+            pg.load_prebinding_gates(registration)
+
+    def test_renamed_gate_raises(self) -> None:
+        registration = _registration()
+        registration["prebinding_qualification"]["gates"][0]["name"] = "slot_recall"
+        with pytest.raises(pg.GateEvaluationError, match="missing="):
+            pg.load_prebinding_gates(registration)
+
+    def test_live_v3_registration_matches_the_pinned_schema(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        registration = json.loads(
+            (
+                repo_root
+                / "docs"
+                / "registrations"
+                / "g5_e2e_stage1_preregistration_v3.json"
+            ).read_text()
+        )
+        gates = pg.load_prebinding_gates(registration)
+        assert [(g["id"], g["name"]) for g in gates] == list(pg.REGISTERED_GATE_SCHEMA)
 
 
 class TestRegisteredNGround:
@@ -276,11 +310,17 @@ class TestUnimplementedGates:
     def test_reports_the_two_scoring_gates(self) -> None:
         assert pg.unimplemented_gates(_registration()) == ["G3.4", "G3.5"]
 
-    def test_empty_when_every_registered_gate_has_an_evaluator(self) -> None:
-        registration = _registration()
-        gates = registration["prebinding_qualification"]["gates"]
-        registration["prebinding_qualification"]["gates"] = gates[:3]
-        assert pg.unimplemented_gates(registration) == []
+    def test_empty_once_the_scoring_gates_gain_evaluators(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Simulates the future state after G3.4/G3.5 become reachable; the
+        # registered five-gate schema is unchanged.
+        monkeypatch.setattr(
+            pg,
+            "_PROBE_GATE_PATHS",
+            {name: ("x",) for _, name in pg.REGISTERED_GATE_SCHEMA},
+        )
+        assert pg.unimplemented_gates(_registration()) == []
 
     def test_frozen_thresholds_do_not_make_a_gate_implementable(self) -> None:
         # The review's P1: freezing G3.4/G3.5 must not be mistaken for

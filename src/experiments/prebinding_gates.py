@@ -105,6 +105,18 @@ def _extract(evaluation: Mapping[str, object], path: Sequence[str]) -> float:
     return float(cursor)
 
 
+#: The exact registered gate set. Pinned so that a hand edit during the
+#: threshold freeze cannot drop or duplicate a gate and leave a report that
+#: reads `complete` because the missing rows were never counted.
+REGISTERED_GATE_SCHEMA: tuple[tuple[str, str], ...] = (
+    ("G3.1", "slot_recall_at_n_ground"),
+    ("G3.2", "Pi_consistency_v2"),
+    ("G3.3", "degree_partialled_clustering_probe_r2"),
+    ("G3.4", "structure_control_6a_v3_clustering_mmd_movement"),
+    ("G3.5", "matched_edge_auprc_guard"),
+)
+
+
 def load_prebinding_gates(registration: Mapping[str, object]) -> list[Mapping[str, object]]:
     """Return the registered gate list, failing closed on a malformed block."""
     qualification = registration.get("prebinding_qualification")
@@ -120,7 +132,31 @@ def load_prebinding_gates(registration: Mapping[str, object]) -> list[Mapping[st
         if not isinstance(entry.get("id"), str) or not isinstance(entry.get("name"), str):
             raise GateEvaluationError("each prebinding gate needs a string id and name")
         parsed.append(entry)
+    _assert_exact_gate_schema(parsed)
     return parsed
+
+
+def _assert_exact_gate_schema(gates: Sequence[Mapping[str, object]]) -> None:
+    """Reject any gate list that is not exactly the registered five.
+
+    A dropped gate would otherwise shrink the tally rather than fail it, so
+    ``complete`` and ``passed`` could both become true against four gates.
+    Duplicates are rejected for the same reason: a repeated passing row must not
+    be able to stand in for a missing one.
+    """
+    observed = [(cast(str, gate["id"]), cast(str, gate["name"])) for gate in gates]
+    if len(set(observed)) != len(observed):
+        duplicates = sorted({pair for pair in observed if observed.count(pair) > 1})
+        raise GateEvaluationError(
+            f"prebinding_qualification.gates contains duplicate entries: {duplicates}"
+        )
+    if set(observed) != set(REGISTERED_GATE_SCHEMA):
+        missing = sorted(set(REGISTERED_GATE_SCHEMA) - set(observed))
+        unexpected = sorted(set(observed) - set(REGISTERED_GATE_SCHEMA))
+        raise GateEvaluationError(
+            "prebinding_qualification.gates does not match the registered schema; "
+            f"missing={missing} unexpected={unexpected}"
+        )
 
 
 def unimplemented_gates(registration: Mapping[str, object]) -> list[str]:
