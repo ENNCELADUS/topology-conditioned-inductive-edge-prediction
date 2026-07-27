@@ -49,7 +49,7 @@ import json
 import logging
 import math
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -136,11 +136,19 @@ def _default_grounding_cache_path(
     f0_cache: Path,
     *,
     n_ground: int,
+    node_ids: Iterable[str],
     method_id: str = POOL_METHOD_ID,
+    role_universe: str = "test",
 ) -> Path:
-    """Namespace a derived grounding cache by its pool method and size."""
+    """Namespace a derived grounding cache by pool configuration and universe."""
+    universe_payload = json.dumps(
+        {"role_universe": role_universe, "node_ids": sorted(set(node_ids))},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    universe_id = hashlib.sha256(universe_payload.encode("utf-8")).hexdigest()
     return f0_cache.with_name(
-        f"{f0_cache.stem}_grounding_{method_id}_n{n_ground}.npz"
+        f"{f0_cache.stem}_grounding_{method_id}_n{n_ground}_u{universe_id}.npz"
     )
 
 
@@ -1959,6 +1967,7 @@ def _score_egostitch_e2e(
         grounding_cache = _default_grounding_cache_path(
             f0_cache,
             n_ground=registered_n_ground,
+            node_ids=node_ids,
         )
     # The e2e generator's own-split n_ground default (spec Sec 13) assumes a
     # real candidate-universe scale (thousands of nodes); clamp to what this

@@ -244,6 +244,8 @@ def make_scaffold_input_perturbation(
 
         zero_src = adj_src - torch.diag_embed(torch.diagonal(adj_src, dim1=-2, dim2=-1))
         zero_dst = adj_dst - torch.diag_embed(torch.diagonal(adj_dst, dim1=-2, dim2=-1))
+        diagonal_src = torch.diag_embed(torch.diagonal(adj_src, dim1=-2, dim2=-1))
+        diagonal_dst = torch.diag_embed(torch.diagonal(adj_dst, dim1=-2, dim2=-1))
         weight_src = pi_src[:, :, None] * pi_src[:, None, :]
         weight_dst = pi_dst[:, :, None] * pi_dst[:, None, :]
         weighted_src = zero_src * weight_src
@@ -278,8 +280,12 @@ def make_scaffold_input_perturbation(
         rewired_plan = rewired[2 * batch_size :]
         rewired_src = 0.5 * (rewired_src + rewired_src.transpose(1, 2))
         rewired_dst = 0.5 * (rewired_dst + rewired_dst.transpose(1, 2))
-        perturbed_src = torch.where(weight_src > 0, rewired_src / weight_src, 0.0)
-        perturbed_dst = torch.where(weight_dst > 0, rewired_dst / weight_dst, 0.0)
+        perturbed_src = (
+            torch.where(weight_src > 0, rewired_src / weight_src, 0.0) + diagonal_src
+        )
+        perturbed_dst = (
+            torch.where(weight_dst > 0, rewired_dst / weight_dst, 0.0) + diagonal_dst
+        )
         perturbed_plan = torch.where(
             canonical_src[:, None, None],
             rewired_plan,
@@ -364,12 +370,6 @@ def build_scaffold(
         pi_src, pi_dst = slots_src.pi.float(), slots_dst.pi.float()
         mult_src, mult_dst = slots_src.mult.float(), slots_dst.mult.float()
         slot_adj_src, slot_adj_dst = slots_src.adj.float(), slots_dst.adj.float()
-        slot_adj_src = slot_adj_src - torch.diag_embed(
-            torch.diagonal(slot_adj_src, dim1=-2, dim2=-1)
-        )
-        slot_adj_dst = slot_adj_dst - torch.diag_embed(
-            torch.diagonal(slot_adj_dst, dim1=-2, dim2=-1)
-        )
         plan32 = plan.float()
         if perturbation is not None:
             slot_adj_src, slot_adj_dst, plan32 = perturbation(
@@ -379,6 +379,12 @@ def build_scaffold(
                 pi_src,
                 pi_dst,
             )
+        adj_src_zero = slot_adj_src - torch.diag_embed(
+            torch.diagonal(slot_adj_src, dim1=-2, dim2=-1)
+        )
+        adj_dst_zero = slot_adj_dst - torch.diag_embed(
+            torch.diagonal(slot_adj_dst, dim1=-2, dim2=-1)
+        )
         adj = torch.zeros(b, EDGE_TYPES, v, v, device=device, dtype=torch.float32)
         s_src = slice(2, 2 + k)
         s_dst = slice(2 + k, v)
@@ -398,8 +404,6 @@ def build_scaffold(
         adj[:, _ALIGN, s_src, s_dst] = plan32
         adj[:, _ALIGN, s_dst, s_src] = plan32.transpose(1, 2)
 
-        adj_src_zero = slot_adj_src
-        adj_dst_zero = slot_adj_dst
         closure = 0.5 * (
             torch.bmm(adj_src_zero, plan32) + torch.bmm(plan32, adj_dst_zero)
         )

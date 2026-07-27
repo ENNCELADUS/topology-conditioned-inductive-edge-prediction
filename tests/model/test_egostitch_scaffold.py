@@ -72,6 +72,22 @@ def test_scaffold_rebuild_symmetry() -> None:
     assert torch.allclose(ji.adj, expected_adj, atol=1e-6, rtol=1e-6)
 
 
+def test_scaffold_preserves_intra_self_loops_and_degree_feature() -> None:
+    si, sj = _slots(b=1, k=3, seed=0), _slots(b=1, k=3, seed=1)
+    si = si._replace(adj=si.adj + torch.diag_embed(torch.tensor([[2.0, 3.0, 4.0]])))
+    sj = sj._replace(adj=sj.adj + torch.diag_embed(torch.tensor([[5.0, 6.0, 7.0]])))
+    plan = torch.rand(1, 3, 3, generator=torch.Generator().manual_seed(2))
+
+    out = build_scaffold(si, sj, plan)
+    expected_src = si.adj * si.pi[:, :, None] * si.pi[:, None, :]
+    expected_dst = sj.adj * sj.pi[:, :, None] * sj.pi[:, None, :]
+
+    assert torch.allclose(out.adj[:, 1, 2:5, 2:5], expected_src, atol=1e-6)
+    assert torch.allclose(out.adj[:, 1, 5:8, 5:8], expected_dst, atol=1e-6)
+    assert torch.allclose(out.feats[:, 2:5, 7], expected_src.sum(dim=-1), atol=1e-6)
+    assert torch.allclose(out.feats[:, 5:8, 7], expected_dst.sum(dim=-1), atol=1e-6)
+
+
 def test_closed_wedge_feature_ignores_adjacency_diagonal() -> None:
     si, sj = _slots(b=1, k=3, seed=0), _slots(b=1, k=3, seed=1)
     plan = torch.tensor([[[0.2, 0.3, 0.5], [0.6, 0.1, 0.3], [0.4, 0.4, 0.2]]])
@@ -94,6 +110,7 @@ def test_closed_wedge_feature_ignores_adjacency_diagonal() -> None:
         adj=sj.adj + torch.diag_embed(torch.tensor([[40.0, 50.0, 60.0]]))
     )
     changed = build_scaffold(changed_i, changed_j, plan)
+    assert torch.allclose(changed.adj[:, 3], baseline.adj[:, 3], atol=1e-6)
     assert torch.allclose(changed.feats[..., 10], baseline.feats[..., 10], atol=1e-6)
 
 
@@ -218,21 +235,34 @@ def test_rewire_checkerboard_preserves_rebuilt_visible_degrees_and_moves_close()
     assert torch.max(torch.abs(controlled.feats[..., 9] - baseline.feats[..., 9])).item() > 1e-4
 
 
-def test_rewire_checkerboard_keeps_adjacency_symmetric_with_zero_diagonal() -> None:
+def test_rewire_checkerboard_uses_zero_diagonal_and_restores_raw_diagonal() -> None:
     si, sj = _slots(b=2, k=4, seed=13), _slots(b=2, k=4, seed=14)
     plan = torch.rand(2, 4, 4, generator=torch.Generator().manual_seed(15))
-    rewired_i, rewired_j, rewired_plan = make_scaffold_input_perturbation(
+    perturb = make_scaffold_input_perturbation(
         "rewire_checkerboard_v1", [("node-a", "node-b"), ("node-c", "node-d")]
-    )(si.adj, sj.adj, plan, si.pi, sj.pi)
+    )
+    rewired_i, rewired_j, rewired_plan = perturb(si.adj, sj.adj, plan, si.pi, sj.pi)
 
-    for rewired in (rewired_i, rewired_j):
+    for rewired, raw in ((rewired_i, si.adj), (rewired_j, sj.adj)):
         assert torch.allclose(rewired, rewired.transpose(1, 2), atol=1e-6, rtol=1e-6)
         assert rewired.min().item() >= -torch.finfo(torch.float32).eps
         assert torch.equal(
             torch.diagonal(rewired, dim1=-2, dim2=-1),
-            torch.zeros_like(si.pi),
+            torch.diagonal(raw, dim1=-2, dim2=-1),
         )
     assert rewired_plan.min().item() >= -torch.finfo(torch.float32).eps
+
+    shifted_i = si.adj + torch.diag_embed(torch.full_like(si.pi, 10.0))
+    shifted_j = sj.adj + torch.diag_embed(torch.full_like(sj.pi, 20.0))
+    shifted_rewired_i, shifted_rewired_j, shifted_plan = perturb(
+        shifted_i, shifted_j, plan, si.pi, sj.pi
+    )
+    off_diagonal = ~torch.eye(4, dtype=torch.bool).unsqueeze(0)
+    mask_i = off_diagonal.expand_as(rewired_i)
+    mask_j = off_diagonal.expand_as(rewired_j)
+    assert torch.equal(shifted_rewired_i[mask_i], rewired_i[mask_i])
+    assert torch.equal(shifted_rewired_j[mask_j], rewired_j[mask_j])
+    assert torch.equal(shifted_plan, rewired_plan)
 
 
 def test_rewire_checkerboard_caps_adversarial_nonuniform_pi_adjacency() -> None:
