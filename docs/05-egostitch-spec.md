@@ -512,6 +512,17 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-26 (sixth entry): §14.4.3 moves the §13.19.2 checkpoint-eligibility
+  warm-reference AUPRC snapshot from Phase A to the first validation after
+  conditioning activates; the `> prevalence + 0.02` threshold is unchanged.
+  Found by Codex review of the rev-3.1 branch: the joint-entry curriculum
+  (§14.4.3) disables `L_edge` and freezes the pair encoder during Phase A, so
+  the Phase-A snapshot measures an untrained random pair head and would leave
+  `full`, `p0`, `cosine_pool`, and `no_l_rel` eligible only by initialization
+  luck. The rule and the curriculum were written against each other; reading
+  the reference where the pair head has trained preserves the guard's intent
+  (catching a head that never learns) without weakening its threshold.
+  Owner-confirmed 2026-07-26.
 - 2026-07-25 (fifth entry): §14.4.5 6e-v1 transfer gains a
   **recipient-capacity cap**, `δ = u · min(w_il, w_kj, c_ij − w_ij,
   c_kl − w_kl)` with `c_ij = π_i π_j`. Found by Codex review of the fourth
@@ -1900,6 +1911,16 @@ Warm-start remains reconstruction-only (no `L_edge`). From the **first
 edge-active step**, the trunk, STE, gates, and both conditioning pathways
 train jointly — the v2 Phase-A `pair_only` head start is removed (supersedes
 §13.19.1 for rev-3.1). Branch dropout `p_topo = p_cont = 0.15` unchanged.
+
+**Checkpoint-eligibility reference (owner-confirmed 2026-07-26; §12 sixth
+entry).** The §13.19.2 warm-reference AUPRC requirement (`> prevalence +
+0.02`) is retained unchanged in threshold, but its snapshot moves to the
+**first validation after conditioning activates**. Under the joint-entry
+curriculum Phase A disables `L_edge` and freezes the pair encoder, so a
+Phase-A snapshot measures an *untrained* pair head and would make an
+otherwise successful run's eligibility depend on initialization luck. The
+guard's intent — catching a pair head that never learns — is preserved by
+reading it where the head has actually trained.
 
 #### 14.4.4 Grounding (supersedes the §13.12 value for this family)
 
