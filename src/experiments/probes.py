@@ -116,6 +116,58 @@ def _build_probe_scope_graph(
     return build_g_struct(nodes, edges)
 
 
+def build_probe_scope_context(
+    scope: E2EProbeScope,
+    *,
+    data_root: Path,
+    strategy: str,
+    partition_seed: int,
+    msg_fraction: float,
+    expected_missing_features: Sequence[str],
+) -> tuple[list[str], nx.Graph]:
+    """Rebuild the exact node set and message graph a probe scope authorizes.
+
+    Composed from the same two scope primitives the producer uses
+    (:func:`_probe_feature_nodes` and :func:`_build_probe_scope_graph`), so scope
+    semantics cannot drift between writing an artifact and re-validating it. The
+    consumer is :mod:`src.experiments.prebinding_gates`, which must rebuild this
+    universe before calling :func:`evaluate_e2e_probe_artifact`: validating a
+    ``calibration_fit`` artifact against the ``formal_train`` universe would
+    compare it to the wrong ``g_struct_sha256`` and wrong stored targets.
+
+    :func:`produce_e2e_probe_artifact` deliberately keeps its own inline
+    derivation because it additionally needs the partition and holdout objects
+    for its per-role grounding caches.
+    """
+    from src import train_egostitch as te
+    from src.data.internal_holdout import derive_internal_holdout
+    from src.data.partition import derive_partition
+
+    strategy_dir = data_root / te._BENCHMARK_SUBDIR / strategy
+    formal_nodes, train_positives = _load_train_side_probe_inputs(
+        strategy_dir,
+        expected_missing_features=expected_missing_features,
+    )
+    partition = derive_partition(
+        train_positives, seed=partition_seed, msg_fraction=msg_fraction
+    )
+    holdout = derive_internal_holdout(formal_nodes, partition.e_msg, partition.e_sup)
+    nodes = _probe_feature_nodes(
+        scope,
+        formal_nodes,
+        v_fit=holdout.v_fit,
+        v_qual=holdout.v_qual,
+    )
+    graph = _build_probe_scope_graph(
+        scope,
+        nodes,
+        formal_e_msg=partition.e_msg,
+        fit_e_msg=holdout.e_msg_fit,
+        qual_e_msg=holdout.qual_manifest.positive_edges,
+    )
+    return nodes, graph
+
+
 def _validate_pi_consistency_inputs(
     plan: torch.Tensor,
     cells: torch.Tensor,
