@@ -57,27 +57,45 @@ hpc/run.sh check
 The check runs the lightweight suite plus the three CPU DDP smoke contracts on Linux;
 the four-H20 cold-run acceptance test remains an explicit opt-in.
 
-EgoStitch e2e v2 has a separate fail-closed qualification entry point. Its Stage 2
-overfit test uses the registered fixed 510-row stream for exactly 2,000 steps on
-every auto-detected visible H20 (four on the current target host), matching Stage 3
-and the formal launch topology. Stage 3 runs the exact 30-epoch full-arm rehearsal
-against `V_qual` without opening `V_select`. Qualification must run from an isolated
-root in which candidate, test, and `V_select` artifacts are absent. Its basename must
-include the retained attempt number (`attempt003` through `attempt005`); an existing
-attempt directory is never replaced:
+EgoStitch e2e rev-3.1 has a separate fail-closed qualification entry point, split
+into two commands because the registered protocol requires the pre-binding gate
+thresholds to **freeze between them**. Qualification must run from an isolated root
+in which candidate, test, and `V_select` artifacts are absent. Its basename must
+include the retained attempt number (`attempt001` through `attempt003`, the v3
+three-attempt budget); an existing stage directory is never replaced.
+
+`calibrate` runs the sanity suite, then the registered fixed 510-row overfit stream
+for exactly 2,000 steps on every auto-detected visible H20 (four on the current
+target host), then produces the `calibration_fit` probe artifact and evaluates the
+registered pre-binding gates. It touches `V_fit` only and never opens `V_qual`:
 
 ```bash
-EGOSTITCH_QUALIFICATION_ROOT=/path/to/isolated/qualification-attempt005 \
-  hpc/qualification.sh qualify
+EGOSTITCH_QUALIFICATION_ROOT=/path/to/isolated/qualification-attempt001 \
+  hpc/qualification.sh calibrate
 ```
 
-The launcher runs its v2 trainer/conditioning tests before either GPU stage and uses
-separate `V_fit` and `V_qual` feature packs. It never substitutes `--max-steps`, never
-promotes the DRAFT registration, and stops immediately on a failed stage. Formal arm
-training remains unavailable until the registration is resolved and marked BINDING:
+The owner then freezes the calibrated thresholds into the DRAFT registration. Only
+after that does `rehearse` run the exact 30-epoch full-arm rehearsal against
+`V_qual`, validate the clip/family/RMS margins, and evaluate the gates again. It
+**refuses to start while any registered gate threshold is still a
+`REQUIRED-BEFORE-BINDING` marker**, because a rehearsal judged against an unresolved
+gate is not prospective:
 
 ```bash
-hpc/qualification.sh formal full
+EGOSTITCH_QUALIFICATION_ROOT=/path/to/isolated/qualification-attempt001 \
+  hpc/qualification.sh rehearse
+```
+
+Both stages run the v3 trainer/conditioning/gate tests before any GPU work and use
+separate `V_fit` and `V_qual` feature packs. Neither substitutes `--max-steps`,
+neither promotes the DRAFT registration, and both stop immediately on failure.
+Formal arm training remains unavailable until the registration is resolved and
+marked BINDING. Six trained arms are selectable; the two scoring-time controls
+(`structure_control_6a_v3`, `structure_control_6e_v1`) reuse the full arm's
+checkpoint and are rejected here:
+
+```bash
+hpc/qualification.sh formal full   # or f_only|pair_topology|p0|cosine_pool|no_l_rel
 ```
 
 Train both frozen baselines. `B0` runs through the auto-sized H20 E2 production pipeline;

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Fail-closed launcher for the §13.19 qualification and bound formal contexts.
+# Fail-closed launcher for the §13.19/§14.4.7 qualification and bound formal contexts.
 set -euo pipefail
 
 readonly REPO_ROOT="/2023533015/topology-conditioned-inductive-edge-prediction"
 readonly PYTHON_BIN="${REPO_ROOT}/.venv/bin/python"
 readonly UV_BIN="/2023533015/.uv/bin/uv"
-readonly PREREGISTRATION="docs/registrations/g5_e2e_stage1_preregistration_v2.json"
-readonly FULL_CONFIG="configs/egostitch_e2e_breadth_first.yaml"
+readonly PREREGISTRATION="docs/registrations/g5_e2e_stage1_preregistration_v3.json"
+readonly FULL_CONFIG="configs/egostitch_e2e_v3_full_breadth_first.yaml"
 readonly FORMAL_GPU_COUNT=4
 readonly EXPECTED_GPU_NAME="NVIDIA H20"
 readonly QUALIFICATION_ROOT="${EGOSTITCH_QUALIFICATION_ROOT:-}"
@@ -15,20 +15,30 @@ DETECTED_GPU_COUNT=0
 usage() {
   cat <<'EOF'
 Usage:
-  EGOSTITCH_QUALIFICATION_ROOT=/path/to/safe-root hpc/qualification.sh qualify
-  hpc/qualification.sh formal <full|f_only|pair_topology|p0>
+  EGOSTITCH_QUALIFICATION_ROOT=/path/to/safe-root hpc/qualification.sh calibrate
+  EGOSTITCH_QUALIFICATION_ROOT=/path/to/safe-root hpc/qualification.sh rehearse
+  hpc/qualification.sh formal <full|f_only|pair_topology|p0|cosine_pool|no_l_rel>
 
-qualify is train/validation-only. The registered 2,000-step overfit and full-arm
-rehearsal auto-detect and use every visible H20, matching the formal launch style.
-It runs sanity -> overfit -> rehearsal and stops at the first failure.
-The DRAFT registration is never edited or promoted.
+calibrate and rehearse are train/validation-only and never edit or promote the
+DRAFT registration. They auto-detect and use every visible H20, matching the
+formal launch style.
+
+calibrate runs sanity -> registered 2,000-step overfit -> probes -> gates on
+V_fit only, and stops at the first failure. It never opens V_qual. Its purpose
+is to produce the measurements the owner freezes into the DRAFT registration.
+
+rehearse spends one of the three registered attempts on the single prospective
+V_qual rehearsal. It refuses to start until every registered pre-binding gate
+threshold is frozen, because a rehearsal against an unresolved gate cannot be
+prospective. Freezing thresholds is an owner action, never this script's.
 
 formal requires exactly 4 visible NVIDIA H20s and a fully resolved BINDING
-registration. It launches one registered arm; scientific execution order remains
-full first, with the full-arm eligibility/liveness preflight required before the
-remaining arms are launched.
+registration. It launches one registered trained arm; the two scoring-time
+controls reuse the full arm's checkpoint and are not launched here. Scientific
+execution order remains full first, with the full-arm eligibility/liveness
+preflight required before the remaining arms are launched.
 
-Both qualification stages execute the registered v2 trainer. --max-steps is
+Both qualification stages execute the registered v3 trainer. --max-steps is
 never substituted for either the 2,000-step overfit or the 30-epoch rehearsal.
 EOF
 }
@@ -52,6 +62,26 @@ registration_has_unresolved_marker() {
   "${PYTHON_BIN}" -c \
     'import sys; raise SystemExit(0 if "REQUIRED-BEFORE-BINDING" in open(sys.argv[1]).read() else 1)' \
     "${PREREGISTRATION}"
+}
+
+# A rehearsal is only prospective if every gate it will be judged against is
+# already frozen. This is narrower than the whole-file marker scan above: the
+# formal path needs the entire registration resolved, but a rehearsal needs
+# exactly the gate thresholds.
+assert_prebinding_gates_frozen() {
+  "${PYTHON_BIN}" -c '
+import json, sys
+gates = json.load(open(sys.argv[1]))["prebinding_qualification"]["gates"]
+unresolved = [
+    g.get("id")
+    for g in gates
+    if isinstance(g.get("threshold"), str) and "REQUIRED-BEFORE-BINDING" in g["threshold"]
+]
+if unresolved:
+    sys.stderr.write("unresolved pre-binding gate thresholds: %s\n" % ", ".join(map(str, unresolved)))
+    raise SystemExit(1)
+' "${PREREGISTRATION}" || \
+    fail "rehearsal refuses unresolved gate thresholds; freeze them from calibration first"
 }
 
 select_all_visible_h20s() {
@@ -102,28 +132,34 @@ assert_registration_unchanged() {
     fail "qualification must not edit or promote the registration"
 }
 
-run_qualification() {
-  [[ -n "${QUALIFICATION_ROOT}" && -d "${QUALIFICATION_ROOT}" ]] || \
-    fail "qualify requires EGOSTITCH_QUALIFICATION_ROOT to name the isolated data root"
+# Shared entry guard for both pre-binding stages. Resolves the attempt root,
+# refuses to overwrite retained evidence, and arms the registration-immutability
+# trap. Echoes the attempt directory on stdout.
+enter_qualification_attempt() {
+  local stage="$1"
   local qualification_basename
   local attempt_number
   local attempt_dir
+  [[ -n "${QUALIFICATION_ROOT}" && -d "${QUALIFICATION_ROOT}" ]] || \
+    fail "${stage} requires EGOSTITCH_QUALIFICATION_ROOT to name the isolated data root"
   qualification_basename="$(basename "${QUALIFICATION_ROOT}")"
   [[ "${qualification_basename}" =~ attempt([0-9]{3}) ]] || \
     fail "qualification root basename must include attemptNNN for retained evidence"
   attempt_number="${BASH_REMATCH[1]}"
-  (( 10#${attempt_number} >= 3 && 10#${attempt_number} <= 5 )) || \
-    fail "attempt ${attempt_number} is outside the registered v2 attempt003-attempt005 window"
-  attempt_dir="outputs/egostitch_e2e_stage1/qualification/attempt-${attempt_number}"
+  (( 10#${attempt_number} >= 1 && 10#${attempt_number} <= 3 )) || \
+    fail "attempt ${attempt_number} is outside the registered v3 attempt001-attempt003 window"
+  attempt_dir="outputs/egostitch_e2e_stage1_v3/qualification/attempt-${attempt_number}"
   cd "${QUALIFICATION_ROOT}"
-  [[ ! -e "${attempt_dir}" ]] || \
-    fail "qualification attempt output already exists and cannot be replaced: ${attempt_dir}"
+  [[ ! -e "${attempt_dir}/${stage}" ]] || \
+    fail "${stage} output already exists and cannot be replaced: ${attempt_dir}/${stage}"
   assert_qualification_boundary
   REGISTRATION_SHA256_BEFORE="$(registration_sha256)"
   export REGISTRATION_SHA256_BEFORE
-  trap assert_registration_unchanged EXIT
+  ATTEMPT_DIR="${attempt_dir}"
+  export ATTEMPT_DIR
+}
 
-  echo "qualification stage 1/3: sanity"
+run_sanity_suite() {
   cd "${REPO_ROOT}"
   "${UV_BIN}" run pytest -q \
     tests/test_train_egostitch.py \
@@ -132,46 +168,100 @@ run_qualification() {
     tests/model/test_egostitch_conditioning.py \
     tests/model/test_egostitch_trunk.py \
     tests/test_e2_pipeline.py \
+    tests/experiments/test_prebinding_gates.py \
     tests/test_hpc_qualification.py
   cd "${QUALIFICATION_ROOT}"
   assert_registration_unchanged
+}
 
-  echo "qualification stage 2/3: registered 2,000-step overfit"
+# Produce the scope-appropriate probe artifact and evaluate the registered
+# pre-binding gates against it. Both are pure post-processing over an already
+# written checkpoint; neither opens a new universe.
+evaluate_stage_gates() {
+  local stage_dir="$1"
+  local scope="$2"
+  "${PYTHON_BIN}" -m src.experiments.probes produce-e2e \
+    --checkpoint "${stage_dir}/best.pt" \
+    --run-metadata "${stage_dir}/run_metadata.json" \
+    --preregistration "${PREREGISTRATION}" \
+    --data-root data \
+    --strategy breadth_first \
+    --output "${stage_dir}/probes/${scope}.npz" \
+    --scope "${scope}"
+  "${PYTHON_BIN}" -m src.experiments.prebinding_gates evaluate \
+    --probe-artifact "${stage_dir}/probes/${scope}.npz" \
+    --preregistration "${PREREGISTRATION}" \
+    --config "${FULL_CONFIG}" \
+    --scope "${scope}" \
+    --output "${stage_dir}/prebinding_gates.json"
+  assert_registration_unchanged
+}
+
+run_calibration() {
+  enter_qualification_attempt calibration
+  trap assert_registration_unchanged EXIT
+
+  echo "calibration stage 1/3: sanity"
+  run_sanity_suite
+
+  echo "calibration stage 2/3: registered 2,000-step overfit on V_fit"
   select_all_visible_h20s
   "${PYTHON_BIN}" -m src.e2_pipeline --config "${FULL_CONFIG}" \
     --worker-module src.train_egostitch \
     --run-kind overfit \
     --pack-dir outputs/feature_packs/egostitch_e2e_v_fit \
-    --output-dir "${attempt_dir}/overfit"
+    --output-dir "${ATTEMPT_DIR}/calibration"
   assert_registration_unchanged
 
-  echo "qualification stage 3/3: exact full-arm rehearsal"
+  echo "calibration stage 3/3: probes and pre-binding gates on V_fit"
+  evaluate_stage_gates "${ATTEMPT_DIR}/calibration" calibration_fit
+  echo "calibration completed; registration remains DRAFT"
+  echo "measurements: ${ATTEMPT_DIR}/calibration/prebinding_gates.json"
+}
+
+run_rehearsal() {
+  enter_qualification_attempt rehearsal
+  assert_prebinding_gates_frozen
+  trap assert_registration_unchanged EXIT
+
+  echo "rehearsal stage 1/3: exact full-arm rehearsal on V_qual"
   select_all_visible_h20s
   "${PYTHON_BIN}" -m src.e2_pipeline --config "${FULL_CONFIG}" \
     --worker-module src.train_egostitch \
     --run-kind rehearsal \
     --pack-dir outputs/feature_packs/egostitch_e2e_v_qual \
-    --output-dir "${attempt_dir}/rehearsal"
+    --output-dir "${ATTEMPT_DIR}/rehearsal"
+  assert_registration_unchanged
+
+  echo "rehearsal stage 2/3: clip/family/RMS margins"
   "${PYTHON_BIN}" -c \
     'import sys; from pathlib import Path; from src.train_egostitch import validate_e2e_qualification_profile; validate_e2e_qualification_profile(Path(sys.argv[1]), output_path=Path(sys.argv[2]))' \
-    "${attempt_dir}/rehearsal/profile.json" \
-    "${attempt_dir}/qualification_margins.json"
+    "${ATTEMPT_DIR}/rehearsal/profile.json" \
+    "${ATTEMPT_DIR}/qualification_margins.json"
   assert_registration_unchanged
-  echo "qualification completed; registration remains DRAFT"
+
+  echo "rehearsal stage 3/3: probes and pre-binding gates on V_qual"
+  evaluate_stage_gates "${ATTEMPT_DIR}/rehearsal" qualification_qual
+  echo "rehearsal completed; registration remains DRAFT"
+  echo "gate outcome: ${ATTEMPT_DIR}/rehearsal/prebinding_gates.json"
 }
 
 formal_config() {
   case "$1" in
-    full) echo "configs/egostitch_e2e_breadth_first.yaml" ;;
-    f_only) echo "configs/egostitch_e2e_f_only_breadth_first.yaml" ;;
-    pair_topology) echo "configs/egostitch_e2e_pair_topology_breadth_first.yaml" ;;
-    p0) echo "configs/egostitch_e2e_p0_breadth_first.yaml" ;;
+    full) echo "configs/egostitch_e2e_v3_full_breadth_first.yaml" ;;
+    f_only) echo "configs/egostitch_e2e_v3_f_only_breadth_first.yaml" ;;
+    pair_topology) echo "configs/egostitch_e2e_v3_pair_topology_breadth_first.yaml" ;;
+    p0) echo "configs/egostitch_e2e_v3_p0_breadth_first.yaml" ;;
+    cosine_pool) echo "configs/egostitch_e2e_v3_cosine_pool_breadth_first.yaml" ;;
+    no_l_rel) echo "configs/egostitch_e2e_v3_no_l_rel_breadth_first.yaml" ;;
+    structure_control_6a_v3|structure_control_6e_v1)
+      fail "$1 is a scoring-time control that reuses the full arm's checkpoint; it is not trained" ;;
     *) fail "unknown formal arm: $1" ;;
   esac
 }
 
 assert_full_preflight() {
-  local metadata="outputs/egostitch_e2e_stage1/full/run_metadata.json"
+  local metadata="outputs/egostitch_e2e_stage1_v3/full/run_metadata.json"
   [[ -s "${metadata}" ]] || \
     fail "remaining arms require the completed full-arm preflight: ${metadata}"
   "${PYTHON_BIN}" -c \
@@ -212,9 +302,13 @@ cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 case "${1:-}" in
-  qualify)
-    [[ $# -eq 1 ]] || fail "qualify takes no arguments"
-    run_qualification
+  calibrate)
+    [[ $# -eq 1 ]] || fail "calibrate takes no arguments"
+    run_calibration
+    ;;
+  rehearse)
+    [[ $# -eq 1 ]] || fail "rehearse takes no arguments"
+    run_rehearsal
     ;;
   formal)
     [[ $# -eq 2 ]] || fail "formal requires exactly one arm"

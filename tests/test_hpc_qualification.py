@@ -12,10 +12,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 RUNNER = REPO_ROOT / "hpc" / "qualification.sh"
 CONFIG_DIR = REPO_ROOT / "configs"
 CONFIGS = {
-    "full": CONFIG_DIR / "egostitch_e2e_breadth_first.yaml",
-    "f_only": CONFIG_DIR / "egostitch_e2e_f_only_breadth_first.yaml",
-    "pair_topology": CONFIG_DIR / "egostitch_e2e_pair_topology_breadth_first.yaml",
-    "p0": CONFIG_DIR / "egostitch_e2e_p0_breadth_first.yaml",
+    "full": CONFIG_DIR / "egostitch_e2e_v3_full_breadth_first.yaml",
+    "f_only": CONFIG_DIR / "egostitch_e2e_v3_f_only_breadth_first.yaml",
+    "pair_topology": CONFIG_DIR / "egostitch_e2e_v3_pair_topology_breadth_first.yaml",
+    "p0": CONFIG_DIR / "egostitch_e2e_v3_p0_breadth_first.yaml",
+    "cosine_pool": CONFIG_DIR / "egostitch_e2e_v3_cosine_pool_breadth_first.yaml",
+    "no_l_rel": CONFIG_DIR / "egostitch_e2e_v3_no_l_rel_breadth_first.yaml",
 }
 
 
@@ -36,12 +38,15 @@ def _load_config(path: Path) -> dict[str, object]:
 def test_e2e_configs_are_exact_registered_arms() -> None:
     configs = {name: _load_config(path) for name, path in CONFIGS.items()}
     expected = {
-        "full": ("none", 0.15, 0.15, "full"),
-        "f_only": ("all_head", 0.15, 0.15, "f_only"),
-        "pair_topology": ("content_head", 0.15, 0.15, "pair_topology"),
-        "p0": ("none", 0.0, 0.0, "p0"),
+        "full": ("none", 0.15, 0.15, "full", 50),
+        "f_only": ("all_head", 0.15, 0.15, "f_only", 50),
+        "pair_topology": ("content_head", 0.15, 0.15, "pair_topology", 50),
+        "p0": ("none", 0.0, 0.0, "p0", 50),
+        # The vocabulary-attribution ablation pins the status-quo pool at 20.
+        "cosine_pool": ("none", 0.15, 0.15, "cosine_pool", 20),
+        "no_l_rel": ("none", 0.15, 0.15, "no_l_rel", 50),
     }
-    for arm, (permanent_null, p_topo, p_cont, output_leaf) in expected.items():
+    for arm, (permanent_null, p_topo, p_cont, output_leaf, n_ground) in expected.items():
         config = configs[arm]
         model = config["model"]
         assert isinstance(model, dict)
@@ -51,7 +56,14 @@ def test_e2e_configs_are_exact_registered_arms() -> None:
         assert model_config["permanent_null"] == permanent_null
         assert model_config["p_topo"] == p_topo
         assert model_config["p_cont"] == p_cont
+        assert model_config["n_ground"] == n_ground
         assert str(config["output_dir"]).endswith(f"/{output_leaf}")
+
+    # The no_l_rel arm is defined as full with the relational weight zeroed.
+    no_l_rel_config = configs["no_l_rel"]["model"]["config"]
+    assert isinstance(no_l_rel_config, dict)
+    assert no_l_rel_config["w_rel"] == 0
+    assert "w_rel" not in configs["full"]["model"]["config"]
 
 
 def test_e2e_configs_pin_training_contract_and_registration() -> None:
@@ -68,7 +80,7 @@ def test_e2e_configs_pin_training_contract_and_registration() -> None:
         assert training["warmup_steps"] == 500
         assert training["residual_ratio_min"] == 1.0e-3
         assert config["preregistration"] == (
-            "docs/registrations/g5_e2e_stage1_preregistration_v2.json"
+            "docs/registrations/g5_e2e_stage1_preregistration_v3.json"
         )
         optim = config["optim"]
         assert isinstance(optim, dict)
@@ -109,42 +121,49 @@ def test_e2e_runner_help_is_local_and_distinguishes_gpu_contexts(bash_exe: str) 
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert "2,000-step overfit and full-arm" in result.stdout
-    assert "rehearsal auto-detect and use every visible H20" in result.stdout
+    assert "auto-detect and use every visible H20" in result.stdout
     assert "exactly 4 visible NVIDIA H20s" in result.stdout
-    assert "sanity -> overfit -> rehearsal" in result.stdout
+    assert "sanity -> registered 2,000-step overfit -> probes -> gates" in result.stdout
+    assert "It never opens V_qual" in result.stdout
+    # The six trained arms are selectable; the two scoring-time controls are not.
+    assert "full|f_only|pair_topology|p0|cosine_pool|no_l_rel" in result.stdout
 
 
 def test_e2e_runner_is_fail_closed_and_never_auto_binds() -> None:
     text = RUNNER.read_text()
-    qualification = text[text.index("run_qualification()") : text.index("formal_config()")]
-    assert qualification.index("stage 1/3: sanity") < qualification.index(
+    prebinding = text[text.index("enter_qualification_attempt()") : text.index("formal_config()")]
+    calibration = text[text.index("run_calibration()") : text.index("run_rehearsal()")]
+    rehearsal = text[text.index("run_rehearsal()") : text.index("formal_config()")]
+
+    assert calibration.index("stage 1/3: sanity") < calibration.index(
         "stage 2/3: registered 2,000-step overfit"
     )
-    assert qualification.index("stage 2/3: registered 2,000-step overfit") < (
-        qualification.index("stage 3/3: exact full-arm rehearsal")
+    assert calibration.index("stage 2/3: registered 2,000-step overfit") < (
+        calibration.index("stage 3/3: probes and pre-binding gates")
     )
-    assert "--run-kind overfit" in qualification
-    assert "--run-kind rehearsal" in qualification
-    assert qualification.index("select_all_visible_h20s") < qualification.index(
+    assert "--run-kind overfit" in calibration
+    assert calibration.index("select_all_visible_h20s") < calibration.index(
         "--run-kind overfit"
     )
-    assert qualification.index("select_all_visible_h20s") < qualification.index(
+    assert "--run-kind rehearsal" in rehearsal
+    assert rehearsal.index("select_all_visible_h20s") < rehearsal.index(
         "--run-kind rehearsal"
     )
+
     assert "OVERFIT_GPU_COUNT" not in text
     assert "OVERFIT_GPU_IDS" not in text
     assert "assert_gpu_selection" not in text
-    assert "egostitch_e2e_v_fit" in qualification
-    assert "egostitch_e2e_v_qual" in qualification
-    assert "attempt_number" in qualification
-    assert "10#${attempt_number} >= 3 && 10#${attempt_number} <= 5" in qualification
-    assert "attempt-${attempt_number}" in qualification
-    assert "cannot be replaced" in qualification
-    assert "--max-steps" not in qualification
-    assert "tests/test_train_egostitch_training.py" in qualification
-    assert "tests/test_train_egostitch_e2e.py" in qualification
-    assert "tests/model/test_egostitch_conditioning.py" in qualification
+    assert "egostitch_e2e_v_fit" in calibration
+    assert "egostitch_e2e_v_qual" in rehearsal
+    assert "attempt_number" in prebinding
+    assert "10#${attempt_number} >= 1 && 10#${attempt_number} <= 3" in prebinding
+    assert "attempt-${attempt_number}" in prebinding
+    assert "cannot be replaced" in prebinding
+    assert "--max-steps" not in prebinding
+    assert "tests/test_train_egostitch_training.py" in text
+    assert "tests/test_train_egostitch_e2e.py" in text
+    assert "tests/model/test_egostitch_conditioning.py" in text
+    assert "tests/experiments/test_prebinding_gates.py" in text
     assert "candidate_test_edges.txt" in text
     assert "test_edges.txt" in text
     assert "v_select" in text.lower()
@@ -153,6 +172,39 @@ def test_e2e_runner_is_fail_closed_and_never_auto_binds() -> None:
     assert "registration remains DRAFT" in text
     assert "sed -i" not in text
     assert 'status": "BINDING' not in text
+
+
+def test_calibration_never_opens_v_qual() -> None:
+    text = RUNNER.read_text()
+    calibration = text[text.index("run_calibration()") : text.index("run_rehearsal()")]
+    assert "egostitch_e2e_v_qual" not in calibration
+    assert "qualification_qual" not in calibration
+    assert "--run-kind rehearsal" not in calibration
+    assert "calibration_fit" in calibration
+
+
+def test_rehearsal_refuses_unresolved_gate_thresholds() -> None:
+    text = RUNNER.read_text()
+    rehearsal = text[text.index("run_rehearsal()") : text.index("formal_config()")]
+    # The freeze check must run before any V_qual access, not after.
+    assert rehearsal.index("assert_prebinding_gates_frozen") < rehearsal.index(
+        "--run-kind rehearsal"
+    )
+    guard = text[
+        text.index("assert_prebinding_gates_frozen()") : text.index("select_all_visible_h20s()")
+    ]
+    assert "prebinding_qualification" in guard
+    assert "REQUIRED-BEFORE-BINDING" in guard
+
+
+def test_both_prebinding_stages_evaluate_the_registered_gates() -> None:
+    text = RUNNER.read_text()
+    assert "src.experiments.prebinding_gates evaluate" in text
+    assert "src.experiments.probes produce-e2e" in text
+    calibration = text[text.index("run_calibration()") : text.index("run_rehearsal()")]
+    rehearsal = text[text.index("run_rehearsal()") : text.index("formal_config()")]
+    assert "evaluate_stage_gates" in calibration
+    assert "evaluate_stage_gates" in rehearsal
 
 
 def test_formal_path_requires_binding_no_markers_and_four_gpus() -> None:
@@ -167,3 +219,18 @@ def test_formal_path_requires_binding_no_markers_and_four_gpus() -> None:
     assert "--run-kind formal" in formal
     assert "egostitch_e2e_v_select" in formal
     assert "REQUIRED-BEFORE-BINDING" in text
+
+
+def test_formal_arm_selector_covers_six_trained_arms_and_rejects_controls() -> None:
+    text = RUNNER.read_text()
+    selector = text[text.index("formal_config()") : text.index("assert_full_preflight()")]
+    for arm in CONFIGS:
+        assert f"configs/egostitch_e2e_v3_{'f_only' if arm == 'f_only' else arm}" in selector
+    # The scoring-time controls reuse the full arm's checkpoint and must not be
+    # launchable as trained arms.
+    assert "structure_control_6a_v3" in selector
+    assert "structure_control_6e_v1" in selector
+    assert "is not trained" in selector
+    # No v2 config may be reachable from the v3 launcher.
+    assert "configs/egostitch_e2e_breadth_first.yaml" not in text
+    assert "preregistration_v2.json" not in text
