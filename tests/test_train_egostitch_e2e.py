@@ -1056,6 +1056,135 @@ class TestE2ECompositeStep:
         assert result.best_epoch == 1
         assert guard_persistence == [False] * len(optimizer_steps)
 
+    @pytest.mark.parametrize(
+        ("reference_auprc", "expect_eligible"),
+        [(0.23, True), (0.22, True), (0.21, False)],
+    )
+    def test_training_loop_captures_first_edge_active_eligibility_reference(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        reference_auprc: float,
+        expect_eligible: bool,
+    ) -> None:
+        """Phase-A validation is ignored; the first trained-head validation stays fail-closed."""
+        torch.manual_seed(0)
+        _, model = self._batch_and_model(tmp_path)
+        cfg = _toy_cfg(tmp_path)
+        registered = te.load_config(
+            Path(__file__).resolve().parents[1] / "configs/egostitch_e2e_breadth_first.yaml"
+        )
+        assert registered.training is not None
+        pack_dir = tmp_path / "token_pack"
+        e2e_cfg = replace(
+            cfg,
+            model=ModelConfig(family="egostitch_e2e", config=dict(_E2E_TINY_MODEL)),
+            data=replace(cfg.data, pack_dir=pack_dir),
+            optim=replace(cfg.optim, epochs=5),
+            diagnostics=replace(cfg.diagnostics, gradient_probe_interval=10_000),
+            training=registered.training,
+            run_kind="rehearsal",
+        )
+        data = _toy_bundle(tmp_path, EgoStitchConfig())
+        original_from_pack = PackedFeatureTable.from_pack.__func__
+
+        def _float_cpu_pack(
+            cls: type[PackedFeatureTable], root: Path, device: torch.device
+        ) -> PackedFeatureTable:
+            table = original_from_pack(cls, root, device)
+            table.tokens = table.tokens.float()
+            return table
+
+        validation_calls = 0
+
+        def _validation(
+            *_args: object,
+            **_kwargs: object,
+        ) -> te._ValidationResult:
+            nonlocal validation_calls
+            call = validation_calls
+            validation_calls += 1
+            f_logit_auprc = reference_auprc if call == 2 else (0.1 if call < 2 else 0.9)
+            metrics = te.EdgeMetrics(
+                auroc=0.7,
+                auprc=0.3,
+                accuracy=0.7,
+                sensitivity=0.7,
+                specificity=0.7,
+                precision=0.7,
+                recall=0.7,
+                f1=0.7,
+                mcc=0.4,
+                ece=0.1,
+                brier=0.1,
+                threshold=0.5,
+                n_pos=2,
+                n_neg=2,
+            )
+            return te._ValidationResult(
+                metrics=metrics,
+                fidelity={
+                    "prevalence": 0.2,
+                    "active_logit_std": 0.2,
+                    "clustering_mmd": 0.1,
+                    "topology_delta_ratio": 0.01,
+                    "f_logit_std": 0.4 if call == 0 else 0.8,
+                    "f_logit_auprc": f_logit_auprc,
+                    "h_pairwise_cosine_mean": 0.2,
+                    "plan_rank1_marginal_residual": 0.2,
+                },
+            )
+
+        seen_records: list[te.E2ECheckpointRecord] = []
+        original_eligible = te.e2e_checkpoint_eligible
+
+        def _track_eligibility(record: te.E2ECheckpointRecord, arm: te.E2EArmName) -> bool:
+            seen_records.append(record)
+            return original_eligible(record, arm)
+
+        monkeypatch.setattr(PackedFeatureTable, "from_pack", classmethod(_float_cpu_pack))
+        monkeypatch.setattr(te, "_validate_epoch", _validation)
+        monkeypatch.setattr(te, "e2e_checkpoint_eligible", _track_eligibility)
+        monkeypatch.setattr(te.E2EClipGuard, "update", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(te, "_e2e_precision_differential", lambda *_args, **_kwargs: {})
+        accelerator = Accelerator(cpu=True)
+
+        if expect_eligible:
+            result = te._train_e2e_stability_loop(
+                model,
+                e2e_cfg,
+                data,
+                accelerator,
+                node_batch=4,
+            )
+            assert result.best_epoch > 0
+        else:
+            with pytest.raises(RuntimeError, match="no eligible checkpoint"):
+                te._train_e2e_stability_loop(
+                    model,
+                    e2e_cfg,
+                    data,
+                    accelerator,
+                    node_batch=4,
+                )
+
+        phase_a_records = [record for record in seen_records if record.phase == "A"]
+        assert phase_a_records
+        assert all(record.warm_reference_auprc is None for record in phase_a_records)
+        assert all(record.warm_reference_std == pytest.approx(0.4) for record in phase_a_records)
+        first_referenced = next(
+            record for record in seen_records if record.warm_reference_auprc is not None
+        )
+        assert first_referenced.warm_reference_std == pytest.approx(0.4)
+        assert first_referenced.warm_reference_auprc == pytest.approx(reference_auprc)
+        assert first_referenced.full_joint_epochs_completed == 0
+        assert not original_eligible(first_referenced, "full")
+        first_full_joint = next(
+            record for record in seen_records if record.full_joint_epochs_completed == 1
+        )
+        assert first_full_joint.warm_reference_auprc == pytest.approx(reference_auprc)
+        assert original_eligible(first_full_joint, "full") is expect_eligible
+
     def test_permanent_null_matches_eval_bypass(self, tmp_path: Path) -> None:
         """The training mask is exactly the corresponding hard eval bypass."""
         batch, model = self._batch_and_model(tmp_path)

@@ -569,7 +569,17 @@ def evaluate_e2e_probe_artifact(
     n_ground_value = metadata.get("n_ground")
     if not isinstance(n_ground_value, int) or n_ground_value <= 0:
         raise ValueError("E2E probe metadata has an invalid n_ground")
+    registered_n_ground = expected_metadata.get("n_ground")
+    if not isinstance(registered_n_ground, int) or registered_n_ground <= 0:
+        raise ValueError("E2E probe validation requires the registered arm's positive n_ground")
+    if n_ground_value != registered_n_ground:
+        raise ValueError(
+            "E2E probe n_ground mismatch: "
+            f"probe={n_ground_value}, registered={registered_n_ground}"
+        )
     for key, expected in expected_metadata.items():
+        if key == "n_ground":
+            continue
         if metadata.get(key) != expected:
             raise ValueError(
                 f"E2E probe metadata {key!r} mismatch: {metadata.get(key)!r} != {expected!r}"

@@ -779,6 +779,15 @@ def e2e_phase_state(step: int, total_steps: int) -> E2EPhaseState:
     return E2EPhaseState("C", 1.0, True, 1.0)
 
 
+def _e2e_should_capture_eligibility_reference(
+    phase: E2EPhaseState,
+    *,
+    warm_reference_auprc: float | None,
+) -> bool:
+    """Take the AUPRC reference at the first validation after edge training starts."""
+    return phase.edge_active and warm_reference_auprc is None
+
+
 _E2E_RECON_COMPONENTS = (
     "feat",
     "exist",
@@ -4463,7 +4472,6 @@ def _train_e2e_stability_loop(
                     if accelerator.is_main_process:
                         assert warm is not None
                         warm_reference_std = warm.fidelity["f_logit_std"]
-                        warm_reference_auprc = warm.fidelity["f_logit_auprc"]
                         if not math.isfinite(warm_reference_std) or warm_reference_std < 1e-4:
                             warm_failure = 1
                     failed = accelerator.reduce(
@@ -4517,6 +4525,7 @@ def _train_e2e_stability_loop(
         )
         validation_seconds = time.monotonic() - validation_started
         epoch_wall = time.monotonic() - epoch_started
+        phase = e2e_phase_state(global_step - 1, schedule_total_steps)
         collapse_failure = 0
         slot_collapse_failure = 0
         if accelerator.is_main_process:
@@ -4525,6 +4534,14 @@ def _train_e2e_stability_loop(
             fidelity = validation.fidelity
             last_metrics = metrics
             last_fidelity = fidelity
+            if (
+                not profile_only
+                and _e2e_should_capture_eligibility_reference(
+                    phase,
+                    warm_reference_auprc=warm_reference_auprc,
+                )
+            ):
+                warm_reference_auprc = fidelity["f_logit_auprc"]
             if warm_reference_std is not None and run_kind != "overfit":
                 threshold = max(
                     training.collapse_fraction * warm_reference_std,
@@ -4533,7 +4550,6 @@ def _train_e2e_stability_loop(
                 collapse_streak = collapse_streak + 1 if fidelity["f_logit_std"] < threshold else 0
                 if collapse_streak >= training.collapse_validations:
                     collapse_failure = 1
-            phase = e2e_phase_state(global_step - 1, schedule_total_steps)
             try:
                 slot_collapse_guard.update(
                     fidelity,

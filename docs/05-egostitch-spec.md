@@ -514,7 +514,12 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 - 2026-07-26 (sixth entry): §14.4.3 moves the §13.19.2 checkpoint-eligibility
   warm-reference AUPRC snapshot from Phase A to the first validation after
-  conditioning activates; the `> prevalence + 0.02` threshold is unchanged.
+  conditioning activates. The requirement itself is unchanged — `>= prevalence
+  + 0.02`, "at least", as §13.19.2 item 3 states it. **Only the snapshot point
+  moves; neither the threshold nor the inequality changes.** (An earlier draft
+  of this entry wrote the shorthand `> prevalence + 0.02`, which tightened the
+  boundary case; that was a wording error, not a decision, and is corrected
+  here.)
   Found by Codex review of the rev-3.1 branch: the joint-entry curriculum
   (§14.4.3) disables `L_edge` and freezes the pair encoder during Phase A, so
   the Phase-A snapshot measures an untrained random pair head and would leave
@@ -1913,8 +1918,10 @@ train jointly — the v2 Phase-A `pair_only` head start is removed (supersedes
 §13.19.1 for rev-3.1). Branch dropout `p_topo = p_cont = 0.15` unchanged.
 
 **Checkpoint-eligibility reference (owner-confirmed 2026-07-26; §12 sixth
-entry).** The §13.19.2 warm-reference AUPRC requirement (`> prevalence +
-0.02`) is retained unchanged in threshold, but its snapshot moves to the
+entry).** The §13.19.2 warm-reference AUPRC requirement — exceeding label
+prevalence by **at least** `0.02`, i.e. `>= prevalence + 0.02`, exactly as
+§13.19.2 item 3 states it — is retained unchanged in threshold **and in its
+inequality**, but its snapshot moves to the
 **first validation after conditioning activates**. Under the joint-entry
 curriculum Phase A disables `L_edge` and freezes the pair encoder, so a
 Phase-A snapshot measures an *untrained* pair head and would make an

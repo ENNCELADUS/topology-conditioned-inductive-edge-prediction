@@ -326,6 +326,24 @@ def test_e2e_three_phase_boundaries_and_first_eligibility() -> None:
     assert te.e2e_first_eligible_epoch(3000, 100) == 10
 
 
+def test_e2e_eligibility_reference_starts_at_first_edge_active_validation() -> None:
+    phase_a = te.e2e_phase_state(399, 2000)
+    first_edge_active = te.e2e_phase_state(400, 2000)
+
+    assert not te._e2e_should_capture_eligibility_reference(
+        phase_a,
+        warm_reference_auprc=None,
+    )
+    assert te._e2e_should_capture_eligibility_reference(
+        first_edge_active,
+        warm_reference_auprc=None,
+    )
+    assert not te._e2e_should_capture_eligibility_reference(
+        first_edge_active,
+        warm_reference_auprc=0.4,
+    )
+
+
 def test_e2e_recon_anneal_factors_are_component_specific_by_name() -> None:
     factors = te.e2e_recon_component_factors(1999, 2000)
     assert factors == {
@@ -913,3 +931,30 @@ def test_e2e_eligibility_and_topology_aware_selection_are_fail_closed() -> None:
         "full",
     )
     assert selected is not None and selected.epoch == 4
+
+
+def test_e2e_eligibility_reference_keeps_pair_head_learning_guard_strict() -> None:
+    learned = _record(1, mmd=0.1, brier=0.1, auprc=0.23)
+    learned = te.E2ECheckpointRecord(
+        **{
+            **learned.__dict__,
+            "prevalence": 0.2,
+            "warm_reference_auprc": 0.23,
+        }
+    )
+    assert te.e2e_checkpoint_eligible(learned, "full")
+
+    at_threshold = te.E2ECheckpointRecord(
+        **{
+            **learned.__dict__,
+            "warm_reference_auprc": 0.22,
+        }
+    )
+    below_threshold = te.E2ECheckpointRecord(
+        **{
+            **learned.__dict__,
+            "warm_reference_auprc": 0.21,
+        }
+    )
+    assert te.e2e_checkpoint_eligible(at_threshold, "full")
+    assert not te.e2e_checkpoint_eligible(below_threshold, "full")

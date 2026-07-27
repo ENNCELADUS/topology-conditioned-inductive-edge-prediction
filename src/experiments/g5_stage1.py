@@ -1839,6 +1839,11 @@ def _evaluate_registered_e2e_probe(
             f"registration requires probe format {E2E_PROBE_FORMAT!r}; "
             f"got {registered_format!r}; older probe versions are rejected"
         )
+    arms = preregistration.get("arms")
+    full_arm = arms.get("full") if isinstance(arms, Mapping) else None
+    registered_n_ground = full_arm.get("n_ground") if isinstance(full_arm, Mapping) else None
+    if not isinstance(registered_n_ground, int) or registered_n_ground <= 0:
+        raise PreregistrationMismatch("registration does not bind a positive full-arm n_ground")
     expected_path = _registered_path(
         preregistration_path,
         registration.get("expected_path"),
@@ -1883,6 +1888,7 @@ def _evaluate_registered_e2e_probe(
             "seed": 0,
             "partition_seed": 0,
             "strategy": strategy,
+            "n_ground": registered_n_ground,
         },
     )
 

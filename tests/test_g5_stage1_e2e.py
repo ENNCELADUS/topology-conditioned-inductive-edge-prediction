@@ -344,6 +344,7 @@ def test_real_probe_producer_artifact_is_accepted_by_g5_evaluator(
         "arms": {
             "full": {
                 "training": str(config_path),
+                "n_ground": 3,
             }
         },
     }

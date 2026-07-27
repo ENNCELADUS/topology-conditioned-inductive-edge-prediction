@@ -303,7 +303,9 @@ def test_train_side_probe_loader_never_requires_test_artifacts(tmp_path: Path) -
 
 class TestE2EProbeArtifact:
     @staticmethod
-    def _write(tmp_path: Path) -> tuple[Path, nx.Graph, list[str], dict[str, object]]:
+    def _write(
+        tmp_path: Path, *, n_ground: int = 2
+    ) -> tuple[Path, nx.Graph, list[str], dict[str, object]]:
         graph = nx.cycle_graph(12)
         graph = nx.relabel_nodes(graph, {node: f"n{node:02d}" for node in graph})
         nodes = sorted(graph.nodes())
@@ -322,7 +324,7 @@ class TestE2EProbeArtifact:
             "strategy": "toy",
             "g_struct_sha256": probes.g_struct_sha256(graph),
             "scope": "formal_train",
-            "n_ground": 2,
+            "n_ground": n_ground,
         }
         path = tmp_path / "probe.npz"
         n_pairs = len(pairs)
@@ -401,6 +403,33 @@ class TestE2EProbeArtifact:
             probes.evaluate_e2e_probe_artifact(
                 path, graph=graph, train_nodes=nodes, expected_metadata=metadata
             )
+
+    def test_consumer_rejects_n_ground_different_from_registered_arm(
+        self, tmp_path: Path
+    ) -> None:
+        path, graph, nodes, metadata = self._write(tmp_path)
+        registered = {**metadata, "n_ground": 50}
+
+        with pytest.raises(ValueError, match=r"probe=2, registered=50"):
+            probes.evaluate_e2e_probe_artifact(
+                path,
+                graph=graph,
+                train_nodes=nodes,
+                expected_metadata=registered,
+            )
+
+    def test_consumer_accepts_cosine_pool_registered_n_ground(self, tmp_path: Path) -> None:
+        path, graph, nodes, metadata = self._write(tmp_path, n_ground=20)
+
+        report = probes.evaluate_e2e_probe_artifact(
+            path,
+            graph=graph,
+            train_nodes=nodes,
+            expected_metadata=metadata,
+        )
+
+        slot_recall = cast(dict[str, float | int], report["slot_recall_at_n_ground"])
+        assert slot_recall["n_ground"] == 20
 
     def test_consumer_rejects_v1_artifact_with_clear_version_error(
         self, tmp_path: Path
