@@ -306,6 +306,50 @@ class TestVerdictEnforcement:
         )
 
 
+class TestCanonicalRegistrationDigest:
+    def test_threshold_freeze_does_not_change_the_digest(self) -> None:
+        before = _registration()
+        after = _registration()
+        for gate in after["prebinding_qualification"]["gates"]:
+            if gate["id"] in {"G3.4", "G3.5"}:
+                gate["threshold"] = 0.0123
+        assert pg.canonical_registration_digest(before) == (
+            pg.canonical_registration_digest(after)
+        )
+
+    def test_flipped_gate_operator_changes_the_digest(self) -> None:
+        before = _registration()
+        after = _registration()
+        after["prebinding_qualification"]["gates"][1]["operator"] = ">="
+        assert pg.canonical_registration_digest(before) != (
+            pg.canonical_registration_digest(after)
+        )
+
+    def test_rewritten_protocol_field_changes_the_digest(self) -> None:
+        before = _registration()
+        after = _registration()
+        after["prebinding_qualification"]["protocol"] = {"v_qual_rehearsals": 99}
+        assert pg.canonical_registration_digest(before) != (
+            pg.canonical_registration_digest(after)
+        )
+
+    def test_unrelated_registration_edit_changes_the_digest(self) -> None:
+        before = _registration()
+        after = _registration()
+        after["grounding"]["n_ground"] = 20
+        assert pg.canonical_registration_digest(before) != (
+            pg.canonical_registration_digest(after)
+        )
+
+    def test_digest_is_stable_across_key_order(self) -> None:
+        registration = _registration()
+        reordered = json.loads(json.dumps(registration))
+        reordered["prebinding_qualification"] = reordered.pop("prebinding_qualification")
+        assert pg.canonical_registration_digest(registration) == (
+            pg.canonical_registration_digest(reordered)
+        )
+
+
 class TestUnimplementedGates:
     def test_reports_the_two_scoring_gates(self) -> None:
         assert pg.unimplemented_gates(_registration()) == ["G3.4", "G3.5"]

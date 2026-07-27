@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import cast
@@ -157,6 +158,33 @@ def _assert_exact_gate_schema(gates: Sequence[Mapping[str, object]]) -> None:
             "prebinding_qualification.gates does not match the registered schema; "
             f"missing={missing} unexpected={unexpected}"
         )
+
+
+#: Placeholder substituted for each gate threshold before digesting, so the
+#: freeze comparison ignores exactly the fields the owner is permitted to edit.
+_THRESHOLD_SENTINEL = "<threshold-frozen-between-stages>"
+
+
+def canonical_registration_digest(registration: Mapping[str, object]) -> str:
+    """Digest the registration with only the permitted threshold edits masked.
+
+    Freezing calibrated thresholds into the DRAFT is the one change allowed
+    between calibration and rehearsal, so the raw file digest cannot be compared.
+    Ignoring registration drift *entirely* is the opposite error: a gate operator
+    flipped from ``>`` to ``>=``, or a protocol field rewritten, would then pass
+    unnoticed and could change the prospective verdict. Masking just
+    ``prebinding_qualification.gates[*].threshold`` pins everything else.
+    """
+    masked = json.loads(json.dumps(registration))
+    qualification = masked.get("prebinding_qualification")
+    if isinstance(qualification, dict):
+        gates = qualification.get("gates")
+        if isinstance(gates, list):
+            for gate in gates:
+                if isinstance(gate, dict) and "threshold" in gate:
+                    gate["threshold"] = _THRESHOLD_SENTINEL
+    payload = json.dumps(masked, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def unimplemented_gates(registration: Mapping[str, object]) -> list[str]:
@@ -385,6 +413,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="exit nonzero unless every registered gate has an evaluator",
     )
     implementable.add_argument("--preregistration", type=Path, required=True)
+    digest = subparsers.add_parser(
+        "canonical-digest",
+        help="print the registration digest with permitted threshold edits masked",
+    )
+    digest.add_argument("--preregistration", type=Path, required=True)
     return parser
 
 
@@ -393,6 +426,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     from src.train_egostitch import load_config
 
     args = build_parser().parse_args(argv)
+    if args.command == "canonical-digest":
+        registration = cast(
+            dict[str, object], json.loads(args.preregistration.read_text(encoding="utf-8"))
+        )
+        sys.stdout.write(canonical_registration_digest(registration) + "\n")
+        return
     if args.command == "check-implementable":
         registration = cast(
             dict[str, object], json.loads(args.preregistration.read_text(encoding="utf-8"))

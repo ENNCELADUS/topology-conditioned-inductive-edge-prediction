@@ -139,34 +139,40 @@ assert_implementation_frozen() {
   local config_abs="${QUALIFICATION_ROOT}/${FULL_CONFIG}"
   [[ -s "${calibration_manifest}" ]] || \
     fail "rehearsal requires the calibration freeze manifest: ${calibration_manifest}"
+  local live_digest
+  live_digest="$("${PYTHON_BIN}" -m src.experiments.prebinding_gates canonical-digest \
+    --preregistration "${QUALIFICATION_ROOT}/${PREREGISTRATION}")" || \
+    fail "could not compute the canonical registration digest"
   cd "${REPO_ROOT}"
   local live_commit
   live_commit="$(git rev-parse HEAD)"
-  [[ -z "$(git status --porcelain)" ]] || \
-    fail "rehearsal requires a clean checkout; the working tree has uncommitted changes"
   "${PYTHON_BIN}" -c '
 import hashlib, json, sys
 from pathlib import Path
 manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-live_commit, config_path = sys.argv[2], Path(sys.argv[3])
+live_commit, config_path, live_canonical = sys.argv[2], Path(sys.argv[3]), sys.argv[4]
 problems = []
 if manifest.get("implementation_commit") != live_commit:
     problems.append(
         "implementation commit drifted: calibration=%s live=%s"
         % (manifest.get("implementation_commit"), live_commit)
     )
-# The registration digest is deliberately NOT compared: freezing the calibrated
-# thresholds into the DRAFT is exactly what happens between the two stages, so
-# requiring equality here would make the rehearsal unreachable. Immutability
-# *during* each stage is enforced separately by assert_registration_unchanged.
 digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
 if manifest.get("config_sha256") != digest:
     problems.append("config digest drifted: calibration=%s live=%s"
                     % (manifest.get("config_sha256"), digest))
+# Not the raw file digest: freezing the calibrated thresholds is the one edit
+# allowed between the stages. The canonical digest masks exactly those fields, so
+# a flipped gate operator or a rewritten protocol field is still caught.
+if manifest.get("registration_canonical_sha256") != live_canonical:
+    problems.append(
+        "registration changed beyond the permitted threshold freeze: calibration=%s live=%s"
+        % (manifest.get("registration_canonical_sha256"), live_canonical)
+    )
 if problems:
     sys.stderr.write("\n".join(problems) + "\n")
     raise SystemExit(1)
-' "${calibration_manifest}" "${live_commit}" "${config_abs}" || \
+' "${calibration_manifest}" "${live_commit}" "${config_abs}" "${live_digest}" || \
     fail "implementation/config drifted since calibration; re-calibrate before rehearsing"
   cd "${QUALIFICATION_ROOT}"
   echo "implementation freeze verified against ${calibration_manifest}"
@@ -180,20 +186,27 @@ write_calibration_freeze_manifest() {
   local output_abs="${QUALIFICATION_ROOT}/$1"
   local config_abs="${QUALIFICATION_ROOT}/${FULL_CONFIG}"
   local registration_abs="${QUALIFICATION_ROOT}/${PREREGISTRATION}"
+  local canonical
+  canonical="$("${PYTHON_BIN}" -m src.experiments.prebinding_gates canonical-digest \
+    --preregistration "${registration_abs}")" || \
+    fail "could not compute the canonical registration digest"
   cd "${REPO_ROOT}"
   local live_commit
   live_commit="$(git rev-parse HEAD)"
   "${PYTHON_BIN}" -c '
 import hashlib, json, sys
 from pathlib import Path
-output, commit, config_path, registration_path = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4])
+output, commit, config_path, registration_path, canonical = (
+    Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4]), sys.argv[5]
+)
 output.parent.mkdir(parents=True, exist_ok=True)
 output.write_text(json.dumps({
     "implementation_commit": commit,
     "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
     "registration_sha256": hashlib.sha256(registration_path.read_bytes()).hexdigest(),
+    "registration_canonical_sha256": canonical,
 }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-' "${output_abs}" "${live_commit}" "${config_abs}" "${registration_abs}" || \
+' "${output_abs}" "${live_commit}" "${config_abs}" "${registration_abs}" "${canonical}" || \
     fail "could not write the calibration freeze manifest"
   cd "${QUALIFICATION_ROOT}"
   echo "recorded the calibration freeze manifest: ${output_abs}"
@@ -221,6 +234,30 @@ select_all_visible_h20s() {
   CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${gpu_ids[*]}")"
   export DETECTED_GPU_COUNT CUDA_VISIBLE_DEVICES
   echo "auto-detected ${DETECTED_GPU_COUNT} visible ${EXPECTED_GPU_NAME} GPUs: ${CUDA_VISIBLE_DEVICES}"
+}
+
+# `python -m` puts the cwd first on sys.path, and both stages run from
+# QUALIFICATION_ROOT. A `src/` under the isolated root would therefore shadow the
+# REPO_ROOT copy, so the implementation actually executed could drift while a
+# freeze that only inspects REPO_ROOT's commit still passes. Verify what Python
+# really resolves rather than trusting PYTHONPATH ordering.
+assert_source_resolves_to_repo() {
+  local resolved
+  resolved="$("${PYTHON_BIN}" -c 'import src, pathlib; print(pathlib.Path(src.__file__).resolve().parent.parent)')" || \
+    fail "could not resolve the src package"
+  [[ "${resolved}" == "${REPO_ROOT}" ]] || \
+    fail "src resolves to ${resolved}, not ${REPO_ROOT}; the isolated root must not shadow the implementation"
+}
+
+# The freeze must pin the source state, not just its commit id. Checking
+# cleanliness only at rehearsal would let calibration run dirty and then pass the
+# freeze once the edits were reverted, since HEAD would be identical.
+assert_clean_checkout() {
+  local stage="$1"
+  local dirty
+  dirty="$(cd "${REPO_ROOT}" && git status --porcelain)"
+  [[ -z "${dirty}" ]] || \
+    fail "${stage} requires a clean checkout; the working tree has uncommitted changes"
 }
 
 assert_qualification_boundary() {
@@ -316,6 +353,11 @@ evaluate_stage_gates() {
 run_calibration() {
   enter_qualification_attempt calibration
   trap assert_registration_unchanged EXIT
+  # Checked here, not only at rehearsal: the freeze manifest records HEAD, so a
+  # dirty calibration whose edits are later reverted would present an identical,
+  # now-clean HEAD and pass a rehearsal-only check.
+  assert_clean_checkout calibration
+  assert_source_resolves_to_repo
 
   echo "calibration stage 1/3: sanity"
   run_sanity_suite
@@ -343,6 +385,8 @@ run_rehearsal() {
   # the ledger is claimed, so a rehearsal rejected for any reason does not burn
   # the one attempt. The claim itself stays immediately before the command that
   # opens V_qual, so an interrupted rehearsal still counts as spent.
+  assert_clean_checkout rehearsal
+  assert_source_resolves_to_repo
   assert_prebinding_gates_frozen
   assert_prebinding_gates_implementable
   assert_implementation_frozen "${ATTEMPT_DIR}/calibration_freeze.json"

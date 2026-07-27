@@ -241,8 +241,11 @@ def test_rehearsal_verifies_the_implementation_freeze() -> None:
     ]
     assert "implementation_commit" in guard
     assert "config_sha256" in guard
-    assert "git status --porcelain" in guard
-    # The registration digest must NOT be compared: freezing the calibrated
+    # Cleanliness lives in its own helper, called by both stages.
+    assert "git status --porcelain" in text[
+        text.index("assert_clean_checkout()") : text.index("assert_qualification_boundary()")
+    ]
+    # The *raw* registration digest must not be compared: freezing the calibrated
     # thresholds into the DRAFT is exactly what happens between the stages.
     assert "registration digest drifted" not in guard
 
@@ -264,6 +267,36 @@ def test_hardware_preflight_precedes_the_ledger_claim() -> None:
     assert rehearsal.index("select_all_visible_h20s") < rehearsal.index(
         "assert_single_v_qual_rehearsal"
     )
+
+
+def test_both_stages_pin_the_source_and_require_a_clean_tree() -> None:
+    # `python -m` puts cwd first on sys.path and both stages run from the
+    # isolated root, so a src/ there would shadow REPO_ROOT's implementation.
+    text = RUNNER.read_text()
+    for stage in ("run_calibration()", "run_rehearsal()"):
+        end = "run_rehearsal()" if stage == "run_calibration()" else "formal_config()"
+        block = text[text.index(stage) : text.index(end)]
+        assert "assert_clean_checkout" in block
+        assert "assert_source_resolves_to_repo" in block
+    guard = text[
+        text.index("assert_source_resolves_to_repo()") : text.index("assert_clean_checkout()")
+    ]
+    assert "src.__file__" in guard
+    assert "${REPO_ROOT}" in guard
+
+
+def test_registration_drift_is_allowlisted_not_ignored() -> None:
+    # Only the threshold fields may change across the freeze; everything else
+    # must still be pinned.
+    text = RUNNER.read_text()
+    assert "canonical-digest" in text
+    assert "registration_canonical_sha256" in text
+    guard = text[
+        text.index("assert_implementation_frozen()") : text.index(
+            "write_calibration_freeze_manifest()"
+        )
+    ]
+    assert "beyond the permitted threshold freeze" in guard
 
 
 def test_freeze_paths_are_resolved_against_the_isolated_root() -> None:
