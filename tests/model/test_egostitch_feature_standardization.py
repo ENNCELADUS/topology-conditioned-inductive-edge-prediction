@@ -151,24 +151,34 @@ class TestInitHealthUnderAnisotropicFeatures:
     @staticmethod
     def _features(
         cfg: EgoStitchConfig, *, seed: int = 0
-    ) -> tuple[np.ndarray, torch.Tensor, torch.Tensor]:
+    ) -> tuple[np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         gen = np.random.default_rng(seed)
         direction = np.abs(gen.standard_normal(cfg.input_dim)) + 1.0
         rows = (40.0 * direction + 4.0 * gen.standard_normal((256, cfg.input_dim))).astype(
             np.float32
         )
-        x = torch.from_numpy(rows[:8])
-        pool = torch.from_numpy(
+        # Two disjoint endpoint batches so the transport plan below aligns two
+        # distinct nodes, matching what production actually scores (a self-plan
+        # gets an exact-zero cost diagonal from `stitch_cost` regardless of
+        # collapse, which would make the plan-based assertions free passes).
+        x_a = torch.from_numpy(rows[:8])
+        x_b = torch.from_numpy(rows[8:16])
+        pool_a = torch.from_numpy(
             np.stack([rows[gen.choice(256, cfg.n_ground, replace=False)] for _ in range(8)])
         )
-        return rows, x, pool
+        pool_b = torch.from_numpy(
+            np.stack([rows[gen.choice(256, cfg.n_ground, replace=False)] for _ in range(8)])
+        )
+        return rows, x_a, pool_a, x_b, pool_b
 
     def _dispersion(self, mode: str, *, seed: int = 0) -> dict[str, float]:
+        # Local imports: keep the trainer's heavy dependencies (accelerate, scipy,
+        # networkx) out of collection for the tests in this file that don't need them.
         from src.model.egostitch.stitch import sinkhorn_plan
         from src.train_egostitch import e2e_dispersion_statistics
 
         cfg = self._config()
-        rows, x, pool = self._features(cfg, seed=seed)
+        rows, x_a, pool_a, x_b, pool_b = self._features(cfg, seed=seed)
         torch.manual_seed(11)
         model = EgoStitchStage1(cfg, feature_standardization=mode)  # type: ignore[arg-type]
         if mode == "zscore_vfit_v1":
@@ -177,25 +187,26 @@ class TestInitHealthUnderAnisotropicFeatures:
             )
         model.eval()
         with torch.no_grad():
-            enc = model.encode_nodes(x, pool)
+            enc_a = model.encode_nodes(x_a, pool_a)
+            enc_b = model.encode_nodes(x_b, pool_b)
             plan = sinkhorn_plan(
-                enc.slots.h,
-                enc.slots.h,
-                enc.slots.pi,
-                enc.slots.pi,
-                enc.slots.mult,
-                enc.slots.mult,
+                enc_a.slots.h,
+                enc_b.slots.h,
+                enc_a.slots.pi,
+                enc_b.slots.pi,
+                enc_a.slots.mult,
+                enc_b.slots.mult,
                 eps=cfg.sinkhorn_eps,
                 iters=cfg.sinkhorn_iters,
                 tau=cfg.sinkhorn_tau,
             )
-            stats = e2e_dispersion_statistics(enc.slots.pi, enc.slots.h, enc.slots.adj, plan)
+            stats = e2e_dispersion_statistics(enc_a.slots.pi, enc_a.slots.h, enc_a.slots.adj, plan)
             stats["plan_total_mass"] = float(plan.float().sum(dim=(1, 2)).mean())
         return stats
 
     def test_the_fixture_reproduces_the_measured_f0_anisotropy(self) -> None:
         cfg = self._config()
-        rows, _, _ = self._features(cfg)
+        rows, _, _, _, _ = self._features(cfg)
         normalized = rows / np.linalg.norm(rows, axis=1, keepdims=True)
         gram = normalized @ normalized.T
         off_diagonal = gram[~np.eye(rows.shape[0], dtype=bool)]
