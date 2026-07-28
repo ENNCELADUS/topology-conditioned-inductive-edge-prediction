@@ -22,7 +22,13 @@ from src import train_egostitch as te
 from src.data import internal_holdout
 from src.data.artifacts import Benchmark, LabeledPairs, SplitArtifacts, canonical_pair
 from src.data.ego_targets import EgoTargetBuilder
-from src.data.feature_stats import compute_feature_stats
+from src.data.feature_stats import (
+    FeatureStats,
+    compute_feature_stats,
+    feature_stats_for_universe,
+    load_feature_stats,
+    node_ids_sha256,
+)
 from src.data.packed_features import (
     PACK_FORMAT,
     PackedFeatureManifest,
@@ -1921,6 +1927,49 @@ class TestPrepareAndAssembleE2E:
             rebuilt_packs["raw_tokens"]["identity_sha256"] == packs["raw_tokens"]["identity_sha256"]
         )
 
+    def test_prepare_pack_writes_and_drift_checks_v_fit_feature_stats(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The cold build writes registered V_fit stats; a tampered file drifts warm."""
+        import src.data.packed_features as packed_features
+
+        monkeypatch.setattr(packed_features, "ProcessPoolExecutor", ThreadPoolExecutor)
+        _write_e2e_feature_root(tmp_path, _E2E_PIPELINE_NODES)
+        benchmark = _e2e_pipeline_benchmark()
+        monkeypatch.setattr(te, "_load_benchmark_for", lambda cfg: benchmark)
+        e2e_cfg = self._e2e_cfg(tmp_path)
+        pack_dir = tmp_path / "pack"
+
+        te.prepare_pack(e2e_cfg, pack_dir, cold_cache=True)
+
+        stats_path = pack_dir / te._PACK_FEATURE_STATS_FILENAME
+        assert stats_path.is_file()
+        manifest = json.loads((pack_dir / te._PACK_MANIFEST_FILENAME).read_text())
+        file_hashes = cast(dict[str, str], manifest["files"])
+        assert te._PACK_FEATURE_STATS_FILENAME in file_hashes
+        digest = file_hashes[te._PACK_FEATURE_STATS_FILENAME]
+        assert len(digest) == 64
+        int(digest, 16)  # sanity: genuinely hex, not a placeholder
+
+        # The pack's registered constants are computed over V_fit (here, for
+        # `cfg.training is None`, `prepare_pack`'s train-side node set --
+        # `benchmark.split.train_nodes & operative`), not the full operative
+        # universe (which also includes any validation nodes when present).
+        stats = load_feature_stats(stats_path)
+        expected_universe = node_ids_sha256(sorted(benchmark.split.train_nodes))
+        assert stats.node_ids_sha256 == expected_universe
+
+        # Warm-path drift check: `prepare_pack`'s warm branch never calls
+        # `load_feature_stats` -- it only re-hashes every manifest-listed file
+        # and compares bytes (the same generic check that already covered
+        # `f0_matrix.pt`/`grounding.npz`). Byte-level tampering of the stats
+        # file must be caught by that same mechanism.
+        stats_path.write_bytes(b"corrupted")
+        with pytest.raises(
+            ValueError, match=f"pack file {te._PACK_FEATURE_STATS_FILENAME} drifted"
+        ):
+            te.prepare_pack(e2e_cfg, pack_dir, cold_cache=False)
+
     def test_prepare_pack_rejects_stage1_only_config_keys(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2055,6 +2104,41 @@ class TestPrepareAndAssembleE2E:
             data.train_nodes,
         )
         assert data.feature_stats.digest == expected.digest
+
+    def test_assembly_raises_when_feature_stats_universe_diverges_from_v_fit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A universe drift (same members, different order) must fail closed.
+
+        Both statistics-content tests above hash `feature_stats.node_ids_sha256`
+        and `audit["training_feature_nodes_sha256"]` from the very same
+        `fit_nodes` variable, so they trivially agree -- they cannot prove the
+        `_assemble_e2e_data` equality-raise guard actually fires. This test
+        engineers a real divergence by monkeypatching
+        `feature_stats_for_universe` to return a `FeatureStats` computed for
+        the correct universe but relabeled with the digest of a *shuffled*
+        copy of the same node ids -- identical membership, different order,
+        exactly the drift the ordered-universe rule exists to catch.
+        """
+        real_feature_stats_for_universe = feature_stats_for_universe
+
+        def shuffled_universe_feature_stats(
+            matrix: np.ndarray,
+            node_index: Mapping[str, int],
+            node_ids: Sequence[str],
+            *,
+            cache_path: Path | None = None,
+        ) -> FeatureStats:
+            del cache_path  # do not let the stub touch disk
+            real = real_feature_stats_for_universe(matrix, node_index, node_ids, cache_path=None)
+            shuffled = list(reversed(node_ids))
+            assert shuffled != list(node_ids)  # sanity: genuinely reordered, same members
+            return replace(real, node_ids_sha256=node_ids_sha256(shuffled))
+
+        monkeypatch.setattr(te, "feature_stats_for_universe", shuffled_universe_feature_stats)
+
+        with pytest.raises(RuntimeError, match="V_fit"):
+            self._assemble_holdout_e2e_data(tmp_path, monkeypatch)
 
 
 class TestOverfitAcceptance:
