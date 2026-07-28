@@ -256,7 +256,8 @@ L_recon = 1.0·L_feat(Hungarian, Huber) + 0.5·L_exist(BCE, ∅-balanced)
         + 0.25·L_gate(partner-vs-peer BCE on grounding gate)
 L_real  = 0.5·ED(ego-stat vectors) + 0.25·ED(random-GIN embeddings)
         + 0.25·ED(seam overlap stats)                [+ 0.1·adversarial, off by default]
-L_ssl   = 0.5·consistency(feature noise σ=0.05) + 0.5·pool-resample consistency
+L_ssl   = 0.5·consistency(feature noise σ=0.05, in standardized coordinates for the
+          E2E family — §13.19.1) + 0.5·pool-resample consistency
           (applied to ungrounded slots only; mean g^k logged)
 ```
 
@@ -512,6 +513,28 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-27 (seventh entry): §13.19.1 replaces the E2E generator's per-row
+  `LayerNorm` F0 standardization with registered per-dimension z-scoring over
+  the ordered V_fit universe (`zscore_vfit_v1`), with a pinned two-pass fp64
+  estimator, an fp32 canonical value, a `feature_stats_sha256` identity bound
+  into the config, the pack manifest, the access audit, and the checkpoint
+  buffers; the rev-3.1 transform is retained as `row_layernorm` for replay
+  only. §7/§13.5: the SSL feature perturbation is applied in standardized
+  coordinates. Found by the 2026-07-27 diagnosis of the rev-3.1 attempt-001
+  `training_invalid(slot_collapse)`: raw F0 rows have mean pairwise cosine
+  0.949, per-row LayerNorm cannot remove a shared cross-row mean direction,
+  and a randomly initialized generator therefore reads
+  `h_pairwise_cosine_mean = 0.9897` — above the §14.4.8 trip line — while its
+  transport plan is healthy (mass 0.069, rank-1 residual 0.87). The guard was
+  measuring a feature-geometry floor, not training dynamics. Measured effect
+  of the edit on a deterministic 300-node real-F0 probe: target-projection
+  cosine 0.9405 → −0.0013, init slot cosine 0.9897 → 0.62, ‖h‖ 9.12 → 9.29.
+  §14.4.8 (criteria, thresholds, arming), the `egostitch_e2e_probe_v2` schema,
+  the eight-arm v3 screen, the five G3 gates, and the §13.12 raw-F0 pool
+  contract are all unchanged; new scale diagnostics are training-log only.
+  Consequence: `config_hash` changes, so rev-3.1 calibration artifacts are
+  inadmissible for rev-3.2 threshold freezing and a new registration version
+  is required. Owner-confirmed 2026-07-27.
 - 2026-07-26 (sixth entry): §14.4.3 moves the §13.19.2 checkpoint-eligibility
   warm-reference AUPRC snapshot from Phase A to the first validation after
   conditioning activates. The requirement itself is unchanged — `>= prevalence
@@ -1117,9 +1140,16 @@ L_recon = 1.0·L_feat(Hungarian, Huber) + 0.5·L_exist(BCE, ∅-balanced)
 L_real  = (2/3)·ED(ego-stat vectors) + (1/3)·ED(random-GIN embeddings)
         # seam-overlap ED deferred to Stage 3 with the seam loss; adversarial off;
         # interior weights renormalized to sum 1
-L_ssl   unchanged (§7): 0.5·consistency(feature noise σ=0.05)
+L_ssl   unchanged (§7): 0.5·consistency(feature noise σ=0.05, in standardized
+        coordinates for the E2E family — §13.19.1)
         + 0.5·pool-resample consistency, ungrounded slots only
 ```
+
+Under `zscore_vfit_v1` the SSL feature perturbation is sampled in standardized
+coordinates (equivalently: sampled in raw coordinates and scaled by the registered
+per-dimension `sigma` before addition). Adding a raw σ = 0.05 perturbation to raw F0
+would be a 5e-5 … 1.9e-3 perturbation per standardized coordinate, since the measured
+per-dimension F0 σ spans 26.1 … 1023.3 — the augmentation would silently vanish.
 
 **Stage-1 `L_gate` form:** §7's partner-vs-peer BCE presupposes harmonization. Until
 Stage 3, `L_gate = BCE(g_u^k, 1[Hungarian-matched target of slot k ∈ G(u)])` — the
@@ -1511,14 +1541,45 @@ global L2 norm `3.0`; topology/content conditioning is clipped to `1.0`, in the 
 is step-based and its phase boundaries are unaffected by world size.
 
 The cached F0 matrix remains the raw fp32 mean pool defined in §9.2. Inside the active
-V2 E2E model only, immediately before every trainable generator path, each F0 row is
-standardized by a stateless
-`LayerNorm(d, elementwise_affine=False, eps=1e-5)`. The same transform is used for
-node features, grounding candidates, reconstruction targets, denoising targets, and
-the generator's shared `d -> d_p` projection; the raw-token pair encoder and cosine
-grounding-pool construction are unchanged. Historical frozen-s0 Stage-1 checkpoints
-retain their original raw-F0 behavior. Because the V2 transform has no parameters,
-the registered optimizer-group name manifests are unchanged.
+E2E model only, immediately before every trainable generator path, each F0 row is
+standardized by registered per-dimension z-scoring `x̃ = (x - mu) / sigma`
+(`feature_standardization: zscore_vfit_v1`). The rev-3.1 per-row
+`LayerNorm(d, elementwise_affine=False, eps=1e-5)` is retained under the name
+`row_layernorm` for replay of rev-3.1 checkpoints only; it may not be selected for a
+rev-3.2 or later run. Rationale: per-row LayerNorm cannot remove the shared cross-row
+mean direction of F0, so the generator's slot set is born at mean pairwise cosine
+0.9897 — above the §14.4.8 trip line — before any training step (design record
+2026-07-27 §2).
+
+`mu` and `sigma` are registered constants, not learned parameters:
+
+1. **Scope.** Computed over the ordered V_fit universe only. When the loaded feature
+   matrix contains sealed V_qual/V_select rows, the statistics are computed after
+   gathering the V_fit rows, and are bit-identical to the statistics of the same rows
+   loaded alone.
+2. **Estimator.** Two-pass, fp64 accumulation: `mu_j = mean_i x_ij`,
+   `var_j = mean_i (x_ij - mu_j)^2` (population, ddof = 0),
+   `sigma_j = sqrt(max(var_j, 1e-12))`. The canonical values are the fp32 casts of
+   `mu` and `sigma`; a zero or non-finite fp32 `sigma_j` is a hard error.
+3. **Identity.** `feature_stats_sha256` = SHA-256 over the method id, the SHA-256 of
+   the ordered V_fit node-id list, the dimension, and the fp32 `mu` then `sigma`
+   bytes. It is recorded in the pack manifest, in the run access audit, in
+   `run_metadata.json`, and as a model buffer; the model config field of the same
+   name pins it. A non-empty config value that disagrees with the computed statistics
+   aborts the run before the first step.
+4. **Storage.** `mu`, `sigma`, and the digest are persistent model buffers, so scoring
+   reconstructs the transform from the checkpoint alone — scoring never sees V_fit.
+   The same frozen constants apply in every universe; there is no universe-conditional
+   preprocessing.
+
+The transform is applied to node features, grounding candidates, reconstruction
+targets, denoising targets, and the generator's shared `d -> d_p` projection — one
+transformation for all consumers. The raw-token pair encoder and cosine grounding-pool
+construction remain on raw F0 and are unchanged; the retrieval/representation mismatch
+is deliberate (it preserves every pool cache and the measured P0 pool ceiling that
+G3.1 is derived from). Historical frozen-s0 Stage-1 checkpoints retain their original
+raw-F0 behavior. Because the transform has no learned parameters, the registered
+optimizer-group name manifests are unchanged.
 
 For a global DDP edge batch, let `m_i` be the real-row mask (zero on DDP padding),
 `w_i = 5 y_i + (1-y_i)`, and `D = all_reduce_sum(sum_local m_i w_i)`. Each rank
