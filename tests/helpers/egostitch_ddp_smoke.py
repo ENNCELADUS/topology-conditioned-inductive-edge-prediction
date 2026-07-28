@@ -95,6 +95,24 @@ def _toy_config(output_dir: Path) -> te.EgoConfig:
             "grad_clip": 1.0,
             "warmstart_fraction": 0.25,
         },
+        "diagnostics": {
+            # 2 ranks x world=2, 4 e_sup positives, negative_ratio=2, edge_batch=4
+            # -> rows_per_rank=[6, 6] -> 2 steps/epoch x 2 epochs = 4 global steps.
+            # warmstart_fraction=0.25 arms the fixed gradient probe at global_step
+            # 2 (post-increment); interval=2 fires it at steps 2 and 4 (2 of the
+            # 3 armed steps) so the loop exercises the probe path without turning
+            # it into a per-step assertion or leaving it dark for the whole run.
+            "gradient_probe_interval": 2,
+            # Production Stage-1 defaults (egostitch_stage1_breadth_first.yaml):
+            # kept as-is because streak growth is bounded by interval * #firings
+            # (<= 4 here), far below gradient_imbalance_steps, so the Kendall
+            # guard cannot spuriously activate during a 4-step toy run.
+            "gradient_imbalance_ratio": 10.0,
+            "gradient_imbalance_steps": 1000,
+            "probe_s1_abs_mean_max": 1000.0,
+            "selection_auprc_tolerance": 1.0e-4,
+            "topk_fraction": 0.01,
+        },
         "eval": {"patience": 2, "eval_every": 1},
         "seed": 0,
         "output_dir": str(output_dir / "run"),
