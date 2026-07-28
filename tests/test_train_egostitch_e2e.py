@@ -2449,3 +2449,42 @@ class TestOverfitAcceptance:
         blocked.write_text("a file where the output directory should be")
         te._write_failed_run_history(blocked, run_kind="overfit", arm="full", history=[])
         assert blocked.is_file()
+
+
+class TestInitProbe:
+    """`_run_init_probe` -- the read-only Sec 13.19.1 S0 hard gate."""
+
+    def test_init_probe_reports_guard_telemetry_without_training(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        _write_tiny_token_pack(cast(Path, cfg.data.pack_dir), _E2E_PIPELINE_NODES, min_length=3)
+        data = te.assemble_egostitch_data(cfg)
+        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+        te._bind_feature_standardization(model, cfg, data)
+        accelerator = Accelerator(cpu=True)
+        before = [p.detach().clone() for p in model.parameters()]
+
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            report = te._run_init_probe(
+                model, cfg, data, accelerator, edge_batch=8, topk_fraction=0.1
+            )
+
+        assert "h_pairwise_cosine_mean" in report
+        assert "plan_rank1_marginal_residual" in report
+        assert "plan_total_mass" in report
+        for original, current in zip(before, model.parameters(), strict=True):
+            torch.testing.assert_close(original, current.detach())
+
+    def test_init_probe_fails_closed_on_an_empty_guard_population(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        data = replace(te.assemble_egostitch_data(cfg), val_pairs=[])
+        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+        te._bind_feature_standardization(model, cfg, data)
+
+        with pytest.raises(RuntimeError, match="guard population"):
+            te._run_init_probe(
+                model, cfg, data, Accelerator(cpu=True), edge_batch=8, topk_fraction=0.1
+            )

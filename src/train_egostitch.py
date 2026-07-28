@@ -1,7 +1,7 @@
 r"""EgoStitch Stage-1 training worker (spec Sec 13; auto-sized H20 DDP).
 
 Drop-in worker for the `src.e2_pipeline` orchestrator: implements the same
-``--ddp-mode {probe,epoch-probe,train}`` CLI contract, runtime-profile schema,
+``--ddp-mode {probe,epoch-probe,init-probe,train}`` CLI contract, runtime-profile schema,
 and Task-4 checkpoint payload as ``src.train_b0``, over the EgoStitch two-stream
 composite step (node stream -> L_recon/L_ssl/L_real; edge stream -> L_edge; the
 joint-pair stream joins in Stage 3). ``--token-budget-per-rank`` is
@@ -1337,6 +1337,13 @@ def select_e2e_overfit_epoch(records: Sequence[E2ECheckpointRecord]) -> int:
     return qualified[-1] if qualified else 0
 
 
+# `DDP_MODES` (from `src.train_b0`) is shared with the frozen-B0 worker CLI;
+# `init-probe` (spec Sec 13.19.1 S0 hard gate) is specific to this worker's
+# `egostitch_e2e` family, so it is appended locally rather than widening the
+# shared tuple.
+_TRAIN_EGOSTITCH_DDP_MODES = (*DDP_MODES, "init-probe")
+
+
 def parse_args(argv: Sequence[str] | None = None) -> EgoCliArgs:
     """Parse the worker CLI (the train_b0 contract + ``--write-s0-manifest``).
 
@@ -1361,7 +1368,7 @@ def parse_args(argv: Sequence[str] | None = None) -> EgoCliArgs:
     )
     parser.add_argument(
         "--ddp-mode",
-        choices=DDP_MODES,
+        choices=_TRAIN_EGOSTITCH_DDP_MODES,
         default=None,
         help="internal multi-H20 worker mode (launched by accelerate launch).",
     )
@@ -6041,6 +6048,81 @@ def _bind_feature_standardization(
     return stats.digest
 
 
+def _run_init_probe(
+    model: EgoStitchE2E,
+    cfg: EgoConfig,
+    data: EgoStitchData,
+    accelerator: Accelerator,
+    *,
+    edge_batch: int,
+    topk_fraction: float,
+) -> dict[str, float]:
+    """Measure the collapse guard's own population at initialization.
+
+    Read-only: no optimizer step, no checkpoint, no artifact. Spec Sec 13.19.1
+    landed a preprocessing change whose whole claim is that a random model is
+    born healthy; this is where that claim is checked before GPU time is spent.
+
+    Args:
+        model: The bound, freshly initialized E2E model.
+        cfg: The loaded run configuration.
+        data: The assembled training data.
+        accelerator: The live accelerator.
+        edge_batch: Validation pair batch size.
+        topk_fraction: The registered top-k fidelity fraction.
+
+    Returns:
+        The guard telemetry plus the scale diagnostics, on the main process
+        (an empty dict on other ranks).
+
+    Raises:
+        RuntimeError: When there are no validation pairs to measure.
+        ValueError: When ``cfg.data.pack_dir`` is unset (required to build the
+            raw-token store this family's validation batches need).
+    """
+    if not data.val_pairs:
+        raise RuntimeError(
+            "init probe has an empty guard population: this config gives "
+            "_validate_epoch no validation pairs, so the slot-collapse guard "
+            "would never evaluate"
+        )
+    if cfg.data.pack_dir is None:
+        raise ValueError("data.pack_dir is required when model.family == 'egostitch_e2e'")
+    token_table = PackedFeatureTable.from_pack(cfg.data.pack_dir, torch.device("cpu"))
+    token_node_index = token_table.manifest.node_index()
+    validation = _validate_epoch(
+        model,
+        data,
+        accelerator,
+        edge_batch=edge_batch,
+        topk_fraction=topk_fraction,
+        token_table=token_table,
+        token_node_index=token_node_index,
+    )
+    if validation is None:
+        return {}
+    report = {
+        "h_pairwise_cosine_mean": validation.fidelity["h_pairwise_cosine_mean"],
+        "plan_rank1_marginal_residual": validation.fidelity["plan_rank1_marginal_residual"],
+        "pi_slot_std": validation.fidelity["pi_slot_std"],
+        "adj_offdiag_std": validation.fidelity["adj_offdiag_std"],
+        **validation.scale_telemetry,
+    }
+    logger.info(
+        "e2e init probe rows=%d feature_stats_sha256=%s %s",
+        len(data.val_pairs),
+        model.feature_stats_digest_hex,
+        " ".join(f"{name}={value:.6g}" for name, value in sorted(report.items())),
+    )
+    if report["h_pairwise_cosine_mean"] > 0.95:
+        logger.error(
+            "init probe reads above the Sec 14.4.8 cosine trip line (%.6f > 0.95): "
+            "the run would be born collapsed",
+            report["h_pairwise_cosine_mean"],
+        )
+    return report
+
+
 def _run_ddp_worker(
     cfg: EgoConfig, args: EgoCliArgs, *, registered_config_hash: str | None = None
 ) -> None:
@@ -6119,6 +6201,19 @@ def _run_ddp_worker(
             {"epoch_seconds": elapsed, "runtime_profile": result.runtime_profile},
         )
         logger.info("epoch-probe complete: %.2fs", elapsed)
+        return
+
+    if args.ddp_mode == "init-probe":
+        if not isinstance(model, EgoStitchE2E):
+            raise ValueError("--ddp-mode init-probe requires model.family == 'egostitch_e2e'")
+        _run_init_probe(
+            model,
+            cfg,
+            data,
+            accelerator,
+            edge_batch=cfg.data.edge_batch,
+            topk_fraction=cfg.diagnostics.topk_fraction,
+        )
         return
 
     if accelerator.is_main_process:
