@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>EgoStitch rev-3.1</title>
+<script defer src="https://cdn.jsdelivr.net/npm/mathjax@4.0.0/tex-chtml.js"></script>
 <style>
 :root {
   --bg: #fbfaf8;
@@ -107,9 +108,10 @@ code {
   border: 1px solid var(--rule);
   border-radius: var(--radius);
   color: var(--ink);
-  font: 13px/1.65 var(--mono);
-  white-space: pre;
+  font-size: 15px;
+  line-height: 1.65;
 }
+.equation mjx-container[display="true"] { margin: 0; text-align: left; }
 .hint { color: var(--ink-3); font-size: 12px; }
 .chip {
   display: inline-block;
@@ -164,23 +166,41 @@ tbody tr:last-child td { border-bottom: none; }
   <section>
     <h2 class="sec">Current status</h2>
     <div class="card active body-copy">
-      <p><span class="chip active">ACTIVE</span> Rev-3.1 implementation and pre-binding qualification work are in progress. The v3 registration remains <code>DRAFT</code>: G3.4 and G3.5 still require <code>V_fit</code>-only GPU calibration, and neither the prospective <code>V_qual</code> rehearsal nor formal execution is authorized until those thresholds and the implementation are frozen.</p>
+      <p><span class="chip active">ACTIVE</span> Rev-3.1 implementation and pre-binding qualification work are in progress. The v3 registration remains <code>DRAFT</code>: G3.4 and G3.5 still require \(V_{\mathrm{fit}}\)-only GPU calibration, and neither the prospective \(V_{\mathrm{qual}}\) rehearsal nor formal execution is authorized until those thresholds and the implementation are frozen.</p>
     </div>
   </section>
 
   <section>
     <h2 class="sec">Core method</h2>
-    <pre class="equation">S_u = Imagine(TokenizeLite(x_u), G(u)) = {(h_u^k, π_u^k, m_u^k, g_u^k, Â_u)}_{k=1..K}
-C^Π_kl = (5/4)‖h_i^k − h_j^l‖² + (5/16)|π_i^k − π_j^l|;   Π = Sinkhorn(C^Π)
-T̂_ij = Scaffold(S_i, S_j, Π; STAR, INTRA, ALIGN, CLOSE)
-c_topo = STE(T̂_ij);   c_cont = ContentTokens(S_i, S_j);   z_pair = Trunk(tok_i, tok_j)
-z′ = z_pair + active_topo·tanh(g_topo)(XAttn(z_pair,c_topo)−μ_topo)
-             + active_cont·tanh(g_cont)(XAttn(z_pair,c_cont)−μ_cont)
-p(edge(i,j)=1) = σ(head(abba_max(z′_AB, z′_BA)))</pre>
+    <div class="equation">
+      \[
+      \begin{aligned}
+      S_u &amp;= \operatorname{Imagine}\!\left(\operatorname{TokenizeLite}(x_u),\,G(u)\right)
+            = \left\{(h_u^k,\pi_u^k,m_u^k,g_u^k,\widehat A_u)\right\}_{k=1}^{K}, \\
+      C^{\Pi}_{k\ell} &amp;= \frac{5}{4}\lVert h_i^k-h_j^\ell\rVert_2^2
+            + \frac{5}{16}\lvert\pi_i^k-\pi_j^\ell\rvert,
+            \qquad \Pi=\operatorname{Sinkhorn}(C^{\Pi}), \\
+      \widehat T_{ij} &amp;= \operatorname{Scaffold}\!\left(S_i,S_j,\Pi;
+            \mathrm{STAR},\mathrm{INTRA},\mathrm{ALIGN},\mathrm{CLOSE}\right), \\
+      c_{\mathrm{topo}} &amp;= \operatorname{STE}(\widehat T_{ij}),\qquad
+      c_{\mathrm{cont}}=\operatorname{ContentTokens}(S_i,S_j),\qquad
+      z_{\mathrm{pair}}=\operatorname{Trunk}(\mathrm{tok}_i,\mathrm{tok}_j), \\
+      z' &amp;= z_{\mathrm{pair}}
+        + a_{\mathrm{topo}}\tanh(g_{\mathrm{topo}})
+          \left[\operatorname{XAttn}(z_{\mathrm{pair}},c_{\mathrm{topo}})-\mu_{\mathrm{topo}}\right] \\
+      &amp;\quad
+        + a_{\mathrm{cont}}\tanh(g_{\mathrm{cont}})
+          \left[\operatorname{XAttn}(z_{\mathrm{pair}},c_{\mathrm{cont}})-\mu_{\mathrm{cont}}\right], \\
+      p\!\left(y_{ij}=1\right) &amp;= \sigma\!\left(
+        \operatorname{head}\!\left(\operatorname{abba\_max}(z'_{AB},z'_{BA})\right)\right),
+      \qquad a_{\mathrm{topo}},a_{\mathrm{cont}}\in\{0,1\}.
+      \end{aligned}
+      \]
+    </div>
     <div class="grid cols-2 body-copy">
       <div class="card">
         <h3>1 · Tokenize-lite and ego-slot imagination</h3>
-        <p>Each unseen endpoint is encoded from its frozen node features and decoded into <code>K</code> soft neighbor slots carrying content <code>h</code>, existence <code>π</code>, multiplicity <code>m</code>, grounding confidence <code>g</code>, and slot adjacency <code>Â</code>. Exact top-50 cosine retrieval supplies a secondary grounding vocabulary; it is not treated as observed topology.</p>
+        <p>Each unseen endpoint is encoded from its frozen node features and decoded into \(K\) soft neighbor slots carrying content \(h\), existence \(\pi\), multiplicity \(m\), grounding confidence \(g\), and slot adjacency \(\widehat A\). Exact top-50 cosine retrieval supplies a secondary grounding vocabulary; it is not treated as observed topology.</p>
         <p>The learned-query, fixed-cardinality set decoder and bipartite set supervision descend from <a href="https://arxiv.org/abs/2005.12872">DETR (Carion et al., 2020)</a>; EgoStitch changes object queries into imagined neighbor slots and adds existence, multiplicity, and adjacency heads.</p>
       </div>
 
@@ -192,37 +212,37 @@ p(edge(i,j)=1) = σ(head(abba_max(z′_AB, z′_BA)))</pre>
 
       <div class="card">
         <h3>3 · Sinkhorn alignment and stitched scaffold</h3>
-        <p>A differentiable transport plan <code>Π</code> aligns the two imagined slot sets. The pair scaffold retains both endpoint anchors and both slot sets, then adds star edges, within-ego adjacency, cross-ego alignment, and a closure edge type. The closed-wedge feature <code>t_k=[ΠÂ̊_otherΠᵀ]_{kk}</code> exposes higher-order overlap without importing an observed test graph.</p>
+        <p>A differentiable transport plan \(\Pi\) aligns the two imagined slot sets. The pair scaffold retains both endpoint anchors and both slot sets, then adds star edges, within-ego adjacency, cross-ego alignment, and a closure edge type. The closed-wedge feature \(t_k=[\Pi\overset{\circ}{\widehat A}_{\mathrm{other}}\Pi^\top]_{kk}\) exposes higher-order overlap without importing an observed test graph.</p>
         <p>Entropic transport follows <a href="https://arxiv.org/abs/1306.0895">Sinkhorn distances (Cuturi, 2013)</a>. <a href="https://arxiv.org/abs/2111.05366">GOAT (Saad-Eldin et al., 2021)</a> and <a href="https://arxiv.org/abs/2301.12721">SLOTAlign (Tang et al., 2023)</a> align observed graphs as the task; EgoStitch uses transport internally to stitch two generated ego networks before edge classification.</p>
       </div>
 
       <div class="card">
         <h3>4 · Structure-only scaffold encoder</h3>
-        <p>The STE applies three edge-weighted message-passing layers to structural scaffold tokens. Its inputs contain anchor labels, <code>π</code>, <code>m</code>, per-edge-type soft degrees, and closed-wedge mass—never slot content <code>h</code>, grounded identity, or the pair label.</p>
+        <p>The STE applies three edge-weighted message-passing layers to structural scaffold tokens. Its inputs contain anchor labels, \(\pi\), \(m\), per-edge-type soft degrees, and closed-wedge mass—never slot content \(h\), grounded identity, or the pair label.</p>
         <p>The local-subgraph principle follows <a href="https://arxiv.org/abs/1802.09691">SEAL (Zhang and Chen, 2018)</a>, while shared-neighbor structure is motivated by <a href="https://arxiv.org/abs/2302.00890">NCN (Wang et al., 2023)</a>. EgoStitch’s protocol difference is that the encoded subgraph is generated from endpoint features rather than extracted from an observed test graph.</p>
       </div>
 
       <div class="card">
         <h3>5 · Separate content pathway</h3>
-        <p>Slot content, soft existence, grounding confidence, matched-identity probability, and counterpart-membership remain in <code>c_cont</code>. Keeping this pathway separate from the STE makes a topology-only null measurable instead of allowing content to masquerade as structure.</p>
+        <p>Slot content, soft existence, grounding confidence, matched-identity probability, and counterpart-membership remain in \(c_{\mathrm{cont}}\). Keeping this pathway separate from the STE makes a topology-only null measurable instead of allowing content to masquerade as structure.</p>
         <p>This graph-to-token interface is related to <a href="https://arxiv.org/abs/2402.05862">GraphToken (Perozzi et al., 2024)</a>; EgoStitch uses separate generated-structure and slot-content token streams to condition a binary pair classifier.</p>
       </div>
 
       <div class="card">
         <h3>6 · Centered gated pair conditioning</h3>
-        <p>A from-scratch Siamese pair trunk receives topology and content through separate cross-attention residuals in its last pair block. Each residual is centered by a synchronized active-row mean and scaled by a zero-initialized <code>tanh</code> gate, so a pathway must learn pair-varying evidence rather than a constant offset.</p>
+        <p>A from-scratch Siamese pair trunk receives topology and content through separate cross-attention residuals in its last pair block. Each residual is centered by a synchronized active-row mean \(\mu\) and scaled by a zero-initialized \(\tanh\) gate, so a pathway must learn pair-varying evidence rather than a constant offset.</p>
         <p>Zero-initialized gated cross-attention follows the fusion pattern of <a href="https://arxiv.org/abs/2204.14198">Flamingo (Alayrac et al., 2022)</a>; EgoStitch injects generated graph context into a from-scratch symmetric edge classifier rather than images into a frozen language model.</p>
       </div>
 
       <div class="card">
         <h3>7 · Checkpoint-exact pathway nulls</h3>
-        <p>The same checkpoint publishes <code>full</code>, pair-only <code>f_logit</code>, pair-plus-content, and pair-plus-topology logits. Training drops topology and content branches independently with probability <code>0.15</code>; evaluation uses exact hard bypasses, and every null preserves <code>p(i,j)=p(j,i)</code>.</p>
+        <p>The same checkpoint publishes <code>full</code>, pair-only <code>f_logit</code>, pair-plus-content, and pair-plus-topology logits. Training drops topology and content branches independently with probability \(0.15\); evaluation uses exact hard bypasses, and every null preserves \(p(i,j)=p(j,i)\).</p>
         <p>The branch-training idea follows <a href="https://arxiv.org/abs/2005.13616">modality dropout (Abdelaziz et al., 2020)</a>; here it supports within-checkpoint mechanism attribution rather than missing-modality robustness alone.</p>
       </div>
 
       <div class="card">
         <h3>8 · Relational repair objectives</h3>
-        <p><code>L_ptr</code> grounds eligible slots, <code>L_align</code> rewards double-Hungarian same-identity transport cells, <code>L_div</code> prevents unmatched-slot collapse, and logit-space <code>L_slotadj</code> sharpens adjacency learning. An STE-only auxiliary head predicts <code>log1p</code> common-neighbor count and neighborhood Jaccard for every positive and negative training pair, then is discarded before scoring.</p>
+        <p>\(L_{\mathrm{ptr}}\) grounds eligible slots, \(L_{\mathrm{align}}\) rewards double-Hungarian same-identity transport cells, \(L_{\mathrm{div}}\) prevents unmatched-slot collapse, and logit-space \(L_{\mathrm{slotadj}}\) sharpens adjacency learning. An STE-only auxiliary head predicts \(\log(1+\text{common-neighbor count})\) and neighborhood Jaccard for every positive and negative training pair, then is discarded before scoring.</p>
         <p>The relational targets use the common-neighbor signal formalized for neural link prediction by <a href="https://arxiv.org/abs/2302.00890">NCN (Wang et al., 2023)</a>; EgoStitch uses them only as train-side pressure on a generated-scaffold representation.</p>
       </div>
     </div>
@@ -230,13 +250,30 @@ p(edge(i,j)=1) = σ(head(abba_max(z′_AB, z′_BA)))</pre>
 
   <section>
     <h2 class="sec">Training objective</h2>
-    <pre class="equation">L = L_edge + 0.5 L_real + 0.1 L_ssl + 1.0 L_recon
-
-L_recon = 1.0 L_feat + 0.5 L_exist + 0.25 L_mult + 0.5 L_deg
-        + 0.5 L_slotadj + 0.25 L_gate + 0.25 L_ptr
-        + 0.5 L_align + 0.1 L_div + 0.25 L_rel</pre>
+    <div class="equation">
+      \[
+      \begin{aligned}
+      \mathcal L &amp;= \mathcal L_{\mathrm{edge}}
+        + 0.5\,\mathcal L_{\mathrm{real}}
+        + 0.1\,\mathcal L_{\mathrm{ssl}}
+        + \mathcal L_{\mathrm{recon}}, \\
+      \mathcal L_{\mathrm{recon}} &amp;=
+        \mathcal L_{\mathrm{feat}}
+        + 0.5\,\mathcal L_{\mathrm{exist}}
+        + 0.25\,\mathcal L_{\mathrm{mult}}
+        + 0.5\,\mathcal L_{\mathrm{deg}} \\
+      &amp;\quad
+        + 0.5\,\mathcal L_{\mathrm{slotadj}}
+        + 0.25\,\mathcal L_{\mathrm{gate}}
+        + 0.25\,\mathcal L_{\mathrm{ptr}}
+        + 0.5\,\mathcal L_{\mathrm{align}}
+        + 0.1\,\mathcal L_{\mathrm{div}}
+        + 0.25\,\mathcal L_{\mathrm{rel}}.
+      \end{aligned}
+      \]
+    </div>
     <div class="card body-copy">
-      <p><code>L_edge</code> is the binary queried-pair objective. <code>L_real</code> matches generated and real train-side ego statistics and random-GIN embeddings; <code>L_ssl</code> enforces feature-noise and pool-resampling consistency. Only <code>L_feat</code>, <code>L_exist</code>, <code>L_mult</code>, and <code>L_deg</code> anneal from 1.0 to 0.25 during the edge-active phase; the relational repair terms remain fully weighted.</p>
+      <p>\(\mathcal L_{\mathrm{edge}}\) is the binary queried-pair objective. \(\mathcal L_{\mathrm{real}}\) matches generated and real train-side ego statistics and random-GIN embeddings; \(\mathcal L_{\mathrm{ssl}}\) enforces feature-noise and pool-resampling consistency. Only \(\mathcal L_{\mathrm{feat}}\), \(\mathcal L_{\mathrm{exist}}\), \(\mathcal L_{\mathrm{mult}}\), and \(\mathcal L_{\mathrm{deg}}\) anneal from \(1\) to \(0.25\) during the edge-active phase; the relational repair terms remain fully weighted.</p>
     </div>
   </section>
 
@@ -250,25 +287,25 @@ L_recon = 1.0 L_feat + 0.5 L_exist + 0.25 L_mult + 0.5 L_deg
         <tbody>
           <tr>
             <td><code>G3.1</code></td>
-            <td>Full-arm slot recall at <code>n_ground=50</code></td>
-            <td><code>≥ 0.0698</code>, half the measured top-50 ceiling <code>0.13952495387963418</code></td>
+            <td>Full-arm slot recall at <code>n_ground</code> \(=50\)</td>
+            <td>\(\ge 0.0698\), half the measured top-50 ceiling \(0.13952495387963418\)</td>
             <td><span class="chip active">FROZEN</span></td>
           </tr>
           <tr>
             <td><code>G3.2</code></td>
-            <td><code>Π</code>-consistency v2: transport mass on double-Hungarian same-identity cells / total mass</td>
-            <td><code>&gt; 0.05</code></td>
+            <td>\(\Pi\)-consistency v2: transport mass on double-Hungarian same-identity cells / total mass</td>
+            <td>\(&gt; 0.05\)</td>
             <td><span class="chip active">FROZEN</span></td>
           </tr>
           <tr>
             <td><code>G3.3</code></td>
-            <td>Degree-partialled clustering probe <code>R²</code> from frozen STE states</td>
-            <td><code>≥ 0.10</code></td>
+            <td>Degree-partialled clustering probe \(R^2\) from frozen STE states</td>
+            <td>\(\ge 0.10\)</td>
             <td><span class="chip active">FROZEN</span></td>
           </tr>
           <tr>
             <td><code>G3.4</code></td>
-            <td><code>clustering-MMD(6a-v3) − clustering-MMD(full)</code></td>
+            <td>\(\operatorname{MMD}_{\mathrm{cluster}}(\texttt{6a-v3})-\operatorname{MMD}_{\mathrm{cluster}}(\texttt{full})\)</td>
             <td>Must exceed the evaluator bootstrap noise floor</td>
             <td><span class="chip pending">V_fit CALIBRATION REQUIRED</span></td>
           </tr>
@@ -281,16 +318,16 @@ L_recon = 1.0 L_feat + 0.5 L_exist + 0.25 L_mult + 0.5 L_deg
         </tbody>
       </table>
     </div>
-    <p class="hint">G3.4 and G3.5 deliberately have no invented number: both thresholds must be measured on <code>V_fit</code>, frozen before any <code>V_qual</code> access, and then evaluated prospectively.</p>
+    <p class="hint">G3.4 and G3.5 deliberately have no invented number: both thresholds must be measured on \(V_{\mathrm{fit}}\), frozen before any \(V_{\mathrm{qual}}\) access, and then evaluated prospectively.</p>
 
     <div class="grid cols-2 body-copy" style="margin-top:14px">
       <div class="card">
         <h3>Qualification sequence</h3>
-        <p><code>V_fit</code> calibration → freeze thresholds and implementation → one prospective <code>V_qual</code> rehearsal, with at most three disclosed attempts. Any failed G3 gate blocks binding. <code>V_select</code> remains sealed until the first bound formal run.</p>
+        <p>\(V_{\mathrm{fit}}\) calibration → freeze thresholds and implementation → one prospective \(V_{\mathrm{qual}}\) rehearsal, with at most three disclosed attempts. Any failed G3 gate blocks binding. \(V_{\mathrm{select}}\) remains sealed until the first bound formal run.</p>
       </div>
       <div class="card note">
         <h3>Collapse abort</h3>
-        <p>After conditioning activates, abort as <code>training_invalid(slot_collapse)</code> if mean pairwise slot-<code>h</code> cosine is <code>&gt; 0.95</code> or <code>‖Π−rcᵀ/m‖F / ‖Π‖F &lt; 0.05</code> for two consecutive validations.</p>
+        <p>After conditioning activates, abort as <code>training_invalid(slot_collapse)</code> if mean pairwise slot-\(h\) cosine is \(&gt;0.95\), or if \(\lVert\Pi-r c^\top/m\rVert_F/\lVert\Pi\rVert_F&lt;0.05\), for two consecutive validations.</p>
       </div>
     </div>
   </section>
@@ -303,19 +340,19 @@ L_recon = 1.0 L_feat + 0.5 L_exist + 0.25 L_mult + 0.5 L_deg
           <tr><th>Arm</th><th>Type</th><th>Difference from full</th><th>Diagnostic question</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>full</code></td><td>Trained</td><td>Complete rev-3.1 model; <code>n_ground=50</code>, <code>w_rel=0.25</code></td><td>Does the complete conditioned encoder carry useful relational topology?</td></tr>
+          <tr><td><code>full</code></td><td>Trained</td><td>Complete rev-3.1 model; <code>n_ground</code> \(=50\), <code>w_rel</code> \(=0.25\)</td><td>Does the complete conditioned encoder carry useful relational topology?</td></tr>
           <tr><td><code>b0_e2e_f_only</code></td><td>Trained null</td><td>Permanent all-head bypass; score <code>f_logit</code></td><td>What does the from-scratch pair trunk achieve without generated context?</td></tr>
           <tr><td><code>pair_topology</code></td><td>Trained null</td><td>Permanent content-head bypass</td><td>Does the topology pathway work without slot-content evidence?</td></tr>
-          <tr><td><code>p0</code></td><td>Trained ablation</td><td><code>p_topo=p_cont=0</code></td><td>Is branch dropout necessary to keep both pathways usable?</td></tr>
-          <tr><td><code>cosine_pool</code></td><td>Trained ablation</td><td>Status-quo cosine grounding with <code>n_ground=20</code></td><td>Does the wider grounding vocabulary matter?</td></tr>
-          <tr><td><code>no_l_rel</code></td><td>Trained ablation</td><td><code>w_rel=0</code>; relational head otherwise absent from scoring in every arm</td><td>Does train-side relational pressure create the useful STE representation?</td></tr>
-          <tr><td><code>6a-v3</code></td><td>Scoring control</td><td>Permute slot axes of <code>Â_src</code>, <code>Â_dst</code>, and <code>Π</code>, then rebuild the scaffold</td><td>Is the model sensitive to the binding between slots and relational structure?</td></tr>
-          <tr><td><code>6e-v1</code></td><td>Scoring control</td><td>Checkerboard-rewire <code>π</code>-weighted slot adjacency and <code>Π</code> directly; preserve rebuilt STAR/INTRA/ALIGN degrees while allowing CLOSE degree to move</td><td>Does the model use higher-order connectivity beyond the preserved soft-degree channels?</td></tr>
+          <tr><td><code>p0</code></td><td>Trained ablation</td><td><code>p_topo</code> \(=\) <code>p_cont</code> \(=0\)</td><td>Is branch dropout necessary to keep both pathways usable?</td></tr>
+          <tr><td><code>cosine_pool</code></td><td>Trained ablation</td><td>Status-quo cosine grounding with <code>n_ground</code> \(=20\)</td><td>Does the wider grounding vocabulary matter?</td></tr>
+          <tr><td><code>no_l_rel</code></td><td>Trained ablation</td><td><code>w_rel</code> \(=0\); relational head otherwise absent from scoring in every arm</td><td>Does train-side relational pressure create the useful STE representation?</td></tr>
+          <tr><td><code>6a-v3</code></td><td>Scoring control</td><td>Permute slot axes of \(\widehat A_{\mathrm{src}}\), \(\widehat A_{\mathrm{dst}}\), and \(\Pi\), then rebuild the scaffold</td><td>Is the model sensitive to the binding between slots and relational structure?</td></tr>
+          <tr><td><code>6e-v1</code></td><td>Scoring control</td><td>Checkerboard-rewire \(\pi\)-weighted slot adjacency and \(\Pi\) directly; preserve rebuilt STAR/INTRA/ALIGN degrees while allowing CLOSE degree to move</td><td>Does the model use higher-order connectivity beyond the preserved soft-degree channels?</td></tr>
         </tbody>
       </table>
     </div>
     <div class="card body-copy" style="margin-top:14px">
-      <p><strong>After G3:</strong> if all five qualification gates pass, the owner may replace every unresolved marker and bind an immutable v3 registration. Formal execution then runs <code>full</code> first on the previously sealed <code>V_select</code>; only an eligible, live, registration-matched full checkpoint unlocks the other five trained arms. The two controls reuse <code>full</code>'s checkpoint. The screen remains fixed-Seed-0 engineering evidence, not significance or cross-seed robustness.</p>
+      <p><strong>After G3:</strong> if all five qualification gates pass, the owner may replace every unresolved marker and bind an immutable v3 registration. Formal execution then runs <code>full</code> first on the previously sealed \(V_{\mathrm{select}}\); only an eligible, live, registration-matched full checkpoint unlocks the other five trained arms. The two controls reuse <code>full</code>'s checkpoint. The screen remains fixed-Seed-0 engineering evidence, not significance or cross-seed robustness.</p>
     </div>
   </section>
 </main>
