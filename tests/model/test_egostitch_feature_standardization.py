@@ -128,6 +128,89 @@ class TestSslNoiseCoordinates:
             torch.testing.assert_close(model.scale_feature_perturbation(noise), noise)
 
 
+class TestInitHealthUnderAnisotropicFeatures:
+    """Spec Sec 13.19.1: a random model must not be born above the guard line."""
+
+    @staticmethod
+    def _config() -> EgoStitchConfig:
+        return EgoStitchConfig(
+            input_dim=64,
+            d_p=32,
+            d_z=16,
+            d_h=32,
+            slots=16,
+            m_max=8,
+            n_ground=50,
+            decoder_layers=2,
+            n_heads=4,
+            gin_hidden=16,
+            gin_layers=2,
+            sinkhorn_iters=20,
+        )
+
+    @staticmethod
+    def _features(
+        cfg: EgoStitchConfig, *, seed: int = 0
+    ) -> tuple[np.ndarray, torch.Tensor, torch.Tensor]:
+        gen = np.random.default_rng(seed)
+        direction = np.abs(gen.standard_normal(cfg.input_dim)) + 1.0
+        rows = (40.0 * direction + 4.0 * gen.standard_normal((256, cfg.input_dim))).astype(
+            np.float32
+        )
+        x = torch.from_numpy(rows[:8])
+        pool = torch.from_numpy(
+            np.stack([rows[gen.choice(256, cfg.n_ground, replace=False)] for _ in range(8)])
+        )
+        return rows, x, pool
+
+    def _dispersion(self, mode: str, *, seed: int = 0) -> dict[str, float]:
+        from src.model.egostitch.stitch import sinkhorn_plan
+        from src.train_egostitch import e2e_dispersion_statistics
+
+        cfg = self._config()
+        rows, x, pool = self._features(cfg, seed=seed)
+        torch.manual_seed(11)
+        model = EgoStitchStage1(cfg, feature_standardization=mode)  # type: ignore[arg-type]
+        if mode == "zscore_vfit_v1":
+            model.set_feature_stats(
+                compute_feature_stats(rows, [f"n{i}" for i in range(rows.shape[0])])
+            )
+        model.eval()
+        with torch.no_grad():
+            enc = model.encode_nodes(x, pool)
+            plan = sinkhorn_plan(
+                enc.slots.h,
+                enc.slots.h,
+                enc.slots.pi,
+                enc.slots.pi,
+                enc.slots.mult,
+                enc.slots.mult,
+                eps=cfg.sinkhorn_eps,
+                iters=cfg.sinkhorn_iters,
+                tau=cfg.sinkhorn_tau,
+            )
+            stats = e2e_dispersion_statistics(enc.slots.pi, enc.slots.h, enc.slots.adj, plan)
+            stats["plan_total_mass"] = float(plan.float().sum(dim=(1, 2)).mean())
+        return stats
+
+    def test_the_fixture_reproduces_the_measured_f0_anisotropy(self) -> None:
+        cfg = self._config()
+        rows, _, _ = self._features(cfg)
+        normalized = rows / np.linalg.norm(rows, axis=1, keepdims=True)
+        gram = normalized @ normalized.T
+        off_diagonal = gram[~np.eye(rows.shape[0], dtype=bool)]
+        assert float(off_diagonal.mean()) > 0.9
+
+    def test_row_layernorm_is_born_above_the_guard_line(self) -> None:
+        assert self._dispersion("row_layernorm")["h_pairwise_cosine_mean"] > 0.95
+
+    def test_zscore_is_born_healthy_on_every_guard_criterion(self) -> None:
+        stats = self._dispersion("zscore_vfit_v1")
+        assert stats["h_pairwise_cosine_mean"] < 0.9
+        assert stats["plan_rank1_marginal_residual"] > 0.3
+        assert stats["plan_total_mass"] > 1e-6
+
+
 class TestStandardizerUnit:
     def test_load_stats_rejects_a_dimension_mismatch(self) -> None:
         standardizer = FeatureStandardizer(_TINY.input_dim)
