@@ -5930,8 +5930,10 @@ def _bind_feature_standardization(
         `row_layernorm` mode.
 
     Raises:
-        RuntimeError: When the registered mode has no statistics available, or
-            when the config pins a digest that disagrees with them.
+        RuntimeError: When the registered `zscore_vfit_v1` mode has no
+            statistics available (`data.feature_stats is None`).
+        RuntimeError: When the config pins a non-empty `feature_stats_sha256`
+            that disagrees with the assembled statistics' digest.
     """
     mode = str(cfg.model.config.get("feature_standardization", "zscore_vfit_v1"))
     if mode != "zscore_vfit_v1":

@@ -460,7 +460,11 @@ class TestE2ECompositeStep:
     """One CPU optimizer forward through the active §13.19 composite."""
 
     def _batch_and_model(
-        self, tmp_path: Path, *, w_rel: float | None = None
+        self,
+        tmp_path: Path,
+        *,
+        w_rel: float | None = None,
+        feature_standardization: str | None = None,
     ) -> tuple[te._CompositeBatch, EgoStitchE2E]:
         # EgoStitchE2E's internal generator always uses the full spec-default
         # EgoStitchConfig() (input_dim=1536, slots=16, ...), never a value
@@ -487,6 +491,8 @@ class TestE2ECompositeStep:
         model_config = dict(e2e_cfg.model.config)
         if w_rel is not None:
             model_config["w_rel"] = w_rel
+        if feature_standardization is not None:
+            model_config["feature_standardization"] = feature_standardization
         model = EgoStitchE2E(E2EConfig.from_mapping(model_config))
         return batch, model
 
@@ -801,6 +807,46 @@ class TestE2ECompositeStep:
     def test_gates_receive_gradient_after_warmstart(self, tmp_path: Path) -> None:
         torch.manual_seed(0)
         batch, model = self._batch_and_model(tmp_path)
+        composite = te._CompositeStep(model, world_size=1)
+        topo_gate, cont_gate = self._gates(model)
+
+        with self._bf16_autocast():
+            out = composite(self._payload(batch, joint_weight=1.0))
+        loss = cast(torch.Tensor, out["loss"])
+        assert bool(torch.isfinite(loss))
+        loss.backward()  # type: ignore[no-untyped-call]
+
+        assert topo_gate.gate.grad is not None
+        assert cont_gate.gate.grad is not None
+        total_abs_grad = float(topo_gate.gate.grad.abs()) + float(cont_gate.gate.grad.abs())
+        assert total_abs_grad > 0.0
+
+    def test_gates_receive_gradient_under_registered_zscore_standardization(
+        self, tmp_path: Path
+    ) -> None:
+        """The composite step must also work under the production zscore_vfit_v1 transform.
+
+        Every other test in this class pins the stateless `row_layernorm` mode
+        because they are about the composite step's optimizer/gate/probe
+        mechanics, not standardization. This is the one test that puts the two
+        together end to end.
+        """
+        torch.manual_seed(0)
+        batch, model = self._batch_and_model(
+            tmp_path, feature_standardization="zscore_vfit_v1"
+        )
+        # Offset and anisotropic per-dimension statistics so the registered
+        # transform actually rescales/recenters each feature dimension
+        # differently, rather than degenerating to a no-op.
+        rng = np.random.default_rng(7)
+        input_dim = model.generator_cfg.input_dim
+        offset = rng.uniform(-5.0, 5.0, size=input_dim)
+        scale = rng.uniform(0.1, 10.0, size=input_dim)
+        rows = (rng.normal(size=(8, input_dim)) * scale + offset).astype(np.float32)
+        stats = compute_feature_stats(rows, [f"stat_node_{i}" for i in range(rows.shape[0])])
+        model.set_feature_stats(stats)
+        assert model.feature_stats_digest_hex == stats.digest
+
         composite = te._CompositeStep(model, world_size=1)
         topo_gate, cont_gate = self._gates(model)
 
@@ -2212,6 +2258,7 @@ class TestFeatureStandardizationBinding:
         model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
 
         assert te._bind_feature_standardization(model, cfg, data) == ""
+        assert model.feature_stats_digest_hex == ""
 
 
 class TestOverfitAcceptance:

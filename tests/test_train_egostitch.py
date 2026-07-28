@@ -683,6 +683,23 @@ class TestTrainLoop:
         completed = json.loads((cfg.output_dir / "run_metadata.json").read_text())
         assert completed["preregistration_sha256"] == snapshot.sha256
 
+    def test_run_start_metadata_records_the_bound_feature_stats_digest(
+        self, tmp_path: Path
+    ) -> None:
+        cfg, data, _ = self._run(tmp_path)
+        digest = "ab" * 32
+        te.write_run_start_metadata(cfg, data, world_size=1, feature_stats_sha256=digest)
+        started = json.loads((cfg.output_dir / "run_metadata.json").read_text())
+        assert started["feature_stats_sha256"] == digest
+
+    def test_run_start_metadata_defaults_feature_stats_digest_to_empty(
+        self, tmp_path: Path
+    ) -> None:
+        cfg, data, _ = self._run(tmp_path)
+        te.write_run_start_metadata(cfg, data, world_size=1)
+        started = json.loads((cfg.output_dir / "run_metadata.json").read_text())
+        assert started["feature_stats_sha256"] == ""
+
     def test_batch_factory_deterministic(self, tmp_path: Path) -> None:
         cfg = _toy_cfg(tmp_path)
         model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
