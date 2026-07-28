@@ -52,6 +52,30 @@ pytestmark = pytest.mark.unit
 
 _TOKEN_DIM = 1536
 
+# Transcribed verbatim from the `fidelity` dict built in `_validate_epoch`'s e2e
+# branch (`src/train_egostitch.py`): the 8 top-level keys, the 5
+# `_e2e_dispersion_rows` names, and `e2e_degree_decorrelation_telemetry`'s one
+# key. This is the tripwire for the `ordered[:, 3:]` open-ended-slice bug: if
+# the dispersion summary ever picks up extra columns, `zip(..., strict=True)`
+# either raises or mis-associates names with values, and either way this set
+# comparison stops matching.
+_EXPECTED_FIDELITY_KEYS = {
+    "active_logit_std",
+    "f_logit_std",
+    "f_logit_auprc",
+    "topology_delta_std",
+    "topology_delta_ratio",
+    "selection_tiebreak",
+    "clustering_mmd",
+    "prevalence",
+    "pi_slot_std",
+    "h_pairwise_cosine_mean",
+    "adj_offdiag_std",
+    "plan_row_entropy",
+    "plan_rank1_marginal_residual",
+    "topology_delta_degree_correlation",
+}
+
 
 def _write_tiny_token_pack(pack_dir: Path, nodes: list[str], *, min_length: int = 2) -> None:
     """Write a minimal raw-token pack (same reader `_BatchFactory` consumes).
@@ -1387,6 +1411,9 @@ class TestE2ECompositeStep:
         ):
             assert key in validation_record
             assert math.isfinite(validation_record[key])
+        fidelity = cast(dict[str, float], result.history[0]["fidelity"])
+        assert set(fidelity) == _EXPECTED_FIDELITY_KEYS  # define from the current keys, verbatim
+        assert 0.0 <= fidelity["h_pairwise_cosine_mean"] <= 1.0
         assert result.best_epoch == 1
         assert guard_persistence == [False] * len(optimizer_steps)
 

@@ -419,6 +419,51 @@ def test_degree_telemetry_uses_validation_role_topology() -> None:
     np.testing.assert_array_equal(te._e2e_validation_endpoint_degrees(data), [3.0, 2.0])
 
 
+class TestScaleTelemetry:
+    def test_scale_rows_report_plan_scale_and_slot_geometry(self) -> None:
+        torch.manual_seed(0)
+        h = torch.randn(3, 4, 6)
+        plan = torch.rand(3, 4, 4)
+        rows = te._e2e_scale_rows(h, plan)
+
+        assert set(rows) == {
+            "plan_total_mass",
+            "plan_max_cell_fraction",
+            "h_norm_mean",
+            "h_pairwise_sqdist_mean",
+        }
+        torch.testing.assert_close(rows["plan_total_mass"], plan.sum(dim=(1, 2)))
+        torch.testing.assert_close(
+            rows["h_norm_mean"], torch.linalg.vector_norm(h, dim=-1).mean(dim=-1)
+        )
+        assert bool((rows["plan_max_cell_fraction"] <= 1.0).all())
+
+    def test_pairwise_squared_distance_matches_the_direct_computation(self) -> None:
+        h = torch.randn(2, 5, 3)
+        direct = ((h[:, :, None, :] - h[:, None, :, :]) ** 2).sum(-1)
+        upper = torch.triu_indices(5, 5, offset=1)
+        expected = direct[:, upper[0], upper[1]].mean(dim=-1)
+        torch.testing.assert_close(
+            te._e2e_scale_rows(h, torch.rand(2, 5, 5))["h_pairwise_sqdist_mean"],
+            expected,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+    def test_dispersion_keys_are_unchanged(self) -> None:
+        """The probe ABI and fidelity_series bind these five names exactly."""
+        rows = te._e2e_dispersion_rows(
+            torch.rand(2, 4), torch.randn(2, 4, 6), torch.rand(2, 4, 4), torch.rand(2, 4, 4)
+        )
+        assert set(rows) == {
+            "pi_slot_std",
+            "h_pairwise_cosine_mean",
+            "adj_offdiag_std",
+            "plan_row_entropy",
+            "plan_rank1_marginal_residual",
+        }
+
+
 def test_overfit_profile_is_the_first_production_epoch_not_a_compressed_schedule() -> None:
     production = te.e2e_overfit_epoch_step_counts(30)
     sampled = te.e2e_overfit_epoch_step_counts(30, profile_only=True)

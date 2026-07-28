@@ -40,7 +40,7 @@ from collections import deque
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from itertools import islice
 from pathlib import Path
@@ -862,6 +862,40 @@ def _e2e_dispersion_rows(
         "plan_row_entropy": row_entropy,
         "plan_rank1_marginal_residual": residual,
     }
+
+
+def _e2e_scale_rows(h: torch.Tensor, plan: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Compute per-row OT-scale diagnostics (training log only, never an artifact).
+
+    The Sinkhorn stage is numerically dead when squared slot distances greatly
+    exceed `eps` and diffuse-rank-1 when they are far below it (design record
+    2026-07-27 R3). These four numbers say which regime a run is in.
+
+    Args:
+        h: Shape ``(B, K, D)`` slot embeddings.
+        plan: Shape ``(B, K, K)`` transport plan.
+
+    Returns:
+        Per-row ``plan_total_mass``, ``plan_max_cell_fraction``, ``h_norm_mean``,
+        ``h_pairwise_sqdist_mean``.
+    """
+    with torch.autocast(device_type=h.device.type, enabled=False):
+        h32 = h.float()
+        plan32 = plan.float()
+        slots = h32.shape[1]
+        mass = plan32.sum(dim=(1, 2))
+        max_cell = plan32.amax(dim=(1, 2)) / mass.clamp_min(1e-30)
+        square = h32.square().sum(dim=-1)
+        distance = (
+            square[:, :, None] + square[:, None, :] - 2.0 * torch.bmm(h32, h32.transpose(1, 2))
+        ).clamp_min(0.0)
+        upper = torch.triu_indices(slots, slots, offset=1, device=h.device)
+        return {
+            "plan_total_mass": mass,
+            "plan_max_cell_fraction": max_cell,
+            "h_norm_mean": torch.linalg.vector_norm(h32, dim=-1).mean(dim=-1),
+            "h_pairwise_sqdist_mean": distance[:, upper[0], upper[1]].mean(dim=-1),
+        }
 
 
 def e2e_dispersion_statistics(
@@ -3526,6 +3560,7 @@ def _enforce_probe_s1_scale(s1_abs_mean: float, limit: float) -> None:
 class _ValidationResult:
     metrics: EdgeMetrics
     fidelity: dict[str, float]
+    scale_telemetry: dict[str, float] = field(default_factory=dict)
 
 
 def _validation_clustering_mmd(data: EgoStitchData, logits: np.ndarray) -> float:
@@ -3738,6 +3773,18 @@ def _validate_epoch(
                 }
                 for name in ("plan_row_entropy", "plan_rank1_marginal_residual"):
                     dispersion_rows[name] = dispersion_rows[name].masked_fill(is_self, torch.nan)
+                scale_a = _e2e_scale_rows(state_a.slots.h, context.plan)
+                scale_b = _e2e_scale_rows(state_b.slots.h, context.plan)
+                scale_rows = {
+                    name: (
+                        0.5 * (scale_a[name] + scale_b[name])
+                        if name in {"h_norm_mean", "h_pairwise_sqdist_mean"}
+                        else scale_a[name]
+                    )
+                    for name in scale_a
+                }
+                for name in ("plan_total_mass", "plan_max_cell_fraction"):
+                    scale_rows[name] = scale_rows[name].masked_fill(is_self, torch.nan)
                 values_out.append(
                     torch.stack(
                         [
@@ -3749,6 +3796,10 @@ def _validate_epoch(
                             dispersion_rows["adj_offdiag_std"],
                             dispersion_rows["plan_row_entropy"],
                             dispersion_rows["plan_rank1_marginal_residual"],
+                            scale_rows["plan_total_mass"],
+                            scale_rows["plan_max_cell_fraction"],
+                            scale_rows["h_norm_mean"],
+                            scale_rows["h_pairwise_sqdist_mean"],
                         ],
                         dim=-1,
                     )
@@ -3801,7 +3852,7 @@ def _validate_epoch(
                 )
             )
 
-    n_cols = 8 if is_e2e else 5
+    n_cols = 12 if is_e2e else 5
     local_values = (
         torch.cat(values_out) if values_out else torch.zeros((0, n_cols), device=accelerator.device)
     )
@@ -3843,7 +3894,21 @@ def _validate_epoch(
                 if bool(np.isfinite(values).any())
                 else 0.0
             )
-            for name, values in zip(dispersion_names, ordered[:, 3:].T, strict=True)
+            for name, values in zip(dispersion_names, ordered[:, 3:8].T, strict=True)
+        }
+        scale_names = (
+            "plan_total_mass",
+            "plan_max_cell_fraction",
+            "h_norm_mean",
+            "h_pairwise_sqdist_mean",
+        )
+        scale_telemetry = {
+            name: (
+                float(np.mean(values[np.isfinite(values)]))
+                if bool(np.isfinite(values).any())
+                else float("nan")
+            )
+            for name, values in zip(scale_names, ordered[:, 8:12].T, strict=True)
         }
         endpoint_degree = _e2e_validation_endpoint_degrees(data)
         fidelity = {
@@ -3865,9 +3930,11 @@ def _validate_epoch(
             {"s1": ordered[:, 2], "s2": ordered[:, 3], "s2_aa": ordered[:, 4]},
             topk_fraction=topk_fraction,
         )
+        scale_telemetry = {}
     return _ValidationResult(
         metrics=compute_edge_metrics(data.val_labels.astype(np.int64), probs),
         fidelity=fidelity,
+        scale_telemetry=scale_telemetry,
     )
 
 
@@ -4632,11 +4699,16 @@ def _train_e2e_stability_loop(
             logger.log(
                 logging.ERROR if slot_collapse_failure else logging.INFO,
                 "e2e slot telemetry epoch=%d h_pairwise_cosine_mean=%.6f "
-                "plan_rank1_marginal_residual=%.6f streak=%d",
+                "plan_rank1_marginal_residual=%.6f streak=%d plan_total_mass=%.6g "
+                "plan_max_cell_fraction=%.6f h_norm_mean=%.4f h_pairwise_sqdist_mean=%.4f",
                 epoch,
                 fidelity.get("h_pairwise_cosine_mean", float("nan")),
                 fidelity.get("plan_rank1_marginal_residual", float("nan")),
                 slot_collapse_guard.streak,
+                validation.scale_telemetry.get("plan_total_mass", float("nan")),
+                validation.scale_telemetry.get("plan_max_cell_fraction", float("nan")),
+                validation.scale_telemetry.get("h_norm_mean", float("nan")),
+                validation.scale_telemetry.get("h_pairwise_sqdist_mean", float("nan")),
             )
             full_joint_epochs = max(0, epoch - first_eligible_epoch + 1)
             record = E2ECheckpointRecord(
