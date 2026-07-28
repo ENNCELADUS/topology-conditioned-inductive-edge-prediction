@@ -1541,7 +1541,7 @@ global L2 norm `3.0`; topology/content conditioning is clipped to `1.0`, in the 
 is step-based and its phase boundaries are unaffected by world size.
 
 The cached F0 matrix remains the raw fp32 mean pool defined in §9.2. Inside the active
-E2E model only, immediately before every trainable generator path, each F0 row is
+V2 E2E model only, immediately before every trainable generator path, each F0 row is
 standardized by registered per-dimension z-scoring `x̃ = (x - mu) / sigma`
 (`feature_standardization: zscore_vfit_v1`). The rev-3.1 per-row
 `LayerNorm(d, elementwise_affine=False, eps=1e-5)` is retained under the name
