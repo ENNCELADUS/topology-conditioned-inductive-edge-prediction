@@ -79,8 +79,8 @@ class TestForwardContract:
         torch.testing.assert_close(model.normalize_features(x), x)
         torch.testing.assert_close(model.project_features(x), model.proj(x))
 
-    def test_e2e_generator_inputs_use_stateless_per_row_normalization(self) -> None:
-        model = EgoStitchStage1(_TINY, standardize_features=True)
+    def test_row_layernorm_mode_keeps_the_rev31_per_row_transform(self) -> None:
+        model = EgoStitchStage1(_TINY, feature_standardization="row_layernorm")
         x = 25.0 + 7.0 * torch.randn(3, _TINY.input_dim)
 
         normalized = model.normalize_features(x)
