@@ -3,8 +3,10 @@
 from collections.abc import Callable
 from typing import cast
 
+import numpy as np
 import pytest
 import torch
+from src.data.feature_stats import compute_feature_stats
 from src.model.egostitch.conditioning import (
     NULL_ALL_HEAD,
     NULL_CONTENT_HEAD,
@@ -71,6 +73,10 @@ def _tiny_model_and_batch(
         xattn_heads=4,
         p_topo=p_topo,
         p_cont=p_cont,
+        # Stateless mode: these tests exercise trunk/scaffold behavior, not
+        # the registered zscore_vfit_v1 statistics, and matches the prior
+        # `standardize_features=True` (LayerNorm) semantics exactly.
+        feature_standardization="row_layernorm",
     )
     model = EgoStitchE2E(cfg).eval()
     b, t, d_in = 4, 6, model.input_dim
@@ -595,3 +601,20 @@ def test_membership_is_content_only_and_content_null_ablates_it() -> None:
     assert torch.equal(null_a, null_b)
     assert context.topo_ab is not None and changed.topo_ab is not None
     assert torch.equal(context.topo_ab, changed.topo_ab)
+
+
+def test_generator_uses_the_configured_standardization_mode() -> None:
+    model = EgoStitchE2E(E2EConfig(feature_standardization="zscore_vfit_v1"))
+    assert model.generator.feature_standardization == "zscore_vfit_v1"
+
+
+def test_set_feature_stats_reaches_the_generator() -> None:
+    gen = np.random.default_rng(0)
+    cfg = E2EConfig(feature_standardization="zscore_vfit_v1")
+    model = EgoStitchE2E(cfg)
+    rows = (30.0 + 4.0 * gen.standard_normal((32, model.generator_cfg.input_dim))).astype(
+        np.float32
+    )
+    stats = compute_feature_stats(rows, [f"n{i}" for i in range(32)])
+    model.set_feature_stats(stats)
+    assert model.feature_stats_digest_hex == stats.digest

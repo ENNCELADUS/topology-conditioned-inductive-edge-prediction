@@ -17,13 +17,14 @@ retraining per arm.
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
+from src.data.feature_stats import FeatureStats
 from src.model.B0 import MLPHead, SiameseEncoder
 from src.model.egostitch.conditioning import (
     NULL_ALL_HEAD,
@@ -41,7 +42,7 @@ from src.model.egostitch.losses import (
     relational_loss,
 )
 from src.model.egostitch.matching import match_slots
-from src.model.egostitch.model import EgoStitchStage1
+from src.model.egostitch.model import EgoStitchStage1, FeatureStandardizationMode
 from src.model.egostitch.scaffold import (
     ContentProjector,
     ScaffoldInputPerturbation,
@@ -112,7 +113,11 @@ class EgoStitchE2E(nn.Module):
         self.node_feature_dim = self.generator_cfg.input_dim
         self.generator = EgoStitchStage1(
             self.generator_cfg,
-            standardize_features=True,
+            # E2EConfig.__post_init__ restricts this to the
+            # _FEATURE_STANDARDIZATION_MODES allowlist, a subset of
+            # FeatureStandardizationMode; the field itself stays plain `str`
+            # so YAML/checkpoint round-tripping needs no special-casing.
+            feature_standardization=cast(FeatureStandardizationMode, cfg.feature_standardization),
             loss_family="egostitch_e2e",
         )
         self.encoder = SiameseEncoder(
@@ -152,6 +157,19 @@ class EgoStitchE2E(nn.Module):
                 nn.GELU(),
                 nn.Linear(rel_hidden, 2),
             )
+
+    def set_feature_stats(self, stats: FeatureStats) -> None:
+        """Pin the registered F0 standardization constants on the generator.
+
+        Args:
+            stats: The V_fit statistics bundle.
+        """
+        self.generator.set_feature_stats(stats)
+
+    @property
+    def feature_stats_digest_hex(self) -> str:
+        """The generator's registered `feature_stats_sha256`, or ``""``."""
+        return self.generator.feature_stats_digest_hex
 
     @staticmethod
     def _select_slots(slots: SlotSet, rows: torch.Tensor) -> SlotSet:

@@ -6,7 +6,7 @@ import math
 
 import pytest
 import torch
-from src.model.egostitch.config import E2EConfig, EgoStitchConfig
+from src.model.egostitch.config import E2EConfig, EgoStitchConfig, e2e_checkpoint_config
 from src.model.egostitch.decision import DecisionHead
 from src.model.egostitch.imagine import (
     NULL_MODE_ALL,
@@ -95,6 +95,39 @@ class TestConfig:
         assert model.generator_cfg.tau_adj == 0.4
         assert model.generator_cfg.tau_div == 0.3
         assert model.generator_cfg.l_gate_pos_weight == 5.0
+
+    def test_feature_standardization_defaults_to_the_rev32_mode(self) -> None:
+        assert E2EConfig().feature_standardization == "zscore_vfit_v1"
+        assert E2EConfig().feature_stats_sha256 == ""
+
+    def test_feature_standardization_allowlist(self) -> None:
+        assert E2EConfig(feature_standardization="row_layernorm").feature_standardization == (
+            "row_layernorm"
+        )
+        with pytest.raises(ValueError, match="feature_standardization"):
+            E2EConfig(feature_standardization="layer_norm")
+
+    def test_feature_stats_sha256_must_be_empty_or_64_hex(self) -> None:
+        assert E2EConfig(feature_stats_sha256="ab" * 32).feature_stats_sha256 == "ab" * 32
+        with pytest.raises(ValueError, match="feature_stats_sha256"):
+            E2EConfig(feature_stats_sha256="deadbeef")
+
+    def test_from_mapping_accepts_the_string_fields(self) -> None:
+        cfg = E2EConfig.from_mapping(
+            {"feature_standardization": "row_layernorm", "feature_stats_sha256": "cd" * 32}
+        )
+        assert cfg.feature_standardization == "row_layernorm"
+
+    def test_checkpoint_config_backfills_rev31_as_row_layernorm(self) -> None:
+        restored = e2e_checkpoint_config({"n_ground": 50}, has_rel_head=False)
+        assert restored["feature_standardization"] == "row_layernorm"
+        assert restored["feature_stats_sha256"] == ""
+
+    def test_checkpoint_config_preserves_an_explicit_mode(self) -> None:
+        restored = e2e_checkpoint_config(
+            {"feature_standardization": "zscore_vfit_v1"}, has_rel_head=False
+        )
+        assert restored["feature_standardization"] == "zscore_vfit_v1"
 
 
 class TestTokenizeLite:

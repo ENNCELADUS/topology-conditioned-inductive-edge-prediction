@@ -14,6 +14,8 @@ from typing import Any, TypeVar, cast
 
 _ConfigT = TypeVar("_ConfigT")
 
+_FEATURE_STANDARDIZATION_MODES = frozenset({"row_layernorm", "zscore_vfit_v1"})
+
 
 def e2e_checkpoint_config(
     mapping: Mapping[str, object],
@@ -26,9 +28,17 @@ def e2e_checkpoint_config(
     lacking relational-head parameters. Reconstruct those with the head
     disabled. This does not make the incompatible pre-rev-3.1 scaffold
     (FEAT_DIM 9 / EDGE_TYPES 3) loadable under rev-3.1 code.
+
+    Checkpoints predating ``feature_standardization`` (rev-3.1 and earlier)
+    were trained with the per-row LayerNorm, not the rev-3.2 default, so a
+    missing key backfills as ``"row_layernorm"`` -- never the current
+    default -- to avoid silently re-interpreting an existing checkpoint under
+    a transform it was never trained with.
     """
     normalized = dict(mapping)
     normalized.setdefault("w_rel", E2EConfig.w_rel if has_rel_head else 0.0)
+    normalized.setdefault("feature_standardization", "row_layernorm")
+    normalized.setdefault("feature_stats_sha256", "")
     return normalized
 
 
@@ -241,6 +251,14 @@ class E2EConfig:
             EMA stored in rev-3.1 checkpoints (spec Sec 14.4.2).
         w_rel: Interior ``L_recon`` weight for the discarded-at-inference
             relational head; ``0`` defines the formal ``no_l_rel`` arm.
+        feature_standardization: Registered feature-preprocessing mode passed
+            to the internal generator (``"row_layernorm"`` or
+            ``"zscore_vfit_v1"``, spec Sec 13.16 D0). Part of ``config_hash``
+            so a run's recorded hash changes when the transform changes.
+        feature_stats_sha256: Digest pinning the exact V_fit statistics used
+            by ``"zscore_vfit_v1"``. Empty until the statistics are measured
+            at execution time; when non-empty must be a 64-hex lowercase
+            sha256.
     """
 
     d_model: int = 512
@@ -260,6 +278,8 @@ class E2EConfig:
     l_gate_pos_weight: float = 6.17
     conditioning_ema_decay: float = 0.99
     w_rel: float = 0.25
+    feature_standardization: str = "zscore_vfit_v1"
+    feature_stats_sha256: str = ""
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants.
@@ -310,6 +330,16 @@ class E2EConfig:
                 "permanent_null must be one of 'none', 'all_head', or 'content_head', "
                 f"got {self.permanent_null!r}"
             )
+        if self.feature_standardization not in _FEATURE_STANDARDIZATION_MODES:
+            raise ValueError(
+                "feature_standardization must be one of "
+                f"{sorted(_FEATURE_STANDARDIZATION_MODES)}"
+            )
+        if self.feature_stats_sha256 and (
+            len(self.feature_stats_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in self.feature_stats_sha256)
+        ):
+            raise ValueError("feature_stats_sha256 must be empty or a 64-hex lowercase sha256")
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object]) -> E2EConfig:
@@ -325,4 +355,11 @@ class E2EConfig:
         Raises:
             ValueError: On unknown keys or invalid values.
         """
-        return _from_mapping(cls, mapping, label="E2E", string_fields=frozenset({"permanent_null"}))
+        return _from_mapping(
+            cls,
+            mapping,
+            label="E2E",
+            string_fields=frozenset(
+                {"permanent_null", "feature_standardization", "feature_stats_sha256"}
+            ),
+        )
