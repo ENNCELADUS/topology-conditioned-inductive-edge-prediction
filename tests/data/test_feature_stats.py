@@ -59,6 +59,18 @@ class TestComputeFeatureStats:
         with pytest.raises(ValueError, match="node ids"):
             compute_feature_stats(_rows(8, 4), ["n0", "n1"])
 
+    def test_nan_dimension_is_rejected_as_non_finite(self) -> None:
+        rows = _rows(8, 4)
+        rows[:, 2] = np.nan
+        with pytest.raises(ValueError, match="finite"):
+            compute_feature_stats(rows, [f"n{i}" for i in range(8)])
+
+    def test_single_inf_entry_is_rejected_as_non_finite(self) -> None:
+        rows = _rows(8, 4)
+        rows[0, 2] = np.inf
+        with pytest.raises(ValueError, match="finite"):
+            compute_feature_stats(rows, [f"n{i}" for i in range(8)])
+
 
 class TestUniverseIsolation:
     def test_sealed_rows_in_the_matrix_do_not_change_the_statistics(self) -> None:

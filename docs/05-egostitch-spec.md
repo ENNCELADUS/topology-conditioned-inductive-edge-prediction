@@ -534,7 +534,13 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   contract are all unchanged; new scale diagnostics are training-log only.
   Consequence: `config_hash` changes, so rev-3.1 calibration artifacts are
   inadmissible for rev-3.2 threshold freezing and a new registration version
-  is required. Owner-confirmed 2026-07-27.
+  is required. Owner-confirmed 2026-07-27. Refinement (same landing): item 2's
+  degeneracy and non-finite checks are specified to run **before** the
+  variance floor, found by review of the D0 (`src/data/feature_stats.py`)
+  implementation because the floored form made the "hard error" structurally
+  unable to fire — `sqrt(max(0, 1e-12)) = 1e-6` survives the fp32 cast intact,
+  so a mathematically constant dimension was silently floored rather than
+  rejected.
 - 2026-07-26 (sixth entry): §14.4.3 moves the §13.19.2 checkpoint-eligibility
   warm-reference AUPRC snapshot from Phase A to the first validation after
   conditioning activates. The requirement itself is unchanged — `>= prevalence
@@ -1558,9 +1564,14 @@ mean direction of F0, so the generator's slot set is born at mean pairwise cosin
    gathering the V_fit rows, and are bit-identical to the statistics of the same rows
    loaded alone.
 2. **Estimator.** Two-pass, fp64 accumulation: `mu_j = mean_i x_ij`,
-   `var_j = mean_i (x_ij - mu_j)^2` (population, ddof = 0),
-   `sigma_j = sqrt(max(var_j, 1e-12))`. The canonical values are the fp32 casts of
-   `mu` and `sigma`; a zero or non-finite fp32 `sigma_j` is a hard error.
+   `var_j = mean_i (x_ij - mu_j)^2` (population, ddof = 0). A non-finite
+   `mu_j` or `var_j`, and a `var_j` that is exactly zero (the dimension is
+   constant across V_fit), are hard errors raised **before** the variance
+   floor is applied: the floor `sigma_j = sqrt(max(var_j, 1e-12))` exists to
+   absorb fp64/fp32 rounding on a legitimately tiny variance, never to
+   rescue a mathematically constant column, which would otherwise divide
+   pure floating-point noise by 1e-6 and inject it into every downstream
+   consumer. The canonical values are the fp32 casts of `mu` and `sigma`.
 3. **Identity.** `feature_stats_sha256` = SHA-256 over the method id, the SHA-256 of
    the ordered V_fit node-id list, the dimension, and the fp32 `mu` then `sigma`
    bytes. It is recorded in the pack manifest, in the run access audit, in

@@ -100,8 +100,9 @@ def compute_feature_stats(
 
     Raises:
         ValueError: On a shape/alignment mismatch, fewer than two rows, a
-            dimension whose fp64 variance is exactly zero (degenerate --
-            constant across the universe), or a non-finite mu/sigma.
+            non-finite fp64 or fp32 mu/var/sigma, or a dimension whose fp64
+            variance is exactly zero (degenerate -- constant across the
+            universe).
     """
     if rows.ndim != 2:
         raise ValueError("feature stats require a (n, d) row matrix")
@@ -111,7 +112,19 @@ def compute_feature_stats(
         raise ValueError("feature stats require at least two rows")
     accumulator = np.asarray(rows, dtype=np.float64)
     mu64 = accumulator.mean(axis=0)
+    if not bool(np.isfinite(mu64).all()):
+        # Checked before the variance pass: a non-finite mu64 (from a NaN or
+        # Inf input row) would make `accumulator - mu64` itself non-finite,
+        # which both warns (invalid value encountered in subtract) and would
+        # otherwise reach the degeneracy check below with an all-False mask
+        # (NaN is neither > 0 nor <= 0), crashing on an empty flatnonzero
+        # instead of raising the documented ValueError.
+        bad = int(np.flatnonzero(~np.isfinite(mu64))[0])
+        raise ValueError(f"feature stats are not finite in dimension {bad}")
     var64 = np.square(accumulator - mu64).mean(axis=0)
+    if not bool(np.isfinite(var64).all()):
+        bad = int(np.flatnonzero(~np.isfinite(var64))[0])
+        raise ValueError(f"feature stats are not finite in dimension {bad}")
     if not bool((var64 > 0.0).all()):
         # Checked *before* the variance floor: the floor exists only to guard
         # fp64-to-fp32 rounding noise on a legitimately tiny-but-nonzero
@@ -123,7 +136,10 @@ def compute_feature_stats(
     mu = mu64.astype(np.float32)
     sigma = sigma64.astype(np.float32)
     if not bool(np.isfinite(mu).all()) or not bool(np.isfinite(sigma).all()):
-        raise ValueError("feature stats are not finite")
+        # Reachable independently of the fp64 guards above: an enormous but
+        # finite fp64 value can overflow to +/-inf on the fp32 downcast even
+        # though mu64/var64 were finite.
+        raise ValueError("feature stats are not finite after the fp32 cast")
     identity = node_ids_sha256(node_ids)
     return FeatureStats(
         mu=mu,
