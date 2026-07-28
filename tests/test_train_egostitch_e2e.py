@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import networkx as nx
 import numpy as np
@@ -2098,6 +2098,37 @@ class TestPrepareAndAssembleE2E:
         ):
             te.prepare_pack(e2e_cfg, pack_dir, cold_cache=False)
 
+    def test_prepare_pack_warm_path_rejects_manifest_missing_feature_stats_entry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pre-rev-3.2 pack manifest (no `feature_stats.npz` entry) must fail closed.
+
+        [P1-A] The warm path used to validate only the files listed in the
+        pack's OWN manifest, so a pre-rev-3.2 pack directory whose manifest
+        predates this change (no `feature_stats.npz` entry) was accepted --
+        leaving the preprocessing statistics outside the recorded pack
+        identity. Simulate that by rewriting a freshly-cold-built manifest to
+        drop the entry, then re-running the warm path against it.
+        """
+        import src.data.packed_features as packed_features
+
+        monkeypatch.setattr(packed_features, "ProcessPoolExecutor", ThreadPoolExecutor)
+        _write_e2e_feature_root(tmp_path, _E2E_PIPELINE_NODES)
+        benchmark = _e2e_pipeline_benchmark()
+        monkeypatch.setattr(te, "_load_benchmark_for", lambda cfg: benchmark)
+        e2e_cfg = self._e2e_cfg(tmp_path)
+        pack_dir = tmp_path / "pack"
+
+        te.prepare_pack(e2e_cfg, pack_dir, cold_cache=True)
+
+        manifest_path = pack_dir / te._PACK_MANIFEST_FILENAME
+        manifest = json.loads(manifest_path.read_text())
+        del manifest["files"][te._PACK_FEATURE_STATS_FILENAME]
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+        with pytest.raises(ValueError, match=te._PACK_FEATURE_STATS_FILENAME):
+            te.prepare_pack(e2e_cfg, pack_dir, cold_cache=False)
+
     def test_prepare_pack_rejects_stage1_only_config_keys(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2286,6 +2317,55 @@ class TestFeatureStandardizationBinding:
 
         assert te._bind_feature_standardization(model, cfg, data) == ""
         assert model.feature_stats_digest_hex == ""
+
+    @pytest.mark.parametrize("run_kind", ["rehearsal", "formal"])
+    def test_binding_fails_closed_on_an_empty_pin_for_budgeted_run_kinds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_kind: str
+    ) -> None:
+        """[P1-B] Rehearsal/formal runs must not train on an unpinned digest.
+
+        Both consume a scarce attempt or publish an artifact, so an empty
+        `feature_stats_sha256` (the default -- nothing pinned it beforehand)
+        must be a hard error, not a silent fall-through to runtime-computed
+        constants.
+        """
+        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        cfg = replace(cfg, run_kind=cast(Literal["overfit", "rehearsal", "formal"], run_kind))
+        data = te.assemble_egostitch_data(cfg)
+        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+
+        with pytest.raises(RuntimeError, match=f"run_kind={run_kind}"):
+            te._bind_feature_standardization(model, cfg, data)
+
+        # The model must not have been bound before the raise.
+        assert model.feature_stats_digest_hex == ""
+
+    @pytest.mark.parametrize("run_kind", [None, "overfit"])
+    def test_binding_allows_an_empty_pin_for_calibration_run_kinds(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        run_kind: Literal["overfit"] | None,
+    ) -> None:
+        """[P1-B] Calibration (measuring the statistics) may leave the pin empty.
+
+        `data` is assembled once under the base (non-"overfit") config so the
+        fixture does not have to satisfy the 85-positive `overfit_manifest`
+        precondition -- `_bind_feature_standardization` itself never inspects
+        how `data` was assembled, only `cfg.run_kind` and `data.feature_stats`,
+        so binding against a `run_kind="overfit"` cfg here is still a faithful
+        test of the calibration path.
+        """
+        base_cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        data = te.assemble_egostitch_data(base_cfg)
+        cfg = replace(base_cfg, run_kind=run_kind)
+        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+
+        digest = te._bind_feature_standardization(model, cfg, data)
+
+        assert data.feature_stats is not None
+        assert digest == data.feature_stats.digest
+        assert model.feature_stats_digest_hex == digest
 
 
 class TestOverfitAcceptance:
@@ -2488,3 +2568,99 @@ class TestInitProbe:
             te._run_init_probe(
                 model, cfg, data, Accelerator(cpu=True), edge_batch=8, topk_fraction=0.1
             )
+
+
+class TestInitProbeDispatch:
+    """[P2] `_run_ddp_worker`'s ``init-probe`` branch must place the model.
+
+    Unlike the `probe`/`epoch-probe`/training branches, nothing here used to
+    call `accelerator.prepare`/`.to(device)` before handing the freshly
+    constructed (CPU) model to `_run_init_probe`, which calls `_validate_epoch`
+    -- and that moves its *batches* to `accelerator.device` unconditionally,
+    so on a real GPU cluster run this would crash on the first device
+    mismatch, exactly where the gate is supposed to run before any training
+    budget is spent.
+
+    A CPU-only test environment cannot exercise an actual device mismatch (no
+    GPU is present, so `accelerator.device` is already `cpu`), so this
+    verifies the *mechanism* instead: the dispatch branch must route the
+    model through the same `accelerator.prepare` call the other branches use
+    for device placement, before `_run_init_probe` is invoked. This is
+    necessarily a "spy on the call, not just the assertion" test, per the
+    limits of a CPU sandbox.
+    """
+
+    def test_init_probe_dispatch_prepares_the_model_before_probing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        _write_tiny_token_pack(cast(Path, cfg.data.pack_dir), _E2E_PIPELINE_NODES, min_length=3)
+
+        # Pin the calibrated digest so the (separately fixed, P1-B) rehearsal
+        # unpinned-digest gate does not interfere with this P2-focused test.
+        calibration_data = te.assemble_egostitch_data(replace(cfg, run_kind=None))
+        assert calibration_data.feature_stats is not None
+        cfg = replace(
+            cfg,
+            run_kind="rehearsal",
+            model=replace(
+                cfg.model,
+                config={
+                    **cfg.model.config,
+                    "feature_stats_sha256": calibration_data.feature_stats.digest,
+                },
+            ),
+        )
+
+        accelerator = Accelerator(cpu=True)
+        prepare_calls: list[object] = []
+        original_prepare = accelerator.prepare
+
+        def recording_prepare(*args: object, **kwargs: object) -> object:
+            prepare_calls.append(args[0] if len(args) == 1 else args)
+            return original_prepare(*args, **kwargs)
+
+        monkeypatch.setattr(accelerator, "prepare", recording_prepare)
+        monkeypatch.setattr(te, "build_egostitch_ddp_accelerator", lambda *a, **kw: accelerator)
+
+        probe_calls: list[tuple[object, object]] = []
+
+        def fake_run_init_probe(
+            model: object, cfg: object, data: object, accelerator: object, **kwargs: object
+        ) -> dict[str, float]:
+            probe_calls.append((model, accelerator))
+            return {}
+
+        monkeypatch.setattr(te, "_run_init_probe", fake_run_init_probe)
+
+        args = te.EgoCliArgs(
+            config=cfg.preregistration,  # unused on the init-probe branch
+            seed=None,
+            output_dir=None,
+            ddp_mode="init-probe",
+            pack_dir=tmp_path / "f0-pack",
+            token_budget_per_rank=4,
+            profile_output=tmp_path / "profile.json",
+        )
+
+        te._run_ddp_worker(cfg, args)
+
+        assert len(prepare_calls) == 1, "init-probe must call accelerator.prepare exactly once"
+        assert len(probe_calls) == 1
+        probed_model, probed_accelerator = probe_calls[0]
+        assert probed_accelerator is accelerator
+
+        # The prepared object must be, or must wrap, the exact model instance
+        # `_run_init_probe` goes on to use -- the same "device-move the raw
+        # model in place, then keep using `model` (not the wrapped return)"
+        # contract the training loop and `_run_probe_mode` already rely on.
+        prepared = prepare_calls[0]
+        prepared_model = prepared.model if isinstance(prepared, te._CompositeStep) else prepared
+        assert prepared_model is probed_model
+
+        # A CPU sandbox cannot fail this by device mismatch (there is only
+        # one device), but it does prove `accelerator.prepare` really ran
+        # against this model -- the same call that performs `.to(device)` on
+        # a real GPU rank.
+        for parameter in probed_model.parameters():
+            assert parameter.device == accelerator.device

@@ -1872,6 +1872,21 @@ def prepare_pack(
     else:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         file_hashes = cast(dict[str, str], manifest["files"])
+        # [P1-A] Packs built before rev-3.2 have no `feature_stats.npz` entry
+        # in their manifest at all, so the generic per-file drift loop below
+        # would simply never look at it -- leaving the preprocessing
+        # statistics outside the recorded pack identity. Require the entry
+        # explicitly instead of silently accepting (and later rebuilding) it.
+        # Scoped to `is_e2e`: family `egostitch` (Stage-1) never reads
+        # `data.feature_stats` (only `_assemble_e2e_data` computes it), so its
+        # legacy packs legitimately have no use for this file.
+        if is_e2e and _PACK_FEATURE_STATS_FILENAME not in file_hashes:
+            raise ValueError(
+                f"pack manifest at {manifest_path} has no "
+                f"{_PACK_FEATURE_STATS_FILENAME} entry (a pre-rev-3.2 pack); "
+                "rebuild the pack with cold_cache=True to register the "
+                "feature-standardization statistics"
+            )
         for name, expected in file_hashes.items():
             actual = _sha256_file(pack_dir / name)
             if actual != expected:
@@ -6021,6 +6036,11 @@ def _bind_feature_standardization(
             statistics available (`data.feature_stats is None`).
         RuntimeError: When the config pins a non-empty `feature_stats_sha256`
             that disagrees with the assembled statistics' digest.
+        RuntimeError: When `cfg.run_kind` is `"rehearsal"` or `"formal"` and
+            no `feature_stats_sha256` was pinned beforehand -- those run
+            kinds consume a scarce attempt or publish an artifact, so an
+            unpinned digest would mean the recorded registration does not
+            identify the preprocessing the model actually used.
     """
     mode = str(cfg.model.config.get("feature_standardization", "zscore_vfit_v1"))
     if mode != "zscore_vfit_v1":
@@ -6036,6 +6056,16 @@ def _bind_feature_standardization(
         raise RuntimeError(
             "feature_stats_sha256 mismatch: config pins "
             f"{pinned}, assembled statistics are {stats.digest}"
+        )
+    # [P1-B] `"rehearsal"`/`"formal"` are budgeted: a single V_qual attempt or
+    # the published screen. Calibration (`"overfit"`, and any config that
+    # never set `run_kind` at all) is the only phase allowed to measure the
+    # statistics on the fly, so only those two kinds are gated here.
+    if not pinned and cfg.run_kind in ("rehearsal", "formal"):
+        raise RuntimeError(
+            f"feature_stats_sha256 is unpinned for run_kind={cfg.run_kind}: "
+            "rehearsal and formal runs must pin the digest measured during "
+            "calibration before launching"
         )
     model.set_feature_stats(stats)
     logger.info(
@@ -6206,6 +6236,18 @@ def _run_ddp_worker(
     if args.ddp_mode == "init-probe":
         if not isinstance(model, EgoStitchE2E):
             raise ValueError("--ddp-mode init-probe requires model.family == 'egostitch_e2e'")
+        # [P2] Every other branch (`probe`, `epoch-probe`, training) reaches
+        # `accelerator.prepare` before its first forward pass, which is what
+        # actually moves the model's parameters/buffers onto
+        # `accelerator.device` -- `_validate_epoch` (which `_run_init_probe`
+        # calls) always operates on the raw, unwrapped `model`, matching how
+        # those branches keep using `model` (not the prepared/wrapped return
+        # value) for validation. Unlike them, this probe never builds an
+        # optimizer or trains, so there is nothing to wrap in `_CompositeStep`
+        # here; `accelerator.prepare` is called on the bare model and its
+        # return value is discarded, since `.prepare` mutates and moves the
+        # underlying module in place.
+        accelerator.prepare(model)
         _run_init_probe(
             model,
             cfg,
