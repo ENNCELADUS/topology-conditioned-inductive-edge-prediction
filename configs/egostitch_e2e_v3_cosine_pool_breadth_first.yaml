@@ -1,4 +1,4 @@
-# EgoStitch E2E rev-3.1 status-quo cosine-pool arm (spec §14.4.6).
+# EgoStitch E2E rev-3.2 (D0 feature standardization; spec §13.19.1) status-quo cosine-pool arm (spec §14.4.6).
 
 model:
   family: egostitch_e2e
@@ -11,6 +11,8 @@ model:
     p_cont: 0.15
     permanent_null: none
     n_ground: 20
+    feature_standardization: zscore_vfit_v1
+    feature_stats_sha256: ""
 
 data:
   root: data

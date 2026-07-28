@@ -1,4 +1,4 @@
-# EgoStitch E2E rev-3.1 no-L_rel arm (spec §14.4.6).
+# EgoStitch E2E rev-3.2 (D0 feature standardization; spec §13.19.1) no-L_rel arm (spec §14.4.6).
 
 model:
   family: egostitch_e2e
@@ -12,6 +12,8 @@ model:
     permanent_null: none
     n_ground: 50
     w_rel: 0
+    feature_standardization: zscore_vfit_v1
+    feature_stats_sha256: ""
 
 data:
   root: data

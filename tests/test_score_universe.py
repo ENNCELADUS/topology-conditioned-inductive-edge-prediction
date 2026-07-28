@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from pathlib import Path
 from typing import cast
 
@@ -20,11 +21,13 @@ from src import score_universe
 from src.data import packed_features
 from src.data.artifacts import canonical_pair
 from src.data.distributed_pairs import CompactPairBatch
+from src.data.feature_stats import compute_feature_stats
 from src.data.features import FeatureStore, build_f0_matrix
 from src.data.grounding import build_grounding_pool
 from src.data.packed_features import PackedFeatureTable, build_packed_features
 from src.model.B0 import V3_1
 from src.model.egostitch.conditioning import GatedCrossAttention
+from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.e2e_model import E2ENodeState, E2EPairContext, EgoStitchE2E
 
 INPUT_DIM = 4
@@ -207,6 +210,71 @@ def test_load_pre_rev31_e2e_checkpoint_rejects_legacy_scaffold_shape(tmp_path: P
         ),
     ):
         score_universe._load_checkpoint(checkpoint_path)
+
+
+def test_e2e_checkpoint_restores_the_feature_standardization(tmp_path: Path) -> None:
+    """A checkpoint's registered mu/sigma buffers must ride the strict load.
+
+    Scoring never sees the V_fit universe: the only way `normalize_features`
+    can reproduce training-time behavior is if `set_feature_stats`'s buffers
+    (`feature_mu`, `feature_sigma`, `feature_stats_ready`,
+    `feature_stats_digest`) are part of `state_dict()` and survive
+    `_load_checkpoint`'s strict `load_state_dict` untouched.
+    """
+    gen = np.random.default_rng(0)
+    cfg = E2EConfig(feature_standardization="zscore_vfit_v1")
+    trained = EgoStitchE2E(cfg)
+    rows = (30.0 + 4.0 * gen.standard_normal((32, trained.generator_cfg.input_dim))).astype(
+        np.float32
+    )
+    stats = compute_feature_stats(rows, [f"n{i}" for i in range(32)])
+    trained.set_feature_stats(stats)
+
+    checkpoint_path = tmp_path / "best.pt"
+    _write_checkpoint(
+        checkpoint_path,
+        model=trained,
+        model_family="egostitch_e2e",
+        model_config={**asdict(cfg), "feature_stats_sha256": stats.digest},
+    )
+
+    restored, model_family, _ = score_universe._load_checkpoint(checkpoint_path)
+    assert model_family == "egostitch_e2e"
+    assert isinstance(restored, EgoStitchE2E)
+    assert restored.feature_stats_digest_hex == stats.digest
+    x = torch.randn(4, trained.generator_cfg.input_dim)
+    torch.testing.assert_close(
+        restored.generator.normalize_features(x), trained.generator.normalize_features(x)
+    )
+
+
+def test_rev31_checkpoints_still_load_as_row_layernorm(tmp_path: Path) -> None:
+    """A checkpoint predating `feature_standardization` must not silently switch modes.
+
+    `e2e_checkpoint_config` backfills the missing key as `"row_layernorm"`
+    (never the current rev-3.2 default), so a rev-3.1 checkpoint keeps its
+    original stateless per-row transform under strict loading.
+    """
+    legacy_cfg = E2EConfig(feature_standardization="row_layernorm")
+    legacy = EgoStitchE2E(legacy_cfg)
+    legacy_config = {
+        key: value
+        for key, value in asdict(legacy_cfg).items()
+        if key not in {"feature_standardization", "feature_stats_sha256"}
+    }
+    checkpoint_path = tmp_path / "pre-rev31-e2e.pt"
+    _write_checkpoint(
+        checkpoint_path,
+        model=legacy,
+        model_family="egostitch_e2e",
+        model_config=legacy_config,
+    )
+
+    restored, _, _ = score_universe._load_checkpoint(checkpoint_path)
+    assert isinstance(restored, EgoStitchE2E)
+    assert restored.generator.feature_standardization == "row_layernorm"
+    for name, expected in legacy.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[name], expected)
 
 
 def test_default_e2e_grounding_cache_path_is_namespaced_by_pool_configuration(
@@ -1152,6 +1220,16 @@ _TINY_E2E_CONFIG: dict[str, object] = {
     "ste_dim": 16,
     "ste_layers": 2,
     "xattn_heads": 4,
+    # Explicit rather than relying on `E2EConfig`'s rev-3.2 default
+    # (`"zscore_vfit_v1"`): these tests build checkpoints through
+    # `build_model`/`_load_checkpoint` without ever calling
+    # `set_feature_stats`, and the registered mode requires those buffers to
+    # be populated before a forward pass. Pinning the stateless rev-3.1
+    # transform keeps this shared fixture representative of what it always
+    # tested (scoring/merge/precision plumbing, not feature standardization)
+    # -- the registered-stats path is covered separately in
+    # `test_e2e_checkpoint_restores_the_feature_standardization`.
+    "feature_standardization": "row_layernorm",
 }
 # EgoStitchE2E's internal Stage-1 generator keeps its own pinned spec default
 # (EgoStitchConfig().input_dim, spec Sec 13) regardless of E2EConfig, so the
