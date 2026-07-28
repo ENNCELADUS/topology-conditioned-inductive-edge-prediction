@@ -58,11 +58,23 @@ class _DirectionalConstantAttention(torch.nn.Module):
         return output, None
 
 
-def _tiny_model_and_batch(
-    *, p_topo: float = 0.15, p_cont: float = 0.15
-) -> tuple[EgoStitchE2E, dict[str, torch.Tensor]]:
-    torch.manual_seed(0)
-    cfg = E2EConfig(
+def _tiny_e2e_config(
+    *,
+    feature_standardization: str = "row_layernorm",
+    p_topo: float = 0.15,
+    p_cont: float = 0.15,
+) -> E2EConfig:
+    """Build the shared tiny trunk/generator sizing used across this file's tests.
+
+    Args:
+        feature_standardization: The registered F0 preprocessing mode.
+        p_topo: Training-time branch-dropout rate for the topo pathway.
+        p_cont: Training-time branch-dropout rate for the content pathway.
+
+    Returns:
+        The tiny `E2EConfig`.
+    """
+    return E2EConfig(
         d_model=32,
         encoder_layers=1,
         cross_attn_layers=2,
@@ -73,10 +85,19 @@ def _tiny_model_and_batch(
         xattn_heads=4,
         p_topo=p_topo,
         p_cont=p_cont,
-        # Stateless mode: these tests exercise trunk/scaffold behavior, not
-        # the registered zscore_vfit_v1 statistics, and matches the prior
-        # `standardize_features=True` (LayerNorm) semantics exactly.
-        feature_standardization="row_layernorm",
+        feature_standardization=feature_standardization,
+    )
+
+
+def _tiny_model_and_batch(
+    *, p_topo: float = 0.15, p_cont: float = 0.15
+) -> tuple[EgoStitchE2E, dict[str, torch.Tensor]]:
+    torch.manual_seed(0)
+    # Stateless mode: these tests exercise trunk/scaffold behavior, not the
+    # registered zscore_vfit_v1 statistics, and matches the prior
+    # `standardize_features=True` (LayerNorm) semantics exactly.
+    cfg = _tiny_e2e_config(
+        feature_standardization="row_layernorm", p_topo=p_topo, p_cont=p_cont
     )
     model = EgoStitchE2E(cfg).eval()
     b, t, d_in = 4, 6, model.input_dim
@@ -618,3 +639,79 @@ def test_set_feature_stats_reaches_the_generator() -> None:
     stats = compute_feature_stats(rows, [f"n{i}" for i in range(32)])
     model.set_feature_stats(stats)
     assert model.feature_stats_digest_hex == stats.digest
+
+
+def test_zscore_vfit_v1_registered_stats_actually_reach_the_forward_pass() -> None:
+    """The production default must change trunk outputs, not just pass through wiring.
+
+    Builds the same tiny architecture twice (identical seed, so identical
+    weights) differing only in `feature_standardization`, and drives both
+    through the full `forward` path on an offset, anisotropic node-feature
+    fixture. A per-dimension zscore and a per-row LayerNorm compute distinct
+    functions of such a fixture, so if the registered transform were silently
+    bypassed (e.g. `zscore_vfit_v1` collapsing to an identity or to
+    `row_layernorm` under the hood), the two logit tensors would match.
+    """
+    d_in = 1536  # frozen generator input_dim (spec Sec 0 table); E2EConfig has no override
+    fixture_gen = np.random.default_rng(0)
+    # Large per-dimension mean plus small per-row noise: a per-row LayerNorm
+    # and a per-dimension zscore diverge sharply on this shape, whereas they
+    # would agree (up to floating point) on a roughly isotropic input.
+    mean_vector = fixture_gen.uniform(10.0, 50.0, size=d_in).astype(np.float32)
+    stats_rows = mean_vector[None, :] + 0.5 * fixture_gen.standard_normal(
+        (64, d_in)
+    ).astype(np.float32)
+    stats = compute_feature_stats(stats_rows, [f"n{i}" for i in range(64)])
+
+    batch_gen = torch.Generator().manual_seed(1)
+    b, t, n_ground = 4, 6, 5
+    node_rows = torch.from_numpy(mean_vector)[None, :] + 0.5 * torch.randn(
+        b, d_in, generator=batch_gen
+    )
+    ground_rows = torch.from_numpy(mean_vector)[None, None, :] + 0.5 * torch.randn(
+        b, n_ground, d_in, generator=batch_gen
+    )
+    batch = {
+        "emb_a": torch.randn(b, t, d_in, generator=batch_gen),
+        "emb_b": torch.randn(b, t, d_in, generator=batch_gen),
+        "len_a": torch.full((b,), t, dtype=torch.long),
+        "len_b": torch.full((b,), t, dtype=torch.long),
+        "x_a": node_rows,
+        "x_b": node_rows.clone(),
+        "ground_a": ground_rows,
+        "ground_b": ground_rows.clone(),
+        "ground_id_a": torch.randint(0, 1000, (b, n_ground), dtype=torch.long),
+        "ground_id_b": torch.randint(0, 1000, (b, n_ground), dtype=torch.long),
+    }
+
+    def _activate_conditioning_gates(model: EgoStitchE2E) -> None:
+        # The trunk's topo/content injections are zero-init gated cross-
+        # attention (module docstring); at a fresh init both gates are zero,
+        # so neither pathway -- and hence no F0 standardization choice --
+        # would move the logits at all. Move them off zero, exactly as
+        # test_decompose_builds_pair_context_once_and_matches_explicit_heads
+        # and test_membership_is_content_only_and_content_null_ablates_it do.
+        with torch.no_grad():
+            cast(GatedCrossAttention, model.trunk.topo_xattn[0]).gate.data.fill_(0.7)
+            cast(GatedCrossAttention, model.trunk.cont_xattn[0]).gate.data.fill_(0.7)
+
+    torch.manual_seed(0)
+    zscore_model = EgoStitchE2E(
+        _tiny_e2e_config(feature_standardization="zscore_vfit_v1")
+    ).eval()
+    zscore_model.set_feature_stats(stats)
+    _activate_conditioning_gates(zscore_model)
+    with torch.no_grad():
+        zscore_logits = zscore_model(batch)["logits"]
+    assert zscore_logits.shape == (b,)
+    assert torch.isfinite(zscore_logits).all()
+
+    torch.manual_seed(0)
+    layernorm_model = EgoStitchE2E(
+        _tiny_e2e_config(feature_standardization="row_layernorm")
+    ).eval()
+    _activate_conditioning_gates(layernorm_model)
+    with torch.no_grad():
+        layernorm_logits = layernorm_model(batch)["logits"]
+
+    assert not torch.allclose(zscore_logits, layernorm_logits)

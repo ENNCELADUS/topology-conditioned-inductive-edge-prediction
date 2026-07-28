@@ -111,6 +111,8 @@ class TestConfig:
         assert E2EConfig(feature_stats_sha256="ab" * 32).feature_stats_sha256 == "ab" * 32
         with pytest.raises(ValueError, match="feature_stats_sha256"):
             E2EConfig(feature_stats_sha256="deadbeef")
+        with pytest.raises(ValueError, match="feature_stats_sha256"):
+            E2EConfig(feature_stats_sha256="AB" * 32)
 
     def test_from_mapping_accepts_the_string_fields(self) -> None:
         cfg = E2EConfig.from_mapping(
