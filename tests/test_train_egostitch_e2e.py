@@ -2264,13 +2264,31 @@ class TestFeatureStandardizationBinding:
     def test_binding_pins_the_statistics_and_returns_the_digest(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
-        data = te.assemble_egostitch_data(cfg)
+        """The realistic post-calibration path: the digest was already pinned.
+
+        `run_kind` is left unset here -- this worker normalizes that to
+        `"formal"` everywhere (`cfg.run_kind or "formal"`), including in this
+        binder's own rehearsal/formal pin requirement (re-reviewed P1-B), so
+        this test must pin the digest itself rather than relying on an
+        unset-`run_kind` exemption that no longer exists.
+        """
+        base_cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        data = te.assemble_egostitch_data(base_cfg)
+        assert data.feature_stats is not None
+        cfg = replace(
+            base_cfg,
+            model=replace(
+                base_cfg.model,
+                config={
+                    **base_cfg.model.config,
+                    "feature_stats_sha256": data.feature_stats.digest,
+                },
+            ),
+        )
         model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
 
         digest = te._bind_feature_standardization(model, cfg, data)
 
-        assert data.feature_stats is not None
         assert digest == data.feature_stats.digest
         assert model.feature_stats_digest_hex == digest
 
@@ -2318,47 +2336,61 @@ class TestFeatureStandardizationBinding:
         assert te._bind_feature_standardization(model, cfg, data) == ""
         assert model.feature_stats_digest_hex == ""
 
-    @pytest.mark.parametrize("run_kind", ["rehearsal", "formal"])
+    @pytest.mark.parametrize(
+        ("run_kind", "effective_run_kind"),
+        [("rehearsal", "rehearsal"), ("formal", "formal"), (None, "formal")],
+    )
     def test_binding_fails_closed_on_an_empty_pin_for_budgeted_run_kinds(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_kind: str
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        run_kind: Literal["rehearsal", "formal"] | None,
+        effective_run_kind: str,
     ) -> None:
-        """[P1-B] Rehearsal/formal runs must not train on an unpinned digest.
+        """[P1-B, re-reviewed] Rehearsal/formal -- including an UNSET run_kind -- must not train.
 
-        Both consume a scarce attempt or publish an artifact, so an empty
-        `feature_stats_sha256` (the default -- nothing pinned it beforehand)
-        must be a hard error, not a silent fall-through to runtime-computed
-        constants.
+        An unset `run_kind` is not calibration: `--run-kind`'s own help text
+        says it "defaults to formal", and every other use of `cfg.run_kind` in
+        this worker normalizes it the same way (`cfg.run_kind or "formal"`) --
+        binding validation, data-role selection, training, artifact metadata.
+        The plain default invocation (nobody passed `--run-kind` at all) must
+        not be able to bypass this pin simply by never setting it; it
+        publishes a `run_kind="formal"` artifact against V_select exactly
+        like an explicit `--run-kind formal` would.
+
+        All three consume a scarce attempt or publish an artifact, so an
+        empty `feature_stats_sha256` (the default -- nothing pinned it
+        beforehand) must be a hard error, not a silent fall-through to
+        runtime-computed constants.
         """
         cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
-        cfg = replace(cfg, run_kind=cast(Literal["overfit", "rehearsal", "formal"], run_kind))
+        cfg = replace(cfg, run_kind=run_kind)
         data = te.assemble_egostitch_data(cfg)
         model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
 
-        with pytest.raises(RuntimeError, match=f"run_kind={run_kind}"):
+        with pytest.raises(RuntimeError, match=f"run_kind={effective_run_kind}"):
             te._bind_feature_standardization(model, cfg, data)
 
         # The model must not have been bound before the raise.
         assert model.feature_stats_digest_hex == ""
 
-    @pytest.mark.parametrize("run_kind", [None, "overfit"])
-    def test_binding_allows_an_empty_pin_for_calibration_run_kinds(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        run_kind: Literal["overfit"] | None,
+    def test_binding_allows_an_empty_pin_for_calibration_run_kind(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """[P1-B] Calibration (measuring the statistics) may leave the pin empty.
+        """[P1-B] Genuine calibration (`run_kind="overfit"`) may leave the pin empty.
 
-        `data` is assembled once under the base (non-"overfit") config so the
-        fixture does not have to satisfy the 85-positive `overfit_manifest`
-        precondition -- `_bind_feature_standardization` itself never inspects
-        how `data` was assembled, only `cfg.run_kind` and `data.feature_stats`,
-        so binding against a `run_kind="overfit"` cfg here is still a faithful
-        test of the calibration path.
+        This is the only `run_kind` string exempted; an unset `run_kind` is no
+        longer treated as calibration (see the `budgeted_run_kinds` test
+        above). `data` is assembled once under the base (non-`"overfit"`) config so
+        the fixture does not have to satisfy the 85-positive
+        `overfit_manifest` precondition -- `_bind_feature_standardization`
+        itself never inspects how `data` was assembled, only `cfg.run_kind`
+        and `data.feature_stats`, so binding against a `run_kind="overfit"`
+        cfg here is still a faithful test of the calibration path.
         """
         base_cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
         data = te.assemble_egostitch_data(base_cfg)
-        cfg = replace(base_cfg, run_kind=run_kind)
+        cfg = replace(base_cfg, run_kind="overfit")
         model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
 
         digest = te._bind_feature_standardization(model, cfg, data)
@@ -2366,6 +2398,50 @@ class TestFeatureStandardizationBinding:
         assert data.feature_stats is not None
         assert digest == data.feature_stats.digest
         assert model.feature_stats_digest_hex == digest
+
+    @pytest.mark.parametrize("ddp_mode", ["probe", "epoch-probe", "init-probe"])
+    def test_binding_allows_an_empty_pin_for_preflight_dispatch_modes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ddp_mode: str
+    ) -> None:
+        """[P2 re-review] Preflight dispatch modes stay exempt even at run_kind="formal".
+
+        `init-probe` is the one documented way to *measure*
+        `feature_stats_sha256` in the first place (S0 gate runbook: run
+        `--ddp-mode init-probe`, record the digest it reports, then paste it
+        into the config) -- it necessarily runs before any digest exists to
+        pin, so it cannot be subject to the same pin requirement as the
+        `train` dispatch it precedes. `probe`/`epoch-probe` build no
+        checkpoint and publish no artifact either, so the same exemption
+        applies to them. This must hold even at the most restrictive
+        `run_kind="formal"` (an unpinned digest here would otherwise raise
+        per `test_binding_fails_closed_on_an_empty_pin_for_budgeted_run_kinds`).
+        """
+        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        cfg = replace(cfg, run_kind="formal")
+        data = te.assemble_egostitch_data(cfg)
+        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+
+        digest = te._bind_feature_standardization(model, cfg, data, ddp_mode=ddp_mode)
+
+        assert data.feature_stats is not None
+        assert digest == data.feature_stats.digest
+        assert model.feature_stats_digest_hex == digest
+
+    def test_binding_still_gates_the_train_dispatch_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """[P2 re-review] `ddp_mode="train"` is not a preflight dispatch mode.
+
+        It is the actual budgeted run, so it must still be gated exactly like
+        the no-`ddp_mode` (test-only) call above.
+        """
+        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        cfg = replace(cfg, run_kind="formal")
+        data = te.assemble_egostitch_data(cfg)
+        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+
+        with pytest.raises(RuntimeError, match="run_kind=formal"):
+            te._bind_feature_standardization(model, cfg, data, ddp_mode="train")
 
 
 class TestOverfitAcceptance:
@@ -2541,7 +2617,12 @@ class TestInitProbe:
         _write_tiny_token_pack(cast(Path, cfg.data.pack_dir), _E2E_PIPELINE_NODES, min_length=3)
         data = te.assemble_egostitch_data(cfg)
         model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
-        te._bind_feature_standardization(model, cfg, data)
+        # `ddp_mode="init-probe"` matches how `_run_ddp_worker` actually calls
+        # this before dispatching to `_run_init_probe` -- an unset `run_kind`
+        # (the default here) would otherwise now require a pinned digest
+        # (re-reviewed P1-B), which this preflight mode is explicitly exempt
+        # from since it is the one documented way to *measure* the digest.
+        te._bind_feature_standardization(model, cfg, data, ddp_mode="init-probe")
         accelerator = Accelerator(cpu=True)
         before = [p.detach().clone() for p in model.parameters()]
 
@@ -2562,7 +2643,7 @@ class TestInitProbe:
         cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
         data = replace(te.assemble_egostitch_data(cfg), val_pairs=[])
         model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
-        te._bind_feature_standardization(model, cfg, data)
+        te._bind_feature_standardization(model, cfg, data, ddp_mode="init-probe")
 
         with pytest.raises(RuntimeError, match="guard population"):
             te._run_init_probe(

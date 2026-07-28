@@ -1343,6 +1343,18 @@ def select_e2e_overfit_epoch(records: Sequence[E2ECheckpointRecord]) -> int:
 # shared tuple.
 _TRAIN_EGOSTITCH_DDP_MODES = (*DDP_MODES, "init-probe")
 
+# Preflight dispatch modes: throughput/memory profiling (`probe`,
+# `epoch-probe`) and the read-only S0 collapse gate (`init-probe`). None of
+# them build a checkpoint, write formal run-start metadata, or publish an
+# artifact -- only the `train` fallthrough branch consumes a `rehearsal`
+# attempt or produces a `formal` artifact. `init-probe` in particular is the
+# one documented way to *measure* `feature_stats_sha256` in the first place
+# (runbook Sec "S0 gate": run it, record the digest, then paste it into the
+# config) -- it necessarily runs before any digest exists to pin, so
+# `_bind_feature_standardization`'s rehearsal/formal pin requirement must not
+# apply to these modes.
+_PROBE_DISPATCH_MODES = ("probe", "epoch-probe", "init-probe")
+
 
 def parse_args(argv: Sequence[str] | None = None) -> EgoCliArgs:
     """Parse the worker CLI (the train_b0 contract + ``--write-s0-manifest``).
@@ -6018,7 +6030,7 @@ def _run_probe_mode(
 
 
 def _bind_feature_standardization(
-    model: EgoStitchE2E, cfg: EgoConfig, data: EgoStitchData
+    model: EgoStitchE2E, cfg: EgoConfig, data: EgoStitchData, *, ddp_mode: str | None = None
 ) -> str:
     """Pin the registered F0 statistics on the model before the first step.
 
@@ -6026,6 +6038,13 @@ def _bind_feature_standardization(
         model: The freshly constructed E2E model.
         cfg: The loaded run configuration.
         data: The assembled training data, carrying the V_fit statistics.
+        ddp_mode: The dispatch mode this call is being made for (``None`` when
+            called outside `_run_ddp_worker`, e.g. directly in tests). A
+            value in `_PROBE_DISPATCH_MODES` (``"probe"``, ``"epoch-probe"``,
+            ``"init-probe"``) exempts the rehearsal/formal pin requirement
+            below -- those modes build no checkpoint and publish no artifact,
+            and `init-probe` is the one documented way to *measure*
+            `feature_stats_sha256` before it exists anywhere to pin.
 
     Returns:
         The bound `feature_stats_sha256`, or ``""`` for the replay-only
@@ -6036,11 +6055,14 @@ def _bind_feature_standardization(
             statistics available (`data.feature_stats is None`).
         RuntimeError: When the config pins a non-empty `feature_stats_sha256`
             that disagrees with the assembled statistics' digest.
-        RuntimeError: When `cfg.run_kind` is `"rehearsal"` or `"formal"` and
-            no `feature_stats_sha256` was pinned beforehand -- those run
-            kinds consume a scarce attempt or publish an artifact, so an
-            unpinned digest would mean the recorded registration does not
-            identify the preprocessing the model actually used.
+        RuntimeError: When the effective run kind (`cfg.run_kind or
+            "formal"`, the same normalization the rest of this worker uses)
+            is `"rehearsal"` or `"formal"`, `ddp_mode` is not a preflight
+            dispatch mode, and no `feature_stats_sha256` was pinned
+            beforehand -- those run kinds consume a scarce attempt or publish
+            an artifact, so an unpinned digest would mean the recorded
+            registration does not identify the preprocessing the model
+            actually used.
     """
     mode = str(cfg.model.config.get("feature_standardization", "zscore_vfit_v1"))
     if mode != "zscore_vfit_v1":
@@ -6057,13 +6079,22 @@ def _bind_feature_standardization(
             "feature_stats_sha256 mismatch: config pins "
             f"{pinned}, assembled statistics are {stats.digest}"
         )
-    # [P1-B] `"rehearsal"`/`"formal"` are budgeted: a single V_qual attempt or
-    # the published screen. Calibration (`"overfit"`, and any config that
-    # never set `run_kind` at all) is the only phase allowed to measure the
-    # statistics on the fly, so only those two kinds are gated here.
-    if not pinned and cfg.run_kind in ("rehearsal", "formal"):
+    # [P1-B, re-reviewed] An unset `cfg.run_kind` is not calibration -- the
+    # CLI documents `--run-kind` as "defaults to formal", and every other use
+    # of `cfg.run_kind` in this worker normalizes it the same way
+    # (`cfg.run_kind or "formal"`: binding validation, data-role selection,
+    # training, artifact metadata). The plain default invocation must not be
+    # able to bypass this pin by simply never setting `--run-kind`. Only
+    # genuine calibration (`"overfit"`) stays exempt by run kind; the
+    # `ddp_mode` preflight exemption below is separate and narrower.
+    effective_run_kind = cfg.run_kind or "formal"
+    if (
+        not pinned
+        and ddp_mode not in _PROBE_DISPATCH_MODES
+        and effective_run_kind in ("rehearsal", "formal")
+    ):
         raise RuntimeError(
-            f"feature_stats_sha256 is unpinned for run_kind={cfg.run_kind}: "
+            f"feature_stats_sha256 is unpinned for run_kind={effective_run_kind}: "
             "rehearsal and formal runs must pin the digest measured during "
             "calibration before launching"
         )
@@ -6188,7 +6219,9 @@ def _run_ddp_worker(
         model = EgoStitchStage1(EgoStitchConfig.from_mapping(cfg.model.config))
     feature_stats_sha256 = ""
     if isinstance(model, EgoStitchE2E):
-        feature_stats_sha256 = _bind_feature_standardization(model, cfg, data)
+        feature_stats_sha256 = _bind_feature_standardization(
+            model, cfg, data, ddp_mode=args.ddp_mode
+        )
     node_batch = args.token_budget_per_rank
 
     if args.ddp_mode == "probe":
