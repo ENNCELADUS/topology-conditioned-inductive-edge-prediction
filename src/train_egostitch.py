@@ -878,11 +878,19 @@ def _e2e_scale_rows(h: torch.Tensor, plan: torch.Tensor) -> dict[str, torch.Tens
     Returns:
         Per-row ``plan_total_mass``, ``plan_max_cell_fraction``, ``h_norm_mean``,
         ``h_pairwise_sqdist_mean``.
+
+    Raises:
+        ValueError: If ``h``/``plan`` are not rank 3, or ``plan``'s batch and
+            slot dimensions disagree with ``h``'s.
     """
+    if h.ndim != 3 or plan.ndim != 3:
+        raise ValueError("scale inputs must have shapes (B,K,D) and (B,K,K)")
+    batch, slots = h.shape[:2]
+    if plan.shape != (batch, slots, slots):
+        raise ValueError("plan shape disagrees with slot embedding shape")
     with torch.autocast(device_type=h.device.type, enabled=False):
         h32 = h.float()
         plan32 = plan.float()
-        slots = h32.shape[1]
         mass = plan32.sum(dim=(1, 2))
         max_cell = plan32.amax(dim=(1, 2)) / mass.clamp_min(1e-30)
         square = h32.square().sum(dim=-1)

@@ -463,6 +463,39 @@ class TestScaleTelemetry:
             "plan_rank1_marginal_residual",
         }
 
+    def test_plan_scale_metrics_match_hand_computed_values(self) -> None:
+        """Assert `plan_total_mass`/`plan_max_cell_fraction` against hand arithmetic.
+
+        `torch.rand` fixtures keep every cell below 1, so a `<= 1.0` bound
+        check on `plan_max_cell_fraction` would pass even with the `/ mass`
+        division missing entirely. This plan is hand-built instead: row 0's
+        dominant cell (2.0) is off the diagonal and strictly less than the
+        row total (4.0), so a missing division (which would leave the raw
+        cell value 2.0 instead of 0.5) or a wrong-axis reduction (which would
+        not find the true max at position (0, 1)) both fail the assertion.
+        Row 1's dominant cell equals its total, exercising the fraction's
+        other boundary.
+        """
+        plan = torch.tensor(
+            [
+                [[0.0, 2.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 1.0]],
+                [[0.0, 0.0, 3.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            ]
+        )
+        h = torch.randn(2, 3, 5)
+        rows = te._e2e_scale_rows(h, plan)
+
+        torch.testing.assert_close(rows["plan_total_mass"], torch.tensor([4.0, 3.0]))
+        torch.testing.assert_close(
+            rows["plan_max_cell_fraction"], torch.tensor([0.5, 1.0])
+        )
+
+    def test_scale_rows_rejects_shape_mismatch_between_h_and_plan(self) -> None:
+        with pytest.raises(ValueError, match="plan shape disagrees"):
+            te._e2e_scale_rows(torch.randn(2, 4, 6), torch.rand(2, 3, 3))
+        with pytest.raises(ValueError, match="scale inputs must have shapes"):
+            te._e2e_scale_rows(torch.randn(2, 4, 6), torch.rand(2, 4))
+
 
 def test_overfit_profile_is_the_first_production_epoch_not_a_compressed_schedule() -> None:
     production = te.e2e_overfit_epoch_step_counts(30)
