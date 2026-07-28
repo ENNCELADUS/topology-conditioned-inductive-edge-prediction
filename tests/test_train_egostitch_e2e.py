@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import json
 import math
+import pickle
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -18,8 +19,10 @@ import pytest
 import torch
 from accelerate import Accelerator
 from src import train_egostitch as te
+from src.data import internal_holdout
 from src.data.artifacts import Benchmark, LabeledPairs, SplitArtifacts, canonical_pair
 from src.data.ego_targets import EgoTargetBuilder
+from src.data.feature_stats import compute_feature_stats
 from src.data.packed_features import (
     PACK_FORMAT,
     PackedFeatureManifest,
@@ -1964,6 +1967,94 @@ class TestPrepareAndAssembleE2E:
         for key in ("emb_a", "emb_b", "len_a", "len_b", "ground_id_i", "ground_id_j"):
             assert key in batch.edge
         assert "s0" not in batch.edge
+
+    def _assemble_holdout_e2e_data(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, n_ground: int = 3
+    ) -> te.EgoStitchData:
+        """Assemble e2e data through the real V_fit/V_qual/V_select holdout path.
+
+        `_e2e_cfg` leaves `cfg.training` unset, so `assemble_egostitch_data`
+        takes its legacy non-training branch (plain `benchmark.split.train_nodes`,
+        no internal holdout). Task 6's V_fit standardization statistics are only
+        computed in `_assemble_e2e_data`, which requires `cfg.training is not
+        None` to be selected. Setting it routes assembly through the real
+        `derive_internal_holdout` machinery, which needs real
+        `split.pkl`/`train_edges.txt` files on disk (unlike
+        `_load_benchmark_for`, `_assemble_e2e_data` never consults the
+        monkeypatched in-memory `Benchmark`).
+
+        `derive_internal_holdout`'s default `holdout_size=256` cannot fit the
+        25-node pipeline fixture (`largest remaining message component has
+        N nodes; need 256`), so it is monkeypatched to call the same, real BFS
+        holdout algorithm with `holdout_size=4` -- not a stub. With this
+        fixture's `partition_seed=0`/`msg_fraction=0.8`, that deterministically
+        yields disjoint universes: 17 `V_fit` nodes, 4 `V_qual`, 4 `V_select`
+        (verified empirically). `n_ground` defaults to 3 because `V_select`
+        only has 4 nodes (`build_grounding_pool` requires `n_ground <=
+        len(universe) - 1`).
+        """
+        _write_e2e_feature_root(tmp_path, _E2E_PIPELINE_NODES)
+        strategy_dir = tmp_path / "data" / te._BENCHMARK_SUBDIR / "toy"
+        strategy_dir.mkdir(parents=True, exist_ok=True)
+        with (strategy_dir / "split.pkl").open("wb") as handle:
+            pickle.dump({"train": _E2E_PIPELINE_NODES, "test": []}, handle)
+        n = len(_E2E_PIPELINE_NODES)
+        edges = [(_E2E_PIPELINE_NODES[i], _E2E_PIPELINE_NODES[(i + 1) % n]) for i in range(n)]
+        (strategy_dir / "train_edges.txt").write_text(
+            "".join(f"{u}\t{v}\t1\n" for u, v in edges), encoding="utf-8"
+        )
+
+        def tiny_holdout(
+            train_nodes: list[str],
+            e_msg: frozenset[tuple[str, str]],
+            e_sup: frozenset[tuple[str, str]],
+        ) -> internal_holdout.InternalHoldoutPartition:
+            return internal_holdout.derive_internal_holdout(
+                train_nodes, e_msg, e_sup, holdout_size=4
+            )
+
+        monkeypatch.setattr(te, "derive_internal_holdout", tiny_holdout)
+        cfg = self._e2e_cfg(tmp_path)
+        e2e_cfg = replace(
+            cfg,
+            model=ModelConfig(family="egostitch_e2e", config={"n_ground": n_ground}),
+            training=te.EgoStitchTrainingConfig(),
+        )
+        return te.assemble_egostitch_data(e2e_cfg)
+
+    def test_assembly_registers_v_fit_feature_statistics(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The registered constants are computed and audited against V_fit."""
+        data = self._assemble_holdout_e2e_data(tmp_path, monkeypatch)
+
+        assert data.feature_stats is not None
+        audit = data.access_audit or {}
+        assert audit["training_feature_stats_sha256"] == data.feature_stats.digest
+        # The statistics universe is exactly the audited V_fit id list.
+        assert (
+            audit["training_feature_stats_universe_sha256"]
+            == audit["training_feature_nodes_sha256"]
+        )
+        assert audit["training_feature_stats_rows"] == data.feature_stats.n_rows
+        assert data.feature_stats.n_rows == len(data.train_nodes)
+
+    def test_assembly_statistics_ignore_sealed_validation_rows(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The loaded matrix carries V_select rows; the constants must not see them."""
+        data = self._assemble_holdout_e2e_data(tmp_path, monkeypatch)
+        assert data.feature_stats is not None
+        assert data.validation_nodes  # precondition: sealed rows really are in the matrix
+
+        expected = compute_feature_stats(
+            np.asarray(
+                data.f0.numpy()[[data.node_index[node] for node in data.train_nodes]],
+                dtype=np.float32,
+            ),
+            data.train_nodes,
+        )
+        assert data.feature_stats.digest == expected.digest
 
 
 class TestOverfitAcceptance:

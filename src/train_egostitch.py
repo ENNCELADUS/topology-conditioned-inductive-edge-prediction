@@ -57,6 +57,7 @@ from scipy.stats import kendalltau
 
 from src.data.artifacts import Benchmark, canonical_pair, load_benchmark
 from src.data.ego_targets import EgoTargetBuilder, EgoTargets
+from src.data.feature_stats import FeatureStats, feature_stats_for_universe
 from src.data.features import FeatureStore, build_f0_matrix
 from src.data.grounding import build_grounding_pool
 from src.data.internal_holdout import InternalHoldoutPartition, derive_internal_holdout
@@ -106,6 +107,7 @@ _PACK_F0_FILENAME = "f0_matrix.pt"
 _PACK_GROUNDING_FILENAME = "grounding.npz"
 _PACK_VALIDATION_GROUNDING_FILENAME = "grounding_validation.npz"
 _PACK_MANIFEST_FILENAME = "manifest.json"
+_PACK_FEATURE_STATS_FILENAME = "feature_stats.npz"
 
 
 def _egostitch_ddp_kwargs(
@@ -1782,7 +1784,17 @@ def prepare_pack(
             role_universe="V_fit",
             cache_path=pack_dir / _PACK_GROUNDING_FILENAME,
         )
-        files = [_PACK_F0_FILENAME, _PACK_GROUNDING_FILENAME]
+        feature_stats_for_universe(
+            np.asarray(matrix.numpy(), dtype=np.float32),
+            index,
+            train_nodes,
+            cache_path=pack_dir / _PACK_FEATURE_STATS_FILENAME,
+        )
+        files = [
+            _PACK_F0_FILENAME,
+            _PACK_GROUNDING_FILENAME,
+            _PACK_FEATURE_STATS_FILENAME,
+        ]
         if validation_nodes:
             assert role is not None
             validation_rows = np.asarray(
@@ -2035,6 +2047,8 @@ class EgoStitchData:
         sampler: The pinned negative sampler.
         s0: The frozen-B0 logit cache.
         rho_train: Message-partition edge density (spec Sec 9.3).
+        feature_stats: Registered V_fit-only standardization constants
+            (spec Sec 13.19.1), or ``None`` on the legacy non-training path.
     """
 
     train_nodes: list[str]
@@ -2057,6 +2071,7 @@ class EgoStitchData:
     validation_grounding_index: NDArray[np.int64] | None = None
     validation_pos: dict[str, int] | None = None
     overfit_manifest: OverfitManifest | None = None
+    feature_stats: FeatureStats | None = None
 
 
 def _read_labeled_pairs(path: Path) -> tuple[list[tuple[str, str]], NDArray[np.int8]]:
@@ -2195,6 +2210,17 @@ def _assemble_e2e_data(
     fit_rows = np.asarray(
         matrix.numpy()[[node_index[node] for node in fit_nodes]], dtype=np.float32
     )
+    feature_stats_cache = (
+        (pack_dir / _PACK_FEATURE_STATS_FILENAME)
+        if pack_dir is not None
+        else cfg.data.f0_cache.with_name(_PACK_FEATURE_STATS_FILENAME)
+    )
+    feature_stats = feature_stats_for_universe(
+        np.asarray(matrix.numpy(), dtype=np.float32),
+        node_index,
+        fit_nodes,
+        cache_path=feature_stats_cache,
+    )
     grounding_cache = (
         (pack_dir / _PACK_GROUNDING_FILENAME) if pack_dir is not None else cfg.data.grounding_cache
     )
@@ -2281,7 +2307,14 @@ def _assemble_e2e_data(
         "forbidden_files_absent": forbidden_files_absent,
         "quarantine_counts": asdict(holdout.quarantine_counts),
         "overlap_proof": asdict(holdout.overlap_proof),
+        "training_feature_stats_sha256": feature_stats.digest,
+        "training_feature_stats_universe_sha256": feature_stats.node_ids_sha256,
+        "training_feature_stats_rows": feature_stats.n_rows,
     }
+    if audit["training_feature_stats_universe_sha256"] != audit["training_feature_nodes_sha256"]:
+        raise RuntimeError(
+            "feature standardization statistics were computed over a universe other than V_fit"
+        )
     present_forbidden = [name for name, absent in forbidden_files_absent.items() if not absent]
     if present_forbidden and run_kind != "formal":
         raise RuntimeError(
@@ -2307,6 +2340,7 @@ def _assemble_e2e_data(
         sampler=sampler,
         s0=s0,
         rho_train=rho_train,
+        feature_stats=feature_stats,
         internal_holdout=holdout,
         validation_role=role,
         access_audit=audit,
