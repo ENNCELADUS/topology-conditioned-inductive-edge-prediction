@@ -1866,6 +1866,61 @@ def _write_e2e_feature_root(tmp_path: Path, nodes: list[str], *, input_dim: int 
     )
 
 
+def _holdout_e2e_cfg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, n_ground: int = 3
+) -> te.EgoConfig:
+    """Build an e2e config that assembles through the real V_fit/V_qual/V_select holdout path.
+
+    `_toy_cfg` alone leaves `cfg.training` unset, so `assemble_egostitch_data`
+    takes its legacy non-training branch (plain `benchmark.split.train_nodes`,
+    no internal holdout). Task 6's V_fit standardization statistics are only
+    computed in `_assemble_e2e_data`, which requires `cfg.training is not
+    None` to be selected. Setting it routes assembly through the real
+    `derive_internal_holdout` machinery, which needs real
+    `split.pkl`/`train_edges.txt` files on disk (unlike `_load_benchmark_for`,
+    `_assemble_e2e_data` never consults the monkeypatched in-memory
+    `Benchmark`).
+
+    `derive_internal_holdout`'s default `holdout_size=256` cannot fit the
+    25-node pipeline fixture (`largest remaining message component has N
+    nodes; need 256`), so it is monkeypatched to call the same, real BFS
+    holdout algorithm with `holdout_size=4` -- not a stub. With this
+    fixture's `partition_seed=0`/`msg_fraction=0.8`, that deterministically
+    yields disjoint universes: 17 `V_fit` nodes, 4 `V_qual`, 4 `V_select`
+    (verified empirically). `n_ground` defaults to 3 because `V_select` only
+    has 4 nodes (`build_grounding_pool` requires `n_ground <= len(universe) -
+    1`).
+    """
+    _write_e2e_feature_root(tmp_path, _E2E_PIPELINE_NODES)
+    strategy_dir = tmp_path / "data" / te._BENCHMARK_SUBDIR / "toy"
+    strategy_dir.mkdir(parents=True, exist_ok=True)
+    with (strategy_dir / "split.pkl").open("wb") as handle:
+        pickle.dump({"train": _E2E_PIPELINE_NODES, "test": []}, handle)
+    n = len(_E2E_PIPELINE_NODES)
+    edges = [(_E2E_PIPELINE_NODES[i], _E2E_PIPELINE_NODES[(i + 1) % n]) for i in range(n)]
+    (strategy_dir / "train_edges.txt").write_text(
+        "".join(f"{u}\t{v}\t1\n" for u, v in edges), encoding="utf-8"
+    )
+
+    def tiny_holdout(
+        train_nodes: list[str],
+        e_msg: frozenset[tuple[str, str]],
+        e_sup: frozenset[tuple[str, str]],
+    ) -> internal_holdout.InternalHoldoutPartition:
+        return internal_holdout.derive_internal_holdout(
+            train_nodes, e_msg, e_sup, holdout_size=4
+        )
+
+    monkeypatch.setattr(te, "derive_internal_holdout", tiny_holdout)
+    cfg = _toy_cfg(tmp_path)
+    cfg = replace(cfg, data=replace(cfg.data, pack_dir=tmp_path / "raw-token-pack"))
+    return replace(
+        cfg,
+        model=ModelConfig(family="egostitch_e2e", config={"n_ground": n_ground}),
+        training=te.EgoStitchTrainingConfig(),
+    )
+
+
 class TestPrepareAndAssembleE2E:
     """config load -> prepare_pack -> assemble_egostitch_data, family egostitch_e2e."""
 
@@ -2022,54 +2077,12 @@ class TestPrepareAndAssembleE2E:
     ) -> te.EgoStitchData:
         """Assemble e2e data through the real V_fit/V_qual/V_select holdout path.
 
-        `_e2e_cfg` leaves `cfg.training` unset, so `assemble_egostitch_data`
-        takes its legacy non-training branch (plain `benchmark.split.train_nodes`,
-        no internal holdout). Task 6's V_fit standardization statistics are only
-        computed in `_assemble_e2e_data`, which requires `cfg.training is not
-        None` to be selected. Setting it routes assembly through the real
-        `derive_internal_holdout` machinery, which needs real
-        `split.pkl`/`train_edges.txt` files on disk (unlike
-        `_load_benchmark_for`, `_assemble_e2e_data` never consults the
-        monkeypatched in-memory `Benchmark`).
-
-        `derive_internal_holdout`'s default `holdout_size=256` cannot fit the
-        25-node pipeline fixture (`largest remaining message component has
-        N nodes; need 256`), so it is monkeypatched to call the same, real BFS
-        holdout algorithm with `holdout_size=4` -- not a stub. With this
-        fixture's `partition_seed=0`/`msg_fraction=0.8`, that deterministically
-        yields disjoint universes: 17 `V_fit` nodes, 4 `V_qual`, 4 `V_select`
-        (verified empirically). `n_ground` defaults to 3 because `V_select`
-        only has 4 nodes (`build_grounding_pool` requires `n_ground <=
-        len(universe) - 1`).
+        See the module-level `_holdout_e2e_cfg` for why the holdout size and
+        node counts are what they are.
         """
-        _write_e2e_feature_root(tmp_path, _E2E_PIPELINE_NODES)
-        strategy_dir = tmp_path / "data" / te._BENCHMARK_SUBDIR / "toy"
-        strategy_dir.mkdir(parents=True, exist_ok=True)
-        with (strategy_dir / "split.pkl").open("wb") as handle:
-            pickle.dump({"train": _E2E_PIPELINE_NODES, "test": []}, handle)
-        n = len(_E2E_PIPELINE_NODES)
-        edges = [(_E2E_PIPELINE_NODES[i], _E2E_PIPELINE_NODES[(i + 1) % n]) for i in range(n)]
-        (strategy_dir / "train_edges.txt").write_text(
-            "".join(f"{u}\t{v}\t1\n" for u, v in edges), encoding="utf-8"
+        return te.assemble_egostitch_data(
+            _holdout_e2e_cfg(tmp_path, monkeypatch, n_ground=n_ground)
         )
-
-        def tiny_holdout(
-            train_nodes: list[str],
-            e_msg: frozenset[tuple[str, str]],
-            e_sup: frozenset[tuple[str, str]],
-        ) -> internal_holdout.InternalHoldoutPartition:
-            return internal_holdout.derive_internal_holdout(
-                train_nodes, e_msg, e_sup, holdout_size=4
-            )
-
-        monkeypatch.setattr(te, "derive_internal_holdout", tiny_holdout)
-        cfg = self._e2e_cfg(tmp_path)
-        e2e_cfg = replace(
-            cfg,
-            model=ModelConfig(family="egostitch_e2e", config={"n_ground": n_ground}),
-            training=te.EgoStitchTrainingConfig(),
-        )
-        return te.assemble_egostitch_data(e2e_cfg)
 
     def test_assembly_registers_v_fit_feature_statistics(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2139,6 +2152,66 @@ class TestPrepareAndAssembleE2E:
 
         with pytest.raises(RuntimeError, match="V_fit"):
             self._assemble_holdout_e2e_data(tmp_path, monkeypatch)
+
+
+class TestFeatureStandardizationBinding:
+    """`_bind_feature_standardization` pins the registered statistics, fail-closed."""
+
+    def test_binding_pins_the_statistics_and_returns_the_digest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        data = te.assemble_egostitch_data(cfg)
+        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+
+        digest = te._bind_feature_standardization(model, cfg, data)
+
+        assert data.feature_stats is not None
+        assert digest == data.feature_stats.digest
+        assert model.feature_stats_digest_hex == digest
+
+    def test_binding_fails_closed_on_a_pinned_digest_mismatch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        cfg = replace(
+            cfg,
+            model=replace(
+                cfg.model,
+                config={**cfg.model.config, "feature_stats_sha256": "ab" * 32},
+            ),
+        )
+        data = te.assemble_egostitch_data(cfg)
+        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+
+        with pytest.raises(RuntimeError, match="feature_stats_sha256"):
+            te._bind_feature_standardization(model, cfg, data)
+
+    def test_binding_fails_closed_when_statistics_are_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        data = replace(te.assemble_egostitch_data(cfg), feature_stats=None)
+        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+
+        with pytest.raises(RuntimeError, match="statistics"):
+            te._bind_feature_standardization(model, cfg, data)
+
+    def test_row_layernorm_binds_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        cfg = replace(
+            cfg,
+            model=replace(
+                cfg.model,
+                config={**cfg.model.config, "feature_standardization": "row_layernorm"},
+            ),
+        )
+        data = te.assemble_egostitch_data(cfg)
+        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+
+        assert te._bind_feature_standardization(model, cfg, data) == ""
 
 
 class TestOverfitAcceptance:

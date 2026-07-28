@@ -55,6 +55,17 @@ _E2E_TINY_MODEL: dict[str, object] = {
     # Sec 14.4.4) stays consistent with those fixtures rather than silently
     # picking up the unrelated rev-3.1 default (50).
     "n_ground": 20,
+    # `_toy_bundle` builds an in-memory `EgoStitchData` with `feature_stats
+    # is None` -- it never goes through `assemble_egostitch_data`'s V_fit
+    # statistics path (Task 6), so the `zscore_vfit_v1` default would raise
+    # unless a test explicitly registers statistics first. The
+    # `TestE2ECompositeStep`/`TestPrepareAndAssembleE2E`-adjacent suites that
+    # build models from this dict exercise the composite optimizer step,
+    # gates, family/budget probes, and telemetry -- not standardization --
+    # so pin the stateless, byte-identical-to-what-these-tests-were-written-
+    # against transform, exactly like `_tiny_model_and_batch` does in
+    # tests/model/test_egostitch_e2e_model.py.
+    "feature_standardization": "row_layernorm",
 }
 
 

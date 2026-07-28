@@ -5493,6 +5493,7 @@ def write_run_start_metadata(
     registered_config_hash: str | None = None,
     config_path: Path | None = None,
     formal_binding: Mapping[str, str] | None = None,
+    feature_stats_sha256: str | None = None,
 ) -> None:
     """Bind the run to config, preregistration, and s0 before optimization."""
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
@@ -5537,6 +5538,7 @@ def write_run_start_metadata(
         "implementation_commit": (
             formal_binding.get("implementation_commit") if formal_binding is not None else None
         ),
+        "feature_stats_sha256": feature_stats_sha256 or "",
     }
     path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
@@ -5913,6 +5915,50 @@ def _run_probe_mode(
     logger.info("probe complete: %s", probe.to_dict())
 
 
+def _bind_feature_standardization(
+    model: EgoStitchE2E, cfg: EgoConfig, data: EgoStitchData
+) -> str:
+    """Pin the registered F0 statistics on the model before the first step.
+
+    Args:
+        model: The freshly constructed E2E model.
+        cfg: The loaded run configuration.
+        data: The assembled training data, carrying the V_fit statistics.
+
+    Returns:
+        The bound `feature_stats_sha256`, or ``""`` for the replay-only
+        `row_layernorm` mode.
+
+    Raises:
+        RuntimeError: When the registered mode has no statistics available, or
+            when the config pins a digest that disagrees with them.
+    """
+    mode = str(cfg.model.config.get("feature_standardization", "zscore_vfit_v1"))
+    if mode != "zscore_vfit_v1":
+        return ""
+    stats = data.feature_stats
+    if stats is None:
+        raise RuntimeError(
+            "feature standardization statistics are unavailable; "
+            "rebuild the feature pack before training"
+        )
+    pinned = str(cfg.model.config.get("feature_stats_sha256", ""))
+    if pinned and pinned != stats.digest:
+        raise RuntimeError(
+            "feature_stats_sha256 mismatch: config pins "
+            f"{pinned}, assembled statistics are {stats.digest}"
+        )
+    model.set_feature_stats(stats)
+    logger.info(
+        "registered feature standardization mode=%s rows=%d feature_stats_sha256=%s pinned=%s",
+        mode,
+        stats.n_rows,
+        stats.digest,
+        "yes" if pinned else "no",
+    )
+    return stats.digest
+
+
 def _run_ddp_worker(
     cfg: EgoConfig, args: EgoCliArgs, *, registered_config_hash: str | None = None
 ) -> None:
@@ -5946,6 +5992,9 @@ def _run_ddp_worker(
         model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
     else:
         model = EgoStitchStage1(EgoStitchConfig.from_mapping(cfg.model.config))
+    feature_stats_sha256 = ""
+    if isinstance(model, EgoStitchE2E):
+        feature_stats_sha256 = _bind_feature_standardization(model, cfg, data)
     node_batch = args.token_budget_per_rank
 
     if args.ddp_mode == "probe":
@@ -6000,6 +6049,7 @@ def _run_ddp_worker(
             registered_config_hash=registered_config_hash,
             config_path=args.config,
             formal_binding=formal_binding,
+            feature_stats_sha256=feature_stats_sha256,
         )
     accelerator.wait_for_everyone()
     result = train_egostitch_ddp_loop(
