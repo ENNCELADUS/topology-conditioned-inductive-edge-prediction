@@ -496,19 +496,59 @@ rule).
    closes the frozen-s0 screen and satisfies spec §14.3(1), without binding the
    successor registration or weakening E1/E3's multi-seed inference rules. Full
    result: `docs/results/G5-stage1-seed0-20260717.md`.
+   **Code retirement (planned, not yet executed).** The two-stage cleanup design
+   (`docs/superpowers/specs/2026-07-29-egostitch-e2e-two-stage-cleanup.md` §6.2)
+   is a PROPOSED document outside this repository's authority chain; per the
+   spec-freeze rule a design authorizes implementation only, not execution. It
+   proposes retiring the frozen-s0 `egostitch` pipeline that produced this
+   screen — Stage-1 training/DDP path, `frozen_s0` scoring mode, and its
+   diagnostics — from the codebase, but the code is not yet removed. Once that
+   retirement lands, the Stage-gate instantiation and dated entries above will
+   govern the completed, published screen only and will no longer describe a
+   runnable pipeline. `docs/results/G5-stage1-seed0-20260717.md`,
+   `docs/registrations/g5_stage1_preregistration.{json,md}`, and
+   `outputs/egostitch_stage1/` remain the citable record regardless of when
+   that retirement lands; the cleanup design's §6.2 proposes each then carry a
+   one-line header naming the commit at which the producing code was removed —
+   a pending intention, not yet an in-force requirement of this document. The
+   rule that a Stage-1-descended screen carries engineering evidence regardless
+   of seed count — inference reserved for E1/E3 under §5.2's ≥3-seed Holm
+   procedure plus the §8-spec 30-config HPO-parity budget — is unaffected by
+   the (pending) code retirement and applies unchanged to any successor ladder.
    **E2E v1 training outcome and prospective replacement (2026-07-19):** the
    registered v1 `full` arm completed its engineering training pipeline, but its
    validation-selected checkpoint came from the reconstruction-only warm-start; the
    subsequent joint phase showed collapsed validation logits and non-finite fixed-probe
    edge-family gradients. No v1 candidate scores, remaining arms, or held-out G5 gate
    result were produced, so this is a training-validity failure rather than a G5
-   scientific verdict. The v1 BINDING registration remains immutable. A versioned v2
-   DRAFT replacement is governed by spec §13.19: train/validation-only qualification,
-   post-ramp arm-specific checkpoint eligibility, node-disjoint internal `E_msg`
-   topology holdouts for model selection under an AUPRC tolerance, fail-fast numerical guards, and a
-   full-arm-first stop rule must be satisfied before v2 can be bound or any held-out
-   scoring begins. DRAFT/debug artifacts are forbidden from candidate/test scoring,
-   not merely from the final gate.
+   scientific verdict. The v1 BINDING registration remains immutable. Binding
+   eligibility for any successor arm is governed by spec §13.19's two-stage ladder
+   (qualification, then formal): both stages train on the full `V_fit` universe and
+   differ only in `optim.epochs`, with qualification running a short schedule. A
+   single 512-node internal topology holdout `V_hold` (:= the union of the
+   former `V_qual` and `V_select`; `V_fit` is unchanged from the two-holdout
+   definition) supplies validation and checkpoint selection for both stages.
+   Measured prevalence, disclosed rather than hidden: `V_hold` is 0.0117
+   (1,533 positives / 130,816 pairs), against `V_select` alone at 0.0247 (807
+   positives / 32,640 pairs) — the union raises positives 1.9x but halves
+   prevalence. The qualification verdict is guards-only ("it trained") — no
+   AUPRC or topology threshold on that verdict. "Guards-only" governs only the
+   qualification **verdict**; `e2e_checkpoint_eligible` — the post-ramp/
+   phase-C restriction, the AUPRC floor at `prevalence + 0.02`, and the
+   residual / logit-std / topology-gradient conditions — is **retained
+   unchanged in both stages**. Because the union halves prevalence, that
+   floor's absolute value drops accordingly: 0.0447 on `V_select` alone to
+   0.0317 on `V_hold`. The qualification stage is otherwise a development
+   loop, not a scientific gate, and its `pass` licenses no held-out claim;
+   only the retained eligibility floor is what prevents selection from
+   landing on a reconstruction-only warm-start checkpoint, the documented
+   2026-07-19 v1 failure above. The formal stage carries pre-registered
+   acceptance thresholds recorded before any held-out read (§5.2.4), and its
+   result is engineering evidence, not inference, at any seed count — only
+   E1/E3 (≥3 seeds, Holm-corrected, plus the §8-spec 30-config HPO-parity
+   budget) carry significance or cross-seed-robustness claims (§5.0.5).
+   DRAFT/debug artifacts remain forbidden from candidate/test scoring, not
+   merely from the final gate.
    **E2E v2 binding and verdict (2026-07-23/2026-07-24):** the v2 replacement
    qualified and bound under registration
    `g5-e2e-stage1-20260719-conditioned-encoder-stability-screen-v2` (binding SHA-256

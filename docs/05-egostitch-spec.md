@@ -383,17 +383,33 @@ component, seeded by the node minimizing `sha256("g5-v2-qual|"+node_id)` and ord
 each frontier by the same hash. Remove `V_qual`; `V_select` is constructed identically
 on the largest remaining component using prefix `g5-v2-select|`. Ties between
 components use the sorted node-id tuple. `V_fit` is every remaining operative train
-node. The v2 training contract replaces `G_struct` with the induced
-`G_fit=(V_fit, E_msg[V_fit] \ self-loops)` and restricts `E_sup` training positives to
-both endpoints in `V_fit`; all cross-partition message/supervision edges are quarantined.
-`E_msg[V_qual]` and `E_msg[V_select]` are disjoint evaluation-only topology labels
-for qualification and formal checkpoint selection respectively. Their nodes, edges,
-and full non-self pair universes never enter a training step, reconstruction/realism
-target, training-time scaffold, or negative sampling; each is opened only by its
-isolated eval-mode qualification/selection scorer. `train_graph.pkl`, `val_edges.txt`,
-and their positives remain excluded from topology gold. Exact node/edge/pair counts
-and hashes, including proofs of zero node and label-edge overlap, are required before
-v2 binding. This internal holdout does not alter the frozen external test protocol.
+node. `V_qual` and `V_select` are node-disjoint by construction (asserted all-zero
+`OverlapProof`) and both are already subtracted from `V_fit`; **`V_hold := V_qual ∪
+V_select`** is the single 512-node validation holdout, used by both stages of the
+§13.19 ladder (qualification and formal). Because `V_hold` is exactly this union,
+defining it changes nothing about `V_fit`: **`V_fit`, `e_msg_fit`, `e_sup_fit`,
+`G_fit`, and `rho_train` are unchanged — bit-identical to the two-holdout
+definition** — so no `V_fit`-side cache, pack, or feature-stats digest is
+invalidated, and results stay comparable to the v2/v3 baselines. (The
+`V_qual`/`V_select` grounding universes are themselves replaced by `V_hold` at
+§13.12 — a deliberate role-universe change, not an invalidation of `V_fit`-side
+state.) The v2 training contract replaces `G_struct` with the induced
+`G_fit=(V_fit, E_msg[V_fit] \ self-loops)` and restricts `E_sup` training positives
+to both endpoints in `V_fit`; all `V_fit`↔`V_hold` cross-partition
+message/supervision edges — i.e. edges with exactly one endpoint in `V_hold` — are
+quarantined from training. The within-holdout cross-side edges (between `V_qual` and
+`V_select`) are **not** quarantined; they are `V_hold`'s evaluation-only topology
+labels, exactly like the within-`V_qual` and within-`V_select` edges. `E_msg[V_hold]`
+— which includes edges within each of `V_qual`/`V_select` and the cross-side edges
+between them — is `V_hold`'s evaluation-only topology label, used for both
+qualification and formal checkpoint selection. `V_hold`'s nodes, edges, and full
+non-self pair universe never enter a training step, reconstruction/realism target,
+training-time scaffold, or negative sampling; `V_hold` is opened only by its isolated
+eval-mode qualification/selection scorer, in either stage. `train_graph.pkl`,
+`val_edges.txt`, and their positives remain excluded from topology gold. Exact
+node/edge/pair counts and hashes, including proofs of zero node and label-edge
+overlap, are required before v2 binding. This internal holdout does not alter the
+frozen external test protocol.
 
 Density normalization (`ρ_eval/ρ_train`, §1): ρ := |E⁺| / (C(|V_side|,2) + |V_side|)
 on the matching universe. Measured full-train ρ_train (random_walk) = 1.354e-3 vs
@@ -513,6 +529,41 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-29: two-stage cleanup rewrite (design:
+  `docs/superpowers/specs/2026-07-29-egostitch-e2e-two-stage-cleanup.md`, r2;
+  owner-decided via grill-me interview). §9.3, §13.12, §13.19.1, §13.19.3,
+  §13.19.4, §13.19.6, and §14.4.7 are rewritten in place — no `§15`, no
+  SUPERSEDED strata — collapsing the e2e ladder from five stages
+  (init-probe → calibrate(overfit) → threshold-freeze → rehearse → formal) to
+  two: **qualification** and **formal**. Both train on the full `V_fit`
+  universe and differ only in `optim.epochs`; a single 512-node holdout
+  `V_hold := V_qual ∪ V_select` validates and selects checkpoints for both, so
+  `V_fit`, `e_msg_fit`, `e_sup_fit`, `G_fit`, and `feature_stats_sha256` stay
+  bit-identical to the two-holdout definition. The qualification verdict is
+  guards-only (§13.19.2 guards, the `training_invalid(slot_collapse)` abort,
+  plus an explicit `fail(no_eligible_checkpoint)` category) — no AUPRC or
+  topology floor; checkpoint eligibility (§13.19.3) is retained at both stages
+  regardless (its absolute floor is lower under the `V_hold` union — disclosed
+  at §13.19.3, not "unchanged"), since "guards-only" governs the verdict, not
+  eligibility, and eligibility is what prevented the documented 2026-07-19 v1
+  failure (selection landing on a reconstruction-only warm-start checkpoint). The formal stage carries pre-registered acceptance
+  thresholds recorded before test opens (protocol §5.2.4). §13's G5 Stage-1
+  carve-out gains a short scope note: §13.1-13.17 govern the completed,
+  published frozen-s0 screen only (`docs/results/G5-stage1-seed0-20260717.md`,
+  verdict `cut`); its implementing code is retired under this cleanup and no
+  future run may cite it as authorization. Retired with their machinery, not
+  restated here: the 510-row overfit test, the single-`V_qual`-rehearsal
+  budget, `calibration_freeze.json`, the exclusive-create rehearsal ledger,
+  the `attempt00[1-3]` window, `src/experiments/prebinding_gates.py`, the
+  `REQUIRED-BEFORE-BINDING` markers, and `qualification_margins.json`.
+  **Editing-in-place mitigation:** this document has published results citing
+  its pre-rewrite text (`docs/results/G5-stage1-seed0-20260717.md`,
+  `docs/results/G5-e2e-stage1-seed0-20260724.md`); the pre-rewrite commit is
+  `26abf7f89aac47d4e65c6e81b3557ed42ff30d71` —
+  `git show 26abf7f89aac47d4e65c6e81b3557ed42ff30d71:docs/05-egostitch-spec.md`
+  resolves those citations to the text the results were actually produced
+  under. Authorizes implementation only per the spec-freeze rule; a fresh
+  registration (v4) is required before any binding run.
 - 2026-07-27 (seventh entry): §13.19.1 replaces the E2E generator's per-row
   `LayerNorm` F0 standardization with registered per-dimension z-scoring over
   the ordered V_fit universe (`zscore_vfit_v1`), with a pinned two-pass fp64
@@ -650,8 +701,10 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   registration file is untouched (its digest is already embedded in all four
   formal run metadata records). Locked by a unit test covering the
   missing-sibling failure and the fallback-located path.
-- 2026-07-23: binding-mechanics amendment to the §13.19.4 item-5 formal
-  commit-identity check. As implemented, the formal worker required a clean
+- 2026-07-23: binding-mechanics amendment to the §13.19.4 item-5 [historical
+  numbering; restored 2026-07-29 as new item 5, the `binding_evidence` schema
+  and commit-identity rule] formal commit-identity check. As implemented, the
+  formal worker required a clean
   checkout whose HEAD begins with the recorded `binding_evidence`
   implementation commit, while the registration is itself a tracked file — a
   registration cannot contain its own promotion commit's hash, so binding was
@@ -701,8 +754,10 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   in-run guards are unchanged. No held-out/candidate/test quantity informed
   this calibration.
 
-- 2026-07-22: replaced the §13.19.4 item-3 per-element logit tolerance with
-  vector relative-L2 bounds after replacement rehearsal attempt 2. The attempt
+- 2026-07-22: replaced the §13.19.4 item-3 [historical numbering; restored
+  2026-07-29 as new item 4, the precision-differential guard] per-element
+  logit tolerance with vector relative-L2 bounds after replacement rehearsal
+  attempt 2. The attempt
   was the healthiest run to date: the full 30-epoch schedule completed with no
   stability guard firing, an eligible checkpoint was selected (including the
   validation-side `1e-3` residual floor), and the end-ramp differential passed
@@ -724,8 +779,10 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   max-abs errors remain logged diagnostics. This consumed rehearsal attempt 2;
   one replacement attempt remains before v3.
 
-- 2026-07-22: recalibrated the §13.19.4 item-3 elementwise tolerance after the
-  first replacement rehearsal attempt failed at the end-ramp differential with
+- 2026-07-22: recalibrated the §13.19.4 item-3 [historical numbering; restored
+  2026-07-29 as new item 4, the precision-differential guard] elementwise
+  tolerance after the first replacement rehearsal attempt failed at the
+  end-ramp differential with
   the residual contract healthy. Measured on the retained failure evidence:
   residual relative L2 `0.0025666` (ceiling `0.05`), correlation `0.9999923`
   (floor `0.999`), non-zero in both paths — the fp32-island correction works
@@ -748,8 +805,10 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   `V_select` quantity was read. This consumed rehearsal attempt 1 of the
   replacement's three-attempt allowance.
 
-- 2026-07-22: recalibrated the §13.19.4 item-1 overfit residual-ratio floor from
-  `1e-3` to the fp32-calibrated `1e-6`. The first gatefix run's retained
+- 2026-07-22: recalibrated the §13.19.4 item-1 [historical numbering, retired
+  2026-07-29 with the overfit machinery; distinct from the new item 1, the
+  guards-only verdict] overfit residual-ratio floor from `1e-3` to the
+  fp32-calibrated `1e-6`. The first gatefix run's retained
   per-epoch failure history (attempt-005, four H20, seed/config/pack unchanged)
   shows the honest fp32 readout path yields Phase-C residual ratios
   `3.622e-6 → 1.2178e-5`, smooth and monotonically increasing across all 22
@@ -767,7 +826,9 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   history for exactly that calibration. No held-out/candidate/test quantity
   informed this correction.
 
-- 2026-07-22: pinned the §13.19.4 item-1 overfit acceptance to its registered
+- 2026-07-22: pinned the §13.19.4 item-1 [historical numbering — overfit
+  acceptance, retired 2026-07-29 with the overfit machinery; distinct from the
+  new item 1, the guards-only verdict] to its registered
   "reaches ... after the conditioning ramp" wording. The implementation had
   accepted only the final reporting epoch, a stricter unregistered rule: the
   retained passing `V_fit` trajectory oscillates around the `1e-3` residual
@@ -1063,6 +1124,14 @@ ego-stat target definitions (§13.6); Benchmark-A/B/C ↔ split-strategy mapping
 
 ## 13. G5 Stage-1 carve-out (normative for the Stage-1 build)
 
+**Scope note (2026-07-29).** §13.1–13.17 govern the completed, published
+frozen-s0 screen only (`docs/results/G5-stage1-seed0-20260717.md`, binding
+verdict `cut`). Their implementing code — the frozen-s0 `egostitch` family,
+its Stage-1 training/DDP path, and `frozen_s0` scoring mode — is retired from
+the codebase under the two-stage cleanup (§12, 2026-07-29 entry). This
+section remains citable and comprehensible as the record of what that screen
+ran; no future run may cite it as authorization.
+
 Gate G5 (protocol §5.0.5) builds the model in three mechanism stages. The frozen
 sections above pin the *full* model; this section pins the **Stage-1 subset** —
 "imagination + degree budget + closure channel only (no codebook, no harmonization,
@@ -1256,10 +1325,11 @@ diagnostic. The two-pass plumbing is built now and becomes score-active in Stage
 side**, self excluded (≈10k nodes — exact matmul, no ANN), computed once and
 disk-cached with a sha256 manifest.
 
-**v2 §13.19 isolation:** the grounding universe is phase-specific and separately
-hashed: training/overfit=`V_fit`, rehearsal=`V_qual`, formal internal selection=
-`V_select`, and external scoring=the original test side. A cache for one universe may
-not serve another. In particular, rehearsal may not read or encode a `V_select` row.
+**v2 §13.19 isolation:** the grounding universe is role-specific and separately
+hashed: training (both stages of the §13.19 ladder)=`V_fit`, validation (both
+stages)=`V_hold`, and external scoring=the original test side. A cache for one
+universe may not serve another. In particular, a training pass may not read or
+encode a `V_hold` row.
 
 **Rev-3.1 (2026-07-25, §14.4.4):** for the rev-3.1 build, `n_g = 50` (the
 measured P0.2 ceiling curve; the reranker alternative was measured and
@@ -1457,10 +1527,16 @@ primary `pair_topology`; `p0` = control `none`, permanent null `none`, primary
 
 **Registration-status enforcement (machine-checked):** a formal training run (no
 `--max-steps`) requires the referenced registration file to carry
-`status: BINDING` **and contain no `REQUIRED-BEFORE-BINDING` marker anywhere**;
-the worker fails closed otherwise before DDP work starts. `--max-steps` debug runs
-accept `DRAFT`/unresolved markers but are redirected to `*_debug` output
-directories and never write held-out artifacts. The G5 gate requires
+`status: BINDING`; the worker fails closed otherwise before DDP work starts.
+**Retired 2026-07-29 (§12):** this check also required the registration to
+contain no `REQUIRED-BEFORE-BINDING` marker anywhere; that marker and its
+enforcing module (`src/experiments/prebinding_gates.py`) are retired under the
+two-stage cleanup, so the registration schema no longer defines the marker at
+all and this clause is vacuously satisfied for any v4+ registration — retained
+here only as a record of the mechanism that gated pre-cleanup registrations.
+`--max-steps` debug runs accept `DRAFT` registrations but are redirected to
+`*_debug` output directories and never write held-out artifacts. The G5 gate
+requires
 `status: BINDING` and a registration
 sha256 that matches the `preregistration_sha256` of **every** consumed formal run
 metadata. Amending a BINDING registration requires a new versioned registration
@@ -1497,11 +1573,13 @@ protocol (CLAUDE.md Integrity gates).
 
 ### 13.19 E2E stability-screen replacement (v2; prospective)
 
-**Scope note (2026-07-25):** §13.19 remains the completed v2 screen's binding
-record. For the rev-3.1 build, §14.4 supersedes §13.19.1's Phase-A
-`pair_only` curriculum and extends §13.19.4 with the two-stage
-calibrate/rehearse qualification gates (§14.4.7); every other §13.19 guard,
-eligibility, and binding rule carries forward unless §14.4 states otherwise.
+**Scope note (2026-07-25; §14.4.7 pointer corrected 2026-07-29):** §13.19
+remains the completed v2 screen's binding record. For the rev-3.1 build, §14.4
+supersedes §13.19.1's Phase-A `pair_only` curriculum; §14.4.7 follows
+§13.19.4's two-stage qualification/formal ladder unchanged and retires the
+calibrate/rehearse pre-binding gates this note originally pointed to; every
+other §13.19 guard, eligibility, and binding rule carries forward unless
+§14.4 states otherwise.
 
 **Evidence and version boundary.** The v1 `full` arm completed the engineering
 `pack -> probe -> train -> publish` pipeline, but the selected checkpoint came from
@@ -1510,7 +1588,7 @@ fixed-replay edge-family gradients plus collapsed validation logits. No v1 candi
 scores, remaining training arms, or formal G5 gate result were produced. These
 train/validation diagnostics motivate this section but are not retroactively added to
 the v1 registration. The replacement registration is a new version and remains
-`DRAFT` until every §13.19 pre-binding item is satisfied.
+`DRAFT` until every §13.19.6 binding-acceptance-matrix criterion is satisfied.
 
 #### 13.19.1 Three-phase curriculum
 
@@ -1560,9 +1638,8 @@ mean direction of F0, so the generator's slot set is born at mean pairwise cosin
 `mu` and `sigma` are registered constants, not learned parameters:
 
 1. **Scope.** Computed over the ordered V_fit universe only. When the loaded feature
-   matrix contains sealed V_qual/V_select rows, the statistics are computed after
-   gathering the V_fit rows, and are bit-identical to the statistics of the same rows
-   loaded alone.
+   matrix contains `V_hold` rows, the statistics are computed after gathering the
+   V_fit rows, and are bit-identical to the statistics of the same rows loaded alone.
 2. **Estimator.** Two-pass, fp64 accumulation: `mu_j = mean_i x_ij`,
    `var_j = mean_i (x_ij - mu_j)^2` (population, ddof = 0). A non-finite
    `mu_j` or `var_j`, and a `var_j` that is exactly zero (the dimension is
@@ -1582,6 +1659,14 @@ mean direction of F0, so the generator's slot set is born at mean pairwise cosin
    reconstructs the transform from the checkpoint alone — scoring never sees V_fit.
    The same frozen constants apply in every universe; there is no universe-conditional
    preprocessing.
+
+**Ladder identity (deliberate).** The §13.19 ladder's qualification and formal stages
+both train on the full `V_fit` universe and differ only in `optim.epochs`; item 1's
+"computed over the ordered V_fit universe only" scope and the `zscore_vfit_v1` method
+id are therefore unchanged by the stage split, and the two stages necessarily compute
+the identical `mu`, `sigma`, and `feature_stats_sha256`. This is deliberate: it is what
+lets the formal-stage preflight compare digests for equality rather than propagate a
+possibly incompatible one.
 
 The transform is applied to node features, grounding candidates, reconstruction
 targets, denoising targets, and the generator's shared `d -> d_p` projection — one
@@ -1665,29 +1750,38 @@ it may not replace non-finite numbers with a value that lets validation succeed.
 
 #### 13.19.3 Checkpoint eligibility and selection
 
-Before binding, §9.3's deterministic, connected, node-disjoint 256-node `V_qual` and `V_select` holdouts
-produce two complete non-self pair manifests. Labels and gold graphs come only from
-the corresponding held-out `E_msg[V_side]`; `train_graph.pkl` and `val_edges.txt` are
-not sources. Paths, node/edge/pair counts, class prevalence, SHA-256 values, and proof
-of zero node and topology-label overlap are pinned. Metrics are computed over the
-complete global manifest after exact DDP gather, in fp32, with
+Before binding, §9.3's single 512-node holdout `V_hold := V_qual ∪ V_select` — each
+half a deterministic, connected, node-disjoint 256-node truncated BFS prefix —
+produces one complete non-self pair manifest (`C(512,2) = 130,816` pairs). Labels and
+the gold graph come only from `E_msg[V_hold]`; `train_graph.pkl` and `val_edges.txt`
+are not sources. Paths, node/edge/pair counts, class prevalence, SHA-256 values, and
+proof of zero node and topology-label overlap are pinned. Metrics are computed over
+the complete global manifest after exact DDP gather, in fp32, with
 `sklearn.metrics.average_precision_score` on binary labels and unweighted Brier/ECE
 reported for calibration.
 
-The warm-start reference is measured immediately after the last Phase-A update on
-the applicable pair manifest and written to immutable run metadata: rehearsal may
-open only `V_qual`, while the first bound formal run opens the previously untouched
-`V_select` manifest. Runtime collapse monitoring uses a fixed slice of that applicable
-manifest. At each eligible epoch, exact-gold-density assembly on the applicable held-
-out graph yields validation clustering MMD. Because each side supplies one 256-node
-gold graph rather than a reference-sample collection, the registered scalar is the
-raw biased squared MMD between the single predicted and gold clustering-coefficient
-histograms under the existing pinned histogram bins and RBF-kernel configuration:
-`MMD_clust_raw^2 = mmd_squared([h_clust(G_pred)], [h_clust(G_gold)])`. It is not the
-normalized multi-sample MMD ratio used by the external assembled-graph evaluator.
-Pair, gold-graph, assembly, histogram, and kernel-configuration hashes are binding.
-These metrics are model-selection evidence only, never external held-out scientific
-evidence.
+The warm-start reference is measured immediately after the last Phase-A update on the
+`V_hold` pair manifest and written to immutable run metadata. **`V_hold` serves both
+stages of the §13.19 ladder** — qualification and formal each open the full `V_hold`
+manifest; there is no partition held back until the first bound formal run. Runtime
+collapse monitoring uses a fixed slice of the `V_hold` manifest. At each eligible
+epoch, exact-gold-density assembly on the `V_hold`-induced held-out graph yields
+validation clustering MMD. Because `V_hold` supplies one 512-node gold graph rather
+than a reference-sample collection, the registered scalar is the raw biased squared
+MMD between the single predicted and gold clustering-coefficient histograms under the
+existing pinned histogram bins and RBF-kernel configuration: `MMD_clust_raw^2 =
+mmd_squared([h_clust(G_pred)], [h_clust(G_gold)])` — raw single-graph clustering MMD²,
+not a density ratio ("RD") and not the normalized multi-sample MMD ratio used by the
+external assembled-graph evaluator. Pair, gold-graph, assembly, histogram, and
+kernel-configuration hashes are binding. These metrics are model-selection evidence
+only, never external held-out scientific evidence.
+
+**Known limitation, recorded not fixed.** `V_hold`'s gold graph is a truncated BFS
+prefix: its nodes carry degree-sum 9,390 in the full `G_msg` but only 3,066 inside
+`E_msg[V_hold]` (33% retained). Selection against `clustering_histogram(gold)`
+therefore partly rewards fidelity to the cut, not to the true local topology. The
+union construction mitigates this — cross-side edges between the two truncated BFS
+prefixes are retained — but does not remove it.
 
 Validation is recorded every epoch, but an epoch is eligible for `best.pt` only after
 the conditioning ramp and one complete full-joint epoch. An eligible full-arm or
@@ -1695,10 +1789,29 @@ the conditioning ramp and one complete full-joint epoch. An eligible full-arm or
 
 1. every §13.19.2 finite/gradient guard passes for the epoch;
 2. `std(f_logit) >= max(0.25 * warm_reference_std, 1e-4)`;
-3. full-model validation AUPRC is no more than `0.02` below the warm-reference
-   pair-only AUPRC, and the warm reference itself exceeds label prevalence by at
-   least `0.02`;
+3. full-model validation AUPRC is no more than **`0.02`** below the warm-reference
+   pair-only AUPRC — `e2e_checkpoint_eligible`'s fixed eligibility floor, distinct
+   from `select_e2e_checkpoint`'s `auprc_tolerance` selection-band kwarg below — and
+   the warm reference itself exceeds label prevalence by at least `0.02`;
 4. `std(full - f_logit) / max(std(f_logit), 1e-12) >= 1e-3`;
+
+`auprc_tolerance` (`select_e2e_checkpoint`'s selection-band kwarg, used in Selection
+below — distinct from item 3's fixed `0.02` eligibility floor) must be **re-derived
+from `V_hold`'s measured AP sampling standard deviation**; it is not held at the
+legacy value `0.02`. Measured: eligible positives grow from 807 (`V_select` alone,
+the old selection manifold) to 1,533 (`V_hold`'s qual+select+cross-side union) — a
+1.9× increase — while prevalence falls from `0.0247` to `0.0117`. Because AP-sampling
+SD scales roughly as `1/sqrt(n_pos)`, this predicts the SD shrinks only about 1.4×
+(`sqrt(1.9)`), not the near-elimination a naive area-scaling argument would suggest.
+Binding requires the recomputed value against `V_hold`'s measured SD; this spec does
+not pin one.
+
+**Disclosed weakening.** Item 3's second clause retains the `prevalence + 0.02`
+eligibility floor's `0.02` constant and its inequality unchanged, but the floor's
+*absolute* value tracks `V_hold`'s prevalence: it drops from `0.0247 + 0.02 = 0.0447`
+(`V_select` alone) to `0.0117 + 0.02 = 0.0317` (`V_hold`), a 29% reduction. This is
+disclosed here; text elsewhere describing this floor as "unchanged" means the
+inequality form, not the absolute value.
 
 For `b0_e2e_f_only`, item 1 applies, `std(f_logit) >= 1e-4`, and its AUPRC must exceed
 label prevalence by at least `0.02`. For the separately trained `pair_topology` arm,
@@ -1710,85 +1823,126 @@ rule remains a gate preflight, but is not a duplicate eligibility test once item
 has passed.
 
 Selection is topology-aware without sacrificing registered edge tolerance. First
-retain eligible epochs whose checkpoint-selection AUPRC is within `0.02` of the best
-eligible AUPRC for that arm; among them choose the lowest train-side validation
+retain eligible epochs whose checkpoint-selection AUPRC is within `auprc_tolerance` of
+the best eligible AUPRC for that arm; among them choose the lowest train-side validation
 clustering MMD. Within MMD tolerance `1e-6`, choose lower unweighted Brier score and
 then the earlier epoch. Warm-start/ramp epochs may be retained as diagnostics but can
 never win. If no epoch is eligible, the run is invalid and there is no fallback to
 epoch 1, `last.pt`, or the numerically least-bad checkpoint.
 
-#### 13.19.4 Train/validation-only pre-binding qualification
+#### 13.19.4 Qualification-stage verdict, artifact, and boundary audit
 
-Before the v2 registration can become `BINDING`, the implementation must produce the
-following without candidate/test scoring:
+The qualification stage trains the full `V_fit` universe at a short schedule
+(`optim.epochs` reduced from the formal stage's registered full schedule; the
+§13.19.1 three-phase curriculum boundaries scale with `schedule_total_steps =
+steps_per_epoch × epochs`, so a short run still traverses Phases A→B→C — Phase
+C opens at 30% of the schedule regardless of its length) and validates on
+`V_hold` exactly as the formal stage does (§13.19.3). It exists to give model
+iteration a fast development loop; it is not a scientific gate, and its
+`pass` does not license any held-out claim.
 
-1. **Overfit test:** a fixed 510-row 1:5 train subset (85 `E_sup[V_fit]` positives and
-   425 deterministic registered-sampler negatives with both endpoints in `V_fit`) is cycled for exactly 2,000 optimizer
-   steps (`T_overfit=2000`: Phase A/B/C = `400/200/1400`) under the formal weighting
-   and schedule. Its canonical-pair manifest is generated once before sharding and is
-   invariant to rank/world size. The launcher auto-detects and uses all visible H20s
-   (four on the current target host), matching the rehearsal/formal launch style, and
-   records the detected world size. It reaches train AUPRC `>= 0.95` and
-   reaches full-vs-f-only residual ratio `>= 1e-6` (fp32-calibrated 2026-07-22;
-   the BF16-era `1e-3` bound measured readout quantization noise, not
-   conditioning signal) after the conditioning ramp:
-   the test passes when at least one post-ramp (Phase-C) validation epoch
-   satisfies both inequalities at that same epoch, and the latest qualifying
-   epoch supplies the retained overfit checkpoint and metrics. A qualification
-   training run that fails checkpoint selection retains its per-epoch validation
-   history alongside the failure evidence.
-2. **Single-arm stability rehearsal:** the exact full-arm config completes the full
-   schedule using only the stability/qualification pair and topology manifests,
-   selects an eligible post-ramp checkpoint, triggers no §13.19.2 guard, and records
-   finite norms/clip coefficients on every rank. The launcher auto-detects and uses all
-   visible H20s, matching the formal launch style (four H20s on the current target
-   host), and records the detected world size. The checkpoint-selection manifests
-   remain unread until the first formal bound run.
-3. **Precision differential:** at the end-ramp and selected checkpoints, the same
-   fixed replay batch is evaluated in eval mode with identical hard masks under
-   BF16+fp32-islands and pure fp32. Full and `f_logit` each have vector relative
-   L2 error `<= 0.05` versus pure fp32 (form change 2026-07-22: replaces the
-   twice-miscalibrated per-element tolerance — per-element max-abs is an
-   extreme-value statistic of BF16-trunk noise that grows with training; the
-   vector bound still catches common-mode and gross single-element corruption);
-   the residual has relative L2 error `<= 0.05`, correlation `>= 0.999`,
-   and is non-zero in both paths. Per-element max-abs errors remain logged as
-   diagnostics.
-4. **Boundary audit:** qualification runs use a data root with candidate/test
-   manifests and `test_graph.pkl` absent. The access log proves training endpoints are
-   in `V_fit` and no `V_qual`, `V_select`, or `V_test` feature row is read by a training
-   step even if a shared pack exists; the training structural-target edge digest is
-   exactly loop-stripped `E_msg[V_fit]`; and `E_sup`/validation positives never enter
-   scaffold or topology-training targets. The existing
-   global-positive rejection set may use validation-positive membership only to avoid
-   sampling a known positive as a negative; this weak label exposure is disclosed,
-   identical across arms, and supplies neither a positive target nor graph structure.
-   No candidate/test score or assembled graph is created before checkpoint freeze.
-5. **Artifact/profile binding:** a schema-validated `binding_evidence` object records
-   exact config and parameter-group hashes, implementation commit, pack identities,
-   validation-manifest hashes, every qualification attempt, selected checkpoint
-   policy version, measured runtime, and peak memory. The first passing attempt
-   freezes implementation/config; any later scientific or optimization change
-   requires v3. The recorded implementation commit is the last commit touching
-   anything outside `docs/registrations/`; a formal launch verifies a clean
-   checkout whose HEAD either equals that commit or descends from it through
-   registration-document-only commits (binding-mechanics amendment 2026-07-23).
+1. **Verdict — guards only.** `verdict = pass` iff no §13.19.2 fail-fast guard
+   tripped over the run. There is no AUPRC floor and no topology floor in the
+   verdict itself — a stably-useless model qualifies, because quality is
+   adjudicated at the formal stage, not here. Three named non-pass outcomes:
+   any §13.19.2 guard trip is `fail(<named_guard>)`; the slot-collapse guard —
+   mean pairwise `h` cosine `> 0.95`, or the Π rank-1 marginal residual
+   `‖Π − r c^T / m‖_F / ‖Π‖_F < 0.05`, for 2 consecutive validations after
+   conditioning activates (§14.4.8) — is `training_invalid(slot_collapse)`, a
+   category distinct from `fail(<named_guard>)` because it is a
+   during-training guard rather than one of §13.19.2's step-level fail-fast
+   checks, and is the documented rev-3.1/rev-3.2 abort mode;
+   `select_e2e_checkpoint` finding no eligible checkpoint is
+   `fail(no_eligible_checkpoint)` — a category distinct from a guard trip,
+   since checkpoint eligibility (below) can fail with every guard clean.
+2. **Artifact.** The qualification stage writes exactly one artifact:
 
-These qualification artifacts may tune no held-out/test quantity. The 2026-07-22
-still-DRAFT replacement has at most three disclosed full-arm rehearsal attempts; all
-earlier failed V2 attempts remain retained as engineering evidence but do not count
-against that replacement allowance because no prior V2 passed. A fourth replacement
-attempt or any change after its first pass requires v3. Any change to optimizer,
-schedule, precision, candidate grid, success inequalities, or frozen inputs after
-binding requires a new registration version.
+   ```json
+   { "verdict": "pass" | "fail(<named_guard>)" | "training_invalid(slot_collapse)" | "fail(no_eligible_checkpoint)",
+     "epochs", "hparams",
+     "feature_stats_sha256",
+     "model_config_sha256" }
+   ```
+
+   `model_config_sha256` is defined over the model-defining config keys only,
+   explicitly excluding `output_dir`, `optim.epochs`, and
+   `feature_stats_sha256`. `_config_hash` bakes in `output_dir`, `data.root`,
+   and `preregistration`, so it cannot serve this role — the two stages
+   necessarily differ in `output_dir` and `optim.epochs`.
+
+   The formal stage's preflight is exactly three assertions: the
+   qualification artifact exists; `verdict == "pass"`; and
+   `feature_stats_sha256` / `model_config_sha256` both match the formal run's
+   own computed values. Because both stages train on the identical `V_fit`
+   universe (§9.3, §13.19.1), the feature-digest comparison is a genuine
+   equality check, not a hand-pasted or propagated value, and the
+   training-universe == stats-universe assertion holds in both stages
+   unchanged.
+
+   `validate_e2e_qualification_profile` — the repo's only clip-coefficient /
+   family-ratio / submodule-RMS margin gate — is retained and runs at the
+   formal stage.
+3. **Boundary audit — retained, strengthened, and now stage-symmetric.**
+   Training may not open a held-out path, **in any run kind** — a path
+   condition, not a `run_kind` condition. This replaces the prior gate on
+   `run_kind != "formal"`, which left the formal stage unguarded (the check
+   that matters was never applied to the run it matters for) while forcing
+   qualification into a separate sanitized-root sandbox merely to run at
+   all. Both stages therefore run against the same repo data root; the
+   guard raises before the first step if any candidate, test, or
+   `test_graph.pkl` path is present, regardless of stage. The access log
+   proves: training endpoints are in `V_fit`; no `V_hold` (`V_qual` or
+   `V_select`) feature row is read by a training step even if a shared pack
+   exists; the training structural-target edge digest is exactly
+   loop-stripped `E_msg[V_fit]`; and `E_sup`/validation positives never
+   enter a scaffold or topology-training target. The existing
+   global-positive rejection set may use validation-positive membership
+   only to avoid sampling a known positive as a negative; this weak-label
+   exposure is disclosed, identical across both stages, and supplies
+   neither a positive target nor graph structure. No candidate/test score
+   or assembled graph is created before checkpoint freeze, at either stage.
+4. **Precision differential (bf16-vs-fp32), formal/binding only.** Before a
+   formal run's registration may carry `status: BINDING`, the trained BF16
+   path must match a pure-fp32 replay of the same checkpoint within vector
+   relative-L2 `<= 0.05`, for both the full logit and the residual
+   (`full - f_logit`), checked at two points: the end-ramp checkpoint and the
+   selected checkpoint. This is the **only** normative guard against the
+   2026-07-16 bf16 scoring-quantization incident (§13.16); it is the referent
+   for §13.19.6's "end-ramp and selected-checkpoint differentials pass."
+   (Historical §13.19.4 numbering: item-3; §12 change-log, 2026-07-22
+   entries.)
+5. **`binding_evidence` schema and implementation-commit / clean-checkout
+   rule.** A registration may carry `status: BINDING` only if it records a
+   `binding_evidence` block naming the implementation commit whose clean
+   checkout produced the qualifying evidence. A formal run's worker verifies
+   its own `HEAD` either equals that commit or is a clean descendant of it
+   through commits touching only `docs/registrations/` paths — the
+   registration cannot record its own promotion commit's hash, so exact-HEAD
+   equality alone is mechanically impossible. (Historical §13.19.4 numbering:
+   item-5; §12 change-log, 2026-07-23 binding-mechanics amendment.)
+
+**Checkpoint eligibility is retained in full and is not weakened by "guards
+only."** The §13.19.3 eligibility conditions govern which checkpoint, if any,
+is eligible at *both* stages, retained — with the absolute value of item 3's
+`prevalence + 0.02` floor lowered by the `V_hold` union (§13.19.3, disclosed
+there), not "unchanged." "Guards only" (item 1) governs the qualification
+*verdict*; it does not touch what makes a checkpoint eligible. This
+distinction is load-bearing: it is what prevents selection from landing on a
+reconstruction-only warm-start checkpoint, the documented 2026-07-19 v1
+failure.
+
+These qualification artifacts tune no held-out/test quantity. Any change to
+optimizer, schedule, precision, candidate grid, or frozen inputs after the
+formal stage's first pass requires a new registration version.
 
 #### 13.19.5 Cost-aware execution order
 
 Formal execution is fail-closed and sequential: train and validate `full` first; run
-its checkpoint-eligibility and liveness preflight; only then train the three remaining
+its checkpoint-eligibility and liveness preflight; only then train the five remaining
 registered arms. Candidate scoring begins only after all required training arms have
 eligible checkpoints and matching registration/config hashes. This ordering changes
-compute exposure, not the five-arm scientific comparison or its verdict inequalities.
+compute exposure, not the eight-arm scientific comparison (§14.4.6: six trained arms
+plus the two scoring-time controls `6a-v3`/`6e-v1`) or its verdict inequalities.
 An E2E candidate/test scoring entry point must reject a DRAFT/debug checkpoint and
 must verify the BINDING registration, formal/complete/eligible run metadata, arm-config
 path, and registration/config/checkpoint hashes. The v2 config path in each formal run
@@ -1796,7 +1950,8 @@ must exactly equal `arms.<arm>.training`; v1 configs are historical reproduction
 
 #### 13.19.6 Binding acceptance matrix
 
-Before v2 can bind, tests must establish all of the following:
+Before a two-stage-ladder registration (§13.19.4) can bind, tests must
+establish all of the following:
 
 - **Schedule:** for the registered `T`, Phase-A/Phase-B boundaries are exactly
   `ceil(0.2T)` and `ceil(0.2T)+ceil(0.1T)`, phases cover `T` once, and first
@@ -1809,13 +1964,25 @@ Before v2 can bind, tests must establish all of the following:
 - **Failure publication:** injected NaN/Inf, a one-step extreme norm, a persistent
   clipping event, and a collapsed logit stream abort synchronously and publish no
   `best.pt`, `complete.json`, score, or gate input.
-- **Selection:** warm-start/ramp checkpoints cannot become eligible; all four training
+- **Selection:** warm-start/ramp checkpoints cannot become eligible; all six training
   arms exercise their arm-specific rules; no-eligible always yields `invalid`; the
   topology-aware selector and deterministic tie-break reproduce exactly.
-- **Boundary:** file/node access logs prove no candidate/test or `V_test` access during
-  qualification/training, training `G_fit` equals loop-stripped `E_msg[V_fit]`, the
-  `V_qual`/`V_select` label sets are node/edge-disjoint and training-quarantined, and
-  scoring refuses DRAFT/debug/incomplete/ineligible provenance.
+- **Boundary:** file/node access logs prove no candidate/test or `V_test` access
+  during **either** qualification or formal training — the path-scoped guard
+  (§13.19.4 item 3) raises in both run kinds, not only `formal`; training `G_fit`
+  equals loop-stripped `E_msg[V_fit]`; `V_hold` is node/edge-disjoint from `V_fit`,
+  with a proof of zero node and label-edge overlap (§9.3), and is
+  training-quarantined at both stages; and scoring refuses
+  DRAFT/debug/incomplete/ineligible provenance.
+- **Digest and degree-prior identity:** because both stages train on the identical
+  `V_fit` universe (§13.19.1), qualification and formal produce the identical
+  `feature_stats_sha256` and the identical `mean(log d)` degree-prior bias. A
+  formal run whose `feature_stats_sha256`/`model_config_sha256` diverges from
+  its own qualification run's recorded values fails the §13.19.4 item 2
+  preflight — that preflight checks digests only; §13.19.4 item 2 defines no
+  degree-prior field. A `mean(log d)` divergence is not itself a preflight
+  check; this test verifies degree-prior identity directly as an acceptance
+  criterion, distinct from the preflight.
 
 ## 14. Approved successor headline: E2E stitched-topology-conditioned pair encoder (2026-07-16)
 
@@ -1909,9 +2076,10 @@ recorded, with full rationale and the four-round review trail, in
 `docs/superpowers/specs/2026-07-25-egostitch-e2e-relational-repair-design.md`
 (r5). Phase-0 audit evidence is archived under `outputs/p0_audit_20260725/`
 (local P0.2/P0.4; container P0.1/P0.3). This section **authorizes
-implementation only**; execution requires a fresh v3 registration with
-`status: BINDING` (§13.18 enforcement). §13.19 remains the completed v2
-screen's binding record; §14.4 supersedes it for rev-3.1 only where stated.
+implementation only**; execution requires a fresh v4 registration (§12,
+2026-07-29 entry) with `status: BINDING` (§13.18 enforcement). §13.19 remains
+the completed v2 screen's binding record; §14.4 supersedes it for rev-3.1
+only where stated.
 All generated/stitched structure remains intermediate context for the binary
 edge decision (`docs/lit-review-plan.md` §5).
 
@@ -2067,23 +2235,31 @@ fails closed on the v2 five-arm shape. Artifact version bumps:
 `egostitch_e2e_probe_v2`; the scores-`.npz` meta version increments; old
 versions are rejected.
 
-#### 14.4.7 Probes and two-stage qualification (extends §13.19.4)
+#### 14.4.7 Probes and the two-stage ladder (extends §13.19.4)
 
 Probes: **Π-consistency v2** = plan mass on double-Hungarian same-identity
 cells / total plan mass (pool-independent; v1 retained with its honest
 grounding-chain scope); per-run slot recall@`n_g`; shared-neighbor-count R²
 from STE pair states; the four slot-dispersion statistics (π std, mean
-pairwise `h` cosine, `Â` off-diagonal std, `Π` row entropy).
+pairwise `h` cosine, `Â` off-diagonal std, `Π` row entropy). These remain
+telemetry, reported every validation at both stages; none of them is a
+binding gate.
 
-Qualification: **calibration exclusively on `V_fit`** (`G_fit` quantities);
-thresholds frozen into the draft v3 registration together with the
-implementation; then a **single `V_qual` rehearsal** evaluates the frozen
-gates prospectively (≤3 attempts total; `V_select` sealed until the bound
-run). Frozen gates: (1) slot recall ≥ 0.5 × the pool's measured recall
-ceiling; (2) Π-consistency v2 > 0.05; (3) degree-partialled clustering probe
-R² ≥ 0.10; (4) the 6a-v3 control moves clustering-MMD beyond the evaluator's
-bootstrap noise floor; (5) the matched edge-AUPRC guard passes. Any failure
-blocks binding.
+The rev-3.2 build follows §13.19.4's two-stage ladder unchanged: the
+qualification stage trains the full `V_fit` universe at a short schedule and
+returns the guards-only verdict of §13.19.4 item 1 (`pass`,
+`fail(<named_guard>)`, `training_invalid(slot_collapse)`, or
+`fail(no_eligible_checkpoint)`); the formal stage trains the full registered
+schedule on the identical `V_fit` universe, validates on `V_hold` (§13.19.3),
+and carries pre-registered acceptance thresholds
+recorded before test opens — the v2 acceptance thresholds (clustering-MMD and
+BFS-macro GS/RD dominance at matched global RD, plus the AUPRC and degree-MMD
+guards), re-pinned as registration v4. The prior five-item frozen-gate
+pre-binding margin list (slot recall, Π-consistency v2, degree-partialled
+clustering R², the 6a-v3 clustering-MMD movement check, and the matched
+edge-AUPRC guard) and its implementing module are retired with the
+calibrate→freeze→rehearse machinery they gated; the probes above remain
+reported, but nothing in this ladder re-admits them as binding checks.
 
 #### 14.4.8 Telemetry and abort rules
 

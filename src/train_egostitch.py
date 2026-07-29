@@ -969,6 +969,38 @@ def _e2e_validation_endpoint_degrees(data: EgoStitchData) -> NDArray[np.float64]
     )
 
 
+def e2e_degree_prior_init(
+    model: EgoStitchStage1 | EgoStitchE2E, data: EgoStitchData
+) -> float:
+    """Center the lognormal degree head on the ``G_struct`` degree prior.
+
+    ``deg_mu`` is a raw linear output (`tokenize.py:71-75`) born near 0, while
+    ``mean(log d)`` on ``G_struct`` sits several nats above it. `degree_nll`'s
+    ``1/sigma**2`` factor turns that standing residual into a generator gradient
+    above the Sec 13.19 clip threshold on *every* step from step 1 -- the
+    2026-07-28 `persistent clipping` abort, whose streak needs a term that is
+    live on all ten steps. Setting the output bias removes the residual at
+    initialization. ``log sigma`` is deliberately left alone: matching it
+    instead of ``mu`` measures worse, because it shrinks the denominator while
+    the numerator is what is wrong.
+
+    Deterministic given ``G_struct``, so every DDP rank computes the same value.
+    """
+    generator = model.generator if isinstance(model, EgoStitchE2E) else model
+    graph = data.target_builder.graph
+    degrees = np.asarray(
+        [max(int(graph.degree(node)), 1) for node in graph.nodes()], dtype=np.float64
+    )
+    if degrees.size == 0:
+        raise RuntimeError("G_struct carries no nodes for the degree prior")
+    mu0 = float(np.log(degrees).mean())
+    if not math.isfinite(mu0):
+        raise RuntimeError(f"degree prior mean(log d) is not finite: {mu0}")
+    with torch.no_grad():
+        generator.tokenize.degree_dist_head[-1].bias[0] = mu0
+    return mu0
+
+
 def e2e_first_eligible_epoch(total_steps: int, steps_per_epoch: int) -> int:
     """First 1-based epoch ending after one complete Phase-C epoch."""
     if steps_per_epoch <= 0:
@@ -6222,6 +6254,8 @@ def _run_ddp_worker(
         feature_stats_sha256 = _bind_feature_standardization(
             model, cfg, data, ddp_mode=args.ddp_mode
         )
+    degree_prior = e2e_degree_prior_init(model, data)
+    logger.info("degree head centered on G_struct prior mean(log d)=%.6f", degree_prior)
     node_batch = args.token_budget_per_rank
 
     if args.ddp_mode == "probe":
