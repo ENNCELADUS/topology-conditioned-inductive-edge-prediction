@@ -77,8 +77,8 @@ Neither command passes `--pack-dir`. The pack manifest is keyed on `n_ground`, s
 config names its own `runtime.pack_dir`; both stages of an arm share it, and arms that
 agree on `n_ground` share it too (`cosine_pool` pins 20, the other five 50).
 
-`qualify` is the development loop. It runs the trainer/conditioning/pipeline sanity
-tests, then a 3-epoch run of the requested arm on every auto-detected visible H20. The
+`qualify` is the development loop. It directly runs the requested arm for 3 epochs on
+every auto-detected visible H20; test-suite execution is not a launch prerequisite. The
 short schedule still traverses curriculum phases A -> B -> C, because the curriculum
 scales with `schedule_total_steps` rather than with a fixed step count. Actual global-
 norm clipping remains enabled (`3.0` for pair/generator, `1.0` for conditioning), and

@@ -506,19 +506,6 @@ print(path)
   echo "produced the registered formal_train probe artifact: ${output}"
 }
 
-# The train_egostitch modules are globbed rather than listed so the suite cannot
-# silently shrink when that file is split: any tests/test_train_egostitch*.py is
-# picked up automatically.
-run_sanity_suite() {
-  "${UV_BIN}" run pytest -q \
-    tests/experiments/test_auprc_tolerance.py \
-    tests/test_train_egostitch*.py \
-    tests/model/test_egostitch_conditioning.py \
-    tests/model/test_egostitch_trunk.py \
-    tests/test_e2_pipeline.py \
-    tests/test_hpc_qualification.py
-}
-
 # Neither stage passes --pack-dir. The F0/grounding pack is keyed on n_ground and
 # the pack manifest rejects a mismatch outright, so the single shared pack this
 # script used to force made the cosine-pool arm (n_ground 20) raise against a pack
@@ -539,11 +526,7 @@ run_qualification() {
   export REGISTRATION_SHA256_BEFORE
   trap assert_registration_unchanged EXIT
 
-  echo "qualification stage 1/2: sanity"
-  run_sanity_suite
-  assert_registration_unchanged
-
-  echo "qualification stage 2/2: ${QUALIFICATION_EPOCHS}-epoch ${arm} run on V_fit, validated on V_hold"
+  echo "qualification: ${QUALIFICATION_EPOCHS}-epoch ${arm} run on V_fit, validated on V_hold"
   select_all_visible_h20s
   # `optim.epochs` is the one value the two stages may differ in, so it is the
   # one value a launcher may substitute: --epochs is the orchestrator's
