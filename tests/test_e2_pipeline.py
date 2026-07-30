@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import cast
 
+import numpy as np
 import pytest
 import src.data.packed_features as packed_features
 import torch
@@ -17,6 +18,7 @@ from src import train_b0
 from src.data.packed_features import build_packed_features
 from src.e2_pipeline import (
     _PUBLISHED_FILENAMES,
+    AUPRC_TOLERANCE_SOURCE_FILENAME,
     QUALIFICATION_ARTIFACT_FILENAME,
     V_HOLD_VALIDATION_EVENTS_FILENAME,
     PipelineArgs,
@@ -1558,6 +1560,117 @@ class TestQualificationVerdictSurvivesPublication:
             manifest[V_HOLD_VALIDATION_EVENTS_FILENAME]["sha256"]
             == hashlib.sha256(validation_ledger.read_bytes()).hexdigest()
         )
+
+    def test_optional_auprc_tolerance_source_is_manifested_and_published(
+        self, tmp_path: Path, e2e_aware_worker: str
+    ) -> None:
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
+        base = _qualification_runner(verdict="pass")
+
+        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            completed = base(command, timeout)
+            staging = Path(_arg_value(command, "--output-dir"))
+            np.savez(
+                staging / AUPRC_TOLERANCE_SOURCE_FILENAME,
+                y_true=np.array([1, 0], dtype=np.int8),
+                y_score=np.array([0.75, -0.25], dtype=np.float32),
+            )
+            return completed
+
+        assert run_pipeline(args, command_runner=runner) == 0
+
+        source = output_dir / AUPRC_TOLERANCE_SOURCE_FILENAME
+        manifest = json.loads((output_dir / "artifact_manifest.json").read_text())
+        assert source.is_file()
+        assert manifest[AUPRC_TOLERANCE_SOURCE_FILENAME] == {
+            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "byte_size": source.stat().st_size,
+        }
+
+    def test_corrupt_auprc_tolerance_source_is_rejected_before_publication(
+        self, tmp_path: Path, e2e_aware_worker: str
+    ) -> None:
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
+        base = _qualification_runner(verdict="pass")
+
+        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            completed = base(command, timeout)
+            staging = Path(_arg_value(command, "--output-dir"))
+            (staging / AUPRC_TOLERANCE_SOURCE_FILENAME).write_bytes(b"not-an-npz")
+            return completed
+
+        assert run_pipeline(args, command_runner=runner) == 2
+        assert json.loads((output_dir / "failure.json").read_text())["stage"] == "artifacts"
+        assert not (output_dir / AUPRC_TOLERANCE_SOURCE_FILENAME).exists()
+
+    @pytest.mark.parametrize("run_kind", ["qualification", "formal"])
+    def test_auprc_tolerance_source_remains_optional_when_worker_does_not_write_it(
+        self, tmp_path: Path, e2e_aware_worker: str, run_kind: str
+    ) -> None:
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        args = replace(
+            args,
+            worker_module=e2e_aware_worker,
+            run_kind=run_kind,
+            epochs=2 if run_kind == "qualification" else None,
+        )
+        runner = (
+            _qualification_runner(verdict="pass")
+            if run_kind == "qualification"
+            else _make_fake_runner(write_v_hold_validation_ledger=True)
+        )
+
+        assert run_pipeline(args, command_runner=runner) == 0
+        manifest = json.loads((output_dir / "artifact_manifest.json").read_text())
+        assert AUPRC_TOLERANCE_SOURCE_FILENAME not in manifest
+        assert not (output_dir / AUPRC_TOLERANCE_SOURCE_FILENAME).exists()
+
+    def test_failed_qualification_does_not_rescue_auprc_tolerance_source(
+        self, tmp_path: Path, e2e_aware_worker: str
+    ) -> None:
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
+        base = _qualification_runner(verdict="fail(slot_collapse)", fail_mode="train")
+
+        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            completed = base(command, timeout)
+            staging = Path(_arg_value(command, "--output-dir"))
+            np.savez(staging / AUPRC_TOLERANCE_SOURCE_FILENAME, y_true=np.array([1]))
+            return completed
+
+        assert run_pipeline(args, command_runner=runner) == 2
+        assert not (output_dir / AUPRC_TOLERANCE_SOURCE_FILENAME).exists()
+
+    def test_auprc_tolerance_source_is_removed_by_publication_rollback(
+        self, tmp_path: Path
+    ) -> None:
+        output_dir = tmp_path / "out"
+        staging_dir = tmp_path / "staging"
+        output_dir.mkdir()
+        staging_dir.mkdir()
+        for filename in _PUBLISHED_FILENAMES:
+            (output_dir / filename).write_text(f"old-{filename}")
+            (staging_dir / filename).write_text(f"new-{filename}")
+        np.savez(staging_dir / AUPRC_TOLERANCE_SOURCE_FILENAME, y_true=np.array([1]))
+
+        backup_dir, published = _publish_staged(
+            staging_dir,
+            output_dir,
+            optional_filenames=(
+                QUALIFICATION_ARTIFACT_FILENAME,
+                V_HOLD_VALIDATION_EVENTS_FILENAME,
+                AUPRC_TOLERANCE_SOURCE_FILENAME,
+            ),
+        )
+        assert (output_dir / AUPRC_TOLERANCE_SOURCE_FILENAME).is_file()
+
+        _rollback_publication(output_dir, backup_dir, published)
+
+        assert not (output_dir / AUPRC_TOLERANCE_SOURCE_FILENAME).exists()
+        for filename in _PUBLISHED_FILENAMES:
+            assert (output_dir / filename).read_text() == f"old-{filename}"
 
     @pytest.mark.parametrize("corruption", ["missing", "tampered"])
     def test_missing_or_tampered_validation_ledger_is_not_published(

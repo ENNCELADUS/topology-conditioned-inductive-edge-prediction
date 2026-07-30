@@ -15,6 +15,8 @@ from src import score_universe
 from src.experiments import g5_stage1
 from src.model.egostitch.e2e_model import EgoStitchE2E
 
+from tests._auprc_binding_fixture import bind_active_v4_calibration
+
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -52,7 +54,15 @@ def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     configs: dict[str, Path] = {}
     for arm in score_universe._EGOSTITCH_E2E_FORMAL_ARMS:
         config = tmp_path / f"{arm}.yaml"
-        config.write_text("model:\n  family: egostitch_e2e\n", encoding="utf-8")
+        config.write_text(
+            "model:\n"
+            "  family: egostitch_e2e\n"
+            "training:\n"
+            "  selection_auprc_tolerance: 0.02\n"
+            "diagnostics:\n"
+            "  selection_auprc_tolerance: 0.02\n",
+            encoding="utf-8",
+        )
         configs[arm] = config
     config = configs["full"]
     checkpoint = tmp_path / "best.pt"
@@ -124,6 +134,9 @@ def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
         },
     }
     registration_path = tmp_path / "registration.json"
+    bind_active_v4_calibration(
+        registration, registration_path, config_paths=configs, tolerance=0.02
+    )
     registration_path.write_text(json.dumps(registration), encoding="utf-8")
     checkpoint_id = "0123456789abcdef"
     metadata = {
@@ -490,7 +503,7 @@ def test_arbitrary_file_is_ledgered_as_heldout_before_pair_read(
         score_universe.main(cli)
 
 
-def test_e2e_formal_scoring_provenance_accepts_exact_binding(tmp_path: Path) -> None:
+def test_e2e_formal_scoring_provenance_accepts_exact_active_v2_binding(tmp_path: Path) -> None:
     registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
 
     provenance = score_universe._validate_e2e_scoring_provenance(
@@ -504,6 +517,87 @@ def test_e2e_formal_scoring_provenance_accepts_exact_binding(tmp_path: Path) -> 
     assert provenance["registration_sha256"] == _sha256(registration)
     assert provenance["checkpoint_sha256"] == _sha256(checkpoint)
     assert provenance["selected_checkpoint_eligible"] is True
+
+
+def test_e2e_formal_scoring_provenance_revalidates_exact_v2_calibration(tmp_path: Path) -> None:
+    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
+    payload = json.loads(registration.read_text(encoding="utf-8"))
+    registration.write_text(json.dumps(payload), encoding="utf-8")
+    run = json.loads(metadata.read_text(encoding="utf-8"))
+    run["preregistration_sha256"] = _sha256(registration)
+    metadata.write_text(json.dumps(run), encoding="utf-8")
+    _write_margin_verdict(metadata)
+
+    provenance = score_universe._validate_e2e_scoring_provenance(
+        registration_path=registration,
+        run_metadata_path=metadata,
+        checkpoint_path=checkpoint,
+        checkpoint_id=checkpoint_id,
+    )
+
+    assert provenance["registration_sha256"] == _sha256(registration)
+
+
+@pytest.mark.parametrize("invalid_calibration", ["missing", "null", "mismatch"])
+def test_v2_calibration_rejection_precedes_heldout_pair_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid_calibration: str
+) -> None:
+    registration, metadata_paths, checkpoint_paths, checkpoint_ids = _write_all_e2e_provenance(
+        tmp_path
+    )
+    payload = json.loads(registration.read_text(encoding="utf-8"))
+    evidence = payload["binding_evidence"]
+    if invalid_calibration == "missing":
+        evidence.pop("auprc_tolerance_calibration")
+    elif invalid_calibration == "null":
+        evidence["auprc_tolerance_calibration"] = None
+    elif invalid_calibration == "mismatch":
+        calibration_path = Path(evidence["auprc_tolerance_calibration"]["path"])
+        evidence["auprc_tolerance_calibration"] = {
+            "path": str(calibration_path),
+            "sha256": "f" * 64,
+        }
+    registration.write_text(json.dumps(payload), encoding="utf-8")
+    for metadata in metadata_paths.values():
+        run = json.loads(metadata.read_text(encoding="utf-8"))
+        run["preregistration_sha256"] = _sha256(registration)
+        metadata.write_text(json.dumps(run), encoding="utf-8")
+
+    monkeypatch.setattr(
+        score_universe,
+        "_load_checkpoint",
+        lambda *_args, **_kwargs: (
+            torch.nn.Linear(1, 1),
+            "egostitch_e2e",
+            checkpoint_ids["full"],
+        ),
+    )
+
+    def forbidden_pair_read(*_args: object, **_kwargs: object) -> tuple[object, object]:
+        raise AssertionError("held-out pairs were read before calibration validation")
+
+    monkeypatch.setattr(score_universe, "_resolve_pairs", forbidden_pair_read)
+    cli = [
+        "score",
+        "--checkpoint",
+        str(checkpoint_paths["full"]),
+        "--pairs",
+        "candidate",
+        "--output",
+        str(tmp_path / "forbidden-v2.npz"),
+        "--preregistration",
+        str(registration),
+    ]
+    for arm, metadata in metadata_paths.items():
+        cli.extend(["--arm-run-metadata", f"{arm}={metadata}"])
+
+    message = (
+        "auprc_tolerance_calibration.*exactly path and sha256"
+        if invalid_calibration != "mismatch"
+        else "auprc_tolerance_calibration.*digest verification failed"
+    )
+    with pytest.raises(ValueError, match=message):
+        score_universe.main(cli)
 
 
 def test_e2e_formal_scoring_rejects_missing_binding_evidence(tmp_path: Path) -> None:
@@ -532,7 +626,9 @@ def test_e2e_formal_scoring_rejects_missing_binding_evidence(tmp_path: Path) -> 
 def test_e2e_formal_scoring_rejects_binding_evidence_digest_mismatch(tmp_path: Path) -> None:
     registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
     payload = json.loads(registration.read_text(encoding="utf-8"))
-    evidence = payload["binding_evidence"]["qualification_attempts"][0]
+    evidence = payload["binding_evidence"]["qualification_attempts"]["full"][0][
+        "qualification"
+    ]
     evidence["sha256"] = "2" * 64
     registration.write_text(json.dumps(payload), encoding="utf-8")
     run = json.loads(metadata.read_text(encoding="utf-8"))
@@ -542,7 +638,7 @@ def test_e2e_formal_scoring_rejects_binding_evidence_digest_mismatch(tmp_path: P
 
     with pytest.raises(
         ValueError,
-        match=rf"qualification_attempts\[0\].*expected=2{{64}}.*found={found}",
+        match=rf"qualification_attempts\.full\[0\]\.qualification.*expected=2{{64}}.*found={found}",
     ):
         score_universe._validate_e2e_scoring_provenance(
             registration_path=registration,
@@ -795,7 +891,7 @@ def test_e2e_formal_scoring_provenance_rejects_non_v3_arm_packages(
     run["preregistration_sha256"] = _sha256(registration)
     metadata.write_text(json.dumps(run), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="six trained"):
+    with pytest.raises(ValueError, match="incompatible arm identity schema"):
         score_universe._validate_e2e_scoring_provenance(
             registration_path=registration,
             run_metadata_path=metadata,

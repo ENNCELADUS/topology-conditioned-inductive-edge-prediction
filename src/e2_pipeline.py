@@ -569,6 +569,7 @@ V_HOLD_VALIDATION_EVENTS_FILENAME = "v_hold_validation_events.jsonl"
 #: formal stage refuses to launch without it. A stale verdict is always cleared,
 #: so a failed re-qualification can never leave an earlier ``pass`` standing.
 QUALIFICATION_ARTIFACT_FILENAME = "qualification.json"
+AUPRC_TOLERANCE_SOURCE_FILENAME = "auprc_tolerance_source.npz"
 _OPTIONAL_PUBLISHED_FILENAMES = (
     # Required conditionally rather than for B0: qualification emits the
     # verdict, while every non-debug E2E run emits the V_hold ledger.
@@ -682,6 +683,7 @@ def _validate_staged_artifacts(
     model_family: str,
     allow_partial: bool = False,
     require_v_hold_validation_events: bool = False,
+    allow_auprc_tolerance_source: bool = False,
 ) -> None:
     """Load and validate every formal worker artifact before hashing it."""
     import torch
@@ -743,15 +745,35 @@ def _validate_staged_artifacts(
         digest = hashlib.sha256(ledger_path.read_bytes()).hexdigest()
         if evidence.get("sha256") != digest:
             raise ValueError("V_hold validation-event ledger digest does not match metadata")
+    source_path = staging_dir / AUPRC_TOLERANCE_SOURCE_FILENAME
+    if allow_auprc_tolerance_source and source_path.is_file():
+        if source_path.stat().st_size <= 0:
+            raise ValueError(f"{AUPRC_TOLERANCE_SOURCE_FILENAME} is empty")
+        import numpy as np
+
+        try:
+            with np.load(source_path, allow_pickle=False) as source:
+                if not source.files:
+                    raise ValueError(f"{AUPRC_TOLERANCE_SOURCE_FILENAME} has no arrays")
+                for name in source.files:
+                    source[name]
+        except (OSError, ValueError) as error:
+            raise ValueError(f"{AUPRC_TOLERANCE_SOURCE_FILENAME} is invalid") from error
 
 
-def _publish_staged(staging_dir: Path, output_dir: Path) -> tuple[Path, list[str]]:
+def _publish_staged(
+    staging_dir: Path,
+    output_dir: Path,
+    *,
+    optional_filenames: Sequence[str] = _OPTIONAL_PUBLISHED_FILENAMES,
+) -> tuple[Path, list[str]]:
     """Publish validated files with rollback-capable per-file atomic replaces."""
+    optional_names = tuple(optional_filenames)
     backup_dir = Path(tempfile.mkdtemp(prefix=".e2-backup-", dir=output_dir))
     published: list[str] = []
     completion_backed_up = False
     staged_optional = tuple(
-        filename for filename in _OPTIONAL_PUBLISHED_FILENAMES if (staging_dir / filename).is_file()
+        filename for filename in optional_names if (staging_dir / filename).is_file()
     )
     try:
         completion = output_dir / "complete.json"
@@ -761,7 +783,7 @@ def _publish_staged(staging_dir: Path, output_dir: Path) -> tuple[Path, list[str
         # Every optional name is backed up whether or not this run staged one, so
         # a prior run's verdict is removed rather than left to masquerade as this
         # run's; rollback restores it from the backup.
-        for filename in _PUBLISHED_FILENAMES + _OPTIONAL_PUBLISHED_FILENAMES:
+        for filename in _PUBLISHED_FILENAMES + optional_names:
             canonical = output_dir / filename
             if canonical.exists():
                 os.replace(canonical, backup_dir / filename)
@@ -813,9 +835,10 @@ def run_pipeline(
     stage); (6) merge stage/profile data into ``profile.json`` and write
     ``artifact_manifest.json`` with SHA-256 and byte size for ``best.pt``,
     ``last.pt``, ``metrics.jsonl``, ``run_metadata.json``, ``profile.json``, plus
-    the E2E ``qualification.json`` / ``v_hold_validation_events.jsonl`` when
-    applicable; and (7) publish the validated staging tree into the canonical
-    output directory with per-file atomic replaces and full rollback.
+    the E2E ``qualification.json`` / ``v_hold_validation_events.jsonl`` and optional
+    qualification-only ``auprc_tolerance_source.npz`` when applicable; and (7)
+    publish the validated staging tree into the canonical output directory with
+    per-file atomic replaces and full rollback.
 
     Every subprocess call goes through ``command_runner`` with ``check=False``
     and an explicit timeout (``runtime.train_eval_budget_seconds`` for
@@ -912,6 +935,11 @@ def run_pipeline(
             (output_dir / "failed_run_history.json").unlink(missing_ok=True)
         write_failure(output_dir, stage=stage, message=message, extra=extra)
         if args.run_kind == "qualification" and not debug_run:
+            # A calibration source is publishable only with a successful
+            # qualification. Never rescue one from a failed attempt, and clear
+            # an earlier source so it cannot masquerade as evidence for this
+            # failed attempt.
+            (output_dir / AUPRC_TOLERANCE_SOURCE_FILENAME).unlink(missing_ok=True)
             # Failed attempts still count every V_hold look already performed.
             # Preserve the adjacent, hash-bound evidence before staging teardown
             # so the immutable attempt can be included in cumulative K.
@@ -1124,6 +1152,9 @@ def run_pipeline(
             require_v_hold_validation_events=(
                 not debug_run and args.run_kind in ("qualification", "formal")
             ),
+            allow_auprc_tolerance_source=(
+                not debug_run and args.run_kind == "qualification"
+            ),
         )
     except Exception as error:
         rejected_profile = {**evidence_profile}
@@ -1149,6 +1180,11 @@ def run_pipeline(
         return 0
     _write_json_atomic(profile_path, final_profile)
     artifacts_started = time.monotonic()
+    optional_published_filenames = _OPTIONAL_PUBLISHED_FILENAMES + (
+        (AUPRC_TOLERANCE_SOURCE_FILENAME,)
+        if args.run_kind == "qualification"
+        else ()
+    )
 
     def artifact_operation() -> None:
         """Publish immutable profile+manifest at the documented late timing cutoff."""
@@ -1163,7 +1199,7 @@ def run_pipeline(
             # outside the integrity record.
             *(
                 filename
-                for filename in _OPTIONAL_PUBLISHED_FILENAMES
+                for filename in optional_published_filenames
                 if (staging_dir / filename).is_file()
             ),
         )
@@ -1205,7 +1241,11 @@ def run_pipeline(
     # The staging tree is now complete and validated. Publication is reversible
     # until the success sentinel lands.
     try:
-        backup_dir, published = _publish_staged(staging_dir, output_dir)
+        backup_dir, published = _publish_staged(
+            staging_dir,
+            output_dir,
+            optional_filenames=optional_published_filenames,
+        )
     except Exception as error:
         return fail(stage="publication", message=f"canonical publication failed: {error}")
     (output_dir / "failure.json").unlink(missing_ok=True)

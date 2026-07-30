@@ -99,6 +99,8 @@ _PACK_GROUNDING_FILENAME = "grounding.npz"
 _PACK_VALIDATION_GROUNDING_FILENAME = "grounding_validation.npz"
 _PACK_MANIFEST_FILENAME = "manifest.json"
 _PACK_FEATURE_STATS_FILENAME = "feature_stats.npz"
+AUPRC_TOLERANCE_SOURCE_FILENAME = "auprc_tolerance_source.npz"
+_AUPRC_TOLERANCE_SOURCE_SCHEMA = "egostitch_e2e_auprc_tolerance_source_v1"
 
 
 def _egostitch_ddp_kwargs(
@@ -634,6 +636,11 @@ def load_config(path: Path) -> EgoConfig:
             0.0 <= training.selection_auprc_tolerance <= 1.0
         ):
             raise ValueError("training.selection_auprc_tolerance must be finite and in [0, 1]")
+        if diagnostics.selection_auprc_tolerance != training.selection_auprc_tolerance:
+            raise ValueError(
+                "diagnostics.selection_auprc_tolerance must exactly equal "
+                "training.selection_auprc_tolerance"
+            )
         registered_training = EgoStitchTrainingConfig()
         if replace(
             training,
@@ -945,10 +952,10 @@ def _e2e_validation_endpoint_degrees(data: EgoStitchData) -> NDArray[np.float64]
 def e2e_degree_prior_init(
     model: EgoStitchStage1 | EgoStitchE2E, data: EgoStitchData
 ) -> float:
-    """Center the lognormal degree head on the ``G_struct`` degree prior.
+    """Center the lognormal degree head on the ``G_fit`` degree prior.
 
     ``deg_mu`` is a raw linear output (`tokenize.py:71-75`) born near 0, while
-    ``mean(log d)`` on ``G_struct`` sits several nats above it. `degree_nll`'s
+    ``mean(log d)`` on ``G_fit`` sits several nats above it. `degree_nll`'s
     ``1/sigma**2`` factor turns that standing residual into a generator gradient
     above the Sec 13.19 clip threshold on *every* step from step 1 -- the
     2026-07-28 `persistent clipping` abort, whose streak needs a term that is
@@ -971,7 +978,7 @@ def e2e_degree_prior_init(
         dtype=np.float64,
     )
     if degrees.size == 0:
-        raise RuntimeError("G_struct carries no nodes for the degree prior")
+        raise RuntimeError("G_fit carries no nodes for the degree prior")
     mu0 = float(np.log(degrees).mean())
     if not math.isfinite(mu0):
         raise RuntimeError(f"degree prior mean(log d) is not finite: {mu0}")
@@ -1463,7 +1470,8 @@ class PreregistrationNotBinding(RuntimeError):
 
 
 _REQUIRED_BEFORE_BINDING = "REQUIRED-BEFORE-BINDING"
-_E2E_BINDING_SCHEMA = "egostitch_e2e_binding_evidence_v1"
+_E2E_BINDING_SCHEMA_V1 = "egostitch_e2e_binding_evidence_v1"
+_E2E_BINDING_SCHEMA = "egostitch_e2e_binding_evidence_v2"
 _E2E_FORMAL_ARMS: tuple[E2EArmName, ...] = (
     "full",
     "b0_e2e_f_only",
@@ -1565,9 +1573,20 @@ def _validate_e2e_formal_binding(
     cfg: EgoConfig, snapshot: PreregistrationSnapshot, config_path: Path
 ) -> dict[str, str]:
     """Fail before DDP unless formal registration evidence matches live inputs."""
+    from src.experiments.auprc_tolerance import (
+        BINDING_SCHEMA_V1,
+        HISTORICAL_V1_ARMS,
+        binding_schema_for_registration,
+        validate_bound_calibration,
+    )
+
     evidence = snapshot.payload.get("binding_evidence")
-    if not isinstance(evidence, Mapping) or evidence.get("schema_version") != _E2E_BINDING_SCHEMA:
-        raise PreregistrationNotBinding("formal E2E run requires valid binding_evidence schema")
+    try:
+        schema = binding_schema_for_registration(snapshot.payload)
+    except ValueError as error:
+        raise PreregistrationNotBinding(str(error)) from error
+    if not isinstance(evidence, Mapping):  # narrowed by the shared fail-closed validator
+        raise PreregistrationNotBinding("formal E2E run requires binding_evidence")
     implementation = evidence.get("implementation")
     commit = implementation.get("commit") if isinstance(implementation, Mapping) else None
     if (
@@ -1577,41 +1596,55 @@ def _validate_e2e_formal_binding(
     ):
         raise PreregistrationNotBinding("binding_evidence implementation commit is invalid")
     configs = evidence.get("configs")
-    if not isinstance(configs, Mapping) or set(configs) != set(_E2E_FORMAL_ARMS):
+    expected_configs = (
+        HISTORICAL_V1_ARMS - {"structure_control_6a"}
+        if schema == BINDING_SCHEMA_V1
+        else frozenset(_E2E_FORMAL_ARMS)
+    )
+    if not isinstance(configs, Mapping) or set(configs) != expected_configs:
         raise PreregistrationNotBinding(
-            "binding_evidence configs must cover exactly the six trained checkpoint arms"
+            "binding_evidence configs do not match the registration's trained checkpoint arms"
         )
     registered_arms = snapshot.payload.get("arms")
-    if not isinstance(registered_arms, Mapping) or set(registered_arms) != set(_E2E_ARMS):
-        raise PreregistrationNotBinding(
-            "registration arms must contain the exact six-trained-plus-two-control schema"
-        )
-    for trained_arm in _E2E_FORMAL_ARMS:
+    expected_arms = HISTORICAL_V1_ARMS if schema == BINDING_SCHEMA_V1 else frozenset(_E2E_ARMS)
+    if not isinstance(registered_arms, Mapping) or set(registered_arms) != expected_arms:
+        raise PreregistrationNotBinding("registration arms do not match its identity schema")
+    for trained_arm in expected_configs:
         entry = registered_arms.get(trained_arm)
-        if not isinstance(entry, Mapping) or entry.get("kind") != "trained_checkpoint":
+        if not isinstance(entry, Mapping) or (
+            schema != BINDING_SCHEMA_V1 and entry.get("kind") != "trained_checkpoint"
+        ):
             raise PreregistrationNotBinding(
                 f"registration arms.{trained_arm} must be a trained_checkpoint"
             )
-    for control_arm in _E2E_CONTROL_ARMS:
-        entry = registered_arms.get(control_arm)
-        if (
-            not isinstance(entry, Mapping)
-            or entry.get("kind") != "scoring_time_control"
-            or entry.get("checkpoint_arm") != "full"
-        ):
-            raise PreregistrationNotBinding(
-                f"registration arms.{control_arm} must be a scoring_time_control over full"
-            )
+    if schema != BINDING_SCHEMA_V1:
+        for control_arm in _E2E_CONTROL_ARMS:
+            entry = registered_arms.get(control_arm)
+            if (
+                not isinstance(entry, Mapping)
+                or entry.get("kind") != "scoring_time_control"
+                or entry.get("checkpoint_arm") != "full"
+            ):
+                raise PreregistrationNotBinding(
+                    f"registration arms.{control_arm} must be a scoring_time_control over full"
+                )
     repo_root = cfg.preregistration.resolve().parents[2]
-    for label in (
+    binding_sections = [
         "parameter_group_manifests",
         "packs_and_validation_manifests",
         "qualification_attempts",
-        "qualification_history_indexes",
         "boundary_access_audit",
         "runtime_and_peak_memory",
-    ):
+    ]
+    if schema != BINDING_SCHEMA_V1:
+        binding_sections.insert(3, "qualification_history_indexes")
+    for label in binding_sections:
         _validate_binding_digest_section(evidence.get(label), label, repo_root)
+    if schema == _E2E_BINDING_SCHEMA:
+        try:
+            validate_bound_calibration(snapshot.payload, cfg.preregistration)
+        except ValueError as error:
+            raise PreregistrationNotBinding(str(error)) from error
     if not isinstance(evidence.get("checkpoint_policy_version"), str):
         raise PreregistrationNotBinding("binding_evidence checkpoint policy is missing")
 
@@ -2089,7 +2122,7 @@ class EgoStitchData:
     Attributes:
         train_nodes: Sorted train-side node ids with F0 rows.
         e_sup_positives: Canonical supervision positives (self-pairs included).
-        val_pairs: Validation pairs in artifact order.
+        val_pairs: Validation pairs in canonical V_hold non-self manifest order.
         val_labels: Aligned validation labels.
         f0: Shape ``(N, d)`` float32 CPU matrix.
         node_index: Node id -> `f0` row.
@@ -3197,6 +3230,107 @@ class _ValidationResult:
     metrics: EdgeMetrics
     fidelity: dict[str, float]
     scale_telemetry: dict[str, float] = field(default_factory=dict)
+    active_logits: NDArray[np.float32] = field(
+        default_factory=lambda: np.empty(0, dtype="<f4")
+    )
+
+
+def _should_capture_auprc_tolerance_source(
+    *,
+    run_kind: str,
+    arm: E2EArmName,
+    seed: int,
+    epoch: int,
+    fixed_source_epoch: int,
+    profile_only: bool,
+) -> bool:
+    """Return whether this existing validation is the immutable calibration source."""
+    return (
+        not profile_only
+        and run_kind == "qualification"
+        and arm == "full"
+        and seed == 0
+        and epoch == fixed_source_epoch
+    )
+
+
+def _write_auprc_tolerance_source(
+    output_path: Path,
+    data: EgoStitchData,
+    validation: _ValidationResult,
+    *,
+    epoch: int,
+    global_step: int,
+    phase: str,
+    full_joint_epochs: int,
+    fixed_source_epoch: int,
+) -> None:
+    """Atomically persist the canonical existing V_hold validation for AP calibration."""
+    if output_path.exists():
+        raise FileExistsError(f"AUPRC tolerance source already exists: {output_path}")
+    if data.validation_role != _E2E_VALIDATION_ROLE or data.internal_holdout is None:
+        raise RuntimeError("AUPRC tolerance source requires canonical V_hold data")
+    manifest = data.internal_holdout.hold_manifest
+    labels = np.ascontiguousarray(data.val_labels, dtype=np.int8)
+    active_logits = np.ascontiguousarray(validation.active_logits, dtype="<f4")
+    if tuple(data.val_pairs) != manifest.pairs:
+        raise RuntimeError("AUPRC tolerance source pair order is not the canonical V_hold manifest")
+    if not np.array_equal(labels, np.asarray(manifest.labels, dtype=np.int8)):
+        raise RuntimeError(
+            "AUPRC tolerance source labels do not match the canonical V_hold manifest"
+        )
+    if active_logits.shape != labels.shape:
+        raise RuntimeError(
+            "AUPRC tolerance source active logits do not cover the canonical V_hold manifest"
+        )
+    positive_count = int(labels.sum(dtype=np.int64))
+    metadata: dict[str, object] = {
+        "schema": _AUPRC_TOLERANCE_SOURCE_SCHEMA,
+        "arm": "full",
+        "seed": 0,
+        "run_kind": "qualification",
+        "validation_role": _E2E_VALIDATION_ROLE,
+        "validation_epoch": epoch,
+        "global_step": global_step,
+        "fixed_source_epoch": fixed_source_epoch,
+        "phase": phase,
+        "full_joint_epochs": full_joint_epochs,
+        "source_rule": (
+            "first validation after the conditioning ramp plus one complete Phase-C epoch"
+        ),
+        "source_validation_reused": True,
+        "source_validation_existing_event": True,
+        "bootstrap_additional_v_hold_evaluations": 0,
+        "pair_count": len(manifest.pairs),
+        "node_count": len(manifest.nodes),
+        "positive_count": positive_count,
+        "negative_count": len(labels) - positive_count,
+        "pair_labels_sha256": manifest.pair_labels_sha256,
+        "nodes_sha256": manifest.nodes_sha256,
+        "positive_edges_sha256": manifest.positive_edges_sha256,
+        "score_transform": "none",
+        "active_logits_dtype": "<f4",
+        "labels_dtype": "int8",
+        "active_logits_sha256": hashlib.sha256(active_logits.tobytes(order="C")).hexdigest(),
+        "labels_sha256": hashlib.sha256(labels.tobytes(order="C")).hexdigest(),
+    }
+    metadata_json = np.asarray(json.dumps(metadata, sort_keys=True), dtype=np.str_)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_name(f".{output_path.name}.tmp-{os.getpid()}")
+    try:
+        with temporary_path.open("xb") as handle:
+            np.savez(
+                handle,
+                labels=labels,
+                active_logits=active_logits,
+                metadata_json=metadata_json,
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, output_path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def _validation_clustering_mmd(data: EgoStitchData, logits: np.ndarray) -> float:
@@ -3477,6 +3611,7 @@ def _validate_epoch(
         metrics=compute_edge_metrics(data.val_labels.astype(np.int64), probs),
         fidelity=fidelity,
         scale_telemetry=scale_telemetry,
+        active_logits=np.asarray(logits_np, dtype="<f4"),
     )
 
 
@@ -4330,6 +4465,25 @@ def _train_e2e_stability_loop(
             fidelity = validation.fidelity
             last_metrics = metrics
             last_fidelity = fidelity
+            full_joint_epochs = max(0, epoch - first_eligible_epoch + 1)
+            if _should_capture_auprc_tolerance_source(
+                run_kind=run_kind,
+                arm=arm,
+                seed=cfg.seed,
+                epoch=epoch,
+                fixed_source_epoch=first_eligible_epoch,
+                profile_only=profile_only,
+            ):
+                _write_auprc_tolerance_source(
+                    cfg.output_dir / AUPRC_TOLERANCE_SOURCE_FILENAME,
+                    data,
+                    validation,
+                    epoch=epoch,
+                    global_step=global_step,
+                    phase=phase.phase,
+                    full_joint_epochs=full_joint_epochs,
+                    fixed_source_epoch=first_eligible_epoch,
+                )
             if (
                 not profile_only
                 and _e2e_should_capture_eligibility_reference(
@@ -4375,7 +4529,6 @@ def _train_e2e_stability_loop(
                 validation.scale_telemetry.get("h_norm_mean", float("nan")),
                 validation.scale_telemetry.get("h_pairwise_sqdist_mean", float("nan")),
             )
-            full_joint_epochs = max(0, epoch - first_eligible_epoch + 1)
             record = E2ECheckpointRecord(
                 epoch=epoch,
                 phase=phase.phase,
@@ -5077,6 +5230,40 @@ def write_run_start_metadata(
         else None
     )
     arm = _e2e_arm_name_from_config(e2e_config) if e2e_config is not None else None
+    live_implementation_commit: str | None = None
+    implementation_tracked_clean: bool | None = None
+    implementation_tracked_status_sha256: str | None = None
+    if e2e_config is not None and not debug and config_path is not None:
+        repo_root = cfg.preregistration.resolve().parents[2]
+        live_implementation_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if (
+            len(live_implementation_commit) != 40
+            or any(
+                character not in "0123456789abcdefABCDEF"
+                for character in live_implementation_commit
+            )
+        ):
+            raise RuntimeError("live implementation commit must be a full 40-hex git HEAD")
+        tracked_status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        implementation_tracked_clean = tracked_status == ""
+        implementation_tracked_status_sha256 = hashlib.sha256(tracked_status.encode()).hexdigest()
+    implementation_commit = (
+        formal_binding.get("implementation_commit")
+        if formal_binding is not None
+        else live_implementation_commit if run_kind == "qualification" else None
+    )
     metadata = {
         "status": "started",
         "run_kind": run_kind,
@@ -5104,9 +5291,9 @@ def write_run_start_metadata(
         "scoring_semantics": (
             _e2e_trained_scoring_semantics(e2e_config) if e2e_config is not None else None
         ),
-        "implementation_commit": (
-            formal_binding.get("implementation_commit") if formal_binding is not None else None
-        ),
+        "implementation_commit": implementation_commit,
+        "implementation_tracked_clean": implementation_tracked_clean,
+        "implementation_tracked_status_sha256": implementation_tracked_status_sha256,
         "feature_stats_sha256": feature_stats_sha256 or "",
     }
     path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
@@ -5513,7 +5700,7 @@ def _run_ddp_dispatch(
         raise ValueError(f"unsupported DDP mode: {args.ddp_mode!r}")
 
     degree_prior = e2e_degree_prior_init(model, data)
-    logger.info("degree head centered on G_struct prior mean(log d)=%.6f", degree_prior)
+    logger.info("degree head centered on G_fit prior mean(log d)=%.6f", degree_prior)
 
     if accelerator.is_main_process:
         write_run_start_metadata(

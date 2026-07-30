@@ -29,6 +29,7 @@ usage() {
   cat <<'EOF'
 Usage:
   hpc/qualification.sh qualify <full|f_only|pair_topology|p0|cosine_pool|no_l_rel>
+  hpc/qualification.sh calibrate-tolerance
   hpc/qualification.sh formal  <full|f_only|pair_topology|p0|cosine_pool|no_l_rel>
 
 Both stages run the rev-3.2 trainer over the identical universe: they
@@ -44,6 +45,13 @@ guards-only: pass iff no fail-fast guard tripped. Checkpoint eligibility is
 unaffected — it is enforced in both stages. qualify never edits or promotes the
 registration and deliberately does not require a clean checkout, because
 iterating on the model is the point.
+
+calibrate-tolerance is the one-shot bootstrap path for the selection AUPRC
+band. It reuses the earliest successful full-arm source already recorded in the
+immutable history; only when no such source exists does it launch and record one
+new full-arm qualification attempt. It then calibrates that attempt's existing
+source validation, never launches another V_hold evaluation, and never edits the
+registration. Ordinary `qualify full` does not run calibration.
 
 formal requires exactly 4 visible NVIDIA H20s, a clean checkout, a fully
 resolved BINDING registration (the active v4 file is still DRAFT), and a qualification for the same arm whose
@@ -212,6 +220,14 @@ assert_clean_checkout() {
   dirty="$(git status --porcelain)"
   [[ -z "${dirty}" ]] || \
     fail "${stage} requires a clean checkout; the working tree has uncommitted changes"
+}
+
+assert_tracked_clean_checkout() {
+  local stage="$1"
+  local dirty
+  dirty="$(git status --porcelain --untracked-files=no)"
+  [[ -z "${dirty}" ]] || \
+    fail "${stage} requires a tracked-clean checkout; tracked files have uncommitted changes"
 }
 
 assert_formal_registration() {
@@ -388,6 +404,7 @@ print(path)
 # picked up automatically.
 run_sanity_suite() {
   "${UV_BIN}" run pytest -q \
+    tests/experiments/test_auprc_tolerance.py \
     tests/test_train_egostitch*.py \
     tests/model/test_egostitch_conditioning.py \
     tests/model/test_egostitch_trunk.py \
@@ -446,6 +463,89 @@ run_qualification() {
   fi
   update_qualification_pointer "${arm}" "${output_dir}" latest-pass
   echo "qualification completed; verdict: ${output_dir}/qualification.json"
+}
+
+assert_tolerance_calibration_not_complete() {
+  local attempts_root="${QUALIFICATION_ROOT_DIR}/full/attempts"
+  local existing=""
+  if [[ -d "${attempts_root}" ]]; then
+    existing="$(find "${attempts_root}" -type f \
+      -name 'auprc_tolerance_calibration.json' -print -quit)"
+  fi
+  [[ -z "${existing}" ]] || \
+    fail "AUPRC tolerance calibration is one-shot; immutable evidence already exists: ${existing}"
+}
+
+find_immutable_tolerance_source_attempt() {
+  local history="${QUALIFICATION_ROOT_DIR}/full/attempt_history.json"
+  if [[ ! -f "${history}" ]]; then
+    return 0
+  fi
+  "${PYTHON_BIN}" -c '
+import json, subprocess, sys
+from pathlib import Path
+
+from src.experiments.auprc_tolerance import (
+    AUPRC_TOLERANCE_SOURCE_FILENAME,
+    _validate_attempt,
+    load_source,
+)
+
+history = Path(sys.argv[1])
+preregistration = Path(sys.argv[2])
+payload = json.loads(history.read_text(encoding="utf-8"))
+if payload.get("schema_version") != "egostitch_e2e_qualification_history_v1":
+    raise SystemExit("qualification attempt-history schema is invalid")
+if payload.get("arm") != "full" or not isinstance(payload.get("attempts"), list):
+    raise SystemExit("qualification attempt history is not the full-arm history")
+for row in payload["attempts"]:
+    if not isinstance(row, dict):
+        raise SystemExit("qualification attempt-history row must be an object")
+    if row.get("exit_code") != 0 or row.get("outcome") != "success" or row.get("verdict") != "pass":
+        continue
+    attempt = Path(str(row.get("attempt_dir", "")))
+    if not attempt.is_absolute():
+        attempt = Path.cwd() / attempt
+    source = attempt / AUPRC_TOLERANCE_SOURCE_FILENAME
+    if not source.is_file() or source.stat().st_size <= 0:
+        continue
+    try:
+        _, _, source_metadata = load_source(source)
+        _validate_attempt(attempt, preregistration, source_metadata)
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        continue
+    print(attempt.resolve())
+    break
+' "${history}" "${PREREGISTRATION}" || \
+    fail "could not select the immutable AUPRC tolerance source attempt"
+}
+
+run_tolerance_calibration() {
+  local attempt_dir
+  assert_tracked_clean_checkout calibrate-tolerance
+  assert_source_resolves_to_repo
+  assert_qualification_registration_open
+  REGISTRATION_SHA256_BEFORE="$(registration_sha256)"
+  export REGISTRATION_SHA256_BEFORE
+  trap assert_registration_unchanged EXIT
+  assert_tolerance_calibration_not_complete
+  attempt_dir="$(find_immutable_tolerance_source_attempt)"
+  if [[ -z "${attempt_dir}" ]]; then
+    run_qualification full
+    attempt_dir="$(find_immutable_tolerance_source_attempt)"
+  fi
+  [[ -n "${attempt_dir}" && -d "${attempt_dir}" ]] || \
+    fail "no successful recorded full qualification attempt contains the calibration source"
+  # Ordering is load-bearing: calibration may only consume an attempt after
+  # run_qualification has appended it to attempt_history.json. An already
+  # recorded source is resumed directly; it is never replaced by a newer
+  # attempt after an interrupted bootstrap. The module re-verifies the exact
+  # history row and refuses an unrecorded source.
+  "${PYTHON_BIN}" -m src.experiments.auprc_tolerance \
+    --attempt-dir "${attempt_dir}" \
+    --preregistration "${PREREGISTRATION}"
+  assert_registration_unchanged
+  echo "AUPRC tolerance calibration completed: ${attempt_dir}/auprc_tolerance_calibration.json"
 }
 
 run_formal() {
@@ -554,6 +654,10 @@ case "${1:-}" in
   qualify)
     [[ $# -eq 2 ]] || fail "qualify requires exactly one arm"
     run_qualification "$2"
+    ;;
+  calibrate-tolerance)
+    [[ $# -eq 1 ]] || fail "calibrate-tolerance takes no arm"
+    run_tolerance_calibration
     ;;
   formal)
     [[ $# -eq 2 ]] || fail "formal requires exactly one arm"

@@ -490,7 +490,59 @@
     "eligibility_applies_to_both_stages": "The eligibility conditions above are retained in full at BOTH stages. 'Guards only' governs the qualification verdict, not what makes a checkpoint eligible - this distinction is what prevents selection from landing on a reconstruction-only warm-start checkpoint, the documented 2026-07-19 v1 failure.",
     "selection": "among eligible epochs within auprc_tolerance of the best eligible AUPRC for that arm, minimize train-side validation clustering MMD",
     "auprc_tolerance": null,
-    "auprc_tolerance_rule": "select_e2e_checkpoint's selection-band kwarg (distinct from the fixed 0.02 eligibility floor above) must be re-derived from V_hold's measured AP sampling standard deviation and recorded before binding. It is deliberately NOT held at the legacy 0.02, which happened to equal about one SD of the smaller V_select manifest. The six live configs still carry the legacy training.selection_auprc_tolerance: 0.02; binding requires the recomputed value in both the configs and this field, and the config digests below re-pinned accordingly.",
+    "auprc_tolerance_rule": "select_e2e_checkpoint's selection-band kwarg is distinct from every fixed 0.02 eligibility constant and is derived from V_hold's measured AP sampling standard deviation. Its numerical value remains null until the immutable method below is executed and its evidence is bound; the fixed eligibility constants and tie_tolerance_mmd remain unchanged.",
+    "auprc_tolerance_calibration_method": {
+      "method_id": "stratified_pair_bootstrap_ap_sd_v1",
+      "scope": "one scalar shared unchanged by all six trained arms",
+      "immutable_source_attempt": "the first full-arm Seed-0 qualification attempt under the first implementation containing this method that reaches the first validation after the conditioning ramp plus one complete Phase-C epoch and successfully writes the complete source artifact; a failed, incomplete, later, or manually preferred attempt cannot replace it",
+      "source_validation_reuse": "reuse that existing validation event; do not trigger another validation and do not add another V_hold evaluation to K. The source attempt and source validation remain in the complete attempt_history.json exposure history and cumulative K exactly once",
+      "pair_universe": {
+        "name": "canonical V_hold non-self pair manifest",
+        "rows": 130816,
+        "positives": 1533,
+        "negatives": 129283
+      },
+      "scores": {
+        "array": "active full-model logits",
+        "dtype": "fp32",
+        "transform": "none; no sigmoid"
+      },
+      "bootstrap": {
+        "unit": "pair row",
+        "stratification": "binary label",
+        "replacement": true,
+        "replicates": 10000,
+        "positive_draws_per_replicate": 1533,
+        "negative_draws_per_replicate": 129283,
+        "rng": "numpy.random.Generator(numpy.random.PCG64(0)); one sequential generator for all draws",
+        "iteration_order": "replicate-major from replicate 0 through 9999",
+        "draw_order_per_replicate": "draw positive row indices first, then negative row indices, from the same sequential generator",
+        "metric_input_assembly": "concatenate the positive sample before the negative sample for y_true, and concatenate the corresponding raw logits in the identical order for y_score",
+        "metric": "sklearn.metrics.average_precision_score"
+      },
+      "estimator": "sample standard deviation of the 10000 replicate AP values with ddof=1",
+      "rounding": "ceil(10000 * sd) / 10000",
+      "clamp": "none; no floor or cap",
+      "forbidden_reads": [
+        "V_hold topology or any clustering/MMD quantity",
+        "candidate pairs or scores",
+        "test pairs or scores",
+        "test graph"
+      ],
+      "unchanged_constants": {
+        "eligibility_auprc_additive_margin": 0.02,
+        "tie_tolerance_mmd": 1e-06
+      },
+      "source_artifact_required_evidence": [
+        "attempt and source-validation identities",
+        "implementation and config identities",
+        "canonical pair-manifest hashes and row/positive/negative counts",
+        "active-logit dtype, no-transform declaration, and source-logit hash",
+        "bootstrap method, PCG64 seed, replicate count, replicate-major order, positive-then-negative draw and metric-input concatenation order, and replicate-AP hash",
+        "ddof, measured sd, rounding rule, and resulting auprc_tolerance",
+        "proof that the source validation is reused, creates no new K event, and is included in the complete history/K"
+      ]
+    },
     "tie_tolerance_mmd": 1e-06,
     "tie_break": "lower unweighted validation Brier score, then earlier epoch",
     "forbidden": [
@@ -700,7 +752,7 @@
     "no_implicit_binding": "Inheritance does not import v2 binding evidence, implementation/config hashes, checkpoints, qualification results, or artifact provenance."
   },
   "binding_evidence": {
-    "schema_version": "egostitch_e2e_binding_evidence_v1",
+    "schema_version": "egostitch_e2e_binding_evidence_v2",
     "draft_state": "The nulls below are the unresolved binding evidence. Every consuming validator already fails closed on a null (src/train_egostitch.py::_validate_e2e_formal_binding, src/experiments/g5_stage1.py::_validate_e2e_binding_evidence, src/score_universe.py::_validate_e2e_scoring_provenance), so no text marker is needed and none is used: a DRAFT cannot be mistaken for a resolved BINDING state.",
     "implementation": null,
     "configs": {
@@ -736,11 +788,12 @@
     "qualification_history_indexes": null,
     "boundary_access_audit": null,
     "runtime_and_peak_memory": null,
+    "auprc_tolerance_calibration": null,
     "checkpoint_policy_version": null
   },
   "binding_prerequisites": [
     "A qualification-stage run on the full V_fit universe returns verdict pass and writes qualification.json with its feature_stats_sha256 and model_config_sha256.",
-    "auprc_tolerance is re-derived from V_hold's measured AP sampling standard deviation, written into checkpoint_selection.auprc_tolerance and into the six configs, and the config digests above are re-pinned to match.",
+    "binding_evidence.auprc_tolerance_calibration is a path-and-SHA-256 reference to the complete source artifact required by checkpoint_selection.auprc_tolerance_calibration_method. It binds the immutable first full Seed-0 qualification source attempt, proves the existing validation was reused with no additional K event while the source remains in complete history/K, and reproduces the unclamped ceil(10000*sd)/10000 value. That value is written into checkpoint_selection.auprc_tolerance and into the six configs, and the config digests above are re-pinned to match.",
     "binding_evidence.implementation names the implementation commit whose clean checkout produced the qualifying evidence; the formal worker verifies its own HEAD equals that commit or is a clean descendant through commits touching only docs/registrations/ paths.",
     "binding_evidence.parameter_group_manifests, packs_and_validation_manifests, qualification_attempts, qualification_history_indexes, boundary_access_audit and runtime_and_peak_memory each carry path-bound SHA-256 artifacts that resolve and hash-match on the execution host.",
     "binding_evidence.qualification_history_indexes maps exactly the six trained arms to path-and-SHA-256 references for each arm's attempt_history.json. Every index has schema_version egostitch_e2e_qualification_history_v1, the matching arm identity, and a non-empty attempts list; binding_evidence.qualification_attempts maps the same exact six arms and each arm's entries equal the referenced index's complete attempts list exactly.",

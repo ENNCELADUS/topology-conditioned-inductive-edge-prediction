@@ -8,12 +8,14 @@ and the sanitized-root sandbox — was deleted with it.
 """
 
 import hashlib
+import io
 import json
 import re
 import shutil
 import stat
 import subprocess
 import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import pytest
@@ -236,6 +238,7 @@ def test_e2e_runner_help_describes_the_two_stage_ladder(bash_exe: str) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert "hpc/qualification.sh qualify" in result.stdout
+    assert "hpc/qualification.sh calibrate-tolerance" in result.stdout
     assert "hpc/qualification.sh formal" in result.stdout
     assert "auto-detects and uses every visible H20" in result.stdout
     assert "exactly 4 visible NVIDIA H20s" in result.stdout
@@ -243,6 +246,199 @@ def test_e2e_runner_help_describes_the_two_stage_ladder(bash_exe: str) -> None:
     # The six trained arms are selectable; the two scoring-time controls are not.
     assert "full|f_only|pair_topology|p0|cosine_pool|no_l_rel" in result.stdout
     assert "--max-steps is never substituted" in result.stdout
+
+
+def test_tolerance_bootstrap_records_the_new_full_attempt_before_calibration() -> None:
+    body = _strip_comments(_block("run_tolerance_calibration()", "run_formal()"))
+    assert body.index("assert_tracked_clean_checkout calibrate-tolerance") < body.index(
+        "run_qualification full"
+    )
+    assert body.index("assert_tolerance_calibration_not_complete") < body.index(
+        "find_immutable_tolerance_source_attempt"
+    )
+    assert body.index("find_immutable_tolerance_source_attempt") < body.index(
+        "run_qualification full"
+    )
+    assert body.index("run_qualification full") < body.index(
+        "src.experiments.auprc_tolerance"
+    )
+    assert 'if [[ -z "${attempt_dir}" ]]' in body
+    assert body.count("run_qualification full") == 1
+    assert '--attempt-dir "${attempt_dir}"' in body
+    assert '--preregistration "${PREREGISTRATION}"' in body
+    assert "assert_registration_unchanged" in body
+
+    qualification = _strip_comments(
+        _block("run_qualification()", "assert_tolerance_calibration_not_complete()")
+    )
+    assert qualification.index("record_qualification_attempt") < qualification.index(
+        'update_qualification_pointer "${arm}" "${output_dir}" latest-pass'
+    )
+
+
+def test_failed_full_qualification_cannot_fabricate_calibration_evidence() -> None:
+    body = _strip_comments(_block("run_tolerance_calibration()", "run_formal()"))
+    launch = body.index("run_qualification full")
+    calibrate = body.index("src.experiments.auprc_tolerance")
+    assert launch < calibrate
+    # `set -e` therefore stops on any failed qualification before the module is
+    # invoked; no masking operator may convert that failure into calibration.
+    assert re.search(r"^\s*run_qualification full\s*$", body, re.MULTILINE)
+
+
+def test_tolerance_bootstrap_is_one_shot_and_ordinary_qualify_does_not_run_it() -> None:
+    guard = _strip_comments(
+        _block(
+            "assert_tolerance_calibration_not_complete()",
+            "find_immutable_tolerance_source_attempt()",
+        )
+    )
+    assert "auprc_tolerance_calibration.json" in guard
+    assert "ap_replicates.npy" not in guard
+    assert "-print -quit" in guard
+    assert "one-shot" in guard
+
+    qualification = _strip_comments(
+        _block("run_qualification()", "assert_tolerance_calibration_not_complete()")
+    )
+    assert "src.experiments.auprc_tolerance" not in qualification
+    assert "ap_replicates.npy" not in qualification
+
+
+def test_tolerance_source_selector_uses_earliest_successful_recorded_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.experiments import auprc_tolerance as calibration
+
+    arm_root = tmp_path / "qualification" / "full"
+    attempts_root = arm_root / "attempts"
+    dirty = attempts_root / "attempt-001"
+    earliest = attempts_root / "attempt-002"
+    later = attempts_root / "attempt-003"
+    for attempt, clean in ((dirty, False), (earliest, True), (later, True)):
+        attempt.mkdir(parents=True)
+        (attempt / "auprc_tolerance_source.npz").write_bytes(b"source")
+        (attempt / "run_metadata.json").write_text(json.dumps({"clean": clean}))
+    (arm_root / "attempt_history.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "egostitch_e2e_qualification_history_v1",
+                "arm": "full",
+                "attempts": [
+                    {
+                        "attempt_dir": str(dirty),
+                        "exit_code": 0,
+                        "outcome": "success",
+                        "verdict": "pass",
+                    },
+                    {
+                        "attempt_dir": str(earliest),
+                        "exit_code": 0,
+                        "outcome": "success",
+                        "verdict": "pass",
+                    },
+                    {
+                        "attempt_dir": str(later),
+                        "exit_code": 0,
+                        "outcome": "success",
+                        "verdict": "pass",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    preregistration = tmp_path / "preregistration.json"
+    preregistration.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(calibration, "load_source", lambda path: (None, None, {}))
+
+    def validate(attempt: Path, preregistration_path: Path, metadata: object) -> None:
+        del preregistration_path, metadata
+        run_metadata = json.loads((attempt / "run_metadata.json").read_text())
+        if run_metadata["clean"] is not True:
+            raise ValueError("dirty source attempt")
+
+    monkeypatch.setattr(calibration, "_validate_attempt", validate)
+    program = _embedded_python(
+        _block("find_immutable_tolerance_source_attempt()", "run_tolerance_calibration()")
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["python", str(arm_root / "attempt_history.json"), str(preregistration)],
+    )
+    stdout = io.StringIO()
+    with redirect_stdout(stdout):
+        exec(compile(program, "<selector>", "exec"), {})
+
+    assert Path(stdout.getvalue().strip()).resolve() == earliest.resolve()
+
+
+def test_tolerance_source_selector_returns_empty_when_no_clean_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.experiments import auprc_tolerance as calibration
+
+    arm_root = tmp_path / "qualification" / "full"
+    attempt = arm_root / "attempts" / "attempt-001"
+    attempt.mkdir(parents=True)
+    (attempt / "auprc_tolerance_source.npz").write_bytes(b"source")
+    history = arm_root / "attempt_history.json"
+    history.write_text(
+        json.dumps(
+            {
+                "schema_version": "egostitch_e2e_qualification_history_v1",
+                "arm": "full",
+                "attempts": [
+                    {
+                        "attempt_dir": str(attempt),
+                        "exit_code": 0,
+                        "outcome": "success",
+                        "verdict": "pass",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    preregistration = tmp_path / "preregistration.json"
+    preregistration.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(calibration, "load_source", lambda path: (None, None, {}))
+    monkeypatch.setattr(
+        calibration,
+        "_validate_attempt",
+        lambda attempt_path, preregistration_path, metadata: (_ for _ in ()).throw(
+            ValueError("dirty source attempt")
+        ),
+    )
+    program = _embedded_python(
+        _block("find_immutable_tolerance_source_attempt()", "run_tolerance_calibration()")
+    )
+    monkeypatch.setattr(sys, "argv", ["python", str(history), str(preregistration)])
+    stdout = io.StringIO()
+    with redirect_stdout(stdout):
+        exec(compile(program, "<selector>", "exec"), {})
+
+    assert stdout.getvalue() == ""
+
+
+def test_interrupted_bootstrap_without_outputs_resumes_the_same_source() -> None:
+    body = _strip_comments(_block("run_tolerance_calibration()", "run_formal()"))
+    assert 'attempt_dir="$(find_immutable_tolerance_source_attempt)"' in body
+    assert 'if [[ -z "${attempt_dir}" ]]' in body
+    # Existing source selection occurs before the only qualification launch.
+    assert body.index('attempt_dir="$(find_immutable_tolerance_source_attempt)"') < body.index(
+        "run_qualification full"
+    )
+    # The selector is history-ordered and never consults mutable latest-pass.
+    assert "latest-pass" not in body
+
+
+def test_calibrate_tolerance_is_a_no_arm_command() -> None:
+    dispatch = _strip_comments(RUNNER.read_text()[RUNNER.read_text().rindex('case "${1:-}" in') :])
+    assert "calibrate-tolerance)" in dispatch
+    assert '[[ $# -eq 1 ]]' in dispatch
+    assert "run_tolerance_calibration" in dispatch
 
 
 @pytest.mark.parametrize("retired", _RETIRED_SURFACE)
@@ -354,6 +550,7 @@ def test_the_sanity_suite_cannot_silently_shrink_when_the_tests_are_split() -> N
     # Globbed, not listed: splitting tests/test_train_egostitch.py must not drop
     # the e2e contracts it carries.
     assert "tests/test_train_egostitch*.py" in body
+    assert "tests/experiments/test_auprc_tolerance.py" in body
     assert "tests/model/test_egostitch_conditioning.py" in body
     assert "tests/test_e2_pipeline.py" in body
     assert "tests/test_hpc_qualification.py" in body

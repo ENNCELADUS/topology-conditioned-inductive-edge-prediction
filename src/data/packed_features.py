@@ -281,8 +281,11 @@ def build_packed_features(
             )
             start += size
 
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            results = list(executor.map(_write_shard, jobs))
+        if workers == 1 and jobs:
+            results = [_write_shard(jobs[0])]
+        else:
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                results = list(executor.map(_write_shard, jobs))
         results.sort(key=lambda result: result[1][0].shard_index)
 
         shards = tuple(result[0] for result in results)

@@ -95,7 +95,12 @@ _META_KEYS = (
 _NAMED_PAIR_SOURCES = ("candidate", "test", "val")
 _EGOSTITCH_E2E_PAIR_PRECISION_CONTRACT = "egostitch_e2e_pair_fp32_v1"
 _EGOSTITCH_E2E_ARRAY_KEYS = ("full", "f_logit", "pair_content", "pair_topology")
-_EGOSTITCH_E2E_BINDING_SCHEMA = "egostitch_e2e_binding_evidence_v1"
+_EGOSTITCH_E2E_BINDING_SCHEMA_V1 = "egostitch_e2e_binding_evidence_v1"
+_EGOSTITCH_E2E_BINDING_SCHEMA_V2 = "egostitch_e2e_binding_evidence_v2"
+_EGOSTITCH_E2E_BINDING_SCHEMAS = {
+    _EGOSTITCH_E2E_BINDING_SCHEMA_V1,
+    _EGOSTITCH_E2E_BINDING_SCHEMA_V2,
+}
 _EGOSTITCH_E2E_FORMAL_ARMS = (
     "full",
     "b0_e2e_f_only",
@@ -1183,10 +1188,32 @@ def _validate_binding_artifact_digests(
         _validate_digest_section(
             evidence.get(section), label=section, registration_path=registration_path
         )
+    if evidence.get("schema_version") == _EGOSTITCH_E2E_BINDING_SCHEMA_V2:
+        _validate_digest_section(
+            evidence.get("qualification_history_indexes"),
+            label="qualification_history_indexes",
+            registration_path=registration_path,
+        )
+        calibration = evidence.get("auprc_tolerance_calibration")
+        if not isinstance(calibration, Mapping) or set(calibration) != {"path", "sha256"}:
+            raise ValueError(
+                "binding_evidence.auprc_tolerance_calibration must contain exactly path and sha256"
+            )
+        _validate_digest_section(
+            calibration,
+            label="auprc_tolerance_calibration",
+            registration_path=registration_path,
+        )
 
 
 def _preflight_binding_artifacts_before_pair_access(registration_path: Path) -> None:
     """Fail closed on binding artifacts without opening a candidate/test pair source."""
+    from src.experiments.auprc_tolerance import (
+        BINDING_SCHEMA_V1,
+        binding_schema_for_registration,
+        validate_bound_calibration,
+    )
+
     registration = _load_json_object(registration_path, label="registration")
     if registration.get("status") != "BINDING":
         raise ValueError("egostitch_e2e candidate/test scoring requires status 'BINDING'")
@@ -1195,11 +1222,10 @@ def _preflight_binding_artifacts_before_pair_access(registration_path: Path) -> 
     evidence = registration.get("binding_evidence")
     if not isinstance(evidence, dict):
         raise ValueError("registration binding_evidence must be an object")
-    if evidence.get("schema_version") != _EGOSTITCH_E2E_BINDING_SCHEMA:
-        raise ValueError(
-            f"binding_evidence.schema_version must be {_EGOSTITCH_E2E_BINDING_SCHEMA!r}"
-        )
+    schema = binding_schema_for_registration(registration)
     _validate_binding_artifact_digests(evidence, registration_path=registration_path)
+    if schema != BINDING_SCHEMA_V1:
+        validate_bound_calibration(registration, registration_path)
 
 
 def _load_json_object(path: Path, *, label: str) -> dict[str, object]:
@@ -1294,6 +1320,13 @@ def _validate_e2e_scoring_provenance(
     failure therefore occurs before either manifest is opened and before an
     output artifact can be created.
     """
+    from src.experiments.auprc_tolerance import (
+        BINDING_SCHEMA_V1,
+        HISTORICAL_V1_ARMS,
+        binding_schema_for_registration,
+        validate_bound_calibration,
+    )
+
     registration = _load_json_object(registration_path, label="registration")
     if registration.get("status") != "BINDING":
         raise ValueError("egostitch_e2e candidate/test scoring requires status 'BINDING'")
@@ -1303,10 +1336,7 @@ def _validate_e2e_scoring_provenance(
     evidence = registration.get("binding_evidence")
     if not isinstance(evidence, dict):
         raise ValueError("registration binding_evidence must be an object")
-    if evidence.get("schema_version") != _EGOSTITCH_E2E_BINDING_SCHEMA:
-        raise ValueError(
-            f"binding_evidence.schema_version must be {_EGOSTITCH_E2E_BINDING_SCHEMA!r}"
-        )
+    schema = binding_schema_for_registration(registration)
     implementation = evidence.get("implementation")
     if not isinstance(implementation, dict):
         raise ValueError("binding_evidence.implementation must be an object")
@@ -1317,37 +1347,47 @@ def _validate_e2e_scoring_provenance(
         raise ValueError("binding_evidence implementation commit must be a 7-64 hex string")
 
     configs = evidence.get("configs")
-    if not isinstance(configs, dict) or set(configs) != set(_EGOSTITCH_E2E_FORMAL_ARMS):
+    formal_arms = (
+        HISTORICAL_V1_ARMS - {"structure_control_6a"}
+        if schema == BINDING_SCHEMA_V1
+        else frozenset(_EGOSTITCH_E2E_FORMAL_ARMS)
+    )
+    all_arms = HISTORICAL_V1_ARMS if schema == BINDING_SCHEMA_V1 else frozenset(
+        _EGOSTITCH_E2E_ARMS
+    )
+    if not isinstance(configs, dict) or set(configs) != formal_arms:
         raise ValueError(
-            "binding_evidence.configs must contain exactly the six trained checkpoint arms"
+            "binding_evidence.configs do not match the registration's trained checkpoint arms"
         )
     registered_arms = registration.get("arms")
-    if not isinstance(registered_arms, dict) or set(registered_arms) != set(
-        _EGOSTITCH_E2E_ARMS
-    ):
-        raise ValueError(
-            "registration arms must contain the exact six-trained-plus-two-control schema"
-        )
-    for trained_arm in _EGOSTITCH_E2E_FORMAL_ARMS:
+    if not isinstance(registered_arms, dict) or set(registered_arms) != all_arms:
+        raise ValueError("registration arms do not match the registered identity schema")
+    for trained_arm in formal_arms:
         entry = registered_arms.get(trained_arm)
         if (
             not isinstance(entry, dict)
-            or entry.get("kind") != "trained_checkpoint"
+            or (schema != BINDING_SCHEMA_V1 and entry.get("kind") != "trained_checkpoint")
             or not isinstance(entry.get("training"), str)
             or not isinstance(entry.get("scoring_provenance"), dict)
         ):
             raise ValueError(f"registration arms.{trained_arm} must be a trained_checkpoint")
-    control_modes = {
-        "structure_control_6a_v3": _SCAFFOLD_CONTROL_SHUFFLE_V3,
-        "structure_control_6e_v1": _SCAFFOLD_CONTROL_REWIRE_V1,
-    }
+    control_modes = (
+        {"structure_control_6a": "shuffle_within_pair"}
+        if schema == BINDING_SCHEMA_V1
+        else {
+            "structure_control_6a_v3": _SCAFFOLD_CONTROL_SHUFFLE_V3,
+            "structure_control_6e_v1": _SCAFFOLD_CONTROL_REWIRE_V1,
+        }
+    )
     for control_arm, control_mode in control_modes.items():
         entry = registered_arms.get(control_arm)
         scoring_semantics = entry.get("scoring_provenance") if isinstance(entry, dict) else None
         if (
             not isinstance(entry, dict)
-            or entry.get("kind") != "scoring_time_control"
-            or entry.get("checkpoint_arm") != "full"
+            or (schema != BINDING_SCHEMA_V1 and entry.get("kind") != "scoring_time_control")
+            or (
+                schema != BINDING_SCHEMA_V1 and entry.get("checkpoint_arm") != "full"
+            )
             or not isinstance(scoring_semantics, dict)
             or scoring_semantics.get("scaffold_control") != control_mode
             or scoring_semantics.get("checkpoint_arm") != "full"
@@ -1357,6 +1397,8 @@ def _validate_e2e_scoring_provenance(
             )
     if validate_binding_artifacts:
         _validate_binding_artifact_digests(evidence, registration_path=registration_path)
+        if schema != BINDING_SCHEMA_V1:
+            validate_bound_calibration(registration, registration_path)
     policy_version = evidence.get("checkpoint_policy_version")
     if not isinstance(policy_version, str) or not policy_version:
         raise ValueError("binding_evidence.checkpoint_policy_version must be a non-empty string")
@@ -1380,8 +1422,8 @@ def _validate_e2e_scoring_provenance(
     validate_e2e_margin_verdict(run_metadata_path, label="egostitch_e2e scoring")
 
     arm = metadata.get("arm")
-    if arm not in _EGOSTITCH_E2E_FORMAL_ARMS:
-        raise ValueError("run metadata arm must name one of the six trained checkpoint arms")
+    if arm not in formal_arms:
+        raise ValueError("run metadata arm must name one of the registered trained arms")
     arm_name = cast(str, arm)
     registered_arm = cast(dict[str, object], registered_arms[arm_name])
     if metadata.get("arm_kind") != "trained_checkpoint":

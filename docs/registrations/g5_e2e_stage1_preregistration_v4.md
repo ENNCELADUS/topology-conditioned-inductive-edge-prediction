@@ -47,6 +47,11 @@ weakening: `_validate_e2e_formal_binding` (`src/train_egostitch.py`),
 a `null` section, so a DRAFT cannot be mistaken for a resolved BINDING state by
 any consumer.
 
+This v4 draft uses `egostitch_e2e_binding_evidence_v2`. Version 2 preserves the v1
+fields and adds mandatory `auprc_tolerance_calibration` evidence. Historical v1
+registrations and artifacts remain unchanged under their original schema; they are not
+rewritten or treated as v2.
+
 ## The two-stage ladder
 
 "Qualification stage" and "formal stage" are the spec §13.19 ladder stages. They
@@ -125,11 +130,39 @@ Two consequences are **disclosed, not hidden**:
 `G_msg`, 3,066 inside `E_msg[V_hold]`, 33% retained). Pre-existing; mitigated by
 the union, not removed.
 
-`auprc_tolerance` is `null` in v4 by design: spec §13.19.3 requires it re-derived
-from `V_hold`'s measured AP sampling SD and forbids holding it at the legacy
-`0.02`. The six live configs still carry
-`training.selection_auprc_tolerance: 0.02`; binding requires the recomputed value
-in both places and the config digests re-pinned to match.
+`auprc_tolerance` is `null` in v4 by design. The method is now frozen, but its
+numerical output does not exist yet:
+
+- **Immutable source:** the first `full`, Seed-0 qualification attempt under the
+  first implementation containing this method that reaches the first validation
+  after the conditioning ramp plus one complete Phase-C epoch and successfully
+  writes the complete source artifact. Failed, incomplete, later, or manually
+  preferred attempts cannot replace it.
+- **No extra exposure:** reuse that existing validation; do not launch another
+  validation and do not add another `V_hold` evaluation to K. The source attempt and
+  validation remain in complete `attempt_history.json` / cumulative K exactly once.
+- **Inputs:** the complete canonical non-self `V_hold` manifest — 130,816 rows,
+  1,533 positives, 129,283 negatives — and the active full-model fp32 logits, with
+  no sigmoid or other transform.
+- **Bootstrap:** iterate replicate-major from replicate 0 through 9,999. Within each
+  replicate, use the same sequential
+  `numpy.random.Generator(numpy.random.PCG64(0))` to draw 1,533 positive-row indices
+  with replacement first, then 129,283 negative-row indices with replacement. Build
+  `y_true` by concatenating the positive sample before the negative sample, and build
+  `y_score` in the identical order from the corresponding raw logits; then call
+  `sklearn.metrics.average_precision_score(y_true, y_score)`.
+- **Pin:** sample SD across replicate AP values with `ddof=1`, then
+  `ceil(10000 * sd) / 10000`, without clamp, floor, or cap. The result is shared by
+  all six trained arms.
+- **Access boundary:** pair labels and active logits only. No `V_hold` topology/MMD,
+  candidate/test pairs or scores, or test graph may be read.
+
+The fixed `0.02` eligibility constants and `1e-6` MMD tie tolerance do not move.
+Before binding, `binding_evidence.auprc_tolerance_calibration` must bind the complete
+method/source/output artifact by path and SHA-256, including the replicate-major,
+positive-draw-first, positive-concatenation-first order; the resulting scalar must be written
+to `checkpoint_selection.auprc_tolerance` and all six configs, whose digests are then
+re-pinned. Until that evidence exists, the value and evidence field remain `null`.
 
 ## Eight arms
 
@@ -228,6 +261,10 @@ binding, `binding_evidence.qualification_history_indexes` must map exactly the s
 trained arms to `{path, sha256}` references for those indexes, and
 `binding_evidence.qualification_attempts` must map the same arms to non-empty attempt
 lists exactly equal to the referenced indexes' complete `attempts` arrays.
+The `full` Seed-0 attempt supplying the AUPRC-tolerance calibration must occur in that
+complete history and its source validation contributes to K exactly once; calibration
+reuses it and creates no additional K event. No `attempt_history` schema change is
+introduced.
 
 Arm **and** checkpoint selection happen on `V_hold`, never on test.
 
@@ -244,10 +281,15 @@ artifact, so the inflation is disclosed rather than hidden.
 
 ## Binding boundary
 
+The governing `binding_evidence.schema_version` is
+`egostitch_e2e_binding_evidence_v2`; its additional mandatory field relative to v1 is
+`auprc_tolerance_calibration`. Historical v1 evidence remains unchanged.
+
 `binding_evidence.implementation`, `parameter_group_manifests`,
 `packs_and_validation_manifests`, `qualification_attempts`,
 `qualification_history_indexes`, `boundary_access_audit`,
-`runtime_and_peak_memory`, and `checkpoint_policy_version` are `null`;
+`runtime_and_peak_memory`, `auprc_tolerance_calibration`, and
+`checkpoint_policy_version` are `null`;
 `checkpoint_selection.auprc_tolerance` is `null`. `binding_prerequisites` in the
 JSON lists exactly what must be resolved.
 The formal worker rejects this DRAFT. **Only the owner may promote a resolved

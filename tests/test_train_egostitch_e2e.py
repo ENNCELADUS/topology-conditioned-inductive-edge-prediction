@@ -1679,6 +1679,8 @@ class _ArchivedV1TrainLoopE2E:
             assert bool((~seen[0].topo).all()) == (permanent_null == "all_head")
             assert bool((~seen[0].cont).all()) == (permanent_null in ("all_head", "content_head"))
             assert validation.fidelity["selection_tiebreak"] == 0.0
+            assert validation.active_logits.dtype.str == "<f4"
+            assert validation.active_logits.shape == data.val_labels.shape
 
 
 _E2E_PIPELINE_NODES = [f"g{i}" for i in range(25)]
@@ -1812,6 +1814,35 @@ class TestPrepareAndAssembleE2E:
         )
         assert audit["training_feature_stats_rows"] == data.feature_stats.n_rows
         assert data.feature_stats.n_rows == len(data.train_nodes)
+
+    def test_qualification_and_formal_degree_priors_are_exactly_identical(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        qualification_cfg = replace(
+            _holdout_e2e_cfg(tmp_path / "qualification", monkeypatch),
+            run_kind="qualification",
+        )
+        formal_cfg = replace(
+            _holdout_e2e_cfg(tmp_path / "formal", monkeypatch),
+            run_kind="formal",
+        )
+        qualification_data = te.assemble_egostitch_data(qualification_cfg)
+        formal_data = te.assemble_egostitch_data(formal_cfg)
+        qualification_model = EgoStitchE2E(
+            E2EConfig.from_mapping(qualification_cfg.model.config)
+        )
+        formal_model = EgoStitchE2E(E2EConfig.from_mapping(formal_cfg.model.config))
+
+        qualification_mu = te.e2e_degree_prior_init(qualification_model, qualification_data)
+        formal_mu = te.e2e_degree_prior_init(formal_model, formal_data)
+
+        assert qualification_mu == formal_mu
+        assert sorted(qualification_data.target_builder.graph.nodes) == sorted(
+            formal_data.target_builder.graph.nodes
+        )
+        assert sorted(qualification_data.target_builder.graph.edges) == sorted(
+            formal_data.target_builder.graph.edges
+        )
 
     def test_assembly_statistics_ignore_sealed_validation_rows(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

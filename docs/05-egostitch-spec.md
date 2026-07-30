@@ -532,6 +532,20 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-30: specified the deterministic selection-band calibration procedure for
+  `select_e2e_checkpoint`'s `auprc_tolerance`. The immutable source is the first
+  full-arm Seed-0 qualification attempt under the landed implementation that reaches
+  the first validation after the conditioning ramp plus one complete Phase-C epoch
+  and writes the complete calibration source artifact. That existing validation is
+  reused and remains in the complete qualification history / cumulative `V_hold`
+  evaluation count K; calibration creates no additional K event. The method uses only
+  the canonical non-self `V_hold` pair labels and active full fp32 logits, with the
+  stratified pair bootstrap, estimator, rounding rule, and evidence acceptance pinned
+  in §13.19.3–§13.19.6. It changes neither the fixed `0.02` eligibility constants nor
+  the `1e-6` MMD tie tolerance and authorizes no execution. The v4 registration uses
+  `egostitch_e2e_binding_evidence_v2`, which extends historical v1 by making
+  `auprc_tolerance_calibration` mandatory; historical v1 registrations and artifacts
+  remain unchanged.
 - 2026-07-30: bound qualification exposure to the exact immutable attempt set.
   Each trained arm's `attempt_history.json` uses schema
   `egostitch_e2e_qualification_history_v1`; before v4 may bind,
@@ -1851,13 +1865,49 @@ the conditioning ramp and one complete full-joint epoch. An eligible full-arm or
 `auprc_tolerance` (`select_e2e_checkpoint`'s selection-band kwarg, used in Selection
 below — distinct from item 3's fixed `0.02` eligibility floor) must be **re-derived
 from `V_hold`'s measured AP sampling standard deviation**; it is not held at the
-legacy value `0.02`. Measured: eligible positives grow from 807 (`V_select` alone,
+legacy value `0.02`. Its source and computation are fixed as follows:
+
+1. **Immutable source attempt.** Use the first `full`, Seed-0 qualification attempt
+   under the first implementation containing this method that reaches the first
+   validation after the conditioning ramp **and** one complete Phase-C epoch, and
+   successfully writes the complete immutable calibration source artifact. Failed,
+   incomplete, later, or manually preferred attempts cannot replace it.
+2. **Existing validation only.** Reuse that already-required validation event; do not
+   trigger another validation or add another `V_hold` evaluation to K. The source
+   attempt and that validation remain included in the complete `attempt_history.json`
+   exposure history and cumulative K exactly once.
+3. **Canonical inputs.** Use the complete canonical non-self `V_hold` pair manifest:
+   130,816 rows, 1,533 positives, and 129,283 negatives. The score vector is the active
+   full-model logit gathered in fp32, with no sigmoid or other score transform.
+4. **Bootstrap.** Perform `B = 10,000` pair-bootstrap replicates, stratified by label.
+   Iterate in replicate-major order. In every replicate, use the same sequential
+   `numpy.random.Generator(numpy.random.PCG64(0))` to draw 1,533 positive-row indices
+   with replacement first, then 129,283 negative-row indices with replacement. Form
+   `y_true` by concatenating the positive sample before the negative sample and form
+   `y_score` in the identical order from the corresponding raw logits; then call
+   `sklearn.metrics.average_precision_score(y_true, y_score)`.
+5. **Estimator and pin.** Let `sd` be the sample standard deviation of the 10,000 AP
+   values with `ddof=1`. Set `auprc_tolerance = ceil(10000 * sd) / 10000`, with no
+   clamp, floor, or cap. This one scalar is shared unchanged by all six trained arms.
+6. **Access boundary.** Calibration may read only the source artifact's canonical pair
+   labels and active full logits. It may not read `V_hold` topology, a clustering/MMD
+   value, candidate or test pairs/scores, or any test graph.
+
+The complete source/evidence record binds the attempt and validation identities,
+implementation/config identity, canonical manifest hashes and counts, score dtype and
+no-transform rule, source-logit hash, bootstrap method/RNG/seed/replicate count,
+replicate-major ordering, positive-then-negative draw and concatenation order,
+replicate-AP hash, `ddof`, measured `sd`, rounding rule, and resulting tolerance. Its
+path and SHA-256 are recorded at
+`binding_evidence.auprc_tolerance_calibration` before binding.
+
+Measured: eligible positives grow from 807 (`V_select` alone,
 the old selection manifold) to 1,533 (`V_hold`'s qual+select+cross-side union) — a
 1.9× increase — while prevalence falls from `0.0247` to `0.0117`. Because AP-sampling
 SD scales roughly as `1/sqrt(n_pos)`, this predicts the SD shrinks only about 1.4×
 (`sqrt(1.9)`), not the near-elimination a naive area-scaling argument would suggest.
-Binding requires the recomputed value against `V_hold`'s measured SD; this spec does
-not pin one.
+The governing v4 draft therefore leaves the numerical value `null` until this immutable
+evidence exists; the method above, not a numerical result, is pinned now.
 
 **Disclosed weakening.** Item 3's second clause retains the `prevalence + 0.02`
 eligibility floor's `0.02` constant and its inequality unchanged, but the floor's
@@ -1966,7 +2016,12 @@ iteration a fast development loop; it is not a scientific gate, and its
    (Historical §13.19.4 numbering: item-3; §12 change-log, 2026-07-22
    entries.)
 5. **`binding_evidence` schema and implementation-commit / clean-checkout
-   rule.** A registration may carry `status: BINDING` only if it records a
+   rule.** The active v4 contract uses `egostitch_e2e_binding_evidence_v2`.
+   Version 2 adds one mandatory field to v1:
+   `auprc_tolerance_calibration`, the path-and-SHA-256 evidence reference defined
+   below. Historical `egostitch_e2e_binding_evidence_v1` registrations and artifacts
+   remain valid under their original contract and are not rewritten or interpreted as
+   v2. A registration may carry `status: BINDING` only if it records a
    `binding_evidence` block naming the implementation commit whose clean
    checkout produced the qualifying evidence. A formal run's worker verifies
    its own `HEAD` either equals that commit or is a clean descendant of it
@@ -1978,6 +2033,11 @@ iteration a fast development loop; it is not a scientific gate, and its
    with schema `egostitch_e2e_qualification_history_v1`, matching arm identity,
    and a non-empty `attempts` list; `qualification_attempts` maps the same exact
    arms and equals each referenced index's complete `attempts` array exactly.
+   `auprc_tolerance_calibration` is a `{path, sha256}` reference to the complete
+   calibration evidence in §13.19.3. Its source attempt must be the immutable first
+   qualifying `full` Seed-0 attempt defined there and must also occur in the complete
+   `full` history / K count; the artifact must prove that it reused the existing source
+   validation and did not add a second K event.
    (Historical §13.19.4 numbering:
    item-5; §12 change-log, 2026-07-23 binding-mechanics amendment.)
 
@@ -2027,7 +2087,19 @@ establish all of the following:
   `best.pt`, `complete.json`, score, or gate input.
 - **Selection:** warm-start/ramp checkpoints cannot become eligible; all six training
   arms exercise their arm-specific rules; no-eligible always yields `invalid`; the
-  topology-aware selector and deterministic tie-break reproduce exactly.
+  topology-aware selector and deterministic tie-break reproduce exactly. The
+  `auprc_tolerance` calibration reproduces bit-for-bit from its bound source artifact:
+  immutable first timing-qualified `full` Seed-0 qualification source, canonical 130,816-row
+  non-self manifest (1,533 positive / 129,283 negative), active full fp32 logits without
+  sigmoid, replicate-major label-stratified with-replacement pair bootstrap
+  (`B=10,000`, `Generator(PCG64(0))`) with positive indices drawn before negative
+  indices and positive samples concatenated before negative samples,
+  `average_precision_score`, sample SD with `ddof=1`, and
+  `ceil(10000*sd)/10000` with no clamp. The same scalar reaches all six trained arms;
+  the fixed `0.02` eligibility constants and `1e-6` MMD tie tolerance remain unchanged.
+  The calibration reuses one existing validation, creates no new K event, and its source
+  attempt remains present in the complete history/K. Tests also prove that calibration
+  cannot read `V_hold` topology/MMD, candidate/test data, or a test graph.
 - **Boundary:** file/node access logs prove no candidate/test or `V_test` access
   during **either** qualification or formal training — the path-scoped guard
   (§13.19.4 item 3) raises in both run kinds, not only `formal`; training `G_fit`

@@ -24,6 +24,7 @@ from src.model.egostitch.e2e_model import EgoStitchE2E
 from src.score_universe import ScoresArtifact, load_scores, save_scores
 from src.train_b0 import ModelConfig, _state_digest
 
+from tests._auprc_binding_fixture import bind_active_v4_calibration
 from tests.test_b0_cal import _toy_inputs as _b0cal_toy_inputs
 from tests.test_g1_hardened_e2 import (
     _NODES,
@@ -830,6 +831,12 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
         "checkpoint_policy_version": "fixture-v1",
     }
     preregistration["evaluator"] = {"seed": 0}
+    bind_active_v4_calibration(
+        preregistration,
+        preregistration_path,
+        config_paths=arm_config_paths,
+        tolerance=0.02,
+    )
     preregistration_path.write_text(json.dumps(preregistration, sort_keys=True, indent=2) + "\n")
     preregistration_sha256 = hashlib.sha256(preregistration_path.read_bytes()).hexdigest()
     run_metadata_paths: dict[str, Path] = {}
@@ -1036,6 +1043,47 @@ def _markdown_table(markdown: str, heading: str) -> dict[str, dict[str, str]]:
 
 
 class TestBuildE2EArmSummary:
+    def test_active_v4_binding_evidence_v2_is_accepted(self, tmp_path: Path) -> None:
+        inputs = _eight_arm_inputs(tmp_path)
+        registration_path = cast(Path, inputs["preregistration_path"])
+        registration = json.loads(registration_path.read_text())
+
+        g5_stage1._validate_e2e_binding_evidence(registration, registration_path)
+
+    def test_binding_evidence_v2_accepts_calibration_artifact(self, tmp_path: Path) -> None:
+        inputs = _eight_arm_inputs(tmp_path)
+        registration_path = cast(Path, inputs["preregistration_path"])
+        registration = json.loads(registration_path.read_text())
+
+        g5_stage1._validate_e2e_binding_evidence(registration, registration_path)
+
+    @pytest.mark.parametrize("invalid_calibration", ["missing", "null", "mismatch"])
+    def test_binding_evidence_v2_rejects_invalid_calibration_artifact(
+        self, tmp_path: Path, invalid_calibration: str
+    ) -> None:
+        inputs = _eight_arm_inputs(tmp_path)
+        registration_path = cast(Path, inputs["preregistration_path"])
+        registration = json.loads(registration_path.read_text())
+        evidence = registration["binding_evidence"]
+        if invalid_calibration == "missing":
+            evidence.pop("auprc_tolerance_calibration")
+        elif invalid_calibration == "null":
+            evidence["auprc_tolerance_calibration"] = None
+        elif invalid_calibration == "mismatch":
+            calibration_path = Path(evidence["auprc_tolerance_calibration"]["path"])
+            evidence["auprc_tolerance_calibration"] = {
+                "path": str(calibration_path),
+                "sha256": "f" * 64,
+            }
+
+        message = (
+            "auprc_tolerance_calibration must contain a JSON object"
+            if invalid_calibration != "mismatch"
+            else "bound AUPRC tolerance calibration artifact is missing or hash-mismatched"
+        )
+        with pytest.raises(g5_stage1.PreregistrationMismatch, match=message):
+            g5_stage1._validate_e2e_binding_evidence(registration, registration_path)
+
     def test_requires_complete_binding_evidence(self, tmp_path: Path) -> None:
         inputs = _eight_arm_inputs(tmp_path)
         registration_path = _d(inputs)["preregistration_path"]

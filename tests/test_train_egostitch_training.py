@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import threading
@@ -17,8 +18,11 @@ import pytest
 import torch
 import yaml  # type: ignore[import-untyped]
 from src import train_egostitch as te
+from src.data.internal_holdout import build_pair_label_manifest
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.e2e_model import EgoStitchE2E
+
+from tests._auprc_binding_fixture import bind_active_v4_calibration
 
 pytestmark = pytest.mark.unit
 
@@ -94,6 +98,19 @@ def test_selection_auprc_tolerance_accepts_a_future_rederived_value(tmp_path: Pa
     assert cfg.diagnostics.selection_auprc_tolerance == 0.01
 
 
+def test_selection_auprc_tolerance_rejects_diagnostics_training_mismatch(
+    tmp_path: Path,
+) -> None:
+    raw = yaml.safe_load(_training_config(tmp_path).read_text(encoding="utf-8"))
+    raw["training"]["selection_auprc_tolerance"] = 0.01
+    raw["diagnostics"]["selection_auprc_tolerance"] = 0.02
+    path = tmp_path / "mismatched-tolerance.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must exactly equal"):
+        te.load_config(path)
+
+
 @pytest.mark.parametrize("value", [-0.1, float("inf"), float("nan")])
 def test_selection_auprc_tolerance_rejects_invalid_values(
     tmp_path: Path, value: float
@@ -105,6 +122,114 @@ def test_selection_auprc_tolerance_rejects_invalid_values(
 
     with pytest.raises(ValueError, match="selection_auprc_tolerance"):
         te.load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("run_kind", "arm", "seed", "epoch", "fixed_source_epoch", "profile_only", "expected"),
+    [
+        ("qualification", "full", 0, 3, 3, False, True),
+        ("formal", "full", 0, 3, 3, False, False),
+        ("qualification", "p0", 0, 3, 3, False, False),
+        ("qualification", "full", 1, 3, 3, False, False),
+        ("qualification", "full", 0, 2, 3, False, False),
+        ("qualification", "full", 0, 3, 3, True, False),
+    ],
+)
+def test_auprc_tolerance_source_capture_condition(
+    run_kind: str,
+    arm: str,
+    seed: int,
+    epoch: int,
+    fixed_source_epoch: int,
+    profile_only: bool,
+    expected: bool,
+) -> None:
+    assert (
+        te._should_capture_auprc_tolerance_source(
+            run_kind=run_kind,
+            arm=cast(te.E2EArmName, arm),
+            seed=seed,
+            epoch=epoch,
+            fixed_source_epoch=fixed_source_epoch,
+            profile_only=profile_only,
+        )
+        is expected
+    )
+
+
+def _calibration_source_fixture() -> tuple[te.EgoStitchData, te._ValidationResult]:
+    manifest = build_pair_label_manifest(["node_c", "node_a", "node_b"], [("node_b", "node_a")])
+    labels = np.asarray(manifest.labels, dtype=np.int8)
+    data = cast(
+        te.EgoStitchData,
+        SimpleNamespace(
+            val_pairs=list(manifest.pairs),
+            val_labels=labels,
+            validation_role=te._E2E_VALIDATION_ROLE,
+            internal_holdout=SimpleNamespace(hold_manifest=manifest),
+        ),
+    )
+    logits = np.asarray([3.0, 1.0, -2.0], dtype="<f4")
+    metrics = te.compute_edge_metrics(labels.astype(np.int64), 1.0 / (1.0 + np.exp(-logits)))
+    return data, te._ValidationResult(metrics=metrics, fidelity={}, active_logits=logits)
+
+
+def test_auprc_tolerance_source_is_canonical_and_complete(tmp_path: Path) -> None:
+    data, validation = _calibration_source_fixture()
+    path = tmp_path / te.AUPRC_TOLERANCE_SOURCE_FILENAME
+
+    te._write_auprc_tolerance_source(
+        path,
+        data,
+        validation,
+        epoch=3,
+        global_step=30,
+        phase="C",
+        full_joint_epochs=1,
+        fixed_source_epoch=3,
+    )
+
+    with np.load(path, allow_pickle=False) as artifact:
+        assert set(artifact.files) == {"labels", "active_logits", "metadata_json"}
+        assert artifact["labels"].dtype == np.dtype(np.int8)
+        assert artifact["labels"].tolist() == [1, 0, 0]
+        assert artifact["active_logits"].dtype.str == "<f4"
+        assert artifact["active_logits"].tolist() == [3.0, 1.0, -2.0]
+        metadata = json.loads(str(artifact["metadata_json"].item()))
+    assert metadata["schema"] == te._AUPRC_TOLERANCE_SOURCE_SCHEMA
+    assert metadata["pair_count"] == 3
+    assert metadata["node_count"] == 3
+    assert metadata["positive_count"] == 1
+    assert metadata["negative_count"] == 2
+    assert metadata["validation_epoch"] == metadata["fixed_source_epoch"] == 3
+    assert metadata["source_validation_reused"] is True
+    assert metadata["bootstrap_additional_v_hold_evaluations"] == 0
+
+
+def test_auprc_tolerance_source_failure_is_atomic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data, validation = _calibration_source_fixture()
+    path = tmp_path / te.AUPRC_TOLERANCE_SOURCE_FILENAME
+
+    def fail_savez(*_args: object, **_kwargs: object) -> None:
+        raise OSError("injected source write failure")
+
+    monkeypatch.setattr(te.np, "savez", fail_savez)
+    with pytest.raises(OSError, match="injected source write failure"):
+        te._write_auprc_tolerance_source(
+            path,
+            data,
+            validation,
+            epoch=3,
+            global_step=30,
+            phase="C",
+            full_joint_epochs=1,
+            fixed_source_epoch=3,
+        )
+
+    assert not path.exists()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_formal_binding_preflight_validates_live_config_and_commit(
@@ -139,9 +264,8 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
         "runtime_and_peak_memory": dict(artifact_record),
         "checkpoint_policy_version": "v1",
     }
-    snapshot = te.PreregistrationSnapshot(
-        {
-            "arms": {
+    registration: dict[str, object] = {
+        "arms": {
                 **{
                     arm: {"kind": "trained_checkpoint", "training": path}
                     for arm, path in arm_paths.items()
@@ -156,11 +280,16 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
                     "training": None,
                     "checkpoint_arm": "full",
                 },
-            },
-            "binding_evidence": evidence,
         },
-        "f" * 64,
+        "binding_evidence": evidence,
+    }
+    bind_active_v4_calibration(
+        registration,
+        tmp_path / "registration.json",
+        config_paths={arm: root / path for arm, path in arm_paths.items()},
+        tolerance=0.02,
     )
+    snapshot = te.PreregistrationSnapshot(registration, "f" * 64)
 
     def fake_run(command: list[str], **_: object) -> SimpleNamespace:
         return SimpleNamespace(stdout=("a" * 40 + "\n") if "rev-parse" in command else "")
@@ -171,14 +300,28 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
     assert binding["arm"] == "full"
     assert binding["config_sha256"] == te._sha256_file(config_path)
 
+    assert evidence["schema_version"] == te._E2E_BINDING_SCHEMA
+    evidence["auprc_tolerance_calibration"] = None
+    with pytest.raises(
+        te.PreregistrationNotBinding,
+        match="auprc_tolerance_calibration must contain a JSON object",
+    ):
+        te._validate_e2e_formal_binding(cfg, snapshot, config_path)
+    bind_active_v4_calibration(
+        registration,
+        tmp_path / "registration.json",
+        config_paths={arm: root / path for arm, path in arm_paths.items()},
+        tolerance=0.02,
+    )
+
     v2_configs = cast(dict[str, object], evidence["configs"])
     evidence["configs"] = {
         name: entry for name, entry in v2_configs.items() if name not in {"cosine_pool", "no_l_rel"}
     }
-    with pytest.raises(te.PreregistrationNotBinding, match="six trained"):
+    with pytest.raises(te.PreregistrationNotBinding, match="trained checkpoint arms"):
         te._validate_e2e_formal_binding(cfg, snapshot, config_path)
     evidence["configs"] = {**v2_configs, "unknown": v2_configs["full"]}
-    with pytest.raises(te.PreregistrationNotBinding, match="six trained"):
+    with pytest.raises(te.PreregistrationNotBinding, match="trained checkpoint arms"):
         te._validate_e2e_formal_binding(cfg, snapshot, config_path)
     evidence["configs"] = v2_configs
 
@@ -198,10 +341,10 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
         },
         "structure_control_6a": registered_arms["structure_control_6a_v3"],
     }
-    with pytest.raises(te.PreregistrationNotBinding, match="six-trained-plus-two-control"):
+    with pytest.raises(te.PreregistrationNotBinding, match="incompatible arm identity schema"):
         te._validate_e2e_formal_binding(cfg, snapshot, config_path)
     snapshot.payload["arms"] = {**registered_arms, "unknown": registered_arms["full"]}
-    with pytest.raises(te.PreregistrationNotBinding, match="six-trained-plus-two-control"):
+    with pytest.raises(te.PreregistrationNotBinding, match="incompatible arm identity schema"):
         te._validate_e2e_formal_binding(cfg, snapshot, config_path)
     snapshot.payload["arms"] = registered_arms
 
@@ -241,11 +384,44 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
     full = configs["full"]
     assert isinstance(full, dict)
     full["sha256"] = "0" * 64
-    with pytest.raises(te.PreregistrationNotBinding, match="live config digest"):
+    with pytest.raises(te.PreregistrationNotBinding, match="config digest"):
         te._validate_e2e_formal_binding(cfg, snapshot, config_path)
 
 
-def test_formal_output_metadata_matches_scorer_contract(tmp_path: Path) -> None:
+@pytest.mark.parametrize("tracked_status", ["", " M src/train_egostitch.py\n"])
+def test_qualification_run_start_records_live_git_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tracked_status: str,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config_path = root / "configs/egostitch_e2e_v3_full_breadth_first.yaml"
+    cfg = replace(
+        te.load_config(config_path),
+        output_dir=tmp_path / "qualification",
+        run_kind="qualification",
+    )
+    data = cast(te.EgoStitchData, SimpleNamespace(rho_train=0.1))
+    head = "b" * 40
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        assert kwargs["cwd"] == root
+        return SimpleNamespace(stdout=head + "\n" if "rev-parse" in command else tracked_status)
+
+    monkeypatch.setattr(te.subprocess, "run", fake_run)
+    te.write_run_start_metadata(cfg, data, world_size=4, config_path=config_path)
+
+    metadata = json.loads((cfg.output_dir / "run_metadata.json").read_text())
+    assert metadata["implementation_commit"] == head
+    assert metadata["implementation_tracked_clean"] is (tracked_status == "")
+    assert metadata["implementation_tracked_status_sha256"] == hashlib.sha256(
+        tracked_status.encode()
+    ).hexdigest()
+
+
+def test_formal_output_metadata_matches_scorer_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = Path(__file__).resolve().parents[1]
     config_path = root / "configs/egostitch_e2e_v3_full_breadth_first.yaml"
     cfg = replace(
@@ -297,6 +473,11 @@ def test_formal_output_metadata_matches_scorer_contract(tmp_path: Path) -> None:
         },
         kendall_state={},
     )
+
+    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+        return SimpleNamespace(stdout=("b" * 40 + "\n") if "rev-parse" in command else "")
+
+    monkeypatch.setattr(te.subprocess, "run", fake_run)
     te.write_run_start_metadata(
         cfg,
         data,
@@ -318,6 +499,8 @@ def test_formal_output_metadata_matches_scorer_contract(tmp_path: Path) -> None:
     }
     assert metadata["config_sha256"] == te._sha256_file(config_path)
     assert metadata["implementation_commit"] == "a" * 40
+    assert metadata["implementation_tracked_clean"] is True
+    assert metadata["implementation_tracked_status_sha256"] == hashlib.sha256(b"").hexdigest()
     assert metadata["checkpoint_sha256"] == te._sha256_file(cfg.output_dir / "best.pt")
     assert te._E2E_VALIDATION_ROLE == "V_hold"
     assert metadata["validation_role"] == "V_hold"

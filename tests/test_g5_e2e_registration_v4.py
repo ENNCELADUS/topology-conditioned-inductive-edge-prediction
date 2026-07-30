@@ -390,6 +390,70 @@ def test_the_selection_band_is_left_unpinned_not_held_at_the_legacy_value() -> N
     assert "warm-reference AUPRC >= label prevalence + 0.02" in selection["full_and_p0_eligibility"]
 
 
+def test_the_selection_band_calibration_method_is_fully_pinned() -> None:
+    selection = _section("checkpoint_selection")
+    method = _mapping(selection["auprc_tolerance_calibration_method"])
+
+    assert selection["auprc_tolerance"] is None
+    assert method["method_id"] == "stratified_pair_bootstrap_ap_sd_v1"
+    assert method["scope"] == "one scalar shared unchanged by all six trained arms"
+    assert method["immutable_source_attempt"] == (
+        "the first full-arm Seed-0 qualification attempt under the first implementation "
+        "containing this method that reaches the first validation after the conditioning "
+        "ramp plus one complete Phase-C epoch and successfully writes the complete source "
+        "artifact; a failed, incomplete, later, or manually preferred attempt cannot replace it"
+    )
+    assert method["source_validation_reuse"] == (
+        "reuse that existing validation event; do not trigger another validation and do not "
+        "add another V_hold evaluation to K. The source attempt and source validation remain "
+        "in the complete attempt_history.json exposure history and cumulative K exactly once"
+    )
+    assert method["pair_universe"] == {
+        "name": "canonical V_hold non-self pair manifest",
+        "rows": 130816,
+        "positives": 1533,
+        "negatives": 129283,
+    }
+    assert method["scores"] == {
+        "array": "active full-model logits",
+        "dtype": "fp32",
+        "transform": "none; no sigmoid",
+    }
+    assert method["bootstrap"] == {
+        "unit": "pair row",
+        "stratification": "binary label",
+        "replacement": True,
+        "replicates": 10000,
+        "positive_draws_per_replicate": 1533,
+        "negative_draws_per_replicate": 129283,
+        "rng": (
+            "numpy.random.Generator(numpy.random.PCG64(0)); one sequential generator for all draws"
+        ),
+        "iteration_order": "replicate-major from replicate 0 through 9999",
+        "draw_order_per_replicate": (
+            "draw positive row indices first, then negative row indices, from the same sequential "
+            "generator"
+        ),
+        "metric_input_assembly": (
+            "concatenate the positive sample before the negative sample for y_true, and "
+            "concatenate "
+            "the corresponding raw logits in the identical order for y_score"
+        ),
+        "metric": "sklearn.metrics.average_precision_score",
+    }
+    assert method["estimator"] == (
+        "sample standard deviation of the 10000 replicate AP values with ddof=1"
+    )
+    assert method["rounding"] == "ceil(10000 * sd) / 10000"
+    assert method["clamp"] == "none; no floor or cap"
+
+    arms = _section("arms")
+    trained_arms = tuple(
+        name for name, arm in arms.items() if _mapping(arm)["kind"] == "trained_checkpoint"
+    )
+    assert trained_arms == EXPECTED_TRAINED_ARMS
+
+
 # --------------------------------------------------------------------------- ladder and arms
 
 
@@ -683,6 +747,7 @@ def test_binding_prerequisites_name_every_unresolved_section() -> None:
         "qualification_history_indexes",
         "boundary_access_audit",
         "runtime_and_peak_memory",
+        "auprc_tolerance_calibration",
         "checkpoint_policy_version",
     }
     prerequisites = registration["binding_prerequisites"]

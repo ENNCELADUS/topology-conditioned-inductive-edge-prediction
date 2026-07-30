@@ -433,6 +433,21 @@ def test_parallel_build_reads_once_and_writes_bf16_shards(tmp_path: Path) -> Non
     assert validate_packed_manifest(pack_root, source_root) == manifest
 
 
+def test_single_worker_build_does_not_start_process_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = _write_feature_root(tmp_path / "source", {"node_a": (3, 4)})
+
+    def unexpected_executor(*args: object, **kwargs: object) -> None:
+        pytest.fail("ProcessPoolExecutor must not start for a single worker")
+
+    monkeypatch.setattr(packed_features, "ProcessPoolExecutor", unexpected_executor)
+
+    manifest = build_packed_features(source_root, tmp_path / "pack", workers=1)
+
+    assert manifest.pack_workers == 1
+
+
 def test_build_loads_each_source_feature_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -616,10 +631,14 @@ def test_build_rejects_source_manifest_mutation_during_pack(
     def mutate_source() -> None:
         source_path.write_text(source_path.read_text() + "\n")
 
-    def executor_factory(max_workers: int) -> _SynchronousExecutor:
-        return _SynchronousExecutor(max_workers, after_map=mutate_source)
+    original_write_shard = packed_features._write_shard
 
-    monkeypatch.setattr(packed_features, "ProcessPoolExecutor", executor_factory)
+    def write_shard_and_mutate(job: _ShardJob) -> _ShardResult:
+        result = original_write_shard(job)
+        mutate_source()
+        return result
+
+    monkeypatch.setattr(packed_features, "_write_shard", write_shard_and_mutate)
 
     with pytest.raises(ValueError, match=message):
         build_packed_features(source_root, tmp_path / "pack", workers=1)

@@ -291,15 +291,24 @@ def _validate_e2e_binding_evidence(
     preregistration: Mapping[str, object], preregistration_path: Path
 ) -> None:
     """Fail closed unless the gate sees the complete rev-3.1 binding package."""
+    from src.experiments.auprc_tolerance import (
+        BINDING_SCHEMA_V1,
+        HISTORICAL_V1_ARMS,
+        binding_schema_for_registration,
+        validate_bound_calibration,
+    )
+
     if _contains_required_before_binding(preregistration):
         raise PreregistrationMismatch(
             "BINDING registration still contains REQUIRED-BEFORE-BINDING markers"
         )
     evidence = preregistration.get("binding_evidence")
-    if not isinstance(evidence, Mapping) or evidence.get(
-        "schema_version"
-    ) != "egostitch_e2e_binding_evidence_v1":
+    if not isinstance(evidence, Mapping):
         raise PreregistrationMismatch("registration requires valid binding_evidence schema")
+    try:
+        schema_version = binding_schema_for_registration(preregistration)
+    except ValueError as error:
+        raise PreregistrationMismatch(str(error)) from error
     implementation = evidence.get("implementation")
     commit = implementation.get("commit") if isinstance(implementation, Mapping) else None
     if not isinstance(commit, str) or not 7 <= len(commit) <= 64 or any(
@@ -308,13 +317,18 @@ def _validate_e2e_binding_evidence(
         raise PreregistrationMismatch("binding_evidence implementation commit is invalid")
     configs = evidence.get("configs")
     arms = preregistration.get("arms")
-    if not isinstance(configs, Mapping) or set(configs) != set(_E2E_FORMAL_ARMS):
+    expected_configs = (
+        HISTORICAL_V1_ARMS - {"structure_control_6a"}
+        if schema_version == BINDING_SCHEMA_V1
+        else frozenset(_E2E_FORMAL_ARMS)
+    )
+    if not isinstance(configs, Mapping) or set(configs) != expected_configs:
         raise PreregistrationMismatch(
-            "binding_evidence.configs must contain exactly the six trained checkpoint arms"
+            "binding_evidence.configs do not match the registration's trained checkpoint arms"
         )
     if not isinstance(arms, Mapping):
         raise PreregistrationMismatch("registration arms must be an object")
-    for arm in _E2E_FORMAL_ARMS:
+    for arm in expected_configs:
         arm_entry = arms.get(arm)
         config_entry = configs.get(arm)
         if (
@@ -335,17 +349,24 @@ def _validate_e2e_binding_evidence(
             raise PreregistrationMismatch(
                 f"binding_evidence config artifact is missing or hash-mismatched for {arm}"
             )
-    for label in (
+    binding_sections = [
         "parameter_group_manifests",
         "packs_and_validation_manifests",
         "qualification_attempts",
-        "qualification_history_indexes",
         "boundary_access_audit",
         "runtime_and_peak_memory",
-    ):
+    ]
+    if schema_version != BINDING_SCHEMA_V1:
+        binding_sections.insert(3, "qualification_history_indexes")
+    for label in binding_sections:
         _validate_e2e_binding_section(
             evidence.get(label), label=label, preregistration_path=preregistration_path
         )
+    if schema_version != BINDING_SCHEMA_V1:
+        try:
+            validate_bound_calibration(preregistration, preregistration_path)
+        except ValueError as error:
+            raise PreregistrationMismatch(str(error)) from error
     if not isinstance(evidence.get("checkpoint_policy_version"), str):
         raise PreregistrationMismatch("binding_evidence checkpoint policy is missing")
 
