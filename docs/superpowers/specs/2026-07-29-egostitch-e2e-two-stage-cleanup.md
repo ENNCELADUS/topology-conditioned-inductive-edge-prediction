@@ -1,13 +1,20 @@
 # EgoStitch E2E: two-stage cleanup
 
-**Status: PROPOSED (2026-07-29), rev 2. Owner-decided via grill-me interview;
-not yet implemented.** Collapses the e2e ladder from five stages to two, removes
+**Status: IMPLEMENTED IN CURRENT WORKTREE (2026-07-30), rev 2; cleanup commit pending.
+Owner-decided via grill-me interview.** Collapses the e2e ladder from five stages to two, removes
 the legacy frozen-s0 `egostitch` family, and adopts the data-derived degree-head
 initialization as standard.
 
-Per the spec freeze rule, code-facing items land only through
+Per the spec freeze rule, the code-facing items landed through
 `docs/05-egostitch-spec.md` edits with §12 change-log lines, then implementation.
-§7 lists the required edits.
+This implementation status authorizes no execution: the v4 registration remains
+`DRAFT`. §7 records the required documentation edits.
+
+Two delete-list items are sanctioned retentions rather than incomplete cleanup:
+the non-publishing `probe`/`epoch-probe` dispatch used to measure
+`feature_stats_sha256`, and `runtime.total_budget_seconds` as the invariant sum of
+the remaining stage budgets. The authoritative rationale is recorded in
+`docs/05-egostitch-spec.md` §12 (2026-07-29, second entry); §4 below reflects it.
 
 **Review trail.** r1 (2026-07-29) drafted a ~2,000-node BFS-ball Stage 1 with a
 guards-only ladder and a design-only registration. Three independent adversarial
@@ -24,9 +31,9 @@ the same ground is not re-walked.
 
 ## 1. Why
 
-The current ladder is `init-probe → calibrate(overfit) → threshold-freeze →
+The previous ladder was `init-probe → calibrate(overfit) → threshold-freeze →
 rehearse → formal`, wrapped in seven independent blocking devices. Every model
-iteration pays that five-stage tax, and the fastest available signal costs a
+iteration paid that five-stage tax, and the fastest available signal cost a
 15-minute calibration run plus a hand-pasted digest.
 
 The cleanup buys one thing: **a fast development loop**. Stage 1 is where model
@@ -240,14 +247,24 @@ only from the deleted `calibrate`/`rehearse` subcommands.
 training may not open a held-out path, in any run kind. This is strictly stronger
 than today, removes the sandbox friction that would otherwise make the "fast
 loop" not fast, and is the only thing that makes acceptance item 4 implementable.
+Mere presence of candidate, test, or `test_graph.pkl` files in the shared repo data
+root is allowed; an attempted open, including through an alias or symlink, raises
+before the held-out path is read.
 
 ## 4. In-run sub-stages
 
-`pack → train → publish`. Deleted: the token-budget `probe` stage and
-`runtime.token_budget_candidates`; the `epoch_probe` stage; the `projection`
-stage and `runtime.total_budget_seconds`; `--ddp-mode init-probe` and
-`_run_init_probe`; `_PROBE_DISPATCH_MODES`, `select_probe_result`,
-`conservative_e2e_epoch_seconds`, `project_total_seconds`.
+`pack → train → publish`. Deleted: the token-budget probe pipeline stage and
+`runtime.token_budget_candidates`; the projection stage; `--ddp-mode init-probe`
+and `_run_init_probe`; `select_probe_result`,
+`conservative_e2e_epoch_seconds`, and `project_total_seconds`.
+
+Two load-bearing pieces are retained under the §12 change-log exception. The
+`probe`/`epoch-probe` entries in `_PROBE_DISPATCH_MODES` and
+`--ddp-mode epoch-probe` survive only as a non-publishing measurement dispatch for
+the pre-run `feature_stats_sha256`; they are not pipeline sub-stages. Likewise,
+`runtime.total_budget_seconds` remains the declared wall-clock total whose value
+must equal the sum of the remaining stage budgets; the projection sub-stage that
+formerly consumed part of it is deleted.
 
 The budget probe goes because it did not prevent the OOM it exists to prevent —
 the rev-3.1 OOM was `_e2e_family_probe` double-buffering autograd graphs, a path
@@ -437,8 +454,10 @@ no-ops or re-issue those artifacts; decide before coding.
 
 **Evidence kept.** `docs/results/G5-stage1-seed0-20260717.md`,
 `docs/registrations/g5_stage1_preregistration.{json,md}` and
-`outputs/egostitch_stage1/` survive, each with a one-line header naming the
-commit at which the producing code was removed.
+`outputs/egostitch_stage1/` survive. The Markdown evidence files state that the
+producing code last exists at `dcae090` and that its deletion is present only in
+the current worktree pending a cleanup commit. The binding JSON remains byte-for-byte
+unchanged because adding a note would alter the registered evidence hash.
 
 **Test files r1 undercounted:** `tests/test_hpc_scripts.py` reads `hpc/g5_stage1.sh`
 at module level, so `:26-33`, `:49-59`, `:64`, `:85`, `:89`, `:102`, `:118`,
@@ -483,7 +502,8 @@ CLAUDE.md needs updating: three data-contract traps retire with their code
 3. Any seed count produces `evidence_class: engineering`; a non-null
    `p_value`/`ci`/`holm` is refused. No path emits `inference`.
 4. The path-scoped held-out guard (§3.1) raises in **both** run kinds. Tested by
-   pointing a training run at a data root containing test files.
+   attempting to open candidate/test/`test_graph.pkl` through direct, alias, and
+   symlink paths in both run kinds. Mere presence in the shared data root is allowed.
 5. `V_hold ∩ V_fit = ∅`; `|V_hold| = 512`; `V_fit` digest equals the pre-cleanup value.
 6. **Stage 1 and Stage 2 produce the *identical* `feature_stats_sha256` and the
    identical `mean(log d)`.** (r1 asserted these must *differ*; that was the
@@ -498,15 +518,18 @@ CLAUDE.md needs updating: three data-contract traps retire with their code
 
 Enlarging V_hold and re-deriving `auprc_tolerance` reduces but does not eliminate
 selection inflation. With ~20 eligible epochs × 8 arms per formal run, plus an
-unbounded and unrecorded number of Stage-1 development iterations on the same V_hold,
-the accumulated argmin count K is large and selection noise is **not exchangeable
+uncapped pre-binding number of Stage-1 development iterations on the same V_hold,
+the accumulated argmin count K can be large and selection noise is **not exchangeable
 across arms** — a higher-capacity arm draws a larger max-of-K. This biases the
 `full` vs `b0_e2e_f_only` contrast, which is the headline ablation.
 
 This is the price of the Q2 decision to share one holdout across both stages, and
-it is accepted knowingly. The mitigation available without reversing that decision
-is to **record K** — log the cumulative count of V_hold evaluations per arm into the
-Stage-2 artifact, so the inflation is disclosed rather than hidden.
+it is accepted knowingly. Every qualification attempt is durably retained under its
+arm's immutable `attempts/attempt-*` history, including failures; the launcher freezes
+new attempts once the registration becomes `BINDING`. The formal artifact binds the
+cumulative count of V_hold evaluations per arm to that history. Thus K is recorded and
+bounded at binding rather than hidden, but the resulting selection inflation can still
+be large and nonexchangeable across arms.
 
 ## 10. What r1 got wrong (do not re-walk)
 

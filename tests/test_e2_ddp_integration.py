@@ -161,10 +161,8 @@ def test_cold_four_h20_run_meets_budget(tmp_path: Path) -> None:
         assert (tmp_path / "outputs" / filename).exists()
 
 
-@pytest.mark.integration
-def test_two_rank_cpu_egostitch_loop_emits_valid_profile_and_artifacts(tmp_path: Path) -> None:
-    """The EgoStitch worker's loop satisfies the orchestrator contracts under real DDP."""
-    result = subprocess.run(
+def _run_egostitch_smoke(output_dir: Path, *, mode: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
         [
             sys.executable,
             "-m",
@@ -173,18 +171,48 @@ def test_two_rank_cpu_egostitch_loop_emits_valid_profile_and_artifacts(tmp_path:
             "--nproc_per_node=2",
             "tests/helpers/egostitch_ddp_smoke.py",
             "--output-dir",
-            str(tmp_path),
+            str(output_dir),
+            "--mode",
+            mode,
         ],
         cwd=REPO_ROOT,
         env=_low_thread_env(),
         capture_output=True,
         text=True,
         check=False,
-        timeout=60,
+        # A hung rank is the failure this pair of tests exists to catch, so the
+        # deadline must be generous enough that a slow-but-live container is
+        # never mistaken for one.
+        timeout=120,
     )
+
+
+@pytest.mark.integration
+def test_two_rank_cpu_egostitch_step_zero_guard_admits_a_healthy_model(tmp_path: Path) -> None:
+    """The E2E step-0 slot guard runs to completion on both ranks."""
+    result = _run_egostitch_smoke(tmp_path, mode="healthy")
+
     assert result.returncode == 0, result.stderr
     summary = json.loads((tmp_path / "smoke_ok.json").read_text())
     assert summary["world_size"] == 2
-    assert summary["epochs_completed"] == 2
-    for filename in ("best.pt", "last.pt", "metrics.jsonl", "run_metadata.json"):
-        assert (tmp_path / "run" / filename).is_file()
+    assert summary["run_kind"] == "qualification"
+    assert summary["validation_rows"] > 0
+    assert summary["h_pairwise_cosine_mean"] <= 0.95
+
+
+@pytest.mark.integration
+def test_two_rank_cpu_egostitch_step_zero_guard_raises_on_every_rank(tmp_path: Path) -> None:
+    """A born-collapsed model must abort both ranks, not hang the process group.
+
+    `_validate_epoch` returns ``None`` off the main process, so the guard
+    reduces its verdict before raising; a rank-zero-only raise would leave rank
+    one blocked forever and the launcher would time out (design 2026-07-29
+    Sec 4.1). Only a real process group can tell those two outcomes apart.
+    """
+    result = _run_egostitch_smoke(tmp_path, mode="collapsed")
+
+    assert result.returncode == 0, result.stderr
+    for rank in range(2):
+        payload = json.loads((tmp_path / f"raised-rank-{rank}.json").read_text())
+        assert payload["rank"] == rank
+        assert payload["error"] == "training_invalid(initial_slot_collapse)"

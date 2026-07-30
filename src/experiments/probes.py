@@ -22,7 +22,7 @@ import argparse
 import hashlib
 import json
 import pickle
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -38,35 +38,14 @@ _MIN_VARIANCE = 1e-10
 E2E_PROBE_FORMAT = "egostitch_e2e_probe_v2"
 _E2E_PROBE_V1_FORMAT = "egostitch_e2e_probe_v1"
 _E2E_PAIR_LIMIT = 4096
-E2EProbeScope = Literal["formal_train", "calibration_fit", "qualification_qual"]
-E2E_PROBE_SCOPES: tuple[E2EProbeScope, ...] = (
-    "formal_train",
-    "calibration_fit",
-    "qualification_qual",
-)
+E2EProbeScope = Literal["formal_train"]
+E2E_PROBE_SCOPES: tuple[E2EProbeScope, ...] = ("formal_train",)
 _DISPERSION_NAMES = (
     "pi_slot_std",
     "h_pairwise_cosine_mean",
     "adj_offdiag_std",
     "plan_row_entropy",
 )
-
-
-def _probe_feature_nodes(
-    scope: E2EProbeScope,
-    formal_nodes: Sequence[str],
-    *,
-    v_fit: Iterable[str],
-    v_qual: Iterable[str],
-) -> list[str]:
-    """Resolve the only feature identities a probe scope may materialize."""
-    if scope == "formal_train":
-        return list(formal_nodes)
-    if scope == "calibration_fit":
-        return sorted(v_fit)
-    if scope == "qualification_qual":
-        return sorted(v_qual)
-    raise ValueError(f"unsupported E2E probe scope {scope!r}")
 
 
 def _load_train_side_probe_inputs(
@@ -94,28 +73,6 @@ def _load_train_side_probe_inputs(
     return train_nodes, positives
 
 
-def _build_probe_scope_graph(
-    scope: E2EProbeScope,
-    nodes: Sequence[str],
-    *,
-    formal_e_msg: Iterable[tuple[str, str]],
-    fit_e_msg: Iterable[tuple[str, str]],
-    qual_e_msg: Iterable[tuple[str, str]],
-) -> nx.Graph:
-    """Build only the explicit train-side message graph authorized by ``scope``."""
-    from src.data.partition import build_g_struct
-
-    if scope == "formal_train":
-        edges = formal_e_msg
-    elif scope == "calibration_fit":
-        edges = fit_e_msg
-    elif scope == "qualification_qual":
-        edges = qual_e_msg
-    else:
-        raise ValueError(f"unsupported E2E probe scope {scope!r}")
-    return build_g_struct(nodes, edges)
-
-
 def build_probe_scope_context(
     scope: E2EProbeScope,
     *,
@@ -127,22 +84,20 @@ def build_probe_scope_context(
 ) -> tuple[list[str], nx.Graph]:
     """Rebuild the exact node set and message graph a probe scope authorizes.
 
-    Composed from the same two scope primitives the producer uses
-    (:func:`_probe_feature_nodes` and :func:`_build_probe_scope_graph`), so scope
-    semantics cannot drift between writing an artifact and re-validating it. The
-    consumer is :mod:`src.experiments.prebinding_gates`, which must rebuild this
-    universe before calling :func:`evaluate_e2e_probe_artifact`: validating a
-    ``calibration_fit`` artifact against the ``formal_train`` universe would
-    compare it to the wrong ``g_struct_sha256`` and wrong stored targets.
+    ``formal_train`` is the only scope: every operative train node over the full
+    train-side ``E_msg``. Re-validating a written artifact must reconstruct that
+    universe exactly, or :func:`evaluate_e2e_probe_artifact` would compare it
+    against the wrong ``g_struct_sha256`` and the wrong stored targets.
 
     :func:`produce_e2e_probe_artifact` deliberately keeps its own inline
     derivation because it additionally needs the partition and holdout objects
     for its per-role grounding caches.
     """
     from src import train_egostitch as te
-    from src.data.internal_holdout import derive_internal_holdout
-    from src.data.partition import derive_partition
+    from src.data.partition import build_g_struct, derive_partition
 
+    if scope not in E2E_PROBE_SCOPES:
+        raise ValueError(f"unsupported E2E probe scope {scope!r}")
     strategy_dir = data_root / te._BENCHMARK_SUBDIR / strategy
     formal_nodes, train_positives = _load_train_side_probe_inputs(
         strategy_dir,
@@ -151,21 +106,7 @@ def build_probe_scope_context(
     partition = derive_partition(
         train_positives, seed=partition_seed, msg_fraction=msg_fraction
     )
-    holdout = derive_internal_holdout(formal_nodes, partition.e_msg, partition.e_sup)
-    nodes = _probe_feature_nodes(
-        scope,
-        formal_nodes,
-        v_fit=holdout.v_fit,
-        v_qual=holdout.v_qual,
-    )
-    graph = _build_probe_scope_graph(
-        scope,
-        nodes,
-        formal_e_msg=partition.e_msg,
-        fit_e_msg=holdout.e_msg_fit,
-        qual_e_msg=holdout.qual_manifest.positive_edges,
-    )
-    return nodes, graph
+    return formal_nodes, build_g_struct(formal_nodes, partition.e_msg)
 
 
 def _validate_pi_consistency_inputs(
@@ -783,10 +724,10 @@ def produce_e2e_probe_artifact(
 ) -> None:
     """Produce the registered full-checkpoint STE/Pi evidence artifact.
 
-    ``scope`` is deliberately required. ``formal_train`` uses the full
-    operative train-side ``G_struct``; pre-binding ``calibration_fit`` and
-    ``qualification_qual`` resolve only to ``G_fit`` and ``E_msg[V_qual]``.
-    There is no ``V_select`` option.
+    ``scope`` is deliberately required and ``formal_train`` is its only value:
+    the full operative train-side ``G_struct``. The producer runs only against a
+    completed, published formal run; the qualification stage has no probe
+    artifact.
     """
     from src import train_egostitch as te
     from src.data.ego_targets import EgoTargetBuilder, EgoTargets
@@ -811,11 +752,8 @@ def produce_e2e_probe_artifact(
         Mapping[str, object] | None, registration_payload.get("probe_artifact")
     )
     registration_status = registration_payload.get("status")
-    if scope == "formal_train":
-        if registration_status != "BINDING":
-            raise ValueError("formal E2E probe production requires a BINDING preregistration")
-    elif registration_status != "DRAFT":
-        raise ValueError("pre-binding E2E probes require a DRAFT preregistration")
+    if registration_status != "BINDING":
+        raise ValueError("formal E2E probe production requires a BINDING preregistration")
     registered_format = (
         probe_registration.get("format") if probe_registration is not None else None
     )
@@ -850,64 +788,22 @@ def produce_e2e_probe_artifact(
     expected_output = Path(registered_output)
     if not expected_output.is_absolute():
         expected_output = preregistration_path.resolve().parents[2] / expected_output
-    if scope == "formal_train":
-        if output_path.resolve() != expected_output.resolve():
-            raise ValueError(
-                f"probe output path does not match registration: {output_path} != {expected_output}"
-            )
-    elif output_path.resolve() == expected_output.resolve():
-        raise ValueError("pre-binding probe output must not overwrite the registered formal path")
+    if output_path.resolve() != expected_output.resolve():
+        raise ValueError(
+            f"probe output path does not match registration: {output_path} != {expected_output}"
+        )
     if run_metadata.get("preregistration_sha256") != registration_sha:
         raise ValueError("probe run metadata does not match preregistration SHA-256")
-    if scope == "formal_train":
-        if (
-            run_metadata.get("run_kind") != "formal"
-            or run_metadata.get("status") != "complete"
-            or run_metadata.get("formal_artifacts_published") is not True
-            or run_metadata.get("permanent_null") != "none"
-        ):
-            raise ValueError("E2E probe producer requires the completed formal full arm")
-    elif scope == "calibration_fit":
-        run_kind = run_metadata.get("run_kind")
-        if run_kind == "rehearsal":
-            raise ValueError(
-                "section 13.19.4 requires calibration_fit probes from a V_fit-only "
-                "checkpoint; the rehearsal checkpoint already touched V_qual"
-            )
-        if run_kind in {"debug", "formal"}:
-            raise ValueError(
-                "section 13.19.4 requires calibration_fit probes from a V_fit-only "
-                f"checkpoint; the {run_kind} checkpoint already touched V_select"
-            )
-        if "validation_role" not in run_metadata or run_metadata["validation_role"] is not None:
-            raise ValueError(
-                "section 13.19.4 cannot establish V_fit-only provenance for the "
-                "calibration_fit checkpoint: validation_role must be explicitly null"
-            )
-        if (
-            run_kind != "overfit"
-            or run_metadata.get("status") != "complete"
-            or run_metadata.get("formal_artifacts_published") is not False
-            or run_metadata.get("permanent_null") != "none"
-        ):
-            raise ValueError(
-                "calibration_fit probe production requires a completed unpublished "
-                "V_fit-only overfit full-arm run under section 13.19.4"
-            )
-    else:
-        allowed_run_kinds = {"rehearsal"}
-        if (
-            run_metadata.get("run_kind") not in allowed_run_kinds
-            or run_metadata.get("status") not in {"complete", "debug_complete"}
-            or run_metadata.get("formal_artifacts_published") is not False
-            or run_metadata.get("permanent_null") != "none"
-        ):
-            raise ValueError(
-                f"{scope} probe production requires a completed unpublished "
-                f"{sorted(allowed_run_kinds)} full-arm run"
-            )
-    if run_metadata.get("seed") != 0 or run_metadata.get("partition_seed") != 0:
-        raise ValueError("E2E probe producer requires Seed 0 and partition Seed 0")
+    # The only producible scope is the published formal run. ``qualification``
+    # and ``debug`` run kinds are rejected by the same equality, so the new
+    # run-kind domain cannot widen this guard.
+    if (
+        run_metadata.get("run_kind") != "formal"
+        or run_metadata.get("status") != "complete"
+        or run_metadata.get("formal_artifacts_published") is not True
+        or run_metadata.get("permanent_null") != "none"
+    ):
+        raise ValueError("E2E probe producer requires the completed formal full arm")
     config_path = Path(str(run_metadata.get("config_path")))
     if config_path.resolve() != registered_config.resolve():
         raise ValueError("E2E probe producer requires the registered full-arm config path")
@@ -925,6 +821,23 @@ def produce_e2e_probe_artifact(
         )
     if cfg.data.root.resolve() != data_root.resolve() or cfg.data.strategy != strategy:
         raise ValueError("probe CLI data root/strategy do not match the formal config")
+    # Multi-seed formal runs are permitted, so the model seed is only required to
+    # be a real seed and is recorded verbatim. ``data.partition_seed`` is not the
+    # model seed: it selects G_struct and the whole pair universe this probe is
+    # validated against, so it is pinned to the registered config, not relaxed.
+    run_seed = run_metadata.get("seed")
+    run_partition_seed = run_metadata.get("partition_seed")
+    if isinstance(run_seed, bool) or not isinstance(run_seed, int) or run_seed < 0:
+        raise ValueError("E2E probe producer requires a nonnegative integer run seed")
+    if (
+        isinstance(run_partition_seed, bool)
+        or not isinstance(run_partition_seed, int)
+        or run_partition_seed != cfg.data.partition_seed
+    ):
+        raise ValueError(
+            "E2E probe run metadata partition_seed does not match the registered "
+            f"config ({cfg.data.partition_seed})"
+        )
     config_hash = te._config_hash(cfg)
     if run_metadata.get("config_hash") != config_hash:
         raise ValueError("probe run metadata config hash does not match the formal config")
@@ -946,14 +859,14 @@ def produce_e2e_probe_artifact(
     table = PackedFeatureTable.from_pack(cfg.data.pack_dir, torch.device("cpu"))
     token_index = table.manifest.node_index()
 
-    # The formal artifact is pinned to all operative train nodes over full
-    # train-side E_msg. Pre-binding scopes are explicit induced universes:
-    # G_fit for calibration and E_msg[V_qual] for rehearsal. V_select is not
-    # representable here.
+    # The formal artifact is pinned to all operative train nodes over the full
+    # train-side E_msg. Grounding pools stay universe-scoped (spec Sec 13.12):
+    # V_fit and the single validation holdout V_hold are hashed separately and
+    # one cache may never serve the other.
     from src.data.features import FeatureStore, build_f0_matrix
     from src.data.grounding import build_grounding_pool
     from src.data.internal_holdout import derive_internal_holdout
-    from src.data.partition import derive_partition
+    from src.data.partition import build_g_struct, derive_partition
 
     strategy_dir = cfg.data.root / te._BENCHMARK_SUBDIR / cfg.data.strategy
     formal_nodes, train_positives = _load_train_side_probe_inputs(
@@ -964,33 +877,18 @@ def produce_e2e_probe_artifact(
         train_positives, seed=cfg.data.partition_seed, msg_fraction=cfg.data.msg_fraction
     )
     holdout = derive_internal_holdout(formal_nodes, partition.e_msg, partition.e_sup)
-    role_universes: tuple[tuple[list[str], str, str], ...]
-    nodes = _probe_feature_nodes(
-        scope,
-        formal_nodes,
-        v_fit=holdout.v_fit,
-        v_qual=holdout.v_qual,
-    )
-    graph = _build_probe_scope_graph(
-        scope,
-        nodes,
-        formal_e_msg=partition.e_msg,
-        fit_e_msg=holdout.e_msg_fit,
-        qual_e_msg=holdout.qual_manifest.positive_edges,
-    )
+    nodes = list(formal_nodes)
+    graph = build_g_struct(nodes, partition.e_msg)
     missing_tokens = [node for node in nodes if node not in token_index]
     if missing_tokens:
         raise ValueError(f"token pack is missing {len(missing_tokens)} probe nodes")
     store = FeatureStore(cfg.data.root / te._FEATURES_SUBDIR)
     cache_dir = output_path.parent
     cache_dir.mkdir(parents=True, exist_ok=True)
-    f0_cache_name = (
-        "probe_f0.pt" if scope == "formal_train" else f"probe_f0_{scope}.pt"
-    )
     matrix, node_index = build_f0_matrix(
         store,
         nodes,
-        cache_path=cache_dir / f0_cache_name,
+        cache_path=cache_dir / "probe_f0.pt",
         allow_cache_subset=True,
     )
     # Sourced from the loaded checkpoint's own generator_cfg (spec Sec 14.4.4:
@@ -999,16 +897,10 @@ def produce_e2e_probe_artifact(
     matrix_np = matrix.numpy()
     grounding_rows: dict[str, list[int]] = {}
     grounding_pool: dict[str, list[str]] = {}
-    if scope == "formal_train":
-        role_universes = (
-            (sorted(holdout.v_fit), "probe_grounding_fit.npz", "V_fit"),
-            (sorted(holdout.v_qual), "probe_grounding_qual.npz", "V_qual"),
-            (sorted(holdout.v_select), "probe_grounding_select.npz", "V_select"),
-        )
-    elif scope == "calibration_fit":
-        role_universes = ((nodes, "probe_grounding_fit.npz", "V_fit"),)
-    else:
-        role_universes = ((nodes, "probe_grounding_qual.npz", "V_qual"),)
+    role_universes: tuple[tuple[list[str], str, str], ...] = (
+        (sorted(holdout.v_fit), "probe_grounding_fit.npz", "V_fit"),
+        (sorted(holdout.v_hold), "probe_grounding_hold.npz", "V_hold"),
+    )
     for role_nodes, cache_name, role_universe in role_universes:
         role_rows = np.asarray(
             matrix_np[[node_index[node] for node in role_nodes]], dtype=np.float32
@@ -1189,8 +1081,8 @@ def produce_e2e_probe_artifact(
             "checkpoint_id": checkpoint_id,
             "registration_sha256": registration_sha,
             "config_hash": config_hash,
-            "seed": 0,
-            "partition_seed": 0,
+            "seed": run_seed,
+            "partition_seed": run_partition_seed,
             "strategy": strategy,
             "g_struct_sha256": g_struct_sha256(graph),
             "scope": scope,

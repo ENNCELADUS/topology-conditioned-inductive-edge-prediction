@@ -13,28 +13,21 @@ usage() {
 Usage:
   hpc/run.sh check
   hpc/run.sh train <config.yaml> [train args...]
-  hpc/run.sh s0-score
   hpc/run.sh score <score args...>
   hpc/run.sh merge <merge args...>
   hpc/run.sh g1 <g1 args...>
   hpc/run.sh g2 <g2 args...>
 
-The train command is the only formal E2 entry: it runs the full
-pack -> probe -> projection -> 30-epoch DDP training pipeline
-(`python -m src.e2_pipeline`) across all visible NVIDIA H20 GPUs via an
-automatically sized `accelerate launch`. Direct `python -m src.train_b0
---max-steps N` remains debug-only (bounded smoke runs); it is never a formal
-E2 training run. B0-alt keeps its own direct `python -m src.train_b0` CLI,
-unaffected by this distributed routing.
+The train command is the only formal E2 entry: it runs the full packed-feature
+DDP training pipeline (`python -m src.e2_pipeline`) across all visible NVIDIA
+H20 GPUs via an automatically sized `accelerate launch`. Direct
+`python -m src.train_b0 --max-steps N` remains debug-only (bounded smoke runs);
+it is never a formal E2 training run. B0-alt keeps its own direct
+`python -m src.train_b0` CLI, unaffected by this distributed routing.
 
-Formal EgoStitch Stage-1 training reuses the same orchestrator with the
-EgoStitch worker (config-driven budget, spec section 13.13):
-  hpc/run.sh train configs/egostitch_stage1_breadth_first.yaml \
-      --worker-module src.train_egostitch
-Its one-off s0 manifest (frozen-B0 logit cache pairs) comes from
-`python -m src.train_egostitch --config <cfg> --write-s0-manifest <tsv>`,
-then `hpc/run.sh s0-score` scores it through the packed-feature, auto-sharded
-multi-GPU fast path.
+EgoStitch E2E training is not launched from here: both stages of its ladder go
+through `hpc/qualification.sh`, which owns the registration and qualification
+preflights.
 
 The score command pins --device cuda --amp bf16. With multiple visible GPUs it
 launches one contiguous shard per GPU, waits for every shard, and strictly merges
@@ -156,25 +149,17 @@ case "${COMMAND}" in
     CONFIG_PATH="$1"
     shift
     [[ -f "${CONFIG_PATH}" ]] || fail "config not found: ${CONFIG_PATH}"
+    # Stated in the usage text and enforced here: an EgoStitch E2E arm launched
+    # from this branch would skip every preflight its ladder owns -- the BINDING
+    # registration, the clean checkout, the qualification verdict and its digest
+    # equality, and the four-GPU pin. The family is read from the config, so
+    # naming the worker module by hand does not reopen the bypass.
+    MODEL_FAMILY="$("${PYTHON_BIN}" -c \
+      'import sys, yaml; from pathlib import Path; config = yaml.safe_load(Path(sys.argv[1]).read_text()); model = config.get("model") or {}; print(model.get("family", ""))' \
+      "${CONFIG_PATH}")" || fail "could not read model.family from ${CONFIG_PATH}"
+    [[ "${MODEL_FAMILY}" != "egostitch_e2e" ]] || \
+      fail "EgoStitch E2E arms are launched only through hpc/qualification.sh"
     exec "${PYTHON_BIN}" -m src.e2_pipeline --config "${CONFIG_PATH}" "$@"
-    ;;
-  s0-score)
-    [[ $# -eq 0 ]] || fail "s0-score takes no arguments"
-    readonly S0_CHECKPOINT="outputs/deliverables/b0_v31_breadth_first_20260711/model/best.pt"
-    readonly S0_MANIFEST="outputs/s0_cache/manifests/all_seeds.tsv"
-    readonly S0_PACK_DIR="outputs/feature_packs/b0_v31_bf16"
-    readonly S0_OUTPUT="outputs/s0_cache/b0_v31_egostitch_pairs.npz"
-    [[ -f "${S0_CHECKPOINT}" ]] || fail "S0 checkpoint not found: ${S0_CHECKPOINT}"
-    [[ -f "${S0_MANIFEST}" ]] || fail "S0 manifest not found: ${S0_MANIFEST}"
-    [[ -f "${S0_PACK_DIR}/manifest.json" ]] || fail "S0 feature pack not found: ${S0_PACK_DIR}"
-    parallel_score \
-      --checkpoint "${S0_CHECKPOINT}" \
-      --pairs "file:${S0_MANIFEST}" \
-      --data-root data \
-      --strategy breadth_first \
-      --pack-dir "${S0_PACK_DIR}" \
-      --token-budget 1048576 \
-      --output "${S0_OUTPUT}"
     ;;
   score)
     parallel_score "$@"

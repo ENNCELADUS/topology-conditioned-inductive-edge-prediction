@@ -846,366 +846,27 @@ def test_cli_missing_checkpoint_raises_system_exit(tmp_path: Path) -> None:
         )
 
 
-# --------------------------------------------------------------------------- egostitch scoring
+# --------------------------------------------------------------------------- retired egostitch
+# The frozen-s0 `egostitch` family was excised with the two-stage cleanup
+# (docs/superpowers/specs/2026-07-29-egostitch-e2e-two-stage-cleanup.md §6.2).
+# Its evidence survives under docs/results/ and outputs/egostitch_stage1/, so
+# these two tests pin that the retirement fails *closed* on a surviving
+# artifact rather than silently admitting it.
 
 
-_TINY_EGOSTITCH_CONFIG: dict[str, object] = {
-    "input_dim": INPUT_DIM,
-    "d_p": 4,
-    "d_z": 4,
-    "d_h": 8,
-    "slots": 3,
-    "m_max": 8,
-    "n_ground": 2,
-    "decoder_layers": 1,
-    "n_heads": 2,
-    "gin_hidden": 8,
-    "gin_layers": 2,
-    "sinkhorn_iters": 3,
-}
-_EGOSTITCH_NODES = [f"e{i}" for i in range(5)]
-# Includes a self-pair: it must route through the single-ego path.
-_EGOSTITCH_PAIRS = [("e0", "e1"), ("e1", "e2"), ("e0", "e3"), ("e2", "e4"), ("e3", "e3")]
+def test_build_model_rejects_the_retired_egostitch_family() -> None:
+    assert "egostitch" not in score_universe.MODEL_BUILDERS
+    with pytest.raises(ValueError, match="unknown model_family 'egostitch'"):
+        score_universe.build_model("egostitch", {})
 
 
-def _egostitch_setup(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
-    """Feature store + checkpoint + pairs TSV + covering b0-scores artifact."""
-    torch.manual_seed(0)
-    node_tokens = {node: torch.randn(3 + i, INPUT_DIM) for i, node in enumerate(_EGOSTITCH_NODES)}
-    data_root = _data_root_with_features(tmp_path, node_tokens)
-
-    model = score_universe.build_model("egostitch", dict(_TINY_EGOSTITCH_CONFIG))
-    checkpoint_path = tmp_path / "egostitch.pt"
-    _write_checkpoint(
-        checkpoint_path,
-        model=model,
-        model_family="egostitch",
-        model_config=dict(_TINY_EGOSTITCH_CONFIG),
-    )
-
-    pairs_path = tmp_path / "pairs.tsv"
-    pairs_path.write_text("".join(f"{u}\t{v}\n" for u, v in _EGOSTITCH_PAIRS))
-
-    b0_path = tmp_path / "b0_scores.npz"
-    position = {node: i for i, node in enumerate(_EGOSTITCH_NODES)}
-    score_universe.save_scores(
-        b0_path,
-        node_ids=list(_EGOSTITCH_NODES),
-        u_idx=np.array([position[u] for u, _ in _EGOSTITCH_PAIRS], dtype=np.int32),
-        v_idx=np.array([position[v] for _, v in _EGOSTITCH_PAIRS], dtype=np.int32),
-        logit=np.linspace(-1.0, 1.0, len(_EGOSTITCH_PAIRS)).astype(np.float32),
-        label=np.full(len(_EGOSTITCH_PAIRS), -1, dtype=np.int8),
-        row_start=0,
-        meta={
-            "checkpoint_id": "cafecafecafecafe",
-            "model_family": "v3_1",
-            "pairs_source": "file",
-            "strategy": "breadth_first",
-            "num_rows": len(_EGOSTITCH_PAIRS),
-            "created_utc": "2026-07-14T00:00:00+00:00",
-            "torch_version": str(torch.__version__),
-        },
-    )
-    return data_root, checkpoint_path, pairs_path, b0_path
-
-
-def _egostitch_score_args(
-    tmp_path: Path, data_root: Path, checkpoint: Path, pairs: Path, b0: Path, output: Path
-) -> list[str]:
-    return [
-        "score",
-        "--checkpoint",
-        str(checkpoint),
-        "--pairs",
-        f"file:{pairs}",
-        "--data-root",
-        str(data_root),
-        "--output",
-        str(output),
-        "--batch-pairs",
-        "3",
-        "--b0-scores",
-        str(b0),
-        "--s0-checkpoint-id",
-        "cafecafecafecafe",
-        "--f0-cache",
-        str(tmp_path / "f0_cache.pt"),
-        "--grounding-cache",
-        str(tmp_path / "grounding.npz"),
-        "--device",
-        "cpu",
-    ]
-
-
-def test_build_model_egostitch_round_trips() -> None:
-    from src.model.egostitch import EgoStitchStage1
-
-    model = score_universe.build_model("egostitch", dict(_TINY_EGOSTITCH_CONFIG))
-    assert isinstance(model, EgoStitchStage1)
-    assert model.config.slots == 3
-    assert isinstance(model.feature_norm, nn.Identity)
-
-
-def test_legacy_egostitch_cached_scoring_matches_direct_forward(tmp_path: Path) -> None:
-    data_root, _, _, _ = _egostitch_setup(tmp_path)
-    store = FeatureStore(data_root / "features" / "frozen_node_features_1024")
-    model = score_universe.build_model("egostitch", dict(_TINY_EGOSTITCH_CONFIG))
-    model.eval()
-    pairs = list(_EGOSTITCH_PAIRS)
-    s0 = np.linspace(-1.0, 1.0, len(pairs), dtype=np.float32)
-    cached = score_universe._score_egostitch(
-        model,
-        pairs,
-        store,
-        device=torch.device("cpu"),
-        amp="off",
-        batch_pairs=3,
-        f0_cache=tmp_path / "legacy-f0.pt",
-        grounding_cache=tmp_path / "legacy-grounding.npz",
-        s0_logits=s0,
-    )
-
-    node_ids = sorted({node for pair in pairs for node in pair})
-    matrix, index = build_f0_matrix(store, node_ids, cache_path=None)
-    grounding = build_grounding_pool(
-        np.asarray(matrix.numpy(), dtype=np.float32),
-        node_ids,
-        n_ground=model.config.n_ground,
-        role_universe="test",
-        cache_path=None,
-    )
-    pool_rows = torch.tensor(
-        [[index[neighbor] for neighbor in grounding[node]] for node in node_ids],
-        dtype=torch.long,
-    )
-    direct: list[float] = []
-    with torch.inference_mode():
-        for row, (u, v) in enumerate(pairs):
-            u_row, v_row = index[u], index[v]
-            batch = {
-                "x_i": matrix[u_row].unsqueeze(0),
-                "ground_i": matrix[pool_rows[u_row]].unsqueeze(0),
-                "s0": torch.tensor([s0[row]]),
-            }
-            if u != v:
-                batch.update(
-                    {
-                        "x_j": matrix[v_row].unsqueeze(0),
-                        "ground_j": matrix[pool_rows[v_row]].unsqueeze(0),
-                    }
-                )
-            direct.append(float(model(batch)["logits"].item()))
-
-    np.testing.assert_allclose(cached, np.asarray(direct, dtype=np.float32), rtol=1e-5, atol=2e-6)
-
-
-def test_egostitch_cli_scores_end_to_end_with_self_pair(tmp_path: Path) -> None:
-    data_root, checkpoint, pairs, b0 = _egostitch_setup(tmp_path)
-    output = tmp_path / "scores.npz"
-    score_universe.main(_egostitch_score_args(tmp_path, data_root, checkpoint, pairs, b0, output))
-    artifact = score_universe.load_scores(output)
-    assert len(artifact.logit) == len(_EGOSTITCH_PAIRS)
-    assert bool(np.isfinite(artifact.logit).all())
-    assert artifact.meta["model_family"] == "egostitch"
-    assert artifact.meta["s0_checkpoint_id"] == "cafecafecafecafe"
-    assert artifact.meta["score_precision"] == {
-        "contract": "egostitch_pair_fp32_v1",
-        "encode_autocast": "off",
-        "pair_compute_dtype": "float32",
-        "pair_autocast": False,
-        "logit_storage_dtype": "float32",
-    }
-    resolution = artifact.meta["score_resolution"]
-    assert isinstance(resolution, dict)
-    assert resolution["n_rows"] == len(_EGOSTITCH_PAIRS)
-    assert resolution["n_unique"] == int(np.unique(artifact.logit).size)
-    density = artifact.meta["density_calibration"]
-    assert isinstance(density, dict)
-    assert density["pass"] == 1
-    assert 0.0 <= float(density["rho_hat_eval"]) <= 1.0
-
-
-def test_egostitch_cli_is_deterministic(tmp_path: Path) -> None:
-    data_root, checkpoint, pairs, b0 = _egostitch_setup(tmp_path)
-    out_a, out_b = tmp_path / "a.npz", tmp_path / "b.npz"
-    for output in (out_a, out_b):
-        score_universe.main(
-            _egostitch_score_args(tmp_path, data_root, checkpoint, pairs, b0, output)
+def test_validate_score_precision_refuses_a_legacy_egostitch_artifact() -> None:
+    with pytest.raises(ValueError, match="frozen-s0 'egostitch' family is retired"):
+        score_universe.validate_score_precision(
+            np.linspace(-1.0, 1.0, 4, dtype=np.float32),
+            meta={"model_family": "egostitch"},
+            label="legacy",
         )
-    np.testing.assert_array_equal(
-        score_universe.load_scores(out_a).logit, score_universe.load_scores(out_b).logit
-    )
-
-
-def test_egostitch_cli_requires_b0_scores(tmp_path: Path) -> None:
-    data_root, checkpoint, pairs, b0 = _egostitch_setup(tmp_path)
-    args = _egostitch_score_args(tmp_path, data_root, checkpoint, pairs, b0, tmp_path / "out.npz")
-    idx = args.index("--b0-scores")
-    del args[idx : idx + 2]
-    with pytest.raises(ValueError, match="requires --b0-scores"):
-        score_universe.main(args)
-
-
-def test_egostitch_cli_rejects_s0_checkpoint_mismatch(tmp_path: Path) -> None:
-    data_root, checkpoint, pairs, b0 = _egostitch_setup(tmp_path)
-    args = _egostitch_score_args(tmp_path, data_root, checkpoint, pairs, b0, tmp_path / "out.npz")
-    args[args.index("--s0-checkpoint-id") + 1] = "0000000000000000"
-    with pytest.raises(ValueError, match="checkpoint_id mismatch"):
-        score_universe.main(args)
-
-
-def test_egostitch_cli_hard_fails_on_missing_s0_pair(tmp_path: Path) -> None:
-    data_root, checkpoint, pairs, b0 = _egostitch_setup(tmp_path)
-    # Rewrite the pairs file with a pair the b0 artifact does not cover.
-    pairs.write_text(pairs.read_text() + "e1\te4\n")
-    with pytest.raises(ValueError, match="missing pair"):
-        score_universe.main(
-            _egostitch_score_args(tmp_path, data_root, checkpoint, pairs, b0, tmp_path / "o.npz")
-        )
-
-
-# ---------------------------------------------------------------------------
-# egostitch pair pass is fp32 even under bf16 amp (spec Sec 13.16)
-# ---------------------------------------------------------------------------
-
-
-def test_score_egostitch_pair_pass_is_fp32_even_under_bf16_amp(tmp_path: Path) -> None:
-    """The bf16-autocast regression: only the per-node encode pass may use bf16.
-
-    Before the fix, the pair-scoring loop (Sinkhorn stitch + decision head) ran
-    inside the same `bf16` autocast context, so every logit landed on the bf16
-    ulp grid regardless of the fp32 output dtype. This reproduces that bug's
-    exact trigger (`--amp bf16` on CPU) and asserts full fp32 resolution.
-    """
-    torch.manual_seed(0)
-    n_nodes = 16
-    nodes = [f"e{i}" for i in range(n_nodes)]
-    node_tokens = {node: torch.randn(3 + (i % 5), INPUT_DIM) for i, node in enumerate(nodes)}
-    data_root = _data_root_with_features(tmp_path, node_tokens)
-    store = FeatureStore(data_root / "features" / "frozen_node_features_1024")
-
-    model = score_universe.build_model("egostitch", dict(_TINY_EGOSTITCH_CONFIG))
-    model.eval()
-
-    rng = np.random.default_rng(1)
-    n_pairs = 60
-    u_idx = rng.integers(0, n_nodes, size=n_pairs)
-    v_idx = (u_idx + rng.integers(1, n_nodes, size=n_pairs)) % n_nodes
-    v_idx[::5] = u_idx[::5]
-    pairs = [(nodes[int(u)], nodes[int(v)]) for u, v in zip(u_idx, v_idx, strict=True)]
-    s0_logits = rng.normal(size=n_pairs).astype(np.float32)
-
-    logits = score_universe._score_egostitch(
-        model,
-        pairs,
-        store,
-        device=torch.device("cpu"),
-        amp="bf16",
-        batch_pairs=5,
-        f0_cache=tmp_path / "f0_cache.pt",
-        grounding_cache=tmp_path / "grounding.npz",
-        s0_logits=s0_logits,
-    )
-
-    assert np.all(np.isfinite(logits))
-    bf16_roundtrip = torch.from_numpy(logits).to(torch.bfloat16).to(torch.float32).numpy()
-    is_self = u_idx == v_idx
-    assert np.any(logits[~is_self] != bf16_roundtrip[~is_self])
-    assert np.any(logits[is_self] != bf16_roundtrip[is_self])
-    assert np.unique(logits).size == n_pairs
-
-
-# ---------------------------------------------------------------------------
-# pair-pass precision provenance (spec Sec 13.16)
-# ---------------------------------------------------------------------------
-
-
-def _egostitch_precision_meta(n_rows: int) -> dict[str, object]:
-    return {
-        "checkpoint_id": "abc123abc123abcd",
-        "model_family": "egostitch",
-        "pairs_source": "candidate",
-        "strategy": "breadth_first",
-        "num_rows": n_rows,
-        "created_utc": "2026-07-16T00:00:00+00:00",
-        "torch_version": str(torch.__version__),
-        "score_precision": {
-            "contract": "egostitch_pair_fp32_v1",
-            "encode_autocast": "bf16",
-            "pair_compute_dtype": "float32",
-            "pair_autocast": False,
-            "logit_storage_dtype": "float32",
-        },
-    }
-
-
-def test_save_scores_rejects_egostitch_without_precision_provenance(tmp_path: Path) -> None:
-    meta = _egostitch_precision_meta(2)
-    del meta["score_precision"]
-    with pytest.raises(ValueError, match="missing score_precision provenance"):
-        score_universe.save_scores(
-            tmp_path / "missing-precision.npz",
-            node_ids=["node_a", "node_b"],
-            u_idx=np.array([0, 0], dtype=np.int32),
-            v_idx=np.array([1, 1], dtype=np.int32),
-            logit=np.array([0.0, 1.0], dtype=np.float32),
-            label=np.full(2, -1, dtype=np.int8),
-            row_start=0,
-            meta=meta,
-        )
-
-
-def test_save_scores_accepts_legitimate_low_unique_egostitch_logits(tmp_path: Path) -> None:
-    n_rows = 10_000
-    values = np.linspace(-1.0, 1.0, 16, dtype=np.float32)
-    logit = np.tile(values, n_rows // len(values) + 1)[:n_rows].astype(np.float32)
-    output = tmp_path / "low-unique.npz"
-    score_universe.save_scores(
-        output,
-        node_ids=["node_a", "node_b"],
-        u_idx=np.zeros(n_rows, dtype=np.int32),
-        v_idx=np.ones(n_rows, dtype=np.int32),
-        logit=logit,
-        label=np.full(n_rows, -1, dtype=np.int8),
-        row_start=0,
-        meta=_egostitch_precision_meta(n_rows),
-    )
-    artifact = score_universe.load_scores(output)
-    score_universe.validate_score_precision(artifact.logit, meta=artifact.meta, label=str(output))
-    resolution = artifact.meta["score_resolution"]
-    assert isinstance(resolution, dict)
-    assert resolution["n_unique"] == 16
-    assert resolution["unique_fraction"] == pytest.approx(0.0016)
-
-
-def test_merge_recomputes_egostitch_resolution_diagnostics(tmp_path: Path) -> None:
-    shard_paths = [tmp_path / "s0.npz", tmp_path / "s1.npz"]
-    for shard, values in enumerate(
-        (
-            np.array([0.1, 0.2], dtype=np.float32),
-            np.array([0.2, 0.3], dtype=np.float32),
-        )
-    ):
-        meta = _egostitch_precision_meta(4)
-        score_universe.save_scores(
-            shard_paths[shard],
-            node_ids=["node_a", "node_b"],
-            u_idx=np.zeros(2, dtype=np.int32),
-            v_idx=np.ones(2, dtype=np.int32),
-            logit=values,
-            label=np.full(2, -1, dtype=np.int8),
-            row_start=2 * shard,
-            meta=meta,
-        )
-
-    output = tmp_path / "merged.npz"
-    score_universe.main(
-        ["merge", "--inputs", *[str(path) for path in shard_paths], "--output", str(output)]
-    )
-    merged = score_universe.load_scores(output)
-    assert merged.meta["score_resolution"] == score_universe.score_resolution_diagnostics(
-        merged.logit
-    )
 
 
 # --------------------------------------------------------------------------- egostitch_e2e scoring
@@ -1266,42 +927,19 @@ def _egostitch_e2e_setup(
 def _egostitch_e2e_score_args(
     tmp_path: Path, data_root: Path, checkpoint: Path, pairs: Path, output: Path
 ) -> list[str]:
-    evidence_artifact = tmp_path / "synthetic-file-score-evidence.json"
-    evidence_artifact.write_text('{"scope": "synthetic-nonheldout"}\n', encoding="utf-8")
-    evidence_record = {
-        "path": str(evidence_artifact),
-        "sha256": score_universe._file_sha256(evidence_artifact),
-    }
-    preregistration = tmp_path / "synthetic-file-score-preregistration.json"
-    preregistration.write_text(
-        json.dumps(
-            {
-                "status": "BINDING",
-                "binding_evidence": {
-                    "schema_version": "egostitch_e2e_binding_evidence_v1",
-                    "configs": {"synthetic": evidence_record},
-                    "parameter_group_manifests": evidence_record,
-                    "packs_and_validation_manifests": evidence_record,
-                    "qualification_attempts": evidence_record,
-                    "boundary_access_audit": evidence_record,
-                    "runtime_and_peak_memory": evidence_record,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
+    val_pairs = data_root / "benchmark_2025_neurips" / "breadth_first" / "val_edges.txt"
+    val_pairs.parent.mkdir(parents=True, exist_ok=True)
+    val_pairs.write_bytes(pairs.read_bytes())
     return [
         "score",
         "--checkpoint",
         str(checkpoint),
         "--pairs",
-        f"file:{pairs}",
+        "val",
         "--data-root",
         str(data_root),
         "--output",
         str(output),
-        "--preregistration",
-        str(preregistration),
         "--token-budget",
         "8192",
         "--f0-cache",

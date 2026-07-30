@@ -7,8 +7,8 @@
 <p>
   <img alt="Venue" src="https://img.shields.io/badge/target-ICLR%202027-b31b1b">
   <img alt="Type" src="https://img.shields.io/badge/paper-empirical%20ML%20method-blue">
-  <img alt="Status" src="https://img.shields.io/badge/status-G5%20rev--3.0%20build-orange">
-  <img alt="Code" src="https://img.shields.io/badge/implementation-EgoStitch%20Stage--1-green">
+  <img alt="Status" src="https://img.shields.io/badge/status-G5%20e2e%20rev--3.2%20build-orange">
+  <img alt="Code" src="https://img.shields.io/badge/implementation-EgoStitch%20E2E%20two--stage%20ladder-green">
 </p>
 
 <p>
@@ -28,18 +28,38 @@
 
 This repository holds the implementation and experiment pipeline for an ICLR 2027
 paper. The benchmark loaders, evaluation library, B0/B0-alt baselines, score-once
-artifact pipeline, gates G1–G3, and the frozen-s0 EgoStitch Stage-1 model are
-implemented and tested. The replacement fixed-Seed-0 screen completed on 2026-07-16
-under its bound registration and produced a formal **`cut`** verdict: both guards
-passed, but EgoStitch failed all three required topology-dominance checks against
-the calibrated-B0 ladder. The frozen-s0 scalar head is now a motivating result and
-ablation rung; the active G5 build line is the approved rev-3.0 end-to-end
-stitched-topology-conditioned pair encoder. The rev-3.0 e2e Stage-1 screen itself
-then completed on 2026-07-24 under a fresh binding registration and also returned
-**`cut`** (multi-label; training was valid, liveness passed) — see
-[`docs/results/G5-e2e-stage1-seed0-20260724.md`](docs/results/G5-e2e-stage1-seed0-20260724.md).
-Disposition of the rev-3.0 build line is pending an owner-side locked-decision
-discussion. Neither screen replaces E1/E3's multi-seed Holm inference.
+artifact pipeline, and gates G1–G3 are implemented and tested. Two G5 screens have
+completed, and both returned a formal **`cut`**:
+
+- the **frozen-s0** EgoStitch screen (2026-07-16/17) — both guards passed, but all
+  three required topology-dominance checks against the calibrated-B0 ladder failed:
+  [`docs/results/G5-stage1-seed0-20260717.md`](docs/results/G5-stage1-seed0-20260717.md);
+- the **rev-3.0 end-to-end** screen (2026-07-24) — multi-label; training was valid and
+  liveness passed:
+  [`docs/results/G5-e2e-stage1-seed0-20260724.md`](docs/results/G5-e2e-stage1-seed0-20260724.md).
+
+Both result notes stay citable as history. The frozen-s0 *implementation* that produced
+the first last exists at commit `dcae090` and is deleted in the current two-stage-cleanup
+worktree pending a cleanup commit. The verdict, its registration, and
+`outputs/egostitch_stage1/` are kept unchanged, and the source paths those notes cite
+resolve at `dcae090`. Both are fixed-Seed-0 engineering
+screens: neither replaces E1/E3's multi-seed Holm inference.
+
+The active build line is **rev-3.2** of the end-to-end stitched-topology-conditioned
+pair encoder, and it runs on a **two-stage ladder**:
+
+```bash
+hpc/qualification.sh qualify <arm>   # short schedule, guards-only verdict — the dev loop
+hpc/qualification.sh formal  <arm>   # registered schedule — results
+```
+
+Both stages train on the identical `V_fit` universe, validate on the single 512-node
+`V_hold`, and differ **only** in `optim.epochs`; each stage runs `pack → train →
+publish` through the shared orchestrator. `qualify` needs no `BINDING` registration and no clean
+checkout. `formal` refuses to launch while
+[`docs/registrations/g5_e2e_stage1_preregistration_v4.json`](docs/registrations/g5_e2e_stage1_preregistration_v4.json)
+is `DRAFT`, and additionally requires exactly four visible H20s, a clean checkout, and a
+`pass` qualification for the same arm with matching feature and model digests.
 
 - **Task:** given two *unseen* nodes with frozen feature vectors, predict whether an
   edge exists between them (binary classification), under a strict inductive protocol
@@ -121,22 +141,26 @@ close the topology gap. The complete closeout package is
 
 ## The Proposed Method (EgoStitch)
 
-> **Status: frozen-s0 Stage-1 formally cut (2026-07-17); rev-3.0 e2e Stage-1 screen
-> also formally cut (2026-07-24).** Design proposal approved and gate G4 signed off —
+> **Status: frozen-s0 screen formally cut (2026-07-17); rev-3.0 e2e screen also
+> formally cut (2026-07-24); rev-3.2 is the active build line on the two-stage
+> ladder.** Design proposal approved and gate G4 signed off —
 > [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) is the active implementation
 > contract (algorithm spec + benchmark/data contract + auto-sized H20 execution design); its
-> §14 records the approved e2e successor headline. Design
-> rationale: [`docs/04-model-proposal.md`](docs/04-model-proposal.md) (rev 3.0). G1 (including
+> §13.19.4 defines the qualification/formal ladder and its §14 records the approved e2e
+> headline. Design rationale:
+> [`docs/04-model-proposal.md`](docs/04-model-proposal.md) (rev 3.0). G1 (including
 > B0-alt), G2, and G3 (Oracle) are complete. The binding frozen-s0 result is recorded in
 > [`docs/results/G5-stage1-seed0-20260717.md`](docs/results/G5-stage1-seed0-20260717.md):
 > matched edge AUPRC and degree-MMD guards pass, while clustering-MMD and matched
-> BFS-macro GS/RD all fail. The rev-3.0 e2e screen's registered five-arm result is
+> BFS-macro GS/RD all fail. That note is retained evidence — its implementing code last
+> exists at `dcae090` and is deleted in the current cleanup worktree pending commit. The
+> rev-3.0 e2e screen's historical four-trained-arm-plus-control result is
 > recorded in [`docs/results/G5-e2e-stage1-seed0-20260724.md`](docs/results/G5-e2e-stage1-seed0-20260724.md):
 > training was valid (liveness passed), BFS-macro GS passes but clustering-MMD and
 > BFS-macro RD fail, the matched-AUPRC guard fails, and pathway attribution and the
 > structure-destruction control both fail to establish a topology-conditioning gain.
-> Disposition of the rev-3.0 build line is pending an owner-side locked-decision
-> discussion.
+> The owner-side disposition subsequently advanced the build through rev-3.1 to the
+> active rev-3.2 eight-arm contract; it does not alter the historical `cut` verdict.
 
 For each queried pair `(i, j)`, each endpoint **imagines its own ego-network** (latent
 neighbor nodes with existence probabilities, local adjacency, and a degree budget)
@@ -175,9 +199,9 @@ docs/
   lit-review-plan.md             review plan, claims K1–K5, terminology guardrail
   results/
     E2-pair-to-topology-gap.md   the motivating result note
-    G5-stage1-seed0-20260715.md  superseded-registration training record
-    G5-stage1-seed0-20260717.md  binding frozen-s0 screen (`cut`) + last.pt diagnostic
-    G5-e2e-stage1-seed0-20260724.md  binding rev-3.0 e2e Stage-1 screen (`cut`)
+    G5-stage1-seed0-20260717.md  binding frozen-s0 screen (`cut`) — retained evidence, retired code
+    G5-e2e-stage1-seed0-20260724.md  binding rev-3.0 e2e screen (`cut`)
+  registrations/                 pre-registrations; the e2e v4 DRAFT gates `formal`
 figures/
   e2-gap.html                    edge-vs-topology contrast (open in a browser)
   positioning.html               2×2 taxonomy positioning figure
@@ -186,15 +210,17 @@ data/
   benchmark_2025_neurips/        graph, edge lists, split artifacts, evaluation buckets
   features/                      neutral node-feature index
 src/
-  data/                          verified benchmark/features + pair batching
+  data/                          verified benchmark/features + pair batching + V_fit/V_hold partition
   eval/                          edge and assembled-graph metrics
-  model/                         frozen B0/B0-alt scorers + EgoStitch Stage-1 modules
-  experiments/                   G1/G2/G3 analyses + pre-registered G5 Stage-1 gate
+  model/                         frozen B0/B0-alt scorers + EgoStitch e2e modules
+  experiments/                   G1/G2/G3 analyses + pre-registered G5 e2e gate + probes
   train_b0.py                    baseline training CLI
-  train_egostitch.py             auto-sized DDP EgoStitch training worker
+  train_egostitch.py             auto-sized DDP EgoStitch e2e training worker (both ladder stages)
+  e2_pipeline.py                 production orchestrator: pack → train → publish
   score_universe.py              score-once artifact CLI
 hpc/
-  run.sh                         direct auto-sized H20 runner
+  run.sh                         direct auto-sized H20 runner (check / B0 train / score / merge / G1 / G2)
+  qualification.sh               the two-stage e2e ladder: `qualify <arm>`, then `formal <arm>`
   README.md                      required target environment + exact experiment runbook
 literature/                      curated reference library (gitignored)
   models/                        PDFs by topic; filename YEAR_venue_short_title.pdf
@@ -216,9 +242,9 @@ general graph-ML benchmark. Don't substitute real dataset names unless asked.
 | 4 | [`docs/04-model-proposal.md`](docs/04-model-proposal.md) | EgoStitch rationale (approved 2026-07-09) |
 | 5 | [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) | **Implementation contract**: algorithm, data/batch contract, auto-sized H20 execution |
 | 6 | [`docs/results/E2-pair-to-topology-gap.md`](docs/results/E2-pair-to-topology-gap.md) | Motivating result |
-| 7 | [`docs/results/G5-stage1-seed0-20260717.md`](docs/results/G5-stage1-seed0-20260717.md) | Binding frozen-s0 Stage-1 result (`cut`) and diagnostic interpretation |
-| 8 | [`docs/results/G5-e2e-stage1-seed0-20260724.md`](docs/results/G5-e2e-stage1-seed0-20260724.md) | Binding rev-3.0 e2e Stage-1 screen result (`cut`); disposition pending owner decision |
-| 9 | [`docs/results/G5-stage1-seed0-20260715.md`](docs/results/G5-stage1-seed0-20260715.md) | Historical superseded-registration training record |
+| 7 | [`docs/results/G5-stage1-seed0-20260717.md`](docs/results/G5-stage1-seed0-20260717.md) | Binding frozen-s0 result (`cut`) and diagnostic interpretation; retained evidence, retired code |
+| 8 | [`docs/results/G5-e2e-stage1-seed0-20260724.md`](docs/results/G5-e2e-stage1-seed0-20260724.md) | Binding rev-3.0 e2e screen result (`cut`); historical evidence for the rev-3.2 successor |
+| 9 | [`hpc/README.md`](hpc/README.md) | Target environment and the exact `qualify` → `formal` runbook |
 | 10 | [`docs/lit-review-plan.md`](docs/lit-review-plan.md) | Review plan, claims, terminology guardrail |
 
 When documents conflict, the more specific/later one refines the earlier — but locked
@@ -243,13 +269,15 @@ target test graph; the queried edge is masked/standardized inside the scaffold. 
 - [x] **G1 + G2** — B0/PA-null, B0-alt architecture replication, and the checkpoint-aligned edge-independence ceiling are complete; the final benchmark-aligned G1 artifacts are under [`outputs/deliverables/g1_graph_metrics_20260714/`](outputs/deliverables/g1_graph_metrics_20260714/).
 - [x] **Latest legacy v3.1 robustness rerun** — canonical G1 confirms that the stronger scorer preserves the topology gap; final artifacts are under [`outputs/deliverables/legacy_g1_graph_metrics_20260714/`](outputs/deliverables/legacy_g1_graph_metrics_20260714/).
 - [x] **G3 gate** — Oracle row passed; Oracle-blend shows substantial headroom over B0 and the feature-insufficiency stop rule is not triggered. Final artifacts are under [`outputs/deliverables/g3_graph_metrics_20260714/`](outputs/deliverables/g3_graph_metrics_20260714/).
-- [x] **EgoStitch Stage-1 implementation (frozen-s0 form)** — model, losses, data targets, auto-sized DDP worker, scoring, fidelity diagnostics, calibrated comparator, G5 runner, and tests are implemented under `src/`.
+- [x] **EgoStitch implementation (frozen-s0 form)** — model, losses, data targets, auto-sized DDP worker, scoring, fidelity diagnostics, calibrated comparator, G5 runner, and tests were implemented under `src/`. The producing code last exists at `dcae090` and is deleted in the current cleanup worktree pending commit. The result note, its registration, and `outputs/egostitch_stage1/` are retained.
 - [x] **E2E headline redesign (rev 3.0)** — approved 2026-07-16 after two user-as-reviewer rounds + a vault/arXiv novelty sweep: stitched-topology-conditioned pair encoder (no frozen anchor). Design record: [`docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md`](docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md); implementation summary: spec §14; Phase 0 is unblocked by the completed frozen-s0 screen: [`docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md`](docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md).
-- [x] **G5 frozen-s0 Stage-1 screening gate** — binding fixed-Seed-0 verdict `cut`: all three primary topology-dominance checks fail and both guards pass. The selected warm-start checkpoint is near S0; a diagnostic `last.pt` rerun proves later joint training moves ranking and passes matched GS, but still fails matched RD/clustering and regresses degree/spectral MMD. See the [result note](docs/results/G5-stage1-seed0-20260717.md) and [presentation-only status snapshot](docs/artifacts/2026-07-17-egostitch-status.html).
-- [x] **Locked-decision disposition** — frozen-s0 scalar fusion is retired to motivating-arm + ablation status; rev 3.0 is the active G5 build line. Successor landing condition §14.3(1) is satisfied.
-- [x] **G5 e2e Stage-1 screening gate** — binding fixed-Seed-0 v2 registration completed training (valid; liveness passed), held-out fp32 scoring, and the formal gate on 2026-07-24: BFS-macro GS passes but clustering-MMD and BFS-macro RD fail, the matched-AUPRC guard fails, and pathway attribution / the structure-destruction control both fail to establish a topology-conditioning gain. Verdict `cut` (multi-label). See the [result note](docs/results/G5-e2e-stage1-seed0-20260724.md).
-- [ ] **Rev-3.0 disposition** — owner-side locked-decision discussion on the rev-3.0 build line following the e2e Stage-1 `cut` verdict; not resolved by this screen.
-- [ ] **Experiments** in priority order (pending the rev-3.0 disposition decision above): E1/E3 multi-seed main + baselines → E4 ablations (incl. E4.15–E4.17 attribution/structure/conditioning-depth) → E5 integrity gates → E7 (load-bearing) → E6 breadth.
+- [x] **G5 frozen-s0 screening gate** — binding fixed-Seed-0 verdict `cut`: all three primary topology-dominance checks fail and both guards pass. The selected warm-start checkpoint is near S0; a diagnostic `last.pt` rerun proves later joint training moves ranking and passes matched GS, but still fails matched RD/clustering and regresses degree/spectral MMD. See the [result note](docs/results/G5-stage1-seed0-20260717.md).
+- [x] **Locked-decision disposition (2026-07-17)** — frozen-s0 scalar fusion is retired to motivating evidence; rev 3.0 was made the active G5 build line, which has since advanced to rev-3.2. Successor landing condition §14.3(1) is satisfied. The frozen-s0 code is deleted in the current cleanup worktree, so after the cleanup commit the arm is citable from published artifacts and `dcae090`, not re-runnable from the active tree.
+- [x] **G5 e2e screening gate** — binding fixed-Seed-0 v2 registration completed training (valid; liveness passed), held-out fp32 scoring, and the formal gate on 2026-07-24: BFS-macro GS passes but clustering-MMD and BFS-macro RD fail, the matched-AUPRC guard fails, and pathway attribution / the structure-destruction control both fail to establish a topology-conditioning gain. Verdict `cut` (multi-label). See the [result note](docs/results/G5-e2e-stage1-seed0-20260724.md).
+- [x] **Two-stage ladder cleanup (current worktree; cleanup commit pending)** — the five-stage e2e ladder collapsed to `qualify` → `formal`, both training on the identical `V_fit` and validating on the single 512-node `V_hold := V_qual ∪ V_select` (so `V_fit`, `e_msg_fit`, `e_sup_fit`, and `feature_stats_sha256` are bit-identical to the two-holdout era). The legacy frozen-s0 family is deleted in this worktree. Design record: [`docs/superpowers/specs/2026-07-29-egostitch-e2e-two-stage-cleanup.md`](docs/superpowers/specs/2026-07-29-egostitch-e2e-two-stage-cleanup.md); contract: spec §13.19.4 and §12.
+- [x] **Rev-3.0 disposition** — the owner-side discussion advanced the line through rev-3.1 to the active rev-3.2 eight-arm contract; the 2026-07-24 `cut` remains historical engineering evidence.
+- [ ] **Registration v4** — `docs/registrations/g5_e2e_stage1_preregistration_v4.json` is `DRAFT`; its unresolved real binding evidence must be supplied and the owner must promote a successor content state to `BINDING` before `hpc/qualification.sh formal` will launch.
+- [ ] **Experiments** in priority order after v4 is bound: the rev-3.2 eight-arm formal screen, then E1/E3 multi-seed main + baselines → E4 ablations (incl. E4.15–E4.17 attribution/structure/conditioning-depth) → E5 integrity gates → E7 (load-bearing) → E6 breadth.
 
 ## HPC execution
 
@@ -258,8 +286,9 @@ The required target environment is a container with one or more NVIDIA H20 GPUs.
 over the cached candidate universe. Formal E2
 (B0 V3.1) training runs **only** through `hpc/run.sh train
 configs/b0_v31_breadth_first.yaml`, which drives the production
-`python -m src.e2_pipeline` entry (pack → probe → projection → 30-epoch DDP train via
-an auto-detected `accelerate launch --num_processes N` across all visible GPUs); direct
+`python -m src.e2_pipeline` entry (pack → train → publish, with the 30-epoch DDP train
+launched by an auto-detected `accelerate launch --num_processes N` across all visible
+GPUs at the config's pinned `runtime.token_budget`); direct
 `python -m src.train_b0 --max-steps N` is debug-only, and `B0-alt` keeps its own direct
 `python -m src.train_b0 --config configs/b0_alt_breadth_first.yaml` training CLI,
 outside this E2-only optimization. The host, repository/data paths, required software
@@ -267,12 +296,39 @@ versions, and the `nohup` form are pinned in [`hpc/README.md`](hpc/README.md). T
 GPU count is recorded with each run, so throughput evidence is interpreted against
 that exact hardware shape. There is no job scheduler (e.g. Slurm).
 
-Formal EgoStitch Stage-1 training uses the same auto-detected multi-GPU orchestrator
-with `configs/egostitch_stage1_breadth_first.yaml` and `src.train_egostitch`; it must
-not be replaced by a hard-coded single-GPU launch. The validated frozen-s0 Seed-0 run
-used two visible H20s (`world_size=2`). The rev-3.0 e2e Stage-1 screen used the same
-auto-sized pattern with the registered `configs/egostitch_e2e_*.yaml` arms and
-detected `world_size=4` (4 × H20).
+**EgoStitch e2e training is a two-stage ladder driven by `hpc/qualification.sh`**, over
+the six configured `configs/egostitch_e2e_v3_*.yaml` trained arms
+(`full`, `f_only`, `pair_topology`, `p0`, `cosine_pool`, `no_l_rel`). Both stages go
+through the same auto-detected multi-GPU orchestrator and `src.train_egostitch`, run
+`pack → train → publish`, train on the full `V_fit`, and validate on the single 512-node
+`V_hold`; they differ only in `optim.epochs`, and neither may open a held-out path —
+that boundary is a path check inside the worker on both run kinds, so both commands run
+directly in the repository checkout. Neither may be replaced by a hard-coded single-GPU
+launch, and neither substitutes `--max-steps` for its schedule.
+
+```bash
+hpc/qualification.sh qualify full   # 3 epochs, every visible H20, guards-only verdict
+hpc/qualification.sh formal  full   # registered schedule; needs 4 × H20 + clean checkout + BINDING registration
+```
+
+Every `qualify` invocation gets an immutable directory under
+`outputs/egostitch_e2e_stage1_v3/qualification/<arm>/attempts/attempt-*/` and writes
+its `qualification.json` there (verdict, `feature_stats_sha256`,
+`model_config_sha256`). The arm-local `latest` pointer records the newest attempt,
+including failures; `latest-pass` advances only after a successful attempt, and
+`formal` reads that pointer. Preserving every attempt makes the cumulative count `K`
+of `V_hold` evaluations auditable instead of letting repeated development selection
+disappear. Each arm's `attempt_history.json` uses schema
+`egostitch_e2e_qualification_history_v1`; binding requires path-and-SHA-256 references
+for the exact six-arm index set and exact equality between every index's complete
+`attempts` array and the registered `qualification_attempts`. `formal` refuses to
+start unless the pointed report exists, its verdict is
+`pass`, and both digests equal the ones the formal config and its shared pack produce. Scientific
+execution order is `full` first. The two scoring-time controls
+(`structure_control_6a_v3`, `structure_control_6e_v1`) reuse the full arm's checkpoint
+and are not launched here. Historical hardware shapes, for interpreting the published
+throughput evidence: the frozen-s0 Seed-0 run used `world_size=2`; the rev-3.0 e2e
+screen used `world_size=4` (4 × H20).
 
 ## Literature
 

@@ -12,7 +12,6 @@ model:
     permanent_null: all_head
     n_ground: 50
     feature_standardization: zscore_vfit_v1
-    feature_stats_sha256: ""
 
 data:
   root: data
@@ -76,22 +75,18 @@ eval:
 seed: 0
 output_dir: outputs/egostitch_e2e_stage1_v3/f_only
 mixed_precision: "bf16"
-preregistration: docs/registrations/g5_e2e_stage1_preregistration_v3.json
+preregistration: docs/registrations/g5_e2e_stage1_preregistration_v4.json
 
 runtime:
   world_size: auto
-  pack_dir: outputs/feature_packs/egostitch_f0
+  pack_dir: outputs/feature_packs/egostitch_e2e_v_hold_ng50
   pack_workers: 8
   loader_workers_per_rank: 0
   prefetch_factor: 2
-  token_budget_candidates: [128]
+  token_budget: 128
   max_pairs_per_rank: 1048576
   memory_limit_gib: 85.0
-  total_budget_seconds: 30300
+  total_budget_seconds: 27720
   pack_budget_seconds: 1200
-  setup_probe_budget_seconds: 2100
   train_eval_budget_seconds: 26400
   artifact_budget_seconds: 120
-  reserve_seconds: 480
-  probe_warmup_steps: 5
-  probe_timed_steps: 15

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import cast, get_args
 
 import networkx as nx
 import numpy as np
@@ -79,6 +80,33 @@ def test_e2e_config_schema_is_strict_and_preserves_run_kind(tmp_path: Path) -> N
         te.load_config(bad)
 
 
+def test_selection_auprc_tolerance_accepts_a_future_rederived_value(tmp_path: Path) -> None:
+    raw = yaml.safe_load(_training_config(tmp_path).read_text(encoding="utf-8"))
+    raw["training"]["selection_auprc_tolerance"] = 0.01
+    raw["diagnostics"]["selection_auprc_tolerance"] = 0.01
+    path = tmp_path / "rederived.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    cfg = te.load_config(path)
+
+    assert cfg.training is not None
+    assert cfg.training.selection_auprc_tolerance == 0.01
+    assert cfg.diagnostics.selection_auprc_tolerance == 0.01
+
+
+@pytest.mark.parametrize("value", [-0.1, float("inf"), float("nan")])
+def test_selection_auprc_tolerance_rejects_invalid_values(
+    tmp_path: Path, value: float
+) -> None:
+    raw = yaml.safe_load(_training_config(tmp_path).read_text(encoding="utf-8"))
+    raw["training"]["selection_auprc_tolerance"] = value
+    path = tmp_path / "invalid-tolerance.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="selection_auprc_tolerance"):
+        te.load_config(path)
+
+
 def test_formal_binding_preflight_validates_live_config_and_commit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -106,6 +134,7 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
         "parameter_group_manifests": dict(artifact_record),
         "packs_and_validation_manifests": dict(artifact_record),
         "qualification_attempts": dict(artifact_record),
+        "qualification_history_indexes": dict(artifact_record),
         "boundary_access_audit": dict(artifact_record),
         "runtime_and_peak_memory": dict(artifact_record),
         "checkpoint_policy_version": "v1",
@@ -152,6 +181,14 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
     with pytest.raises(te.PreregistrationNotBinding, match="six trained"):
         te._validate_e2e_formal_binding(cfg, snapshot, config_path)
     evidence["configs"] = v2_configs
+
+    history_indexes = evidence["qualification_history_indexes"]
+    evidence["qualification_history_indexes"] = None
+    with pytest.raises(
+        te.PreregistrationNotBinding, match="qualification_history_indexes must be structured"
+    ):
+        te._validate_e2e_formal_binding(cfg, snapshot, config_path)
+    evidence["qualification_history_indexes"] = history_indexes
 
     registered_arms = cast(dict[str, object], snapshot.payload["arms"])
     snapshot.payload["arms"] = {
@@ -216,9 +253,15 @@ def test_formal_output_metadata_matches_scorer_contract(tmp_path: Path) -> None:
         output_dir=tmp_path / "formal",
         run_kind="formal",
     )
+    # The two-stage ladder validates both stages on the single `V_hold`
+    # manifest, so `V_hold` is the only role production can emit
+    # (`_E2E_VALIDATION_ROLE`, typed `Literal["V_hold"] | None`). The stub is
+    # pinned to that constant rather than to a hand-written string, so a role
+    # rename cannot leave this fixture asserting a value the worker never
+    # writes.
     data = SimpleNamespace(
         rho_train=0.1,
-        validation_role="V_select",
+        validation_role=te._E2E_VALIDATION_ROLE,
         access_audit={"observed_training_access": []},
     )
     metrics = te.EdgeMetrics(
@@ -276,43 +319,48 @@ def test_formal_output_metadata_matches_scorer_contract(tmp_path: Path) -> None:
     assert metadata["config_sha256"] == te._sha256_file(config_path)
     assert metadata["implementation_commit"] == "a" * 40
     assert metadata["checkpoint_sha256"] == te._sha256_file(cfg.output_dir / "best.pt")
+    assert te._E2E_VALIDATION_ROLE == "V_hold"
+    assert metadata["validation_role"] == "V_hold"
 
 
 def test_run_kinds_enforce_registered_boundaries(tmp_path: Path) -> None:
     loaded = te.load_config(_training_config(tmp_path))
-    overfit = te.apply_overrides(
+    qualification = te.apply_overrides(
         loaded,
         te.EgoCliArgs(
-            config=tmp_path / "training.yaml", seed=None, output_dir=None, run_kind="overfit"
+            config=tmp_path / "training.yaml", seed=None, output_dir=None, run_kind="qualification"
         ),
     )
-    prepared, is_debug, _ = te.prepare_ddp_run_config(overfit, max_steps=None)
-    assert prepared.run_kind == "overfit"
+    # Guards-only stage: it publishes no formal artifact, so a DRAFT
+    # registration is enough, but the schedule still runs whole.
+    prepared, is_debug, _ = te.prepare_ddp_run_config(qualification, max_steps=None)
+    assert prepared.run_kind == "qualification"
     assert is_debug is False
-    with pytest.raises(ValueError, match="2,000 registered steps"):
-        te.prepare_ddp_run_config(overfit, max_steps=2000)
+    with pytest.raises(ValueError, match="complete schedule"):
+        te.prepare_ddp_run_config(qualification, max_steps=2000)
 
-    rehearsal = te.apply_overrides(
+    formal = te.apply_overrides(
         loaded,
         te.EgoCliArgs(
-            config=tmp_path / "training.yaml", seed=None, output_dir=None, run_kind="rehearsal"
+            config=tmp_path / "training.yaml", seed=None, output_dir=None, run_kind="formal"
         ),
     )
     with pytest.raises(ValueError, match="complete schedule"):
-        te.prepare_ddp_run_config(rehearsal, max_steps=1)
-
-    formal = loaded
+        te.prepare_ddp_run_config(formal, max_steps=1)
     with pytest.raises(te.PreregistrationNotBinding):
         te.prepare_ddp_run_config(formal, max_steps=None)
 
+    # An unset run_kind is the formal stage, never a laxer one.
+    assert loaded.run_kind is None
+    with pytest.raises(te.PreregistrationNotBinding):
+        te.prepare_ddp_run_config(loaded, max_steps=None)
+
+
+def test_run_kind_domain_is_the_two_stage_ladder_plus_debug() -> None:
+    assert get_args(te.E2ERunKind) == ("qualification", "formal", "debug")
+
 
 def test_e2e_three_phase_boundaries_and_first_eligibility() -> None:
-    epoch_steps = te.e2e_overfit_epoch_step_counts(30)
-    assert len(epoch_steps) == 30
-    assert sum(epoch_steps) == 2000
-    assert epoch_steps[:20] == (67,) * 20
-    assert epoch_steps[20:] == (66,) * 10
-    assert te.e2e_overfit_epoch_step_counts(30, profile_only=True) == (67,)
     assert te.e2e_phase_boundaries(2000) == (400, 600)
     warm = te.e2e_phase_state(399, 2000)
     first_edge = te.e2e_phase_state(400, 2000)
@@ -324,6 +372,30 @@ def test_e2e_three_phase_boundaries_and_first_eligibility() -> None:
     assert te.e2e_phase_state(600, 2000) == te.E2EPhaseState("C", 1.0, True, 1.0)
     assert "pair_only" not in te.E2EPhaseState.__dataclass_fields__
     assert te.e2e_first_eligible_epoch(3000, 100) == 10
+
+
+def test_short_qualification_schedule_still_traverses_all_three_phases() -> None:
+    """Both stages share one curriculum; only `optim.epochs` differs.
+
+    The qualification stage is only useful if a 3-epoch schedule still reaches
+    Phase C and can therefore produce an eligible checkpoint (design
+    2026-07-29 Sec 2). The boundaries are fractions of the whole schedule, so
+    they scale rather than being pinned to the formal step count.
+    """
+    _, steps_per_epoch = te._epoch_step_plan(400, negative_ratio=5, edge_batch=128, world_size=4)
+    for epochs in (3, 30):
+        total = steps_per_epoch * epochs
+        warm_end, phase_c_start = te.e2e_phase_boundaries(total)
+        assert 0 < warm_end < phase_c_start < total
+        assert warm_end == math.ceil(0.2 * total)
+        assert phase_c_start == warm_end + math.ceil(0.1 * total)
+        assert te.e2e_phase_state(0, total).phase == "A"
+        assert not te.e2e_phase_state(0, total).edge_active
+        assert te.e2e_phase_state(warm_end, total).edge_active
+        assert te.e2e_phase_state(total - 1, total).phase == "C"
+        # Eligibility opens inside the schedule in both stages, so a short
+        # qualification run still has an eligible checkpoint to select.
+        assert 1 <= te.e2e_first_eligible_epoch(total, steps_per_epoch) <= epochs
 
 
 def test_e2e_eligibility_reference_starts_at_first_edge_active_validation() -> None:
@@ -495,131 +567,6 @@ class TestScaleTelemetry:
             te._e2e_scale_rows(torch.randn(2, 4, 6), torch.rand(2, 3, 3))
         with pytest.raises(ValueError, match="scale inputs must have shapes"):
             te._e2e_scale_rows(torch.randn(2, 4, 6), torch.rand(2, 4))
-
-
-def test_overfit_profile_is_the_first_production_epoch_not_a_compressed_schedule() -> None:
-    production = te.e2e_overfit_epoch_step_counts(30)
-    sampled = te.e2e_overfit_epoch_step_counts(30, profile_only=True)
-
-    assert sampled == production[:1]
-    assert all(
-        te.e2e_phase_state(step, sum(production)).phase == "A" for step in range(sum(sampled))
-    )
-
-
-def test_overfit_rows_and_target_seed_are_world_size_invariant() -> None:
-    rows = tuple((f"n{i}", f"n{i + 1}", i % 2) for i in range(10))
-    manifest = te.OverfitManifest(rows=rows, sha256="a" * 64)
-    expected = te.e2e_overfit_step_rows(manifest, step=1, batch_size=6)
-    assert expected == rows[6:] + rows[:2]
-
-    for world_size in (1, 2, 4):
-        shards = [
-            te.e2e_overfit_rank_step_rows(
-                manifest,
-                step=1,
-                global_batch_size=6,
-                rank=rank,
-                world_size=world_size,
-            )
-            for rank in range(world_size)
-        ]
-        recovered = tuple(
-            shards[index % world_size][index // world_size] for index in range(len(expected))
-        )
-        assert recovered == expected
-
-    assert te.e2e_overfit_target_seed(seed=7, step=11, rank=3) == (7, 0, 11, 3, 0x7A)
-
-
-def test_fixed_overfit_batches_preserve_global_rows_and_four_rank_padding(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    cfg = te.load_config(_training_config(tmp_path))
-    rows = tuple((f"n{i}", f"n{i + 1}", i % 2) for i in range(10))
-    manifest = te.OverfitManifest(rows=rows, sha256="a" * 64)
-    seen_rows: dict[int, tuple[tuple[str, str, int], ...]] = {}
-    seen_node_epochs: dict[int, int] = {}
-    seen_rng_draws: dict[int, int] = {}
-
-    class _TargetBuilder:
-        def __init__(self, rank: int) -> None:
-            self.rank = rank
-
-        def build(self, nodes: list[str], rng: np.random.Generator) -> None:
-            del nodes
-            seen_rng_draws[self.rank] = int(rng.integers(0, 2**31))
-
-    def _next_nodes(factory: te._BatchFactory) -> list[str]:
-        del factory
-        return ["n0"]
-
-    def _node_tensors(
-        factory: te._BatchFactory,
-        nodes: list[str],
-        targets: None,
-        *,
-        epoch: int,
-        step: int,
-    ) -> dict[str, torch.Tensor]:
-        del nodes, targets, step
-        seen_node_epochs[factory._rank] = epoch
-        return {
-            "x": torch.zeros(1, 1),
-            "ground_x": torch.zeros(1, 1, 1),
-            "target_features": torch.zeros(1, 1, 1),
-        }
-
-    def _edge_tensors(
-        factory: te._BatchFactory,
-        local_rows: tuple[tuple[str, str, int], ...],
-        *,
-        pad_to: int,
-        epoch: int,
-        step: int,
-    ) -> tuple[dict[str, torch.Tensor], int]:
-        del epoch, step
-        seen_rows[factory._rank] = local_rows
-        labels = [label for _, _, label in local_rows]
-        return {
-            "x_i": torch.zeros(pad_to, 1),
-            "label": torch.tensor(labels + [0] * (pad_to - len(labels))),
-            "edge_mask": torch.tensor([1] * len(labels) + [0] * (pad_to - len(labels))),
-        }, len(local_rows)
-
-    monkeypatch.setattr(te._BatchFactory, "_next_nodes", _next_nodes)
-    monkeypatch.setattr(te._BatchFactory, "_node_tensors", _node_tensors)
-    monkeypatch.setattr(te._BatchFactory, "_edge_tensors", _edge_tensors)
-
-    batches: list[te._CompositeBatch] = []
-    for rank in range(4):
-        factory = object.__new__(te._BatchFactory)
-        factory._cfg = cfg
-        factory._rank = rank
-        factory._world = 4
-        factory._data = cast(te.EgoStitchData, SimpleNamespace(target_builder=_TargetBuilder(rank)))
-        batches.append(
-            next(
-                factory.fixed_row_batches(
-                    manifest=manifest,
-                    epoch=1,
-                    steps=1,
-                    step_offset=1,
-                )
-            )
-        )
-
-    expected = te.e2e_overfit_step_rows(manifest, step=1, batch_size=cfg.data.edge_batch)
-    recovered = tuple(seen_rows[index % 4][index // 4] for index in range(cfg.data.edge_batch))
-    assert recovered == expected
-    assert all(batch.edge_rows_global == cfg.data.edge_batch for batch in batches)
-    assert [batch.edge_rows_true for batch in batches] == [2, 2, 1, 1]
-    assert [int(batch.edge["edge_mask"].sum()) for batch in batches] == [2, 2, 1, 1]
-    assert seen_node_epochs == dict.fromkeys(range(4), 0)
-    assert seen_rng_draws == {
-        rank: int(np.random.default_rng((cfg.seed, 0, 1, rank, 0x7A)).integers(0, 2**31))
-        for rank in range(4)
-    }
 
 
 def test_prefetch_batches_builds_ahead_without_reordering() -> None:

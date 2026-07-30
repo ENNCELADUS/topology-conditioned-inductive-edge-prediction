@@ -1,5 +1,13 @@
 # G5 Stage-1 Membership-Normalized Screening Registration (human-readable twin)
 
+> **Retained evidence, retired code.** The frozen-s0 `egostitch` implementation this
+> registration governed last exists at commit `dcae090`; it is deleted in the current
+> two-stage-cleanup worktree pending a cleanup commit
+> (`docs/superpowers/specs/2026-07-29-egostitch-e2e-two-stage-cleanup.md` §6.2). The
+> registration is kept verbatim as the evidence record for
+> `docs/results/G5-stage1-seed0-20260717.md`; it can no longer be executed, and the
+> source paths it names resolve through git history at `dcae090`.
+
 > Machine-checked source of truth: [`g5_stage1_preregistration.json`](g5_stage1_preregistration.json).
 > The training worker records that file's sha256 in `run_metadata.json` at run start;
 > the gate evaluator (`src/experiments/g5_stage1.py`) refuses to open held-out metrics

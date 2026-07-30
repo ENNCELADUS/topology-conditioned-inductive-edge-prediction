@@ -1,25 +1,32 @@
-"""Tests for src.train_egostitch: the EgoStitch Stage-1 training worker."""
+"""Config-schema and edge-stream tests for the `src.train_egostitch` worker.
+
+This module is also the shared toy-fixture home for the EgoStitch worker test
+suite: `tests/test_train_egostitch_core.py`, `tests/test_train_egostitch_e2e.py`
+and `tests/test_g5_stage1_e2e.py` all import `_toy_cfg`/`_toy_bundle` and the
+tiny model dicts from here, so the fixtures below stay put even though the
+frozen-s0 ``egostitch`` execution path they were originally written for was
+retired with the two-stage cleanup (design 2026-07-29 Sec 6.2).
+
+The live worker-core behaviour (run kinds, the BINDING gate, the qualification
+artifact, the batch factory, the registered diagnostics) lives in
+`tests/test_train_egostitch_core.py`.
+"""
 
 from __future__ import annotations
 
-import json
-from dataclasses import replace
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import networkx as nx
 import numpy as np
 import pytest
 import torch
 import yaml  # type: ignore[import-untyped]
-from accelerate import Accelerator
 from src import train_egostitch as te
 from src.data.artifacts import canonical_pair
 from src.data.ego_targets import EgoTargetBuilder
 from src.data.pairs import NegativeSampler
-from src.e2_pipeline import _validate_worker_profile
-from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
-from src.model.egostitch.config import E2EConfig
+from src.model.egostitch import EgoStitchConfig
 
 pytestmark = pytest.mark.unit
 
@@ -71,43 +78,42 @@ _E2E_TINY_MODEL: dict[str, object] = {
 
 def _config_mapping(tmp_path: Path, **overrides: object) -> dict[str, Any]:
     mapping: dict[str, Any] = {
-        "model": {"family": "egostitch", "config": dict(_TINY_MODEL)},
+        "model": {"family": "egostitch_e2e", "config": dict(_E2E_TINY_MODEL)},
         "data": {
             "root": str(tmp_path / "data"),
             "strategy": "toy",
             "train_positives": "e_sup",
-            "negative_ratio": 2,
+            "negative_ratio": 5,
             "partition_seed": 0,
             "msg_fraction": 0.8,
             "node_batch": 4,
             "edge_batch": 6,
             "f0_cache": str(tmp_path / "f0.pt"),
             "grounding_cache": str(tmp_path / "grounding.npz"),
-            "s0_cache": str(tmp_path / "s0.npz"),
-            "s0_checkpoint_id": "deadbeefcafefeed",
             "expected_missing_features": [],
+            "pack_dir": str(tmp_path / "token_pack"),
         },
         "optim": {
-            "lr": 1e-3,
-            "weight_decay": 0.0,
-            "epochs": 2,
-            "warmup_steps": 2,
+            "lr": 1e-4,
+            "weight_decay": 0.01,
+            "epochs": 30,
+            "warmup_steps": 500,
             "grad_clip": 1.0,
-            "warmstart_fraction": 0.25,
         },
         "diagnostics": {
-            "gradient_probe_interval": 1,
-            "gradient_imbalance_ratio": 10.0,
-            "gradient_imbalance_steps": 2,
+            "gradient_probe_interval": 50,
+            "gradient_imbalance_ratio": 50.0,
+            "gradient_imbalance_steps": 200,
             "probe_s1_abs_mean_max": 1000.0,
-            "selection_auprc_tolerance": 1e-4,
-            "topk_fraction": 0.25,
+            "selection_auprc_tolerance": 0.02,
+            "topk_fraction": 0.01,
         },
         "eval": {"patience": 2, "eval_every": 1},
         "seed": 0,
         "output_dir": str(tmp_path / "out"),
-        "mixed_precision": "no",
+        "mixed_precision": "bf16",
         "preregistration": str(tmp_path / "prereg.json"),
+        "training": {},
     }
     mapping.update(overrides)
     return mapping
@@ -125,57 +131,31 @@ _RUNTIME: dict[str, Any] = {
     "pack_workers": 1,
     "loader_workers_per_rank": 0,
     "prefetch_factor": 2,
-    "token_budget_candidates": [4, 8],
+    "token_budget": 4,
     "max_pairs_per_rank": 1024,
     "memory_limit_gib": 85.0,
-    "total_budget_seconds": 100,
+    "total_budget_seconds": 70,
     "pack_budget_seconds": 20,
-    "setup_probe_budget_seconds": 20,
     "train_eval_budget_seconds": 40,
     "artifact_budget_seconds": 10,
-    "reserve_seconds": 10,
-    "probe_warmup_steps": 1,
-    "probe_timed_steps": 2,
 }
-
-
-def test_ddp_accelerator_detects_conditionally_unused_parameters() -> None:
-    handler = te._egostitch_ddp_kwargs()
-    assert handler.broadcast_buffers is False
-    assert handler.find_unused_parameters is True
-    assert handler.gradient_as_bucket_view is True
-    assert (
-        te._egostitch_ddp_kwargs(find_unused_parameters=False).find_unused_parameters
-        is False
-    )
-
-
-@pytest.mark.parametrize(
-    ("n_val", "expected"),
-    [(0, ()), (1, (0,)), (99, (0,)), (100, (0,)), (101, (0, 1)), (250, (0, 1, 2))],
-)
-def test_e2e_validation_slice_uses_fixed_global_manifest_rows(
-    n_val: int, expected: tuple[int, ...]
-) -> None:
-    assert te._e2e_validation_slice_rows(n_val) == expected
 
 
 class TestLoadConfig:
     def test_round_trip(self, tmp_path: Path) -> None:
         cfg = te.load_config(_write_config(tmp_path))
-        assert cfg.model.family == "egostitch"
+        assert cfg.model.family == "egostitch_e2e"
         assert cfg.data.train_positives == "e_sup"
-        assert cfg.optim.warmstart_fraction == 0.25
-        assert cfg.diagnostics.gradient_probe_interval == 1
-        assert cfg.diagnostics.gradient_imbalance_steps == 2
+        assert cfg.diagnostics.gradient_probe_interval == 50
+        assert cfg.diagnostics.gradient_imbalance_steps == 200
         assert cfg.preregistration == tmp_path / "prereg.json"
         assert cfg.runtime is None
 
-    def test_runtime_accepts_family_specific_candidates(self, tmp_path: Path) -> None:
+    def test_runtime_accepts_family_specific_token_budget(self, tmp_path: Path) -> None:
         cfg = te.load_config(_write_config(tmp_path, runtime=dict(_RUNTIME)))
         assert cfg.runtime is not None
-        # NOT the frozen E2 probe list — B_n candidates are config-driven.
-        assert cfg.runtime.token_budget_candidates == [4, 8]
+        # NOT a frozen E2 probe value — B_n is config-driven for this family.
+        assert cfg.runtime.token_budget == 4
 
     def test_rejects_wrong_family(self, tmp_path: Path) -> None:
         mapping = _config_mapping(tmp_path)
@@ -208,14 +188,26 @@ class TestLoadConfig:
         assert cfg.runtime is not None
         assert cfg.runtime.world_size == 0
 
-    def test_rejects_empty_candidates(self, tmp_path: Path) -> None:
-        runtime = dict(_RUNTIME, token_budget_candidates=[])
-        with pytest.raises(ValueError, match="token_budget_candidates"):
+    def test_rejects_non_positive_token_budget(self, tmp_path: Path) -> None:
+        runtime = dict(_RUNTIME, token_budget=0)
+        with pytest.raises(ValueError, match="token_budget"):
             te.load_config(_write_config(tmp_path, runtime=runtime))
 
-    def test_rejects_budget_mismatch(self, tmp_path: Path) -> None:
-        runtime = dict(_RUNTIME, reserve_seconds=999)
-        with pytest.raises(ValueError, match="stage budgets"):
+    def test_requires_total_runtime_budget(self, tmp_path: Path) -> None:
+        runtime = dict(_RUNTIME)
+        del runtime["total_budget_seconds"]
+        with pytest.raises(ValueError, match="total_budget_seconds"):
+            te.load_config(_write_config(tmp_path, runtime=runtime))
+
+    def test_rejects_runtime_stage_budget_sum_mismatch(self, tmp_path: Path) -> None:
+        runtime = dict(_RUNTIME, total_budget_seconds=71)
+        with pytest.raises(ValueError, match="stage budgets must sum"):
+            te.load_config(_write_config(tmp_path, runtime=runtime))
+
+    @pytest.mark.parametrize("retired_key", ["setup_probe_budget_seconds", "probe_warmup_steps"])
+    def test_rejects_retired_runtime_keys(self, tmp_path: Path, retired_key: str) -> None:
+        runtime = dict(_RUNTIME, **{retired_key: 1})
+        with pytest.raises(ValueError, match="unknown config keys"):
             te.load_config(_write_config(tmp_path, runtime=runtime))
 
     def test_missing_preregistration_key_rejected(self, tmp_path: Path) -> None:
@@ -226,10 +218,6 @@ class TestLoadConfig:
         with pytest.raises(ValueError, match="preregistration"):
             te.load_config(path)
 
-    def test_pack_dir_defaults_to_none(self, tmp_path: Path) -> None:
-        cfg = te.load_config(_write_config(tmp_path))
-        assert cfg.data.pack_dir is None
-
     def test_accepts_pack_dir(self, tmp_path: Path) -> None:
         mapping = _config_mapping(tmp_path)
         mapping["data"]["pack_dir"] = str(tmp_path / "token_pack")
@@ -238,75 +226,41 @@ class TestLoadConfig:
         cfg = te.load_config(path)
         assert cfg.data.pack_dir == tmp_path / "token_pack"
 
-    def test_rejects_legacy_egostitch_e2e_without_v2_contract(self, tmp_path: Path) -> None:
-        mapping = _config_mapping(tmp_path)
-        mapping["model"] = {"family": "egostitch_e2e", "config": dict(_E2E_TINY_MODEL)}
-        mapping["data"]["pack_dir"] = str(tmp_path / "token_pack")
-        del mapping["optim"]["warmstart_fraction"]
-        path = tmp_path / "config.yaml"
-        path.write_text(yaml.safe_dump(mapping))
-        with pytest.raises(ValueError, match="legacy egostitch_e2e v1 execution"):
-            te.load_config(path)
-
-    def test_egostitch_e2e_family_rejects_stage1_only_keys(self, tmp_path: Path) -> None:
-        mapping = _config_mapping(tmp_path)
-        mapping["model"] = {"family": "egostitch_e2e", "config": {"slots": 4}}
-        path = tmp_path / "config.yaml"
-        path.write_text(yaml.safe_dump(mapping))
-        with pytest.raises(ValueError, match="unknown E2E config keys"):
-            te.load_config(path)
-
-    def test_e2e_permanent_null_accepts_only_registered_values(self) -> None:
-        for value in ("none", "all_head", "content_head"):
-            assert E2EConfig.from_mapping({"permanent_null": value}).permanent_null == value
-        with pytest.raises(ValueError, match="permanent_null"):
-            E2EConfig.from_mapping({"permanent_null": "topo_head"})
-
 
 class TestParseArgs:
     def test_ddp_mode_requires_worker_flags(self, tmp_path: Path) -> None:
         with pytest.raises(SystemExit):
-            te.parse_args(["--config", str(tmp_path / "c.yaml"), "--ddp-mode", "probe"])
+            te.parse_args(["--config", str(tmp_path / "c.yaml"), "--ddp-mode", "train"])
 
-    def test_write_s0_manifest_flag(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("measurement_mode", ["probe", "epoch-probe"])
+    def test_measurement_ddp_modes_are_accepted(
+        self, tmp_path: Path, measurement_mode: str
+    ) -> None:
         args = te.parse_args(
-            ["--config", str(tmp_path / "c.yaml"), "--write-s0-manifest", str(tmp_path / "s0.tsv")]
+            [
+                "--config",
+                str(tmp_path / "c.yaml"),
+                "--ddp-mode",
+                measurement_mode,
+                "--pack-dir",
+                str(tmp_path / "pack"),
+                "--output-dir",
+                str(tmp_path / "out"),
+                "--token-budget-per-rank",
+                "4",
+                "--profile-output",
+                str(tmp_path / "profile.json"),
+            ]
         )
-        assert args.write_s0_manifest == tmp_path / "s0.tsv"
-        assert args.ddp_mode is None
+        assert args.ddp_mode == measurement_mode
+
+    def test_retired_init_probe_mode_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(SystemExit):
+            te.parse_args(["--config", str(tmp_path / "c.yaml"), "--ddp-mode", "init-probe"])
 
     def test_direct_training_entry_is_rejected(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="e2_pipeline"):
             te.main(["--config", str(_write_config(tmp_path))])
-
-    def test_s0_manifest_uses_detected_world_size(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        detected_world_size = 3
-        data = type(
-            "ManifestData",
-            (),
-            {"e_sup_positives": [], "val_pairs": [], "sampler": object()},
-        )()
-        captured: dict[str, object] = {}
-
-        monkeypatch.setattr(te, "detect_visible_gpu_count", lambda: detected_world_size)
-        monkeypatch.setattr(te, "assemble_egostitch_data", lambda *_args, **_kwargs: data)
-
-        def fake_build(*_args: object, **kwargs: object) -> int:
-            captured.update(kwargs)
-            return 0
-
-        monkeypatch.setattr(te, "build_s0_manifest", fake_build)
-        te.main(
-            [
-                "--config",
-                str(_write_config(tmp_path)),
-                "--write-s0-manifest",
-                str(tmp_path / "s0.tsv"),
-            ]
-        )
-        assert captured["world_size"] == detected_world_size
 
 
 # --------------------------------------------------------------------------- toy data bundle
@@ -351,13 +305,6 @@ def _toy_bundle(tmp_path: Path, model_cfg: EgoStitchConfig) -> te.EgoStitchData:
     val_pairs = [("n0", "n4"), ("n1", "n2"), ("n2", "n6"), ("n3", "n7")]
     val_labels = np.array([0, 1, 0, 0], dtype=np.int8)
 
-    # s0 cache over the full toy universe (guaranteed coverage).
-    s0 = te.S0Cache.__new__(te.S0Cache)
-    s0._logits = {}
-    for i, u in enumerate(_NODES):
-        for v in _NODES[i:]:
-            s0._logits[canonical_pair(u, v)] = 0.1 * (i + 1)
-
     return te.EgoStitchData(
         train_nodes=list(_NODES),
         e_sup_positives=e_sup,
@@ -369,101 +316,46 @@ def _toy_bundle(tmp_path: Path, model_cfg: EgoStitchConfig) -> te.EgoStitchData:
         train_pos={node: i for i, node in enumerate(_NODES)},
         target_builder=builder,
         sampler=sampler,
-        s0=s0,
         rho_train=float(g.number_of_edges() / 36.0),
     )
 
 
 def _toy_cfg(tmp_path: Path) -> te.EgoConfig:
     (tmp_path / "prereg.json").write_text('{"registration_id": "toy"}\n')
-    return te.load_config(_write_config(tmp_path))
-
-
-class TestRegistrationRunMode:
-    def test_historical_frozen_s0_worker_accepts_registration_without_status(
-        self, tmp_path: Path
-    ) -> None:
-        cfg = _toy_cfg(tmp_path)
-        formal_cfg, is_debug, _ = te.prepare_ddp_run_config(cfg, max_steps=None)
-        assert formal_cfg == cfg
-        assert is_debug is False
-
-    def test_formal_e2e_worker_refuses_registration_without_binding_status(
-        self, tmp_path: Path
-    ) -> None:
-        cfg = _toy_cfg(tmp_path)
-        e2e_cfg = replace(cfg, model=replace(cfg.model, family="egostitch_e2e"))
-        with pytest.raises(te.PreregistrationNotBinding, match="status == 'BINDING'"):
-            te.prepare_ddp_run_config(e2e_cfg, max_steps=None)
-
-    def test_formal_e2e_worker_refuses_unresolved_binding_marker(self, tmp_path: Path) -> None:
-        cfg = _toy_cfg(tmp_path)
-        cfg.preregistration.write_text(
-            json.dumps(
-                {
-                    "status": "BINDING",
-                    "frozen_inputs": {"b0cal_results": {"sha256": "REQUIRED-BEFORE-BINDING"}},
-                }
-            )
-        )
-        e2e_cfg = replace(cfg, model=replace(cfg.model, family="egostitch_e2e"))
-
-        with pytest.raises(te.PreregistrationNotBinding, match="marker to be resolved"):
-            te.prepare_ddp_run_config(e2e_cfg, max_steps=None)
-
-    def test_formal_e2e_worker_accepts_resolved_binding_registration(self, tmp_path: Path) -> None:
-        cfg = _toy_cfg(tmp_path)
-        cfg.preregistration.write_text(
-            json.dumps(
-                {
-                    "status": "BINDING",
-                    "frozen_inputs": {"b0cal_results": {"sha256": "a" * 64}},
-                    "cost_report": {"measured": {"profile_sha256": "b" * 64}},
-                }
-            )
-        )
-        e2e_cfg = replace(cfg, model=replace(cfg.model, family="egostitch_e2e"))
-
-        prepared, is_debug, _ = te.prepare_ddp_run_config(e2e_cfg, max_steps=None)
-        assert prepared == e2e_cfg
-        assert is_debug is False
-
-    def test_active_e2e_config_uses_current_training_contract(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        cfg = te.load_config(root / "configs/egostitch_e2e_breadth_first.yaml")
-        assert cfg.model.family == "egostitch_e2e"
-        assert cfg.training == te.EgoStitchTrainingConfig()
-        assert cfg.training.pair_encoder_clip_norm == 3.0
-        assert cfg.training.generator_clip_norm == 3.0
-        assert cfg.training.clip_norm == 1.0
-        registration = json.loads(cfg.preregistration.read_text(encoding="utf-8"))
-        registered_groups = registration["training_contract"]["optimizer_groups"]
-        assert registered_groups["pair_encoder_head"]["grad_clip_l2"] == 3.0
-        assert registered_groups["generator"]["grad_clip_l2"] == 3.0
-        assert registered_groups["topology_content_conditioning"]["grad_clip_l2"] == 1.0
-
-    def test_debug_worker_redirects_and_marks_nonformal(self, tmp_path: Path) -> None:
-        cfg = _toy_cfg(tmp_path)
-
-        debug_cfg, is_debug, _ = te.prepare_ddp_run_config(cfg, max_steps=5)
-
-        assert is_debug is True
-        assert debug_cfg.output_dir == tmp_path / "out_debug"
-        assert debug_cfg.output_dir != cfg.output_dir
-        data = _toy_bundle(tmp_path, EgoStitchConfig.from_mapping(cfg.model.config))
-        te.write_run_start_metadata(debug_cfg, data, world_size=1, debug=True)
-        metadata = json.loads((debug_cfg.output_dir / "run_metadata.json").read_text())
-        assert metadata["run_kind"] == "debug"
-        assert metadata["formal_artifacts_published"] is False
-        assert not (cfg.output_dir / "run_metadata.json").exists()
-
-    def test_orchestrator_selected_debug_root_is_not_redirected_again(self, tmp_path: Path) -> None:
-        cfg = _toy_cfg(tmp_path)
-        prepared, is_debug, _ = te.prepare_ddp_run_config(
-            replace(cfg, output_dir=tmp_path / "out_debug"), max_steps=1
-        )
-        assert is_debug is True
-        assert prepared.output_dir == tmp_path / "out_debug"
+    return te.EgoConfig(
+        model=te.ModelConfig(family="egostitch_e2e", config=dict(_E2E_TINY_MODEL)),
+        data=te.EgoDataConfig(
+            root=tmp_path / "data",
+            strategy="toy",
+            train_positives="e_sup",
+            negative_ratio=5,
+            partition_seed=0,
+            msg_fraction=0.8,
+            node_batch=4,
+            edge_batch=6,
+            f0_cache=tmp_path / "f0.pt",
+            grounding_cache=tmp_path / "grounding.npz",
+            expected_missing_features=[],
+            pack_dir=tmp_path / "token_pack",
+        ),
+        optim=te.EgoOptimConfig(
+            lr=1e-4, weight_decay=0.01, epochs=2, warmup_steps=2, grad_clip=1.0
+        ),
+        diagnostics=te.EgoDiagnosticsConfig(
+            gradient_probe_interval=1,
+            gradient_imbalance_ratio=10.0,
+            gradient_imbalance_steps=2,
+            probe_s1_abs_mean_max=1000.0,
+            selection_auprc_tolerance=0.02,
+            topk_fraction=0.25,
+        ),
+        eval=te.EvalConfig(patience=2, eval_every=1),
+        seed=0,
+        output_dir=tmp_path / "out",
+        mixed_precision="no",
+        preregistration=tmp_path / "prereg.json",
+        training=te.EgoStitchTrainingConfig(),
+    )
 
 
 # --------------------------------------------------------------------------- streams
@@ -523,200 +415,3 @@ class TestEnumerateEdgeStream:
 
     def test_epochs_differ(self) -> None:
         assert self._rows(1, 0, 2) != self._rows(2, 0, 2)
-
-
-class TestS0Manifest:
-    def test_manifest_covers_every_stream_pair(self, tmp_path: Path) -> None:
-        cfg = _toy_cfg(tmp_path)
-        model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
-        data = _toy_bundle(tmp_path, model_cfg)
-        manifest_path = tmp_path / "s0_manifest.tsv"
-        n_unique = te.build_s0_manifest(
-            cfg, data.e_sup_positives, data.val_pairs, data.sampler, manifest_path, world_size=2
-        )
-        listed = {
-            tuple(line.split("\t")) for line in manifest_path.read_text().strip().splitlines()
-        }
-        assert n_unique == len(listed)
-        for epoch in range(1, cfg.optim.epochs + 1):
-            for rank in range(2):
-                for u, v, _ in te.enumerate_edge_stream(
-                    data.e_sup_positives,
-                    data.sampler,
-                    negative_ratio=cfg.data.negative_ratio,
-                    seed=cfg.seed,
-                    epoch=epoch,
-                    rank=rank,
-                    world_size=2,
-                ):
-                    assert canonical_pair(u, v) in listed
-        for u, v in data.val_pairs:
-            assert canonical_pair(u, v) in listed
-
-
-class TestS0Cache:
-    def test_checkpoint_mismatch_raises(self, tmp_path: Path) -> None:
-        from tests.test_g1_hardened_e2 import _write_universe_npz
-
-        pairs = [("n0", "n1"), ("n1", "n2")]
-        path = tmp_path / "s0.npz"
-        _write_universe_npz(
-            path,
-            node_ids=_NODES,
-            pairs=pairs,
-            logits=np.array([0.5, -0.5], dtype=np.float32),
-            labels=np.array([1, 0], dtype=np.int8),
-        )
-        with pytest.raises(ValueError, match="checkpoint_id"):
-            te.S0Cache.from_path(path, expected_checkpoint_id="0000000000000000")
-
-    def test_lookup_and_hard_miss(self, tmp_path: Path) -> None:
-        from tests.test_g1_hardened_e2 import _write_universe_npz
-
-        pairs = [("n0", "n1"), ("n1", "n2")]
-        path = tmp_path / "s0.npz"
-        _write_universe_npz(
-            path,
-            node_ids=_NODES,
-            pairs=pairs,
-            logits=np.array([0.5, -0.5], dtype=np.float32),
-            labels=np.array([1, 0], dtype=np.int8),
-        )
-        cache = te.S0Cache.from_path(path, expected_checkpoint_id="deadbeefcafefeed")
-        np.testing.assert_allclose(cache.lookup([("n1", "n0")]), [0.5])
-        with pytest.raises(KeyError, match="missing pair"):
-            cache.lookup([("n0", "n7")])
-
-
-class TestEpochStepPlan:
-    def test_rows_and_steps(self) -> None:
-        rows, steps = te._epoch_step_plan(10, negative_ratio=2, edge_batch=6, world_size=4)
-        assert rows == [9, 9, 6, 6]  # ceil splits of 10 positives x (1 + 2)
-        assert steps == 2
-
-    def test_global_count_tail(self) -> None:
-        rows = [9, 9, 6, 6]
-        assert te._step_global_count(rows, 0, 6) == 24
-        assert te._step_global_count(rows, 1, 6) == 6
-        assert te._step_global_count(rows, 2, 6) == 0
-
-
-class TestRegisteredDiagnostics:
-    def test_gradient_imbalance_activates_only_after_persistence(self) -> None:
-        monitor = te._GradientImbalanceMonitor(ratio=10.0, required_steps=100, interval=50)
-        norms = {"edge": 100.0, "recon": 1.0, "real": 1.0, "ssl": 1.0}
-        assert monitor.update(50, norms) is False
-        assert monitor.update(100, norms) is True
-        assert monitor.activated_step == 100
-
-    def test_probe_scale_guard_fails_on_synthetic_broken_kernel(self) -> None:
-        with pytest.raises(RuntimeError, match="pathological Stage-1 membership scale"):
-            te._enforce_probe_s1_scale(1.2e7, 1.0e3)
-
-
-# --------------------------------------------------------------------------- loop smoke
-
-
-class TestTrainLoop:
-    def _run(self, tmp_path: Path) -> tuple[te.EgoConfig, te.EgoStitchData, te.EgoTrainResult]:
-        torch.manual_seed(0)
-        cfg = _toy_cfg(tmp_path)
-        model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
-        data = _toy_bundle(tmp_path, model_cfg)
-        model = EgoStitchStage1(model_cfg)
-        accelerator = Accelerator(mixed_precision="no", cpu=True)
-        result = te.train_egostitch_ddp_loop(
-            model, cfg, data, accelerator, node_batch=cfg.data.node_batch
-        )
-        return cfg, data, result
-
-    def test_history_and_profile_contract(self, tmp_path: Path) -> None:
-        cfg, _, result = self._run(tmp_path)
-        assert [int(cast(float, row["epoch"])) for row in result.history] == [1, 2]
-        assert all("auprc" in row and "loss_total" in row for row in result.history)
-        assert all("fidelity" in row for row in result.history)
-        assert any(row["gradient_norm_probes"] for row in result.history)
-        assert "kendall_fallback" in result.runtime_profile
-        # The orchestrator-validated schema accepts this profile verbatim.
-        profile = _validate_worker_profile(
-            result.runtime_profile, epochs=cfg.optim.epochs, world_size=1, memory_limit_gib=85.0
-        )
-        assert profile["feature_cache_hit_rate"] == 1.0
-
-    def test_write_outputs_payload_contract(self, tmp_path: Path) -> None:
-        cfg, data, result = self._run(tmp_path)
-        te.write_run_start_metadata(cfg, data, world_size=1)
-        started = json.loads((cfg.output_dir / "run_metadata.json").read_text())
-        assert started["status"] == "started"
-        assert started["seed"] == cfg.seed
-        assert started["world_size"] == 1
-        te.write_outputs(result, cfg, data)
-        payload = torch.load(cfg.output_dir / "best.pt", weights_only=False)
-        assert set(payload) == {
-            "model_state",
-            "model_family",
-            "model_config",
-            "epoch",
-            "val_metrics",
-            "seed",
-            "config",
-        }
-        assert payload["model_family"] == "egostitch"
-        rows = [
-            json.loads(line) for line in (cfg.output_dir / "metrics.jsonl").read_text().splitlines()
-        ]
-        assert [row["epoch"] for row in rows] == [1, 2]
-        assert all("fidelity" in row and "gradient_norm_probes" in row for row in rows)
-        metadata = json.loads((cfg.output_dir / "run_metadata.json").read_text())
-        assert metadata["status"] == "complete"
-        assert metadata["started_at"] == started["started_at"]
-        assert metadata["preregistration_sha256"] == te._sha256_file(cfg.preregistration)
-        assert metadata["s0_checkpoint_id"] == "deadbeefcafefeed"
-        assert metadata["rho_train"] == data.rho_train
-
-    def test_preregistration_snapshot_survives_later_file_replacement(self, tmp_path: Path) -> None:
-        cfg, data, result = self._run(tmp_path)
-        snapshot = te._preregistration_snapshot(cfg.preregistration)
-        cfg.preregistration.write_text('{"registration_id": "changed"}\n')
-        te.write_run_start_metadata(cfg, data, world_size=1, preregistration_sha256=snapshot.sha256)
-        te.write_outputs(result, cfg, data)
-        completed = json.loads((cfg.output_dir / "run_metadata.json").read_text())
-        assert completed["preregistration_sha256"] == snapshot.sha256
-
-    def test_run_start_metadata_records_the_bound_feature_stats_digest(
-        self, tmp_path: Path
-    ) -> None:
-        cfg, data, _ = self._run(tmp_path)
-        digest = "ab" * 32
-        te.write_run_start_metadata(cfg, data, world_size=1, feature_stats_sha256=digest)
-        started = json.loads((cfg.output_dir / "run_metadata.json").read_text())
-        assert started["feature_stats_sha256"] == digest
-
-    def test_run_start_metadata_defaults_feature_stats_digest_to_empty(
-        self, tmp_path: Path
-    ) -> None:
-        cfg, data, _ = self._run(tmp_path)
-        te.write_run_start_metadata(cfg, data, world_size=1)
-        started = json.loads((cfg.output_dir / "run_metadata.json").read_text())
-        assert started["feature_stats_sha256"] == ""
-
-    def test_batch_factory_deterministic(self, tmp_path: Path) -> None:
-        cfg = _toy_cfg(tmp_path)
-        model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
-        data = _toy_bundle(tmp_path, model_cfg)
-        rows, steps = te._epoch_step_plan(
-            len(data.e_sup_positives),
-            negative_ratio=cfg.data.negative_ratio,
-            edge_batch=cfg.data.edge_batch,
-            world_size=1,
-        )
-
-        def first_batch() -> te._CompositeBatch:
-            factory = te._BatchFactory(cfg, model_cfg, data, node_batch=4, rank=0, world_size=1)
-            return next(iter(factory.epoch_batches(1, rows_per_rank=rows, steps=steps)))
-
-        a, b = first_batch(), first_batch()
-        torch.testing.assert_close(a.node["x"], b.node["x"])
-        torch.testing.assert_close(a.edge["s0"], b.edge["s0"])
-        torch.testing.assert_close(a.node["null_mode"], b.node["null_mode"])
-        assert a.edge_rows_global == b.edge_rows_global

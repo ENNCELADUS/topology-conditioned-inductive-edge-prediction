@@ -33,7 +33,7 @@ from typing import Any, TypeVar, cast
 import numpy as np
 import torch
 import torch.nn as nn
-import yaml  # type: ignore[import-untyped]
+import yaml  # type: ignore[import-untyped,unused-ignore]
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import broadcast_object_list, set_seed
 from torch.utils.data import DataLoader, Sampler
@@ -170,7 +170,7 @@ class RuntimeConfig:
     pack_workers: int
     loader_workers_per_rank: int
     prefetch_factor: int
-    token_budget_candidates: list[int]
+    token_budget: int
     max_pairs_per_rank: int
     memory_limit_gib: float
     total_budget_seconds: int
@@ -275,12 +275,6 @@ def _as_str_list(value: object, name: str) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError(f"config key '{name}' must be a list of strings, got {value!r}")
     return cast(list[str], value)
-
-
-def _as_int_list(value: object, name: str) -> list[int]:
-    if not isinstance(value, list) or not all(isinstance(item, int) for item in value):
-        raise ValueError(f"config key '{name}' must be a list of integers")
-    return [int(item) for item in value]
 
 
 def _check_no_unknown_keys(
@@ -409,7 +403,7 @@ def load_config(path: Path) -> Config:
             "pack_workers",
             "loader_workers_per_rank",
             "prefetch_factor",
-            "token_budget_candidates",
+            "token_budget",
             "max_pairs_per_rank",
             "memory_limit_gib",
             "total_budget_seconds",
@@ -441,9 +435,9 @@ def load_config(path: Path) -> Config:
                 _require(runtime_raw, "prefetch_factor", "runtime."),
                 "runtime.prefetch_factor",
             ),
-            token_budget_candidates=_as_int_list(
-                _require(runtime_raw, "token_budget_candidates", "runtime."),
-                "runtime.token_budget_candidates",
+            token_budget=_as_int(
+                _require(runtime_raw, "token_budget", "runtime."),
+                "runtime.token_budget",
             ),
             max_pairs_per_rank=_as_int(
                 _require(runtime_raw, "max_pairs_per_rank", "runtime."),
@@ -501,8 +495,8 @@ def load_config(path: Path) -> Config:
                 f"runtime stage budgets must sum to {runtime.total_budget_seconds}; "
                 f"got {stage_total}"
             )
-        if runtime.token_budget_candidates != [262144, 524288, 1048576, 1572864]:
-            raise ValueError("runtime.token_budget_candidates must match the frozen E2 probe set")
+        if runtime.token_budget <= 0:
+            raise ValueError("runtime.token_budget must be positive")
 
     return Config(
         model=model,

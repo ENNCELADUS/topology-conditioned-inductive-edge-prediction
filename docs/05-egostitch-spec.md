@@ -518,9 +518,12 @@ with per-epoch order shuffling but no negative resampling.
 
 The formal E2 B0 V3.1 run uses all visible NVIDIA H20 GPUs. The runner validates
 that at least one H20 is visible, automatically detects the count `N`, exports those
-devices, and launches `accelerate launch --num_processes N`. A cold acceptance run includes first BF16
-feature-pack construction, bounded batch probes, exactly 30 epochs, validation after
-every epoch, and final artifacts. The complete interval must be at most 60 minutes.
+devices, and launches `accelerate launch --num_processes N`. Its production
+orchestrator is `pack → train → publish`: a cold acceptance run includes first BF16
+feature-pack construction, exactly 30 epochs, validation after every epoch, and final
+artifacts. The retained `probe`/`epoch-probe` worker dispatch entries are
+non-publishing measurement-only paths, not production orchestration stages; the
+projection stage is deleted. The complete interval must be at most 60 minutes.
 
 Each rank owns one model/optimizer replica and one complete GPU-resident BF16 feature
 table. DataLoader workers transfer compact endpoint indices only. Training and
@@ -529,6 +532,45 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-30: bound qualification exposure to the exact immutable attempt set.
+  Each trained arm's `attempt_history.json` uses schema
+  `egostitch_e2e_qualification_history_v1`; before v4 may bind,
+  `binding_evidence.qualification_history_indexes` maps exactly the six trained
+  arms to path-and-SHA-256 references for those files, and
+  `binding_evidence.qualification_attempts` maps the same arms to non-empty lists
+  exactly equal to each referenced index's complete `attempts` array. This closes
+  omission and stale-index routes in the cumulative `V_hold` evaluation count K;
+  it changes no acceptance threshold and authorizes no execution.
+- 2026-07-29 (second entry): recorded deviation from the two-stage cleanup
+  design's §4 delete list. Two items on that list were deliberately **kept**;
+  both retentions are load-bearing rather than oversights, and neither was
+  documented when it landed.
+  - **`_PROBE_DISPATCH_MODES` is retained** (`train_egostitch.py:1361`,
+    `("probe", "epoch-probe")`), and with it `--ddp-mode epoch-probe`
+    (`DDP_MODES`, `train_b0.py:74`). It is the exemption clause in
+    `_bind_feature_standardization` (`train_egostitch.py:5918`) and is
+    therefore the only remaining way to *measure* `feature_stats_sha256`
+    before any stage has recorded it. §13.19.4's formal preflight compares the
+    formal run's computed digest against the one the qualification stage
+    wrote, so the digest must be observable from a dispatch that builds no
+    checkpoint, writes no run-start metadata, and publishes no artifact.
+    Without the exemption the pin requirement would apply to a mode that
+    cannot satisfy it, and the qualification stage — where the digest is born
+    — would need it as a config input, which is precisely the circularity the
+    two-stage ladder removes. The rest of §4's probe list was deleted as
+    designed: `--ddp-mode init-probe`, `_run_init_probe`,
+    `select_probe_result`, `conservative_e2e_epoch_seconds`, and
+    `project_total_seconds` no longer exist in `src/`.
+  - **`runtime.total_budget_seconds` is retained** as a required
+    `RuntimeConfig` key (`train_egostitch.py:524`, `:560`; `train_b0.py:181`)
+    together with the invariant that the per-stage budgets sum to it exactly
+    (`train_egostitch.py:603`). What §4 deleted is the *projection sub-stage*
+    that consumed it, not the wall-clock budget declaration; all six v3 arm
+    configs and `b0_v31_breadth_first.yaml` still pin it, and the sum
+    invariant is the only remaining check that a config's stage budgets are
+    internally coherent.
+  Implementation-level only: no verdict inequality, registration status,
+  binding threshold, or data-contract quantity changes in this entry.
 - 2026-07-29: two-stage cleanup rewrite (design:
   `docs/superpowers/specs/2026-07-29-egostitch-e2e-two-stage-cleanup.md`, r2;
   owner-decided via grill-me interview). §9.3, §13.12, §13.19.1, §13.19.3,
@@ -669,10 +711,11 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   this family; the measured P0.2 curve rejected the reranker and left
   protocol §0 untouched); 6a-v3/6e-v1 controls; the eight-arm v3 screen
   schema with full provenance migration and artifact version bumps;
-  Π-consistency v2; and the two-stage V_fit-calibrate → V_qual-rehearsal
-  qualification gates. Authorizes implementation only; execution requires a
-  fresh BINDING v3 registration. The completed v2 screen's record (§13.19,
-  five-arm schema, `n_g = 20`) is unchanged as history.
+  Π-consistency v2; and the then-proposed V_fit-calibrate → V_qual-rehearsal
+  qualification gates, superseded by the 2026-07-29 two-stage cleanup entry above.
+  The completed v2 screen's record (§13.19, four trained checkpoints plus one
+  scoring-time control, `n_g = 20`) is unchanged as history; current formal execution
+  instead requires an owner-promoted BINDING v4 registration.
 - 2026-07-24: gate-side telemetry shape fix. The §13.17 registered names
   `grad_rms_trunk`/`grad_rms_ste`/`grad_rms_content` are published by the
   worker nested under `submodule_gradient_rms` per fixed-replay gradient row;
@@ -1343,15 +1386,20 @@ remains the recorded contract of the completed v2 screen.
 §11's 60-minute cold-run pin applies to the formal E2 B0 V3.1 run only. The
 EgoStitch worker uses the same automatically detected H20 count and
 `accelerate launch --num_processes N` layout, the same runtime-profile and checkpoint payload schemas, and a
-**config-driven** budget (`runtime.total_budget_seconds`; stage budgets must sum).
+**config-driven** budget. `runtime.total_budget_seconds` is retained only as the
+sum invariant for the remaining stage budgets; it does not authorize a projection
+or probe sub-stage.
 This family's generic pack stage has **two required, independently cold/warm
 validated packs**: (1) the F0 pooled matrix + grounding-pool cache at
 `runtime.pack_dir`; and (2) the raw-token BF16 pack at `data.pack_dir`. A cold run
-builds either missing pack before probes; a warm run validates both against the
+builds either missing pack before training; a warm run validates both against the
 same frozen source feature manifests. Both manifest payloads and both manifest
 SHA-256 identities are embedded in pipeline/run evidence. A worker may not reach
-probe/train with only one pack present. The orchestrator's probe/projection gating
-applies against the configured budget.
+training with only one pack present. The production two-stage orchestrator is
+`pack → train → publish`; projection is deleted. The retained
+`probe`/`epoch-probe` dispatch entries may use validated packs only to measure
+pre-run `feature_stats_sha256`; they publish no checkpoint or formal artifact and
+are not orchestrator stages.
 
 ### 13.14 Stage-gate comparators and pre-registration
 
@@ -1573,13 +1621,14 @@ protocol (CLAUDE.md Integrity gates).
 
 ### 13.19 E2E stability-screen replacement (v2; prospective)
 
-**Scope note (2026-07-25; §14.4.7 pointer corrected 2026-07-29):** §13.19
-remains the completed v2 screen's binding record. For the rev-3.1 build, §14.4
-supersedes §13.19.1's Phase-A `pair_only` curriculum; §14.4.7 follows
-§13.19.4's two-stage qualification/formal ladder unchanged and retires the
-calibrate/rehearse pre-binding gates this note originally pointed to; every
-other §13.19 guard, eligibility, and binding rule carries forward unless
-§14.4 states otherwise.
+**Scope note (2026-07-25; §14.4.7 pointer corrected 2026-07-29; retired-ladder
+reference removed 2026-07-29):** §13.19 remains the completed v2 screen's
+binding record. For the rev-3.1 build, §14.4 supersedes §13.19.1's Phase-A
+`pair_only` curriculum; §14.4.7 follows §13.19.4's two-stage
+qualification/formal ladder unchanged, and the pre-binding gate list this note
+originally pointed to is retired together with the five-stage ladder that gated
+it (§12, 2026-07-29); every other §13.19 guard, eligibility, and binding rule
+carries forward unless §14.4 states otherwise.
 
 **Evidence and version boundary.** The v1 `full` arm completed the engineering
 `pack -> probe -> train -> publish` pipeline, but the selected checkpoint came from
@@ -1732,16 +1781,20 @@ any of the following occurs:
 reference is measured after the final warm-start optimizer step in evaluation mode
 and must itself be finite and at least `1e-4`.
 
-The `0.1`/`0.001` clip-coefficient and `50` imbalance thresholds remained DRAFT until
-the passing rehearsal recorded their empirical distribution; the 2026-07-22 completed
-replacement rehearsal recorded it (per-group clip-coefficient `p1`
-`0.1100`/`0.0281`/`0.5187` for `pair_encoder_head`/`generator`/
-`topology_content_conditioning`). Binding requires the calibrated per-group
-clip-coefficient `p1` floors `pair_encoder_head > 0.04`, `generator > 0.01`,
-`topology_content_conditioning > 0.15` (an unlisted group defaults to the
-scaffold-era `0.12`), minimum `> 0.0012`, and longest consecutive run below `0.1`
-shorter than 10 steps; the per-group family-ratio `p99` must be `< 40`. Changing a
-threshold after binding is a scientific change.
+The `0.1`/`0.001` clip-coefficient and `50` imbalance thresholds were DRAFT until a
+completed full-schedule run recorded their empirical distribution. The 2026-07-22 run
+recorded it, under the five-stage ladder retired on 2026-07-29 (§12): per-group
+clip-coefficient `p1` `0.1100`/`0.0281`/`0.5187` for `pair_encoder_head`/`generator`/
+`topology_content_conditioning`. Those measured values stand as recorded; the
+two-stage ladder does not re-derive them and no stage of it may. Binding requires the
+calibrated per-group clip-coefficient `p1` floors `pair_encoder_head > 0.04`,
+`generator > 0.01`, `topology_content_conditioning > 0.15` (an unlisted group defaults
+to the scaffold-era `0.12`), minimum `> 0.0012`, and longest consecutive run below
+`0.1` shorter than 10 steps; the per-group family-ratio `p99` must be `< 40`. These
+floors are checked by `validate_e2e_qualification_profile` at the **formal** stage
+(§13.19.4 item 2), which is the repo's only clip-coefficient / family-ratio /
+submodule-RMS margin gate; the qualification stage does not evaluate them, because its
+verdict is guards-only. Changing a threshold after binding is a scientific change.
 
 No `best.pt`, `complete.json`, candidate scores, or gate input may be published from
 an aborted run. `last.pt`, when available, is diagnostic-only and is stored beneath a
@@ -1888,9 +1941,10 @@ iteration a fast development loop; it is not a scientific gate, and its
    `run_kind != "formal"`, which left the formal stage unguarded (the check
    that matters was never applied to the run it matters for) while forcing
    qualification into a separate sanitized-root sandbox merely to run at
-   all. Both stages therefore run against the same repo data root; the
-   guard raises before the first step if any candidate, test, or
-   `test_graph.pkl` path is present, regardless of stage. The access log
+   all. Both stages therefore run against the same repo data root; candidate,
+   test, and `test_graph.pkl` paths may be present, but the guard raises before
+   any attempted open — including through an alias or symlink — regardless of
+   stage. The access log
    proves: training endpoints are in `V_fit`; no `V_hold` (`V_qual` or
    `V_select`) feature row is read by a training step even if a shared pack
    exists; the training structural-target edge digest is exactly
@@ -1918,7 +1972,13 @@ iteration a fast development loop; it is not a scientific gate, and its
    its own `HEAD` either equals that commit or is a clean descendant of it
    through commits touching only `docs/registrations/` paths — the
    registration cannot record its own promotion commit's hash, so exact-HEAD
-   equality alone is mechanically impossible. (Historical §13.19.4 numbering:
+   equality alone is mechanically impossible. Qualification exposure is also
+   exact-set bound: `qualification_history_indexes` maps exactly the six trained
+   arms to `{path, sha256}` references for per-arm `attempt_history.json` files
+   with schema `egostitch_e2e_qualification_history_v1`, matching arm identity,
+   and a non-empty `attempts` list; `qualification_attempts` maps the same exact
+   arms and equals each referenced index's complete `attempts` array exactly.
+   (Historical §13.19.4 numbering:
    item-5; §12 change-log, 2026-07-23 binding-mechanics amendment.)
 
 **Checkpoint eligibility is retained in full and is not weakened by "guards
@@ -1945,8 +2005,9 @@ compute exposure, not the eight-arm scientific comparison (§14.4.6: six trained
 plus the two scoring-time controls `6a-v3`/`6e-v1`) or its verdict inequalities.
 An E2E candidate/test scoring entry point must reject a DRAFT/debug checkpoint and
 must verify the BINDING registration, formal/complete/eligible run metadata, arm-config
-path, and registration/config/checkpoint hashes. The v2 config path in each formal run
-must exactly equal `arms.<arm>.training`; v1 configs are historical reproduction only.
+path, and registration/config/checkpoint hashes. The registered config path in each
+formal run must exactly equal `arms.<arm>.training`; v1/v2 configs are historical
+reproduction only.
 
 #### 13.19.6 Binding acceptance matrix
 
@@ -2057,13 +2118,14 @@ cache is retired for this family.
    **Satisfied 2026-07-17:** §5/§13 rewritten (change-log entry); §13.18 landed
    with the defaults, `permanent_null` overrides, `shuffle_within_pair` control,
    and registration-status enforcement.
-3. Fresh registration with the five-arm Stage-1 scope (full, `B0-e2e`/f-only,
-   pair+topology, within-pair `Â`/`Π` shuffle, `p = 0`), the four-logit decomposition
+3. Fresh v4 registration with the eight-arm scope in §14.4.6 (six trained
+   checkpoints plus two scoring-time controls), the four-logit decomposition
    report, the representation-probe protocol (degree / ego density / clustering +
    degree-partialled + Π-consistency, frozen-encoder linear probes on held-out
    message-partition nodes), the pathway-attribution decision rule, and a measured
    H20 cost re-estimate (the 673 s / 2.04 GiB frozen-s0 Stage-1 profile does not
-   extrapolate; budget class is the E2 B0 run).
+   extrapolate; budget class is the E2 B0 run). The v4 registration is currently
+   `DRAFT`; only the owner may promote a fully resolved successor content state.
 4. Implementation plan:
    `docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md`
    (B0.py untouched; conditioned trunk subclass; train-mask ≡ eval-bypass and
@@ -2231,7 +2293,8 @@ pools), `no_l_rel` (identical to `full` except `w_rel = 0`) — plus two
 scoring-time controls over `full`'s checkpoint: `6a-v3`, `6e-v1`. Every
 formal-arm constant, binding-evidence validator, scoring CLI/provenance enum,
 run-metadata schema field, and test fixture migrates to this schema and
-fails closed on the v2 five-arm shape. Artifact version bumps:
+fails closed on the predecessor's four-trained-checkpoint-plus-one-control shape.
+Artifact version bumps:
 `egostitch_e2e_probe_v2`; the scores-`.npz` meta version increments; old
 versions are rejected.
 
@@ -2257,8 +2320,8 @@ BFS-macro GS/RD dominance at matched global RD, plus the AUPRC and degree-MMD
 guards), re-pinned as registration v4. The prior five-item frozen-gate
 pre-binding margin list (slot recall, Π-consistency v2, degree-partialled
 clustering R², the 6a-v3 clustering-MMD movement check, and the matched
-edge-AUPRC guard) and its implementing module are retired with the
-calibrate→freeze→rehearse machinery they gated; the probes above remain
+edge-AUPRC guard) and its implementing module are retired together with the
+five-stage ladder they gated (§12, 2026-07-29); the probes above remain
 reported, but nothing in this ladder re-admits them as binding checks.
 
 #### 14.4.8 Telemetry and abort rules

@@ -8,7 +8,6 @@ import math
 import pickle
 import weakref
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -26,7 +25,6 @@ from src.data.feature_stats import (
     FeatureStats,
     compute_feature_stats,
     feature_stats_for_universe,
-    load_feature_stats,
     node_ids_sha256,
 )
 from src.data.packed_features import (
@@ -39,6 +37,7 @@ from src.data.packed_features import (
     write_packed_manifest,
 )
 from src.data.pairs import NegativeSampler
+from src.eval.edge_metrics import EdgeMetrics
 from src.model.egostitch import EgoStitchConfig
 from src.model.egostitch import e2e_model as e2e_module
 from src.model.egostitch.conditioning import GatedCrossAttention, HeadNullMasks
@@ -51,6 +50,7 @@ from tests.test_train_egostitch import _E2E_TINY_MODEL, _NODES, _toy_bundle, _to
 pytestmark = pytest.mark.unit
 
 _TOKEN_DIM = 1536
+_E2E_PIPELINE_N_GROUND = 3
 
 # Transcribed verbatim from the `fidelity` dict built in `_validate_epoch`'s e2e
 # branch (`src/train_egostitch.py`): the 8 top-level keys, the 5
@@ -75,6 +75,29 @@ _EXPECTED_FIDELITY_KEYS = {
     "plan_rank1_marginal_residual",
     "topology_delta_degree_correlation",
 }
+
+
+def _flat_edge_metrics() -> EdgeMetrics:
+    """Uniform, finite edge metrics for stubbed `_validate_epoch` returns.
+
+    Nothing under test reads these; the stubs' signal lives in `fidelity`.
+    """
+    return EdgeMetrics(
+        auroc=0.7,
+        auprc=0.3,
+        accuracy=0.7,
+        sensitivity=0.7,
+        specificity=0.7,
+        precision=0.7,
+        recall=0.7,
+        f1=0.7,
+        mcc=0.4,
+        ece=0.1,
+        brier=0.1,
+        threshold=0.5,
+        n_pos=2,
+        n_neg=2,
+    )
 
 
 def _write_tiny_token_pack(pack_dir: Path, nodes: list[str], *, min_length: int = 2) -> None:
@@ -146,8 +169,6 @@ class TestBatchFactoryE2E:
         )
         degrees = {node: int(graph.degree(node)) for node in nodes}
         sampler = NegativeSampler(nodes, degrees, frozenset(graph.edges()))
-        s0 = te.S0Cache.__new__(te.S0Cache)
-        s0._logits = {}
         data = te.EgoStitchData(
             train_nodes=nodes,
             e_sup_positives=[(nodes[0], nodes[1]), (nodes[0], nodes[2])],
@@ -165,7 +186,6 @@ class TestBatchFactoryE2E:
                 slots=model_cfg.slots,
             ),
             sampler=sampler,
-            s0=s0,
             rho_train=float(graph.number_of_edges() / (len(nodes) * (len(nodes) - 1) / 2)),
         )
         pack_dir = tmp_path / f"target-pack-{rank}"
@@ -318,7 +338,7 @@ class TestBatchFactoryE2E:
 
     def test_edge_batch_carries_token_streams_in_stream_order(self, tmp_path: Path) -> None:
         cfg = _toy_cfg(tmp_path)
-        model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
+        model_cfg = replace(EgoStitchConfig(), n_ground=7)
         data = _toy_bundle(tmp_path, model_cfg)
         pack_dir = tmp_path / "token_pack"
         _write_tiny_token_pack(pack_dir, _NODES)
@@ -387,16 +407,16 @@ class TestBatchFactoryE2E:
         torch.testing.assert_close(data.f0[batch.edge["ground_id_i"]], batch.edge["ground_i"])
 
     def test_requires_pack_dir(self, tmp_path: Path) -> None:
-        cfg = _toy_cfg(tmp_path)
-        model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
+        cfg = replace(_toy_cfg(tmp_path), data=replace(_toy_cfg(tmp_path).data, pack_dir=None))
+        model_cfg = replace(EgoStitchConfig(), n_ground=7)
         data = _toy_bundle(tmp_path, model_cfg)
         e2e_cfg = replace(cfg, model=ModelConfig(family="egostitch_e2e", config={}))
         with pytest.raises(ValueError, match="pack_dir"):
             te._BatchFactory(e2e_cfg, model_cfg, data, node_batch=4, rank=0, world_size=1)
 
-    def test_prefetch_preserves_real_epoch_and_overfit_batches(self, tmp_path: Path) -> None:
+    def test_prefetch_preserves_real_epoch_batches(self, tmp_path: Path) -> None:
         cfg = _toy_cfg(tmp_path)
-        model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
+        model_cfg = replace(EgoStitchConfig(), n_ground=7)
         data = _toy_bundle(tmp_path, model_cfg)
         pack_dir = tmp_path / "token_pack"
         _write_tiny_token_pack(pack_dir, _NODES)
@@ -411,15 +431,6 @@ class TestBatchFactoryE2E:
             edge_batch=e2e_cfg.data.edge_batch,
             world_size=2,
         )
-        manifest_rows = tuple(
-            (
-                _NODES[index % len(_NODES)],
-                _NODES[(index + 1) % len(_NODES)],
-                index % 2,
-            )
-            for index in range(10)
-        )
-        manifest = te.OverfitManifest(rows=manifest_rows, sha256="a" * 64)
 
         def assert_batches_equal(
             direct: list[te._CompositeBatch], prefetched: list[te._CompositeBatch]
@@ -437,47 +448,41 @@ class TestBatchFactoryE2E:
                     assert torch.equal(actual.edge[name], expected.edge[name])
 
         for rank in range(2):
-            for mode in ("epoch", "overfit"):
-                direct_factory = te._BatchFactory(
-                    e2e_cfg, model_cfg, data, node_batch=4, rank=rank, world_size=2
-                )
-                if mode == "epoch":
-                    direct_source = direct_factory.epoch_batches(
-                        1, rows_per_rank=rows_per_rank, steps=epoch_steps
-                    )
-                else:
-                    direct_source = direct_factory.fixed_row_batches(
-                        manifest=manifest, epoch=1, steps=3, step_offset=5
-                    )
-                direct = list(direct_source)
-                direct_state = (
-                    direct_factory._node_cursor,
-                    direct_factory._node_cycle,
-                    direct_factory.training_nodes_read,
-                    direct_factory.training_f0_rows_read,
-                )
+            direct_factory = te._BatchFactory(
+                e2e_cfg, model_cfg, data, node_batch=4, rank=rank, world_size=2
+            )
+            direct = list(
+                direct_factory.epoch_batches(1, rows_per_rank=rows_per_rank, steps=epoch_steps)
+            )
+            direct_state = (
+                direct_factory._node_cursor,
+                direct_factory._node_cycle,
+                direct_factory.training_nodes_read,
+                direct_factory.training_f0_rows_read,
+            )
 
-                prefetch_factory = te._BatchFactory(
-                    e2e_cfg, model_cfg, data, node_batch=4, rank=rank, world_size=2
+            prefetch_factory = te._BatchFactory(
+                e2e_cfg, model_cfg, data, node_batch=4, rank=rank, world_size=2
+            )
+            prefetched = list(
+                te._prefetch_batches(
+                    iter(
+                        prefetch_factory.epoch_batches(
+                            1, rows_per_rank=rows_per_rank, steps=epoch_steps
+                        )
+                    ),
+                    depth=2,
                 )
-                if mode == "epoch":
-                    prefetch_source = prefetch_factory.epoch_batches(
-                        1, rows_per_rank=rows_per_rank, steps=epoch_steps
-                    )
-                else:
-                    prefetch_source = prefetch_factory.fixed_row_batches(
-                        manifest=manifest, epoch=1, steps=3, step_offset=5
-                    )
-                prefetched = list(te._prefetch_batches(iter(prefetch_source), depth=2))
-                prefetch_state = (
-                    prefetch_factory._node_cursor,
-                    prefetch_factory._node_cycle,
-                    prefetch_factory.training_nodes_read,
-                    prefetch_factory.training_f0_rows_read,
-                )
+            )
+            prefetch_state = (
+                prefetch_factory._node_cursor,
+                prefetch_factory._node_cycle,
+                prefetch_factory.training_nodes_read,
+                prefetch_factory.training_f0_rows_read,
+            )
 
-                assert_batches_equal(direct, prefetched)
-                assert prefetch_state == direct_state
+            assert_batches_equal(direct, prefetched)
+            assert prefetch_state == direct_state
 
 
 class TestE2ECompositeStep:
@@ -1119,188 +1124,6 @@ class TestE2ECompositeStep:
                 accelerator,
             )
 
-    def _probe_mode_inputs(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> tuple[te.EgoConfig, te.EgoStitchData, EgoStitchE2E]:
-        # `_run_probe_mode` drives the model without Accelerate's bf16
-        # autocast on CPU, so the bf16-only packed store must be floated first.
-        self._float_the_packed_store(monkeypatch)
-        cfg = _toy_cfg(tmp_path)
-        registered = te.load_config(
-            Path(__file__).resolve().parents[1] / "configs/egostitch_e2e_breadth_first.yaml"
-        )
-        assert registered.training is not None
-        assert registered.runtime is not None
-        pack_dir = tmp_path / "token_pack"
-        _write_tiny_token_pack(pack_dir, _NODES, min_length=3)
-        e2e_cfg = replace(
-            cfg,
-            model=ModelConfig(family="egostitch_e2e", config=dict(_E2E_TINY_MODEL)),
-            data=replace(cfg.data, pack_dir=pack_dir),
-            runtime=replace(registered.runtime, probe_warmup_steps=1, probe_timed_steps=1),
-            training=registered.training,
-        )
-        data = _toy_bundle(tmp_path, EgoStitchConfig())
-        model = EgoStitchE2E(E2EConfig.from_mapping(dict(_E2E_TINY_MODEL)))
-        return e2e_cfg, data, model
-
-    def test_budget_probe_measures_the_family_probe_peak(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """`memory_limit_gib` must be compared against a peak that includes the probe.
-
-        `_run_probe_mode`'s timed loop only executes plain optimizer steps, but
-        training additionally runs `_e2e_family_probe` every
-        `gradient_probe_interval` steps -- up to four more full forward/backward
-        passes. A candidate admitted on the plain-step peak is admitted on a
-        number the run never reaches, which is how a 67.1 GiB prediction cleared
-        an 85.0 GiB limit and then allocated 92.7 GiB.
-        """
-        torch.manual_seed(0)
-        e2e_cfg, data, model = self._probe_mode_inputs(tmp_path, monkeypatch)
-        seen: list[tuple[te.E2EPhaseState, dict[str, object], bool]] = []
-        original = te._e2e_family_probe
-
-        def _record(
-            wrapped: torch.nn.Module,
-            payload: dict[str, object],
-            groups: Mapping[str, Sequence[torch.nn.Parameter]],
-            phase: te.E2EPhaseState,
-            arm: te.E2EArmName,
-            accelerator: Accelerator,
-            *,
-            require_live_gradients: bool = True,
-        ) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
-            seen.append((phase, payload, require_live_gradients))
-            return original(
-                wrapped,
-                payload,
-                groups,
-                phase,
-                arm,
-                accelerator,
-                require_live_gradients=require_live_gradients,
-            )
-
-        monkeypatch.setattr(te, "_e2e_family_probe", _record)
-        profile_output = tmp_path / "probe.json"
-
-        te._run_probe_mode(
-            model,
-            e2e_cfg,
-            data,
-            Accelerator(cpu=True),
-            node_batch=4,
-            profile_output=profile_output,
-        )
-
-        assert len(seen) == 1, "the budget probe must fold in exactly one family probe"
-        phase, payload, require_live_gradients = seen[0]
-        # Phase C is the worst case: every family is live at once.
-        assert (phase.alpha, phase.edge_active, phase.real_ssl_scale) == (1.0, True, 1.0)
-        assert payload["edge_active"] is True
-        # Step-0 gates are zero, so liveness is relaxed -- allocation is not.
-        assert require_live_gradients is False
-        assert json.loads(profile_output.read_text())["valid"] is True
-
-    def test_budget_probe_replays_the_first_batch_and_clones_it(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The folded-in probe must reproduce production's replay residency.
-
-        `_train_e2e_stability_loop` clones the *first* payload into
-        `fixed_replay`, keeps it device-resident for the whole run, and
-        deep-clones it again for every probe -- so production holds two full
-        batches where an aliased last-batch payload would hold one. E2E edge
-        tensors also pad to each batch's own maximum endpoint length, so the
-        last probe batch is not the batch production replays. Getting either
-        wrong makes the guard admit a candidate whose real run still OOMs.
-        """
-        torch.manual_seed(0)
-        e2e_cfg, data, model = self._probe_mode_inputs(tmp_path, monkeypatch)
-        step_labels: list[torch.Tensor] = []
-        original_forward = te._CompositeStep.forward
-
-        def _spy_forward(
-            inner: te._CompositeStep, batch: dict[str, object]
-        ) -> dict[str, object]:
-            step_labels.append(cast(dict[str, torch.Tensor], batch["edge"])["label"])
-            return cast(dict[str, object], original_forward(inner, batch))
-
-        monkeypatch.setattr(te._CompositeStep, "forward", _spy_forward)
-        seen: list[dict[str, object]] = []
-        timed_forwards: list[int] = []
-        original_probe = te._e2e_family_probe
-
-        def _record(
-            wrapped: torch.nn.Module,
-            payload: dict[str, object],
-            groups: Mapping[str, Sequence[torch.nn.Parameter]],
-            phase: te.E2EPhaseState,
-            arm: te.E2EArmName,
-            accelerator: Accelerator,
-            *,
-            require_live_gradients: bool = True,
-        ) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
-            seen.append(payload)
-            # The probe's own forwards land in `step_labels` too; mark where the
-            # timed loop stopped so they are not compared against themselves.
-            timed_forwards.append(len(step_labels))
-            return original_probe(
-                wrapped,
-                payload,
-                groups,
-                phase,
-                arm,
-                accelerator,
-                require_live_gradients=require_live_gradients,
-            )
-
-        monkeypatch.setattr(te, "_e2e_family_probe", _record)
-
-        te._run_probe_mode(
-            model,
-            e2e_cfg,
-            data,
-            Accelerator(cpu=True),
-            node_batch=4,
-            profile_output=tmp_path / "probe.json",
-        )
-
-        assert len(seen) == 1
-        timed = step_labels[: timed_forwards[0]]
-        assert len(timed) >= 2, "need more than one timed step for this to bite"
-        probe_label = cast(dict[str, torch.Tensor], seen[0]["edge"])["label"]
-        # A clone, not an alias: production's replay and its per-probe clone are
-        # two separate batches on the device.
-        assert all(probe_label is not label for label in timed)
-        # And it is the *first* batch, the one production pins as `fixed_replay`.
-        assert torch.equal(probe_label, timed[0])
-
-    def test_budget_probe_reports_a_family_probe_oom_as_a_candidate_failure(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """An OOM in the folded-in probe must fail the candidate, not the whole sweep."""
-        torch.manual_seed(0)
-        e2e_cfg, data, model = self._probe_mode_inputs(tmp_path, monkeypatch)
-
-        def _oom(*_args: object, **_kwargs: object) -> None:
-            raise RuntimeError("CUDA out of memory. Tried to allocate 952.00 MiB")
-
-        monkeypatch.setattr(te, "_e2e_family_probe", _oom)
-
-        with pytest.raises(RuntimeError, match="out of memory"):
-            te._run_probe_mode(
-                model,
-                e2e_cfg,
-                data,
-                Accelerator(cpu=True),
-                node_batch=4,
-                profile_output=tmp_path / "probe.json",
-            )
-
-        assert "E2_PROBE_CANDIDATE_FAILURE" in capsys.readouterr().err
-
     def test_profile_loop_executes_real_optimizer_and_validation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1309,7 +1132,7 @@ class TestE2ECompositeStep:
         batch, model = self._batch_and_model(tmp_path)
         cfg = _toy_cfg(tmp_path)
         registered = te.load_config(
-            Path(__file__).resolve().parents[1] / "configs/egostitch_e2e_breadth_first.yaml"
+            Path(__file__).resolve().parents[1] / "configs/egostitch_e2e_v3_full_breadth_first.yaml"
         )
         assert registered.training is not None
         pack_dir = tmp_path / "token_pack"
@@ -1322,7 +1145,7 @@ class TestE2ECompositeStep:
                 clip_immediate_abort=1e-12,
                 clip_persistent_threshold=0.0,
             ),
-            run_kind="rehearsal",
+            run_kind="formal",
         )
         data = _toy_bundle(tmp_path, EgoStitchConfig())
         self._float_the_packed_store(monkeypatch)
@@ -1347,6 +1170,18 @@ class TestE2ECompositeStep:
             )
 
         monkeypatch.setattr(te.E2EClipGuard, "update", _count_guard_calls)
+
+        # The step-0 slot-health guard is deliberately not gated on
+        # `profile_only` -- a guard a flag can skip is a guard that fails open
+        # -- so it must run on this path too, and before any optimizer step.
+        step_0_guard_calls: list[int] = []
+        original_slot_health = te._enforce_e2e_initial_slot_health
+
+        def _spy_slot_health(*args: object, **kwargs: object) -> dict[str, float]:
+            step_0_guard_calls.append(len(guard_persistence))
+            return original_slot_health(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(te, "_enforce_e2e_initial_slot_health", _spy_slot_health)
         accelerator = Accelerator(cpu=True)
 
         result = te._train_e2e_stability_loop(
@@ -1358,7 +1193,12 @@ class TestE2ECompositeStep:
             profile_only=True,
         )
 
+        assert step_0_guard_calls == [0], "step-0 guard must run once, before the first step"
         assert result.runtime_profile is not None
+        assert result.runtime_profile["v_hold_validation_event_count"] == 2
+        assert [
+            row["kind"] for row in result.runtime_profile["v_hold_validation_events"]
+        ] == ["step_0", "epoch_end"]
         assert result.runtime_profile["total_optimizer_steps"] > 0
         assert (
             len(result.runtime_profile["optimizer_step_gradients"])
@@ -1433,7 +1273,7 @@ class TestE2ECompositeStep:
         _, model = self._batch_and_model(tmp_path)
         cfg = _toy_cfg(tmp_path)
         registered = te.load_config(
-            Path(__file__).resolve().parents[1] / "configs/egostitch_e2e_breadth_first.yaml"
+            Path(__file__).resolve().parents[1] / "configs/egostitch_e2e_v3_full_breadth_first.yaml"
         )
         assert registered.training is not None
         pack_dir = tmp_path / "token_pack"
@@ -1444,7 +1284,7 @@ class TestE2ECompositeStep:
             optim=replace(cfg.optim, epochs=5),
             diagnostics=replace(cfg.diagnostics, gradient_probe_interval=10_000),
             training=registered.training,
-            run_kind="rehearsal",
+            run_kind="formal",
         )
         data = _toy_bundle(tmp_path, EgoStitchConfig())
         original_from_pack = PackedFeatureTable.from_pack.__func__
@@ -1463,25 +1303,14 @@ class TestE2ECompositeStep:
             **_kwargs: object,
         ) -> te._ValidationResult:
             nonlocal validation_calls
-            call = validation_calls
+            # Call 0 is the step-0 slot-health guard (design 2026-07-29
+            # Sec 4.1), which runs one validation pass before the schedule
+            # starts. Epoch validations are numbered after it, so this
+            # trajectory is the same one the pre-guard loop saw.
+            call = validation_calls - 1
             validation_calls += 1
             f_logit_auprc = reference_auprc if call == 2 else (0.1 if call < 2 else 0.9)
-            metrics = te.EdgeMetrics(
-                auroc=0.7,
-                auprc=0.3,
-                accuracy=0.7,
-                sensitivity=0.7,
-                specificity=0.7,
-                precision=0.7,
-                recall=0.7,
-                f1=0.7,
-                mcc=0.4,
-                ece=0.1,
-                brier=0.1,
-                threshold=0.5,
-                n_pos=2,
-                n_neg=2,
-            )
+            metrics = _flat_edge_metrics()
             return te._ValidationResult(
                 metrics=metrics,
                 fidelity={
@@ -1489,9 +1318,16 @@ class TestE2ECompositeStep:
                     "active_logit_std": 0.2,
                     "clustering_mmd": 0.1,
                     "topology_delta_ratio": 0.01,
-                    "f_logit_std": 0.4 if call == 0 else 0.8,
+                    "f_logit_std": 0.4 if call <= 0 else 0.8,
                     "f_logit_auprc": f_logit_auprc,
+                    # The five dispersion keys the real `_validate_epoch`
+                    # always emits for an `EgoStitchE2E`: the step-0 slot
+                    # guard and `E2ESlotCollapseGuard` both index them hard,
+                    # so a stub that omits them fails with a bare KeyError.
+                    "pi_slot_std": 0.3,
                     "h_pairwise_cosine_mean": 0.2,
+                    "adj_offdiag_std": 0.3,
+                    "plan_row_entropy": 0.5,
                     "plan_rank1_marginal_residual": 0.2,
                 },
             )
@@ -1765,6 +1601,13 @@ class _ArchivedV1TrainLoopE2E:
         log_variances = cast(dict[str, float], result.kendall_state["log_variances"])
         assert set(log_variances) == {"edge", "recon", "real", "ssl"}
         assert any(abs(value) > 0.0 for value in log_variances.values())
+        validation_events = result.runtime_profile["v_hold_validation_events"]
+        assert result.runtime_profile["v_hold_validation_event_count"] == cfg.optim.epochs + 2
+        assert [row["kind"] for row in validation_events] == [
+            "step_0",
+            "phase_a_end",
+            *(["epoch_end"] * cfg.optim.epochs),
+        ]
 
         te.write_run_start_metadata(cfg, data, world_size=1)
         te.write_outputs(result, cfg, data)
@@ -1838,89 +1681,44 @@ class _ArchivedV1TrainLoopE2E:
             assert validation.fidelity["selection_tiebreak"] == 0.0
 
 
-class TestPreparePack:
-    def test_warm_validation_detects_drift(self, tmp_path: Path) -> None:
-        # Build a fake warm pack with a manifest, then corrupt a file.
-        pack_dir = tmp_path / "pack"
-        pack_dir.mkdir()
-        (pack_dir / te._PACK_F0_FILENAME).write_bytes(b"f0")
-        (pack_dir / te._PACK_GROUNDING_FILENAME).write_bytes(b"pool")
-        manifest = {
-            "family": "egostitch",
-            "strategy": "toy",
-            "n_operative_nodes": 8,
-            "n_train_nodes": 8,
-            "n_ground": 3,
-            "files": {
-                te._PACK_F0_FILENAME: te._sha256_file(pack_dir / te._PACK_F0_FILENAME),
-                te._PACK_GROUNDING_FILENAME: te._sha256_file(
-                    pack_dir / te._PACK_GROUNDING_FILENAME
-                ),
-            },
-        }
-        (pack_dir / te._PACK_MANIFEST_FILENAME).write_text(json.dumps(manifest))
-        cfg = _toy_cfg(tmp_path)
-        payload = te.prepare_pack(cfg, pack_dir, cold_cache=False)
-        assert cast(dict[str, object], payload["pack_manifest"])["n_ground"] == 3
-        (pack_dir / te._PACK_F0_FILENAME).write_bytes(b"corrupted")
-        with pytest.raises(ValueError, match="drifted"):
-            te.prepare_pack(cfg, pack_dir, cold_cache=False)
-
-
-# --------------------------------------------------------------------------- e2e full pipeline
-#
-# Family `egostitch_e2e` sources `n_ground` from `E2EConfig` (spec Sec 14.4.4;
-# it supersedes the internal generator's own pinned `EgoStitchConfig` default
-# for this family). This fixture pins it explicitly to the pre-rev-3.1
-# default (20) rather than the new rev-3.1 default (50), so `n_ground` stays
-# comfortably below `build_grounding_pool`'s `n_ground <= len(train_nodes) -
-# 1` bound without needing more than the 25-node pipeline universe.
-
 _E2E_PIPELINE_NODES = [f"g{i}" for i in range(25)]
-_E2E_PIPELINE_N_GROUND = 20
 
 
 def _e2e_pipeline_benchmark() -> Benchmark:
-    """Build a self-contained `Benchmark` for the e2e pipeline fixture.
-
-    All 25 nodes sit on the train side (a cycle graph), built directly as
-    dataclasses -- no disk I/O, so tests that only need
-    `prepare_pack`/`assemble_egostitch_data`'s own logic (not
-    `load_benchmark`'s file parsing) can monkeypatch `_load_benchmark_for`
-    with it directly.
-    """
+    """Build the in-memory benchmark shared by E2E pipeline tests."""
     nodes = _E2E_PIPELINE_NODES
     graph = nx.Graph()
     graph.add_nodes_from(nodes)
     edges = [(nodes[i], nodes[(i + 1) % len(nodes)]) for i in range(len(nodes))]
     graph.add_edges_from(edges)
     positive_edges = frozenset(canonical_pair(u, v) for u, v in edges)
-    pairs_sorted = sorted(canonical_pair(u, v) for u, v in edges)
-    train_pairs = LabeledPairs(pairs=pairs_sorted, labels=np.ones(len(pairs_sorted), dtype=np.int8))
-    val_pairs = LabeledPairs(
-        pairs=[canonical_pair(nodes[0], nodes[5]), canonical_pair(nodes[1], nodes[6])],
-        labels=np.array([1, 0], dtype=np.int8),
-    )
+    pairs_sorted = sorted(positive_edges)
     split = SplitArtifacts(
         strategy="toy",
         train_nodes=frozenset(nodes),
         test_nodes=frozenset(),
-        train_pairs=train_pairs,
-        val_pairs=val_pairs,
+        train_pairs=LabeledPairs(
+            pairs=pairs_sorted,
+            labels=np.ones(len(pairs_sorted), dtype=np.int8),
+        ),
+        val_pairs=LabeledPairs(
+            pairs=[canonical_pair(nodes[0], nodes[5]), canonical_pair(nodes[1], nodes[6])],
+            labels=np.array([1, 0], dtype=np.int8),
+        ),
         test_pairs=LabeledPairs(pairs=[], labels=np.array([], dtype=np.int8)),
         train_graph=graph.copy(),
         test_graph=nx.Graph(),
         buckets={},
     )
-    return Benchmark(root=Path("unused"), graph=graph, positive_edges=positive_edges, split=split)
+    return Benchmark(
+        root=Path("unused"),
+        graph=graph,
+        positive_edges=positive_edges,
+        split=split,
+    )
 
 
 def _write_e2e_feature_root(tmp_path: Path, nodes: list[str], *, input_dim: int = 1536) -> None:
-    """Write a real, minimal, disk-backed `FeatureStore` root for `nodes`.
-
-    Written under ``tmp_path / "data" / "features" / "frozen_node_features_1024"``,
-    the exact location `_FEATURES_SUBDIR` resolves against `cfg.data.root`.
-    """
     root = tmp_path / "data" / "features" / "frozen_node_features_1024"
     embeddings_dir = root / "embeddings"
     embeddings_dir.mkdir(parents=True)
@@ -1942,28 +1740,7 @@ def _write_e2e_feature_root(tmp_path: Path, nodes: list[str], *, input_dim: int 
 def _holdout_e2e_cfg(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, n_ground: int = 3
 ) -> te.EgoConfig:
-    """Build an e2e config that assembles through the real V_fit/V_qual/V_select holdout path.
-
-    `_toy_cfg` alone leaves `cfg.training` unset, so `assemble_egostitch_data`
-    takes its legacy non-training branch (plain `benchmark.split.train_nodes`,
-    no internal holdout). Task 6's V_fit standardization statistics are only
-    computed in `_assemble_e2e_data`, which requires `cfg.training is not
-    None` to be selected. Setting it routes assembly through the real
-    `derive_internal_holdout` machinery, which needs real
-    `split.pkl`/`train_edges.txt` files on disk (unlike `_load_benchmark_for`,
-    `_assemble_e2e_data` never consults the monkeypatched in-memory
-    `Benchmark`).
-
-    `derive_internal_holdout`'s default `holdout_size=256` cannot fit the
-    25-node pipeline fixture (`largest remaining message component has N
-    nodes; need 256`), so it is monkeypatched to call the same, real BFS
-    holdout algorithm with `holdout_size=4` -- not a stub. With this
-    fixture's `partition_seed=0`/`msg_fraction=0.8`, that deterministically
-    yields disjoint universes: 17 `V_fit` nodes, 4 `V_qual`, 4 `V_select`
-    (verified empirically). `n_ground` defaults to 3 because `V_select` only
-    has 4 nodes (`build_grounding_pool` requires `n_ground <= len(universe) -
-    1`).
-    """
+    """Build an active E2E config over a small real internal holdout."""
     _write_e2e_feature_root(tmp_path, _E2E_PIPELINE_NODES)
     strategy_dir = tmp_path / "data" / te._BENCHMARK_SUBDIR / "toy"
     strategy_dir.mkdir(parents=True, exist_ok=True)
@@ -1986,10 +1763,10 @@ def _holdout_e2e_cfg(
 
     monkeypatch.setattr(te, "derive_internal_holdout", tiny_holdout)
     cfg = _toy_cfg(tmp_path)
-    cfg = replace(cfg, data=replace(cfg.data, pack_dir=tmp_path / "raw-token-pack"))
     return replace(
         cfg,
         model=ModelConfig(family="egostitch_e2e", config={"n_ground": n_ground}),
+        data=replace(cfg.data, pack_dir=tmp_path / "raw-token-pack"),
         training=te.EgoStitchTrainingConfig(),
     )
 
@@ -2006,175 +1783,6 @@ class TestPrepareAndAssembleE2E:
             ),
             data=replace(cfg.data, pack_dir=tmp_path / "raw-token-pack"),
         )
-
-    def test_prepare_pack_uses_e2e_config_n_ground(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import src.data.packed_features as packed_features
-
-        monkeypatch.setattr(packed_features, "ProcessPoolExecutor", ThreadPoolExecutor)
-        _write_e2e_feature_root(tmp_path, _E2E_PIPELINE_NODES)
-        benchmark = _e2e_pipeline_benchmark()
-        monkeypatch.setattr(te, "_load_benchmark_for", lambda cfg: benchmark)
-        original_load = torch.load
-        source_load_counts: dict[str, int] = {}
-
-        def counting_load(path: Path, *, map_location: str, weights_only: bool) -> object:
-            if path.suffix == ".pt" and path.parent.name == "embeddings":
-                source_load_counts[path.name] = source_load_counts.get(path.name, 0) + 1
-            return original_load(path, map_location=map_location, weights_only=weights_only)
-
-        monkeypatch.setattr(torch, "load", counting_load)
-        e2e_cfg = self._e2e_cfg(tmp_path)
-        pack_dir = tmp_path / "pack"
-
-        payload = te.prepare_pack(e2e_cfg, pack_dir, cold_cache=True)
-        manifest = cast(dict[str, object], payload["pack_manifest"])
-        assert manifest["family"] == "egostitch_e2e"
-        assert manifest["n_ground"] == _E2E_PIPELINE_N_GROUND
-        packs = cast(dict[str, dict[str, object]], payload["packs"])
-        assert set(packs) == {"f0_grounding", "raw_tokens"}
-        assert packs["f0_grounding"]["cold"] is True
-        assert packs["raw_tokens"]["cold"] is True
-        assert source_load_counts == {f"{node}.pt": 1 for node in _E2E_PIPELINE_NODES}
-        assert (cast(Path, e2e_cfg.data.pack_dir) / "manifest.json").is_file()
-        assert te.required_pack_paths(e2e_cfg, pack_dir) == (
-            pack_dir,
-            e2e_cfg.data.pack_dir,
-        )
-
-        # Warm-path re-validation must agree with the same configured n_ground.
-        rebuilt = te.prepare_pack(e2e_cfg, pack_dir, cold_cache=False)
-        assert cast(dict[str, object], rebuilt["pack_manifest"])["n_ground"] == (
-            _E2E_PIPELINE_N_GROUND
-        )
-        rebuilt_packs = cast(dict[str, dict[str, object]], rebuilt["packs"])
-        assert rebuilt_packs["f0_grounding"]["cold"] is False
-        assert rebuilt_packs["raw_tokens"]["cold"] is False
-        assert (
-            rebuilt_packs["raw_tokens"]["identity_sha256"] == packs["raw_tokens"]["identity_sha256"]
-        )
-
-    def test_prepare_pack_writes_and_drift_checks_v_fit_feature_stats(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The cold build writes registered V_fit stats; a tampered file drifts warm."""
-        import src.data.packed_features as packed_features
-
-        monkeypatch.setattr(packed_features, "ProcessPoolExecutor", ThreadPoolExecutor)
-        _write_e2e_feature_root(tmp_path, _E2E_PIPELINE_NODES)
-        benchmark = _e2e_pipeline_benchmark()
-        monkeypatch.setattr(te, "_load_benchmark_for", lambda cfg: benchmark)
-        e2e_cfg = self._e2e_cfg(tmp_path)
-        pack_dir = tmp_path / "pack"
-
-        te.prepare_pack(e2e_cfg, pack_dir, cold_cache=True)
-
-        stats_path = pack_dir / te._PACK_FEATURE_STATS_FILENAME
-        assert stats_path.is_file()
-        manifest = json.loads((pack_dir / te._PACK_MANIFEST_FILENAME).read_text())
-        file_hashes = cast(dict[str, str], manifest["files"])
-        assert te._PACK_FEATURE_STATS_FILENAME in file_hashes
-        digest = file_hashes[te._PACK_FEATURE_STATS_FILENAME]
-        assert len(digest) == 64
-        int(digest, 16)  # sanity: genuinely hex, not a placeholder
-
-        # The pack's registered constants are computed over V_fit (here, for
-        # `cfg.training is None`, `prepare_pack`'s train-side node set --
-        # `benchmark.split.train_nodes & operative`), not the full operative
-        # universe (which also includes any validation nodes when present).
-        stats = load_feature_stats(stats_path)
-        expected_universe = node_ids_sha256(sorted(benchmark.split.train_nodes))
-        assert stats.node_ids_sha256 == expected_universe
-
-        # Warm-path drift check: `prepare_pack`'s warm branch never calls
-        # `load_feature_stats` -- it only re-hashes every manifest-listed file
-        # and compares bytes (the same generic check that already covered
-        # `f0_matrix.pt`/`grounding.npz`). Byte-level tampering of the stats
-        # file must be caught by that same mechanism.
-        stats_path.write_bytes(b"corrupted")
-        with pytest.raises(
-            ValueError, match=f"pack file {te._PACK_FEATURE_STATS_FILENAME} drifted"
-        ):
-            te.prepare_pack(e2e_cfg, pack_dir, cold_cache=False)
-
-    def test_prepare_pack_warm_path_rejects_manifest_missing_feature_stats_entry(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A pre-rev-3.2 pack manifest (no `feature_stats.npz` entry) must fail closed.
-
-        [P1-A] The warm path used to validate only the files listed in the
-        pack's OWN manifest, so a pre-rev-3.2 pack directory whose manifest
-        predates this change (no `feature_stats.npz` entry) was accepted --
-        leaving the preprocessing statistics outside the recorded pack
-        identity. Simulate that by rewriting a freshly-cold-built manifest to
-        drop the entry, then re-running the warm path against it.
-        """
-        import src.data.packed_features as packed_features
-
-        monkeypatch.setattr(packed_features, "ProcessPoolExecutor", ThreadPoolExecutor)
-        _write_e2e_feature_root(tmp_path, _E2E_PIPELINE_NODES)
-        benchmark = _e2e_pipeline_benchmark()
-        monkeypatch.setattr(te, "_load_benchmark_for", lambda cfg: benchmark)
-        e2e_cfg = self._e2e_cfg(tmp_path)
-        pack_dir = tmp_path / "pack"
-
-        te.prepare_pack(e2e_cfg, pack_dir, cold_cache=True)
-
-        manifest_path = pack_dir / te._PACK_MANIFEST_FILENAME
-        manifest = json.loads(manifest_path.read_text())
-        del manifest["files"][te._PACK_FEATURE_STATS_FILENAME]
-        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-
-        with pytest.raises(ValueError, match=te._PACK_FEATURE_STATS_FILENAME):
-            te.prepare_pack(e2e_cfg, pack_dir, cold_cache=False)
-
-    def test_prepare_pack_rejects_stage1_only_config_keys(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _write_e2e_feature_root(tmp_path, _E2E_PIPELINE_NODES)
-        benchmark = _e2e_pipeline_benchmark()
-        monkeypatch.setattr(te, "_load_benchmark_for", lambda cfg: benchmark)
-        cfg = _toy_cfg(tmp_path)
-        e2e_cfg = replace(cfg, model=ModelConfig(family="egostitch_e2e", config={"slots": 4}))
-        with pytest.raises(ValueError, match="unknown E2E config keys"):
-            te.prepare_pack(e2e_cfg, tmp_path / "pack", cold_cache=True)
-
-    def test_assemble_skips_s0_and_produces_e2e_batches(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _write_e2e_feature_root(tmp_path, _E2E_PIPELINE_NODES)
-        benchmark = _e2e_pipeline_benchmark()
-        monkeypatch.setattr(te, "_load_benchmark_for", lambda cfg: benchmark)
-        e2e_cfg = self._e2e_cfg(tmp_path)
-        pack_dir = tmp_path / "pack"
-
-        # require_s0 defaults True; family egostitch_e2e must still skip it
-        # (spec Sec 13.10: s0 retired for this family).
-        data = te.assemble_egostitch_data(e2e_cfg, pack_dir=pack_dir)
-        assert len(data.s0) == 0
-        assert data.grounding_index.shape == (
-            len(_E2E_PIPELINE_NODES),
-            _E2E_PIPELINE_N_GROUND,
-        )
-
-        token_pack_dir = tmp_path / "token_pack"
-        _write_tiny_token_pack(token_pack_dir, _E2E_PIPELINE_NODES, min_length=3)
-        e2e_cfg_with_pack = replace(e2e_cfg, data=replace(e2e_cfg.data, pack_dir=token_pack_dir))
-        model_cfg = EgoStitchConfig()
-        rows, steps = te._epoch_step_plan(
-            len(data.e_sup_positives),
-            negative_ratio=e2e_cfg_with_pack.data.negative_ratio,
-            edge_batch=e2e_cfg_with_pack.data.edge_batch,
-            world_size=1,
-        )
-        factory = te._BatchFactory(
-            e2e_cfg_with_pack, model_cfg, data, node_batch=4, rank=0, world_size=1
-        )
-        batch = next(iter(factory.epoch_batches(1, rows_per_rank=rows, steps=steps)))
-        for key in ("emb_a", "emb_b", "len_a", "len_b", "ground_id_i", "ground_id_j"):
-            assert key in batch.edge
-        assert "s0" not in batch.edge
 
     def _assemble_holdout_e2e_data(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, n_ground: int = 3
@@ -2258,21 +1866,76 @@ class TestPrepareAndAssembleE2E:
             self._assemble_holdout_e2e_data(tmp_path, monkeypatch)
 
 
+class TestHeldOutPathBoundary:
+    """Acceptance item 4 (design 2026-07-29 Sec 3.1): the guard must actually fire.
+
+    The verdict mapping (`"opened a held-out path"` -> `fail(held_out_path)`)
+    is asserted in `tests/test_train_egostitch_core.py`, but a message-to-label
+    table proves nothing about whether any code path reaches the raise. These
+    tests drive real assemblies into it, in both run kinds, and pin the
+    property that made the pre-cleanup form unusable: mere *presence* of the
+    held-out files -- which is the state of the repository data root -- must
+    not block a training run.
+    """
+
+    def _strategy_dir(self, tmp_path: Path) -> Path:
+        return tmp_path / "data" / te._BENCHMARK_SUBDIR / "toy"
+
+    @pytest.mark.parametrize("run_kind", ["qualification", "formal"])
+    def test_a_train_side_symlink_onto_a_held_out_file_raises_in_both_run_kinds(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        run_kind: Literal["qualification", "formal"],
+    ) -> None:
+        """Following symlinks is the one way a train-side name can alias a held-out file."""
+        cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind=run_kind)
+        strategy_dir = self._strategy_dir(tmp_path)
+        train_edges = strategy_dir / "train_edges.txt"
+        held_out = strategy_dir / "test_edges.txt"
+        held_out.write_text(train_edges.read_text(encoding="utf-8"), encoding="utf-8")
+        train_edges.unlink()
+        train_edges.symlink_to(held_out)
+
+        with pytest.raises(RuntimeError, match="opened a held-out path"):
+            te.assemble_egostitch_data(cfg)
+
+    @pytest.mark.parametrize("run_kind", ["qualification", "formal"])
+    def test_present_but_unopened_held_out_files_do_not_block_either_run_kind(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        run_kind: Literal["qualification", "formal"],
+    ) -> None:
+        """The repository data root carries all three; both stages must still run in it."""
+        cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind=run_kind)
+        strategy_dir = self._strategy_dir(tmp_path)
+        for name in te._HELD_OUT_FILENAMES:
+            (strategy_dir / name).write_text("sealed\n", encoding="utf-8")
+
+        data = te.assemble_egostitch_data(cfg)
+
+        audit = data.access_audit or {}
+        assert audit["forbidden_files_absent"] == dict.fromkeys(te._HELD_OUT_FILENAMES, False)
+
+
 class TestFeatureStandardizationBinding:
     """`_bind_feature_standardization` pins the registered statistics, fail-closed."""
 
     def test_binding_pins_the_statistics_and_returns_the_digest(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The realistic post-calibration path: the digest was already pinned.
+        """The realistic path: the qualification stage computes the digest.
 
-        `run_kind` is left unset here -- this worker normalizes that to
-        `"formal"` everywhere (`cfg.run_kind or "formal"`), including in this
-        binder's own rehearsal/formal pin requirement (re-reviewed P1-B), so
-        this test must pin the digest itself rather than relying on an
-        unset-`run_kind` exemption that no longer exists.
+        `run_kind` is `"qualification"` because that is the stage the digest
+        is *born* in (design 2026-07-29 Sec 3): it is not a config input any
+        more -- the six v3 configs no longer carry `feature_stats_sha256` --
+        and it is recorded in `qualification.json` for the formal stage to
+        compare against. A config that still pins the field is honoured, so
+        this fixture pins the matching value to prove the check agrees rather
+        than being skipped.
         """
-        base_cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        base_cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="qualification")
         data = te.assemble_egostitch_data(base_cfg)
         assert data.feature_stats is not None
         cfg = replace(
@@ -2295,7 +1958,7 @@ class TestFeatureStandardizationBinding:
     def test_binding_fails_closed_on_a_pinned_digest_mismatch(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="qualification")
         cfg = replace(
             cfg,
             model=replace(
@@ -2312,7 +1975,7 @@ class TestFeatureStandardizationBinding:
     def test_binding_fails_closed_when_statistics_are_absent(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="qualification")
         data = replace(te.assemble_egostitch_data(cfg), feature_stats=None)
         model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
 
@@ -2336,61 +1999,75 @@ class TestFeatureStandardizationBinding:
         assert te._bind_feature_standardization(model, cfg, data) == ""
         assert model.feature_stats_digest_hex == ""
 
-    @pytest.mark.parametrize(
-        ("run_kind", "effective_run_kind"),
-        [("rehearsal", "rehearsal"), ("formal", "formal"), (None, "formal")],
-    )
-    def test_binding_fails_closed_on_an_empty_pin_for_budgeted_run_kinds(
+    @pytest.mark.parametrize("run_kind", ["formal", None])
+    def test_binding_fails_closed_without_a_qualification_artifact(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        run_kind: Literal["rehearsal", "formal"] | None,
-        effective_run_kind: str,
+        run_kind: Literal["qualification", "formal"] | None,
     ) -> None:
-        """[P1-B, re-reviewed] Rehearsal/formal -- including an UNSET run_kind -- must not train.
+        """[P1-B, re-reviewed] An UNSET run_kind is the formal stage, and must not train.
 
-        An unset `run_kind` is not calibration: `--run-kind`'s own help text
+        An unset `run_kind` is not an exemption: `--run-kind`'s own help text
         says it "defaults to formal", and every other use of `cfg.run_kind` in
         this worker normalizes it the same way (`cfg.run_kind or "formal"`) --
         binding validation, data-role selection, training, artifact metadata.
         The plain default invocation (nobody passed `--run-kind` at all) must
-        not be able to bypass this pin simply by never setting it; it
-        publishes a `run_kind="formal"` artifact against V_select exactly
-        like an explicit `--run-kind formal` would.
-
-        All three consume a scarce attempt or publish an artifact, so an
-        empty `feature_stats_sha256` (the default -- nothing pinned it
-        beforehand) must be a hard error, not a silent fall-through to
-        runtime-computed constants.
+        not be able to bypass the formal comparison simply by never setting
+        it; it publishes a `run_kind="formal"` artifact exactly like an
+        explicit `--run-kind formal` would.
         """
         cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
         cfg = replace(cfg, run_kind=run_kind)
         data = te.assemble_egostitch_data(cfg)
         model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
 
-        with pytest.raises(RuntimeError, match=f"run_kind={effective_run_kind}"):
+        with pytest.raises(RuntimeError, match="run_kind=formal"):
             te._bind_feature_standardization(model, cfg, data)
 
         # The model must not have been bound before the raise.
         assert model.feature_stats_digest_hex == ""
 
-    def test_binding_allows_an_empty_pin_for_calibration_run_kind(
+    def test_binding_compares_the_formal_digest_against_the_recorded_one(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """[P1-B] Genuine calibration (`run_kind="overfit"`) may leave the pin empty.
+        """The formal stage's assertion is a genuine equality over one V_fit.
 
-        This is the only `run_kind` string exempted; an unset `run_kind` is no
-        longer treated as calibration (see the `budgeted_run_kinds` test
-        above). `data` is assembled once under the base (non-`"overfit"`) config so
-        the fixture does not have to satisfy the 85-positive
-        `overfit_manifest` precondition -- `_bind_feature_standardization`
-        itself never inspects how `data` was assembled, only `cfg.run_kind`
-        and `data.feature_stats`, so binding against a `run_kind="overfit"`
-        cfg here is still a faithful test of the calibration path.
+        Both stages train on the identical universe (design Sec 2), so the
+        digest the formal run computes here must equal the one the
+        qualification run recorded -- assembled twice from the same fixture,
+        not copied between the two configs.
+        """
+        qualification = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="qualification")
+        data = te.assemble_egostitch_data(qualification)
+        assert data.feature_stats is not None
+        artifact = te.write_qualification_artifact(
+            qualification, verdict="pass", feature_stats_sha256=data.feature_stats.digest
+        )
+        formal = replace(qualification, run_kind="formal")
+        model = EgoStitchE2E(E2EConfig.from_mapping(formal.model.config))
+
+        digest = te._bind_feature_standardization(
+            model, formal, data, qualification_artifact=artifact
+        )
+
+        assert digest == data.feature_stats.digest
+        assert model.feature_stats_digest_hex == digest
+
+    def test_binding_allows_an_empty_pin_for_the_debug_run_kind(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`run_kind="debug"` is the only exempted kind.
+
+        A bounded `--max-steps` run publishes no artifact and cannot be read
+        as evidence, so it may leave the pin empty. `data` is assembled once
+        under the base config -- `_bind_feature_standardization` never
+        inspects how `data` was assembled, only `cfg.run_kind` and
+        `data.feature_stats`.
         """
         base_cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
         data = te.assemble_egostitch_data(base_cfg)
-        cfg = replace(base_cfg, run_kind="overfit")
+        cfg = replace(base_cfg, run_kind="debug")
         model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
 
         digest = te._bind_feature_standardization(model, cfg, data)
@@ -2399,349 +2076,138 @@ class TestFeatureStandardizationBinding:
         assert digest == data.feature_stats.digest
         assert model.feature_stats_digest_hex == digest
 
-    @pytest.mark.parametrize("ddp_mode", ["probe", "epoch-probe", "init-probe"])
-    def test_binding_allows_an_empty_pin_for_preflight_dispatch_modes(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ddp_mode: str
-    ) -> None:
-        """[P2 re-review] Preflight dispatch modes stay exempt even at run_kind="formal".
 
-        `init-probe` is the one documented way to *measure*
-        `feature_stats_sha256` in the first place (S0 gate runbook: run
-        `--ddp-mode init-probe`, record the digest it reports, then paste it
-        into the config) -- it necessarily runs before any digest exists to
-        pin, so it cannot be subject to the same pin requirement as the
-        `train` dispatch it precedes. `probe`/`epoch-probe` build no
-        checkpoint and publish no artifact either, so the same exemption
-        applies to them. This must hold even at the most restrictive
-        `run_kind="formal"` (an unpinned digest here would otherwise raise
-        per `test_binding_fails_closed_on_an_empty_pin_for_budgeted_run_kinds`).
-        """
-        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
-        cfg = replace(cfg, run_kind="formal")
-        data = te.assemble_egostitch_data(cfg)
-        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
-
-        digest = te._bind_feature_standardization(model, cfg, data, ddp_mode=ddp_mode)
-
-        assert data.feature_stats is not None
-        assert digest == data.feature_stats.digest
-        assert model.feature_stats_digest_hex == digest
-
-    def test_binding_still_gates_the_train_dispatch_mode(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """[P2 re-review] `ddp_mode="train"` is not a preflight dispatch mode.
-
-        It is the actual budgeted run, so it must still be gated exactly like
-        the no-`ddp_mode` (test-only) call above.
-        """
-        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
-        cfg = replace(cfg, run_kind="formal")
-        data = te.assemble_egostitch_data(cfg)
-        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
-
-        with pytest.raises(RuntimeError, match="run_kind=formal"):
-            te._bind_feature_standardization(model, cfg, data, ddp_mode="train")
-
-
-class TestOverfitAcceptance:
-    """§13.19.4 item-1 post-ramp overfit acceptance (spec change-log 2026-07-22)."""
-
-    # The retained passing attempt-005 V_fit trajectory (metrics.jsonl,
-    # 2026-07-21, BF16-era readout): AUPRC saturates at 1.0 from epoch 7;
-    # Phase-C residual ratios oscillate around 1e-3 (readout quantization
-    # noise per spec §12 2026-07-22).
-    _RETAINED = (
-        (1, "A", 0.348471, 0.0),
-        (2, "A", 0.559022, 0.0),
-        (3, "A", 0.720202, 0.0),
-        (4, "A", 0.908526, 0.0),
-        (5, "A", 0.990429, 0.0),
-        (6, "B", 0.999725, 0.000520600),
-        (7, "B", 1.0, 0.000901622),
-        (8, "B", 1.0, 0.000668134),
-        (9, "C", 1.0, 0.001495493),
-        (10, "C", 1.0, 0.001216008),
-        (11, "C", 1.0, 0.001083565),
-        (12, "C", 1.0, 0.001181883),
-        (13, "C", 1.0, 0.000997061),
-        (14, "C", 1.0, 0.001157461),
-        (15, "C", 1.0, 0.000979123),
-        (16, "C", 1.0, 0.001140527),
-        (17, "C", 1.0, 0.001179883),
-        (18, "C", 1.0, 0.001072686),
-        (19, "C", 1.0, 0.000954866),
-        (20, "C", 1.0, 0.001165148),
-        (21, "C", 1.0, 0.001060615),
-        (22, "C", 1.0, 0.000946267),
-        (23, "C", 1.0, 0.001054033),
-        (24, "C", 1.0, 0.001412919),
-        (25, "C", 1.0, 0.001370386),
-        (26, "C", 1.0, 0.001328335),
-        (27, "C", 1.0, 0.001241188),
-        (28, "C", 1.0, 0.001282460),
-        (29, "C", 1.0, 0.000992638),
-        (30, "C", 1.0, 0.001278644),
-    )
-
-    @staticmethod
-    def _record(
-        epoch: int, phase: te.E2EPhaseName, auprc: float, residual: float | None
-    ) -> te.E2ECheckpointRecord:
-        return te.E2ECheckpointRecord(
-            epoch=epoch,
-            phase=phase,
-            full_joint_epochs_completed=max(0, epoch - 9),
-            guards_passed=True,
-            auprc=auprc,
-            prevalence=1.0 / 6.0,
-            active_logit_std=1.0,
-            clustering_mmd=0.0,
-            brier=0.0,
-            residual_ratio=residual,
-        )
-
-    # The retained fp32-readout gatefix trajectory (failed_run_history.json,
-    # 2026-07-22): identical seed/config/pack; the honest fp32 residual sits
-    # in the 1e-5 decade and grows monotonically across Phase C.
-    _FP32_RETAINED = (
-        (1, "A", 0.346710, 0.0),
-        (2, "A", 0.544728, 0.0),
-        (3, "A", 0.743517, 0.0),
-        (4, "A", 0.903183, 0.0),
-        (5, "A", 0.997577, 0.0),
-        (6, "B", 1.0, 0.000000131),
-        (7, "B", 1.0, 0.000007328),
-        (8, "B", 1.0, 0.000004242),
-        (9, "C", 1.0, 0.000003622),
-        (10, "C", 1.0, 0.000003718),
-        (11, "C", 1.0, 0.000003936),
-        (12, "C", 1.0, 0.000004352),
-        (13, "C", 1.0, 0.000004948),
-        (14, "C", 1.0, 0.000005518),
-        (15, "C", 1.0, 0.000006066),
-        (16, "C", 1.0, 0.000006694),
-        (17, "C", 1.0, 0.000007403),
-        (18, "C", 1.0, 0.000008042),
-        (19, "C", 1.0, 0.000008641),
-        (20, "C", 1.0, 0.000009245),
-        (21, "C", 1.0, 0.000009815),
-        (22, "C", 1.0, 0.000010245),
-        (23, "C", 1.0, 0.000010664),
-        (24, "C", 1.0, 0.000010996),
-        (25, "C", 1.0, 0.000011267),
-        (26, "C", 1.0, 0.000011505),
-        (27, "C", 1.0, 0.000011689),
-        (28, "C", 1.0, 0.000011868),
-        (29, "C", 1.0, 0.000012046),
-        (30, "C", 1.0, 0.000012178),
-    )
-
-    def _retained_records(self) -> list[te.E2ECheckpointRecord]:
-        return [
-            self._record(epoch, cast(te.E2EPhaseName, phase), auprc, residual)
-            for epoch, phase, auprc, residual in self._RETAINED
-        ]
-
-    def _fp32_records(self) -> list[te.E2ECheckpointRecord]:
-        return [
-            self._record(epoch, cast(te.E2EPhaseName, phase), auprc, residual)
-            for epoch, phase, auprc, residual in self._FP32_RETAINED
-        ]
-
-    def test_pre_ramp_epochs_never_qualify(self) -> None:
-        assert not te.e2e_overfit_epoch_qualified(self._record(5, "A", 1.0, 0.01))
-        assert not te.e2e_overfit_epoch_qualified(self._record(7, "B", 1.0, 0.01))
-
-    def test_phase_c_requires_both_registered_inequalities(self) -> None:
-        assert te.e2e_overfit_epoch_qualified(self._record(9, "C", 0.95, 1e-6))
-        assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", 0.949, 1e-6))
-        assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", 1.0, 9.9e-7))
-        assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", 1.0, 0.0))
-        assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", 1.0, None))
-        assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", float("nan"), 1e-6))
-        assert not te.e2e_overfit_epoch_qualified(self._record(9, "C", 1.0, float("nan")))
-
-    def test_retained_passing_trajectory_selects_the_same_final_epoch(self) -> None:
-        """The run that passed the old final-epoch rule selects the identical epoch."""
-        assert te.select_e2e_overfit_epoch(self._retained_records()) == 30
-
-    def test_knife_edge_final_epoch_no_longer_invalidates_the_run(self) -> None:
-        """The latest qualifying epoch wins despite a below-floor final epoch.
-
-        This is the attempt-005 final-epoch-only failure mode, recast at the
-        fp32-calibrated boundary.
-        """
-        records = self._retained_records()
-        records[-2], records[-1] = (
-            self._record(29, "C", 1.0, 1.2e-5),
-            self._record(30, "C", 1.0, 5e-7),
-        )
-        assert te.select_e2e_overfit_epoch(records) == 29
-
-    def test_fp32_trajectory_selects_the_final_epoch(self) -> None:
-        """The retained fp32 gatefix trajectory qualifies under the recalibrated floor."""
-        assert te.select_e2e_overfit_epoch(self._fp32_records()) == 30
-
-    def test_no_qualifying_epoch_returns_zero(self) -> None:
-        records = [self._record(epoch, "C", 1.0, 5e-7) for epoch in range(9, 31)]
-        assert te.select_e2e_overfit_epoch(records) == 0
-        assert te.select_e2e_overfit_epoch([]) == 0
+class TestFailedSelectionHistory:
+    """`_write_failed_run_history` -- the forensic trail a failed run leaves."""
 
     def test_failed_selection_history_is_retained(self, tmp_path: Path) -> None:
         history: list[dict[str, object]] = [
             {"epoch": 1.0, "auprc": 0.5, "fidelity": {"topology_delta_ratio": 0.0}}
         ]
         te._write_failed_run_history(
-            tmp_path / "out", run_kind="overfit", arm="full", history=history
+            tmp_path / "out", run_kind="qualification", arm="full", history=history
         )
         payload = json.loads((tmp_path / "out" / "failed_run_history.json").read_text())
-        assert payload["run_kind"] == "overfit"
+        assert payload["run_kind"] == "qualification"
         assert payload["arm"] == "full"
         assert payload["history"] == history
 
     def test_failed_selection_history_write_never_masks_the_failure(self, tmp_path: Path) -> None:
         blocked = tmp_path / "blocked"
         blocked.write_text("a file where the output directory should be")
-        te._write_failed_run_history(blocked, run_kind="overfit", arm="full", history=[])
+        te._write_failed_run_history(blocked, run_kind="qualification", arm="full", history=[])
         assert blocked.is_file()
 
 
-class TestInitProbe:
-    """`_run_init_probe` -- the read-only Sec 13.19.1 S0 hard gate."""
+class TestInitialSlotHealthGuard:
+    """`_enforce_e2e_initial_slot_health` -- the step-0 death guard.
 
-    def test_init_probe_reports_guard_telemetry_without_training(
+    The retired `--ddp-mode init-probe` measured exactly this and then only
+    logged it, which is how the 2026-07-27 run trained for fifteen minutes
+    before dying of a condition present at initialization (design 2026-07-29
+    Sec 4.1). The measurement is retained; the log is now a raise.
+    """
+
+    @staticmethod
+    def _token_store(cfg: te.EgoConfig) -> tuple[PackedFeatureTable, dict[str, int]]:
+        table = PackedFeatureTable.from_pack(cast(Path, cfg.data.pack_dir), torch.device("cpu"))
+        return table, table.manifest.node_index()
+
+    def test_guard_reports_slot_telemetry_without_training(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="qualification")
         _write_tiny_token_pack(cast(Path, cfg.data.pack_dir), _E2E_PIPELINE_NODES, min_length=3)
         data = te.assemble_egostitch_data(cfg)
         model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
-        # `ddp_mode="init-probe"` matches how `_run_ddp_worker` actually calls
-        # this before dispatching to `_run_init_probe` -- an unset `run_kind`
-        # (the default here) would otherwise now require a pinned digest
-        # (re-reviewed P1-B), which this preflight mode is explicitly exempt
-        # from since it is the one documented way to *measure* the digest.
-        te._bind_feature_standardization(model, cfg, data, ddp_mode="init-probe")
+        te._bind_feature_standardization(model, cfg, data)
+        table, node_index = self._token_store(cfg)
         accelerator = Accelerator(cpu=True)
         before = [p.detach().clone() for p in model.parameters()]
 
         with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-            report = te._run_init_probe(
-                model, cfg, data, accelerator, edge_batch=8, topk_fraction=0.1
+            report = te._enforce_e2e_initial_slot_health(
+                model,
+                data,
+                accelerator,
+                edge_batch=8,
+                topk_fraction=0.1,
+                token_table=table,
+                token_node_index=node_index,
             )
 
         assert "h_pairwise_cosine_mean" in report
         assert "plan_rank1_marginal_residual" in report
+        assert "pi_slot_std" in report
+        assert "adj_offdiag_std" in report
         assert "plan_total_mass" in report
+        # Read-only: the guard runs before the first optimizer step.
         for original, current in zip(before, model.parameters(), strict=True):
             torch.testing.assert_close(original, current.detach())
 
-    def test_init_probe_fails_closed_on_an_empty_guard_population(
+    def test_guard_fails_closed_on_an_empty_guard_population(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="qualification")
         data = replace(te.assemble_egostitch_data(cfg), val_pairs=[])
         model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
-        te._bind_feature_standardization(model, cfg, data, ddp_mode="init-probe")
+        te._bind_feature_standardization(model, cfg, data)
 
-        with pytest.raises(RuntimeError, match="guard population"):
-            te._run_init_probe(
-                model, cfg, data, Accelerator(cpu=True), edge_batch=8, topk_fraction=0.1
+        with pytest.raises(RuntimeError, match="empty population"):
+            te._enforce_e2e_initial_slot_health(
+                model,
+                data,
+                Accelerator(cpu=True),
+                edge_batch=8,
+                topk_fraction=0.1,
+                token_table=None,
+                token_node_index=None,
             )
 
-
-class TestInitProbeDispatch:
-    """[P2] `_run_ddp_worker`'s ``init-probe`` branch must place the model.
-
-    Unlike the `probe`/`epoch-probe`/training branches, nothing here used to
-    call `accelerator.prepare`/`.to(device)` before handing the freshly
-    constructed (CPU) model to `_run_init_probe`, which calls `_validate_epoch`
-    -- and that moves its *batches* to `accelerator.device` unconditionally,
-    so on a real GPU cluster run this would crash on the first device
-    mismatch, exactly where the gate is supposed to run before any training
-    budget is spent.
-
-    A CPU-only test environment cannot exercise an actual device mismatch (no
-    GPU is present, so `accelerator.device` is already `cpu`), so this
-    verifies the *mechanism* instead: the dispatch branch must route the
-    model through the same `accelerator.prepare` call the other branches use
-    for device placement, before `_run_init_probe` is invoked. This is
-    necessarily a "spy on the call, not just the assertion" test, per the
-    limits of a CPU sandbox.
-    """
-
-    def test_init_probe_dispatch_prepares_the_model_before_probing(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize(
+        ("cosine", "expect_raise"),
+        [(0.9500001, True), (0.95, False), (0.62, False)],
+    )
+    def test_guard_raises_when_born_above_the_cosine_trip_line(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        cosine: float,
+        expect_raise: bool,
     ) -> None:
+        """Strictly above 0.95 is a refusal, not a warning."""
         cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
-        _write_tiny_token_pack(cast(Path, cfg.data.pack_dir), _E2E_PIPELINE_NODES, min_length=3)
+        data = te.assemble_egostitch_data(cfg)
+        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+        assert data.val_pairs
 
-        # Pin the calibrated digest so the (separately fixed, P1-B) rehearsal
-        # unpinned-digest gate does not interfere with this P2-focused test.
-        calibration_data = te.assemble_egostitch_data(replace(cfg, run_kind=None))
-        assert calibration_data.feature_stats is not None
-        cfg = replace(
-            cfg,
-            run_kind="rehearsal",
-            model=replace(
-                cfg.model,
-                config={
-                    **cfg.model.config,
-                    "feature_stats_sha256": calibration_data.feature_stats.digest,
+        def _validation(*_args: object, **_kwargs: object) -> te._ValidationResult:
+            return te._ValidationResult(
+                metrics=_flat_edge_metrics(),
+                fidelity={
+                    "pi_slot_std": 0.3,
+                    "h_pairwise_cosine_mean": cosine,
+                    "adj_offdiag_std": 0.3,
+                    "plan_row_entropy": 0.5,
+                    "plan_rank1_marginal_residual": 0.2,
                 },
-            ),
-        )
+            )
 
-        accelerator = Accelerator(cpu=True)
-        prepare_calls: list[object] = []
-        original_prepare = accelerator.prepare
+        monkeypatch.setattr(te, "_validate_epoch", _validation)
 
-        def recording_prepare(*args: object, **kwargs: object) -> object:
-            prepare_calls.append(args[0] if len(args) == 1 else args)
-            return original_prepare(*args, **kwargs)
+        def _run() -> dict[str, float]:
+            return te._enforce_e2e_initial_slot_health(
+                model,
+                data,
+                Accelerator(cpu=True),
+                edge_batch=8,
+                topk_fraction=0.1,
+                token_table=None,
+                token_node_index=None,
+            )
 
-        monkeypatch.setattr(accelerator, "prepare", recording_prepare)
-        monkeypatch.setattr(te, "build_egostitch_ddp_accelerator", lambda *a, **kw: accelerator)
-
-        probe_calls: list[tuple[object, object]] = []
-
-        def fake_run_init_probe(
-            model: object, cfg: object, data: object, accelerator: object, **kwargs: object
-        ) -> dict[str, float]:
-            probe_calls.append((model, accelerator))
-            return {}
-
-        monkeypatch.setattr(te, "_run_init_probe", fake_run_init_probe)
-
-        args = te.EgoCliArgs(
-            config=cfg.preregistration,  # unused on the init-probe branch
-            seed=None,
-            output_dir=None,
-            ddp_mode="init-probe",
-            pack_dir=tmp_path / "f0-pack",
-            token_budget_per_rank=4,
-            profile_output=tmp_path / "profile.json",
-        )
-
-        te._run_ddp_worker(cfg, args)
-
-        assert len(prepare_calls) == 1, "init-probe must call accelerator.prepare exactly once"
-        assert len(probe_calls) == 1
-        probed_model, probed_accelerator = probe_calls[0]
-        assert probed_accelerator is accelerator
-
-        # The prepared object must be, or must wrap, the exact model instance
-        # `_run_init_probe` goes on to use -- the same "device-move the raw
-        # model in place, then keep using `model` (not the wrapped return)"
-        # contract the training loop and `_run_probe_mode` already rely on.
-        prepared = prepare_calls[0]
-        prepared_model = prepared.model if isinstance(prepared, te._CompositeStep) else prepared
-        assert prepared_model is probed_model
-
-        # A CPU sandbox cannot fail this by device mismatch (there is only
-        # one device), but it does prove `accelerator.prepare` really ran
-        # against this model -- the same call that performs `.to(device)` on
-        # a real GPU rank.
-        for parameter in probed_model.parameters():
-            assert parameter.device == accelerator.device
+        if expect_raise:
+            with pytest.raises(RuntimeError, match=r"training_invalid\(initial_slot_collapse\)"):
+                _run()
+        else:
+            assert _run()["h_pairwise_cosine_mean"] == pytest.approx(cosine)

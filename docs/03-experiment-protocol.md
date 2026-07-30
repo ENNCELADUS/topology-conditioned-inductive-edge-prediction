@@ -470,7 +470,7 @@ rule).
    the completed artifact retains its old registration hash and remains diagnostic-only.
    A binding one-seed screening run requires the replacement experiment ID and run
    metadata pinned before training begins.
-   **Headline-model revision (2026-07-16, rev 3.0):** the pending frozen-s0 screening
+   **Headline-model revision (2026-07-16, rev 3.0; historical):** the pending frozen-s0 screening
    contract above is unchanged and remains the binding contract for the already-pinned
    frozen-s0 run — its outcome is the motivating arm for the successor. The **next**
    Stage-1 build after that screen publishes is the e2e stitched-topology-conditioned
@@ -484,6 +484,8 @@ rule).
    registration must additionally pin the four-logit decomposition report, the
    representation-probe protocol (including degree-partialled probes), the
    within-checkpoint `f_logit` liveness reference, and a measured H20 cost re-estimate.
+   That five-arm scope governed the completed rev-3.0 screen only; the active rev-3.2
+   successor uses the eight-arm two-stage contract described below.
    **Binding frozen-s0 result and disposition (2026-07-17):** the replacement
    fixed-Seed-0 run (commit `60745f2`, checkpoint `56b91c17fa8d3b86`, registration
    `97e61a7d...`) completed all required artifacts and returned `cut`. Both guards
@@ -496,25 +498,23 @@ rule).
    closes the frozen-s0 screen and satisfies spec §14.3(1), without binding the
    successor registration or weakening E1/E3's multi-seed inference rules. Full
    result: `docs/results/G5-stage1-seed0-20260717.md`.
-   **Code retirement (planned, not yet executed).** The two-stage cleanup design
-   (`docs/superpowers/specs/2026-07-29-egostitch-e2e-two-stage-cleanup.md` §6.2)
-   is a PROPOSED document outside this repository's authority chain; per the
-   spec-freeze rule a design authorizes implementation only, not execution. It
-   proposes retiring the frozen-s0 `egostitch` pipeline that produced this
-   screen — Stage-1 training/DDP path, `frozen_s0` scoring mode, and its
-   diagnostics — from the codebase, but the code is not yet removed. Once that
-   retirement lands, the Stage-gate instantiation and dated entries above will
-   govern the completed, published screen only and will no longer describe a
-   runnable pipeline. `docs/results/G5-stage1-seed0-20260717.md`,
+   **Code retirement (implemented in the current worktree; cleanup commit pending).**
+   The two-stage cleanup deletes the frozen-s0 `egostitch` pipeline that produced this
+   screen — its Stage-1 training/DDP path, `frozen_s0` scoring mode, and diagnostics.
+   The producing code last exists at commit `dcae090`. The Stage-gate instantiation and
+   dated entries above therefore govern the completed, published screen only and no
+   longer describe a runnable active-tree pipeline. Per the spec-freeze rule, this
+   implementation authorizes no execution; the successor v4 registration remains
+   `DRAFT`. `docs/results/G5-stage1-seed0-20260717.md`,
    `docs/registrations/g5_stage1_preregistration.{json,md}`, and
    `outputs/egostitch_stage1/` remain the citable record regardless of when
-   that retirement lands; the cleanup design's §6.2 proposes each then carry a
-   one-line header naming the commit at which the producing code was removed —
-   a pending intention, not yet an in-force requirement of this document. The
+   that retirement lands; the two Markdown evidence records name `dcae090` and state
+   that deletion is in the current worktree pending a cleanup commit. The binding JSON
+   remains unchanged because altering it would change the registered evidence hash. The
    rule that a Stage-1-descended screen carries engineering evidence regardless
    of seed count — inference reserved for E1/E3 under §5.2's ≥3-seed Holm
    procedure plus the §8-spec 30-config HPO-parity budget — is unaffected by
-   the (pending) code retirement and applies unchanged to any successor ladder.
+   the code retirement and applies unchanged to any successor ladder.
    **E2E v1 training outcome and prospective replacement (2026-07-19):** the
    registered v1 `full` arm completed its engineering training pipeline, but its
    validation-selected checkpoint came from the reconstruction-only warm-start; the
@@ -569,15 +569,18 @@ rule).
    under owner delegation: the rev-3.0 build line proceeds as the rev-3.1 repair
    (spec §14.4; decision trail
    `docs/superpowers/specs/2026-07-25-egostitch-e2e-relational-repair-design.md` r5,
-   P0 audits `outputs/p0_audit_20260725/`). Its screen is a fresh v3 registration
-   with an **eight-arm** scope — six trained arms (full, `B0-e2e`/f-only,
+   P0 audits `outputs/p0_audit_20260725/`). Its screen is governed prospectively by
+   the fresh v4 registration, currently `DRAFT`, with an **eight-arm** scope — six
+   trained arms (full, `B0-e2e`/f-only,
    pair+topology, `p = 0`, `cosine_pool`, `no_l_rel`) plus two scoring-time
    controls over the full checkpoint (within-pair rebuild-form shuffle 6a-v3 and
-   degree-preserving rewiring 6e-v1) — with two-stage `V_fit`-calibrated /
-   `V_qual`-rehearsed qualification gates frozen before binding. The frozen
+   degree-preserving rewiring 6e-v1) — on the two-stage ladder: both stages train on
+   identical `V_fit`, validate/select on `V_hold`, and differ only in `optim.epochs`.
+   Qualification has a guards-only verdict; formal execution requires owner-promoted
+   `BINDING` v4 and retains the registered acceptance thresholds. The frozen
    pairwise scorer's §0 role is **unchanged** (the measured grounding-pool audit
    eliminated the candidate-proposer reuse), and this paragraph does not bind the
-   v3 registration or weaken E1/E3's multi-seed inference rules.
+   v4 registration or weaken E1/E3's multi-seed inference rules.
 
 ### 5.1 Priority order (after gates)
 

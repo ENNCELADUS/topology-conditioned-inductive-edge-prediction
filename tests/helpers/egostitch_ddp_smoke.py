@@ -1,15 +1,30 @@
-"""Two-rank CPU/gloo smoke driver for the EgoStitch Stage-1 DDP loop.
+"""Two-rank CPU/gloo smoke driver for the EgoStitch E2E step-0 slot guard.
 
 Launched by the integration test as::
 
     python -m torch.distributed.run --standalone --nproc_per_node=2 \
-        tests/helpers/egostitch_ddp_smoke.py --output-dir <dir>
+        tests/helpers/egostitch_ddp_smoke.py --output-dir <dir> [--mode collapsed]
 
-Drives a tiny `EgoStitchStage1` through `train_egostitch_ddp_loop` on a
-synthetic 8-node bundle with a fake s0 cache, then asserts on rank zero that
-the emitted runtime profile passes the orchestrator's exact
-`_validate_worker_profile` schema and that `write_outputs` produces the pinned
-Task-4 payload.
+Drives a tiny `EgoStitchE2E` through `_enforce_e2e_initial_slot_health` — the
+step-0 death guard the two-stage cleanup put in place of the retired
+``--ddp-mode init-probe`` — under a real two-rank process group.
+
+Why this and not the whole loop: the guard's raise is an
+``accelerator.reduce`` followed by a raise on *every* rank, precisely because
+`_validate_epoch` returns ``None`` off the main process and a rank-zero-only
+raise is a DDP hang (design 2026-07-29 Sec 4.1). Only a real process group can
+tell a correct all-rank raise from a hang, and a single-process unit test
+cannot. The rest of `_train_e2e_stability_loop` is not reachable on a toy
+bundle: its clip guard aborts a random 8-node fixture at step 2, and making it
+survive would mean loosening registered guard thresholds until the run proved
+nothing.
+
+``--mode healthy`` (default) asserts the guard admits a freshly initialized
+model and returns its telemetry. ``--mode collapsed`` zeroes the imagine
+decoder's slot head so every slot embedding is the same bias vector — a model
+genuinely born at ``h_pairwise_cosine_mean == 1`` — and asserts that *both*
+ranks raise ``training_invalid(initial_slot_collapse)``. A rank that hangs
+instead never writes its file and the launching test times out.
 """
 
 from __future__ import annotations
@@ -30,13 +45,22 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import yaml  # type: ignore[import-untyped]  # noqa: E402
 from src import train_egostitch as te  # noqa: E402
 from src.data.artifacts import canonical_pair  # noqa: E402
 from src.data.ego_targets import EgoTargetBuilder  # noqa: E402
+from src.data.packed_features import (  # noqa: E402
+    PACK_FORMAT,
+    PackedFeatureManifest,
+    PackedNodeRecord,
+    PackedShardRecord,
+    sha256_file,
+    write_packed_manifest,
+)
 from src.data.pairs import NegativeSampler  # noqa: E402
-from src.e2_pipeline import _validate_worker_profile  # noqa: E402
-from src.model.egostitch import EgoStitchConfig, EgoStitchStage1  # noqa: E402
+from src.model.egostitch import EgoStitchConfig  # noqa: E402
+from src.model.egostitch.config import E2EConfig  # noqa: E402
+from src.model.egostitch.e2e_model import EgoStitchE2E  # noqa: E402
+from src.train_b0 import EvalConfig, ModelConfig  # noqa: E402
 
 _NODES = [f"n{i}" for i in range(8)]
 _POSITIVES = [
@@ -51,77 +75,117 @@ _POSITIVES = [
     ("n1", "n7"),
     ("n7", "n7"),
 ]
-_TINY_MODEL = {
-    "input_dim": 8,
-    "d_p": 4,
-    "d_z": 4,
-    "d_h": 8,
-    "slots": 4,
-    "m_max": 8,
-    "n_ground": 3,
-    "decoder_layers": 1,
+_TOKEN_DIM = 1536
+_E2E_TINY_MODEL: dict[str, object] = {
+    "d_model": 16,
+    "encoder_layers": 1,
+    "cross_attn_layers": 1,
     "n_heads": 2,
-    "gin_hidden": 8,
-    "gin_layers": 2,
-    "sinkhorn_iters": 3,
+    "n_inj": 1,
+    "ste_dim": 8,
+    "ste_layers": 1,
+    "xattn_heads": 2,
+    "p_topo": 0.15,
+    "p_cont": 0.15,
+    "n_ground": 20,
+    # The toy bundle carries `feature_stats is None` — it never goes through
+    # `assemble_egostitch_data`'s V_fit statistics path — so the registered
+    # `zscore_vfit_v1` transform would raise for want of constants. The guard
+    # under test reads slot geometry, not standardization.
+    "feature_standardization": "row_layernorm",
 }
 
 
-def _toy_config(output_dir: Path) -> te.EgoConfig:
+def _write_tiny_token_pack(pack_dir: Path) -> None:
+    """Write the minimal raw-token pack `_BatchFactory` consumes.
+
+    Every node gets a distinct sequence length (>= 3, the minimum a real
+    `PairCrossAttention` forward needs: one inner token strictly between the
+    BOS/EOS positions).
+    """
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(1)
+    shard_path = pack_dir / "shard-000.bin"
+    records: list[PackedNodeRecord] = []
+    offset = 0
+    with shard_path.open("wb") as handle:
+        for i, node in enumerate(_NODES):
+            length = 3 + i
+            tensor = torch.from_numpy(rng.normal(size=(length, _TOKEN_DIM)).astype(np.float32))
+            raw = tensor.to(torch.bfloat16).contiguous().view(torch.uint16)
+            handle.write(raw.numpy().tobytes())
+            records.append(PackedNodeRecord(node, 0, offset, offset, length))
+            offset += length
+    manifest = PackedFeatureManifest(
+        format=PACK_FORMAT,
+        input_dim=_TOKEN_DIM,
+        dtype="bfloat16",
+        source_metadata_sha256="0" * 64,
+        source_index_sha256="0" * 64,
+        nodes=tuple(records),
+        shards=(
+            PackedShardRecord(
+                filename="shard-000.bin",
+                num_tokens=offset,
+                byte_size=shard_path.stat().st_size,
+                sha256=sha256_file(shard_path),
+            ),
+        ),
+        pack_workers=1,
+        build_seconds=0.0,
+    )
+    write_packed_manifest(pack_dir, manifest)
+
+
+def _toy_config(output_dir: Path, pack_dir: Path) -> te.EgoConfig:
+    """Build the E2E worker config directly, bypassing the registered pins.
+
+    `load_config` enforces the registered arm contract (bf16, negative_ratio 5,
+    the pinned optimizer block); this driver runs on CPU over eight synthetic
+    nodes, so the dataclass is constructed here rather than round-tripped
+    through YAML.
+    """
     prereg = output_dir / "prereg.json"
     prereg.write_text('{"registration_id": "smoke"}\n')
-    mapping = {
-        "model": {"family": "egostitch", "config": dict(_TINY_MODEL)},
-        "data": {
-            "root": str(output_dir / "data"),
-            "strategy": "toy",
-            "train_positives": "e_sup",
-            "negative_ratio": 2,
-            "partition_seed": 0,
-            "msg_fraction": 0.8,
-            "node_batch": 4,
-            "edge_batch": 4,
-            "f0_cache": str(output_dir / "f0.pt"),
-            "grounding_cache": str(output_dir / "grounding.npz"),
-            "s0_cache": str(output_dir / "s0.npz"),
-            "s0_checkpoint_id": "deadbeefcafefeed",
-            "expected_missing_features": [],
-        },
-        "optim": {
-            "lr": 1e-3,
-            "weight_decay": 0.0,
-            "epochs": 2,
-            "warmup_steps": 2,
-            "grad_clip": 1.0,
-            "warmstart_fraction": 0.25,
-        },
-        "diagnostics": {
-            # 2 ranks x world=2, 4 e_sup positives, negative_ratio=2, edge_batch=4
-            # -> rows_per_rank=[6, 6] -> 2 steps/epoch x 2 epochs = 4 global steps.
-            # warmstart_fraction=0.25 arms the fixed gradient probe at global_step
-            # 2 (post-increment); interval=2 fires it at steps 2 and 4 (2 of the
-            # 3 armed steps) so the loop exercises the probe path without turning
-            # it into a per-step assertion or leaving it dark for the whole run.
-            "gradient_probe_interval": 2,
-            # Production Stage-1 defaults (egostitch_stage1_breadth_first.yaml):
-            # kept as-is because streak growth is bounded by interval * #firings
-            # (<= 4 here), far below gradient_imbalance_steps, so the Kendall
-            # guard cannot spuriously activate during a 4-step toy run.
-            "gradient_imbalance_ratio": 10.0,
-            "gradient_imbalance_steps": 1000,
-            "probe_s1_abs_mean_max": 1000.0,
-            "selection_auprc_tolerance": 1.0e-4,
-            "topk_fraction": 0.01,
-        },
-        "eval": {"patience": 2, "eval_every": 1},
-        "seed": 0,
-        "output_dir": str(output_dir / "run"),
-        "mixed_precision": "no",
-        "preregistration": str(prereg),
-    }
-    config_path = output_dir / "config.yaml"
-    config_path.write_text(yaml.safe_dump(mapping))
-    return te.load_config(config_path)
+    return te.EgoConfig(
+        model=ModelConfig(family="egostitch_e2e", config=dict(_E2E_TINY_MODEL)),
+        data=te.EgoDataConfig(
+            root=output_dir / "data",
+            strategy="toy",
+            train_positives="e_sup",
+            negative_ratio=5,
+            partition_seed=0,
+            msg_fraction=0.8,
+            node_batch=4,
+            edge_batch=4,
+            f0_cache=output_dir / "f0.pt",
+            grounding_cache=output_dir / "grounding.npz",
+            expected_missing_features=[],
+            pack_dir=pack_dir,
+        ),
+        optim=te.EgoOptimConfig(
+            lr=1e-4,
+            weight_decay=0.01,
+            epochs=1,
+            warmup_steps=500,
+            grad_clip=1.0,
+        ),
+        diagnostics=te.EgoDiagnosticsConfig(
+            gradient_probe_interval=50,
+            gradient_imbalance_ratio=50.0,
+            gradient_imbalance_steps=200,
+            probe_s1_abs_mean_max=1000.0,
+            selection_auprc_tolerance=0.02,
+            topk_fraction=0.01,
+        ),
+        eval=EvalConfig(patience=2, eval_every=1),
+        seed=0,
+        output_dir=output_dir / "run",
+        mixed_precision="no",
+        preregistration=prereg,
+        training=te.EgoStitchTrainingConfig(),
+        run_kind="qualification",
+    )
 
 
 def _toy_bundle(model_cfg: EgoStitchConfig) -> te.EgoStitchData:
@@ -140,11 +204,6 @@ def _toy_bundle(model_cfg: EgoStitchConfig) -> te.EgoStitchData:
     sampler = NegativeSampler(
         _NODES, degrees, frozenset(canonical_pair(u, v) for u, v in _POSITIVES)
     )
-    s0 = te.S0Cache.__new__(te.S0Cache)
-    s0._logits = {}
-    for i, u in enumerate(_NODES):
-        for v in _NODES[i:]:
-            s0._logits[canonical_pair(u, v)] = 0.1 * (i + 1)
     return te.EgoStitchData(
         train_nodes=list(_NODES),
         e_sup_positives=[canonical_pair(u, v) for u, v in _POSITIVES[6:]],
@@ -156,55 +215,91 @@ def _toy_bundle(model_cfg: EgoStitchConfig) -> te.EgoStitchData:
         train_pos={node: i for i, node in enumerate(_NODES)},
         target_builder=builder,
         sampler=sampler,
-        s0=s0,
         rho_train=float(g.number_of_edges() / 36.0),
     )
+
+
+def _collapse_slot_head(model: EgoStitchE2E) -> None:
+    """Make every generated slot embedding identical, without touching a threshold.
+
+    ``h = head_h(main)`` (`src/model/egostitch/imagine.py`); with a zero weight
+    every slot of every node is the same bias vector, so the normalized
+    pairwise slot cosine is exactly 1 — a model genuinely born above the
+    Sec 14.4.8 trip line rather than a stubbed measurement.
+    """
+    with torch.no_grad():
+        model.generator.imagine.head_h.weight.zero_()
+        model.generator.imagine.head_h.bias.fill_(1.0)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--mode", choices=("healthy", "collapsed"), default="healthy")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    rank = int(os.environ["RANK"])
 
     torch.manual_seed(0)
-    cfg = _toy_config(args.output_dir)
-    model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
-    data = _toy_bundle(model_cfg)
-    model = EgoStitchStage1(model_cfg)
-    accelerator = te.build_egostitch_ddp_accelerator("no")
-
+    pack_dir = args.output_dir / "token_pack"
+    cfg = _toy_config(args.output_dir, pack_dir)
+    model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+    data = _toy_bundle(model.generator_cfg)
+    accelerator = te.build_egostitch_ddp_accelerator(cfg.mixed_precision)
+    # One writer, then a barrier: every rank opens the same pack directory.
     if accelerator.is_main_process:
-        te.write_run_start_metadata(cfg, data, world_size=accelerator.num_processes)
+        _write_tiny_token_pack(pack_dir)
     accelerator.wait_for_everyone()
-    result = te.train_egostitch_ddp_loop(
-        model, cfg, data, accelerator, node_batch=cfg.data.node_batch
-    )
-    profile = _validate_worker_profile(
-        result.runtime_profile,
-        epochs=cfg.optim.epochs,
+    factory = te._BatchFactory(
+        cfg,
+        model.generator_cfg,
+        data,
+        node_batch=cfg.data.node_batch,
+        rank=accelerator.process_index,
         world_size=accelerator.num_processes,
-        memory_limit_gib=85.0,
     )
+    if args.mode == "collapsed":
+        _collapse_slot_head(model)
+
+    # The packed token store is bf16-only; a real run consumes it under
+    # Accelerate's bf16 autocast, reproduced explicitly because this driver
+    # runs the CPU accelerator at mixed_precision="no".
+    def _guard() -> dict[str, float]:
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            return te._enforce_e2e_initial_slot_health(
+                model,
+                data,
+                accelerator,
+                edge_batch=cfg.data.edge_batch,
+                topk_fraction=cfg.diagnostics.topk_fraction,
+                token_table=factory._token_table,
+                token_node_index=factory._token_node_index,
+            )
+
+    if args.mode == "collapsed":
+        raised = ""
+        try:
+            _guard()
+        except RuntimeError as error:
+            raised = str(error)
+        if raised != "training_invalid(initial_slot_collapse)":
+            raise RuntimeError(f"rank {rank} did not raise the named guard: {raised!r}")
+        (args.output_dir / f"raised-rank-{rank}.json").write_text(
+            json.dumps({"rank": rank, "error": raised}) + "\n"
+        )
+        accelerator.wait_for_everyone()
+        return
+
+    report = _guard()
+    accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        te.write_outputs(result, cfg, data)
-        payload = torch.load(cfg.output_dir / "best.pt", weights_only=False)
-        assert set(payload) == {
-            "model_state",
-            "model_family",
-            "model_config",
-            "epoch",
-            "val_metrics",
-            "seed",
-            "config",
-        }, sorted(payload)
-        assert payload["model_family"] == "egostitch"
         (args.output_dir / "smoke_ok.json").write_text(
             json.dumps(
                 {
                     "world_size": accelerator.num_processes,
-                    "epochs_completed": profile["epochs_completed"],
-                    "best_epoch": result.best_epoch,
+                    "run_kind": cfg.run_kind,
+                    "h_pairwise_cosine_mean": report["h_pairwise_cosine_mean"],
+                    "validation_rows": len(data.val_pairs),
                 }
             )
             + "\n"

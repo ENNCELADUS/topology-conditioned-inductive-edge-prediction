@@ -288,113 +288,27 @@ class TestSinkhornPlan:
 
 
 class TestDecisionHead:
-    def _slots(self, batch: int, *, seed: int) -> SlotSet:
-        gen = torch.Generator().manual_seed(seed)
-        k, d_p, n_g = _TINY.slots, _TINY.d_p, _TINY.n_ground
-        adj_raw = torch.rand(batch, k, k, generator=gen)
-        adj = 0.5 * (adj_raw + adj_raw.transpose(1, 2))
-        return SlotSet(
-            h=torch.randn(batch, k, d_p, generator=gen),
-            pi=torch.rand(batch, k, generator=gen),
-            mult=1.0 + torch.rand(batch, k, generator=gen),
-            gate=torch.rand(batch, k, generator=gen),
-            pointer=torch.softmax(torch.randn(batch, k, n_g, generator=gen), dim=-1),
-            adj=adj,
-            adj_logits=torch.logit(adj.clamp(1e-6, 1.0 - 1e-6)),
-        )
+    """Only the `tau_kappa` surface survives the two-stage cleanup.
+
+    `DecisionHead` stays in the tree because `EgoStitchE2E` reads
+    `generator.decision.tau_kappa` (`e2e_model.py:341`) as the temperature for
+    `scaffold.counterpart_membership`. Its own `(s0, s1, s2)` fusion --
+    `forward`, `forward_self`, `channels`, `fuse`, `_membership` -- belonged to
+    the retired frozen-s0 `egostitch` scorer and no longer has a live caller;
+    those tests were removed with it (design 2026-07-29 Sec 6.2).
+    `counterpart_membership` is covered in `tests/model/test_egostitch_e2e_model.py`.
+    """
 
     def test_tau_kappa_initializes_to_one(self) -> None:
         head = DecisionHead(_TINY)
-        assert float(head.tau_kappa) == pytest.approx(1.0, abs=1e-6)
+        assert float(head.tau_kappa.detach()) == pytest.approx(1.0, abs=1e-6)
 
-    def test_forward_shapes(self) -> None:
-        torch.manual_seed(0)
-        head = DecisionHead(_TINY)
-        slots_i = self._slots(2, seed=1)
-        slots_j = self._slots(2, seed=2)
-        plan = torch.rand(2, _TINY.slots, _TINY.slots)
-        proj = torch.randn(2, _TINY.d_p)
-        d_hat = torch.rand(2) * 5
-        s0 = torch.randn(2)
-        logits = head(s0, slots_i, slots_j, plan, proj, proj, d_hat, d_hat)
-        assert logits.shape == (2,)
-        assert bool(torch.isfinite(logits).all())
-
-    def test_membership_is_scale_safe_and_pair_discriminative(self) -> None:
-        """Realistic raw norms must not drive s1 into the saturated -1e7 regime."""
-        config = EgoStitchConfig(
-            input_dim=8,
-            d_p=256,
-            d_z=4,
-            d_h=8,
-            slots=4,
-            m_max=8,
-            n_ground=3,
-            decoder_layers=1,
-            n_heads=2,
-            gin_hidden=8,
-            gin_layers=2,
-        )
-        head = DecisionHead(config)
-        batch, slots_n = 32, config.slots
-        gen = torch.Generator().manual_seed(17)
-        h = 25.0 * torch.randn(batch, slots_n, config.d_p, generator=gen)
-        slots = SlotSet(
-            h=h,
-            pi=torch.full((batch, slots_n), 0.5),
-            mult=torch.ones(batch, slots_n),
-            gate=torch.full((batch, slots_n), 0.5),
-            pointer=torch.full((batch, slots_n, config.n_ground), 1.0 / config.n_ground),
-            adj=torch.zeros(batch, slots_n, slots_n),
-            adj_logits=torch.full((batch, slots_n, slots_n), -20.0),
-        )
-        other = 225.0 * torch.randn(batch, config.d_p, generator=gen)
-
-        s1 = head._membership(slots, other)
-
-        assert float(s1.abs().max()) < 10.0
-        assert float(s1.std()) > 1e-4
-
-        channels = {"s1": s1, "s2": torch.rand(batch), "s2_aa": torch.rand(batch)}
-        residual = head.fuse(torch.zeros(batch), channels)
-        assert residual.dtype == torch.float32
-        assert float(residual.std()) > 1e-6
-
-    def test_self_path_matches_pinned_formula(self) -> None:
-        torch.manual_seed(0)
-        head = DecisionHead(_TINY)
-        slots = self._slots(1, seed=3)
-        proj = torch.randn(1, _TINY.d_p)
-        d_hat = torch.tensor([3.0])
-        s0 = torch.tensor([0.25])
-        logits = head.forward_self(s0, slots, proj, d_hat)
-
-        # Recompute s2(u, u) = sum_k pi_k^2 * adj[k, k] by hand.
-        diag = torch.diagonal(slots.adj, dim1=-2, dim2=-1)
-        s2 = float((slots.pi**2 * diag).sum())
-        diff = (
-            torch.nn.functional.normalize(slots.h, dim=-1)
-            - torch.nn.functional.normalize(proj, dim=-1)[:, None, :]
-        )
-        kappa = -(diff**2).sum(dim=-1) / head.tau_kappa
-        s1 = float(torch.logsumexp(kappa + torch.log(slots.pi * slots.mult), dim=-1))
-        damping = max(float(torch.log1p(d_hat)), 1e-3)
-        stacked = torch.tensor([[s1, s2, s2 / damping]])
-        expected = float(s0 + head.gate(stacked).squeeze(-1) * head.w)
-        assert float(logits) == pytest.approx(expected, rel=1e-5)
-
-    def test_zero_w_reduces_to_s0(self) -> None:
-        torch.manual_seed(0)
+    def test_tau_kappa_stays_positive_under_a_negative_raw_parameter(self) -> None:
+        """It is softplus-parameterized, so it can never reach the divide-by-zero."""
         head = DecisionHead(_TINY)
         with torch.no_grad():
-            head.w.zero_()
-        slots = self._slots(2, seed=4)
-        plan = torch.rand(2, _TINY.slots, _TINY.slots)
-        proj = torch.randn(2, _TINY.d_p)
-        d_hat = torch.ones(2)
-        s0 = torch.tensor([1.5, -0.5])
-        logits = head(s0, slots, slots, plan, proj, proj, d_hat, d_hat)
-        torch.testing.assert_close(logits, s0)
+            head.tau_kappa_raw.fill_(-50.0)
+        assert float(head.tau_kappa.detach()) > 0.0
 
     def test_softplus_unit_init_constant(self) -> None:
         assert math.isclose(math.log(math.expm1(1.0)), 0.5413248546129181, rel_tol=1e-9)

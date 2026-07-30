@@ -228,57 +228,53 @@ def test_probe_scope_is_required_and_v_select_is_not_exposed() -> None:
     assert "v_select" not in probes.E2E_PROBE_SCOPES
 
 
-def test_prebinding_scope_feature_reads_exclude_sealed_nodes() -> None:
-    formal_nodes = ["fit-a", "fit-b", "qual-a", "select-a"]
-    fit_nodes = frozenset({"fit-a", "fit-b"})
-    qual_nodes = frozenset({"qual-a"})
-    assert probes._probe_feature_nodes(
-        "calibration_fit",
-        formal_nodes,
-        v_fit=fit_nodes,
-        v_qual=qual_nodes,
-    ) == ["fit-a", "fit-b"]
-    assert probes._probe_feature_nodes(
-        "qualification_qual",
-        formal_nodes,
-        v_fit=fit_nodes,
-        v_qual=qual_nodes,
-    ) == ["qual-a"]
-    assert probes._probe_feature_nodes(
+@pytest.mark.parametrize("retired_scope", ["calibration_fit", "qualification_qual"])
+def test_retired_prebinding_probe_scopes_are_rejected_everywhere(retired_scope: str) -> None:
+    """The two-stage cleanup collapses the scope domain to `formal_train` alone."""
+    assert probes.E2E_PROBE_SCOPES == ("formal_train",)
+    assert retired_scope not in probes.E2E_PROBE_SCOPES
+    with pytest.raises(ValueError, match=f"unsupported E2E probe scope '{retired_scope}'"):
+        probes.build_probe_scope_context(
+            cast(probes.E2EProbeScope, retired_scope),
+            data_root=Path("unused"),
+            strategy="breadth_first",
+            partition_seed=0,
+            msg_fraction=0.8,
+            expected_missing_features=(),
+        )
+
+
+def test_build_probe_scope_context_rebuilds_the_full_train_side_universe(
+    tmp_path: Path,
+) -> None:
+    from src.train_egostitch import _BENCHMARK_SUBDIR
+
+    strategy_dir = tmp_path / _BENCHMARK_SUBDIR / "breadth_first"
+    strategy_dir.mkdir(parents=True)
+    with (strategy_dir / "split.pkl").open("wb") as handle:
+        pickle.dump({"train": ["a", "b", "c", "d"], "test": ["sealed-test"]}, handle)
+    (strategy_dir / "train_edges.txt").write_text(
+        "a\tb\t1\nb\tc\t1\nc\td\t1\na\tc\t0\n",
+        encoding="utf-8",
+    )
+
+    nodes, graph = probes.build_probe_scope_context(
         "formal_train",
-        formal_nodes,
-        v_fit=fit_nodes,
-        v_qual=qual_nodes,
-    ) == formal_nodes
+        data_root=tmp_path,
+        strategy="breadth_first",
+        partition_seed=0,
+        msg_fraction=1.0,
+        expected_missing_features=(),
+    )
 
-
-def test_probe_scope_graph_uses_exact_fit_and_qualification_edges() -> None:
-    formal_edges = frozenset(
-        {
-            ("fit-a", "fit-b"),
-            ("qual-a", "qual-b"),
-            ("select-a", "select-b"),
-            ("fit-a", "qual-a"),
-        }
-    )
-    fit_graph = probes._build_probe_scope_graph(
-        "calibration_fit",
-        ["fit-a", "fit-b"],
-        formal_e_msg=formal_edges,
-        fit_e_msg=frozenset({("fit-a", "fit-b")}),
-        qual_e_msg=frozenset({("qual-a", "qual-b")}),
-    )
-    qual_graph = probes._build_probe_scope_graph(
-        "qualification_qual",
-        ["qual-a", "qual-b"],
-        formal_e_msg=formal_edges,
-        fit_e_msg=frozenset({("fit-a", "fit-b")}),
-        qual_e_msg=frozenset({("qual-a", "qual-b")}),
-    )
-    assert set(fit_graph.nodes) == {"fit-a", "fit-b"}
-    assert set(fit_graph.edges) == {("fit-a", "fit-b")}
-    assert set(qual_graph.nodes) == {"qual-a", "qual-b"}
-    assert set(qual_graph.edges) == {("qual-a", "qual-b")}
+    # Every operative train node, and only the message-side positives.
+    assert nodes == ["a", "b", "c", "d"]
+    assert set(graph.nodes) == {"a", "b", "c", "d"}
+    assert {frozenset(edge) for edge in graph.edges} == {
+        frozenset({"a", "b"}),
+        frozenset({"b", "c"}),
+        frozenset({"c", "d"}),
+    }
 
 
 def test_train_side_probe_loader_never_requires_test_artifacts(tmp_path: Path) -> None:
@@ -490,153 +486,30 @@ class TestE2EProbeArtifact:
                 scope="formal_train",
             )
 
+    @pytest.mark.parametrize("retired_scope", ["calibration_fit", "qualification_qual"])
+    def test_producer_rejects_the_retired_prebinding_scopes(
+        self, tmp_path: Path, retired_scope: str
+    ) -> None:
+        """The scope guard fires before any file is read, so nothing else matters."""
+        with pytest.raises(ValueError, match=f"unsupported E2E probe scope '{retired_scope}'"):
+            probes.produce_e2e_probe_artifact(
+                checkpoint_path=tmp_path / "best.pt",
+                run_metadata_path=tmp_path / "run_metadata.json",
+                preregistration_path=tmp_path / "registration.json",
+                data_root=tmp_path / "data",
+                strategy="breadth_first",
+                output_path=tmp_path / "probe.npz",
+                scope=cast(probes.E2EProbeScope, retired_scope),
+            )
+
     @staticmethod
-    def _write_prebinding_producer_inputs(
+    def _write_source_producer_inputs(
         tmp_path: Path,
         *,
         run_kind: str,
-        validation_role: object = ...,
         status: str = "complete",
-    ) -> tuple[Path, Path, Path, Path]:
-        formal_output = tmp_path / "formal-probe.npz"
-        full_config = tmp_path / "missing-full.yaml"
-        registration = tmp_path / "registration.json"
-        registration.write_text(
-            json.dumps(
-                {
-                    "status": "DRAFT",
-                    "probe_artifact": {
-                        "format": "egostitch_e2e_probe_v2",
-                        "source_arm": "full",
-                        "expected_path": str(formal_output),
-                    },
-                    "arms": {"full": {"training": str(full_config)}},
-                }
-            ),
-            encoding="utf-8",
-        )
-        registration_sha = hashlib.sha256(registration.read_bytes()).hexdigest()
-        metadata_payload: dict[str, object] = {
-            "preregistration_sha256": registration_sha,
-            "run_kind": run_kind,
-            "status": status,
-            "formal_artifacts_published": False,
-            "permanent_null": "none",
-            "seed": 0,
-            "partition_seed": 0,
-            "config_path": str(full_config),
-        }
-        if validation_role is not ...:
-            metadata_payload["validation_role"] = validation_role
-        metadata = tmp_path / "run_metadata.json"
-        metadata.write_text(json.dumps(metadata_payload), encoding="utf-8")
-        return registration, metadata, full_config, formal_output
-
-    def test_calibration_fit_accepts_explicit_v_fit_only_source(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        registration, metadata, _, _ = self._write_prebinding_producer_inputs(
-            tmp_path,
-            run_kind="overfit",
-            validation_role=None,
-        )
-
-        with pytest.raises(FileNotFoundError):
-            probes.produce_e2e_probe_artifact(
-                checkpoint_path=tmp_path / "best.pt",
-                run_metadata_path=metadata,
-                preregistration_path=registration,
-                data_root=tmp_path / "data",
-                strategy="breadth_first",
-                output_path=tmp_path / "calibration-fit-probe.npz",
-                scope="calibration_fit",
-            )
-
-    def test_qualification_scope_accepts_rehearsal_and_separate_output(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        registration, metadata, _, _ = self._write_prebinding_producer_inputs(
-            tmp_path,
-            run_kind="rehearsal",
-            validation_role="V_qual",
-        )
-
-        with pytest.raises(FileNotFoundError):
-            probes.produce_e2e_probe_artifact(
-                checkpoint_path=tmp_path / "best.pt",
-                run_metadata_path=metadata,
-                preregistration_path=registration,
-                data_root=tmp_path / "data",
-                strategy="breadth_first",
-                output_path=tmp_path / "qualification-qual-probe.npz",
-                scope="qualification_qual",
-            )
-
-    @pytest.mark.parametrize(
-        ("run_kind", "validation_role", "touched_universe", "status"),
-        [
-            ("rehearsal", "V_qual", "V_qual", "complete"),
-            ("debug", "V_select", "V_select", "debug_complete"),
-        ],
-    )
-    def test_calibration_fit_rejects_checkpoint_that_touched_sealed_universe(
-        self,
-        tmp_path: Path,
-        run_kind: str,
-        validation_role: str,
-        touched_universe: str,
-        status: str,
-    ) -> None:
-        registration, metadata, _, _ = self._write_prebinding_producer_inputs(
-            tmp_path,
-            run_kind=run_kind,
-            validation_role=validation_role,
-            status=status,
-        )
-
-        with pytest.raises(
-            ValueError,
-            match=rf"13\.19\.4.*{touched_universe}",
-        ):
-            probes.produce_e2e_probe_artifact(
-                checkpoint_path=tmp_path / "best.pt",
-                run_metadata_path=metadata,
-                preregistration_path=registration,
-                data_root=tmp_path / "data",
-                strategy="breadth_first",
-                output_path=tmp_path / "calibration-fit-probe.npz",
-                scope="calibration_fit",
-            )
-
-    @pytest.mark.parametrize("validation_role", [..., "unexpected"])
-    def test_calibration_fit_rejects_missing_or_unrecognized_validation_role(
-        self,
-        tmp_path: Path,
-        validation_role: object,
-    ) -> None:
-        registration, metadata, _, _ = self._write_prebinding_producer_inputs(
-            tmp_path,
-            run_kind="overfit",
-            validation_role=validation_role,
-        )
-
-        with pytest.raises(
-            ValueError,
-            match=r"13\.19\.4.*cannot establish V_fit-only provenance",
-        ):
-            probes.produce_e2e_probe_artifact(
-                checkpoint_path=tmp_path / "best.pt",
-                run_metadata_path=metadata,
-                preregistration_path=registration,
-                data_root=tmp_path / "data",
-                strategy="breadth_first",
-                output_path=tmp_path / "calibration-fit-probe.npz",
-                scope="calibration_fit",
-            )
-
-    def test_producer_rejects_nonformal_or_incomplete_source(self, tmp_path: Path) -> None:
+        formal_artifacts_published: bool = True,
+    ) -> tuple[Path, Path, Path]:
         output = tmp_path / "probe.npz"
         registration = tmp_path / "registration.json"
         registration.write_text(
@@ -659,13 +532,47 @@ class TestE2EProbeArtifact:
             json.dumps(
                 {
                     "preregistration_sha256": registration_sha,
-                    "run_kind": "formal",
-                    "status": "running",
-                    "formal_artifacts_published": False,
+                    "run_kind": run_kind,
+                    "status": status,
+                    "formal_artifacts_published": formal_artifacts_published,
                     "permanent_null": "none",
                 }
             ),
             encoding="utf-8",
+        )
+        return registration, metadata, output
+
+    def test_producer_rejects_nonformal_or_incomplete_source(self, tmp_path: Path) -> None:
+        registration, metadata, output = self._write_source_producer_inputs(
+            tmp_path,
+            run_kind="formal",
+            status="running",
+            formal_artifacts_published=False,
+        )
+
+        with pytest.raises(ValueError, match="completed formal full arm"):
+            probes.produce_e2e_probe_artifact(
+                checkpoint_path=tmp_path / "best.pt",
+                run_metadata_path=metadata,
+                preregistration_path=registration,
+                data_root=tmp_path / "data",
+                strategy="breadth_first",
+                output_path=output,
+                scope="formal_train",
+            )
+
+    @pytest.mark.parametrize("run_kind", ["qualification", "debug"])
+    def test_producer_rejects_every_nonformal_run_kind(
+        self, tmp_path: Path, run_kind: str
+    ) -> None:
+        """The `{qualification, formal, debug}` domain must not widen this guard.
+
+        The check is a `!= "formal"` equality, not a blacklist, so a run kind
+        added after it was written cannot slip through and publish a probe
+        artifact off a short qualification run.
+        """
+        registration, metadata, output = self._write_source_producer_inputs(
+            tmp_path, run_kind=run_kind
         )
 
         with pytest.raises(ValueError, match="completed formal full arm"):

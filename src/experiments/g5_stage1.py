@@ -1,33 +1,45 @@
-r"""G5 Stage-1 gate evaluation: registered EgoStitch-vs-comparator screen.
+r"""G5 E2E Stage-1 gate evaluation: the registered eight-arm EgoStitch screen.
 
-Evaluates one fixed EgoStitch Stage-1 seed as a binding engineering screening
-gate against the frozen comparators (B0 recomputed from its cached artifact;
-the B0+cal arms from the committed kill-test payload) under the registered criteria
-(docs/registrations/g5_stage1_preregistration.json; protocol Sec 5.0.5/5.2):
+Evaluates one training seed of the ``egostitch_e2e`` family as a binding
+engineering screening gate against the frozen comparators (B0 recomputed from
+its cached artifact; the B0+cal arms from the committed kill-test payload)
+under the registered criteria (docs/registrations/g5_e2e_stage1_preregistration
+*.json; protocol Sec 5.0.5/5.2):
 
-- **Enforcement first**: the pre-registration file's sha256 must equal the
-  ``preregistration_sha256`` recorded in every training run's
+- **Enforcement first**: the registration must carry status ``BINDING`` and its
+  sha256 must equal the ``preregistration_sha256`` recorded in every arm's
   ``run_metadata.json`` — held-out metrics are never opened on a mismatch.
-- **Primary family** (single-seed point-estimate dominance, all must pass):
-  clustering-MMD ratio at the canonical G1 operating point; BFS-macro GS and RD
-  at matched global simple-edge RD (per-comparator deterministic exact-quota
-  re-assembly). Inferential and Holm fields are not applicable at Stage 1.
+- **Eight arms**: the six trained checkpoint arms plus the two mandatory
+  scoring-time controls ``structure_control_6a_v3`` (shuffle-within-pair) and
+  ``structure_control_6e_v1`` (degree-preserving rewiring). Neither control is
+  optional; both reuse the ``full`` checkpoint.
+- **Primary family** (point-estimate dominance, all must pass): clustering-MMD
+  ratio at the canonical operating point; BFS-macro GS and RD at matched global
+  simple-edge RD (per-comparator deterministic exact-quota re-assembly).
 - **Guards**: degree-MMD non-regression (<= 1.10x B0); matched edge AUPRC
   (degree-corrected ratio-1, within 0.02 of B0).
-- **Verdict**: the fixed seed yields ``"pass"`` or ``"cut"`` and, on cut, the
-  registered failure reading is written verbatim. This engineering screen does
-  not establish statistical significance or cross-seed robustness.
+- **Evidence class**: always ``"engineering"``, at every seed count. Only E1/E3
+  carry inference (CLAUDE.md; protocol Sec 5.0.5), so ``p_value``/``ci``/
+  ``holm`` are written null and the artifact is refused if they are not. Extra
+  registered seeds add cross-seed variance reporting, never significance.
+- **Verdict**: the seed yields ``"pass"`` or ``"cut"`` and, on cut, the
+  registered failure reading is written verbatim.
 
 CLI::
 
     python -m src.experiments.g5_stage1 \
-        --egostitch-universe s0.npz \
-        --s0-universe b0_fp32_candidate.npz \
-        --run-metadata run0/run_metadata.json \
+        --full-universe full.npz --fonly-universe f_only.npz \
+        --pt-universe pair_topology.npz --p0-universe p0.npz \
+        --cosine-pool-universe cosine_pool.npz --no-l-rel-universe no_l_rel.npz \
+        --control-6a-universe control_6a.npz --control-6e-universe control_6e.npz \
+        --run-metadata run_full.json ... \
         --b0-universe scores/b0_v31_candidate.npz \
         --b0cal-results outputs/b0_cal/b0cal_results.json \
-        --preregistration docs/registrations/g5_stage1_preregistration.json \
-        --data-root data --strategy breadth_first --output-dir outputs/g5_stage1
+        --probe-artifact outputs/e2e_probe/full_probe.json \
+        --preregistration docs/registrations/g5_e2e_stage1_preregistration_v3.json \
+        --data-root data --strategy breadth_first --output-dir outputs/g5_e2e_stage1
+
+The six ``--run-metadata`` paths are positional in registered trained-arm order.
 
 Determinism: identical inputs produce byte-identical outputs.
 """
@@ -69,25 +81,44 @@ from src.experiments.g1_hardened_e2 import (
     _FEATURES_SUBDIR,
     AssembledRow,
     _assembled_row_to_dict,
-    _edge_metrics_table_to_dict,
     _expected_candidate_rows,
-    _self_pair_edge_metrics_to_dict,
     assemble_and_evaluate,
-    compute_self_pair_edge_metrics,
     evaluate_regime_table,
     load_test_graph,
     load_test_node_buckets,
     validate_universe_artifact,
 )
-from src.experiments.probes import E2E_PROBE_FORMAT, evaluate_e2e_probe_artifact
-from src.score_universe import ScoresArtifact, load_scores, validate_artifact_precision
+from src.experiments.probes import (
+    E2E_PROBE_FORMAT,
+    _load_train_side_probe_inputs,
+    evaluate_e2e_probe_artifact,
+)
+from src.score_universe import (
+    ScoresArtifact,
+    load_scores,
+    validate_artifact_precision,
+    validate_e2e_margin_verdict,
+)
 
 logger = logging.getLogger(__name__)
 
 _COMPARATORS: tuple[str, ...] = ("b0", "b0_cal_density", "b0_cal_selfdensity", "b0_cal_degseq")
-_PRIMARY_FAMILY: tuple[str, ...] = ("clustering_mmd_ratio", "bfs_macro_gs", "bfs_macro_rd")
-_Z_95 = 1.959963984540054
-_SE_FLOOR = 1e-12
+
+#: This ladder is engineering evidence at every seed count (CLAUDE.md; protocol
+#: Sec 5.0.5 — only E1/E3 carry inference), so every inferential field must be
+#: written null at every nesting depth of the emitted artifact.
+_EVIDENCE_CLASS = "engineering"
+_INFERENCE_FIELDS: frozenset[str] = frozenset(
+    {
+        "ci",
+        "ci_excludes_zero",
+        "holm",
+        "holm_alpha",
+        "holm_survives",
+        "p_value",
+        "p_values",
+    }
+)
 
 
 class PreregistrationMismatch(RuntimeError):
@@ -100,6 +131,10 @@ class PreregistrationNotBinding(PreregistrationMismatch):
 
 class RegistrationShaMismatch(PreregistrationMismatch, ValueError):
     """Raised when formal metadata is not bound to the supplied registration."""
+
+
+class EvidenceClassViolation(RuntimeError):
+    """Raised when a screen artifact would carry or claim inferential evidence."""
 
 
 @dataclass(frozen=True)
@@ -139,7 +174,13 @@ def _preregistration_snapshot(path: Path) -> tuple[dict[str, object], str]:
 def _enforce_metadata_registration_hash(
     preregistration_path: Path, run_metadata_paths: Sequence[Path], expected: str
 ) -> str:
-    """Validate metadata against an already-captured registration hash."""
+    """Validate metadata against an already-captured registration hash.
+
+    The ``run_kind`` condition is a whitelist, not a ``!= "debug"`` blacklist:
+    the run-kind domain gained ``qualification``, and a blacklist would have let
+    a qualification run publish held-out metrics without anyone editing this
+    function.
+    """
     for path in run_metadata_paths:
         metadata = json.loads(path.read_text(encoding="utf-8"))
         recorded = metadata.get("preregistration_sha256")
@@ -154,30 +195,14 @@ def _enforce_metadata_registration_hash(
                 "(protocol Sec 5.2.4)"
             )
         if (
-            metadata.get("run_kind") == "debug"
+            metadata.get("run_kind") != "formal"
             or metadata.get("formal_artifacts_published") is False
         ):
             raise RegistrationShaMismatch(
-                f"{path}: debug/non-formal run metadata cannot publish held-out metrics"
+                f"{path}: only run_kind 'formal' metadata may publish held-out metrics; "
+                f"debug/non-formal run metadata cannot, and got {metadata.get('run_kind')!r}"
             )
     return expected
-
-
-def enforce_preregistration(preregistration_path: Path, run_metadata_paths: Sequence[Path]) -> str:
-    """Refuse to open held-out metrics unless every run pinned this prereg file.
-
-    Args:
-        preregistration_path: The committed pre-registration JSON.
-        run_metadata_paths: One ``run_metadata.json`` per training seed.
-
-    Returns:
-        The pre-registration file's sha256 (recorded in the gate payload).
-
-    Raises:
-        PreregistrationMismatch: On any absent or non-matching hash.
-    """
-    _, expected = _preregistration_snapshot(preregistration_path)
-    return _enforce_metadata_registration_hash(preregistration_path, run_metadata_paths, expected)
 
 
 def enforce_e2e_preregistration(
@@ -314,6 +339,7 @@ def _validate_e2e_binding_evidence(
         "parameter_group_manifests",
         "packs_and_validation_manifests",
         "qualification_attempts",
+        "qualification_history_indexes",
         "boundary_access_audit",
         "runtime_and_peak_memory",
     ):
@@ -325,10 +351,56 @@ def _validate_e2e_binding_evidence(
 
 
 def _enforce_e2e_evaluator_seed(prereg: Mapping[str, object], seed: int) -> None:
-    """Reject any formal evaluator stream except the registered seed zero."""
+    """Reject any formal evaluator stream except the registered seed zero.
+
+    This pins the *evaluator* stream (bootstrap resampling and assembled-metric
+    seeding), which is a property of the gate, not of the model. The training
+    seed is a separate axis governed by :func:`_registered_training_seeds`.
+    """
     evaluator = cast(Mapping[str, object] | None, prereg.get("evaluator"))
     if evaluator is None or evaluator.get("seed") != 0 or seed != 0:
         raise RegistrationShaMismatch("formal E2E gate requires registered evaluator seed 0")
+
+
+def _registered_training_seeds(preregistration: Mapping[str, object]) -> tuple[int, ...]:
+    """Return the registration's declared training-seed list.
+
+    Args:
+        preregistration: The parsed registration payload.
+
+    Returns:
+        The registered training seeds, in registered order.
+
+    Raises:
+        RegistrationShaMismatch: If the registration does not declare a
+            non-empty list of distinct integer seeds. A missing or malformed
+            list is a hard failure, never a silent fallback to ``[0]``.
+    """
+    seeds = preregistration.get("seeds")
+    if (
+        not isinstance(seeds, list)
+        or not seeds
+        or any(not isinstance(value, int) or isinstance(value, bool) for value in seeds)
+        or len(set(cast(list[int], seeds))) != len(seeds)
+    ):
+        raise RegistrationShaMismatch(
+            "registration must declare 'seeds' as a non-empty list of distinct "
+            f"integer training seeds; got {seeds!r}"
+        )
+    return tuple(cast(list[int], seeds))
+
+
+def _enforce_registered_training_seed(
+    metadata: Mapping[str, object], registered_seeds: Sequence[int], *, label: str
+) -> int:
+    """Bind one run's training seed to the registered seed list."""
+    seed = metadata.get("seed")
+    if not isinstance(seed, int) or isinstance(seed, bool) or seed not in registered_seeds:
+        raise RegistrationShaMismatch(
+            f"{label}: training seed {seed!r} is not one of the registered seeds "
+            f"{list(registered_seeds)}"
+        )
+    return seed
 
 
 def paired_bootstrap_lower_bound(
@@ -536,53 +608,6 @@ def assemble_matched_global_rd_graph(
     return graph
 
 
-def validate_dead_residual(
-    egostitch: ScoresArtifact,
-    s0: ScoresArtifact,
-    *,
-    min_residual_std_ratio: float,
-    max_spearman: float,
-    max_topk_overlap: float,
-    topk_fraction: float,
-) -> dict[str, float]:
-    """Fail closed when scale, rank, and top-k evidence all identify a dead residual."""
-    s0_by_pair = {
-        pair: float(logit) for pair, logit in zip(s0.pairs(), s0.logit.tolist(), strict=True)
-    }
-    pairs = list(egostitch.pairs())
-    if len(s0_by_pair) != len(pairs) or any(pair not in s0_by_pair for pair in pairs):
-        raise ValueError("dead-residual validation requires identical pair universes")
-    aligned_s0 = np.asarray([s0_by_pair[pair] for pair in pairs], dtype=np.float64)
-    logits = egostitch.logit.astype(np.float64)
-    residual = logits - aligned_s0
-    s0_std = float(np.std(aligned_s0))
-    residual_std = float(np.std(residual))
-    residual_ratio = residual_std / max(s0_std, 1e-30)
-    correlation = float(spearmanr(aligned_s0, logits).statistic)
-    if not np.isfinite(correlation):
-        correlation = 1.0 if np.array_equal(aligned_s0, logits) else 0.0
-    topk = max(1, min(len(pairs), int(round(len(pairs) * topk_fraction))))
-    row_ids = np.arange(len(pairs), dtype=np.int64)
-    s0_top = set(np.lexsort((row_ids, -aligned_s0))[:topk].tolist())
-    ego_top = set(np.lexsort((row_ids, -logits))[:topk].tolist())
-    overlap = len(s0_top & ego_top) / topk
-    report = {
-        "s0_std": s0_std,
-        "residual_std": residual_std,
-        "residual_s0_std_ratio": residual_ratio,
-        "spearman_vs_s0": correlation,
-        "topk_overlap_vs_s0": overlap,
-        "topk_fraction": topk_fraction,
-    }
-    if (
-        residual_ratio < min_residual_std_ratio
-        and correlation > max_spearman
-        and overlap > max_topk_overlap
-    ):
-        raise ValueError(f"dead residual fidelity gate failed: {report}")
-    return report
-
-
 def validate_dead_residual_within_checkpoint(
     artifact: ScoresArtifact,
     *,
@@ -595,12 +620,11 @@ def validate_dead_residual_within_checkpoint(
 
     Family ``egostitch_e2e`` liveness (spec Sec 13.17/13.8, re-registered
     2026-07-17) references the **within-checkpoint** ``f_logit`` arm of the
-    SAME scored artifact instead of a fresh frozen-s0 comparator: ``full`` and
-    ``f_logit`` already share row order by construction (one artifact, one
+    SAME scored artifact rather than a separate comparator artifact: ``full``
+    and ``f_logit`` already share row order by construction (one artifact, one
     scoring pass over the same pair universe), so no cross-artifact pair
-    alignment step exists or is needed for this family — contrast
-    :func:`validate_dead_residual`, which aligns two distinct artifacts for
-    the historical frozen-s0 family.
+    alignment step exists or is needed. The retired frozen-s0 family's
+    two-artifact variant of this gate was removed with its pipeline.
 
     Args:
         artifact: A loaded ``egostitch_e2e`` scores artifact; its ``f_logit``
@@ -661,44 +685,6 @@ def validate_dead_residual_within_checkpoint(
     return report
 
 
-_FIDELITY_KEYS = {
-    "degree_calibration_curve",
-    "slot_recall_at_k_train",
-    "slot_recall_at_k_test",
-    "slot_adjacency_clustering_correlation",
-    "s_channel_correlation",
-    "self_nonself",
-    "self_loop_rate",
-    "proj_variance_trajectory",
-}
-_COST_KEYS = {"per_node_cached", "per_pair_marginal", "candidate_universe"}
-
-
-def _load_required_diagnostics(
-    fidelity_report_paths: Sequence[Path], cost_report_path: Path | None, n_runs: int
-) -> tuple[list[dict[str, object]], dict[str, object]]:
-    if len(fidelity_report_paths) != n_runs:
-        raise ValueError("one required fidelity report per egostitch universe is required")
-    if cost_report_path is None:
-        raise ValueError("the required cost report is missing")
-    fidelity: list[dict[str, object]] = []
-    for path in fidelity_report_paths:
-        report = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
-        missing = sorted(_FIDELITY_KEYS - report.keys())
-        if missing:
-            raise ValueError(f"fidelity report {path} is missing keys: {missing}")
-        fidelity.append(report)
-    cost = cast(dict[str, object], json.loads(cost_report_path.read_text(encoding="utf-8")))
-    missing_cost = sorted(_COST_KEYS - cost.keys())
-    if missing_cost or cost.get("harmonization_rounds") != 0:
-        raise ValueError(f"cost report must include {_COST_KEYS} and harmonization_rounds=0")
-    for key in _COST_KEYS:
-        row = cast(dict[str, object], cost[key])
-        if "flops" not in row or "wall_seconds" not in row:
-            raise ValueError(f"cost report {key!r} requires flops and wall_seconds")
-    return fidelity, cost
-
-
 def _training_diagnostics(
     run_metadata: Sequence[dict[str, object]], *, require_e2e_submodule_rms: bool = False
 ) -> list[dict[str, object]]:
@@ -744,6 +730,345 @@ def _training_diagnostics(
     return reports
 
 
+def _vhold_validation_event_count(
+    path: Path,
+    *,
+    label: str,
+    arm: str,
+    run_kind: str,
+) -> int:
+    """Validate and count the worker's explicit ``V_hold`` event ledger."""
+    rows: list[object] = []
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    raise ValueError(f"{label}: validation-event row {line_number} is blank")
+                rows.append(json.loads(line))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label}: validation-event evidence is unreadable: {path}") from error
+    if not rows:
+        raise ValueError(f"{label}: validation-event evidence contains no V_hold evaluations")
+    for expected_ordinal, row in enumerate(rows, start=1):
+        if (
+            not isinstance(row, Mapping)
+            or row.get("ordinal") != expected_ordinal
+            or row.get("validation_role") != "V_hold"
+            or row.get("arm") != arm
+            or row.get("run_kind") != run_kind
+            or row.get("kind") not in {"step_0", "phase_a_end", "epoch_end"}
+            or isinstance(row.get("optimizer_step"), bool)
+            or not isinstance(row.get("optimizer_step"), int)
+            or cast(int, row["optimizer_step"]) < 0
+        ):
+            raise ValueError(
+                f"{label}: validation-event row {expected_ordinal} is not a verified V_hold "
+                "validation result"
+            )
+    first = cast(Mapping[str, object], rows[0])
+    if first.get("kind") != "step_0" or first.get("optimizer_step") != 0:
+        raise ValueError(f"{label}: first V_hold validation event must be step_0 at step 0")
+    return len(rows)
+
+
+def _vhold_evaluation_disclosure(
+    run_metadata: Mapping[str, Mapping[str, object]],
+    *,
+    run_metadata_paths: Mapping[str, Path],
+    preregistration: Mapping[str, object],
+    preregistration_path: Path,
+) -> dict[str, object]:
+    """Build cumulative per-arm K from hashed qualification and formal evidence.
+
+    ``K`` counts every verified validation event, not only checkpoint-eligible
+    epochs. Qualification attempts are accepted only through the registration's
+    path-and-hash-bound evidence; a missing, malformed, duplicated, or stale
+    source aborts the formal artifact rather than silently contributing zero.
+    """
+    evidence = preregistration.get("binding_evidence")
+    attempts_by_arm = (
+        evidence.get("qualification_attempts") if isinstance(evidence, Mapping) else None
+    )
+    indexes_by_arm = (
+        evidence.get("qualification_history_indexes")
+        if isinstance(evidence, Mapping)
+        else None
+    )
+    if not isinstance(attempts_by_arm, Mapping) or set(attempts_by_arm) != set(
+        _E2E_FORMAL_ARMS
+    ):
+        raise PreregistrationMismatch(
+            "binding_evidence.qualification_attempts must map exactly the six trained arms "
+            "to their complete qualification histories"
+        )
+    if not isinstance(indexes_by_arm, Mapping) or set(indexes_by_arm) != set(
+        _E2E_FORMAL_ARMS
+    ):
+        raise PreregistrationMismatch(
+            "binding_evidence.qualification_history_indexes must map exactly the six "
+            "trained arms to path-and-SHA-bound complete-history indexes"
+        )
+
+    seen_paths: set[Path] = set()
+    seen_attempt_fingerprints: set[tuple[str, str]] = set()
+
+    def artifact_ref(value: object, *, label: str) -> tuple[Path, str]:
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != {"path", "sha256"}
+            or not isinstance(value.get("path"), str)
+            or not _is_sha256(value.get("sha256"))
+        ):
+            raise PreregistrationMismatch(f"{label} must be exactly path + sha256 evidence")
+        path = _registered_path(
+            preregistration_path,
+            value["path"],
+            key=f"{label}.path",
+            scope="V_hold evaluation disclosure",
+        ).resolve()
+        digest = cast(str, value["sha256"])
+        if path in seen_paths:
+            raise PreregistrationMismatch(f"duplicate V_hold evaluation evidence path: {path}")
+        seen_paths.add(path)
+        if not path.is_file() or _sha256_file(path) != digest:
+            raise PreregistrationMismatch(f"{label} is missing or hash-mismatched: {path}")
+        return path, digest
+
+    arm_rows: dict[str, object] = {}
+    for arm in _E2E_FORMAL_ARMS:
+        raw_attempts = attempts_by_arm[arm]
+        if not isinstance(raw_attempts, list) or not raw_attempts:
+            raise PreregistrationMismatch(
+                f"binding_evidence.qualification_attempts.{arm} must contain at least one "
+                "verified attempt"
+            )
+        index_path, index_sha256 = artifact_ref(
+            indexes_by_arm[arm],
+            label=f"binding_evidence.qualification_history_indexes.{arm}",
+        )
+        try:
+            history_index = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise PreregistrationMismatch(
+                f"qualification history index is unreadable for {arm}: {index_path}"
+            ) from error
+        indexed_attempts = (
+            history_index.get("attempts") if isinstance(history_index, Mapping) else None
+        )
+        if (
+            not isinstance(history_index, Mapping)
+            or history_index.get("schema_version")
+            != "egostitch_e2e_qualification_history_v1"
+            or history_index.get("arm") != arm
+            or not isinstance(indexed_attempts, list)
+        ):
+            raise PreregistrationMismatch(
+                f"qualification history index has invalid schema or arm identity for {arm}"
+            )
+        if raw_attempts != indexed_attempts:
+            raise PreregistrationMismatch(
+                f"binding_evidence.qualification_attempts.{arm} does not exactly match "
+                "the immutable qualification history index"
+            )
+        qualification_sources: list[dict[str, object]] = []
+        qualification_count = 0
+        for index, raw_attempt in enumerate(raw_attempts):
+            label = f"binding_evidence.qualification_attempts.{arm}[{index}]"
+            if not isinstance(raw_attempt, Mapping) or set(raw_attempt) != {
+                "attempt_id",
+                "attempt_dir",
+                "recorded_at_utc",
+                "exit_code",
+                "outcome",
+                "verdict",
+                "qualification",
+                "run_metadata",
+                "validation_events",
+            }:
+                raise PreregistrationMismatch(
+                    f"{label} does not match the qualification-history attempt schema"
+                )
+            attempt_id = raw_attempt.get("attempt_id")
+            attempt_dir_value = raw_attempt.get("attempt_dir")
+            exit_code = raw_attempt.get("exit_code")
+            outcome = raw_attempt.get("outcome")
+            if (
+                not isinstance(attempt_id, str)
+                or not attempt_id
+                or not isinstance(attempt_dir_value, str)
+                or Path(attempt_dir_value).name != attempt_id
+                or isinstance(exit_code, bool)
+                or not isinstance(exit_code, int)
+                or outcome != ("success" if exit_code == 0 else "failure")
+            ):
+                raise PreregistrationMismatch(f"{label} has invalid attempt identity or outcome")
+            qualification_ref = raw_attempt.get("qualification")
+            metadata_ref = raw_attempt.get("run_metadata")
+            events_ref = raw_attempt.get("validation_events")
+            if outcome == "success" and (
+                qualification_ref is None or metadata_ref is None or events_ref is None
+            ):
+                raise PreregistrationMismatch(
+                    f"{label} successful attempt lacks qualification, metadata, or event evidence"
+                )
+            if qualification_ref is not None:
+                artifact_ref(qualification_ref, label=f"{label}.qualification")
+            if events_ref is None:
+                qualification_sources.append(
+                    {
+                        "attempt_id": attempt_id,
+                        "outcome": outcome,
+                        "count": 0,
+                    }
+                )
+                continue
+            if metadata_ref is None:
+                raise PreregistrationMismatch(
+                    f"{label} has validation events without run metadata"
+                )
+            metadata_path, metadata_sha256 = artifact_ref(
+                metadata_ref, label=f"{label}.run_metadata"
+            )
+            events_path, events_sha256 = artifact_ref(
+                events_ref, label=f"{label}.validation_events"
+            )
+            fingerprint = (metadata_sha256, events_sha256)
+            if fingerprint in seen_attempt_fingerprints:
+                raise PreregistrationMismatch(f"duplicate V_hold qualification evidence: {label}")
+            seen_attempt_fingerprints.add(fingerprint)
+            try:
+                qualification_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise PreregistrationMismatch(
+                    f"{label}.run_metadata is not readable JSON: {metadata_path}"
+                ) from error
+            if (
+                not isinstance(qualification_metadata, Mapping)
+                or qualification_metadata.get("run_kind") != "qualification"
+                or qualification_metadata.get("arm") != arm
+                or qualification_metadata.get("validation_role") != "V_hold"
+            ):
+                raise PreregistrationMismatch(
+                    f"{label}.run_metadata does not verify qualification arm {arm!r} on V_hold"
+                )
+            validation_evidence = qualification_metadata.get("v_hold_validation_evidence")
+            if (
+                not isinstance(validation_evidence, Mapping)
+                or validation_evidence.get("count")
+                != _vhold_validation_event_count(
+                    events_path, label=label, arm=arm, run_kind="qualification"
+                )
+                or validation_evidence.get("sha256") != events_sha256
+                or validation_evidence.get("path") != events_path.name
+            ):
+                raise PreregistrationMismatch(
+                    f"{label}.run_metadata does not bind its validation-event evidence"
+                )
+            count = cast(int, validation_evidence["count"])
+            qualification_count += count
+            qualification_sources.append(
+                {
+                    "attempt_id": attempt_id,
+                    "outcome": outcome,
+                    "run_metadata": {
+                        "path": str(metadata_path),
+                        "sha256": metadata_sha256,
+                    },
+                    "validation_events": {
+                        "path": str(events_path),
+                        "sha256": events_sha256,
+                    },
+                    "count": count,
+                }
+            )
+
+        formal_metadata_path = run_metadata_paths[arm].resolve()
+        if run_metadata[arm].get("validation_role") != "V_hold":
+            raise PreregistrationMismatch(
+                f"{arm}: formal run metadata does not verify validation_role 'V_hold'"
+            )
+        if formal_metadata_path in seen_paths:
+            raise PreregistrationMismatch(
+                f"duplicate V_hold evaluation evidence path: {formal_metadata_path}"
+            )
+        seen_paths.add(formal_metadata_path)
+        formal_evidence = run_metadata[arm].get("v_hold_validation_evidence")
+        if not isinstance(formal_evidence, Mapping):
+            raise PreregistrationMismatch(
+                f"{arm}: formal run metadata lacks V_hold validation-event evidence"
+            )
+        formal_events_name = formal_evidence.get("path")
+        if (
+            not isinstance(formal_events_name, str)
+            or Path(formal_events_name).name != formal_events_name
+        ):
+            raise PreregistrationMismatch(
+                f"{arm}: formal validation-event evidence path must be an adjacent filename"
+            )
+        formal_events_path = formal_metadata_path.with_name(formal_events_name)
+        if formal_events_path in seen_paths:
+            raise PreregistrationMismatch(
+                f"duplicate V_hold evaluation evidence path: {formal_events_path}"
+            )
+        seen_paths.add(formal_events_path)
+        formal_count = _vhold_validation_event_count(
+            formal_events_path,
+            label=f"{arm} formal run",
+            arm=arm,
+            run_kind="formal",
+        )
+        if (
+            formal_evidence.get("count") != formal_count
+            or formal_evidence.get("sha256") != _sha256_file(formal_events_path)
+        ):
+            raise PreregistrationMismatch(
+                f"{arm}: formal run metadata does not bind its validation-event evidence"
+            )
+        formal_metadata_sha256 = _sha256_file(formal_metadata_path)
+        formal_events_sha256 = _sha256_file(formal_events_path)
+        arm_rows[arm] = {
+            "k_cumulative": qualification_count + formal_count,
+            "qualification": {
+                "count": qualification_count,
+                "history_index": {
+                    "path": str(index_path),
+                    "sha256": index_sha256,
+                },
+                "attempts": qualification_sources,
+            },
+            "formal": {
+                "count": formal_count,
+                "run_metadata": {
+                    "path": str(formal_metadata_path),
+                    "sha256": formal_metadata_sha256,
+                },
+                "validation_events": {
+                    "path": str(formal_events_path),
+                    "sha256": formal_events_sha256,
+                },
+            },
+        }
+
+    return {
+        "definition": (
+            "K is the cumulative count of verified V_hold validation events, including "
+            "step-0, phase-A-end, and every epoch-end event in every qualification and "
+            "formal run regardless of checkpoint eligibility."
+        ),
+        "scope": (
+            "Selection-inflation disclosure for engineering evidence; not inferential evidence."
+        ),
+        "trained_arms": arm_rows,
+        "scoring_time_controls": {
+            arm: {
+                "k_cumulative": None,
+                "reason": "not applicable: scoring-time control reuses the full checkpoint",
+            }
+            for arm in _E2E_CONTROL_ARMS
+        },
+    }
+
+
 def _validate_b0cal_lineage(
     payload: dict[str, object], b0_meta: dict[str, object], b0_row: AssembledRow
 ) -> None:
@@ -781,564 +1106,6 @@ def _resolve_b0cal_results_path(path: Path) -> Path:
             f"found {len(candidates)}"
         )
     return candidates[0]
-
-
-# --------------------------------------------------------------------------- statistics
-
-
-def _one_sided_p(mean: float, se: float) -> float:
-    """One-sided normal p-value for ``H1: mean > 0`` (prereg procedure)."""
-    z = mean / max(se, _SE_FLOOR)
-    return 0.5 * math.erfc(z / math.sqrt(2.0))
-
-
-def holm_step_down(p_values: dict[str, float], alpha: float) -> dict[str, bool]:
-    """Holm step-down over a family: member -> survives.
-
-    Args:
-        p_values: Family member -> nominal one-sided p-value.
-        alpha: Family-wise error rate.
-
-    Returns:
-        Member -> ``True`` iff it survives (once a member fails, every larger
-        p-value fails with it).
-    """
-    ordered = sorted(p_values, key=lambda name: (p_values[name], name))
-    m = len(ordered)
-    survives: dict[str, bool] = {}
-    failed = False
-    for i, name in enumerate(ordered):
-        threshold = alpha / (m - i)
-        if failed or p_values[name] > threshold:
-            failed = True
-            survives[name] = False
-        else:
-            survives[name] = True
-    return survives
-
-
-@dataclass(frozen=True)
-class CriterionResult:
-    """One primary-family member's evaluation.
-
-    Attributes:
-        metric: The family member name.
-        mean_diff: Mean per-seed improvement vs the best comparator
-            (positive = improvement in the beneficial direction).
-        se: The pre-registered standard error.
-        p_value: One-sided nominal p-value.
-        dominates_every_comparator: Strict mean dominance over every
-            comparator (pre-registered requirement).
-        ci_excludes_zero: ``mean - 1.96·se > 0`` (binding for the MMD member).
-        best_comparator: The comparator setting the bar on this axis.
-    """
-
-    metric: str
-    mean_diff: float
-    se: float
-    p_value: float
-    dominates_every_comparator: bool
-    ci_excludes_zero: bool
-    best_comparator: str
-
-    def to_jsonable(self) -> dict[str, object]:
-        """Return a plain-dict representation."""
-        return {
-            "metric": self.metric,
-            "mean_diff": self.mean_diff,
-            "se": self.se,
-            "p_value": self.p_value,
-            "dominates_every_comparator": self.dominates_every_comparator,
-            "ci_excludes_zero": self.ci_excludes_zero,
-            "best_comparator": self.best_comparator,
-        }
-
-
-def _seed_variance(values: Sequence[float]) -> float:
-    """Unbiased between-seed variance (0 for a single seed, disclosed)."""
-    if len(values) < 2:
-        return 0.0
-    return float(np.var(np.asarray(values, dtype=np.float64), ddof=1))
-
-
-def clustering_criterion(
-    ego_rows: Sequence[AssembledRow], comparators: dict[str, dict[str, object]]
-) -> CriterionResult:
-    """The clustering-MMD member (canonical operating point, bootstrap-aware).
-
-    ``d_s = mmd(best comparator) - mmd(ego, seed s)`` (positive = better);
-    ``SE^2 = mean_s(var_boot(ego_s) + var_boot(best comp)) + var_s(d_s)/n``.
-
-    Args:
-        ego_rows: Canonical assembled rows, one per seed.
-        comparators: Comparator name -> assembled-row JSON dict.
-
-    Returns:
-        The `CriterionResult`.
-    """
-    comp_values = {
-        name: cast(dict[str, float], row["mmd_ratio"])["clustering"]
-        for name, row in comparators.items()
-    }
-    best_name = min(comp_values, key=lambda name: (comp_values[name], name))
-    best_value = comp_values[best_name]
-    best_boot_var = (
-        cast(dict[str, float], comparators[best_name]["bootstrap_std"])["clustering"] ** 2
-    )
-
-    diffs = [best_value - row.mmd_ratio["clustering"] for row in ego_rows]
-    boot_vars = [row.bootstrap_std["clustering"] ** 2 + best_boot_var for row in ego_rows]
-    n = len(ego_rows)
-    se = math.sqrt(float(np.mean(boot_vars)) + _seed_variance(diffs) / n)
-    mean_diff = float(np.mean(diffs))
-    ego_mean = float(np.mean([row.mmd_ratio["clustering"] for row in ego_rows]))
-    dominates = all(ego_mean < value for value in comp_values.values())
-    return CriterionResult(
-        metric="clustering_mmd_ratio",
-        mean_diff=mean_diff,
-        se=se,
-        p_value=_one_sided_p(mean_diff, se),
-        dominates_every_comparator=dominates,
-        ci_excludes_zero=mean_diff - _Z_95 * se > 0.0,
-        best_comparator=best_name,
-    )
-
-
-def matched_rd_criterion(
-    metric: str,
-    matched_values: dict[str, list[float]],
-    comparator_values: dict[str, float],
-) -> CriterionResult:
-    """One matched-global-RD member (GS or BFS-macro RD; higher is better).
-
-    Per comparator ``c``: ``d_s = value(ego matched to c, seed s) - value(c)``.
-    The Holm p-value comes from the best (highest-valued) comparator; strict
-    mean dominance is required against every comparator at its own matched
-    operating point.
-
-    Args:
-        metric: ``"bfs_macro_gs"`` or ``"bfs_macro_rd"``.
-        matched_values: Comparator name -> per-seed egostitch values at that
-            comparator's matched operating point.
-        comparator_values: Comparator name -> its own value.
-
-    Returns:
-        The `CriterionResult`.
-    """
-    best_name = max(comparator_values, key=lambda name: (comparator_values[name], name))
-    diffs = [value - comparator_values[best_name] for value in matched_values[best_name]]
-    n = len(diffs)
-    se = math.sqrt(_seed_variance(diffs) / n) if n else _SE_FLOOR
-    mean_diff = float(np.mean(diffs)) if diffs else 0.0
-    dominates = all(
-        float(np.mean(matched_values[name])) > comparator_values[name] for name in comparator_values
-    )
-    return CriterionResult(
-        metric=metric,
-        mean_diff=mean_diff,
-        se=se,
-        p_value=_one_sided_p(mean_diff, se),
-        dominates_every_comparator=dominates,
-        ci_excludes_zero=mean_diff - _Z_95 * se > 0.0,
-        best_comparator=best_name,
-    )
-
-
-# --------------------------------------------------------------------------- pipeline
-
-
-def run_g5_stage1_pipeline(
-    *,
-    egostitch_universe_paths: Sequence[Path],
-    s0_universe_paths: Sequence[Path] = (),
-    run_metadata_paths: Sequence[Path],
-    b0_universe_path: Path,
-    b0cal_results_path: Path,
-    preregistration_path: Path,
-    data_root: Path,
-    strategy: str,
-    output_dir: Path,
-    seed: int = 0,
-    fidelity_report_paths: Sequence[Path] = (),
-    cost_report_path: Path | None = None,
-) -> dict[str, object]:
-    """Run the pre-registered G5 Stage-1 gate and write its outputs.
-
-    Args:
-        egostitch_universe_paths: One candidate-scores ``.npz`` per training seed.
-        s0_universe_paths: Matching fp32 frozen-B0 candidate artifacts used to
-            compute each scored residual. These are distinct from the canonical
-            comparator artifact when that historical deliverable is quantized.
-        run_metadata_paths: The matching ``run_metadata.json`` per seed
-            (pre-registration binding), aligned with `egostitch_universe_paths`.
-        b0_universe_path: The frozen B0 candidate-scores artifact.
-        b0cal_results_path: The committed ``b0cal_results.json`` (comparator
-            rows + realized edge counts).
-        preregistration_path: The committed pre-registration JSON.
-        data_root: Directory containing the benchmark package.
-        strategy: Benchmark split strategy.
-        output_dir: Directory for ``g5_stage1_results.json`` / ``_tables.md``.
-        seed: Evaluation seed (bootstrap resampling only; training seeds live
-            in the artifacts).
-        fidelity_report_paths: Per-seed fidelity JSONs (`src.eval.ego_fidelity`
-            outputs), embedded verbatim and required for the binding gate.
-        cost_report_path: FLOPs/wall-clock JSON (proposal Sec 4.7 R = 0
-            commitment), embedded verbatim and required for the formal gate.
-
-    Returns:
-        The JSON-ready payload (also written to disk).
-
-    Raises:
-        PreregistrationMismatch: Before any metric is computed, on hash drift.
-        ValueError: On artifact validation failures.
-    """
-    n_runs = len(egostitch_universe_paths)
-    if n_runs != len(run_metadata_paths):
-        raise ValueError("one --run-metadata per --egostitch-universe is required")
-
-    # (1) Pre-registration enforcement FIRST — no scores are opened before this.
-    prereg_sha = enforce_preregistration(preregistration_path, run_metadata_paths)
-    prereg = cast(dict[str, object], json.loads(preregistration_path.read_text(encoding="utf-8")))
-    enforce_frozen_inputs(prereg, preregistration_path, b0_universe_path)
-    if len(s0_universe_paths) != n_runs:
-        raise ValueError("one --s0-universe per --egostitch-universe is required")
-    registered_seeds = cast(list[int], prereg.get("seeds"))
-    if registered_seeds != [0]:
-        raise ValueError("G5 Stage-1 registration must pin exactly seeds: [0]")
-    if n_runs != len(registered_seeds):
-        raise ValueError(
-            f"G5 Stage-1 registration requires {len(registered_seeds)} seed artifact(s); "
-            f"received {n_runs}"
-        )
-    primary_config = cast(dict[str, object], prereg["primary_criteria"])
-    decision_procedure = primary_config.get("decision_procedure")
-    if decision_procedure != "single_seed_point_estimate_dominance":
-        raise ValueError("unsupported G5 Stage-1 decision_procedure")
-    dead_residual_config = cast(dict[str, object] | None, prereg.get("fidelity_validity_gate"))
-    if dead_residual_config is None:
-        raise ValueError("preregistration is missing fidelity_validity_gate")
-    fidelity, cost_report = _load_required_diagnostics(
-        fidelity_report_paths, cost_report_path, n_runs
-    )
-    run_metadata = [
-        cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
-        for path in run_metadata_paths
-    ]
-    training_diagnostics = _training_diagnostics(run_metadata)
-    for expected_seed, metadata in zip(registered_seeds, run_metadata, strict=True):
-        if metadata.get("seed") not in (None, expected_seed):
-            raise ValueError(
-                f"run metadata seed {metadata.get('seed')!r} does not match "
-                f"registered seed {expected_seed}"
-            )
-
-    benchmark_root = data_root / _BENCHMARK_SUBDIR
-    g_ref = load_test_graph(benchmark_root, strategy)
-    buckets = load_test_node_buckets(benchmark_root, strategy)
-    g_simple = strip_self_loops(g_ref)
-    target_edges = g_simple.number_of_edges()
-    n_test_nodes = g_ref.number_of_nodes()
-    nodes = list(g_ref.nodes())
-    config = MMDConfig()
-
-    store: FeatureStore | None = None
-    features_root = data_root / _FEATURES_SUBDIR
-    if (features_root / "index.json").exists():
-        store = FeatureStore(features_root)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    f0_cache = output_dir / "f0_cache.pt"
-
-    # (2) Comparators: B0 recomputed from its frozen artifact; cal arms from
-    # the committed kill-test payload.
-    b0_universe = load_scores(b0_universe_path)
-    validate_universe_artifact(
-        b0_universe, strategy=strategy, n_test_nodes=n_test_nodes, label="b0 universe"
-    )
-    frozen = cast(dict[str, object], prereg["frozen_inputs"])
-    frozen_b0 = cast(dict[str, object], frozen["b0_candidate_scores"])
-    if b0_universe.meta.get("checkpoint_id") != frozen_b0.get("checkpoint_id"):
-        raise PreregistrationMismatch(
-            "frozen input B0 checkpoint_id mismatch: "
-            f"{b0_universe.meta.get('checkpoint_id')!r} != {frozen_b0.get('checkpoint_id')!r}"
-        )
-    b0_probs = b0_universe.probs()
-    b0_pairs = list(b0_universe.pairs())
-    b0_non_self = b0_universe.u_idx != b0_universe.v_idx
-    b0_threshold = density_matched_threshold(b0_probs[b0_non_self], target_edges)
-    b0_graph = assemble_graph(b0_pairs, b0_probs, threshold=b0_threshold, nodes=nodes)
-    b0_row = assemble_and_evaluate(
-        g_pred=b0_graph,
-        g_ref=g_ref,
-        buckets=buckets,
-        config=config,
-        seed=seed,
-        threshold=b0_threshold,
-    )
-    b0_regimes = evaluate_regime_table(
-        labels=b0_universe.label,
-        probs=b0_probs,
-        u_idx=b0_universe.u_idx,
-        v_idx=b0_universe.v_idx,
-        node_ids=b0_universe.node_ids,
-        g_ref=g_ref,
-        store=store,
-        f0_cache=f0_cache,
-        seed=seed,
-    )
-    b0_auprc = b0_regimes["degree_corrected"]["ratio_1"].auprc
-
-    b0cal_results_path = _resolve_b0cal_results_path(b0cal_results_path)
-    b0cal_payload = json.loads(b0cal_results_path.read_text(encoding="utf-8"))
-    _validate_b0cal_lineage(cast(dict[str, object], b0cal_payload), b0_universe.meta, b0_row)
-    b0cal_assembled = cast(dict[str, dict[str, object]], b0cal_payload["assembled"])
-    realized = cast(
-        dict[str, int],
-        cast(dict[str, object], b0cal_payload["metadata"])["realized_non_self_edges"],
-    )
-    comparators: dict[str, dict[str, object]] = {
-        name: dict(b0cal_assembled[name]) for name in _COMPARATORS if name != "b0"
-    }
-    comparators["b0"] = _assembled_row_to_dict(b0_row)
-    realized = dict(realized)
-    realized["b0"] = int(strip_self_loops(b0_graph).number_of_edges())
-
-    # (3) Per-seed egostitch rows.
-    ego_rows: list[AssembledRow] = []
-    ego_regime_tables: list[dict[str, object]] = []
-    ego_self_pair: list[dict[str, object]] = []
-    ego_auprcs: list[float] = []
-    s0_correlations: list[float] = []
-    dead_residual_reports: list[dict[str, float]] = []
-    matched_gs: dict[str, list[float]] = {name: [] for name in _COMPARATORS}
-    matched_rd: dict[str, list[float]] = {name: [] for name in _COMPARATORS}
-    matched_rd_gap: dict[str, list[float]] = {name: [] for name in _COMPARATORS}
-    matched_rd_boundary_score: dict[str, list[float]] = {name: [] for name in _COMPARATORS}
-    matched_rd_boundary_tie_size: dict[str, list[int]] = {name: [] for name in _COMPARATORS}
-    matched_rd_selected_from_tie: dict[str, list[int]] = {name: [] for name in _COMPARATORS}
-    matched_rd_split_boundary_tie: dict[str, list[bool]] = {name: [] for name in _COMPARATORS}
-
-    b0_logit_by_pair = {
-        pair: float(logit) for pair, logit in zip(b0_pairs, b0_universe.logit.tolist(), strict=True)
-    }
-
-    for artifact_path, s0_path, metadata in zip(
-        egostitch_universe_paths, s0_universe_paths, run_metadata, strict=True
-    ):
-        universe = load_scores(artifact_path)
-        s0_universe = load_scores(s0_path)
-        validate_universe_artifact(
-            universe, strategy=strategy, n_test_nodes=n_test_nodes, label=str(artifact_path)
-        )
-        validate_universe_artifact(
-            s0_universe, strategy=strategy, n_test_nodes=n_test_nodes, label=str(s0_path)
-        )
-        if universe.meta.get("model_family") != "egostitch":
-            raise ValueError(f"{artifact_path}: model_family must be 'egostitch'")
-        if metadata.get("checkpoint_id") != universe.meta.get("checkpoint_id"):
-            raise ValueError(f"{artifact_path}: run metadata checkpoint_id mismatch")
-        if metadata.get("s0_checkpoint_id") != frozen_b0.get("checkpoint_id"):
-            raise ValueError(f"{artifact_path}: run metadata s0_checkpoint_id mismatch")
-        if s0_universe.meta.get("checkpoint_id") != frozen_b0.get("checkpoint_id"):
-            raise ValueError(f"{s0_path}: s0 checkpoint_id mismatch")
-        dead_residual_reports.append(
-            validate_dead_residual(
-                universe,
-                s0_universe,
-                min_residual_std_ratio=cast(float, dead_residual_config["min_residual_std_ratio"]),
-                max_spearman=cast(float, dead_residual_config["max_spearman"]),
-                max_topk_overlap=cast(float, dead_residual_config["max_topk_overlap"]),
-                topk_fraction=cast(float, dead_residual_config["topk_fraction"]),
-            )
-        )
-        probs = universe.probs()
-        pairs = list(universe.pairs())
-        non_self = universe.u_idx != universe.v_idx
-
-        threshold = density_matched_threshold(probs[non_self], target_edges)
-        graph = assemble_graph(pairs, probs, threshold=threshold, nodes=nodes)
-        ego_rows.append(
-            assemble_and_evaluate(
-                g_pred=graph,
-                g_ref=g_ref,
-                buckets=buckets,
-                config=config,
-                seed=seed,
-                threshold=threshold,
-            )
-        )
-        regimes = evaluate_regime_table(
-            labels=universe.label,
-            probs=probs,
-            u_idx=universe.u_idx,
-            v_idx=universe.v_idx,
-            node_ids=universe.node_ids,
-            g_ref=g_ref,
-            store=store,
-            f0_cache=f0_cache,
-            seed=seed,
-        )
-        ego_regime_tables.append(cast(dict[str, object], _edge_metrics_table_to_dict(regimes)))
-        ego_auprcs.append(regimes["degree_corrected"]["ratio_1"].auprc)
-        ego_self_pair.append(
-            _self_pair_edge_metrics_to_dict(
-                compute_self_pair_edge_metrics(
-                    universe.label, probs, universe.u_idx, universe.v_idx
-                )
-            )
-        )
-        aligned_b0 = np.array([b0_logit_by_pair[pair] for pair in pairs], dtype=np.float64)
-        s0_correlations.append(
-            float(np.corrcoef(universe.logit.astype(np.float64), aligned_b0)[0, 1])
-        )
-
-        # Matched-global-RD rows: realize each comparator's exact non-self
-        # quota; only the boundary-score tie uses canonical pair order.
-        for name in _COMPARATORS:
-            quota = realized[name]
-            selected = select_matched_global_rd_rows(
-                probs,
-                universe.u_idx,
-                universe.v_idx,
-                target_edges=quota,
-                reference_edges=target_edges,
-            )
-            matched_graph = assemble_matched_global_rd_graph(
-                pairs,
-                probs,
-                universe.u_idx,
-                universe.v_idx,
-                selected,
-                nodes,
-            )
-            report = evaluate_assembled_graph(matched_graph, g_ref, buckets, config)
-            matched_gs[name].append(report.graph_similarity)
-            matched_rd[name].append(report.relative_density)
-            realized_matched = strip_self_loops(matched_graph).number_of_edges()
-            if realized_matched != selected.realized_edges:
-                raise ValueError("matched global simple-edge RD count disagrees with assembly")
-            matched_rd_gap[name].append(selected.rd_gap)
-            matched_rd_boundary_score[name].append(selected.boundary_score)
-            matched_rd_boundary_tie_size[name].append(selected.boundary_tie_size)
-            matched_rd_selected_from_tie[name].append(selected.selected_from_boundary_tie)
-            matched_rd_split_boundary_tie[name].append(selected.split_boundary_tie)
-
-    # (4) Primary criteria. Stage 1 is a one-seed engineering screen, so
-    # inferential fields and Holm decisions are deliberately not applicable.
-    criteria = {
-        "clustering_mmd_ratio": clustering_criterion(ego_rows, comparators),
-        "bfs_macro_gs": matched_rd_criterion(
-            "bfs_macro_gs",
-            matched_gs,
-            {name: cast(float, comparators[name]["graph_similarity"]) for name in _COMPARATORS},
-        ),
-        "bfs_macro_rd": matched_rd_criterion(
-            "bfs_macro_rd",
-            matched_rd,
-            {name: cast(float, comparators[name]["relative_density"]) for name in _COMPARATORS},
-        ),
-    }
-    holm: dict[str, bool | None] = dict.fromkeys(_PRIMARY_FAMILY)
-    primary_pass: dict[str, bool | None] = {
-        name: criteria[name].dominates_every_comparator for name in _PRIMARY_FAMILY
-    }
-
-    # (5) Guards.
-    ego_degree_mean = float(np.mean([row.mmd_ratio["degree"] for row in ego_rows]))
-    degree_guard = ego_degree_mean <= 1.10 * b0_row.mmd_ratio["degree"]
-    auprc_mean = float(np.mean(ego_auprcs))
-    auprc_guard = auprc_mean >= b0_auprc - 0.02
-    guards = {
-        "degree_mmd_non_regression": {
-            "passed": bool(degree_guard),
-            "ego_mean": ego_degree_mean,
-            "limit": 1.10 * b0_row.mmd_ratio["degree"],
-        },
-        "matched_edge_auprc": {
-            "passed": bool(auprc_guard),
-            "ego_mean": auprc_mean,
-            "limit": b0_auprc - 0.02,
-            "b0_auprc": b0_auprc,
-        },
-    }
-
-    verdict = (
-        "pass"
-        if all(value is True for value in primary_pass.values()) and degree_guard and auprc_guard
-        else "cut"
-    )
-    criteria_payload = {name: criteria[name].to_jsonable() for name in _PRIMARY_FAMILY}
-    for row in criteria_payload.values():
-        row["se"] = None
-        row["p_value"] = None
-        row["ci_excludes_zero"] = None
-
-    payload: dict[str, object] = {
-        "metadata": {
-            "preregistration_sha256": prereg_sha,
-            "preregistration_path": str(preregistration_path),
-            "benchmark": {"benchmark_a": strategy},
-            "n_seeds": n_runs,
-            "evaluation_mode": "single_seed_screening",
-            "binding_verdict": True,
-            "decision_procedure": decision_procedure,
-            "evaluation_seed": seed,
-            "holm_alpha": None,
-            "matched_rd_rule": (
-                "per comparator: egostitch realizes the comparator's exact non-self "
-                "edge quota by descending pass-1 score; only the boundary-score tie "
-                "is split by canonical pair order; self-pairs use the boundary score; "
-                "every row enforces |RD_global(ego)-RD_global(comparator)| <= 0.005"
-            ),
-            "single_seed_caveat": (
-                "This binding Stage-1 engineering screen uses one fixed training seed and "
-                "deterministic point-estimate dominance. It does not establish statistical "
-                "significance or cross-seed robustness and does not replace E1/E3's "
-                "at-least-three-seed Holm procedure."
-            ),
-            "s0_correlation_note": (
-                "corr(egostitch logit, frozen-B0 logit) per seed; the full "
-                "(s0, s1, s2) channel matrix is a training-side diagnostic "
-                "reported from the worker's validation logs"
-            ),
-        },
-        "comparators": comparators,
-        "comparator_realized_non_self_edges": realized,
-        "egostitch": {
-            "assembled": [_assembled_row_to_dict(row) for row in ego_rows],
-            "regime_tables": ego_regime_tables,
-            "self_pair_edge_metrics": ego_self_pair,
-            "degree_corrected_auprc": ego_auprcs,
-            "s0_logit_correlation": s0_correlations,
-            "dead_residual_fidelity": dead_residual_reports,
-            "matched_gs": matched_gs,
-            "matched_rd": matched_rd,
-            "matched_rd_quota_gap": matched_rd_gap,
-            "matched_rd_boundary_score": matched_rd_boundary_score,
-            "matched_rd_boundary_tie_size": matched_rd_boundary_tie_size,
-            "matched_rd_selected_from_boundary_tie": matched_rd_selected_from_tie,
-            "matched_rd_split_boundary_tie": matched_rd_split_boundary_tie,
-        },
-        "criteria": criteria_payload,
-        "holm_survives": holm,
-        "primary_pass": primary_pass,
-        "guards": guards,
-        "verdict": verdict,
-        "failure_reading": (cast(str, prereg["failure_reading"]) if verdict == "cut" else None),
-        "decision_rules_5_2_verbatim": prereg.get("decision_rules_5_2_verbatim"),
-        "fidelity_reports": fidelity,
-        "training_diagnostics": training_diagnostics,
-        "cost_report": cost_report,
-    }
-
-    (output_dir / "g5_stage1_results.json").write_text(
-        json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8"
-    )
-    (output_dir / "g5_stage1_tables.md").write_text(
-        render_tables_markdown(payload), encoding="utf-8"
-    )
-    logger.info("wrote G5 Stage-1 gate results to %s (verdict: %s)", output_dir, verdict)
-    return payload
 
 
 # --------------------------------------------------------------------------- e2e eight-arm summary
@@ -1405,10 +1172,40 @@ def _e2e_registration_sha256(run_metadata: Mapping[str, Mapping[str, object]]) -
 def _enforce_e2e_formal_metadata(
     run_metadata: Mapping[str, Mapping[str, object]],
     *,
+    run_metadata_paths: Mapping[str, Path],
     preregistration: Mapping[str, object],
     preregistration_path: Path,
-) -> None:
-    """Reject anything except completed, explicitly formal E2E arm metadata."""
+) -> int:
+    """Reject anything except completed, explicitly formal E2E arm metadata.
+
+    "Completed" is deliberately not sufficient: the clip/family/RMS margin gate
+    can only run after ``src.e2_pipeline`` has published the run, so
+    ``status: complete`` and ``formal_artifacts_published: true`` are both
+    stamped while the margins are still unknown. Every arm must therefore carry
+    its own passing, run-bound margin verdict
+    (:func:`src.score_universe.validate_e2e_margin_verdict`) before this gate
+    will screen it.
+
+    Args:
+        run_metadata: Trained-arm name -> its parsed ``run_metadata.json``.
+        run_metadata_paths: The same mapping's source paths, used to locate and
+            bind each arm's persisted margin verdict.
+        preregistration: The parsed registration payload.
+        preregistration_path: Path the registration was read from (used to
+            resolve registered relative config paths).
+
+    Returns:
+        The single training seed shared by every supplied arm. One gate
+        invocation covers exactly one training seed; a registration may declare
+        several, and each is screened by its own invocation.
+
+    Raises:
+        RegistrationShaMismatch: On any provenance, completion, or seed
+            mismatch against the registration.
+        ValueError: If an arm's clip/family/RMS margin verdict is absent,
+            failing, or bound to a different run.
+    """
+    seeds_seen: set[int] = set()
     expected_semantics: dict[str, tuple[str, float, float]] = {
         "full": ("none", 0.15, 0.15),
         "b0_e2e_f_only": ("all_head", 0.15, 0.15),
@@ -1445,6 +1242,7 @@ def _enforce_e2e_formal_metadata(
             )
     benchmark = cast(Mapping[str, object], preregistration.get("benchmark"))
     registered_strategy = benchmark.get("strategy")
+    registered_seeds = _registered_training_seeds(preregistration)
     from src.model.egostitch.config import E2EConfig
     from src.train_egostitch import _config_hash, _e2e_arm_name_from_config, load_config
 
@@ -1468,6 +1266,7 @@ def _enforce_e2e_formal_metadata(
             raise RegistrationShaMismatch(f"{arm}: formal_artifacts_published must be exactly true")
         if metadata.get("status") != "complete":
             raise RegistrationShaMismatch(f"{arm}: formal run metadata status must be 'complete'")
+        validate_e2e_margin_verdict(run_metadata_paths[arm], label=f"{arm} formal run")
         if metadata.get("selected_checkpoint_eligible") is not True:
             raise RegistrationShaMismatch(
                 f"{arm}: selected_checkpoint_eligible must be exactly true"
@@ -1495,8 +1294,7 @@ def _enforce_e2e_formal_metadata(
             raise RegistrationShaMismatch(f"{arm}: permanent_null does not match registered arm")
         if metadata.get("p_topo") != p_topo or metadata.get("p_cont") != p_cont:
             raise RegistrationShaMismatch(f"{arm}: branch dropout does not match registered arm")
-        if metadata.get("seed") != 0:
-            raise RegistrationShaMismatch(f"{arm}: formal E2E seed must be 0")
+        seeds_seen.add(_enforce_registered_training_seed(metadata, registered_seeds, label=arm))
         if metadata.get("strategy") != registered_strategy:
             raise RegistrationShaMismatch(f"{arm}: strategy does not match registration")
         if metadata.get("partition_seed") != 0:
@@ -1526,6 +1324,12 @@ def _enforce_e2e_formal_metadata(
             raise RegistrationShaMismatch(
                 f"{arm}: registered config resolves to trained arm {resolved_arm!r}"
             )
+    if len(seeds_seen) != 1:
+        raise RegistrationShaMismatch(
+            "one E2E gate invocation screens exactly one training seed; the supplied "
+            f"arm metadata declare {sorted(seeds_seen)}"
+        )
+    return next(iter(seeds_seen))
 
 
 def _validate_e2e_universe_shape(
@@ -1823,7 +1627,13 @@ def _evaluate_registered_e2e_probe(
     data_root: Path,
     strategy: str,
 ) -> dict[str, object]:
-    """Rebuild G_struct identities and consume the required probe artifact."""
+    """Rebuild G_struct identities and consume the required probe artifact.
+
+    The probe artifact is bound to the full arm's *registered* training seed
+    rather than to a hard-coded zero, so a registration declaring several seeds
+    can be screened one seed per invocation. ``partition_seed`` stays pinned at
+    ``0``: it is not a training seed and changing it redefines ``G_struct``.
+    """
     from src import train_egostitch as te
     from src.data.partition import build_g_struct, derive_partition
 
@@ -1855,22 +1665,17 @@ def _evaluate_registered_e2e_probe(
             f"E2E probe artifact path mismatch: {probe_artifact_path.resolve()} != {expected_path}"
         )
     metadata = cast(dict[str, object], json.loads(run_metadata_path.read_text(encoding="utf-8")))
+    training_seed = _enforce_registered_training_seed(
+        metadata, _registered_training_seeds(preregistration), label="full"
+    )
     config_path = Path(str(metadata.get("config_path")))
     cfg = te.load_config(config_path)
     if cfg.data.root.resolve() != data_root.resolve() or cfg.data.strategy != strategy:
         raise RegistrationShaMismatch("full-arm config data identity does not match gate inputs")
-    benchmark = te._load_benchmark_for(cfg)
-    operative = sorted(set(benchmark.graph.nodes()) - set(cfg.data.expected_missing_features))
-    train_nodes = sorted(set(benchmark.split.train_nodes) & set(operative))
-    train_positives = [
-        pair
-        for pair, label in zip(
-            benchmark.split.train_pairs.pairs,
-            benchmark.split.train_pairs.labels,
-            strict=True,
-        )
-        if label == 1
-    ]
+    train_nodes, train_positives = _load_train_side_probe_inputs(
+        cfg.data.root / _BENCHMARK_SUBDIR / cfg.data.strategy,
+        expected_missing_features=cfg.data.expected_missing_features,
+    )
     partition = derive_partition(
         train_positives,
         seed=cfg.data.partition_seed,
@@ -1885,7 +1690,7 @@ def _evaluate_registered_e2e_probe(
             "checkpoint_id": metadata.get("checkpoint_id"),
             "registration_sha256": metadata.get("preregistration_sha256"),
             "config_hash": metadata.get("config_hash"),
-            "seed": 0,
+            "seed": training_seed,
             "partition_seed": 0,
             "strategy": strategy,
             "n_ground": registered_n_ground,
@@ -1911,23 +1716,21 @@ def build_e2e_arm_summary(
     the raw ``validate_score_precision(artifact.logit, meta=...)`` idiom, which
     silently drops the ``f_logit``/``pair_content``/``pair_topology`` arrays),
     then reports each arm's canonical-operating-point assembled metrics plus
-    the ``full`` arm's within-checkpoint liveness report. This is a
-    self-contained entry point distinct from :func:`run_g5_stage1_pipeline`
-    (which remains the historical frozen-s0 family gate, unmodified): every
-    arm artifact and every formal run's metadata is loaded and validated in
-    one place here, so a later registration-``BINDING``-status enforcement
-    hook (exp-Task 7's scope) slots in without touching the per-arm metric
-    computation below. This function does not itself compute the registered
-    pathway-attribution or structure-control decision rules (spec Sec 14,
-    ``e2e_rules``) — those consume this table's per-arm ``clustering_mmd_ratio``
-    values plus (for the structure-control condition) a paired-bootstrap
-    procedure that is exp-Task 7's scope.
+    the ``full`` arm's within-checkpoint liveness report. Every arm artifact
+    and every formal run's metadata is loaded and validated in one place here.
+    This function does not itself compute the registered pathway-attribution or
+    structure-control decision rules (spec Sec 14, ``e2e_rules``) — those are
+    applied by :func:`run_g5_e2e_stage1_pipeline`, which consumes this table's
+    per-arm ``clustering_mmd_ratio`` values plus (for the structure-control
+    condition) the paired-bootstrap lower bound computed below.
 
     Args:
         arm_universe_paths: Exact registered six-trained-plus-two-control
             mapping to scored ``.npz`` artifacts.
         run_metadata_paths: Formal-run arm name -> its ``run_metadata.json``.
-            Scoring-time controls never have entries.
+            Scoring-time controls never have entries. Each directory must also
+            hold that run's passing ``margin_verdict.json``; a published run is
+            not certified by publication alone.
         preregistration_path: Binding registration whose sha must be present
             in every one of the six trained-arm metadata records.
         data_root: Directory containing the benchmark package.
@@ -1942,9 +1745,10 @@ def build_e2e_arm_summary(
 
     Returns:
         A JSON-ready payload: ``registration_sha256`` (the non-empty single
-        hash shared by the six trained run metadata records), a per-arm
-        ``checkpoint_id`` / ``registration_sha256`` / ``assembled`` /
-        ``degree_corrected_auprc`` row, and the ``full`` arm's
+        hash shared by the six trained run metadata records), the
+        ``training_seed`` those six arms share and the ``registered_seeds`` it
+        was drawn from, a per-arm ``checkpoint_id`` / ``registration_sha256`` /
+        ``assembled`` / ``degree_corrected_auprc`` row, and the ``full`` arm's
         within-checkpoint ``liveness`` report.
 
     Raises:
@@ -1978,14 +1782,22 @@ def build_e2e_arm_summary(
         preregistration_path, list(run_metadata_paths.values()), snapshot=snapshot
     )
     registration_sha256 = _e2e_registration_sha256(run_metadata)
-    _enforce_e2e_formal_metadata(
+    training_seed = _enforce_e2e_formal_metadata(
         run_metadata,
+        run_metadata_paths=run_metadata_paths,
         preregistration=preregistration,
         preregistration_path=preregistration_path,
     )
+    registered_seeds = _registered_training_seeds(preregistration)
     training_diagnostics = _training_diagnostics(
         [run_metadata[name] for name in _E2E_FORMAL_ARMS],
         require_e2e_submodule_rms=True,
+    )
+    vhold_evaluations = _vhold_evaluation_disclosure(
+        run_metadata,
+        run_metadata_paths=run_metadata_paths,
+        preregistration=preregistration,
+        preregistration_path=preregistration_path,
     )
     if registration_sha256 != bound_registration_sha256:  # pragma: no cover - enforced above
         raise RegistrationShaMismatch("formal e2e metadata disagree with the binding registration")
@@ -2121,8 +1933,11 @@ def build_e2e_arm_summary(
 
     return {
         "registration_sha256": registration_sha256,
+        "training_seed": training_seed,
+        "registered_seeds": list(registered_seeds),
         "arms": rows,
         "training_diagnostics": dict(zip(_E2E_FORMAL_ARMS, training_diagnostics, strict=True)),
+        "v_hold_evaluation_disclosure": vhold_evaluations,
         "decomposition": decomposition,
         "liveness": liveness,
         "structure_control": {
@@ -2144,14 +1959,61 @@ _E2E_LIVENESS_CONFIG: dict[str, float] = {
     "topk_fraction": 0.01,
 }
 
+_EVIDENCE_CLASS_NOTE = (
+    "Engineering evidence at every seed count. Only E1/E3 carry inference "
+    "(CLAUDE.md; protocol Sec 5.0.5), so p_value/ci/holm are null by "
+    "construction and screening several registered seeds adds cross-seed "
+    "variance reporting only — never significance or cross-seed robustness."
+)
+
+
+def _enforce_engineering_evidence_class(payload: Mapping[str, object]) -> None:
+    """Refuse any artifact that would carry inference out of this screen.
+
+    Args:
+        payload: The complete JSON-ready gate payload, before it is written.
+
+    Raises:
+        EvidenceClassViolation: If ``evidence_class`` is anything other than
+            ``"engineering"``, or if any inferential field (`_INFERENCE_FIELDS`)
+            is non-null at any nesting depth. The walk is recursive precisely so
+            a nested inferential field cannot slip past a top-level check.
+    """
+    if payload.get("evidence_class") != _EVIDENCE_CLASS:
+        raise EvidenceClassViolation(
+            f"the G5 E2E ladder emits evidence_class {_EVIDENCE_CLASS!r} at every seed "
+            f"count; got {payload.get('evidence_class')!r}"
+        )
+
+    def walk(node: object, path: str) -> None:
+        if isinstance(node, Mapping):
+            for key, value in node.items():
+                child = f"{path}.{key}" if path else str(key)
+                if str(key) in _INFERENCE_FIELDS and value is not None:
+                    raise EvidenceClassViolation(
+                        f"{child} must be null in an {_EVIDENCE_CLASS}-class artifact; "
+                        f"got {value!r}"
+                    )
+                walk(value, child)
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, f"{path}[{index}]")
+
+    walk(payload, "")
+
 
 def render_e2e_tables_markdown(payload: Mapping[str, object]) -> str:
     """Render the complete eight-arm, decomposition, and probe evidence tables."""
     arms = cast(Mapping[str, Mapping[str, object]], payload["arms"])
+    metadata = cast(Mapping[str, object], payload["metadata"])
     lines = [
         "# G5 E2E Stage-1 gate",
         "",
         f"**Verdict: `{payload['verdict']}`**",
+        "",
+        f"**Evidence class: `{payload['evidence_class']}`** (training seed "
+        f"`{_fmt(metadata.get('training_seed'))}` of registered "
+        f"`{metadata.get('registered_seeds')}`)",
         "",
         "Fixed-seed evaluator-stability evidence only; not significance or cross-seed robustness.",
         "",
@@ -2294,7 +2156,13 @@ def run_g5_e2e_stage1_pipeline(
     output_dir: Path,
     seed: int = 0,
 ) -> dict[str, object]:
-    """Run the binding E2E eight-arm G5 gate and write its verdict artifacts."""
+    """Run the binding E2E eight-arm G5 gate and write its verdict artifacts.
+
+    One invocation screens one registered training seed over all eight arms
+    (six trained checkpoints plus the two mandatory scoring-time controls). The
+    emitted artifact is always ``evidence_class: "engineering"`` and is refused
+    outright if any inferential field survives (`_enforce_engineering_evidence_class`).
+    """
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     # A rejected run must not leave an older verdict looking authoritative.
     for filename in ("g5_e2e_stage1_results.json", "g5_e2e_stage1_tables.md"):
@@ -2458,11 +2326,19 @@ def run_g5_e2e_stage1_pipeline(
         "metadata": {
             "registration_sha256": summary["registration_sha256"],
             "evaluation_mode": "single_seed_e2e_screening",
+            "training_seed": summary["training_seed"],
+            "registered_seeds": summary["registered_seeds"],
+            "arms_screened": list(_E2E_ARMS),
+            "evidence_class_note": _EVIDENCE_CLASS_NOTE,
             "single_seed_caveat": (
                 "Fixed-seed evaluator-stability evidence only; not significance or cross-seed "
                 "robustness."
             ),
         },
+        "evidence_class": _EVIDENCE_CLASS,
+        "p_value": None,
+        "ci": None,
+        "holm": None,
         "arms": arms,
         "comparators": comparators,
         "full_matched": full_matched,
@@ -2470,6 +2346,7 @@ def run_g5_e2e_stage1_pipeline(
         "guards": guards,
         "liveness": summary["liveness"],
         "training_diagnostics": summary["training_diagnostics"],
+        "v_hold_evaluation_disclosure": summary["v_hold_evaluation_disclosure"],
         "decomposition": summary["decomposition"],
         "probes": probes,
         "pathway_attribution": {
@@ -2482,6 +2359,9 @@ def run_g5_e2e_stage1_pipeline(
         "verdict": verdict,
         "failure_reading": prereg["failure_reading"] if verdict == "cut" else None,
     }
+    # Refused before anything is written: an inference-bearing screen artifact
+    # must not exist on disk even transiently.
+    _enforce_engineering_evidence_class(payload)
     staging_dir = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.stage-", dir=output_dir.parent))
     (staging_dir / "g5_e2e_stage1_results.json").write_text(
         json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8"
@@ -2519,80 +2399,6 @@ def _fmt(value: object) -> str:
     return str(value)
 
 
-def render_tables_markdown(payload: dict[str, object]) -> str:
-    """Render the human-readable gate report for one payload.
-
-    Args:
-        payload: A `run_g5_stage1_pipeline` payload.
-
-    Returns:
-        The complete markdown document text.
-    """
-    comparators = cast(dict[str, dict[str, object]], payload["comparators"])
-    ego = cast(dict[str, object], payload["egostitch"])
-    criteria = cast(dict[str, dict[str, object]], payload["criteria"])
-    holm = cast(dict[str, bool | None], payload["holm_survives"])
-    primary_pass = cast(dict[str, bool | None], payload["primary_pass"])
-    guards = cast(dict[str, dict[str, object]], payload["guards"])
-    lines: list[str] = [
-        "# G5 Stage-1 single-seed screening gate report",
-        "",
-        f"**Verdict: `{payload['verdict']}`**",
-        "",
-        "**Scope:** Binding Stage-1 engineering screen for one fixed seed; this report ",
-        "does not claim statistical significance or cross-seed robustness and does not ",
-        "replace the E1/E3 multi-seed Holm evaluation.",
-        "",
-    ]
-    lines += [
-        "## Assembled rows (canonical operating point)",
-        "",
-        "| arm | GS | BFS-macro RD | degree MMD | clustering MMD | spectral MMD |",
-        "|---|---|---|---|---|---|",
-    ]
-    for name in _COMPARATORS:
-        row = comparators[name]
-        ratio = cast(dict[str, float], row["mmd_ratio"])
-        lines.append(
-            f"| {name} | {_fmt(row['graph_similarity'])} | {_fmt(row['relative_density'])} "
-            f"| {_fmt(ratio['degree'])} | {_fmt(ratio['clustering'])} | {_fmt(ratio['spectral'])} |"
-        )
-    for i, row in enumerate(cast(list[dict[str, object]], ego["assembled"])):
-        ratio = cast(dict[str, float], row["mmd_ratio"])
-        lines.append(
-            f"| egostitch (seed {i}) | {_fmt(row['graph_similarity'])} "
-            f"| {_fmt(row['relative_density'])} "
-            f"| {_fmt(ratio['degree'])} | {_fmt(ratio['clustering'])} | {_fmt(ratio['spectral'])} |"
-        )
-
-    lines += [
-        "",
-        "## Registered decision table",
-        "",
-        "| criterion | mean diff | SE | p | Holm | dominance | CI excl. 0 | bar | pass |",
-        "|---|---|---|---|---|---|---|---|---|",
-    ]
-    for name in _PRIMARY_FAMILY:
-        c = criteria[name]
-        lines.append(
-            f"| {name} | {_fmt(c['mean_diff'])} | {_fmt(c['se'])} | {_fmt(c['p_value'])} "
-            f"| {_fmt(holm[name])} | {c['dominates_every_comparator']} "
-            f"| {c['ci_excludes_zero']} | {c['best_comparator']} "
-            f"| **{_fmt(primary_pass[name])}** |"
-        )
-
-    lines += ["", "## Guards", "", "| guard | passed | ego mean | limit |", "|---|---|---|---|"]
-    for name, guard in guards.items():
-        lines.append(
-            f"| {name} | {guard['passed']} | {_fmt(guard['ego_mean'])} | {_fmt(guard['limit'])} |"
-        )
-
-    if payload.get("failure_reading"):
-        lines += ["", "## Pre-registered failure reading", "", str(payload["failure_reading"])]
-    lines.append("")
-    return "\n".join(lines)
-
-
 # --------------------------------------------------------------------------- CLI
 
 
@@ -2600,29 +2406,19 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the ``g5_stage1`` argument parser."""
     parser = argparse.ArgumentParser(
         prog="python -m src.experiments.g5_stage1",
-        description="Pre-registered G5 Stage-1 gate evaluation.",
+        description="Pre-registered G5 E2E Stage-1 eight-arm gate evaluation.",
     )
-    parser.add_argument("--mode", choices=("frozen_s0", "e2e"), default="frozen_s0")
-    parser.add_argument(
-        "--egostitch-universe",
-        type=Path,
-        nargs="+",
-        default=(),
-        help="one candidate-scores .npz per training seed",
-    )
+    # The legacy frozen-s0 ``egostitch`` family and its ``--mode frozen_s0``
+    # pipeline are gone; the flag survives only so an explicit ``--mode e2e``
+    # keeps working and any other value is rejected loudly rather than silently
+    # falling through to a pipeline that no longer exists.
+    parser.add_argument("--mode", choices=("e2e",), default="e2e")
     parser.add_argument(
         "--run-metadata",
         type=Path,
         nargs="+",
         default=(),
-        help="the matching run_metadata.json per seed (prereg binding)",
-    )
-    parser.add_argument(
-        "--s0-universe",
-        type=Path,
-        nargs="+",
-        default=(),
-        help="matching fp32 frozen-B0 candidate artifact per EgoStitch seed",
+        help="one run_metadata.json per trained arm, in registered arm order",
     )
     parser.add_argument("--b0-universe", type=Path)
     parser.add_argument("--b0cal-results", type=Path)
@@ -2631,13 +2427,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strategy", default="breadth_first")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--fidelity-report",
-        type=Path,
-        nargs="+",
-        default=(),
-        help=("required per-seed fidelity report for the binding Stage-1 screen"),
-    )
     parser.add_argument("--full-universe", type=Path)
     parser.add_argument("--control-6a-universe", type=Path)
     parser.add_argument("--control-6e-universe", type=Path)
@@ -2647,12 +2436,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cosine-pool-universe", type=Path)
     parser.add_argument("--no-l-rel-universe", type=Path)
     parser.add_argument("--probe-artifact", type=Path)
-    parser.add_argument(
-        "--cost-report",
-        type=Path,
-        default=None,
-        help="required cost report for the binding Stage-1 screen",
-    )
     return parser
 
 
@@ -2668,92 +2451,53 @@ def main(argv: Sequence[str] | None = None) -> None:
     """
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.mode == "e2e":
-        arm_paths = {
-            "full": args.full_universe,
-            "b0_e2e_f_only": args.fonly_universe,
-            "pair_topology": args.pt_universe,
-            "p0": args.p0_universe,
-            "cosine_pool": args.cosine_pool_universe,
-            "no_l_rel": args.no_l_rel_universe,
-            "structure_control_6a_v3": args.control_6a_universe,
-            "structure_control_6e_v1": args.control_6e_universe,
-        }
-        required = {
-            **arm_paths,
-            "b0_universe": args.b0_universe,
-            "b0cal_results": args.b0cal_results,
-            "probe_artifact": args.probe_artifact,
-            "preregistration": args.preregistration,
-            "output_dir": args.output_dir,
-        }
-        missing = [name for name, path in required.items() if path is None]
-        if missing:
-            parser.error(f"--mode e2e requires: {', '.join(missing)}")
-        if len(args.run_metadata) != 6:
-            parser.error("--mode e2e requires exactly six --run-metadata paths")
-        for path in [
-            *cast(dict[str, Path], arm_paths).values(),
-            *args.run_metadata,
-            cast(Path, args.b0_universe),
-            cast(Path, args.b0cal_results),
-            cast(Path, args.probe_artifact),
-            cast(Path, args.preregistration),
-        ]:
-            if not path.exists():
-                parser.error(f"input not found: {path}")
-        run_g5_e2e_stage1_pipeline(
-            arm_universe_paths=cast(dict[str, Path], arm_paths),
-            run_metadata_paths=dict(zip(_E2E_FORMAL_ARMS, args.run_metadata, strict=True)),
-            b0_universe_path=cast(Path, args.b0_universe),
-            b0cal_results_path=cast(Path, args.b0cal_results),
-            probe_artifact_path=cast(Path, args.probe_artifact),
-            preregistration_path=cast(Path, args.preregistration),
-            data_root=args.data_root,
-            strategy=args.strategy,
-            output_dir=cast(Path, args.output_dir),
-            seed=args.seed,
-        )
-        return
-    frozen_required = {
-        "egostitch_universe": args.egostitch_universe,
-        "run_metadata": args.run_metadata,
-        "s0_universe": args.s0_universe,
+    arm_paths = {
+        "full": args.full_universe,
+        "b0_e2e_f_only": args.fonly_universe,
+        "pair_topology": args.pt_universe,
+        "p0": args.p0_universe,
+        "cosine_pool": args.cosine_pool_universe,
+        "no_l_rel": args.no_l_rel_universe,
+        "structure_control_6a_v3": args.control_6a_universe,
+        "structure_control_6e_v1": args.control_6e_universe,
+    }
+    required = {
+        **arm_paths,
         "b0_universe": args.b0_universe,
         "b0cal_results": args.b0cal_results,
+        "probe_artifact": args.probe_artifact,
         "preregistration": args.preregistration,
         "output_dir": args.output_dir,
     }
-    missing_frozen = [name for name, value in frozen_required.items() if not value]
-    if missing_frozen:
-        parser.error(f"--mode frozen_s0 requires: {', '.join(missing_frozen)}")
+    missing = [name for name, path in required.items() if path is None]
+    if missing:
+        parser.error(f"--mode e2e requires: {', '.join(missing)}")
+    if len(args.run_metadata) != len(_E2E_FORMAL_ARMS):
+        parser.error(
+            f"--mode e2e requires exactly {len(_E2E_FORMAL_ARMS)} --run-metadata paths, "
+            f"one per trained arm in the order {list(_E2E_FORMAL_ARMS)}"
+        )
     for path in [
-        *args.egostitch_universe,
+        *cast(dict[str, Path], arm_paths).values(),
         *args.run_metadata,
-        *args.s0_universe,
         cast(Path, args.b0_universe),
         cast(Path, args.b0cal_results),
+        cast(Path, args.probe_artifact),
         cast(Path, args.preregistration),
-        *args.fidelity_report,
     ]:
         if not path.exists():
             parser.error(f"input not found: {path}")
-    if args.cost_report is not None and not args.cost_report.exists():
-        parser.error(f"input not found: {args.cost_report}")
-
-    run_g5_stage1_pipeline(
-        egostitch_universe_paths=args.egostitch_universe,
-        s0_universe_paths=args.s0_universe,
-        run_metadata_paths=args.run_metadata,
+    run_g5_e2e_stage1_pipeline(
+        arm_universe_paths=cast(dict[str, Path], arm_paths),
+        run_metadata_paths=dict(zip(_E2E_FORMAL_ARMS, args.run_metadata, strict=True)),
         b0_universe_path=cast(Path, args.b0_universe),
         b0cal_results_path=cast(Path, args.b0cal_results),
+        probe_artifact_path=cast(Path, args.probe_artifact),
         preregistration_path=cast(Path, args.preregistration),
         data_root=args.data_root,
         strategy=args.strategy,
         output_dir=cast(Path, args.output_dir),
         seed=args.seed,
-        fidelity_report_paths=args.fidelity_report,
-        cost_report_path=args.cost_report,
     )
 
 
@@ -2764,18 +2508,15 @@ if __name__ == "__main__":
 
 # Referenced for reuse by tests and companion tooling.
 __all__ = [
-    "CriterionResult",
-    "PreregistrationNotBinding",
+    "EvidenceClassViolation",
     "PreregistrationMismatch",
+    "PreregistrationNotBinding",
     "RegistrationShaMismatch",
     "build_e2e_arm_summary",
-    "clustering_criterion",
-    "enforce_preregistration",
-    "holm_step_down",
-    "matched_rd_criterion",
+    "enforce_e2e_frozen_inputs",
+    "enforce_e2e_preregistration",
     "paired_bootstrap_lower_bound",
-    "render_tables_markdown",
-    "run_g5_stage1_pipeline",
+    "render_e2e_tables_markdown",
     "run_g5_e2e_stage1_pipeline",
     "validate_dead_residual_within_checkpoint",
 ]

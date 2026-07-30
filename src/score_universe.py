@@ -44,11 +44,12 @@ Artifact format (pinned — do not drift):
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import logging
 import math
-from collections import Counter
+import os
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -92,7 +93,6 @@ _META_KEYS = (
     "torch_version",
 )
 _NAMED_PAIR_SOURCES = ("candidate", "test", "val")
-_EGOSTITCH_PAIR_PRECISION_CONTRACT = "egostitch_pair_fp32_v1"
 _EGOSTITCH_E2E_PAIR_PRECISION_CONTRACT = "egostitch_e2e_pair_fp32_v1"
 _EGOSTITCH_E2E_ARRAY_KEYS = ("full", "f_logit", "pair_content", "pair_topology")
 _EGOSTITCH_E2E_BINDING_SCHEMA = "egostitch_e2e_binding_evidence_v1"
@@ -112,6 +112,8 @@ _SCAFFOLD_CONTROL_SHUFFLE_V3 = "shuffle_within_pair_v3"
 _SCAFFOLD_CONTROL_REWIRE_V1 = "rewire_checkerboard_v1"
 _SCAFFOLD_CONTROL_SHUFFLE_V2 = "shuffle_within_pair"
 _SCAFFOLD_CONTROL_SEED = 0
+_TEST_ACCESS_LEDGER_FILENAME = "test_access_ledger.jsonl"
+_TEST_ACCESS_LEDGER_SCHEMA = "egostitch_test_access_v1"
 
 
 def _e2e_primary_logit_key(permanent_null: str) -> str:
@@ -207,6 +209,20 @@ class ScoresArtifact:
         return out
 
 
+@dataclass
+class _TestAccessContext:
+    """Identity needed to ledger one held-out scoring epoch."""
+
+    ledger_path: Path
+    scoring_arm: str
+    seed: int
+    output: Path
+    shard: int
+    num_shards: int
+    rescore_reason: str | None
+    ledger_binding: dict[str, object] | None = None
+
+
 class _Shard(NamedTuple):
     """One raw scores file (including its shard offset), as read from disk."""
 
@@ -257,7 +273,7 @@ def validate_score_precision(
     require_diagnostics: bool = True,
     extra_arrays: Mapping[str, NDArray[np.float32]] | None = None,
 ) -> None:
-    """Validate EgoStitch pair-pass fp32 provenance and stored diagnostics.
+    """Validate EgoStitch-E2E pair-pass fp32 provenance and stored diagnostics.
 
     Args:
         logit: The scores artifact's primary logit column.
@@ -270,69 +286,51 @@ def validate_score_precision(
             Ignored for every other family.
 
     Raises:
-        ValueError: If an EgoStitch or EgoStitch-E2E artifact lacks or
-            contradicts its pinned pair-pass fp32 contract, is missing one of
-            the four decomposition arrays, or its stored diagnostics are
-            inconsistent.
+        ValueError: If an EgoStitch-E2E artifact lacks or contradicts its
+            pinned pair-pass fp32 contract, is missing one of the four
+            decomposition arrays, or its stored diagnostics are inconsistent;
+            or if the artifact belongs to the retired frozen-s0 ``egostitch``
+            family, whose validator was removed with its scorer.
     """
     family = meta.get("model_family")
-    if family == "egostitch_e2e":
-        _validate_egostitch_e2e_precision(
-            logit,
-            meta=meta,
-            label=label,
-            require_diagnostics=require_diagnostics,
-            extra_arrays=extra_arrays or {},
-        )
-        return
-    if family != "egostitch":
-        return
-    precision = meta.get("score_precision")
-    if not isinstance(precision, dict):
+    if family == "egostitch":
+        # Fail closed rather than silently passing: the frozen-s0 family's
+        # pair-pass fp32 validator was excised with its scorer, so a surviving
+        # legacy artifact has no contract left to check. Its evidence is kept
+        # under docs/results/ and outputs/egostitch_stage1/; score it from a
+        # pre-excision commit if it must be re-analysed.
         raise ValueError(
-            f"{label}: EgoStitch artifact is missing score_precision provenance; "
-            "rescore with the pair-pass fp32 contract"
+            f"{label}: the frozen-s0 'egostitch' family is retired; its scorer and "
+            "precision contract were removed. Re-analyse legacy artifacts from a "
+            "pre-excision commit."
         )
-    expected = {
-        "contract": _EGOSTITCH_PAIR_PRECISION_CONTRACT,
-        "pair_compute_dtype": "float32",
-        "pair_autocast": False,
-        "logit_storage_dtype": "float32",
-    }
-    mismatches = {
-        key: (precision.get(key), value)
-        for key, value in expected.items()
-        if precision.get(key) != value
-    }
-    if mismatches:
-        raise ValueError(f"{label}: invalid EgoStitch score_precision provenance: {mismatches}")
-    if precision.get("encode_autocast") not in {"off", "bf16"}:
-        raise ValueError(f"{label}: score_precision.encode_autocast must be 'off' or 'bf16'")
-    if np.asarray(logit).dtype != np.float32:
-        raise ValueError(f"{label}: EgoStitch logits must be stored as float32")
-
-    if not require_diagnostics:
+    if family != "egostitch_e2e":
         return
-    recorded = meta.get("score_resolution")
-    actual = score_resolution_diagnostics(logit)
-    if recorded != actual:
-        raise ValueError(
-            f"{label}: score_resolution diagnostics are missing or inconsistent; "
-            f"recorded={recorded!r}, actual={actual!r}"
-        )
+    _validate_egostitch_e2e_precision(
+        logit,
+        meta=meta,
+        label=label,
+        require_diagnostics=require_diagnostics,
+        extra_arrays=extra_arrays or {},
+    )
 
 
 def validate_artifact_precision(artifact: ScoresArtifact, *, label: str = "artifact") -> None:
-    """Validate a loaded `ScoresArtifact`'s EgoStitch pair-pass fp32 provenance.
+    """Validate a loaded `ScoresArtifact`'s EgoStitch-E2E pair-pass fp32 provenance.
 
     Thin, family-agnostic wrapper over :func:`validate_score_precision`: it
     derives ``extra_arrays`` from the artifact's own diagnostic fields, so a caller
     that only has a `ScoresArtifact` (and
-    does not know in advance whether its family is ``egostitch_e2e``,
-    ``egostitch``, or a plain B0-family scorer) can validate it directly, the
+    does not know in advance whether its family is ``egostitch_e2e`` or a plain
+    B0-family scorer) can validate it directly, the
     same way :func:`load_scores` returns it. Non-``egostitch_e2e`` artifacts
     simply pass an empty ``extra_arrays`` mapping, matching
     :func:`validate_score_precision`'s existing behavior for those families.
+
+    This is the only correct entry point for an ``egostitch_e2e`` artifact:
+    calling :func:`validate_score_precision` directly with just
+    ``artifact.logit`` omits the decomposition arrays the contract requires and
+    raises a spurious "missing arrays" error.
 
     Args:
         artifact: The loaded scores artifact (from :func:`load_scores` or
@@ -340,11 +338,11 @@ def validate_artifact_precision(artifact: ScoresArtifact, *, label: str = "artif
         label: Human-readable artifact label used in errors.
 
     Raises:
-        ValueError: If an EgoStitch or EgoStitch-E2E artifact lacks or
-            contradicts its pinned pair-pass fp32 contract, is missing one of
-            the four decomposition arrays, or its stored diagnostics are
-            inconsistent.
+        ValueError: If an EgoStitch-E2E artifact lacks or contradicts its
+            pinned pair-pass fp32 contract, is missing one of the four
+            decomposition arrays, or its stored diagnostics are inconsistent.
     """
+    validate_test_access_ledger_binding(artifact.meta, label=label)
     extra_arrays: dict[str, NDArray[np.float32]] = {}
     if artifact.f_logit is not None:
         extra_arrays["f_logit"] = artifact.f_logit
@@ -360,6 +358,121 @@ def validate_artifact_precision(artifact: ScoresArtifact, *, label: str = "artif
         label=label,
         extra_arrays=extra_arrays,
     )
+
+
+def validate_test_access_ledger_binding(
+    meta: Mapping[str, object],
+    *,
+    artifact_path: Path | None = None,
+    label: str = "artifact",
+) -> None:
+    """Fail closed when held-out E2E score metadata is not bound to its ledger.
+
+    Each shard binds the hash of its own append-only ledger record. A merged
+    artifact binds the complete shard-record set. The ledger itself is a hash
+    chain, so deletion or mutation of any historical record invalidates every
+    later artifact without making valid artifacts fail when new records append.
+    """
+    if meta.get("model_family") != "egostitch_e2e":
+        return
+    pairs_source = meta.get("pairs_source")
+    if not isinstance(pairs_source, str) or not (
+        pairs_source in {"candidate", "test"} or pairs_source.startswith("file:")
+    ):
+        return
+    raw_binding = meta.get("test_access_ledger")
+    formal_markers = (
+        "formal_scoring_provenance",
+        "scoring_arm",
+        "checkpoint_arm",
+        "arm_kind",
+    )
+    if raw_binding is None and not any(key in meta for key in formal_markers):
+        # Unit-level/synthetic score containers are not claims of held-out
+        # formal access. Formal producers and consumers always carry the
+        # scoring-provenance markers above and therefore cannot take this path.
+        return
+    if not isinstance(raw_binding, dict):
+        raise ValueError(f"{label}: held-out E2E artifact is missing test_access_ledger")
+    binding = cast(dict[str, object], raw_binding)
+    required = {
+        "schema_version": str,
+        "path": str,
+        "record_sha256": str,
+        "scoring_arm": str,
+        "seed": int,
+        "scoring_epoch": int,
+        "num_shards": int,
+        "output": str,
+    }
+    for key, expected_type in required.items():
+        value = binding.get(key)
+        if isinstance(value, bool) or not isinstance(value, expected_type):
+            raise ValueError(f"{label}: invalid test_access_ledger.{key}")
+    if binding["schema_version"] != _TEST_ACCESS_LEDGER_SCHEMA:
+        raise ValueError(f"{label}: unsupported test-access ledger schema")
+    ledger_path = Path(cast(str, binding["path"]))
+    if not ledger_path.is_file():
+        raise ValueError(f"{label}: test-access ledger is missing: {ledger_path}")
+    with ledger_path.open(encoding="utf-8") as ledger:
+        fcntl.flock(ledger.fileno(), fcntl.LOCK_SH)
+        records = _validate_test_access_records(ledger, label=f"{label}: test-access ledger")
+
+    raw_members = binding.get("records")
+    if raw_members is None:
+        raw_shard = binding.get("shard")
+        if isinstance(raw_shard, bool) or not isinstance(raw_shard, int):
+            raise ValueError(f"{label}: invalid test_access_ledger.shard")
+        members = [binding]
+    else:
+        if not isinstance(raw_members, list) or not raw_members:
+            raise ValueError(f"{label}: invalid test_access_ledger.records")
+        if not all(isinstance(member, dict) for member in raw_members):
+            raise ValueError(f"{label}: invalid test_access_ledger.records")
+        members = cast(list[dict[str, object]], raw_members)
+        member_digests = [member.get("record_sha256") for member in members]
+        aggregate = hashlib.sha256(
+            json.dumps(member_digests, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if binding["record_sha256"] != aggregate:
+            raise ValueError(f"{label}: merged test-access ledger digest mismatch")
+
+    by_digest = {record.get("record_sha256"): record for record in records}
+    expected_common = {
+        "scoring_arm": binding["scoring_arm"],
+        "seed": binding["seed"],
+        "scoring_epoch": binding["scoring_epoch"],
+        "num_shards": binding["num_shards"],
+        "output": binding["output"],
+    }
+    seen_shards: set[int] = set()
+    for member in members:
+        digest = member.get("record_sha256")
+        record = by_digest.get(digest)
+        if record is None:
+            raise ValueError(f"{label}: bound test-access ledger record is missing")
+        for key, expected in expected_common.items():
+            if member.get(key, expected) != expected or record.get(key) != expected:
+                raise ValueError(f"{label}: test-access ledger {key} mismatch")
+        shard = member.get("shard")
+        if isinstance(shard, bool) or not isinstance(shard, int) or record.get("shard") != shard:
+            raise ValueError(f"{label}: test-access ledger shard mismatch")
+        if shard in seen_shards:
+            raise ValueError(f"{label}: duplicate test-access ledger shard")
+        seen_shards.add(shard)
+    num_shards = cast(int, binding["num_shards"])
+    if raw_members is not None and seen_shards != set(range(num_shards)):
+        raise ValueError(f"{label}: merged test-access ledger shard set is incomplete")
+
+    if artifact_path is not None:
+        output = Path(cast(str, binding["output"]))
+        expected_path = (
+            output
+            if raw_members is not None or num_shards == 1
+            else _shard_output_path(output, next(iter(seen_shards)))
+        )
+        if artifact_path.resolve() != expected_path.resolve():
+            raise ValueError(f"{label}: artifact path contradicts test-access ledger output")
 
 
 def _validate_egostitch_e2e_precision(
@@ -501,9 +614,9 @@ def save_scores(
     Raises:
         ValueError: If array lengths disagree, indices fall outside `node_ids`,
             `row_start` is negative, `meta` is missing pinned keys, an
-            EgoStitch artifact violates the pair-pass fp32 provenance contract,
-            or an ``egostitch_e2e`` artifact is missing one of the three extra
-            decomposition arrays.
+            ``egostitch_e2e`` artifact violates the pair-pass fp32 provenance
+            contract, or an ``egostitch_e2e`` artifact is missing one of the
+            three extra decomposition arrays.
     """
     n = len(logit)
     if not (len(u_idx) == len(v_idx) == len(label) == n):
@@ -532,14 +645,7 @@ def save_scores(
     if missing:
         raise ValueError(f"meta is missing required keys: {missing}")
     stored_meta = dict(meta)
-    family = stored_meta.get("model_family")
-    if family == "egostitch":
-        validate_score_precision(
-            logit, meta=stored_meta, label=str(path), require_diagnostics=False
-        )
-        stored_meta["score_resolution"] = score_resolution_diagnostics(logit)
-        validate_score_precision(logit, meta=stored_meta, label=str(path))
-    elif family == "egostitch_e2e":
+    if stored_meta.get("model_family") == "egostitch_e2e":
         stored_meta["scores_meta_version"] = _SCORES_META_VERSION
         if f_logit is None or pair_content is None or pair_topology is None:
             raise ValueError(
@@ -571,6 +677,9 @@ def save_scores(
         }
         validate_score_precision(
             logit, meta=stored_meta, label=str(path), extra_arrays=extra_arrays
+        )
+        validate_test_access_ledger_binding(
+            stored_meta, artifact_path=path, label=str(path)
         )
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -656,6 +765,7 @@ def _load_shard(path: Path) -> _Shard:
             full_logit = data["full_logit"].astype(np.float32, copy=False)
         else:
             full_logit = None
+    validate_test_access_ledger_binding(meta, artifact_path=path, label=str(path))
     return _Shard(
         path=path,
         node_ids=node_ids,
@@ -780,6 +890,33 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
         v_parts.append(mapping[shard.v_idx] if len(shard.v_idx) else shard.v_idx)
 
     merged_meta = dict(reference.meta)
+    if reference.meta.get("model_family") == "egostitch_e2e" and isinstance(
+        reference.meta.get("test_access_ledger"), dict
+    ):
+        bindings = [
+            cast(dict[str, object], shard.meta["test_access_ledger"])
+            for shard in ordered
+        ]
+        common_keys = (
+            "schema_version",
+            "path",
+            "scoring_arm",
+            "seed",
+            "scoring_epoch",
+            "num_shards",
+            "output",
+        )
+        for key in common_keys:
+            if any(binding.get(key) != bindings[0].get(key) for binding in bindings[1:]):
+                raise ValueError(f"merge inputs disagree on test-access ledger {key!r}")
+        member_digests = [binding["record_sha256"] for binding in bindings]
+        merged_meta["test_access_ledger"] = {
+            **{key: bindings[0][key] for key in common_keys},
+            "record_sha256": hashlib.sha256(
+                json.dumps(member_digests, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+            "records": bindings,
+        }
     profiles = [shard.meta.get("score_profile") for shard in ordered]
     if all(isinstance(profile, dict) for profile in profiles):
         typed_profiles = cast(list[dict[str, object]], profiles)
@@ -849,13 +986,6 @@ def _build_f0_mlp(model_config: dict[str, object]) -> nn.Module:
     return cast(nn.Module, F0PairMLP(**cast(dict[str, Any], model_config)))
 
 
-def _build_egostitch(model_config: dict[str, object]) -> nn.Module:
-    """Build an `EgoStitchStage1` model from its checkpointed config (spec Sec 13)."""
-    from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
-
-    return EgoStitchStage1(EgoStitchConfig.from_mapping(model_config))
-
-
 def _build_egostitch_e2e(model_config: dict[str, object]) -> nn.Module:
     """Build an `EgoStitchE2E` model from its checkpointed config (design rev 3).
 
@@ -877,7 +1007,6 @@ def _build_egostitch_e2e(model_config: dict[str, object]) -> nn.Module:
 MODEL_BUILDERS: dict[str, Callable[[dict[str, object]], nn.Module]] = {
     "v3_1": _build_v3_1,
     "f0_mlp": _build_f0_mlp,
-    "egostitch": _build_egostitch,
     "egostitch_e2e": _build_egostitch_e2e,
 }
 
@@ -1084,6 +1213,73 @@ def _load_json_object(path: Path, *, label: str) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
+E2E_MARGIN_VERDICT_FILENAME = "margin_verdict.json"
+E2E_RUN_PROFILE_FILENAME = "profile.json"
+
+
+def validate_e2e_margin_verdict(run_metadata_path: Path, *, label: str) -> str:
+    """Require the run's persisted clip/family/RMS margin verdict, bound to it.
+
+    ``validate_e2e_qualification_profile`` is the repository's only clip-
+    coefficient / family-ratio / submodule-RMS margin gate, and it can only run
+    after ``src.e2_pipeline`` has published the run -- by which point
+    ``run_metadata.json`` already reads ``status: complete`` and
+    ``formal_artifacts_published: true``. Completion therefore carries no margin
+    evidence at all, and every consumer of a formal E2E run has to demand the
+    verdict itself rather than infer it from publication. This is that single
+    demand; ``hpc/qualification.sh``, formal scoring and the G5 gate all route
+    through it so the rule has one definition.
+
+    The verdict is refused unless it is bound to the exact run it describes:
+    ``run_metadata_sha256`` pins the metadata record the caller is consuming and
+    ``profile_sha256`` pins the ``profile.json`` the margins were computed from,
+    so a verdict left behind by an earlier run in the same output directory
+    cannot stand in for this one.
+
+    Args:
+        run_metadata_path: The formal run's ``run_metadata.json``. The verdict
+            and the profile are read from its directory, which is the layout
+            ``_publish_staged`` produces.
+        label: Human-readable prefix for the refusal messages.
+
+    Returns:
+        The verdict file's SHA-256.
+
+    Raises:
+        ValueError: If the verdict is absent, unreadable, not ``pass``, or bound
+            to a different run than `run_metadata_path`.
+    """
+    run_dir = run_metadata_path.parent
+    verdict_path = run_dir / E2E_MARGIN_VERDICT_FILENAME
+    if not verdict_path.is_file():
+        raise ValueError(
+            f"{label}: no clip/family/RMS margin verdict at {verdict_path}; a completed "
+            "formal run is not certified until its margins have been validated"
+        )
+    verdict = _load_json_object(verdict_path, label=f"{label} margin verdict")
+    status = verdict.get("status")
+    if status != "pass":
+        raise ValueError(
+            f"{label}: clip/family/RMS margin verdict is {status!r}, not 'pass': {verdict_path}"
+        )
+    profile_path = run_dir / E2E_RUN_PROFILE_FILENAME
+    if not profile_path.is_file():
+        raise ValueError(
+            f"{label}: margin verdict cannot be bound to a run without {profile_path}"
+        )
+    for key, bound_path in (
+        ("profile_sha256", profile_path),
+        ("run_metadata_sha256", run_metadata_path),
+    ):
+        expected = _file_sha256(bound_path)
+        if verdict.get(key) != expected:
+            raise ValueError(
+                f"{label}: margin verdict {key} does not describe this run: "
+                f"{verdict.get(key)!r} != {expected!r} ({bound_path})"
+            )
+    return _file_sha256(verdict_path)
+
+
 def _validate_e2e_scoring_provenance(
     *,
     registration_path: Path,
@@ -1177,6 +1373,11 @@ def _validate_e2e_scoring_provenance(
         raise ValueError("egostitch_e2e scoring requires an eligible selected checkpoint")
     if metadata.get("model_family") != "egostitch_e2e":
         raise ValueError("run metadata model_family must be 'egostitch_e2e'")
+    # `status: complete` is stamped before the margin gate can run, so it is not
+    # evidence that this run's clip/family/RMS margins held. Held-out scoring of
+    # an uncertified -- or a certified-failing -- run is refused here, before any
+    # candidate/test manifest is opened.
+    validate_e2e_margin_verdict(run_metadata_path, label="egostitch_e2e scoring")
 
     arm = metadata.get("arm")
     if arm not in _EGOSTITCH_E2E_FORMAL_ARMS:
@@ -1230,6 +1431,9 @@ def _validate_e2e_scoring_provenance(
     checkpoint_sha256 = _file_sha256(checkpoint_path)
     if metadata.get("checkpoint_sha256") != checkpoint_sha256:
         raise ValueError("run metadata checkpoint_sha256 does not match selected checkpoint")
+    seed = metadata.get("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("run metadata seed must be an integer")
 
     return {
         "arm": arm_name,
@@ -1244,38 +1448,6 @@ def _validate_e2e_scoring_provenance(
         "implementation_commit": implementation_commit,
         "selected_checkpoint_eligible": True,
     }
-
-
-def _is_heldout_pair_source(pairs_source: str, data_root: Path, strategy: str) -> bool:
-    """Recognize named held-out sources, including the same manifest passed via `file:`."""
-    if pairs_source in {"candidate", "test"}:
-        return True
-    if not pairs_source.startswith("file:"):
-        return False
-    supplied = Path(pairs_source[len("file:") :])
-    benchmark_dir = data_root / _BENCHMARK_SUBDIR / strategy
-    heldout_paths = (
-        benchmark_dir / "candidate_test_edges.txt",
-        benchmark_dir / "test_edges.txt",
-    )
-    if supplied.resolve() in {path.resolve() for path in heldout_paths}:
-        return True
-    if not supplied.is_file():
-        return False
-    supplied_sha256 = _file_sha256(supplied)
-    supplied_multiset: Counter[tuple[str, str]] | None = None
-    for path in heldout_paths:
-        if not path.is_file():
-            continue
-        if _file_sha256(path) == supplied_sha256:
-            return True
-        # Canonical-pair multiset comparison: a reordered, label-stripped, or
-        # endpoint-swapped copy of a held-out manifest is still held-out.
-        if supplied_multiset is None:
-            supplied_multiset = Counter(_read_pairs_tsv(supplied)[0])
-        if supplied_multiset == Counter(_read_pairs_tsv(path)[0]):
-            return True
-    return False
 
 
 def _load_checkpoint(
@@ -1402,8 +1574,130 @@ def _read_pairs_tsv(path: Path) -> tuple[list[tuple[str, str]], NDArray[np.int8]
     return pairs, np.array(labels, dtype=np.int8)
 
 
+def _ledger_record_sha256(record: Mapping[str, object]) -> str:
+    """Return the canonical digest of one ledger record, excluding its digest field."""
+    payload = {key: value for key, value in record.items() if key != "record_sha256"}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_test_access_records(
+    raw_lines: Iterable[str], *, label: str
+) -> list[dict[str, object]]:
+    """Parse and validate the append-only ledger hash chain."""
+    records: list[dict[str, object]] = []
+    previous: str | None = None
+    for line_number, raw_line in enumerate(raw_lines, start=1):
+        try:
+            record = json.loads(raw_line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"{label} is malformed at line {line_number}: {exc.msg}"
+            ) from exc
+        if not isinstance(record, dict) or record.get("schema_version") != (
+            _TEST_ACCESS_LEDGER_SCHEMA
+        ):
+            raise ValueError(f"{label} has an invalid record at line {line_number}")
+        typed = cast(dict[str, object], record)
+        recorded_digest = typed.get("record_sha256")
+        if not isinstance(recorded_digest, str) or recorded_digest != _ledger_record_sha256(typed):
+            raise ValueError(f"{label} has a digest mismatch at line {line_number}")
+        if typed.get("previous_record_sha256") != previous:
+            raise ValueError(f"{label} has a broken hash chain at line {line_number}")
+        records.append(typed)
+        previous = recorded_digest
+    return records
+
+
+def _record_test_access(context: _TestAccessContext, *, pairs_source: str) -> dict[str, object]:
+    """Append one held-out manifest read while enforcing scoring-epoch uniqueness.
+
+    Records from concurrent shards share an epoch when their arm, seed, output,
+    shard count, and re-score reason agree. A duplicate shard or a different
+    output starts another epoch and therefore requires an explicit reason.
+    """
+    context.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    with context.ledger_path.open("a+", encoding="utf-8") as ledger:
+        fcntl.flock(ledger.fileno(), fcntl.LOCK_EX)
+        ledger.seek(0)
+        records = _validate_test_access_records(
+            ledger, label="test-access ledger"
+        )
+
+        matching = [
+            record
+            for record in records
+            if record.get("event") == "resolve_pairs"
+            and record.get("scoring_arm") == context.scoring_arm
+            and record.get("seed") == context.seed
+        ]
+        epoch = 1
+        if matching:
+            epoch_values = [record.get("scoring_epoch") for record in matching]
+            if any(isinstance(value, bool) or not isinstance(value, int) for value in epoch_values):
+                raise ValueError("test-access ledger contains an invalid scoring_epoch")
+            latest_epoch = max(cast(list[int], epoch_values))
+            latest = [record for record in matching if record["scoring_epoch"] == latest_epoch]
+            used_shards = {record.get("shard") for record in latest}
+            joins_latest_epoch = (
+                all(record.get("output") == str(context.output.resolve()) for record in latest)
+                and all(record.get("num_shards") == context.num_shards for record in latest)
+                and all(record.get("rescore_reason") == context.rescore_reason for record in latest)
+                and context.shard not in used_shards
+                and len(used_shards) < context.num_shards
+            )
+            if joins_latest_epoch:
+                epoch = latest_epoch
+            else:
+                if context.rescore_reason is None:
+                    raise ValueError(
+                        "held-out scoring already has an epoch for "
+                        f"arm={context.scoring_arm!r}, seed={context.seed}; "
+                        "repeat scoring requires --rescore-reason"
+                    )
+                epoch = latest_epoch + 1
+
+        record = {
+            "schema_version": _TEST_ACCESS_LEDGER_SCHEMA,
+            "event": "resolve_pairs",
+            "accessed_utc": datetime.now(UTC).isoformat(),
+            "scoring_epoch": epoch,
+            "scoring_arm": context.scoring_arm,
+            "seed": context.seed,
+            "pairs_source": pairs_source,
+            "output": str(context.output.resolve()),
+            "shard": context.shard,
+            "num_shards": context.num_shards,
+            "rescore_reason": context.rescore_reason,
+            "previous_record_sha256": (
+                records[-1]["record_sha256"] if records else None
+            ),
+        }
+        record["record_sha256"] = _ledger_record_sha256(record)
+        ledger.seek(0, 2)
+        ledger.write(json.dumps(record, sort_keys=True) + "\n")
+        ledger.flush()
+        os.fsync(ledger.fileno())
+        context.ledger_binding = {
+            "schema_version": _TEST_ACCESS_LEDGER_SCHEMA,
+            "path": str(context.ledger_path.resolve()),
+            "record_sha256": record["record_sha256"],
+            "scoring_arm": context.scoring_arm,
+            "seed": context.seed,
+            "scoring_epoch": epoch,
+            "shard": context.shard,
+            "num_shards": context.num_shards,
+            "output": str(context.output.resolve()),
+        }
+        return record
+
+
 def _resolve_pairs(
-    pairs_source: str, data_root: Path, strategy: str
+    pairs_source: str,
+    data_root: Path,
+    strategy: str,
+    *,
+    test_access: _TestAccessContext | None = None,
 ) -> tuple[list[tuple[str, str]], NDArray[np.int8]]:
     """Resolve a ``--pairs`` spec to canonical pairs plus labels, in file row order.
 
@@ -1412,6 +1706,8 @@ def _resolve_pairs(
         data_root: Directory containing ``benchmark_2025_neurips/`` and
             ``features/frozen_node_features_1024/``.
         strategy: Split strategy name (e.g. ``breadth_first``).
+        test_access: Held-out scoring identity to append before the pair manifest
+            is read; ``None`` for non-held-out sources.
 
     Returns:
         ``(pairs, labels)``, aligned index-for-index.
@@ -1419,6 +1715,8 @@ def _resolve_pairs(
     Raises:
         ValueError: If `pairs_source` is not one of the supported forms.
     """
+    if test_access is not None:
+        _record_test_access(test_access, pairs_source=pairs_source)
     benchmark_root = data_root / _BENCHMARK_SUBDIR
     if pairs_source == "candidate":
         labeled = load_candidate_pairs(benchmark_root, strategy)
@@ -1682,204 +1980,6 @@ def _score_f0_mlp(
     return out
 
 
-def _align_s0_logits(
-    artifact: ScoresArtifact, pairs: Sequence[tuple[str, str]]
-) -> NDArray[np.float32]:
-    """Row-align frozen-B0 logits to `pairs` by canonical pair (hard-fails on a miss).
-
-    Alignment is by pair identity, not row order, so a candidate/val/test
-    artifact covers any subset or reordering of its pairs. A missing pair is a
-    contract violation (spec Sec 13.10) and never silently imputed.
-    """
-    lookup: dict[tuple[str, str], float] = {}
-    logits = artifact.logit.astype(np.float64)
-    for row, (u, v) in enumerate(artifact.pairs()):
-        lookup[(u, v) if u <= v else (v, u)] = float(logits[row])
-    out = np.empty(len(pairs), dtype=np.float32)
-    for i, (u, v) in enumerate(pairs):
-        key = (u, v) if u <= v else (v, u)
-        if key not in lookup:
-            raise ValueError(
-                f"--b0-scores is missing pair {key}; it must cover every scored row "
-                "(spec Sec 13.10)"
-            )
-        out[i] = lookup[key]
-    return out
-
-
-def _score_egostitch(
-    model: nn.Module,
-    pairs: Sequence[tuple[str, str]],
-    store: FeatureStore,
-    *,
-    device: torch.device,
-    amp: str,
-    batch_pairs: int,
-    f0_cache: Path,
-    grounding_cache: Path | None,
-    s0_logits: NDArray[np.float32],
-) -> NDArray[np.float32]:
-    """Score pairs with an `EgoStitchStage1` model (spec Sec 10.3 / Sec 13).
-
-    Runs the cacheable per-node pass (Tokenize-lite + Imagine) once over the
-    unique endpoints, then scores pair batches from the cache: Sinkhorn stitch
-    + decision head fused with the cached frozen-B0 ``s0`` logits. Self-pairs
-    route through the single-ego path (spec Sec 13.9). Stage-1 scores are
-    pass-1 (ratio 1) scores (spec Sec 13.11). The per-pair pass (Sinkhorn
-    stitch, decision head, self-pair single-ego branch) always runs in fp32,
-    regardless of `amp` (spec Sec 13.16 score-precision pin); only the
-    per-node encode pass honors `amp`.
-
-    Args:
-        model: Frozen `EgoStitchStage1`, on `device`, in ``eval()`` mode.
-        pairs: Node-id pairs in input row order.
-        store: Feature store providing per-node token sequences.
-        device: Compute device.
-        amp: ``off`` or ``bf16``; applies only to the per-node encode pass.
-            The per-pair scoring pass always runs in fp32 (see above).
-        batch_pairs: Pair rows per forward pass.
-        f0_cache: F0 matrix cache path (f0_mlp semantics).
-        grounding_cache: Grounding-pool cache path (derived from `f0_cache`
-            when ``None``).
-        s0_logits: Row-aligned frozen-B0 logits.
-
-    Returns:
-        Shape ``(len(pairs),)`` float32 logits in input row order.
-    """
-    from src.data.grounding import build_grounding_pool
-    from src.model.egostitch.model import EgoStitchStage1, NodeEncoding
-    from src.model.egostitch.stitch import sinkhorn_plan
-
-    assert isinstance(model, EgoStitchStage1)
-    model.set_density_ratio(1.0)  # pass-1 scores (spec Sec 13.11)
-    node_ids = sorted({node_id for pair in pairs for node_id in pair})
-    try:
-        f0_cache.parent.mkdir(parents=True, exist_ok=True)
-        matrix, index = build_f0_matrix(
-            store, node_ids, cache_path=f0_cache, allow_cache_subset=True
-        )
-    except ValueError:
-        logger.warning(
-            "F0 cache at %s does not match the requested node set; recomputing without cache",
-            f0_cache,
-        )
-        matrix, index = build_f0_matrix(store, node_ids, cache_path=None)
-    if grounding_cache is None:
-        grounding_cache = f0_cache.with_name(f"{f0_cache.stem}_grounding.npz")
-    pool = build_grounding_pool(
-        np.asarray(matrix.numpy(), dtype=np.float32),
-        node_ids,
-        n_ground=model.config.n_ground,
-        role_universe="test",
-        cache_path=grounding_cache,
-    )
-    pool_rows = torch.tensor(
-        [[index[neighbor] for neighbor in pool[node]] for node in node_ids],
-        dtype=torch.int64,
-    )
-
-    # Cacheable per-node pass (spec Sec 10.3): one batched encode per node.
-    encode_batch = max(batch_pairs // max(model.config.slots, 1), 1)
-    h_cache: list[torch.Tensor] = []
-    pi_cache: list[torch.Tensor] = []
-    mult_cache: list[torch.Tensor] = []
-    adj_cache: list[torch.Tensor] = []
-    d_hat_cache: list[torch.Tensor] = []
-    proj_cache: list[torch.Tensor] = []
-    for start in range(0, len(node_ids), encode_batch):
-        rows = torch.arange(start, min(start + encode_batch, len(node_ids)))
-        x = matrix[rows].to(device)
-        ground_x = matrix[pool_rows[rows]].to(device)
-        with torch.inference_mode(), _autocast_context(device, amp):
-            enc: NodeEncoding = model.encode_nodes(x, ground_x)
-            proj = model.project_features(x)
-        h_cache.append(enc.slots.h.float())
-        pi_cache.append(enc.slots.pi.float())
-        mult_cache.append(enc.slots.mult.float())
-        adj_cache.append(enc.slots.adj.float())
-        d_hat_cache.append(model.d_hat(enc.tok).float())
-        proj_cache.append(proj.float())
-    h_all = torch.cat(h_cache)
-    pi_all = torch.cat(pi_cache)
-    mult_all = torch.cat(mult_cache)
-    adj_all = torch.cat(adj_cache)
-    d_hat_all = torch.cat(d_hat_cache)
-    proj_all = torch.cat(proj_cache)
-
-    from src.model.egostitch.imagine import SlotSet
-
-    u_rows = torch.tensor([index[u] for u, _ in pairs], dtype=torch.int64)
-    v_rows = torch.tensor([index[v] for _, v in pairs], dtype=torch.int64)
-    is_self = u_rows == v_rows
-    out: NDArray[np.float32] = np.empty(len(pairs), dtype=np.float32)
-    filler = torch.zeros(1, dtype=torch.float32, device=device)
-
-    def _slots(rows: torch.Tensor) -> SlotSet:
-        adj = adj_all[rows]
-        return SlotSet(
-            h=h_all[rows],
-            pi=pi_all[rows],
-            mult=mult_all[rows],
-            gate=filler.expand(rows.shape[0], pi_all.shape[1]),
-            pointer=filler.expand(rows.shape[0], pi_all.shape[1], 1),
-            adj=adj,
-            adj_logits=torch.logit(adj.clamp(1e-6, 1.0 - 1e-6)),
-        )
-
-    for start in range(0, len(pairs), batch_pairs):
-        end = min(start + batch_pairs, len(pairs))
-        batch_u = u_rows[start:end].to(device)
-        batch_v = v_rows[start:end].to(device)
-        batch_self = is_self[start:end].to(device)
-        s0 = torch.from_numpy(s0_logits[start:end].astype(np.float32)).to(device)
-        # Pair pass always runs fp32 regardless of `amp` (spec Sec 13.16
-        # score-precision pin): under bf16 autocast the Sinkhorn stitch and
-        # decision head (both branches below) emit bfloat16 values, and
-        # assigning them into `logits` silently preserves the bf16 ulp grid
-        # (spacing 0.03125 at |logit| in [4,8)) even though `logits` itself is
-        # fp32. Inputs here are already fp32 (`h_all`/`pi_all`/`mult_all`/
-        # `adj_all`/`proj_all`/`d_hat_all` are `.float()`-cast above; `s0` is
-        # fp32), so disabling autocast is behavior-correcting, not a refactor.
-        with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=False):
-            logits = torch.zeros(end - start, dtype=torch.float32, device=device)
-            sel = torch.nonzero(~batch_self, as_tuple=False).squeeze(-1)
-            if sel.numel() > 0:
-                slots_i = _slots(batch_u[sel])
-                slots_j = _slots(batch_v[sel])
-                plan = sinkhorn_plan(
-                    slots_i.h,
-                    slots_j.h,
-                    slots_i.pi,
-                    slots_j.pi,
-                    slots_i.mult,
-                    slots_j.mult,
-                    eps=model.config.sinkhorn_eps,
-                    iters=model.config.sinkhorn_iters,
-                    tau=model.config.sinkhorn_tau,
-                )
-                logits[sel] = model.decision(
-                    s0[sel],
-                    slots_i,
-                    slots_j,
-                    plan,
-                    proj_all[batch_u[sel]],
-                    proj_all[batch_v[sel]],
-                    d_hat_all[batch_u[sel]],
-                    d_hat_all[batch_v[sel]],
-                ).float()
-            sel = torch.nonzero(batch_self, as_tuple=False).squeeze(-1)
-            if sel.numel() > 0:
-                logits[sel] = model.decision.forward_self(
-                    s0[sel],
-                    _slots(batch_u[sel]),
-                    proj_all[batch_u[sel]],
-                    d_hat_all[batch_u[sel]],
-                ).float()
-        out[start:end] = logits.detach().to(torch.float32).cpu().numpy().reshape(-1)
-        _log_progress(end, len(pairs), end - start)
-    return out
-
-
 def _score_egostitch_e2e(
     model: nn.Module,
     pairs: Sequence[tuple[str, str]],
@@ -1902,8 +2002,8 @@ def _score_egostitch_e2e(
     disabled for this family, regardless of any future `--amp` wiring.
 
     Each batch is assembled with real grounding-pool candidates (spec Sec
-    13.12), reusing the same `build_f0_matrix`/`build_grounding_pool` loader
-    the Stage-1 `_score_egostitch` path uses: ``ground_a``/``ground_b`` carry
+    13.12) via the `build_f0_matrix`/`build_grounding_pool` loader:
+    ``ground_a``/``ground_b`` carry
     the pool's F0 features and ``ground_id_a``/``ground_id_b`` carry the
     pool's global node ids (matrix-row indices into the shared, run-scoped
     `node_ids` vocabulary — consistent across both endpoints and batches, so
@@ -1919,9 +2019,9 @@ def _score_egostitch_e2e(
         device: Compute device.
         token_budget: Approximate per-batch token budget for the bucketed sampler.
         f0_cache: F0 matrix cache path providing the mean-pooled `x_a`/`x_b`
-            generator inputs (f0_mlp/egostitch semantics).
+            generator inputs (f0_mlp semantics).
         grounding_cache: Grounding-pool cache path (derived from `f0_cache`
-            when ``None``, mirroring `_score_egostitch`).
+            when ``None``).
         scaffold_control: Optional registered within-pair scaffold perturbation.
         universe_pairs: Full input universe used to keep grounding pools stable
             when this scorer receives a contiguous shard.
@@ -2249,21 +2349,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional pair-head autocast override for packed v3_1 scoring",
     )
     score.add_argument(
-        "--b0-scores",
-        type=Path,
-        default=None,
-        help="frozen-B0 scores .npz supplying s0 (required for egostitch; spec Sec 13.10)",
-    )
-    score.add_argument(
-        "--s0-checkpoint-id",
-        default="e092537d8cf1e208",
-        help="required checkpoint_id of --b0-scores (the audited frozen B0)",
-    )
-    score.add_argument(
         "--grounding-cache",
         type=Path,
         default=None,
-        help="grounding-pool cache path (egostitch only; built when absent)",
+        help="grounding-pool cache path (egostitch_e2e only; built when absent)",
     )
     score.add_argument(
         "--scaffold-control",
@@ -2278,6 +2367,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     score.add_argument("--shard", type=int, default=None, help="shard index K (with --num-shards)")
     score.add_argument("--num-shards", type=int, default=None, help="total shard count N")
+    score.add_argument(
+        "--rescore-reason",
+        default=None,
+        help="required reason for a repeated egostitch_e2e held-out scoring epoch",
+    )
     score.add_argument(
         "--f0-cache",
         type=Path,
@@ -2318,6 +2412,8 @@ def _validate_score_args(parser: argparse.ArgumentParser, args: argparse.Namespa
             parser.error(f"--num-shards must be >= 1, got {args.num_shards}")
         if not 0 <= args.shard < args.num_shards:
             parser.error(f"--shard must be in [0, {args.num_shards}), got {args.shard}")
+    if args.rescore_reason is not None and not args.rescore_reason.strip():
+        parser.error("--rescore-reason must contain non-whitespace text")
 
 
 def _run_score(args: argparse.Namespace) -> None:
@@ -2347,11 +2443,13 @@ def _run_score(args: argparse.Namespace) -> None:
             )
         _preflight_binding_artifacts_before_pair_access(args.preregistration)
         binding_artifacts_validated = True
-    heldout_e2e = model_family == "egostitch_e2e" and _is_heldout_pair_source(
-        args.pairs, args.data_root, args.strategy
-    )
+    # Every E2E `file:` source is conservatively held out. Content-equality
+    # detection would itself read the path before formal readiness and would
+    # miss test subsets/supersets.
+    heldout_e2e = potentially_heldout_e2e
     scoring_provenance: dict[str, object] | None = None
     scoring_arm: str | None = None
+    scoring_seed: int | None = None
     if heldout_e2e:
         if args.preregistration is None:
             raise ValueError(
@@ -2446,11 +2544,32 @@ def _run_score(args: argparse.Namespace) -> None:
                 for arm, provenance in provenances.items()
             },
         }
+        selected_metadata = _load_json_object(
+            arm_paths[selected_arm], label=f"{selected_arm} run metadata"
+        )
+        scoring_seed = cast(int, selected_metadata["seed"])
+    if args.rescore_reason is not None and not heldout_e2e:
+        raise ValueError("--rescore-reason is valid only for egostitch_e2e held-out scoring")
     if args.scaffold_control != _SCAFFOLD_CONTROL_NONE and model_family != "egostitch_e2e":
         raise ValueError("--scaffold-control is supported only for model_family 'egostitch_e2e'")
     model.to(device)
 
-    pairs, labels = _resolve_pairs(args.pairs, args.data_root, args.strategy)
+    test_access = None
+    if heldout_e2e:
+        assert scoring_arm is not None
+        assert scoring_seed is not None
+        test_access = _TestAccessContext(
+            ledger_path=arm_paths[selected_arm].parent / _TEST_ACCESS_LEDGER_FILENAME,
+            scoring_arm=scoring_arm,
+            seed=scoring_seed,
+            output=args.output,
+            shard=args.shard if args.shard is not None else 0,
+            num_shards=args.num_shards if args.num_shards is not None else 1,
+            rescore_reason=args.rescore_reason,
+        )
+    pairs, labels = _resolve_pairs(
+        args.pairs, args.data_root, args.strategy, test_access=test_access
+    )
     total_rows = len(pairs)
     logger.info("resolved %d pairs from %s", total_rows, args.pairs)
 
@@ -2509,52 +2628,6 @@ def _run_score(args: argparse.Namespace) -> None:
             batch_pairs=args.batch_pairs,
             f0_cache=args.f0_cache,
         )
-    elif model_family == "egostitch":
-        if args.b0_scores is None:
-            raise ValueError(
-                "egostitch scoring requires --b0-scores (the frozen-B0 s0 cache, spec Sec 13.10)"
-            )
-        s0_artifact = load_scores(args.b0_scores)
-        actual_s0_id = s0_artifact.meta.get("checkpoint_id")
-        if actual_s0_id != args.s0_checkpoint_id:
-            raise ValueError(
-                f"--b0-scores checkpoint_id mismatch: expected {args.s0_checkpoint_id!r}, "
-                f"got {actual_s0_id!r} (spec Sec 13.10: s0 is the audited frozen B0)"
-            )
-        s0_rows = _align_s0_logits(s0_artifact, row_pairs)
-        logits = _score_egostitch(
-            model,
-            row_pairs,
-            store,
-            device=device,
-            amp=args.amp,
-            batch_pairs=args.batch_pairs,
-            f0_cache=args.f0_cache,
-            grounding_cache=args.grounding_cache,
-            s0_logits=s0_rows,
-        )
-        logits64 = logits.astype(np.float64)
-        probs = np.where(
-            logits64 >= 0,
-            1.0 / (1.0 + np.exp(-np.abs(logits64))),
-            np.exp(-np.abs(logits64)) / (1.0 + np.exp(-np.abs(logits64))),
-        )
-        meta_extra = {
-            "s0_checkpoint_id": args.s0_checkpoint_id,
-            "s0_artifact_sha256": _file_sha256(args.b0_scores),
-            "score_precision": {
-                "contract": _EGOSTITCH_PAIR_PRECISION_CONTRACT,
-                "encode_autocast": args.amp,
-                "pair_compute_dtype": "float32",
-                "pair_autocast": False,
-                "logit_storage_dtype": "float32",
-            },
-            "density_calibration": {
-                "pass": 1,
-                "rho_hat_eval": float(np.mean(probs)) if len(probs) else 0.0,
-                "note": "Stage-1 scores are pass-1 scores (spec Sec 13.11)",
-            },
-        }
     elif model_family == "egostitch_e2e":
         decomposed = _score_egostitch_e2e(
             model,
@@ -2597,11 +2670,17 @@ def _run_score(args: argparse.Namespace) -> None:
         if scoring_provenance is not None:
             meta_extra["formal_scoring_provenance"] = scoring_provenance
             meta_extra["scoring_arm"] = scoring_arm
+            meta_extra["seed"] = scoring_seed
             meta_extra["arm_kind"] = scoring_provenance["arm_kind"]
             meta_extra["checkpoint_arm"] = scoring_provenance["checkpoint_arm"]
             meta_extra["scoring_semantics"] = scoring_provenance["scoring_semantics"]
     else:  # pragma: no cover - build_model already rejects unknown families
         raise ValueError(f"no scoring path for model_family {model_family!r}")
+
+    if test_access is not None:
+        if test_access.ledger_binding is None:  # pragma: no cover - invariant guard
+            raise RuntimeError("held-out pair access completed without a durable ledger binding")
+        meta_extra["test_access_ledger"] = test_access.ledger_binding
 
     score_wall_seconds = perf_counter() - score_started
     node_ids = sorted({node_id for pair in row_pairs for node_id in pair})
@@ -2691,6 +2770,7 @@ __all__ = [
     "score_resolution_diagnostics",
     "validate_artifact_precision",
     "validate_score_precision",
+    "validate_test_access_ledger_binding",
 ]
 
 

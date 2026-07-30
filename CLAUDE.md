@@ -31,8 +31,10 @@ CODEX_HOME="$CH" codex review --base <WAVE_BASE_SHA> > <wave>-review.txt 2>&1
 — the `codex` CLI beneath it is yours to run.
 
 Runtime, for any training/scoring/gate command: the world size is **auto-detected**
-from all visible NVIDIA H20 devices (`hpc/run.sh`, `g5_stage1.sh`,
-`qualification.sh`), and config keys change meaning per model family.
+from all visible NVIDIA H20 devices (`hpc/run.sh`, `hpc/qualification.sh`), and config
+keys change meaning per model family. The e2e ladder is two stages, both launched from
+`hpc/qualification.sh`: `qualify <arm>` (short schedule, guards-only verdict, any GPU
+count) then `formal <arm>` (registered schedule, exactly 4 H20s, clean checkout).
 
 **`-c 'mcp_servers={}'` does NOT disable MCP** — `-c` merges into the config, so the
 `[mcp_servers.*]` sub-tables in `~/.codex/config.toml` survive it. Verified 2026-07-25:
@@ -70,7 +72,7 @@ nodes?" (`docs/lit-review-plan.md` §5, binding for all writing.)
   `src/data/artifacts.py:9`, spec §9.3.
 - **`train_graph.pkl` contains every val positive** (`artifacts.py:258` asserts
   `train⁺ ∪ val⁺`). It is for split audits only. Everything structural must come from
-  `build_g_struct` (`src/data/partition.py:69`). `val_edges.txt` is model selection
+  `build_g_struct` (`src/data/partition.py:71`). `val_edges.txt` is model selection
   only, never a training target.
 - **`exclude_nodes` filters only `train/val/test_pairs`** (`artifacts.py:367`) —
   `graph`, `train_graph`, `test_graph`, and `buckets` come back unfiltered, so
@@ -78,38 +80,46 @@ nodes?" (`docs/lit-review-plan.md` §5, binding for all writing.)
 - **Self-loop policy is asymmetric**: training structural targets strip self-loops;
   canonical MMD descriptors and official GS/RD induced subgraphs *retain* them, exactly
   as the benchmark evaluator does. Spec §9.4.
-- **Grounding pools are universe-scoped** (`V_fit`/`V_qual`/`V_select`/test, separately
-  hashed). One cache may never serve another; rehearsal may not read a `V_select` row.
-  Spec §13.12.
+- **Grounding pools are universe-scoped** (`V_fit` = training, `V_hold` = validation,
+  test; separately hashed, and both ladder stages share the same three). One cache may
+  never serve another; a training pass may not read a `V_hold` row. Spec §13.12.
+- **`V_hold` must stay the union of the two former holdouts** (`V_qual ∪ V_select`:
+  512 nodes, 1,533 positives, 130,816 pairs — `internal_holdout.py:171-178`). That union
+  is the only reason `V_fit`, `e_msg_fit`, `feature_stats_sha256` and every pack manifest
+  are bit-identical to the two-holdout era. Re-deriving `V_hold` from a single BFS draw
+  silently changes `V_fit` and every digest. Spec §9.3.
 
 ## Traps that silently corrupt results rather than raising
 
-- **`load_scores` does no precision validation** (`src/score_universe.py:665`). A
+- **`load_scores` does no precision validation** (`src/score_universe.py:648`). A
   bf16-contaminated EgoStitch artifact loads and analyses cleanly. Call
   `validate_artifact_precision(artifact, label=...)` yourself — it is the only correct
   entry point; calling `validate_score_precision` directly on an `egostitch_e2e`
   artifact spuriously raises "missing arrays".
-- **Never shard the Stage-1 scorer.** `_score_egostitch` derives its grounding-pool
-  universe from *this call's* `pairs` (`score_universe.py:1600`), so `--shard` yields
-  different logits per shard. The e2e path is safe only because `_run_score` forwards
-  `universe_pairs`/`row_start`.
-- **The fp32 island in `stitch.py:79` must promote `h`/`pi`/`m` before** cost and
+- **Guards-only is the qualification *verdict*, not checkpoint eligibility.**
+  `e2e_checkpoint_eligible` (`train_egostitch.py:1291`) is enforced in **both** stages;
+  conflating the two reauthorizes the 2026-07-19 degenerate-checkpoint failure. Its AUPRC
+  floor is `prevalence + 0.02`, and `V_hold`'s prevalence is half `V_select`'s (`0.0117`
+  vs `0.0247`), so the floor is 29% lower in absolute terms — `0.0317`, not `0.0447`.
+  Spec §13.19.3.
+- **The fp32 island in `stitch.py:80` must promote `h`/`pi`/`m` before** cost and
   marginal products are formed. Casting afterward keeps the bf16 ulp grid (0.03125
   spacing at |logit| ∈ [4,8)) and silently quantizes logits. Spec §13.16.
-- **Null-head naming is inverted** at `src/model/egostitch/e2e_model.py:416`:
+- **Null-head naming is inverted** at `src/model/egostitch/e2e_model.py:596`:
   `pair_content` comes from `NULL_TOPO_HEAD`, `pair_topology` from `NULL_CONTENT_HEAD`.
   Swapping them mislabels two published arms.
-- **`data.partition_seed` is not `seed`** (`train_egostitch.py:366`). Changing it
-  silently changes `G_struct`, the internal holdouts, and the whole s0 pair universe.
-- **`_config_hash` bakes in paths** (`train_egostitch.py:708` — `output_dir`,
-  `data.root`, `preregistration`), so overriding `--output-dir` breaks the
-  `config_hash` equality gate at `src/experiments/probes.py:505`.
-- **The s0 manifest is tied to `(world_size, epochs, negative_ratio, seed)`**
-  (`train_egostitch.py:1786`). Launching with a different `--num_processes` than the
-  manifest build leaves the s0 cache incomplete.
-- **Stale caches warn instead of failing**: mismatched grounding (`grounding.py:58`)
-  and F0 (`features.py:130`) caches log a warning, recompute in memory, and are *never
-  rewritten* — so the mismatch recurs on every run.
+- **`data.partition_seed` is not `seed`** (`train_egostitch.py:401`). Changing it
+  silently changes `G_struct`, the internal holdouts, and the whole training pair
+  universe.
+- **`_config_hash` bakes in paths** (`train_egostitch.py:5099` — `output_dir`,
+  `data.root`, `preregistration`) *and* `optim.epochs`, so overriding `--output-dir`
+  breaks the `config_hash` equality gate at `src/experiments/probes.py:842`, and the two
+  ladder stages never share it. Cross-stage identity is `model_config_hash` (`:5132`).
+- **F0 caches serve supersets silently**: with `allow_cache_subset=True`
+  (`features.py:130`; live at `train_egostitch.py:2245`, `probes.py:892`,
+  `score_universe.py:1624`/`:1723`) a superset cache is gathered into a *different* node
+  set with no content digest. Exact-order F0 mismatches (`features.py:140`) and grounding
+  `pool_method_hash` mismatches now raise — this subset path is the one that stays quiet.
 - **Packed-feature manifests depend on `index.json` insertion order**
   (`packed_features.py:571`); sorting or reserializing it invalidates the pack. The F0
   cache written during packing holds exact fp32 means taken *before* bf16 conversion,
@@ -125,8 +135,14 @@ The load-bearing E2/G1/G2/G3 values are duplicated across
 `docs/results/E2-pair-to-topology-gap.md` (canonical), `docs/03-experiment-protocol.md`,
 `docs/04-model-proposal.md`, `README.md`, and `figures/e2-gap.html`. Read the canonical
 file rather than trusting a remembered number, and update all five together.
-Current G5 verdicts live in `docs/results/G5-stage1-seed0-20260717.md` (frozen-s0,
-`cut`) and `docs/results/G5-e2e-stage1-seed0-20260724.md` (rev-3.0 e2e, `cut`).
+Current G5 verdicts live in `docs/results/G5-stage1-seed0-20260717.md` (frozen-s0, `cut`
+— evidence retained; its producing code last exists at `dcae090` and is deleted in the
+current cleanup worktree pending commit) and
+`docs/results/G5-e2e-stage1-seed0-20260724.md` (rev-3.0 e2e, `cut`). The active line is
+rev-3.2 on the two-stage ladder; `g5_e2e_stage1_preregistration_v4.json` is still
+`DRAFT`, so `hpc/qualification.sh formal` refuses to launch until it is re-pinned and
+promoted to `BINDING`. `qualify` needs no **BINDING** registration and may run against
+the active v4 `DRAFT` within its registered `V_fit`/`V_hold` boundary.
 
 Benchmark and baseline names (`Benchmark-A/B/C`, `B0`, `B0-alt`, `B0-e2e`, `B1`,
 `B2-*`, `B3`, `B5`, `Ours`, `Oracle`, `PA-null`) are deliberate dataset-agnostic

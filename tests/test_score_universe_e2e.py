@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +18,34 @@ from src.model.egostitch.e2e_model import EgoStitchE2E
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_margin_verdict(metadata_path: Path, *, status: str = "pass") -> Path:
+    """Write the run-bound margin verdict `hpc/qualification.sh` persists.
+
+    The clip/family/RMS gate can only run once ``src.e2_pipeline`` has published
+    the run, so ``status: complete`` / ``formal_artifacts_published: true`` are
+    already stamped while the margins are unknown. Scoring therefore demands the
+    verdict itself, bound to this run's ``profile.json`` and metadata.
+    """
+    run_dir = metadata_path.parent
+    profile_path = run_dir / "profile.json"
+    if not profile_path.is_file():
+        profile_path.write_text(
+            json.dumps({"fixture_profile_for": run_dir.name}), encoding="utf-8"
+        )
+    verdict_path = run_dir / "margin_verdict.json"
+    verdict_path.write_text(
+        json.dumps(
+            {
+                "status": status,
+                "profile_sha256": _sha256(profile_path),
+                "run_metadata_sha256": _sha256(metadata_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return verdict_path
 
 
 def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
@@ -106,6 +136,7 @@ def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
             "primary_logit": "full",
         },
         "run_kind": "formal",
+        "seed": 0,
         "status": "complete",
         "formal_artifacts_published": True,
         "selected_checkpoint_eligible": True,
@@ -119,6 +150,7 @@ def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     }
     metadata_path = tmp_path / "run_metadata.json"
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    _write_margin_verdict(metadata_path)
     return registration_path, metadata_path, checkpoint, checkpoint_id
 
 
@@ -151,6 +183,7 @@ def _write_all_e2e_provenance(
                     "checkpoint_arm": arm,
                     "scoring_semantics": scoring_semantics,
                     "run_kind": "formal",
+                    "seed": 0,
                     "status": "complete",
                     "formal_artifacts_published": True,
                     "selected_checkpoint_eligible": True,
@@ -166,6 +199,7 @@ def _write_all_e2e_provenance(
             ),
             encoding="utf-8",
         )
+        _write_margin_verdict(metadata_path)
         metadata_paths[arm] = metadata_path
         checkpoint_paths[arm] = checkpoint_path
         checkpoint_ids[arm] = checkpoint_id
@@ -178,6 +212,282 @@ class _ScoringStub(EgoStitchE2E):
     def __init__(self) -> None:
         torch.nn.Module.__init__(self)
         self.cfg = type("Cfg", (), {"permanent_null": "none"})()
+
+
+def _test_access_context(
+    tmp_path: Path,
+    *,
+    shard: int = 0,
+    num_shards: int = 1,
+    reason: str | None = None,
+) -> score_universe._TestAccessContext:
+    return score_universe._TestAccessContext(
+        ledger_path=tmp_path / "scores" / "test_access_ledger.jsonl",
+        scoring_arm="full",
+        seed=0,
+        output=tmp_path / "scores" / "full.npz",
+        shard=shard,
+        num_shards=num_shards,
+        rescore_reason=reason,
+    )
+
+
+def _write_test_pairs(tmp_path: Path) -> Path:
+    path = (
+        tmp_path / "data" / "benchmark_2025_neurips" / "breadth_first" / "test_edges.txt"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_text("a\tb\t1\n", encoding="utf-8")
+    return path
+
+
+def _ledger_records(path: Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def _write_bound_score_artifact(
+    tmp_path: Path,
+    *,
+    shard: int = 0,
+    num_shards: int = 1,
+) -> tuple[Path, Path]:
+    output = tmp_path / "bound.npz"
+    path = output if num_shards == 1 else score_universe._shard_output_path(output, shard)
+    ledger_path = tmp_path / "test_access_ledger.jsonl"
+    access = score_universe._TestAccessContext(
+        ledger_path=ledger_path,
+        scoring_arm="full",
+        seed=0,
+        output=output,
+        shard=shard,
+        num_shards=num_shards,
+        rescore_reason=None,
+    )
+    score_universe._record_test_access(access, pairs_source="test")
+    assert access.ledger_binding is not None
+    values = np.array([0.1 + shard], dtype=np.float32)
+    score_universe.save_scores(
+        path,
+        node_ids=["a", "b"],
+        u_idx=np.array([0], dtype=np.int32),
+        v_idx=np.array([1], dtype=np.int32),
+        logit=values,
+        label=np.array([1], dtype=np.int8),
+        row_start=shard,
+        meta={
+            "checkpoint_id": "checkpoint",
+            "model_family": "egostitch_e2e",
+            "pairs_source": "test",
+            "strategy": "toy",
+            "num_rows": num_shards,
+            "created_utc": "2026-07-30T00:00:00Z",
+            "torch_version": "test",
+            "permanent_null": "none",
+            "primary_logit": "full",
+            "score_precision": {
+                "contract": "egostitch_e2e_pair_fp32_v1",
+                "pair_compute_dtype": "float32",
+                "pair_autocast": False,
+                "logit_storage_dtype": "float32",
+            },
+            "test_access_ledger": access.ledger_binding,
+        },
+        f_logit=values,
+        pair_content=values,
+        pair_topology=values,
+    )
+    return path, ledger_path
+
+
+def _rewrite_artifact_meta(path: Path, mutate: Callable[[dict[str, object]], None]) -> None:
+    with np.load(path, allow_pickle=False) as artifact:
+        arrays = {name: artifact[name].copy() for name in artifact.files}
+    meta = json.loads(str(arrays["meta"][()]))
+    mutate(meta)
+    arrays["meta"] = np.array(json.dumps(meta, sort_keys=True))
+    np.savez_compressed(path, **arrays)
+
+
+def test_test_access_ledger_groups_multi_gpu_shards_into_one_epoch(tmp_path: Path) -> None:
+    _write_test_pairs(tmp_path)
+    def resolve_shard(shard: int) -> None:
+        score_universe._resolve_pairs(
+            "test",
+            tmp_path / "data",
+            "breadth_first",
+            test_access=_test_access_context(tmp_path, shard=shard, num_shards=4),
+        )
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        list(executor.map(resolve_shard, (2, 0, 3, 1)))
+
+    records = _ledger_records(tmp_path / "scores" / "test_access_ledger.jsonl")
+    assert len(records) == 4
+    assert {record["scoring_epoch"] for record in records} == {1}
+    assert {record["shard"] for record in records} == {0, 1, 2, 3}
+
+
+def test_ledger_bound_shards_load_and_merge_as_one_scoring_epoch(tmp_path: Path) -> None:
+    shard_paths = [
+        _write_bound_score_artifact(tmp_path, shard=shard, num_shards=2)[0]
+        for shard in range(2)
+    ]
+
+    for path in shard_paths:
+        score_universe.load_scores(path)
+    merged = score_universe.merge_scores(shard_paths)
+    score_universe.validate_test_access_ledger_binding(merged.meta, label="merged")
+    binding = merged.meta["test_access_ledger"]
+    assert isinstance(binding, dict)
+    assert binding["scoring_epoch"] == 1
+    assert {record["shard"] for record in binding["records"]} == {0, 1}
+    merged_path = tmp_path / "bound.npz"
+    score_universe.save_scores(
+        merged_path,
+        node_ids=merged.node_ids,
+        u_idx=merged.u_idx,
+        v_idx=merged.v_idx,
+        logit=merged.logit,
+        label=merged.label,
+        row_start=0,
+        meta=merged.meta,
+        f_logit=merged.f_logit,
+        pair_content=merged.pair_content,
+        pair_topology=merged.pair_topology,
+        full_logit=merged.full_logit,
+    )
+    loaded = score_universe.load_scores(merged_path)
+    score_universe.validate_artifact_precision(loaded, label="merged")
+
+
+def test_ledger_bound_artifact_rejects_deleted_ledger(tmp_path: Path) -> None:
+    path, ledger = _write_bound_score_artifact(tmp_path)
+    ledger.unlink()
+
+    with pytest.raises(ValueError, match="test-access ledger is missing"):
+        score_universe.load_scores(path)
+
+
+def test_ledger_bound_artifact_rejects_ledger_digest_tamper(tmp_path: Path) -> None:
+    path, ledger = _write_bound_score_artifact(tmp_path)
+    record = _ledger_records(ledger)[0]
+    record["pairs_source"] = "candidate"
+    ledger.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="digest mismatch"):
+        score_universe.load_scores(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("scoring_arm", "p0", "scoring_arm mismatch"),
+        ("seed", 7, "seed mismatch"),
+        ("scoring_epoch", 2, "scoring_epoch mismatch"),
+    ],
+)
+def test_ledger_bound_artifact_rejects_identity_mismatch(
+    tmp_path: Path, field: str, value: object, error: str
+) -> None:
+    path, _ledger = _write_bound_score_artifact(tmp_path)
+
+    def mutate(meta: dict[str, object]) -> None:
+        binding = meta["test_access_ledger"]
+        assert isinstance(binding, dict)
+        binding[field] = value
+
+    _rewrite_artifact_meta(path, mutate)
+    with pytest.raises(ValueError, match=error):
+        score_universe.load_scores(path)
+
+
+def test_test_access_ledger_rejects_repeat_without_reason_and_records_reasoned_repeat(
+    tmp_path: Path,
+) -> None:
+    _write_test_pairs(tmp_path)
+    first = _test_access_context(tmp_path)
+    score_universe._resolve_pairs(
+        "test", tmp_path / "data", "breadth_first", test_access=first
+    )
+
+    with pytest.raises(ValueError, match="repeat scoring requires --rescore-reason"):
+        score_universe._resolve_pairs(
+            "test", tmp_path / "data", "breadth_first", test_access=first
+        )
+
+    score_universe._resolve_pairs(
+        "test",
+        tmp_path / "data",
+        "breadth_first",
+        test_access=_test_access_context(tmp_path, reason="replace corrupt score artifact"),
+    )
+    records = _ledger_records(tmp_path / "scores" / "test_access_ledger.jsonl")
+    assert [record["scoring_epoch"] for record in records] == [1, 2]
+    assert records[1]["rescore_reason"] == "replace corrupt score artifact"
+
+
+def test_test_access_ledger_refuses_malformed_history_before_pair_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_test_pairs(tmp_path)
+    context = _test_access_context(tmp_path)
+    context.ledger_path.parent.mkdir(parents=True)
+    context.ledger_path.write_text("not-json\n", encoding="utf-8")
+
+    def forbidden_pair_read(_path: Path) -> tuple[object, object]:
+        raise AssertionError("pairs were read before the ledger was validated")
+
+    monkeypatch.setattr(score_universe, "_read_pairs_tsv", forbidden_pair_read)
+    with pytest.raises(ValueError, match="test-access ledger is malformed at line 1"):
+        score_universe._resolve_pairs(
+            "test", tmp_path / "data", "breadth_first", test_access=context
+        )
+
+
+def test_arbitrary_file_is_ledgered_as_heldout_before_pair_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registration, metadata_paths, checkpoint_paths, checkpoint_ids = (
+        _write_all_e2e_provenance(tmp_path)
+    )
+    copied = tmp_path / "copied-test.tsv"
+    copied.write_text("a\tb\t1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        score_universe,
+        "_load_checkpoint",
+        lambda *_args, **_kwargs: (
+            torch.nn.Linear(1, 1),
+            "egostitch_e2e",
+            checkpoint_ids["full"],
+        ),
+    )
+
+    def inspect_after_ledger(_path: Path) -> tuple[object, object]:
+        ledger = metadata_paths["full"].parent / "test_access_ledger.jsonl"
+        records = _ledger_records(ledger)
+        assert records[-1]["event"] == "resolve_pairs"
+        assert records[-1]["pairs_source"] == f"file:{copied}"
+        assert records[-1]["scoring_arm"] == "full"
+        assert records[-1]["seed"] == 0
+        raise AssertionError("pair read reached after formal ledger record")
+
+    monkeypatch.setattr(score_universe, "_read_pairs_tsv", inspect_after_ledger)
+    cli = [
+        "score",
+        "--checkpoint",
+        str(checkpoint_paths["full"]),
+        "--pairs",
+        f"file:{copied}",
+        "--output",
+        str(tmp_path / "scores" / "full.npz"),
+        "--preregistration",
+        str(registration),
+    ]
+    for arm, metadata in metadata_paths.items():
+        cli.extend(["--arm-run-metadata", f"{arm}={metadata}"])
+
+    with pytest.raises(AssertionError, match="pair read reached after formal ledger record"):
+        score_universe.main(cli)
 
 
 def test_e2e_formal_scoring_provenance_accepts_exact_binding(tmp_path: Path) -> None:
@@ -397,11 +707,12 @@ def test_real_scorer_provenance_is_accepted_by_g5_validator(
             checkpoint_ids[checkpoint_arm],
         ),
     )
-    monkeypatch.setattr(
-        score_universe,
-        "_resolve_pairs",
-        lambda *_args, **_kwargs: ([('a', 'b')], np.array([1], dtype=np.int8)),
+    data_root = tmp_path / "data"
+    test_pairs = (
+        data_root / "benchmark_2025_neurips" / "breadth_first" / "test_edges.txt"
     )
+    test_pairs.parent.mkdir(parents=True)
+    test_pairs.write_text("a\tb\t1\n", encoding="utf-8")
     monkeypatch.setattr(score_universe, "FeatureStore", lambda *_args, **_kwargs: object())
     values = np.array([0.25], dtype=np.float32)
     monkeypatch.setattr(
@@ -420,7 +731,9 @@ def test_real_scorer_provenance_is_accepted_by_g5_validator(
         "--checkpoint",
         str(checkpoint_paths[checkpoint_arm]),
         "--pairs",
-        "candidate",
+        "test",
+        "--data-root",
+        str(data_root),
         "--output",
         str(output_path),
         "--preregistration",
@@ -436,6 +749,11 @@ def test_real_scorer_provenance_is_accepted_by_g5_validator(
     score_universe.main(cli)
 
     artifact = score_universe.load_scores(output_path)
+    ledger = metadata_paths[checkpoint_arm].parent / "test_access_ledger.jsonl"
+    records = _ledger_records(ledger)
+    assert records[-1]["event"] == "resolve_pairs"
+    assert records[-1]["scoring_arm"] == scoring_arm
+    assert records[-1]["seed"] == 0
     preregistration = json.loads(registration_path.read_text(encoding="utf-8"))
     run_metadata = {
         arm: json.loads(path.read_text(encoding="utf-8"))
@@ -514,6 +832,9 @@ def test_e2e_provenance_rejects_invalid_run_before_output(
         run = json.loads(metadata.read_text(encoding="utf-8"))
         run["preregistration_sha256"] = _sha256(registration)
         metadata.write_text(json.dumps(run), encoding="utf-8")
+    # The mutated run still carries a margin verdict of its own, so each refusal
+    # below is attributable to the field under test.
+    _write_margin_verdict(metadata)
 
     monkeypatch.setattr(
         score_universe,
@@ -538,6 +859,106 @@ def test_e2e_provenance_rejects_invalid_run_before_output(
             ]
         )
     assert not output.exists()
+
+
+# --------------------------------------------------- clip/family/RMS margin verdict
+# `src.e2_pipeline` publishes `status: complete` and
+# `formal_artifacts_published: true` before the margin gate is able to run, so a
+# failed arm looks finished. Scoring is one of the two consumers that has to
+# refuse it anyway (the G5 gate is the other).
+
+
+def test_scoring_refuses_a_failing_margin_verdict_before_pair_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One failed arm refuses the whole pass, before a held-out pair is read."""
+    registration, metadata_paths, checkpoint_paths, checkpoint_ids = _write_all_e2e_provenance(
+        tmp_path
+    )
+    _write_margin_verdict(metadata_paths["no_l_rel"], status="fail")
+    monkeypatch.setattr(
+        score_universe,
+        "_load_checkpoint",
+        lambda *_args, **_kwargs: (
+            torch.nn.Linear(1, 1),
+            "egostitch_e2e",
+            checkpoint_ids["full"],
+        ),
+    )
+
+    def forbidden_pair_read(*_args: object, **_kwargs: object) -> tuple[object, object]:
+        raise AssertionError("held-out pairs were read before the margin verdict was checked")
+
+    monkeypatch.setattr(score_universe, "_resolve_pairs", forbidden_pair_read)
+
+    output = tmp_path / "forbidden.npz"
+    cli = [
+        "score",
+        "--checkpoint",
+        str(checkpoint_paths["full"]),
+        "--pairs",
+        "candidate",
+        "--output",
+        str(output),
+        "--preregistration",
+        str(registration),
+    ]
+    for arm, metadata in metadata_paths.items():
+        cli.extend(["--arm-run-metadata", f"{arm}={metadata}"])
+
+    with pytest.raises(ValueError, match=r"margin verdict is 'fail', not 'pass'"):
+        score_universe.main(cli)
+    assert not output.exists()
+
+
+def test_scoring_refuses_a_published_run_with_no_margin_verdict(tmp_path: Path) -> None:
+    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
+    (metadata.parent / "margin_verdict.json").unlink()
+
+    with pytest.raises(ValueError, match="no clip/family/RMS margin verdict"):
+        score_universe._validate_e2e_scoring_provenance(
+            registration_path=registration,
+            run_metadata_path=metadata,
+            checkpoint_path=checkpoint,
+            checkpoint_id=checkpoint_id,
+        )
+
+
+@pytest.mark.parametrize("stale_key", ["profile_sha256", "run_metadata_sha256"])
+def test_scoring_refuses_a_margin_verdict_bound_to_another_run(
+    tmp_path: Path, stale_key: str
+) -> None:
+    """A pass verdict is only usable for the exact run it was computed on."""
+    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
+    verdict_path = metadata.parent / "margin_verdict.json"
+    verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
+    verdict[stale_key] = "0" * 64
+    verdict_path.write_text(json.dumps(verdict), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=rf"margin verdict {stale_key} does not describe this run"):
+        score_universe._validate_e2e_scoring_provenance(
+            registration_path=registration,
+            run_metadata_path=metadata,
+            checkpoint_path=checkpoint,
+            checkpoint_id=checkpoint_id,
+        )
+
+
+def test_margin_verdict_validator_accepts_only_a_run_bound_pass(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    metadata = run_dir / "run_metadata.json"
+    metadata.write_text(json.dumps({"status": "complete"}), encoding="utf-8")
+    verdict_path = _write_margin_verdict(metadata)
+
+    assert score_universe.validate_e2e_margin_verdict(metadata, label="run") == _sha256(
+        verdict_path
+    )
+
+    # The profile the margins were computed from is part of the binding.
+    (run_dir / "profile.json").unlink()
+    with pytest.raises(ValueError, match="cannot be bound to a run without"):
+        score_universe.validate_e2e_margin_verdict(metadata, label="run")
 
 
 def test_e2e_rejects_required_marker_and_bad_config_digest(tmp_path: Path) -> None:
@@ -686,6 +1107,17 @@ def test_arm_checkpoint_path_falls_back_to_metadata_sibling_best_pt(
 def test_e2e_artifact_physically_stores_all_four_decomposition_arrays(tmp_path: Path) -> None:
     output = tmp_path / "scores.npz"
     values = np.array([0.1, 0.2], dtype=np.float32)
+    access = score_universe._TestAccessContext(
+        ledger_path=tmp_path / "test_access_ledger.jsonl",
+        scoring_arm="full",
+        seed=0,
+        output=output,
+        shard=0,
+        num_shards=1,
+        rescore_reason=None,
+    )
+    score_universe._record_test_access(access, pairs_source="candidate")
+    assert access.ledger_binding is not None
     meta: dict[str, object] = {
         "checkpoint_id": "checkpoint",
         "model_family": "egostitch_e2e",
@@ -702,6 +1134,7 @@ def test_e2e_artifact_physically_stores_all_four_decomposition_arrays(tmp_path: 
             "pair_autocast": False,
             "logit_storage_dtype": "float32",
         },
+        "test_access_ledger": access.ledger_binding,
     }
     score_universe.save_scores(
         output,
@@ -796,62 +1229,3 @@ def test_formal_v2_loader_rejects_missing_or_contradictory_full_array(tmp_path: 
     np.savez_compressed(output, **common, full=values + 1)
     with pytest.raises(ValueError, match="contradicts primary logit"):
         score_universe.load_scores(output)
-
-
-class TestHeldoutPairSourceGuard:
-    """`_is_heldout_pair_source` must catch semantically equivalent aliases."""
-
-    @staticmethod
-    def _benchmark(tmp_path: Path) -> Path:
-        benchmark_dir = tmp_path / "data" / "benchmark_2025_neurips" / "breadth_first"
-        benchmark_dir.mkdir(parents=True)
-        (benchmark_dir / "candidate_test_edges.txt").write_text(
-            "a\tb\t1\nc\td\t0\ne\tf\t1\n", encoding="utf-8"
-        )
-        (benchmark_dir / "test_edges.txt").write_text("g\th\t1\ni\tj\t0\n", encoding="utf-8")
-        return tmp_path / "data"
-
-    def _check(self, tmp_path: Path, supplied: Path) -> bool:
-        return score_universe._is_heldout_pair_source(
-            f"file:{supplied}", self._benchmark(tmp_path), "breadth_first"
-        )
-
-    def test_named_sources_are_heldout(self, tmp_path: Path) -> None:
-        data_root = self._benchmark(tmp_path)
-        for name in ("candidate", "test"):
-            assert score_universe._is_heldout_pair_source(name, data_root, "breadth_first")
-
-    def test_exact_copy_is_heldout(self, tmp_path: Path) -> None:
-        supplied = tmp_path / "copy.txt"
-        supplied.write_text("a\tb\t1\nc\td\t0\ne\tf\t1\n", encoding="utf-8")
-        assert self._check(tmp_path, supplied)
-
-    def test_reordered_copy_is_heldout(self, tmp_path: Path) -> None:
-        supplied = tmp_path / "reordered.txt"
-        supplied.write_text("e\tf\t1\na\tb\t1\nc\td\t0\n", encoding="utf-8")
-        assert self._check(tmp_path, supplied)
-
-    def test_label_stripped_copy_is_heldout(self, tmp_path: Path) -> None:
-        supplied = tmp_path / "unlabeled.txt"
-        supplied.write_text("a\tb\nc\td\ne\tf\n", encoding="utf-8")
-        assert self._check(tmp_path, supplied)
-
-    def test_endpoint_swapped_copy_is_heldout(self, tmp_path: Path) -> None:
-        supplied = tmp_path / "swapped.txt"
-        supplied.write_text("b\ta\t1\nd\tc\t0\nf\te\t1\n", encoding="utf-8")
-        assert self._check(tmp_path, supplied)
-
-    def test_reordered_unlabeled_test_manifest_is_heldout(self, tmp_path: Path) -> None:
-        supplied = tmp_path / "test_alias.txt"
-        supplied.write_text("j\ti\ng\th\n", encoding="utf-8")
-        assert self._check(tmp_path, supplied)
-
-    def test_unrelated_pairs_are_not_heldout(self, tmp_path: Path) -> None:
-        supplied = tmp_path / "other.txt"
-        supplied.write_text("x\ty\t1\nz\tw\t0\n", encoding="utf-8")
-        assert not self._check(tmp_path, supplied)
-
-    def test_proper_subset_is_not_equal_multiset(self, tmp_path: Path) -> None:
-        supplied = tmp_path / "subset.txt"
-        supplied.write_text("a\tb\t1\nc\td\t0\n", encoding="utf-8")
-        assert not self._check(tmp_path, supplied)

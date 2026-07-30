@@ -3,34 +3,32 @@ import importlib
 import json
 import subprocess
 import sys
+import types
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import cast
 
 import pytest
 import src.data.packed_features as packed_features
 import torch
+from src import train_b0
 from src.data.packed_features import build_packed_features
 from src.e2_pipeline import (
     _PUBLISHED_FILENAMES,
-    BudgetExceeded,
+    QUALIFICATION_ARTIFACT_FILENAME,
+    V_HOLD_VALIDATION_EVENTS_FILENAME,
     PipelineArgs,
-    PipelineProfile,
     ProbeResult,
     _publish_staged,
     _rollback_publication,
     build_accelerate_command,
-    conservative_e2e_epoch_seconds,
     detect_visible_gpu_count,
-    enforce_projection,
     main,
     parse_pipeline_args,
-    project_total_seconds,
     run_command,
     run_pipeline,
-    select_probe_result,
     write_failure,
 )
 
@@ -41,17 +39,6 @@ pytestmark = pytest.mark.unit
 def _avoid_pack_process_pool_startup(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pipeline unit tests need pack semantics, not OS process startup."""
     monkeypatch.setattr(packed_features, "ProcessPoolExecutor", ThreadPoolExecutor)
-
-
-class _FakeClock:
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def monotonic(self) -> float:
-        return self.now
-
-    def advance(self, seconds: float) -> None:
-        self.now += seconds
 
 
 def test_publication_revokes_and_restores_the_old_completion_sentinel_first(
@@ -103,45 +90,14 @@ def test_failed_completion_sentinel_backup_does_not_delete_the_old_sentinel(
     assert (output_dir / "complete.json").read_text() == "old-complete"
 
 
-# --------------------------------------------------------------------------- Task 7 (unchanged)
-
-
-def test_selects_fastest_valid_probe_below_memory_limit() -> None:
-    results = [
-        ProbeResult(262144, True, 1200.0, 40.0, None),
-        ProbeResult(524288, True, 1900.0, 70.0, None),
-        ProbeResult(1048576, True, 1800.0, 82.0, None),
-        ProbeResult(1572864, False, 0.0, 90.0, "memory limit"),
-    ]
-    assert select_probe_result(results, memory_limit_gib=85.0).token_budget == 524288
-
-
-def test_projection_includes_all_thirty_epochs() -> None:
-    projected = project_total_seconds(
-        pack_seconds=240.0,
-        setup_probe_seconds=240.0,
-        epoch_seconds=90.0,
-        epochs=30,
-        artifact_seconds=60.0,
-    )
-    assert projected == pytest.approx(3240.0)
-
-
-def test_e2e_projection_combines_prefix_overhead_with_full_joint_compute() -> None:
-    projected = conservative_e2e_epoch_seconds(
-        measured_epoch_seconds=100.0,
-        runtime_profile={"per_epoch": [{"global_pairs": 1000, "compute_seconds": 20.0}]},
-        full_joint_pairs_per_second=5.0,
-    )
-
-    assert projected == pytest.approx(280.0)
+# --------------------------------------------------------------------------- failure artifacts
 
 
 def test_failure_json_is_atomic_and_structured(tmp_path: Path) -> None:
-    path = write_failure(tmp_path, stage="probe", message="projected budget miss")
+    path = write_failure(tmp_path, stage="pack", message="feature pack stage failed")
     payload = json.loads(path.read_text())
-    assert payload["stage"] == "probe"
-    assert payload["message"] == "projected budget miss"
+    assert payload["stage"] == "pack"
+    assert payload["message"] == "feature pack stage failed"
     assert not path.with_suffix(".json.tmp").exists()
 
 
@@ -152,7 +108,7 @@ def test_accelerate_command_uses_resolved_world_size(tmp_path: Path) -> None:
     command = build_accelerate_command(
         accelerate_bin=Path("/venv/bin/accelerate"),
         config_path=Path("configs/b0_v31_breadth_first.yaml"),
-        mode="probe",
+        mode="train",
         pack_dir=tmp_path / "pack",
         output_dir=tmp_path / "outputs",
         token_budget=524288,
@@ -214,22 +170,6 @@ def test_run_command_timeout_kills_the_whole_process_group(tmp_path: Path) -> No
     assert not state or state.startswith("Z"), (
         f"grandchild process {grandchild_pid} remained live in state {state!r}"
     )
-
-
-# --------------------------------------------------------------------------- projection gate
-
-
-def test_projection_budget_failure_writes_artifact(tmp_path: Path) -> None:
-    with pytest.raises(BudgetExceeded, match="3600"):
-        enforce_projection(projected_seconds=6200.0, limit_seconds=3600, output_dir=tmp_path)
-    payload = json.loads((tmp_path / "failure.json").read_text())
-    assert payload["stage"] == "projection"
-    assert payload["projected_seconds"] == 6200.0
-
-
-def test_projection_within_budget_does_not_raise_or_write_failure(tmp_path: Path) -> None:
-    enforce_projection(projected_seconds=3000.0, limit_seconds=3600, output_dir=tmp_path)
-    assert not (tmp_path / "failure.json").exists()
 
 
 # --------------------------------------------------------------------------- CLI parsing
@@ -295,16 +235,17 @@ def test_pipeline_forwards_debug_max_steps_to_worker(tmp_path: Path) -> None:
     assert command[command.index("--max-steps") + 1] == "5"
 
 
-def test_pipeline_forwards_run_kind_to_worker(tmp_path: Path) -> None:
+@pytest.mark.parametrize("run_kind", ["qualification", "formal"])
+def test_pipeline_forwards_run_kind_to_worker(tmp_path: Path, run_kind: str) -> None:
     args = parse_pipeline_args(
         [
             "--config",
             str(tmp_path / "cfg.yaml"),
             "--run-kind",
-            "rehearsal",
+            run_kind,
         ]
     )
-    assert args.run_kind == "rehearsal"
+    assert args.run_kind == run_kind
 
     command = build_accelerate_command(
         accelerate_bin=tmp_path / "accelerate",
@@ -319,7 +260,41 @@ def test_pipeline_forwards_run_kind_to_worker(tmp_path: Path) -> None:
         run_kind=args.run_kind,
     )
 
-    assert command[command.index("--run-kind") + 1] == "rehearsal"
+    assert command[command.index("--run-kind") + 1] == run_kind
+
+
+@pytest.mark.parametrize("run_kind", ["overfit", "rehearsal", "calibration", "debug"])
+def test_pipeline_refuses_run_kinds_outside_the_two_stage_ladder(
+    tmp_path: Path, run_kind: str
+) -> None:
+    """The retired kinds are rejected, and `debug` is never selectable.
+
+    `debug` is a real `run_kind` the worker records, but it is *derived* from
+    ``--max-steps``; offering it here would hand out the feature-digest-pin
+    exemption to any caller that asked for it.
+    """
+    with pytest.raises(SystemExit):
+        parse_pipeline_args(["--config", str(tmp_path / "cfg.yaml"), "--run-kind", run_kind])
+
+
+def test_pipeline_omits_run_kind_when_unset(tmp_path: Path) -> None:
+    args = parse_pipeline_args(["--config", str(tmp_path / "cfg.yaml")])
+    assert args.run_kind is None
+
+    command = build_accelerate_command(
+        accelerate_bin=tmp_path / "accelerate",
+        config_path=args.config,
+        mode="train",
+        pack_dir=tmp_path / "pack",
+        output_dir=tmp_path / "out",
+        token_budget=256,
+        profile_output=tmp_path / "profile.json",
+        world_size=2,
+        worker_module="src.train_egostitch",
+        run_kind=args.run_kind,
+    )
+
+    assert "--run-kind" not in command
 
 
 def test_build_accelerate_command_worker_module(tmp_path: Path) -> None:
@@ -361,26 +336,16 @@ def test_build_accelerate_command_seed_override(tmp_path: Path) -> None:
     assert command[command.index("--seed") + 1] == "2"
 
 
-# ------------------------------------------------------------------- PipelineProfile round trip
-# (closes the Task 7 review gap: from_dict had no round-trip coverage)
+# ------------------------------------------------------------------- ProbeResult payload contract
+# The orchestrator no longer sweeps token budgets, but the workers' own
+# ``--ddp-mode probe`` path still emits this payload, so its strict reader has
+# to keep rejecting malformed worker output.
 
 
-def test_pipeline_profile_round_trips_through_json() -> None:
-    probes = [
-        ProbeResult(262144, True, 1200.0, 40.0, None),
-        ProbeResult(524288, False, 0.0, 90.0, "oom"),
-    ]
-    profile = PipelineProfile(
-        cold_cache=True,
-        stage_seconds={"pack": 12.0, "setup_probe": 34.0},
-        probe_results=probes,
-        selected_token_budget=262144,
-        projected_total_seconds=3120.5,
-    )
+def test_probe_result_round_trips_through_json() -> None:
+    probe = ProbeResult(262144, True, 1200.0, 40.0, None)
 
-    restored = PipelineProfile.from_dict(json.loads(json.dumps(profile.to_dict())))
-
-    assert restored == profile
+    assert ProbeResult.from_dict(json.loads(json.dumps(probe.to_dict()))) == probe
 
 
 @pytest.mark.parametrize(
@@ -458,7 +423,10 @@ def _write_feature_root(root: Path, node_shapes: dict[str, tuple[int, int]]) -> 
     return root
 
 
-_RUNTIME_TOKEN_BUDGETS = (262144, 524288, 1048576, 1572864)
+# `runtime.token_budget` is a scalar the orchestrator forwards verbatim; the
+# candidate sweep and the projection budget it fed were deleted with the probe
+# stage (design 2026-07-29 Sec 4).
+_RUNTIME_TOKEN_BUDGET = 524288
 
 
 def _pipeline_config_dict(
@@ -475,7 +443,7 @@ def _pipeline_config_dict(
         "pack_workers": 1,
         "loader_workers_per_rank": 0,
         "prefetch_factor": 2,
-        "token_budget_candidates": list(_RUNTIME_TOKEN_BUDGETS),
+        "token_budget": _RUNTIME_TOKEN_BUDGET,
         "max_pairs_per_rank": 4096,
         "memory_limit_gib": 85.0,
         "total_budget_seconds": 40,
@@ -489,6 +457,20 @@ def _pipeline_config_dict(
     }
     if runtime_overrides:
         runtime.update(runtime_overrides)
+        # `train_b0.load_config` asserts the five stage budgets sum to
+        # `total_budget_seconds`, so an override of any one of them has to be
+        # re-balanced or the config is rejected before the pipeline ever runs.
+        if "total_budget_seconds" not in runtime_overrides:
+            runtime["total_budget_seconds"] = sum(
+                cast(int, runtime[key])
+                for key in (
+                    "pack_budget_seconds",
+                    "setup_probe_budget_seconds",
+                    "train_eval_budget_seconds",
+                    "artifact_budget_seconds",
+                    "reserve_seconds",
+                )
+            )
     return {
         "model": {"family": "v3_1", "config": {}},
         "data": {
@@ -525,15 +507,6 @@ def _write_pipeline_config(path: Path, config: dict[str, object]) -> None:
 def _arg_value(command: Sequence[str], flag: str) -> str:
     command_list = list(command)
     return command_list[command_list.index(flag) + 1]
-
-
-def _default_probe_results() -> dict[int, ProbeResult]:
-    return {
-        262144: ProbeResult(262144, True, 1000.0, 40.0, None),
-        524288: ProbeResult(524288, True, 1900.0, 70.0, None),
-        1048576: ProbeResult(1048576, True, 1800.0, 82.0, None),
-        1572864: ProbeResult(1572864, False, 0.0, 90.0, "oom"),
-    }
 
 
 def _write_train_outputs(output_dir: Path) -> None:
@@ -583,52 +556,79 @@ def _valid_worker_profile() -> dict[str, object]:
 
 def _make_fake_runner(
     *,
-    probe_by_budget: dict[int, ProbeResult] | None = None,
-    epoch_seconds: object = 5.0,
-    epoch_runtime_profile: object | None = None,
     train_runtime_profile: dict[str, object] | None = None,
     fail_mode: str | None = None,
     timeout_mode: str | None = None,
-    advance_seconds_by_mode: dict[str, float] | None = None,
-    clock: _FakeClock | None = None,
+    write_v_hold_validation_ledger: bool = False,
 ) -> Callable[[Sequence[str], float], subprocess.CompletedProcess[str]]:
-    resolved_probes = probe_by_budget or _default_probe_results()
+    """Stand in for the single ``train`` process group the orchestrator launches."""
     resolved_train_profile: dict[str, object] = train_runtime_profile or _valid_worker_profile()
-    resolved_advances = advance_seconds_by_mode or {}
 
     def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
         command_list = list(command)
         mode = _arg_value(command_list, "--ddp-mode")
         profile_output = Path(_arg_value(command_list, "--profile-output"))
         out_dir = Path(_arg_value(command_list, "--output-dir"))
-        token_budget = int(_arg_value(command_list, "--token-budget-per-rank"))
 
         if timeout_mode == mode:
             raise subprocess.TimeoutExpired(cmd=command_list, timeout=timeout)
-        advance_by = resolved_advances.get(mode)
-        if advance_by:
-            assert clock is not None
-            clock.advance(advance_by)
         if fail_mode == mode:
             return subprocess.CompletedProcess(command_list, returncode=1, stdout="", stderr="boom")
 
-        if mode == "probe":
-            profile_output.write_text(json.dumps(resolved_probes[token_budget].to_dict()))
-        elif mode == "epoch-probe":
-            profile_output.write_text(
-                json.dumps(
-                    {
-                        "epoch_seconds": epoch_seconds,
-                        "runtime_profile": epoch_runtime_profile or {},
-                    }
-                )
-            )
-        elif mode == "train":
+        if mode == "train":
             _write_train_outputs(out_dir)
+            if write_v_hold_validation_ledger:
+                ledger_path = out_dir / V_HOLD_VALIDATION_EVENTS_FILENAME
+                ledger_path.write_text(
+                    json.dumps(
+                        {
+                            "ordinal": 1,
+                            "kind": "epoch_end",
+                            "epoch": 1,
+                            "optimizer_step": 1,
+                            "run_kind": "formal",
+                            "arm": "full",
+                            "validation_role": "V_hold",
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+                metadata_path = out_dir / "run_metadata.json"
+                metadata = json.loads(metadata_path.read_text())
+                metadata["v_hold_validation_evidence"] = {
+                    "schema": "egostitch_e2e_v_hold_validation_events_v1",
+                    "count": 1,
+                    "path": V_HOLD_VALIDATION_EVENTS_FILENAME,
+                    "sha256": hashlib.sha256(ledger_path.read_bytes()).hexdigest(),
+                }
+                metadata_path.write_text(json.dumps(metadata))
             profile_output.write_text(json.dumps(resolved_train_profile))
         return subprocess.CompletedProcess(command_list, returncode=0, stdout="", stderr="")
 
     return runner
+
+
+def test_orchestrator_launches_only_the_train_stage(tmp_path: Path) -> None:
+    """`pack -> train -> publish`: no probe, epoch-probe or projection launch."""
+    args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+    base_runner = _make_fake_runner()
+    launched: list[tuple[str, str]] = []
+
+    def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        launched.append(
+            (_arg_value(command, "--ddp-mode"), _arg_value(command, "--token-budget-per-rank"))
+        )
+        return base_runner(command, timeout)
+
+    assert run_pipeline(args, command_runner=runner) == 0
+    assert launched == [("train", str(_RUNTIME_TOKEN_BUDGET))]
+    profile = json.loads((output_dir / "profile.json").read_text())
+    assert profile["token_budget"] == _RUNTIME_TOKEN_BUDGET
+    assert "probe_results" not in profile
+    assert "selected_token_budget" not in profile
+    assert "projected_total_seconds" not in profile
+    assert "epoch_probe" not in profile
 
 
 # ---------------------------------------------------------------------- run_pipeline: success paths
@@ -710,7 +710,13 @@ class TestRunPipelineSuccess:
             worker_module="fake.dual_worker",
         )
 
-        assert run_pipeline(args, command_runner=_make_fake_runner()) == 0
+        assert (
+            run_pipeline(
+                args,
+                command_runner=_make_fake_runner(),
+            )
+            == 0
+        )
         cold_profile = json.loads((output_dir / "profile.json").read_text())
         assert cold_profile["cold_cache"] is True
         assert cold_profile["pack_evidence"]["raw_tokens"]["cold"] is True
@@ -777,12 +783,10 @@ class TestRunPipelineSuccess:
         assert not (output_dir / "failure.json").exists()
         profile = json.loads((output_dir / "profile.json").read_text())
         assert profile["cold_cache"] is True
-        assert profile["selected_token_budget"] == 524288  # fastest valid at/below 85 GiB
+        assert profile["token_budget"] == _RUNTIME_TOKEN_BUDGET
         assert profile["epochs_completed"] == 2
-        assert set(profile["stage_seconds"]) == {"pack", "setup_probe", "train", "artifacts"}
-        assert len(profile["probe_results"]) == 4
+        assert set(profile["stage_seconds"]) == {"pack", "train", "artifacts"}
         assert profile["total_seconds"] > 0
-        assert profile["projected_total_seconds"] > 0
         assert profile["stage_seconds"]["artifacts"] >= 0
         assert profile["total_seconds"] >= sum(profile["stage_seconds"].values())
         assert profile["pack_manifest"]["source_metadata_sha256"]
@@ -858,22 +862,17 @@ class TestRunPipelineSuccess:
         assert validation_calls == 1  # the cold builder's publication validation only
         assert (output_dir / "profile.json").exists()
 
-    def test_unstructured_oom_is_a_systemic_probe_failure(self, tmp_path: Path) -> None:
+    def test_oom_during_training_is_a_train_stage_failure(self, tmp_path: Path) -> None:
+        """With no candidate sweep left, an OOM is simply a failed train stage."""
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
-        base_runner = _make_fake_runner()
-        attempted: list[int] = []
 
-        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
-            if _arg_value(command, "--ddp-mode") == "probe":
-                budget = int(_arg_value(command, "--token-budget-per-rank"))
-                attempted.append(budget)
-                if budget == _RUNTIME_TOKEN_BUDGETS[0]:
-                    return subprocess.CompletedProcess(command, 1, "", "CUDA out of memory")
-            return base_runner(command, timeout)
+        def runner(command: Sequence[str], _timeout: float) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 1, "", "CUDA out of memory")
 
         assert run_pipeline(args, command_runner=runner) == 2
-        assert attempted == [_RUNTIME_TOKEN_BUDGETS[0]]
-        assert json.loads((output_dir / "failure.json").read_text())["stage"] == "probe"
+        failure = json.loads((output_dir / "failure.json").read_text())
+        assert failure["stage"] == "train"
+        assert "CUDA out of memory" in failure["stderr"]
 
     def test_successful_rerun_cannot_reuse_stale_worker_outputs(self, tmp_path: Path) -> None:
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
@@ -922,12 +921,14 @@ class TestRunPipelineSuccess:
 
     def test_failed_rerun_without_new_history_removes_stale_history(self, tmp_path: Path) -> None:
         """A pre-train failure must not leave a prior run's history as evidence."""
-        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(
+            tmp_path, pack_budget_seconds=0
+        )
         output_dir.mkdir()
         (output_dir / "failed_run_history.json").write_text('{"history": ["stale"]}')
 
-        assert run_pipeline(args, command_runner=_make_fake_runner(fail_mode="probe")) == 2
-        assert json.loads((output_dir / "failure.json").read_text())["stage"] == "probe"
+        assert run_pipeline(args, command_runner=_make_fake_runner()) == 2
+        assert json.loads((output_dir / "failure.json").read_text())["stage"] == "pack"
         assert not (output_dir / "failed_run_history.json").exists()
 
     def test_successful_rerun_removes_stale_history_evidence(self, tmp_path: Path) -> None:
@@ -1067,14 +1068,11 @@ class TestRunPipelineFailures:
     def _assert_canonical_unchanged(output_dir: Path, before: dict[str, bytes]) -> None:
         assert {name: (output_dir / name).read_bytes() for name in before} == before
 
-    @pytest.mark.parametrize("fail_mode", ["probe", "epoch-probe", "train"])
-    def test_prior_canonical_survives_subprocess_failure(
-        self, tmp_path: Path, fail_mode: str
-    ) -> None:
+    def test_prior_canonical_survives_subprocess_failure(self, tmp_path: Path) -> None:
         args, output_dir = self._base_args_and_config(tmp_path)
         before = self._seed_canonical(output_dir)
 
-        assert run_pipeline(args, command_runner=_make_fake_runner(fail_mode=fail_mode)) == 2
+        assert run_pipeline(args, command_runner=_make_fake_runner(fail_mode="train")) == 2
 
         self._assert_canonical_unchanged(output_dir, before)
         assert (output_dir / "failure.json").exists()
@@ -1130,36 +1128,6 @@ class TestRunPipelineFailures:
         assert not created[0].exists()
         assert json.loads((output_dir / "failure.json").read_text())["stage"] == "pack"
 
-    def test_prior_canonical_survives_total_budget_failure(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        args, output_dir = self._base_args_and_config(
-            tmp_path,
-            pack_budget_seconds=1,
-            setup_probe_budget_seconds=1,
-            train_eval_budget_seconds=0,
-            artifact_budget_seconds=1,
-            reserve_seconds=0,
-            total_budget_seconds=3,
-        )
-        before = self._seed_canonical(output_dir)
-        clock = _FakeClock()
-        monkeypatch.setattr("src.e2_pipeline.time.monotonic", clock.monotonic)
-
-        assert (
-            run_pipeline(
-                args,
-                command_runner=_make_fake_runner(
-                    epoch_seconds=0.001,
-                    advance_seconds_by_mode={"train": 3.2},
-                    clock=clock,
-                ),
-            )
-            == 2
-        )
-
-        self._assert_canonical_unchanged(output_dir, before)
-
     @pytest.mark.parametrize(
         "profile_update",
         [
@@ -1210,71 +1178,6 @@ class TestRunPipelineFailures:
         assert json.loads((output_dir / "failure.json").read_text())["stage"] == "artifacts"
         assert not (output_dir / "artifact_manifest.json").exists()
 
-    def test_only_structured_oom_marker_is_candidate_local_and_skips_larger_budgets(
-        self, tmp_path: Path
-    ) -> None:
-        args, output_dir = self._base_args_and_config(tmp_path)
-        base = _make_fake_runner()
-        attempted: list[int] = []
-
-        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
-            if _arg_value(command, "--ddp-mode") == "probe":
-                budget = int(_arg_value(command, "--token-budget-per-rank"))
-                attempted.append(budget)
-                if budget == 524288:
-                    marker = (
-                        "E2_PROBE_CANDIDATE_FAILURE:"
-                        '{"kind":"oom","message":"rank-symmetric CUDA OOM"}'
-                    )
-                    return subprocess.CompletedProcess(command, 1, "", marker)
-            return base(command, timeout)
-
-        assert run_pipeline(args, command_runner=runner) == 0
-        profile = json.loads((output_dir / "profile.json").read_text())
-        assert attempted == [262144, 524288]
-        assert [result["failure"] for result in profile["probe_results"][1:]] == [
-            "rank-symmetric CUDA OOM",
-            "skipped after smaller token budget OOM",
-            "skipped after smaller token budget OOM",
-        ]
-
-    def test_generic_oom_text_without_marker_is_systemic(self, tmp_path: Path) -> None:
-        args, output_dir = self._base_args_and_config(tmp_path)
-        base = _make_fake_runner()
-
-        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
-            if _arg_value(command, "--ddp-mode") == "probe":
-                return subprocess.CompletedProcess(command, 1, "", "launcher CUDA out of memory")
-            return base(command, timeout)
-
-        assert run_pipeline(args, command_runner=runner) == 2
-        assert json.loads((output_dir / "failure.json").read_text())["stage"] == "probe"
-
-    def test_structured_nonfinite_marker_invalidates_only_that_candidate(
-        self, tmp_path: Path
-    ) -> None:
-        args, output_dir = self._base_args_and_config(tmp_path)
-        base = _make_fake_runner()
-        attempted: list[int] = []
-
-        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
-            if _arg_value(command, "--ddp-mode") == "probe":
-                budget = int(_arg_value(command, "--token-budget-per-rank"))
-                attempted.append(budget)
-                if budget == 524288:
-                    marker = (
-                        "E2_PROBE_CANDIDATE_FAILURE:"
-                        '{"kind":"nonfinite","message":"rank-symmetric non-finite loss"}'
-                    )
-                    return subprocess.CompletedProcess(command, 1, "", marker)
-            return base(command, timeout)
-
-        assert run_pipeline(args, command_runner=runner) == 0
-        profile = json.loads((output_dir / "profile.json").read_text())
-        assert attempted == list(_RUNTIME_TOKEN_BUDGETS)
-        assert profile["probe_results"][1]["valid"] is False
-        assert profile["probe_results"][1]["failure"] == "rank-symmetric non-finite loss"
-
     def test_pack_build_error_writes_failure_and_returns_2(self, tmp_path: Path) -> None:
         # data_root has no features/ directory at all -> build_packed_features raises.
         data_root = tmp_path / "data-missing-features"
@@ -1296,9 +1199,7 @@ class TestRunPipelineFailures:
     def test_pack_stage_exceeding_its_budget_writes_failure_and_returns_2(
         self, tmp_path: Path
     ) -> None:
-        args, output_dir = self._base_args_and_config(
-            tmp_path, pack_budget_seconds=0, total_budget_seconds=20
-        )
+        args, output_dir = self._base_args_and_config(tmp_path, pack_budget_seconds=0)
 
         exit_code = run_pipeline(args, command_runner=_make_fake_runner())
 
@@ -1307,9 +1208,7 @@ class TestRunPipelineFailures:
         assert failure["stage"] == "pack"
 
     def test_pack_timeout_is_supervised_and_structured(self, tmp_path: Path) -> None:
-        args, output_dir = self._base_args_and_config(
-            tmp_path, pack_budget_seconds=1, total_budget_seconds=21
-        )
+        args, output_dir = self._base_args_and_config(tmp_path, pack_budget_seconds=1)
         observed: dict[str, float] = {}
 
         def timeout_stage(_operation: Callable[[], None], timeout: float) -> None:
@@ -1324,225 +1223,28 @@ class TestRunPipelineFailures:
         assert observed["timeout"] == 1
         assert json.loads((output_dir / "failure.json").read_text())["stage"] == "pack"
 
-    def test_probe_subprocess_failure_writes_failure_and_returns_2(self, tmp_path: Path) -> None:
-        args, output_dir = self._base_args_and_config(tmp_path)
-
-        exit_code = run_pipeline(args, command_runner=_make_fake_runner(fail_mode="probe"))
-
-        assert exit_code == 2
-        failure = json.loads((output_dir / "failure.json").read_text())
-        assert failure["stage"] == "probe"
-        assert failure["returncode"] == 1
-
-    def test_probe_subprocess_timeout_writes_failure_and_returns_2(self, tmp_path: Path) -> None:
-        args, output_dir = self._base_args_and_config(tmp_path)
-
-        exit_code = run_pipeline(args, command_runner=_make_fake_runner(timeout_mode="probe"))
-
-        assert exit_code == 2
-        failure = json.loads((output_dir / "failure.json").read_text())
-        assert failure["stage"] == "probe"
-        assert "timeout_seconds" in failure
-
-    def test_unstructured_oom_timeout_is_systemic(self, tmp_path: Path) -> None:
-        args, output_dir = self._base_args_and_config(tmp_path)
-        base_runner = _make_fake_runner()
-        first = True
-
-        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
-            nonlocal first
-            if _arg_value(command, "--ddp-mode") == "probe" and first:
-                first = False
-                raise subprocess.TimeoutExpired(
-                    cmd=command, timeout=timeout, stderr="CUDA out of memory"
-                )
-            return base_runner(command, timeout)
-
-        assert run_pipeline(args, command_runner=runner) == 2
-        assert json.loads((output_dir / "failure.json").read_text())["stage"] == "probe"
-
-    @pytest.mark.parametrize(
-        "payload",
-        [
-            {
-                "token_budget": 999,
-                "valid": True,
-                "global_pairs_per_second": 1.0,
-                "peak_memory_gib": 1.0,
-                "failure": None,
-            },
-            {
-                "token_budget": 262144,
-                "valid": True,
-                "global_pairs_per_second": float("nan"),
-                "peak_memory_gib": 1.0,
-                "failure": None,
-            },
-        ],
-    )
-    def test_malformed_probe_profile_persists_partial_evidence(
-        self, tmp_path: Path, payload: dict[str, object]
-    ) -> None:
-        args, output_dir = self._base_args_and_config(tmp_path)
-
-        def runner(command: Sequence[str], _timeout: float) -> subprocess.CompletedProcess[str]:
-            Path(_arg_value(command, "--profile-output")).write_text(json.dumps(payload))
-            return subprocess.CompletedProcess(command, 0, "", "")
-
-        assert run_pipeline(args, command_runner=runner) == 2
-        failure = json.loads((output_dir / "failure.json").read_text())
-        evidence = json.loads((output_dir / "failed_run_profile.json").read_text())
-        assert failure["stage"] == "probe"
-        assert evidence["probe_results"] == []
-        assert evidence["stage_seconds"]["pack"] >= 0
-
     @pytest.mark.parametrize("payload", [None, "not-json", "{}"])
-    def test_missing_or_malformed_probe_profile_is_structured_failure(
+    def test_missing_or_malformed_train_profile_is_a_structured_artifact_failure(
         self, tmp_path: Path, payload: str | None
     ) -> None:
         args, output_dir = self._base_args_and_config(tmp_path)
+        base = _make_fake_runner()
 
-        def runner(command: Sequence[str], _timeout: float) -> subprocess.CompletedProcess[str]:
+        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            completed = base(command, timeout)
             profile_output = Path(_arg_value(command, "--profile-output"))
+            profile_output.unlink(missing_ok=True)
             if payload is not None:
                 profile_output.write_text(payload)
-            return subprocess.CompletedProcess(command, 0, "", "")
+            return completed
 
         assert run_pipeline(args, command_runner=runner) == 2
         failure = json.loads((output_dir / "failure.json").read_text())
-        assert failure["stage"] == "probe"
+        assert failure["stage"] == "artifacts"
         assert "profile" in failure["message"]
-
-    def test_no_valid_probe_writes_failure_and_returns_2(self, tmp_path: Path) -> None:
-        args, output_dir = self._base_args_and_config(tmp_path)
-        all_invalid = {
-            budget: ProbeResult(budget, False, 0.0, 99.0, "oom")
-            for budget in _RUNTIME_TOKEN_BUDGETS
-        }
-
-        exit_code = run_pipeline(
-            args, command_runner=_make_fake_runner(probe_by_budget=all_invalid)
-        )
-
-        assert exit_code == 2
-        failure = json.loads((output_dir / "failure.json").read_text())
-        assert failure["stage"] == "probe"
-
-    def test_setup_probe_budget_exhausted_before_first_probe_returns_2(
-        self, tmp_path: Path
-    ) -> None:
-        args, output_dir = self._base_args_and_config(
-            tmp_path, setup_probe_budget_seconds=0, total_budget_seconds=30
-        )
-
-        def never_called(
-            command: Sequence[str], timeout: float
-        ) -> subprocess.CompletedProcess[str]:
-            raise AssertionError("command_runner must not be invoked once the budget is exhausted")
-
-        exit_code = run_pipeline(args, command_runner=never_called)
-
-        assert exit_code == 2
-        failure = json.loads((output_dir / "failure.json").read_text())
-        assert failure["stage"] == "probe"
-
-    def test_setup_probe_budget_exhausted_between_probes_and_epoch_probe_returns_2(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # The deadline is shared across the whole setup/probe stage: each of the 4
-        # candidate probes eats into it, so it can run out strictly *after* the
-        # last probe succeeds but *before* the epoch-probe is ever launched.
-        args, output_dir = self._base_args_and_config(
-            tmp_path, setup_probe_budget_seconds=2, total_budget_seconds=32
-        )
-        clock = _FakeClock()
-        monkeypatch.setattr("src.e2_pipeline.time.monotonic", clock.monotonic)
-
-        exit_code = run_pipeline(
-            args,
-            command_runner=_make_fake_runner(advance_seconds_by_mode={"probe": 0.55}, clock=clock),
-        )
-
-        assert exit_code == 2
-        failure = json.loads((output_dir / "failure.json").read_text())
-        assert failure["stage"] == "epoch_probe"
-        assert "epoch probe" in failure["message"]
-
-    def test_epoch_probe_subprocess_failure_writes_failure_and_returns_2(
-        self, tmp_path: Path
-    ) -> None:
-        args, output_dir = self._base_args_and_config(tmp_path)
-
-        exit_code = run_pipeline(args, command_runner=_make_fake_runner(fail_mode="epoch-probe"))
-
-        assert exit_code == 2
-        failure = json.loads((output_dir / "failure.json").read_text())
-        assert failure["stage"] == "epoch_probe"
-
-    def test_epoch_probe_subprocess_timeout_writes_failure_and_returns_2(
-        self, tmp_path: Path
-    ) -> None:
-        args, output_dir = self._base_args_and_config(tmp_path)
-
-        exit_code = run_pipeline(args, command_runner=_make_fake_runner(timeout_mode="epoch-probe"))
-
-        assert exit_code == 2
-        failure = json.loads((output_dir / "failure.json").read_text())
-        assert failure["stage"] == "epoch_probe"
-
-    @pytest.mark.parametrize("epoch_seconds", [True, 0, -1, float("nan"), float("inf")])
-    def test_epoch_probe_rejects_nonpositive_nonfinite_or_bool_seconds(
-        self, tmp_path: Path, epoch_seconds: object
-    ) -> None:
-        args, output_dir = self._base_args_and_config(tmp_path)
-        assert (
-            run_pipeline(args, command_runner=_make_fake_runner(epoch_seconds=epoch_seconds)) == 2
-        )
-        failure = json.loads((output_dir / "failure.json").read_text())
-        assert failure["stage"] == "epoch_probe"
-        assert "malformed" in failure["message"]
-
-    def test_projection_over_budget_writes_failure_and_returns_2(self, tmp_path: Path) -> None:
-        args, output_dir = self._base_args_and_config(tmp_path)
-
-        exit_code = run_pipeline(args, command_runner=_make_fake_runner(epoch_seconds=1000.0))
-
-        assert exit_code == 2
-        failure = json.loads((output_dir / "failure.json").read_text())
-        assert failure["stage"] == "projection"
-        profile = json.loads((output_dir / "failed_run_profile.json").read_text())
-        assert len(profile["probe_results"]) == 4
-        assert profile["stage_seconds"]["pack"] >= 0
-        assert profile["epoch_probe"]["epoch_seconds"] == 1000.0
-
-    def test_e2e_projection_uses_full_joint_candidate_throughput(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from src import train_b0
-
-        args, output_dir = self._base_args_and_config(tmp_path)
-        original_load_config = train_b0.load_config
-
-        def load_e2e_config(path: Path) -> train_b0.Config:
-            cfg = original_load_config(path)
-            return replace(cfg, model=replace(cfg.model, family="egostitch_e2e"))
-
-        monkeypatch.setattr(train_b0, "load_config", load_e2e_config)
-        probes = {
-            budget: ProbeResult(budget, True, 5.0, 40.0, None) for budget in _RUNTIME_TOKEN_BUDGETS
-        }
-        runner = _make_fake_runner(
-            probe_by_budget=probes,
-            epoch_seconds=5.0,
-            epoch_runtime_profile={"per_epoch": [{"global_pairs": 1000, "compute_seconds": 1.0}]},
-        )
-
-        assert run_pipeline(args, command_runner=runner) == 2
-        failure = json.loads((output_dir / "failure.json").read_text())
-        profile = json.loads((output_dir / "failed_run_profile.json").read_text())
-        assert failure["stage"] == "projection"
-        assert profile["epoch_probe"]["projection_epoch_seconds"] == pytest.approx(204.0)
-        assert profile["projected_total_seconds"] > 400.0
+        evidence = json.loads((output_dir / "failed_run_profile.json").read_text())
+        assert evidence["token_budget"] == _RUNTIME_TOKEN_BUDGET
+        assert evidence["stage_seconds"]["pack"] >= 0
 
     def test_train_subprocess_failure_writes_failure_and_returns_2(self, tmp_path: Path) -> None:
         args, output_dir = self._base_args_and_config(tmp_path)
@@ -1567,8 +1269,9 @@ class TestRunPipelineFailures:
 
         assert run_pipeline(args, command_runner=corrupting_runner) == 2
         profile = json.loads((output_dir / "failed_run_profile.json").read_text())
-        assert len(profile["probe_results"]) == 4
-        assert profile["epoch_probe"]["epoch_seconds"] == 5.0
+        assert profile["token_budget"] == _RUNTIME_TOKEN_BUDGET
+        assert profile["stage_seconds"]["pack"] >= 0
+        assert profile["cold_cache"] is True
 
     def test_train_subprocess_timeout_writes_failure_and_returns_2(self, tmp_path: Path) -> None:
         args, output_dir = self._base_args_and_config(tmp_path)
@@ -1600,40 +1303,11 @@ class TestRunPipelineFailures:
         )
         assert json.loads((output_dir / "failure.json").read_text())["stage"] == "artifacts"
 
-    def test_total_elapsed_over_budget_after_artifacts_writes_failure_and_returns_2(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        args, output_dir = self._base_args_and_config(
-            tmp_path,
-            pack_budget_seconds=1,
-            setup_probe_budget_seconds=1,
-            train_eval_budget_seconds=0,
-            artifact_budget_seconds=1,
-            reserve_seconds=0,
-            total_budget_seconds=3,
-        )
-        clock = _FakeClock()
-        monkeypatch.setattr("src.e2_pipeline.time.monotonic", clock.monotonic)
-
-        exit_code = run_pipeline(
-            args,
-            command_runner=_make_fake_runner(
-                epoch_seconds=0.001,
-                advance_seconds_by_mode={"train": 3.2},
-                clock=clock,
-            ),
-        )
-
-        assert exit_code == 2
-        failure = json.loads((output_dir / "failure.json").read_text())
-        assert failure["stage"] == "total_budget"
-        assert not (output_dir / "profile.json").exists()
-        assert not (output_dir / "artifact_manifest.json").exists()
-
     def test_artifact_timeout_preserves_worker_and_pipeline_evidence(self, tmp_path: Path) -> None:
         args, output_dir = self._base_args_and_config(tmp_path)
         calls = 0
 
+        # Two supervised stages remain: pack, then artifacts.
         def stage_runner(operation: Callable[[], None], timeout: float) -> None:
             nonlocal calls
             calls += 1
@@ -1672,7 +1346,33 @@ class TestRunPipelineFailures:
         profile = json.loads((output_dir / "failed_run_profile.json").read_text())
         assert profile["counterfactual_stop_epoch"] == 1
         assert profile["per_rank"][0]["pairs_per_second"] == 42.0
-        assert len(profile["probe_results"]) == 4
+        assert profile["token_budget"] == _RUNTIME_TOKEN_BUDGET
+
+    def test_cold_b0_total_budget_includes_publication_and_rolls_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        args, output_dir = self._base_args_and_config(tmp_path)
+        before = self._seed_canonical(output_dir)
+        ticks = iter((0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 45.0))
+        monkeypatch.setattr(
+            "src.e2_pipeline.time",
+            types.SimpleNamespace(monotonic=lambda: next(ticks)),
+        )
+
+        assert (
+            run_pipeline(
+                args,
+                command_runner=_make_fake_runner(),
+                stage_runner=lambda operation, _timeout: operation(),
+            )
+            == 2
+        )
+
+        self._assert_canonical_unchanged(output_dir, before)
+        failure = json.loads((output_dir / "failure.json").read_text())
+        assert failure["stage"] == "total_budget"
+        assert failure["elapsed_seconds"] == 45.0
+        assert failure["limit_seconds"] == 40
 
 
 # --------------------------------------------------------------------------- CLI entry point
@@ -1693,3 +1393,314 @@ def test_main_returns_run_pipelines_exit_code(
 
     assert exit_code == 2
     assert cast(PipelineArgs, captured["args"]).config == tmp_path / "cfg.yaml"
+
+
+# ------------------------------------------------------- the qualification verdict crosses staging
+
+
+@dataclass(frozen=True)
+class _E2eAwareConfig(train_b0.Config):
+    """The one field `run_kind`/`--epochs`/`--qualification-artifact` key off.
+
+    `run_pipeline` refuses those three overrides on a worker whose config has no
+    ``run_kind``, so the B0 config the other fixtures use cannot exercise the
+    two-stage ladder at all.
+    """
+
+    run_kind: str | None = None
+
+
+@pytest.fixture
+def e2e_aware_worker(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Register a minimal E2E-aware worker module and return its dotted name."""
+    module = types.ModuleType("tests._e2e_aware_worker")
+
+    def load_config(path: Path) -> _E2eAwareConfig:
+        base = train_b0.load_config(path)
+        return _E2eAwareConfig(
+            model=base.model,
+            data=base.data,
+            optim=base.optim,
+            eval=base.eval,
+            seed=base.seed,
+            output_dir=base.output_dir,
+            mixed_precision=base.mixed_precision,
+            runtime=base.runtime,
+        )
+
+    def write_qualification_artifact(
+        cfg: _E2eAwareConfig,
+        *,
+        verdict: str,
+        feature_stats_sha256: str,
+        output_dir: Path | None = None,
+    ) -> Path:
+        destination = cfg.output_dir if output_dir is None else output_dir
+        destination.mkdir(parents=True, exist_ok=True)
+        path = destination / QUALIFICATION_ARTIFACT_FILENAME
+        path.write_text(
+            json.dumps(
+                {
+                    "verdict": verdict,
+                    "epochs": cfg.optim.epochs,
+                    "feature_stats_sha256": feature_stats_sha256,
+                    "model_config_sha256": "cd" * 32,
+                }
+            )
+        )
+        return path
+
+    def validate_qualification_artifact(
+        path: Path,
+        _cfg: _E2eAwareConfig,
+        *,
+        feature_stats_sha256: str,
+    ) -> dict[str, object]:
+        payload = json.loads(path.read_text())
+        if not isinstance(payload, dict):
+            raise RuntimeError("qualification artifact must contain an object")
+        if payload.get("verdict") != "pass":
+            raise RuntimeError("qualification verdict is not pass")
+        if payload.get("model_config_sha256") != "cd" * 32:
+            raise RuntimeError("qualification model identity mismatch")
+        if payload.get("feature_stats_sha256") != feature_stats_sha256:
+            raise RuntimeError("qualification feature identity mismatch")
+        return cast(dict[str, object], payload)
+
+    module.load_config = load_config  # type: ignore[attr-defined]
+    module.prepare_pack = train_b0.prepare_pack  # type: ignore[attr-defined]
+    module.write_qualification_artifact = write_qualification_artifact  # type: ignore[attr-defined]
+    module.validate_qualification_artifact = (  # type: ignore[attr-defined]
+        validate_qualification_artifact
+    )
+    monkeypatch.setitem(sys.modules, "tests._e2e_aware_worker", module)
+    return "tests._e2e_aware_worker"
+
+
+def _qualification_runner(
+    *, verdict: str, fail_mode: str | None = None
+) -> Callable[[Sequence[str], float], subprocess.CompletedProcess[str]]:
+    """A worker that writes its verdict into the staging tree, as the real one does.
+
+    `write_qualification_artifact` writes into ``cfg.output_dir``, which the
+    orchestrator points at the staging directory for every non-debug run. The
+    verdict therefore only reaches the canonical directory if publication (or,
+    on the failure path, the teardown rescue) moves it there.
+    """
+    base = _make_fake_runner(
+        fail_mode=fail_mode,
+        write_v_hold_validation_ledger=True,
+    )
+
+    def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        out_dir = Path(_arg_value(command, "--output-dir"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        completed = base(command, timeout)
+        metadata_path = out_dir / "run_metadata.json"
+        if metadata_path.is_file():
+            metadata = json.loads(metadata_path.read_text())
+            metadata["feature_stats_sha256"] = "ab" * 32
+            metadata_path.write_text(json.dumps(metadata))
+        (out_dir / QUALIFICATION_ARTIFACT_FILENAME).write_text(
+            json.dumps(
+                {
+                    "verdict": verdict,
+                    "epochs": 2,
+                    "hparams": {
+                        "lr": None,
+                        "weight_decay": None,
+                        "warmup_steps": None,
+                        "grad_clip": None,
+                        "seed": None,
+                        "negative_ratio": None,
+                        "node_batch": None,
+                        "edge_batch": None,
+                        "mixed_precision": None,
+                        "training": None,
+                    },
+                    "feature_stats_sha256": "ab" * 32,
+                    "model_config_sha256": "cd" * 32,
+                }
+            )
+        )
+        return completed
+
+    return runner
+
+
+class TestQualificationVerdictSurvivesPublication:
+    """Defect 3: the verdict is the qualification stage's whole product.
+
+    `_publish_staged` moves only `_PUBLISHED_FILENAMES` and `fail()` deletes the
+    staging tree, so before the cleanup a `pass` was destroyed by the first and a
+    `fail(<named_guard>)` by the second. Both are verdicts the formal stage's
+    preflight has to be able to read.
+    """
+
+    def test_a_pass_verdict_is_published_and_hashed_into_the_manifest(
+        self, tmp_path: Path, e2e_aware_worker: str
+    ) -> None:
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
+
+        assert run_pipeline(args, command_runner=_qualification_runner(verdict="pass")) == 0
+
+        published = output_dir / QUALIFICATION_ARTIFACT_FILENAME
+        assert json.loads(published.read_text())["verdict"] == "pass"
+        validation_ledger = output_dir / V_HOLD_VALIDATION_EVENTS_FILENAME
+        assert validation_ledger.is_file()
+        manifest = json.loads((output_dir / "artifact_manifest.json").read_text())
+        assert (
+            manifest[QUALIFICATION_ARTIFACT_FILENAME]["sha256"]
+            == hashlib.sha256(published.read_bytes()).hexdigest()
+        )
+        assert (
+            manifest[V_HOLD_VALIDATION_EVENTS_FILENAME]["sha256"]
+            == hashlib.sha256(validation_ledger.read_bytes()).hexdigest()
+        )
+
+    @pytest.mark.parametrize("corruption", ["missing", "tampered"])
+    def test_missing_or_tampered_validation_ledger_is_not_published(
+        self,
+        tmp_path: Path,
+        e2e_aware_worker: str,
+        corruption: str,
+    ) -> None:
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
+        base = _qualification_runner(verdict="pass")
+
+        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            completed = base(command, timeout)
+            staging = Path(_arg_value(command, "--output-dir"))
+            ledger = staging / V_HOLD_VALIDATION_EVENTS_FILENAME
+            if corruption == "missing":
+                ledger.unlink()
+            else:
+                ledger.write_text(ledger.read_text() + '{"ordinal": 2}\n')
+            return completed
+
+        assert run_pipeline(args, command_runner=runner) == 2
+        assert json.loads((output_dir / "failure.json").read_text())["stage"] == "artifacts"
+        assert (output_dir / "run_metadata.json").is_file()
+        assert (output_dir / V_HOLD_VALIDATION_EVENTS_FILENAME).is_file() is (
+            corruption == "tampered"
+        )
+        assert not (output_dir / "complete.json").exists()
+
+    def test_a_named_guard_failure_survives_the_staging_teardown(
+        self, tmp_path: Path, e2e_aware_worker: str
+    ) -> None:
+        """`fail(<named_guard>)` is a result, not an absence of one."""
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
+        runner = _qualification_runner(verdict="fail(slot_collapse)", fail_mode="train")
+
+        assert run_pipeline(args, command_runner=runner) == 2
+
+        payload = json.loads((output_dir / QUALIFICATION_ARTIFACT_FILENAME).read_text())
+        assert payload["verdict"] == "fail(slot_collapse)"
+        assert json.loads((output_dir / "failure.json").read_text())["stage"] == "train"
+
+    def test_a_dead_worker_replaces_an_earlier_pass(
+        self, tmp_path: Path, e2e_aware_worker: str
+    ) -> None:
+        """A dead worker must replace a stale pass with a pipeline-owned failure."""
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
+        assert run_pipeline(args, command_runner=_qualification_runner(verdict="pass")) == 0
+        assert (output_dir / QUALIFICATION_ARTIFACT_FILENAME).is_file()
+
+        assert run_pipeline(args, command_runner=_make_fake_runner(fail_mode="train")) == 2
+
+        payload = json.loads((output_dir / QUALIFICATION_ARTIFACT_FILENAME).read_text())
+        assert payload["verdict"] == "fail(training_worker)"
+
+    def test_a_formal_run_publishes_no_verdict(self, tmp_path: Path, e2e_aware_worker: str) -> None:
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        args = replace(args, worker_module=e2e_aware_worker, run_kind="formal")
+
+        assert (
+            run_pipeline(
+                args,
+                command_runner=_make_fake_runner(write_v_hold_validation_ledger=True),
+            )
+            == 0
+        )
+
+        assert not (output_dir / QUALIFICATION_ARTIFACT_FILENAME).exists()
+        assert (output_dir / V_HOLD_VALIDATION_EVENTS_FILENAME).is_file()
+        manifest = json.loads((output_dir / "artifact_manifest.json").read_text())
+        assert QUALIFICATION_ARTIFACT_FILENAME not in manifest
+        assert V_HOLD_VALIDATION_EVENTS_FILENAME in manifest
+
+
+class TestQualificationArtifactForwarding:
+    """The formal stage's digest equality needs the artifact path to reach the worker.
+
+    The worker cannot derive it: `hpc/qualification.sh` keys its directories by
+    the short arm name (``f_only``) while the worker knows the arm only by its
+    config-derived name (``b0_e2e_f_only``).
+    """
+
+    def test_the_path_is_forwarded_to_the_worker_command(
+        self, tmp_path: Path, e2e_aware_worker: str
+    ) -> None:
+        args, _ = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        artifact = tmp_path / QUALIFICATION_ARTIFACT_FILENAME
+        artifact.write_text(json.dumps({"verdict": "pass"}))
+        args = replace(
+            args,
+            worker_module=e2e_aware_worker,
+            run_kind="formal",
+            qualification_artifact=artifact,
+        )
+        seen: list[Sequence[str]] = []
+        base = _make_fake_runner(write_v_hold_validation_ledger=True)
+
+        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            seen.append(list(command))
+            return base(command, timeout)
+
+        assert run_pipeline(args, command_runner=runner) == 0
+        assert _arg_value(seen[0], "--qualification-artifact") == str(artifact)
+
+    def test_a_missing_artifact_is_refused_before_the_pack_stage(
+        self, tmp_path: Path, e2e_aware_worker: str
+    ) -> None:
+        args, _ = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        args = replace(
+            args,
+            worker_module=e2e_aware_worker,
+            run_kind="formal",
+            qualification_artifact=tmp_path / "absent.json",
+        )
+        launched: list[Sequence[str]] = []
+
+        def recording_runner(
+            command: Sequence[str], timeout: float
+        ) -> subprocess.CompletedProcess[str]:
+            launched.append(list(command))
+            return subprocess.CompletedProcess(list(command), returncode=0, stdout="", stderr="")
+
+        with pytest.raises(ValueError, match="qualification artifact not found"):
+            run_pipeline(args, command_runner=recording_runner)
+
+        assert launched == []
+
+    def test_the_qualification_stage_refuses_one_as_input(
+        self, tmp_path: Path, e2e_aware_worker: str
+    ) -> None:
+        """It is the stage's output; accepting it as input is the removed circularity."""
+        args, _ = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        artifact = tmp_path / QUALIFICATION_ARTIFACT_FILENAME
+        artifact.write_text(json.dumps({"verdict": "pass"}))
+        args = replace(
+            args,
+            worker_module=e2e_aware_worker,
+            run_kind="qualification",
+            qualification_artifact=artifact,
+        )
+
+        with pytest.raises(ValueError, match="output, not its input"):
+            run_pipeline(args, command_runner=_make_fake_runner())

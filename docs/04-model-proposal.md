@@ -1003,7 +1003,7 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   deterministic point-estimate dominance. The inspected artifact is not retroactively
   rebound; a new-hash run plus fidelity/cost reports is required for the screening verdict.
   E1/E3 retain multi-seed Holm inference.
-  *Headline revision 2026-07-16 (rev 3.0):* the pending frozen-s0 screen keeps its
+  *Headline revision 2026-07-16 (rev 3.0; historical):* the pending frozen-s0 screen keeps its
   registered contract unchanged and becomes the motivating arm for the §4.4 e2e
   redesign. The **next** binding Stage-1 build is the stitched-topology-conditioned
   pair encoder with a five-arm screen scope — full model, matched `B0-e2e`/f-only,
@@ -1019,6 +1019,12 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   frozen-s0 scalar fusion is retired to motivating-arm + ablation status. The rev-3.0
   conditioned encoder is now the active G5 build line; see
   `docs/results/G5-stage1-seed0-20260717.md`.
+  *Active successor update 2026-07-30 (rev 3.2):* the five-arm rev-3.0 scope above
+  describes the completed historical screen only. The active contract is the
+  two-stage, eight-arm screen in spec §13.19.4 and §14.4.6: six trained checkpoints
+  plus two scoring-time controls, with identical `V_fit`/`V_hold` universes across
+  qualification and formal stages. The v4 registration remains `DRAFT`, so this update
+  authorizes implementation but no formal execution.
 
 ### 6.1 Method rows
 

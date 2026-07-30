@@ -117,14 +117,6 @@ class TestForwardContract:
             second = model(batch)["logits"]
         torch.testing.assert_close(first, second)
 
-    def test_density_ratio_scales_budget(self) -> None:
-        model = _model()
-        x = torch.randn(2, _TINY.input_dim)
-        tok = model.tokenize(x)
-        base = model.d_hat(tok)
-        model.set_density_ratio(11.6)
-        torch.testing.assert_close(model.d_hat(tok), base * 11.6)
-
 
 class TestNodeLosses:
     def test_all_families_finite(self) -> None:
@@ -168,21 +160,6 @@ class TestNodeLosses:
 
 
 class TestGradientFlow:
-    def test_pair_score_backpropagates_through_projection(self) -> None:
-        model = _model()
-        for name, parameter in model.named_parameters():
-            parameter.requires_grad_(name.startswith("imagine.proj."))
-        batch = _pair_batch()
-        with torch.no_grad():
-            enc_i = model.encode_nodes(batch["x_i"], batch["ground_i"])
-            enc_j = model.encode_nodes(batch["x_j"], batch["ground_j"])
-        logits, _ = model.pair_outputs(enc_i, enc_j, batch["x_i"], batch["x_j"], batch["s0"])
-        logits.sum().backward()  # type: ignore[no-untyped-call]
-        grad = model.proj.weight.grad
-        assert grad is not None
-        assert bool(torch.isfinite(grad).all())
-        assert bool(torch.count_nonzero(grad))
-
     def test_every_trainable_parameter_receives_gradient(self) -> None:
         model = _model()
         node = _node_batch()

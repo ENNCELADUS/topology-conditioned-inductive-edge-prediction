@@ -112,7 +112,7 @@ def _runtime_dict() -> dict[str, object]:
         "pack_workers": 16,
         "loader_workers_per_rank": 4,
         "prefetch_factor": 4,
-        "token_budget_candidates": [262144, 524288, 1048576, 1572864],
+        "token_budget": 524288,
         "max_pairs_per_rank": 4096,
         "memory_limit_gib": 85.0,
         "total_budget_seconds": 3600,
@@ -200,7 +200,7 @@ class TestLoadConfig:
 
         assert cfg.runtime is not None
         assert cfg.runtime.world_size == 0
-        assert cfg.runtime.token_budget_candidates == [262144, 524288, 1048576, 1572864]
+        assert cfg.runtime.token_budget == 524288
         assert cfg.runtime.total_budget_seconds == 3600
 
     def test_runtime_budget_must_sum_to_total(self, tmp_path: Path) -> None:
@@ -210,6 +210,18 @@ class TestLoadConfig:
         _write_yaml_config(config_path, {"runtime": runtime})
 
         with pytest.raises(ValueError, match="runtime stage budgets must sum to 3600"):
+            load_config(config_path)
+
+    @pytest.mark.parametrize("token_budget", [0, -1])
+    def test_runtime_token_budget_must_be_positive(
+        self, tmp_path: Path, token_budget: int
+    ) -> None:
+        runtime = _runtime_dict()
+        runtime["token_budget"] = token_budget
+        config_path = tmp_path / "cfg.yaml"
+        _write_yaml_config(config_path, {"runtime": runtime})
+
+        with pytest.raises(ValueError, match="runtime.token_budget must be positive"):
             load_config(config_path)
 
     def test_unknown_family_raises_clear_error(self, tmp_path: Path) -> None:

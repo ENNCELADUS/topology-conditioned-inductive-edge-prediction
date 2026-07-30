@@ -1,25 +1,26 @@
 r"""EgoStitch Stage-1 training worker (spec Sec 13; auto-sized H20 DDP).
 
 Drop-in worker for the `src.e2_pipeline` orchestrator: implements the same
-``--ddp-mode {probe,epoch-probe,init-probe,train}`` CLI contract, runtime-profile schema,
+``--ddp-mode train`` CLI contract, runtime-profile schema,
 and Task-4 checkpoint payload as ``src.train_b0``, over the EgoStitch two-stream
 composite step (node stream -> L_recon/L_ssl/L_real; edge stream -> L_edge; the
 joint-pair stream joins in Stage 3). ``--token-budget-per-rank`` is
 reinterpreted for this family as the per-rank node-stream batch size ``B_n``
 (spec Sec 13.13); the runtime budget is config-driven, not the E2 60-minute pin.
 
+Two execution stages share this worker and differ only in ``optim.epochs``
+(``--run-kind {qualification,formal}``). Both train on the full ``V_fit`` and
+validate on the single ``V_hold`` universe, so every pack, grounding cache and
+feature-statistics digest is identical between them. ``qualification`` is the
+guards-only development loop and writes ``qualification.json``; ``formal``
+produces the registered results.
+
 Launch (formal):
 
     accelerate launch --num_processes <visible-H20-count> --mixed_precision bf16 \
-        -m src.train_egostitch --config configs/egostitch_stage1_breadth_first.yaml \
-        --ddp-mode train --pack-dir <pack> --output-dir <out> \
+        -m src.train_egostitch --config configs/egostitch_e2e_v3_full_breadth_first.yaml \
+        --ddp-mode train --run-kind formal --pack-dir <pack> --output-dir <out> \
         --token-budget-per-rank 256 --profile-output <profile.json>
-
-s0 cache (spec Sec 13.10): every training/val pair's frozen-B0 logit must be
-precomputed. ``--write-s0-manifest <tsv>`` enumerates the exact deterministic
-pair universe this config will consume (all epochs x ranks + val), to be scored
-once via ``python -m src.score_universe score --pairs file:<tsv> ...`` with the
-audited checkpoint; ``data.s0_cache`` then points at the resulting ``.npz``.
 
 Pre-registration (protocol Sec 5.2.4): the worker records the sha256 of
 ``preregistration:`` in ``run_metadata.json`` before the first optimizer step;
@@ -33,16 +34,15 @@ import hashlib
 import json
 import logging
 import math
+import os
 import pickle
 import subprocess
 import time
 from collections import deque
-from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
-from itertools import islice
 from pathlib import Path
 from typing import Literal, TypeVar, cast
 
@@ -53,9 +53,8 @@ import yaml  # type: ignore[import-untyped]
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 from numpy.typing import NDArray
-from scipy.stats import kendalltau
 
-from src.data.artifacts import Benchmark, canonical_pair, load_benchmark
+from src.data.artifacts import canonical_pair
 from src.data.ego_targets import EgoTargetBuilder, EgoTargets
 from src.data.feature_stats import FeatureStats, feature_stats_for_universe
 from src.data.features import FeatureStore, build_f0_matrix
@@ -63,8 +62,7 @@ from src.data.grounding import build_grounding_pool
 from src.data.internal_holdout import InternalHoldoutPartition, derive_internal_holdout
 from src.data.packed_features import PackedFeatureManifest, PackedFeatureTable
 from src.data.pairs import NegativeSampler
-from src.data.partition import build_g_struct, derive_partition
-from src.e2_pipeline import ProbeResult, detect_visible_gpu_count
+from src.data.partition import derive_partition
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.eval.graph_metrics import MMDConfig, clustering_histogram, mmd_squared
 from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
@@ -78,23 +76,16 @@ from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.e2e_model import EgoStitchE2E
 from src.model.egostitch.imagine import NULL_MODE_ALL, NULL_MODE_CONTENT, NULL_MODE_FULL
 from src.model.egostitch.losses import stage1_family_tensors, stage1_total
-from src.score_universe import ScoresArtifact, load_scores
 from src.train_b0 import (
-    DDP_MODES,
     EvalConfig,
     ModelConfig,
-    RuntimeConfig,
     _as_float,
     _as_int,
-    _as_int_list,
     _as_mapping,
     _as_str,
     _as_str_list,
     _check_no_unknown_keys,
-    _emit_probe_candidate_failure,
-    _is_oom_error,
     _require,
-    _run_timed_epoch_probe,
     _state_digest,
     _write_json_rank_zero,
 )
@@ -137,9 +128,18 @@ def build_egostitch_ddp_accelerator(
     )
 
 
-# Frozen audited B0 checkpoint providing s0 (spec Sec 13.10); overridable in
-# the config only for synthetic-fixture tests.
-DEFAULT_S0_CHECKPOINT_ID = "e092537d8cf1e208"
+# The complete execution-context domain (design 2026-07-29 Sec 2): the
+# qualification stage is the guards-only development loop, the formal stage
+# produces registered results, and ``debug`` is *derived* from ``--max-steps``
+# by `write_run_start_metadata`/`write_outputs` rather than selected on the
+# CLI. It is named here because `run_metadata.json` publishes it and
+# `src.experiments.probes` reads it back.
+E2ERunKind = Literal["qualification", "formal", "debug"]
+
+# The single validation universe both stages share (`V_hold = V_qual union
+# V_select`, design Sec 2.1). It is also the grounding-pool ``role_universe``
+# identity, so a cache built for one stage is byte-identical for the other.
+_E2E_VALIDATION_ROLE: Literal["V_hold"] = "V_hold"
 
 
 # --------------------------------------------------------------------------- config
@@ -158,15 +158,13 @@ class EgoDataConfig:
         msg_fraction: Message share of train positives (spec 0.8).
         node_batch: Per-rank node-stream batch size ``B_n``.
         edge_batch: Per-rank edge-stream batch size ``B_e``.
-        f0_cache: F0 matrix cache path used while building the s0 manifest;
-            DDP modes use the pack directory instead.
+        f0_cache: F0 matrix cache path used outside packed execution; DDP modes
+            use the pack directory instead.
         grounding_cache: Grounding-pool cache path (same convention).
-        s0_cache: Frozen-B0 scores ``.npz`` covering every training/val pair.
-        s0_checkpoint_id: Expected ``checkpoint_id`` of `s0_cache`.
         expected_missing_features: Exact graph nodes expected to lack features.
         pack_dir: Raw-token pack directory (spec Sec 13.18 family only; the
             same packed-feature store the B0 V3.1 loader consumes). ``None``
-            for the frozen-s0 ``egostitch`` family, which has no token stream.
+            when no packed execution is requested.
     """
 
     root: Path
@@ -179,8 +177,6 @@ class EgoDataConfig:
     edge_batch: int
     f0_cache: Path
     grounding_cache: Path
-    s0_cache: Path
-    s0_checkpoint_id: str
     expected_missing_features: list[str]
     pack_dir: Path | None = None
 
@@ -195,8 +191,6 @@ class EgoOptimConfig:
         epochs: Fixed epoch count (counterfactual early stop is bookkeeping).
         warmup_steps: Linear LR warmup steps.
         grad_clip: Gradient-norm clip; 0 disables.
-        warmstart_fraction: Leading fraction of total steps where only
-            ``L_recon`` (+ degree NLL) carries gradient (spec Sec 13.8).
     """
 
     lr: float
@@ -204,7 +198,24 @@ class EgoOptimConfig:
     epochs: int
     warmup_steps: int
     grad_clip: float
-    warmstart_fraction: float
+
+
+@dataclass(frozen=True)
+class EgoRuntimeConfig:
+    """Runtime contract for the active E2E ``pack -> train -> publish`` path."""
+
+    world_size: int
+    pack_dir: Path
+    pack_workers: int
+    loader_workers_per_rank: int
+    prefetch_factor: int
+    token_budget: int
+    max_pairs_per_rank: int
+    memory_limit_gib: float
+    total_budget_seconds: int
+    pack_budget_seconds: int
+    train_eval_budget_seconds: int
+    artifact_budget_seconds: int
 
 
 @dataclass(frozen=True)
@@ -257,7 +268,7 @@ class EgoConfig:
     """The full validated EgoStitch worker configuration.
 
     Attributes:
-        model: ``family: egostitch`` plus `EgoStitchConfig` overrides.
+        model: The active ``family: egostitch_e2e`` model configuration.
         data: Data assembly settings.
         optim: Optimizer settings.
         eval: VAL-CRITERION bookkeeping settings.
@@ -266,8 +277,8 @@ class EgoConfig:
         mixed_precision: ``"no"`` or ``"bf16"``.
         preregistration: Path to the committed pre-registration JSON whose
             sha256 is recorded in ``run_metadata.json``.
-        runtime: Orchestrator runtime contract (``token_budget_candidates``
-            reinterpreted as ``B_n`` candidates; no frozen E2 probe list).
+        runtime: Orchestrator runtime contract (``token_budget`` reinterpreted
+            as the node batch ``B_n``; no frozen E2 probe list).
     """
 
     model: ModelConfig
@@ -279,14 +290,14 @@ class EgoConfig:
     output_dir: Path
     mixed_precision: str
     preregistration: Path
-    runtime: RuntimeConfig | None = None
+    runtime: EgoRuntimeConfig | None = None
     training: EgoStitchTrainingConfig | None = None
-    run_kind: Literal["overfit", "rehearsal", "formal"] | None = None
+    run_kind: E2ERunKind | None = None
 
 
 @dataclass(frozen=True)
 class EgoCliArgs:
-    """Parsed CLI arguments (train_b0 contract + ``--write-s0-manifest``)."""
+    """Parsed CLI arguments (the shared ``src.train_b0`` worker contract)."""
 
     config: Path
     seed: int | None
@@ -296,8 +307,9 @@ class EgoCliArgs:
     pack_dir: Path | None = None
     token_budget_per_rank: int | None = None
     profile_output: Path | None = None
-    write_s0_manifest: Path | None = None
-    run_kind: Literal["overfit", "rehearsal", "formal"] | None = None
+    run_kind: E2ERunKind | None = None
+    epochs: int | None = None
+    qualification_artifact: Path | None = None
 
 
 def load_config(path: Path) -> EgoConfig:
@@ -334,15 +346,10 @@ def load_config(path: Path) -> EgoConfig:
     model_raw = _as_mapping(_require(raw, "model", ""), "model")
     _check_no_unknown_keys(model_raw, ("family", "config"), "model")
     family = _as_str(_require(model_raw, "family", "model."), "model.family")
-    if family not in ("egostitch", _EGOSTITCH_E2E_FAMILY):
-        raise ValueError(
-            f"model.family must be 'egostitch' or {_EGOSTITCH_E2E_FAMILY!r}, got {family!r}"
-        )
+    if family != _EGOSTITCH_E2E_FAMILY:
+        raise ValueError(f"model.family must be {_EGOSTITCH_E2E_FAMILY!r}, got {family!r}")
     model_kwargs = _as_mapping(model_raw.get("config") or {}, "model.config")
-    if family == _EGOSTITCH_E2E_FAMILY:
-        E2EConfig.from_mapping(model_kwargs)  # validate eagerly, fail loudly
-    else:
-        EgoStitchConfig.from_mapping(model_kwargs)  # validate eagerly, fail loudly
+    E2EConfig.from_mapping(model_kwargs)  # validate eagerly, fail loudly
     model = ModelConfig(family=family, config=dict(model_kwargs))
 
     data_raw = _as_mapping(_require(raw, "data", ""), "data")
@@ -357,8 +364,6 @@ def load_config(path: Path) -> EgoConfig:
         "edge_batch",
         "f0_cache",
         "grounding_cache",
-        "s0_cache",
-        "s0_checkpoint_id",
         "expected_missing_features",
         "pack_dir",
     )
@@ -388,14 +393,6 @@ def load_config(path: Path) -> EgoConfig:
         grounding_cache=Path(
             _as_str(_require(data_raw, "grounding_cache", "data."), "data.grounding_cache")
         ),
-        s0_cache=(
-            Path(_as_str(_require(data_raw, "s0_cache", "data."), "data.s0_cache"))
-            if family == "egostitch"
-            else Path("")
-        ),
-        s0_checkpoint_id=_as_str(
-            data_raw.get("s0_checkpoint_id", DEFAULT_S0_CHECKPOINT_ID), "data.s0_checkpoint_id"
-        ),
         expected_missing_features=_as_str_list(
             data_raw.get("expected_missing_features", []), "data.expected_missing_features"
         ),
@@ -410,23 +407,13 @@ def load_config(path: Path) -> EgoConfig:
 
     optim_raw = _as_mapping(_require(raw, "optim", ""), "optim")
     optim_keys: tuple[str, ...] = ("lr", "weight_decay", "epochs", "warmup_steps", "grad_clip")
-    if family == "egostitch":
-        optim_keys += ("warmstart_fraction",)
     _check_no_unknown_keys(optim_raw, optim_keys, "optim")
-    warmstart_fraction = (
-        _as_float(optim_raw.get("warmstart_fraction", 0.2), "optim.warmstart_fraction")
-        if family == "egostitch"
-        else 0.0
-    )
-    if not 0.0 <= warmstart_fraction < 1.0:
-        raise ValueError(f"optim.warmstart_fraction must be in [0, 1), got {warmstart_fraction}")
     optim = EgoOptimConfig(
         lr=_as_float(_require(optim_raw, "lr", "optim."), "optim.lr"),
         weight_decay=_as_float(_require(optim_raw, "weight_decay", "optim."), "optim.weight_decay"),
         epochs=_as_int(_require(optim_raw, "epochs", "optim."), "optim.epochs"),
         warmup_steps=_as_int(_require(optim_raw, "warmup_steps", "optim."), "optim.warmup_steps"),
         grad_clip=_as_float(_require(optim_raw, "grad_clip", "optim."), "optim.grad_clip"),
-        warmstart_fraction=warmstart_fraction,
     )
     if optim.epochs <= 0:
         raise ValueError("optim.epochs must be positive")
@@ -473,8 +460,10 @@ def load_config(path: Path) -> EgoConfig:
         raise ValueError("diagnostics.gradient_imbalance_ratio must exceed 1")
     if diagnostics.probe_s1_abs_mean_max <= 0:
         raise ValueError("diagnostics.probe_s1_abs_mean_max must be positive")
-    if diagnostics.selection_auprc_tolerance < 0:
-        raise ValueError("diagnostics.selection_auprc_tolerance must be non-negative")
+    if not math.isfinite(diagnostics.selection_auprc_tolerance) or not (
+        0.0 <= diagnostics.selection_auprc_tolerance <= 1.0
+    ):
+        raise ValueError("diagnostics.selection_auprc_tolerance must be finite and in [0, 1]")
     if not 0.0 < diagnostics.topk_fraction <= 1.0:
         raise ValueError("diagnostics.topk_fraction must be in (0, 1]")
 
@@ -489,7 +478,7 @@ def load_config(path: Path) -> EgoConfig:
     if mixed_precision not in ("no", "bf16"):
         raise ValueError(f"mixed_precision must be 'no' or 'bf16', got {mixed_precision!r}")
 
-    runtime: RuntimeConfig | None = None
+    runtime: EgoRuntimeConfig | None = None
     if raw.get("runtime") is not None:
         runtime_raw = _as_mapping(raw["runtime"], "runtime")
         runtime_keys = (
@@ -498,23 +487,19 @@ def load_config(path: Path) -> EgoConfig:
             "pack_workers",
             "loader_workers_per_rank",
             "prefetch_factor",
-            "token_budget_candidates",
+            "token_budget",
             "max_pairs_per_rank",
             "memory_limit_gib",
             "total_budget_seconds",
             "pack_budget_seconds",
-            "setup_probe_budget_seconds",
             "train_eval_budget_seconds",
             "artifact_budget_seconds",
-            "reserve_seconds",
-            "probe_warmup_steps",
-            "probe_timed_steps",
         )
         _check_no_unknown_keys(runtime_raw, runtime_keys, "runtime")
         world_size_raw = _require(runtime_raw, "world_size", "runtime.")
         if world_size_raw != "auto":
             raise ValueError("runtime.world_size must be 'auto' for EgoStitch Stage-1")
-        runtime = RuntimeConfig(
+        runtime = EgoRuntimeConfig(
             world_size=0,
             pack_dir=Path(
                 _as_str(_require(runtime_raw, "pack_dir", "runtime."), "runtime.pack_dir")
@@ -529,9 +514,8 @@ def load_config(path: Path) -> EgoConfig:
             prefetch_factor=_as_int(
                 _require(runtime_raw, "prefetch_factor", "runtime."), "runtime.prefetch_factor"
             ),
-            token_budget_candidates=_as_int_list(
-                _require(runtime_raw, "token_budget_candidates", "runtime."),
-                "runtime.token_budget_candidates",
+            token_budget=_as_int(
+                _require(runtime_raw, "token_budget", "runtime."), "runtime.token_budget"
             ),
             max_pairs_per_rank=_as_int(
                 _require(runtime_raw, "max_pairs_per_rank", "runtime."),
@@ -548,10 +532,6 @@ def load_config(path: Path) -> EgoConfig:
                 _require(runtime_raw, "pack_budget_seconds", "runtime."),
                 "runtime.pack_budget_seconds",
             ),
-            setup_probe_budget_seconds=_as_int(
-                _require(runtime_raw, "setup_probe_budget_seconds", "runtime."),
-                "runtime.setup_probe_budget_seconds",
-            ),
             train_eval_budget_seconds=_as_int(
                 _require(runtime_raw, "train_eval_budget_seconds", "runtime."),
                 "runtime.train_eval_budget_seconds",
@@ -560,31 +540,15 @@ def load_config(path: Path) -> EgoConfig:
                 _require(runtime_raw, "artifact_budget_seconds", "runtime."),
                 "runtime.artifact_budget_seconds",
             ),
-            reserve_seconds=_as_int(
-                _require(runtime_raw, "reserve_seconds", "runtime."), "runtime.reserve_seconds"
-            ),
-            probe_warmup_steps=_as_int(
-                _require(runtime_raw, "probe_warmup_steps", "runtime."),
-                "runtime.probe_warmup_steps",
-            ),
-            probe_timed_steps=_as_int(
-                _require(runtime_raw, "probe_timed_steps", "runtime."),
-                "runtime.probe_timed_steps",
-            ),
         )
-        if not runtime.token_budget_candidates or any(
-            candidate <= 0 for candidate in runtime.token_budget_candidates
-        ):
+        if runtime.token_budget <= 0:
             raise ValueError(
-                "runtime.token_budget_candidates must be a non-empty list of positive "
-                "node-batch (B_n) candidates for this family"
+                "runtime.token_budget must be a positive node-batch (B_n) size for this family"
             )
         stage_total = (
             runtime.pack_budget_seconds
-            + runtime.setup_probe_budget_seconds
             + runtime.train_eval_budget_seconds
             + runtime.artifact_budget_seconds
-            + runtime.reserve_seconds
         )
         if stage_total != runtime.total_budget_seconds:
             raise ValueError(
@@ -666,21 +630,31 @@ def load_config(path: Path) -> EgoConfig:
                 training_raw.get("residual_ratio_min", 1e-3), "training.residual_ratio_min"
             ),
         )
+        if not math.isfinite(training.selection_auprc_tolerance) or not (
+            0.0 <= training.selection_auprc_tolerance <= 1.0
+        ):
+            raise ValueError("training.selection_auprc_tolerance must be finite and in [0, 1]")
         registered_training = EgoStitchTrainingConfig()
-        if training != registered_training:
+        if replace(
+            training,
+            selection_auprc_tolerance=registered_training.selection_auprc_tolerance,
+        ) != registered_training:
             raise ValueError(
                 f"training values must exactly match the DRAFT registration; got {training!r}"
             )
         if data.negative_ratio != 5:
             raise ValueError("training requires data.negative_ratio=5")
+        # `optim.epochs` is deliberately absent: it is the *only* value the
+        # qualification and the formal stage are allowed to differ in (design
+        # 2026-07-29 Sec 2), and the three-phase curriculum scales with
+        # `schedule_total_steps`, so a short schedule still traverses A -> B -> C.
         if (
             optim.lr != 1e-4
             or optim.weight_decay != 0.01
             or optim.warmup_steps != 500
-            or optim.epochs != 30
             or optim.grad_clip != 1.0
         ):
-            raise ValueError("training requires the registered optimizer and 30-epoch schedule")
+            raise ValueError("training requires the registered optimizer settings")
         resolved_e2e = E2EConfig.from_mapping(model_kwargs)
         if (resolved_e2e.p_topo, resolved_e2e.p_cont) not in ((0.15, 0.15), (0.0, 0.0)):
             raise ValueError(
@@ -692,7 +666,6 @@ def load_config(path: Path) -> EgoConfig:
             diagnostics.gradient_probe_interval != 50
             or diagnostics.gradient_imbalance_ratio != 50.0
             or diagnostics.gradient_imbalance_steps != 200
-            or diagnostics.selection_auprc_tolerance != 0.02
         ):
             raise ValueError("training diagnostics do not match the registered guard cadence")
 
@@ -984,20 +957,38 @@ def e2e_degree_prior_init(
     instead of ``mu`` measures worse, because it shrinks the denominator while
     the numerator is what is wrong.
 
-    Deterministic given ``G_struct``, so every DDP rank computes the same value.
+    ``sorted`` is load-bearing, not cosmetic: ``build_g_fit`` adds nodes from a
+    ``frozenset[str]``, whose iteration order depends on ``PYTHONHASHSEED``
+    (pinned nowhere in this repo), and ``np.log(...).mean()`` uses pairwise
+    summation, so an unsorted traversal makes the last ulp order-dependent. Each
+    rank computes this independently, so without the sort the replicas can
+    disagree in the final bit from step 0.
     """
     generator = model.generator if isinstance(model, EgoStitchE2E) else model
     graph = data.target_builder.graph
     degrees = np.asarray(
-        [max(int(graph.degree(node)), 1) for node in graph.nodes()], dtype=np.float64
+        [max(int(graph.degree(node)), 1) for node in sorted(graph.nodes())],
+        dtype=np.float64,
     )
     if degrees.size == 0:
         raise RuntimeError("G_struct carries no nodes for the degree prior")
     mu0 = float(np.log(degrees).mean())
     if not math.isfinite(mu0):
         raise RuntimeError(f"degree prior mean(log d) is not finite: {mu0}")
+    # `nn.Sequential.__getitem__` is typed `-> Module`, and `Module.__getattr__`
+    # widens `.bias` to `Tensor | Module`; the isinstance narrowing below is what
+    # makes `head.bias` a `Tensor` for the type checker. It is also a real
+    # assertion: `build_mlp` (`layers.py:14-32`) ends every head in a bias-
+    # carrying `nn.Linear`, and silently skipping the write if that ever stopped
+    # being true would reintroduce the standing residual this function removes.
+    head = generator.tokenize.degree_dist_head[-1]
+    if not isinstance(head, torch.nn.Linear):
+        raise RuntimeError(f"degree head does not end in nn.Linear: {type(head).__name__}")
+    bias: torch.Tensor | None = head.bias
+    if bias is None:
+        raise RuntimeError("degree head's output layer carries no bias to center")
     with torch.no_grad():
-        generator.tokenize.degree_dist_head[-1].bias[0] = mu0
+        bias[0] = mu0
     return mu0
 
 
@@ -1007,22 +998,6 @@ def e2e_first_eligible_epoch(total_steps: int, steps_per_epoch: int) -> int:
         raise ValueError("steps_per_epoch must be positive")
     _, phase_b_end = e2e_phase_boundaries(total_steps)
     return math.ceil((phase_b_end + steps_per_epoch) / steps_per_epoch)
-
-
-def e2e_overfit_epoch_step_counts(
-    reporting_epochs: int, *, profile_only: bool = False
-) -> tuple[int, ...]:
-    """Split the fixed 2,000-step overfit run into reporting epochs.
-
-    The epoch probe executes only the first representative reporting epoch;
-    the orchestrator projects it across the registered 30 epochs. The actual
-    overfit execution always receives the exhaustive tuple summing to 2,000.
-    """
-    if reporting_epochs <= 0:
-        raise ValueError("reporting_epochs must be positive")
-    base_steps, extra = divmod(2000, reporting_epochs)
-    counts = tuple(base_steps + (1 if epoch < extra else 0) for epoch in range(reporting_epochs))
-    return counts[:1] if profile_only else counts
 
 
 def e2e_weighted_bce_with_logits(
@@ -1344,52 +1319,12 @@ def select_e2e_checkpoint(
     return min(candidates, key=lambda record: (record.brier, record.epoch))
 
 
-def e2e_overfit_epoch_qualified(record: E2ECheckpointRecord) -> bool:
-    """Apply the §13.19.4 item-1 post-ramp acceptance to one overfit epoch.
-
-    The residual floor is the fp32-calibrated `1e-6` (spec §12, 2026-07-22):
-    the honest fp32 readout measures Phase-C ratios in the `1e-5` decade,
-    while a dead conditioning pathway measures exactly zero. The formal
-    §13.19.3 validation-side floor remains `1e-3` and is not this constant.
-    """
-    residual = record.residual_ratio
-    return (
-        record.phase == "C"
-        and math.isfinite(record.auprc)
-        and record.auprc >= 0.95
-        and residual is not None
-        and math.isfinite(residual)
-        and residual >= 1e-6
-    )
-
-
-def select_e2e_overfit_epoch(records: Sequence[E2ECheckpointRecord]) -> int:
-    """Latest §13.19.4 item-1 qualifying epoch, or ``0`` when none qualifies."""
-    qualified = [record.epoch for record in records if e2e_overfit_epoch_qualified(record)]
-    return qualified[-1] if qualified else 0
-
-
-# `DDP_MODES` (from `src.train_b0`) is shared with the frozen-B0 worker CLI;
-# `init-probe` (spec Sec 13.19.1 S0 hard gate) is specific to this worker's
-# `egostitch_e2e` family, so it is appended locally rather than widening the
-# shared tuple.
-_TRAIN_EGOSTITCH_DDP_MODES = (*DDP_MODES, "init-probe")
-
-# Preflight dispatch modes: throughput/memory profiling (`probe`,
-# `epoch-probe`) and the read-only S0 collapse gate (`init-probe`). None of
-# them build a checkpoint, write formal run-start metadata, or publish an
-# artifact -- only the `train` fallthrough branch consumes a `rehearsal`
-# attempt or produces a `formal` artifact. `init-probe` in particular is the
-# one documented way to *measure* `feature_stats_sha256` in the first place
-# (runbook Sec "S0 gate": run it, record the digest, then paste it into the
-# config) -- it necessarily runs before any digest exists to pin, so
-# `_bind_feature_standardization`'s rehearsal/formal pin requirement must not
-# apply to these modes.
-_PROBE_DISPATCH_MODES = ("probe", "epoch-probe", "init-probe")
+_PROBE_DISPATCH_MODES = ("probe", "epoch-probe")
+_TRAIN_EGOSTITCH_DDP_MODES = ("train", *_PROBE_DISPATCH_MODES)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> EgoCliArgs:
-    """Parse the worker CLI (the train_b0 contract + ``--write-s0-manifest``).
+    """Parse the worker CLI (the shared ``src.train_b0`` contract).
 
     Args:
         argv: Argument list; ``None`` uses ``sys.argv[1:]``.
@@ -1424,19 +1359,36 @@ def parse_args(argv: Sequence[str] | None = None) -> EgoCliArgs:
         help="per-rank node-stream batch size B_n for this family (spec Sec 13.13).",
     )
     parser.add_argument("--profile-output", type=Path, default=None)
+    # `debug` is deliberately absent: it is derived from `--max-steps`, never
+    # selected. Offering it here would let a caller claim the digest-pin
+    # exemption `_bind_feature_standardization` grants debug runs without
+    # actually running a bounded, non-publishing schedule.
     parser.add_argument(
         "--run-kind",
-        choices=("overfit", "rehearsal", "formal"),
+        choices=("qualification", "formal"),
         default=None,
         help="E2E execution context; defaults to formal and does not alter the config hash",
     )
+    # The two stages differ in exactly one value (design 2026-07-29 Sec 2), so
+    # the short schedule is reachable through an override rather than a second
+    # copy of every config. `apply_overrides` restricts it to the
+    # qualification stage: the formal stage runs the registered schedule.
     parser.add_argument(
-        "--write-s0-manifest",
+        "--epochs",
+        type=int,
+        default=None,
+        help=(
+            "qualification-stage override for optim.epochs -- the only value the two stages "
+            "are allowed to differ in."
+        ),
+    )
+    parser.add_argument(
+        "--qualification-artifact",
         type=Path,
         default=None,
         help=(
-            "write the deterministic pair-universe TSV this config will consume "
-            "(for the one-off frozen-B0 s0 scoring pass) and exit"
+            "path to the qualification stage's qualification.json; required by a formal "
+            "run, whose feature_stats_sha256 must equal the recorded one."
         ),
     )
     namespace = parser.parse_args(argv)
@@ -1462,13 +1414,28 @@ def parse_args(argv: Sequence[str] | None = None) -> EgoCliArgs:
         pack_dir=namespace.pack_dir,
         token_budget_per_rank=namespace.token_budget_per_rank,
         profile_output=namespace.profile_output,
-        write_s0_manifest=namespace.write_s0_manifest,
         run_kind=namespace.run_kind,
+        epochs=namespace.epochs,
+        qualification_artifact=namespace.qualification_artifact,
     )
 
 
 def apply_overrides(cfg: EgoConfig, args: EgoCliArgs) -> EgoConfig:
-    """Apply the ``--seed`` / ``--output-dir`` CLI overrides."""
+    """Apply the ``--seed`` / ``--output-dir`` / ``--run-kind`` / ``--epochs`` overrides.
+
+    ``--epochs`` is deliberately narrower than the other three: it is the one
+    value the qualification and the formal stage are allowed to differ in
+    (design 2026-07-29 Sec 2), so it is accepted only for the qualification
+    stage. Applying it here -- rather than at the training call site -- is what
+    makes it reach *every* consumer of ``cfg.optim.epochs``, including the
+    ``metrics.jsonl`` row count and the staged-artifact epoch validation, not
+    just the loop's schedule.
+
+    Raises:
+        ValueError: When ``--epochs`` is non-positive, is used without a
+            training config section, or is used outside the qualification
+            stage.
+    """
     if args.seed is not None:
         cfg = replace(cfg, seed=args.seed)
     if args.output_dir is not None:
@@ -1477,6 +1444,17 @@ def apply_overrides(cfg: EgoConfig, args: EgoCliArgs) -> EgoConfig:
         if cfg.training is None:
             raise ValueError("--run-kind requires a training config section")
         cfg = replace(cfg, run_kind=args.run_kind)
+    if args.epochs is not None:
+        if cfg.training is None:
+            raise ValueError("--epochs requires a training config section")
+        if (cfg.run_kind or "formal") != "qualification":
+            raise ValueError(
+                "--epochs is a qualification-stage override; the formal stage must run the "
+                "registered schedule from its config"
+            )
+        if args.epochs <= 0:
+            raise ValueError("--epochs must be positive")
+        cfg = replace(cfg, optim=replace(cfg.optim, epochs=args.epochs))
     return cfg
 
 
@@ -1629,6 +1607,7 @@ def _validate_e2e_formal_binding(
         "parameter_group_manifests",
         "packs_and_validation_manifests",
         "qualification_attempts",
+        "qualification_history_indexes",
         "boundary_access_audit",
         "runtime_and_peak_memory",
     ):
@@ -1707,20 +1686,20 @@ def prepare_ddp_run_config(
     status = snapshot.payload.get("status")
     if cfg.training is not None:
         run_kind = cfg.run_kind or "formal"
-        if run_kind == "overfit":
-            if max_steps is not None:
-                raise ValueError(
-                    "E2E overfit uses exactly 2,000 registered steps; --max-steps forbidden"
-                )
-            return cfg, False, snapshot
-        if run_kind == "rehearsal":
-            if max_steps is not None:
-                raise ValueError(
-                    "E2E rehearsal must run the complete schedule; --max-steps forbidden"
-                )
-            return cfg, False, snapshot
         if max_steps is not None:
-            raise ValueError("E2E formal runs forbid --max-steps")
+            raise ValueError(
+                f"E2E {run_kind} runs must execute the complete schedule; --max-steps forbidden"
+            )
+        # The qualification stage is guards-only (design 2026-07-29 Sec 2.3):
+        # it publishes no formal artifact, so it does not require a BINDING
+        # registration. The formal stage falls through to that check below.
+        if run_kind == "qualification":
+            if status == "BINDING":
+                raise PreregistrationNotBinding(
+                    "qualification is frozen once preregistration status is BINDING; "
+                    "post-binding attempts would escape the registered K disclosure"
+                )
+            return cfg, False, snapshot
     if max_steps is None:
         if cfg.model.family == _EGOSTITCH_E2E_FAMILY:
             if status != "BINDING":
@@ -1754,10 +1733,115 @@ def _sha256_file(path: Path) -> str:
     return hasher.hexdigest()
 
 
+# The held-out artifacts no training-side stage may read (design 2026-07-29
+# Sec 3.1). Named once so every stage -- the two-stage e2e assembly, its
+# `cfg.training is None` sibling, and the pack builder that precedes both --
+# shares one definition rather than one carrying the boundary and the rest
+# carrying nothing.
+_HELD_OUT_FILENAMES = ("candidate_test_edges.txt", "test_edges.txt", "test_graph.pkl")
+
+# The complete set of benchmark inputs each stage opens, enumerated so the
+# boundary can be applied *before* the first open rather than after. Keep these
+# in step with the reads themselves: `_assemble_e2e_data` / `prepare_pack`'s
+# training branch open the train-side three; the `cfg.training is None` sibling
+# assembles through `load_benchmark` + `verify_benchmark`
+# (`src/data/artifacts.py:205-311, 350-384`), which open the rest.
+_E2E_TRAIN_SIDE_INPUTS = ("split.pkl", "train_edges.txt", "val_edges.txt")
+_BENCHMARK_PACKAGE_ROOT_INPUTS = ("graph.pkl", "positive_edges.txt")
+_BENCHMARK_PACKAGE_STRATEGY_INPUTS = (
+    "split.pkl",
+    "train_edges.txt",
+    "val_edges.txt",
+    "test_edges.txt",
+    "candidate_test_edges.txt",
+    "train_graph.pkl",
+    "test_graph.pkl",
+    "test_node_buckets.pkl",
+)
+
+
+def _stat_or_none(path: Path) -> os.stat_result | None:
+    """Return ``path.stat()`` (symlinks followed), or ``None`` if it is unreadable."""
+    try:
+        return path.stat()
+    except OSError:
+        return None
+
+
+def _assert_no_held_out_access(strategy_dir: Path, opened: Iterable[Path]) -> None:
+    """Raise when a training-side stage would read a held-out artifact.
+
+    The check is path-scoped and run-kind independent: it is *opening* a
+    held-out path that is forbidden, in every run kind, which is strictly
+    stronger than the pre-cleanup form (which raised on the mere presence of
+    those files and exempted `run_kind == "formal"`, so it made every other
+    kind impossible in the repository data root while never once guarding the
+    run that matters).
+
+    Aliasing is checked two ways, because name resolution alone does not cover
+    it. `Path.resolve` collapses symlinks and relative aliases such as
+    ``<strategy>/../<strategy>/test_edges.txt``, and it is applied to the
+    forbidden set too so a symlinked `strategy_dir` cannot put the two sides in
+    different namespaces. `(st_dev, st_ino)` then catches the case resolution
+    cannot see at all: a *hard* link, which is a second name for the same inode
+    with no link to follow. Candidate paths that do not exist are dropped: a
+    read of a missing file raises before any held-out row can reach the model,
+    and keeping them would make the sibling branch unconditionally unusable
+    rather than boundary-checked.
+
+    Args:
+        strategy_dir: The split-strategy directory the stage reads from.
+        opened: Every path this stage reads.
+
+    Raises:
+        RuntimeError: When any opened path resolves or aliases onto a held-out
+            artifact.
+    """
+    forbidden = {(strategy_dir / name).resolve() for name in _HELD_OUT_FILENAMES}
+    forbidden_inodes: set[tuple[int, int]] = set()
+    for path in forbidden:
+        info = _stat_or_none(path)
+        if info is not None:
+            forbidden_inodes.add((info.st_dev, info.st_ino))
+    trespass: set[str] = set()
+    for path in opened:
+        info = _stat_or_none(path)
+        if info is None:
+            continue
+        if path.resolve() in forbidden or (info.st_dev, info.st_ino) in forbidden_inodes:
+            trespass.add(str(path.resolve()))
+    if trespass:
+        raise RuntimeError("E2E training opened a held-out path: " + ", ".join(sorted(trespass)))
+
+
+def _assert_input_boundary(cfg: EgoConfig) -> Path:
+    """Reject every input path this config would open, before the first open.
+
+    A guard that runs after the reads is not a guard: the pre-Wave-3 form fired
+    only once `split.pkl`, `train_edges.txt` and `val_edges.txt` had been read
+    and the F0, feature-statistics and grounding caches had been written, so a
+    trespassing root still got its held-out bytes into memory and left derived
+    caches on disk keyed to them. `prepare_pack` -- which opens the same paths
+    one stage earlier -- had no boundary at all. This resolves the whole input
+    set up front so both stages refuse before touching the filesystem.
+
+    Args:
+        cfg: The validated worker config.
+
+    Returns:
+        The strategy directory, so callers need not re-derive it.
+
+    Raises:
+        RuntimeError: When any path this config would open is held out.
+    """
+    strategy_dir = cfg.data.root / _BENCHMARK_SUBDIR / cfg.data.strategy
+    opened = [strategy_dir / name for name in _E2E_TRAIN_SIDE_INPUTS]
+    _assert_no_held_out_access(strategy_dir, opened)
+    return strategy_dir
+
+
 def required_pack_paths(cfg: EgoConfig, pack_dir: Path) -> tuple[Path, ...]:
     """Return every cache directory the generic pack stage must supervise."""
-    if cfg.model.family != _EGOSTITCH_E2E_FAMILY:
-        return (pack_dir,)
     if cfg.data.pack_dir is None:
         raise ValueError("data.pack_dir is required when model.family == 'egostitch_e2e'")
     return (pack_dir, cfg.data.pack_dir)
@@ -1785,31 +1869,32 @@ def prepare_pack(
 
     Raises:
         ValueError: On warm-cache validation drift.
+        RuntimeError: When any benchmark input this pack would open is held out.
     """
+    # [H] Path-scoped held-out boundary (design 2026-07-29 Sec 3.1), first
+    # statement of the function: the pack stage runs *before* assembly and opens
+    # the same `split.pkl`/`train_edges.txt` (or the whole benchmark package on
+    # the `cfg.training is None` sibling), so a boundary that lived only in
+    # assembly let the pack consume held-out rows and bake them into the F0,
+    # grounding and feature-statistics caches the assembly then reuses.
+    strategy_dir = _assert_input_boundary(cfg)
     # Call-time import preserves the pack builder/validator monkeypatch seam.
     from src.data import packed_features
 
-    # Family `egostitch_e2e` (spec Sec 13.18): `cfg.model.config` validates
-    # against `E2EConfig`, not `EgoStitchConfig` -- it sizes only the pair
-    # trunk/conditioning pathways, except `n_ground`, which supersedes the
-    # internal Stage-1 generator's pinned `EgoStitchConfig` default for this
-    # family (spec Sec 14.4.4: per-arm grounding-pool size, e.g. `full` uses
-    # the rev-3.1 default 50, `cosine_pool` pins 20).
-    is_e2e = cfg.model.family == _EGOSTITCH_E2E_FAMILY
-    if is_e2e:
-        e2e_model_cfg = E2EConfig.from_mapping(cfg.model.config)  # validate eagerly, fail loudly
-        n_ground = e2e_model_cfg.n_ground
-    else:
-        model_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
-        n_ground = model_cfg.n_ground
+    e2e_model_cfg = E2EConfig.from_mapping(cfg.model.config)
+    n_ground = e2e_model_cfg.n_ground
     manifest_path = pack_dir / _PACK_MANIFEST_FILENAME
-    run_kind = cfg.run_kind or "formal"
-    role = None if run_kind == "overfit" else ("V_qual" if run_kind == "rehearsal" else "V_select")
+    # Both stages train on V_fit and validate on V_hold, so the pack carries no
+    # run-kind identity at all: a pack built by a qualification run *is* the
+    # pack the formal run must reuse (design 2026-07-29 Sec 2/Sec 4). The
+    # grounding caches keep their own `role_universe` identity internally
+    # (`src/data/grounding.py`), so nothing is lost by dropping it here.
+    role: Literal["V_hold"] = _E2E_VALIDATION_ROLE
     f0_cold = not pack_dir.exists()
     raw_manifest: PackedFeatureManifest | None = None
-    raw_pack_dir = cfg.data.pack_dir if is_e2e else None
+    raw_pack_dir = cfg.data.pack_dir
     raw_cold = bool(raw_pack_dir is not None and not raw_pack_dir.exists())
-    if is_e2e and raw_pack_dir is None:
+    if raw_pack_dir is None:
         raise ValueError("data.pack_dir is required when model.family == 'egostitch_e2e'")
     if not cold_cache and raw_cold:
         raise ValueError(f"warm raw-token pack is missing: {raw_pack_dir}")
@@ -1818,45 +1903,28 @@ def prepare_pack(
     if f0_cold:
         pack_dir.mkdir(parents=True, exist_ok=True)
         store = FeatureStore(cfg.data.root / _FEATURES_SUBDIR)
-        if cfg.training is not None:
-            strategy_dir = cfg.data.root / _BENCHMARK_SUBDIR / cfg.data.strategy
-            with (strategy_dir / "split.pkl").open("rb") as handle:
-                split_payload = pickle.load(handle)  # noqa: S301 - repository benchmark artifact
-            if not isinstance(split_payload, dict) or "train" not in split_payload:
-                raise ValueError("split.pkl must contain a train node collection")
-            train_nodes_all = sorted(
-                set(cast(Sequence[str], split_payload["train"]))
-                - set(cfg.data.expected_missing_features)
-            )
-            train_pairs, train_labels = _read_labeled_pairs(strategy_dir / "train_edges.txt")
-            positives = [
-                pair
-                for pair, label in zip(train_pairs, train_labels, strict=True)
-                if int(label) == 1
-            ]
-            partition = derive_partition(
-                positives, seed=cfg.data.partition_seed, msg_fraction=cfg.data.msg_fraction
-            )
-            holdout = derive_internal_holdout(train_nodes_all, partition.e_msg, partition.e_sup)
-            validation_nodes = (
-                ()
-                if role is None
-                else (
-                    holdout.qual_manifest.nodes
-                    if role == "V_qual"
-                    else holdout.select_manifest.nodes
-                )
-            )
-            train_nodes = sorted(holdout.v_fit)
-            operative = sorted(set(train_nodes) | set(validation_nodes))
-        else:
-            benchmark = _load_benchmark_for(cfg)
-            operative = sorted(
-                set(benchmark.graph.nodes()) - set(cfg.data.expected_missing_features)
-            )
-            train_nodes = sorted(set(benchmark.split.train_nodes) & set(operative))
-            validation_nodes = ()
-        if is_e2e and raw_cold:
+        with (strategy_dir / "split.pkl").open("rb") as handle:
+            split_payload = pickle.load(handle)  # noqa: S301 - repository benchmark artifact
+        if not isinstance(split_payload, dict) or "train" not in split_payload:
+            raise ValueError("split.pkl must contain a train node collection")
+        train_nodes_all = sorted(
+            set(cast(Sequence[str], split_payload["train"]))
+            - set(cfg.data.expected_missing_features)
+        )
+        train_pairs, train_labels = _read_labeled_pairs(strategy_dir / "train_edges.txt")
+        positives = [
+            pair
+            for pair, label in zip(train_pairs, train_labels, strict=True)
+            if int(label) == 1
+        ]
+        partition = derive_partition(
+            positives, seed=cfg.data.partition_seed, msg_fraction=cfg.data.msg_fraction
+        )
+        holdout = derive_internal_holdout(train_nodes_all, partition.e_msg, partition.e_sup)
+        validation_nodes = holdout.hold_manifest.nodes
+        train_nodes = sorted(holdout.v_fit)
+        operative = sorted(set(train_nodes) | set(validation_nodes))
+        if raw_cold:
             assert raw_pack_dir is not None
             raw_manifest = packed_features.build_packed_features(
                 cfg.data.root / _FEATURES_SUBDIR,
@@ -1889,7 +1957,6 @@ def prepare_pack(
             _PACK_FEATURE_STATS_FILENAME,
         ]
         if validation_nodes:
-            assert role is not None
             validation_rows = np.asarray(
                 matrix.numpy()[[index[node] for node in validation_nodes]], dtype=np.float32
             )
@@ -1904,7 +1971,6 @@ def prepare_pack(
         manifest = {
             "family": cfg.model.family,
             "strategy": cfg.data.strategy,
-            "run_kind": run_kind,
             "validation_role": role,
             "n_operative_nodes": len(operative),
             "n_train_nodes": len(train_nodes),
@@ -1921,10 +1987,7 @@ def prepare_pack(
         # would simply never look at it -- leaving the preprocessing
         # statistics outside the recorded pack identity. Require the entry
         # explicitly instead of silently accepting (and later rebuilding) it.
-        # Scoped to `is_e2e`: family `egostitch` (Stage-1) never reads
-        # `data.feature_stats` (only `_assemble_e2e_data` computes it), so its
-        # legacy packs legitimately have no use for this file.
-        if is_e2e and _PACK_FEATURE_STATS_FILENAME not in file_hashes:
+        if _PACK_FEATURE_STATS_FILENAME not in file_hashes:
             raise ValueError(
                 f"pack manifest at {manifest_path} has no "
                 f"{_PACK_FEATURE_STATS_FILENAME} entry (a pre-rev-3.2 pack); "
@@ -1939,10 +2002,8 @@ def prepare_pack(
             raise ValueError("pack manifest strategy does not match the config")
         if manifest.get("n_ground") != n_ground:
             raise ValueError("pack manifest n_ground does not match the model config")
-        if cfg.training is not None and (
-            manifest.get("run_kind") != run_kind or manifest.get("validation_role") != role
-        ):
-            raise ValueError("pack manifest data role does not match the execution context")
+        if manifest.get("validation_role") != role:
+            raise ValueError("pack manifest validation role does not match the execution context")
     f0_identity = _sha256_file(manifest_path)
     packs: dict[str, object] = {
         "f0_grounding": {
@@ -1952,92 +2013,31 @@ def prepare_pack(
             "cold": f0_cold,
         }
     }
-    if is_e2e:
-        assert raw_pack_dir is not None
-        source_root = cfg.data.root / _FEATURES_SUBDIR
-        if raw_manifest is None:
-            if raw_cold:
-                raw_manifest = packed_features.build_packed_features(
-                    source_root,
-                    raw_pack_dir,
-                    workers=cfg.runtime.pack_workers if cfg.runtime is not None else 1,
-                    temp_prefix=temp_prefix or None,
-                )
-            else:
-                raw_manifest = packed_features.validate_packed_manifest(raw_pack_dir, source_root)
-        raw_identity = packed_features.sha256_file(raw_pack_dir / "manifest.json")
-        assert raw_manifest is not None
-        packs["raw_tokens"] = {
-            "path": str(raw_pack_dir),
-            "manifest": asdict(raw_manifest),
-            "identity_sha256": raw_identity,
-            "cold": raw_cold,
-        }
+    assert raw_pack_dir is not None
+    source_root = cfg.data.root / _FEATURES_SUBDIR
+    if raw_manifest is None:
+        if raw_cold:
+            raw_manifest = packed_features.build_packed_features(
+                source_root,
+                raw_pack_dir,
+                workers=cfg.runtime.pack_workers if cfg.runtime is not None else 1,
+                temp_prefix=temp_prefix or None,
+            )
+        else:
+            raw_manifest = packed_features.validate_packed_manifest(raw_pack_dir, source_root)
+    raw_identity = packed_features.sha256_file(raw_pack_dir / "manifest.json")
+    assert raw_manifest is not None
+    packs["raw_tokens"] = {
+        "path": str(raw_pack_dir),
+        "manifest": asdict(raw_manifest),
+        "identity_sha256": raw_identity,
+        "cold": raw_cold,
+    }
     return {
         "pack_manifest": manifest,
         "pack_identity_sha256": f0_identity,
         "packs": packs,
     }
-
-
-# --------------------------------------------------------------------------- s0 cache
-
-
-class S0Cache:
-    """Frozen-B0 logit cache (spec Sec 13.10): hard-fails on any miss."""
-
-    def __init__(self, artifact: ScoresArtifact, *, expected_checkpoint_id: str) -> None:
-        """Index one scores artifact by canonical pair.
-
-        Args:
-            artifact: The loaded scores artifact.
-            expected_checkpoint_id: Required ``meta['checkpoint_id']``.
-
-        Raises:
-            ValueError: On a checkpoint-identity mismatch.
-        """
-        actual = artifact.meta.get("checkpoint_id")
-        if actual != expected_checkpoint_id:
-            raise ValueError(
-                f"s0 cache checkpoint_id mismatch: expected {expected_checkpoint_id!r}, "
-                f"got {actual!r} (spec Sec 13.10: s0 is the audited frozen B0)"
-            )
-        self._logits: dict[tuple[str, str], float] = {}
-        logits = artifact.logit.astype(np.float64)
-        for row, (u, v) in enumerate(artifact.pairs()):
-            self._logits[canonical_pair(u, v)] = float(logits[row])
-
-    @classmethod
-    def from_path(cls, path: Path, *, expected_checkpoint_id: str) -> S0Cache:
-        """Load a cache from one ``.npz`` scores artifact."""
-        return cls(load_scores(path), expected_checkpoint_id=expected_checkpoint_id)
-
-    def __len__(self) -> int:
-        """Return the number of cached pairs."""
-        return len(self._logits)
-
-    def lookup(self, pairs: Sequence[tuple[str, str]]) -> NDArray[np.float32]:
-        """Return row-aligned s0 logits for `pairs`.
-
-        Args:
-            pairs: Node pairs (canonicalized internally).
-
-        Returns:
-            Shape ``(n,)`` float32 logits.
-
-        Raises:
-            KeyError: On the first missing pair (never silently imputed).
-        """
-        out = np.empty(len(pairs), dtype=np.float32)
-        for i, (u, v) in enumerate(pairs):
-            key = canonical_pair(u, v)
-            if key not in self._logits:
-                raise KeyError(
-                    f"s0 cache is missing pair {key}; regenerate the manifest with "
-                    "--write-s0-manifest and re-score it with the frozen checkpoint"
-                )
-            out[i] = self._logits[key]
-        return out
 
 
 def enumerate_edge_stream(
@@ -2052,8 +2052,8 @@ def enumerate_edge_stream(
 ) -> list[tuple[str, str, int]]:
     """Enumerate one (epoch, rank) edge-stream pair list, deterministically.
 
-    The single source of truth shared by the training loader and the s0
-    manifest builder (spec Sec 13.10): positives are epoch-shuffled and
+    The single source of truth for the training loader
+    (`_BatchFactory.epoch_batches`): positives are epoch-shuffled and
     rank-strided; negatives come from the pinned Sec 10.2 sampler seeded by
     ``(seed, epoch, rank)``; the combined list is shuffled with the same stream.
 
@@ -2079,62 +2079,7 @@ def enumerate_edge_stream(
     return [rows[i] for i in perm.tolist()]
 
 
-def build_s0_manifest(
-    cfg: EgoConfig,
-    e_sup_positives: Sequence[tuple[str, str]],
-    val_pairs: Sequence[tuple[str, str]],
-    sampler: NegativeSampler,
-    output_path: Path,
-    *,
-    world_size: int,
-) -> int:
-    r"""Write the deduplicated pair-universe TSV the s0 cache must cover.
-
-    Args:
-        cfg: The validated worker config (epochs/ratio/seed).
-        e_sup_positives: Canonical supervision positives.
-        val_pairs: Validation pairs (model selection also needs s0).
-        sampler: The pinned negative sampler.
-        output_path: TSV destination (``u\\tv`` rows, canonical order, sorted).
-        world_size: Rank count of the formal run.
-
-    Returns:
-        The number of unique pairs written.
-    """
-    unique: set[tuple[str, str]] = set()
-    for epoch in range(1, cfg.optim.epochs + 1):
-        for rank in range(world_size):
-            for u, v, _ in enumerate_edge_stream(
-                e_sup_positives,
-                sampler,
-                negative_ratio=cfg.data.negative_ratio,
-                seed=cfg.seed,
-                epoch=epoch,
-                rank=rank,
-                world_size=world_size,
-            ):
-                unique.add(canonical_pair(u, v))
-    for u, v in val_pairs:
-        unique.add(canonical_pair(u, v))
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as handle:
-        for u, v in sorted(unique):
-            handle.write(f"{u}\t{v}\n")
-    logger.info("wrote %d unique s0 pairs to %s", len(unique), output_path)
-    return len(unique)
-
-
 # --------------------------------------------------------------------------- data assembly
-
-
-def _load_benchmark_for(cfg: EgoConfig) -> Benchmark:
-    """Load the benchmark package (verification on for the pinned strategy)."""
-    return load_benchmark(
-        cfg.data.root / _BENCHMARK_SUBDIR,
-        cfg.data.strategy,
-        verify=cfg.data.strategy == "breadth_first",
-        exclude_nodes=frozenset(cfg.data.expected_missing_features),
-    )
 
 
 @dataclass
@@ -2153,10 +2098,8 @@ class EgoStitchData:
         train_pos: Node id -> position in `train_nodes`.
         target_builder: The `EgoTargetBuilder` over ``G_struct``.
         sampler: The pinned negative sampler.
-        s0: The frozen-B0 logit cache.
         rho_train: Message-partition edge density (spec Sec 9.3).
-        feature_stats: Registered V_fit-only standardization constants
-            (spec Sec 13.19.1), or ``None`` on the legacy non-training path.
+        feature_stats: Registered V_fit-only standardization constants.
     """
 
     train_nodes: list[str]
@@ -2169,16 +2112,14 @@ class EgoStitchData:
     train_pos: dict[str, int]
     target_builder: EgoTargetBuilder
     sampler: NegativeSampler
-    s0: S0Cache
     rho_train: float
     internal_holdout: InternalHoldoutPartition | None = None
-    validation_role: Literal["V_qual", "V_select"] | None = None
+    validation_role: Literal["V_hold"] | None = None
     access_audit: dict[str, object] | None = None
     validation_nodes: tuple[str, ...] = ()
     validation_positive_edges: tuple[tuple[str, str], ...] = ()
     validation_grounding_index: NDArray[np.int64] | None = None
     validation_pos: dict[str, int] | None = None
-    overfit_manifest: OverfitManifest | None = None
     feature_stats: FeatureStats | None = None
 
 
@@ -2203,77 +2144,25 @@ def _sha256_pairs(pairs: Sequence[tuple[str, str]]) -> str:
     return hashlib.sha256("".join(f"{u}\t{v}\n" for u, v in sorted(pairs)).encode()).hexdigest()
 
 
-@dataclass(frozen=True)
-class OverfitManifest:
-    """The fixed rank/world-size-invariant 510-row qualification manifest."""
-
-    rows: tuple[tuple[str, str, int], ...]
-    sha256: str
-
-
-def e2e_overfit_step_rows(
-    manifest: OverfitManifest, *, step: int, batch_size: int
-) -> tuple[tuple[str, str, int], ...]:
-    """Select one canonical global overfit row window before DDP sharding."""
-    if step < 0 or batch_size <= 0 or not manifest.rows:
-        raise ValueError("overfit step, batch size, and manifest must be valid")
-    start = step * batch_size
-    return tuple(manifest.rows[(start + index) % len(manifest.rows)] for index in range(batch_size))
-
-
-def e2e_overfit_rank_step_rows(
-    manifest: OverfitManifest,
-    *,
-    step: int,
-    global_batch_size: int,
-    rank: int,
-    world_size: int,
-) -> tuple[tuple[str, str, int], ...]:
-    """Rank-stride one canonical global overfit batch without changing its rows."""
-    if world_size <= 0 or not 0 <= rank < world_size:
-        raise ValueError("invalid rank/world_size")
-    return e2e_overfit_step_rows(manifest, step=step, batch_size=global_batch_size)[
-        rank::world_size
-    ]
-
-
-def e2e_overfit_target_seed(*, seed: int, step: int, rank: int) -> tuple[int, int, int, int, int]:
-    """Return the reporting-epoch-invariant reconstruction-target seed."""
-    if step < 0 or rank < 0:
-        raise ValueError("overfit step and rank must be non-negative")
-    return seed, 0, step, rank, 0x7A
-
-
-def build_overfit_manifest(cfg: EgoConfig, data: EgoStitchData) -> OverfitManifest:
-    """Select 85 hash-smallest positives and 425 registered negatives once."""
-    if cfg.training is None:
-        raise ValueError("E2E overfit manifest requires training")
-    if len(data.e_sup_positives) < 85:
-        raise ValueError("E2E overfit manifest requires at least 85 V_fit supervision positives")
-
-    def pair_hash(pair: tuple[str, str]) -> tuple[bytes, tuple[str, str]]:
-        u, v = canonical_pair(*pair)
-        return hashlib.sha256(f"{u}\t{v}".encode()).digest(), (u, v)
-
-    positives = sorted(data.e_sup_positives, key=pair_hash)[:85]
-    negatives = data.sampler.sample(positives, ratio=5, seed=cfg.seed, epoch=0, rank=0)
-    rows = tuple([(u, v, 1) for u, v in positives] + [(u, v, 0) for u, v in negatives])
-    if len(rows) != 510 or sum(label for _, _, label in rows) != 85:
-        raise RuntimeError("registered E2E overfit manifest cardinality is broken")
-    digest = hashlib.sha256(
-        "".join(f"{u}\t{v}\t{label}\n" for u, v, label in rows).encode()
-    ).hexdigest()
-    return OverfitManifest(rows=rows, sha256=digest)
-
-
 def _assemble_e2e_data(
     cfg: EgoConfig,
     generator_cfg: EgoStitchConfig,
     *,
     pack_dir: Path | None,
 ) -> EgoStitchData:
-    """Assemble E2E training data from train-side files only, with role-isolated holdouts."""
-    strategy_dir = cfg.data.root / _BENCHMARK_SUBDIR / cfg.data.strategy
+    """Assemble E2E training data from train-side files only, with role-isolated holdouts.
+
+    Raises:
+        RuntimeError: When any benchmark input this assembly would open is held
+            out -- checked before the first open, so nothing held out is read
+            and no derived cache is written on the way to the raise.
+    """
+    # [H] Path-scoped held-out boundary (design 2026-07-29 Sec 3.1), first
+    # statement of the function. It sat at the *end* of the assembly until
+    # Wave 3, which meant `split.pkl`, `train_edges.txt` and `val_edges.txt`
+    # were already read and the F0 / feature-statistics / grounding caches were
+    # already written by the time it fired -- a post-mortem, not a guard.
+    strategy_dir = _assert_input_boundary(cfg)
     split_path = strategy_dir / "split.pkl"
     with split_path.open("rb") as handle:
         split_payload = pickle.load(handle)  # noqa: S301 - repository benchmark artifact
@@ -2294,16 +2183,14 @@ def _assemble_e2e_data(
         partition.e_msg,
         partition.e_sup,
     )
+    # One universe pair for both stages (design 2026-07-29 Sec 2): training is
+    # always the full V_fit, validation is always V_hold. Nothing here reads
+    # `run_kind` any more, which is exactly what makes the two stages share a
+    # pack, a grounding cache and a `feature_stats_sha256`.
     run_kind = cfg.run_kind or "formal"
-    role: Literal["V_qual", "V_select"] | None
-    if run_kind == "overfit":
-        role = None
-        validation = None
-        allowed_nodes = sorted(holdout.v_fit)
-    else:
-        role = "V_qual" if run_kind == "rehearsal" else "V_select"
-        validation = holdout.qual_manifest if role == "V_qual" else holdout.select_manifest
-        allowed_nodes = sorted(set(holdout.v_fit) | set(validation.nodes))
+    role: Literal["V_hold"] = _E2E_VALIDATION_ROLE
+    validation = holdout.hold_manifest
+    allowed_nodes = sorted(set(holdout.v_fit) | set(validation.nodes))
 
     store = FeatureStore(cfg.data.root / _FEATURES_SUBDIR)
     f0_cache = (pack_dir / _PACK_F0_FILENAME) if pack_dir is not None else cfg.data.f0_cache
@@ -2342,37 +2229,28 @@ def _assemble_e2e_data(
     grounding_index = np.asarray(
         [[node_index[neighbor] for neighbor in pool[node]] for node in fit_nodes], dtype=np.int64
     )
-    validation_nodes: tuple[str, ...] = ()
-    validation_positive_edges: tuple[tuple[str, str], ...] = ()
-    validation_grounding_index: NDArray[np.int64] | None = None
-    validation_pos: dict[str, int] | None = None
-    if validation is not None:
-        assert role is not None
-        validation_nodes = validation.nodes
-        validation_positive_edges = validation.positive_edges
-        validation_rows = np.asarray(
-            matrix.numpy()[[node_index[node] for node in validation_nodes]], dtype=np.float32
-        )
-        validation_cache = (
-            pack_dir / _PACK_VALIDATION_GROUNDING_FILENAME
-            if pack_dir is not None
-            else cfg.output_dir / "cache" / role / _PACK_GROUNDING_FILENAME
-        )
-        validation_pool = build_grounding_pool(
-            validation_rows,
-            validation_nodes,
-            n_ground=generator_cfg.n_ground,
-            role_universe=role,
-            cache_path=validation_cache,
-        )
-        validation_grounding_index = np.asarray(
-            [
-                [node_index[neighbor] for neighbor in validation_pool[node]]
-                for node in validation_nodes
-            ],
-            dtype=np.int64,
-        )
-        validation_pos = {node: index for index, node in enumerate(validation_nodes)}
+    validation_nodes: tuple[str, ...] = validation.nodes
+    validation_positive_edges: tuple[tuple[str, str], ...] = validation.positive_edges
+    validation_rows = np.asarray(
+        matrix.numpy()[[node_index[node] for node in validation_nodes]], dtype=np.float32
+    )
+    validation_cache = (
+        pack_dir / _PACK_VALIDATION_GROUNDING_FILENAME
+        if pack_dir is not None
+        else cfg.output_dir / "cache" / role / _PACK_GROUNDING_FILENAME
+    )
+    validation_pool = build_grounding_pool(
+        validation_rows,
+        validation_nodes,
+        n_ground=generator_cfg.n_ground,
+        role_universe=role,
+        cache_path=validation_cache,
+    )
+    validation_grounding_index: NDArray[np.int64] = np.asarray(
+        [[node_index[neighbor] for neighbor in validation_pool[node]] for node in validation_nodes],
+        dtype=np.int64,
+    )
+    validation_pos: dict[str, int] = {node: index for index, node in enumerate(validation_nodes)}
     g_fit = holdout.build_g_fit()
     target_builder = EgoTargetBuilder(
         g_fit,
@@ -2393,17 +2271,16 @@ def _assemble_e2e_data(
     sampler = NegativeSampler(fit_nodes, degrees, frozenset(rejection_positives))
     n_fit = len(fit_nodes)
     rho_train = g_fit.number_of_edges() / (math.comb(n_fit, 2) + n_fit)
-    forbidden = ("candidate_test_edges.txt", "test_edges.txt", "test_graph.pkl")
-    forbidden_files_absent = {name: not (strategy_dir / name).exists() for name in forbidden}
+    forbidden_files_absent = {
+        name: not (strategy_dir / name).exists() for name in _HELD_OUT_FILENAMES
+    }
     audit: dict[str, object] = {
         "run_kind": run_kind,
         "validation_role": role,
         "training_feature_nodes_sha256": hashlib.sha256(
             "".join(f"{node}\n" for node in fit_nodes).encode()
         ).hexdigest(),
-        "validation_feature_nodes_sha256": (
-            validation.nodes_sha256 if validation is not None else None
-        ),
+        "validation_feature_nodes_sha256": validation.nodes_sha256,
         "training_structural_target_sha256": _sha256_pairs(sorted(holdout.e_msg_fit)),
         "training_supervision_sha256": _sha256_pairs(sorted(holdout.e_sup_fit)),
         "training_endpoints_within_v_fit": True,
@@ -2423,30 +2300,17 @@ def _assemble_e2e_data(
         raise RuntimeError(
             "feature standardization statistics were computed over a universe other than V_fit"
         )
-    present_forbidden = [name for name, absent in forbidden_files_absent.items() if not absent]
-    if present_forbidden and run_kind != "formal":
-        raise RuntimeError(
-            "E2E train/qualification data root contains forbidden held-out files: "
-            + ", ".join(sorted(present_forbidden))
-        )
-    s0 = S0Cache.__new__(S0Cache)
-    s0._logits = {}
     data = EgoStitchData(
         train_nodes=fit_nodes,
         e_sup_positives=sorted(holdout.e_sup_fit),
-        val_pairs=list(validation.pairs) if validation is not None else [],
-        val_labels=(
-            np.asarray(validation.labels, dtype=np.int8)
-            if validation is not None
-            else np.asarray([], dtype=np.int8)
-        ),
+        val_pairs=list(validation.pairs),
+        val_labels=np.asarray(validation.labels, dtype=np.int8),
         f0=matrix,
         node_index=node_index,
         grounding_index=grounding_index,
         train_pos={node: i for i, node in enumerate(fit_nodes)},
         target_builder=target_builder,
         sampler=sampler,
-        s0=s0,
         rho_train=rho_train,
         feature_stats=feature_stats,
         internal_holdout=holdout,
@@ -2457,11 +2321,6 @@ def _assemble_e2e_data(
         validation_grounding_index=validation_grounding_index,
         validation_pos=validation_pos,
     )
-    if run_kind == "overfit":
-        manifest = build_overfit_manifest(cfg, data)
-        data.overfit_manifest = manifest
-        data.val_pairs = [(u, v) for u, v, _ in manifest.rows]
-        data.val_labels = np.asarray([label for _, _, label in manifest.rows], dtype=np.int8)
     return data
 
 
@@ -2469,7 +2328,6 @@ def assemble_egostitch_data(
     cfg: EgoConfig,
     *,
     pack_dir: Path | None = None,
-    require_s0: bool = True,
 ) -> EgoStitchData:
     """Assemble the full training data bundle from the frozen artifacts.
 
@@ -2477,106 +2335,28 @@ def assemble_egostitch_data(
         cfg: The validated worker config.
         pack_dir: DDP pack directory (its F0/grounding caches win); ``None``
             uses ``cfg.data.f0_cache`` / ``cfg.data.grounding_cache``.
-        require_s0: Load and validate the s0 cache (disabled only for the
-            ``--write-s0-manifest`` path, which exists to create it). Ignored
-            (always treated as ``False``) for family `egostitch_e2e`, which
-            retired the s0 channel entirely (spec Sec 13.10): its node stream
-            still needs the same `EgoTargetBuilder`/grounding-pool machinery
-            as the frozen-s0 family (delegated, unchanged, to the internal
-            trainable generator), sized off the generator's own pinned
-            `EgoStitchConfig()` defaults rather than ``cfg.model.config``
-            (which validates as `E2EConfig` for this family) -- except the
-            registered rev-3.1 grounding/loss-calibration fields, which
-            supersede the generator defaults for this family.
+            The node stream uses the internal trainable generator and its
+            registered rev-3.1 grounding/loss-calibration fields.
 
     Returns:
         The `EgoStitchData` bundle.
+
+    Raises:
+        RuntimeError: When any benchmark input this config would open is held
+            out -- checked before the first open on both branches.
     """
-    is_e2e = cfg.model.family == _EGOSTITCH_E2E_FAMILY
-    if is_e2e:
-        e2e_model_cfg = E2EConfig.from_mapping(cfg.model.config)  # validate eagerly, fail loudly
-        generator_cfg = replace(
-            EgoStitchConfig(),
-            n_ground=e2e_model_cfg.n_ground,
-            tau_adj=e2e_model_cfg.tau_adj,
-            tau_div=e2e_model_cfg.tau_div,
-            l_gate_pos_weight=e2e_model_cfg.l_gate_pos_weight,
-        )
-    else:
-        generator_cfg = EgoStitchConfig.from_mapping(cfg.model.config)
-    if cfg.training is not None:
-        return _assemble_e2e_data(cfg, generator_cfg, pack_dir=pack_dir)
-    benchmark = _load_benchmark_for(cfg)
-    store = FeatureStore(cfg.data.root / _FEATURES_SUBDIR)
-
-    operative = sorted(set(benchmark.graph.nodes()) - set(cfg.data.expected_missing_features))
-    f0_cache = (pack_dir / _PACK_F0_FILENAME) if pack_dir is not None else cfg.data.f0_cache
-    f0_cache.parent.mkdir(parents=True, exist_ok=True)
-    matrix, node_index = build_f0_matrix(store, operative, cache_path=f0_cache)
-
-    train_nodes = sorted(set(benchmark.split.train_nodes) & set(operative))
-    train_positives = [
-        pair
-        for pair, label in zip(
-            benchmark.split.train_pairs.pairs, benchmark.split.train_pairs.labels, strict=True
-        )
-        if label == 1
-    ]
-    partition = derive_partition(
-        train_positives, seed=cfg.data.partition_seed, msg_fraction=cfg.data.msg_fraction
+    # [H] Path-scoped held-out boundary (design 2026-07-29 Sec 3.1), first
+    # statement of the function so it precedes the first open.
+    _assert_input_boundary(cfg)
+    e2e_model_cfg = E2EConfig.from_mapping(cfg.model.config)
+    generator_cfg = replace(
+        EgoStitchConfig(),
+        n_ground=e2e_model_cfg.n_ground,
+        tau_adj=e2e_model_cfg.tau_adj,
+        tau_div=e2e_model_cfg.tau_div,
+        l_gate_pos_weight=e2e_model_cfg.l_gate_pos_weight,
     )
-    g_struct = build_g_struct(train_nodes, partition.e_msg)
-    n_train = len(train_nodes)
-    rho_train = g_struct.number_of_edges() / (math.comb(n_train, 2) + n_train)
-
-    grounding_cache = (
-        (pack_dir / _PACK_GROUNDING_FILENAME) if pack_dir is not None else cfg.data.grounding_cache
-    )
-    train_rows = np.asarray(
-        matrix.numpy()[[node_index[node] for node in train_nodes]], dtype=np.float32
-    )
-    pool = build_grounding_pool(
-        train_rows,
-        train_nodes,
-        n_ground=generator_cfg.n_ground,
-        role_universe="V_fit",
-        cache_path=grounding_cache,
-    )
-    grounding_index = np.array(
-        [[node_index[neighbor] for neighbor in pool[node]] for node in train_nodes],
-        dtype=np.int64,
-    )
-
-    target_builder = EgoTargetBuilder(
-        g_struct,
-        np.asarray(matrix.numpy(), dtype=np.float32),
-        node_index,
-        pool,
-        slots=generator_cfg.slots,
-    )
-    degrees = {node: int(g_struct.degree(node)) if node in g_struct else 0 for node in train_nodes}
-    sampler = NegativeSampler(train_nodes, degrees, benchmark.positive_edges)
-
-    if require_s0 and not is_e2e:
-        s0 = S0Cache.from_path(cfg.data.s0_cache, expected_checkpoint_id=cfg.data.s0_checkpoint_id)
-    else:  # manifest-writing path, or family egostitch_e2e (s0 retired)
-        s0 = S0Cache.__new__(S0Cache)
-        s0._logits = {}
-
-    return EgoStitchData(
-        train_nodes=train_nodes,
-        e_sup_positives=[canonical_pair(u, v) for u, v in partition.e_sup],
-        val_pairs=list(benchmark.split.val_pairs.pairs),
-        val_labels=benchmark.split.val_pairs.labels,
-        f0=matrix,
-        node_index=node_index,
-        grounding_index=grounding_index,
-        train_pos={node: i for i, node in enumerate(train_nodes)},
-        target_builder=target_builder,
-        sampler=sampler,
-        s0=s0,
-        rho_train=rho_train,
-    )
+    return _assemble_e2e_data(cfg, generator_cfg, pack_dir=pack_dir)
 
 
 # --------------------------------------------------------------------------- batches
@@ -2969,27 +2749,16 @@ class _BatchFactory:
                 dtype=torch.float32,
             ),
         }
-        if self._token_table is not None:
-            endpoints_u = [u for u, _, _ in padded]
-            endpoints_v = [v for _, v, _ in padded]
-            edge.update(self._token_streams(endpoints_u, endpoints_v))
-            # Same-index-space grounding ids for both endpoints (spec Sec
-            # 13.18): required by `EgoStitchE2E`'s grounded-identity-match
-            # flag, which compares `ground_id_a`/`ground_id_b` for equality.
-            edge["ground_id_i"] = self._ground_pool_rows(endpoints_u)
-            edge["ground_id_j"] = self._ground_pool_rows(endpoints_v)
-            edge.update(self._edge_target_tensors(padded, true_rows=true_rows, epoch=epoch))
-            edge["rel_target"] = relational_pair_targets(
-                self._data.target_builder.graph,
-                padded,
-            )
-        else:
-            s0 = (
-                self._data.s0.lookup([(u, v) for u, v, _ in padded])
-                if true_rows > 0
-                else np.zeros(len(padded), dtype=np.float32)
-            )
-            edge["s0"] = torch.from_numpy(s0)
+        if self._token_table is None:
+            raise RuntimeError("egostitch_e2e batches require a packed token table")
+        endpoints_u = [u for u, _, _ in padded]
+        endpoints_v = [v for _, v, _ in padded]
+        edge.update(self._token_streams(endpoints_u, endpoints_v))
+        # Same-index-space grounding ids for both endpoints (spec Sec 13.18).
+        edge["ground_id_i"] = self._ground_pool_rows(endpoints_u)
+        edge["ground_id_j"] = self._ground_pool_rows(endpoints_v)
+        edge.update(self._edge_target_tensors(padded, true_rows=true_rows, epoch=epoch))
+        edge["rel_target"] = relational_pair_targets(self._data.target_builder.graph, padded)
         return edge, true_rows
 
     def epoch_batches(
@@ -3039,59 +2808,6 @@ class _BatchFactory:
                 f0_rows_gathered=f0_rows,
             )
 
-    def fixed_row_batches(
-        self,
-        *,
-        manifest: OverfitManifest,
-        epoch: int,
-        steps: int,
-        step_offset: int,
-    ) -> Iterator[_CompositeBatch]:
-        """Cycle canonical global overfit rows, then shard each step by rank."""
-        edge_batch = self._cfg.data.edge_batch
-        for local_step in range(steps):
-            global_step = step_offset + local_step
-            global_rows = e2e_overfit_step_rows(manifest, step=global_step, batch_size=edge_batch)
-            local_rows = e2e_overfit_rank_step_rows(
-                manifest,
-                step=global_step,
-                global_batch_size=edge_batch,
-                rank=self._rank,
-                world_size=self._world,
-            )
-            nodes = self._next_nodes()
-            targets = self._data.target_builder.build(
-                nodes,
-                np.random.default_rng(
-                    e2e_overfit_target_seed(seed=self._cfg.seed, step=global_step, rank=self._rank)
-                ),
-            )
-            node = self._node_tensors(nodes, targets, epoch=0, step=global_step)
-            edge, true_rows = self._edge_tensors(
-                local_rows,
-                pad_to=edge_batch,
-                epoch=epoch,
-                step=global_step,
-            )
-            f0_rows = (
-                node["x"].shape[0]
-                + node["ground_x"].shape[0] * node["ground_x"].shape[1]
-                + node["target_features"].shape[0] * node["target_features"].shape[1]
-                + 4 * edge["x_i"].shape[0]
-                + sum(
-                    edge[name].shape[0] * edge[name].shape[1]
-                    for name in ("target_features_i", "target_features_j")
-                    if name in edge
-                )
-            )
-            yield _CompositeBatch(
-                node=node,
-                edge=edge,
-                edge_rows_true=true_rows,
-                edge_rows_global=len(global_rows),
-                f0_rows_gathered=f0_rows,
-            )
-
 
 # --------------------------------------------------------------------------- composite module
 
@@ -3115,77 +2831,18 @@ class _CompositeStep(torch.nn.Module):
     head as reconstruction terms.
     """
 
-    kendall_active: torch.Tensor
-
-    def __init__(self, model: EgoStitchStage1 | EgoStitchE2E, world_size: int) -> None:
+    def __init__(self, model: EgoStitchE2E, world_size: int) -> None:
         super().__init__()
         self.model = model
         self.world_size = world_size
-        self.kendall_log_vars = torch.nn.ParameterDict(
-            {name: torch.nn.Parameter(torch.zeros(())) for name in ("edge", "recon", "real", "ssl")}
-        )
-        if isinstance(model, EgoStitchE2E):
-            for parameter in self.kendall_log_vars.parameters():
-                parameter.requires_grad_(False)
-        self.register_buffer("kendall_active", torch.tensor(False), persistent=True)
-
-    def activate_kendall(self) -> None:
-        """Enable the pre-instantiated registered uncertainty weights."""
-        self.kendall_active[...] = True
 
     def _generator(self) -> EgoStitchStage1:
-        """Return the trainable Stage-1 generator for either family.
-
-        For family `egostitch` this is ``self.model`` itself; for
-        `egostitch_e2e` it is `EgoStitchE2E.generator`, the internal
-        (non-frozen) Stage-1 module the node stream still trains via the
-        unchanged `EgoStitchStage1.node_losses`/`ssl_losses`.
-        """
-        if isinstance(self.model, EgoStitchE2E):
-            return self.model.generator
-        return self.model
-
-    def _edge_outputs(self, edge: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Frozen-s0 family (`egostitch`) self/non-self pair scoring split."""
-        assert isinstance(self.model, EgoStitchStage1)  # family egostitch only; narrows the Union
-        is_self = edge["is_self"]
-        outputs = {
-            name: edge["s0"].new_zeros(edge["s0"].shape)
-            for name in ("logits", "residual", "s1", "s2", "s2_aa")
-        }
-        non_self = ~is_self
-        if bool(non_self.any()):
-            idx = torch.nonzero(non_self, as_tuple=False).squeeze(-1)
-            batch = {
-                "x_i": edge["x_i"][idx],
-                "x_j": edge["x_j"][idx],
-                "ground_i": edge["ground_i"][idx],
-                "ground_j": edge["ground_j"][idx],
-                "s0": edge["s0"][idx],
-            }
-            sub_out = self.model(batch)
-            for name in outputs:
-                outputs[name] = outputs[name].index_put((idx,), sub_out[name])
-        if bool(is_self.any()):
-            idx = torch.nonzero(is_self, as_tuple=False).squeeze(-1)
-            batch = {
-                "x_i": edge["x_i"][idx],
-                "ground_i": edge["ground_i"][idx],
-                "s0": edge["s0"][idx],
-            }
-            sub_out = self.model(batch)
-            for name in outputs:
-                outputs[name] = outputs[name].index_put((idx,), sub_out[name])
-        return outputs
+        """Return the active E2E model's trainable Stage-1 generator."""
+        return self.model.generator
 
     def forward(self, batch: dict[str, object]) -> dict[str, object]:
         node = cast(dict[str, torch.Tensor], batch["node"])
         edge = cast(dict[str, torch.Tensor], batch["edge"])
-        joint_weight = cast(
-            torch.Tensor,
-            batch.get("joint_weight", torch.tensor(1.0, device=edge["label"].device)),
-        )
-        global_count = cast(int, batch["edge_rows_global"])
         collect_diagnostics = bool(batch.get("collect_diagnostics", False))
 
         generator = self._generator()
@@ -3210,28 +2867,27 @@ class _CompositeStep(torch.nn.Module):
         )
 
         extra: dict[str, object] = {}
-        if isinstance(self.model, EgoStitchE2E):
-            edge_active = bool(batch.get("edge_active", True))
-            real_ssl_scale = cast(torch.Tensor, batch["real_ssl_scale"])
-            seed = cast(int, batch["seed"])
-            epoch = cast(int, batch["epoch"])
-            step = cast(int, batch["step"])
-            if self.model.cfg.permanent_null == "none":
-                branch_masks = sample_branch_masks(
-                    edge["label"].shape[0],
-                    self.model.cfg.p_topo,
-                    self.model.cfg.p_cont,
-                    generator=_seeded_generator(seed, epoch, step),
-                    device=edge["label"].device,
-                )
-            else:
-                branch_masks = masks_for_null(
-                    self.model.cfg.permanent_null,
-                    edge["label"].shape[0],
-                    edge["label"].device,
-                )
-            edge_view = _e2e_edge_view(edge)
-            edge_view.update(
+        edge_active = bool(batch.get("edge_active", True))
+        real_ssl_scale = cast(torch.Tensor, batch["real_ssl_scale"])
+        seed = cast(int, batch["seed"])
+        epoch = cast(int, batch["epoch"])
+        step = cast(int, batch["step"])
+        if self.model.cfg.permanent_null == "none":
+            branch_masks = sample_branch_masks(
+                edge["label"].shape[0],
+                self.model.cfg.p_topo,
+                self.model.cfg.p_cont,
+                generator=_seeded_generator(seed, epoch, step),
+                device=edge["label"].device,
+            )
+        else:
+            branch_masks = masks_for_null(
+                self.model.cfg.permanent_null,
+                edge["label"].shape[0],
+                edge["label"].device,
+            )
+        edge_view = _e2e_edge_view(edge)
+        edge_view.update(
                 {
                     "target_features_a": edge["target_features_i"],
                     "target_features_b": edge["target_features_j"],
@@ -3252,138 +2908,64 @@ class _CompositeStep(torch.nn.Module):
                     ),
                 }
             )
-            edge_output = self.model(edge_view, masks=branch_masks)
-            logits = edge_output["logits"]
-            losses = losses._replace(
-                recon={
-                    **losses.recon,
-                    "align": edge_output["align_loss"],
-                    "rel": edge_output["rel_loss"],
-                }
+        edge_output = self.model(edge_view, masks=branch_masks)
+        logits = edge_output["logits"]
+        losses = losses._replace(
+            recon={
+                **losses.recon,
+                "align": edge_output["align_loss"],
+                "rel": edge_output["rel_loss"],
+            }
+        )
+        if collect_diagnostics:
+            extra.update(_e2e_gate_tanh(self.model))
+        edge_loss = (
+            e2e_weighted_bce_with_logits(
+                logits, edge["label"], edge["edge_mask"], world_size=self.world_size
             )
-            if collect_diagnostics:
-                extra.update(_e2e_gate_tanh(self.model))
-        else:
-            edge_outputs = self._edge_outputs(edge)
-            logits = edge_outputs["logits"]
-            if collect_diagnostics:
-                extra["channel_stats"] = {
-                    f"{name}_{stat}": float(getattr(edge_outputs[name].detach().float(), stat)())
-                    for name in ("s1", "s2", "s2_aa", "residual")
-                    for stat in ("mean", "std")
-                }
-
-        if isinstance(self.model, EgoStitchE2E):
-            edge_loss = (
-                e2e_weighted_bce_with_logits(
-                    logits,
-                    edge["label"],
-                    edge["edge_mask"],
-                    world_size=self.world_size,
-                )
-                if edge_active
-                else logits.sum() * 0.0
-            )
-        else:
-            per_row = torch.nn.functional.binary_cross_entropy_with_logits(
-                logits, edge["label"], reduction="none"
-            )
-            edge_loss = (per_row * edge["edge_mask"]).sum() * self.world_size / global_count
+            if edge_active
+            else logits.sum() * 0.0
+        )
 
         total, parts = stage1_total(
             generator.config,
-            family=(
-                "egostitch_e2e"
-                if isinstance(self.model, EgoStitchE2E)
-                else "egostitch"
-            ),
-            edge=edge_loss if isinstance(self.model, EgoStitchE2E) else edge_loss * joint_weight,
+            family="egostitch_e2e",
+            edge=edge_loss,
             recon=losses.recon,
             deg=losses.deg,
-            real_egostat=(
-                losses.real_egostat * real_ssl_scale
-                if isinstance(self.model, EgoStitchE2E)
-                else losses.real_egostat * joint_weight
-            ),
-            real_gin=(
-                losses.real_gin * real_ssl_scale
-                if isinstance(self.model, EgoStitchE2E)
-                else losses.real_gin * joint_weight
-            ),
-            ssl_noise=(
-                ssl["noise"] * real_ssl_scale
-                if isinstance(self.model, EgoStitchE2E)
-                else ssl["noise"] * joint_weight
-            ),
-            ssl_pool=(
-                ssl["pool"] * real_ssl_scale
-                if isinstance(self.model, EgoStitchE2E)
-                else ssl["pool"] * joint_weight
-            ),
+            real_egostat=losses.real_egostat * real_ssl_scale,
+            real_gin=losses.real_gin * real_ssl_scale,
+            ssl_noise=ssl["noise"] * real_ssl_scale,
+            ssl_pool=ssl["pool"] * real_ssl_scale,
             recon_factors=cast(
                 Mapping[str, float] | None,
-                batch.get("recon_factors") if isinstance(self.model, EgoStitchE2E) else None,
+                batch.get("recon_factors"),
             ),
         )
         families = stage1_family_tensors(
             generator.config,
-            family=(
-                "egostitch_e2e"
-                if isinstance(self.model, EgoStitchE2E)
-                else "egostitch"
-            ),
-            edge=edge_loss if isinstance(self.model, EgoStitchE2E) else edge_loss * joint_weight,
+            family="egostitch_e2e",
+            edge=edge_loss,
             recon=losses.recon,
             deg=losses.deg,
-            real_egostat=(
-                losses.real_egostat * real_ssl_scale
-                if isinstance(self.model, EgoStitchE2E)
-                else losses.real_egostat * joint_weight
-            ),
-            real_gin=(
-                losses.real_gin * real_ssl_scale
-                if isinstance(self.model, EgoStitchE2E)
-                else losses.real_gin * joint_weight
-            ),
-            ssl_noise=(
-                ssl["noise"] * real_ssl_scale
-                if isinstance(self.model, EgoStitchE2E)
-                else ssl["noise"] * joint_weight
-            ),
-            ssl_pool=(
-                ssl["pool"] * real_ssl_scale
-                if isinstance(self.model, EgoStitchE2E)
-                else ssl["pool"] * joint_weight
-            ),
+            real_egostat=losses.real_egostat * real_ssl_scale,
+            real_gin=losses.real_gin * real_ssl_scale,
+            ssl_noise=ssl["noise"] * real_ssl_scale,
+            ssl_pool=ssl["pool"] * real_ssl_scale,
             recon_factors=cast(
                 Mapping[str, float] | None,
-                batch.get("recon_factors") if isinstance(self.model, EgoStitchE2E) else None,
+                batch.get("recon_factors"),
             ),
         )
-        if isinstance(self.model, EgoStitchE2E):
-            parameter_anchor = 0.0 * torch.stack(
-                tuple(
-                    parameter.sum()
-                    for parameter in self.model.parameters()
-                    if parameter.requires_grad
-                )
-            ).sum()
-            total = total + parameter_anchor
-            families = {
-                name: family + parameter_anchor
-                for name, family in families.items()
-            }
-        if isinstance(self.model, EgoStitchE2E):
-            pass
-        elif bool(self.kendall_active):
-            total = torch.stack(
-                tuple(
-                    torch.exp(-self.kendall_log_vars[name]) * family + self.kendall_log_vars[name]
-                    for name, family in families.items()
-                )
-            ).sum()
-        else:
-            total = total + 0.0 * torch.stack(tuple(self.kendall_log_vars.values())).sum()
+        parameter_anchor = 0.0 * torch.stack(
+            tuple(
+                parameter.sum()
+                for parameter in self.model.parameters()
+                if parameter.requires_grad
+            )
+        ).sum()
+        total = total + parameter_anchor
+        families = {name: family + parameter_anchor for name, family in families.items()}
         result: dict[str, object] = {
             "loss": total,
             "parts": parts,
@@ -3410,26 +2992,6 @@ def _detached_clone(value: object) -> object:
     if isinstance(value, dict):
         return {key: _detached_clone(item) for key, item in value.items()}
     return value
-
-
-def _family_gradient_norms(
-    model: EgoStitchStage1 | EgoStitchE2E, families: dict[str, torch.Tensor]
-) -> dict[str, float]:
-    """Measure family-specific global L2 norms with isolated retained-graph backwards."""
-    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    norms: dict[str, float] = {}
-    for index, (name, family) in enumerate(families.items()):
-        model.zero_grad(set_to_none=True)
-        family.backward(  # type: ignore[no-untyped-call]
-            retain_graph=index < len(families) - 1
-        )
-        squared = family.new_zeros((), dtype=torch.float32)
-        for parameter in parameters:
-            if parameter.grad is not None:
-                squared = squared + parameter.grad.detach().float().square().sum()
-        norms[name] = float(torch.sqrt(squared))
-    model.zero_grad(set_to_none=True)
-    return norms
 
 
 def _e2e_edge_view(edge: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -3659,41 +3221,6 @@ def _validation_clustering_mmd(data: EgoStitchData, logits: np.ndarray) -> float
     )
 
 
-def _fidelity_summary(
-    s0: np.ndarray,
-    logits: np.ndarray,
-    channels: dict[str, np.ndarray],
-    *,
-    topk_fraction: float,
-) -> dict[str, float]:
-    """Compute the registered pair-ranking fidelity series for one epoch."""
-    residual = logits - s0
-    s0_std = float(np.std(s0))
-    residual_std = float(np.std(residual))
-    tau_result = kendalltau(s0, logits)
-    tau = float(tau_result.statistic)
-    if not np.isfinite(tau):
-        tau = 1.0 if np.array_equal(s0, logits) else 0.0
-    topk = max(1, min(len(s0), int(round(len(s0) * topk_fraction))))
-    row_ids = np.arange(len(s0), dtype=np.int64)
-    s0_top = set(np.lexsort((row_ids, -s0))[:topk].tolist())
-    logit_top = set(np.lexsort((row_ids, -logits))[:topk].tolist())
-    return {
-        "s0_std": s0_std,
-        "s1_mean": float(np.mean(channels["s1"])),
-        "s1_std": float(np.std(channels["s1"])),
-        "s2_mean": float(np.mean(channels["s2"])),
-        "s2_std": float(np.std(channels["s2"])),
-        "s2_aa_mean": float(np.mean(channels["s2_aa"])),
-        "s2_aa_std": float(np.std(channels["s2_aa"])),
-        "residual_std": residual_std,
-        "residual_s0_std_ratio": residual_std / max(s0_std, 1e-30),
-        "kendall_tau_vs_s0": tau,
-        "rank_mobility": 1.0 - tau,
-        "topk_overlap": len(s0_top & logit_top) / topk,
-    }
-
-
 def _e2e_validation_batch(
     data: EgoStitchData,
     token_table: PackedFeatureTable,
@@ -3741,7 +3268,7 @@ def _e2e_validation_slice_rows(n_val: int) -> tuple[int, ...]:
 
 
 def _validate_epoch(
-    model: EgoStitchStage1 | EgoStitchE2E,
+    model: EgoStitchE2E,
     data: EgoStitchData,
     accelerator: Accelerator,
     *,
@@ -3768,7 +3295,6 @@ def _validate_epoch(
     only to the full ``none`` arm; permanent-null arms select by active-arm
     AUPRC without that topology tie-break.
     """
-    is_e2e = isinstance(model, EgoStitchE2E)
     model.eval()
     n_val = len(data.val_pairs)
     rank, world = accelerator.process_index, accelerator.num_processes
@@ -3783,150 +3309,101 @@ def _validate_epoch(
             chunk = shard_rows[start : start + edge_batch]
             rows = [(*data.val_pairs[i], int(data.val_labels[i])) for i in chunk]
 
-            if isinstance(model, EgoStitchE2E):
-                assert token_table is not None and token_node_index is not None, (
-                    "family egostitch_e2e requires token_table/token_node_index"
+            assert token_table is not None and token_node_index is not None, (
+                "family egostitch_e2e requires token_table/token_node_index"
+            )
+            e2e_batch = _e2e_validation_batch(
+                data, token_table, token_node_index, rows, accelerator.device
+            )
+            # The packed token store is bf16-only (src/data/packed_features.py);
+            # `accelerator.prepare()` autocasts the training-step forward
+            # (`wrapped(...)`) automatically, but this call goes straight
+            # to the unwrapped model (matching the frozen-s0 branch below),
+            # so autocast must be requested explicitly here too (spec Sec
+            # 13.16 extension: per-node encode may stay bf16; this repeats
+            # that same contract at validation time).
+            masks = (
+                None
+                if model.cfg.permanent_null == "none"
+                else masks_for_null(
+                    model.cfg.permanent_null,
+                    e2e_batch["x_a"].shape[0],
+                    accelerator.device,
                 )
-                e2e_batch = _e2e_validation_batch(
-                    data, token_table, token_node_index, rows, accelerator.device
-                )
-                # The packed token store is bf16-only (src/data/packed_features.py);
-                # `accelerator.prepare()` autocasts the training-step forward
-                # (`wrapped(...)`) automatically, but this call goes straight
-                # to the unwrapped model (matching the frozen-s0 branch below),
-                # so autocast must be requested explicitly here too (spec Sec
-                # 13.16 extension: per-node encode may stay bf16; this repeats
-                # that same contract at validation time).
-                masks = (
-                    None
-                    if model.cfg.permanent_null == "none"
-                    else masks_for_null(
-                        model.cfg.permanent_null,
+            )
+            with accelerator.autocast():
+                state_a, state_b, is_self = model._pair_node_states(e2e_batch)
+                context = model.build_pair_context_from_states(state_a, state_b, is_self)
+                full_logits = model.score_pair_context(context)
+                f_logits = model.score_pair_context(
+                    context,
+                    masks=masks_for_null(
+                        NULL_ALL_HEAD,
                         e2e_batch["x_a"].shape[0],
                         accelerator.device,
-                    )
+                    ),
                 )
-                with accelerator.autocast():
-                    state_a, state_b, is_self = model._pair_node_states(e2e_batch)
-                    context = model.build_pair_context_from_states(state_a, state_b, is_self)
-                    full_logits = model.score_pair_context(context)
-                    f_logits = model.score_pair_context(
-                        context,
-                        masks=masks_for_null(
-                            NULL_ALL_HEAD,
-                            e2e_batch["x_a"].shape[0],
-                            accelerator.device,
-                        ),
-                    )
-                    active_logits = (
-                        full_logits
-                        if masks is None
-                        else model.score_pair_context(context, masks=masks)
-                    )
-                assert context.plan is not None
-                dispersion_a = _e2e_dispersion_rows(
-                    state_a.slots.pi,
-                    state_a.slots.h,
-                    state_a.slots.adj,
-                    context.plan,
+                active_logits = (
+                    full_logits
+                    if masks is None
+                    else model.score_pair_context(context, masks=masks)
                 )
-                dispersion_b = _e2e_dispersion_rows(
-                    state_b.slots.pi,
-                    state_b.slots.h,
-                    state_b.slots.adj,
-                    context.plan,
+            assert context.plan is not None
+            dispersion_a = _e2e_dispersion_rows(
+                state_a.slots.pi,
+                state_a.slots.h,
+                state_a.slots.adj,
+                context.plan,
+            )
+            dispersion_b = _e2e_dispersion_rows(
+                state_b.slots.pi,
+                state_b.slots.h,
+                state_b.slots.adj,
+                context.plan,
+            )
+            dispersion_rows = {
+                name: (
+                    0.5 * (dispersion_a[name] + dispersion_b[name])
+                    if name
+                    in {"pi_slot_std", "h_pairwise_cosine_mean", "adj_offdiag_std"}
+                    else dispersion_a[name]
                 )
-                dispersion_rows = {
-                    name: (
-                        0.5 * (dispersion_a[name] + dispersion_b[name])
-                        if name
-                        in {"pi_slot_std", "h_pairwise_cosine_mean", "adj_offdiag_std"}
-                        else dispersion_a[name]
-                    )
-                    for name in dispersion_a
-                }
-                for name in ("plan_row_entropy", "plan_rank1_marginal_residual"):
-                    dispersion_rows[name] = dispersion_rows[name].masked_fill(is_self, torch.nan)
-                scale_a = _e2e_scale_rows(state_a.slots.h, context.plan)
-                scale_b = _e2e_scale_rows(state_b.slots.h, context.plan)
-                scale_rows = {
-                    name: (
-                        0.5 * (scale_a[name] + scale_b[name])
-                        if name in {"h_norm_mean", "h_pairwise_sqdist_mean"}
-                        else scale_a[name]
-                    )
-                    for name in scale_a
-                }
-                for name in ("plan_total_mass", "plan_max_cell_fraction"):
-                    scale_rows[name] = scale_rows[name].masked_fill(is_self, torch.nan)
-                values_out.append(
-                    torch.stack(
-                        [
-                            active_logits.float(),
-                            full_logits.float(),
-                            f_logits.float(),
-                            dispersion_rows["pi_slot_std"],
-                            dispersion_rows["h_pairwise_cosine_mean"],
-                            dispersion_rows["adj_offdiag_std"],
-                            dispersion_rows["plan_row_entropy"],
-                            dispersion_rows["plan_rank1_marginal_residual"],
-                            scale_rows["plan_total_mass"],
-                            scale_rows["plan_max_cell_fraction"],
-                            scale_rows["h_norm_mean"],
-                            scale_rows["h_pairwise_sqdist_mean"],
-                        ],
-                        dim=-1,
-                    )
-                )
-                continue
-
-            idx_i = torch.tensor([data.node_index[u] for u, _, _ in rows], dtype=torch.long)
-            idx_j = torch.tensor([data.node_index[v] for _, v, _ in rows], dtype=torch.long)
-            s0 = data.s0.lookup([(u, v) for u, v, _ in rows])
-            pool_rows = data.grounding_index[[data.train_pos[u] for u, _, _ in rows]]
-            pool_rows_j = data.grounding_index[[data.train_pos[v] for _, v, _ in rows]]
-            is_self = torch.tensor([u == v for u, v, _ in rows], dtype=torch.bool)
-            batch: dict[str, torch.Tensor] = {
-                "x_i": data.f0[idx_i],
-                "x_j": data.f0[idx_j],
-                "ground_i": data.f0[torch.from_numpy(pool_rows)],
-                "ground_j": data.f0[torch.from_numpy(pool_rows_j)],
-                "s0": torch.from_numpy(s0),
-                "is_self": is_self,
+                for name in dispersion_a
             }
-            batch = cast(dict[str, torch.Tensor], _to_device(batch, accelerator.device))
-            outputs = {
-                name: batch["s0"].new_zeros(batch["s0"].shape)
-                for name in ("logits", "s1", "s2", "s2_aa")
+            for name in ("plan_row_entropy", "plan_rank1_marginal_residual"):
+                dispersion_rows[name] = dispersion_rows[name].masked_fill(is_self, torch.nan)
+            scale_a = _e2e_scale_rows(state_a.slots.h, context.plan)
+            scale_b = _e2e_scale_rows(state_b.slots.h, context.plan)
+            scale_rows = {
+                name: (
+                    0.5 * (scale_a[name] + scale_b[name])
+                    if name in {"h_norm_mean", "h_pairwise_sqdist_mean"}
+                    else scale_a[name]
+                )
+                for name in scale_a
             }
-            non_self = ~batch["is_self"]
-            if bool(non_self.any()):
-                sel = torch.nonzero(non_self, as_tuple=False).squeeze(-1)
-                keys = ("x_i", "x_j", "ground_i", "ground_j", "s0")
-                sub = {k: batch[k][sel] for k in keys}
-                sub_out = model(sub)
-                for name in outputs:
-                    outputs[name] = outputs[name].index_put((sel,), sub_out[name])
-            if bool(batch["is_self"].any()):
-                sel = torch.nonzero(batch["is_self"], as_tuple=False).squeeze(-1)
-                sub = {k: batch[k][sel] for k in ("x_i", "ground_i", "s0")}
-                sub_out = model(sub)
-                for name in outputs:
-                    outputs[name] = outputs[name].index_put((sel,), sub_out[name])
+            for name in ("plan_total_mass", "plan_max_cell_fraction"):
+                scale_rows[name] = scale_rows[name].masked_fill(is_self, torch.nan)
             values_out.append(
                 torch.stack(
                     [
-                        outputs["logits"].float(),
-                        batch["s0"].float(),
-                        outputs["s1"].float(),
-                        outputs["s2"].float(),
-                        outputs["s2_aa"].float(),
+                        active_logits.float(),
+                        full_logits.float(),
+                        f_logits.float(),
+                        dispersion_rows["pi_slot_std"],
+                        dispersion_rows["h_pairwise_cosine_mean"],
+                        dispersion_rows["adj_offdiag_std"],
+                        dispersion_rows["plan_row_entropy"],
+                        dispersion_rows["plan_rank1_marginal_residual"],
+                        scale_rows["plan_total_mass"],
+                        scale_rows["plan_max_cell_fraction"],
+                        scale_rows["h_norm_mean"],
+                        scale_rows["h_pairwise_sqdist_mean"],
                     ],
                     dim=-1,
                 )
             )
-
-    n_cols = 12 if is_e2e else 5
+    n_cols = 12
     local_values = (
         torch.cat(values_out) if values_out else torch.zeros((0, n_cols), device=accelerator.device)
     )
@@ -3947,64 +3424,55 @@ def _validate_epoch(
     logits_np = ordered[:, 0]
     probs = 1.0 / (1.0 + np.exp(-logits_np))
 
-    if isinstance(model, EgoStitchE2E):
-        full_np = ordered[:, 1]
-        f_np = ordered[:, 2]
-        residual_std = float(np.std(full_np - f_np))
-        f_std = float(np.std(f_np))
-        f_probs = 1.0 / (1.0 + np.exp(-f_np))
-        f_metrics = compute_edge_metrics(data.val_labels.astype(np.int64), f_probs)
-        active_std = float(np.std(logits_np))
-        dispersion_names = (
-            "pi_slot_std",
-            "h_pairwise_cosine_mean",
-            "adj_offdiag_std",
-            "plan_row_entropy",
-            "plan_rank1_marginal_residual",
+    full_np = ordered[:, 1]
+    f_np = ordered[:, 2]
+    residual_std = float(np.std(full_np - f_np))
+    f_std = float(np.std(f_np))
+    f_probs = 1.0 / (1.0 + np.exp(-f_np))
+    f_metrics = compute_edge_metrics(data.val_labels.astype(np.int64), f_probs)
+    active_std = float(np.std(logits_np))
+    dispersion_names = (
+        "pi_slot_std",
+        "h_pairwise_cosine_mean",
+        "adj_offdiag_std",
+        "plan_row_entropy",
+        "plan_rank1_marginal_residual",
+    )
+    dispersion_summary = {
+        name: (
+            float(np.mean(values[np.isfinite(values)]))
+            if bool(np.isfinite(values).any())
+            else 0.0
         )
-        dispersion_summary = {
-            name: (
-                float(np.mean(values[np.isfinite(values)]))
-                if bool(np.isfinite(values).any())
-                else 0.0
-            )
-            for name, values in zip(dispersion_names, ordered[:, 3:8].T, strict=True)
-        }
-        scale_names = (
-            "plan_total_mass",
-            "plan_max_cell_fraction",
-            "h_norm_mean",
-            "h_pairwise_sqdist_mean",
+        for name, values in zip(dispersion_names, ordered[:, 3:8].T, strict=True)
+    }
+    scale_names = (
+        "plan_total_mass",
+        "plan_max_cell_fraction",
+        "h_norm_mean",
+        "h_pairwise_sqdist_mean",
+    )
+    scale_telemetry = {
+        name: (
+            float(np.mean(values[np.isfinite(values)]))
+            if bool(np.isfinite(values).any())
+            else float("nan")
         )
-        scale_telemetry = {
-            name: (
-                float(np.mean(values[np.isfinite(values)]))
-                if bool(np.isfinite(values).any())
-                else float("nan")
-            )
-            for name, values in zip(scale_names, ordered[:, 8:12].T, strict=True)
-        }
-        endpoint_degree = _e2e_validation_endpoint_degrees(data)
-        fidelity = {
-            "active_logit_std": active_std,
-            "f_logit_std": f_std,
-            "f_logit_auprc": f_metrics.auprc,
-            "topology_delta_std": residual_std,
-            "topology_delta_ratio": residual_std / max(f_std, 1e-12),
-            "selection_tiebreak": 0.0,
-            "clustering_mmd": _validation_clustering_mmd(data, logits_np),
-            "prevalence": float(np.mean(data.val_labels)),
-            **dispersion_summary,
-            **e2e_degree_decorrelation_telemetry(endpoint_degree, full_np - f_np),
-        }
-    else:
-        fidelity = _fidelity_summary(
-            ordered[:, 1],
-            logits_np,
-            {"s1": ordered[:, 2], "s2": ordered[:, 3], "s2_aa": ordered[:, 4]},
-            topk_fraction=topk_fraction,
-        )
-        scale_telemetry = {}
+        for name, values in zip(scale_names, ordered[:, 8:12].T, strict=True)
+    }
+    endpoint_degree = _e2e_validation_endpoint_degrees(data)
+    fidelity = {
+        "active_logit_std": active_std,
+        "f_logit_std": f_std,
+        "f_logit_auprc": f_metrics.auprc,
+        "topology_delta_std": residual_std,
+        "topology_delta_ratio": residual_std / max(f_std, 1e-12),
+        "selection_tiebreak": 0.0,
+        "clustering_mmd": _validation_clustering_mmd(data, logits_np),
+        "prevalence": float(np.mean(data.val_labels)),
+        **dispersion_summary,
+        **e2e_degree_decorrelation_telemetry(endpoint_degree, full_np - f_np),
+    }
     return _ValidationResult(
         metrics=compute_edge_metrics(data.val_labels.astype(np.int64), probs),
         fidelity=fidelity,
@@ -4399,6 +3867,104 @@ def _e2e_precision_differential(
         model.train(was_training)
 
 
+def _enforce_e2e_initial_slot_health(
+    model: EgoStitchE2E,
+    data: EgoStitchData,
+    accelerator: Accelerator,
+    *,
+    edge_batch: int,
+    topk_fraction: float,
+    token_table: PackedFeatureTable | None,
+    token_node_index: Mapping[str, int] | None,
+    validation_event_callback: Callable[[str, int | None, int], None] | None = None,
+) -> dict[str, float]:
+    """Refuse to start a run that is already above the cosine trip line.
+
+    Spec Sec 13.19.1 landed a preprocessing change whose whole claim is that a
+    random model is born healthy. This is where that claim is *enforced*, at
+    step 0, before any GPU time is spent on a schedule that cannot survive it:
+    the retired ``--ddp-mode init-probe`` measured exactly this and then only
+    logged, which is how the 2026-07-27 run trained for fifteen minutes before
+    dying of a condition present at initialization.
+
+    Only the ``h_pairwise_cosine_mean`` half of `E2ESlotCollapseGuard` is
+    checkable here. That guard also needs two consecutive validations and
+    short-circuits on ``conditioning_active``, which is ``False`` throughout
+    Phase A (`e2e_phase_state(0, N)`), so it cannot be moved to step 0 and
+    stays a during-training guard.
+
+    Args:
+        model: The prepared, freshly initialized E2E model (unwrapped, per the
+            ``[P2]`` convention every other validation call in this module
+            follows).
+        data: The assembled training data.
+        accelerator: The live accelerator.
+        edge_batch: Validation pair batch size.
+        topk_fraction: The registered top-k fidelity fraction.
+        token_table: The raw-token store the validation batches need.
+        token_node_index: Its node index.
+        validation_event_callback: Records the completed step-0 validation before
+            any resulting guard failure is raised.
+
+    Returns:
+        The guard telemetry plus scale diagnostics on the main process (an
+        empty dict on the others).
+
+    Raises:
+        RuntimeError: When there are no validation pairs to measure, or the
+            initial ``h_pairwise_cosine_mean`` is above the Sec 14.4.8 trip
+            line. Raised on *every* rank -- `_validate_epoch` returns ``None``
+            off the main process, so a rank-0-only raise is a DDP hang.
+    """
+    if not data.val_pairs:
+        raise RuntimeError(
+            "step-0 slot guard has an empty population: this config gives "
+            "_validate_epoch no validation pairs, so neither this guard nor "
+            "the during-training slot-collapse guard would ever evaluate"
+        )
+    validation = _validate_epoch(
+        model,
+        data,
+        accelerator,
+        edge_batch=edge_batch,
+        topk_fraction=topk_fraction,
+        token_table=token_table,
+        token_node_index=token_node_index,
+    )
+    if validation_event_callback is not None:
+        validation_event_callback("step_0", None, 0)
+    report: dict[str, float] = {}
+    born_collapsed = 0
+    if accelerator.is_main_process:
+        assert validation is not None
+        report = {
+            "h_pairwise_cosine_mean": validation.fidelity["h_pairwise_cosine_mean"],
+            "plan_rank1_marginal_residual": validation.fidelity["plan_rank1_marginal_residual"],
+            "pi_slot_std": validation.fidelity["pi_slot_std"],
+            "adj_offdiag_std": validation.fidelity["adj_offdiag_std"],
+            **validation.scale_telemetry,
+        }
+        logger.info(
+            "e2e step-0 slot health rows=%d feature_stats_sha256=%s %s",
+            len(data.val_pairs),
+            model.feature_stats_digest_hex,
+            " ".join(f"{name}={value:.6g}" for name, value in sorted(report.items())),
+        )
+        if report["h_pairwise_cosine_mean"] > 0.95:
+            logger.error(
+                "step-0 slot health is above the Sec 14.4.8 cosine trip line "
+                "(%.6f > 0.95): the run is born collapsed",
+                report["h_pairwise_cosine_mean"],
+            )
+            born_collapsed = 1
+    failed = accelerator.reduce(
+        torch.tensor(born_collapsed, device=accelerator.device), reduction="sum"
+    )
+    if int(failed.item()) > 0:
+        raise RuntimeError("training_invalid(initial_slot_collapse)")
+    return report
+
+
 def _train_e2e_stability_loop(
     model: EgoStitchE2E,
     cfg: EgoConfig,
@@ -4443,37 +4009,77 @@ def _train_e2e_stability_loop(
         world_size=world,
     )
 
-    if run_kind == "overfit":
-        manifest = data.overfit_manifest
-        if manifest is None:
-            raise RuntimeError("overfit execution is missing the registered 510-row manifest")
-        overfit_manifest: OverfitManifest | None = manifest
-        production_epoch_step_counts = list(e2e_overfit_epoch_step_counts(cfg.optim.epochs))
-        epoch_step_counts = (
-            production_epoch_step_counts[:1] if profile_only else production_epoch_step_counts
-        )
-        rows_per_rank: list[int] = []
-        steps_per_epoch = 0
-        schedule_total_steps = sum(production_epoch_step_counts)
-    else:
-        overfit_manifest = None
-        rows_per_rank, steps_per_epoch = _epoch_step_plan(
-            len(data.e_sup_positives),
-            negative_ratio=cfg.data.negative_ratio,
-            edge_batch=cfg.data.edge_batch,
-            world_size=world,
-        )
-        production_epoch_step_counts = [steps_per_epoch] * cfg.optim.epochs
-        epoch_step_counts = (
-            production_epoch_step_counts[:1] if profile_only else production_epoch_step_counts
-        )
-        schedule_total_steps = steps_per_epoch * cfg.optim.epochs
+    validation_events_path = cfg.output_dir / V_HOLD_VALIDATION_EVENTS_FILENAME
+    if accelerator.is_main_process:
+        cfg.output_dir.mkdir(parents=True, exist_ok=True)
+        if validation_events_path.exists():
+            raise FileExistsError(
+                f"V_hold validation-event ledger already exists: {validation_events_path}"
+            )
+        validation_events_path.touch()
+    accelerator.wait_for_everyone()
+    validation_events: list[dict[str, object]] = []
+
+    def record_validation_event(kind: str, epoch: int | None, optimizer_step: int) -> None:
+        event: dict[str, object] = {
+            "ordinal": len(validation_events) + 1,
+            "kind": kind,
+            "epoch": epoch,
+            "optimizer_step": optimizer_step,
+            "run_kind": run_kind,
+            "arm": arm,
+            "validation_role": data.validation_role,
+        }
+        validation_events.append(event)
+        if accelerator.is_main_process:
+            with validation_events_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, sort_keys=True) + "\n")
+            metadata_path = cfg.output_dir / "run_metadata.json"
+            if metadata_path.is_file():
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                metadata["v_hold_validation_evidence"] = {
+                    "schema": "egostitch_e2e_v_hold_validation_events_v1",
+                    "count": len(validation_events),
+                    "path": V_HOLD_VALIDATION_EVENTS_FILENAME,
+                    "sha256": _sha256_file(validation_events_path),
+                }
+                metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+    # [C] Step-0 death guard: the run must not be *born* above the Sec 14.4.8
+    # cosine trip line. Placed here so the model is on `accelerator.device`
+    # (`accelerator.prepare` moves it in place) and the factory's token table
+    # exists, and run before the first optimizer step so a collapsed
+    # initialization costs one validation pass instead of a whole schedule.
+    #
+    # It is deliberately not gated on `profile_only`: a guard a flag can skip
+    # is a guard that fails open. The cost is one extra full validation pass
+    # over C(|V_hold|, 2) rows per run, charged before the peak-memory counter
+    # is reset below and therefore outside the measured training peak.
+    _enforce_e2e_initial_slot_health(
+        model,
+        data,
+        accelerator,
+        edge_batch=cfg.data.edge_batch,
+        topk_fraction=cfg.diagnostics.topk_fraction,
+        token_table=factory._token_table,
+        token_node_index=factory._token_node_index,
+        validation_event_callback=record_validation_event,
+    )
+
+    rows_per_rank, steps_per_epoch = _epoch_step_plan(
+        len(data.e_sup_positives),
+        negative_ratio=cfg.data.negative_ratio,
+        edge_batch=cfg.data.edge_batch,
+        world_size=world,
+    )
+    production_epoch_step_counts = [steps_per_epoch] * cfg.optim.epochs
+    epoch_step_counts = (
+        production_epoch_step_counts[:1] if profile_only else production_epoch_step_counts
+    )
+    schedule_total_steps = steps_per_epoch * cfg.optim.epochs
     executed_steps = sum(epoch_step_counts)
     phase_a_end, phase_b_end = e2e_phase_boundaries(schedule_total_steps)
-    first_eligible_epoch = e2e_first_eligible_epoch(
-        schedule_total_steps,
-        steps_per_epoch if run_kind != "overfit" else max(production_epoch_step_counts),
-    )
+    first_eligible_epoch = e2e_first_eligible_epoch(schedule_total_steps, steps_per_epoch)
 
     if use_cuda:
         torch.cuda.reset_peak_memory_stats(accelerator.device)
@@ -4489,7 +4095,6 @@ def _train_e2e_stability_loop(
     history: list[dict[str, object]] = []
     records: list[E2ECheckpointRecord] = []
     metrics_by_epoch: dict[int, EdgeMetrics] = {}
-    overfit_state: dict[str, torch.Tensor] = {}
     state_paths: dict[int, Path] = {}
     checkpoint_dir = cfg.output_dir / ".eligible_checkpoints"
     if accelerator.is_main_process:
@@ -4525,20 +4130,9 @@ def _train_e2e_stability_loop(
         epoch_global_pairs = 0
         epoch_parts: dict[str, float] = {}
         epoch_probes: list[dict[str, object]] = []
-        if run_kind == "overfit":
-            assert overfit_manifest is not None
-            batch_source = iter(
-                factory.fixed_row_batches(
-                    manifest=overfit_manifest,
-                    epoch=epoch,
-                    steps=epoch_steps,
-                    step_offset=global_step,
-                )
-            )
-        else:
-            batch_source = iter(
-                factory.epoch_batches(epoch, rows_per_rank=rows_per_rank, steps=epoch_steps)
-            )
+        batch_source = iter(
+            factory.epoch_batches(epoch, rows_per_rank=rows_per_rank, steps=epoch_steps)
+        )
         batches = _prefetch_batches(batch_source, depth=prefetch_depth)
         try:
             for _step_in_epoch in range(epoch_steps):
@@ -4559,7 +4153,7 @@ def _train_e2e_stability_loop(
                     batch,
                     cfg,
                     phase,
-                    epoch=1 if run_kind == "overfit" else epoch,
+                    epoch=epoch,
                     step=global_step,
                     total_steps=schedule_total_steps,
                     device=accelerator.device,
@@ -4673,6 +4267,7 @@ def _train_e2e_stability_loop(
                         token_table=factory._token_table,
                         token_node_index=factory._token_node_index,
                     )
+                    record_validation_event("phase_a_end", epoch, global_step)
                     warm_failure = 0
                     if accelerator.is_main_process:
                         assert warm is not None
@@ -4684,12 +4279,7 @@ def _train_e2e_stability_loop(
                     )
                     if int(failed.item()) > 0:
                         raise RuntimeError("invalid E2E warm-reference logit standard deviation")
-                if (
-                    not profile_only
-                    and global_step == phase_b_end
-                    and arm == "full"
-                    and run_kind != "overfit"
-                ):
+                if not profile_only and global_step == phase_b_end and arm == "full":
                     assert fixed_replay is not None
                     precision_failure = 0
                     if accelerator.is_main_process:
@@ -4728,6 +4318,7 @@ def _train_e2e_stability_loop(
             token_table=factory._token_table,
             token_node_index=factory._token_node_index,
         )
+        record_validation_event("epoch_end", epoch, global_step)
         validation_seconds = time.monotonic() - validation_started
         epoch_wall = time.monotonic() - epoch_started
         phase = e2e_phase_state(global_step - 1, schedule_total_steps)
@@ -4747,7 +4338,7 @@ def _train_e2e_stability_loop(
                 )
             ):
                 warm_reference_auprc = fidelity["f_logit_auprc"]
-            if warm_reference_std is not None and run_kind != "overfit":
+            if warm_reference_std is not None:
                 threshold = max(
                     training.collapse_fraction * warm_reference_std,
                     training.collapse_floor,
@@ -4802,12 +4393,14 @@ def _train_e2e_stability_loop(
             )
             records.append(record)
             metrics_by_epoch[epoch] = metrics
-            if not profile_only and run_kind != "overfit" and e2e_checkpoint_eligible(record, arm):
+            # Checkpoint *eligibility* is retained in both stages (design
+            # 2026-07-29 Sec 2.3): "guards only" governs the qualification
+            # verdict, never this rule, which is what prevents the documented
+            # 2026-07-19 v1 selection onto a reconstruction-only checkpoint.
+            if not profile_only and e2e_checkpoint_eligible(record, arm):
                 path = checkpoint_dir / f"epoch-{epoch:03d}.pt"
                 torch.save(_cpu_state_dict(accelerator, wrapped), path)
                 state_paths[epoch] = path
-            if not profile_only and run_kind == "overfit" and e2e_overfit_epoch_qualified(record):
-                overfit_state = _cpu_state_dict(accelerator, wrapped)
             history.append(
                 {
                     "epoch": float(epoch),
@@ -4862,12 +4455,6 @@ def _train_e2e_stability_loop(
             selected_epoch_local = len(epoch_step_counts)
             best_state = last_state
             best_metrics = last_metrics
-        elif run_kind == "overfit":
-            qualifying_epoch = select_e2e_overfit_epoch(records)
-            if qualifying_epoch > 0:
-                selected_epoch_local = qualifying_epoch
-                best_state = overfit_state
-                best_metrics = metrics_by_epoch[qualifying_epoch]
         else:
             selected = select_e2e_checkpoint(
                 records,
@@ -4892,7 +4479,7 @@ def _train_e2e_stability_loop(
             _write_failed_run_history(cfg.output_dir, run_kind=run_kind, arm=arm, history=history)
         raise RuntimeError("E2E run produced no eligible checkpoint; fallback is forbidden")
 
-    if not profile_only and arm == "full" and run_kind != "overfit":
+    if not profile_only and arm == "full":
         precision_failure = 0
         if accelerator.is_main_process:
             assert fixed_replay is not None
@@ -4993,6 +4580,8 @@ def _train_e2e_stability_loop(
     runtime_profile: dict[str, object] = {
         "epochs_completed": len(epoch_step_counts),
         "validations_completed": len(epoch_step_counts),
+        "v_hold_validation_event_count": len(validation_events),
+        "v_hold_validation_events": validation_events,
         "peak_memory_gib_per_rank": [float(row[4]) for row in rank_stats],
         "steady_state_data_wait_fraction": max(
             float(row[3] / row[2]) if row[2] > 0 else 0.0 for row in rank_stats
@@ -5036,9 +4625,6 @@ def _train_e2e_stability_loop(
         },
         "validation_role": data.validation_role,
         "access_audit": data.access_audit,
-        "overfit_manifest_sha256": (
-            data.overfit_manifest.sha256 if data.overfit_manifest is not None else None
-        ),
         "precision_differential": {
             "end_ramp": end_ramp_precision,
             "selected": selected_precision,
@@ -5096,424 +4682,52 @@ def train_egostitch_ddp_loop(
     node_batch: int,
     max_steps: int | None = None,
 ) -> EgoTrainResult:
-    """Run the fixed-epoch Stage-1 training loop (any world size >= 1).
+    """Dispatch the §13.19 E2E stability schedule (any world size >= 1).
 
     Emits the exact runtime-profile schema the orchestrator validates and the
     Task-4 checkpoint state via `EgoTrainResult`.
 
-    Family `egostitch_e2e` (design rev 3): `model` is an `EgoStitchE2E`
-    instead of a frozen-s0 `EgoStitchStage1`. The optimizer is built over
-    `_e2e_optimizer_parameters(model, composite)` (excludes the dead,
-    never-called `DecisionHead` while retaining the registered Kendall
-    log-variance weights); there is no ``set_density_ratio``/two-pass calibration
-    for this family (that mechanism belongs to `generator.decision`, itself
-    unused). Everything else -- Accelerate wiring, the warm-start/joint-
-    weight curriculum, the budget guard, and the Sec 13.17 gradient-probe
-    emission cadence -- is reused unchanged.
+    The legacy frozen-s0 loop this function used to carry was removed with the
+    rest of the `egostitch` family (design 2026-07-29 Sec 6.2); the only
+    executable path left is `_train_e2e_stability_loop`, which both the
+    qualification and the formal stage run.
 
     Args:
-        model: The Stage-1 (pass-1 density ratio applied here) or e2e model.
+        model: The e2e model.
         cfg: The validated worker config.
         data: The assembled data bundle.
         accelerator: The (DDP or single-process) accelerator.
         node_batch: Per-rank ``B_n`` (the orchestrator-selected candidate).
-        max_steps: DEBUG ONLY bounded optimizer-step limit.
+        max_steps: Bounded optimizer-step limit; forbidden for this family.
 
     Returns:
         The `EgoTrainResult`.
+
+    Raises:
+        RuntimeError: When the config carries no ``training`` section, or the
+            model is not an `EgoStitchE2E`.
+        ValueError: When ``max_steps`` is set.
     """
-    if cfg.training is not None:
-        if not isinstance(model, EgoStitchE2E):
-            raise RuntimeError("§13.19 training requires model.family='egostitch_e2e'")
-        if max_steps is not None:
-            raise ValueError("§13.19 execution forbids --max-steps")
-        return _train_e2e_stability_loop(
-            model,
-            cfg,
-            data,
-            accelerator,
-            node_batch=node_batch,
-        )
-    if isinstance(model, EgoStitchE2E):
+    if cfg.training is None:
         raise RuntimeError(
-            "legacy egostitch_e2e v1 training is archived on archive/egostitch-e2e-v1"
+            "legacy frozen-s0 egostitch training was removed; every executable "
+            "configuration must carry a training section"
         )
-    is_e2e = isinstance(model, EgoStitchE2E)
-    e2e_permanent_null = cfg.model.config.get("permanent_null", "none")
-    assert isinstance(e2e_permanent_null, str)
-    model_cfg = model.generator_cfg if isinstance(model, EgoStitchE2E) else model.config
-    if isinstance(model, EgoStitchStage1):
-        model.set_density_ratio(1.0)  # pass-1 scores are the Stage-1 scores (Sec 13.11)
-    world = accelerator.num_processes
-    rank = accelerator.process_index
-    use_cuda = accelerator.device.type == "cuda"
-
-    composite = _CompositeStep(model, world)
-    if isinstance(model, EgoStitchE2E):
-        optimizer_parameters: list[torch.nn.Parameter] = _e2e_optimizer_parameters(model, composite)
-    else:
-        optimizer_parameters = list(composite.parameters())
-    optimizer = torch.optim.AdamW(
-        optimizer_parameters, lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
-    )
-    warmup = max(cfg.optim.warmup_steps, 1)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda step: min(1.0, (step + 1) / warmup)
-    )
-    wrapped, optimizer, scheduler = accelerator.prepare(composite, optimizer, scheduler)
-
-    factory = _BatchFactory(
-        cfg, model_cfg, data, node_batch=node_batch, rank=rank, world_size=world
-    )
-    rows_per_rank, steps_per_epoch = _epoch_step_plan(
-        len(data.e_sup_positives),
-        negative_ratio=cfg.data.negative_ratio,
-        edge_batch=cfg.data.edge_batch,
-        world_size=world,
-    )
-    total_steps = steps_per_epoch * cfg.optim.epochs
-    warmstart_steps = int(cfg.optim.warmstart_fraction * total_steps)
-
-    if use_cuda:
-        torch.cuda.reset_peak_memory_stats(accelerator.device)
-
-    history: list[dict[str, object]] = []
-    per_epoch_profiles: list[dict[str, object]] = []
-    best_metrics: EdgeMetrics | None = None
-    best_state: dict[str, torch.Tensor] = {}
-    best_epoch = 0
-    best_fidelity_ratio = -math.inf
-    evals_since_improvement = 0
-    counterfactual_stop_epoch: int | None = None
-    last_metrics: EdgeMetrics | None = None
-    global_step = 0
-    fixed_gradient_probe: dict[str, object] | None = None
-    imbalance_monitor = _GradientImbalanceMonitor(
-        ratio=cfg.diagnostics.gradient_imbalance_ratio,
-        required_steps=cfg.diagnostics.gradient_imbalance_steps,
-        interval=cfg.diagnostics.gradient_probe_interval,
-    )
-    gradient_norm_series: list[dict[str, object]] = []
-    total_local_pairs = 0
-    total_local_tokens = 0
-    total_wall = 0.0
-    total_data_wait = 0.0
-    total_validation_seconds = 0.0
-    reached_max_steps = False
-    for epoch in range(1, cfg.optim.epochs + 1):
-        epoch_started = time.monotonic()
-        epoch_data_wait = 0.0
-        epoch_local_pairs = 0
-        epoch_local_tokens = 0
-        epoch_global_pairs = 0
-        epoch_steps = 0
-        batches = iter(
-            factory.epoch_batches(epoch, rows_per_rank=rows_per_rank, steps=steps_per_epoch)
+    if not isinstance(model, EgoStitchE2E):
+        raise RuntimeError("§13.19 training requires model.family='egostitch_e2e'")
+    if max_steps is not None:
+        raise ValueError("§13.19 execution forbids --max-steps")
+    if cfg.runtime is not None and node_batch != cfg.runtime.token_budget:
+        raise ValueError(
+            "effective node_batch must equal the model-config-bound "
+            f"runtime.token_budget ({node_batch} != {cfg.runtime.token_budget})"
         )
-        parts: dict[str, float] = {}
-        epoch_gradient_probes: list[dict[str, object]] = []
-        for step_in_epoch in range(steps_per_epoch):
-            fetch_started = time.monotonic()
-            batch = next(batches)
-            epoch_data_wait += time.monotonic() - fetch_started
-            joint_weight = 0.0 if global_step < warmstart_steps else 1.0
-            payload: dict[str, object] = {
-                "node": _to_device(batch.node, accelerator.device),
-                "edge": _to_device(batch.edge, accelerator.device),
-                "joint_weight": torch.tensor(joint_weight, device=accelerator.device),
-                "edge_rows_global": batch.edge_rows_global,
-            }
-            if is_e2e:
-                # `_CompositeStep.forward`'s e2e branch seeds per-step branch-
-                # dropout masks from this triple (`_seeded_generator(seed,
-                # epoch, step)`), the same convention `_BatchFactory` used
-                # internally to build this exact batch.
-                payload["seed"] = cfg.seed
-                payload["epoch"] = epoch
-                payload["step"] = step_in_epoch
-            if joint_weight > 0.0 and fixed_gradient_probe is None:
-                fixed_gradient_probe = cast(dict[str, object], _detached_clone(payload))
-                fixed_gradient_probe["collect_diagnostics"] = True
-            out = wrapped(payload)
-            loss = cast(torch.Tensor, out["loss"])
-            if not bool(torch.isfinite(loss).all()):
-                raise RuntimeError(f"non-finite training loss at epoch {epoch}")
-            optimizer.zero_grad()
-            accelerator.backward(loss)
-            if cfg.optim.grad_clip > 0:
-                accelerator.clip_grad_norm_(wrapped.parameters(), cfg.optim.grad_clip)
-            optimizer.step()
-            scheduler.step()
-
-            parts = cast(dict[str, float], out["parts"])
-            global_step += 1
-            if (
-                fixed_gradient_probe is not None
-                and global_step % cfg.diagnostics.gradient_probe_interval == 0
-            ):
-                sync_context = wrapped.no_sync() if hasattr(wrapped, "no_sync") else nullcontext()
-                with sync_context:
-                    probe_out = wrapped(fixed_gradient_probe)
-                    probe_model = accelerator.unwrap_model(wrapped).model
-                    local_submodule_rms = (
-                        _e2e_submodule_gradient_rms(
-                            probe_model,
-                            cast(dict[str, torch.Tensor], probe_out["families"])["edge"],
-                        )
-                        if isinstance(probe_model, EgoStitchE2E)
-                        else {}
-                    )
-                    local_norms = _family_gradient_norms(
-                        probe_model,
-                        cast(dict[str, torch.Tensor], probe_out["families"]),
-                    )
-                names = ("edge", "recon", "real", "ssl")
-                local_vector = torch.tensor(
-                    [local_norms[name] for name in names],
-                    device=accelerator.device,
-                    dtype=torch.float64,
-                )
-                gathered_norms = accelerator.gather(local_vector).reshape(-1, len(names))
-                aggregate = torch.sqrt(torch.mean(gathered_norms.square(), dim=0)).cpu().numpy()
-                norms = {
-                    name: float(value)
-                    for name, value in zip(names, aggregate.tolist(), strict=True)
-                }
-                submodule_rms: dict[str, float] = {}
-                if local_submodule_rms:
-                    rms_names = ("grad_rms_trunk", "grad_rms_ste", "grad_rms_content")
-                    local_rms_vector = torch.tensor(
-                        [local_submodule_rms[name] for name in rms_names],
-                        device=accelerator.device,
-                        dtype=torch.float64,
-                    )
-                    gathered_rms = accelerator.gather(local_rms_vector).reshape(-1, len(rms_names))
-                    aggregate_rms = (
-                        torch.sqrt(torch.mean(gathered_rms.square(), dim=0)).cpu().numpy()
-                    )
-                    submodule_rms = {
-                        name: float(value)
-                        for name, value in zip(rms_names, aggregate_rms.tolist(), strict=True)
-                    }
-                activated_now = imbalance_monitor.update(global_step, norms)
-                if activated_now:
-                    accelerator.unwrap_model(wrapped).activate_kendall()
-                probe_record: dict[str, object] = {
-                    "step": global_step,
-                    **{f"grad_norm_{name}": value for name, value in norms.items()},
-                    "imbalance_streak_steps": imbalance_monitor.streak_steps,
-                    "kendall_activated_now": activated_now,
-                    "kendall_active": imbalance_monitor.activated_step is not None,
-                    **submodule_rms,
-                }
-                # Family egostitch_e2e (spec Sec 13.17 re-registration): the
-                # gate-tanh readouts are pure parameter reads already computed
-                # by `_CompositeStep.forward`'s `collect_diagnostics` branch --
-                # no extra backward needed, just surface them on this row too.
-                for gate_key in ("gate_topo_tanh", "gate_cont_tanh"):
-                    if gate_key in probe_out:
-                        probe_record[gate_key] = probe_out[gate_key]
-                epoch_gradient_probes.append(probe_record)
-                gradient_norm_series.append(probe_record)
-            epoch_steps += 1
-            epoch_local_pairs += batch.edge_rows_true
-            epoch_local_tokens += batch.f0_rows_gathered
-            epoch_global_pairs += batch.edge_rows_global
-            if max_steps is not None and global_step >= max_steps:
-                reached_max_steps = True
-                logger.warning("--max-steps %d reached (debug); stopping training", max_steps)
-                break
-
-        val_started = time.monotonic()
-        validation = _validate_epoch(
-            model,
-            data,
-            accelerator,
-            edge_batch=cfg.data.edge_batch,
-            topk_fraction=cfg.diagnostics.topk_fraction,
-            token_table=factory._token_table,
-            token_node_index=factory._token_node_index,
-        )
-        validation_seconds = time.monotonic() - val_started
-        epoch_wall = time.monotonic() - epoch_started
-
-        if accelerator.is_main_process:
-            assert validation is not None
-            metrics = validation.metrics
-            fidelity = validation.fidelity
-            last_metrics = metrics
-            # Sec 13.8 checkpoint-selection tie-break: family egostitch_e2e
-            # (s0 retired) uses std(full - f_logit)/std(f_logit) in place of
-            # the historical residual/s0 ratio -- same direction (larger
-            # value wins), same tolerance/tie-break mechanics below.
-            fidelity_ratio = (
-                fidelity["topology_delta_ratio"]
-                if is_e2e and e2e_permanent_null == "none"
-                else fidelity["selection_tiebreak"]
-                if is_e2e
-                else fidelity["residual_s0_std_ratio"]
-            )
-            improved = best_metrics is None or metrics.auprc > (
-                best_metrics.auprc + cfg.diagnostics.selection_auprc_tolerance
-            )
-            if (
-                best_metrics is not None
-                and abs(metrics.auprc - best_metrics.auprc)
-                <= cfg.diagnostics.selection_auprc_tolerance
-                and fidelity_ratio > best_fidelity_ratio
-            ):
-                improved = True
-            if improved:
-                best_metrics = metrics
-                best_epoch = epoch
-                best_state = _cpu_state_dict(accelerator, wrapped)
-                best_fidelity_ratio = fidelity_ratio
-                evals_since_improvement = 0
-            else:
-                evals_since_improvement += 1
-                if (
-                    counterfactual_stop_epoch is None
-                    and evals_since_improvement >= cfg.eval.patience
-                ):
-                    counterfactual_stop_epoch = epoch
-            history.append(
-                {
-                    "epoch": float(epoch),
-                    "auroc": metrics.auroc,
-                    "auprc": metrics.auprc,
-                    "lr": float(optimizer.param_groups[0]["lr"]),
-                    "fidelity": fidelity,
-                    "gradient_norm_probes": epoch_gradient_probes,
-                    "kendall_active": imbalance_monitor.activated_step is not None,
-                    **{f"loss_{name}": value for name, value in parts.items()},
-                }
-            )
-
-        per_epoch_profiles.append(
-            {
-                "epoch": epoch,
-                "steps": max(epoch_steps, 1),
-                "global_pairs": max(epoch_global_pairs, 1),
-                "local_pairs": max(epoch_local_pairs, 1),
-                "local_tokens": max(epoch_local_tokens, 1),
-                "wall_seconds": epoch_wall,
-                "data_wait_seconds": epoch_data_wait,
-                "compute_seconds": max(epoch_wall - epoch_data_wait - validation_seconds, 0.0),
-                "validation_seconds": validation_seconds,
-            }
-        )
-        total_wall += epoch_wall
-        total_data_wait += epoch_data_wait
-        total_validation_seconds += validation_seconds
-        total_local_pairs += epoch_local_pairs
-        total_local_tokens += epoch_local_tokens
-        if reached_max_steps:
-            break
-
-    # ---- runtime profile (the exact orchestrator-validated schema)
-    local_peak_gib = (
-        torch.cuda.max_memory_allocated(accelerator.device) / (1024**3) if use_cuda else 0.0
-    )
-    stats = torch.tensor(
-        [
-            float(total_local_pairs),
-            float(total_local_tokens),
-            total_wall,
-            total_data_wait,
-            local_peak_gib,
-        ],
-        device=accelerator.device,
-        dtype=torch.float64,
-    )
-    gathered = accelerator.gather(stats.unsqueeze(0))
-    rank_stats = gathered.cpu().numpy()
-    per_rank = [
-        {
-            "rank": r,
-            "pairs": max(int(row[0]), 1),
-            "batches": max(int(global_step), 1),
-            "steps": max(int(global_step), 1),
-            "tokens": max(int(row[1]), 1),
-            "train_wall_seconds": float(row[2]),
-            "data_wait_seconds": float(row[3]),
-            "pairs_per_second": float(row[0] / row[2]) if row[2] > 0 else 0.0,
-            "tokens_per_second": float(row[1] / row[2]) if row[2] > 0 else 0.0,
-        }
-        for r, row in enumerate(rank_stats)
-    ]
-    data_wait_fraction = max((float(row[3] / row[2]) if row[2] > 0 else 0.0) for row in rank_stats)
-    global_pairs = int(sum(entry["global_pairs"] for entry in per_epoch_profiles))  # type: ignore[misc]
-    slowest_wall = max(float(row[2]) for row in rank_stats)
-    global_tokens = int(sum(float(row[1]) for row in rank_stats))
-    epochs_completed = len(per_epoch_profiles)
-    runtime_profile: dict[str, object] = {
-        "epochs_completed": epochs_completed,
-        "validations_completed": epochs_completed,
-        "peak_memory_gib_per_rank": [float(row[4]) for row in rank_stats],
-        "steady_state_data_wait_fraction": data_wait_fraction,
-        "training_coverage_exact": True,
-        "validation_coverage_exact": True,
-        "feature_cache_hit_rate": 1.0,
-        "counterfactual_stop_epoch": counterfactual_stop_epoch,
-        "per_rank": per_rank,
-        "global_pairs": global_pairs,
-        "global_pairs_per_second": global_pairs / slowest_wall if slowest_wall > 0 else 0.0,
-        "global_tokens": global_tokens,
-        "global_tokens_per_second": global_tokens / slowest_wall if slowest_wall > 0 else 0.0,
-        "validation_seconds": total_validation_seconds,
-        "per_epoch": per_epoch_profiles,
-        "gradient_norm_series": gradient_norm_series,
-        "kendall_fallback": {
-            "active": imbalance_monitor.activated_step is not None,
-            "activated_step": imbalance_monitor.activated_step,
-            "imbalance_streak_steps": imbalance_monitor.streak_steps,
-        },
-    }
-
-    if accelerator.is_main_process:
-        assert last_metrics is not None and best_metrics is not None
-        last_state = _cpu_state_dict(accelerator, wrapped)
-        if not best_state:
-            best_state = last_state
-    else:
-        placeholder = EdgeMetrics(
-            auroc=0.0,
-            auprc=0.0,
-            accuracy=0.0,
-            sensitivity=0.0,
-            specificity=0.0,
-            precision=0.0,
-            recall=0.0,
-            f1=0.0,
-            mcc=0.0,
-            ece=0.0,
-            brier=0.0,
-            threshold=0.5,
-            n_pos=0,
-            n_neg=0,
-        )
-        last_state = {}
-        best_metrics = placeholder
-        last_metrics = placeholder
-
-    return EgoTrainResult(
-        best_state_dict=best_state,
-        best_epoch=best_epoch,
-        best_val_metrics=best_metrics,
-        last_state_dict=last_state,
-        last_epoch=epochs_completed,
-        last_val_metrics=last_metrics,
-        history=history,
-        counterfactual_stop_epoch=counterfactual_stop_epoch,
-        runtime_profile=runtime_profile,
-        kendall_state={
-            "active": imbalance_monitor.activated_step is not None,
-            "activated_step": imbalance_monitor.activated_step,
-            "log_variances": {
-                name: float(value.detach().cpu())
-                for name, value in accelerator.unwrap_model(wrapped).kendall_log_vars.items()
-            },
-        },
+    return _train_e2e_stability_loop(
+        model,
+        cfg,
+        data,
+        accelerator,
+        node_batch=node_batch,
     )
 
 
@@ -5524,6 +4738,211 @@ def _config_hash(cfg: EgoConfig) -> str:
     return hashlib.sha256(
         json.dumps(config_to_dict(cfg), sort_keys=True).encode("utf-8")
     ).hexdigest()
+
+
+QUALIFICATION_FILENAME = "qualification.json"
+V_HOLD_VALIDATION_EVENTS_FILENAME = "v_hold_validation_events.jsonl"
+
+_MODEL_CONFIG_HASH_SCHEMA = "egostitch_e2e_model_config_v2"
+
+# Named Stage-1 failure verdicts, keyed by a substring of the fail-fast
+# exception each guard raises. Ordered: the first match wins, so the two
+# registered `training_invalid(...)` labels are listed before the generic
+# clip/gradient substrings that could also appear inside a longer message.
+_QUALIFICATION_VERDICT_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("training_invalid(initial_slot_collapse)", "training_invalid(initial_slot_collapse)"),
+    ("training_invalid(slot_collapse)", "training_invalid(slot_collapse)"),
+    ("no eligible checkpoint", "fail(no_eligible_checkpoint)"),
+    ("extreme clipping", "fail(extreme_clipping)"),
+    ("persistent clipping", "fail(persistent_clipping)"),
+    ("persistent E2E family-gradient imbalance", "fail(family_gradient_imbalance)"),
+    ("persistent E2E validation-logit collapse", "fail(validation_logit_collapse)"),
+    ("invalid E2E warm-reference logit standard deviation", "fail(warm_reference_std)"),
+    ("non-finite E2E loss", "fail(nonfinite_loss)"),
+    ("non-finite E2E parameter or optimizer state", "fail(nonfinite_optimizer_state)"),
+    ("non-finite gradient in", "fail(nonfinite_gradient)"),
+    ("zero gradient norm in", "fail(zero_gradient_norm)"),
+    ("precision differential failed", "fail(precision_differential)"),
+    ("E2E execution coverage broken", "fail(execution_coverage)"),
+    ("opened a held-out path", "fail(held_out_path)"),
+)
+
+
+def model_config_hash(cfg: EgoConfig) -> str:
+    """Hash the model-defining configuration, invariant across the two stages.
+
+    `_config_hash` cannot serve the formal stage's preflight: it hashes the
+    whole config, including ``output_dir``, ``data.root`` and
+    ``preregistration``, and the two stages necessarily differ in the first
+    (documented CLAUDE.md trap). This digest covers what defines the model and
+    what it is trained on, and deliberately excludes:
+
+    - ``output_dir`` / ``data.root`` / every other path, and ``preregistration``;
+    - ``optim.epochs`` -- the *only* value the two stages may differ in;
+    - ``model.config['feature_stats_sha256']`` -- reported alongside this
+      digest in `QUALIFICATION_FILENAME` rather than folded into it, so a
+      mismatch names which of the two things drifted;
+    - ``seed`` -- an execution parameter. The formal stage may sweep
+      ``--seeds`` while the qualification stage ran a single seed, and that is
+      not a model change.
+
+    Args:
+        cfg: The validated worker config.
+
+    Returns:
+        The 64-character hex digest.
+    """
+    model_config = {
+        key: value for key, value in cfg.model.config.items() if key != "feature_stats_sha256"
+    }
+    payload: dict[str, object] = {
+        "schema": _MODEL_CONFIG_HASH_SCHEMA,
+        "model": {"family": cfg.model.family, "config": model_config},
+        "data": {
+            "strategy": cfg.data.strategy,
+            "train_positives": cfg.data.train_positives,
+            "negative_ratio": cfg.data.negative_ratio,
+            "partition_seed": cfg.data.partition_seed,
+            "msg_fraction": cfg.data.msg_fraction,
+            "node_batch": cfg.data.node_batch,
+            "edge_batch": cfg.data.edge_batch,
+            "expected_missing_features": list(cfg.data.expected_missing_features),
+        },
+        "optim": {
+            "lr": cfg.optim.lr,
+            "weight_decay": cfg.optim.weight_decay,
+            "warmup_steps": cfg.optim.warmup_steps,
+            "grad_clip": cfg.optim.grad_clip,
+        },
+        "training": asdict(cfg.training) if cfg.training is not None else None,
+        "diagnostics": asdict(cfg.diagnostics),
+        "runtime": {
+            "token_budget": cfg.runtime.token_budget if cfg.runtime is not None else None,
+        },
+        "mixed_precision": cfg.mixed_precision,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def qualification_verdict(error: BaseException | None) -> str:
+    """Map one fail-fast training exception onto a named Stage-1 verdict.
+
+    The qualification verdict is guards-only (design 2026-07-29 Sec 2.3): a
+    completed run passes, and anything else must be *named* so the formal
+    stage's preflight and the run log agree on what happened. An exception no
+    registered guard raises still yields a named verdict rather than an
+    unreadable artifact.
+
+    Args:
+        error: The exception that ended the run, or ``None`` when it completed.
+
+    Returns:
+        ``"pass"``, or one of the registered ``fail(...)`` /
+        ``training_invalid(...)`` labels.
+    """
+    if error is None:
+        return "pass"
+    message = str(error)
+    for needle, verdict in _QUALIFICATION_VERDICT_PATTERNS:
+        if needle in message:
+            return verdict
+    return "fail(unclassified_guard)"
+
+
+def write_qualification_artifact(
+    cfg: EgoConfig,
+    *,
+    verdict: str,
+    feature_stats_sha256: str,
+    output_dir: Path | None = None,
+) -> Path:
+    """Write the Stage-1 verdict the formal stage's preflight reads.
+
+    Args:
+        cfg: The validated worker config.
+        verdict: ``"pass"`` or a named failure (`qualification_verdict`).
+        feature_stats_sha256: The digest bound by
+            `_bind_feature_standardization` for this run.
+        output_dir: Destination directory; defaults to ``cfg.output_dir``.
+
+    Returns:
+        The written path.
+
+    Raises:
+        ValueError: When ``verdict`` is neither ``"pass"`` nor a named failure.
+    """
+    if verdict != "pass" and not (
+        verdict.startswith(("fail(", "training_invalid(")) and verdict.endswith(")")
+    ):
+        raise ValueError(f"qualification verdict must be 'pass' or a named failure: {verdict!r}")
+    destination = cfg.output_dir if output_dir is None else output_dir
+    destination.mkdir(parents=True, exist_ok=True)
+    path = destination / QUALIFICATION_FILENAME
+    payload = {
+        "verdict": verdict,
+        "epochs": cfg.optim.epochs,
+        "hparams": {
+            "lr": cfg.optim.lr,
+            "weight_decay": cfg.optim.weight_decay,
+            "warmup_steps": cfg.optim.warmup_steps,
+            "grad_clip": cfg.optim.grad_clip,
+            "seed": cfg.seed,
+            "negative_ratio": cfg.data.negative_ratio,
+            "node_batch": cfg.data.node_batch,
+            "edge_batch": cfg.data.edge_batch,
+            "mixed_precision": cfg.mixed_precision,
+            "training": asdict(cfg.training) if cfg.training is not None else None,
+        },
+        "feature_stats_sha256": feature_stats_sha256,
+        "model_config_sha256": model_config_hash(cfg),
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    logger.info("wrote qualification verdict %s to %s", verdict, path)
+    return path
+
+
+def validate_qualification_artifact(
+    path: Path, cfg: EgoConfig, *, feature_stats_sha256: str
+) -> dict[str, object]:
+    """Apply the formal stage's three preflight assertions (design Sec 3).
+
+    The digest comparison is a genuine equality rather than a propagation:
+    both stages train on the identical ``V_fit`` and validate on the identical
+    ``V_hold``, so `feature_stats_sha256` and `model_config_hash` must match
+    exactly.
+
+    Args:
+        path: The Stage-1 ``qualification.json``.
+        cfg: The validated formal-stage config.
+        feature_stats_sha256: The digest bound for the formal run.
+
+    Returns:
+        The parsed artifact.
+
+    Raises:
+        RuntimeError: When the file is missing, malformed, does not carry
+            ``verdict == "pass"``, or either digest disagrees.
+    """
+    if not path.is_file():
+        raise RuntimeError(f"formal stage requires a qualification artifact: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"qualification artifact must be a JSON object: {path}")
+    verdict = payload.get("verdict")
+    if verdict != "pass":
+        raise RuntimeError(f"qualification verdict is not 'pass': {verdict!r}")
+    expected_model = model_config_hash(cfg)
+    if payload.get("model_config_sha256") != expected_model:
+        raise RuntimeError(
+            "qualification model_config_sha256 does not match this config: "
+            f"{payload.get('model_config_sha256')!r} != {expected_model!r}"
+        )
+    if payload.get("feature_stats_sha256") != feature_stats_sha256:
+        raise RuntimeError(
+            "qualification feature_stats_sha256 does not match this run: "
+            f"{payload.get('feature_stats_sha256')!r} != {feature_stats_sha256!r}"
+        )
+    return cast(dict[str, object], payload)
 
 
 # Per-group clip-coefficient p1 floors calibrated from the first completed
@@ -5539,7 +4958,12 @@ _E2E_QUALIFICATION_CLIP_P1_FLOORS: dict[str, float] = {
 def validate_e2e_qualification_profile(
     profile_path: Path, *, output_path: Path | None = None
 ) -> dict[str, object]:
-    """Validate the preregistered clip/family/RMS margins after rehearsal."""
+    """Validate the preregistered clip/family/RMS margins on a finished run.
+
+    Retained and re-homed onto the formal stage (design 2026-07-29 Sec 3): it
+    is the repository's only clip-coefficient / family-ratio / submodule-RMS
+    margin gate and nothing else replaces it.
+    """
     profile = json.loads(profile_path.read_text(encoding="utf-8"))
     if not isinstance(profile, dict):
         raise ValueError("qualification profile must be a JSON object")
@@ -5664,7 +5088,6 @@ def write_run_start_metadata(
         else _preregistration_snapshot(cfg.preregistration).sha256,
         "seed": cfg.seed,
         "world_size": world_size,
-        "s0_checkpoint_id": cfg.data.s0_checkpoint_id,
         "partition_seed": cfg.data.partition_seed,
         "strategy": cfg.data.strategy,
         "rho_train": data.rho_train,
@@ -5712,6 +5135,33 @@ def write_outputs(
     expected_run_kind = "debug" if debug else (cfg.run_kind or "formal")
     if run_metadata.get("run_kind") != expected_run_kind:
         raise RuntimeError("run kind changed after run start; refusing to finalize artifacts")
+    validation_events = result.runtime_profile.get("v_hold_validation_events")
+    validation_event_count = result.runtime_profile.get("v_hold_validation_event_count")
+    validation_evidence: dict[str, object] | None = None
+    if validation_events is not None or validation_event_count is not None:
+        if (
+            not isinstance(validation_events, list)
+            or isinstance(validation_event_count, bool)
+            or not isinstance(validation_event_count, int)
+            or validation_event_count != len(validation_events)
+        ):
+            raise RuntimeError("invalid V_hold validation-event count in runtime profile")
+        validation_events_path = output_dir / V_HOLD_VALIDATION_EVENTS_FILENAME
+        if not validation_events_path.is_file():
+            raise RuntimeError("V_hold validation-event ledger is missing")
+        persisted_events = [
+            json.loads(line)
+            for line in validation_events_path.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        if persisted_events != validation_events:
+            raise RuntimeError("V_hold validation-event ledger disagrees with runtime profile")
+        validation_evidence = {
+            "schema": "egostitch_e2e_v_hold_validation_events_v1",
+            "count": validation_event_count,
+            "path": V_HOLD_VALIDATION_EVENTS_FILENAME,
+            "sha256": _sha256_file(validation_events_path),
+        }
 
     def payload(
         state: dict[str, torch.Tensor], epoch: int, metrics: EdgeMetrics
@@ -5743,12 +5193,17 @@ def write_outputs(
             "status": "debug_complete" if debug else "complete",
             "formal_artifacts_published": not debug and expected_run_kind == "formal",
             "checkpoint_id": _state_digest(result.best_state_dict)[:16],
+            # Gated on `formal` explicitly, never on "not <removed kind>": the
+            # qualification stage runs the same selector and produces the same
+            # `selected_epoch`, so a negated whitelist would silently publish a
+            # qualification checkpoint as eligible the moment `overfit` was
+            # removed from the domain (design 2026-07-29 Sec 6.1).
             "checkpoint_eligible": (
-                expected_run_kind != "overfit"
+                expected_run_kind == "formal"
                 and result.runtime_profile.get("selected_epoch") is not None
             ),
             "selected_checkpoint_eligible": (
-                expected_run_kind != "overfit"
+                expected_run_kind == "formal"
                 and result.runtime_profile.get("selected_epoch") is not None
             ),
             "checkpoint_sha256": _sha256_file(best_path),
@@ -5765,6 +5220,7 @@ def write_outputs(
                 )
             ),
             "validation_role": data.validation_role,
+            "v_hold_validation_evidence": validation_evidence,
             "access_audit": data.access_audit,
             "kendall_fallback": result.kendall_state,
             "training_diagnostics": {
@@ -5788,295 +5244,46 @@ def write_outputs(
 # --------------------------------------------------------------------------- DDP worker modes
 
 
-def _probe_family_peak(
-    wrapped: torch.nn.Module,
-    replay_payload: dict[str, object],
+def _bind_feature_standardization(
     model: EgoStitchE2E,
-    groups: Mapping[str, Sequence[torch.nn.Parameter]],
-    accelerator: Accelerator,
-) -> None:
-    """Fold the diagnostic family probe into the measured candidate peak.
-
-    `_train_e2e_stability_loop` runs `_e2e_family_probe` every
-    `diagnostics.gradient_probe_interval` optimizer steps, and that probe -- up
-    to four *additional* full forward/backward passes over one batch -- is where
-    training actually peaks. The timed loop in `_run_probe_mode` only ever
-    executes plain steps, so a candidate admitted on its peak is admitted on a
-    number training never reaches: that is how a 67.1 GiB prediction passed an
-    85.0 GiB `memory_limit_gib` and then allocated 92.7 GiB mid-run. Running one
-    family probe here -- after the timing window has closed, so throughput is
-    unaffected -- is what makes `memory_limit_gib` bind on the real peak.
-
-    Phase C is deliberate: it is the only phase that activates all four families
-    at once (edge + recon + real + ssl), so it measures the worst case the
-    curriculum reaches rather than an average one.
-    """
-    phase = E2EPhaseState("C", 1.0, True, 1.0)
-    family_payload: dict[str, object] = {
-        # Production deep-clones `fixed_replay` for every probe rather than
-        # aliasing it (the replay batch has to stay immutable across 2,000
-        # steps), so the resident replay and this clone are two separate
-        # batches on the device. Aliasing here would under-measure by one.
-        **cast(dict[str, object], _detached_clone(replay_payload)),
-        "edge_active": True,
-        "real_ssl_scale": torch.tensor(1.0, device=accelerator.device),
-        # Step 0 of a 1-step schedule sits before the edge ramp, so every
-        # component keeps factor 1.0 -- the most active, highest-memory setting.
-        "recon_factors": e2e_recon_component_factors(0, 1),
-    }
-    try:
-        _e2e_family_probe(
-            wrapped,
-            family_payload,
-            groups,
-            phase,
-            _e2e_arm_name(model),
-            accelerator,
-            # This model is freshly initialized, and every
-            # `GatedCrossAttention.gate` starts at exactly zero
-            # (`conditioning.py`), so `tanh(gate) == 0` severs the
-            # edge -> generator path by construction and that group's edge norm
-            # is legitimately 0.0. The training-time probe never sees that
-            # state -- it first fires at `gradient_probe_interval`, long after
-            # the gate has moved -- so the liveness check would fail a candidate
-            # for a property of step 0. Allocation is identical either way, and
-            # allocation is the only thing this call measures.
-            require_live_gradients=False,
-        )
-    except RuntimeError as error:
-        if _is_oom_error(error):
-            _emit_probe_candidate_failure("oom", str(error))
-        raise
-
-
-def _run_probe_mode(
-    model: EgoStitchStage1 | EgoStitchE2E,
     cfg: EgoConfig,
     data: EgoStitchData,
-    accelerator: Accelerator,
     *,
-    node_batch: int,
-    profile_output: Path,
-) -> None:
-    """Warm-up + timed composite steps -> one rank-zero `ProbeResult` JSON."""
-    runtime = cfg.runtime
-    if runtime is None:
-        raise ValueError("probe mode requires a configured cfg.runtime")
-    is_e2e = isinstance(model, EgoStitchE2E)
-    if isinstance(model, EgoStitchStage1):
-        model.set_density_ratio(1.0)
-    model_cfg = model.generator_cfg if isinstance(model, EgoStitchE2E) else model.config
-    world = accelerator.num_processes
-    composite = _CompositeStep(model, world)
-    e2e_groups: dict[str, tuple[torch.nn.Parameter, ...]] | None = None
-    if isinstance(model, EgoStitchE2E):
-        # Must precede `accelerator.prepare`: this call is what freezes the dead
-        # `DecisionHead` parameters, and DDP builds its reducer from the
-        # `requires_grad` set it sees at wrap time.
-        e2e_groups = build_e2e_parameter_groups(model).groups
-        optimizer_parameters: list[torch.nn.Parameter] = _e2e_optimizer_parameters(model, composite)
-    else:
-        optimizer_parameters = list(composite.parameters())
-    optimizer = torch.optim.AdamW(
-        optimizer_parameters, lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
-    )
-    wrapped, optimizer = accelerator.prepare(composite, optimizer)
-    factory = _BatchFactory(
-        cfg,
-        model_cfg,
-        data,
-        node_batch=node_batch,
-        rank=accelerator.process_index,
-        world_size=world,
-    )
-    rows_per_rank, steps_per_epoch = _epoch_step_plan(
-        len(data.e_sup_positives),
-        negative_ratio=cfg.data.negative_ratio,
-        edge_batch=cfg.data.edge_batch,
-        world_size=world,
-    )
-
-    def batch_iterator() -> Iterator[_CompositeBatch]:
-        epoch = 1
-        while True:
-            yield from factory.epoch_batches(
-                epoch, rows_per_rank=rows_per_rank, steps=steps_per_epoch
-            )
-            epoch += 1
-
-    use_cuda = accelerator.device.type == "cuda"
-    wrapped.train()
-    if use_cuda:
-        torch.cuda.reset_peak_memory_stats(accelerator.device)
-
-    warmup, timed = runtime.probe_warmup_steps, runtime.probe_timed_steps
-    probe_steps = warmup + timed
-    probe_batches = iter(islice(batch_iterator(), probe_steps))
-    iterator = (
-        _prefetch_batches(probe_batches, depth=runtime.prefetch_factor) if is_e2e else probe_batches
-    )
-    timed_global_pairs = 0
-    timed_start: float | None = None
-    failure: str | None = None
-    local_elapsed = 0.0
-    replay_payload: dict[str, object] | None = None
-    try:
-        for step in range(probe_steps):
-            if step == warmup:
-                accelerator.wait_for_everyone()
-                if use_cuda:
-                    torch.cuda.synchronize(accelerator.device)
-                timed_start = time.monotonic()
-            batch = next(iterator)
-            payload: dict[str, object] = {
-                "node": _to_device(batch.node, accelerator.device),
-                "edge": _to_device(batch.edge, accelerator.device),
-                "joint_weight": torch.tensor(1.0, device=accelerator.device),
-                "edge_rows_global": batch.edge_rows_global,
-                "collect_diagnostics": step == 0,
-            }
-            if is_e2e:
-                # Mirrors `batch_iterator`'s own epoch/step-within-epoch cycling
-                # (`factory.epoch_batches(epoch, ...)` yields exactly
-                # `steps_per_epoch` batches per epoch), so this matches the
-                # seeding `_BatchFactory` used internally for this same batch.
-                payload["seed"] = cfg.seed
-                payload["epoch"] = step // steps_per_epoch + 1
-                payload["step"] = step % steps_per_epoch
-                if cfg.training is not None:
-                    payload["edge_active"] = True
-                    payload["real_ssl_scale"] = torch.tensor(1.0, device=accelerator.device)
-                if replay_payload is None:
-                    # Mirror production residency and batch identity.
-                    # `_train_e2e_stability_loop` clones the *first* payload into
-                    # `fixed_replay` and keeps it on the device for the whole
-                    # run, so every ordinary step holds two full batches, not
-                    # one. Capture it once: e2e edge tensors pad to each batch's
-                    # own maximum endpoint length, so the last probe batch is not
-                    # the batch production actually replays.
-                    replay_payload = cast(dict[str, object], _detached_clone(payload))
-            loss: torch.Tensor | None = None
-            local_failure: tuple[str, str] | None = None
-            s1_abs_mean: float | None = None
-            try:
-                probe_out = wrapped(payload)
-                loss = cast(torch.Tensor, probe_out["loss"])
-                if not bool(torch.isfinite(loss).all()):
-                    local_failure = ("nonfinite", "non-finite probe loss")
-                # Family egostitch_e2e has no s1/s2 channels (spec Sec 13.17
-                # re-registration retires this frozen-s0-specific guard for that
-                # family; its liveness telemetry is `_e2e_gate_tanh`/
-                # `topology_delta_std`, checked per-epoch in `_validate_epoch`
-                # instead of at probe time).
-                if step == 0 and not is_e2e:
-                    channel_stats = cast(dict[str, float], probe_out["channel_stats"])
-                    s1_abs_mean = abs(channel_stats["s1_mean"])
-            except RuntimeError as error:
-                if not _is_oom_error(error):
-                    raise
-                local_failure = ("oom", str(error))
-            failed_ranks = accelerator.reduce(
-                torch.tensor(
-                    1 if local_failure is not None else 0,
-                    device=accelerator.device,
-                    dtype=torch.int64,
-                ),
-                reduction="sum",
-            )
-            if int(failed_ranks.item()) > 0:
-                if use_cuda and local_failure is not None:
-                    torch.cuda.empty_cache()
-                kind, message = local_failure or (
-                    "oom",
-                    "probe candidate failed on another rank",
-                )
-                _emit_probe_candidate_failure(kind, message)
-                raise RuntimeError(message)
-            if step == 0 and not is_e2e:
-                assert s1_abs_mean is not None
-                global_s1_abs_mean = float(
-                    accelerator.gather(
-                        torch.tensor([s1_abs_mean], device=accelerator.device, dtype=torch.float64)
-                    )
-                    .max()
-                    .item()
-                )
-                _enforce_probe_s1_scale(global_s1_abs_mean, cfg.diagnostics.probe_s1_abs_mean_max)
-            if loss is None:  # pragma: no cover - collective failure raises above
-                raise RuntimeError("probe forward produced no loss")
-            optimizer.zero_grad()
-            # DDP collectives may be in flight past this point: exceptions must
-            # escape immediately (deferring them can deadlock the other ranks).
-            try:
-                accelerator.backward(loss)
-                if cfg.optim.grad_clip > 0:
-                    accelerator.clip_grad_norm_(wrapped.parameters(), cfg.optim.grad_clip)
-                optimizer.step()
-            except RuntimeError as error:
-                if _is_oom_error(error):
-                    _emit_probe_candidate_failure("oom", str(error))
-                raise
-            if step >= warmup:
-                timed_global_pairs += batch.edge_rows_global
-        if use_cuda:
-            torch.cuda.synchronize(accelerator.device)
-        local_elapsed = time.monotonic() - timed_start if timed_start is not None else 0.0
-    finally:
-        if is_e2e:
-            cast(Generator[_CompositeBatch, None, None], iterator).close()
-    elapsed = float(
-        accelerator.gather(
-            torch.tensor([local_elapsed], device=accelerator.device, dtype=torch.float64)
-        )
-        .max()
-        .item()
-    )
-    if e2e_groups is not None and replay_payload is not None and failure is None:
-        # The training loop drops the step's own payload before its family probe,
-        # so production holds the replay plus one clone of it -- not a third
-        # batch. Release the last timed batch to measure that same residency.
-        del payload
-        _probe_family_peak(
-            wrapped, replay_payload, cast(EgoStitchE2E, model), e2e_groups, accelerator
-        )
-    local_peak_gib = (
-        torch.cuda.max_memory_allocated(accelerator.device) / (1024**3) if use_cuda else 0.0
-    )
-    peak = float(
-        accelerator.gather(
-            torch.tensor([local_peak_gib], device=accelerator.device, dtype=torch.float32)
-        )
-        .max()
-        .item()
-    )
-    throughput = timed_global_pairs / elapsed if elapsed > 0 and failure is None else 0.0
-    probe = ProbeResult(
-        token_budget=node_batch,
-        valid=failure is None,
-        global_pairs_per_second=throughput,
-        peak_memory_gib=peak,
-        failure=failure,
-    )
-    _write_json_rank_zero(accelerator, profile_output, probe.to_dict())
-    logger.info("probe complete: %s", probe.to_dict())
-
-
-def _bind_feature_standardization(
-    model: EgoStitchE2E, cfg: EgoConfig, data: EgoStitchData, *, ddp_mode: str | None = None
+    qualification_artifact: Path | None = None,
+    ddp_mode: str | None = None,
 ) -> str:
     """Pin the registered F0 statistics on the model before the first step.
+
+    This is the single enforcement point for the two-stage digest contract
+    (design 2026-07-29 Sec 3), so that neither stage can fail open by way of a
+    forgotten call site:
+
+    - **qualification** *computes* the digest. It is not a config input --
+      the six v3 configs no longer carry `feature_stats_sha256` -- and it is
+      recorded in ``qualification.json`` by the caller.
+    - **probe/epoch-probe** expose that same computed digest through a
+      non-publishing measurement dispatch. They require no prior qualification
+      artifact because the digest is the value they exist to measure.
+    - **formal** *compares* the digest it computed against the recorded one,
+      via `validate_qualification_artifact`, which is a genuine equality:
+      both stages train on the identical ``V_fit``, so the two digests are
+      necessarily equal unless something drifted. The artifact is a required
+      input; a formal run without one refuses to train.
+    - **debug** is exempt: it publishes no artifact and is read as evidence by
+      nothing.
+
+    A config that still pins `feature_stats_sha256` is honoured in every kind
+    -- a disagreement with the assembled statistics is always a refusal.
 
     Args:
         model: The freshly constructed E2E model.
         cfg: The loaded run configuration.
         data: The assembled training data, carrying the V_fit statistics.
-        ddp_mode: The dispatch mode this call is being made for (``None`` when
-            called outside `_run_ddp_worker`, e.g. directly in tests). A
-            value in `_PROBE_DISPATCH_MODES` (``"probe"``, ``"epoch-probe"``,
-            ``"init-probe"``) exempts the rehearsal/formal pin requirement
-            below -- those modes build no checkpoint and publish no artifact,
-            and `init-probe` is the one documented way to *measure*
-            `feature_stats_sha256` before it exists anywhere to pin.
+        qualification_artifact: The qualification stage's ``qualification.json``
+            for this arm. Required by the formal stage, ignored by every other
+            kind (which has nothing to compare against yet).
+        ddp_mode: Worker dispatch mode. The two measurement-only probe modes
+            are exempt from the formal-stage artifact comparison.
 
     Returns:
         The bound `feature_stats_sha256`, or ``""`` for the replay-only
@@ -6089,12 +5296,12 @@ def _bind_feature_standardization(
             that disagrees with the assembled statistics' digest.
         RuntimeError: When the effective run kind (`cfg.run_kind or
             "formal"`, the same normalization the rest of this worker uses)
-            is `"rehearsal"` or `"formal"`, `ddp_mode` is not a preflight
-            dispatch mode, and no `feature_stats_sha256` was pinned
-            beforehand -- those run kinds consume a scarce attempt or publish
-            an artifact, so an unpinned digest would mean the recorded
-            registration does not identify the preprocessing the model
-            actually used.
+            is `"formal"` and no qualification artifact was supplied -- a formal run publishes the
+            registered results, so the preprocessing it used must be pinned to
+            something recorded rather than merely recomputed.
+        RuntimeError: When the supplied qualification artifact is missing,
+            malformed, does not carry ``verdict == "pass"``, or disagrees on
+            either digest (`validate_qualification_artifact`).
     """
     mode = str(cfg.model.config.get("feature_standardization", "zscore_vfit_v1"))
     if mode != "zscore_vfit_v1":
@@ -6111,116 +5318,69 @@ def _bind_feature_standardization(
             "feature_stats_sha256 mismatch: config pins "
             f"{pinned}, assembled statistics are {stats.digest}"
         )
-    # [P1-B, re-reviewed] An unset `cfg.run_kind` is not calibration -- the
+    # [P1-B, re-reviewed] An unset `cfg.run_kind` is not an exemption -- the
     # CLI documents `--run-kind` as "defaults to formal", and every other use
     # of `cfg.run_kind` in this worker normalizes it the same way
     # (`cfg.run_kind or "formal"`: binding validation, data-role selection,
     # training, artifact metadata). The plain default invocation must not be
-    # able to bypass this pin by simply never setting `--run-kind`. Only
-    # genuine calibration (`"overfit"`) stays exempt by run kind; the
-    # `ddp_mode` preflight exemption below is separate and narrower.
+    # able to bypass the formal contract by simply never setting `--run-kind`.
+    #
+    # Written as an exhaustive match over the run-kind domain, never as a
+    # whitelist of the kinds that exist today: the pre-cleanup form listed
+    # `("rehearsal", "formal")` and would have left the new `qualification`
+    # kind silently unguarded (design 2026-07-29 Sec 6.1). An unrecognized
+    # kind therefore lands on the formal branch, which is the strict one.
+    #
+    # The exempt side is the closed list, so the strict side is the default:
+    # the qualification stage is where the digest is *born* (it computes the
+    # statistics over V_fit and its caller records `stats.digest` in
+    # `QUALIFICATION_FILENAME`), and demanding it as a config input there is
+    # exactly the circularity the two-stage design removed.
     effective_run_kind = cfg.run_kind or "formal"
-    if (
-        not pinned
-        and ddp_mode not in _PROBE_DISPATCH_MODES
-        and effective_run_kind in ("rehearsal", "formal")
-    ):
-        raise RuntimeError(
-            f"feature_stats_sha256 is unpinned for run_kind={effective_run_kind}: "
-            "rehearsal and formal runs must pin the digest measured during "
-            "calibration before launching"
+    qualification_payload: dict[str, object] | None = None
+    compares_recorded_digest = (
+        ddp_mode not in _PROBE_DISPATCH_MODES
+        and effective_run_kind not in ("qualification", "debug")
+    )
+    if compares_recorded_digest:
+        if qualification_artifact is None:
+            raise RuntimeError(
+                f"feature_stats_sha256 is unpinned for run_kind={effective_run_kind}: "
+                "the formal stage must compare its digest against the qualification "
+                "stage's recorded one; pass --qualification-artifact"
+            )
+        qualification_payload = validate_qualification_artifact(
+            qualification_artifact, cfg, feature_stats_sha256=stats.digest
         )
     model.set_feature_stats(stats)
     logger.info(
-        "registered feature standardization mode=%s rows=%d feature_stats_sha256=%s pinned=%s",
+        "registered feature standardization mode=%s rows=%d feature_stats_sha256=%s "
+        "run_kind=%s config_pinned=%s qualification_verified=%s",
         mode,
         stats.n_rows,
         stats.digest,
+        effective_run_kind,
         "yes" if pinned else "no",
+        "yes" if qualification_payload is not None else "no",
     )
     return stats.digest
-
-
-def _run_init_probe(
-    model: EgoStitchE2E,
-    cfg: EgoConfig,
-    data: EgoStitchData,
-    accelerator: Accelerator,
-    *,
-    edge_batch: int,
-    topk_fraction: float,
-) -> dict[str, float]:
-    """Measure the collapse guard's own population at initialization.
-
-    Read-only: no optimizer step, no checkpoint, no artifact. Spec Sec 13.19.1
-    landed a preprocessing change whose whole claim is that a random model is
-    born healthy; this is where that claim is checked before GPU time is spent.
-
-    Args:
-        model: The bound, freshly initialized E2E model.
-        cfg: The loaded run configuration.
-        data: The assembled training data.
-        accelerator: The live accelerator.
-        edge_batch: Validation pair batch size.
-        topk_fraction: The registered top-k fidelity fraction.
-
-    Returns:
-        The guard telemetry plus the scale diagnostics, on the main process
-        (an empty dict on other ranks).
-
-    Raises:
-        RuntimeError: When there are no validation pairs to measure.
-        ValueError: When ``cfg.data.pack_dir`` is unset (required to build the
-            raw-token store this family's validation batches need).
-    """
-    if not data.val_pairs:
-        raise RuntimeError(
-            "init probe has an empty guard population: this config gives "
-            "_validate_epoch no validation pairs, so the slot-collapse guard "
-            "would never evaluate"
-        )
-    if cfg.data.pack_dir is None:
-        raise ValueError("data.pack_dir is required when model.family == 'egostitch_e2e'")
-    token_table = PackedFeatureTable.from_pack(cfg.data.pack_dir, torch.device("cpu"))
-    token_node_index = token_table.manifest.node_index()
-    validation = _validate_epoch(
-        model,
-        data,
-        accelerator,
-        edge_batch=edge_batch,
-        topk_fraction=topk_fraction,
-        token_table=token_table,
-        token_node_index=token_node_index,
-    )
-    if validation is None:
-        return {}
-    report = {
-        "h_pairwise_cosine_mean": validation.fidelity["h_pairwise_cosine_mean"],
-        "plan_rank1_marginal_residual": validation.fidelity["plan_rank1_marginal_residual"],
-        "pi_slot_std": validation.fidelity["pi_slot_std"],
-        "adj_offdiag_std": validation.fidelity["adj_offdiag_std"],
-        **validation.scale_telemetry,
-    }
-    logger.info(
-        "e2e init probe rows=%d feature_stats_sha256=%s %s",
-        len(data.val_pairs),
-        model.feature_stats_digest_hex,
-        " ".join(f"{name}={value:.6g}" for name, value in sorted(report.items())),
-    )
-    if report["h_pairwise_cosine_mean"] > 0.95:
-        logger.error(
-            "init probe reads above the Sec 14.4.8 cosine trip line (%.6f > 0.95): "
-            "the run would be born collapsed",
-            report["h_pairwise_cosine_mean"],
-        )
-    return report
 
 
 def _run_ddp_worker(
     cfg: EgoConfig, args: EgoCliArgs, *, registered_config_hash: str | None = None
 ) -> None:
     """Dispatch an ``accelerate launch`` worker to the requested DDP mode."""
-    cfg, _is_debug, preregistration = prepare_ddp_run_config(cfg, max_steps=args.max_steps)
+    measurement_only = args.ddp_mode in _PROBE_DISPATCH_MODES
+    if measurement_only:
+        if args.max_steps is not None:
+            raise ValueError("measurement-only probe modes do not accept --max-steps")
+        if not cfg.preregistration.is_file():
+            raise ValueError(f"preregistration file not found: {cfg.preregistration}")
+        preregistration = _preregistration_snapshot(cfg.preregistration)
+    else:
+        cfg, _is_debug, preregistration = prepare_ddp_run_config(
+            cfg, max_steps=args.max_steps
+        )
     if args.pack_dir is None or args.token_budget_per_rank is None or args.profile_output is None:
         raise ValueError(
             "DDP worker modes require --pack-dir, --token-budget-per-rank, and --profile-output"
@@ -6228,12 +5388,16 @@ def _run_ddp_worker(
     if not cfg.preregistration.is_file():
         raise ValueError(f"preregistration file not found: {cfg.preregistration}")
     formal_binding: dict[str, str] | None = None
-    if cfg.training is not None and (cfg.run_kind or "formal") == "formal":
+    if (
+        not measurement_only
+        and cfg.training is not None
+        and (cfg.run_kind or "formal") == "formal"
+    ):
         formal_binding = _validate_e2e_formal_binding(cfg, preregistration, args.config)
 
     accelerator = build_egostitch_ddp_accelerator(
         cfg.mixed_precision,
-        find_unused_parameters=cfg.model.family != "egostitch_e2e",
+        find_unused_parameters=False,
     )
     set_seed(cfg.seed)
     logger.info(
@@ -6243,87 +5407,113 @@ def _run_ddp_worker(
         accelerator.num_processes,
         accelerator.device,
     )
-    data = assemble_egostitch_data(cfg, pack_dir=args.pack_dir)
-    model: EgoStitchStage1 | EgoStitchE2E
-    if cfg.model.family == _EGOSTITCH_E2E_FAMILY:
-        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
-    else:
-        model = EgoStitchStage1(EgoStitchConfig.from_mapping(cfg.model.config))
+    run_kind = "debug" if args.max_steps is not None else (cfg.run_kind or "formal")
     feature_stats_sha256 = ""
-    if isinstance(model, EgoStitchE2E):
-        feature_stats_sha256 = _bind_feature_standardization(
-            model, cfg, data, ddp_mode=args.ddp_mode
-        )
-    degree_prior = e2e_degree_prior_init(model, data)
-    logger.info("degree head centered on G_struct prior mean(log d)=%.6f", degree_prior)
-    node_batch = args.token_budget_per_rank
 
-    if args.ddp_mode == "probe":
-        _run_probe_mode(
+    def record_qualification_failure(error: BaseException) -> None:
+        """Name a qualification failure in `QUALIFICATION_FILENAME`, never mask it.
+
+        Acceptance item 1 (design 2026-07-29 Sec 8): a qualification run must
+        end in ``pass`` or a *named* failure, never in a bare traceback the
+        formal stage's preflight cannot read. Every fail-fast guard raises on
+        all ranks, so the main process is guaranteed to reach this writer.
+        Caught broadly on purpose -- `qualification_verdict` names an
+        unrecognized failure rather than letting one escape unrecorded.
+
+        `feature_stats_sha256` is read at call time and is ``""`` when the
+        run died before binding (e.g. on the held-out path guard, whose
+        `fail(held_out_path)` verdict is a registered one): a failure record
+        with no digest is still a readable verdict, and
+        `validate_qualification_artifact` refuses it on ``verdict`` first.
+        """
+        if (
+            measurement_only
+            or run_kind != "qualification"
+            or not accelerator.is_main_process
+        ):
+            return
+        try:
+            write_qualification_artifact(
+                cfg,
+                verdict=qualification_verdict(error),
+                feature_stats_sha256=feature_stats_sha256,
+            )
+        except (OSError, TypeError, ValueError) as write_error:
+            # Recording the verdict must never mask the primary failure.
+            logger.error("failed to write the qualification verdict: %s", write_error)
+
+    # The verdict writer wraps the *whole* run, not just the training loop:
+    # `assemble_egostitch_data` (held-out path guard) and
+    # `_bind_feature_standardization` (digest contract) both raise before the
+    # first step, and both map onto registered verdicts. Wrapping only the
+    # loop left those failures with no `QUALIFICATION_FILENAME` at all.
+    try:
+        data = assemble_egostitch_data(cfg, pack_dir=args.pack_dir)
+        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+        feature_stats_sha256 = _bind_feature_standardization(
             model,
             cfg,
             data,
-            accelerator,
-            node_batch=node_batch,
+            qualification_artifact=args.qualification_artifact,
+            ddp_mode=args.ddp_mode,
+        )
+        _run_ddp_dispatch(
+            cfg,
+            args,
+            model,
+            data,
+            accelerator=accelerator,
+            preregistration=preregistration,
+            registered_config_hash=registered_config_hash,
+            formal_binding=formal_binding,
+            run_kind=run_kind,
+            feature_stats_sha256=feature_stats_sha256,
+            node_batch=args.token_budget_per_rank,
             profile_output=args.profile_output,
         )
-        return
+    except Exception as error:
+        record_qualification_failure(error)
+        raise
 
-    if args.ddp_mode == "epoch-probe":
-        result, elapsed = _run_timed_epoch_probe(
-            accelerator,
-            lambda: (
-                _train_e2e_stability_loop(
-                    model,
-                    cfg,
-                    data,
-                    accelerator,
-                    node_batch=node_batch,
-                    profile_only=True,
-                )
-                if isinstance(model, EgoStitchE2E) and cfg.training is not None
-                else train_egostitch_ddp_loop(
-                    model,
-                    replace(cfg, optim=replace(cfg.optim, epochs=1)),
-                    data,
-                    accelerator,
-                    node_batch=node_batch,
-                    max_steps=args.max_steps,
-                )
-            ),
-        )
+
+def _run_ddp_dispatch(
+    cfg: EgoConfig,
+    args: EgoCliArgs,
+    model: EgoStitchE2E,
+    data: EgoStitchData,
+    *,
+    accelerator: Accelerator,
+    preregistration: PreregistrationSnapshot,
+    registered_config_hash: str | None,
+    formal_binding: dict[str, str] | None,
+    run_kind: str,
+    feature_stats_sha256: str,
+    node_batch: int,
+    profile_output: Path,
+) -> None:
+    """Run one dispatch mode on an assembled, bound model (see `_run_ddp_worker`)."""
+    if args.ddp_mode in _PROBE_DISPATCH_MODES:
+        accelerator.wait_for_everyone()
         _write_json_rank_zero(
             accelerator,
-            args.profile_output,
-            {"epoch_seconds": elapsed, "runtime_profile": result.runtime_profile},
+            profile_output,
+            {
+                "mode": args.ddp_mode,
+                "feature_stats_sha256": feature_stats_sha256,
+                "feature_stats_rows": data.feature_stats.n_rows if data.feature_stats else 0,
+            },
         )
-        logger.info("epoch-probe complete: %.2fs", elapsed)
+        logger.info(
+            "egostitch %s measurement complete: feature_stats_sha256=%s",
+            args.ddp_mode,
+            feature_stats_sha256,
+        )
         return
+    if args.ddp_mode != "train":
+        raise ValueError(f"unsupported DDP mode: {args.ddp_mode!r}")
 
-    if args.ddp_mode == "init-probe":
-        if not isinstance(model, EgoStitchE2E):
-            raise ValueError("--ddp-mode init-probe requires model.family == 'egostitch_e2e'")
-        # [P2] Every other branch (`probe`, `epoch-probe`, training) reaches
-        # `accelerator.prepare` before its first forward pass, which is what
-        # actually moves the model's parameters/buffers onto
-        # `accelerator.device` -- `_validate_epoch` (which `_run_init_probe`
-        # calls) always operates on the raw, unwrapped `model`, matching how
-        # those branches keep using `model` (not the prepared/wrapped return
-        # value) for validation. Unlike them, this probe never builds an
-        # optimizer or trains, so there is nothing to wrap in `_CompositeStep`
-        # here; `accelerator.prepare` is called on the bare model and its
-        # return value is discarded, since `.prepare` mutates and moves the
-        # underlying module in place.
-        accelerator.prepare(model)
-        _run_init_probe(
-            model,
-            cfg,
-            data,
-            accelerator,
-            edge_batch=cfg.data.edge_batch,
-            topk_fraction=cfg.diagnostics.topk_fraction,
-        )
-        return
+    degree_prior = e2e_degree_prior_init(model, data)
+    logger.info("degree head centered on G_struct prior mean(log d)=%.6f", degree_prior)
 
     if accelerator.is_main_process:
         write_run_start_metadata(
@@ -6338,12 +5528,21 @@ def _run_ddp_worker(
             feature_stats_sha256=feature_stats_sha256,
         )
     accelerator.wait_for_everyone()
+    # The failure half of this contract lives in `_run_ddp_worker`, which wraps
+    # this call together with data assembly and digest binding -- guards that
+    # also raise before the first step and also map onto registered verdicts.
     result = train_egostitch_ddp_loop(
         model, cfg, data, accelerator, node_batch=node_batch, max_steps=args.max_steps
     )
     if accelerator.is_main_process:
         write_outputs(result, cfg, data, debug=args.max_steps is not None)
-    _write_json_rank_zero(accelerator, args.profile_output, result.runtime_profile)
+        if run_kind == "qualification":
+            write_qualification_artifact(
+                cfg,
+                verdict="pass",
+                feature_stats_sha256=feature_stats_sha256,
+            )
+    _write_json_rank_zero(accelerator, profile_output, result.runtime_profile)
     logger.info(
         "egostitch ddp train complete: best epoch %d val AUPRC %.4f (counterfactual_stop_epoch=%s)",
         result.best_epoch,
@@ -6365,19 +5564,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     loaded_cfg = load_config(args.config)
     cfg = apply_overrides(loaded_cfg, args)
-
-    if args.write_s0_manifest is not None:
-        world = detect_visible_gpu_count()
-        data = assemble_egostitch_data(cfg, require_s0=False)
-        build_s0_manifest(
-            cfg,
-            data.e_sup_positives,
-            data.val_pairs,
-            data.sampler,
-            args.write_s0_manifest,
-            world_size=world,
-        )
-        return
 
     if args.ddp_mode is not None:
         _run_ddp_worker(cfg, args, registered_config_hash=_config_hash(loaded_cfg))

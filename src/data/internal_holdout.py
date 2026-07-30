@@ -1,8 +1,10 @@
-"""Current E2E internal topology holdouts (spec §§9.3 and 13.19).
+"""Current E2E internal topology holdout (spec §§9.3 and 13.19).
 
-The holdouts are derived solely from the seeded message graph.  This module also
-materializes the complete, non-self pair/label universes used by qualification
-and checkpoint selection so their exact contents can be pinned before binding.
+The holdout is derived solely from the seeded message graph.  ``V_hold`` is the
+union of the two historical BFS draws and is the single validation universe for
+both the qualification and the formal stage.  This module also materializes the
+complete, non-self pair/label universe over ``V_hold`` so its exact contents can
+be pinned before binding.
 """
 
 from __future__ import annotations
@@ -53,7 +55,7 @@ class QuarantineCounts:
 
 @dataclass(frozen=True)
 class OverlapProof:
-    """Explicit overlap counts required by the pre-binding audit."""
+    """Explicit overlap counts published in the run access audit."""
 
     node: dict[str, int]
     label_edge: dict[str, int]
@@ -66,15 +68,14 @@ class OverlapProof:
 
 @dataclass(frozen=True)
 class InternalHoldoutPartition:
-    """Training and two isolated internal topology partitions."""
+    """Training nodes and the single isolated internal topology holdout."""
 
     v_fit: frozenset[str]
-    v_qual: frozenset[str]
-    v_select: frozenset[str]
+    v_hold: frozenset[str]
     e_msg_fit: frozenset[Pair]
     e_sup_fit: frozenset[Pair]
-    qual_manifest: PairLabelManifest
-    select_manifest: PairLabelManifest
+    e_msg_hold: frozenset[Pair]
+    hold_manifest: PairLabelManifest
     quarantine_counts: QuarantineCounts
     overlap_proof: OverlapProof
 
@@ -83,6 +84,13 @@ class InternalHoldoutPartition:
         graph = nx.Graph()
         graph.add_nodes_from(self.v_fit)
         graph.add_edges_from(self.e_msg_fit)
+        return graph
+
+    def build_g_hold(self) -> nx.Graph:
+        """Return the loopless induced holdout gold graph, including isolates."""
+        graph = nx.Graph()
+        graph.add_nodes_from(self.v_hold)
+        graph.add_edges_from(self.e_msg_hold)
         return graph
 
 
@@ -134,11 +142,18 @@ def derive_internal_holdout(
     *,
     holdout_size: int = 256,
 ) -> InternalHoldoutPartition:
-    """Derive deterministic ``V_qual``, ``V_select``, and ``V_fit`` partitions.
+    """Derive the deterministic ``V_hold`` and ``V_fit`` partitions.
 
-    ``V_qual`` is a hashed-frontier BFS prefix of the largest loopless message
-    component.  It is removed before deriving ``V_select`` by the same rule.
-    Training message and supervision edges are then restricted to ``V_fit``.
+    ``V_hold`` is the union of two hashed-frontier BFS prefixes of the largest
+    loopless message component, drawn with the historical ``g5-v2-qual|`` and
+    ``g5-v2-select|`` salts; the first draw is removed before the second is
+    taken.  Both draws are kept verbatim so that ``V_fit`` — and therefore every
+    feature-stats, grounding and pack digest keyed on it — is bit-identical to
+    the two-holdout construction this replaces.  ``holdout_size`` is the size of
+    *each* draw, so ``V_hold`` holds twice that many nodes.  Training message
+    and supervision edges are then restricted to ``V_fit``; the message edges
+    induced on ``V_hold`` — including the ones crossing between the two draws —
+    become the evaluation-only topology labels.
     """
     if holdout_size <= 0:
         raise ValueError("holdout_size must be positive")
@@ -150,38 +165,43 @@ def derive_internal_holdout(
     graph.add_nodes_from(node_set)
     graph.add_edges_from(message)
 
-    v_qual = frozenset(_holdout_bfs(graph, holdout_size, "g5-v2-qual|"))
-    remaining = graph.subgraph(node_set - v_qual).copy()
-    v_select = frozenset(_holdout_bfs(remaining, holdout_size, "g5-v2-select|"))
-    v_fit = node_set - v_qual - v_select
+    first_draw = frozenset(_holdout_bfs(graph, holdout_size, "g5-v2-qual|"))
+    remaining = graph.subgraph(node_set - first_draw).copy()
+    second_draw = frozenset(_holdout_bfs(remaining, holdout_size, "g5-v2-select|"))
+    v_hold = first_draw | second_draw
+    # Asserted, not assumed: the union must not shrink, or V_fit would grow and
+    # every digest keyed on it would move.
+    if len(v_hold) != 2 * holdout_size:
+        raise AssertionError(
+            f"V_hold must union two disjoint {holdout_size}-node draws, got {len(v_hold)} nodes"
+        )
+    v_fit = node_set - v_hold
+    if v_fit != node_set - first_draw - second_draw:
+        raise AssertionError("V_fit drifted from the two-draw complement")
 
     e_msg_fit = frozenset((u, v) for u, v in message if u in v_fit and v in v_fit)
     e_sup_fit = frozenset((u, v) for u, v in supervision if u in v_fit and v in v_fit)
-    e_msg_qual = frozenset((u, v) for u, v in message if u in v_qual and v in v_qual)
-    e_msg_select = frozenset((u, v) for u, v in message if u in v_select and v in v_select)
+    e_msg_hold = frozenset((u, v) for u, v in message if u in v_hold and v in v_hold)
 
-    partitions = {"fit": v_fit, "qual": v_qual, "select": v_select}
+    partitions = {"fit": v_fit, "hold": v_hold}
     quarantine = QuarantineCounts(
         message=_cross_partition_counts(message, partitions),
         supervision=_cross_partition_counts(supervision, partitions),
     )
     proof = OverlapProof(
         node=_pairwise_overlap_counts(partitions),
-        label_edge=_pairwise_overlap_counts(
-            {"fit": e_msg_fit, "qual": e_msg_qual, "select": e_msg_select}
-        ),
+        label_edge=_pairwise_overlap_counts({"fit": e_msg_fit, "hold": e_msg_hold}),
     )
     if not proof.all_zero:  # defensive invariant: disjoint node-induced labels
         raise AssertionError("internal holdout overlap proof is non-zero")
 
     return InternalHoldoutPartition(
         v_fit=v_fit,
-        v_qual=v_qual,
-        v_select=v_select,
+        v_hold=v_hold,
         e_msg_fit=e_msg_fit,
         e_sup_fit=e_sup_fit,
-        qual_manifest=build_pair_label_manifest(v_qual, e_msg_qual),
-        select_manifest=build_pair_label_manifest(v_select, e_msg_select),
+        e_msg_hold=e_msg_hold,
+        hold_manifest=build_pair_label_manifest(v_hold, e_msg_hold),
         quarantine_counts=quarantine,
         overlap_proof=proof,
     )
@@ -235,10 +255,12 @@ def _canonical_edge_set(
 
 
 def _cross_partition_counts(
-    edges: Iterable[Pair], partitions: dict[str, frozenset[str]]
+    edges: Iterable[Pair], partitions: Mapping[str, frozenset[str]]
 ) -> dict[str, int]:
     owner = {node: name for name, nodes in partitions.items() for node in nodes}
-    counts = {"fit__qual": 0, "fit__select": 0, "qual__select": 0}
+    counts = {
+        f"{left}__{right}": 0 for left, right in itertools.combinations(sorted(partitions), 2)
+    }
     for u, v in edges:
         left, right = owner[u], owner[v]
         if left == right:

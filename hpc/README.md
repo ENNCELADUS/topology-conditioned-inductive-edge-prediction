@@ -1,19 +1,25 @@
 # Auto-sized H20 container runner
 
-This directory is the only HPC execution layer. It runs the implemented baseline and
-gate CLIs directly inside the pinned container; there is no Slurm scheduler, job array,
-or cluster-specific environment file.
+This directory is the only HPC execution layer. It runs the implemented baseline, gate,
+and EgoStitch CLIs directly inside the pinned container; there is no scheduler, job
+array, or cluster-specific environment file. Two tracked runners:
+
+- `hpc/run.sh` — the baselines, cached scoring, and the G1/G2 gates.
+- `hpc/qualification.sh` — the EgoStitch E2E two-stage ladder (`qualify` then `formal`),
+  which owns the registration and preflight checks. `hpc/run.sh train` **refuses** a
+  config whose `model.family` is `egostitch_e2e`: launching an arm from there would skip
+  every preflight the ladder owns.
 
 Formal E2 training (`B0`, `configs/b0_v31_breadth_first.yaml`) runs **only** through
-`hpc/run.sh train configs/b0_v31_breadth_first.yaml`, which is now the runner's single
-`train` branch and always drives the production `python -m src.e2_pipeline` entry:
-pack-or-validate the BF16 feature cache, probe candidate token budgets, project the
-fixed 30-epoch wall time, then launch one clean `accelerate launch` whose process count
-is automatically set to all visible NVIDIA H20 GPUs, targeting a 60-minute total
-pipeline budget. Direct `python -m src.train_b0 --max-steps N` remains debug-only
-(bounded smoke runs) and must never be used for a reported E2 experiment. `B0-alt`
-(`configs/b0_alt_breadth_first.yaml`) is outside this E2-only optimization: its config
-is not the V3.1 shape `src.e2_pipeline` expects, so it is **not** trained through
+`hpc/run.sh train configs/b0_v31_breadth_first.yaml`, the runner's single `train` branch,
+which always drives the production `python -m src.e2_pipeline` entry. That pipeline has
+three sub-stages, `pack -> train -> publish`: build or strictly validate the BF16 feature
+pack, launch one clean `accelerate launch` at the configured `runtime.token_budget` whose
+process count is automatically set to all visible NVIDIA H20 GPUs, then validate and
+atomically publish the staging tree. Direct `python -m src.train_b0 --max-steps N` remains
+debug-only (bounded smoke runs) and must never be used for a reported E2 experiment.
+`B0-alt` (`configs/b0_alt_breadth_first.yaml`) is outside this E2-only optimization: its
+config is not the V3.1 shape `src.e2_pipeline` expects, so it is **not** trained through
 `hpc/run.sh train` — it keeps its existing direct
 `.venv/bin/python -m src.train_b0 --config configs/b0_alt_breadth_first.yaml`
 invocation, run directly (bypassing the runner's `train` branch) inside the same
@@ -23,7 +29,8 @@ container.
 
 Formal execution requires one or more NVIDIA H20 GPUs. GPU count is intentionally
 node-dependent and is recorded in runtime/run metadata; throughput claims remain tied
-to the exact count in their retained artifacts.
+to the exact count in their retained artifacts. The EgoStitch `formal` stage is the one
+exception: it pins exactly four.
 
 | Item | Fixed value |
 |---|---|
@@ -57,46 +64,81 @@ hpc/run.sh check
 The check runs the lightweight suite plus the three CPU DDP smoke contracts on Linux;
 the four-H20 cold-run acceptance test remains an explicit opt-in.
 
-EgoStitch e2e rev-3.1 has a separate fail-closed qualification entry point, split
-into two commands because the registered protocol requires the pre-binding gate
-thresholds to **freeze between them**. Qualification must run from an isolated root
-in which candidate, test, and `V_select` artifacts are absent. Its basename must
-include the retained attempt number (`attempt001` through `attempt003`, the v3
-three-attempt budget); an existing stage directory is never replaced.
+## The EgoStitch E2E ladder: qualify, then formal
 
-`calibrate` runs the sanity suite, then the registered fixed 510-row overfit stream
-for exactly 2,000 steps on every auto-detected visible H20 (four on the current
-target host), then produces the `calibration_fit` probe artifact and evaluates the
-registered pre-binding gates. It touches `V_fit` only and never opens `V_qual`:
+Two stages, no sandbox and no threshold-freeze step between them. Both train on the full
+`V_fit` and validate on the single 512-node `V_hold`, and they differ **only** in
+`optim.epochs`; that identity is what lets them share one F0/grounding pack, one
+grounding cache, and one `feature_stats_sha256`. Neither stage may open a held-out path —
+that boundary is a path check inside the worker on both run kinds, not an isolated data
+root, so both commands run directly in the repository checkout.
+
+Neither command passes `--pack-dir`. The pack manifest is keyed on `n_ground`, so each
+config names its own `runtime.pack_dir`; both stages of an arm share it, and arms that
+agree on `n_ground` share it too (`cosine_pool` pins 20, the other five 50).
+
+`qualify` is the development loop. It runs the trainer/conditioning/pipeline sanity
+tests, then a 3-epoch run of the requested arm on every auto-detected visible H20. The
+short schedule still traverses curriculum phases A -> B -> C, because the curriculum
+scales with `schedule_total_steps` rather than with a fixed step count. Its verdict is
+guards-only — `pass` iff no fail-fast guard tripped. Each invocation receives an
+immutable directory under
+`outputs/egostitch_e2e_stage1_v3/qualification/<arm>/attempts/attempt-*/` and writes
+its `qualification.json` there together with the `feature_stats_sha256` and
+`model_config_sha256` the formal stage compares against. The arm-local `latest`
+symlink advances after every attempt, including a retained failure; `latest-pass`
+advances only after a successful attempt. The formal preflight reads
+`latest-pass/qualification.json`, never a mutable canonical report.
+
+This durable history is part of the selection-exposure audit: every qualification
+attempt evaluates the shared `V_hold`, so retaining all attempts makes the cumulative
+evaluation count `K` recoverable per arm instead of hiding repeated development
+selection. Qualification is frozen once v4 becomes `BINDING`; allowing further
+attempts would escape the registered `K` disclosure. Each arm's
+`attempt_history.json` uses schema `egostitch_e2e_qualification_history_v1`. Binding
+must map exactly the six trained arms to `{path, sha256}` index references and register
+the same exact, non-empty attempt lists under `qualification_attempts`; any omission,
+extra arm, stale index, or list mismatch is a refusal.
+
+Checkpoint eligibility is unaffected: it is enforced in both stages. `qualify` never
+edits or promotes the active v4 registration, which remains `DRAFT`, and deliberately
+does not require a clean checkout, because iterating on the model is the point:
 
 ```bash
-EGOSTITCH_QUALIFICATION_ROOT=/path/to/isolated/qualification-attempt001 \
-  hpc/qualification.sh calibrate
+hpc/qualification.sh qualify full   # or f_only|pair_topology|p0|cosine_pool|no_l_rel
 ```
 
-The owner then freezes the calibrated thresholds into the DRAFT registration. Only
-after that does `rehearse` run the exact 30-epoch full-arm rehearsal against
-`V_qual`, validate the clip/family/RMS margins, and evaluate the gates again. It
-**refuses to start while any registered gate threshold is still a
-`REQUIRED-BEFORE-BINDING` marker**, because a rehearsal judged against an unresolved
-gate is not prospective:
-
-```bash
-EGOSTITCH_QUALIFICATION_ROOT=/path/to/isolated/qualification-attempt001 \
-  hpc/qualification.sh rehearse
-```
-
-Both stages run the v3 trainer/conditioning/gate tests before any GPU work and use
-separate `V_fit` and `V_qual` feature packs. Neither substitutes `--max-steps`,
-neither promotes the DRAFT registration, and both stop immediately on failure.
-Formal arm training remains unavailable until the registration is resolved and
-marked BINDING. Six trained arms are selectable; the two scoring-time controls
-(`structure_control_6a_v3`, `structure_control_6e_v1`) reuse the full arm's
-checkpoint and are rejected here:
+`formal` produces results. It refuses to start unless there are exactly four visible
+H20s, the checkout is clean, the registration is `BINDING` with every required
+binding-evidence field resolved, and this arm's qualification verdict is `pass` with
+both digests equal to the ones this formal config and its shared pack produce — a stale
+report from before a model change is a refusal, not a pass. Six trained arms are
+selectable; the two scoring-time controls (`structure_control_6a_v3`,
+`structure_control_6e_v1`) reuse the full arm's checkpoint and are rejected here:
 
 ```bash
 hpc/qualification.sh formal full   # or f_only|pair_topology|p0|cosine_pool|no_l_rel
 ```
+
+The governing file is
+`docs/registrations/g5_e2e_stage1_preregistration_v4.json`. It is currently `DRAFT`,
+so `formal` is intentionally launch-blocked until the owner resolves its real binding
+evidence and promotes a successor content state to `BINDING`.
+
+Scientific execution order is `full` first. After training, the stage validates the
+registered clip-coefficient, family-ratio, and submodule-RMS margins and persists that
+verdict to `<output_dir>/margin_verdict.json`, bound to the digest of the `profile.json`
+it was computed from. That gate necessarily runs *after* the pipeline has published the
+run, so a completed run carries no margin evidence on its own: the remaining arms require
+the full arm's persisted verdict alongside its eligibility and liveness preflight, and a
+verdict left behind by an earlier full run cannot stand in for the current one. For the
+full arm the stage then produces the registered `formal_train` probe artifact that the G5
+gate evaluator consumes, at the path bound in the registration.
+
+Neither stage substitutes `--max-steps` for its schedule, and neither promotes the
+registration; both stop immediately on failure.
+
+## Baselines
 
 Train both frozen baselines. `B0` runs through the auto-sized H20 E2 production pipeline;
 `B0-alt` is outside this optimization and is trained directly, without the runner's
@@ -110,60 +152,21 @@ hpc/run.sh train configs/b0_v31_breadth_first.yaml                       # B0: a
 
 `hpc/run.sh train configs/b0_v31_breadth_first.yaml` writes, under the pipeline's
 output directory, `best.pt`, `last.pt`, `metrics.jsonl`, `run_metadata.json`,
-`profile.json` (per-stage timings and the selected token budget), and
+`profile.json` (per-stage timings and the configured token budget), and
 `artifact_manifest.json` (sha256 + byte size of the above). A successful atomic
 publication writes `complete.json` last; its `total_seconds` is the authoritative
-post-publication 60-minute acceptance time. It returns exit code `0` on
-success and `2` on a gated failure (for example, the projected 30-epoch time exceeding
-the 60-minute budget); the runner does not mask this exit code.
+post-publication 60-minute acceptance time. It returns exit code `0` on success and `2`
+on a gated failure (for example a pack or training stage exceeding its
+`runtime.*_budget_seconds` deadline), naming the stage in `failure.json`; the runner does
+not mask this exit code.
 
-Formal EgoStitch Stage-1 training uses the same auto-detected DDP orchestrator and all
-visible H20s, but its config-driven budget and worker module:
-
-```bash
-hpc/run.sh train configs/egostitch_stage1_breadth_first.yaml \
-  --worker-module src.train_egostitch
-```
-
-It publishes the same atomic checkpoint/profile/manifest contract under the requested
-seed output directory. A complete training artifact is not a G5 result: the formal
-gate additionally requires the fixed Seed 0 candidate-universe scoring, fidelity
-diagnostics, the shared cost report, and `src.experiments.g5_stage1` evaluation.
-
-The tracked outer runner completes the fixed seed before opening the screening gate:
-
-```bash
-hpc/g5_stage1.sh seed 0   # validate/reuse training -> fresh-fp32 s0 -> candidate score
-hpc/g5_stage1.sh formal   # seed pipeline -> generate diagnostics/cost -> screening gate
-```
-
-Every `seed` invocation writes candidate scores under
-`outputs/egostitch_stage1/seedN/scores/`. Only `formal_gate/` may contain the binding
-single-seed Stage-1 screening verdict. Inferential and Holm fields are not applicable;
-the screen does not replace E1/E3's multi-seed inference. The runner hashes the fresh
-fp32 `s0` candidate artifact into the EgoStitch score provenance, generates Seed 0's
-required `fidelity.json` and shared `cost_report.json`, and fails closed if any identity
-or registered diagnostic is missing.
+## Scoring and gates
 
 Score the candidate universe once per checkpoint. `run.sh score` defaults to
-`--device cuda --amp bf16` (the formal frozen-`s0` pass keeps bf16 node encoding but
-sets `--pair-amp off` for fp32 pair logits); on a
-multi-GPU node it launches one contiguous shard per
-GPU and publishes the final output only after strict `score_universe merge` validation.
-For V3.1, pass `--pack-dir` to keep the BF16 token table GPU-resident and avoid repeated
+`--device cuda --amp bf16`; on a multi-GPU node it launches one contiguous shard per GPU
+and publishes the final output only after strict `score_universe merge` validation. For
+V3.1, pass `--pack-dir` to keep the BF16 token table GPU-resident and avoid repeated
 per-pair feature-file reads.
-
-EgoStitch Stage-1 S0 scoring has a dedicated production entry point. It pins the
-frozen-B0 checkpoint, all-seeds manifest, BF16 feature pack, and the profiled token
-budget, then automatically launches one contiguous shard on every visible H20 and
-strictly merges the shards:
-
-```bash
-hpc/run.sh s0-score
-```
-
-Do not replace this with a direct `src.score_universe` call: the unpacked path repeats
-feature-file I/O per pair and a direct call does not fan out across the visible GPUs.
 
 ```bash
 hpc/run.sh score \
@@ -198,6 +201,8 @@ python -m src.experiments.g3_oracle \
   --universe outputs/deliverables/b0_v31_breadth_first_20260711/scores/candidate.npz \
   --data-root data --strategy breadth_first --output-dir outputs/g3
 ```
+
+## Disconnect-safe runs
 
 The commands above run in the foreground. For a disconnect-safe run, keep the same
 runner and add only shell-level logging/backgrounding:

@@ -8,6 +8,7 @@ import itertools
 import networkx as nx
 import pytest
 from src.data.internal_holdout import (
+    _holdout_bfs,
     build_pair_label_manifest,
     canonical_pair_label_sha256,
     derive_internal_holdout,
@@ -27,26 +28,48 @@ def test_partition_is_deterministic_disjoint_and_exhaustive() -> None:
     )
 
     assert first == second
-    assert len(first.v_qual) == len(first.v_select) == 4
-    assert first.v_fit | first.v_qual | first.v_select == nodes
-    assert not (first.v_fit & first.v_qual)
-    assert not (first.v_fit & first.v_select)
-    assert not (first.v_qual & first.v_select)
+    assert len(first.v_hold) == 8
+    assert first.v_fit | first.v_hold == nodes
+    assert not (first.v_fit & first.v_hold)
     assert first.overlap_proof.all_zero
 
 
+def test_v_hold_is_exactly_the_union_of_the_two_historical_draws() -> None:
+    """V_fit must stay bit-identical to the two-holdout construction it replaces.
+
+    Every feature-stats, grounding and pack digest is keyed on ``V_fit``, so the
+    union is only cost-free while it removes exactly the same nodes the two
+    historical ``g5-v2-qual|``/``g5-v2-select|`` draws removed.
+    """
+    nodes = {f"n{i:03d}" for i in range(20)}
+    edges = _path_edges(20)
+    result = derive_internal_holdout(nodes, edges, [], holdout_size=4)
+
+    graph = nx.Graph()
+    graph.add_nodes_from(nodes)
+    graph.add_edges_from(edges)
+    qual_draw = frozenset(_holdout_bfs(graph, 4, "g5-v2-qual|"))
+    remaining = graph.subgraph(nodes - qual_draw).copy()
+    select_draw = frozenset(_holdout_bfs(remaining, 4, "g5-v2-select|"))
+
+    assert not (qual_draw & select_draw)
+    assert result.v_hold == qual_draw | select_draw
+    assert result.v_fit == frozenset(nodes) - qual_draw - select_draw
+
+
 def test_bfs_uses_largest_component_and_hash_ordered_frontiers() -> None:
-    large = {"root", "a", "b", "c", "d"}
+    large = {"root", "a", "b", "c", "d", "e"}
     small = {"x", "y", "z"}
-    edges = [("root", node) for node in large - {"root"}] + [("x", "y"), ("y", "z")]
+    edges = list(itertools.combinations(sorted(large), 2)) + [("x", "y"), ("y", "z")]
     result = derive_internal_holdout(large | small, edges, [], holdout_size=2)
     qual_seed = min(
         large,
         key=lambda node: (hashlib.sha256(f"g5-v2-qual|{node}".encode()).digest(), node),
     )
 
-    assert qual_seed in result.v_qual
-    assert result.v_qual <= large
+    assert qual_seed in result.v_hold
+    # Both draws stay inside the largest component: the small one is never taken.
+    assert result.v_hold <= large
 
 
 def test_loopless_induced_fit_edges_and_supervision_restriction() -> None:
@@ -69,14 +92,10 @@ def test_cross_partition_quarantine_counts_match_direct_count() -> None:
     result = derive_internal_holdout(nodes, message, supervision, holdout_size=3)
     owner = {
         node: name
-        for name, part in (
-            ("fit", result.v_fit),
-            ("qual", result.v_qual),
-            ("select", result.v_select),
-        )
+        for name, part in (("fit", result.v_fit), ("hold", result.v_hold))
         for node in part
     }
-    expected = {"fit__qual": 0, "fit__select": 0, "qual__select": 0}
+    expected = {"fit__hold": 0}
     for u, v in supervision:
         if owner[u] != owner[v]:
             expected["__".join(sorted((owner[u], owner[v])))] += 1

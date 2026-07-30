@@ -1,22 +1,24 @@
-"""E2 pipeline probe selection, projection, failure artifacts, and orchestration.
+"""E2 pipeline worker payloads, failure artifacts, and orchestration.
 
 Provides pure dataclasses and functions for:
-- ProbeResult: token-budget probe outcome (timing, memory, validity)
-- PipelineProfile: aggregated probe results and projected runtime
-- select_probe_result(): fastest valid probe below memory limit
-- project_total_seconds(): total elapsed time for all pipeline stages
+- ProbeResult: one worker-reported throughput/memory measurement
 - write_failure(): atomic failure JSON artifact writer
 
 And the production orchestrator (``python -m src.e2_pipeline``) that drives the
-cold multi-H20 run end to end: pack-or-validate the BF16 feature cache, launch one
-fresh ``accelerate launch`` probe process group per candidate token budget, select
-the fastest valid one, launch one ``epoch-probe``, gate formal training on the
-projected 30-epoch wall time, launch one clean ``train`` process group, merge the
-worker's runtime profile with pipeline-level fields, and write the artifact
-manifest. See :func:`run_pipeline` for the full 11-step contract.
+cold multi-H20 run end to end in three sub-stages — ``pack -> train ->
+publish``: pack-or-validate the BF16 feature cache, launch one clean
+``accelerate launch`` ``train`` process group at the configured
+``runtime.token_budget``, merge the worker's runtime profile with pipeline-level
+fields, and publish the validated staging tree atomically. See
+:func:`run_pipeline` for the full contract.
+
+Both stages of the E2E ladder run through this orchestrator and differ only in
+``optim.epochs``: the qualification stage passes ``--run-kind qualification
+--epochs N``, the formal stage runs the config's registered schedule.
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -40,12 +42,15 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ProbeResult:
-    """Outcome of a single token-budget probe run.
+    """Outcome of a single worker throughput/memory measurement.
+
+    The orchestrator no longer sweeps token budgets, but the workers still emit
+    this payload from their own ``--ddp-mode probe`` measurement path.
 
     Attributes:
         token_budget: Number of tokens per global batch (pairs).
-        valid: True if probe completed without OOM or other hard failure.
-        global_pairs_per_second: Throughput achieved in this probe.
+        valid: True if the measurement completed without OOM or other hard failure.
+        global_pairs_per_second: Throughput achieved in this measurement.
         peak_memory_gib: Peak GPU memory used (GiB).
         failure: None if valid=True; error message if valid=False.
     """
@@ -97,139 +102,6 @@ class ProbeResult:
             peak_memory_gib=peak_memory_float,
             failure=cast(str | None, failure),
         )
-
-
-@dataclass
-class PipelineProfile:
-    """Aggregated probe results and projected pipeline runtime.
-
-    Attributes:
-        cold_cache: True if initial feature cache was cold on this host.
-        stage_seconds: Dict of {stage_name: elapsed_seconds} for all stages.
-        probe_results: All probe runs attempted.
-        selected_token_budget: Selected token budget (None if selection failed).
-        projected_total_seconds: Total elapsed seconds if selected budget
-            completes (None if unknown).
-    """
-
-    cold_cache: bool
-    stage_seconds: dict[str, float]
-    probe_results: list[ProbeResult]
-    selected_token_budget: int | None
-    projected_total_seconds: float | None
-
-    def to_dict(self) -> dict[str, object]:
-        """Convert to JSON-serializable dict without external dependencies."""
-        return {
-            "cold_cache": self.cold_cache,
-            "stage_seconds": self.stage_seconds,
-            "probe_results": [r.to_dict() for r in self.probe_results],
-            "selected_token_budget": self.selected_token_budget,
-            "projected_total_seconds": self.projected_total_seconds,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, object]) -> "PipelineProfile":
-        """Reconstruct from dict (reverse of to_dict)."""
-        probe_results_data = data["probe_results"]
-        if not isinstance(probe_results_data, list):
-            raise ValueError("probe_results must be a list")
-
-        stage_seconds_data = data.get("stage_seconds")
-        if stage_seconds_data is None:
-            stage_seconds_data = {}
-        if not isinstance(stage_seconds_data, dict):
-            raise ValueError("stage_seconds must be a dict")
-
-        return cls(
-            cold_cache=cast(bool, data["cold_cache"]),
-            stage_seconds={str(k): float(v) for k, v in stage_seconds_data.items()},
-            probe_results=[
-                ProbeResult.from_dict(cast(dict[str, object], r)) for r in probe_results_data
-            ],
-            selected_token_budget=cast(int | None, data.get("selected_token_budget")),
-            projected_total_seconds=cast(float | None, data.get("projected_total_seconds")),
-        )
-
-
-def select_probe_result(results: Sequence[ProbeResult], memory_limit_gib: float) -> ProbeResult:
-    """Select the fastest valid probe that fits within memory limit.
-
-    Args:
-        results: Sequence of probe outcomes to evaluate.
-        memory_limit_gib: Maximum allowed peak memory (GiB).
-
-    Returns:
-        ProbeResult with maximum global_pairs_per_second among valid candidates.
-
-    Raises:
-        RuntimeError: If no valid probe exists below memory limit.
-    """
-    valid = [
-        result for result in results if result.valid and result.peak_memory_gib <= memory_limit_gib
-    ]
-    if not valid:
-        raise RuntimeError("no valid E2 token-budget probe")
-    return max(valid, key=lambda result: result.global_pairs_per_second)
-
-
-def project_total_seconds(
-    *,
-    pack_seconds: float,
-    setup_probe_seconds: float,
-    epoch_seconds: float,
-    epochs: int,
-    artifact_seconds: float,
-) -> float:
-    """Project total elapsed time for complete E2 pipeline.
-
-    Sums all stage durations: feature packing, probe setup, all epochs, artifact writing.
-
-    Args:
-        pack_seconds: Time to pack features into BF16 format.
-        setup_probe_seconds: Time to set up probe (env, checkpoint load).
-        epoch_seconds: Elapsed seconds per training epoch.
-        epochs: Number of training epochs to run.
-        artifact_seconds: Time to write final scores/metrics artifacts.
-
-    Returns:
-        Total projected elapsed seconds (pack + setup_probe + epoch*epochs + artifact).
-    """
-    return pack_seconds + setup_probe_seconds + epoch_seconds * epochs + artifact_seconds
-
-
-def conservative_e2e_epoch_seconds(
-    *,
-    measured_epoch_seconds: object,
-    runtime_profile: object,
-    full_joint_pairs_per_second: object,
-) -> float:
-    """Project an E2E epoch using measured overhead plus full-joint compute.
-
-    The epoch probe follows the exact production prefix and therefore measures
-    Phase-A gradient behavior. Candidate probes execute the more expensive full
-    joint objective. Combining those two observations prevents the Phase-A
-    prefix from understating later Phase-B/C compute.
-    """
-    measured = _positive_finite_seconds(measured_epoch_seconds, field="measured_epoch_seconds")
-    throughput = _positive_finite_seconds(
-        full_joint_pairs_per_second, field="full_joint_pairs_per_second"
-    )
-    if not isinstance(runtime_profile, dict):
-        raise TypeError("runtime_profile must be an object")
-    per_epoch = runtime_profile.get("per_epoch")
-    if not isinstance(per_epoch, list) or len(per_epoch) != 1:
-        raise ValueError("runtime_profile.per_epoch must contain exactly one epoch")
-    epoch = per_epoch[0]
-    if not isinstance(epoch, dict):
-        raise TypeError("runtime_profile.per_epoch[0] must be an object")
-    global_pairs = _positive_finite_seconds(epoch.get("global_pairs"), field="global_pairs")
-    prefix_compute = _finite_number(epoch.get("compute_seconds"), field="compute_seconds")
-    if prefix_compute > measured:
-        raise ValueError("compute_seconds cannot exceed measured_epoch_seconds")
-    non_compute = measured - prefix_compute
-    full_joint_compute = global_pairs / throughput
-    return max(measured, non_compute + full_joint_compute)
 
 
 def write_failure(
@@ -289,11 +161,21 @@ class PipelineArgs:
         seed: Optional worker seed override for pre-registered multi-seed runs.
         max_steps: Optional DEBUG-ONLY bounded worker-step limit.
         run_kind: Optional EgoStitch-E2E execution context forwarded to the
-            worker; one of ``overfit``, ``rehearsal``, or ``formal``.
+            worker; one of ``qualification`` or ``formal``. ``debug`` is not
+            selectable here — it is derived by the worker from ``--max-steps``.
+        epochs: Optional ``optim.epochs`` override; the qualification stage's
+            short schedule. Accepted only with ``--run-kind qualification``, so
+            it can never silently shorten the registered formal schedule behind
+            a config sha256 that still matches the BINDING registration.
+        qualification_artifact: Path to the qualification stage's
+            ``qualification.json``, forwarded to the worker. The formal stage
+            compares its own ``feature_stats_sha256`` against the recorded one
+            and refuses without it; the qualification stage is where that digest
+            is born, so passing one there is refused as a misuse.
         worker_module: Dotted module implementing the worker contract
-            (``load_config``, ``prepare_pack``, and the ``--ddp-mode``
-            probe/epoch-probe/train CLI). Defaults to the formal E2 B0 worker;
-            ``src.train_egostitch`` selects the EgoStitch Stage-1 worker.
+            (``load_config``, ``prepare_pack``, and the ``--ddp-mode train``
+            CLI). Defaults to the formal E2 B0 worker; ``src.train_egostitch``
+            selects the EgoStitch worker.
     """
 
     config: Path
@@ -303,34 +185,8 @@ class PipelineArgs:
     seed: int | None = None
     max_steps: int | None = None
     run_kind: str | None = None
-
-
-class BudgetExceeded(RuntimeError):
-    """Raised before formal training when projected wall time exceeds the budget."""
-
-
-def enforce_projection(*, projected_seconds: float, limit_seconds: int, output_dir: Path) -> None:
-    """Gate formal training on the projected 30-epoch wall-clock estimate.
-
-    Args:
-        projected_seconds: Output of :func:`project_total_seconds`.
-        limit_seconds: The frozen total wall-clock budget
-            (``runtime.total_budget_seconds``).
-        output_dir: Where to write ``failure.json`` when over budget.
-
-    Raises:
-        BudgetExceeded: If ``projected_seconds > limit_seconds``. ``failure.json``
-            is written first so the caller can inspect the projected/limit numbers.
-    """
-    if projected_seconds <= limit_seconds:
-        return
-    write_failure(
-        output_dir,
-        stage="projection",
-        message=f"projected {projected_seconds:.1f}s exceeds {limit_seconds}s",
-        extra={"projected_seconds": projected_seconds, "limit_seconds": limit_seconds},
-    )
-    raise BudgetExceeded(f"projected runtime exceeds {limit_seconds} seconds")
+    epochs: int | None = None
+    qualification_artifact: Path | None = None
 
 
 def build_accelerate_command(
@@ -347,6 +203,8 @@ def build_accelerate_command(
     seed: int | None = None,
     max_steps: int | None = None,
     run_kind: str | None = None,
+    epochs: int | None = None,
+    qualification_artifact: Path | None = None,
 ) -> list[str]:
     """Build the pinned ``accelerate launch -m <worker>`` worker command.
 
@@ -354,13 +212,13 @@ def build_accelerate_command(
         accelerate_bin: Path to the ``accelerate`` executable (same venv as the
             orchestrator's own interpreter).
         config_path: Path to the worker training YAML config.
-        mode: One of the worker's DDP modes (``probe``/``epoch-probe``/
-            ``train``).
+        mode: The worker's DDP mode; the orchestrator only launches ``train``.
         pack_dir: Packed feature directory the worker loads onto its device.
         output_dir: Run output directory (checkpoints/metrics for ``train``;
             passed through unconditionally so every mode sees the same override).
-        token_budget: Per-rank token budget for this worker invocation (the
-            EgoStitch worker reinterprets it as the node-batch ``B_n``).
+        token_budget: Per-rank token budget for this worker invocation
+            (``runtime.token_budget``; the EgoStitch worker reinterprets it as
+            the node-batch ``B_n``).
         profile_output: Path the rank-zero worker writes its JSON profile to.
         world_size: Number of visible H20 ranks to launch.
         worker_module: Dotted worker module (default: the formal E2 B0 worker).
@@ -368,6 +226,12 @@ def build_accelerate_command(
         max_steps: Optional DEBUG-ONLY bounded worker-step limit.
         run_kind: Optional EgoStitch-E2E execution context forwarded unchanged
             to the worker.
+        epochs: Optional ``optim.epochs`` override forwarded unchanged to the
+            worker, so the worker trains the same schedule the orchestrator
+            validates its artifacts against.
+        qualification_artifact: Optional path to the qualification stage's
+            ``qualification.json``, forwarded unchanged to the worker, which is
+            the single place the digest equality is enforced.
 
     Returns:
         The exact ``accelerate launch --num_processes <world_size> --mixed_precision bf16
@@ -401,6 +265,10 @@ def build_accelerate_command(
         command.extend(("--max-steps", str(max_steps)))
     if run_kind is not None:
         command.extend(("--run-kind", run_kind))
+    if epochs is not None:
+        command.extend(("--epochs", str(epochs)))
+    if qualification_artifact is not None:
+        command.extend(("--qualification-artifact", str(qualification_artifact)))
     return command
 
 
@@ -440,9 +308,30 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument(
         "--run-kind",
-        choices=("overfit", "rehearsal", "formal"),
+        choices=("qualification", "formal"),
         default=None,
-        help="EgoStitch E2E execution context; forwarded unchanged to the worker",
+        help=(
+            "EgoStitch E2E execution context; forwarded unchanged to the worker. "
+            "'debug' is not selectable: the worker derives it from --max-steps"
+        ),
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help=(
+            "override optim.epochs with the qualification stage's short schedule; "
+            "requires --run-kind qualification and is forwarded to the worker"
+        ),
+    )
+    parser.add_argument(
+        "--qualification-artifact",
+        type=Path,
+        default=None,
+        help=(
+            "path to the qualification stage's qualification.json, forwarded to the "
+            "worker; a formal EgoStitch-E2E run refuses to train without it"
+        ),
     )
     parser.add_argument(
         "--worker-module",
@@ -450,7 +339,7 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
         help=(
             "worker module implementing load_config/prepare_pack and the "
             "--ddp-mode CLI (default: src.train_b0; src.train_egostitch for "
-            "the EgoStitch Stage-1 worker)"
+            "the EgoStitch worker)"
         ),
     )
     namespace = parser.parse_args(argv)
@@ -462,6 +351,8 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
         seed=namespace.seed,
         max_steps=namespace.max_steps,
         run_kind=namespace.run_kind,
+        epochs=namespace.epochs,
+        qualification_artifact=namespace.qualification_artifact,
     )
 
 
@@ -540,38 +431,6 @@ def run_stage(operation: Callable[[], None], timeout_seconds: float) -> None:
 def _resolve_accelerate_bin() -> Path:
     """Return the ``accelerate`` executable next to the running interpreter."""
     return Path(sys.executable).with_name("accelerate")
-
-
-_CANDIDATE_FAILURE_PREFIX = "E2_PROBE_CANDIDATE_FAILURE:"
-
-
-def _candidate_failure(error_text: str | None) -> tuple[str, str] | None:
-    """Parse a worker's structured candidate-local OOM/non-finite marker."""
-    for line in (error_text or "").splitlines():
-        if not line.startswith(_CANDIDATE_FAILURE_PREFIX):
-            continue
-        try:
-            payload = json.loads(line.removeprefix(_CANDIDATE_FAILURE_PREFIX))
-        except json.JSONDecodeError:
-            return None
-        if (
-            isinstance(payload, dict)
-            and payload.get("kind") in {"oom", "nonfinite"}
-            and isinstance(payload.get("message"), str)
-            and cast(str, payload["message"]).strip()
-        ):
-            return cast(str, payload["kind"]), cast(str, payload["message"])
-    return None
-
-
-def _positive_finite_seconds(value: object, *, field: str) -> float:
-    """Validate a worker-reported positive finite duration (bool is not numeric)."""
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise TypeError(f"{field} must be numeric")
-    seconds = float(value)
-    if not math.isfinite(seconds) or seconds <= 0:
-        raise ValueError(f"{field} must be finite and positive")
-    return seconds
 
 
 def _finite_number(value: object, *, field: str, minimum: float = 0.0) -> float:
@@ -705,10 +564,124 @@ _PUBLISHED_FILENAMES = (
     "profile.json",
     "artifact_manifest.json",
 )
+V_HOLD_VALIDATION_EVENTS_FILENAME = "v_hold_validation_events.jsonl"
+#: Written by the qualification stage only. It is the stage's verdict, and the
+#: formal stage refuses to launch without it. A stale verdict is always cleared,
+#: so a failed re-qualification can never leave an earlier ``pass`` standing.
+QUALIFICATION_ARTIFACT_FILENAME = "qualification.json"
+_OPTIONAL_PUBLISHED_FILENAMES = (
+    # Required conditionally rather than for B0: qualification emits the
+    # verdict, while every non-debug E2E run emits the V_hold ledger.
+    QUALIFICATION_ARTIFACT_FILENAME,
+    V_HOLD_VALIDATION_EVENTS_FILENAME,
+)
+
+_QUALIFICATION_PIPELINE_FAILURE_VERDICTS = {
+    "pack": "fail(pack_stage)",
+    "train": "fail(training_worker)",
+    "artifacts": "fail(staged_artifacts)",
+    "publication": "fail(publication)",
+}
+
+_QUALIFICATION_ARTIFACT_KEYS = {
+    "verdict",
+    "epochs",
+    "hparams",
+    "feature_stats_sha256",
+    "model_config_sha256",
+}
+_QUALIFICATION_HPARAM_KEYS = {
+    "lr",
+    "weight_decay",
+    "warmup_steps",
+    "grad_clip",
+    "seed",
+    "negative_ratio",
+    "node_batch",
+    "edge_batch",
+    "mixed_precision",
+    "training",
+}
+
+
+def _validate_qualification_artifact_schema(payload: object, *, epochs: int) -> dict[str, object]:
+    """Validate the common schema used by pass and named-failure verdicts."""
+    if not isinstance(payload, dict) or set(payload) != _QUALIFICATION_ARTIFACT_KEYS:
+        raise ValueError("qualification.json has an invalid top-level schema")
+    recorded_epochs = payload.get("epochs")
+    if (
+        isinstance(recorded_epochs, bool)
+        or not isinstance(recorded_epochs, int)
+        or recorded_epochs != epochs
+    ):
+        raise ValueError("qualification epochs do not match this run")
+    hparams = payload.get("hparams")
+    if not isinstance(hparams, dict) or set(hparams) != _QUALIFICATION_HPARAM_KEYS:
+        raise ValueError("qualification hparams have an invalid schema")
+    for field, allow_empty in (
+        ("feature_stats_sha256", True),
+        ("model_config_sha256", False),
+    ):
+        digest = payload.get(field)
+        if not isinstance(digest, str) or (not digest and not allow_empty):
+            raise ValueError(f"qualification {field} is invalid")
+        if digest:
+            if len(digest) != 64:
+                raise ValueError(f"qualification {field} is invalid")
+            try:
+                int(digest, 16)
+            except ValueError as error:
+                raise ValueError(f"qualification {field} is invalid") from error
+    return cast(dict[str, object], payload)
+
+
+def _validate_qualification_success_artifact(
+    staging_dir: Path, *, cfg: object, worker: object
+) -> None:
+    """Require the qualification worker's pass verdict and bind it to this run."""
+    path = staging_dir / QUALIFICATION_ARTIFACT_FILENAME
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise ValueError(f"{QUALIFICATION_ARTIFACT_FILENAME} is missing or empty")
+    payload = _validate_qualification_artifact_schema(
+        json.loads(path.read_text(encoding="utf-8")),
+        epochs=cast(int, getattr(getattr(cfg, "optim", None), "epochs", None)),
+    )
+    if payload.get("verdict") != "pass":
+        raise ValueError(f"qualification verdict is not 'pass': {payload.get('verdict')!r}")
+
+    metadata_path = staging_dir / "run_metadata.json"
+    if not metadata_path.is_file() or metadata_path.stat().st_size <= 0:
+        raise ValueError("run_metadata.json is missing or empty")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if not isinstance(metadata, dict):
+        raise ValueError("run_metadata.json must contain an object")
+    feature_stats_sha256 = metadata.get("feature_stats_sha256")
+    if not isinstance(feature_stats_sha256, str) or len(feature_stats_sha256) != 64:
+        raise ValueError("run_metadata.json has no valid feature_stats_sha256")
+    try:
+        int(feature_stats_sha256, 16)
+    except ValueError as error:
+        raise ValueError("run_metadata.json has no valid feature_stats_sha256") from error
+
+    validate_qualification = getattr(worker, "validate_qualification_artifact", None)
+    if not callable(validate_qualification):
+        raise ValueError("qualification worker must provide validate_qualification_artifact")
+    validated = validate_qualification(
+        path,
+        cfg,
+        feature_stats_sha256=feature_stats_sha256,
+    )
+    if not isinstance(validated, dict) or validated != payload:
+        raise ValueError("qualification worker returned an invalid validation result")
 
 
 def _validate_staged_artifacts(
-    staging_dir: Path, *, epochs: int, model_family: str, allow_partial: bool = False
+    staging_dir: Path,
+    *,
+    epochs: int,
+    model_family: str,
+    allow_partial: bool = False,
+    require_v_hold_validation_events: bool = False,
 ) -> None:
     """Load and validate every formal worker artifact before hashing it."""
     import torch
@@ -742,6 +715,34 @@ def _validate_staged_artifacts(
     metadata = json.loads((staging_dir / "run_metadata.json").read_text(encoding="utf-8"))
     if not isinstance(metadata, dict):
         raise ValueError("run_metadata.json must contain an object")
+    if require_v_hold_validation_events:
+        evidence = metadata.get("v_hold_validation_evidence")
+        if not isinstance(evidence, dict):
+            raise ValueError("run_metadata.json is missing V_hold validation evidence")
+        if evidence.get("schema") != "egostitch_e2e_v_hold_validation_events_v1":
+            raise ValueError("V_hold validation-event evidence has an invalid schema")
+        if evidence.get("path") != V_HOLD_VALIDATION_EVENTS_FILENAME:
+            raise ValueError("V_hold validation-event evidence has an invalid path")
+        count = evidence.get("count")
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError("V_hold validation-event evidence has an invalid count")
+        ledger_path = staging_dir / V_HOLD_VALIDATION_EVENTS_FILENAME
+        if not ledger_path.is_file() or ledger_path.stat().st_size <= 0:
+            raise ValueError(f"{V_HOLD_VALIDATION_EVENTS_FILENAME} is missing or empty")
+        ledger_rows: list[object] = []
+        with ledger_path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    raise ValueError("V_hold validation-event ledger contains a blank row")
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError("V_hold validation-event ledger row must be an object")
+                ledger_rows.append(row)
+        if len(ledger_rows) != count:
+            raise ValueError("V_hold validation-event ledger count does not match metadata")
+        digest = hashlib.sha256(ledger_path.read_bytes()).hexdigest()
+        if evidence.get("sha256") != digest:
+            raise ValueError("V_hold validation-event ledger digest does not match metadata")
 
 
 def _publish_staged(staging_dir: Path, output_dir: Path) -> tuple[Path, list[str]]:
@@ -749,16 +750,22 @@ def _publish_staged(staging_dir: Path, output_dir: Path) -> tuple[Path, list[str
     backup_dir = Path(tempfile.mkdtemp(prefix=".e2-backup-", dir=output_dir))
     published: list[str] = []
     completion_backed_up = False
+    staged_optional = tuple(
+        filename for filename in _OPTIONAL_PUBLISHED_FILENAMES if (staging_dir / filename).is_file()
+    )
     try:
         completion = output_dir / "complete.json"
         if completion.exists():
             os.replace(completion, backup_dir / completion.name)
             completion_backed_up = True
-        for filename in _PUBLISHED_FILENAMES:
+        # Every optional name is backed up whether or not this run staged one, so
+        # a prior run's verdict is removed rather than left to masquerade as this
+        # run's; rollback restores it from the backup.
+        for filename in _PUBLISHED_FILENAMES + _OPTIONAL_PUBLISHED_FILENAMES:
             canonical = output_dir / filename
             if canonical.exists():
                 os.replace(canonical, backup_dir / filename)
-        for filename in _PUBLISHED_FILENAMES:
+        for filename in _PUBLISHED_FILENAMES + staged_optional:
             os.replace(staging_dir / filename, output_dir / filename)
             published.append(filename)
     except BaseException:
@@ -797,26 +804,26 @@ def run_pipeline(
 ) -> int:
     """Execute the cold E2 pipeline and return 0 on success or 2 on a gated failure.
 
-    Stages: (1) load and validate the V3.1 config/runtime; (2) record whether the
-    pack path was initially absent; (3) build or strictly validate the pack within
-    the pack budget; (4) launch one fresh ``probe`` process group per candidate
-    token budget; (5) select the fastest valid result at or below the memory
-    limit; (6) launch one ``epoch-probe`` with the selected budget; (7) project 30
-    epochs plus completed setup/artifact allowance; (8) write ``failure.json`` and
-    return 2 when the projection exceeds the total budget; (9) launch one clean
-    ``train`` process group with the frozen budget; (10) merge stage/profile data
-    into ``profile.json``; and (11) write ``artifact_manifest.json`` with SHA-256
-    and byte size for ``best.pt``, ``last.pt``, ``metrics.jsonl``,
-    ``run_metadata.json``, and ``profile.json``.
+    Sub-stages, ``pack -> train -> publish``: (1) load and validate the
+    config/runtime; (2) record whether the pack path was initially absent;
+    (3) build or strictly validate the pack within the pack budget; (4) launch
+    one clean ``train`` process group at ``runtime.token_budget``; (5) validate
+    the worker's runtime profile and every staged artifact against
+    ``cfg.optim.epochs`` (which ``--epochs`` overrides for the qualification
+    stage); (6) merge stage/profile data into ``profile.json`` and write
+    ``artifact_manifest.json`` with SHA-256 and byte size for ``best.pt``,
+    ``last.pt``, ``metrics.jsonl``, ``run_metadata.json``, ``profile.json``, plus
+    the E2E ``qualification.json`` / ``v_hold_validation_events.jsonl`` when
+    applicable; and (7) publish the validated staging tree into the canonical
+    output directory with per-file atomic replaces and full rollback.
 
-    Every subprocess call goes through ``command_runner`` with ``check=False`` and
-    an explicit timeout (the remaining setup/probe budget for probe modes,
-    ``runtime.train_eval_budget_seconds`` for formal training). Candidate-local OOM
-    and non-finite probe failures are recorded as invalid candidates; systemic
-    probe failures and every failure after formal training starts stop immediately.
-    The selected configuration is frozen once formal training begins. After
-    artifact writing, a total elapsed time above ``runtime.total_budget_seconds``
-    is also a gated failure.
+    Every subprocess call goes through ``command_runner`` with ``check=False``
+    and an explicit timeout (``runtime.train_eval_budget_seconds`` for
+    training). Every failure after training starts stops immediately; nothing is
+    published until the whole staging tree has been validated — except the
+    qualification verdict, which is published on both the success and the
+    failure path because ``fail(<named_guard>)`` is itself a valid verdict the
+    formal stage must be able to refuse on.
 
     Args:
         args: Parsed pipeline CLI arguments.
@@ -847,6 +854,29 @@ def run_pipeline(
         if not hasattr(cfg, "run_kind"):
             raise ValueError("--run-kind is only supported by an E2E-aware worker")
         cfg = replace(cfg, run_kind=args.run_kind)
+    if args.epochs is not None:
+        # The formal schedule is registered and its config is digest-pinned, so an
+        # epoch override there would shorten the run behind a matching sha256.
+        if args.run_kind != "qualification":
+            raise ValueError("--epochs is only supported with --run-kind qualification")
+        if args.epochs <= 0:
+            raise ValueError("--epochs must be positive")
+        # Both _validate_worker_profile and _validate_staged_artifacts key off
+        # cfg.optim.epochs, so overriding it here is what makes them track the
+        # schedule the worker is actually told to run.
+        cfg = replace(cfg, optim=replace(cfg.optim, epochs=args.epochs))
+    if args.qualification_artifact is not None:
+        # The qualification stage *computes* this digest and writes the artifact;
+        # accepting one as its input would recreate the circularity the two-stage
+        # design removed. Only the formal stage reads it.
+        if args.run_kind == "qualification":
+            raise ValueError(
+                "--qualification-artifact is the qualification stage's output, not its input"
+            )
+        # Checked here so a formal run refuses before it spends the pack stage;
+        # the digest equality itself stays a worker-side check with one call site.
+        if not args.qualification_artifact.is_file():
+            raise ValueError(f"qualification artifact not found: {args.qualification_artifact}")
     if args.max_steps is not None and args.max_steps <= 0:
         raise ValueError("--max-steps must be positive")
     if cfg.runtime is None:
@@ -881,6 +911,67 @@ def run_pipeline(
             # retained history must not masquerade as this failure's evidence.
             (output_dir / "failed_run_history.json").unlink(missing_ok=True)
         write_failure(output_dir, stage=stage, message=message, extra=extra)
+        if args.run_kind == "qualification" and not debug_run:
+            # Failed attempts still count every V_hold look already performed.
+            # Preserve the adjacent, hash-bound evidence before staging teardown
+            # so the immutable attempt can be included in cumulative K.
+            for filename in ("run_metadata.json", V_HOLD_VALIDATION_EVENTS_FILENAME):
+                staged_evidence = staging_dir / filename
+                if staged_evidence.is_file():
+                    with suppress(OSError):
+                        os.replace(staged_evidence, output_dir / filename)
+        # A qualification failure is itself a verdict. Worker guard failures
+        # already carry the most specific name, while orchestration failures
+        # need a stable pipeline-owned name because the worker may never have
+        # launched. Reuse the worker's schema writer so this path cannot drift
+        # from the artifact consumed by the formal preflight.
+        if args.run_kind == "qualification" and not debug_run:
+            staged_qualification = staging_dir / QUALIFICATION_ARTIFACT_FILENAME
+            verdict = _QUALIFICATION_PIPELINE_FAILURE_VERDICTS[stage]
+            feature_stats_sha256 = ""
+            worker_failure_artifact = False
+            if staged_qualification.is_file():
+                with suppress(OSError, TypeError, ValueError, json.JSONDecodeError):
+                    payload = _validate_qualification_artifact_schema(
+                        json.loads(staged_qualification.read_text(encoding="utf-8")),
+                        epochs=cfg.optim.epochs,
+                    )
+                    staged_verdict = payload.get("verdict")
+                    if isinstance(staged_verdict, str) and staged_verdict.startswith(
+                        ("fail(", "training_invalid(")
+                    ) and staged_verdict.endswith(")"):
+                        verdict = staged_verdict
+                        worker_failure_artifact = True
+                    staged_digest = payload.get("feature_stats_sha256")
+                    if isinstance(staged_digest, str):
+                        feature_stats_sha256 = staged_digest
+            if worker_failure_artifact:
+                os.replace(
+                    staged_qualification,
+                    output_dir / QUALIFICATION_ARTIFACT_FILENAME,
+                )
+            else:
+                write_qualification = getattr(worker, "write_qualification_artifact", None)
+                if not callable(write_qualification):
+                    raise RuntimeError(
+                        "qualification worker must provide write_qualification_artifact"
+                    )
+                write_qualification(
+                    cfg,
+                    verdict=verdict,
+                    feature_stats_sha256=feature_stats_sha256,
+                    output_dir=output_dir,
+                )
+        elif not debug_run:
+            # Preserve the pre-existing formal behavior: rescue a staged
+            # optional artifact if present, otherwise clear the canonical one.
+            staged_qualification = staging_dir / QUALIFICATION_ARTIFACT_FILENAME
+            canonical_qualification = output_dir / QUALIFICATION_ARTIFACT_FILENAME
+            if staged_qualification.is_file():
+                with suppress(OSError):
+                    os.replace(staged_qualification, canonical_qualification)
+            else:
+                canonical_qualification.unlink(missing_ok=True)
         shutil.rmtree(staging_dir, ignore_errors=True)
         return 2
 
@@ -888,9 +979,14 @@ def run_pipeline(
 
     # --- pack: build (cold) or strictly validate (warm) within the pack budget ---
     required_pack_paths = getattr(worker, "required_pack_paths", None)
-    pack_paths = (
-        tuple(required_pack_paths(cfg, pack_dir)) if callable(required_pack_paths) else (pack_dir,)
-    )
+    try:
+        pack_paths = (
+            tuple(required_pack_paths(cfg, pack_dir))
+            if callable(required_pack_paths)
+            else (pack_dir,)
+        )
+    except Exception as error:
+        return fail(stage="pack", message=f"required pack path resolution failed: {error}")
     if not pack_paths or any(not isinstance(path, Path) for path in pack_paths):
         return fail(stage="pack", message="worker returned invalid required pack paths")
     cold_cache = any(not path.exists() for path in pack_paths)
@@ -939,268 +1035,74 @@ def run_pipeline(
     pack_evidence = cast(dict[str, object], pack_validation.get("packs", {}))
 
     profile_path = staging_dir / "profile.json"
-    probe_results: list[ProbeResult] = []
+    evidence_profile: dict[str, object] = {
+        "cold_cache": cold_cache,
+        "stage_seconds": dict(stage_seconds),
+        "token_budget": runtime.token_budget,
+        "pack_manifest": pack_manifest_payload,
+        "pack_identity_sha256": pack_identity_sha256,
+        "pack_evidence": pack_evidence,
+        "world_size": runtime.world_size,
+    }
+    _write_json_atomic(profile_path, evidence_profile)
 
-    def write_evidence(
-        *,
-        selected_token_budget: int | None = None,
-        projected_total_seconds: float | None = None,
-        epoch_probe: Mapping[str, object] | None = None,
-    ) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "cold_cache": cold_cache,
-            "stage_seconds": dict(stage_seconds),
-            "probe_results": [result.to_dict() for result in probe_results],
-            "selected_token_budget": selected_token_budget,
-            "projected_total_seconds": projected_total_seconds,
-            "pack_manifest": pack_manifest_payload,
-            "pack_identity_sha256": pack_identity_sha256,
-            "pack_evidence": pack_evidence,
-            "world_size": runtime.world_size,
-        }
-        if epoch_probe is not None:
-            payload["epoch_probe"] = dict(epoch_probe)
-        _write_json_atomic(profile_path, payload)
-        return payload
-
-    write_evidence()
-
-    # --- setup + probe: one fresh probe per candidate, then one epoch-probe ---
-    accelerate_bin = _resolve_accelerate_bin()
-    setup_probe_started = time.monotonic()
-    setup_probe_deadline = setup_probe_started + runtime.setup_probe_budget_seconds
-
-    skip_larger_after_oom = False
-    for token_budget in runtime.token_budget_candidates:
-        if skip_larger_after_oom:
-            probe_results.append(
-                ProbeResult(
-                    token_budget,
-                    False,
-                    0.0,
-                    0.0,
-                    "skipped after smaller token budget OOM",
-                )
-            )
-            write_evidence()
-            continue
-        remaining = setup_probe_deadline - time.monotonic()
-        if remaining <= 0:
-            write_evidence()
-            return fail(
-                stage="probe",
-                message="setup/probe budget exhausted before launching all candidate probes",
-                extra={"token_budget": token_budget},
-            )
-        profile_output = staging_dir / f"probe_{token_budget}.json"
-        profile_output.unlink(missing_ok=True)
+    # --- train: one clean process group at the configured token budget ---
+    train_started = time.monotonic()
+    worker_profile_path = staging_dir / "train_worker_profile.json"
+    worker_profile_path.unlink(missing_ok=True)
+    try:
         command = build_accelerate_command(
-            accelerate_bin=accelerate_bin,
+            accelerate_bin=_resolve_accelerate_bin(),
             config_path=args.config,
-            mode="probe",
+            mode="train",
             pack_dir=pack_dir,
             output_dir=output_dir if debug_run else staging_dir,
-            token_budget=token_budget,
-            profile_output=profile_output,
+            token_budget=runtime.token_budget,
+            profile_output=worker_profile_path,
             world_size=runtime.world_size,
             worker_module=args.worker_module,
             seed=args.seed,
             max_steps=args.max_steps,
             run_kind=args.run_kind,
+            epochs=args.epochs,
+            qualification_artifact=args.qualification_artifact,
         )
-        try:
-            completed = command_runner(command, remaining)
-        except subprocess.TimeoutExpired as error:
-            candidate_failure = _candidate_failure(cast(str | None, error.stderr or error.output))
-            if candidate_failure is not None:
-                failure_kind, failure_message = candidate_failure
-                probe_results.append(ProbeResult(token_budget, False, 0.0, 0.0, failure_message))
-                write_evidence()
-                skip_larger_after_oom = failure_kind == "oom"
-                continue
-            write_evidence()
-            return fail(
-                stage="probe",
-                message=f"probe subprocess timed out after {remaining:.1f}s",
-                extra={"token_budget": token_budget, "timeout_seconds": remaining},
-            )
-        if completed.returncode != 0:
-            candidate_failure = _candidate_failure(completed.stderr)
-            if candidate_failure is not None:
-                failure_kind, failure_message = candidate_failure
-                probe_results.append(ProbeResult(token_budget, False, 0.0, 0.0, failure_message))
-                write_evidence()
-                skip_larger_after_oom = failure_kind == "oom"
-                continue
-            write_evidence()
-            return fail(
-                stage="probe",
-                message=f"probe subprocess exited with code {completed.returncode}",
-                extra={
-                    "token_budget": token_budget,
-                    "returncode": completed.returncode,
-                    "stderr": completed.stderr,
-                },
-            )
-        try:
-            probe_data = cast(
-                dict[str, object], json.loads(profile_output.read_text(encoding="utf-8"))
-            )
-            probe_result = ProbeResult.from_dict(probe_data)
-            if probe_result.token_budget != token_budget:
-                raise ValueError(
-                    f"probe token_budget {probe_result.token_budget} does not match "
-                    f"command {token_budget}"
-                )
-            probe_results.append(probe_result)
-            write_evidence()
-        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
-            write_evidence()
-            return fail(
-                stage="probe",
-                message=f"probe profile is missing or malformed: {error}",
-                extra={"token_budget": token_budget},
-            )
-
-    try:
-        selected = select_probe_result(probe_results, memory_limit_gib=runtime.memory_limit_gib)
-    except RuntimeError as error:
-        write_evidence()
-        return fail(stage="probe", message=str(error))
-    logger.info(
-        "selected token budget %d (%.1f pairs/s, %.1f GiB peak)",
-        selected.token_budget,
-        selected.global_pairs_per_second,
-        selected.peak_memory_gib,
-    )
-
-    remaining = setup_probe_deadline - time.monotonic()
-    if remaining <= 0:
-        write_evidence(selected_token_budget=selected.token_budget)
-        return fail(
-            stage="epoch_probe",
-            message="setup/probe budget exhausted before the epoch probe",
-            extra={"token_budget": selected.token_budget},
-        )
-    epoch_profile_output = staging_dir / "epoch_probe.json"
-    epoch_profile_output.unlink(missing_ok=True)
-    command = build_accelerate_command(
-        accelerate_bin=accelerate_bin,
-        config_path=args.config,
-        mode="epoch-probe",
-        pack_dir=pack_dir,
-        output_dir=output_dir if debug_run else staging_dir,
-        token_budget=selected.token_budget,
-        profile_output=epoch_profile_output,
-        world_size=runtime.world_size,
-        worker_module=args.worker_module,
-        seed=args.seed,
-        max_steps=args.max_steps,
-        run_kind=args.run_kind,
-    )
-    try:
-        completed = command_runner(command, remaining)
-    except subprocess.TimeoutExpired:
-        write_evidence(selected_token_budget=selected.token_budget)
-        return fail(
-            stage="epoch_probe",
-            message=f"epoch-probe subprocess timed out after {remaining:.1f}s",
-            extra={"timeout_seconds": remaining},
-        )
-    if completed.returncode != 0:
-        write_evidence(selected_token_budget=selected.token_budget)
-        return fail(
-            stage="epoch_probe",
-            message=f"epoch-probe subprocess exited with code {completed.returncode}",
-            extra={"returncode": completed.returncode, "stderr": completed.stderr},
-        )
-    try:
-        epoch_probe_data = cast(
-            dict[str, object], json.loads(epoch_profile_output.read_text(encoding="utf-8"))
-        )
-        epoch_seconds = _positive_finite_seconds(
-            epoch_probe_data["epoch_seconds"], field="epoch_seconds"
-        )
-        projection_epoch_seconds = epoch_seconds
-        if cfg.model.family == "egostitch_e2e":
-            projection_epoch_seconds = conservative_e2e_epoch_seconds(
-                measured_epoch_seconds=epoch_seconds,
-                runtime_profile=epoch_probe_data.get("runtime_profile"),
-                full_joint_pairs_per_second=selected.global_pairs_per_second,
-            )
-            epoch_probe_data["projection_epoch_seconds"] = projection_epoch_seconds
-            epoch_probe_data["projection_basis"] = (
-                "max(measured_production_prefix, measured_non_compute_plus_"
-                "full_joint_candidate_compute)"
-            )
-    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
-        write_evidence(selected_token_budget=selected.token_budget)
-        return fail(
-            stage="epoch_probe",
-            message=f"epoch-probe profile is missing or malformed: {error}",
-        )
-    stage_seconds["setup_probe"] = time.monotonic() - setup_probe_started
-
-    # --- gate: project the full run before committing to formal training ---
-    projected_total_seconds = project_total_seconds(
-        pack_seconds=stage_seconds["pack"],
-        setup_probe_seconds=stage_seconds["setup_probe"],
-        epoch_seconds=projection_epoch_seconds,
-        epochs=1 if debug_run else cfg.optim.epochs,
-        artifact_seconds=float(runtime.artifact_budget_seconds),
-    )
-    evidence_profile = write_evidence(
-        selected_token_budget=selected.token_budget,
-        projected_total_seconds=projected_total_seconds,
-        epoch_probe=epoch_probe_data,
-    )
-    if projected_total_seconds > runtime.total_budget_seconds:
-        return fail(
-            stage="projection",
-            message=(
-                f"projected {projected_total_seconds:.1f}s exceeds {runtime.total_budget_seconds}s"
-            ),
-            extra={
-                "projected_seconds": projected_total_seconds,
-                "limit_seconds": runtime.total_budget_seconds,
-            },
-        )
-
-    # --- train: one clean process group with the frozen, selected configuration ---
-    train_started = time.monotonic()
-    worker_profile_path = staging_dir / "train_worker_profile.json"
-    worker_profile_path.unlink(missing_ok=True)
-    command = build_accelerate_command(
-        accelerate_bin=accelerate_bin,
-        config_path=args.config,
-        mode="train",
-        pack_dir=pack_dir,
-        output_dir=output_dir if debug_run else staging_dir,
-        token_budget=selected.token_budget,
-        profile_output=worker_profile_path,
-        world_size=runtime.world_size,
-        worker_module=args.worker_module,
-        seed=args.seed,
-        max_steps=args.max_steps,
-        run_kind=args.run_kind,
-    )
+    except Exception as error:
+        _write_json_atomic(profile_path, evidence_profile)
+        return fail(stage="train", message=f"training worker launch setup failed: {error}")
     try:
         completed = command_runner(command, float(runtime.train_eval_budget_seconds))
     except subprocess.TimeoutExpired:
         _write_json_atomic(profile_path, evidence_profile)
         return fail(
             stage="train",
-            message=f"formal training timed out after {runtime.train_eval_budget_seconds}s",
+            message=f"training timed out after {runtime.train_eval_budget_seconds}s",
             extra={"timeout_seconds": runtime.train_eval_budget_seconds},
         )
+    except Exception as error:
+        _write_json_atomic(profile_path, evidence_profile)
+        return fail(stage="train", message=f"training worker launch failed: {error}")
     if completed.returncode != 0:
         _write_json_atomic(profile_path, evidence_profile)
         return fail(
             stage="train",
-            message=f"formal training subprocess exited with code {completed.returncode}",
+            message=f"training subprocess exited with code {completed.returncode}",
             extra={"returncode": completed.returncode, "stderr": completed.stderr},
         )
     stage_seconds["train"] = time.monotonic() - train_started
+
+    # A zero worker exit is not a qualification verdict. Require the worker's
+    # schema-valid, identity-bound ``pass`` before any general staged-artifact
+    # validation can turn the run into a publishable success.
+    if args.run_kind == "qualification" and not debug_run:
+        try:
+            _validate_qualification_success_artifact(staging_dir, cfg=cfg, worker=worker)
+        except Exception as error:
+            _write_json_atomic(profile_path, evidence_profile)
+            return fail(
+                stage="artifacts",
+                message=f"qualification artifact is missing, malformed, or invalid: {error}",
+            )
 
     # --- merge the worker runtime profile with pipeline-level fields ---
     worker_data: object | None = None
@@ -1219,6 +1121,9 @@ def run_pipeline(
             epochs=completed_epochs if debug_run else cfg.optim.epochs,
             model_family=cfg.model.family,
             allow_partial=debug_run,
+            require_v_hold_validation_events=(
+                not debug_run and args.run_kind in ("qualification", "formal")
+            ),
         )
     except Exception as error:
         rejected_profile = {**evidence_profile}
@@ -1253,6 +1158,14 @@ def run_pipeline(
             "last.pt",
             "metrics.jsonl",
             "run_metadata.json",
+            # Digested when the qualification stage produced it: the formal
+            # stage's preflight reads this file, so it may not be published
+            # outside the integrity record.
+            *(
+                filename
+                for filename in _OPTIONAL_PUBLISHED_FILENAMES
+                if (staging_dir / filename).is_file()
+            ),
         )
         for filename in non_profile_filenames:
             artifact_path = staging_dir / filename
@@ -1261,8 +1174,7 @@ def run_pipeline(
                 "byte_size": artifact_path.stat().st_size,
             }
         # The recorded cutoff is immediately before the final profile write. The
-        # later wall-budget gate is deliberately stricter and includes both final
-        # JSON writes. The profile is never rewritten after its digest is taken.
+        # profile is never rewritten after its digest is taken.
         cutoff = time.monotonic()
         final_profile["timing_cutoff"] = "before_final_profile_write"
         final_profile["stage_seconds"] = {
@@ -1291,20 +1203,7 @@ def run_pipeline(
         return fail(stage="artifacts", message=f"artifact merge/manifest failed: {error}")
 
     # The staging tree is now complete and validated. Publication is reversible
-    # until the post-publication budget gate and success sentinel both pass.
-    prepublication_elapsed = time.monotonic() - pipeline_started
-    if prepublication_elapsed > runtime.total_budget_seconds:
-        return fail(
-            stage="total_budget",
-            message=(
-                f"total elapsed {prepublication_elapsed:.1f}s exceeds "
-                f"{runtime.total_budget_seconds}s"
-            ),
-            extra={
-                "total_seconds": prepublication_elapsed,
-                "limit_seconds": runtime.total_budget_seconds,
-            },
-        )
+    # until the success sentinel lands.
     try:
         backup_dir, published = _publish_staged(staging_dir, output_dir)
     except Exception as error:
@@ -1313,12 +1212,24 @@ def run_pipeline(
     (output_dir / "failed_run_profile.json").unlink(missing_ok=True)
     (output_dir / "failed_run_history.json").unlink(missing_ok=True)
     total_elapsed = time.monotonic() - pipeline_started
-    if total_elapsed > runtime.total_budget_seconds:
+    b0_formal_cold = (
+        not debug_run
+        and cold_cache
+        and cfg.model.family in ("v3_1", "f0_mlp")
+        and args.run_kind is None
+    )
+    if b0_formal_cold and total_elapsed > runtime.total_budget_seconds:
         _rollback_publication(output_dir, backup_dir, published)
         return fail(
             stage="total_budget",
-            message=f"total elapsed {total_elapsed:.1f}s exceeds {runtime.total_budget_seconds}s",
-            extra={"total_seconds": total_elapsed, "limit_seconds": runtime.total_budget_seconds},
+            message=(
+                f"cold formal pipeline elapsed {total_elapsed:.1f}s exceeds "
+                f"{runtime.total_budget_seconds}s"
+            ),
+            extra={
+                "elapsed_seconds": total_elapsed,
+                "limit_seconds": runtime.total_budget_seconds,
+            },
         )
     try:
         _write_json_atomic(
@@ -1331,11 +1242,7 @@ def run_pipeline(
     shutil.rmtree(backup_dir, ignore_errors=True)
     shutil.rmtree(staging_dir, ignore_errors=True)
 
-    logger.info(
-        "E2 pipeline complete: %.1fs elapsed (budget %ds)",
-        total_elapsed,
-        runtime.total_budget_seconds,
-    )
+    logger.info("E2 pipeline complete: %.1fs elapsed", total_elapsed)
     return 0
 
 

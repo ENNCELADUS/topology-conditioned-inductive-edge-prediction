@@ -15,7 +15,7 @@ number. The exceptions below are the ways to get a wrong number silently.
 - Registrations live in `docs/registrations/*.json`. The `.md` twin is
   explanatory only — **if they disagree, the JSON governs**.
 - The training worker records the registration JSON's SHA-256 in
-  `run_metadata.json` at run start. `src/experiments/g5_stage1.py:139`
+  `run_metadata.json` at run start. `src/experiments/g5_stage1.py:165`
   (`_enforce_metadata_registration_hash`) refuses to open any held-out metric
   when the hashes disagree. Spec §13.14, §13.18.
 - A `BINDING` registration is **immutable**. Amending it means a new versioned
@@ -25,9 +25,15 @@ number. The exceptions below are the ways to get a wrong number silently.
 - Changing *any* threshold, optimizer, schedule, precision, candidate grid,
   success inequality, or frozen input after binding is a **scientific change**
   requiring a new registration version — not a bugfix. Spec §13.19.2.
-- Qualification evidence may tune **no** held-out or test quantity. Three
-  rehearsal attempts max; a fourth requires a new registration version.
-  Spec §13.19.4.
+- The E2E ladder is **two stages**: `hpc/qualification.sh qualify <arm>` then
+  `formal <arm>`, both training the full `V_fit` and validating on `V_hold`, differing
+  only in `optim.epochs`. The calibrate → threshold-freeze → rehearse pre-binding
+  ladder and its attempt window are gone. Qualification is unregistered, unlimited, and
+  guards-only — but it may still tune **no** held-out or test quantity, and it never
+  produces a result. Spec §13.19.4, §14.4.7.
+- The formal stage carries **pre-registered acceptance thresholds pinned before test
+  opens** (protocol §5.2.4). A guards-only qualification pass is a licence to run the
+  formal stage, never a substitute for those thresholds.
 
 ## Binding vs diagnostic-only
 
@@ -39,8 +45,9 @@ number. The exceptions below are the ways to get a wrong number silently.
   formal `best.pt` verdict, even when it scores better.
 - Non-finite values may not be serialized away in a manner that permits success.
 - `--max-steps` runs are debug-only and are redirected to `*_debug` directories
-  (`src/e2_pipeline.py:861`). Debug artifacts are forbidden from candidate/test
-  scoring, not merely from the final gate. Spec §13.18, §13.19.5.
+  (`src/e2_pipeline.py:685-688`); `--max-steps` is never a substitute for either
+  stage's schedule. Debug artifacts are forbidden from candidate/test scoring, not
+  merely from the final gate. Spec §13.18, §13.19.5.
 
 ## Claim rules
 
@@ -48,6 +55,10 @@ number. The exceptions below are the ways to get a wrong number silently.
   Stage-1 screen.** It is a fixed-Seed-0 engineering screen: p-values, CIs, and
   Holm decisions must be emitted as `null`/not-applicable. Only E1/E3, with ≥3
   seeds plus Holm, carry inferential claims. Spec §13.15; protocol §5.2.3.
+  **The two-stage ladder emits `evidence_class: engineering` at every seed count** —
+  extra seeds buy cross-seed *variance reporting*, never significance, because
+  inference additionally needs the spec §8 30-config HPO-parity budget and Holm over
+  the pre-registered held-out assembled family. Protocol §5.0.5, §5.2.4.
 - **Never headline one metric family alone.** Every claim reports edge-level
   *and* assembled-graph metrics together, with the held-out family headlined and
   noise-floor / ceiling / Oracle reference rows attached. Methodology §6.5;

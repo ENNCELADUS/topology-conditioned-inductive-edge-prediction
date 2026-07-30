@@ -10,7 +10,6 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HPC_DIR = REPO_ROOT / "hpc"
 RUNNER = HPC_DIR / "run.sh"
-G5_RUNNER = HPC_DIR / "g5_stage1.sh"
 
 
 @pytest.fixture(scope="module")
@@ -23,10 +22,14 @@ def bash_exe() -> str:
 
 
 def test_hpc_layer_has_only_runners_and_documentation() -> None:
-    """The old scheduler layer is replaced by direct, tracked runners."""
+    """The old scheduler layer is replaced by direct, tracked runners.
+
+    `g5_stage1.sh` orchestrated the frozen-s0 `egostitch` family and was
+    deleted with it (design 2026-07-29 Sec 6.2); the EgoStitch ladder is now
+    entirely inside `qualification.sh`.
+    """
     assert sorted(path.name for path in HPC_DIR.iterdir()) == [
         "README.md",
-        "g5_stage1.sh",
         "qualification.sh",
         "run.sh",
     ]
@@ -48,19 +51,6 @@ def test_runner_is_valid_executable_bash(bash_exe: str) -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_g5_runner_is_valid_executable_bash(bash_exe: str) -> None:
-    assert G5_RUNNER.read_text().splitlines()[0] == "#!/usr/bin/env bash"
-    assert "set -euo pipefail" in G5_RUNNER.read_text()
-    assert G5_RUNNER.stat().st_mode & stat.S_IXUSR
-    result = subprocess.run(
-        [bash_exe, "-n", str(G5_RUNNER)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-
-
 def test_help_is_available_without_the_remote_container(bash_exe: str) -> None:
     """Usage can be inspected locally before the fixed remote paths are checked."""
     result = subprocess.run(
@@ -70,63 +60,14 @@ def test_help_is_available_without_the_remote_container(bash_exe: str) -> None:
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    for command in ("check", "train", "s0-score", "score", "merge", "g1", "g2"):
+    for command in ("check", "train", "score", "merge", "g1", "g2"):
         assert f"hpc/run.sh {command}" in result.stdout
-    # The EgoStitch Stage-1 worker routes through the same train entry.
-    assert "--worker-module src.train_egostitch" in result.stdout
-
-    g5_result = subprocess.run(
-        [bash_exe, str(G5_RUNNER), "--help"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert g5_result.returncode == 0, g5_result.stderr
-    assert "hpc/g5_stage1.sh seed <0|1|2>" in g5_result.stdout
-    assert "single-seed Stage-1 screening gate" in g5_result.stdout
-
-
-def test_g5_runner_completes_fixed_seed_before_screening_gate() -> None:
-    text = G5_RUNNER.read_text()
-    run_seed_body = text[text.index("run_seed()") : text.index("run_formal()")]
-    assert run_seed_body.index("hpc/run.sh train") < run_seed_body.index("hpc/run.sh score")
-    assert "-m src.experiments.g5_stage1" not in run_seed_body
-    formal_body = text[text.index("run_formal()") :]
-    assert formal_body.index("run_seed 0") < formal_body.index(
-        '--output-dir "${FORMAL_ROOT}/formal_gate"'
-    )
-    assert "Holm-corrected inference" in text
-
-
-def test_g5_formal_runner_builds_every_registered_gate_input() -> None:
-    """Formal orchestration must produce diagnostics and fresh fp32 s0 scores."""
-    text = G5_RUNNER.read_text()
-    formal_body = text[text.index("run_formal()") :]
-
-    assert "src.experiments.g5_stage1_diagnostics" in text
-    assert '--checkpoint "${B0_CHECKPOINT}"' in text
-    assert "--amp bf16" in text
-    assert "--pair-amp off" in text
-    assert "--token-budget 262144" in text
-    assert '--s0-universe "${S0_CANDIDATE}"' in formal_body
-    assert formal_body.index("run_diagnostics") < formal_body.index("-m src.experiments.g5_stage1")
-
-
-def test_g5_seed_reuse_is_bound_to_registration_config_and_commit() -> None:
-    text = G5_RUNNER.read_text()
-    training_check = text[text.index("training_is_current()") : text.index("run_seed()")]
-
-    assert "preregistration_sha256" in training_check
-    assert "config_hash" in training_check
-    assert "source_commit" in training_check
-    assert "state=complete stage=candidate_score" in text
-
-
-def test_g5_runner_rejects_candidate_without_precision_provenance_before_reuse() -> None:
-    text = G5_RUNNER.read_text()
-    candidate_check = text[text.index("candidate_is_current()") : text.index("run_seed()")]
-    assert "validate_score_precision" in candidate_check
-    assert "meta=a.meta" in candidate_check
+    # `s0-score` served the retired frozen-s0 family and must not come back.
+    assert "s0-score" not in result.stdout
+    # Both EgoStitch stages own their own preflights, so neither is launchable
+    # from the generic runner.
+    assert "hpc/qualification.sh" in result.stdout
+    assert "src.train_egostitch" not in result.stdout
 
 
 def test_runner_discovers_visible_h20s() -> None:
@@ -148,7 +89,9 @@ def test_docs_describe_auto_sized_h20_runtime() -> None:
     readme = (REPO_ROOT / "README.md").read_text()
     claude = (REPO_ROOT / "CLAUDE.md").read_text()
     config = (REPO_ROOT / "configs" / "b0_v31_breadth_first.yaml").read_text()
-    egostitch_config = (REPO_ROOT / "configs" / "egostitch_stage1_breadth_first.yaml").read_text()
+    egostitch_config = (
+        REPO_ROOT / "configs" / "egostitch_e2e_v3_full_breadth_first.yaml"
+    ).read_text()
 
     assert "all visible NVIDIA H20" in " ".join(hpc.split())
     assert "auto-detected" in " ".join(readme.split())
@@ -170,15 +113,16 @@ def test_runner_dispatches_to_the_implemented_clis() -> None:
     assert 'tests/test_e2_ddp_integration.py -m "integration and not slow"' in text
 
 
-def test_s0_scoring_uses_packed_auto_sharded_fast_path() -> None:
+def test_scoring_is_auto_sharded_and_strictly_merged() -> None:
+    """`score` owns sharding: one contiguous shard per visible GPU, then a merge."""
     text = RUNNER.read_text()
 
-    assert "s0-score)" in text
-    assert "outputs/s0_cache/manifests/all_seeds.tsv" in text
-    assert "outputs/feature_packs/b0_v31_bf16" in text
-    assert '--pack-dir "${S0_PACK_DIR}"' in text
-    assert "--token-budget 1048576" in text
-    assert "parallel_score \\\n" in text
+    assert "s0-score" not in text
+    assert "outputs/s0_cache" not in text
+    assert 'fail "hpc/run.sh score owns sharding' in text
+    assert '--shard "${gpu}"' in text
+    assert '--num-shards "${GPU_COUNT}"' in text
+    assert '-m src.score_universe merge --inputs "${shard_inputs[@]}"' in text
 
 
 @pytest.mark.parametrize(

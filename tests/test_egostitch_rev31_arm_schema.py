@@ -84,7 +84,7 @@ def test_v3_configs_load_and_have_only_registered_arm_differences() -> None:
     }
     for arm, config in loaded.items():
         assert config.preregistration == Path(
-            "docs/registrations/g5_e2e_stage1_preregistration_v3.json"
+            "docs/registrations/g5_e2e_stage1_preregistration_v4.json"
         )
         output_arm = "f_only" if arm == "b0_e2e_f_only" else arm
         assert config.output_dir == Path(f"outputs/egostitch_e2e_stage1_v3/{output_arm}")
