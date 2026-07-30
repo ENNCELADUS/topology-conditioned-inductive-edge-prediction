@@ -112,6 +112,7 @@ def _e2e_training_cfg(tmp_path: Path, run_kind: te.E2ERunKind | None = None) -> 
         cfg,
         model=replace(cfg.model, family="egostitch_e2e", config=dict(_E2E_TINY_MODEL)),
         training=te.EgoStitchTrainingConfig(),
+        optim=replace(cfg.optim, epochs=3) if run_kind == "qualification" else cfg.optim,
         run_kind=run_kind,
     )
 
@@ -392,10 +393,10 @@ class TestQualificationEpochOverride:
                 replace(_toy_cfg(tmp_path), training=None), self._args("--epochs", "3")
             )
 
-    @pytest.mark.parametrize("epochs", ["0", "-1"])
-    def test_a_non_positive_override_is_refused(self, tmp_path: Path, epochs: str) -> None:
+    @pytest.mark.parametrize("epochs", ["-1", "0", "2", "4"])
+    def test_any_non_three_override_is_refused(self, tmp_path: Path, epochs: str) -> None:
         cfg = _e2e_training_cfg(tmp_path)
-        with pytest.raises(ValueError, match="--epochs must be positive"):
+        with pytest.raises(ValueError, match="qualification --epochs must equal 3"):
             te.apply_overrides(cfg, self._args("--run-kind", "qualification", "--epochs", epochs))
 
     def test_the_override_does_not_move_the_model_config_digest(self, tmp_path: Path) -> None:
@@ -421,6 +422,10 @@ class TestQualificationEpochOverride:
         assert metadata["checkpoint_eligible"] is False
         assert metadata["selected_checkpoint_eligible"] is False
         assert metadata["formal_artifacts_published"] is False
+        assert metadata["validation_liveness_pass"] is False
+        assert metadata["checkpoint_role"] == "qualification_manual_review_only"
+        assert metadata["diagnostic_checkpoint_epoch"] == 1
+        assert metadata["diagnostic_checkpoint_sha256"] == metadata["checkpoint_sha256"]
 
     def test_formal_artifacts_stay_eligible(self, tmp_path: Path) -> None:
         cfg = _toy_cfg(tmp_path)
@@ -432,6 +437,9 @@ class TestQualificationEpochOverride:
         assert metadata["checkpoint_eligible"] is True
         assert metadata["selected_checkpoint_eligible"] is True
         assert metadata["formal_artifacts_published"] is True
+        assert metadata["checkpoint_role"] == "formal_selected"
+        assert metadata["diagnostic_checkpoint_epoch"] is None
+        assert metadata["diagnostic_checkpoint_sha256"] is None
 
     def test_formal_checkpoint_without_a_selected_epoch_is_not_eligible(
         self, tmp_path: Path
@@ -885,6 +893,12 @@ class TestQualificationVerdictCoversPreTrainingGuards:
             raise error
 
         monkeypatch.setattr(te, "assemble_egostitch_data", refuse)
+
+    def test_worker_entry_rejects_a_non_three_epoch_qualification(self, tmp_path: Path) -> None:
+        cfg = _e2e_training_cfg(tmp_path, run_kind="qualification")
+        cfg = replace(cfg, optim=replace(cfg.optim, epochs=2))
+        with pytest.raises(ValueError, match="qualification worker requires exactly 3 epochs"):
+            te._run_ddp_worker(cfg, self._args(tmp_path))
 
     def test_a_held_out_trespass_before_training_is_recorded_and_re_raised(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

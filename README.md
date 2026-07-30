@@ -49,7 +49,7 @@ The active build line is **rev-3.2** of the end-to-end stitched-topology-conditi
 pair encoder, and it runs on a **two-stage ladder**:
 
 ```bash
-hpc/qualification.sh qualify <arm>   # short schedule, guards-only verdict — the dev loop
+hpc/qualification.sh qualify <arm>   # 3 epochs, finite-quality telemetry -> pending manual review
 hpc/qualification.sh formal  <arm>   # registered schedule — results
 ```
 
@@ -307,7 +307,7 @@ directly in the repository checkout. Neither may be replaced by a hard-coded sin
 launch, and neither substitutes `--max-steps` for its schedule.
 
 ```bash
-hpc/qualification.sh qualify full   # 3 epochs, every visible H20, guards-only verdict
+hpc/qualification.sh qualify full   # 3 epochs, every visible H20, telemetry-completion verdict
 hpc/qualification.sh formal  full   # registered schedule; needs 4 × H20 + clean checkout + BINDING registration
 ```
 
@@ -315,8 +315,9 @@ Every `qualify` invocation gets an immutable directory under
 `outputs/egostitch_e2e_stage1_v3/qualification/<arm>/attempts/attempt-*/` and writes
 its `qualification.json` there (verdict, `feature_stats_sha256`,
 `model_config_sha256`). The arm-local `latest` pointer records the newest attempt,
-including failures; `latest-pass` advances only after a successful attempt, and
-`formal` reads that pointer. Preserving every attempt makes the cumulative count `K`
+including failures; `latest-pass` does not advance for `pending_manual_review`, and
+formal inspects the authoritative current attempt rather than falling back to that
+historical pointer. Preserving every attempt makes the cumulative count `K`
 of `V_hold` evaluations auditable instead of letting repeated development selection
 disappear. Each arm's `attempt_history.json` uses schema
 `egostitch_e2e_qualification_history_v1`; binding requires path-and-SHA-256 references

@@ -532,6 +532,22 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-30 (owner-confirmed, supersedes the earlier qualification-verdict
+  amendment below): qualification is a complete three-epoch telemetry run, not a
+  finite model-quality gate. Every finite threshold or quality predicate is
+  telemetry-only in qualification: initial and during-training slot statistics,
+  finite zero gradient/family norms, immediate and persistent clip coefficients,
+  family-norm ratio, warm-reference and validation logit-dispersion floors,
+  BF16/fp32 precision differentials, validation-collapse predicates, and checkpoint
+  eligibility. The registered clipping operation remains unchanged. Only non-finite
+  values, DDP synchronization/equality failures, boundary violations, incomplete or
+  inexact coverage, and I/O/infrastructure failures abort qualification. A run that
+  completes all three epochs writes `pending_manual_review` even if no quality-eligible
+  checkpoint exists; in that case the final epoch is exposed through the existing
+  checkpoint compatibility aliases for diagnostic manual review only, and neither
+  `best.pt` nor `last.pt` authorizes formal. Formal
+  guards, eligibility, selection, and fail-closed preflight are unchanged. This entry
+  defines no approval artifact or automatic conversion to `pass`; v4 remains `DRAFT`.
 - 2026-07-30 (owner-confirmed): qualification no longer converts persistent
   clipping into an automatic abort or an automatic pass. The registered clipping
   operation itself is unchanged: the pair and generator groups are still clipped
@@ -539,11 +555,11 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   clip coefficient, and consecutive-low-coefficient streak remains complete
   telemetry. Specifically, the `< 0.1` for ten consecutive steps condition remains
   a hard failure in formal training but is telemetry-only during qualification;
-  the one-step `< 1e-3` extreme, non-finite checks, family-imbalance guard,
-  logit-collapse guard, slot-collapse guard, and no-eligible-checkpoint outcome are
-  unchanged hard failures. A qualification that completes its entire reduced
-  schedule, retains complete telemetry, has an eligible selected checkpoint, and
-  hits none of those other hard failures writes `pending_manual_review`, never
+  the one-step `< 1e-3` extreme, family-imbalance guard, logit-collapse guard,
+  slot-collapse guard, and no-eligible-checkpoint outcome were still hard failures
+  under this intermediate amendment; the owner-confirmed entry immediately above
+  supersedes that qualification-only treatment. A qualification that completes its
+  entire reduced schedule and retains complete telemetry writes `pending_manual_review`, never
   `pass`. `pending_manual_review` is not formal authorization and formal preflight
   rejects it. This entry defines no approval artifact, no automatic conversion to
   `pass`, and no in-place edit of an immutable attempt; the owner will decide any
@@ -612,13 +628,11 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   `V_hold := V_qual ∪ V_select` validates and selects checkpoints for both, so
   `V_fit`, `e_msg_fit`, `e_sup_fit`, `G_fit`, and `feature_stats_sha256` stay
   bit-identical to the two-holdout definition. The qualification verdict is
-  guards-only (§13.19.2 guards, the `training_invalid(slot_collapse)` abort,
-  plus an explicit `fail(no_eligible_checkpoint)` category) — no AUPRC or
-  topology floor; checkpoint eligibility (§13.19.3) is retained at both stages
-  regardless (its absolute floor is lower under the `V_hold` union — disclosed
-  at §13.19.3, not "unchanged"), since "guards-only" governs the verdict, not
-  eligibility, and eligibility is what prevented the documented 2026-07-19 v1
-  failure (selection landing on a reconstruction-only warm-start checkpoint). The formal stage carries pre-registered acceptance
+  telemetry-completion-only for finite model-quality signals; only non-finite,
+  DDP, boundary, coverage, and I/O/infrastructure failures abort it. Checkpoint
+  eligibility (§13.19.3) is still computed and reported during qualification but
+  governs checkpoint selection only in formal. Its absolute floor is lower under
+  the `V_hold` union — disclosed at §13.19.3, not "unchanged". The formal stage carries pre-registered acceptance
   thresholds recorded before test opens (protocol §5.2.4). §13's G5 Stage-1
   carve-out gains a short scope note: §13.1-13.17 govern the completed,
   published frozen-s0 screen only (`docs/results/G5-stage1-seed0-20260717.md`,
@@ -1781,10 +1795,11 @@ all-gathers `S_G` to assert cross-rank equality, and records
 `norm_G = sqrt(mean_ranks(S_G))`; summing identical replicated norms across ranks is
 forbidden. `clip_G = min(1, c_G/(norm_G + 1e-12))`, where `c_G=3` for the
 pair-encoder/head and generator groups and `c_G=1` for topology/content conditioning.
-A group that is
-inactive by the phase/arm contract is recorded as inactive and excluded from clip
-thresholds; an active group with zero norm is invalid. After the optimizer step, all
-parameters and optimizer-state tensors are checked.
+A group that is inactive by the phase/arm contract is recorded as inactive and
+excluded from clip thresholds. An active group with a finite zero norm is a formal
+failure and qualification telemetry; a non-finite norm is a hard failure in both
+stages. After the optimizer step, all parameters and optimizer-state tensors are
+checked.
 
 The fixed replay probe remains every 50 steps. It uses the same checkpoint, replay
 batch, evaluation masks, and retained graph; one isolated backward per active loss
@@ -1794,27 +1809,34 @@ gradients. Only families active by the current phase and arm enter imbalance che
 The ratio is computed within each
 shared optimizer group across its active families; groups with fewer than two active
 families are reported but not ratio-tested. Disabled/null families never enter the
-median. A non-positive or non-finite median for an otherwise testable group is an
-invalid probe.
+median. A non-positive finite median for an otherwise testable group is a formal
+failure and qualification telemetry; a non-finite median is a hard failure in both
+stages.
 
-Except for the qualification-only persistent-clipping treatment stated below, the run
-aborts synchronously on every rank and publishes only a failure artifact when any of
-the following occurs:
+In formal training, the run aborts synchronously on every rank and publishes only a
+failure artifact when any of the following occurs:
 
 - a loss, logit, parameter, optimizer-state tensor, gradient tensor, family norm, or
   submodule RMS is non-finite;
 - any optimizer group has clip coefficient `< 1e-3` on one step;
-- in formal training, any optimizer group has clip coefficient `< 0.1` for ten
-  consecutive steps. Qualification continues through this condition, preserving the
-  same actual clipping and complete norm/coefficient/streak telemetry for manual
-  review; this qualification-only exception does not change the clip thresholds or
-  optimizer update;
+- any optimizer group has clip coefficient `< 0.1` for ten consecutive steps;
 - the per-group fixed-probe `max(active_family_norm) / median(active_family_norm)`
   exceeds `50` for four consecutive probes after `alpha = 1`;
 - pair-logit standard deviation on the frozen stability-validation split falls below
   `max(0.25 * warm_reference_std, 1e-4)` for two consecutive validations. The
 reference is measured after the final warm-start optimizer step in evaluation mode
 and must itself be finite and at least `1e-4`.
+
+Qualification applies the identical clipping operation and records every predicate
+above, but every **finite** model-quality outcome is telemetry-only: finite zero
+gradient/family norm, either clip-coefficient threshold, family imbalance, the finite
+warm-reference floor, and validation logit collapse do not abort. Initial and
+during-training slot thresholds (§14.4.8), finite BF16/fp32 precision-differential
+threshold misses, and all checkpoint-quality/eligibility predicates (§13.19.3) are
+likewise telemetry-only. Non-finite values remain hard failures. DDP
+synchronization/equality failure, boundary violation, incomplete or duplicate
+coverage, and I/O/infrastructure failure are also hard qualification failures. This
+stage override does not weaken any formal guard.
 
 The `0.1`/`0.001` clip-coefficient and `50` imbalance thresholds were DRAFT until a
 completed full-schedule run recorded their empirical distribution. The 2026-07-22 run
@@ -1829,7 +1851,7 @@ to the scaffold-era `0.12`), minimum `> 0.0012`, and longest consecutive run bel
 floors are checked by `validate_e2e_qualification_profile` at the **formal** stage
 (§13.19.4 item 2), which is the repo's only clip-coefficient / family-ratio /
 submodule-RMS margin gate; the qualification stage records the underlying telemetry
-but does not turn the persistent-clipping streak into an automatic verdict. Changing a
+but does not turn any finite model-quality threshold into an automatic verdict. Changing a
 threshold after binding is a scientific change.
 
 No `best.pt`, `complete.json`, candidate scores, or gate input may be published from
@@ -1947,18 +1969,21 @@ compared against the full-arm warm reference. The within-checkpoint liveness dea
 rule remains a gate preflight, but is not a duplicate eligibility test once item 4
 has passed.
 
-Selection is topology-aware without sacrificing registered edge tolerance. First
+Formal selection is topology-aware without sacrificing registered edge tolerance. First
 retain eligible epochs whose checkpoint-selection AUPRC is within `auprc_tolerance` of
 the best eligible AUPRC for that arm; among them choose the lowest train-side validation
 clustering MMD. Within MMD tolerance `1e-6`, choose lower unweighted Brier score and
 then the earlier epoch. Warm-start/ramp epochs may be retained as diagnostics but can
-never win. If no epoch is eligible, the run is invalid and there is no fallback to
-epoch 1, `last.pt`, or the numerically least-bad checkpoint.
+never win. If no epoch is eligible, the formal run is invalid and there is no fallback
+to epoch 1, `last.pt`, or the numerically least-bad checkpoint. Qualification still
+computes and records these eligibility predicates for manual review; if none passes,
+its final epoch is exposed through the existing checkpoint compatibility aliases for
+diagnostic manual review only, never as an eligible checkpoint or formal authorization.
 
 #### 13.19.4 Qualification-stage verdict, artifact, and boundary audit
 
 The qualification stage trains the full `V_fit` universe at a short schedule
-(`optim.epochs` reduced from the formal stage's registered full schedule; the
+(`optim.epochs = 3`, reduced from the formal stage's registered full schedule; the
 §13.19.1 three-phase curriculum boundaries scale with `schedule_total_steps =
 steps_per_epoch × epochs`, so a short run still traverses Phases A→B→C — Phase
 C opens at 30% of the schedule regardless of its length) and validates on
@@ -1967,31 +1992,26 @@ iteration a fast development loop; it is not a scientific gate, and its
 `pending_manual_review` does not license any held-out claim or formal run.
 
 1. **Verdict — complete run, then manual review.** Qualification never emits an
-   automatic `pass`. If the complete reduced schedule finishes, complete clipping
-   telemetry is retained, an eligible checkpoint is selected, and no hard failure
-   below occurs, `verdict = pending_manual_review`. Persistent clipping — clip
-   coefficient `< 0.1` for ten consecutive steps — does not abort qualification;
-   the registered clip operation remains active and its pre-clip norm, coefficient,
-   and streak are recorded for every step. There is no AUPRC floor and no topology
-   floor in this artifact verdict. Named hard-failure outcomes remain:
-   any §13.19.2 guard trip is `fail(<named_guard>)`; the slot-collapse guard —
-   mean pairwise `h` cosine `> 0.95`, or the Π rank-1 marginal residual
-   `‖Π − r c^T / m‖_F / ‖Π‖_F < 0.05`, for 2 consecutive validations after
-   conditioning activates (§14.4.8) — is `training_invalid(slot_collapse)`, a
-   category distinct from `fail(<named_guard>)` because it is a
-   during-training guard rather than one of §13.19.2's step-level fail-fast
-   checks, and is the documented rev-3.1/rev-3.2 abort mode;
-   `select_e2e_checkpoint` finding no eligible checkpoint is
-   `fail(no_eligible_checkpoint)` — a category distinct from a guard trip,
-   since checkpoint eligibility (below) can fail with every other guard clean.
-   The §13.19.2 one-step `< 1e-3` extreme, non-finite, family-imbalance, and
-   logit-collapse failures remain active; only its ten-consecutive-step
-   persistent-clipping abort is qualification-exempt. No approval artifact or
+   automatic `pass`. If all three epochs finish with exact coverage and required
+   telemetry, and no hard failure below occurs, `verdict = pending_manual_review`
+   regardless of checkpoint eligibility. The registered clip operation remains active
+   and every pre-clip norm, coefficient, and streak is recorded. Initial/during slot
+   thresholds, finite zero gradient/family norms, immediate/persistent clipping,
+   family imbalance, warm-reference and validation-collapse floors, precision
+   thresholds, and checkpoint eligibility are model-quality telemetry only. If no
+   checkpoint is quality-eligible, the final epoch is exposed through the existing
+   `best.pt`/`last.pt` compatibility aliases for diagnostic manual review; metadata,
+   metrics, and the profile mark it non-eligible, and neither alias is formal
+   authorization. Hard qualification outcomes retain `fail(<named_guard>)`, limited
+   to non-finite values, DDP, boundary, coverage, and
+   I/O/infrastructure failures. An interrupt, timeout, OOM, worker/process failure,
+   incomplete epoch, missing required telemetry/artifact, or inexact/duplicate
+   coverage cannot produce `pending_manual_review`. No approval artifact or
    automatic/manual conversion to `pass` is defined here.
 2. **Artifact.** The qualification stage writes exactly one artifact:
 
    ```json
-   { "verdict": "pending_manual_review" | "fail(<named_guard>)" | "training_invalid(slot_collapse)" | "fail(no_eligible_checkpoint)",
+   { "verdict": "pending_manual_review" | "fail(<named_guard>)",
      "epochs", "hparams",
      "feature_stats_sha256",
      "model_config_sha256" }
@@ -2015,6 +2035,9 @@ iteration a fast development loop; it is not a scientific gate, and its
    decision must specify any such mechanism without editing the immutable attempt.
    Preflight must inspect the current immutable attempt and may not bypass a latest
    `pending_manual_review` by falling back to an earlier `pass` artifact.
+
+   The existing profile, metrics, and run metadata carry the complete finite-threshold
+   telemetry, per-predicate eligibility status, and diagnostic-selection identity.
 
    `validate_e2e_qualification_profile` — the repo's only clip-coefficient /
    family-ratio / submodule-RMS margin gate — is retained and runs at the
@@ -2075,13 +2098,13 @@ iteration a fast development loop; it is not a scientific gate, and its
    (Historical §13.19.4 numbering:
    item-5; §12 change-log, 2026-07-23 binding-mechanics amendment.)
 
-**Checkpoint eligibility is retained in full and is not weakened by manual
-review.** The §13.19.3 eligibility conditions govern which checkpoint, if any,
-is eligible at *both* stages, retained — with the absolute value of item 3's
+**Formal checkpoint eligibility is retained in full and is not weakened by manual
+review.** The §13.19.3 eligibility conditions govern formal selection, while
+qualification computes them as telemetry — with the absolute value of item 3's
 `prevalence + 0.02` floor lowered by the `V_hold` union (§13.19.3, disclosed
-there), not "unchanged." The qualification verdict policy (item 1) does not
-touch what makes a checkpoint eligible. This
-distinction is load-bearing: it is what prevents selection from landing on a
+there), not "unchanged." A qualification diagnostic selection is never formally
+eligible merely because it was recorded. This distinction is load-bearing: formal
+eligibility prevents selection from landing on a
 reconstruction-only warm-start checkpoint, the documented 2026-07-19 v1
 failure.
 
@@ -2116,13 +2139,16 @@ establish all of the following:
 - **Groups and precision:** trainable parameter groups are disjoint/exhaustive;
   Kendall scalars have no trainable gradient; end-ramp and selected-checkpoint
   differentials pass with identical replay identities and masks.
-- **Failure publication:** injected NaN/Inf, a one-step extreme norm, and a collapsed
-  logit stream abort synchronously and publish no `best.pt`, `complete.json`, score,
-  or gate input. A persistent-clipping streak aborts formal synchronously; in
-  qualification it instead completes under unchanged clipping, preserves exact
-  telemetry, and may produce only `pending_manual_review`, never `pass`.
-- **Selection:** warm-start/ramp checkpoints cannot become eligible; all six training
-  arms exercise their arm-specific rules; no-eligible always yields `invalid`; the
+- **Failure publication:** injected NaN/Inf, DDP mismatch, boundary violation,
+  inexact coverage, and I/O/infrastructure failure abort qualification synchronously.
+  Every finite model-quality threshold is instead recorded while qualification
+  continues under unchanged clipping; a complete three-epoch run produces only
+  `pending_manual_review`, never `pass`. The same finite conditions remain hard where
+  specified in formal.
+- **Selection:** warm-start/ramp checkpoints cannot become formally eligible; all six training
+  arms exercise their arm-specific rules; no-eligible invalidates formal but a
+  completed qualification exposes its final epoch through the existing compatibility
+  aliases as diagnostic-only; the
   topology-aware selector and deterministic tie-break reproduce exactly. The
   `auprc_tolerance` calibration reproduces bit-for-bit from its bound source artifact:
   immutable first timing-qualified `full` Seed-0 qualification source, canonical 130,816-row
@@ -2418,10 +2444,9 @@ binding gate.
 
 The rev-3.2 build follows §13.19.4's two-stage ladder: the qualification stage
 trains the full `V_fit` universe at a short schedule, keeps the registered
-clipping operation and complete telemetry, treats only the ten-step persistent-
-clipping condition as non-aborting, and returns `pending_manual_review` after a
-complete otherwise-valid run (or `fail(<named_guard>)`,
-`training_invalid(slot_collapse)`, or `fail(no_eligible_checkpoint)`). It never
+clipping operation and complete telemetry, treats every finite model-quality
+threshold as non-aborting, and returns `pending_manual_review` after a complete
+three-epoch run (or one of the hard failure classes in §13.19.4). It never
 emits automatic `pass`; the formal stage rejects `pending_manual_review` and
 trains the full registered
 schedule on the identical `V_fit` universe, validates on `V_hold` (§13.19.3),
@@ -2437,11 +2462,12 @@ reported, but nothing in this ladder re-admits them as binding checks.
 
 #### 14.4.8 Telemetry and abort rules
 
-- **Collapse abort** (§13.19.2-class): mean pairwise `h` cosine > 0.95, or
+- **Collapse threshold** (§13.19.2-class): mean pairwise `h` cosine > 0.95, or
   the Π rank-1 marginal residual `‖Π − r c^T / m‖_F / ‖Π‖_F < 0.05` (with
   `r`/`c` Π's row/column sums and `m` its total mass — "the plan carries
   nothing beyond its marginals"), for 2 consecutive validations after
-  conditioning activates ⇒ `training_invalid(slot_collapse)`.
+  conditioning activates ⇒ `training_invalid(slot_collapse)` in formal and
+  telemetry-only in qualification.
   Calibration basis (P0.1, measured on the collapsed v2 checkpoint
   `a471010f57e495f0`): mean pairwise `h` cosine `0.9997`; Â off-diagonal
   `0.5014 ± 0.0004` (constant); π std across slots `0.042`. A Π

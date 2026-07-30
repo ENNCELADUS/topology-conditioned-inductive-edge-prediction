@@ -40,11 +40,13 @@ root, so both commands run directly in the repository.
 
 qualify is the development loop. It auto-detects and uses every visible H20,
 overrides optim.epochs to 3, writes into
-outputs/egostitch_e2e_stage1_v3/qualification/<arm>, and a complete run with an
-eligible checkpoint and no hard failure writes pending_manual_review, never an
-automatic pass. The registered clipping remains active and its telemetry is
-retained; only the ten-step persistent-clipping streak is non-aborting here.
-Checkpoint eligibility is unaffected — it is enforced in both stages. qualify
+outputs/egostitch_e2e_stage1_v3/qualification/<arm>, and a complete exact
+three-epoch run with exact coverage, complete telemetry, and no non-finite, DDP,
+boundary, coverage, I/O, or infrastructure failure writes pending_manual_review,
+never an automatic pass. Every finite model-quality threshold is telemetry-only here,
+including slot, gradient/family-norm, clipping, family-ratio, dispersion, precision,
+collapse, and checkpoint-eligibility predicates. Registered clipping remains active.
+Eligibility remains a hard requirement only in formal. qualify
 never edits or promotes the registration and deliberately does not require a
 clean checkout, because iterating on the model is the point.
 

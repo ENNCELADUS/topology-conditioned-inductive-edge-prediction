@@ -62,9 +62,9 @@ Stage-1 screen.
 |---|---|---|
 | trains on | full `V_fit` | full `V_fit` |
 | validates on | `V_hold` | `V_hold` |
-| `optim.epochs` | reduced; recorded in `qualification.json`, **not registered** | `30` |
+| `optim.epochs` | exactly `3` | `30` |
 | purpose | development loop ending in manual review | results |
-| verdict | `pending_manual_review` after a complete otherwise-valid run; never automatic `pass` | the re-pinned v2 thresholds |
+| verdict | complete 3 epochs → `pending_manual_review`; never automatic `pass` | the re-pinned v2 thresholds |
 | test access | never opened | one scoring epoch per (arm, seed) |
 
 Both stages train on the **identical** universe and differ only in
@@ -75,25 +75,30 @@ compares equal values rather than propagating a digest.
 **Qualification verdict — complete run, then manual review.** The actual clipping
 operation is unchanged: global L2 norm `3.0` for pair/generator and `1.0` for
 conditioning, with every pre-clip norm, coefficient, and low-coefficient streak
-recorded. Clip coefficient `< 0.1` for ten consecutive steps no longer aborts
-qualification; it remains visible telemetry and remains a hard failure in formal.
-A qualification that finishes the complete reduced schedule, selects an eligible
-checkpoint, and hits no other hard failure writes `pending_manual_review`, never
-automatic `pass`. The one-step `< 1e-3` extreme, non-finite, family-imbalance,
-logit-collapse, slot-collapse, and no-eligible-checkpoint failures are unchanged.
-Named failure outcomes remain `fail(<named_guard>)`,
-`training_invalid(slot_collapse)`, and `fail(no_eligible_checkpoint)`.
+recorded. Every finite model-quality threshold is telemetry-only in qualification:
+initial/during slot statistics, finite zero gradient/family norms, immediate and
+persistent clipping, family ratio, warm-reference and validation dispersion floors,
+precision thresholds, validation collapse, and checkpoint eligibility. Only
+non-finite, DDP, boundary, coverage, and I/O/infrastructure failures abort. A run that
+finishes all three epochs with exact coverage and complete telemetry writes
+`pending_manual_review`, regardless of quality eligibility. If no checkpoint is
+quality-eligible, the final epoch is the diagnostic manual-review selection only;
+the existing `best.pt`/`last.pt` compatibility aliases may expose it, but metadata,
+metrics, and the profile mark it non-eligible and neither alias authorizes formal.
+Actual clipping and all formal guards remain unchanged. The existing profile, metrics,
+and run metadata carry finite-threshold/eligibility telemetry and the diagnostic
+selection; `qualification.json` keeps its existing fields.
 `pending_manual_review` fails formal preflight. This DRAFT defines neither a manual-
 approval artifact nor any conversion to `pass`; an immutable attempt is not edited in
 place. Formal preflight must inspect the current immutable attempt and may not fall
 back from a latest pending result to an earlier `pass` artifact.
 
-**Manual review does not weaken checkpoint eligibility.** The §13.19.3
+**Manual review does not weaken formal checkpoint eligibility.** The §13.19.3
 eligibility conditions — post-ramp/Phase-C restriction, the
 `prevalence + 0.02` AUPRC floor, and the residual / logit-std /
-topology-gradient conditions — are retained in full at **both** stages. That
-retention is what prevents selection from landing on a reconstruction-only
-warm-start checkpoint, the documented 2026-07-19 v1 failure.
+topology-gradient conditions — remain hard and unchanged in formal. Qualification
+computes and reports them only as model-quality telemetry. Its final-epoch diagnostic
+compatibility aliases cannot satisfy formal preflight.
 
 **Boundary audit.** Training may not open a held-out path **in any run kind** —
 a path condition, not a `run_kind` condition. The prior form gated on

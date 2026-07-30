@@ -912,6 +912,91 @@ class TestE2ECompositeStep:
                 fp32_f,
             )
 
+        telemetry = te._validate_e2e_precision_outputs(
+            fp32_f + fp32_residual * 1.06,
+            fp32_f,
+            fp32_full,
+            fp32_f,
+            enforce_quality=False,
+        )
+        assert telemetry["quality_pass"] is False
+        assert "residual relative L2 <= 0.05" in telemetry["quality_failures"]
+
+    def test_precision_differential_marks_undefined_correlation_without_nan(self) -> None:
+        fp32_f = torch.ones(4)
+        fp32_full = fp32_f.clone()
+        telemetry = te._validate_e2e_precision_outputs(
+            fp32_full,
+            fp32_f,
+            fp32_full,
+            fp32_f,
+            enforce_quality=False,
+        )
+        assert telemetry["residual_correlation_defined"] is False
+        assert telemetry["residual_correlation"] == 0.0
+        assert math.isfinite(cast(float, telemetry["residual_correlation"]))
+        assert telemetry["quality_pass"] is False
+
+    @pytest.mark.parametrize("enforce_quality", [True, False])
+    def test_precision_nonfinite_inputs_remain_hard(
+        self, enforce_quality: bool
+    ) -> None:
+        finite = torch.ones(3)
+        nonfinite = torch.tensor([1.0, float("nan"), 2.0])
+        with pytest.raises(te._E2EPrecisionNumericalError, match="non-finite.*input"):
+            te._validate_e2e_precision_outputs(
+                nonfinite,
+                finite,
+                finite,
+                finite,
+                enforce_quality=enforce_quality,
+            )
+
+    def test_precision_nonfinite_derived_metrics_remain_hard(self) -> None:
+        huge = torch.tensor([torch.finfo(torch.float32).max])
+        zero = torch.zeros(1)
+        with pytest.raises(te._E2EPrecisionNumericalError, match="non-finite.*derived"):
+            te._validate_e2e_precision_outputs(
+                huge,
+                zero,
+                zero,
+                zero,
+                enforce_quality=False,
+            )
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            te._E2EPrecisionQualityError("finite quality miss"),
+            te._E2EPrecisionNumericalError("non-finite metric"),
+            torch.cuda.OutOfMemoryError("CUDA out of memory"),
+        ],
+    )
+    def test_precision_failures_synchronize_and_preserve_the_main_cause(
+        self, error: Exception
+    ) -> None:
+        with pytest.raises(RuntimeError, match="end-ramp.*failed") as raised:
+            te._raise_synchronized_precision_failure(
+                Accelerator(cpu=True), local_error=error, context="end-ramp"
+            )
+        assert raised.value.__cause__ is error
+
+    def test_precision_failure_on_another_rank_still_raises_locally(self) -> None:
+        class _RemoteFailureAccelerator:
+            device = torch.device("cpu")
+
+            def reduce(self, _value: torch.Tensor, *, reduction: str) -> torch.Tensor:
+                assert reduction == "sum"
+                return torch.tensor(1)
+
+        with pytest.raises(RuntimeError, match="selected-checkpoint.*failed") as raised:
+            te._raise_synchronized_precision_failure(
+                cast(Any, _RemoteFailureAccelerator()),
+                local_error=None,
+                context="selected-checkpoint",
+            )
+        assert raised.value.__cause__ is None
+
     def test_vector_tolerance_admits_bf16_tail_noise(self) -> None:
         """Per-element BF16-trunk tail noise passes the vector bounds.
 
@@ -1124,6 +1209,20 @@ class TestE2ECompositeStep:
                 accelerator,
             )
 
+        with self._bf16_autocast():
+            family_norms, _ = te._e2e_family_probe(
+                composite,
+                payload,
+                groups,
+                te.e2e_phase_state(50, 100),
+                "full",
+                accelerator,
+                require_live_gradients=False,
+            )
+        assert any(
+            norm == 0.0 for norms in family_norms.values() for norm in norms.values()
+        )
+
     def test_profile_loop_executes_real_optimizer_and_validation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1158,6 +1257,7 @@ class TestE2ECompositeStep:
             *,
             step: int | None = None,
             phase: te.E2EPhaseName | None = None,
+            enforce_immediate: bool = True,
             enforce_persistent: bool = True,
         ) -> None:
             guard_persistence.append(enforce_persistent)
@@ -1166,6 +1266,7 @@ class TestE2ECompositeStep:
                 records,
                 step=step,
                 phase=phase,
+                enforce_immediate=enforce_immediate,
                 enforce_persistent=enforce_persistent,
             )
 
@@ -1294,9 +1395,11 @@ class TestE2ECompositeStep:
             *,
             step: int | None = None,
             phase: te.E2EPhaseName | None = None,
+            enforce_immediate: bool = True,
             enforce_persistent: bool = True,
         ) -> None:
             del step, phase
+            assert enforce_immediate is expected_enforcement
             enforcement.append(enforce_persistent)
             raise RuntimeError("stop after persistent-guard call")
 
@@ -1313,15 +1416,37 @@ class TestE2ECompositeStep:
         assert enforcement == [expected_enforcement]
 
     @pytest.mark.parametrize(
-        ("reference_auprc", "expect_eligible"),
-        [(0.23, True), (0.22, True), (0.21, False)],
+        (
+            "reference_auprc",
+            "run_kind",
+            "warm_std",
+            "collapse",
+            "expect_eligible",
+            "expect_complete",
+            "expected_error",
+        ),
+        [
+            (0.23, "formal", 0.4, False, True, True, None),
+            (0.22, "formal", 0.4, False, True, True, None),
+            (0.21, "formal", 0.4, False, False, False, "no eligible checkpoint"),
+            (0.21, "qualification", 0.4, False, False, True, None),
+            (0.23, "formal", 0.0, False, False, False, "warm-reference"),
+            (0.23, "qualification", 0.0, False, False, True, None),
+            (0.23, "formal", 0.4, True, False, False, "validation-logit collapse"),
+            (0.23, "qualification", 0.4, True, False, True, None),
+        ],
     )
     def test_training_loop_captures_first_edge_active_eligibility_reference(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         reference_auprc: float,
+        run_kind: te.E2ERunKind,
+        warm_std: float,
+        collapse: bool,
         expect_eligible: bool,
+        expect_complete: bool,
+        expected_error: str | None,
     ) -> None:
         """Phase-A validation is ignored; the first trained-head validation stays fail-closed."""
         torch.manual_seed(0)
@@ -1338,8 +1463,12 @@ class TestE2ECompositeStep:
             data=replace(cfg.data, pack_dir=pack_dir),
             optim=replace(cfg.optim, epochs=5),
             diagnostics=replace(cfg.diagnostics, gradient_probe_interval=10_000),
-            training=registered.training,
-            run_kind="formal",
+            training=replace(
+                registered.training,
+                clip_immediate_abort=0.0,
+                clip_persistent_threshold=0.0,
+            ),
+            run_kind=run_kind,
         )
         data = _toy_bundle(tmp_path, EgoStitchConfig())
         original_from_pack = PackedFeatureTable.from_pack.__func__
@@ -1365,6 +1494,7 @@ class TestE2ECompositeStep:
             call = validation_calls - 1
             validation_calls += 1
             f_logit_auprc = reference_auprc if call == 2 else (0.1 if call < 2 else 0.9)
+            f_logit_std = warm_std if call <= 0 else (0.0 if collapse else 0.8)
             metrics = _flat_edge_metrics()
             return te._ValidationResult(
                 metrics=metrics,
@@ -1373,7 +1503,7 @@ class TestE2ECompositeStep:
                     "active_logit_std": 0.2,
                     "clustering_mmd": 0.1,
                     "topology_delta_ratio": 0.01,
-                    "f_logit_std": 0.4 if call <= 0 else 0.8,
+                    "f_logit_std": f_logit_std,
                     "f_logit_auprc": f_logit_auprc,
                     # The five dispersion keys the real `_validate_epoch`
                     # always emits for an `EgoStitchE2E`: the step-0 slot
@@ -1398,10 +1528,9 @@ class TestE2ECompositeStep:
         monkeypatch.setattr(te, "_validate_epoch", _validation)
         monkeypatch.setattr(te, "e2e_checkpoint_eligible", _track_eligibility)
         monkeypatch.setattr(te.E2EClipGuard, "update", lambda *_args, **_kwargs: None)
-        monkeypatch.setattr(te, "_e2e_precision_differential", lambda *_args, **_kwargs: {})
         accelerator = Accelerator(cpu=True)
 
-        if expect_eligible:
+        if expect_complete:
             result = te._train_e2e_stability_loop(
                 model,
                 e2e_cfg,
@@ -1410,8 +1539,18 @@ class TestE2ECompositeStep:
                 node_batch=4,
             )
             assert result.best_epoch > 0
+            if expect_eligible:
+                assert result.runtime_profile["selected_epoch"] == result.best_epoch
+                assert result.runtime_profile["selection_status"] == "selected"
+                assert result.runtime_profile["diagnostic_epoch"] is None
+            else:
+                assert result.runtime_profile["selected_epoch"] is None
+                assert result.runtime_profile["selection_status"] == "diagnostic_last_epoch"
+                assert result.runtime_profile["diagnostic_epoch"] == result.last_epoch
+                assert result.best_epoch == result.last_epoch
         else:
-            with pytest.raises(RuntimeError, match="no eligible checkpoint"):
+            assert expected_error is not None
+            with pytest.raises(RuntimeError, match=expected_error):
                 te._train_e2e_stability_loop(
                     model,
                     e2e_cfg,
@@ -1419,15 +1558,18 @@ class TestE2ECompositeStep:
                     accelerator,
                     node_batch=4,
                 )
+            return
 
         phase_a_records = [record for record in seen_records if record.phase == "A"]
         assert phase_a_records
         assert all(record.warm_reference_auprc is None for record in phase_a_records)
-        assert all(record.warm_reference_std == pytest.approx(0.4) for record in phase_a_records)
+        assert all(
+            record.warm_reference_std == pytest.approx(warm_std) for record in phase_a_records
+        )
         first_referenced = next(
             record for record in seen_records if record.warm_reference_auprc is not None
         )
-        assert first_referenced.warm_reference_std == pytest.approx(0.4)
+        assert first_referenced.warm_reference_std == pytest.approx(warm_std)
         assert first_referenced.warm_reference_auprc == pytest.approx(reference_auprc)
         assert first_referenced.full_joint_epochs_completed == 0
         assert not original_eligible(first_referenced, "full")
@@ -2305,5 +2447,49 @@ class TestInitialSlotHealthGuard:
         if expect_raise:
             with pytest.raises(RuntimeError, match=r"training_invalid\(initial_slot_collapse\)"):
                 _run()
+            report = te._enforce_e2e_initial_slot_health(
+                model,
+                data,
+                Accelerator(cpu=True),
+                edge_batch=8,
+                topk_fraction=0.1,
+                token_table=None,
+                token_node_index=None,
+                enforce_quality=False,
+            )
+            assert report["quality_threshold_missed"] == 1.0
         else:
             assert _run()["h_pairwise_cosine_mean"] == pytest.approx(cosine)
+
+    def test_nonfinite_initial_slot_telemetry_remains_a_hard_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        data = te.assemble_egostitch_data(cfg)
+        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+
+        monkeypatch.setattr(
+            te,
+            "_validate_epoch",
+            lambda *_args, **_kwargs: te._ValidationResult(
+                metrics=_flat_edge_metrics(),
+                fidelity={
+                    "pi_slot_std": 0.3,
+                    "h_pairwise_cosine_mean": float("nan"),
+                    "adj_offdiag_std": 0.3,
+                    "plan_row_entropy": 0.5,
+                    "plan_rank1_marginal_residual": 0.2,
+                },
+            ),
+        )
+        with pytest.raises(RuntimeError, match="non-finite E2E step-0"):
+            te._enforce_e2e_initial_slot_health(
+                model,
+                data,
+                Accelerator(cpu=True),
+                edge_batch=8,
+                topk_fraction=0.1,
+                token_table=None,
+                token_node_index=None,
+                enforce_quality=False,
+            )

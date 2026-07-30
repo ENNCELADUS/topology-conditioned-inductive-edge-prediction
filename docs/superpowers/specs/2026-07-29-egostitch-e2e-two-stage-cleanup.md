@@ -35,6 +35,18 @@ writes `pending_manual_review`, never automatic `pass`; formal rejects that pend
 state. All other hard failures remain unchanged. This design trail defines no approval
 artifact and never edits an immutable attempt in place.
 
+**r4 owner amendment (2026-07-30; supersedes r3's qualification-verdict
+boundary).** Qualification is exactly three epochs and every finite model-quality
+threshold is telemetry-only: initial/during slot statistics, finite zero
+gradient/family norms, immediate/persistent clipping, family ratio, warm-reference
+and validation dispersion floors, precision thresholds, validation collapse, and
+checkpoint eligibility. Actual clipping is unchanged. Only non-finite, DDP, boundary,
+coverage, and I/O/infrastructure failures abort qualification. Every complete
+three-epoch run writes `pending_manual_review`; with no quality-eligible checkpoint,
+the existing `best.pt`/`last.pt` compatibility aliases expose the final epoch for
+diagnostic manual review only and metadata/profile mark it non-eligible. Formal guards,
+eligibility, selection, and fail-closed preflight remain unchanged.
+
 ---
 
 ## 1. Why
@@ -80,11 +92,11 @@ is what makes the whole thing cheap:
 - The degree regime, isolate fraction and ego-net statistics are identical by
   construction, not by a sampler argument.
 
-Stage 1 at `epochs=3` costs ~1/10 of Stage 2. The three-phase curriculum scales
+Stage 1 at exactly `epochs=3` costs ~1/10 of Stage 2. The three-phase curriculum scales
 with `schedule_total_steps = steps_per_epoch × epochs`
 (`_epoch_step_plan`, `train_egostitch.py:2585-2600`), so a short run still
-traverses A → B → C and still produces eligible checkpoints — Phase C opens at
-30% of the schedule regardless of its length.
+traverses A → B → C. Eligibility is recorded as telemetry and may be absent;
+Phase C opens at 30% of the schedule regardless of its length.
 
 ### 2.1 V_hold is the union of the two existing holdouts
 
@@ -131,7 +143,7 @@ partly for fidelity to the cut. This is pre-existing; the union mitigates it
 |---|---|---|
 | trains on | full V_fit | full V_fit |
 | validates on | V_hold | V_hold |
-| epochs | short (≈3) | registered full schedule |
+| epochs | exactly 3 | registered full schedule |
 | purpose | development loop | results |
 | verdict | complete run → `pending_manual_review`; never automatic `pass` | registered thresholds, §2.3 |
 | arms | whichever is under development | 6 trained + 2 scoring-time controls |
@@ -147,26 +159,27 @@ ablation table.
 **Stage 1: complete run, then manual review.** The registered global-norm clipping
 remains active (`3.0` for pair/generator, `1.0` for conditioning), and every pre-clip
 norm, clip coefficient, and consecutive-low-coefficient streak remains telemetry.
-The `< 0.1` for ten consecutive steps condition is non-aborting in qualification only;
-the one-step `< 1e-3` extreme and every other numerical, family-imbalance,
-logit-collapse, slot-collapse, and no-eligible-checkpoint failure remain hard. A full
-short-schedule run with an eligible checkpoint and no other failure writes
-`pending_manual_review`, never `pass`. There is still no AUPRC or topology floor in
-that artifact verdict. `pending_manual_review` does not authorize Stage 2, and this
-revision defines no approval artifact or conversion to `pass`.
+Every finite model-quality threshold is non-aborting in qualification: initial/during
+slot statistics, finite zero gradient/family norms, immediate/persistent clipping,
+family ratio, warm-reference and validation dispersion floors, precision thresholds,
+validation collapse, and checkpoint eligibility. Only non-finite, DDP, boundary,
+coverage, and I/O/infrastructure failures remain hard. Every complete three-epoch run
+writes `pending_manual_review`, never `pass`, regardless of quality eligibility.
+`pending_manual_review` does not authorize Stage 2, and this revision defines no
+approval artifact or conversion to `pass`.
 
 Two consequences that must be implemented, not assumed:
 
-- `e2e_checkpoint_eligible` (`:1284`) enforces an AUPRC floor of
+- `e2e_checkpoint_eligible` (`:1284`) computes an AUPRC floor of
   `prevalence + 0.02` plus `residual_ratio`, `active_logit_std` and
-  `topology_gradient_norm` conditions. Eligibility is **retained** — it is what
-  prevents the documented 2026-07-19 v1 failure where selection landed on a
-  reconstruction-only warm-start checkpoint. "Guards only" governs the
-  *qualification verdict*, not checkpoint eligibility.
-- `select_e2e_checkpoint` returning `None` raises "no eligible checkpoint;
-  fallback is forbidden" (`:4893`), which is neither `pass` nor one of the named
-  guards. Stage 1's verdict schema needs an explicit
-  `fail(no_eligible_checkpoint)` category.
+  `topology_gradient_norm` conditions. These are qualification telemetry and remain
+  hard formal eligibility — they prevent formal selection from repeating the
+  documented 2026-07-19 v1 failure where selection landed on a reconstruction-only
+  warm-start checkpoint.
+- If `select_e2e_checkpoint` finds no quality-eligible epoch, Stage 1 exposes the final
+  epoch through the existing `best.pt`/`last.pt` compatibility aliases for diagnostic
+  manual review. Metadata/profile mark it non-eligible; neither alias is Stage 2
+  authorization, and formal still forbids fallback.
 
 **Stage 2: pre-registered thresholds, pinned before test opens.** Registration v4
 re-pins the v2 acceptance thresholds — clustering-MMD and BFS-macro GS/RD
@@ -218,8 +231,7 @@ Multi-seed additionally requires relaxing four hard seed-0 pins:
 Stage 1 writes one artifact:
 
 ```json
-{ "verdict": "pending_manual_review" | "fail(<named_guard>)" |
-             "training_invalid(slot_collapse)" | "fail(no_eligible_checkpoint)",
+{ "verdict": "pending_manual_review" | "fail(<named_guard>)",
   "epochs", "hparams",
   "feature_stats_sha256",
   "model_config_sha256" }
@@ -232,6 +244,9 @@ digest comparison is a genuine equality — no propagation, no hand-pasting, and
 in both stages unchanged.
 `pending_manual_review` therefore fails closed. r3 intentionally defines no approval
 artifact or in-place mutation capable of changing an immutable attempt to `pass`.
+The existing profile, metrics, and run metadata carry the finite-threshold telemetry,
+per-predicate eligibility status, and diagnostic-selection identity. Existing
+checkpoint aliases are compatibility outputs, not formal authorization artifacts.
 
 `model_config_sha256` **must be defined; no such function exists today.**
 `_config_hash` (`:5523`) bakes in `output_dir`, `data.root` and `preregistration`
@@ -306,14 +321,15 @@ r1 claimed h-cos and slot/plan statistics are "computed at step 0 and fail fast"
 Partly fiction. What is true:
 
 - `h_pairwise_cosine_mean > 0.95` is computable at step 0 and is the check
-  `_run_init_probe` already performs (`:6210`) — but it **logs and returns**; it
-  must be converted to a raise.
+  `_run_init_probe` already performs (`:6210`). It remains telemetry in
+  qualification and a hard condition in formal.
 - `E2ESlotCollapseGuard` is **inert at step 0**: it short-circuits on
   `conditioning_active`, and `e2e_phase_state(0, N)` is Phase A with
   `edge_active=False` (`:775-776`, `:926-937`). It also needs two consecutive
   validations. It cannot be a step-0 guard; it stays a during-training guard.
-- Clip-guard and non-finite-loss need a forward/backward, so they are step-1
-  guards at the earliest.
+- Clip telemetry and non-finite-loss checks need a forward/backward, so they are
+  available at step 1 at the earliest; finite clip thresholds do not abort
+  qualification.
 
 The raise must follow the loop's rank-synchronization pattern (`accelerator.reduce`
 then raise on all ranks, `:4823-4828`) — `_validate_epoch` returns `None` on
@@ -495,6 +511,10 @@ qualification-time automatic abort, run the complete three epochs, and require m
 review of the immutable result. The formal-stage hard failure and margin checks remain
 unchanged.
 
+The subsequent r4 owner decision broadens that qualification-only rationale to all
+finite model-quality thresholds. Non-finite, DDP, boundary, coverage, and
+I/O/infrastructure failures remain hard; formal is unchanged.
+
 ## 7. Doc edits
 
 Rewritten in place — no `§15`, no SUPERSEDED strata:
@@ -520,11 +540,15 @@ CLAUDE.md needs updating: three data-contract traps retire with their code
 
 ## 8. Acceptance
 
-1. Stage 1 runs end-to-end on full V_fit at the short schedule and writes
-   `qualification.json` with `pending_manual_review`, or a named hard failure
-   including `fail(no_eligible_checkpoint)`. A hang, automatic `pass`, or unnamed
-   failure is not a valid result. A persistent low-coefficient streak alone must
-   complete under unchanged clipping with complete telemetry.
+1. Stage 1 runs end-to-end on full V_fit for exactly three epochs and writes
+   `qualification.json` with `pending_manual_review`, regardless of quality
+   eligibility. Every finite quality-threshold miss must continue under unchanged
+   clipping with complete telemetry. No eligible checkpoint means final-epoch
+   diagnostic selection through the existing compatibility aliases, with metadata and
+   profile marking it non-eligible; neither alias is formal authorization. Named hard
+   verdicts remain `fail(<named_guard>)`, limited to non-finite values, DDP,
+   boundary, coverage, and I/O/infrastructure failures; an
+   interrupted, incomplete, or inexact-coverage run cannot write pending.
 2. Stage 2 refuses to launch on a missing, `pending_manual_review`, `fail`, or
    digest-mismatched `qualification.json`. It may not fall back from the latest
    pending attempt to a stale historical pass.

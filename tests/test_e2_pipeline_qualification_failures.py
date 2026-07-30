@@ -172,7 +172,7 @@ def _qualification_args(tmp_path: Path, worker_module: str) -> tuple[PipelineArg
     output_dir = tmp_path / "out"
     args = PipelineArgs(config_path, None, None)
     return (
-        replace(args, worker_module=worker_module, run_kind="qualification", epochs=2),
+        replace(args, worker_module=worker_module, run_kind="qualification", epochs=3),
         output_dir,
     )
 
@@ -329,6 +329,9 @@ def test_zero_exit_refuses_identity_mismatched_qualification_artifact(
         "nonfinite",
         "malformed",
         "missing_group",
+        "missing_quality_thresholds",
+        "missing_quality_group",
+        "malformed_quality_flags",
         "count_mismatch",
         "schedule_mismatch",
     ],
@@ -361,6 +364,12 @@ def test_zero_exit_refuses_incomplete_or_malformed_gradient_telemetry(
             rows[0]["optimizer_group_gradients"]["generator"].pop("clip_coefficient")
         elif corruption == "missing_group":
             rows[0]["optimizer_group_gradients"].pop("generator")
+        elif corruption == "missing_quality_thresholds":
+            rows[0].pop("quality_thresholds")
+        elif corruption == "missing_quality_group":
+            rows[0]["quality_thresholds"].pop("generator")
+        elif corruption == "malformed_quality_flags":
+            rows[0]["quality_thresholds"]["generator"]["finite_zero_norm"] = 0
         elif corruption == "count_mismatch":
             rows.pop()
             profile["total_optimizer_steps"] = 1

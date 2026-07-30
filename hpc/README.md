@@ -82,11 +82,17 @@ tests, then a 3-epoch run of the requested arm on every auto-detected visible H2
 short schedule still traverses curriculum phases A -> B -> C, because the curriculum
 scales with `schedule_total_steps` rather than with a fixed step count. Actual global-
 norm clipping remains enabled (`3.0` for pair/generator, `1.0` for conditioning), and
-the complete pre-clip norm/coefficient/streak telemetry is retained. A coefficient
-below `0.1` for ten consecutive steps does not abort qualification; every other hard
-failure, including the one-step `< 1e-3` extreme, is unchanged. A complete three-epoch
-run with an eligible checkpoint and no other failure writes
-`pending_manual_review`, never automatic `pass`. Each invocation receives an
+the complete pre-clip norm/coefficient/streak telemetry is retained. Every finite
+model-quality threshold is telemetry-only: initial/during slot statistics, finite zero
+gradient/family norms, immediate/persistent clipping, family ratio, warm-reference
+and validation dispersion floors, precision thresholds, validation collapse, and
+checkpoint eligibility. Only non-finite, DDP, boundary, coverage, and
+I/O/infrastructure failures abort qualification. Every complete three-epoch run writes
+`pending_manual_review`, regardless of quality eligibility, never automatic `pass`.
+If no quality-eligible checkpoint exists, the final epoch is the diagnostic
+manual-review selection; the existing `best.pt`/`last.pt` compatibility aliases may
+expose it, but metadata/profile mark it non-eligible and neither alias authorizes
+formal. Each invocation receives an
 immutable directory under
 `outputs/egostitch_e2e_stage1_v3/qualification/<arm>/attempts/attempt-*/` and writes
 its `qualification.json` there together with the `feature_stats_sha256` and
@@ -107,7 +113,8 @@ must map exactly the six trained arms to `{path, sha256}` index references and r
 the same exact, non-empty attempt lists under `qualification_attempts`; any omission,
 extra arm, stale index, or list mismatch is a refusal.
 
-Checkpoint eligibility is unaffected: it is enforced in both stages. `qualify` never
+Checkpoint eligibility is computed and reported in qualification but enforced only
+as a hard requirement in formal. `qualify` never
 edits or promotes the active v4 registration, which remains `DRAFT`, and deliberately
 does not require a clean checkout, because iterating on the model is the point:
 

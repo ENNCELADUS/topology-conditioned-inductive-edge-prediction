@@ -1505,8 +1505,17 @@ def _qualification_runner(
         profile_path = Path(_arg_value(command, "--profile-output"))
         if profile_path.is_file():
             profile = json.loads(profile_path.read_text())
+            profile["epochs_completed"] = 3
+            profile["validations_completed"] = 3
+            profile["per_epoch"].append({**profile["per_epoch"][-1], "epoch": 3})
             profile.update(_valid_qualification_gradient_telemetry())
             profile_path.write_text(json.dumps(profile))
+        last_path = out_dir / "last.pt"
+        if last_path.is_file():
+            last = torch.load(last_path, map_location="cpu", weights_only=False)
+            torch.save({**last, "epoch": 3}, last_path)
+            with (out_dir / "metrics.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write('{"epoch": 3, "val_auroc": 0.8}\n')
         metadata_path = out_dir / "run_metadata.json"
         if metadata_path.is_file():
             metadata = json.loads(metadata_path.read_text())
@@ -1516,7 +1525,7 @@ def _qualification_runner(
             json.dumps(
                 {
                     "verdict": verdict,
-                    "epochs": 2,
+                    "epochs": 3,
                     "hparams": {
                         "lr": None,
                         "weight_decay": None,
@@ -1571,6 +1580,23 @@ def _valid_qualification_gradient_telemetry(
                         "nonfinite_elements": 0,
                     },
                 },
+                "quality_thresholds": {
+                    "pair_encoder_head": {
+                        "finite_zero_norm": False,
+                        "immediate_clip_threshold_missed": phase != "A",
+                        "persistent_clip_threshold_missed": False,
+                    },
+                    "generator": {
+                        "finite_zero_norm": False,
+                        "immediate_clip_threshold_missed": True,
+                        "persistent_clip_threshold_missed": step >= 10,
+                    },
+                    "topology_content_conditioning": {
+                        "finite_zero_norm": False,
+                        "immediate_clip_threshold_missed": False,
+                        "persistent_clip_threshold_missed": step >= 10,
+                    },
+                },
             }
         )
     return {
@@ -1589,11 +1615,24 @@ class TestQualificationVerdictSurvivesPublication:
     evidence; a pending result does not authorize formal execution.
     """
 
+    def test_pipeline_rejects_a_non_three_epoch_qualification(
+        self, tmp_path: Path, e2e_aware_worker: str
+    ) -> None:
+        args, _ = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        args = replace(
+            args,
+            worker_module=e2e_aware_worker,
+            run_kind="qualification",
+            epochs=2,
+        )
+        with pytest.raises(ValueError, match="qualification --epochs must equal 3"):
+            run_pipeline(args)
+
     def test_a_pending_verdict_is_published_and_hashed_into_the_manifest(
         self, tmp_path: Path, e2e_aware_worker: str
     ) -> None:
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
-        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
+        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=3)
 
         assert (
             run_pipeline(
@@ -1624,7 +1663,7 @@ class TestQualificationVerdictSurvivesPublication:
         self, tmp_path: Path, e2e_aware_worker: str
     ) -> None:
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
-        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
+        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=3)
         base = _qualification_runner(verdict="pending_manual_review")
 
         def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
@@ -1651,7 +1690,7 @@ class TestQualificationVerdictSurvivesPublication:
         self, tmp_path: Path, e2e_aware_worker: str
     ) -> None:
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
-        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
+        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=3)
         base = _qualification_runner(verdict="pending_manual_review")
 
         def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
@@ -1673,7 +1712,7 @@ class TestQualificationVerdictSurvivesPublication:
             args,
             worker_module=e2e_aware_worker,
             run_kind=run_kind,
-            epochs=2 if run_kind == "qualification" else None,
+            epochs=3 if run_kind == "qualification" else None,
         )
         runner = (
             _qualification_runner(verdict="pending_manual_review")
@@ -1690,7 +1729,7 @@ class TestQualificationVerdictSurvivesPublication:
         self, tmp_path: Path, e2e_aware_worker: str
     ) -> None:
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
-        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
+        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=3)
         base = _qualification_runner(verdict="fail(slot_collapse)", fail_mode="train")
 
         def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
@@ -1739,7 +1778,7 @@ class TestQualificationVerdictSurvivesPublication:
         corruption: str,
     ) -> None:
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
-        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
+        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=3)
         base = _qualification_runner(verdict="pending_manual_review")
 
         def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
@@ -1765,7 +1804,7 @@ class TestQualificationVerdictSurvivesPublication:
     ) -> None:
         """`fail(<named_guard>)` is a result, not an absence of one."""
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
-        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
+        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=3)
         runner = _qualification_runner(verdict="fail(slot_collapse)", fail_mode="train")
 
         assert run_pipeline(args, command_runner=runner) == 2
@@ -1779,7 +1818,7 @@ class TestQualificationVerdictSurvivesPublication:
     ) -> None:
         """A dead worker must replace stale pending evidence with a named failure."""
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
-        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
+        args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=3)
         assert (
             run_pipeline(
                 args,

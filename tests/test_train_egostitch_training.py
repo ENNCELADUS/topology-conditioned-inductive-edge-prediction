@@ -632,6 +632,44 @@ def test_slot_collapse_guard_uses_two_active_consecutive_validations_per_arm() -
     for _ in range(4):
         guard.update(healthy, conditioning_active=True)
 
+    qualification_guard = te.E2ESlotCollapseGuard()
+    qualification_guard.update(cosine_collapse, conditioning_active=True)
+    assert qualification_guard.update(
+        cosine_collapse, conditioning_active=True, enforce_quality=False
+    )
+    with pytest.raises(RuntimeError, match="non-finite E2E slot-collapse telemetry"):
+        qualification_guard.update(
+            {**healthy, "h_pairwise_cosine_mean": float("nan")},
+            conditioning_active=True,
+            enforce_quality=False,
+        )
+
+
+def test_family_ratio_guard_telemeters_finite_quality_misses_but_not_nonfinite() -> None:
+    zero = {"generator": {"edge": 0.0, "recon": 0.0}}
+    qualification_guard = te._E2EFamilyRatioGuard(threshold=2.0, required_probes=2)
+    assert qualification_guard.update(zero, enabled=True, enforce_quality=False) == {
+        "generator": 0.0
+    }
+    assert qualification_guard.ratio_defined == {"generator": False}
+    with pytest.raises(RuntimeError, match="family-gradient median"):
+        te._E2EFamilyRatioGuard(2.0, 2).update(zero, enabled=True)
+
+    imbalanced = {"generator": {"edge": 10.0, "recon": 1.0, "ssl": 1.0}}
+    qualification_guard.update(imbalanced, enabled=True, enforce_quality=False)
+    qualification_guard.update(imbalanced, enabled=True, enforce_quality=False)
+    assert qualification_guard.streaks == {"generator": 2}
+    formal_guard = te._E2EFamilyRatioGuard(threshold=2.0, required_probes=2)
+    formal_guard.update(imbalanced, enabled=True)
+    with pytest.raises(RuntimeError, match="family-gradient imbalance"):
+        formal_guard.update(imbalanced, enabled=True)
+    with pytest.raises(RuntimeError, match="non-finite E2E family-gradient norm"):
+        qualification_guard.update(
+            {"generator": {"edge": float("nan"), "recon": 1.0}},
+            enabled=True,
+            enforce_quality=False,
+        )
+
 
 def test_rank1_plan_abort_is_not_blinded_by_concentrated_row_entropy() -> None:
     row_marginal = torch.tensor([0.74, 0.08666667, 0.08666667, 0.08666667])
@@ -1077,6 +1115,14 @@ def test_e2e_per_group_gradient_guards_clip_and_fail_closed() -> None:
     first.grad = torch.tensor([float("nan")])
     with pytest.raises(RuntimeError, match="non-finite gradient"):
         te.e2e_check_and_clip_gradients({"active": (first,)}, {"active"})
+    first.grad = torch.zeros(1)
+    with pytest.raises(RuntimeError, match="zero gradient norm"):
+        te.e2e_check_and_clip_gradients({"active": (first,)}, {"active"})
+    zero_record = te.e2e_check_and_clip_gradients(
+        {"active": (first,)}, {"active"}, enforce_nonzero=False
+    )["active"]
+    assert zero_record.norm == 0.0
+    assert zero_record.clip_coefficient == 1.0
 
     guard = te.E2EClipGuard(persistent_steps=2)
     clipped = te.E2EGradientGroupRecord(True, 20.0, 0.05, 0)
@@ -1099,6 +1145,21 @@ def test_e2e_per_group_gradient_guards_clip_and_fail_closed() -> None:
     extreme = te.E2EGradientGroupRecord(True, 4000.0, 0.00075, 0)
     with pytest.raises(RuntimeError, match="extreme clipping"):
         te.E2EClipGuard().update({"active": extreme}, enforce_persistent=False)
+    qualification_clip_guard = te.E2EClipGuard(persistent_steps=2)
+    qualification_clip_guard.update(
+        {"active": extreme}, enforce_immediate=False, enforce_persistent=False
+    )
+    qualification_clip_guard.update(
+        {"active": extreme}, enforce_immediate=False, enforce_persistent=False
+    )
+    assert qualification_clip_guard.streaks == {"active": 2}
+    nonfinite_clip = te.E2EGradientGroupRecord(True, 1.0, float("nan"), 0)
+    with pytest.raises(RuntimeError, match="invalid clip coefficient"):
+        qualification_clip_guard.update(
+            {"active": nonfinite_clip},
+            enforce_immediate=False,
+            enforce_persistent=False,
+        )
 
     te.e2e_assert_replicated_squared_norms({"active": torch.tensor([4.0, 4.0])})
     with pytest.raises(RuntimeError, match="differ across ranks"):

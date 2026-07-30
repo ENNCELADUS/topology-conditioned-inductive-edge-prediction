@@ -903,18 +903,32 @@ class E2ESlotCollapseGuard:
 
     streak: int = 0
 
-    def update(self, telemetry: Mapping[str, float], *, conditioning_active: bool) -> None:
-        """Raise the registered invalid-run label after two active bad validations."""
+    def update(
+        self,
+        telemetry: Mapping[str, float],
+        *,
+        conditioning_active: bool,
+        enforce_quality: bool = True,
+    ) -> bool:
+        """Track collapse and optionally enforce the finite quality threshold."""
         if not conditioning_active:
             self.streak = 0
-            return
+            return False
+        values = (
+            telemetry["h_pairwise_cosine_mean"],
+            telemetry["plan_rank1_marginal_residual"],
+        )
+        if not all(math.isfinite(value) for value in values):
+            raise RuntimeError("non-finite E2E slot-collapse telemetry")
         collapsed = (
             telemetry["h_pairwise_cosine_mean"] > 0.95
             or telemetry["plan_rank1_marginal_residual"] < 0.05
         )
         self.streak = self.streak + 1 if collapsed else 0
-        if self.streak >= 2:
+        tripped = self.streak >= 2
+        if tripped and enforce_quality:
             raise RuntimeError("training_invalid(slot_collapse)")
+        return tripped
 
 
 def e2e_degree_decorrelation_telemetry(
@@ -1117,6 +1131,7 @@ def e2e_check_and_clip_gradients(
     active_groups: set[str],
     *,
     max_norm: float | Mapping[str, float] = 1.0,
+    enforce_nonzero: bool = True,
 ) -> dict[str, E2EGradientGroupRecord]:
     """Fail closed on group gradients and independently clip active groups."""
     if isinstance(max_norm, Mapping):
@@ -1150,7 +1165,7 @@ def e2e_check_and_clip_gradients(
         norm = float(torch.sqrt(squared).item())
         if nonfinite or not math.isfinite(norm):
             raise RuntimeError(f"non-finite gradient in active E2E group {name!r}")
-        if norm == 0.0:
+        if norm == 0.0 and enforce_nonzero:
             raise RuntimeError(f"zero gradient norm in active E2E group {name!r}")
         coefficient = min(1.0, max_norms[name] / (norm + 1e-12))
         for grad in grads:
@@ -1188,6 +1203,7 @@ class E2EClipGuard:
         *,
         step: int | None = None,
         phase: E2EPhaseName | None = None,
+        enforce_immediate: bool = True,
         enforce_persistent: bool = True,
     ) -> None:
         """Advance one optimizer step and raise immediately on a violation."""
@@ -1219,7 +1235,7 @@ class E2EClipGuard:
             self.streaks[name] = (
                 self.streaks.get(name, 0) + 1 if coefficient < self.persistent_threshold else 0
             )
-            if coefficient < self.immediate_threshold:
+            if coefficient < self.immediate_threshold and enforce_immediate:
                 raise RuntimeError(
                     f"extreme clipping in active E2E group {name!r}; "
                     f"{context} streak={self.streaks[name]} recent={recent}"
@@ -1459,8 +1475,8 @@ def apply_overrides(cfg: EgoConfig, args: EgoCliArgs) -> EgoConfig:
                 "--epochs is a qualification-stage override; the formal stage must run the "
                 "registered schedule from its config"
             )
-        if args.epochs <= 0:
-            raise ValueError("--epochs must be positive")
+        if args.epochs != 3:
+            raise ValueError("qualification --epochs must equal 3")
         cfg = replace(cfg, optim=replace(cfg.optim, epochs=args.epochs))
     return cfg
 
@@ -3774,27 +3790,44 @@ class _E2EFamilyRatioGuard:
     threshold: float
     required_probes: int
     streaks: dict[str, int] | None = None
+    ratio_defined: dict[str, bool] | None = None
 
     def update(
-        self, norms: Mapping[str, Mapping[str, float]], *, enabled: bool
+        self,
+        norms: Mapping[str, Mapping[str, float]],
+        *,
+        enabled: bool,
+        enforce_quality: bool = True,
     ) -> dict[str, float]:
         if self.streaks is None:
             self.streaks = {}
+        if self.ratio_defined is None:
+            self.ratio_defined = {}
         ratios: dict[str, float] = {}
         for group, family_norms in norms.items():
             values = np.asarray(list(family_norms.values()), dtype=np.float64)
             if values.size < 2:
                 self.streaks[group] = 0
+                self.ratio_defined[group] = False
                 continue
-            if not np.isfinite(values).all() or float(np.median(values)) <= 0.0:
+            if not np.isfinite(values).all():
+                raise RuntimeError(f"non-finite E2E family-gradient norm for group {group!r}")
+            median = float(np.median(values))
+            if median <= 0.0:
+                self.ratio_defined[group] = False
+                ratios[group] = 0.0
+                self.streaks[group] = 0
+                if not enforce_quality:
+                    continue
                 raise RuntimeError(f"invalid E2E family-gradient median for group {group!r}")
-            ratio = float(values.max() / np.median(values))
+            self.ratio_defined[group] = True
+            ratio = float(values.max() / median)
             ratios[group] = ratio
             if not enabled:
                 self.streaks[group] = 0
                 continue
             self.streaks[group] = self.streaks.get(group, 0) + 1 if ratio > self.threshold else 0
-            if self.streaks[group] >= self.required_probes:
+            if self.streaks[group] >= self.required_probes and enforce_quality:
                 raise RuntimeError(f"persistent E2E family-gradient imbalance in group {group!r}")
         return ratios
 
@@ -3912,26 +3945,56 @@ def _e2e_current_submodule_gradient_rms(
     return result
 
 
+class _E2EPrecisionNumericalError(RuntimeError):
+    """Non-finite precision input or derived numerical state."""
+
+
+class _E2EPrecisionQualityError(RuntimeError):
+    """Finite precision-differential quality-threshold miss."""
+
+
 def _validate_e2e_precision_outputs(
     mixed_full: torch.Tensor,
     mixed_f: torch.Tensor,
     fp32_full: torch.Tensor,
     fp32_f: torch.Tensor,
-) -> dict[str, float]:
-    """Apply the registered precision differential to fixed replay outputs."""
+    *,
+    enforce_quality: bool = True,
+) -> dict[str, object]:
+    """Measure precision and optionally enforce finite quality thresholds."""
+    tensors = {
+        "mixed_full": mixed_full,
+        "mixed_f": mixed_f,
+        "fp32_full": fp32_full,
+        "fp32_f": fp32_f,
+    }
+    nonfinite_inputs = [
+        name for name, value in tensors.items() if not bool(torch.isfinite(value).all())
+    ]
+    if nonfinite_inputs:
+        raise _E2EPrecisionNumericalError(
+            f"non-finite E2E precision input tensors: {', '.join(nonfinite_inputs)}"
+        )
     mixed_residual = mixed_full - mixed_f
     fp32_residual = fp32_full - fp32_f
     residual_relative_l2 = float(
         torch.linalg.vector_norm(mixed_residual - fp32_residual)
         / torch.clamp(torch.linalg.vector_norm(fp32_residual), min=1e-12)
     )
-    with np.errstate(invalid="ignore", divide="ignore"):
-        residual_correlation = float(
-            np.corrcoef(
-                mixed_residual.detach().cpu().numpy(),
-                fp32_residual.detach().cpu().numpy(),
-            )[0, 1]
-        )
+    mixed_residual_np = mixed_residual.detach().double().cpu().numpy()
+    fp32_residual_np = fp32_residual.detach().double().cpu().numpy()
+    mixed_std = float(np.std(mixed_residual_np))
+    fp32_std = float(np.std(fp32_residual_np))
+    if not all(math.isfinite(value) for value in (mixed_std, fp32_std)):
+        raise _E2EPrecisionNumericalError("non-finite E2E precision residual standard deviation")
+    residual_correlation_defined = (
+        mixed_residual_np.size >= 2 and mixed_std > 0.0 and fp32_std > 0.0
+    )
+    residual_correlation = (
+        float(np.corrcoef(mixed_residual_np, fp32_residual_np)[0, 1])
+        if residual_correlation_defined
+        else 0.0
+    )
     full_relative_l2 = float(
         torch.linalg.vector_norm(mixed_full - fp32_full)
         / torch.clamp(torch.linalg.vector_norm(fp32_full), min=1e-12)
@@ -3940,7 +4003,7 @@ def _validate_e2e_precision_outputs(
         torch.linalg.vector_norm(mixed_f - fp32_f)
         / torch.clamp(torch.linalg.vector_norm(fp32_f), min=1e-12)
     )
-    metrics = {
+    numerical_metrics = {
         "full_max_abs_error": float(torch.max(torch.abs(mixed_full - fp32_full))),
         "f_logit_max_abs_error": float(torch.max(torch.abs(mixed_f - fp32_f))),
         "full_relative_l2": full_relative_l2,
@@ -3948,22 +4011,39 @@ def _validate_e2e_precision_outputs(
         "residual_relative_l2": residual_relative_l2,
         "residual_correlation": residual_correlation,
     }
+    nonfinite_derived = [
+        name for name, value in numerical_metrics.items() if not math.isfinite(value)
+    ]
+    if nonfinite_derived:
+        raise _E2EPrecisionNumericalError(
+            f"non-finite E2E precision derived metrics: {', '.join(nonfinite_derived)}"
+        )
     failures: list[str] = []
     # Vector relative-L2 bounds (registration vector_tolerance_amendment
     # 2026-07-22): per-element max-abs is an extreme-value statistic of
     # BF16-trunk noise and stays a logged diagnostic only.
-    if not math.isfinite(full_relative_l2) or full_relative_l2 > 5e-2:
+    if full_relative_l2 > 5e-2:
         failures.append("full relative L2 <= 0.05")
-    if not math.isfinite(f_logit_relative_l2) or f_logit_relative_l2 > 5e-2:
+    if f_logit_relative_l2 > 5e-2:
         failures.append("f_logit relative L2 <= 0.05")
-    if not bool((mixed_residual != 0).any()) or not bool((fp32_residual != 0).any()):
+    residual_nonzero = bool((mixed_residual != 0).any()) and bool((fp32_residual != 0).any())
+    if not residual_nonzero:
         failures.append("non-zero residual")
-    if not math.isfinite(residual_relative_l2) or residual_relative_l2 > 5e-2:
+    if residual_relative_l2 > 5e-2:
         failures.append("residual relative L2 <= 0.05")
-    if not math.isfinite(residual_correlation) or residual_correlation < 0.999:
+    if not residual_correlation_defined:
+        failures.append("residual correlation defined")
+    elif residual_correlation < 0.999:
         failures.append("residual correlation >= 0.999")
-    if failures:
-        raise RuntimeError(
+    metrics: dict[str, object] = {
+        **numerical_metrics,
+        "residual_nonzero": residual_nonzero,
+        "residual_correlation_defined": residual_correlation_defined,
+        "quality_pass": not failures,
+        "quality_failures": failures,
+    }
+    if failures and enforce_quality:
+        raise _E2EPrecisionQualityError(
             "E2E precision differential failed: "
             f"{', '.join(failures)}; metrics={json.dumps(metrics, sort_keys=True)}"
         )
@@ -3974,7 +4054,9 @@ def _e2e_precision_differential(
     model: EgoStitchE2E,
     edge: dict[str, torch.Tensor],
     accelerator: Accelerator,
-) -> dict[str, float]:
+    *,
+    enforce_quality: bool = True,
+) -> dict[str, object]:
     """Compare BF16+islands with pure fp32 on the same fixed replay identities."""
     batch = _e2e_edge_view(edge)
     float_batch = {
@@ -3997,9 +4079,33 @@ def _e2e_precision_differential(
                 fp32_context,
                 masks=masks_for_null(NULL_ALL_HEAD, fp32_full.shape[0], fp32_full.device),
             ).float()
-        return _validate_e2e_precision_outputs(mixed_full, mixed_f, fp32_full, fp32_f)
+        return _validate_e2e_precision_outputs(
+            mixed_full,
+            mixed_f,
+            fp32_full,
+            fp32_f,
+            enforce_quality=enforce_quality,
+        )
     finally:
         model.train(was_training)
+
+
+def _raise_synchronized_precision_failure(
+    accelerator: Accelerator,
+    *,
+    local_error: Exception | None,
+    context: str,
+) -> None:
+    """Synchronize any rank-local precision exception before raising everywhere."""
+    failed = accelerator.reduce(
+        torch.tensor(int(local_error is not None), device=accelerator.device), reduction="sum"
+    )
+    if int(failed.item()) <= 0:
+        return
+    failure = RuntimeError(f"{context} E2E precision differential failed")
+    if local_error is not None:
+        raise failure from local_error
+    raise failure
 
 
 def _enforce_e2e_initial_slot_health(
@@ -4012,6 +4118,7 @@ def _enforce_e2e_initial_slot_health(
     token_table: PackedFeatureTable | None,
     token_node_index: Mapping[str, int] | None,
     validation_event_callback: Callable[[str, int | None, int], None] | None = None,
+    enforce_quality: bool = True,
 ) -> dict[str, float]:
     """Refuse to start a run that is already above the cosine trip line.
 
@@ -4040,6 +4147,7 @@ def _enforce_e2e_initial_slot_health(
         token_node_index: Its node index.
         validation_event_callback: Records the completed step-0 validation before
             any resulting guard failure is raised.
+        enforce_quality: Whether a finite threshold miss aborts the run.
 
     Returns:
         The guard telemetry plus scale diagnostics on the main process (an
@@ -4070,6 +4178,7 @@ def _enforce_e2e_initial_slot_health(
         validation_event_callback("step_0", None, 0)
     report: dict[str, float] = {}
     born_collapsed = 0
+    nonfinite_telemetry = 0
     if accelerator.is_main_process:
         assert validation is not None
         report = {
@@ -4079,6 +4188,11 @@ def _enforce_e2e_initial_slot_health(
             "adj_offdiag_std": validation.fidelity["adj_offdiag_std"],
             **validation.scale_telemetry,
         }
+        if not all(math.isfinite(value) for value in report.values()):
+            nonfinite_telemetry = 1
+        report["quality_threshold_missed"] = float(
+            report["h_pairwise_cosine_mean"] > 0.95
+        )
         logger.info(
             "e2e step-0 slot health rows=%d feature_stats_sha256=%s %s",
             len(data.val_pairs),
@@ -4092,10 +4206,15 @@ def _enforce_e2e_initial_slot_health(
                 report["h_pairwise_cosine_mean"],
             )
             born_collapsed = 1
+    nonfinite = accelerator.reduce(
+        torch.tensor(nonfinite_telemetry, device=accelerator.device), reduction="sum"
+    )
+    if int(nonfinite.item()) > 0:
+        raise RuntimeError("non-finite E2E step-0 slot-health telemetry")
     failed = accelerator.reduce(
         torch.tensor(born_collapsed, device=accelerator.device), reduction="sum"
     )
-    if int(failed.item()) > 0:
+    if int(failed.item()) > 0 and enforce_quality:
         raise RuntimeError("training_invalid(initial_slot_collapse)")
     return report
 
@@ -4114,6 +4233,7 @@ def _train_e2e_stability_loop(
     if training is None:
         raise ValueError("E2E stability training requires cfg.training")
     run_kind = cfg.run_kind or "formal"
+    enforce_quality = run_kind != "qualification"
     arm = _e2e_arm_name(model)
     world = accelerator.num_processes
     rank = accelerator.process_index
@@ -4190,7 +4310,7 @@ def _train_e2e_stability_loop(
     # is a guard that fails open. The cost is one extra full validation pass
     # over C(|V_hold|, 2) rows per run, charged before the peak-memory counter
     # is reset below and therefore outside the measured training peak.
-    _enforce_e2e_initial_slot_health(
+    initial_slot_health = _enforce_e2e_initial_slot_health(
         model,
         data,
         accelerator,
@@ -4199,6 +4319,7 @@ def _train_e2e_stability_loop(
         token_table=factory._token_table,
         token_node_index=factory._token_node_index,
         validation_event_callback=record_validation_event,
+        enforce_quality=enforce_quality,
     )
 
     rows_per_rank, steps_per_epoch = _epoch_step_plan(
@@ -4243,11 +4364,18 @@ def _train_e2e_stability_loop(
     last_metrics: EdgeMetrics | None = None
     last_fidelity: dict[str, float] | None = None
     fixed_replay: dict[str, object] | None = None
-    end_ramp_precision: dict[str, float] | None = None
-    selected_precision: dict[str, float] | None = None
+    end_ramp_precision: dict[str, object] | None = None
+    selected_precision: dict[str, object] | None = None
     latest_topology_norm: float | None = None
     gradient_norm_series: list[dict[str, object]] = []
     optimizer_step_gradients: list[dict[str, object]] = []
+    quality_guard_events: list[dict[str, object]] = []
+    quality_guards_passed = not bool(initial_slot_health.get("quality_threshold_missed", 0.0))
+    if accelerator.is_main_process and not quality_guards_passed:
+        quality_guard_events.append(
+            {"kind": "initial_slot_collapse", "optimizer_step": 0, **initial_slot_health}
+        )
+    warm_reference_quality_pass: bool | None = None
     per_epoch_profiles: list[dict[str, object]] = []
     total_local_pairs = 0
     total_local_tokens = 0
@@ -4315,6 +4443,7 @@ def _train_e2e_stability_loop(
                         "generator": training.generator_clip_norm,
                         "topology_content_conditioning": training.clip_norm,
                     },
+                    enforce_nonzero=enforce_quality,
                 )
                 gradient_row: dict[str, object] = {
                     "step": global_step + 1,
@@ -4330,11 +4459,46 @@ def _train_e2e_stability_loop(
                     gradient_records,
                     step=global_step + 1,
                     phase=phase.phase,
+                    enforce_immediate=enforce_quality,
                     enforce_persistent=(
                         not profile_only
-                        and (cfg.run_kind or "formal") != "qualification"
+                        and enforce_quality
                     ),
                 )
+                gradient_quality: dict[str, dict[str, bool]] = {}
+                for name, gradient_record in gradient_records.items():
+                    if not gradient_record.active:
+                        gradient_quality[name] = {
+                            "finite_zero_norm": False,
+                            "immediate_clip_threshold_missed": False,
+                            "persistent_clip_threshold_missed": False,
+                        }
+                        continue
+                    coefficient = cast(float, gradient_record.clip_coefficient)
+                    flags = {
+                        "finite_zero_norm": gradient_record.norm == 0.0,
+                        "immediate_clip_threshold_missed": (
+                            coefficient < training.clip_immediate_abort
+                        ),
+                        "persistent_clip_threshold_missed": (
+                            clip_guard.streaks is not None
+                            and clip_guard.streaks.get(name, 0) >= training.clip_persistent_steps
+                        ),
+                    }
+                    gradient_quality[name] = flags
+                    if any(flags.values()):
+                        quality_guards_passed = False
+                        if accelerator.is_main_process:
+                            quality_guard_events.append(
+                                {
+                                    "kind": "optimizer_gradient",
+                                    "step": global_step + 1,
+                                    "phase": phase.phase,
+                                    "group": name,
+                                    **flags,
+                                }
+                            )
+                gradient_row["quality_thresholds"] = gradient_quality
                 optimizer.step()
                 post_step_failure = 0
                 try:
@@ -4375,8 +4539,38 @@ def _train_e2e_stability_loop(
                         phase,
                         arm,
                         accelerator,
+                        require_live_gradients=enforce_quality,
                     )
-                    ratios = ratio_guard.update(family_norms, enabled=phase.alpha == 1.0)
+                    ratios = ratio_guard.update(
+                        family_norms,
+                        enabled=phase.alpha == 1.0,
+                        enforce_quality=enforce_quality,
+                    )
+                    ratio_defined = dict(ratio_guard.ratio_defined or {})
+                    family_quality_misses = {
+                        group: {
+                            "finite_zero_norm": any(value == 0.0 for value in values.values()),
+                            "ratio_defined": ratio_defined.get(group, False),
+                            "ratio_threshold_missed": (
+                                ratio_defined.get(group, False)
+                                and ratios.get(group, 0.0) > training.family_ratio_abort
+                            ),
+                            "persistent_ratio_threshold_missed": (
+                                ratio_guard.streaks is not None
+                                and ratio_guard.streaks.get(group, 0)
+                                >= training.family_ratio_probes
+                            ),
+                        }
+                        for group, values in family_norms.items()
+                    }
+                    if any(
+                        flags["finite_zero_norm"]
+                        or (len(family_norms[group]) >= 2 and not flags["ratio_defined"])
+                        or flags["ratio_threshold_missed"]
+                        or flags["persistent_ratio_threshold_missed"]
+                        for group, flags in family_quality_misses.items()
+                    ):
+                        quality_guards_passed = False
                     latest_topology_norm = family_norms["topology_content_conditioning"].get("edge")
                     probe_record: dict[str, object] = {
                         "step": global_step,
@@ -4387,6 +4581,8 @@ def _train_e2e_stability_loop(
                         },
                         "family_group_norms": family_norms,
                         "family_group_ratios": ratios,
+                        "family_group_ratio_defined": ratio_defined,
+                        "family_quality_thresholds": family_quality_misses,
                         "submodule_gradient_rms": submodule_rms,
                         **_e2e_gate_tanh(
                             cast(EgoStitchE2E, accelerator.unwrap_model(wrapped).model)
@@ -4394,6 +4590,26 @@ def _train_e2e_stability_loop(
                     }
                     epoch_probes.append(probe_record)
                     gradient_norm_series.append(probe_record)
+                    if accelerator.is_main_process:
+                        for group, flags in family_quality_misses.items():
+                            if (
+                                flags["finite_zero_norm"]
+                                or (
+                                    len(family_norms[group]) >= 2
+                                    and not flags["ratio_defined"]
+                                )
+                                or flags["ratio_threshold_missed"]
+                                or flags["persistent_ratio_threshold_missed"]
+                            ):
+                                quality_guard_events.append(
+                                    {
+                                        "kind": "family_gradient",
+                                        "step": global_step,
+                                        "phase": phase.phase,
+                                        "group": group,
+                                        **flags,
+                                    }
+                                )
 
                 if not profile_only and global_step == phase_a_end:
                     warm = _validate_epoch(
@@ -4407,19 +4623,39 @@ def _train_e2e_stability_loop(
                     )
                     record_validation_event("phase_a_end", epoch, global_step)
                     warm_failure = 0
+                    warm_floor_failure = 0
                     if accelerator.is_main_process:
                         assert warm is not None
                         warm_reference_std = warm.fidelity["f_logit_std"]
-                        if not math.isfinite(warm_reference_std) or warm_reference_std < 1e-4:
+                        if not math.isfinite(warm_reference_std):
                             warm_failure = 1
+                        else:
+                            warm_reference_quality_pass = warm_reference_std >= 1e-4
+                            if not warm_reference_quality_pass:
+                                warm_floor_failure = 1
+                                quality_guards_passed = False
+                                quality_guard_events.append(
+                                    {
+                                        "kind": "warm_reference_std",
+                                        "step": global_step,
+                                        "value": warm_reference_std,
+                                        "floor": 1e-4,
+                                    }
+                                )
                     failed = accelerator.reduce(
                         torch.tensor(warm_failure, device=accelerator.device), reduction="sum"
                     )
                     if int(failed.item()) > 0:
                         raise RuntimeError("invalid E2E warm-reference logit standard deviation")
+                    failed = accelerator.reduce(
+                        torch.tensor(warm_floor_failure, device=accelerator.device),
+                        reduction="sum",
+                    )
+                    if int(failed.item()) > 0 and enforce_quality:
+                        raise RuntimeError("invalid E2E warm-reference logit standard deviation")
                 if not profile_only and global_step == phase_b_end and arm == "full":
                     assert fixed_replay is not None
-                    precision_failure = 0
+                    precision_error: Exception | None = None
                     if accelerator.is_main_process:
                         try:
                             inner_model = cast(
@@ -4430,15 +4666,31 @@ def _train_e2e_stability_loop(
                                 inner_model,
                                 cast(dict[str, torch.Tensor], fixed_replay["edge"]),
                                 accelerator,
+                                enforce_quality=enforce_quality,
                             )
-                        except RuntimeError as error:
-                            logger.error("end-ramp precision differential: %s", error)
-                            precision_failure = 1
-                    failed = accelerator.reduce(
-                        torch.tensor(precision_failure, device=accelerator.device), reduction="sum"
+                            if not bool(end_ramp_precision["quality_pass"]):
+                                quality_guards_passed = False
+                                quality_guard_events.append(
+                                    {
+                                        "kind": "end_ramp_precision",
+                                        "step": global_step,
+                                        "quality_failures": end_ramp_precision[
+                                            "quality_failures"
+                                        ],
+                                    }
+                                )
+                        except Exception as error:
+                            precision_error = error
+                            logger.error(
+                                "end-ramp precision differential: %s: %s",
+                                type(error).__name__,
+                                error,
+                            )
+                    _raise_synchronized_precision_failure(
+                        accelerator,
+                        local_error=precision_error,
+                        context="end-ramp",
                     )
-                    if int(failed.item()) > 0:
-                        raise RuntimeError("end-ramp E2E precision differential failed")
 
                 epoch_local_pairs += batch.edge_rows_true
                 epoch_local_tokens += batch.f0_rows_gathered
@@ -4462,6 +4714,7 @@ def _train_e2e_stability_loop(
         phase = e2e_phase_state(global_step - 1, schedule_total_steps)
         collapse_failure = 0
         slot_collapse_failure = 0
+        validation_nonfinite_failure = 0
         if accelerator.is_main_process:
             assert validation is not None
             metrics = validation.metrics
@@ -4469,6 +4722,22 @@ def _train_e2e_stability_loop(
             last_metrics = metrics
             last_fidelity = fidelity
             full_joint_epochs = max(0, epoch - first_eligible_epoch + 1)
+            validation_quality_values = {
+                "auprc": metrics.auprc,
+                "brier": metrics.brier,
+                "prevalence": fidelity["prevalence"],
+                "active_logit_std": fidelity["active_logit_std"],
+                "clustering_mmd": fidelity["clustering_mmd"],
+                "f_logit_std": fidelity["f_logit_std"],
+                "f_logit_auprc": fidelity["f_logit_auprc"],
+                "h_pairwise_cosine_mean": fidelity["h_pairwise_cosine_mean"],
+                "plan_rank1_marginal_residual": fidelity[
+                    "plan_rank1_marginal_residual"
+                ],
+            }
+            validation_nonfinite_failure = int(
+                not all(math.isfinite(value) for value in validation_quality_values.values())
+            )
             if _should_capture_auprc_tolerance_source(
                 run_kind=run_kind,
                 arm=arm,
@@ -4495,7 +4764,7 @@ def _train_e2e_stability_loop(
                 )
             ):
                 warm_reference_auprc = fidelity["f_logit_auprc"]
-            if warm_reference_std is not None:
+            if warm_reference_std is not None and not validation_nonfinite_failure:
                 threshold = max(
                     training.collapse_fraction * warm_reference_std,
                     training.collapse_floor,
@@ -4503,13 +4772,40 @@ def _train_e2e_stability_loop(
                 collapse_streak = collapse_streak + 1 if fidelity["f_logit_std"] < threshold else 0
                 if collapse_streak >= training.collapse_validations:
                     collapse_failure = 1
-            try:
-                slot_collapse_guard.update(
-                    fidelity,
-                    conditioning_active=phase.edge_active and arm != "b0_e2e_f_only",
+            if not validation_nonfinite_failure:
+                slot_collapse_failure = int(
+                    slot_collapse_guard.update(
+                        fidelity,
+                        conditioning_active=phase.edge_active and arm != "b0_e2e_f_only",
+                        enforce_quality=False,
+                    )
                 )
-            except RuntimeError:
-                slot_collapse_failure = 1
+            if collapse_failure:
+                quality_guards_passed = False
+                quality_guard_events.append(
+                    {
+                        "kind": "validation_logit_collapse",
+                        "epoch": epoch,
+                        "step": global_step,
+                        "streak": collapse_streak,
+                        "value": fidelity["f_logit_std"],
+                        "threshold": threshold,
+                    }
+                )
+            if slot_collapse_failure:
+                quality_guards_passed = False
+                quality_guard_events.append(
+                    {
+                        "kind": "slot_collapse",
+                        "epoch": epoch,
+                        "step": global_step,
+                        "streak": slot_collapse_guard.streak,
+                        "h_pairwise_cosine_mean": fidelity["h_pairwise_cosine_mean"],
+                        "plan_rank1_marginal_residual": fidelity[
+                            "plan_rank1_marginal_residual"
+                        ],
+                    }
+                )
             # `history` is written only when the run completes, and the
             # registered `training_invalid(slot_collapse)` label carries no
             # numbers -- so a collapse otherwise leaves no record of which
@@ -4536,7 +4832,7 @@ def _train_e2e_stability_loop(
                 epoch=epoch,
                 phase=phase.phase,
                 full_joint_epochs_completed=full_joint_epochs,
-                guards_passed=True,
+                guards_passed=quality_guards_passed,
                 auprc=metrics.auprc,
                 prevalence=fidelity["prevalence"],
                 active_logit_std=fidelity["active_logit_std"],
@@ -4566,19 +4862,32 @@ def _train_e2e_stability_loop(
                     "lr": float(optimizer.param_groups[0]["lr"]),
                     "fidelity": fidelity,
                     "checkpoint_eligible": e2e_checkpoint_eligible(record, arm),
+                    "quality_thresholds": {
+                        "validation_values_finite": not bool(validation_nonfinite_failure),
+                        "warm_reference_floor_pass": warm_reference_quality_pass,
+                        "validation_logit_collapse": bool(collapse_failure),
+                        "slot_collapse": bool(slot_collapse_failure),
+                        "cumulative_quality_guards_passed": quality_guards_passed,
+                    },
                     "gradient_norm_probes": epoch_probes,
                     **{f"loss_{name}": value for name, value in epoch_parts.items()},
                 }
             )
         failed = accelerator.reduce(
-            torch.tensor(slot_collapse_failure, device=accelerator.device), reduction="sum"
+            torch.tensor(validation_nonfinite_failure, device=accelerator.device),
+            reduction="sum",
         )
         if int(failed.item()) > 0:
+            raise RuntimeError("non-finite E2E validation quality telemetry")
+        failed = accelerator.reduce(
+            torch.tensor(slot_collapse_failure, device=accelerator.device), reduction="sum"
+        )
+        if int(failed.item()) > 0 and enforce_quality:
             raise RuntimeError("training_invalid(slot_collapse)")
         failed = accelerator.reduce(
             torch.tensor(collapse_failure, device=accelerator.device), reduction="sum"
         )
-        if int(failed.item()) > 0:
+        if int(failed.item()) > 0 and enforce_quality:
             raise RuntimeError("persistent E2E validation-logit collapse")
         per_epoch_profiles.append(
             {
@@ -4630,13 +4939,24 @@ def _train_e2e_stability_loop(
         reduction="sum",
     )
     selected_epoch = int(selected_epoch_tensor.item())
+    selection_status = "selected"
+    diagnostic_epoch: int | None = None
     if selected_epoch <= 0:
+        if run_kind != "qualification":
+            if accelerator.is_main_process:
+                _write_failed_run_history(
+                    cfg.output_dir, run_kind=run_kind, arm=arm, history=history
+                )
+            raise RuntimeError("E2E run produced no eligible checkpoint; fallback is forbidden")
+        selection_status = "diagnostic_last_epoch"
+        diagnostic_epoch = len(epoch_step_counts)
         if accelerator.is_main_process:
-            _write_failed_run_history(cfg.output_dir, run_kind=run_kind, arm=arm, history=history)
-        raise RuntimeError("E2E run produced no eligible checkpoint; fallback is forbidden")
+            best_state = last_state
+            best_metrics = last_metrics
+    result_epoch = selected_epoch if selected_epoch > 0 else cast(int, diagnostic_epoch)
 
     if not profile_only and arm == "full":
-        precision_failure = 0
+        precision_error = None
         if accelerator.is_main_process:
             assert fixed_replay is not None
             inner_model = cast(_CompositeStep, accelerator.unwrap_model(wrapped)).model
@@ -4647,15 +4967,29 @@ def _train_e2e_stability_loop(
                     inner_model,
                     cast(dict[str, torch.Tensor], fixed_replay["edge"]),
                     accelerator,
+                    enforce_quality=enforce_quality,
                 )
-            except RuntimeError as error:
-                logger.error("selected-checkpoint precision differential: %s", error)
-                precision_failure = 1
-        failed = accelerator.reduce(
-            torch.tensor(precision_failure, device=accelerator.device), reduction="sum"
+                if not bool(selected_precision["quality_pass"]):
+                    quality_guards_passed = False
+                    quality_guard_events.append(
+                        {
+                            "kind": "selected_precision",
+                            "epoch": result_epoch,
+                            "quality_failures": selected_precision["quality_failures"],
+                        }
+                    )
+            except Exception as error:
+                precision_error = error
+                logger.error(
+                    "selected-checkpoint precision differential: %s: %s",
+                    type(error).__name__,
+                    error,
+                )
+        _raise_synchronized_precision_failure(
+            accelerator,
+            local_error=precision_error,
+            context="selected-checkpoint",
         )
-        if int(failed.item()) > 0:
-            raise RuntimeError("selected-checkpoint E2E precision differential failed")
 
     local_peak_gib = (
         torch.cuda.max_memory_allocated(accelerator.device) / (1024**3) if use_cuda else 0.0
@@ -4785,7 +5119,12 @@ def _train_e2e_stability_loop(
             "end_ramp": end_ramp_precision,
             "selected": selected_precision,
         },
-        "selected_epoch": selected_epoch,
+        "initial_slot_health": initial_slot_health,
+        "quality_guard_events": quality_guard_events,
+        "quality_guards_passed": quality_guards_passed,
+        "selected_epoch": selected_epoch if selected_epoch > 0 else None,
+        "selection_status": selection_status,
+        "diagnostic_epoch": diagnostic_epoch,
         "profile_only": profile_only,
     }
     if accelerator.is_main_process and data.access_audit is not None:
@@ -4817,7 +5156,7 @@ def _train_e2e_stability_loop(
         checkpoint_dir.rmdir()
     return EgoTrainResult(
         best_state_dict=best_state,
-        best_epoch=selected_epoch,
+        best_epoch=result_epoch,
         best_val_metrics=best_metrics,
         last_state_dict=last_state,
         last_epoch=len(epoch_step_counts),
@@ -5383,6 +5722,14 @@ def write_outputs(
         for entry in result.history:
             handle.write(json.dumps({**entry, "epoch": int(cast(float, entry["epoch"]))}) + "\n")
 
+    checkpoint_sha256 = _sha256_file(best_path)
+    checkpoint_role = (
+        "qualification_manual_review_only"
+        if expected_run_kind == "qualification"
+        else "debug_only"
+        if debug
+        else "formal_selected"
+    )
     run_metadata.update(
         {
             "status": "debug_complete" if debug else "complete",
@@ -5401,9 +5748,17 @@ def write_outputs(
                 expected_run_kind == "formal"
                 and result.runtime_profile.get("selected_epoch") is not None
             ),
-            "checkpoint_sha256": _sha256_file(best_path),
+            "checkpoint_role": checkpoint_role,
+            "checkpoint_sha256": checkpoint_sha256,
+            "diagnostic_checkpoint_sha256": (
+                checkpoint_sha256 if expected_run_kind == "qualification" else None
+            ),
+            "diagnostic_checkpoint_epoch": (
+                result.best_epoch if expected_run_kind == "qualification" else None
+            ),
             "validation_liveness_pass": (
-                result.best_epoch > 0
+                expected_run_kind == "formal"
+                and result.best_epoch > 0
                 and (
                     cfg.model.config.get("permanent_null") != "none"
                     or any(
@@ -5590,6 +5945,14 @@ def _run_ddp_worker(
     ):
         formal_binding = _validate_e2e_formal_binding(cfg, preregistration, args.config)
 
+    effective_run_kind = "debug" if args.max_steps is not None else (cfg.run_kind or "formal")
+    if (
+        not measurement_only
+        and effective_run_kind == "qualification"
+        and cfg.optim.epochs != 3
+    ):
+        raise ValueError("qualification worker requires exactly 3 epochs")
+
     accelerator = build_egostitch_ddp_accelerator(
         cfg.mixed_precision,
         find_unused_parameters=False,
@@ -5602,7 +5965,7 @@ def _run_ddp_worker(
         accelerator.num_processes,
         accelerator.device,
     )
-    run_kind = "debug" if args.max_steps is not None else (cfg.run_kind or "formal")
+    run_kind = effective_run_kind
     feature_stats_sha256 = ""
 
     def record_qualification_failure(error: BaseException) -> None:

@@ -531,18 +531,19 @@ rule).
    Measured prevalence, disclosed rather than hidden: `V_hold` is 0.0117
    (1,533 positives / 130,816 pairs), against `V_select` alone at 0.0247 (807
    positives / 32,640 pairs) — the union raises positives 1.9x but halves
-   prevalence. The qualification verdict is guards-only ("it trained") — no
-   AUPRC or topology threshold on that verdict. "Guards-only" governs only the
-   qualification **verdict**; `e2e_checkpoint_eligible` — the post-ramp/
+   prevalence. Qualification is exactly three epochs and every finite model-quality
+   threshold is telemetry-only; a complete run writes `pending_manual_review` even
+   without a quality-eligible checkpoint. `e2e_checkpoint_eligible` — the post-ramp/
    phase-C restriction, the AUPRC floor at `prevalence + 0.02`, and the
-   residual / logit-std / topology-gradient conditions — is **retained
-   unchanged in both stages**. Because the union halves prevalence, that
+   residual / logit-std / topology-gradient conditions — is computed as
+   qualification telemetry and remains an unchanged hard requirement in formal.
+   Because the union halves prevalence, that
    floor's absolute value drops accordingly: 0.0447 on `V_select` alone to
-   0.0317 on `V_hold`. The qualification stage is otherwise a development
-   loop, not a scientific gate, and its `pass` licenses no held-out claim;
-   only the retained eligibility floor is what prevents selection from
-   landing on a reconstruction-only warm-start checkpoint, the documented
-   2026-07-19 v1 failure above. The formal stage carries pre-registered
+   0.0317 on `V_hold`. Qualification is a development loop, not a scientific gate;
+   `pending_manual_review` and its diagnostic checkpoint aliases license no held-out
+   claim or formal run. Formal eligibility prevents selection from landing on a
+   reconstruction-only warm-start checkpoint, the documented 2026-07-19 v1 failure
+   above. The formal stage carries pre-registered
    acceptance thresholds recorded before any held-out read (§5.2.4), and its
    result is engineering evidence, not inference, at any seed count — only
    E1/E3 (≥3 seeds, Holm-corrected, plus the §8-spec 30-config HPO-parity
@@ -576,7 +577,7 @@ rule).
    controls over the full checkpoint (within-pair rebuild-form shuffle 6a-v3 and
    degree-preserving rewiring 6e-v1) — on the two-stage ladder: both stages train on
    identical `V_fit`, validate/select on `V_hold`, and differ only in `optim.epochs`.
-   Qualification has a guards-only verdict; formal execution requires owner-promoted
+   Qualification uses the three-epoch telemetry-completion verdict above; formal execution requires owner-promoted
    `BINDING` v4 and retains the registered acceptance thresholds. The frozen
    pairwise scorer's §0 role is **unchanged** (the measured grounding-pool audit
    eliminated the candidate-proposer reuse), and this paragraph does not bind the

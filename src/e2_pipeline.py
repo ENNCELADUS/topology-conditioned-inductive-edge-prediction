@@ -608,12 +608,23 @@ _E2E_OPTIMIZER_GROUP_NAMES = {
     "generator",
     "topology_content_conditioning",
 }
-_E2E_GRADIENT_ROW_KEYS = {"step", "phase", "alpha", "optimizer_group_gradients"}
+_E2E_GRADIENT_ROW_KEYS = {
+    "step",
+    "phase",
+    "alpha",
+    "optimizer_group_gradients",
+    "quality_thresholds",
+}
 _E2E_GRADIENT_RECORD_KEYS = {
     "active",
     "norm",
     "clip_coefficient",
     "nonfinite_elements",
+}
+_E2E_GRADIENT_QUALITY_FLAG_KEYS = {
+    "finite_zero_norm",
+    "immediate_clip_threshold_missed",
+    "persistent_clip_threshold_missed",
 }
 
 
@@ -795,6 +806,23 @@ def _validate_qualification_gradient_telemetry(profile: Mapping[str, object]) ->
             ):
                 raise ValueError(
                     f"qualification active clip coefficient for {name} is invalid"
+                )
+        quality_thresholds = row.get("quality_thresholds")
+        if (
+            not isinstance(quality_thresholds, dict)
+            or set(quality_thresholds) != _E2E_OPTIMIZER_GROUP_NAMES
+        ):
+            raise ValueError(
+                "qualification optimizer-step quality-threshold groups are incomplete"
+            )
+        for name, flags in quality_thresholds.items():
+            if not isinstance(flags, dict) or set(flags) != _E2E_GRADIENT_QUALITY_FLAG_KEYS:
+                raise ValueError(
+                    f"qualification quality-threshold flags for {name} have an invalid schema"
+                )
+            if not all(isinstance(value, bool) for value in flags.values()):
+                raise ValueError(
+                    f"qualification quality-threshold flags for {name} must be boolean"
                 )
 
 
@@ -1004,8 +1032,8 @@ def run_pipeline(
         # epoch override there would shorten the run behind a matching sha256.
         if args.run_kind != "qualification":
             raise ValueError("--epochs is only supported with --run-kind qualification")
-        if args.epochs <= 0:
-            raise ValueError("--epochs must be positive")
+        if args.epochs != 3:
+            raise ValueError("qualification --epochs must equal 3")
         # Both _validate_worker_profile and _validate_staged_artifacts key off
         # cfg.optim.epochs, so overriding it here is what makes them track the
         # schedule the worker is actually told to run.
