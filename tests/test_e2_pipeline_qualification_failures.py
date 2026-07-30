@@ -161,6 +161,7 @@ def qualification_worker(monkeypatch: pytest.MonkeyPatch) -> str:
     module.validate_qualification_artifact = (  # type: ignore[attr-defined]
         validate_qualification_artifact
     )
+    module.model_config_hash = lambda _cfg: "cd" * 32  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, module_name, module)
     return module_name
 
@@ -211,11 +212,11 @@ def test_worker_launch_failure_writes_named_qualification_verdict(
     assert qualification["feature_stats_sha256"] == ""
 
 
-def test_staged_artifact_failure_replaces_worker_pass_with_failure(
+def test_staged_artifact_failure_replaces_worker_pending_with_failure(
     tmp_path: Path, qualification_worker: str
 ) -> None:
     args, output_dir = _qualification_args(tmp_path, qualification_worker)
-    base = pipeline_tests._qualification_runner(verdict="pass")
+    base = pipeline_tests._qualification_runner(verdict="pending_manual_review")
 
     def corrupt_checkpoint(
         command: Sequence[str], timeout: float
@@ -234,16 +235,19 @@ def test_staged_artifact_failure_replaces_worker_pass_with_failure(
     assert (output_dir / "v_hold_validation_events.jsonl").is_file()
 
 
-def test_success_preserves_worker_pass_verdict(
+def test_success_preserves_worker_pending_verdict(
     tmp_path: Path, qualification_worker: str
 ) -> None:
     args, output_dir = _qualification_args(tmp_path, qualification_worker)
     runner: Callable[[Sequence[str], float], subprocess.CompletedProcess[str]] = (
-        pipeline_tests._qualification_runner(verdict="pass")
+        pipeline_tests._qualification_runner(verdict="pending_manual_review")
     )
 
     assert run_pipeline(args, command_runner=runner) == 0
-    assert json.loads((output_dir / "qualification.json").read_text())["verdict"] == "pass"
+    assert (
+        json.loads((output_dir / "qualification.json").read_text())["verdict"]
+        == "pending_manual_review"
+    )
     assert not (output_dir / "failure.json").exists()
 
 
@@ -254,7 +258,7 @@ def test_zero_exit_refuses_missing_or_malformed_qualification_artifact(
     failure_mode: str,
 ) -> None:
     args, output_dir = _qualification_args(tmp_path, qualification_worker)
-    base = pipeline_tests._qualification_runner(verdict="pass")
+    base = pipeline_tests._qualification_runner(verdict="pending_manual_review")
 
     def invalid_artifact_runner(
         command: Sequence[str], timeout: float
@@ -296,7 +300,7 @@ def test_zero_exit_refuses_identity_mismatched_qualification_artifact(
     value: object,
 ) -> None:
     args, output_dir = _qualification_args(tmp_path, qualification_worker)
-    base = pipeline_tests._qualification_runner(verdict="pass")
+    base = pipeline_tests._qualification_runner(verdict="pending_manual_review")
 
     def mismatched_artifact_runner(
         command: Sequence[str], timeout: float
@@ -313,6 +317,89 @@ def test_zero_exit_refuses_identity_mismatched_qualification_artifact(
     assert json.loads((output_dir / "failure.json").read_text())["stage"] == "artifacts"
     assert json.loads((output_dir / "qualification.json").read_text())["verdict"] == (
         "fail(staged_artifacts)"
+    )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "missing",
+        "truncated",
+        "skipped_step",
+        "nonfinite",
+        "malformed",
+        "missing_group",
+        "count_mismatch",
+        "schedule_mismatch",
+    ],
+)
+def test_zero_exit_refuses_incomplete_or_malformed_gradient_telemetry(
+    tmp_path: Path,
+    qualification_worker: str,
+    corruption: str,
+) -> None:
+    args, output_dir = _qualification_args(tmp_path, qualification_worker)
+    base = pipeline_tests._qualification_runner(verdict="pending_manual_review")
+
+    def corrupt_telemetry(
+        command: Sequence[str], timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        completed = base(command, timeout)
+        profile_path = Path(pipeline_tests._arg_value(command, "--profile-output"))
+        profile = json.loads(profile_path.read_text())
+        rows = profile["optimizer_step_gradients"]
+        assert isinstance(rows, list)
+        if corruption == "missing":
+            profile.pop("optimizer_step_gradients")
+        elif corruption == "truncated":
+            rows.pop()
+        elif corruption == "skipped_step":
+            rows[1]["step"] = 3
+        elif corruption == "nonfinite":
+            rows[0]["optimizer_group_gradients"]["generator"]["norm"] = float("nan")
+        elif corruption == "malformed":
+            rows[0]["optimizer_group_gradients"]["generator"].pop("clip_coefficient")
+        elif corruption == "missing_group":
+            rows[0]["optimizer_group_gradients"].pop("generator")
+        elif corruption == "count_mismatch":
+            rows.pop()
+            profile["total_optimizer_steps"] = 1
+            profile["schedule_total_optimizer_steps"] = 1
+        else:
+            profile["schedule_total_optimizer_steps"] = 3
+        profile_path.write_text(json.dumps(profile))
+        return completed
+
+    assert run_pipeline(args, command_runner=corrupt_telemetry) == 2
+    assert not (output_dir / "complete.json").exists()
+    assert json.loads((output_dir / "failure.json").read_text())["stage"] == "artifacts"
+    assert json.loads((output_dir / "qualification.json").read_text())["verdict"] == (
+        "fail(staged_artifacts)"
+    )
+
+
+def test_persistent_low_clip_telemetry_is_published_for_manual_review(
+    tmp_path: Path, qualification_worker: str
+) -> None:
+    args, output_dir = _qualification_args(tmp_path, qualification_worker)
+    base = pipeline_tests._qualification_runner(verdict="pending_manual_review")
+
+    def ten_low_clip_steps(
+        command: Sequence[str], timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        completed = base(command, timeout)
+        profile_path = Path(pipeline_tests._arg_value(command, "--profile-output"))
+        profile = json.loads(profile_path.read_text())
+        profile.update(pipeline_tests._valid_qualification_gradient_telemetry(total_steps=10))
+        for epoch in profile["per_epoch"]:
+            epoch["steps"] = 5
+        profile_path.write_text(json.dumps(profile))
+        return completed
+
+    assert run_pipeline(args, command_runner=ten_low_clip_steps) == 0
+    assert json.loads((output_dir / "complete.json").read_text())["status"] == "complete"
+    assert json.loads((output_dir / "qualification.json").read_text())["verdict"] == (
+        "pending_manual_review"
     )
 
 
@@ -334,4 +421,23 @@ def test_zero_exit_preserves_worker_named_failure_instead_of_completing(
     assert json.loads((output_dir / "failure.json").read_text())["stage"] == "artifacts"
     assert json.loads((output_dir / "qualification.json").read_text())["verdict"] == (
         "training_invalid(slot_collapse)"
+    )
+
+
+def test_zero_exit_refuses_automatic_pass_instead_of_completing(
+    tmp_path: Path, qualification_worker: str
+) -> None:
+    args, output_dir = _qualification_args(tmp_path, qualification_worker)
+
+    assert (
+        run_pipeline(
+            args,
+            command_runner=pipeline_tests._qualification_runner(verdict="pass"),
+        )
+        == 2
+    )
+    assert not (output_dir / "complete.json").exists()
+    assert json.loads((output_dir / "failure.json").read_text())["stage"] == "artifacts"
+    assert json.loads((output_dir / "qualification.json").read_text())["verdict"] == (
+        "fail(staged_artifacts)"
     )

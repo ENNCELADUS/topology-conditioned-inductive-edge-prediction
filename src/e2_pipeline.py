@@ -567,7 +567,7 @@ _PUBLISHED_FILENAMES = (
 V_HOLD_VALIDATION_EVENTS_FILENAME = "v_hold_validation_events.jsonl"
 #: Written by the qualification stage only. It is the stage's verdict, and the
 #: formal stage refuses to launch without it. A stale verdict is always cleared,
-#: so a failed re-qualification can never leave an earlier ``pass`` standing.
+#: so a failed re-qualification can never leave an earlier verdict standing.
 QUALIFICATION_ARTIFACT_FILENAME = "qualification.json"
 AUPRC_TOLERANCE_SOURCE_FILENAME = "auprc_tolerance_source.npz"
 _OPTIONAL_PUBLISHED_FILENAMES = (
@@ -603,10 +603,22 @@ _QUALIFICATION_HPARAM_KEYS = {
     "mixed_precision",
     "training",
 }
+_E2E_OPTIMIZER_GROUP_NAMES = {
+    "pair_encoder_head",
+    "generator",
+    "topology_content_conditioning",
+}
+_E2E_GRADIENT_ROW_KEYS = {"step", "phase", "alpha", "optimizer_group_gradients"}
+_E2E_GRADIENT_RECORD_KEYS = {
+    "active",
+    "norm",
+    "clip_coefficient",
+    "nonfinite_elements",
+}
 
 
 def _validate_qualification_artifact_schema(payload: object, *, epochs: int) -> dict[str, object]:
-    """Validate the common schema used by pass and named-failure verdicts."""
+    """Validate the common schema used by every qualification verdict."""
     if not isinstance(payload, dict) or set(payload) != _QUALIFICATION_ARTIFACT_KEYS:
         raise ValueError("qualification.json has an invalid top-level schema")
     recorded_epochs = payload.get("epochs")
@@ -636,10 +648,17 @@ def _validate_qualification_artifact_schema(payload: object, *, epochs: int) -> 
     return cast(dict[str, object], payload)
 
 
-def _validate_qualification_success_artifact(
+def _validate_qualification_completion_artifact(
     staging_dir: Path, *, cfg: object, worker: object
 ) -> None:
-    """Require the qualification worker's pass verdict and bind it to this run."""
+    """Bind a completed qualification's pending verdict to this exact run.
+
+    The worker's public ``validate_qualification_artifact`` is intentionally a
+    formal-preflight validator: it accepts only ``pass``, which this pipeline
+    neither creates nor derives from a pending artifact. Qualification
+    completion is a narrower engineering assertion, so validate its immutable
+    ``pending_manual_review`` artifact here without weakening formal preflight.
+    """
     path = staging_dir / QUALIFICATION_ARTIFACT_FILENAME
     if not path.is_file() or path.stat().st_size <= 0:
         raise ValueError(f"{QUALIFICATION_ARTIFACT_FILENAME} is missing or empty")
@@ -647,8 +666,11 @@ def _validate_qualification_success_artifact(
         json.loads(path.read_text(encoding="utf-8")),
         epochs=cast(int, getattr(getattr(cfg, "optim", None), "epochs", None)),
     )
-    if payload.get("verdict") != "pass":
-        raise ValueError(f"qualification verdict is not 'pass': {payload.get('verdict')!r}")
+    if payload.get("verdict") != "pending_manual_review":
+        raise ValueError(
+            "qualification verdict is not 'pending_manual_review': "
+            f"{payload.get('verdict')!r}"
+        )
 
     metadata_path = staging_dir / "run_metadata.json"
     if not metadata_path.is_file() or metadata_path.stat().st_size <= 0:
@@ -664,16 +686,116 @@ def _validate_qualification_success_artifact(
     except ValueError as error:
         raise ValueError("run_metadata.json has no valid feature_stats_sha256") from error
 
-    validate_qualification = getattr(worker, "validate_qualification_artifact", None)
-    if not callable(validate_qualification):
-        raise ValueError("qualification worker must provide validate_qualification_artifact")
-    validated = validate_qualification(
-        path,
-        cfg,
-        feature_stats_sha256=feature_stats_sha256,
-    )
-    if not isinstance(validated, dict) or validated != payload:
-        raise ValueError("qualification worker returned an invalid validation result")
+    if payload.get("feature_stats_sha256") != feature_stats_sha256:
+        raise ValueError("qualification feature_stats_sha256 does not match this run")
+
+    model_config_hash = getattr(worker, "model_config_hash", None)
+    if not callable(model_config_hash):
+        raise ValueError("qualification worker must provide model_config_hash")
+    expected_model_config_sha256 = model_config_hash(cfg)
+    if (
+        not isinstance(expected_model_config_sha256, str)
+        or len(expected_model_config_sha256) != 64
+    ):
+        raise ValueError("qualification worker returned an invalid model config digest")
+    try:
+        int(expected_model_config_sha256, 16)
+    except ValueError as error:
+        raise ValueError("qualification worker returned an invalid model config digest") from error
+    if payload.get("model_config_sha256") != expected_model_config_sha256:
+        raise ValueError("qualification model_config_sha256 does not match this config")
+
+
+def _validate_qualification_gradient_telemetry(profile: Mapping[str, object]) -> None:
+    """Require complete finite per-step telemetry without applying margin gates."""
+    total_steps = profile.get("total_optimizer_steps")
+    if isinstance(total_steps, bool) or not isinstance(total_steps, int) or total_steps <= 0:
+        raise ValueError("qualification total_optimizer_steps must be a positive integer")
+    schedule_total_steps = profile.get("schedule_total_optimizer_steps")
+    if (
+        isinstance(schedule_total_steps, bool)
+        or not isinstance(schedule_total_steps, int)
+        or schedule_total_steps != total_steps
+    ):
+        raise ValueError("qualification schedule and executed optimizer-step counts disagree")
+    per_epoch = profile.get("per_epoch")
+    if not isinstance(per_epoch, list) or not per_epoch:
+        raise ValueError("qualification per-epoch optimizer-step telemetry is missing")
+    per_epoch_steps = 0
+    for row in per_epoch:
+        steps = row.get("steps") if isinstance(row, dict) else None
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps <= 0:
+            raise ValueError("qualification per-epoch optimizer-step count is invalid")
+        per_epoch_steps += steps
+    if per_epoch_steps != total_steps:
+        raise ValueError("qualification per-epoch and total optimizer-step counts disagree")
+    rows = profile.get("optimizer_step_gradients")
+    if not isinstance(rows, list) or len(rows) != total_steps:
+        raise ValueError("qualification optimizer-step gradient telemetry is incomplete")
+
+    for expected_step, row in enumerate(rows, start=1):
+        if not isinstance(row, dict) or set(row) != _E2E_GRADIENT_ROW_KEYS:
+            raise ValueError("qualification optimizer-step gradient row has an invalid schema")
+        step = row.get("step")
+        if isinstance(step, bool) or not isinstance(step, int) or step != expected_step:
+            raise ValueError("qualification optimizer-step gradient sequence is invalid")
+        if row.get("phase") not in {"A", "B", "C"}:
+            raise ValueError("qualification optimizer-step gradient phase is invalid")
+        alpha = row.get("alpha")
+        if (
+            isinstance(alpha, bool)
+            or not isinstance(alpha, int | float)
+            or not math.isfinite(float(alpha))
+            or not 0.0 <= float(alpha) <= 1.0
+        ):
+            raise ValueError("qualification optimizer-step gradient alpha is invalid")
+
+        groups = row.get("optimizer_group_gradients")
+        if not isinstance(groups, dict) or set(groups) != _E2E_OPTIMIZER_GROUP_NAMES:
+            raise ValueError("qualification optimizer-step gradient groups are incomplete")
+        if not isinstance(groups.get("generator"), dict) or groups["generator"].get(
+            "active"
+        ) is not True:
+            raise ValueError("qualification generator gradient telemetry must be active")
+        for name, record in groups.items():
+            if not isinstance(record, dict) or set(record) != _E2E_GRADIENT_RECORD_KEYS:
+                raise ValueError(f"qualification gradient record for {name} has an invalid schema")
+            active = record.get("active")
+            if not isinstance(active, bool):
+                raise ValueError(f"qualification gradient record for {name} has invalid activity")
+            nonfinite = record.get("nonfinite_elements")
+            if (
+                isinstance(nonfinite, bool)
+                or not isinstance(nonfinite, int)
+                or nonfinite != 0
+            ):
+                raise ValueError(
+                    f"qualification gradient record for {name} has non-finite elements"
+                )
+            norm = record.get("norm")
+            coefficient = record.get("clip_coefficient")
+            if not active:
+                if norm is not None or coefficient is not None:
+                    raise ValueError(
+                        f"qualification inactive gradient record for {name} must have null values"
+                    )
+                continue
+            if (
+                isinstance(norm, bool)
+                or not isinstance(norm, int | float)
+                or not math.isfinite(float(norm))
+                or float(norm) < 0.0
+            ):
+                raise ValueError(f"qualification active gradient norm for {name} is invalid")
+            if (
+                isinstance(coefficient, bool)
+                or not isinstance(coefficient, int | float)
+                or not math.isfinite(float(coefficient))
+                or not 0.0 < float(coefficient) <= 1.0
+            ):
+                raise ValueError(
+                    f"qualification active clip coefficient for {name} is invalid"
+                )
 
 
 def _validate_staged_artifacts(
@@ -1119,12 +1241,13 @@ def run_pipeline(
         )
     stage_seconds["train"] = time.monotonic() - train_started
 
-    # A zero worker exit is not a qualification verdict. Require the worker's
-    # schema-valid, identity-bound ``pass`` before any general staged-artifact
-    # validation can turn the run into a publishable success.
+    # A zero worker exit is not a qualification result. Require the worker's
+    # schema-valid, identity-bound pending verdict before general artifact
+    # validation may publish an engineering-complete run. This does not call
+    # the pass-only formal-preflight validator or authorize formal execution.
     if args.run_kind == "qualification" and not debug_run:
         try:
-            _validate_qualification_success_artifact(staging_dir, cfg=cfg, worker=worker)
+            _validate_qualification_completion_artifact(staging_dir, cfg=cfg, worker=worker)
         except Exception as error:
             _write_json_atomic(profile_path, evidence_profile)
             return fail(
@@ -1143,6 +1266,8 @@ def run_pipeline(
             memory_limit_gib=runtime.memory_limit_gib,
             allow_partial=debug_run,
         )
+        if args.run_kind == "qualification" and not debug_run:
+            _validate_qualification_gradient_telemetry(worker_runtime_profile)
         completed_epochs = cast(int, worker_runtime_profile["epochs_completed"])
         _validate_staged_artifacts(
             output_dir if debug_run else staging_dir,

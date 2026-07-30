@@ -457,7 +457,7 @@ def test_the_selection_band_calibration_method_is_fully_pinned() -> None:
 # --------------------------------------------------------------------------- ladder and arms
 
 
-def test_v4_registers_the_two_stage_ladder_with_a_guards_only_qualification() -> None:
+def test_v4_registers_pending_manual_review_without_weakening_clipping() -> None:
     ladder = _registration()["ladder"]
     assert isinstance(ladder, dict)
     qualification = ladder["qualification"]
@@ -467,13 +467,21 @@ def test_v4_registers_the_two_stage_ladder_with_a_guards_only_qualification() ->
 
     assert qualification["trains_on"] == formal["trains_on"] == "full V_fit"
     assert qualification["validates_on"] == formal["validates_on"] == "V_hold"
-    assert qualification["verdict"] == "guards only"
+    assert qualification["verdict"] == (
+        "pending manual review after a complete otherwise-valid run; never automatic pass"
+    )
     assert qualification["verdict_values"] == [
-        "pass",
+        "pending_manual_review",
         "fail(<named_guard>)",
         "training_invalid(slot_collapse)",
         "fail(no_eligible_checkpoint)",
     ]
+    verdict_rule = str(qualification["verdict_rule"])
+    assert "writes pending_manual_review, never pass" in verdict_rule
+    assert "global-norm clipping remains active at 3.0 for pair/generator and 1.0" in verdict_rule
+    assert "below 0.1 for ten consecutive steps is telemetry-only in qualification" in verdict_rule
+    assert "one-step below-1e-3 extreme" in verdict_rule
+    assert "no manual-approval artifact or conversion to pass" in verdict_rule
     # The short schedule is a launch-time choice, not a registered constant.
     assert qualification["optim_epochs"] is None
     assert formal["optim_epochs"] == 30
@@ -491,15 +499,35 @@ def test_v4_registers_the_two_stage_ladder_with_a_guards_only_qualification() ->
     ]
     assert formal["preflight"] == [
         "the qualification artifact exists",
-        "verdict == 'pass'",
+        "the current immutable attempt has verdict == 'pass'; pending_manual_review fails "
+        "closed, this DRAFT defines no approval/conversion artifact, and preflight may not "
+        "fall back from a latest pending attempt to an earlier pass",
         "feature_stats_sha256 and model_config_sha256 both equal the formal run's "
         "own computed values",
     ]
+
+    guards = _section("stability_guards")
+    assert guards["immediate_abort"] == [
+        "non-finite loss or logit",
+        "non-finite parameter or optimizer state",
+        "non-finite gradient element, optimizer-group norm, family norm, or submodule RMS",
+        "any optimizer-group clip coefficient below 1e-3",
+    ]
+    persistent_abort = guards["persistent_abort"]
+    assert isinstance(persistent_abort, list)
+    assert persistent_abort[0] == (
+        "formal only: any optimizer-group clip coefficient below 0.1 for 10 consecutive "
+        "steps. Qualification records the identical pre-clip norms, coefficients, and "
+        "streak while applying unchanged clipping, but does not abort on this condition "
+        "and can emit only pending_manual_review"
+    )
+    assert len(persistent_abort) == 3
+    assert "unchanged actual clipping and complete telemetry" in str(guards["abort_consequence"])
     assert "in ANY run kind" in str(ladder["boundary_audit"])
 
 
 def test_checkpoint_eligibility_is_retained_at_both_stages() -> None:
-    """Guards-only governs the verdict, never what makes a checkpoint eligible."""
+    """Manual review governs the verdict, never what makes a checkpoint eligible."""
     selection = _registration()["checkpoint_selection"]
     assert isinstance(selection, dict)
     assert "BOTH stages" in str(selection["eligibility_applies_to_both_stages"])

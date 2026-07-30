@@ -1469,12 +1469,16 @@ def e2e_aware_worker(monkeypatch: pytest.MonkeyPatch) -> str:
             raise RuntimeError("qualification feature identity mismatch")
         return cast(dict[str, object], payload)
 
+    def model_config_hash(_cfg: _E2eAwareConfig) -> str:
+        return "cd" * 32
+
     module.load_config = load_config  # type: ignore[attr-defined]
     module.prepare_pack = train_b0.prepare_pack  # type: ignore[attr-defined]
     module.write_qualification_artifact = write_qualification_artifact  # type: ignore[attr-defined]
     module.validate_qualification_artifact = (  # type: ignore[attr-defined]
         validate_qualification_artifact
     )
+    module.model_config_hash = model_config_hash  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "tests._e2e_aware_worker", module)
     return "tests._e2e_aware_worker"
 
@@ -1498,6 +1502,11 @@ def _qualification_runner(
         out_dir = Path(_arg_value(command, "--output-dir"))
         out_dir.mkdir(parents=True, exist_ok=True)
         completed = base(command, timeout)
+        profile_path = Path(_arg_value(command, "--profile-output"))
+        if profile_path.is_file():
+            profile = json.loads(profile_path.read_text())
+            profile.update(_valid_qualification_gradient_telemetry())
+            profile_path.write_text(json.dumps(profile))
         metadata_path = out_dir / "run_metadata.json"
         if metadata_path.is_file():
             metadata = json.loads(metadata_path.read_text())
@@ -1530,25 +1539,75 @@ def _qualification_runner(
     return runner
 
 
+def _valid_qualification_gradient_telemetry(
+    *, total_steps: int = 2
+) -> dict[str, object]:
+    """Minimal complete schema; low coefficients remain review telemetry."""
+    rows: list[dict[str, object]] = []
+    for step in range(1, total_steps + 1):
+        phase = "A" if step == 1 else "C"
+        rows.append(
+            {
+                "step": step,
+                "phase": phase,
+                "alpha": 0.0 if phase == "A" else 1.0,
+                "optimizer_group_gradients": {
+                    "pair_encoder_head": {
+                        "active": phase != "A",
+                        "norm": None if phase == "A" else 600.0,
+                        "clip_coefficient": None if phase == "A" else 0.005,
+                        "nonfinite_elements": 0,
+                    },
+                    "generator": {
+                        "active": True,
+                        "norm": 600.0,
+                        "clip_coefficient": 0.005,
+                        "nonfinite_elements": 0,
+                    },
+                    "topology_content_conditioning": {
+                        "active": True,
+                        "norm": 300.0,
+                        "clip_coefficient": 0.01,
+                        "nonfinite_elements": 0,
+                    },
+                },
+            }
+        )
+    return {
+        "total_optimizer_steps": total_steps,
+        "schedule_total_optimizer_steps": total_steps,
+        "optimizer_step_gradients": rows,
+    }
+
+
 class TestQualificationVerdictSurvivesPublication:
     """Defect 3: the verdict is the qualification stage's whole product.
 
     `_publish_staged` moves only `_PUBLISHED_FILENAMES` and `fail()` deletes the
-    staging tree, so before the cleanup a `pass` was destroyed by the first and a
-    `fail(<named_guard>)` by the second. Both are verdicts the formal stage's
-    preflight has to be able to read.
+    staging tree, so before the cleanup a completion verdict was destroyed by
+    the first and a `fail(<named_guard>)` by the second. Both remain immutable
+    evidence; a pending result does not authorize formal execution.
     """
 
-    def test_a_pass_verdict_is_published_and_hashed_into_the_manifest(
+    def test_a_pending_verdict_is_published_and_hashed_into_the_manifest(
         self, tmp_path: Path, e2e_aware_worker: str
     ) -> None:
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
         args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
 
-        assert run_pipeline(args, command_runner=_qualification_runner(verdict="pass")) == 0
+        assert (
+            run_pipeline(
+                args,
+                command_runner=_qualification_runner(verdict="pending_manual_review"),
+            )
+            == 0
+        )
 
         published = output_dir / QUALIFICATION_ARTIFACT_FILENAME
-        assert json.loads(published.read_text())["verdict"] == "pass"
+        assert json.loads(published.read_text())["verdict"] == "pending_manual_review"
+        assert json.loads((output_dir / "complete.json").read_text())["status"] == "complete"
+        for filename in ("best.pt", "last.pt", "profile.json"):
+            assert (output_dir / filename).is_file()
         validation_ledger = output_dir / V_HOLD_VALIDATION_EVENTS_FILENAME
         assert validation_ledger.is_file()
         manifest = json.loads((output_dir / "artifact_manifest.json").read_text())
@@ -1566,7 +1625,7 @@ class TestQualificationVerdictSurvivesPublication:
     ) -> None:
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
         args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
-        base = _qualification_runner(verdict="pass")
+        base = _qualification_runner(verdict="pending_manual_review")
 
         def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
             completed = base(command, timeout)
@@ -1593,7 +1652,7 @@ class TestQualificationVerdictSurvivesPublication:
     ) -> None:
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
         args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
-        base = _qualification_runner(verdict="pass")
+        base = _qualification_runner(verdict="pending_manual_review")
 
         def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
             completed = base(command, timeout)
@@ -1617,7 +1676,7 @@ class TestQualificationVerdictSurvivesPublication:
             epochs=2 if run_kind == "qualification" else None,
         )
         runner = (
-            _qualification_runner(verdict="pass")
+            _qualification_runner(verdict="pending_manual_review")
             if run_kind == "qualification"
             else _make_fake_runner(write_v_hold_validation_ledger=True)
         )
@@ -1681,7 +1740,7 @@ class TestQualificationVerdictSurvivesPublication:
     ) -> None:
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
         args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
-        base = _qualification_runner(verdict="pass")
+        base = _qualification_runner(verdict="pending_manual_review")
 
         def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
             completed = base(command, timeout)
@@ -1715,13 +1774,19 @@ class TestQualificationVerdictSurvivesPublication:
         assert payload["verdict"] == "fail(slot_collapse)"
         assert json.loads((output_dir / "failure.json").read_text())["stage"] == "train"
 
-    def test_a_dead_worker_replaces_an_earlier_pass(
+    def test_a_dead_worker_replaces_an_earlier_pending_result(
         self, tmp_path: Path, e2e_aware_worker: str
     ) -> None:
-        """A dead worker must replace a stale pass with a pipeline-owned failure."""
+        """A dead worker must replace stale pending evidence with a named failure."""
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
         args = replace(args, worker_module=e2e_aware_worker, run_kind="qualification", epochs=2)
-        assert run_pipeline(args, command_runner=_qualification_runner(verdict="pass")) == 0
+        assert (
+            run_pipeline(
+                args,
+                command_runner=_qualification_runner(verdict="pending_manual_review"),
+            )
+            == 0
+        )
         assert (output_dir / QUALIFICATION_ARTIFACT_FILENAME).is_file()
 
         assert run_pipeline(args, command_runner=_make_fake_runner(fail_mode="train")) == 2

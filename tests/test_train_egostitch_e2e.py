@@ -1258,6 +1258,61 @@ class TestE2ECompositeStep:
         assert guard_persistence == [False] * len(optimizer_steps)
 
     @pytest.mark.parametrize(
+        ("run_kind", "expected_enforcement"),
+        [(None, True), ("formal", True), ("qualification", False)],
+    )
+    def test_persistent_clip_guard_enforcement_is_run_kind_scoped(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        run_kind: te.E2ERunKind | None,
+        expected_enforcement: bool,
+    ) -> None:
+        """Only qualification turns the persistent streak into telemetry."""
+        torch.manual_seed(0)
+        _, model = self._batch_and_model(tmp_path)
+        cfg = _toy_cfg(tmp_path)
+        registered = te.load_config(
+            Path(__file__).resolve().parents[1]
+            / "configs/egostitch_e2e_v3_full_breadth_first.yaml"
+        )
+        assert registered.training is not None
+        e2e_cfg = replace(
+            cfg,
+            model=ModelConfig(family="egostitch_e2e", config=dict(_E2E_TINY_MODEL)),
+            data=replace(cfg.data, pack_dir=tmp_path / "token_pack"),
+            training=registered.training,
+            run_kind=run_kind,
+        )
+        data = _toy_bundle(tmp_path, EgoStitchConfig())
+        self._float_the_packed_store(monkeypatch)
+        enforcement: list[bool] = []
+
+        def _capture_then_stop(
+            _guard: te.E2EClipGuard,
+            _records: dict[str, te.E2EGradientGroupRecord],
+            *,
+            step: int | None = None,
+            phase: te.E2EPhaseName | None = None,
+            enforce_persistent: bool = True,
+        ) -> None:
+            del step, phase
+            enforcement.append(enforce_persistent)
+            raise RuntimeError("stop after persistent-guard call")
+
+        monkeypatch.setattr(te.E2EClipGuard, "update", _capture_then_stop)
+        with pytest.raises(RuntimeError, match="stop after persistent-guard call"):
+            te._train_e2e_stability_loop(
+                model,
+                e2e_cfg,
+                data,
+                Accelerator(cpu=True),
+                node_batch=4,
+            )
+
+        assert enforcement == [expected_enforcement]
+
+    @pytest.mark.parametrize(
         ("reference_auprc", "expect_eligible"),
         [(0.23, True), (0.22, True), (0.21, False)],
     )
@@ -2072,8 +2127,18 @@ class TestFeatureStandardizationBinding:
         qualification = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="qualification")
         data = te.assemble_egostitch_data(qualification)
         assert data.feature_stats is not None
-        artifact = te.write_qualification_artifact(
-            qualification, verdict="pass", feature_stats_sha256=data.feature_stats.digest
+        qualification.output_dir.mkdir(parents=True, exist_ok=True)
+        artifact = qualification.output_dir / te.QUALIFICATION_FILENAME
+        artifact.write_text(
+            json.dumps(
+                {
+                    "verdict": "pass",
+                    "feature_stats_sha256": data.feature_stats.digest,
+                    "model_config_sha256": te.model_config_hash(qualification),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
         )
         formal = replace(qualification, run_kind="formal")
         model = EgoStitchE2E(E2EConfig.from_mapping(formal.model.config))

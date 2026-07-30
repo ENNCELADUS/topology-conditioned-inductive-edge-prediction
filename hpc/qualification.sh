@@ -40,11 +40,13 @@ root, so both commands run directly in the repository.
 
 qualify is the development loop. It auto-detects and uses every visible H20,
 overrides optim.epochs to 3, writes into
-outputs/egostitch_e2e_stage1_v3/qualification/<arm>, and its verdict is
-guards-only: pass iff no fail-fast guard tripped. Checkpoint eligibility is
-unaffected — it is enforced in both stages. qualify never edits or promotes the
-registration and deliberately does not require a clean checkout, because
-iterating on the model is the point.
+outputs/egostitch_e2e_stage1_v3/qualification/<arm>, and a complete run with an
+eligible checkpoint and no hard failure writes pending_manual_review, never an
+automatic pass. The registered clipping remains active and its telemetry is
+retained; only the ten-step persistent-clipping streak is non-aborting here.
+Checkpoint eligibility is unaffected — it is enforced in both stages. qualify
+never edits or promotes the registration and deliberately does not require a
+clean checkout, because iterating on the model is the point.
 
 calibrate-tolerance is the one-shot bootstrap path for the selection AUPRC
 band. It reuses the earliest successful full-arm source already recorded in the
@@ -54,9 +56,11 @@ source validation, never launches another V_hold evaluation, and never edits the
 registration. Ordinary `qualify full` does not run calibration.
 
 formal requires exactly 4 visible NVIDIA H20s, a clean checkout, a fully
-resolved BINDING registration (the active v4 file is still DRAFT), and a qualification for the same arm whose
-verdict is pass and whose model and feature digests equal the ones this formal
-config and its shared F0 pack produce. It launches one registered trained arm;
+resolved BINDING registration (the active v4 file is still DRAFT), and a current
+qualification for the same arm whose verdict is pass and whose model and feature
+digests equal the ones this formal config and its shared F0 pack produce.
+pending_manual_review fails closed and cannot fall back to an older pass. It
+launches one registered trained arm;
 the two scoring-time controls reuse the full arm's checkpoint and are not
 launched here. Scientific execution order remains full first, with the full-arm
 eligibility/liveness preflight and its persisted clip/family/RMS margin verdict
@@ -147,6 +151,7 @@ entry = {
     "run_metadata": artifact("run_metadata.json"),
     "validation_events": artifact("v_hold_validation_events.jsonl"),
 }
+
 if index_path.is_file():
     payload = json.loads(index_path.read_text())
 else:
@@ -173,6 +178,98 @@ finally:
         os.unlink(temporary)
 ' "${index_path}" "${arm}" "${attempt_dir}" "${exit_code}" || \
     fail "could not atomically index qualification attempt: ${attempt_dir}"
+}
+
+qualification_verdict() {
+  local report="$1"
+  "${PYTHON_BIN}" -c '
+import json, sys
+from pathlib import Path
+
+report = Path(sys.argv[1])
+payload = json.loads(report.read_text(encoding="utf-8"))
+verdict = payload.get("verdict")
+if not isinstance(verdict, str) or not verdict:
+    raise SystemExit("qualification report lacks a usable verdict")
+print(verdict)
+' "${report}"
+}
+
+current_qualification_attempt() {
+  local arm="$1"
+  local history="${QUALIFICATION_ROOT_DIR}/${arm}/attempt_history.json"
+  local latest="${QUALIFICATION_ROOT_DIR}/${arm}/latest"
+  local attempts_root="${QUALIFICATION_ROOT_DIR}/${arm}/attempts"
+  if [[ ! -f "${history}" ]]; then
+    return 0
+  fi
+  "${PYTHON_BIN}" -c '
+import json, sys
+from pathlib import Path
+
+history, arm, latest, attempts_root = (
+    Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4])
+)
+payload = json.loads(history.read_text(encoding="utf-8"))
+if payload.get("schema_version") != "egostitch_e2e_qualification_history_v1":
+    raise SystemExit("qualification attempt-history schema is invalid")
+if payload.get("arm") != arm:
+    raise SystemExit("qualification attempt-history arm is invalid")
+attempts = payload.get("attempts")
+if not isinstance(attempts, list):
+    raise SystemExit("qualification attempt history has no attempts list")
+if not attempts:
+    if latest.exists() or latest.is_symlink():
+        raise SystemExit("latest exists while qualification history is empty")
+    raise SystemExit(0)
+tail = attempts[-1]
+if not isinstance(tail, dict):
+    raise SystemExit("qualification attempt-history tail must be an object")
+attempt = Path(str(tail.get("attempt_dir", "")))
+if not attempt.is_absolute():
+    attempt = Path.cwd() / attempt
+attempt = attempt.resolve(strict=True)
+root = attempts_root.resolve(strict=True)
+if attempt.parent != root or tail.get("attempt_id") != attempt.name:
+    raise SystemExit("qualification attempt-history tail is outside the immutable history")
+try:
+    resolved_latest = latest.resolve(strict=True)
+except OSError as error:
+    raise SystemExit("latest does not resolve to the qualification-history tail") from error
+if resolved_latest != attempt:
+    raise SystemExit("latest does not resolve to the qualification-history tail")
+print(attempt)
+' "${history}" "${arm}" "${latest}" "${attempts_root}" || \
+    fail "could not resolve the authoritative current qualification attempt for ${arm}"
+}
+
+assert_current_qualification_recorded_pass() {
+  local arm="$1"
+  local attempt_dir="$2"
+  local history="${QUALIFICATION_ROOT_DIR}/${arm}/attempt_history.json"
+  "${PYTHON_BIN}" -c '
+import json, sys
+from pathlib import Path
+
+history, attempt = Path(sys.argv[1]), Path(sys.argv[2]).resolve(strict=True)
+payload = json.loads(history.read_text(encoding="utf-8"))
+tail = payload["attempts"][-1]
+recorded = Path(str(tail.get("attempt_dir", "")))
+if not recorded.is_absolute():
+    recorded = Path.cwd() / recorded
+if recorded.resolve(strict=True) != attempt:
+    raise SystemExit("current qualification is not the history tail")
+if (
+    tail.get("exit_code") != 0
+    or tail.get("outcome") != "success"
+    or tail.get("verdict") != "pass"
+):
+    raise SystemExit("current qualification history row is not an exact pass")
+report = json.loads((attempt / "qualification.json").read_text(encoding="utf-8"))
+if report.get("verdict") != "pass":
+    raise SystemExit("current qualification artifact is not an exact pass")
+' "${history}" "${attempt_dir}" || \
+    fail "current qualification is not a recorded pass: ${attempt_dir}"
 }
 
 select_all_visible_h20s() {
@@ -274,7 +371,8 @@ print(value)
 ' "$1" || fail "could not read output_dir from $1"
 }
 
-# Stage 2 refuses to launch on a missing, failing or mismatched qualification
+# Stage 2 refuses to launch on a missing, pending, failing, or mismatched current
+# qualification
 # for the same arm (design 2026-07-29 Sec 3). Two fail-closed reads: first the
 # launcher-local shape/verdict check, which refuses a malformed report without
 # importing the worker; then the authoritative one, which recomputes
@@ -286,7 +384,14 @@ print(value)
 assert_qualification_passed() {
   local arm="$1"
   local config="$2"
-  local report="${QUALIFICATION_ROOT_DIR}/${arm}/latest-pass/qualification.json"
+  local attempt_dir
+  # The current immutable attempt is authoritative. Reading `latest-pass` here
+  # would let an older pass silently override a newer pending/failing attempt.
+  attempt_dir="$(current_qualification_attempt "${arm}")"
+  [[ -n "${attempt_dir}" ]] || \
+    fail "formal training requires a recorded qualification attempt for ${arm}"
+  assert_current_qualification_recorded_pass "${arm}" "${attempt_dir}"
+  local report="${attempt_dir}/qualification.json"
   [[ -s "${report}" ]] || \
     fail "formal training requires a completed qualification stage: ${report}"
   "${PYTHON_BIN}" -c '
@@ -423,6 +528,7 @@ run_qualification() {
   local config
   local output_dir
   local pipeline_status
+  local verdict
   config="$(arm_config "${arm}")"
   output_dir="$(allocate_qualification_attempt_dir "${arm}")"
   assert_source_resolves_to_repo
@@ -454,6 +560,15 @@ run_qualification() {
   else
     pipeline_status=$?
   fi
+  if [[ "${pipeline_status}" -eq 0 ]]; then
+    if ! verdict="$(qualification_verdict "${output_dir}/qualification.json")"; then
+      echo "successful qualification wrote an unreadable verdict: ${output_dir}/qualification.json" >&2
+      pipeline_status=1
+    elif [[ "${verdict}" != "pending_manual_review" ]]; then
+      echo "successful qualification returned forbidden automatic verdict ${verdict}: ${output_dir}/qualification.json" >&2
+      pipeline_status=1
+    fi
+  fi
   record_qualification_attempt "${arm}" "${output_dir}" "${pipeline_status}"
   update_qualification_pointer "${arm}" "${output_dir}" latest
   assert_registration_unchanged
@@ -461,8 +576,7 @@ run_qualification() {
     echo "qualification attempt failed and was retained: ${output_dir}" >&2
     return "${pipeline_status}"
   fi
-  update_qualification_pointer "${arm}" "${output_dir}" latest-pass
-  echo "qualification completed; verdict: ${output_dir}/qualification.json"
+  echo "qualification completed with verdict ${verdict}: ${output_dir}/qualification.json"
 }
 
 assert_tolerance_calibration_not_complete() {
@@ -522,6 +636,7 @@ for row in payload["attempts"]:
 
 run_tolerance_calibration() {
   local attempt_dir
+  local current_attempt
   assert_tracked_clean_checkout calibrate-tolerance
   assert_source_resolves_to_repo
   assert_qualification_registration_open
@@ -529,6 +644,12 @@ run_tolerance_calibration() {
   export REGISTRATION_SHA256_BEFORE
   trap assert_registration_unchanged EXIT
   assert_tolerance_calibration_not_complete
+  current_attempt="$(current_qualification_attempt full)"
+  if [[ -n "${current_attempt}" ]]; then
+    # A pending/failing current attempt is authoritative. It cannot be bypassed
+    # by selecting an older successful source from immutable history.
+    assert_current_qualification_recorded_pass full "${current_attempt}"
+  fi
   attempt_dir="$(find_immutable_tolerance_source_attempt)"
   if [[ -z "${attempt_dir}" ]]; then
     run_qualification full

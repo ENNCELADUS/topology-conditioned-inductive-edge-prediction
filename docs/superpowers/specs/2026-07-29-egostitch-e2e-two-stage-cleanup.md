@@ -1,6 +1,6 @@
 # EgoStitch E2E: two-stage cleanup
 
-**Status: IMPLEMENTED IN CURRENT WORKTREE (2026-07-30), rev 2; cleanup commit pending.
+**Status: IMPLEMENTED IN CURRENT WORKTREE (2026-07-30), rev 3; cleanup commit pending.
 Owner-decided via grill-me interview.** Collapses the e2e ladder from five stages to two, removes
 the legacy frozen-s0 `egostitch` family, and adopts the data-derived degree-head
 initialization as standard.
@@ -26,6 +26,14 @@ rule violated protocol §5.2.4. **r1 §2 (BFS ball), §2.2 (seed-count evidence
 promotion), §3 (design-only registration and digest propagation), and acceptance
 item 6 are withdrawn.** The text below is r2. §10 records what r1 got wrong so
 the same ground is not re-walked.
+
+**r3 owner amendment (2026-07-30).** The first full qualification confirmed the
+§5.1 persistent-gradient prediction. Qualification now keeps the registered clipping
+operation and complete telemetry but does not abort merely because a clip coefficient
+stays below `0.1` for ten consecutive steps. A complete otherwise-valid qualification
+writes `pending_manual_review`, never automatic `pass`; formal rejects that pending
+state. All other hard failures remain unchanged. This design trail defines no approval
+artifact and never edits an immutable attempt in place.
 
 ---
 
@@ -125,7 +133,7 @@ partly for fidelity to the cut. This is pre-existing; the union mitigates it
 | validates on | V_hold | V_hold |
 | epochs | short (≈3) | registered full schedule |
 | purpose | development loop | results |
-| verdict | guards only — "it trained" | registered thresholds, §2.3 |
+| verdict | complete run → `pending_manual_review`; never automatic `pass` | registered thresholds, §2.3 |
 | arms | whichever is under development | 6 trained + 2 scoring-time controls |
 | seeds | 1 | `--seeds`, default `0` |
 | test | never opened | §2.4 |
@@ -136,9 +144,16 @@ ablation table.
 
 ### 2.3 Decision rules
 
-**Stage 1: guards only.** `verdict = pass` iff no fail-fast guard tripped. No
-AUPRC floor, no topology floor, nothing to argue about. A stably-useless model
-qualifies; that is accepted, because quality is adjudicated at Stage 2.
+**Stage 1: complete run, then manual review.** The registered global-norm clipping
+remains active (`3.0` for pair/generator, `1.0` for conditioning), and every pre-clip
+norm, clip coefficient, and consecutive-low-coefficient streak remains telemetry.
+The `< 0.1` for ten consecutive steps condition is non-aborting in qualification only;
+the one-step `< 1e-3` extreme and every other numerical, family-imbalance,
+logit-collapse, slot-collapse, and no-eligible-checkpoint failure remain hard. A full
+short-schedule run with an eligible checkpoint and no other failure writes
+`pending_manual_review`, never `pass`. There is still no AUPRC or topology floor in
+that artifact verdict. `pending_manual_review` does not authorize Stage 2, and this
+revision defines no approval artifact or conversion to `pass`.
 
 Two consequences that must be implemented, not assumed:
 
@@ -203,7 +218,8 @@ Multi-seed additionally requires relaxing four hard seed-0 pins:
 Stage 1 writes one artifact:
 
 ```json
-{ "verdict": "pass" | "fail(<named_guard>)",
+{ "verdict": "pending_manual_review" | "fail(<named_guard>)" |
+             "training_invalid(slot_collapse)" | "fail(no_eligible_checkpoint)",
   "epochs", "hparams",
   "feature_stats_sha256",
   "model_config_sha256" }
@@ -214,6 +230,8 @@ and both digests match. Because §2 makes the universes identical, the feature
 digest comparison is a genuine equality — no propagation, no hand-pasting, and
 `train_egostitch.py:2422`'s stats-universe == training-universe assertion holds
 in both stages unchanged.
+`pending_manual_review` therefore fails closed. r3 intentionally defines no approval
+artifact or in-place mutation capable of changing an immutable attempt to `pass`.
 
 `model_config_sha256` **must be defined; no such function exists today.**
 `_config_hash` (`:5523`) bakes in `output_dir`, `data.root` and `preregistration`
@@ -469,6 +487,14 @@ at module level, so `:26-33`, `:49-59`, `:64`, `:85`, `:89`, `:102`, `:118`,
 `tests/test_train_egostitch_e2e.py:1325, 1447` are parametrized on the removed
 run kinds.
 
+**Observed and dispositioned 2026-07-30.** The first full qualification produced
+generator norms `540–618` and tripped the ten-step persistent-clipping condition.
+That confirms the tripwire but does not by itself establish divergence or scientific
+failure. The owner chose to keep actual clipping and telemetry, remove only this
+qualification-time automatic abort, run the complete three epochs, and require manual
+review of the immutable result. The formal-stage hard failure and margin checks remain
+unchanged.
+
 ## 7. Doc edits
 
 Rewritten in place — no `§15`, no SUPERSEDED strata:
@@ -479,7 +505,7 @@ Rewritten in place — no `§15`, no SUPERSEDED strata:
 | §13.12 (`:1259-1262`) | role universes: `V_fit`-side, V_hold, test |
 | §13.19.1 (`:1550-1595`) | **added by r2** — `zscore_vfit_v1` semantics are unchanged by this cleanup precisely because both stages use V_fit; state that explicitly so the method id is not re-litigated |
 | §13.19.3 (`:1666-1689`) | strike "`V_select` unread until the first formal bound run"; V_hold serves both stages; re-derive `auprc_tolerance`; correct the metric name (§10) |
-| §13.19.4 (`:1720-1766`) | five pre-binding items → the guards-only Stage-1 verdict |
+| §13.19.4 (`:1720-1766`) | five pre-binding items → complete qualification with `pending_manual_review`; no automatic pass |
 | §13.19.6 (`:1797-1818`) | acceptance matrix retargeted at the two-stage ladder |
 | §14.4.7 (`:2070+`) | calibrate→freeze→rehearse→formal → the §2 ladder |
 | §13.1–13.17 (`:1064-1420`) | frozen-s0 carve-out retired with its code |
@@ -495,10 +521,13 @@ CLAUDE.md needs updating: three data-contract traps retire with their code
 ## 8. Acceptance
 
 1. Stage 1 runs end-to-end on full V_fit at the short schedule and writes
-   `qualification.json` with `pass`, or `fail(<named_guard>)` including
-   `no_eligible_checkpoint`. A hang or an unnamed failure is not a valid result.
-2. Stage 2 refuses to launch on a missing, `fail`, or digest-mismatched
-   `qualification.json` — three tests, one per assertion.
+   `qualification.json` with `pending_manual_review`, or a named hard failure
+   including `fail(no_eligible_checkpoint)`. A hang, automatic `pass`, or unnamed
+   failure is not a valid result. A persistent low-coefficient streak alone must
+   complete under unchanged clipping with complete telemetry.
+2. Stage 2 refuses to launch on a missing, `pending_manual_review`, `fail`, or
+   digest-mismatched `qualification.json`. It may not fall back from the latest
+   pending attempt to a stale historical pass.
 3. Any seed count produces `evidence_class: engineering`; a non-null
    `p_value`/`ci`/`holm` is refused. No path emits `inference`.
 4. The path-scoped held-out guard (§3.1) raises in **both** run kinds. Tested by

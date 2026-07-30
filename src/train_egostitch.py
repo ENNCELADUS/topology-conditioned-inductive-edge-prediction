@@ -4330,7 +4330,10 @@ def _train_e2e_stability_loop(
                     gradient_records,
                     step=global_step + 1,
                     phase=phase.phase,
-                    enforce_persistent=not profile_only,
+                    enforce_persistent=(
+                        not profile_only
+                        and (cfg.run_kind or "formal") != "qualification"
+                    ),
                 )
                 optimizer.step()
                 post_step_failure = 0
@@ -4980,21 +4983,20 @@ def model_config_hash(cfg: EgoConfig) -> str:
 def qualification_verdict(error: BaseException | None) -> str:
     """Map one fail-fast training exception onto a named Stage-1 verdict.
 
-    The qualification verdict is guards-only (design 2026-07-29 Sec 2.3): a
-    completed run passes, and anything else must be *named* so the formal
-    stage's preflight and the run log agree on what happened. An exception no
-    registered guard raises still yields a named verdict rather than an
-    unreadable artifact.
+    A completed qualification requires owner review and therefore remains
+    pending; anything else must be *named* so the formal stage's preflight and
+    the run log agree on what happened. An exception no registered guard raises
+    still yields a named verdict rather than an unreadable artifact.
 
     Args:
         error: The exception that ended the run, or ``None`` when it completed.
 
     Returns:
-        ``"pass"``, or one of the registered ``fail(...)`` /
+        ``"pending_manual_review"``, or one of the registered ``fail(...)`` /
         ``training_invalid(...)`` labels.
     """
     if error is None:
-        return "pass"
+        return "pending_manual_review"
     message = str(error)
     for needle, verdict in _QUALIFICATION_VERDICT_PATTERNS:
         if needle in message:
@@ -5013,7 +5015,9 @@ def write_qualification_artifact(
 
     Args:
         cfg: The validated worker config.
-        verdict: ``"pass"`` or a named failure (`qualification_verdict`).
+        verdict: ``"pending_manual_review"`` or a named failure
+            (`qualification_verdict`). Historical ``"pass"`` artifacts remain
+            readable but this producer cannot create new ones.
         feature_stats_sha256: The digest bound by
             `_bind_feature_standardization` for this run.
         output_dir: Destination directory; defaults to ``cfg.output_dir``.
@@ -5022,12 +5026,16 @@ def write_qualification_artifact(
         The written path.
 
     Raises:
-        ValueError: When ``verdict`` is neither ``"pass"`` nor a named failure.
+        ValueError: When ``verdict`` is neither the one registered pending value
+            nor a named failure.
     """
-    if verdict != "pass" and not (
+    if verdict != "pending_manual_review" and not (
         verdict.startswith(("fail(", "training_invalid(")) and verdict.endswith(")")
     ):
-        raise ValueError(f"qualification verdict must be 'pass' or a named failure: {verdict!r}")
+        raise ValueError(
+            "qualification verdict must be 'pending_manual_review' or a named failure: "
+            f"{verdict!r}"
+        )
     destination = cfg.output_dir if output_dir is None else output_dir
     destination.mkdir(parents=True, exist_ok=True)
     path = destination / QUALIFICATION_FILENAME
@@ -5600,10 +5608,10 @@ def _run_ddp_worker(
     def record_qualification_failure(error: BaseException) -> None:
         """Name a qualification failure in `QUALIFICATION_FILENAME`, never mask it.
 
-        Acceptance item 1 (design 2026-07-29 Sec 8): a qualification run must
-        end in ``pass`` or a *named* failure, never in a bare traceback the
-        formal stage's preflight cannot read. Every fail-fast guard raises on
-        all ranks, so the main process is guaranteed to reach this writer.
+        A qualification run must end in ``pending_manual_review`` or a *named*
+        failure, never in a bare traceback the formal stage's preflight cannot
+        read. Every fail-fast guard raises on all ranks, so the main process is
+        guaranteed to reach this writer.
         Caught broadly on purpose -- `qualification_verdict` names an
         unrecognized failure rather than letting one escape unrecorded.
 
@@ -5726,7 +5734,7 @@ def _run_ddp_dispatch(
         if run_kind == "qualification":
             write_qualification_artifact(
                 cfg,
-                verdict="pass",
+                verdict=qualification_verdict(None),
                 feature_stats_sha256=feature_stats_sha256,
             )
     _write_json_rank_zero(accelerator, profile_output, result.runtime_profile)

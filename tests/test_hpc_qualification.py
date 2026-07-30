@@ -256,6 +256,9 @@ def test_tolerance_bootstrap_records_the_new_full_attempt_before_calibration() -
     assert body.index("assert_tolerance_calibration_not_complete") < body.index(
         "find_immutable_tolerance_source_attempt"
     )
+    assert body.index('current_attempt="$(current_qualification_attempt full)"') < body.index(
+        "find_immutable_tolerance_source_attempt"
+    )
     assert body.index("find_immutable_tolerance_source_attempt") < body.index(
         "run_qualification full"
     )
@@ -272,8 +275,9 @@ def test_tolerance_bootstrap_records_the_new_full_attempt_before_calibration() -
         _block("run_qualification()", "assert_tolerance_calibration_not_complete()")
     )
     assert qualification.index("record_qualification_attempt") < qualification.index(
-        'update_qualification_pointer "${arm}" "${output_dir}" latest-pass'
+        'update_qualification_pointer "${arm}" "${output_dir}" latest'
     )
+    assert "latest-pass" not in qualification
 
 
 def test_failed_full_qualification_cannot_fabricate_calibration_evidence() -> None:
@@ -434,6 +438,14 @@ def test_interrupted_bootstrap_without_outputs_resumes_the_same_source() -> None
     assert "latest-pass" not in body
 
 
+def test_pending_latest_qualification_blocks_calibration_before_selection_or_launch() -> None:
+    body = _strip_comments(_block("run_tolerance_calibration()", "run_formal()"))
+    current = body.index('current_attempt="$(current_qualification_attempt full)"')
+    recorded_pass = body.index("assert_current_qualification_recorded_pass full")
+    assert current < recorded_pass < body.index("find_immutable_tolerance_source_attempt")
+    assert recorded_pass < body.index("run_qualification full")
+
+
 def test_calibrate_tolerance_is_a_no_arm_command() -> None:
     dispatch = _strip_comments(RUNNER.read_text()[RUNNER.read_text().rindex('case "${1:-}" in') :])
     assert "calibrate-tolerance)" in dispatch
@@ -514,14 +526,196 @@ def test_qualification_attempt_directories_are_unique_and_failed_attempt_is_reta
     assert history["attempts"][1]["validation_events"] is None
 
 
+def test_pending_qualification_history_is_a_successful_pending_attempt(
+    tmp_path: Path, bash_exe: str
+) -> None:
+    functions = _block("allocate_qualification_attempt_dir()", "select_all_visible_h20s()")
+    program = (
+        'QUALIFICATION_ROOT_DIR="$1"\n'
+        'PYTHON_BIN="$2"\n'
+        'fail() { echo "$*" >&2; return 1; }\n'
+        + functions
+        + '\nattempt="$(allocate_qualification_attempt_dir full)"\n'
+        + 'printf \'{"verdict":"pending_manual_review"}\\n\' > "${attempt}/qualification.json"\n'
+        + 'record_qualification_attempt full "${attempt}" 0\n'
+        + 'update_qualification_pointer full "${attempt}" latest\n'
+    )
+    result = subprocess.run(
+        [
+            bash_exe,
+            "-c",
+            program,
+            "bash",
+            str(tmp_path / "qualification"),
+            sys.executable,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    arm_root = tmp_path / "qualification" / "full"
+    history = json.loads((arm_root / "attempt_history.json").read_text())
+    assert len(history["attempts"]) == 1
+    assert history["attempts"][0]["exit_code"] == 0
+    assert history["attempts"][0]["outcome"] == "success"
+    assert history["attempts"][0]["verdict"] == "pending_manual_review"
+    assert (arm_root / "latest").resolve().name == history["attempts"][0]["attempt_id"]
+    assert not (arm_root / "latest-pass").exists()
+
+
+def _write_qualification_authority_state(
+    tmp_path: Path,
+    rows: list[tuple[str, int, str]],
+    *,
+    latest_index: int | None,
+    latest_pass_index: int | None = None,
+) -> Path:
+    arm_root = tmp_path / "qualification" / "full"
+    attempts_root = arm_root / "attempts"
+    attempts_root.mkdir(parents=True)
+    attempts = []
+    attempt_dirs = []
+    for index, (verdict, exit_code, outcome) in enumerate(rows):
+        attempt = attempts_root / f"attempt-{index:03d}"
+        attempt.mkdir()
+        (attempt / "qualification.json").write_text(
+            json.dumps({"verdict": verdict}), encoding="utf-8"
+        )
+        attempt_dirs.append(attempt)
+        attempts.append(
+            {
+                "attempt_id": attempt.name,
+                "attempt_dir": str(attempt),
+                "exit_code": exit_code,
+                "outcome": outcome,
+                "verdict": verdict,
+            }
+        )
+    (arm_root / "attempt_history.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "egostitch_e2e_qualification_history_v1",
+                "arm": "full",
+                "attempts": attempts,
+            }
+        ),
+        encoding="utf-8",
+    )
+    if latest_index is not None:
+        (arm_root / "latest").symlink_to(Path("attempts") / attempt_dirs[latest_index].name)
+    if latest_pass_index is not None:
+        (arm_root / "latest-pass").symlink_to(
+            Path("attempts") / attempt_dirs[latest_pass_index].name
+        )
+    return tmp_path / "qualification"
+
+
+def _run_current_qualification_authority_guard(
+    qualification_root: Path, bash_exe: str
+) -> subprocess.CompletedProcess[str]:
+    functions = _block("allocate_qualification_attempt_dir()", "select_all_visible_h20s()")
+    program = (
+        'QUALIFICATION_ROOT_DIR="$1"\n'
+        'PYTHON_BIN="$2"\n'
+        'fail() { echo "$*" >&2; return 1; }\n'
+        + functions
+        + '\nattempt="$(current_qualification_attempt full)" || exit $?\n'
+        + '[[ -n "${attempt}" ]] || exit 90\n'
+        + 'assert_current_qualification_recorded_pass full "${attempt}"\n'
+    )
+    return subprocess.run(
+        [bash_exe, "-c", program, "bash", str(qualification_root), sys.executable],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_current_history_tail_and_matching_latest_exact_pass_are_authoritative(
+    tmp_path: Path, bash_exe: str
+) -> None:
+    root = _write_qualification_authority_state(
+        tmp_path, [("pass", 0, "success")], latest_index=0
+    )
+    result = _run_current_qualification_authority_guard(root, bash_exe)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("verdict", "exit_code", "outcome"),
+    [
+        ("pending_manual_review", 0, "success"),
+        ("fail(persistent_clipping)", 2, "failure"),
+    ],
+)
+def test_current_pending_or_failure_cannot_fall_back_to_stale_latest_pass(
+    tmp_path: Path,
+    bash_exe: str,
+    verdict: str,
+    exit_code: int,
+    outcome: str,
+) -> None:
+    root = _write_qualification_authority_state(
+        tmp_path,
+        [("pass", 0, "success"), (verdict, exit_code, outcome)],
+        latest_index=1,
+        latest_pass_index=0,
+    )
+    result = _run_current_qualification_authority_guard(root, bash_exe)
+    assert result.returncode != 0
+    assert "not a recorded pass" in result.stderr
+
+
+def test_stale_latest_symlink_is_rejected_even_when_history_tail_passes(
+    tmp_path: Path, bash_exe: str
+) -> None:
+    root = _write_qualification_authority_state(
+        tmp_path,
+        [("pass", 0, "success"), ("pass", 0, "success")],
+        latest_index=0,
+        latest_pass_index=0,
+    )
+    result = _run_current_qualification_authority_guard(root, bash_exe)
+    assert result.returncode != 0
+    assert "authoritative current qualification" in result.stderr
+
+
+def test_history_append_without_latest_update_is_rejected(
+    tmp_path: Path, bash_exe: str
+) -> None:
+    root = _write_qualification_authority_state(
+        tmp_path, [("pass", 0, "success")], latest_index=None
+    )
+    result = _run_current_qualification_authority_guard(root, bash_exe)
+    assert result.returncode != 0
+    assert "authoritative current qualification" in result.stderr
+
+
 def test_failed_qualification_updates_latest_without_replacing_latest_pass() -> None:
     body = _strip_comments(_block("run_qualification()", "run_formal()"))
     assert body.index('update_qualification_pointer "${arm}" "${output_dir}" latest') < body.index(
         'if [[ "${pipeline_status}" -ne 0 ]]'
     )
-    assert body.index('if [[ "${pipeline_status}" -ne 0 ]]') < body.index(
-        'update_qualification_pointer "${arm}" "${output_dir}" latest-pass'
+    assert "latest-pass" not in body
+
+
+def test_pending_qualification_is_successful_but_does_not_advance_latest_pass() -> None:
+    body = _strip_comments(_block("run_qualification()", "run_formal()"))
+    assert '[[ "${verdict}" != "pending_manual_review" ]]' in body
+    assert "latest-pass" not in body
+    assert body.index("record_qualification_attempt") < body.index(
+        'update_qualification_pointer "${arm}" "${output_dir}" latest'
     )
+
+
+def test_new_qualification_rejects_an_automatic_pass_and_records_failure() -> None:
+    body = _strip_comments(_block("run_qualification()", "run_formal()"))
+    assert "forbidden automatic verdict" in body
+    rejection = body.index('[[ "${verdict}" != "pending_manual_review" ]]')
+    assert rejection < body.index("pipeline_status=1", rejection)
+    assert rejection < body.index("record_qualification_attempt")
+    assert "latest-pass" not in body
 
 
 def test_neither_stage_forces_a_shared_pack_dir() -> None:
@@ -575,6 +769,15 @@ def test_formal_requires_binding_registration_clean_checkout_and_a_passing_quali
     assert "readonly FORMAL_GPU_COUNT=4" in RUNNER.read_text()
 
 
+def test_formal_reads_current_latest_and_cannot_fall_back_to_stale_latest_pass() -> None:
+    guard = _strip_comments(_block("assert_qualification_passed()", "assert_full_preflight()"))
+    assert 'attempt_dir="$(current_qualification_attempt "${arm}")"' in guard
+    assert 'assert_current_qualification_recorded_pass "${arm}" "${attempt_dir}"' in guard
+    assert 'local report="${attempt_dir}/qualification.json"' in guard
+    assert "latest-pass" not in guard
+    assert 'verdict != "pass"' in guard
+
+
 def test_formal_forwards_the_verified_qualification_artifact_to_the_worker() -> None:
     """The worker refuses a formal run without it, and cannot derive the path itself.
 
@@ -606,7 +809,7 @@ def test_formal_registration_guard_refuses_draft_without_legacy_markers() -> Non
 
 
 def test_formal_full_arm_preflight_requires_eligibility_and_liveness() -> None:
-    """Checkpoint eligibility is retained in both stages; only the *verdict* is guards-only."""
+    """Checkpoint eligibility is retained in both stages despite manual review."""
     guard = _block("assert_full_preflight()", "produce_formal_probe_artifact()")
     assert "selected_checkpoint_eligible" in guard
     assert "validation_liveness_pass" in guard
@@ -814,7 +1017,7 @@ def test_formal_refuses_a_missing_qualification_report() -> None:
     guard = _strip_comments(_block("assert_qualification_passed()", "assert_full_preflight()"))
     assert '[[ -s "${report}" ]]' in guard
     assert "requires a completed qualification stage" in guard
-    assert "QUALIFICATION_ROOT_DIR}/${arm}/latest-pass/qualification.json" in guard
+    assert 'local report="${attempt_dir}/qualification.json"' in guard
 
 
 def test_formal_accepts_a_passing_qualification_report(tmp_path: Path) -> None:

@@ -32,7 +32,7 @@
   },
   "design_trail": {
     "path": "docs/superpowers/specs/2026-07-29-egostitch-e2e-two-stage-cleanup.md",
-    "sha256": "a1836241196499dac1010f4945054d7806d20ab96cacf1d0ff525bc7f9cb26b3",
+    "sha256": "1d032f6b3a28b7ea95de6efd5fb6e49add478ead074b418761e1d67d3775c98a",
     "authority": "decision trail only; docs/05-egostitch-spec.md §13.19 and §14.4 govern",
     "prior_trail": {
       "path": "docs/superpowers/specs/2026-07-25-egostitch-e2e-relational-repair-design.md",
@@ -85,15 +85,15 @@
       "optim_epochs": null,
       "optim_epochs_note": "A reduced schedule, set at launch and recorded in the run's qualification.json; it is deliberately not a registered constant, because the qualification verdict licenses no held-out claim. The design trail records approximately 3. The §13.19.1 three-phase curriculum boundaries scale with schedule_total_steps = steps_per_epoch * epochs, so a short run still traverses Phases A -> B -> C.",
       "seeds": 1,
-      "purpose": "development loop; not a scientific gate",
-      "verdict": "guards only",
+      "purpose": "development loop ending in manual review; not a scientific gate",
+      "verdict": "pending manual review after a complete otherwise-valid run; never automatic pass",
       "verdict_values": [
-        "pass",
+        "pending_manual_review",
         "fail(<named_guard>)",
         "training_invalid(slot_collapse)",
         "fail(no_eligible_checkpoint)"
       ],
-      "verdict_rule": "pass iff no §13.19.2 fail-fast guard tripped over the run. There is no AUPRC floor and no topology floor in the verdict itself - a stably-useless model qualifies, because quality is adjudicated at the formal stage. 'Guards only' governs the verdict, not checkpoint eligibility: the §13.19.3 eligibility conditions are retained in full at both stages.",
+      "verdict_rule": "A complete reduced schedule with complete clipping telemetry, an eligible selected checkpoint, and no hard failure writes pending_manual_review, never pass. The registered global-norm clipping remains active at 3.0 for pair/generator and 1.0 for conditioning. Clip coefficient below 0.1 for ten consecutive steps is telemetry-only in qualification; the one-step below-1e-3 extreme, non-finite checks, family-imbalance guard, logit-collapse guard, slot-collapse guard, and no-eligible-checkpoint outcome remain hard failures. There is no AUPRC or topology floor in the artifact verdict. This DRAFT defines no manual-approval artifact or conversion to pass.",
       "artifact": {
         "filename": "qualification.json",
         "fields": [
@@ -116,7 +116,7 @@
       "verdict": "the pre-registered acceptance thresholds re-pinned below",
       "preflight": [
         "the qualification artifact exists",
-        "verdict == 'pass'",
+        "the current immutable attempt has verdict == 'pass'; pending_manual_review fails closed, this DRAFT defines no approval/conversion artifact, and preflight may not fall back from a latest pending attempt to an earlier pass",
         "feature_stats_sha256 and model_config_sha256 both equal the formal run's own computed values"
       ],
       "retained_margin_gate": "validate_e2e_qualification_profile - the repo's only clip-coefficient / family-ratio / submodule-RMS margin gate - is retained and runs at this stage",
@@ -487,7 +487,7 @@
     ],
     "f_only_eligibility": "finite/gradient guards; std(f_logit)>=1e-4; AUPRC(f_logit)>=label prevalence+0.02",
     "pair_topology_eligibility": "finite/gradient guards; std(pair_topology)>=1e-4; AUPRC(pair_topology)>=label prevalence+0.02; active topology-conditioning fixed-replay gradient norm >=1e-8",
-    "eligibility_applies_to_both_stages": "The eligibility conditions above are retained in full at BOTH stages. 'Guards only' governs the qualification verdict, not what makes a checkpoint eligible - this distinction is what prevents selection from landing on a reconstruction-only warm-start checkpoint, the documented 2026-07-19 v1 failure.",
+    "eligibility_applies_to_both_stages": "The eligibility conditions above are retained in full at BOTH stages. The qualification manual-review policy does not change what makes a checkpoint eligible - this distinction is what prevents selection from landing on a reconstruction-only warm-start checkpoint, the documented 2026-07-19 v1 failure.",
     "selection": "among eligible epochs within auprc_tolerance of the best eligible AUPRC for that arm, minimize train-side validation clustering MMD",
     "auprc_tolerance": null,
     "auprc_tolerance_rule": "select_e2e_checkpoint's selection-band kwarg is distinct from every fixed 0.02 eligibility constant and is derived from V_hold's measured AP sampling standard deviation. Its numerical value remains null until the immutable method below is executed and its evidence is bound; the fixed eligibility constants and tie_tolerance_mmd remain unchanged.",
@@ -562,13 +562,13 @@
       "any optimizer-group clip coefficient below 1e-3"
     ],
     "persistent_abort": [
-      "any optimizer-group clip coefficient below 0.1 for 10 consecutive steps",
+      "formal only: any optimizer-group clip coefficient below 0.1 for 10 consecutive steps. Qualification records the identical pre-clip norms, coefficients, and streak while applying unchanged clipping, but does not abort on this condition and can emit only pending_manual_review",
       "within a shared optimizer group, max active-family norm divided by median active-family norm above 50 for four consecutive fixed probes after alpha reaches 1; inactive/null families excluded",
       "fixed stability-split pair-logit std below max(0.25 times warm-start-end reference, 1e-4) for two consecutive validations"
     ],
     "reference_validity": "warm-start-end pair-logit std is measured after the final Phase-A update in eval mode and must be finite and >=1e-4",
     "binding_margin": "per-group clip-coefficient p1 floors pair_encoder_head>0.04, generator>0.01, topology_content_conditioning>0.15, unlisted groups default to 0.12; minimum>0.0012; longest consecutive run below 0.1 is <10 steps; pooled family-ratio p99<40 (single scalar over all groups' alpha=1 ratios, as computed by validate_e2e_qualification_profile). Carried over unchanged from v2's clip_margin_amendment_20260722; validate_e2e_qualification_profile now runs at the formal stage.",
-    "abort_consequence": "synchronous invalid run; publish failure metadata only; no best.pt, complete.json, candidate score, or gate input",
+    "abort_consequence": "synchronous invalid run; publish failure metadata only; no best.pt, complete.json, candidate score, or gate input. Qualification's ten-step persistent-clipping exception is not an abort: it completes with unchanged actual clipping and complete telemetry, then can publish only pending_manual_review",
     "last_checkpoint": "diagnostic-only under a failure-specific directory; never eligible for formal scoring"
   },
   "collapse_abort": {
@@ -730,7 +730,8 @@
     }
   },
   "execution_order": [
-    "run the qualification stage and obtain verdict pass",
+    "run the qualification stage to completion and obtain pending_manual_review; this is evidence for owner review, not formal authorization",
+    "do not start formal while the qualification verdict is pending_manual_review; this DRAFT defines no approval artifact or conversion to pass",
     "resolve every binding_prerequisite and let the owner promote a successor content state to BINDING",
     "train and validate the formal full arm first",
     "run its checkpoint-eligibility and validation liveness preflight",
@@ -792,7 +793,7 @@
     "checkpoint_policy_version": null
   },
   "binding_prerequisites": [
-    "A qualification-stage run on the full V_fit universe returns verdict pass and writes qualification.json with its feature_stats_sha256 and model_config_sha256.",
+    "A qualification-stage run on the full V_fit universe completes all reduced-schedule epochs, preserves complete clipping telemetry under unchanged actual clipping, selects an eligible checkpoint, returns pending_manual_review, and writes qualification.json with its feature_stats_sha256 and model_config_sha256. This artifact is review evidence only: pending_manual_review fails formal preflight, and this DRAFT defines no approval artifact or conversion to pass.",
     "binding_evidence.auprc_tolerance_calibration is a path-and-SHA-256 reference to the complete source artifact required by checkpoint_selection.auprc_tolerance_calibration_method. It binds the immutable first full Seed-0 qualification source attempt, proves the existing validation was reused with no additional K event while the source remains in complete history/K, and reproduces the unclamped ceil(10000*sd)/10000 value. That value is written into checkpoint_selection.auprc_tolerance and into the six configs, and the config digests above are re-pinned to match.",
     "binding_evidence.implementation names the implementation commit whose clean checkout produced the qualifying evidence; the formal worker verifies its own HEAD equals that commit or is a clean descendant through commits touching only docs/registrations/ paths.",
     "binding_evidence.parameter_group_manifests, packs_and_validation_manifests, qualification_attempts, qualification_history_indexes, boundary_access_audit and runtime_and_peak_memory each carry path-bound SHA-256 artifacts that resolve and hash-match on the execution host.",

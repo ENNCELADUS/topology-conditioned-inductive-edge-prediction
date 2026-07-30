@@ -63,8 +63,8 @@ Stage-1 screen.
 | trains on | full `V_fit` | full `V_fit` |
 | validates on | `V_hold` | `V_hold` |
 | `optim.epochs` | reduced; recorded in `qualification.json`, **not registered** | `30` |
-| purpose | development loop | results |
-| verdict | guards only | the re-pinned v2 thresholds |
+| purpose | development loop ending in manual review | results |
+| verdict | `pending_manual_review` after a complete otherwise-valid run; never automatic `pass` | the re-pinned v2 thresholds |
 | test access | never opened | one scoring epoch per (arm, seed) |
 
 Both stages train on the **identical** universe and differ only in
@@ -72,12 +72,23 @@ Both stages train on the **identical** universe and differ only in
 degree prior identical between stages by construction, so the formal preflight
 compares equal values rather than propagating a digest.
 
-**Qualification verdict — guards only.** `pass` iff no §13.19.2 fail-fast guard
-tripped. Named non-`pass` outcomes: `fail(<named_guard>)`,
-`training_invalid(slot_collapse)`, `fail(no_eligible_checkpoint)`. A
-stably-useless model qualifies; quality is adjudicated at the formal stage.
+**Qualification verdict — complete run, then manual review.** The actual clipping
+operation is unchanged: global L2 norm `3.0` for pair/generator and `1.0` for
+conditioning, with every pre-clip norm, coefficient, and low-coefficient streak
+recorded. Clip coefficient `< 0.1` for ten consecutive steps no longer aborts
+qualification; it remains visible telemetry and remains a hard failure in formal.
+A qualification that finishes the complete reduced schedule, selects an eligible
+checkpoint, and hits no other hard failure writes `pending_manual_review`, never
+automatic `pass`. The one-step `< 1e-3` extreme, non-finite, family-imbalance,
+logit-collapse, slot-collapse, and no-eligible-checkpoint failures are unchanged.
+Named failure outcomes remain `fail(<named_guard>)`,
+`training_invalid(slot_collapse)`, and `fail(no_eligible_checkpoint)`.
+`pending_manual_review` fails formal preflight. This DRAFT defines neither a manual-
+approval artifact nor any conversion to `pass`; an immutable attempt is not edited in
+place. Formal preflight must inspect the current immutable attempt and may not fall
+back from a latest pending result to an earlier `pass` artifact.
 
-**"Guards only" does not weaken checkpoint eligibility.** The §13.19.3
+**Manual review does not weaken checkpoint eligibility.** The §13.19.3
 eligibility conditions — post-ramp/Phase-C restriction, the
 `prevalence + 0.02` AUPRC floor, and the residual / logit-std /
 topology-gradient conditions — are retained in full at **both** stages. That
@@ -294,3 +305,6 @@ The governing `binding_evidence.schema_version` is
 JSON lists exactly what must be resolved.
 The formal worker rejects this DRAFT. **Only the owner may promote a resolved
 successor content state to BINDING** — no agent, screen, or note may do it.
+Even after a qualification completes, its `pending_manual_review` verdict is only
+review evidence and formal remains fail-closed. This DRAFT deliberately specifies no
+approval artifact or mutation that could turn the immutable attempt into `pass`.

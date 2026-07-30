@@ -80,15 +80,22 @@ agree on `n_ground` share it too (`cosine_pool` pins 20, the other five 50).
 `qualify` is the development loop. It runs the trainer/conditioning/pipeline sanity
 tests, then a 3-epoch run of the requested arm on every auto-detected visible H20. The
 short schedule still traverses curriculum phases A -> B -> C, because the curriculum
-scales with `schedule_total_steps` rather than with a fixed step count. Its verdict is
-guards-only — `pass` iff no fail-fast guard tripped. Each invocation receives an
+scales with `schedule_total_steps` rather than with a fixed step count. Actual global-
+norm clipping remains enabled (`3.0` for pair/generator, `1.0` for conditioning), and
+the complete pre-clip norm/coefficient/streak telemetry is retained. A coefficient
+below `0.1` for ten consecutive steps does not abort qualification; every other hard
+failure, including the one-step `< 1e-3` extreme, is unchanged. A complete three-epoch
+run with an eligible checkpoint and no other failure writes
+`pending_manual_review`, never automatic `pass`. Each invocation receives an
 immutable directory under
 `outputs/egostitch_e2e_stage1_v3/qualification/<arm>/attempts/attempt-*/` and writes
 its `qualification.json` there together with the `feature_stats_sha256` and
 `model_config_sha256` the formal stage compares against. The arm-local `latest`
-symlink advances after every attempt, including a retained failure; `latest-pass`
-advances only after a successful attempt. The formal preflight reads
-`latest-pass/qualification.json`, never a mutable canonical report.
+symlink advances after every attempt, including a retained failure or pending review;
+`latest-pass` does not advance for `pending_manual_review`. Formal must fail closed on
+the latest pending state rather than fall back to a stale historical pass. This DRAFT
+defines no approval artifact or conversion to `pass`; manual review is a later owner
+decision and never edits the immutable attempt in place.
 
 This durable history is part of the selection-exposure audit: every qualification
 attempt evaluates the shared `V_hold`, so retaining all attempts makes the cumulative
@@ -112,7 +119,8 @@ hpc/qualification.sh qualify full   # or f_only|pair_topology|p0|cosine_pool|no_
 H20s, the checkout is clean, the registration is `BINDING` with every required
 binding-evidence field resolved, and this arm's qualification verdict is `pass` with
 both digests equal to the ones this formal config and its shared pack produce — a stale
-report from before a model change is a refusal, not a pass. Six trained arms are
+report from before a model change is a refusal, not a pass. In particular,
+`pending_manual_review` is always a refusal under the current contract. Six trained arms are
 selectable; the two scoring-time controls (`structure_control_6a_v3`,
 `structure_control_6e_v1`) reuse the full arm's checkpoint and are rejected here:
 

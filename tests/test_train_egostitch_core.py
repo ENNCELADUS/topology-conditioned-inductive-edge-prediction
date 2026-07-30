@@ -116,6 +116,26 @@ def _e2e_training_cfg(tmp_path: Path, run_kind: te.E2ERunKind | None = None) -> 
     )
 
 
+def _write_historical_pass_artifact(
+    cfg: te.EgoConfig, *, feature_stats_sha256: str
+) -> Path:
+    """Create a legacy approved artifact without using the current producer."""
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    path = cfg.output_dir / te.QUALIFICATION_FILENAME
+    path.write_text(
+        json.dumps(
+            {
+                "verdict": "pass",
+                "feature_stats_sha256": feature_stats_sha256,
+                "model_config_sha256": te.model_config_hash(cfg),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 # --------------------------------------------------------------------------- DDP contract
 
 
@@ -355,7 +375,9 @@ class TestQualificationEpochOverride:
         cfg = te.apply_overrides(
             _e2e_training_cfg(tmp_path), self._args("--run-kind", "qualification", "--epochs", "3")
         )
-        path = te.write_qualification_artifact(cfg, verdict="pass", feature_stats_sha256="ab" * 32)
+        path = te.write_qualification_artifact(
+            cfg, verdict="pending_manual_review", feature_stats_sha256="ab" * 32
+        )
         assert json.loads(path.read_text())["epochs"] == 3
 
     def test_the_formal_stage_refuses_the_override(self, tmp_path: Path) -> None:
@@ -489,8 +511,8 @@ class TestFeatureDigestPinByRunKind:
     def test_the_formal_stage_equality_checks_the_recorded_digest(self, tmp_path: Path) -> None:
         model, data = self._model_and_data(tmp_path)
         qualification = self._cfg(tmp_path, "qualification")
-        artifact = te.write_qualification_artifact(
-            qualification, verdict="pass", feature_stats_sha256="ab" * 32
+        artifact = _write_historical_pass_artifact(
+            qualification, feature_stats_sha256="ab" * 32
         )
 
         with pytest.raises(RuntimeError, match="feature_stats_sha256 does not match"):
@@ -507,8 +529,8 @@ class TestFeatureDigestPinByRunKind:
         model, data = self._model_and_data(tmp_path)
         assert data.feature_stats is not None
         qualification = self._cfg(tmp_path, "qualification")
-        artifact = te.write_qualification_artifact(
-            qualification, verdict="pass", feature_stats_sha256=data.feature_stats.digest
+        artifact = _write_historical_pass_artifact(
+            qualification, feature_stats_sha256=data.feature_stats.digest
         )
 
         digest = te._bind_feature_standardization(
@@ -578,8 +600,8 @@ class TestFeatureDigestPinByRunKind:
 
 
 class TestQualificationVerdict:
-    def test_a_completed_run_passes(self) -> None:
-        assert te.qualification_verdict(None) == "pass"
+    def test_a_completed_run_requires_manual_review(self) -> None:
+        assert te.qualification_verdict(None) == "pending_manual_review"
 
     @pytest.mark.parametrize(
         ("message", "verdict"),
@@ -615,7 +637,9 @@ class TestQualificationArtifact:
 
     def test_payload_contract(self, tmp_path: Path) -> None:
         cfg = self._cfg(tmp_path)
-        path = te.write_qualification_artifact(cfg, verdict="pass", feature_stats_sha256="ab" * 32)
+        path = te.write_qualification_artifact(
+            cfg, verdict="pending_manual_review", feature_stats_sha256="ab" * 32
+        )
         assert path.name == te.QUALIFICATION_FILENAME
         payload = json.loads(path.read_text(encoding="utf-8"))
         assert set(payload) == {
@@ -625,7 +649,7 @@ class TestQualificationArtifact:
             "feature_stats_sha256",
             "model_config_sha256",
         }
-        assert payload["verdict"] == "pass"
+        assert payload["verdict"] == "pending_manual_review"
         assert payload["epochs"] == cfg.optim.epochs
         assert payload["feature_stats_sha256"] == "ab" * 32
         assert payload["model_config_sha256"] == te.model_config_hash(cfg)
@@ -640,9 +664,26 @@ class TestQualificationArtifact:
         )
         assert json.loads(path.read_text())["verdict"] == "fail(no_eligible_checkpoint)"
 
-    @pytest.mark.parametrize("verdict", ["fail", "boom", "failed(x)", "fail(x"])
+    def test_the_registered_pending_verdict_is_writable(self, tmp_path: Path) -> None:
+        path = te.write_qualification_artifact(
+            self._cfg(tmp_path),
+            verdict="pending_manual_review",
+            feature_stats_sha256="ab" * 32,
+        )
+        assert json.loads(path.read_text())["verdict"] == "pending_manual_review"
+
+    def test_writer_refuses_to_produce_a_pass_verdict(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="must be 'pending_manual_review'"):
+            te.write_qualification_artifact(
+                self._cfg(tmp_path), verdict="pass", feature_stats_sha256="ab" * 32
+            )
+
+    @pytest.mark.parametrize(
+        "verdict",
+        ["fail", "boom", "failed(x)", "fail(x", "pending", "pending_review"],
+    )
     def test_unnamed_verdicts_are_refused(self, tmp_path: Path, verdict: str) -> None:
-        with pytest.raises(ValueError, match="must be 'pass' or a named failure"):
+        with pytest.raises(ValueError, match="must be 'pending_manual_review'"):
             te.write_qualification_artifact(
                 self._cfg(tmp_path), verdict=verdict, feature_stats_sha256="ab" * 32
             )
@@ -666,22 +707,30 @@ class TestQualificationArtifact:
         with pytest.raises(RuntimeError, match="verdict is not 'pass'"):
             te.validate_qualification_artifact(path, cfg, feature_stats_sha256="ab" * 32)
 
+    def test_formal_stage_refuses_a_pending_manual_review(self, tmp_path: Path) -> None:
+        cfg = self._cfg(tmp_path)
+        path = te.write_qualification_artifact(
+            cfg, verdict="pending_manual_review", feature_stats_sha256="ab" * 32
+        )
+        with pytest.raises(RuntimeError, match="verdict is not 'pass'"):
+            te.validate_qualification_artifact(path, cfg, feature_stats_sha256="ab" * 32)
+
     def test_formal_stage_refuses_a_model_digest_mismatch(self, tmp_path: Path) -> None:
         cfg = self._cfg(tmp_path)
-        path = te.write_qualification_artifact(cfg, verdict="pass", feature_stats_sha256="ab" * 32)
+        path = _write_historical_pass_artifact(cfg, feature_stats_sha256="ab" * 32)
         drifted = replace(cfg, model=replace(cfg.model, config={**cfg.model.config, "slots": 8}))
         with pytest.raises(RuntimeError, match="model_config_sha256 does not match"):
             te.validate_qualification_artifact(path, drifted, feature_stats_sha256="ab" * 32)
 
     def test_formal_stage_refuses_a_feature_digest_mismatch(self, tmp_path: Path) -> None:
         cfg = self._cfg(tmp_path)
-        path = te.write_qualification_artifact(cfg, verdict="pass", feature_stats_sha256="ab" * 32)
+        path = _write_historical_pass_artifact(cfg, feature_stats_sha256="ab" * 32)
         with pytest.raises(RuntimeError, match="feature_stats_sha256 does not match"):
             te.validate_qualification_artifact(path, cfg, feature_stats_sha256="cd" * 32)
 
     def test_formal_stage_accepts_a_matching_artifact(self, tmp_path: Path) -> None:
         cfg = self._cfg(tmp_path)
-        path = te.write_qualification_artifact(cfg, verdict="pass", feature_stats_sha256="ab" * 32)
+        path = _write_historical_pass_artifact(cfg, feature_stats_sha256="ab" * 32)
         # The two stages differ only in `optim.epochs` and `output_dir`, and
         # neither enters `model_config_hash` -- so this is a genuine equality
         # rather than a propagated digest (design 2026-07-29 Sec 3).
@@ -760,9 +809,51 @@ class TestMeasurementDispatch:
         }
         assert not (cfg.output_dir / "run_metadata.json").exists()
 
+    def test_completed_qualification_writes_pending_manual_review(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = _e2e_training_cfg(tmp_path, run_kind="qualification")
+        data = _toy_bundle(tmp_path, EgoStitchConfig())
+        model = EgoStitchE2E(E2EConfig.from_mapping(_E2E_TINY_MODEL))
+        args = te.EgoCliArgs(
+            config=tmp_path / "config.yaml",
+            seed=None,
+            output_dir=None,
+            ddp_mode="train",
+            pack_dir=tmp_path / "pack",
+            token_budget_per_rank=4,
+            profile_output=tmp_path / "profile.json",
+        )
+        monkeypatch.setattr(te, "e2e_degree_prior_init", lambda *args: 0.0)
+        monkeypatch.setattr(te, "write_run_start_metadata", lambda *args, **kwargs: None)
+        monkeypatch.setattr(te, "train_egostitch_ddp_loop", lambda *args, **kwargs: _stub_result())
+        monkeypatch.setattr(te, "write_outputs", lambda *args, **kwargs: None)
+
+        te._run_ddp_dispatch(
+            cfg,
+            args,
+            model,
+            data,
+            accelerator=_StubAccelerator(),
+            preregistration=te.PreregistrationSnapshot(
+                payload={"status": "DRAFT"}, sha256="0" * 64
+            ),
+            registered_config_hash=None,
+            formal_binding=None,
+            run_kind="qualification",
+            feature_stats_sha256="ab" * 32,
+            node_batch=4,
+            profile_output=args.profile_output,
+        )
+
+        payload = json.loads(
+            (cfg.output_dir / te.QUALIFICATION_FILENAME).read_text(encoding="utf-8")
+        )
+        assert payload["verdict"] == "pending_manual_review"
+
 
 class TestQualificationVerdictCoversPreTrainingGuards:
-    """Acceptance item 1: a qualification run ends in `pass` or a *named* failure.
+    """A qualification run ends pending manual review or with a named failure.
 
     The guards that fire before the first optimizer step -- the held-out path
     boundary in data assembly and the digest contract in
