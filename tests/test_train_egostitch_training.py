@@ -379,13 +379,10 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
     with pytest.raises(te.PreregistrationNotBinding, match="missing or hash-mismatched"):
         te._validate_e2e_formal_binding(cfg, snapshot, config_path)
     artifact.write_text('{"status":"pass"}\n')
-    configs = evidence["configs"]
-    assert isinstance(configs, dict)
-    full = configs["full"]
-    assert isinstance(full, dict)
-    full["sha256"] = "0" * 64
-    with pytest.raises(te.PreregistrationNotBinding, match="config digest"):
-        te._validate_e2e_formal_binding(cfg, snapshot, config_path)
+    mismatched_config = tmp_path / config_path.name
+    mismatched_config.write_bytes(config_path.read_bytes() + b"\n# digest mismatch\n")
+    with pytest.raises(te.PreregistrationNotBinding, match="live config digest"):
+        te._validate_e2e_formal_binding(cfg, snapshot, mismatched_config)
 
 
 @pytest.mark.parametrize("tracked_status", ["", " M src/train_egostitch.py\n"])
