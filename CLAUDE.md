@@ -32,9 +32,10 @@ CODEX_HOME="$CH" codex review --base <WAVE_BASE_SHA> > <wave>-review.txt 2>&1
 
 Runtime, for any training/scoring/gate command: the world size is **auto-detected**
 from all visible NVIDIA H20 devices (`hpc/run.sh`, `hpc/qualification.sh`), and config
-keys change meaning per model family. The e2e ladder is two stages, both launched from
-`hpc/qualification.sh`: `qualify <arm>` (short schedule, guards-only verdict, any GPU
-count) then `formal <arm>` (registered schedule, exactly 4 H20s, clean checkout).
+keys change meaning per model family. EgoStitch e2e has one stage, launched from the
+historically named `hpc/qualification.sh`: `formal <arm>` (registered schedule,
+exactly 4 H20s, clean checkout). Registration status and nullable run-evidence
+placeholders are not preflight gates; the run records concrete provenance.
 
 **`-c 'mcp_servers={}'` does NOT disable MCP** — `-c` merges into the config, so the
 `[mcp_servers.*]` sub-tables in `~/.codex/config.toml` survive it. Verified 2026-07-25:
@@ -139,10 +140,9 @@ Current G5 verdicts live in `docs/results/G5-stage1-seed0-20260717.md` (frozen-s
 — evidence retained; its producing code last exists at `dcae090` and is deleted in the
 current cleanup worktree pending commit) and
 `docs/results/G5-e2e-stage1-seed0-20260724.md` (rev-3.0 e2e, `cut`). The active line is
-rev-3.2 on the two-stage ladder; `g5_e2e_stage1_preregistration_v4.json` is still
-`DRAFT`, so `hpc/qualification.sh formal` refuses to launch until it is re-pinned and
-promoted to `BINDING`. `qualify` needs no **BINDING** registration and may run against
-the active v4 `DRAFT` within its registered `V_fit`/`V_hold` boundary.
+rev-3.2 on a single formal stage. `g5_e2e_stage1_preregistration_v4.json` remains
+`DRAFT` as descriptive provenance; formal launch uses its exact bytes/SHA and
+arm/config identities without gating on status or nullable run-evidence placeholders.
 
 Benchmark and baseline names (`Benchmark-A/B/C`, `B0`, `B0-alt`, `B0-e2e`, `B1`,
 `B2-*`, `B3`, `B5`, `Ours`, `Oracle`, `PA-null`) are deliberate dataset-agnostic

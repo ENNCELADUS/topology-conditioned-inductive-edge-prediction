@@ -1,13 +1,13 @@
 r"""G5 E2E Stage-1 gate evaluation: the registered eight-arm EgoStitch screen.
 
-Evaluates one training seed of the ``egostitch_e2e`` family as a binding
+Evaluates one training seed of the ``egostitch_e2e`` family as a plan-bound
 engineering screening gate against the frozen comparators (B0 recomputed from
 its cached artifact; the B0+cal arms from the committed kill-test payload)
 under the registered criteria (docs/registrations/g5_e2e_stage1_preregistration
 *.json; protocol Sec 5.0.5/5.2):
 
-- **Enforcement first**: the registration must carry status ``BINDING`` and its
-  sha256 must equal the ``preregistration_sha256`` recorded in every arm's
+- **Enforcement first**: the registration sha256 must equal the
+  ``preregistration_sha256`` recorded in every arm's
   ``run_metadata.json`` — held-out metrics are never opened on a mismatch.
 - **Eight arms**: the six trained checkpoint arms plus the two mandatory
   scoring-time controls ``structure_control_6a_v3`` (shuffle-within-pair) and
@@ -124,10 +124,6 @@ class PreregistrationMismatch(RuntimeError):
     """Raised before any held-out metric is touched (prereg mechanics)."""
 
 
-class PreregistrationNotBinding(PreregistrationMismatch):
-    """Raised when a gate is offered a non-binding registration."""
-
-
 class RegistrationShaMismatch(PreregistrationMismatch, ValueError):
     """Raised when formal metadata is not bound to the supplied registration."""
 
@@ -209,155 +205,28 @@ def enforce_e2e_preregistration(
     *,
     snapshot: tuple[dict[str, object], str] | None = None,
 ) -> str:
-    """Apply the rev-3 E2E-only BINDING status contract."""
+    """Apply plan/frozen-input identity without registration-state gating."""
+    from src.experiments.e2e_binding import plan_schema_for_registration
+
     prereg, expected = snapshot or _preregistration_snapshot(preregistration_path)
-    if prereg.get("status") != "BINDING":
-        raise PreregistrationNotBinding(
-            "held-out E2E G5 metrics require preregistration status == 'BINDING'"
-        )
+    try:
+        plan_schema_for_registration(prereg)
+    except ValueError as error:
+        raise PreregistrationMismatch(str(error)) from error
     frozen = cast(Mapping[str, object] | None, prereg.get("frozen_inputs"))
     b0cal = cast(Mapping[str, object] | None, frozen.get("b0cal_results") if frozen else None)
     digest = b0cal.get("sha256") if b0cal else None
     if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
         raise PreregistrationMismatch(
-            "BINDING E2E registration requires a real b0cal_results sha256; "
-            "REQUIRED-BEFORE-BINDING is not a digest"
+            "E2E registration requires a real frozen b0cal_results sha256"
         )
-    _validate_e2e_binding_evidence(prereg, preregistration_path)
     return _enforce_metadata_registration_hash(preregistration_path, run_metadata_paths, expected)
-
-
-def _contains_required_before_binding(value: object) -> bool:
-    if isinstance(value, str):
-        return "REQUIRED-BEFORE-BINDING" in value
-    if isinstance(value, Mapping):
-        return any(_contains_required_before_binding(item) for item in value.values())
-    if isinstance(value, list):
-        return any(_contains_required_before_binding(item) for item in value)
-    return False
 
 
 def _is_sha256(value: object) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value) is not None
 
 
-def _validate_e2e_binding_section(
-    section: object, *, label: str, preregistration_path: Path
-) -> None:
-    if not isinstance(section, (Mapping, list)) or not section:
-        raise PreregistrationMismatch(f"binding_evidence.{label} must be structured")
-    digests: list[object] = []
-    artifacts: list[tuple[Path, str]] = []
-
-    def collect(item: object) -> None:
-        if isinstance(item, Mapping):
-            path_value = item.get("path")
-            digest_value = item.get("sha256")
-            if isinstance(path_value, str) and _is_sha256(digest_value):
-                artifacts.append(
-                    (
-                        _registered_path(
-                            preregistration_path,
-                            path_value,
-                            key=f"binding_evidence.{label}.path",
-                            scope="binding evidence validation",
-                        ),
-                        cast(str, digest_value),
-                    )
-                )
-            for key, nested in item.items():
-                if str(key).endswith("sha256"):
-                    digests.append(nested)
-                collect(nested)
-        elif isinstance(item, list):
-            for nested in item:
-                collect(nested)
-
-    collect(section)
-    if not digests or any(not _is_sha256(digest) for digest in digests) or not artifacts:
-        raise PreregistrationMismatch(
-            f"binding_evidence.{label} requires path-bound SHA-256 evidence"
-        )
-    for path, digest in artifacts:
-        if not path.is_file() or _sha256_file(path) != digest:
-            raise PreregistrationMismatch(
-                f"binding_evidence.{label} artifact is missing or hash-mismatched: {path}"
-            )
-
-
-def _validate_e2e_binding_evidence(
-    preregistration: Mapping[str, object], preregistration_path: Path
-) -> None:
-    """Fail closed unless the gate sees the complete rev-3.1 binding package."""
-    from src.experiments.e2e_binding import (
-        BINDING_SCHEMA_V1,
-        HISTORICAL_V1_ARMS,
-        binding_schema_for_registration,
-    )
-
-    if _contains_required_before_binding(preregistration):
-        raise PreregistrationMismatch(
-            "BINDING registration still contains REQUIRED-BEFORE-BINDING markers"
-        )
-    evidence = preregistration.get("binding_evidence")
-    if not isinstance(evidence, Mapping):
-        raise PreregistrationMismatch("registration requires valid binding_evidence schema")
-    try:
-        schema_version = binding_schema_for_registration(preregistration)
-    except ValueError as error:
-        raise PreregistrationMismatch(str(error)) from error
-    implementation = evidence.get("implementation")
-    commit = implementation.get("commit") if isinstance(implementation, Mapping) else None
-    if not isinstance(commit, str) or not 7 <= len(commit) <= 64 or any(
-        character not in "0123456789abcdefABCDEF" for character in commit
-    ):
-        raise PreregistrationMismatch("binding_evidence implementation commit is invalid")
-    configs = evidence.get("configs")
-    arms = preregistration.get("arms")
-    expected_configs = (
-        HISTORICAL_V1_ARMS - {"structure_control_6a"}
-        if schema_version == BINDING_SCHEMA_V1
-        else frozenset(_E2E_FORMAL_ARMS)
-    )
-    if not isinstance(configs, Mapping) or set(configs) != expected_configs:
-        raise PreregistrationMismatch(
-            "binding_evidence.configs do not match the registration's trained checkpoint arms"
-        )
-    if not isinstance(arms, Mapping):
-        raise PreregistrationMismatch("registration arms must be an object")
-    for arm in expected_configs:
-        arm_entry = arms.get(arm)
-        config_entry = configs.get(arm)
-        if (
-            not isinstance(arm_entry, Mapping)
-            or not isinstance(config_entry, Mapping)
-            or set(config_entry) != {"path", "sha256"}
-            or config_entry.get("path") != arm_entry.get("training")
-            or not _is_sha256(config_entry.get("sha256"))
-        ):
-            raise PreregistrationMismatch(f"binding_evidence config entry is invalid for {arm}")
-        config_path = _registered_path(
-            preregistration_path,
-            config_entry["path"],
-            key=f"binding_evidence.configs.{arm}.path",
-            scope="binding evidence validation",
-        )
-        if not config_path.is_file() or _sha256_file(config_path) != config_entry["sha256"]:
-            raise PreregistrationMismatch(
-                f"binding_evidence config artifact is missing or hash-mismatched for {arm}"
-            )
-    binding_sections = [
-        "parameter_group_manifests",
-        "packs_and_validation_manifests",
-        "boundary_access_audit",
-        "runtime_and_peak_memory",
-    ]
-    for label in binding_sections:
-        _validate_e2e_binding_section(
-            evidence.get(label), label=label, preregistration_path=preregistration_path
-        )
-    if not isinstance(evidence.get("checkpoint_policy_version"), str):
-        raise PreregistrationMismatch("binding_evidence checkpoint policy is missing")
 
 
 def _enforce_e2e_evaluator_seed(prereg: Mapping[str, object], seed: int) -> None:
@@ -931,10 +800,11 @@ def _enforce_e2e_formal_metadata(
         "no_l_rel": ("none", 0.15, 0.15),
     }
     checkpoints: set[str] = set()
+    implementations: set[str] = set()
     arms = cast(Mapping[str, Mapping[str, object]], preregistration.get("arms"))
-    evidence = cast(Mapping[str, object], preregistration.get("binding_evidence"))
-    implementation = cast(Mapping[str, object], evidence.get("implementation"))
-    config_evidence = cast(Mapping[str, Mapping[str, object]], evidence.get("configs"))
+    config_evidence = cast(
+        Mapping[str, Mapping[str, object]], preregistration.get("config_artifacts")
+    )
     if set(arms) != set(_E2E_ARMS):
         raise RegistrationShaMismatch(
             "registration must bind the exact six-trained-plus-two-control E2E schema"
@@ -960,6 +830,7 @@ def _enforce_e2e_formal_metadata(
     registered_strategy = benchmark.get("strategy")
     registered_seeds = _registered_training_seeds(preregistration)
     from src.model.egostitch.config import E2EConfig
+    from src.score_universe import _validate_e2e_run_provenance
     from src.train_egostitch import _config_hash, _e2e_arm_name_from_config, load_config
 
     for arm, metadata in run_metadata.items():
@@ -984,13 +855,21 @@ def _enforce_e2e_formal_metadata(
             raise RegistrationShaMismatch(f"{arm}: formal run metadata status must be 'complete'")
         if not _is_sha256(metadata.get("checkpoint_sha256")):
             raise RegistrationShaMismatch(f"{arm}: checkpoint_sha256 must be 64-hex")
-        if metadata.get("implementation_commit") != implementation.get("commit"):
-            raise RegistrationShaMismatch(
-                f"{arm}: implementation_commit does not match binding evidence"
+        try:
+            _validate_e2e_run_provenance(
+                metadata, run_metadata_path=run_metadata_paths[arm]
             )
+        except ValueError as error:
+            raise RegistrationShaMismatch(
+                f"{arm}: invalid run-produced provenance: {error}"
+            ) from error
+        implementation_commit = metadata.get("implementation_commit")
+        if not isinstance(implementation_commit, str):
+            raise RegistrationShaMismatch(f"{arm}: implementation_commit is missing")
+        implementations.add(implementation_commit)
         if metadata.get("config_sha256") != config_evidence[arm].get("sha256"):
             raise RegistrationShaMismatch(
-                f"{arm}: config_sha256 does not match binding evidence"
+                f"{arm}: config_sha256 does not match registered config artifact"
             )
         checkpoint = metadata.get("checkpoint_id")
         if not isinstance(checkpoint, str) or not checkpoint:
@@ -1039,6 +918,10 @@ def _enforce_e2e_formal_metadata(
         raise RegistrationShaMismatch(
             "one E2E gate invocation screens exactly one training seed; the supplied "
             f"arm metadata declare {sorted(seeds_seen)}"
+        )
+    if len(implementations) != 1:
+        raise RegistrationShaMismatch(
+            "all formal E2E arms must share one live implementation commit"
         )
     return next(iter(seeds_seen))
 
@@ -1156,9 +1039,19 @@ def _validate_e2e_scoring_provenance(
     metadata_path = run_metadata_paths[source_arm]
     registered_arms = cast(Mapping[str, Mapping[str, object]], preregistration["arms"])
     source_registration = registered_arms[source_arm]
-    evidence = cast(Mapping[str, object], preregistration["binding_evidence"])
-    config_evidence_by_arm = cast(Mapping[str, Mapping[str, object]], evidence["configs"])
+    config_evidence_by_arm = cast(
+        Mapping[str, Mapping[str, object]], preregistration["config_artifacts"]
+    )
     config_evidence = config_evidence_by_arm[source_arm]
+    from src.score_universe import _validate_e2e_run_provenance
+
+    run_provenance_by_arm = {
+        arm: _validate_e2e_run_provenance(
+            run_metadata[arm], run_metadata_path=run_metadata_paths[arm]
+        )
+        for arm in _E2E_FORMAL_ARMS
+    }
+    source_run_provenance = run_provenance_by_arm[source_arm]
     formal = artifact.meta.get("formal_scoring_provenance")
     expected_formal = {
         "arm": source_arm,
@@ -1177,16 +1070,28 @@ def _validate_e2e_scoring_provenance(
         ),
         "config_sha256": config_evidence.get("sha256"),
         "checkpoint_sha256": metadata.get("checkpoint_sha256"),
-        "implementation_commit": cast(Mapping[str, object], evidence["implementation"]).get(
-            "commit"
-        ),
+        "implementation_commit": metadata.get("implementation_commit"),
         "selected_checkpoint_eligible": metadata.get("selected_checkpoint_eligible"),
+        "run_provenance_sha256": source_run_provenance["run_provenance_sha256"],
+        "runtime_profile_sha256": source_run_provenance["runtime_profile_sha256"],
+        "checkpoint_policy_version": source_run_provenance[
+            "checkpoint_policy_version"
+        ],
         "scoring_arm": name,
         "all_formal_arms": {
             arm: {
                 "run_metadata_sha256": _sha256_file(run_metadata_paths[arm]),
                 "checkpoint_sha256": run_metadata[arm].get("checkpoint_sha256"),
                 "config_sha256": config_evidence_by_arm[arm].get("sha256"),
+                "run_provenance_sha256": run_provenance_by_arm[arm][
+                    "run_provenance_sha256"
+                ],
+                "runtime_profile_sha256": run_provenance_by_arm[arm][
+                    "runtime_profile_sha256"
+                ],
+                "checkpoint_policy_version": run_provenance_by_arm[arm][
+                    "checkpoint_policy_version"
+                ],
                 "selected_checkpoint_eligible": run_metadata[arm].get(
                     "selected_checkpoint_eligible"
                 ),
@@ -2219,7 +2124,6 @@ if __name__ == "__main__":
 __all__ = [
     "EvidenceClassViolation",
     "PreregistrationMismatch",
-    "PreregistrationNotBinding",
     "RegistrationShaMismatch",
     "build_e2e_arm_summary",
     "enforce_e2e_frozen_inputs",

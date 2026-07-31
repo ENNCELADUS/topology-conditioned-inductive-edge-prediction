@@ -173,8 +173,6 @@ def test_v4_carries_no_unresolved_marker_strings() -> None:
 
     assert raw.count(RETIRED_MARKER) == 0
     assert set(_marker_paths(registration)) == set()
-    assert score_universe._contains_required_marker(registration) is False
-    assert g5_stage1._contains_required_before_binding(registration) is False
 
 
 def test_v4_pins_no_prebinding_threshold_on_the_measured_pool_ceilings() -> None:
@@ -558,11 +556,9 @@ def test_registered_trained_arm_provenance_matches_what_the_worker_writes() -> N
 
 def test_the_six_v3_config_digests_are_repinned_as_they_now_stand() -> None:
     registration = _registration()
-    evidence = registration["binding_evidence"]
     arms = registration["arms"]
-    assert isinstance(evidence, dict)
     assert isinstance(arms, dict)
-    configs = evidence["configs"]
+    configs = registration["config_artifacts"]
     assert isinstance(configs, dict)
     assert set(configs) == set(g5_stage1._E2E_FORMAL_ARMS)
 
@@ -599,34 +595,11 @@ def test_frozen_inputs_carry_real_digests_and_resolve_where_present() -> None:
 # --------------------------------------------------------------------------- fail-closed boundary
 
 
-def test_a_v4_payload_flipped_to_binding_is_still_refused(tmp_path: Path) -> None:
-    """Explicit nulls replaced the marker convention; they must fail just as hard.
-
-    Exercised through the real validators, on a copy -- the governing DRAFT is
-    never mutated and no unresolved section is filled.
-    """
-    bound_copy = {**_registration(), "status": "BINDING"}
-    registration_path = tmp_path / "docs/registrations/registration.json"
-    registration_path.parent.mkdir(parents=True)
-    registration_path.write_text(json.dumps(bound_copy), encoding="utf-8")
-
-    with pytest.raises(g5_stage1.PreregistrationMismatch):
-        g5_stage1._validate_e2e_binding_evidence(bound_copy, registration_path)
-
-    with pytest.raises(ValueError):
-        score_universe._preflight_binding_artifacts_before_pair_access(registration_path)
-
-
-def test_the_governing_draft_is_refused_before_any_pair_source_is_opened() -> None:
-    with pytest.raises(ValueError, match="requires status 'BINDING'"):
-        score_universe._preflight_binding_artifacts_before_pair_access(REGISTRATION_PATH)
-
-
-def test_binding_prerequisites_name_every_unresolved_section() -> None:
+def test_run_evidence_placeholders_are_nullable_and_non_authorizing() -> None:
     registration = _registration()
-    evidence = registration["binding_evidence"]
+    evidence = registration["run_evidence_placeholders"]
     assert isinstance(evidence, dict)
-    assert evidence["schema_version"] == train_egostitch._E2E_BINDING_SCHEMA
+    assert evidence["schema_version"] == "egostitch_e2e_run_provenance_v1"
     unresolved = {key for key, value in evidence.items() if value is None}
     assert unresolved == {
         "implementation",
@@ -636,12 +609,7 @@ def test_binding_prerequisites_name_every_unresolved_section() -> None:
         "runtime_and_peak_memory",
         "checkpoint_policy_version",
     }
-    prerequisites = registration["binding_prerequisites"]
-    assert isinstance(prerequisites, list)
-    joined = " ".join(str(item) for item in prerequisites)
-    for section in unresolved:
-        assert section in joined, f"binding_prerequisites does not name {section}"
-    assert "owner" in joined.lower()
+    assert "Null never blocks" in str(evidence["semantics"])
 
 
 # --------------------------------------------------------------------------- test protocol
@@ -865,7 +833,7 @@ def test_v4_markdown_declares_json_authority_and_matches_critical_pins() -> None
         "one formal training stage",
         "There is no qualification stage",
         "Eligibility, liveness, slot-collapse indicators",
-        "exact artifact identities",
-        "owner-bound",
+        "run then emits implementation",
+        "nullable run-evidence placeholders",
     ):
         assert pin in text, f"markdown twin lost pin {pin}"

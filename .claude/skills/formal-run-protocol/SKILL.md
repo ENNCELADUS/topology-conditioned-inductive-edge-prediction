@@ -1,53 +1,51 @@
 ---
 name: formal-run-protocol
-description: Use before binding a pre-registration, launching a formal (non-debug) run, interpreting a gate verdict, or writing up any result. Covers registration hashing, BINDING vs diagnostic-only artifacts, the spec freeze rule, and what claims a one-seed screen may make.
+description: Use before binding a pre-registration, launching a formal (non-debug) run, or writing up any result. Covers plan/artifact identity, BINDING status, debug boundaries, and what a one-seed screen may claim.
 ---
 
 # Formal run protocol
 
 This repo runs pre-registered experiments. A result is worthless — worse,
 misleading — unless it was bound *before* training. These rules are enforced in
-code, so violating them usually means a `PreregistrationMismatch`, not a wrong
-number. The exceptions below are the ways to get a wrong number silently.
+code, so violating them usually means a provenance or preregistration mismatch,
+not a wrong number. Model-quality telemetry is deliberately not an authorization
+mechanism.
 
 ## Binding a run
 
 - Registrations live in `docs/registrations/*.json`. The `.md` twin is
   explanatory only — **if they disagree, the JSON governs**.
 - The training worker records the registration JSON's SHA-256 in
-  `run_metadata.json` at run start. `src/experiments/g5_stage1.py:165`
-  (`_enforce_metadata_registration_hash`) refuses to open any held-out metric
+  `run_metadata.json` at run start. `_enforce_metadata_registration_hash`
+  refuses to open any held-out metric
   when the hashes disagree. Spec §13.14, §13.18.
 - A `BINDING` registration is **immutable**. Amending it means a new versioned
   file (v1→v2→v3, predecessor recorded). Nothing is ever rebound retroactively:
   an artifact produced under a superseded hash stays diagnostic-only forever,
   carrying its old hash in provenance. Spec §13.15, §13.18, §13.19.4.
-- Changing *any* threshold, optimizer, schedule, precision, candidate grid,
-  success inequality, or frozen input after binding is a **scientific change**
+- Changing any plan-defining optimizer, schedule, precision, candidate grid, or
+  frozen input after binding is a **scientific change**
   requiring a new registration version — not a bugfix. Spec §13.19.2.
-- The E2E ladder is **two stages**: `hpc/qualification.sh qualify <arm>` then
-  `formal <arm>`, both training the full `V_fit` and validating on `V_hold`, differing
-  only in `optim.epochs`. The calibrate → threshold-freeze → rehearse pre-binding
-  ladder and its attempt window are gone. Qualification is unregistered, unlimited, and
-  guards-only — but it may still tune **no** held-out or test quantity, and it never
-  produces a result. Spec §13.19.4, §14.4.7.
-- The formal stage carries **pre-registered acceptance thresholds pinned before test
-  opens** (protocol §5.2.4). A guards-only qualification pass is a licence to run the
-  formal stage, never a substitute for those thresholds.
+- The E2E path is a single formal stage: `hpc/qualification.sh formal <arm>`.
+  There is no qualification stage, qualification artifact, verdict/history, or
+  qualification-to-formal authorization path.
+- Formal preflight is limited to the bound plan and artifact identity: BINDING
+  registration, clean implementation identity, the six config digests, and the
+  registered parameter-group, pack/validation, boundary-audit, runtime, and
+  checkpoint-policy evidence. It does not require a quality pass.
 
 ## Binding vs diagnostic-only
 
-- An aborted or ineligible run publishes **nothing usable** — no `best.pt`, no
-  `complete.json`, no candidate scores, no gate input. If no epoch is eligible
-  the run is `invalid`; there is no fallback to epoch 1 or the least-bad
-  checkpoint. Spec §13.19.2–§13.19.3.
-- `last.pt` is diagnostic-only, under a failure directory. It never replaces a
-  formal `best.pt` verdict, even when it scores better.
+- A successful formal run publishes its plan-bound artifacts and checkpoint.
+  Checkpoint ranking considers all completed epochs under the registered
+  selection rule; quality predicates are retained as telemetry only.
+- `selected_checkpoint_eligible`, liveness, collapse, gradient, and AUPRC/MMD
+  fields may be reported but cannot prevent selection, completion, publication,
+  scoring, or evaluation.
 - Non-finite values may not be serialized away in a manner that permits success.
 - `--max-steps` runs are debug-only and are redirected to `*_debug` directories
-  (`src/e2_pipeline.py:685-688`); `--max-steps` is never a substitute for either
-  stage's schedule. Debug artifacts are forbidden from candidate/test scoring, not
-  merely from the final gate. Spec §13.18, §13.19.5.
+  and are forbidden from candidate/test scoring. Debug is an execution boundary,
+  not a quality verdict.
 
 ## Claim rules
 
@@ -55,7 +53,7 @@ number. The exceptions below are the ways to get a wrong number silently.
   Stage-1 screen.** It is a fixed-Seed-0 engineering screen: p-values, CIs, and
   Holm decisions must be emitted as `null`/not-applicable. Only E1/E3, with ≥3
   seeds plus Holm, carry inferential claims. Spec §13.15; protocol §5.2.3.
-  **The two-stage ladder emits `evidence_class: engineering` at every seed count** —
+  **The E2E screen emits `evidence_class: engineering` at every seed count** —
   extra seeds buy cross-seed *variance reporting*, never significance, because
   inference additionally needs the spec §8 30-config HPO-parity budget and Holm over
   the pre-registered held-out assembled family. Protocol §5.0.5, §5.2.4.

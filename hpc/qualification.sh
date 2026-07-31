@@ -17,7 +17,7 @@ Usage:
   hpc/qualification.sh formal <full|f_only|pair_topology|p0|cosine_pool|no_l_rel>
 
 formal executes one complete plan-bound training run. It requires exactly four
-visible NVIDIA H20 GPUs, a clean checkout, and a BINDING registration. No prior
+visible NVIDIA H20 GPUs, a clean checkout, and an unchanged registration snapshot. No prior
 qualification artifact, quality verdict, checkpoint-eligibility result, liveness
 predicate, or full-arm margin preflight is consulted. Model-quality predicates are
 retained as telemetry only. Data-boundary, exact-coverage, non-finite, DDP, input,
@@ -32,12 +32,6 @@ fail() {
 
 registration_sha256() {
   sha256sum "${PREREGISTRATION}" | cut -d' ' -f1
-}
-
-registration_status() {
-  "${PYTHON_BIN}" -c \
-    'import json,sys; print(json.load(open(sys.argv[1]))["status"])' \
-    "${PREREGISTRATION}"
 }
 
 select_all_visible_h20s() {
@@ -73,11 +67,6 @@ assert_clean_checkout() {
   [[ -z "${dirty}" ]] || fail "formal requires a clean checkout"
 }
 
-assert_formal_registration() {
-  [[ "$(registration_status)" == "BINDING" ]] || \
-    fail "formal E2E training requires registration status BINDING"
-}
-
 assert_registration_unchanged() {
   [[ "$(registration_sha256)" == "${REGISTRATION_SHA256_BEFORE}" ]] || \
     fail "formal execution must not edit or replace its registered plan"
@@ -106,7 +95,6 @@ run_formal() {
     fail "formal E2E training requires exactly ${FORMAL_GPU_COUNT} visible H20 GPUs, found ${DETECTED_GPU_COUNT}"
   assert_clean_checkout
   assert_source_resolves_to_repo
-  assert_formal_registration
   REGISTRATION_SHA256_BEFORE="$(registration_sha256)"
   export REGISTRATION_SHA256_BEFORE
   trap assert_registration_unchanged EXIT

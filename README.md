@@ -198,7 +198,7 @@ docs/
     E2-pair-to-topology-gap.md   the motivating result note
     G5-stage1-seed0-20260717.md  binding frozen-s0 screen (`cut`) — retained evidence, retired code
     G5-e2e-stage1-seed0-20260724.md  binding rev-3.0 e2e screen (`cut`)
-  registrations/                 pre-registrations; the e2e v4 DRAFT gates `formal`
+  registrations/                 versioned experiment plans and artifact identities
 figures/
   e2-gap.html                    edge-vs-topology contrast (open in a browser)
   positioning.html               2×2 taxonomy positioning figure
@@ -273,8 +273,8 @@ target test graph; the queried edge is masked/standardized inside the scaffold. 
 - [x] **G5 e2e screening gate** — binding fixed-Seed-0 v2 registration completed training (valid; liveness passed), held-out fp32 scoring, and the formal gate on 2026-07-24: BFS-macro GS passes but clustering-MMD and BFS-macro RD fail, the matched-AUPRC guard fails, and pathway attribution / the structure-destruction control both fail to establish a topology-conditioning gain. Verdict `cut` (multi-label). See the [result note](docs/results/G5-e2e-stage1-seed0-20260724.md).
 - [x] **Single-stage plan-bound cleanup (current worktree; commit pending)** — qualification and every qualification-to-formal or model-quality authorization gate are removed. Formal execution is coupled only to the owner-bound experiment plan and exact artifact identities; model-quality signals are telemetry. `V_fit` and the single 512-node `V_hold := V_qual ∪ V_select` remain unchanged. Contract: spec §13.19 and §12.
 - [x] **Rev-3.0 disposition** — the owner-side discussion advanced the line through rev-3.1 to the active rev-3.2 eight-arm contract; the 2026-07-24 `cut` remains historical engineering evidence.
-- [ ] **Registration v4** — `docs/registrations/g5_e2e_stage1_preregistration_v4.json` is `DRAFT`; its unresolved real binding evidence must be supplied and the owner must promote a successor content state to `BINDING` before `hpc/qualification.sh formal` will launch.
-- [ ] **Experiments** in priority order after v4 is bound: the rev-3.2 eight-arm formal screen, then E1/E3 multi-seed main + baselines → E4 ablations (incl. E4.15–E4.17 attribution/structure/conditioning-depth) → E5 integrity gates → E7 (load-bearing) → E6 breadth.
+- [x] **Registration v4 plan snapshot** — `docs/registrations/g5_e2e_stage1_preregistration_v4.json` pins the exact arm/config and frozen-input identities. Its `DRAFT` status and nullable run-evidence placeholders are descriptive, not launch gates.
+- [ ] **Experiments** in priority order: the rev-3.2 eight-arm formal screen, then E1/E3 multi-seed main + baselines → E4 ablations (incl. E4.15–E4.17 attribution/structure/conditioning-depth) → E5 integrity gates → E7 (load-bearing) → E6 breadth.
 
 ## HPC execution
 
@@ -301,13 +301,14 @@ auto-detected multi-GPU orchestrator and `src.train_egostitch`, runs `pack → t
 publish`, trains on `V_fit`, validates on `V_hold`, and may not open a held-out path.
 
 ```bash
-hpc/qualification.sh formal  full   # registered schedule; needs 4 × H20 + clean checkout + BINDING registration
+hpc/qualification.sh formal  full   # registered schedule; needs 4 × H20 + clean checkout
 ```
 
-No qualification artifact, pass/pending verdict, liveness/eligibility predicate, or
-margin verdict is read by formal launch or scoring. The registration SHA-256, exact
-arm/config and implementation identity, frozen input manifests, checkpoint/score
-hashes, access audit, and artifact provenance remain fail-closed. Model-quality
+No qualification artifact, registration status, nullable evidence placeholder,
+pass/pending verdict, liveness/eligibility predicate, or margin verdict is read as a
+formal launch/scoring gate. The registration SHA-256, exact arm/config and live
+implementation identity, frozen input manifests, run-produced provenance,
+checkpoint/score hashes, access audit, and artifact provenance remain fail-closed. Model-quality
 signals remain telemetry, and a quality miss cannot suppress a completed artifact.
 The two scoring-time controls
 (`structure_control_6a_v3`, `structure_control_6e_v1`) reuse the full arm's checkpoint

@@ -151,7 +151,8 @@ case "${COMMAND}" in
     [[ -f "${CONFIG_PATH}" ]] || fail "config not found: ${CONFIG_PATH}"
     # Stated in the usage text and enforced here: an EgoStitch E2E arm launched
     # from this branch would skip its plan/artifact identity preflight -- the
-    # BINDING registration, clean checkout, registered config, and four-GPU pin.
+    # unchanged registration snapshot, clean checkout, registered config, and
+    # four-GPU pin.
     # The family is read from the config, so
     # naming the worker module by hand does not reopen the bypass.
     MODEL_FAMILY="$("${PYTHON_BIN}" -c \

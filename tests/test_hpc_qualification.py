@@ -124,7 +124,6 @@ def test_formal_preflight_binds_plan_and_environment_not_quality() -> None:
     for required in (
         "assert_clean_checkout",
         "assert_source_resolves_to_repo",
-        "assert_formal_registration",
         "assert_registration_unchanged",
         "FORMAL_GPU_COUNT=4",
     ):
@@ -138,6 +137,8 @@ def test_formal_preflight_binds_plan_and_environment_not_quality() -> None:
         "margin_verdict",
         "assert_full_preflight",
         "validate_e2e_qualification_profile",
+        "registration_status",
+        "status BINDING",
     ):
         assert retired not in text
 

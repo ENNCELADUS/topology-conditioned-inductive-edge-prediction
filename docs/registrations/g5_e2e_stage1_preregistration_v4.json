@@ -1,12 +1,12 @@
 {
-  "registration_id": "g5-e2e-stage1-20260730-single-stage-plan-bound-screen-v4-draft",
+  "registration_id": "g5-e2e-stage1-20260730-single-stage-plan-bound-screen-v4",
   "status": "DRAFT",
   "created_utc": "2026-07-29T00:00:00Z",
   "bound_utc": null,
   "gate": "G5 Stage 1 - EgoStitch E2E rev-3.2 single-stage plan-bound screen",
   "spec_binding": "docs/05-egostitch-spec.md §13.19 (single-stage plan-bound experiment) and §14.4 in full",
   "protocol_binding": "docs/03-experiment-protocol.md §5 G5, §5.0.5, §5.2, and §5.2.4",
-  "draft_boundary": "This DRAFT authorizes no formal training, candidate/test scoring, external held-out read, or scientific claim. Only the owner may promote this plan to BINDING after the plan identity and required input evidence are resolved. A BINDING registration is immutable.",
+  "status_semantics": "Status is descriptive provenance only. DRAFT, BINDING, or another value neither authorizes nor blocks training, scoring, evaluation, or claims; exact registration bytes and SHA-256 remain immutable within each run/artifact chain.",
   "predecessor": {
     "registration": "g5-e2e-stage1-20260719-conditioned-encoder-stability-screen-v2",
     "path": "docs/registrations/g5_e2e_stage1_preregistration_v2.json",
@@ -27,7 +27,7 @@
       "protocol.v_qual_rehearsals (the single-rehearsal budget)",
       "protocol.v_select 'sealed until first bound run' (V_select is no longer a universe; V_hold := V_qual union V_select serves both stages)",
       "the calibration/qualification pre-binding probe scopes (E2EProbeScope is now formal_train only)",
-      "every unresolved-marker string of the retired grep-discoverable convention; unresolved binding evidence is now explicit JSON null, which every consuming validator already fails closed on"
+      "every unresolved-marker string and every registration-state or null-evidence execution gate"
     ]
   },
   "design_trail": {
@@ -73,16 +73,16 @@
   "claims": {
     "primary": "A valid rev-3.2 topology-conditioned encoder improves edge-level and assembled-graph evidence together over calibrated independent scoring while passing the matched edge-AUPRC guard.",
     "supporting": "The registered controls and ablations attribute any improvement to relational structure rather than only pair/content capacity, grounding-vocabulary width, or the train-only relational auxiliary head.",
-    "anti_claim": "A random, collapsed, warm-start-only, numerically unstable, unqualified, or DRAFT-backed checkpoint cannot count as formal evidence for or against the architecture."
+    "anti_claim": "A random, warm-start-only, numerically unstable, plan-mismatched, or artifact-corrupted checkpoint cannot count as formal evidence for or against the architecture."
   },
   "execution_plan": {
     "shape": "one plan-bound formal training stage followed by provenance-bound scoring and evaluation",
     "training": "full V_fit, registered 30-epoch schedule, registered seeds",
     "validation": "V_hold for checkpoint selection and telemetry",
     "preflight": [
-      "registration status is BINDING and the registration SHA-256 is recorded at run start",
+      "the exact registration SHA-256 is recorded at run start and the registration remains byte-unchanged",
       "the exact registered arm/config path and SHA-256 match the live clean implementation",
-      "required input packs/manifests and data-boundary audit evidence match their registered digests"
+      "the repository/runtime boundary is correct and exactly four visible H20s are available"
     ],
     "quality_policy": "All model-quality predicates are telemetry-only. Eligibility, liveness, slot-collapse, clipping/family/RMS margins, AUPRC, dispersion, and precision quality misses cannot block training completion, checkpoint publication, scoring, or evaluation.",
     "truthfulness_failures": "Non-finite tensors, DDP disagreement, incomplete or duplicate coverage, data-boundary violations, malformed or hash-mismatched inputs/artifacts, and I/O/infrastructure failures still fail closed.",
@@ -635,7 +635,6 @@
     }
   },
   "execution_order": [
-    "resolve every binding_prerequisite and let the owner promote a successor content state to BINDING",
     "train each registered arm under the single plan-bound formal schedule",
     "publish the plan-selected checkpoint even when model-quality telemetry misses",
     "score all registered candidate artifacts, one scoring epoch per (arm, seed), recording the test-access ledger",
@@ -652,11 +651,7 @@
     "rule": "The v2 edge-level plus assembled-graph reporting, fixed-Seed-0 claim limits, comparator identities, density-matched operating point, four-logit decomposition, and fail-closed publication rules continue except where spec §13.19/§14.4 or this v4 draft explicitly supersedes them.",
     "no_implicit_binding": "Inheritance does not import v2 binding evidence, implementation/config hashes, checkpoints, qualification results, or artifact provenance."
   },
-  "binding_evidence": {
-    "schema_version": "egostitch_e2e_binding_evidence_v2",
-    "draft_state": "The nulls below are the unresolved binding evidence. Every consuming validator already fails closed on a null (src/train_egostitch.py::_validate_e2e_formal_binding, src/experiments/g5_stage1.py::_validate_e2e_binding_evidence, src/score_universe.py::_validate_e2e_scoring_provenance), so no text marker is needed and none is used: a DRAFT cannot be mistaken for a resolved BINDING state.",
-    "implementation": null,
-    "configs": {
+  "config_artifacts": {
       "full": {
         "path": "configs/egostitch_e2e_v3_full_breadth_first.yaml",
         "sha256": "d9b2e542666fd3bfd6b8b6ebc09611a6fe452229b1ea0843fb4860b6c657d4de"
@@ -681,24 +676,27 @@
         "path": "configs/egostitch_e2e_v3_no_l_rel_breadth_first.yaml",
         "sha256": "e0f7f482e56f2aa19b62a6d51868cd50370593b748c8e4daa1fccce9a025257f"
       }
-    },
-    "configs_pinned_at": "2026-07-30, against the six v3-named configs after the single-stage cleanup: feature_standardization zscore_vfit_v1, no hand-pasted feature_stats_sha256, runtime.token_budget scalar, retained runtime.total_budget_seconds sum invariant, n_ground-keyed runtime.pack_dir, and preregistration retargeted to this v4 DRAFT. Any further byte change to a config moves its digest and must be re-pinned here before binding.",
+  },
+  "config_artifacts_pinned_at": "2026-07-30, against the six v3-named configs after the single-stage cleanup. Any config byte change moves its digest and requires a new exact plan snapshot before that changed config is run.",
+  "run_evidence_placeholders": {
+    "schema_version": "egostitch_e2e_run_provenance_v1",
+    "semantics": "These nullable fields describe evidence emitted by the actual formal run. Null never blocks training, scoring, or evaluation; downstream consumers validate the non-null run-produced provenance and exact artifact chain.",
+    "implementation": null,
     "parameter_group_manifests": null,
     "packs_and_validation_manifests": null,
     "boundary_access_audit": null,
     "runtime_and_peak_memory": null,
     "checkpoint_policy_version": null
   },
-  "binding_prerequisites": [
-    "binding_evidence.implementation names the implementation commit; the formal worker verifies its clean checkout identity.",
-    "binding_evidence.parameter_group_manifests, packs_and_validation_manifests, boundary_access_audit and runtime_and_peak_memory each carry path-bound SHA-256 artifacts that resolve and hash-match on the execution host.",
-    "binding_evidence.checkpoint_policy_version is a non-empty version string.",
-    "The owner promotes the resolved successor content state to BINDING. No agent, screen, or note may do this."
+  "run_provenance_contract": [
+    "run_metadata.json records the clean live implementation commit and tracked-status digest.",
+    "run_metadata.json and profile.json record parameter-group, pack/validation, boundary-access, runtime/peak-memory, and checkpoint-policy provenance generated by that run.",
+    "scoring and G5 validate the run-produced provenance plus exact registration/config/checkpoint/score-artifact identities; registration placeholders are never preflight gates."
   ],
   "mechanics": {
-    "formal_worker": "must reject this DRAFT; formal egostitch_e2e runs require status == 'BINDING'",
+    "formal_worker": "accepts any descriptive registration status; requires an unchanged registration snapshot, exact arm/config identity, clean checkout, correct repository/runtime boundary, and four visible H20s",
     "debug_worker": "bounded runs are redirected to a *_debug output directory and marked non-formal; their checkpoints are forbidden from candidate/test scoring",
-    "owner_boundary": "only the owner binds; this draft must not be promoted automatically",
-    "amendment": "any post-binding scientific, threshold, optimizer, schedule, precision, guard, eligibility, or frozen-input change requires a new versioned registration"
+    "status": "descriptive only and never an execution, scoring, or evaluation gate",
+    "amendment": "any scientific, threshold, optimizer, schedule, precision, or frozen-input change requires a new versioned registration snapshot"
   }
 }

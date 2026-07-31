@@ -1423,13 +1423,8 @@ def apply_overrides(cfg: EgoConfig, args: EgoCliArgs) -> EgoConfig:
     return cfg
 
 
-class PreregistrationNotBinding(RuntimeError):
-    """Raised when a formal worker run is not backed by a BINDING registration."""
-
-
-_REQUIRED_BEFORE_BINDING = "REQUIRED-BEFORE-BINDING"
-_E2E_BINDING_SCHEMA_V1 = "egostitch_e2e_binding_evidence_v1"
-_E2E_BINDING_SCHEMA = "egostitch_e2e_binding_evidence_v2"
+class FormalPlanMismatch(RuntimeError):
+    """Raised when a formal worker does not match the registered plan identity."""
 _E2E_FORMAL_ARMS: tuple[E2EArmName, ...] = (
     "full",
     "b0_e2e_f_only",
@@ -1440,6 +1435,7 @@ _E2E_FORMAL_ARMS: tuple[E2EArmName, ...] = (
 )
 _E2E_CONTROL_ARMS = ("structure_control_6a_v3", "structure_control_6e_v1")
 _E2E_ARMS = _E2E_FORMAL_ARMS + _E2E_CONTROL_ARMS
+E2E_CHECKPOINT_POLICY_VERSION = "egostitch_e2e_all_completed_epochs_v1"
 
 
 @dataclass(frozen=True)
@@ -1458,145 +1454,52 @@ def _is_sha256(value: object) -> bool:
     )
 
 
-def _validate_binding_digest_section(value: object, label: str, repo_root: Path) -> None:
-    if not isinstance(value, (Mapping, list)) or not value:
-        raise PreregistrationNotBinding(f"binding_evidence.{label} must be structured")
-    digests: list[object] = []
-    artifacts: list[tuple[Path, str]] = []
-
-    def collect(item: object) -> None:
-        if isinstance(item, Mapping):
-            path_value = item.get("path")
-            digest_value = item.get("sha256")
-            if isinstance(path_value, str) and _is_sha256(digest_value):
-                path = Path(path_value)
-                artifacts.append(
-                    (path if path.is_absolute() else repo_root / path, cast(str, digest_value))
-                )
-            for key, nested in item.items():
-                if str(key).endswith("sha256"):
-                    digests.append(nested)
-                collect(nested)
-        elif isinstance(item, list):
-            for nested in item:
-                collect(nested)
-
-    collect(value)
-    if not digests or any(not _is_sha256(digest) for digest in digests):
-        raise PreregistrationNotBinding(f"binding_evidence.{label} requires valid SHA-256 evidence")
-    if not artifacts:
-        raise PreregistrationNotBinding(
-            f"binding_evidence.{label} requires at least one path and sha256 artifact"
-        )
-    for path, expected in artifacts:
-        if not path.is_file() or _sha256_file(path) != expected:
-            raise PreregistrationNotBinding(
-                f"binding_evidence.{label} artifact is missing or hash-mismatched: {path}"
-            )
-
-
-_REGISTRATION_DOCS_PREFIX = "docs/registrations/"
-
-
-def _head_matches_implementation_commit(commit: str, live_commit: str, repo_root: Path) -> bool:
-    """Accept HEAD == commit, or registration-document-only descent from it.
-
-    A tracked registration cannot contain its own promotion commit hash
-    (binding-mechanics amendment 2026-07-23), so the binding commit is allowed
-    to sit on top of the recorded implementation commit as long as every path
-    it touches lives under ``docs/registrations/``.
-    """
-    if live_commit.startswith(commit):
-        return True
-    is_ancestor = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
-        cwd=repo_root,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if is_ancestor.returncode != 0:
-        return False
-    changed_paths = subprocess.run(
-        ["git", "diff", "--name-only", f"{commit}..HEAD"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.splitlines()
-    return all(path.startswith(_REGISTRATION_DOCS_PREFIX) for path in changed_paths if path.strip())
-
-
-def _validate_e2e_formal_binding(
+def _validate_e2e_formal_plan(
     cfg: EgoConfig, snapshot: PreregistrationSnapshot, config_path: Path
 ) -> dict[str, str]:
-    """Fail before DDP unless formal registration evidence matches live inputs."""
+    """Validate plan/config identity and record the clean live implementation.
+
+    Registration status and nullable run-produced evidence are intentionally not
+    consulted here.
+    """
     from src.experiments.e2e_binding import (
-        BINDING_SCHEMA_V1,
-        HISTORICAL_V1_ARMS,
-        binding_schema_for_registration,
+        ACTIVE_V4_ARMS,
+        PLAN_SCHEMA_V2,
+        plan_schema_for_registration,
     )
 
-    evidence = snapshot.payload.get("binding_evidence")
     try:
-        schema = binding_schema_for_registration(snapshot.payload)
+        schema = plan_schema_for_registration(snapshot.payload)
     except ValueError as error:
-        raise PreregistrationNotBinding(str(error)) from error
-    if not isinstance(evidence, Mapping):  # narrowed by the shared fail-closed validator
-        raise PreregistrationNotBinding("formal E2E run requires binding_evidence")
-    implementation = evidence.get("implementation")
-    commit = implementation.get("commit") if isinstance(implementation, Mapping) else None
-    if (
-        not isinstance(commit, str)
-        or not 7 <= len(commit) <= 64
-        or any(character not in "0123456789abcdefABCDEF" for character in commit)
-    ):
-        raise PreregistrationNotBinding("binding_evidence implementation commit is invalid")
-    configs = evidence.get("configs")
-    expected_configs = (
-        HISTORICAL_V1_ARMS - {"structure_control_6a"}
-        if schema == BINDING_SCHEMA_V1
-        else frozenset(_E2E_FORMAL_ARMS)
-    )
+        raise FormalPlanMismatch(str(error)) from error
+    if schema != PLAN_SCHEMA_V2:
+        raise FormalPlanMismatch("formal training requires the active v4 plan schema")
+    configs = snapshot.payload.get("config_artifacts")
+    expected_configs = frozenset(_E2E_FORMAL_ARMS)
     if not isinstance(configs, Mapping) or set(configs) != expected_configs:
-        raise PreregistrationNotBinding(
-            "binding_evidence configs do not match the registration's trained checkpoint arms"
+        raise FormalPlanMismatch(
+            "config_artifacts do not match the registration's trained checkpoint arms"
         )
     registered_arms = snapshot.payload.get("arms")
-    expected_arms = HISTORICAL_V1_ARMS if schema == BINDING_SCHEMA_V1 else frozenset(_E2E_ARMS)
-    if not isinstance(registered_arms, Mapping) or set(registered_arms) != expected_arms:
-        raise PreregistrationNotBinding("registration arms do not match its identity schema")
+    if not isinstance(registered_arms, Mapping) or set(registered_arms) != ACTIVE_V4_ARMS:
+        raise FormalPlanMismatch("registration arms do not match its identity schema")
     for trained_arm in expected_configs:
         entry = registered_arms.get(trained_arm)
-        if not isinstance(entry, Mapping) or (
-            schema != BINDING_SCHEMA_V1 and entry.get("kind") != "trained_checkpoint"
-        ):
-            raise PreregistrationNotBinding(
+        if not isinstance(entry, Mapping) or entry.get("kind") != "trained_checkpoint":
+            raise FormalPlanMismatch(
                 f"registration arms.{trained_arm} must be a trained_checkpoint"
             )
-    if schema != BINDING_SCHEMA_V1:
-        for control_arm in _E2E_CONTROL_ARMS:
-            entry = registered_arms.get(control_arm)
-            if (
-                not isinstance(entry, Mapping)
-                or entry.get("kind") != "scoring_time_control"
-                or entry.get("checkpoint_arm") != "full"
-            ):
-                raise PreregistrationNotBinding(
-                    f"registration arms.{control_arm} must be a scoring_time_control over full"
-                )
+    for control_arm in _E2E_CONTROL_ARMS:
+        entry = registered_arms.get(control_arm)
+        if (
+            not isinstance(entry, Mapping)
+            or entry.get("kind") != "scoring_time_control"
+            or entry.get("checkpoint_arm") != "full"
+        ):
+            raise FormalPlanMismatch(
+                f"registration arms.{control_arm} must be a scoring_time_control over full"
+            )
     repo_root = cfg.preregistration.resolve().parents[2]
-    binding_sections = [
-        "parameter_group_manifests",
-        "packs_and_validation_manifests",
-        "boundary_access_audit",
-        "runtime_and_peak_memory",
-    ]
-    for label in binding_sections:
-        _validate_binding_digest_section(evidence.get(label), label, repo_root)
-    if not isinstance(evidence.get("checkpoint_policy_version"), str):
-        raise PreregistrationNotBinding("binding_evidence checkpoint policy is missing")
-
     arm = _e2e_arm_name_from_config(E2EConfig.from_mapping(cfg.model.config))
     registered_arm = registered_arms.get(arm) if isinstance(registered_arms, Mapping) else None
     registered_training = (
@@ -1608,15 +1511,13 @@ def _validate_e2e_formal_binding(
         or set(config_evidence) != {"path", "sha256"}
         or config_evidence.get("path") != registered_training
     ):
-        raise PreregistrationNotBinding(f"binding_evidence config entry is invalid for {arm}")
+        raise FormalPlanMismatch(f"config_artifacts entry is invalid for {arm}")
     config_sha256 = config_evidence.get("sha256")
     if not _is_sha256(config_sha256) or _sha256_file(config_path) != config_sha256:
-        raise PreregistrationNotBinding(
-            f"live config digest does not match binding evidence for {arm}"
-        )
+        raise FormalPlanMismatch(f"live config digest does not match registered plan for {arm}")
     expected_path = (repo_root / str(registered_training)).resolve()
     if config_path.resolve() != expected_path:
-        raise PreregistrationNotBinding(f"config path does not match arms.{arm}.training")
+        raise FormalPlanMismatch(f"config path does not match arms.{arm}.training")
     live_commit = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=repo_root,
@@ -1631,13 +1532,11 @@ def _validate_e2e_formal_binding(
         capture_output=True,
         text=True,
     ).stdout.strip()
-    if tracked_changes or not _head_matches_implementation_commit(commit, live_commit, repo_root):
-        raise PreregistrationNotBinding(
-            "binding_evidence implementation commit does not match a clean live checkout"
-        )
+    if tracked_changes:
+        raise FormalPlanMismatch("formal execution requires a clean live checkout")
     return {
         "arm": arm,
-        "implementation_commit": commit,
+        "implementation_commit": live_commit,
         "config_sha256": cast(str, config_sha256),
     }
 
@@ -1665,7 +1564,6 @@ def prepare_ddp_run_config(
     if not cfg.preregistration.is_file():
         raise ValueError(f"preregistration file not found: {cfg.preregistration}")
     snapshot = _preregistration_snapshot(cfg.preregistration)
-    status = snapshot.payload.get("status")
     if cfg.training is not None:
         run_kind = cfg.run_kind or "formal"
         if max_steps is not None:
@@ -1673,16 +1571,6 @@ def prepare_ddp_run_config(
                 f"E2E {run_kind} runs must execute the complete schedule; --max-steps forbidden"
             )
     if max_steps is None:
-        if cfg.model.family == _EGOSTITCH_E2E_FAMILY:
-            if status != "BINDING":
-                raise PreregistrationNotBinding(
-                    "formal egostitch_e2e runs require preregistration status == 'BINDING'"
-                )
-            if _REQUIRED_BEFORE_BINDING in json.dumps(snapshot.payload, sort_keys=True):
-                raise PreregistrationNotBinding(
-                    "formal egostitch_e2e runs require every "
-                    "REQUIRED-BEFORE-BINDING marker to be resolved"
-                )
         return cfg, False, snapshot
     if max_steps <= 0:
         raise ValueError("--max-steps must be positive")
@@ -5099,7 +4987,7 @@ def write_run_start_metadata(
     preregistration_sha256: str | None = None,
     registered_config_hash: str | None = None,
     config_path: Path | None = None,
-    formal_binding: Mapping[str, str] | None = None,
+    formal_plan: Mapping[str, str] | None = None,
     feature_stats_sha256: str | None = None,
 ) -> None:
     """Bind the run to config, preregistration, and s0 before optimization."""
@@ -5144,8 +5032,8 @@ def write_run_start_metadata(
         implementation_tracked_clean = tracked_status == ""
         implementation_tracked_status_sha256 = hashlib.sha256(tracked_status.encode()).hexdigest()
     implementation_commit = (
-        formal_binding.get("implementation_commit")
-        if formal_binding is not None
+        formal_plan.get("implementation_commit")
+        if formal_plan is not None
         else live_implementation_commit
     )
     metadata = {
@@ -5294,6 +5182,34 @@ def write_outputs(
             "validation_role": data.validation_role,
             "v_hold_validation_evidence": validation_evidence,
             "access_audit": data.access_audit,
+            "run_provenance": {
+                "schema_version": "egostitch_e2e_run_provenance_v1",
+                "implementation": {
+                    "commit": run_metadata.get("implementation_commit"),
+                    "tracked_clean": run_metadata.get("implementation_tracked_clean"),
+                    "tracked_status_sha256": run_metadata.get(
+                        "implementation_tracked_status_sha256"
+                    ),
+                },
+                "parameter_group_manifests": result.runtime_profile.get(
+                    "parameter_groups"
+                ),
+                "packs_and_validation_manifests": {
+                    "pipeline_profile_path": "profile.json",
+                    "feature_stats_sha256": run_metadata.get("feature_stats_sha256"),
+                    "v_hold_validation_evidence": validation_evidence,
+                },
+                "boundary_access_audit": data.access_audit,
+                "runtime_and_peak_memory": {
+                    "world_size": run_metadata.get("world_size"),
+                    "epochs_completed": result.runtime_profile.get("epochs_completed"),
+                    "optimizer_steps": result.runtime_profile.get("optimizer_steps"),
+                    "peak_memory_gib_per_rank": result.runtime_profile.get(
+                        "peak_memory_gib_per_rank"
+                    ),
+                },
+                "checkpoint_policy_version": E2E_CHECKPOINT_POLICY_VERSION,
+            },
             "kendall_fallback": result.kendall_state,
             "training_diagnostics": {
                 "fidelity_series": [entry["fidelity"] for entry in result.history],
@@ -5391,13 +5307,13 @@ def _run_ddp_worker(
         )
     if not cfg.preregistration.is_file():
         raise ValueError(f"preregistration file not found: {cfg.preregistration}")
-    formal_binding: dict[str, str] | None = None
+    formal_plan: dict[str, str] | None = None
     if (
         not measurement_only
         and cfg.training is not None
         and (cfg.run_kind or "formal") == "formal"
     ):
-        formal_binding = _validate_e2e_formal_binding(cfg, preregistration, args.config)
+        formal_plan = _validate_e2e_formal_plan(cfg, preregistration, args.config)
 
     effective_run_kind = "debug" if args.max_steps is not None else (cfg.run_kind or "formal")
     accelerator = build_egostitch_ddp_accelerator(
@@ -5426,7 +5342,7 @@ def _run_ddp_worker(
         accelerator=accelerator,
         preregistration=preregistration,
         registered_config_hash=registered_config_hash,
-        formal_binding=formal_binding,
+        formal_plan=formal_plan,
         run_kind=run_kind,
         feature_stats_sha256=feature_stats_sha256,
         node_batch=args.token_budget_per_rank,
@@ -5443,7 +5359,7 @@ def _run_ddp_dispatch(
     accelerator: Accelerator,
     preregistration: PreregistrationSnapshot,
     registered_config_hash: str | None,
-    formal_binding: dict[str, str] | None,
+    formal_plan: dict[str, str] | None,
     run_kind: str,
     feature_stats_sha256: str,
     node_batch: int,
@@ -5482,7 +5398,7 @@ def _run_ddp_dispatch(
             preregistration_sha256=preregistration.sha256,
             registered_config_hash=registered_config_hash,
             config_path=args.config,
-            formal_binding=formal_binding,
+            formal_plan=formal_plan,
             feature_stats_sha256=feature_stats_sha256,
         )
     accelerator.wait_for_everyone()

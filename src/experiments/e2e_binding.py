@@ -1,12 +1,12 @@
-"""Registration identity and binding-evidence schema checks for EgoStitch E2E."""
+"""Plan identity checks for supported EgoStitch E2E registrations."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 
-BINDING_SCHEMA_V1 = "egostitch_e2e_binding_evidence_v1"
-BINDING_SCHEMA_V2 = "egostitch_e2e_binding_evidence_v2"
-ACTIVE_V4_REGISTRATION_ID = "g5-e2e-stage1-20260729-two-stage-ladder-screen-v4-draft"
+PLAN_SCHEMA_V1 = "egostitch_e2e_plan_v1"
+PLAN_SCHEMA_V2 = "egostitch_e2e_plan_v2"
+ACTIVE_V4_REGISTRATION_ID = "g5-e2e-stage1-20260730-single-stage-plan-bound-screen-v4"
 HISTORICAL_V1_REGISTRATION_ID = (
     "g5-e2e-stage1-20260719-conditioned-encoder-stability-screen-v2"
 )
@@ -27,26 +27,24 @@ HISTORICAL_V1_ARMS = frozenset(
 )
 
 
-def binding_schema_for_registration(registration: Mapping[str, object]) -> str:
-    """Couple each supported registration identity and arm set to one evidence schema."""
+def plan_schema_for_registration(registration: Mapping[str, object]) -> str:
+    """Couple each supported registration identity to its exact arm schema.
+
+    Registration status and run-produced evidence are deliberately outside this
+    identity check: neither exists to authorize execution.
+    """
     registration_id = registration.get("registration_id")
     arms = registration.get("arms")
-    evidence = registration.get("binding_evidence")
-    if not isinstance(arms, Mapping) or not isinstance(evidence, Mapping):
-        raise ValueError("registration requires structured arms and binding_evidence")
-    schema = evidence.get("schema_version")
+    if not isinstance(arms, Mapping):
+        raise ValueError("registration requires structured arms")
     if registration_id == ACTIVE_V4_REGISTRATION_ID:
-        expected_arms, expected_schema = ACTIVE_V4_ARMS, BINDING_SCHEMA_V2
+        expected_arms, schema = ACTIVE_V4_ARMS, PLAN_SCHEMA_V2
     elif registration_id == HISTORICAL_V1_REGISTRATION_ID:
-        expected_arms, expected_schema = HISTORICAL_V1_ARMS, BINDING_SCHEMA_V1
+        expected_arms, schema = HISTORICAL_V1_ARMS, PLAN_SCHEMA_V1
     else:
         raise ValueError(f"unsupported E2E registration identity: {registration_id!r}")
     if set(arms) != expected_arms:
         raise ValueError(
             f"registration {registration_id!r} has an incompatible arm identity schema"
         )
-    if schema != expected_schema:
-        raise ValueError(
-            f"registration {registration_id!r} requires binding evidence {expected_schema}"
-        )
-    return expected_schema
+    return schema

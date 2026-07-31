@@ -13,11 +13,72 @@ import pytest
 import torch
 from src import score_universe
 from src.experiments import g5_stage1
+from src.experiments.e2e_binding import ACTIVE_V4_REGISTRATION_ID
 from src.model.egostitch.e2e_model import EgoStitchE2E
 
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_run_provenance(metadata_path: Path, metadata: dict[str, object]) -> None:
+    validation_path = metadata_path.parent / "v_hold_validation_events.jsonl"
+    validation_path.write_text('{"epoch":1}\n', encoding="utf-8")
+    validation = {
+        "schema": "egostitch_e2e_v_hold_validation_events_v1",
+        "count": 1,
+        "path": validation_path.name,
+        "sha256": _sha256(validation_path),
+    }
+    parameter_groups = {"names": ["generator"], "sha256": {"generator": "b" * 64}}
+    memories = [1.0, 1.0, 1.0, 1.0]
+    access_audit = {"observed_training_access": []}
+    metadata.update(
+        {
+            "world_size": 4,
+            "feature_stats_sha256": "c" * 64,
+            "implementation_tracked_clean": True,
+            "implementation_tracked_status_sha256": hashlib.sha256(b"").hexdigest(),
+            "v_hold_validation_evidence": validation,
+            "access_audit": access_audit,
+            "run_provenance": {
+                "schema_version": "egostitch_e2e_run_provenance_v1",
+                "implementation": {
+                    "commit": metadata["implementation_commit"],
+                    "tracked_clean": True,
+                    "tracked_status_sha256": hashlib.sha256(b"").hexdigest(),
+                },
+                "parameter_group_manifests": parameter_groups,
+                "packs_and_validation_manifests": {
+                    "pipeline_profile_path": "profile.json",
+                    "feature_stats_sha256": "c" * 64,
+                    "v_hold_validation_evidence": validation,
+                },
+                "boundary_access_audit": access_audit,
+                "runtime_and_peak_memory": {
+                    "world_size": 4,
+                    "epochs_completed": 30,
+                    "optimizer_steps": 2340,
+                    "peak_memory_gib_per_rank": memories,
+                },
+                "checkpoint_policy_version": "egostitch_e2e_all_completed_epochs_v1",
+            },
+        }
+    )
+    (metadata_path.parent / "profile.json").write_text(
+        json.dumps(
+            {
+                "parameter_groups": parameter_groups,
+                "peak_memory_gib_per_rank": memories,
+                "world_size": 4,
+                "pack_manifest": {},
+                "pack_identity_sha256": "d" * 64,
+                "pack_evidence": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
 
 def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
@@ -37,12 +98,9 @@ def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     config = configs["full"]
     checkpoint = tmp_path / "best.pt"
     checkpoint.write_bytes(b"selected checkpoint")
-    evidence_artifact = tmp_path / "evidence.json"
-    evidence_artifact.write_text('{"qualified": true}\n', encoding="utf-8")
-    digest_record = {"path": str(evidence_artifact), "sha256": _sha256(evidence_artifact)}
     registration = {
-        "registration_id": "g5-e2e-stage1-20260729-two-stage-ladder-screen-v4-draft",
-        "status": "BINDING",
+        "registration_id": ACTIVE_V4_REGISTRATION_ID,
+        "status": "DRAFT",
         "arms": {
             **{
                 arm: {
@@ -89,18 +147,13 @@ def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
                 },
             },
         },
-        "binding_evidence": {
-            "schema_version": "egostitch_e2e_binding_evidence_v2",
-            "implementation": {"commit": "a" * 40},
-            "configs": {
-                arm: {"path": str(path), "sha256": _sha256(path)}
-                for arm, path in configs.items()
-            },
-            "parameter_group_manifests": digest_record,
-            "packs_and_validation_manifests": digest_record,
-            "boundary_access_audit": digest_record,
-            "runtime_and_peak_memory": digest_record,
-            "checkpoint_policy_version": "v2",
+        "config_artifacts": {
+            arm: {"path": str(path), "sha256": _sha256(path)}
+            for arm, path in configs.items()
+        },
+        "run_evidence_placeholders": {
+            "implementation": None,
+            "runtime_and_peak_memory": None,
         },
     }
     registration_path = tmp_path / "registration.json"
@@ -129,7 +182,7 @@ def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
         "checkpoint_sha256": _sha256(checkpoint),
     }
     metadata_path = tmp_path / "run_metadata.json"
-    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    _write_run_provenance(metadata_path, metadata)
     return registration_path, metadata_path, checkpoint, checkpoint_id
 
 
@@ -154,9 +207,7 @@ def _write_all_e2e_provenance(
         config_path = Path(arm_registration["training"])
         scoring_semantics = arm_registration["scoring_provenance"]
         metadata_path = arm_dir / "run_metadata.json"
-        metadata_path.write_text(
-            json.dumps(
-                {
+        metadata: dict[str, object] = {
                     "arm": arm,
                     "arm_kind": "trained_checkpoint",
                     "checkpoint_arm": arm,
@@ -174,10 +225,8 @@ def _write_all_e2e_provenance(
                     "checkpoint_id": checkpoint_id,
                     "checkpoint_sha256": _sha256(checkpoint_path),
                     "selected_checkpoint_path": str(checkpoint_path),
-                }
-            ),
-            encoding="utf-8",
-        )
+        }
+        _write_run_provenance(metadata_path, metadata)
         metadata_paths[arm] = metadata_path
         checkpoint_paths[arm] = checkpoint_path
         checkpoint_ids[arm] = checkpoint_id
@@ -520,178 +569,18 @@ def test_e2e_formal_scoring_provenance_revalidates_registration_digest(tmp_path:
     assert provenance["registration_sha256"] == _sha256(registration)
 
 
-def test_e2e_formal_scoring_rejects_missing_binding_evidence(tmp_path: Path) -> None:
-    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
-    payload = json.loads(registration.read_text(encoding="utf-8"))
-    evidence = payload["binding_evidence"]["boundary_access_audit"]
-    evidence["path"] = str(tmp_path / "missing-boundary-audit.json")
-    evidence["sha256"] = "1" * 64
-    registration.write_text(json.dumps(payload), encoding="utf-8")
-    run = json.loads(metadata.read_text(encoding="utf-8"))
-    run["preregistration_sha256"] = _sha256(registration)
-    metadata.write_text(json.dumps(run), encoding="utf-8")
-
-    with pytest.raises(
-        ValueError,
-        match=r"boundary_access_audit.*missing-boundary-audit\.json.*expected=1{64}.*found=<missing>",
-    ):
-        score_universe._validate_e2e_scoring_provenance(
-            registration_path=registration,
-            run_metadata_path=metadata,
-            checkpoint_path=checkpoint,
-            checkpoint_id=checkpoint_id,
-        )
-
-
-def test_e2e_formal_scoring_rejects_binding_evidence_digest_mismatch(tmp_path: Path) -> None:
-    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
-    payload = json.loads(registration.read_text(encoding="utf-8"))
-    evidence = payload["binding_evidence"]["boundary_access_audit"]
-    evidence["sha256"] = "2" * 64
-    registration.write_text(json.dumps(payload), encoding="utf-8")
-    run = json.loads(metadata.read_text(encoding="utf-8"))
-    run["preregistration_sha256"] = _sha256(registration)
-    metadata.write_text(json.dumps(run), encoding="utf-8")
-    found = _sha256(Path(evidence["path"]))
-
-    with pytest.raises(
-        ValueError,
-        match=rf"boundary_access_audit.*expected=2{{64}}.*found={found}",
-    ):
-        score_universe._validate_e2e_scoring_provenance(
-            registration_path=registration,
-            run_metadata_path=metadata,
-            checkpoint_path=checkpoint,
-            checkpoint_id=checkpoint_id,
-        )
-
-
-def test_e2e_formal_scoring_rejects_unreadable_binding_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
-    payload = json.loads(registration.read_text(encoding="utf-8"))
-    evidence_path = Path(payload["binding_evidence"]["parameter_group_manifests"]["path"])
-    file_sha256 = score_universe._file_sha256
-
-    def unreadable_evidence(path: Path) -> str:
-        if path == evidence_path:
-            raise PermissionError("permission denied")
-        return file_sha256(path)
-
-    monkeypatch.setattr(score_universe, "_file_sha256", unreadable_evidence)
-
-    with pytest.raises(
-        ValueError,
-        match=r"parameter_group_manifests.*expected=.*found=<unreadable: permission denied>",
-    ):
-        score_universe._validate_e2e_scoring_provenance(
-            registration_path=registration,
-            run_metadata_path=metadata,
-            checkpoint_path=checkpoint,
-            checkpoint_id=checkpoint_id,
-        )
-
-
-def test_binding_evidence_rejection_precedes_heldout_pair_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    registration, metadata_paths, checkpoint_paths, checkpoint_ids = _write_all_e2e_provenance(
-        tmp_path
-    )
-    payload = json.loads(registration.read_text(encoding="utf-8"))
-    evidence = payload["binding_evidence"]["packs_and_validation_manifests"]
-    evidence["path"] = str(tmp_path / "missing-pack-evidence.json")
-    evidence["sha256"] = "3" * 64
-    registration.write_text(json.dumps(payload), encoding="utf-8")
-    for metadata in metadata_paths.values():
-        run = json.loads(metadata.read_text(encoding="utf-8"))
-        run["preregistration_sha256"] = _sha256(registration)
-        metadata.write_text(json.dumps(run), encoding="utf-8")
-    monkeypatch.setattr(
-        score_universe,
-        "_load_checkpoint",
-        lambda *_args, **_kwargs: (
-            torch.nn.Linear(1, 1),
-            "egostitch_e2e",
-            checkpoint_ids["full"],
-        ),
-    )
-
-    def forbidden_pair_read(*_args: object, **_kwargs: object) -> tuple[object, object]:
-        raise AssertionError("held-out pairs were read before binding evidence validation")
-
-    monkeypatch.setattr(score_universe, "_resolve_pairs", forbidden_pair_read)
-
-    cli = [
-        "score",
-        "--checkpoint",
-        str(checkpoint_paths["full"]),
-        "--pairs",
-        "candidate",
-        "--output",
-        str(tmp_path / "forbidden.npz"),
-        "--preregistration",
-        str(registration),
-    ]
-    for arm, metadata in metadata_paths.items():
-        cli.extend(["--arm-run-metadata", f"{arm}={metadata}"])
-
-    with pytest.raises(ValueError, match=r"packs_and_validation_manifests.*found=<missing>"):
-        score_universe.main(cli)
-
-
-def test_binding_evidence_rejection_precedes_heldout_file_alias_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_scoring_rejects_tampered_run_provenance(tmp_path: Path) -> None:
     registration, _metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
-    payload = json.loads(registration.read_text(encoding="utf-8"))
-    evidence = payload["binding_evidence"]["boundary_access_audit"]
-    evidence["path"] = str(tmp_path / "missing-boundary-evidence.json")
-    evidence["sha256"] = "4" * 64
-    registration.write_text(json.dumps(payload), encoding="utf-8")
-
-    data_root = tmp_path / "data"
-    candidate = (
-        data_root
-        / "benchmark_2025_neurips"
-        / "breadth_first"
-        / "candidate_test_edges.txt"
-    )
-    candidate.parent.mkdir(parents=True)
-    candidate.write_text("a\tb\nc\td\n", encoding="utf-8")
-    alias = tmp_path / "reordered-candidate.tsv"
-    alias.write_text("d\tc\nb\ta\n", encoding="utf-8")
-    heldout_paths = {candidate.resolve(), alias.resolve()}
-    file_sha256 = score_universe._file_sha256
-
-    def reject_heldout_read(path: Path) -> str:
-        if path.resolve() in heldout_paths:
-            raise AssertionError("held-out file was opened before binding evidence validation")
-        return file_sha256(path)
-
-    monkeypatch.setattr(score_universe, "_file_sha256", reject_heldout_read)
-    monkeypatch.setattr(
-        score_universe,
-        "_load_checkpoint",
-        lambda *_args, **_kwargs: (torch.nn.Linear(1, 1), "egostitch_e2e", checkpoint_id),
-    )
-
-    with pytest.raises(ValueError, match=r"boundary_access_audit.*found=<missing>"):
-        score_universe.main(
-            [
-                "score",
-                "--checkpoint",
-                str(checkpoint),
-                "--pairs",
-                f"file:{alias}",
-                "--data-root",
-                str(data_root),
-                "--output",
-                str(tmp_path / "forbidden.npz"),
-                "--preregistration",
-                str(registration),
-            ]
+    metadata = tmp_path / "run_metadata.json"
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    payload["run_provenance"]["runtime_and_peak_memory"]["world_size"] = 3
+    metadata.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="runtime provenance"):
+        score_universe._validate_e2e_scoring_provenance(
+            registration_path=registration,
+            run_metadata_path=metadata,
+            checkpoint_path=checkpoint,
+            checkpoint_id=checkpoint_id,
         )
 
 
@@ -797,13 +686,11 @@ def test_e2e_formal_scoring_provenance_rejects_non_v3_arm_packages(
         "structure_control_6a_v3"
     )
     payload["arms"].pop("structure_control_6e_v1")
-    payload["binding_evidence"]["configs"].pop("cosine_pool")
-    payload["binding_evidence"]["configs"].pop("no_l_rel")
+    payload["config_artifacts"].pop("cosine_pool")
+    payload["config_artifacts"].pop("no_l_rel")
     if extra_arm is not None:
         payload["arms"][extra_arm] = payload["arms"]["full"]
-        payload["binding_evidence"]["configs"][extra_arm] = payload["binding_evidence"][
-            "configs"
-        ]["full"]
+        payload["config_artifacts"][extra_arm] = payload["config_artifacts"]["full"]
     registration.write_text(json.dumps(payload), encoding="utf-8")
     run = json.loads(metadata.read_text(encoding="utf-8"))
     run["preregistration_sha256"] = _sha256(registration)
@@ -821,10 +708,9 @@ def test_e2e_formal_scoring_provenance_rejects_non_v3_arm_packages(
 @pytest.mark.parametrize(
     ("target", "field", "value", "match"),
     [
-        ("registration", "status", "DRAFT", "status 'BINDING'"),
         ("metadata", "run_kind", "debug", "debug/non-formal"),
         ("metadata", "status", "started", "complete formal"),
-        ("metadata", "implementation_commit", "b" * 40, "implementation_commit"),
+        ("metadata", "implementation_commit", "b" * 40, "implementation provenance"),
         ("metadata", "checkpoint_sha256", "b" * 64, "checkpoint_sha256"),
     ],
 )
@@ -870,29 +756,16 @@ def test_e2e_provenance_rejects_invalid_run_before_output(
     assert not output.exists()
 
 
-def test_e2e_rejects_required_marker_and_bad_config_digest(tmp_path: Path) -> None:
+def test_e2e_rejects_bad_registered_config_digest(tmp_path: Path) -> None:
     registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
     payload = json.loads(registration.read_text(encoding="utf-8"))
-    payload["required_before_binding"] = ["REQUIRED-BEFORE-BINDING: rehearsal"]
-    registration.write_text(json.dumps(payload), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="REQUIRED-BEFORE-BINDING"):
-        score_universe._validate_e2e_scoring_provenance(
-            registration_path=registration,
-            run_metadata_path=metadata,
-            checkpoint_path=checkpoint,
-            checkpoint_id=checkpoint_id,
-        )
-
-    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
-    payload = json.loads(registration.read_text(encoding="utf-8"))
-    payload["binding_evidence"]["configs"]["full"]["sha256"] = "f" * 64
+    payload["config_artifacts"]["full"]["sha256"] = "f" * 64
     registration.write_text(json.dumps(payload), encoding="utf-8")
     run = json.loads(metadata.read_text(encoding="utf-8"))
     run["preregistration_sha256"] = _sha256(registration)
     run["config_sha256"] = "f" * 64
     metadata.write_text(json.dumps(run), encoding="utf-8")
-    with pytest.raises(ValueError, match=r"binding_evidence\.configs\.full digest verification"):
+    with pytest.raises(ValueError, match=r"registered config digest mismatch"):
         score_universe._validate_e2e_scoring_provenance(
             registration_path=registration,
             run_metadata_path=metadata,
@@ -1008,7 +881,7 @@ def test_arm_checkpoint_path_falls_back_to_metadata_sibling_best_pt(
     with pytest.raises(ValueError, match="selected checkpoint not found"):
         score_universe.main(common)
     (other_dir / "best.pt").write_bytes(b"other arm checkpoint")
-    with pytest.raises(ValueError, match="scoring rejects debug/non-formal runs"):
+    with pytest.raises(ValueError, match="run metadata requires egostitch_e2e_run_provenance"):
         score_universe.main(common)
     assert not output.exists()
 

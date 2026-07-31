@@ -172,41 +172,20 @@ class TestE2EConfigRejection:
             E2EConfig.from_mapping({"permanent_null": "topo_head"})
 
 
-# --------------------------------------------------------------------------- BINDING gate
+# --------------------------------------------------------------------------- registration snapshot
 
 
 class TestRegistrationRunMode:
-    def test_formal_e2e_worker_refuses_registration_without_binding_status(
-        self, tmp_path: Path
-    ) -> None:
-        cfg = _toy_cfg(tmp_path)
-        e2e_cfg = replace(cfg, model=replace(cfg.model, family="egostitch_e2e"))
-        with pytest.raises(te.PreregistrationNotBinding, match="status == 'BINDING'"):
-            te.prepare_ddp_run_config(e2e_cfg, max_steps=None)
-
-    def test_formal_e2e_worker_refuses_unresolved_binding_marker(self, tmp_path: Path) -> None:
+    def test_formal_worker_accepts_draft_with_null_run_evidence(self, tmp_path: Path) -> None:
         cfg = _toy_cfg(tmp_path)
         cfg.preregistration.write_text(
             json.dumps(
                 {
-                    "status": "BINDING",
-                    "frozen_inputs": {"b0cal_results": {"sha256": "REQUIRED-BEFORE-BINDING"}},
-                }
-            )
-        )
-        e2e_cfg = replace(cfg, model=replace(cfg.model, family="egostitch_e2e"))
-
-        with pytest.raises(te.PreregistrationNotBinding, match="marker to be resolved"):
-            te.prepare_ddp_run_config(e2e_cfg, max_steps=None)
-
-    def test_formal_e2e_worker_accepts_resolved_binding_registration(self, tmp_path: Path) -> None:
-        cfg = _toy_cfg(tmp_path)
-        cfg.preregistration.write_text(
-            json.dumps(
-                {
-                    "status": "BINDING",
-                    "frozen_inputs": {"b0cal_results": {"sha256": "a" * 64}},
-                    "cost_report": {"measured": {"profile_sha256": "b" * 64}},
+                    "status": "DRAFT",
+                    "run_evidence_placeholders": {
+                        "implementation": None,
+                        "runtime_and_peak_memory": None,
+                    },
                 }
             )
         )

@@ -95,12 +95,6 @@ _META_KEYS = (
 _NAMED_PAIR_SOURCES = ("candidate", "test", "val")
 _EGOSTITCH_E2E_PAIR_PRECISION_CONTRACT = "egostitch_e2e_pair_fp32_v1"
 _EGOSTITCH_E2E_ARRAY_KEYS = ("full", "f_logit", "pair_content", "pair_topology")
-_EGOSTITCH_E2E_BINDING_SCHEMA_V1 = "egostitch_e2e_binding_evidence_v1"
-_EGOSTITCH_E2E_BINDING_SCHEMA_V2 = "egostitch_e2e_binding_evidence_v2"
-_EGOSTITCH_E2E_BINDING_SCHEMAS = {
-    _EGOSTITCH_E2E_BINDING_SCHEMA_V1,
-    _EGOSTITCH_E2E_BINDING_SCHEMA_V2,
-}
 _EGOSTITCH_E2E_FORMAL_ARMS = (
     "full",
     "b0_e2e_f_only",
@@ -110,6 +104,7 @@ _EGOSTITCH_E2E_FORMAL_ARMS = (
     "no_l_rel",
 )
 _EGOSTITCH_E2E_CONTROL_ARMS = ("structure_control_6a_v3", "structure_control_6e_v1")
+_EGOSTITCH_E2E_CHECKPOINT_POLICY = "egostitch_e2e_all_completed_epochs_v1"
 _EGOSTITCH_E2E_ARMS = _EGOSTITCH_E2E_FORMAL_ARMS + _EGOSTITCH_E2E_CONTROL_ARMS
 _SCORES_META_VERSION = "egostitch_e2e_scores_v3"
 _SCAFFOLD_CONTROL_NONE = "none"
@@ -1101,110 +1096,6 @@ def _is_sha256(value: object) -> bool:
     )
 
 
-def _contains_required_marker(value: object) -> bool:
-    """Return whether a nested registration value still contains a REQUIRED marker."""
-    if isinstance(value, str):
-        return "REQUIRED-BEFORE-BINDING" in value
-    if isinstance(value, Mapping):
-        return any(
-            _contains_required_marker(key) or _contains_required_marker(item)
-            for key, item in value.items()
-        )
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        return any(_contains_required_marker(item) for item in value)
-    return False
-
-
-def _validate_digest_section(
-    value: object, *, label: str, registration_path: Path
-) -> None:
-    """Resolve and hash every path-bound artifact in one binding-evidence section."""
-    if not isinstance(value, (Mapping, list)) or not value:
-        raise ValueError(f"binding_evidence.{label} must be a non-empty object or list")
-    digests: list[object] = []
-    artifacts: list[tuple[str, object, object]] = []
-
-    def collect(item: object, *, entry: str) -> None:
-        if isinstance(item, Mapping):
-            if "path" in item:
-                artifacts.append((entry, item.get("path"), item.get("sha256")))
-            for key, nested in item.items():
-                if str(key).endswith("sha256"):
-                    digests.append(nested)
-                collect(nested, entry=f"{entry}.{key}")
-        elif isinstance(item, list):
-            for index, nested in enumerate(item):
-                collect(nested, entry=f"{entry}[{index}]")
-
-    collect(value, entry=f"binding_evidence.{label}")
-    if not digests:
-        raise ValueError(f"binding_evidence.{label} must contain a SHA-256 digest")
-    if any(not _is_sha256(digest) for digest in digests):
-        raise ValueError(f"binding_evidence.{label} contains a non-64-hex SHA-256 digest")
-    if not artifacts:
-        raise ValueError(f"binding_evidence.{label} must contain path-bound SHA-256 evidence")
-
-    for entry, path_value, expected_value in artifacts:
-        if not _is_sha256(expected_value):
-            raise ValueError(f"{entry} must pair path with a 64-hex SHA-256 digest")
-        expected = cast(str, expected_value)
-        path = _registered_path(
-            registration_path,
-            path_value,
-            key=f"{entry}.path",
-            scope="binding evidence validation before held-out scoring",
-        )
-        if not path.is_file():
-            raise ValueError(
-                f"{entry} digest verification failed: path={path}, "
-                f"expected={expected}, found=<missing>"
-            )
-        try:
-            found = _file_sha256(path)
-        except OSError as error:
-            raise ValueError(
-                f"{entry} digest verification failed: path={path}, "
-                f"expected={expected}, found=<unreadable: {error}>"
-            ) from error
-        if found != expected:
-            raise ValueError(
-                f"{entry} digest verification failed: path={path}, "
-                f"expected={expected}, found={found}"
-            )
-
-
-def _validate_binding_artifact_digests(
-    evidence: Mapping[str, object], *, registration_path: Path
-) -> None:
-    """Hash the complete path-bound binding package before held-out pair access."""
-    for section in (
-        "configs",
-        "parameter_group_manifests",
-        "packs_and_validation_manifests",
-        "boundary_access_audit",
-        "runtime_and_peak_memory",
-    ):
-        _validate_digest_section(
-            evidence.get(section), label=section, registration_path=registration_path
-        )
-
-
-def _preflight_binding_artifacts_before_pair_access(registration_path: Path) -> None:
-    """Fail closed on binding artifacts without opening a candidate/test pair source."""
-    from src.experiments.e2e_binding import binding_schema_for_registration
-
-    registration = _load_json_object(registration_path, label="registration")
-    if registration.get("status") != "BINDING":
-        raise ValueError("egostitch_e2e candidate/test scoring requires status 'BINDING'")
-    if _contains_required_marker(registration):
-        raise ValueError("BINDING registration still contains REQUIRED-BEFORE-BINDING markers")
-    evidence = registration.get("binding_evidence")
-    if not isinstance(evidence, dict):
-        raise ValueError("registration binding_evidence must be an object")
-    binding_schema_for_registration(registration)
-    _validate_binding_artifact_digests(evidence, registration_path=registration_path)
-
-
 def _load_json_object(path: Path, *, label: str) -> dict[str, object]:
     """Load a JSON object with a provenance-specific error."""
     try:
@@ -1216,13 +1107,124 @@ def _load_json_object(path: Path, *, label: str) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
+def _validate_e2e_run_provenance(
+    metadata: Mapping[str, object], *, run_metadata_path: Path
+) -> dict[str, object]:
+    """Validate evidence emitted by the completed run, never registration nulls."""
+    provenance = metadata.get("run_provenance")
+    if not isinstance(provenance, Mapping) or provenance.get("schema_version") != (
+        "egostitch_e2e_run_provenance_v1"
+    ):
+        raise ValueError("formal run metadata requires egostitch_e2e_run_provenance_v1")
+
+    implementation = provenance.get("implementation")
+    empty_status_sha256 = hashlib.sha256(b"").hexdigest()
+    if (
+        not isinstance(implementation, Mapping)
+        or implementation.get("commit") != metadata.get("implementation_commit")
+        or implementation.get("tracked_clean") is not True
+        or implementation.get("tracked_status_sha256") != empty_status_sha256
+    ):
+        raise ValueError("formal run implementation provenance is missing or not clean")
+    commit = implementation.get("commit")
+    if not isinstance(commit, str) or len(commit) != 40 or any(
+        character not in "0123456789abcdefABCDEF" for character in commit
+    ):
+        raise ValueError("formal run implementation commit must be full 40-hex")
+
+    parameter_groups = provenance.get("parameter_group_manifests")
+    parameter_group_digests = (
+        parameter_groups.get("sha256") if isinstance(parameter_groups, Mapping) else None
+    )
+    if (
+        not isinstance(parameter_groups, Mapping)
+        or not isinstance(parameter_groups.get("names"), list)
+        or not parameter_groups.get("names")
+        or not isinstance(parameter_group_digests, Mapping)
+        or set(parameter_group_digests) != set(parameter_groups.get("names", []))
+        or any(not _is_sha256(value) for value in parameter_group_digests.values())
+    ):
+        raise ValueError("formal run parameter-group provenance is malformed")
+
+    validation_manifests = provenance.get("packs_and_validation_manifests")
+    if not isinstance(validation_manifests, Mapping):
+        raise ValueError("formal run pack/validation provenance is malformed")
+    if validation_manifests.get("feature_stats_sha256") != metadata.get(
+        "feature_stats_sha256"
+    ):
+        raise ValueError("formal run feature-statistics provenance disagrees with metadata")
+    validation = validation_manifests.get("v_hold_validation_evidence")
+    if validation != metadata.get("v_hold_validation_evidence") or not isinstance(
+        validation, Mapping
+    ):
+        raise ValueError("formal run validation-manifest provenance is missing")
+    validation_path_value = validation.get("path")
+    validation_sha256 = validation.get("sha256")
+    if not isinstance(validation_path_value, str) or not _is_sha256(validation_sha256):
+        raise ValueError("formal run validation ledger identity is malformed")
+    validation_path = run_metadata_path.parent / validation_path_value
+    if not validation_path.is_file() or _file_sha256(validation_path) != validation_sha256:
+        raise ValueError("formal run validation ledger is missing or hash-mismatched")
+
+    boundary_audit = provenance.get("boundary_access_audit")
+    if (
+        not isinstance(boundary_audit, Mapping)
+        or not boundary_audit
+        or boundary_audit != metadata.get("access_audit")
+    ):
+        raise ValueError("formal run boundary-access provenance is missing or contradictory")
+
+    runtime = provenance.get("runtime_and_peak_memory")
+    if not isinstance(runtime, Mapping) or runtime.get("world_size") != metadata.get(
+        "world_size"
+    ):
+        raise ValueError("formal run runtime provenance is malformed")
+    memories = runtime.get("peak_memory_gib_per_rank")
+    world_size = runtime.get("world_size")
+    if (
+        isinstance(world_size, bool)
+        or not isinstance(world_size, int)
+        or world_size < 1
+        or not isinstance(memories, list)
+        or len(memories) != world_size
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(float(value))
+            or float(value) < 0
+            for value in memories
+        )
+    ):
+        raise ValueError("formal run peak-memory provenance is malformed")
+    if provenance.get("checkpoint_policy_version") != _EGOSTITCH_E2E_CHECKPOINT_POLICY:
+        raise ValueError("formal run checkpoint-policy provenance is missing")
+
+    profile_path = run_metadata_path.parent / "profile.json"
+    profile = _load_json_object(profile_path, label="formal runtime profile")
+    if (
+        profile.get("parameter_groups") != parameter_groups
+        or profile.get("peak_memory_gib_per_rank") != memories
+        or profile.get("world_size") != world_size
+        or not isinstance(profile.get("pack_manifest"), Mapping)
+        or not _is_sha256(profile.get("pack_identity_sha256"))
+        or not isinstance(profile.get("pack_evidence"), Mapping)
+    ):
+        raise ValueError("formal runtime profile disagrees with run-produced provenance")
+    return {
+        "run_provenance_sha256": hashlib.sha256(
+            json.dumps(provenance, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+        "runtime_profile_sha256": _file_sha256(profile_path),
+        "checkpoint_policy_version": _EGOSTITCH_E2E_CHECKPOINT_POLICY,
+    }
+
+
 def _validate_e2e_scoring_provenance(
     *,
     registration_path: Path,
     run_metadata_path: Path,
     checkpoint_path: Path,
     checkpoint_id: str,
-    validate_binding_artifacts: bool = True,
 ) -> dict[str, object]:
     """Validate the E2E formal-run provenance required before held-out scoring.
 
@@ -1231,42 +1233,32 @@ def _validate_e2e_scoring_provenance(
     output artifact can be created.
     """
     from src.experiments.e2e_binding import (
-        BINDING_SCHEMA_V1,
         HISTORICAL_V1_ARMS,
-        binding_schema_for_registration,
+        PLAN_SCHEMA_V1,
+        plan_schema_for_registration,
     )
 
     registration = _load_json_object(registration_path, label="registration")
-    if registration.get("status") != "BINDING":
-        raise ValueError("egostitch_e2e candidate/test scoring requires status 'BINDING'")
-    if _contains_required_marker(registration):
-        raise ValueError("BINDING registration still contains REQUIRED-BEFORE-BINDING markers")
-
-    evidence = registration.get("binding_evidence")
-    if not isinstance(evidence, dict):
-        raise ValueError("registration binding_evidence must be an object")
-    schema = binding_schema_for_registration(registration)
-    implementation = evidence.get("implementation")
-    if not isinstance(implementation, dict):
-        raise ValueError("binding_evidence.implementation must be an object")
-    implementation_commit = implementation.get("commit")
-    if not isinstance(implementation_commit, str) or not 7 <= len(implementation_commit) <= 64:
-        raise ValueError("binding_evidence implementation commit must be a 7-64 hex string")
-    if any(character not in "0123456789abcdefABCDEF" for character in implementation_commit):
-        raise ValueError("binding_evidence implementation commit must be a 7-64 hex string")
-
-    configs = evidence.get("configs")
+    schema = plan_schema_for_registration(registration)
+    configs = registration.get("config_artifacts")
+    if schema == PLAN_SCHEMA_V1:
+        historical_evidence = registration.get("binding_evidence")
+        configs = (
+            historical_evidence.get("configs")
+            if isinstance(historical_evidence, Mapping)
+            else None
+        )
     formal_arms = (
         HISTORICAL_V1_ARMS - {"structure_control_6a"}
-        if schema == BINDING_SCHEMA_V1
+        if schema == PLAN_SCHEMA_V1
         else frozenset(_EGOSTITCH_E2E_FORMAL_ARMS)
     )
-    all_arms = HISTORICAL_V1_ARMS if schema == BINDING_SCHEMA_V1 else frozenset(
+    all_arms = HISTORICAL_V1_ARMS if schema == PLAN_SCHEMA_V1 else frozenset(
         _EGOSTITCH_E2E_ARMS
     )
     if not isinstance(configs, dict) or set(configs) != formal_arms:
         raise ValueError(
-            "binding_evidence.configs do not match the registration's trained checkpoint arms"
+            "config_artifacts do not match the registration's trained checkpoint arms"
         )
     registered_arms = registration.get("arms")
     if not isinstance(registered_arms, dict) or set(registered_arms) != all_arms:
@@ -1275,14 +1267,14 @@ def _validate_e2e_scoring_provenance(
         entry = registered_arms.get(trained_arm)
         if (
             not isinstance(entry, dict)
-            or (schema != BINDING_SCHEMA_V1 and entry.get("kind") != "trained_checkpoint")
+            or (schema != PLAN_SCHEMA_V1 and entry.get("kind") != "trained_checkpoint")
             or not isinstance(entry.get("training"), str)
             or not isinstance(entry.get("scoring_provenance"), dict)
         ):
             raise ValueError(f"registration arms.{trained_arm} must be a trained_checkpoint")
     control_modes = (
         {"structure_control_6a": "shuffle_within_pair"}
-        if schema == BINDING_SCHEMA_V1
+        if schema == PLAN_SCHEMA_V1
         else {
             "structure_control_6a_v3": _SCAFFOLD_CONTROL_SHUFFLE_V3,
             "structure_control_6e_v1": _SCAFFOLD_CONTROL_REWIRE_V1,
@@ -1293,9 +1285,9 @@ def _validate_e2e_scoring_provenance(
         scoring_semantics = entry.get("scoring_provenance") if isinstance(entry, dict) else None
         if (
             not isinstance(entry, dict)
-            or (schema != BINDING_SCHEMA_V1 and entry.get("kind") != "scoring_time_control")
+            or (schema != PLAN_SCHEMA_V1 and entry.get("kind") != "scoring_time_control")
             or (
-                schema != BINDING_SCHEMA_V1 and entry.get("checkpoint_arm") != "full"
+                schema != PLAN_SCHEMA_V1 and entry.get("checkpoint_arm") != "full"
             )
             or not isinstance(scoring_semantics, dict)
             or scoring_semantics.get("scaffold_control") != control_mode
@@ -1304,13 +1296,10 @@ def _validate_e2e_scoring_provenance(
             raise ValueError(
                 f"registration arms.{control_arm} must be a scoring_time_control over full"
             )
-    if validate_binding_artifacts:
-        _validate_binding_artifact_digests(evidence, registration_path=registration_path)
-    policy_version = evidence.get("checkpoint_policy_version")
-    if not isinstance(policy_version, str) or not policy_version:
-        raise ValueError("binding_evidence.checkpoint_policy_version must be a non-empty string")
-
     metadata = _load_json_object(run_metadata_path, label="run metadata")
+    run_provenance = _validate_e2e_run_provenance(
+        metadata, run_metadata_path=run_metadata_path
+    )
     if metadata.get("run_kind") != "formal":
         raise ValueError("egostitch_e2e candidate/test scoring rejects debug/non-formal runs")
     if (
@@ -1337,15 +1326,15 @@ def _validate_e2e_scoring_provenance(
     config_evidence = configs[arm_name]
     if not isinstance(config_evidence, dict) or set(config_evidence) != {"path", "sha256"}:
         raise ValueError(
-            f"binding_evidence.configs.{arm_name} must contain exactly path and sha256"
+            f"config_artifacts.{arm_name} must contain exactly path and sha256"
         )
     if config_evidence.get("path") != registered_training:
         raise ValueError(
-            f"binding_evidence config path for {arm_name} does not match arms training"
+            f"registered config path for {arm_name} does not match arms training"
         )
     config_sha256 = config_evidence.get("sha256")
     if not _is_sha256(config_sha256):
-        raise ValueError(f"binding_evidence config SHA-256 for {arm_name} is not 64-hex")
+        raise ValueError(f"registered config SHA-256 for {arm_name} is not 64-hex")
     config_path = _registered_path(
         registration_path,
         registered_training,
@@ -1361,13 +1350,11 @@ def _validate_e2e_scoring_provenance(
     ):
         raise ValueError(f"run metadata config_path does not match arms.{arm_name}.training")
     if metadata.get("config_sha256") != config_sha256:
-        raise ValueError("run metadata config_sha256 does not match binding evidence")
+        raise ValueError("run metadata config_sha256 does not match registered config")
 
     registration_sha256 = _file_sha256(registration_path)
     if metadata.get("preregistration_sha256") != registration_sha256:
         raise ValueError("run metadata preregistration_sha256 does not match registration")
-    if metadata.get("implementation_commit") != implementation_commit:
-        raise ValueError("run metadata implementation_commit does not match binding evidence")
     if metadata.get("checkpoint_id") != checkpoint_id:
         raise ValueError("run metadata checkpoint_id does not match selected checkpoint")
     checkpoint_sha256 = _file_sha256(checkpoint_path)
@@ -1387,8 +1374,9 @@ def _validate_e2e_scoring_provenance(
         "config_path": str(config_path.resolve()),
         "config_sha256": config_sha256,
         "checkpoint_sha256": checkpoint_sha256,
-        "implementation_commit": implementation_commit,
+        "implementation_commit": metadata.get("implementation_commit"),
         "selected_checkpoint_eligible": metadata.get("selected_checkpoint_eligible"),
+        **run_provenance,
     }
 
 
@@ -2241,7 +2229,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--preregistration",
         type=Path,
         default=None,
-        help="BINDING registration required for egostitch_e2e candidate/test scoring",
+        help=(
+            "registration snapshot required for egostitch_e2e candidate/test scoring; "
+            "status is descriptive only"
+        ),
     )
     score.add_argument(
         "--run-metadata",
@@ -2373,18 +2364,14 @@ def _run_score(args: argparse.Namespace) -> None:
         model_family=args.model_family,
         model_config=model_config,
     )
-    binding_artifacts_validated = False
     potentially_heldout_e2e = model_family == "egostitch_e2e" and (
         args.pairs in {"candidate", "test"} or args.pairs.startswith("file:")
     )
-    if potentially_heldout_e2e:
-        if args.preregistration is None:
-            raise ValueError(
-                "egostitch_e2e candidate/test or file scoring requires --preregistration "
-                "before pair access"
-            )
-        _preflight_binding_artifacts_before_pair_access(args.preregistration)
-        binding_artifacts_validated = True
+    if potentially_heldout_e2e and args.preregistration is None:
+        raise ValueError(
+            "egostitch_e2e candidate/test or file scoring requires --preregistration "
+            "before pair access"
+        )
     # Every E2E `file:` source is conservatively held out. Content-equality
     # detection would itself read the path before formal readiness and would
     # miss test subsets/supersets.
@@ -2408,7 +2395,6 @@ def _run_score(args: argparse.Namespace) -> None:
                 run_metadata_path=args.run_metadata,
                 checkpoint_path=args.checkpoint,
                 checkpoint_id=checkpoint_id,
-                validate_binding_artifacts=not binding_artifacts_validated,
             )
         arm_paths: dict[str, Path] = {}
         for item in args.arm_run_metadata:
@@ -2449,7 +2435,6 @@ def _run_score(args: argparse.Namespace) -> None:
                 run_metadata_path=metadata_path,
                 checkpoint_path=arm_checkpoint_path,
                 checkpoint_id=arm_checkpoint_id,
-                validate_binding_artifacts=not binding_artifacts_validated,
             )
         matching_arms = [
             arm
@@ -2481,6 +2466,11 @@ def _run_score(args: argparse.Namespace) -> None:
                     "run_metadata_sha256": provenance["run_metadata_sha256"],
                     "checkpoint_sha256": provenance["checkpoint_sha256"],
                     "config_sha256": provenance["config_sha256"],
+                    "run_provenance_sha256": provenance["run_provenance_sha256"],
+                    "runtime_profile_sha256": provenance["runtime_profile_sha256"],
+                    "checkpoint_policy_version": provenance[
+                        "checkpoint_policy_version"
+                    ],
                     "selected_checkpoint_eligible": provenance.get(
                         "selected_checkpoint_eligible"
                     ),

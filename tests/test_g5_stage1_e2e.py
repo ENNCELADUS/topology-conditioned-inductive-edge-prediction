@@ -19,6 +19,7 @@ from src import score_universe
 from src import train_egostitch as te
 from src.data import internal_holdout
 from src.experiments import b0_cal, g5_stage1, probes
+from src.experiments.e2e_binding import ACTIVE_V4_REGISTRATION_ID
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.e2e_model import EgoStitchE2E
 from src.score_universe import ScoresArtifact, load_scores, save_scores
@@ -695,10 +696,6 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
             },
         },
     }
-    evidence_path = tmp_path / "binding-evidence.json"
-    evidence_path.write_text('{"verified": true}\n')
-    evidence_sha256 = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
-    evidence_artifact = {"path": str(evidence_path), "sha256": evidence_sha256}
     def validation_events(name: str, run_kind: str, epochs: int) -> list[dict[str, object]]:
         raw = [("step_0", None, 0), ("phase_a_end", 1, 1)]
         raw.extend(("epoch_end", epoch, epoch) for epoch in range(1, epochs + 1))
@@ -715,27 +712,26 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
             for ordinal, (kind, epoch, step) in enumerate(raw, start=1)
         ]
 
-    implementation_commit = "4280c4b"
-    preregistration["binding_evidence"] = {
-        "schema_version": "egostitch_e2e_binding_evidence_v2",
-        "implementation": {"commit": implementation_commit},
-        "configs": {
+    implementation_commit = "4" * 40
+    preregistration["config_artifacts"] = {
             name: {
                 "path": str(path),
                 "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             }
             for name, path in arm_config_paths.items()
-        },
-        "parameter_group_manifests": {"fixture": evidence_artifact},
-        "packs_and_validation_manifests": {"fixture": evidence_artifact},
-        "boundary_access_audit": {"fixture": evidence_artifact},
-        "runtime_and_peak_memory": {"fixture": evidence_artifact},
-        "checkpoint_policy_version": "fixture-v1",
     }
+    preregistration["run_evidence_placeholders"] = {
+        "schema_version": "egostitch_e2e_run_provenance_v1",
+        "implementation": None,
+        "parameter_group_manifests": None,
+        "packs_and_validation_manifests": None,
+        "boundary_access_audit": None,
+        "runtime_and_peak_memory": None,
+        "checkpoint_policy_version": None,
+    }
+    preregistration.pop("binding_evidence", None)
     preregistration["evaluator"] = {"seed": 0}
-    preregistration["registration_id"] = (
-        "g5-e2e-stage1-20260729-two-stage-ladder-screen-v4-draft"
-    )
+    preregistration["registration_id"] = ACTIVE_V4_REGISTRATION_ID
     preregistration_path.write_text(json.dumps(preregistration, sort_keys=True, indent=2) + "\n")
     preregistration_sha256 = hashlib.sha256(preregistration_path.read_bytes()).hexdigest()
     run_metadata_paths: dict[str, Path] = {}
@@ -761,6 +757,18 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
         formal_events.write_text(
             "".join(json.dumps(row, sort_keys=True) + "\n" for row in formal_event_rows)
         )
+        parameter_groups = {
+            "names": ["generator"],
+            "sha256": {"generator": "b" * 64},
+        }
+        peak_memory = [1.0, 1.0, 1.0, 1.0]
+        access_audit = {"observed_training_access": []}
+        validation_evidence = {
+            "schema": "egostitch_e2e_v_hold_validation_events_v1",
+            "count": len(formal_event_rows),
+            "path": formal_events.name,
+            "sha256": hashlib.sha256(formal_events.read_bytes()).hexdigest(),
+        }
         meta_path.write_text(
             json.dumps(
                 {
@@ -774,12 +782,12 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
                     "formal_artifacts_published": True,
                     "status": "complete",
                     "validation_role": "V_hold",
-                    "v_hold_validation_evidence": {
-                        "schema": "egostitch_e2e_v_hold_validation_events_v1",
-                        "count": len(formal_event_rows),
-                        "path": formal_events.name,
-                        "sha256": hashlib.sha256(formal_events.read_bytes()).hexdigest(),
-                    },
+                    "v_hold_validation_evidence": validation_evidence,
+                    "world_size": 4,
+                    "feature_stats_sha256": "c" * 64,
+                    "implementation_tracked_clean": True,
+                    "implementation_tracked_status_sha256": hashlib.sha256(b"").hexdigest(),
+                    "access_audit": access_audit,
                     "selected_checkpoint_eligible": True,
                     "model_family": "egostitch_e2e",
                     "permanent_null": permanent_null,
@@ -797,6 +805,30 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
                         f"checkpoint:{name}".encode()
                     ).hexdigest(),
                     "implementation_commit": implementation_commit,
+                    "run_provenance": {
+                        "schema_version": "egostitch_e2e_run_provenance_v1",
+                        "implementation": {
+                            "commit": implementation_commit,
+                            "tracked_clean": True,
+                            "tracked_status_sha256": hashlib.sha256(b"").hexdigest(),
+                        },
+                        "parameter_group_manifests": parameter_groups,
+                        "packs_and_validation_manifests": {
+                            "pipeline_profile_path": "profile.json",
+                            "feature_stats_sha256": "c" * 64,
+                            "v_hold_validation_evidence": validation_evidence,
+                        },
+                        "boundary_access_audit": access_audit,
+                        "runtime_and_peak_memory": {
+                            "world_size": 4,
+                            "epochs_completed": 3,
+                            "optimizer_steps": 3,
+                            "peak_memory_gib_per_rank": peak_memory,
+                        },
+                        "checkpoint_policy_version": (
+                            "egostitch_e2e_all_completed_epochs_v1"
+                        ),
+                    },
                     "training_diagnostics": {
                         "fidelity_series": [{"topology_delta_std": 0.1}],
                         "gradient_norm_series": [
@@ -809,6 +841,18 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
                         ],
                         "kendall_fallback": {"active": False},
                     },
+                }
+            )
+        )
+        (arm_run_dir / "profile.json").write_text(
+            json.dumps(
+                {
+                    "parameter_groups": parameter_groups,
+                    "peak_memory_gib_per_rank": peak_memory,
+                    "world_size": 4,
+                    "pack_manifest": {},
+                    "pack_identity_sha256": "d" * 64,
+                    "pack_evidence": {},
                 }
             )
         )
@@ -828,6 +872,14 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
         scoring_registration = preregistration["arms"][name]
         artifact = load_scores(artifact_path)
         artifact_meta = dict(artifact.meta)
+        run_provenance_by_arm = {
+            arm: score_universe._validate_e2e_run_provenance(
+                json.loads(run_metadata_paths[arm].read_text()),
+                run_metadata_path=run_metadata_paths[arm],
+            )
+            for arm in g5_stage1._E2E_FORMAL_ARMS
+        }
+        source_run_provenance = run_provenance_by_arm[source_arm]
         artifact_meta["formal_scoring_provenance"] = {
             "arm": source_arm,
             "arm_kind": scoring_registration["kind"],
@@ -840,6 +892,11 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
             "checkpoint_sha256": metadata["checkpoint_sha256"],
             "implementation_commit": implementation_commit,
             "selected_checkpoint_eligible": True,
+            "run_provenance_sha256": source_run_provenance["run_provenance_sha256"],
+            "runtime_profile_sha256": source_run_provenance["runtime_profile_sha256"],
+            "checkpoint_policy_version": source_run_provenance[
+                "checkpoint_policy_version"
+            ],
             "scoring_arm": name,
             "all_formal_arms": {
                 arm: {
@@ -849,8 +906,15 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
                     "checkpoint_sha256": json.loads(
                         run_metadata_paths[arm].read_text()
                     )["checkpoint_sha256"],
-                    "config_sha256": preregistration["binding_evidence"]["configs"][arm][
-                        "sha256"
+                    "config_sha256": preregistration["config_artifacts"][arm]["sha256"],
+                    "run_provenance_sha256": run_provenance_by_arm[arm][
+                        "run_provenance_sha256"
+                    ],
+                    "runtime_profile_sha256": run_provenance_by_arm[arm][
+                        "runtime_profile_sha256"
+                    ],
+                    "checkpoint_policy_version": run_provenance_by_arm[arm][
+                        "checkpoint_policy_version"
                     ],
                     "selected_checkpoint_eligible": True,
                 }
@@ -941,28 +1005,6 @@ def _markdown_table(markdown: str, heading: str) -> dict[str, dict[str, str]]:
 
 
 class TestBuildE2EArmSummary:
-    def test_active_v4_binding_evidence_v2_is_accepted(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        registration_path = cast(Path, inputs["preregistration_path"])
-        registration = json.loads(registration_path.read_text())
-
-        g5_stage1._validate_e2e_binding_evidence(registration, registration_path)
-
-    def test_requires_complete_binding_evidence(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        registration_path = _d(inputs)["preregistration_path"]
-        registration = json.loads(registration_path.read_text())
-        registration.pop("binding_evidence", None)
-        registration_path.write_text(json.dumps(registration, sort_keys=True, indent=2) + "\n")
-        registration_sha256 = hashlib.sha256(registration_path.read_bytes()).hexdigest()
-        for metadata_path in _d(inputs["run_metadata_paths"]).values():
-            metadata = json.loads(metadata_path.read_text())
-            metadata["preregistration_sha256"] = registration_sha256
-            metadata_path.write_text(json.dumps(metadata))
-
-        with pytest.raises(g5_stage1.PreregistrationMismatch, match="binding_evidence"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
     def test_requires_scorer_emitted_formal_provenance(self, tmp_path: Path) -> None:
         inputs = _eight_arm_inputs(tmp_path)
         full_path = _d(inputs["arm_universe_paths"])["full"]
@@ -1048,7 +1090,7 @@ class TestBuildE2EArmSummary:
         metadata_path = _d(inputs["run_metadata_paths"])["full"]
         metadata_path.with_name(te.V_HOLD_VALIDATION_EVENTS_FILENAME).unlink()
 
-        with pytest.raises(ValueError, match="validation-event evidence is unreadable"):
+        with pytest.raises(ValueError, match="validation ledger is missing or hash-mismatched"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
     def test_rejects_unknown_arm(self, tmp_path: Path) -> None:
@@ -1156,14 +1198,6 @@ class TestBuildE2EArmSummary:
         inputs["run_metadata_paths"] = dict(inputs["run_metadata_paths"])
         inputs["run_metadata_paths"]["p0"] = bad_meta
         with pytest.raises(g5_stage1.RegistrationShaMismatch, match="does not match"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_requires_binding_registration_status(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        preregistration_path = _d(inputs)["preregistration_path"]
-        preregistration_path.write_text(json.dumps({"status": "DRAFT"}))
-
-        with pytest.raises(g5_stage1.PreregistrationNotBinding, match="status == 'BINDING'"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
     def test_rejects_debug_run_metadata(self, tmp_path: Path) -> None:
@@ -1306,13 +1340,15 @@ class TestBuildE2EArmSummary:
         with pytest.raises(g5_stage1.RegistrationShaMismatch, match="candidate labels"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
-    def test_binding_registration_rejects_b0cal_marker(self, tmp_path: Path) -> None:
+    def test_plan_rejects_non_digest_b0cal_identity(self, tmp_path: Path) -> None:
         inputs = _eight_arm_inputs(tmp_path)
         preregistration_path = _d(inputs)["preregistration_path"]
         registration = json.loads(preregistration_path.read_text())
         registration["frozen_inputs"]["b0cal_results"]["sha256"] = "REQUIRED-BEFORE-BINDING"
         preregistration_path.write_text(json.dumps(registration))
-        with pytest.raises(g5_stage1.PreregistrationMismatch, match="real b0cal_results"):
+        with pytest.raises(
+            g5_stage1.PreregistrationMismatch, match="real frozen b0cal_results"
+        ):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
     def test_missing_submodule_rms_telemetry_does_not_gate_evaluation(

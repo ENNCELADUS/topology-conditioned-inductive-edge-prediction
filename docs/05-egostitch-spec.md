@@ -532,6 +532,19 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-30 (owner decision; supersedes registration-state and pre-run
+  evidence-completeness clauses): formal execution no longer requires
+  `status: BINDING`, resolved `binding_evidence`, or any run-produced evidence
+  to exist before the run that produces it. Registration status and nullable
+  evidence slots are descriptive provenance only. Preflight keeps the exact
+  registration bytes/SHA, registered arm/config and frozen-input identity,
+  clean implementation checkout, repository/runtime boundary, and exactly four
+  visible H20s. Implementation, parameter-group manifests, pack/validation
+  manifests, boundary audit, runtime/peak-memory evidence, and checkpoint-policy
+  provenance must be recorded from the actual run and verified downstream
+  against its artifacts; absent placeholders in the registration cannot block
+  training, scoring, or evaluation. Owner rationale: requiring run-produced
+  evidence before execution was circular and added no artifact-integrity proof.
 - 2026-07-30 (owner decision; supersedes every qualification/formal-ladder and
   model-quality-gate clause below): the active rev-3.2 experiment is a
   **single-stage, plan-bound formal run**. Qualification, calibration,
@@ -777,8 +790,9 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   Π-consistency v2; and the then-proposed V_fit-calibrate → V_qual-rehearsal
   qualification gates, superseded by the 2026-07-29 two-stage cleanup entry above.
   The completed v2 screen's record (§13.19, four trained checkpoints plus one
-  scoring-time control, `n_g = 20`) is unchanged as history; current formal execution
-  instead requires an owner-promoted BINDING v4 registration.
+  scoring-time control, `n_g = 20`) is unchanged as history; formal execution
+  at that time required an owner-promoted BINDING v4 registration, a state gate
+  retired by the latest 2026-07-30 owner decision above.
 - 2026-07-24: gate-side telemetry shape fix. The §13.17 registered names
   `grad_rms_trunk`/`grad_rms_ste`/`grad_rms_content` are published by the
   worker nested under `submodule_gradient_rms` per fixed-replay gradient row;
@@ -1636,22 +1650,20 @@ checkpoint; `b0_e2e_f_only` = control `none`, permanent null `all_head`, primary
 primary `pair_topology`; `p0` = control `none`, permanent null `none`, primary
 `full`. The gate fails closed on any field, checkpoint, row, or label mutation.
 
-**Registration-status enforcement (machine-checked):** a formal training run (no
-`--max-steps`) requires the referenced registration file to carry
-`status: BINDING`; the worker fails closed otherwise before DDP work starts.
-**Retired 2026-07-29 (§12):** this check also required the registration to
-contain no `REQUIRED-BEFORE-BINDING` marker anywhere; that marker and its
-enforcing module (`src/experiments/prebinding_gates.py`) are retired under the
-two-stage cleanup, so the registration schema no longer defines the marker at
-all and this clause is vacuously satisfied for any v4+ registration — retained
-here only as a record of the mechanism that gated pre-cleanup registrations.
-`--max-steps` debug runs accept `DRAFT` registrations but are redirected to
-`*_debug` output directories and never write held-out artifacts. The G5 gate
-requires
-`status: BINDING` and a registration
-sha256 that matches the `preregistration_sha256` of **every** consumed formal run
-metadata. Amending a BINDING registration requires a new versioned registration
-file (predecessor convention).
+**Registration and artifact identity (machine-checked):** the worker snapshots
+and hashes the referenced registration before DDP work; its status field is
+informational and its nullable evidence slots are not preflight inputs. The
+registration SHA-256 must match the `preregistration_sha256` of every consumed
+formal run metadata and score artifact. Exact arm/config/frozen-input identity,
+clean checkout, checkpoint and score digests, data-boundary integrity, and
+append-only test access remain fail-closed. Implementation, parameter-group,
+pack/validation, boundary-audit, runtime/peak-memory, and checkpoint-policy
+evidence is produced by the run and validated from run metadata/artifacts, never
+required to be non-null in the registration before execution. `--max-steps`
+debug runs remain redirected to `*_debug` output directories and may not publish
+held-out artifacts. Registration amendments use a new versioned file so existing
+artifact hashes remain interpretable; this versioning rule is independent of the
+descriptive status field.
 
 **Grounded-identity-match flag (e2e content tokens, pinned 2026-07-17):** for a
 pair `(i, j)`, slot `k` of endpoint `u ∈ {i, j}` is grounded-identity-matched
@@ -1709,9 +1721,15 @@ record the plan SHA-256, live implementation/config identities, V_hold evaluatio
 ledger, selected-checkpoint identity and digest, score-artifact provenance, and
 append-only test-access ledger.
 
-Execution is authorized by the experiment owner after the registration is promoted
-to `BINDING`; no preliminary run, metric threshold, automated gate, note, or agent
-may promote it or substitute for that owner decision.
+Registration status is descriptive and is not an execution state machine. A
+`DRAFT`, `BINDING`, or other status value cannot authorize or block training,
+scoring, or evaluation. Likewise, nullable registration evidence fields are
+forward declarations of provenance to be produced by the run, not preconditions.
+Downstream consumers validate the actual run-produced implementation,
+parameter-group, pack/validation, boundary-audit, runtime/peak-memory, and
+checkpoint-policy provenance together with exact registration/config/checkpoint/
+artifact identity. The registration file itself remains immutable during a run
+and its SHA-256 remains part of every artifact chain.
 
 ## 14. Approved successor headline: E2E stitched-topology-conditioned pair encoder (2026-07-16)
 
@@ -1723,8 +1741,8 @@ Stage-1 screen and its retained implementation on `main`. That screen published 
 binding `cut` verdict on 2026-07-17, satisfying §14.3(1). **§5/§13 were rewritten to §14 on
 2026-07-17** (change-log entry above): §14 plus the rewritten §5/§13 are now the
 normative implementation contract for family `egostitch_e2e`. A formal e2e run
-additionally requires a fresh Stage-1 registration with `status: BINDING`
-(§13.18 enforcement); the rewrite alone authorizes implementation, not execution.
+requires an exact Stage-1 registration snapshot and records its SHA-256; registration
+status and empty run-produced-evidence placeholders are not execution gates.
 
 ### 14.1 Architecture summary
 
@@ -1775,7 +1793,12 @@ pair-pass pin extends to trunk, STE, gates, and head
 within-checkpoint `f_logit` (no frozen-s0 comparator artifact); the §13.10 s0 logit
 cache is retired for this family.
 
-### 14.3 Landing conditions (all required before a binding e2e run)
+### 14.3 Implementation and experiment-plan record
+
+The items below document the architecture and experiment-plan lineage. They are
+not a registration-status or evidence-completeness preflight. Formal launcher
+preflight is limited to the live repository/runtime boundary, clean checkout,
+exact registration/config/frozen-input identity, and exactly four visible H20s.
 
 1. Frozen-s0 screen published (its outcome is the successor's motivating arm).
    **Satisfied 2026-07-17:** binding verdict `cut`; result note
@@ -1784,16 +1807,15 @@ cache is retired for this family.
    (`ste_layers = 3`, `ste_dim = 128`, `xattn_heads = 8`, `n_inj` default 1 sweep
    {1, 2}).
    **Satisfied 2026-07-17:** §5/§13 rewritten (change-log entry); §13.18 landed
-   with the defaults, `permanent_null` overrides, `shuffle_within_pair` control,
-   and registration-status enforcement.
+   with the defaults, `permanent_null` overrides, and `shuffle_within_pair` control.
 3. Fresh v4 registration with the eight-arm scope in §14.4.6 (six trained
    checkpoints plus two scoring-time controls), the four-logit decomposition
    report, the representation-probe protocol (degree / ego density / clustering +
    degree-partialled + Π-consistency, frozen-encoder linear probes on held-out
    message-partition nodes), the pathway-attribution decision rule, and a measured
    H20 cost re-estimate (the 673 s / 2.04 GiB frozen-s0 Stage-1 profile does not
-   extrapolate; budget class is the E2 B0 run). The v4 registration is currently
-   `DRAFT`; only the owner may promote a fully resolved successor content state.
+   extrapolate; budget class is the E2 B0 run). The v4 registration status is
+   descriptive; runtime and peak-memory evidence are emitted by the formal run.
 4. Implementation plan:
    `docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md`
    (B0.py untouched; conditioned trunk subclass; train-mask ≡ eval-bypass and
@@ -1806,8 +1828,8 @@ recorded, with full rationale and the four-round review trail, in
 `docs/superpowers/specs/2026-07-25-egostitch-e2e-relational-repair-design.md`
 (r5). Phase-0 audit evidence is archived under `outputs/p0_audit_20260725/`
 (local P0.2/P0.4; container P0.1/P0.3). This section **authorizes
-implementation only**; execution requires a fresh v4 registration (§12,
-2026-07-29 entry) with `status: BINDING` (§13.18 enforcement). §13.19 remains
+implementation only**; execution records the exact v4 registration bytes and
+SHA-256 but does not gate on its status or nullable run-produced evidence. §13.19 remains
 the completed v2 screen's binding record; §14.4 supersedes it for rev-3.1
 only where stated.
 All generated/stitched structure remains intermediate context for the binary

@@ -751,9 +751,6 @@ def produce_e2e_probe_artifact(
     probe_registration = cast(
         Mapping[str, object] | None, registration_payload.get("probe_artifact")
     )
-    registration_status = registration_payload.get("status")
-    if registration_status != "BINDING":
-        raise ValueError("formal E2E probe production requires a BINDING preregistration")
     registered_format = (
         probe_registration.get("format") if probe_registration is not None else None
     )

@@ -6,7 +6,7 @@ import hashlib
 import inspect
 import json
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -49,18 +49,11 @@ def test_checkpoint_quality_predicate_remains_available_as_telemetry() -> None:
     assert te.select_e2e_checkpoint([record], "full") == record
 
 
-def test_binding_preflight_keeps_truthfulness_sections_and_drops_qualification() -> None:
-    source = inspect.getsource(te._validate_e2e_formal_binding)
-    for section in (
-        "parameter_group_manifests",
-        "packs_and_validation_manifests",
-        "boundary_access_audit",
-        "runtime_and_peak_memory",
-    ):
-        assert section in source
-    assert "qualification_attempts" not in source
-    assert "qualification_history_indexes" not in source
-    assert "validate_bound_calibration" not in source
+def test_formal_plan_preflight_does_not_read_status_or_run_evidence() -> None:
+    source = inspect.getsource(te._validate_e2e_formal_plan)
+    assert 'snapshot.payload.get("status")' not in source
+    assert "binding_evidence" not in source
+    assert "run_evidence_placeholders" not in source
 
 
 def _training_config(tmp_path: Path) -> Path:
@@ -128,7 +121,7 @@ def test_e2e_config_schema_is_strict_and_preserves_run_kind(tmp_path: Path) -> N
 
 
 
-def test_formal_binding_preflight_validates_live_config_and_commit(
+def test_formal_plan_preflight_validates_live_config_and_clean_commit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root = Path(__file__).resolve().parents[1]
@@ -142,21 +135,9 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
         "cosine_pool": "configs/egostitch_e2e_v3_cosine_pool_breadth_first.yaml",
         "no_l_rel": "configs/egostitch_e2e_v3_no_l_rel_breadth_first.yaml",
     }
-    artifact = tmp_path / "binding-artifact.json"
-    artifact.write_text('{"status":"pass"}\n')
-    artifact_record = {"path": str(artifact), "sha256": te._sha256_file(artifact)}
-    evidence: dict[str, object] = {
-        "schema_version": "egostitch_e2e_binding_evidence_v2",
-        "implementation": {"commit": "a" * 40},
-        "configs": {
+    configs: dict[str, object] = {
             arm: {"path": path, "sha256": te._sha256_file(root / path)}
             for arm, path in arm_paths.items()
-        },
-        "parameter_group_manifests": dict(artifact_record),
-        "packs_and_validation_manifests": dict(artifact_record),
-        "boundary_access_audit": dict(artifact_record),
-        "runtime_and_peak_memory": dict(artifact_record),
-        "checkpoint_policy_version": "v1",
     }
     registration: dict[str, object] = {
         "registration_id": ACTIVE_V4_REGISTRATION_ID,
@@ -176,7 +157,12 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
                     "checkpoint_arm": "full",
                 },
         },
-        "binding_evidence": evidence,
+        "status": "DRAFT",
+        "config_artifacts": configs,
+        "run_evidence_placeholders": {
+            "implementation": None,
+            "runtime_and_peak_memory": None,
+        },
     }
     snapshot = te.PreregistrationSnapshot(registration, "f" * 64)
 
@@ -184,23 +170,18 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
         return SimpleNamespace(stdout=("a" * 40 + "\n") if "rev-parse" in command else "")
 
     monkeypatch.setattr(te.subprocess, "run", fake_run)
-    binding = te._validate_e2e_formal_binding(cfg, snapshot, config_path)
+    plan = te._validate_e2e_formal_plan(cfg, snapshot, config_path)
 
-    assert binding["arm"] == "full"
-    assert binding["config_sha256"] == te._sha256_file(config_path)
+    assert plan["arm"] == "full"
+    assert plan["implementation_commit"] == "a" * 40
+    assert plan["config_sha256"] == te._sha256_file(config_path)
 
-
-    v2_configs = cast(dict[str, object], evidence["configs"])
-    evidence["configs"] = {
-        name: entry for name, entry in v2_configs.items() if name not in {"cosine_pool", "no_l_rel"}
+    snapshot.payload["config_artifacts"] = {
+        name: entry for name, entry in configs.items() if name not in {"cosine_pool", "no_l_rel"}
     }
-    with pytest.raises(te.PreregistrationNotBinding, match="trained checkpoint arms"):
-        te._validate_e2e_formal_binding(cfg, snapshot, config_path)
-    evidence["configs"] = {**v2_configs, "unknown": v2_configs["full"]}
-    with pytest.raises(te.PreregistrationNotBinding, match="trained checkpoint arms"):
-        te._validate_e2e_formal_binding(cfg, snapshot, config_path)
-    evidence["configs"] = v2_configs
-
+    with pytest.raises(te.FormalPlanMismatch, match="trained checkpoint arms"):
+        te._validate_e2e_formal_plan(cfg, snapshot, config_path)
+    snapshot.payload["config_artifacts"] = configs
 
     registered_arms = cast(dict[str, object], snapshot.payload["arms"])
     snapshot.payload["arms"] = {
@@ -210,48 +191,26 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
         },
         "structure_control_6a": registered_arms["structure_control_6a_v3"],
     }
-    with pytest.raises(te.PreregistrationNotBinding, match="incompatible arm identity schema"):
-        te._validate_e2e_formal_binding(cfg, snapshot, config_path)
+    with pytest.raises(te.FormalPlanMismatch, match="incompatible arm identity schema"):
+        te._validate_e2e_formal_plan(cfg, snapshot, config_path)
     snapshot.payload["arms"] = {**registered_arms, "unknown": registered_arms["full"]}
-    with pytest.raises(te.PreregistrationNotBinding, match="incompatible arm identity schema"):
-        te._validate_e2e_formal_binding(cfg, snapshot, config_path)
+    with pytest.raises(te.FormalPlanMismatch, match="incompatible arm identity schema"):
+        te._validate_e2e_formal_plan(cfg, snapshot, config_path)
     snapshot.payload["arms"] = registered_arms
 
-    def fake_run_descent(diff_paths: str, ancestor_rc: int) -> Callable[..., SimpleNamespace]:
-        def runner(command: list[str], **_: object) -> SimpleNamespace:
-            if "rev-parse" in command:
-                return SimpleNamespace(stdout="b" * 40 + "\n", returncode=0)
-            if "merge-base" in command:
-                return SimpleNamespace(stdout="", returncode=ancestor_rc)
-            if "diff" in command:
-                return SimpleNamespace(stdout=diff_paths, returncode=0)
-            return SimpleNamespace(stdout="", returncode=0)
+    def dirty_run(command: list[str], **_: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            stdout=("b" * 40 + "\n") if "rev-parse" in command else "src/train_b0.py\n"
+        )
 
-        return runner
-
-    monkeypatch.setattr(
-        "src.train_egostitch.subprocess.run",
-        fake_run_descent("docs/registrations/g5_e2e_stage1_preregistration_v2.json\n", 0),
-    )
-    assert te._validate_e2e_formal_binding(cfg, snapshot, config_path)["arm"] == "full"
-    monkeypatch.setattr(
-        "src.train_egostitch.subprocess.run",
-        fake_run_descent("docs/registrations/x.json\nsrc/train_b0.py\n", 0),
-    )
-    with pytest.raises(te.PreregistrationNotBinding, match="clean live checkout"):
-        te._validate_e2e_formal_binding(cfg, snapshot, config_path)
-    monkeypatch.setattr("src.train_egostitch.subprocess.run", fake_run_descent("", 1))
-    with pytest.raises(te.PreregistrationNotBinding, match="clean live checkout"):
-        te._validate_e2e_formal_binding(cfg, snapshot, config_path)
-    monkeypatch.setattr("src.train_egostitch.subprocess.run", fake_run)
-    artifact.unlink()
-    with pytest.raises(te.PreregistrationNotBinding, match="missing or hash-mismatched"):
-        te._validate_e2e_formal_binding(cfg, snapshot, config_path)
-    artifact.write_text('{"status":"pass"}\n')
+    monkeypatch.setattr(te.subprocess, "run", dirty_run)
+    with pytest.raises(te.FormalPlanMismatch, match="clean live checkout"):
+        te._validate_e2e_formal_plan(cfg, snapshot, config_path)
+    monkeypatch.setattr(te.subprocess, "run", fake_run)
     mismatched_config = tmp_path / config_path.name
     mismatched_config.write_bytes(config_path.read_bytes() + b"\n# digest mismatch\n")
-    with pytest.raises(te.PreregistrationNotBinding, match="live config digest"):
-        te._validate_e2e_formal_binding(cfg, snapshot, mismatched_config)
+    with pytest.raises(te.FormalPlanMismatch, match="live config digest"):
+        te._validate_e2e_formal_plan(cfg, snapshot, mismatched_config)
 
 
 
@@ -304,6 +263,10 @@ def test_formal_output_metadata_matches_scorer_contract(
         counterfactual_stop_epoch=None,
         runtime_profile={
             "selected_epoch": 10,
+            "epochs_completed": 30,
+            "optimizer_steps": 2340,
+            "peak_memory_gib_per_rank": [1.0, 1.0, 1.0, 1.0],
+            "parameter_groups": {"names": ["generator"], "sha256": {"generator": "a" * 64}},
             "gradient_norm_series": [],
             "optimizer_step_gradients": [],
             "kendall_fallback": {},
@@ -320,7 +283,7 @@ def test_formal_output_metadata_matches_scorer_contract(
         data,
         world_size=4,
         config_path=config_path,
-        formal_binding={"implementation_commit": "a" * 40},
+        formal_plan={"implementation_commit": "a" * 40},
     )
     te.write_outputs(result, cfg, data)
 
@@ -342,6 +305,9 @@ def test_formal_output_metadata_matches_scorer_contract(
     assert metadata["checkpoint_sha256"] == te._sha256_file(cfg.output_dir / "best.pt")
     assert te._E2E_VALIDATION_ROLE == "V_hold"
     assert metadata["validation_role"] == "V_hold"
+    assert metadata["run_provenance"]["checkpoint_policy_version"] == (
+        te.E2E_CHECKPOINT_POLICY_VERSION
+    )
 
 
 

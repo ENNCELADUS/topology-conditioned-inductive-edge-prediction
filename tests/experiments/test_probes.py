@@ -456,36 +456,6 @@ class TestE2EProbeArtifact:
             graph.copy(), limit=2
         )
 
-    def test_producer_rejects_draft_registration(self, tmp_path: Path) -> None:
-        registration = tmp_path / "registration.json"
-        registration.write_text(
-            json.dumps(
-                {
-                    "status": "DRAFT",
-                    "probe_artifact": {
-                        "format": "egostitch_e2e_probe_v2",
-                        "source_arm": "full",
-                        "expected_path": str(tmp_path / "probe.npz"),
-                    },
-                    "arms": {"full": {"training": str(tmp_path / "full.yaml")}},
-                }
-            ),
-            encoding="utf-8",
-        )
-        metadata = tmp_path / "run_metadata.json"
-        metadata.write_text("{}", encoding="utf-8")
-
-        with pytest.raises(ValueError, match="BINDING preregistration"):
-            probes.produce_e2e_probe_artifact(
-                checkpoint_path=tmp_path / "best.pt",
-                run_metadata_path=metadata,
-                preregistration_path=registration,
-                data_root=tmp_path / "data",
-                strategy="breadth_first",
-                output_path=tmp_path / "probe.npz",
-                scope="formal_train",
-            )
-
     @pytest.mark.parametrize("retired_scope", ["calibration_fit", "qualification_qual"])
     def test_producer_rejects_the_retired_prebinding_scopes(
         self, tmp_path: Path, retired_scope: str
@@ -515,7 +485,7 @@ class TestE2EProbeArtifact:
         registration.write_text(
             json.dumps(
                 {
-                    "status": "BINDING",
+                    "status": "DRAFT",
                     "probe_artifact": {
                         "format": "egostitch_e2e_probe_v2",
                         "source_arm": "full",
