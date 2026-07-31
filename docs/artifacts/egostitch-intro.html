@@ -139,6 +139,7 @@ h2 { margin: 0; font: 600 28px/1.1 var(--serif); letter-spacing: -.02em; }
 .swatch.topo { background: var(--blue-soft); border-color: var(--blue-line); }
 .swatch.content { background: var(--amber-soft); border-color: var(--amber-line); }
 .swatch.generated { background: var(--green-soft); border-color: var(--green-line); }
+.swatch.artifact { background: var(--surface-2); border-color: var(--rule-strong); border-style: dashed; }
 .dash { width: 18px; border-top: 2px dashed var(--red); }
 
 .math-ribbon {
@@ -229,6 +230,10 @@ svg .flow { fill: none; stroke: #73818b; stroke-width: 1.55; }
 svg .flow-blue { fill: none; stroke: var(--blue); stroke-width: 1.75; }
 svg .flow-amber { fill: none; stroke: var(--amber); stroke-width: 1.75; }
 svg .flow-red { fill: none; stroke: var(--red); stroke-width: 1.45; stroke-dasharray: 6 4; }
+svg .flow, svg .flow-blue, svg .flow-amber, svg .flow-red {
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
 svg .node { fill: var(--green-soft); stroke: var(--green); stroke-width: 1.3; }
 svg .anchor { fill: var(--blue); stroke: var(--blue); stroke-width: 1.3; }
 svg .slot { fill: var(--surface); stroke: var(--green); stroke-width: 1.2; }
@@ -237,6 +242,20 @@ svg .matrix-cell { stroke: var(--surface); stroke-width: 1; }
 svg .edge-star { stroke: var(--green); stroke-width: 1.5; }
 svg .edge-intra { stroke: var(--blue); stroke-width: 1.8; }
 svg .edge-align { stroke: var(--amber); stroke-width: 1.7; stroke-dasharray: 4 3; }
+svg .edge-close { stroke: var(--red); stroke-width: 1.4; stroke-dasharray: 3 3; fill: none; }
+
+/* Artifact cards: the tensor/graph object handed from one module to the next. */
+svg .art { fill: var(--surface-2); stroke: var(--rule-strong); stroke-width: 1.1; stroke-dasharray: 5 3; }
+svg .art-tag { font-family: var(--mono); font-size: 8px; font-weight: 700; letter-spacing: .7px; fill: var(--ink-3); }
+svg .sub { fill: #fff; stroke: var(--rule-strong); stroke-width: 1; }
+svg .sub-blue { fill: #fff; stroke: var(--blue-line); stroke-width: 1; }
+svg .sub-amber { fill: #fff; stroke: var(--amber-line); stroke-width: 1; }
+svg .sub-dark { fill: #4a5964; stroke: #4a5964; }
+svg .s-white { font-size: 12px; font-weight: 700; fill: #fff; }
+svg .s-white-s { font-size: 9.5px; font-weight: 600; fill: #dce4e9; }
+svg .s-white-mono { font-family: var(--mono); font-size: 9px; fill: #dce4e9; }
+svg .s-tiny { font-size: 8.5px; font-weight: 500; fill: var(--ink-3); }
+svg .s-mono-b { font-family: var(--mono); font-size: 9px; font-weight: 700; fill: var(--ink); }
 
 @media print {
   body { background: white; }
@@ -268,116 +287,379 @@ svg .edge-align { stroke: var(--amber); stroke-width: 1.7; stroke-dasharray: 4 3
       <span class="section-note">solid: inference · dashed: training only</span>
     </div>
     <figure class="figure-card">
-      <svg viewBox="0 0 1320 470" role="img" aria-labelledby="overview-svg-title overview-svg-desc">
-        <title id="overview-svg-title">EgoStitch overall model architecture and data flow</title>
-        <desc id="overview-svg-desc">Two unseen endpoint features are tokenized and decoded into imagined neighbor slots. The slots directly supply content tokens, while Sinkhorn alignment and scaffold stitching supply structure-only topology tokens. Both pathways condition a symmetric raw-token pair classifier. Training-only supervision is shown below with dashed red arrows.</desc>
+      <svg viewBox="0 0 1320 1900" role="img" aria-labelledby="overview-svg-title overview-svg-desc">
+        <title id="overview-svg-title">EgoStitch end-to-end network architecture, top to bottom</title>
+        <desc id="overview-svg-desc">A top-to-bottom network diagram. Raw endpoint token streams enter a Siamese transformer encoder on the left. Endpoint features and a grounding pool enter the Stage-1 generator on the right: feature standardization, TokenizeLite, and a DETR-style ImagineDecoder that emits K neighbor slots. The slot sets split into a topology branch (Sinkhorn alignment, typed scaffold assembly, structure-only message-passing encoder) and a content branch (grounded identity match, content-token assembly, linear projection). Both produce token streams that condition the cls token of the last conditioned pair-trunk layer through zero-initialized gated cross-attention. A gated readout, order-invariant max fusion, and an MLP head produce the binary edge probability. Solid boxes are network modules; dashed cards are the intermediate artifacts passed between them; dashed red cards on the left are training-only supervision.</desc>
         <defs>
           <marker id="arrow" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#73818b"/></marker>
           <marker id="arrow-blue" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#2d67a3"/></marker>
           <marker id="arrow-amber" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#a76318"/></marker>
           <marker id="arrow-red" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#b34f43"/></marker>
+          <marker id="arrow-lblue" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#a9c9e8"/></marker>
+          <marker id="arrow-lamber" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#e8c68d"/></marker>
         </defs>
 
-        <text class="s-micro" x="18" y="27">INFERENCE FORWARD PATH</text>
-        <rect class="box" x="18" y="49" width="150" height="160" rx="8"/>
-        <text class="s-title" x="93" y="73" text-anchor="middle">Unseen pair</text>
-        <circle class="anchor" cx="64" cy="116" r="16"/><text x="64" y="120" text-anchor="middle" style="font-size:12px;font-weight:700;fill:white">i</text>
-        <circle class="anchor" cx="122" cy="116" r="16"/><text x="122" y="120" text-anchor="middle" style="font-size:12px;font-weight:700;fill:white">j</text>
-        <line x1="80" y1="116" x2="106" y2="116" stroke="#b9b4a9" stroke-width="1.2" stroke-dasharray="3 3"/>
-        <text class="s-mono" x="93" y="156" text-anchor="middle">x_i, x_j</text>
-        <text class="s-small" x="93" y="179" text-anchor="middle">frozen endpoint</text>
-        <text class="s-small" x="93" y="193" text-anchor="middle">features only</text>
+        <!-- ============================ 00 INPUTS ============================ -->
+        <text class="s-micro" x="40" y="24">00 / INPUT · ONE QUERIED PAIR (u, v) OF UNSEEN NODES · NO OBSERVED TEST TOPOLOGY</text>
+        <text class="s-micro" x="1280" y="24" text-anchor="end">SOLID BOX = NETWORK MODULE · DASHED CARD = ARTIFACT PASSED BETWEEN MODULES</text>
 
-        <path class="flow" d="M168 129 H205" marker-end="url(#arrow)"/>
-        <rect class="box-green" x="208" y="49" width="190" height="160" rx="8"/>
-        <text class="s-title" x="303" y="73" text-anchor="middle">Imagine ego slots</text>
-        <circle class="anchor" cx="259" cy="125" r="12"/>
-        <circle class="slot" cx="236" cy="98" r="8"/><circle class="slot" cx="283" cy="94" r="8"/><circle class="slot" cx="291" cy="132" r="8"/><circle class="slot-faint" cx="244" cy="151" r="8"/>
-        <line class="edge-star" x1="259" y1="125" x2="236" y2="98"/><line class="edge-star" x1="259" y1="125" x2="283" y2="94"/><line class="edge-star" x1="259" y1="125" x2="291" y2="132"/><line class="edge-star" x1="259" y1="125" x2="244" y2="151"/>
-        <text class="s-mono" x="330" y="111">h · π · m · g</text>
-        <text class="s-mono" x="330" y="131">Â adjacency</text>
-        <text class="s-small" x="303" y="184" text-anchor="middle">DETR-style set decoder</text>
+        <rect class="box" x="40" y="34" width="360" height="74" rx="7"/>
+        <text class="s-label" x="60" y="56">Raw token streams</text>
+        <text class="s-mono" x="60" y="76">emb_a, emb_b  (B, L, 1536)</text>
+        <text class="s-small" x="60" y="94">len_a, len_b · per-item evidence tokens</text>
 
-        <path class="flow" d="M398 129 H435" marker-end="url(#arrow)"/>
-        <rect class="box-green" x="438" y="49" width="190" height="160" rx="8"/>
-        <text class="s-title" x="533" y="73" text-anchor="middle">Align + stitch</text>
-        <rect x="459" y="92" width="54" height="54" rx="3" fill="#fff" stroke="#ddbf8e"/>
-        <rect class="matrix-cell" x="463" y="96" width="13" height="13" fill="#f1d29f"/><rect class="matrix-cell" x="477" y="96" width="13" height="13" fill="#f8e8ca"/><rect class="matrix-cell" x="491" y="96" width="13" height="13" fill="#e5b568"/>
-        <rect class="matrix-cell" x="463" y="110" width="13" height="13" fill="#fbf1df"/><rect class="matrix-cell" x="477" y="110" width="13" height="13" fill="#d99b43"/><rect class="matrix-cell" x="491" y="110" width="13" height="13" fill="#f5ddb6"/>
-        <rect class="matrix-cell" x="463" y="124" width="13" height="13" fill="#e7bb77"/><rect class="matrix-cell" x="477" y="124" width="13" height="13" fill="#f7e4c4"/><rect class="matrix-cell" x="491" y="124" width="13" height="13" fill="#edca91"/>
-        <text class="s-mono" x="486" y="160" text-anchor="middle">Π</text>
-        <circle class="anchor" cx="562" cy="111" r="9"/><circle class="anchor" cx="603" cy="132" r="9"/>
-        <circle class="slot" cx="546" cy="88" r="6"/><circle class="slot" cx="577" cy="84" r="6"/><circle class="slot" cx="589" cy="105" r="6"/><circle class="slot" cx="615" cy="105" r="6"/><circle class="slot" cx="620" cy="153" r="6"/><circle class="slot" cx="584" cy="156" r="6"/>
-        <line class="edge-star" x1="562" y1="111" x2="546" y2="88"/><line class="edge-star" x1="562" y1="111" x2="577" y2="84"/><line class="edge-star" x1="562" y1="111" x2="589" y2="105"/>
-        <line class="edge-star" x1="603" y1="132" x2="615" y2="105"/><line class="edge-star" x1="603" y1="132" x2="620" y2="153"/><line class="edge-star" x1="603" y1="132" x2="584" y2="156"/>
-        <line class="edge-align" x1="577" y1="84" x2="615" y2="105"/><line class="edge-align" x1="589" y1="105" x2="584" y2="156"/>
-        <text class="s-small" x="533" y="184" text-anchor="middle">generated scaffold T̂_ij</text>
+        <rect class="box" x="424" y="34" width="400" height="74" rx="7"/>
+        <text class="s-label" x="444" y="56">Endpoint features</text>
+        <text class="s-mono" x="444" y="76">x_a, x_b  (B, 1536)</text>
+        <text class="s-small" x="444" y="94">frozen F0 mean-pool · d = input_dim</text>
 
-        <path class="flow-blue" d="M628 113 H665" marker-end="url(#arrow-blue)"/>
-        <path class="flow-amber" d="M398 184 V207 H674 V168 H688" marker-end="url(#arrow-amber)"/>
-        <text class="s-micro" x="533" y="201" text-anchor="middle" style="fill:#a76318">CONTENT DIRECTLY FROM S_i, S_j</text>
-        <rect class="box" x="668" y="49" width="236" height="160" rx="8"/>
-        <text class="s-title" x="786" y="73" text-anchor="middle">Separate evidence</text>
-        <rect class="box-blue" x="688" y="91" width="196" height="43" rx="5"/>
-        <text class="s-label" x="703" y="108">Topology tokens</text><text class="s-mono" x="703" y="123">STE(T̂_ij) · no slot h</text>
-        <rect class="box-amber" x="688" y="146" width="196" height="43" rx="5"/>
-        <text class="s-label" x="703" y="163">Content tokens</text><text class="s-mono" x="703" y="178">h · π · g · identity</text>
+        <rect class="box" x="848" y="34" width="432" height="74" rx="7"/>
+        <text class="s-label" x="868" y="56">Grounding pool</text>
+        <text class="s-mono" x="868" y="76">ground_a, ground_b  (B, n_g = 20, 1536)</text>
+        <text class="s-small" x="868" y="94">candidate real neighbors the slots may point at</text>
 
-        <path class="flow-blue" d="M904 113 H944 V94 H974" marker-end="url(#arrow-blue)"/>
-        <path class="flow-amber" d="M904 168 H944 V177 H974" marker-end="url(#arrow-amber)"/>
-        <rect class="box-dark" x="977" y="49" width="205" height="160" rx="8"/>
-        <text x="1079.5" y="73" text-anchor="middle" style="font-size:14px;font-weight:700;fill:white">Symmetric pair trunk</text>
-        <text x="1079.5" y="98" text-anchor="middle" style="font-family:var(--mono);font-size:9px;fill:#dce4e9">tok_i ⇄ tok_j</text>
-        <rect x="998" y="112" width="163" height="25" rx="3" fill="#4a5964"/>
-        <text x="1079.5" y="128" text-anchor="middle" style="font-size:9px;font-weight:600;fill:white">gated cross-attention</text>
-        <rect x="998" y="146" width="75" height="25" rx="3" fill="#4a5964"/><rect x="1086" y="146" width="75" height="25" rx="3" fill="#4a5964"/>
-        <text x="1035.5" y="162" text-anchor="middle" style="font-family:var(--mono);font-size:9px;fill:white">AB</text><text x="1123.5" y="162" text-anchor="middle" style="font-family:var(--mono);font-size:9px;fill:white">BA</text>
-        <text x="1079.5" y="190" text-anchor="middle" style="font-family:var(--mono);font-size:9px;fill:#dce4e9">abba_max</text>
+        <path class="flow" d="M220 108 V134" marker-end="url(#arrow)"/>
+        <path class="flow" d="M624 108 V134" marker-end="url(#arrow)"/>
+        <path class="flow" d="M1064 108 V134" marker-end="url(#arrow)"/>
 
-        <path class="flow" d="M1182 129 H1214" marker-end="url(#arrow)"/>
-        <rect class="box-blue" x="1217" y="76" width="85" height="106" rx="8"/>
-        <text class="s-micro" x="1259.5" y="98" text-anchor="middle">OUTPUT</text>
-        <text x="1259.5" y="130" text-anchor="middle" style="font-family:var(--serif);font-size:25px;font-weight:600;fill:#2d67a3">p<tspan baseline-shift="sub" font-size="13">ij</tspan></text>
-        <text class="s-small" x="1259.5" y="152" text-anchor="middle">edge exists?</text>
-        <text class="s-mono" x="1259.5" y="168" text-anchor="middle">∈ [0,1]</text>
+        <!-- ==================== 01 RAW-TOKEN PAIR EVIDENCE ==================== -->
+        <text class="s-micro" x="40" y="130">01 / RAW-TOKEN PAIR EVIDENCE</text>
+        <rect class="box" x="40" y="140" width="360" height="150" rx="7"/>
+        <text class="s-title" x="220" y="166" text-anchor="middle">SiameseEncoder</text>
+        <text class="s-mono" x="220" y="190" text-anchor="middle">input_projection  1536 → 512</text>
+        <text class="s-mono" x="220" y="212" text-anchor="middle">3 × TransformerEncoderLayer</text>
+        <text class="s-small" x="220" y="230" text-anchor="middle">d = 512 · 8 heads · FFN 2048 · dropout .1</text>
+        <text class="s-mono" x="220" y="252" text-anchor="middle">output_norm  LayerNorm(512)</text>
+        <text class="s-tiny" x="220" y="274" text-anchor="middle">shared weights both sides · a self-pair encodes once</text>
 
-        <line x1="18" y1="243" x2="1302" y2="243" stroke="#d8d3c8"/>
-        <text class="s-micro" x="18" y="270" style="fill:#b34f43">TRAINING-ONLY SUPERVISION</text>
-        <rect class="box-red" x="50" y="297" width="260" height="98" rx="7"/>
-        <text class="s-title" x="180" y="320" text-anchor="middle">Message-partition neighbors</text>
-        <text class="s-small" x="180" y="342" text-anchor="middle">Hungarian slot targets · feature · existence</text>
-        <text class="s-small" x="180" y="358" text-anchor="middle">multiplicity · degree · adjacency</text>
-        <text class="s-mono" x="180" y="380" text-anchor="middle">L_recon + L_real + L_ssl</text>
-        <path class="flow-red" d="M180 297 V231 H303 V211" marker-end="url(#arrow-red)"/>
+        <path class="flow" d="M220 290 V304" marker-end="url(#arrow)"/>
+        <rect class="art" x="40" y="308" width="360" height="110" rx="6"/>
+        <text class="art-tag" x="58" y="328">ARTIFACT · ENCODED TOKEN STREAM</text>
+        <rect class="box-blue" x="60" y="338" width="24" height="42" rx="2"/><rect class="box-blue" x="90" y="338" width="24" height="42" rx="2"/><rect class="box-blue" x="120" y="338" width="24" height="42" rx="2"/><rect class="box-blue" x="150" y="338" width="24" height="42" rx="2"/><rect class="box-blue" x="180" y="338" width="24" height="42" rx="2"/><rect class="box-blue" x="210" y="338" width="24" height="42" rx="2"/><rect class="box-blue" x="240" y="338" width="24" height="42" rx="2"/><rect class="slot-faint" x="270" y="338" width="24" height="42" rx="2"/><rect class="slot-faint" x="300" y="338" width="24" height="42" rx="2"/>
+        <text class="s-tiny" x="336" y="364">padded</text>
+        <text class="s-mono-b" x="220" y="404" text-anchor="middle">encoded_a / encoded_b  (B, L, 512)</text>
 
-        <rect class="box-red" x="405" y="297" width="250" height="98" rx="7"/>
-        <text class="s-title" x="530" y="320" text-anchor="middle">Relational repair targets</text>
-        <text class="s-small" x="530" y="342" text-anchor="middle">grounding · alignment · diversity</text>
-        <text class="s-small" x="530" y="358" text-anchor="middle">common neighbors · Jaccard</text>
-        <text class="s-mono" x="530" y="380" text-anchor="middle">L_ptr + L_align + L_rel</text>
-        <path class="flow-red" d="M530 297 V231 H786 V211" marker-end="url(#arrow-red)"/>
+        <path class="flow" d="M85 418 V1502" marker-end="url(#arrow)"/>
+        <text class="s-mono" transform="rotate(-90 74 980)" x="74" y="980" text-anchor="middle">raw pair evidence → trunk</text>
 
-        <rect class="box-red" x="750" y="297" width="250" height="98" rx="7"/>
-        <text class="s-title" x="875" y="320" text-anchor="middle">Pathway dropout</text>
-        <text class="s-small" x="875" y="342" text-anchor="middle">independent topology/content masks</text>
-        <text class="s-small" x="875" y="358" text-anchor="middle">checkpoint-exact mechanism nulls</text>
-        <text class="s-mono" x="875" y="380" text-anchor="middle">a_topo, a_cont ∈ {0,1}</text>
-        <path class="flow-red" d="M875 297 V270 H1079 V211" marker-end="url(#arrow-red)"/>
+        <!-- ================= 02 PER-ENDPOINT STAGE-1 GENERATOR ================= -->
+        <text class="s-micro" x="424" y="130">02 / PER-ENDPOINT GENERATOR</text>
+        <rect class="box-green" x="424" y="140" width="856" height="48" rx="7"/>
+        <text class="s-label" x="444" y="169">FeatureStandardizer</text>
+        <text class="s-mono" x="600" y="169">per-dim z-score · zscore_vfit_v1 · runs once per endpoint (a, then b)</text>
+        <text class="s-small" x="1260" y="169" text-anchor="end">constants pinned by feature_stats_sha256 (V_fit only)</text>
 
-        <rect class="box-red" x="1095" y="297" width="185" height="98" rx="7"/>
-        <text class="s-title" x="1187.5" y="320" text-anchor="middle">Pair label y_ij</text>
-        <text class="s-small" x="1187.5" y="342" text-anchor="middle">positive / negative</text>
-        <text class="s-small" x="1187.5" y="358" text-anchor="middle">supervision pairs</text>
-        <text class="s-mono" x="1187.5" y="380" text-anchor="middle">L_edge</text>
-        <path class="flow-red" d="M1187 297 V231 H1259 V184" marker-end="url(#arrow-red)"/>
+        <path class="flow" d="M624 188 V206" marker-end="url(#arrow)"/>
+        <path class="flow" d="M1160 188 V466" marker-end="url(#arrow)"/>
+        <text class="s-mono" x="1172" y="300">ĝ  (B, 20, 1536)</text>
+        <text class="s-tiny" x="1172" y="316">grounding memory</text>
 
-        <path class="flow" d="M93 209 V233 H1079 V211" marker-end="url(#arrow)"/>
-        <rect x="813" y="217" width="251" height="19" rx="9.5" fill="#fffdf8" stroke="#d8d3c8"/>
-        <text class="s-micro" x="938.5" y="230" text-anchor="middle">DIRECT RAW-TOKEN PATH · tok_i, tok_j</text>
+        <rect class="box-green" x="424" y="210" width="620" height="160" rx="7"/>
+        <text class="s-title" x="734" y="236" text-anchor="middle">TokenizeLite · Module 1</text>
+        <rect class="sub" x="442" y="250" width="190" height="44" rx="4"/>
+        <text class="s-small" x="537" y="268" text-anchor="middle">encoder MLP</text><text class="s-mono" x="537" y="284" text-anchor="middle">1536 → 256 → 64</text>
+        <rect class="sub" x="644" y="250" width="190" height="44" rx="4"/>
+        <text class="s-small" x="739" y="268" text-anchor="middle">degree_mean_head</text><text class="s-mono" x="739" y="284" text-anchor="middle">[x̂;e] 1600 → 256 → 1</text>
+        <rect class="sub" x="846" y="250" width="180" height="44" rx="4"/>
+        <text class="s-small" x="936" y="268" text-anchor="middle">degree_dist_head</text><text class="s-mono" x="936" y="284" text-anchor="middle">[x̂;e] 1600 → 256 → 2</text>
+        <text class="s-small" x="734" y="318" text-anchor="middle">GELU + LayerNorm between every pair of linears</text>
+        <text class="s-tiny" x="734" y="338" text-anchor="middle">no VQ codebook in Stage 1 — the encoder embedding e_u replaces the code pair (z_u, r_u) everywhere downstream</text>
+        <text class="s-tiny" x="734" y="356" text-anchor="middle">the degree budget is density-normalized by ρ_eval / ρ_train inside the model, never inside this module</text>
+
+        <path class="flow" d="M734 370 V380" marker-end="url(#arrow)"/>
+        <rect class="art" x="424" y="384" width="620" height="60" rx="6"/>
+        <text class="art-tag" x="442" y="402">ARTIFACT · NODE CODE + DEGREE BUDGET</text>
+        <rect class="box-green" x="442" y="410" width="9" height="20" rx="1"/><rect class="box-green" x="453" y="410" width="9" height="20" rx="1"/><rect class="box-green" x="464" y="410" width="9" height="20" rx="1"/><rect class="box-green" x="475" y="410" width="9" height="20" rx="1"/><rect class="box-green" x="486" y="410" width="9" height="20" rx="1"/><rect class="box-green" x="497" y="410" width="9" height="20" rx="1"/>
+        <text class="s-mono-b" x="516" y="425">e_u  (B, 64)</text>
+        <text class="s-mono" x="640" y="425">d̂ (B,)  ·  μ, log σ (B,)</text>
+        <text class="s-tiny" x="1026" y="425" text-anchor="end">degree budget · training target only</text>
+
+        <path class="flow" d="M734 444 V466" marker-end="url(#arrow)"/>
+        <rect class="box-green" x="424" y="470" width="856" height="215" rx="7"/>
+        <text class="s-title" x="852" y="496" text-anchor="middle">ImagineDecoder · Module 2 — DETR-style set decoder, K = 16 slots</text>
+        <rect class="sub" x="444" y="510" width="400" height="54" rx="4"/>
+        <text class="s-small" x="458" y="528">decoder memory  [ T_cond ; T_g ]</text>
+        <text class="s-mono" x="458" y="544">w_x 1536→256 · w_e 64→256 · w_g 256→256</text>
+        <text class="s-mono" x="458" y="558">(B, 2 + n_g, 256)</text>
+        <rect class="sub" x="864" y="510" width="396" height="54" rx="4"/>
+        <text class="s-small" x="878" y="528">slot queries</text>
+        <text class="s-mono" x="878" y="544">w_q [proj(x_g); e] 320→256 · else q_base + w_q_base(e)</text>
+        <text class="s-mono" x="878" y="558">(B, K, 256)</text>
+        <rect class="sub" x="444" y="576" width="816" height="40" rx="4"/>
+        <text class="s-small" x="852" y="601" text-anchor="middle">3 × _DecoderLayer — slot self-attention → cross-attention to memory → FFN 256 → 1024 → 256, LayerNorm on each residual</text>
+        <rect class="sub-blue" x="444" y="628" width="126" height="34" rx="4"/><text class="s-small" x="507" y="643" text-anchor="middle">head_h</text><text class="s-mono" x="507" y="656" text-anchor="middle">256→256</text>
+        <rect class="sub-blue" x="582" y="628" width="126" height="34" rx="4"/><text class="s-small" x="645" y="643" text-anchor="middle">head_pi</text><text class="s-mono" x="645" y="656" text-anchor="middle">256→1</text>
+        <rect class="sub-blue" x="720" y="628" width="126" height="34" rx="4"/><text class="s-small" x="783" y="643" text-anchor="middle">head_mult</text><text class="s-mono" x="783" y="656" text-anchor="middle">256→1</text>
+        <rect class="sub-blue" x="858" y="628" width="126" height="34" rx="4"/><text class="s-small" x="921" y="643" text-anchor="middle">head_gate</text><text class="s-mono" x="921" y="656" text-anchor="middle">256→1</text>
+        <rect class="sub-blue" x="996" y="628" width="126" height="34" rx="4"/><text class="s-small" x="1059" y="643" text-anchor="middle">head_pointer</text><text class="s-mono" x="1059" y="656" text-anchor="middle">256→256</text>
+        <rect class="sub-blue" x="1134" y="628" width="126" height="34" rx="4"/><text class="s-small" x="1197" y="643" text-anchor="middle">head_adj</text><text class="s-mono" x="1197" y="656" text-anchor="middle">256→256</text>
+        <text class="s-tiny" x="852" y="678" text-anchor="middle">shared projection proj: 1536 → 256 also feeds the matching cost, L_feat, and counterpart membership · the whole generator trains end-to-end with the classifier</text>
+
+        <path class="flow" d="M852 685 V696" marker-end="url(#arrow)"/>
+        <rect class="art" x="424" y="700" width="856" height="130" rx="6"/>
+        <text class="art-tag" x="442" y="720">ARTIFACT · ONE GENERATED EGO NET PER ENDPOINT — SlotSet</text>
+        <circle class="anchor" cx="520" cy="782" r="14"/><text x="520" y="786" text-anchor="middle" style="font-size:10px;font-weight:700;fill:white">u</text>
+        <circle class="slot" cx="478" cy="748" r="9"/><circle class="slot" cx="545" cy="740" r="9"/><circle class="slot" cx="578" cy="778" r="9"/><circle class="slot" cx="500" cy="818" r="9"/><circle class="slot-faint" cx="562" cy="815" r="9"/>
+        <line class="edge-star" x1="520" y1="782" x2="478" y2="748"/><line class="edge-star" x1="520" y1="782" x2="545" y2="740"/><line class="edge-star" x1="520" y1="782" x2="578" y2="778"/><line class="edge-star" x1="520" y1="782" x2="500" y2="818"/><line class="edge-star" x1="520" y1="782" x2="562" y2="815"/>
+        <path class="edge-intra" d="M545 740 Q574 748 578 778" fill="none"/>
+        <text class="s-mono" x="640" y="748">h    (B, K, 256)</text>
+        <text class="s-mono" x="640" y="772">π    (B, K) ∈ [0, 1]</text>
+        <text class="s-mono" x="640" y="796">m    (B, K) ≥ 1</text>
+        <text class="s-mono" x="850" y="748">g       (B, K) grounding gate</text>
+        <text class="s-mono" x="850" y="772">pointer (B, K, 20) softmax</text>
+        <text class="s-mono" x="850" y="796">Â       (B, K, K) symmetric</text>
+        <text class="s-tiny" x="1100" y="748">π = existence, m = multiplicity;</text>
+        <text class="s-tiny" x="1100" y="764">the faint slot is π → 0, i.e. unused</text>
+        <text class="s-tiny" x="1100" y="780">capacity in a fixed-cardinality set.</text>
+        <text class="s-tiny" x="1100" y="804">Nothing here has been scored yet.</text>
+
+        <path class="flow-blue" d="M852 830 V834 H631 V846" marker-end="url(#arrow-blue)"/>
+        <path class="flow-amber" d="M852 830 V834 H1073 V846" marker-end="url(#arrow-amber)"/>
+
+        <!-- ======================= 03/04 PAIR FUSION ======================= -->
+        <text class="s-micro" x="424" y="846" style="fill:#2d67a3">03 / TOPOLOGY BRANCH</text>
+        <text class="s-micro" x="866" y="846" style="fill:#a76318">04 / CONTENT BRANCH</text>
+
+        <rect class="box-blue" x="424" y="850" width="414" height="75" rx="7"/>
+        <text class="s-title" x="631" y="874" text-anchor="middle">sinkhorn_log_plan · fp32 island</text>
+        <text class="s-mono" x="631" y="894" text-anchor="middle">cost from (h, π, m) of both sides · ε, iters, τ registered</text>
+        <text class="s-tiny" x="631" y="912" text-anchor="middle">a self-pair (u, u) short-circuits to the identity plan</text>
+
+        <rect class="box-amber" x="866" y="850" width="414" height="75" rx="7"/>
+        <text class="s-title" x="1073" y="874" text-anchor="middle">grounded_identity_match + counterpart_membership</text>
+        <text class="s-mono" x="1073" y="894" text-anchor="middle">pointer × gate × ground ids  ·  τ_κ vs. the other side's proj(x)</text>
+        <text class="s-tiny" x="1073" y="912" text-anchor="middle">τ_κ is the only part of DecisionHead this model uses — its gate MLP 3→256→1 is Stage-1-only</text>
+
+        <path class="flow-blue" d="M631 925 V935" marker-end="url(#arrow-blue)"/>
+        <path class="flow-amber" d="M1073 925 V935" marker-end="url(#arrow-amber)"/>
+
+        <rect class="art" x="424" y="939" width="414" height="116" rx="6"/>
+        <text class="art-tag" x="442" y="957">ARTIFACT · ALIGNMENT PLAN Π (B, 16, 16)</text>
+        <rect x="448" y="966" width="85" height="85" fill="#fff" stroke="#ddbf8e"/>
+        <rect class="matrix-cell" x="450" y="968" width="16" height="16" fill="#d99b43"/><rect class="matrix-cell" x="467" y="968" width="16" height="16" fill="#f6dfbb"/><rect class="matrix-cell" x="484" y="968" width="16" height="16" fill="#faedd7"/><rect class="matrix-cell" x="501" y="968" width="16" height="16" fill="#f3d5a5"/><rect class="matrix-cell" x="518" y="968" width="13" height="16" fill="#fbf3e6"/>
+        <rect class="matrix-cell" x="450" y="985" width="16" height="16" fill="#f7e5c7"/><rect class="matrix-cell" x="467" y="985" width="16" height="16" fill="#e4b362"/><rect class="matrix-cell" x="484" y="985" width="16" height="16" fill="#f8e8ce"/><rect class="matrix-cell" x="501" y="985" width="16" height="16" fill="#fbf3e6"/><rect class="matrix-cell" x="518" y="985" width="13" height="16" fill="#f2cf98"/>
+        <rect class="matrix-cell" x="450" y="1002" width="16" height="16" fill="#faedd7"/><rect class="matrix-cell" x="467" y="1002" width="16" height="16" fill="#f5dbb2"/><rect class="matrix-cell" x="484" y="1002" width="16" height="16" fill="#dda44e"/><rect class="matrix-cell" x="501" y="1002" width="16" height="16" fill="#faefdd"/><rect class="matrix-cell" x="518" y="1002" width="13" height="16" fill="#f8e8ce"/>
+        <rect class="matrix-cell" x="450" y="1019" width="16" height="16" fill="#fbf3e6"/><rect class="matrix-cell" x="467" y="1019" width="16" height="16" fill="#f8e8ce"/><rect class="matrix-cell" x="484" y="1019" width="16" height="16" fill="#f3d5a5"/><rect class="matrix-cell" x="501" y="1019" width="16" height="16" fill="#e7bb77"/><rect class="matrix-cell" x="518" y="1019" width="13" height="16" fill="#faedd7"/>
+        <rect class="matrix-cell" x="450" y="1036" width="16" height="13" fill="#f5dbb2"/><rect class="matrix-cell" x="467" y="1036" width="16" height="13" fill="#fbf3e6"/><rect class="matrix-cell" x="484" y="1036" width="16" height="13" fill="#f8e8ce"/><rect class="matrix-cell" x="501" y="1036" width="16" height="13" fill="#f6dfbb"/><rect class="matrix-cell" x="518" y="1036" width="13" height="13" fill="#d99b43"/>
+        <text class="s-small" x="552" y="982">soft, doubly-stochastic matching</text>
+        <text class="s-small" x="552" y="1000">between the two imagined slot sets</text>
+        <text class="s-mono" x="552" y="1022">Π = exp(log Π)</text>
+        <text class="s-tiny" x="552" y="1042">log Π is kept — L_align consumes it directly</text>
+
+        <rect class="art" x="866" y="939" width="414" height="116" rx="6"/>
+        <text class="art-tag" x="884" y="957">ARTIFACT · CROSS-SIDE SLOT LABELS</text>
+        <circle class="slot" cx="900" cy="998" r="10" fill="#e8f2eb"/><circle class="slot" cx="932" cy="998" r="10"/><circle class="slot" cx="964" cy="998" r="10" fill="#e8f2eb"/><circle class="slot" cx="996" cy="998" r="10"/><circle class="slot-faint" cx="1028" cy="998" r="10"/>
+        <text class="s-tiny" x="964" y="1026" text-anchor="middle">per-slot, per-side scalars</text>
+        <text class="s-mono" x="1060" y="982">matched_a, matched_b   (B, K)</text>
+        <text class="s-mono" x="1060" y="1004">membership_a, membership_b   (B, K)</text>
+        <text class="s-tiny" x="1060" y="1026">"does this slot name a node the other endpoint also names?"</text>
+        <text class="s-tiny" x="1060" y="1042">"is this slot compatible with the other endpoint's own features?"</text>
+
+        <path class="flow-blue" d="M631 1055 V1065" marker-end="url(#arrow-blue)"/>
+        <path class="flow-amber" d="M1073 1055 V1065" marker-end="url(#arrow-amber)"/>
+
+        <rect class="box-blue" x="424" y="1069" width="414" height="88" rx="7"/>
+        <text class="s-title" x="631" y="1091" text-anchor="middle">build_scaffold · fp32 island</text>
+        <rect class="sub-blue" x="436" y="1100" width="94" height="28" rx="4"/><text class="s-small" x="483" y="1113" text-anchor="middle">STAR</text><text class="s-tiny" x="483" y="1124" text-anchor="middle">π · m</text>
+        <rect class="sub-blue" x="538" y="1100" width="94" height="28" rx="4"/><text class="s-small" x="585" y="1113" text-anchor="middle">INTRA</text><text class="s-tiny" x="585" y="1124" text-anchor="middle">Â · π · π</text>
+        <rect class="sub-blue" x="640" y="1100" width="94" height="28" rx="4"/><text class="s-small" x="687" y="1113" text-anchor="middle">ALIGN</text><text class="s-tiny" x="687" y="1124" text-anchor="middle">Π , Πᵀ</text>
+        <rect class="sub-blue" x="742" y="1100" width="94" height="28" rx="4"/><text class="s-small" x="789" y="1113" text-anchor="middle">CLOSE</text><text class="s-tiny" x="789" y="1124" text-anchor="middle">½(ÂΠ + ΠÂ)</text>
+        <text class="s-mono" x="631" y="1146" text-anchor="middle">V = 2 + 2K = 34 nodes · FEAT_DIM 11 · EDGE_TYPES 4</text>
+
+        <rect class="box-amber" x="866" y="1069" width="414" height="88" rx="7"/>
+        <text class="s-title" x="1073" y="1091" text-anchor="middle">build_content_tokens</text>
+        <text class="s-mono" x="1073" y="1114" text-anchor="middle">[ h ; π ; gate ; matched ; membership ]</text>
+        <text class="s-tiny" x="1073" y="1133" text-anchor="middle">2K = 32 tokens, source-side slots first</text>
+        <text class="s-tiny" x="1073" y="1148" text-anchor="middle">no adjacency, no plan, no scaffold geometry — content cannot smuggle structure</text>
+
+        <path class="flow-blue" d="M631 1157 V1163" marker-end="url(#arrow-blue)"/>
+        <path class="flow-amber" d="M1073 1157 V1163" marker-end="url(#arrow-amber)"/>
+
+        <rect class="art" x="424" y="1167" width="414" height="128" rx="6"/>
+        <text class="art-tag" x="442" y="1185">ARTIFACT · TYPED STITCHED SCAFFOLD</text>
+        <text class="s-tiny" x="822" y="1185" text-anchor="end">structure only — no h, no gate, no pointer</text>
+        <circle class="anchor" cx="520" cy="1222" r="12"/><text x="520" y="1226" text-anchor="middle" style="font-size:9px;font-weight:700;fill:white">u</text>
+        <circle class="anchor" cx="742" cy="1222" r="12"/><text x="742" y="1226" text-anchor="middle" style="font-size:9px;font-weight:700;fill:white">v</text>
+        <circle class="slot" cx="565" cy="1204" r="9"/><circle class="slot" cx="580" cy="1236" r="9"/><circle class="slot" cx="555" cy="1262" r="9"/>
+        <circle class="slot" cx="697" cy="1204" r="9"/><circle class="slot" cx="682" cy="1236" r="9"/><circle class="slot" cx="707" cy="1262" r="9"/>
+        <line class="edge-star" x1="520" y1="1222" x2="565" y2="1204"/><line class="edge-star" x1="520" y1="1222" x2="580" y2="1236"/><line class="edge-star" x1="520" y1="1222" x2="555" y2="1262"/>
+        <line class="edge-star" x1="742" y1="1222" x2="697" y2="1204"/><line class="edge-star" x1="742" y1="1222" x2="682" y2="1236"/><line class="edge-star" x1="742" y1="1222" x2="707" y2="1262"/>
+        <path class="edge-intra" d="M565 1204 Q592 1214 580 1236" fill="none"/><path class="edge-intra" d="M697 1204 Q670 1214 682 1236" fill="none"/>
+        <line class="edge-align" x1="565" y1="1204" x2="697" y2="1204"/><line class="edge-align" x1="580" y1="1236" x2="682" y2="1236"/>
+        <path class="edge-close" d="M555 1262 Q631 1288 707 1262"/>
+        <text class="s-mono-b" x="631" y="1290" text-anchor="middle">feats (B, 34, 11) · adj (B, 4, 34, 34)</text>
+
+        <rect class="art" x="866" y="1167" width="414" height="128" rx="6"/>
+        <text class="art-tag" x="884" y="1185">ARTIFACT · CONTENT TOKENS</text>
+        <rect class="box-amber" x="890" y="1204" width="230" height="14" rx="2"/><rect class="sub-amber" x="1124" y="1204" width="24" height="14" rx="2"/><rect class="sub-amber" x="1150" y="1204" width="24" height="14" rx="2"/><rect class="sub-amber" x="1176" y="1204" width="24" height="14" rx="2"/><rect class="sub-amber" x="1202" y="1204" width="24" height="14" rx="2"/>
+        <rect class="box-amber" x="890" y="1222" width="230" height="14" rx="2"/><rect class="sub-amber" x="1124" y="1222" width="24" height="14" rx="2"/><rect class="sub-amber" x="1150" y="1222" width="24" height="14" rx="2"/><rect class="sub-amber" x="1176" y="1222" width="24" height="14" rx="2"/><rect class="sub-amber" x="1202" y="1222" width="24" height="14" rx="2"/>
+        <rect class="box-amber" x="890" y="1240" width="230" height="14" rx="2"/><rect class="sub-amber" x="1124" y="1240" width="24" height="14" rx="2"/><rect class="sub-amber" x="1150" y="1240" width="24" height="14" rx="2"/><rect class="sub-amber" x="1176" y="1240" width="24" height="14" rx="2"/><rect class="sub-amber" x="1202" y="1240" width="24" height="14" rx="2"/>
+        <rect class="box-amber" x="890" y="1258" width="230" height="14" rx="2"/><rect class="sub-amber" x="1124" y="1258" width="24" height="14" rx="2"/><rect class="sub-amber" x="1150" y="1258" width="24" height="14" rx="2"/><rect class="sub-amber" x="1176" y="1258" width="24" height="14" rx="2"/><rect class="sub-amber" x="1202" y="1258" width="24" height="14" rx="2"/>
+        <text class="s-tiny" x="1005" y="1199" text-anchor="middle">h · 256</text>
+        <text class="s-tiny" x="1136" y="1199" text-anchor="middle">π</text><text class="s-tiny" x="1162" y="1199" text-anchor="middle">g</text><text class="s-tiny" x="1188" y="1199" text-anchor="middle">id</text><text class="s-tiny" x="1214" y="1199" text-anchor="middle">mb</text>
+        <text class="s-tiny" x="1268" y="1236" text-anchor="end">2K = 32</text>
+        <text class="s-tiny" x="1268" y="1252" text-anchor="end">tokens</text>
+        <text class="s-mono-b" x="1073" y="1288" text-anchor="middle">content tokens (B, 32, 260)</text>
+
+        <path class="flow-blue" d="M631 1295 V1305" marker-end="url(#arrow-blue)"/>
+        <path class="flow-amber" d="M1073 1295 V1305" marker-end="url(#arrow-amber)"/>
+
+        <rect class="box-blue" x="424" y="1309" width="414" height="80" rx="7"/>
+        <text class="s-title" x="631" y="1333" text-anchor="middle">STEncoder · typed message passing</text>
+        <text class="s-mono" x="631" y="1353" text-anchor="middle">embed 11→128 · 3 × _MPLayer · out 128→512</text>
+        <text class="s-tiny" x="631" y="1372" text-anchor="middle">each layer carries one message Linear 128→128 per edge type, LayerNorm ×2, MLP 128→256→128</text>
+
+        <rect class="box-amber" x="866" y="1309" width="414" height="80" rx="7"/>
+        <text class="s-title" x="1073" y="1333" text-anchor="middle">ContentProjector</text>
+        <text class="s-mono" x="1073" y="1353" text-anchor="middle">Linear 260 → 512</text>
+        <text class="s-tiny" x="1073" y="1372" text-anchor="middle">one projection per token — content never mixes across slots before the trunk</text>
+
+        <path class="flow-blue" d="M631 1389 V1399" marker-end="url(#arrow-blue)"/>
+        <path class="flow-amber" d="M1073 1389 V1399" marker-end="url(#arrow-amber)"/>
+
+        <rect class="art" x="424" y="1403" width="414" height="75" rx="6"/>
+        <text class="art-tag" x="442" y="1421">ARTIFACT · TOPOLOGY TOKENS</text>
+        <rect class="box-blue" x="442" y="1430" width="18" height="34" rx="2"/><rect class="box-blue" x="464" y="1430" width="18" height="34" rx="2"/><rect class="box-blue" x="486" y="1430" width="18" height="34" rx="2"/><rect class="box-blue" x="508" y="1430" width="18" height="34" rx="2"/><rect class="box-blue" x="530" y="1430" width="18" height="34" rx="2"/><rect class="box-blue" x="552" y="1430" width="18" height="34" rx="2"/>
+        <text class="s-mono-b" x="584" y="1443">topo_ab, topo_ba  (B, 34, 512)</text>
+        <text class="s-tiny" x="584" y="1460">second pass = swap_direction(scaffold), same weights</text>
+
+        <rect class="art" x="866" y="1403" width="414" height="75" rx="6"/>
+        <text class="art-tag" x="884" y="1421">ARTIFACT · CONTENT TOKENS</text>
+        <rect class="box-amber" x="884" y="1430" width="18" height="34" rx="2"/><rect class="box-amber" x="906" y="1430" width="18" height="34" rx="2"/><rect class="box-amber" x="928" y="1430" width="18" height="34" rx="2"/><rect class="box-amber" x="950" y="1430" width="18" height="34" rx="2"/><rect class="box-amber" x="972" y="1430" width="18" height="34" rx="2"/><rect class="box-amber" x="994" y="1430" width="18" height="34" rx="2"/>
+        <text class="s-mono-b" x="1026" y="1443">cont  (B, 32, 512)</text>
+        <text class="s-tiny" x="1026" y="1460">direction-free: one tensor conditions both rows</text>
+
+        <!-- =================== TRAINING-ONLY SUPERVISION RAIL =================== -->
+        <text class="s-micro" x="130" y="452" style="fill:#b34f43">TRAINING-ONLY PRESSURE</text>
+        <rect class="box-red" x="130" y="470" width="270" height="100" rx="6"/>
+        <text class="s-label" x="146" y="492">Degree budget</text>
+        <text class="s-mono" x="146" y="512">lognormal NLL(μ, log σ)</text>
+        <text class="s-mono" x="146" y="530">L_deg</text>
+        <text class="s-tiny" x="146" y="552">supervises how many neighbors a node should</text>
+        <text class="s-tiny" x="146" y="564">imagine before any slot is matched</text>
+        <path class="flow-red" d="M400 500 H412 V332 H418" marker-end="url(#arrow-red)"/>
+
+        <rect class="box-red" x="130" y="590" width="270" height="100" rx="6"/>
+        <text class="s-label" x="146" y="612">Hungarian slot targets</text>
+        <text class="s-mono" x="146" y="632">match_slots · message-partition</text>
+        <text class="s-mono" x="146" y="650">L_feat · L_exist · L_mult · L_slotadj</text>
+        <text class="s-tiny" x="146" y="672">assignment is recomputed every step; the model</text>
+        <text class="s-tiny" x="146" y="684">never sees the target ordering</text>
+        <path class="flow-red" d="M400 640 H418" marker-end="url(#arrow-red)"/>
+
+        <rect class="box-red" x="130" y="710" width="270" height="100" rx="6"/>
+        <text class="s-label" x="146" y="732">Grounding + diversity</text>
+        <text class="s-mono" x="146" y="752">L_ptr · L_gate · L_div</text>
+        <text class="s-tiny" x="146" y="774">pushes each slot to name a real candidate and</text>
+        <text class="s-tiny" x="146" y="786">keeps slot content off the collapse manifold</text>
+        <text class="s-tiny" x="146" y="802">(cosine guard τ_div, gate pos-weight 6.17)</text>
+        <path class="flow-red" d="M400 760 H418" marker-end="url(#arrow-red)"/>
+
+        <rect class="box-red" x="130" y="830" width="270" height="100" rx="6"/>
+        <text class="s-label" x="146" y="852">Alignment teacher</text>
+        <text class="s-mono" x="146" y="872">alignment_teacher_cells → L_align</text>
+        <text class="s-tiny" x="146" y="894">double matching says which (slot, slot) cells</text>
+        <text class="s-tiny" x="146" y="906">name the same real node; log Π is scored against</text>
+        <text class="s-tiny" x="146" y="918">them on real positives only</text>
+        <path class="flow-red" d="M400 880 H418" marker-end="url(#arrow-red)"/>
+
+        <rect class="box-red" x="130" y="950" width="270" height="100" rx="6"/>
+        <text class="s-label" x="146" y="972">Realism · RandomGIN</text>
+        <text class="s-mono" x="146" y="992">4→64→64→64 (random) · L_real</text>
+        <text class="s-tiny" x="146" y="1014">MMD between generated and real train-side ego</text>
+        <text class="s-tiny" x="146" y="1026">statistics and random-GIN embeddings; the three</text>
+        <text class="s-tiny" x="146" y="1038">MMD ratios are never aggregated</text>
+        <path class="flow-red" d="M400 1000 H412 V1105 H418" marker-end="url(#arrow-red)"/>
+
+        <rect class="box-red" x="130" y="1070" width="270" height="100" rx="6"/>
+        <text class="s-label" x="146" y="1092">Relational head</text>
+        <text class="s-mono" x="146" y="1112">rel_head 512→256→2 · L_rel</text>
+        <text class="s-tiny" x="146" y="1134">reads mean(topo_ab) and predicts common</text>
+        <text class="s-tiny" x="146" y="1146">neighbors / Jaccard; discarded at inference,</text>
+        <text class="s-tiny" x="146" y="1158">absent entirely in the w_rel = 0 arm</text>
+        <path class="flow-red" d="M400 1120 H412 V1440 H418" marker-end="url(#arrow-red)"/>
+
+        <rect class="box-red" x="130" y="1190" width="270" height="100" rx="6"/>
+        <text class="s-label" x="146" y="1212">Edge objective + branch dropout</text>
+        <text class="s-mono" x="146" y="1232">L_edge · p_topo = p_cont = 0.15</text>
+        <text class="s-tiny" x="146" y="1254">the only loss on the scored logit; independent</text>
+        <text class="s-tiny" x="146" y="1266">branch masks keep every hard-bypass logit of the</text>
+        <text class="s-tiny" x="146" y="1278">same checkpoint trained and usable</text>
+        <path class="flow-red" d="M265 1290 V1502" marker-end="url(#arrow-red)"/>
+
+        <!-- ================= 05 CONDITIONED PAIR TRUNK ================= -->
+        <path class="flow-blue" d="M631 1478 V1494 H1090 V1512"/>
+        <path class="flow-amber" d="M1073 1478 V1502 H1235 V1512"/>
+
+        <rect class="box-dark" x="40" y="1510" width="1240" height="250" rx="8"/>
+        <path class="flow-blue" d="M1090 1510 V1572" stroke="#a9c9e8" marker-end="url(#arrow-lblue)"/>
+        <path class="flow-amber" d="M1235 1510 V1637 H1208" stroke="#e8c68d" marker-end="url(#arrow-lamber)"/>
+        <text class="s-micro" x="62" y="1534" style="fill:#a9c9e8">05 / CONDITIONED PAIR TRUNK</text>
+        <text class="s-white" x="660" y="1534" text-anchor="middle">ConditionedPairCrossAttention — AB and BA stacked into one trunk batch (2B rows)</text>
+        <text class="s-white-mono" x="660" y="1556" text-anchor="middle">q = [enc_a ; enc_b]   ·   kv = [enc_b ; enc_a]   ·   + learned cls token   ·   both directions share one synchronized conditioning statistic and one EMA update</text>
+
+        <rect class="sub-dark" x="70" y="1578" width="290" height="72" rx="5"/>
+        <text class="s-white-s" x="215" y="1598" text-anchor="middle">CrossAttentionLayer 1</text>
+        <text class="s-white-mono" x="215" y="1616" text-anchor="middle">a ⇄ b cross-attn · 8 heads</text>
+        <text class="s-white-mono" x="215" y="1632" text-anchor="middle">FFN 512→2048→512 · cls: attn_cls + ff_cls 1024</text>
+        <path class="flow" d="M360 1614 H376" marker-end="url(#arrow)" stroke="#dce4e9"/>
+        <rect class="sub-dark" x="380" y="1578" width="290" height="72" rx="5"/>
+        <text class="s-white-s" x="525" y="1598" text-anchor="middle">CrossAttentionLayer 2</text>
+        <text class="s-white-mono" x="525" y="1616" text-anchor="middle">same block, shared shape</text>
+        <text class="s-white-mono" x="525" y="1632" text-anchor="middle">4 LayerNorms · dropout .1 on every residual</text>
+        <path class="flow" d="M670 1614 H686" marker-end="url(#arrow)" stroke="#dce4e9"/>
+        <rect class="sub-dark" x="690" y="1578" width="290" height="72" rx="5"/>
+        <text class="s-white-s" x="835" y="1598" text-anchor="middle">CrossAttentionLayer 3</text>
+        <text class="s-white-mono" x="835" y="1616" text-anchor="middle">last of n_layers = 3</text>
+        <text class="s-white-mono" x="835" y="1632" text-anchor="middle">its cls output is the injection point</text>
+        <path class="flow-blue" d="M980 1596 H1006" marker-end="url(#arrow-blue)"/>
+
+        <rect x="1010" y="1576" width="190" height="36" rx="5" fill="#2d67a3" stroke="#2d67a3"/>
+        <text class="s-white-s" x="1105" y="1591" text-anchor="middle">GatedCrossAttention · topo</text>
+        <text class="s-white-mono" x="1105" y="1605" text-anchor="middle">cls ← topo tokens</text>
+        <path class="flow-blue" d="M1105 1612 V1622" marker-end="url(#arrow-blue)" stroke="#dce4e9"/>
+        <rect x="1010" y="1626" width="190" height="36" rx="5" fill="#a76318" stroke="#a76318"/>
+        <text class="s-white-s" x="1105" y="1641" text-anchor="middle">GatedCrossAttention · cont</text>
+        <text class="s-white-mono" x="1105" y="1655" text-anchor="middle">cls ← content tokens</text>
+
+        <text class="s-white-mono" x="70" y="1676">n_inj = 1 · zero-init tanh gate · EMA-centered on real rows · cls token only · a_topo / a_cont are the exact four-logit hard bypass</text>
+
+        <path class="flow" d="M835 1650 V1686" marker-end="url(#arrow)" stroke="#dce4e9"/>
+        <path class="flow" d="M1105 1662 V1686" marker-end="url(#arrow)" stroke="#dce4e9"/>
+        <rect class="sub-dark" x="70" y="1690" width="1190" height="55" rx="5"/>
+        <text class="s-white-s" x="90" y="1712">PairContextGatedReadout — fp32, gradient-checkpointed</text>
+        <text class="s-white-mono" x="90" y="1732">context_proj 1024→512 · attn_scorer 1024→512→1 · branch_gate 6144→3 · branch_proj 2048→512 · final_proj 1024→512   →   pair representation (2B, 512)</text>
+
+        <!-- ================= 06 SYMMETRIC EDGE DECISION ================= -->
+        <path class="flow" d="M660 1760 V1786" marker-end="url(#arrow)"/>
+        <text class="s-micro" x="460" y="1782">06 / SYMMETRIC EDGE DECISION</text>
+
+        <rect class="box" x="40" y="1790" width="390" height="86" rx="7"/>
+        <text class="s-label" x="58" y="1812">Three fp32 islands</text>
+        <text class="s-tiny" x="58" y="1832">Sinkhorn · scaffold products · readout and head.</text>
+        <text class="s-tiny" x="58" y="1848">bf16 would quantize away the full-minus-null residual,</text>
+        <text class="s-tiny" x="58" y="1864">which is the quantity every mechanism claim rests on.</text>
+
+        <rect class="box" x="460" y="1790" width="300" height="86" rx="7"/>
+        <text class="s-title" x="610" y="1818" text-anchor="middle">abba max</text>
+        <text class="s-mono" x="610" y="1840" text-anchor="middle">max(feat_AB, feat_BA)</text>
+        <text class="s-tiny" x="610" y="1860" text-anchor="middle">feature-wise · enforces p(u,v) = p(v,u)</text>
+        <path class="flow" d="M760 1833 H796" marker-end="url(#arrow)"/>
+
+        <rect class="box" x="800" y="1790" width="220" height="86" rx="7"/>
+        <text class="s-title" x="910" y="1818" text-anchor="middle">MLPHead</text>
+        <text class="s-mono" x="910" y="1840" text-anchor="middle">512 → 256 → 1</text>
+        <text class="s-tiny" x="910" y="1860" text-anchor="middle">LayerNorm · GELU · drop .1</text>
+        <path class="flow" d="M1020 1833 H1056" marker-end="url(#arrow)"/>
+
+        <rect class="box-blue" x="1060" y="1790" width="220" height="86" rx="7"/>
+        <text class="s-micro" x="1170" y="1810" text-anchor="middle">BINARY QUERIED-EDGE OUTPUT</text>
+        <text x="1170" y="1843" text-anchor="middle" style="font-family:var(--serif);font-size:24px;font-weight:600;fill:#2d67a3">p<tspan baseline-shift="sub" font-size="12">uv</tspan></text>
+        <text class="s-mono" x="1170" y="1864" text-anchor="middle">= σ(logit) ∈ [0, 1]</text>
       </svg>
       <figcaption class="figure-caption">
-        <span><strong>Figure 1 · Overall architecture.</strong> Both endpoint ego networks are generated from endpoint features, aligned into a typed scaffold, and used only as conditioning context for the final symmetric queried-pair classifier.</span>
-        <span class="legend"><span class="legend-item"><i class="swatch generated"></i>generated</span><span class="legend-item"><i class="swatch topo"></i>topology</span><span class="legend-item"><i class="swatch content"></i>content</span><span class="legend-item"><i class="dash"></i>training only</span></span>
+        <span><strong>Figure 1 · The complete network, top to bottom.</strong> Every trained module is named with its actual widths; the dashed cards between them are the artifacts each module hands to the next — the generated ego net, the alignment plan, the typed scaffold, and the two token streams. Generated topology is compressed into 34 scaffold nodes and injected only into the cls token of the last trunk layer: it is conditioning context, never the output.</span>
+        <span class="legend"><span class="legend-item"><i class="swatch generated"></i>generator</span><span class="legend-item"><i class="swatch topo"></i>topology</span><span class="legend-item"><i class="swatch content"></i>content</span><span class="legend-item"><i class="swatch artifact"></i>artifact</span><span class="legend-item"><i class="dash"></i>training only</span></span>
       </figcaption>
     </figure>
 
