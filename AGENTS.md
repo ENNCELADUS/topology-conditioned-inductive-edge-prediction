@@ -117,10 +117,11 @@ Current G5 verdicts live in `docs/results/G5-stage1-seed0-20260717.md` (frozen-s
 — evidence retained; its producing code last exists at `dcae090` and is deleted in the
 current cleanup worktree pending commit) and
 `docs/results/G5-e2e-stage1-seed0-20260724.md` (rev-3.0 e2e, `cut`). The active line is
-rev-3.2 on the two-stage ladder; `g5_e2e_stage1_preregistration_v4.json` is still
-`DRAFT`, so `hpc/qualification.sh formal` refuses to launch until it is re-pinned and
-promoted to `BINDING`. `qualify` needs no **BINDING** registration and may run against
-the active v4 `DRAFT` within its registered `V_fit`/`V_hold` boundary.
+rev-3.2 on a single formal stage. `g5_e2e_stage1_preregistration_v5.json` (the
+component-ablation schema; v4 is superseded history) remains `DRAFT` as descriptive
+provenance; `hpc/qualification.sh formal <arm>` launches directly against its exact
+bytes/SHA and arm/config identities without gating on status or nullable run-evidence
+placeholders.
 
 Benchmark and baseline names (`Benchmark-A/B/C`, `B0`, `B0-alt`, `B0-e2e`, `B1`,
 `B2-*`, `B3`, `B5`, `Ours`, `Oracle`, `PA-null`) are deliberate dataset-agnostic

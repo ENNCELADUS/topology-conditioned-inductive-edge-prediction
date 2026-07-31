@@ -18,7 +18,7 @@ import pytest
 import torch
 import yaml  # type: ignore[import-untyped]
 from src import train_egostitch as te
-from src.experiments.e2e_binding import ACTIVE_V4_REGISTRATION_ID
+from src.experiments.e2e_binding import ACTIVE_V5_REGISTRATION_ID
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.e2e_model import EgoStitchE2E
 
@@ -132,15 +132,15 @@ def test_formal_plan_preflight_validates_live_config_and_clean_commit(
         "b0_e2e_f_only": "configs/egostitch_e2e_v3_f_only_breadth_first.yaml",
         "pair_topology": "configs/egostitch_e2e_v3_pair_topology_breadth_first.yaml",
         "p0": "configs/egostitch_e2e_v3_p0_breadth_first.yaml",
-        "cosine_pool": "configs/egostitch_e2e_v3_cosine_pool_breadth_first.yaml",
         "no_l_rel": "configs/egostitch_e2e_v3_no_l_rel_breadth_first.yaml",
+        "row_layernorm": "configs/egostitch_e2e_v3_row_layernorm_breadth_first.yaml",
     }
     configs: dict[str, object] = {
             arm: {"path": path, "sha256": te._sha256_file(root / path)}
             for arm, path in arm_paths.items()
     }
     registration: dict[str, object] = {
-        "registration_id": ACTIVE_V4_REGISTRATION_ID,
+        "registration_id": ACTIVE_V5_REGISTRATION_ID,
         "arms": {
                 **{
                     arm: {"kind": "trained_checkpoint", "training": path}
@@ -177,7 +177,9 @@ def test_formal_plan_preflight_validates_live_config_and_clean_commit(
     assert plan["config_sha256"] == te._sha256_file(config_path)
 
     snapshot.payload["config_artifacts"] = {
-        name: entry for name, entry in configs.items() if name not in {"cosine_pool", "no_l_rel"}
+        name: entry
+        for name, entry in configs.items()
+        if name not in {"row_layernorm", "no_l_rel"}
     }
     with pytest.raises(te.FormalPlanMismatch, match="trained checkpoint arms"):
         te._validate_e2e_formal_plan(cfg, snapshot, config_path)

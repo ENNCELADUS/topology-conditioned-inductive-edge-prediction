@@ -6,7 +6,7 @@ set -euo pipefail
 readonly REPO_ROOT="/2023533015/topology-conditioned-inductive-edge-prediction"
 readonly PYTHON_BIN="${REPO_ROOT}/.venv/bin/python"
 readonly UV_BIN="/2023533015/.uv/bin/uv"
-readonly PREREGISTRATION="docs/registrations/g5_e2e_stage1_preregistration_v4.json"
+readonly PREREGISTRATION="docs/registrations/g5_e2e_stage1_preregistration_v5.json"
 readonly FORMAL_GPU_COUNT=4
 readonly EXPECTED_GPU_NAME="NVIDIA H20"
 DETECTED_GPU_COUNT=0
@@ -14,7 +14,7 @@ DETECTED_GPU_COUNT=0
 usage() {
   cat <<'EOF'
 Usage:
-  hpc/qualification.sh formal <full|f_only|pair_topology|p0|cosine_pool|no_l_rel>
+  hpc/qualification.sh formal <full|f_only|pair_topology|p0|no_l_rel|row_layernorm>
 
 formal executes one complete plan-bound training run. It requires exactly four
 visible NVIDIA H20 GPUs, a clean checkout, and an unchanged registration snapshot. No prior
@@ -78,8 +78,8 @@ arm_config() {
     f_only) echo "configs/egostitch_e2e_v3_f_only_breadth_first.yaml" ;;
     pair_topology) echo "configs/egostitch_e2e_v3_pair_topology_breadth_first.yaml" ;;
     p0) echo "configs/egostitch_e2e_v3_p0_breadth_first.yaml" ;;
-    cosine_pool) echo "configs/egostitch_e2e_v3_cosine_pool_breadth_first.yaml" ;;
     no_l_rel) echo "configs/egostitch_e2e_v3_no_l_rel_breadth_first.yaml" ;;
+    row_layernorm) echo "configs/egostitch_e2e_v3_row_layernorm_breadth_first.yaml" ;;
     structure_control_6a_v3|structure_control_6e_v1)
       fail "$1 is a scoring-time control that reuses the full checkpoint" ;;
     *) fail "unknown arm: $1" ;;

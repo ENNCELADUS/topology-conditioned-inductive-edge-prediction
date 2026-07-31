@@ -100,8 +100,8 @@ _EGOSTITCH_E2E_FORMAL_ARMS = (
     "b0_e2e_f_only",
     "pair_topology",
     "p0",
-    "cosine_pool",
     "no_l_rel",
+    "row_layernorm",
 )
 _EGOSTITCH_E2E_CONTROL_ARMS = ("structure_control_6a_v3", "structure_control_6e_v1")
 _EGOSTITCH_E2E_CHECKPOINT_POLICY = "egostitch_e2e_all_completed_epochs_v1"

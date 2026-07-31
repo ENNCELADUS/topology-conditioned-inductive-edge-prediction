@@ -140,7 +140,8 @@ Current G5 verdicts live in `docs/results/G5-stage1-seed0-20260717.md` (frozen-s
 — evidence retained; its producing code last exists at `dcae090` and is deleted in the
 current cleanup worktree pending commit) and
 `docs/results/G5-e2e-stage1-seed0-20260724.md` (rev-3.0 e2e, `cut`). The active line is
-rev-3.2 on a single formal stage. `g5_e2e_stage1_preregistration_v4.json` remains
+rev-3.2 on a single formal stage. `g5_e2e_stage1_preregistration_v5.json` (the
+component-ablation arm schema; v4 is superseded history) remains
 `DRAFT` as descriptive provenance; formal launch uses its exact bytes/SHA and
 arm/config identities without gating on status or nullable run-evidence placeholders.
 

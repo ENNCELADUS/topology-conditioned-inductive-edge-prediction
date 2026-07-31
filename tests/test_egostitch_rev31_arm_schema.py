@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
-from itertools import combinations
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,8 +22,8 @@ TRAINED_ARMS = (
     "b0_e2e_f_only",
     "pair_topology",
     "p0",
-    "cosine_pool",
     "no_l_rel",
+    "row_layernorm",
 )
 CONTROL_ARMS = ("structure_control_6a_v3", "structure_control_6e_v1")
 V3_CONFIGS = {
@@ -33,9 +32,14 @@ V3_CONFIGS = {
     "pair_topology": REPO_ROOT
     / "configs/egostitch_e2e_v3_pair_topology_breadth_first.yaml",
     "p0": REPO_ROOT / "configs/egostitch_e2e_v3_p0_breadth_first.yaml",
-    "cosine_pool": REPO_ROOT / "configs/egostitch_e2e_v3_cosine_pool_breadth_first.yaml",
     "no_l_rel": REPO_ROOT / "configs/egostitch_e2e_v3_no_l_rel_breadth_first.yaml",
+    "row_layernorm": REPO_ROOT
+    / "configs/egostitch_e2e_v3_row_layernorm_breadth_first.yaml",
 }
+# Historical only: retired from the trained set in v5 but retained on disk.
+RETIRED_COSINE_POOL_CONFIG = (
+    REPO_ROOT / "configs/egostitch_e2e_v3_cosine_pool_breadth_first.yaml"
+)
 
 
 def test_all_enforcement_constants_use_exact_eight_arm_schema() -> None:
@@ -57,8 +61,8 @@ def test_v3_configs_load_and_have_only_registered_arm_differences() -> None:
         "b0_e2e_f_only": {"permanent_null": "all_head"},
         "pair_topology": {"permanent_null": "content_head"},
         "p0": {"p_topo": 0.0, "p_cont": 0.0},
-        "cosine_pool": {"n_ground": 20},
         "no_l_rel": {"w_rel": 0.0},
+        "row_layernorm": {"feature_standardization": "row_layernorm"},
     }
     for arm, model_config in model_configs.items():
         differences = {
@@ -71,32 +75,34 @@ def test_v3_configs_load_and_have_only_registered_arm_differences() -> None:
         "b0_e2e_f_only": 50,
         "pair_topology": 50,
         "p0": 50,
-        "cosine_pool": 20,
         "no_l_rel": 50,
+        "row_layernorm": 50,
     }
     assert {arm: model["w_rel"] for arm, model in model_configs.items()} == {
         "full": 0.25,
         "b0_e2e_f_only": 0.25,
         "pair_topology": 0.25,
         "p0": 0.25,
-        "cosine_pool": 0.25,
         "no_l_rel": 0.0,
+        "row_layernorm": 0.25,
     }
     for arm, config in loaded.items():
         assert config.preregistration == Path(
-            "docs/registrations/g5_e2e_stage1_preregistration_v4.json"
+            "docs/registrations/g5_e2e_stage1_preregistration_v5.json"
         )
         output_arm = "f_only" if arm == "b0_e2e_f_only" else arm
         assert config.output_dir == Path(f"outputs/egostitch_e2e_stage1_v3/{output_arm}")
 
 
-def test_v3_grounding_packs_are_isolated_by_pool_size() -> None:
+def test_v3_live_arms_share_one_ng50_pack_and_grounding_cache() -> None:
+    """v5: all six trained arms are n_ground=50 and share one pack + grounding cache."""
     config_paths = sorted(
         (REPO_ROOT / "configs").glob("egostitch_e2e_v3_*_breadth_first.yaml")
     )
-    assert set(config_paths) == set(V3_CONFIGS.values())
+    # The retired cosine_pool config stays on disk as history; no live arm uses it.
+    assert set(config_paths) == set(V3_CONFIGS.values()) | {RETIRED_COSINE_POOL_CONFIG}
     configs = []
-    for path in config_paths:
+    for path in sorted(V3_CONFIGS.values()):
         payload = yaml.safe_load(path.read_text(encoding="utf-8"))
         configs.append(
             (
@@ -109,11 +115,11 @@ def test_v3_grounding_packs_are_isolated_by_pool_size() -> None:
             )
         )
 
-    for left, right in combinations(configs, 2):
-        if left[1] != right[1]:
-            assert left[2] != right[2], f"runtime pack collision: {left[0]} and {right[0]}"
-            assert left[3] != right[3], f"grounding cache collision: {left[0]} and {right[0]}"
-
+    assert {config[1] for config in configs} == {50}
+    assert {config[2] for config in configs} == {
+        "outputs/feature_packs/egostitch_e2e_v_hold_ng50"
+    }
+    assert len({config[3] for config in configs}) == 1
     assert len({config[4] for config in configs}) == 1
     assert len({config[5] for config in configs}) == 1
 
@@ -128,7 +134,7 @@ def test_arm_classifier_distinguishes_all_six_trained_checkpoints() -> None:
 def test_run_metadata_represents_trained_checkpoint_and_scoring_semantics(
     tmp_path: Path,
 ) -> None:
-    config_path = V3_CONFIGS["cosine_pool"]
+    config_path = V3_CONFIGS["row_layernorm"]
     config = train_egostitch.load_config(config_path)
     config = train_egostitch.replace(config, output_dir=tmp_path / "run")
     data = SimpleNamespace(rho_train=0.1)
@@ -141,9 +147,9 @@ def test_run_metadata_represents_trained_checkpoint_and_scoring_semantics(
     )
 
     metadata = json.loads((config.output_dir / "run_metadata.json").read_text())
-    assert metadata["arm"] == "cosine_pool"
+    assert metadata["arm"] == "row_layernorm"
     assert metadata["arm_kind"] == "trained_checkpoint"
-    assert metadata["checkpoint_arm"] == "cosine_pool"
+    assert metadata["checkpoint_arm"] == "row_layernorm"
     assert metadata["scoring_semantics"] == {
         "scaffold_control": "none",
         "permanent_null": "none",

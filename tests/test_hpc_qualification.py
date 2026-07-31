@@ -17,8 +17,8 @@ CONFIGS = {
     "f_only": CONFIG_DIR / "egostitch_e2e_v3_f_only_breadth_first.yaml",
     "pair_topology": CONFIG_DIR / "egostitch_e2e_v3_pair_topology_breadth_first.yaml",
     "p0": CONFIG_DIR / "egostitch_e2e_v3_p0_breadth_first.yaml",
-    "cosine_pool": CONFIG_DIR / "egostitch_e2e_v3_cosine_pool_breadth_first.yaml",
     "no_l_rel": CONFIG_DIR / "egostitch_e2e_v3_no_l_rel_breadth_first.yaml",
+    "row_layernorm": CONFIG_DIR / "egostitch_e2e_v3_row_layernorm_breadth_first.yaml",
 }
 
 
@@ -45,8 +45,8 @@ def test_e2e_configs_are_exact_registered_arms() -> None:
         "f_only": ("all_head", 0.15, 0.15, "f_only", 50),
         "pair_topology": ("content_head", 0.15, 0.15, "pair_topology", 50),
         "p0": ("none", 0.0, 0.0, "p0", 50),
-        "cosine_pool": ("none", 0.15, 0.15, "cosine_pool", 20),
         "no_l_rel": ("none", 0.15, 0.15, "no_l_rel", 50),
+        "row_layernorm": ("none", 0.15, 0.15, "row_layernorm", 50),
     }
     for arm, (permanent_null, p_topo, p_cont, output_leaf, n_ground) in expected.items():
         config = configs[arm]
@@ -60,6 +60,12 @@ def test_e2e_configs_are_exact_registered_arms() -> None:
         assert str(config["output_dir"]).endswith(f"/{output_leaf}")
     assert _model_config(configs["no_l_rel"])["w_rel"] == 0
     assert "w_rel" not in _model_config(configs["full"])
+    assert _model_config(configs["full"])["feature_standardization"] == "zscore_vfit_v1"
+    assert (
+        _model_config(configs["row_layernorm"])["feature_standardization"] == "row_layernorm"
+    )
+    for arm in ("f_only", "pair_topology", "p0", "no_l_rel"):
+        assert _model_config(configs[arm])["feature_standardization"] == "zscore_vfit_v1"
 
 
 def test_e2e_configs_pin_training_contract_and_registration() -> None:
@@ -75,7 +81,7 @@ def test_e2e_configs_pin_training_contract_and_registration() -> None:
         assert training["warmup_steps"] == 500
         assert training["residual_ratio_min"] == 1.0e-3
         assert config["preregistration"] == (
-            "docs/registrations/g5_e2e_stage1_preregistration_v4.json"
+            "docs/registrations/g5_e2e_stage1_preregistration_v5.json"
         )
         runtime = _section(config, "runtime")
         assert runtime["world_size"] == "auto"
@@ -93,17 +99,21 @@ def test_e2e_configs_carry_no_hand_pasted_feature_digest() -> None:
         assert "feature_stats_sha256" not in _model_config(_load_config(path))
 
 
-def test_arms_that_disagree_on_n_ground_do_not_share_a_pack() -> None:
-    pack_dirs: dict[str, set[str]] = {}
-    for name, path in CONFIGS.items():
+def test_all_six_arms_share_the_single_ng50_pack_and_grounding_cache() -> None:
+    """v5: every trained arm is n_ground=50, so one pack and one grounding cache serve all."""
+    pack_dirs: set[str] = set()
+    grounding_caches: set[str] = set()
+    for path in CONFIGS.values():
         config = _load_config(path)
         runtime = _section(config, "runtime")
-        n_ground = _model_config(config)["n_ground"]
+        data = _section(config, "data")
+        assert _model_config(config)["n_ground"] == 50
         assert isinstance(runtime["pack_dir"], str)
-        pack_dirs.setdefault(runtime["pack_dir"], set()).add(f"{name}:{n_ground}")
-    for pack_dir, arms in pack_dirs.items():
-        n_grounds = {arm.split(":")[1] for arm in arms}
-        assert len(n_grounds) == 1, f"{pack_dir} is shared by arms with n_ground {n_grounds}"
+        assert isinstance(data["grounding_cache"], str)
+        pack_dirs.add(runtime["pack_dir"])
+        grounding_caches.add(data["grounding_cache"])
+    assert pack_dirs == {"outputs/feature_packs/egostitch_e2e_v_hold_ng50"}
+    assert len(grounding_caches) == 1
 
 
 def test_launcher_is_strict_bash_and_formal_only() -> None:
@@ -117,6 +127,8 @@ def test_launcher_is_strict_bash_and_formal_only() -> None:
     assert "run_formal" in text
     assert "run_qualification" not in text
     assert "calibrate-tolerance" not in text
+    assert "<full|f_only|pair_topology|p0|no_l_rel|row_layernorm>" in text
+    assert "cosine_pool" not in text
 
 
 def test_formal_preflight_binds_plan_and_environment_not_quality() -> None:

@@ -285,7 +285,7 @@ def test_default_e2e_grounding_cache_path_is_namespaced_by_pool_configuration(
     full = score_universe._default_grounding_cache_path(
         f0_cache, n_ground=50, node_ids=universe
     )
-    cosine_pool = score_universe._default_grounding_cache_path(
+    narrow_pool = score_universe._default_grounding_cache_path(
         f0_cache, n_ground=20, node_ids=universe
     )
     same_pool = score_universe._default_grounding_cache_path(
@@ -295,7 +295,7 @@ def test_default_e2e_grounding_cache_path_is_namespaced_by_pool_configuration(
         f0_cache, n_ground=50, node_ids=["node-a", "node-b", "node-d"]
     )
 
-    assert full != cosine_pool
+    assert full != narrow_pool
     assert full == same_pool
     assert full != other_universe
     assert "cosine_topk_v1" in full.name

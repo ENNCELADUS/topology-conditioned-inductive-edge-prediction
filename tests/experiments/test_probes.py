@@ -414,7 +414,7 @@ class TestE2EProbeArtifact:
                 expected_metadata=registered,
             )
 
-    def test_consumer_accepts_cosine_pool_registered_n_ground(self, tmp_path: Path) -> None:
+    def test_consumer_accepts_narrower_registered_n_ground(self, tmp_path: Path) -> None:
         path, graph, nodes, metadata = self._write(tmp_path, n_ground=20)
 
         report = probes.evaluate_e2e_probe_artifact(

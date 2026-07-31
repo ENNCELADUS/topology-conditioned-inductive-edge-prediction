@@ -1,18 +1,20 @@
-"""Contract tests for the EgoStitch rev-3.2 v4 draft registration.
+"""Contract tests for the EgoStitch rev-3.2 v5 draft registration.
 
-v4 records the single-stage plan-bound design (spec §13.19, §14.4.6-7) and
-re-pins the scientific reporting thresholds for the formal result. The tests below are
-written against three distinct failure modes:
+v5 migrates the trained-arm schema to the spec §14.4.6 component-ablation set
+(``cosine_pool`` retires; ``row_layernorm`` joins as the D0 ablation arm) while
+keeping v4's single-stage plan-bound design (spec §13.19, §14.4.6-7) and its
+re-pinned scientific reporting thresholds. The tests below are written against
+three distinct failure modes:
 
 1. *Dead machinery.*  v3 declared a five-gate pre-binding ladder, a three-attempt
    window, a rehearsal budget and a sealed ``V_select`` -- all of which the code
    can no longer run.  A green suite that asserts those fields enforces dead
-   machinery, so v4's tests assert their **absence**.
+   machinery, so these tests assert their **absence**.
 2. *Invented thresholds.*  Every formal-stage acceptance threshold is compared
    against the immutable BINDING v2 registration, field by field, so a number
    that drifted or was made up fails here rather than in a published table.
-3. *Fail-open drafts.*  v4 replaces the retired unresolved-marker string
-   convention with explicit JSON ``null``.  The tests prove that a v4 payload
+3. *Fail-open drafts.*  v4/v5 replace the retired unresolved-marker string
+   convention with explicit JSON ``null``.  The tests prove that a v5 payload
    flipped to ``BINDING`` is still refused by the real validators, so the
    convention change did not weaken the boundary.
 """
@@ -34,17 +36,18 @@ from src.model.egostitch.config import E2EConfig
 pytestmark = pytest.mark.unit
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-REGISTRATION_PATH = REPO_ROOT / "docs/registrations/g5_e2e_stage1_preregistration_v4.json"
-MARKDOWN_PATH = REPO_ROOT / "docs/registrations/g5_e2e_stage1_preregistration_v4.md"
+REGISTRATION_PATH = REPO_ROOT / "docs/registrations/g5_e2e_stage1_preregistration_v5.json"
+MARKDOWN_PATH = REPO_ROOT / "docs/registrations/g5_e2e_stage1_preregistration_v5.md"
 V2_REGISTRATION_PATH = REPO_ROOT / "docs/registrations/g5_e2e_stage1_preregistration_v2.json"
-V3_REGISTRATION_PATH = REPO_ROOT / "docs/registrations/g5_e2e_stage1_preregistration_v3.json"
+V4_REGISTRATION_PATH = REPO_ROOT / "docs/registrations/g5_e2e_stage1_preregistration_v4.json"
+EXPECTED_REGISTRATION_ID = "g5-e2e-stage1-20260730-component-ablation-screen-v5"
 EXPECTED_TRAINED_ARMS = (
     "full",
     "b0_e2e_f_only",
     "pair_topology",
     "p0",
-    "cosine_pool",
     "no_l_rel",
+    "row_layernorm",
 )
 EXPECTED_CONTROL_ARMS = (
     "structure_control_6a_v3",
@@ -79,7 +82,7 @@ def _as_int(value: object) -> int:
 
 
 def _section(key: str) -> dict[str, object]:
-    """Return one top-level v4 section, narrowed."""
+    """Return one top-level v5 section, narrowed."""
     return _mapping(_registration()[key])
 
 
@@ -101,9 +104,10 @@ def _marker_paths(value: object, path: str = "$") -> Iterator[str]:
 # --------------------------------------------------------------------------- draft identity
 
 
-def test_v4_registration_parses_as_a_nonbinding_draft() -> None:
+def test_v5_registration_parses_as_a_nonbinding_draft() -> None:
     registration = _registration()
 
+    assert registration["registration_id"] == EXPECTED_REGISTRATION_ID
     assert registration["status"] == "DRAFT"
     assert registration["status"] != "BINDING"
     assert registration["bound_utc"] is None
@@ -114,14 +118,14 @@ def test_v4_registration_parses_as_a_nonbinding_draft() -> None:
     assert hashlib.sha256(V2_REGISTRATION_PATH.read_bytes()).hexdigest() == predecessor["sha256"]
 
 
-def test_v3_is_retained_on_disk_and_named_as_the_superseded_draft() -> None:
-    """A published registration is history; v4 supersedes it without deleting it."""
-    assert V3_REGISTRATION_PATH.is_file()
+def test_v4_is_retained_on_disk_and_named_as_the_superseded_draft() -> None:
+    """A published registration is history; v5 supersedes v4 without deleting it."""
+    assert V4_REGISTRATION_PATH.is_file()
     superseded = _registration()["superseded_draft"]
     assert isinstance(superseded, dict)
-    assert superseded["path"] == ("docs/registrations/g5_e2e_stage1_preregistration_v3.json")
+    assert superseded["path"] == ("docs/registrations/g5_e2e_stage1_preregistration_v4.json")
     assert superseded["status"] == "DRAFT"
-    assert hashlib.sha256(V3_REGISTRATION_PATH.read_bytes()).hexdigest() == superseded["sha256"]
+    assert hashlib.sha256(V4_REGISTRATION_PATH.read_bytes()).hexdigest() == superseded["sha256"]
 
 
 def test_design_trail_digest_resolves() -> None:
@@ -135,7 +139,7 @@ def test_design_trail_digest_resolves() -> None:
 # --------------------------------------------------------------------------- deleted machinery
 
 
-def test_v4_declares_no_prebinding_ladder() -> None:
+def test_v5_declares_no_prebinding_ladder() -> None:
     """v3's five-gate ladder, attempt window and rehearsal budget are gone.
 
     Asserting their presence is what made the green suite enforce machinery the
@@ -146,9 +150,9 @@ def test_v4_declares_no_prebinding_ladder() -> None:
     assert "prebinding_qualification" not in registration
     assert "required_before_binding" not in registration
 
-    # `superseded_draft.what_v4_removes` is the change record and necessarily
-    # names the retired fields; every *live* section is searched instead, so a
-    # re-added gate anywhere else still fails here.
+    # `superseded_draft` is the change record and may necessarily name retired
+    # fields; every *live* section is searched instead, so a re-added gate
+    # anywhere else still fails here.
     live = {key: value for key, value in registration.items() if key != "superseded_draft"}
     raw = json.dumps(live)
     for retired in (
@@ -164,10 +168,10 @@ def test_v4_declares_no_prebinding_ladder() -> None:
         '"G3.4"',
         '"G3.5"',
     ):
-        assert retired not in raw, f"v4 still declares retired machinery: {retired}"
+        assert retired not in raw, f"v5 still declares retired machinery: {retired}"
 
 
-def test_v4_carries_no_unresolved_marker_strings() -> None:
+def test_v5_carries_no_unresolved_marker_strings() -> None:
     raw = REGISTRATION_PATH.read_text(encoding="utf-8")
     registration = json.loads(raw)
 
@@ -175,7 +179,7 @@ def test_v4_carries_no_unresolved_marker_strings() -> None:
     assert set(_marker_paths(registration)) == set()
 
 
-def test_v4_pins_no_prebinding_threshold_on_the_measured_pool_ceilings() -> None:
+def test_v5_pins_no_prebinding_threshold_on_the_measured_pool_ceilings() -> None:
     """The Phase-0 ceilings survive as measurements; the gate derived from them does not."""
     grounding = _registration()["grounding"]
     assert isinstance(grounding, dict)
@@ -205,7 +209,7 @@ def test_formal_acceptance_thresholds_are_copied_from_binding_v2() -> None:
 
     Protocol §5.2.4 requires the decision rules recorded before any held-out
     read.  Recording *new* numbers at that moment would be indistinguishable
-    from recording them after the fact, so v4 re-pins and this test proves it.
+    from recording them after the fact, so v5 re-pins and this test proves it.
     """
     registration = _registration()
     v2 = _v2_registration()
@@ -398,11 +402,11 @@ def test_quality_predicates_are_telemetry_only() -> None:
 
 
 
-def test_v4_registration_freezes_the_rev32_contract() -> None:
+def test_v5_registration_freezes_the_rev32_contract() -> None:
     registration = _registration()
     arms = registration["arms"]
     assert isinstance(arms, dict)
-    assert tuple(arms) == EXPECTED_TRAINED_ARMS + EXPECTED_CONTROL_ARMS
+    assert set(arms) == set(EXPECTED_TRAINED_ARMS + EXPECTED_CONTROL_ARMS)
 
     reconstruction = registration["training_contract"]
     assert isinstance(reconstruction, dict)
@@ -515,12 +519,12 @@ def test_v4_registration_freezes_the_rev32_contract() -> None:
     )
 
 
-def test_v4_registration_arm_schema_matches_the_migrated_code() -> None:
+def test_v5_registration_arm_schema_matches_the_migrated_code() -> None:
     registration = _registration()
     assert tuple(g5_stage1._E2E_ARMS) == EXPECTED_TRAINED_ARMS + EXPECTED_CONTROL_ARMS
     assert tuple(g5_stage1._E2E_FORMAL_ARMS) == EXPECTED_TRAINED_ARMS
     arms = _mapping(registration["arms"])
-    assert tuple(arms) == tuple(g5_stage1._E2E_ARMS)
+    assert set(arms) == set(g5_stage1._E2E_ARMS)
 
     for name in EXPECTED_TRAINED_ARMS:
         entry = _mapping(arms[name])
@@ -536,6 +540,43 @@ def test_v4_registration_arm_schema_matches_the_migrated_code() -> None:
         assert provenance["seed"] == 0
         assert provenance["keying"] == "canonical_pair_v1"
         assert provenance["checkpoint_arm"] == "full"
+
+
+def test_row_layernorm_arm_is_registered_as_the_d0_ablation() -> None:
+    """The new v5 arm is full plus one delta: row-LayerNorm feature standardization."""
+    arms = _section("arms")
+    entry = _mapping(arms["row_layernorm"])
+    assert entry["kind"] == "trained_checkpoint"
+    assert entry["training"] == ("configs/egostitch_e2e_v3_row_layernorm_breadth_first.yaml")
+    assert entry["n_ground"] == 50
+    assert entry["w_rel"] == 0.25
+    assert "feature_standardization: row_layernorm" in str(entry["difference_from_full"])
+    assert entry["scoring_provenance"] == {
+        "scaffold_control": "none",
+        "permanent_null": "none",
+        "primary_logit": "full",
+    }
+
+
+def test_observation_plan_registers_the_three_telemetry_only_targets() -> None:
+    plan = _section("observation_plan")
+    assert set(plan) == {
+        "semantics",
+        "generator_clipping",
+        "slot_collapse",
+        "end_ramp_precision_differential",
+    }
+    assert "telemetry-only" in str(plan["semantics"])
+    for target in (
+        "generator_clipping",
+        "slot_collapse",
+        "end_ramp_precision_differential",
+    ):
+        block = _mapping(plan[target])
+        question = block["question"]
+        assert isinstance(question, str) and question
+        telemetry = block["telemetry"]
+        assert isinstance(telemetry, list) and telemetry
 
 
 def test_registered_trained_arm_provenance_matches_what_the_worker_writes() -> None:
@@ -570,7 +611,7 @@ def test_the_six_v3_config_digests_are_repinned_as_they_now_stand() -> None:
         path = REPO_ROOT / str(entry["path"])
         assert path.is_file()
         assert hashlib.sha256(path.read_bytes()).hexdigest() == entry["sha256"], (
-            f"{arm}: config digest moved; re-pin it in registration v4"
+            f"{arm}: config digest moved; re-pin it in registration v5"
         )
 
 
@@ -648,7 +689,7 @@ def test_metrics_block_keeps_the_paired_reporting_and_naming_rules() -> None:
 # --------------------------------------------------------------------------- probe producer
 
 
-def test_v4_registration_formal_probe_path_is_producer_accepted(
+def test_v5_registration_formal_probe_path_is_producer_accepted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -822,7 +863,7 @@ def test_shared_registration_path_resolvers_reject_invalid_values(
 # --------------------------------------------------------------------------- markdown twin
 
 
-def test_v4_markdown_declares_json_authority_and_matches_critical_pins() -> None:
+def test_v5_markdown_declares_json_authority_and_matches_critical_pins() -> None:
     text = MARKDOWN_PATH.read_text(encoding="utf-8")
 
     assert "Status: `DRAFT`" in text
@@ -830,10 +871,10 @@ def test_v4_markdown_declares_json_authority_and_matches_critical_pins() -> None
     for arm in EXPECTED_TRAINED_ARMS + EXPECTED_CONTROL_ARMS:
         assert f"`{arm}`" in text
     for pin in (
-        "one formal training stage",
+        "One formal training stage",
         "There is no qualification stage",
         "Eligibility, liveness, slot-collapse indicators",
-        "run then emits implementation",
         "nullable run-evidence placeholders",
+        "`feature_standardization: row_layernorm`",
     ):
         assert pin in text, f"markdown twin lost pin {pin}"

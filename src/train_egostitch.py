@@ -711,8 +711,8 @@ E2EArmName = Literal[
     "b0_e2e_f_only",
     "pair_topology",
     "p0",
-    "cosine_pool",
     "no_l_rel",
+    "row_layernorm",
 ]
 
 
@@ -1430,8 +1430,8 @@ _E2E_FORMAL_ARMS: tuple[E2EArmName, ...] = (
     "b0_e2e_f_only",
     "pair_topology",
     "p0",
-    "cosine_pool",
     "no_l_rel",
+    "row_layernorm",
 )
 _E2E_CONTROL_ARMS = ("structure_control_6a_v3", "structure_control_6e_v1")
 _E2E_ARMS = _E2E_FORMAL_ARMS + _E2E_CONTROL_ARMS
@@ -1463,7 +1463,7 @@ def _validate_e2e_formal_plan(
     consulted here.
     """
     from src.experiments.e2e_binding import (
-        ACTIVE_V4_ARMS,
+        ACTIVE_V5_ARMS,
         PLAN_SCHEMA_V2,
         plan_schema_for_registration,
     )
@@ -1473,7 +1473,7 @@ def _validate_e2e_formal_plan(
     except ValueError as error:
         raise FormalPlanMismatch(str(error)) from error
     if schema != PLAN_SCHEMA_V2:
-        raise FormalPlanMismatch("formal training requires the active v4 plan schema")
+        raise FormalPlanMismatch("formal training requires the active v5 plan schema")
     configs = snapshot.payload.get("config_artifacts")
     expected_configs = frozenset(_E2E_FORMAL_ARMS)
     if not isinstance(configs, Mapping) or set(configs) != expected_configs:
@@ -1481,7 +1481,7 @@ def _validate_e2e_formal_plan(
             "config_artifacts do not match the registration's trained checkpoint arms"
         )
     registered_arms = snapshot.payload.get("arms")
-    if not isinstance(registered_arms, Mapping) or set(registered_arms) != ACTIVE_V4_ARMS:
+    if not isinstance(registered_arms, Mapping) or set(registered_arms) != ACTIVE_V5_ARMS:
         raise FormalPlanMismatch("registration arms do not match its identity schema")
     for trained_arm in expected_configs:
         entry = registered_arms.get(trained_arm)
@@ -3403,8 +3403,8 @@ def _e2e_arm_name_from_config(config: E2EConfig) -> E2EArmName:
         return "p0"
     if config.w_rel == 0.0:
         return "no_l_rel"
-    if config.n_ground == 20:
-        return "cosine_pool"
+    if config.feature_standardization == "row_layernorm":
+        return "row_layernorm"
     return "full"
 
 
@@ -5248,8 +5248,9 @@ def _bind_feature_standardization(
         data: The assembled training data, carrying the V_fit statistics.
 
     Returns:
-        The bound `feature_stats_sha256`, or ``""`` for the replay-only
-        `row_layernorm` mode.
+        The bound `feature_stats_sha256`, or ``""`` for the `row_layernorm`
+        mode (the registered D0-ablation arm and replay of pre-D0
+        checkpoints), which binds no statistics.
 
     Raises:
         RuntimeError: When the registered `zscore_vfit_v1` mode has no

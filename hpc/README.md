@@ -80,11 +80,11 @@ are selectable; the two scoring-time controls (`structure_control_6a_v3`,
 `structure_control_6e_v1`) reuse the full arm's checkpoint and are rejected here:
 
 ```bash
-hpc/qualification.sh formal full   # or f_only|pair_topology|p0|cosine_pool|no_l_rel
+hpc/qualification.sh formal full   # or f_only|pair_topology|p0|no_l_rel|row_layernorm
 ```
 
 The governing file is
-`docs/registrations/g5_e2e_stage1_preregistration_v4.json`. Its exact bytes and SHA-256
+`docs/registrations/g5_e2e_stage1_preregistration_v5.json`. Its exact bytes and SHA-256
 are recorded and must remain unchanged for the run. Its descriptive `DRAFT` status and
 nullable evidence placeholders do not block execution; the concrete implementation,
 parameter-group, pack/validation, boundary, runtime/peak-memory, and checkpoint-policy

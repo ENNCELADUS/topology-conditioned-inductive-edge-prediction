@@ -19,7 +19,7 @@ from src import score_universe
 from src import train_egostitch as te
 from src.data import internal_holdout
 from src.experiments import b0_cal, g5_stage1, probes
-from src.experiments.e2e_binding import ACTIVE_V4_REGISTRATION_ID
+from src.experiments.e2e_binding import ACTIVE_V5_REGISTRATION_ID
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.e2e_model import EgoStitchE2E
 from src.score_universe import ScoresArtifact, load_scores, save_scores
@@ -582,8 +582,8 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
             "b0_e2e_f_only": ("none", "all_head", "f_logit"),
             "pair_topology": ("none", "content_head", "pair_topology"),
             "p0": ("none", "none", "full"),
-            "cosine_pool": ("none", "none", "full"),
             "no_l_rel": ("none", "none", "full"),
+            "row_layernorm": ("none", "none", "full"),
             "structure_control_6a_v3": ("shuffle_within_pair_v3", "none", "full"),
             "structure_control_6e_v1": ("rewire_checkerboard_v1", "none", "full"),
         }[name]
@@ -630,8 +630,8 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
         "b0_e2e_f_only": config_root / "egostitch_e2e_v3_f_only_breadth_first.yaml",
         "pair_topology": config_root / "egostitch_e2e_v3_pair_topology_breadth_first.yaml",
         "p0": config_root / "egostitch_e2e_v3_p0_breadth_first.yaml",
-        "cosine_pool": config_root / "egostitch_e2e_v3_cosine_pool_breadth_first.yaml",
         "no_l_rel": config_root / "egostitch_e2e_v3_no_l_rel_breadth_first.yaml",
+        "row_layernorm": config_root / "egostitch_e2e_v3_row_layernorm_breadth_first.yaml",
     }
     preregistration = json.loads(preregistration_path.read_text())
     preregistration["benchmark"] = {"strategy": "toy"}
@@ -646,24 +646,24 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
                         "b0_e2e_f_only": "none",
                         "pair_topology": "none",
                         "p0": "none",
-                        "cosine_pool": "none",
                         "no_l_rel": "none",
+                        "row_layernorm": "none",
                     }[name],
                     "permanent_null": {
                         "full": "none",
                         "b0_e2e_f_only": "all_head",
                         "pair_topology": "content_head",
                         "p0": "none",
-                        "cosine_pool": "none",
                         "no_l_rel": "none",
+                        "row_layernorm": "none",
                     }[name],
                     "primary_logit": {
                         "full": "full",
                         "b0_e2e_f_only": "f_logit",
                         "pair_topology": "pair_topology",
                         "p0": "full",
-                        "cosine_pool": "full",
                         "no_l_rel": "full",
+                        "row_layernorm": "full",
                     }[name],
                 },
             }
@@ -731,7 +731,7 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
     }
     preregistration.pop("binding_evidence", None)
     preregistration["evaluator"] = {"seed": 0}
-    preregistration["registration_id"] = ACTIVE_V4_REGISTRATION_ID
+    preregistration["registration_id"] = ACTIVE_V5_REGISTRATION_ID
     preregistration_path.write_text(json.dumps(preregistration, sort_keys=True, indent=2) + "\n")
     preregistration_sha256 = hashlib.sha256(preregistration_path.read_bytes()).hexdigest()
     run_metadata_paths: dict[str, Path] = {}
@@ -741,8 +741,8 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
             "b0_e2e_f_only": ("all_head", 0.15, 0.15),
             "pair_topology": ("content_head", 0.15, 0.15),
             "p0": ("none", 0.0, 0.0),
-            "cosine_pool": ("none", 0.15, 0.15),
             "no_l_rel": ("none", 0.15, 0.15),
+            "row_layernorm": ("none", 0.15, 0.15),
         }[name]
         scoring_semantics = cast(
             dict[str, object], preregistration["arms"][name]["scoring_provenance"]
@@ -1642,10 +1642,10 @@ class TestE2EGateCli:
                 str(_d(inputs)["arm_universe_paths"]["pair_topology"]),
                 "--p0-universe",
                 str(_d(inputs)["arm_universe_paths"]["p0"]),
-                "--cosine-pool-universe",
-                str(_d(inputs)["arm_universe_paths"]["cosine_pool"]),
                 "--no-l-rel-universe",
                 str(_d(inputs)["arm_universe_paths"]["no_l_rel"]),
+                "--row-layernorm-universe",
+                str(_d(inputs)["arm_universe_paths"]["row_layernorm"]),
                 "--run-metadata",
                 *[str(path) for path in _d(inputs)["run_metadata_paths"].values()],
                 "--b0-universe",

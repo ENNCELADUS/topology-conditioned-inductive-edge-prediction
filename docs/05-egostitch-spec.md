@@ -532,6 +532,24 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-07-30 (arm-schema migration to the v5 component-ablation set; supersedes
+  the §14.4.6 eight-arm listing): the trained-arm set becomes `full`,
+  `b0_e2e_f_only`, `pair_topology`, `p0`, `no_l_rel`, `row_layernorm`;
+  `cosine_pool` retires from the trained set (the Phase-0 measured slot-recall
+  ceilings, top-50 0.1395 vs top-20 0.1073, already bound the pool-width
+  effect, and its registered top-20 pack/caches remain on disk as historical
+  evidence). The new `row_layernorm` arm is identical to `full` except
+  `feature_standardization: row_layernorm` (the pre-D0 status-quo per-row
+  LayerNorm; binds no `feature_stats_sha256`), giving the rev-3.2 D0
+  per-dimension z-scoring mechanism the ablation arm the §4.6 anti-grab-bag
+  rule requires. The two scoring-time controls are unchanged. Probe
+  (`egostitch_e2e_probe_v2`) and scores-meta (`egostitch_e2e_scores_v3`)
+  versions do not bump: the array ABI and provenance fields are unchanged, and
+  the arm-enum plus registration-SHA validation already rejects
+  stale-schema artifacts. Registration v5 pins this schema. Rationale: the
+  formal screen must attribute each critical mechanism — conditioning as a
+  whole, the content pathway, branch dropout, `L_rel`, and D0 feature
+  standardization — to an arm it owns.
 - 2026-07-30 (owner decision; supersedes registration-state and pre-run
   evidence-completeness clauses): formal execution no longer requires
   `status: BINDING`, resolved `binding_evidence`, or any run-produced evidence
@@ -1975,18 +1993,29 @@ mutated-features-same-ids).
   retained; cross-process determinism; non-inertness on a random
   non-collapsed model.
 
-#### 14.4.6 v3 screen schema (eight arms)
+#### 14.4.6 v5 screen schema (eight arms)
 
-Six trained checkpoints — `full`, `b0_e2e_f_only`, `pair_topology`, `p0`,
-`cosine_pool` (identical to `full` except status-quo `n_g = 20` cosine
-pools), `no_l_rel` (identical to `full` except `w_rel = 0`) — plus two
-scoring-time controls over `full`'s checkpoint: `6a-v3`, `6e-v1`. Every
-formal-arm constant, binding-evidence validator, scoring CLI/provenance enum,
-run-metadata schema field, and test fixture migrates to this schema and
-fails closed on the predecessor's four-trained-checkpoint-plus-one-control shape.
-Artifact version bumps:
-`egostitch_e2e_probe_v2`; the scores-`.npz` meta version increments; old
-versions are rejected.
+Six trained checkpoints — `full`, `b0_e2e_f_only` (both conditioning
+pathways permanently nulled), `pair_topology` (content pathway permanently
+nulled), `p0` (identical to `full` except `p_topo = p_cont = 0`),
+`no_l_rel` (identical to `full` except `w_rel = 0`), `row_layernorm`
+(identical to `full` except `feature_standardization: row_layernorm`, the
+pre-D0 status-quo per-row LayerNorm; it binds no `feature_stats_sha256`
+and is the registered ablation of the §13.19.1 D0 per-dimension V_fit
+z-scoring) — plus two scoring-time controls over `full`'s checkpoint:
+`6a-v3`, `6e-v1`. Each trained arm owns exactly one mechanism axis:
+conditioning as a whole (`b0_e2e_f_only`), the content pathway
+(`pair_topology`), branch dropout (`p0`), the train-only relational
+auxiliary (`no_l_rel`), and D0 feature standardization (`row_layernorm`).
+`cosine_pool` (status-quo `n_g = 20` pools) is retired from the trained
+set per the 2026-07-30 §12 entry; the Phase-0 measured slot-recall
+ceilings carry the pool-width attribution. Every formal-arm constant,
+binding-evidence validator, scoring CLI/provenance enum, run-metadata
+schema field, and test fixture migrates to this schema and fails closed
+on the predecessor shapes. Artifact versions are unchanged
+(`egostitch_e2e_probe_v2`, `egostitch_e2e_scores_v3`): the array ABI and
+provenance fields do not move, and arm-enum plus registration-SHA
+validation rejects stale-schema artifacts.
 
 #### 14.4.7 Probes and single-stage execution (extends §13.19)
 

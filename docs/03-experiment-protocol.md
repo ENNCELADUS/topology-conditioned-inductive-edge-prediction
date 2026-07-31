@@ -579,6 +579,19 @@ rule).
    pairwise scorer's §0 role is **unchanged** (the measured grounding-pool audit
    eliminated the candidate-proposer reuse), and this paragraph does not bind the
    v4 registration or weaken E1/E3's multi-seed inference rules.
+   **Rev-3.2 v5 component-ablation schema (2026-07-30):** the v4 draft was
+   superseded before any run bound to it. The v5 registration
+   (`docs/registrations/g5_e2e_stage1_preregistration_v5.json`, spec §14.4.6)
+   keeps the eight-arm shape but re-points the trained set so each arm owns one
+   mechanism axis: `cosine_pool` retires (the Phase-0 measured slot-recall
+   ceilings carry the pool-width attribution) and `row_layernorm` — identical to
+   full except per-row LayerNorm feature standardization — becomes the ablation
+   of the rev-3.2 D0 per-dimension z-scoring fix. Acceptance thresholds, guards,
+   comparators, the operating point, and every claim-limit rule re-pin unchanged
+   from the BINDING v2 lineage. The v5 `observation_plan` additionally names the
+   three run-observation targets (generator clipping margins, slot collapse,
+   end-ramp precision differential) and the run-produced telemetry recording
+   them; it is descriptive and never an execution gate.
 
 ### 5.1 Priority order (after gates)
 

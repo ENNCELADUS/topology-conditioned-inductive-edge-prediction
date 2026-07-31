@@ -13,7 +13,7 @@ import pytest
 import torch
 from src import score_universe
 from src.experiments import g5_stage1
-from src.experiments.e2e_binding import ACTIVE_V4_REGISTRATION_ID
+from src.experiments.e2e_binding import ACTIVE_V5_REGISTRATION_ID
 from src.model.egostitch.e2e_model import EgoStitchE2E
 
 
@@ -99,7 +99,7 @@ def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     checkpoint = tmp_path / "best.pt"
     checkpoint.write_bytes(b"selected checkpoint")
     registration = {
-        "registration_id": ACTIVE_V4_REGISTRATION_ID,
+        "registration_id": ACTIVE_V5_REGISTRATION_ID,
         "status": "DRAFT",
         "arms": {
             **{
@@ -587,7 +587,7 @@ def test_scoring_rejects_tampered_run_provenance(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("scoring_arm", "checkpoint_arm", "scaffold_control"),
     [
-        ("cosine_pool", "cosine_pool", "none"),
+        ("row_layernorm", "row_layernorm", "none"),
         ("structure_control_6a_v3", "full", "shuffle_within_pair_v3"),
     ],
 )
@@ -680,13 +680,13 @@ def test_e2e_formal_scoring_provenance_rejects_non_v3_arm_packages(
 ) -> None:
     registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
     payload = json.loads(registration.read_text(encoding="utf-8"))
-    payload["arms"].pop("cosine_pool")
+    payload["arms"].pop("row_layernorm")
     payload["arms"].pop("no_l_rel")
     payload["arms"]["structure_control_6a"] = payload["arms"].pop(
         "structure_control_6a_v3"
     )
     payload["arms"].pop("structure_control_6e_v1")
-    payload["config_artifacts"].pop("cosine_pool")
+    payload["config_artifacts"].pop("row_layernorm")
     payload["config_artifacts"].pop("no_l_rel")
     if extra_arm is not None:
         payload["arms"][extra_arm] = payload["arms"]["full"]
@@ -874,9 +874,9 @@ def test_arm_checkpoint_path_falls_back_to_metadata_sibling_best_pt(
         "--arm-run-metadata",
         f"p0={metadata}",
         "--arm-run-metadata",
-        f"cosine_pool={metadata}",
-        "--arm-run-metadata",
         f"no_l_rel={metadata}",
+        "--arm-run-metadata",
+        f"row_layernorm={metadata}",
     ]
     with pytest.raises(ValueError, match="selected checkpoint not found"):
         score_universe.main(common)

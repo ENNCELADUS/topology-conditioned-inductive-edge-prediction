@@ -1,4 +1,5 @@
-# EgoStitch E2E rev-3.2 (D0 feature standardization; spec §13.19.1) p0 arm (spec §14.4.6).
+# EgoStitch E2E rev-3.2 D0-ablation arm (spec §14.4.6): identical to full except
+# feature_standardization row_layernorm (pre-D0 status-quo; binds no stats digest).
 
 model:
   family: egostitch_e2e
@@ -7,11 +8,11 @@ model:
     ste_dim: 128
     xattn_heads: 8
     n_inj: 1
-    p_topo: 0.0
-    p_cont: 0.0
+    p_topo: 0.15
+    p_cont: 0.15
     permanent_null: none
     n_ground: 50
-    feature_standardization: zscore_vfit_v1
+    feature_standardization: row_layernorm
 
 data:
   root: data
@@ -73,7 +74,7 @@ eval:
   eval_every: 1
 
 seed: 0
-output_dir: outputs/egostitch_e2e_stage1_v3/p0
+output_dir: outputs/egostitch_e2e_stage1_v3/row_layernorm
 mixed_precision: "bf16"
 preregistration: docs/registrations/g5_e2e_stage1_preregistration_v5.json
 

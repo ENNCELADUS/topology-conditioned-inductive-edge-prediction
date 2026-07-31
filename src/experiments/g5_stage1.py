@@ -30,7 +30,7 @@ CLI::
     python -m src.experiments.g5_stage1 \
         --full-universe full.npz --fonly-universe f_only.npz \
         --pt-universe pair_topology.npz --p0-universe p0.npz \
-        --cosine-pool-universe cosine_pool.npz --no-l-rel-universe no_l_rel.npz \
+        --no-l-rel-universe no_l_rel.npz --row-layernorm-universe row_layernorm.npz \
         --control-6a-universe control_6a.npz --control-6e-universe control_6e.npz \
         --run-metadata run_full.json ... \
         --b0-universe scores/b0_v31_candidate.npz \
@@ -707,8 +707,8 @@ _E2E_ARMS: tuple[str, ...] = (
     "b0_e2e_f_only",
     "pair_topology",
     "p0",
-    "cosine_pool",
     "no_l_rel",
+    "row_layernorm",
     "structure_control_6a_v3",
     "structure_control_6e_v1",
 )
@@ -717,8 +717,8 @@ _E2E_FORMAL_ARMS: tuple[str, ...] = (
     "b0_e2e_f_only",
     "pair_topology",
     "p0",
-    "cosine_pool",
     "no_l_rel",
+    "row_layernorm",
 )
 _E2E_CONTROL_ARMS: tuple[str, ...] = (
     "structure_control_6a_v3",
@@ -796,8 +796,8 @@ def _enforce_e2e_formal_metadata(
         "b0_e2e_f_only": ("all_head", 0.15, 0.15),
         "pair_topology": ("content_head", 0.15, 0.15),
         "p0": ("none", 0.0, 0.0),
-        "cosine_pool": ("none", 0.15, 0.15),
         "no_l_rel": ("none", 0.15, 0.15),
+        "row_layernorm": ("none", 0.15, 0.15),
     }
     checkpoints: set[str] = set()
     implementations: set[str] = set()
@@ -2047,8 +2047,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fonly-universe", type=Path)
     parser.add_argument("--pt-universe", type=Path)
     parser.add_argument("--p0-universe", type=Path)
-    parser.add_argument("--cosine-pool-universe", type=Path)
     parser.add_argument("--no-l-rel-universe", type=Path)
+    parser.add_argument("--row-layernorm-universe", type=Path)
     parser.add_argument("--probe-artifact", type=Path)
     return parser
 
@@ -2070,8 +2070,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "b0_e2e_f_only": args.fonly_universe,
         "pair_topology": args.pt_universe,
         "p0": args.p0_universe,
-        "cosine_pool": args.cosine_pool_universe,
         "no_l_rel": args.no_l_rel_universe,
+        "row_layernorm": args.row_layernorm_universe,
         "structure_control_6a_v3": args.control_6a_universe,
         "structure_control_6e_v1": args.control_6e_universe,
     }

@@ -53,10 +53,10 @@ hpc/qualification.sh formal <arm>   # registered schedule — results
 ```
 
 The run trains on `V_fit`, validates on the single 512-node `V_hold`, and executes
-`pack → train → publish` through the shared orchestrator. `formal` refuses to launch while
-[`docs/registrations/g5_e2e_stage1_preregistration_v4.json`](docs/registrations/g5_e2e_stage1_preregistration_v4.json)
-is `DRAFT`, and additionally requires exactly four visible H20s, a clean checkout,
-and exact plan/config/input identity. Quality telemetry never acts as authorization.
+`pack → train → publish` through the shared orchestrator. `formal` binds the exact bytes of
+[`docs/registrations/g5_e2e_stage1_preregistration_v5.json`](docs/registrations/g5_e2e_stage1_preregistration_v5.json)
+(status is descriptive, never a gate) and requires exactly four visible H20s, a clean
+checkout, and exact plan/config/input identity. Quality telemetry never acts as authorization.
 
 - **Task:** given two *unseen* nodes with frozen feature vectors, predict whether an
   edge exists between them (binary classification), under a strict inductive protocol
@@ -273,7 +273,8 @@ target test graph; the queried edge is masked/standardized inside the scaffold. 
 - [x] **G5 e2e screening gate** — binding fixed-Seed-0 v2 registration completed training (valid; liveness passed), held-out fp32 scoring, and the formal gate on 2026-07-24: BFS-macro GS passes but clustering-MMD and BFS-macro RD fail, the matched-AUPRC guard fails, and pathway attribution / the structure-destruction control both fail to establish a topology-conditioning gain. Verdict `cut` (multi-label). See the [result note](docs/results/G5-e2e-stage1-seed0-20260724.md).
 - [x] **Single-stage plan-bound cleanup (current worktree; commit pending)** — qualification and every qualification-to-formal or model-quality authorization gate are removed. Formal execution is coupled only to the owner-bound experiment plan and exact artifact identities; model-quality signals are telemetry. `V_fit` and the single 512-node `V_hold := V_qual ∪ V_select` remain unchanged. Contract: spec §13.19 and §12.
 - [x] **Rev-3.0 disposition** — the owner-side discussion advanced the line through rev-3.1 to the active rev-3.2 eight-arm contract; the 2026-07-24 `cut` remains historical engineering evidence.
-- [x] **Registration v4 plan snapshot** — `docs/registrations/g5_e2e_stage1_preregistration_v4.json` pins the exact arm/config and frozen-input identities. Its `DRAFT` status and nullable run-evidence placeholders are descriptive, not launch gates.
+- [x] **Registration v4 plan snapshot** — superseded by v5 before any run bound to it; retained on disk as history.
+- [x] **Registration v5 component-ablation snapshot** — `docs/registrations/g5_e2e_stage1_preregistration_v5.json` pins the exact arm/config and frozen-input identities for the rev-3.2 screen. Each trained arm owns one mechanism axis; `cosine_pool` retired (Phase-0 pool-recall ceilings carry the width attribution) and the new `row_layernorm` arm ablates the D0 z-scoring fix. Its `observation_plan` maps the three run-observation targets (generator clipping margins, slot collapse, end-ramp precision differential) to the exact `profile.json` telemetry; `python -m src.experiments.observe_e2e_formal <output_dir>` prints the reports. `DRAFT` status and nullable run-evidence placeholders are descriptive, not launch gates.
 - [ ] **Experiments** in priority order: the rev-3.2 eight-arm formal screen, then E1/E3 multi-seed main + baselines → E4 ablations (incl. E4.15–E4.17 attribution/structure/conditioning-depth) → E5 integrity gates → E7 (load-bearing) → E6 breadth.
 
 ## HPC execution
@@ -296,7 +297,7 @@ that exact hardware shape. There is no job scheduler (e.g. Slurm).
 **EgoStitch e2e training is a single plan-bound run driven by the historically named
 `hpc/qualification.sh`**, over
 the six configured `configs/egostitch_e2e_v3_*.yaml` trained arms
-(`full`, `f_only`, `pair_topology`, `p0`, `cosine_pool`, `no_l_rel`). It uses the
+(`full`, `f_only`, `pair_topology`, `p0`, `no_l_rel`, `row_layernorm`). It uses the
 auto-detected multi-GPU orchestrator and `src.train_egostitch`, runs `pack → train →
 publish`, trains on `V_fit`, validates on `V_hold`, and may not open a held-out path.
 
