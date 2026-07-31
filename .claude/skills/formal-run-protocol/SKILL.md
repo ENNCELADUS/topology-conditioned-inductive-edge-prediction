@@ -1,17 +1,17 @@
 ---
 name: formal-run-protocol
-description: Use before binding a pre-registration, launching a formal (non-debug) run, or writing up any result. Covers plan/artifact identity, BINDING status, debug boundaries, and what a one-seed screen may claim.
+description: Use before fixing a registration snapshot, launching a formal (non-debug) run, or writing up any result. Covers exact plan/artifact identity, descriptive registration status, debug boundaries, and what a one-seed screen may claim.
 ---
 
 # Formal run protocol
 
-This repo runs pre-registered experiments. A result is worthless — worse,
-misleading — unless it was bound *before* training. These rules are enforced in
-code, so violating them usually means a provenance or preregistration mismatch,
-not a wrong number. Model-quality telemetry is deliberately not an authorization
-mechanism.
+This repo runs plan-bound experiments. A result is worthless — worse,
+misleading — unless the exact experiment plan is captured before training and
+carried through every artifact by byte identity and SHA-256. Registration status
+is descriptive provenance, not an authorization state machine. Model-quality
+telemetry is deliberately not an authorization mechanism.
 
-## Binding a run
+## Plan identity and registration status
 
 - Registrations live in `docs/registrations/*.json`. The `.md` twin is
   explanatory only — **if they disagree, the JSON governs**.
@@ -19,22 +19,27 @@ mechanism.
   `run_metadata.json` at run start. `_enforce_metadata_registration_hash`
   refuses to open any held-out metric
   when the hashes disagree. Spec §13.14, §13.18.
-- A `BINDING` registration is **immutable**. Amending it means a new versioned
-  file (v1→v2→v3, predecessor recorded). Nothing is ever rebound retroactively:
-  an artifact produced under a superseded hash stays diagnostic-only forever,
-  carrying its old hash in provenance. Spec §13.15, §13.18, §13.19.4.
-- Changing any plan-defining optimizer, schedule, precision, candidate grid, or
-  frozen input after binding is a **scientific change**
-  requiring a new registration version — not a bugfix. Spec §13.19.2.
+- `status` and `bound_utc` are descriptive only. `DRAFT`, `BINDING`, or another
+  value neither authorizes nor blocks training, scoring, evaluation, or claims.
+  Formal execution does not require resolved `binding_evidence` or run-produced
+  evidence placeholders. Spec §12 (2026-07-30), §13.19.4, §14.4.
+- A historical `BINDING` registration remains immutable, and every run's exact
+  registration snapshot is immutable within that run/artifact chain. Changing
+  any plan-defining optimizer, schedule, precision, candidate grid, frozen input,
+  arm config, or registration byte is a **scientific change** requiring a new
+  versioned snapshot, never a retroactive rewrite. Spec §13.15, §13.18, §13.19.2.
 - The E2E path is a single formal stage: `hpc/qualification.sh formal <arm>`.
   There is no qualification stage, qualification artifact, verdict/history, or
   qualification-to-formal authorization path.
-- Formal preflight is limited to the bound plan and artifact identity: BINDING
-  registration, clean implementation identity, the six config digests, and the
-  registered parameter-group, pack/validation, boundary-audit, runtime, and
-  checkpoint-policy evidence. It does not require a quality pass.
+- Formal preflight requires the unchanged registration snapshot/SHA-256, exact
+  registered arm/config path and digest, a clean implementation checkout, the
+  correct repository/runtime boundary, and exactly four visible NVIDIA H20s.
+- Parameter-group manifests, pack/validation manifests, boundary audits,
+  runtime/peak-memory evidence, and checkpoint-policy provenance are produced by
+  the actual run and verified downstream against its artifacts. Their absence
+  before the run cannot block execution.
 
-## Binding vs diagnostic-only
+## Formal vs debug
 
 - A successful formal run publishes its plan-bound artifacts and checkpoint.
   Checkpoint ranking considers all completed epochs under the registered
@@ -76,16 +81,16 @@ mechanism.
 ## Who decides
 
 Dispositions are **owner-side locked-decision discussions** — not decided by a
-screen, a result note, or any agent. The rev-3.0 build line's fate is explicitly
-open (`docs/results/G5-e2e-stage1-seed0-20260724.md`, "Next step"). Blueprint §10
-locked decisions must be flagged, never renegotiated unilaterally.
+screen, a result note, or any agent. Blueprint §10 locked decisions must be
+flagged, never renegotiated unilaterally.
 
 ## Spec freeze rule
 
 `docs/05-egostitch-spec.md` was signed off at G4 (2026-07-09). Implementation may
 not silently deviate: **edit the spec first**, with a one-line rationale in §12
 (change log), then the code. A spec rewrite authorizes *implementation*, not
-*execution* (§14) — execution still needs a fresh BINDING registration.
+*execution* (§14). Formal execution additionally requires the exact-plan
+preflight above; it does not require `status: BINDING` or a qualification artifact.
 
 `docs/superpowers/specs/` holds design decision-trails and proposals awaiting
 owner sign-off. They are **not** contracts and edit nothing on their own.
