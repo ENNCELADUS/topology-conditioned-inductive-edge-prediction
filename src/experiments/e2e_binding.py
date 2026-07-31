@@ -6,7 +6,7 @@ from collections.abc import Mapping
 
 PLAN_SCHEMA_V1 = "egostitch_e2e_plan_v1"
 PLAN_SCHEMA_V2 = "egostitch_e2e_plan_v2"
-ACTIVE_V5_REGISTRATION_ID = "g5-e2e-stage1-20260730-component-ablation-screen-v5"
+ACTIVE_V5_REGISTRATION_ID = "g5-e2e-stage1-20260731-component-ablation-screen-v5"
 HISTORICAL_V1_REGISTRATION_ID = (
     "g5-e2e-stage1-20260719-conditioned-encoder-stability-screen-v2"
 )

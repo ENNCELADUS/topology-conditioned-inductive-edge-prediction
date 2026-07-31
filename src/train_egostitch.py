@@ -46,6 +46,7 @@ from typing import Literal, TypeVar, cast
 import networkx as nx
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml  # type: ignore[import-untyped]
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
@@ -70,8 +71,8 @@ from src.model.egostitch.conditioning import (
     sample_branch_masks,
 )
 from src.model.egostitch.config import E2EConfig
-from src.model.egostitch.e2e_model import EgoStitchE2E
-from src.model.egostitch.imagine import NULL_MODE_ALL, NULL_MODE_CONTENT, NULL_MODE_FULL
+from src.model.egostitch.e2e_model import E2ENodeState, EgoStitchE2E
+from src.model.egostitch.imagine import NULL_MODE_ALL, NULL_MODE_CONTENT, NULL_MODE_FULL, SlotSet
 from src.model.egostitch.losses import stage1_family_tensors, stage1_total
 from src.train_b0 import (
     EvalConfig,
@@ -2056,7 +2057,7 @@ def _assemble_e2e_data(
         store,
         allowed_nodes,
         cache_path=f0_cache,
-        allow_cache_subset=True,
+        allow_cache_subset=False,
     )
     fit_nodes = sorted(holdout.v_fit)
     fit_rows = np.asarray(
@@ -3054,6 +3055,7 @@ class _ValidationResult:
     metrics: EdgeMetrics
     fidelity: dict[str, float]
     scale_telemetry: dict[str, float] = field(default_factory=dict)
+    timing: dict[str, float] = field(default_factory=dict)
     active_logits: NDArray[np.float32] = field(
         default_factory=lambda: np.empty(0, dtype="<f4")
     )
@@ -3081,43 +3083,96 @@ def _validation_clustering_mmd(data: EgoStitchData, logits: np.ndarray) -> float
     )
 
 
-def _e2e_validation_batch(
+def _e2e_validation_grounding_rows(
+    data: EgoStitchData,
+    nodes: Sequence[str],
+) -> NDArray[np.int64]:
+    """Resolve role-specific validation grounding to global F0 row ids."""
+    validation_index = data.validation_grounding_index
+    validation_pos = data.validation_pos or {}
+    rows: list[NDArray[np.int64]] = []
+    for node in nodes:
+        if node in data.train_pos:
+            rows.append(data.grounding_index[data.train_pos[node]])
+        elif validation_index is not None and node in validation_pos:
+            rows.append(validation_index[validation_pos[node]])
+        else:
+            raise RuntimeError(f"no role-specific grounding row for validation node {node!r}")
+    return np.stack(rows).astype(np.int64, copy=False)
+
+
+def _e2e_validation_node_batch(
     data: EgoStitchData,
     token_table: PackedFeatureTable,
     token_node_index: Mapping[str, int],
-    rows: Sequence[tuple[str, str, int]],
+    nodes: Sequence[str],
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
-    """Build one `egostitch_e2e` validation batch (real grounding, no `s0`)."""
-    endpoints_u = [u for u, _, _ in rows]
-    endpoints_v = [v for _, v, _ in rows]
-    idx_i = torch.tensor([data.node_index[u] for u in endpoints_u], dtype=torch.long)
-    idx_j = torch.tensor([data.node_index[v] for v in endpoints_v], dtype=torch.long)
-    validation_index = data.validation_grounding_index
-    validation_pos = data.validation_pos or {}
-
-    def pool_rows(nodes: Sequence[str]) -> NDArray[np.int64]:
-        rows: list[NDArray[np.int64]] = []
-        for node in nodes:
-            if node in data.train_pos:
-                rows.append(data.grounding_index[data.train_pos[node]])
-            elif validation_index is not None and node in validation_pos:
-                rows.append(validation_index[validation_pos[node]])
-            else:
-                raise RuntimeError(f"no role-specific grounding row for validation node {node!r}")
-        return np.stack(rows).astype(np.int64, copy=False)
-
-    pool_rows_u = pool_rows(endpoints_u)
-    pool_rows_v = pool_rows(endpoints_v)
-    batch = _gather_token_streams(token_table, token_node_index, endpoints_u, endpoints_v)
-    batch["x_a"] = data.f0[idx_i]
-    batch["x_b"] = data.f0[idx_j]
-    batch["ground_a"] = data.f0[torch.from_numpy(pool_rows_u)]
-    batch["ground_b"] = data.f0[torch.from_numpy(pool_rows_v)]
-    batch["ground_id_a"] = torch.from_numpy(pool_rows_u)
-    batch["ground_id_b"] = torch.from_numpy(pool_rows_v)
-    batch["is_self"] = torch.tensor([u == v for u, v, _ in rows], dtype=torch.bool)
+    """Build one unique-node validation encode batch."""
+    packed_rows = torch.tensor([token_node_index[node] for node in nodes], dtype=torch.long)
+    boundary = max(token_table.manifest.nodes[row].length for row in packed_rows.tolist())
+    emb, length = token_table.gather_nodes(packed_rows, boundary)
+    node_rows = torch.tensor([data.node_index[node] for node in nodes], dtype=torch.long)
+    grounding_rows = _e2e_validation_grounding_rows(data, nodes)
+    batch = {
+        "emb": emb,
+        "length": length,
+        "x": data.f0[node_rows],
+        "ground": data.f0[torch.from_numpy(grounding_rows)],
+        "ground_ids": torch.from_numpy(grounding_rows),
+    }
     return cast(dict[str, torch.Tensor], _to_device(batch, device))
+
+
+def _fp32_cached_node_state(state: E2ENodeState, row: int) -> E2ENodeState:
+    """Detach one encoded node while preserving integer identity fields exactly."""
+    length = state.length[row : row + 1].clone()
+    true_length = int(length.item())
+    slots = SlotSet(
+        *(
+            value[row : row + 1].float().clone()
+            if value.is_floating_point()
+            else value[row : row + 1].clone()
+            for value in state.slots
+        )
+    )
+    ground_ids = None
+    if state.ground_ids is not None:
+        ground_ids = state.ground_ids[row : row + 1].clone()
+    return E2ENodeState(
+        encoded=state.encoded[row : row + 1, :true_length].float().clone(),
+        length=length,
+        slots=slots,
+        projected_x=state.projected_x[row : row + 1].float().clone(),
+        ground_ids=ground_ids,
+    )
+
+
+def _stack_cached_node_states(
+    cache: Mapping[str, E2ENodeState], nodes: Sequence[str]
+) -> E2ENodeState:
+    """Reconstruct one pair-endpoint state batch from the per-rank cache."""
+    states = [cache[node] for node in nodes]
+    width = max(state.encoded.size(1) for state in states)
+    encoded = torch.cat(
+        [F.pad(state.encoded, (0, 0, 0, width - state.encoded.size(1))) for state in states]
+    )
+    ground_ids: torch.Tensor | None
+    if any(state.ground_ids is None for state in states):
+        if not all(state.ground_ids is None for state in states):
+            raise RuntimeError("validation node cache has inconsistent grounding ids")
+        ground_ids = None
+    else:
+        ground_ids = torch.cat([cast(torch.Tensor, state.ground_ids) for state in states])
+    return E2ENodeState(
+        encoded=encoded,
+        length=torch.cat([state.length for state in states]),
+        slots=SlotSet(
+            *(torch.cat(values) for values in zip(*(state.slots for state in states), strict=True))
+        ),
+        projected_x=torch.cat([state.projected_x for state in states]),
+        ground_ids=ground_ids,
+    )
 
 
 def _e2e_validation_slice_rows(n_val: int) -> tuple[int, ...]:
@@ -3155,6 +3210,7 @@ def _validate_epoch(
     only to the full ``none`` arm; permanent-null arms select by active-arm
     AUPRC without that topology tie-break.
     """
+    was_training = model.training
     model.eval()
     n_val = len(data.val_pairs)
     rank, world = accelerator.process_index, accelerator.num_processes
@@ -3163,43 +3219,86 @@ def _validate_epoch(
     while len(shard_rows) < shard_len:
         shard_rows.append(shard_rows[0] if shard_rows else 0)
 
+    assert token_table is not None and token_node_index is not None, (
+        "family egostitch_e2e requires token_table/token_node_index"
+    )
+    unique_nodes = list(
+        dict.fromkeys(node for row in shard_rows for node in data.val_pairs[row])
+    )
+
+    def synchronize_device() -> None:
+        if accelerator.device.type == "cuda":
+            torch.cuda.synchronize(accelerator.device)
+
+    synchronize_device()
+    node_cache_started = time.monotonic()
+    node_cache: dict[str, E2ENodeState] = {}
     values_out: list[torch.Tensor] = []
+    # Validation may run inside an outer autocast context (for example the
+    # CPU bf16 contract test).  `inference_mode` can then seed autocast's
+    # weight cache with inference tensors that a later training forward tries
+    # to save for backward.  `no_grad` preserves eval semantics without
+    # contaminating the following optimizer step.
     with torch.no_grad():
+        length_buckets: dict[int, list[str]] = {}
+        for node in unique_nodes:
+            length = token_table.manifest.nodes[token_node_index[node]].length
+            bucket = next(
+                (boundary for boundary in (128, 256, 384, 512, 768, 1024) if length <= boundary),
+                length,
+            )
+            length_buckets.setdefault(bucket, []).append(node)
+        for bucket_nodes in length_buckets.values():
+            for start in range(0, len(bucket_nodes), edge_batch):
+                nodes = bucket_nodes[start : start + edge_batch]
+                node_batch = _e2e_validation_node_batch(
+                    data, token_table, token_node_index, nodes, accelerator.device
+                )
+                with torch.autocast(
+                    device_type=accelerator.device.type,
+                    dtype=torch.bfloat16,
+                ):
+                    encoded = model.encode_node_state(
+                        node_batch["emb"],
+                        node_batch["length"],
+                        node_batch["x"],
+                        node_batch["ground"],
+                        node_batch["ground_ids"],
+                    )
+                for offset, node in enumerate(nodes):
+                    node_cache[node] = _fp32_cached_node_state(encoded, offset)
+        synchronize_device()
+        node_cache_seconds = time.monotonic() - node_cache_started
+        pair_scoring_started = time.monotonic()
         for start in range(0, shard_len, edge_batch):
             chunk = shard_rows[start : start + edge_batch]
             rows = [(*data.val_pairs[i], int(data.val_labels[i])) for i in chunk]
-
-            assert token_table is not None and token_node_index is not None, (
-                "family egostitch_e2e requires token_table/token_node_index"
+            endpoints_u = [u for u, _, _ in rows]
+            endpoints_v = [v for _, v, _ in rows]
+            state_a = _stack_cached_node_states(node_cache, endpoints_u)
+            state_b = _stack_cached_node_states(node_cache, endpoints_v)
+            is_self = torch.tensor(
+                [u == v for u, v, _ in rows],
+                dtype=torch.bool,
+                device=accelerator.device,
             )
-            e2e_batch = _e2e_validation_batch(
-                data, token_table, token_node_index, rows, accelerator.device
-            )
-            # The packed token store is bf16-only (src/data/packed_features.py);
-            # `accelerator.prepare()` autocasts the training-step forward
-            # (`wrapped(...)`) automatically, but this call goes straight
-            # to the unwrapped model (matching the frozen-s0 branch below),
-            # so autocast must be requested explicitly here too (spec Sec
-            # 13.16 extension: per-node encode may stay bf16; this repeats
-            # that same contract at validation time).
             masks = (
                 None
                 if model.cfg.permanent_null == "none"
                 else masks_for_null(
                     model.cfg.permanent_null,
-                    e2e_batch["x_a"].shape[0],
+                    len(rows),
                     accelerator.device,
                 )
             )
-            with accelerator.autocast():
-                state_a, state_b, is_self = model._pair_node_states(e2e_batch)
+            with torch.autocast(device_type=accelerator.device.type, enabled=False):
                 context = model.build_pair_context_from_states(state_a, state_b, is_self)
                 full_logits = model.score_pair_context(context)
                 f_logits = model.score_pair_context(
                     context,
                     masks=masks_for_null(
                         NULL_ALL_HEAD,
-                        e2e_batch["x_a"].shape[0],
+                        len(rows),
                         accelerator.device,
                     ),
                 )
@@ -3263,14 +3362,27 @@ def _validate_epoch(
                     dim=-1,
                 )
             )
+        synchronize_device()
+        pair_scoring_seconds = time.monotonic() - pair_scoring_started
     n_cols = 12
     local_values = (
         torch.cat(values_out) if values_out else torch.zeros((0, n_cols), device=accelerator.device)
     )
     local_rows = torch.tensor(shard_rows, dtype=torch.long, device=accelerator.device)
+    gather_metrics_started = time.monotonic()
+    phase_timing_rows = accelerator.gather(
+        torch.tensor(
+            [node_cache_seconds, pair_scoring_seconds],
+            dtype=torch.float64,
+            device=accelerator.device,
+        ).unsqueeze(0)
+    ).reshape(world, 2)
+    node_cache_seconds = float(phase_timing_rows[:, 0].max().item())
+    pair_scoring_seconds = float(phase_timing_rows[:, 1].max().item())
     gathered_values = accelerator.gather(local_values)
     gathered_rows = accelerator.gather(local_rows)
-    model.train()
+    if was_training:
+        model.train()
     if not accelerator.is_main_process:
         return None
     rows_np = gathered_rows.cpu().numpy()
@@ -3333,10 +3445,17 @@ def _validate_epoch(
         **dispersion_summary,
         **e2e_degree_decorrelation_telemetry(endpoint_degree, full_np - f_np),
     }
+    active_metrics = compute_edge_metrics(data.val_labels.astype(np.int64), probs)
+    gather_metrics_seconds = time.monotonic() - gather_metrics_started
     return _ValidationResult(
-        metrics=compute_edge_metrics(data.val_labels.astype(np.int64), probs),
+        metrics=active_metrics,
         fidelity=fidelity,
         scale_telemetry=scale_telemetry,
+        timing={
+            "node_cache_encode_seconds": node_cache_seconds,
+            "pair_scoring_seconds": pair_scoring_seconds,
+            "gather_metrics_seconds": gather_metrics_seconds,
+        },
         active_logits=np.asarray(logits_np, dtype="<f4"),
     )
 
@@ -4095,6 +4214,11 @@ def _train_e2e_stability_loop(
     total_wall = 0.0
     total_data_wait = 0.0
     total_validation_seconds = 0.0
+    total_validation_timing = {
+        "node_cache_encode_seconds": 0.0,
+        "pair_scoring_seconds": 0.0,
+        "gather_metrics_seconds": 0.0,
+    }
     global_step = 0
     prefetch_depth = cfg.runtime.prefetch_factor if cfg.runtime is not None else 1
 
@@ -4106,6 +4230,8 @@ def _train_e2e_stability_loop(
         epoch_global_pairs = 0
         epoch_parts: dict[str, float] = {}
         epoch_probes: list[dict[str, object]] = []
+        epoch_validation_seconds = 0.0
+        epoch_validation_timing = dict.fromkeys(total_validation_timing, 0.0)
         batch_source = iter(
             factory.epoch_batches(epoch, rows_per_rank=rows_per_rank, steps=epoch_steps)
         )
@@ -4325,6 +4451,7 @@ def _train_e2e_stability_loop(
                                 )
 
                 if not profile_only and global_step == phase_a_end:
+                    phase_a_validation_started = time.monotonic()
                     warm = _validate_epoch(
                         model,
                         data,
@@ -4334,6 +4461,10 @@ def _train_e2e_stability_loop(
                         token_table=factory._token_table,
                         token_node_index=factory._token_node_index,
                     )
+                    epoch_validation_seconds += time.monotonic() - phase_a_validation_started
+                    if warm is not None:
+                        for name in epoch_validation_timing:
+                            epoch_validation_timing[name] += warm.timing.get(name, 0.0)
                     record_validation_event("phase_a_end", epoch, global_step)
                     warm_failure = 0
                     warm_floor_failure = 0
@@ -4421,8 +4552,12 @@ def _train_e2e_stability_loop(
             token_table=factory._token_table,
             token_node_index=factory._token_node_index,
         )
+        epoch_validation_seconds += time.monotonic() - validation_started
+        if validation is not None:
+            for name in epoch_validation_timing:
+                epoch_validation_timing[name] += validation.timing.get(name, 0.0)
         record_validation_event("epoch_end", epoch, global_step)
-        validation_seconds = time.monotonic() - validation_started
+        validation_seconds = epoch_validation_seconds
         epoch_wall = time.monotonic() - epoch_started
         phase = e2e_phase_state(global_step - 1, schedule_total_steps)
         collapse_failure = 0
@@ -4593,6 +4728,7 @@ def _train_e2e_stability_loop(
                 "data_wait_seconds": epoch_data_wait,
                 "compute_seconds": max(epoch_wall - epoch_data_wait - validation_seconds, 0.0),
                 "validation_seconds": validation_seconds,
+                **epoch_validation_timing,
             }
         )
         total_local_pairs += epoch_local_pairs
@@ -4600,6 +4736,8 @@ def _train_e2e_stability_loop(
         total_wall += epoch_wall
         total_data_wait += epoch_data_wait
         total_validation_seconds += validation_seconds
+        for name in total_validation_timing:
+            total_validation_timing[name] += epoch_validation_timing[name]
 
     if global_step != executed_steps:
         raise RuntimeError(f"E2E execution coverage broken: {global_step} != {executed_steps}")
@@ -4786,6 +4924,7 @@ def _train_e2e_stability_loop(
         "global_tokens": global_tokens,
         "global_tokens_per_second": global_tokens / slowest_wall if slowest_wall > 0 else 0.0,
         "validation_seconds": total_validation_seconds,
+        "validation_timing": total_validation_timing,
         "per_epoch": per_epoch_profiles,
         "gradient_norm_series": gradient_norm_series,
         "optimizer_step_gradients": optimizer_step_gradients,

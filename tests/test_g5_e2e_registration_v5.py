@@ -40,7 +40,7 @@ REGISTRATION_PATH = REPO_ROOT / "docs/registrations/g5_e2e_stage1_preregistratio
 MARKDOWN_PATH = REPO_ROOT / "docs/registrations/g5_e2e_stage1_preregistration_v5.md"
 V2_REGISTRATION_PATH = REPO_ROOT / "docs/registrations/g5_e2e_stage1_preregistration_v2.json"
 V4_REGISTRATION_PATH = REPO_ROOT / "docs/registrations/g5_e2e_stage1_preregistration_v4.json"
-EXPECTED_REGISTRATION_ID = "g5-e2e-stage1-20260730-component-ablation-screen-v5"
+EXPECTED_REGISTRATION_ID = "g5-e2e-stage1-20260731-component-ablation-screen-v5"
 EXPECTED_TRAINED_ARMS = (
     "full",
     "b0_e2e_f_only",
@@ -108,6 +108,7 @@ def test_v5_registration_parses_as_a_nonbinding_draft() -> None:
     registration = _registration()
 
     assert registration["registration_id"] == EXPECTED_REGISTRATION_ID
+    assert registration["created_utc"] == "2026-07-31T00:00:00Z"
     assert registration["status"] == "DRAFT"
     assert registration["status"] != "BINDING"
     assert registration["bound_utc"] is None
@@ -382,6 +383,33 @@ def test_selection_band_is_a_fixed_plan_value_without_calibration_artifact() -> 
         selection["auprc_tolerance_rule"]
     )
     assert "auprc_tolerance_calibration_method" not in selection
+
+
+def test_v5_pins_the_repaired_validation_and_cache_runtime() -> None:
+    registration = _registration()
+    runtime = _mapping(registration["validation_runtime_contract"])
+    cache = _mapping(registration["f0_cache_identity_contract"])
+    selection = _section("checkpoint_selection")
+
+    assert "each unique endpoint node exactly once" in str(runtime["endpoint_encoding"])
+    assert "fp32" in str(runtime["node_state_precision"])
+    assert "autocast disabled in fp32" in str(runtime["pair_precision"])
+    assert "torch.no_grad" in str(runtime["autograd_boundary"])
+    assert "torch.inference_mode is forbidden" in str(runtime["autograd_boundary"])
+    assert runtime["timing_telemetry"] == [
+        "node_cache_encode_seconds",
+        "pair_scoring_seconds",
+        "gather_metrics_seconds",
+    ]
+    assert "phase_a_end is not aliased" in str(runtime["validation_events"])
+    assert "exact ordered V_fit union V_hold" in str(cache["training"])
+    assert "superset-cache fallback is forbidden" in str(cache["scoring"])
+    assert "last Phase-A update" in str(selection["warm_reference_std"])
+    assert "first validation after conditioning activates" in str(
+        selection["warm_reference_auprc"]
+    )
+    assert ">= label prevalence + 0.02" in str(selection["warm_reference_auprc"])
+    assert "warm_reference" not in selection
 
 
 def test_single_stage_plan_has_no_qualification_contract() -> None:

@@ -42,7 +42,8 @@ from src.model.egostitch import EgoStitchConfig
 from src.model.egostitch import e2e_model as e2e_module
 from src.model.egostitch.conditioning import GatedCrossAttention, HeadNullMasks
 from src.model.egostitch.config import E2EConfig
-from src.model.egostitch.e2e_model import E2EPairContext, EgoStitchE2E
+from src.model.egostitch.e2e_model import E2ENodeState, E2EPairContext, EgoStitchE2E
+from src.model.egostitch.imagine import SlotSet
 from src.train_b0 import ModelConfig
 
 from tests.test_train_egostitch import _E2E_TINY_MODEL, _NODES, _toy_bundle, _toy_cfg
@@ -1488,6 +1489,417 @@ class TestE2ECompositeStep:
         assert any(id(p) in trainable_ids for p in model.trunk.parameters())
 
 
+def _float_node_state(state: E2ENodeState) -> E2ENodeState:
+    """Detach the cacheable fields exactly where validation enters its fp32 island."""
+    return E2ENodeState(
+        encoded=state.encoded.float(),
+        length=state.length,
+        slots=SlotSet(
+            *(value.float() if value.is_floating_point() else value for value in state.slots)
+        ),
+        projected_x=state.projected_x.float(),
+        ground_ids=state.ground_ids,
+    )
+
+
+def _uncached_validation_node_batch(
+    data: te.EgoStitchData,
+    token_table: PackedFeatureTable,
+    token_node_index: Mapping[str, int],
+    node: str,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Build one independent role-scoped endpoint input for the reference path."""
+    packed_row = token_node_index[node]
+    boundary = token_table.manifest.nodes[packed_row].length
+    emb, length = token_table.gather_nodes(torch.tensor([packed_row]), boundary)
+    if node in data.train_pos:
+        grounding_rows = data.grounding_index[data.train_pos[node]]
+    elif data.validation_grounding_index is not None and node in (data.validation_pos or {}):
+        validation_pos = cast(dict[str, int], data.validation_pos)
+        grounding_rows = data.validation_grounding_index[validation_pos[node]]
+    else:
+        raise RuntimeError(f"no role-specific grounding row for validation node {node!r}")
+    node_row = data.node_index[node]
+    rows = torch.from_numpy(np.asarray(grounding_rows, dtype=np.int64)).unsqueeze(0)
+    return {
+        "emb": emb.to(device),
+        "length": length.to(device),
+        "x": data.f0[node_row : node_row + 1].to(device),
+        "ground": data.f0[rows].to(device),
+        "ground_ids": rows.to(device),
+    }
+
+
+def _uncached_validation_reference(
+    model: EgoStitchE2E,
+    data: te.EgoStitchData,
+    accelerator: Accelerator,
+    token_table: PackedFeatureTable,
+    token_node_index: Mapping[str, int],
+) -> tuple[np.ndarray, dict[str, float], dict[str, float], EdgeMetrics]:
+    """Score each endpoint afresh: BF16 node encode, then an fp32 pair pass."""
+    values: list[list[float]] = []
+    was_training = model.training
+    model.eval()
+    with torch.inference_mode():
+        for u, v in data.val_pairs:
+            states: dict[str, E2ENodeState] = {}
+            for node in dict.fromkeys((u, v)):
+                batch = _uncached_validation_node_batch(
+                    data,
+                    token_table,
+                    token_node_index,
+                    node,
+                    accelerator.device,
+                )
+                with accelerator.autocast():
+                    state = model.encode_node_state(
+                        batch["emb"],
+                        batch["length"],
+                        batch["x"],
+                        batch["ground"],
+                        batch["ground_ids"],
+                    )
+                states[node] = _float_node_state(state)
+            state_a = states[u]
+            state_b = states[v]
+            is_self = torch.tensor([u == v], device=accelerator.device)
+            with torch.autocast(device_type=accelerator.device.type, enabled=False):
+                context = model.build_pair_context_from_states(state_a, state_b, is_self)
+                full = model.score_pair_context(context)
+                f_logit = model.score_pair_context(
+                    context,
+                    masks=te.masks_for_null(te.NULL_ALL_HEAD, 1, accelerator.device),
+                )
+                active = (
+                    full
+                    if model.cfg.permanent_null == "none"
+                    else model.score_pair_context(
+                        context,
+                        masks=te.masks_for_null(model.cfg.permanent_null, 1, accelerator.device),
+                    )
+                )
+            assert context.plan is not None
+            dispersion_a = te._e2e_dispersion_rows(
+                state_a.slots.pi, state_a.slots.h, state_a.slots.adj, context.plan
+            )
+            dispersion_b = te._e2e_dispersion_rows(
+                state_b.slots.pi, state_b.slots.h, state_b.slots.adj, context.plan
+            )
+            dispersion = {
+                name: (
+                    0.5 * (dispersion_a[name] + dispersion_b[name])
+                    if name in {"pi_slot_std", "h_pairwise_cosine_mean", "adj_offdiag_std"}
+                    else dispersion_a[name]
+                )
+                for name in dispersion_a
+            }
+            scale_a = te._e2e_scale_rows(state_a.slots.h, context.plan)
+            scale_b = te._e2e_scale_rows(state_b.slots.h, context.plan)
+            scale = {
+                name: (
+                    0.5 * (scale_a[name] + scale_b[name])
+                    if name in {"h_norm_mean", "h_pairwise_sqdist_mean"}
+                    else scale_a[name]
+                )
+                for name in scale_a
+            }
+            if u == v:
+                for name in ("plan_row_entropy", "plan_rank1_marginal_residual"):
+                    dispersion[name] = torch.full_like(dispersion[name], torch.nan)
+                for name in ("plan_total_mass", "plan_max_cell_fraction"):
+                    scale[name] = torch.full_like(scale[name], torch.nan)
+            values.append(
+                [
+                    float(active),
+                    float(full),
+                    float(f_logit),
+                    *(
+                        float(dispersion[name])
+                        for name in (
+                            "pi_slot_std",
+                            "h_pairwise_cosine_mean",
+                            "adj_offdiag_std",
+                            "plan_row_entropy",
+                            "plan_rank1_marginal_residual",
+                        )
+                    ),
+                    *(
+                        float(scale[name])
+                        for name in (
+                            "plan_total_mass",
+                            "plan_max_cell_fraction",
+                            "h_norm_mean",
+                            "h_pairwise_sqdist_mean",
+                        )
+                    ),
+                ]
+            )
+    model.train(was_training)
+    ordered = np.asarray(values, dtype=np.float64)
+    active_logits = ordered[:, 0]
+    full_logits = ordered[:, 1]
+    f_logits = ordered[:, 2]
+    residual_std = float(np.std(full_logits - f_logits))
+    f_std = float(np.std(f_logits))
+    dispersion_names = (
+        "pi_slot_std",
+        "h_pairwise_cosine_mean",
+        "adj_offdiag_std",
+        "plan_row_entropy",
+        "plan_rank1_marginal_residual",
+    )
+    dispersion_summary = {
+        name: (
+            float(np.mean(column[np.isfinite(column)])) if bool(np.isfinite(column).any()) else 0.0
+        )
+        for name, column in zip(dispersion_names, ordered[:, 3:8].T, strict=True)
+    }
+    scale_names = (
+        "plan_total_mass",
+        "plan_max_cell_fraction",
+        "h_norm_mean",
+        "h_pairwise_sqdist_mean",
+    )
+    scale_summary = {
+        name: (
+            float(np.mean(column[np.isfinite(column)]))
+            if bool(np.isfinite(column).any())
+            else float("nan")
+        )
+        for name, column in zip(scale_names, ordered[:, 8:12].T, strict=True)
+    }
+    f_probs = 1.0 / (1.0 + np.exp(-f_logits))
+    f_metrics = te.compute_edge_metrics(data.val_labels.astype(np.int64), f_probs)
+    fidelity = {
+        "active_logit_std": float(np.std(active_logits)),
+        "f_logit_std": f_std,
+        "f_logit_auprc": f_metrics.auprc,
+        "topology_delta_std": residual_std,
+        "topology_delta_ratio": residual_std / max(f_std, 1e-12),
+        **dispersion_summary,
+        **te.e2e_degree_decorrelation_telemetry(
+            te._e2e_validation_endpoint_degrees(data), full_logits - f_logits
+        ),
+    }
+    probs = 1.0 / (1.0 + np.exp(-active_logits))
+    metrics = te.compute_edge_metrics(data.val_labels.astype(np.int64), probs)
+    return active_logits, fidelity, scale_summary, metrics
+
+
+class TestE2EValidationCache:
+    """The per-call V_hold node cache and fp32 pair-pass contract."""
+
+    @staticmethod
+    def _setup(
+        tmp_path: Path,
+    ) -> tuple[
+        te.EgoStitchData,
+        EgoStitchE2E,
+        Accelerator,
+        PackedFeatureTable,
+        dict[str, int],
+    ]:
+        torch.manual_seed(0)
+        data = replace(
+            _toy_bundle(tmp_path, EgoStitchConfig()),
+            val_pairs=[("n0", "n1"), ("n1", "n0"), ("n2", "n2"), ("n0", "n2")],
+            val_labels=np.asarray([1, 0, 1, 0], dtype=np.int8),
+        )
+        pack_dir = tmp_path / "validation-token-pack"
+        _write_tiny_token_pack(pack_dir, _NODES, min_length=3)
+        table = PackedFeatureTable.from_pack(pack_dir, torch.device("cpu"))
+        model = EgoStitchE2E(E2EConfig.from_mapping(dict(_E2E_TINY_MODEL)))
+        return data, model, Accelerator(cpu=True), table, table.manifest.node_index()
+
+    @staticmethod
+    def _validate(
+        model: EgoStitchE2E,
+        data: te.EgoStitchData,
+        accelerator: Accelerator,
+        table: PackedFeatureTable,
+        index: Mapping[str, int],
+    ) -> te._ValidationResult:
+        result = te._validate_epoch(
+            model,
+            data,
+            accelerator,
+            edge_batch=2,
+            topk_fraction=0.25,
+            token_table=table,
+            token_node_index=index,
+        )
+        assert result is not None
+        return result
+
+    def test_unique_nodes_are_cached_as_fp32_and_pair_pass_disables_autocast(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        data, model, accelerator, table, index = self._setup(tmp_path)
+        encode_lengths: list[int] = []
+        encode_autocast: list[bool] = []
+        pair_rows: list[tuple[list[int], list[int], list[bool]]] = []
+        original_encode = model.encode_node_state
+        original_build = model.build_pair_context_from_states
+        original_score = model.score_pair_context
+
+        def _encode(*args: object, **kwargs: object) -> E2ENodeState:
+            lengths = cast(torch.Tensor, args[1])
+            encode_lengths.extend(int(value) for value in lengths.tolist())
+            encode_autocast.append(torch.is_autocast_enabled("cpu"))
+            return original_encode(*args, **kwargs)  # type: ignore[arg-type]
+
+        def _build(
+            state_a: E2ENodeState,
+            state_b: E2ENodeState,
+            is_self: torch.Tensor,
+            **kwargs: object,
+        ) -> E2EPairContext:
+            assert not torch.is_autocast_enabled("cpu")
+            for state in (state_a, state_b):
+                floating = (
+                    state.encoded,
+                    state.projected_x,
+                    *(value for value in state.slots if value.is_floating_point()),
+                )
+                assert all(value.dtype == torch.float32 for value in floating)
+            pair_rows.append(
+                (
+                    [int(value) for value in state_a.length.tolist()],
+                    [int(value) for value in state_b.length.tolist()],
+                    [bool(value) for value in is_self.tolist()],
+                )
+            )
+            return original_build(state_a, state_b, is_self, **kwargs)
+
+        def _score(context: E2EPairContext, **kwargs: object) -> torch.Tensor:
+            assert not torch.is_autocast_enabled("cpu")
+            logits = original_score(context, **kwargs)
+            assert logits.dtype == torch.float32
+            return logits
+
+        monkeypatch.setattr(model, "encode_node_state", _encode)
+        monkeypatch.setattr(model, "build_pair_context_from_states", _build)
+        monkeypatch.setattr(model, "score_pair_context", _score)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            result = self._validate(model, data, accelerator, table, index)
+
+        expected_lengths = [table.manifest.nodes[index[node]].length for node in ("n0", "n1", "n2")]
+        assert sorted(encode_lengths) == sorted(expected_lengths)
+        assert all(encode_autocast)
+        assert pair_rows == [([3, 4], [4, 3], [False, False]), ([5, 3], [5, 5], [True, False])]
+        assert result.active_logits.dtype == np.dtype("<f4")
+        assert set(result.timing) == {
+            "node_cache_encode_seconds",
+            "pair_scoring_seconds",
+            "gather_metrics_seconds",
+        }
+        assert all(value >= 0.0 for value in result.timing.values())
+
+    def test_cached_outputs_match_uncached_reference_with_ab_ba_and_self(
+        self, tmp_path: Path
+    ) -> None:
+        data, model, accelerator, table, index = self._setup(tmp_path)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            cached = self._validate(model, data, accelerator, table, index)
+            logits, fidelity, scale, metrics = _uncached_validation_reference(
+                model, data, accelerator, table, index
+            )
+
+        np.testing.assert_allclose(cached.active_logits, logits, rtol=2e-4, atol=2e-5)
+        for name, expected in fidelity.items():
+            assert cached.fidelity[name] == pytest.approx(expected, rel=2e-4, abs=2e-5)
+        for name, expected in scale.items():
+            assert cached.scale_telemetry[name] == pytest.approx(expected, rel=2e-4, abs=2e-5)
+        for name in EdgeMetrics.__dataclass_fields__:
+            actual = getattr(cached.metrics, name)
+            expected = getattr(metrics, name)
+            if isinstance(expected, float):
+                assert actual == pytest.approx(expected, rel=2e-4, abs=2e-5)
+            else:
+                assert actual == expected
+
+    def test_cache_is_rebuilt_after_model_mutation(self, tmp_path: Path) -> None:
+        data, model, accelerator, table, index = self._setup(tmp_path)
+        encode_rows = 0
+        original_encode = model.encode_node_state
+
+        def _encode(*args: object, **kwargs: object) -> E2ENodeState:
+            nonlocal encode_rows
+            encode_rows += int(cast(torch.Tensor, args[1]).numel())
+            return original_encode(*args, **kwargs)  # type: ignore[arg-type]
+
+        model.encode_node_state = _encode  # type: ignore[method-assign]
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            before = self._validate(model, data, accelerator, table, index)
+            with torch.no_grad():
+                list(model.head.parameters())[-1].add_(0.75)
+            after = self._validate(model, data, accelerator, table, index)
+
+        assert encode_rows == 2 * len({node for pair in data.val_pairs for node in pair})
+        np.testing.assert_allclose(
+            after.active_logits - before.active_logits,
+            np.full(len(data.val_pairs), 0.75, dtype=np.float32),
+            rtol=2e-4,
+            atol=2e-5,
+        )
+
+    def test_validation_encoding_reads_only_v_hold_rows(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        data, model, accelerator, table, index = self._setup(tmp_path)
+        validation_nodes = ("n0", "n1", "n2")
+        validation_rows = {data.node_index[node] for node in validation_nodes}
+        n_ground = model.generator_cfg.n_ground
+        grounding = np.asarray(
+            [
+                [
+                    data.node_index[validation_nodes[(row + offset) % 3]]
+                    for offset in range(n_ground)
+                ]
+                for row in range(3)
+            ],
+            dtype=np.int64,
+        )
+        data = replace(
+            data,
+            train_nodes=["n3", "n4", "n5", "n6"],
+            train_pos={node: offset for offset, node in enumerate(("n3", "n4", "n5", "n6"))},
+            validation_role="V_hold",
+            validation_nodes=validation_nodes,
+            validation_positive_edges=(("n0", "n1"),),
+            validation_grounding_index=grounding,
+            validation_pos={node: offset for offset, node in enumerate(validation_nodes)},
+        )
+        endpoint_rows: set[int] = set()
+        grounding_rows: set[int] = set()
+        original_encode = model.encode_node_state
+
+        def _encode(
+            emb: torch.Tensor,
+            length: torch.Tensor,
+            x: torch.Tensor,
+            ground: torch.Tensor,
+            ground_ids: torch.Tensor | None = None,
+        ) -> E2ENodeState:
+            assert ground_ids is not None
+            for row in x:
+                matches = torch.nonzero((data.f0 == row.cpu()).all(dim=1), as_tuple=False)
+                assert matches.shape == (1, 1)
+                endpoint_rows.add(int(matches.item()))
+            grounding_rows.update(int(value) for value in ground_ids.flatten().tolist())
+            return original_encode(emb, length, x, ground, ground_ids)
+
+        monkeypatch.setattr(model, "encode_node_state", _encode)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            self._validate(model, data, accelerator, table, index)
+
+        assert endpoint_rows == validation_rows
+        assert grounding_rows == validation_rows
+        assert data.node_index["n7"] not in endpoint_rows | grounding_rows
+
+
 class _ArchivedV1TrainLoopE2E:
     """Full `train_egostitch_ddp_loop` run, family egostitch_e2e (Task 13c).
 
@@ -1657,6 +2069,48 @@ class _ArchivedV1TrainLoopE2E:
             assert validation.active_logits.shape == data.val_labels.shape
 
 
+def test_phase_a_end_and_epoch_end_are_distinct_validation_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper = _ArchivedV1TrainLoopE2E()
+
+    def _activate_once(
+        monitor: te._GradientImbalanceMonitor, step: int, norms: dict[str, float]
+    ) -> bool:
+        del norms
+        if monitor.activated_step is not None:
+            return False
+        monitor.activated_step = step
+        return True
+
+    monkeypatch.setattr(te._GradientImbalanceMonitor, "update", _activate_once)
+    original_forward = te._CompositeStep.forward
+
+    def _assert_training_inputs_are_not_inference_tensors(
+        composite: te._CompositeStep, batch: dict[str, object]
+    ) -> dict[str, object]:
+        for section in ("node", "edge"):
+            for name, value in cast(dict[str, object], batch[section]).items():
+                if isinstance(value, torch.Tensor):
+                    assert not value.is_inference(), f"{section}.{name} is an inference tensor"
+        return cast(dict[str, object], original_forward(composite, batch))
+
+    monkeypatch.setattr(
+        te._CompositeStep,
+        "forward",
+        _assert_training_inputs_are_not_inference_tensors,
+    )
+    cfg, _, _, result = helper._run(tmp_path)
+
+    events = result.runtime_profile["v_hold_validation_events"]
+    assert result.runtime_profile["v_hold_validation_event_count"] == cfg.optim.epochs + 2
+    assert [row["kind"] for row in events] == [
+        "step_0",
+        "phase_a_end",
+        *(["epoch_end"] * cfg.optim.epochs),
+    ]
+
+
 _E2E_PIPELINE_NODES = [f"g{i}" for i in range(25)]
 
 
@@ -1806,6 +2260,31 @@ class TestPrepareAndAssembleE2E:
             data.train_nodes,
         )
         assert data.feature_stats.digest == expected.digest
+
+    def test_assembly_rejects_an_f0_cache_superset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """V_fit union V_hold must match the cached row identity exactly."""
+        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
+        data = te.assemble_egostitch_data(cfg)
+        cache_path = cfg.data.f0_cache
+        cached = cast(
+            dict[str, object],
+            torch.load(cache_path, map_location="cpu", weights_only=True),
+        )
+        exact_nodes = sorted(set(data.train_nodes) | set(data.validation_nodes))
+        assert cached["node_ids"] == exact_nodes
+        matrix = cast(torch.Tensor, cached["matrix"])
+        torch.save(
+            {
+                "node_ids": [*exact_nodes, "sealed-test-sentinel"],
+                "matrix": torch.cat([matrix, torch.zeros_like(matrix[:1])]),
+            },
+            cache_path,
+        )
+
+        with pytest.raises(ValueError, match="node ordering"):
+            te.assemble_egostitch_data(cfg)
 
     def test_assembly_raises_when_feature_stats_universe_diverges_from_v_fit(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

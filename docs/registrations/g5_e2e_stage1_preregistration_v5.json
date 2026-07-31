@@ -1,7 +1,7 @@
 {
-  "registration_id": "g5-e2e-stage1-20260730-component-ablation-screen-v5",
+  "registration_id": "g5-e2e-stage1-20260731-component-ablation-screen-v5",
   "status": "DRAFT",
-  "created_utc": "2026-07-30T00:00:00Z",
+  "created_utc": "2026-07-31T00:00:00Z",
   "bound_utc": null,
   "gate": "G5 Stage 1 - EgoStitch E2E rev-3.2 single-stage component-ablation screen",
   "spec_binding": "docs/05-egostitch-spec.md \u00a713.19 (single-stage plan-bound experiment) and \u00a714.4 in full",
@@ -25,6 +25,7 @@
       "the trained-arm schema migrates to the spec 14.4.6 v5 component-ablation set: cosine_pool retires from the trained set (the Phase-0 measured slot-recall ceilings, top-50 0.1395 vs top-20 0.1073, already bound the pool-width effect; its registered top-20 pack and caches remain on disk as historical evidence)",
       "a new row_layernorm trained arm - identical to full except feature_standardization: row_layernorm, the pre-D0 status-quo per-row LayerNorm binding no feature_stats_sha256 - gives the rev-3.2 D0 per-dimension z-scoring mechanism the ablation arm the proposal 4.6 anti-grab-bag rule requires",
       "a descriptive observation_plan block names the three run-observation targets (generator clipping margins, slot collapse, end-ramp precision differential) and the exact profile.json telemetry that records them; it is documentation of telemetry, never an execution gate",
+      "the validation and scoring runtime is re-pinned to unique-node endpoint encoding, fp32 cached node state, autocast-disabled fp32 pair scoring, exact F0 cache-universe identity, and real two-rank DDP coverage; validation uses no_grad rather than inference_mode so an enclosing autocast context cannot contaminate a later training backward pass",
       "config_artifacts digests re-pinned against the six v5-schema configs; every acceptance threshold, guard, comparator, evaluator setting, and claim-limit rule is carried over from v4 (itself re-pinned verbatim from BINDING v2) unchanged"
     ]
   },
@@ -85,6 +86,25 @@
     "quality_policy": "All model-quality predicates are telemetry-only. Eligibility, liveness, slot-collapse, clipping/family/RMS margins, AUPRC, dispersion, and precision quality misses cannot block training completion, checkpoint publication, scoring, or evaluation.",
     "truthfulness_failures": "Non-finite tensors, DDP disagreement, incomplete or duplicate coverage, data-boundary violations, malformed or hash-mismatched inputs/artifacts, and I/O/infrastructure failures still fail closed.",
     "test_access": "see test_protocol below"
+  },
+  "validation_runtime_contract": {
+    "endpoint_encoding": "within each validation event and rank, derive the existing rank-strided padded pair shard, encode each unique endpoint node exactly once in length buckets, and reconstruct AB, BA, and self-pair batches from that event-local cache",
+    "node_state_precision": "raw-token and generator node encoding may run under BF16 autocast; every floating E2ENodeState field is detached into fp32 before caching, while integer lengths and global grounding ids retain their exact integer dtype and identity",
+    "pair_precision": "build_pair_context_from_states, full/f_logit/active-arm scoring, and their selection telemetry run with autocast disabled in fp32",
+    "autograd_boundary": "validation runs in eval mode under torch.no_grad and restores the model's prior training mode; torch.inference_mode is forbidden because an enclosing autocast cache can otherwise retain inference tensors that fail the following training backward pass",
+    "ddp_coverage": "all ranks execute collectives in the same order; slowest-rank node-cache and pair-scoring timings are gathered before value and row gathers; rank zero deduplicates padded row ids and requires exact ordered coverage of the complete V_hold manifest",
+    "validation_events": "step_0, phase_a_end, and each epoch_end are actual validation executions and immutable ledger events; phase_a_end is not aliased to a coincident epoch_end",
+    "timing_telemetry": [
+      "node_cache_encode_seconds",
+      "pair_scoring_seconds",
+      "gather_metrics_seconds"
+    ],
+    "verification": "the Linux gate is a real two-rank process-group test over a five-row non-divisible shard and must match serial logits/metrics within fp32 numerical tolerance without deadlock"
+  },
+  "f0_cache_identity_contract": {
+    "training": "the assembled EgoStitch E2E F0 cache must match the exact ordered V_fit union V_hold node universe; a superset or reordered cache is rejected",
+    "scoring": "score_universe requires the exact ordered requested scoring-node universe when an F0 cache exists; a missing cache may be built, but a superset-cache fallback is forbidden",
+    "role_boundary": "validation endpoint and grounding reads use only the registered V_hold role rows; training reads remain V_fit-only"
   },
   "arms": {
     "full": {
@@ -438,7 +458,8 @@
   "checkpoint_selection": {
     "first_eligible_time": "after the conditioning ramp and one complete full-joint (Phase-C) epoch, independently of world size",
     "aggregation": "complete global V_hold manifest after exact DDP gather; fp32 average_precision_score on binary labels, with unweighted Brier/ECE reported for calibration",
-    "warm_reference": "measured immediately after the last Phase-A update, in evaluation mode, on the complete V_hold pair manifest and written to immutable run metadata; runtime collapse monitoring uses a fixed slice of that manifest",
+    "warm_reference_std": "std(f_logit) is measured immediately after the last Phase-A update, in evaluation mode, on the complete V_hold pair manifest and written to immutable run metadata; runtime collapse monitoring uses a fixed slice of that manifest",
+    "warm_reference_auprc": "AUPRC(f_logit) is measured at the first validation after conditioning activates, exactly as frozen spec section 14.4.3 requires; its threshold remains >= label prevalence + 0.02",
     "topology_metric": "raw biased squared MMD between the single exact-gold-density predicted-graph and gold-graph clustering-coefficient histograms under the pinned histogram bins and RBF-kernel configuration: MMD_clust_raw^2 = mmd_squared([h_clust(G_pred)], [h_clust(G_gold)]). It is raw single-graph clustering MMD-squared - NOT a density ratio ('RD') and NOT the normalized multi-sample MMD ratio used by the external assembled-graph evaluator. Model-selection evidence only, never external held-out scientific evidence.",
     "full_and_p0_eligibility": [
       "all finite and gradient guards pass for the epoch",

@@ -1980,17 +1980,8 @@ def _score_egostitch_e2e(
     if not 0 <= row_start <= row_start + len(pairs) <= len(node_universe):
         raise ValueError("e2e scoring rows are outside the declared pair universe")
     node_ids = sorted({node_id for pair in node_universe for node_id in pair})
-    try:
-        f0_cache.parent.mkdir(parents=True, exist_ok=True)
-        matrix, index = build_f0_matrix(
-            store, node_ids, cache_path=f0_cache, allow_cache_subset=True
-        )
-    except ValueError:
-        logger.warning(
-            "F0 cache at %s does not match the requested node set; recomputing without cache",
-            f0_cache,
-        )
-        matrix, index = build_f0_matrix(store, node_ids, cache_path=None)
+    f0_cache.parent.mkdir(parents=True, exist_ok=True)
+    matrix, index = build_f0_matrix(store, node_ids, cache_path=f0_cache)
 
     registered_n_ground = model.generator_cfg.n_ground
     if grounding_cache is None:

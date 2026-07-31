@@ -13,7 +13,10 @@ effect; its top-20 pack and caches stay on disk as historical evidence). A new
 `feature_standardization: row_layernorm` — gives the rev-3.2 D0 per-dimension
 z-scoring mechanism the ablation arm the proposal §4.6 anti-grab-bag rule
 requires. Every acceptance threshold, guard, comparator, evaluator setting,
-and claim-limit rule is carried over unchanged (v4 → v2 lineage).
+and claim-limit rule is carried over unchanged (v4 → v2 lineage). This v5 is
+the owner-directed 2026-07-31 replacement snapshot: it also binds the repaired
+validation/cache/precision execution path described below; no earlier v5 bytes
+remain authoritative.
 
 ## Active execution contract
 
@@ -26,6 +29,40 @@ only the exact experiment plan and runtime boundary:
 - registration ID and byte-unchanged SHA-256;
 - clean implementation checkout and exact arm/config path plus SHA-256;
 - correct repository/runtime boundary and exactly four visible H20s.
+
+## Validation and cache execution contract
+
+Each rank keeps the existing rank-strided, padded validation pair shard, but
+encodes every unique endpoint node only once per validation event. Endpoint
+states are reconstructed for `AB`, `BA`, and self pairs from an event-local
+cache. Raw-token and generator encoding may use BF16 autocast; every floating
+cached `E2ENodeState` field is promoted to FP32, while lengths and global
+grounding IDs retain their integer identity. Pair-context construction and all
+full/null/active-arm logits run with autocast disabled in FP32.
+
+Validation uses `torch.no_grad()` in eval mode and restores the model's previous
+training mode. `torch.inference_mode()` is forbidden here: under an enclosing
+autocast context it can seed the autocast weight cache with inference tensors
+that make the following training backward pass fail. `step_0`, `phase_a_end`,
+and every `epoch_end` remain separate real validation executions and ledger
+events even when two events share an optimizer step.
+
+The DDP contract requires identical collective order on every rank, exact
+ordered global `V_hold` coverage after padded-row deduplication, and timing for
+the slowest-rank node-cache encode, pair scoring, and rank-zero gather/metrics
+phases. The Linux gate runs a real two-rank, five-row non-divisible shard and
+compares it with serial validation within FP32 numerical tolerance.
+
+F0 caches are exact-universe artifacts. Training requires the exact ordered
+`V_fit ∪ V_hold` universe; scoring requires the exact ordered requested scoring
+universe. Superset or reordered caches fail closed. Validation endpoint and
+grounding reads remain `V_hold`-only, and training remains `V_fit`-only.
+
+The two warm-reference quantities have distinct registered snapshot points:
+`warm_reference_std` is measured immediately after the final Phase-A update;
+`warm_reference_auprc` is measured at the first validation after conditioning
+activates, as frozen spec §14.4.3 requires. Its threshold remains
+`>= prevalence + 0.02`.
 
 ## Registered arms (each owns one mechanism axis)
 

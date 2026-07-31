@@ -1074,6 +1074,77 @@ def test_egostitch_e2e_cli_is_deterministic(tmp_path: Path) -> None:
     np.testing.assert_array_equal(a.f_logit, b.f_logit)
 
 
+def test_egostitch_e2e_f0_cache_requires_exact_universe_match(tmp_path: Path) -> None:
+    data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
+    cache_path = tmp_path / "f0_cache.pt"
+    store = FeatureStore(data_root / "features" / "frozen_node_features_1024")
+    expected_node_ids = sorted({node for pair in _E2E_PAIRS for node in pair})
+    build_f0_matrix(store, expected_node_ids, cache_path=cache_path)
+
+    output = tmp_path / "exact-cache.npz"
+    score_universe.main(_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, output))
+
+    artifact = score_universe.load_scores(output)
+    assert artifact.node_ids == expected_node_ids
+
+
+def test_egostitch_e2e_rejects_superset_f0_cache(tmp_path: Path) -> None:
+    data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
+    cache_path = tmp_path / "f0_cache.pt"
+    store = FeatureStore(data_root / "features" / "frozen_node_features_1024")
+    build_f0_matrix(store, sorted(_E2E_NODES), cache_path=cache_path)
+
+    with pytest.raises(ValueError, match="does not match the requested node_ids"):
+        score_universe.main(
+            _egostitch_e2e_score_args(
+                tmp_path, data_root, checkpoint, pairs, tmp_path / "rejected.npz"
+            )
+        )
+
+
+def test_egostitch_e2e_exact_f0_cache_is_shard_invariant(tmp_path: Path) -> None:
+    data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
+    cache_path = tmp_path / "f0_cache.pt"
+    store = FeatureStore(data_root / "features" / "frozen_node_features_1024")
+    expected_node_ids = sorted({node for pair in _E2E_PAIRS for node in pair})
+    build_f0_matrix(store, expected_node_ids, cache_path=cache_path)
+
+    unsharded_path = tmp_path / "unsharded-cache.npz"
+    score_universe.main(
+        _egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, unsharded_path)
+    )
+    unsharded = score_universe.load_scores(unsharded_path)
+
+    shard_base = tmp_path / "sharded-cache.npz"
+    shard_artifacts = []
+    for shard in range(2):
+        score_universe.main(
+            [
+                *_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, shard_base),
+                "--shard",
+                str(shard),
+                "--num-shards",
+                "2",
+            ]
+        )
+        shard_artifacts.append(
+            score_universe.load_scores(
+                shard_base.with_name(f"{shard_base.stem}.shard-{shard}{shard_base.suffix}")
+            )
+        )
+
+    for key in ("logit", "f_logit", "pair_content", "pair_topology"):
+        full = getattr(unsharded, key)
+        parts = [getattr(artifact, key) for artifact in shard_artifacts]
+        assert full is not None and all(part is not None for part in parts)
+        np.testing.assert_allclose(
+            np.concatenate(cast(list[np.ndarray], parts)),
+            full,
+            rtol=1e-5,
+            atol=2e-6,
+        )
+
+
 def _enable_e2e_conditioning_gates(checkpoint: Path) -> None:
     """Make the synthetic checkpoint sensitive to topology perturbations."""
     payload = torch.load(checkpoint, weights_only=False)
