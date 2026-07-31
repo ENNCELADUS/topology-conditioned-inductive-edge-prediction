@@ -195,7 +195,7 @@ def test_two_rank_cpu_egostitch_step_zero_guard_admits_a_healthy_model(tmp_path:
     assert result.returncode == 0, result.stderr
     summary = json.loads((tmp_path / "smoke_ok.json").read_text())
     assert summary["world_size"] == 2
-    assert summary["run_kind"] == "qualification"
+    assert summary["run_kind"] == "formal"
     assert summary["validation_rows"] > 0
     assert summary["h_pairwise_cosine_mean"] <= 0.95
 

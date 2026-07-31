@@ -485,7 +485,7 @@ rule).
    representation-probe protocol (including degree-partialled probes), the
    within-checkpoint `f_logit` liveness reference, and a measured H20 cost re-estimate.
    That five-arm scope governed the completed rev-3.0 screen only; the active rev-3.2
-   successor uses the eight-arm two-stage contract described below.
+   successor uses the eight-arm single-stage contract described below.
    **Binding frozen-s0 result and disposition (2026-07-17):** the replacement
    fixed-Seed-0 run (commit `60745f2`, checkpoint `56b91c17fa8d3b86`, registration
    `97e61a7d...`) completed all required artifacts and returned `cut`. Both guards
@@ -522,28 +522,23 @@ rule).
    edge-family gradients. No v1 candidate scores, remaining arms, or held-out G5 gate
    result were produced, so this is a training-validity failure rather than a G5
    scientific verdict. The v1 BINDING registration remains immutable. Binding
-   eligibility for any successor arm is governed by spec §13.19's two-stage ladder
-   (qualification, then formal): both stages train on the full `V_fit` universe and
-   differ only in `optim.epochs`, with qualification running a short schedule. A
+   execution for any successor arm is governed by spec §13.19's single-stage,
+   plan-bound formal run. A
    single 512-node internal topology holdout `V_hold` (:= the union of the
    former `V_qual` and `V_select`; `V_fit` is unchanged from the two-holdout
-   definition) supplies validation and checkpoint selection for both stages.
+   definition) supplies validation and checkpoint selection for the run.
    Measured prevalence, disclosed rather than hidden: `V_hold` is 0.0117
    (1,533 positives / 130,816 pairs), against `V_select` alone at 0.0247 (807
    positives / 32,640 pairs) — the union raises positives 1.9x but halves
-   prevalence. Qualification is exactly three epochs and every finite model-quality
-   threshold is telemetry-only; a complete run writes `pending_manual_review` even
-   without a quality-eligible checkpoint. `e2e_checkpoint_eligible` — the post-ramp/
+   prevalence. `e2e_checkpoint_eligible` — the post-ramp/
    phase-C restriction, the AUPRC floor at `prevalence + 0.02`, and the
    residual / logit-std / topology-gradient conditions — is computed as
-   qualification telemetry and remains an unchanged hard requirement in formal.
+   run telemetry and cannot block completion, publication, scoring, or evaluation.
    Because the union halves prevalence, that
    floor's absolute value drops accordingly: 0.0447 on `V_select` alone to
-   0.0317 on `V_hold`. Qualification is a development loop, not a scientific gate;
-   `pending_manual_review` and its diagnostic checkpoint aliases license no held-out
-   claim or formal run. Formal eligibility prevents selection from landing on a
-   reconstruction-only warm-start checkpoint, the documented 2026-07-19 v1 failure
-   above. The formal stage carries pre-registered
+   0.0317 on `V_hold`. Checkpoint selection applies the registered AUPRC/MMD/Brier
+   rule to every completed epoch; quality-predicate misses are recorded only. The formal stage
+   carries pre-registered
    acceptance thresholds recorded before any held-out read (§5.2.4), and its
    result is engineering evidence, not inference, at any seed count — only
    E1/E3 (≥3 seeds, Holm-corrected, plus the §8-spec 30-config HPO-parity
@@ -554,7 +549,7 @@ rule).
    qualified and bound under registration
    `g5-e2e-stage1-20260719-conditioned-encoder-stability-screen-v2` (binding SHA-256
    `7937d8bb...`, implementation commit `c878a939...`) on 2026-07-23 after satisfying
-   spec §13.19's qualification requirements. All four registered arms
+   the then-current spec §13.19 requirements. All four registered arms
    (`full`/`b0_e2e_f_only`/`pair_topology`/`p0`, plus the `structure_control_6a`
    shuffle control over `full`'s checkpoint) trained 2026-07-23/2026-07-24 on 4 × H20
    (`world_size=4`). Training was valid — the within-checkpoint liveness death rule
@@ -575,10 +570,10 @@ rule).
    trained arms (full, `B0-e2e`/f-only,
    pair+topology, `p = 0`, `cosine_pool`, `no_l_rel`) plus two scoring-time
    controls over the full checkpoint (within-pair rebuild-form shuffle 6a-v3 and
-   degree-preserving rewiring 6e-v1) — on the two-stage ladder: both stages train on
-   identical `V_fit`, validate/select on `V_hold`, and differ only in `optim.epochs`.
-   Qualification uses the three-epoch telemetry-completion verdict above; formal execution requires owner-promoted
-   `BINDING` v4 and retains the registered acceptance thresholds. The frozen
+   degree-preserving rewiring 6e-v1) — under one plan-bound formal run that trains on
+   `V_fit` and validates/selects on `V_hold`. Formal execution requires owner-promoted
+   `BINDING` v4 and exact plan/artifact provenance; no model-quality threshold
+   authorizes or blocks execution. The frozen
    pairwise scorer's §0 role is **unchanged** (the measured grounding-pool audit
    eliminated the candidate-proposer reuse), and this paragraph does not bind the
    v4 registration or weaken E1/E3's multi-seed inference rules.

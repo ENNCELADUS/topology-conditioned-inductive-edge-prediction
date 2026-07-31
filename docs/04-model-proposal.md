@@ -1021,9 +1021,10 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   `docs/results/G5-stage1-seed0-20260717.md`.
   *Active successor update 2026-07-30 (rev 3.2):* the five-arm rev-3.0 scope above
   describes the completed historical screen only. The active contract is the
-  two-stage, eight-arm screen in spec §13.19.4 and §14.4.6: six trained checkpoints
-  plus two scoring-time controls, with identical `V_fit`/`V_hold` universes across
-  qualification and formal stages. The v4 registration remains `DRAFT`, so this update
+  single-stage, plan-bound eight-arm screen in spec §13.19.4 and §14.4.6: six trained
+  checkpoints plus two scoring-time controls. Model-quality predicates are telemetry
+  only; plan identity and run artifact provenance remain binding. The v4 registration
+  remains `DRAFT`, so this update
   authorizes implementation but no formal execution.
 
 ### 6.1 Method rows

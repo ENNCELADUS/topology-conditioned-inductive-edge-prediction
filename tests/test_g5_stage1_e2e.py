@@ -24,7 +24,6 @@ from src.model.egostitch.e2e_model import EgoStitchE2E
 from src.score_universe import ScoresArtifact, load_scores, save_scores
 from src.train_b0 import ModelConfig, _state_digest
 
-from tests._auprc_binding_fixture import bind_active_v4_calibration
 from tests.test_b0_cal import _toy_inputs as _b0cal_toy_inputs
 from tests.test_g1_hardened_e2 import (
     _NODES,
@@ -129,19 +128,19 @@ class TestWithinCheckpointLivenessGuard:
             f_logit=f_logit.astype(np.float32),
         )
 
-    def test_fires_when_full_equals_f_logit(self) -> None:
+    def test_reports_failure_when_full_equals_f_logit(self) -> None:
         f_logit = np.array([-1.0, 0.0, 1.0, 2.0, 3.0])
         artifact = self._artifact(f_logit.copy(), f_logit)
-        with pytest.raises(ValueError, match="dead residual"):
-            g5_stage1.validate_dead_residual_within_checkpoint(
-                artifact,
-                min_residual_std_ratio=1e-5,
-                max_spearman=0.9999,
-                max_topk_overlap=0.9999,
-                topk_fraction=0.01,
-            )
+        report = g5_stage1.validate_dead_residual_within_checkpoint(
+            artifact,
+            min_residual_std_ratio=1e-5,
+            max_spearman=0.9999,
+            max_topk_overlap=0.9999,
+            topk_fraction=0.01,
+        )
+        assert report["quality_pass"] is False
 
-    def test_fires_on_pair_invariant_residual(self) -> None:
+    def test_reports_failure_on_pair_invariant_residual(self) -> None:
         # A tiny constant offset scales the residual so small that the
         # conjunctive rule still fires, mirroring the frozen-s0 dead-residual
         # test: the residual must genuinely vary with the pair, not merely be
@@ -149,14 +148,14 @@ class TestWithinCheckpointLivenessGuard:
         f_logit = np.linspace(-2.0, 2.0, 200)
         full = f_logit + 1e-9
         artifact = self._artifact(full, f_logit)
-        with pytest.raises(ValueError, match="dead residual"):
-            g5_stage1.validate_dead_residual_within_checkpoint(
-                artifact,
-                min_residual_std_ratio=1e-5,
-                max_spearman=0.9999,
-                max_topk_overlap=0.9999,
-                topk_fraction=0.01,
-            )
+        report = g5_stage1.validate_dead_residual_within_checkpoint(
+            artifact,
+            min_residual_std_ratio=1e-5,
+            max_spearman=0.9999,
+            max_topk_overlap=0.9999,
+            topk_fraction=0.01,
+        )
+        assert report["quality_pass"] is False
 
     def test_does_not_fire_on_decorrelated_full(self) -> None:
         rng = np.random.default_rng(0)
@@ -328,30 +327,6 @@ def _rewrite_e2e_artifact(
         np.savez_compressed(path, **arrays)
 
 
-def _write_margin_verdict(metadata_path: Path, *, status: str = "pass") -> Path:
-    """Write the run-bound clip/family/RMS margin verdict `hpc/qualification.sh` persists.
-
-    A published run is not certified by publication: the margin gate necessarily
-    runs after `run_metadata.json` already says ``status: complete``, so every
-    consumer demands this file and refuses a verdict bound to a different run.
-    """
-    run_dir = metadata_path.parent
-    profile_path = run_dir / "profile.json"
-    if not profile_path.is_file():
-        profile_path.write_text(json.dumps({"fixture_profile_for": run_dir.name}))
-    verdict_path = run_dir / "margin_verdict.json"
-    verdict_path.write_text(
-        json.dumps(
-            {
-                "status": status,
-                "profile_sha256": hashlib.sha256(profile_path.read_bytes()).hexdigest(),
-                "run_metadata_sha256": hashlib.sha256(metadata_path.read_bytes()).hexdigest(),
-            }
-        )
-    )
-    return verdict_path
-
-
 def _refresh_formal_run_metadata_hashes(inputs: dict[str, Any]) -> None:
     """Model rescoring after a semantically valid run-metadata fixture rewrite."""
     arm_paths = _d(inputs["arm_universe_paths"])
@@ -363,9 +338,6 @@ def _refresh_formal_run_metadata_hashes(inputs: dict[str, Any]) -> None:
         metadata = json.loads(metadata_path.read_text())
         metadata["preregistration_sha256"] = registration_sha256
         metadata_path.write_text(json.dumps(metadata))
-        # A re-run re-validates its margins; a rewritten record would otherwise
-        # be left certified by a verdict describing the record it replaced.
-        _write_margin_verdict(metadata_path)
     for name, artifact_path in arm_paths.items():
         source_arm = "full" if name in g5_stage1._E2E_CONTROL_ARMS else name
         artifact = load_scores(artifact_path)
@@ -727,9 +699,6 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
     evidence_path.write_text('{"verified": true}\n')
     evidence_sha256 = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
     evidence_artifact = {"path": str(evidence_path), "sha256": evidence_sha256}
-    qualification_attempts: dict[str, list[dict[str, object]]] = {}
-    qualification_history_indexes: dict[str, dict[str, str]] = {}
-
     def validation_events(name: str, run_kind: str, epochs: int) -> list[dict[str, object]]:
         raw = [("step_0", None, 0), ("phase_a_end", 1, 1)]
         raw.extend(("epoch_end", epoch, epoch) for epoch in range(1, epochs + 1))
@@ -746,74 +715,9 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
             for ordinal, (kind, epoch, step) in enumerate(raw, start=1)
         ]
 
-    for name in g5_stage1._E2E_FORMAL_ARMS:
-        attempt_dir = tmp_path / "qualification" / name / "attempts" / "attempt-001"
-        attempt_dir.mkdir(parents=True, exist_ok=True)
-        attempt_metadata = attempt_dir / "run_metadata.json"
-        attempt_events = attempt_dir / te.V_HOLD_VALIDATION_EVENTS_FILENAME
-        event_rows = validation_events(name, "qualification", 2)
-        attempt_events.write_text(
-            "".join(json.dumps(row, sort_keys=True) + "\n" for row in event_rows)
-        )
-        attempt_metadata.write_text(
-            json.dumps(
-                {
-                    "run_kind": "qualification",
-                    "arm": name,
-                    "validation_role": "V_hold",
-                    "status": "complete",
-                    "v_hold_validation_evidence": {
-                        "schema": "egostitch_e2e_v_hold_validation_events_v1",
-                        "count": len(event_rows),
-                        "path": attempt_events.name,
-                        "sha256": hashlib.sha256(attempt_events.read_bytes()).hexdigest(),
-                    },
-                }
-            )
-        )
-        attempt_qualification = attempt_dir / "qualification.json"
-        attempt_qualification.write_text(json.dumps({"verdict": "pass"}) + "\n")
-        attempt_entry = {
-            "attempt_id": attempt_dir.name,
-            "attempt_dir": str(attempt_dir),
-            "recorded_at_utc": "2026-07-30T00:00:00+00:00",
-            "exit_code": 0,
-            "outcome": "success",
-            "verdict": "pass",
-            "qualification": {
-                "path": str(attempt_qualification),
-                "sha256": hashlib.sha256(attempt_qualification.read_bytes()).hexdigest(),
-            },
-            "run_metadata": {
-                "path": str(attempt_metadata),
-                "sha256": hashlib.sha256(attempt_metadata.read_bytes()).hexdigest(),
-            },
-            "validation_events": {
-                "path": str(attempt_events),
-                "sha256": hashlib.sha256(attempt_events.read_bytes()).hexdigest(),
-            },
-        }
-        qualification_attempts[name] = [attempt_entry]
-        history_index = attempt_dir.parents[1] / "attempt_history.json"
-        history_index.write_text(
-            json.dumps(
-                {
-                    "schema_version": "egostitch_e2e_qualification_history_v1",
-                    "arm": name,
-                    "attempts": [attempt_entry],
-                },
-                sort_keys=True,
-                indent=2,
-            )
-            + "\n"
-        )
-        qualification_history_indexes[name] = {
-            "path": str(history_index),
-            "sha256": hashlib.sha256(history_index.read_bytes()).hexdigest(),
-        }
     implementation_commit = "4280c4b"
     preregistration["binding_evidence"] = {
-        "schema_version": "egostitch_e2e_binding_evidence_v1",
+        "schema_version": "egostitch_e2e_binding_evidence_v2",
         "implementation": {"commit": implementation_commit},
         "configs": {
             name: {
@@ -824,18 +728,13 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
         },
         "parameter_group_manifests": {"fixture": evidence_artifact},
         "packs_and_validation_manifests": {"fixture": evidence_artifact},
-        "qualification_attempts": qualification_attempts,
-        "qualification_history_indexes": qualification_history_indexes,
         "boundary_access_audit": {"fixture": evidence_artifact},
         "runtime_and_peak_memory": {"fixture": evidence_artifact},
         "checkpoint_policy_version": "fixture-v1",
     }
     preregistration["evaluator"] = {"seed": 0}
-    bind_active_v4_calibration(
-        preregistration,
-        preregistration_path,
-        config_paths=arm_config_paths,
-        tolerance=0.02,
+    preregistration["registration_id"] = (
+        "g5-e2e-stage1-20260729-two-stage-ladder-screen-v4-draft"
     )
     preregistration_path.write_text(json.dumps(preregistration, sort_keys=True, indent=2) + "\n")
     preregistration_sha256 = hashlib.sha256(preregistration_path.read_bytes()).hexdigest()
@@ -920,7 +819,6 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
                 for epoch in (1, 2, 3)
             )
         )
-        _write_margin_verdict(meta_path)
         run_metadata_paths[name] = meta_path
 
     for name, artifact_path in arm_paths.items():
@@ -1050,40 +948,6 @@ class TestBuildE2EArmSummary:
 
         g5_stage1._validate_e2e_binding_evidence(registration, registration_path)
 
-    def test_binding_evidence_v2_accepts_calibration_artifact(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        registration_path = cast(Path, inputs["preregistration_path"])
-        registration = json.loads(registration_path.read_text())
-
-        g5_stage1._validate_e2e_binding_evidence(registration, registration_path)
-
-    @pytest.mark.parametrize("invalid_calibration", ["missing", "null", "mismatch"])
-    def test_binding_evidence_v2_rejects_invalid_calibration_artifact(
-        self, tmp_path: Path, invalid_calibration: str
-    ) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        registration_path = cast(Path, inputs["preregistration_path"])
-        registration = json.loads(registration_path.read_text())
-        evidence = registration["binding_evidence"]
-        if invalid_calibration == "missing":
-            evidence.pop("auprc_tolerance_calibration")
-        elif invalid_calibration == "null":
-            evidence["auprc_tolerance_calibration"] = None
-        elif invalid_calibration == "mismatch":
-            calibration_path = Path(evidence["auprc_tolerance_calibration"]["path"])
-            evidence["auprc_tolerance_calibration"] = {
-                "path": str(calibration_path),
-                "sha256": "f" * 64,
-            }
-
-        message = (
-            "auprc_tolerance_calibration must contain a JSON object"
-            if invalid_calibration != "mismatch"
-            else "bound AUPRC tolerance calibration artifact is missing or hash-mismatched"
-        )
-        with pytest.raises(g5_stage1.PreregistrationMismatch, match=message):
-            g5_stage1._validate_e2e_binding_evidence(registration, registration_path)
-
     def test_requires_complete_binding_evidence(self, tmp_path: Path) -> None:
         inputs = _eight_arm_inputs(tmp_path)
         registration_path = _d(inputs)["preregistration_path"]
@@ -1156,8 +1020,8 @@ class TestBuildE2EArmSummary:
         trained = _d(disclosure["trained_arms"])
         assert set(trained) == set(g5_stage1._E2E_FORMAL_ARMS)
         for name in g5_stage1._E2E_FORMAL_ARMS:
-            assert _d(trained[name])["k_cumulative"] == 9
-            assert _d(_d(trained[name])["qualification"])["count"] == 4
+            assert _d(trained[name])["k_cumulative"] == 5
+            assert "qualification" not in _d(trained[name])
             assert _d(_d(trained[name])["formal"])["count"] == 5
         controls = _d(disclosure["scoring_time_controls"])
         assert set(controls) == set(g5_stage1._E2E_CONTROL_ARMS)
@@ -1185,68 +1049,6 @@ class TestBuildE2EArmSummary:
         metadata_path.with_name(te.V_HOLD_VALIDATION_EVENTS_FILENAME).unlink()
 
         with pytest.raises(ValueError, match="validation-event evidence is unreadable"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_vhold_disclosure_rejects_tampered_qualification_event_ledger(
-        self, tmp_path: Path
-    ) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        registration = json.loads(_d(inputs)["preregistration_path"].read_text())
-        attempt = registration["binding_evidence"]["qualification_attempts"]["full"][0]
-        events_path = Path(attempt["validation_events"]["path"])
-        events_path.write_text(events_path.read_text() + '{"ordinal": 5}\n')
-
-        with pytest.raises(g5_stage1.PreregistrationMismatch, match="hash-mismatched"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_vhold_disclosure_rejects_duplicate_qualification_evidence(
-        self, tmp_path: Path
-    ) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        preregistration_path = _d(inputs)["preregistration_path"]
-        registration = json.loads(preregistration_path.read_text())
-        attempts = registration["binding_evidence"]["qualification_attempts"]["full"]
-        attempts.append(dict(attempts[0]))
-        preregistration_path.write_text(json.dumps(registration, sort_keys=True, indent=2) + "\n")
-        _refresh_formal_run_metadata_hashes(inputs)
-
-        with pytest.raises(
-            g5_stage1.PreregistrationMismatch, match="does not exactly match.*history index"
-        ):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_vhold_disclosure_rejects_qualification_attempt_omitted_from_registration(
-        self, tmp_path: Path
-    ) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        preregistration_path = _d(inputs)["preregistration_path"]
-        registration = json.loads(preregistration_path.read_text())
-        index_ref = registration["binding_evidence"]["qualification_history_indexes"]["full"]
-        index_path = Path(index_ref["path"])
-        history = json.loads(index_path.read_text())
-        omitted_dir = index_path.parent / "attempts" / "attempt-omitted"
-        omitted_dir.mkdir()
-        history["attempts"].append(
-            {
-                "attempt_id": omitted_dir.name,
-                "attempt_dir": str(omitted_dir),
-                "recorded_at_utc": "2026-07-30T00:01:00+00:00",
-                "exit_code": 7,
-                "outcome": "failure",
-                "verdict": None,
-                "qualification": None,
-                "run_metadata": None,
-                "validation_events": None,
-            }
-        )
-        index_path.write_text(json.dumps(history, sort_keys=True, indent=2) + "\n")
-        index_ref["sha256"] = hashlib.sha256(index_path.read_bytes()).hexdigest()
-        preregistration_path.write_text(json.dumps(registration, sort_keys=True, indent=2) + "\n")
-        _refresh_formal_run_metadata_hashes(inputs)
-
-        with pytest.raises(
-            g5_stage1.PreregistrationMismatch, match="does not exactly match.*history index"
-        ):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
     def test_rejects_unknown_arm(self, tmp_path: Path) -> None:
@@ -1397,9 +1199,6 @@ class TestBuildE2EArmSummary:
         metadata = json.loads(path.read_text())
         metadata["p_topo"] = 0.15
         path.write_text(json.dumps(metadata))
-        # Certified by its own margins: the refusal must come from the arm
-        # semantics, not from an incidentally stale verdict.
-        _write_margin_verdict(path)
         with pytest.raises(g5_stage1.RegistrationShaMismatch, match="branch dropout"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
@@ -1427,7 +1226,6 @@ class TestBuildE2EArmSummary:
         metadata = json.loads(path.read_text())
         metadata[field] = value
         path.write_text(json.dumps(metadata))
-        _write_margin_verdict(path)
         with pytest.raises(g5_stage1.RegistrationShaMismatch, match=match):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
@@ -1439,7 +1237,6 @@ class TestBuildE2EArmSummary:
             "config_path"
         ]
         path.write_text(json.dumps(metadata))
-        _write_margin_verdict(path)
         with pytest.raises(g5_stage1.RegistrationShaMismatch, match="config_path"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
@@ -1518,15 +1315,16 @@ class TestBuildE2EArmSummary:
         with pytest.raises(g5_stage1.PreregistrationMismatch, match="real b0cal_results"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
-    def test_missing_submodule_rms_telemetry_fails_closed(self, tmp_path: Path) -> None:
+    def test_missing_submodule_rms_telemetry_does_not_gate_evaluation(
+        self, tmp_path: Path
+    ) -> None:
         inputs = _eight_arm_inputs(tmp_path)
         metadata_path = _d(inputs["run_metadata_paths"])["full"]
         metadata = json.loads(metadata_path.read_text())
         del metadata["training_diagnostics"]["gradient_norm_series"][0]["grad_rms_content"]
         metadata_path.write_text(json.dumps(metadata))
-        _write_margin_verdict(metadata_path)
-        with pytest.raises(ValueError, match="submodule RMS telemetry"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+        _refresh_formal_run_metadata_hashes(inputs)
+        g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
     def test_nested_worker_submodule_rms_shape_is_accepted(self, tmp_path: Path) -> None:
         inputs = _eight_arm_inputs(tmp_path)
@@ -1540,57 +1338,6 @@ class TestBuildE2EArmSummary:
             metadata_path.write_text(json.dumps(metadata))
         _refresh_formal_run_metadata_hashes(inputs)
         g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    # ------------------------------------------------- clip/family/RMS margin verdict
-    # `src.e2_pipeline` stamps `status: complete` and
-    # `formal_artifacts_published: true` *before* the margin gate can run, so
-    # neither field is margin evidence. Wave-2 made the next arm's launch
-    # require the verdict; these pin the other half -- the failed arm itself is
-    # not screenable.
-
-    def test_gate_refuses_an_arm_whose_margin_verdict_failed(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        metadata_path = _d(inputs["run_metadata_paths"])["p0"]
-        _write_margin_verdict(metadata_path, status="fail")
-
-        with pytest.raises(ValueError, match="margin verdict is 'fail', not 'pass'"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_gate_refuses_an_arm_with_no_margin_verdict(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        metadata_path = _d(inputs["run_metadata_paths"])["full"]
-        (metadata_path.parent / "margin_verdict.json").unlink()
-
-        with pytest.raises(ValueError, match="no clip/family/RMS margin verdict"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_gate_refuses_a_margin_verdict_from_another_run(self, tmp_path: Path) -> None:
-        """A passing verdict copied from a sibling arm certifies nothing here."""
-        inputs = _eight_arm_inputs(tmp_path)
-        donor = _d(inputs["run_metadata_paths"])["full"].parent / "margin_verdict.json"
-        recipient = _d(inputs["run_metadata_paths"])["no_l_rel"].parent / "margin_verdict.json"
-        recipient.write_text(donor.read_text())
-
-        with pytest.raises(ValueError, match="margin verdict profile_sha256 does not describe"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_gate_refuses_a_margin_verdict_left_by_an_earlier_run(self, tmp_path: Path) -> None:
-        """Re-publishing the same output directory invalidates the old verdict."""
-        inputs = _eight_arm_inputs(tmp_path)
-        metadata_path = _d(inputs["run_metadata_paths"])["cosine_pool"]
-        metadata = json.loads(metadata_path.read_text())
-        metadata["republished"] = True
-        metadata_path.write_text(json.dumps(metadata))
-        _refresh_formal_run_metadata_hashes(inputs)
-        # The re-run's own verdict, then the stale one put back over it.
-        stale = json.loads((metadata_path.parent / "margin_verdict.json").read_text())
-        stale["run_metadata_sha256"] = "0" * 64
-        (metadata_path.parent / "margin_verdict.json").write_text(json.dumps(stale))
-
-        with pytest.raises(
-            ValueError, match="margin verdict run_metadata_sha256 does not describe"
-        ):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
     def test_formal_evaluator_seed_must_be_zero(self, tmp_path: Path) -> None:
         inputs = _eight_arm_inputs(tmp_path)

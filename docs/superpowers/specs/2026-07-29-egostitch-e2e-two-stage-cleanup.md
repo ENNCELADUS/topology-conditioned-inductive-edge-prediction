@@ -1,5 +1,11 @@
 # EgoStitch E2E: two-stage cleanup
 
+> **Superseded 2026-07-30 by owner decision.** Qualification and every
+> qualification-to-formal or model-quality authorization gate described below are
+> retired. The active contract is the single-stage, plan-bound run in
+> `docs/05-egostitch-spec.md` §12/§13.19 and registration v4. This file is retained
+> only as the historical decision trail.
+
 **Status: IMPLEMENTED IN CURRENT WORKTREE (2026-07-30), rev 3; cleanup commit pending.
 Owner-decided via grill-me interview.** Collapses the e2e ladder from five stages to two, removes
 the legacy frozen-s0 `egostitch` family, and adopts the data-derived degree-head

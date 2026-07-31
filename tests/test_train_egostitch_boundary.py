@@ -180,7 +180,7 @@ def _benchmark_reads(opened: list[Path], tmp_path: Path) -> list[Path]:
     return [path for path in opened if benchmark_root in path.resolve().parents]
 
 
-_ALL_RUN_KINDS: list[te.E2ERunKind | None] = ["qualification", "formal", "debug", None]
+_ALL_RUN_KINDS: list[te.E2ERunKind | None] = ["formal", "debug", None]
 
 
 # --------------------------------------------------------------------------- tests
@@ -320,7 +320,7 @@ class TestBoundaryIsPathScopedNotPresenceScoped:
         _tiny_holdout(monkeypatch)
         for name in te._HELD_OUT_FILENAMES:
             (strategy_dir / name).write_text("sealed\n", encoding="utf-8")
-        cfg = replace(_cfg(tmp_path), run_kind="qualification")
+        cfg = replace(_cfg(tmp_path), run_kind="formal")
         pack_dir = tmp_path / "pack"
 
         payload = te.prepare_pack(cfg, pack_dir, cold_cache=True)
@@ -376,7 +376,7 @@ class TestBoundaryEnumerationCoversEveryRead:
         _write_train_side_root(tmp_path)
         _write_feature_root(tmp_path)
         _tiny_holdout(monkeypatch)
-        cfg = replace(_cfg(tmp_path), run_kind="qualification")
+        cfg = replace(_cfg(tmp_path), run_kind="formal")
 
         with _recorded_opens(monkeypatch) as opened:
             te.prepare_pack(cfg, tmp_path / "pack", cold_cache=True)

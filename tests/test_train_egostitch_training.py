@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
-import math
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast, get_args
+from typing import cast
 
 import networkx as nx
 import numpy as np
@@ -18,13 +18,49 @@ import pytest
 import torch
 import yaml  # type: ignore[import-untyped]
 from src import train_egostitch as te
-from src.data.internal_holdout import build_pair_label_manifest
+from src.experiments.e2e_binding import ACTIVE_V4_REGISTRATION_ID
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.e2e_model import EgoStitchE2E
 
-from tests._auprc_binding_fixture import bind_active_v4_calibration
-
 pytestmark = pytest.mark.unit
+
+
+def test_quality_miss_uses_completed_final_epoch_instead_of_aborting() -> None:
+    source = inspect.getsource(te._train_e2e_stability_loop)
+    assert 'selection_status = "telemetry_miss_last_epoch"' in source
+    assert "best_state = last_state" in source
+    assert "produced no eligible checkpoint" not in source
+    assert "enforce_quality = False" in source
+
+
+def test_checkpoint_quality_predicate_remains_available_as_telemetry() -> None:
+    record = te.E2ECheckpointRecord(
+        epoch=30,
+        phase="C",
+        full_joint_epochs_completed=20,
+        guards_passed=False,
+        auprc=0.0,
+        prevalence=0.1,
+        active_logit_std=0.0,
+        clustering_mmd=1.0,
+        brier=1.0,
+    )
+    assert te.e2e_checkpoint_eligible(record, "full") is False
+    assert te.select_e2e_checkpoint([record], "full") == record
+
+
+def test_binding_preflight_keeps_truthfulness_sections_and_drops_qualification() -> None:
+    source = inspect.getsource(te._validate_e2e_formal_binding)
+    for section in (
+        "parameter_group_manifests",
+        "packs_and_validation_manifests",
+        "boundary_access_audit",
+        "runtime_and_peak_memory",
+    ):
+        assert section in source
+    assert "qualification_attempts" not in source
+    assert "qualification_history_indexes" not in source
+    assert "validate_bound_calibration" not in source
 
 
 def _training_config(tmp_path: Path) -> Path:
@@ -84,152 +120,12 @@ def test_e2e_config_schema_is_strict_and_preserves_run_kind(tmp_path: Path) -> N
         te.load_config(bad)
 
 
-def test_selection_auprc_tolerance_accepts_a_future_rederived_value(tmp_path: Path) -> None:
-    raw = yaml.safe_load(_training_config(tmp_path).read_text(encoding="utf-8"))
-    raw["training"]["selection_auprc_tolerance"] = 0.01
-    raw["diagnostics"]["selection_auprc_tolerance"] = 0.01
-    path = tmp_path / "rederived.yaml"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-
-    cfg = te.load_config(path)
-
-    assert cfg.training is not None
-    assert cfg.training.selection_auprc_tolerance == 0.01
-    assert cfg.diagnostics.selection_auprc_tolerance == 0.01
 
 
-def test_selection_auprc_tolerance_rejects_diagnostics_training_mismatch(
-    tmp_path: Path,
-) -> None:
-    raw = yaml.safe_load(_training_config(tmp_path).read_text(encoding="utf-8"))
-    raw["training"]["selection_auprc_tolerance"] = 0.01
-    raw["diagnostics"]["selection_auprc_tolerance"] = 0.02
-    path = tmp_path / "mismatched-tolerance.yaml"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="must exactly equal"):
-        te.load_config(path)
 
 
-@pytest.mark.parametrize("value", [-0.1, float("inf"), float("nan")])
-def test_selection_auprc_tolerance_rejects_invalid_values(
-    tmp_path: Path, value: float
-) -> None:
-    raw = yaml.safe_load(_training_config(tmp_path).read_text(encoding="utf-8"))
-    raw["training"]["selection_auprc_tolerance"] = value
-    path = tmp_path / "invalid-tolerance.yaml"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="selection_auprc_tolerance"):
-        te.load_config(path)
 
 
-@pytest.mark.parametrize(
-    ("run_kind", "arm", "seed", "epoch", "fixed_source_epoch", "profile_only", "expected"),
-    [
-        ("qualification", "full", 0, 3, 3, False, True),
-        ("formal", "full", 0, 3, 3, False, False),
-        ("qualification", "p0", 0, 3, 3, False, False),
-        ("qualification", "full", 1, 3, 3, False, False),
-        ("qualification", "full", 0, 2, 3, False, False),
-        ("qualification", "full", 0, 3, 3, True, False),
-    ],
-)
-def test_auprc_tolerance_source_capture_condition(
-    run_kind: str,
-    arm: str,
-    seed: int,
-    epoch: int,
-    fixed_source_epoch: int,
-    profile_only: bool,
-    expected: bool,
-) -> None:
-    assert (
-        te._should_capture_auprc_tolerance_source(
-            run_kind=run_kind,
-            arm=cast(te.E2EArmName, arm),
-            seed=seed,
-            epoch=epoch,
-            fixed_source_epoch=fixed_source_epoch,
-            profile_only=profile_only,
-        )
-        is expected
-    )
-
-
-def _calibration_source_fixture() -> tuple[te.EgoStitchData, te._ValidationResult]:
-    manifest = build_pair_label_manifest(["node_c", "node_a", "node_b"], [("node_b", "node_a")])
-    labels = np.asarray(manifest.labels, dtype=np.int8)
-    data = cast(
-        te.EgoStitchData,
-        SimpleNamespace(
-            val_pairs=list(manifest.pairs),
-            val_labels=labels,
-            validation_role=te._E2E_VALIDATION_ROLE,
-            internal_holdout=SimpleNamespace(hold_manifest=manifest),
-        ),
-    )
-    logits = np.asarray([3.0, 1.0, -2.0], dtype="<f4")
-    metrics = te.compute_edge_metrics(labels.astype(np.int64), 1.0 / (1.0 + np.exp(-logits)))
-    return data, te._ValidationResult(metrics=metrics, fidelity={}, active_logits=logits)
-
-
-def test_auprc_tolerance_source_is_canonical_and_complete(tmp_path: Path) -> None:
-    data, validation = _calibration_source_fixture()
-    path = tmp_path / te.AUPRC_TOLERANCE_SOURCE_FILENAME
-
-    te._write_auprc_tolerance_source(
-        path,
-        data,
-        validation,
-        epoch=3,
-        global_step=30,
-        phase="C",
-        full_joint_epochs=1,
-        fixed_source_epoch=3,
-    )
-
-    with np.load(path, allow_pickle=False) as artifact:
-        assert set(artifact.files) == {"labels", "active_logits", "metadata_json"}
-        assert artifact["labels"].dtype == np.dtype(np.int8)
-        assert artifact["labels"].tolist() == [1, 0, 0]
-        assert artifact["active_logits"].dtype.str == "<f4"
-        assert artifact["active_logits"].tolist() == [3.0, 1.0, -2.0]
-        metadata = json.loads(str(artifact["metadata_json"].item()))
-    assert metadata["schema"] == te._AUPRC_TOLERANCE_SOURCE_SCHEMA
-    assert metadata["pair_count"] == 3
-    assert metadata["node_count"] == 3
-    assert metadata["positive_count"] == 1
-    assert metadata["negative_count"] == 2
-    assert metadata["validation_epoch"] == metadata["fixed_source_epoch"] == 3
-    assert metadata["source_validation_reused"] is True
-    assert metadata["bootstrap_additional_v_hold_evaluations"] == 0
-
-
-def test_auprc_tolerance_source_failure_is_atomic(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    data, validation = _calibration_source_fixture()
-    path = tmp_path / te.AUPRC_TOLERANCE_SOURCE_FILENAME
-
-    def fail_savez(*_args: object, **_kwargs: object) -> None:
-        raise OSError("injected source write failure")
-
-    monkeypatch.setattr(te.np, "savez", fail_savez)
-    with pytest.raises(OSError, match="injected source write failure"):
-        te._write_auprc_tolerance_source(
-            path,
-            data,
-            validation,
-            epoch=3,
-            global_step=30,
-            phase="C",
-            full_joint_epochs=1,
-            fixed_source_epoch=3,
-        )
-
-    assert not path.exists()
-    assert list(tmp_path.iterdir()) == []
 
 
 def test_formal_binding_preflight_validates_live_config_and_commit(
@@ -250,7 +146,7 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
     artifact.write_text('{"status":"pass"}\n')
     artifact_record = {"path": str(artifact), "sha256": te._sha256_file(artifact)}
     evidence: dict[str, object] = {
-        "schema_version": "egostitch_e2e_binding_evidence_v1",
+        "schema_version": "egostitch_e2e_binding_evidence_v2",
         "implementation": {"commit": "a" * 40},
         "configs": {
             arm: {"path": path, "sha256": te._sha256_file(root / path)}
@@ -258,13 +154,12 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
         },
         "parameter_group_manifests": dict(artifact_record),
         "packs_and_validation_manifests": dict(artifact_record),
-        "qualification_attempts": dict(artifact_record),
-        "qualification_history_indexes": dict(artifact_record),
         "boundary_access_audit": dict(artifact_record),
         "runtime_and_peak_memory": dict(artifact_record),
         "checkpoint_policy_version": "v1",
     }
     registration: dict[str, object] = {
+        "registration_id": ACTIVE_V4_REGISTRATION_ID,
         "arms": {
                 **{
                     arm: {"kind": "trained_checkpoint", "training": path}
@@ -283,12 +178,6 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
         },
         "binding_evidence": evidence,
     }
-    bind_active_v4_calibration(
-        registration,
-        tmp_path / "registration.json",
-        config_paths={arm: root / path for arm, path in arm_paths.items()},
-        tolerance=0.02,
-    )
     snapshot = te.PreregistrationSnapshot(registration, "f" * 64)
 
     def fake_run(command: list[str], **_: object) -> SimpleNamespace:
@@ -300,19 +189,6 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
     assert binding["arm"] == "full"
     assert binding["config_sha256"] == te._sha256_file(config_path)
 
-    assert evidence["schema_version"] == te._E2E_BINDING_SCHEMA
-    evidence["auprc_tolerance_calibration"] = None
-    with pytest.raises(
-        te.PreregistrationNotBinding,
-        match="auprc_tolerance_calibration must contain a JSON object",
-    ):
-        te._validate_e2e_formal_binding(cfg, snapshot, config_path)
-    bind_active_v4_calibration(
-        registration,
-        tmp_path / "registration.json",
-        config_paths={arm: root / path for arm, path in arm_paths.items()},
-        tolerance=0.02,
-    )
 
     v2_configs = cast(dict[str, object], evidence["configs"])
     evidence["configs"] = {
@@ -325,13 +201,6 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
         te._validate_e2e_formal_binding(cfg, snapshot, config_path)
     evidence["configs"] = v2_configs
 
-    history_indexes = evidence["qualification_history_indexes"]
-    evidence["qualification_history_indexes"] = None
-    with pytest.raises(
-        te.PreregistrationNotBinding, match="qualification_history_indexes must be structured"
-    ):
-        te._validate_e2e_formal_binding(cfg, snapshot, config_path)
-    evidence["qualification_history_indexes"] = history_indexes
 
     registered_arms = cast(dict[str, object], snapshot.payload["arms"])
     snapshot.payload["arms"] = {
@@ -385,35 +254,6 @@ def test_formal_binding_preflight_validates_live_config_and_commit(
         te._validate_e2e_formal_binding(cfg, snapshot, mismatched_config)
 
 
-@pytest.mark.parametrize("tracked_status", ["", " M src/train_egostitch.py\n"])
-def test_qualification_run_start_records_live_git_identity(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    tracked_status: str,
-) -> None:
-    root = Path(__file__).resolve().parents[1]
-    config_path = root / "configs/egostitch_e2e_v3_full_breadth_first.yaml"
-    cfg = replace(
-        te.load_config(config_path),
-        output_dir=tmp_path / "qualification",
-        run_kind="qualification",
-    )
-    data = cast(te.EgoStitchData, SimpleNamespace(rho_train=0.1))
-    head = "b" * 40
-
-    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
-        assert kwargs["cwd"] == root
-        return SimpleNamespace(stdout=head + "\n" if "rev-parse" in command else tracked_status)
-
-    monkeypatch.setattr(te.subprocess, "run", fake_run)
-    te.write_run_start_metadata(cfg, data, world_size=4, config_path=config_path)
-
-    metadata = json.loads((cfg.output_dir / "run_metadata.json").read_text())
-    assert metadata["implementation_commit"] == head
-    assert metadata["implementation_tracked_clean"] is (tracked_status == "")
-    assert metadata["implementation_tracked_status_sha256"] == hashlib.sha256(
-        tracked_status.encode()
-    ).hexdigest()
 
 
 def test_formal_output_metadata_matches_scorer_contract(
@@ -426,8 +266,8 @@ def test_formal_output_metadata_matches_scorer_contract(
         output_dir=tmp_path / "formal",
         run_kind="formal",
     )
-    # The two-stage ladder validates both stages on the single `V_hold`
-    # manifest, so `V_hold` is the only role production can emit
+    # The plan pins a single `V_hold` manifest, so `V_hold` is the only role
+    # production can emit
     # (`_E2E_VALIDATION_ROLE`, typed `Literal["V_hold"] | None`). The stub is
     # pinned to that constant rather than to a hand-written string, so a role
     # rename cannot leave this fixture asserting a value the worker never
@@ -485,7 +325,8 @@ def test_formal_output_metadata_matches_scorer_contract(
     te.write_outputs(result, cfg, data)
 
     metadata = json.loads((cfg.output_dir / "run_metadata.json").read_text())
-    assert metadata["selected_checkpoint_eligible"] is True
+    assert metadata["selected_checkpoint_eligible"] is False
+    assert metadata["quality_fields_policy"] == "telemetry_only"
     assert metadata["arm"] == "full"
     assert metadata["arm_kind"] == "trained_checkpoint"
     assert metadata["checkpoint_arm"] == "full"
@@ -503,41 +344,8 @@ def test_formal_output_metadata_matches_scorer_contract(
     assert metadata["validation_role"] == "V_hold"
 
 
-def test_run_kinds_enforce_registered_boundaries(tmp_path: Path) -> None:
-    loaded = te.load_config(_training_config(tmp_path))
-    qualification = te.apply_overrides(
-        loaded,
-        te.EgoCliArgs(
-            config=tmp_path / "training.yaml", seed=None, output_dir=None, run_kind="qualification"
-        ),
-    )
-    # Guards-only stage: it publishes no formal artifact, so a DRAFT
-    # registration is enough, but the schedule still runs whole.
-    prepared, is_debug, _ = te.prepare_ddp_run_config(qualification, max_steps=None)
-    assert prepared.run_kind == "qualification"
-    assert is_debug is False
-    with pytest.raises(ValueError, match="complete schedule"):
-        te.prepare_ddp_run_config(qualification, max_steps=2000)
-
-    formal = te.apply_overrides(
-        loaded,
-        te.EgoCliArgs(
-            config=tmp_path / "training.yaml", seed=None, output_dir=None, run_kind="formal"
-        ),
-    )
-    with pytest.raises(ValueError, match="complete schedule"):
-        te.prepare_ddp_run_config(formal, max_steps=1)
-    with pytest.raises(te.PreregistrationNotBinding):
-        te.prepare_ddp_run_config(formal, max_steps=None)
-
-    # An unset run_kind is the formal stage, never a laxer one.
-    assert loaded.run_kind is None
-    with pytest.raises(te.PreregistrationNotBinding):
-        te.prepare_ddp_run_config(loaded, max_steps=None)
 
 
-def test_run_kind_domain_is_the_two_stage_ladder_plus_debug() -> None:
-    assert get_args(te.E2ERunKind) == ("qualification", "formal", "debug")
 
 
 def test_e2e_three_phase_boundaries_and_first_eligibility() -> None:
@@ -554,46 +362,8 @@ def test_e2e_three_phase_boundaries_and_first_eligibility() -> None:
     assert te.e2e_first_eligible_epoch(3000, 100) == 10
 
 
-def test_short_qualification_schedule_still_traverses_all_three_phases() -> None:
-    """Both stages share one curriculum; only `optim.epochs` differs.
-
-    The qualification stage is only useful if a 3-epoch schedule still reaches
-    Phase C and can therefore produce an eligible checkpoint (design
-    2026-07-29 Sec 2). The boundaries are fractions of the whole schedule, so
-    they scale rather than being pinned to the formal step count.
-    """
-    _, steps_per_epoch = te._epoch_step_plan(400, negative_ratio=5, edge_batch=128, world_size=4)
-    for epochs in (3, 30):
-        total = steps_per_epoch * epochs
-        warm_end, phase_c_start = te.e2e_phase_boundaries(total)
-        assert 0 < warm_end < phase_c_start < total
-        assert warm_end == math.ceil(0.2 * total)
-        assert phase_c_start == warm_end + math.ceil(0.1 * total)
-        assert te.e2e_phase_state(0, total).phase == "A"
-        assert not te.e2e_phase_state(0, total).edge_active
-        assert te.e2e_phase_state(warm_end, total).edge_active
-        assert te.e2e_phase_state(total - 1, total).phase == "C"
-        # Eligibility opens inside the schedule in both stages, so a short
-        # qualification run still has an eligible checkpoint to select.
-        assert 1 <= te.e2e_first_eligible_epoch(total, steps_per_epoch) <= epochs
 
 
-def test_e2e_eligibility_reference_starts_at_first_edge_active_validation() -> None:
-    phase_a = te.e2e_phase_state(399, 2000)
-    first_edge_active = te.e2e_phase_state(400, 2000)
-
-    assert not te._e2e_should_capture_eligibility_reference(
-        phase_a,
-        warm_reference_auprc=None,
-    )
-    assert te._e2e_should_capture_eligibility_reference(
-        first_edge_active,
-        warm_reference_auprc=None,
-    )
-    assert not te._e2e_should_capture_eligibility_reference(
-        first_edge_active,
-        warm_reference_auprc=0.4,
-    )
 
 
 def test_e2e_recon_anneal_factors_are_component_specific_by_name() -> None:
@@ -612,7 +382,7 @@ def test_e2e_recon_anneal_factors_are_component_specific_by_name() -> None:
     }
 
 
-def test_slot_collapse_guard_uses_two_active_consecutive_validations_per_arm() -> None:
+def test_slot_collapse_guard_telemeters_two_consecutive_quality_misses() -> None:
     healthy = {
         "h_pairwise_cosine_mean": 0.2,
         "plan_rank1_marginal_residual": 0.4,
@@ -624,21 +394,20 @@ def test_slot_collapse_guard_uses_two_active_consecutive_validations_per_arm() -
         guard = te.E2ESlotCollapseGuard()
         guard.update(collapsed, conditioning_active=False)
         guard.update(collapsed, conditioning_active=False)
-        guard.update(collapsed, conditioning_active=True)
-        with pytest.raises(RuntimeError, match=r"training_invalid\(slot_collapse\)"):
-            guard.update(collapsed, conditioning_active=True)
+        guard.update(collapsed, conditioning_active=True, enforce_quality=False)
+        assert guard.update(collapsed, conditioning_active=True, enforce_quality=False)
 
     guard = te.E2ESlotCollapseGuard()
     for _ in range(4):
         guard.update(healthy, conditioning_active=True)
 
-    qualification_guard = te.E2ESlotCollapseGuard()
-    qualification_guard.update(cosine_collapse, conditioning_active=True)
-    assert qualification_guard.update(
+    telemetry_guard = te.E2ESlotCollapseGuard()
+    telemetry_guard.update(cosine_collapse, conditioning_active=True)
+    assert telemetry_guard.update(
         cosine_collapse, conditioning_active=True, enforce_quality=False
     )
     with pytest.raises(RuntimeError, match="non-finite E2E slot-collapse telemetry"):
-        qualification_guard.update(
+        telemetry_guard.update(
             {**healthy, "h_pairwise_cosine_mean": float("nan")},
             conditioning_active=True,
             enforce_quality=False,
@@ -647,24 +416,18 @@ def test_slot_collapse_guard_uses_two_active_consecutive_validations_per_arm() -
 
 def test_family_ratio_guard_telemeters_finite_quality_misses_but_not_nonfinite() -> None:
     zero = {"generator": {"edge": 0.0, "recon": 0.0}}
-    qualification_guard = te._E2EFamilyRatioGuard(threshold=2.0, required_probes=2)
-    assert qualification_guard.update(zero, enabled=True, enforce_quality=False) == {
+    telemetry_guard = te._E2EFamilyRatioGuard(threshold=2.0, required_probes=2)
+    assert telemetry_guard.update(zero, enabled=True, enforce_quality=False) == {
         "generator": 0.0
     }
-    assert qualification_guard.ratio_defined == {"generator": False}
-    with pytest.raises(RuntimeError, match="family-gradient median"):
-        te._E2EFamilyRatioGuard(2.0, 2).update(zero, enabled=True)
+    assert telemetry_guard.ratio_defined == {"generator": False}
 
     imbalanced = {"generator": {"edge": 10.0, "recon": 1.0, "ssl": 1.0}}
-    qualification_guard.update(imbalanced, enabled=True, enforce_quality=False)
-    qualification_guard.update(imbalanced, enabled=True, enforce_quality=False)
-    assert qualification_guard.streaks == {"generator": 2}
-    formal_guard = te._E2EFamilyRatioGuard(threshold=2.0, required_probes=2)
-    formal_guard.update(imbalanced, enabled=True)
-    with pytest.raises(RuntimeError, match="family-gradient imbalance"):
-        formal_guard.update(imbalanced, enabled=True)
+    telemetry_guard.update(imbalanced, enabled=True, enforce_quality=False)
+    telemetry_guard.update(imbalanced, enabled=True, enforce_quality=False)
+    assert telemetry_guard.streaks == {"generator": 2}
     with pytest.raises(RuntimeError, match="non-finite E2E family-gradient norm"):
-        qualification_guard.update(
+        telemetry_guard.update(
             {"generator": {"edge": float("nan"), "recon": 1.0}},
             enabled=True,
             enforce_quality=False,
@@ -889,116 +652,8 @@ def test_e2e_lr_and_active_groups_follow_registered_phase_contract() -> None:
     )
 
 
-def test_qualification_profile_requires_registered_guard_margins(tmp_path: Path) -> None:
-    profile = {
-        "total_optimizer_steps": 4,
-        "optimizer_step_gradients": [
-            {
-                "optimizer_group_gradients": {
-                    "pair_encoder_head": {"active": True, "clip_coefficient": 0.5},
-                    "generator": {"active": True, "clip_coefficient": 0.6},
-                }
-            }
-            for _ in range(4)
-        ],
-        "gradient_norm_series": [
-            {
-                "alpha": 1.0,
-                "family_group_ratios": {"generator": 2.0},
-                "submodule_gradient_rms": {
-                    "grad_rms_trunk": 0.1,
-                    "grad_rms_ste": 0.01,
-                    "grad_rms_content": 0.02,
-                },
-            }
-        ],
-    }
-    path = tmp_path / "profile.json"
-    output = tmp_path / "margins.json"
-    path.write_text(json.dumps(profile))
-
-    summary = te.validate_e2e_qualification_profile(path, output_path=output)
-
-    assert summary["status"] == "pass"
-    assert json.loads(output.read_text())["family_ratio_p99"] == pytest.approx(2.0)
-    profile["optimizer_step_gradients"][0]["optimizer_group_gradients"]["generator"][  # type: ignore[index]
-        "clip_coefficient"
-    ] = 0.001
-    path.write_text(json.dumps(profile))
-    with pytest.raises(RuntimeError, match="clip margins"):
-        te.validate_e2e_qualification_profile(path)
 
 
-def test_qualification_clip_floors_are_per_group_and_fail_closed(tmp_path: Path) -> None:
-    """The calibrated per-group p1 floors admit the retained rehearsal pattern.
-
-    Regression for the 2026-07-22 attempt-3 margins failure: measured p1
-    0.1100/0.0281/0.5187 (pair/generator/topology) must pass the calibrated
-    floors 0.04/0.01/0.15, while an unlisted group falls back to the
-    scaffold-era 0.12 default.
-    """
-
-    def _profile(groups: dict[str, float]) -> dict[str, object]:
-        return {
-            "total_optimizer_steps": 200,
-            "optimizer_step_gradients": [
-                {
-                    "optimizer_group_gradients": {
-                        # The first 4 of 200 steps (2%) carry each group's
-                        # p1-scale low value so np.percentile(values, 1) lands
-                        # on it; the rest sit high so streak/minimum stay clean.
-                        name: {
-                            "active": True,
-                            "clip_coefficient": low if step < 4 else max(0.5, low * 5),
-                        }
-                        for name, low in groups.items()
-                    }
-                }
-                for step in range(200)
-            ],
-            "gradient_norm_series": [
-                {
-                    "alpha": 1.0,
-                    "family_group_ratios": {"generator": 13.7},
-                    "submodule_gradient_rms": {
-                        "grad_rms_trunk": 0.1,
-                        "grad_rms_ste": 0.01,
-                        "grad_rms_content": 0.02,
-                    },
-                }
-            ],
-        }
-
-    rehearsal_like = _profile(
-        {
-            "pair_encoder_head": 0.110,
-            "generator": 0.0281,
-            "topology_content_conditioning": 0.5187,
-        }
-    )
-    path = tmp_path / "profile.json"
-    path.write_text(json.dumps(rehearsal_like))
-    summary = te.validate_e2e_qualification_profile(path)
-    assert summary["status"] == "pass"
-    clip_groups = cast(dict[str, dict[str, float]], summary["clip_groups"])
-    assert clip_groups["generator"]["p1_floor"] == pytest.approx(0.01)
-    assert clip_groups["topology_content_conditioning"]["p1_floor"] == pytest.approx(0.15)
-
-    topology_below_floor = _profile(
-        {
-            "pair_encoder_head": 0.110,
-            "generator": 0.0281,
-            "topology_content_conditioning": 0.10,
-        }
-    )
-    path.write_text(json.dumps(topology_below_floor))
-    with pytest.raises(RuntimeError, match="clip margins failed for topology"):
-        te.validate_e2e_qualification_profile(path)
-
-    unknown_group_uses_default = _profile({"mystery_group": 0.05})
-    path.write_text(json.dumps(unknown_group_uses_default))
-    with pytest.raises(RuntimeError, match="clip margins failed for mystery_group"):
-        te.validate_e2e_qualification_profile(path)
 
 
 def test_e2e_weighted_bce_matches_one_and_two_rank_gradients_with_padding() -> None:
@@ -1084,86 +739,6 @@ def test_e2e_parameter_groups_are_disjoint_exhaustive_and_exclude_kendall() -> N
     assert all(len(digest) == 64 for digest in manifest.sha256.values())
 
 
-def test_e2e_per_group_gradient_guards_clip_and_fail_closed() -> None:
-    first = torch.nn.Parameter(torch.tensor([3.0]))
-    second = torch.nn.Parameter(torch.tensor([4.0]))
-    first.grad = torch.tensor([3.0])
-    second.grad = torch.tensor([4.0])
-    records = te.e2e_check_and_clip_gradients({"active": (first, second)}, {"active"})
-    assert records["active"].norm == pytest.approx(5.0)
-    assert records["active"].clip_coefficient == pytest.approx(0.2)
-    assert torch.linalg.vector_norm(torch.stack([first.grad[0], second.grad[0]])) == pytest.approx(
-        1.0
-    )
-
-    generator = torch.nn.Parameter(torch.tensor([0.0]))
-    generator.grad = torch.tensor([1545.4539013796064])
-    calibrated = te.e2e_check_and_clip_gradients(
-        {"generator": (generator,)},
-        {"generator"},
-        max_norm={"generator": 3.0},
-    )
-    assert calibrated["generator"].clip_coefficient == pytest.approx(3.0 / 1545.4539013796064)
-    te.E2EClipGuard().update(calibrated)
-    with pytest.raises(ValueError, match="max_norm mapping"):
-        te.e2e_check_and_clip_gradients({"generator": (generator,)}, {"generator"}, max_norm={})
-    with pytest.raises(ValueError, match="max_norm mapping"):
-        te.e2e_check_and_clip_gradients(
-            {"generator": (generator,)}, {"generator"}, max_norm={"generator": 0.0}
-        )
-
-    first.grad = torch.tensor([float("nan")])
-    with pytest.raises(RuntimeError, match="non-finite gradient"):
-        te.e2e_check_and_clip_gradients({"active": (first,)}, {"active"})
-    first.grad = torch.zeros(1)
-    with pytest.raises(RuntimeError, match="zero gradient norm"):
-        te.e2e_check_and_clip_gradients({"active": (first,)}, {"active"})
-    zero_record = te.e2e_check_and_clip_gradients(
-        {"active": (first,)}, {"active"}, enforce_nonzero=False
-    )["active"]
-    assert zero_record.norm == 0.0
-    assert zero_record.clip_coefficient == 1.0
-
-    guard = te.E2EClipGuard(persistent_steps=2)
-    clipped = te.E2EGradientGroupRecord(True, 20.0, 0.05, 0)
-    guard.update({"active": clipped}, step=11, phase="A")
-    with pytest.raises(RuntimeError, match="persistent clipping") as error:
-        guard.update({"active": clipped}, step=12, phase="A")
-    message = str(error.value)
-    assert "step=12" in message
-    assert "phase=A" in message
-    assert "norm=20.0" in message
-    assert "coefficient=0.05" in message
-    assert '"step": 11' in message
-    assert '"step": 12' in message
-
-    probe_guard = te.E2EClipGuard(persistent_steps=2)
-    probe_guard.update({"active": clipped}, enforce_persistent=False)
-    probe_guard.update({"active": clipped}, enforce_persistent=False)
-    with pytest.raises(RuntimeError, match="persistent clipping"):
-        probe_guard.update({"active": clipped})
-    extreme = te.E2EGradientGroupRecord(True, 4000.0, 0.00075, 0)
-    with pytest.raises(RuntimeError, match="extreme clipping"):
-        te.E2EClipGuard().update({"active": extreme}, enforce_persistent=False)
-    qualification_clip_guard = te.E2EClipGuard(persistent_steps=2)
-    qualification_clip_guard.update(
-        {"active": extreme}, enforce_immediate=False, enforce_persistent=False
-    )
-    qualification_clip_guard.update(
-        {"active": extreme}, enforce_immediate=False, enforce_persistent=False
-    )
-    assert qualification_clip_guard.streaks == {"active": 2}
-    nonfinite_clip = te.E2EGradientGroupRecord(True, 1.0, float("nan"), 0)
-    with pytest.raises(RuntimeError, match="invalid clip coefficient"):
-        qualification_clip_guard.update(
-            {"active": nonfinite_clip},
-            enforce_immediate=False,
-            enforce_persistent=False,
-        )
-
-    te.e2e_assert_replicated_squared_norms({"active": torch.tensor([4.0, 4.0])})
-    with pytest.raises(RuntimeError, match="differ across ranks"):
-        te.e2e_assert_replicated_squared_norms({"active": torch.tensor([4.0, 5.0])})
 
 
 def _record(epoch: int, *, mmd: float, brier: float, auprc: float = 0.6) -> te.E2ECheckpointRecord:
@@ -1181,46 +756,3 @@ def _record(epoch: int, *, mmd: float, brier: float, auprc: float = 0.6) -> te.E
         warm_reference_auprc=0.61,
         residual_ratio=1e-2,
     )
-
-
-def test_e2e_eligibility_and_topology_aware_selection_are_fail_closed() -> None:
-    warm = te.E2ECheckpointRecord(**{**_record(1, mmd=0.1, brier=0.1).__dict__, "phase": "A"})
-    assert not te.e2e_checkpoint_eligible(warm, "full")
-    assert te.select_e2e_checkpoint([warm], "full") is None
-
-    selected = te.select_e2e_checkpoint(
-        [
-            _record(2, mmd=0.4, brier=0.1, auprc=0.62),
-            _record(3, mmd=0.2, brier=0.3, auprc=0.60),
-            _record(4, mmd=0.2 + 5e-7, brier=0.2, auprc=0.60),
-        ],
-        "full",
-    )
-    assert selected is not None and selected.epoch == 4
-
-
-def test_e2e_eligibility_reference_keeps_pair_head_learning_guard_strict() -> None:
-    learned = _record(1, mmd=0.1, brier=0.1, auprc=0.23)
-    learned = te.E2ECheckpointRecord(
-        **{
-            **learned.__dict__,
-            "prevalence": 0.2,
-            "warm_reference_auprc": 0.23,
-        }
-    )
-    assert te.e2e_checkpoint_eligible(learned, "full")
-
-    at_threshold = te.E2ECheckpointRecord(
-        **{
-            **learned.__dict__,
-            "warm_reference_auprc": 0.22,
-        }
-    )
-    below_threshold = te.E2ECheckpointRecord(
-        **{
-            **learned.__dict__,
-            "warm_reference_auprc": 0.21,
-        }
-    )
-    assert te.e2e_checkpoint_eligible(at_threshold, "full")
-    assert not te.e2e_checkpoint_eligible(below_threshold, "full")

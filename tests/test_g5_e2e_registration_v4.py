@@ -1,7 +1,7 @@
 """Contract tests for the EgoStitch rev-3.2 v4 draft registration.
 
-v4 records the design of the two-stage ladder (spec §13.19.4, §14.4.6-7) and
-re-pins the v2 acceptance thresholds for the formal stage.  The tests below are
+v4 records the single-stage plan-bound design (spec §13.19, §14.4.6-7) and
+re-pins the scientific reporting thresholds for the formal result. The tests below are
 written against three distinct failure modes:
 
 1. *Dead machinery.*  v3 declared a five-gate pre-binding ladder, a three-attempt
@@ -219,7 +219,6 @@ def test_formal_acceptance_thresholds_are_copied_from_binding_v2() -> None:
         "comparators",
         "comparator_note",
         "evaluator",
-        "verdict_rule",
         "failure_reading",
     ):
         assert registration[field] == v2[field], f"{field} drifted from BINDING v2"
@@ -374,172 +373,31 @@ def test_v_hold_digests_are_pinned_and_proved_disjoint_from_v_fit() -> None:
     ]
 
 
-def test_the_selection_band_is_left_unpinned_not_held_at_the_legacy_value() -> None:
-    """Spec §13.19.3 forbids carrying `auprc_tolerance` at the legacy 0.02.
-
-    A null here is the honest state: the value must be re-derived from V_hold's
-    measured AP sampling SD.  Silently re-pinning 0.02 would make the AUPRC band
-    admit nearly every post-ramp epoch, collapsing selection onto a
-    single-sample MMD argmin.
-    """
-    selection = _registration()["checkpoint_selection"]
-    assert isinstance(selection, dict)
-    assert selection["auprc_tolerance"] is None
-    assert "measured AP sampling standard deviation" in str(selection["auprc_tolerance_rule"])
-    # The fixed eligibility floor is a different constant and is retained.
-    assert "warm-reference AUPRC >= label prevalence + 0.02" in selection["full_and_p0_eligibility"]
-
-
-def test_the_selection_band_calibration_method_is_fully_pinned() -> None:
+def test_selection_band_is_a_fixed_plan_value_without_calibration_artifact() -> None:
     selection = _section("checkpoint_selection")
-    method = _mapping(selection["auprc_tolerance_calibration_method"])
-
-    assert selection["auprc_tolerance"] is None
-    assert method["method_id"] == "stratified_pair_bootstrap_ap_sd_v1"
-    assert method["scope"] == "one scalar shared unchanged by all six trained arms"
-    assert method["immutable_source_attempt"] == (
-        "the first full-arm Seed-0 qualification attempt under the first implementation "
-        "containing this method that reaches the first validation after the conditioning "
-        "ramp plus one complete Phase-C epoch and successfully writes the complete source "
-        "artifact; a failed, incomplete, later, or manually preferred attempt cannot replace it"
+    assert selection["auprc_tolerance"] == 0.02
+    assert "preliminary run or calibration artifact" in str(
+        selection["auprc_tolerance_rule"]
     )
-    assert method["source_validation_reuse"] == (
-        "reuse that existing validation event; do not trigger another validation and do not "
-        "add another V_hold evaluation to K. The source attempt and source validation remain "
-        "in the complete attempt_history.json exposure history and cumulative K exactly once"
-    )
-    assert method["pair_universe"] == {
-        "name": "canonical V_hold non-self pair manifest",
-        "rows": 130816,
-        "positives": 1533,
-        "negatives": 129283,
-    }
-    assert method["scores"] == {
-        "array": "active full-model logits",
-        "dtype": "fp32",
-        "transform": "none; no sigmoid",
-    }
-    assert method["bootstrap"] == {
-        "unit": "pair row",
-        "stratification": "binary label",
-        "replacement": True,
-        "replicates": 10000,
-        "positive_draws_per_replicate": 1533,
-        "negative_draws_per_replicate": 129283,
-        "rng": (
-            "numpy.random.Generator(numpy.random.PCG64(0)); one sequential generator for all draws"
-        ),
-        "iteration_order": "replicate-major from replicate 0 through 9999",
-        "draw_order_per_replicate": (
-            "draw positive row indices first, then negative row indices, from the same sequential "
-            "generator"
-        ),
-        "metric_input_assembly": (
-            "concatenate the positive sample before the negative sample for y_true, and "
-            "concatenate "
-            "the corresponding raw logits in the identical order for y_score"
-        ),
-        "metric": "sklearn.metrics.average_precision_score",
-    }
-    assert method["estimator"] == (
-        "sample standard deviation of the 10000 replicate AP values with ddof=1"
-    )
-    assert method["rounding"] == "ceil(10000 * sd) / 10000"
-    assert method["clamp"] == "none; no floor or cap"
-
-    arms = _section("arms")
-    trained_arms = tuple(
-        name for name, arm in arms.items() if _mapping(arm)["kind"] == "trained_checkpoint"
-    )
-    assert trained_arms == EXPECTED_TRAINED_ARMS
+    assert "auprc_tolerance_calibration_method" not in selection
 
 
-# --------------------------------------------------------------------------- ladder and arms
+def test_single_stage_plan_has_no_qualification_contract() -> None:
+    registration = _registration()
+    assert "ladder" not in registration
+    assert "qualification_stage" not in _mapping(registration["test_protocol"])
+    assert "qualification_worker" not in _mapping(registration["mechanics"])
+    assert train_egostitch.E2ERunKind.__args__ == ("formal", "debug")
 
 
-def test_v4_registers_pending_manual_review_without_weakening_clipping() -> None:
-    ladder = _registration()["ladder"]
-    assert isinstance(ladder, dict)
-    qualification = ladder["qualification"]
-    formal = ladder["formal"]
-    assert isinstance(qualification, dict)
-    assert isinstance(formal, dict)
-
-    assert qualification["trains_on"] == formal["trains_on"] == "full V_fit"
-    assert qualification["validates_on"] == formal["validates_on"] == "V_hold"
-    assert qualification["verdict"] == (
-        "complete three epochs with no hard operational failure yields pending manual "
-        "review; never automatic pass"
-    )
-    assert qualification["verdict_values"] == [
-        "pending_manual_review",
-        "fail(<named_guard>)",
-    ]
-    verdict_rule = str(qualification["verdict_rule"])
-    assert "writes pending_manual_review, never pass" in verdict_rule
-    assert "global-norm clipping remains active at 3.0 for pair/generator and 1.0" in verdict_rule
-    assert "Every finite model-quality threshold is telemetry-only in qualification" in verdict_rule
-    assert "regardless of checkpoint eligibility" in verdict_rule
-    assert "no manual-approval artifact or conversion to pass" in verdict_rule
-    assert qualification["optim_epochs"] == 3
-    assert formal["optim_epochs"] == 30
-    assert qualification["test_access"] == "none"
-
-    artifact = qualification["artifact"]
-    assert isinstance(artifact, dict)
-    assert artifact["filename"] == train_egostitch.QUALIFICATION_FILENAME
-    assert artifact["fields"] == [
-        "verdict",
-        "epochs",
-        "hparams",
-        "feature_stats_sha256",
-        "model_config_sha256",
-    ]
-    assert formal["preflight"] == [
-        "the qualification artifact exists",
-        "the current immutable attempt has verdict == 'pass'; pending_manual_review fails "
-        "closed, this DRAFT defines no approval/conversion artifact, and preflight may not "
-        "fall back from a latest pending attempt to an earlier pass",
-        "feature_stats_sha256 and model_config_sha256 both equal the formal run's "
-        "own computed values",
-    ]
-
-    guards = _section("stability_guards")
-    assert guards["immediate_abort"] == [
-        "non-finite loss or logit",
-        "non-finite parameter or optimizer state",
-        "non-finite gradient element, optimizer-group norm, family norm, or submodule RMS",
-    ]
-    persistent_abort = guards["persistent_abort"]
-    assert isinstance(persistent_abort, list)
-    assert persistent_abort[0] == (
-        "formal only: any optimizer-group clip coefficient below 1e-3 on one step"
-    )
-    assert len(persistent_abort) == 4
-    assert "finite model-quality misses remain telemetry" in str(guards["abort_consequence"])
-    assert "Actual clipping and complete telemetry are unchanged" in str(
-        guards["qualification_policy"]
-    )
-    assert "in ANY run kind" in str(ladder["boundary_audit"])
-
-
-def test_formal_eligibility_is_retained_while_qualification_records_telemetry() -> None:
-    """Formal retains eligibility; qualification records non-authorizing telemetry."""
-    selection = _registration()["checkpoint_selection"]
-    assert isinstance(selection, dict)
+def test_quality_predicates_are_telemetry_only() -> None:
+    selection = _section("checkpoint_selection")
     policy = str(selection["eligibility_stage_policy"])
-    assert "hard eligibility requirements for formal" in policy
-    assert "model-quality telemetry" in policy
-    assert "best.pt/last.pt compatibility aliases" in policy
-    assert "neither alias is formal authorization" in policy
-    assert selection["forbidden"] == [
-        "formal only: warm-start or ramp checkpoint selection",
-        "formal only: fallback to epoch 1",
-        "formal only: fallback to last.pt",
-        "formal only: fallback to a checkpoint that violates any eligibility condition; "
-        "qualification may expose the non-eligible final epoch through diagnostic "
-        "compatibility aliases only",
-    ]
+    assert "telemetry-only" in policy
+    assert "cannot prevent selection, completion, publication, scoring, or evaluation" in policy
+    assert "all completed epochs" in str(selection["selection"])
+    assert selection["no_eligible_checkpoint"].startswith("not a blocking state")
+
 
 
 def test_v4_registration_freezes_the_rev32_contract() -> None:
@@ -774,11 +632,8 @@ def test_binding_prerequisites_name_every_unresolved_section() -> None:
         "implementation",
         "parameter_group_manifests",
         "packs_and_validation_manifests",
-        "qualification_attempts",
-        "qualification_history_indexes",
         "boundary_access_audit",
         "runtime_and_peak_memory",
-        "auprc_tolerance_calibration",
         "checkpoint_policy_version",
     }
     prerequisites = registration["binding_prerequisites"]
@@ -786,7 +641,6 @@ def test_binding_prerequisites_name_every_unresolved_section() -> None:
     joined = " ".join(str(item) for item in prerequisites)
     for section in unresolved:
         assert section in joined, f"binding_prerequisites does not name {section}"
-    assert "auprc_tolerance" in joined
     assert "owner" in joined.lower()
 
 
@@ -804,13 +658,13 @@ def test_test_protocol_registers_the_ledger_and_refuses_the_once_only_claim() ->
     assert "exactly once" in str(formal["not_claimed"])
     assert "append-only" in str(formal["ledger"])
     assert "never on test" in str(formal["selection_boundary"])
-    assert str(protocol["qualification_stage"]).startswith("the test universe is never opened")
+    assert "qualification_stage" not in protocol
 
 
 def test_selection_exposure_is_disclosed_with_the_k_mitigation() -> None:
     disclosure = _registration()["selection_exposure_disclosure"]
     assert isinstance(disclosure, dict)
-    assert "not exchangeable across arms" in str(disclosure["hazard"])
+    assert "Repeated formal-plan development" in str(disclosure["hazard"])
     assert "record K" in str(disclosure["mitigation"])
 
 
@@ -1003,22 +857,15 @@ def test_shared_registration_path_resolvers_reject_invalid_values(
 def test_v4_markdown_declares_json_authority_and_matches_critical_pins() -> None:
     text = MARKDOWN_PATH.read_text(encoding="utf-8")
 
-    assert "**Status: DRAFT." in text
-    assert "**If the two disagree, the JSON governs.**" in text
+    assert "Status: `DRAFT`" in text
+    assert "JSON twin is authoritative" in text
     for arm in EXPECTED_TRAINED_ARMS + EXPECTED_CONTROL_ARMS:
         assert f"`{arm}`" in text
     for pin in (
-        "`shuffle_within_pair_v3`",
-        "`rewire_checkerboard_v1`",
-        "`egostitch_e2e_probe_v2`",
-        "`b0_cal_selfdensity`",
-        "0.01171875",
-        "130,816",
-        "1,533",
-        "7,558",
-        "22,708",
-        "6,612",
-        "`1.10`",
-        "`B = 1000`",
+        "one formal training stage",
+        "There is no qualification stage",
+        "Eligibility, liveness, slot-collapse indicators",
+        "exact artifact identities",
+        "owner-bound",
     ):
         assert pin in text, f"markdown twin lost pin {pin}"

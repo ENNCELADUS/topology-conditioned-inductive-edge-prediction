@@ -2,7 +2,7 @@
 
 The holdout is derived solely from the seeded message graph.  ``V_hold`` is the
 union of the two historical BFS draws and is the single validation universe for
-both the qualification and the formal stage.  This module also materializes the
+the formal training plan.  This module also materializes the
 complete, non-self pair/label universe over ``V_hold`` so its exact contents can
 be pinned before binding.
 """

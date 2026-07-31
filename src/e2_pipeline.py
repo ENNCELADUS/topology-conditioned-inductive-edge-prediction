@@ -12,9 +12,7 @@ publish``: pack-or-validate the BF16 feature cache, launch one clean
 fields, and publish the validated staging tree atomically. See
 :func:`run_pipeline` for the full contract.
 
-Both stages of the E2E ladder run through this orchestrator and differ only in
-``optim.epochs``: the qualification stage passes ``--run-kind qualification
---epochs N``, the formal stage runs the config's registered schedule.
+EgoStitch E2E uses this orchestrator for the single plan-bound formal schedule.
 """
 
 import argparse
@@ -161,17 +159,8 @@ class PipelineArgs:
         seed: Optional worker seed override for pre-registered multi-seed runs.
         max_steps: Optional DEBUG-ONLY bounded worker-step limit.
         run_kind: Optional EgoStitch-E2E execution context forwarded to the
-            worker; one of ``qualification`` or ``formal``. ``debug`` is not
+            worker; the only public value is ``formal``. ``debug`` is not
             selectable here — it is derived by the worker from ``--max-steps``.
-        epochs: Optional ``optim.epochs`` override; the qualification stage's
-            short schedule. Accepted only with ``--run-kind qualification``, so
-            it can never silently shorten the registered formal schedule behind
-            a config sha256 that still matches the BINDING registration.
-        qualification_artifact: Path to the qualification stage's
-            ``qualification.json``, forwarded to the worker. The formal stage
-            compares its own ``feature_stats_sha256`` against the recorded one
-            and refuses without it; the qualification stage is where that digest
-            is born, so passing one there is refused as a misuse.
         worker_module: Dotted module implementing the worker contract
             (``load_config``, ``prepare_pack``, and the ``--ddp-mode train``
             CLI). Defaults to the formal E2 B0 worker; ``src.train_egostitch``
@@ -185,8 +174,6 @@ class PipelineArgs:
     seed: int | None = None
     max_steps: int | None = None
     run_kind: str | None = None
-    epochs: int | None = None
-    qualification_artifact: Path | None = None
 
 
 def build_accelerate_command(
@@ -203,8 +190,6 @@ def build_accelerate_command(
     seed: int | None = None,
     max_steps: int | None = None,
     run_kind: str | None = None,
-    epochs: int | None = None,
-    qualification_artifact: Path | None = None,
 ) -> list[str]:
     """Build the pinned ``accelerate launch -m <worker>`` worker command.
 
@@ -226,12 +211,6 @@ def build_accelerate_command(
         max_steps: Optional DEBUG-ONLY bounded worker-step limit.
         run_kind: Optional EgoStitch-E2E execution context forwarded unchanged
             to the worker.
-        epochs: Optional ``optim.epochs`` override forwarded unchanged to the
-            worker, so the worker trains the same schedule the orchestrator
-            validates its artifacts against.
-        qualification_artifact: Optional path to the qualification stage's
-            ``qualification.json``, forwarded unchanged to the worker, which is
-            the single place the digest equality is enforced.
 
     Returns:
         The exact ``accelerate launch --num_processes <world_size> --mixed_precision bf16
@@ -265,10 +244,6 @@ def build_accelerate_command(
         command.extend(("--max-steps", str(max_steps)))
     if run_kind is not None:
         command.extend(("--run-kind", run_kind))
-    if epochs is not None:
-        command.extend(("--epochs", str(epochs)))
-    if qualification_artifact is not None:
-        command.extend(("--qualification-artifact", str(qualification_artifact)))
     return command
 
 
@@ -308,29 +283,11 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument(
         "--run-kind",
-        choices=("qualification", "formal"),
+        choices=("formal",),
         default=None,
         help=(
             "EgoStitch E2E execution context; forwarded unchanged to the worker. "
             "'debug' is not selectable: the worker derives it from --max-steps"
-        ),
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=None,
-        help=(
-            "override optim.epochs with the qualification stage's short schedule; "
-            "requires --run-kind qualification and is forwarded to the worker"
-        ),
-    )
-    parser.add_argument(
-        "--qualification-artifact",
-        type=Path,
-        default=None,
-        help=(
-            "path to the qualification stage's qualification.json, forwarded to the "
-            "worker; a formal EgoStitch-E2E run refuses to train without it"
         ),
     )
     parser.add_argument(
@@ -351,8 +308,6 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
         seed=namespace.seed,
         max_steps=namespace.max_steps,
         run_kind=namespace.run_kind,
-        epochs=namespace.epochs,
-        qualification_artifact=namespace.qualification_artifact,
     )
 
 
@@ -565,265 +520,9 @@ _PUBLISHED_FILENAMES = (
     "artifact_manifest.json",
 )
 V_HOLD_VALIDATION_EVENTS_FILENAME = "v_hold_validation_events.jsonl"
-#: Written by the qualification stage only. It is the stage's verdict, and the
-#: formal stage refuses to launch without it. A stale verdict is always cleared,
-#: so a failed re-qualification can never leave an earlier verdict standing.
-QUALIFICATION_ARTIFACT_FILENAME = "qualification.json"
-AUPRC_TOLERANCE_SOURCE_FILENAME = "auprc_tolerance_source.npz"
 _OPTIONAL_PUBLISHED_FILENAMES = (
-    # Required conditionally rather than for B0: qualification emits the
-    # verdict, while every non-debug E2E run emits the V_hold ledger.
-    QUALIFICATION_ARTIFACT_FILENAME,
     V_HOLD_VALIDATION_EVENTS_FILENAME,
 )
-
-_QUALIFICATION_PIPELINE_FAILURE_VERDICTS = {
-    "pack": "fail(pack_stage)",
-    "train": "fail(training_worker)",
-    "artifacts": "fail(staged_artifacts)",
-    "publication": "fail(publication)",
-}
-
-_QUALIFICATION_ARTIFACT_KEYS = {
-    "verdict",
-    "epochs",
-    "hparams",
-    "feature_stats_sha256",
-    "model_config_sha256",
-}
-_QUALIFICATION_HPARAM_KEYS = {
-    "lr",
-    "weight_decay",
-    "warmup_steps",
-    "grad_clip",
-    "seed",
-    "negative_ratio",
-    "node_batch",
-    "edge_batch",
-    "mixed_precision",
-    "training",
-}
-_E2E_OPTIMIZER_GROUP_NAMES = {
-    "pair_encoder_head",
-    "generator",
-    "topology_content_conditioning",
-}
-_E2E_GRADIENT_ROW_KEYS = {
-    "step",
-    "phase",
-    "alpha",
-    "optimizer_group_gradients",
-    "quality_thresholds",
-}
-_E2E_GRADIENT_RECORD_KEYS = {
-    "active",
-    "norm",
-    "clip_coefficient",
-    "nonfinite_elements",
-}
-_E2E_GRADIENT_QUALITY_FLAG_KEYS = {
-    "finite_zero_norm",
-    "immediate_clip_threshold_missed",
-    "persistent_clip_threshold_missed",
-}
-
-
-def _validate_qualification_artifact_schema(payload: object, *, epochs: int) -> dict[str, object]:
-    """Validate the common schema used by every qualification verdict."""
-    if not isinstance(payload, dict) or set(payload) != _QUALIFICATION_ARTIFACT_KEYS:
-        raise ValueError("qualification.json has an invalid top-level schema")
-    recorded_epochs = payload.get("epochs")
-    if (
-        isinstance(recorded_epochs, bool)
-        or not isinstance(recorded_epochs, int)
-        or recorded_epochs != epochs
-    ):
-        raise ValueError("qualification epochs do not match this run")
-    hparams = payload.get("hparams")
-    if not isinstance(hparams, dict) or set(hparams) != _QUALIFICATION_HPARAM_KEYS:
-        raise ValueError("qualification hparams have an invalid schema")
-    for field, allow_empty in (
-        ("feature_stats_sha256", True),
-        ("model_config_sha256", False),
-    ):
-        digest = payload.get(field)
-        if not isinstance(digest, str) or (not digest and not allow_empty):
-            raise ValueError(f"qualification {field} is invalid")
-        if digest:
-            if len(digest) != 64:
-                raise ValueError(f"qualification {field} is invalid")
-            try:
-                int(digest, 16)
-            except ValueError as error:
-                raise ValueError(f"qualification {field} is invalid") from error
-    return cast(dict[str, object], payload)
-
-
-def _validate_qualification_completion_artifact(
-    staging_dir: Path, *, cfg: object, worker: object
-) -> None:
-    """Bind a completed qualification's pending verdict to this exact run.
-
-    The worker's public ``validate_qualification_artifact`` is intentionally a
-    formal-preflight validator: it accepts only ``pass``, which this pipeline
-    neither creates nor derives from a pending artifact. Qualification
-    completion is a narrower engineering assertion, so validate its immutable
-    ``pending_manual_review`` artifact here without weakening formal preflight.
-    """
-    path = staging_dir / QUALIFICATION_ARTIFACT_FILENAME
-    if not path.is_file() or path.stat().st_size <= 0:
-        raise ValueError(f"{QUALIFICATION_ARTIFACT_FILENAME} is missing or empty")
-    payload = _validate_qualification_artifact_schema(
-        json.loads(path.read_text(encoding="utf-8")),
-        epochs=cast(int, getattr(getattr(cfg, "optim", None), "epochs", None)),
-    )
-    if payload.get("verdict") != "pending_manual_review":
-        raise ValueError(
-            "qualification verdict is not 'pending_manual_review': "
-            f"{payload.get('verdict')!r}"
-        )
-
-    metadata_path = staging_dir / "run_metadata.json"
-    if not metadata_path.is_file() or metadata_path.stat().st_size <= 0:
-        raise ValueError("run_metadata.json is missing or empty")
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    if not isinstance(metadata, dict):
-        raise ValueError("run_metadata.json must contain an object")
-    feature_stats_sha256 = metadata.get("feature_stats_sha256")
-    if not isinstance(feature_stats_sha256, str) or len(feature_stats_sha256) != 64:
-        raise ValueError("run_metadata.json has no valid feature_stats_sha256")
-    try:
-        int(feature_stats_sha256, 16)
-    except ValueError as error:
-        raise ValueError("run_metadata.json has no valid feature_stats_sha256") from error
-
-    if payload.get("feature_stats_sha256") != feature_stats_sha256:
-        raise ValueError("qualification feature_stats_sha256 does not match this run")
-
-    model_config_hash = getattr(worker, "model_config_hash", None)
-    if not callable(model_config_hash):
-        raise ValueError("qualification worker must provide model_config_hash")
-    expected_model_config_sha256 = model_config_hash(cfg)
-    if (
-        not isinstance(expected_model_config_sha256, str)
-        or len(expected_model_config_sha256) != 64
-    ):
-        raise ValueError("qualification worker returned an invalid model config digest")
-    try:
-        int(expected_model_config_sha256, 16)
-    except ValueError as error:
-        raise ValueError("qualification worker returned an invalid model config digest") from error
-    if payload.get("model_config_sha256") != expected_model_config_sha256:
-        raise ValueError("qualification model_config_sha256 does not match this config")
-
-
-def _validate_qualification_gradient_telemetry(profile: Mapping[str, object]) -> None:
-    """Require complete finite per-step telemetry without applying margin gates."""
-    total_steps = profile.get("total_optimizer_steps")
-    if isinstance(total_steps, bool) or not isinstance(total_steps, int) or total_steps <= 0:
-        raise ValueError("qualification total_optimizer_steps must be a positive integer")
-    schedule_total_steps = profile.get("schedule_total_optimizer_steps")
-    if (
-        isinstance(schedule_total_steps, bool)
-        or not isinstance(schedule_total_steps, int)
-        or schedule_total_steps != total_steps
-    ):
-        raise ValueError("qualification schedule and executed optimizer-step counts disagree")
-    per_epoch = profile.get("per_epoch")
-    if not isinstance(per_epoch, list) or not per_epoch:
-        raise ValueError("qualification per-epoch optimizer-step telemetry is missing")
-    per_epoch_steps = 0
-    for row in per_epoch:
-        steps = row.get("steps") if isinstance(row, dict) else None
-        if isinstance(steps, bool) or not isinstance(steps, int) or steps <= 0:
-            raise ValueError("qualification per-epoch optimizer-step count is invalid")
-        per_epoch_steps += steps
-    if per_epoch_steps != total_steps:
-        raise ValueError("qualification per-epoch and total optimizer-step counts disagree")
-    rows = profile.get("optimizer_step_gradients")
-    if not isinstance(rows, list) or len(rows) != total_steps:
-        raise ValueError("qualification optimizer-step gradient telemetry is incomplete")
-
-    for expected_step, row in enumerate(rows, start=1):
-        if not isinstance(row, dict) or set(row) != _E2E_GRADIENT_ROW_KEYS:
-            raise ValueError("qualification optimizer-step gradient row has an invalid schema")
-        step = row.get("step")
-        if isinstance(step, bool) or not isinstance(step, int) or step != expected_step:
-            raise ValueError("qualification optimizer-step gradient sequence is invalid")
-        if row.get("phase") not in {"A", "B", "C"}:
-            raise ValueError("qualification optimizer-step gradient phase is invalid")
-        alpha = row.get("alpha")
-        if (
-            isinstance(alpha, bool)
-            or not isinstance(alpha, int | float)
-            or not math.isfinite(float(alpha))
-            or not 0.0 <= float(alpha) <= 1.0
-        ):
-            raise ValueError("qualification optimizer-step gradient alpha is invalid")
-
-        groups = row.get("optimizer_group_gradients")
-        if not isinstance(groups, dict) or set(groups) != _E2E_OPTIMIZER_GROUP_NAMES:
-            raise ValueError("qualification optimizer-step gradient groups are incomplete")
-        if not isinstance(groups.get("generator"), dict) or groups["generator"].get(
-            "active"
-        ) is not True:
-            raise ValueError("qualification generator gradient telemetry must be active")
-        for name, record in groups.items():
-            if not isinstance(record, dict) or set(record) != _E2E_GRADIENT_RECORD_KEYS:
-                raise ValueError(f"qualification gradient record for {name} has an invalid schema")
-            active = record.get("active")
-            if not isinstance(active, bool):
-                raise ValueError(f"qualification gradient record for {name} has invalid activity")
-            nonfinite = record.get("nonfinite_elements")
-            if (
-                isinstance(nonfinite, bool)
-                or not isinstance(nonfinite, int)
-                or nonfinite != 0
-            ):
-                raise ValueError(
-                    f"qualification gradient record for {name} has non-finite elements"
-                )
-            norm = record.get("norm")
-            coefficient = record.get("clip_coefficient")
-            if not active:
-                if norm is not None or coefficient is not None:
-                    raise ValueError(
-                        f"qualification inactive gradient record for {name} must have null values"
-                    )
-                continue
-            if (
-                isinstance(norm, bool)
-                or not isinstance(norm, int | float)
-                or not math.isfinite(float(norm))
-                or float(norm) < 0.0
-            ):
-                raise ValueError(f"qualification active gradient norm for {name} is invalid")
-            if (
-                isinstance(coefficient, bool)
-                or not isinstance(coefficient, int | float)
-                or not math.isfinite(float(coefficient))
-                or not 0.0 < float(coefficient) <= 1.0
-            ):
-                raise ValueError(
-                    f"qualification active clip coefficient for {name} is invalid"
-                )
-        quality_thresholds = row.get("quality_thresholds")
-        if (
-            not isinstance(quality_thresholds, dict)
-            or set(quality_thresholds) != _E2E_OPTIMIZER_GROUP_NAMES
-        ):
-            raise ValueError(
-                "qualification optimizer-step quality-threshold groups are incomplete"
-            )
-        for name, flags in quality_thresholds.items():
-            if not isinstance(flags, dict) or set(flags) != _E2E_GRADIENT_QUALITY_FLAG_KEYS:
-                raise ValueError(
-                    f"qualification quality-threshold flags for {name} have an invalid schema"
-                )
-            if not all(isinstance(value, bool) for value in flags.values()):
-                raise ValueError(
-                    f"qualification quality-threshold flags for {name} must be boolean"
-                )
 
 
 def _validate_staged_artifacts(
@@ -833,7 +532,6 @@ def _validate_staged_artifacts(
     model_family: str,
     allow_partial: bool = False,
     require_v_hold_validation_events: bool = False,
-    allow_auprc_tolerance_source: bool = False,
 ) -> None:
     """Load and validate every formal worker artifact before hashing it."""
     import torch
@@ -895,22 +593,6 @@ def _validate_staged_artifacts(
         digest = hashlib.sha256(ledger_path.read_bytes()).hexdigest()
         if evidence.get("sha256") != digest:
             raise ValueError("V_hold validation-event ledger digest does not match metadata")
-    source_path = staging_dir / AUPRC_TOLERANCE_SOURCE_FILENAME
-    if allow_auprc_tolerance_source and source_path.is_file():
-        if source_path.stat().st_size <= 0:
-            raise ValueError(f"{AUPRC_TOLERANCE_SOURCE_FILENAME} is empty")
-        import numpy as np
-
-        try:
-            with np.load(source_path, allow_pickle=False) as source:
-                if not source.files:
-                    raise ValueError(f"{AUPRC_TOLERANCE_SOURCE_FILENAME} has no arrays")
-                for name in source.files:
-                    source[name]
-        except (OSError, ValueError) as error:
-            raise ValueError(f"{AUPRC_TOLERANCE_SOURCE_FILENAME} is invalid") from error
-
-
 def _publish_staged(
     staging_dir: Path,
     output_dir: Path,
@@ -974,29 +656,24 @@ def run_pipeline(
     command_runner: CommandRunner = run_command,
     stage_runner: StageRunner = run_stage,
 ) -> int:
-    """Execute the cold E2 pipeline and return 0 on success or 2 on a gated failure.
+    """Execute the cold E2 pipeline and return 0 on success or 2 on failure.
 
     Sub-stages, ``pack -> train -> publish``: (1) load and validate the
     config/runtime; (2) record whether the pack path was initially absent;
     (3) build or strictly validate the pack within the pack budget; (4) launch
     one clean ``train`` process group at ``runtime.token_budget``; (5) validate
     the worker's runtime profile and every staged artifact against
-    ``cfg.optim.epochs`` (which ``--epochs`` overrides for the qualification
-    stage); (6) merge stage/profile data into ``profile.json`` and write
+    ``cfg.optim.epochs``; (6) merge stage/profile data into ``profile.json`` and write
     ``artifact_manifest.json`` with SHA-256 and byte size for ``best.pt``,
     ``last.pt``, ``metrics.jsonl``, ``run_metadata.json``, ``profile.json``, plus
-    the E2E ``qualification.json`` / ``v_hold_validation_events.jsonl`` and optional
-    qualification-only ``auprc_tolerance_source.npz`` when applicable; and (7)
+    the E2E ``v_hold_validation_events.jsonl`` when applicable; and (7)
     publish the validated staging tree into the canonical output directory with
     per-file atomic replaces and full rollback.
 
     Every subprocess call goes through ``command_runner`` with ``check=False``
     and an explicit timeout (``runtime.train_eval_budget_seconds`` for
     training). Every failure after training starts stops immediately; nothing is
-    published until the whole staging tree has been validated — except the
-    qualification verdict, which is published on both the success and the
-    failure path because ``fail(<named_guard>)`` is itself a valid verdict the
-    formal stage must be able to refuse on.
+    published until the whole staging tree has been validated.
 
     Args:
         args: Parsed pipeline CLI arguments.
@@ -1006,7 +683,7 @@ def run_pipeline(
             artifact deadlines.
 
     Returns:
-        0 on success, 2 on any gated failure (see the stage in ``failure.json``).
+        0 on success, 2 on failure (see the stage in ``failure.json``).
     """
     # Deferred import: workers import ProbeResult from *this* module at their
     # own top level, so importing them back at this module's top level would
@@ -1027,29 +704,6 @@ def run_pipeline(
         if not hasattr(cfg, "run_kind"):
             raise ValueError("--run-kind is only supported by an E2E-aware worker")
         cfg = replace(cfg, run_kind=args.run_kind)
-    if args.epochs is not None:
-        # The formal schedule is registered and its config is digest-pinned, so an
-        # epoch override there would shorten the run behind a matching sha256.
-        if args.run_kind != "qualification":
-            raise ValueError("--epochs is only supported with --run-kind qualification")
-        if args.epochs != 3:
-            raise ValueError("qualification --epochs must equal 3")
-        # Both _validate_worker_profile and _validate_staged_artifacts key off
-        # cfg.optim.epochs, so overriding it here is what makes them track the
-        # schedule the worker is actually told to run.
-        cfg = replace(cfg, optim=replace(cfg.optim, epochs=args.epochs))
-    if args.qualification_artifact is not None:
-        # The qualification stage *computes* this digest and writes the artifact;
-        # accepting one as its input would recreate the circularity the two-stage
-        # design removed. Only the formal stage reads it.
-        if args.run_kind == "qualification":
-            raise ValueError(
-                "--qualification-artifact is the qualification stage's output, not its input"
-            )
-        # Checked here so a formal run refuses before it spends the pack stage;
-        # the digest equality itself stays a worker-side check with one call site.
-        if not args.qualification_artifact.is_file():
-            raise ValueError(f"qualification artifact not found: {args.qualification_artifact}")
     if args.max_steps is not None and args.max_steps <= 0:
         raise ValueError("--max-steps must be positive")
     if cfg.runtime is None:
@@ -1084,72 +738,6 @@ def run_pipeline(
             # retained history must not masquerade as this failure's evidence.
             (output_dir / "failed_run_history.json").unlink(missing_ok=True)
         write_failure(output_dir, stage=stage, message=message, extra=extra)
-        if args.run_kind == "qualification" and not debug_run:
-            # A calibration source is publishable only with a successful
-            # qualification. Never rescue one from a failed attempt, and clear
-            # an earlier source so it cannot masquerade as evidence for this
-            # failed attempt.
-            (output_dir / AUPRC_TOLERANCE_SOURCE_FILENAME).unlink(missing_ok=True)
-            # Failed attempts still count every V_hold look already performed.
-            # Preserve the adjacent, hash-bound evidence before staging teardown
-            # so the immutable attempt can be included in cumulative K.
-            for filename in ("run_metadata.json", V_HOLD_VALIDATION_EVENTS_FILENAME):
-                staged_evidence = staging_dir / filename
-                if staged_evidence.is_file():
-                    with suppress(OSError):
-                        os.replace(staged_evidence, output_dir / filename)
-        # A qualification failure is itself a verdict. Worker guard failures
-        # already carry the most specific name, while orchestration failures
-        # need a stable pipeline-owned name because the worker may never have
-        # launched. Reuse the worker's schema writer so this path cannot drift
-        # from the artifact consumed by the formal preflight.
-        if args.run_kind == "qualification" and not debug_run:
-            staged_qualification = staging_dir / QUALIFICATION_ARTIFACT_FILENAME
-            verdict = _QUALIFICATION_PIPELINE_FAILURE_VERDICTS[stage]
-            feature_stats_sha256 = ""
-            worker_failure_artifact = False
-            if staged_qualification.is_file():
-                with suppress(OSError, TypeError, ValueError, json.JSONDecodeError):
-                    payload = _validate_qualification_artifact_schema(
-                        json.loads(staged_qualification.read_text(encoding="utf-8")),
-                        epochs=cfg.optim.epochs,
-                    )
-                    staged_verdict = payload.get("verdict")
-                    if isinstance(staged_verdict, str) and staged_verdict.startswith(
-                        ("fail(", "training_invalid(")
-                    ) and staged_verdict.endswith(")"):
-                        verdict = staged_verdict
-                        worker_failure_artifact = True
-                    staged_digest = payload.get("feature_stats_sha256")
-                    if isinstance(staged_digest, str):
-                        feature_stats_sha256 = staged_digest
-            if worker_failure_artifact:
-                os.replace(
-                    staged_qualification,
-                    output_dir / QUALIFICATION_ARTIFACT_FILENAME,
-                )
-            else:
-                write_qualification = getattr(worker, "write_qualification_artifact", None)
-                if not callable(write_qualification):
-                    raise RuntimeError(
-                        "qualification worker must provide write_qualification_artifact"
-                    )
-                write_qualification(
-                    cfg,
-                    verdict=verdict,
-                    feature_stats_sha256=feature_stats_sha256,
-                    output_dir=output_dir,
-                )
-        elif not debug_run:
-            # Preserve the pre-existing formal behavior: rescue a staged
-            # optional artifact if present, otherwise clear the canonical one.
-            staged_qualification = staging_dir / QUALIFICATION_ARTIFACT_FILENAME
-            canonical_qualification = output_dir / QUALIFICATION_ARTIFACT_FILENAME
-            if staged_qualification.is_file():
-                with suppress(OSError):
-                    os.replace(staged_qualification, canonical_qualification)
-            else:
-                canonical_qualification.unlink(missing_ok=True)
         shutil.rmtree(staging_dir, ignore_errors=True)
         return 2
 
@@ -1242,8 +830,6 @@ def run_pipeline(
             seed=args.seed,
             max_steps=args.max_steps,
             run_kind=args.run_kind,
-            epochs=args.epochs,
-            qualification_artifact=args.qualification_artifact,
         )
     except Exception as error:
         _write_json_atomic(profile_path, evidence_profile)
@@ -1269,20 +855,6 @@ def run_pipeline(
         )
     stage_seconds["train"] = time.monotonic() - train_started
 
-    # A zero worker exit is not a qualification result. Require the worker's
-    # schema-valid, identity-bound pending verdict before general artifact
-    # validation may publish an engineering-complete run. This does not call
-    # the pass-only formal-preflight validator or authorize formal execution.
-    if args.run_kind == "qualification" and not debug_run:
-        try:
-            _validate_qualification_completion_artifact(staging_dir, cfg=cfg, worker=worker)
-        except Exception as error:
-            _write_json_atomic(profile_path, evidence_profile)
-            return fail(
-                stage="artifacts",
-                message=f"qualification artifact is missing, malformed, or invalid: {error}",
-            )
-
     # --- merge the worker runtime profile with pipeline-level fields ---
     worker_data: object | None = None
     try:
@@ -1294,8 +866,6 @@ def run_pipeline(
             memory_limit_gib=runtime.memory_limit_gib,
             allow_partial=debug_run,
         )
-        if args.run_kind == "qualification" and not debug_run:
-            _validate_qualification_gradient_telemetry(worker_runtime_profile)
         completed_epochs = cast(int, worker_runtime_profile["epochs_completed"])
         _validate_staged_artifacts(
             output_dir if debug_run else staging_dir,
@@ -1303,10 +873,7 @@ def run_pipeline(
             model_family=cfg.model.family,
             allow_partial=debug_run,
             require_v_hold_validation_events=(
-                not debug_run and args.run_kind in ("qualification", "formal")
-            ),
-            allow_auprc_tolerance_source=(
-                not debug_run and args.run_kind == "qualification"
+                not debug_run and args.run_kind == "formal"
             ),
         )
     except Exception as error:
@@ -1333,11 +900,7 @@ def run_pipeline(
         return 0
     _write_json_atomic(profile_path, final_profile)
     artifacts_started = time.monotonic()
-    optional_published_filenames = _OPTIONAL_PUBLISHED_FILENAMES + (
-        (AUPRC_TOLERANCE_SOURCE_FILENAME,)
-        if args.run_kind == "qualification"
-        else ()
-    )
+    optional_published_filenames = _OPTIONAL_PUBLISHED_FILENAMES
 
     def artifact_operation() -> None:
         """Publish immutable profile+manifest at the documented late timing cutoff."""
@@ -1347,9 +910,7 @@ def run_pipeline(
             "last.pt",
             "metrics.jsonl",
             "run_metadata.json",
-            # Digested when the qualification stage produced it: the formal
-            # stage's preflight reads this file, so it may not be published
-            # outside the integrity record.
+            # Optional plan-required artifacts remain inside the integrity record.
             *(
                 filename
                 for filename in optional_published_filenames

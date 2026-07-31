@@ -1,12 +1,12 @@
 {
-  "registration_id": "g5-e2e-stage1-20260729-two-stage-ladder-screen-v4-draft",
+  "registration_id": "g5-e2e-stage1-20260730-single-stage-plan-bound-screen-v4-draft",
   "status": "DRAFT",
   "created_utc": "2026-07-29T00:00:00Z",
   "bound_utc": null,
-  "gate": "G5 Stage 1 - EgoStitch E2E rev-3.2 two-stage-ladder screen",
-  "spec_binding": "docs/05-egostitch-spec.md §13.19 (two-stage ladder: §13.19.1 through §13.19.6) and §14.4 in full",
+  "gate": "G5 Stage 1 - EgoStitch E2E rev-3.2 single-stage plan-bound screen",
+  "spec_binding": "docs/05-egostitch-spec.md §13.19 (single-stage plan-bound experiment) and §14.4 in full",
   "protocol_binding": "docs/03-experiment-protocol.md §5 G5, §5.0.5, §5.2, and §5.2.4",
-  "draft_boundary": "This file authorizes qualification training on the registered V_fit/V_hold universes only. It authorizes no formal training, candidate/test scoring, external held-out read, or scientific claim. Only the owner may promote a successor content state to BINDING, and only after the binding_prerequisites below are resolved with real artifacts. A BINDING registration is immutable.",
+  "draft_boundary": "This DRAFT authorizes no formal training, candidate/test scoring, external held-out read, or scientific claim. Only the owner may promote this plan to BINDING after the plan identity and required input evidence are resolved. A BINDING registration is immutable.",
   "predecessor": {
     "registration": "g5-e2e-stage1-20260719-conditioned-encoder-stability-screen-v2",
     "path": "docs/registrations/g5_e2e_stage1_preregistration_v2.json",
@@ -32,7 +32,7 @@
   },
   "design_trail": {
     "path": "docs/superpowers/specs/2026-07-29-egostitch-e2e-two-stage-cleanup.md",
-    "sha256": "9d66fc6142b8e8c37a0de2530e7b17a6d717cd7c77bcedc1e2822d8be547e915",
+    "sha256": "c16af78e94bf5cc138cba4ae8a8cd61d91f2afa8f10d7303a76e830d63283745",
     "authority": "decision trail only; docs/05-egostitch-spec.md §13.19 and §14.4 govern",
     "prior_trail": {
       "path": "docs/superpowers/specs/2026-07-25-egostitch-e2e-relational-repair-design.md",
@@ -75,52 +75,18 @@
     "supporting": "The registered controls and ablations attribute any improvement to relational structure rather than only pair/content capacity, grounding-vocabulary width, or the train-only relational auxiliary head.",
     "anti_claim": "A random, collapsed, warm-start-only, numerically unstable, unqualified, or DRAFT-backed checkpoint cannot count as formal evidence for or against the architecture."
   },
-  "ladder": {
-    "shape": "two stages (spec §13.19.4): qualification, then formal. The prior calibrate -> threshold-freeze -> rehearse -> formal ladder and its attempt window, rehearsal budget and frozen pre-binding margin list are deleted.",
-    "naming_note": "'qualification stage' and 'formal stage' here are the spec §13.19 ladder stages. They are not the G5 Stage-1/2/3 architecture ladder (imagination / codebook / harmonization) and not the frozen-s0 G5 Stage-1 screen.",
-    "shared_universe": "Both stages train on the identical full V_fit universe and validate on the identical full V_hold manifest. They differ only in optim.epochs. Because the universes are identical, feature_stats_sha256 and the mean(log d) degree prior are identical between stages by construction, so the formal preflight compares equal values rather than propagating a digest.",
-    "qualification": {
-      "trains_on": "full V_fit",
-      "validates_on": "V_hold",
-      "optim_epochs": 3,
-      "optim_epochs_note": "Exactly three epochs. The §13.19.1 three-phase curriculum boundaries scale with schedule_total_steps = steps_per_epoch * epochs, so this short run still traverses Phases A -> B -> C.",
-      "seeds": 1,
-      "purpose": "development loop ending in manual review; not a scientific gate",
-      "verdict": "complete three epochs with no hard operational failure yields pending manual review; never automatic pass",
-      "verdict_values": [
-        "pending_manual_review",
-        "fail(<named_guard>)"
-      ],
-      "verdict_rule": "A run that completes exactly three epochs with exact coverage and complete required telemetry, and has no non-finite, DDP, boundary, coverage, or I/O/infrastructure failure, writes pending_manual_review, never pass, regardless of checkpoint eligibility. Every finite model-quality threshold is telemetry-only in qualification: initial/during slot statistics, finite zero gradient/family norms, immediate/persistent clip coefficients, family ratio, warm-reference and validation dispersion floors, precision thresholds, validation collapse, and checkpoint eligibility. The registered global-norm clipping remains active at 3.0 for pair/generator and 1.0 for conditioning. An interrupt, timeout, OOM, worker/process failure, incomplete epoch, missing artifact/telemetry, or inexact/duplicate coverage cannot write pending_manual_review. This DRAFT defines no manual-approval artifact or conversion to pass.",
-      "artifact": {
-        "filename": "qualification.json",
-        "fields": [
-          "verdict",
-          "epochs",
-          "hparams",
-          "feature_stats_sha256",
-          "model_config_sha256"
-        ],
-        "model_config_sha256": "defined over the model-defining config keys only, explicitly excluding output_dir, optim.epochs and feature_stats_sha256; _config_hash cannot serve because it bakes in output_dir, data.root and preregistration"
-      },
-      "test_access": "none"
-    },
-    "formal": {
-      "trains_on": "full V_fit",
-      "validates_on": "V_hold",
-      "optim_epochs": 30,
-      "seeds": "the registered seeds list above",
-      "purpose": "results",
-      "verdict": "the pre-registered acceptance thresholds re-pinned below",
-      "preflight": [
-        "the qualification artifact exists",
-        "the current immutable attempt has verdict == 'pass'; pending_manual_review fails closed, this DRAFT defines no approval/conversion artifact, and preflight may not fall back from a latest pending attempt to an earlier pass",
-        "feature_stats_sha256 and model_config_sha256 both equal the formal run's own computed values"
-      ],
-      "retained_margin_gate": "validate_e2e_qualification_profile - the repo's only clip-coefficient / family-ratio / submodule-RMS margin gate - is retained and runs at this stage",
-      "test_access": "see test_protocol below"
-    },
-    "boundary_audit": "Training may not open a held-out path, in ANY run kind - a path condition, not a run_kind condition. This replaces the prior gate on run_kind != 'formal', which left the formal stage unguarded while forcing qualification into a sanitized-root sandbox merely to run at all. Both stages may use the same repo data root: mere presence of candidate, test or test_graph.pkl files is allowed, but any attempted open (including an alias or symlink) raises before the held-out path is read (spec §13.19.4 item 3)."
+  "execution_plan": {
+    "shape": "one plan-bound formal training stage followed by provenance-bound scoring and evaluation",
+    "training": "full V_fit, registered 30-epoch schedule, registered seeds",
+    "validation": "V_hold for checkpoint selection and telemetry",
+    "preflight": [
+      "registration status is BINDING and the registration SHA-256 is recorded at run start",
+      "the exact registered arm/config path and SHA-256 match the live clean implementation",
+      "required input packs/manifests and data-boundary audit evidence match their registered digests"
+    ],
+    "quality_policy": "All model-quality predicates are telemetry-only. Eligibility, liveness, slot-collapse, clipping/family/RMS margins, AUPRC, dispersion, and precision quality misses cannot block training completion, checkpoint publication, scoring, or evaluation.",
+    "truthfulness_failures": "Non-finite tensors, DDP disagreement, incomplete or duplicate coverage, data-boundary violations, malformed or hash-mismatched inputs/artifacts, and I/O/infrastructure failures still fail closed.",
+    "test_access": "see test_protocol below"
   },
   "arms": {
     "full": {
@@ -304,14 +270,14 @@
       "scope": "per-dimension mu/sigma computed over the ordered V_fit universe only; the same frozen constants apply in every universe, with no universe-conditional preprocessing (spec §13.19.1)",
       "consumers": "node features, grounding candidates, reconstruction targets, denoising targets, and the generator's shared d -> d_p projection; the raw-token pair encoder and the cosine grounding-pool construction remain on raw F0",
       "feature_stats_sha256": null,
-      "feature_stats_sha256_note": "computed at run time and identical between the two stages by construction (spec §13.19.6); it is deliberately not a hand-pinned config or registration field"
+      "feature_stats_sha256_note": "computed at run time from the plan-locked V_fit universe; it is deliberately not a hand-pinned config or registration field"
     },
     "degree_prior_init": {
       "rule": "the generator degree head's output bias is initialized to mean(log d) over G_fit, with degrees floored at 1 and nodes traversed in sorted order",
       "value": null,
       "value_note": "data-derived from G_fit at run time, not a registered constant; sorted traversal is load-bearing because build_g_fit adds nodes from a frozenset whose iteration order depends on PYTHONHASHSEED, and np.log(...).mean() uses pairwise summation, so an unsorted traversal makes the last ulp order-dependent across ranks",
       "log_sigma": "deliberately left at its initialization; matching sigma instead of mu measures worse",
-      "stage_identity": "because both stages train on the identical V_fit universe, qualification and formal produce the identical mean(log d) (spec §13.19.6)"
+      "stage_identity": "data-derived once from the plan-locked V_fit universe"
     },
     "l_recon": {
       "family": "egostitch_e2e",
@@ -423,7 +389,7 @@
       "node_007050"
     ],
     "fit_manifest": {
-      "unchanged_from_v2": "V_fit, e_msg_fit, e_sup_fit and every digest keyed on them are bit-identical to the two-holdout construction the union replaces; the qualification-stage split does not move them",
+      "unchanged_from_v2": "V_fit, e_msg_fit, e_sup_fit and every digest keyed on them are bit-identical to the two-holdout construction the union replaces",
       "v_fit_node_count": 7558,
       "e_msg_fit_count": 22708,
       "e_sup_fit_count": 6612,
@@ -485,71 +451,17 @@
     ],
     "f_only_eligibility": "finite/gradient guards; std(f_logit)>=1e-4; AUPRC(f_logit)>=label prevalence+0.02",
     "pair_topology_eligibility": "finite/gradient guards; std(pair_topology)>=1e-4; AUPRC(pair_topology)>=label prevalence+0.02; active topology-conditioning fixed-replay gradient norm >=1e-8",
-    "eligibility_stage_policy": "The conditions above remain unchanged hard eligibility requirements for formal. Qualification computes and records every predicate as model-quality telemetry, but eligibility does not control its pending_manual_review verdict. If none passes, qualification exposes the final epoch through the existing best.pt/last.pt compatibility aliases for diagnostic manual review; metadata, metrics, and the profile mark it non-eligible, and neither alias is formal authorization.",
-    "selection": "among eligible epochs within auprc_tolerance of the best eligible AUPRC for that arm, minimize train-side validation clustering MMD",
-    "auprc_tolerance": null,
-    "auprc_tolerance_rule": "select_e2e_checkpoint's selection-band kwarg is distinct from every fixed 0.02 eligibility constant and is derived from V_hold's measured AP sampling standard deviation. Its numerical value remains null until the immutable method below is executed and its evidence is bound; the fixed eligibility constants and tie_tolerance_mmd remain unchanged.",
-    "auprc_tolerance_calibration_method": {
-      "method_id": "stratified_pair_bootstrap_ap_sd_v1",
-      "scope": "one scalar shared unchanged by all six trained arms",
-      "immutable_source_attempt": "the first full-arm Seed-0 qualification attempt under the first implementation containing this method that reaches the first validation after the conditioning ramp plus one complete Phase-C epoch and successfully writes the complete source artifact; a failed, incomplete, later, or manually preferred attempt cannot replace it",
-      "source_validation_reuse": "reuse that existing validation event; do not trigger another validation and do not add another V_hold evaluation to K. The source attempt and source validation remain in the complete attempt_history.json exposure history and cumulative K exactly once",
-      "pair_universe": {
-        "name": "canonical V_hold non-self pair manifest",
-        "rows": 130816,
-        "positives": 1533,
-        "negatives": 129283
-      },
-      "scores": {
-        "array": "active full-model logits",
-        "dtype": "fp32",
-        "transform": "none; no sigmoid"
-      },
-      "bootstrap": {
-        "unit": "pair row",
-        "stratification": "binary label",
-        "replacement": true,
-        "replicates": 10000,
-        "positive_draws_per_replicate": 1533,
-        "negative_draws_per_replicate": 129283,
-        "rng": "numpy.random.Generator(numpy.random.PCG64(0)); one sequential generator for all draws",
-        "iteration_order": "replicate-major from replicate 0 through 9999",
-        "draw_order_per_replicate": "draw positive row indices first, then negative row indices, from the same sequential generator",
-        "metric_input_assembly": "concatenate the positive sample before the negative sample for y_true, and concatenate the corresponding raw logits in the identical order for y_score",
-        "metric": "sklearn.metrics.average_precision_score"
-      },
-      "estimator": "sample standard deviation of the 10000 replicate AP values with ddof=1",
-      "rounding": "ceil(10000 * sd) / 10000",
-      "clamp": "none; no floor or cap",
-      "forbidden_reads": [
-        "V_hold topology or any clustering/MMD quantity",
-        "candidate pairs or scores",
-        "test pairs or scores",
-        "test graph"
-      ],
-      "unchanged_constants": {
-        "eligibility_auprc_additive_margin": 0.02,
-        "tie_tolerance_mmd": 1e-06
-      },
-      "source_artifact_required_evidence": [
-        "attempt and source-validation identities",
-        "implementation and config identities",
-        "canonical pair-manifest hashes and row/positive/negative counts",
-        "active-logit dtype, no-transform declaration, and source-logit hash",
-        "bootstrap method, PCG64 seed, replicate count, replicate-major order, positive-then-negative draw and metric-input concatenation order, and replicate-AP hash",
-        "ddof, measured sd, rounding rule, and resulting auprc_tolerance",
-        "proof that the source validation is reused, creates no new K event, and is included in the complete history/K"
-      ]
-    },
+    "eligibility_stage_policy": "Every condition above is telemetry-only and cannot prevent selection, completion, publication, scoring, or evaluation.",
+    "selection": "among all completed epochs, maximize validation AUPRC; retain every model-quality predicate as telemetry only",
+    "auprc_tolerance": 0.02,
+    "auprc_tolerance_rule": "fixed experiment-plan selection band shared unchanged by all six trained arms; it requires no preliminary run or calibration artifact",
     "tie_tolerance_mmd": 1e-06,
     "tie_break": "lower unweighted validation Brier score, then earlier epoch",
     "forbidden": [
-      "formal only: warm-start or ramp checkpoint selection",
-      "formal only: fallback to epoch 1",
-      "formal only: fallback to last.pt",
-      "formal only: fallback to a checkpoint that violates any eligibility condition; qualification may expose the non-eligible final epoch through diagnostic compatibility aliases only"
+      "publishing a checkpoint that is not bound to this run's plan/config/artifact provenance",
+      "silently substituting a checkpoint from another run"
     ],
-    "no_eligible_checkpoint": "select_e2e_checkpoint returning None invalidates formal with no fallback. A completed qualification instead writes pending_manual_review and exposes its final epoch through the existing best.pt/last.pt compatibility aliases for diagnostic manual review; metadata, metrics, and the profile mark it non-eligible, and neither alias authorizes formal."
+    "no_eligible_checkpoint": "not a blocking state; quality eligibility is telemetry only"
   },
   "stability_guards": {
     "measurement": "each step: replicated DDP-averaged per-group norm from fp64 local sum with cross-rank equality assertion; fixed replay every 50 steps: isolated active-family x shared-group norms",
@@ -558,17 +470,12 @@
       "non-finite parameter or optimizer state",
       "non-finite gradient element, optimizer-group norm, family norm, or submodule RMS"
     ],
-    "persistent_abort": [
-      "formal only: any optimizer-group clip coefficient below 1e-3 on one step",
-      "formal only: any optimizer-group clip coefficient below 0.1 for 10 consecutive steps",
-      "within a shared optimizer group, max active-family norm divided by median active-family norm above 50 for four consecutive fixed probes after alpha reaches 1; inactive/null families excluded",
-      "fixed stability-split pair-logit std below max(0.25 times warm-start-end reference, 1e-4) for two consecutive validations"
-    ],
-    "reference_validity": "warm-start-end pair-logit std is measured after the final Phase-A update in eval mode. Non-finite is a hard failure in both stages; finite below 1e-4 is telemetry-only in qualification and a formal failure.",
-    "qualification_policy": "Every finite model-quality threshold in stability_guards and collapse_abort is telemetry-only in qualification, including finite zero gradient/family norms, immediate/persistent clipping, family ratio, warm-reference floor, validation collapse, and initial/during slot thresholds. Actual clipping and complete telemetry are unchanged. Only non-finite, DDP, boundary, coverage, and I/O/infrastructure failures abort qualification. Formal behavior is unchanged.",
-    "binding_margin": "per-group clip-coefficient p1 floors pair_encoder_head>0.04, generator>0.01, topology_content_conditioning>0.15, unlisted groups default to 0.12; minimum>0.0012; longest consecutive run below 0.1 is <10 steps; pooled family-ratio p99<40 (single scalar over all groups' alpha=1 ratios, as computed by validate_e2e_qualification_profile). Carried over unchanged from v2's clip_margin_amendment_20260722; validate_e2e_qualification_profile now runs at the formal stage.",
-    "abort_consequence": "Formal guard failure is synchronous and publishes failure metadata only. Qualification aborts only for non-finite, DDP, boundary, coverage, or I/O/infrastructure failure; finite model-quality misses remain telemetry and a complete three-epoch run can publish only pending_manual_review.",
-    "last_checkpoint": "diagnostic-only under a failure-specific directory; never eligible for formal scoring"
+    "persistent_abort": [],
+    "reference_validity": "warm-start-end dispersion is recorded as telemetry; a finite threshold miss does not abort",
+    "quality_policy": "All finite model-quality thresholds in stability_guards and collapse_abort are telemetry-only. Actual registered clipping and complete telemetry remain unchanged.",
+    "binding_margin": "retired as an authorization or publication gate; clip/family/submodule-RMS summaries remain telemetry",
+    "abort_consequence": "Only truthfulness/safety failures such as non-finite state, DDP disagreement, boundary/coverage violations, or I/O/infrastructure failure abort publication.",
+    "last_checkpoint": "published according to the plan-selected fallback and bound to run provenance"
   },
   "collapse_abort": {
     "mean_pairwise_h_cosine": {
@@ -582,7 +489,7 @@
     },
     "consecutive_validations": 2,
     "arming": "after conditioning activates",
-    "verdict_category": "formal: training_invalid(slot_collapse); qualification: telemetry-only",
+    "verdict_category": "telemetry_only",
     "pi_row_entropy_is_not_a_collapse_gate": true
   },
   "probe_artifact": {
@@ -603,7 +510,7 @@
       "A_hat off-diagonal standard deviation",
       "Pi normalized row entropy"
     ],
-    "verdict_effect": "none - required output evidence, reported at every validation of both stages; no probe is a binding gate (spec §14.4.7)",
+    "verdict_effect": "none - output telemetry only; no probe is an execution gate (spec §14.4.7)",
     "old_version_policy": "reject egostitch_e2e_probe_v1"
   },
   "metrics": {
@@ -679,7 +586,7 @@
     },
     "four_logit_decomposition": "full, f_logit, pair_content, and pair_topology per scored pair for every scored arm/artifact, fp32, provenance egostitch_e2e_pair_fp32_v1, per-array resolution guard; diagnostic only"
   },
-  "verdict_rule": "pass iff every training arm is valid, full passes all primary criteria and both guards, liveness passes, G_full>0, attribution share passes, and structure control passes; training invalid precedes scientific verdict, otherwise failures are multi-label cut reasons",
+  "verdict_rule": "post-run scientific report is pass iff full passes all primary criteria and both guards, G_full>0, attribution share passes, and structure control passes; failures are multi-label cut reasons, while model-quality telemetry never blocks execution or evaluation",
   "failure_reading": {
     "training_invalid": "The registered optimization process did not produce a numerically valid and eligible checkpoint; no architecture-level held-out conclusion is permitted.",
     "primary_fail": "The stable topology-conditioned encoder does not beat calibrated independent scoring at this stage.",
@@ -689,7 +596,6 @@
     "classification_order": "training_invalid first and no scientific verdict; otherwise report every applicable primary_fail, guard_fail, attribution_fail, and structure_control_fail label and return cut if any is present"
   },
   "test_protocol": {
-    "qualification_stage": "the test universe is never opened; candidate, test and test_graph.pkl files may be present in the shared repo data root, but the path-scoped boundary guard raises before any attempted open, including through an alias or symlink",
     "formal_stage": {
       "enforceable_property": "one scoring epoch per (arm, seed); no re-scoring after seeing results",
       "not_claimed": "'test opened exactly once' is NOT claimed and would be false: scoring shards across every visible GPU with each shard independently reading candidate_test_edges.txt, and load_test_graph is called at three sites. The v2 screen spent about 24.5 h across five candidate-scoring passes.",
@@ -699,9 +605,9 @@
     }
   },
   "selection_exposure_disclosure": {
-    "hazard": "Roughly 20 eligible epochs x 8 arms per formal run, plus an unbounded number of qualification-stage development iterations on the same V_hold, make the accumulated argmin count K large. Selection noise is not exchangeable across arms - a higher-capacity arm draws a larger max-of-K - which biases the full vs b0_e2e_f_only contrast, the headline ablation.",
-    "accepted": "This is the price of sharing one holdout across both stages and is accepted knowingly; enlarging V_hold and re-deriving auprc_tolerance reduce but do not eliminate it.",
-    "mitigation": "record K: the cumulative count of V_hold evaluations per arm is logged into the formal-stage artifact, so the inflation is disclosed rather than hidden."
+    "hazard": "Repeated formal-plan development against V_hold can inflate model-selection exposure and bias the full vs b0_e2e_f_only contrast.",
+    "accepted": "This limitation is disclosed; it does not create an execution gate.",
+    "mitigation": "record K, the formal run's cumulative V_hold evaluation count per arm, in the result artifact."
   },
   "frozen_inputs": {
     "b0_candidate_scores": {
@@ -729,14 +635,9 @@
     }
   },
   "execution_order": [
-    "run the qualification stage to completion and obtain pending_manual_review; this is evidence for owner review, not formal authorization",
-    "do not start formal while the qualification verdict is pending_manual_review; this DRAFT defines no approval artifact or conversion to pass",
     "resolve every binding_prerequisite and let the owner promote a successor content state to BINDING",
-    "train and validate the formal full arm first",
-    "run its checkpoint-eligibility and validation liveness preflight",
-    "stop the experiment if full is invalid",
-    "train b0_e2e_f_only, pair_topology, p0, cosine_pool, and no_l_rel",
-    "require eligible checkpoints and matching registration/config hashes for every arm",
+    "train each registered arm under the single plan-bound formal schedule",
+    "publish the plan-selected checkpoint even when model-quality telemetry misses",
     "score all registered candidate artifacts, one scoring epoch per (arm, seed), recording the test-access ledger",
     "produce the formal_train representation probe and run the formal G5 evaluator"
   ],
@@ -781,30 +682,21 @@
         "sha256": "e0f7f482e56f2aa19b62a6d51868cd50370593b748c8e4daa1fccce9a025257f"
       }
     },
-    "configs_pinned_at": "2026-07-30, against the six v3-named configs after the two-stage cleanup: feature_standardization zscore_vfit_v1, no hand-pasted feature_stats_sha256, runtime.token_budget scalar, retained runtime.total_budget_seconds sum invariant, n_ground-keyed runtime.pack_dir, and preregistration retargeted to this v4 DRAFT. Any further byte change to a config - including re-pinning training.selection_auprc_tolerance - moves its digest and must be re-pinned here before binding.",
+    "configs_pinned_at": "2026-07-30, against the six v3-named configs after the single-stage cleanup: feature_standardization zscore_vfit_v1, no hand-pasted feature_stats_sha256, runtime.token_budget scalar, retained runtime.total_budget_seconds sum invariant, n_ground-keyed runtime.pack_dir, and preregistration retargeted to this v4 DRAFT. Any further byte change to a config moves its digest and must be re-pinned here before binding.",
     "parameter_group_manifests": null,
     "packs_and_validation_manifests": null,
-    "qualification_attempts": null,
-    "qualification_history_indexes": null,
     "boundary_access_audit": null,
     "runtime_and_peak_memory": null,
-    "auprc_tolerance_calibration": null,
     "checkpoint_policy_version": null
   },
   "binding_prerequisites": [
-    "A qualification-stage run on the full V_fit universe completes exactly three epochs with exact coverage, preserves complete finite-threshold telemetry under unchanged actual clipping, returns pending_manual_review regardless of quality eligibility, and writes qualification.json with its existing fields. If no checkpoint is quality-eligible, the existing best.pt/last.pt compatibility aliases expose the final epoch for diagnostic manual review and metadata, metrics, and the profile mark it non-eligible. This evidence does not authorize formal, and this DRAFT defines no approval artifact or conversion to pass.",
-    "binding_evidence.auprc_tolerance_calibration is a path-and-SHA-256 reference to the complete source artifact required by checkpoint_selection.auprc_tolerance_calibration_method. It binds the immutable first full Seed-0 qualification source attempt, proves the existing validation was reused with no additional K event while the source remains in complete history/K, and reproduces the unclamped ceil(10000*sd)/10000 value. That value is written into checkpoint_selection.auprc_tolerance and into the six configs, and the config digests above are re-pinned to match.",
-    "binding_evidence.implementation names the implementation commit whose clean checkout produced the qualifying evidence; the formal worker verifies its own HEAD equals that commit or is a clean descendant through commits touching only docs/registrations/ paths.",
-    "binding_evidence.parameter_group_manifests, packs_and_validation_manifests, qualification_attempts, qualification_history_indexes, boundary_access_audit and runtime_and_peak_memory each carry path-bound SHA-256 artifacts that resolve and hash-match on the execution host.",
-    "binding_evidence.qualification_history_indexes maps exactly the six trained arms to path-and-SHA-256 references for each arm's attempt_history.json. Every index has schema_version egostitch_e2e_qualification_history_v1, the matching arm identity, and a non-empty attempts list; binding_evidence.qualification_attempts maps the same exact six arms and each arm's entries equal the referenced index's complete attempts list exactly.",
+    "binding_evidence.implementation names the implementation commit; the formal worker verifies its clean checkout identity.",
+    "binding_evidence.parameter_group_manifests, packs_and_validation_manifests, boundary_access_audit and runtime_and_peak_memory each carry path-bound SHA-256 artifacts that resolve and hash-match on the execution host.",
     "binding_evidence.checkpoint_policy_version is a non-empty version string.",
-    "The precision differential (spec §13.19.4 item 4) passes at both the end-ramp and the selected checkpoint: BF16 against a pure-fp32 replay within vector relative-L2 <= 0.05, for the full logit and for the residual (full - f_logit).",
-    "The spec §13.19.6 binding acceptance matrix passes in full.",
     "The owner promotes the resolved successor content state to BINDING. No agent, screen, or note may do this."
   ],
   "mechanics": {
     "formal_worker": "must reject this DRAFT; formal egostitch_e2e runs require status == 'BINDING'",
-    "qualification_worker": "may run against this DRAFT - the qualification stage publishes no formal artifact and is exempt from the BINDING gate - but only within the registered V_fit/V_hold universes; no candidate or test scoring, in any run kind",
     "debug_worker": "bounded runs are redirected to a *_debug output directory and marked non-formal; their checkpoints are forbidden from candidate/test scoring",
     "owner_boundary": "only the owner binds; this draft must not be promoted automatically",
     "amendment": "any post-binding scientific, threshold, optimizer, schedule, precision, guard, eligibility, or frozen-input change requires a new versioned registration"

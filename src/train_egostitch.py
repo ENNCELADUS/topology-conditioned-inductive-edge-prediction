@@ -8,12 +8,9 @@ joint-pair stream joins in Stage 3). ``--token-budget-per-rank`` is
 reinterpreted for this family as the per-rank node-stream batch size ``B_n``
 (spec Sec 13.13); the runtime budget is config-driven, not the E2 60-minute pin.
 
-Two execution stages share this worker and differ only in ``optim.epochs``
-(``--run-kind {qualification,formal}``). Both train on the full ``V_fit`` and
-validate on the single ``V_hold`` universe, so every pack, grounding cache and
-feature-statistics digest is identical between them. ``qualification`` is the
-guards-only development loop and writes ``qualification.json``; ``formal``
-produces the registered results.
+The worker executes the plan-bound formal schedule on ``V_fit`` and validates
+on ``V_hold``. Model-quality diagnostics are recorded as telemetry; they do not
+authorize or block checkpoint publication, scoring, or evaluation.
 
 Launch (formal):
 
@@ -99,10 +96,6 @@ _PACK_GROUNDING_FILENAME = "grounding.npz"
 _PACK_VALIDATION_GROUNDING_FILENAME = "grounding_validation.npz"
 _PACK_MANIFEST_FILENAME = "manifest.json"
 _PACK_FEATURE_STATS_FILENAME = "feature_stats.npz"
-AUPRC_TOLERANCE_SOURCE_FILENAME = "auprc_tolerance_source.npz"
-_AUPRC_TOLERANCE_SOURCE_SCHEMA = "egostitch_e2e_auprc_tolerance_source_v1"
-
-
 def _egostitch_ddp_kwargs(
     *, find_unused_parameters: bool = True
 ) -> DistributedDataParallelKwargs:
@@ -130,17 +123,15 @@ def build_egostitch_ddp_accelerator(
     )
 
 
-# The complete execution-context domain (design 2026-07-29 Sec 2): the
-# qualification stage is the guards-only development loop, the formal stage
-# produces registered results, and ``debug`` is *derived* from ``--max-steps``
+# The complete execution-context domain: ``formal`` produces registered results,
+# and ``debug`` is *derived* from ``--max-steps``
 # by `write_run_start_metadata`/`write_outputs` rather than selected on the
 # CLI. It is named here because `run_metadata.json` publishes it and
 # `src.experiments.probes` reads it back.
-E2ERunKind = Literal["qualification", "formal", "debug"]
+E2ERunKind = Literal["formal", "debug"]
 
-# The single validation universe both stages share (`V_hold = V_qual union
-# V_select`, design Sec 2.1). It is also the grounding-pool ``role_universe``
-# identity, so a cache built for one stage is byte-identical for the other.
+# The single validation universe (`V_hold = V_qual union V_select`). It is also
+# the grounding-pool ``role_universe`` identity.
 _E2E_VALIDATION_ROLE: Literal["V_hold"] = "V_hold"
 
 
@@ -310,8 +301,6 @@ class EgoCliArgs:
     token_budget_per_rank: int | None = None
     profile_output: Path | None = None
     run_kind: E2ERunKind | None = None
-    epochs: int | None = None
-    qualification_artifact: Path | None = None
 
 
 def load_config(path: Path) -> EgoConfig:
@@ -651,10 +640,8 @@ def load_config(path: Path) -> EgoConfig:
             )
         if data.negative_ratio != 5:
             raise ValueError("training requires data.negative_ratio=5")
-        # `optim.epochs` is deliberately absent: it is the *only* value the
-        # qualification and the formal stage are allowed to differ in (design
-        # 2026-07-29 Sec 2), and the three-phase curriculum scales with
-        # `schedule_total_steps`, so a short schedule still traverses A -> B -> C.
+        # `optim.epochs` belongs to the experiment plan while the three-phase
+        # curriculum scales with `schedule_total_steps`.
         if (
             optim.lr != 1e-4
             or optim.weight_decay != 0.01
@@ -1329,12 +1316,12 @@ def select_e2e_checkpoint(
     auprc_tolerance: float = 0.02,
     mmd_tolerance: float = 1e-6,
 ) -> E2ECheckpointRecord | None:
-    """Select topology-aware best eligible checkpoint, or ``None`` invalid."""
-    eligible = [record for record in records if e2e_checkpoint_eligible(record, arm)]
-    if not eligible:
+    """Select the plan-ranked checkpoint; quality predicates are telemetry only."""
+    del arm
+    if not records:
         return None
-    best_auprc = max(record.auprc for record in eligible)
-    candidates = [record for record in eligible if record.auprc >= best_auprc - auprc_tolerance]
+    best_auprc = max(record.auprc for record in records)
+    candidates = [record for record in records if record.auprc >= best_auprc - auprc_tolerance]
     best_mmd = min(record.clustering_mmd for record in candidates)
     candidates = [
         record for record in candidates if record.clustering_mmd <= best_mmd + mmd_tolerance
@@ -1388,31 +1375,9 @@ def parse_args(argv: Sequence[str] | None = None) -> EgoCliArgs:
     # actually running a bounded, non-publishing schedule.
     parser.add_argument(
         "--run-kind",
-        choices=("qualification", "formal"),
+        choices=("formal",),
         default=None,
         help="E2E execution context; defaults to formal and does not alter the config hash",
-    )
-    # The two stages differ in exactly one value (design 2026-07-29 Sec 2), so
-    # the short schedule is reachable through an override rather than a second
-    # copy of every config. `apply_overrides` restricts it to the
-    # qualification stage: the formal stage runs the registered schedule.
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=None,
-        help=(
-            "qualification-stage override for optim.epochs -- the only value the two stages "
-            "are allowed to differ in."
-        ),
-    )
-    parser.add_argument(
-        "--qualification-artifact",
-        type=Path,
-        default=None,
-        help=(
-            "path to the qualification stage's qualification.json; required by a formal "
-            "run, whose feature_stats_sha256 must equal the recorded one."
-        ),
     )
     namespace = parser.parse_args(argv)
     if namespace.ddp_mode is not None:
@@ -1438,26 +1403,14 @@ def parse_args(argv: Sequence[str] | None = None) -> EgoCliArgs:
         token_budget_per_rank=namespace.token_budget_per_rank,
         profile_output=namespace.profile_output,
         run_kind=namespace.run_kind,
-        epochs=namespace.epochs,
-        qualification_artifact=namespace.qualification_artifact,
     )
 
 
 def apply_overrides(cfg: EgoConfig, args: EgoCliArgs) -> EgoConfig:
-    """Apply the ``--seed`` / ``--output-dir`` / ``--run-kind`` / ``--epochs`` overrides.
-
-    ``--epochs`` is deliberately narrower than the other three: it is the one
-    value the qualification and the formal stage are allowed to differ in
-    (design 2026-07-29 Sec 2), so it is accepted only for the qualification
-    stage. Applying it here -- rather than at the training call site -- is what
-    makes it reach *every* consumer of ``cfg.optim.epochs``, including the
-    ``metrics.jsonl`` row count and the staged-artifact epoch validation, not
-    just the loop's schedule.
+    """Apply the ``--seed`` / ``--output-dir`` / ``--run-kind`` overrides.
 
     Raises:
-        ValueError: When ``--epochs`` is non-positive, is used without a
-            training config section, or is used outside the qualification
-            stage.
+        ValueError: When an override requires a missing training section.
     """
     if args.seed is not None:
         cfg = replace(cfg, seed=args.seed)
@@ -1467,17 +1420,6 @@ def apply_overrides(cfg: EgoConfig, args: EgoCliArgs) -> EgoConfig:
         if cfg.training is None:
             raise ValueError("--run-kind requires a training config section")
         cfg = replace(cfg, run_kind=args.run_kind)
-    if args.epochs is not None:
-        if cfg.training is None:
-            raise ValueError("--epochs requires a training config section")
-        if (cfg.run_kind or "formal") != "qualification":
-            raise ValueError(
-                "--epochs is a qualification-stage override; the formal stage must run the "
-                "registered schedule from its config"
-            )
-        if args.epochs != 3:
-            raise ValueError("qualification --epochs must equal 3")
-        cfg = replace(cfg, optim=replace(cfg.optim, epochs=args.epochs))
     return cfg
 
 
@@ -1589,11 +1531,10 @@ def _validate_e2e_formal_binding(
     cfg: EgoConfig, snapshot: PreregistrationSnapshot, config_path: Path
 ) -> dict[str, str]:
     """Fail before DDP unless formal registration evidence matches live inputs."""
-    from src.experiments.auprc_tolerance import (
+    from src.experiments.e2e_binding import (
         BINDING_SCHEMA_V1,
         HISTORICAL_V1_ARMS,
         binding_schema_for_registration,
-        validate_bound_calibration,
     )
 
     evidence = snapshot.payload.get("binding_evidence")
@@ -1648,19 +1589,11 @@ def _validate_e2e_formal_binding(
     binding_sections = [
         "parameter_group_manifests",
         "packs_and_validation_manifests",
-        "qualification_attempts",
         "boundary_access_audit",
         "runtime_and_peak_memory",
     ]
-    if schema != BINDING_SCHEMA_V1:
-        binding_sections.insert(3, "qualification_history_indexes")
     for label in binding_sections:
         _validate_binding_digest_section(evidence.get(label), label, repo_root)
-    if schema == _E2E_BINDING_SCHEMA:
-        try:
-            validate_bound_calibration(snapshot.payload, cfg.preregistration)
-        except ValueError as error:
-            raise PreregistrationNotBinding(str(error)) from error
     if not isinstance(evidence.get("checkpoint_policy_version"), str):
         raise PreregistrationNotBinding("binding_evidence checkpoint policy is missing")
 
@@ -1739,16 +1672,6 @@ def prepare_ddp_run_config(
             raise ValueError(
                 f"E2E {run_kind} runs must execute the complete schedule; --max-steps forbidden"
             )
-        # The qualification stage is guards-only (design 2026-07-29 Sec 2.3):
-        # it publishes no formal artifact, so it does not require a BINDING
-        # registration. The formal stage falls through to that check below.
-        if run_kind == "qualification":
-            if status == "BINDING":
-                raise PreregistrationNotBinding(
-                    "qualification is frozen once preregistration status is BINDING; "
-                    "post-binding attempts would escape the registered K disclosure"
-                )
-            return cfg, False, snapshot
     if max_steps is None:
         if cfg.model.family == _EGOSTITCH_E2E_FAMILY:
             if status != "BINDING":
@@ -1933,11 +1856,8 @@ def prepare_pack(
     e2e_model_cfg = E2EConfig.from_mapping(cfg.model.config)
     n_ground = e2e_model_cfg.n_ground
     manifest_path = pack_dir / _PACK_MANIFEST_FILENAME
-    # Both stages train on V_fit and validate on V_hold, so the pack carries no
-    # run-kind identity at all: a pack built by a qualification run *is* the
-    # pack the formal run must reuse (design 2026-07-29 Sec 2/Sec 4). The
-    # grounding caches keep their own `role_universe` identity internally
-    # (`src/data/grounding.py`), so nothing is lost by dropping it here.
+    # The pack carries data-universe identity rather than execution-stage
+    # identity. Grounding caches keep their own `role_universe` internally.
     role: Literal["V_hold"] = _E2E_VALIDATION_ROLE
     f0_cold = not pack_dir.exists()
     raw_manifest: PackedFeatureManifest | None = None
@@ -3251,104 +3171,6 @@ class _ValidationResult:
     )
 
 
-def _should_capture_auprc_tolerance_source(
-    *,
-    run_kind: str,
-    arm: E2EArmName,
-    seed: int,
-    epoch: int,
-    fixed_source_epoch: int,
-    profile_only: bool,
-) -> bool:
-    """Return whether this existing validation is the immutable calibration source."""
-    return (
-        not profile_only
-        and run_kind == "qualification"
-        and arm == "full"
-        and seed == 0
-        and epoch == fixed_source_epoch
-    )
-
-
-def _write_auprc_tolerance_source(
-    output_path: Path,
-    data: EgoStitchData,
-    validation: _ValidationResult,
-    *,
-    epoch: int,
-    global_step: int,
-    phase: str,
-    full_joint_epochs: int,
-    fixed_source_epoch: int,
-) -> None:
-    """Atomically persist the canonical existing V_hold validation for AP calibration."""
-    if output_path.exists():
-        raise FileExistsError(f"AUPRC tolerance source already exists: {output_path}")
-    if data.validation_role != _E2E_VALIDATION_ROLE or data.internal_holdout is None:
-        raise RuntimeError("AUPRC tolerance source requires canonical V_hold data")
-    manifest = data.internal_holdout.hold_manifest
-    labels = np.ascontiguousarray(data.val_labels, dtype=np.int8)
-    active_logits = np.ascontiguousarray(validation.active_logits, dtype="<f4")
-    if tuple(data.val_pairs) != manifest.pairs:
-        raise RuntimeError("AUPRC tolerance source pair order is not the canonical V_hold manifest")
-    if not np.array_equal(labels, np.asarray(manifest.labels, dtype=np.int8)):
-        raise RuntimeError(
-            "AUPRC tolerance source labels do not match the canonical V_hold manifest"
-        )
-    if active_logits.shape != labels.shape:
-        raise RuntimeError(
-            "AUPRC tolerance source active logits do not cover the canonical V_hold manifest"
-        )
-    positive_count = int(labels.sum(dtype=np.int64))
-    metadata: dict[str, object] = {
-        "schema": _AUPRC_TOLERANCE_SOURCE_SCHEMA,
-        "arm": "full",
-        "seed": 0,
-        "run_kind": "qualification",
-        "validation_role": _E2E_VALIDATION_ROLE,
-        "validation_epoch": epoch,
-        "global_step": global_step,
-        "fixed_source_epoch": fixed_source_epoch,
-        "phase": phase,
-        "full_joint_epochs": full_joint_epochs,
-        "source_rule": (
-            "first validation after the conditioning ramp plus one complete Phase-C epoch"
-        ),
-        "source_validation_reused": True,
-        "source_validation_existing_event": True,
-        "bootstrap_additional_v_hold_evaluations": 0,
-        "pair_count": len(manifest.pairs),
-        "node_count": len(manifest.nodes),
-        "positive_count": positive_count,
-        "negative_count": len(labels) - positive_count,
-        "pair_labels_sha256": manifest.pair_labels_sha256,
-        "nodes_sha256": manifest.nodes_sha256,
-        "positive_edges_sha256": manifest.positive_edges_sha256,
-        "score_transform": "none",
-        "active_logits_dtype": "<f4",
-        "labels_dtype": "int8",
-        "active_logits_sha256": hashlib.sha256(active_logits.tobytes(order="C")).hexdigest(),
-        "labels_sha256": hashlib.sha256(labels.tobytes(order="C")).hexdigest(),
-    }
-    metadata_json = np.asarray(json.dumps(metadata, sort_keys=True), dtype=np.str_)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = output_path.with_name(f".{output_path.name}.tmp-{os.getpid()}")
-    try:
-        with temporary_path.open("xb") as handle:
-            np.savez(
-                handle,
-                labels=labels,
-                active_logits=active_logits,
-                metadata_json=metadata_json,
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, output_path)
-    except BaseException:
-        temporary_path.unlink(missing_ok=True)
-        raise
-
-
 def _validation_clustering_mmd(data: EgoStitchData, logits: np.ndarray) -> float:
     """Raw single-graph clustering MMD at the exact held-out gold edge count."""
     if not data.validation_nodes:
@@ -4233,7 +4055,10 @@ def _train_e2e_stability_loop(
     if training is None:
         raise ValueError("E2E stability training requires cfg.training")
     run_kind = cfg.run_kind or "formal"
-    enforce_quality = run_kind != "qualification"
+    # Model-quality thresholds are telemetry-only. Truthfulness failures such
+    # as non-finite tensors, DDP disagreement, coverage, and boundary errors
+    # remain enforced at their source.
+    enforce_quality = False
     arm = _e2e_arm_name(model)
     world = accelerator.num_processes
     rank = accelerator.process_index
@@ -4738,24 +4563,6 @@ def _train_e2e_stability_loop(
             validation_nonfinite_failure = int(
                 not all(math.isfinite(value) for value in validation_quality_values.values())
             )
-            if _should_capture_auprc_tolerance_source(
-                run_kind=run_kind,
-                arm=arm,
-                seed=cfg.seed,
-                epoch=epoch,
-                fixed_source_epoch=first_eligible_epoch,
-                profile_only=profile_only,
-            ):
-                _write_auprc_tolerance_source(
-                    cfg.output_dir / AUPRC_TOLERANCE_SOURCE_FILENAME,
-                    data,
-                    validation,
-                    epoch=epoch,
-                    global_step=global_step,
-                    phase=phase.phase,
-                    full_joint_epochs=full_joint_epochs,
-                    fixed_source_epoch=first_eligible_epoch,
-                )
             if (
                 not profile_only
                 and _e2e_should_capture_eligibility_reference(
@@ -4845,11 +4652,9 @@ def _train_e2e_stability_loop(
             )
             records.append(record)
             metrics_by_epoch[epoch] = metrics
-            # Checkpoint *eligibility* is retained in both stages (design
-            # 2026-07-29 Sec 2.3): "guards only" governs the qualification
-            # verdict, never this rule, which is what prevents the documented
-            # 2026-07-19 v1 selection onto a reconstruction-only checkpoint.
-            if not profile_only and e2e_checkpoint_eligible(record, arm):
+            # Snapshot every completed epoch. Quality predicates remain in the
+            # history as telemetry but do not control checkpoint availability.
+            if not profile_only:
                 path = checkpoint_dir / f"epoch-{epoch:03d}.pt"
                 torch.save(_cpu_state_dict(accelerator, wrapped), path)
                 state_paths[epoch] = path
@@ -4942,13 +4747,7 @@ def _train_e2e_stability_loop(
     selection_status = "selected"
     diagnostic_epoch: int | None = None
     if selected_epoch <= 0:
-        if run_kind != "qualification":
-            if accelerator.is_main_process:
-                _write_failed_run_history(
-                    cfg.output_dir, run_kind=run_kind, arm=arm, history=history
-                )
-            raise RuntimeError("E2E run produced no eligible checkpoint; fallback is forbidden")
-        selection_status = "diagnostic_last_epoch"
+        selection_status = "telemetry_miss_last_epoch"
         diagnostic_epoch = len(epoch_step_counts)
         if accelerator.is_main_process:
             best_state = last_state
@@ -5184,8 +4983,7 @@ def train_egostitch_ddp_loop(
 
     The legacy frozen-s0 loop this function used to carry was removed with the
     rest of the `egostitch` family (design 2026-07-29 Sec 6.2); the only
-    executable path left is `_train_e2e_stability_loop`, which both the
-    qualification and the formal stage run.
+    executable path left is `_train_e2e_stability_loop`.
 
     Args:
         model: The e2e model.
@@ -5235,51 +5033,24 @@ def _config_hash(cfg: EgoConfig) -> str:
     ).hexdigest()
 
 
-QUALIFICATION_FILENAME = "qualification.json"
 V_HOLD_VALIDATION_EVENTS_FILENAME = "v_hold_validation_events.jsonl"
 
 _MODEL_CONFIG_HASH_SCHEMA = "egostitch_e2e_model_config_v2"
 
-# Named Stage-1 failure verdicts, keyed by a substring of the fail-fast
-# exception each guard raises. Ordered: the first match wins, so the two
-# registered `training_invalid(...)` labels are listed before the generic
-# clip/gradient substrings that could also appear inside a longer message.
-_QUALIFICATION_VERDICT_PATTERNS: tuple[tuple[str, str], ...] = (
-    ("training_invalid(initial_slot_collapse)", "training_invalid(initial_slot_collapse)"),
-    ("training_invalid(slot_collapse)", "training_invalid(slot_collapse)"),
-    ("no eligible checkpoint", "fail(no_eligible_checkpoint)"),
-    ("extreme clipping", "fail(extreme_clipping)"),
-    ("persistent clipping", "fail(persistent_clipping)"),
-    ("persistent E2E family-gradient imbalance", "fail(family_gradient_imbalance)"),
-    ("persistent E2E validation-logit collapse", "fail(validation_logit_collapse)"),
-    ("invalid E2E warm-reference logit standard deviation", "fail(warm_reference_std)"),
-    ("non-finite E2E loss", "fail(nonfinite_loss)"),
-    ("non-finite E2E parameter or optimizer state", "fail(nonfinite_optimizer_state)"),
-    ("non-finite gradient in", "fail(nonfinite_gradient)"),
-    ("zero gradient norm in", "fail(zero_gradient_norm)"),
-    ("precision differential failed", "fail(precision_differential)"),
-    ("E2E execution coverage broken", "fail(execution_coverage)"),
-    ("opened a held-out path", "fail(held_out_path)"),
-)
-
-
 def model_config_hash(cfg: EgoConfig) -> str:
-    """Hash the model-defining configuration, invariant across the two stages.
+    """Hash the model-defining configuration for run provenance.
 
-    `_config_hash` cannot serve the formal stage's preflight: it hashes the
+    `_config_hash` is path-sensitive: it hashes the
     whole config, including ``output_dir``, ``data.root`` and
     ``preregistration``, and the two stages necessarily differ in the first
     (documented CLAUDE.md trap). This digest covers what defines the model and
     what it is trained on, and deliberately excludes:
 
     - ``output_dir`` / ``data.root`` / every other path, and ``preregistration``;
-    - ``optim.epochs`` -- the *only* value the two stages may differ in;
-    - ``model.config['feature_stats_sha256']`` -- reported alongside this
-      digest in `QUALIFICATION_FILENAME` rather than folded into it, so a
-      mismatch names which of the two things drifted;
+    - ``optim.epochs`` -- recorded by the plan/config identity instead;
+    - ``model.config['feature_stats_sha256']`` -- recorded alongside this digest;
     - ``seed`` -- an execution parameter. The formal stage may sweep
-      ``--seeds`` while the qualification stage ran a single seed, and that is
-      not a model change.
+      ``--seeds`` without changing the model definition.
 
     Args:
         cfg: The validated worker config.
@@ -5317,240 +5088,6 @@ def model_config_hash(cfg: EgoConfig) -> str:
         "mixed_precision": cfg.mixed_precision,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
-
-
-def qualification_verdict(error: BaseException | None) -> str:
-    """Map one fail-fast training exception onto a named Stage-1 verdict.
-
-    A completed qualification requires owner review and therefore remains
-    pending; anything else must be *named* so the formal stage's preflight and
-    the run log agree on what happened. An exception no registered guard raises
-    still yields a named verdict rather than an unreadable artifact.
-
-    Args:
-        error: The exception that ended the run, or ``None`` when it completed.
-
-    Returns:
-        ``"pending_manual_review"``, or one of the registered ``fail(...)`` /
-        ``training_invalid(...)`` labels.
-    """
-    if error is None:
-        return "pending_manual_review"
-    message = str(error)
-    for needle, verdict in _QUALIFICATION_VERDICT_PATTERNS:
-        if needle in message:
-            return verdict
-    return "fail(unclassified_guard)"
-
-
-def write_qualification_artifact(
-    cfg: EgoConfig,
-    *,
-    verdict: str,
-    feature_stats_sha256: str,
-    output_dir: Path | None = None,
-) -> Path:
-    """Write the Stage-1 verdict the formal stage's preflight reads.
-
-    Args:
-        cfg: The validated worker config.
-        verdict: ``"pending_manual_review"`` or a named failure
-            (`qualification_verdict`). Historical ``"pass"`` artifacts remain
-            readable but this producer cannot create new ones.
-        feature_stats_sha256: The digest bound by
-            `_bind_feature_standardization` for this run.
-        output_dir: Destination directory; defaults to ``cfg.output_dir``.
-
-    Returns:
-        The written path.
-
-    Raises:
-        ValueError: When ``verdict`` is neither the one registered pending value
-            nor a named failure.
-    """
-    if verdict != "pending_manual_review" and not (
-        verdict.startswith(("fail(", "training_invalid(")) and verdict.endswith(")")
-    ):
-        raise ValueError(
-            "qualification verdict must be 'pending_manual_review' or a named failure: "
-            f"{verdict!r}"
-        )
-    destination = cfg.output_dir if output_dir is None else output_dir
-    destination.mkdir(parents=True, exist_ok=True)
-    path = destination / QUALIFICATION_FILENAME
-    payload = {
-        "verdict": verdict,
-        "epochs": cfg.optim.epochs,
-        "hparams": {
-            "lr": cfg.optim.lr,
-            "weight_decay": cfg.optim.weight_decay,
-            "warmup_steps": cfg.optim.warmup_steps,
-            "grad_clip": cfg.optim.grad_clip,
-            "seed": cfg.seed,
-            "negative_ratio": cfg.data.negative_ratio,
-            "node_batch": cfg.data.node_batch,
-            "edge_batch": cfg.data.edge_batch,
-            "mixed_precision": cfg.mixed_precision,
-            "training": asdict(cfg.training) if cfg.training is not None else None,
-        },
-        "feature_stats_sha256": feature_stats_sha256,
-        "model_config_sha256": model_config_hash(cfg),
-    }
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    logger.info("wrote qualification verdict %s to %s", verdict, path)
-    return path
-
-
-def validate_qualification_artifact(
-    path: Path, cfg: EgoConfig, *, feature_stats_sha256: str
-) -> dict[str, object]:
-    """Apply the formal stage's three preflight assertions (design Sec 3).
-
-    The digest comparison is a genuine equality rather than a propagation:
-    both stages train on the identical ``V_fit`` and validate on the identical
-    ``V_hold``, so `feature_stats_sha256` and `model_config_hash` must match
-    exactly.
-
-    Args:
-        path: The Stage-1 ``qualification.json``.
-        cfg: The validated formal-stage config.
-        feature_stats_sha256: The digest bound for the formal run.
-
-    Returns:
-        The parsed artifact.
-
-    Raises:
-        RuntimeError: When the file is missing, malformed, does not carry
-            ``verdict == "pass"``, or either digest disagrees.
-    """
-    if not path.is_file():
-        raise RuntimeError(f"formal stage requires a qualification artifact: {path}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"qualification artifact must be a JSON object: {path}")
-    verdict = payload.get("verdict")
-    if verdict != "pass":
-        raise RuntimeError(f"qualification verdict is not 'pass': {verdict!r}")
-    expected_model = model_config_hash(cfg)
-    if payload.get("model_config_sha256") != expected_model:
-        raise RuntimeError(
-            "qualification model_config_sha256 does not match this config: "
-            f"{payload.get('model_config_sha256')!r} != {expected_model!r}"
-        )
-    if payload.get("feature_stats_sha256") != feature_stats_sha256:
-        raise RuntimeError(
-            "qualification feature_stats_sha256 does not match this run: "
-            f"{payload.get('feature_stats_sha256')!r} != {feature_stats_sha256!r}"
-        )
-    return cast(dict[str, object], payload)
-
-
-# Per-group clip-coefficient p1 floors calibrated from the first completed
-# replacement rehearsal (registration clip_margin_amendment_20260722); an
-# unlisted group falls back to the scaffold-era 0.12 fail-closed default.
-_E2E_QUALIFICATION_CLIP_P1_FLOORS: dict[str, float] = {
-    "pair_encoder_head": 0.04,
-    "generator": 0.01,
-    "topology_content_conditioning": 0.15,
-}
-
-
-def validate_e2e_qualification_profile(
-    profile_path: Path, *, output_path: Path | None = None
-) -> dict[str, object]:
-    """Validate the preregistered clip/family/RMS margins on a finished run.
-
-    Retained and re-homed onto the formal stage (design 2026-07-29 Sec 3): it
-    is the repository's only clip-coefficient / family-ratio / submodule-RMS
-    margin gate and nothing else replaces it.
-    """
-    profile = json.loads(profile_path.read_text(encoding="utf-8"))
-    if not isinstance(profile, dict):
-        raise ValueError("qualification profile must be a JSON object")
-    steps = profile.get("optimizer_step_gradients")
-    expected_steps = profile.get("total_optimizer_steps")
-    if (
-        not isinstance(steps, list)
-        or not isinstance(expected_steps, int)
-        or len(steps) != expected_steps
-    ):
-        raise ValueError("qualification profile lacks exact per-step gradient coverage")
-    coefficients: dict[str, list[float]] = {}
-    for row in steps:
-        groups = row.get("optimizer_group_gradients") if isinstance(row, dict) else None
-        if not isinstance(groups, dict):
-            raise ValueError("invalid optimizer-step gradient row")
-        for name, record in groups.items():
-            if not isinstance(record, dict) or record.get("active") is not True:
-                continue
-            value = record.get("clip_coefficient")
-            if not isinstance(value, (float, int)) or not math.isfinite(float(value)):
-                raise ValueError(f"invalid active clip coefficient for {name}")
-            coefficients.setdefault(name, []).append(float(value))
-    if not coefficients:
-        raise ValueError("qualification profile contains no active clip coefficients")
-    clip_summary: dict[str, object] = {}
-    for name, values in coefficients.items():
-        below_streak = longest = 0
-        for value in values:
-            below_streak = below_streak + 1 if value < 0.1 else 0
-            longest = max(longest, below_streak)
-        p1 = float(np.percentile(np.asarray(values, dtype=np.float64), 1))
-        minimum = min(values)
-        p1_floor = _E2E_QUALIFICATION_CLIP_P1_FLOORS.get(name, 0.12)
-        if p1 <= p1_floor or minimum <= 0.0012 or longest >= 10:
-            raise RuntimeError(f"qualification clip margins failed for {name}")
-        clip_summary[name] = {
-            "p1": p1,
-            "p1_floor": p1_floor,
-            "minimum": minimum,
-            "longest_below_0_1": longest,
-        }
-
-    probes = profile.get("gradient_norm_series")
-    if not isinstance(probes, list) or not probes:
-        raise ValueError("qualification profile contains no fixed-replay probes")
-    ratios: list[float] = []
-    rms_rows = 0
-    for row in probes:
-        if not isinstance(row, dict):
-            raise ValueError("invalid fixed-replay probe row")
-        group_ratios = row.get("family_group_ratios")
-        if row.get("alpha") == 1.0 and isinstance(group_ratios, dict):
-            ratios.extend(float(value) for value in group_ratios.values())
-        rms = row.get("submodule_gradient_rms")
-        if (
-            isinstance(rms, dict)
-            and set(rms)
-            == {
-                "grad_rms_trunk",
-                "grad_rms_ste",
-                "grad_rms_content",
-            }
-            and all(
-                isinstance(value, (float, int)) and math.isfinite(float(value))
-                for value in rms.values()
-            )
-        ):
-            rms_rows += 1
-    if not ratios or not all(math.isfinite(value) for value in ratios):
-        raise ValueError("qualification profile contains no finite family ratios")
-    ratio_p99 = float(np.percentile(np.asarray(ratios, dtype=np.float64), 99))
-    if ratio_p99 >= 40.0:
-        raise RuntimeError("qualification family-gradient p99 margin failed")
-    if rms_rows == 0:
-        raise RuntimeError("qualification profile contains no complete submodule RMS probe")
-    summary: dict[str, object] = {
-        "status": "pass",
-        "optimizer_steps": expected_steps,
-        "clip_groups": clip_summary,
-        "family_ratio_p99": ratio_p99,
-        "submodule_rms_probe_rows": rms_rows,
-    }
-    if output_path is not None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-    return summary
 
 
 def write_run_start_metadata(
@@ -5609,7 +5146,7 @@ def write_run_start_metadata(
     implementation_commit = (
         formal_binding.get("implementation_commit")
         if formal_binding is not None
-        else live_implementation_commit if run_kind == "qualification" else None
+        else live_implementation_commit
     )
     metadata = {
         "status": "started",
@@ -5723,52 +5260,37 @@ def write_outputs(
             handle.write(json.dumps({**entry, "epoch": int(cast(float, entry["epoch"]))}) + "\n")
 
     checkpoint_sha256 = _sha256_file(best_path)
-    checkpoint_role = (
-        "qualification_manual_review_only"
-        if expected_run_kind == "qualification"
-        else "debug_only"
-        if debug
-        else "formal_selected"
+    checkpoint_role = "debug_only" if debug else "formal_plan_selected"
+    selected_checkpoint_quality_pass = any(
+        int(cast(float, entry["epoch"])) == result.best_epoch
+        and bool(entry.get("checkpoint_eligible"))
+        for entry in result.history
+    )
+    validation_liveness_observed = (
+        result.best_epoch > 0
+        and (
+            cfg.model.config.get("permanent_null") != "none"
+            or any(
+                cast(dict[str, float], entry["fidelity"]).get("topology_delta_ratio", 0.0)
+                >= 1e-3
+                for entry in result.history
+                if int(cast(float, entry["epoch"])) == result.best_epoch
+            )
+        )
     )
     run_metadata.update(
         {
             "status": "debug_complete" if debug else "complete",
             "formal_artifacts_published": not debug and expected_run_kind == "formal",
             "checkpoint_id": _state_digest(result.best_state_dict)[:16],
-            # Gated on `formal` explicitly, never on "not <removed kind>": the
-            # qualification stage runs the same selector and produces the same
-            # `selected_epoch`, so a negated whitelist would silently publish a
-            # qualification checkpoint as eligible the moment `overfit` was
-            # removed from the domain (design 2026-07-29 Sec 6.1).
-            "checkpoint_eligible": (
-                expected_run_kind == "formal"
-                and result.runtime_profile.get("selected_epoch") is not None
-            ),
-            "selected_checkpoint_eligible": (
-                expected_run_kind == "formal"
-                and result.runtime_profile.get("selected_epoch") is not None
-            ),
+            "checkpoint_eligible": selected_checkpoint_quality_pass,
+            "selected_checkpoint_eligible": selected_checkpoint_quality_pass,
+            "quality_fields_policy": "telemetry_only",
             "checkpoint_role": checkpoint_role,
             "checkpoint_sha256": checkpoint_sha256,
-            "diagnostic_checkpoint_sha256": (
-                checkpoint_sha256 if expected_run_kind == "qualification" else None
-            ),
-            "diagnostic_checkpoint_epoch": (
-                result.best_epoch if expected_run_kind == "qualification" else None
-            ),
-            "validation_liveness_pass": (
-                expected_run_kind == "formal"
-                and result.best_epoch > 0
-                and (
-                    cfg.model.config.get("permanent_null") != "none"
-                    or any(
-                        cast(dict[str, float], entry["fidelity"]).get("topology_delta_ratio", 0.0)
-                        >= 1e-3
-                        for entry in result.history
-                        if int(cast(float, entry["epoch"])) == result.best_epoch
-                    )
-                )
-            ),
+            "diagnostic_checkpoint_sha256": None,
+            "diagnostic_checkpoint_epoch": None,
+            "validation_liveness_pass": validation_liveness_observed,
             "validation_role": data.validation_role,
             "v_hold_validation_evidence": validation_evidence,
             "access_audit": data.access_audit,
@@ -5798,29 +5320,8 @@ def _bind_feature_standardization(
     model: EgoStitchE2E,
     cfg: EgoConfig,
     data: EgoStitchData,
-    *,
-    qualification_artifact: Path | None = None,
-    ddp_mode: str | None = None,
 ) -> str:
-    """Pin the registered F0 statistics on the model before the first step.
-
-    This is the single enforcement point for the two-stage digest contract
-    (design 2026-07-29 Sec 3), so that neither stage can fail open by way of a
-    forgotten call site:
-
-    - **qualification** *computes* the digest. It is not a config input --
-      the six v3 configs no longer carry `feature_stats_sha256` -- and it is
-      recorded in ``qualification.json`` by the caller.
-    - **probe/epoch-probe** expose that same computed digest through a
-      non-publishing measurement dispatch. They require no prior qualification
-      artifact because the digest is the value they exist to measure.
-    - **formal** *compares* the digest it computed against the recorded one,
-      via `validate_qualification_artifact`, which is a genuine equality:
-      both stages train on the identical ``V_fit``, so the two digests are
-      necessarily equal unless something drifted. The artifact is a required
-      input; a formal run without one refuses to train.
-    - **debug** is exempt: it publishes no artifact and is read as evidence by
-      nothing.
+    """Bind and record the plan-scoped F0 statistics before the first step.
 
     A config that still pins `feature_stats_sha256` is honoured in every kind
     -- a disagreement with the assembled statistics is always a refusal.
@@ -5829,11 +5330,6 @@ def _bind_feature_standardization(
         model: The freshly constructed E2E model.
         cfg: The loaded run configuration.
         data: The assembled training data, carrying the V_fit statistics.
-        qualification_artifact: The qualification stage's ``qualification.json``
-            for this arm. Required by the formal stage, ignored by every other
-            kind (which has nothing to compare against yet).
-        ddp_mode: Worker dispatch mode. The two measurement-only probe modes
-            are exempt from the formal-stage artifact comparison.
 
     Returns:
         The bound `feature_stats_sha256`, or ``""`` for the replay-only
@@ -5844,14 +5340,6 @@ def _bind_feature_standardization(
             statistics available (`data.feature_stats is None`).
         RuntimeError: When the config pins a non-empty `feature_stats_sha256`
             that disagrees with the assembled statistics' digest.
-        RuntimeError: When the effective run kind (`cfg.run_kind or
-            "formal"`, the same normalization the rest of this worker uses)
-            is `"formal"` and no qualification artifact was supplied -- a formal run publishes the
-            registered results, so the preprocessing it used must be pinned to
-            something recorded rather than merely recomputed.
-        RuntimeError: When the supplied qualification artifact is missing,
-            malformed, does not carry ``verdict == "pass"``, or disagrees on
-            either digest (`validate_qualification_artifact`).
     """
     mode = str(cfg.model.config.get("feature_standardization", "zscore_vfit_v1"))
     if mode != "zscore_vfit_v1":
@@ -5868,50 +5356,16 @@ def _bind_feature_standardization(
             "feature_stats_sha256 mismatch: config pins "
             f"{pinned}, assembled statistics are {stats.digest}"
         )
-    # [P1-B, re-reviewed] An unset `cfg.run_kind` is not an exemption -- the
-    # CLI documents `--run-kind` as "defaults to formal", and every other use
-    # of `cfg.run_kind` in this worker normalizes it the same way
-    # (`cfg.run_kind or "formal"`: binding validation, data-role selection,
-    # training, artifact metadata). The plain default invocation must not be
-    # able to bypass the formal contract by simply never setting `--run-kind`.
-    #
-    # Written as an exhaustive match over the run-kind domain, never as a
-    # whitelist of the kinds that exist today: the pre-cleanup form listed
-    # `("rehearsal", "formal")` and would have left the new `qualification`
-    # kind silently unguarded (design 2026-07-29 Sec 6.1). An unrecognized
-    # kind therefore lands on the formal branch, which is the strict one.
-    #
-    # The exempt side is the closed list, so the strict side is the default:
-    # the qualification stage is where the digest is *born* (it computes the
-    # statistics over V_fit and its caller records `stats.digest` in
-    # `QUALIFICATION_FILENAME`), and demanding it as a config input there is
-    # exactly the circularity the two-stage design removed.
     effective_run_kind = cfg.run_kind or "formal"
-    qualification_payload: dict[str, object] | None = None
-    compares_recorded_digest = (
-        ddp_mode not in _PROBE_DISPATCH_MODES
-        and effective_run_kind not in ("qualification", "debug")
-    )
-    if compares_recorded_digest:
-        if qualification_artifact is None:
-            raise RuntimeError(
-                f"feature_stats_sha256 is unpinned for run_kind={effective_run_kind}: "
-                "the formal stage must compare its digest against the qualification "
-                "stage's recorded one; pass --qualification-artifact"
-            )
-        qualification_payload = validate_qualification_artifact(
-            qualification_artifact, cfg, feature_stats_sha256=stats.digest
-        )
     model.set_feature_stats(stats)
     logger.info(
         "registered feature standardization mode=%s rows=%d feature_stats_sha256=%s "
-        "run_kind=%s config_pinned=%s qualification_verified=%s",
+        "run_kind=%s config_pinned=%s",
         mode,
         stats.n_rows,
         stats.digest,
         effective_run_kind,
         "yes" if pinned else "no",
-        "yes" if qualification_payload is not None else "no",
     )
     return stats.digest
 
@@ -5946,13 +5400,6 @@ def _run_ddp_worker(
         formal_binding = _validate_e2e_formal_binding(cfg, preregistration, args.config)
 
     effective_run_kind = "debug" if args.max_steps is not None else (cfg.run_kind or "formal")
-    if (
-        not measurement_only
-        and effective_run_kind == "qualification"
-        and cfg.optim.epochs != 3
-    ):
-        raise ValueError("qualification worker requires exactly 3 epochs")
-
     accelerator = build_egostitch_ddp_accelerator(
         cfg.mixed_precision,
         find_unused_parameters=False,
@@ -5968,70 +5415,23 @@ def _run_ddp_worker(
     run_kind = effective_run_kind
     feature_stats_sha256 = ""
 
-    def record_qualification_failure(error: BaseException) -> None:
-        """Name a qualification failure in `QUALIFICATION_FILENAME`, never mask it.
-
-        A qualification run must end in ``pending_manual_review`` or a *named*
-        failure, never in a bare traceback the formal stage's preflight cannot
-        read. Every fail-fast guard raises on all ranks, so the main process is
-        guaranteed to reach this writer.
-        Caught broadly on purpose -- `qualification_verdict` names an
-        unrecognized failure rather than letting one escape unrecorded.
-
-        `feature_stats_sha256` is read at call time and is ``""`` when the
-        run died before binding (e.g. on the held-out path guard, whose
-        `fail(held_out_path)` verdict is a registered one): a failure record
-        with no digest is still a readable verdict, and
-        `validate_qualification_artifact` refuses it on ``verdict`` first.
-        """
-        if (
-            measurement_only
-            or run_kind != "qualification"
-            or not accelerator.is_main_process
-        ):
-            return
-        try:
-            write_qualification_artifact(
-                cfg,
-                verdict=qualification_verdict(error),
-                feature_stats_sha256=feature_stats_sha256,
-            )
-        except (OSError, TypeError, ValueError) as write_error:
-            # Recording the verdict must never mask the primary failure.
-            logger.error("failed to write the qualification verdict: %s", write_error)
-
-    # The verdict writer wraps the *whole* run, not just the training loop:
-    # `assemble_egostitch_data` (held-out path guard) and
-    # `_bind_feature_standardization` (digest contract) both raise before the
-    # first step, and both map onto registered verdicts. Wrapping only the
-    # loop left those failures with no `QUALIFICATION_FILENAME` at all.
-    try:
-        data = assemble_egostitch_data(cfg, pack_dir=args.pack_dir)
-        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
-        feature_stats_sha256 = _bind_feature_standardization(
-            model,
-            cfg,
-            data,
-            qualification_artifact=args.qualification_artifact,
-            ddp_mode=args.ddp_mode,
-        )
-        _run_ddp_dispatch(
-            cfg,
-            args,
-            model,
-            data,
-            accelerator=accelerator,
-            preregistration=preregistration,
-            registered_config_hash=registered_config_hash,
-            formal_binding=formal_binding,
-            run_kind=run_kind,
-            feature_stats_sha256=feature_stats_sha256,
-            node_batch=args.token_budget_per_rank,
-            profile_output=args.profile_output,
-        )
-    except Exception as error:
-        record_qualification_failure(error)
-        raise
+    data = assemble_egostitch_data(cfg, pack_dir=args.pack_dir)
+    model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+    feature_stats_sha256 = _bind_feature_standardization(model, cfg, data)
+    _run_ddp_dispatch(
+        cfg,
+        args,
+        model,
+        data,
+        accelerator=accelerator,
+        preregistration=preregistration,
+        registered_config_hash=registered_config_hash,
+        formal_binding=formal_binding,
+        run_kind=run_kind,
+        feature_stats_sha256=feature_stats_sha256,
+        node_batch=args.token_budget_per_rank,
+        profile_output=args.profile_output,
+    )
 
 
 def _run_ddp_dispatch(
@@ -6094,12 +5494,6 @@ def _run_ddp_dispatch(
     )
     if accelerator.is_main_process:
         write_outputs(result, cfg, data, debug=args.max_steps is not None)
-        if run_kind == "qualification":
-            write_qualification_artifact(
-                cfg,
-                verdict=qualification_verdict(None),
-                feature_stats_sha256=feature_stats_sha256,
-            )
     _write_json_rank_zero(accelerator, profile_output, result.runtime_profile)
     logger.info(
         "egostitch ddp train complete: best epoch %d val AUPRC %.4f (counterfactual_stop_epoch=%s)",

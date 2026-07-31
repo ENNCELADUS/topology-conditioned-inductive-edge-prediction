@@ -7,8 +7,8 @@ tiny model dicts from here, so the fixtures below stay put even though the
 frozen-s0 ``egostitch`` execution path they were originally written for was
 retired with the two-stage cleanup (design 2026-07-29 Sec 6.2).
 
-The live worker-core behaviour (run kinds, the BINDING gate, the qualification
-artifact, the batch factory, the registered diagnostics) lives in
+The live worker-core behaviour (run kinds, the BINDING plan lock, the batch
+factory, and registered diagnostics) lives in
 `tests/test_train_egostitch_core.py`.
 """
 

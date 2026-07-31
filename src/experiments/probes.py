@@ -726,7 +726,7 @@ def produce_e2e_probe_artifact(
 
     ``scope`` is deliberately required and ``formal_train`` is its only value:
     the full operative train-side ``G_struct``. The producer runs only against a
-    completed, published formal run; the qualification stage has no probe
+    completed, published formal run; no preliminary execution stage has a probe
     artifact.
     """
     from src import train_egostitch as te
@@ -794,7 +794,7 @@ def produce_e2e_probe_artifact(
         )
     if run_metadata.get("preregistration_sha256") != registration_sha:
         raise ValueError("probe run metadata does not match preregistration SHA-256")
-    # The only producible scope is the published formal run. ``qualification``
+    # The only producible scope is the published formal run. Retired scopes
     # and ``debug`` run kinds are rejected by the same equality, so the new
     # run-kind domain cannot widen this guard.
     if (

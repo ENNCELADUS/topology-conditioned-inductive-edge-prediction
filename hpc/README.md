@@ -5,10 +5,10 @@ and EgoStitch CLIs directly inside the pinned container; there is no scheduler, 
 array, or cluster-specific environment file. Two tracked runners:
 
 - `hpc/run.sh` — the baselines, cached scoring, and the G1/G2 gates.
-- `hpc/qualification.sh` — the EgoStitch E2E two-stage ladder (`qualify` then `formal`),
-  which owns the registration and preflight checks. `hpc/run.sh train` **refuses** a
+- `hpc/qualification.sh` — the historically named single-stage EgoStitch E2E formal
+  launcher, which owns plan/environment preflight checks. `hpc/run.sh train` **refuses** a
   config whose `model.family` is `egostitch_e2e`: launching an arm from there would skip
-  every preflight the ladder owns.
+  the plan/artifact identity preflight.
 
 Formal E2 training (`B0`, `configs/b0_v31_breadth_first.yaml`) runs **only** through
 `hpc/run.sh train configs/b0_v31_breadth_first.yaml`, the runner's single `train` branch,
@@ -64,7 +64,7 @@ hpc/run.sh check
 The check runs the lightweight suite plus the three CPU DDP smoke contracts on Linux;
 the four-H20 cold-run acceptance test remains an explicit opt-in.
 
-## The EgoStitch E2E ladder: qualify, then formal
+## EgoStitch E2E: single-stage formal execution
 
 Two stages, no sandbox and no threshold-freeze step between them. Both train on the full
 `V_fit` and validate on the single 512-node `V_hold`, and they differ **only** in
@@ -73,62 +73,12 @@ grounding cache, and one `feature_stats_sha256`. Neither stage may open a held-o
 that boundary is a path check inside the worker on both run kinds, not an isolated data
 root, so both commands run directly in the repository checkout.
 
-Neither command passes `--pack-dir`. The pack manifest is keyed on `n_ground`, so each
-config names its own `runtime.pack_dir`; both stages of an arm share it, and arms that
-agree on `n_ground` share it too (`cosine_pool` pins 20, the other five 50).
-
-`qualify` is the development loop. It directly runs the requested arm for 3 epochs on
-every auto-detected visible H20; test-suite execution is not a launch prerequisite. The
-short schedule still traverses curriculum phases A -> B -> C, because the curriculum
-scales with `schedule_total_steps` rather than with a fixed step count. Actual global-
-norm clipping remains enabled (`3.0` for pair/generator, `1.0` for conditioning), and
-the complete pre-clip norm/coefficient/streak telemetry is retained. Every finite
-model-quality threshold is telemetry-only: initial/during slot statistics, finite zero
-gradient/family norms, immediate/persistent clipping, family ratio, warm-reference
-and validation dispersion floors, precision thresholds, validation collapse, and
-checkpoint eligibility. Only non-finite, DDP, boundary, coverage, and
-I/O/infrastructure failures abort qualification. Every complete three-epoch run writes
-`pending_manual_review`, regardless of quality eligibility, never automatic `pass`.
-If no quality-eligible checkpoint exists, the final epoch is the diagnostic
-manual-review selection; the existing `best.pt`/`last.pt` compatibility aliases may
-expose it, but metadata/profile mark it non-eligible and neither alias authorizes
-formal. Each invocation receives an
-immutable directory under
-`outputs/egostitch_e2e_stage1_v3/qualification/<arm>/attempts/attempt-*/` and writes
-its `qualification.json` there together with the `feature_stats_sha256` and
-`model_config_sha256` the formal stage compares against. The arm-local `latest`
-symlink advances after every attempt, including a retained failure or pending review;
-`latest-pass` does not advance for `pending_manual_review`. Formal must fail closed on
-the latest pending state rather than fall back to a stale historical pass. This DRAFT
-defines no approval artifact or conversion to `pass`; manual review is a later owner
-decision and never edits the immutable attempt in place.
-
-This durable history is part of the selection-exposure audit: every qualification
-attempt evaluates the shared `V_hold`, so retaining all attempts makes the cumulative
-evaluation count `K` recoverable per arm instead of hiding repeated development
-selection. Qualification is frozen once v4 becomes `BINDING`; allowing further
-attempts would escape the registered `K` disclosure. Each arm's
-`attempt_history.json` uses schema `egostitch_e2e_qualification_history_v1`. Binding
-must map exactly the six trained arms to `{path, sha256}` index references and register
-the same exact, non-empty attempt lists under `qualification_attempts`; any omission,
-extra arm, stale index, or list mismatch is a refusal.
-
-Checkpoint eligibility is computed and reported in qualification but enforced only
-as a hard requirement in formal. `qualify` never
-edits or promotes the active v4 registration, which remains `DRAFT`, and deliberately
-does not require a clean checkout, because iterating on the model is the point:
-
-```bash
-hpc/qualification.sh qualify full   # or f_only|pair_topology|p0|cosine_pool|no_l_rel
-```
-
-`formal` produces results. It refuses to start unless there are exactly four visible
-H20s, the checkout is clean, the registration is `BINDING` with every required
-binding-evidence field resolved, and this arm's qualification verdict is `pass` with
-both digests equal to the ones this formal config and its shared pack produce — a stale
-report from before a model change is a refusal, not a pass. In particular,
-`pending_manual_review` is always a refusal under the current contract. Six trained arms are
-selectable; the two scoring-time controls (`structure_control_6a_v3`,
+The launcher does not pass `--pack-dir`; each config names its plan-bound pack. `formal`
+refuses to start unless exactly four H20s are visible, the checkout is clean, the
+registration is `BINDING`, and the exact arm/config/implementation and required input
+digests match. It does not read a qualification artifact, pass/pending verdict,
+eligibility/liveness result, full-arm preflight, or margin verdict. Six trained arms
+are selectable; the two scoring-time controls (`structure_control_6a_v3`,
 `structure_control_6e_v1`) reuse the full arm's checkpoint and are rejected here:
 
 ```bash
@@ -140,18 +90,13 @@ The governing file is
 so `formal` is intentionally launch-blocked until the owner resolves its real binding
 evidence and promotes a successor content state to `BINDING`.
 
-Scientific execution order is `full` first. After training, the stage validates the
-registered clip-coefficient, family-ratio, and submodule-RMS margins and persists that
-verdict to `<output_dir>/margin_verdict.json`, bound to the digest of the `profile.json`
-it was computed from. That gate necessarily runs *after* the pipeline has published the
-run, so a completed run carries no margin evidence on its own: the remaining arms require
-the full arm's persisted verdict alongside its eligibility and liveness preflight, and a
-verdict left behind by an earlier full run cannot stand in for the current one. For the
-full arm the stage then produces the registered `formal_train` probe artifact that the G5
-gate evaluator consumes, at the path bound in the registration.
-
-Neither stage substitutes `--max-steps` for its schedule, and neither promotes the
-registration; both stop immediately on failure.
+All finite model-quality predicates are telemetry-only. The actual clipping operation
+and telemetry remain, but eligibility, liveness, slot collapse, clip/family/RMS margins,
+AUPRC, dispersion, and precision quality misses cannot block completion, publication,
+scoring, or evaluation. Non-finite state, DDP disagreement, coverage/data-boundary
+violations, plan/input/artifact hash mismatch, and I/O/infrastructure failures remain
+fail-closed. The launcher never substitutes `--max-steps` and never promotes the
+registration.
 
 ## Baselines
 

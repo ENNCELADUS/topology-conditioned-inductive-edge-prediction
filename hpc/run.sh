@@ -25,9 +25,9 @@ H20 GPUs via an automatically sized `accelerate launch`. Direct
 it is never a formal E2 training run. B0-alt keeps its own direct
 `python -m src.train_b0` CLI, unaffected by this distributed routing.
 
-EgoStitch E2E training is not launched from here: both stages of its ladder go
-through `hpc/qualification.sh`, which owns the registration and qualification
-preflights.
+EgoStitch E2E training is not launched from here: its plan-bound formal run goes
+through the historically named `hpc/qualification.sh`, which verifies the
+registration, configuration, implementation, and input-artifact identities.
 
 The score command pins --device cuda --amp bf16. With multiple visible GPUs it
 launches one contiguous shard per GPU, waits for every shard, and strictly merges
@@ -150,9 +150,9 @@ case "${COMMAND}" in
     shift
     [[ -f "${CONFIG_PATH}" ]] || fail "config not found: ${CONFIG_PATH}"
     # Stated in the usage text and enforced here: an EgoStitch E2E arm launched
-    # from this branch would skip every preflight its ladder owns -- the BINDING
-    # registration, the clean checkout, the qualification verdict and its digest
-    # equality, and the four-GPU pin. The family is read from the config, so
+    # from this branch would skip its plan/artifact identity preflight -- the
+    # BINDING registration, clean checkout, registered config, and four-GPU pin.
+    # The family is read from the config, so
     # naming the worker module by hand does not reopen the bypass.
     MODEL_FAMILY="$("${PYTHON_BIN}" -c \
       'import sys, yaml; from pathlib import Path; config = yaml.safe_load(Path(sys.argv[1]).read_text()); model = config.get("model") or {}; print(model.get("family", ""))' \

@@ -1355,229 +1355,6 @@ class TestE2ECompositeStep:
         fidelity = cast(dict[str, float], result.history[0]["fidelity"])
         assert set(fidelity) == _EXPECTED_FIDELITY_KEYS  # define from the current keys, verbatim
         assert 0.0 <= fidelity["h_pairwise_cosine_mean"] <= 1.0
-        assert result.best_epoch == 1
-        assert guard_persistence == [False] * len(optimizer_steps)
-
-    @pytest.mark.parametrize(
-        ("run_kind", "expected_enforcement"),
-        [(None, True), ("formal", True), ("qualification", False)],
-    )
-    def test_persistent_clip_guard_enforcement_is_run_kind_scoped(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        run_kind: te.E2ERunKind | None,
-        expected_enforcement: bool,
-    ) -> None:
-        """Only qualification turns the persistent streak into telemetry."""
-        torch.manual_seed(0)
-        _, model = self._batch_and_model(tmp_path)
-        cfg = _toy_cfg(tmp_path)
-        registered = te.load_config(
-            Path(__file__).resolve().parents[1]
-            / "configs/egostitch_e2e_v3_full_breadth_first.yaml"
-        )
-        assert registered.training is not None
-        e2e_cfg = replace(
-            cfg,
-            model=ModelConfig(family="egostitch_e2e", config=dict(_E2E_TINY_MODEL)),
-            data=replace(cfg.data, pack_dir=tmp_path / "token_pack"),
-            training=registered.training,
-            run_kind=run_kind,
-        )
-        data = _toy_bundle(tmp_path, EgoStitchConfig())
-        self._float_the_packed_store(monkeypatch)
-        enforcement: list[bool] = []
-
-        def _capture_then_stop(
-            _guard: te.E2EClipGuard,
-            _records: dict[str, te.E2EGradientGroupRecord],
-            *,
-            step: int | None = None,
-            phase: te.E2EPhaseName | None = None,
-            enforce_immediate: bool = True,
-            enforce_persistent: bool = True,
-        ) -> None:
-            del step, phase
-            assert enforce_immediate is expected_enforcement
-            enforcement.append(enforce_persistent)
-            raise RuntimeError("stop after persistent-guard call")
-
-        monkeypatch.setattr(te.E2EClipGuard, "update", _capture_then_stop)
-        with pytest.raises(RuntimeError, match="stop after persistent-guard call"):
-            te._train_e2e_stability_loop(
-                model,
-                e2e_cfg,
-                data,
-                Accelerator(cpu=True),
-                node_batch=4,
-            )
-
-        assert enforcement == [expected_enforcement]
-
-    @pytest.mark.parametrize(
-        (
-            "reference_auprc",
-            "run_kind",
-            "warm_std",
-            "collapse",
-            "expect_eligible",
-            "expect_complete",
-            "expected_error",
-        ),
-        [
-            (0.23, "formal", 0.4, False, True, True, None),
-            (0.22, "formal", 0.4, False, True, True, None),
-            (0.21, "formal", 0.4, False, False, False, "no eligible checkpoint"),
-            (0.21, "qualification", 0.4, False, False, True, None),
-            (0.23, "formal", 0.0, False, False, False, "warm-reference"),
-            (0.23, "qualification", 0.0, False, False, True, None),
-            (0.23, "formal", 0.4, True, False, False, "validation-logit collapse"),
-            (0.23, "qualification", 0.4, True, False, True, None),
-        ],
-    )
-    def test_training_loop_captures_first_edge_active_eligibility_reference(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        reference_auprc: float,
-        run_kind: te.E2ERunKind,
-        warm_std: float,
-        collapse: bool,
-        expect_eligible: bool,
-        expect_complete: bool,
-        expected_error: str | None,
-    ) -> None:
-        """Phase-A validation is ignored; the first trained-head validation stays fail-closed."""
-        torch.manual_seed(0)
-        _, model = self._batch_and_model(tmp_path)
-        cfg = _toy_cfg(tmp_path)
-        registered = te.load_config(
-            Path(__file__).resolve().parents[1] / "configs/egostitch_e2e_v3_full_breadth_first.yaml"
-        )
-        assert registered.training is not None
-        pack_dir = tmp_path / "token_pack"
-        e2e_cfg = replace(
-            cfg,
-            model=ModelConfig(family="egostitch_e2e", config=dict(_E2E_TINY_MODEL)),
-            data=replace(cfg.data, pack_dir=pack_dir),
-            optim=replace(cfg.optim, epochs=5),
-            diagnostics=replace(cfg.diagnostics, gradient_probe_interval=10_000),
-            training=replace(
-                registered.training,
-                clip_immediate_abort=0.0,
-                clip_persistent_threshold=0.0,
-            ),
-            run_kind=run_kind,
-        )
-        data = _toy_bundle(tmp_path, EgoStitchConfig())
-        original_from_pack = PackedFeatureTable.from_pack.__func__
-
-        def _float_cpu_pack(
-            cls: type[PackedFeatureTable], root: Path, device: torch.device
-        ) -> PackedFeatureTable:
-            table = original_from_pack(cls, root, device)
-            table.tokens = table.tokens.float()
-            return table
-
-        validation_calls = 0
-
-        def _validation(
-            *_args: object,
-            **_kwargs: object,
-        ) -> te._ValidationResult:
-            nonlocal validation_calls
-            # Call 0 is the step-0 slot-health guard (design 2026-07-29
-            # Sec 4.1), which runs one validation pass before the schedule
-            # starts. Epoch validations are numbered after it, so this
-            # trajectory is the same one the pre-guard loop saw.
-            call = validation_calls - 1
-            validation_calls += 1
-            f_logit_auprc = reference_auprc if call == 2 else (0.1 if call < 2 else 0.9)
-            f_logit_std = warm_std if call <= 0 else (0.0 if collapse else 0.8)
-            metrics = _flat_edge_metrics()
-            return te._ValidationResult(
-                metrics=metrics,
-                fidelity={
-                    "prevalence": 0.2,
-                    "active_logit_std": 0.2,
-                    "clustering_mmd": 0.1,
-                    "topology_delta_ratio": 0.01,
-                    "f_logit_std": f_logit_std,
-                    "f_logit_auprc": f_logit_auprc,
-                    # The five dispersion keys the real `_validate_epoch`
-                    # always emits for an `EgoStitchE2E`: the step-0 slot
-                    # guard and `E2ESlotCollapseGuard` both index them hard,
-                    # so a stub that omits them fails with a bare KeyError.
-                    "pi_slot_std": 0.3,
-                    "h_pairwise_cosine_mean": 0.2,
-                    "adj_offdiag_std": 0.3,
-                    "plan_row_entropy": 0.5,
-                    "plan_rank1_marginal_residual": 0.2,
-                },
-            )
-
-        seen_records: list[te.E2ECheckpointRecord] = []
-        original_eligible = te.e2e_checkpoint_eligible
-
-        def _track_eligibility(record: te.E2ECheckpointRecord, arm: te.E2EArmName) -> bool:
-            seen_records.append(record)
-            return original_eligible(record, arm)
-
-        monkeypatch.setattr(PackedFeatureTable, "from_pack", classmethod(_float_cpu_pack))
-        monkeypatch.setattr(te, "_validate_epoch", _validation)
-        monkeypatch.setattr(te, "e2e_checkpoint_eligible", _track_eligibility)
-        monkeypatch.setattr(te.E2EClipGuard, "update", lambda *_args, **_kwargs: None)
-        accelerator = Accelerator(cpu=True)
-
-        if expect_complete:
-            result = te._train_e2e_stability_loop(
-                model,
-                e2e_cfg,
-                data,
-                accelerator,
-                node_batch=4,
-            )
-            assert result.best_epoch > 0
-            if expect_eligible:
-                assert result.runtime_profile["selected_epoch"] == result.best_epoch
-                assert result.runtime_profile["selection_status"] == "selected"
-                assert result.runtime_profile["diagnostic_epoch"] is None
-            else:
-                assert result.runtime_profile["selected_epoch"] is None
-                assert result.runtime_profile["selection_status"] == "diagnostic_last_epoch"
-                assert result.runtime_profile["diagnostic_epoch"] == result.last_epoch
-                assert result.best_epoch == result.last_epoch
-        else:
-            assert expected_error is not None
-            with pytest.raises(RuntimeError, match=expected_error):
-                te._train_e2e_stability_loop(
-                    model,
-                    e2e_cfg,
-                    data,
-                    accelerator,
-                    node_batch=4,
-                )
-            return
-
-        phase_a_records = [record for record in seen_records if record.phase == "A"]
-        assert phase_a_records
-        assert all(record.warm_reference_auprc is None for record in phase_a_records)
-        assert all(
-            record.warm_reference_std == pytest.approx(warm_std) for record in phase_a_records
-        )
-        first_referenced = next(
-            record for record in seen_records if record.warm_reference_auprc is not None
-        )
-        assert first_referenced.warm_reference_std == pytest.approx(warm_std)
-        assert first_referenced.warm_reference_auprc == pytest.approx(reference_auprc)
-        assert first_referenced.full_joint_epochs_completed == 0
-        assert not original_eligible(first_referenced, "full")
-        first_full_joint = next(
-            record for record in seen_records if record.full_joint_epochs_completed == 1
-        )
-        assert first_full_joint.warm_reference_auprc == pytest.approx(reference_auprc)
-        assert original_eligible(first_full_joint, "full") is expect_eligible
 
     def test_permanent_null_matches_eval_bypass(self, tmp_path: Path) -> None:
         """The training mask is exactly the corresponding hard eval bypass."""
@@ -2012,34 +1789,6 @@ class TestPrepareAndAssembleE2E:
         assert audit["training_feature_stats_rows"] == data.feature_stats.n_rows
         assert data.feature_stats.n_rows == len(data.train_nodes)
 
-    def test_qualification_and_formal_degree_priors_are_exactly_identical(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        qualification_cfg = replace(
-            _holdout_e2e_cfg(tmp_path / "qualification", monkeypatch),
-            run_kind="qualification",
-        )
-        formal_cfg = replace(
-            _holdout_e2e_cfg(tmp_path / "formal", monkeypatch),
-            run_kind="formal",
-        )
-        qualification_data = te.assemble_egostitch_data(qualification_cfg)
-        formal_data = te.assemble_egostitch_data(formal_cfg)
-        qualification_model = EgoStitchE2E(
-            E2EConfig.from_mapping(qualification_cfg.model.config)
-        )
-        formal_model = EgoStitchE2E(E2EConfig.from_mapping(formal_cfg.model.config))
-
-        qualification_mu = te.e2e_degree_prior_init(qualification_model, qualification_data)
-        formal_mu = te.e2e_degree_prior_init(formal_model, formal_data)
-
-        assert qualification_mu == formal_mu
-        assert sorted(qualification_data.target_builder.graph.nodes) == sorted(
-            formal_data.target_builder.graph.nodes
-        )
-        assert sorted(qualification_data.target_builder.graph.edges) == sorted(
-            formal_data.target_builder.graph.edges
-        )
 
     def test_assembly_statistics_ignore_sealed_validation_rows(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2109,12 +1858,12 @@ class TestHeldOutPathBoundary:
     def _strategy_dir(self, tmp_path: Path) -> Path:
         return tmp_path / "data" / te._BENCHMARK_SUBDIR / "toy"
 
-    @pytest.mark.parametrize("run_kind", ["qualification", "formal"])
-    def test_a_train_side_symlink_onto_a_held_out_file_raises_in_both_run_kinds(
+    @pytest.mark.parametrize("run_kind", ["formal"])
+    def test_a_train_side_symlink_onto_a_held_out_file_raises(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        run_kind: Literal["qualification", "formal"],
+        run_kind: Literal["formal"],
     ) -> None:
         """Following symlinks is the one way a train-side name can alias a held-out file."""
         cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind=run_kind)
@@ -2128,12 +1877,12 @@ class TestHeldOutPathBoundary:
         with pytest.raises(RuntimeError, match="opened a held-out path"):
             te.assemble_egostitch_data(cfg)
 
-    @pytest.mark.parametrize("run_kind", ["qualification", "formal"])
-    def test_present_but_unopened_held_out_files_do_not_block_either_run_kind(
+    @pytest.mark.parametrize("run_kind", ["formal"])
+    def test_present_but_unopened_held_out_files_do_not_block_formal(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        run_kind: Literal["qualification", "formal"],
+        run_kind: Literal["formal"],
     ) -> None:
         """The repository data root carries all three; both stages must still run in it."""
         cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind=run_kind)
@@ -2153,17 +1902,8 @@ class TestFeatureStandardizationBinding:
     def test_binding_pins_the_statistics_and_returns_the_digest(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The realistic path: the qualification stage computes the digest.
-
-        `run_kind` is `"qualification"` because that is the stage the digest
-        is *born* in (design 2026-07-29 Sec 3): it is not a config input any
-        more -- the six v3 configs no longer carry `feature_stats_sha256` --
-        and it is recorded in `qualification.json` for the formal stage to
-        compare against. A config that still pins the field is honoured, so
-        this fixture pins the matching value to prove the check agrees rather
-        than being skipped.
-        """
-        base_cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="qualification")
+        """The formal plan binds the V_fit-derived statistics digest."""
+        base_cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="formal")
         data = te.assemble_egostitch_data(base_cfg)
         assert data.feature_stats is not None
         cfg = replace(
@@ -2186,7 +1926,7 @@ class TestFeatureStandardizationBinding:
     def test_binding_fails_closed_on_a_pinned_digest_mismatch(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="qualification")
+        cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="formal")
         cfg = replace(
             cfg,
             model=replace(
@@ -2203,7 +1943,7 @@ class TestFeatureStandardizationBinding:
     def test_binding_fails_closed_when_statistics_are_absent(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="qualification")
+        cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="formal")
         data = replace(te.assemble_egostitch_data(cfg), feature_stats=None)
         model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
 
@@ -2227,70 +1967,6 @@ class TestFeatureStandardizationBinding:
         assert te._bind_feature_standardization(model, cfg, data) == ""
         assert model.feature_stats_digest_hex == ""
 
-    @pytest.mark.parametrize("run_kind", ["formal", None])
-    def test_binding_fails_closed_without_a_qualification_artifact(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        run_kind: Literal["qualification", "formal"] | None,
-    ) -> None:
-        """[P1-B, re-reviewed] An UNSET run_kind is the formal stage, and must not train.
-
-        An unset `run_kind` is not an exemption: `--run-kind`'s own help text
-        says it "defaults to formal", and every other use of `cfg.run_kind` in
-        this worker normalizes it the same way (`cfg.run_kind or "formal"`) --
-        binding validation, data-role selection, training, artifact metadata.
-        The plain default invocation (nobody passed `--run-kind` at all) must
-        not be able to bypass the formal comparison simply by never setting
-        it; it publishes a `run_kind="formal"` artifact exactly like an
-        explicit `--run-kind formal` would.
-        """
-        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
-        cfg = replace(cfg, run_kind=run_kind)
-        data = te.assemble_egostitch_data(cfg)
-        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
-
-        with pytest.raises(RuntimeError, match="run_kind=formal"):
-            te._bind_feature_standardization(model, cfg, data)
-
-        # The model must not have been bound before the raise.
-        assert model.feature_stats_digest_hex == ""
-
-    def test_binding_compares_the_formal_digest_against_the_recorded_one(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The formal stage's assertion is a genuine equality over one V_fit.
-
-        Both stages train on the identical universe (design Sec 2), so the
-        digest the formal run computes here must equal the one the
-        qualification run recorded -- assembled twice from the same fixture,
-        not copied between the two configs.
-        """
-        qualification = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="qualification")
-        data = te.assemble_egostitch_data(qualification)
-        assert data.feature_stats is not None
-        qualification.output_dir.mkdir(parents=True, exist_ok=True)
-        artifact = qualification.output_dir / te.QUALIFICATION_FILENAME
-        artifact.write_text(
-            json.dumps(
-                {
-                    "verdict": "pass",
-                    "feature_stats_sha256": data.feature_stats.digest,
-                    "model_config_sha256": te.model_config_hash(qualification),
-                }
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        formal = replace(qualification, run_kind="formal")
-        model = EgoStitchE2E(E2EConfig.from_mapping(formal.model.config))
-
-        digest = te._bind_feature_standardization(
-            model, formal, data, qualification_artifact=artifact
-        )
-
-        assert digest == data.feature_stats.digest
-        assert model.feature_stats_digest_hex == digest
 
     def test_binding_allows_an_empty_pin_for_the_debug_run_kind(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2323,17 +1999,17 @@ class TestFailedSelectionHistory:
             {"epoch": 1.0, "auprc": 0.5, "fidelity": {"topology_delta_ratio": 0.0}}
         ]
         te._write_failed_run_history(
-            tmp_path / "out", run_kind="qualification", arm="full", history=history
+            tmp_path / "out", run_kind="formal", arm="full", history=history
         )
         payload = json.loads((tmp_path / "out" / "failed_run_history.json").read_text())
-        assert payload["run_kind"] == "qualification"
+        assert payload["run_kind"] == "formal"
         assert payload["arm"] == "full"
         assert payload["history"] == history
 
     def test_failed_selection_history_write_never_masks_the_failure(self, tmp_path: Path) -> None:
         blocked = tmp_path / "blocked"
         blocked.write_text("a file where the output directory should be")
-        te._write_failed_run_history(blocked, run_kind="qualification", arm="full", history=[])
+        te._write_failed_run_history(blocked, run_kind="formal", arm="full", history=[])
         assert blocked.is_file()
 
 
@@ -2354,7 +2030,7 @@ class TestInitialSlotHealthGuard:
     def test_guard_reports_slot_telemetry_without_training(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="qualification")
+        cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="formal")
         _write_tiny_token_pack(cast(Path, cfg.data.pack_dir), _E2E_PIPELINE_NODES, min_length=3)
         data = te.assemble_egostitch_data(cfg)
         model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
@@ -2386,7 +2062,7 @@ class TestInitialSlotHealthGuard:
     def test_guard_fails_closed_on_an_empty_guard_population(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="qualification")
+        cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="formal")
         data = replace(te.assemble_egostitch_data(cfg), val_pairs=[])
         model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
         te._bind_feature_standardization(model, cfg, data)

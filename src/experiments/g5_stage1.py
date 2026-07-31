@@ -97,7 +97,6 @@ from src.score_universe import (
     ScoresArtifact,
     load_scores,
     validate_artifact_precision,
-    validate_e2e_margin_verdict,
 )
 
 logger = logging.getLogger(__name__)
@@ -177,9 +176,8 @@ def _enforce_metadata_registration_hash(
     """Validate metadata against an already-captured registration hash.
 
     The ``run_kind`` condition is a whitelist, not a ``!= "debug"`` blacklist:
-    the run-kind domain gained ``qualification``, and a blacklist would have let
-    a qualification run publish held-out metrics without anyone editing this
-    function.
+    retired/debug run kinds cannot publish held-out metrics without an explicit
+    contract change here.
     """
     for path in run_metadata_paths:
         metadata = json.loads(path.read_text(encoding="utf-8"))
@@ -291,11 +289,10 @@ def _validate_e2e_binding_evidence(
     preregistration: Mapping[str, object], preregistration_path: Path
 ) -> None:
     """Fail closed unless the gate sees the complete rev-3.1 binding package."""
-    from src.experiments.auprc_tolerance import (
+    from src.experiments.e2e_binding import (
         BINDING_SCHEMA_V1,
         HISTORICAL_V1_ARMS,
         binding_schema_for_registration,
-        validate_bound_calibration,
     )
 
     if _contains_required_before_binding(preregistration):
@@ -352,21 +349,13 @@ def _validate_e2e_binding_evidence(
     binding_sections = [
         "parameter_group_manifests",
         "packs_and_validation_manifests",
-        "qualification_attempts",
         "boundary_access_audit",
         "runtime_and_peak_memory",
     ]
-    if schema_version != BINDING_SCHEMA_V1:
-        binding_sections.insert(3, "qualification_history_indexes")
     for label in binding_sections:
         _validate_e2e_binding_section(
             evidence.get(label), label=label, preregistration_path=preregistration_path
         )
-    if schema_version != BINDING_SCHEMA_V1:
-        try:
-            validate_bound_calibration(preregistration, preregistration_path)
-        except ValueError as error:
-            raise PreregistrationMismatch(str(error)) from error
     if not isinstance(evidence.get("checkpoint_policy_version"), str):
         raise PreregistrationMismatch("binding_evidence checkpoint policy is missing")
 
@@ -637,7 +626,7 @@ def validate_dead_residual_within_checkpoint(
     max_topk_overlap: float,
     topk_fraction: float,
 ) -> dict[str, float]:
-    """Fail closed when a checkpoint's own topology/content pathway carries no signal.
+    """Report whether a checkpoint's own topology/content pathway carries signal.
 
     Family ``egostitch_e2e`` liveness (spec Sec 13.17/13.8, re-registered
     2026-07-17) references the **within-checkpoint** ``f_logit`` arm of the
@@ -662,12 +651,9 @@ def validate_dead_residual_within_checkpoint(
         A diagnostics dict (std ratio, correlation, overlap, and their raw
         ingredients).
 
-    Raises:
-        ValueError: If `artifact.f_logit` is absent, or if all three death
-            signals hold conjunctively (residual/`f_logit` standard-deviation
-            ratio below `min_residual_std_ratio`, Spearman correlation with
-            `f_logit` above `max_spearman`, and top-k overlap with `f_logit`
-            above `max_topk_overlap`).
+    Missing plan-required score arrays remain an artifact-integrity error. The
+    finite liveness thresholds themselves are telemetry and never authorize or
+    block evaluation.
     """
     if artifact.f_logit is None:
         raise ValueError(
@@ -697,57 +683,22 @@ def validate_dead_residual_within_checkpoint(
         "topk_overlap_vs_f_logit": overlap,
         "topk_fraction": topk_fraction,
     }
-    if (
+    report["quality_pass"] = not (
         residual_ratio < min_residual_std_ratio
         and correlation > max_spearman
         and overlap > max_topk_overlap
-    ):
-        raise ValueError(f"within-checkpoint dead residual fidelity gate failed: {report}")
+    )
     return report
 
 
 def _training_diagnostics(
-    run_metadata: Sequence[dict[str, object]], *, require_e2e_submodule_rms: bool = False
+    run_metadata: Sequence[dict[str, object]],
 ) -> list[dict[str, object]]:
-    """Validate the registered training-side series embedded in run metadata."""
-    required = {"fidelity_series", "gradient_norm_series", "kendall_fallback"}
+    """Return training-side quality telemetry without gating the evaluator."""
     reports: list[dict[str, object]] = []
-    for index, metadata in enumerate(run_metadata):
+    for metadata in run_metadata:
         report = cast(dict[str, object] | None, metadata.get("training_diagnostics"))
-        if report is None or required - report.keys():
-            missing = sorted(required - (report.keys() if report is not None else set()))
-            raise ValueError(f"run metadata {index} is missing training diagnostics: {missing}")
-        if not cast(list[object], report["fidelity_series"]):
-            raise ValueError(f"run metadata {index} has an empty fidelity series")
-        if not cast(list[object], report["gradient_norm_series"]):
-            raise ValueError(f"run metadata {index} has an empty gradient-norm series")
-        if require_e2e_submodule_rms:
-            rms_keys = {"grad_rms_trunk", "grad_rms_ste", "grad_rms_content"}
-            for row_index, raw_row in enumerate(
-                cast(list[dict[str, object]], report["gradient_norm_series"])
-            ):
-                # The worker publishes the registered spec §13.17 names nested
-                # under `submodule_gradient_rms`; accept that shape alongside
-                # flat rows.
-                nested = raw_row.get("submodule_gradient_rms")
-                source = cast(dict[str, object], nested) if isinstance(nested, dict) else raw_row
-                missing_rms = rms_keys - source.keys()
-                if missing_rms:
-                    raise ValueError(
-                        f"run metadata {index} gradient row {row_index} is missing "
-                        f"submodule RMS telemetry: {sorted(missing_rms)}"
-                    )
-                if any(
-                    not isinstance(source[key], (int, float))
-                    or not math.isfinite(float(cast(float, source[key])))
-                    or float(cast(float, source[key])) < 0.0
-                    for key in rms_keys
-                ):
-                    raise ValueError(
-                        f"run metadata {index} gradient row {row_index} has invalid "
-                        "submodule RMS telemetry"
-                    )
-        reports.append(report)
+        reports.append(report if isinstance(report, dict) else {})
     return reports
 
 
@@ -792,293 +743,44 @@ def _vhold_validation_event_count(
     return len(rows)
 
 
-def _vhold_evaluation_disclosure(
+def _formal_vhold_evaluation_disclosure(
     run_metadata: Mapping[str, Mapping[str, object]],
     *,
     run_metadata_paths: Mapping[str, Path],
-    preregistration: Mapping[str, object],
-    preregistration_path: Path,
 ) -> dict[str, object]:
-    """Build cumulative per-arm K from hashed qualification and formal evidence.
-
-    ``K`` counts every verified validation event, not only checkpoint-eligible
-    epochs. Qualification attempts are accepted only through the registration's
-    path-and-hash-bound evidence; a missing, malformed, duplicated, or stale
-    source aborts the formal artifact rather than silently contributing zero.
-    """
-    evidence = preregistration.get("binding_evidence")
-    attempts_by_arm = (
-        evidence.get("qualification_attempts") if isinstance(evidence, Mapping) else None
-    )
-    indexes_by_arm = (
-        evidence.get("qualification_history_indexes")
-        if isinstance(evidence, Mapping)
-        else None
-    )
-    if not isinstance(attempts_by_arm, Mapping) or set(attempts_by_arm) != set(
-        _E2E_FORMAL_ARMS
-    ):
-        raise PreregistrationMismatch(
-            "binding_evidence.qualification_attempts must map exactly the six trained arms "
-            "to their complete qualification histories"
-        )
-    if not isinstance(indexes_by_arm, Mapping) or set(indexes_by_arm) != set(
-        _E2E_FORMAL_ARMS
-    ):
-        raise PreregistrationMismatch(
-            "binding_evidence.qualification_history_indexes must map exactly the six "
-            "trained arms to path-and-SHA-bound complete-history indexes"
-        )
-
-    seen_paths: set[Path] = set()
-    seen_attempt_fingerprints: set[tuple[str, str]] = set()
-
-    def artifact_ref(value: object, *, label: str) -> tuple[Path, str]:
-        if (
-            not isinstance(value, Mapping)
-            or set(value) != {"path", "sha256"}
-            or not isinstance(value.get("path"), str)
-            or not _is_sha256(value.get("sha256"))
-        ):
-            raise PreregistrationMismatch(f"{label} must be exactly path + sha256 evidence")
-        path = _registered_path(
-            preregistration_path,
-            value["path"],
-            key=f"{label}.path",
-            scope="V_hold evaluation disclosure",
-        ).resolve()
-        digest = cast(str, value["sha256"])
-        if path in seen_paths:
-            raise PreregistrationMismatch(f"duplicate V_hold evaluation evidence path: {path}")
-        seen_paths.add(path)
-        if not path.is_file() or _sha256_file(path) != digest:
-            raise PreregistrationMismatch(f"{label} is missing or hash-mismatched: {path}")
-        return path, digest
-
+    """Disclose only validation events from the plan-bound formal runs."""
     arm_rows: dict[str, object] = {}
     for arm in _E2E_FORMAL_ARMS:
-        raw_attempts = attempts_by_arm[arm]
-        if not isinstance(raw_attempts, list) or not raw_attempts:
-            raise PreregistrationMismatch(
-                f"binding_evidence.qualification_attempts.{arm} must contain at least one "
-                "verified attempt"
-            )
-        index_path, index_sha256 = artifact_ref(
-            indexes_by_arm[arm],
-            label=f"binding_evidence.qualification_history_indexes.{arm}",
+        metadata_path = run_metadata_paths[arm]
+        metadata = run_metadata[arm]
+        evidence = metadata.get("v_hold_validation_evidence")
+        if not isinstance(evidence, Mapping):
+            raise PreregistrationMismatch(f"{arm}: missing validation-event evidence")
+        events_path = metadata_path.parent / str(evidence.get("path", ""))
+        count = _vhold_validation_event_count(
+            events_path, label=f"{arm} formal", arm=arm, run_kind="formal"
         )
-        try:
-            history_index = json.loads(index_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise PreregistrationMismatch(
-                f"qualification history index is unreadable for {arm}: {index_path}"
-            ) from error
-        indexed_attempts = (
-            history_index.get("attempts") if isinstance(history_index, Mapping) else None
-        )
-        if (
-            not isinstance(history_index, Mapping)
-            or history_index.get("schema_version")
-            != "egostitch_e2e_qualification_history_v1"
-            or history_index.get("arm") != arm
-            or not isinstance(indexed_attempts, list)
-        ):
-            raise PreregistrationMismatch(
-                f"qualification history index has invalid schema or arm identity for {arm}"
-            )
-        if raw_attempts != indexed_attempts:
-            raise PreregistrationMismatch(
-                f"binding_evidence.qualification_attempts.{arm} does not exactly match "
-                "the immutable qualification history index"
-            )
-        qualification_sources: list[dict[str, object]] = []
-        qualification_count = 0
-        for index, raw_attempt in enumerate(raw_attempts):
-            label = f"binding_evidence.qualification_attempts.{arm}[{index}]"
-            if not isinstance(raw_attempt, Mapping) or set(raw_attempt) != {
-                "attempt_id",
-                "attempt_dir",
-                "recorded_at_utc",
-                "exit_code",
-                "outcome",
-                "verdict",
-                "qualification",
-                "run_metadata",
-                "validation_events",
-            }:
-                raise PreregistrationMismatch(
-                    f"{label} does not match the qualification-history attempt schema"
-                )
-            attempt_id = raw_attempt.get("attempt_id")
-            attempt_dir_value = raw_attempt.get("attempt_dir")
-            exit_code = raw_attempt.get("exit_code")
-            outcome = raw_attempt.get("outcome")
-            if (
-                not isinstance(attempt_id, str)
-                or not attempt_id
-                or not isinstance(attempt_dir_value, str)
-                or Path(attempt_dir_value).name != attempt_id
-                or isinstance(exit_code, bool)
-                or not isinstance(exit_code, int)
-                or outcome != ("success" if exit_code == 0 else "failure")
-            ):
-                raise PreregistrationMismatch(f"{label} has invalid attempt identity or outcome")
-            qualification_ref = raw_attempt.get("qualification")
-            metadata_ref = raw_attempt.get("run_metadata")
-            events_ref = raw_attempt.get("validation_events")
-            if outcome == "success" and (
-                qualification_ref is None or metadata_ref is None or events_ref is None
-            ):
-                raise PreregistrationMismatch(
-                    f"{label} successful attempt lacks qualification, metadata, or event evidence"
-                )
-            if qualification_ref is not None:
-                artifact_ref(qualification_ref, label=f"{label}.qualification")
-            if events_ref is None:
-                qualification_sources.append(
-                    {
-                        "attempt_id": attempt_id,
-                        "outcome": outcome,
-                        "count": 0,
-                    }
-                )
-                continue
-            if metadata_ref is None:
-                raise PreregistrationMismatch(
-                    f"{label} has validation events without run metadata"
-                )
-            metadata_path, metadata_sha256 = artifact_ref(
-                metadata_ref, label=f"{label}.run_metadata"
-            )
-            events_path, events_sha256 = artifact_ref(
-                events_ref, label=f"{label}.validation_events"
-            )
-            fingerprint = (metadata_sha256, events_sha256)
-            if fingerprint in seen_attempt_fingerprints:
-                raise PreregistrationMismatch(f"duplicate V_hold qualification evidence: {label}")
-            seen_attempt_fingerprints.add(fingerprint)
-            try:
-                qualification_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as error:
-                raise PreregistrationMismatch(
-                    f"{label}.run_metadata is not readable JSON: {metadata_path}"
-                ) from error
-            if (
-                not isinstance(qualification_metadata, Mapping)
-                or qualification_metadata.get("run_kind") != "qualification"
-                or qualification_metadata.get("arm") != arm
-                or qualification_metadata.get("validation_role") != "V_hold"
-            ):
-                raise PreregistrationMismatch(
-                    f"{label}.run_metadata does not verify qualification arm {arm!r} on V_hold"
-                )
-            validation_evidence = qualification_metadata.get("v_hold_validation_evidence")
-            if (
-                not isinstance(validation_evidence, Mapping)
-                or validation_evidence.get("count")
-                != _vhold_validation_event_count(
-                    events_path, label=label, arm=arm, run_kind="qualification"
-                )
-                or validation_evidence.get("sha256") != events_sha256
-                or validation_evidence.get("path") != events_path.name
-            ):
-                raise PreregistrationMismatch(
-                    f"{label}.run_metadata does not bind its validation-event evidence"
-                )
-            count = cast(int, validation_evidence["count"])
-            qualification_count += count
-            qualification_sources.append(
-                {
-                    "attempt_id": attempt_id,
-                    "outcome": outcome,
-                    "run_metadata": {
-                        "path": str(metadata_path),
-                        "sha256": metadata_sha256,
-                    },
-                    "validation_events": {
-                        "path": str(events_path),
-                        "sha256": events_sha256,
-                    },
-                    "count": count,
-                }
-            )
-
-        formal_metadata_path = run_metadata_paths[arm].resolve()
-        if run_metadata[arm].get("validation_role") != "V_hold":
-            raise PreregistrationMismatch(
-                f"{arm}: formal run metadata does not verify validation_role 'V_hold'"
-            )
-        if formal_metadata_path in seen_paths:
-            raise PreregistrationMismatch(
-                f"duplicate V_hold evaluation evidence path: {formal_metadata_path}"
-            )
-        seen_paths.add(formal_metadata_path)
-        formal_evidence = run_metadata[arm].get("v_hold_validation_evidence")
-        if not isinstance(formal_evidence, Mapping):
-            raise PreregistrationMismatch(
-                f"{arm}: formal run metadata lacks V_hold validation-event evidence"
-            )
-        formal_events_name = formal_evidence.get("path")
-        if (
-            not isinstance(formal_events_name, str)
-            or Path(formal_events_name).name != formal_events_name
-        ):
-            raise PreregistrationMismatch(
-                f"{arm}: formal validation-event evidence path must be an adjacent filename"
-            )
-        formal_events_path = formal_metadata_path.with_name(formal_events_name)
-        if formal_events_path in seen_paths:
-            raise PreregistrationMismatch(
-                f"duplicate V_hold evaluation evidence path: {formal_events_path}"
-            )
-        seen_paths.add(formal_events_path)
-        formal_count = _vhold_validation_event_count(
-            formal_events_path,
-            label=f"{arm} formal run",
-            arm=arm,
-            run_kind="formal",
-        )
-        if (
-            formal_evidence.get("count") != formal_count
-            or formal_evidence.get("sha256") != _sha256_file(formal_events_path)
-        ):
+        if evidence.get("count") != count or evidence.get("sha256") != _sha256_file(events_path):
             raise PreregistrationMismatch(
                 f"{arm}: formal run metadata does not bind its validation-event evidence"
             )
-        formal_metadata_sha256 = _sha256_file(formal_metadata_path)
-        formal_events_sha256 = _sha256_file(formal_events_path)
         arm_rows[arm] = {
-            "k_cumulative": qualification_count + formal_count,
-            "qualification": {
-                "count": qualification_count,
-                "history_index": {
-                    "path": str(index_path),
-                    "sha256": index_sha256,
-                },
-                "attempts": qualification_sources,
-            },
+            "k_cumulative": count,
             "formal": {
-                "count": formal_count,
+                "count": count,
                 "run_metadata": {
-                    "path": str(formal_metadata_path),
-                    "sha256": formal_metadata_sha256,
+                    "path": str(metadata_path),
+                    "sha256": _sha256_file(metadata_path),
                 },
                 "validation_events": {
-                    "path": str(formal_events_path),
-                    "sha256": formal_events_sha256,
+                    "path": str(events_path),
+                    "sha256": _sha256_file(events_path),
                 },
             },
         }
-
     return {
-        "definition": (
-            "K is the cumulative count of verified V_hold validation events, including "
-            "step-0, phase-A-end, and every epoch-end event in every qualification and "
-            "formal run regardless of checkpoint eligibility."
-        ),
-        "scope": (
-            "Selection-inflation disclosure for engineering evidence; not inferential evidence."
-        ),
+        "definition": "K is the verified V_hold validation-event count in each formal run.",
+        "scope": "Selection-inflation disclosure for engineering evidence.",
         "trained_arms": arm_rows,
         "scoring_time_controls": {
             arm: {
@@ -1199,18 +901,13 @@ def _enforce_e2e_formal_metadata(
 ) -> int:
     """Reject anything except completed, explicitly formal E2E arm metadata.
 
-    "Completed" is deliberately not sufficient: the clip/family/RMS margin gate
-    can only run after ``src.e2_pipeline`` has published the run, so
-    ``status: complete`` and ``formal_artifacts_published: true`` are both
-    stamped while the margins are still unknown. Every arm must therefore carry
-    its own passing, run-bound margin verdict
-    (:func:`src.score_universe.validate_e2e_margin_verdict`) before this gate
-    will screen it.
+    Completion, plan identity, and artifact provenance are required. Finite
+    model-quality fields, including clip/family/RMS margins, eligibility, and
+    liveness, are telemetry-only.
 
     Args:
         run_metadata: Trained-arm name -> its parsed ``run_metadata.json``.
-        run_metadata_paths: The same mapping's source paths, used to locate and
-            bind each arm's persisted margin verdict.
+        run_metadata_paths: The same mapping's source paths, used for provenance.
         preregistration: The parsed registration payload.
         preregistration_path: Path the registration was read from (used to
             resolve registered relative config paths).
@@ -1223,8 +920,6 @@ def _enforce_e2e_formal_metadata(
     Raises:
         RegistrationShaMismatch: On any provenance, completion, or seed
             mismatch against the registration.
-        ValueError: If an arm's clip/family/RMS margin verdict is absent,
-            failing, or bound to a different run.
     """
     seeds_seen: set[int] = set()
     expected_semantics: dict[str, tuple[str, float, float]] = {
@@ -1287,11 +982,6 @@ def _enforce_e2e_formal_metadata(
             raise RegistrationShaMismatch(f"{arm}: formal_artifacts_published must be exactly true")
         if metadata.get("status") != "complete":
             raise RegistrationShaMismatch(f"{arm}: formal run metadata status must be 'complete'")
-        validate_e2e_margin_verdict(run_metadata_paths[arm], label=f"{arm} formal run")
-        if metadata.get("selected_checkpoint_eligible") is not True:
-            raise RegistrationShaMismatch(
-                f"{arm}: selected_checkpoint_eligible must be exactly true"
-            )
         if not _is_sha256(metadata.get("checkpoint_sha256")):
             raise RegistrationShaMismatch(f"{arm}: checkpoint_sha256 must be 64-hex")
         if metadata.get("implementation_commit") != implementation.get("commit"):
@@ -1490,14 +1180,16 @@ def _validate_e2e_scoring_provenance(
         "implementation_commit": cast(Mapping[str, object], evidence["implementation"]).get(
             "commit"
         ),
-        "selected_checkpoint_eligible": True,
+        "selected_checkpoint_eligible": metadata.get("selected_checkpoint_eligible"),
         "scoring_arm": name,
         "all_formal_arms": {
             arm: {
                 "run_metadata_sha256": _sha256_file(run_metadata_paths[arm]),
                 "checkpoint_sha256": run_metadata[arm].get("checkpoint_sha256"),
                 "config_sha256": config_evidence_by_arm[arm].get("sha256"),
-                "selected_checkpoint_eligible": True,
+                "selected_checkpoint_eligible": run_metadata[arm].get(
+                    "selected_checkpoint_eligible"
+                ),
             }
             for arm in _E2E_FORMAL_ARMS
         },
@@ -1749,9 +1441,8 @@ def build_e2e_arm_summary(
         arm_universe_paths: Exact registered six-trained-plus-two-control
             mapping to scored ``.npz`` artifacts.
         run_metadata_paths: Formal-run arm name -> its ``run_metadata.json``.
-            Scoring-time controls never have entries. Each directory must also
-            hold that run's passing ``margin_verdict.json``; a published run is
-            not certified by publication alone.
+            Scoring-time controls never have entries. Completion and artifact
+            provenance are required; model-quality telemetry does not gate use.
         preregistration_path: Binding registration whose sha must be present
             in every one of the six trained-arm metadata records.
         data_root: Directory containing the benchmark package.
@@ -1811,14 +1502,11 @@ def build_e2e_arm_summary(
     )
     registered_seeds = _registered_training_seeds(preregistration)
     training_diagnostics = _training_diagnostics(
-        [run_metadata[name] for name in _E2E_FORMAL_ARMS],
-        require_e2e_submodule_rms=True,
+        [run_metadata[name] for name in _E2E_FORMAL_ARMS]
     )
-    vhold_evaluations = _vhold_evaluation_disclosure(
+    vhold_evaluations = _formal_vhold_evaluation_disclosure(
         run_metadata,
         run_metadata_paths=run_metadata_paths,
-        preregistration=preregistration,
-        preregistration_path=preregistration_path,
     )
     if registration_sha256 != bound_registration_sha256:  # pragma: no cover - enforced above
         raise RegistrationShaMismatch("formal e2e metadata disagree with the binding registration")

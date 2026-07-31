@@ -1181,38 +1181,17 @@ def _validate_binding_artifact_digests(
         "configs",
         "parameter_group_manifests",
         "packs_and_validation_manifests",
-        "qualification_attempts",
         "boundary_access_audit",
         "runtime_and_peak_memory",
     ):
         _validate_digest_section(
             evidence.get(section), label=section, registration_path=registration_path
         )
-    if evidence.get("schema_version") == _EGOSTITCH_E2E_BINDING_SCHEMA_V2:
-        _validate_digest_section(
-            evidence.get("qualification_history_indexes"),
-            label="qualification_history_indexes",
-            registration_path=registration_path,
-        )
-        calibration = evidence.get("auprc_tolerance_calibration")
-        if not isinstance(calibration, Mapping) or set(calibration) != {"path", "sha256"}:
-            raise ValueError(
-                "binding_evidence.auprc_tolerance_calibration must contain exactly path and sha256"
-            )
-        _validate_digest_section(
-            calibration,
-            label="auprc_tolerance_calibration",
-            registration_path=registration_path,
-        )
 
 
 def _preflight_binding_artifacts_before_pair_access(registration_path: Path) -> None:
     """Fail closed on binding artifacts without opening a candidate/test pair source."""
-    from src.experiments.auprc_tolerance import (
-        BINDING_SCHEMA_V1,
-        binding_schema_for_registration,
-        validate_bound_calibration,
-    )
+    from src.experiments.e2e_binding import binding_schema_for_registration
 
     registration = _load_json_object(registration_path, label="registration")
     if registration.get("status") != "BINDING":
@@ -1222,10 +1201,8 @@ def _preflight_binding_artifacts_before_pair_access(registration_path: Path) -> 
     evidence = registration.get("binding_evidence")
     if not isinstance(evidence, dict):
         raise ValueError("registration binding_evidence must be an object")
-    schema = binding_schema_for_registration(registration)
+    binding_schema_for_registration(registration)
     _validate_binding_artifact_digests(evidence, registration_path=registration_path)
-    if schema != BINDING_SCHEMA_V1:
-        validate_bound_calibration(registration, registration_path)
 
 
 def _load_json_object(path: Path, *, label: str) -> dict[str, object]:
@@ -1237,73 +1214,6 @@ def _load_json_object(path: Path, *, label: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError(f"{label} {path} must contain a JSON object")
     return cast(dict[str, object], value)
-
-
-E2E_MARGIN_VERDICT_FILENAME = "margin_verdict.json"
-E2E_RUN_PROFILE_FILENAME = "profile.json"
-
-
-def validate_e2e_margin_verdict(run_metadata_path: Path, *, label: str) -> str:
-    """Require the run's persisted clip/family/RMS margin verdict, bound to it.
-
-    ``validate_e2e_qualification_profile`` is the repository's only clip-
-    coefficient / family-ratio / submodule-RMS margin gate, and it can only run
-    after ``src.e2_pipeline`` has published the run -- by which point
-    ``run_metadata.json`` already reads ``status: complete`` and
-    ``formal_artifacts_published: true``. Completion therefore carries no margin
-    evidence at all, and every consumer of a formal E2E run has to demand the
-    verdict itself rather than infer it from publication. This is that single
-    demand; ``hpc/qualification.sh``, formal scoring and the G5 gate all route
-    through it so the rule has one definition.
-
-    The verdict is refused unless it is bound to the exact run it describes:
-    ``run_metadata_sha256`` pins the metadata record the caller is consuming and
-    ``profile_sha256`` pins the ``profile.json`` the margins were computed from,
-    so a verdict left behind by an earlier run in the same output directory
-    cannot stand in for this one.
-
-    Args:
-        run_metadata_path: The formal run's ``run_metadata.json``. The verdict
-            and the profile are read from its directory, which is the layout
-            ``_publish_staged`` produces.
-        label: Human-readable prefix for the refusal messages.
-
-    Returns:
-        The verdict file's SHA-256.
-
-    Raises:
-        ValueError: If the verdict is absent, unreadable, not ``pass``, or bound
-            to a different run than `run_metadata_path`.
-    """
-    run_dir = run_metadata_path.parent
-    verdict_path = run_dir / E2E_MARGIN_VERDICT_FILENAME
-    if not verdict_path.is_file():
-        raise ValueError(
-            f"{label}: no clip/family/RMS margin verdict at {verdict_path}; a completed "
-            "formal run is not certified until its margins have been validated"
-        )
-    verdict = _load_json_object(verdict_path, label=f"{label} margin verdict")
-    status = verdict.get("status")
-    if status != "pass":
-        raise ValueError(
-            f"{label}: clip/family/RMS margin verdict is {status!r}, not 'pass': {verdict_path}"
-        )
-    profile_path = run_dir / E2E_RUN_PROFILE_FILENAME
-    if not profile_path.is_file():
-        raise ValueError(
-            f"{label}: margin verdict cannot be bound to a run without {profile_path}"
-        )
-    for key, bound_path in (
-        ("profile_sha256", profile_path),
-        ("run_metadata_sha256", run_metadata_path),
-    ):
-        expected = _file_sha256(bound_path)
-        if verdict.get(key) != expected:
-            raise ValueError(
-                f"{label}: margin verdict {key} does not describe this run: "
-                f"{verdict.get(key)!r} != {expected!r} ({bound_path})"
-            )
-    return _file_sha256(verdict_path)
 
 
 def _validate_e2e_scoring_provenance(
@@ -1320,11 +1230,10 @@ def _validate_e2e_scoring_provenance(
     failure therefore occurs before either manifest is opened and before an
     output artifact can be created.
     """
-    from src.experiments.auprc_tolerance import (
+    from src.experiments.e2e_binding import (
         BINDING_SCHEMA_V1,
         HISTORICAL_V1_ARMS,
         binding_schema_for_registration,
-        validate_bound_calibration,
     )
 
     registration = _load_json_object(registration_path, label="registration")
@@ -1397,8 +1306,6 @@ def _validate_e2e_scoring_provenance(
             )
     if validate_binding_artifacts:
         _validate_binding_artifact_digests(evidence, registration_path=registration_path)
-        if schema != BINDING_SCHEMA_V1:
-            validate_bound_calibration(registration, registration_path)
     policy_version = evidence.get("checkpoint_policy_version")
     if not isinstance(policy_version, str) or not policy_version:
         raise ValueError("binding_evidence.checkpoint_policy_version must be a non-empty string")
@@ -1411,15 +1318,8 @@ def _validate_e2e_scoring_provenance(
         or metadata.get("formal_artifacts_published") is not True
     ):
         raise ValueError("egostitch_e2e scoring requires a complete formal run")
-    if metadata.get("selected_checkpoint_eligible") is not True:
-        raise ValueError("egostitch_e2e scoring requires an eligible selected checkpoint")
     if metadata.get("model_family") != "egostitch_e2e":
         raise ValueError("run metadata model_family must be 'egostitch_e2e'")
-    # `status: complete` is stamped before the margin gate can run, so it is not
-    # evidence that this run's clip/family/RMS margins held. Held-out scoring of
-    # an uncertified -- or a certified-failing -- run is refused here, before any
-    # candidate/test manifest is opened.
-    validate_e2e_margin_verdict(run_metadata_path, label="egostitch_e2e scoring")
 
     arm = metadata.get("arm")
     if arm not in formal_arms:
@@ -1488,7 +1388,7 @@ def _validate_e2e_scoring_provenance(
         "config_sha256": config_sha256,
         "checkpoint_sha256": checkpoint_sha256,
         "implementation_commit": implementation_commit,
-        "selected_checkpoint_eligible": True,
+        "selected_checkpoint_eligible": metadata.get("selected_checkpoint_eligible"),
     }
 
 
@@ -2581,7 +2481,9 @@ def _run_score(args: argparse.Namespace) -> None:
                     "run_metadata_sha256": provenance["run_metadata_sha256"],
                     "checkpoint_sha256": provenance["checkpoint_sha256"],
                     "config_sha256": provenance["config_sha256"],
-                    "selected_checkpoint_eligible": True,
+                    "selected_checkpoint_eligible": provenance.get(
+                        "selected_checkpoint_eligible"
+                    ),
                 }
                 for arm, provenance in provenances.items()
             },

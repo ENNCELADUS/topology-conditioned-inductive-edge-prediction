@@ -184,7 +184,7 @@ def _toy_config(output_dir: Path, pack_dir: Path) -> te.EgoConfig:
         mixed_precision="no",
         preregistration=prereg,
         training=te.EgoStitchTrainingConfig(),
-        run_kind="qualification",
+        run_kind="formal",
     )
 
 

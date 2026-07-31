@@ -15,39 +15,9 @@ from src import score_universe
 from src.experiments import g5_stage1
 from src.model.egostitch.e2e_model import EgoStitchE2E
 
-from tests._auprc_binding_fixture import bind_active_v4_calibration
-
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _write_margin_verdict(metadata_path: Path, *, status: str = "pass") -> Path:
-    """Write the run-bound margin verdict `hpc/qualification.sh` persists.
-
-    The clip/family/RMS gate can only run once ``src.e2_pipeline`` has published
-    the run, so ``status: complete`` / ``formal_artifacts_published: true`` are
-    already stamped while the margins are unknown. Scoring therefore demands the
-    verdict itself, bound to this run's ``profile.json`` and metadata.
-    """
-    run_dir = metadata_path.parent
-    profile_path = run_dir / "profile.json"
-    if not profile_path.is_file():
-        profile_path.write_text(
-            json.dumps({"fixture_profile_for": run_dir.name}), encoding="utf-8"
-        )
-    verdict_path = run_dir / "margin_verdict.json"
-    verdict_path.write_text(
-        json.dumps(
-            {
-                "status": status,
-                "profile_sha256": _sha256(profile_path),
-                "run_metadata_sha256": _sha256(metadata_path),
-            }
-        ),
-        encoding="utf-8",
-    )
-    return verdict_path
 
 
 def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
@@ -71,6 +41,7 @@ def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     evidence_artifact.write_text('{"qualified": true}\n', encoding="utf-8")
     digest_record = {"path": str(evidence_artifact), "sha256": _sha256(evidence_artifact)}
     registration = {
+        "registration_id": "g5-e2e-stage1-20260729-two-stage-ladder-screen-v4-draft",
         "status": "BINDING",
         "arms": {
             **{
@@ -119,7 +90,7 @@ def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
             },
         },
         "binding_evidence": {
-            "schema_version": "egostitch_e2e_binding_evidence_v1",
+            "schema_version": "egostitch_e2e_binding_evidence_v2",
             "implementation": {"commit": "a" * 40},
             "configs": {
                 arm: {"path": str(path), "sha256": _sha256(path)}
@@ -127,16 +98,12 @@ def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
             },
             "parameter_group_manifests": digest_record,
             "packs_and_validation_manifests": digest_record,
-            "qualification_attempts": [digest_record],
             "boundary_access_audit": digest_record,
             "runtime_and_peak_memory": digest_record,
             "checkpoint_policy_version": "v2",
         },
     }
     registration_path = tmp_path / "registration.json"
-    bind_active_v4_calibration(
-        registration, registration_path, config_paths=configs, tolerance=0.02
-    )
     registration_path.write_text(json.dumps(registration), encoding="utf-8")
     checkpoint_id = "0123456789abcdef"
     metadata = {
@@ -163,7 +130,6 @@ def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     }
     metadata_path = tmp_path / "run_metadata.json"
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
-    _write_margin_verdict(metadata_path)
     return registration_path, metadata_path, checkpoint, checkpoint_id
 
 
@@ -212,7 +178,6 @@ def _write_all_e2e_provenance(
             ),
             encoding="utf-8",
         )
-        _write_margin_verdict(metadata_path)
         metadata_paths[arm] = metadata_path
         checkpoint_paths[arm] = checkpoint_path
         checkpoint_ids[arm] = checkpoint_id
@@ -519,14 +484,14 @@ def test_e2e_formal_scoring_provenance_accepts_exact_active_v2_binding(tmp_path:
     assert provenance["selected_checkpoint_eligible"] is True
 
 
-def test_e2e_formal_scoring_provenance_revalidates_exact_v2_calibration(tmp_path: Path) -> None:
+def test_scoring_accepts_quality_telemetry_miss_without_margin_verdict(tmp_path: Path) -> None:
     registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
-    payload = json.loads(registration.read_text(encoding="utf-8"))
-    registration.write_text(json.dumps(payload), encoding="utf-8")
     run = json.loads(metadata.read_text(encoding="utf-8"))
-    run["preregistration_sha256"] = _sha256(registration)
+    run["selected_checkpoint_eligible"] = False
+    run["validation_liveness_pass"] = False
+    run["quality_fields_policy"] = "telemetry_only"
     metadata.write_text(json.dumps(run), encoding="utf-8")
-    _write_margin_verdict(metadata)
+    (metadata.parent / "margin_verdict.json").unlink(missing_ok=True)
 
     provenance = score_universe._validate_e2e_scoring_provenance(
         registration_path=registration,
@@ -535,69 +500,24 @@ def test_e2e_formal_scoring_provenance_revalidates_exact_v2_calibration(tmp_path
         checkpoint_id=checkpoint_id,
     )
 
-    assert provenance["registration_sha256"] == _sha256(registration)
+    assert provenance["selected_checkpoint_eligible"] is False
 
 
-@pytest.mark.parametrize("invalid_calibration", ["missing", "null", "mismatch"])
-def test_v2_calibration_rejection_precedes_heldout_pair_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid_calibration: str
-) -> None:
-    registration, metadata_paths, checkpoint_paths, checkpoint_ids = _write_all_e2e_provenance(
-        tmp_path
-    )
+def test_e2e_formal_scoring_provenance_revalidates_registration_digest(tmp_path: Path) -> None:
+    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
     payload = json.loads(registration.read_text(encoding="utf-8"))
-    evidence = payload["binding_evidence"]
-    if invalid_calibration == "missing":
-        evidence.pop("auprc_tolerance_calibration")
-    elif invalid_calibration == "null":
-        evidence["auprc_tolerance_calibration"] = None
-    elif invalid_calibration == "mismatch":
-        calibration_path = Path(evidence["auprc_tolerance_calibration"]["path"])
-        evidence["auprc_tolerance_calibration"] = {
-            "path": str(calibration_path),
-            "sha256": "f" * 64,
-        }
     registration.write_text(json.dumps(payload), encoding="utf-8")
-    for metadata in metadata_paths.values():
-        run = json.loads(metadata.read_text(encoding="utf-8"))
-        run["preregistration_sha256"] = _sha256(registration)
-        metadata.write_text(json.dumps(run), encoding="utf-8")
-
-    monkeypatch.setattr(
-        score_universe,
-        "_load_checkpoint",
-        lambda *_args, **_kwargs: (
-            torch.nn.Linear(1, 1),
-            "egostitch_e2e",
-            checkpoint_ids["full"],
-        ),
+    run = json.loads(metadata.read_text(encoding="utf-8"))
+    run["preregistration_sha256"] = _sha256(registration)
+    metadata.write_text(json.dumps(run), encoding="utf-8")
+    provenance = score_universe._validate_e2e_scoring_provenance(
+        registration_path=registration,
+        run_metadata_path=metadata,
+        checkpoint_path=checkpoint,
+        checkpoint_id=checkpoint_id,
     )
 
-    def forbidden_pair_read(*_args: object, **_kwargs: object) -> tuple[object, object]:
-        raise AssertionError("held-out pairs were read before calibration validation")
-
-    monkeypatch.setattr(score_universe, "_resolve_pairs", forbidden_pair_read)
-    cli = [
-        "score",
-        "--checkpoint",
-        str(checkpoint_paths["full"]),
-        "--pairs",
-        "candidate",
-        "--output",
-        str(tmp_path / "forbidden-v2.npz"),
-        "--preregistration",
-        str(registration),
-    ]
-    for arm, metadata in metadata_paths.items():
-        cli.extend(["--arm-run-metadata", f"{arm}={metadata}"])
-
-    message = (
-        "auprc_tolerance_calibration.*exactly path and sha256"
-        if invalid_calibration != "mismatch"
-        else "auprc_tolerance_calibration.*digest verification failed"
-    )
-    with pytest.raises(ValueError, match=message):
-        score_universe.main(cli)
+    assert provenance["registration_sha256"] == _sha256(registration)
 
 
 def test_e2e_formal_scoring_rejects_missing_binding_evidence(tmp_path: Path) -> None:
@@ -626,9 +546,7 @@ def test_e2e_formal_scoring_rejects_missing_binding_evidence(tmp_path: Path) -> 
 def test_e2e_formal_scoring_rejects_binding_evidence_digest_mismatch(tmp_path: Path) -> None:
     registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
     payload = json.loads(registration.read_text(encoding="utf-8"))
-    evidence = payload["binding_evidence"]["qualification_attempts"]["full"][0][
-        "qualification"
-    ]
+    evidence = payload["binding_evidence"]["boundary_access_audit"]
     evidence["sha256"] = "2" * 64
     registration.write_text(json.dumps(payload), encoding="utf-8")
     run = json.loads(metadata.read_text(encoding="utf-8"))
@@ -638,7 +556,7 @@ def test_e2e_formal_scoring_rejects_binding_evidence_digest_mismatch(tmp_path: P
 
     with pytest.raises(
         ValueError,
-        match=rf"qualification_attempts\.full\[0\]\.qualification.*expected=2{{64}}.*found={found}",
+        match=rf"boundary_access_audit.*expected=2{{64}}.*found={found}",
     ):
         score_universe._validate_e2e_scoring_provenance(
             registration_path=registration,
@@ -906,7 +824,6 @@ def test_e2e_formal_scoring_provenance_rejects_non_v3_arm_packages(
         ("registration", "status", "DRAFT", "status 'BINDING'"),
         ("metadata", "run_kind", "debug", "debug/non-formal"),
         ("metadata", "status", "started", "complete formal"),
-        ("metadata", "selected_checkpoint_eligible", False, "eligible selected"),
         ("metadata", "implementation_commit", "b" * 40, "implementation_commit"),
         ("metadata", "checkpoint_sha256", "b" * 64, "checkpoint_sha256"),
     ],
@@ -928,10 +845,6 @@ def test_e2e_provenance_rejects_invalid_run_before_output(
         run = json.loads(metadata.read_text(encoding="utf-8"))
         run["preregistration_sha256"] = _sha256(registration)
         metadata.write_text(json.dumps(run), encoding="utf-8")
-    # The mutated run still carries a margin verdict of its own, so each refusal
-    # below is attributable to the field under test.
-    _write_margin_verdict(metadata)
-
     monkeypatch.setattr(
         score_universe,
         "_load_checkpoint",
@@ -955,106 +868,6 @@ def test_e2e_provenance_rejects_invalid_run_before_output(
             ]
         )
     assert not output.exists()
-
-
-# --------------------------------------------------- clip/family/RMS margin verdict
-# `src.e2_pipeline` publishes `status: complete` and
-# `formal_artifacts_published: true` before the margin gate is able to run, so a
-# failed arm looks finished. Scoring is one of the two consumers that has to
-# refuse it anyway (the G5 gate is the other).
-
-
-def test_scoring_refuses_a_failing_margin_verdict_before_pair_access(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """One failed arm refuses the whole pass, before a held-out pair is read."""
-    registration, metadata_paths, checkpoint_paths, checkpoint_ids = _write_all_e2e_provenance(
-        tmp_path
-    )
-    _write_margin_verdict(metadata_paths["no_l_rel"], status="fail")
-    monkeypatch.setattr(
-        score_universe,
-        "_load_checkpoint",
-        lambda *_args, **_kwargs: (
-            torch.nn.Linear(1, 1),
-            "egostitch_e2e",
-            checkpoint_ids["full"],
-        ),
-    )
-
-    def forbidden_pair_read(*_args: object, **_kwargs: object) -> tuple[object, object]:
-        raise AssertionError("held-out pairs were read before the margin verdict was checked")
-
-    monkeypatch.setattr(score_universe, "_resolve_pairs", forbidden_pair_read)
-
-    output = tmp_path / "forbidden.npz"
-    cli = [
-        "score",
-        "--checkpoint",
-        str(checkpoint_paths["full"]),
-        "--pairs",
-        "candidate",
-        "--output",
-        str(output),
-        "--preregistration",
-        str(registration),
-    ]
-    for arm, metadata in metadata_paths.items():
-        cli.extend(["--arm-run-metadata", f"{arm}={metadata}"])
-
-    with pytest.raises(ValueError, match=r"margin verdict is 'fail', not 'pass'"):
-        score_universe.main(cli)
-    assert not output.exists()
-
-
-def test_scoring_refuses_a_published_run_with_no_margin_verdict(tmp_path: Path) -> None:
-    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
-    (metadata.parent / "margin_verdict.json").unlink()
-
-    with pytest.raises(ValueError, match="no clip/family/RMS margin verdict"):
-        score_universe._validate_e2e_scoring_provenance(
-            registration_path=registration,
-            run_metadata_path=metadata,
-            checkpoint_path=checkpoint,
-            checkpoint_id=checkpoint_id,
-        )
-
-
-@pytest.mark.parametrize("stale_key", ["profile_sha256", "run_metadata_sha256"])
-def test_scoring_refuses_a_margin_verdict_bound_to_another_run(
-    tmp_path: Path, stale_key: str
-) -> None:
-    """A pass verdict is only usable for the exact run it was computed on."""
-    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
-    verdict_path = metadata.parent / "margin_verdict.json"
-    verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
-    verdict[stale_key] = "0" * 64
-    verdict_path.write_text(json.dumps(verdict), encoding="utf-8")
-
-    with pytest.raises(ValueError, match=rf"margin verdict {stale_key} does not describe this run"):
-        score_universe._validate_e2e_scoring_provenance(
-            registration_path=registration,
-            run_metadata_path=metadata,
-            checkpoint_path=checkpoint,
-            checkpoint_id=checkpoint_id,
-        )
-
-
-def test_margin_verdict_validator_accepts_only_a_run_bound_pass(tmp_path: Path) -> None:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    metadata = run_dir / "run_metadata.json"
-    metadata.write_text(json.dumps({"status": "complete"}), encoding="utf-8")
-    verdict_path = _write_margin_verdict(metadata)
-
-    assert score_universe.validate_e2e_margin_verdict(metadata, label="run") == _sha256(
-        verdict_path
-    )
-
-    # The profile the margins were computed from is part of the binding.
-    (run_dir / "profile.json").unlink()
-    with pytest.raises(ValueError, match="cannot be bound to a run without"):
-        score_universe.validate_e2e_margin_verdict(metadata, label="run")
 
 
 def test_e2e_rejects_required_marker_and_bad_config_digest(tmp_path: Path) -> None:
