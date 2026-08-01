@@ -102,7 +102,7 @@ h2 { margin: 0; font: 600 28px/1.1 var(--serif); letter-spacing: -.02em; }
 .figure-card svg, .workflow svg { display: block; width: 100%; height: auto; }
 .architecture-grid {
   display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(360px, .92fr);
+  grid-template-columns: minmax(0, 1.55fr) minmax(400px, 1fr);
   gap: 22px;
   align-items: start;
 }
@@ -146,16 +146,47 @@ h2 { margin: 0; font: 600 28px/1.1 var(--serif); letter-spacing: -.02em; }
 }
 .loss-box h4 {
   display: flex;
-  justify-content: space-between;
-  gap: 12px;
+  align-items: center;
+  gap: 9px;
   margin: 0;
   color: var(--ink);
   font: 700 10px/1.2 var(--mono);
 }
-.loss-box h4 span { color: var(--ink-3); font-size: 8px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
-.loss-math { margin-top: 4px; color: var(--red); font-size: 11.5px; overflow-x: auto; }
+.loss-box h4 .tap-n {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: var(--red);
+  color: #fff;
+  font: 700 10px/1 var(--mono);
+}
+.loss-box h4 .loss-name { color: var(--ink); font-size: 13px; }
+.loss-box h4 .loss-where {
+  margin-left: auto;
+  text-align: right;
+  color: var(--ink-3);
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.loss-math { margin-top: 5px; color: var(--red); font-size: 11.5px; overflow-x: auto; scrollbar-width: none; }
+.loss-math::-webkit-scrollbar, .loss-terms .t-math::-webkit-scrollbar { display: none; }
 .loss-math mjx-container { margin: 0 !important; }
-.loss-box p { margin: 4px 0 0; color: var(--ink-2); font: 400 11px/1.35 var(--serif); }
+.loss-box p { margin: 5px 0 0; color: var(--ink-2); font: 400 11px/1.35 var(--serif); }
+.loss-terms { margin: 8px 0 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+.loss-terms li {
+  padding-left: 9px;
+  border-left: 2px solid var(--red-line);
+  color: var(--ink-2);
+  font: 400 10.5px/1.35 var(--serif);
+}
+.loss-terms .t-math { display: block; color: var(--red); font-size: 11px; overflow-x: auto; scrollbar-width: none; }
+.loss-terms .t-math mjx-container { margin: 0 !important; }
 .loss-total {
   margin-top: 15px;
   padding: 13px 14px;
@@ -184,8 +215,8 @@ h2 { margin: 0; font: 600 28px/1.1 var(--serif); letter-spacing: -.02em; }
 .swatch.topo { background: var(--blue-soft); border-color: var(--blue-line); }
 .swatch.content { background: var(--amber-soft); border-color: var(--amber-line); }
 .swatch.generated { background: var(--green-soft); border-color: var(--green-line); }
-.swatch.artifact { background: var(--surface-2); border-color: var(--rule-strong); border-style: dashed; }
-.dash { width: 18px; border-top: 2px dashed var(--red); }
+.swatch.artifact { background: #efe9dd; border-color: var(--ink-3); }
+.swatch.tap { background: var(--red); border-color: var(--red); border-radius: 50%; }
 
 .data-flow {
   max-width: 1120px;
@@ -298,6 +329,19 @@ svg .s-white-mono { font-family: var(--mono); font-size: 9px; fill: #dce4e9; }
 svg .s-tiny { font-size: 8.5px; font-weight: 500; fill: var(--ink-3); }
 svg .s-mono-b { font-family: var(--mono); font-size: 9px; font-weight: 700; fill: var(--ink); }
 
+/* Loss taps: the numbered anchor marking where a training loss is computed. */
+svg .tensor { fill: #efe9dd; stroke: var(--ink-3); stroke-width: 1; }
+/* Typeset equations inside the flow figure: real TeX via foreignObject. */
+svg foreignObject { overflow: visible; }
+svg foreignObject div { font-family: var(--serif); }
+svg foreignObject mjx-container { margin: 0 !important; }
+svg foreignObject .eqf { font-size: 14px; line-height: 20px; text-align: center; color: var(--ink); white-space: nowrap; }
+svg foreignObject .dimf { font-size: 10px; line-height: 15px; text-align: center; color: var(--ink-3); white-space: nowrap; }
+svg foreignObject .symf { font-size: 13px; line-height: 17px; text-align: left; color: var(--ink); white-space: nowrap; }
+svg foreignObject .dimlf { font-size: 10px; line-height: 15px; text-align: left; color: var(--ink-3); white-space: nowrap; }
+svg .tap { fill: var(--red); stroke: #fffdf8; stroke-width: 1.6; }
+svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: #fff; text-anchor: middle; }
+
 @media print {
   body { background: white; }
   .poster { width: 1420px; padding: 28px; }
@@ -324,340 +368,289 @@ svg .s-mono-b { font-family: var(--mono); font-size: 9px; font-weight: 700; fill
     <figure class="figure-card">
       <div class="architecture-grid">
         <div class="flow-canvas">
-          <svg viewBox="0 0 860 1920" role="img" aria-labelledby="overview-svg-title overview-svg-desc">
-            <title id="overview-svg-title">EgoStitch inference flow and supervised intermediate outputs</title>
-            <desc id="overview-svg-desc">The inference path occupies the left canvas. Raw endpoint tokens form protein token streams, while pooled endpoint features and grounding candidates form generated slot sets that split into topology and content tokens. These three token streams enter separate, explicitly drawn ports of a light-background conditioned pair trunk. Three shared cross-attention layers process both endpoint directions; at the final layer topology first updates the CLS state, then content cross-attention queries that updated state. A gated readout, symmetric max fusion, and binary head produce the queried-edge probability. Red dashed taps identify the shared module outputs supervised by separate node and edge training batches.</desc>
+          <svg viewBox="0 -76 860 1436" role="img" aria-labelledby="overview-svg-title overview-svg-desc">
+            <title id="overview-svg-title">EgoStitch inference flow as one formal function per block</title>
+            <desc id="overview-svg-desc">A top-to-bottom flow in which every trained block is drawn as a trapezoid carrying its title, one typeset equation, and the dimensions it maps between; the taper of each trapezoid shows whether the block widens or narrows the representation. Between blocks the intermediate tensors are drawn as plain rectangles whose width is proportional to the channel count and whose height is proportional to the token count, so a pooled 1536-vector is a thin wide strip while a 16 by 16 transport plan is a small square. Three inputs open the figure and each names what it holds: raw token embeddings, the pooled node embedding, and the grounding embeddings. Two dashed source panels above the inputs say where the two derived inputs come from. The pooled embedding is frozen F0, defined as the plain arithmetic mean of the same per-token matrix over the token axis, computed in fp32 before the token store is cast to bfloat16 and never fine-tuned. The grounding pool is retrieved rather than learned: the top fifty cosine nearest neighbours of that pooled embedding in frozen F0 space, self excluded, drawn only from the query node’s own split universe. Raw endpoint tokens then run down the left through the shared encoder and three cross-attention layers; pooled features and grounding candidates run down the right through standardization, the shared generator, alignment, stitching, and the two token encoders. The two paths meet in the topology and content CLS updates, the gated readout, the symmetric maximum, and the binary edge head. Numbered red taps one through six mark the block at which each combined training loss on the right rail is computed.</desc>
             <defs>
               <marker id="overview-arrow" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#73818b"/></marker>
               <marker id="overview-arrow-blue" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#2d67a3"/></marker>
               <marker id="overview-arrow-amber" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#a76318"/></marker>
-              <marker id="overview-arrow-red" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#b34f43"/></marker>
             </defs>
 
-            <text class="s-micro" x="20" y="18">INFERENCE PATH · ONE QUERIED PAIR (u, v)</text>
+            <text class="s-micro" x="20" y="-54">INFERENCE PATH · ONE QUERIED PAIR (u, v)</text>
 
-            <!-- Inputs -->
-            <rect class="box" x="20" y="36" width="250" height="92" rx="7"/>
-            <text class="s-label" x="38" y="61">Endpoint token streams</text>
-            <text class="s-mono-b" x="38" y="83">E_u, E_v ∈ R^(L × 1536)</text>
-            <text class="s-small" x="38" y="104">per-token endpoint evidence</text>
+            <!-- Where the grounding pool comes from: a retrieval over the split's own node universe -->
+            <path class="art" d="M548,-70 L850,-70 L850,-12 L548,-12 Z"/>
+            <text class="art-tag" x="562" y="-54">GROUNDING POOL · RETRIEVED, NOT LEARNED</text>
+            <foreignObject x="562" y="-50" width="280" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">every node of the query’s own split universe</div></foreignObject>
+            <foreignObject x="562" y="-34" width="280" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(\mathcal V_{\mathrm{fit}}\) train · \(\mathcal V_{\mathrm{hold}}\) val · test — never mixed</div></foreignObject>
 
-            <rect class="box" x="300" y="36" width="250" height="92" rx="7"/>
-            <text class="s-label" x="318" y="61">Pooled endpoint features</text>
-            <text class="s-mono-b" x="318" y="83">x_u, x_v ∈ R^1536</text>
-            <text class="s-small" x="318" y="104">frozen F0 endpoint summaries</text>
+            <!-- What "frozen F0" actually is: the token-mean of the same per-node matrix -->
+            <path class="art" d="M290,-70 L540,-70 L540,-12 L290,-12 Z"/>
+            <text class="art-tag" x="304" y="-54">FROZEN F0 · MEAN-POOLED, NEVER FINE-TUNED</text>
+            <foreignObject x="304" y="-49" width="230" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf" style="text-align:left">\(x_r=\operatorname{mean}_{t}E_r[t]\)</div></foreignObject>
+            <foreignObject x="304" y="-30" width="230" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">fp32 mean, taken before the bf16 shards</div></foreignObject>
+            <path class="flow" d="M160 56 V-41 H286" marker-end="url(#overview-arrow)"/>
+            <path class="flow" d="M415 -12 V88" marker-end="url(#overview-arrow)"/>
 
-            <rect class="box" x="580" y="36" width="250" height="92" rx="7"/>
-            <text class="s-label" x="598" y="61">Grounding candidates</text>
-            <text class="s-mono-b" x="598" y="83">G_u, G_v ∈ R^(50 × 1536)</text>
-            <text class="s-small" x="598" y="104">real candidates available to each slot</text>
+            <path class="flow" d="M660 -12 V74" marker-end="url(#overview-arrow)"/>
+            <foreignObject x="670" y="8" width="190" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">top-50 cosine neighbours of \(x_r\)</div></foreignObject>
+            <foreignObject x="670" y="23" width="190" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">in frozen F0, self excluded</div></foreignObject>
 
-            <path class="flow" d="M145 128 V160" marker-end="url(#overview-arrow)"/>
-            <path class="flow" d="M425 128 V160" marker-end="url(#overview-arrow)"/>
-            <path class="flow" d="M705 128 V160" marker-end="url(#overview-arrow)"/>
+            <!-- Inputs: tensors, drawn to scale -->
+            <rect class="tensor" x="101" y="56" width="118" height="44"/>
+            <foreignObject x="229" y="64" width="100" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(E_u,\,E_v\)</div></foreignObject>
+            <foreignObject x="229" y="82" width="100" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(L\times1536\)</div></foreignObject>
+            <foreignObject x="229" y="98" width="100" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">raw token embeddings</div></foreignObject>
+
+            <rect class="tensor" x="341" y="94" width="118" height="6"/>
+            <foreignObject x="469" y="64" width="150" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(x_u,\,x_v\)</div></foreignObject>
+            <foreignObject x="469" y="82" width="150" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(1536\)</div></foreignObject>
+            <foreignObject x="469" y="98" width="150" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">mean-pooled · frozen F0</div></foreignObject>
+
+            <rect class="tensor" x="601" y="80" width="118" height="20"/>
+            <foreignObject x="729" y="64" width="125" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(G_u,\,G_v\)</div></foreignObject>
+            <foreignObject x="729" y="82" width="125" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(50\times1536\)</div></foreignObject>
+            <foreignObject x="729" y="98" width="125" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">grounding embeddings</div></foreignObject>
+
+            <path class="flow" d="M160 100 V124" marker-end="url(#overview-arrow)"/>
+            <path class="flow" d="M400 100 V124" marker-end="url(#overview-arrow)"/>
+            <path class="flow" d="M660 100 V124" marker-end="url(#overview-arrow)"/>
 
             <!-- Raw-token branch -->
-            <rect class="box" x="20" y="168" width="250" height="188" rx="7"/>
-            <text class="s-title" x="145" y="196" text-anchor="middle">Siamese endpoint encoder</text>
-            <rect class="sub" x="42" y="216" width="206" height="36" rx="4"/>
-            <text class="s-mono" x="145" y="239" text-anchor="middle">Linear 1536 → 512</text>
-            <path class="flow" d="M145 252 V266" marker-end="url(#overview-arrow)"/>
-            <rect class="sub" x="42" y="270" width="206" height="58" rx="4"/>
-            <text class="s-small" x="145" y="292" text-anchor="middle">3 × Transformer encoder</text>
-            <text class="s-mono" x="145" y="312" text-anchor="middle">8 heads · FFN 2048</text>
-            <text class="s-tiny" x="145" y="345" text-anchor="middle">same weights for u and v</text>
+            <path class="box" d="M20,130 L300,130 L274,216 L46,216 Z"/>
+            <text class="s-title" x="160" y="158" text-anchor="middle">Siamese endpoint encoder</text>
+            <foreignObject x="35" y="170" width="250" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(A_r=\operatorname{Enc}(E_r)\)</div></foreignObject>
+            <foreignObject x="35" y="193" width="250" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(L\times1536\to L\times512\)</div></foreignObject>
 
-            <path class="flow" d="M145 356 V382" marker-end="url(#overview-arrow)"/>
-            <rect class="art" x="20" y="388" width="250" height="78" rx="6"/>
-            <text class="art-tag" x="38" y="409">PROTEIN TOKEN STREAMS</text>
-            <text class="s-mono-b" x="145" y="434" text-anchor="middle">A_u, A_v ∈ R^(L × 512)</text>
-            <text class="s-tiny" x="145" y="452" text-anchor="middle">pair evidence retained token by token</text>
+            <path class="flow" d="M160 216 V222" marker-end="url(#overview-arrow)"/>
+            <rect class="tensor" x="126" y="228" width="68" height="44"/>
+            <foreignObject x="204" y="237" width="116" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(A_u,\,A_v\)</div></foreignObject>
+            <foreignObject x="204" y="255" width="116" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(L\times512\)</div></foreignObject>
 
             <!-- Generator branch -->
-            <rect class="box-green" x="300" y="168" width="530" height="66" rx="7"/>
-            <text class="s-label" x="320" y="193">Feature standardization</text>
-            <text class="s-mono" x="320" y="216">x̃_r, G̃_r = Std(x_r, G_r) · r ∈ {u,v}</text>
+            <path class="box-green" d="M320,130 L830,130 L830,204 L320,204 Z"/>
+            <text class="s-title" x="575" y="154" text-anchor="middle">Feature standardization</text>
+            <foreignObject x="330" y="164" width="490" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\((\widetilde x_r,\widetilde G_r)=\operatorname{Std}_{\mathrm{fit}}(x_r,G_r)\)</div></foreignObject>
+            <foreignObject x="330" y="185" width="490" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(1536\to1536\) · statistics frozen on \(\mathcal V_{\mathrm{fit}}\)</div></foreignObject>
 
-            <path class="flow" d="M565 234 V252" marker-end="url(#overview-arrow)"/>
-            <rect class="box-green" x="300" y="258" width="530" height="208" rx="7"/>
-            <text class="s-title" x="565" y="286" text-anchor="middle">Shared endpoint generator</text>
+            <path class="flow" d="M575 204 V216" marker-end="url(#overview-arrow)"/>
+            <path class="box-green" d="M320,222 L830,222 L796,318 L354,318 Z"/>
+            <text class="s-title" x="575" y="250" text-anchor="middle">Shared endpoint generator</text>
+            <foreignObject x="330" y="264" width="490" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(S_r=\operatorname{Gen}(\widetilde x_r,\widetilde G_r)=(H_r,\pi_r,m_r,g_r,Q_r,\widehat A_r)\)</div></foreignObject>
+            <foreignObject x="330" y="289" width="490" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(1536\to K=16\) slots \(\times\,256\)</div></foreignObject>
+            <circle class="tap" cx="786" cy="248" r="11"/>
+            <text class="tap-n" x="786" y="251.5">1</text>
+            <circle class="tap" cx="814" cy="248" r="11"/>
+            <text class="tap-n" x="814" y="251.5">3</text>
 
-            <rect class="sub" x="326" y="308" width="200" height="112" rx="5"/>
-            <text class="s-label" x="426" y="332" text-anchor="middle">TokenizeLite</text>
-            <text class="s-mono" x="426" y="354" text-anchor="middle">1536 → 256 → 64</text>
-            <text class="s-small" x="426" y="378" text-anchor="middle">endpoint code e_r</text>
-            <text class="s-small" x="426" y="397" text-anchor="middle">degree distribution μ_d, σ_d</text>
+            <path class="flow" d="M575 318 V330" marker-end="url(#overview-arrow)"/>
+            <rect class="tensor" x="551" y="336" width="48" height="16"/>
+            <foreignObject x="609" y="331" width="170" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(S_u,\,S_v\)</div></foreignObject>
+            <foreignObject x="609" y="349" width="170" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(16\times256\) · with \(\pi,m,g,Q,\widehat A\)</div></foreignObject>
+            <circle class="tap" cx="800" cy="344" r="11"/>
+            <text class="tap-n" x="800" y="347.5">2</text>
 
-            <path class="flow" d="M526 364 H550" marker-end="url(#overview-arrow)"/>
-            <rect class="sub" x="556" y="308" width="248" height="112" rx="5"/>
-            <text class="s-label" x="680" y="332" text-anchor="middle">ImagineDecoder</text>
-            <text class="s-mono" x="680" y="354" text-anchor="middle">K = 16 latent neighbor slots</text>
-            <text class="s-small" x="680" y="378" text-anchor="middle">cross-attend to grounding memory</text>
-            <text class="s-small" x="680" y="397" text-anchor="middle">emit h, π, m, g, Q, Â</text>
+            <path class="flow-blue" d="M575 352 V370 H460 V386" marker-end="url(#overview-arrow-blue)"/>
+            <path class="flow-amber" d="M575 352 V370 H720 V386" marker-end="url(#overview-arrow-amber)"/>
 
-            <text class="s-tiny" x="565" y="448" text-anchor="middle">the same generator is applied independently to endpoints u and v</text>
+            <!-- Topology branch -->
+            <path class="box-blue" d="M320,392 L600,392 L600,478 L320,478 Z"/>
+            <text class="s-title" x="460" y="420" text-anchor="middle">Align the two slot sets</text>
+            <foreignObject x="330" y="432" width="260" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(\Pi_{uv}=\operatorname{Sinkhorn}_{\varepsilon}\!\left(\operatorname{Cost}(S_u,S_v);\pi_u,\pi_v\right)\)</div></foreignObject>
+            <foreignObject x="330" y="455" width="260" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(K\times K=16\times16\)</div></foreignObject>
+            <circle class="tap" cx="582" cy="410" r="11"/>
+            <text class="tap-n" x="582" y="413.5">4</text>
 
-            <path class="flow-red" d="M830 442 H850" marker-end="url(#overview-arrow-red)"/>
-            <text class="s-tiny" x="846" y="432" text-anchor="end" style="fill:#b34f43">node batch · degree + slot targets</text>
+            <path class="flow-blue" d="M460 478 V490" marker-end="url(#overview-arrow-blue)"/>
+            <rect class="tensor" x="454" y="496" width="12" height="16"/>
+            <foreignObject x="476" y="491" width="160" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(\Pi_{uv}\)</div></foreignObject>
+            <foreignObject x="476" y="509" width="160" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(16\times16\)</div></foreignObject>
 
-            <path class="flow" d="M565 466 V492" marker-end="url(#overview-arrow)"/>
-            <rect class="art" x="300" y="498" width="530" height="112" rx="6"/>
-            <text class="art-tag" x="320" y="520">GENERATED ENDPOINT STATES</text>
-            <text class="s-mono-b" x="565" y="548" text-anchor="middle">S_r = (H_r, π_r, m_r, g_r, Q_r, Â_r)</text>
-            <text class="s-small" x="565" y="574" text-anchor="middle">slot content · existence · multiplicity · grounding · pointer · adjacency</text>
-            <text class="s-tiny" x="565" y="594" text-anchor="middle">generated topology is intermediate context, not the prediction target</text>
+            <path class="flow-blue" d="M460 512 V524" marker-end="url(#overview-arrow-blue)"/>
+            <path class="box-blue" d="M320,530 L600,530 L600,616 L320,616 Z"/>
+            <text class="s-title" x="460" y="558" text-anchor="middle">Stitch typed scaffold</text>
+            <foreignObject x="330" y="570" width="260" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(\mathcal T_{uv}=\operatorname{Stitch}(S_u,S_v,\Pi_{uv})\)</div></foreignObject>
+            <foreignObject x="325" y="593" width="270" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(2+2K=34\) nodes \(\times\,11\) feats · 4 edge types</div></foreignObject>
 
-            <path class="flow-red" d="M830 552 H850" marker-end="url(#overview-arrow-red)"/>
-            <text class="s-tiny" x="846" y="540" text-anchor="end" style="fill:#b34f43">node batch · recon + SSL</text>
+            <path class="flow-blue" d="M460 616 V628" marker-end="url(#overview-arrow-blue)"/>
+            <rect class="tensor" x="455" y="634" width="10" height="23"/>
+            <foreignObject x="475" y="632" width="160" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(\mathcal T_{uv}\)</div></foreignObject>
+            <foreignObject x="475" y="650" width="160" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(34\times11\)</div></foreignObject>
 
-            <path class="flow-red" d="M830 590 H850" marker-end="url(#overview-arrow-red)"/>
-            <text class="s-tiny" x="846" y="580" text-anchor="end" style="fill:#b34f43">node batch · endpoint realism</text>
+            <path class="flow-blue" d="M460 657 V670" marker-end="url(#overview-arrow-blue)"/>
+            <path class="box-blue" d="M350,676 L570,676 L600,762 L320,762 Z"/>
+            <text class="s-title" x="460" y="704" text-anchor="middle">STEncoder</text>
+            <foreignObject x="330" y="716" width="260" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(C_{\mathrm{topo}}^{uv}=\operatorname{STE}(\mathcal T_{uv})\)</div></foreignObject>
+            <foreignObject x="330" y="739" width="260" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(34\times11\to34\times512\)</div></foreignObject>
 
-            <!-- Topology/content split -->
-            <path class="flow-blue" d="M500 610 V638 H435 V654" marker-end="url(#overview-arrow-blue)"/>
-            <path class="flow-amber" d="M630 610 V638 H700 V654" marker-end="url(#overview-arrow-amber)"/>
+            <path class="flow-blue" d="M460 762 V774" marker-end="url(#overview-arrow-blue)"/>
+            <rect class="tensor" x="426" y="780" width="68" height="23"/>
+            <foreignObject x="504" y="778" width="176" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(C_{\mathrm{topo}}^{uv}\)</div></foreignObject>
+            <foreignObject x="504" y="796" width="176" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(34\times512\)</div></foreignObject>
 
-            <rect class="box-blue" x="300" y="660" width="265" height="104" rx="7"/>
-            <text class="s-title" x="432" y="686" text-anchor="middle">Align the two slot sets</text>
-            <text class="s-mono" x="432" y="710" text-anchor="middle">C_uv = Cost(S_u, S_v)</text>
-            <text class="s-mono" x="432" y="733" text-anchor="middle">Π_uv = Sinkhorn_ε(C_uv)</text>
-            <text class="s-tiny" x="432" y="751" text-anchor="middle">soft cross-endpoint transport plan</text>
+            <!-- Content branch -->
+            <path class="box-amber" d="M636,392 L804,392 L820,478 L620,478 Z"/>
+            <text class="s-title" x="720" y="420" text-anchor="middle">Assemble content tokens</text>
+            <foreignObject x="630" y="432" width="180" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(C_{\mathrm{cont}}^{uv}=\operatorname{Cont}(S_u,S_v)\)</div></foreignObject>
+            <foreignObject x="625" y="455" width="190" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(2K\times260\to2K\times512\)</div></foreignObject>
 
-            <path class="flow-amber" d="M700 654 V660" marker-end="url(#overview-arrow-amber)"/>
-            <rect class="box-amber" x="590" y="660" width="240" height="104" rx="7"/>
-            <text class="s-title" x="710" y="686" text-anchor="middle">Assemble content tokens</text>
-            <text class="s-mono" x="710" y="710" text-anchor="middle">[H; π; g; id; membership]</text>
-            <text class="s-mono" x="710" y="733" text-anchor="middle">Linear 260 → 512</text>
-            <text class="s-tiny" x="710" y="751" text-anchor="middle">no adjacency or transport plan</text>
+            <path class="flow-amber" d="M720 478 V774" marker-end="url(#overview-arrow-amber)"/>
+            <rect class="tensor" x="686" y="780" width="68" height="22"/>
+            <foreignObject x="764" y="778" width="96" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(C_{\mathrm{cont}}^{uv}\)</div></foreignObject>
+            <foreignObject x="764" y="796" width="96" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(32\times512\)</div></foreignObject>
 
-            <path class="flow-red" d="M565 712 H576 V778 H850" marker-end="url(#overview-arrow-red)"/>
-            <text class="s-tiny" x="846" y="768" text-anchor="end" style="fill:#b34f43">edge batch · alignment teacher</text>
+            <!-- Pair trunk: three shared cross-attention layers on the raw-token branch -->
+            <path class="flow" d="M160 272 V284" marker-end="url(#overview-arrow)"/>
+            <path class="box" d="M20,290 L300,290 L300,370 L20,370 Z"/>
+            <text class="s-title" x="160" y="317" text-anchor="middle">Cross-attention layer 1</text>
+            <foreignObject x="30" y="329" width="260" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\((A^{[1]},c^{[1]})=\operatorname{Layer}_1(A_u,A_v,c^{[0]})\)</div></foreignObject>
+            <foreignObject x="30" y="350" width="260" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(L\times512\to L\times512\)</div></foreignObject>
 
-            <path class="flow-blue" d="M432 764 V786" marker-end="url(#overview-arrow-blue)"/>
-            <rect class="box-blue" x="300" y="792" width="265" height="102" rx="7"/>
-            <text class="s-title" x="432" y="818" text-anchor="middle">Stitch typed scaffold</text>
-            <text class="s-mono" x="432" y="842" text-anchor="middle">T_uv = Stitch(S_u,S_v,Π_uv)</text>
-            <text class="s-small" x="432" y="865" text-anchor="middle">STAR · INTRA · ALIGN · CLOSE</text>
-            <text class="s-tiny" x="432" y="882" text-anchor="middle">2 anchors + 2K slots = 34 nodes</text>
+            <path class="flow" d="M160 370 V384" marker-end="url(#overview-arrow)"/>
+            <path class="box" d="M20,390 L300,390 L300,470 L20,470 Z"/>
+            <text class="s-title" x="160" y="417" text-anchor="middle">Cross-attention layer 2</text>
+            <foreignObject x="30" y="429" width="260" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\((A^{[2]},c^{[2]})=\operatorname{Layer}_2(A^{[1]},c^{[1]})\)</div></foreignObject>
+            <foreignObject x="30" y="450" width="260" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(L\times512\to L\times512\)</div></foreignObject>
 
-            <path class="flow-blue" d="M432 894 V916" marker-end="url(#overview-arrow-blue)"/>
-            <rect class="box-blue" x="300" y="922" width="265" height="82" rx="7"/>
-            <text class="s-title" x="432" y="948" text-anchor="middle">STEncoder</text>
-            <text class="s-mono" x="432" y="971" text-anchor="middle">typed message passing · 11→128→512</text>
-            <text class="s-tiny" x="432" y="990" text-anchor="middle">encodes scaffold geometry only</text>
+            <path class="flow" d="M160 470 V484" marker-end="url(#overview-arrow)"/>
+            <path class="box" d="M20,490 L300,490 L300,578 L20,578 Z"/>
+            <text class="s-title" x="160" y="517" text-anchor="middle">Cross-attention layer 3</text>
+            <foreignObject x="30" y="529" width="260" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\((A^{[3]},c_{rs}^{(0)})=\operatorname{Layer}_3(A^{[2]},c^{[2]})\)</div></foreignObject>
+            <foreignObject x="30" y="551" width="260" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(L\times512\to L\times512,\ 1\times512\)</div></foreignObject>
 
-            <!-- Three explicit trunk inputs -->
-            <path class="flow" d="M145 466 V1018" marker-end="url(#overview-arrow)"/>
-            <path class="flow-blue" d="M432 1004 V1018" marker-end="url(#overview-arrow-blue)"/>
-            <path class="flow-amber" d="M710 764 V1018" marker-end="url(#overview-arrow-amber)"/>
+            <path class="flow" d="M160 578 V590" marker-end="url(#overview-arrow)"/>
+            <rect class="tensor" x="126" y="596" width="68" height="44"/>
+            <foreignObject x="204" y="603" width="116" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(A^{[3]}_u,\,A^{[3]}_v\)</div></foreignObject>
+            <foreignObject x="204" y="621" width="116" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(L\times512\)</div></foreignObject>
 
-            <rect class="art" x="20" y="1024" width="250" height="78" rx="6"/>
-            <text class="art-tag" x="38" y="1045">INPUT 1 · PROTEIN TOKENS</text>
-            <text class="s-mono-b" x="145" y="1072" text-anchor="middle">A_u, A_v · L × 512</text>
-            <text class="s-tiny" x="145" y="1090" text-anchor="middle">directed pair evidence</text>
+            <rect class="tensor" x="126" y="656" width="68" height="6"/>
+            <foreignObject x="204" y="641" width="116" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(c_{rs}^{(0)}\)</div></foreignObject>
+            <foreignObject x="204" y="659" width="116" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(512\)</div></foreignObject>
 
-            <rect class="art" x="300" y="1024" width="265" height="78" rx="6"/>
-            <text class="art-tag" x="318" y="1045" style="fill:#2d67a3">INPUT 2 · TOPOLOGY TOKENS</text>
-            <text class="s-mono-b" x="432" y="1072" text-anchor="middle">C_topo^(uv), C_topo^(vu)</text>
-            <text class="s-tiny" x="432" y="1090" text-anchor="middle">34 scaffold nodes · 512 dims</text>
+            <!-- Layer-3 CLS injection: topology first, then content queries the result.
+                 The wide blocks stop at x=670/810 so the descending lanes never cross a box. -->
+            <path class="flow" d="M160 662 V824" marker-end="url(#overview-arrow)"/>
+            <path class="flow-blue" d="M460 803 V824" marker-end="url(#overview-arrow-blue)"/>
+            <path class="box-blue" d="M70,830 L670,830 L670,920 L70,920 Z"/>
+            <text class="s-title" x="370" y="858" text-anchor="middle">1 · Topology update</text>
+            <foreignObject x="80" y="871" width="580" height="22"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(c_{rs}^{\mathrm{topo}}=c_{rs}^{(0)}+a_{\mathrm{topo}}\tanh(\gamma_{\mathrm{topo}})\bigl[\operatorname{XAttn}_{\mathrm{topo}}\bigl(c_{rs}^{(0)},C_{\mathrm{topo}}^{rs}\bigr)-\mu_{\mathrm{topo}}\bigr]\)</div></foreignObject>
+            <foreignObject x="80" y="896" width="580" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(1\times512\) · attends over \(34\times512\) · centered, gated, exactly bypassable</div></foreignObject>
 
-            <rect class="art" x="590" y="1024" width="240" height="78" rx="6"/>
-            <text class="art-tag" x="608" y="1045" style="fill:#a76318">INPUT 3 · CONTENT TOKENS</text>
-            <text class="s-mono-b" x="710" y="1072" text-anchor="middle">C_cont · 32 × 512</text>
-            <text class="s-tiny" x="710" y="1090" text-anchor="middle">direction-free slot content</text>
+            <path class="flow" d="M370 920 V934" marker-end="url(#overview-arrow)"/>
+            <path class="flow-amber" d="M720 802 V934" marker-end="url(#overview-arrow-amber)"/>
+            <path class="box-amber" d="M70,940 L810,940 L810,1030 L70,1030 Z"/>
+            <text class="s-title" x="440" y="968" text-anchor="middle">2 · Content update</text>
+            <foreignObject x="80" y="981" width="720" height="22"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(c_{rs}^{\mathrm{cond}}=c_{rs}^{\mathrm{topo}}+a_{\mathrm{cont}}\tanh(\gamma_{\mathrm{cont}})\bigl[\operatorname{XAttn}_{\mathrm{cont}}\bigl(c_{rs}^{\mathrm{topo}},C_{\mathrm{cont}}^{rs}\bigr)-\mu_{\mathrm{cont}}\bigr]\)</div></foreignObject>
+            <foreignObject x="80" y="1006" width="720" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(1\times512\) · attends over \(32\times512\) · content queries the topology-updated CLS</div></foreignObject>
 
-            <path class="flow" d="M145 1102 V1182" marker-end="url(#overview-arrow)"/>
+            <path class="flow" d="M126 618 H45 V1090 H68" marker-end="url(#overview-arrow)"/>
+            <path class="flow" d="M440 1030 V1044" marker-end="url(#overview-arrow)"/>
+            <path class="box" d="M70,1050 L810,1050 L788,1140 L92,1140 Z"/>
+            <text class="s-title" x="440" y="1078" text-anchor="middle">PairContextGatedReadout</text>
+            <foreignObject x="80" y="1091" width="720" height="22"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(z_{rs}=\operatorname{Readout}\bigl(A^{[3]}_u,A^{[3]}_v,c_{rs}^{\mathrm{cond}}\bigr)\)</div></foreignObject>
+            <foreignObject x="80" y="1116" width="720" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(\to512\) · once per direction \((r,s)\in\{(u,v),(v,u)\}\) · fp32</div></foreignObject>
 
-            <!-- Light conditioned pair trunk -->
-            <rect class="box" x="20" y="1132" width="810" height="500" rx="8" style="stroke-width:1.8"/>
-            <text class="s-title" x="42" y="1160">Conditioned pair trunk</text>
-            <text class="s-tiny" x="812" y="1160" text-anchor="end">layer-3 CLS: topology update first, then content update</text>
-
-            <rect class="sub" x="48" y="1182" width="225" height="68" rx="5"/>
-            <text class="s-label" x="160" y="1207" text-anchor="middle">Cross-attention layer 1</text>
-            <text class="s-mono" x="160" y="1230" text-anchor="middle">endpoint tokens exchange evidence</text>
-
-            <path class="flow" d="M160 1250 V1270" marker-end="url(#overview-arrow)"/>
-            <rect class="sub" x="48" y="1276" width="225" height="68" rx="5"/>
-            <text class="s-label" x="160" y="1301" text-anchor="middle">Cross-attention layer 2</text>
-            <text class="s-mono" x="160" y="1324" text-anchor="middle">same 512-d residual block</text>
-
-            <path class="flow" d="M160 1344 V1364" marker-end="url(#overview-arrow)"/>
-            <rect class="sub" x="48" y="1370" width="225" height="82" rx="5"/>
-            <text class="s-label" x="160" y="1395" text-anchor="middle">Cross-attention layer 3</text>
-            <text class="s-mono" x="160" y="1418" text-anchor="middle">produces base CLS state c⁰_rs</text>
-            <text class="s-tiny" x="160" y="1438" text-anchor="middle">its CLS state is the injection query</text>
-
-            <rect class="sub-blue" x="320" y="1320" width="226" height="112" rx="5"/>
-            <text class="s-label" x="433" y="1346" text-anchor="middle">1 · Topology update</text>
-            <text class="s-mono" x="433" y="1370" text-anchor="middle">δ_topo = XAttn(c⁰,C_topo) − μ_topo</text>
-            <text class="s-mono-b" x="433" y="1395" text-anchor="middle">c_topo = c⁰ + a_topo tanh(γ_topo)δ_topo</text>
-            <text class="s-tiny" x="433" y="1416" text-anchor="middle">centered · gated · exactly bypassable</text>
-
-            <rect class="sub-amber" x="574" y="1320" width="228" height="112" rx="5"/>
-            <text class="s-label" x="688" y="1346" text-anchor="middle">2 · Content update</text>
-            <text class="s-mono" x="688" y="1370" text-anchor="middle">δ_cont = XAttn(c_topo,C_cont) − μ_cont</text>
-            <text class="s-mono-b" x="688" y="1395" text-anchor="middle">c_cond = c_topo + a_cont tanh(γ_cont)δ_cont</text>
-            <text class="s-tiny" x="688" y="1416" text-anchor="middle">content queries the topology-updated CLS</text>
-
-            <path class="flow" d="M273 1411 H314" marker-end="url(#overview-arrow)"/>
-            <path class="flow-blue" d="M432 1102 V1314" marker-end="url(#overview-arrow-blue)"/>
-            <path class="flow-amber" d="M710 1102 V1314" marker-end="url(#overview-arrow-amber)"/>
-            <path class="flow" d="M546 1376 H568" marker-end="url(#overview-arrow)"/>
-
-            <path class="flow" d="M688 1432 V1480" marker-end="url(#overview-arrow)"/>
-            <rect class="sub" x="320" y="1486" width="482" height="82" rx="5"/>
-            <text class="s-label" x="561" y="1511" text-anchor="middle">PairContextGatedReadout</text>
-            <text class="s-mono" x="561" y="1536" text-anchor="middle">conditioned CLS + branch summaries → z_rs ∈ R^512</text>
-            <text class="s-tiny" x="561" y="1556" text-anchor="middle">computed once for r→s = u→v and once for v→u</text>
-
-            <path class="flow" d="M561 1568 V1647 H340 V1662" marker-end="url(#overview-arrow)"/>
-            <rect class="art" x="170" y="1662" width="340" height="80" rx="6"/>
-            <text class="art-tag" x="188" y="1684">DIRECTED PAIR EMBEDDINGS</text>
-            <text class="s-mono-b" x="340" y="1712" text-anchor="middle">z_uv, z_vu ∈ R^512</text>
-            <text class="s-tiny" x="340" y="1731" text-anchor="middle">same trunk, opposite endpoint order</text>
-
-            <rect class="box-red" x="546" y="1662" width="284" height="80" rx="6"/>
-            <text class="s-label" x="688" y="1686" text-anchor="middle">Train-only relational head</text>
-            <text class="s-mono" x="688" y="1710" text-anchor="middle">mean(C_topo) → 512→256→2</text>
-            <text class="s-tiny" x="688" y="1730" text-anchor="middle">discarded for inference and scoring</text>
-            <path class="flow-blue" d="M432 1102 H842 V1702 H830" marker-end="url(#overview-arrow-blue)"/>
-            <path class="flow-red" d="M830 1702 H850" marker-end="url(#overview-arrow-red)"/>
+            <path class="flow" d="M140 1140 V1154" marker-end="url(#overview-arrow)"/>
+            <rect class="tensor" x="106" y="1160" width="68" height="6"/>
+            <foreignObject x="184" y="1145" width="160" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(z_{uv},\,z_{vu}\)</div></foreignObject>
+            <foreignObject x="184" y="1163" width="160" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(512\)</div></foreignObject>
 
             <!-- Symmetric decision -->
-            <path class="flow" d="M340 1742 V1768" marker-end="url(#overview-arrow)"/>
-            <rect class="box" x="70" y="1774" width="240" height="92" rx="7"/>
-            <text class="s-title" x="190" y="1803" text-anchor="middle">AB/BA symmetric max</text>
-            <text class="s-mono" x="190" y="1828" text-anchor="middle">z_sym = max(z_uv, z_vu)</text>
-            <text class="s-tiny" x="190" y="1848" text-anchor="middle">feature-wise order invariance</text>
+            <path class="flow" d="M140 1166 V1194" marker-end="url(#overview-arrow)"/>
+            <path class="box" d="M20,1200 L260,1200 L260,1286 L20,1286 Z"/>
+            <text class="s-title" x="140" y="1228" text-anchor="middle">AB/BA symmetric max</text>
+            <foreignObject x="25" y="1240" width="230" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(z_{uv}^{\mathrm{sym}}=\max(z_{uv},z_{vu})\)</div></foreignObject>
+            <foreignObject x="25" y="1263" width="230" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(512\to512\)</div></foreignObject>
 
-            <path class="flow" d="M310 1820 H344" marker-end="url(#overview-arrow)"/>
-            <rect class="box" x="350" y="1774" width="220" height="92" rx="7"/>
-            <text class="s-title" x="460" y="1803" text-anchor="middle">Binary edge head</text>
-            <text class="s-mono" x="460" y="1828" text-anchor="middle">ℓ_uv = MLP(z_sym)</text>
-            <text class="s-tiny" x="460" y="1848" text-anchor="middle">512 → 256 → 1</text>
+            <path class="flow" d="M260 1243 H284" marker-end="url(#overview-arrow)"/>
+            <path class="box" d="M290,1200 L520,1200 L460,1286 L350,1286 Z"/>
+            <text class="s-title" x="405" y="1228" text-anchor="middle">Binary edge head</text>
+            <foreignObject x="295" y="1240" width="220" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(p_{uv}=\sigma\!\left(\operatorname{MLP}(z_{uv}^{\mathrm{sym}})\right)\)</div></foreignObject>
+            <foreignObject x="295" y="1263" width="220" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(512\to256\to1\)</div></foreignObject>
+            <circle class="tap" cx="490" cy="1220" r="11"/>
+            <text class="tap-n" x="490" y="1223.5">6</text>
 
-            <path class="flow" d="M570 1820 H604" marker-end="url(#overview-arrow)"/>
-            <rect class="box-blue" x="610" y="1774" width="220" height="92" rx="7"/>
-            <text x="720" y="1816" text-anchor="middle" style="font-family:var(--serif);font-size:22px;font-weight:600;fill:#2d67a3">p_uv = σ(ℓ_uv)</text>
-            <text class="s-small" x="720" y="1845" text-anchor="middle">binary queried-edge probability</text>
-            <path class="flow-red" d="M830 1820 H850" marker-end="url(#overview-arrow-red)"/>
+            <path class="flow-blue" d="M460 803 V818 H845 V1243 H824" marker-end="url(#overview-arrow-blue)"/>
+            <path class="box-red" d="M560,1200 L830,1200 L810,1286 L580,1286 Z"/>
+            <text class="s-title" x="695" y="1228" text-anchor="middle">Train-only relational head</text>
+            <foreignObject x="570" y="1240" width="250" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(\widehat r_{uv}=\operatorname{RelHead}\!\left(\operatorname{mean}(C_{\mathrm{topo}}^{uv})\right)\)</div></foreignObject>
+            <foreignObject x="570" y="1263" width="250" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(512\to256\to2\) · never scored</div></foreignObject>
+            <circle class="tap" cx="808" cy="1218" r="11"/>
+            <text class="tap-n" x="808" y="1221.5">5</text>
+
+            <path class="flow" d="M405 1286 V1304" marker-end="url(#overview-arrow)"/>
+            <rect class="tensor" x="400" y="1310" width="10" height="10"/>
+            <foreignObject x="420" y="1299" width="200" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(p_{uv}\)</div></foreignObject>
+            <foreignObject x="420" y="1317" width="220" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\([0,1]\) · one scalar per queried pair</div></foreignObject>
           </svg>
         </div>
 
         <aside class="loss-rail" aria-labelledby="loss-rail-title">
           <div class="loss-rail-head">
             <h3 id="loss-rail-title">Training losses</h3>
-            <p>Training synchronizes two streams: a node batch supplies generator reconstruction, endpoint realism, and SSL; an edge batch supplies alignment, relational, and queried-edge targets. Dashed taps mark shared-module outputs, not reuse of the queried-pair rows. Only \(\mathcal L_{\mathrm{edge}}\) touches the scored edge logit.</p>
+            <p>Training synchronizes two streams: a node batch supplies generator reconstruction, endpoint realism, and SSL; an edge batch supplies alignment, relational, and queried-edge targets. Each card carries the number of the module in the flow at which its loss is computed. Only \(\mathcal L_{\mathrm{edge}}\) touches the scored edge logit.</p>
           </div>
 
           <div class="loss-group">
-            <h4 class="loss-group-title">Generator and matched slots · node batch</h4>
+            <h4 class="loss-group-title">Node batch</h4>
 
             <article class="loss-box">
-              <h4><span>\(\mathcal L_{\mathrm{deg}}\)</span><span>degree head</span></h4>
-              <div class="loss-math">\(\mathcal L_{\mathrm{deg}}=-\log p_{\mathrm{LogNormal}}(d_r^\star\mid\mu_r,\sigma_r)\)</div>
-              <p>Fits the total number of neighbors the endpoint generator should represent.</p>
+              <h4><span class="tap-n">1</span><span class="loss-name">\(\mathcal L_{\mathrm{recon}}\)</span><span class="loss-where">shared endpoint generator</span></h4>
+              <div class="loss-math">\(\mathcal L_{\mathrm{recon}}(t)=\sum_{j\in\mathcal R}f_j(t)\,w_j\,\mathcal L_j\)</div>
+              <p>Eight head-level terms scoring the generated slot set against Hungarian-matched real neighbors. The fidelity factors \(f_j\) for degree, feature, existence, and multiplicity anneal from 1 to .25 once edge training starts.</p>
+              <ul class="loss-terms">
+                <li><span class="t-math">\(\mathcal L_{\mathrm{deg}}=-\log p_{\mathrm{LogNormal}}(d_r^\star\mid\mu_r,\sigma_r)\)</span>how many neighbors the endpoint must represent.</li>
+                <li><span class="t-math">\(\mathcal L_{\mathrm{feat}}=\operatorname{mean}_{k\in M}\!\operatorname{SmoothL1}(h_k,h^\star_{a(k)})+\operatorname{mean}_{k\in D}\!\operatorname{SmoothL1}(h_k^D,h_k^{D\star})\)</span>matched slot states plus the fixed-assignment denoising queries.</li>
+                <li><span class="t-math">\(\mathcal L_{\mathrm{exist}}=\tfrac12\operatorname{BCE}_{+}(\pi,t^\pi)+\tfrac12\operatorname{BCE}_{-}(\pi,t^\pi)+\operatorname{mean}_{k\in D}\operatorname{BCE}(\pi_k^D,1)\)</span>balanced existence over matched and unmatched slots.</li>
+                <li><span class="t-math">\(\mathcal L_{\mathrm{mult}}=\tfrac12\operatorname{mean}_k[\log m_k-\log m^\star_{a(k)}]^2\)</span>how many real neighbors one slot compresses.</li>
+                <li><span class="t-math">\(\mathcal L_{\mathrm{slotadj}}=\operatorname{BCEWithLogits}(\ell^{A}_{k\ell}/\tau_A,A^\star_{a(k)a(\ell)})\)</span>edges among the matched neighbor slots.</li>
+                <li><span class="t-math">\(\mathcal L_{\mathrm{gate}}=\operatorname{WBCE}(g_k,\mathbf 1[h^\star_{a(k)}\in G_r];w_+=6.17)\)</span>whether a slot should name a real candidate.</li>
+                <li><span class="t-math">\(\mathcal L_{\mathrm{ptr}}=-\operatorname{mean}_k\log Q_{k,j^\star_{a(k)}}\)</span>which candidate in the pool it names.</li>
+                <li><span class="t-math">\(\mathcal L_{\mathrm{div}}=\operatorname{mean}_{(k,\ell)\in\mathcal E}[\cos(h_k,h_\ell)-\tau_{\mathrm{div}}]_+^2\)</span>separation where no target supplies it.</li>
+              </ul>
             </article>
 
             <article class="loss-box">
-              <h4><span>\(\mathcal L_{\mathrm{feat}}\)</span><span>slot states</span></h4>
-              <div class="loss-math">\(\mathcal L_{\mathrm{feat}}=\operatorname{mean}_{k\in M}\!\operatorname{SmoothL1}(h_k,h^\star_{a(k)})+\operatorname{mean}_{k\in D}\!\operatorname{SmoothL1}(h_k^D,h_k^{D\star})\)</div>
-              <p>Reconstructs Hungarian-matched neighbors and folds in the fixed-assignment denoising-query feature target.</p>
+              <h4><span class="tap-n">2</span><span class="loss-name">\(\mathcal L_{\mathrm{real}}\)</span><span class="loss-where">generated endpoint states</span></h4>
+              <div class="loss-math">\(\mathcal L_{\mathrm{real}}=\tfrac23\mathcal L_{\mathrm{egostat}}+\tfrac13\mathcal L_{\mathrm{GIN}}\)</div>
+              <p>Standardized energy distance \(\operatorname{ED}\) between the generated ego net and real ones, read off the slot set the generator just emitted.</p>
+              <ul class="loss-terms">
+                <li><span class="t-math">\(\mathcal L_{\mathrm{egostat}}=\operatorname{ED}(s(\widehat S_r),s(S_r^\star))\)</span>degree, neighbor-neighbor density, total ego edges, whole-ego density.</li>
+                <li><span class="t-math">\(\mathcal L_{\mathrm{GIN}}=\operatorname{ED}(\operatorname{GIN}_{\mathrm{rand}}(\widehat S_r),\operatorname{GIN}_{\mathrm{rand}}(S_r^\star))\)</span>the same comparison in a frozen random-GIN representation.</li>
+              </ul>
             </article>
 
             <article class="loss-box">
-              <h4><span>\(\mathcal L_{\mathrm{exist}}\)</span><span>existence probabilities</span></h4>
-              <div class="loss-math">\(\mathcal L_{\mathrm{exist}}=\tfrac12\operatorname{BCE}_{+}(\pi,t^\pi)+\tfrac12\operatorname{BCE}_{-}(\pi,t^\pi)+\operatorname{mean}_{k\in D}\operatorname{BCE}(\pi_k^D,1)\)</div>
-              <p>Balances matched and unmatched slots, then adds the denoising queries' positive-existence target.</p>
-            </article>
-
-            <article class="loss-box">
-              <h4><span>\(\mathcal L_{\mathrm{mult}}\)</span><span>multiplicity head</span></h4>
-              <div class="loss-math">\(\mathcal L_{\mathrm{mult}}=\tfrac12\operatorname{mean}_k[\log m_k-\log m^\star_{a(k)}]^2\)</div>
-              <p>Predicts how many real neighbors a matched slot compresses into one state.</p>
-            </article>
-
-            <article class="loss-box">
-              <h4><span>\(\mathcal L_{\mathrm{slotadj}}\)</span><span>adjacency logits</span></h4>
-              <div class="loss-math">\(\mathcal L_{\mathrm{slotadj}}=\operatorname{BCEWithLogits}(\ell^{A}_{k\ell}/\tau_A,A^\star_{a(k)a(\ell)})\)</div>
-              <p>Reconstructs edges among the matched neighbor slots of each endpoint.</p>
-            </article>
-
-            <article class="loss-box">
-              <h4><span>\(\mathcal L_{\mathrm{gate}}\)</span><span>grounding probability</span></h4>
-              <div class="loss-math">\(\mathcal L_{\mathrm{gate}}=\operatorname{WBCE}(g_k,\mathbf 1[h^\star_{a(k)}\in G_r];w_+=6.17)\)</div>
-              <p>Decides whether a slot should name a candidate from the available grounding pool.</p>
-            </article>
-
-            <article class="loss-box">
-              <h4><span>\(\mathcal L_{\mathrm{ptr}}\)</span><span>pointer probabilities</span></h4>
-              <div class="loss-math">\(\mathcal L_{\mathrm{ptr}}=-\operatorname{mean}_k\log Q_{k,j^\star_{a(k)}}\)</div>
-              <p>Selects the correct real grounding candidate when the matched target is in the pool.</p>
-            </article>
-
-            <article class="loss-box">
-              <h4><span>\(\mathcal L_{\mathrm{div}}\)</span><span>slot geometry</span></h4>
-              <div class="loss-math">\(\mathcal L_{\mathrm{div}}=\operatorname{mean}_{(k,\ell)\in\mathcal E}[\cos(h_k,h_\ell)-\tau_{\mathrm{div}}]_+^2\)</div>
-              <p>Separates slot pairs for which at least one slot is unmatched, where target reconstruction gives no pairwise separation.</p>
+              <h4><span class="tap-n">3</span><span class="loss-name">\(\mathcal L_{\mathrm{ssl}}\)</span><span class="loss-where">shared endpoint generator</span></h4>
+              <div class="loss-math">\(\mathcal L_{\mathrm{ssl}}=\tfrac12\mathcal L_{\mathrm{noise}}+\tfrac12\mathcal L_{\mathrm{pool}}\)</div>
+              <p>Ungrounded slots \((g_k&lt;.5)\) must not move when the generator's two inputs are perturbed — they have no reconstruction target to hold them still.</p>
+              <ul class="loss-terms">
+                <li><span class="t-math">\(\mathcal L_{\mathrm{noise}}=\operatorname{mean}_{k}\lVert h_k(x_r,G_r)-h_k(x_r+\epsilon,G_r)\rVert_2^2\)</span>endpoint feature jitter.</li>
+                <li><span class="t-math">\(\mathcal L_{\mathrm{pool}}=\operatorname{mean}_{k}\lVert h_k(x_r,G_r)-h_k(x_r,G'_r)\rVert_2^2\)</span>grounding pool resample.</li>
+              </ul>
             </article>
           </div>
 
           <div class="loss-group">
-            <h4 class="loss-group-title">Alignment · edge batch</h4>
+            <h4 class="loss-group-title">Edge batch</h4>
 
             <article class="loss-box">
-              <h4><span>\(\mathcal L_{\mathrm{align}}\)</span><span>Sinkhorn log-plan</span></h4>
+              <h4><span class="tap-n">4</span><span class="loss-name">\(\mathcal L_{\mathrm{align}}\)</span><span class="loss-where">Sinkhorn transport plan</span></h4>
               <div class="loss-math">\(\mathcal L_{\mathrm{align}}=-\operatorname{mean}_{(k,\ell)\in T}\frac12[\log\Pi_{\ell\mid k}+\log\Pi_{k\mid\ell}]\)</div>
-              <p>Places slots that name the same real neighbor into the teacher-marked transport cells.</p>
-            </article>
-          </div>
-
-          <div class="loss-group">
-            <h4 class="loss-group-title">Endpoint realism · node batch</h4>
-
-            <article class="loss-box">
-              <h4><span>\(\mathcal L_{\mathrm{egostat}}\)</span><span>ego statistics</span></h4>
-              <div class="loss-math">\(\mathcal L_{\mathrm{egostat}}=\operatorname{ED}(s(\widehat S_r),s(S_r^\star))\)</div>
-              <p>Matches degree, neighbor-neighbor density, total ego edges, and whole-ego density.</p>
+              <p>Slots of \(u\) and \(v\) that name the same real neighbor are pushed into the teacher-marked transport cells, in both conditional directions.</p>
             </article>
 
             <article class="loss-box">
-              <h4><span>\(\mathcal L_{\mathrm{GIN}}\)</span><span>graph embedding</span></h4>
-              <div class="loss-math">\(\mathcal L_{\mathrm{GIN}}=\operatorname{ED}(\operatorname{GIN}_{\mathrm{rand}}(\widehat S_r),\operatorname{GIN}_{\mathrm{rand}}(S_r^\star))\)</div>
-              <p>Matches generated topology to real ego graphs in a frozen random-GIN representation.</p>
-            </article>
-          </div>
-
-          <div class="loss-group">
-            <h4 class="loss-group-title">Perturbation consistency · node batch</h4>
-
-            <article class="loss-box">
-              <h4><span>\(\mathcal L_{\mathrm{noise}}\)</span><span>slot consistency</span></h4>
-              <div class="loss-math">\(\mathcal L_{\mathrm{noise}}=\operatorname{mean}_{k:g_k&lt;.5}\lVert h_k(x_r,G_r)-h_k(x_r+\epsilon,G_r)\rVert_2^2\)</div>
-              <p>Keeps ungrounded slots stable when the endpoint feature is slightly perturbed.</p>
-            </article>
-
-            <article class="loss-box">
-              <h4><span>\(\mathcal L_{\mathrm{pool}}\)</span><span>slot consistency</span></h4>
-              <div class="loss-math">\(\mathcal L_{\mathrm{pool}}=\operatorname{mean}_{k:g_k&lt;.5}\lVert h_k(x_r,G_r)-h_k(x_r,G'_r)\rVert_2^2\)</div>
-              <p>Keeps ungrounded slots stable when the grounding candidate pool is resampled.</p>
-            </article>
-          </div>
-
-          <div class="loss-group">
-            <h4 class="loss-group-title">Pair-level objectives · edge batch</h4>
-
-            <article class="loss-box">
-              <h4><span>\(\mathcal L_{\mathrm{rel}}\)</span><span>train-only head</span></h4>
+              <h4><span class="tap-n">5</span><span class="loss-name">\(\mathcal L_{\mathrm{rel}}\)</span><span class="loss-where">train-only relational head</span></h4>
               <div class="loss-math">\(\mathcal L_{\mathrm{rel}}=\operatorname{SmoothL1}(\widehat r_{uv},[\log(1+\mathrm{CN}_{uv}),J_{uv}])\)</div>
-              <p>Teaches log common-neighbor count and Jaccard relation without entering the scored logit.</p>
+              <p>Reads the mean topology token only. Teaches log common-neighbor count and Jaccard overlap into the scaffold representation; the head itself never reaches a scored logit.</p>
             </article>
 
             <article class="loss-box">
-              <h4><span>\(\mathcal L_{\mathrm{edge}}\)</span><span>scored logit</span></h4>
+              <h4><span class="tap-n">6</span><span class="loss-name">\(\mathcal L_{\mathrm{edge}}\)</span><span class="loss-where">binary edge head</span></h4>
               <div class="loss-math">\(\mathcal L_{\mathrm{edge}}=\frac{\sum_i m_i\,\omega(y_i)\operatorname{BCEWithLogits}(\ell_i,y_i)}{\sum_i m_i\,\omega(y_i)},\quad\omega(1)=5\)</div>
-              <p>The only loss applied to the final queried-edge logit; padding rows are masked out.</p>
+              <p>The only loss applied to the final queried-edge logit; padding rows are masked out and positives are up-weighted.</p>
             </article>
           </div>
 
@@ -680,8 +673,8 @@ svg .s-mono-b { font-family: var(--mono); font-size: 9px; font-weight: 700; fill
         </aside>
       </div>
       <figcaption class="figure-caption">
-        <span><strong>Figure 1 · Inference flow on the left, optimization targets on the right.</strong> Protein, topology, and content tokens enter three explicit ports of the conditioned pair trunk. After the third shared pair layer produces a base CLS state, topology updates that state first and content cross-attention queries the topology-updated result; the gated readout then forms each directed pair embedding. Dashed taps distinguish node-batch from edge-batch supervision, while generated topology remains intermediate context for the binary queried-edge decision.</span>
-        <span class="legend"><span class="legend-item"><i class="swatch generated"></i>generator</span><span class="legend-item"><i class="swatch topo"></i>topology</span><span class="legend-item"><i class="swatch content"></i>content</span><span class="legend-item"><i class="swatch artifact"></i>artifact</span><span class="legend-item"><i class="dash"></i>training only</span></span>
+        <span><strong>Figure 1 · One formal function per block, on the left; the six combined losses, on the right.</strong> Every trapezoid is a block of the model carrying its title, its single defining equation, and the dimensions it maps between; the taper shows the direction of that change — the encoder and the binary head narrow, the STEncoder and the content projector widen, the attention layers preserve width. Every rectangle between them is the intermediate tensor, drawn to scale: width tracks the channel count and height the token count, so a pooled 1536-vector is a thin wide strip and the 16 × 16 transport plan is a small square. Loss cards are numbered with the block that computes them — 1 and 3 at the generator, 2 at its emitted slot set, 4 at the transport plan, 5 at the train-only relational head, 6 at the binary edge head.</span>
+        <span class="legend"><span class="legend-item"><i class="swatch generated"></i>generator</span><span class="legend-item"><i class="swatch topo"></i>topology</span><span class="legend-item"><i class="swatch content"></i>content</span><span class="legend-item"><i class="swatch artifact"></i>tensor</span><span class="legend-item"><i class="swatch tap"></i>loss tap</span></span>
       </figcaption>
     </figure>
 
