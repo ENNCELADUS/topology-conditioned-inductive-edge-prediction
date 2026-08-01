@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>EgoStitch rev-3.1 · Model architecture</title>
+<title>EgoStitch rev-3.2 · Model architecture</title>
 <script defer src="https://cdn.jsdelivr.net/npm/mathjax@4.0.0/tex-chtml.js"></script>
 <style>
 :root {
@@ -57,8 +57,7 @@ code { font-family: var(--mono); font-size: .88em; }
 
 .masthead {
   display: grid;
-  grid-template-columns: 1fr 330px;
-  gap: 58px;
+  grid-template-columns: 1fr;
   align-items: end;
   padding: 8px 4px 30px;
   border-bottom: 2px solid var(--ink);
@@ -81,26 +80,6 @@ h1 {
   color: var(--ink-2);
   font: 400 20px/1.48 var(--serif);
 }
-.thesis {
-  padding: 18px 20px;
-  background: var(--ink);
-  color: #fffdf8;
-  border-radius: 4px;
-  box-shadow: var(--shadow);
-}
-.thesis .label { color: #a9c9e8; font: 700 10px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; }
-.thesis p { margin: 10px 0 0; font: 500 16px/1.45 var(--serif); }
-.tags { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 17px; }
-.tag {
-  display: inline-block;
-  padding: 4px 8px;
-  border: 1px solid rgba(255,255,255,.25);
-  border-radius: 999px;
-  color: #d9e1e7;
-  font: 600 9px/1 var(--mono);
-  letter-spacing: .05em;
-  text-transform: uppercase;
-}
 
 section { margin-top: 42px; scroll-margin-top: 20px; }
 .section-head {
@@ -121,6 +100,72 @@ h2 { margin: 0; font: 600 28px/1.1 var(--serif); letter-spacing: -.02em; }
 }
 .figure-card { padding: 18px 20px 16px; border-radius: 6px; }
 .figure-card svg, .workflow svg { display: block; width: 100%; height: auto; }
+.architecture-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(360px, .92fr);
+  gap: 22px;
+  align-items: start;
+}
+.flow-canvas {
+  min-width: 0;
+  padding-right: 18px;
+  border-right: 1px solid var(--rule);
+}
+.loss-rail { min-width: 0; }
+.loss-rail-head {
+  margin: 2px 0 12px;
+  padding-bottom: 10px;
+  border-bottom: 2px solid var(--red);
+}
+.loss-rail-head h3 { margin: 0; font: 600 22px/1.15 var(--serif); }
+.loss-rail-head p { margin: 6px 0 0; color: var(--ink-2); font: 400 12px/1.45 var(--serif); }
+.loss-group { margin-top: 14px; }
+.loss-group-title {
+  margin: 0 0 7px;
+  color: var(--red);
+  font: 700 9px/1 var(--mono);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+.loss-box {
+  position: relative;
+  margin-top: 7px;
+  padding: 9px 11px 9px 13px;
+  border: 1px solid var(--red-line);
+  border-left: 3px solid var(--red);
+  border-radius: 4px;
+  background: rgba(250, 236, 233, .58);
+}
+.loss-box::before {
+  content: "";
+  position: absolute;
+  left: -14px;
+  top: 50%;
+  width: 11px;
+  border-top: 1.5px dashed var(--red);
+}
+.loss-box h4 {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0;
+  color: var(--ink);
+  font: 700 10px/1.2 var(--mono);
+}
+.loss-box h4 span { color: var(--ink-3); font-size: 8px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+.loss-math { margin-top: 4px; color: var(--red); font-size: 11.5px; overflow-x: auto; }
+.loss-math mjx-container { margin: 0 !important; }
+.loss-box p { margin: 4px 0 0; color: var(--ink-2); font: 400 11px/1.35 var(--serif); }
+.loss-total {
+  margin-top: 15px;
+  padding: 13px 14px;
+  border: 1px solid var(--rule-strong);
+  border-top: 3px solid var(--ink);
+  border-radius: 4px;
+  background: var(--surface-2);
+}
+.loss-total .loss-math { color: var(--ink); font-size: 11px; }
+.loss-total p { margin: 7px 0 0; color: var(--ink-2); font: 400 11px/1.4 var(--serif); }
 .figure-caption {
   display: flex;
   justify-content: space-between;
@@ -142,20 +187,16 @@ h2 { margin: 0; font: 600 28px/1.1 var(--serif); letter-spacing: -.02em; }
 .swatch.artifact { background: var(--surface-2); border-color: var(--rule-strong); border-style: dashed; }
 .dash { width: 18px; border-top: 2px dashed var(--red); }
 
-.math-ribbon {
-  display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  margin-top: 14px;
-  border: 1px solid var(--rule-strong);
-  background: var(--ink);
-  color: white;
+.data-flow {
+  max-width: 1120px;
+  margin: 26px auto 0;
+  color: var(--ink-2);
+  font: 400 15px/1.65 var(--serif);
 }
-.math-step { position: relative; padding: 13px 18px 14px; border-right: 1px solid rgba(255,255,255,.2); }
-.math-step:last-child { border-right: 0; }
-.math-step::after { content: "→"; position: absolute; right: -10px; top: 18px; z-index: 1; color: #a9c9e8; font-weight: 700; }
-.math-step:last-child::after { display: none; }
-.math-step b { display: block; color: #a9c9e8; font: 700 9px/1 var(--mono); letter-spacing: .13em; text-transform: uppercase; }
-.math-step span { display: block; margin-top: 7px; font: 400 13px/1.3 var(--mono); }
+.data-flow h3 { margin: 0 0 12px; color: var(--ink); font: 600 24px/1.2 var(--serif); }
+.data-flow p { margin: 12px 0 0; }
+.data-flow strong { color: var(--ink); font-weight: 600; }
+.data-flow mjx-container[display="true"] { margin: 14px 0 !important; overflow-x: auto; overflow-y: hidden; text-align: left !important; }
 
 .workflow-list { display: grid; gap: 20px; }
 .workflow { display: grid; grid-template-columns: 222px 1fr; border-radius: 5px; overflow: hidden; }
@@ -269,406 +310,424 @@ svg .s-mono-b { font-family: var(--mono); font-size: 9px; font-weight: 700; fill
 <main class="poster">
   <header class="masthead">
     <div>
-      <p class="kicker">Topology-conditioned inductive edge prediction · rev-3.1</p>
+      <p class="kicker">Topology-conditioned inductive edge prediction · rev-3.2</p>
       <h1>EgoStitch</h1>
       <p class="lede">Imagine two endpoint neighborhoods, align their latent slots, and stitch them into generated local topology that conditions a symmetric binary edge classifier.</p>
     </div>
-    <aside class="thesis" aria-label="Core thesis">
-      <span class="label">The task stays edge prediction</span>
-      <p>Generated topology is intermediate context—not an observed test graph and not the final output.</p>
-      <div class="tags"><span class="tag">unseen nodes</span><span class="tag">binary edge</span><span class="tag">no test topology</span></div>
-    </aside>
   </header>
 
   <section aria-labelledby="architecture-title">
     <div class="section-head">
       <span class="section-no">01 / FLOW</span>
       <h2 id="architecture-title">From endpoint features to an edge probability</h2>
-      <span class="section-note">solid: inference · dashed: training only</span>
     </div>
     <figure class="figure-card">
-      <svg viewBox="0 0 1320 1900" role="img" aria-labelledby="overview-svg-title overview-svg-desc">
-        <title id="overview-svg-title">EgoStitch end-to-end network architecture, top to bottom</title>
-        <desc id="overview-svg-desc">A top-to-bottom network diagram. Raw endpoint token streams enter a Siamese transformer encoder on the left. Endpoint features and a grounding pool enter the Stage-1 generator on the right: feature standardization, TokenizeLite, and a DETR-style ImagineDecoder that emits K neighbor slots. The slot sets split into a topology branch (Sinkhorn alignment, typed scaffold assembly, structure-only message-passing encoder) and a content branch (grounded identity match, content-token assembly, linear projection). Both produce token streams that condition the cls token of the last conditioned pair-trunk layer through zero-initialized gated cross-attention. A gated readout, order-invariant max fusion, and an MLP head produce the binary edge probability. Solid boxes are network modules; dashed cards are the intermediate artifacts passed between them; dashed red cards on the left are training-only supervision.</desc>
-        <defs>
-          <marker id="arrow" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#73818b"/></marker>
-          <marker id="arrow-blue" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#2d67a3"/></marker>
-          <marker id="arrow-amber" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#a76318"/></marker>
-          <marker id="arrow-red" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#b34f43"/></marker>
-          <marker id="arrow-lblue" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#a9c9e8"/></marker>
-          <marker id="arrow-lamber" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#e8c68d"/></marker>
-        </defs>
+      <div class="architecture-grid">
+        <div class="flow-canvas">
+          <svg viewBox="0 0 860 1920" role="img" aria-labelledby="overview-svg-title overview-svg-desc">
+            <title id="overview-svg-title">EgoStitch inference flow and supervised intermediate outputs</title>
+            <desc id="overview-svg-desc">The inference path occupies the left canvas. Raw endpoint tokens form protein token streams, while pooled endpoint features and grounding candidates form generated slot sets that split into topology and content tokens. These three token streams enter separate, explicitly drawn ports of a light-background conditioned pair trunk. Three shared cross-attention layers process both endpoint directions; at the final layer topology first updates the CLS state, then content cross-attention queries that updated state. A gated readout, symmetric max fusion, and binary head produce the queried-edge probability. Red dashed taps identify the shared module outputs supervised by separate node and edge training batches.</desc>
+            <defs>
+              <marker id="overview-arrow" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#73818b"/></marker>
+              <marker id="overview-arrow-blue" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#2d67a3"/></marker>
+              <marker id="overview-arrow-amber" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#a76318"/></marker>
+              <marker id="overview-arrow-red" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#b34f43"/></marker>
+            </defs>
 
-        <!-- ============================ 00 INPUTS ============================ -->
-        <text class="s-micro" x="40" y="24">00 / INPUT · ONE QUERIED PAIR (u, v) OF UNSEEN NODES · NO OBSERVED TEST TOPOLOGY</text>
-        <text class="s-micro" x="1280" y="24" text-anchor="end">SOLID BOX = NETWORK MODULE · DASHED CARD = ARTIFACT PASSED BETWEEN MODULES</text>
+            <text class="s-micro" x="20" y="18">INFERENCE PATH · ONE QUERIED PAIR (u, v)</text>
 
-        <rect class="box" x="40" y="34" width="360" height="74" rx="7"/>
-        <text class="s-label" x="60" y="56">Raw token streams</text>
-        <text class="s-mono" x="60" y="76">emb_a, emb_b  (B, L, 1536)</text>
-        <text class="s-small" x="60" y="94">len_a, len_b · per-item evidence tokens</text>
+            <!-- Inputs -->
+            <rect class="box" x="20" y="36" width="250" height="92" rx="7"/>
+            <text class="s-label" x="38" y="61">Endpoint token streams</text>
+            <text class="s-mono-b" x="38" y="83">E_u, E_v ∈ R^(L × 1536)</text>
+            <text class="s-small" x="38" y="104">per-token endpoint evidence</text>
 
-        <rect class="box" x="424" y="34" width="400" height="74" rx="7"/>
-        <text class="s-label" x="444" y="56">Endpoint features</text>
-        <text class="s-mono" x="444" y="76">x_a, x_b  (B, 1536)</text>
-        <text class="s-small" x="444" y="94">frozen F0 mean-pool · d = input_dim</text>
+            <rect class="box" x="300" y="36" width="250" height="92" rx="7"/>
+            <text class="s-label" x="318" y="61">Pooled endpoint features</text>
+            <text class="s-mono-b" x="318" y="83">x_u, x_v ∈ R^1536</text>
+            <text class="s-small" x="318" y="104">frozen F0 endpoint summaries</text>
 
-        <rect class="box" x="848" y="34" width="432" height="74" rx="7"/>
-        <text class="s-label" x="868" y="56">Grounding pool</text>
-        <text class="s-mono" x="868" y="76">ground_a, ground_b  (B, n_g = 20, 1536)</text>
-        <text class="s-small" x="868" y="94">candidate real neighbors the slots may point at</text>
+            <rect class="box" x="580" y="36" width="250" height="92" rx="7"/>
+            <text class="s-label" x="598" y="61">Grounding candidates</text>
+            <text class="s-mono-b" x="598" y="83">G_u, G_v ∈ R^(50 × 1536)</text>
+            <text class="s-small" x="598" y="104">real candidates available to each slot</text>
 
-        <path class="flow" d="M220 108 V134" marker-end="url(#arrow)"/>
-        <path class="flow" d="M624 108 V134" marker-end="url(#arrow)"/>
-        <path class="flow" d="M1064 108 V134" marker-end="url(#arrow)"/>
+            <path class="flow" d="M145 128 V160" marker-end="url(#overview-arrow)"/>
+            <path class="flow" d="M425 128 V160" marker-end="url(#overview-arrow)"/>
+            <path class="flow" d="M705 128 V160" marker-end="url(#overview-arrow)"/>
 
-        <!-- ==================== 01 RAW-TOKEN PAIR EVIDENCE ==================== -->
-        <text class="s-micro" x="40" y="130">01 / RAW-TOKEN PAIR EVIDENCE</text>
-        <rect class="box" x="40" y="140" width="360" height="150" rx="7"/>
-        <text class="s-title" x="220" y="166" text-anchor="middle">SiameseEncoder</text>
-        <text class="s-mono" x="220" y="190" text-anchor="middle">input_projection  1536 → 512</text>
-        <text class="s-mono" x="220" y="212" text-anchor="middle">3 × TransformerEncoderLayer</text>
-        <text class="s-small" x="220" y="230" text-anchor="middle">d = 512 · 8 heads · FFN 2048 · dropout .1</text>
-        <text class="s-mono" x="220" y="252" text-anchor="middle">output_norm  LayerNorm(512)</text>
-        <text class="s-tiny" x="220" y="274" text-anchor="middle">shared weights both sides · a self-pair encodes once</text>
+            <!-- Raw-token branch -->
+            <rect class="box" x="20" y="168" width="250" height="188" rx="7"/>
+            <text class="s-title" x="145" y="196" text-anchor="middle">Siamese endpoint encoder</text>
+            <rect class="sub" x="42" y="216" width="206" height="36" rx="4"/>
+            <text class="s-mono" x="145" y="239" text-anchor="middle">Linear 1536 → 512</text>
+            <path class="flow" d="M145 252 V266" marker-end="url(#overview-arrow)"/>
+            <rect class="sub" x="42" y="270" width="206" height="58" rx="4"/>
+            <text class="s-small" x="145" y="292" text-anchor="middle">3 × Transformer encoder</text>
+            <text class="s-mono" x="145" y="312" text-anchor="middle">8 heads · FFN 2048</text>
+            <text class="s-tiny" x="145" y="345" text-anchor="middle">same weights for u and v</text>
 
-        <path class="flow" d="M220 290 V304" marker-end="url(#arrow)"/>
-        <rect class="art" x="40" y="308" width="360" height="110" rx="6"/>
-        <text class="art-tag" x="58" y="328">ARTIFACT · ENCODED TOKEN STREAM</text>
-        <rect class="box-blue" x="60" y="338" width="24" height="42" rx="2"/><rect class="box-blue" x="90" y="338" width="24" height="42" rx="2"/><rect class="box-blue" x="120" y="338" width="24" height="42" rx="2"/><rect class="box-blue" x="150" y="338" width="24" height="42" rx="2"/><rect class="box-blue" x="180" y="338" width="24" height="42" rx="2"/><rect class="box-blue" x="210" y="338" width="24" height="42" rx="2"/><rect class="box-blue" x="240" y="338" width="24" height="42" rx="2"/><rect class="slot-faint" x="270" y="338" width="24" height="42" rx="2"/><rect class="slot-faint" x="300" y="338" width="24" height="42" rx="2"/>
-        <text class="s-tiny" x="336" y="364">padded</text>
-        <text class="s-mono-b" x="220" y="404" text-anchor="middle">encoded_a / encoded_b  (B, L, 512)</text>
+            <path class="flow" d="M145 356 V382" marker-end="url(#overview-arrow)"/>
+            <rect class="art" x="20" y="388" width="250" height="78" rx="6"/>
+            <text class="art-tag" x="38" y="409">PROTEIN TOKEN STREAMS</text>
+            <text class="s-mono-b" x="145" y="434" text-anchor="middle">A_u, A_v ∈ R^(L × 512)</text>
+            <text class="s-tiny" x="145" y="452" text-anchor="middle">pair evidence retained token by token</text>
 
-        <path class="flow" d="M85 418 V1502" marker-end="url(#arrow)"/>
-        <text class="s-mono" transform="rotate(-90 74 980)" x="74" y="980" text-anchor="middle">raw pair evidence → trunk</text>
+            <!-- Generator branch -->
+            <rect class="box-green" x="300" y="168" width="530" height="66" rx="7"/>
+            <text class="s-label" x="320" y="193">Feature standardization</text>
+            <text class="s-mono" x="320" y="216">x̃_r, G̃_r = Std(x_r, G_r) · r ∈ {u,v}</text>
 
-        <!-- ================= 02 PER-ENDPOINT STAGE-1 GENERATOR ================= -->
-        <text class="s-micro" x="424" y="130">02 / PER-ENDPOINT GENERATOR</text>
-        <rect class="box-green" x="424" y="140" width="856" height="48" rx="7"/>
-        <text class="s-label" x="444" y="169">FeatureStandardizer</text>
-        <text class="s-mono" x="600" y="169">per-dim z-score · zscore_vfit_v1 · runs once per endpoint (a, then b)</text>
-        <text class="s-small" x="1260" y="169" text-anchor="end">constants pinned by feature_stats_sha256 (V_fit only)</text>
+            <path class="flow" d="M565 234 V252" marker-end="url(#overview-arrow)"/>
+            <rect class="box-green" x="300" y="258" width="530" height="208" rx="7"/>
+            <text class="s-title" x="565" y="286" text-anchor="middle">Shared endpoint generator</text>
 
-        <path class="flow" d="M624 188 V206" marker-end="url(#arrow)"/>
-        <path class="flow" d="M1160 188 V466" marker-end="url(#arrow)"/>
-        <text class="s-mono" x="1172" y="300">ĝ  (B, 20, 1536)</text>
-        <text class="s-tiny" x="1172" y="316">grounding memory</text>
+            <rect class="sub" x="326" y="308" width="200" height="112" rx="5"/>
+            <text class="s-label" x="426" y="332" text-anchor="middle">TokenizeLite</text>
+            <text class="s-mono" x="426" y="354" text-anchor="middle">1536 → 256 → 64</text>
+            <text class="s-small" x="426" y="378" text-anchor="middle">endpoint code e_r</text>
+            <text class="s-small" x="426" y="397" text-anchor="middle">degree distribution μ_d, σ_d</text>
 
-        <rect class="box-green" x="424" y="210" width="620" height="160" rx="7"/>
-        <text class="s-title" x="734" y="236" text-anchor="middle">TokenizeLite · Module 1</text>
-        <rect class="sub" x="442" y="250" width="190" height="44" rx="4"/>
-        <text class="s-small" x="537" y="268" text-anchor="middle">encoder MLP</text><text class="s-mono" x="537" y="284" text-anchor="middle">1536 → 256 → 64</text>
-        <rect class="sub" x="644" y="250" width="190" height="44" rx="4"/>
-        <text class="s-small" x="739" y="268" text-anchor="middle">degree_mean_head</text><text class="s-mono" x="739" y="284" text-anchor="middle">[x̂;e] 1600 → 256 → 1</text>
-        <rect class="sub" x="846" y="250" width="180" height="44" rx="4"/>
-        <text class="s-small" x="936" y="268" text-anchor="middle">degree_dist_head</text><text class="s-mono" x="936" y="284" text-anchor="middle">[x̂;e] 1600 → 256 → 2</text>
-        <text class="s-small" x="734" y="318" text-anchor="middle">GELU + LayerNorm between every pair of linears</text>
-        <text class="s-tiny" x="734" y="338" text-anchor="middle">no VQ codebook in Stage 1 — the encoder embedding e_u replaces the code pair (z_u, r_u) everywhere downstream</text>
-        <text class="s-tiny" x="734" y="356" text-anchor="middle">the degree budget is density-normalized by ρ_eval / ρ_train inside the model, never inside this module</text>
+            <path class="flow" d="M526 364 H550" marker-end="url(#overview-arrow)"/>
+            <rect class="sub" x="556" y="308" width="248" height="112" rx="5"/>
+            <text class="s-label" x="680" y="332" text-anchor="middle">ImagineDecoder</text>
+            <text class="s-mono" x="680" y="354" text-anchor="middle">K = 16 latent neighbor slots</text>
+            <text class="s-small" x="680" y="378" text-anchor="middle">cross-attend to grounding memory</text>
+            <text class="s-small" x="680" y="397" text-anchor="middle">emit h, π, m, g, Q, Â</text>
 
-        <path class="flow" d="M734 370 V380" marker-end="url(#arrow)"/>
-        <rect class="art" x="424" y="384" width="620" height="60" rx="6"/>
-        <text class="art-tag" x="442" y="402">ARTIFACT · NODE CODE + DEGREE BUDGET</text>
-        <rect class="box-green" x="442" y="410" width="9" height="20" rx="1"/><rect class="box-green" x="453" y="410" width="9" height="20" rx="1"/><rect class="box-green" x="464" y="410" width="9" height="20" rx="1"/><rect class="box-green" x="475" y="410" width="9" height="20" rx="1"/><rect class="box-green" x="486" y="410" width="9" height="20" rx="1"/><rect class="box-green" x="497" y="410" width="9" height="20" rx="1"/>
-        <text class="s-mono-b" x="516" y="425">e_u  (B, 64)</text>
-        <text class="s-mono" x="640" y="425">d̂ (B,)  ·  μ, log σ (B,)</text>
-        <text class="s-tiny" x="1026" y="425" text-anchor="end">degree budget · training target only</text>
+            <text class="s-tiny" x="565" y="448" text-anchor="middle">the same generator is applied independently to endpoints u and v</text>
 
-        <path class="flow" d="M734 444 V466" marker-end="url(#arrow)"/>
-        <rect class="box-green" x="424" y="470" width="856" height="215" rx="7"/>
-        <text class="s-title" x="852" y="496" text-anchor="middle">ImagineDecoder · Module 2 — DETR-style set decoder, K = 16 slots</text>
-        <rect class="sub" x="444" y="510" width="400" height="54" rx="4"/>
-        <text class="s-small" x="458" y="528">decoder memory  [ T_cond ; T_g ]</text>
-        <text class="s-mono" x="458" y="544">w_x 1536→256 · w_e 64→256 · w_g 256→256</text>
-        <text class="s-mono" x="458" y="558">(B, 2 + n_g, 256)</text>
-        <rect class="sub" x="864" y="510" width="396" height="54" rx="4"/>
-        <text class="s-small" x="878" y="528">slot queries</text>
-        <text class="s-mono" x="878" y="544">w_q [proj(x_g); e] 320→256 · else q_base + w_q_base(e)</text>
-        <text class="s-mono" x="878" y="558">(B, K, 256)</text>
-        <rect class="sub" x="444" y="576" width="816" height="40" rx="4"/>
-        <text class="s-small" x="852" y="601" text-anchor="middle">3 × _DecoderLayer — slot self-attention → cross-attention to memory → FFN 256 → 1024 → 256, LayerNorm on each residual</text>
-        <rect class="sub-blue" x="444" y="628" width="126" height="34" rx="4"/><text class="s-small" x="507" y="643" text-anchor="middle">head_h</text><text class="s-mono" x="507" y="656" text-anchor="middle">256→256</text>
-        <rect class="sub-blue" x="582" y="628" width="126" height="34" rx="4"/><text class="s-small" x="645" y="643" text-anchor="middle">head_pi</text><text class="s-mono" x="645" y="656" text-anchor="middle">256→1</text>
-        <rect class="sub-blue" x="720" y="628" width="126" height="34" rx="4"/><text class="s-small" x="783" y="643" text-anchor="middle">head_mult</text><text class="s-mono" x="783" y="656" text-anchor="middle">256→1</text>
-        <rect class="sub-blue" x="858" y="628" width="126" height="34" rx="4"/><text class="s-small" x="921" y="643" text-anchor="middle">head_gate</text><text class="s-mono" x="921" y="656" text-anchor="middle">256→1</text>
-        <rect class="sub-blue" x="996" y="628" width="126" height="34" rx="4"/><text class="s-small" x="1059" y="643" text-anchor="middle">head_pointer</text><text class="s-mono" x="1059" y="656" text-anchor="middle">256→256</text>
-        <rect class="sub-blue" x="1134" y="628" width="126" height="34" rx="4"/><text class="s-small" x="1197" y="643" text-anchor="middle">head_adj</text><text class="s-mono" x="1197" y="656" text-anchor="middle">256→256</text>
-        <text class="s-tiny" x="852" y="678" text-anchor="middle">shared projection proj: 1536 → 256 also feeds the matching cost, L_feat, and counterpart membership · the whole generator trains end-to-end with the classifier</text>
+            <path class="flow-red" d="M830 442 H850" marker-end="url(#overview-arrow-red)"/>
+            <text class="s-tiny" x="846" y="432" text-anchor="end" style="fill:#b34f43">node batch · degree + slot targets</text>
 
-        <path class="flow" d="M852 685 V696" marker-end="url(#arrow)"/>
-        <rect class="art" x="424" y="700" width="856" height="130" rx="6"/>
-        <text class="art-tag" x="442" y="720">ARTIFACT · ONE GENERATED EGO NET PER ENDPOINT — SlotSet</text>
-        <circle class="anchor" cx="520" cy="782" r="14"/><text x="520" y="786" text-anchor="middle" style="font-size:10px;font-weight:700;fill:white">u</text>
-        <circle class="slot" cx="478" cy="748" r="9"/><circle class="slot" cx="545" cy="740" r="9"/><circle class="slot" cx="578" cy="778" r="9"/><circle class="slot" cx="500" cy="818" r="9"/><circle class="slot-faint" cx="562" cy="815" r="9"/>
-        <line class="edge-star" x1="520" y1="782" x2="478" y2="748"/><line class="edge-star" x1="520" y1="782" x2="545" y2="740"/><line class="edge-star" x1="520" y1="782" x2="578" y2="778"/><line class="edge-star" x1="520" y1="782" x2="500" y2="818"/><line class="edge-star" x1="520" y1="782" x2="562" y2="815"/>
-        <path class="edge-intra" d="M545 740 Q574 748 578 778" fill="none"/>
-        <text class="s-mono" x="640" y="748">h    (B, K, 256)</text>
-        <text class="s-mono" x="640" y="772">π    (B, K) ∈ [0, 1]</text>
-        <text class="s-mono" x="640" y="796">m    (B, K) ≥ 1</text>
-        <text class="s-mono" x="850" y="748">g       (B, K) grounding gate</text>
-        <text class="s-mono" x="850" y="772">pointer (B, K, 20) softmax</text>
-        <text class="s-mono" x="850" y="796">Â       (B, K, K) symmetric</text>
-        <text class="s-tiny" x="1100" y="748">π = existence, m = multiplicity;</text>
-        <text class="s-tiny" x="1100" y="764">the faint slot is π → 0, i.e. unused</text>
-        <text class="s-tiny" x="1100" y="780">capacity in a fixed-cardinality set.</text>
-        <text class="s-tiny" x="1100" y="804">Nothing here has been scored yet.</text>
+            <path class="flow" d="M565 466 V492" marker-end="url(#overview-arrow)"/>
+            <rect class="art" x="300" y="498" width="530" height="112" rx="6"/>
+            <text class="art-tag" x="320" y="520">GENERATED ENDPOINT STATES</text>
+            <text class="s-mono-b" x="565" y="548" text-anchor="middle">S_r = (H_r, π_r, m_r, g_r, Q_r, Â_r)</text>
+            <text class="s-small" x="565" y="574" text-anchor="middle">slot content · existence · multiplicity · grounding · pointer · adjacency</text>
+            <text class="s-tiny" x="565" y="594" text-anchor="middle">generated topology is intermediate context, not the prediction target</text>
 
-        <path class="flow-blue" d="M852 830 V834 H631 V846" marker-end="url(#arrow-blue)"/>
-        <path class="flow-amber" d="M852 830 V834 H1073 V846" marker-end="url(#arrow-amber)"/>
+            <path class="flow-red" d="M830 552 H850" marker-end="url(#overview-arrow-red)"/>
+            <text class="s-tiny" x="846" y="540" text-anchor="end" style="fill:#b34f43">node batch · recon + SSL</text>
 
-        <!-- ======================= 03/04 PAIR FUSION ======================= -->
-        <text class="s-micro" x="424" y="846" style="fill:#2d67a3">03 / TOPOLOGY BRANCH</text>
-        <text class="s-micro" x="866" y="846" style="fill:#a76318">04 / CONTENT BRANCH</text>
+            <path class="flow-red" d="M830 590 H850" marker-end="url(#overview-arrow-red)"/>
+            <text class="s-tiny" x="846" y="580" text-anchor="end" style="fill:#b34f43">node batch · endpoint realism</text>
 
-        <rect class="box-blue" x="424" y="850" width="414" height="75" rx="7"/>
-        <text class="s-title" x="631" y="874" text-anchor="middle">sinkhorn_log_plan · fp32 island</text>
-        <text class="s-mono" x="631" y="894" text-anchor="middle">cost from (h, π, m) of both sides · ε, iters, τ registered</text>
-        <text class="s-tiny" x="631" y="912" text-anchor="middle">a self-pair (u, u) short-circuits to the identity plan</text>
+            <!-- Topology/content split -->
+            <path class="flow-blue" d="M500 610 V638 H435 V654" marker-end="url(#overview-arrow-blue)"/>
+            <path class="flow-amber" d="M630 610 V638 H700 V654" marker-end="url(#overview-arrow-amber)"/>
 
-        <rect class="box-amber" x="866" y="850" width="414" height="75" rx="7"/>
-        <text class="s-title" x="1073" y="874" text-anchor="middle">grounded_identity_match + counterpart_membership</text>
-        <text class="s-mono" x="1073" y="894" text-anchor="middle">pointer × gate × ground ids  ·  τ_κ vs. the other side's proj(x)</text>
-        <text class="s-tiny" x="1073" y="912" text-anchor="middle">τ_κ is the only part of DecisionHead this model uses — its gate MLP 3→256→1 is Stage-1-only</text>
+            <rect class="box-blue" x="300" y="660" width="265" height="104" rx="7"/>
+            <text class="s-title" x="432" y="686" text-anchor="middle">Align the two slot sets</text>
+            <text class="s-mono" x="432" y="710" text-anchor="middle">C_uv = Cost(S_u, S_v)</text>
+            <text class="s-mono" x="432" y="733" text-anchor="middle">Π_uv = Sinkhorn_ε(C_uv)</text>
+            <text class="s-tiny" x="432" y="751" text-anchor="middle">soft cross-endpoint transport plan</text>
 
-        <path class="flow-blue" d="M631 925 V935" marker-end="url(#arrow-blue)"/>
-        <path class="flow-amber" d="M1073 925 V935" marker-end="url(#arrow-amber)"/>
+            <path class="flow-amber" d="M700 654 V660" marker-end="url(#overview-arrow-amber)"/>
+            <rect class="box-amber" x="590" y="660" width="240" height="104" rx="7"/>
+            <text class="s-title" x="710" y="686" text-anchor="middle">Assemble content tokens</text>
+            <text class="s-mono" x="710" y="710" text-anchor="middle">[H; π; g; id; membership]</text>
+            <text class="s-mono" x="710" y="733" text-anchor="middle">Linear 260 → 512</text>
+            <text class="s-tiny" x="710" y="751" text-anchor="middle">no adjacency or transport plan</text>
 
-        <rect class="art" x="424" y="939" width="414" height="116" rx="6"/>
-        <text class="art-tag" x="442" y="957">ARTIFACT · ALIGNMENT PLAN Π (B, 16, 16)</text>
-        <rect x="448" y="966" width="85" height="85" fill="#fff" stroke="#ddbf8e"/>
-        <rect class="matrix-cell" x="450" y="968" width="16" height="16" fill="#d99b43"/><rect class="matrix-cell" x="467" y="968" width="16" height="16" fill="#f6dfbb"/><rect class="matrix-cell" x="484" y="968" width="16" height="16" fill="#faedd7"/><rect class="matrix-cell" x="501" y="968" width="16" height="16" fill="#f3d5a5"/><rect class="matrix-cell" x="518" y="968" width="13" height="16" fill="#fbf3e6"/>
-        <rect class="matrix-cell" x="450" y="985" width="16" height="16" fill="#f7e5c7"/><rect class="matrix-cell" x="467" y="985" width="16" height="16" fill="#e4b362"/><rect class="matrix-cell" x="484" y="985" width="16" height="16" fill="#f8e8ce"/><rect class="matrix-cell" x="501" y="985" width="16" height="16" fill="#fbf3e6"/><rect class="matrix-cell" x="518" y="985" width="13" height="16" fill="#f2cf98"/>
-        <rect class="matrix-cell" x="450" y="1002" width="16" height="16" fill="#faedd7"/><rect class="matrix-cell" x="467" y="1002" width="16" height="16" fill="#f5dbb2"/><rect class="matrix-cell" x="484" y="1002" width="16" height="16" fill="#dda44e"/><rect class="matrix-cell" x="501" y="1002" width="16" height="16" fill="#faefdd"/><rect class="matrix-cell" x="518" y="1002" width="13" height="16" fill="#f8e8ce"/>
-        <rect class="matrix-cell" x="450" y="1019" width="16" height="16" fill="#fbf3e6"/><rect class="matrix-cell" x="467" y="1019" width="16" height="16" fill="#f8e8ce"/><rect class="matrix-cell" x="484" y="1019" width="16" height="16" fill="#f3d5a5"/><rect class="matrix-cell" x="501" y="1019" width="16" height="16" fill="#e7bb77"/><rect class="matrix-cell" x="518" y="1019" width="13" height="16" fill="#faedd7"/>
-        <rect class="matrix-cell" x="450" y="1036" width="16" height="13" fill="#f5dbb2"/><rect class="matrix-cell" x="467" y="1036" width="16" height="13" fill="#fbf3e6"/><rect class="matrix-cell" x="484" y="1036" width="16" height="13" fill="#f8e8ce"/><rect class="matrix-cell" x="501" y="1036" width="16" height="13" fill="#f6dfbb"/><rect class="matrix-cell" x="518" y="1036" width="13" height="13" fill="#d99b43"/>
-        <text class="s-small" x="552" y="982">soft, doubly-stochastic matching</text>
-        <text class="s-small" x="552" y="1000">between the two imagined slot sets</text>
-        <text class="s-mono" x="552" y="1022">Π = exp(log Π)</text>
-        <text class="s-tiny" x="552" y="1042">log Π is kept — L_align consumes it directly</text>
+            <path class="flow-red" d="M565 712 H576 V778 H850" marker-end="url(#overview-arrow-red)"/>
+            <text class="s-tiny" x="846" y="768" text-anchor="end" style="fill:#b34f43">edge batch · alignment teacher</text>
 
-        <rect class="art" x="866" y="939" width="414" height="116" rx="6"/>
-        <text class="art-tag" x="884" y="957">ARTIFACT · CROSS-SIDE SLOT LABELS</text>
-        <circle class="slot" cx="900" cy="998" r="10" fill="#e8f2eb"/><circle class="slot" cx="932" cy="998" r="10"/><circle class="slot" cx="964" cy="998" r="10" fill="#e8f2eb"/><circle class="slot" cx="996" cy="998" r="10"/><circle class="slot-faint" cx="1028" cy="998" r="10"/>
-        <text class="s-tiny" x="964" y="1026" text-anchor="middle">per-slot, per-side scalars</text>
-        <text class="s-mono" x="1060" y="982">matched_a, matched_b   (B, K)</text>
-        <text class="s-mono" x="1060" y="1004">membership_a, membership_b   (B, K)</text>
-        <text class="s-tiny" x="1060" y="1026">"does this slot name a node the other endpoint also names?"</text>
-        <text class="s-tiny" x="1060" y="1042">"is this slot compatible with the other endpoint's own features?"</text>
+            <path class="flow-blue" d="M432 764 V786" marker-end="url(#overview-arrow-blue)"/>
+            <rect class="box-blue" x="300" y="792" width="265" height="102" rx="7"/>
+            <text class="s-title" x="432" y="818" text-anchor="middle">Stitch typed scaffold</text>
+            <text class="s-mono" x="432" y="842" text-anchor="middle">T_uv = Stitch(S_u,S_v,Π_uv)</text>
+            <text class="s-small" x="432" y="865" text-anchor="middle">STAR · INTRA · ALIGN · CLOSE</text>
+            <text class="s-tiny" x="432" y="882" text-anchor="middle">2 anchors + 2K slots = 34 nodes</text>
 
-        <path class="flow-blue" d="M631 1055 V1065" marker-end="url(#arrow-blue)"/>
-        <path class="flow-amber" d="M1073 1055 V1065" marker-end="url(#arrow-amber)"/>
+            <path class="flow-blue" d="M432 894 V916" marker-end="url(#overview-arrow-blue)"/>
+            <rect class="box-blue" x="300" y="922" width="265" height="82" rx="7"/>
+            <text class="s-title" x="432" y="948" text-anchor="middle">STEncoder</text>
+            <text class="s-mono" x="432" y="971" text-anchor="middle">typed message passing · 11→128→512</text>
+            <text class="s-tiny" x="432" y="990" text-anchor="middle">encodes scaffold geometry only</text>
 
-        <rect class="box-blue" x="424" y="1069" width="414" height="88" rx="7"/>
-        <text class="s-title" x="631" y="1091" text-anchor="middle">build_scaffold · fp32 island</text>
-        <rect class="sub-blue" x="436" y="1100" width="94" height="28" rx="4"/><text class="s-small" x="483" y="1113" text-anchor="middle">STAR</text><text class="s-tiny" x="483" y="1124" text-anchor="middle">π · m</text>
-        <rect class="sub-blue" x="538" y="1100" width="94" height="28" rx="4"/><text class="s-small" x="585" y="1113" text-anchor="middle">INTRA</text><text class="s-tiny" x="585" y="1124" text-anchor="middle">Â · π · π</text>
-        <rect class="sub-blue" x="640" y="1100" width="94" height="28" rx="4"/><text class="s-small" x="687" y="1113" text-anchor="middle">ALIGN</text><text class="s-tiny" x="687" y="1124" text-anchor="middle">Π , Πᵀ</text>
-        <rect class="sub-blue" x="742" y="1100" width="94" height="28" rx="4"/><text class="s-small" x="789" y="1113" text-anchor="middle">CLOSE</text><text class="s-tiny" x="789" y="1124" text-anchor="middle">½(ÂΠ + ΠÂ)</text>
-        <text class="s-mono" x="631" y="1146" text-anchor="middle">V = 2 + 2K = 34 nodes · FEAT_DIM 11 · EDGE_TYPES 4</text>
+            <!-- Three explicit trunk inputs -->
+            <path class="flow" d="M145 466 V1018" marker-end="url(#overview-arrow)"/>
+            <path class="flow-blue" d="M432 1004 V1018" marker-end="url(#overview-arrow-blue)"/>
+            <path class="flow-amber" d="M710 764 V1018" marker-end="url(#overview-arrow-amber)"/>
 
-        <rect class="box-amber" x="866" y="1069" width="414" height="88" rx="7"/>
-        <text class="s-title" x="1073" y="1091" text-anchor="middle">build_content_tokens</text>
-        <text class="s-mono" x="1073" y="1114" text-anchor="middle">[ h ; π ; gate ; matched ; membership ]</text>
-        <text class="s-tiny" x="1073" y="1133" text-anchor="middle">2K = 32 tokens, source-side slots first</text>
-        <text class="s-tiny" x="1073" y="1148" text-anchor="middle">no adjacency, no plan, no scaffold geometry — content cannot smuggle structure</text>
+            <rect class="art" x="20" y="1024" width="250" height="78" rx="6"/>
+            <text class="art-tag" x="38" y="1045">INPUT 1 · PROTEIN TOKENS</text>
+            <text class="s-mono-b" x="145" y="1072" text-anchor="middle">A_u, A_v · L × 512</text>
+            <text class="s-tiny" x="145" y="1090" text-anchor="middle">directed pair evidence</text>
 
-        <path class="flow-blue" d="M631 1157 V1163" marker-end="url(#arrow-blue)"/>
-        <path class="flow-amber" d="M1073 1157 V1163" marker-end="url(#arrow-amber)"/>
+            <rect class="art" x="300" y="1024" width="265" height="78" rx="6"/>
+            <text class="art-tag" x="318" y="1045" style="fill:#2d67a3">INPUT 2 · TOPOLOGY TOKENS</text>
+            <text class="s-mono-b" x="432" y="1072" text-anchor="middle">C_topo^(uv), C_topo^(vu)</text>
+            <text class="s-tiny" x="432" y="1090" text-anchor="middle">34 scaffold nodes · 512 dims</text>
 
-        <rect class="art" x="424" y="1167" width="414" height="128" rx="6"/>
-        <text class="art-tag" x="442" y="1185">ARTIFACT · TYPED STITCHED SCAFFOLD</text>
-        <text class="s-tiny" x="822" y="1185" text-anchor="end">structure only — no h, no gate, no pointer</text>
-        <circle class="anchor" cx="520" cy="1222" r="12"/><text x="520" y="1226" text-anchor="middle" style="font-size:9px;font-weight:700;fill:white">u</text>
-        <circle class="anchor" cx="742" cy="1222" r="12"/><text x="742" y="1226" text-anchor="middle" style="font-size:9px;font-weight:700;fill:white">v</text>
-        <circle class="slot" cx="565" cy="1204" r="9"/><circle class="slot" cx="580" cy="1236" r="9"/><circle class="slot" cx="555" cy="1262" r="9"/>
-        <circle class="slot" cx="697" cy="1204" r="9"/><circle class="slot" cx="682" cy="1236" r="9"/><circle class="slot" cx="707" cy="1262" r="9"/>
-        <line class="edge-star" x1="520" y1="1222" x2="565" y2="1204"/><line class="edge-star" x1="520" y1="1222" x2="580" y2="1236"/><line class="edge-star" x1="520" y1="1222" x2="555" y2="1262"/>
-        <line class="edge-star" x1="742" y1="1222" x2="697" y2="1204"/><line class="edge-star" x1="742" y1="1222" x2="682" y2="1236"/><line class="edge-star" x1="742" y1="1222" x2="707" y2="1262"/>
-        <path class="edge-intra" d="M565 1204 Q592 1214 580 1236" fill="none"/><path class="edge-intra" d="M697 1204 Q670 1214 682 1236" fill="none"/>
-        <line class="edge-align" x1="565" y1="1204" x2="697" y2="1204"/><line class="edge-align" x1="580" y1="1236" x2="682" y2="1236"/>
-        <path class="edge-close" d="M555 1262 Q631 1288 707 1262"/>
-        <text class="s-mono-b" x="631" y="1290" text-anchor="middle">feats (B, 34, 11) · adj (B, 4, 34, 34)</text>
+            <rect class="art" x="590" y="1024" width="240" height="78" rx="6"/>
+            <text class="art-tag" x="608" y="1045" style="fill:#a76318">INPUT 3 · CONTENT TOKENS</text>
+            <text class="s-mono-b" x="710" y="1072" text-anchor="middle">C_cont · 32 × 512</text>
+            <text class="s-tiny" x="710" y="1090" text-anchor="middle">direction-free slot content</text>
 
-        <rect class="art" x="866" y="1167" width="414" height="128" rx="6"/>
-        <text class="art-tag" x="884" y="1185">ARTIFACT · CONTENT TOKENS</text>
-        <rect class="box-amber" x="890" y="1204" width="230" height="14" rx="2"/><rect class="sub-amber" x="1124" y="1204" width="24" height="14" rx="2"/><rect class="sub-amber" x="1150" y="1204" width="24" height="14" rx="2"/><rect class="sub-amber" x="1176" y="1204" width="24" height="14" rx="2"/><rect class="sub-amber" x="1202" y="1204" width="24" height="14" rx="2"/>
-        <rect class="box-amber" x="890" y="1222" width="230" height="14" rx="2"/><rect class="sub-amber" x="1124" y="1222" width="24" height="14" rx="2"/><rect class="sub-amber" x="1150" y="1222" width="24" height="14" rx="2"/><rect class="sub-amber" x="1176" y="1222" width="24" height="14" rx="2"/><rect class="sub-amber" x="1202" y="1222" width="24" height="14" rx="2"/>
-        <rect class="box-amber" x="890" y="1240" width="230" height="14" rx="2"/><rect class="sub-amber" x="1124" y="1240" width="24" height="14" rx="2"/><rect class="sub-amber" x="1150" y="1240" width="24" height="14" rx="2"/><rect class="sub-amber" x="1176" y="1240" width="24" height="14" rx="2"/><rect class="sub-amber" x="1202" y="1240" width="24" height="14" rx="2"/>
-        <rect class="box-amber" x="890" y="1258" width="230" height="14" rx="2"/><rect class="sub-amber" x="1124" y="1258" width="24" height="14" rx="2"/><rect class="sub-amber" x="1150" y="1258" width="24" height="14" rx="2"/><rect class="sub-amber" x="1176" y="1258" width="24" height="14" rx="2"/><rect class="sub-amber" x="1202" y="1258" width="24" height="14" rx="2"/>
-        <text class="s-tiny" x="1005" y="1199" text-anchor="middle">h · 256</text>
-        <text class="s-tiny" x="1136" y="1199" text-anchor="middle">π</text><text class="s-tiny" x="1162" y="1199" text-anchor="middle">g</text><text class="s-tiny" x="1188" y="1199" text-anchor="middle">id</text><text class="s-tiny" x="1214" y="1199" text-anchor="middle">mb</text>
-        <text class="s-tiny" x="1268" y="1236" text-anchor="end">2K = 32</text>
-        <text class="s-tiny" x="1268" y="1252" text-anchor="end">tokens</text>
-        <text class="s-mono-b" x="1073" y="1288" text-anchor="middle">content tokens (B, 32, 260)</text>
+            <path class="flow" d="M145 1102 V1182" marker-end="url(#overview-arrow)"/>
 
-        <path class="flow-blue" d="M631 1295 V1305" marker-end="url(#arrow-blue)"/>
-        <path class="flow-amber" d="M1073 1295 V1305" marker-end="url(#arrow-amber)"/>
+            <!-- Light conditioned pair trunk -->
+            <rect class="box" x="20" y="1132" width="810" height="500" rx="8" style="stroke-width:1.8"/>
+            <text class="s-title" x="42" y="1160">Conditioned pair trunk</text>
+            <text class="s-tiny" x="812" y="1160" text-anchor="end">layer-3 CLS: topology update first, then content update</text>
 
-        <rect class="box-blue" x="424" y="1309" width="414" height="80" rx="7"/>
-        <text class="s-title" x="631" y="1333" text-anchor="middle">STEncoder · typed message passing</text>
-        <text class="s-mono" x="631" y="1353" text-anchor="middle">embed 11→128 · 3 × _MPLayer · out 128→512</text>
-        <text class="s-tiny" x="631" y="1372" text-anchor="middle">each layer carries one message Linear 128→128 per edge type, LayerNorm ×2, MLP 128→256→128</text>
+            <rect class="sub" x="48" y="1182" width="225" height="68" rx="5"/>
+            <text class="s-label" x="160" y="1207" text-anchor="middle">Cross-attention layer 1</text>
+            <text class="s-mono" x="160" y="1230" text-anchor="middle">endpoint tokens exchange evidence</text>
 
-        <rect class="box-amber" x="866" y="1309" width="414" height="80" rx="7"/>
-        <text class="s-title" x="1073" y="1333" text-anchor="middle">ContentProjector</text>
-        <text class="s-mono" x="1073" y="1353" text-anchor="middle">Linear 260 → 512</text>
-        <text class="s-tiny" x="1073" y="1372" text-anchor="middle">one projection per token — content never mixes across slots before the trunk</text>
+            <path class="flow" d="M160 1250 V1270" marker-end="url(#overview-arrow)"/>
+            <rect class="sub" x="48" y="1276" width="225" height="68" rx="5"/>
+            <text class="s-label" x="160" y="1301" text-anchor="middle">Cross-attention layer 2</text>
+            <text class="s-mono" x="160" y="1324" text-anchor="middle">same 512-d residual block</text>
 
-        <path class="flow-blue" d="M631 1389 V1399" marker-end="url(#arrow-blue)"/>
-        <path class="flow-amber" d="M1073 1389 V1399" marker-end="url(#arrow-amber)"/>
+            <path class="flow" d="M160 1344 V1364" marker-end="url(#overview-arrow)"/>
+            <rect class="sub" x="48" y="1370" width="225" height="82" rx="5"/>
+            <text class="s-label" x="160" y="1395" text-anchor="middle">Cross-attention layer 3</text>
+            <text class="s-mono" x="160" y="1418" text-anchor="middle">produces base CLS state c⁰_rs</text>
+            <text class="s-tiny" x="160" y="1438" text-anchor="middle">its CLS state is the injection query</text>
 
-        <rect class="art" x="424" y="1403" width="414" height="75" rx="6"/>
-        <text class="art-tag" x="442" y="1421">ARTIFACT · TOPOLOGY TOKENS</text>
-        <rect class="box-blue" x="442" y="1430" width="18" height="34" rx="2"/><rect class="box-blue" x="464" y="1430" width="18" height="34" rx="2"/><rect class="box-blue" x="486" y="1430" width="18" height="34" rx="2"/><rect class="box-blue" x="508" y="1430" width="18" height="34" rx="2"/><rect class="box-blue" x="530" y="1430" width="18" height="34" rx="2"/><rect class="box-blue" x="552" y="1430" width="18" height="34" rx="2"/>
-        <text class="s-mono-b" x="584" y="1443">topo_ab, topo_ba  (B, 34, 512)</text>
-        <text class="s-tiny" x="584" y="1460">second pass = swap_direction(scaffold), same weights</text>
+            <rect class="sub-blue" x="320" y="1320" width="226" height="112" rx="5"/>
+            <text class="s-label" x="433" y="1346" text-anchor="middle">1 · Topology update</text>
+            <text class="s-mono" x="433" y="1370" text-anchor="middle">δ_topo = XAttn(c⁰,C_topo) − μ_topo</text>
+            <text class="s-mono-b" x="433" y="1395" text-anchor="middle">c_topo = c⁰ + a_topo tanh(γ_topo)δ_topo</text>
+            <text class="s-tiny" x="433" y="1416" text-anchor="middle">centered · gated · exactly bypassable</text>
 
-        <rect class="art" x="866" y="1403" width="414" height="75" rx="6"/>
-        <text class="art-tag" x="884" y="1421">ARTIFACT · CONTENT TOKENS</text>
-        <rect class="box-amber" x="884" y="1430" width="18" height="34" rx="2"/><rect class="box-amber" x="906" y="1430" width="18" height="34" rx="2"/><rect class="box-amber" x="928" y="1430" width="18" height="34" rx="2"/><rect class="box-amber" x="950" y="1430" width="18" height="34" rx="2"/><rect class="box-amber" x="972" y="1430" width="18" height="34" rx="2"/><rect class="box-amber" x="994" y="1430" width="18" height="34" rx="2"/>
-        <text class="s-mono-b" x="1026" y="1443">cont  (B, 32, 512)</text>
-        <text class="s-tiny" x="1026" y="1460">direction-free: one tensor conditions both rows</text>
+            <rect class="sub-amber" x="574" y="1320" width="228" height="112" rx="5"/>
+            <text class="s-label" x="688" y="1346" text-anchor="middle">2 · Content update</text>
+            <text class="s-mono" x="688" y="1370" text-anchor="middle">δ_cont = XAttn(c_topo,C_cont) − μ_cont</text>
+            <text class="s-mono-b" x="688" y="1395" text-anchor="middle">c_cond = c_topo + a_cont tanh(γ_cont)δ_cont</text>
+            <text class="s-tiny" x="688" y="1416" text-anchor="middle">content queries the topology-updated CLS</text>
 
-        <!-- =================== TRAINING-ONLY SUPERVISION RAIL =================== -->
-        <text class="s-micro" x="130" y="452" style="fill:#b34f43">TRAINING-ONLY PRESSURE</text>
-        <rect class="box-red" x="130" y="470" width="270" height="100" rx="6"/>
-        <text class="s-label" x="146" y="492">Degree budget</text>
-        <text class="s-mono" x="146" y="512">lognormal NLL(μ, log σ)</text>
-        <text class="s-mono" x="146" y="530">L_deg</text>
-        <text class="s-tiny" x="146" y="552">supervises how many neighbors a node should</text>
-        <text class="s-tiny" x="146" y="564">imagine before any slot is matched</text>
-        <path class="flow-red" d="M400 500 H412 V332 H418" marker-end="url(#arrow-red)"/>
+            <path class="flow" d="M273 1411 H314" marker-end="url(#overview-arrow)"/>
+            <path class="flow-blue" d="M432 1102 V1314" marker-end="url(#overview-arrow-blue)"/>
+            <path class="flow-amber" d="M710 1102 V1314" marker-end="url(#overview-arrow-amber)"/>
+            <path class="flow" d="M546 1376 H568" marker-end="url(#overview-arrow)"/>
 
-        <rect class="box-red" x="130" y="590" width="270" height="100" rx="6"/>
-        <text class="s-label" x="146" y="612">Hungarian slot targets</text>
-        <text class="s-mono" x="146" y="632">match_slots · message-partition</text>
-        <text class="s-mono" x="146" y="650">L_feat · L_exist · L_mult · L_slotadj</text>
-        <text class="s-tiny" x="146" y="672">assignment is recomputed every step; the model</text>
-        <text class="s-tiny" x="146" y="684">never sees the target ordering</text>
-        <path class="flow-red" d="M400 640 H418" marker-end="url(#arrow-red)"/>
+            <path class="flow" d="M688 1432 V1480" marker-end="url(#overview-arrow)"/>
+            <rect class="sub" x="320" y="1486" width="482" height="82" rx="5"/>
+            <text class="s-label" x="561" y="1511" text-anchor="middle">PairContextGatedReadout</text>
+            <text class="s-mono" x="561" y="1536" text-anchor="middle">conditioned CLS + branch summaries → z_rs ∈ R^512</text>
+            <text class="s-tiny" x="561" y="1556" text-anchor="middle">computed once for r→s = u→v and once for v→u</text>
 
-        <rect class="box-red" x="130" y="710" width="270" height="100" rx="6"/>
-        <text class="s-label" x="146" y="732">Grounding + diversity</text>
-        <text class="s-mono" x="146" y="752">L_ptr · L_gate · L_div</text>
-        <text class="s-tiny" x="146" y="774">pushes each slot to name a real candidate and</text>
-        <text class="s-tiny" x="146" y="786">keeps slot content off the collapse manifold</text>
-        <text class="s-tiny" x="146" y="802">(cosine guard τ_div, gate pos-weight 6.17)</text>
-        <path class="flow-red" d="M400 760 H418" marker-end="url(#arrow-red)"/>
+            <path class="flow" d="M561 1568 V1647 H340 V1662" marker-end="url(#overview-arrow)"/>
+            <rect class="art" x="170" y="1662" width="340" height="80" rx="6"/>
+            <text class="art-tag" x="188" y="1684">DIRECTED PAIR EMBEDDINGS</text>
+            <text class="s-mono-b" x="340" y="1712" text-anchor="middle">z_uv, z_vu ∈ R^512</text>
+            <text class="s-tiny" x="340" y="1731" text-anchor="middle">same trunk, opposite endpoint order</text>
 
-        <rect class="box-red" x="130" y="830" width="270" height="100" rx="6"/>
-        <text class="s-label" x="146" y="852">Alignment teacher</text>
-        <text class="s-mono" x="146" y="872">alignment_teacher_cells → L_align</text>
-        <text class="s-tiny" x="146" y="894">double matching says which (slot, slot) cells</text>
-        <text class="s-tiny" x="146" y="906">name the same real node; log Π is scored against</text>
-        <text class="s-tiny" x="146" y="918">them on real positives only</text>
-        <path class="flow-red" d="M400 880 H418" marker-end="url(#arrow-red)"/>
+            <rect class="box-red" x="546" y="1662" width="284" height="80" rx="6"/>
+            <text class="s-label" x="688" y="1686" text-anchor="middle">Train-only relational head</text>
+            <text class="s-mono" x="688" y="1710" text-anchor="middle">mean(C_topo) → 512→256→2</text>
+            <text class="s-tiny" x="688" y="1730" text-anchor="middle">discarded for inference and scoring</text>
+            <path class="flow-blue" d="M432 1102 H842 V1702 H830" marker-end="url(#overview-arrow-blue)"/>
+            <path class="flow-red" d="M830 1702 H850" marker-end="url(#overview-arrow-red)"/>
 
-        <rect class="box-red" x="130" y="950" width="270" height="100" rx="6"/>
-        <text class="s-label" x="146" y="972">Realism · RandomGIN</text>
-        <text class="s-mono" x="146" y="992">4→64→64→64 (random) · L_real</text>
-        <text class="s-tiny" x="146" y="1014">MMD between generated and real train-side ego</text>
-        <text class="s-tiny" x="146" y="1026">statistics and random-GIN embeddings; the three</text>
-        <text class="s-tiny" x="146" y="1038">MMD ratios are never aggregated</text>
-        <path class="flow-red" d="M400 1000 H412 V1105 H418" marker-end="url(#arrow-red)"/>
+            <!-- Symmetric decision -->
+            <path class="flow" d="M340 1742 V1768" marker-end="url(#overview-arrow)"/>
+            <rect class="box" x="70" y="1774" width="240" height="92" rx="7"/>
+            <text class="s-title" x="190" y="1803" text-anchor="middle">AB/BA symmetric max</text>
+            <text class="s-mono" x="190" y="1828" text-anchor="middle">z_sym = max(z_uv, z_vu)</text>
+            <text class="s-tiny" x="190" y="1848" text-anchor="middle">feature-wise order invariance</text>
 
-        <rect class="box-red" x="130" y="1070" width="270" height="100" rx="6"/>
-        <text class="s-label" x="146" y="1092">Relational head</text>
-        <text class="s-mono" x="146" y="1112">rel_head 512→256→2 · L_rel</text>
-        <text class="s-tiny" x="146" y="1134">reads mean(topo_ab) and predicts common</text>
-        <text class="s-tiny" x="146" y="1146">neighbors / Jaccard; discarded at inference,</text>
-        <text class="s-tiny" x="146" y="1158">absent entirely in the w_rel = 0 arm</text>
-        <path class="flow-red" d="M400 1120 H412 V1440 H418" marker-end="url(#arrow-red)"/>
+            <path class="flow" d="M310 1820 H344" marker-end="url(#overview-arrow)"/>
+            <rect class="box" x="350" y="1774" width="220" height="92" rx="7"/>
+            <text class="s-title" x="460" y="1803" text-anchor="middle">Binary edge head</text>
+            <text class="s-mono" x="460" y="1828" text-anchor="middle">ℓ_uv = MLP(z_sym)</text>
+            <text class="s-tiny" x="460" y="1848" text-anchor="middle">512 → 256 → 1</text>
 
-        <rect class="box-red" x="130" y="1190" width="270" height="100" rx="6"/>
-        <text class="s-label" x="146" y="1212">Edge objective + branch dropout</text>
-        <text class="s-mono" x="146" y="1232">L_edge · p_topo = p_cont = 0.15</text>
-        <text class="s-tiny" x="146" y="1254">the only loss on the scored logit; independent</text>
-        <text class="s-tiny" x="146" y="1266">branch masks keep every hard-bypass logit of the</text>
-        <text class="s-tiny" x="146" y="1278">same checkpoint trained and usable</text>
-        <path class="flow-red" d="M265 1290 V1502" marker-end="url(#arrow-red)"/>
+            <path class="flow" d="M570 1820 H604" marker-end="url(#overview-arrow)"/>
+            <rect class="box-blue" x="610" y="1774" width="220" height="92" rx="7"/>
+            <text x="720" y="1816" text-anchor="middle" style="font-family:var(--serif);font-size:22px;font-weight:600;fill:#2d67a3">p_uv = σ(ℓ_uv)</text>
+            <text class="s-small" x="720" y="1845" text-anchor="middle">binary queried-edge probability</text>
+            <path class="flow-red" d="M830 1820 H850" marker-end="url(#overview-arrow-red)"/>
+          </svg>
+        </div>
 
-        <!-- ================= 05 CONDITIONED PAIR TRUNK ================= -->
-        <path class="flow-blue" d="M631 1478 V1494 H1090 V1512"/>
-        <path class="flow-amber" d="M1073 1478 V1502 H1235 V1512"/>
+        <aside class="loss-rail" aria-labelledby="loss-rail-title">
+          <div class="loss-rail-head">
+            <h3 id="loss-rail-title">Training losses</h3>
+            <p>Training synchronizes two streams: a node batch supplies generator reconstruction, endpoint realism, and SSL; an edge batch supplies alignment, relational, and queried-edge targets. Dashed taps mark shared-module outputs, not reuse of the queried-pair rows. Only \(\mathcal L_{\mathrm{edge}}\) touches the scored edge logit.</p>
+          </div>
 
-        <rect class="box-dark" x="40" y="1510" width="1240" height="250" rx="8"/>
-        <path class="flow-blue" d="M1090 1510 V1572" stroke="#a9c9e8" marker-end="url(#arrow-lblue)"/>
-        <path class="flow-amber" d="M1235 1510 V1637 H1208" stroke="#e8c68d" marker-end="url(#arrow-lamber)"/>
-        <text class="s-micro" x="62" y="1534" style="fill:#a9c9e8">05 / CONDITIONED PAIR TRUNK</text>
-        <text class="s-white" x="660" y="1534" text-anchor="middle">ConditionedPairCrossAttention — AB and BA stacked into one trunk batch (2B rows)</text>
-        <text class="s-white-mono" x="660" y="1556" text-anchor="middle">q = [enc_a ; enc_b]   ·   kv = [enc_b ; enc_a]   ·   + learned cls token   ·   both directions share one synchronized conditioning statistic and one EMA update</text>
+          <div class="loss-group">
+            <h4 class="loss-group-title">Generator and matched slots · node batch</h4>
 
-        <rect class="sub-dark" x="70" y="1578" width="290" height="72" rx="5"/>
-        <text class="s-white-s" x="215" y="1598" text-anchor="middle">CrossAttentionLayer 1</text>
-        <text class="s-white-mono" x="215" y="1616" text-anchor="middle">a ⇄ b cross-attn · 8 heads</text>
-        <text class="s-white-mono" x="215" y="1632" text-anchor="middle">FFN 512→2048→512 · cls: attn_cls + ff_cls 1024</text>
-        <path class="flow" d="M360 1614 H376" marker-end="url(#arrow)" stroke="#dce4e9"/>
-        <rect class="sub-dark" x="380" y="1578" width="290" height="72" rx="5"/>
-        <text class="s-white-s" x="525" y="1598" text-anchor="middle">CrossAttentionLayer 2</text>
-        <text class="s-white-mono" x="525" y="1616" text-anchor="middle">same block, shared shape</text>
-        <text class="s-white-mono" x="525" y="1632" text-anchor="middle">4 LayerNorms · dropout .1 on every residual</text>
-        <path class="flow" d="M670 1614 H686" marker-end="url(#arrow)" stroke="#dce4e9"/>
-        <rect class="sub-dark" x="690" y="1578" width="290" height="72" rx="5"/>
-        <text class="s-white-s" x="835" y="1598" text-anchor="middle">CrossAttentionLayer 3</text>
-        <text class="s-white-mono" x="835" y="1616" text-anchor="middle">last of n_layers = 3</text>
-        <text class="s-white-mono" x="835" y="1632" text-anchor="middle">its cls output is the injection point</text>
-        <path class="flow-blue" d="M980 1596 H1006" marker-end="url(#arrow-blue)"/>
+            <article class="loss-box">
+              <h4><span>\(\mathcal L_{\mathrm{deg}}\)</span><span>degree head</span></h4>
+              <div class="loss-math">\(\mathcal L_{\mathrm{deg}}=-\log p_{\mathrm{LogNormal}}(d_r^\star\mid\mu_r,\sigma_r)\)</div>
+              <p>Fits the total number of neighbors the endpoint generator should represent.</p>
+            </article>
 
-        <rect x="1010" y="1576" width="190" height="36" rx="5" fill="#2d67a3" stroke="#2d67a3"/>
-        <text class="s-white-s" x="1105" y="1591" text-anchor="middle">GatedCrossAttention · topo</text>
-        <text class="s-white-mono" x="1105" y="1605" text-anchor="middle">cls ← topo tokens</text>
-        <path class="flow-blue" d="M1105 1612 V1622" marker-end="url(#arrow-blue)" stroke="#dce4e9"/>
-        <rect x="1010" y="1626" width="190" height="36" rx="5" fill="#a76318" stroke="#a76318"/>
-        <text class="s-white-s" x="1105" y="1641" text-anchor="middle">GatedCrossAttention · cont</text>
-        <text class="s-white-mono" x="1105" y="1655" text-anchor="middle">cls ← content tokens</text>
+            <article class="loss-box">
+              <h4><span>\(\mathcal L_{\mathrm{feat}}\)</span><span>slot states</span></h4>
+              <div class="loss-math">\(\mathcal L_{\mathrm{feat}}=\operatorname{mean}_{k\in M}\!\operatorname{SmoothL1}(h_k,h^\star_{a(k)})+\operatorname{mean}_{k\in D}\!\operatorname{SmoothL1}(h_k^D,h_k^{D\star})\)</div>
+              <p>Reconstructs Hungarian-matched neighbors and folds in the fixed-assignment denoising-query feature target.</p>
+            </article>
 
-        <text class="s-white-mono" x="70" y="1676">n_inj = 1 · zero-init tanh gate · EMA-centered on real rows · cls token only · a_topo / a_cont are the exact four-logit hard bypass</text>
+            <article class="loss-box">
+              <h4><span>\(\mathcal L_{\mathrm{exist}}\)</span><span>existence probabilities</span></h4>
+              <div class="loss-math">\(\mathcal L_{\mathrm{exist}}=\tfrac12\operatorname{BCE}_{+}(\pi,t^\pi)+\tfrac12\operatorname{BCE}_{-}(\pi,t^\pi)+\operatorname{mean}_{k\in D}\operatorname{BCE}(\pi_k^D,1)\)</div>
+              <p>Balances matched and unmatched slots, then adds the denoising queries' positive-existence target.</p>
+            </article>
 
-        <path class="flow" d="M835 1650 V1686" marker-end="url(#arrow)" stroke="#dce4e9"/>
-        <path class="flow" d="M1105 1662 V1686" marker-end="url(#arrow)" stroke="#dce4e9"/>
-        <rect class="sub-dark" x="70" y="1690" width="1190" height="55" rx="5"/>
-        <text class="s-white-s" x="90" y="1712">PairContextGatedReadout — fp32, gradient-checkpointed</text>
-        <text class="s-white-mono" x="90" y="1732">context_proj 1024→512 · attn_scorer 1024→512→1 · branch_gate 6144→3 · branch_proj 2048→512 · final_proj 1024→512   →   pair representation (2B, 512)</text>
+            <article class="loss-box">
+              <h4><span>\(\mathcal L_{\mathrm{mult}}\)</span><span>multiplicity head</span></h4>
+              <div class="loss-math">\(\mathcal L_{\mathrm{mult}}=\tfrac12\operatorname{mean}_k[\log m_k-\log m^\star_{a(k)}]^2\)</div>
+              <p>Predicts how many real neighbors a matched slot compresses into one state.</p>
+            </article>
 
-        <!-- ================= 06 SYMMETRIC EDGE DECISION ================= -->
-        <path class="flow" d="M660 1760 V1786" marker-end="url(#arrow)"/>
-        <text class="s-micro" x="460" y="1782">06 / SYMMETRIC EDGE DECISION</text>
+            <article class="loss-box">
+              <h4><span>\(\mathcal L_{\mathrm{slotadj}}\)</span><span>adjacency logits</span></h4>
+              <div class="loss-math">\(\mathcal L_{\mathrm{slotadj}}=\operatorname{BCEWithLogits}(\ell^{A}_{k\ell}/\tau_A,A^\star_{a(k)a(\ell)})\)</div>
+              <p>Reconstructs edges among the matched neighbor slots of each endpoint.</p>
+            </article>
 
-        <rect class="box" x="40" y="1790" width="390" height="86" rx="7"/>
-        <text class="s-label" x="58" y="1812">Three fp32 islands</text>
-        <text class="s-tiny" x="58" y="1832">Sinkhorn · scaffold products · readout and head.</text>
-        <text class="s-tiny" x="58" y="1848">bf16 would quantize away the full-minus-null residual,</text>
-        <text class="s-tiny" x="58" y="1864">which is the quantity every mechanism claim rests on.</text>
+            <article class="loss-box">
+              <h4><span>\(\mathcal L_{\mathrm{gate}}\)</span><span>grounding probability</span></h4>
+              <div class="loss-math">\(\mathcal L_{\mathrm{gate}}=\operatorname{WBCE}(g_k,\mathbf 1[h^\star_{a(k)}\in G_r];w_+=6.17)\)</div>
+              <p>Decides whether a slot should name a candidate from the available grounding pool.</p>
+            </article>
 
-        <rect class="box" x="460" y="1790" width="300" height="86" rx="7"/>
-        <text class="s-title" x="610" y="1818" text-anchor="middle">abba max</text>
-        <text class="s-mono" x="610" y="1840" text-anchor="middle">max(feat_AB, feat_BA)</text>
-        <text class="s-tiny" x="610" y="1860" text-anchor="middle">feature-wise · enforces p(u,v) = p(v,u)</text>
-        <path class="flow" d="M760 1833 H796" marker-end="url(#arrow)"/>
+            <article class="loss-box">
+              <h4><span>\(\mathcal L_{\mathrm{ptr}}\)</span><span>pointer probabilities</span></h4>
+              <div class="loss-math">\(\mathcal L_{\mathrm{ptr}}=-\operatorname{mean}_k\log Q_{k,j^\star_{a(k)}}\)</div>
+              <p>Selects the correct real grounding candidate when the matched target is in the pool.</p>
+            </article>
 
-        <rect class="box" x="800" y="1790" width="220" height="86" rx="7"/>
-        <text class="s-title" x="910" y="1818" text-anchor="middle">MLPHead</text>
-        <text class="s-mono" x="910" y="1840" text-anchor="middle">512 → 256 → 1</text>
-        <text class="s-tiny" x="910" y="1860" text-anchor="middle">LayerNorm · GELU · drop .1</text>
-        <path class="flow" d="M1020 1833 H1056" marker-end="url(#arrow)"/>
+            <article class="loss-box">
+              <h4><span>\(\mathcal L_{\mathrm{div}}\)</span><span>slot geometry</span></h4>
+              <div class="loss-math">\(\mathcal L_{\mathrm{div}}=\operatorname{mean}_{(k,\ell)\in\mathcal E}[\cos(h_k,h_\ell)-\tau_{\mathrm{div}}]_+^2\)</div>
+              <p>Separates slot pairs for which at least one slot is unmatched, where target reconstruction gives no pairwise separation.</p>
+            </article>
+          </div>
 
-        <rect class="box-blue" x="1060" y="1790" width="220" height="86" rx="7"/>
-        <text class="s-micro" x="1170" y="1810" text-anchor="middle">BINARY QUERIED-EDGE OUTPUT</text>
-        <text x="1170" y="1843" text-anchor="middle" style="font-family:var(--serif);font-size:24px;font-weight:600;fill:#2d67a3">p<tspan baseline-shift="sub" font-size="12">uv</tspan></text>
-        <text class="s-mono" x="1170" y="1864" text-anchor="middle">= σ(logit) ∈ [0, 1]</text>
-      </svg>
+          <div class="loss-group">
+            <h4 class="loss-group-title">Alignment · edge batch</h4>
+
+            <article class="loss-box">
+              <h4><span>\(\mathcal L_{\mathrm{align}}\)</span><span>Sinkhorn log-plan</span></h4>
+              <div class="loss-math">\(\mathcal L_{\mathrm{align}}=-\operatorname{mean}_{(k,\ell)\in T}\frac12[\log\Pi_{\ell\mid k}+\log\Pi_{k\mid\ell}]\)</div>
+              <p>Places slots that name the same real neighbor into the teacher-marked transport cells.</p>
+            </article>
+          </div>
+
+          <div class="loss-group">
+            <h4 class="loss-group-title">Endpoint realism · node batch</h4>
+
+            <article class="loss-box">
+              <h4><span>\(\mathcal L_{\mathrm{egostat}}\)</span><span>ego statistics</span></h4>
+              <div class="loss-math">\(\mathcal L_{\mathrm{egostat}}=\operatorname{ED}(s(\widehat S_r),s(S_r^\star))\)</div>
+              <p>Matches degree, neighbor-neighbor density, total ego edges, and whole-ego density.</p>
+            </article>
+
+            <article class="loss-box">
+              <h4><span>\(\mathcal L_{\mathrm{GIN}}\)</span><span>graph embedding</span></h4>
+              <div class="loss-math">\(\mathcal L_{\mathrm{GIN}}=\operatorname{ED}(\operatorname{GIN}_{\mathrm{rand}}(\widehat S_r),\operatorname{GIN}_{\mathrm{rand}}(S_r^\star))\)</div>
+              <p>Matches generated topology to real ego graphs in a frozen random-GIN representation.</p>
+            </article>
+          </div>
+
+          <div class="loss-group">
+            <h4 class="loss-group-title">Perturbation consistency · node batch</h4>
+
+            <article class="loss-box">
+              <h4><span>\(\mathcal L_{\mathrm{noise}}\)</span><span>slot consistency</span></h4>
+              <div class="loss-math">\(\mathcal L_{\mathrm{noise}}=\operatorname{mean}_{k:g_k&lt;.5}\lVert h_k(x_r,G_r)-h_k(x_r+\epsilon,G_r)\rVert_2^2\)</div>
+              <p>Keeps ungrounded slots stable when the endpoint feature is slightly perturbed.</p>
+            </article>
+
+            <article class="loss-box">
+              <h4><span>\(\mathcal L_{\mathrm{pool}}\)</span><span>slot consistency</span></h4>
+              <div class="loss-math">\(\mathcal L_{\mathrm{pool}}=\operatorname{mean}_{k:g_k&lt;.5}\lVert h_k(x_r,G_r)-h_k(x_r,G'_r)\rVert_2^2\)</div>
+              <p>Keeps ungrounded slots stable when the grounding candidate pool is resampled.</p>
+            </article>
+          </div>
+
+          <div class="loss-group">
+            <h4 class="loss-group-title">Pair-level objectives · edge batch</h4>
+
+            <article class="loss-box">
+              <h4><span>\(\mathcal L_{\mathrm{rel}}\)</span><span>train-only head</span></h4>
+              <div class="loss-math">\(\mathcal L_{\mathrm{rel}}=\operatorname{SmoothL1}(\widehat r_{uv},[\log(1+\mathrm{CN}_{uv}),J_{uv}])\)</div>
+              <p>Teaches log common-neighbor count and Jaccard relation without entering the scored logit.</p>
+            </article>
+
+            <article class="loss-box">
+              <h4><span>\(\mathcal L_{\mathrm{edge}}\)</span><span>scored logit</span></h4>
+              <div class="loss-math">\(\mathcal L_{\mathrm{edge}}=\frac{\sum_i m_i\,\omega(y_i)\operatorname{BCEWithLogits}(\ell_i,y_i)}{\sum_i m_i\,\omega(y_i)},\quad\omega(1)=5\)</div>
+              <p>The only loss applied to the final queried-edge logit; padding rows are masked out.</p>
+            </article>
+          </div>
+
+          <div class="loss-total">
+            <div class="loss-math">
+              \[
+              \begin{aligned}
+              \mathcal L_{\mathrm{total}}(t)&=\mathcal L_{\mathrm{recon}}(t)+I_{\mathrm{edge}}(t)\mathcal L_{\mathrm{edge}}\\
+              &\quad+\alpha(t)\,[0.5\mathcal L_{\mathrm{real}}+0.1\mathcal L_{\mathrm{ssl}}],\\
+              \mathcal L_{\mathrm{recon}}(t)&=\sum_{j\in\mathcal R}f_j(t)w_j\mathcal L_j,\\
+              \mathcal L_{\mathrm{real}}&=\tfrac23\mathcal L_{\mathrm{egostat}}+\tfrac13\mathcal L_{\mathrm{GIN}},\\
+              \mathcal L_{\mathrm{ssl}}&=\tfrac12\mathcal L_{\mathrm{noise}}+\tfrac12\mathcal L_{\mathrm{pool}},\\
+              I_{\mathrm{edge}}(t)&=\mathbf1[t\in B\cup C],\qquad
+              \alpha(t)=0\ (A),\ 0{\to}1\ (B),\ 1\ (C).
+              \end{aligned}
+              \]
+            </div>
+            <p>Phase A trains reconstruction only; Phase B activates the full edge term while ramping realism and SSL; Phase C uses all terms. The fidelity factors for degree, feature, existence, and multiplicity anneal from 1 to .25 after edge training starts. Here \(M\) is the matched-slot set, \(D\) the denoising-query set, \(a(k)\) the Hungarian assignment, \(T\) the alignment-teacher cells, \(\mathcal E=\{(k,\ell):k\ne\ell\text{ and not both slots are matched}\}\), and \(\operatorname{ED}\) standardized energy distance.</p>
+          </div>
+        </aside>
+      </div>
       <figcaption class="figure-caption">
-        <span><strong>Figure 1 · The complete network, top to bottom.</strong> Every trained module is named with its actual widths; the dashed cards between them are the artifacts each module hands to the next — the generated ego net, the alignment plan, the typed scaffold, and the two token streams. Generated topology is compressed into 34 scaffold nodes and injected only into the cls token of the last trunk layer: it is conditioning context, never the output.</span>
+        <span><strong>Figure 1 · Inference flow on the left, optimization targets on the right.</strong> Protein, topology, and content tokens enter three explicit ports of the conditioned pair trunk. After the third shared pair layer produces a base CLS state, topology updates that state first and content cross-attention queries the topology-updated result; the gated readout then forms each directed pair embedding. Dashed taps distinguish node-batch from edge-batch supervision, while generated topology remains intermediate context for the binary queried-edge decision.</span>
         <span class="legend"><span class="legend-item"><i class="swatch generated"></i>generator</span><span class="legend-item"><i class="swatch topo"></i>topology</span><span class="legend-item"><i class="swatch content"></i>content</span><span class="legend-item"><i class="swatch artifact"></i>artifact</span><span class="legend-item"><i class="dash"></i>training only</span></span>
       </figcaption>
     </figure>
 
-    <div class="math-ribbon" aria-label="Compact EgoStitch mathematical pipeline">
-      <div class="math-step"><b>Imagine</b><span>\(S_u = \operatorname{Imagine}(x_u)\)</span></div>
-      <div class="math-step"><b>Align</b><span>\(\Pi = \operatorname{Sinkhorn}(C^\Pi)\)</span></div>
-      <div class="math-step"><b>Scaffold</b><span>\(\widehat T_{ij} = \operatorname{Stitch}(S_i,S_j,\Pi)\)</span></div>
-      <div class="math-step"><b>Condition</b><span>\(z' = \operatorname{Trunk}+\operatorname{XAttn}(c_{\mathrm{topo}},c_{\mathrm{cont}})\)</span></div>
-      <div class="math-step"><b>Predict</b><span>\(p_{ij}=\sigma(\operatorname{head}(\operatorname{abba\_max}(z')))\)</span></div>
+    <div class="data-flow" aria-labelledby="data-flow-title">
+      <h3 id="data-flow-title">Model data flow</h3>
+      <p><strong>Inputs and output.</strong> For a queried endpoint pair \((u,v)\), the model receives raw endpoint token streams \(E_u,E_v\), frozen pooled endpoint features \(x_u,x_v\), and endpoint-specific grounding candidates \(G_u,G_v\). Its only task output is the probability \(p_{uv}\) that the queried edge exists; generated topology remains intermediate conditioning context.</p>
+      \[
+      \begin{aligned}
+      &E_r\in\mathbb{R}^{L_r\times1536},\quad x_r\in\mathbb{R}^{1536},\quad G_r\in\mathbb{R}^{n_g\times1536},\qquad r\in\{u,v\},\\
+      &(\widetilde x_r,\widetilde G_r)=\operatorname{Std}_{\mathrm{fit}}(x_r,G_r),\qquad A_r=\operatorname{Enc}(E_r)\in\mathbb{R}^{L_r\times512},\\
+      &p_{uv}=P\!\left(y_{uv}=1\mid E_u,E_v,x_u,x_v,G_u,G_v\right)\in[0,1].
+      \end{aligned}
+      \]
+      <p><strong>Generate, align, and stitch.</strong> The shared endpoint generator converts each standardized endpoint and its grounding pool into \(K\) latent neighbor slots. A learned cost aligns the two unordered slot sets with entropic optimal transport; the resulting plan is then used to assemble a typed pair scaffold.</p>
+      \[
+      \begin{aligned}
+      S_r&=\operatorname{Gen}(\widetilde x_r,\widetilde G_r)
+      =(H_r,\pi_r,m_r,g_r,Q_r,\widehat A_r),\\
+      H_r&\in\mathbb{R}^{K\times256},\quad
+      \pi_r,g_r\in[0,1]^K,\quad m_r\in[1,\infty)^K,\quad
+      Q_r\in[0,1]^{K\times n_g},\quad \widehat A_r\in[0,1]^{K\times K},\\
+      C_{uv}&=\operatorname{Cost}(S_u,S_v),\qquad
+      \Pi_{uv}=\operatorname{Sinkhorn}_{\varepsilon}(C_{uv};\pi_u,\pi_v)\in\mathbb{R}_{+}^{K\times K},\\
+      \mathcal T_{uv}&=\operatorname{Stitch}(S_u,S_v,\Pi_{uv}),\qquad
+      C_{\mathrm{topo}}^{uv}=\operatorname{STE}(\mathcal T_{uv}),\qquad
+      C_{\mathrm{cont}}^{uv}=\operatorname{Cont}(S_u,S_v).
+      \end{aligned}
+      \]
+      <p><strong>Condition both directions.</strong> The Siamese pair trunk processes \(u\!\to\!v\) and \(v\!\to\!u\) separately. In its final layer, topology first updates the base CLS state; content cross-attention then queries that topology-updated state. Both updates are centered, gated residuals and can be bypassed exactly.</p>
+      \[
+      \begin{aligned}
+      c_{rs}^{(0)}&=\operatorname{CLS}\!\left(\operatorname{Trunk}(A_r,A_s)\right),\\
+      \delta_{rs}^{\mathrm{topo}}&=\operatorname{XAttn}_{\mathrm{topo}}\!\left(c_{rs}^{(0)},C_{\mathrm{topo}}^{rs}\right)-\mu_{\mathrm{topo}},\\
+      c_{rs}^{\mathrm{topo}}&=c_{rs}^{(0)}+a_{\mathrm{topo}}\tanh(\gamma_{\mathrm{topo}})\,\delta_{rs}^{\mathrm{topo}},\\
+      \delta_{rs}^{\mathrm{cont}}&=\operatorname{XAttn}_{\mathrm{cont}}\!\left(c_{rs}^{\mathrm{topo}},C_{\mathrm{cont}}^{rs}\right)-\mu_{\mathrm{cont}},\\
+      c_{rs}^{\mathrm{cond}}&=c_{rs}^{\mathrm{topo}}+a_{\mathrm{cont}}\tanh(\gamma_{\mathrm{cont}})\,\delta_{rs}^{\mathrm{cont}},\\
+      z_{rs}&=\operatorname{Readout}\!\left(A_r,A_s,c_{rs}^{\mathrm{cond}}\right),\qquad
+      (r,s)\in\{(u,v),(v,u)\}.
+      \end{aligned}
+      \]
+      <p><strong>Symmetric edge decision.</strong> The two directed states are combined by a feature-wise maximum before the binary head, so swapping the queried endpoints leaves the prediction unchanged.</p>
+      \[
+      z_{uv}^{\mathrm{sym}}=\operatorname{max}\!\left(z_{uv},z_{vu}\right),\qquad
+      p_{uv}=\sigma\!\left(\operatorname{MLP}(z_{uv}^{\mathrm{sym}})\right)=p_{vu}.
+      \]
+      <p><strong>Symbols.</strong> \(L_r\) is endpoint \(r\)'s token count, \(n_g\) the number of grounding candidates, \(K\) the number of generated slots, and \(y_{uv}\in\{0,1\}\) the queried-edge label. \(\operatorname{Std}_{\mathrm{fit}}\) uses statistics frozen on the fitting universe for both endpoint and grounding features, while \(\operatorname{Enc}\) is the shared raw-token encoder. \(H_r\) are slot states; \(\pi_r\), \(m_r\), and \(g_r\) are slot existence, multiplicity, and grounding gates; \(Q_r\) is the pointer distribution over grounding candidates; and \(\widehat A_r\) is the symmetric within-endpoint slot adjacency. \(\Pi_{uv}\) is the cross-endpoint transport plan, \(\mathcal T_{uv}\) the stitched typed scaffold, and \(C_{\mathrm{topo}}^{rs},C_{\mathrm{cont}}^{rs}\) the topology and content token sequences. The states \(c_{rs}^{(0)}\), \(c_{rs}^{\mathrm{topo}}\), and \(c_{rs}^{\mathrm{cond}}\) are the base, topology-updated, and fully conditioned CLS vectors; \(z_{rs}\) is the directed embedding after \(\operatorname{Readout}\), which combines that CLS vector with mean, max, and attention summaries of both protein-token streams. Finally, \(a_b\in\{0,1\}\) is an exact pathway switch, \(\gamma_b\) a learned scalar gate, \(\mu_b\) the synchronized centering statistic for branch \(b\), and \(\sigma\) the logistic sigmoid.</p>
     </div>
   </section>
 
@@ -838,89 +897,31 @@ svg .s-mono-b { font-family: var(--mono); font-size: 9px; font-weight: 700; fill
     </div>
   </section>
 
-  <section aria-labelledby="objective-title">
+  <section aria-labelledby="ablations-title">
     <div class="section-head">
-      <span class="section-no">03 / TRAIN</span>
-      <h2 id="objective-title">Training objective</h2>
-      <span class="section-note">edge-active, reconstruction-aware</span>
-    </div>
-    <div class="equation">
-      \[
-      \begin{aligned}
-      \mathcal L &amp;= \mathcal L_{\mathrm{edge}}
-        + 0.5\,\mathcal L_{\mathrm{real}}
-        + 0.1\,\mathcal L_{\mathrm{ssl}}
-        + \mathcal L_{\mathrm{recon}}, \\
-      \mathcal L_{\mathrm{recon}} &amp;=
-        \mathcal L_{\mathrm{feat}}
-        + 0.5\,\mathcal L_{\mathrm{exist}}
-        + 0.25\,\mathcal L_{\mathrm{mult}}
-        + 0.5\,\mathcal L_{\mathrm{deg}} \\
-      &amp;\quad
-        + 0.5\,\mathcal L_{\mathrm{slotadj}}
-        + 0.25\,\mathcal L_{\mathrm{gate}}
-        + 0.25\,\mathcal L_{\mathrm{ptr}}
-        + 0.5\,\mathcal L_{\mathrm{align}}
-        + 0.1\,\mathcal L_{\mathrm{div}}
-        + 0.25\,\mathcal L_{\mathrm{rel}}.
-      \end{aligned}
-      \]
-    </div>
-    <p class="objective-copy">\(\mathcal L_{\mathrm{edge}}\) is the binary queried-pair objective. \(\mathcal L_{\mathrm{real}}\) matches generated and real train-side ego statistics and random-GIN embeddings; \(\mathcal L_{\mathrm{ssl}}\) enforces feature-noise and pool-resampling consistency. Only \(\mathcal L_{\mathrm{feat}}\), \(\mathcal L_{\mathrm{exist}}\), \(\mathcal L_{\mathrm{mult}}\), and \(\mathcal L_{\mathrm{deg}}\) anneal from \(1\) to \(0.25\) during the edge-active phase; the relational repair terms remain fully weighted.</p>
-  </section>
-
-  <section aria-labelledby="g3-title">
-    <div class="section-head">
-      <span class="section-no">04 / G3</span>
-      <h2 id="g3-title">Pre-binding diagnosis</h2>
-      <span class="section-note">qualification gates</span>
+      <span class="section-no">03 / ABLATE</span>
+      <h2 id="ablations-title">Six-arm component ablation screen</h2>
+      <span class="section-note">rev-3.2 · fixed-Seed-0 engineering evidence</span>
     </div>
     <div class="table-shell">
-      <table aria-labelledby="g3-title">
-        <thead><tr><th>Gate</th><th>Measurement</th><th>Exact criterion</th><th>Current binding state</th></tr></thead>
+      <table aria-labelledby="ablations-title">
+        <thead><tr><th>Arm</th><th>Role</th><th>Single controlled change</th><th>Question answered</th></tr></thead>
         <tbody>
-          <tr><td><code>G3.1</code></td><td>Full-arm slot recall at <code>n_ground</code> \(=50\)</td><td>\(\ge 0.0698\), half the measured top-50 ceiling \(0.13952495387963418\)</td><td><span class="chip active">FROZEN</span></td></tr>
-          <tr><td><code>G3.2</code></td><td>\(\Pi\)-consistency v2: transport mass on double-Hungarian same-identity cells / total mass</td><td>\(&gt; 0.05\)</td><td><span class="chip active">FROZEN</span></td></tr>
-          <tr><td><code>G3.3</code></td><td>Degree-partialled clustering probe \(R^2\) from frozen STE states</td><td>\(\ge 0.10\)</td><td><span class="chip active">FROZEN</span></td></tr>
-          <tr><td><code>G3.4</code></td><td>\(\operatorname{MMD}_{\mathrm{cluster}}(\texttt{6a-v3})-\operatorname{MMD}_{\mathrm{cluster}}(\texttt{full})\)</td><td>Must exceed the evaluator bootstrap noise floor</td><td><span class="chip pending">V_fit CALIBRATION REQUIRED</span></td></tr>
-          <tr><td><code>G3.5</code></td><td>Matched edge-AUPRC of <code>full</code> relative to the registered matched reference</td><td>Must pass the frozen matched edge-AUPRC guard</td><td><span class="chip pending">V_fit CALIBRATION REQUIRED</span></td></tr>
+          <tr><td><code>full</code></td><td><span class="chip active">REFERENCE</span></td><td>Complete rev-3.2 model: <code>zscore_vfit_v1</code>, both conditioning pathways, <code>p_topo=p_cont=0.15</code>, and <code>w_rel=0.25</code>.</td><td>Does the complete topology-conditioned encoder improve queried-edge prediction?</td></tr>
+          <tr><td><code>b0_e2e_f_only</code></td><td>Matched null</td><td>Permanent all-head bypass; publish and score <code>f_logit</code>.</td><td>What can the matched from-scratch pair encoder do without generated context?</td></tr>
+          <tr><td><code>pair_topology</code></td><td>Pathway ablation</td><td>Permanent content-path bypass; retain pair evidence plus topology conditioning.</td><td>Does the topology pathway carry useful signal without slot-content conditioning?</td></tr>
+          <tr><td><code>p0</code></td><td>Regularization ablation</td><td>Set <code>p_topo=p_cont=0</code>; both pathways remain active, but branch dropout is removed.</td><td>Does branch dropout keep both conditioning pathways usable?</td></tr>
+          <tr><td><code>no_l_rel</code></td><td>Objective ablation</td><td>Set <code>w_rel=0</code>; the train-only relational head remains absent from every scored logit.</td><td>Does relational training pressure create a useful topology representation?</td></tr>
+          <tr><td><code>row_layernorm</code></td><td>Input ablation</td><td>Replace per-dimension <code>V_fit</code> z-scoring with the pre-D0 per-row LayerNorm; all other full-arm settings stay fixed.</td><td>Is population-calibrated feature standardization necessary for healthy slots and edge prediction?</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="hint">G3.4 and G3.5 deliberately have no invented number: both thresholds must be measured on \(V_{\mathrm{fit}}\), frozen before any \(V_{\mathrm{qual}}\) access, and then evaluated prospectively.</p>
-    <div class="notes-grid">
-      <div class="note-card"><h3>Qualification sequence</h3><p>\(V_{\mathrm{fit}}\) calibration → freeze thresholds and implementation → one prospective \(V_{\mathrm{qual}}\) rehearsal, with at most three disclosed attempts. Any failed G3 gate blocks binding. \(V_{\mathrm{select}}\) remains sealed until the first bound formal run.</p></div>
-      <div class="note-card alert"><h3>Collapse abort</h3><p>After conditioning activates, abort as <code>training_invalid(slot_collapse)</code> if mean pairwise slot-\(h\) cosine is \(&gt;0.95\), or if \(\lVert\Pi-r c^\top/m\rVert_F/\lVert\Pi\rVert_F&lt;0.05\), for two consecutive validations.</p></div>
-    </div>
-  </section>
-
-  <section aria-labelledby="g4-title">
-    <div class="section-head">
-      <span class="section-no">05 / G4</span>
-      <h2 id="g4-title">Eight-arm mechanism screen</h2>
-      <span class="section-note">fixed-seed engineering evidence</span>
-    </div>
-    <div class="table-shell">
-      <table aria-labelledby="g4-title">
-        <thead><tr><th>Arm</th><th>Type</th><th>Difference from full</th><th>Diagnostic question</th></tr></thead>
-        <tbody>
-          <tr><td><code>full</code></td><td>Trained</td><td>Complete rev-3.1 model; <code>n_ground</code> \(=50\), <code>w_rel</code> \(=0.25\)</td><td>Does the complete conditioned encoder carry useful relational topology?</td></tr>
-          <tr><td><code>b0_e2e_f_only</code></td><td>Trained null</td><td>Permanent all-head bypass; score <code>f_logit</code></td><td>What does the from-scratch pair trunk achieve without generated context?</td></tr>
-          <tr><td><code>pair_topology</code></td><td>Trained null</td><td>Permanent content-head bypass</td><td>Does the topology pathway work without slot-content evidence?</td></tr>
-          <tr><td><code>p0</code></td><td>Trained ablation</td><td><code>p_topo</code> \(=\) <code>p_cont</code> \(=0\)</td><td>Is branch dropout necessary to keep both pathways usable?</td></tr>
-          <tr><td><code>cosine_pool</code></td><td>Trained ablation</td><td>Status-quo cosine grounding with <code>n_ground</code> \(=20\)</td><td>Does the wider grounding vocabulary matter?</td></tr>
-          <tr><td><code>no_l_rel</code></td><td>Trained ablation</td><td><code>w_rel</code> \(=0\); relational head otherwise absent from scoring in every arm</td><td>Does train-side relational pressure create the useful STE representation?</td></tr>
-          <tr><td><code>6a-v3</code></td><td>Scoring control</td><td>Permute slot axes of \(\widehat A_{\mathrm{src}}\), \(\widehat A_{\mathrm{dst}}\), and \(\Pi\), then rebuild the scaffold</td><td>Is the model sensitive to the binding between slots and relational structure?</td></tr>
-          <tr><td><code>6e-v1</code></td><td>Scoring control</td><td>Checkerboard-rewire \(\pi\)-weighted slot adjacency and \(\Pi\) directly; preserve rebuilt STAR/INTRA/ALIGN degrees while allowing CLOSE degree to move</td><td>Does the model use higher-order connectivity beyond the preserved soft-degree channels?</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <div class="note-card" style="margin-top:12px"><p><strong>After G3:</strong> if all five qualification gates pass, the owner may replace every unresolved marker and bind an immutable v3 registration. Formal execution then runs <code>full</code> first on the previously sealed \(V_{\mathrm{select}}\); only an eligible, live, registration-matched full checkpoint unlocks the other five trained arms. The two controls reuse <code>full</code>'s checkpoint. The screen remains fixed-Seed-0 engineering evidence, not significance or cross-seed robustness.</p></div>
+    <div class="note-card" style="margin-top:12px"><p><strong>Shared contract:</strong> all six arms use the same Seed 0, 30-epoch schedule, <code>V_fit</code>/<code>V_hold</code> boundary, <code>n_ground=50</code>, checkpoint rule, and final binary queried-edge task. One registered factor changes at a time. The screen supports mechanism attribution as engineering evidence—not significance or cross-seed robustness.</p></div>
   </section>
 
   <section class="references" aria-labelledby="references-title">
     <div class="section-head">
-      <span class="section-no">06 / LIT</span>
+      <span class="section-no">04 / LIT</span>
       <h2 id="references-title">Component lineage</h2>
       <span class="section-note">related mechanism ≠ identical task</span>
     </div>
