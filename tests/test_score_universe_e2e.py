@@ -30,7 +30,14 @@ def _write_run_provenance(metadata_path: Path, metadata: dict[str, object]) -> N
         "path": validation_path.name,
         "sha256": _sha256(validation_path),
     }
-    parameter_groups = {"names": ["generator"], "sha256": {"generator": "b" * 64}}
+    parameter_names = {"generator": ["generator.weight"]}
+    parameter_groups = {
+        "names": parameter_names,
+        "sha256": {
+            group: hashlib.sha256(("\n".join(names) + "\n").encode()).hexdigest()
+            for group, names in parameter_names.items()
+        },
+    }
     memories = [1.0, 1.0, 1.0, 1.0]
     access_audit = {"observed_training_access": []}
     metadata.update(
@@ -576,6 +583,22 @@ def test_scoring_rejects_tampered_run_provenance(tmp_path: Path) -> None:
     payload["run_provenance"]["runtime_and_peak_memory"]["world_size"] = 3
     metadata.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="runtime provenance"):
+        score_universe._validate_e2e_scoring_provenance(
+            registration_path=registration,
+            run_metadata_path=metadata,
+            checkpoint_path=checkpoint,
+            checkpoint_id=checkpoint_id,
+        )
+
+
+def test_scoring_rejects_tampered_parameter_group_manifest(tmp_path: Path) -> None:
+    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    payload["run_provenance"]["parameter_group_manifests"]["names"]["generator"].append(
+        "generator.bias"
+    )
+    metadata.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="parameter-group provenance"):
         score_universe._validate_e2e_scoring_provenance(
             registration_path=registration,
             run_metadata_path=metadata,

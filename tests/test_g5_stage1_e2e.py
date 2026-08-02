@@ -757,9 +757,13 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
         formal_events.write_text(
             "".join(json.dumps(row, sort_keys=True) + "\n" for row in formal_event_rows)
         )
+        parameter_names = {"generator": ["generator.weight"]}
         parameter_groups = {
-            "names": ["generator"],
-            "sha256": {"generator": "b" * 64},
+            "names": parameter_names,
+            "sha256": {
+                group: hashlib.sha256(("\n".join(names) + "\n").encode()).hexdigest()
+                for group, names in parameter_names.items()
+            },
         }
         peak_memory = [1.0, 1.0, 1.0, 1.0]
         access_audit = {"observed_training_access": []}

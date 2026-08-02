@@ -1133,18 +1133,33 @@ def _validate_e2e_run_provenance(
         raise ValueError("formal run implementation commit must be full 40-hex")
 
     parameter_groups = provenance.get("parameter_group_manifests")
+    parameter_group_names = (
+        parameter_groups.get("names") if isinstance(parameter_groups, Mapping) else None
+    )
     parameter_group_digests = (
         parameter_groups.get("sha256") if isinstance(parameter_groups, Mapping) else None
     )
     if (
         not isinstance(parameter_groups, Mapping)
-        or not isinstance(parameter_groups.get("names"), list)
-        or not parameter_groups.get("names")
+        or not isinstance(parameter_group_names, Mapping)
+        or not parameter_group_names
         or not isinstance(parameter_group_digests, Mapping)
-        or set(parameter_group_digests) != set(parameter_groups.get("names", []))
-        or any(not _is_sha256(value) for value in parameter_group_digests.values())
+        or set(parameter_group_digests) != set(parameter_group_names)
     ):
         raise ValueError("formal run parameter-group provenance is malformed")
+    for group, names in parameter_group_names.items():
+        if (
+            not isinstance(group, str)
+            or not group
+            or not isinstance(names, list)
+            or not names
+            or any(not isinstance(name, str) or not name for name in names)
+            or names != sorted(set(names))
+        ):
+            raise ValueError("formal run parameter-group provenance is malformed")
+        expected_digest = hashlib.sha256(("\n".join(names) + "\n").encode()).hexdigest()
+        if parameter_group_digests.get(group) != expected_digest:
+            raise ValueError("formal run parameter-group provenance is malformed")
 
     validation_manifests = provenance.get("packs_and_validation_manifests")
     if not isinstance(validation_manifests, Mapping):

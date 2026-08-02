@@ -339,6 +339,10 @@ svg foreignObject .eqf { font-size: 14px; line-height: 20px; text-align: center;
 svg foreignObject .dimf { font-size: 10px; line-height: 15px; text-align: center; color: var(--ink-3); white-space: nowrap; }
 svg foreignObject .symf { font-size: 13px; line-height: 17px; text-align: left; color: var(--ink); white-space: nowrap; }
 svg foreignObject .dimlf { font-size: 10px; line-height: 15px; text-align: left; color: var(--ink-3); white-space: nowrap; }
+svg foreignObject .symrf { font-size: 13px; line-height: 17px; text-align: right; color: var(--ink); white-space: nowrap; }
+svg foreignObject .dimrf { font-size: 10px; line-height: 15px; text-align: right; color: var(--ink-3); white-space: nowrap; }
+svg foreignObject .symcf { font-size: 13px; line-height: 17px; text-align: center; color: var(--ink); white-space: nowrap; }
+svg foreignObject .eqs { font-size: 10.5px; line-height: 18px; text-align: center; color: var(--ink); white-space: nowrap; }
 svg .tap { fill: var(--red); stroke: #fffdf8; stroke-width: 1.6; }
 svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: #fff; text-anchor: middle; }
 
@@ -370,7 +374,7 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
         <div class="flow-canvas">
           <svg viewBox="0 -76 860 1436" role="img" aria-labelledby="overview-svg-title overview-svg-desc">
             <title id="overview-svg-title">EgoStitch inference flow as one formal function per block</title>
-            <desc id="overview-svg-desc">A top-to-bottom flow in which every trained block is drawn as a trapezoid carrying its title, one typeset equation, and the dimensions it maps between; the taper of each trapezoid shows whether the block widens or narrows the representation. Between blocks the intermediate tensors are drawn as plain rectangles whose width is proportional to the channel count and whose height is proportional to the token count, so a pooled 1536-vector is a thin wide strip while a 16 by 16 transport plan is a small square. Three inputs open the figure and each names what it holds: raw token embeddings, the pooled node embedding, and the grounding embeddings. Two dashed source panels above the inputs say where the two derived inputs come from. The pooled embedding is frozen F0, defined as the plain arithmetic mean of the same per-token matrix over the token axis, computed in fp32 before the token store is cast to bfloat16 and never fine-tuned. The grounding pool is retrieved rather than learned: the top fifty cosine nearest neighbours of that pooled embedding in frozen F0 space, self excluded, drawn only from the query node’s own split universe. Raw endpoint tokens then run down the left through the shared encoder and three cross-attention layers; pooled features and grounding candidates run down the right through standardization, the shared generator, alignment, stitching, and the two token encoders. The two paths meet in the topology and content CLS updates, the gated readout, the symmetric maximum, and the binary edge head. Numbered red taps one through six mark the block at which each combined training loss on the right rail is computed.</desc>
+            <desc id="overview-svg-desc">A top-to-bottom flow in which every trained block is drawn as a trapezoid carrying its title, one typeset equation, and the dimensions it maps between; the taper of each trapezoid shows whether the block widens or narrows the representation. Between blocks the intermediate tensors are drawn as plain rectangles whose width is proportional to the channel count and whose height is proportional to the token count, so a pooled 1536-vector is a thin wide strip while a 16 by 16 transport plan is a small square. Three inputs open the figure and each names what it holds: raw token embeddings, the pooled node embedding, and the grounding embeddings. The grounding pool is retrieved rather than learned: the top fifty cosine nearest neighbours of that pooled embedding, self excluded, drawn only from the query node’s own split universe. Raw endpoint tokens then run down the left through the shared encoder and three cross-attention layers; pooled features and grounding candidates run down the right through standardization, the shared generator, alignment, stitching, and the two token encoders. The two paths meet in the topology and content CLS updates, the gated readout, the symmetric maximum, and the binary edge head. Numbered red taps one through six mark the block at which each combined training loss on the right rail is computed.</desc>
             <defs>
               <marker id="overview-arrow" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#73818b"/></marker>
               <marker id="overview-arrow-blue" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#2d67a3"/></marker>
@@ -385,17 +389,8 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
             <foreignObject x="562" y="-50" width="280" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">every node of the query’s own split universe</div></foreignObject>
             <foreignObject x="562" y="-34" width="280" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(\mathcal V_{\mathrm{fit}}\) train · \(\mathcal V_{\mathrm{hold}}\) val · test — never mixed</div></foreignObject>
 
-            <!-- What "frozen F0" actually is: the token-mean of the same per-node matrix -->
-            <path class="art" d="M290,-70 L540,-70 L540,-12 L290,-12 Z"/>
-            <text class="art-tag" x="304" y="-54">FROZEN F0 · MEAN-POOLED, NEVER FINE-TUNED</text>
-            <foreignObject x="304" y="-49" width="230" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf" style="text-align:left">\(x_r=\operatorname{mean}_{t}E_r[t]\)</div></foreignObject>
-            <foreignObject x="304" y="-30" width="230" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">fp32 mean, taken before the bf16 shards</div></foreignObject>
-            <path class="flow" d="M160 56 V-41 H286" marker-end="url(#overview-arrow)"/>
-            <path class="flow" d="M415 -12 V88" marker-end="url(#overview-arrow)"/>
-
             <path class="flow" d="M660 -12 V74" marker-end="url(#overview-arrow)"/>
             <foreignObject x="670" y="8" width="190" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">top-50 cosine neighbours of \(x_r\)</div></foreignObject>
-            <foreignObject x="670" y="23" width="190" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">in frozen F0, self excluded</div></foreignObject>
 
             <!-- Inputs: tensors, drawn to scale -->
             <rect class="tensor" x="101" y="56" width="118" height="44"/>
@@ -406,7 +401,7 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
             <rect class="tensor" x="341" y="94" width="118" height="6"/>
             <foreignObject x="469" y="64" width="150" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(x_u,\,x_v\)</div></foreignObject>
             <foreignObject x="469" y="82" width="150" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(1536\)</div></foreignObject>
-            <foreignObject x="469" y="98" width="150" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">mean-pooled · frozen F0</div></foreignObject>
+            <foreignObject x="469" y="98" width="150" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">mean-pooled embeddings</div></foreignObject>
 
             <rect class="tensor" x="601" y="80" width="118" height="20"/>
             <foreignObject x="729" y="64" width="125" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(G_u,\,G_v\)</div></foreignObject>
@@ -534,14 +529,14 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
             <path class="flow-blue" d="M460 803 V824" marker-end="url(#overview-arrow-blue)"/>
             <path class="box-blue" d="M70,830 L670,830 L670,920 L70,920 Z"/>
             <text class="s-title" x="370" y="858" text-anchor="middle">1 · Topology update</text>
-            <foreignObject x="80" y="871" width="580" height="22"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(c_{rs}^{\mathrm{topo}}=c_{rs}^{(0)}+a_{\mathrm{topo}}\tanh(\gamma_{\mathrm{topo}})\bigl[\operatorname{XAttn}_{\mathrm{topo}}\bigl(c_{rs}^{(0)},C_{\mathrm{topo}}^{rs}\bigr)-\mu_{\mathrm{topo}}\bigr]\)</div></foreignObject>
-            <foreignObject x="80" y="896" width="580" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(1\times512\) · attends over \(34\times512\) · centered, gated, exactly bypassable</div></foreignObject>
+            <foreignObject x="80" y="871" width="580" height="22"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(c_{rs}^{\mathrm{topo}}=c_{rs}^{(0)}+\tanh(\gamma_{\mathrm{topo}})\bigl[\operatorname{XAttn}_{\mathrm{topo}}\bigl(c_{rs}^{(0)},C_{\mathrm{topo}}^{rs}\bigr)-\mu_{\mathrm{topo}}\bigr]\)</div></foreignObject>
+            <foreignObject x="80" y="896" width="580" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(1\times512\) · attends over \(34\times512\) · centered, gated</div></foreignObject>
 
             <path class="flow" d="M370 920 V934" marker-end="url(#overview-arrow)"/>
             <path class="flow-amber" d="M720 802 V934" marker-end="url(#overview-arrow-amber)"/>
             <path class="box-amber" d="M70,940 L810,940 L810,1030 L70,1030 Z"/>
             <text class="s-title" x="440" y="968" text-anchor="middle">2 · Content update</text>
-            <foreignObject x="80" y="981" width="720" height="22"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(c_{rs}^{\mathrm{cond}}=c_{rs}^{\mathrm{topo}}+a_{\mathrm{cont}}\tanh(\gamma_{\mathrm{cont}})\bigl[\operatorname{XAttn}_{\mathrm{cont}}\bigl(c_{rs}^{\mathrm{topo}},C_{\mathrm{cont}}^{rs}\bigr)-\mu_{\mathrm{cont}}\bigr]\)</div></foreignObject>
+            <foreignObject x="80" y="981" width="720" height="22"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(c_{rs}^{\mathrm{cond}}=c_{rs}^{\mathrm{topo}}+\tanh(\gamma_{\mathrm{cont}})\bigl[\operatorname{XAttn}_{\mathrm{cont}}\bigl(c_{rs}^{\mathrm{topo}},C_{\mathrm{cont}}^{rs}\bigr)-\mu_{\mathrm{cont}}\bigr]\)</div></foreignObject>
             <foreignObject x="80" y="1006" width="720" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(1\times512\) · attends over \(32\times512\) · content queries the topology-updated CLS</div></foreignObject>
 
             <path class="flow" d="M126 618 H45 V1090 H68" marker-end="url(#overview-arrow)"/>
@@ -678,6 +673,171 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
       </figcaption>
     </figure>
 
+    <figure class="figure-card" style="margin-top:20px">
+      <svg viewBox="0 0 1240 774" role="img" aria-labelledby="gen-svg-title gen-svg-desc">
+        <title id="gen-svg-title">Inside the shared endpoint generator</title>
+        <desc id="gen-svg-desc">An expansion of the single generator trapezoid in the previous figure. The standardized pooled embedding runs through TokenizeLite to an endpoint code and, with that code, through the degree-budget heads. The standardized grounding embeddings run through a shared linear projection. Both feed one assembly block that builds the fifty-two token conditioning memory and the sixteen slot queries, which a stack of three DETR-style decoder layers turns into sixteen decoded slot states. Six linear heads then read those states in parallel and emit the six output tensors of the slot set: slot content, existence, multiplicity, grounding gate, pointer distribution over grounding candidates, and the symmetric slot adjacency. Each output tensor is drawn to scale, so the sixteen by two hundred fifty-six slot states are a wide block while existence, multiplicity, and the grounding gate are one-channel slivers.</desc>
+        <defs>
+          <marker id="gen-arrow" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#73818b"/></marker>
+        </defs>
+
+        <text class="s-micro" x="40" y="26">INSIDE THE SHARED ENDPOINT GENERATOR · APPLIED INDEPENDENTLY TO u AND v</text>
+
+        <!-- Standardized inputs, handed over by Feature standardization in Figure 1 -->
+        <rect class="tensor" x="141" y="70" width="118" height="6"/>
+        <foreignObject x="15" y="40" width="120" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symrf">\(\widetilde x_r\)</div></foreignObject>
+        <foreignObject x="15" y="58" width="120" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimrf">1536</div></foreignObject>
+
+        <rect class="tensor" x="701" y="52" width="118" height="24"/>
+        <foreignObject x="829" y="40" width="150" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(\widetilde G_r\)</div></foreignObject>
+        <foreignObject x="829" y="58" width="150" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(50\times1536\)</div></foreignObject>
+
+        <path class="flow" d="M200 76 V90" marker-end="url(#gen-arrow)"/>
+        <path class="flow" d="M760 76 V90" marker-end="url(#gen-arrow)"/>
+
+        <path class="box-green" d="M40,96 L360,96 L316,182 L84,182 Z"/>
+        <text class="s-title" x="200" y="122" text-anchor="middle">TokenizeLite · encoder</text>
+        <foreignObject x="50" y="134" width="300" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(e_r=\operatorname{MLP}_2(\widetilde x_r)\)</div></foreignObject>
+        <foreignObject x="50" y="158" width="300" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(1536\to256\to64\) · GELU, LayerNorm</div></foreignObject>
+
+        <path class="box-green" d="M600,96 L920,96 L876,182 L644,182 Z"/>
+        <text class="s-title" x="760" y="122" text-anchor="middle">Shared projection</text>
+        <foreignObject x="610" y="134" width="300" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(P_r=\operatorname{Proj}(\widetilde G_r)\)</div></foreignObject>
+        <foreignObject x="610" y="158" width="300" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(50\times1536\to50\times256\) · one linear</div></foreignObject>
+
+        <path class="flow" d="M200 182 V204" marker-end="url(#gen-arrow)"/>
+        <rect class="tensor" x="188" y="210" width="24" height="6"/>
+        <foreignObject x="60" y="196" width="120" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symrf">\(e_r\)</div></foreignObject>
+        <foreignObject x="60" y="214" width="120" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimrf">\(64\) · endpoint code</div></foreignObject>
+
+        <path class="flow" d="M760 182 V186" marker-end="url(#gen-arrow)"/>
+        <rect class="tensor" x="736" y="192" width="48" height="24"/>
+        <foreignObject x="794" y="188" width="150" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(P_r\)</div></foreignObject>
+        <foreignObject x="794" y="205" width="150" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(50\times256\)</div></foreignObject>
+
+        <!-- Degree budget -->
+        <path class="flow" d="M200 216 V230" marker-end="url(#gen-arrow)"/>
+        <path class="box-green" d="M40,236 L360,236 L290,332 L110,332 Z"/>
+        <text class="s-title" x="200" y="262" text-anchor="middle">Degree-budget heads</text>
+        <foreignObject x="45" y="274" width="310" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\((\hat d_r^{\mathrm{raw}},\mu_r,\log\sigma_r)=\operatorname{MLP}_2([\widetilde x_r;e_r])\)</div></foreignObject>
+        <foreignObject x="45" y="300" width="310" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(1600\to256\to1\oplus2\) · softplus on the mean</div></foreignObject>
+
+        <path class="flow" d="M200 332 V344" marker-end="url(#gen-arrow)"/>
+        <rect class="tensor" x="196" y="350" width="8" height="8"/>
+        <foreignObject x="214" y="344" width="180" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(\hat d_r,\ \mu_r,\ \log\sigma_r\)</div></foreignObject>
+        <foreignObject x="214" y="362" width="180" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">3 scalars · \(\hat d_r=\rho\,\hat d_r^{\mathrm{raw}}\)</div></foreignObject>
+
+        <!-- Memory and queries -->
+        <path class="flow" d="M259 73 H540 V230" marker-end="url(#gen-arrow)"/>
+        <path class="flow" d="M212 213 H500 V230" marker-end="url(#gen-arrow)"/>
+        <path class="flow" d="M760 216 V230" marker-end="url(#gen-arrow)"/>
+        <path class="box-green" d="M440,236 L920,236 L920,340 L440,340 Z"/>
+        <text class="s-title" x="680" y="262" text-anchor="middle">Memory &amp; query assembly</text>
+        <foreignObject x="450" y="272" width="460" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(M_r=[\,W_x\widetilde x_r;\ W_e e_r;\ T_g\,],\qquad T_g=W_g P_r\)</div></foreignObject>
+        <foreignObject x="450" y="294" width="460" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(q^{(0)}_k=W_q[\,P_{r,k};\,e_r\,]\)</div></foreignObject>
+        <foreignObject x="450" y="317" width="460" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">2 conditioning tokens + 50 grounding tokens · \(K=16\le n_g\), so every query is grounded</div></foreignObject>
+
+        <path class="flow" d="M600 340 V350" marker-end="url(#gen-arrow)"/>
+        <rect class="tensor" x="576" y="356" width="48" height="26"/>
+        <foreignObject x="634" y="352" width="110" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(M_r\)</div></foreignObject>
+        <foreignObject x="634" y="369" width="110" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(52\times256\)</div></foreignObject>
+
+        <path class="flow" d="M800 340 V350" marker-end="url(#gen-arrow)"/>
+        <rect class="tensor" x="776" y="356" width="48" height="16"/>
+        <foreignObject x="834" y="352" width="110" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(q^{(0)}\)</div></foreignObject>
+        <foreignObject x="834" y="369" width="110" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(16\times256\)</div></foreignObject>
+
+        <!-- Fixed configuration, not learned -->
+        <path class="art" d="M40,396 L360,396 L360,492 L40,492 Z"/>
+        <text class="art-tag" x="56" y="418">PINNED, NOT LEARNED</text>
+        <foreignObject x="56" y="424" width="290" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(K=16\) slots · \(n_g=50\) candidates · \(m_{\max}=32\)</div></foreignObject>
+        <foreignObject x="56" y="443" width="290" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(d_z=64\) · \(d_h=256\) · \(d_p=256\) · 8 heads · 3 layers</div></foreignObject>
+        <foreignObject x="56" y="462" width="290" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">the same weights run for \(u\) and for \(v\)</div></foreignObject>
+
+        <!-- Decoder stack -->
+        <path class="flow" d="M600 382 V390" marker-end="url(#gen-arrow)"/>
+        <path class="flow" d="M800 372 V390" marker-end="url(#gen-arrow)"/>
+        <path class="box-green" d="M440,396 L920,396 L920,492 L440,492 Z"/>
+        <text class="s-title" x="680" y="422" text-anchor="middle">3 × ImagineDecoder layer</text>
+        <foreignObject x="450" y="434" width="460" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(q^{(\ell)}=\operatorname{FFN}\!\bigl(\operatorname{XAttn}(\operatorname{SelfAttn}(q^{(\ell-1)}),\,M_r)\bigr)\)</div></foreignObject>
+        <foreignObject x="450" y="464" width="460" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(16\times256\to16\times256\) · 8 heads · FFN 1024 · post-add LayerNorm · \(\ell=1,2,3\)</div></foreignObject>
+
+        <path class="flow" d="M680 492 V504" marker-end="url(#gen-arrow)"/>
+        <rect class="tensor" x="656" y="510" width="48" height="16"/>
+        <foreignObject x="714" y="506" width="150" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(q^{(3)}\)</div></foreignObject>
+        <foreignObject x="714" y="523" width="150" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(16\times256\) · decoded slots</div></foreignObject>
+
+        <!-- Six parallel heads read the decoded slots -->
+        <path class="flow" d="M680 526 V554"/>
+        <path class="flow" d="M115 554 H1115"/>
+        <path class="flow" d="M115 554 V574" marker-end="url(#gen-arrow)"/>
+        <path class="flow" d="M315 554 V574" marker-end="url(#gen-arrow)"/>
+        <path class="flow" d="M515 554 V574" marker-end="url(#gen-arrow)"/>
+        <path class="flow" d="M715 554 V574" marker-end="url(#gen-arrow)"/>
+        <path class="flow" d="M915 554 V574" marker-end="url(#gen-arrow)"/>
+        <path class="flow" d="M1115 554 V574" marker-end="url(#gen-arrow)"/>
+
+        <path class="box" d="M20,580 L210,580 L210,666 L20,666 Z"/>
+        <text class="s-title" x="115" y="604" text-anchor="middle">head_h</text>
+        <foreignObject x="22" y="610" width="186" height="18"><div xmlns="http://www.w3.org/1999/xhtml" class="eqs">\(h_r=W_h\,q^{(3)}\)</div></foreignObject>
+        <foreignObject x="22" y="640" width="186" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(256\to256\) · slot content</div></foreignObject>
+        <path class="flow" d="M115 666 V678" marker-end="url(#gen-arrow)"/>
+        <rect class="tensor" x="91" y="684" width="48" height="16"/>
+        <foreignObject x="25" y="704" width="180" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symcf">\(h_r\)</div></foreignObject>
+        <foreignObject x="25" y="722" width="180" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(16\times256\)</div></foreignObject>
+
+        <path class="box" d="M220,580 L410,580 L390,666 L240,666 Z"/>
+        <text class="s-title" x="315" y="604" text-anchor="middle">head_pi</text>
+        <foreignObject x="222" y="610" width="186" height="18"><div xmlns="http://www.w3.org/1999/xhtml" class="eqs">\(\pi_r=\sigma(W_\pi q^{(3)})\)</div></foreignObject>
+        <foreignObject x="222" y="640" width="186" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(256\to1\) · existence</div></foreignObject>
+        <path class="flow" d="M315 666 V678" marker-end="url(#gen-arrow)"/>
+        <rect class="tensor" x="312" y="684" width="6" height="16"/>
+        <foreignObject x="225" y="704" width="180" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symcf">\(\pi_r\)</div></foreignObject>
+        <foreignObject x="225" y="722" width="180" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(16\) · in \([0,1]\)</div></foreignObject>
+
+        <path class="box" d="M420,580 L610,580 L590,666 L440,666 Z"/>
+        <text class="s-title" x="515" y="604" text-anchor="middle">head_mult</text>
+        <foreignObject x="422" y="610" width="186" height="18"><div xmlns="http://www.w3.org/1999/xhtml" class="eqs">\(m_r=1+\operatorname{softplus}(W_m q^{(3)})\)</div></foreignObject>
+        <foreignObject x="422" y="640" width="186" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(256\to1\) · clamped at 32</div></foreignObject>
+        <path class="flow" d="M515 666 V678" marker-end="url(#gen-arrow)"/>
+        <rect class="tensor" x="512" y="684" width="6" height="16"/>
+        <foreignObject x="425" y="704" width="180" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symcf">\(m_r\)</div></foreignObject>
+        <foreignObject x="425" y="722" width="180" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(16\) · in \([1,32]\)</div></foreignObject>
+
+        <path class="box" d="M620,580 L810,580 L790,666 L640,666 Z"/>
+        <text class="s-title" x="715" y="604" text-anchor="middle">head_gate</text>
+        <foreignObject x="622" y="610" width="186" height="18"><div xmlns="http://www.w3.org/1999/xhtml" class="eqs">\(g_r=\sigma(W_g q^{(3)})\)</div></foreignObject>
+        <foreignObject x="622" y="640" width="186" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(256\to1\) · grounding gate</div></foreignObject>
+        <path class="flow" d="M715 666 V678" marker-end="url(#gen-arrow)"/>
+        <rect class="tensor" x="712" y="684" width="6" height="16"/>
+        <foreignObject x="625" y="704" width="180" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symcf">\(g_r\)</div></foreignObject>
+        <foreignObject x="625" y="722" width="180" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(16\) · in \([0,1]\)</div></foreignObject>
+
+        <path class="box" d="M820,580 L1010,580 L1010,666 L820,666 Z"/>
+        <text class="s-title" x="915" y="604" text-anchor="middle">head_pointer</text>
+        <foreignObject x="822" y="610" width="186" height="18"><div xmlns="http://www.w3.org/1999/xhtml" class="eqs">\(Q_r=\operatorname{softmax}(W_p q^{(3)}T_g^\top)\)</div></foreignObject>
+        <foreignObject x="822" y="640" width="186" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">scaled by \(\sqrt{d_h}\) · over the 50</div></foreignObject>
+        <path class="flow" d="M915 666 V678" marker-end="url(#gen-arrow)"/>
+        <rect class="tensor" x="904" y="684" width="21" height="16"/>
+        <foreignObject x="825" y="704" width="180" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symcf">\(Q_r\)</div></foreignObject>
+        <foreignObject x="825" y="722" width="180" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(16\times50\) · rows sum to 1</div></foreignObject>
+
+        <path class="box" d="M1020,580 L1210,580 L1210,666 L1020,666 Z"/>
+        <text class="s-title" x="1115" y="604" text-anchor="middle">head_adj</text>
+        <foreignObject x="1022" y="610" width="186" height="18"><div xmlns="http://www.w3.org/1999/xhtml" class="eqs">\(\widehat A_r=\sigma(W_a h_r(W_a h_r)^\top)\)</div></foreignObject>
+        <foreignObject x="1022" y="640" width="186" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">scaled by \(\sqrt{d_p}\) · reads \(h_r\)</div></foreignObject>
+        <path class="flow" d="M1115 666 V678" marker-end="url(#gen-arrow)"/>
+        <rect class="tensor" x="1109" y="684" width="12" height="16"/>
+        <foreignObject x="1025" y="704" width="180" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symcf">\(\widehat A_r\)</div></foreignObject>
+        <foreignObject x="1025" y="722" width="180" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(16\times16\) · symmetric</div></foreignObject>
+
+        <foreignObject x="320" y="742" width="600" height="18"><div xmlns="http://www.w3.org/1999/xhtml" class="eqs">\(S_r=(h_r,\pi_r,m_r,g_r,Q_r,\widehat A_r)\) — the slot set consumed by Figure 1</div></foreignObject>
+      </svg>
+      <figcaption class="figure-caption">
+        <span><strong>Figure 2 · Inside the shared endpoint generator.</strong> The single trapezoid \(S_r=\operatorname{Gen}(\widetilde x_r,\widetilde G_r)\) in Figure 1, expanded. Only the grounding projection and the two assembly matrices see the candidate pool; the decoder itself is a DETR-style set decoder that attends 16 slot queries over a 52-token memory, and the six heads are all linear reads of the same decoded state. The bottom row is the slot set \(S_r\) that Figure 1 hands to alignment and to content assembly — drawn to scale, so the slot content is a wide block while existence, multiplicity, and the grounding gate are one-channel slivers. Training-only paths are omitted: denoising queries reuse the same heads with fixed assignments, and conditioning dropout replaces the two conditioning tokens, or those plus all grounding tokens, with learned null tokens.</span>
+      </figcaption>
+    </figure>
+
     <div class="data-flow" aria-labelledby="data-flow-title">
       <h3 id="data-flow-title">Model data flow</h3>
       <p><strong>Inputs and output.</strong> For a queried endpoint pair \((u,v)\), the model receives raw endpoint token streams \(E_u,E_v\), frozen pooled endpoint features \(x_u,x_v\), and endpoint-specific grounding candidates \(G_u,G_v\). Its only task output is the probability \(p_{uv}\) that the queried edge exists; generated topology remains intermediate conditioning context.</p>
@@ -703,14 +863,14 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
       C_{\mathrm{cont}}^{uv}=\operatorname{Cont}(S_u,S_v).
       \end{aligned}
       \]
-      <p><strong>Condition both directions.</strong> The Siamese pair trunk processes \(u\!\to\!v\) and \(v\!\to\!u\) separately. In its final layer, topology first updates the base CLS state; content cross-attention then queries that topology-updated state. Both updates are centered, gated residuals and can be bypassed exactly.</p>
+      <p><strong>Condition both directions.</strong> The Siamese pair trunk processes \(u\!\to\!v\) and \(v\!\to\!u\) separately. In its final layer, topology first updates the base CLS state; content cross-attention then queries that topology-updated state. In the full model, both pathways are active centered, gated residuals.</p>
       \[
       \begin{aligned}
       c_{rs}^{(0)}&=\operatorname{CLS}\!\left(\operatorname{Trunk}(A_r,A_s)\right),\\
       \delta_{rs}^{\mathrm{topo}}&=\operatorname{XAttn}_{\mathrm{topo}}\!\left(c_{rs}^{(0)},C_{\mathrm{topo}}^{rs}\right)-\mu_{\mathrm{topo}},\\
-      c_{rs}^{\mathrm{topo}}&=c_{rs}^{(0)}+a_{\mathrm{topo}}\tanh(\gamma_{\mathrm{topo}})\,\delta_{rs}^{\mathrm{topo}},\\
+      c_{rs}^{\mathrm{topo}}&=c_{rs}^{(0)}+\tanh(\gamma_{\mathrm{topo}})\,\delta_{rs}^{\mathrm{topo}},\\
       \delta_{rs}^{\mathrm{cont}}&=\operatorname{XAttn}_{\mathrm{cont}}\!\left(c_{rs}^{\mathrm{topo}},C_{\mathrm{cont}}^{rs}\right)-\mu_{\mathrm{cont}},\\
-      c_{rs}^{\mathrm{cond}}&=c_{rs}^{\mathrm{topo}}+a_{\mathrm{cont}}\tanh(\gamma_{\mathrm{cont}})\,\delta_{rs}^{\mathrm{cont}},\\
+      c_{rs}^{\mathrm{cond}}&=c_{rs}^{\mathrm{topo}}+\tanh(\gamma_{\mathrm{cont}})\,\delta_{rs}^{\mathrm{cont}},\\
       z_{rs}&=\operatorname{Readout}\!\left(A_r,A_s,c_{rs}^{\mathrm{cond}}\right),\qquad
       (r,s)\in\{(u,v),(v,u)\}.
       \end{aligned}
@@ -720,7 +880,7 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
       z_{uv}^{\mathrm{sym}}=\operatorname{max}\!\left(z_{uv},z_{vu}\right),\qquad
       p_{uv}=\sigma\!\left(\operatorname{MLP}(z_{uv}^{\mathrm{sym}})\right)=p_{vu}.
       \]
-      <p><strong>Symbols.</strong> \(L_r\) is endpoint \(r\)'s token count, \(n_g\) the number of grounding candidates, \(K\) the number of generated slots, and \(y_{uv}\in\{0,1\}\) the queried-edge label. \(\operatorname{Std}_{\mathrm{fit}}\) uses statistics frozen on the fitting universe for both endpoint and grounding features, while \(\operatorname{Enc}\) is the shared raw-token encoder. \(H_r\) are slot states; \(\pi_r\), \(m_r\), and \(g_r\) are slot existence, multiplicity, and grounding gates; \(Q_r\) is the pointer distribution over grounding candidates; and \(\widehat A_r\) is the symmetric within-endpoint slot adjacency. \(\Pi_{uv}\) is the cross-endpoint transport plan, \(\mathcal T_{uv}\) the stitched typed scaffold, and \(C_{\mathrm{topo}}^{rs},C_{\mathrm{cont}}^{rs}\) the topology and content token sequences. The states \(c_{rs}^{(0)}\), \(c_{rs}^{\mathrm{topo}}\), and \(c_{rs}^{\mathrm{cond}}\) are the base, topology-updated, and fully conditioned CLS vectors; \(z_{rs}\) is the directed embedding after \(\operatorname{Readout}\), which combines that CLS vector with mean, max, and attention summaries of both protein-token streams. Finally, \(a_b\in\{0,1\}\) is an exact pathway switch, \(\gamma_b\) a learned scalar gate, \(\mu_b\) the synchronized centering statistic for branch \(b\), and \(\sigma\) the logistic sigmoid.</p>
+      <p><strong>Symbols.</strong> \(L_r\) is endpoint \(r\)'s token count, \(n_g\) the number of grounding candidates, \(K\) the number of generated slots, and \(y_{uv}\in\{0,1\}\) the queried-edge label. \(\operatorname{Std}_{\mathrm{fit}}\) uses statistics frozen on the fitting universe for both endpoint and grounding features, while \(\operatorname{Enc}\) is the shared raw-token encoder. \(H_r\) are slot states; \(\pi_r\), \(m_r\), and \(g_r\) are slot existence, multiplicity, and grounding gates; \(Q_r\) is the pointer distribution over grounding candidates; and \(\widehat A_r\) is the symmetric within-endpoint slot adjacency. \(\Pi_{uv}\) is the cross-endpoint transport plan, \(\mathcal T_{uv}\) the stitched typed scaffold, and \(C_{\mathrm{topo}}^{rs},C_{\mathrm{cont}}^{rs}\) the topology and content token sequences. The states \(c_{rs}^{(0)}\), \(c_{rs}^{\mathrm{topo}}\), and \(c_{rs}^{\mathrm{cond}}\) are the base, topology-updated, and fully conditioned CLS vectors; \(z_{rs}\) is the directed embedding after \(\operatorname{Readout}\), which combines that CLS vector with mean, max, and attention summaries of both protein-token streams. Finally, \(\gamma_b\) is a learned scalar gate, \(\mu_b\) the synchronized centering statistic for branch \(b\), and \(\sigma\) the logistic sigmoid.</p>
     </div>
   </section>
 
@@ -848,7 +1008,7 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
             <path class="flow-blue" d="M323 166 V153 H349" marker-end="url(#s4-blue)"/><path class="flow-amber" d="M549 166 V153 H363" marker-end="url(#s4-amber)"/>
             <circle cx="356" cy="153" r="7" fill="#fffdf8" stroke="#73818b" stroke-width="1.2"/>
             <path class="flow" d="M356 146 V113" marker-end="url(#s4-arrow)"/>
-            <text class="s-micro" x="431" y="238" text-anchor="middle">BOTH AB/BA · CENTERED · ZERO-INITIALIZED · HARD-BYPASSABLE</text>
+            <text class="s-micro" x="431" y="238" text-anchor="middle">BOTH AB/BA · CENTERED · ZERO-INITIALIZED · FULL MODEL</text>
             <path class="flow" d="M491 82 H553" marker-end="url(#s4-arrow)"/>
             <rect class="box" x="557" y="45" width="184" height="73" rx="7"/><text class="s-title" x="649" y="69" text-anchor="middle">Symmetry operator</text><text class="s-mono" x="649" y="91" text-anchor="middle">abba_max(z′_AB, z′_BA)</text><text class="s-small" x="649" y="106" text-anchor="middle">feature-wise invariant</text>
             <path class="flow" d="M741 82 H785" marker-end="url(#s4-arrow)"/>
@@ -860,14 +1020,14 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
       <article class="workflow">
         <div class="workflow-intro">
           <span class="workflow-index">Stage 5</span>
-          <h3>Training and attribution</h3>
-          <p class="workflow-caption">Relational repair shapes generated structure; exact pathway bypasses expose what the same checkpoint actually uses.</p>
+          <h3>Full-model training</h3>
+          <p class="workflow-caption">The complete objective shapes generated structure and trains both conditioning pathways in one checkpoint.</p>
           <div class="cite-row"><a class="cite" href="#ref-moddrop">Abdelaziz et al. 2020 · Modality dropout</a><a class="cite" href="#ref-ncn">Wang et al. 2023 · NCN</a></div>
         </div>
         <div class="workflow-figure">
           <svg viewBox="0 0 1050 250" role="img" aria-labelledby="stage5-title stage5-desc">
-            <title id="stage5-title">Training losses and checkpoint-exact pathway nulls</title>
-            <desc id="stage5-desc">Edge, reconstruction, realism, consistency, and relational losses train the complete model. Independent topology and content switches publish full, pair-only, pair-plus-content, and pair-plus-topology logits from the same checkpoint.</desc>
+            <title id="stage5-title">Full-model training losses and output</title>
+            <desc id="stage5-desc">Edge, reconstruction, realism, consistency, and relational losses train one complete model whose topology and content pathways are both active at inference.</desc>
             <defs><marker id="s5-arrow" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#73818b"/></marker></defs>
             <text class="s-micro" x="20" y="25">TRAIN-SIDE PRESSURE</text>
             <rect class="box-red" x="20" y="42" width="135" height="52" rx="6"/><text class="s-label" x="87" y="63" text-anchor="middle">Edge objective</text><text class="s-mono" x="87" y="80" text-anchor="middle">L_edge</text>
@@ -877,13 +1037,10 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
             <path class="flow" d="M87 94 V119 H720"/><path class="flow" d="M247 94 V119"/><path class="flow" d="M412 94 V119"/><path class="flow" d="M590 94 V119"/>
             <rect class="box-dark" x="704" y="42" width="150" height="99" rx="7"/><text x="779" y="68" text-anchor="middle" style="font-size:13px;font-weight:700;fill:white">One checkpoint</text><text x="779" y="88" text-anchor="middle" style="font-family:var(--mono);font-size:9px;fill:#dce4e9">p_topo = 0.15</text><text x="779" y="104" text-anchor="middle" style="font-family:var(--mono);font-size:9px;fill:#dce4e9">p_cont = 0.15</text><text x="779" y="125" text-anchor="middle" style="font-size:8px;fill:#dce4e9">independent branch dropout</text>
             <path class="flow" d="M854 91 H897" marker-end="url(#s5-arrow)"/>
-            <rect class="box" x="901" y="42" width="128" height="99" rx="7"/><text class="s-label" x="965" y="64" text-anchor="middle">Hard bypass</text><text class="s-small" x="965" y="84" text-anchor="middle">exact at evaluation</text><text class="s-mono" x="965" y="104" text-anchor="middle">a_topo</text><text class="s-mono" x="965" y="121" text-anchor="middle">a_cont</text>
+            <rect class="box-blue" x="901" y="42" width="128" height="99" rx="7"/><text class="s-label" x="965" y="64" text-anchor="middle">Full inference</text><text class="s-small" x="965" y="84" text-anchor="middle">both pathways active</text><text class="s-mono" x="965" y="104" text-anchor="middle">topology ✓</text><text class="s-mono" x="965" y="121" text-anchor="middle">content ✓</text>
 
-            <text class="s-micro" x="20" y="170">FOUR LOGITS · SAME WEIGHTS · SAME PAIR</text>
-            <rect class="box-green" x="20" y="184" width="225" height="45" rx="6"/><text class="s-label" x="132" y="203" text-anchor="middle">full</text><text class="s-mono" x="132" y="219" text-anchor="middle">topology ✓ · content ✓</text>
-            <rect class="box" x="260" y="184" width="225" height="45" rx="6"/><text class="s-label" x="372" y="203" text-anchor="middle">pair-only · f_logit</text><text class="s-mono" x="372" y="219" text-anchor="middle">topology × · content ×</text>
-            <rect class="box-amber" x="500" y="184" width="225" height="45" rx="6"/><text class="s-label" x="612" y="203" text-anchor="middle">pair + content</text><text class="s-mono" x="612" y="219" text-anchor="middle">topology × · content ✓</text>
-            <rect class="box-blue" x="740" y="184" width="289" height="45" rx="6"/><text class="s-label" x="884" y="203" text-anchor="middle">pair + topology</text><text class="s-mono" x="884" y="219" text-anchor="middle">topology ✓ · content ×</text>
+            <text class="s-micro" x="20" y="170">ONE LOGIT · FULL MODEL · QUERIED PAIR</text>
+            <rect class="box-blue" x="20" y="184" width="1009" height="45" rx="6"/><text class="s-label" x="524" y="203" text-anchor="middle">full</text><text class="s-mono" x="524" y="219" text-anchor="middle">topology ✓ · content ✓ · p(y_ij = 1)</text>
           </svg>
         </div>
       </article>
