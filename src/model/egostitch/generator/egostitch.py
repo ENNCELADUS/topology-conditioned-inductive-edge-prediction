@@ -50,6 +50,22 @@ from src.model.egostitch.scaffold import (
 )
 from src.model.egostitch.stitch import sinkhorn_log_plan
 
+__all__ = [
+    "EgoStitchImagineGenerator",
+    "GeneratorNodeState",
+    "StitchedGraph",
+    # Re-exported so tests can `monkeypatch.setattr(generator_module, ...)`
+    # against this module's own namespace -- `stitch`/`auxiliary_losses`
+    # look these up as module globals, not local rebindings, so patching the
+    # module is how `tests/model/test_generator_component.py` (and, for
+    # `alignment_teacher_cells`, `tests/test_train_egostitch_e2e.py`)
+    # observes/replaces them without reaching into `stitch.py`/`scaffold.py`/
+    # `losses.py` directly.
+    "alignment_teacher_cells",
+    "build_scaffold",
+    "sinkhorn_log_plan",
+]
+
 # `mask` is smuggled into `x`'s channel 4 today (scaffold.py: node-existence
 # channel, `scaffold.feats[:, :, 4] = cat([1, 1, pi_src, pi_dst])`) --
 # `ImaginedGraph.mask` reads it back out rather than recomputing it, so the
@@ -127,7 +143,9 @@ class StitchedGraph(ImaginedGraph):
         )
 
 
-class EgoStitchImagineGenerator(NeighborhoodGenerator):
+class EgoStitchImagineGenerator(
+    NeighborhoodGenerator[GeneratorNodeState, ScaffoldInputPerturbation, StitchedGraph]
+):
     """Wraps today's Tokenize-lite + Imagine + Stitch + scaffold pipeline.
 
     Internally owns a trainable `EgoStitchStage1` (Tokenize-lite + Imagine +
@@ -135,6 +153,11 @@ class EgoStitchImagineGenerator(NeighborhoodGenerator):
     does today (`e2e_model.py:107-115`). Everything downstream of
     `encode_nodes` -- Sinkhorn alignment, scaffold assembly -- moves here
     from `e2e_model.py`, unchanged.
+
+    Binds the generic base's ``NodeStateT``/``PerturbationT``/``GraphT`` to
+    its own `GeneratorNodeState` / `ScaffoldInputPerturbation` / `StitchedGraph`
+    types, so `encode_node`/`stitch` carry this generator's real argument and
+    return types rather than the base's opaque `object`.
     """
 
     def __init__(
@@ -307,7 +330,7 @@ class EgoStitchImagineGenerator(NeighborhoodGenerator):
         )
 
     def auxiliary_losses(
-        self, graph: StitchedGraph, batch: Mapping[str, torch.Tensor]
+        self, graph: StitchedGraph | None, batch: Mapping[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """Compute every generator-owned loss component (design §6), unweighted.
 
@@ -343,14 +366,31 @@ class EgoStitchImagineGenerator(NeighborhoodGenerator):
 
         Args:
             graph: This generator's own most recent output for the pair
-                half of ``batch``.
+                half of ``batch``. Unlike the base contract, never `None`
+                in practice: `EgoStitchImagineGenerator.stitch` always
+                returns a `StitchedGraph` (the null case is `NullGenerator`'s
+                contract, not this generator's) -- accepted here as
+                `StitchedGraph | None` only to satisfy the base signature
+                without narrowing it (LSP), and rejected explicitly below.
             batch: The combined node+edge training batch (see above).
 
         Returns:
             ``{"feat", "exist", "mult", "slotadj", "gate", "ptr", "div",
             "deg", "real_egostat", "real_gin", "ssl_noise", "ssl_pool",
             "align"}``.
+
+        Raises:
+            ValueError: If ``graph`` is `None` -- this generator never
+                imagines nothing, so a `None` graph here indicates a caller
+                bug (e.g. reusing another generator's output), not a valid
+                null case.
         """
+        if graph is None:
+            raise ValueError(
+                "EgoStitchImagineGenerator.auxiliary_losses requires its own "
+                "StitchedGraph; got None (this generator never returns None "
+                "from stitch)"
+            )
         node_losses, _ = self.stage1.node_losses(
             batch["x"],
             batch["ground_x"],

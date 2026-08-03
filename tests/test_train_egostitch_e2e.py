@@ -823,7 +823,7 @@ class TestE2ECompositeStep:
         )
         assert records["classifier"].active
         assert records["classifier"].norm is not None
-        assert cast(float, records["classifier"].norm) > 0.0
+        assert records["classifier"].norm > 0.0
         for parameter in parameter_groups.groups["classifier"]:
             parameter.grad = None
         with pytest.raises(
@@ -1387,7 +1387,11 @@ class TestE2ECompositeStep:
             model.cfg = replace(model.cfg, permanent_null=null)
             expected = model.decompose(edge_view)[key]
             seen: list[torch.Tensor] = []
-            original = model.forward
+            # `EgoStitchModel.forward` returns `dict[str, object]` (it also
+            # carries the non-Tensor `"graph"`/`"embedding_ab"` reuse payload,
+            # design §6) -- narrow back to this test's actual usage
+            # (`_capture`'s own body only ever reads/returns Tensor values).
+            original = cast(Callable[..., dict[str, torch.Tensor]], model.forward)
 
             def _capture(
                 payload: dict[str, torch.Tensor],
@@ -2053,7 +2057,10 @@ class _ArchivedV1TrainLoopE2E:
             )
             next(iter(factory.epoch_batches(1, rows_per_rank=rows, steps=steps)))
             seen: list[HeadNullMasks | None] = []
-            original = EgoStitchModel.forward
+            # See the identical narrowing note above: `forward` returns
+            # `dict[str, object]`; this spy only ever reads/returns Tensor
+            # values.
+            original = cast(Callable[..., dict[str, torch.Tensor]], EgoStitchModel.forward)
 
             def _spy(
                 self: EgoStitchModel,

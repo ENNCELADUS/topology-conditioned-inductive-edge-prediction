@@ -67,7 +67,8 @@ from src.model.egostitch.conditioning import (
     sample_branch_masks,
 )
 from src.model.egostitch.config import E2EConfig
-from src.model.egostitch.graph import GraphEmbedding, ImaginedGraph
+from src.model.egostitch.generator import StitchedGraph
+from src.model.egostitch.graph import GraphEmbedding
 from src.model.egostitch.imagine import NULL_MODE_ALL, NULL_MODE_CONTENT, NULL_MODE_FULL, SlotSet
 from src.model.egostitch.losses import stage1_family_tensors, stage1_total
 from src.train_b0 import (
@@ -2567,7 +2568,11 @@ class _CompositeStep(torch.nn.Module):
             )
         edge_output = self.model(edge_view, masks=branch_masks)
         logits = cast(torch.Tensor, edge_output["logits"])
-        graph = cast(ImaginedGraph, edge_output["graph"])
+        # `self.model.generator` is concretely `EgoStitchImagineGenerator` for
+        # P2 (registry-driven swapping is P3), whose `stitch` only ever
+        # produces a `StitchedGraph` -- match its own `auxiliary_losses`
+        # contract exactly rather than the wider base `ImaginedGraph`.
+        graph = cast(StitchedGraph, edge_output["graph"])
         embedding_ab = cast(GraphEmbedding, edge_output["embedding_ab"])
 
         # Every key `NeighborhoodGenerator.auxiliary_losses`/

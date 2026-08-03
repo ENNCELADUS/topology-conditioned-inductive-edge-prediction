@@ -13,7 +13,7 @@ shape-contract failure, mask handling, `aux` privacy, substitutability
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 
 import pytest
 import torch
@@ -258,3 +258,67 @@ def test_auxiliary_losses_zero_when_relational_head_disabled() -> None:
 def test_graph_encoder_is_abstract() -> None:
     with pytest.raises(TypeError):
         GraphEncoder(d_model=8, w_rel=0.0)  # type: ignore[abstract]
+
+
+def test_no_l_rel_arm_shares_initialization_with_the_full_arm() -> None:
+    """`w_rel=0` must change only `L_rel`, never the initial weights.
+
+    The `no_l_rel` ablation is interpretable only if it differs from `full` by
+    the loss term alone. `GraphEncoder.__init__` allocates `rel_head`
+    conditionally and runs before a subclass's own layers and before the
+    classifier, so an RNG-consuming conditional would give the two arms
+    different initial weights everywhere downstream and confound the ablation
+    with an initialization difference.
+    """
+    from src.model.egostitch.composite import EgoStitchModel
+    from src.model.egostitch.config import E2EConfig
+
+    shared = {
+        "d_model": 32,
+        "encoder_layers": 1,
+        "cross_attn_layers": 2,
+        "n_heads": 2,
+        "n_inj": 1,
+        "ste_dim": 16,
+        "ste_layers": 2,
+        "xattn_heads": 2,
+    }
+    torch.manual_seed(0)
+    # `**dict[str, int]` unpacking can't be proven to avoid `E2EConfig`'s
+    # other, non-`int`-typed fields (e.g. `feature_standardization: str`),
+    # even though none of `shared`'s keys target one; same limitation
+    # `tests/model/test_composite.py`'s `_tiny_e2e_config` hits.
+    full = EgoStitchModel(E2EConfig(**shared, w_rel=0.25))  # type: ignore[arg-type]
+    torch.manual_seed(0)
+    no_l_rel = EgoStitchModel(E2EConfig(**shared, w_rel=0.0))  # type: ignore[arg-type]
+
+    assert full.encoder.rel_head is not None
+    assert no_l_rel.encoder.rel_head is None
+
+    full_state = full.state_dict()
+    shared_names = [
+        name
+        for name in no_l_rel.state_dict()
+        if not name.startswith("encoder.rel_head")
+    ]
+    assert shared_names, "expected shared parameters to compare"
+
+    def _mismatch_msg(name: str) -> Callable[[str], str]:
+        """Bind `name` by closure so each iteration's message is correct.
+
+        A `lambda m, name=name: ...` default-argument capture is the usual
+        late-binding fix for this, but its extra defaulted parameter defeats
+        mypy's inference against `assert_close`'s `Callable[[str], str]`
+        `msg` type; a nested closure has the same one-binding-per-iteration
+        behavior with an inferrable signature.
+        """
+        return lambda m: f"{name} differs between arms: {m}"
+
+    for name in shared_names:
+        torch.testing.assert_close(
+            no_l_rel.state_dict()[name],
+            full_state[name],
+            rtol=0,
+            atol=0,
+            msg=_mismatch_msg(name),
+        )

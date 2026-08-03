@@ -22,14 +22,15 @@ deliberately no `EgoStitchModel.aggregate_losses`, see composite.py).
 
 from __future__ import annotations
 
-from typing import cast
+from typing import Any, cast
 
 import pytest
 import torch
 from src.model.egostitch.composite import EgoStitchModel
+from src.model.egostitch.conditioning import GatedCrossAttention
 from src.model.egostitch.config import E2EConfig
-from src.model.egostitch.generator import NullGenerator
-from src.model.egostitch.graph import GraphEmbedding, ImaginedGraph, PairInputs
+from src.model.egostitch.generator import NullGenerator, StitchedGraph
+from src.model.egostitch.graph import GraphEmbedding, PairInputs
 from src.model.egostitch.losses import stage1_family_tensors, stage1_total
 from src.model.egostitch.scaffold import make_scaffold_input_perturbation
 
@@ -57,7 +58,12 @@ def _tiny_model_and_batch(
     **config_overrides: object,
 ) -> tuple[EgoStitchModel, dict[str, torch.Tensor]]:
     torch.manual_seed(0)
-    cfg = _tiny_e2e_config(**config_overrides)
+    # Same mypy limitation `_tiny_e2e_config`'s own `E2EConfig(**kwargs)` call
+    # hits (see its `# type: ignore[arg-type]` below): a `**dict[str, object]`
+    # unpack can't be proven to avoid `_tiny_e2e_config`'s one narrower-typed
+    # named parameter (`n_ground: int`), even though this call site never
+    # actually targets it.
+    cfg = _tiny_e2e_config(**config_overrides)  # type: ignore[arg-type]
     model = EgoStitchModel(cfg).eval()
     b, t, d_in = 4, 6, model.input_dim
     n_ground = cfg.n_ground
@@ -166,7 +172,11 @@ def test_self_pair_batch_encodes_each_unique_endpoint_once(
     calls = 0
     original = model.generator.encode_node
 
-    def counted(*args: object, **kwargs: object) -> object:
+    # `Any`, not `object`, on purpose: this wrapper forwards to whatever
+    # `original`'s real (narrower) signature is -- it never inspects its own
+    # arguments -- so typing them `object` would make the forwarding call
+    # itself untypeable without reflecting any real safety property here.
+    def counted(*args: Any, **kwargs: Any) -> object:  # noqa: ANN401 -- generic monkeypatch forwarding wrapper
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
@@ -193,7 +203,9 @@ def test_mixed_self_and_non_self_batch_encodes_b_only_for_non_self_rows(
     call_batch_sizes: list[int] = []
     original = model.generator.encode_node
 
-    def counted(x: torch.Tensor, *args: object, **kwargs: object) -> object:
+    # `Any` for the same reason as the wrapper above: forwards blindly to
+    # `original`'s real signature.
+    def counted(x: torch.Tensor, *args: Any, **kwargs: Any) -> object:  # noqa: ANN401 -- generic monkeypatch forwarding wrapper
         call_batch_sizes.append(x.size(0))
         return original(x, *args, **kwargs)
 
@@ -227,7 +239,8 @@ def test_shared_endpoint_across_several_pairs_calls_encode_tokens_once_per_uniqu
     calls = 0
     original = model.classifier.encode_tokens
 
-    def counted(*args: object, **kwargs: object) -> object:
+    # `Any` for the same reason as the generator wrappers above.
+    def counted(*args: Any, **kwargs: Any) -> object:  # noqa: ANN401 -- generic monkeypatch forwarding wrapper
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
@@ -273,8 +286,13 @@ def test_null_generator_cond_none_matches_conditioned_model_f_logit() -> None:
     component-composition level available today.
     """
     model, batch = _tiny_model_and_batch()
+    # `nn.ModuleList.__getitem__` is typed to return plain `Module`; narrow to
+    # the concrete type to reach `.gate` (same idiom as
+    # `tests/test_train_egostitch_e2e.py`'s `_gates` helper).
+    topo_gate = model.classifier.trunk.topo_xattn[0]
+    assert isinstance(topo_gate, GatedCrossAttention)
     with torch.no_grad():
-        model.classifier.trunk.topo_xattn[0].gate.fill_(0.7)  # open gate: prove it's truly bypassed
+        topo_gate.gate.fill_(0.7)  # open gate: prove it's truly bypassed
 
     f_logit = model.decompose(batch)["f_logit"]
 
@@ -318,7 +336,10 @@ def test_perturbation_reaches_the_generator_through_build_pair_context_from_stat
     captured: dict[str, object] = {}
     original_stitch = model.generator.stitch
 
-    def capturing_stitch(*args: object, **kwargs: object) -> object:
+    # `Any` for the same reason as the wrappers in
+    # `test_self_pair_batch_encodes_each_unique_endpoint_once` above: forwards
+    # blindly to `original_stitch`'s real signature.
+    def capturing_stitch(*args: Any, **kwargs: Any) -> object:  # noqa: ANN401 -- generic monkeypatch forwarding wrapper
         captured["perturbation"] = kwargs.get("perturbation")
         return original_stitch(*args, **kwargs)
 
@@ -364,7 +385,7 @@ def test_forward_graph_and_embedding_ab_feed_generator_and_encoder_auxiliary_los
     batch = _full_training_batch(model, cfg)
 
     output = model(batch)
-    graph = cast(ImaginedGraph, output["graph"])
+    graph = cast(StitchedGraph, output["graph"])
     embedding_ab = cast(GraphEmbedding, output["embedding_ab"])
     generator_losses = model.generator.auxiliary_losses(graph, batch)
     encoder_losses = model.encoder.auxiliary_losses(embedding_ab, batch)
@@ -431,7 +452,9 @@ def test_forward_graph_reused_by_auxiliary_losses_does_not_stitch_again(
     calls = 0
     original_stitch = model.generator.stitch
 
-    def counted(*args: object, **kwargs: object) -> object:
+    # `Any` for the same reason as the wrappers above: forwards blindly to
+    # `original_stitch`'s real signature.
+    def counted(*args: Any, **kwargs: Any) -> object:  # noqa: ANN401 -- generic monkeypatch forwarding wrapper
         nonlocal calls
         calls += 1
         return original_stitch(*args, **kwargs)
@@ -441,6 +464,6 @@ def test_forward_graph_reused_by_auxiliary_losses_does_not_stitch_again(
     output = model(batch)
     assert calls == 1
 
-    model.generator.auxiliary_losses(cast(ImaginedGraph, output["graph"]), batch)
+    model.generator.auxiliary_losses(cast(StitchedGraph, output["graph"]), batch)
 
     assert calls == 1

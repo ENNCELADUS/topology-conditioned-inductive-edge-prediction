@@ -223,9 +223,9 @@ def _validation_worker(output_dir: Path) -> None:
         sys.path.insert(0, str(REPO_ROOT))
 
     from src import train_egostitch as te
+    from src.model.egostitch.composite import E2ENodeState, E2EPairContext, EgoStitchModel
     from src.model.egostitch.conditioning import HeadNullMasks
     from src.model.egostitch.config import E2EConfig
-    from src.model.egostitch.e2e_model import E2ENodeState, E2EPairContext, EgoStitchE2E
 
     from tests.helpers import egostitch_ddp_smoke as smoke
 
@@ -233,7 +233,7 @@ def _validation_worker(output_dir: Path) -> None:
     torch.manual_seed(0)
     pack_dir = output_dir / "token_pack"
     cfg = smoke._toy_config(output_dir, pack_dir)
-    model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+    model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
     data = smoke._toy_bundle(model.generator_cfg)
     data.val_pairs = [
         ("n0", "n1"),
@@ -262,7 +262,7 @@ def _validation_worker(output_dir: Path) -> None:
     original_score = model.score_pair_context
 
     def counted_encode(
-        self: EgoStitchE2E,
+        self: EgoStitchModel,
         emb: torch.Tensor,
         length: torch.Tensor,
         x: torch.Tensor,
@@ -274,7 +274,7 @@ def _validation_worker(output_dir: Path) -> None:
         return original_encode(emb, length, x, ground, ground_ids)
 
     def checked_score(
-        self: EgoStitchE2E,
+        self: EgoStitchModel,
         context: E2EPairContext,
         *,
         masks: HeadNullMasks | None = None,

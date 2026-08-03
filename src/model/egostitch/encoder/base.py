@@ -48,12 +48,26 @@ class GraphEncoder(nn.Module, ABC):
     def __init__(self, *, d_model: int, w_rel: float) -> None:
         """Build the shared relational head.
 
+        The allocation is RNG-neutral, and that is load-bearing rather than
+        tidiness. `w_rel == 0.0` defines the ``no_l_rel`` ablation arm, which
+        must differ from ``full`` **only** by the ``L_rel`` term. This base
+        runs via `super().__init__()`, i.e. before a subclass's own layers and
+        before the classifier the composite builds next, so a bare conditional
+        here would consume RNG in one arm and not the other and silently give
+        the two arms different initial weights everywhere downstream --
+        confounding the ablation with an initialization difference. (The
+        pre-refactor `EgoStitchE2E` was accidentally safe: it allocated
+        `rel_head` last, after every other module.) Saving and restoring the
+        RNG state keeps the stream identical under either weight, so any
+        subclass inherits the property without having to know about it.
+
         Args:
             d_model: Width of the encoded tokens the relational head reads.
                 Must equal the `d` a subclass's `forward` returns.
             w_rel: Nonnegative auxiliary-loss weight. `w_rel == 0.0` omits
                 the relational head entirely (no extra parameters), exactly
-                as `EgoStitchE2E.rel_head` is `None` when `cfg.w_rel == 0.0`.
+                as the pre-refactor `rel_head` was `None` when
+                ``cfg.w_rel == 0.0``.
 
         Raises:
             ValueError: If `w_rel` is negative.
@@ -63,6 +77,7 @@ class GraphEncoder(nn.Module, ABC):
             raise ValueError(f"w_rel must be non-negative, got {w_rel}")
         self.w_rel = w_rel
         self.rel_head: nn.Sequential | None = None
+        rng_state = torch.random.get_rng_state()
         if w_rel > 0.0:
             rel_hidden = max(1, d_model // 2)
             self.rel_head = nn.Sequential(
@@ -70,6 +85,7 @@ class GraphEncoder(nn.Module, ABC):
                 nn.GELU(),
                 nn.Linear(rel_hidden, 2),
             )
+        torch.random.set_rng_state(rng_state)
 
     @abstractmethod
     def forward(self, graph: ImaginedGraph) -> GraphEmbedding:

@@ -295,7 +295,12 @@ def test_ema_updates_once_and_matches_joint_ab_ba_mean() -> None:
     classifier.train()
     pair, cond = _tiny_pair_and_cond(cfg, batch_size=4, n_topo=3)
     layer = cast(GatedCrossAttention, classifier.trunk.topo_xattn[0])
-    layer.attn = _DirectionalConstantAttention(batch_size=4, ab=1.0, ba=3.0)
+    # Deliberate test double: `_DirectionalConstantAttention` duck-types
+    # `nn.MultiheadAttention`'s call contract without being one, exactly as
+    # `tests/model/test_egostitch_conditioning.py`'s `_FixedAttention` swaps
+    # into the same `.attn` slot -- the checker is right that the nominal
+    # types disagree; the substitution is intentional.
+    layer.attn = _DirectionalConstantAttention(batch_size=4, ab=1.0, ba=3.0)  # type: ignore[assignment]
 
     classifier(pair, cond)
 
@@ -355,7 +360,8 @@ def test_train_and_eval_residuals_agree() -> None:
     classifier.eval()
     pair, cond = _tiny_pair_and_cond(cfg, batch_size=4, n_topo=3)
     layer = cast(GatedCrossAttention, classifier.trunk.topo_xattn[0])
-    layer.attn = _DirectionalConstantAttention(batch_size=4, ab=1.0, ba=3.0)
+    # Deliberate test double -- see the identical comment above.
+    layer.attn = _DirectionalConstantAttention(batch_size=4, ab=1.0, ba=3.0)  # type: ignore[assignment]
     with torch.no_grad():
         layer.gate.fill_(0.7)
 
@@ -414,7 +420,8 @@ def test_edge_mask_filler_rows_excluded_from_mu() -> None:
             torch.full((1, 1, d_model), 200.0),
         ]
     )
-    layer.attn = _FixedAttention(attention_output)
+    # Deliberate test double -- see the identical comment above.
+    layer.attn = _FixedAttention(attention_output)  # type: ignore[assignment]
 
     classifier(pair, cond)
 

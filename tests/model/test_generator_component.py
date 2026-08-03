@@ -27,6 +27,7 @@ from src.model.egostitch.generator.egostitch import _slotset_from_aux
 from src.model.egostitch.imagine import SlotSet
 from src.model.egostitch.losses import alignment_loss, alignment_teacher_cells
 from src.model.egostitch.matching import match_slots
+from src.model.egostitch.model import FeatureStandardizationMode
 from src.model.egostitch.scaffold import (
     EDGE_TYPES,
     FEAT_DIM,
@@ -328,7 +329,12 @@ def test_matches_live_e2e_build_pair_context(monkeypatch: pytest.MonkeyPatch) ->
 
     generator = EgoStitchImagineGenerator(
         model.generator_cfg,
-        feature_standardization=cfg.feature_standardization,
+        # `E2EConfig.feature_standardization` is a runtime-validated plain
+        # `str` (`config.py`'s `__post_init__`), not the narrower
+        # `FeatureStandardizationMode` literal `EgoStitchImagineGenerator`
+        # expects; same cast `composite.py`'s own `EgoStitchModel.__init__`
+        # uses for this exact value.
+        feature_standardization=cast(FeatureStandardizationMode, cfg.feature_standardization),
         loss_family="egostitch_e2e",
     )
     generator.stage1 = model.generator.stage1  # share the exact live weights

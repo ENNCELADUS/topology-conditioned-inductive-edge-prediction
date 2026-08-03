@@ -18,6 +18,8 @@ each node once via `encode_tokens` and reuses it, instead of paying the
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 import torch.distributed as dist
 from torch.nn import functional as F
@@ -112,7 +114,10 @@ class B0V31PairClassifier(PairClassifier):
         `self.encoder` is called -- `forward` consumes only its output, via
         `PairInputs.tokens_a`/`tokens_b`.
         """
-        return self.encoder(emb, length)
+        # `nn.Module.__call__` is typed to return `Any`; `SiameseEncoder.forward`
+        # itself is annotated `-> torch.Tensor`, so this narrows back to what
+        # the module actually returns rather than widening the contract.
+        return cast(torch.Tensor, self.encoder(emb, length))
 
     def forward(
         self,

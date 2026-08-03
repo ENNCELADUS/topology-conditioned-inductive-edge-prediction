@@ -21,8 +21,16 @@ from src.model.egostitch.generator.base import NeighborhoodGenerator
 from src.model.egostitch.graph import ImaginedGraph
 
 
-class NullGenerator(NeighborhoodGenerator):
-    """Imagines nothing. `stitch` always returns `None`; no auxiliary losses."""
+class NullGenerator(NeighborhoodGenerator[torch.Tensor, object, ImaginedGraph]):
+    """Imagines nothing. `stitch` always returns `None`; no auxiliary losses.
+
+    Binds the generic base's ``NodeStateT``/``PerturbationT``/``GraphT`` to
+    ``torch.Tensor``/``object``/``ImaginedGraph``: `encode_node` echoes `x`
+    back rather than allocating a dedicated state type, and `stitch` neither
+    has nor needs a perturbation type of its own, so the widest possible
+    binding (`object`) is the honest contract -- it never reads `perturbation`
+    regardless of what is passed.
+    """
 
     def encode_node(
         self,

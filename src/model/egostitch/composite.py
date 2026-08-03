@@ -59,6 +59,7 @@ from src.model.egostitch.generator import EgoStitchImagineGenerator, GeneratorNo
 from src.model.egostitch.graph import GraphEmbedding, ImaginedGraph, PairConditioning, PairInputs
 from src.model.egostitch.imagine import SlotSet
 from src.model.egostitch.model import FeatureStandardizationMode
+from src.model.egostitch.scaffold import ScaffoldInputPerturbation
 
 
 class E2ENodeState(NamedTuple):
@@ -347,7 +348,7 @@ class EgoStitchModel(nn.Module):
         state_b: E2ENodeState,
         is_self: torch.Tensor,
         *,
-        perturbation: object | None = None,
+        perturbation: ScaffoldInputPerturbation | None = None,
     ) -> tuple[ImaginedGraph, GraphEmbedding, GraphEmbedding]:
         """Imagine the joint graph once, then encode both AB and BA directions.
 
@@ -372,7 +373,7 @@ class EgoStitchModel(nn.Module):
         is_self: torch.Tensor,
         *,
         need_topo: bool,
-        scaffold_input_perturbation: object | None = None,
+        scaffold_input_perturbation: ScaffoldInputPerturbation | None = None,
     ) -> tuple[E2EPairContext, ImaginedGraph | None, GraphEmbedding | None]:
         """Shared implementation behind `build_pair_context_from_states`.
 
@@ -423,7 +424,7 @@ class EgoStitchModel(nn.Module):
         is_self: torch.Tensor,
         *,
         need_topo: bool = True,
-        scaffold_input_perturbation: object | None = None,
+        scaffold_input_perturbation: ScaffoldInputPerturbation | None = None,
     ) -> E2EPairContext:
         """Build the shared pair context once from cacheable endpoint states."""
         context, _, _ = self._build_pair_context_and_graph(
@@ -507,7 +508,10 @@ class EgoStitchModel(nn.Module):
             len_b=context.len_b,
             edge_mask=edge_mask,
         )
-        return self.classifier(pair, cond, masks=masks)
+        # `nn.Module.__call__` is typed to return `Any`; `PairClassifier.forward`
+        # itself is annotated `-> torch.Tensor`, so this narrows back to what
+        # the module actually returns rather than widening the contract.
+        return cast(torch.Tensor, self.classifier(pair, cond, masks=masks))
 
     def forward(
         self, batch: Mapping[str, torch.Tensor], *, masks: HeadNullMasks | None = None

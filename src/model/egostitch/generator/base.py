@@ -15,20 +15,42 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
+from typing import Generic, TypeVar
 
 import torch
 from torch import nn
 
 from src.model.egostitch.graph import ImaginedGraph
 
+NodeStateT = TypeVar("NodeStateT")
+"""A generator's own cacheable per-node state type, opaque to every other component."""
 
-class NeighborhoodGenerator(nn.Module, ABC):
+PerturbationT = TypeVar("PerturbationT")
+"""A generator's own deterministic scaffold-structure control input type."""
+
+GraphT = TypeVar("GraphT", bound=ImaginedGraph)
+"""A generator's own imagined-graph type (always an `ImaginedGraph` or subclass)."""
+
+
+class NeighborhoodGenerator(nn.Module, ABC, Generic[NodeStateT, PerturbationT, GraphT]):
     """Consumes two endpoints' features and grounding pools, emits one graph (or none).
 
     Concrete generators own every auxiliary loss that supervises their own
     imagination (design §6): a generator swap swaps its losses with it,
     because those losses read only this generator's own `graph.aux`, which
     is otherwise off-limits to every other component (`graph.py`).
+
+    Generic over ``NodeStateT`` (the per-node cache type `encode_node`
+    produces and `stitch` consumes), ``PerturbationT`` (the scaffold-control
+    input type `stitch` accepts) and ``GraphT`` (the concrete `ImaginedGraph`
+    subclass `stitch` emits): a concrete generator binds all three to its own
+    types (e.g. ``NeighborhoodGenerator[GeneratorNodeState,
+    ScaffoldInputPerturbation, StitchedGraph]``), which lets `encode_node`/
+    `stitch`/`auxiliary_losses` be overridden with that generator's own exact
+    argument and return types instead of the opaque `object` every generator
+    would otherwise be forced to share -- a second generator implementation
+    (`NullGenerator` is the existing one) binds its own, different types the
+    same way.
     """
 
     @abstractmethod
@@ -37,7 +59,7 @@ class NeighborhoodGenerator(nn.Module, ABC):
         x: torch.Tensor,
         ground: torch.Tensor,
         ground_ids: torch.Tensor | None = None,
-    ) -> object:
+    ) -> NodeStateT:
         """Run the cacheable per-node half of imagination for one endpoint batch.
 
         Callers that score many pairs over a shared node universe (candidate
@@ -64,12 +86,12 @@ class NeighborhoodGenerator(nn.Module, ABC):
     @abstractmethod
     def stitch(
         self,
-        state_a: object,
-        state_b: object,
+        state_a: NodeStateT,
+        state_b: NodeStateT,
         is_self: torch.Tensor,
         *,
-        perturbation: object | None = None,
-    ) -> ImaginedGraph | None:
+        perturbation: PerturbationT | None = None,
+    ) -> GraphT | None:
         """Imagine the joint graph from two already-encoded endpoint states.
 
         Args:
@@ -99,8 +121,8 @@ class NeighborhoodGenerator(nn.Module, ABC):
         ground_b: torch.Tensor,
         *,
         is_self: torch.Tensor,
-        perturbation: object | None = None,
-    ) -> ImaginedGraph | None:
+        perturbation: PerturbationT | None = None,
+    ) -> GraphT | None:
         """Convenience composition: `encode_node` both endpoints, then `stitch`.
 
         Callers that do not need cross-pair node-state reuse (a single
@@ -127,7 +149,7 @@ class NeighborhoodGenerator(nn.Module, ABC):
 
     @abstractmethod
     def auxiliary_losses(
-        self, graph: ImaginedGraph | None, batch: Mapping[str, torch.Tensor]
+        self, graph: GraphT | None, batch: Mapping[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """Compute every loss that supervises this generator's own imagination.
 
