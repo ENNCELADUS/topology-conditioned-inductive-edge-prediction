@@ -23,13 +23,13 @@ from typing import cast
 
 import torch
 import torch.testing
-from src.model.egostitch.classifier.b0_v31 import B0V31PairClassifier
-from src.model.egostitch.composite import E2EPairContext, EgoStitchModel
-from src.model.egostitch.conditioning import (
+from src.model.egostitch.classifier.b0_v31 import (
     NULL_ALL_HEAD,
+    B0V31PairClassifier,
     GatedCrossAttention,
     masks_for_null,
 )
+from src.model.egostitch.composite import E2EPairContext, EgoStitchModel
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.graph import GraphEmbedding, PairConditioning, PairInputs
 

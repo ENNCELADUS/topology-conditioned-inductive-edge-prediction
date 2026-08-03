@@ -25,8 +25,8 @@ from src.data.distributed_pairs import CompactPairBatchDataset, PairBatchSpec
 from src.data.packed_features import PackedFeatureTable, build_packed_features
 from src.data.pairs import TokenPairDataset
 from src.eval.edge_metrics import EdgeMetrics
-from src.model.B0 import BEST_V3_1_CONFIG, V3_1
-from src.model.b0_alt import F0PairMLP
+from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
+from src.model.egostitch.classifier.layers import MLPHead
 from src.train_b0 import (
     AssembledData,
     Config,
@@ -149,6 +149,50 @@ def _make_synthetic_pair_dataset(
 
 def _batch_of(items: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
     return {key: torch.stack([item[key] for item in items]) for key in ("x_a", "x_b", "label")}
+
+
+class _TinyPairMLP(nn.Module):
+    """Local double for the pinned `f0_mlp` batch contract (x_a/x_b/label -> logits/loss).
+
+    `src/model/b0_alt.py` (`F0PairMLP`, the B0-alt baseline) was removed 2026-08-03 by
+    owner decision; see `docs/results/E2-pair-to-topology-gap.md` for the closed result
+    it produced. `train_loop` is model-agnostic (it only needs the pinned batch
+    contract), so this small real `nn.Module` — symmetric pair features through an
+    `MLPHead`, exactly as `F0PairMLP` did — stands in wherever these tests need a
+    concrete, trainable model rather than testing `build_model`'s `f0_mlp` dispatch
+    itself (which now raises; see `TestBuildModel`).
+    """
+
+    def __init__(
+        self, input_dim: int, hidden_dims: tuple[int, ...] = (16,), dropout: float = 0.0
+    ) -> None:
+        super().__init__()
+        self.input_dim = input_dim
+        self.head = MLPHead(
+            input_dim=3 * input_dim,
+            hidden_dims=list(hidden_dims),
+            output_dim=1,
+            dropout=dropout,
+            activation="gelu",
+            norm="layernorm",
+        )
+
+    def forward(
+        self, batch: dict[str, torch.Tensor] | None = None, **kwargs: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        merged: dict[str, torch.Tensor] = dict(batch or {})
+        merged.update(kwargs)
+        x_a, x_b = merged["x_a"], merged["x_b"]
+        pair_features = torch.cat([x_a + x_b, (x_a - x_b).abs(), x_a * x_b], dim=-1)
+        logits = self.head(pair_features)
+        output: dict[str, torch.Tensor] = {"logits": logits}
+        if "label" in merged:
+            squeeze_last = logits.dim() > 1 and logits.size(-1) == 1
+            logits_for_loss = logits.squeeze(-1) if squeeze_last else logits
+            output["loss"] = F.binary_cross_entropy_with_logits(
+                logits_for_loss, merged["label"].float()
+            )
+        return output
 
 
 # --------------------------------------------------------------------------- load_config
@@ -352,28 +396,16 @@ class TestBuildModel:
         assert isinstance(model, V3_1)
         assert model.d_model == 32
 
-    def test_f0_mlp_with_empty_config_uses_defaults(self, tmp_path: Path) -> None:
+    def test_f0_mlp_family_has_no_buildable_model(self, tmp_path: Path) -> None:
+        # f0_mlp (B0-alt) remains a schema-valid family (config-schema symmetry) but
+        # its model was removed 2026-08-03 by owner decision; build_model must raise
+        # a clear error naming the family rather than silently building something else.
         config_path = tmp_path / "cfg.yaml"
         _write_yaml_config(config_path, {"model": {"family": "f0_mlp", "config": {}}})
         cfg = load_config(config_path)
 
-        model = build_model(cfg)
-
-        assert isinstance(model, F0PairMLP)
-        assert model.input_dim == 1536
-
-    def test_f0_mlp_with_explicit_config(self, tmp_path: Path) -> None:
-        config_path = tmp_path / "cfg.yaml"
-        _write_yaml_config(
-            config_path,
-            {"model": {"family": "f0_mlp", "config": {"input_dim": 8, "hidden_dims": [16]}}},
-        )
-        cfg = load_config(config_path)
-
-        model = build_model(cfg)
-
-        assert isinstance(model, F0PairMLP)
-        assert model.input_dim == 8
+        with pytest.raises(ValueError, match="f0_mlp"):
+            build_model(cfg)
 
     def test_unknown_family_raises(self, tmp_path: Path) -> None:
         config_path = tmp_path / "cfg.yaml"
@@ -470,10 +502,10 @@ def _tiny_config(epochs: int = 5, patience: int = 8, eval_every: int = 1) -> Con
     )
 
 
-class TestTrainLoopSyntheticF0Mlp:
+class TestTrainLoopSyntheticPairMlp:
     def test_loss_decreases_over_epochs(self) -> None:
         torch.manual_seed(0)
-        model = F0PairMLP(input_dim=4, hidden_dims=(16,), dropout=0.0)
+        model = _TinyPairMLP(input_dim=4, hidden_dims=(16,), dropout=0.0)
         train_items = _make_synthetic_pair_dataset(64, input_dim=4, seed=1)
         val_items = _make_synthetic_pair_dataset(32, input_dim=4, seed=2)
         train_batch = _batch_of(train_items)
@@ -494,7 +526,7 @@ class TestTrainLoopSyntheticF0Mlp:
 
     def test_metrics_history_entries_have_expected_keys(self) -> None:
         torch.manual_seed(0)
-        model = F0PairMLP(input_dim=4, hidden_dims=(16,), dropout=0.0)
+        model = _TinyPairMLP(input_dim=4, hidden_dims=(16,), dropout=0.0)
         train_batch = _batch_of(_make_synthetic_pair_dataset(32, input_dim=4, seed=1))
         val_batch = _batch_of(_make_synthetic_pair_dataset(16, input_dim=4, seed=2))
         cfg = _tiny_config(epochs=3)
@@ -507,7 +539,7 @@ class TestTrainLoopSyntheticF0Mlp:
 
     def test_checkpoint_save_reload_reproduces_logits_exactly(self) -> None:
         torch.manual_seed(0)
-        model = F0PairMLP(input_dim=4, hidden_dims=(16,), dropout=0.0)
+        model = _TinyPairMLP(input_dim=4, hidden_dims=(16,), dropout=0.0)
         train_batch = _batch_of(_make_synthetic_pair_dataset(32, input_dim=4, seed=1))
         val_batch = _batch_of(_make_synthetic_pair_dataset(16, input_dim=4, seed=2))
         cfg = _tiny_config(epochs=3)
@@ -515,10 +547,10 @@ class TestTrainLoopSyntheticF0Mlp:
 
         result = train_loop(model, lambda epoch: [train_batch], [val_batch], cfg, accelerator)
 
-        reloaded = F0PairMLP(input_dim=4, hidden_dims=(16,), dropout=0.0)
+        reloaded = _TinyPairMLP(input_dim=4, hidden_dims=(16,), dropout=0.0)
         reloaded.load_state_dict(result.best_state_dict)
         reloaded.eval()
-        original = F0PairMLP(input_dim=4, hidden_dims=(16,), dropout=0.0)
+        original = _TinyPairMLP(input_dim=4, hidden_dims=(16,), dropout=0.0)
         original.load_state_dict(result.best_state_dict)
         original.eval()
 
@@ -631,7 +663,7 @@ class TestWriteOutputs:
             output_dir=output_dir,
             mixed_precision=cfg.mixed_precision,
         )
-        model = F0PairMLP(input_dim=4, hidden_dims=(8,), dropout=0.0)
+        model = _TinyPairMLP(input_dim=4, hidden_dims=(8,), dropout=0.0)
         state_dict = {k: v.clone() for k, v in model.state_dict().items()}
         metrics = EdgeMetrics(
             auroc=0.9,
@@ -1445,7 +1477,7 @@ def test_evaluate_distributed_coverage_failure_raises_on_non_main_rank() -> None
     # A duplicate validation row must raise the coverage ValueError on EVERY
     # rank symmetrically. If only rank zero validated, the other ranks would
     # block in broadcast_object_list until the NCCL watchdog killed the job.
-    model = F0PairMLP(input_dim=4, hidden_dims=(8,), dropout=0.0)
+    model = _TinyPairMLP(input_dim=4, hidden_dims=(8,), dropout=0.0)
     batch = _batch_of(_make_synthetic_pair_dataset(4))
     batch["_row_id"] = torch.tensor([0, 0, 1, 2])  # row 0 gathered twice
 
@@ -1463,7 +1495,7 @@ def test_ddp_loop_records_counterfactual_stop_but_runs_all_epochs(tmp_path: Path
     config_path = tmp_path / "cfg.yaml"
     _write_yaml_config(config_path, {"optim.epochs": 4, "eval.patience": 1})
     cfg = load_config(config_path)
-    model = F0PairMLP(input_dim=4, hidden_dims=(8,), dropout=0.0)
+    model = _TinyPairMLP(input_dim=4, hidden_dims=(8,), dropout=0.0)
     batch = _batch_of(_make_synthetic_pair_dataset(8))
     batch["_local_pair_count"] = torch.tensor(8)
     batch["_global_pair_count"] = torch.tensor(8)
@@ -1589,7 +1621,7 @@ def test_ddp_loop_runtime_profile_has_task12_keys(tmp_path: Path) -> None:
     config_path = tmp_path / "cfg.yaml"
     _write_yaml_config(config_path, {"optim.epochs": 2, "eval.patience": 8})
     cfg = load_config(config_path)
-    model = F0PairMLP(input_dim=4, hidden_dims=(8,), dropout=0.0)
+    model = _TinyPairMLP(input_dim=4, hidden_dims=(8,), dropout=0.0)
     batch = _batch_of(_make_synthetic_pair_dataset(8))
     batch["_local_pair_count"] = torch.tensor(8)
     batch["_global_pair_count"] = torch.tensor(8)

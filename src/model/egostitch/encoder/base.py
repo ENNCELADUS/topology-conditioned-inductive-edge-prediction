@@ -18,8 +18,8 @@ from collections.abc import Mapping
 import torch
 from torch import nn
 
+from src.model.egostitch.generator.losses import relational_loss
 from src.model.egostitch.graph import GraphEmbedding, ImaginedGraph
-from src.model.egostitch.losses import relational_loss
 
 
 class GraphEncoder(nn.Module, ABC):

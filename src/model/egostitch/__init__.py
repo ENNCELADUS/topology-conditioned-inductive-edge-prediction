@@ -12,7 +12,7 @@ codebook, no harmonization, no CVAE. The frozen-s0 decision head over
 
 from src.model.egostitch.composite import E2ENodeState, E2EPairContext, EgoStitchModel
 from src.model.egostitch.config import EgoStitchConfig
-from src.model.egostitch.model import EgoStitchStage1
+from src.model.egostitch.generator.imagine import EgoStitchStage1
 
 __all__ = [
     "E2ENodeState",

@@ -6,7 +6,7 @@ from typing import cast
 
 import torch
 import torch.nn as nn
-from src.model.B0 import BlockSelfMixingLayer, CrossAttentionLayer
+from src.model.egostitch.classifier.layers import BlockSelfMixingLayer, CrossAttentionLayer
 
 
 class _RecordingAttention(nn.Module):

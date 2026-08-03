@@ -18,7 +18,7 @@ from src.data.pairs import (
     collate_token_pairs,
     probe_lengths,
 )
-from src.model.B0 import V3_1
+from src.model.egostitch.classifier.b0_v31 import V3_1
 
 pytestmark = pytest.mark.unit
 

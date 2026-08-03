@@ -8,15 +8,15 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from src.model.egostitch import conditioning as conditioning_module
-from src.model.egostitch.conditioning import (
+from src.model.egostitch.classifier import b0_v31 as conditioning_module
+from src.model.egostitch.classifier.b0_v31 import (
     NULL_ALL_HEAD,
     NULL_NONE,
     GatedCrossAttention,
-    HeadNullMasks,
     masks_for_null,
     sample_branch_masks,
 )
+from src.model.egostitch.classifier.base import HeadNullMasks
 from src.model.egostitch.config import E2EConfig
 from torch import nn
 
@@ -126,7 +126,7 @@ def test_sample_branch_masks_deterministic_given_seed() -> None:
 def test_sample_branch_masks_topo_stream_is_bit_identical_to_a_direct_draw() -> None:
     """Content-path removal deleted the `cont` draw that used to follow `topo`.
 
-    `topo` was always drawn first from the shared generator (conditioning.py
+    `topo` was always drawn first from the shared generator (b0_v31.py
     §2 mask-stream ordering), so removing the second (`cont`) draw must not
     perturb it: the mask equals the first ``torch.rand(...) >= p_topo`` draw
     from an identically seeded generator, exactly as it did before the `cont`

@@ -1,4 +1,4 @@
-"""Tests for src.model.egostitch.losses: the Stage-1 loss tree."""
+"""Tests for src.model.egostitch.generator.losses: the Stage-1 loss tree."""
 
 from __future__ import annotations
 
@@ -7,8 +7,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 from src.model.egostitch.config import EgoStitchConfig
-from src.model.egostitch.imagine import DenoiseSlots, SlotSet
-from src.model.egostitch.losses import (
+from src.model.egostitch.generator.assemble import Assignment
+from src.model.egostitch.generator.imagine import DenoiseSlots, SlotSet
+from src.model.egostitch.generator.losses import (
     RandomGIN,
     alignment_loss,
     degree_nll,
@@ -23,7 +24,6 @@ from src.model.egostitch.losses import (
     stage1_total,
     standardized_energy_distance,
 )
-from src.model.egostitch.matching import Assignment
 
 pytestmark = pytest.mark.unit
 
@@ -376,7 +376,7 @@ class TestReconLosses:
 
     def test_pointer_loss_reaches_pointer_head(self) -> None:
         torch.manual_seed(7)
-        from src.model.egostitch.imagine import ImagineDecoder
+        from src.model.egostitch.generator.imagine import ImagineDecoder
 
         decoder = ImagineDecoder(_TINY)
         x = torch.randn(1, _TINY.input_dim)

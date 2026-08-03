@@ -47,19 +47,14 @@ from torch.nn import functional as F
 
 from src.data.feature_stats import FeatureStats
 from src.model.egostitch.classifier import B0V31PairClassifier
-from src.model.egostitch.conditioning import (
-    NULL_ALL_HEAD,
-    NULL_NONE,
-    HeadNullMasks,
-    masks_for_null,
-)
+from src.model.egostitch.classifier.b0_v31 import NULL_ALL_HEAD, NULL_NONE, masks_for_null
+from src.model.egostitch.classifier.base import HeadNullMasks
 from src.model.egostitch.config import E2EConfig, EgoStitchConfig
 from src.model.egostitch.encoder import TypedMessagePassingEncoder
 from src.model.egostitch.generator import EgoStitchImagineGenerator, GeneratorNodeState
+from src.model.egostitch.generator.assemble import ScaffoldInputPerturbation
+from src.model.egostitch.generator.imagine import FeatureStandardizationMode, SlotSet
 from src.model.egostitch.graph import GraphEmbedding, ImaginedGraph, PairConditioning, PairInputs
-from src.model.egostitch.imagine import SlotSet
-from src.model.egostitch.model import FeatureStandardizationMode
-from src.model.egostitch.scaffold import ScaffoldInputPerturbation
 
 
 class E2ENodeState(NamedTuple):
@@ -125,9 +120,9 @@ def _generator_graph_dims(generator: EgoStitchImagineGenerator) -> tuple[int, in
     """Read ``(feature_dim, num_relations)`` from one throwaway self-row graph.
 
     Design task 1: the encoder's input dims must be read from the graph the
-    generator actually emits, never hardcoded (`scaffold.py`'s module-level
-    ``FEAT_DIM = 11`` / ``EDGE_TYPES = 4`` stay private to the generator
-    package). A self-row pair short-circuits `stitch`'s Sinkhorn call
+    generator actually emits, never hardcoded (`generator/assemble.py`'s
+    module-level ``FEAT_DIM = 11`` / ``EDGE_TYPES = 4`` stay private to the
+    generator package). A self-row pair short-circuits `stitch`'s Sinkhorn call
     entirely and never touches feature standardization (`stitch` consumes
     only already-generated `SlotSet` tensors), so this is safe to call in
     `EgoStitchModel.__init__`, before `set_feature_stats`.
@@ -224,7 +219,7 @@ class EgoStitchModel(nn.Module):
         Preserved verbatim as a pinned attribute (design coordinator
         amendment, 2026-08-03): read directly by
         `src/experiments/probes.py:820,895,985` (`.n_ground`, `.slots`),
-        `src/train_egostitch.py:3869` and `src/score_universe.py:1760`.
+        `src/train_egostitch.py:3875` and `src/score_universe.py:1760`.
         Same object identity as `self.generator.cfg`.
         """
         return self.generator.cfg

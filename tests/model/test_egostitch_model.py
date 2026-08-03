@@ -1,13 +1,16 @@
-"""Tests for src.model.egostitch.model: the composed Stage-1 model."""
+"""Tests for src.model.egostitch.generator.imagine: the composed Stage-1 model."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 from src.model.egostitch.config import EgoStitchConfig
-from src.model.egostitch.imagine import NULL_MODE_CONTENT, NULL_MODE_FULL
-from src.model.egostitch.losses import stage1_total
-from src.model.egostitch.model import EgoStitchStage1
+from src.model.egostitch.generator.imagine import (
+    NULL_MODE_CONTENT,
+    NULL_MODE_FULL,
+    EgoStitchStage1,
+)
+from src.model.egostitch.generator.losses import stage1_total
 
 pytestmark = pytest.mark.unit
 

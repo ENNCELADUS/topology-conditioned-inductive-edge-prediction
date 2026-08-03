@@ -32,23 +32,26 @@ import torch
 
 from src.data.feature_stats import FeatureStats
 from src.model.egostitch.config import EgoStitchConfig
+from src.model.egostitch.generator.assemble import (
+    ScaffoldInputPerturbation,
+    ScaffoldTokens,
+    build_scaffold,
+    match_slots,
+    sinkhorn_log_plan,
+    swap_direction,
+)
 from src.model.egostitch.generator.base import NeighborhoodGenerator
-from src.model.egostitch.graph import ImaginedGraph
-from src.model.egostitch.imagine import SlotSet
-from src.model.egostitch.losses import (
+from src.model.egostitch.generator.imagine import (
+    EgoStitchStage1,
+    FeatureStandardizationMode,
+    SlotSet,
+)
+from src.model.egostitch.generator.losses import (
     LossFamily,
     alignment_loss,
     alignment_teacher_cells,
 )
-from src.model.egostitch.matching import match_slots
-from src.model.egostitch.model import EgoStitchStage1, FeatureStandardizationMode
-from src.model.egostitch.scaffold import (
-    ScaffoldInputPerturbation,
-    ScaffoldTokens,
-    build_scaffold,
-    swap_direction,
-)
-from src.model.egostitch.stitch import sinkhorn_log_plan
+from src.model.egostitch.graph import ImaginedGraph
 
 __all__ = [
     "EgoStitchImagineGenerator",
@@ -59,14 +62,14 @@ __all__ = [
     # look these up as module globals, not local rebindings, so patching the
     # module is how `tests/model/test_generator_component.py` (and, for
     # `alignment_teacher_cells`, `tests/test_train_egostitch_e2e.py`)
-    # observes/replaces them without reaching into `stitch.py`/`scaffold.py`/
-    # `losses.py` directly.
+    # observes/replaces them without reaching into `generator/assemble.py`/
+    # `generator/losses.py` directly.
     "alignment_teacher_cells",
     "build_scaffold",
     "sinkhorn_log_plan",
 ]
 
-# `mask` is smuggled into `x`'s channel 4 today (scaffold.py: node-existence
+# `mask` is smuggled into `x`'s channel 4 today (generator/assemble.py: node-existence
 # channel, `scaffold.feats[:, :, 4] = cat([1, 1, pi_src, pi_dst])`) --
 # `ImaginedGraph.mask` reads it back out rather than recomputing it, so the
 # two can never silently disagree.
@@ -93,7 +96,7 @@ class GeneratorNodeState(NamedTuple):
     fields (`encoded`/`length`), which now belong to the classifier
     component: every field here index-selects, index-copies, and
     concatenates the same way `E2ENodeState`'s generator-owned fields do
-    today (`score_universe.py:1859-1882`, `train_egostitch.py:2944-2968`),
+    today (`score_universe.py:1859-1882`, `train_egostitch.py:2950-2974`),
     so existing per-node caching call sites port over field-by-field.
 
     Attributes:
@@ -122,7 +125,7 @@ class StitchedGraph(ImaginedGraph):
     def swapped(self) -> StitchedGraph:
         """Relabel the four anchor one-hot channels for the BA stream.
 
-        Delegates to the existing `swap_direction` logic (`scaffold.py`)
+        Delegates to the existing `swap_direction` logic (`generator/assemble.py`)
         instead of rebuilding anything: the joint graph is built exactly
         once per pair (design §4). `adj` is passed straight through
         `swap_direction` untouched, so it is literally the same tensor
@@ -242,7 +245,7 @@ class EgoStitchImagineGenerator(
         exactly: self-pair rows (``is_self``) get an exact identity alignment
         plan without running Sinkhorn on that row at all; non-self rows run
         the unbalanced Sinkhorn plan (an fp32 island regardless of the
-        ambient autocast state -- see `stitch.sinkhorn_log_plan`) and
+        ambient autocast state -- see `assemble.sinkhorn_log_plan`) and
         `build_scaffold` promotes to fp32 before any product is formed.
         ``perturbation``, when given, is forwarded to `build_scaffold`
         unchanged -- the deterministic §14.4.5 scaffold-structure control

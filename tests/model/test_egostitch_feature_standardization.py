@@ -7,7 +7,7 @@ import pytest
 import torch
 from src.data.feature_stats import FeatureStats, compute_feature_stats
 from src.model.egostitch.config import EgoStitchConfig
-from src.model.egostitch.model import EgoStitchStage1, FeatureStandardizer
+from src.model.egostitch.generator.imagine import EgoStitchStage1, FeatureStandardizer
 
 pytestmark = pytest.mark.unit
 
@@ -174,7 +174,7 @@ class TestInitHealthUnderAnisotropicFeatures:
     def _dispersion(self, mode: str, *, seed: int = 0) -> dict[str, float]:
         # Local imports: keep the trainer's heavy dependencies (accelerate, scipy,
         # networkx) out of collection for the tests in this file that don't need them.
-        from src.model.egostitch.stitch import sinkhorn_plan
+        from src.model.egostitch.generator.assemble import sinkhorn_plan
         from src.train_egostitch import e2e_dispersion_statistics
 
         cfg = self._config()

@@ -127,10 +127,14 @@ def test_scoring_is_auto_sharded_and_strictly_merged() -> None:
 
 @pytest.mark.parametrize(
     "config_name",
-    ["b0_v31_breadth_first.yaml", "b0_alt_breadth_first.yaml"],
+    ["b0_v31_breadth_first.yaml"],
 )
 def test_hpc_training_configs_pin_bf16(config_name: str) -> None:
-    """Both implemented baseline runs use H20-native BF16 in the fixed environment."""
+    """The implemented baseline run uses H20-native BF16 in the fixed environment.
+
+    ``b0_alt_breadth_first.yaml`` (B0-alt) was removed 2026-08-03 by owner decision;
+    see ``docs/results/E2-pair-to-topology-gap.md`` for the closed result it produced.
+    """
     text = (REPO_ROOT / "configs" / config_name).read_text()
     assert 'mixed_precision: "bf16"' in text
 

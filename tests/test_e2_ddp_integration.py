@@ -223,8 +223,8 @@ def _validation_worker(output_dir: Path) -> None:
         sys.path.insert(0, str(REPO_ROOT))
 
     from src import train_egostitch as te
+    from src.model.egostitch.classifier.base import HeadNullMasks
     from src.model.egostitch.composite import E2ENodeState, E2EPairContext, EgoStitchModel
-    from src.model.egostitch.conditioning import HeadNullMasks
     from src.model.egostitch.config import E2EConfig
 
     from tests.helpers import egostitch_ddp_smoke as smoke

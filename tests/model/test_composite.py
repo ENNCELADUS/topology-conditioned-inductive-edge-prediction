@@ -26,13 +26,13 @@ from typing import Any, cast
 
 import pytest
 import torch
+from src.model.egostitch.classifier.b0_v31 import GatedCrossAttention
 from src.model.egostitch.composite import EgoStitchModel
-from src.model.egostitch.conditioning import GatedCrossAttention
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.generator import NullGenerator, StitchedGraph
+from src.model.egostitch.generator.assemble import make_scaffold_input_perturbation
+from src.model.egostitch.generator.losses import stage1_family_tensors, stage1_total
 from src.model.egostitch.graph import GraphEmbedding, PairInputs
-from src.model.egostitch.losses import stage1_family_tensors, stage1_total
-from src.model.egostitch.scaffold import make_scaffold_input_perturbation
 
 
 def _tiny_e2e_config(*, n_ground: int = 5, **overrides: object) -> E2EConfig:

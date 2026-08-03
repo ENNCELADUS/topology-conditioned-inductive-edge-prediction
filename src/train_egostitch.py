@@ -59,18 +59,23 @@ from src.data.partition import derive_partition
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.eval.graph_metrics import MMDConfig, clustering_histogram, mmd_squared
 from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
-from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
-from src.model.egostitch.conditioning import (
+from src.model.egostitch.classifier.b0_v31 import (
     NULL_ALL_HEAD,
     GatedCrossAttention,
     masks_for_null,
     sample_branch_masks,
 )
+from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.generator import StitchedGraph
+from src.model.egostitch.generator.imagine import (
+    NULL_MODE_ALL,
+    NULL_MODE_CONTENT,
+    NULL_MODE_FULL,
+    SlotSet,
+)
+from src.model.egostitch.generator.losses import stage1_family_tensors, stage1_total
 from src.model.egostitch.graph import GraphEmbedding
-from src.model.egostitch.imagine import NULL_MODE_ALL, NULL_MODE_CONTENT, NULL_MODE_FULL, SlotSet
-from src.model.egostitch.losses import stage1_family_tensors, stage1_total
 from src.train_b0 import (
     EvalConfig,
     ModelConfig,
@@ -945,7 +950,8 @@ def e2e_degree_prior_init(
 ) -> float:
     """Center the lognormal degree head on the ``G_fit`` degree prior.
 
-    ``deg_mu`` is a raw linear output (`tokenize.py:71-75`) born near 0, while
+    ``deg_mu`` is a raw linear output (`generator/imagine.py`'s
+    `TokenizeLite.degree_dist_head`) born near 0, while
     ``mean(log d)`` on ``G_fit`` sits several nats above it. `degree_nll`'s
     ``1/sigma**2`` factor turns that standing residual into a generator gradient
     above the Sec 13.19 clip threshold on *every* step from step 1 -- the

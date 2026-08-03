@@ -218,7 +218,7 @@ def _toy_bundle(model_cfg: EgoStitchConfig) -> te.EgoStitchData:
 def _collapse_slot_head(model: EgoStitchModel) -> None:
     """Make every generated slot embedding identical, without touching a threshold.
 
-    ``h = head_h(main)`` (`src/model/egostitch/imagine.py`); with a zero weight
+    ``h = head_h(main)`` (`src/model/egostitch/generator/imagine.py`); with a zero weight
     every slot of every node is the same bias vector, so the normalized
     pairwise slot cosine is exactly 1 — a model genuinely born above the
     Sec 14.4.8 trip line rather than a stubbed measurement.

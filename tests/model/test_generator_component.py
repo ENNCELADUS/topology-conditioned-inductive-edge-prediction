@@ -23,16 +23,15 @@ from src.model.egostitch.generator import (
     NullGenerator,
     StitchedGraph,
 )
-from src.model.egostitch.generator.egostitch import _slotset_from_aux
-from src.model.egostitch.imagine import SlotSet
-from src.model.egostitch.losses import alignment_loss, alignment_teacher_cells
-from src.model.egostitch.matching import match_slots
-from src.model.egostitch.model import FeatureStandardizationMode
-from src.model.egostitch.scaffold import (
+from src.model.egostitch.generator.assemble import (
     EDGE_TYPES,
     FEAT_DIM,
     make_scaffold_input_perturbation,
+    match_slots,
 )
+from src.model.egostitch.generator.egostitch import _slotset_from_aux
+from src.model.egostitch.generator.imagine import FeatureStandardizationMode, SlotSet
+from src.model.egostitch.generator.losses import alignment_loss, alignment_teacher_cells
 
 pytestmark = pytest.mark.unit
 

@@ -1,4 +1,10 @@
-"""Training CLI for the frozen B0 pairwise scorers (families ``v3_1`` and ``f0_mlp``).
+"""Training CLI for the frozen B0 pairwise scorer (family ``v3_1``).
+
+``model.family: f0_mlp`` remains a schema-valid ``data:``/``model:`` value (kept for
+config schema symmetry) but has no buildable model: ``src/model/b0_alt.py``
+(``F0PairMLP``, the B0-alt baseline) was removed 2026-08-03 by owner decision;
+:func:`build_model` raises for this family. See
+``docs/results/E2-pair-to-topology-gap.md`` for the closed result it produced.
 
 Usage::
 
@@ -57,8 +63,7 @@ from src.data.pairs import (
 from src.data.partition import build_g_struct, derive_partition
 from src.e2_pipeline import ProbeResult
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
-from src.model.B0 import BEST_V3_1_CONFIG, V3_1
-from src.model.b0_alt import F0PairMLP
+from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
 
 logger = logging.getLogger(__name__)
 
@@ -83,10 +88,11 @@ class ModelConfig:
     """The ``model:`` config section.
 
     Attributes:
-        family: Scorer family, one of ``v3_1`` or ``f0_mlp``.
+        family: Scorer family, one of ``v3_1`` or ``f0_mlp``. ``f0_mlp`` (the B0-alt
+            baseline) has no buildable model: :func:`build_model` raises for it.
         config: Model constructor kwargs. Empty for ``v3_1`` means
-            :data:`~src.model.B0.BEST_V3_1_CONFIG`; empty for ``f0_mlp`` means the
-            :class:`~src.model.b0_alt.F0PairMLP` defaults.
+            :data:`~src.model.egostitch.classifier.b0_v31.BEST_V3_1_CONFIG`; for
+            ``f0_mlp`` this is stored but never consumed (see above).
     """
 
     family: str
@@ -521,7 +527,7 @@ def parse_args(argv: Sequence[str] | None = None) -> CliArgs:
     """
     parser = argparse.ArgumentParser(
         prog="python -m src.train_b0",
-        description="Train a frozen B0 pairwise scorer (v3_1 or f0_mlp).",
+        description="Train a frozen B0 pairwise scorer (v3_1); f0_mlp/B0-alt is retired.",
     )
     parser.add_argument("--config", type=Path, required=True, help="YAML config path.")
     parser.add_argument("--seed", type=int, default=None, help="Override config seed.")
@@ -633,8 +639,8 @@ def resolve_model_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
 
     Returns:
         For ``v3_1``: the explicit kwargs, or a copy of
-        :data:`~src.model.B0.BEST_V3_1_CONFIG` when empty. For ``f0_mlp``: the
-        explicit kwargs (empty means :class:`~src.model.b0_alt.F0PairMLP` defaults).
+        :data:`~src.model.egostitch.classifier.b0_v31.BEST_V3_1_CONFIG` when empty.
+        For ``f0_mlp``: the explicit kwargs verbatim, unused (see :func:`build_model`).
 
     Raises:
         ValueError: If the family is unknown.
@@ -653,15 +659,21 @@ def build_model(cfg: Config) -> nn.Module:
         cfg: The full training config.
 
     Returns:
-        A `V3_1` or `F0PairMLP` instance.
+        A `V3_1` instance.
 
     Raises:
-        ValueError: If the model family is unknown.
+        ValueError: If the model family is unknown, or is ``f0_mlp`` (the B0-alt
+            baseline): ``src/model/b0_alt.py`` (``F0PairMLP``) was removed 2026-08-03
+            by owner decision and has no replacement. See
+            ``docs/results/E2-pair-to-topology-gap.md`` for its closed result.
     """
     kwargs = resolve_model_kwargs(cfg.model)
     if cfg.model.family == "v3_1":
         return V3_1(**kwargs)
-    return F0PairMLP(**cast(dict[str, Any], kwargs))
+    raise ValueError(
+        f"model family '{cfg.model.family}' has no buildable model: "
+        "src/model/b0_alt.py (F0PairMLP) was removed 2026-08-03 by owner decision"
+    )
 
 
 # --------------------------------------------------------------------------- data assembly

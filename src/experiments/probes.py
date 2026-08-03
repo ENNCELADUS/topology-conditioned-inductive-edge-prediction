@@ -731,8 +731,8 @@ def produce_e2e_probe_artifact(
     from src.data.packed_features import PackedFeatureTable
     from src.model.egostitch.composite import EgoStitchModel
     from src.model.egostitch.config import E2EConfig
-    from src.model.egostitch.losses import alignment_teacher_cells
-    from src.model.egostitch.matching import match_slots
+    from src.model.egostitch.generator.assemble import match_slots
+    from src.model.egostitch.generator.losses import alignment_teacher_cells
     from src.train_b0 import _state_digest
 
     if scope not in E2E_PROBE_SCOPES:

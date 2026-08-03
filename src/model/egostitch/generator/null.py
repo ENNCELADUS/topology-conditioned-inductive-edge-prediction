@@ -3,7 +3,7 @@
 Design §3.3, §8: setting ``generator.name: null`` yields exactly ``cond=None``
 at the composite, so the classifier runs unconditioned on `PairInputs` alone
 -- numerically the existing eval-time hard bypass
-(``masks_for_null(NULL_ALL_HEAD, ...)``, `conditioning.py:42-49`), now
+(``masks_for_null(NULL_ALL_HEAD, ...)``, `classifier/b0_v31.py`), now
 reachable without a registered null condition. No parameters: there is
 nothing to imagine, nothing to cache, and nothing to stitch. `forward` is
 inherited from `NeighborhoodGenerator` unchanged (`encode_node` twice, then

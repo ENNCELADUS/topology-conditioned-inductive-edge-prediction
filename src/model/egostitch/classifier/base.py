@@ -5,7 +5,7 @@ The pairwise classifier pathway: consumes an optional graph conditioning
 and emits one edge logit per pair. `cond=None` is the unconditioned path --
 with a null generator this is exactly the pure B0 pairwise baseline,
 numerically the same eval-time hard bypass realized today by
-``masks_for_null(NULL_ALL_HEAD, ...)`` (`conditioning.py:42-49`).
+``masks_for_null(NULL_ALL_HEAD, ...)`` (`b0_v31.py`).
 
 Split into a cacheable per-node phase and a pair-level phase (correction,
 2026-08-03, mirroring `NeighborhoodGenerator.encode_node`/`.stitch`): a
@@ -24,12 +24,25 @@ of its own: design §6 assigns ``L_edge`` to the trainer, not the model.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import NamedTuple
 
 import torch
 from torch import nn
 
-from src.model.egostitch.conditioning import HeadNullMasks
 from src.model.egostitch.graph import PairConditioning, PairInputs
+
+
+class HeadNullMasks(NamedTuple):
+    """Per-pair pathway activity masks (True = active).
+
+    Defined here (rather than in `b0_v31.py`, where the mask-producing
+    helpers `sample_branch_masks`/`masks_for_null` live) so this base module
+    can carry it in `PairClassifier.forward`'s signature without importing
+    `b0_v31.py` -- which itself imports `PairClassifier` from here, and a
+    reverse import would be circular.
+    """
+
+    topo: torch.Tensor
 
 
 class PairClassifier(nn.Module, ABC):
@@ -41,7 +54,7 @@ class PairClassifier(nn.Module, ABC):
     AB-union-BA statistic and advances its EMA exactly once per call. Two
     separate trunk calls would center twice against two different means,
     break `ema_updates == 1`, and break train/eval agreement (evaluation
-    reads the single frozen `ema_mu`, `conditioning.py:203`).
+    reads the single frozen `ema_mu`, `b0_v31.py`).
 
     Must never see endpoint features or grounding pools -- `PairInputs`
     deliberately excludes them. That exclusion is what makes the

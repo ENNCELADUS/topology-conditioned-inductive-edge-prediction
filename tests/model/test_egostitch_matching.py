@@ -1,12 +1,11 @@
-"""Tests for src.model.egostitch.matching: the two-pass Hungarian assignment."""
+"""Tests for src.model.egostitch.generator.assemble: the two-pass Hungarian assignment."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 import torch
-from src.model.egostitch.imagine import SlotSet
-from src.model.egostitch.matching import (
+from src.model.egostitch.generator.assemble import (
     Assignment,
     base_match_cost,
     deg_bucket_index,
@@ -14,6 +13,7 @@ from src.model.egostitch.matching import (
     match_slots,
     overlap_penalty,
 )
+from src.model.egostitch.generator.imagine import SlotSet
 
 pytestmark = pytest.mark.unit
 

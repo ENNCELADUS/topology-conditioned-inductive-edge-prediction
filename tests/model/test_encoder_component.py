@@ -18,9 +18,14 @@ from collections.abc import Callable, Iterator, Mapping
 import pytest
 import torch
 from src.model.egostitch.encoder import GraphEncoder, TypedMessagePassingEncoder
+from src.model.egostitch.generator.assemble import (
+    EDGE_TYPES,
+    FEAT_DIM,
+    ScaffoldTokens,
+    build_scaffold,
+)
+from src.model.egostitch.generator.losses import relational_loss
 from src.model.egostitch.graph import ImaginedGraph
-from src.model.egostitch.losses import relational_loss
-from src.model.egostitch.scaffold import EDGE_TYPES, FEAT_DIM, ScaffoldTokens, build_scaffold
 
 from tests.model.test_egostitch_scaffold import _slots
 

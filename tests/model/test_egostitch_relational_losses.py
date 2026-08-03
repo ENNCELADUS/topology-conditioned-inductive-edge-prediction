@@ -7,15 +7,13 @@ import numpy as np
 import pytest
 import torch
 from src.model.egostitch.config import EgoStitchConfig
-from src.model.egostitch.imagine import SlotSet
-from src.model.egostitch.losses import (
+from src.model.egostitch.generator.assemble import Assignment, match_slots, sinkhorn_log_plan
+from src.model.egostitch.generator.imagine import EgoStitchStage1, SlotSet
+from src.model.egostitch.generator.losses import (
     alignment_loss,
     alignment_teacher_cells,
     relational_loss,
 )
-from src.model.egostitch.matching import Assignment, match_slots
-from src.model.egostitch.model import EgoStitchStage1
-from src.model.egostitch.stitch import sinkhorn_log_plan
 from src.train_egostitch import relational_pair_targets
 from torch import nn
 

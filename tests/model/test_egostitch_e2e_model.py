@@ -18,15 +18,14 @@ import numpy as np
 import pytest
 import torch
 from src.data.feature_stats import compute_feature_stats
-from src.model.egostitch.composite import E2EPairContext, EgoStitchModel
-from src.model.egostitch.conditioning import (
+from src.model.egostitch.classifier.b0_v31 import (
     NULL_ALL_HEAD,
     GatedCrossAttention,
     masks_for_null,
 )
+from src.model.egostitch.composite import E2EPairContext, EgoStitchModel
 from src.model.egostitch.config import E2EConfig
-from src.model.egostitch.imagine import SlotSet
-from src.model.egostitch.model import NodeEncoding
+from src.model.egostitch.generator.imagine import NodeEncoding, SlotSet
 
 
 class _DirectionalConstantAttention(torch.nn.Module):

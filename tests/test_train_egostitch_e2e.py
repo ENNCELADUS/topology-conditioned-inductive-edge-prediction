@@ -39,11 +39,12 @@ from src.data.packed_features import (
 from src.data.pairs import NegativeSampler
 from src.eval.edge_metrics import EdgeMetrics
 from src.model.egostitch import EgoStitchConfig
+from src.model.egostitch.classifier.b0_v31 import GatedCrossAttention
+from src.model.egostitch.classifier.base import HeadNullMasks
 from src.model.egostitch.composite import E2ENodeState, E2EPairContext, EgoStitchModel
-from src.model.egostitch.conditioning import GatedCrossAttention, HeadNullMasks
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.generator import egostitch as e2e_module
-from src.model.egostitch.imagine import SlotSet
+from src.model.egostitch.generator.imagine import SlotSet
 from src.train_b0 import ModelConfig
 
 from tests.test_train_egostitch import _E2E_TINY_MODEL, _NODES, _toy_bundle, _toy_cfg
@@ -109,7 +110,8 @@ def _write_tiny_token_pack(pack_dir: Path, nodes: list[str], *, min_length: int 
     ``min_length`` (default 2, matching the original fixture) is bumped to 3
     by callers that run the sequences through a real `PairCrossAttention`-
     family forward pass, which requires at least one inner token strictly
-    between the BOS/EOS positions (`src/model/B0.py`'s `inner_token_mask`).
+    between the BOS/EOS positions (`src/model/egostitch/classifier/layers.py`'s
+    `inner_token_mask`).
     """
     pack_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(1)

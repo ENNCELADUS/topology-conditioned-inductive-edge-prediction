@@ -7,9 +7,7 @@ import sys
 import pytest
 import torch
 from src.model.egostitch.encoder import TypedMessagePassingEncoder
-from src.model.egostitch.graph import ImaginedGraph
-from src.model.egostitch.imagine import SlotSet
-from src.model.egostitch.scaffold import (
+from src.model.egostitch.generator.assemble import (
     EDGE_TYPES,
     FEAT_DIM,
     N_ANCHOR_TYPES,
@@ -20,6 +18,8 @@ from src.model.egostitch.scaffold import (
     make_scaffold_input_perturbation,
     swap_direction,
 )
+from src.model.egostitch.generator.imagine import SlotSet
+from src.model.egostitch.graph import ImaginedGraph
 from torch.profiler import ProfilerActivity, profile
 
 
@@ -326,7 +326,7 @@ def test_scaffold_controls_are_cross_process_deterministic_and_pair_keyed() -> N
     code = """
 import json
 import torch
-from src.model.egostitch.scaffold import make_scaffold_input_perturbation
+from src.model.egostitch.generator.assemble import make_scaffold_input_perturbation
 
 adj = torch.tensor([[
     [0.0, 0.2, 0.7, 0.4],

@@ -3,7 +3,7 @@
 Split into a cacheable per-node phase and a pair-level phase (design
 correction, 2026-08-03): a single fused ``forward(x_a, x_b, ...)`` would
 re-encode both endpoints for every pair, but `src/score_universe.py:1859-1926`
-and `src/train_egostitch.py:2944-3072` encode each node in a scored/validated
+and `src/train_egostitch.py:2950-3078` encode each node in a scored/validated
 universe exactly once, cache that state, and reassemble per-pair batches from
 it by index-select / index-copy / concatenation (`E2ENodeState` today).
 `encode_node` is that cacheable half; `stitch` is the pair-level half that
@@ -67,7 +67,7 @@ class NeighborhoodGenerator(nn.Module, ABC, Generic[NodeStateT, PerturbationT, G
         the result, and reassemble per-pair batches from it by
         index-select / index-copy / concatenation -- the same pattern
         `E2ENodeState` supports today (`e2e_model.py`,
-        `score_universe.py:1859-1882`, `train_egostitch.py:2944-2968`).
+        `score_universe.py:1859-1882`, `train_egostitch.py:2950-2974`).
 
         Args:
             x: Shape ``(B, d)`` frozen node features.

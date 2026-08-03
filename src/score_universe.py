@@ -79,8 +79,8 @@ from src.data.pairs import (
     collate_token_pairs,
     probe_lengths,
 )
-from src.model.B0 import V3_1
-from src.model.egostitch.scaffold import make_scaffold_input_perturbation
+from src.model.egostitch.classifier.b0_v31 import V3_1
+from src.model.egostitch.generator.assemble import make_scaffold_input_perturbation
 
 logger = logging.getLogger(__name__)
 
@@ -1041,21 +1041,6 @@ def _build_v3_1(model_config: dict[str, object]) -> nn.Module:
     return V3_1(**model_config)
 
 
-def _build_f0_mlp(model_config: dict[str, object]) -> nn.Module:
-    """Build an `F0PairMLP` model from its checkpointed config.
-
-    The import is deliberately lazy: ``src/model/b0_alt.py`` is delivered by a
-    parallel task, and this module must import cleanly regardless of landing
-    order. The checkpoint format and forward contract are pinned in
-    ``.superpowers/sdd/briefs/task-4-brief.md``.
-    """
-    from src.model.b0_alt import F0PairMLP
-
-    # Checkpointed configs are inherently dynamic (parsed from a .pt payload),
-    # so the kwargs unpack goes through Any deliberately.
-    return cast(nn.Module, F0PairMLP(**cast(dict[str, Any], model_config)))
-
-
 def _build_egostitch_e2e(model_config: dict[str, object]) -> nn.Module:
     """Build an `EgoStitchModel` from its checkpointed config (design rev 3).
 
@@ -1073,13 +1058,12 @@ def _build_egostitch_e2e(model_config: dict[str, object]) -> nn.Module:
     from src.model.egostitch.config import E2EConfig
 
     # Checkpointed configs are inherently dynamic (parsed from a .pt payload),
-    # so the kwargs unpack goes through Any deliberately (mirrors _build_f0_mlp).
+    # so the kwargs unpack goes through Any deliberately.
     return EgoStitchModel(E2EConfig(**cast(dict[str, Any], model_config)))
 
 
 MODEL_BUILDERS: dict[str, Callable[[dict[str, object]], nn.Module]] = {
     "v3_1": _build_v3_1,
-    "f0_mlp": _build_f0_mlp,
     "egostitch_e2e": _build_egostitch_e2e,
 }
 
@@ -1087,8 +1071,16 @@ MODEL_BUILDERS: dict[str, Callable[[dict[str, object]], nn.Module]] = {
 def build_model(model_family: str, model_config: dict[str, object]) -> nn.Module:
     """Build an untrained scorer of the given family from a checkpointed config.
 
+    ``f0_mlp`` (the B0-alt baseline, ``src/model/b0_alt.py``'s ``F0PairMLP``) has no
+    entry here: it was removed 2026-08-03 by owner decision. Its scoring path
+    (:func:`_score_f0_mlp`) and CLI plumbing remain, since neither imports the deleted
+    module; a caller may still register a ``"f0_mlp"`` builder into
+    :data:`MODEL_BUILDERS` itself (as the tests do) to score against a different model
+    under that family name.
+
     Args:
-        model_family: One of the keys of :data:`MODEL_BUILDERS` (``v3_1``/``f0_mlp``).
+        model_family: One of the keys of :data:`MODEL_BUILDERS` (``v3_1``/
+            ``egostitch_e2e`` by default).
         model_config: The checkpoint's ``model_config`` dict.
 
     Returns:
@@ -1750,7 +1742,7 @@ def _score_egostitch_e2e(
     """
     from src.data.grounding import build_grounding_pool
     from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
-    from src.model.egostitch.imagine import SlotSet
+    from src.model.egostitch.generator.imagine import SlotSet
 
     assert isinstance(model, EgoStitchModel)
     _reject_superseded_scaffold_control(scaffold_control)

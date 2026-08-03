@@ -4,6 +4,11 @@
 > Density (RD) were formally rerun on frozen score artifacts over all 500 fixed
 > `breadth_first` induced subgraphs. MMD ratios remain canonical-run values.
 
+> **Provenance note (2026-08-03):** the B0-alt implementation (`src/model/b0_alt.py`,
+> `F0PairMLP`) was removed from the code tree by owner decision. Every B0-alt value
+> reported below is retained unchanged; reproducing them requires checking out a
+> commit at or before `7842684`.
+
 ## Executive summary
 
 **Experiment:** hardened E2 on Benchmark-A (`breadth_first`).

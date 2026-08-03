@@ -25,9 +25,8 @@ from src.data.feature_stats import compute_feature_stats
 from src.data.features import FeatureStore, build_f0_matrix
 from src.data.grounding import build_grounding_pool
 from src.data.packed_features import PackedFeatureTable, build_packed_features
-from src.model.B0 import V3_1
+from src.model.egostitch.classifier.b0_v31 import V3_1, GatedCrossAttention
 from src.model.egostitch.composite import E2ENodeState, E2EPairContext, EgoStitchModel
-from src.model.egostitch.conditioning import GatedCrossAttention
 from src.model.egostitch.config import E2EConfig
 
 INPUT_DIM = 4
@@ -362,16 +361,15 @@ def _write_tsv(path: Path, rows: list[tuple[str, str, int | None]]) -> None:
 
 
 class _FakeF0PairMLP(nn.Module):
-    """Stand-in mirroring the pinned `src.model.b0_alt.F0PairMLP` batch contract.
+    """Stand-in for the pinned `f0_mlp` batch contract (x_a/x_b/label -> logits/loss).
 
-    `src/model/b0_alt.py` is being built concurrently (Task 4) and did not exist at the
-    time these tests were written. Per the Task-5 brief's contingency note, the f0_mlp
-    scoring path in `score_universe` is exercised end-to-end using a local double that
-    implements the identical pinned contract (batch keys `x_a`/`x_b`, optional `label`,
-    returns `{"logits", "loss"}`), registered into `score_universe.MODEL_BUILDERS` for the
-    duration of a single test via monkeypatch. This proves the F0-matrix batching, row
-    order restoration, determinism, and label passthrough logic without depending on
-    `b0_alt.py`'s landing order.
+    `src/model/b0_alt.py` (`F0PairMLP`, the B0-alt baseline) was removed 2026-08-03 by
+    owner decision; see `docs/results/E2-pair-to-topology-gap.md` for the closed result
+    it produced. `score_universe.MODEL_BUILDERS` no longer ships a default `"f0_mlp"`
+    entry, but the family's scoring path (F0-matrix batching, row order restoration,
+    determinism, label passthrough) is decoupled from any concrete model, so it is
+    still exercised end-to-end here using this local double, registered into
+    `score_universe.MODEL_BUILDERS` for the duration of a single test via monkeypatch.
     """
 
     def __init__(self, input_dim: int, hidden_dim: int = 8) -> None:

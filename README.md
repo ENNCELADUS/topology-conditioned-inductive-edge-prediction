@@ -122,6 +122,11 @@ figure: [`figures/e2-gap.html`](figures/e2-gap.html).
 | Assembled graph (B0-alt) | global simple-edge RD | **0.9987** | independently calibrated threshold |
 | Assembled graph (B0-alt) | degree / clustering / spectral MMD ratio | **15.8304 / 13.4718 / 23.4734** | gap persists and is larger |
 
+> **Provenance note (2026-08-03):** the B0-alt implementation (`src/model/b0_alt.py`,
+> `F0PairMLP`) and its config were removed from the code tree by owner decision. Every
+> B0-alt value above is retained unchanged; reproducing them requires checking out a
+> commit at or before `7842684`.
+
 The final two-architecture G1 threshold sweep and all negative-regime rows are recorded in
 [`outputs/deliverables/g1_graph_metrics_20260714/g1_tables.md`](outputs/deliverables/g1_graph_metrics_20260714/g1_tables.md).
 G2 reports measured soft-score overlap 0.4799 versus the minimum 0.0550 required to
@@ -212,7 +217,8 @@ data/
 src/
   data/                          verified benchmark/features + pair batching + V_fit/V_hold partition
   eval/                          edge and assembled-graph metrics
-  model/                         frozen B0/B0-alt scorers + EgoStitch e2e modules
+  model/                         B0-V3.1 pairwise baseline + EgoStitch three-component model
+                                  (generator/encoder/classifier, each independently swappable)
   experiments/                   G1/G2/G3 analyses + G5 e2e gate + probes
   train_b0.py                    baseline training CLI
   train_egostitch.py             auto-sized DDP EgoStitch e2e training worker
@@ -289,9 +295,9 @@ configs/b0_v31_breadth_first.yaml`, which drives the production
 `python -m src.e2_pipeline` entry (pack → train → publish, with the 30-epoch DDP train
 launched by an auto-detected `accelerate launch --num_processes N` across all visible
 GPUs at the config's pinned `runtime.token_budget`); direct
-`python -m src.train_b0 --max-steps N` is debug-only, and `B0-alt` keeps its own direct
-`python -m src.train_b0 --config configs/b0_alt_breadth_first.yaml` training CLI,
-outside this E2-only optimization. The host, repository/data paths, required software
+`python -m src.train_b0 --max-steps N` is debug-only. `B0-alt` no longer has a training
+CLI: its implementation and config were removed from the tree on 2026-08-03 (see the
+provenance note below). The host, repository/data paths, required software
 versions, and the `nohup` form are pinned in [`hpc/README.md`](hpc/README.md). The
 GPU count is recorded with each run, so throughput evidence is interpreted against
 that exact hardware shape. There is no job scheduler (e.g. Slurm).

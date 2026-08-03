@@ -6,9 +6,11 @@ from typing import Any, cast
 
 import pytest
 import torch
-from src.model.B0 import PairCrossAttention
-from src.model.egostitch.conditioning import GatedCrossAttention
-from src.model.egostitch.trunk import ConditionedPairCrossAttention
+from src.model.egostitch.classifier.b0_v31 import (
+    ConditionedPairCrossAttention,
+    GatedCrossAttention,
+)
+from src.model.egostitch.classifier.layers import PairCrossAttention
 from torch.utils import checkpoint as checkpoint_module
 
 _KW: dict[str, Any] = {

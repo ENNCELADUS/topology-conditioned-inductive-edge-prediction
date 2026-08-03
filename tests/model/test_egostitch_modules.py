@@ -5,15 +5,15 @@ from __future__ import annotations
 import pytest
 import torch
 from src.model.egostitch.config import E2EConfig, EgoStitchConfig
-from src.model.egostitch.imagine import (
+from src.model.egostitch.generator.assemble import sinkhorn_plan, stitch_cost
+from src.model.egostitch.generator.imagine import (
     NULL_MODE_ALL,
     NULL_MODE_CONTENT,
     NULL_MODE_FULL,
     ImagineDecoder,
     SlotSet,
+    TokenizeLite,
 )
-from src.model.egostitch.stitch import sinkhorn_plan, stitch_cost
-from src.model.egostitch.tokenize import TokenizeLite
 
 pytestmark = pytest.mark.unit
 
