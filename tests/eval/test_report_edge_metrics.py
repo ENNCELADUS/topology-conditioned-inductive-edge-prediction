@@ -253,6 +253,59 @@ class TestSelfNonSelfSplit:
         assert report["metrics_non_self"]["auroc"] < report["metrics"]["auroc"]
 
 
+class TestSplitScope:
+    """Self-loops are kept everywhere; only the test view is also split."""
+
+    @pytest.mark.parametrize("pairs_source", ["val", "candidate"])
+    def test_non_test_views_report_headline_only(
+        self, tmp_path: Path, pairs_source: str
+    ) -> None:
+        """Val and candidate keep self-loops but emit no split."""
+        path = tmp_path / f"{pairs_source}.npz"
+        _write_artifact(path, pairs_source=pairs_source)
+
+        report = report_edge_metrics(path)
+
+        assert report["self_loops_included"] is True
+        assert "metrics" in report
+        assert "metrics_self" not in report
+        assert "metrics_non_self" not in report
+        assert "self_loop_rate" not in report
+
+    def test_test_view_reports_both(self, tmp_path: Path) -> None:
+        """The test view carries the split alongside the headline block."""
+        path = tmp_path / "test.npz"
+        _write_artifact(path, pairs_source="test")
+
+        report = report_edge_metrics(path)
+
+        assert "metrics" in report
+        assert "metrics_non_self" in report
+        assert "self_loop_rate" in report
+
+    def test_self_loop_including_metrics_come_first(self, tmp_path: Path) -> None:
+        """Key order is load-bearing: the headline precedes the split."""
+        path = tmp_path / "test.npz"
+        _write_artifact(path, pairs_source="test")
+
+        keys = list(report_edge_metrics(path))
+
+        assert keys.index("metrics") < keys.index("metrics_self")
+        assert keys.index("metrics") < keys.index("metrics_non_self")
+        assert keys.index("metrics") < keys.index("self_loop_rate")
+
+    def test_cli_preserves_headline_first_ordering(self, tmp_path: Path) -> None:
+        """The written JSON is not alphabetized, so the ordering survives."""
+        scores = tmp_path / "test.npz"
+        _write_artifact(scores, pairs_source="test")
+        output = tmp_path / "out.json"
+
+        main(["--scores", str(scores), "--output", str(output)])
+
+        keys = list(json.loads(output.read_text()))
+        assert keys.index("metrics") < keys.index("metrics_non_self")
+
+
 class TestShardGuard:
     """A partial shard must not be reported as the full pair view."""
 

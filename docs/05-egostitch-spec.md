@@ -440,7 +440,11 @@ test, and candidate files as `(u, u)` rows). Binding rules:
    `s0 = pair_logit(u, u)`, self-membership
    `lse_k(κ(h_u^k, proj(x_u)) + log π m)`, `s2` from the Â_u diagonal blocks,
    unchanged `s3`, and the single-ego scaffold with both anchor labels on `u`.
-3. **Reporting**: edge metrics overall *and* split self / non-self; canonical MMD and
+3. **Reporting**: self-loops are **retained by default in every labeled pair view**
+   (val and test alike) — no view strips them from its headline edge metrics. The
+   **test** view alone additionally reports the self / non-self split, and reports the
+   self-loop-*including* block **first**, with the split supplementary beneath it; val
+   reports the self-loop-including block only. Canonical MMD and
    official GS/RD on loop-retaining induced subgraphs; GS/RD are computed per fixed
    sampled node set and macro-averaged over every sample across node-size buckets. Recall
    remains a simple-graph diagnostic. Report a separate self-loop-rate row (predicted vs
@@ -520,10 +524,28 @@ The formal E2 B0 V3.1 run uses all visible NVIDIA H20 GPUs. The runner validates
 that at least one H20 is visible, automatically detects the count `N`, exports those
 devices, and launches `accelerate launch --num_processes N`. Its production
 orchestrator is `pack → train → publish`: a cold acceptance run includes first BF16
-feature-pack construction, exactly 30 epochs, validation after every epoch, and final
-artifacts. The retained `probe`/`epoch-probe` worker dispatch entries are
-non-publishing measurement-only paths, not production orchestration stages; the
-projection stage is deleted. The complete interval must be at most 60 minutes.
+feature-pack construction, the configured epoch count with validation after every
+epoch, and final artifacts. The retained `probe`/`epoch-probe` worker dispatch entries
+are non-publishing measurement-only paths, not production orchestration stages; the
+projection stage is deleted.
+
+The epoch count and the complete-interval budget are set by the run's config rather
+than fixed here, because they are coupled: a OneCycle schedule must run its full
+`total_steps` to reach its annealed floor, so truncating epochs changes the recipe
+rather than merely shortening it. Two recipes are currently normative:
+
+- **Constant-LR recipe (historical):** 30 epochs, warmup-then-constant LR, complete
+  interval at most 60 minutes. This is the recipe every B0 artifact through
+  2026-07-14 was produced under.
+- **OneCycle recipe (legacy V3.1 reproduction):** 50 epochs, `optim.scheduler.type:
+  onecycle`, `weight_decay 0.05`, `label_smoothing 0.05`, complete interval at most
+  163 minutes (`configs/b0_v31_breadth_first.yaml`).
+
+`runtime.*_budget_seconds` must sum exactly to `runtime.total_budget_seconds`, and
+`train_eval_budget_seconds` is a hard subprocess timeout — under-sizing it fails the
+run rather than shortening it. Early stopping is counterfactual-only in the DDP path
+(`eval.patience` records `counterfactual_stop_epoch` and never breaks), which is what
+lets a OneCycle schedule complete.
 
 Each rank owns one model/optimizer replica and one complete GPU-resident BF16 feature
 table. DataLoader workers transfer compact endpoint indices only. Training and
@@ -532,6 +554,33 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-08-03 (owner decision): §11's fixed "exactly 30 epochs / at most 60 minutes"
+  formal-B0 binding is replaced by a config-set epoch count and budget, with two
+  normative recipes listed — the historical constant-LR 30-epoch recipe and a new
+  OneCycle 50-epoch recipe reproducing the legacy V3.1 result (`optim.scheduler.type:
+  onecycle`, `max_lr 1e-4`, `pct_start 0.1`, `div_factor 25`, `final_div_factor
+  10000`, `anneal_strategy cos`; `weight_decay 0.05`, `label_smoothing 0.05`; complete
+  interval at most 163 minutes). The two are coupled, which is why the epoch count
+  could not simply be raised: a OneCycle schedule must run its full `total_steps` to
+  reach its annealed floor, so truncating epochs changes the recipe rather than
+  shortening it. Enabling code: `optim.scheduler` block and `V3_1(label_smoothing=...)`
+  in commit `66b00ea`. Early stopping was already counterfactual-only in the DDP path,
+  which is what permits the schedule to complete. Per §14, this authorizes
+  implementation, not execution.
+- 2026-08-03 (owner decision): §9.4 rule 3 reporting refined. Self-loops are retained
+  by default in **every** labeled pair view (val and test); no view strips them from
+  its headline edge metrics. Only the **test** view additionally reports the self /
+  non-self split, and it reports the self-loop-*including* block **first** with the
+  split supplementary beneath it. Rationale: the split exists to expose self-loop
+  behavior in the final reported result, not to re-cut model-selection numbers.
+  Implemented in `src/eval/report_edge_metrics.py`, which is also the first committed
+  code path for the §10.3 balanced `test_edges.txt` edge metrics — previously that
+  number had no writer in `src/` (the G1/G2/G3/G5 analyzers all reject
+  `pairs_source != "candidate"`). Measured on the existing 2026-07-10 B0 artifact:
+  all 1,891 `(u, u)` test rows are positive and all 1,891 are predicted positive, so
+  the self stratum is single-class (AUROC/AUPRC undefined, emitted as null) and the
+  non-self stratum sits at AUROC `0.6883` / AUPRC `0.6894` against the
+  self-loop-including `0.7067` / `0.7316`.
 - 2026-08-03 (owner decision): B0-alt withdrawn as a baseline family. The mature B0
   (V3.1) is now the sole baseline going forward; `03-experiment-protocol.md` §2's
   baseline-hierarchy table and its E3 run list, and `04-model-proposal.md` §6.0 G1's

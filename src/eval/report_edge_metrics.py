@@ -44,6 +44,12 @@ logger = logging.getLogger(__name__)
 #: Row label written by `src.score_universe` for a pair it could not label.
 _UNLABELED = -1
 
+#: Pair views that additionally report the self / non-self split. Every view keeps
+#: self-loops in its headline metric; only the test view is also split out, because
+#: the split exists to expose self-loop behavior in the final reported result, not
+#: to re-cut model-selection numbers.
+_SPLIT_REPORTING_SOURCES = ("test",)
+
 
 def _stratum_metrics(
     labels: NDArray[np.int64],
@@ -82,10 +88,15 @@ def report_edge_metrics(
 ) -> dict[str, object]:
     """Load a scores artifact and compute its edge-level classification metrics.
 
-    Emits the overall block *and* the self / non-self split, plus a self-loop-rate
-    row, as required by ``docs/05-egostitch-spec.md`` §9.4 rule 3: self-loops are
-    first-class labeled ``(u, u)`` queries in this benchmark, so a single
-    aggregate block can conceal materially different self-loop behavior.
+    **Self-loops are retained in every pair view.** They are first-class labeled
+    ``(u, u)`` queries in this benchmark (spec §9.4), so the headline ``metrics``
+    block always includes them, for val and test alike — nothing is stripped.
+
+    The **test** view additionally reports the self / non-self split and a
+    self-loop-rate row, per spec §9.4 rule 3, so that self-loop behavior is
+    visible in the final reported result. The split is supplementary: the
+    self-loop-including ``metrics`` block comes first and remains the headline.
+    Other views (val, candidate) report the headline block only.
 
     Args:
         scores_path: Path to a ``.npz`` written by :mod:`src.score_universe`.
@@ -96,9 +107,10 @@ def report_edge_metrics(
         ece_bins: Bin count for expected calibration error.
 
     Returns:
-        A JSON-serializable dict carrying the overall metric block, the
-        ``self``/``non_self`` strata, the self-loop-rate row, and the artifact
-        provenance needed to trace it back to a checkpoint.
+        A JSON-serializable dict carrying the self-loop-including ``metrics``
+        block first, the artifact provenance needed to trace it back to a
+        checkpoint, and — for the test view only — the ``metrics_self`` /
+        ``metrics_non_self`` strata and the ``self_loop_rate`` row.
 
     Raises:
         ValueError: If the artifact fails its precision contract, its
@@ -152,40 +164,48 @@ def report_edge_metrics(
         metrics.ece,
     )
 
-    # Spec §9.4 rule 3: predicted vs reference self-loop counts, reported as its
-    # own row rather than folded into the aggregate metrics.
-    self_loop_rate = {
-        "self_rows": int(is_self.sum()),
-        "reference_positive": int((labels64[is_self] == 1).sum()),
-        "predicted_positive": int((probs[is_self] >= threshold).sum()),
-    }
-
-    return {
+    # Key order is meaningful and preserved on write: the self-loop-including
+    # headline block comes first, any split second.
+    report: dict[str, object] = {
         "scores_path": str(scores_path),
         "checkpoint_id": artifact.meta.get("checkpoint_id"),
         "model_family": artifact.meta.get("model_family"),
         "pairs_source": pairs_source,
         "strategy": artifact.meta.get("strategy"),
         "num_rows": n_rows,
+        "self_rows": int(is_self.sum()),
         "threshold": threshold,
         "ece_bins": ece_bins,
+        "self_loops_included": True,
         "metrics": asdict(metrics),
-        "metrics_self": _stratum_metrics(
-            labels64[is_self],
-            probs[is_self],
-            threshold=threshold,
-            ece_bins=ece_bins,
-            name="self",
-        ),
-        "metrics_non_self": _stratum_metrics(
-            labels64[~is_self],
-            probs[~is_self],
-            threshold=threshold,
-            ece_bins=ece_bins,
-            name="non_self",
-        ),
-        "self_loop_rate": self_loop_rate,
     }
+
+    if pairs_source not in _SPLIT_REPORTING_SOURCES:
+        return report
+
+    # Spec §9.4 rule 3, test view only: the split plus predicted-vs-reference
+    # self-loop counts, reported as their own rows rather than folded into the
+    # headline metrics above.
+    report["metrics_self"] = _stratum_metrics(
+        labels64[is_self],
+        probs[is_self],
+        threshold=threshold,
+        ece_bins=ece_bins,
+        name="self",
+    )
+    report["metrics_non_self"] = _stratum_metrics(
+        labels64[~is_self],
+        probs[~is_self],
+        threshold=threshold,
+        ece_bins=ece_bins,
+        name="non_self",
+    )
+    report["self_loop_rate"] = {
+        "self_rows": int(is_self.sum()),
+        "reference_positive": int((labels64[is_self] == 1).sum()),
+        "predicted_positive": int((probs[is_self] >= threshold).sum()),
+    }
+    return report
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -223,7 +243,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         ece_bins=args.ece_bins,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    # Not sort_keys: the insertion order puts the self-loop-including headline
+    # metrics ahead of any supplementary split, and that ordering is intentional.
+    args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     logger.info("wrote %s", args.output)
 
 
