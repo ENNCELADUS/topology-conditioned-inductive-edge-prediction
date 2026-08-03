@@ -3,7 +3,7 @@ model:
   topology_dim: 128
   latent_dim: 32
   network_layers: 1
-  heads: 4
+  heads: 6
 
 data:
   root: data
