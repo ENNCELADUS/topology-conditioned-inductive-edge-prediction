@@ -212,20 +212,12 @@ Generated neighborhood 是压缩且不确定的中间表征。两个 endpoint �
 
 ---
 
-## 7. Generator 输出后为什么分成两条支路？
+## 7. Generator 输出后为什么只保留 topology conditioning？
 
-Generator 的 slot set 被拆成：
-
-1. topology branch；
-2. content branch。
-
-两条支路分别回答不同问题：
-
-> Topology branch：这些 imagined neighbor groups 如何连接？
->
-> Content branch：这些 imagined neighbor groups 大致是什么？
-
-如果把两者过早混合，模型可能只凭 slot content 做预测，而没有真正利用连接结构。分支设计让结构信息和内容信息分别形成证据，再按固定顺序进入 pair representation。
+Generator 的 slot set 只通过 typed scaffold 进入最终 classifier：它回答
+“这些 imagined neighbor groups 如何连接”。完整 slot content 仍用于 generator
+自身的重建与训练损失，但不再作为独立 conditioning pathway 输入 edge head。
+这样 classifier 无法绕过结构、直接凭 slot content 完成预测。
 
 ---
 
@@ -311,23 +303,11 @@ STEncoder 是一个 typed message-passing network。
 
 ---
 
-## 11. Assemble content tokens：保留每个 slot 的语义证据
+## 11. Slot content 的边界：训练 generator，不直接条件化 classifier
 
-Topology branch 故意不直接携带完整 slot content。另一条 content branch 会保留：
-
-- slot content；
-- slot 是否存在；
-- slot 是否 grounded；
-- 两侧 slots 是否可能指向相同 grounding identity；
-- slot 是否像另一个 endpoint。
-
-**它做什么？**
-
-告诉模型每个 imagined neighbor group “是什么”和“有多可信”。
-
-**为什么不把这些信息全部塞进 scaffold？**
-
-如果 topology encoder 同时看到完整语义内容，模型可能绕过结构，直接通过 slot content 完成预测。Structure-only scaffold 加独立 content branch，使“怎么连”和“是什么”保持可区分。
+Slot content、grounding 与匹配信息仍监督 imagined slots，并参与构建 scaffold
+的存在概率、multiplicity 与 typed edges；但完整语义向量不会被组装成第二套
+classifier tokens。最终 edge prediction 只接收 structure-only scaffold encoding。
 
 ---
 
@@ -349,17 +329,10 @@ Raw-token pair branch 已经形成一个初始 CLS。Topology update 让这个 C
 
 ---
 
-## 13. Content update：再用具体 slot 内容补充结构判断
+## 13. 为什么没有独立 content update？
 
-完成 topology update 后，CLS 再查询 content tokens。
-
-**它做什么？**
-
-为刚才得到的结构判断补充具体语义证据。
-
-**为什么顺序是 topology first、content second？**
-
-模型先根据 scaffold 确定“哪些结构关系值得关注”，再检查相关 slots 的内容是否支持这种关系。这样比把 topology 和 content 一次性混合更容易保持两类信息的分工。
+旧设计曾让 CLS 再查询 slot-content tokens；当前三组件模型已删除这条路径。
+因此 `pair_topology` 与 `full` 不再是不同模型，前者也从 active arms 中退役。
 
 ---
 
@@ -367,7 +340,7 @@ Raw-token pair branch 已经形成一个初始 CLS。Topology update 让这个 C
 
 到这里模型拥有：
 
-- topology/content-conditioned CLS；
+- topology-conditioned CLS；
 - $u$ 的完整 token representations；
 - $v$ 的完整 token representations。
 
@@ -478,7 +451,7 @@ $$
 
 - queried endpoints 的真实 ego graphs；
 - 真实 neighbors；
-- target edges 或 message graph；
+- deployment target edges 或训练时的 topology graph；
 - common-neighbor/Jaccard targets；
 - reconstruction、realism、alignment 等训练 targets。
 

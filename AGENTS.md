@@ -67,11 +67,13 @@ the baselines, naming the worker explicitly:
 - **Grounding pools are universe-scoped** (`V_fit` = training, `V_hold` = validation,
   test; separately hashed, and both ladder stages share the same three). One cache may
   never serve another; a training pass may not read a `V_hold` row. Spec §13.12.
-- **`V_hold` must stay the union of the two former holdouts** (`V_qual ∪ V_select`:
-  512 nodes, 1,533 positives, 130,816 pairs — `internal_holdout.py:171-178`). That union
-  is the only reason `V_fit`, `e_msg_fit`, `feature_stats_sha256` and every pack manifest
-  are bit-identical to the two-holdout era. Re-deriving `V_hold` from a single BFS draw
-  silently changes `V_fit` and every digest. Spec §9.3.
+- **Topology and classification use the same train positives.** There is no seeded
+  message/supervision split or `data.partition_seed`/`msg_fraction` knob. Topology uses
+  the loopless projection; classification retains self-pairs. Edge-stream structural
+  targets must explicitly remove the queried partner and decrement its degree. Spec §9.3.
+- **`V_hold` stays the union of the two deterministic 256-node BFS draws** over the full
+  training topology. The 2026-08-03 shared-interaction correction changed that graph and
+  invalidated every older `V_fit` cache, pack, digest, threshold, and result.
 
 ## Traps that silently corrupt results rather than raising
 
@@ -92,9 +94,6 @@ the baselines, naming the worker explicitly:
 - **Null-head naming is inverted** at `src/model/egostitch/e2e_model.py:596`:
   `pair_content` comes from `NULL_TOPO_HEAD`, `pair_topology` from `NULL_CONTENT_HEAD`.
   Swapping them mislabels two published arms.
-- **`data.partition_seed` is not `seed`** (`train_egostitch.py:401`). Changing it
-  silently changes `G_struct`, the internal holdouts, and the whole training pair
-  universe.
 - **F0 caches serve supersets silently**: with `allow_cache_subset=True`
   (`features.py:130`; live at `train_egostitch.py:2245`, `probes.py:892`,
   `score_universe.py:1624`/`:1723`) a superset cache is gathered into a *different* node

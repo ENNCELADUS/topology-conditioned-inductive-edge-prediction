@@ -108,9 +108,9 @@ Components:
 - **Candidate universe:** all candidate node pairs for the held-out benchmark split. Labels define
   the edge prediction task only; graph topology is evaluated after assembling predictions.
 - **Splits and integrity:** training and test nodes are disjoint. Any near-duplicate or overlap
-  filter used by the benchmark must be reported with the run. Training-graph edges are further
-  split into **message (80%) / supervision (20%)** partitions per seed: structural targets use
-  message edges only; edge-loss supervision uses supervision edges (spec §6).
+  filter used by the benchmark must be reported with the run. The same complete train-side
+  positive interactions supply both structural topology and edge-loss classification; the
+  topology projection alone removes self-pairs (spec §§6, 9.3).
 - **Edge-level metrics:** AUROC, AUPRC, accuracy, sensitivity, specificity, precision, recall, F1,
   MCC at the selected operating point; calibration (ECE, Brier) on averaged probabilities.
 - **Assembled graph metrics — two families (binding):**
@@ -166,7 +166,7 @@ Components:
 | ID | Baseline | Neutral instantiation | Isolates |
 |---|---|---|---|
 | **B0** | Independent pairwise scorer | Frozen pairwise scorer over `(x_i, x_j)` | Topology-blind edge prediction |
-| **B0-e2e** | Matched-training pairwise-only arm (rev 3.0) | `Ours`'s trunk with all conditioning permanently bypassed (`∅_all_head`), trained under exactly the `Ours` data/negatives/edge-active-steps/optimizer/seed/HPO | The honest pairwise control for the e2e head: separates training-regime effects from conditioning effects. Never conflated with canonical B0 (different data regime: `e_sup`/1:5/lr 3e-4/seed 0 vs `train_plus`/1:1/lr 1e-4/seed 47) |
+| **B0-e2e** | Matched-training pairwise-only arm (rev 3.0) | `Ours`'s trunk with all conditioning permanently bypassed (`∅_all_head`), trained under exactly the `Ours` data/negatives/edge-active-steps/optimizer/seed/HPO | The honest pairwise control for the e2e head: separates training-regime effects from conditioning effects. Never conflated with canonical B0 (both use all train positives after the 2026-08-03 correction, but their negative ratios, optimizer settings, seeds, and architecture remain different) |
 | **B0+cal** | B0 + calibrated assembly | Temperature/Platt calibration + density- and degree-sequence-matched thresholding of B0 scores | Whether trivial assembly calibration recovers the topology gains. Also applied on top of `Ours` as a diagnostic |
 | **B1** | Retrieval, no generated adjacency | Retrieve neighbors around `i` and `j`, pool features, use no scaffold edges | Value of adjacency vs retrieval alone |
 | **B2-global** | Global post-hoc refiner | Build one generated graph from pairwise scores, encode globally, decode each pair | Global context vs local context |
@@ -182,8 +182,8 @@ Components:
 | **Ours** | Per-query generated local scaffold + conditioning | EgoStitch per `04-model-proposal.md` §4 / `05-egostitch-spec.md` | Conditioning the decision on generated, harmonized local topology |
 | **Oracle** | Observed-graph upper bound | Uses true held-out graph neighborhoods at evaluation time (pinned instantiation: §5.0 G3) | Headroom; violates the inductive protocol; **run first (gate G3)** |
 
-All fair baselines share the same frozen features, splits, query sets, message/supervision
-partition, negative-sampling protocol, and an equal, pre-registered HPO budget (30 configs ×
+All fair baselines share the same frozen features, splits, query sets, complete training
+interactions, negative-sampling protocol, and an equal, pre-registered HPO budget (30 configs ×
 3 seeds each, recorded before held-out metrics are opened).
 
 ---
@@ -339,8 +339,9 @@ rule).
 - **Node-disjoint gate:** train/test nodes must be disjoint.
 - **Near-duplicate gate:** report benchmark-provided duplicate filtering or run a repository-local
   nearest-neighbor overlap check.
-- **Message/supervision partition gate:** all structural losses on message edges only;
-  leave-one-out corrections verified for in-batch supervision pairs.
+- **Shared-interaction gate:** topology and classification cover the same train positives;
+  the topology projection alone removes self-pairs, and explicit leave-one-out corrections
+  are verified for every in-batch positive pair.
 - **B0 provenance gate:** the frozen scorer must never have seen validation/test pairs.
 - **Seam-reference gate:** realism-loss references sampled label-agnostically.
 - **Hard negatives:** compare random negatives with heuristic-related hard negatives.
@@ -494,7 +495,7 @@ rule).
    representation-probe protocol (including degree-partialled probes), the
    within-checkpoint `f_logit` liveness reference, and a measured H20 cost re-estimate.
    That five-arm scope governed the completed rev-3.0 screen only; the active rev-3.2
-   successor uses the eight-arm single-stage contract described below.
+   successor uses the seven-arm direct-run contract described below.
    **Binding frozen-s0 result and disposition (2026-07-17):** the replacement
    fixed-Seed-0 run (commit `60745f2`, checkpoint `56b91c17fa8d3b86`, registration
    `97e61a7d...`) completed all required artifacts and returned `cut`. Both guards
@@ -570,12 +571,12 @@ rule).
    This closes the e2e Stage-1 screen; the rev-3.0 build line's disposition is an
    owner-side locked-decision discussion and is not resolved by this screen. Full
    result: `docs/results/G5-e2e-stage1-seed0-20260724.md`.
-   **Rev-3.1 relational repair (2026-07-25):** the disposition discussion resolved
+   **Historical rev-3.1 relational-repair proposal (retired):** the disposition discussion resolved
    under owner delegation: the rev-3.0 build line proceeds as the rev-3.1 repair
    (spec §14.4; decision trail
    `docs/superpowers/specs/2026-07-25-egostitch-e2e-relational-repair-design.md` r5,
    P0 audits `outputs/p0_audit_20260725/`). Its screen is governed prospectively by
-   the fresh v4 registration, currently `DRAFT`, with an **eight-arm** scope — six
+   the then-fresh v4 registration, with an **eight-arm** scope — six
    trained arms (full, `B0-e2e`/f-only,
    pair+topology, `p = 0`, `cosine_pool`, `no_l_rel`) plus two scoring-time
    controls over the full checkpoint (within-pair rebuild-form shuffle 6a-v3 and
@@ -587,20 +588,15 @@ rule).
    threshold authorizes or blocks execution. The frozen
    pairwise scorer's §0 role is **unchanged** (the measured grounding-pool audit
    eliminated the candidate-proposer reuse), and this paragraph does not bind the
-   v4 registration or weaken E1/E3's multi-seed inference rules.
-   **Rev-3.2 v5 component-ablation schema (2026-07-30):** the v4 draft was
-   superseded before any run bound to it. The v5 registration
-   (`docs/registrations/g5_e2e_stage1_preregistration_v5.json`, spec §14.4.6)
-   keeps the eight-arm shape but re-points the trained set so each arm owns one
-   mechanism axis: `cosine_pool` retires (the Phase-0 measured slot-recall
-   ceilings carry the pool-width attribution) and `row_layernorm` — identical to
-   full except per-row LayerNorm feature standardization — becomes the ablation
-   of the rev-3.2 D0 per-dimension z-scoring fix. Acceptance thresholds, guards,
-   comparators, the operating point, and every claim-limit rule re-pin unchanged
-   from the BINDING v2 lineage. The v5 `observation_plan` additionally names the
-   three run-observation targets (generator clipping margins, slot collapse,
-   end-ramp precision differential) and the run-produced telemetry recording
-   them; it is descriptive and never an execution gate.
+   v4 registration or weaken E1/E3's multi-seed inference rules. This proposal
+   never became the active contract; the registration machinery is deleted.
+   **Current rev-3.2 component-ablation schema:** five trained checkpoints
+   (`full`, `b0_e2e_f_only`, `p0`, `no_l_rel`, `row_layernorm`) plus two
+   scoring-time structure controls. The content pathway is deleted, making
+   `pair_topology` identical to `full`, so that arm is retired; `cosine_pool` is
+   also retired. Runs execute directly without a registration or plan-identity
+   gate. Checkpoint, score, and G5 provenance instead bind the shared
+   training-interaction contract and matching interaction/topology digests.
 
 ### 5.1 Priority order (after gates)
 

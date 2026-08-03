@@ -113,10 +113,7 @@ def _config_mapping(tmp_path: Path, **overrides: object) -> dict[str, Any]:
         "data": {
             "root": str(tmp_path / "data"),
             "strategy": "toy",
-            "train_positives": "e_sup",
             "negative_ratio": 5,
-            "partition_seed": 0,
-            "msg_fraction": 0.8,
             "node_batch": 4,
             "edge_batch": 6,
             "f0_cache": str(tmp_path / "f0.pt"),
@@ -175,7 +172,6 @@ class TestLoadConfig:
     def test_round_trip(self, tmp_path: Path) -> None:
         cfg = te.load_config(_write_config(tmp_path))
         assert cfg.model.family == "egostitch_e2e"
-        assert cfg.data.train_positives == "e_sup"
         assert cfg.diagnostics.gradient_probe_interval == 50
         assert cfg.diagnostics.gradient_imbalance_steps == 200
         assert cfg.runtime is None
@@ -198,12 +194,12 @@ class TestLoadConfig:
         with pytest.raises(ValueError, match="unknown config keys"):
             te.load_config(_write_config(tmp_path, bogus=1))
 
-    def test_rejects_non_e_sup_positives(self, tmp_path: Path) -> None:
+    def test_rejects_removed_message_supervision_config(self, tmp_path: Path) -> None:
         mapping = _config_mapping(tmp_path)
-        mapping["data"]["train_positives"] = "train_plus"
+        mapping["data"]["msg_fraction"] = 0.8
         path = tmp_path / "config.yaml"
         path.write_text(yaml.safe_dump(mapping))
-        with pytest.raises(ValueError, match="e_sup"):
+        with pytest.raises(ValueError, match="unknown config keys"):
             te.load_config(path)
 
     def test_rejects_explicit_world_size(self, tmp_path: Path) -> None:
@@ -322,13 +318,13 @@ def _toy_bundle(tmp_path: Path, model_cfg: EgoStitchConfig) -> te.EgoStitchData:
     builder = EgoTargetBuilder(g, f0, node_index, pool, slots=model_cfg.slots)
     sampler = _toy_sampler(g)
 
-    e_sup = [canonical_pair(u, v) for u, v in _POSITIVES[6:]]
+    training_positives = [canonical_pair(u, v) for u, v in _POSITIVES[6:]]
     val_pairs = [("n0", "n4"), ("n1", "n2"), ("n2", "n6"), ("n3", "n7")]
     val_labels = np.array([0, 1, 0, 0], dtype=np.int8)
 
     return te.EgoStitchData(
         train_nodes=list(_NODES),
-        e_sup_positives=e_sup,
+        training_positives=training_positives,
         val_pairs=val_pairs,
         val_labels=val_labels,
         f0=torch.from_numpy(f0),
@@ -347,10 +343,7 @@ def _toy_cfg(tmp_path: Path) -> te.EgoConfig:
         data=te.EgoDataConfig(
             root=tmp_path / "data",
             strategy="toy",
-            train_positives="e_sup",
             negative_ratio=5,
-            partition_seed=0,
-            msg_fraction=0.8,
             node_batch=4,
             edge_batch=6,
             f0_cache=tmp_path / "f0.pt",
@@ -419,7 +412,7 @@ class TestEnumerateEdgeStream:
         )
         assert forward == reversed_rows
 
-    def test_positive_shards_partition_e_sup(self) -> None:
+    def test_positive_shards_partition_all_training_positives(self) -> None:
         positives = {canonical_pair(u, v) for u, v in _POSITIVES[6:]}
         seen: list[tuple[str, str]] = []
         for rank in range(2):

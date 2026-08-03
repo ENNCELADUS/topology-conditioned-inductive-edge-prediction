@@ -62,6 +62,19 @@ class TestEgoTargetBuilder:
         assert float(out.degree[0]) == 2.0
         torch.testing.assert_close(out.mult[out.mask], torch.ones(2), atol=0.0, rtol=0.0)
 
+    def test_leave_one_out_removes_queried_partner_and_decrements_degree(self) -> None:
+        builder = _builder()
+        out = builder.build(
+            ["n1"], np.random.default_rng(0), exclude_neighbors=["n0"]
+        )
+
+        assert int(out.mask.sum()) == 1
+        assert float(out.degree[0]) == 1.0
+        assert int(out.node_index[0, 0]) == _NODES.index("n2")
+        np.testing.assert_allclose(
+            out.ego_stats[0].numpy(), [1.0, 0.0, 1.0, 1.0], rtol=1e-6
+        )
+
     def test_hub_multiplicity_labels_sum_to_true_degree(self) -> None:
         builder = _builder(slots=3)
         out = builder.build(["n0"], np.random.default_rng(1))

@@ -1,11 +1,10 @@
 """Ego-net structural targets from ``G_struct`` (spec Sec 6, Sec 9.3, Sec 13.4/13.6).
 
-Everything structural derives from the message partition's ``G_struct`` — never
+Everything structural derives from the shared training-interaction ``G_struct`` — never
 from ``train_graph.pkl`` (quarantined, spec Sec 9.3). Self-loops are already
-absent (`build_g_struct` strips them). Leave-one-out (spec Sec 6) is satisfied
-structurally: ``E_sup`` and ``E_msg`` are disjoint by construction
-(`derive_partition`), so a supervision pair's endpoint can never appear among
-its partner's ``G_struct`` targets — asserted here, not re-implemented.
+absent (`build_g_struct` strips them). Edge-stream callers enforce leave-one-out
+(spec Sec 6) explicitly by passing each queried partner through
+``exclude_neighbors``; node-stream targets use the complete topology.
 
 Hub policy (spec Sec 13.4): when ``|N(u)| > K``, neighbors are stratified by
 ``deg_G_struct`` log2 bucket; largest-remainder proportional allocation capped
@@ -105,7 +104,7 @@ class EgoTargetBuilder:
         """Precompute static per-node target ingredients.
 
         Args:
-            g_struct: The message-partition structural graph (simple; from
+            g_struct: The shared-interaction structural graph (simple; from
                 `src.data.partition.build_g_struct`).
             f0_matrix: The F0 mean-pool matrix.
             node_index: Node id -> `f0_matrix` row.
@@ -131,7 +130,7 @@ class EgoTargetBuilder:
         self._neighbors: dict[str, list[str]] = {
             node: sorted(g_struct.neighbors(node)) for node in g_struct.nodes()
         }
-        self._ego_stats: dict[str, tuple[float, float, float, float]] = {}
+        self._ego_stats: dict[tuple[str, str | None], tuple[float, float, float, float]] = {}
         self._feature_read_observer: Callable[[Sequence[str]], None] | None = None
 
     def set_feature_read_observer(self, observer: Callable[[Sequence[str]], None] | None) -> None:
@@ -140,25 +139,48 @@ class EgoTargetBuilder:
 
     @property
     def graph(self) -> nx.Graph:
-        """Return the protocol-clean message graph used to build all targets."""
+        """Return the protocol-clean shared-interaction graph used for all targets."""
         return self._g
 
-    def _node_ego_stats(self, node: str) -> tuple[float, float, float, float]:
-        """The pinned real-side ego-stat 4-vector (spec Sec 13.6), cached."""
-        cached = self._ego_stats.get(node)
+    def _node_ego_stats(
+        self, node: str, exclude_neighbor: str | None = None
+    ) -> tuple[float, float, float, float]:
+        """Return real-side ego statistics after an optional leave-one-out removal."""
+        effective_exclusion = (
+            exclude_neighbor if exclude_neighbor in self._neighbors.get(node, []) else None
+        )
+        key = (node, effective_exclusion)
+        cached = self._ego_stats.get(key)
         if cached is not None:
             return cached
-        neighbors = self._neighbors.get(node, [])
+        neighbors = [
+            neighbor
+            for neighbor in self._neighbors.get(node, [])
+            if neighbor != effective_exclusion
+        ]
         degree = float(len(neighbors))
-        clustering = float(nx.clustering(self._g, node)) if neighbors else 0.0
+        neighbor_edges = self._g.subgraph(neighbors).number_of_edges()
+        clustering = (
+            float(2 * neighbor_edges / (len(neighbors) * (len(neighbors) - 1)))
+            if len(neighbors) > 1
+            else 0.0
+        )
         ego = self._g.subgraph([node, *neighbors])
         stats = (degree, clustering, float(ego.number_of_edges()), float(nx.density(ego)))
-        self._ego_stats[node] = stats
+        self._ego_stats[key] = stats
         return stats
 
-    def _select_targets(self, node: str, rng: np.random.Generator) -> tuple[list[str], list[float]]:
+    def _select_targets(
+        self,
+        node: str,
+        rng: np.random.Generator,
+        *,
+        exclude_neighbor: str | None = None,
+    ) -> tuple[list[str], list[float]]:
         """Select up to K targets and their multiplicity labels (spec Sec 13.4)."""
-        neighbors = self._neighbors.get(node, [])
+        neighbors = [
+            neighbor for neighbor in self._neighbors.get(node, []) if neighbor != exclude_neighbor
+        ]
         if len(neighbors) <= self._slots:
             return list(neighbors), [1.0] * len(neighbors)
         strata: dict[int, list[str]] = {}
@@ -180,17 +202,31 @@ class EgoTargetBuilder:
                 mult.append(label)
         return selected, mult
 
-    def build(self, node_ids: Sequence[str], rng: np.random.Generator) -> EgoTargets:
+    def build(
+        self,
+        node_ids: Sequence[str],
+        rng: np.random.Generator,
+        *,
+        exclude_neighbors: Sequence[str | None] | None = None,
+    ) -> EgoTargets:
         """Build one target batch.
 
         Args:
             node_ids: The node-stream batch.
             rng: Seeded generator (the hub subsample is its only consumer).
+            exclude_neighbors: Optional queried partner per row. When present,
+                that partner is removed from reconstruction targets and ego statistics.
 
         Returns:
             The `EgoTargets` batch (targets padded to ``K``).
         """
         batch = len(node_ids)
+        if exclude_neighbors is None:
+            exclusions: Sequence[str | None] = [None] * batch
+        else:
+            if len(exclude_neighbors) != batch:
+                raise ValueError("exclude_neighbors must align one-to-one with node_ids")
+            exclusions = exclude_neighbors
         k = self._slots
         d = self._f0.shape[1]
         features = np.zeros((batch, k, d), dtype=np.float32)
@@ -203,12 +239,21 @@ class EgoTargetBuilder:
         target_node_index = np.full((batch, k), -1, dtype=np.int64)
         ego_stats = np.zeros((batch, 4), dtype=np.float32)
 
-        for b, node in enumerate(node_ids):
-            selected, labels = self._select_targets(node, rng)
+        for b, (node, excluded_neighbor) in enumerate(
+            zip(node_ids, exclusions, strict=True)
+        ):
+            selected, labels = self._select_targets(
+                node, rng, exclude_neighbor=excluded_neighbor
+            )
             if self._feature_read_observer is not None:
                 self._feature_read_observer(selected)
-            degree[b] = float(len(self._neighbors.get(node, [])))
-            ego_stats[b] = self._node_ego_stats(node)
+            degree[b] = float(
+                sum(
+                    neighbor != excluded_neighbor
+                    for neighbor in self._neighbors.get(node, [])
+                )
+            )
+            ego_stats[b] = self._node_ego_stats(node, excluded_neighbor)
             pool: dict[str, int] = self._pool.get(node, {})
             for t, (v, label) in enumerate(zip(selected, labels, strict=True)):
                 features[b, t] = self._f0[self._index[v]]

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import networkx as nx
 import numpy as np
 import pytest
@@ -245,6 +247,14 @@ def _world_size_teacher_and_targets() -> tuple[torch.Tensor, torch.Tensor]:
         [("a", "b", 1), ("c", "d", 0), ("e", "f", 1)],
     )
     return teacher, targets
+
+
+def test_relational_targets_remove_the_queried_edge_before_jaccard() -> None:
+    graph = nx.Graph([("u", "v"), ("u", "x"), ("v", "x")])
+
+    target = relational_pair_targets(graph, [("u", "v", 1)])
+
+    torch.testing.assert_close(target[0], torch.tensor([math.log(2.0), 1.0]))
 
 
 def _combined_loss(

@@ -60,7 +60,7 @@ from src.data.pairs import (
     TokenPairDataset,
     collate_token_pairs,
 )
-from src.data.partition import build_g_struct, derive_partition
+from src.data.partition import build_g_struct, derive_training_interactions
 from src.e2_pipeline import ProbeResult
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
@@ -68,7 +68,6 @@ from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
 logger = logging.getLogger(__name__)
 
 MODEL_FAMILIES = ("v3_1", "f0_mlp")
-TRAIN_POSITIVES_MODES = ("train_plus", "e_sup")
 MIXED_PRECISION_MODES = ("no", "bf16")
 
 Batch = dict[str, torch.Tensor]
@@ -107,10 +106,7 @@ class DataConfig:
         root: Data root containing ``benchmark_2025_neurips/`` and
             ``features/frozen_node_features_1024/``.
         strategy: Split strategy name (e.g. ``breadth_first``).
-        train_positives: ``train_plus`` (all train-side positives) or ``e_sup``
-            (supervision split of the seeded message/supervision partition).
         negative_ratio: Negatives sampled per positive, per epoch on the F0-MLP path.
-        partition_seed: Seed for the message/supervision partition.
         token_budget: Per-batch token budget on the ``v3_1`` path.
         batch_pairs: Per-batch pair count on the ``f0_mlp`` path.
         num_workers: DataLoader workers on the ``v3_1`` path.
@@ -121,9 +117,7 @@ class DataConfig:
 
     root: Path
     strategy: str
-    train_positives: str
     negative_ratio: int
-    partition_seed: int
     token_budget: int
     batch_pairs: int
     num_workers: int
@@ -550,9 +544,7 @@ def load_config(path: Path) -> Config:
     data_keys = (
         "root",
         "strategy",
-        "train_positives",
         "negative_ratio",
-        "partition_seed",
         "token_budget",
         "batch_pairs",
         "num_workers",
@@ -560,23 +552,11 @@ def load_config(path: Path) -> Config:
         "expected_missing_features",
     )
     _check_no_unknown_keys(data_raw, data_keys, "data")
-    train_positives = _as_str(
-        _require(data_raw, "train_positives", "data."), "data.train_positives"
-    )
-    if train_positives not in TRAIN_POSITIVES_MODES:
-        raise ValueError(
-            f"data.train_positives must be one of {list(TRAIN_POSITIVES_MODES)}, "
-            f"got '{train_positives}'"
-        )
     data = DataConfig(
         root=Path(_as_str(_require(data_raw, "root", "data."), "data.root")),
         strategy=_as_str(_require(data_raw, "strategy", "data."), "data.strategy"),
-        train_positives=train_positives,
         negative_ratio=_as_int(
             _require(data_raw, "negative_ratio", "data."), "data.negative_ratio"
-        ),
-        partition_seed=_as_int(
-            _require(data_raw, "partition_seed", "data."), "data.partition_seed"
         ),
         token_budget=_as_int(_require(data_raw, "token_budget", "data."), "data.token_budget"),
         batch_pairs=_as_int(_require(data_raw, "batch_pairs", "data."), "data.batch_pairs"),
@@ -909,8 +889,8 @@ class AssembledData:
     Attributes:
         benchmark: Loaded benchmark (featureless-node pairs already dropped).
         store: Frozen per-node token-sequence feature store.
-        training_positives: Positive training pairs per ``data.train_positives``.
-        degrees: Simple-graph degrees from ``G_struct`` (message partition).
+        training_positives: All positive train-side interactions.
+        degrees: Simple-graph degrees from all loopless training interactions.
         dropped_pair_counts: Rows dropped per labeled file due to missing features.
         operative_node_ids: Sorted node ids in both the graph and the feature index.
         operative_node_count: ``len(operative_node_ids)``.
@@ -995,13 +975,9 @@ def assemble_data(cfg: Config, *, verify: bool = True) -> AssembledData:
         for pair, label in zip(train_pairs.pairs, train_pairs.labels, strict=True)
         if label == 1
     ]
-    partition = derive_partition(train_plus, cfg.data.partition_seed)
-    if cfg.data.train_positives == "train_plus":
-        training_positives = train_plus
-    else:
-        training_positives = sorted(partition.e_sup)
-
-    g_struct = build_g_struct(bench.split.train_nodes, partition.e_msg)
+    interactions = derive_training_interactions(train_plus)
+    training_positives = sorted(interactions.classification_positives)
+    g_struct = build_g_struct(bench.split.train_nodes, interactions.topology_edges)
     degrees = {str(node): int(degree) for node, degree in g_struct.degree()}
 
     return AssembledData(
@@ -1326,7 +1302,7 @@ def write_outputs(
         "torch_version": str(torch.__version__),
         "timestamp": datetime.now(UTC).isoformat(),
         "dropped_pair_counts": dropped_pair_counts,
-        "positives_mode": cfg.data.train_positives,
+        "training_interactions": "all_train_positives",
     }
     (output_dir / "run_metadata.json").write_text(
         json.dumps(run_metadata, indent=2) + "\n", encoding="utf-8"
@@ -2815,9 +2791,8 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     assembled = assemble_data(cfg)
     logger.info(
-        "assembled data: %d training positives (%s mode), dropped pairs %s",
+        "assembled data: %d shared training positives, dropped pairs %s",
         len(assembled.training_positives),
-        cfg.data.train_positives,
         assembled.dropped_pair_counts,
     )
     model = build_model(cfg)

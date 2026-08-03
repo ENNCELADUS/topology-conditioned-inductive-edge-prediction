@@ -48,6 +48,13 @@ owner has withdrawn the registration mechanism —
 §10). Both are fixed-Seed-0 engineering screens: neither replaces E1/E3's multi-seed
 Holm inference.
 
+> **Data-contract correction (2026-08-03):** those historical screens used the retired
+> 80/20 message/supervision split. The active implementation now uses the same complete
+> train-side positive interactions for topology learning and edge classification (with
+> explicit per-query leave-one-out reconstruction targets). All older packs, caches,
+> thresholds, and results are non-comparable to this corrected contract; no scientific
+> result has yet been produced under it.
+
 The active build line is **rev-3.2** of the end-to-end stitched-topology-conditioned
 pair encoder, run directly (the owner has withdrawn the preregistration/formal-run
 gating mechanism):
@@ -57,7 +64,8 @@ hpc/run.sh train configs/egostitch_e2e_v3_full_breadth_first.yaml \
   --worker-module src.train_egostitch --run-kind formal   # or another trained-arm config
 ```
 
-The run trains on `V_fit`, validates on the single 512-node `V_hold`, and executes
+The run trains topology and classification on the same interactions induced within
+`V_fit`, validates on the single 512-node `V_hold`, and executes
 `pack → train → publish` through the shared orchestrator. Quality telemetry
 (eligibility, liveness, slot collapse, margins) is recorded but never blocks
 completion, publication, scoring, or evaluation.
@@ -166,7 +174,8 @@ close the topology gap. The complete closeout package is
 > BFS-macro RD fail, the matched-AUPRC guard fails, and pathway attribution and the
 > structure-destruction control both fail to establish a topology-conditioning gain.
 > The owner-side disposition subsequently advanced the build through rev-3.1 to the
-> active rev-3.2 eight-arm contract; it does not alter the historical `cut` verdict.
+> active rev-3.2 seven-arm contract (five trained checkpoints plus two scoring-time
+> controls); it does not alter the historical `cut` verdict.
 
 For each queried pair `(i, j)`, each endpoint **imagines its own ego-network** (latent
 neighbor nodes with existence probabilities, local adjacency, and a degree budget)
@@ -176,16 +185,15 @@ is **end-to-end**: a from-scratch pair encoder over the two endpoints' raw token
 sequences is *conditioned on the scaffold* — a structure-only **stitched-topology
 encoder** (anchor labels, existence, multiplicity, degrees, and the scaffold's edge
 structure; no content embeddings) produces token-level topology states that enter the
-pair encoder through zero-initialized gated cross-attention, with content evidence on a
-separate, independently ablatable pathway. No pretrained frozen classifier appears
-anywhere in the model; the same checkpoint emits a pair-only logit, pair+content,
-pair+topology, and the full logit for attribution.
+pair encoder through zero-initialized gated cross-attention. No pretrained frozen
+classifier or separate slot-content conditioning pathway appears in the model; the
+checkpoint emits the topology-conditioned logit plus its pair-only `f_logit` reference.
 
 ```text
 step 1  community coding      z_u, F_u, d̂_u       = Tokenize(x_u)            (per node, cached)
 step 2  ego-net imagination   S_u = {(h_u^k, π_u^k)} = Imagine(x_u, z_u, G(u)) (per node, cached)
 step 3  stitch                T̂_ij = Stitch(S_i, S_j, {i, j})                 (per pair)
-step 4  encode + decide       t = STE(T̂_ij);  p_ij = σ(head(Trunk(tok_i, tok_j | t, c_content)))
+step 4  encode + decide       t = STE(T̂_ij);  p_ij = σ(head(Trunk(tok_i, tok_j | t)))
 ```
 
 Training objective (maps onto the methodology plan's four terms):
@@ -279,11 +287,11 @@ target test graph; the queried edge is masked/standardized inside the scaffold. 
 - [x] **G5 frozen-s0 screening gate** — binding fixed-Seed-0 verdict `cut`: all three primary topology-dominance checks fail and both guards pass. The selected warm-start checkpoint is near S0; a diagnostic `last.pt` rerun proves later joint training moves ranking and passes matched GS, but still fails matched RD/clustering and regresses degree/spectral MMD. See the [result note](docs/results/G5-stage1-seed0-20260717.md).
 - [x] **Locked-decision disposition (2026-07-17)** — frozen-s0 scalar fusion is retired to motivating evidence; rev 3.0 was made the active G5 build line, which has since advanced to rev-3.2. Successor landing condition §14.3(1) is satisfied. The frozen-s0 code is deleted in the current cleanup worktree, so after the cleanup commit the arm is citable from published artifacts and `dcae090`, not re-runnable from the active tree.
 - [x] **G5 e2e screening gate** — binding fixed-Seed-0 v2 registration completed training (valid; liveness passed), held-out fp32 scoring, and the formal gate on 2026-07-24: BFS-macro GS passes but clustering-MMD and BFS-macro RD fail, the matched-AUPRC guard fails, and pathway attribution / the structure-destruction control both fail to establish a topology-conditioning gain. Verdict `cut` (multi-label). See the [result note](docs/results/G5-e2e-stage1-seed0-20260724.md).
-- [x] **Single-stage plan-bound cleanup (current worktree; commit pending)** — qualification and every qualification-to-formal or model-quality authorization gate are removed. Formal execution is coupled only to the owner-bound experiment plan and exact artifact identities; model-quality signals are telemetry. `V_fit` and the single 512-node `V_hold := V_qual ∪ V_select` remain unchanged. Contract: spec §13.19 and §12.
-- [x] **Rev-3.0 disposition** — the owner-side discussion advanced the line through rev-3.1 to the active rev-3.2 eight-arm contract; the 2026-07-24 `cut` remains historical engineering evidence.
-- [x] **Component-ablation arm set** — six trained arms (`full`, `f_only`, `pair_topology`, `p0`, `no_l_rel`, `row_layernorm`), each owning one mechanism axis; `cosine_pool` is retired (Phase-0 pool-recall ceilings carry the width attribution) and `row_layernorm` ablates the D0 z-scoring fix. `python -m src.experiments.observe_e2e_formal <output_dir>` reports the three run-observation targets (generator clipping margins, slot collapse, end-ramp precision differential) from `profile.json` telemetry.
+- [x] **Single-stage direct-run cleanup** — qualification, preregistration, plan-identity, and every model-quality authorization gate are removed. Runs execute directly; model-quality signals are telemetry. Contract: spec §14.4.7 and the 2026-08-02 three-component refactor design §10.
+- [x] **Rev-3.0 disposition** — the owner-side discussion advanced the line through rev-3.1 to the active rev-3.2 seven-arm contract; the 2026-07-24 `cut` remains historical engineering evidence.
+- [x] **Component-ablation arm set** — five trained arms (`full`, `f_only`, `p0`, `no_l_rel`, `row_layernorm`) plus two scoring-time structure controls. The deleted content pathway makes `pair_topology` identical to `full`, so it is retired; `cosine_pool` is also retired. `row_layernorm` ablates the D0 z-scoring fix. `python -m src.experiments.observe_e2e_formal <output_dir>` reports the run-observation targets from `profile.json` telemetry.
 - [x] **Registration excision (2026-08-02)** — the preregistration/formal-run-registration/provenance-gating machinery (`docs/registrations/`, `hpc/qualification.sh`) is removed in full; the owner runs experiments directly against the trained-arm configs via `hpc/run.sh train`. Design: [`docs/superpowers/specs/2026-08-02-three-component-refactor-design.md`](docs/superpowers/specs/2026-08-02-three-component-refactor-design.md) §10.
-- [ ] **Experiments** in priority order: the rev-3.2 eight-arm formal screen, then E1/E3 multi-seed main + baselines → E4 ablations (incl. E4.15–E4.17 attribution/structure/conditioning-depth) → E5 integrity gates → E7 (load-bearing) → E6 breadth.
+- [ ] **Experiments** in priority order: the rev-3.2 seven-arm formal screen, then E1/E3 multi-seed main + baselines → E4 ablations (incl. E4.15–E4.17 attribution/structure/conditioning-depth) → E5 integrity gates → E7 (load-bearing) → E6 breadth.
 
 ## HPC execution
 
@@ -303,8 +311,8 @@ GPU count is recorded with each run, so throughput evidence is interpreted again
 that exact hardware shape. There is no job scheduler (e.g. Slurm).
 
 **EgoStitch e2e training runs through the same `hpc/run.sh train` branch as the
-baselines**, over the six configured `configs/egostitch_e2e_v3_*.yaml` trained arms
-(`full`, `f_only`, `pair_topology`, `p0`, `no_l_rel`, `row_layernorm`). It uses the
+baselines**, over the five active trained arms (`full`, `f_only`, `p0`, `no_l_rel`,
+`row_layernorm`). It uses the
 auto-detected multi-GPU orchestrator and `src.train_egostitch`, runs `pack → train →
 publish`, trains on `V_fit`, validates on `V_hold`, and may not open a held-out path.
 

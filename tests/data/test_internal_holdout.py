@@ -22,9 +22,9 @@ def _path_edges(size: int) -> list[tuple[str, str]]:
 def test_partition_is_deterministic_disjoint_and_exhaustive() -> None:
     nodes = {f"n{i:03d}" for i in range(20)}
     edges = _path_edges(20)
-    first = derive_internal_holdout(nodes, edges, [], holdout_size=4)
+    first = derive_internal_holdout(nodes, edges, holdout_size=4)
     second = derive_internal_holdout(
-        reversed(tuple(sorted(nodes))), reversed(edges), [], holdout_size=4
+        reversed(tuple(sorted(nodes))), reversed(edges), holdout_size=4
     )
 
     assert first == second
@@ -35,15 +35,10 @@ def test_partition_is_deterministic_disjoint_and_exhaustive() -> None:
 
 
 def test_v_hold_is_exactly_the_union_of_the_two_historical_draws() -> None:
-    """V_fit must stay bit-identical to the two-holdout construction it replaces.
-
-    Every feature-stats, grounding and pack digest is keyed on ``V_fit``, so the
-    union is only cost-free while it removes exactly the same nodes the two
-    historical ``g5-v2-qual|``/``g5-v2-select|`` draws removed.
-    """
+    """V_hold remains the union of the two deterministic BFS draws."""
     nodes = {f"n{i:03d}" for i in range(20)}
     edges = _path_edges(20)
-    result = derive_internal_holdout(nodes, edges, [], holdout_size=4)
+    result = derive_internal_holdout(nodes, edges, holdout_size=4)
 
     graph = nx.Graph()
     graph.add_nodes_from(nodes)
@@ -61,7 +56,7 @@ def test_bfs_uses_largest_component_and_hash_ordered_frontiers() -> None:
     large = {"root", "a", "b", "c", "d", "e"}
     small = {"x", "y", "z"}
     edges = list(itertools.combinations(sorted(large), 2)) + [("x", "y"), ("y", "z")]
-    result = derive_internal_holdout(large | small, edges, [], holdout_size=2)
+    result = derive_internal_holdout(large | small, edges, holdout_size=2)
     qual_seed = min(
         large,
         key=lambda node: (hashlib.sha256(f"g5-v2-qual|{node}".encode()).digest(), node),
@@ -72,35 +67,42 @@ def test_bfs_uses_largest_component_and_hash_ordered_frontiers() -> None:
     assert result.v_hold <= large
 
 
-def test_loopless_induced_fit_edges_and_supervision_restriction() -> None:
+def test_fit_topology_and_classification_use_the_same_interactions() -> None:
     nodes = {f"n{i:03d}" for i in range(12)}
-    message = _path_edges(12) + [("n000", "n000")]
-    supervision = list(itertools.combinations(sorted(nodes), 2)) + [("n011", "n011")]
-    result = derive_internal_holdout(nodes, message, supervision, holdout_size=2)
+    interactions = list(itertools.combinations(sorted(nodes), 2)) + [("n011", "n011")]
+    result = derive_internal_holdout(nodes, interactions, holdout_size=2)
 
-    assert all(u != v and u in result.v_fit and v in result.v_fit for u, v in result.e_msg_fit)
-    assert all(u in result.v_fit and v in result.v_fit for u, v in result.e_sup_fit)
+    assert all(
+        u in result.v_fit and v in result.v_fit
+        for u, v in result.training_interactions_fit
+    )
+    assert result.topology_fit == frozenset(
+        (u, v) for u, v in result.training_interactions_fit if u != v
+    )
     assert nx.number_of_selfloops(result.build_g_fit()) == 0
     assert set(result.build_g_fit().nodes) == result.v_fit
-    assert ("n011", "n011") in result.e_sup_fit if "n011" in result.v_fit else True
+    assert (
+        ("n011", "n011") in result.training_interactions_fit
+        if "n011" in result.v_fit
+        else True
+    )
 
 
 def test_cross_partition_quarantine_counts_match_direct_count() -> None:
     nodes = {f"n{i:03d}" for i in range(14)}
-    message = _path_edges(14)
-    supervision = list(itertools.combinations(sorted(nodes), 2))
-    result = derive_internal_holdout(nodes, message, supervision, holdout_size=3)
+    interactions = list(itertools.combinations(sorted(nodes), 2))
+    result = derive_internal_holdout(nodes, interactions, holdout_size=3)
     owner = {
         node: name
         for name, part in (("fit", result.v_fit), ("hold", result.v_hold))
         for node in part
     }
     expected = {"fit__hold": 0}
-    for u, v in supervision:
+    for u, v in interactions:
         if owner[u] != owner[v]:
             expected["__".join(sorted((owner[u], owner[v])))] += 1
 
-    assert result.quarantine_counts.supervision == expected
+    assert result.quarantine_counts.training_interactions == expected
 
 
 def test_complete_manifest_is_loopless_labeled_and_hashes_canonical_rows() -> None:
@@ -123,6 +125,6 @@ def test_complete_manifest_is_loopless_labeled_and_hashes_canonical_rows() -> No
 
 def test_rejects_too_small_remaining_component_and_foreign_endpoints() -> None:
     with pytest.raises(ValueError, match="largest remaining"):
-        derive_internal_holdout({"a", "b", "c"}, [("a", "b"), ("b", "c")], [], holdout_size=2)
+        derive_internal_holdout({"a", "b", "c"}, [("a", "b"), ("b", "c")], holdout_size=2)
     with pytest.raises(ValueError, match="outside operative"):
-        derive_internal_holdout({"a", "b"}, [("a", "foreign")], [], holdout_size=1)
+        derive_internal_holdout({"a", "b"}, [("a", "foreign")], holdout_size=1)

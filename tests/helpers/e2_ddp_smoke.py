@@ -88,9 +88,7 @@ def _run_train(output_dir: Path, rank: int) -> None:
         data=DataConfig(
             root=Path("data"),
             strategy="breadth_first",
-            train_positives="train_plus",
             negative_ratio=1,
-            partition_seed=0,
             token_budget=64,
             batch_pairs=2,
             num_workers=0,

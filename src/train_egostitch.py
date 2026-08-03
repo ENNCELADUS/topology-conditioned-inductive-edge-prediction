@@ -55,7 +55,10 @@ from src.data.grounding import build_grounding_pool
 from src.data.internal_holdout import InternalHoldoutPartition, derive_internal_holdout
 from src.data.packed_features import PackedFeatureManifest, PackedFeatureTable
 from src.data.pairs import NegativeSampler
-from src.data.partition import derive_partition
+from src.data.partition import (
+    TRAINING_INTERACTION_CONTRACT,
+    derive_training_interactions,
+)
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.eval.graph_metrics import MMDConfig, clustering_histogram, mmd_squared
 from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
@@ -151,10 +154,7 @@ class EgoDataConfig:
     Attributes:
         root: Data root containing the benchmark and feature packages.
         strategy: Split strategy name (Benchmark-A = ``breadth_first``).
-        train_positives: Pinned to ``e_sup`` (spec Sec 9.3).
         negative_ratio: Negatives per positive in the edge stream (spec 1:5).
-        partition_seed: Seed of the message/supervision partition.
-        msg_fraction: Message share of train positives (spec 0.8).
         node_batch: Per-rank node-stream batch size ``B_n``.
         edge_batch: Per-rank edge-stream batch size ``B_e``.
         f0_cache: F0 matrix cache path used outside packed execution; DDP modes
@@ -168,10 +168,7 @@ class EgoDataConfig:
 
     root: Path
     strategy: str
-    train_positives: str
     negative_ratio: int
-    partition_seed: int
-    msg_fraction: float
     node_batch: int
     edge_batch: int
     f0_cache: Path
@@ -349,10 +346,7 @@ def load_config(path: Path) -> EgoConfig:
     data_keys = (
         "root",
         "strategy",
-        "train_positives",
         "negative_ratio",
-        "partition_seed",
-        "msg_fraction",
         "node_batch",
         "edge_batch",
         "f0_cache",
@@ -361,25 +355,12 @@ def load_config(path: Path) -> EgoConfig:
         "pack_dir",
     )
     _check_no_unknown_keys(data_raw, data_keys, "data")
-    train_positives = _as_str(
-        _require(data_raw, "train_positives", "data."), "data.train_positives"
-    )
-    if train_positives != "e_sup":
-        raise ValueError(f"data.train_positives is pinned to 'e_sup', got {train_positives!r}")
-    msg_fraction = _as_float(data_raw.get("msg_fraction", 0.8), "data.msg_fraction")
-    if not 0.0 < msg_fraction < 1.0:
-        raise ValueError(f"data.msg_fraction must be in (0, 1), got {msg_fraction}")
     data = EgoDataConfig(
         root=Path(_as_str(_require(data_raw, "root", "data."), "data.root")),
         strategy=_as_str(_require(data_raw, "strategy", "data."), "data.strategy"),
-        train_positives=train_positives,
         negative_ratio=_as_int(
             _require(data_raw, "negative_ratio", "data."), "data.negative_ratio"
         ),
-        partition_seed=_as_int(
-            _require(data_raw, "partition_seed", "data."), "data.partition_seed"
-        ),
-        msg_fraction=msg_fraction,
         node_batch=_as_int(_require(data_raw, "node_batch", "data."), "data.node_batch"),
         edge_batch=_as_int(_require(data_raw, "edge_batch", "data."), "data.edge_batch"),
         f0_cache=Path(_as_str(_require(data_raw, "f0_cache", "data."), "data.f0_cache")),
@@ -1454,6 +1435,14 @@ def _sha256_file(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdefABCDEF" for character in value)
+    )
+
+
 # The held-out artifacts no training-side stage may read (design 2026-07-29
 # Sec 3.1). Named once so every stage -- the two-stage e2e assembly, its
 # `cfg.training is None` sibling, and the pack builder that precedes both --
@@ -1599,6 +1588,12 @@ def prepare_pack(
     # assembly let the pack consume held-out rows and bake them into the F0,
     # grounding and feature-statistics caches the assembly then reuses.
     strategy_dir = _assert_input_boundary(cfg)
+    val_path = strategy_dir / "val_edges.txt"
+    if not val_path.is_file():
+        raise FileNotFoundError(
+            f"required validation-positive rejection source is missing: {val_path}"
+        )
+    _read_labeled_pairs(val_path)
     # Call-time import preserves the pack builder/validator monkeypatch seam.
     from src.data import packed_features
 
@@ -1635,10 +1630,8 @@ def prepare_pack(
             for pair, label in zip(train_pairs, train_labels, strict=True)
             if int(label) == 1
         ]
-        partition = derive_partition(
-            positives, seed=cfg.data.partition_seed, msg_fraction=cfg.data.msg_fraction
-        )
-        holdout = derive_internal_holdout(train_nodes_all, partition.e_msg, partition.e_sup)
+        interactions = derive_training_interactions(positives)
+        holdout = derive_internal_holdout(train_nodes_all, interactions.positives)
         validation_nodes = holdout.hold_manifest.nodes
         train_nodes = sorted(holdout.v_fit)
         operative = sorted(set(train_nodes) | set(validation_nodes))
@@ -1759,7 +1752,7 @@ def prepare_pack(
 
 
 def enumerate_edge_stream(
-    e_sup_positives: Sequence[tuple[str, str]],
+    training_positives: Sequence[tuple[str, str]],
     sampler: NegativeSampler,
     *,
     negative_ratio: int,
@@ -1776,7 +1769,7 @@ def enumerate_edge_stream(
     ``(seed, epoch, rank)``; the combined list is shuffled with the same stream.
 
     Args:
-        e_sup_positives: Canonical supervision positives (self-pairs included).
+        training_positives: Canonical shared training positives (self-pairs included).
         sampler: The pinned negative sampler.
         negative_ratio: Negatives per positive.
         seed: Base seed.
@@ -1787,7 +1780,7 @@ def enumerate_edge_stream(
     Returns:
         Row list ``(u, v, label)`` for this epoch/rank.
     """
-    positives = sorted(e_sup_positives)
+    positives = sorted(training_positives)
     rng = np.random.default_rng((seed, epoch, rank, 0xE5))
     order = np.random.default_rng((seed, epoch, 0xE5)).permutation(len(positives))
     shard = [positives[i] for i in order.tolist()][rank::world_size]
@@ -1806,7 +1799,7 @@ class EgoStitchData:
 
     Attributes:
         train_nodes: Sorted train-side node ids with F0 rows.
-        e_sup_positives: Canonical supervision positives (self-pairs included).
+        training_positives: Canonical shared training positives (self-pairs included).
         val_pairs: Validation pairs in canonical V_hold non-self manifest order.
         val_labels: Aligned validation labels.
         f0: Shape ``(N, d)`` float32 CPU matrix.
@@ -1816,12 +1809,12 @@ class EgoStitchData:
         train_pos: Node id -> position in `train_nodes`.
         target_builder: The `EgoTargetBuilder` over ``G_struct``.
         sampler: The pinned negative sampler.
-        rho_train: Message-partition edge density (spec Sec 9.3).
+        rho_train: Shared training-topology edge density (spec Sec 9.3).
         feature_stats: Registered V_fit-only standardization constants.
     """
 
     train_nodes: list[str]
-    e_sup_positives: list[tuple[str, str]]
+    training_positives: list[tuple[str, str]]
     val_pairs: list[tuple[str, str]]
     val_labels: NDArray[np.int8]
     f0: torch.Tensor
@@ -1893,14 +1886,17 @@ def _assemble_e2e_data(
     positives = [
         pair for pair, label in zip(train_pairs, train_labels, strict=True) if int(label) == 1
     ]
-    partition = derive_partition(
-        positives, seed=cfg.data.partition_seed, msg_fraction=cfg.data.msg_fraction
-    )
-    holdout = derive_internal_holdout(
-        train_nodes_all,
-        partition.e_msg,
-        partition.e_sup,
-    )
+    val_path = strategy_dir / "val_edges.txt"
+    if not val_path.is_file():
+        raise FileNotFoundError(
+            f"required validation-positive rejection source is missing: {val_path}"
+        )
+    val_pairs, val_labels = _read_labeled_pairs(val_path)
+    benchmark_val_positives = {
+        pair for pair, label in zip(val_pairs, val_labels, strict=True) if int(label) == 1
+    }
+    interactions = derive_training_interactions(positives)
+    holdout = derive_internal_holdout(train_nodes_all, interactions.positives)
     # One universe pair for both stages (design 2026-07-29 Sec 2): training is
     # always the full V_fit, validation is always V_hold. Nothing here reads
     # `run_kind` any more, which is exactly what makes the two stages share a
@@ -1978,14 +1974,8 @@ def _assemble_e2e_data(
         slots=generator_cfg.slots,
     )
     degrees = {node: int(g_fit.degree(node)) for node in fit_nodes}
-    rejection_positives = set(partition.e_msg) | set(partition.e_sup)
-    val_path = strategy_dir / "val_edges.txt"
-    validation_positive_membership_used = val_path.is_file()
-    if validation_positive_membership_used:
-        val_pairs, val_labels = _read_labeled_pairs(val_path)
-        rejection_positives.update(
-            pair for pair, label in zip(val_pairs, val_labels, strict=True) if int(label) == 1
-        )
+    rejection_positives = set(interactions.positives) | benchmark_val_positives
+    validation_positive_membership_used = True
     sampler = NegativeSampler(fit_nodes, degrees, frozenset(rejection_positives))
     n_fit = len(fit_nodes)
     rho_train = g_fit.number_of_edges() / (math.comb(n_fit, 2) + n_fit)
@@ -1999,11 +1989,17 @@ def _assemble_e2e_data(
             "".join(f"{node}\n" for node in fit_nodes).encode()
         ).hexdigest(),
         "validation_feature_nodes_sha256": validation.nodes_sha256,
-        "training_structural_target_sha256": _sha256_pairs(sorted(holdout.e_msg_fit)),
-        "training_supervision_sha256": _sha256_pairs(sorted(holdout.e_sup_fit)),
+        "training_interactions_sha256": _sha256_pairs(
+            sorted(holdout.training_interactions_fit)
+        ),
+        "training_topology_sha256": _sha256_pairs(sorted(holdout.topology_fit)),
         "training_endpoints_within_v_fit": True,
-        "structural_target_equals_e_msg_fit": {canonical_pair(u, v) for u, v in g_fit.edges()}
-        == set(holdout.e_msg_fit),
+        "classification_uses_all_training_interactions": True,
+        "topology_is_nonself_projection_of_training_interactions": True,
+        "structural_target_equals_nonself_training_interactions": {
+            canonical_pair(u, v) for u, v in g_fit.edges()
+        }
+        == set(holdout.topology_fit),
         "validation_positive_membership_used_for_negative_rejection_only": (
             validation_positive_membership_used
         ),
@@ -2020,7 +2016,7 @@ def _assemble_e2e_data(
         )
     data = EgoStitchData(
         train_nodes=fit_nodes,
-        e_sup_positives=sorted(holdout.e_sup_fit),
+        training_positives=sorted(holdout.training_interactions_fit),
         val_pairs=list(validation.pairs),
         val_labels=np.asarray(validation.labels, dtype=np.int8),
         f0=matrix,
@@ -2134,13 +2130,15 @@ def relational_pair_targets(
     graph: nx.Graph,
     rows: Sequence[tuple[str, str, int]],
 ) -> torch.Tensor:
-    """Compute `L_rel` targets from `G_fit` for every positive or negative pair."""
+    """Compute pair-edge-masked `L_rel` targets for every positive or negative pair."""
     targets = torch.zeros(len(rows), 2, dtype=torch.float32)
     for row, (node_u, node_v, _) in enumerate(rows):
         if node_u not in graph or node_v not in graph:
             raise ValueError("relational target pair contains a node outside G_fit")
         neighbors_u = set(graph.neighbors(node_u))
         neighbors_v = set(graph.neighbors(node_v))
+        neighbors_u.discard(node_v)
+        neighbors_v.discard(node_u)
         common = len(neighbors_u & neighbors_v)
         union = len(neighbors_u | neighbors_v)
         targets[row, 0] = math.log1p(common)
@@ -2399,7 +2397,7 @@ class _BatchFactory:
         true_rows: int,
         epoch: int,
     ) -> dict[str, torch.Tensor]:
-        """Build positive-real-row endpoint targets keyed only by node and epoch."""
+        """Build positive-real-row targets with explicit queried-partner leave-one-out."""
         batch = len(rows)
         slots = self._model_cfg.slots
         input_dim = self._model_cfg.input_dim
@@ -2417,18 +2415,23 @@ class _BatchFactory:
                 (batch, slots), -1, dtype=torch.long
             )
 
-        cached: dict[str, EgoTargets] = {}
+        cached: dict[tuple[str, str], EgoTargets] = {}
         for row_index, (node_i, node_j, label) in enumerate(rows):
             if row_index >= true_rows or label != 1:
                 continue
-            for side, node_id in (("i", node_i), ("j", node_j)):
-                node_targets = cached.get(node_id)
+            for side, node_id, excluded_id in (
+                ("i", node_i, node_j),
+                ("j", node_j, node_i),
+            ):
+                cache_key = (node_id, excluded_id)
+                node_targets = cached.get(cache_key)
                 if node_targets is None:
                     node_targets = self._data.target_builder.build(
                         [node_id],
                         _edge_target_rng(node_id, seed=self._cfg.seed, epoch=epoch),
+                        exclude_neighbors=[excluded_id],
                     )
-                    cached[node_id] = node_targets
+                    cached[cache_key] = node_targets
                 targets[f"target_features_{side}"][row_index] = node_targets.features[0]
                 targets[f"target_mult_{side}"][row_index] = node_targets.mult[0]
                 targets[f"target_adj_{side}"][row_index] = node_targets.adj[0]
@@ -2484,7 +2487,7 @@ class _BatchFactory:
     ) -> Iterator[_CompositeBatch]:
         """Yield the epoch's composite batches for this rank."""
         edge_rows = enumerate_edge_stream(
-            self._data.e_sup_positives,
+            self._data.training_positives,
             self._data.sampler,
             negative_ratio=self._cfg.data.negative_ratio,
             seed=self._cfg.seed,
@@ -4083,7 +4086,7 @@ def _train_e2e_stability_loop(
     )
 
     rows_per_rank, steps_per_epoch = _epoch_step_plan(
-        len(data.e_sup_positives),
+        len(data.training_positives),
         negative_ratio=cfg.data.negative_ratio,
         edge_batch=cfg.data.edge_batch,
         world_size=world,
@@ -5019,10 +5022,8 @@ def model_config_hash(cfg: EgoConfig) -> str:
         "model": {"family": cfg.model.family, "config": model_config},
         "data": {
             "strategy": cfg.data.strategy,
-            "train_positives": cfg.data.train_positives,
+            "training_interactions": "all_train_positives",
             "negative_ratio": cfg.data.negative_ratio,
-            "partition_seed": cfg.data.partition_seed,
-            "msg_fraction": cfg.data.msg_fraction,
             "node_batch": cfg.data.node_batch,
             "edge_batch": cfg.data.edge_batch,
             "expected_missing_features": list(cfg.data.expected_missing_features),
@@ -5071,10 +5072,9 @@ def write_run_start_metadata(
         "started_at": datetime.now(UTC).isoformat(),
         "seed": cfg.seed,
         "world_size": world_size,
-        "partition_seed": cfg.data.partition_seed,
         "strategy": cfg.data.strategy,
         "rho_train": data.rho_train,
-        "positives_mode": cfg.data.train_positives,
+        "training_interactions": "all_train_positives",
         "permanent_null": (
             e2e_config.classifier.permanent_null if e2e_config is not None else "none"
         ),
@@ -5093,9 +5093,8 @@ def write_outputs(
 ) -> None:
     """Write the pinned Task-4 artifacts and finalize the run's metadata record.
 
-    ``best.pt``/``last.pt`` carry exactly the seven pinned payload keys;
-    ``run_metadata.json`` additionally records the s0 checkpoint identity, the
-    partition seed, and the measured ``rho_train``.
+    ``best.pt``/``last.pt`` and ``run_metadata.json`` bind the shared-training-
+    interaction contract and both canonical training-interaction digests.
     """
     output_dir = cfg.output_dir
     config_dict = config_to_dict(cfg)
@@ -5106,6 +5105,20 @@ def write_outputs(
     expected_run_kind = "debug" if debug else (cfg.run_kind or "formal")
     if run_metadata.get("run_kind") != expected_run_kind:
         raise RuntimeError("run kind changed after run start; refusing to finalize artifacts")
+    access_audit = data.access_audit
+    if not isinstance(access_audit, Mapping):
+        raise RuntimeError("training access audit is missing")
+    training_interactions_sha256 = access_audit.get("training_interactions_sha256")
+    training_topology_sha256 = access_audit.get("training_topology_sha256")
+    if not _is_sha256(training_interactions_sha256) or not _is_sha256(
+        training_topology_sha256
+    ):
+        raise RuntimeError("training access audit is missing canonical interaction digests")
+    data_provenance = {
+        "data_contract": TRAINING_INTERACTION_CONTRACT,
+        "training_interactions_sha256": training_interactions_sha256,
+        "training_topology_sha256": training_topology_sha256,
+    }
     validation_events = result.runtime_profile.get("v_hold_validation_events")
     validation_event_count = result.runtime_profile.get("v_hold_validation_event_count")
     validation_evidence: dict[str, object] | None = None
@@ -5145,6 +5158,7 @@ def write_outputs(
             "val_metrics": asdict(metrics),
             "seed": cfg.seed,
             "config": config_dict,
+            **data_provenance,
         }
 
     best_path = output_dir / "best.pt"
@@ -5186,7 +5200,8 @@ def write_outputs(
             "validation_liveness_pass": validation_liveness_observed,
             "validation_role": data.validation_role,
             "v_hold_validation_evidence": validation_evidence,
-            "access_audit": data.access_audit,
+            "access_audit": access_audit,
+            **data_provenance,
             "kendall_fallback": result.kendall_state,
             "training_diagnostics": {
                 "fidelity_series": [entry["fidelity"] for entry in result.history],

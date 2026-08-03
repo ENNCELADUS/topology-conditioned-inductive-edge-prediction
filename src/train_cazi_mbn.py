@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import logging
 import math
@@ -28,11 +29,16 @@ from src.baselines.cazi_mbn import CAZIStudent, CAZITeacher
 from src.data.artifacts import (
     Benchmark,
     LabeledPairs,
+    canonical_pair,
     load_benchmark,
     load_candidate_pairs,
 )
 from src.data.features import FeatureStore, build_f0_matrix
-from src.data.partition import build_g_struct, derive_partition
+from src.data.partition import (
+    TRAINING_INTERACTION_CONTRACT,
+    build_g_struct,
+    derive_training_interactions,
+)
 from src.eval.assembly import assemble_graph, density_matched_threshold
 from src.eval.edge_metrics import compute_edge_metrics
 from src.eval.graph_metrics import MMDConfig, strip_self_loops
@@ -45,7 +51,6 @@ from src.experiments.g1_hardened_e2 import (
 
 logger = logging.getLogger(__name__)
 
-
 @dataclasses.dataclass(frozen=True)
 class CAZIConfig:
     """Validated execution settings for the CAZI-MBN baseline."""
@@ -55,7 +60,6 @@ class CAZIConfig:
     output_dir: Path
     f0_cache: Path
     expected_missing_features: tuple[str, ...]
-    partition_seed: int
     seed: int
     order: int
     topology_dim: int
@@ -92,12 +96,25 @@ class PreparedData:
     val_labels: NDArray[np.int8]
     train_node_position: dict[str, int]
     missing_features: frozenset[str]
+    training_interactions_sha256: str
+    training_topology_sha256: str
 
 
 def _mapping(value: object, label: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{label} must be a mapping")
     return cast(Mapping[str, Any], value)
+
+
+def _check_keys(value: Mapping[str, Any], allowed: set[str], label: str) -> None:
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(f"{label} has unknown keys: {unknown}")
+
+
+def _sha256_pairs(pairs: Iterable[tuple[str, str]]) -> str:
+    rows = sorted(canonical_pair(u, v) for u, v in pairs)
+    return hashlib.sha256("".join(f"{u}\t{v}\n" for u, v in rows).encode()).hexdigest()
 
 
 def load_config(path: Path) -> CAZIConfig:
@@ -108,13 +125,36 @@ def load_config(path: Path) -> CAZIConfig:
     optim = _mapping(raw["optim"], "optim")
     runtime = _mapping(raw["runtime"], "runtime")
     loss = _mapping(raw["loss"], "loss")
+    _check_keys(raw, {"data", "model", "optim", "runtime", "loss", "output_dir", "seed"}, "config")
+    _check_keys(data, {"root", "strategy", "f0_cache", "expected_missing_features"}, "data")
+    _check_keys(
+        model,
+        {"order", "topology_dim", "latent_dim", "network_layers", "heads"},
+        "model",
+    )
+    _check_keys(
+        optim,
+        {"learning_rate", "weight_decay", "teacher_epochs", "student_epochs", "patience"},
+        "optim",
+    )
+    _check_keys(runtime, {"batch_size", "score_batch_size"}, "runtime")
+    _check_keys(
+        loss,
+        {
+            "discriminator_coef",
+            "regularization_coef",
+            "classification_coef",
+            "distillation_weight",
+            "supervised_weight",
+        },
+        "loss",
+    )
     return CAZIConfig(
         data_root=Path(str(data["root"])),
         strategy=str(data["strategy"]),
         output_dir=Path(str(raw["output_dir"])),
         f0_cache=Path(str(data["f0_cache"])),
         expected_missing_features=tuple(str(x) for x in data["expected_missing_features"]),
-        partition_seed=int(data["partition_seed"]),
         seed=int(raw["seed"]),
         order=int(model["order"]),
         topology_dim=int(model["topology_dim"]),
@@ -241,13 +281,40 @@ def load_or_build_ugt(
     feature_length: int,
     seed: int,
 ) -> torch.Tensor:
-    """Load an exact-node-order UGT cache or create it."""
+    """Load an exact-data-contract UGT cache or create it."""
+    topology_sha256 = _sha256_pairs(edges)
     if path.exists():
         with np.load(path, allow_pickle=False) as payload:
+            required = {
+                "node_ids",
+                "projection",
+                "data_contract",
+                "topology_sha256",
+                "order",
+                "feature_length",
+                "seed",
+            }
+            missing = sorted(required - set(payload.files))
+            if missing:
+                raise ValueError(
+                    f"{path}: stale UGT cache missing identity fields {missing}; rebuild it"
+                )
             cached_nodes = payload["node_ids"].astype(str).tolist()
             if cached_nodes != list(node_ids):
                 raise ValueError(f"{path}: cached UGT node order mismatch")
+            if str(payload["data_contract"].item()) != TRAINING_INTERACTION_CONTRACT:
+                raise ValueError(f"{path}: cached UGT data contract mismatch")
+            if str(payload["topology_sha256"].item()) != topology_sha256:
+                raise ValueError(f"{path}: cached UGT topology mismatch")
+            if int(payload["order"].item()) != order:
+                raise ValueError(f"{path}: cached UGT order mismatch")
+            if int(payload["feature_length"].item()) != feature_length:
+                raise ValueError(f"{path}: cached UGT feature length mismatch")
+            if int(payload["seed"].item()) != seed:
+                raise ValueError(f"{path}: cached UGT seed mismatch")
             projection = payload["projection"].astype(np.float32, copy=False)
+            if projection.shape != (len(node_ids), feature_length):
+                raise ValueError(f"{path}: cached UGT projection shape mismatch")
     else:
         logger.info("computing sparse UGT projection for %d nodes", len(node_ids))
         projection = compute_ugt_projection(
@@ -258,7 +325,16 @@ def load_or_build_ugt(
             seed=seed,
         )
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(path, node_ids=np.asarray(node_ids), projection=projection)
+        np.savez_compressed(
+            path,
+            node_ids=np.asarray(node_ids),
+            projection=projection,
+            data_contract=np.asarray(TRAINING_INTERACTION_CONTRACT),
+            topology_sha256=np.asarray(topology_sha256),
+            order=np.asarray(order, dtype=np.int64),
+            feature_length=np.asarray(feature_length, dtype=np.int64),
+            seed=np.asarray(seed, dtype=np.int64),
+        )
     return torch.from_numpy(projection.copy())
 
 
@@ -308,7 +384,7 @@ def _feature_coverage(
 
 
 def prepare_data(cfg: CAZIConfig) -> PreparedData:
-    """Assemble the canonical E_msg/E_sup train split and CAZI inputs."""
+    """Assemble shared training interactions and CAZI inputs."""
     benchmark_root = cfg.data_root / "benchmark_2025_neurips"
     feature_root = cfg.data_root / "features" / "frozen_node_features_1024"
     store = FeatureStore(feature_root)
@@ -336,13 +412,13 @@ def prepare_data(cfg: CAZIConfig) -> PreparedData:
         )
         if label == 1
     }
-    partition = derive_partition(sorted(all_train_positive), seed=cfg.partition_seed)
-    g_struct = build_g_struct(train_nodes, partition.e_msg)
-    message_edges = sorted(cast(Iterable[tuple[str, str]], g_struct.edges()))
+    interactions = derive_training_interactions(sorted(all_train_positive))
+    g_struct = build_g_struct(train_nodes, interactions.topology_edges)
+    topology_edges = sorted(cast(Iterable[tuple[str, str]], g_struct.edges()))
     train_pairs, train_labels = _sample_rows(
         benchmark.split.train_pairs.pairs,
         benchmark.split.train_pairs.labels,
-        set(partition.e_sup),
+        set(interactions.classification_positives),
         seed=cfg.seed,
     )
     negative_candidates = [
@@ -354,17 +430,17 @@ def prepare_data(cfg: CAZIConfig) -> PreparedData:
         )
         if label == 0 and pair[0] != pair[1]
     ]
-    if len(negative_candidates) < len(message_edges):
+    if len(negative_candidates) < len(topology_edges):
         raise ValueError("not enough frozen negatives to build the CAZI negative graph")
     rng = np.random.default_rng(cfg.seed)
     negative_choice = rng.choice(
-        len(negative_candidates), size=len(message_edges), replace=False
+        len(negative_candidates), size=len(topology_edges), replace=False
     )
     negative_edges = [negative_candidates[int(i)] for i in negative_choice]
     topology = load_or_build_ugt(
         cfg.output_dir / "ugt_projection.npz",
         train_nodes,
-        message_edges,
+        topology_edges,
         order=cfg.order,
         feature_length=cfg.topology_dim,
         seed=cfg.seed,
@@ -374,7 +450,7 @@ def prepare_data(cfg: CAZIConfig) -> PreparedData:
         train_nodes=train_nodes,
         train_sequence=train_sequence,
         topology=topology,
-        positive_edge_index=_edge_index(message_edges, train_node_position),
+        positive_edge_index=_edge_index(topology_edges, train_node_position),
         negative_edge_index=_edge_index(negative_edges, train_node_position),
         train_pairs=train_pairs,
         train_labels=train_labels,
@@ -382,6 +458,8 @@ def prepare_data(cfg: CAZIConfig) -> PreparedData:
         val_labels=benchmark.split.val_pairs.labels,
         train_node_position=train_node_position,
         missing_features=missing,
+        training_interactions_sha256=_sha256_pairs(interactions.positives),
+        training_topology_sha256=_sha256_pairs(topology_edges),
     )
 
 
@@ -441,6 +519,23 @@ def _write_history(path: Path, row: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(dict(row), sort_keys=True) + "\n")
+
+
+def _data_provenance(data: PreparedData) -> dict[str, str]:
+    return {
+        "data_contract": TRAINING_INTERACTION_CONTRACT,
+        "training_interactions_sha256": data.training_interactions_sha256,
+        "training_topology_sha256": data.training_topology_sha256,
+    }
+
+
+def _validate_data_provenance(
+    payload: Mapping[str, object], data: PreparedData, *, label: str
+) -> None:
+    expected = _data_provenance(data)
+    actual = {key: payload.get(key) for key in expected}
+    if actual != expected:
+        raise ValueError(f"{label} data provenance mismatch: {actual} != {expected}")
 
 
 def train_teacher(
@@ -528,7 +623,11 @@ def train_teacher(
                 break
     model.load_state_dict(best_state)
     torch.save(
-        {"state_dict": best_state, "best_val_auroc": best_auroc},
+        {
+            "state_dict": best_state,
+            "best_val_auroc": best_auroc,
+            **_data_provenance(data),
+        },
         cfg.output_dir / "teacher.pt",
     )
     return model
@@ -620,7 +719,11 @@ def train_student(
                 break
     model.load_state_dict(best_state)
     torch.save(
-        {"state_dict": best_state, "best_val_auroc": best_auroc},
+        {
+            "state_dict": best_state,
+            "best_val_auroc": best_auroc,
+            **_data_provenance(data),
+        },
         cfg.output_dir / "student.pt",
     )
     return model
@@ -714,6 +817,9 @@ def score_and_evaluate(
     v_idx = np.asarray([node_position[v] for _, v in candidate.pairs], dtype=np.int32)
     np.savez_compressed(
         cfg.output_dir / "student_candidate_scores.npz",
+        data_contract=np.asarray(TRAINING_INTERACTION_CONTRACT),
+        training_interactions_sha256=np.asarray(data.training_interactions_sha256),
+        training_topology_sha256=np.asarray(data.training_topology_sha256),
         node_ids=np.asarray(test_nodes),
         u_idx=u_idx,
         v_idx=v_idx,
@@ -725,6 +831,7 @@ def score_and_evaluate(
         "teacher_role": "train-only topology-aware distillation teacher",
         "benchmark": cfg.strategy,
         "seed": cfg.seed,
+        **_data_provenance(data),
         "pairwise": {
             "balanced_test": _metrics_dict(balanced.labels, balanced_probs),
             "full_universe": _metrics_dict(candidate.labels, universe_probs),
@@ -787,6 +894,8 @@ def _load_models(
     ).to(device)
     teacher_payload = torch.load(cfg.output_dir / "teacher.pt", map_location="cpu")
     student_payload = torch.load(cfg.output_dir / "student.pt", map_location="cpu")
+    _validate_data_provenance(teacher_payload, data, label="teacher checkpoint")
+    _validate_data_provenance(student_payload, data, label="student checkpoint")
     teacher.load_state_dict(teacher_payload["state_dict"])
     student.load_state_dict(student_payload["state_dict"])
     return teacher, student
@@ -850,7 +959,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             (cfg.output_dir / "failure.json").unlink(missing_ok=True)
             (cfg.output_dir / "complete.json").write_text(
                 json.dumps(
-                    {"status": "complete", "total_seconds": time.monotonic() - started},
+                    {
+                        "status": "complete",
+                        "total_seconds": time.monotonic() - started,
+                        **_data_provenance(data),
+                    },
                     sort_keys=True,
                 )
                 + "\n",

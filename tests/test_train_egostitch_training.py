@@ -63,10 +63,7 @@ def _training_config(tmp_path: Path) -> Path:
         "data": {
             "root": str(tmp_path / "data"),
             "strategy": "breadth_first",
-            "train_positives": "e_sup",
             "negative_ratio": 5,
-            "partition_seed": 0,
-            "msg_fraction": 0.8,
             "node_batch": 2,
             "edge_batch": 6,
             "f0_cache": str(tmp_path / "f0.pt"),
@@ -143,7 +140,11 @@ def test_formal_output_metadata_matches_scorer_contract(tmp_path: Path) -> None:
     data = SimpleNamespace(
         rho_train=0.1,
         validation_role=te._E2E_VALIDATION_ROLE,
-        access_audit={"observed_training_access": []},
+        access_audit={
+            "observed_training_access": [],
+            "training_interactions_sha256": "a" * 64,
+            "training_topology_sha256": "b" * 64,
+        },
     )
     metrics = te.EdgeMetrics(
         auroc=0.5,

@@ -71,9 +71,7 @@ def _write_yaml_config(path: Path, overrides: dict[str, object] | None = None) -
         "data": {
             "root": "data",
             "strategy": "breadth_first",
-            "train_positives": "train_plus",
             "negative_ratio": 5,
-            "partition_seed": 0,
             "token_budget": 131072,
             "batch_pairs": 1024,
             "num_workers": 0,
@@ -209,9 +207,7 @@ class TestLoadConfig:
         assert cfg.model.config == {}
         assert cfg.data.root == Path("data")
         assert cfg.data.strategy == "breadth_first"
-        assert cfg.data.train_positives == "train_plus"
         assert cfg.data.negative_ratio == 5
-        assert cfg.data.partition_seed == 0
         assert cfg.data.token_budget == 131072
         assert cfg.data.batch_pairs == 1024
         assert cfg.data.num_workers == 0
@@ -275,15 +271,15 @@ class TestLoadConfig:
         with pytest.raises(ValueError, match="bogus_family"):
             load_config(config_path)
 
-    def test_unknown_train_positives_raises_clear_error(self, tmp_path: Path) -> None:
+    def test_removed_split_config_raises_clear_error(self, tmp_path: Path) -> None:
         config_path = tmp_path / "cfg.yaml"
         base = _write_yaml_config(config_path)
         data_section = base["data"]
         assert isinstance(data_section, dict)
-        data_section["train_positives"] = "bogus_mode"
+        data_section["msg_fraction"] = 0.8
         config_path.write_text(json.dumps(base))
 
-        with pytest.raises(ValueError, match="train_positives"):
+        with pytest.raises(ValueError, match="unknown config keys"):
             load_config(config_path)
 
     def test_missing_top_level_section_raises_clear_error(self, tmp_path: Path) -> None:
@@ -483,9 +479,7 @@ def _tiny_config(epochs: int = 5, patience: int = 8, eval_every: int = 1) -> Con
         data=DataConfig(
             root=Path("data"),
             strategy="breadth_first",
-            train_positives="train_plus",
             negative_ratio=5,
-            partition_seed=0,
             token_budget=131072,
             batch_pairs=1024,
             num_workers=0,
@@ -733,7 +727,7 @@ class TestWriteOutputs:
         assert "torch_version" in run_metadata
         assert "timestamp" in run_metadata
         assert run_metadata["dropped_pair_counts"] == assembled_dropped_counts
-        assert run_metadata["positives_mode"] == "train_plus"
+        assert run_metadata["training_interactions"] == "all_train_positives"
 
 
 # ------------------------------------------------- assemble_data (feature-coverage gate)
@@ -834,9 +828,7 @@ def _synthetic_data_config(data_root: Path, *, expected_missing_features: list[s
         data=DataConfig(
             root=data_root,
             strategy="synthetic",
-            train_positives="train_plus",
             negative_ratio=2,
-            partition_seed=0,
             token_budget=131072,
             batch_pairs=8,
             num_workers=0,
@@ -886,27 +878,10 @@ class TestAssembleDataFeatureCoverageGate:
         assert assembled.dropped_pair_counts["train_edges.txt"] == 0
         assert assembled.dropped_pair_counts["val_edges.txt"] == 0
         assert len(assembled.training_positives) == 2  # the two train+ positives
-        assert assembled.degrees  # built from G_struct, non-empty
-
-    def test_e_sup_mode_uses_supervision_split_only(self, tmp_path: Path) -> None:
-        data_root = tmp_path / "data"
-        benchmark_root = data_root / "benchmark_2025_neurips"
-        benchmark_root.mkdir(parents=True)
-        _build_synthetic_benchmark(benchmark_root, "synthetic")
-        features_root = data_root / "features" / "frozen_node_features_1024"
-        all_nodes = [f"node_{i:06d}" for i in range(1, 7)]
-        _write_feature_store(features_root, all_nodes)
-
-        cfg = _synthetic_data_config(data_root, expected_missing_features=["node_000007"])
-        from dataclasses import replace
-
-        cfg = replace(cfg, data=replace(cfg.data, train_positives="e_sup"))
-
-        assembled = assemble_data(cfg, verify=False)
-
-        # e_sup is a strict subset of the 2 train+ positives (80/20 split of n=2 -> 1/1).
-        assert len(assembled.training_positives) <= 2
-
+        assert assembled.degrees["node_000001"] == 1
+        assert assembled.degrees["node_000002"] == 1
+        assert assembled.degrees["node_000003"] == 1
+        assert assembled.degrees["node_000004"] == 1
 
 class TestV31TrainingLoader:
     def test_each_epoch_only_reorders_fixed_train_file_pairs(self, tmp_path: Path) -> None:

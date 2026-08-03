@@ -182,6 +182,9 @@ def _write_e2e_universe_npz(
         "num_rows": len(pairs),
         "created_utc": "2026-07-17T00:00:00+00:00",
         "torch_version": "2.10.0",
+        "data_contract": "shared_train_positives_v1",
+        "training_interactions_sha256": "a" * 64,
+        "training_topology_sha256": "b" * 64,
         "score_precision": {
             "contract": "egostitch_e2e_pair_fp32_v1",
             "encode_autocast": "off",
@@ -332,7 +335,6 @@ def test_real_probe_producer_artifact_is_accepted_by_g5_evaluator(
         json.dumps(
             {
                 "seed": 0,
-                "partition_seed": 0,
                 "config_path": str(config_path),
                 "checkpoint_id": _state_digest(state)[:16],
             },
@@ -345,8 +347,7 @@ def test_real_probe_producer_artifact_is_accepted_by_g5_evaluator(
 
     def tiny_internal_holdout(
         train_nodes: list[str],
-        e_msg: frozenset[tuple[str, str]],
-        _e_sup: frozenset[tuple[str, str]],
+        training_interactions: frozenset[tuple[str, str]],
     ) -> SimpleNamespace:
         # One holdout, not two (design 2026-07-29 Sec 2.1): `V_hold` is the
         # union of the former `V_qual`/`V_select` draws, and `V_fit ∪ V_hold`
@@ -358,14 +359,14 @@ def test_real_probe_producer_artifact_is_accepted_by_g5_evaluator(
         def induced(nodes_subset: frozenset[str]) -> frozenset[tuple[str, str]]:
             return frozenset(
                 (node_u, node_v)
-                for node_u, node_v in e_msg
+                for node_u, node_v in training_interactions
                 if node_u in nodes_subset and node_v in nodes_subset
             )
 
         return SimpleNamespace(
             v_fit=v_fit,
             v_hold=v_hold,
-            e_msg_fit=induced(v_fit),
+            topology_fit=induced(v_fit),
             hold_manifest=SimpleNamespace(positive_edges=induced(v_hold)),
         )
 
@@ -434,11 +435,13 @@ def _write_trained_arm_metadata(
         json.dumps(
             {
                 "checkpoint_id": checkpoint_id,
+                "data_contract": "shared_train_positives_v1",
+                "training_interactions_sha256": "a" * 64,
+                "training_topology_sha256": "b" * 64,
                 "arm": name,
                 "run_kind": "formal",
                 "seed": 0,
                 "strategy": "toy",
-                "partition_seed": 0,
                 "config_path": str(tmp_path / f"{name}.yaml"),
                 "v_hold_validation_evidence": {
                     "count": len(rows),
@@ -532,7 +535,6 @@ def _probe_v2_report(tmp_path: Path) -> tuple[Path, dict[str, object]]:
     metadata: dict[str, object] = {
         "checkpoint_id": "probe-checkpoint",
         "seed": 0,
-        "partition_seed": 0,
         "strategy": "toy",
         "g_struct_sha256": probes.g_struct_sha256(graph),
         "scope": "formal_train",
@@ -616,6 +618,23 @@ class TestBuildE2EArmSummary:
         assert set(full_deltas) == {"full_minus_f_logit"}
         rerun = g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
         assert json.dumps(payload, sort_keys=True) == json.dumps(rerun, sort_keys=True)
+
+    def test_rejects_trained_arms_from_different_training_data(self, tmp_path: Path) -> None:
+        inputs = _seven_arm_inputs(tmp_path)
+        metadata_path = _d(inputs["run_metadata_paths"])["p0"]
+        metadata = json.loads(metadata_path.read_text())
+        metadata["training_interactions_sha256"] = "c" * 64
+        metadata_path.write_text(json.dumps(metadata))
+        artifact_path = _d(inputs["arm_universe_paths"])["p0"]
+        artifact = load_scores(artifact_path)
+        artifact_meta = dict(artifact.meta)
+        artifact_meta["training_interactions_sha256"] = "c" * 64
+        _rewrite_e2e_artifact(artifact_path, meta=artifact_meta)
+
+        with pytest.raises(ValueError, match="does not share full's training-data provenance"):
+            g5_stage1.build_e2e_arm_summary(
+                liveness_config=_E2E_LIVENESS_CONFIG, **inputs
+            )
 
     def test_rejects_unknown_arm(self, tmp_path: Path) -> None:
         inputs = _seven_arm_inputs(tmp_path)

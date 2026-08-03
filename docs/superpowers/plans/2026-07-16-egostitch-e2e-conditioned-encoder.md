@@ -1,5 +1,9 @@
 # EgoStitch E2E Stitched-Topology-Conditioned Pair Encoder — Implementation Plan
 
+> **2026-08-03 data-contract disposition:** every 80/20 message/supervision split in
+> this historical plan is superseded by spec §9.3. Topology and classification now use
+> the same complete train-side positive interactions.
+
 > **2026-07-19 disposition:** this plan records the v1 implementation landing. Its
 > `L_edge`-inactive warm-start and v1 config/registration commands are superseded for
 > the prospective v2 screen by normative spec §13.19 and

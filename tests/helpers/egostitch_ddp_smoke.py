@@ -156,10 +156,7 @@ def _toy_config(output_dir: Path, pack_dir: Path) -> te.EgoConfig:
         data=te.EgoDataConfig(
             root=output_dir / "data",
             strategy="toy",
-            train_positives="e_sup",
             negative_ratio=5,
-            partition_seed=0,
-            msg_fraction=0.8,
             node_batch=4,
             edge_batch=4,
             f0_cache=output_dir / "f0.pt",
@@ -209,7 +206,7 @@ def _toy_bundle(model_cfg: EgoStitchConfig) -> te.EgoStitchData:
     )
     return te.EgoStitchData(
         train_nodes=list(_NODES),
-        e_sup_positives=[canonical_pair(u, v) for u, v in _POSITIVES[6:]],
+        training_positives=[canonical_pair(u, v) for u, v in _POSITIVES[6:]],
         val_pairs=[("n0", "n4"), ("n1", "n2"), ("n2", "n6"), ("n3", "n7")],
         val_labels=np.array([0, 1, 0, 0], dtype=np.int8),
         f0=torch.from_numpy(f0),

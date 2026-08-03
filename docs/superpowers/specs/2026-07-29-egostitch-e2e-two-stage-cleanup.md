@@ -1,5 +1,9 @@
 # EgoStitch E2E: two-stage cleanup
 
+> **2026-08-03 data-contract disposition:** every message/supervision split in this
+> historical design is superseded by spec §9.3. Topology and classification now use the
+> same complete train-side positive interactions.
+
 > **Superseded 2026-07-30 by owner decision.** Qualification and every
 > qualification-to-formal or model-quality authorization gate described below are
 > retired. The active contract is the single-stage, plan-bound run in

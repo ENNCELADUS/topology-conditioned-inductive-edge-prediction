@@ -96,10 +96,10 @@ Devil's Advocate):
 - **(e) Hub policy for set decoding** [R3-W1/W2]: importance-weighted target
   subsampling with community-multiplicity counts, compound matching costs, denoising
   queries, and a budget trigger redefined in K-representable terms.
-- **(f) Leakage partition** [R1-W5]: structural targets (BP-NLL, degree NLL,
-  reconstruction) are computed on a message-edge set disjoint from `L_edge`
-  supervision edges; seam references are sampled label-agnostically; B0 provenance is
-  an E5 gate.
+- **(f) Shared interactions with leave-one-out** [R1-W5]: structural targets (BP-NLL,
+  degree NLL, reconstruction) and `L_edge` use the same complete train positives;
+  the queried partner is explicitly removed from per-pair reconstruction targets and
+  degree counts. Seam references are sampled label-agnostically; B0 provenance is an E5 gate.
 - **(g) Goodhart split** [R1-W7]: assembled-graph metrics are partitioned into
   trained-on and held-out families; the held-out family is headlined.
 - **(h) Full loss tree** [R1-W1]: every sub-loss assigned a weight under the four
@@ -327,7 +327,7 @@ retrieved + thresholded (unsupervised echo) ≠ generated + realism-trained + ha
 | R6 | Carry explicit **degree budgets** and **community/block priors** into every decision; enforce the budget as a hard constraint **at the scaffold level** and measure its transmission to assembly | §1.6, §1.7; NOCD 1909.12201; EDGE 2305.04111 (degree-first factorization); MaskGAE degree decoder 2205.10053; DC-SBM (Karrer & Newman 2011) as the classical ancestor of the `d̂`+block channel |
 | R7 | Apply the **labeling trick** on the scaffold (anchor labels for `i`,`j`) — the most expressive pair-aware readout *of the generated context* (§5.4) and the theoretically grounded implementation of the queried-edge masking gate | §1.9; 2010.16103; Distance Encoding 2009.00142 ⊕ |
 | R8 | Generation must be **label-agnostic** (no edge-hypothesis conditioning), including all realism-loss reference sampling | TDE 2002.11949; SGG bias evidence 1711.06640; §4.5 seam-reference rule |
-| R9 | Negative sampling **after** masking; queried endpoint removed from reconstruction targets; structural targets computed on a **message-edge partition disjoint from supervision edges** | vault masked-edge report; [R1-W5] |
+| R9 | Negative sampling **after** masking; queried endpoint explicitly removed from reconstruction targets; topology and classification otherwise use the **same complete training interactions** | vault masked-edge report; [R1-W5] |
 | R10 | Per-node computation should be **cacheable across queries** (amortization), with the per-pair marginal cost stated honestly against B0, not against the old scaffold | protocol §0; [R3-W9] |
 | R11 | The stitched scaffold must be **seam-consistent**, via a *trained* joint refinement procedure (train/test-matched conditionals) | RePaint 2201.09865; MaskGIT 2202.04200; [R3-W4] |
 | R12 | The reconstruction pretext must be **train/test-matched**: mask *entire* ego-networks (the zero-edge inference condition), mask structurally coherent units, and train all conditioning patterns used at inference (including cross-ego conditionals and dropout nulls) | pix2gestalt 2401.14398; MAE 2111.06377; MaskGAE Prop. 1; [R3-W4] |
@@ -406,7 +406,7 @@ step 2:  ego-net imagination   S_u = {(h_u^k, π_u^k)} = Imagine(x_u, z_u, r_u, 
 step 3a: stitch                T̂⁰_ij = Stitch(S_i, S_j, {i, j})                   (per pair)
 step 3b: consensus             T̂_ij  = Harmonize(T̂⁰_ij | d̂_i, d̂_j, R rounds)     (per pair, trained module)
 step 4:  encode + decide       t = STE(T̂_ij)   # structure-only token states (§4.4)
-         p_ij = σ(head(Trunk(tok_i, tok_j | t, c_content)))                       (per pair; rev 3.0)
+         p_ij = σ(head(Trunk(tok_i, tok_j | t)))                                  (per pair)
 ```
 
 The per-query local scaffold boundary is unchanged: `T̂_ij` is a local topological
@@ -431,11 +431,11 @@ Seeds fix the sample set, making inference reproducible.
   neighbor is.
 - **Overlapping community affiliation:** `F_u = softplus(MLP_F([x_u; z_u])) ≥ 0`,
   trained with the NOCD Bernoulli–Poisson likelihood on the training graph's
-  **message-edge partition** (R9), class-balanced negatives. The encoder is the
+  full loopless training topology (R9), with class-balanced negatives. The encoder is the
   feature-only MLP form (never graph-conditioned), so affiliations exist for zero-edge
   unseen nodes by construction — the property the whole channel depends on (§3C).
 - **Degree budget:** `d̂_u = softplus(MLP_deg([x_u; z_u]))`, trained with NLL against
-  message-partition degrees, **normalized as expected degree per unit candidate-universe
+  full training-topology degrees, **normalized as expected degree per unit candidate-universe
   density** so budgets transfer across evaluation scales (train graph vs 20–200-node
   buckets vs Benchmark-B/C; [R1-W11-iii, R2-Q8]). MaskGAE's degree decoder 2205.10053
   is the cited prior for auxiliary degree supervision; EDGE for degree-first
@@ -478,7 +478,7 @@ cited as related set-decoding lineages, not as additional components.
   embedding `h_u^k` (in a projection of frozen-feature space), existence probability
   `π_u^k`, a **multiplicity weight** `m_u^k ≥ 1` (hub policy, below), and a grounding
   gate `g^k ∈ [0,1]` with a pointer over `G(u)`. **The grounding gate is trained as a
-  partner-vs-peer discriminator** [R3-W8]: against the message partition, `g^k` is
+  partner-vs-peer discriminator** [R3-W8]: against the full training topology, `g^k` is
   supervised to predict *adjacency plausibility* of the candidate (is this candidate
   actually a neighbor type, not merely feature-similar), so grounded slots earn trust
   from evidence rather than retrieval rank. Parametric conditioning remains primary
@@ -507,7 +507,7 @@ cited as related set-decoding lineages, not as additional components.
   connectivity between matched community groups) to be robust to near-duplicate
   assignment flips [R3-W2]; a Bandana-style continuous bandwidth form (2402.03814) is
   the registered alternative.
-- **Training — masked ego-net reconstruction** on the message partition (R9, R12):
+- **Training — masked ego-net reconstruction** on the full training topology (R9, R12):
   hide node `u`'s **entire** neighbor set — the total-masking limit matches the
   zero-edge inference condition, which no masked graph autoencoder trains (§5) — and
   mask structurally coherent units in curricula (pix2gestalt lesson). Hungarian
@@ -556,8 +556,9 @@ inpainting: locally plausible, globally wrong, with the error concentrated at th
 generated ego-nets.
 
 **Joint training task (the fix for the untrained-conditional gap [R3-W4/W6]).** During
-training, sample message-partition pairs `(u, v)` (both adjacent and non-adjacent,
-label-agnostically; R8), build both ego-nets, mask each side at a scheduled ratio, and
+training, sample from the `V_fit` pair universe `(u, v)` (50% from `E_topo`, 50%
+random train-node pairs, label-agnostically; R8), build both ego-nets, mask each
+side at a scheduled ratio, and
 train the decoder to re-decode its masked slots conditioned on `[x_u; z_u; r_u]`, its
 own kept slots, *and the partner's kept slots* (a dedicated cross-ego input channel,
 with `Π` computed on the fly). This makes inference-time harmonization query
@@ -598,6 +599,11 @@ warm-start. A half-page algorithm box with tensor shapes is a deliverable of gat
 §6.0-G4 before implementation.
 
 ### 4.4 Module 4 — Stitched-topology-conditioned pair encoder **[rev 3.0, 2026-07-16]**
+
+> **Historical rev-3.0 architecture, superseded 2026-08-02.** The current
+> three-component model deletes the separate content pathway; see the active
+> successor update in §6.0 and spec §14.4.6–14.4.7. The details below are retained
+> only to interpret the completed 2026-07-24 screen.
 
 The rev-2.2 head — frozen B0 `pair_logit` anchor plus logit-level gated-residual
 fusion of scalar channels `s1..s4` — is replaced. Motivations: (i) the frozen
@@ -656,7 +662,7 @@ non-message-passing, and **degree-preserving rewiring** controls (the decisive a
 to "is the STE encoding topology or a continuous latent code disguised as a graph",
 given π/m/Â/Π are all feature-derived); (iii) *representation evidence* — frozen-STE
 linear probes to real degree / ego density / clustering / `Π`-consistency on held-out
-message-partition nodes, **with degree-partialled variants** (degree bias dominates LP
+train-side nodes, **with degree-partialled variants** (degree bias dominates LP
 signals: 2405.14985, 2310.04612); (iv) the pre-registered prediction that topology
 conditioning adds value precisely on low-FCR benchmarks and tail-degree strata
 (Cold Brew FCR, §6.4.9) stands unchanged — if it does not, `Ours → B5` and §6.5's
@@ -714,7 +720,7 @@ HPO-parity protocol (§6.5):
   + **VQ commitment/codebook losses** + **code-supervision head** (ego-net statistics
   from `z_u`) + **code-usage entropy regularizer** (the two former orphans, now owned
   here) + the joint two-ego harmonization task (§4.3b). All structural targets on the
-  message partition (R9).
+  shared training interactions, using their loopless topology projection (R9).
 - `λ_real · L_real` (distributional): energy distance between generated and real
   ego-net statistic vectors (degree, clustering, code histogram, motif conductance);
   energy distance in untrained random-GIN embedding space (2201.09871); the **seam
@@ -1024,13 +1030,12 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   frozen-s0 scalar fusion is retired to motivating-arm + ablation status. The rev-3.0
   conditioned encoder is now the active G5 build line; see
   `docs/results/G5-stage1-seed0-20260717.md`.
-  *Active successor update 2026-07-30 (rev 3.2):* the five-arm rev-3.0 scope above
-  describes the completed historical screen only. The active contract is the
-  single-stage, plan-bound eight-arm screen in spec §13.19.4 and §14.4.6: six trained
-  checkpoints plus two scoring-time controls. Model-quality predicates are telemetry
-  only; plan identity and run artifact provenance remain binding. The v4 registration
-  remains `DRAFT`, so this update
-  authorizes implementation but no formal execution.
+  *Active successor update (rev 3.2):* the five-arm rev-3.0 scope above describes
+  the completed historical screen only. The active contract is the seven-arm
+  direct-run screen in spec §14.4.6–14.4.7: five trained checkpoints plus two
+  scoring-time controls. The content pathway is deleted, so `pair_topology` is
+  retired as identical to `full`. There is no registration or plan-identity gate;
+  checkpoint, score, and G5 provenance bind the shared training-interaction contract.
 
 ### 6.1 Method rows
 
@@ -1175,8 +1180,8 @@ quality).
 ### 6.5 Integrity, parity, and decision rules **[protocol-Δ]**
 
 - All five existing gates hold; gate 4 is strengthened (label-agnostic generation +
-  endpoint removal + anchor labeling). New gates: **message/supervision edge
-  partition** for all structural losses [R1-W5-i]; **label-agnostic seam references**
+  endpoint removal + anchor labeling). New gates: **shared training-interaction identity
+  plus per-query leave-one-out** for all structural losses [R1-W5-i]; **label-agnostic seam references**
   [R1-W5-ii]; **B0 provenance audit** (the frozen scorer must never have seen
   validation/test pairs) [R1-W5-iii].
 - **HPO parity:** a pre-registered, equal tuning budget per baseline, recorded before
@@ -1215,8 +1220,8 @@ block-model marginals close most of the pair-to-topology gap") if the controls w
 | Harmonization train/inference mismatch | joint two-ego training task (§4.3b) — harmonization conditionals trained by construction; R12 |
 | CVAE posterior collapse / mode-seeking imagination | free-bits + KL annealing; diversity diagnostic; SIG-VAE-style richer posterior as fallback; s1–s3 correlation watch |
 | Generator becomes `L_edge`'s covert channel (realistic-looking but discriminatively-warped ego-nets) | held-out ego-net fidelity diagnostics (§6.4.8a) reported alongside headline metrics; `L_recon` weight floor; G5 staging isolates when it happens |
-| Imagined neighbors leak the queried label | label-agnostic generation; endpoint removed from targets; message/supervision partition; `∅_content` counterfactual reported |
-| s3 train-time quasi-oracle (structural targets contain supervision edges) | message-edge partition (R9) + leave-one-out corrections; E5 gate |
+| Imagined neighbors leak the queried label | label-agnostic generation; queried endpoint explicitly removed from targets; `∅_content` counterfactual reported |
+| s3 train-time quasi-oracle (the classified interaction is present in the shared topology) | explicit per-query leave-one-out targets and degree correction (R9); E5 gate |
 | Community prior shortcut (context overrides pair) | gated fusion + counterfactual control; hard negatives |
 | Content pathway carries the win / topology gates stay dead [rev 3.0] | pathway-attribution rule (§4.4) is a headline requirement; gate-magnitude + per-branch gradient telemetry; branch dropout; FCR-stratified pre-registered prediction; §6.5 decision rule (ii) |
 | STE encodes a latent code disguised as a graph (π/m/Â/Π are feature-derived) [rev 3.0] | degree-preserving rewiring is the decisive control; edge-shuffle / DeepSets-reduction / matched-capacity-no-MP battery; degree-partialled representation probes |

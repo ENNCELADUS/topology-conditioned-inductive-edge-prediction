@@ -57,7 +57,7 @@ stats_u = MLP_2(d_z → 4)(z_u)   # code-supervision head: [deg, clustering,
   β = 0.25; code-usage entropy regularizer weight in §7.
 - Degree NLL: lognormal parameterization (μ, σ from a 2-head MLP) — heavy-tailed
   degrees; the table above shows the mean head.
-- All structural targets computed on the **message partition** (§6).
+- All structural targets computed on the **full shared training topology** (§6).
 
 ## 2. Module 2 — Imagine (per node, cached; DETR-style decoder)
 
@@ -141,8 +141,9 @@ for r = 1..R:
 Output: T̂_ij; diagnostic: slot-agreement trajectory agree_r = Σ Π_{kk'} conf_k conf_{k'}
 ```
 
-**Joint training task:** sample message-partition pairs (u,v) — 50% adjacent / 50%
-random (label-agnostic, R8) — mask each ego-net at ratio ~ U(0.3, 1.0), run 1–2
+**Joint training task:** sample from the `V_fit` pair universe — 50% from
+`E_topo`, 50% random train-node pairs (label-agnostic, R8) — mask each ego-net
+at ratio ~ U(0.3, 1.0), run 1–2
 harmonization rounds, supervise re-decoded slots by the §2 matching losses.
 **Gradient estimators:** keep/re-mask = straight-through on the binary keep mask;
 budget trigger = detached comparison + soft mirror penalty
@@ -151,12 +152,12 @@ critic trained with its own BCE, gradients not propagated into h (detached input
 
 ## 5. Module 4 — Decision head (per pair)
 
-**Rev 3.0 headline (family `egostitch_e2e`, normative since 2026-07-17):** the
+**Current headline (family `egostitch_e2e`, updated 2026-08-02):** the
 decision head is a from-scratch V3.1-class pair encoder conditioned on the stitched
 topology — no frozen B0 anchor, no `s0`:
 
 ```text
-p_ij = σ( head( Trunk(tok_i, tok_j | STE(T̂_ij), c_content) ) )
+p_ij = σ( head( Trunk(tok_i, tok_j | STE(T̂_ij)) ) )
 ```
 
 - **Trunk:** Siamese token encoder + pair cross-attention over the raw token
@@ -169,7 +170,7 @@ p_ij = σ( head( Trunk(tok_i, tok_j | STE(T̂_ij), c_content) ) )
   grounding embeddings `g`, no grounded-identity-match flag. Edge weights: star
   edges `π·m`, intra-side `Â_i`/`Â_j` weighted by `π` outer products, and the
   alignment plan `Π`. `ste_layers` edge-weighted message-passing layers
-  (defaults §13.18); **token-level output** — one conditioning token per slot and
+  (defaults §14.3); **token-level output** — one conditioning token per slot and
   per endpoint (the promoted `s4` lineage: the pooled scalar summary is replaced
   by tokens).
 - **Conditioning:** zero-initialized tanh-gated cross-attention
@@ -177,33 +178,23 @@ p_ij = σ( head( Trunk(tok_i, tok_j | STE(T̂_ij), c_content) ) )
   the only query**, injected after the final `n_inj ∈ {1, 2}` pair-cross-attention
   blocks (default 1). The AB and BA directions share STE and cross-attention
   parameters before `abba_max`.
-- **`c_content` (separate ablatable pathway):** each side's slot token appends the
-  former-s1 counterpart-membership value
-  `q_u^k = -||norm(h_u^k)-norm(proj(x_other))||^2/tau_kappa + log(pi_u^k m_u^k)`
-  (learned positive `tau_kappa`, shared historical projection), plus the
-  grounded-identity-match flag, through its own zero-init gated cross-attention.
-  `q` is content/compatibility evidence and is forbidden from `c_topo`. The
-  topology-representation claim must survive removal of this pathway (protocol
-  E4.15).
-- **Three mutually exclusive head nulls** (train = per-pair multiplicative masks at
-  `p_topo`/`p_cont`, eval = batch-level hard bypass; the residual sublayer form
-  makes the two numerically identical — required unit test; `p(i,j) = p(j,i)` under
-  every null): `∅_all_head` (skip both pathways → pair-only `f_logit`),
-  `∅_topo_head` (skip STE + topology x-attn → pair+content), `∅_content_head`
-  (skip content x-attn → pair+topology). The `_head` namespace is disjoint from
-  the §2 conditioning-dropout decoder nulls.
-- **Four logits published per scored pair:** full, `f_logit`, pair+content,
-  pair+topology (§13.16 fp32 pin applies to all four).
+- **No separate content pathway:** slot semantics supervise the generator and help
+  construct the typed scaffold, but complete slot-content tokens never directly
+  condition the classifier.
+- **Topology null:** training uses the per-pair topology mask `p_topo`; evaluation's
+  `∅_all_head` hard bypass yields the pair-only `f_logit`. Symmetry and mask/bypass
+  equivalence remain required tests.
+- **Two logits published per scored pair:** full and `f_logit` (§13.16 fp32 pin
+  applies to both).
 
-Channel disposition (rev 2.2 → 3.0): `s4` is promoted into the STE; `s1` feeds
-`c_content`; `s0` is retired (§13.10); `s2` remains a training-side diagnostic and
+Channel disposition: `s4` is promoted into the STE; the former direct `s1` content
+path is retired; `s0` is retired (§13.10); `s2` remains a training-side diagnostic and
 probe target; `s3` remains a Stage-2 STE input.
 
 **Retired anchored head** (frozen-s0 family `egostitch`; motivating result and E4
 ablation arm only — binding `cut` verdict 2026-07-17,
 `docs/results/G5-stage1-seed0-20260717.md`):
 
-```text
 ```text
 s0 = pair_logit(i, j)                                    # frozen B0
 s1 = ½[ lse_k(κ(h_i^k, proj(x_j)) + log π_i^k m_i^k) + (i↔j) ],
@@ -214,27 +205,27 @@ s4 = MLP_2([H_i; H_j; H_T; spec(T̂)])   from a 3-layer edge-weighted GNN over T
      (anchor-labeled; spec(T̂) = [λ_2, λ_max, triangle count, density] of T̂)
 p_ij = σ( s0 + g_θ(s1..s4) · w ),   g_θ = MLP_2(gate), w learned scalar init 0.1
 ```
-```
 
-Required diagnostic: the four-logit decomposition table (plus
-`topology_delta = full − pair+content` and `content_delta = full − pair+topology`
-summary statistics) with every headline table; the retired arm keeps its channel
-correlation matrix on its available channels `(s0..s4)`.
+Required current diagnostic: the two-logit decomposition (`full`, `f_logit`) plus
+`full − f_logit` summary statistics. The retired frozen-s0 arm keeps its historical
+channel correlation matrix on `(s0..s4)` only for interpreting that old result.
 
 ## 6. Data partitions and leakage rules
 
-- Training graph edges split **80% message / 20% supervision** (per seed). All
-  structural targets (reconstruction, degree NLL, BP-NLL, code stats, seam references,
-  critic training) use message edges only; `L_edge` positives/negatives come from
-  supervision edges (+ post-masking negatives). Leave-one-out: when a supervision pair
-  (u,v) is in the batch, v is excluded from u's targets and |N(u)| decremented.
-- Seam references: unions of message-partition ego-net pairs sampled 50/50
+- **The same complete set of train-side positive interactions is used for topology
+  learning and edge classification.** Structural targets (reconstruction, degree NLL,
+  BP-NLL, code stats, seam references, critic training) and `L_edge` positives are both
+  derived from `E_train+`; there is no message/supervision partition. The loopless
+  topology projection drops self-pairs, while classification retains them (§9.4).
+  Leave-one-out remains mandatory: when a positive pair (u,v) is in the batch, v is
+  excluded from u's reconstruction targets and |N(u)| decremented.
+- Seam references: unions of training-interaction ego-net pairs sampled 50/50
   adjacent/random with labels marginalized.
 - B0 provenance audit is an E5 gate precondition. The E2 B0 scorer is
   pinned to the audited V3.1 `pair_context_gated` / `abba_max` / no-cross checkpoint
   family (`d_model = 512`, no spectral normalization) and trains from the fixed
   balanced `train_edges.txt` rows when a local retrain is required.
-- **Benchmark binding:** how the shipped artifacts map onto message/supervision/val,
+- **Benchmark binding:** how the shipped artifacts map onto shared training interactions/val,
   which shipped files are quarantined, and the self-loop policy are fixed in §9 —
   §9 is normative wherever the shipped artifacts differ from the abstract wording
   above.
@@ -317,8 +308,11 @@ unordered pairs **plus all 2,018 self-pairs** (2,037,171 rows); its positives eq
 `test_graph.pkl` edge set exactly. `test_node_buckets.pkl` = 50 node subsets at each
 size {20, 40, …, 200} for bucketed assembled-graph evaluation.
 
-Identities verified: `train_graph.pkl` edges = train⁺ ∪ val⁺ exactly (val⁺ is the
-20% complement of train⁺); train/val/test negatives ∩ global positives = ∅.
+Identities verified: `train_graph.pkl` edges = benchmark train⁺ ∪ val⁺ exactly
+(val⁺ is the benchmark's model-selection complement, never a training target);
+train/val/test negatives ∩ global positives = ∅. Within `V_fit`, topology and
+classification both consume the same complete `train_edges.txt` positive set;
+`val_edges.txt` positives are used only to prevent false-negative sampling.
 
 **Benchmark-A/B/C ↔ strategy mapping** is recorded in the run metadata. The completed
 canonical-metric G1 rerun uses `Benchmark-A = breadth_first`, checkpoint
@@ -351,16 +345,15 @@ indexed nodes). `index.json` maps node id → content-addressed `.pt` path.
 3 train pairs + 1 val pair touch them → dropped at load, counts logged). The 105
 indexed nodes absent from the graph are inert.
 
-### 9.3 Partition binding (message / supervision / val)
+### 9.3 Training-interaction and validation binding
 
-The shipped artifacts do **not** ship the §6 message/supervision partition; it is
-derived at load, per seed:
+The shipped train rows bind one shared positive-interaction set:
 
 ```text
 E_train⁺ := positives of train_edges.txt            (per strategy)
-E_msg    := seeded 80% of E_train⁺ ;  E_sup := the remaining 20%
-G_struct := simple graph (V_train, E_msg \ self-loops)     # ALL structural targets
-L_edge positives := E_sup (self-pairs included, §9.4)
+E_topo   := E_train⁺ \ self-loops                    # loopless topology projection
+G_struct := simple graph (V_train, E_topo)           # ALL structural targets
+L_edge positives := E_train⁺                         # same interactions; self-pairs retained
 val_edges.txt    := model selection only (VAL-CRITERION, §8) — never a target
 ```
 
@@ -377,8 +370,8 @@ val_edges.txt    := model selection only (VAL-CRITERION, §8) — never a target
    At most a clearly-labeled comparability appendix row.
 
 **Prospective v2 internal topology holdout (§13.19 only).** After deriving simple
-`G_msg=(V_train,E_msg \ self-loops)`, construct two 256-node connected holdouts before
-training. `V_qual` is the first 256 nodes of deterministic BFS in `G_msg`'s largest
+`G_train=(V_train,E_topo)`, construct two 256-node connected holdouts before
+training. `V_qual` is the first 256 nodes of deterministic BFS in `G_train`'s largest
 component, seeded by the node minimizing `sha256("g5-v2-qual|"+node_id)` and ordering
 each frontier by the same hash. Remove `V_qual`; `V_select` is constructed identically
 on the largest remaining component using prefix `g5-v2-select|`. Ties between
@@ -387,19 +380,20 @@ node. `V_qual` and `V_select` are node-disjoint by construction (asserted all-ze
 `OverlapProof`) and both are already subtracted from `V_fit`; **`V_hold := V_qual ∪
 V_select`** is the single 512-node validation holdout used by the formal plan.
 Because `V_hold` is exactly this union,
-defining it changes nothing about `V_fit`: **`V_fit`, `e_msg_fit`, `e_sup_fit`,
-`G_fit`, and `rho_train` are unchanged — bit-identical to the two-holdout
-definition** — so no `V_fit`-side cache, pack, or feature-stats digest is
-invalidated, and results stay comparable to the v2/v3 baselines. (The
+defining it changes nothing about `V_fit`: **`V_fit`, `E_train⁺[V_fit]`,
+`G_fit`, and `rho_train` are unchanged relative to the former two-holdout
+definition under this same shared-interaction contract**. The 2026-08-03 removal of
+the 80/20 split itself changes the holdout graph and therefore invalidates all older
+`V_fit`-side caches, packs, feature-statistics digests, and result comparability. (The
 `V_qual`/`V_select` grounding universes are themselves replaced by `V_hold` at
 §13.12 — a deliberate role-universe change, not an invalidation of `V_fit`-side
 state.) The v2 training contract replaces `G_struct` with the induced
-`G_fit=(V_fit, E_msg[V_fit] \ self-loops)` and restricts `E_sup` training positives
-to both endpoints in `V_fit`; all `V_fit`↔`V_hold` cross-partition
-message/supervision edges — i.e. edges with exactly one endpoint in `V_hold` — are
-quarantined from training. The within-holdout cross-side edges (between `V_qual` and
+`G_fit=(V_fit, E_train⁺[V_fit] \ self-loops)` and restricts classification positives
+to the same interactions with both endpoints in `V_fit`; all `V_fit`↔`V_hold`
+cross-partition interactions — i.e. positives with exactly one endpoint in `V_hold` —
+are quarantined from training. The within-holdout cross-side edges (between `V_qual` and
 `V_select`) are **not** quarantined; they are `V_hold`'s evaluation-only topology
-labels, exactly like the within-`V_qual` and within-`V_select` edges. `E_msg[V_hold]`
+labels, exactly like the within-`V_qual` and within-`V_select` edges. `E_topo[V_hold]`
 — which includes edges within each of `V_qual`/`V_select` and the cross-side edges
 between them — is `V_hold`'s evaluation-only topology label, used for formal
 checkpoint selection. `V_hold`'s nodes, edges, and full
@@ -412,10 +406,11 @@ overlap, are required before v2 binding. This internal holdout does not alter th
 frozen external test protocol.
 
 Density normalization (`ρ_eval/ρ_train`, §1): ρ := |E⁺| / (C(|V_side|,2) + |V_side|)
-on the matching universe. Measured full-train ρ_train (random_walk) = 1.354e-3 vs
-ρ_eval = 1.485e-2 — an **~11× train→test density shift** (mean simple degree 9.4 →
-28.3); per-seed ρ_train is computed on `E_msg` at load. Because true test density is
-**not observable** under the strict gate, the inference-time ratio is pinned as:
+on the matching universe. The former random-walk `ρ_train = 1.354e-3` and **~11×**
+shift were measured under the retired 80/20 contract and must not be reused. Under
+the corrected contract, `ρ_train` is recomputed and recorded from `E_topo[V_fit]` for
+the active strategy and holdout. Because true test density is **not observable** under
+the strict gate, the inference-time ratio is pinned as:
 
 - **default — self-calibrated, two passes:** pass 1 runs the candidate universe with
   ratio 1 and no budget re-scale; ρ̂_eval := Σ p⁰_ij / |candidates| (model outputs
@@ -460,11 +455,11 @@ process (defaults sweep ±2×):
 | Stream | Source | Default | Feeds |
 |---|---|---|---|
 | node stream | uniform over V_train (`accelerator.prepare`, §11.0) | B_n = 256 nodes | L_recon, L_ssl |
-| joint-pair stream | 50% E_msg edges / 50% random train pairs (§4) | B_p = 128 pairs | L_joint |
-| edge stream | E_sup positives + resampled negatives | frozen-s0: B_e = 512 pairs/rank; packed-token E2E: B_e = 128 pairs/rank (both 1:5) | L_edge |
+| joint-pair stream | 50% E_topo edges / 50% random train pairs (§4) | B_p = 128 pairs | L_joint |
+| edge stream | E_train⁺ positives + resampled negatives | frozen-s0: B_e = 512 pairs/rank; packed-token E2E: B_e = 128 pairs/rank (both 1:5) | L_edge |
 
 Curriculum (§8) toggles streams: stage 1 node-only; stage 2 node + joint; stage 3
-all. An **epoch** = one full pass over E_sup in the edge stream; node and joint
+all. An **epoch** = one full pass over `E_train⁺[V_fit]` in the edge stream; node and joint
 streams cycle independently.
 
 ### 10.2 Negative sampling (training)
@@ -581,6 +576,14 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   the self stratum is single-class (AUROC/AUPRC undefined, emitted as null) and the
   non-self stratum sits at AUROC `0.6883` / AUPRC `0.6894` against the
   self-loop-including `0.7067` / `0.7316`.
+- 2026-08-03 (owner decision; data-contract correction): removed the seeded 80/20
+  message/supervision split. Topology learning and edge classification now consume the
+  same complete `E_train+` interaction set; only the already-pinned loopless topology
+  projection removes self-pairs. The internal `V_hold` is consequently derived from the
+  full training topology. This supersedes every contrary message/supervision clause in
+  this document and invalidates all packs, caches, digests, thresholds, and results
+  produced under the former split; they remain historical evidence only and are not
+  comparable to runs under this contract.
 - 2026-08-03 (owner decision): B0-alt withdrawn as a baseline family. The mature B0
   (V3.1) is now the sole baseline going forward; `03-experiment-protocol.md` §2's
   baseline-hierarchy table and its E3 run list, and `04-model-proposal.md` §6.0 G1's
@@ -603,9 +606,9 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   per-dimension z-scoring mechanism the ablation arm the §4.6 anti-grab-bag
   rule requires. The two scoring-time controls are unchanged. Probe
   (`egostitch_e2e_probe_v2`) and scores-meta (`egostitch_e2e_scores_v3`)
-  versions do not bump: the array ABI and provenance fields are unchanged, and
-  the arm-enum plus registration-SHA validation already rejects
-  stale-schema artifacts. Registration v5 pins this schema. Rationale: the
+  versions did not bump at that time. This historical registration-era claim
+  is retired by the 2026-08-03 shared-interaction contract and the current
+  `egostitch_e2e_scores_v4` provenance checks. Rationale at the time: the
   formal screen must attribute each critical mechanism — conditioning as a
   whole, the content pathway, branch dropout, `L_rel`, and D0 feature
   standardization — to an arm it owns.
@@ -735,7 +738,8 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   two: **qualification** and **formal**. Both train on the full `V_fit`
   universe and differ only in `optim.epochs`; a single 512-node holdout
   `V_hold := V_qual ∪ V_select` validates and selects checkpoints for both, so
-  `V_fit`, `e_msg_fit`, `e_sup_fit`, `G_fit`, and `feature_stats_sha256` stay
+  `V_fit`, the then-named `e_msg_fit`/`e_sup_fit` partitions, `G_fit`, and
+  `feature_stats_sha256` stayed
   bit-identical to the two-holdout definition. The qualification verdict is
   telemetry-completion-only for finite model-quality signals; only non-finite,
   DDP, boundary, coverage, and I/O/infrastructure failures abort it. Checkpoint
@@ -1327,7 +1331,9 @@ verdict `cut`). Their implementing code — the frozen-s0 `egostitch` family,
 its Stage-1 training/DDP path, and `frozen_s0` scoring mode — is retired from
 the codebase under the two-stage cleanup (§12, 2026-07-29 entry). This
 section remains citable and comprehensible as the record of what that screen
-ran; no future run may cite it as authorization.
+ran; no future run may cite it as authorization. Its 80/20
+message/supervision-partition data contract is retired and its results are not
+comparable to the shared-training-interaction contract adopted 2026-08-03.
 
 Gate G5 (protocol §5.0.5) builds the model in three mechanism stages. The frozen
 sections above pin the *full* model; this section pins the **Stage-1 subset** —
@@ -1656,13 +1662,14 @@ persisted in metrics/run metadata, and required (numeric, at least one probe row
 by the formal gate. The channel-scale series of this section read the available quantities
 (`f_logit`, pathway deltas) in place of `s1/s2/residual-vs-s0`.
 
-The required nonbinding representation evidence is a deterministic
+**Historical frozen-s0 probe provenance (retired; not an active implementation
+contract):** the required nonbinding representation evidence was a deterministic
 `egostitch_e2e_probe_v1` artifact generated from the selected full checkpoint
 after scoring and consumed by the gate. The producer accepts only the registered
 `arms.full.training` config, with `permanent_null = none` and the full-arm
 `p_topo = p_cont = 0.15`; the p0 arm is invalid even though it also has no
 permanent null. It is bound to checkpoint id, registration SHA-256, config hash,
-Seed 0, partition Seed 0, and `G_struct`. Node
+partition Seed 0 and full-`E_msg` `G_struct`. Node
 rows are every operative train node in sorted id order; pair rows are the 4,096
 non-self `E_msg` pairs with smallest `sha256("min(u,v)|max(u,v)")` (or all rows
 when fewer exist). It carries mean-pooled STE states and evaluator targets for
@@ -1690,7 +1697,12 @@ fatal and may not be converted into JSON `null`, ignored, or treated as a succes
 Kendall-fallback activation.
 
 
-### 13.18 E2E family pins (defaults, overrides, controls, enforcement)
+### 13.18 Historical E2E family pins (retired)
+
+> **Retired contract.** Everything in §13.18–§13.19 records the completed
+> registration-era topology+content screens. It must not configure a current run.
+> The active topology-only, direct-run contract is §14.1–§14.4.7; it has five
+> trained arms plus two scoring controls and no registration or plan-identity gate.
 
 Registered defaults for family `egostitch_e2e` (fixed for the Stage-1 screen; the
 named sweeps are reserved for E1/E3):
@@ -1817,9 +1829,9 @@ architecture (proposal §4.4; full decision trail and pins in
 Stage-1 screen and its retained implementation on `main`. That screen published a
 binding `cut` verdict on 2026-07-17, satisfying §14.3(1). **§5/§13 were rewritten to §14 on
 2026-07-17** (change-log entry above): §14 plus the rewritten §5/§13 are now the
-normative implementation contract for family `egostitch_e2e`. A formal e2e run
-requires an exact Stage-1 registration snapshot and records its SHA-256; registration
-status and empty run-produced-evidence placeholders are not execution gates.
+normative implementation contract for family `egostitch_e2e`, as amended by the
+2026-08-02 three-component refactor and §12 change log. Current e2e runs execute
+directly without a registration or plan-identity gate.
 
 ### 14.1 Architecture summary
 
@@ -1832,39 +1844,32 @@ c_topo = STE(T̂_ij)                # structure-only stitched-topology encoder o
                                   # anchor labels, π, m, soft degrees (NO h, NO g,
                                   # NO grounded-identity-match); 2–3 edge-weighted MP
                                   # layers (promoted s4 lineage); token-level output
-c_cont = ContentTokens(S_i, S_j)  # separate pathway: [h; π; g; grounded-identity-
-                                  # match; counterpart-membership] per slot
 inject: in the last N_inj ∈ {1, 2} pair-cross-attention blocks (default 1), the CLS
-        token cross-attends to c_topo and (separately) c_cont through zero-initialized
-        tanh gates, per direction (AB / BA, swapped anchor labels) BEFORE abba_max;
+        token cross-attends to c_topo through a zero-initialized tanh gate, per
+        direction (AB / BA, swapped anchor labels) BEFORE abba_max;
         AB/BA share STE and attention parameters; branch masks are per pair, shared
         across directions
 p_ij  = σ(head(z'_pair))
 ```
 
-Scaffold/content construction fails closed unless both sides have equal slot
-counts, `Π` is exactly `(B,K,K)`, every matched/membership array is exactly
-`(B,K)`, and all tensors share the same batch size.
+Scaffold construction fails closed unless both sides have equal slot counts, `Π`
+is exactly `(B,K,K)`, and all tensors share the same batch size.
 
-### 14.2 Null taxonomy (three mutually exclusive head nulls; checkpoint-exact)
+### 14.2 Topology null (checkpoint-exact)
 
 | Null | Skips | Yields |
 |---|---|---|
-| `∅_all_head` | STE + topology XAttn + content XAttn | pair-only `f_logit` |
-| `∅_topo_head` | STE + topology XAttn | pair + content |
-| `∅_content_head` | content XAttn | pair + topology |
+| `∅_all_head` | generator/scaffold topology conditioning | pair-only `f_logit` |
 
-Training realizes nulls as per-pair multiplicative masks (probabilities
-`p_topo = p_cont = 0.15` default, sweep 0.1–0.2, plus `p = 0` arms); evaluation uses
+Training realizes the null as a per-pair multiplicative mask (`p_topo = 0.15`
+default, plus the `p0` arm); evaluation uses
 batch-level hard bypasses; residual sublayer form makes the two numerically identical
 (required unit test), as is `p(i,j) = p(j,i)` under every null. Disclosed
 2026-07-23: the frozen V2 mask realization derives its dropout randomness
 without the DDP rank, so per-step mask draws are correlated across ranks
-(identical per local batch index); expected rates are unchanged, the property
-is identical across arms, and any correction is deferred to a future versioned
-registration (§12 change log). The `_head` namespace
-is disjoint from the §2 conditioning-dropout `∅_content` / `∅_all` (decoder nulls).
-All four logits (full + three nulls) are published per scored pair; the §13.16 fp32
+(identical per local batch index); expected rates are unchanged. The `_head`
+namespace is disjoint from the §2 decoder nulls.
+Both logits (full + `f_logit`) are published per scored pair; the §13.16 fp32
 pair-pass pin extends to trunk, STE, gates, and head
 (`egostitch_e2e_pair_fp32_v1`); §13.17 liveness signals re-register against the
 within-checkpoint `f_logit` (no frozen-s0 comparator artifact); the §13.10 s0 logit
@@ -1873,9 +1878,9 @@ cache is retired for this family.
 ### 14.3 Implementation and experiment-plan record
 
 The items below document the architecture and experiment-plan lineage. They are
-not a registration-status or evidence-completeness preflight. Formal launcher
-preflight is limited to the live repository/runtime boundary, clean checkout,
-exact registration/config/frozen-input identity, and exactly four visible H20s.
+not a registration-status or evidence-completeness preflight. Current runs execute
+directly through `hpc/run.sh train`; runtime and data provenance fail closed in the
+produced checkpoint and artifacts.
 
 1. Frozen-s0 screen published (its outcome is the successor's motivating arm).
    **Satisfied 2026-07-17:** binding verdict `cut`; result note
@@ -1885,11 +1890,12 @@ exact registration/config/frozen-input identity, and exactly four visible H20s.
    {1, 2}).
    **Satisfied 2026-07-17:** §5/§13 rewritten (change-log entry); §13.18 landed
    with the defaults, `permanent_null` overrides, and `shuffle_within_pair` control.
-3. Fresh v4 registration with the eight-arm scope in §14.4.6 (six trained
+3. **Historical registration-era requirement, retired 2026-08-03:** fresh v4
+   registration with the eight-arm scope then present in §14.4.6 (six trained
    checkpoints plus two scoring-time controls), the four-logit decomposition
    report, the representation-probe protocol (degree / ego density / clustering +
    degree-partialled + Π-consistency, frozen-encoder linear probes on held-out
-   message-partition nodes), the pathway-attribution decision rule, and a measured
+   then-named message-partition nodes), the pathway-attribution decision rule, and a measured
    H20 cost re-estimate (the 673 s / 2.04 GiB frozen-s0 Stage-1 profile does not
    extrapolate; budget class is the E2 B0 run). The v4 registration status is
    descriptive; runtime and peak-memory evidence are emitted by the formal run.
@@ -1931,7 +1937,7 @@ edge decision (`docs/lit-review-plan.md` §5).
   most one Hungarian-matched slot; `τ_div = 0.5` initial.
 - **`L_rel`**: a 2-layer head on the STE AB-direction pair state (mean over
   scaffold tokens) predicts `log1p(common-neighbor count)` and neighborhood
-  Jaccard, computed from the training message graph **independently for every
+  Jaccard, computed from the shared training topology **independently for every
   pair, positive and negative** (a sampled non-edge with common neighbors
   receives its true nonzero targets — required regression motif). Huber loss.
   The head is excluded from every scored logit; `L_rel` is its own telemetry
@@ -1952,7 +1958,11 @@ edge decision (`docs/lit-review-plan.md` §5).
   `L_rel` targets use no RNG. The invariance contract is per-pair; negative
   stream composition remains `(seed, epoch, rank)`-drawn as in v2.
 
-#### 14.4.2 Architecture deltas
+#### 14.4.2 Historical rev-3.1 architecture deltas (superseded)
+
+> **Superseded by the 2026-08-02 three-component refactor.** §§14.4.2–14.4.5
+> retain the rev-3.1 lineage only; content-path, matched-content, `p_cont`, and
+> registration clauses below are not active implementation contracts.
 
 - **Soft matched flags**: with shared-id indicator `I[g_a, g_b]`,
   `M = p_a I p_b^T`, `matched_a[k] = gate_a[k] · max_l(M[k,l] · gate_b[l])`
@@ -2001,11 +2011,12 @@ reading it where the head has actually trained.
 #### 14.4.4 Grounding (supersedes the §13.12 value for this family)
 
 `n_g = 50`, exact top-`n_g` cosine within the node's §13.12 role universe.
-No reranker: the measured P0.2 curve (e_sup pair ceilings 0.095 / 0.134 /
-0.179 for cosine top-20/50/100; B0-alt rerank ≈ cosine at 2.5× pool size)
-fired the registered stop rule, and the delegated resolution re-scoped the
-grounded-identity chain to a **secondary** channel — every claim about it
-carries its measured ceiling (≈ 0.134 of e_sup positives at `n_g = 50`).
+No reranker. The former P0.2 curve (`e_sup` pair ceilings 0.095 / 0.134 /
+0.179 for cosine top-20/50/100; B0-alt rerank ≈ cosine at 2.5× pool size) was
+measured under the retired 80/20 contract. It remains historical evidence for
+the earlier design decision but is **non-binding and non-comparable** under the
+shared-interaction contract; the current grounding ceiling must be remeasured
+before it supports any new claim.
 Pool caches bind `pool_method_hash = H(method id, n_g, shortlist M when
 present, ordered F0/source-feature-pack digest, role-universe identity)`;
 loaders fail closed on any mismatch (regression tests: stale-method and
@@ -2052,29 +2063,17 @@ mutated-features-same-ids).
   retained; cross-process determinism; non-inertness on a random
   non-collapsed model.
 
-#### 14.4.6 v5 screen schema (eight arms)
+#### 14.4.6 Current screen schema (seven arms)
 
-Six trained checkpoints — `full`, `b0_e2e_f_only` (both conditioning
-pathways permanently nulled), `pair_topology` (content pathway permanently
-nulled), `p0` (identical to `full` except `p_topo = p_cont = 0`),
-`no_l_rel` (identical to `full` except `w_rel = 0`), `row_layernorm`
-(identical to `full` except `feature_standardization: row_layernorm`, the
-pre-D0 status-quo per-row LayerNorm; it binds no `feature_stats_sha256`
-and is the registered ablation of the §13.19.1 D0 per-dimension V_fit
-z-scoring) — plus two scoring-time controls over `full`'s checkpoint:
-`6a-v3`, `6e-v1`. Each trained arm owns exactly one mechanism axis:
-conditioning as a whole (`b0_e2e_f_only`), the content pathway
-(`pair_topology`), branch dropout (`p0`), the train-only relational
-auxiliary (`no_l_rel`), and D0 feature standardization (`row_layernorm`).
-`cosine_pool` (status-quo `n_g = 20` pools) is retired from the trained
-set per the 2026-07-30 §12 entry; the Phase-0 measured slot-recall
-ceilings carry the pool-width attribution. Every formal-arm constant,
-binding-evidence validator, scoring CLI/provenance enum, run-metadata
-schema field, and test fixture migrates to this schema and fails closed
-on the predecessor shapes. Artifact versions are unchanged
-(`egostitch_e2e_probe_v2`, `egostitch_e2e_scores_v3`): the array ABI and
-provenance fields do not move, and arm-enum plus registration-SHA
-validation rejects stale-schema artifacts.
+Five trained checkpoints — `full`, `b0_e2e_f_only`, `p0`, `no_l_rel`, and
+`row_layernorm` — plus the two scoring-time controls `6a-v3` and `6e-v1` over
+`full`'s checkpoint. The removed content pathway makes `pair_topology`
+identical to `full`, so that arm is retired. Current checkpoints,
+`run_metadata.json`, and `egostitch_e2e_scores_v4` artifacts must all bind
+`data_contract = shared_train_positives_v1` plus identical
+`training_interactions_sha256` and `training_topology_sha256` values. Old
+80/20-partition checkpoints and score artifacts fail closed and are not
+comparable to runs under this contract.
 
 #### 14.4.7 Probes and single-stage execution (extends §13.19)
 
@@ -2086,9 +2085,12 @@ pairwise `h` cosine, `Â` off-diagonal std, `Π` row entropy). These are output
 telemetry at each formal validation. They do not authorize or block training,
 checkpoint publication, scoring, evaluation, or plan binding.
 
-The formal run trains the registered schedule on `V_fit`, validates on
-`V_hold`, and is coupled only to the owner-bound plan and exact artifact
-identities described in §13.19.
+The formal run executes directly on `V_fit` and validates on `V_hold`. It uses
+the same complete `V_fit` training interactions for topology and
+classification, with per-query leave-one-out only when constructing the target
+for that queried positive. There is no preregistration or artifact-identity
+gate; checkpoint/scoring provenance enforces the shared-interaction data
+contract described in §9.3.
 
 #### 14.4.8 Telemetry and abort rules
 

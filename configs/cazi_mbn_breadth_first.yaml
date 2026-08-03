@@ -8,7 +8,6 @@ model:
 data:
   root: data
   strategy: breadth_first
-  partition_seed: 0
   f0_cache: outputs/f0_cache/all_operative_nodes.pt
   expected_missing_features:
     - node_004764

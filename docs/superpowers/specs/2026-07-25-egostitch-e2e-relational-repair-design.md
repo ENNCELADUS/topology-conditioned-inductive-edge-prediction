@@ -1,5 +1,9 @@
 # EgoStitch E2E Relational Repair: rev 3.1 Fix Design
 
+> **2026-08-03 data-contract disposition:** every message/supervision split in this
+> historical design is superseded by spec §9.3. Topology and classification now use the
+> same complete train-side positive interactions.
+
 **Status: DECIDED (owner-delegated, 2026-07-25).** This document specifies the
 rev-3.1 repair of the rev-3.0 e2e conditioned encoder after the binding
 2026-07-24 `cut` (`docs/results/G5-e2e-stage1-seed0-20260724.md`). The owner

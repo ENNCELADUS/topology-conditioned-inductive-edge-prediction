@@ -12,7 +12,7 @@ lambda 1e-3, 5-fold), plus degree-partialled variants and Pi-consistency").
 
 The rev-3.1 artifact additionally records direct alignment, grounding-pool
 recall, relational-state, and slot-dispersion measurements. Structural targets
-are always explicitly scoped to train-side ``E_msg``; no default can select a
+are always explicitly scoped to the train-side topology projection; no default can select a
 sealed universe.
 """
 
@@ -78,23 +78,21 @@ def build_probe_scope_context(
     *,
     data_root: Path,
     strategy: str,
-    partition_seed: int,
-    msg_fraction: float,
     expected_missing_features: Sequence[str],
 ) -> tuple[list[str], nx.Graph]:
-    """Rebuild the exact node set and message graph a probe scope authorizes.
+    """Rebuild the exact node set and shared-interaction graph a probe scope authorizes.
 
     ``formal_train`` is the only scope: every operative train node over the full
-    train-side ``E_msg``. Re-validating a written artifact must reconstruct that
+    train-side topology. Re-validating a written artifact must reconstruct that
     universe exactly, or :func:`evaluate_e2e_probe_artifact` would compare it
     against the wrong ``g_struct_sha256`` and the wrong stored targets.
 
     :func:`produce_e2e_probe_artifact` deliberately keeps its own inline
-    derivation because it additionally needs the partition and holdout objects
+    derivation because it additionally needs the shared interactions and holdout object
     for its per-role grounding caches.
     """
     from src import train_egostitch as te
-    from src.data.partition import build_g_struct, derive_partition
+    from src.data.partition import build_g_struct, derive_training_interactions
 
     if scope not in E2E_PROBE_SCOPES:
         raise ValueError(f"unsupported E2E probe scope {scope!r}")
@@ -103,10 +101,8 @@ def build_probe_scope_context(
         strategy_dir,
         expected_missing_features=expected_missing_features,
     )
-    partition = derive_partition(
-        train_positives, seed=partition_seed, msg_fraction=msg_fraction
-    )
-    return formal_nodes, build_g_struct(formal_nodes, partition.e_msg)
+    interactions = derive_training_interactions(train_positives)
+    return formal_nodes, build_g_struct(formal_nodes, interactions.topology_edges)
 
 
 def _validate_pi_consistency_inputs(
@@ -204,7 +200,7 @@ def probe_targets(graph: nx.Graph, nodes: Sequence[str]) -> dict[str, NDArray[np
     ``degree = deg(u)``, ``clustering = nx.clustering(G, u)``,
     ``ego_edges = |E(ego(u))|`` and ``ego_density = nx.density(ego(u))`` with
     ``ego(u) = G.subgraph(N(u) | {u})`` on the simple graph. Callers pass the
-    message-partition structural graph (``G_struct``, spec Sec 9.3) so probe
+    shared-interaction structural graph (``G_struct``, spec Sec 9.3) so probe
     targets never touch the target test graph.
 
     Args:
@@ -390,7 +386,7 @@ def g_struct_sha256(graph: nx.Graph) -> str:
 
 
 def select_probe_pairs(graph: nx.Graph, *, limit: int = _E2E_PAIR_LIMIT) -> list[tuple[str, str]]:
-    """Select the registered hash-smallest non-self E_msg pairs."""
+    """Select the registered hash-smallest non-self training-topology pairs."""
     if limit <= 0:
         raise ValueError("probe pair limit must be positive")
     pairs = {
@@ -582,7 +578,9 @@ def evaluate_e2e_probe_artifact(
         raise ValueError("E2E probe node identities do not match sorted operative train nodes")
     expected_pairs = select_probe_pairs(graph)
     if pair_ids != expected_pairs:
-        raise ValueError("E2E probe pair identities do not match registered E_msg selection")
+        raise ValueError(
+            "E2E probe pair identities do not match registered training-topology selection"
+        )
     if metadata.get("g_struct_sha256") != g_struct_sha256(graph):
         raise ValueError("E2E probe G_struct identity mismatch")
     expected_targets = probe_targets(graph, expected_nodes)
@@ -759,22 +757,10 @@ def produce_e2e_probe_artifact(
     if cfg.data.root.resolve() != data_root.resolve() or cfg.data.strategy != strategy:
         raise ValueError("probe CLI data root/strategy do not match the formal config")
     # Multi-seed runs are permitted, so the model seed is only required to be a
-    # real seed and is recorded verbatim. ``data.partition_seed`` is not the
-    # model seed: it selects G_struct and the whole pair universe this probe is
-    # validated against, so it is pinned to the config, not relaxed.
+    # real seed and is recorded verbatim. The shared interaction graph is seed-independent.
     run_seed = run_metadata.get("seed")
-    run_partition_seed = run_metadata.get("partition_seed")
     if isinstance(run_seed, bool) or not isinstance(run_seed, int) or run_seed < 0:
         raise ValueError("E2E probe producer requires a nonnegative integer run seed")
-    if (
-        isinstance(run_partition_seed, bool)
-        or not isinstance(run_partition_seed, int)
-        or run_partition_seed != cfg.data.partition_seed
-    ):
-        raise ValueError(
-            "E2E probe run metadata partition_seed does not match the config "
-            f"({cfg.data.partition_seed})"
-        )
     payload = cast(dict[str, object], torch.load(checkpoint_path, map_location="cpu"))
     state = cast(dict[str, torch.Tensor], payload["model_state"])
     checkpoint_id = _state_digest(state)[:16]
@@ -804,25 +790,23 @@ def produce_e2e_probe_artifact(
     token_index = table.manifest.node_index()
 
     # The formal artifact is pinned to all operative train nodes over the full
-    # train-side E_msg. Grounding pools stay universe-scoped (spec Sec 13.12):
+    # train-side topology. Grounding pools stay universe-scoped (spec Sec 13.12):
     # V_fit and the single validation holdout V_hold are hashed separately and
     # one cache may never serve the other.
     from src.data.features import FeatureStore, build_f0_matrix
     from src.data.grounding import build_grounding_pool
     from src.data.internal_holdout import derive_internal_holdout
-    from src.data.partition import build_g_struct, derive_partition
+    from src.data.partition import build_g_struct, derive_training_interactions
 
     strategy_dir = cfg.data.root / te._BENCHMARK_SUBDIR / cfg.data.strategy
     formal_nodes, train_positives = _load_train_side_probe_inputs(
         strategy_dir,
         expected_missing_features=cfg.data.expected_missing_features,
     )
-    partition = derive_partition(
-        train_positives, seed=cfg.data.partition_seed, msg_fraction=cfg.data.msg_fraction
-    )
-    holdout = derive_internal_holdout(formal_nodes, partition.e_msg, partition.e_sup)
+    interactions = derive_training_interactions(train_positives)
+    holdout = derive_internal_holdout(formal_nodes, interactions.positives)
     nodes = list(formal_nodes)
-    graph = build_g_struct(nodes, partition.e_msg)
+    graph = build_g_struct(nodes, interactions.topology_edges)
     missing_tokens = [node for node in nodes if node not in token_index]
     if missing_tokens:
         raise ValueError(f"token pack is missing {len(missing_tokens)} probe nodes")
@@ -1060,7 +1044,6 @@ def produce_e2e_probe_artifact(
         metadata={
             "checkpoint_id": checkpoint_id,
             "seed": run_seed,
-            "partition_seed": run_partition_seed,
             "strategy": strategy,
             "g_struct_sha256": g_struct_sha256(graph),
             "scope": scope,

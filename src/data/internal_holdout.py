@@ -1,6 +1,6 @@
 """Current E2E internal topology holdout (spec §§9.3 and 13.19).
 
-The holdout is derived solely from the seeded message graph.  ``V_hold`` is the
+The holdout is derived from the full loopless training-interaction graph. ``V_hold`` is the
 union of the two historical BFS draws and is the single validation universe for
 the formal training plan.  This module also materializes the
 complete, non-self pair/label universe over ``V_hold`` so its exact contents can
@@ -47,10 +47,9 @@ class PairLabelManifest:
 
 @dataclass(frozen=True)
 class QuarantineCounts:
-    """Counts of edges crossing each unordered node-partition pair."""
+    """Counts of training interactions crossing each unordered node-partition pair."""
 
-    message: dict[str, int]
-    supervision: dict[str, int]
+    training_interactions: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -72,25 +71,25 @@ class InternalHoldoutPartition:
 
     v_fit: frozenset[str]
     v_hold: frozenset[str]
-    e_msg_fit: frozenset[Pair]
-    e_sup_fit: frozenset[Pair]
-    e_msg_hold: frozenset[Pair]
+    training_interactions_fit: frozenset[Pair]
+    topology_fit: frozenset[Pair]
+    topology_hold: frozenset[Pair]
     hold_manifest: PairLabelManifest
     quarantine_counts: QuarantineCounts
     overlap_proof: OverlapProof
 
     def build_g_fit(self) -> nx.Graph:
-        """Return the loopless induced training message graph, including isolates."""
+        """Return the loopless induced training topology, including isolates."""
         graph = nx.Graph()
         graph.add_nodes_from(self.v_fit)
-        graph.add_edges_from(self.e_msg_fit)
+        graph.add_edges_from(self.topology_fit)
         return graph
 
     def build_g_hold(self) -> nx.Graph:
         """Return the loopless induced holdout gold graph, including isolates."""
         graph = nx.Graph()
         graph.add_nodes_from(self.v_hold)
-        graph.add_edges_from(self.e_msg_hold)
+        graph.add_edges_from(self.topology_hold)
         return graph
 
 
@@ -137,33 +136,31 @@ def build_pair_label_manifest(
 
 def derive_internal_holdout(
     train_nodes: Iterable[str],
-    e_msg: Iterable[Pair],
-    e_sup: Iterable[Pair],
+    training_interactions: Iterable[Pair],
     *,
     holdout_size: int = 256,
 ) -> InternalHoldoutPartition:
     """Derive the deterministic ``V_hold`` and ``V_fit`` partitions.
 
     ``V_hold`` is the union of two hashed-frontier BFS prefixes of the largest
-    loopless message component, drawn with the historical ``g5-v2-qual|`` and
+    loopless training-topology component, drawn with the historical ``g5-v2-qual|`` and
     ``g5-v2-select|`` salts; the first draw is removed before the second is
     taken.  Both draws are kept verbatim so that ``V_fit`` — and therefore every
-    feature-stats, grounding and pack digest keyed on it — is bit-identical to
-    the two-holdout construction this replaces.  ``holdout_size`` is the size of
-    *each* draw, so ``V_hold`` holds twice that many nodes.  Training message
-    and supervision edges are then restricted to ``V_fit``; the message edges
-    induced on ``V_hold`` — including the ones crossing between the two draws —
+    feature-stats, grounding and pack digest keyed on it. ``holdout_size`` is the size of
+    *each* draw, so ``V_hold`` holds twice that many nodes. The shared training
+    interactions are then restricted to ``V_fit``; their loopless projection
+    induced on ``V_hold`` — including the edges crossing between the two draws —
     become the evaluation-only topology labels.
     """
     if holdout_size <= 0:
         raise ValueError("holdout_size must be positive")
 
     node_set = frozenset(train_nodes)
-    message = _canonical_edge_set(e_msg, node_set, drop_loops=True)
-    supervision = _canonical_edge_set(e_sup, node_set, drop_loops=False)
+    interactions = _canonical_edge_set(training_interactions, node_set, drop_loops=False)
+    topology = frozenset((u, v) for u, v in interactions if u != v)
     graph = nx.Graph()
     graph.add_nodes_from(node_set)
-    graph.add_edges_from(message)
+    graph.add_edges_from(topology)
 
     first_draw = frozenset(_holdout_bfs(graph, holdout_size, "g5-v2-qual|"))
     remaining = graph.subgraph(node_set - first_draw).copy()
@@ -179,18 +176,24 @@ def derive_internal_holdout(
     if v_fit != node_set - first_draw - second_draw:
         raise AssertionError("V_fit drifted from the two-draw complement")
 
-    e_msg_fit = frozenset((u, v) for u, v in message if u in v_fit and v in v_fit)
-    e_sup_fit = frozenset((u, v) for u, v in supervision if u in v_fit and v in v_fit)
-    e_msg_hold = frozenset((u, v) for u, v in message if u in v_hold and v in v_hold)
+    training_interactions_fit = frozenset(
+        (u, v) for u, v in interactions if u in v_fit and v in v_fit
+    )
+    topology_fit = frozenset((u, v) for u, v in topology if u in v_fit and v in v_fit)
+    topology_hold = frozenset((u, v) for u, v in topology if u in v_hold and v in v_hold)
+    expected_topology_fit = frozenset(
+        (u, v) for u, v in training_interactions_fit if u != v
+    )
+    if topology_fit != expected_topology_fit:
+        raise AssertionError("training topology is not the loopless interaction projection")
 
     partitions = {"fit": v_fit, "hold": v_hold}
     quarantine = QuarantineCounts(
-        message=_cross_partition_counts(message, partitions),
-        supervision=_cross_partition_counts(supervision, partitions),
+        training_interactions=_cross_partition_counts(interactions, partitions),
     )
     proof = OverlapProof(
         node=_pairwise_overlap_counts(partitions),
-        label_edge=_pairwise_overlap_counts({"fit": e_msg_fit, "hold": e_msg_hold}),
+        label_edge=_pairwise_overlap_counts({"fit": topology_fit, "hold": topology_hold}),
     )
     if not proof.all_zero:  # defensive invariant: disjoint node-induced labels
         raise AssertionError("internal holdout overlap proof is non-zero")
@@ -198,10 +201,10 @@ def derive_internal_holdout(
     return InternalHoldoutPartition(
         v_fit=v_fit,
         v_hold=v_hold,
-        e_msg_fit=e_msg_fit,
-        e_sup_fit=e_sup_fit,
-        e_msg_hold=e_msg_hold,
-        hold_manifest=build_pair_label_manifest(v_hold, e_msg_hold),
+        training_interactions_fit=training_interactions_fit,
+        topology_fit=topology_fit,
+        topology_hold=topology_hold,
+        hold_manifest=build_pair_label_manifest(v_hold, topology_hold),
         quarantine_counts=quarantine,
         overlap_proof=proof,
     )
@@ -211,11 +214,11 @@ def _holdout_bfs(graph: nx.Graph, size: int, prefix: str) -> tuple[str, ...]:
     """Return a deterministic hashed-frontier BFS prefix of the largest component."""
     components = [tuple(sorted(component)) for component in nx.connected_components(graph)]
     if not components:
-        raise ValueError("message graph has no nodes")
+        raise ValueError("training topology has no nodes")
     component = min(components, key=lambda nodes: (-len(nodes), nodes))
     if len(component) < size:
         raise ValueError(
-            f"largest remaining message component has {len(component)} nodes; need {size}"
+            f"largest remaining training-topology component has {len(component)} nodes; need {size}"
         )
 
     def order_key(node: str) -> tuple[bytes, str]:

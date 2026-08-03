@@ -15,6 +15,18 @@ from src import score_universe
 
 from tests.test_score_universe import _egostitch_e2e_setup
 
+_DATA_PROVENANCE = {
+    "data_contract": "shared_train_positives_v1",
+    "training_interactions_sha256": "a" * 64,
+    "training_topology_sha256": "b" * 64,
+}
+
+
+def _fake_loaded_e2e_model() -> torch.nn.Module:
+    model = torch.nn.Linear(1, 1)
+    model._training_data_provenance = dict(_DATA_PROVENANCE)  # type: ignore[attr-defined]
+    return model
+
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -88,6 +100,7 @@ def _write_bound_score_artifact(
             "num_rows": num_shards,
             "created_utc": "2026-07-30T00:00:00Z",
             "torch_version": "test",
+            **_DATA_PROVENANCE,
             "permanent_null": "none",
             "primary_logit": "full",
             "score_precision": {
@@ -160,6 +173,20 @@ def test_ledger_bound_shards_load_and_merge_as_one_scoring_epoch(tmp_path: Path)
     )
     loaded = score_universe.load_scores(merged_path)
     score_universe.validate_artifact_precision(loaded, label="merged")
+
+
+def test_merge_rejects_shards_with_different_training_data_provenance(tmp_path: Path) -> None:
+    shard_paths = [
+        _write_bound_score_artifact(tmp_path, shard=shard, num_shards=2)[0]
+        for shard in range(2)
+    ]
+    _rewrite_artifact_meta(
+        shard_paths[1],
+        lambda meta: meta.__setitem__("training_interactions_sha256", "c" * 64),
+    )
+
+    with pytest.raises(ValueError, match="training_interactions_sha256"):
+        score_universe.merge_scores(shard_paths)
 
 
 def test_ledger_bound_artifact_rejects_deleted_ledger(tmp_path: Path) -> None:
@@ -276,8 +303,18 @@ def test_scoring_full_then_both_scaffold_controls_needs_no_rescore_reason(
     test_pairs_path.write_bytes(pairs_path.read_bytes())
 
     run_metadata_path = tmp_path / "run_metadata.json"
+    checkpoint_payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
     run_metadata_path.write_text(
-        json.dumps({"arm": "full", "seed": 0, "checkpoint_id": "irrelevant"}),
+        json.dumps(
+            {
+                "arm": "full",
+                "seed": 0,
+                "checkpoint_id": score_universe._checkpoint_id(
+                    checkpoint_payload["model_state"]
+                ),
+                **_DATA_PROVENANCE,
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -375,7 +412,14 @@ def test_arbitrary_file_is_ledgered_as_heldout_before_pair_read(
     checkpoint_id = "0123456789abcdef"
     run_metadata_path = tmp_path / "run_metadata.json"
     run_metadata_path.write_text(
-        json.dumps({"arm": "full", "seed": 0, "checkpoint_id": checkpoint_id}),
+        json.dumps(
+            {
+                "arm": "full",
+                "seed": 0,
+                "checkpoint_id": checkpoint_id,
+                **_DATA_PROVENANCE,
+            }
+        ),
         encoding="utf-8",
     )
     copied = tmp_path / "copied-test.tsv"
@@ -384,7 +428,7 @@ def test_arbitrary_file_is_ledgered_as_heldout_before_pair_read(
         score_universe,
         "_load_checkpoint",
         lambda *_args, **_kwargs: (
-            torch.nn.Linear(1, 1),
+            _fake_loaded_e2e_model(),
             "egostitch_e2e",
             checkpoint_id,
         ),
@@ -436,7 +480,7 @@ def test_file_alias_of_candidate_manifest_still_requires_run_metadata(
     monkeypatch.setattr(
         score_universe,
         "_load_checkpoint",
-        lambda *_args, **_kwargs: (torch.nn.Linear(1, 1), "egostitch_e2e", checkpoint_id),
+        lambda *_args, **_kwargs: (_fake_loaded_e2e_model(), "egostitch_e2e", checkpoint_id),
     )
     output = tmp_path / "forbidden.npz"
 
@@ -480,6 +524,7 @@ def test_e2e_artifact_physically_stores_exactly_two_decomposition_arrays(tmp_pat
         "num_rows": 2,
         "created_utc": "2026-07-19T00:00:00Z",
         "torch_version": "test",
+        **_DATA_PROVENANCE,
         "permanent_null": "none",
         "primary_logit": "full",
         "score_precision": {

@@ -1,5 +1,9 @@
 # EgoStitch E2E Stage-1 Screen — Experiment Plan
 
+> **2026-08-03 data-contract disposition:** every 80/20 message/supervision split in
+> this historical plan is superseded by spec §9.3. Topology and classification now use
+> the same complete train-side positive interactions.
+
 > **2026-07-19 disposition:** this is the historical v1 screen plan. The v1 full arm
 > completed only its engineering training pipeline and was training-invalid; it did
 > not produce a G5 verdict. Prospective v2 execution is governed by spec §13.19 and

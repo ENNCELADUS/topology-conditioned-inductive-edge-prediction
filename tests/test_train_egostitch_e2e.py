@@ -181,7 +181,7 @@ class TestBatchFactoryE2E:
         sampler = NegativeSampler(nodes, degrees, frozenset(graph.edges()))
         data = te.EgoStitchData(
             train_nodes=nodes,
-            e_sup_positives=[(nodes[0], nodes[1]), (nodes[0], nodes[2])],
+            training_positives=[(nodes[0], nodes[1]), (nodes[0], nodes[2])],
             val_pairs=[],
             val_labels=np.empty(0, dtype=np.int8),
             f0=torch.from_numpy(f0),
@@ -218,26 +218,27 @@ class TestBatchFactoryE2E:
             model_cfg,
         )
 
-    def test_edge_targets_are_node_epoch_keyed_across_pairs_directions_and_ranks(
+    def test_edge_targets_are_node_partner_epoch_keyed_across_directions_and_ranks(
         self, tmp_path: Path
     ) -> None:
         factory, _ = self._target_factory(tmp_path)
         node = "target-node-00"
+        partner = "target-node-01"
         first, _ = factory._edge_tensors(
-            [(node, "target-node-01", 1), ("target-node-02", node, 1)],
+            [(node, partner, 1), (partner, node, 1)],
             pad_to=2,
             epoch=3,
             step=1,
         )
         later, _ = factory._edge_tensors(
-            [("target-node-03", node, 1), (node, "target-node-04", 1)],
+            [("target-node-03", "target-node-04", 1), (node, partner, 1)],
             pad_to=2,
             epoch=3,
             step=99,
         )
         other_rank_factory, _ = self._target_factory(tmp_path, rank=3, world_size=4)
         other_rank, _ = other_rank_factory._edge_tensors(
-            [(node, "target-node-05", 1)],
+            [(node, partner, 1)],
             pad_to=1,
             epoch=3,
             step=17,
@@ -245,13 +246,12 @@ class TestBatchFactoryE2E:
 
         expected = first["target_features_i"][0]
         torch.testing.assert_close(first["target_features_j"][1], expected)
-        torch.testing.assert_close(later["target_features_j"][0], expected)
         torch.testing.assert_close(later["target_features_i"][1], expected)
         torch.testing.assert_close(other_rank["target_features_i"][0], expected)
         assert torch.equal(first["target_mask_i"][0], first["target_mask_j"][1])
-        assert torch.equal(later["target_mask_j"][0], first["target_mask_i"][0])
+        assert torch.equal(later["target_mask_i"][1], first["target_mask_i"][0])
         assert torch.equal(first["target_node_index_i"][0], first["target_node_index_j"][1])
-        assert torch.equal(later["target_node_index_j"][0], first["target_node_index_i"][0])
+        assert torch.equal(later["target_node_index_i"][1], first["target_node_index_i"][0])
         assert torch.equal(other_rank["target_node_index_i"][0], first["target_node_index_i"][0])
 
         next_epoch, _ = factory._edge_tensors(
@@ -280,9 +280,11 @@ class TestBatchFactoryE2E:
         assert edge["target_mask_i"].shape == (4, 16)
         assert edge["target_features_i"].shape == (4, 16, model_cfg.input_dim)
         assert int(edge["target_mask_i"][0].sum()) == 16
-        assert int(edge["target_mask_j"][0].sum()) == 1
-        assert not edge["target_mask_j"][0, 1:].any()
-        assert torch.count_nonzero(edge["target_features_j"][0, 1:]) == 0
+        partner_index = factory._data.node_index["target-node-01"]
+        assert partner_index not in edge["target_node_index_i"][0].tolist()
+        # target-node-01's only neighbor is the queried partner, so leave-one-out empties it.
+        assert int(edge["target_mask_j"][0].sum()) == 0
+        assert torch.count_nonzero(edge["target_features_j"][0]) == 0
         for name in (
             "target_mask_i",
             "target_mask_j",
@@ -331,7 +333,7 @@ class TestBatchFactoryE2E:
     ) -> None:
         factory, model_cfg = self._target_factory(tmp_path)
         rows_per_rank, steps = te._epoch_step_plan(
-            len(factory._data.e_sup_positives),
+            len(factory._data.training_positives),
             negative_ratio=factory._cfg.data.negative_ratio,
             edge_batch=factory._cfg.data.edge_batch,
             world_size=1,
@@ -358,7 +360,7 @@ class TestBatchFactoryE2E:
             data=replace(cfg.data, pack_dir=pack_dir),
         )
         rows, steps = te._epoch_step_plan(
-            len(data.e_sup_positives),
+            len(data.training_positives),
             negative_ratio=e2e_cfg.data.negative_ratio,
             edge_batch=e2e_cfg.data.edge_batch,
             world_size=1,
@@ -378,7 +380,7 @@ class TestBatchFactoryE2E:
         assert batch.edge["ground_i"].shape[0] == edge_batch
 
         expected_rows = te.enumerate_edge_stream(
-            data.e_sup_positives,
+            data.training_positives,
             data.sampler,
             negative_ratio=e2e_cfg.data.negative_ratio,
             seed=e2e_cfg.seed,
@@ -436,7 +438,7 @@ class TestBatchFactoryE2E:
             data=replace(cfg.data, pack_dir=pack_dir),
         )
         rows_per_rank, epoch_steps = te._epoch_step_plan(
-            len(data.e_sup_positives),
+            len(data.training_positives),
             negative_ratio=e2e_cfg.data.negative_ratio,
             edge_batch=e2e_cfg.data.edge_batch,
             world_size=2,
@@ -520,7 +522,7 @@ class TestE2ECompositeStep:
             data=replace(cfg.data, pack_dir=pack_dir),
         )
         rows, steps = te._epoch_step_plan(
-            len(data.e_sup_positives),
+            len(data.training_positives),
             negative_ratio=e2e_cfg.data.negative_ratio,
             edge_batch=e2e_cfg.data.edge_batch,
             world_size=1,
@@ -1339,7 +1341,7 @@ class TestE2ECompositeStep:
         optimizer_steps = result.runtime_profile["optimizer_step_gradients"]
         phases = [step["phase"] for step in optimizer_steps]
         _, steps_per_epoch = te._epoch_step_plan(
-            len(data.e_sup_positives),
+            len(data.training_positives),
             negative_ratio=e2e_cfg.data.negative_ratio,
             edge_batch=e2e_cfg.data.edge_batch,
             world_size=1,
@@ -2075,7 +2077,7 @@ class _ArchivedV1TrainLoopE2E:
                 world_size=1,
             )
             rows, steps = te._epoch_step_plan(
-                len(data.e_sup_positives),
+                len(data.training_positives),
                 negative_ratio=e2e_cfg.data.negative_ratio,
                 edge_batch=e2e_cfg.data.edge_batch,
                 world_size=1,
@@ -2232,14 +2234,18 @@ def _holdout_e2e_cfg(
     (strategy_dir / "train_edges.txt").write_text(
         "".join(f"{u}\t{v}\t1\n" for u, v in edges), encoding="utf-8"
     )
+    (strategy_dir / "val_edges.txt").write_text(
+        f"{_E2E_PIPELINE_NODES[0]}\t{_E2E_PIPELINE_NODES[5]}\t1\n"
+        f"{_E2E_PIPELINE_NODES[1]}\t{_E2E_PIPELINE_NODES[6]}\t0\n",
+        encoding="utf-8",
+    )
 
     def tiny_holdout(
         train_nodes: list[str],
-        e_msg: frozenset[tuple[str, str]],
-        e_sup: frozenset[tuple[str, str]],
+        training_interactions: frozenset[tuple[str, str]],
     ) -> internal_holdout.InternalHoldoutPartition:
         return internal_holdout.derive_internal_holdout(
-            train_nodes, e_msg, e_sup, holdout_size=4
+            train_nodes, training_interactions, holdout_size=4
         )
 
     monkeypatch.setattr(te, "derive_internal_holdout", tiny_holdout)

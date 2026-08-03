@@ -475,9 +475,7 @@ def _pipeline_config_dict(
         "data": {
             "root": str(data_root),
             "strategy": "breadth_first",
-            "train_positives": "train_plus",
             "negative_ratio": 1,
-            "partition_seed": 0,
             "token_budget": 131072,
             "batch_pairs": 1024,
             "num_workers": 0,
@@ -518,13 +516,25 @@ def _write_train_outputs(output_dir: Path) -> None:
         "val_metrics": {},
         "seed": 47,
         "config": {},
+        "data_contract": "shared_train_positives_v1",
+        "training_interactions_sha256": "a" * 64,
+        "training_topology_sha256": "b" * 64,
     }
     torch.save(checkpoint, output_dir / "best.pt")
     torch.save({**checkpoint, "epoch": 2}, output_dir / "last.pt")
     (output_dir / "metrics.jsonl").write_text(
         '{"epoch": 1, "val_auroc": 0.7}\n{"epoch": 2, "val_auroc": 0.8}\n'
     )
-    (output_dir / "run_metadata.json").write_text(json.dumps({"config_hash": "abc123"}))
+    (output_dir / "run_metadata.json").write_text(
+        json.dumps(
+            {
+                "config_hash": "abc123",
+                "data_contract": "shared_train_positives_v1",
+                "training_interactions_sha256": "a" * 64,
+                "training_topology_sha256": "b" * 64,
+            }
+        )
+    )
 
 
 def _valid_worker_profile() -> dict[str, object]:

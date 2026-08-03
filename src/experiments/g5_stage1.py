@@ -63,6 +63,7 @@ from scipy.stats import spearmanr
 
 from src.data.artifacts import load_candidate_pairs
 from src.data.features import FeatureStore
+from src.data.partition import TRAINING_INTERACTION_CONTRACT
 from src.eval.assembly import assemble_graph, density_matched_threshold
 from src.eval.graph_metrics import (
     MMDConfig,
@@ -708,7 +709,7 @@ def _evaluate_e2e_probe(
 ) -> dict[str, object]:
     """Rebuild the full arm's ``G_struct`` identity and evaluate its probe artifact."""
     from src import train_egostitch as te
-    from src.data.partition import build_g_struct, derive_partition
+    from src.data.partition import build_g_struct, derive_training_interactions
     from src.model.egostitch.config import E2EConfig
 
     metadata = cast(dict[str, object], json.loads(run_metadata_path.read_text(encoding="utf-8")))
@@ -720,12 +721,8 @@ def _evaluate_e2e_probe(
         cfg.data.root / _BENCHMARK_SUBDIR / cfg.data.strategy,
         expected_missing_features=cfg.data.expected_missing_features,
     )
-    partition = derive_partition(
-        train_positives,
-        seed=cfg.data.partition_seed,
-        msg_fraction=cfg.data.msg_fraction,
-    )
-    graph = build_g_struct(train_nodes, partition.e_msg)
+    interactions = derive_training_interactions(train_positives)
+    graph = build_g_struct(train_nodes, interactions.topology_edges)
     # Three-component refactor (design 2026-08-02 Sec 8): `n_ground` moved
     # from the flat `E2EConfig` onto the nested `generator` sub-config.
     n_ground = E2EConfig.from_mapping(cfg.model.config).generator.n_ground
@@ -735,7 +732,6 @@ def _evaluate_e2e_probe(
         train_nodes=train_nodes,
         expected_metadata={
             "seed": metadata.get("seed"),
-            "partition_seed": cfg.data.partition_seed,
             "strategy": strategy,
             "n_ground": n_ground,
         },
@@ -816,6 +812,20 @@ def build_e2e_arm_summary(
         for name, path in run_metadata_paths.items()
     }
     training_seed = _assert_shared_training_seed(run_metadata, _TRAINED_ARMS)
+    shared_data_provenance = {
+        key: run_metadata["full"].get(key)
+        for key in (
+            "data_contract",
+            "training_interactions_sha256",
+            "training_topology_sha256",
+        )
+    }
+    for name in _TRAINED_ARMS:
+        observed = {key: run_metadata[name].get(key) for key in shared_data_provenance}
+        if observed != shared_data_provenance:
+            raise ValueError(
+                f"trained arm {name!r} does not share full's training-data provenance"
+            )
     training_diagnostics = _training_diagnostics([run_metadata[name] for name in _TRAINED_ARMS])
     _validate_vhold_event_ledgers(
         run_metadata,
@@ -875,6 +885,28 @@ def build_e2e_arm_summary(
                 f"{name} checkpoint_id mismatch: "
                 f"{metadata_checkpoint!r} != {artifact_checkpoint!r}"
             )
+        metadata = run_metadata[expected_checkpoint_arm]
+        if metadata.get("data_contract") != TRAINING_INTERACTION_CONTRACT:
+            raise ValueError(
+                f"{expected_checkpoint_arm} run metadata has an invalid data_contract"
+            )
+        for key in ("training_interactions_sha256", "training_topology_sha256"):
+            value = metadata.get(key)
+            if not (
+                isinstance(value, str)
+                and len(value) == 64
+                and all(character in "0123456789abcdefABCDEF" for character in value)
+            ):
+                raise ValueError(f"{expected_checkpoint_arm} run metadata has an invalid {key}")
+        for key in (
+            "data_contract",
+            "training_interactions_sha256",
+            "training_topology_sha256",
+        ):
+            if artifact.meta.get(key) != metadata.get(key):
+                raise ValueError(
+                    f"{name} {key} mismatch between score artifact and run metadata"
+                )
         _validate_scaffold_control_arm_semantics(artifact, name=name, label=label)
         if list(artifact.pairs()) != candidate_pairs:
             raise ValueError(
@@ -1084,7 +1116,7 @@ def render_e2e_tables_markdown(payload: Mapping[str, object]) -> str:
         "",
         "| Pi/shared-neighbor consistency | mean | std | nonzero fraction | n pairs |",
         "|---|---:|---:|---:|---:|",
-        f"| E_msg selection | {_fmt(pi['mean'])} | {_fmt(pi['std'])} "
+        f"| training-topology selection | {_fmt(pi['mean'])} | {_fmt(pi['std'])} "
         f"| {_fmt(pi['nonzero_fraction'])} | {_fmt(pi['n_pairs'])} |",
         "",
         "## Probe-v2 evidence",

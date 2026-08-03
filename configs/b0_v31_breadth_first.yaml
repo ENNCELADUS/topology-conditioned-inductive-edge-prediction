@@ -30,9 +30,7 @@ model:
 data:
   root: data
   strategy: breadth_first
-  train_positives: train_plus # train_plus = all train+ | e_sup = supervision split only
   negative_ratio: 1 # F0-only; V3.1 trains on fixed balanced train_edges.txt rows
-  partition_seed: 0
   token_budget: 131072
   batch_pairs: 1024
   num_workers: 0

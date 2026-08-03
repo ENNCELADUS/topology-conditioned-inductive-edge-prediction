@@ -18,10 +18,7 @@ model:
 data:
   root: data
   strategy: breadth_first
-  train_positives: e_sup
   negative_ratio: 5
-  partition_seed: 0
-  msg_fraction: 0.8
   node_batch: 256
   edge_batch: 128
   f0_cache: outputs/feature_packs/egostitch_f0/f0_matrix.pt

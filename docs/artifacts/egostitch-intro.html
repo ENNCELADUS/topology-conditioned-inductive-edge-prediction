@@ -484,17 +484,6 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
             <foreignObject x="504" y="778" width="176" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(C_{\mathrm{topo}}^{uv}\)</div></foreignObject>
             <foreignObject x="504" y="796" width="176" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(34\times512\)</div></foreignObject>
 
-            <!-- Content branch -->
-            <path class="box-amber" d="M636,392 L804,392 L820,478 L620,478 Z"/>
-            <text class="s-title" x="720" y="420" text-anchor="middle">Assemble content tokens</text>
-            <foreignObject x="630" y="432" width="180" height="20"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(C_{\mathrm{cont}}^{uv}=\operatorname{Cont}(S_u,S_v)\)</div></foreignObject>
-            <foreignObject x="625" y="455" width="190" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(2K\times260\to2K\times512\)</div></foreignObject>
-
-            <path class="flow-amber" d="M720 478 V774" marker-end="url(#overview-arrow-amber)"/>
-            <rect class="tensor" x="686" y="780" width="68" height="22"/>
-            <foreignObject x="764" y="778" width="96" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(C_{\mathrm{cont}}^{uv}\)</div></foreignObject>
-            <foreignObject x="764" y="796" width="96" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(32\times512\)</div></foreignObject>
-
             <!-- Pair trunk: three shared cross-attention layers on the raw-token branch -->
             <path class="flow" d="M160 272 V284" marker-end="url(#overview-arrow)"/>
             <path class="box" d="M20,290 L300,290 L300,370 L20,370 Z"/>
@@ -523,8 +512,7 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
             <foreignObject x="204" y="641" width="116" height="17"><div xmlns="http://www.w3.org/1999/xhtml" class="symf">\(c_{rs}^{(0)}\)</div></foreignObject>
             <foreignObject x="204" y="659" width="116" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimlf">\(512\)</div></foreignObject>
 
-            <!-- Layer-3 CLS injection: topology first, then content queries the result.
-                 The wide blocks stop at x=670/810 so the descending lanes never cross a box. -->
+            <!-- Layer-3 CLS injection: topology-only conditioning. -->
             <path class="flow" d="M160 662 V824" marker-end="url(#overview-arrow)"/>
             <path class="flow-blue" d="M460 803 V824" marker-end="url(#overview-arrow-blue)"/>
             <path class="box-blue" d="M70,830 L670,830 L670,920 L70,920 Z"/>
@@ -532,18 +520,11 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
             <foreignObject x="80" y="871" width="580" height="22"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(c_{rs}^{\mathrm{topo}}=c_{rs}^{(0)}+\tanh(\gamma_{\mathrm{topo}})\bigl[\operatorname{XAttn}_{\mathrm{topo}}\bigl(c_{rs}^{(0)},C_{\mathrm{topo}}^{rs}\bigr)-\mu_{\mathrm{topo}}\bigr]\)</div></foreignObject>
             <foreignObject x="80" y="896" width="580" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(1\times512\) · attends over \(34\times512\) · centered, gated</div></foreignObject>
 
-            <path class="flow" d="M370 920 V934" marker-end="url(#overview-arrow)"/>
-            <path class="flow-amber" d="M720 802 V934" marker-end="url(#overview-arrow-amber)"/>
-            <path class="box-amber" d="M70,940 L810,940 L810,1030 L70,1030 Z"/>
-            <text class="s-title" x="440" y="968" text-anchor="middle">2 · Content update</text>
-            <foreignObject x="80" y="981" width="720" height="22"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(c_{rs}^{\mathrm{cond}}=c_{rs}^{\mathrm{topo}}+\tanh(\gamma_{\mathrm{cont}})\bigl[\operatorname{XAttn}_{\mathrm{cont}}\bigl(c_{rs}^{\mathrm{topo}},C_{\mathrm{cont}}^{rs}\bigr)-\mu_{\mathrm{cont}}\bigr]\)</div></foreignObject>
-            <foreignObject x="80" y="1006" width="720" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(1\times512\) · attends over \(32\times512\) · content queries the topology-updated CLS</div></foreignObject>
-
             <path class="flow" d="M126 618 H45 V1090 H68" marker-end="url(#overview-arrow)"/>
-            <path class="flow" d="M440 1030 V1044" marker-end="url(#overview-arrow)"/>
+            <path class="flow" d="M370 920 V1044" marker-end="url(#overview-arrow)"/>
             <path class="box" d="M70,1050 L810,1050 L788,1140 L92,1140 Z"/>
             <text class="s-title" x="440" y="1078" text-anchor="middle">PairContextGatedReadout</text>
-            <foreignObject x="80" y="1091" width="720" height="22"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(z_{rs}=\operatorname{Readout}\bigl(A^{[3]}_u,A^{[3]}_v,c_{rs}^{\mathrm{cond}}\bigr)\)</div></foreignObject>
+            <foreignObject x="80" y="1091" width="720" height="22"><div xmlns="http://www.w3.org/1999/xhtml" class="eqf">\(z_{rs}=\operatorname{Readout}\bigl(A^{[3]}_u,A^{[3]}_v,c_{rs}^{\mathrm{topo}}\bigr)\)</div></foreignObject>
             <foreignObject x="80" y="1116" width="720" height="15"><div xmlns="http://www.w3.org/1999/xhtml" class="dimf">\(\to512\) · once per direction \((r,s)\in\{(u,v),(v,u)\}\) · fp32</div></foreignObject>
 
             <path class="flow" d="M140 1140 V1154" marker-end="url(#overview-arrow)"/>
@@ -859,19 +840,16 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
       C_{uv}&=\operatorname{Cost}(S_u,S_v),\qquad
       \Pi_{uv}=\operatorname{Sinkhorn}_{\varepsilon}(C_{uv};\pi_u,\pi_v)\in\mathbb{R}_{+}^{K\times K},\\
       \mathcal T_{uv}&=\operatorname{Stitch}(S_u,S_v,\Pi_{uv}),\qquad
-      C_{\mathrm{topo}}^{uv}=\operatorname{STE}(\mathcal T_{uv}),\qquad
-      C_{\mathrm{cont}}^{uv}=\operatorname{Cont}(S_u,S_v).
+      C_{\mathrm{topo}}^{uv}=\operatorname{STE}(\mathcal T_{uv}).
       \end{aligned}
       \]
-      <p><strong>Condition both directions.</strong> The Siamese pair trunk processes \(u\!\to\!v\) and \(v\!\to\!u\) separately. In its final layer, topology first updates the base CLS state; content cross-attention then queries that topology-updated state. In the full model, both pathways are active centered, gated residuals.</p>
+      <p><strong>Condition both directions.</strong> The Siamese pair trunk processes \(u\!\to\!v\) and \(v\!\to\!u\) separately. In its final layer, a centered, gated topology residual updates the base CLS state.</p>
       \[
       \begin{aligned}
       c_{rs}^{(0)}&=\operatorname{CLS}\!\left(\operatorname{Trunk}(A_r,A_s)\right),\\
       \delta_{rs}^{\mathrm{topo}}&=\operatorname{XAttn}_{\mathrm{topo}}\!\left(c_{rs}^{(0)},C_{\mathrm{topo}}^{rs}\right)-\mu_{\mathrm{topo}},\\
       c_{rs}^{\mathrm{topo}}&=c_{rs}^{(0)}+\tanh(\gamma_{\mathrm{topo}})\,\delta_{rs}^{\mathrm{topo}},\\
-      \delta_{rs}^{\mathrm{cont}}&=\operatorname{XAttn}_{\mathrm{cont}}\!\left(c_{rs}^{\mathrm{topo}},C_{\mathrm{cont}}^{rs}\right)-\mu_{\mathrm{cont}},\\
-      c_{rs}^{\mathrm{cond}}&=c_{rs}^{\mathrm{topo}}+\tanh(\gamma_{\mathrm{cont}})\,\delta_{rs}^{\mathrm{cont}},\\
-      z_{rs}&=\operatorname{Readout}\!\left(A_r,A_s,c_{rs}^{\mathrm{cond}}\right),\qquad
+      z_{rs}&=\operatorname{Readout}\!\left(A_r,A_s,c_{rs}^{\mathrm{topo}}\right),\qquad
       (r,s)\in\{(u,v),(v,u)\}.
       \end{aligned}
       \]
@@ -880,7 +858,7 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
       z_{uv}^{\mathrm{sym}}=\operatorname{max}\!\left(z_{uv},z_{vu}\right),\qquad
       p_{uv}=\sigma\!\left(\operatorname{MLP}(z_{uv}^{\mathrm{sym}})\right)=p_{vu}.
       \]
-      <p><strong>Symbols.</strong> \(L_r\) is endpoint \(r\)'s token count, \(n_g\) the number of grounding candidates, \(K\) the number of generated slots, and \(y_{uv}\in\{0,1\}\) the queried-edge label. \(\operatorname{Std}_{\mathrm{fit}}\) uses statistics frozen on the fitting universe for both endpoint and grounding features, while \(\operatorname{Enc}\) is the shared raw-token encoder. \(H_r\) are slot states; \(\pi_r\), \(m_r\), and \(g_r\) are slot existence, multiplicity, and grounding gates; \(Q_r\) is the pointer distribution over grounding candidates; and \(\widehat A_r\) is the symmetric within-endpoint slot adjacency. \(\Pi_{uv}\) is the cross-endpoint transport plan, \(\mathcal T_{uv}\) the stitched typed scaffold, and \(C_{\mathrm{topo}}^{rs},C_{\mathrm{cont}}^{rs}\) the topology and content token sequences. The states \(c_{rs}^{(0)}\), \(c_{rs}^{\mathrm{topo}}\), and \(c_{rs}^{\mathrm{cond}}\) are the base, topology-updated, and fully conditioned CLS vectors; \(z_{rs}\) is the directed embedding after \(\operatorname{Readout}\), which combines that CLS vector with mean, max, and attention summaries of both protein-token streams. Finally, \(\gamma_b\) is a learned scalar gate, \(\mu_b\) the synchronized centering statistic for branch \(b\), and \(\sigma\) the logistic sigmoid.</p>
+      <p><strong>Symbols.</strong> \(L_r\) is endpoint \(r\)'s token count, \(n_g\) the number of grounding candidates, \(K\) the number of generated slots, and \(y_{uv}\in\{0,1\}\) the queried-edge label. \(\operatorname{Std}_{\mathrm{fit}}\) uses statistics frozen on the fitting universe for both endpoint and grounding features, while \(\operatorname{Enc}\) is the shared raw-token encoder. \(H_r\) are slot states; \(\pi_r\), \(m_r\), and \(g_r\) are slot existence, multiplicity, and grounding gates; \(Q_r\) is the pointer distribution over grounding candidates; and \(\widehat A_r\) is the symmetric within-endpoint slot adjacency. \(\Pi_{uv}\) is the cross-endpoint transport plan, \(\mathcal T_{uv}\) the stitched typed scaffold, and \(C_{\mathrm{topo}}^{rs}\) the topology token sequence. The states \(c_{rs}^{(0)}\) and \(c_{rs}^{\mathrm{topo}}\) are the base and topology-updated CLS vectors; \(z_{rs}\) is the directed embedding after \(\operatorname{Readout}\). Finally, \(\gamma_{\mathrm{topo}}\) is the learned topology gate, \(\mu_{\mathrm{topo}}\) its synchronized centering statistic, and \(\sigma\) the logistic sigmoid.</p>
     </div>
   </section>
 
@@ -901,7 +879,7 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
         <div class="workflow-figure">
           <svg viewBox="0 0 1050 250" role="img" aria-labelledby="stage1-title stage1-desc">
             <title id="stage1-title">Ego-slot imagination and Hungarian supervision</title>
-            <desc id="stage1-desc">Endpoint features and grounding candidates enter a set decoder, producing K neighbor slots with content, existence, multiplicity, grounding, and adjacency. Predicted slots are matched to message-partition neighbors during training.</desc>
+            <desc id="stage1-desc">Endpoint features and grounding candidates enter a set decoder, producing K neighbor slots with content, existence, multiplicity, grounding, and adjacency. Predicted slots are matched to the same shared training-interaction neighbors used by classification.</desc>
             <defs><marker id="s1-arrow" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#73818b"/></marker><marker id="s1-red" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#b34f43"/></marker></defs>
             <rect class="box" x="18" y="42" width="150" height="76" rx="7"/><circle class="anchor" cx="53" cy="80" r="15"/><text x="53" y="84" text-anchor="middle" style="font-size:11px;font-weight:700;fill:white">u</text><text class="s-label" x="82" y="70">Endpoint tokens</text><text class="s-mono" x="82" y="89">x_u · frozen F0</text><text class="s-small" x="82" y="105">+ top-50 vocabulary</text>
             <path class="flow" d="M168 80 H218" marker-end="url(#s1-arrow)"/>
@@ -915,7 +893,7 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
             <path class="flow" d="M776 80 H820" marker-end="url(#s1-arrow)"/>
             <rect class="box" x="824" y="32" width="208" height="96" rx="7"/><text class="s-title" x="928" y="58" text-anchor="middle">Cached ego representation</text><text class="s-mono" x="928" y="82" text-anchor="middle">S_u = {(h,π,m,g,Â)}₁ᴷ</text><text class="s-small" x="928" y="104" text-anchor="middle">one slot set per endpoint node</text>
 
-            <rect class="box-red" x="271" y="177" width="448" height="54" rx="7"/><text class="s-label" x="292" y="198">Message-partition neighbors</text><circle cx="484" cy="203" r="7" fill="#faece9" stroke="#b34f43"/><circle cx="519" cy="203" r="7" fill="#faece9" stroke="#b34f43"/><circle cx="554" cy="203" r="7" fill="#faece9" stroke="#b34f43"/><text class="s-mono" x="593" y="207">feature + degree + overlap cost</text>
+            <rect class="box-red" x="271" y="177" width="448" height="54" rx="7"/><text class="s-label" x="292" y="198">Shared training neighbors</text><circle cx="484" cy="203" r="7" fill="#faece9" stroke="#b34f43"/><circle cx="519" cy="203" r="7" fill="#faece9" stroke="#b34f43"/><circle cx="554" cy="203" r="7" fill="#faece9" stroke="#b34f43"/><text class="s-mono" x="593" y="207">feature + degree + overlap cost</text>
             <path class="flow-red" d="M484 177 C484 151 544 151 560 73" marker-end="url(#s1-red)"/><path class="flow-red" d="M519 177 C519 151 587 151 612 74" marker-end="url(#s1-red)"/><path class="flow-red" d="M554 177 C554 151 635 151 667 72" marker-end="url(#s1-red)"/>
             <text class="s-micro" x="736" y="207" style="fill:#b34f43">HUNGARIAN · TRAINING ONLY</text>
           </svg>
@@ -962,28 +940,24 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
       <article class="workflow">
         <div class="workflow-intro">
           <span class="workflow-index">Stage 3</span>
-          <h3>Topology/content separation</h3>
-          <p class="workflow-caption">Structure and slot content travel through different token streams so topology-only evidence stays measurable.</p>
+          <h3>Structure-only topology encoding</h3>
+          <p class="workflow-caption">The stitched scaffold is encoded without a separate slot-content conditioning stream.</p>
           <div class="cite-row"><a class="cite" href="#ref-seal">Zhang &amp; Chen 2018 · SEAL</a><a class="cite" href="#ref-ncn">Wang et al. 2023 · NCN</a><a class="cite" href="#ref-graphtoken">Perozzi et al. 2024 · GraphToken</a></div>
         </div>
         <div class="workflow-figure">
           <svg viewBox="0 0 1050 250" role="img" aria-labelledby="stage3-title stage3-desc">
-            <title id="stage3-title">Separate topology and content encoders</title>
-            <desc id="stage3-desc">The stitched scaffold feeds only a structure-only message-passing encoder. The imagined endpoint slot sets independently feed a separate content-token pathway. Forbidden and allowed features are shown explicitly before both streams reach the pair model.</desc>
+            <title id="stage3-title">Structure-only topology encoder</title>
+            <desc id="stage3-desc">The stitched scaffold feeds a structure-only message-passing encoder. Full slot content and grounded identity are excluded from the classifier conditioning stream.</desc>
             <defs><marker id="s3-blue" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#2d67a3"/></marker><marker id="s3-amber" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#a76318"/></marker></defs>
             <rect class="box-green" x="20" y="24" width="170" height="88" rx="7"/><text class="s-title" x="105" y="45" text-anchor="middle">Stitched scaffold</text><circle class="anchor" cx="74" cy="78" r="8"/><circle class="anchor" cx="138" cy="78" r="8"/><circle class="slot" cx="91" cy="59" r="5"/><circle class="slot" cx="121" cy="59" r="5"/><circle class="slot" cx="105" cy="94" r="5"/><line class="edge-star" x1="74" y1="78" x2="91" y2="59"/><line class="edge-star" x1="138" y1="78" x2="121" y2="59"/><line class="edge-align" x1="91" y1="59" x2="121" y2="59"/><text class="s-mono" x="164" y="101" text-anchor="end">T̂_ij</text>
-            <rect class="box-amber" x="20" y="139" width="170" height="88" rx="7"/><text class="s-title" x="105" y="161" text-anchor="middle">Imagined slot sets</text><circle class="slot" cx="57" cy="190" r="7"/><circle class="slot" cx="82" cy="181" r="7"/><circle class="slot" cx="107" cy="192" r="7"/><circle class="slot" cx="132" cy="181" r="7"/><circle class="slot-faint" cx="157" cy="191" r="7"/><text class="s-mono" x="105" y="216" text-anchor="middle">S_i, S_j</text>
-            <path class="flow-blue" d="M190 68 H239" marker-end="url(#s3-blue)"/><path class="flow-amber" d="M190 183 H239" marker-end="url(#s3-amber)"/>
+            <path class="flow-blue" d="M190 68 H239" marker-end="url(#s3-blue)"/>
             <rect class="box-blue" x="243" y="19" width="515" height="97" rx="7"/><text class="s-micro" x="263" y="40" style="fill:#2d67a3">TOPOLOGY PATHWAY</text><text class="s-title" x="263" y="62">Structure-only scaffold encoder · STE</text>
             <rect x="263" y="76" width="93" height="23" rx="3" fill="#fff" stroke="#a7bfd7"/><rect x="365" y="76" width="93" height="23" rx="3" fill="#fff" stroke="#a7bfd7"/><rect x="467" y="76" width="93" height="23" rx="3" fill="#fff" stroke="#a7bfd7"/><rect x="569" y="76" width="169" height="23" rx="3" fill="#fff" stroke="#a7bfd7"/>
             <text class="s-small" x="309" y="91" text-anchor="middle">anchor type</text><text class="s-small" x="411" y="91" text-anchor="middle">π · m</text><text class="s-small" x="513" y="91" text-anchor="middle">soft degree</text><text class="s-small" x="653" y="91" text-anchor="middle">closed-wedge mass</text>
             <rect class="box-red" x="779" y="31" width="136" height="70" rx="5"/><text class="s-micro" x="847" y="51" text-anchor="middle" style="fill:#b34f43">FORBIDDEN</text><text class="s-small" x="847" y="70" text-anchor="middle">slot h · identity</text><text class="s-small" x="847" y="86" text-anchor="middle">grounded content</text>
             <path class="flow-blue" d="M915 66 H1008" marker-end="url(#s3-blue)"/><text class="s-mono" x="960" y="58" text-anchor="middle">c_topo</text>
 
-            <rect class="box-amber" x="243" y="134" width="672" height="97" rx="7"/><text class="s-micro" x="263" y="155" style="fill:#a76318">CONTENT PATHWAY</text><text class="s-title" x="263" y="177">Slot-content tokens</text>
-            <rect x="263" y="191" width="93" height="23" rx="3" fill="#fff" stroke="#ddbf8e"/><rect x="365" y="191" width="93" height="23" rx="3" fill="#fff" stroke="#ddbf8e"/><rect x="467" y="191" width="115" height="23" rx="3" fill="#fff" stroke="#ddbf8e"/><rect x="591" y="191" width="136" height="23" rx="3" fill="#fff" stroke="#ddbf8e"/><rect x="736" y="191" width="159" height="23" rx="3" fill="#fff" stroke="#ddbf8e"/>
-            <text class="s-small" x="309" y="206" text-anchor="middle">slot h</text><text class="s-small" x="411" y="206" text-anchor="middle">π · g</text><text class="s-small" x="524" y="206" text-anchor="middle">multiplicity</text><text class="s-small" x="659" y="206" text-anchor="middle">identity match</text><text class="s-small" x="815" y="206" text-anchor="middle">counterpart membership</text>
-            <path class="flow-amber" d="M915 183 H1008" marker-end="url(#s3-amber)"/><text class="s-mono" x="960" y="175" text-anchor="middle">c_cont</text>
+            <rect class="box-red" x="243" y="139" width="672" height="67" rx="7"/><text class="s-micro" x="579" y="160" text-anchor="middle" style="fill:#b34f43">NO SEPARATE CONTENT CONDITIONING PATH</text><text class="s-small" x="579" y="184" text-anchor="middle">slot semantics supervise generation but do not directly condition the edge classifier</text>
           </svg>
         </div>
       </article>
@@ -992,23 +966,22 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
         <div class="workflow-intro">
           <span class="workflow-index">Stage 4</span>
           <h3>Symmetric edge classification</h3>
-          <p class="workflow-caption">Two centered, zero-initialized gates inject generated evidence into a from-scratch AB/BA pair encoder.</p>
+          <p class="workflow-caption">One centered, zero-initialized topology gate injects generated structure into a from-scratch AB/BA pair encoder.</p>
           <div class="cite-row"><a class="cite" href="#ref-flamingo">Alayrac et al. 2022 · Flamingo</a></div>
         </div>
         <div class="workflow-figure">
           <svg viewBox="0 0 1050 250" role="img" aria-labelledby="stage4-title stage4-desc">
             <title id="stage4-title">Gated symmetric queried-pair classification</title>
-            <desc id="stage4-desc">Raw endpoint tokens run through shared AB and BA pair encoders. Separate centered topology and content cross-attention residuals condition the final pair block, and feature-wise abba max enforces symmetry before binary classification.</desc>
+            <desc id="stage4-desc">Raw endpoint tokens run through shared AB and BA pair encoders. A centered topology cross-attention residual conditions the final pair block, and feature-wise abba max enforces symmetry before binary classification.</desc>
             <defs><marker id="s4-arrow" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#73818b"/></marker><marker id="s4-blue" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#2d67a3"/></marker><marker id="s4-amber" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#a76318"/></marker></defs>
             <rect class="box" x="18" y="45" width="155" height="73" rx="7"/><text class="s-title" x="95" y="69" text-anchor="middle">Endpoint tokens</text><text class="s-mono" x="95" y="91" text-anchor="middle">tok_i · tok_j</text><text class="s-small" x="95" y="106" text-anchor="middle">raw pair evidence</text>
             <path class="flow" d="M173 82 H217" marker-end="url(#s4-arrow)"/>
             <rect class="box-dark" x="221" y="24" width="270" height="116" rx="7"/><text x="356" y="48" text-anchor="middle" style="font-size:14px;font-weight:700;fill:white">Shared Siamese pair trunk</text><rect x="244" y="66" width="102" height="45" rx="4" fill="#4a5964"/><rect x="366" y="66" width="102" height="45" rx="4" fill="#4a5964"/><text x="295" y="86" text-anchor="middle" style="font-family:var(--mono);font-size:10px;fill:white">AB pass</text><text x="295" y="101" text-anchor="middle" style="font-size:8px;fill:#dce4e9">i queries j</text><text x="417" y="86" text-anchor="middle" style="font-family:var(--mono);font-size:10px;fill:white">BA pass</text><text x="417" y="101" text-anchor="middle" style="font-size:8px;fill:#dce4e9">j queries i</text><text x="356" y="128" text-anchor="middle" style="font-family:var(--mono);font-size:8px;fill:#dce4e9">shared parameters</text>
-            <rect class="box-blue" x="221" y="166" width="205" height="57" rx="7"/><text class="s-label" x="323" y="186" text-anchor="middle">Topology conditioning</text><text class="s-mono" x="323" y="206" text-anchor="middle">tanh(g_topo) · [XAttn−μ_topo]</text>
-            <rect class="box-amber" x="447" y="166" width="205" height="57" rx="7"/><text class="s-label" x="549" y="186" text-anchor="middle">Content conditioning</text><text class="s-mono" x="549" y="206" text-anchor="middle">tanh(g_cont) · [XAttn−μ_cont]</text>
-            <path class="flow-blue" d="M323 166 V153 H349" marker-end="url(#s4-blue)"/><path class="flow-amber" d="M549 166 V153 H363" marker-end="url(#s4-amber)"/>
+            <rect class="box-blue" x="221" y="166" width="431" height="57" rx="7"/><text class="s-label" x="436" y="186" text-anchor="middle">Topology conditioning</text><text class="s-mono" x="436" y="206" text-anchor="middle">tanh(g_topo) · [XAttn−μ_topo]</text>
+            <path class="flow-blue" d="M436 166 V153 H356" marker-end="url(#s4-blue)"/>
             <circle cx="356" cy="153" r="7" fill="#fffdf8" stroke="#73818b" stroke-width="1.2"/>
             <path class="flow" d="M356 146 V113" marker-end="url(#s4-arrow)"/>
-            <text class="s-micro" x="431" y="238" text-anchor="middle">BOTH AB/BA · CENTERED · ZERO-INITIALIZED · FULL MODEL</text>
+            <text class="s-micro" x="431" y="238" text-anchor="middle">BOTH AB/BA · CENTERED TOPOLOGY GATE · FULL MODEL</text>
             <path class="flow" d="M491 82 H553" marker-end="url(#s4-arrow)"/>
             <rect class="box" x="557" y="45" width="184" height="73" rx="7"/><text class="s-title" x="649" y="69" text-anchor="middle">Symmetry operator</text><text class="s-mono" x="649" y="91" text-anchor="middle">abba_max(z′_AB, z′_BA)</text><text class="s-small" x="649" y="106" text-anchor="middle">feature-wise invariant</text>
             <path class="flow" d="M741 82 H785" marker-end="url(#s4-arrow)"/>
@@ -1021,13 +994,13 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
         <div class="workflow-intro">
           <span class="workflow-index">Stage 5</span>
           <h3>Full-model training</h3>
-          <p class="workflow-caption">The complete objective shapes generated structure and trains both conditioning pathways in one checkpoint.</p>
+          <p class="workflow-caption">The complete objective shapes generated structure and trains the topology-conditioning pathway in one checkpoint.</p>
           <div class="cite-row"><a class="cite" href="#ref-moddrop">Abdelaziz et al. 2020 · Modality dropout</a><a class="cite" href="#ref-ncn">Wang et al. 2023 · NCN</a></div>
         </div>
         <div class="workflow-figure">
           <svg viewBox="0 0 1050 250" role="img" aria-labelledby="stage5-title stage5-desc">
             <title id="stage5-title">Full-model training losses and output</title>
-            <desc id="stage5-desc">Edge, reconstruction, realism, consistency, and relational losses train one complete model whose topology and content pathways are both active at inference.</desc>
+            <desc id="stage5-desc">Edge, reconstruction, realism, consistency, and relational losses train one complete model whose topology-conditioning pathway is active at inference.</desc>
             <defs><marker id="s5-arrow" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#73818b"/></marker></defs>
             <text class="s-micro" x="20" y="25">TRAIN-SIDE PRESSURE</text>
             <rect class="box-red" x="20" y="42" width="135" height="52" rx="6"/><text class="s-label" x="87" y="63" text-anchor="middle">Edge objective</text><text class="s-mono" x="87" y="80" text-anchor="middle">L_edge</text>
@@ -1035,12 +1008,12 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
             <rect class="box-green" x="340" y="42" width="145" height="52" rx="6"/><text class="s-label" x="412" y="63" text-anchor="middle">Reality + SSL</text><text class="s-mono" x="412" y="80" text-anchor="middle">L_real · L_ssl</text>
             <rect class="box-blue" x="500" y="42" width="180" height="52" rx="6"/><text class="s-label" x="590" y="63" text-anchor="middle">Relational repair</text><text class="s-mono" x="590" y="80" text-anchor="middle">ptr · align · div · rel</text>
             <path class="flow" d="M87 94 V119 H720"/><path class="flow" d="M247 94 V119"/><path class="flow" d="M412 94 V119"/><path class="flow" d="M590 94 V119"/>
-            <rect class="box-dark" x="704" y="42" width="150" height="99" rx="7"/><text x="779" y="68" text-anchor="middle" style="font-size:13px;font-weight:700;fill:white">One checkpoint</text><text x="779" y="88" text-anchor="middle" style="font-family:var(--mono);font-size:9px;fill:#dce4e9">p_topo = 0.15</text><text x="779" y="104" text-anchor="middle" style="font-family:var(--mono);font-size:9px;fill:#dce4e9">p_cont = 0.15</text><text x="779" y="125" text-anchor="middle" style="font-size:8px;fill:#dce4e9">independent branch dropout</text>
+            <rect class="box-dark" x="704" y="42" width="150" height="99" rx="7"/><text x="779" y="68" text-anchor="middle" style="font-size:13px;font-weight:700;fill:white">One checkpoint</text><text x="779" y="91" text-anchor="middle" style="font-family:var(--mono);font-size:9px;fill:#dce4e9">p_topo = 0.15</text><text x="779" y="118" text-anchor="middle" style="font-size:8px;fill:#dce4e9">topology branch dropout</text>
             <path class="flow" d="M854 91 H897" marker-end="url(#s5-arrow)"/>
-            <rect class="box-blue" x="901" y="42" width="128" height="99" rx="7"/><text class="s-label" x="965" y="64" text-anchor="middle">Full inference</text><text class="s-small" x="965" y="84" text-anchor="middle">both pathways active</text><text class="s-mono" x="965" y="104" text-anchor="middle">topology ✓</text><text class="s-mono" x="965" y="121" text-anchor="middle">content ✓</text>
+            <rect class="box-blue" x="901" y="42" width="128" height="99" rx="7"/><text class="s-label" x="965" y="64" text-anchor="middle">Full inference</text><text class="s-small" x="965" y="88" text-anchor="middle">topology conditioned</text><text class="s-mono" x="965" y="112" text-anchor="middle">topology ✓</text>
 
             <text class="s-micro" x="20" y="170">ONE LOGIT · FULL MODEL · QUERIED PAIR</text>
-            <rect class="box-blue" x="20" y="184" width="1009" height="45" rx="6"/><text class="s-label" x="524" y="203" text-anchor="middle">full</text><text class="s-mono" x="524" y="219" text-anchor="middle">topology ✓ · content ✓ · p(y_ij = 1)</text>
+            <rect class="box-blue" x="20" y="184" width="1009" height="45" rx="6"/><text class="s-label" x="524" y="203" text-anchor="middle">full</text><text class="s-mono" x="524" y="219" text-anchor="middle">topology ✓ · p(y_ij = 1)</text>
           </svg>
         </div>
       </article>
@@ -1050,23 +1023,22 @@ svg .tap-n { font-family: var(--mono); font-size: 10px; font-weight: 700; fill: 
   <section aria-labelledby="ablations-title">
     <div class="section-head">
       <span class="section-no">03 / ABLATE</span>
-      <h2 id="ablations-title">Six-arm component ablation screen</h2>
+      <h2 id="ablations-title">Five trained arms + two scoring controls</h2>
       <span class="section-note">rev-3.2 · fixed-Seed-0 engineering evidence</span>
     </div>
     <div class="table-shell">
       <table aria-labelledby="ablations-title">
         <thead><tr><th>Arm</th><th>Role</th><th>Single controlled change</th><th>Question answered</th></tr></thead>
         <tbody>
-          <tr><td><code>full</code></td><td><span class="chip active">REFERENCE</span></td><td>Complete rev-3.2 model: <code>zscore_vfit_v1</code>, both conditioning pathways, <code>p_topo=p_cont=0.15</code>, and <code>w_rel=0.25</code>.</td><td>Does the complete topology-conditioned encoder improve queried-edge prediction?</td></tr>
+          <tr><td><code>full</code></td><td><span class="chip active">REFERENCE</span></td><td>Complete rev-3.2 model: <code>zscore_vfit_v1</code>, topology conditioning, <code>p_topo=0.15</code>, and <code>w_rel=0.25</code>.</td><td>Does the complete topology-conditioned encoder improve queried-edge prediction?</td></tr>
           <tr><td><code>b0_e2e_f_only</code></td><td>Matched null</td><td>Permanent all-head bypass; publish and score <code>f_logit</code>.</td><td>What can the matched from-scratch pair encoder do without generated context?</td></tr>
-          <tr><td><code>pair_topology</code></td><td>Pathway ablation</td><td>Permanent content-path bypass; retain pair evidence plus topology conditioning.</td><td>Does the topology pathway carry useful signal without slot-content conditioning?</td></tr>
-          <tr><td><code>p0</code></td><td>Regularization ablation</td><td>Set <code>p_topo=p_cont=0</code>; both pathways remain active, but branch dropout is removed.</td><td>Does branch dropout keep both conditioning pathways usable?</td></tr>
+          <tr><td><code>p0</code></td><td>Regularization ablation</td><td>Set <code>p_topo=0</code>; topology conditioning remains active, but branch dropout is removed.</td><td>Does branch dropout keep topology conditioning usable?</td></tr>
           <tr><td><code>no_l_rel</code></td><td>Objective ablation</td><td>Set <code>w_rel=0</code>; the train-only relational head remains absent from every scored logit.</td><td>Does relational training pressure create a useful topology representation?</td></tr>
           <tr><td><code>row_layernorm</code></td><td>Input ablation</td><td>Replace per-dimension <code>V_fit</code> z-scoring with the pre-D0 per-row LayerNorm; all other full-arm settings stay fixed.</td><td>Is population-calibrated feature standardization necessary for healthy slots and edge prediction?</td></tr>
         </tbody>
       </table>
     </div>
-    <div class="note-card" style="margin-top:12px"><p><strong>Shared contract:</strong> all six arms use the same Seed 0, 30-epoch schedule, <code>V_fit</code>/<code>V_hold</code> boundary, <code>n_ground=50</code>, checkpoint rule, and final binary queried-edge task. One registered factor changes at a time. The screen supports mechanism attribution as engineering evidence—not significance or cross-seed robustness.</p></div>
+    <div class="note-card" style="margin-top:12px"><p><strong>Shared contract:</strong> all five trained arms use the same Seed 0, 30-epoch schedule, <code>V_fit</code>/<code>V_hold</code> boundary, <code>n_ground=50</code>, checkpoint rule, and final binary queried-edge task. Two structure controls are scored from <code>full</code>. The screen supports mechanism attribution as engineering evidence—not significance or cross-seed robustness.</p></div>
   </section>
 
   <section class="references" aria-labelledby="references-title">

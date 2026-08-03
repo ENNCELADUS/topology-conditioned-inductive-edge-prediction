@@ -237,8 +237,6 @@ def test_retired_prebinding_probe_scopes_are_rejected_everywhere(retired_scope: 
             cast(probes.E2EProbeScope, retired_scope),
             data_root=Path("unused"),
             strategy="breadth_first",
-            partition_seed=0,
-            msg_fraction=0.8,
             expected_missing_features=(),
         )
 
@@ -261,8 +259,6 @@ def test_build_probe_scope_context_rebuilds_the_full_train_side_universe(
         "formal_train",
         data_root=tmp_path,
         strategy="breadth_first",
-        partition_seed=0,
-        msg_fraction=1.0,
         expected_missing_features=(),
     )
 
@@ -315,7 +311,6 @@ class TestE2EProbeArtifact:
             "registration_sha256": "a" * 64,
             "config_hash": "b" * 64,
             "seed": 0,
-            "partition_seed": 0,
             "strategy": "toy",
             "g_struct_sha256": probes.g_struct_sha256(graph),
             "scope": "formal_train",

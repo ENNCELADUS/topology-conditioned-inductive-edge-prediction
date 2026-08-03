@@ -92,10 +92,7 @@ def _cfg(tmp_path: Path, *, strategy: str = _STRATEGY, training: bool = True) ->
         data=te.EgoDataConfig(
             root=tmp_path / "data",
             strategy=strategy,
-            train_positives="e_sup",
             negative_ratio=5,
-            partition_seed=0,
-            msg_fraction=0.8,
             node_batch=2,
             edge_batch=4,
             f0_cache=caches / "f0_matrix.pt",
@@ -131,10 +128,11 @@ def _tiny_holdout(monkeypatch: pytest.MonkeyPatch) -> None:
 
     def tiny(
         train_nodes: list[str],
-        e_msg: frozenset[tuple[str, str]],
-        e_sup: frozenset[tuple[str, str]],
+        training_interactions: frozenset[tuple[str, str]],
     ) -> internal_holdout.InternalHoldoutPartition:
-        return internal_holdout.derive_internal_holdout(train_nodes, e_msg, e_sup, holdout_size=4)
+        return internal_holdout.derive_internal_holdout(
+            train_nodes, training_interactions, holdout_size=4
+        )
 
     monkeypatch.setattr(te, "derive_internal_holdout", tiny)
 
@@ -179,6 +177,19 @@ def _recorded_opens(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[Path]]:
 def _benchmark_reads(opened: list[Path], tmp_path: Path) -> list[Path]:
     benchmark_root = (tmp_path / "data" / te._BENCHMARK_SUBDIR).resolve()
     return [path for path in opened if benchmark_root in path.resolve().parents]
+
+
+def test_missing_validation_rejection_source_fails_before_cache_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    strategy_dir = _write_train_side_root(tmp_path)
+    (strategy_dir / "val_edges.txt").unlink()
+    _tiny_holdout(monkeypatch)
+
+    with pytest.raises(FileNotFoundError, match="validation-positive rejection source"):
+        te.assemble_egostitch_data(_cfg(tmp_path))
+
+    assert not (tmp_path / "caches").exists()
 
 
 _ALL_RUN_KINDS: list[te.E2ERunKind | None] = ["formal", "debug", None]

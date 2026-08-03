@@ -1,5 +1,9 @@
 # EgoStitch rev-3.1 relational repair — implementation plan
 
+> **2026-08-03 data-contract disposition:** every message/supervision split in this
+> historical plan is superseded by spec §9.3. Topology and classification now use the
+> same complete train-side positive interactions.
+
 **Status: implementation-only.** The binding contract is `docs/05-egostitch-spec.md`
 §14.4 (landed 2026-07-25, commit `0fef801`) plus the `docs/03-experiment-protocol.md`
 §0 amendment. The decision trail is
