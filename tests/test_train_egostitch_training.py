@@ -140,11 +140,7 @@ def test_formal_output_metadata_matches_scorer_contract(tmp_path: Path) -> None:
     data = SimpleNamespace(
         rho_train=0.1,
         validation_role=te._E2E_VALIDATION_ROLE,
-        access_audit={
-            "observed_training_access": [],
-            "training_interactions_sha256": "a" * 64,
-            "training_topology_sha256": "b" * 64,
-        },
+        access_audit={"observed_training_access": []},
     )
     metrics = te.EdgeMetrics(
         auroc=0.5,

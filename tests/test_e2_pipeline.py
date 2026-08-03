@@ -516,9 +516,6 @@ def _write_train_outputs(output_dir: Path) -> None:
         "val_metrics": {},
         "seed": 47,
         "config": {},
-        "data_contract": "shared_train_positives_v1",
-        "training_interactions_sha256": "a" * 64,
-        "training_topology_sha256": "b" * 64,
     }
     torch.save(checkpoint, output_dir / "best.pt")
     torch.save({**checkpoint, "epoch": 2}, output_dir / "last.pt")
@@ -527,12 +524,7 @@ def _write_train_outputs(output_dir: Path) -> None:
     )
     (output_dir / "run_metadata.json").write_text(
         json.dumps(
-            {
-                "config_hash": "abc123",
-                "data_contract": "shared_train_positives_v1",
-                "training_interactions_sha256": "a" * 64,
-                "training_topology_sha256": "b" * 64,
-            }
+            {"config_hash": "abc123"}
         )
     )
 

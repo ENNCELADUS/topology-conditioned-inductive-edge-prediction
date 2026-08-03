@@ -595,8 +595,9 @@ rule).
    scoring-time structure controls. The content pathway is deleted, making
    `pair_topology` identical to `full`, so that arm is retired; `cosine_pool` is
    also retired. Runs execute directly without a registration or plan-identity
-   gate. Checkpoint, score, and G5 provenance instead bind the shared
-   training-interaction contract and matching interaction/topology digests.
+   gate, and checkpoints/score artifacts carry no training-data identity field
+   (spec §12, 2026-08-03) — keeping shared-interaction runs apart from older
+   80/20-partition ones is an owner-side responsibility, not a gate.
 
 ### 5.1 Priority order (after gates)
 

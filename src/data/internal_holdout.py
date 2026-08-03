@@ -179,13 +179,9 @@ def derive_internal_holdout(
     training_interactions_fit = frozenset(
         (u, v) for u, v in interactions if u in v_fit and v in v_fit
     )
-    topology_fit = frozenset((u, v) for u, v in topology if u in v_fit and v in v_fit)
+    # Topology is the loopless projection of the same interactions, by construction.
+    topology_fit = frozenset((u, v) for u, v in training_interactions_fit if u != v)
     topology_hold = frozenset((u, v) for u, v in topology if u in v_hold and v in v_hold)
-    expected_topology_fit = frozenset(
-        (u, v) for u, v in training_interactions_fit if u != v
-    )
-    if topology_fit != expected_topology_fit:
-        raise AssertionError("training topology is not the loopless interaction projection")
 
     partitions = {"fit": v_fit, "hold": v_hold}
     quarantine = QuarantineCounts(

@@ -1034,8 +1034,10 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   the completed historical screen only. The active contract is the seven-arm
   direct-run screen in spec §14.4.6–14.4.7: five trained checkpoints plus two
   scoring-time controls. The content pathway is deleted, so `pair_topology` is
-  retired as identical to `full`. There is no registration or plan-identity gate;
-  checkpoint, score, and G5 provenance bind the shared training-interaction contract.
+  retired as identical to `full`. There is no registration or plan-identity gate, and
+  no training-data identity field on checkpoints or score artifacts (spec §12,
+  2026-08-03); separating shared-interaction runs from older 80/20-partition ones is
+  owner-side.
 
 ### 6.1 Method rows
 

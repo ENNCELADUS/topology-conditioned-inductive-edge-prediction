@@ -146,28 +146,28 @@ class EgoTargetBuilder:
         self, node: str, exclude_neighbor: str | None = None
     ) -> tuple[float, float, float, float]:
         """Return real-side ego statistics after an optional leave-one-out removal."""
-        effective_exclusion = (
-            exclude_neighbor if exclude_neighbor in self._neighbors.get(node, []) else None
-        )
-        key = (node, effective_exclusion)
-        cached = self._ego_stats.get(key)
+        # Keyed by the *effective* exclusion so a non-neighbor partner shares the
+        # plain node entry. The table is O(|V| + |E_fit|) four-float tuples (~6 MB
+        # here); dropping the leave-one-out half costs ~21 s of recompute per
+        # epoch per rank on the training-step path, which is the wrong trade.
+        excluded = exclude_neighbor if self._g.has_edge(node, exclude_neighbor) else None
+        cached = self._ego_stats.get((node, excluded))
         if cached is not None:
             return cached
-        neighbors = [
-            neighbor
-            for neighbor in self._neighbors.get(node, [])
-            if neighbor != effective_exclusion
-        ]
-        degree = float(len(neighbors))
-        neighbor_edges = self._g.subgraph(neighbors).number_of_edges()
-        clustering = (
-            float(2 * neighbor_edges / (len(neighbors) * (len(neighbors) - 1)))
-            if len(neighbors) > 1
-            else 0.0
-        )
+        neighbors = [n for n in self._neighbors.get(node, []) if n != excluded]
         ego = self._g.subgraph([node, *neighbors])
-        stats = (degree, clustering, float(ego.number_of_edges()), float(nx.density(ego)))
-        self._ego_stats[key] = stats
+        degree = len(neighbors)
+        # Every neighbor contributes exactly one edge to `node`, so the remaining
+        # ego edges are the neighbor-neighbor ones `nx.clustering` counts.
+        neighbor_edges = ego.number_of_edges() - degree
+        clustering = 2 * neighbor_edges / (degree * (degree - 1)) if degree > 1 else 0.0
+        stats = (
+            float(degree),
+            float(clustering),
+            float(ego.number_of_edges()),
+            float(nx.density(ego)),
+        )
+        self._ego_stats[(node, excluded)] = stats
         return stats
 
     def _select_targets(
@@ -239,21 +239,13 @@ class EgoTargetBuilder:
         target_node_index = np.full((batch, k), -1, dtype=np.int64)
         ego_stats = np.zeros((batch, 4), dtype=np.float32)
 
-        for b, (node, excluded_neighbor) in enumerate(
-            zip(node_ids, exclusions, strict=True)
-        ):
-            selected, labels = self._select_targets(
-                node, rng, exclude_neighbor=excluded_neighbor
-            )
+        for b, (node, excluded_neighbor) in enumerate(zip(node_ids, exclusions, strict=True)):
+            selected, labels = self._select_targets(node, rng, exclude_neighbor=excluded_neighbor)
             if self._feature_read_observer is not None:
                 self._feature_read_observer(selected)
-            degree[b] = float(
-                sum(
-                    neighbor != excluded_neighbor
-                    for neighbor in self._neighbors.get(node, [])
-                )
-            )
-            ego_stats[b] = self._node_ego_stats(node, excluded_neighbor)
+            stats = self._node_ego_stats(node, excluded_neighbor)
+            degree[b] = stats[0]
+            ego_stats[b] = stats
             pool: dict[str, int] = self._pool.get(node, {})
             for t, (v, label) in enumerate(zip(selected, labels, strict=True)):
                 features[b, t] = self._f0[self._index[v]]

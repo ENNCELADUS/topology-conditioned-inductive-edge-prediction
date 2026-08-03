@@ -976,7 +976,7 @@ def assemble_data(cfg: Config, *, verify: bool = True) -> AssembledData:
         if label == 1
     ]
     interactions = derive_training_interactions(train_plus)
-    training_positives = sorted(interactions.classification_positives)
+    training_positives = sorted(interactions.positives)
     g_struct = build_g_struct(bench.split.train_nodes, interactions.topology_edges)
     degrees = {str(node): int(degree) for node, degree in g_struct.degree()}
 

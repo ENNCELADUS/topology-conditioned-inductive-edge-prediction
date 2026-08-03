@@ -182,9 +182,6 @@ def _write_e2e_universe_npz(
         "num_rows": len(pairs),
         "created_utc": "2026-07-17T00:00:00+00:00",
         "torch_version": "2.10.0",
-        "data_contract": "shared_train_positives_v1",
-        "training_interactions_sha256": "a" * 64,
-        "training_topology_sha256": "b" * 64,
         "score_precision": {
             "contract": "egostitch_e2e_pair_fp32_v1",
             "encode_autocast": "off",
@@ -435,9 +432,6 @@ def _write_trained_arm_metadata(
         json.dumps(
             {
                 "checkpoint_id": checkpoint_id,
-                "data_contract": "shared_train_positives_v1",
-                "training_interactions_sha256": "a" * 64,
-                "training_topology_sha256": "b" * 64,
                 "arm": name,
                 "run_kind": "formal",
                 "seed": 0,
@@ -618,23 +612,6 @@ class TestBuildE2EArmSummary:
         assert set(full_deltas) == {"full_minus_f_logit"}
         rerun = g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
         assert json.dumps(payload, sort_keys=True) == json.dumps(rerun, sort_keys=True)
-
-    def test_rejects_trained_arms_from_different_training_data(self, tmp_path: Path) -> None:
-        inputs = _seven_arm_inputs(tmp_path)
-        metadata_path = _d(inputs["run_metadata_paths"])["p0"]
-        metadata = json.loads(metadata_path.read_text())
-        metadata["training_interactions_sha256"] = "c" * 64
-        metadata_path.write_text(json.dumps(metadata))
-        artifact_path = _d(inputs["arm_universe_paths"])["p0"]
-        artifact = load_scores(artifact_path)
-        artifact_meta = dict(artifact.meta)
-        artifact_meta["training_interactions_sha256"] = "c" * 64
-        _rewrite_e2e_artifact(artifact_path, meta=artifact_meta)
-
-        with pytest.raises(ValueError, match="does not share full's training-data provenance"):
-            g5_stage1.build_e2e_arm_summary(
-                liveness_config=_E2E_LIVENESS_CONFIG, **inputs
-            )
 
     def test_rejects_unknown_arm(self, tmp_path: Path) -> None:
         inputs = _seven_arm_inputs(tmp_path)

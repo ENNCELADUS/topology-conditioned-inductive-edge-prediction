@@ -94,9 +94,6 @@ def test_scores_meta_version_is_written_and_older_versions_are_rejected(
             "num_rows": 1,
             "created_utc": "2026-07-26T00:00:00Z",
             "torch_version": "test",
-            "data_contract": "shared_train_positives_v1",
-            "training_interactions_sha256": "a" * 64,
-            "training_topology_sha256": "b" * 64,
             "permanent_null": "none",
             "primary_logit": "full",
             "score_precision": {

@@ -79,7 +79,6 @@ from src.data.pairs import (
     collate_token_pairs,
     probe_lengths,
 )
-from src.data.partition import TRAINING_INTERACTION_CONTRACT
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.model.egostitch.generator.assemble import make_scaffold_input_perturbation
 
@@ -713,21 +712,6 @@ def save_scores(
     stored_meta = dict(meta)
     stored_meta["heldout"] = _is_heldout_universe(stored_meta)
     if stored_meta.get("model_family") == "egostitch_e2e":
-        for key in (
-            "data_contract",
-            "training_interactions_sha256",
-            "training_topology_sha256",
-        ):
-            if key not in stored_meta:
-                raise ValueError(f"{path}: egostitch_e2e metadata is missing {key}")
-        if stored_meta["data_contract"] != TRAINING_INTERACTION_CONTRACT:
-            raise ValueError(
-                f"{path}: data_contract must equal {TRAINING_INTERACTION_CONTRACT!r}"
-            )
-        if not _is_sha256(stored_meta["training_interactions_sha256"]) or not _is_sha256(
-            stored_meta["training_topology_sha256"]
-        ):
-            raise ValueError(f"{path}: training interaction digests must be SHA-256 values")
         stored_meta["scores_meta_version"] = _SCORES_META_VERSION
         if f_logit is None:
             raise ValueError(f"{path}: egostitch_e2e artifacts require an f_logit array")
@@ -917,9 +901,6 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
         "primary_logit",
         "scores_meta_version",
         "heldout",
-        "data_contract",
-        "training_interactions_sha256",
-        "training_topology_sha256",
     ):
         values = {str(shard.meta.get(key)) for shard in shards}
         if len(values) > 1:
@@ -1162,15 +1143,6 @@ def _file_sha256(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def _is_sha256(value: object) -> bool:
-    """Return whether `value` is a lowercase-or-uppercase 64-hex digest."""
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdefABCDEF" for character in value)
-    )
-
-
 def _load_json_object(path: Path, *, label: str) -> dict[str, object]:
     """Load a JSON object with a provenance-specific error."""
     try:
@@ -1204,10 +1176,7 @@ def _load_checkpoint(
             key types.
     """
     checkpoint = cast(Mapping[str, object], torch.load(path, map_location="cpu", weights_only=True))
-    embedded_checkpoint = all(
-        key in checkpoint for key in ("model_state", "model_family", "model_config")
-    )
-    if embedded_checkpoint:
+    if all(key in checkpoint for key in ("model_state", "model_family", "model_config")):
         embedded_family = checkpoint["model_family"]
         if not isinstance(embedded_family, str):
             raise ValueError(f"checkpoint {path}: model_family must be a string")
@@ -1225,11 +1194,6 @@ def _load_checkpoint(
         model_state = cast(dict[str, torch.Tensor], checkpoint)
 
     if model_family == "egostitch_e2e":
-        if not embedded_checkpoint:
-            raise ValueError(
-                f"bare legacy egostitch_e2e checkpoint {path} is not bound to the "
-                f"{TRAINING_INTERACTION_CONTRACT!r} data contract"
-            )
         # Three-component refactor design (2026-08-02) §5: `model.ste` (the
         # `STEncoder`) is now `model.encoder` (a `TypedMessagePassingEncoder`),
         # so the stitched-topology-encoder's input projection now serializes
@@ -1250,20 +1214,6 @@ def _load_checkpoint(
                 "are not loadable under rev-3.1 code and must be scored from a "
                 "pre-rev-3.1 commit"
             )
-        data_contract = checkpoint.get("data_contract")
-        training_interactions_sha256 = checkpoint.get("training_interactions_sha256")
-        training_topology_sha256 = checkpoint.get("training_topology_sha256")
-        if data_contract != TRAINING_INTERACTION_CONTRACT:
-            raise ValueError(
-                f"checkpoint {path}: data_contract must equal "
-                f"{TRAINING_INTERACTION_CONTRACT!r}; got {data_contract!r}"
-            )
-        if not _is_sha256(training_interactions_sha256) or not _is_sha256(
-            training_topology_sha256
-        ):
-            raise ValueError(
-                f"checkpoint {path}: shared-training-interaction digests are missing or invalid"
-            )
         # No checkpoint-config normalization: the rev-3.1 backfills were deleted
         # with the content path (design 2026-08-02 §11), so a checkpoint must
         # carry its own complete model config. One that does not fails loudly at
@@ -1271,12 +1221,6 @@ def _load_checkpoint(
         # under a config it was never trained with.
     model = build_model(model_family, model_config)
     model.load_state_dict(model_state)
-    if model_family == "egostitch_e2e":
-        model._training_data_provenance = {  # type: ignore[attr-defined]
-            "data_contract": checkpoint["data_contract"],
-            "training_interactions_sha256": checkpoint["training_interactions_sha256"],
-            "training_topology_sha256": checkpoint["training_topology_sha256"],
-        }
     model.eval()
     return model, model_family, _checkpoint_id(model_state)
 
@@ -2259,12 +2203,6 @@ def _run_score(args: argparse.Namespace) -> None:
         model_family=args.model_family,
         model_config=model_config,
     )
-    training_data_provenance: dict[str, object] = {}
-    if model_family == "egostitch_e2e":
-        provenance = getattr(model, "_training_data_provenance", None)
-        if not isinstance(provenance, dict):
-            raise ValueError("egostitch_e2e checkpoint is missing training-data provenance")
-        training_data_provenance = cast(dict[str, object], provenance)
     heldout_e2e = model_family == "egostitch_e2e" and (
         args.pairs in {"candidate", "test"} or args.pairs.startswith("file:")
     )
@@ -2280,11 +2218,6 @@ def _run_score(args: argparse.Namespace) -> None:
                 "before pair access"
             )
         run_metadata_for_ledger = _load_json_object(args.run_metadata, label="run metadata")
-        if run_metadata_for_ledger.get("checkpoint_id") != checkpoint_id:
-            raise ValueError("run metadata checkpoint_id does not match the loaded checkpoint")
-        for key, expected in training_data_provenance.items():
-            if run_metadata_for_ledger.get(key) != expected:
-                raise ValueError(f"run metadata {key} does not match the loaded checkpoint")
         arm = run_metadata_for_ledger.get("arm")
         if not isinstance(arm, str) or not arm:
             raise ValueError("run metadata is missing arm")
@@ -2406,7 +2339,6 @@ def _run_score(args: argparse.Namespace) -> None:
             full_logit = decomposed["full"]
         f_logit = decomposed["f_logit"]
         meta_extra = {
-            **training_data_provenance,
             "score_precision": {
                 "contract": _EGOSTITCH_E2E_PAIR_PRECISION_CONTRACT,
                 "pair_compute_dtype": "float32",

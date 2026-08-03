@@ -36,8 +36,6 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import cast
 
-from src.data.partition import TRAINING_INTERACTION_CONTRACT
-
 logger = logging.getLogger(__name__)
 
 
@@ -513,9 +511,6 @@ _CHECKPOINT_KEYS = {
     "val_metrics",
     "seed",
     "config",
-    "data_contract",
-    "training_interactions_sha256",
-    "training_topology_sha256",
 }
 _PUBLISHED_FILENAMES = (
     "best.pt",
@@ -546,7 +541,6 @@ def _validate_staged_artifacts(
         path = staging_dir / filename
         if not path.is_file() or path.stat().st_size <= 0:
             raise ValueError(f"{filename} is missing or empty")
-    checkpoint_provenance: dict[str, object] | None = None
     for filename, exact_epoch in (("best.pt", None), ("last.pt", epochs)):
         payload = torch.load(staging_dir / filename, map_location="cpu", weights_only=False)
         if not isinstance(payload, dict) or set(payload) != _CHECKPOINT_KEYS:
@@ -558,28 +552,6 @@ def _validate_staged_artifacts(
             raise ValueError(f"{filename} epoch is invalid")
         if exact_epoch is not None and epoch != exact_epoch:
             raise ValueError(f"{filename} epoch must equal {exact_epoch}")
-        provenance = {
-            key: payload[key]
-            for key in (
-                "data_contract",
-                "training_interactions_sha256",
-                "training_topology_sha256",
-            )
-        }
-        if provenance["data_contract"] != TRAINING_INTERACTION_CONTRACT:
-            raise ValueError(f"{filename} has an invalid training-interaction contract")
-        for key in ("training_interactions_sha256", "training_topology_sha256"):
-            value = provenance[key]
-            if not (
-                isinstance(value, str)
-                and len(value) == 64
-                and all(character in "0123456789abcdefABCDEF" for character in value)
-            ):
-                raise ValueError(f"{filename} has an invalid {key}")
-        if checkpoint_provenance is None:
-            checkpoint_provenance = provenance
-        elif provenance != checkpoint_provenance:
-            raise ValueError("best.pt and last.pt training-data provenance differs")
     metric_rows: list[object] = []
     with (staging_dir / "metrics.jsonl").open(encoding="utf-8") as handle:
         for line in handle:
@@ -594,10 +566,6 @@ def _validate_staged_artifacts(
     metadata = json.loads((staging_dir / "run_metadata.json").read_text(encoding="utf-8"))
     if not isinstance(metadata, dict):
         raise ValueError("run_metadata.json must contain an object")
-    assert checkpoint_provenance is not None
-    for key, expected in checkpoint_provenance.items():
-        if metadata.get(key) != expected:
-            raise ValueError(f"run_metadata.json {key} does not match the checkpoints")
     if require_v_hold_validation_events:
         evidence = metadata.get("v_hold_validation_evidence")
         if not isinstance(evidence, dict):

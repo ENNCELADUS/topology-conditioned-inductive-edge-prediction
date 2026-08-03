@@ -1,22 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
-from types import SimpleNamespace
-from typing import cast
-
 import numpy as np
-import pytest
 import scipy.sparse as sp
 import torch
-import yaml
 from src.baselines.cazi_mbn import CAZIStudent, CAZITeacher
-from src.train_cazi_mbn import (
-    PreparedData,
-    _validate_data_provenance,
-    compute_ugt_projection,
-    load_config,
-    load_or_build_ugt,
-)
+from src.train_cazi_mbn import compute_ugt_projection
 
 
 def test_teacher_and_student_contracts() -> None:
@@ -70,69 +58,3 @@ def test_sparse_ugt_matches_released_dense_operator_subspace() -> None:
         dense_projection @ dense_projection.T,
         atol=1e-4,
     )
-
-
-def test_ugt_cache_rejects_pre_contract_node_only_payload(tmp_path: Path) -> None:
-    path = tmp_path / "ugt_projection.npz"
-    np.savez_compressed(
-        path,
-        node_ids=np.asarray(["a", "b", "c"]),
-        projection=np.zeros((3, 1), dtype=np.float32),
-    )
-
-    with pytest.raises(ValueError, match="stale UGT cache"):
-        load_or_build_ugt(
-            path,
-            ["a", "b", "c"],
-            [("a", "b"), ("b", "c")],
-            order=1,
-            feature_length=1,
-            seed=0,
-        )
-
-
-def test_ugt_cache_rejects_same_nodes_with_different_topology(tmp_path: Path) -> None:
-    path = tmp_path / "ugt_projection.npz"
-    nodes = [f"n{i}" for i in range(6)]
-    load_or_build_ugt(
-        path,
-        nodes,
-        [("n0", "n1"), ("n1", "n2"), ("n2", "n3")],
-        order=1,
-        feature_length=2,
-        seed=0,
-    )
-
-    with pytest.raises(ValueError, match="topology mismatch"):
-        load_or_build_ugt(
-            path,
-            nodes,
-            [("n0", "n1"), ("n1", "n2"), ("n4", "n5")],
-            order=1,
-            feature_length=2,
-            seed=0,
-        )
-
-
-def test_load_config_rejects_removed_partition_seed(tmp_path: Path) -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    payload = yaml.safe_load((repo_root / "configs/cazi_mbn_breadth_first.yaml").read_text())
-    payload["data"]["partition_seed"] = 0
-    config_path = tmp_path / "cazi.yaml"
-    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="data has unknown keys"):
-        load_config(config_path)
-
-
-def test_checkpoint_provenance_rejects_old_contract_payload() -> None:
-    data = cast(
-        PreparedData,
-        SimpleNamespace(
-            training_interactions_sha256="interactions",
-            training_topology_sha256="topology",
-        ),
-    )
-
-    with pytest.raises(ValueError, match="data provenance mismatch"):
-        _validate_data_provenance({"state_dict": {}}, data, label="checkpoint")

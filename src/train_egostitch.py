@@ -55,10 +55,7 @@ from src.data.grounding import build_grounding_pool
 from src.data.internal_holdout import InternalHoldoutPartition, derive_internal_holdout
 from src.data.packed_features import PackedFeatureManifest, PackedFeatureTable
 from src.data.pairs import NegativeSampler
-from src.data.partition import (
-    TRAINING_INTERACTION_CONTRACT,
-    derive_training_interactions,
-)
+from src.data.partition import derive_training_interactions
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.eval.graph_metrics import MMDConfig, clustering_histogram, mmd_squared
 from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
@@ -1435,14 +1432,6 @@ def _sha256_file(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def _is_sha256(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdefABCDEF" for character in value)
-    )
-
-
 # The held-out artifacts no training-side stage may read (design 2026-07-29
 # Sec 3.1). Named once so every stage -- the two-stage e2e assembly, its
 # `cfg.training is None` sibling, and the pack builder that precedes both --
@@ -1588,12 +1577,8 @@ def prepare_pack(
     # assembly let the pack consume held-out rows and bake them into the F0,
     # grounding and feature-statistics caches the assembly then reuses.
     strategy_dir = _assert_input_boundary(cfg)
-    val_path = strategy_dir / "val_edges.txt"
-    if not val_path.is_file():
-        raise FileNotFoundError(
-            f"required validation-positive rejection source is missing: {val_path}"
-        )
-    _read_labeled_pairs(val_path)
+    # Fail before any cache is written if assembly's rejection source is unusable.
+    _validation_positives(strategy_dir)
     # Call-time import preserves the pack builder/validator monkeypatch seam.
     from src.data import packed_features
 
@@ -1851,8 +1836,20 @@ def _read_labeled_pairs(path: Path) -> tuple[list[tuple[str, str]], NDArray[np.i
     return pairs, np.asarray(labels, dtype=np.int8)
 
 
-def _sha256_pairs(pairs: Sequence[tuple[str, str]]) -> str:
-    return hashlib.sha256("".join(f"{u}\t{v}\n" for u, v in sorted(pairs)).encode()).hexdigest()
+def _validation_positives(strategy_dir: Path) -> set[tuple[str, str]]:
+    """Read the val-positive set assembly uses only to reject sampled negatives.
+
+    Raises:
+        FileNotFoundError: If ``val_edges.txt`` is absent, which would silently
+            weaken negative rejection instead of failing the run.
+    """
+    val_path = strategy_dir / "val_edges.txt"
+    if not val_path.is_file():
+        raise FileNotFoundError(
+            f"required validation-positive rejection source is missing: {val_path}"
+        )
+    pairs, labels = _read_labeled_pairs(val_path)
+    return {pair for pair, label in zip(pairs, labels, strict=True) if int(label) == 1}
 
 
 def _assemble_e2e_data(
@@ -1886,15 +1883,7 @@ def _assemble_e2e_data(
     positives = [
         pair for pair, label in zip(train_pairs, train_labels, strict=True) if int(label) == 1
     ]
-    val_path = strategy_dir / "val_edges.txt"
-    if not val_path.is_file():
-        raise FileNotFoundError(
-            f"required validation-positive rejection source is missing: {val_path}"
-        )
-    val_pairs, val_labels = _read_labeled_pairs(val_path)
-    benchmark_val_positives = {
-        pair for pair, label in zip(val_pairs, val_labels, strict=True) if int(label) == 1
-    }
+    benchmark_val_positives = _validation_positives(strategy_dir)
     interactions = derive_training_interactions(positives)
     holdout = derive_internal_holdout(train_nodes_all, interactions.positives)
     # One universe pair for both stages (design 2026-07-29 Sec 2): training is
@@ -1974,8 +1963,7 @@ def _assemble_e2e_data(
         slots=generator_cfg.slots,
     )
     degrees = {node: int(g_fit.degree(node)) for node in fit_nodes}
-    rejection_positives = set(interactions.positives) | benchmark_val_positives
-    validation_positive_membership_used = True
+    rejection_positives = interactions.positives | benchmark_val_positives
     sampler = NegativeSampler(fit_nodes, degrees, frozenset(rejection_positives))
     n_fit = len(fit_nodes)
     rho_train = g_fit.number_of_edges() / (math.comb(n_fit, 2) + n_fit)
@@ -1989,20 +1977,12 @@ def _assemble_e2e_data(
             "".join(f"{node}\n" for node in fit_nodes).encode()
         ).hexdigest(),
         "validation_feature_nodes_sha256": validation.nodes_sha256,
-        "training_interactions_sha256": _sha256_pairs(
-            sorted(holdout.training_interactions_fit)
-        ),
-        "training_topology_sha256": _sha256_pairs(sorted(holdout.topology_fit)),
         "training_endpoints_within_v_fit": True,
-        "classification_uses_all_training_interactions": True,
-        "topology_is_nonself_projection_of_training_interactions": True,
         "structural_target_equals_nonself_training_interactions": {
             canonical_pair(u, v) for u, v in g_fit.edges()
         }
         == set(holdout.topology_fit),
-        "validation_positive_membership_used_for_negative_rejection_only": (
-            validation_positive_membership_used
-        ),
+        "validation_positive_membership_used_for_negative_rejection_only": True,
         "forbidden_files_absent": forbidden_files_absent,
         "quarantine_counts": asdict(holdout.quarantine_counts),
         "overlap_proof": asdict(holdout.overlap_proof),
@@ -5093,8 +5073,9 @@ def write_outputs(
 ) -> None:
     """Write the pinned Task-4 artifacts and finalize the run's metadata record.
 
-    ``best.pt``/``last.pt`` and ``run_metadata.json`` bind the shared-training-
-    interaction contract and both canonical training-interaction digests.
+    ``best.pt``/``last.pt`` carry exactly the seven pinned payload keys;
+    ``run_metadata.json`` additionally records the s0 checkpoint identity and the
+    measured ``rho_train``.
     """
     output_dir = cfg.output_dir
     config_dict = config_to_dict(cfg)
@@ -5105,20 +5086,6 @@ def write_outputs(
     expected_run_kind = "debug" if debug else (cfg.run_kind or "formal")
     if run_metadata.get("run_kind") != expected_run_kind:
         raise RuntimeError("run kind changed after run start; refusing to finalize artifacts")
-    access_audit = data.access_audit
-    if not isinstance(access_audit, Mapping):
-        raise RuntimeError("training access audit is missing")
-    training_interactions_sha256 = access_audit.get("training_interactions_sha256")
-    training_topology_sha256 = access_audit.get("training_topology_sha256")
-    if not _is_sha256(training_interactions_sha256) or not _is_sha256(
-        training_topology_sha256
-    ):
-        raise RuntimeError("training access audit is missing canonical interaction digests")
-    data_provenance = {
-        "data_contract": TRAINING_INTERACTION_CONTRACT,
-        "training_interactions_sha256": training_interactions_sha256,
-        "training_topology_sha256": training_topology_sha256,
-    }
     validation_events = result.runtime_profile.get("v_hold_validation_events")
     validation_event_count = result.runtime_profile.get("v_hold_validation_event_count")
     validation_evidence: dict[str, object] | None = None
@@ -5158,7 +5125,6 @@ def write_outputs(
             "val_metrics": asdict(metrics),
             "seed": cfg.seed,
             "config": config_dict,
-            **data_provenance,
         }
 
     best_path = output_dir / "best.pt"
@@ -5200,8 +5166,7 @@ def write_outputs(
             "validation_liveness_pass": validation_liveness_observed,
             "validation_role": data.validation_role,
             "v_hold_validation_evidence": validation_evidence,
-            "access_audit": access_audit,
-            **data_provenance,
+            "access_audit": data.access_audit,
             "kendall_fallback": result.kendall_state,
             "training_diagnostics": {
                 "fidelity_series": [entry["fidelity"] for entry in result.history],

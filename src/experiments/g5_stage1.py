@@ -63,7 +63,6 @@ from scipy.stats import spearmanr
 
 from src.data.artifacts import load_candidate_pairs
 from src.data.features import FeatureStore
-from src.data.partition import TRAINING_INTERACTION_CONTRACT
 from src.eval.assembly import assemble_graph, density_matched_threshold
 from src.eval.graph_metrics import (
     MMDConfig,
@@ -812,20 +811,6 @@ def build_e2e_arm_summary(
         for name, path in run_metadata_paths.items()
     }
     training_seed = _assert_shared_training_seed(run_metadata, _TRAINED_ARMS)
-    shared_data_provenance = {
-        key: run_metadata["full"].get(key)
-        for key in (
-            "data_contract",
-            "training_interactions_sha256",
-            "training_topology_sha256",
-        )
-    }
-    for name in _TRAINED_ARMS:
-        observed = {key: run_metadata[name].get(key) for key in shared_data_provenance}
-        if observed != shared_data_provenance:
-            raise ValueError(
-                f"trained arm {name!r} does not share full's training-data provenance"
-            )
     training_diagnostics = _training_diagnostics([run_metadata[name] for name in _TRAINED_ARMS])
     _validate_vhold_event_ledgers(
         run_metadata,
@@ -885,28 +870,6 @@ def build_e2e_arm_summary(
                 f"{name} checkpoint_id mismatch: "
                 f"{metadata_checkpoint!r} != {artifact_checkpoint!r}"
             )
-        metadata = run_metadata[expected_checkpoint_arm]
-        if metadata.get("data_contract") != TRAINING_INTERACTION_CONTRACT:
-            raise ValueError(
-                f"{expected_checkpoint_arm} run metadata has an invalid data_contract"
-            )
-        for key in ("training_interactions_sha256", "training_topology_sha256"):
-            value = metadata.get(key)
-            if not (
-                isinstance(value, str)
-                and len(value) == 64
-                and all(character in "0123456789abcdefABCDEF" for character in value)
-            ):
-                raise ValueError(f"{expected_checkpoint_arm} run metadata has an invalid {key}")
-        for key in (
-            "data_contract",
-            "training_interactions_sha256",
-            "training_topology_sha256",
-        ):
-            if artifact.meta.get(key) != metadata.get(key):
-                raise ValueError(
-                    f"{name} {key} mismatch between score artifact and run metadata"
-                )
         _validate_scaffold_control_arm_semantics(artifact, name=name, label=label)
         if list(artifact.pairs()) != candidate_pairs:
             raise ValueError(

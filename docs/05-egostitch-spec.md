@@ -549,6 +549,33 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-08-03 (owner decision): the training-interaction **provenance digests are
+  withdrawn**. The shared-interaction refactor (`6315519`) had bound every
+  checkpoint, `run_metadata.json`, scores artifact, and CAZI UGT cache to a
+  `data_contract = shared_train_positives_v1` tag plus `training_interactions_sha256`
+  and `training_topology_sha256`, and made `src/e2_pipeline.py`,
+  `src/experiments/g5_stage1.py`, `src/score_universe.py`, and
+  `src/train_cazi_mbn.py` fail closed on any mismatch. None of it is recorded or
+  checked any more: artifacts carry no training-data identity field, and stale
+  pre-refactor checkpoints/artifacts no longer fail closed on that basis — they are
+  distinguished by run directory and commit, an owner-side responsibility. §14.4.6
+  is amended accordingly, as are protocol §5 and model-proposal §6. Also withdrawn
+  with it, by the same decision: the `run_metadata.checkpoint_id == loaded
+  checkpoint` equality check in `score_universe._run_score`; the `load_config`
+  unknown-key rejection in `src/train_cazi_mbn.py`; the identity fields
+  (`topology_sha256`, `order`, `feature_length`, `seed`) inside the CAZI UGT
+  `.npz` cache; and the `egostitch_e2e` bare-checkpoint rejection in
+  `score_universe._load_checkpoint`. Three consequences are accepted, not
+  overlooked:
+  1. `checkpoint_id` is still bound one stage later — `g5_stage1.build_e2e_arm_summary`
+     requires each arm's score artifact to match its `run_metadata.json`. Scoring the
+     wrong checkpoint against another arm's metadata now succeeds through the
+     held-out pair read and the test-access ledger write, and fails only at G5
+     aggregation, after the ledger has been written.
+  2. A pre-refactor `ugt_projection.npz` left in a CAZI `output_dir` is silently
+     reused: only node order and shape are checked. Existing stale caches under
+     `outputs/cazi_mbn_breadth_first/` must be deleted by hand before any rerun.
+  3. `model.order`/`seed` changes no longer invalidate that cache either.
 - 2026-08-03 (owner decision): §11's fixed "exactly 30 epochs / at most 60 minutes"
   formal-B0 binding is replaced by a config-set epoch count and budget, with two
   normative recipes listed — the historical constant-LR 30-epoch recipe and a new
@@ -1879,8 +1906,8 @@ cache is retired for this family.
 
 The items below document the architecture and experiment-plan lineage. They are
 not a registration-status or evidence-completeness preflight. Current runs execute
-directly through `hpc/run.sh train`; runtime and data provenance fail closed in the
-produced checkpoint and artifacts.
+directly through `hpc/run.sh train`. Runtime provenance is recorded in the produced
+checkpoint and artifacts; training-*data* provenance is not (§12, 2026-08-03).
 
 1. Frozen-s0 screen published (its outcome is the successor's motivating arm).
    **Satisfied 2026-07-17:** binding verdict `cut`; result note
@@ -2068,12 +2095,11 @@ mutated-features-same-ids).
 Five trained checkpoints — `full`, `b0_e2e_f_only`, `p0`, `no_l_rel`, and
 `row_layernorm` — plus the two scoring-time controls `6a-v3` and `6e-v1` over
 `full`'s checkpoint. The removed content pathway makes `pair_topology`
-identical to `full`, so that arm is retired. Current checkpoints,
-`run_metadata.json`, and `egostitch_e2e_scores_v4` artifacts must all bind
-`data_contract = shared_train_positives_v1` plus identical
-`training_interactions_sha256` and `training_topology_sha256` values. Old
-80/20-partition checkpoints and score artifacts fail closed and are not
-comparable to runs under this contract.
+identical to `full`, so that arm is retired. Checkpoints and score artifacts
+carry **no training-data identity field** (§12, 2026-08-03): nothing in the code
+distinguishes an artifact trained under the shared-interaction contract from an
+older 80/20-partition one, so keeping the two apart is an owner-side
+responsibility discharged by run directory and commit, not by a gate.
 
 #### 14.4.7 Probes and single-stage execution (extends §13.19)
 
@@ -2089,8 +2115,10 @@ The formal run executes directly on `V_fit` and validates on `V_hold`. It uses
 the same complete `V_fit` training interactions for topology and
 classification, with per-query leave-one-out only when constructing the target
 for that queried positive. There is no preregistration or artifact-identity
-gate; checkpoint/scoring provenance enforces the shared-interaction data
-contract described in §9.3.
+gate, and nothing in the checkpoint or scoring path enforces the §9.3
+shared-interaction data contract — it holds by construction in
+`derive_training_interactions`, and stale artifacts are excluded by hand (§12,
+2026-08-03).
 
 #### 14.4.8 Telemetry and abort rules
 

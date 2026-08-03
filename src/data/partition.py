@@ -9,8 +9,6 @@ import networkx as nx
 
 from src.data.artifacts import canonical_pair
 
-TRAINING_INTERACTION_CONTRACT = "shared_train_positives_v1"
-
 
 @dataclass(frozen=True)
 class TrainingInteractions:
@@ -18,6 +16,8 @@ class TrainingInteractions:
 
     Attributes:
         positives: Canonical, de-duplicated train-side positive interactions.
+            These are the classification (`L_edge`) positives verbatim — self-pairs
+            retained (spec §9.3). Topology objectives take `topology_edges`.
     """
 
     positives: frozenset[tuple[str, str]]
@@ -26,11 +26,6 @@ class TrainingInteractions:
     def topology_edges(self) -> frozenset[tuple[str, str]]:
         """Return the loopless projection used by topology objectives."""
         return frozenset((u, v) for u, v in self.positives if u != v)
-
-    @property
-    def classification_positives(self) -> frozenset[tuple[str, str]]:
-        """Return the same interactions for edge classification, including self-pairs."""
-        return self.positives
 
 
 def derive_training_interactions(

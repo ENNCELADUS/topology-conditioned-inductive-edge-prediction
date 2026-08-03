@@ -17,7 +17,7 @@ def _chain_positives(n: int) -> list[tuple[str, str]]:
 class TestDeriveTrainingInteractions:
     def test_topology_and_classification_share_every_nonself_interaction(self) -> None:
         interactions = derive_training_interactions(_chain_positives(20))
-        assert interactions.topology_edges == interactions.classification_positives
+        assert interactions.topology_edges == interactions.positives
 
     def test_canonicalizes_and_deduplicates_without_splitting(self) -> None:
         positives = [("n2", "n1"), ("n1", "n2"), ("n3", "n4")]
@@ -26,7 +26,7 @@ class TestDeriveTrainingInteractions:
 
     def test_only_topology_projection_drops_self_pairs(self) -> None:
         interactions = derive_training_interactions([("n1", "n1"), ("n1", "n2")])
-        assert interactions.classification_positives == frozenset(
+        assert interactions.positives == frozenset(
             {("n1", "n1"), ("n1", "n2")}
         )
         assert interactions.topology_edges == frozenset({("n1", "n2")})

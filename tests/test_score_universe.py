@@ -86,14 +86,6 @@ def _write_checkpoint(
         "seed": 0,
         "config": {},
     }
-    if model_family == "egostitch_e2e":
-        payload.update(
-            {
-                "data_contract": "shared_train_positives_v1",
-                "training_interactions_sha256": "a" * 64,
-                "training_topology_sha256": "b" * 64,
-            }
-        )
     torch.save(payload, path)
 
 
@@ -237,24 +229,6 @@ def test_load_pre_rev31_e2e_checkpoint_rejects_legacy_scaffold_shape(tmp_path: P
             "pre-rev-3\\.1 commit"
         ),
     ):
-        score_universe._load_checkpoint(checkpoint_path)
-
-
-def test_current_shape_e2e_checkpoint_without_shared_interaction_provenance_is_rejected(
-    tmp_path: Path,
-) -> None:
-    model = score_universe.build_model("egostitch_e2e", dict(_TINY_E2E_CONFIG))
-    checkpoint_path = tmp_path / "old-data-contract.pt"
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "model_family": "egostitch_e2e",
-            "model_config": dict(_TINY_E2E_CONFIG),
-        },
-        checkpoint_path,
-    )
-
-    with pytest.raises(ValueError, match="data_contract must equal"):
         score_universe._load_checkpoint(checkpoint_path)
 
 
@@ -1713,9 +1687,6 @@ def test_merge_rejects_conflicting_scaffold_control_provenance(tmp_path: Path) -
         "num_rows": 2,
         "created_utc": "2026-07-17T00:00:00+00:00",
         "torch_version": str(torch.__version__),
-        "data_contract": "shared_train_positives_v1",
-        "training_interactions_sha256": "a" * 64,
-        "training_topology_sha256": "b" * 64,
         "score_precision": {
             "contract": "egostitch_e2e_pair_fp32_v1",
             "pair_compute_dtype": "float32",
