@@ -1722,6 +1722,16 @@ def _score_egostitch_e2e(
     ``egostitch_e2e_pair_fp32_v1``; autocast is always disabled for this
     family, regardless of any future `--amp` wiring.
 
+    Supports both registered generators (design 2026-08-02 §12 P3): the real
+    `egostitch_imagine` generator, whose per-node cache carries a `SlotSet`/
+    projected features, and the null generator (`generator.name: "null"`),
+    whose per-node cache carries `slots=None`/`projected_x=None` because
+    there is nothing to imagine. For the null generator the returned ``full``
+    and ``f_logit`` arrays are identical -- the composite's `self.encoder is
+    None` clamps topology off for both heads, so this is the correct null
+    result (the topology pathway contributed nothing) rather than a
+    special-cased single array. Any other generator raises `ValueError`.
+
     Each batch is assembled with real grounding-pool candidates (spec Sec
     13.12) via the `build_f0_matrix`/`build_grounding_pool` loader:
     ``ground_a``/``ground_b`` carry
@@ -1757,19 +1767,33 @@ def _score_egostitch_e2e(
     from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
     from src.model.egostitch.generator.egostitch import EgoStitchImagineGenerator
     from src.model.egostitch.generator.imagine import SlotSet
+    from src.model.egostitch.generator.null import NullGenerator
 
     assert isinstance(model, EgoStitchModel)
-    # This scorer's two-logit `full`/`f_logit` decomposition is inherently
-    # topology-conditioned; a `generator.name: null` model (design 2026-08-02
-    # §12 P3) has no `SlotSet`/topology conditioning to decompose at all
-    # (`encode_node_state` returns `slots=None`, and `full == f_logit` would
-    # be a vacuous distinction). Assert the real generator explicitly so a
-    # misrouted null-generator checkpoint fails loudly here instead of with
-    # an opaque `NoneType` crash deep in the node-state cache below.
-    assert isinstance(model.generator, EgoStitchImagineGenerator), (
-        "egostitch_e2e scoring requires the real egostitch_imagine generator, "
-        f"got {type(model.generator).__name__}"
-    )
+    # `EgoStitchModel.decompose_pair_context` (composite.py) is well-defined
+    # for both registered generators. For the real `egostitch_imagine`
+    # generator, `full` and `f_logit` diverge once trained -- the ordinary
+    # topology-conditioned decomposition. For `generator.name: "null"`
+    # (design 2026-08-02 §12 P3), `self.encoder is None` unconditionally
+    # clamps `need_topo` off inside `score_pair_context`, so *both* logits
+    # run the classifier fully unconditioned and come out identical -- the
+    # correct null result (the topology pathway contributed nothing, i.e.
+    # this arm reproduces the pairwise baseline), not a vacuous one. Its
+    # node state correspondingly has no `SlotSet`/`projected_x` to cache
+    # (`encode_node_state` returns `slots=None`, `projected_x=None`); this
+    # scorer carries that `None` through its per-node cache explicitly
+    # (`is_real_generator` below) instead of asserting it away. Any other
+    # generator is genuinely unsupported here and must fail loudly at this
+    # point, not with an opaque `NoneType` crash deep in the node-state
+    # cache below.
+    is_real_generator = isinstance(model.generator, EgoStitchImagineGenerator)
+    is_null_generator = isinstance(model.generator, NullGenerator)
+    if not (is_real_generator or is_null_generator):
+        raise ValueError(
+            "egostitch_e2e scoring supports only the real egostitch_imagine "
+            "generator (topology-conditioned) or the null generator "
+            f"(topology-free pairwise baseline); got {type(model.generator).__name__}"
+        )
     _reject_superseded_scaffold_control(scaffold_control)
     active_controls = (
         _SCAFFOLD_CONTROL_SHUFFLE_V3,
@@ -1859,10 +1883,24 @@ def _score_egostitch_e2e(
                     matrix[pool_rows[rows]].to(device),
                     pool_rows[rows].to(device),
                 )
-                # The `isinstance(model.generator, EgoStitchImagineGenerator)`
-                # guard above means `slots`/`projected_x` are always populated
-                # here (only `NullGenerator` leaves them `None`).
-                assert state.slots is not None and state.projected_x is not None
+                if is_real_generator:
+                    # A real `egostitch_imagine` generator's `encode_node`
+                    # always returns a `GeneratorNodeState`
+                    # (`EgoStitchModel.encode_node_state`), so `slots`/
+                    # `projected_x` are always populated here. `None` would
+                    # mean a broken generator/checkpoint pairing, not the
+                    # (separately handled) null-generator arm -- this must
+                    # still fail loudly rather than caching a silent `None`.
+                    assert state.slots is not None and state.projected_x is not None, (
+                        "real egostitch_imagine generator produced no slot state for "
+                        "this node batch -- this is a bug, not the supported "
+                        "null-generator arm"
+                    )
+                else:
+                    assert state.slots is None and state.projected_x is None, (
+                        "null generator unexpectedly produced slot state -- "
+                        "encode_node_state should never populate it for NullGenerator"
+                    )
                 for position, node_id in enumerate(batch_nodes):
                     true_length = int(lengths[position].item())
                     ground_ids = (
@@ -1870,22 +1908,29 @@ def _score_egostitch_e2e(
                         if state.ground_ids is None
                         else state.ground_ids[position : position + 1].detach().cpu()
                     )
+                    slots = (
+                        SlotSet(
+                            *(
+                                value[position : position + 1].detach().float().cpu()
+                                for value in state.slots
+                            )
+                        )
+                        if state.slots is not None
+                        else None
+                    )
+                    projected_x = (
+                        state.projected_x[position : position + 1].detach().float().cpu()
+                        if state.projected_x is not None
+                        else None
+                    )
                     node_cache[node_id] = E2ENodeState(
                         encoded=state.encoded[position : position + 1, :true_length]
                         .detach()
                         .float()
                         .cpu(),
                         length=state.length[position : position + 1].detach().cpu(),
-                        slots=SlotSet(
-                            *(
-                                value[position : position + 1].detach().float().cpu()
-                                for value in state.slots
-                            )
-                        ),
-                        projected_x=state.projected_x[position : position + 1]
-                        .detach()
-                        .float()
-                        .cpu(),
+                        slots=slots,
+                        projected_x=projected_x,
                         ground_ids=ground_ids,
                     )
 
@@ -1901,23 +1946,36 @@ def _score_egostitch_e2e(
             ).to(device)
         else:
             ground_ids = None
-        # `node_cache` is only ever populated above, where `slots`/
-        # `projected_x` are already asserted non-`None` (the real generator
-        # guard at the top of this function).
-        return E2ENodeState(
-            encoded=encoded,
-            length=torch.cat([state.length for state in states], dim=0).to(device),
-            slots=SlotSet(
+        # `node_cache` is populated homogeneously by this call's own
+        # `is_real_generator` branch above: every cached state's `slots`/
+        # `projected_x` is populated together (real generator) or `None`
+        # together (null generator), never mixed within one scoring call.
+        slots: SlotSet | None
+        projected_x: torch.Tensor | None
+        if is_real_generator:
+            assert all(state.slots is not None for state in states)
+            slots = SlotSet(
                 *(
                     torch.cat(values, dim=0).to(device)
                     for values in zip(
                         *(cast(SlotSet, state.slots) for state in states), strict=True
                     )
                 )
-            ),
-            projected_x=torch.cat(
+            )
+            assert all(state.projected_x is not None for state in states)
+            projected_x = torch.cat(
                 [cast(torch.Tensor, state.projected_x) for state in states], dim=0
-            ).to(device),
+            ).to(device)
+        else:
+            assert all(state.slots is None for state in states)
+            assert all(state.projected_x is None for state in states)
+            slots = None
+            projected_x = None
+        return E2ENodeState(
+            encoded=encoded,
+            length=torch.cat([state.length for state in states], dim=0).to(device),
+            slots=slots,
+            projected_x=projected_x,
             ground_ids=ground_ids,
         )
 

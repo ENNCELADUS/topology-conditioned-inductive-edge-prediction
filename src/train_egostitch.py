@@ -1117,8 +1117,12 @@ def build_e2e_parameter_groups(model: EgoStitchModel) -> E2EParameterGroups:
                 "the null-generator arm is scoring-only and not yet trainable: it has no "
                 "generator or encoder parameters, and the phase curriculum, family probe, "
                 "active-group schedule and validation dispersion telemetry all require "
-                "both. Use it to score or to reproduce the pairwise baseline's f_logit; "
-                "train the pairwise baseline itself through src.train_b0."
+                "both. Score an already-trained-classifier checkpoint of this arm through "
+                "score_universe.py -- its `full` and `f_logit` arrays come out identical "
+                "by design (a null generator's `self.encoder is None` clamps topology off "
+                "for both heads), which is the correct reproduction of the pairwise "
+                "baseline's logit, not a degenerate result. To train the pairwise baseline "
+                "itself, use src.train_b0."
             )
         raise RuntimeError(
             f"every E2E optimizer group must contain trainable parameters; empty: {empty}"

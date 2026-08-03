@@ -1131,6 +1131,214 @@ def test_egostitch_e2e_null_arm_merge_preserves_true_full_logit(
     score_universe.validate_artifact_precision(merged)
 
 
+# --------------------------------------------------------------------------- null-generator arm
+# (Codex P1, 2026-08-03: `_score_egostitch_e2e` used to blanket-assert the real
+# `egostitch_imagine` generator, so every `generator.name: "null"` checkpoint
+# failed to score at all -- contradicting `build_e2e_parameter_groups`'s own
+# refusal message, which tells the user to score that arm. Fixed by handling
+# the null generator's `slots=None`/`projected_x=None` node state explicitly
+# instead of asserting it away, while keeping the assert loud for a genuinely
+# broken real-generator/checkpoint pairing.)
+
+
+def _null_generator_e2e_config() -> dict[str, object]:
+    """`_TINY_E2E_CONFIG` with `generator.name` overridden to `"null"`."""
+    return {
+        **_TINY_E2E_CONFIG,
+        "generator": {
+            **cast(dict[str, object], _TINY_E2E_CONFIG["generator"]),
+            "name": "null",
+        },
+    }
+
+
+def _null_generator_e2e_setup(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    """Feature store + a conditioned checkpoint + a matching null-generator checkpoint.
+
+    The null-generator checkpoint's classifier weights are loaded directly
+    from the conditioned checkpoint's classifier -- the same reasoning
+    `tests/model/test_composite.py`'s
+    `test_registry_driven_null_generator_config_matches_conditioned_model_f_logit`
+    applies in-process: the two models are independently seeded, so their
+    classifiers start with different weights unless reconciled;
+    `load_state_dict` isolates "does the null-generator arm reproduce this
+    classifier's baseline" from "do two independently-seeded models happen to
+    match".
+
+    Returns:
+        ``(data_root, conditioned_checkpoint, null_checkpoint, pairs_path)``.
+    """
+    torch.manual_seed(0)
+    node_tokens = {node: torch.randn(3 + i, _E2E_NODE_DIM) for i, node in enumerate(_E2E_NODES)}
+    data_root = _data_root_with_features(tmp_path, node_tokens, input_dim=_E2E_NODE_DIM)
+
+    conditioned_config = dict(_TINY_E2E_CONFIG)
+    conditioned_model = score_universe.build_model("egostitch_e2e", conditioned_config)
+    assert isinstance(conditioned_model, EgoStitchModel)
+    conditioned_checkpoint = tmp_path / "conditioned.pt"
+    _write_checkpoint(
+        conditioned_checkpoint,
+        model=conditioned_model,
+        model_family="egostitch_e2e",
+        model_config=conditioned_config,
+    )
+
+    null_config = _null_generator_e2e_config()
+    null_model = score_universe.build_model("egostitch_e2e", null_config)
+    assert isinstance(null_model, EgoStitchModel)
+    null_model.classifier.load_state_dict(conditioned_model.classifier.state_dict())
+    null_checkpoint = tmp_path / "null_generator.pt"
+    _write_checkpoint(
+        null_checkpoint,
+        model=null_model,
+        model_family="egostitch_e2e",
+        model_config=null_config,
+    )
+
+    pairs_path = tmp_path / "pairs.tsv"
+    pairs_path.write_text("".join(f"{u}\t{v}\n" for u, v in _E2E_PAIRS))
+    return data_root, conditioned_checkpoint, null_checkpoint, pairs_path
+
+
+def test_null_generator_checkpoint_scores_through_score_universe_and_produces_valid_v4_artifact(
+    tmp_path: Path,
+) -> None:
+    """A `generator.name: "null"` checkpoint scores end to end through the real CLI.
+
+    This is the defect itself: as shipped, the blanket
+    `isinstance(model.generator, EgoStitchImagineGenerator)` assert made this
+    call fail for every null-generator checkpoint. Scoring through
+    `score_universe.main`'s real ``score`` command (not a hand-rolled call
+    into ``_score_egostitch_e2e``) and loading the result back must now
+    succeed and satisfy the v4 artifact schema.
+    """
+    data_root, _conditioned_checkpoint, null_checkpoint, pairs_path = _null_generator_e2e_setup(
+        tmp_path
+    )
+    output = tmp_path / "null_generator_scores.npz"
+    score_universe.main(
+        _egostitch_e2e_score_args(tmp_path, data_root, null_checkpoint, pairs_path, output)
+    )
+
+    artifact = score_universe.load_scores(output)
+    assert artifact.meta["model_family"] == "egostitch_e2e"
+    assert artifact.meta["scores_meta_version"] == score_universe._SCORES_META_VERSION
+    assert len(artifact.logit) == len(_E2E_PAIRS)
+    assert artifact.logit.dtype == np.float32
+    assert artifact.f_logit is not None
+    assert artifact.f_logit.dtype == np.float32
+    assert artifact.f_logit.shape == artifact.logit.shape
+    assert bool(np.isfinite(artifact.logit).all())
+    assert bool(np.isfinite(artifact.f_logit).all())
+    score_universe.validate_artifact_precision(artifact)
+
+
+def test_null_generator_full_and_f_logit_arrays_are_exactly_equal(tmp_path: Path) -> None:
+    """The null-generator arm's `full` and `f_logit` arrays are bit-identical.
+
+    Not a degenerate result: `EgoStitchModel.__init__` never constructs a
+    `GraphEncoder` for `generator.name: "null"` (`self.encoder is None`), so
+    `score_pair_context`'s `need_topo` clamps to `False` unconditionally --
+    the `full` head and the `f_logit` head both run the classifier fully
+    unconditioned on the identical `PairInputs`, so they must come out
+    exactly equal. That equality is the correct null measurement (the
+    topology pathway contributed nothing), not a special case to collapse
+    into a single published array.
+    """
+    data_root, _conditioned_checkpoint, null_checkpoint, pairs_path = _null_generator_e2e_setup(
+        tmp_path
+    )
+    output = tmp_path / "null_generator_scores.npz"
+    score_universe.main(
+        _egostitch_e2e_score_args(tmp_path, data_root, null_checkpoint, pairs_path, output)
+    )
+
+    artifact = score_universe.load_scores(output)
+    assert artifact.f_logit is not None
+    np.testing.assert_array_equal(artifact.logit, artifact.f_logit)
+
+
+def test_null_generator_logits_match_conditioned_checkpoints_f_logit(tmp_path: Path) -> None:
+    """The null-generator arm really is the pairwise baseline, at the artifact level.
+
+    Artifact-level counterpart of `tests/model/test_composite.py`'s in-process
+    `test_registry_driven_null_generator_config_matches_conditioned_model_f_logit`:
+    scoring a null-generator checkpoint through the real CLI ``score`` command
+    reproduces exactly what the *same* classifier weights produce as
+    ``f_logit`` when a real, topology-conditioned checkpoint is scored
+    through the identical command. `f_logit` is invariant to the grounding
+    pool and to topology (the eval-time hard bypass nulls the topo head
+    before the classifier ever attends to it), so this holds regardless of
+    the two runs' independently-built grounding-pool caches.
+    """
+    data_root, conditioned_checkpoint, null_checkpoint, pairs_path = _null_generator_e2e_setup(
+        tmp_path
+    )
+    conditioned_output = tmp_path / "conditioned_scores.npz"
+    score_universe.main(
+        _egostitch_e2e_score_args(
+            tmp_path, data_root, conditioned_checkpoint, pairs_path, conditioned_output
+        )
+    )
+    conditioned_artifact = score_universe.load_scores(conditioned_output)
+    assert conditioned_artifact.f_logit is not None
+
+    null_output = tmp_path / "null_generator_scores.npz"
+    score_universe.main(
+        _egostitch_e2e_score_args(tmp_path, data_root, null_checkpoint, pairs_path, null_output)
+    )
+    null_artifact = score_universe.load_scores(null_output)
+
+    np.testing.assert_allclose(
+        null_artifact.logit, conditioned_artifact.f_logit, rtol=0.0, atol=1e-5
+    )
+
+
+def test_real_generator_checkpoint_missing_slot_state_still_fails_loudly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real-generator checkpoint whose node state is missing slots still raises loudly.
+
+    The null-generator fix (above) replaced a blanket assert with a branch on
+    `is_real_generator`; this proves the branch did not weaken the real
+    generator's own guarantee. Forcing `EgoStitchImagineGenerator.encode_node`
+    to echo its input back (the null generator's own behavior) simulates a
+    genuinely broken generator/checkpoint pairing without changing
+    `model.generator`'s type -- `is_real_generator` still reads `True`, so
+    the scorer must still assert instead of silently caching `slots=None` or
+    crashing on a `NoneType` deep inside `_stack_cached`.
+    """
+    data_root, conditioned_checkpoint, _null_checkpoint, pairs_path = _null_generator_e2e_setup(
+        tmp_path
+    )
+    del pairs_path
+    payload = torch.load(conditioned_checkpoint, weights_only=False)
+    model = score_universe.build_model("egostitch_e2e", dict(_TINY_E2E_CONFIG))
+    assert isinstance(model, EgoStitchModel)
+    model.load_state_dict(payload["model_state"])
+    model.eval()
+
+    def _echo_x(
+        x: torch.Tensor, ground: torch.Tensor, ground_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        del ground, ground_ids
+        return x
+
+    monkeypatch.setattr(model.generator, "encode_node", _echo_x)
+
+    store = FeatureStore(data_root / "features" / "frozen_node_features_1024")
+    with pytest.raises(AssertionError, match="not the supported null-generator arm"):
+        score_universe._score_egostitch_e2e(
+            model,
+            _E2E_PAIRS,
+            store,
+            device=torch.device("cpu"),
+            token_budget=4096,
+            f0_cache=tmp_path / "missing-slots-f0.npz",
+            grounding_cache=tmp_path / "missing-slots-grounding.npz",
+        )
+
+
 def test_egostitch_e2e_cli_is_deterministic(tmp_path: Path) -> None:
     data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
     out_a, out_b = tmp_path / "a.npz", tmp_path / "b.npz"
