@@ -3,7 +3,7 @@ model:
   topology_dim: 128
   latent_dim: 32
   network_layers: 1
-  heads: 6
+  heads: 4
 
 data:
   root: data
@@ -24,7 +24,7 @@ optim:
 loss:
   discriminator_coef: 1.0
   regularization_coef: 1.0
-  classification_coef: 10.0
+  classification_coef: 1.0
   distillation_weight: 0.5
   supervised_weight: 0.5
 
@@ -33,4 +33,4 @@ runtime:
   score_batch_size: 16384
 
 seed: 0
-output_dir: outputs/cazi_mbn_breadth_first/seed0
+output_dir: outputs/cazi_mbn_breadth_first/seed0_paper_repo_defaults
