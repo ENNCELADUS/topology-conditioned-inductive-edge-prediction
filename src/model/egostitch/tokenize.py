@@ -1,10 +1,15 @@
 """Module 1 (Stage-1 form): Tokenize-lite — encoder + degree budget (spec Sec 1, Sec 13.2).
 
 No VQ codebook, no BP affiliations, no code-stats head in Stage 1; ``e_u``
-replaces ``(z_u, r_u)`` everywhere downstream. The degree head is
-density-normalized by the caller (``rho_eval / rho_train`` lives in the model,
-spec Sec 9.3); this module outputs the raw softplus mean head plus the
-lognormal NLL parameters (mu, log sigma).
+replaces ``(z_u, r_u)`` everywhere downstream. This module outputs the
+lognormal NLL parameters (mu, log sigma) that `degree_nll` (`losses.py`)
+supervises. The density-normalized raw softplus mean head
+(``degree_mean_head`` / ``d_hat_raw``) was removed (three-component refactor
+design §12 P2a dead-code sweep): its only consumer was
+``EgoStitchStage1.d_hat()``, itself only called by the retired frozen-s0
+``pair_outputs``/``self_outputs`` decision-fusion methods deleted with
+`decision.py` (design §9). ``deg_mu``/``deg_log_sigma`` are unrelated and
+stay -- they are `degree_nll`'s live inputs.
 """
 
 from __future__ import annotations
@@ -13,7 +18,6 @@ from typing import NamedTuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from src.model.egostitch.config import EgoStitchConfig
 from src.model.egostitch.layers import build_mlp
@@ -24,35 +28,31 @@ class TokenizeOut(NamedTuple):
 
     Attributes:
         e: Shape ``(B, d_z)`` encoder embeddings ``e_u``.
-        d_hat_raw: Shape ``(B,)`` raw (density-unnormalized) degree budget mean.
         deg_mu: Shape ``(B,)`` lognormal location parameter.
         deg_log_sigma: Shape ``(B,)`` lognormal log-scale parameter.
     """
 
     e: torch.Tensor
-    d_hat_raw: torch.Tensor
     deg_mu: torch.Tensor
     deg_log_sigma: torch.Tensor
 
 
 class TokenizeLite(nn.Module):
-    """Encoder ``e_u = MLP_2(d -> d_z)(x_u)`` + degree-budget heads.
+    """Encoder ``e_u = MLP_2(d -> d_z)(x_u)`` + degree-distribution head.
 
-    ``d_hat_raw = softplus(MLP_2(d + d_z -> 1)([x_u; e_u]))`` (spec Sec 13.2 —
-    ``e_u`` substitutes the codebook code) and the 2-head lognormal
-    parameterization ``(mu, log sigma) = MLP_2(d + d_z -> 2)([x_u; e_u])``
-    (spec Sec 1: "the table above shows the mean head").
+    The 2-head lognormal parameterization
+    ``(mu, log sigma) = MLP_2(d + d_z -> 2)([x_u; e_u])`` (spec Sec 1:
+    "the table above shows the mean head") feeds `degree_nll` directly.
     """
 
     def __init__(self, config: EgoStitchConfig) -> None:
-        """Build the encoder and degree heads.
+        """Build the encoder and degree-distribution head.
 
         Args:
             config: The pinned Stage-1 configuration.
         """
         super().__init__()
         self.encoder = build_mlp(config.input_dim, config.d_h, config.d_z)
-        self.degree_mean_head = build_mlp(config.input_dim + config.d_z, config.d_h, 1)
         self.degree_dist_head = build_mlp(config.input_dim + config.d_z, config.d_h, 2)
 
     def forward(self, x: torch.Tensor) -> TokenizeOut:
@@ -66,11 +66,9 @@ class TokenizeLite(nn.Module):
         """
         e = self.encoder(x)
         xe = torch.cat([x, e], dim=-1)
-        d_hat_raw = F.softplus(self.degree_mean_head(xe)).squeeze(-1)
         dist = self.degree_dist_head(xe)
         return TokenizeOut(
             e=e,
-            d_hat_raw=d_hat_raw,
             deg_mu=dist[:, 0],
             deg_log_sigma=dist[:, 1],
         )

@@ -1,4 +1,15 @@
-"""E2E model property tests (design rev 3 §3.4–§3.5 acceptance criteria)."""
+"""`EgoStitchModel` property tests (design rev 3 §3.4-§3.5 acceptance criteria).
+
+Retargeted from `EgoStitchE2E` onto the three-component composite (three-
+component refactor design §5, P2): every assertion here is behavior-
+preserving, just re-expressed through `model.generator`/`model.encoder`/
+`model.classifier` instead of the monolithic module's own submodules
+(`model.trunk` -> `model.classifier.trunk`, `model.head` -> `model.classifier.head`,
+`model.rel_head` -> `model.encoder.rel_head`, `model.generator.encode_nodes` ->
+`model.generator.stage1.encode_nodes`). `model.cfg` and `model.generator_cfg`
+stay exactly as named (pinned attributes, design coordinator amendment
+2026-08-03).
+"""
 
 from collections.abc import Callable
 from typing import cast
@@ -7,13 +18,13 @@ import numpy as np
 import pytest
 import torch
 from src.data.feature_stats import compute_feature_stats
+from src.model.egostitch.composite import E2EPairContext, EgoStitchModel
 from src.model.egostitch.conditioning import (
     NULL_ALL_HEAD,
     GatedCrossAttention,
     masks_for_null,
 )
 from src.model.egostitch.config import E2EConfig
-from src.model.egostitch.e2e_model import E2EPairContext, EgoStitchE2E
 from src.model.egostitch.imagine import SlotSet
 from src.model.egostitch.model import NodeEncoding
 
@@ -85,13 +96,13 @@ def _tiny_e2e_config(
 
 def _tiny_model_and_batch(
     *, p_topo: float = 0.15
-) -> tuple[EgoStitchE2E, dict[str, torch.Tensor]]:
+) -> tuple[EgoStitchModel, dict[str, torch.Tensor]]:
     torch.manual_seed(0)
     # Stateless mode: these tests exercise trunk/scaffold behavior, not the
     # registered zscore_vfit_v1 statistics, and matches the prior
     # `standardize_features=True` (LayerNorm) semantics exactly.
     cfg = _tiny_e2e_config(feature_standardization="row_layernorm", p_topo=p_topo)
-    model = EgoStitchE2E(cfg).eval()
+    model = EgoStitchModel(cfg).eval()
     b, t, d_in = 4, 6, model.input_dim
     n_ground = 5
     batch = {
@@ -110,7 +121,7 @@ def _tiny_model_and_batch(
 
 
 def _topology_injections(
-    model: EgoStitchE2E,
+    model: EgoStitchModel,
     context: E2EPairContext,
     attention: _DirectionalConstantAttention,
     *,
@@ -118,7 +129,7 @@ def _topology_injections(
     edge_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Capture the AB-then-BA residuals emitted by the shared topology layer."""
-    layer = cast(GatedCrossAttention, model.trunk.topo_xattn[0])
+    layer = cast(GatedCrossAttention, model.classifier.trunk.topo_xattn[0])
     layer.attn = attention
     attention.reset()
     model.eval()
@@ -148,7 +159,7 @@ def test_shared_direction_centering_matches_training_and_evaluation() -> None:
     model, batch = _tiny_model_and_batch()
     context = model.build_pair_context(batch)
     attention = _DirectionalConstantAttention(batch_size=4, ab=1.0, ba=3.0)
-    layer = cast(GatedCrossAttention, model.trunk.topo_xattn[0])
+    layer = cast(GatedCrossAttention, model.classifier.trunk.topo_xattn[0])
     with torch.no_grad():
         layer.gate.fill_(0.7)
 
@@ -165,7 +176,7 @@ def test_globally_constant_direction_pathway_is_zero_in_train_and_eval() -> None
     model, batch = _tiny_model_and_batch()
     context = model.build_pair_context(batch)
     attention = _DirectionalConstantAttention(batch_size=4, ab=2.0, ba=2.0)
-    layer = cast(GatedCrossAttention, model.trunk.topo_xattn[0])
+    layer = cast(GatedCrossAttention, model.classifier.trunk.topo_xattn[0])
     with torch.no_grad():
         layer.gate.fill_(0.7)
 
@@ -182,7 +193,7 @@ def test_symmetric_trunk_updates_one_shared_ema_once_per_step() -> None:
     model, batch = _tiny_model_and_batch()
     context = model.build_pair_context(batch)
     edge_mask = torch.tensor([True, True, False, False])
-    layer = cast(GatedCrossAttention, model.trunk.topo_xattn[0])
+    layer = cast(GatedCrossAttention, model.classifier.trunk.topo_xattn[0])
     layer.attn = _DirectionalConstantAttention(batch_size=4, ab=1.0, ba=3.0)
 
     model.train()
@@ -195,7 +206,7 @@ def test_symmetric_trunk_updates_one_shared_ema_once_per_step() -> None:
 def test_pair_symmetry_all_conditions() -> None:
     model, batch = _tiny_model_and_batch()
     batch["ground_id_b"] = batch["ground_id_a"].roll(shifts=1, dims=1)
-    topo_xattn = model.trunk.topo_xattn[0]
+    topo_xattn = model.classifier.trunk.topo_xattn[0]
     assert isinstance(topo_xattn, GatedCrossAttention)
     with torch.no_grad():
         topo_xattn.gate.fill_(0.4)  # open gate: symmetry must hold with live conditioning
@@ -216,7 +227,7 @@ def test_pair_symmetry_all_conditions() -> None:
 
     p0_model, p0_batch = _tiny_model_and_batch(p_topo=0.0)
     p0_batch["ground_id_b"] = p0_batch["ground_id_a"].roll(shifts=1, dims=1)
-    p0_topo_xattn = p0_model.trunk.topo_xattn[0]
+    p0_topo_xattn = p0_model.classifier.trunk.topo_xattn[0]
     assert isinstance(p0_topo_xattn, GatedCrossAttention)
     with torch.no_grad():
         p0_topo_xattn.gate.fill_(0.4)
@@ -237,7 +248,7 @@ def test_pair_symmetry_all_conditions() -> None:
 def test_train_mask_equals_eval_bypass() -> None:
     model, batch = _tiny_model_and_batch()
     batch["ground_id_b"] = batch["ground_id_a"].roll(shifts=1, dims=1)
-    topo_xattn = model.trunk.topo_xattn[0]
+    topo_xattn = model.classifier.trunk.topo_xattn[0]
     assert isinstance(topo_xattn, GatedCrossAttention)
     with torch.no_grad():
         topo_xattn.gate.fill_(0.4)
@@ -279,8 +290,8 @@ def test_f_logit_invariant_to_grounding() -> None:
 def test_relational_head_is_absent_from_every_scored_logit() -> None:
     model, batch = _tiny_model_and_batch()
     before = {name: value.clone() for name, value in model.decompose(batch).items()}
-    assert model.rel_head is not None
-    model.rel_head = None
+    assert model.encoder.rel_head is not None
+    model.encoder.rel_head = None
     after = model.decompose(batch)
     assert before.keys() == after.keys()
     for name in before:
@@ -288,10 +299,10 @@ def test_relational_head_is_absent_from_every_scored_logit() -> None:
 
 
 def test_w_rel_config_wires_formal_no_l_rel_arm() -> None:
-    model = EgoStitchE2E(E2EConfig(w_rel=0.0))
+    model = EgoStitchModel(E2EConfig(w_rel=0.0))
     assert model.cfg.w_rel == 0.0
-    assert model.generator.config.w_rel == 0.0
-    assert model.rel_head is None
+    assert model.generator_cfg.w_rel == 0.0
+    assert model.encoder.rel_head is None
     with pytest.raises(ValueError, match="w_rel"):
         E2EConfig(w_rel=-0.01)
 
@@ -338,7 +349,7 @@ def test_decompose_builds_pair_context_once_and_matches_explicit_heads(
 ) -> None:
     model, batch = _tiny_model_and_batch()
     with torch.no_grad():
-        cast(GatedCrossAttention, model.trunk.topo_xattn[0]).gate.data.fill_(0.4)
+        cast(GatedCrossAttention, model.classifier.trunk.topo_xattn[0]).gate.data.fill_(0.4)
     calls = 0
     original = model.build_pair_context
 
@@ -373,21 +384,21 @@ def test_self_pairs_encode_one_ego_and_use_exact_identity_plan(
     batch["is_self"] = torch.ones(4, dtype=torch.bool)
 
     encode_calls = 0
-    original_encode = model.generator.encode_nodes
+    original_encode = model.generator.stage1.encode_nodes
 
     def counted_encode(*args: torch.Tensor, **kwargs: torch.Tensor) -> NodeEncoding:
         nonlocal encode_calls
         encode_calls += 1
         return original_encode(*args, **kwargs)
 
-    monkeypatch.setattr(model.generator, "encode_nodes", counted_encode)
+    monkeypatch.setattr(model.generator.stage1, "encode_nodes", counted_encode)
 
-    import src.model.egostitch.e2e_model as e2e_module
+    import src.model.egostitch.generator.egostitch as generator_module
 
     sinkhorn_calls = 0
     original_sinkhorn = cast(
         Callable[..., torch.Tensor],
-        e2e_module.sinkhorn_log_plan,
+        generator_module.sinkhorn_log_plan,
     )
 
     def counted_sinkhorn(*args: torch.Tensor, **kwargs: object) -> torch.Tensor:
@@ -395,7 +406,7 @@ def test_self_pairs_encode_one_ego_and_use_exact_identity_plan(
         sinkhorn_calls += 1
         return original_sinkhorn(*args, **kwargs)
 
-    monkeypatch.setattr(e2e_module, "sinkhorn_log_plan", counted_sinkhorn)
+    monkeypatch.setattr(generator_module, "sinkhorn_log_plan", counted_sinkhorn)
     context = model.build_pair_context(batch)
     assert encode_calls == 1
     assert sinkhorn_calls == 0
@@ -446,13 +457,13 @@ def test_bf16_autocast_returns_registered_fp32_readout_and_logits(
     """The registered BF16 path keeps the pair readout and logits in fp32."""
     model, batch = _tiny_model_and_batch()
     head_input_dtypes: list[torch.dtype] = []
-    original_forward = model.head.forward
+    original_forward = model.classifier.head.forward
 
     def capture_head_input(feat: torch.Tensor) -> torch.Tensor:
         head_input_dtypes.append(feat.dtype)
         return original_forward(feat)
 
-    monkeypatch.setattr(model.head, "forward", capture_head_input)
+    monkeypatch.setattr(model.classifier.head, "forward", capture_head_input)
 
     with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
         output = model(batch)["logits"]
@@ -462,14 +473,14 @@ def test_bf16_autocast_returns_registered_fp32_readout_and_logits(
 
 
 def test_generator_uses_the_configured_standardization_mode() -> None:
-    model = EgoStitchE2E(E2EConfig(feature_standardization="zscore_vfit_v1"))
-    assert model.generator.feature_standardization == "zscore_vfit_v1"
+    model = EgoStitchModel(E2EConfig(feature_standardization="zscore_vfit_v1"))
+    assert model.generator.stage1.feature_standardization == "zscore_vfit_v1"
 
 
 def test_set_feature_stats_reaches_the_generator() -> None:
     gen = np.random.default_rng(0)
     cfg = E2EConfig(feature_standardization="zscore_vfit_v1")
-    model = EgoStitchE2E(cfg)
+    model = EgoStitchModel(cfg)
     rows = (30.0 + 4.0 * gen.standard_normal((32, model.generator_cfg.input_dim))).astype(
         np.float32
     )
@@ -521,17 +532,17 @@ def test_zscore_vfit_v1_registered_stats_actually_reach_the_forward_pass() -> No
         "ground_id_b": torch.randint(0, 1000, (b, n_ground), dtype=torch.long),
     }
 
-    def _activate_conditioning_gates(model: EgoStitchE2E) -> None:
+    def _activate_conditioning_gates(model: EgoStitchModel) -> None:
         # The trunk's topo injection is zero-init gated cross-attention
         # (module docstring); at a fresh init the gate is zero, so the
         # pathway -- and hence the F0 standardization choice -- would not
         # move the logits at all. Move it off zero, exactly as
         # test_decompose_builds_pair_context_once_and_matches_explicit_heads does.
         with torch.no_grad():
-            cast(GatedCrossAttention, model.trunk.topo_xattn[0]).gate.data.fill_(0.7)
+            cast(GatedCrossAttention, model.classifier.trunk.topo_xattn[0]).gate.data.fill_(0.7)
 
     torch.manual_seed(0)
-    zscore_model = EgoStitchE2E(
+    zscore_model = EgoStitchModel(
         _tiny_e2e_config(feature_standardization="zscore_vfit_v1")
     ).eval()
     zscore_model.set_feature_stats(stats)
@@ -542,7 +553,7 @@ def test_zscore_vfit_v1_registered_stats_actually_reach_the_forward_pass() -> No
     assert torch.isfinite(zscore_logits).all()
 
     torch.manual_seed(0)
-    layernorm_model = EgoStitchE2E(
+    layernorm_model = EgoStitchModel(
         _tiny_e2e_config(feature_standardization="row_layernorm")
     ).eval()
     _activate_conditioning_gates(layernorm_model)

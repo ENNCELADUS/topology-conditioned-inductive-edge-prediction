@@ -6,6 +6,8 @@ import sys
 
 import pytest
 import torch
+from src.model.egostitch.encoder import TypedMessagePassingEncoder
+from src.model.egostitch.graph import ImaginedGraph
 from src.model.egostitch.imagine import SlotSet
 from src.model.egostitch.scaffold import (
     EDGE_TYPES,
@@ -18,7 +20,6 @@ from src.model.egostitch.scaffold import (
     make_scaffold_input_perturbation,
     swap_direction,
 )
-from src.model.egostitch.ste import STEncoder
 from torch.profiler import ProfilerActivity, profile
 
 
@@ -366,23 +367,33 @@ print(json.dumps(out, sort_keys=True))
         assert payload[mode]["same_pair"] != payload[mode]["other_pair"]
 
 
+def _graph(sc: ScaffoldTokens) -> ImaginedGraph:
+    """Wrap a raw scaffold as the `ImaginedGraph` the graph encoder consumes."""
+    batch, nodes, _ = sc.feats.shape
+    return ImaginedGraph(x=sc.feats, adj=sc.adj, mask=torch.ones(batch, nodes), aux={})
+
+
 @pytest.mark.parametrize("mode", ["shuffle_within_pair_v3", "rewire_checkerboard_v1"])
 def test_scaffold_control_measurably_moves_noncollapsed_ste_output(mode: str) -> None:
     torch.manual_seed(21)
     si, sj = _slots(b=2, k=4, seed=22), _slots(b=2, k=4, seed=23)
     plan = torch.rand(2, 4, 4)
-    ste = STEncoder(d_model=16, ste_dim=8, n_layers=2).eval()
-    baseline = ste(build_scaffold(si, sj, plan))
+    ste = TypedMessagePassingEncoder(
+        in_dim=FEAT_DIM, num_relations=EDGE_TYPES, d_model=16, dim=8, layers=2, w_rel=0.0
+    ).eval()
+    baseline = ste(_graph(build_scaffold(si, sj, plan))).tokens
     controlled = ste(
-        build_scaffold(
-            si,
-            sj,
-            plan,
-            perturbation=make_scaffold_input_perturbation(
-                mode, [("node-a", "node-b"), ("node-c", "node-d")]
-            ),
+        _graph(
+            build_scaffold(
+                si,
+                sj,
+                plan,
+                perturbation=make_scaffold_input_perturbation(
+                    mode, [("node-a", "node-b"), ("node-c", "node-d")]
+                ),
+            )
         )
-    )
+    ).tokens
     assert torch.max(torch.abs(controlled - baseline)).item() > 1e-6
 
 

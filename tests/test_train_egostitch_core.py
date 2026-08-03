@@ -17,8 +17,8 @@ from src import train_egostitch as te
 from src.data.feature_stats import compute_feature_stats
 from src.eval.edge_metrics import EdgeMetrics
 from src.model.egostitch import EgoStitchConfig
+from src.model.egostitch.composite import EgoStitchModel
 from src.model.egostitch.config import E2EConfig
-from src.model.egostitch.e2e_model import EgoStitchE2E
 
 from tests.test_train_egostitch import (
     _E2E_TINY_MODEL,
@@ -225,9 +225,9 @@ class TestRunKindDomain:
 class TestFeatureDigestPinByRunKind:
     """Feature-stat identity stays pinned independently of quality telemetry."""
 
-    def _model_and_data(self, tmp_path: Path) -> tuple[EgoStitchE2E, te.EgoStitchData]:
+    def _model_and_data(self, tmp_path: Path) -> tuple[EgoStitchModel, te.EgoStitchData]:
         config = {**_E2E_TINY_MODEL, "feature_standardization": "zscore_vfit_v1"}
-        model = EgoStitchE2E(E2EConfig.from_mapping(config))
+        model = EgoStitchModel(E2EConfig.from_mapping(config))
         data = _toy_bundle(tmp_path, EgoStitchConfig())
         rows = np.arange(4 * model.generator_cfg.input_dim, dtype=np.float32).reshape(4, -1)
         data.feature_stats = compute_feature_stats(rows, ["a", "b", "c", "d"])

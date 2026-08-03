@@ -57,7 +57,7 @@ _E2E_TINY_MODEL: dict[str, object] = {
     "p_topo": 0.15,
     # Matches the `EgoStitchConfig()` base default used to build the paired
     # `_toy_bundle`/`_BatchFactory` fixtures in test_train_egostitch_e2e.py,
-    # so `EgoStitchE2E.generator_cfg.n_ground` (E2EConfig-sourced, spec
+    # so `EgoStitchModel.generator.cfg.n_ground` (E2EConfig-sourced, spec
     # Sec 14.4.4) stays consistent with those fixtures rather than silently
     # picking up the unrelated rev-3.1 default (50).
     "n_ground": 20,

@@ -59,6 +59,7 @@ from src.data.partition import derive_partition
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.eval.graph_metrics import MMDConfig, clustering_histogram, mmd_squared
 from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
+from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
 from src.model.egostitch.conditioning import (
     NULL_ALL_HEAD,
     GatedCrossAttention,
@@ -66,7 +67,7 @@ from src.model.egostitch.conditioning import (
     sample_branch_masks,
 )
 from src.model.egostitch.config import E2EConfig
-from src.model.egostitch.e2e_model import E2ENodeState, EgoStitchE2E
+from src.model.egostitch.graph import GraphEmbedding, ImaginedGraph
 from src.model.egostitch.imagine import NULL_MODE_ALL, NULL_MODE_CONTENT, NULL_MODE_FULL, SlotSet
 from src.model.egostitch.losses import stage1_family_tensors, stage1_total
 from src.train_b0 import (
@@ -939,7 +940,7 @@ def _e2e_validation_endpoint_degrees(data: EgoStitchData) -> NDArray[np.float64]
 
 
 def e2e_degree_prior_init(
-    model: EgoStitchStage1 | EgoStitchE2E, data: EgoStitchData
+    model: EgoStitchStage1 | EgoStitchModel, data: EgoStitchData
 ) -> float:
     """Center the lognormal degree head on the ``G_fit`` degree prior.
 
@@ -960,7 +961,7 @@ def e2e_degree_prior_init(
     rank computes this independently, so without the sort the replicas can
     disagree in the final bit from step 0.
     """
-    generator = model.generator if isinstance(model, EgoStitchE2E) else model
+    generator = model.generator.stage1 if isinstance(model, EgoStitchModel) else model
     graph = data.target_builder.graph
     degrees = np.asarray(
         [max(int(graph.degree(node)), 1) for node in sorted(graph.nodes())],
@@ -1045,29 +1046,33 @@ class E2EParameterGroups:
     sha256: dict[str, str]
 
 
-def build_e2e_parameter_groups(model: EgoStitchE2E) -> E2EParameterGroups:
-    """Build the three registered groups without the retired v1 composite."""
+def build_e2e_parameter_groups(model: EgoStitchModel) -> E2EParameterGroups:
+    """Build one optimizer group per top-level component (design 2026-08-02 §7).
+
+    Every parameter's group is simply its qualified name's first path segment
+    -- ``generator``, ``encoder``, or ``classifier`` -- since those are
+    exactly `EgoStitchModel`'s three submodule names. This replaces the old
+    name-prefix scheme (a bespoke ``conditioning_prefixes`` allowlist for the
+    STE encoder, the relational head, and the trunk's gated cross-attention)
+    with the component boundary itself: ``rel_head`` now lives inside
+    ``encoder`` and needs no special case, and ``trunk`` (including its
+    ``topo_xattn`` gates) now lives inside ``classifier``.
+    """
     live_ids = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
     grouped: dict[str, list[tuple[str, torch.nn.Parameter]]] = {
-        "pair_encoder_head": [],
         "generator": [],
-        "topology_content_conditioning": [],
+        "encoder": [],
+        "classifier": [],
     }
-    conditioning_prefixes = (
-        "ste.",
-        "rel_head.",
-        "trunk.topo_xattn.",
-    )
     for name, parameter in model.named_parameters():
         if id(parameter) not in live_ids:
             continue
-        if name.startswith("generator."):
-            group = "generator"
-        elif name.startswith(conditioning_prefixes):
-            group = "topology_content_conditioning"
-        else:
-            group = "pair_encoder_head"
-        grouped[group].append((name, parameter))
+        component = name.split(".", 1)[0]
+        if component not in grouped:
+            raise RuntimeError(
+                f"E2E parameter {name!r} does not belong to a known component group"
+            )
+        grouped[component].append((name, parameter))
 
     all_ids = [id(parameter) for rows in grouped.values() for _, parameter in rows]
     if len(all_ids) != len(set(all_ids)) or set(all_ids) != live_ids:
@@ -2490,51 +2495,34 @@ class _CompositeStep(torch.nn.Module):
     ``L_recon`` remains fully active, including the rev-3.1 ``L_align`` and
     ``L_rel`` edge-stream components.
 
-    Family `egostitch_e2e` (design rev 3, spec Sec 14): ``model`` is an
-    `EgoStitchE2E` instead of a frozen-s0 `EgoStitchStage1`. The node stream
-    (``L_recon``/``L_real``/``L_ssl``) is delegated to the internal, still
-    trainable `EgoStitchE2E.generator`, unchanged from Stage 1. The edge stream
-    runs the full `EgoStitchE2E.forward` under per-step seeded branch-dropout
-    masks (`sample_branch_masks`, design Sec 4). During warm-start the
-    zero-anchored logits retain the pair trunk and conditioning pathways in the
-    graph, while ``L_align`` and ``L_rel`` train the plan, STE, and relational
-    head as reconstruction terms.
+    Family `egostitch_e2e` (design rev 3, spec Sec 14; three-component
+    refactor design 2026-08-02): ``model`` is an `EgoStitchModel`. The node
+    stream (``L_recon``/``L_real``/``L_ssl``) and the edge stream's
+    ``L_align`` are delegated to `EgoStitchModel.generator.auxiliary_losses`;
+    ``L_rel`` to `EgoStitchModel.encoder.auxiliary_losses` (design §6: each
+    component owns the losses that supervise it, so swapping a component
+    swaps its auxiliary losses with it). This module never reaches into
+    `generator.stage1` directly -- that reach-through was the exact coupling
+    the three-component split exists to remove. Both calls reuse the
+    `ImaginedGraph` / AB `GraphEmbedding` that `model.forward` already built
+    to score ``logits`` (its ``"graph"``/``"embedding_ab"`` output), so no
+    second stitch+encode pass runs. This module keeps applying
+    `real_ssl_scale` (the Phase A/B warm-start ramp) and
+    `losses.stage1_total`/`.stage1_family_tensors` itself -- that is trainer
+    policy, not model policy (design §6/§12 P2 retargeting note;
+    `composite.py`'s "loss aggregation" section explains why no
+    `EgoStitchModel.aggregate_losses` exists to do this instead).
     """
 
-    def __init__(self, model: EgoStitchE2E, world_size: int) -> None:
+    def __init__(self, model: EgoStitchModel, world_size: int) -> None:
         super().__init__()
         self.model = model
         self.world_size = world_size
-
-    def _generator(self) -> EgoStitchStage1:
-        """Return the active E2E model's trainable Stage-1 generator."""
-        return self.model.generator
 
     def forward(self, batch: dict[str, object]) -> dict[str, object]:
         node = cast(dict[str, torch.Tensor], batch["node"])
         edge = cast(dict[str, torch.Tensor], batch["edge"])
         collect_diagnostics = bool(batch.get("collect_diagnostics", False))
-
-        generator = self._generator()
-        losses, _ = generator.node_losses(
-            node["x"],
-            node["ground_x"],
-            target_features=node["target_features"],
-            target_mult=node["target_mult"],
-            target_adj=node["target_adj"],
-            target_mask=node["target_mask"],
-            target_in_pool=node["target_in_pool"],
-            target_pool_index=node["target_pool_index"],
-            true_degree=node["true_degree"],
-            real_ego_stats=node["real_ego_stats"],
-            null_mode=node["null_mode"],
-            denoise_features=node["denoise_features"],
-            denoise_mask=node["denoise_mask"],
-            denoise_noise=node["denoise_noise"],
-        )
-        ssl = generator.ssl_losses(
-            node["x"], node["ground_x"], node["ground_resampled"], noise=node["ssl_noise"]
-        )
 
         extra: dict[str, object] = {}
         edge_active = bool(batch.get("edge_active", True))
@@ -2578,14 +2566,31 @@ class _CompositeStep(torch.nn.Module):
                 }
             )
         edge_output = self.model(edge_view, masks=branch_masks)
-        logits = edge_output["logits"]
-        losses = losses._replace(
-            recon={
-                **losses.recon,
-                "align": edge_output["align_loss"],
-                "rel": edge_output["rel_loss"],
-            }
-        )
+        logits = cast(torch.Tensor, edge_output["logits"])
+        graph = cast(ImaginedGraph, edge_output["graph"])
+        embedding_ab = cast(GraphEmbedding, edge_output["embedding_ab"])
+
+        # Every key `NeighborhoodGenerator.auxiliary_losses`/
+        # `GraphEncoder.auxiliary_losses` read is either a `node`-stream key
+        # (unsuffixed) or an `edge_view`-stream key (`_a`/`_b`-suffixed or
+        # distinctly named), so the merge below is a disjoint union -- see
+        # `generator/egostitch.py:auxiliary_losses`'s docstring for the exact
+        # key inventory.
+        auxiliary_batch = {**node, **edge_view}
+        generator_losses = self.model.generator.auxiliary_losses(graph, auxiliary_batch)
+        encoder_losses = self.model.encoder.auxiliary_losses(embedding_ab, auxiliary_batch)
+        recon = {
+            "feat": generator_losses["feat"],
+            "exist": generator_losses["exist"],
+            "mult": generator_losses["mult"],
+            "slotadj": generator_losses["slotadj"],
+            "gate": generator_losses["gate"],
+            "ptr": generator_losses["ptr"],
+            "div": generator_losses["div"],
+            "align": generator_losses["align"],
+            "rel": encoder_losses["rel_loss"],
+        }
+
         if collect_diagnostics:
             extra.update(_e2e_gate_tanh(self.model))
         edge_loss = (
@@ -2597,30 +2602,30 @@ class _CompositeStep(torch.nn.Module):
         )
 
         total, parts = stage1_total(
-            generator.config,
+            self.model.generator_cfg,
             family="egostitch_e2e",
             edge=edge_loss,
-            recon=losses.recon,
-            deg=losses.deg,
-            real_egostat=losses.real_egostat * real_ssl_scale,
-            real_gin=losses.real_gin * real_ssl_scale,
-            ssl_noise=ssl["noise"] * real_ssl_scale,
-            ssl_pool=ssl["pool"] * real_ssl_scale,
+            recon=recon,
+            deg=generator_losses["deg"],
+            real_egostat=generator_losses["real_egostat"] * real_ssl_scale,
+            real_gin=generator_losses["real_gin"] * real_ssl_scale,
+            ssl_noise=generator_losses["ssl_noise"] * real_ssl_scale,
+            ssl_pool=generator_losses["ssl_pool"] * real_ssl_scale,
             recon_factors=cast(
                 Mapping[str, float] | None,
                 batch.get("recon_factors"),
             ),
         )
         families = stage1_family_tensors(
-            generator.config,
+            self.model.generator_cfg,
             family="egostitch_e2e",
             edge=edge_loss,
-            recon=losses.recon,
-            deg=losses.deg,
-            real_egostat=losses.real_egostat * real_ssl_scale,
-            real_gin=losses.real_gin * real_ssl_scale,
-            ssl_noise=ssl["noise"] * real_ssl_scale,
-            ssl_pool=ssl["pool"] * real_ssl_scale,
+            recon=recon,
+            deg=generator_losses["deg"],
+            real_egostat=generator_losses["real_egostat"] * real_ssl_scale,
+            real_gin=generator_losses["real_gin"] * real_ssl_scale,
+            ssl_noise=generator_losses["ssl_noise"] * real_ssl_scale,
+            ssl_pool=generator_losses["ssl_pool"] * real_ssl_scale,
             recon_factors=cast(
                 Mapping[str, float] | None,
                 batch.get("recon_factors"),
@@ -2664,13 +2669,13 @@ def _detached_clone(value: object) -> object:
 
 
 def _e2e_edge_view(edge: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Translate the worker's edge-tensor keys to `EgoStitchE2E`'s batch contract.
+    """Translate the worker's edge-tensor keys to `EgoStitchModel`'s batch contract.
 
     Maps ``x_i``/``x_j`` to ``x_a``/``x_b`` and ``ground_i``/``ground_j``/
     ``ground_id_i``/``ground_id_j`` to ``ground_a``/``ground_b``/
     ``ground_id_a``/``ground_id_b`` (spec Sec 13.18: the real grounding-
     candidate features and their same-index-space global ids, required for
-    `EgoStitchE2E`'s grounded-identity-match flag to engage instead of its
+    `EgoStitchModel`'s grounded-identity-match flag to engage instead of its
     degenerate placeholder path); ``emb_a``/``emb_b``/``len_a``/``len_b``
     already match and pass through unchanged. `_BatchFactory._edge_tensors`
     always populates ``ground_i``/``ground_j``/``ground_id_i``/``ground_id_j``
@@ -2692,7 +2697,7 @@ def _e2e_edge_view(edge: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     }
 
 
-def _e2e_gate_tanh(model: EgoStitchE2E) -> dict[str, list[float]]:
+def _e2e_gate_tanh(model: EgoStitchModel) -> dict[str, list[float]]:
     """Per-injected-block ``tanh(gate)`` readout for the topology conditioning pathway.
 
     Registered name (spec Sec 13.17): ``gate_topo_tanh``. A pure parameter
@@ -2707,26 +2712,27 @@ def _e2e_gate_tanh(model: EgoStitchE2E) -> dict[str, list[float]]:
         return out
 
     return {
-        "gate_topo_tanh": _values(model.trunk.topo_xattn),
+        "gate_topo_tanh": _values(model.classifier.trunk.topo_xattn),
     }
 
 
-def _e2e_submodule_gradient_rms(model: EgoStitchE2E, loss: torch.Tensor) -> dict[str, float]:
+def _e2e_submodule_gradient_rms(model: EgoStitchModel, loss: torch.Tensor) -> dict[str, float]:
     """Per-submodule gradient RMS from one isolated retained-graph backward.
 
     Registered names (spec Sec 13.17): ``grad_rms_trunk``, ``grad_rms_ste``.
-    Measures how much of ``loss``'s gradient reaches the trunk and the
-    stitched-topology encoder -- the zero-init gated pathways the warm-start
-    curriculum is designed to keep dead until ``L_edge`` activates. Mirrors
-    `_family_gradient_norms`'s isolated-backward pattern: intended to be
-    called on a dedicated probe forward's output (spec Sec 13.17's fixed
-    replay batch), not on the tensor the caller is about to call its own
-    `.backward()` on -- leaves every parameter's ``.grad`` at ``None``
-    afterward either way.
+    Measures how much of ``loss``'s gradient reaches the pair trunk
+    (`model.classifier.trunk`) and the stitched-topology encoder
+    (`model.encoder`, née `model.ste`) -- the zero-init gated pathways the
+    warm-start curriculum is designed to keep dead until ``L_edge``
+    activates. Mirrors `_family_gradient_norms`'s isolated-backward pattern:
+    intended to be called on a dedicated probe forward's output (spec Sec
+    13.17's fixed replay batch), not on the tensor the caller is about to
+    call its own `.backward()` on -- leaves every parameter's ``.grad`` at
+    ``None`` afterward either way.
     """
     groups: dict[str, list[torch.nn.Parameter]] = {
-        "grad_rms_trunk": list(model.trunk.parameters()),
-        "grad_rms_ste": list(model.ste.parameters()),
+        "grad_rms_trunk": list(model.classifier.trunk.parameters()),
+        "grad_rms_ste": list(model.encoder.parameters()),
     }
     model.zero_grad(set_to_none=True)
     loss.backward(retain_graph=True)  # type: ignore[no-untyped-call]
@@ -2744,7 +2750,7 @@ def _e2e_submodule_gradient_rms(model: EgoStitchE2E, loss: torch.Tensor) -> dict
 
 
 def _e2e_topology_delta_std(
-    model: EgoStitchE2E, batch: dict[str, torch.Tensor]
+    model: EgoStitchModel, batch: dict[str, torch.Tensor]
 ) -> dict[str, float]:
     """Std of ``full - f_logit`` over one batch (design Sec 14, spec Sec 13.17).
 
@@ -2759,7 +2765,9 @@ def _e2e_topology_delta_std(
     return {"topology_delta_std": _e2e_topology_fidelity(model, batch)["topology_delta_std"]}
 
 
-def _e2e_topology_fidelity(model: EgoStitchE2E, batch: dict[str, torch.Tensor]) -> dict[str, float]:
+def _e2e_topology_fidelity(
+    model: EgoStitchModel, batch: dict[str, torch.Tensor]
+) -> dict[str, float]:
     """Compute the validation topology tie-break with one shared pair context."""
     with torch.no_grad():
         context = model.build_pair_context(batch)
@@ -2788,14 +2796,14 @@ def _e2e_null_arm_tiebreak(logits: np.ndarray) -> dict[str, float]:
     return {"active_logit_std": float(np.std(logits)), "selection_tiebreak": 0.0}
 
 
-def _e2e_trainable_parameters(model: EgoStitchE2E) -> list[torch.nn.Parameter]:
+def _e2e_trainable_parameters(model: EgoStitchModel) -> list[torch.nn.Parameter]:
     """Trainable parameters for family `egostitch_e2e`, excluding dead ones.
 
     `DecisionHead` (the frozen-s0 family's ``(s0, s1, s2)`` fusion head, spec
     Sec 13.1) is deleted entirely along with the content path -- there is no
-    longer a `generator.decision` submodule to special-case.
-    `generator.random_gin` *is* exercised (via `node_losses`'s ``L_real``
-    energy-distance term) but is already frozen at construction
+    longer a `generator.stage1.decision` submodule to special-case.
+    `generator.stage1.random_gin` *is* exercised (via `node_losses`'s
+    ``L_real`` energy-distance term) but is already frozen at construction
     (`requires_grad=False`, spec Sec 13.6), so the plain `requires_grad`
     filter below excludes it without any name-based special case.
     """
@@ -2803,7 +2811,7 @@ def _e2e_trainable_parameters(model: EgoStitchE2E) -> list[torch.nn.Parameter]:
 
 
 def _e2e_optimizer_parameters(
-    model: EgoStitchE2E, composite: _CompositeStep
+    model: EgoStitchModel, composite: _CompositeStep
 ) -> list[torch.nn.Parameter]:
     """Return only live E2E model parameters; Kendall is frozen by §13.19."""
     del composite
@@ -2976,7 +2984,7 @@ def _e2e_validation_slice_rows(n_val: int) -> tuple[int, ...]:
 
 
 def _validate_epoch(
-    model: EgoStitchE2E,
+    model: EgoStitchModel,
     data: EgoStitchData,
     accelerator: Accelerator,
     *,
@@ -2996,7 +3004,7 @@ def _validate_epoch(
     branch dropout); the ``none`` arm is the true full decomposition. There is
     no `s0` fusion and no self/non-self split (a self pair is simply
     ``x_a == x_b``/``emb_a == emb_b``, handled internally by
-    `EgoStitchE2E.forward`). `token_table`/`token_node_index` (the packed
+    `EgoStitchModel.forward`). `token_table`/`token_node_index` (the packed
     raw-token store `_BatchFactory` already loaded) are required for this
     family to build the ``emb_a``/``emb_b`` batch keys. The per-epoch
     `topology_delta_std` telemetry and checkpoint-selection tie-break apply
@@ -3302,7 +3310,7 @@ def _write_failed_run_history(
         logger.error("failed to retain per-epoch failure history: %s", error)
 
 
-def _e2e_arm_name(model: EgoStitchE2E) -> E2EArmName:
+def _e2e_arm_name(model: EgoStitchModel) -> E2EArmName:
     return _e2e_arm_name_from_config(model.cfg)
 
 
@@ -3330,12 +3338,12 @@ def _e2e_base_lr(step: int, total_steps: int, config: EgoStitchTrainingConfig) -
     return config.min_lr + (config.lr_peak - config.min_lr) * cosine
 
 
-def _e2e_active_groups(phase: E2EPhaseState, model: EgoStitchE2E) -> set[str]:
+def _e2e_active_groups(phase: E2EPhaseState, model: EgoStitchModel) -> set[str]:
     groups = {"generator"}
-    if model.rel_head is not None or phase.edge_active:
-        groups.add("topology_content_conditioning")
+    if model.encoder.rel_head is not None or phase.edge_active:
+        groups.add("encoder")
     if phase.edge_active:
-        groups.add("pair_encoder_head")
+        groups.add("classifier")
     return groups
 
 
@@ -3348,7 +3356,7 @@ def _e2e_optimizer_group_lr(
     """Keep repair modules live in Phase A, then preserve the joint-entry ramp."""
     if group_name not in active_groups:
         return 0.0
-    if group_name == "topology_content_conditioning" and phase.edge_active:
+    if group_name == "encoder" and phase.edge_active:
         return base_lr * phase.alpha
     return base_lr
 
@@ -3458,20 +3466,20 @@ def _e2e_family_probe(
     training, but at budget-probe time it is an artifact of step-0 init.
     """
     inner = cast(_CompositeStep, accelerator.unwrap_model(wrapped)).model
-    assert isinstance(inner, EgoStitchE2E)
+    assert isinstance(inner, EgoStitchModel)
     families = ["recon"]
     if phase.edge_active:
         families.insert(0, "edge")
     if phase.real_ssl_scale > 0.0:
         families.extend(("real", "ssl"))
     expected: dict[str, set[str]] = {
-        "pair_encoder_head": {"edge"} if phase.edge_active else set(),
+        "classifier": {"edge"} if phase.edge_active else set(),
         "generator": {"recon"} | ({"real", "ssl"} if phase.real_ssl_scale > 0.0 else set()),
-        "topology_content_conditioning": {"recon"} if inner.rel_head is not None else set(),
+        "encoder": {"recon"} if inner.encoder.rel_head is not None else set(),
     }
     if phase.edge_active and arm != "b0_e2e_f_only":
         expected["generator"].add("edge")
-        expected["topology_content_conditioning"].add("edge")
+        expected["encoder"].add("edge")
     result: dict[str, dict[str, float]] = {group: {} for group in groups}
     submodule_rms: dict[str, float] = {}
     probe_payload = {**payload, "collect_diagnostics": True}
@@ -3520,12 +3528,12 @@ def _e2e_family_probe(
 
 
 def _e2e_current_submodule_gradient_rms(
-    model: EgoStitchE2E, accelerator: Accelerator
+    model: EgoStitchModel, accelerator: Accelerator
 ) -> dict[str, float]:
     """RMS telemetry from the current synchronized fixed-replay edge backward."""
     submodules: dict[str, Sequence[torch.nn.Parameter]] = {
-        "grad_rms_trunk": tuple(model.trunk.parameters()),
-        "grad_rms_ste": tuple(model.ste.parameters()),
+        "grad_rms_trunk": tuple(model.classifier.trunk.parameters()),
+        "grad_rms_ste": tuple(model.encoder.parameters()),
     }
     result: dict[str, float] = {}
     for name, parameters in submodules.items():
@@ -3657,7 +3665,7 @@ def _validate_e2e_precision_outputs(
 
 
 def _e2e_precision_differential(
-    model: EgoStitchE2E,
+    model: EgoStitchModel,
     edge: dict[str, torch.Tensor],
     accelerator: Accelerator,
     *,
@@ -3715,7 +3723,7 @@ def _raise_synchronized_precision_failure(
 
 
 def _enforce_e2e_initial_slot_health(
-    model: EgoStitchE2E,
+    model: EgoStitchModel,
     data: EgoStitchData,
     accelerator: Accelerator,
     *,
@@ -3826,7 +3834,7 @@ def _enforce_e2e_initial_slot_health(
 
 
 def _train_e2e_stability_loop(
-    model: EgoStitchE2E,
+    model: EgoStitchModel,
     cfg: EgoConfig,
     data: EgoStitchData,
     accelerator: Accelerator,
@@ -3854,9 +3862,9 @@ def _train_e2e_stability_loop(
         [
             {"params": parameter_groups.groups[name], "lr": training.lr_peak, "name": name}
             for name in (
-                "pair_encoder_head",
                 "generator",
-                "topology_content_conditioning",
+                "encoder",
+                "classifier",
             )
         ],
         betas=training.betas,
@@ -4055,9 +4063,9 @@ def _train_e2e_stability_loop(
                     parameter_groups.groups,
                     active_groups,
                     max_norm={
-                        "pair_encoder_head": training.pair_encoder_clip_norm,
+                        "classifier": training.pair_encoder_clip_norm,
                         "generator": training.generator_clip_norm,
-                        "topology_content_conditioning": training.clip_norm,
+                        "encoder": training.clip_norm,
                     },
                     enforce_nonzero=enforce_quality,
                 )
@@ -4187,7 +4195,7 @@ def _train_e2e_stability_loop(
                         for group, flags in family_quality_misses.items()
                     ):
                         quality_guards_passed = False
-                    latest_topology_norm = family_norms["topology_content_conditioning"].get("edge")
+                    latest_topology_norm = family_norms["encoder"].get("edge")
                     probe_record: dict[str, object] = {
                         "step": global_step,
                         "phase": phase.phase,
@@ -4201,7 +4209,7 @@ def _train_e2e_stability_loop(
                         "family_quality_thresholds": family_quality_misses,
                         "submodule_gradient_rms": submodule_rms,
                         **_e2e_gate_tanh(
-                            cast(EgoStitchE2E, accelerator.unwrap_model(wrapped).model)
+                            cast(EgoStitchModel, accelerator.unwrap_model(wrapped).model)
                         ),
                     }
                     epoch_probes.append(probe_record)
@@ -4282,7 +4290,7 @@ def _train_e2e_stability_loop(
                             inner_model = cast(
                                 _CompositeStep, accelerator.unwrap_model(wrapped)
                             ).model
-                            assert isinstance(inner_model, EgoStitchE2E)
+                            assert isinstance(inner_model, EgoStitchModel)
                             end_ramp_precision = _e2e_precision_differential(
                                 inner_model,
                                 cast(dict[str, torch.Tensor], fixed_replay["edge"]),
@@ -4561,7 +4569,7 @@ def _train_e2e_stability_loop(
         if accelerator.is_main_process:
             assert fixed_replay is not None
             inner_model = cast(_CompositeStep, accelerator.unwrap_model(wrapped)).model
-            assert isinstance(inner_model, EgoStitchE2E)
+            assert isinstance(inner_model, EgoStitchModel)
             inner_model.load_state_dict(best_state)
             try:
                 selected_precision = _e2e_precision_differential(
@@ -4771,7 +4779,7 @@ def _train_e2e_stability_loop(
 
 
 def train_egostitch_ddp_loop(
-    model: EgoStitchStage1 | EgoStitchE2E,
+    model: EgoStitchStage1 | EgoStitchModel,
     cfg: EgoConfig,
     data: EgoStitchData,
     accelerator: Accelerator,
@@ -4801,7 +4809,7 @@ def train_egostitch_ddp_loop(
 
     Raises:
         RuntimeError: When the config carries no ``training`` section, or the
-            model is not an `EgoStitchE2E`.
+            model is not an `EgoStitchModel`.
         ValueError: When ``max_steps`` is set.
     """
     if cfg.training is None:
@@ -4809,7 +4817,7 @@ def train_egostitch_ddp_loop(
             "legacy frozen-s0 egostitch training was removed; every executable "
             "configuration must carry a training section"
         )
-    if not isinstance(model, EgoStitchE2E):
+    if not isinstance(model, EgoStitchModel):
         raise RuntimeError("§13.19 training requires model.family='egostitch_e2e'")
     if max_steps is not None:
         raise ValueError("§13.19 execution forbids --max-steps")
@@ -5050,7 +5058,7 @@ def write_outputs(
 
 
 def _bind_feature_standardization(
-    model: EgoStitchE2E,
+    model: EgoStitchModel,
     cfg: EgoConfig,
     data: EgoStitchData,
 ) -> str:
@@ -5134,7 +5142,7 @@ def _run_ddp_worker(cfg: EgoConfig, args: EgoCliArgs) -> None:
     feature_stats_sha256 = ""
 
     data = assemble_egostitch_data(cfg, pack_dir=args.pack_dir)
-    model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+    model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
     feature_stats_sha256 = _bind_feature_standardization(model, cfg, data)
     _run_ddp_dispatch(
         cfg,
@@ -5152,7 +5160,7 @@ def _run_ddp_worker(cfg: EgoConfig, args: EgoCliArgs) -> None:
 def _run_ddp_dispatch(
     cfg: EgoConfig,
     args: EgoCliArgs,
-    model: EgoStitchE2E,
+    model: EgoStitchModel,
     data: EgoStitchData,
     *,
     accelerator: Accelerator,

@@ -83,12 +83,12 @@ class TestConfig:
             EgoStitchConfig(tau_adj=tau_adj)
 
     def test_e2e_repair_calibration_fields_propagate_to_generator(self) -> None:
-        from src.model.egostitch.e2e_model import EgoStitchE2E
+        from src.model.egostitch.composite import EgoStitchModel
 
         config = E2EConfig.from_mapping(
             {"tau_adj": 0.4, "tau_div": 0.3, "l_gate_pos_weight": 5.0}
         )
-        model = EgoStitchE2E(config)
+        model = EgoStitchModel(config)
         assert model.generator_cfg.tau_adj == 0.4
         assert model.generator_cfg.tau_div == 0.3
         assert model.generator_cfg.l_gate_pos_weight == 5.0
@@ -124,14 +124,8 @@ class TestTokenizeLite:
         x, _ = _tiny_inputs()
         out = module(x)
         assert out.e.shape == (3, _TINY.d_z)
-        assert out.d_hat_raw.shape == (3,)
         assert out.deg_mu.shape == (3,)
         assert out.deg_log_sigma.shape == (3,)
-
-    def test_degree_budget_non_negative(self) -> None:
-        module = TokenizeLite(_TINY)
-        x, _ = _tiny_inputs(seed=1)
-        assert bool((module(x).d_hat_raw >= 0).all())
 
     def test_deterministic(self) -> None:
         torch.manual_seed(0)

@@ -26,9 +26,9 @@ from src.data.features import FeatureStore, build_f0_matrix
 from src.data.grounding import build_grounding_pool
 from src.data.packed_features import PackedFeatureTable, build_packed_features
 from src.model.B0 import V3_1
+from src.model.egostitch.composite import E2ENodeState, E2EPairContext, EgoStitchModel
 from src.model.egostitch.conditioning import GatedCrossAttention
 from src.model.egostitch.config import E2EConfig
-from src.model.egostitch.e2e_model import E2ENodeState, E2EPairContext, EgoStitchE2E
 
 INPUT_DIM = 4
 
@@ -190,10 +190,10 @@ def test_load_pre_rev31_e2e_checkpoint_rejects_legacy_scaffold_shape(tmp_path: P
     legacy_config["w_rel"] = 0.0
     source_model = score_universe.build_model("egostitch_e2e", legacy_config)
     legacy_state = dict(source_model.state_dict())
-    legacy_state["ste.embed.weight"] = legacy_state["ste.embed.weight"][:, :9].clone()
+    legacy_state["encoder.embed.weight"] = legacy_state["encoder.embed.weight"][:, :9].clone()
     for layer in range(cast(int, legacy_config["ste_layers"])):
-        legacy_state.pop(f"ste.layers.{layer}.msg.3.weight")
-        legacy_state.pop(f"ste.layers.{layer}.msg.3.bias")
+        legacy_state.pop(f"encoder.layers.{layer}.msg.3.weight")
+        legacy_state.pop(f"encoder.layers.{layer}.msg.3.bias")
     checkpoint_config = dict(legacy_config)
     checkpoint_config.pop("w_rel")
     checkpoint_path = tmp_path / "pre-rev31-e2e.pt"
@@ -228,7 +228,7 @@ def test_e2e_checkpoint_restores_the_feature_standardization(tmp_path: Path) -> 
     """
     gen = np.random.default_rng(0)
     cfg = E2EConfig(feature_standardization="zscore_vfit_v1")
-    trained = EgoStitchE2E(cfg)
+    trained = EgoStitchModel(cfg)
     rows = (30.0 + 4.0 * gen.standard_normal((32, trained.generator_cfg.input_dim))).astype(
         np.float32
     )
@@ -245,11 +245,16 @@ def test_e2e_checkpoint_restores_the_feature_standardization(tmp_path: Path) -> 
 
     restored, model_family, _ = score_universe._load_checkpoint(checkpoint_path)
     assert model_family == "egostitch_e2e"
-    assert isinstance(restored, EgoStitchE2E)
+    assert isinstance(restored, EgoStitchModel)
     assert restored.feature_stats_digest_hex == stats.digest
     x = torch.randn(4, trained.generator_cfg.input_dim)
+    # `model.generator` used to be the `EgoStitchStage1` itself; the
+    # three-component refactor (design §5) moves it to `model.generator.stage1`
+    # (the composite's `generator` attribute is now the `EgoStitchImagineGenerator`
+    # wrapper). `normalize_features` lives on `EgoStitchStage1`, not the wrapper.
     torch.testing.assert_close(
-        restored.generator.normalize_features(x), trained.generator.normalize_features(x)
+        restored.generator.stage1.normalize_features(x),
+        trained.generator.stage1.normalize_features(x),
     )
 
 
@@ -263,10 +268,10 @@ def test_checkpoint_missing_feature_standardization_never_silently_switches_mode
     the backfills gone (design 2026-08-02 §11) the config's own rev-3.2 default
     would apply instead, which would score a row-LayerNorm checkpoint under
     z-scored features. Strict loading catches it because the two modes differ in
-    state: only `zscore_vfit_v1` carries `generator.feature_norm.*` buffers.
+    state: only `zscore_vfit_v1` carries `generator.stage1.feature_norm.*` buffers.
     """
     legacy_cfg = E2EConfig(feature_standardization="row_layernorm")
-    legacy = EgoStitchE2E(legacy_cfg)
+    legacy = EgoStitchModel(legacy_cfg)
     legacy_config = {
         key: value
         for key, value in asdict(legacy_cfg).items()
@@ -902,7 +907,7 @@ _TINY_E2E_CONFIG: dict[str, object] = {
     # `test_e2e_checkpoint_restores_the_feature_standardization`.
     "feature_standardization": "row_layernorm",
 }
-# EgoStitchE2E's internal Stage-1 generator keeps its own pinned spec default
+# EgoStitchModel's internal Stage-1 generator keeps its own pinned spec default
 # (EgoStitchConfig().input_dim, spec Sec 13) regardless of E2EConfig, so the
 # feature store backing these tests must use that exact node-token dimension.
 _E2E_NODE_DIM = 1536
@@ -960,10 +965,10 @@ def _egostitch_e2e_score_args(
 
 
 def test_build_model_egostitch_e2e_round_trips() -> None:
-    from src.model.egostitch.e2e_model import EgoStitchE2E
+    from src.model.egostitch.composite import EgoStitchModel
 
     model = score_universe.build_model("egostitch_e2e", dict(_TINY_E2E_CONFIG))
-    assert isinstance(model, EgoStitchE2E)
+    assert isinstance(model, EgoStitchModel)
     assert model.cfg.d_model == 32
 
 
@@ -1158,11 +1163,13 @@ def _enable_e2e_conditioning_gates(checkpoint: Path) -> None:
     """Make the synthetic checkpoint sensitive to topology perturbations."""
     payload = torch.load(checkpoint, weights_only=False)
     model = score_universe.build_model("egostitch_e2e", dict(_TINY_E2E_CONFIG))
-    assert isinstance(model, EgoStitchE2E)
+    assert isinstance(model, EgoStitchModel)
     model.load_state_dict(payload["model_state"])
     # cont_xattn is deleted with the content path (design doc §9); only the
     # topo pathway remains to make the checkpoint sensitive to perturbations.
-    for module in [*model.trunk.topo_xattn]:
+    # `model.trunk` (an `EgoStitchE2E` attribute) is now `model.classifier.trunk`
+    # (design §5).
+    for module in [*model.classifier.trunk.topo_xattn]:
         assert isinstance(module, GatedCrossAttention)
         module.gate.data.fill_(1.0)
     payload["model_state"] = model.state_dict()
@@ -1181,7 +1188,7 @@ def _direct_e2e_control_scores(
 ) -> dict[str, np.ndarray]:
     payload = torch.load(checkpoint, weights_only=False)
     model = score_universe.build_model("egostitch_e2e", dict(_TINY_E2E_CONFIG))
-    assert isinstance(model, EgoStitchE2E)
+    assert isinstance(model, EgoStitchModel)
     model.load_state_dict(payload["model_state"])
     model.eval()
     store = FeatureStore(data_root / "features" / "frozen_node_features_1024")
@@ -1264,13 +1271,13 @@ def test_egostitch_e2e_scaffold_control_uses_multi_pair_batches(
     _enable_e2e_conditioning_gates(checkpoint)
     many_pairs = _E2E_PAIRS * 8
     calls: list[int] = []
-    original = EgoStitchE2E.decompose_pair_context
+    original = EgoStitchModel.decompose_pair_context
 
-    def _spy(self: EgoStitchE2E, context: E2EPairContext) -> dict[str, torch.Tensor]:
+    def _spy(self: EgoStitchModel, context: E2EPairContext) -> dict[str, torch.Tensor]:
         calls.append(context.encoded_a.shape[0])
         return original(self, context)
 
-    monkeypatch.setattr(EgoStitchE2E, "decompose_pair_context", _spy)
+    monkeypatch.setattr(EgoStitchModel, "decompose_pair_context", _spy)
     _direct_e2e_control_scores(
         tmp_path,
         data_root,
@@ -1293,30 +1300,30 @@ def test_egostitch_e2e_scoring_caches_unique_nodes_and_reuses_pair_context(
     encoded_rows = 0
     context_calls = 0
     head_calls = 0
-    original_encode = cast(Callable[..., E2ENodeState], EgoStitchE2E.encode_node_state)
+    original_encode = cast(Callable[..., E2ENodeState], EgoStitchModel.encode_node_state)
     original_context = cast(
-        Callable[..., E2EPairContext], EgoStitchE2E.build_pair_context_from_states
+        Callable[..., E2EPairContext], EgoStitchModel.build_pair_context_from_states
     )
-    original_head = cast(Callable[..., torch.Tensor], EgoStitchE2E.score_pair_context)
+    original_head = cast(Callable[..., torch.Tensor], EgoStitchModel.score_pair_context)
 
-    def encode_spy(self: EgoStitchE2E, *args: object, **kwargs: object) -> E2ENodeState:
+    def encode_spy(self: EgoStitchModel, *args: object, **kwargs: object) -> E2ENodeState:
         nonlocal encoded_rows
         encoded_rows += cast(torch.Tensor, args[0]).shape[0]
         return original_encode(self, *args, **kwargs)
 
-    def context_spy(self: EgoStitchE2E, *args: object, **kwargs: object) -> E2EPairContext:
+    def context_spy(self: EgoStitchModel, *args: object, **kwargs: object) -> E2EPairContext:
         nonlocal context_calls
         context_calls += 1
         return original_context(self, *args, **kwargs)
 
-    def head_spy(self: EgoStitchE2E, *args: object, **kwargs: object) -> torch.Tensor:
+    def head_spy(self: EgoStitchModel, *args: object, **kwargs: object) -> torch.Tensor:
         nonlocal head_calls
         head_calls += 1
         return original_head(self, *args, **kwargs)
 
-    monkeypatch.setattr(EgoStitchE2E, "encode_node_state", encode_spy)
-    monkeypatch.setattr(EgoStitchE2E, "build_pair_context_from_states", context_spy)
-    monkeypatch.setattr(EgoStitchE2E, "score_pair_context", head_spy)
+    monkeypatch.setattr(EgoStitchModel, "encode_node_state", encode_spy)
+    monkeypatch.setattr(EgoStitchModel, "build_pair_context_from_states", context_spy)
+    monkeypatch.setattr(EgoStitchModel, "score_pair_context", head_spy)
     score_universe.main(
         _egostitch_e2e_score_args(
             tmp_path, data_root, checkpoint, pairs_path, tmp_path / "cached.npz"
@@ -1346,7 +1353,7 @@ def test_egostitch_e2e_cached_scoring_matches_uncached_decomposition(tmp_path: P
     model = score_universe.build_model(
         "egostitch_e2e", cast(dict[str, object], payload["model_config"])
     )
-    assert isinstance(model, EgoStitchE2E)
+    assert isinstance(model, EgoStitchModel)
     model.load_state_dict(cast(dict[str, torch.Tensor], payload["model_state"]))
     model.eval()
     store = FeatureStore(data_root / "features" / "frozen_node_features_1024")
@@ -1600,22 +1607,22 @@ def test_egostitch_e2e_scorer_supplies_grounding_batch_keys(
 ) -> None:
     """`_score_egostitch_e2e` assembles real grounding-pool batch keys per pair.
 
-    Spies on `EgoStitchE2E.encode_node_state` to capture the node-cache inputs,
+    Spies on `EgoStitchModel.encode_node_state` to capture the node-cache inputs,
     asserting the required ``ground_a``/``ground_b`` tensors and optional
     ``ground_id_a``/``ground_id_b`` identifiers are present with the expected
     shapes and dtypes for every scored batch.
     """
+    from src.model.egostitch.composite import EgoStitchModel
     from src.model.egostitch.config import E2EConfig
-    from src.model.egostitch.e2e_model import EgoStitchE2E
 
     data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
     output = tmp_path / "scores.npz"
 
     captured: list[tuple[torch.Tensor | None, torch.Tensor | None]] = []
-    original_encode = EgoStitchE2E.encode_node_state
+    original_encode = EgoStitchModel.encode_node_state
 
     def _spy_encode(
-        self: EgoStitchE2E,
+        self: EgoStitchModel,
         emb: torch.Tensor,
         length: torch.Tensor,
         x: torch.Tensor,
@@ -1625,7 +1632,7 @@ def test_egostitch_e2e_scorer_supplies_grounding_batch_keys(
         captured.append((ground, ground_ids))
         return original_encode(self, emb, length, x, ground, ground_ids)
 
-    monkeypatch.setattr(EgoStitchE2E, "encode_node_state", _spy_encode)
+    monkeypatch.setattr(EgoStitchModel, "encode_node_state", _spy_encode)
 
     score_universe.main(_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, output))
 
@@ -1654,7 +1661,7 @@ def test_egostitch_e2e_scorer_warns_on_n_ground_clamp(
     """`_score_egostitch_e2e` warns when the registered `n_ground` gets clamped.
 
     The tiny 3-node fixture (`_E2E_PAIRS` over `{n0, n1, n2}`) can only support
-    `len(node_ids) - 1 == 2` grounding candidates, while `EgoStitchE2E`'s
+    `len(node_ids) - 1 == 2` grounding candidates, while `EgoStitchModel`'s
     `generator_cfg.n_ground` registers `E2EConfig()`'s rev-3.1 default (spec
     Sec 14.4.4; `_egostitch_e2e_setup`'s `_TINY_E2E_CONFIG` does not override
     it). Every call here silently clamps the registered default down to 2;

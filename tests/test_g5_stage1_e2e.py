@@ -19,8 +19,8 @@ from src import score_universe
 from src import train_egostitch as te
 from src.data import internal_holdout
 from src.experiments import b0_cal, g5_stage1, probes
+from src.model.egostitch.composite import EgoStitchModel
 from src.model.egostitch.config import E2EConfig
-from src.model.egostitch.e2e_model import EgoStitchE2E
 from src.score_universe import ScoresArtifact, load_scores, save_scores
 from src.train_b0 import ModelConfig, _state_digest
 
@@ -304,7 +304,7 @@ def test_real_probe_producer_artifact_is_accepted_by_g5_evaluator(
     config_path = tmp_path / "config.yaml"
     probe_path = tmp_path / "probe.npz"
 
-    model = EgoStitchE2E(E2EConfig.from_mapping(model_config))
+    model = EgoStitchModel(E2EConfig.from_mapping(model_config))
     checkpoint_path = tmp_path / "best.pt"
     state = model.state_dict()
     torch.save(

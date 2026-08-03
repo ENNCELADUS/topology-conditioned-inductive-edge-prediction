@@ -17,8 +17,8 @@ import pytest
 import torch
 import yaml  # type: ignore[import-untyped]
 from src import train_egostitch as te
+from src.model.egostitch.composite import EgoStitchModel
 from src.model.egostitch.config import E2EConfig
-from src.model.egostitch.e2e_model import EgoStitchE2E
 
 pytestmark = pytest.mark.unit
 
@@ -472,7 +472,7 @@ def test_prefetch_batches_propagates_producer_error_and_shutdowns() -> None:
 
 def test_e2e_lr_and_active_groups_follow_registered_phase_contract() -> None:
     config = te.EgoStitchTrainingConfig()
-    full_model = EgoStitchE2E(E2EConfig(w_rel=0.25))
+    full_model = EgoStitchModel(E2EConfig(w_rel=0.25))
     assert te._e2e_base_lr(0, 2000, config) == pytest.approx(2e-7)
     assert te._e2e_base_lr(499, 2000, config) == pytest.approx(1e-4)
     assert te._e2e_base_lr(1999, 2000, config) == pytest.approx(1e-5)
@@ -481,35 +481,35 @@ def test_e2e_lr_and_active_groups_follow_registered_phase_contract() -> None:
     phase_c = te.E2EPhaseState("C", 1.0, True, 1.0)
     assert te._e2e_active_groups(phase_a, full_model) == {
         "generator",
-        "topology_content_conditioning",
+        "encoder",
     }
     assert te._e2e_active_groups(first_edge, full_model) == {
-        "pair_encoder_head",
+        "classifier",
         "generator",
-        "topology_content_conditioning",
+        "encoder",
     }
     assert te._e2e_active_groups(phase_c, full_model) == {
-        "pair_encoder_head",
+        "classifier",
         "generator",
-        "topology_content_conditioning",
+        "encoder",
     }
     full_phase_a_groups = te._e2e_active_groups(phase_a, full_model)
     full_edge_groups = te._e2e_active_groups(first_edge, full_model)
     assert (
         te._e2e_optimizer_group_lr(
-            1e-4, phase_a, "topology_content_conditioning", full_phase_a_groups
+            1e-4, phase_a, "encoder", full_phase_a_groups
         )
         == 1e-4
     )
     assert te._e2e_optimizer_group_lr(
-        1e-4, first_edge, "topology_content_conditioning", full_edge_groups
+        1e-4, first_edge, "encoder", full_edge_groups
     ) == pytest.approx(1e-4 * first_edge.alpha)
     assert (
-        te._e2e_optimizer_group_lr(1e-4, phase_a, "pair_encoder_head", full_phase_a_groups)
+        te._e2e_optimizer_group_lr(1e-4, phase_a, "classifier", full_phase_a_groups)
         == 0.0
     )
     assert (
-        te._e2e_optimizer_group_lr(1e-4, first_edge, "pair_encoder_head", full_edge_groups)
+        te._e2e_optimizer_group_lr(1e-4, first_edge, "classifier", full_edge_groups)
         == 1e-4
     )
 
@@ -578,7 +578,7 @@ def test_e2e_weighted_bce_matches_one_and_two_rank_gradients_with_padding() -> N
 
 
 def test_e2e_parameter_groups_are_disjoint_exhaustive_and_exclude_kendall() -> None:
-    model = EgoStitchE2E(
+    model = EgoStitchModel(
         E2EConfig(
             d_model=16,
             encoder_layers=1,
@@ -594,9 +594,9 @@ def test_e2e_parameter_groups_are_disjoint_exhaustive_and_exclude_kendall() -> N
     ids = [id(parameter) for group in manifest.groups.values() for parameter in group]
     assert len(ids) == len(set(ids)) == len(te._e2e_trainable_parameters(model))
     assert set(manifest.groups) == {
-        "pair_encoder_head",
         "generator",
-        "topology_content_conditioning",
+        "encoder",
+        "classifier",
     }
     assert all(len(digest) == 64 for digest in manifest.sha256.values())
 

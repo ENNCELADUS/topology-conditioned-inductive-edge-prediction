@@ -29,14 +29,13 @@ _TINY = EgoStitchConfig(
 
 # The frozen random GIN and the rev-3.1-only pointer head legitimately receive
 # no gradient under the standalone family's frozen Section-13 objective.
-# `tokenize.degree_mean_head` fed `d_hat_raw` into `EgoStitchStage1.d_hat()`,
-# which was consumed only by the retired `pair_outputs`/`self_outputs`
-# decision-fusion methods (deleted alongside `decision.py`, three-component
-# refactor design §9). It was already unreachable from `EgoStitchE2E`'s own
-# forward path (which never called `pair_outputs`/`self_outputs`/`d_hat`), so
-# this does not change any live e2e training gradient -- only this isolated
-# standalone-class unit test's coverage.
-_NO_GRAD_PREFIXES = ("random_gin", "imagine.head_pointer", "tokenize.degree_mean_head")
+# `tokenize.degree_mean_head` (fed `d_hat_raw` into the retired
+# `EgoStitchStage1.d_hat()`, itself only consumed by the `pair_outputs`/
+# `self_outputs` decision-fusion methods deleted alongside `decision.py`,
+# three-component refactor design §9) was removed entirely in the P2a
+# dead-code sweep, so there are no more parameters under that prefix to
+# exempt.
+_NO_GRAD_PREFIXES = ("random_gin", "imagine.head_pointer")
 
 
 def _model(seed: int = 0) -> EgoStitchStage1:

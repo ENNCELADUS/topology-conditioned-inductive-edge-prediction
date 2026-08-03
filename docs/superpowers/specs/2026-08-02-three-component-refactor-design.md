@@ -127,7 +127,10 @@ addition needs no encoder change.
 
 ```python
 class NeighborhoodGenerator(Protocol):
-    def forward(self, x_a, x_b, ground_a, ground_b, *, is_self) -> ImaginedGraph | None: ...
+    def encode_node(self, x, ground, ground_ids=None) -> GeneratorNodeState: ...
+    def stitch(self, state_a, state_b, is_self, *, perturbation=None) -> ImaginedGraph | None: ...
+    def forward(self, x_a, x_b, ground_a, ground_b, *, is_self,
+                perturbation=None) -> ImaginedGraph | None: ...
     def auxiliary_losses(self, graph, batch) -> dict[str, Tensor]: ...
 
 class GraphEncoder(Protocol):
@@ -142,6 +145,21 @@ class PairClassifier(Protocol):
 Returning `None` from the generator is the null case: the composite passes `cond=None`
 and the classifier runs unconditioned. That path is exactly the B0 pairwise baseline,
 reachable by config alone.
+
+**Amendment (2026-08-03), correcting two errors in this section as first drafted.**
+Both were found by the agents implementing it, not by review of the spec:
+
+1. **The generator must expose a separable per-node phase.** A single fused
+   `forward(x_a, x_b, ...)` breaks per-node caching, and that caching is load-bearing:
+   `score_universe.py:1981-2123` and `train_egostitch.py:3127-3175` encode each node
+   once and reuse the state across many pairs, so a universe scoring pass does not
+   re-encode both endpoints per pair. Hence `encode_node` / `stitch`, with `forward`
+   as the convenience composition. `GeneratorNodeState` must survive index-select,
+   index-copy and re-stack, because that is what the caching callers do to it.
+2. **`stitch` must accept a scaffold-control perturbation.** `score_universe.py:1935`
+   builds one via `make_scaffold_input_perturbation` and threads it into scaffold
+   assembly to produce the two mandatory structure-control arms (6a shuffle,
+   6e rewire). Omitting it from the protocol would have silently broken both controls.
 
 ### 3.4 Composite
 

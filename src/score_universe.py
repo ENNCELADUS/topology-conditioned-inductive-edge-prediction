@@ -1057,21 +1057,24 @@ def _build_f0_mlp(model_config: dict[str, object]) -> nn.Module:
 
 
 def _build_egostitch_e2e(model_config: dict[str, object]) -> nn.Module:
-    """Build an `EgoStitchE2E` model from its checkpointed config (design rev 3).
+    """Build an `EgoStitchModel` from its checkpointed config (design rev 3).
 
-    The internal Stage-1 generator keeps its own pinned spec defaults
+    Three-component refactor design (2026-08-02): the internal Stage-1
+    generator keeps its own pinned spec defaults
     (``EgoStitchConfig()``, spec Sec 13) except for `n_ground` and the rev-3.1
     calibration fields `tau_adj`, `tau_div`, and `l_gate_pos_weight`, which
     are checkpoint-configurable via `E2EConfig` (spec Sec 14.4.1-14.4.4).
     The remaining pair-trunk/conditioning fields in `E2EConfig` are likewise
-    checkpoint-configurable (design rev 3 Sec 3.4-3.5).
+    checkpoint-configurable (design rev 3 Sec 3.4-3.5). `EgoStitchModel`
+    replaces `EgoStitchE2E`; the family name `egostitch_e2e` and `E2EConfig`
+    itself are unchanged (design §8).
     """
+    from src.model.egostitch.composite import EgoStitchModel
     from src.model.egostitch.config import E2EConfig
-    from src.model.egostitch.e2e_model import EgoStitchE2E
 
     # Checkpointed configs are inherently dynamic (parsed from a .pt payload),
     # so the kwargs unpack goes through Any deliberately (mirrors _build_f0_mlp).
-    return EgoStitchE2E(E2EConfig(**cast(dict[str, Any], model_config)))
+    return EgoStitchModel(E2EConfig(**cast(dict[str, Any], model_config)))
 
 
 MODEL_BUILDERS: dict[str, Callable[[dict[str, object]], nn.Module]] = {
@@ -1195,7 +1198,15 @@ def _load_checkpoint(
         model_state = cast(dict[str, torch.Tensor], checkpoint)
 
     if model_family == "egostitch_e2e":
-        scaffold_embed = model_state.get("ste.embed.weight")
+        # Three-component refactor design (2026-08-02) §5: `model.ste` (the
+        # `STEncoder`) is now `model.encoder` (a `TypedMessagePassingEncoder`),
+        # so the stitched-topology-encoder's input projection now serializes
+        # under the `encoder.` prefix, not `ste.`. Keying this check on the
+        # old `ste.embed.weight` name would silently stop finding the key on
+        # any current-format checkpoint, so the shape guard below would never
+        # fire again -- vacuously passing on a genuinely incompatible
+        # checkpoint instead of rejecting it.
+        scaffold_embed = model_state.get("encoder.embed.weight")
         if (
             isinstance(scaffold_embed, torch.Tensor)
             and scaffold_embed.ndim == 2
@@ -1697,7 +1708,7 @@ def _score_egostitch_e2e(
     universe_pairs: Sequence[tuple[str, str]] | None = None,
     row_start: int = 0,
 ) -> dict[str, NDArray[np.float32]]:
-    """Score pairs with an `EgoStitchE2E` model's two-logit decomposition.
+    """Score pairs with an `EgoStitchModel`'s two-logit decomposition.
 
     Encodes each unique node exactly once, caches its raw-token/generator state
     on CPU, then builds one shared pair context per pair batch and applies the
@@ -1712,13 +1723,14 @@ def _score_egostitch_e2e(
     the pool's F0 features and ``ground_id_a``/``ground_id_b`` carry the
     pool's global node ids (matrix-row indices into the shared, run-scoped
     `node_ids` vocabulary — consistent across both endpoints and batches, so
-    `EgoStitchE2E`'s grounded-identity-match flag can compare them for
+    `EgoStitchModel`'s grounded-identity-match flag can compare them for
     equality). This always exercises the non-degenerate grounding path in
-    `EgoStitchE2E._context`; the placeholder `_ground`/zero-matched-flags path
-    is reserved for tiny unit fixtures that omit these batch keys.
+    `EgoStitchModel`'s pair-context construction; the placeholder
+    `_ground`/zero-matched-flags path is reserved for tiny unit fixtures that
+    omit these batch keys.
 
     Args:
-        model: Frozen `EgoStitchE2E`, on `device`, in `eval()` mode.
+        model: Frozen `EgoStitchModel`, on `device`, in `eval()` mode.
         pairs: Node-id pairs in input row order.
         store: Feature store providing per-node token sequences.
         device: Compute device.
@@ -1737,10 +1749,10 @@ def _score_egostitch_e2e(
         float32 array in input row order.
     """
     from src.data.grounding import build_grounding_pool
-    from src.model.egostitch.e2e_model import E2ENodeState, EgoStitchE2E
+    from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
     from src.model.egostitch.imagine import SlotSet
 
-    assert isinstance(model, EgoStitchE2E)
+    assert isinstance(model, EgoStitchModel)
     _reject_superseded_scaffold_control(scaffold_control)
     active_controls = (
         _SCAFFOLD_CONTROL_SHUFFLE_V3,
@@ -2237,9 +2249,9 @@ def _run_score(args: argparse.Namespace) -> None:
             universe_pairs=pairs,
             row_start=start,
         )
-        from src.model.egostitch.e2e_model import EgoStitchE2E
+        from src.model.egostitch.composite import EgoStitchModel
 
-        assert isinstance(model, EgoStitchE2E)
+        assert isinstance(model, EgoStitchModel)
         permanent_null = model.cfg.permanent_null
         primary_logit = _e2e_primary_logit_key(permanent_null)
         logits = decomposed[primary_logit]

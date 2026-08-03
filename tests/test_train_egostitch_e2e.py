@@ -39,10 +39,10 @@ from src.data.packed_features import (
 from src.data.pairs import NegativeSampler
 from src.eval.edge_metrics import EdgeMetrics
 from src.model.egostitch import EgoStitchConfig
-from src.model.egostitch import e2e_model as e2e_module
+from src.model.egostitch.composite import E2ENodeState, E2EPairContext, EgoStitchModel
 from src.model.egostitch.conditioning import GatedCrossAttention, HeadNullMasks
 from src.model.egostitch.config import E2EConfig
-from src.model.egostitch.e2e_model import E2ENodeState, E2EPairContext, EgoStitchE2E
+from src.model.egostitch.generator import egostitch as e2e_module
 from src.model.egostitch.imagine import SlotSet
 from src.train_b0 import ModelConfig
 
@@ -394,7 +394,7 @@ class TestBatchFactoryE2E:
         assert batch.edge["emb_a"].shape[1] == expected_boundary
 
         # Task 13c: same-index-space grounding ids for both endpoints (spec
-        # Sec 13.18) -- required by EgoStitchE2E's grounded-identity-match
+        # Sec 13.18) -- required by EgoStitchModel's grounded-identity-match
         # flag, which compares ground_id_a/ground_id_b for equality.
         assert batch.edge["ground_id_i"].shape == (edge_batch, model_cfg.n_ground)
         assert batch.edge["ground_id_j"].shape == (edge_batch, model_cfg.n_ground)
@@ -495,8 +495,8 @@ class TestE2ECompositeStep:
         *,
         w_rel: float | None = None,
         feature_standardization: str | None = None,
-    ) -> tuple[te._CompositeBatch, EgoStitchE2E]:
-        # EgoStitchE2E's internal generator always uses the full spec-default
+    ) -> tuple[te._CompositeBatch, EgoStitchModel]:
+        # EgoStitchModel's internal generator always uses the full spec-default
         # EgoStitchConfig() (input_dim=1536, slots=16, ...), never a value
         # parsed from E2EConfig -- the toy bundle must match that, not the
         # tiny per-field dict the frozen-s0 family tests use.
@@ -523,7 +523,7 @@ class TestE2ECompositeStep:
             model_config["w_rel"] = w_rel
         if feature_standardization is not None:
             model_config["feature_standardization"] = feature_standardization
-        model = EgoStitchE2E(E2EConfig.from_mapping(model_config))
+        model = EgoStitchModel(E2EConfig.from_mapping(model_config))
         return batch, model
 
     def _payload(
@@ -560,8 +560,8 @@ class TestE2ECompositeStep:
 
         monkeypatch.setattr(PackedFeatureTable, "from_pack", classmethod(_float_cpu_pack))
 
-    def _gates(self, model: EgoStitchE2E) -> GatedCrossAttention:
-        topo_gate = model.trunk.topo_xattn[0]
+    def _gates(self, model: EgoStitchModel) -> GatedCrossAttention:
+        topo_gate = model.classifier.trunk.topo_xattn[0]
         assert isinstance(topo_gate, GatedCrossAttention)
         return topo_gate
 
@@ -604,10 +604,14 @@ class TestE2ECompositeStep:
             captured_teacher_cells.append(cells)
             return cells
 
+        # `sinkhorn_log_plan` and `alignment_teacher_cells` are both called
+        # from `EgoStitchImagineGenerator.stitch` / `.auxiliary_losses`
+        # (`generator/egostitch.py`'s own import bindings -- GAP 1, three-
+        # component refactor design §6: `_CompositeStep` routes through
+        # `generator.auxiliary_losses` rather than computing alignment itself,
+        # so both monkeypatches target the same module now).
         monkeypatch.setattr(e2e_module, "sinkhorn_log_plan", _retaining_sinkhorn)
-        monkeypatch.setattr(
-            e2e_module, "alignment_teacher_cells", _teacher_bearing_cells
-        )
+        monkeypatch.setattr(e2e_module, "alignment_teacher_cells", _teacher_bearing_cells)
 
         with self._bf16_autocast():
             out = composite(self._payload(batch, joint_weight=0.0))
@@ -623,7 +627,7 @@ class TestE2ECompositeStep:
 
         ste_gradients = [
             parameter.grad
-            for parameter in model.ste.parameters()
+            for parameter in model.encoder.parameters()
             if parameter.requires_grad
         ]
         assert ste_gradients
@@ -653,36 +657,36 @@ class TestE2ECompositeStep:
                         1e-3,
                         te.E2EPhaseState("A", 0.0, False, 0.0),
                         name,
-                        {"generator", "topology_content_conditioning"},
+                        {"generator", "encoder"},
                     ),
                 }
                 for name in parameter_groups.groups
             ],
             weight_decay=0.01,
         )
-        ste_before = [parameter.detach().clone() for parameter in model.ste.parameters()]
-        assert model.rel_head is not None
+        ste_before = [parameter.detach().clone() for parameter in model.encoder.parameters()]
+        assert model.encoder.rel_head is not None
         rel_before = [
-            parameter.detach().clone() for parameter in model.rel_head.parameters()
+            parameter.detach().clone() for parameter in model.encoder.rel_head.parameters()
         ]
         pair_before = [
             parameter.detach().clone()
-            for parameter in parameter_groups.groups["pair_encoder_head"]
+            for parameter in parameter_groups.groups["classifier"]
         ]
         optimizer.step()
         assert any(
             not torch.equal(before, after)
-            for before, after in zip(ste_before, model.ste.parameters(), strict=True)
+            for before, after in zip(ste_before, model.encoder.parameters(), strict=True)
         )
         assert any(
             not torch.equal(before, after)
-            for before, after in zip(rel_before, model.rel_head.parameters(), strict=True)
+            for before, after in zip(rel_before, model.encoder.rel_head.parameters(), strict=True)
         )
         assert all(
             torch.equal(before, after)
             for before, after in zip(
                 pair_before,
-                parameter_groups.groups["pair_encoder_head"],
+                parameter_groups.groups["classifier"],
                 strict=True,
             )
         )
@@ -692,7 +696,7 @@ class TestE2ECompositeStep:
     ) -> None:
         torch.manual_seed(0)
         batch, model = self._batch_and_model(tmp_path, w_rel=0.0)
-        assert model.rel_head is None
+        assert model.encoder.rel_head is None
         composite = te._CompositeStep(model, world_size=1)
         parameter_groups = te.build_e2e_parameter_groups(model)
         phase = te.E2EPhaseState("A", 0.0, False, 0.0)
@@ -713,7 +717,7 @@ class TestE2ECompositeStep:
             active_groups,
         )
         assert records["generator"].active
-        assert not records["topology_content_conditioning"].active
+        assert not records["encoder"].active
         optimizer.step()
 
         accelerator = Accelerator(cpu=True)
@@ -727,7 +731,7 @@ class TestE2ECompositeStep:
                 accelerator,
             )
         assert set(family_norms["generator"]) == {"recon"}
-        assert family_norms["topology_content_conditioning"] == {}
+        assert family_norms["encoder"] == {}
         assert submodule_rms == {}
 
     @pytest.mark.parametrize(
@@ -769,7 +773,7 @@ class TestE2ECompositeStep:
         with self._bf16_autocast():
             out = composite(self._payload(batch, joint_weight=joint_weight))
         cast(torch.Tensor, out["loss"]).backward()  # type: ignore[no-untyped-call]
-        topology_parameters = parameter_groups.groups["topology_content_conditioning"]
+        topology_parameters = parameter_groups.groups["encoder"]
         before = [parameter.detach().clone() for parameter in topology_parameters]
         optimizer.step()
 
@@ -782,6 +786,25 @@ class TestE2ECompositeStep:
     def test_no_rel_head_conditioning_liveness_resumes_when_edge_active(
         self, tmp_path: Path
     ) -> None:
+        """The topo-gated conditioning pathway is live once edge training starts.
+
+        Post-refactor, ``trunk.topo_xattn`` -- the zero-init gate that is the
+        actual "conditioning liveness" switch -- lives in the ``classifier``
+        group, not ``encoder`` (design 2026-08-02 §7). ``encoder`` (the
+        stitched-topology message-passing stack) sits *behind* that gate: at
+        a fresh, never-optimized checkpoint the gate is exactly ``0``, so
+        ``tanh(gate) == 0`` multiplicatively zeroes the gradient reaching
+        ``encoder`` even though the gate's own gradient (and hence
+        ``classifier``'s) is live -- confirmed empirically (gate grad
+        `-0.0062`, `encoder` sq-norm `0.0`) before writing this assertion.
+        That is expected, not a regression: the gate only opens once
+        `_e2e_active_groups`'s ``classifier`` condition makes it optimizable,
+        which happens starting exactly at this same edge-active transition.
+        `encoder`'s legitimate zero is why this test relaxes
+        ``enforce_nonzero`` for the first (whole-group) check -- exactly as
+        production does via ``enforce_quality=False`` -- rather than treating
+        it as a guard failure.
+        """
         torch.manual_seed(0)
         batch, model = self._batch_and_model(tmp_path, w_rel=0.0)
         composite = te._CompositeStep(model, world_size=1)
@@ -792,25 +815,31 @@ class TestE2ECompositeStep:
             out = composite(self._payload(batch, joint_weight=1.0))
         cast(torch.Tensor, out["loss"]).backward()  # type: ignore[no-untyped-call]
         active_groups = te._e2e_active_groups(phase, model)
-        assert "topology_content_conditioning" in active_groups
+        assert "classifier" in active_groups
         records = te.e2e_check_and_clip_gradients(
             parameter_groups.groups,
             active_groups,
+            enforce_nonzero=False,
         )
-        assert records["topology_content_conditioning"].active
-        for parameter in parameter_groups.groups["topology_content_conditioning"]:
+        assert records["classifier"].active
+        assert records["classifier"].norm is not None
+        assert cast(float, records["classifier"].norm) > 0.0
+        for parameter in parameter_groups.groups["classifier"]:
             parameter.grad = None
         with pytest.raises(
             RuntimeError,
-            match="zero gradient norm in active E2E group 'topology_content_conditioning'",
+            match="zero gradient norm in active E2E group 'classifier'",
         ):
-            te.e2e_check_and_clip_gradients(parameter_groups.groups, active_groups)
+            te.e2e_check_and_clip_gradients(
+                {"classifier": parameter_groups.groups["classifier"]},
+                {"classifier"},
+            )
 
     def test_rel_head_keeps_conditioning_liveness_guard_active_in_both_phases(
         self, tmp_path: Path
     ) -> None:
         _, model = self._batch_and_model(tmp_path, w_rel=0.25)
-        assert model.rel_head is not None
+        assert model.encoder.rel_head is not None
         parameter_groups = te.build_e2e_parameter_groups(model)
         phases = (
             te.E2EPhaseState("A", 0.0, False, 0.0),
@@ -818,18 +847,14 @@ class TestE2ECompositeStep:
         )
         for phase in phases:
             active_groups = te._e2e_active_groups(phase, model)
-            assert "topology_content_conditioning" in active_groups
+            assert "encoder" in active_groups
             with pytest.raises(
                 RuntimeError,
-                match="zero gradient norm in active E2E group 'topology_content_conditioning'",
+                match="zero gradient norm in active E2E group 'encoder'",
             ):
                 te.e2e_check_and_clip_gradients(
-                    {
-                        "topology_content_conditioning": parameter_groups.groups[
-                            "topology_content_conditioning"
-                        ]
-                    },
-                    {"topology_content_conditioning"},
+                    {"encoder": parameter_groups.groups["encoder"]},
+                    {"encoder"},
                 )
 
     def test_gates_receive_gradient_after_warmstart(self, tmp_path: Path) -> None:
@@ -1072,10 +1097,10 @@ class TestE2ECompositeStep:
                 accelerator,
             )
 
-        assert family_norms["pair_encoder_head"] == {}
+        assert family_norms["classifier"] == {}
         assert set(family_norms["generator"]) == {"recon"}
-        assert set(family_norms["topology_content_conditioning"]) == {"recon"}
-        assert family_norms["topology_content_conditioning"]["recon"] > 0.0
+        assert set(family_norms["encoder"]) == {"recon"}
+        assert family_norms["encoder"]["recon"] > 0.0
         assert submodule_rms == {}
         assert payload["collect_diagnostics"] is False
 
@@ -1319,9 +1344,9 @@ class TestE2ECompositeStep:
             "phase_b_end": te.e2e_phase_boundaries(schedule_steps)[1],
         }
         for group, ceiling in (
-            ("pair_encoder_head", 3.0),
+            ("classifier", 3.0),
             ("generator", 3.0),
-            ("topology_content_conditioning", 1.0),
+            ("encoder", 1.0),
         ):
             record = next(
                 step["optimizer_group_gradients"][group]
@@ -1472,17 +1497,18 @@ class TestE2ECompositeStep:
         assert fidelity == expected
 
     def test_frozen_random_gin_excluded_from_trainable_parameters(self, tmp_path: Path) -> None:
-        """`generator.random_gin` is frozen at construction (spec Sec 13.6) and
-        must never appear among the E2E worker's trainable parameters, even
+        """`generator.stage1.random_gin` is frozen at construction (spec Sec 13.6).
+
+        It must never appear among the E2E worker's trainable parameters, even
         though the plain `requires_grad` filter is now the only exclusion
         mechanism (`decision.py` and its name-based special case are gone).
         """
         _, model = self._batch_and_model(tmp_path)
         trainable_ids = {id(p) for p in te._e2e_trainable_parameters(model)}
-        random_gin_ids = {id(p) for p in model.generator.random_gin.parameters()}
+        random_gin_ids = {id(p) for p in model.generator.stage1.random_gin.parameters()}
         assert random_gin_ids, "random_gin must have parameters for this exclusion check to be real"
         assert trainable_ids.isdisjoint(random_gin_ids)
-        assert any(id(p) in trainable_ids for p in model.trunk.parameters())
+        assert any(id(p) in trainable_ids for p in model.classifier.trunk.parameters())
 
 
 def _float_node_state(state: E2ENodeState) -> E2ENodeState:
@@ -1528,7 +1554,7 @@ def _uncached_validation_node_batch(
 
 
 def _uncached_validation_reference(
-    model: EgoStitchE2E,
+    model: EgoStitchModel,
     data: te.EgoStitchData,
     accelerator: Accelerator,
     token_table: PackedFeatureTable,
@@ -1692,7 +1718,7 @@ class TestE2EValidationCache:
         tmp_path: Path,
     ) -> tuple[
         te.EgoStitchData,
-        EgoStitchE2E,
+        EgoStitchModel,
         Accelerator,
         PackedFeatureTable,
         dict[str, int],
@@ -1706,12 +1732,12 @@ class TestE2EValidationCache:
         pack_dir = tmp_path / "validation-token-pack"
         _write_tiny_token_pack(pack_dir, _NODES, min_length=3)
         table = PackedFeatureTable.from_pack(pack_dir, torch.device("cpu"))
-        model = EgoStitchE2E(E2EConfig.from_mapping(dict(_E2E_TINY_MODEL)))
+        model = EgoStitchModel(E2EConfig.from_mapping(dict(_E2E_TINY_MODEL)))
         return data, model, Accelerator(cpu=True), table, table.manifest.node_index()
 
     @staticmethod
     def _validate(
-        model: EgoStitchE2E,
+        model: EgoStitchModel,
         data: te.EgoStitchData,
         accelerator: Accelerator,
         table: PackedFeatureTable,
@@ -1830,7 +1856,7 @@ class TestE2EValidationCache:
         with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
             before = self._validate(model, data, accelerator, table, index)
             with torch.no_grad():
-                list(model.head.parameters())[-1].add_(0.75)
+                list(model.classifier.head.parameters())[-1].add_(0.75)
             after = self._validate(model, data, accelerator, table, index)
 
         assert encode_rows == 2 * len({node for pair in data.val_pairs for node in pair})
@@ -1914,7 +1940,7 @@ class _ArchivedV1TrainLoopE2E:
 
     def _e2e_setup(
         self, tmp_path: Path
-    ) -> tuple[te.EgoConfig, te.EgoStitchData, EgoStitchE2E, Accelerator]:
+    ) -> tuple[te.EgoConfig, te.EgoStitchData, EgoStitchModel, Accelerator]:
         torch.manual_seed(0)
         model_cfg = EgoStitchConfig()
         cfg = _toy_cfg(tmp_path)
@@ -1927,13 +1953,13 @@ class _ArchivedV1TrainLoopE2E:
             data=replace(cfg.data, pack_dir=pack_dir),
             optim=replace(cfg.optim, epochs=1),
         )
-        model = EgoStitchE2E(E2EConfig.from_mapping(e2e_cfg.model.config))
+        model = EgoStitchModel(E2EConfig.from_mapping(e2e_cfg.model.config))
         accelerator = Accelerator(mixed_precision="no", cpu=True)
         return e2e_cfg, data, model, accelerator
 
     def _run(
         self, tmp_path: Path
-    ) -> tuple[te.EgoConfig, te.EgoStitchData, EgoStitchE2E, te.EgoTrainResult]:
+    ) -> tuple[te.EgoConfig, te.EgoStitchData, EgoStitchModel, te.EgoTrainResult]:
         e2e_cfg, data, model, accelerator = self._e2e_setup(tmp_path)
         with self._bf16_autocast():
             result = te.train_egostitch_ddp_loop(
@@ -2010,7 +2036,7 @@ class _ArchivedV1TrainLoopE2E:
                     config={**_E2E_TINY_MODEL, "permanent_null": permanent_null},
                 ),
             )
-            model = EgoStitchE2E(E2EConfig.from_mapping(e2e_cfg.model.config))
+            model = EgoStitchModel(E2EConfig.from_mapping(e2e_cfg.model.config))
             factory = te._BatchFactory(
                 e2e_cfg,
                 model.generator_cfg,
@@ -2027,10 +2053,10 @@ class _ArchivedV1TrainLoopE2E:
             )
             next(iter(factory.epoch_batches(1, rows_per_rank=rows, steps=steps)))
             seen: list[HeadNullMasks | None] = []
-            original = EgoStitchE2E.forward
+            original = EgoStitchModel.forward
 
             def _spy(
-                self: EgoStitchE2E,
+                self: EgoStitchModel,
                 batch: dict[str, torch.Tensor],
                 *,
                 masks: HeadNullMasks | None = None,
@@ -2040,7 +2066,7 @@ class _ArchivedV1TrainLoopE2E:
                 _seen.append(masks)
                 return _original(self, batch, masks=masks)
 
-            monkeypatch.setattr(EgoStitchE2E, "forward", _spy)
+            monkeypatch.setattr(EgoStitchModel, "forward", _spy)
             try:
                 with self._bf16_autocast():
                     validation = te._validate_epoch(
@@ -2388,7 +2414,7 @@ class TestFeatureStandardizationBinding:
                 },
             ),
         )
-        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+        model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
 
         digest = te._bind_feature_standardization(model, cfg, data)
 
@@ -2407,7 +2433,7 @@ class TestFeatureStandardizationBinding:
             ),
         )
         data = te.assemble_egostitch_data(cfg)
-        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+        model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
 
         with pytest.raises(RuntimeError, match="feature_stats_sha256"):
             te._bind_feature_standardization(model, cfg, data)
@@ -2417,7 +2443,7 @@ class TestFeatureStandardizationBinding:
     ) -> None:
         cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="formal")
         data = replace(te.assemble_egostitch_data(cfg), feature_stats=None)
-        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+        model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
 
         with pytest.raises(RuntimeError, match="statistics"):
             te._bind_feature_standardization(model, cfg, data)
@@ -2434,7 +2460,7 @@ class TestFeatureStandardizationBinding:
             ),
         )
         data = te.assemble_egostitch_data(cfg)
-        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+        model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
 
         assert te._bind_feature_standardization(model, cfg, data) == ""
         assert model.feature_stats_digest_hex == ""
@@ -2454,7 +2480,7 @@ class TestFeatureStandardizationBinding:
         base_cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
         data = te.assemble_egostitch_data(base_cfg)
         cfg = replace(base_cfg, run_kind="debug")
-        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+        model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
 
         digest = te._bind_feature_standardization(model, cfg, data)
 
@@ -2505,7 +2531,7 @@ class TestInitialSlotHealthGuard:
         cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="formal")
         _write_tiny_token_pack(cast(Path, cfg.data.pack_dir), _E2E_PIPELINE_NODES, min_length=3)
         data = te.assemble_egostitch_data(cfg)
-        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+        model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
         te._bind_feature_standardization(model, cfg, data)
         table, node_index = self._token_store(cfg)
         accelerator = Accelerator(cpu=True)
@@ -2536,7 +2562,7 @@ class TestInitialSlotHealthGuard:
     ) -> None:
         cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="formal")
         data = replace(te.assemble_egostitch_data(cfg), val_pairs=[])
-        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+        model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
         te._bind_feature_standardization(model, cfg, data)
 
         with pytest.raises(RuntimeError, match="empty population"):
@@ -2564,7 +2590,7 @@ class TestInitialSlotHealthGuard:
         """Strictly above 0.95 is a refusal, not a warning."""
         cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
         data = te.assemble_egostitch_data(cfg)
-        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+        model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
         assert data.val_pairs
 
         def _validation(*_args: object, **_kwargs: object) -> te._ValidationResult:
@@ -2614,7 +2640,7 @@ class TestInitialSlotHealthGuard:
     ) -> None:
         cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
         data = te.assemble_egostitch_data(cfg)
-        model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+        model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
 
         monkeypatch.setattr(
             te,

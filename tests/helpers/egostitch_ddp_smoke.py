@@ -5,7 +5,7 @@ Launched by the integration test as::
     python -m torch.distributed.run --standalone --nproc_per_node=2 \
         tests/helpers/egostitch_ddp_smoke.py --output-dir <dir> [--mode collapsed]
 
-Drives a tiny `EgoStitchE2E` through `_enforce_e2e_initial_slot_health` — the
+Drives a tiny `EgoStitchModel` through `_enforce_e2e_initial_slot_health` — the
 step-0 death guard the two-stage cleanup put in place of the retired
 ``--ddp-mode init-probe`` — under a real two-rank process group.
 
@@ -58,8 +58,8 @@ from src.data.packed_features import (  # noqa: E402
 )
 from src.data.pairs import NegativeSampler  # noqa: E402
 from src.model.egostitch import EgoStitchConfig  # noqa: E402
+from src.model.egostitch.composite import EgoStitchModel  # noqa: E402
 from src.model.egostitch.config import E2EConfig  # noqa: E402
-from src.model.egostitch.e2e_model import EgoStitchE2E  # noqa: E402
 from src.train_b0 import EvalConfig, ModelConfig  # noqa: E402
 
 _NODES = [f"n{i}" for i in range(8)]
@@ -215,7 +215,7 @@ def _toy_bundle(model_cfg: EgoStitchConfig) -> te.EgoStitchData:
     )
 
 
-def _collapse_slot_head(model: EgoStitchE2E) -> None:
+def _collapse_slot_head(model: EgoStitchModel) -> None:
     """Make every generated slot embedding identical, without touching a threshold.
 
     ``h = head_h(main)`` (`src/model/egostitch/imagine.py`); with a zero weight
@@ -224,8 +224,8 @@ def _collapse_slot_head(model: EgoStitchE2E) -> None:
     Sec 14.4.8 trip line rather than a stubbed measurement.
     """
     with torch.no_grad():
-        model.generator.imagine.head_h.weight.zero_()
-        model.generator.imagine.head_h.bias.fill_(1.0)
+        model.generator.stage1.imagine.head_h.weight.zero_()
+        model.generator.stage1.imagine.head_h.bias.fill_(1.0)
 
 
 def main() -> None:
@@ -239,7 +239,7 @@ def main() -> None:
     torch.manual_seed(0)
     pack_dir = args.output_dir / "token_pack"
     cfg = _toy_config(args.output_dir, pack_dir)
-    model = EgoStitchE2E(E2EConfig.from_mapping(cfg.model.config))
+    model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
     data = _toy_bundle(model.generator_cfg)
     accelerator = te.build_egostitch_ddp_accelerator(cfg.mixed_precision)
     # One writer, then a barrier: every rank opens the same pack directory.

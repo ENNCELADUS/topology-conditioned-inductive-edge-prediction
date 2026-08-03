@@ -729,8 +729,8 @@ def produce_e2e_probe_artifact(
     from src import train_egostitch as te
     from src.data.ego_targets import EgoTargetBuilder, EgoTargets
     from src.data.packed_features import PackedFeatureTable
+    from src.model.egostitch.composite import EgoStitchModel
     from src.model.egostitch.config import E2EConfig
-    from src.model.egostitch.e2e_model import EgoStitchE2E
     from src.model.egostitch.losses import alignment_teacher_cells
     from src.model.egostitch.matching import match_slots
     from src.train_b0 import _state_digest
@@ -774,7 +774,7 @@ def produce_e2e_probe_artifact(
     # The rev-3.1 checkpoint-config backfills were deleted with the content path
     # (design 2026-08-02 §11); the checkpoint carries its own complete config.
     checkpoint_model_cfg = cast(dict[str, object], payload["model_config"])
-    model = EgoStitchE2E(E2EConfig.from_mapping(checkpoint_model_cfg))
+    model = EgoStitchModel(E2EConfig.from_mapping(checkpoint_model_cfg))
     model.load_state_dict(state)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device).eval()
@@ -853,11 +853,23 @@ def produce_e2e_probe_artifact(
         for start in range(0, len(nodes), batch_size):
             batch_nodes = nodes[start : start + batch_size]
             batch = _probe_batch(data, table, token_index, batch_nodes, batch_nodes, device)
-            state_a, state_b, is_self = model._pair_node_states(batch)
+            # `_pair_node_states` is private and does not survive the composite
+            # rewrite (three-component refactor design §5). Every row here is
+            # a self-pair (endpoints_a == endpoints_b), so the public
+            # `encode_node_state` need only run once per batch, mirroring
+            # `_pair_node_states`'s own all-self short-circuit
+            # (`state_a, state_a, is_self`).
+            state_a = model.encode_node_state(
+                batch["emb_a"],
+                batch["len_a"],
+                batch["x_a"],
+                batch["ground_a"],
+                batch.get("ground_id_a"),
+            )
             context = model.build_pair_context_from_states(
                 state_a,
-                state_b,
-                is_self,
+                state_a,
+                batch["is_self"],
                 need_topo=True,
             )
             assert context.topo_ab is not None
@@ -924,9 +936,26 @@ def produce_e2e_probe_artifact(
                 endpoints_b,
                 device,
             )
-            state_a, state_b, is_self = model._pair_node_states(batch)
+            # No row here is a self-pair (`select_probe_pairs` excludes
+            # `node_u == node_v`), so this is exactly `_pair_node_states`'s
+            # own all-non-self branch: independently encode both endpoints
+            # via the public surface.
+            state_a = model.encode_node_state(
+                batch["emb_a"],
+                batch["len_a"],
+                batch["x_a"],
+                batch["ground_a"],
+                batch.get("ground_id_a"),
+            )
+            state_b = model.encode_node_state(
+                batch["emb_b"],
+                batch["len_b"],
+                batch["x_b"],
+                batch["ground_b"],
+                batch.get("ground_id_b"),
+            )
             context = model.build_pair_context_from_states(
-                state_a, state_b, is_self, need_topo=True
+                state_a, state_b, batch["is_self"], need_topo=True
             )
             assert context.plan is not None
             assert context.topo_ab is not None
@@ -936,14 +965,14 @@ def produce_e2e_probe_artifact(
             targets_b = batch_targets(endpoints_b)
             assignment_a = match_slots(
                 state_a.slots,
-                target_proj=model.generator.project_features(targets_a.features).detach(),
+                target_proj=model.generator.stage1.project_features(targets_a.features).detach(),
                 target_mult=targets_a.mult,
                 target_adj=targets_a.adj,
                 target_mask=targets_a.mask,
             )
             assignment_b = match_slots(
                 state_b.slots,
-                target_proj=model.generator.project_features(targets_b.features).detach(),
+                target_proj=model.generator.stage1.project_features(targets_b.features).detach(),
                 target_mult=targets_b.mult,
                 target_adj=targets_b.adj,
                 target_mask=targets_b.mask,

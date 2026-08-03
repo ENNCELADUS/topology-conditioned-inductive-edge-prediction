@@ -208,8 +208,6 @@ class EgoStitchStage1(nn.Module):
         self.tokenize = TokenizeLite(config)
         self.imagine = ImagineDecoder(config)
         self.random_gin = RandomGIN(config)
-        # rho_eval / rho_train (spec Sec 9.3); the trainer sets it at load.
-        self.register_buffer("density_ratio", torch.tensor(1.0))
 
     @property
     def proj(self) -> nn.Linear:
@@ -261,18 +259,6 @@ class EgoStitchStage1(nn.Module):
         if not isinstance(self.feature_norm, FeatureStandardizer):
             return noise
         return self.feature_norm.scale_perturbation(noise)
-
-    def set_density_ratio(self, ratio: float) -> None:
-        """Pin the density normalization ``rho_eval / rho_train``."""
-        buffer = self.density_ratio
-        assert isinstance(buffer, torch.Tensor)
-        buffer.fill_(float(ratio))
-
-    def d_hat(self, tok: TokenizeOut) -> torch.Tensor:
-        """Density-normalized degree budget ``d_hat_u`` (spec Sec 13.2)."""
-        buffer = self.density_ratio
-        assert isinstance(buffer, torch.Tensor)
-        return tok.d_hat_raw * buffer
 
     def encode_nodes(
         self,
