@@ -33,6 +33,7 @@ dev = [
     "mypy==1.19.1",
     "pytest==9.0.2",
     "pytest-cov==7.0.0",
+    "pytest-xdist==3.8.0",
     "ruff==0.15.0",
     "vulture==2.14",
 ]
@@ -46,7 +47,12 @@ pythonpath = ["."]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = ["-q", "-ra", "--strict-markers"]
+# -n auto parallelizes across cores; --dist loadfile keeps every test in a file
+# on one worker. That grouping is required, not merely tidy: with per-test
+# distribution (--dist load) 19 tests in tests/test_train_egostitch_e2e.py fail
+# on shared in-file state. Drop to `-p no:xdist` or `-n0` when debugging, since
+# xdist swallows breakpoints and interleaves output.
+addopts = ["-q", "-ra", "--strict-markers", "-n", "auto", "--dist", "loadfile"]
 norecursedirs = [".*", "__pycache__"]
 markers = [
     "unit: unit tests",
