@@ -26,6 +26,7 @@ model:
       spectral_norm: false
     mixing:
       mode: none
+    label_smoothing: 0.05 # symmetric BCE smoothing, legacy V3.1 recipe
 data:
   root: data
   strategy: breadth_first
@@ -39,12 +40,19 @@ data:
   expected_missing_features: [node_004764, node_007050]
 optim:
   lr: 1.0e-4
-  weight_decay: 0.01
-  epochs: 30
-  warmup_steps: 500
+  weight_decay: 0.05
+  epochs: 50
+  warmup_steps: 500 # unused while a onecycle scheduler is configured
   grad_clip: 1.0
+  scheduler:
+    type: onecycle
+    max_lr: 1.0e-4
+    pct_start: 0.1
+    div_factor: 25
+    final_div_factor: 10000
+    anneal_strategy: cos
 eval:
-  patience: 8
+  patience: 10
   eval_every: 1
 runtime:
   world_size: auto
@@ -55,10 +63,14 @@ runtime:
   token_budget: 524288
   max_pairs_per_rank: 4096
   memory_limit_gib: 85.0
-  total_budget_seconds: 3600
+  # Stage budgets must sum exactly to total_budget_seconds (train_b0.py:722).
+  # Sized for 50 epochs at the ~122 s/epoch observed on the 23-epoch 30-epoch-config
+  # run (~6.1 ks), with headroom; train_eval_budget_seconds is a hard subprocess
+  # timeout, so under-sizing it fails the run outright.
+  total_budget_seconds: 9780
   pack_budget_seconds: 300
   setup_probe_budget_seconds: 300
-  train_eval_budget_seconds: 2820
+  train_eval_budget_seconds: 9000
   artifact_budget_seconds: 60
   reserve_seconds: 120
   probe_warmup_steps: 10

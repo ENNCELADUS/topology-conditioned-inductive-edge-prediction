@@ -29,12 +29,12 @@ import logging
 import pickle
 import sys
 import time
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence, Sized
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from itertools import cycle, islice
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast
 
 import numpy as np
 import torch
@@ -132,15 +132,44 @@ class DataConfig:
 
 
 @dataclass(frozen=True)
+class SchedulerConfig:
+    """The optional ``optim.scheduler:`` block.
+
+    Only ``onecycle`` is supported. When this block is absent the trainer keeps
+    its historical schedule: linear warmup over ``optim.warmup_steps`` then a
+    constant LR.
+
+    Attributes:
+        type: Scheduler name; must be ``"onecycle"``.
+        max_lr: Peak LR at the end of the warmup phase.
+        pct_start: Fraction of total steps spent ramping up to `max_lr`.
+        div_factor: Initial LR is ``max_lr / div_factor``.
+        final_div_factor: Final LR is ``max_lr / div_factor / final_div_factor``.
+        anneal_strategy: ``"cos"`` or ``"linear"``.
+    """
+
+    type: str
+    max_lr: float
+    pct_start: float
+    div_factor: float
+    final_div_factor: float
+    anneal_strategy: str
+
+
+@dataclass(frozen=True)
 class OptimConfig:
     """The ``optim:`` config section.
 
     Attributes:
-        lr: AdamW learning rate (post-warmup constant).
+        lr: AdamW learning rate (post-warmup constant). With a ``onecycle``
+            scheduler the schedule is driven by ``scheduler.max_lr`` instead.
         weight_decay: AdamW weight decay.
         epochs: Maximum number of epochs.
-        warmup_steps: Linear LR warmup steps (then constant).
+        warmup_steps: Linear LR warmup steps (then constant). Ignored when a
+            ``onecycle`` scheduler is configured — OneCycle owns its own warmup
+            via ``scheduler.pct_start``.
         grad_clip: Gradient-norm clip value; 0 disables clipping.
+        scheduler: Optional LR-schedule override; `None` keeps warmup+constant.
     """
 
     lr: float
@@ -148,6 +177,7 @@ class OptimConfig:
     epochs: int
     warmup_steps: int
     grad_clip: float
+    scheduler: SchedulerConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -292,6 +322,196 @@ def _check_no_unknown_keys(
         raise ValueError(f"unknown config keys in '{context}': {unknown}")
 
 
+SCHEDULER_TYPES = ("onecycle",)
+ANNEAL_STRATEGIES = ("cos", "linear")
+
+
+def _parse_scheduler(value: object) -> SchedulerConfig | None:
+    """Parse the optional ``optim.scheduler`` block.
+
+    Args:
+        value: The raw ``optim.scheduler`` value; `None`/absent selects the
+            historical warmup-then-constant schedule.
+
+    Returns:
+        The validated `SchedulerConfig`, or `None` when no block is present.
+
+    Raises:
+        ValueError: On an unknown scheduler type, an unknown anneal strategy, an
+            unknown key, or an out-of-range numeric field.
+    """
+    if value is None:
+        return None
+
+    raw = _as_mapping(value, "optim.scheduler")
+    _check_no_unknown_keys(
+        raw,
+        ("type", "max_lr", "pct_start", "div_factor", "final_div_factor", "anneal_strategy"),
+        "optim.scheduler",
+    )
+
+    scheduler_type = _as_str(_require(raw, "type", "optim.scheduler."), "optim.scheduler.type")
+    if scheduler_type not in SCHEDULER_TYPES:
+        raise ValueError(
+            f"optim.scheduler.type must be one of {list(SCHEDULER_TYPES)}, got {scheduler_type!r}"
+        )
+
+    anneal_strategy = _as_str(
+        _require(raw, "anneal_strategy", "optim.scheduler."), "optim.scheduler.anneal_strategy"
+    )
+    if anneal_strategy not in ANNEAL_STRATEGIES:
+        raise ValueError(
+            f"optim.scheduler.anneal_strategy must be one of {list(ANNEAL_STRATEGIES)}, "
+            f"got {anneal_strategy!r}"
+        )
+
+    max_lr = _as_float(_require(raw, "max_lr", "optim.scheduler."), "optim.scheduler.max_lr")
+    pct_start = _as_float(
+        _require(raw, "pct_start", "optim.scheduler."), "optim.scheduler.pct_start"
+    )
+    div_factor = _as_float(
+        _require(raw, "div_factor", "optim.scheduler."), "optim.scheduler.div_factor"
+    )
+    final_div_factor = _as_float(
+        _require(raw, "final_div_factor", "optim.scheduler."), "optim.scheduler.final_div_factor"
+    )
+
+    if max_lr <= 0.0:
+        raise ValueError(f"optim.scheduler.max_lr must be > 0, got {max_lr}")
+    if not 0.0 < pct_start < 1.0:
+        raise ValueError(f"optim.scheduler.pct_start must be in (0.0, 1.0), got {pct_start}")
+    if div_factor <= 0.0:
+        raise ValueError(f"optim.scheduler.div_factor must be > 0, got {div_factor}")
+    if final_div_factor <= 0.0:
+        raise ValueError(f"optim.scheduler.final_div_factor must be > 0, got {final_div_factor}")
+
+    return SchedulerConfig(
+        type=scheduler_type,
+        max_lr=max_lr,
+        pct_start=pct_start,
+        div_factor=div_factor,
+        final_div_factor=final_div_factor,
+        anneal_strategy=anneal_strategy,
+    )
+
+
+def _build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    cfg: Config,
+    *,
+    warmup_steps: int,
+    total_steps: int | None,
+) -> torch.optim.lr_scheduler.LRScheduler:
+    """Build the per-step LR scheduler for a training loop.
+
+    With no ``optim.scheduler`` block this reproduces the historical schedule
+    exactly: linear warmup over `warmup_steps` then a constant LR. With a
+    ``onecycle`` block it builds `torch.optim.lr_scheduler.OneCycleLR` sized to
+    `total_steps`; `warmup_steps` is then unused because OneCycle owns its own
+    ramp via ``pct_start``.
+
+    `total_steps` must be the *exact* optimizer-step count for the full run. The
+    length-bucketed batch plan yields a different batch count per epoch, so
+    ``steps_per_epoch * epochs`` is not a valid substitute — callers derive the
+    exact sum from the precomputed per-epoch plans.
+
+    Args:
+        optimizer: The prepared optimizer to schedule.
+        cfg: The full training config.
+        warmup_steps: Linear-warmup step count for the default schedule.
+        total_steps: Exact total optimizer steps; required for OneCycle.
+
+    Returns:
+        The scheduler, to be stepped once per optimizer step via `_step_scheduler`.
+
+    Raises:
+        ValueError: If OneCycle is configured but `total_steps` is unknown or
+            non-positive, which would otherwise yield a silently wrong schedule.
+    """
+    scheduler_cfg = cfg.optim.scheduler
+    if scheduler_cfg is None:
+        warmup = max(1, warmup_steps)
+        return torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=lambda step: min(1.0, float(step + 1) / float(warmup))
+        )
+
+    if total_steps is None or total_steps < 1:
+        raise ValueError(
+            "optim.scheduler.type='onecycle' requires a known positive total_steps to size "
+            f"its schedule, got {total_steps!r}"
+        )
+
+    logger.info(
+        "onecycle scheduler: max_lr=%.3e total_steps=%d over %d epochs "
+        "pct_start=%.3f div_factor=%.1f final_div_factor=%.1f anneal=%s",
+        scheduler_cfg.max_lr,
+        total_steps,
+        cfg.optim.epochs,
+        scheduler_cfg.pct_start,
+        scheduler_cfg.div_factor,
+        scheduler_cfg.final_div_factor,
+        scheduler_cfg.anneal_strategy,
+    )
+    return torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=scheduler_cfg.max_lr,
+        total_steps=total_steps,
+        pct_start=scheduler_cfg.pct_start,
+        div_factor=scheduler_cfg.div_factor,
+        final_div_factor=scheduler_cfg.final_div_factor,
+        anneal_strategy=cast(Literal["cos", "linear"], scheduler_cfg.anneal_strategy),
+        cycle_momentum=False,
+    )
+
+
+def _count_single_process_steps(factory: LoaderFactory, cfg: Config) -> int:
+    """Count exact optimizer steps across all epochs for the single-process loop.
+
+    The length-bucketed sampler reshuffles per epoch, so each epoch has its own
+    batch count and they must be summed rather than extrapolated from one epoch.
+    Each epoch's loader is sized without touching feature data (the node-length
+    probe is cached), so this only walks the batch plan.
+
+    Args:
+        factory: The per-epoch loader factory.
+        cfg: The full training config.
+
+    Returns:
+        Total optimizer steps over epochs ``1..cfg.optim.epochs``.
+
+    Raises:
+        ValueError: If a per-epoch loader has no length, which would leave a
+            OneCycle schedule mis-sized.
+    """
+    total = 0
+    for epoch in range(1, cfg.optim.epochs + 1):
+        loader = factory(epoch)
+        try:
+            total += len(cast(Sized, loader))
+        except TypeError as exc:
+            raise ValueError(
+                "optim.scheduler requires a sized per-epoch loader to count total steps; "
+                f"epoch {epoch} loader {type(loader).__name__} has no __len__"
+            ) from exc
+    return total
+
+
+def _step_scheduler(scheduler: torch.optim.lr_scheduler.LRScheduler) -> None:
+    """Advance the LR scheduler by one optimizer step, tolerating overshoot.
+
+    `OneCycleLR` raises once it is stepped past its ``total_steps``. Callers size
+    it from the exact per-epoch plans, but a resumed or re-planned run could
+    still take one extra step; holding the final LR is the correct degradation
+    there, whereas crashing would discard a nearly finished training run.
+    """
+    try:
+        scheduler.step()
+    except ValueError:
+        if not isinstance(scheduler, torch.optim.lr_scheduler.OneCycleLR):
+            raise
+        logger.warning("LR scheduler exhausted its total_steps; holding the final LR")
+
+
 def load_config(path: Path) -> Config:
     """Load and validate a training config from a YAML file.
 
@@ -370,7 +590,9 @@ def load_config(path: Path) -> Config:
 
     optim_raw = _as_mapping(_require(raw, "optim", ""), "optim")
     _check_no_unknown_keys(
-        optim_raw, ("lr", "weight_decay", "epochs", "warmup_steps", "grad_clip"), "optim"
+        optim_raw,
+        ("lr", "weight_decay", "epochs", "warmup_steps", "grad_clip", "scheduler"),
+        "optim",
     )
     optim = OptimConfig(
         lr=_as_float(_require(optim_raw, "lr", "optim."), "optim.lr"),
@@ -378,6 +600,7 @@ def load_config(path: Path) -> Config:
         epochs=_as_int(_require(optim_raw, "epochs", "optim."), "optim.epochs"),
         warmup_steps=_as_int(_require(optim_raw, "warmup_steps", "optim."), "optim.warmup_steps"),
         grad_clip=_as_float(_require(optim_raw, "grad_clip", "optim."), "optim.grad_clip"),
+        scheduler=_parse_scheduler(optim_raw.get("scheduler")),
     )
     if optim.epochs < 1:
         raise ValueError(f"optim.epochs must be >= 1, got {optim.epochs}")
@@ -871,6 +1094,7 @@ def train_loop(
     accelerator: Accelerator,
     *,
     max_steps: int | None = None,
+    schedule_total_steps: int | None = None,
     on_eval: OnEval | None = None,
 ) -> TrainResult:
     """Run the full training loop with eval-driven checkpoint selection.
@@ -891,6 +1115,8 @@ def train_loop(
         cfg: The full training config.
         accelerator: HF Accelerator (single-process semantics).
         max_steps: DEBUG ONLY — stop after this many optimizer steps.
+        schedule_total_steps: Exact optimizer-step count over all epochs, used to
+            size a ``optim.scheduler`` OneCycle schedule; unused otherwise.
         on_eval: Optional callback ``(history_entry, improved, metrics)`` invoked
             after every evaluation (used by the CLI for incremental artifacts).
 
@@ -904,9 +1130,11 @@ def train_loop(
         model.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
     )
     model, optimizer = accelerator.prepare(model, optimizer)
-    warmup = max(1, cfg.optim.warmup_steps)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda step: min(1.0, float(step + 1) / float(warmup))
+    scheduler = _build_scheduler(
+        optimizer,
+        cfg,
+        warmup_steps=cfg.optim.warmup_steps,
+        total_steps=schedule_total_steps,
     )
 
     history: list[dict[str, float]] = []
@@ -933,7 +1161,7 @@ def train_loop(
             if cfg.optim.grad_clip > 0:
                 accelerator.clip_grad_norm_(model.parameters(), cfg.optim.grad_clip)
             optimizer.step()
-            scheduler.step()
+            _step_scheduler(scheduler)
             global_step += 1
             losses.append(float(loss.detach().float().item()))
             if global_step % 50 == 0:
@@ -1516,7 +1744,7 @@ def _build_packed_v3_1_loaders(
     token_budget_per_rank: int,
     process_index: int,
     world_size: int,
-) -> tuple[PackedLoaderFactory, Iterable[Batch], int]:
+) -> tuple[PackedLoaderFactory, Iterable[Batch], int, int]:
     """Build packed, multi-worker ``v3_1`` train/val loaders for one DDP rank.
 
     Endpoint integer ids and true token lengths come from ``table.manifest`` only —
@@ -1536,7 +1764,9 @@ def _build_packed_v3_1_loaders(
         world_size: Total rank count (``1`` selects the unit-test single-process path).
 
     Returns:
-        ``(train_loader_factory, val_loader, warmup_steps)``.
+        ``(train_loader_factory, val_loader, warmup_steps, schedule_total_steps)``,
+        where the last element is the exact optimizer-step count across epochs
+        ``1..cfg.optim.epochs`` for this rank (used to size a OneCycle schedule).
 
     Raises:
         ValueError: If ``cfg.runtime`` is unset.
@@ -1628,7 +1858,15 @@ def _build_packed_v3_1_loaders(
         baseline_batch_sizes, new_global_batch_sizes, baseline_steps=cfg.optim.warmup_steps
     )
 
-    return factory, val_loader, warmup_steps
+    # Exact optimizer-step count for the whole run. The training loop iterates
+    # epochs 1..epochs (epoch 0 is only the warmup-scaling reference plan), and
+    # each epoch's length-bucketed plan has its own batch count, so this sum --
+    # not steps_per_epoch * epochs -- is what sizes a OneCycle schedule.
+    schedule_total_steps = sum(
+        len(plans_by_epoch[epoch][process_index]) for epoch in range(1, cfg.optim.epochs + 1)
+    )
+
+    return factory, val_loader, warmup_steps, schedule_total_steps
 
 
 # --------------------------------------------------------------------------- DDP training
@@ -1908,6 +2146,7 @@ def train_ddp_loop(
     accelerator: Accelerator,
     *,
     warmup_steps: int,
+    schedule_total_steps: int | None = None,
     evaluate_fn: EvaluateFn = _evaluate_distributed,
     on_eval: OnEval | None = None,
 ) -> TrainResult:
@@ -1928,6 +2167,8 @@ def train_ddp_loop(
         cfg: The full training config.
         accelerator: DDP accelerator (see :func:`build_ddp_accelerator`).
         warmup_steps: Linear-warmup step count (then constant LR).
+        schedule_total_steps: Exact optimizer-step count over all epochs, used to
+            size a ``optim.scheduler`` OneCycle schedule; unused otherwise.
         evaluate_fn: Validation function; defaults to distributed validation.
             Unit tests inject a deterministic metric source.
         on_eval: Optional main-rank-only callback after each evaluation.
@@ -1943,9 +2184,11 @@ def train_ddp_loop(
         model.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
     )
     model, optimizer = accelerator.prepare(model, optimizer)
-    warmup = max(1, warmup_steps)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda step: min(1.0, float(step + 1) / float(warmup))
+    scheduler = _build_scheduler(
+        optimizer,
+        cfg,
+        warmup_steps=warmup_steps,
+        total_steps=schedule_total_steps,
     )
     world_size = accelerator.num_processes
     use_cuda = accelerator.device.type == "cuda"
@@ -2014,7 +2257,7 @@ def train_ddp_loop(
             if cfg.optim.grad_clip > 0:
                 accelerator.clip_grad_norm_(model.parameters(), cfg.optim.grad_clip)
             optimizer.step()
-            scheduler.step()
+            _step_scheduler(scheduler)
             if start_event is not None and end_event is not None:
                 end_event.record()  # type: ignore[no-untyped-call]
                 cuda_event_pairs.append((start_event, end_event))
@@ -2462,7 +2705,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
 
     assembled = assemble_data(cfg)
     table = PackedFeatureTable.from_pack(args.pack_dir, accelerator.device)
-    factory, val_loader, warmup_steps = _build_packed_v3_1_loaders(
+    factory, val_loader, warmup_steps, schedule_total_steps = _build_packed_v3_1_loaders(
         cfg,
         assembled,
         table,
@@ -2503,6 +2746,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                 one_epoch_cfg,
                 accelerator,
                 warmup_steps=warmup_steps,
+                schedule_total_steps=schedule_total_steps,
                 evaluate_fn=evaluate_fn,
             ),
         )
@@ -2523,6 +2767,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         cfg,
         accelerator,
         warmup_steps=warmup_steps,
+        schedule_total_steps=schedule_total_steps,
         evaluate_fn=evaluate_fn,
     )
     if accelerator.is_main_process:
@@ -2583,6 +2828,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     else:
         factory, val_loader = _build_f0_loaders(cfg, assembled)
 
+    schedule_total_steps = (
+        _count_single_process_steps(factory, cfg) if cfg.optim.scheduler is not None else None
+    )
+
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = cfg.output_dir / "metrics.jsonl"
     metrics_path.unlink(missing_ok=True)
@@ -2611,6 +2860,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         cfg,
         accelerator,
         max_steps=args.max_steps,
+        schedule_total_steps=schedule_total_steps,
         on_eval=on_eval,
     )
     write_outputs(result, cfg, model_kwargs, assembled.dropped_pair_counts)

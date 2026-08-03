@@ -991,7 +991,7 @@ def test_packed_loader_does_not_call_feature_store(
         Mock(side_effect=AssertionError("unexpected feature I/O")),
     )
 
-    factory, val_loader, warmup_steps = _build_packed_v3_1_loaders(
+    factory, val_loader, warmup_steps, _ = _build_packed_v3_1_loaders(
         cfg,
         assembled,
         table,
@@ -1018,7 +1018,7 @@ def test_packed_loader_multi_worker_ranks_cover_all_rows(
     expected_row_ids = list(range(len(assembled.benchmark.split.train_pairs.pairs)))
     seen_row_ids: list[int] = []
     for process_index in (0, 1):
-        multi_worker_factory, _, _ = _build_packed_v3_1_loaders(
+        multi_worker_factory, _, _, _ = _build_packed_v3_1_loaders(
             cfg,
             assembled,
             table,
@@ -1053,7 +1053,7 @@ def test_packed_loader_reuses_one_dataloader_across_epochs(
 ) -> None:
     cfg, assembled, pack_root = _synthetic_v31_pack_fixture(tmp_path, monkeypatch)
     table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
-    factory, _, _ = _build_packed_v3_1_loaders(
+    factory, _, _, _ = _build_packed_v3_1_loaders(
         cfg,
         assembled,
         table,
@@ -1074,7 +1074,7 @@ def test_packed_loader_enables_persistent_workers_and_reuses_loader(
 ) -> None:
     cfg, assembled, pack_root = _synthetic_v31_pack_fixture(tmp_path, monkeypatch)
     table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
-    factory, _, _ = _build_packed_v3_1_loaders(
+    factory, _, _, _ = _build_packed_v3_1_loaders(
         cfg,
         assembled,
         table,

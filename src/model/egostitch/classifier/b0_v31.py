@@ -594,6 +594,18 @@ class V3_1(nn.Module):
         )
         self.n_heads = _to_int(model_config["n_heads"], "model_config.n_heads")
 
+        # Loss-side only: symmetric BCE label smoothing, applied in `forward` when
+        # `label` is present. Architecture is unaffected, so a scoring-time rebuild
+        # from a checkpoint's embedded config carries it harmlessly.
+        self.label_smoothing = _to_float(
+            model_config.get("label_smoothing", 0.0), "model_config.label_smoothing"
+        )
+        if not 0.0 <= self.label_smoothing < 1.0:
+            raise ValueError(
+                "model_config.label_smoothing must be in [0.0, 1.0), got "
+                f"{self.label_smoothing}"
+            )
+
         mlp_cfg_raw = model_config.get("mlp_head")
         if not isinstance(mlp_cfg_raw, dict) or not mlp_cfg_raw:
             raise ValueError("mlp_head configuration is required for V3_1")
@@ -802,6 +814,11 @@ class V3_1(nn.Module):
             labels_for_loss = (
                 labels.squeeze(-1) if labels.dim() > 1 and labels.size(-1) == 1 else labels
             )
+            if self.label_smoothing > 0.0:
+                # Symmetric binary smoothing: 1 -> 1 - eps/2, 0 -> eps/2.
+                labels_for_loss = (
+                    labels_for_loss * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
+                )
             output["loss"] = nn.functional.binary_cross_entropy_with_logits(
                 logits_for_loss, labels_for_loss
             )
