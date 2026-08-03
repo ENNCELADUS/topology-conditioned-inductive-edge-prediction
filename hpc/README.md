@@ -27,6 +27,20 @@ container.
 `--worker-module src.train_egostitch --run-kind formal` after the config path to select
 the EgoStitch worker instead (see "EgoStitch E2E" below).
 
+The external CAZI-MBN reproduction is intentionally isolated from the E2
+`pack -> train -> publish` workers because its released teacher/student schedule is
+not that pipeline. It still goes through the fixed H20 runner and its environment,
+data, and GPU checks:
+
+```bash
+hpc/run.sh train configs/cazi_mbn_breadth_first.yaml \
+  --worker-module src.train_cazi_mbn
+```
+
+This direct branch preserves CAZI's early-stopped teacher-then-student schedule and
+writes its checkpoints, cached candidate scores, and pairwise/topology report under
+the config's `output_dir`.
+
 ## Required target environment
 
 Formal execution requires one or more NVIDIA H20 GPUs. GPU count is intentionally

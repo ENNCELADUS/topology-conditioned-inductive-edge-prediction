@@ -1,0 +1,36 @@
+model:
+  order: 5
+  topology_dim: 128
+  latent_dim: 32
+  network_layers: 1
+  heads: 6
+
+data:
+  root: data
+  strategy: breadth_first
+  partition_seed: 0
+  f0_cache: outputs/f0_cache/all_operative_nodes.pt
+  expected_missing_features:
+    - node_004764
+    - node_007050
+
+optim:
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  teacher_epochs: 10000
+  student_epochs: 10000
+  patience: 30
+
+loss:
+  discriminator_coef: 1.0
+  regularization_coef: 1.0
+  classification_coef: 10.0
+  distillation_weight: 0.5
+  supervised_weight: 0.5
+
+runtime:
+  batch_size: 256
+  score_batch_size: 16384
+
+seed: 0
+output_dir: outputs/cazi_mbn_breadth_first/seed0

@@ -68,6 +68,14 @@ def test_help_is_available_without_the_remote_container(bash_exe: str) -> None:
     # generic `train` branch via an explicit worker-module override.
     assert "qualification.sh" not in result.stdout
     assert "src.train_egostitch" in result.stdout
+    assert "src.train_cazi_mbn" in result.stdout
+
+
+def test_cazi_uses_isolated_h20_train_worker() -> None:
+    """The external CAZI schedule bypasses only the incompatible E2 pipeline."""
+    text = RUNNER.read_text()
+    assert '"$2" == "src.train_cazi_mbn"' in text
+    assert '-m src.train_cazi_mbn "${CONFIG_PATH}" --device cuda' in text
 
 
 def test_runner_discovers_visible_h20s() -> None:

@@ -25,8 +25,10 @@ automatically sized `accelerate launch`. It defaults to the B0 worker
 after the config path to train an EgoStitch E2E config
 (`model.family: egostitch_e2e`) instead. Direct `python -m src.train_b0
 --max-steps N` remains debug-only (bounded smoke runs); it is never a formal E2
-training run. B0-alt keeps its own direct `python -m src.train_b0` CLI,
-unaffected by this distributed routing.
+training run. The external CAZI-MBN reproduction is not an E2 packed-feature
+worker; select its isolated runner with `--worker-module src.train_cazi_mbn`.
+B0-alt keeps its own direct `python -m src.train_b0` CLI, unaffected by this
+distributed routing.
 
 The score command pins --device cuda --amp bf16. With multiple visible GPUs it
 launches one contiguous shard per GPU, waits for every shard, and strictly merges
@@ -148,6 +150,9 @@ case "${COMMAND}" in
     CONFIG_PATH="$1"
     shift
     [[ -f "${CONFIG_PATH}" ]] || fail "config not found: ${CONFIG_PATH}"
+    if [[ $# -eq 2 && "$1" == "--worker-module" && "$2" == "src.train_cazi_mbn" ]]; then
+      exec "${PYTHON_BIN}" -m src.train_cazi_mbn "${CONFIG_PATH}" --device cuda
+    fi
     exec "${PYTHON_BIN}" -m src.e2_pipeline --config "${CONFIG_PATH}" "$@"
     ;;
   score)
