@@ -138,15 +138,13 @@ def _write_tiny_token_pack(pack_dir: Path) -> None:
 
 
 def _toy_config(output_dir: Path, pack_dir: Path) -> te.EgoConfig:
-    """Build the E2E worker config directly, bypassing the registered pins.
+    """Build the E2E worker config directly, bypassing the pinned contract.
 
-    `load_config` enforces the registered arm contract (bf16, negative_ratio 5,
-    the pinned optimizer block); this driver runs on CPU over eight synthetic
-    nodes, so the dataclass is constructed here rather than round-tripped
-    through YAML.
+    `load_config` enforces the pinned training contract (bf16, negative_ratio
+    5, the pinned optimizer block); this driver runs on CPU over eight
+    synthetic nodes, so the dataclass is constructed here rather than
+    round-tripped through YAML.
     """
-    prereg = output_dir / "prereg.json"
-    prereg.write_text('{"registration_id": "smoke"}\n')
     return te.EgoConfig(
         model=ModelConfig(family="egostitch_e2e", config=dict(_E2E_TINY_MODEL)),
         data=te.EgoDataConfig(
@@ -182,7 +180,6 @@ def _toy_config(output_dir: Path, pack_dir: Path) -> te.EgoConfig:
         seed=0,
         output_dir=output_dir / "run",
         mixed_precision="no",
-        preregistration=prereg,
         training=te.EgoStitchTrainingConfig(),
         run_kind="formal",
     )

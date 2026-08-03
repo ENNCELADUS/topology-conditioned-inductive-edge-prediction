@@ -16,6 +16,12 @@ not *execution* (§14). Authority order: `01-blueprint` → `02-methodology` →
 Later refines earlier, but blueprint §10 Locked Decisions and protocol §0 override
 casual changes — **flag conflicts, don't resolve them unilaterally**.
 
+**Active design:** `docs/superpowers/specs/2026-08-02-three-component-refactor-design.md`
+governs the current EgoStitch component-interface refactor and the excision of the
+preregistration/formal-run-registration machinery (its §10). The owner has withdrawn
+the registration mechanism; experiments are run directly, without a plan/artifact
+identity gate.
+
 ## After each implementation wave
 
 **You run the review, not the user.** Background it to a file and read the findings
@@ -31,11 +37,10 @@ CODEX_HOME="$CH" codex review --base <WAVE_BASE_SHA> > <wave>-review.txt 2>&1
 — the `codex` CLI beneath it is yours to run.
 
 Runtime, for any training/scoring/gate command: the world size is **auto-detected**
-from all visible NVIDIA H20 devices (`hpc/run.sh`, `hpc/qualification.sh`), and config
-keys change meaning per model family. EgoStitch e2e has one stage, launched from the
-historically named `hpc/qualification.sh`: `formal <arm>` (registered schedule,
-exactly 4 H20s, clean checkout). Registration status and nullable run-evidence
-placeholders are not preflight gates; the run records concrete provenance.
+from all visible NVIDIA H20 devices via `hpc/run.sh`, and config keys change meaning
+per model family. EgoStitch e2e trains through the same `hpc/run.sh train` branch as
+the baselines, naming the worker explicitly:
+`hpc/run.sh train <config.yaml> --worker-module src.train_egostitch --run-kind formal`.
 
 **`-c 'mcp_servers={}'` does NOT disable MCP** — `-c` merges into the config, so the
 `[mcp_servers.*]` sub-tables in `~/.codex/config.toml` survive it. Verified 2026-07-25:
@@ -97,12 +102,12 @@ nodes?" (`docs/lit-review-plan.md` §5, binding for all writing.)
   `validate_artifact_precision(artifact, label=...)` yourself — it is the only correct
   entry point; calling `validate_score_precision` directly on an `egostitch_e2e`
   artifact spuriously raises "missing arrays".
-- **Guards-only is the qualification *verdict*, not checkpoint eligibility.**
-  `e2e_checkpoint_eligible` (`train_egostitch.py:1291`) is enforced in **both** stages;
-  conflating the two reauthorizes the 2026-07-19 degenerate-checkpoint failure. Its AUPRC
-  floor is `prevalence + 0.02`, and `V_hold`'s prevalence is half `V_select`'s (`0.0117`
-  vs `0.0247`), so the floor is 29% lower in absolute terms — `0.0317`, not `0.0447`.
-  Spec §13.19.3.
+- **There is no checkpoint-eligibility predicate, by owner decision (2026-08-02).**
+  `e2e_checkpoint_eligible` is deleted and nothing replaces it: `select_e2e_checkpoint`
+  returns the best record by AUPRC → clustering MMD → Brier and will happily return a
+  degenerate one. No code decides whether a checkpoint is scientifically usable —
+  judge it yourself from the per-epoch rows in `metrics.jsonl`. Do not reintroduce an
+  automated eligibility gate.
 - **The fp32 island in `stitch.py:80` must promote `h`/`pi`/`m` before** cost and
   marginal products are formed. Casting afterward keeps the bf16 ulp grid (0.03125
   spacing at |logit| ∈ [4,8)) and silently quantizes logits. Spec §13.16.
@@ -112,10 +117,6 @@ nodes?" (`docs/lit-review-plan.md` §5, binding for all writing.)
 - **`data.partition_seed` is not `seed`** (`train_egostitch.py:401`). Changing it
   silently changes `G_struct`, the internal holdouts, and the whole training pair
   universe.
-- **`_config_hash` bakes in paths** (`train_egostitch.py:5099` — `output_dir`,
-  `data.root`, `preregistration`) *and* `optim.epochs`, so overriding `--output-dir`
-  breaks the `config_hash` equality gate at `src/experiments/probes.py:842`, and the two
-  ladder stages never share it. Cross-stage identity is `model_config_hash` (`:5132`).
 - **F0 caches serve supersets silently**: with `allow_cache_subset=True`
   (`features.py:130`; live at `train_egostitch.py:2245`, `probes.py:892`,
   `score_universe.py:1624`/`:1723`) a superset cache is gathered into a *different* node
@@ -140,10 +141,9 @@ Current G5 verdicts live in `docs/results/G5-stage1-seed0-20260717.md` (frozen-s
 — evidence retained; its producing code last exists at `dcae090` and is deleted in the
 current cleanup worktree pending commit) and
 `docs/results/G5-e2e-stage1-seed0-20260724.md` (rev-3.0 e2e, `cut`). The active line is
-rev-3.2 on a single formal stage. `g5_e2e_stage1_preregistration_v5.json` (the
-component-ablation arm schema; v4 is superseded history) remains
-`DRAFT` as descriptive provenance; formal launch uses its exact bytes/SHA and
-arm/config identities without gating on status or nullable run-evidence placeholders.
+rev-3.2 on a single formal stage, run directly (`hpc/run.sh train`) without a
+preregistration plan or artifact-identity gate — see
+`docs/superpowers/specs/2026-08-02-three-component-refactor-design.md` §10.
 
 Benchmark and baseline names (`Benchmark-A/B/C`, `B0`, `B0-alt`, `B0-e2e`, `B1`,
 `B2-*`, `B3`, `B5`, `Ours`, `Oracle`, `PA-null`) are deliberate dataset-agnostic

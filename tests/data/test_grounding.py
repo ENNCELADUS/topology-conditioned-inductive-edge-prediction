@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -214,25 +212,3 @@ class TestE2EConfigNGroundReachesPoolBuilder:
         f0 = rng.normal(size=(len(nodes), 6)).astype(np.float32)
         pool = build_grounding_pool(f0, nodes, n_ground=cfg.n_ground, role_universe="V_fit")
         assert all(len(v) == 20 for v in pool.values())
-
-
-def test_binding_v2_arm_config_sha256_digests_are_intact() -> None:
-    """Every frozen v2 config still matches its digest in the BINDING registration."""
-    repo_root = Path(__file__).resolve().parents[2]
-    registration_path = (
-        repo_root / "docs/registrations/g5_e2e_stage1_preregistration_v2.json"
-    )
-    registration = json.loads(registration_path.read_text())
-    configs = registration["binding_evidence"]["configs"]
-    expected_paths = {
-        "configs/egostitch_e2e_breadth_first.yaml",
-        "configs/egostitch_e2e_f_only_breadth_first.yaml",
-        "configs/egostitch_e2e_pair_topology_breadth_first.yaml",
-        "configs/egostitch_e2e_p0_breadth_first.yaml",
-    }
-
-    assert registration["status"] == "BINDING"
-    assert {entry["path"] for entry in configs.values()} == expected_paths
-    for entry in configs.values():
-        config_path = repo_root / entry["path"]
-        assert hashlib.sha256(config_path.read_bytes()).hexdigest() == entry["sha256"]

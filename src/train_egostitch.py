@@ -18,10 +18,6 @@ Launch (formal):
         -m src.train_egostitch --config configs/egostitch_e2e_v3_full_breadth_first.yaml \
         --ddp-mode train --run-kind formal --pack-dir <pack> --output-dir <out> \
         --token-budget-per-rank 256 --profile-output <profile.json>
-
-Pre-registration (protocol Sec 5.2.4): the worker records the sha256 of
-``preregistration:`` in ``run_metadata.json`` before the first optimizer step;
-the G5 gate evaluator refuses held-out metrics on any mismatch.
 """
 
 from __future__ import annotations
@@ -33,7 +29,6 @@ import logging
 import math
 import os
 import pickle
-import subprocess
 import time
 from collections import deque
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
@@ -269,8 +264,6 @@ class EgoConfig:
         seed: Global seed.
         output_dir: Artifact directory.
         mixed_precision: ``"no"`` or ``"bf16"``.
-        preregistration: Path to the committed pre-registration JSON whose
-            sha256 is recorded in ``run_metadata.json``.
         runtime: Orchestrator runtime contract (``token_budget`` reinterpreted
             as the node batch ``B_n``; no frozen E2 probe list).
     """
@@ -283,7 +276,6 @@ class EgoConfig:
     seed: int
     output_dir: Path
     mixed_precision: str
-    preregistration: Path
     runtime: EgoRuntimeConfig | None = None
     training: EgoStitchTrainingConfig | None = None
     run_kind: E2ERunKind | None = None
@@ -328,7 +320,6 @@ def load_config(path: Path) -> EgoConfig:
             "seed",
             "output_dir",
             "mixed_precision",
-            "preregistration",
             "runtime",
             "training",
         ),
@@ -631,13 +622,13 @@ def load_config(path: Path) -> EgoConfig:
                 "diagnostics.selection_auprc_tolerance must exactly equal "
                 "training.selection_auprc_tolerance"
             )
-        registered_training = EgoStitchTrainingConfig()
+        pinned_training = EgoStitchTrainingConfig()
         if replace(
             training,
-            selection_auprc_tolerance=registered_training.selection_auprc_tolerance,
-        ) != registered_training:
+            selection_auprc_tolerance=pinned_training.selection_auprc_tolerance,
+        ) != pinned_training:
             raise ValueError(
-                f"training values must exactly match the DRAFT registration; got {training!r}"
+                f"training values must exactly match the pinned defaults; got {training!r}"
             )
         if data.negative_ratio != 5:
             raise ValueError("training requires data.negative_ratio=5")
@@ -649,11 +640,11 @@ def load_config(path: Path) -> EgoConfig:
             or optim.warmup_steps != 500
             or optim.grad_clip != 1.0
         ):
-            raise ValueError("training requires the registered optimizer settings")
+            raise ValueError("training requires the pinned optimizer settings")
         resolved_e2e = E2EConfig.from_mapping(model_kwargs)
         if (resolved_e2e.p_topo, resolved_e2e.p_cont) not in ((0.15, 0.15), (0.0, 0.0)):
             raise ValueError(
-                "training requires p_topo=p_cont=0.15, or 0.0 for the registered p0 arm"
+                "training requires p_topo=p_cont=0.15, or 0.0 for the p0 arm"
             )
         if mixed_precision != "bf16" or eval_cfg.eval_every != 1:
             raise ValueError("training requires mixed_precision=bf16 and eval.eval_every=1")
@@ -662,7 +653,7 @@ def load_config(path: Path) -> EgoConfig:
             or diagnostics.gradient_imbalance_ratio != 50.0
             or diagnostics.gradient_imbalance_steps != 200
         ):
-            raise ValueError("training diagnostics do not match the registered guard cadence")
+            raise ValueError("training diagnostics do not match the pinned guard cadence")
 
     if family == _EGOSTITCH_E2E_FAMILY and training is None:
         raise ValueError(
@@ -679,7 +670,6 @@ def load_config(path: Path) -> EgoConfig:
         seed=_as_int(_require(raw, "seed", ""), "seed"),
         output_dir=Path(_as_str(_require(raw, "output_dir", ""), "output_dir")),
         mixed_precision=mixed_precision,
-        preregistration=Path(_as_str(_require(raw, "preregistration", ""), "preregistration")),
         runtime=runtime,
         training=training,
         run_kind=None,
@@ -1267,49 +1257,6 @@ class E2ECheckpointRecord:
     topology_gradient_norm: float | None = None
 
 
-def e2e_checkpoint_eligible(record: E2ECheckpointRecord, arm: E2EArmName) -> bool:
-    """Apply the arm-specific §13.19.3 rules without any fallback."""
-    values = (
-        record.auprc,
-        record.prevalence,
-        record.active_logit_std,
-        record.clustering_mmd,
-        record.brier,
-    )
-    if (
-        record.phase != "C"
-        or record.full_joint_epochs_completed < 1
-        or not record.guards_passed
-        or not all(math.isfinite(value) for value in values)
-    ):
-        return False
-    if arm == "b0_e2e_f_only":
-        return record.active_logit_std >= 1e-4 and record.auprc >= record.prevalence + 0.02
-    if arm == "pair_topology":
-        norm = record.topology_gradient_norm
-        return (
-            record.active_logit_std >= 1e-4
-            and record.auprc >= record.prevalence + 0.02
-            and norm is not None
-            and math.isfinite(norm)
-            and norm >= 1e-8
-        )
-    warm_std = record.warm_reference_std
-    warm_auprc = record.warm_reference_auprc
-    residual = record.residual_ratio
-    return (
-        warm_std is not None
-        and warm_auprc is not None
-        and residual is not None
-        and all(math.isfinite(value) for value in (warm_std, warm_auprc, residual))
-        and warm_std >= 1e-4
-        and record.active_logit_std >= max(0.25 * warm_std, 1e-4)
-        and warm_auprc >= record.prevalence + 0.02
-        and record.auprc >= warm_auprc - 0.02
-        and residual >= 1e-3
-    )
-
-
 def select_e2e_checkpoint(
     records: Sequence[E2ECheckpointRecord],
     arm: E2EArmName,
@@ -1317,7 +1264,14 @@ def select_e2e_checkpoint(
     auprc_tolerance: float = 0.02,
     mmd_tolerance: float = 1e-6,
 ) -> E2ECheckpointRecord | None:
-    """Select the plan-ranked checkpoint; quality predicates are telemetry only."""
+    """Select the best-ranked checkpoint: AUPRC, then clustering MMD, then Brier.
+
+    There is no eligibility predicate. Whether a selected checkpoint is
+    scientifically usable is an owner-side judgement made from the raw
+    per-epoch metrics in ``metrics.jsonl``, not something this function or any
+    other code path decides. ``arm`` is accepted only to keep one call
+    signature across arms.
+    """
     del arm
     if not records:
         return None
@@ -1424,147 +1378,13 @@ def apply_overrides(cfg: EgoConfig, args: EgoCliArgs) -> EgoConfig:
     return cfg
 
 
-class FormalPlanMismatch(RuntimeError):
-    """Raised when a formal worker does not match the registered plan identity."""
-_E2E_FORMAL_ARMS: tuple[E2EArmName, ...] = (
-    "full",
-    "b0_e2e_f_only",
-    "pair_topology",
-    "p0",
-    "no_l_rel",
-    "row_layernorm",
-)
-_E2E_CONTROL_ARMS = ("structure_control_6a_v3", "structure_control_6e_v1")
-_E2E_ARMS = _E2E_FORMAL_ARMS + _E2E_CONTROL_ARMS
-E2E_CHECKPOINT_POLICY_VERSION = "egostitch_e2e_all_completed_epochs_v1"
-
-
-@dataclass(frozen=True)
-class PreregistrationSnapshot:
-    """One immutable registration payload and its digest."""
-
-    payload: dict[str, object]
-    sha256: str
-
-
-def _is_sha256(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdefABCDEF" for character in value)
-    )
-
-
-def _validate_e2e_formal_plan(
-    cfg: EgoConfig, snapshot: PreregistrationSnapshot, config_path: Path
-) -> dict[str, str]:
-    """Validate plan/config identity and record the clean live implementation.
-
-    Registration status and nullable run-produced evidence are intentionally not
-    consulted here.
-    """
-    from src.experiments.e2e_binding import (
-        ACTIVE_V5_ARMS,
-        PLAN_SCHEMA_V2,
-        plan_schema_for_registration,
-    )
-
-    try:
-        schema = plan_schema_for_registration(snapshot.payload)
-    except ValueError as error:
-        raise FormalPlanMismatch(str(error)) from error
-    if schema != PLAN_SCHEMA_V2:
-        raise FormalPlanMismatch("formal training requires the active v5 plan schema")
-    configs = snapshot.payload.get("config_artifacts")
-    expected_configs = frozenset(_E2E_FORMAL_ARMS)
-    if not isinstance(configs, Mapping) or set(configs) != expected_configs:
-        raise FormalPlanMismatch(
-            "config_artifacts do not match the registration's trained checkpoint arms"
-        )
-    registered_arms = snapshot.payload.get("arms")
-    if not isinstance(registered_arms, Mapping) or set(registered_arms) != ACTIVE_V5_ARMS:
-        raise FormalPlanMismatch("registration arms do not match its identity schema")
-    for trained_arm in expected_configs:
-        entry = registered_arms.get(trained_arm)
-        if not isinstance(entry, Mapping) or entry.get("kind") != "trained_checkpoint":
-            raise FormalPlanMismatch(
-                f"registration arms.{trained_arm} must be a trained_checkpoint"
-            )
-    for control_arm in _E2E_CONTROL_ARMS:
-        entry = registered_arms.get(control_arm)
-        if (
-            not isinstance(entry, Mapping)
-            or entry.get("kind") != "scoring_time_control"
-            or entry.get("checkpoint_arm") != "full"
-        ):
-            raise FormalPlanMismatch(
-                f"registration arms.{control_arm} must be a scoring_time_control over full"
-            )
-    repo_root = cfg.preregistration.resolve().parents[2]
-    arm = _e2e_arm_name_from_config(E2EConfig.from_mapping(cfg.model.config))
-    registered_arm = registered_arms.get(arm) if isinstance(registered_arms, Mapping) else None
-    registered_training = (
-        registered_arm.get("training") if isinstance(registered_arm, Mapping) else None
-    )
-    config_evidence = configs.get(arm)
-    if (
-        not isinstance(config_evidence, Mapping)
-        or set(config_evidence) != {"path", "sha256"}
-        or config_evidence.get("path") != registered_training
-    ):
-        raise FormalPlanMismatch(f"config_artifacts entry is invalid for {arm}")
-    config_sha256 = config_evidence.get("sha256")
-    if not _is_sha256(config_sha256) or _sha256_file(config_path) != config_sha256:
-        raise FormalPlanMismatch(f"live config digest does not match registered plan for {arm}")
-    expected_path = (repo_root / str(registered_training)).resolve()
-    if config_path.resolve() != expected_path:
-        raise FormalPlanMismatch(f"config path does not match arms.{arm}.training")
-    live_commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    tracked_changes = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=no"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    if tracked_changes:
-        raise FormalPlanMismatch("formal execution requires a clean live checkout")
-    return {
-        "arm": arm,
-        "implementation_commit": live_commit,
-        "config_sha256": cast(str, config_sha256),
-    }
-
-
-def _preregistration_snapshot(path: Path) -> PreregistrationSnapshot:
-    """Parse and hash one immutable registration byte snapshot."""
-    raw = path.read_bytes()
-    payload = json.loads(raw)
-    if not isinstance(payload, dict):
-        raise ValueError("preregistration must be a JSON object")
-    return PreregistrationSnapshot(
-        cast(dict[str, object], payload), hashlib.sha256(raw).hexdigest()
-    )
-
-
-def prepare_ddp_run_config(
-    cfg: EgoConfig, *, max_steps: int | None
-) -> tuple[EgoConfig, bool, PreregistrationSnapshot]:
-    """Enforce the formal/debug registration boundary before DDP work starts.
+def prepare_ddp_run_config(cfg: EgoConfig, *, max_steps: int | None) -> tuple[EgoConfig, bool]:
+    """Enforce the formal/debug output-directory boundary before DDP work starts.
 
     A bounded run is never allowed to use the configured formal output directory.
     Its checkpoints may support local smoke checks, but its metadata explicitly
     marks them non-formal so the gate cannot publish held-out results from them.
     """
-    if not cfg.preregistration.is_file():
-        raise ValueError(f"preregistration file not found: {cfg.preregistration}")
-    snapshot = _preregistration_snapshot(cfg.preregistration)
     if cfg.training is not None:
         run_kind = cfg.run_kind or "formal"
         if max_steps is not None:
@@ -1572,7 +1392,7 @@ def prepare_ddp_run_config(
                 f"E2E {run_kind} runs must execute the complete schedule; --max-steps forbidden"
             )
     if max_steps is None:
-        return cfg, False, snapshot
+        return cfg, False
     if max_steps <= 0:
         raise ValueError("--max-steps must be positive")
     debug_dir = (
@@ -1580,7 +1400,7 @@ def prepare_ddp_run_config(
         if cfg.output_dir.name.endswith("_debug")
         else cfg.output_dir.with_name(f"{cfg.output_dir.name}_debug")
     )
-    return replace(cfg, output_dir=debug_dir), True, snapshot
+    return replace(cfg, output_dir=debug_dir), True
 
 
 # --------------------------------------------------------------------------- pack stage
@@ -3527,19 +3347,6 @@ def _e2e_arm_name_from_config(config: E2EConfig) -> E2EArmName:
     return "full"
 
 
-def _e2e_trained_scoring_semantics(config: E2EConfig) -> dict[str, str]:
-    """Describe how one trained checkpoint is scored under spec Sec 14.4.6."""
-    return {
-        "scaffold_control": "none",
-        "permanent_null": config.permanent_null,
-        "primary_logit": {
-            "none": "full",
-            "all_head": "f_logit",
-            "content_head": "pair_topology",
-        }[config.permanent_null],
-    }
-
-
 def _e2e_base_lr(step: int, total_steps: int, config: EgoStitchTrainingConfig) -> float:
     """Registered 500-step warm-up followed by cosine decay to ``min_lr``."""
     if not 0 <= step < total_steps:
@@ -4689,7 +4496,6 @@ def _train_e2e_stability_loop(
                     "auprc": metrics.auprc,
                     "lr": float(optimizer.param_groups[0]["lr"]),
                     "fidelity": fidelity,
-                    "checkpoint_eligible": e2e_checkpoint_eligible(record, arm),
                     "quality_thresholds": {
                         "validation_values_finite": not bool(validation_nonfinite_failure),
                         "warm_reference_floor_pass": warm_reference_quality_pass,
@@ -5054,12 +4860,6 @@ def train_egostitch_ddp_loop(
 # --------------------------------------------------------------------------- artifacts
 
 
-def _config_hash(cfg: EgoConfig) -> str:
-    return hashlib.sha256(
-        json.dumps(config_to_dict(cfg), sort_keys=True).encode("utf-8")
-    ).hexdigest()
-
-
 V_HOLD_VALIDATION_EVENTS_FILENAME = "v_hold_validation_events.jsonl"
 
 _MODEL_CONFIG_HASH_SCHEMA = "egostitch_e2e_model_config_v2"
@@ -5067,13 +4867,12 @@ _MODEL_CONFIG_HASH_SCHEMA = "egostitch_e2e_model_config_v2"
 def model_config_hash(cfg: EgoConfig) -> str:
     """Hash the model-defining configuration for run provenance.
 
-    `_config_hash` is path-sensitive: it hashes the
-    whole config, including ``output_dir``, ``data.root`` and
-    ``preregistration``, and the two stages necessarily differ in the first
-    (documented CLAUDE.md trap). This digest covers what defines the model and
-    what it is trained on, and deliberately excludes:
+    `config_to_dict` is path-sensitive: it carries the whole config, including
+    ``output_dir`` and ``data.root`` (documented CLAUDE.md trap). This digest
+    covers what defines the model and what it is trained on, and deliberately
+    excludes:
 
-    - ``output_dir`` / ``data.root`` / every other path, and ``preregistration``;
+    - ``output_dir`` / ``data.root`` / every other path;
     - ``optim.epochs`` -- recorded by the plan/config identity instead;
     - ``model.config['feature_stats_sha256']`` -- recorded alongside this digest;
     - ``seed`` -- an execution parameter. The formal stage may sweep
@@ -5123,13 +4922,10 @@ def write_run_start_metadata(
     *,
     world_size: int,
     debug: bool = False,
-    preregistration_sha256: str | None = None,
-    registered_config_hash: str | None = None,
     config_path: Path | None = None,
-    formal_plan: Mapping[str, str] | None = None,
     feature_stats_sha256: str | None = None,
 ) -> None:
-    """Bind the run to config, preregistration, and s0 before optimization."""
+    """Bind the run to its config and s0 statistics before optimization."""
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     path = cfg.output_dir / "run_metadata.json"
     if path.exists():
@@ -5141,49 +4937,11 @@ def write_run_start_metadata(
         else None
     )
     arm = _e2e_arm_name_from_config(e2e_config) if e2e_config is not None else None
-    live_implementation_commit: str | None = None
-    implementation_tracked_clean: bool | None = None
-    implementation_tracked_status_sha256: str | None = None
-    if e2e_config is not None and not debug and config_path is not None:
-        repo_root = cfg.preregistration.resolve().parents[2]
-        live_implementation_commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        if (
-            len(live_implementation_commit) != 40
-            or any(
-                character not in "0123456789abcdefABCDEF"
-                for character in live_implementation_commit
-            )
-        ):
-            raise RuntimeError("live implementation commit must be a full 40-hex git HEAD")
-        tracked_status = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-        implementation_tracked_clean = tracked_status == ""
-        implementation_tracked_status_sha256 = hashlib.sha256(tracked_status.encode()).hexdigest()
-    implementation_commit = (
-        formal_plan.get("implementation_commit")
-        if formal_plan is not None
-        else live_implementation_commit
-    )
     metadata = {
         "status": "started",
         "run_kind": run_kind,
         "formal_artifacts_published": False,
         "started_at": datetime.now(UTC).isoformat(),
-        "config_hash": registered_config_hash or _config_hash(cfg),
-        "preregistration_sha256": preregistration_sha256
-        if preregistration_sha256 is not None
-        else _preregistration_snapshot(cfg.preregistration).sha256,
         "seed": cfg.seed,
         "world_size": world_size,
         "partition_seed": cfg.data.partition_seed,
@@ -5197,14 +4955,6 @@ def write_run_start_metadata(
         "config_path": str(config_path.resolve()) if config_path is not None else None,
         "config_sha256": _sha256_file(config_path) if config_path is not None else None,
         "arm": arm,
-        "arm_kind": "trained_checkpoint" if arm is not None else None,
-        "checkpoint_arm": arm,
-        "scoring_semantics": (
-            _e2e_trained_scoring_semantics(e2e_config) if e2e_config is not None else None
-        ),
-        "implementation_commit": implementation_commit,
-        "implementation_tracked_clean": implementation_tracked_clean,
-        "implementation_tracked_status_sha256": implementation_tracked_status_sha256,
         "feature_stats_sha256": feature_stats_sha256 or "",
     }
     path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
@@ -5213,23 +4963,18 @@ def write_run_start_metadata(
 def write_outputs(
     result: EgoTrainResult, cfg: EgoConfig, data: EgoStitchData, *, debug: bool = False
 ) -> None:
-    """Write the pinned Task-4 artifacts + the pre-registration binding.
+    """Write the pinned Task-4 artifacts and finalize the run's metadata record.
 
     ``best.pt``/``last.pt`` carry exactly the seven pinned payload keys;
-    ``run_metadata.json`` additionally records ``preregistration_sha256``
-    (protocol Sec 5.2.4), the s0 checkpoint identity, the partition seed, and
-    the measured ``rho_train``.
+    ``run_metadata.json`` additionally records the s0 checkpoint identity, the
+    partition seed, and the measured ``rho_train``.
     """
     output_dir = cfg.output_dir
     config_dict = config_to_dict(cfg)
     metadata_path = output_dir / "run_metadata.json"
     if not metadata_path.is_file():
-        raise RuntimeError("run-start metadata is missing; refuse post-hoc preregistration binding")
+        raise RuntimeError("run-start metadata is missing; refuse post-hoc artifact finalization")
     run_metadata = cast(dict[str, object], json.loads(metadata_path.read_text(encoding="utf-8")))
-    if not isinstance(run_metadata.get("preregistration_sha256"), str):
-        raise RuntimeError("run-start metadata is missing preregistration binding")
-    if not isinstance(run_metadata.get("config_hash"), str):
-        raise RuntimeError("run-start metadata is missing configuration binding")
     expected_run_kind = "debug" if debug else (cfg.run_kind or "formal")
     if run_metadata.get("run_kind") != expected_run_kind:
         raise RuntimeError("run kind changed after run start; refusing to finalize artifacts")
@@ -5288,11 +5033,6 @@ def write_outputs(
 
     checkpoint_sha256 = _sha256_file(best_path)
     checkpoint_role = "debug_only" if debug else "formal_plan_selected"
-    selected_checkpoint_quality_pass = any(
-        int(cast(float, entry["epoch"])) == result.best_epoch
-        and bool(entry.get("checkpoint_eligible"))
-        for entry in result.history
-    )
     validation_liveness_observed = (
         result.best_epoch > 0
         and (
@@ -5310,9 +5050,6 @@ def write_outputs(
             "status": "debug_complete" if debug else "complete",
             "formal_artifacts_published": not debug and expected_run_kind == "formal",
             "checkpoint_id": _state_digest(result.best_state_dict)[:16],
-            "checkpoint_eligible": selected_checkpoint_quality_pass,
-            "selected_checkpoint_eligible": selected_checkpoint_quality_pass,
-            "quality_fields_policy": "telemetry_only",
             "checkpoint_role": checkpoint_role,
             "checkpoint_sha256": checkpoint_sha256,
             "diagnostic_checkpoint_sha256": None,
@@ -5321,34 +5058,6 @@ def write_outputs(
             "validation_role": data.validation_role,
             "v_hold_validation_evidence": validation_evidence,
             "access_audit": data.access_audit,
-            "run_provenance": {
-                "schema_version": "egostitch_e2e_run_provenance_v1",
-                "implementation": {
-                    "commit": run_metadata.get("implementation_commit"),
-                    "tracked_clean": run_metadata.get("implementation_tracked_clean"),
-                    "tracked_status_sha256": run_metadata.get(
-                        "implementation_tracked_status_sha256"
-                    ),
-                },
-                "parameter_group_manifests": result.runtime_profile.get(
-                    "parameter_groups"
-                ),
-                "packs_and_validation_manifests": {
-                    "pipeline_profile_path": "profile.json",
-                    "feature_stats_sha256": run_metadata.get("feature_stats_sha256"),
-                    "v_hold_validation_evidence": validation_evidence,
-                },
-                "boundary_access_audit": data.access_audit,
-                "runtime_and_peak_memory": {
-                    "world_size": run_metadata.get("world_size"),
-                    "epochs_completed": result.runtime_profile.get("epochs_completed"),
-                    "optimizer_steps": result.runtime_profile.get("optimizer_steps"),
-                    "peak_memory_gib_per_rank": result.runtime_profile.get(
-                        "peak_memory_gib_per_rank"
-                    ),
-                },
-                "checkpoint_policy_version": E2E_CHECKPOINT_POLICY_VERSION,
-            },
             "kendall_fallback": result.kendall_state,
             "training_diagnostics": {
                 "fidelity_series": [entry["fidelity"] for entry in result.history],
@@ -5426,34 +5135,18 @@ def _bind_feature_standardization(
     return stats.digest
 
 
-def _run_ddp_worker(
-    cfg: EgoConfig, args: EgoCliArgs, *, registered_config_hash: str | None = None
-) -> None:
+def _run_ddp_worker(cfg: EgoConfig, args: EgoCliArgs) -> None:
     """Dispatch an ``accelerate launch`` worker to the requested DDP mode."""
     measurement_only = args.ddp_mode in _PROBE_DISPATCH_MODES
     if measurement_only:
         if args.max_steps is not None:
             raise ValueError("measurement-only probe modes do not accept --max-steps")
-        if not cfg.preregistration.is_file():
-            raise ValueError(f"preregistration file not found: {cfg.preregistration}")
-        preregistration = _preregistration_snapshot(cfg.preregistration)
     else:
-        cfg, _is_debug, preregistration = prepare_ddp_run_config(
-            cfg, max_steps=args.max_steps
-        )
+        cfg, _is_debug = prepare_ddp_run_config(cfg, max_steps=args.max_steps)
     if args.pack_dir is None or args.token_budget_per_rank is None or args.profile_output is None:
         raise ValueError(
             "DDP worker modes require --pack-dir, --token-budget-per-rank, and --profile-output"
         )
-    if not cfg.preregistration.is_file():
-        raise ValueError(f"preregistration file not found: {cfg.preregistration}")
-    formal_plan: dict[str, str] | None = None
-    if (
-        not measurement_only
-        and cfg.training is not None
-        and (cfg.run_kind or "formal") == "formal"
-    ):
-        formal_plan = _validate_e2e_formal_plan(cfg, preregistration, args.config)
 
     effective_run_kind = "debug" if args.max_steps is not None else (cfg.run_kind or "formal")
     accelerator = build_egostitch_ddp_accelerator(
@@ -5480,9 +5173,6 @@ def _run_ddp_worker(
         model,
         data,
         accelerator=accelerator,
-        preregistration=preregistration,
-        registered_config_hash=registered_config_hash,
-        formal_plan=formal_plan,
         run_kind=run_kind,
         feature_stats_sha256=feature_stats_sha256,
         node_batch=args.token_budget_per_rank,
@@ -5497,9 +5187,6 @@ def _run_ddp_dispatch(
     data: EgoStitchData,
     *,
     accelerator: Accelerator,
-    preregistration: PreregistrationSnapshot,
-    registered_config_hash: str | None,
-    formal_plan: dict[str, str] | None,
     run_kind: str,
     feature_stats_sha256: str,
     node_batch: int,
@@ -5535,16 +5222,13 @@ def _run_ddp_dispatch(
             data,
             world_size=accelerator.num_processes,
             debug=args.max_steps is not None,
-            preregistration_sha256=preregistration.sha256,
-            registered_config_hash=registered_config_hash,
             config_path=args.config,
-            formal_plan=formal_plan,
             feature_stats_sha256=feature_stats_sha256,
         )
     accelerator.wait_for_everyone()
     # The failure half of this contract lives in `_run_ddp_worker`, which wraps
     # this call together with data assembly and digest binding -- guards that
-    # also raise before the first step and also map onto registered verdicts.
+    # also raise before the first step.
     result = train_egostitch_ddp_loop(
         model, cfg, data, accelerator, node_batch=node_batch, max_steps=args.max_steps
     )
@@ -5574,7 +5258,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     cfg = apply_overrides(loaded_cfg, args)
 
     if args.ddp_mode is not None:
-        _run_ddp_worker(cfg, args, registered_config_hash=_config_hash(loaded_cfg))
+        _run_ddp_worker(cfg, args)
         return
 
     raise ValueError(

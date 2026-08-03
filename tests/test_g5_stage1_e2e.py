@@ -19,7 +19,6 @@ from src import score_universe
 from src import train_egostitch as te
 from src.data import internal_holdout
 from src.experiments import b0_cal, g5_stage1, probes
-from src.experiments.e2e_binding import ACTIVE_V5_REGISTRATION_ID
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.e2e_model import EgoStitchE2E
 from src.score_universe import ScoresArtifact, load_scores, save_scores
@@ -50,65 +49,6 @@ pytestmark = pytest.mark.unit
 
 def _d(x: object) -> dict[str, Any]:
     return cast(dict[str, Any], x)
-
-
-_PREREG = {
-    "registration_id": "toy-prereg",
-    "status": "BINDING",
-    "seeds": [0],
-    "primary_criteria": {"decision_procedure": "single_seed_point_estimate_dominance"},
-    "failure_reading": "pre-registered failure reading text (verbatim)",
-    "decision_rules_5_2_verbatim": ["rule one", "rule two"],
-    "fidelity_validity_gate": {
-        "min_residual_std_ratio": 1e-5,
-        "max_spearman": 0.9999,
-        "max_topk_overlap": 0.9999,
-        "topk_fraction": 0.25,
-    },
-}
-
-
-def _write_prereg(tmp_path: Path, b0_path: Path | None = None) -> Path:
-    path = tmp_path / "prereg.json"
-    payload = dict(_PREREG)
-    if b0_path is not None:
-        g1_path = tmp_path / "g1_results.json"
-        g3_path = tmp_path / "g3_results.json"
-        g1_path.write_text("{}\n")
-        g3_path.write_text("{}\n")
-        payload["frozen_inputs"] = {
-            "b0_candidate_scores": {
-                "path": str(b0_path),
-                "sha256": hashlib.sha256(b0_path.read_bytes()).hexdigest(),
-                "checkpoint_id": "deadbeefcafefeed",
-            },
-            "g1_results": {
-                "path": str(g1_path),
-                "sha256": hashlib.sha256(g1_path.read_bytes()).hexdigest(),
-            },
-            "g3_results": {
-                "path": str(g3_path),
-                "sha256": hashlib.sha256(g3_path.read_bytes()).hexdigest(),
-            },
-        }
-        candidate_path = (
-            tmp_path / "data" / "benchmark_2025_neurips" / "toy" / "candidate_test_edges.txt"
-        )
-        if candidate_path.is_file():
-            _d(payload["frozen_inputs"])["candidate_manifest"] = {
-                "path": str(candidate_path),
-                "sha256": hashlib.sha256(candidate_path.read_bytes()).hexdigest(),
-            }
-        b0cal_path = tmp_path / "b0cal" / "b0cal_results.json"
-        if not b0cal_path.is_file():
-            b0cal_path.parent.mkdir(exist_ok=True)
-            b0cal_path.write_text("{}\n")
-        _d(payload["frozen_inputs"])["b0cal_results"] = {
-            "path": str(b0cal_path),
-            "sha256": hashlib.sha256(b0cal_path.read_bytes()).hexdigest(),
-        }
-    path.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n")
-    return path
 
 
 # --------------------------------------------------------------------------- e2e family:
@@ -220,9 +160,6 @@ def _write_e2e_universe_npz(
     permanent_null: str = "none",
     primary_logit: str = "full",
     scoring_arm: str = "full",
-    arm_kind: str = "trained_checkpoint",
-    checkpoint_arm: str = "full",
-    scoring_semantics: dict[str, object] | None = None,
 ) -> None:
     """Write a toy family-``egostitch_e2e`` four-array scores artifact."""
     access = score_universe._TestAccessContext(
@@ -261,15 +198,6 @@ def _write_e2e_universe_npz(
         },
         "permanent_null": permanent_null,
         "primary_logit": primary_logit,
-        "scoring_arm": scoring_arm,
-        "arm_kind": arm_kind,
-        "checkpoint_arm": checkpoint_arm,
-        "scoring_semantics": scoring_semantics
-        or {
-            "scaffold_control": scaffold_control,
-            "permanent_null": permanent_null,
-            "primary_logit": primary_logit,
-        },
         "test_access_ledger": access.ledger_binding,
     }
     arrays = {
@@ -328,38 +256,6 @@ def _rewrite_e2e_artifact(
         np.savez_compressed(path, **arrays)
 
 
-def _refresh_formal_run_metadata_hashes(inputs: dict[str, Any]) -> None:
-    """Model rescoring after a semantically valid run-metadata fixture rewrite."""
-    arm_paths = _d(inputs["arm_universe_paths"])
-    metadata_paths = _d(inputs["run_metadata_paths"])
-    registration_sha256 = hashlib.sha256(
-        cast(Path, inputs["preregistration_path"]).read_bytes()
-    ).hexdigest()
-    for metadata_path in metadata_paths.values():
-        metadata = json.loads(metadata_path.read_text())
-        metadata["preregistration_sha256"] = registration_sha256
-        metadata_path.write_text(json.dumps(metadata))
-    for name, artifact_path in arm_paths.items():
-        source_arm = "full" if name in g5_stage1._E2E_CONTROL_ARMS else name
-        artifact = load_scores(artifact_path)
-        meta = dict(artifact.meta)
-        provenance = dict(_d(meta["formal_scoring_provenance"]))
-        provenance["registration_sha256"] = registration_sha256
-        provenance["run_metadata_sha256"] = hashlib.sha256(
-            metadata_paths[source_arm].read_bytes()
-        ).hexdigest()
-        all_formal_arms = dict(_d(provenance["all_formal_arms"]))
-        for arm, metadata_path in metadata_paths.items():
-            arm_provenance = dict(_d(all_formal_arms[arm]))
-            arm_provenance["run_metadata_sha256"] = hashlib.sha256(
-                metadata_path.read_bytes()
-            ).hexdigest()
-            all_formal_arms[arm] = arm_provenance
-        provenance["all_formal_arms"] = all_formal_arms
-        meta["formal_scoring_provenance"] = provenance
-        _rewrite_e2e_artifact(artifact_path, meta=meta)
-
-
 _E2E_LIVENESS_CONFIG = {
     "min_residual_std_ratio": 1e-5,
     "max_spearman": 0.9999,
@@ -415,27 +311,6 @@ def test_real_probe_producer_artifact_is_accepted_by_g5_evaluator(
     )
     config_path = tmp_path / "config.yaml"
     probe_path = tmp_path / "probe.npz"
-    registration_path = cfg.preregistration
-    registration = {
-        "status": "BINDING",
-        "seeds": [0],
-        "probe_artifact": {
-            "format": "egostitch_e2e_probe_v2",
-            "source_arm": "full",
-            "expected_path": str(probe_path),
-        },
-        "arms": {
-            "full": {
-                "training": str(config_path),
-                "n_ground": 3,
-            }
-        },
-    }
-    registration_path.write_text(
-        json.dumps(registration, sort_keys=True),
-        encoding="utf-8",
-    )
-    registration_sha = hashlib.sha256(registration_path.read_bytes()).hexdigest()
 
     model = EgoStitchE2E(E2EConfig.from_mapping(model_config))
     checkpoint_path = tmp_path / "best.pt"
@@ -456,15 +331,9 @@ def test_real_probe_producer_artifact_is_accepted_by_g5_evaluator(
     run_metadata_path.write_text(
         json.dumps(
             {
-                "preregistration_sha256": registration_sha,
-                "run_kind": "formal",
-                "status": "complete",
-                "formal_artifacts_published": True,
-                "permanent_null": "none",
                 "seed": 0,
                 "partition_seed": 0,
                 "config_path": str(config_path),
-                "config_hash": te._config_hash(cfg),
                 "checkpoint_id": _state_digest(state)[:16],
             },
             sort_keys=True,
@@ -515,7 +384,6 @@ def test_real_probe_producer_artifact_is_accepted_by_g5_evaluator(
     probes.produce_e2e_probe_artifact(
         checkpoint_path=checkpoint_path,
         run_metadata_path=run_metadata_path,
-        preregistration_path=registration_path,
         data_root=data_root,
         strategy="toy",
         output_path=probe_path,
@@ -525,10 +393,8 @@ def test_real_probe_producer_artifact_is_accepted_by_g5_evaluator(
         produced_metadata = json.loads(str(archive["meta"].item()))
     assert produced_metadata["format"] == "egostitch_e2e_probe_v2"
 
-    report = g5_stage1._evaluate_registered_e2e_probe(
+    report = g5_stage1._evaluate_e2e_probe(
         probe_artifact_path=probe_path,
-        preregistration=registration,
-        preregistration_path=registration_path,
         run_metadata_path=run_metadata_path,
         data_root=data_root,
         strategy="toy",
@@ -538,29 +404,68 @@ def test_real_probe_producer_artifact_is_accepted_by_g5_evaluator(
     )
 
 
-def test_g5_evaluator_rejects_v1_probe_registration(tmp_path: Path) -> None:
-    with pytest.raises(
-        g5_stage1.PreregistrationMismatch,
-        match="egostitch_e2e_probe_v2.*egostitch_e2e_probe_v1.*rejected",
-    ):
-        g5_stage1._evaluate_registered_e2e_probe(
-            probe_artifact_path=tmp_path / "probe-v1.npz",
-            preregistration={
-                "probe_artifact": {
-                    "format": "egostitch_e2e_probe_v1",
-                    "expected_path": str(tmp_path / "probe-v1.npz"),
-                }
+def _validation_events(name: str, epochs: int) -> list[dict[str, object]]:
+    """One ``step_0`` row plus ``phase_a_end``/``epoch_end`` rows, in ordinal order."""
+    raw = [("step_0", 0), ("phase_a_end", 1)]
+    raw.extend(("epoch_end", epoch) for epoch in range(1, epochs + 1))
+    return [
+        {
+            "ordinal": ordinal,
+            "kind": kind,
+            "optimizer_step": step,
+            "arm": name,
+            "validation_role": "V_hold",
+        }
+        for ordinal, (kind, step) in enumerate(raw, start=1)
+    ]
+
+
+def _write_trained_arm_metadata(
+    tmp_path: Path, name: str, *, checkpoint_id: str
+) -> Path:
+    """Write one trained arm's minimal ``run_metadata.json`` plus its V_hold ledger."""
+    arm_dir = tmp_path / "runs" / name
+    arm_dir.mkdir(parents=True, exist_ok=True)
+    events_path = arm_dir / te.V_HOLD_VALIDATION_EVENTS_FILENAME
+    rows = _validation_events(name, epochs=3)
+    events_path.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
+    meta_path = arm_dir / "run_metadata.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "checkpoint_id": checkpoint_id,
+                "arm": name,
+                "run_kind": "formal",
+                "seed": 0,
+                "strategy": "toy",
+                "partition_seed": 0,
+                "config_path": str(tmp_path / f"{name}.yaml"),
+                "v_hold_validation_evidence": {
+                    "count": len(rows),
+                    "path": events_path.name,
+                    "sha256": hashlib.sha256(events_path.read_bytes()).hexdigest(),
+                },
+                "training_diagnostics": {
+                    "fidelity_series": [{"topology_delta_std": 0.1}],
+                    "gradient_norm_series": [
+                        {
+                            "step": 1,
+                            "grad_rms_trunk": 0.1,
+                            "grad_rms_ste": 0.1,
+                            "grad_rms_content": 0.1,
+                        }
+                    ],
+                },
             },
-            preregistration_path=tmp_path / "registration.json",
-            run_metadata_path=tmp_path / "run_metadata.json",
-            data_root=tmp_path / "data",
-            strategy="toy",
+            sort_keys=True,
         )
+    )
+    return meta_path
 
 
 def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
     """Toy benchmark + eight E2E arm universes + six trained-run metadata records."""
-    b0_universe_path, _val_path, data_root = _b0cal_toy_inputs(tmp_path)
+    _b0_universe_path, _val_path, data_root = _b0cal_toy_inputs(tmp_path)
     pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
     rng = np.random.default_rng(42)
     full = rng.normal(size=len(pairs))
@@ -575,33 +480,20 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
         )
     )
 
+    provenance_by_arm = {
+        "full": ("none", "none", "full"),
+        "b0_e2e_f_only": ("none", "all_head", "f_logit"),
+        "pair_topology": ("none", "content_head", "pair_topology"),
+        "p0": ("none", "none", "full"),
+        "no_l_rel": ("none", "none", "full"),
+        "row_layernorm": ("none", "none", "full"),
+        "structure_control_6a_v3": ("shuffle_within_pair_v3", "none", "full"),
+        "structure_control_6e_v1": ("rewire_checkerboard_v1", "none", "full"),
+    }
     arm_paths: dict[str, Path] = {}
-    for name in g5_stage1._E2E_ARMS:
-        provenance = {
-            "full": ("none", "none", "full"),
-            "b0_e2e_f_only": ("none", "all_head", "f_logit"),
-            "pair_topology": ("none", "content_head", "pair_topology"),
-            "p0": ("none", "none", "full"),
-            "no_l_rel": ("none", "none", "full"),
-            "row_layernorm": ("none", "none", "full"),
-            "structure_control_6a_v3": ("shuffle_within_pair_v3", "none", "full"),
-            "structure_control_6e_v1": ("rewire_checkerboard_v1", "none", "full"),
-        }[name]
-        kind = (
-            "scoring_time_control"
-            if name in g5_stage1._E2E_CONTROL_ARMS
-            else "trained_checkpoint"
-        )
-        checkpoint_arm = "full" if kind == "scoring_time_control" else name
-        scoring_semantics: dict[str, object] = {
-            "scaffold_control": provenance[0],
-            "permanent_null": provenance[1],
-            "primary_logit": provenance[2],
-        }
-        if kind == "scoring_time_control":
-            scoring_semantics.update(
-                {"seed": 0, "keying": "canonical_pair_v1", "checkpoint_arm": "full"}
-            )
+    for name in g5_stage1._ALL_ARMS:
+        scaffold_control, permanent_null, primary_logit = provenance_by_arm[name]
+        checkpoint_id = "ckpt_full" if name in g5_stage1._CONTROL_ARMS else f"ckpt_{name}"
         path = tmp_path / f"{name}.npz"
         _write_e2e_universe_npz(
             path,
@@ -612,325 +504,22 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
             pair_content=pair_content,
             pair_topology=pair_topology,
             labels=labels,
-            checkpoint_id=("ckpt_full" if kind == "scoring_time_control" else f"ckpt_{name}"),
-            scaffold_control=provenance[0],
-            permanent_null=provenance[1],
-            primary_logit=provenance[2],
+            checkpoint_id=checkpoint_id,
+            scaffold_control=scaffold_control,
+            permanent_null=permanent_null,
+            primary_logit=primary_logit,
             scoring_arm=name,
-            arm_kind=kind,
-            checkpoint_arm=checkpoint_arm,
-            scoring_semantics=scoring_semantics,
         )
         arm_paths[name] = path
 
-    preregistration_path = _write_prereg(tmp_path, b0_universe_path)
-    config_root = Path(__file__).resolve().parents[1] / "configs"
-    arm_config_paths = {
-        "full": config_root / "egostitch_e2e_v3_full_breadth_first.yaml",
-        "b0_e2e_f_only": config_root / "egostitch_e2e_v3_f_only_breadth_first.yaml",
-        "pair_topology": config_root / "egostitch_e2e_v3_pair_topology_breadth_first.yaml",
-        "p0": config_root / "egostitch_e2e_v3_p0_breadth_first.yaml",
-        "no_l_rel": config_root / "egostitch_e2e_v3_no_l_rel_breadth_first.yaml",
-        "row_layernorm": config_root / "egostitch_e2e_v3_row_layernorm_breadth_first.yaml",
+    run_metadata_paths: dict[str, Path] = {
+        name: _write_trained_arm_metadata(tmp_path, name, checkpoint_id=f"ckpt_{name}")
+        for name in g5_stage1._TRAINED_ARMS
     }
-    preregistration = json.loads(preregistration_path.read_text())
-    preregistration["benchmark"] = {"strategy": "toy"}
-    preregistration["arms"] = {
-        **{
-            name: {
-                "kind": "trained_checkpoint",
-                "training": str(path),
-                "scoring_provenance": {
-                    "scaffold_control": {
-                        "full": "none",
-                        "b0_e2e_f_only": "none",
-                        "pair_topology": "none",
-                        "p0": "none",
-                        "no_l_rel": "none",
-                        "row_layernorm": "none",
-                    }[name],
-                    "permanent_null": {
-                        "full": "none",
-                        "b0_e2e_f_only": "all_head",
-                        "pair_topology": "content_head",
-                        "p0": "none",
-                        "no_l_rel": "none",
-                        "row_layernorm": "none",
-                    }[name],
-                    "primary_logit": {
-                        "full": "full",
-                        "b0_e2e_f_only": "f_logit",
-                        "pair_topology": "pair_topology",
-                        "p0": "full",
-                        "no_l_rel": "full",
-                        "row_layernorm": "full",
-                    }[name],
-                },
-            }
-            for name, path in arm_config_paths.items()
-        },
-        "structure_control_6a_v3": {
-            "kind": "scoring_time_control",
-            "training": None,
-            "checkpoint_arm": "full",
-            "scoring_provenance": {
-                "scaffold_control": "shuffle_within_pair_v3",
-                "seed": 0,
-                "keying": "canonical_pair_v1",
-                "permanent_null": "none",
-                "primary_logit": "full",
-                "checkpoint_arm": "full",
-            },
-        },
-        "structure_control_6e_v1": {
-            "kind": "scoring_time_control",
-            "training": None,
-            "checkpoint_arm": "full",
-            "scoring_provenance": {
-                "scaffold_control": "rewire_checkerboard_v1",
-                "seed": 0,
-                "keying": "canonical_pair_v1",
-                "permanent_null": "none",
-                "primary_logit": "full",
-                "checkpoint_arm": "full",
-            },
-        },
-    }
-    def validation_events(name: str, run_kind: str, epochs: int) -> list[dict[str, object]]:
-        raw = [("step_0", None, 0), ("phase_a_end", 1, 1)]
-        raw.extend(("epoch_end", epoch, epoch) for epoch in range(1, epochs + 1))
-        return [
-            {
-                "ordinal": ordinal,
-                "kind": kind,
-                "epoch": epoch,
-                "optimizer_step": step,
-                "run_kind": run_kind,
-                "arm": name,
-                "validation_role": "V_hold",
-            }
-            for ordinal, (kind, epoch, step) in enumerate(raw, start=1)
-        ]
-
-    implementation_commit = "4" * 40
-    preregistration["config_artifacts"] = {
-            name: {
-                "path": str(path),
-                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            }
-            for name, path in arm_config_paths.items()
-    }
-    preregistration["run_evidence_placeholders"] = {
-        "schema_version": "egostitch_e2e_run_provenance_v1",
-        "implementation": None,
-        "parameter_group_manifests": None,
-        "packs_and_validation_manifests": None,
-        "boundary_access_audit": None,
-        "runtime_and_peak_memory": None,
-        "checkpoint_policy_version": None,
-    }
-    preregistration.pop("binding_evidence", None)
-    preregistration["evaluator"] = {"seed": 0}
-    preregistration["registration_id"] = ACTIVE_V5_REGISTRATION_ID
-    preregistration_path.write_text(json.dumps(preregistration, sort_keys=True, indent=2) + "\n")
-    preregistration_sha256 = hashlib.sha256(preregistration_path.read_bytes()).hexdigest()
-    run_metadata_paths: dict[str, Path] = {}
-    for name in g5_stage1._E2E_FORMAL_ARMS:
-        permanent_null, p_topo, p_cont = {
-            "full": ("none", 0.15, 0.15),
-            "b0_e2e_f_only": ("all_head", 0.15, 0.15),
-            "pair_topology": ("content_head", 0.15, 0.15),
-            "p0": ("none", 0.0, 0.0),
-            "no_l_rel": ("none", 0.15, 0.15),
-            "row_layernorm": ("none", 0.15, 0.15),
-        }[name]
-        scoring_semantics = cast(
-            dict[str, object], preregistration["arms"][name]["scoring_provenance"]
-        )
-        # One directory per arm, as `_publish_staged` produces: the margin
-        # verdict is read from beside the run metadata it certifies.
-        arm_run_dir = tmp_path / "runs" / name
-        arm_run_dir.mkdir(parents=True, exist_ok=True)
-        meta_path = arm_run_dir / "run_metadata.json"
-        formal_events = arm_run_dir / te.V_HOLD_VALIDATION_EVENTS_FILENAME
-        formal_event_rows = validation_events(name, "formal", 3)
-        formal_events.write_text(
-            "".join(json.dumps(row, sort_keys=True) + "\n" for row in formal_event_rows)
-        )
-        parameter_names = {"generator": ["generator.weight"]}
-        parameter_groups = {
-            "names": parameter_names,
-            "sha256": {
-                group: hashlib.sha256(("\n".join(names) + "\n").encode()).hexdigest()
-                for group, names in parameter_names.items()
-            },
-        }
-        peak_memory = [1.0, 1.0, 1.0, 1.0]
-        access_audit = {"observed_training_access": []}
-        validation_evidence = {
-            "schema": "egostitch_e2e_v_hold_validation_events_v1",
-            "count": len(formal_event_rows),
-            "path": formal_events.name,
-            "sha256": hashlib.sha256(formal_events.read_bytes()).hexdigest(),
-        }
-        meta_path.write_text(
-            json.dumps(
-                {
-                    "preregistration_sha256": preregistration_sha256,
-                    "checkpoint_id": f"ckpt_{name}",
-                    "arm": name,
-                    "arm_kind": "trained_checkpoint",
-                    "checkpoint_arm": name,
-                    "scoring_semantics": scoring_semantics,
-                    "run_kind": "formal",
-                    "formal_artifacts_published": True,
-                    "status": "complete",
-                    "validation_role": "V_hold",
-                    "v_hold_validation_evidence": validation_evidence,
-                    "world_size": 4,
-                    "feature_stats_sha256": "c" * 64,
-                    "implementation_tracked_clean": True,
-                    "implementation_tracked_status_sha256": hashlib.sha256(b"").hexdigest(),
-                    "access_audit": access_audit,
-                    "selected_checkpoint_eligible": True,
-                    "model_family": "egostitch_e2e",
-                    "permanent_null": permanent_null,
-                    "p_topo": p_topo,
-                    "p_cont": p_cont,
-                    "seed": 0,
-                    "strategy": "toy",
-                    "partition_seed": 0,
-                    "config_path": str(arm_config_paths[name].resolve()),
-                    "config_hash": te._config_hash(te.load_config(arm_config_paths[name])),
-                    "config_sha256": hashlib.sha256(
-                        arm_config_paths[name].read_bytes()
-                    ).hexdigest(),
-                    "checkpoint_sha256": hashlib.sha256(
-                        f"checkpoint:{name}".encode()
-                    ).hexdigest(),
-                    "implementation_commit": implementation_commit,
-                    "run_provenance": {
-                        "schema_version": "egostitch_e2e_run_provenance_v1",
-                        "implementation": {
-                            "commit": implementation_commit,
-                            "tracked_clean": True,
-                            "tracked_status_sha256": hashlib.sha256(b"").hexdigest(),
-                        },
-                        "parameter_group_manifests": parameter_groups,
-                        "packs_and_validation_manifests": {
-                            "pipeline_profile_path": "profile.json",
-                            "feature_stats_sha256": "c" * 64,
-                            "v_hold_validation_evidence": validation_evidence,
-                        },
-                        "boundary_access_audit": access_audit,
-                        "runtime_and_peak_memory": {
-                            "world_size": 4,
-                            "epochs_completed": 3,
-                            "optimizer_steps": 3,
-                            "peak_memory_gib_per_rank": peak_memory,
-                        },
-                        "checkpoint_policy_version": (
-                            "egostitch_e2e_all_completed_epochs_v1"
-                        ),
-                    },
-                    "training_diagnostics": {
-                        "fidelity_series": [{"topology_delta_std": 0.1}],
-                        "gradient_norm_series": [
-                            {
-                                "step": 1,
-                                "grad_rms_trunk": 0.1,
-                                "grad_rms_ste": 0.1,
-                                "grad_rms_content": 0.1,
-                            }
-                        ],
-                        "kendall_fallback": {"active": False},
-                    },
-                }
-            )
-        )
-        (arm_run_dir / "profile.json").write_text(
-            json.dumps(
-                {
-                    "parameter_groups": parameter_groups,
-                    "peak_memory_gib_per_rank": peak_memory,
-                    "world_size": 4,
-                    "pack_manifest": {},
-                    "pack_identity_sha256": "d" * 64,
-                    "pack_evidence": {},
-                }
-            )
-        )
-        (arm_run_dir / "metrics.jsonl").write_text(
-            "".join(
-                json.dumps({"epoch": epoch, "auprc": 0.2, "fidelity": {"prevalence": 0.01}})
-                + "\n"
-                for epoch in (1, 2, 3)
-            )
-        )
-        run_metadata_paths[name] = meta_path
-
-    for name, artifact_path in arm_paths.items():
-        source_arm = "full" if name in g5_stage1._E2E_CONTROL_ARMS else name
-        metadata_path = run_metadata_paths[source_arm]
-        metadata = json.loads(metadata_path.read_text())
-        scoring_registration = preregistration["arms"][name]
-        artifact = load_scores(artifact_path)
-        artifact_meta = dict(artifact.meta)
-        run_provenance_by_arm = {
-            arm: score_universe._validate_e2e_run_provenance(
-                json.loads(run_metadata_paths[arm].read_text()),
-                run_metadata_path=run_metadata_paths[arm],
-            )
-            for arm in g5_stage1._E2E_FORMAL_ARMS
-        }
-        source_run_provenance = run_provenance_by_arm[source_arm]
-        artifact_meta["formal_scoring_provenance"] = {
-            "arm": source_arm,
-            "arm_kind": scoring_registration["kind"],
-            "checkpoint_arm": source_arm,
-            "scoring_semantics": scoring_registration["scoring_provenance"],
-            "registration_sha256": preregistration_sha256,
-            "run_metadata_sha256": hashlib.sha256(metadata_path.read_bytes()).hexdigest(),
-            "config_path": str(arm_config_paths[source_arm].resolve()),
-            "config_sha256": metadata["config_sha256"],
-            "checkpoint_sha256": metadata["checkpoint_sha256"],
-            "implementation_commit": implementation_commit,
-            "selected_checkpoint_eligible": True,
-            "run_provenance_sha256": source_run_provenance["run_provenance_sha256"],
-            "runtime_profile_sha256": source_run_provenance["runtime_profile_sha256"],
-            "checkpoint_policy_version": source_run_provenance[
-                "checkpoint_policy_version"
-            ],
-            "scoring_arm": name,
-            "all_formal_arms": {
-                arm: {
-                    "run_metadata_sha256": hashlib.sha256(
-                        run_metadata_paths[arm].read_bytes()
-                    ).hexdigest(),
-                    "checkpoint_sha256": json.loads(
-                        run_metadata_paths[arm].read_text()
-                    )["checkpoint_sha256"],
-                    "config_sha256": preregistration["config_artifacts"][arm]["sha256"],
-                    "run_provenance_sha256": run_provenance_by_arm[arm][
-                        "run_provenance_sha256"
-                    ],
-                    "runtime_profile_sha256": run_provenance_by_arm[arm][
-                        "runtime_profile_sha256"
-                    ],
-                    "checkpoint_policy_version": run_provenance_by_arm[arm][
-                        "checkpoint_policy_version"
-                    ],
-                    "selected_checkpoint_eligible": True,
-                }
-                for arm in g5_stage1._E2E_FORMAL_ARMS
-            },
-        }
-        _rewrite_e2e_artifact(artifact_path, meta=artifact_meta)
 
     return {
         "arm_universe_paths": arm_paths,
         "run_metadata_paths": run_metadata_paths,
-        "preregistration_path": preregistration_path,
         "data_root": data_root,
         "strategy": "toy",
     }
@@ -947,8 +536,6 @@ def _probe_v2_report(tmp_path: Path) -> tuple[Path, dict[str, object]]:
     rng = np.random.default_rng(17)
     metadata: dict[str, object] = {
         "checkpoint_id": "probe-checkpoint",
-        "registration_sha256": "a" * 64,
-        "config_hash": "b" * 64,
         "seed": 0,
         "partition_seed": 0,
         "strategy": "toy",
@@ -1009,69 +596,19 @@ def _markdown_table(markdown: str, heading: str) -> dict[str, dict[str, str]]:
 
 
 class TestBuildE2EArmSummary:
-    def test_requires_scorer_emitted_formal_provenance(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        full_path = _d(inputs["arm_universe_paths"])["full"]
-        artifact = load_scores(full_path)
-        meta = dict(artifact.meta)
-        meta.pop("formal_scoring_provenance", None)
-        _rewrite_e2e_artifact(full_path, meta=meta)
-
-        with pytest.raises(ValueError, match="formal_scoring_provenance"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_rejects_formal_artifact_missing_test_access_ledger(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        full_path = _d(inputs["arm_universe_paths"])["full"]
-        artifact = load_scores(full_path)
-        meta = dict(artifact.meta)
-        meta.pop("test_access_ledger")
-        _rewrite_e2e_artifact(full_path, meta=meta)
-
-        with pytest.raises(ValueError, match="missing test_access_ledger"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_rejects_tampered_test_access_ledger(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        ledger_path = tmp_path / "test_access_ledger.jsonl"
-        lines = ledger_path.read_text().splitlines()
-        first = json.loads(lines[0])
-        first["seed"] = 7
-        lines[0] = json.dumps(first, sort_keys=True)
-        ledger_path.write_text("\n".join(lines) + "\n")
-
-        with pytest.raises(ValueError, match="digest mismatch"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
     def test_all_eight_arms_reported_and_rerun_is_deterministic(self, tmp_path: Path) -> None:
         inputs = _eight_arm_inputs(tmp_path)
         payload = g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
         arms = _d(payload["arms"])
-        assert set(arms) == set(g5_stage1._E2E_ARMS)
-        expected_sha = hashlib.sha256(_d(inputs)["preregistration_path"].read_bytes()).hexdigest()
-        assert payload["registration_sha256"] == expected_sha
-        for name in g5_stage1._E2E_ARMS:
+        assert set(arms) == set(g5_stage1._ALL_ARMS)
+        for name in g5_stage1._ALL_ARMS:
             row = _d(arms[name])
             expected_checkpoint = (
-                "ckpt_full" if name in g5_stage1._E2E_CONTROL_ARMS else f"ckpt_{name}"
+                "ckpt_full" if name in g5_stage1._CONTROL_ARMS else f"ckpt_{name}"
             )
             assert row["checkpoint_id"] == expected_checkpoint
             assert "graph_similarity" in _d(row["assembled"])
-        # Scoring controls have no run metadata, but inherit the full checkpoint.
-        assert _d(arms["structure_control_6a_v3"])["registration_sha256"] == expected_sha
-        assert _d(arms["structure_control_6e_v1"])["registration_sha256"] == expected_sha
-        assert _d(arms["full"])["registration_sha256"] == expected_sha
-        disclosure = _d(payload["v_hold_evaluation_disclosure"])
-        trained = _d(disclosure["trained_arms"])
-        assert set(trained) == set(g5_stage1._E2E_FORMAL_ARMS)
-        for name in g5_stage1._E2E_FORMAL_ARMS:
-            assert _d(trained[name])["k_cumulative"] == 5
-            assert "qualification" not in _d(trained[name])
-            assert _d(_d(trained[name])["formal"])["count"] == 5
-        controls = _d(disclosure["scoring_time_controls"])
-        assert set(controls) == set(g5_stage1._E2E_CONTROL_ARMS)
-        assert all(_d(row)["k_cumulative"] is None for row in controls.values())
         liveness = _d(payload["liveness"])
         assert liveness["residual_std"] > 0
         structure_control = _d(payload["structure_control"])
@@ -1079,7 +616,7 @@ class TestBuildE2EArmSummary:
         assert structure_control["seed"] == 0
         assert structure_control["passed"] is (structure_control["lower_bound"] > 0.0)
         decomposition = _d(payload["decomposition"])
-        assert set(_d(decomposition["arms"])) == set(g5_stage1._E2E_ARMS)
+        assert set(_d(decomposition["arms"])) == set(g5_stage1._ALL_ARMS)
         full_deltas = _d(_d(_d(decomposition["arms"])["full"])["deltas"])
         assert set(full_deltas) == {
             "full_minus_f_logit",
@@ -1089,31 +626,10 @@ class TestBuildE2EArmSummary:
         rerun = g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
         assert json.dumps(payload, sort_keys=True) == json.dumps(rerun, sort_keys=True)
 
-    def test_vhold_disclosure_requires_adjacent_formal_event_ledger(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        metadata_path = _d(inputs["run_metadata_paths"])["full"]
-        metadata_path.with_name(te.V_HOLD_VALIDATION_EVENTS_FILENAME).unlink()
-
-        with pytest.raises(ValueError, match="validation ledger is missing or hash-mismatched"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
     def test_rejects_unknown_arm(self, tmp_path: Path) -> None:
         inputs = _eight_arm_inputs(tmp_path)
         inputs["arm_universe_paths"] = dict(inputs["arm_universe_paths"])
         inputs["arm_universe_paths"]["bogus"] = inputs["arm_universe_paths"]["full"]
-        with pytest.raises(ValueError, match="unrecognized"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_rejects_v2_five_arm_package(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        arm_paths = _d(inputs["arm_universe_paths"])
-        inputs["arm_universe_paths"] = {
-            "full": arm_paths["full"],
-            "b0_e2e_f_only": arm_paths["b0_e2e_f_only"],
-            "pair_topology": arm_paths["pair_topology"],
-            "structure_control_6a": arm_paths["structure_control_6a_v3"],
-            "p0": arm_paths["p0"],
-        }
         with pytest.raises(ValueError, match="unrecognized"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
@@ -1132,38 +648,38 @@ class TestBuildE2EArmSummary:
         with pytest.raises(ValueError, match="exactly the eight registered arms"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
-    def test_requires_all_six_trained_run_metadata_records(self, tmp_path: Path) -> None:
+    def test_rejects_candidate_pair_order_swap(self, tmp_path: Path) -> None:
         inputs = _eight_arm_inputs(tmp_path)
-        inputs["run_metadata_paths"] = dict(inputs["run_metadata_paths"])
-        inputs["run_metadata_paths"].pop("p0")
-        with pytest.raises(ValueError, match="exactly the six trained"):
+        path = _d(inputs["arm_universe_paths"])["p0"]
+        artifact = load_scores(path)
+        pairs = list(artifact.pairs())
+        pairs[0], pairs[1] = pairs[1], pairs[0]
+        labels = artifact.label.copy()
+        labels[[0, 1]] = labels[[1, 0]]
+        _rewrite_e2e_artifact(path, pairs=pairs, labels=labels)
+        with pytest.raises(ValueError, match="pair identity/order"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
-    @pytest.mark.parametrize("registration", [None, ""])
-    def test_requires_nonempty_shared_registration_hash(
-        self, tmp_path: Path, registration: str | None
-    ) -> None:
+    def test_rejects_candidate_label_mutation(self, tmp_path: Path) -> None:
         inputs = _eight_arm_inputs(tmp_path)
-        metadata_path = _d(inputs["run_metadata_paths"])["p0"]
-        payload = json.loads(metadata_path.read_text())
-        payload.pop("preregistration_sha256")
-        if registration is not None:
-            payload["preregistration_sha256"] = registration
-        metadata_path.write_text(json.dumps(payload))
-        with pytest.raises(ValueError, match="non-empty preregistration_sha256"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_rejects_formal_artifact_checkpoint_mismatch(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        metadata_path = _d(inputs["run_metadata_paths"])["pair_topology"]
-        payload = json.loads(metadata_path.read_text())
-        payload["checkpoint_id"] = "wrong"
-        metadata_path.write_text(json.dumps(payload))
-        _refresh_formal_run_metadata_hashes(inputs)
-        with pytest.raises(ValueError, match="checkpoint_id mismatch"):
+        path = _d(inputs["arm_universe_paths"])["p0"]
+        artifact = load_scores(path)
+        labels = artifact.label.copy()
+        labels[0] = 1 - labels[0]
+        _rewrite_e2e_artifact(path, labels=labels)
+        with pytest.raises(ValueError, match="candidate labels"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
     def test_requires_6a_to_use_full_scoring_checkpoint(self, tmp_path: Path) -> None:
+        """The surviving checkpoint_id check: a control must reuse full's checkpoint.
+
+        Restores the regression test deleted in error during the P0
+        registration excision (adversarial-review finding 5): the check
+        itself (`build_e2e_arm_summary`'s ``{name} checkpoint_id mismatch``
+        raise) survived the excision, but its only test did not. Rebuilt
+        here against the current post-excision fixtures rather than the
+        deleted registration-based ones.
+        """
         inputs = _eight_arm_inputs(tmp_path)
         pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
         rng = np.random.default_rng(123)
@@ -1179,179 +695,42 @@ class TestBuildE2EArmSummary:
             checkpoint_id="ckpt_not_full",
             scaffold_control="shuffle_within_pair_v3",
             scoring_arm="structure_control_6a_v3",
-            arm_kind="scoring_time_control",
-            checkpoint_arm="full",
-            scoring_semantics={
-                "scaffold_control": "shuffle_within_pair_v3",
-                "seed": 0,
-                "keying": "canonical_pair_v1",
-                "permanent_null": "none",
-                "primary_logit": "full",
-                "checkpoint_arm": "full",
-            },
         )
         with pytest.raises(ValueError, match="structure_control_6a_v3 checkpoint_id"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
-    def test_registration_hash_mismatch_rejected(self, tmp_path: Path) -> None:
+    def test_rejects_swapped_scaffold_control_arms(self, tmp_path: Path) -> None:
+        """Swapping the two control NPZ paths must be caught by arm-semantic validation.
+
+        Both controls share `full`'s checkpoint_id, so the checkpoint_id
+        check cannot tell them apart. `_validate_scaffold_control_arm_semantics`
+        reads each artifact's own `meta["scaffold_control"]["mode"]` and
+        requires it to match the arm slot it was supplied under
+        (adversarial-review finding 3).
+        """
         inputs = _eight_arm_inputs(tmp_path)
-        bad_meta = tmp_path / "bad_meta.json"
-        payload = json.loads(_d(inputs)["run_metadata_paths"]["p0"].read_text())
-        payload["preregistration_sha256"] = "b" * 64
-        bad_meta.write_text(json.dumps(payload))
-        inputs["run_metadata_paths"] = dict(inputs["run_metadata_paths"])
-        inputs["run_metadata_paths"]["p0"] = bad_meta
-        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="does not match"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_rejects_debug_run_metadata(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        metadata_path = _d(inputs)["run_metadata_paths"]["full"]
-        metadata = json.loads(metadata_path.read_text())
-        metadata.update({"run_kind": "debug", "formal_artifacts_published": False})
-        metadata_path.write_text(json.dumps(metadata))
-
-        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="debug/non-formal"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_requires_completed_formal_run_metadata(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        metadata_path = _d(inputs)["run_metadata_paths"]["full"]
-        metadata = json.loads(metadata_path.read_text())
-        metadata.pop("formal_artifacts_published")
-        metadata_path.write_text(json.dumps(metadata))
-
-        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="exactly true"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_rejects_one_full_run_masquerading_as_all_formal_arms(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        full = _d(inputs)["run_metadata_paths"]["full"]
-        inputs["run_metadata_paths"] = dict.fromkeys(g5_stage1._E2E_FORMAL_ARMS, full)
-        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="distinct run metadata"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_rejects_wrong_registered_arm_semantics(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        path = _d(inputs)["run_metadata_paths"]["p0"]
-        metadata = json.loads(path.read_text())
-        metadata["p_topo"] = 0.15
-        path.write_text(json.dumps(metadata))
-        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="branch dropout"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    @pytest.mark.parametrize(
-        ("field", "value", "match"),
-        [
-            # `seed` is now bound to the registration's declared `seeds` list
-            # rather than hard-pinned to 0 (multi-seed screens are permitted,
-            # still at `evidence_class: engineering`); the toy registration
-            # declares `[0]`, so 1 is still refused -- by the registered-list
-            # membership test, not by a literal zero pin.
-            ("seed", 1, r"training seed 1 is not one of the registered seeds"),
-            ("strategy", "alternate", "strategy does not match"),
-            # `partition_seed` is NOT relaxed: it selects G_struct and the
-            # whole pair universe, so it stays pinned at 0.
-            ("partition_seed", 1, "partition_seed must be 0"),
-            ("config_hash", "0" * 64, "config_hash does not match"),
-        ],
-    )
-    def test_rejects_wrong_registered_run_identity(
-        self, tmp_path: Path, field: str, value: object, match: str
-    ) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        path = _d(inputs)["run_metadata_paths"]["full"]
-        metadata = json.loads(path.read_text())
-        metadata[field] = value
-        path.write_text(json.dumps(metadata))
-        with pytest.raises(g5_stage1.RegistrationShaMismatch, match=match):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_rejects_wrong_registered_config_path(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        path = _d(inputs)["run_metadata_paths"]["full"]
-        metadata = json.loads(path.read_text())
-        metadata["config_path"] = json.loads(_d(inputs)["run_metadata_paths"]["p0"].read_text())[
-            "config_path"
-        ]
-        path.write_text(json.dumps(metadata))
-        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="config_path"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_captured_registration_snapshot_is_not_reopened(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        preregistration_path = _d(inputs)["preregistration_path"]
-        snapshot = g5_stage1._preregistration_snapshot(preregistration_path)
-        preregistration_path.write_text(json.dumps({"status": "DRAFT"}))
-        payload = g5_stage1.build_e2e_arm_summary(
-            liveness_config=_E2E_LIVENESS_CONFIG,
-            preregistration_snapshot=snapshot,
-            **inputs,
+        paths = _d(inputs["arm_universe_paths"])
+        paths["structure_control_6a_v3"], paths["structure_control_6e_v1"] = (
+            paths["structure_control_6e_v1"],
+            paths["structure_control_6a_v3"],
         )
-        assert payload["registration_sha256"] == snapshot[1]
-
-    @pytest.mark.parametrize(
-        ("arm", "field", "value", "match"),
-        [
-            ("full", "permanent_null", "all_head", "permanent_null"),
-            ("p0", "primary_logit", "pair_topology", "primary_logit"),
-            ("structure_control_6a_v3", "control_seed", 1, "scaffold_control"),
-            ("structure_control_6a_v3", "control_keying", "wrong", "scaffold_control"),
-            ("full", "control_mode", "shuffle_within_pair_v3", "scaffold_control"),
-        ],
-    )
-    def test_rejects_each_mutated_score_provenance_field(
-        self,
-        tmp_path: Path,
-        arm: str,
-        field: str,
-        value: object,
-        match: str,
-    ) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        path = _d(inputs["arm_universe_paths"])[arm]
-        artifact = load_scores(path)
-        meta = dict(artifact.meta)
-        if field.startswith("control_"):
-            control = dict(cast(dict[str, object], meta["scaffold_control"]))
-            control[field.removeprefix("control_")] = value
-            meta["scaffold_control"] = control
-        else:
-            meta[field] = value
-        _rewrite_e2e_artifact(path, meta=meta)
-        with pytest.raises((ValueError, g5_stage1.RegistrationShaMismatch), match=match):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_rejects_candidate_pair_order_swap(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        path = _d(inputs["arm_universe_paths"])["p0"]
-        artifact = load_scores(path)
-        pairs = list(artifact.pairs())
-        pairs[0], pairs[1] = pairs[1], pairs[0]
-        labels = artifact.label.copy()
-        labels[[0, 1]] = labels[[1, 0]]
-        _rewrite_e2e_artifact(path, pairs=pairs, labels=labels)
-        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="pair identity/order"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_rejects_candidate_label_mutation(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        path = _d(inputs["arm_universe_paths"])["p0"]
-        artifact = load_scores(path)
-        labels = artifact.label.copy()
-        labels[0] = 1 - labels[0]
-        _rewrite_e2e_artifact(path, labels=labels)
-        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="candidate labels"):
-            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_plan_rejects_non_digest_b0cal_identity(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        preregistration_path = _d(inputs)["preregistration_path"]
-        registration = json.loads(preregistration_path.read_text())
-        registration["frozen_inputs"]["b0cal_results"]["sha256"] = "REQUIRED-BEFORE-BINDING"
-        preregistration_path.write_text(json.dumps(registration))
         with pytest.raises(
-            g5_stage1.PreregistrationMismatch, match="real frozen b0cal_results"
+            ValueError, match="structure_control_6a_v3.*requires scaffold_control.mode"
+        ):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_rejects_unperturbed_full_artifact_passed_as_control(self, tmp_path: Path) -> None:
+        """An unperturbed `full` artifact substituted for a control must be rejected.
+
+        This artifact shares `full`'s checkpoint_id trivially (it *is*
+        full's artifact), so only the scaffold-control arm-semantic check
+        catches it (adversarial-review finding 3).
+        """
+        inputs = _eight_arm_inputs(tmp_path)
+        paths = _d(inputs["arm_universe_paths"])
+        paths["structure_control_6a_v3"] = paths["full"]
+        with pytest.raises(
+            ValueError, match="structure_control_6a_v3.*requires scaffold_control.mode"
         ):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
@@ -1363,7 +742,6 @@ class TestBuildE2EArmSummary:
         metadata = json.loads(metadata_path.read_text())
         del metadata["training_diagnostics"]["gradient_norm_series"][0]["grad_rms_content"]
         metadata_path.write_text(json.dumps(metadata))
-        _refresh_formal_run_metadata_hashes(inputs)
         g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
     def test_nested_worker_submodule_rms_shape_is_accepted(self, tmp_path: Path) -> None:
@@ -1376,41 +754,7 @@ class TestBuildE2EArmSummary:
             }
             row["submodule_gradient_rms"] = nested
             metadata_path.write_text(json.dumps(metadata))
-        _refresh_formal_run_metadata_hashes(inputs)
         g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-
-    def test_formal_evaluator_seed_must_be_zero(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        preregistration = json.loads(_d(inputs)["preregistration_path"].read_text())
-        g5_stage1._enforce_e2e_evaluator_seed(preregistration, 0)
-        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="seed 0"):
-            g5_stage1._enforce_e2e_evaluator_seed(preregistration, 1)
-
-    def test_b0cal_comparator_path_and_digest_are_exact(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
-        preregistration_path = _d(inputs)["preregistration_path"]
-        preregistration = json.loads(preregistration_path.read_text())
-        frozen = preregistration["frozen_inputs"]
-        b0_path = Path(frozen["b0_candidate_scores"]["path"])
-        b0cal_path = Path(frozen["b0cal_results"]["path"])
-        assert (
-            g5_stage1.enforce_e2e_frozen_inputs(
-                preregistration, preregistration_path, b0_path, b0cal_path
-            )
-            == b0cal_path.resolve()
-        )
-
-        copy = tmp_path / "copied_b0cal_results.json"
-        copy.write_bytes(b0cal_path.read_bytes())
-        with pytest.raises(g5_stage1.PreregistrationMismatch, match="path mismatch"):
-            g5_stage1.enforce_e2e_frozen_inputs(
-                preregistration, preregistration_path, b0_path, copy
-            )
-        b0cal_path.write_text('{"mutated": true}\n')
-        with pytest.raises(g5_stage1.PreregistrationMismatch, match="sha256 mismatch"):
-            g5_stage1.enforce_e2e_frozen_inputs(
-                preregistration, preregistration_path, b0_path, b0cal_path
-            )
 
 
 def test_formal_gate_reports_rev31_telemetry_without_changing_verdict(
@@ -1419,25 +763,19 @@ def test_formal_gate_reports_rev31_telemetry_without_changing_verdict(
 ) -> None:
     """The real gate writer must headline all nonbinding rev-3.1 telemetry."""
     inputs = _eight_arm_inputs(tmp_path)
-    preregistration_path = cast(Path, inputs["preregistration_path"])
-    registration = json.loads(preregistration_path.read_text())
-    frozen = _d(registration["frozen_inputs"])
-    b0_universe_path = Path(cast(str, _d(frozen["b0_candidate_scores"])["path"]))
+    data_root = cast(Path, inputs["data_root"])
+    b0_universe_path = tmp_path / "universe.npz"
     b0cal_output_dir = tmp_path / "b0cal"
     b0_cal.run_b0_cal_pipeline(
         universe_path=b0_universe_path,
         val_scores_path=tmp_path / "val.npz",
-        data_root=cast(Path, inputs["data_root"]),
+        data_root=data_root,
         strategy="toy",
         output_dir=b0cal_output_dir,
         seed=0,
         skip_perturbation_check=True,
     )
     b0cal_results_path = b0cal_output_dir / "b0cal_results.json"
-    _d(frozen["b0cal_results"])["sha256"] = hashlib.sha256(
-        b0cal_results_path.read_bytes()
-    ).hexdigest()
-    preregistration_path.write_text(json.dumps(registration, sort_keys=True, indent=2) + "\n")
 
     expected_correlations: dict[str, float] = {}
     for index, (arm, metadata_path) in enumerate(
@@ -1450,7 +788,6 @@ def test_formal_gate_reports_rev31_telemetry_without_changing_verdict(
         ] = correlation
         metadata_path.write_text(json.dumps(metadata))
         expected_correlations[arm] = correlation
-    _refresh_formal_run_metadata_hashes(inputs)
 
     summary = g5_stage1.build_e2e_arm_summary(
         liveness_config=_E2E_LIVENESS_CONFIG,
@@ -1465,18 +802,8 @@ def test_formal_gate_reports_rev31_telemetry_without_changing_verdict(
     monkeypatch.setattr(g5_stage1, "build_e2e_arm_summary", _summary)
     monkeypatch.setattr(
         g5_stage1,
-        "_evaluate_registered_e2e_probe",
+        "_evaluate_e2e_probe",
         lambda **_kwargs: probe_report,
-    )
-    gate_registration = cast(dict[str, object], json.loads(json.dumps(registration)))
-    gate_registration["benchmark"] = {"strategy": "breadth_first"}
-    monkeypatch.setattr(
-        g5_stage1,
-        "_preregistration_snapshot",
-        lambda _path: (
-            gate_registration,
-            hashlib.sha256(preregistration_path.read_bytes()).hexdigest(),
-        ),
     )
     b0_row = g5_stage1.AssembledRow(
         threshold=0.5,
@@ -1510,25 +837,34 @@ def test_formal_gate_reports_rev31_telemetry_without_changing_verdict(
         },
     )
 
-    def run_gate(output_dir: Path) -> dict[str, object]:
+    def run_gate(output_dir: Path, *, seed: int = 0) -> dict[str, object]:
         return g5_stage1.run_g5_e2e_stage1_pipeline(
             arm_universe_paths=_d(inputs["arm_universe_paths"]),
             run_metadata_paths=_d(inputs["run_metadata_paths"]),
             b0_universe_path=b0_universe_path,
             b0cal_results_path=b0cal_results_path,
             probe_artifact_path=probe_path,
-            preregistration_path=preregistration_path,
-            data_root=cast(Path, inputs["data_root"]),
+            data_root=data_root,
             strategy="toy",
             output_dir=output_dir,
+            seed=seed,
         )
 
     reported_dir = tmp_path / "reported-gate"
-    reported = run_gate(reported_dir)
+    # Every trained arm's run metadata (`_write_trained_arm_metadata`) records
+    # `seed: 0`; passing a distinct evaluation `--seed` here proves the two
+    # values in the emitted metadata are independently sourced, not one
+    # field silently duplicated as the other (adversarial-review finding 4).
+    reported = run_gate(reported_dir, seed=3)
     reported_json = json.loads(
         (reported_dir / "g5_e2e_stage1_results.json").read_text()
     )
     reported_markdown = (reported_dir / "g5_e2e_stage1_tables.md").read_text()
+
+    assert _d(reported["metadata"])["training_seed"] == 0
+    assert _d(reported["metadata"])["seed"] == 3
+    assert _d(reported_json["metadata"])["training_seed"] == 0
+    assert _d(reported_json["metadata"])["seed"] == 3
 
     diagnostics = _d(reported_json["training_diagnostics"])
     for arm, expected in expected_correlations.items():
@@ -1552,7 +888,7 @@ def test_formal_gate_reports_rev31_telemetry_without_changing_verdict(
             expected
         )
 
-    probe_rows = _markdown_table(reported_markdown, "## Registered probe-v2 evidence")
+    probe_rows = _markdown_table(reported_markdown, "## Probe-v2 evidence")
     expected_probe_rows = {
         "pi_consistency_v2",
         "slot_recall_at_n_ground",
@@ -1658,14 +994,12 @@ class TestE2EGateCli:
                 str(b0cal_path),
                 "--probe-artifact",
                 str(probe_path),
-                "--preregistration",
-                str(_d(inputs)["preregistration_path"]),
                 "--output-dir",
                 str(tmp_path / "gate"),
             ]
         )
-        assert set(_d(captured["arm_universe_paths"])) == set(g5_stage1._E2E_ARMS)
-        assert set(_d(captured["run_metadata_paths"])) == set(g5_stage1._E2E_FORMAL_ARMS)
+        assert set(_d(captured["arm_universe_paths"])) == set(g5_stage1._ALL_ARMS)
+        assert set(_d(captured["run_metadata_paths"])) == set(g5_stage1._TRAINED_ARMS)
         assert captured["probe_artifact_path"] == probe_path
 
     def test_rejects_wrong_model_family(self, tmp_path: Path) -> None:
@@ -1705,7 +1039,7 @@ class TestEngineeringEvidenceClass:
             "p_value": None,
             "ci": None,
             "holm": None,
-            "metadata": {"training_seed": 0, "registered_seeds": [0]},
+            "metadata": {"arms_screened": list(g5_stage1._ALL_ARMS)},
             "arms": {"full": {"graph_similarity": 0.5}},
             "verdict": "cut",
         }
@@ -1718,7 +1052,7 @@ class TestEngineeringEvidenceClass:
     @pytest.mark.parametrize("seeds", [[0], [0, 1, 2]])
     def test_evidence_class_is_engineering_at_every_seed_count(self, seeds: list[int]) -> None:
         """Extra seeds add cross-seed variance reporting, never significance."""
-        payload = self._payload(metadata={"training_seed": seeds[0], "registered_seeds": seeds})
+        payload = self._payload(metadata={"training_seed": seeds[0], "screened_seeds": seeds})
         g5_stage1._enforce_engineering_evidence_class(payload)
         assert payload["evidence_class"] == "engineering"
         assert payload["p_value"] is None
@@ -1776,69 +1110,3 @@ class TestEngineeringEvidenceClass:
         g5_stage1._enforce_engineering_evidence_class(
             self._payload(structure_control={"lower_bound": 0.0, "alpha": 0.05})
         )
-
-
-class TestRegisteredSeedsAndRunKindWhitelist:
-    """Multi-seed relaxation and the publish whitelist that guards it."""
-
-    @staticmethod
-    def _metadata(tmp_path: Path, name: str, **overrides: object) -> Path:
-        payload: dict[str, object] = {
-            "preregistration_sha256": "f" * 64,
-            "run_kind": "formal",
-            "formal_artifacts_published": True,
-        }
-        payload.update(overrides)
-        path = tmp_path / name
-        path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-        return path
-
-    @pytest.mark.parametrize("run_kind", ["qualification", "debug", None, "formal_"])
-    def test_only_formal_metadata_may_publish_held_out_metrics(
-        self, tmp_path: Path, run_kind: object
-    ) -> None:
-        """A whitelist, not a `!= "debug"` blacklist.
-
-        The pre-cleanup form rejected only `run_kind == "debug"`, so the new
-        `qualification` kind would have published held-out metrics without
-        anyone editing the guard. `formal_artifacts_published` is set true here
-        on purpose: the run kind alone must be decisive.
-        """
-        path = self._metadata(tmp_path, "meta.json", run_kind=run_kind)
-        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="debug/non-formal"):
-            g5_stage1._enforce_metadata_registration_hash(
-                tmp_path / "prereg.json", [path], "f" * 64
-            )
-
-    def test_formal_metadata_passes_the_same_guard(self, tmp_path: Path) -> None:
-        path = self._metadata(tmp_path, "meta.json")
-        assert (
-            g5_stage1._enforce_metadata_registration_hash(
-                tmp_path / "prereg.json", [path], "f" * 64
-            )
-            == "f" * 64
-        )
-
-    @pytest.mark.parametrize("seeds", [[0], [0, 1, 2], [7]])
-    def test_registered_seeds_are_read_verbatim(self, seeds: list[int]) -> None:
-        assert g5_stage1._registered_training_seeds({"seeds": seeds}) == tuple(seeds)
-
-    @pytest.mark.parametrize(
-        "seeds",
-        [None, [], "0", [0, 0], [0, "1"], [0, 1.0], [True], {"0": 0}],
-    )
-    def test_a_missing_or_malformed_seed_list_fails_closed(self, seeds: object) -> None:
-        """No silent fallback to `[0]`: the registration must declare the axis."""
-        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="non-empty list of distinct"):
-            g5_stage1._registered_training_seeds({"seeds": seeds})
-
-    def test_a_run_seed_must_be_one_of_the_registered_seeds(self) -> None:
-        bound = g5_stage1._enforce_registered_training_seed({"seed": 2}, (0, 1, 2), label="full")
-        assert bound == 2
-        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="not one of the registered"):
-            g5_stage1._enforce_registered_training_seed({"seed": 3}, (0, 1, 2), label="full")
-        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="not one of the registered"):
-            g5_stage1._enforce_registered_training_seed({}, (0,), label="full")
-        # `True == 1` in Python; a bool is not a seed.
-        with pytest.raises(g5_stage1.RegistrationShaMismatch, match="not one of the registered"):
-            g5_stage1._enforce_registered_training_seed({"seed": True}, (0, 1), label="full")

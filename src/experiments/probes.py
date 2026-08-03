@@ -716,18 +716,15 @@ def produce_e2e_probe_artifact(
     *,
     checkpoint_path: Path,
     run_metadata_path: Path,
-    preregistration_path: Path,
     data_root: Path,
     strategy: str,
     output_path: Path,
     scope: E2EProbeScope,
 ) -> None:
-    """Produce the registered full-checkpoint STE/Pi evidence artifact.
+    """Produce the full-checkpoint STE/Pi evidence artifact.
 
     ``scope`` is deliberately required and ``formal_train`` is its only value:
-    the full operative train-side ``G_struct``. The producer runs only against a
-    completed, published formal run; no preliminary execution stage has a probe
-    artifact.
+    the full operative train-side ``G_struct``.
     """
     from src import train_egostitch as te
     from src.data.ego_targets import EgoTargetBuilder, EgoTargets
@@ -743,67 +740,7 @@ def produce_e2e_probe_artifact(
     run_metadata = cast(
         dict[str, object], json.loads(run_metadata_path.read_text(encoding="utf-8"))
     )
-    preregistration_bytes = preregistration_path.read_bytes()
-    registration_sha = hashlib.sha256(preregistration_bytes).hexdigest()
-    registration_payload = cast(
-        dict[str, object], json.loads(preregistration_bytes.decode("utf-8"))
-    )
-    probe_registration = cast(
-        Mapping[str, object] | None, registration_payload.get("probe_artifact")
-    )
-    registered_format = (
-        probe_registration.get("format") if probe_registration is not None else None
-    )
-    if registered_format == _E2E_PROBE_V1_FORMAT:
-        raise ValueError(
-            f"E2E probe artifact format {_E2E_PROBE_V1_FORMAT!r} is not supported; "
-            f"expected {E2E_PROBE_FORMAT!r}"
-        )
-    if probe_registration is None or registered_format != E2E_PROBE_FORMAT:
-        raise ValueError("preregistration does not bind the E2E probe artifact format")
-    if probe_registration.get("source_arm") != "full":
-        raise ValueError("preregistration does not bind the E2E probe source to the full arm")
-    arms = registration_payload.get("arms")
-    if not isinstance(arms, Mapping):
-        raise ValueError("preregistration does not define formal arms")
-    full_arm = arms.get("full")
-    registered_training = full_arm.get("training") if isinstance(full_arm, Mapping) else None
-    if not isinstance(registered_training, str) or not registered_training.strip():
-        raise ValueError(
-            f"registration key 'arms.full.training' must be a non-empty path "
-            f"for probe scope {scope!r}"
-        )
-    registered_config = Path(registered_training)
-    if not registered_config.is_absolute():
-        registered_config = preregistration_path.resolve().parents[2] / registered_config
-    registered_output = probe_registration.get("expected_path")
-    if not isinstance(registered_output, str) or not registered_output.strip():
-        raise ValueError(
-            f"registration key 'probe_artifact.expected_path' must be a non-empty path "
-            f"for probe scope {scope!r}"
-        )
-    expected_output = Path(registered_output)
-    if not expected_output.is_absolute():
-        expected_output = preregistration_path.resolve().parents[2] / expected_output
-    if output_path.resolve() != expected_output.resolve():
-        raise ValueError(
-            f"probe output path does not match registration: {output_path} != {expected_output}"
-        )
-    if run_metadata.get("preregistration_sha256") != registration_sha:
-        raise ValueError("probe run metadata does not match preregistration SHA-256")
-    # The only producible scope is the published formal run. Retired scopes
-    # and ``debug`` run kinds are rejected by the same equality, so the new
-    # run-kind domain cannot widen this guard.
-    if (
-        run_metadata.get("run_kind") != "formal"
-        or run_metadata.get("status") != "complete"
-        or run_metadata.get("formal_artifacts_published") is not True
-        or run_metadata.get("permanent_null") != "none"
-    ):
-        raise ValueError("E2E probe producer requires the completed formal full arm")
     config_path = Path(str(run_metadata.get("config_path")))
-    if config_path.resolve() != registered_config.resolve():
-        raise ValueError("E2E probe producer requires the registered full-arm config path")
     cfg = te.load_config(config_path)
     if cfg.model.family != "egostitch_e2e":
         raise ValueError("E2E probe producer requires model family egostitch_e2e")
@@ -818,10 +755,10 @@ def produce_e2e_probe_artifact(
         )
     if cfg.data.root.resolve() != data_root.resolve() or cfg.data.strategy != strategy:
         raise ValueError("probe CLI data root/strategy do not match the formal config")
-    # Multi-seed formal runs are permitted, so the model seed is only required to
-    # be a real seed and is recorded verbatim. ``data.partition_seed`` is not the
+    # Multi-seed runs are permitted, so the model seed is only required to be a
+    # real seed and is recorded verbatim. ``data.partition_seed`` is not the
     # model seed: it selects G_struct and the whole pair universe this probe is
-    # validated against, so it is pinned to the registered config, not relaxed.
+    # validated against, so it is pinned to the config, not relaxed.
     run_seed = run_metadata.get("seed")
     run_partition_seed = run_metadata.get("partition_seed")
     if isinstance(run_seed, bool) or not isinstance(run_seed, int) or run_seed < 0:
@@ -832,17 +769,12 @@ def produce_e2e_probe_artifact(
         or run_partition_seed != cfg.data.partition_seed
     ):
         raise ValueError(
-            "E2E probe run metadata partition_seed does not match the registered "
-            f"config ({cfg.data.partition_seed})"
+            "E2E probe run metadata partition_seed does not match the config "
+            f"({cfg.data.partition_seed})"
         )
-    config_hash = te._config_hash(cfg)
-    if run_metadata.get("config_hash") != config_hash:
-        raise ValueError("probe run metadata config hash does not match the formal config")
     payload = cast(dict[str, object], torch.load(checkpoint_path, map_location="cpu"))
     state = cast(dict[str, torch.Tensor], payload["model_state"])
     checkpoint_id = _state_digest(state)[:16]
-    if run_metadata.get("checkpoint_id") != checkpoint_id:
-        raise ValueError("probe checkpoint does not match selected formal checkpoint_id")
     checkpoint_model_cfg = e2e_checkpoint_config(
         cast(dict[str, object], payload["model_config"]),
         has_rel_head=any(key.startswith("rel_head.") for key in state),
@@ -1076,8 +1008,6 @@ def produce_e2e_probe_artifact(
         output_path,
         metadata={
             "checkpoint_id": checkpoint_id,
-            "registration_sha256": registration_sha,
-            "config_hash": config_hash,
             "seed": run_seed,
             "partition_seed": run_partition_seed,
             "strategy": strategy,
@@ -1113,7 +1043,6 @@ def build_parser() -> argparse.ArgumentParser:
     produce = subparsers.add_parser("produce-e2e")
     produce.add_argument("--checkpoint", type=Path, required=True)
     produce.add_argument("--run-metadata", type=Path, required=True)
-    produce.add_argument("--preregistration", type=Path, required=True)
     produce.add_argument("--data-root", type=Path, required=True)
     produce.add_argument("--strategy", required=True)
     produce.add_argument("--output", type=Path, required=True)
@@ -1128,7 +1057,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         produce_e2e_probe_artifact(
             checkpoint_path=args.checkpoint,
             run_metadata_path=args.run_metadata,
-            preregistration_path=args.preregistration,
             data_root=args.data_root,
             strategy=args.strategy,
             output_path=args.output,

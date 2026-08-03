@@ -75,7 +75,6 @@ eval:
 seed: 0
 output_dir: outputs/egostitch_e2e_stage1_v3/cosine_pool
 mixed_precision: "bf16"
-preregistration: docs/registrations/g5_e2e_stage1_preregistration_v4.json
 
 runtime:
   world_size: auto

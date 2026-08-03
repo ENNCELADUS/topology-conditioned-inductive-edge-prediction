@@ -74,7 +74,6 @@ eval:
 seed: 0
 output_dir: outputs/egostitch_e2e_stage1/p0
 mixed_precision: "bf16"
-preregistration: docs/registrations/g5_e2e_stage1_preregistration_v2.json
 
 runtime:
   world_size: auto

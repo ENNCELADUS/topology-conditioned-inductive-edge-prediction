@@ -1,4 +1,4 @@
-"""E2E fail-closed scoring provenance and four-array publication tests."""
+"""E2E fail-closed test-access ledger and four-array publication tests."""
 
 from __future__ import annotations
 
@@ -12,240 +12,12 @@ import numpy as np
 import pytest
 import torch
 from src import score_universe
-from src.experiments import g5_stage1
-from src.experiments.e2e_binding import ACTIVE_V5_REGISTRATION_ID
-from src.model.egostitch.e2e_model import EgoStitchE2E
+
+from tests.test_score_universe import _egostitch_e2e_setup
 
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _write_run_provenance(metadata_path: Path, metadata: dict[str, object]) -> None:
-    validation_path = metadata_path.parent / "v_hold_validation_events.jsonl"
-    validation_path.write_text('{"epoch":1}\n', encoding="utf-8")
-    validation = {
-        "schema": "egostitch_e2e_v_hold_validation_events_v1",
-        "count": 1,
-        "path": validation_path.name,
-        "sha256": _sha256(validation_path),
-    }
-    parameter_names = {"generator": ["generator.weight"]}
-    parameter_groups = {
-        "names": parameter_names,
-        "sha256": {
-            group: hashlib.sha256(("\n".join(names) + "\n").encode()).hexdigest()
-            for group, names in parameter_names.items()
-        },
-    }
-    memories = [1.0, 1.0, 1.0, 1.0]
-    access_audit = {"observed_training_access": []}
-    metadata.update(
-        {
-            "world_size": 4,
-            "feature_stats_sha256": "c" * 64,
-            "implementation_tracked_clean": True,
-            "implementation_tracked_status_sha256": hashlib.sha256(b"").hexdigest(),
-            "v_hold_validation_evidence": validation,
-            "access_audit": access_audit,
-            "run_provenance": {
-                "schema_version": "egostitch_e2e_run_provenance_v1",
-                "implementation": {
-                    "commit": metadata["implementation_commit"],
-                    "tracked_clean": True,
-                    "tracked_status_sha256": hashlib.sha256(b"").hexdigest(),
-                },
-                "parameter_group_manifests": parameter_groups,
-                "packs_and_validation_manifests": {
-                    "pipeline_profile_path": "profile.json",
-                    "feature_stats_sha256": "c" * 64,
-                    "v_hold_validation_evidence": validation,
-                },
-                "boundary_access_audit": access_audit,
-                "runtime_and_peak_memory": {
-                    "world_size": 4,
-                    "epochs_completed": 30,
-                    "optimizer_steps": 2340,
-                    "peak_memory_gib_per_rank": memories,
-                },
-                "checkpoint_policy_version": "egostitch_e2e_all_completed_epochs_v1",
-            },
-        }
-    )
-    (metadata_path.parent / "profile.json").write_text(
-        json.dumps(
-            {
-                "parameter_groups": parameter_groups,
-                "peak_memory_gib_per_rank": memories,
-                "world_size": 4,
-                "pack_manifest": {},
-                "pack_identity_sha256": "d" * 64,
-                "pack_evidence": {},
-            }
-        ),
-        encoding="utf-8",
-    )
-    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
-
-
-def _write_e2e_provenance(tmp_path: Path) -> tuple[Path, Path, Path, str]:
-    configs: dict[str, Path] = {}
-    for arm in score_universe._EGOSTITCH_E2E_FORMAL_ARMS:
-        config = tmp_path / f"{arm}.yaml"
-        config.write_text(
-            "model:\n"
-            "  family: egostitch_e2e\n"
-            "training:\n"
-            "  selection_auprc_tolerance: 0.02\n"
-            "diagnostics:\n"
-            "  selection_auprc_tolerance: 0.02\n",
-            encoding="utf-8",
-        )
-        configs[arm] = config
-    config = configs["full"]
-    checkpoint = tmp_path / "best.pt"
-    checkpoint.write_bytes(b"selected checkpoint")
-    registration = {
-        "registration_id": ACTIVE_V5_REGISTRATION_ID,
-        "status": "DRAFT",
-        "arms": {
-            **{
-                arm: {
-                    "kind": "trained_checkpoint",
-                    "training": str(path),
-                    "scoring_provenance": {
-                        "scaffold_control": "none",
-                        "permanent_null": {
-                            "b0_e2e_f_only": "all_head",
-                            "pair_topology": "content_head",
-                        }.get(arm, "none"),
-                        "primary_logit": {
-                            "b0_e2e_f_only": "f_logit",
-                            "pair_topology": "pair_topology",
-                        }.get(arm, "full"),
-                    },
-                }
-                for arm, path in configs.items()
-            },
-            "structure_control_6a_v3": {
-                "kind": "scoring_time_control",
-                "training": None,
-                "checkpoint_arm": "full",
-                "scoring_provenance": {
-                    "scaffold_control": "shuffle_within_pair_v3",
-                    "seed": 0,
-                    "keying": "canonical_pair_v1",
-                    "permanent_null": "none",
-                    "primary_logit": "full",
-                    "checkpoint_arm": "full",
-                },
-            },
-            "structure_control_6e_v1": {
-                "kind": "scoring_time_control",
-                "training": None,
-                "checkpoint_arm": "full",
-                "scoring_provenance": {
-                    "scaffold_control": "rewire_checkerboard_v1",
-                    "seed": 0,
-                    "keying": "canonical_pair_v1",
-                    "permanent_null": "none",
-                    "primary_logit": "full",
-                    "checkpoint_arm": "full",
-                },
-            },
-        },
-        "config_artifacts": {
-            arm: {"path": str(path), "sha256": _sha256(path)}
-            for arm, path in configs.items()
-        },
-        "run_evidence_placeholders": {
-            "implementation": None,
-            "runtime_and_peak_memory": None,
-        },
-    }
-    registration_path = tmp_path / "registration.json"
-    registration_path.write_text(json.dumps(registration), encoding="utf-8")
-    checkpoint_id = "0123456789abcdef"
-    metadata = {
-        "arm": "full",
-        "arm_kind": "trained_checkpoint",
-        "checkpoint_arm": "full",
-        "scoring_semantics": {
-            "scaffold_control": "none",
-            "permanent_null": "none",
-            "primary_logit": "full",
-        },
-        "run_kind": "formal",
-        "seed": 0,
-        "status": "complete",
-        "formal_artifacts_published": True,
-        "selected_checkpoint_eligible": True,
-        "model_family": "egostitch_e2e",
-        "config_path": str(config.resolve()),
-        "config_sha256": _sha256(config),
-        "preregistration_sha256": _sha256(registration_path),
-        "implementation_commit": "a" * 40,
-        "checkpoint_id": checkpoint_id,
-        "checkpoint_sha256": _sha256(checkpoint),
-    }
-    metadata_path = tmp_path / "run_metadata.json"
-    _write_run_provenance(metadata_path, metadata)
-    return registration_path, metadata_path, checkpoint, checkpoint_id
-
-
-def _write_all_e2e_provenance(
-    tmp_path: Path,
-) -> tuple[Path, dict[str, Path], dict[str, Path], dict[str, str]]:
-    registration_path, _metadata, _checkpoint, _checkpoint_id = _write_e2e_provenance(
-        tmp_path
-    )
-    registration = json.loads(registration_path.read_text(encoding="utf-8"))
-    registration_sha256 = _sha256(registration_path)
-    metadata_paths: dict[str, Path] = {}
-    checkpoint_paths: dict[str, Path] = {}
-    checkpoint_ids: dict[str, str] = {}
-    for index, arm in enumerate(score_universe._EGOSTITCH_E2E_FORMAL_ARMS):
-        arm_dir = tmp_path / arm
-        arm_dir.mkdir(exist_ok=True)
-        checkpoint_path = arm_dir / "best.pt"
-        checkpoint_path.write_bytes(f"checkpoint:{arm}".encode())
-        checkpoint_id = f"{index + 1:016x}"
-        arm_registration = registration["arms"][arm]
-        config_path = Path(arm_registration["training"])
-        scoring_semantics = arm_registration["scoring_provenance"]
-        metadata_path = arm_dir / "run_metadata.json"
-        metadata: dict[str, object] = {
-                    "arm": arm,
-                    "arm_kind": "trained_checkpoint",
-                    "checkpoint_arm": arm,
-                    "scoring_semantics": scoring_semantics,
-                    "run_kind": "formal",
-                    "seed": 0,
-                    "status": "complete",
-                    "formal_artifacts_published": True,
-                    "selected_checkpoint_eligible": True,
-                    "model_family": "egostitch_e2e",
-                    "config_path": str(config_path.resolve()),
-                    "config_sha256": _sha256(config_path),
-                    "preregistration_sha256": registration_sha256,
-                    "implementation_commit": "a" * 40,
-                    "checkpoint_id": checkpoint_id,
-                    "checkpoint_sha256": _sha256(checkpoint_path),
-                    "selected_checkpoint_path": str(checkpoint_path),
-        }
-        _write_run_provenance(metadata_path, metadata)
-        metadata_paths[arm] = metadata_path
-        checkpoint_paths[arm] = checkpoint_path
-        checkpoint_ids[arm] = checkpoint_id
-    return registration_path, metadata_paths, checkpoint_paths, checkpoint_ids
-
-
-class _ScoringStub(EgoStitchE2E):
-    """Minimal type-correct model for exercising the real score producer."""
-
-    def __init__(self) -> None:
-        torch.nn.Module.__init__(self)
-        self.cfg = type("Cfg", (), {"permanent_null": "none"})()
 
 
 def _test_access_context(
@@ -412,6 +184,61 @@ def test_ledger_bound_artifact_rejects_ledger_digest_tamper(tmp_path: Path) -> N
         score_universe.load_scores(path)
 
 
+def test_heldout_shaped_artifact_missing_heldout_marker_fails_closed(tmp_path: Path) -> None:
+    """The `heldout` discriminator itself must fail closed, not just the ledger file.
+
+    A genuine held-out artifact is produced with a valid ledger binding and
+    `heldout: True` (stamped automatically by `save_scores`). Stripping just the
+    `heldout` marker -- leaving the valid `test_access_ledger` binding intact --
+    must still raise: an e2e artifact over a held-out-shaped `pairs_source`
+    with no explicit marker at all can never be trusted to have legitimately
+    skipped ledger enforcement (design doc §10 item 1).
+    """
+    path, _ledger = _write_bound_score_artifact(tmp_path)
+
+    def strip_heldout(meta: dict[str, object]) -> None:
+        del meta["heldout"]
+
+    _rewrite_artifact_meta(path, strip_heldout)
+    with pytest.raises(ValueError, match="missing the heldout marker"):
+        score_universe.load_scores(path)
+
+    # Direct-call form: validate_test_access_ledger_binding is the SURVIVING
+    # entry point other agents' code paths call directly, not only through
+    # load_scores.
+    with np.load(path, allow_pickle=False) as artifact:
+        meta = json.loads(str(artifact["meta"][()]))
+    assert "heldout" not in meta
+    with pytest.raises(ValueError, match="missing the heldout marker"):
+        score_universe.validate_test_access_ledger_binding(meta, label="direct")
+
+
+def test_heldout_shaped_artifact_false_heldout_marker_fails_closed(tmp_path: Path) -> None:
+    """A `heldout: false` marker on a held-out-shaped artifact must raise, not skip.
+
+    `save_scores` always derives `heldout` from `_is_heldout_universe` for a
+    held-out-shaped artifact (family `egostitch_e2e` scoring
+    `candidate`/`test`/`file:*`), so there is no legitimate way such an
+    artifact carries `heldout: False`. Flipping the flag must not bypass
+    ledger validation -- the ledger could otherwise be deleted or tampered
+    with while `load_scores` still succeeds (design doc §10 item 1).
+    """
+    path, _ledger = _write_bound_score_artifact(tmp_path)
+
+    def flip_heldout(meta: dict[str, object]) -> None:
+        meta["heldout"] = False
+
+    _rewrite_artifact_meta(path, flip_heldout)
+    with pytest.raises(ValueError, match="expected True"):
+        score_universe.load_scores(path)
+
+    with np.load(path, allow_pickle=False) as artifact:
+        meta = json.loads(str(artifact["meta"][()]))
+    assert meta["heldout"] is False
+    with pytest.raises(ValueError, match="expected True"):
+        score_universe.validate_test_access_ledger_binding(meta, label="direct")
+
+
 @pytest.mark.parametrize(
     ("field", "value", "error"),
     [
@@ -433,6 +260,72 @@ def test_ledger_bound_artifact_rejects_identity_mismatch(
     _rewrite_artifact_meta(path, mutate)
     with pytest.raises(ValueError, match=error):
         score_universe.load_scores(path)
+
+
+def test_scoring_full_then_both_scaffold_controls_needs_no_rescore_reason(
+    tmp_path: Path,
+) -> None:
+    """The two mandatory scaffold-structure controls must ledger under distinct arms.
+
+    Both controls reuse the `full` checkpoint and its run metadata. Before
+    the fix, scoring either one recorded it into the test-access ledger
+    under arm `full`, so scoring a control after the ordinary full score was
+    rejected as repeat full-arm scoring -- blocking normal first-time
+    scoring of the mandatory controls unless the operator supplied a
+    misleading `--rescore-reason` (design doc §10 item 1 / finding 2).
+    """
+    data_root, checkpoint, pairs_path = _egostitch_e2e_setup(tmp_path)
+    test_pairs_path = data_root / "benchmark_2025_neurips" / "breadth_first" / "test_edges.txt"
+    test_pairs_path.parent.mkdir(parents=True, exist_ok=True)
+    test_pairs_path.write_bytes(pairs_path.read_bytes())
+
+    run_metadata_path = tmp_path / "run_metadata.json"
+    run_metadata_path.write_text(
+        json.dumps({"arm": "full", "seed": 0, "checkpoint_id": "irrelevant"}),
+        encoding="utf-8",
+    )
+
+    def score(output_name: str, scaffold_control: str | None) -> None:
+        args = [
+            "score",
+            "--checkpoint",
+            str(checkpoint),
+            "--pairs",
+            "test",
+            "--data-root",
+            str(data_root),
+            "--output",
+            str(tmp_path / output_name),
+            "--token-budget",
+            "8192",
+            "--f0-cache",
+            str(tmp_path / "f0_cache.pt"),
+            "--device",
+            "cpu",
+            "--run-metadata",
+            str(run_metadata_path),
+        ]
+        if scaffold_control is not None:
+            args += ["--scaffold-control", scaffold_control]
+        score_universe.main(args)
+
+    # No --rescore-reason anywhere: each of these must be accepted as a
+    # first-time score under its own arm.
+    score("full.npz", None)
+    score("control_6a.npz", "shuffle_within_pair_v3")
+    score("control_6e.npz", "rewire_checkerboard_v1")
+
+    records = _ledger_records(tmp_path / "test_access_ledger.jsonl")
+    arms = {record["scoring_arm"] for record in records}
+    assert arms == {"full", "structure_control_6a_v3", "structure_control_6e_v1"}
+    assert {record["scoring_epoch"] for record in records} == {1}
+
+    full = score_universe.load_scores(tmp_path / "full.npz")
+    control_6a = score_universe.load_scores(tmp_path / "control_6a.npz")
+    control_6e = score_universe.load_scores(tmp_path / "control_6e.npz")
+    assert full.meta["test_access_ledger"]["scoring_arm"] == "full"
+    assert control_6a.meta["test_access_ledger"]["scoring_arm"] == "structure_control_6a_v3"
+    assert control_6e.meta["test_access_ledger"]["scoring_arm"] == "structure_control_6e_v1"
 
 
 def test_test_access_ledger_rejects_repeat_without_reason_and_records_reasoned_repeat(
@@ -481,8 +374,13 @@ def test_test_access_ledger_refuses_malformed_history_before_pair_read(
 def test_arbitrary_file_is_ledgered_as_heldout_before_pair_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    registration, metadata_paths, checkpoint_paths, checkpoint_ids = (
-        _write_all_e2e_provenance(tmp_path)
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"selected checkpoint")
+    checkpoint_id = "0123456789abcdef"
+    run_metadata_path = tmp_path / "run_metadata.json"
+    run_metadata_path.write_text(
+        json.dumps({"arm": "full", "seed": 0, "checkpoint_id": checkpoint_id}),
+        encoding="utf-8",
     )
     copied = tmp_path / "copied-test.tsv"
     copied.write_text("a\tb\t1\n", encoding="utf-8")
@@ -492,317 +390,48 @@ def test_arbitrary_file_is_ledgered_as_heldout_before_pair_read(
         lambda *_args, **_kwargs: (
             torch.nn.Linear(1, 1),
             "egostitch_e2e",
-            checkpoint_ids["full"],
+            checkpoint_id,
         ),
     )
 
     def inspect_after_ledger(_path: Path) -> tuple[object, object]:
-        ledger = metadata_paths["full"].parent / "test_access_ledger.jsonl"
+        ledger = run_metadata_path.parent / "test_access_ledger.jsonl"
         records = _ledger_records(ledger)
         assert records[-1]["event"] == "resolve_pairs"
         assert records[-1]["pairs_source"] == f"file:{copied}"
         assert records[-1]["scoring_arm"] == "full"
         assert records[-1]["seed"] == 0
-        raise AssertionError("pair read reached after formal ledger record")
+        raise AssertionError("pair read reached after ledger record")
 
     monkeypatch.setattr(score_universe, "_read_pairs_tsv", inspect_after_ledger)
     cli = [
         "score",
         "--checkpoint",
-        str(checkpoint_paths["full"]),
+        str(checkpoint),
         "--pairs",
         f"file:{copied}",
         "--output",
         str(tmp_path / "scores" / "full.npz"),
-        "--preregistration",
-        str(registration),
+        "--run-metadata",
+        str(run_metadata_path),
     ]
-    for arm, metadata in metadata_paths.items():
-        cli.extend(["--arm-run-metadata", f"{arm}={metadata}"])
 
-    with pytest.raises(AssertionError, match="pair read reached after formal ledger record"):
+    with pytest.raises(AssertionError, match="pair read reached after ledger record"):
         score_universe.main(cli)
 
 
-def test_e2e_formal_scoring_provenance_accepts_exact_active_v2_binding(tmp_path: Path) -> None:
-    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
-
-    provenance = score_universe._validate_e2e_scoring_provenance(
-        registration_path=registration,
-        run_metadata_path=metadata,
-        checkpoint_path=checkpoint,
-        checkpoint_id=checkpoint_id,
-    )
-
-    assert provenance["arm"] == "full"
-    assert provenance["registration_sha256"] == _sha256(registration)
-    assert provenance["checkpoint_sha256"] == _sha256(checkpoint)
-    assert provenance["selected_checkpoint_eligible"] is True
-
-
-def test_scoring_accepts_quality_telemetry_miss_without_margin_verdict(tmp_path: Path) -> None:
-    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
-    run = json.loads(metadata.read_text(encoding="utf-8"))
-    run["selected_checkpoint_eligible"] = False
-    run["validation_liveness_pass"] = False
-    run["quality_fields_policy"] = "telemetry_only"
-    metadata.write_text(json.dumps(run), encoding="utf-8")
-    (metadata.parent / "margin_verdict.json").unlink(missing_ok=True)
-
-    provenance = score_universe._validate_e2e_scoring_provenance(
-        registration_path=registration,
-        run_metadata_path=metadata,
-        checkpoint_path=checkpoint,
-        checkpoint_id=checkpoint_id,
-    )
-
-    assert provenance["selected_checkpoint_eligible"] is False
-
-
-def test_e2e_formal_scoring_provenance_revalidates_registration_digest(tmp_path: Path) -> None:
-    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
-    payload = json.loads(registration.read_text(encoding="utf-8"))
-    registration.write_text(json.dumps(payload), encoding="utf-8")
-    run = json.loads(metadata.read_text(encoding="utf-8"))
-    run["preregistration_sha256"] = _sha256(registration)
-    metadata.write_text(json.dumps(run), encoding="utf-8")
-    provenance = score_universe._validate_e2e_scoring_provenance(
-        registration_path=registration,
-        run_metadata_path=metadata,
-        checkpoint_path=checkpoint,
-        checkpoint_id=checkpoint_id,
-    )
-
-    assert provenance["registration_sha256"] == _sha256(registration)
-
-
-def test_scoring_rejects_tampered_run_provenance(tmp_path: Path) -> None:
-    registration, _metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
-    metadata = tmp_path / "run_metadata.json"
-    payload = json.loads(metadata.read_text(encoding="utf-8"))
-    payload["run_provenance"]["runtime_and_peak_memory"]["world_size"] = 3
-    metadata.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ValueError, match="runtime provenance"):
-        score_universe._validate_e2e_scoring_provenance(
-            registration_path=registration,
-            run_metadata_path=metadata,
-            checkpoint_path=checkpoint,
-            checkpoint_id=checkpoint_id,
-        )
-
-
-def test_scoring_rejects_tampered_parameter_group_manifest(tmp_path: Path) -> None:
-    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
-    payload = json.loads(metadata.read_text(encoding="utf-8"))
-    payload["run_provenance"]["parameter_group_manifests"]["names"]["generator"].append(
-        "generator.bias"
-    )
-    metadata.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ValueError, match="parameter-group provenance"):
-        score_universe._validate_e2e_scoring_provenance(
-            registration_path=registration,
-            run_metadata_path=metadata,
-            checkpoint_path=checkpoint,
-            checkpoint_id=checkpoint_id,
-        )
-
-
-@pytest.mark.parametrize(
-    ("scoring_arm", "checkpoint_arm", "scaffold_control"),
-    [
-        ("row_layernorm", "row_layernorm", "none"),
-        ("structure_control_6a_v3", "full", "shuffle_within_pair_v3"),
-    ],
-)
-def test_real_scorer_provenance_is_accepted_by_g5_validator(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    scoring_arm: str,
-    checkpoint_arm: str,
-    scaffold_control: str,
-) -> None:
-    registration_path, metadata_paths, checkpoint_paths, checkpoint_ids = (
-        _write_all_e2e_provenance(tmp_path)
-    )
-    monkeypatch.setattr(
-        score_universe,
-        "_load_checkpoint",
-        lambda *_args, **_kwargs: (
-            _ScoringStub(),
-            "egostitch_e2e",
-            checkpoint_ids[checkpoint_arm],
-        ),
-    )
-    data_root = tmp_path / "data"
-    test_pairs = (
-        data_root / "benchmark_2025_neurips" / "breadth_first" / "test_edges.txt"
-    )
-    test_pairs.parent.mkdir(parents=True)
-    test_pairs.write_text("a\tb\t1\n", encoding="utf-8")
-    monkeypatch.setattr(score_universe, "FeatureStore", lambda *_args, **_kwargs: object())
-    values = np.array([0.25], dtype=np.float32)
-    monkeypatch.setattr(
-        score_universe,
-        "_score_egostitch_e2e",
-        lambda *_args, **_kwargs: {
-            "full": values,
-            "f_logit": values,
-            "pair_content": values,
-            "pair_topology": values,
-        },
-    )
-    output_path = tmp_path / f"{scoring_arm}.npz"
-    cli = [
-        "score",
-        "--checkpoint",
-        str(checkpoint_paths[checkpoint_arm]),
-        "--pairs",
-        "test",
-        "--data-root",
-        str(data_root),
-        "--output",
-        str(output_path),
-        "--preregistration",
-        str(registration_path),
-        "--scaffold-control",
-        scaffold_control,
-        "--device",
-        "cpu",
-    ]
-    for arm, metadata_path in metadata_paths.items():
-        cli.extend(["--arm-run-metadata", f"{arm}={metadata_path}"])
-
-    score_universe.main(cli)
-
-    artifact = score_universe.load_scores(output_path)
-    ledger = metadata_paths[checkpoint_arm].parent / "test_access_ledger.jsonl"
-    records = _ledger_records(ledger)
-    assert records[-1]["event"] == "resolve_pairs"
-    assert records[-1]["scoring_arm"] == scoring_arm
-    assert records[-1]["seed"] == 0
-    preregistration = json.loads(registration_path.read_text(encoding="utf-8"))
-    run_metadata = {
-        arm: json.loads(path.read_text(encoding="utf-8"))
-        for arm, path in metadata_paths.items()
-    }
-    g5_stage1._validate_e2e_scoring_provenance(
-        scoring_arm,
-        artifact,
-        preregistration["arms"][scoring_arm],
-        run_metadata=run_metadata,
-        run_metadata_paths=metadata_paths,
-        preregistration=preregistration,
-        preregistration_path=registration_path,
-        registration_sha256=_sha256(registration_path),
-    )
-
-
-@pytest.mark.parametrize("extra_arm", [None, "unknown"])
-def test_e2e_formal_scoring_provenance_rejects_non_v3_arm_packages(
-    tmp_path: Path, extra_arm: str | None
-) -> None:
-    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
-    payload = json.loads(registration.read_text(encoding="utf-8"))
-    payload["arms"].pop("row_layernorm")
-    payload["arms"].pop("no_l_rel")
-    payload["arms"]["structure_control_6a"] = payload["arms"].pop(
-        "structure_control_6a_v3"
-    )
-    payload["arms"].pop("structure_control_6e_v1")
-    payload["config_artifacts"].pop("row_layernorm")
-    payload["config_artifacts"].pop("no_l_rel")
-    if extra_arm is not None:
-        payload["arms"][extra_arm] = payload["arms"]["full"]
-        payload["config_artifacts"][extra_arm] = payload["config_artifacts"]["full"]
-    registration.write_text(json.dumps(payload), encoding="utf-8")
-    run = json.loads(metadata.read_text(encoding="utf-8"))
-    run["preregistration_sha256"] = _sha256(registration)
-    metadata.write_text(json.dumps(run), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="incompatible arm identity schema"):
-        score_universe._validate_e2e_scoring_provenance(
-            registration_path=registration,
-            run_metadata_path=metadata,
-            checkpoint_path=checkpoint,
-            checkpoint_id=checkpoint_id,
-        )
-
-
-@pytest.mark.parametrize(
-    ("target", "field", "value", "match"),
-    [
-        ("metadata", "run_kind", "debug", "debug/non-formal"),
-        ("metadata", "status", "started", "complete formal"),
-        ("metadata", "implementation_commit", "b" * 40, "implementation provenance"),
-        ("metadata", "checkpoint_sha256", "b" * 64, "checkpoint_sha256"),
-    ],
-)
-def test_e2e_provenance_rejects_invalid_run_before_output(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    target: str,
-    field: str,
-    value: object,
-    match: str,
-) -> None:
-    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
-    path = registration if target == "registration" else metadata
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    payload[field] = value
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    if target == "registration":
-        run = json.loads(metadata.read_text(encoding="utf-8"))
-        run["preregistration_sha256"] = _sha256(registration)
-        metadata.write_text(json.dumps(run), encoding="utf-8")
-    monkeypatch.setattr(
-        score_universe,
-        "_load_checkpoint",
-        lambda *_args, **_kwargs: (torch.nn.Linear(1, 1), "egostitch_e2e", checkpoint_id),
-    )
-    output = tmp_path / "forbidden.npz"
-    with pytest.raises(ValueError, match=match):
-        score_universe.main(
-            [
-                "score",
-                "--checkpoint",
-                str(checkpoint),
-                "--pairs",
-                "candidate",
-                "--output",
-                str(output),
-                "--preregistration",
-                str(registration),
-                "--run-metadata",
-                str(metadata),
-            ]
-        )
-    assert not output.exists()
-
-
-def test_e2e_rejects_bad_registered_config_digest(tmp_path: Path) -> None:
-    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
-    payload = json.loads(registration.read_text(encoding="utf-8"))
-    payload["config_artifacts"]["full"]["sha256"] = "f" * 64
-    registration.write_text(json.dumps(payload), encoding="utf-8")
-    run = json.loads(metadata.read_text(encoding="utf-8"))
-    run["preregistration_sha256"] = _sha256(registration)
-    run["config_sha256"] = "f" * 64
-    metadata.write_text(json.dumps(run), encoding="utf-8")
-    with pytest.raises(ValueError, match=r"registered config digest mismatch"):
-        score_universe._validate_e2e_scoring_provenance(
-            registration_path=registration,
-            run_metadata_path=metadata,
-            checkpoint_path=checkpoint,
-            checkpoint_id=checkpoint_id,
-        )
-
-
-def test_file_alias_of_candidate_manifest_still_requires_provenance(
+def test_file_alias_of_candidate_manifest_still_requires_run_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _registration, _metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"selected checkpoint")
+    checkpoint_id = "0123456789abcdef"
     candidate = (
-        tmp_path / "data" / "benchmark_2025_neurips" / "breadth_first" / "candidate_test_edges.txt"
+        tmp_path
+        / "data"
+        / "benchmark_2025_neurips"
+        / "breadth_first"
+        / "candidate_test_edges.txt"
     )
     candidate.parent.mkdir(parents=True)
     candidate.write_text("a\tb\n", encoding="utf-8")
@@ -815,7 +444,7 @@ def test_file_alias_of_candidate_manifest_still_requires_provenance(
     )
     output = tmp_path / "forbidden.npz"
 
-    with pytest.raises(ValueError, match="requires --preregistration"):
+    with pytest.raises(ValueError, match="requires --run-metadata"):
         score_universe.main(
             [
                 "score",
@@ -829,83 +458,6 @@ def test_file_alias_of_candidate_manifest_still_requires_provenance(
                 str(output),
             ]
         )
-    assert not output.exists()
-
-
-def test_candidate_scoring_requires_all_six_arm_metadata(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
-    monkeypatch.setattr(
-        score_universe,
-        "_load_checkpoint",
-        lambda *_args, **_kwargs: (torch.nn.Linear(1, 1), "egostitch_e2e", checkpoint_id),
-    )
-    output = tmp_path / "forbidden.npz"
-    with pytest.raises(ValueError, match="exactly six arm metadata"):
-        score_universe.main(
-            [
-                "score",
-                "--checkpoint",
-                str(checkpoint),
-                "--pairs",
-                "candidate",
-                "--output",
-                str(output),
-                "--preregistration",
-                str(registration),
-                "--run-metadata",
-                str(metadata),
-            ]
-        )
-    assert not output.exists()
-
-
-def test_arm_checkpoint_path_falls_back_to_metadata_sibling_best_pt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    registration, metadata, checkpoint, checkpoint_id = _write_e2e_provenance(tmp_path)
-    monkeypatch.setattr(
-        score_universe,
-        "_load_checkpoint",
-        lambda *_args, **_kwargs: (torch.nn.Linear(1, 1), "egostitch_e2e", checkpoint_id),
-    )
-    other_dir = tmp_path / "f_only"
-    other_dir.mkdir()
-    other_metadata = other_dir / "run_metadata.json"
-    other_metadata.write_text(
-        json.dumps({"arm": "b0_e2e_f_only", "checkpoint_id": "feedfeedfeedfeed"}),
-        encoding="utf-8",
-    )
-    output = tmp_path / "forbidden.npz"
-    common = [
-        "score",
-        "--checkpoint",
-        str(checkpoint),
-        "--pairs",
-        "candidate",
-        "--output",
-        str(output),
-        "--preregistration",
-        str(registration),
-        "--arm-run-metadata",
-        f"b0_e2e_f_only={other_metadata}",
-        "--arm-run-metadata",
-        f"full={metadata}",
-        "--arm-run-metadata",
-        f"pair_topology={metadata}",
-        "--arm-run-metadata",
-        f"p0={metadata}",
-        "--arm-run-metadata",
-        f"no_l_rel={metadata}",
-        "--arm-run-metadata",
-        f"row_layernorm={metadata}",
-    ]
-    with pytest.raises(ValueError, match="selected checkpoint not found"):
-        score_universe.main(common)
-    (other_dir / "best.pt").write_bytes(b"other arm checkpoint")
-    with pytest.raises(ValueError, match="run metadata requires egostitch_e2e_run_provenance"):
-        score_universe.main(common)
     assert not output.exists()
 
 

@@ -22,15 +22,15 @@ def bash_exe() -> str:
 
 
 def test_hpc_layer_has_only_runners_and_documentation() -> None:
-    """The old scheduler layer is replaced by direct, tracked runners.
+    """The old scheduler layer is replaced by one direct, tracked runner.
 
     `g5_stage1.sh` orchestrated the frozen-s0 `egostitch` family and was
-    deleted with it (design 2026-07-29 Sec 6.2); the EgoStitch ladder is now
-    entirely inside `qualification.sh`.
+    deleted with it (design 2026-07-29 Sec 6.2). `qualification.sh` and the
+    registration/preregistration machinery it enforced were excised (design
+    2026-08-02 Sec 10): `run.sh train` now launches EgoStitch E2E directly.
     """
     assert sorted(path.name for path in HPC_DIR.iterdir()) == [
         "README.md",
-        "qualification.sh",
         "run.sh",
     ]
     assert not (REPO_ROOT / "slurm").exists()
@@ -64,10 +64,10 @@ def test_help_is_available_without_the_remote_container(bash_exe: str) -> None:
         assert f"hpc/run.sh {command}" in result.stdout
     # `s0-score` served the retired frozen-s0 family and must not come back.
     assert "s0-score" not in result.stdout
-    # Both EgoStitch stages own their own preflights, so neither is launchable
-    # from the generic runner.
-    assert "hpc/qualification.sh" in result.stdout
-    assert "src.train_egostitch" not in result.stdout
+    # `qualification.sh` is gone; EgoStitch E2E now launches through the
+    # generic `train` branch via an explicit worker-module override.
+    assert "qualification.sh" not in result.stdout
+    assert "src.train_egostitch" in result.stdout
 
 
 def test_runner_discovers_visible_h20s() -> None:

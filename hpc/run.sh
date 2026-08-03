@@ -18,16 +18,15 @@ Usage:
   hpc/run.sh g1 <g1 args...>
   hpc/run.sh g2 <g2 args...>
 
-The train command is the only formal E2 entry: it runs the full packed-feature
-DDP training pipeline (`python -m src.e2_pipeline`) across all visible NVIDIA
-H20 GPUs via an automatically sized `accelerate launch`. Direct
-`python -m src.train_b0 --max-steps N` remains debug-only (bounded smoke runs);
-it is never a formal E2 training run. B0-alt keeps its own direct
-`python -m src.train_b0` CLI, unaffected by this distributed routing.
-
-EgoStitch E2E training is not launched from here: its plan-bound formal run goes
-through the historically named `hpc/qualification.sh`, which verifies the
-registration, configuration, implementation, and input-artifact identities.
+The train command drives the full packed-feature DDP training pipeline
+(`python -m src.e2_pipeline`) across all visible NVIDIA H20 GPUs via an
+automatically sized `accelerate launch`. It defaults to the B0 worker
+(`src.train_b0`); pass `--worker-module src.train_egostitch --run-kind formal`
+after the config path to train an EgoStitch E2E config
+(`model.family: egostitch_e2e`) instead. Direct `python -m src.train_b0
+--max-steps N` remains debug-only (bounded smoke runs); it is never a formal E2
+training run. B0-alt keeps its own direct `python -m src.train_b0` CLI,
+unaffected by this distributed routing.
 
 The score command pins --device cuda --amp bf16. With multiple visible GPUs it
 launches one contiguous shard per GPU, waits for every shard, and strictly merges
@@ -149,17 +148,6 @@ case "${COMMAND}" in
     CONFIG_PATH="$1"
     shift
     [[ -f "${CONFIG_PATH}" ]] || fail "config not found: ${CONFIG_PATH}"
-    # Stated in the usage text and enforced here: an EgoStitch E2E arm launched
-    # from this branch would skip its plan/artifact identity preflight -- the
-    # unchanged registration snapshot, clean checkout, registered config, and
-    # four-GPU pin.
-    # The family is read from the config, so
-    # naming the worker module by hand does not reopen the bypass.
-    MODEL_FAMILY="$("${PYTHON_BIN}" -c \
-      'import sys, yaml; from pathlib import Path; config = yaml.safe_load(Path(sys.argv[1]).read_text()); model = config.get("model") or {}; print(model.get("family", ""))' \
-      "${CONFIG_PATH}")" || fail "could not read model.family from ${CONFIG_PATH}"
-    [[ "${MODEL_FAMILY}" != "egostitch_e2e" ]] || \
-      fail "EgoStitch E2E arms are launched only through hpc/qualification.sh"
     exec "${PYTHON_BIN}" -m src.e2_pipeline --config "${CONFIG_PATH}" "$@"
     ;;
   score)

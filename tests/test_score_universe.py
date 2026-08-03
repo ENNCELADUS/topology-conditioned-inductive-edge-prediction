@@ -429,7 +429,10 @@ def test_save_load_roundtrip_preserves_everything(tmp_path: Path) -> None:
     np.testing.assert_array_equal(loaded.v_idx, v_idx)
     np.testing.assert_array_equal(loaded.logit, logit)
     np.testing.assert_array_equal(loaded.label, label)
-    assert loaded.meta == meta
+    # save_scores always stamps an explicit heldout marker (False here: family
+    # v3_1 never claims the held-out E2E universe); the round-trip otherwise
+    # preserves the input meta exactly.
+    assert loaded.meta == {**meta, "heldout": False}
     assert list(loaded.pairs()) == [
         ("node_a", "node_b"),
         ("node_b", "node_c"),
@@ -1395,7 +1398,11 @@ def test_merge_rejects_conflicting_scaffold_control_provenance(tmp_path: Path) -
     base_meta = {
         "checkpoint_id": "abc123abc123abcd",
         "model_family": "egostitch_e2e",
-        "pairs_source": "candidate",
+        # "val" (not "candidate"/"test") deliberately: this test is only about
+        # merge's scaffold_control/permanent_null/primary_logit conflict
+        # detection, and a held-out pairs_source would require a genuine
+        # test-access ledger binding it has no reason to fabricate.
+        "pairs_source": "val",
         "strategy": "breadth_first",
         "num_rows": 2,
         "created_utc": "2026-07-17T00:00:00+00:00",

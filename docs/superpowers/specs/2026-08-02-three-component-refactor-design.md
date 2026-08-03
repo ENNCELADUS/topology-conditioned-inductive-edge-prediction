@@ -397,10 +397,17 @@ ledger. `run_metadata.json` as a plain record. `model_config_hash`
 
 2. **`_e2e_arm_name` / `_e2e_arm_name_from_config` must survive**
    (`train_egostitch.py:3512-3527`). They read as registration but are behaviorally
-   load-bearing: `arm` drives `e2e_checkpoint_eligible` (`:4692`),
-   `select_e2e_checkpoint` (`:4757`), the precision differential (`:4500`, `:4783`),
-   `conditioning_active` (`:4609`), and the V_hold ledger rows (`:4117`). They become
-   plain config-derived labels with no registered arm set.
+   load-bearing: `arm` drives `select_e2e_checkpoint`, the precision differential
+   (`:4500`, `:4783`), `conditioning_active` (`:4609`), and the V_hold ledger rows
+   (`:4117`). They become plain config-derived labels with no registered arm set.
+
+   **Amendment (owner decision, 2026-08-02):** `e2e_checkpoint_eligible` is deleted
+   outright rather than rewired to a surviving consumer. Nothing in code evaluates
+   checkpoint eligibility; `select_e2e_checkpoint` returns the best record by AUPRC →
+   clustering MMD → Brier regardless of quality, and whether that checkpoint is usable
+   is an owner-side judgement read from `metrics.jsonl`. The `checkpoint_eligible`,
+   `selected_checkpoint_eligible` and `quality_fields_policy` keys are gone from
+   `run_metadata.json`.
 
 3. **Reader/writer pairs must move together.** `write_outputs` refuses to finalize
    unless `run_metadata.json` already carries `preregistration_sha256` and

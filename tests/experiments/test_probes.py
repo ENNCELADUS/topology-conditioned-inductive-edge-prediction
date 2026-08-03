@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import inspect
 import json
 import pickle
@@ -381,14 +380,8 @@ class TestE2EProbeArtifact:
             "plan_row_entropy",
         }
 
-    def test_consumer_rejects_provenance_or_target_drift(self, tmp_path: Path) -> None:
+    def test_consumer_rejects_target_drift(self, tmp_path: Path) -> None:
         path, graph, nodes, metadata = self._write(tmp_path)
-        wrong = {**metadata, "checkpoint_id": "wrong"}
-        with pytest.raises(ValueError, match="checkpoint_id"):
-            probes.evaluate_e2e_probe_artifact(
-                path, graph=graph, train_nodes=nodes, expected_metadata=wrong
-            )
-
         with np.load(path, allow_pickle=False) as archive:
             arrays = {key: archive[key] for key in archive.files}
         arrays["degree"] = arrays["degree"].copy()
@@ -465,140 +458,8 @@ class TestE2EProbeArtifact:
             probes.produce_e2e_probe_artifact(
                 checkpoint_path=tmp_path / "best.pt",
                 run_metadata_path=tmp_path / "run_metadata.json",
-                preregistration_path=tmp_path / "registration.json",
                 data_root=tmp_path / "data",
                 strategy="breadth_first",
                 output_path=tmp_path / "probe.npz",
                 scope=cast(probes.E2EProbeScope, retired_scope),
-            )
-
-    @staticmethod
-    def _write_source_producer_inputs(
-        tmp_path: Path,
-        *,
-        run_kind: str,
-        status: str = "complete",
-        formal_artifacts_published: bool = True,
-    ) -> tuple[Path, Path, Path]:
-        output = tmp_path / "probe.npz"
-        registration = tmp_path / "registration.json"
-        registration.write_text(
-            json.dumps(
-                {
-                    "status": "DRAFT",
-                    "probe_artifact": {
-                        "format": "egostitch_e2e_probe_v2",
-                        "source_arm": "full",
-                        "expected_path": str(output),
-                    },
-                    "arms": {"full": {"training": str(tmp_path / "full.yaml")}},
-                }
-            ),
-            encoding="utf-8",
-        )
-        registration_sha = hashlib.sha256(registration.read_bytes()).hexdigest()
-        metadata = tmp_path / "run_metadata.json"
-        metadata.write_text(
-            json.dumps(
-                {
-                    "preregistration_sha256": registration_sha,
-                    "run_kind": run_kind,
-                    "status": status,
-                    "formal_artifacts_published": formal_artifacts_published,
-                    "permanent_null": "none",
-                }
-            ),
-            encoding="utf-8",
-        )
-        return registration, metadata, output
-
-    def test_producer_rejects_nonformal_or_incomplete_source(self, tmp_path: Path) -> None:
-        registration, metadata, output = self._write_source_producer_inputs(
-            tmp_path,
-            run_kind="formal",
-            status="running",
-            formal_artifacts_published=False,
-        )
-
-        with pytest.raises(ValueError, match="completed formal full arm"):
-            probes.produce_e2e_probe_artifact(
-                checkpoint_path=tmp_path / "best.pt",
-                run_metadata_path=metadata,
-                preregistration_path=registration,
-                data_root=tmp_path / "data",
-                strategy="breadth_first",
-                output_path=output,
-                scope="formal_train",
-            )
-
-    @pytest.mark.parametrize("run_kind", ["qualification", "debug"])
-    def test_producer_rejects_every_nonformal_run_kind(
-        self, tmp_path: Path, run_kind: str
-    ) -> None:
-        """The `{qualification, formal, debug}` domain must not widen this guard.
-
-        The check is a `!= "formal"` equality, not a blacklist, so a run kind
-        added after it was written cannot slip through and publish a probe
-        artifact off a short qualification run.
-        """
-        registration, metadata, output = self._write_source_producer_inputs(
-            tmp_path, run_kind=run_kind
-        )
-
-        with pytest.raises(ValueError, match="completed formal full arm"):
-            probes.produce_e2e_probe_artifact(
-                checkpoint_path=tmp_path / "best.pt",
-                run_metadata_path=metadata,
-                preregistration_path=registration,
-                data_root=tmp_path / "data",
-                strategy="breadth_first",
-                output_path=output,
-                scope="formal_train",
-            )
-
-    def test_producer_rejects_completed_p0_source(self, tmp_path: Path) -> None:
-        output = tmp_path / "probe.npz"
-        full_config = tmp_path / "full.yaml"
-        registration = tmp_path / "registration.json"
-        registration.write_text(
-            json.dumps(
-                {
-                    "status": "BINDING",
-                    "probe_artifact": {
-                        "format": "egostitch_e2e_probe_v2",
-                        "source_arm": "full",
-                        "expected_path": str(output),
-                    },
-                    "arms": {"full": {"training": str(full_config)}},
-                }
-            ),
-            encoding="utf-8",
-        )
-        registration_sha = hashlib.sha256(registration.read_bytes()).hexdigest()
-        metadata = tmp_path / "run_metadata.json"
-        metadata.write_text(
-            json.dumps(
-                {
-                    "preregistration_sha256": registration_sha,
-                    "run_kind": "formal",
-                    "status": "complete",
-                    "formal_artifacts_published": True,
-                    "permanent_null": "none",
-                    "seed": 0,
-                    "partition_seed": 0,
-                    "config_path": str(tmp_path / "p0.yaml"),
-                }
-            ),
-            encoding="utf-8",
-        )
-
-        with pytest.raises(ValueError, match="registered full-arm config path"):
-            probes.produce_e2e_probe_artifact(
-                checkpoint_path=tmp_path / "best.pt",
-                run_metadata_path=metadata,
-                preregistration_path=registration,
-                data_root=tmp_path / "data",
-                strategy="breadth_first",
-                output_path=output,
-                scope="formal_train",
             )

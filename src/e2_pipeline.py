@@ -12,7 +12,8 @@ publish``: pack-or-validate the BF16 feature cache, launch one clean
 fields, and publish the validated staging tree atomically. See
 :func:`run_pipeline` for the full contract.
 
-EgoStitch E2E uses this orchestrator for the single plan-bound formal schedule.
+EgoStitch E2E uses this same orchestrator, selected via ``--worker-module
+src.train_egostitch``.
 """
 
 import argparse
@@ -893,7 +894,6 @@ def run_pipeline(
     }
     if debug_run:
         final_profile["run_kind"] = "debug"
-        final_profile["formal_artifacts_published"] = False
         _write_json_atomic(output_dir / "profile.json", final_profile)
         _write_json_atomic(output_dir / "debug_complete.json", {"status": "debug_complete"})
         shutil.rmtree(staging_dir, ignore_errors=True)

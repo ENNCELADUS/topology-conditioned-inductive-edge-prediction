@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import inspect
 import json
 import threading
@@ -18,7 +17,6 @@ import pytest
 import torch
 import yaml  # type: ignore[import-untyped]
 from src import train_egostitch as te
-from src.experiments.e2e_binding import ACTIVE_V5_REGISTRATION_ID
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.e2e_model import EgoStitchE2E
 
@@ -33,7 +31,13 @@ def test_quality_miss_uses_completed_final_epoch_instead_of_aborting() -> None:
     assert "enforce_quality = False" in source
 
 
-def test_checkpoint_quality_predicate_remains_available_as_telemetry() -> None:
+def test_selection_returns_the_best_record_with_no_eligibility_predicate() -> None:
+    """A degenerate record is still selected: eligibility is an owner judgement.
+
+    There is deliberately no `e2e_checkpoint_eligible` anywhere in the tree —
+    nothing in code decides whether a checkpoint is scientifically usable.
+    """
+    assert not hasattr(te, "e2e_checkpoint_eligible")
     record = te.E2ECheckpointRecord(
         epoch=30,
         phase="C",
@@ -45,20 +49,10 @@ def test_checkpoint_quality_predicate_remains_available_as_telemetry() -> None:
         clustering_mmd=1.0,
         brier=1.0,
     )
-    assert te.e2e_checkpoint_eligible(record, "full") is False
     assert te.select_e2e_checkpoint([record], "full") == record
 
 
-def test_formal_plan_preflight_does_not_read_status_or_run_evidence() -> None:
-    source = inspect.getsource(te._validate_e2e_formal_plan)
-    assert 'snapshot.payload.get("status")' not in source
-    assert "binding_evidence" not in source
-    assert "run_evidence_placeholders" not in source
-
-
 def _training_config(tmp_path: Path) -> Path:
-    preregistration = tmp_path / "prereg.json"
-    preregistration.write_text(json.dumps({"status": "DRAFT"}), encoding="utf-8")
     mapping = {
         "model": {"family": "egostitch_e2e", "config": {}},
         "data": {
@@ -93,7 +87,6 @@ def _training_config(tmp_path: Path) -> Path:
         "seed": 0,
         "output_dir": str(tmp_path / "out"),
         "mixed_precision": "bf16",
-        "preregistration": str(preregistration),
         "training": {},
     }
     path = tmp_path / "training.yaml"
@@ -121,105 +114,14 @@ def test_e2e_config_schema_is_strict_and_preserves_run_kind(tmp_path: Path) -> N
 
 
 
-def test_formal_plan_preflight_validates_live_config_and_clean_commit(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    root = Path(__file__).resolve().parents[1]
-    config_path = root / "configs/egostitch_e2e_v3_full_breadth_first.yaml"
-    cfg = te.load_config(config_path)
-    arm_paths = {
-        "full": "configs/egostitch_e2e_v3_full_breadth_first.yaml",
-        "b0_e2e_f_only": "configs/egostitch_e2e_v3_f_only_breadth_first.yaml",
-        "pair_topology": "configs/egostitch_e2e_v3_pair_topology_breadth_first.yaml",
-        "p0": "configs/egostitch_e2e_v3_p0_breadth_first.yaml",
-        "no_l_rel": "configs/egostitch_e2e_v3_no_l_rel_breadth_first.yaml",
-        "row_layernorm": "configs/egostitch_e2e_v3_row_layernorm_breadth_first.yaml",
-    }
-    configs: dict[str, object] = {
-            arm: {"path": path, "sha256": te._sha256_file(root / path)}
-            for arm, path in arm_paths.items()
-    }
-    registration: dict[str, object] = {
-        "registration_id": ACTIVE_V5_REGISTRATION_ID,
-        "arms": {
-                **{
-                    arm: {"kind": "trained_checkpoint", "training": path}
-                    for arm, path in arm_paths.items()
-                },
-                "structure_control_6a_v3": {
-                    "kind": "scoring_time_control",
-                    "training": None,
-                    "checkpoint_arm": "full",
-                },
-                "structure_control_6e_v1": {
-                    "kind": "scoring_time_control",
-                    "training": None,
-                    "checkpoint_arm": "full",
-                },
-        },
-        "status": "DRAFT",
-        "config_artifacts": configs,
-        "run_evidence_placeholders": {
-            "implementation": None,
-            "runtime_and_peak_memory": None,
-        },
-    }
-    snapshot = te.PreregistrationSnapshot(registration, "f" * 64)
+def test_formal_output_metadata_matches_scorer_contract(tmp_path: Path) -> None:
+    """The only end-to-end check that ``run_metadata.json`` is well-formed.
 
-    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
-        return SimpleNamespace(stdout=("a" * 40 + "\n") if "rev-parse" in command else "")
-
-    monkeypatch.setattr(te.subprocess, "run", fake_run)
-    plan = te._validate_e2e_formal_plan(cfg, snapshot, config_path)
-
-    assert plan["arm"] == "full"
-    assert plan["implementation_commit"] == "a" * 40
-    assert plan["config_sha256"] == te._sha256_file(config_path)
-
-    snapshot.payload["config_artifacts"] = {
-        name: entry
-        for name, entry in configs.items()
-        if name not in {"row_layernorm", "no_l_rel"}
-    }
-    with pytest.raises(te.FormalPlanMismatch, match="trained checkpoint arms"):
-        te._validate_e2e_formal_plan(cfg, snapshot, config_path)
-    snapshot.payload["config_artifacts"] = configs
-
-    registered_arms = cast(dict[str, object], snapshot.payload["arms"])
-    snapshot.payload["arms"] = {
-        **{
-            name: registered_arms[name]
-            for name in ("full", "b0_e2e_f_only", "pair_topology", "p0")
-        },
-        "structure_control_6a": registered_arms["structure_control_6a_v3"],
-    }
-    with pytest.raises(te.FormalPlanMismatch, match="incompatible arm identity schema"):
-        te._validate_e2e_formal_plan(cfg, snapshot, config_path)
-    snapshot.payload["arms"] = {**registered_arms, "unknown": registered_arms["full"]}
-    with pytest.raises(te.FormalPlanMismatch, match="incompatible arm identity schema"):
-        te._validate_e2e_formal_plan(cfg, snapshot, config_path)
-    snapshot.payload["arms"] = registered_arms
-
-    def dirty_run(command: list[str], **_: object) -> SimpleNamespace:
-        return SimpleNamespace(
-            stdout=("b" * 40 + "\n") if "rev-parse" in command else "src/train_b0.py\n"
-        )
-
-    monkeypatch.setattr(te.subprocess, "run", dirty_run)
-    with pytest.raises(te.FormalPlanMismatch, match="clean live checkout"):
-        te._validate_e2e_formal_plan(cfg, snapshot, config_path)
-    monkeypatch.setattr(te.subprocess, "run", fake_run)
-    mismatched_config = tmp_path / config_path.name
-    mismatched_config.write_bytes(config_path.read_bytes() + b"\n# digest mismatch\n")
-    with pytest.raises(te.FormalPlanMismatch, match="live config digest"):
-        te._validate_e2e_formal_plan(cfg, snapshot, mismatched_config)
-
-
-
-
-def test_formal_output_metadata_matches_scorer_contract(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+    Retargeted at the surviving key set after the registration excision
+    (design 2026-08-02 Sec 10): no more preregistration binding, config hash,
+    or git-derived implementation provenance -- just the plain run record the
+    trainer and scorer still rely on.
+    """
     root = Path(__file__).resolve().parents[1]
     config_path = root / "configs/egostitch_e2e_v3_full_breadth_first.yaml"
     cfg = replace(
@@ -276,40 +178,32 @@ def test_formal_output_metadata_matches_scorer_contract(
         kendall_state={},
     )
 
-    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
-        return SimpleNamespace(stdout=("b" * 40 + "\n") if "rev-parse" in command else "")
-
-    monkeypatch.setattr(te.subprocess, "run", fake_run)
     te.write_run_start_metadata(
         cfg,
         data,
         world_size=4,
         config_path=config_path,
-        formal_plan={"implementation_commit": "a" * 40},
     )
     te.write_outputs(result, cfg, data)
 
     metadata = json.loads((cfg.output_dir / "run_metadata.json").read_text())
-    assert metadata["selected_checkpoint_eligible"] is False
-    assert metadata["quality_fields_policy"] == "telemetry_only"
+    # No eligibility verdict is recorded at all: the raw per-epoch metrics in
+    # metrics.jsonl are the only basis, and reading them is the owner's call.
+    assert "checkpoint_eligible" not in metadata
+    assert "selected_checkpoint_eligible" not in metadata
+    assert "quality_fields_policy" not in metadata
     assert metadata["arm"] == "full"
-    assert metadata["arm_kind"] == "trained_checkpoint"
-    assert metadata["checkpoint_arm"] == "full"
-    assert metadata["scoring_semantics"] == {
-        "scaffold_control": "none",
-        "permanent_null": "none",
-        "primary_logit": "full",
-    }
     assert metadata["config_sha256"] == te._sha256_file(config_path)
-    assert metadata["implementation_commit"] == "a" * 40
-    assert metadata["implementation_tracked_clean"] is True
-    assert metadata["implementation_tracked_status_sha256"] == hashlib.sha256(b"").hexdigest()
     assert metadata["checkpoint_sha256"] == te._sha256_file(cfg.output_dir / "best.pt")
     assert te._E2E_VALIDATION_ROLE == "V_hold"
     assert metadata["validation_role"] == "V_hold"
-    assert metadata["run_provenance"]["checkpoint_policy_version"] == (
-        te.E2E_CHECKPOINT_POLICY_VERSION
-    )
+    assert metadata["run_kind"] == "formal"
+    assert metadata["world_size"] == 4
+    assert metadata["rho_train"] == data.rho_train
+    assert metadata["access_audit"] == data.access_audit
+    assert metadata["training_diagnostics"]["fidelity_series"] == [
+        entry["fidelity"] for entry in result.history
+    ]
 
 
 

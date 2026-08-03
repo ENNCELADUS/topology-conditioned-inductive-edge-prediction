@@ -112,7 +112,6 @@ def _config_mapping(tmp_path: Path, **overrides: object) -> dict[str, Any]:
         "seed": 0,
         "output_dir": str(tmp_path / "out"),
         "mixed_precision": "bf16",
-        "preregistration": str(tmp_path / "prereg.json"),
         "training": {},
     }
     mapping.update(overrides)
@@ -148,7 +147,6 @@ class TestLoadConfig:
         assert cfg.data.train_positives == "e_sup"
         assert cfg.diagnostics.gradient_probe_interval == 50
         assert cfg.diagnostics.gradient_imbalance_steps == 200
-        assert cfg.preregistration == tmp_path / "prereg.json"
         assert cfg.runtime is None
 
     def test_runtime_accepts_family_specific_token_budget(self, tmp_path: Path) -> None:
@@ -209,14 +207,6 @@ class TestLoadConfig:
         runtime = dict(_RUNTIME, **{retired_key: 1})
         with pytest.raises(ValueError, match="unknown config keys"):
             te.load_config(_write_config(tmp_path, runtime=runtime))
-
-    def test_missing_preregistration_key_rejected(self, tmp_path: Path) -> None:
-        mapping = _config_mapping(tmp_path)
-        del mapping["preregistration"]
-        path = tmp_path / "config.yaml"
-        path.write_text(yaml.safe_dump(mapping))
-        with pytest.raises(ValueError, match="preregistration"):
-            te.load_config(path)
 
     def test_accepts_pack_dir(self, tmp_path: Path) -> None:
         mapping = _config_mapping(tmp_path)
@@ -321,7 +311,6 @@ def _toy_bundle(tmp_path: Path, model_cfg: EgoStitchConfig) -> te.EgoStitchData:
 
 
 def _toy_cfg(tmp_path: Path) -> te.EgoConfig:
-    (tmp_path / "prereg.json").write_text('{"registration_id": "toy"}\n')
     return te.EgoConfig(
         model=te.ModelConfig(family="egostitch_e2e", config=dict(_E2E_TINY_MODEL)),
         data=te.EgoDataConfig(
@@ -353,7 +342,6 @@ def _toy_cfg(tmp_path: Path) -> te.EgoConfig:
         seed=0,
         output_dir=tmp_path / "out",
         mixed_precision="no",
-        preregistration=tmp_path / "prereg.json",
         training=te.EgoStitchTrainingConfig(),
     )
 

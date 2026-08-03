@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import inspect
 import json
 from collections.abc import Callable
@@ -172,58 +171,10 @@ class TestE2EConfigRejection:
             E2EConfig.from_mapping({"permanent_null": "topo_head"})
 
 
-# --------------------------------------------------------------------------- registration snapshot
+# --------------------------------------------------------------------------- ddp run config
 
 
-class TestRegistrationRunMode:
-    def test_formal_worker_accepts_draft_with_null_run_evidence(self, tmp_path: Path) -> None:
-        cfg = _toy_cfg(tmp_path)
-        cfg.preregistration.write_text(
-            json.dumps(
-                {
-                    "status": "DRAFT",
-                    "run_evidence_placeholders": {
-                        "implementation": None,
-                        "runtime_and_peak_memory": None,
-                    },
-                }
-            )
-        )
-        e2e_cfg = replace(cfg, model=replace(cfg.model, family="egostitch_e2e"))
-
-        prepared, is_debug, _ = te.prepare_ddp_run_config(e2e_cfg, max_steps=None)
-        assert prepared == e2e_cfg
-        assert is_debug is False
-
-
-
-
-    def test_active_e2e_config_uses_current_training_contract(self) -> None:
-        """The active arm is v3; the v2 configs are byte-frozen BINDING evidence.
-
-        `optimizer_groups` is registered once, in the v2 registration the v3
-        draft names as its predecessor, so the group clip norms are resolved
-        through that link — and the link's own digest is checked, because an
-        unverified pointer would let the contract be re-pinned silently.
-        """
-        root = Path(__file__).resolve().parents[1]
-        cfg = te.load_config(root / "configs/egostitch_e2e_v3_full_breadth_first.yaml")
-        assert cfg.model.family == "egostitch_e2e"
-        assert cfg.training == te.EgoStitchTrainingConfig()
-        assert cfg.training.pair_encoder_clip_norm == 3.0
-        assert cfg.training.generator_clip_norm == 3.0
-        assert cfg.training.clip_norm == 1.0
-        registration = json.loads(cfg.preregistration.read_text(encoding="utf-8"))
-        predecessor = registration["predecessor"]
-        assert predecessor["status"] == "BINDING"
-        predecessor_path = root / predecessor["path"]
-        assert hashlib.sha256(predecessor_path.read_bytes()).hexdigest() == predecessor["sha256"]
-        bound = json.loads(predecessor_path.read_text(encoding="utf-8"))
-        registered_groups = bound["training_contract"]["optimizer_groups"]
-        assert registered_groups["pair_encoder_head"]["grad_clip_l2"] == 3.0
-        assert registered_groups["generator"]["grad_clip_l2"] == 3.0
-        assert registered_groups["topology_content_conditioning"]["grad_clip_l2"] == 1.0
-
+class TestDdpRunConfigPreparation:
     def test_bounded_e2e_worker_run_is_forbidden(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="--max-steps forbidden"):
             te.prepare_ddp_run_config(_toy_cfg(tmp_path), max_steps=1)
@@ -264,7 +215,7 @@ class TestRunKindDomain:
     def test_run_kind_is_not_part_of_the_scientific_config(self, tmp_path: Path) -> None:
         cfg = _e2e_training_cfg(tmp_path)
         assert "run_kind" not in te.config_to_dict(cfg)
-        assert te._config_hash(replace(cfg, run_kind="debug")) == te._config_hash(
+        assert te.config_to_dict(replace(cfg, run_kind="debug")) == te.config_to_dict(
             replace(cfg, run_kind="formal")
         )
 
@@ -325,9 +276,6 @@ class TestModelConfigHash:
             pytest.param(
                 lambda cfg: replace(cfg, data=replace(cfg.data, root=Path("/elsewhere"))),
                 id="data_root",
-            ),
-            pytest.param(
-                lambda cfg: replace(cfg, preregistration=Path("/elsewhere.json")), id="prereg"
             ),
             pytest.param(
                 lambda cfg: replace(cfg, optim=replace(cfg.optim, epochs=30)), id="epochs"
@@ -426,18 +374,6 @@ class TestRegisteredDiagnostics:
 
 
 class TestRunStartMetadata:
-    def test_preregistration_snapshot_survives_later_file_replacement(self, tmp_path: Path) -> None:
-        cfg = _toy_cfg(tmp_path)
-        data = _toy_bundle(tmp_path, EgoStitchConfig())
-        snapshot = te._preregistration_snapshot(cfg.preregistration)
-        cfg.preregistration.write_text('{"registration_id": "changed"}\n')
-        te.write_run_start_metadata(cfg, data, world_size=1, preregistration_sha256=snapshot.sha256)
-        te.write_outputs(_stub_result(), cfg, data)
-        completed = json.loads((cfg.output_dir / "run_metadata.json").read_text())
-        assert completed["status"] == "complete"
-        assert completed["preregistration_sha256"] == snapshot.sha256
-        assert completed["preregistration_sha256"] != te._sha256_file(cfg.preregistration)
-
     def test_records_the_bound_feature_stats_digest(self, tmp_path: Path) -> None:
         cfg = _toy_cfg(tmp_path)
         data = _toy_bundle(tmp_path, EgoStitchConfig())

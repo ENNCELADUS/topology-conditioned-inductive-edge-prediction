@@ -120,7 +120,6 @@ def _cfg(tmp_path: Path, *, strategy: str = _STRATEGY, training: bool = True) ->
         seed=0,
         output_dir=tmp_path / "out",
         mixed_precision="no",
-        preregistration=tmp_path / "prereg.json",
         training=te.EgoStitchTrainingConfig() if training else None,
     )
 
