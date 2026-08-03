@@ -34,6 +34,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
+from numpy.typing import NDArray
 
 from src.eval.edge_metrics import compute_edge_metrics
 from src.score_universe import load_scores, validate_artifact_precision
@@ -42,6 +43,34 @@ logger = logging.getLogger(__name__)
 
 #: Row label written by `src.score_universe` for a pair it could not label.
 _UNLABELED = -1
+
+
+def _stratum_metrics(
+    labels: NDArray[np.int64],
+    probs: NDArray[np.float64],
+    *,
+    threshold: float,
+    ece_bins: int,
+    name: str,
+) -> dict[str, object] | None:
+    """Compute one stratum's metrics, or `None` when it cannot carry them.
+
+    A stratum with no rows, or with only one label class, has undefined
+    AUROC/AUPRC/MCC. Spec §9.4 still requires the stratum to appear in the
+    report, so it is emitted as an explicit null with a reason rather than
+    silently dropped or filled with NaN.
+    """
+    n_rows = int(labels.size)
+    n_pos = int((labels == 1).sum())
+    if n_rows == 0:
+        logger.info("%s stratum: empty", name)
+        return None
+    if n_pos == 0 or n_pos == n_rows:
+        logger.warning(
+            "%s stratum: single-class (%d/%d positive); metrics undefined", name, n_pos, n_rows
+        )
+        return None
+    return asdict(compute_edge_metrics(labels, probs, threshold=threshold, ece_bins=ece_bins))
 
 
 def report_edge_metrics(
@@ -53,6 +82,11 @@ def report_edge_metrics(
 ) -> dict[str, object]:
     """Load a scores artifact and compute its edge-level classification metrics.
 
+    Emits the overall block *and* the self / non-self split, plus a self-loop-rate
+    row, as required by ``docs/05-egostitch-spec.md`` §9.4 rule 3: self-loops are
+    first-class labeled ``(u, u)`` queries in this benchmark, so a single
+    aggregate block can conceal materially different self-loop behavior.
+
     Args:
         scores_path: Path to a ``.npz`` written by :mod:`src.score_universe`.
         expect_pairs_source: When set, require ``meta["pairs_source"]`` to equal
@@ -62,13 +96,15 @@ def report_edge_metrics(
         ece_bins: Bin count for expected calibration error.
 
     Returns:
-        A JSON-serializable dict carrying the metric block plus the artifact
+        A JSON-serializable dict carrying the overall metric block, the
+        ``self``/``non_self`` strata, the self-loop-rate row, and the artifact
         provenance needed to trace it back to a checkpoint.
 
     Raises:
         ValueError: If the artifact fails its precision contract, its
-            ``pairs_source`` contradicts `expect_pairs_source`, or it contains
-            unlabeled rows (which cannot enter a classification metric).
+            ``pairs_source`` contradicts `expect_pairs_source`, it contains
+            unlabeled rows, or it is a partial shard rather than a merged
+            artifact.
     """
     artifact = load_scores(scores_path)
     # The only correct entry point: calling validate_score_precision directly on
@@ -82,24 +118,47 @@ def report_edge_metrics(
         )
 
     labels = artifact.label
+    n_rows = int(labels.size)
+
+    # A single distributed shard loads cleanly but carries only its own rows while
+    # its metadata still records the full universe, so metrics computed from it
+    # would silently describe a subset. Merge shards first (score_universe merge).
+    meta_rows = artifact.meta.get("num_rows")
+    if isinstance(meta_rows, int) and meta_rows != n_rows:
+        raise ValueError(
+            f"{scores_path}: loaded {n_rows} rows but metadata declares {meta_rows}; "
+            "this looks like a partial shard — merge shards before reporting"
+        )
+
     n_unlabeled = int((labels == _UNLABELED).sum())
     if n_unlabeled:
         raise ValueError(
-            f"{scores_path}: {n_unlabeled} of {labels.size} rows are unlabeled (-1); "
+            f"{scores_path}: {n_unlabeled} of {n_rows} rows are unlabeled (-1); "
             "edge-level classification metrics require a fully labeled pair set"
         )
 
-    metrics = compute_edge_metrics(
-        labels.astype(np.int64), artifact.probs(), threshold=threshold, ece_bins=ece_bins
-    )
+    labels64 = labels.astype(np.int64)
+    probs = artifact.probs()
+    is_self = artifact.u_idx == artifact.v_idx
+
+    metrics = compute_edge_metrics(labels64, probs, threshold=threshold, ece_bins=ece_bins)
     logger.info(
-        "%s: %d rows, AUROC %.6f AUPRC %.6f ECE %.6f",
+        "%s: %d rows (%d self), AUROC %.6f AUPRC %.6f ECE %.6f",
         scores_path,
-        labels.size,
+        n_rows,
+        int(is_self.sum()),
         metrics.auroc,
         metrics.auprc,
         metrics.ece,
     )
+
+    # Spec §9.4 rule 3: predicted vs reference self-loop counts, reported as its
+    # own row rather than folded into the aggregate metrics.
+    self_loop_rate = {
+        "self_rows": int(is_self.sum()),
+        "reference_positive": int((labels64[is_self] == 1).sum()),
+        "predicted_positive": int((probs[is_self] >= threshold).sum()),
+    }
 
     return {
         "scores_path": str(scores_path),
@@ -107,10 +166,25 @@ def report_edge_metrics(
         "model_family": artifact.meta.get("model_family"),
         "pairs_source": pairs_source,
         "strategy": artifact.meta.get("strategy"),
-        "num_rows": int(labels.size),
+        "num_rows": n_rows,
         "threshold": threshold,
         "ece_bins": ece_bins,
         "metrics": asdict(metrics),
+        "metrics_self": _stratum_metrics(
+            labels64[is_self],
+            probs[is_self],
+            threshold=threshold,
+            ece_bins=ece_bins,
+            name="self",
+        ),
+        "metrics_non_self": _stratum_metrics(
+            labels64[~is_self],
+            probs[~is_self],
+            threshold=threshold,
+            ece_bins=ece_bins,
+            name="non_self",
+        ),
+        "self_loop_rate": self_loop_rate,
     }
 
 

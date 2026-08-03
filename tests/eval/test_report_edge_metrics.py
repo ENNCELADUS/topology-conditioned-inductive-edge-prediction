@@ -133,6 +133,145 @@ class TestReportEdgeMetrics:
         assert high["threshold"] == 0.9
 
 
+class TestSelfNonSelfSplit:
+    """Spec §9.4 rule 3: overall metrics *and* the self / non-self split."""
+
+    def _write_with_self_pairs(self, path: Path) -> None:
+        """Write an artifact containing both ``(u, u)`` and ``(u, v)`` rows."""
+        labels = np.array([1, 0, 1, 0, 1, 0], dtype=np.int8)
+        logits = np.array([2.0, -1.5, 0.5, -0.25, 3.0, -2.0], dtype=np.float32)
+        # Rows 0 and 1 are self-pairs; the rest are distinct-endpoint pairs.
+        u_idx = np.array([0, 1, 2, 3, 4, 5], dtype=np.int32)
+        v_idx = np.array([0, 1, 3, 4, 5, 6], dtype=np.int32)
+        save_scores(
+            path,
+            node_ids=[f"node_{i:03d}" for i in range(7)],
+            u_idx=u_idx,
+            v_idx=v_idx,
+            logit=logits,
+            label=labels,
+            row_start=0,
+            meta={
+                "checkpoint_id": "deadbeefcafe0000",
+                "model_family": "v3_1",
+                "pairs_source": "test",
+                "strategy": "breadth_first",
+                "num_rows": 6,
+                "created_utc": "2026-08-03T00:00:00Z",
+                "torch_version": "2.10.0+cu128",
+            },
+        )
+
+    def test_reports_both_strata_and_self_loop_rate(self, tmp_path: Path) -> None:
+        """Both strata and the self-loop-rate row are present."""
+        path = tmp_path / "test.npz"
+        self._write_with_self_pairs(path)
+
+        report = report_edge_metrics(path)
+
+        assert report["metrics"]["n_pos"] + report["metrics"]["n_neg"] == 6
+        # Rows 0,1 are self (one positive, one negative) -> two-class, computable.
+        assert report["metrics_self"] is not None
+        assert report["metrics_self"]["n_pos"] == 1
+        assert report["metrics_self"]["n_neg"] == 1
+        assert report["metrics_non_self"]["n_pos"] == 2
+        assert report["metrics_non_self"]["n_neg"] == 2
+        assert report["self_loop_rate"] == {
+            "self_rows": 2,
+            "reference_positive": 1,
+            "predicted_positive": 1,
+        }
+
+    def test_single_class_self_stratum_is_null_not_a_crash(self, tmp_path: Path) -> None:
+        """An all-positive self stratum is emitted as null with the row still counted.
+
+        This is the real benchmark's shape: every ``(u, u)`` row in
+        ``test_edges.txt`` is positive, so AUROC/AUPRC are undefined there.
+        """
+        path = tmp_path / "test.npz"
+        labels = np.array([1, 1, 1, 0, 1, 0], dtype=np.int8)
+        save_scores(
+            path,
+            node_ids=[f"node_{i:03d}" for i in range(7)],
+            u_idx=np.array([0, 1, 2, 3, 4, 5], dtype=np.int32),
+            v_idx=np.array([0, 1, 3, 4, 5, 6], dtype=np.int32),
+            logit=np.array([2.0, 1.5, 0.5, -0.25, 3.0, -2.0], dtype=np.float32),
+            label=labels,
+            row_start=0,
+            meta={
+                "checkpoint_id": "deadbeefcafe0000",
+                "model_family": "v3_1",
+                "pairs_source": "test",
+                "strategy": "breadth_first",
+                "num_rows": 6,
+                "created_utc": "2026-08-03T00:00:00Z",
+                "torch_version": "2.10.0+cu128",
+            },
+        )
+
+        report = report_edge_metrics(path)
+
+        assert report["metrics_self"] is None
+        assert report["self_loop_rate"]["self_rows"] == 2
+        assert report["self_loop_rate"]["reference_positive"] == 2
+        assert report["metrics_non_self"] is not None
+
+    def test_non_self_metrics_differ_from_aggregate(self, tmp_path: Path) -> None:
+        """The split is not cosmetic: removing self rows changes the numbers.
+
+        Self rows are perfectly ranked while the non-self stratum carries one
+        inversion, so the aggregate AUROC is optimistic relative to non-self --
+        the same direction seen on the real benchmark, where every ``(u, u)``
+        row is a positive the model gets right for free.
+        """
+        path = tmp_path / "test.npz"
+        save_scores(
+            path,
+            node_ids=[f"node_{i:03d}" for i in range(7)],
+            u_idx=np.array([0, 1, 2, 3, 4, 5], dtype=np.int32),
+            v_idx=np.array([0, 1, 3, 4, 5, 6], dtype=np.int32),
+            # self: +2.0 (pos), -1.5 (neg) -> perfectly ranked.
+            # non-self: 0.5 (pos) ranked below 1.0 (neg) -> one inversion.
+            logit=np.array([2.0, -1.5, 0.5, 1.0, 3.0, -2.0], dtype=np.float32),
+            label=np.array([1, 0, 1, 0, 1, 0], dtype=np.int8),
+            row_start=0,
+            meta={
+                "checkpoint_id": "deadbeefcafe0000",
+                "model_family": "v3_1",
+                "pairs_source": "test",
+                "strategy": "breadth_first",
+                "num_rows": 6,
+                "created_utc": "2026-08-03T00:00:00Z",
+                "torch_version": "2.10.0+cu128",
+            },
+        )
+
+        report = report_edge_metrics(path)
+
+        assert report["metrics_non_self"]["auroc"] == pytest.approx(0.75)
+        assert report["metrics"]["auroc"] == pytest.approx(8 / 9)
+        assert report["metrics_non_self"]["auroc"] < report["metrics"]["auroc"]
+
+
+class TestShardGuard:
+    """A partial shard must not be reported as the full pair view."""
+
+    def test_rejects_row_count_below_declared_num_rows(self, tmp_path: Path) -> None:
+        """Metadata declaring more rows than loaded means an unmerged shard."""
+        path = tmp_path / "shard.npz"
+        _write_artifact(path)
+        # Simulate a shard: same rows, metadata claiming the full universe.
+        with np.load(path, allow_pickle=False) as data:
+            arrays = {key: data[key] for key in data.files}
+        meta = json.loads(str(arrays["meta"]))
+        meta["num_rows"] = 2_037_171
+        arrays["meta"] = np.array(json.dumps(meta, sort_keys=True))
+        np.savez_compressed(path, **arrays)
+
+        with pytest.raises(ValueError, match="partial shard"):
+            report_edge_metrics(path)
+
+
 class TestCli:
     """The ``python -m src.eval.report_edge_metrics`` entry point."""
 
