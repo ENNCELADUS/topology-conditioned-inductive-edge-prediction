@@ -1,9 +1,21 @@
-# EgoStitch E2E stability-screen matched f-only arm (spec §13.19).
-# Rehearsal uses all auto-detected H20s; bound formal execution requires exactly 4 x H20.
+# EgoStitch E2E rev-4 null-generator arm (three-component refactor design
+# 2026-08-02 §3.3, §8, §12 P3): `generator.name: "null"` selects
+# `NullGenerator`, whose `stitch` always returns `None`, so the composite
+# never builds a graph or an encoder and the classifier scores every pair
+# unconditioned -- the pure pairwise (B0) baseline, reachable by config alone
+# rather than a separate model family. `feature_standardization` is pinned to
+# `row_layernorm` here (not the D0 `zscore_vfit_v1` default the sibling v3
+# arms use) because `NullGenerator` carries no `EgoStitchConfig` of its own to
+# bind V_fit statistics onto; `row_layernorm` binds no stats digest, so no
+# statistics binding is attempted for this arm.
 
 model:
   family: egostitch_e2e
   config:
+    generator:
+      name: "null"
+      n_ground: 50
+      feature_standardization: row_layernorm
     encoder:
       name: ste_typed
       dim: 128
@@ -13,7 +25,7 @@ model:
       xattn_heads: 8
       n_inj: 1
       p_topo: 0.15
-      permanent_null: all_head
+      permanent_null: none
 
 data:
   root: data
@@ -75,23 +87,19 @@ eval:
   eval_every: 1
 
 seed: 0
-output_dir: outputs/egostitch_e2e_stage1/f_only
+output_dir: outputs/egostitch_e2e_stage1_v3/null_generator
 mixed_precision: "bf16"
 
 runtime:
   world_size: auto
-  pack_dir: outputs/feature_packs/egostitch_f0
+  pack_dir: outputs/feature_packs/egostitch_e2e_v_hold_ng50
   pack_workers: 8
   loader_workers_per_rank: 0
   prefetch_factor: 2
-  token_budget_candidates: [128]
+  token_budget: 128
   max_pairs_per_rank: 1048576
   memory_limit_gib: 85.0
-  total_budget_seconds: 30300
+  total_budget_seconds: 27720
   pack_budget_seconds: 1200
-  setup_probe_budget_seconds: 2100
   train_eval_budget_seconds: 26400
   artifact_budget_seconds: 120
-  reserve_seconds: 480
-  probe_warmup_steps: 5
-  probe_timed_steps: 15

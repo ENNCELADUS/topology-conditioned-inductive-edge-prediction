@@ -86,7 +86,9 @@ def _cfg(tmp_path: Path, *, strategy: str = _STRATEGY, training: bool = True) ->
     """
     caches = tmp_path / "caches"
     return te.EgoConfig(
-        model=ModelConfig(family=te._EGOSTITCH_E2E_FAMILY, config={"n_ground": _N_GROUND}),
+        model=ModelConfig(
+            family=te._EGOSTITCH_E2E_FAMILY, config={"generator": {"n_ground": _N_GROUND}}
+        ),
         data=te.EgoDataConfig(
             root=tmp_path / "data",
             strategy=strategy,

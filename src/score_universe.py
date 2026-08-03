@@ -1044,22 +1044,35 @@ def _build_v3_1(model_config: dict[str, object]) -> nn.Module:
 def _build_egostitch_e2e(model_config: dict[str, object]) -> nn.Module:
     """Build an `EgoStitchModel` from its checkpointed config (design rev 3).
 
-    Three-component refactor design (2026-08-02): the internal Stage-1
-    generator keeps its own pinned spec defaults
-    (``EgoStitchConfig()``, spec Sec 13) except for `n_ground` and the rev-3.1
-    calibration fields `tau_adj`, `tau_div`, and `l_gate_pos_weight`, which
-    are checkpoint-configurable via `E2EConfig` (spec Sec 14.4.1-14.4.4).
-    The remaining pair-trunk/conditioning fields in `E2EConfig` are likewise
-    checkpoint-configurable (design rev 3 Sec 3.4-3.5). `EgoStitchModel`
-    replaces `EgoStitchE2E`; the family name `egostitch_e2e` and `E2EConfig`
-    itself are unchanged (design §8).
+    Three-component refactor design (2026-08-02) Sec 8/P3: `E2EConfig` is now
+    three nested sub-configs -- `generator`/`encoder`/`classifier`, each its
+    own strict `from_mapping` (`GeneratorConfig`/`EncoderConfig`/
+    `ClassifierConfig`) -- in place of the old flat field list. The internal
+    Stage-1 generator still keeps its own pinned spec defaults
+    (``EgoStitchConfig()``, spec Sec 13) except for the fields the nested
+    `generator` sub-config supersedes (`n_ground`, `tau_adj`, `tau_div`,
+    `l_gate_pos_weight`, spec Sec 14.4.1-14.4.4). `EgoStitchModel` replaces
+    `EgoStitchE2E`; the family name `egostitch_e2e` and `E2EConfig` itself
+    are unchanged (design Sec 8).
+
+    No compatibility shim is written for the pre-refactor flat schema
+    (design Sec 11): a checkpoint whose `model_config` still carries the old
+    top-level fields (`d_model`/`ste_dim`/`n_ground`/...) instead of the three
+    nested sub-configs predates this refactor and cannot be loaded.
+    `E2EConfig.from_mapping` itself detects that shape (it recognizes every
+    pre-P3 flat field name) and raises naming the schema change -- "E2EConfig
+    no longer accepts the flat model.config schema ... nest fields under
+    'generator:'/'encoder:'/'classifier:' instead" -- rather than the opaque
+    "unknown E2E config keys" a plain unknown-key rejection would give for a
+    mapping that never mentions `generator`/`encoder`/`classifier` at all, so
+    no separate guard is needed here.
     """
     from src.model.egostitch.composite import EgoStitchModel
     from src.model.egostitch.config import E2EConfig
 
     # Checkpointed configs are inherently dynamic (parsed from a .pt payload),
-    # so the kwargs unpack goes through Any deliberately.
-    return EgoStitchModel(E2EConfig(**cast(dict[str, Any], model_config)))
+    # so the mapping goes through Any deliberately.
+    return EgoStitchModel(E2EConfig.from_mapping(cast(dict[str, Any], model_config)))
 
 
 MODEL_BUILDERS: dict[str, Callable[[dict[str, object]], nn.Module]] = {
@@ -1742,9 +1755,21 @@ def _score_egostitch_e2e(
     """
     from src.data.grounding import build_grounding_pool
     from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
+    from src.model.egostitch.generator.egostitch import EgoStitchImagineGenerator
     from src.model.egostitch.generator.imagine import SlotSet
 
     assert isinstance(model, EgoStitchModel)
+    # This scorer's two-logit `full`/`f_logit` decomposition is inherently
+    # topology-conditioned; a `generator.name: null` model (design 2026-08-02
+    # §12 P3) has no `SlotSet`/topology conditioning to decompose at all
+    # (`encode_node_state` returns `slots=None`, and `full == f_logit` would
+    # be a vacuous distinction). Assert the real generator explicitly so a
+    # misrouted null-generator checkpoint fails loudly here instead of with
+    # an opaque `NoneType` crash deep in the node-state cache below.
+    assert isinstance(model.generator, EgoStitchImagineGenerator), (
+        "egostitch_e2e scoring requires the real egostitch_imagine generator, "
+        f"got {type(model.generator).__name__}"
+    )
     _reject_superseded_scaffold_control(scaffold_control)
     active_controls = (
         _SCAFFOLD_CONTROL_SHUFFLE_V3,
@@ -1834,6 +1859,10 @@ def _score_egostitch_e2e(
                     matrix[pool_rows[rows]].to(device),
                     pool_rows[rows].to(device),
                 )
+                # The `isinstance(model.generator, EgoStitchImagineGenerator)`
+                # guard above means `slots`/`projected_x` are always populated
+                # here (only `NullGenerator` leaves them `None`).
+                assert state.slots is not None and state.projected_x is not None
                 for position, node_id in enumerate(batch_nodes):
                     true_length = int(lengths[position].item())
                     ground_ids = (
@@ -1872,16 +1901,23 @@ def _score_egostitch_e2e(
             ).to(device)
         else:
             ground_ids = None
+        # `node_cache` is only ever populated above, where `slots`/
+        # `projected_x` are already asserted non-`None` (the real generator
+        # guard at the top of this function).
         return E2ENodeState(
             encoded=encoded,
             length=torch.cat([state.length for state in states], dim=0).to(device),
             slots=SlotSet(
                 *(
                     torch.cat(values, dim=0).to(device)
-                    for values in zip(*(state.slots for state in states), strict=True)
+                    for values in zip(
+                        *(cast(SlotSet, state.slots) for state in states), strict=True
+                    )
                 )
             ),
-            projected_x=torch.cat([state.projected_x for state in states], dim=0).to(device),
+            projected_x=torch.cat(
+                [cast(torch.Tensor, state.projected_x) for state in states], dim=0
+            ).to(device),
             ground_ids=ground_ids,
         )
 
@@ -2244,7 +2280,10 @@ def _run_score(args: argparse.Namespace) -> None:
         from src.model.egostitch.composite import EgoStitchModel
 
         assert isinstance(model, EgoStitchModel)
-        permanent_null = model.cfg.permanent_null
+        # Three-component refactor (design 2026-08-02 Sec 8): `permanent_null`
+        # moved from flat `model.cfg.permanent_null` to nested
+        # `model.cfg.classifier.permanent_null`.
+        permanent_null = model.cfg.classifier.permanent_null
         primary_logit = _e2e_primary_logit_key(permanent_null)
         logits = decomposed[primary_logit]
         if primary_logit != "full":

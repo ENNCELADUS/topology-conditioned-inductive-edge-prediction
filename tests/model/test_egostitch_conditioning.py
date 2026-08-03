@@ -17,7 +17,7 @@ from src.model.egostitch.classifier.b0_v31 import (
     sample_branch_masks,
 )
 from src.model.egostitch.classifier.base import HeadNullMasks
-from src.model.egostitch.config import E2EConfig
+from src.model.egostitch.config import ClassifierConfig, E2EConfig
 from torch import nn
 
 
@@ -172,9 +172,9 @@ def test_gated_xattn_identity_at_init() -> None:
 
 
 def test_conditioning_ema_decay_is_configurable_and_validated() -> None:
-    assert E2EConfig().conditioning_ema_decay == 0.99
+    assert E2EConfig().classifier.conditioning_ema_decay == 0.99
     with pytest.raises(ValueError, match="conditioning_ema_decay must be in \\(0, 1\\)"):
-        E2EConfig(conditioning_ema_decay=1.0)
+        ClassifierConfig(conditioning_ema_decay=1.0)
 
     module = GatedCrossAttention(d_model=4, n_heads=1, dropout=0.0, ema_decay=0.8)
     module._update_ema(torch.ones(1, 1, 4))

@@ -945,13 +945,18 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
 
 - **G1 — E2 hardening.** Re-run E2 with: one frozen scorer family (same as `Ours` will
   use), one candidate universe, one canonical metric normalization, a true threshold
-  sweep (recall/density-vs-MMD curves), easy *and* hard negatives, B0-alt replication,
+  sweep (recall/density-vs-MMD curves), easy *and* hard negatives, a second-architecture
+  replication (B0-alt, as actually run — see the retirement note in the Result below),
   a real-vs-real MMD noise floor, bootstrap variance over buckets/seeds, and official
   official Graph Similarity / Relative Density over the fixed induced subgraphs. Also record the full-candidate-universe
   imbalance view [DA-m17]. *Stop condition:* if the gap substantially closes under hard
   negatives or calibrated thresholds, the motivation is dead as stated and the project
   pivots to the evaluation/benchmark paper. **Result (2026-07-13): passed and closed;**
-  B0-alt preserves the topology gap under the canonical evaluator.
+  B0-alt preserves the topology gap under the canonical evaluator. B0-alt was G1's
+  architecture-independence replication, run once for that closed gate; by owner
+  decision (2026-08-03) it is retired from the forward baseline set (B0 is the sole
+  baseline) and its implementation was removed from the code tree — provenance in
+  `docs/results/E2-pair-to-topology-gap.md`.
 - **G2 — Edge-independence ceiling check (rev 2.2 semantics).** Using the reference
   graph and cached B0 scores, with Chanpuriya 2111.00048's exact identities:
   (i) compute the assembly's operating point exactly — `V(P) = Σ p_ij`,

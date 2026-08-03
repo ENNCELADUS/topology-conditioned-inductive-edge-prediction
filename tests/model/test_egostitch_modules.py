@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from src.model.egostitch.config import E2EConfig, EgoStitchConfig
+from src.model.egostitch.config import E2EConfig, EgoStitchConfig, GeneratorConfig
 from src.model.egostitch.generator.assemble import sinkhorn_plan, stitch_cost
 from src.model.egostitch.generator.imagine import (
     NULL_MODE_ALL,
@@ -86,7 +86,7 @@ class TestConfig:
         from src.model.egostitch.composite import EgoStitchModel
 
         config = E2EConfig.from_mapping(
-            {"tau_adj": 0.4, "tau_div": 0.3, "l_gate_pos_weight": 5.0}
+            {"generator": {"tau_adj": 0.4, "tau_div": 0.3, "l_gate_pos_weight": 5.0}}
         )
         model = EgoStitchModel(config)
         assert model.generator_cfg.tau_adj == 0.4
@@ -94,28 +94,33 @@ class TestConfig:
         assert model.generator_cfg.l_gate_pos_weight == 5.0
 
     def test_feature_standardization_defaults_to_the_rev32_mode(self) -> None:
-        assert E2EConfig().feature_standardization == "zscore_vfit_v1"
-        assert E2EConfig().feature_stats_sha256 == ""
+        assert E2EConfig().generator.feature_standardization == "zscore_vfit_v1"
+        assert E2EConfig().generator.feature_stats_sha256 == ""
 
     def test_feature_standardization_allowlist(self) -> None:
-        assert E2EConfig(feature_standardization="row_layernorm").feature_standardization == (
-            "row_layernorm"
-        )
+        cfg = E2EConfig(generator=GeneratorConfig(feature_standardization="row_layernorm"))
+        assert cfg.generator.feature_standardization == "row_layernorm"
         with pytest.raises(ValueError, match="feature_standardization"):
-            E2EConfig(feature_standardization="layer_norm")
+            GeneratorConfig(feature_standardization="layer_norm")
 
     def test_feature_stats_sha256_must_be_empty_or_64_hex(self) -> None:
-        assert E2EConfig(feature_stats_sha256="ab" * 32).feature_stats_sha256 == "ab" * 32
+        cfg = E2EConfig(generator=GeneratorConfig(feature_stats_sha256="ab" * 32))
+        assert cfg.generator.feature_stats_sha256 == "ab" * 32
         with pytest.raises(ValueError, match="feature_stats_sha256"):
-            E2EConfig(feature_stats_sha256="deadbeef")
+            GeneratorConfig(feature_stats_sha256="deadbeef")
         with pytest.raises(ValueError, match="feature_stats_sha256"):
-            E2EConfig(feature_stats_sha256="AB" * 32)
+            GeneratorConfig(feature_stats_sha256="AB" * 32)
 
     def test_from_mapping_accepts_the_string_fields(self) -> None:
         cfg = E2EConfig.from_mapping(
-            {"feature_standardization": "row_layernorm", "feature_stats_sha256": "cd" * 32}
+            {
+                "generator": {
+                    "feature_standardization": "row_layernorm",
+                    "feature_stats_sha256": "cd" * 32,
+                }
+            }
         )
-        assert cfg.feature_standardization == "row_layernorm"
+        assert cfg.generator.feature_standardization == "row_layernorm"
 
 
 class TestTokenizeLite:

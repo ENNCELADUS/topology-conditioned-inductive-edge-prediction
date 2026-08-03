@@ -24,6 +24,12 @@ V3_CONFIGS = {
     "no_l_rel": REPO_ROOT / "configs/egostitch_e2e_v3_no_l_rel_breadth_first.yaml",
     "row_layernorm": REPO_ROOT
     / "configs/egostitch_e2e_v3_row_layernorm_breadth_first.yaml",
+    # Three-component refactor (design 2026-08-02 §3.3, §8, §12 P3):
+    # `generator.name: "null"` demonstrates acceptance criterion 5 (a
+    # config-only pure pairwise/B0 baseline) as a seventh formal arm sharing
+    # the same data/runtime plumbing as the other six.
+    "null_generator": REPO_ROOT
+    / "configs/egostitch_e2e_v3_null_generator_breadth_first.yaml",
 }
 # Historical only: retired from the trained set in v5 but retained on disk.
 RETIRED_COSINE_POOL_CONFIG = (
@@ -32,7 +38,7 @@ RETIRED_COSINE_POOL_CONFIG = (
 
 
 def test_v3_live_arms_share_one_ng50_pack_and_grounding_cache() -> None:
-    """v5: all six trained arms are n_ground=50 and share one pack + grounding cache."""
+    """v5+null-generator: all seven trained arms are n_ground=50 and share one pack/cache."""
     config_paths = sorted(
         (REPO_ROOT / "configs").glob("egostitch_e2e_v3_*_breadth_first.yaml")
     )
@@ -44,7 +50,10 @@ def test_v3_live_arms_share_one_ng50_pack_and_grounding_cache() -> None:
         configs.append(
             (
                 path.name,
-                payload["model"]["config"]["n_ground"],
+                # Three-component refactor (design 2026-08-02 Sec 8): `n_ground`
+                # moved from flat `model.config.n_ground` to nested
+                # `model.config.generator.n_ground`.
+                payload["model"]["config"]["generator"]["n_ground"],
                 payload["runtime"]["pack_dir"],
                 payload["data"]["grounding_cache"],
                 payload["data"]["f0_cache"],

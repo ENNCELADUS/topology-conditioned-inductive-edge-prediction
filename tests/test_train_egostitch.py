@@ -14,8 +14,9 @@ factory, and registered diagnostics) lives in
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import networkx as nx
 import numpy as np
@@ -46,33 +47,64 @@ _TINY_MODEL: dict[str, object] = {
 }
 
 _E2E_TINY_MODEL: dict[str, object] = {
-    "d_model": 16,
-    "encoder_layers": 1,
-    "cross_attn_layers": 1,
-    "n_heads": 2,
-    "n_inj": 1,
-    "ste_dim": 8,
-    "ste_layers": 1,
-    "xattn_heads": 2,
-    "p_topo": 0.15,
-    # Matches the `EgoStitchConfig()` base default used to build the paired
-    # `_toy_bundle`/`_BatchFactory` fixtures in test_train_egostitch_e2e.py,
-    # so `EgoStitchModel.generator.cfg.n_ground` (E2EConfig-sourced, spec
-    # Sec 14.4.4) stays consistent with those fixtures rather than silently
-    # picking up the unrelated rev-3.1 default (50).
-    "n_ground": 20,
-    # `_toy_bundle` builds an in-memory `EgoStitchData` with `feature_stats
-    # is None` -- it never goes through `assemble_egostitch_data`'s V_fit
-    # statistics path (Task 6), so the `zscore_vfit_v1` default would raise
-    # unless a test explicitly registers statistics first. The
-    # `TestE2ECompositeStep`/`TestPrepareAndAssembleE2E`-adjacent suites that
-    # build models from this dict exercise the composite optimizer step,
-    # gates, family/budget probes, and telemetry -- not standardization --
-    # so pin the stateless, byte-identical-to-what-these-tests-were-written-
-    # against transform, exactly like `_tiny_model_and_batch` does in
-    # tests/model/test_egostitch_e2e_model.py.
-    "feature_standardization": "row_layernorm",
+    "generator": {
+        "name": "egostitch_imagine",
+        # Matches the `EgoStitchConfig()` base default used to build the
+        # paired `_toy_bundle`/`_BatchFactory` fixtures in
+        # test_train_egostitch_e2e.py, so `EgoStitchModel.generator.cfg.n_ground`
+        # (`GeneratorConfig`-sourced, spec Sec 14.4.4) stays consistent with
+        # those fixtures rather than silently picking up the unrelated
+        # rev-3.1 default (50).
+        "n_ground": 20,
+        # `_toy_bundle` builds an in-memory `EgoStitchData` with `feature_stats
+        # is None` -- it never goes through `assemble_egostitch_data`'s V_fit
+        # statistics path (Task 6), so the `zscore_vfit_v1` default would raise
+        # unless a test explicitly registers statistics first. The
+        # `TestE2ECompositeStep`/`TestPrepareAndAssembleE2E`-adjacent suites that
+        # build models from this dict exercise the composite optimizer step,
+        # gates, family/budget probes, and telemetry -- not standardization --
+        # so pin the stateless, byte-identical-to-what-these-tests-were-written-
+        # against transform, exactly like `_tiny_model_and_batch` does in
+        # tests/model/test_egostitch_e2e_model.py.
+        "feature_standardization": "row_layernorm",
+    },
+    "encoder": {
+        "name": "ste_typed",
+        "dim": 8,
+        "layers": 1,
+    },
+    "classifier": {
+        "name": "b0_v31",
+        "d_model": 16,
+        "encoder_layers": 1,
+        "cross_attn_layers": 1,
+        "n_heads": 2,
+        "n_inj": 1,
+        "xattn_heads": 2,
+        "p_topo": 0.15,
+    },
 }
+
+
+def _e2e_model_config(
+    base: Mapping[str, object] = _E2E_TINY_MODEL, **section_overrides: Mapping[str, object]
+) -> dict[str, Any]:
+    """`base` (default `_E2E_TINY_MODEL`) with each keyword merged into that section.
+
+    The nested-schema analogue of the old flat-config idiom
+    ``{**_E2E_TINY_MODEL, "permanent_null": "all_head"}``: since a field now
+    lives inside its component's own sub-mapping, overriding it means merging
+    into that sub-mapping rather than the top level. Example:
+    ``_e2e_model_config(classifier={"permanent_null": "all_head"})`` returns
+    ``base`` with only ``classifier.permanent_null`` overridden -- every other
+    ``classifier`` field, and every other section, is left at ``base``'s value.
+    """
+    merged: dict[str, Any] = {
+        key: dict(cast(Mapping[str, object], value)) for key, value in base.items()
+    }
+    for section, overrides in section_overrides.items():
+        merged.setdefault(section, {}).update(overrides)
+    return merged
 
 
 def _config_mapping(tmp_path: Path, **overrides: object) -> dict[str, Any]:

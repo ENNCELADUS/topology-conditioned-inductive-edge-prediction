@@ -287,7 +287,15 @@ def test_real_probe_producer_artifact_is_accepted_by_g5_evaluator(
     token_pack = tmp_path / "token-pack"
     _write_tiny_token_pack(token_pack, nodes, min_length=3)
 
-    model_config = {**_E2E_TINY_MODEL, "n_ground": 3}
+    # Three-component refactor (design 2026-08-02 Sec 8): `n_ground` moved
+    # from the flat `_E2E_TINY_MODEL` onto its nested `generator` sub-config.
+    model_config = {
+        **_E2E_TINY_MODEL,
+        "generator": {
+            **cast(dict[str, object], _E2E_TINY_MODEL["generator"]),
+            "n_ground": 3,
+        },
+    }
     base_cfg = _toy_cfg(tmp_path)
     cfg = replace(
         base_cfg,

@@ -15,7 +15,13 @@ from typing import cast
 import pytest
 import torch
 from src.model.egostitch.composite import EgoStitchModel
-from src.model.egostitch.config import E2EConfig, EgoStitchConfig
+from src.model.egostitch.config import (
+    ClassifierConfig,
+    E2EConfig,
+    EgoStitchConfig,
+    EncoderConfig,
+    GeneratorConfig,
+)
 from src.model.egostitch.generator import (
     EgoStitchImagineGenerator,
     GeneratorNodeState,
@@ -270,15 +276,16 @@ def test_matches_live_e2e_build_pair_context(monkeypatch: pytest.MonkeyPatch) ->
     """
     torch.manual_seed(0)
     cfg = E2EConfig(
-        d_model=16,
-        encoder_layers=1,
-        cross_attn_layers=1,
-        n_heads=2,
-        n_inj=1,
-        ste_dim=8,
-        ste_layers=1,
-        xattn_heads=2,
-        feature_standardization="row_layernorm",
+        generator=GeneratorConfig(feature_standardization="row_layernorm"),
+        encoder=EncoderConfig(dim=8, layers=1),
+        classifier=ClassifierConfig(
+            d_model=16,
+            encoder_layers=1,
+            cross_attn_layers=1,
+            n_heads=2,
+            n_inj=1,
+            xattn_heads=2,
+        ),
     )
     model = EgoStitchModel(cfg).eval()
 
@@ -328,14 +335,20 @@ def test_matches_live_e2e_build_pair_context(monkeypatch: pytest.MonkeyPatch) ->
 
     generator = EgoStitchImagineGenerator(
         model.generator_cfg,
-        # `E2EConfig.feature_standardization` is a runtime-validated plain
-        # `str` (`config.py`'s `__post_init__`), not the narrower
+        # `GeneratorConfig.feature_standardization` is a runtime-validated
+        # plain `str` (`config.py`'s `__post_init__`), not the narrower
         # `FeatureStandardizationMode` literal `EgoStitchImagineGenerator`
-        # expects; same cast `composite.py`'s own `EgoStitchModel.__init__`
-        # uses for this exact value.
-        feature_standardization=cast(FeatureStandardizationMode, cfg.feature_standardization),
+        # expects; same cast `registry.build_generator` uses for this exact
+        # value.
+        feature_standardization=cast(
+            FeatureStandardizationMode, cfg.generator.feature_standardization
+        ),
         loss_family="egostitch_e2e",
     )
+    # `model.generator`'s static type is the `NeighborhoodGenerator` ABC now
+    # that construction is registry-driven (design §12 P3); narrow to the
+    # concrete class this test always builds to reach `.stage1`.
+    assert isinstance(model.generator, EgoStitchImagineGenerator)
     generator.stage1 = model.generator.stage1  # share the exact live weights
     generator.eval()
 

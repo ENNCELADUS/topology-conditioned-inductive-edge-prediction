@@ -23,6 +23,7 @@ from src.model.egostitch.config import E2EConfig
 from tests.test_train_egostitch import (
     _E2E_TINY_MODEL,
     _config_mapping,
+    _e2e_model_config,
     _toy_bundle,
     _toy_cfg,
 )
@@ -166,11 +167,12 @@ class TestE2EConfigRejection:
 
     def test_e2e_permanent_null_accepts_only_registered_values(self) -> None:
         for value in ("none", "all_head"):
-            assert E2EConfig.from_mapping({"permanent_null": value}).permanent_null == value
+            cfg = E2EConfig.from_mapping({"classifier": {"permanent_null": value}})
+            assert cfg.classifier.permanent_null == value
         with pytest.raises(ValueError, match="permanent_null"):
-            E2EConfig.from_mapping({"permanent_null": "content_head"})
+            E2EConfig.from_mapping({"classifier": {"permanent_null": "content_head"}})
         with pytest.raises(ValueError, match="permanent_null"):
-            E2EConfig.from_mapping({"permanent_null": "topo_head"})
+            E2EConfig.from_mapping({"classifier": {"permanent_null": "topo_head"}})
 
 
 # --------------------------------------------------------------------------- ddp run config
@@ -226,7 +228,7 @@ class TestFeatureDigestPinByRunKind:
     """Feature-stat identity stays pinned independently of quality telemetry."""
 
     def _model_and_data(self, tmp_path: Path) -> tuple[EgoStitchModel, te.EgoStitchData]:
-        config = {**_E2E_TINY_MODEL, "feature_standardization": "zscore_vfit_v1"}
+        config = _e2e_model_config(generator={"feature_standardization": "zscore_vfit_v1"})
         model = EgoStitchModel(E2EConfig.from_mapping(config))
         data = _toy_bundle(tmp_path, EgoStitchConfig())
         rows = np.arange(4 * model.generator_cfg.input_dim, dtype=np.float32).reshape(4, -1)
@@ -239,7 +241,7 @@ class TestFeatureDigestPinByRunKind:
             cfg,
             model=replace(
                 cfg.model,
-                config={**_E2E_TINY_MODEL, "feature_standardization": "zscore_vfit_v1"},
+                config=_e2e_model_config(generator={"feature_standardization": "zscore_vfit_v1"}),
             ),
         )
 
@@ -261,7 +263,10 @@ class TestFeatureDigestPinByRunKind:
         cfg = replace(
             cfg,
             model=replace(
-                cfg.model, config={**cfg.model.config, "feature_stats_sha256": "ab" * 32}
+                cfg.model,
+                config=_e2e_model_config(
+                    cfg.model.config, generator={"feature_stats_sha256": "ab" * 32}
+                ),
             ),
         )
         with pytest.raises(RuntimeError, match="feature_stats_sha256 mismatch"):
@@ -288,7 +293,9 @@ class TestModelConfigHash:
                     cfg,
                     model=replace(
                         cfg.model,
-                        config={**cfg.model.config, "feature_stats_sha256": "ab" * 32},
+                        config=_e2e_model_config(
+                            cfg.model.config, generator={"feature_stats_sha256": "ab" * 32}
+                        ),
                     ),
                 ),
                 id="feature_stats_sha256",

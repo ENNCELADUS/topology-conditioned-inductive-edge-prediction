@@ -25,9 +25,10 @@ from src.data.feature_stats import compute_feature_stats
 from src.data.features import FeatureStore, build_f0_matrix
 from src.data.grounding import build_grounding_pool
 from src.data.packed_features import PackedFeatureTable, build_packed_features
-from src.model.egostitch.classifier.b0_v31 import V3_1, GatedCrossAttention
+from src.model.egostitch.classifier.b0_v31 import V3_1, B0V31PairClassifier, GatedCrossAttention
 from src.model.egostitch.composite import E2ENodeState, E2EPairContext, EgoStitchModel
-from src.model.egostitch.config import E2EConfig
+from src.model.egostitch.config import E2EConfig, GeneratorConfig
+from src.model.egostitch.generator.egostitch import EgoStitchImagineGenerator
 
 INPUT_DIM = 4
 
@@ -167,11 +168,21 @@ def test_e2e_checkpoint_missing_w_rel_fails_loudly_instead_of_backfilling(
     is the point: silently reinterpreting a checkpoint under a config it was
     never trained with is the outcome this guards against.
     """
-    legacy_config = dict(_TINY_E2E_CONFIG)
-    legacy_config["w_rel"] = 0.0
+    # Three-component refactor (design 2026-08-02 Sec 8): `w_rel` moved from
+    # the flat `E2EConfig` onto the nested `encoder` sub-config.
+    legacy_config = {
+        **_TINY_E2E_CONFIG,
+        "encoder": {**cast(dict[str, object], _TINY_E2E_CONFIG["encoder"]), "w_rel": 0.0},
+    }
     source_model = score_universe.build_model("egostitch_e2e", legacy_config)
-    checkpoint_config = dict(legacy_config)
-    checkpoint_config.pop("w_rel")
+    checkpoint_config = {
+        **legacy_config,
+        "encoder": {
+            key: value
+            for key, value in cast(dict[str, object], legacy_config["encoder"]).items()
+            if key != "w_rel"
+        },
+    }
     checkpoint_path = tmp_path / "config-incomplete-e2e.pt"
     _write_checkpoint(
         checkpoint_path,
@@ -185,16 +196,23 @@ def test_e2e_checkpoint_missing_w_rel_fails_loudly_instead_of_backfilling(
 
 
 def test_load_pre_rev31_e2e_checkpoint_rejects_legacy_scaffold_shape(tmp_path: Path) -> None:
-    legacy_config = dict(_TINY_E2E_CONFIG)
-    legacy_config["w_rel"] = 0.0
+    legacy_config = {
+        **_TINY_E2E_CONFIG,
+        "encoder": {**cast(dict[str, object], _TINY_E2E_CONFIG["encoder"]), "w_rel": 0.0},
+    }
     source_model = score_universe.build_model("egostitch_e2e", legacy_config)
     legacy_state = dict(source_model.state_dict())
     legacy_state["encoder.embed.weight"] = legacy_state["encoder.embed.weight"][:, :9].clone()
-    for layer in range(cast(int, legacy_config["ste_layers"])):
+    # `ste_layers` was renamed `layers` and moved onto the nested `encoder`
+    # sub-config (design 2026-08-02 Sec 8).
+    encoder_config = cast(dict[str, object], legacy_config["encoder"])
+    for layer in range(cast(int, encoder_config["layers"])):
         legacy_state.pop(f"encoder.layers.{layer}.msg.3.weight")
         legacy_state.pop(f"encoder.layers.{layer}.msg.3.bias")
-    checkpoint_config = dict(legacy_config)
-    checkpoint_config.pop("w_rel")
+    checkpoint_config = {
+        **legacy_config,
+        "encoder": {key: value for key, value in encoder_config.items() if key != "w_rel"},
+    }
     checkpoint_path = tmp_path / "pre-rev31-e2e.pt"
     torch.save(
         {
@@ -226,7 +244,10 @@ def test_e2e_checkpoint_restores_the_feature_standardization(tmp_path: Path) -> 
     `_load_checkpoint`'s strict `load_state_dict` untouched.
     """
     gen = np.random.default_rng(0)
-    cfg = E2EConfig(feature_standardization="zscore_vfit_v1")
+    # Three-component refactor (design 2026-08-02 Sec 8): `feature_standardization`
+    # and `feature_stats_sha256` moved from the flat `E2EConfig` onto the nested
+    # `generator` sub-config.
+    cfg = E2EConfig(generator=GeneratorConfig(feature_standardization="zscore_vfit_v1"))
     trained = EgoStitchModel(cfg)
     rows = (30.0 + 4.0 * gen.standard_normal((32, trained.generator_cfg.input_dim))).astype(
         np.float32
@@ -235,11 +256,13 @@ def test_e2e_checkpoint_restores_the_feature_standardization(tmp_path: Path) -> 
     trained.set_feature_stats(stats)
 
     checkpoint_path = tmp_path / "best.pt"
+    model_config = asdict(cfg)
+    model_config["generator"] = {**model_config["generator"], "feature_stats_sha256": stats.digest}
     _write_checkpoint(
         checkpoint_path,
         model=trained,
         model_family="egostitch_e2e",
-        model_config={**asdict(cfg), "feature_stats_sha256": stats.digest},
+        model_config=model_config,
     )
 
     restored, model_family, _ = score_universe._load_checkpoint(checkpoint_path)
@@ -251,6 +274,11 @@ def test_e2e_checkpoint_restores_the_feature_standardization(tmp_path: Path) -> 
     # three-component refactor (design §5) moves it to `model.generator.stage1`
     # (the composite's `generator` attribute is now the `EgoStitchImagineGenerator`
     # wrapper). `normalize_features` lives on `EgoStitchStage1`, not the wrapper.
+    # Both `restored`/`trained` are built with the default (real) generator, so
+    # narrow `model.generator`'s registry-widened type explicitly (design
+    # 2026-08-02 §12 P3 introduces `NullGenerator`, which has no `.stage1`).
+    assert isinstance(restored.generator, EgoStitchImagineGenerator)
+    assert isinstance(trained.generator, EgoStitchImagineGenerator)
     torch.testing.assert_close(
         restored.generator.stage1.normalize_features(x),
         trained.generator.stage1.normalize_features(x),
@@ -269,11 +297,14 @@ def test_checkpoint_missing_feature_standardization_never_silently_switches_mode
     z-scored features. Strict loading catches it because the two modes differ in
     state: only `zscore_vfit_v1` carries `generator.stage1.feature_norm.*` buffers.
     """
-    legacy_cfg = E2EConfig(feature_standardization="row_layernorm")
+    legacy_cfg = E2EConfig(generator=GeneratorConfig(feature_standardization="row_layernorm"))
     legacy = EgoStitchModel(legacy_cfg)
-    legacy_config = {
+    # Three-component refactor (design 2026-08-02 Sec 8): both keys now live
+    # on the nested `generator` sub-config, not the top level.
+    legacy_config = asdict(legacy_cfg)
+    legacy_config["generator"] = {
         key: value
-        for key, value in asdict(legacy_cfg).items()
+        for key, value in legacy_config["generator"].items()
         if key not in {"feature_standardization", "feature_stats_sha256"}
     }
     checkpoint_path = tmp_path / "config-incomplete-e2e.pt"
@@ -885,26 +916,53 @@ def test_validate_score_precision_refuses_a_legacy_egostitch_artifact() -> None:
 # --------------------------------------------------------------------------- egostitch_e2e scoring
 # (design rev 4 two-logit decomposition, content path removed; Task 14)
 
+# Three-component refactor (design 2026-08-02 Sec 8): the flat `E2EConfig`
+# fields are now nested under `generator`/`encoder`/`classifier`
+# sub-mappings; `ste_dim`/`ste_layers` were renamed `dim`/`layers` on the
+# `encoder` sub-config.
 _TINY_E2E_CONFIG: dict[str, object] = {
-    "d_model": 32,
-    "encoder_layers": 1,
-    "cross_attn_layers": 2,
-    "n_heads": 4,
-    "n_inj": 1,
-    "ste_dim": 16,
-    "ste_layers": 2,
-    "xattn_heads": 4,
-    # Explicit rather than relying on `E2EConfig`'s rev-3.2 default
-    # (`"zscore_vfit_v1"`): these tests build checkpoints through
-    # `build_model`/`_load_checkpoint` without ever calling
-    # `set_feature_stats`, and the registered mode requires those buffers to
-    # be populated before a forward pass. Pinning the stateless rev-3.1
-    # transform keeps this shared fixture representative of what it always
-    # tested (scoring/merge/precision plumbing, not feature standardization)
-    # -- the registered-stats path is covered separately in
-    # `test_e2e_checkpoint_restores_the_feature_standardization`.
-    "feature_standardization": "row_layernorm",
+    "generator": {
+        # Explicit rather than relying on `GeneratorConfig`'s rev-3.2 default
+        # (`"zscore_vfit_v1"`): these tests build checkpoints through
+        # `build_model`/`_load_checkpoint` without ever calling
+        # `set_feature_stats`, and the registered mode requires those buffers
+        # to be populated before a forward pass. Pinning the stateless
+        # rev-3.1 transform keeps this shared fixture representative of what
+        # it always tested (scoring/merge/precision plumbing, not feature
+        # standardization) -- the registered-stats path is covered
+        # separately in `test_e2e_checkpoint_restores_the_feature_standardization`.
+        "feature_standardization": "row_layernorm",
+    },
+    "encoder": {
+        "dim": 16,
+        "layers": 2,
+    },
+    "classifier": {
+        "d_model": 32,
+        "encoder_layers": 1,
+        "cross_attn_layers": 2,
+        "n_heads": 4,
+        "n_inj": 1,
+        "xattn_heads": 4,
+    },
 }
+
+
+def _tiny_e2e_config_with_permanent_null(permanent_null: str) -> dict[str, object]:
+    """`_TINY_E2E_CONFIG` with `classifier.permanent_null` overridden.
+
+    `permanent_null` moved from the flat `E2EConfig` onto the nested
+    `classifier` sub-config (design 2026-08-02 Sec 8).
+    """
+    return {
+        **_TINY_E2E_CONFIG,
+        "classifier": {
+            **cast(dict[str, object], _TINY_E2E_CONFIG["classifier"]),
+            "permanent_null": permanent_null,
+        },
+    }
+
+
 # EgoStitchModel's internal Stage-1 generator keeps its own pinned spec default
 # (EgoStitchConfig().input_dim, spec Sec 13) regardless of E2EConfig, so the
 # feature store backing these tests must use that exact node-token dimension.
@@ -967,7 +1025,7 @@ def test_build_model_egostitch_e2e_round_trips() -> None:
 
     model = score_universe.build_model("egostitch_e2e", dict(_TINY_E2E_CONFIG))
     assert isinstance(model, EgoStitchModel)
-    assert model.cfg.d_model == 32
+    assert model.cfg.classifier.d_model == 32
 
 
 def test_egostitch_e2e_cli_scores_two_logit_decomposition(tmp_path: Path) -> None:
@@ -1015,7 +1073,7 @@ def test_egostitch_e2e_permanent_null_publishes_active_primary_logit(tmp_path: P
     # content_head is deleted with the content path (design doc §9); "none"
     # and "all_head" are the only surviving permanent_null values.
     for permanent_null, active_key in (("all_head", "f_logit"),):
-        config = {**_TINY_E2E_CONFIG, "permanent_null": permanent_null}
+        config = _tiny_e2e_config_with_permanent_null(permanent_null)
         data_root, checkpoint, pairs = _egostitch_e2e_setup(
             tmp_path / permanent_null, model_config=config
         )
@@ -1043,7 +1101,7 @@ def test_egostitch_e2e_null_arm_merge_preserves_true_full_logit(
     tmp_path: Path, permanent_null: str
 ) -> None:
     """Null-arm shards retain the distinct true full arm through merge/load."""
-    config = {**_TINY_E2E_CONFIG, "permanent_null": permanent_null}
+    config = _tiny_e2e_config_with_permanent_null(permanent_null)
     data_root, checkpoint, pairs = _egostitch_e2e_setup(
         tmp_path / permanent_null, model_config=config
     )
@@ -1166,7 +1224,10 @@ def _enable_e2e_conditioning_gates(checkpoint: Path) -> None:
     # cont_xattn is deleted with the content path (design doc §9); only the
     # topo pathway remains to make the checkpoint sensitive to perturbations.
     # `model.trunk` (an `EgoStitchE2E` attribute) is now `model.classifier.trunk`
-    # (design §5).
+    # (design §5). `model.classifier`'s registry-widened type (design §12 P3)
+    # no longer statically exposes `.trunk`, so narrow it explicitly --
+    # `_TINY_E2E_CONFIG` always selects the default `b0_v31` classifier.
+    assert isinstance(model.classifier, B0V31PairClassifier)
     for module in [*model.classifier.trunk.topo_xattn]:
         assert isinstance(module, GatedCrossAttention)
         module.gate.data.fill_(1.0)
@@ -1638,9 +1699,11 @@ def test_egostitch_e2e_scorer_supplies_grounding_batch_keys(
     node_universe = len({node for pair in _E2E_PAIRS for node in pair})
     # `_egostitch_e2e_setup` builds the checkpoint from `_TINY_E2E_CONFIG`,
     # which does not override `n_ground` -- so the registered value is
-    # `E2EConfig()`'s rev-3.1 default (spec Sec 14.4.4), not the internal
-    # generator's own pinned `EgoStitchConfig()` default.
-    expected_n_ground = min(E2EConfig().n_ground, node_universe - 1)
+    # `GeneratorConfig()`'s rev-3.1 default (spec Sec 14.4.4), not the internal
+    # generator's own pinned `EgoStitchConfig()` default. `n_ground` moved
+    # from the flat `E2EConfig` onto the nested `generator` sub-config
+    # (design 2026-08-02 Sec 8).
+    expected_n_ground = min(E2EConfig().generator.n_ground, node_universe - 1)
     for ground, ground_ids in captured:
         assert ground is not None and ground_ids is not None
         rows = ground.shape[0]
@@ -1660,10 +1723,10 @@ def test_egostitch_e2e_scorer_warns_on_n_ground_clamp(
 
     The tiny 3-node fixture (`_E2E_PAIRS` over `{n0, n1, n2}`) can only support
     `len(node_ids) - 1 == 2` grounding candidates, while `EgoStitchModel`'s
-    `generator_cfg.n_ground` registers `E2EConfig()`'s rev-3.1 default (spec
-    Sec 14.4.4; `_egostitch_e2e_setup`'s `_TINY_E2E_CONFIG` does not override
-    it). Every call here silently clamps the registered default down to 2;
-    that must now be logged, stating both the registered and effective
+    `generator_cfg.n_ground` registers `GeneratorConfig()`'s rev-3.1 default
+    (spec Sec 14.4.4; `_egostitch_e2e_setup`'s `_TINY_E2E_CONFIG` does not
+    override it). Every call here silently clamps the registered default down
+    to 2; that must now be logged, stating both the registered and effective
     values.
     """
     from src.model.egostitch.config import E2EConfig
@@ -1677,7 +1740,9 @@ def test_egostitch_e2e_scorer_warns_on_n_ground_clamp(
         )
 
     node_universe = len({node for pair in _E2E_PAIRS for node in pair})
-    registered_n_ground = E2EConfig().n_ground
+    # `n_ground` moved from the flat `E2EConfig` onto the nested `generator`
+    # sub-config (design 2026-08-02 Sec 8).
+    registered_n_ground = E2EConfig().generator.n_ground
     expected_n_ground = min(registered_n_ground, node_universe - 1)
     assert expected_n_ground < registered_n_ground, "fixture must actually trigger the clamp"
 

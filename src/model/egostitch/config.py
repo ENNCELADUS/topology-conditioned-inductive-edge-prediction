@@ -9,7 +9,7 @@ so unit tests can run tiny instances. The G5 stage gate runs at these defaults
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from typing import Any, TypeVar, cast
 
 _ConfigT = TypeVar("_ConfigT")
@@ -193,38 +193,17 @@ class EgoStitchConfig:
 
 
 @dataclass(frozen=True)
-class E2EConfig:
-    """Rev-3.0 end-to-end conditioned-encoder hyperparameters (design rev 3).
-
-    The internal Stage-1 generator keeps its own pinned `EgoStitchConfig`
-    defaults (spec Sec 13); these fields size only the pair-encoder trunk and
-    its topo conditioning pathway (design rev 3 Sec 3.4-3.5) -- with
-    the rev-3.1 grounding and loss-calibration fields below supersede the
-    generator's own pinned values for this family, so a v3 registration and
-    checkpoint carry them explicitly while absent legacy keys retain their
-    historical defaults.
+class GeneratorConfig:
+    """Neighborhood-generator selection and calibration (design 2026-08-02 §8).
 
     Attributes:
-        d_model: Pair-trunk hidden width.
-        encoder_layers: `SiameseEncoder` depth (per-item token encoder).
-        cross_attn_layers: `ConditionedPairCrossAttention` depth.
-        n_heads: Attention heads for the item encoder and pair trunk.
-        n_inj: Trailing trunk layers receiving gated topo injection.
-        ste_dim: Stitched-topology encoder hidden width.
-        ste_layers: Stitched-topology encoder depth.
-        xattn_heads: Gated cross-attention heads (topo pathway).
-        p_topo: Training-time branch-dropout rate for the topo pathway.
+        name: Registry key selecting the generator implementation
+            (`registry.GENERATOR_REGISTRY`); ``"egostitch_imagine"`` for
+            today's Tokenize-lite + Imagine + Stitch pipeline, ``"null"`` for
+            the parameter-free pairwise-baseline generator.
         n_ground: Grounding candidates per node `n_g` (spec Sec 14.4.4;
             supersedes the internal generator's own pinned `EgoStitchConfig`
             default for this family).
-        tau_adj: Registered slot-adjacency temperature (spec Sec 14.4.2).
-        tau_div: Registered slot-diversity threshold (spec Sec 14.4.1).
-        l_gate_pos_weight: Registered positive-class weight for ``L_gate``
-            (spec Sec 14.4.1).
-        conditioning_ema_decay: Decay for the synchronized conditioning-center
-            EMA stored in rev-3.1 checkpoints (spec Sec 14.4.2).
-        w_rel: Interior ``L_recon`` weight for the discarded-at-inference
-            relational head; ``0`` defines the formal ``no_l_rel`` arm.
         feature_standardization: Registered feature-preprocessing mode passed
             to the internal generator (``"row_layernorm"`` or
             ``"zscore_vfit_v1"``, spec Sec 13.16 D0). Part of ``config_hash``
@@ -233,26 +212,19 @@ class E2EConfig:
             by ``"zscore_vfit_v1"``. Empty until the statistics are measured
             at execution time; when non-empty must be a 64-hex lowercase
             sha256.
+        tau_adj: Registered slot-adjacency temperature (spec Sec 14.4.2).
+        tau_div: Registered slot-diversity threshold (spec Sec 14.4.1).
+        l_gate_pos_weight: Registered positive-class weight for ``L_gate``
+            (spec Sec 14.4.1).
     """
 
-    d_model: int = 512
-    encoder_layers: int = 3
-    cross_attn_layers: int = 3
-    n_heads: int = 8
-    n_inj: int = 1
-    ste_dim: int = 128
-    ste_layers: int = 3
-    xattn_heads: int = 8
-    p_topo: float = 0.15
-    permanent_null: str = "none"
+    name: str = "egostitch_imagine"
     n_ground: int = 20
+    feature_standardization: str = "zscore_vfit_v1"
+    feature_stats_sha256: str = ""
     tau_adj: float = 0.5
     tau_div: float = 0.5
     l_gate_pos_weight: float = 6.17
-    conditioning_ema_decay: float = 0.99
-    w_rel: float = 0.25
-    feature_standardization: str = "zscore_vfit_v1"
-    feature_stats_sha256: str = ""
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants.
@@ -260,27 +232,8 @@ class E2EConfig:
         Raises:
             ValueError: On any non-positive dimension or out-of-range rate.
         """
-        for name in (
-            "d_model",
-            "encoder_layers",
-            "cross_attn_layers",
-            "n_heads",
-            "n_inj",
-            "ste_dim",
-            "ste_layers",
-            "xattn_heads",
-            "n_ground",
-        ):
-            if int(getattr(self, name)) <= 0:
-                raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
-        if self.d_model % self.n_heads != 0:
-            raise ValueError(
-                f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})"
-            )
-        if not 1 <= self.n_inj <= self.cross_attn_layers:
-            raise ValueError(f"n_inj must be in [1, cross_attn_layers], got {self.n_inj}")
-        if not 0.0 <= self.p_topo <= 1.0:
-            raise ValueError(f"p_topo must be in [0, 1], got {self.p_topo}")
+        if self.n_ground <= 0:
+            raise ValueError(f"n_ground must be positive, got {self.n_ground}")
         if not 0.0 < self.tau_adj < 1.0:
             raise ValueError(f"tau_adj must be in (0, 1), got {self.tau_adj}")
         if not -1.0 <= self.tau_div <= 1.0:
@@ -288,18 +241,6 @@ class E2EConfig:
         if self.l_gate_pos_weight <= 0.0:
             raise ValueError(
                 f"l_gate_pos_weight must be positive, got {self.l_gate_pos_weight}"
-            )
-        if not 0.0 < self.conditioning_ema_decay < 1.0:
-            raise ValueError(
-                "conditioning_ema_decay must be in (0, 1), "
-                f"got {self.conditioning_ema_decay}"
-            )
-        if self.w_rel < 0.0:
-            raise ValueError(f"w_rel must be non-negative, got {self.w_rel}")
-        if self.permanent_null not in ("none", "all_head"):
-            raise ValueError(
-                "permanent_null must be one of 'none' or 'all_head', "
-                f"got {self.permanent_null!r}"
             )
         if self.feature_standardization not in _FEATURE_STANDARDIZATION_MODES:
             raise ValueError(
@@ -313,15 +254,8 @@ class E2EConfig:
             raise ValueError("feature_stats_sha256 must be empty or a 64-hex lowercase sha256")
 
     @classmethod
-    def from_mapping(cls, mapping: Mapping[str, object]) -> E2EConfig:
-        """Build a config from a YAML ``model.config`` mapping.
-
-        Args:
-            mapping: Field-name -> value overrides; unknown keys are rejected
-                (the train_b0 strict-config convention).
-
-        Returns:
-            The validated `E2EConfig`.
+    def from_mapping(cls, mapping: Mapping[str, object]) -> GeneratorConfig:
+        """Build a `generator:` config section from a YAML mapping.
 
         Raises:
             ValueError: On unknown keys or invalid values.
@@ -329,8 +263,235 @@ class E2EConfig:
         return _from_mapping(
             cls,
             mapping,
-            label="E2E",
-            string_fields=frozenset(
-                {"permanent_null", "feature_standardization", "feature_stats_sha256"}
-            ),
+            label="generator",
+            string_fields=frozenset({"name", "feature_standardization", "feature_stats_sha256"}),
+        )
+
+
+@dataclass(frozen=True)
+class EncoderConfig:
+    """Graph-encoder selection and sizing (design 2026-08-02 §8).
+
+    Deliberately carries no ``d_model``: the encoder's output width must
+    match what the classifier attends over, and `ClassifierConfig.d_model` is
+    the single source of truth for that width (design task pin) -- the
+    composite passes it into the encoder's constructor at build time.
+
+    Attributes:
+        name: Registry key selecting the encoder implementation
+            (`registry.ENCODER_REGISTRY`); ``"ste_typed"`` for the typed
+            message-passing port of today's `STEncoder`.
+        dim: Hidden width of the encoder's internal message-passing stack
+            (was ``ste_dim``).
+        layers: Message-passing depth (was ``ste_layers``).
+        w_rel: Interior ``L_recon`` weight for the discarded-at-inference
+            relational head; ``0`` defines the formal ``no_l_rel`` arm and
+            omits the relational head entirely.
+    """
+
+    name: str = "ste_typed"
+    dim: int = 128
+    layers: int = 3
+    w_rel: float = 0.25
+
+    def __post_init__(self) -> None:
+        """Validate cross-field invariants.
+
+        Raises:
+            ValueError: On any non-positive dimension or a negative weight.
+        """
+        if self.dim <= 0:
+            raise ValueError(f"dim must be positive, got {self.dim}")
+        if self.layers <= 0:
+            raise ValueError(f"layers must be positive, got {self.layers}")
+        if self.w_rel < 0.0:
+            raise ValueError(f"w_rel must be non-negative, got {self.w_rel}")
+
+    @classmethod
+    def from_mapping(cls, mapping: Mapping[str, object]) -> EncoderConfig:
+        """Build an `encoder:` config section from a YAML mapping.
+
+        Raises:
+            ValueError: On unknown keys or invalid values.
+        """
+        return _from_mapping(cls, mapping, label="encoder", string_fields=frozenset({"name"}))
+
+
+@dataclass(frozen=True)
+class ClassifierConfig:
+    """Pairwise-classifier selection and pair-trunk sizing (design 2026-08-02 §8).
+
+    Attributes:
+        name: Registry key selecting the classifier implementation
+            (`registry.CLASSIFIER_REGISTRY`); ``"b0_v31"`` for the mature
+            B0-V3.1 baseline plus its conditioning socket.
+        d_model: Pair-trunk hidden width. Also the width the composite passes
+            into the encoder's constructor (see `EncoderConfig`).
+        encoder_layers: `SiameseEncoder` depth (per-item token encoder).
+        cross_attn_layers: `ConditionedPairCrossAttention` depth.
+        n_heads: Attention heads for the item encoder and pair trunk.
+        n_inj: Trailing trunk layers receiving gated topo injection.
+        xattn_heads: Gated cross-attention heads (topo pathway).
+        p_topo: Training-time branch-dropout rate for the topo pathway.
+        permanent_null: Permanently-forced head-null condition (``"none"`` or
+            ``"all_head"``).
+        conditioning_ema_decay: Decay for the synchronized conditioning-center
+            EMA stored in rev-3.1 checkpoints (spec Sec 14.4.2).
+    """
+
+    name: str = "b0_v31"
+    d_model: int = 512
+    encoder_layers: int = 3
+    cross_attn_layers: int = 3
+    n_heads: int = 8
+    n_inj: int = 1
+    xattn_heads: int = 8
+    p_topo: float = 0.15
+    permanent_null: str = "none"
+    conditioning_ema_decay: float = 0.99
+
+    def __post_init__(self) -> None:
+        """Validate cross-field invariants.
+
+        Raises:
+            ValueError: On any non-positive dimension or out-of-range rate.
+        """
+        for name in (
+            "d_model",
+            "encoder_layers",
+            "cross_attn_layers",
+            "n_heads",
+            "n_inj",
+            "xattn_heads",
+        ):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
+        if self.d_model % self.n_heads != 0:
+            raise ValueError(
+                f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})"
+            )
+        if not 1 <= self.n_inj <= self.cross_attn_layers:
+            raise ValueError(f"n_inj must be in [1, cross_attn_layers], got {self.n_inj}")
+        if not 0.0 <= self.p_topo <= 1.0:
+            raise ValueError(f"p_topo must be in [0, 1], got {self.p_topo}")
+        if self.permanent_null not in ("none", "all_head"):
+            raise ValueError(
+                "permanent_null must be one of 'none' or 'all_head', "
+                f"got {self.permanent_null!r}"
+            )
+        if not 0.0 < self.conditioning_ema_decay < 1.0:
+            raise ValueError(
+                "conditioning_ema_decay must be in (0, 1), "
+                f"got {self.conditioning_ema_decay}"
+            )
+
+    @classmethod
+    def from_mapping(cls, mapping: Mapping[str, object]) -> ClassifierConfig:
+        """Build a `classifier:` config section from a YAML mapping.
+
+        Raises:
+            ValueError: On unknown keys or invalid values.
+        """
+        return _from_mapping(
+            cls,
+            mapping,
+            label="classifier",
+            string_fields=frozenset({"name", "permanent_null"}),
+        )
+
+
+_E2E_TOP_LEVEL_KEYS = frozenset({"generator", "encoder", "classifier"})
+
+# Every field name that lived directly on the pre-P3 flat `E2EConfig`
+# (design 2026-08-02 §8/§12 P3). A mapping presenting any of these at the top
+# level is the dead flat schema, not an unrecognized future key -- callers get
+# a message pointing at the nested shape instead of a generic "unknown key"
+# error that would leave them guessing where the field went.
+_E2E_FLAT_LEGACY_KEYS = frozenset(
+    {
+        "d_model",
+        "encoder_layers",
+        "cross_attn_layers",
+        "n_heads",
+        "n_inj",
+        "ste_dim",
+        "ste_layers",
+        "xattn_heads",
+        "p_topo",
+        "permanent_null",
+        "n_ground",
+        "tau_adj",
+        "tau_div",
+        "l_gate_pos_weight",
+        "conditioning_ema_decay",
+        "w_rel",
+        "feature_standardization",
+        "feature_stats_sha256",
+    }
+)
+
+
+def _as_section_mapping(mapping: Mapping[str, object], key: str) -> Mapping[str, object]:
+    """Extract and type-check one nested config section."""
+    raw = mapping.get(key, {})
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"model.config.{key} must be a mapping, got {raw!r}")
+    return raw
+
+
+@dataclass(frozen=True)
+class E2EConfig:
+    """Rev-4 end-to-end three-component hyperparameters (design 2026-08-02 §8).
+
+    Nests the pair-trunk/classifier, graph-encoder and neighborhood-generator
+    hyperparameters under their own sub-configs -- ``generator:``,
+    ``encoder:``, ``classifier:`` -- each independently strict about unknown
+    keys (`GeneratorConfig.from_mapping`, `EncoderConfig.from_mapping`,
+    `ClassifierConfig.from_mapping`). There is no backward-compatible flat
+    path: `from_mapping` rejects the pre-P3 flat schema loudly rather than
+    silently reinterpreting it (design §12 P3).
+
+    Attributes:
+        generator: Neighborhood-generator selection and calibration.
+        encoder: Graph-encoder selection and sizing.
+        classifier: Pairwise-classifier selection and pair-trunk sizing.
+    """
+
+    generator: GeneratorConfig = field(default_factory=GeneratorConfig)
+    encoder: EncoderConfig = field(default_factory=EncoderConfig)
+    classifier: ClassifierConfig = field(default_factory=ClassifierConfig)
+
+    @classmethod
+    def from_mapping(cls, mapping: Mapping[str, object]) -> E2EConfig:
+        """Build a config from a YAML ``model.config`` mapping.
+
+        Args:
+            mapping: Must carry only ``generator``/``encoder``/``classifier``
+                keys, each itself a mapping validated by that component's own
+                `from_mapping` (unknown keys rejected per component, the
+                train_b0 strict-config convention).
+
+        Returns:
+            The validated `E2EConfig`.
+
+        Raises:
+            ValueError: If `mapping` carries the pre-P3 flat schema (any
+                legacy top-level field name), any other unknown top-level
+                key, or an invalid value inside any section.
+        """
+        unknown = sorted(set(mapping) - _E2E_TOP_LEVEL_KEYS)
+        if unknown:
+            flat_hit = sorted(set(unknown) & _E2E_FLAT_LEGACY_KEYS)
+            if flat_hit:
+                raise ValueError(
+                    "E2EConfig no longer accepts the flat model.config schema "
+                    f"(found top-level {flat_hit}); nest fields under "
+                    "'generator:'/'encoder:'/'classifier:' instead "
+                    "(design 2026-08-02 §8)"
+                )
+            raise ValueError(f"unknown E2E config keys: {unknown}")
+        return cls(
+            generator=GeneratorConfig.from_mapping(_as_section_mapping(mapping, "generator")),
+            encoder=EncoderConfig.from_mapping(_as_section_mapping(mapping, "encoder")),
+            classifier=ClassifierConfig.from_mapping(_as_section_mapping(mapping, "classifier")),
         )

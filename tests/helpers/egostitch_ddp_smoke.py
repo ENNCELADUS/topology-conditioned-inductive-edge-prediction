@@ -60,6 +60,7 @@ from src.data.pairs import NegativeSampler  # noqa: E402
 from src.model.egostitch import EgoStitchConfig  # noqa: E402
 from src.model.egostitch.composite import EgoStitchModel  # noqa: E402
 from src.model.egostitch.config import E2EConfig  # noqa: E402
+from src.model.egostitch.generator import EgoStitchImagineGenerator  # noqa: E402
 from src.train_b0 import EvalConfig, ModelConfig  # noqa: E402
 
 _NODES = [f"n{i}" for i in range(8)]
@@ -77,21 +78,27 @@ _POSITIVES = [
 ]
 _TOKEN_DIM = 1536
 _E2E_TINY_MODEL: dict[str, object] = {
-    "d_model": 16,
-    "encoder_layers": 1,
-    "cross_attn_layers": 1,
-    "n_heads": 2,
-    "n_inj": 1,
-    "ste_dim": 8,
-    "ste_layers": 1,
-    "xattn_heads": 2,
-    "p_topo": 0.15,
-    "n_ground": 20,
-    # The toy bundle carries `feature_stats is None` — it never goes through
-    # `assemble_egostitch_data`'s V_fit statistics path — so the registered
-    # `zscore_vfit_v1` transform would raise for want of constants. The guard
-    # under test reads slot geometry, not standardization.
-    "feature_standardization": "row_layernorm",
+    "generator": {
+        "n_ground": 20,
+        # The toy bundle carries `feature_stats is None` — it never goes through
+        # `assemble_egostitch_data`'s V_fit statistics path — so the registered
+        # `zscore_vfit_v1` transform would raise for want of constants. The guard
+        # under test reads slot geometry, not standardization.
+        "feature_standardization": "row_layernorm",
+    },
+    "encoder": {
+        "dim": 8,
+        "layers": 1,
+    },
+    "classifier": {
+        "d_model": 16,
+        "encoder_layers": 1,
+        "cross_attn_layers": 1,
+        "n_heads": 2,
+        "n_inj": 1,
+        "xattn_heads": 2,
+        "p_topo": 0.15,
+    },
 }
 
 
@@ -223,6 +230,7 @@ def _collapse_slot_head(model: EgoStitchModel) -> None:
     pairwise slot cosine is exactly 1 — a model genuinely born above the
     Sec 14.4.8 trip line rather than a stubbed measurement.
     """
+    assert isinstance(model.generator, EgoStitchImagineGenerator)
     with torch.no_grad():
         model.generator.stage1.imagine.head_h.weight.zero_()
         model.generator.stage1.imagine.head_h.bias.fill_(1.0)

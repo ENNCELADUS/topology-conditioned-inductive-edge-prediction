@@ -30,7 +30,7 @@ from src.model.egostitch.classifier.b0_v31 import (
     masks_for_null,
 )
 from src.model.egostitch.composite import E2EPairContext, EgoStitchModel
-from src.model.egostitch.config import E2EConfig
+from src.model.egostitch.config import ClassifierConfig, E2EConfig, EncoderConfig, GeneratorConfig
 from src.model.egostitch.graph import GraphEmbedding, PairConditioning, PairInputs
 
 # --- Shared fixtures ----------------------------------------------------------
@@ -39,16 +39,17 @@ from src.model.egostitch.graph import GraphEmbedding, PairConditioning, PairInpu
 def _tiny_e2e_config(*, feature_standardization: str = "row_layernorm") -> E2EConfig:
     """The shared tiny trunk sizing used across this file's tests."""
     return E2EConfig(
-        d_model=32,
-        encoder_layers=1,
-        cross_attn_layers=2,
-        n_heads=4,
-        n_inj=1,
-        ste_dim=16,
-        ste_layers=2,
-        xattn_heads=4,
-        p_topo=0.15,
-        feature_standardization=feature_standardization,
+        generator=GeneratorConfig(feature_standardization=feature_standardization),
+        encoder=EncoderConfig(dim=16, layers=2),
+        classifier=ClassifierConfig(
+            d_model=32,
+            encoder_layers=1,
+            cross_attn_layers=2,
+            n_heads=4,
+            n_inj=1,
+            xattn_heads=4,
+            p_topo=0.15,
+        ),
     )
 
 
@@ -78,14 +79,19 @@ def _classifier_from(model: EgoStitchModel, cfg: E2EConfig) -> B0V31PairClassifi
     """Build a `B0V31PairClassifier` sharing `model`'s pair-trunk weights."""
     classifier = B0V31PairClassifier(
         input_dim=model.input_dim,
-        d_model=cfg.d_model,
-        encoder_layers=cfg.encoder_layers,
-        n_heads=cfg.n_heads,
-        cross_attn_layers=cfg.cross_attn_layers,
-        n_inj=cfg.n_inj,
-        xattn_heads=cfg.xattn_heads,
-        conditioning_ema_decay=cfg.conditioning_ema_decay,
+        d_model=cfg.classifier.d_model,
+        encoder_layers=cfg.classifier.encoder_layers,
+        n_heads=cfg.classifier.n_heads,
+        cross_attn_layers=cfg.classifier.cross_attn_layers,
+        n_inj=cfg.classifier.n_inj,
+        xattn_heads=cfg.classifier.xattn_heads,
+        conditioning_ema_decay=cfg.classifier.conditioning_ema_decay,
     ).eval()
+    # `model.classifier`'s static type is the `PairClassifier` ABC now that
+    # construction is registry-driven (design §12 P3); narrow to the
+    # concrete class every model in this file is built with to reach
+    # `.encoder`/`.trunk`/`.head`.
+    assert isinstance(model.classifier, B0V31PairClassifier)
     classifier.encoder.load_state_dict(model.classifier.encoder.state_dict())
     classifier.trunk.load_state_dict(model.classifier.trunk.state_dict())
     classifier.head.load_state_dict(model.classifier.head.state_dict())
@@ -96,13 +102,13 @@ def _standalone_classifier(cfg: E2EConfig, *, input_dim: int) -> B0V31PairClassi
     """Build a `B0V31PairClassifier` with no accompanying `EgoStitchModel`."""
     return B0V31PairClassifier(
         input_dim=input_dim,
-        d_model=cfg.d_model,
-        encoder_layers=cfg.encoder_layers,
-        n_heads=cfg.n_heads,
-        cross_attn_layers=cfg.cross_attn_layers,
-        n_inj=cfg.n_inj,
-        xattn_heads=cfg.xattn_heads,
-        conditioning_ema_decay=cfg.conditioning_ema_decay,
+        d_model=cfg.classifier.d_model,
+        encoder_layers=cfg.classifier.encoder_layers,
+        n_heads=cfg.classifier.n_heads,
+        cross_attn_layers=cfg.classifier.cross_attn_layers,
+        n_inj=cfg.classifier.n_inj,
+        xattn_heads=cfg.classifier.xattn_heads,
+        conditioning_ema_decay=cfg.classifier.conditioning_ema_decay,
     )
 
 
@@ -195,18 +201,18 @@ def _tiny_pair_and_cond(
     """Build a synthetic already-encoded `PairInputs` (2026-08-03 fix).
 
     `tokens_a`/`tokens_b` stand in directly for `encode_tokens`'s output, at
-    `cfg.d_model` width -- these tests pin trunk-level structural properties
+    `cfg.classifier.d_model` width -- these tests pin trunk-level structural properties
     (AB/BA symmetry, EMA, the fp32 head island) independent of the token
     encoder itself, so there is no real per-node data behind them.
     """
     b, t = batch_size, 6
     pair = PairInputs(
-        tokens_a=torch.randn(b, t, cfg.d_model),
-        tokens_b=torch.randn(b, t, cfg.d_model),
+        tokens_a=torch.randn(b, t, cfg.classifier.d_model),
+        tokens_b=torch.randn(b, t, cfg.classifier.d_model),
         len_a=torch.full((b,), t, dtype=torch.long),
         len_b=torch.full((b,), t, dtype=torch.long),
     )
-    tokens = torch.randn(b, n_topo, cfg.d_model)
+    tokens = torch.randn(b, n_topo, cfg.classifier.d_model)
     cond = PairConditioning(
         ab=GraphEmbedding(tokens=tokens, pooled=tokens.mean(dim=1)),
         ba=GraphEmbedding(tokens=tokens, pooled=tokens.mean(dim=1)),
@@ -396,19 +402,19 @@ def test_edge_mask_filler_rows_excluded_from_mu() -> None:
     classifier.train()
     b, t, n_topo = 2, 6, 3
     pair = PairInputs(
-        tokens_a=torch.randn(b, t, cfg.d_model),
-        tokens_b=torch.randn(b, t, cfg.d_model),
+        tokens_a=torch.randn(b, t, cfg.classifier.d_model),
+        tokens_b=torch.randn(b, t, cfg.classifier.d_model),
         len_a=torch.full((b,), t, dtype=torch.long),
         len_b=torch.full((b,), t, dtype=torch.long),
         edge_mask=torch.tensor([True, False]),  # pair 1 is a DDP filler row
     )
-    tokens = torch.randn(b, n_topo, cfg.d_model)
+    tokens = torch.randn(b, n_topo, cfg.classifier.d_model)
     cond = PairConditioning(
         ab=GraphEmbedding(tokens=tokens, pooled=tokens.mean(dim=1)),
         ba=GraphEmbedding(tokens=tokens, pooled=tokens.mean(dim=1)),
     )
     layer = cast(GatedCrossAttention, classifier.trunk.topo_xattn[0])
-    d_model = cfg.d_model
+    d_model = cfg.classifier.d_model
     # Doubled batch order is (AB pair0, AB pair1, BA pair0, BA pair1); pair 1
     # is the filler in both halves. Naive inclusion would give mu == 76.0
     # (mean of 1, 100, 3, 200); correct exclusion gives mu == 2.0.
@@ -444,7 +450,7 @@ def test_fp32_head_island_survives_under_autocast() -> None:
     """
     cfg = _tiny_e2e_config()
     classifier = _standalone_classifier(cfg, input_dim=8).eval()
-    fixed_feat = torch.randn(8, cfg.d_model)  # 2 * batch_size rows (AB then BA)
+    fixed_feat = torch.randn(8, cfg.classifier.d_model)  # 2 * batch_size rows (AB then BA)
 
     class _FixedTrunk(torch.nn.Module):
         def forward(self, *args: object, **kwargs: object) -> torch.Tensor:

@@ -731,6 +731,7 @@ def produce_e2e_probe_artifact(
     from src.data.packed_features import PackedFeatureTable
     from src.model.egostitch.composite import EgoStitchModel
     from src.model.egostitch.config import E2EConfig
+    from src.model.egostitch.generator import EgoStitchImagineGenerator
     from src.model.egostitch.generator.assemble import match_slots
     from src.model.egostitch.generator.losses import alignment_teacher_cells
     from src.train_b0 import _state_digest
@@ -745,7 +746,13 @@ def produce_e2e_probe_artifact(
     if cfg.model.family != "egostitch_e2e":
         raise ValueError("E2E probe producer requires model family egostitch_e2e")
     formal_model_cfg = E2EConfig.from_mapping(cfg.model.config)
-    if formal_model_cfg.permanent_null != "none" or formal_model_cfg.p_topo != 0.15:
+    # Three-component refactor (design 2026-08-02 Sec 8): `permanent_null` and
+    # `p_topo` moved from the flat `E2EConfig` onto the nested `classifier`
+    # sub-config.
+    if (
+        formal_model_cfg.classifier.permanent_null != "none"
+        or formal_model_cfg.classifier.p_topo != 0.15
+    ):
         raise ValueError(
             "E2E probe producer requires full-arm permanent_null=none and p_topo=0.15"
         )
@@ -776,6 +783,19 @@ def produce_e2e_probe_artifact(
     checkpoint_model_cfg = cast(dict[str, object], payload["model_config"])
     model = EgoStitchModel(E2EConfig.from_mapping(checkpoint_model_cfg))
     model.load_state_dict(state)
+    # This producer's slot-level probes (`match_slots`, `.stage1.project_features`,
+    # the dispersion/consistency telemetry below) are inherently specific to the
+    # real Tokenize-lite + Imagine + Stitch generator; a `generator.name: null`
+    # checkpoint (design 2026-08-02 §12 P3) has no `SlotSet` to probe at all
+    # (`EgoStitchModel.encode_node_state` returns `slots=None` for it). The guard
+    # above already requires the formal full arm, which never configures a null
+    # generator, but assert it explicitly so a misconfigured checkpoint fails
+    # loudly here rather than with an opaque `AttributeError`/`NoneType` crash
+    # deep in the probe loop below.
+    assert isinstance(model.generator, EgoStitchImagineGenerator), (
+        "E2E probe producer requires the real egostitch_imagine generator, "
+        f"got {type(model.generator).__name__}"
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device).eval()
     if cfg.data.pack_dir is None:
@@ -874,6 +894,10 @@ def produce_e2e_probe_artifact(
             )
             assert context.topo_ab is not None
             assert state_a.ground_ids is not None
+            # The `isinstance(model.generator, EgoStitchImagineGenerator)`
+            # guard above means `encode_node_state` always populates `slots`
+            # here (only `NullGenerator` leaves it `None`).
+            assert state_a.slots is not None
             state_rows.append(context.topo_ab.mean(dim=1).float().cpu().numpy())
             selected_ids = torch.gather(
                 state_a.ground_ids,
@@ -960,6 +984,10 @@ def produce_e2e_probe_artifact(
             assert context.plan is not None
             assert context.topo_ab is not None
             assert state_a.ground_ids is not None and state_b.ground_ids is not None
+            # Same guard as the self-pair loop above: `slots` is only `None`
+            # for `NullGenerator`, which `produce_e2e_probe_artifact` already
+            # rejects.
+            assert state_a.slots is not None and state_b.slots is not None
             pair_state_rows.append(context.topo_ab.float().mean(dim=1).cpu().numpy())
             targets_a = batch_targets(endpoints_a)
             targets_b = batch_targets(endpoints_b)

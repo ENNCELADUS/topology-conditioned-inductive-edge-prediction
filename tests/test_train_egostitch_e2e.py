@@ -43,11 +43,18 @@ from src.model.egostitch.classifier.b0_v31 import GatedCrossAttention
 from src.model.egostitch.classifier.base import HeadNullMasks
 from src.model.egostitch.composite import E2ENodeState, E2EPairContext, EgoStitchModel
 from src.model.egostitch.config import E2EConfig
+from src.model.egostitch.generator import EgoStitchImagineGenerator
 from src.model.egostitch.generator import egostitch as e2e_module
 from src.model.egostitch.generator.imagine import SlotSet
 from src.train_b0 import ModelConfig
 
-from tests.test_train_egostitch import _E2E_TINY_MODEL, _NODES, _toy_bundle, _toy_cfg
+from tests.test_train_egostitch import (
+    _E2E_TINY_MODEL,
+    _NODES,
+    _e2e_model_config,
+    _toy_bundle,
+    _toy_cfg,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -520,11 +527,12 @@ class TestE2ECompositeStep:
         )
         factory = te._BatchFactory(e2e_cfg, model_cfg, data, node_batch=4, rank=0, world_size=1)
         batch = next(iter(factory.epoch_batches(1, rows_per_rank=rows, steps=steps)))
-        model_config = dict(e2e_cfg.model.config)
+        section_overrides: dict[str, Mapping[str, object]] = {}
         if w_rel is not None:
-            model_config["w_rel"] = w_rel
+            section_overrides["encoder"] = {"w_rel": w_rel}
         if feature_standardization is not None:
-            model_config["feature_standardization"] = feature_standardization
+            section_overrides["generator"] = {"feature_standardization": feature_standardization}
+        model_config = _e2e_model_config(e2e_cfg.model.config, **section_overrides)
         model = EgoStitchModel(E2EConfig.from_mapping(model_config))
         return batch, model
 
@@ -563,7 +571,7 @@ class TestE2ECompositeStep:
         monkeypatch.setattr(PackedFeatureTable, "from_pack", classmethod(_float_cpu_pack))
 
     def _gates(self, model: EgoStitchModel) -> GatedCrossAttention:
-        topo_gate = model.classifier.trunk.topo_xattn[0]
+        topo_gate = te._require_b0v31_classifier(model).trunk.topo_xattn[0]
         assert isinstance(topo_gate, GatedCrossAttention)
         return topo_gate
 
@@ -627,9 +635,10 @@ class TestE2ECompositeStep:
         assert parts["recon_rel"] > 0.0
         loss.backward()  # type: ignore[no-untyped-call]
 
+        encoder = te._require_encoder(model)
         ste_gradients = [
             parameter.grad
-            for parameter in model.encoder.parameters()
+            for parameter in encoder.parameters()
             if parameter.requires_grad
         ]
         assert ste_gradients
@@ -666,10 +675,10 @@ class TestE2ECompositeStep:
             ],
             weight_decay=0.01,
         )
-        ste_before = [parameter.detach().clone() for parameter in model.encoder.parameters()]
-        assert model.encoder.rel_head is not None
+        ste_before = [parameter.detach().clone() for parameter in encoder.parameters()]
+        assert encoder.rel_head is not None
         rel_before = [
-            parameter.detach().clone() for parameter in model.encoder.rel_head.parameters()
+            parameter.detach().clone() for parameter in encoder.rel_head.parameters()
         ]
         pair_before = [
             parameter.detach().clone()
@@ -678,11 +687,11 @@ class TestE2ECompositeStep:
         optimizer.step()
         assert any(
             not torch.equal(before, after)
-            for before, after in zip(ste_before, model.encoder.parameters(), strict=True)
+            for before, after in zip(ste_before, encoder.parameters(), strict=True)
         )
         assert any(
             not torch.equal(before, after)
-            for before, after in zip(rel_before, model.encoder.rel_head.parameters(), strict=True)
+            for before, after in zip(rel_before, encoder.rel_head.parameters(), strict=True)
         )
         assert all(
             torch.equal(before, after)
@@ -698,7 +707,7 @@ class TestE2ECompositeStep:
     ) -> None:
         torch.manual_seed(0)
         batch, model = self._batch_and_model(tmp_path, w_rel=0.0)
-        assert model.encoder.rel_head is None
+        assert te._require_encoder(model).rel_head is None
         composite = te._CompositeStep(model, world_size=1)
         parameter_groups = te.build_e2e_parameter_groups(model)
         phase = te.E2EPhaseState("A", 0.0, False, 0.0)
@@ -841,7 +850,7 @@ class TestE2ECompositeStep:
         self, tmp_path: Path
     ) -> None:
         _, model = self._batch_and_model(tmp_path, w_rel=0.25)
-        assert model.encoder.rel_head is not None
+        assert te._require_encoder(model).rel_head is not None
         parameter_groups = te.build_e2e_parameter_groups(model)
         phases = (
             te.E2EPhaseState("A", 0.0, False, 0.0),
@@ -1386,7 +1395,9 @@ class TestE2ECompositeStep:
         batch.edge["emb_b"] = batch.edge["emb_b"].float()
         edge_view = te._e2e_edge_view(batch.edge)
         for null, key in (("all_head", "f_logit"),):
-            model.cfg = replace(model.cfg, permanent_null=null)
+            model.cfg = replace(
+                model.cfg, classifier=replace(model.cfg.classifier, permanent_null=null)
+            )
             expected = model.decompose(edge_view)[key]
             seen: list[torch.Tensor] = []
             # `EgoStitchModel.forward` returns `dict[str, object]` (it also
@@ -1435,7 +1446,7 @@ class TestE2ECompositeStep:
         for key in ("gate_topo_tanh",):
             assert key in out
             values = cast(list[float], out[key])
-            assert len(values) == model.cfg.n_inj
+            assert len(values) == model.cfg.classifier.n_inj
             assert all(math.isfinite(value) for value in values)
 
         families = cast(dict[str, torch.Tensor], out["families"])
@@ -1511,21 +1522,28 @@ class TestE2ECompositeStep:
         """
         _, model = self._batch_and_model(tmp_path)
         trainable_ids = {id(p) for p in te._e2e_trainable_parameters(model)}
+        assert isinstance(model.generator, EgoStitchImagineGenerator)
         random_gin_ids = {id(p) for p in model.generator.stage1.random_gin.parameters()}
         assert random_gin_ids, "random_gin must have parameters for this exclusion check to be real"
         assert trainable_ids.isdisjoint(random_gin_ids)
-        assert any(id(p) in trainable_ids for p in model.classifier.trunk.parameters())
+        assert any(
+            id(p) in trainable_ids for p in te._require_b0v31_classifier(model).trunk.parameters()
+        )
 
 
 def _float_node_state(state: E2ENodeState) -> E2ENodeState:
     """Detach the cacheable fields exactly where validation enters its fp32 island."""
+    slots = (
+        SlotSet(*(value.float() if value.is_floating_point() else value for value in state.slots))
+        if state.slots is not None
+        else None
+    )
+    projected_x = state.projected_x.float() if state.projected_x is not None else None
     return E2ENodeState(
         encoded=state.encoded.float(),
         length=state.length,
-        slots=SlotSet(
-            *(value.float() if value.is_floating_point() else value for value in state.slots)
-        ),
-        projected_x=state.projected_x.float(),
+        slots=slots,
+        projected_x=projected_x,
         ground_ids=state.ground_ids,
     )
 
@@ -1602,18 +1620,22 @@ def _uncached_validation_reference(
                 )
                 active = (
                     full
-                    if model.cfg.permanent_null == "none"
+                    if model.cfg.classifier.permanent_null == "none"
                     else model.score_pair_context(
                         context,
-                        masks=te.masks_for_null(model.cfg.permanent_null, 1, accelerator.device),
+                        masks=te.masks_for_null(
+                            model.cfg.classifier.permanent_null, 1, accelerator.device
+                        ),
                     )
                 )
             assert context.plan is not None
+            slots_a = te._require_slots(state_a)
+            slots_b = te._require_slots(state_b)
             dispersion_a = te._e2e_dispersion_rows(
-                state_a.slots.pi, state_a.slots.h, state_a.slots.adj, context.plan
+                slots_a.pi, slots_a.h, slots_a.adj, context.plan
             )
             dispersion_b = te._e2e_dispersion_rows(
-                state_b.slots.pi, state_b.slots.h, state_b.slots.adj, context.plan
+                slots_b.pi, slots_b.h, slots_b.adj, context.plan
             )
             dispersion = {
                 name: (
@@ -1623,8 +1645,8 @@ def _uncached_validation_reference(
                 )
                 for name in dispersion_a
             }
-            scale_a = te._e2e_scale_rows(state_a.slots.h, context.plan)
-            scale_b = te._e2e_scale_rows(state_b.slots.h, context.plan)
+            scale_a = te._e2e_scale_rows(slots_a.h, context.plan)
+            scale_b = te._e2e_scale_rows(slots_b.h, context.plan)
             scale = {
                 name: (
                     0.5 * (scale_a[name] + scale_b[name])
@@ -1786,10 +1808,11 @@ class TestE2EValidationCache:
         ) -> E2EPairContext:
             assert not torch.is_autocast_enabled("cpu")
             for state in (state_a, state_b):
+                assert state.projected_x is not None
                 floating = (
                     state.encoded,
                     state.projected_x,
-                    *(value for value in state.slots if value.is_floating_point()),
+                    *(value for value in te._require_slots(state) if value.is_floating_point()),
                 )
                 assert all(value.dtype == torch.float32 for value in floating)
             pair_rows.append(
@@ -1862,7 +1885,7 @@ class TestE2EValidationCache:
         with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
             before = self._validate(model, data, accelerator, table, index)
             with torch.no_grad():
-                list(model.classifier.head.parameters())[-1].add_(0.75)
+                list(te._require_b0v31_classifier(model).head.parameters())[-1].add_(0.75)
             after = self._validate(model, data, accelerator, table, index)
 
         assert encode_rows == 2 * len({node for pair in data.val_pairs for node in pair})
@@ -2039,7 +2062,7 @@ class _ArchivedV1TrainLoopE2E:
                 e2e_cfg,
                 model=ModelConfig(
                     family="egostitch_e2e",
-                    config={**_E2E_TINY_MODEL, "permanent_null": permanent_null},
+                    config=_e2e_model_config(classifier={"permanent_null": permanent_null}),
                 ),
             )
             model = EgoStitchModel(E2EConfig.from_mapping(e2e_cfg.model.config))
@@ -2223,7 +2246,9 @@ def _holdout_e2e_cfg(
     cfg = _toy_cfg(tmp_path)
     return replace(
         cfg,
-        model=ModelConfig(family="egostitch_e2e", config={"n_ground": n_ground}),
+        model=ModelConfig(
+            family="egostitch_e2e", config={"generator": {"n_ground": n_ground}}
+        ),
         data=replace(cfg.data, pack_dir=tmp_path / "raw-token-pack"),
         training=te.EgoStitchTrainingConfig(),
     )
@@ -2237,7 +2262,8 @@ class TestPrepareAndAssembleE2E:
         return replace(
             cfg,
             model=ModelConfig(
-                family="egostitch_e2e", config={"n_ground": _E2E_PIPELINE_N_GROUND}
+                family="egostitch_e2e",
+                config={"generator": {"n_ground": _E2E_PIPELINE_N_GROUND}},
             ),
             data=replace(cfg.data, pack_dir=tmp_path / "raw-token-pack"),
         )
@@ -2417,10 +2443,10 @@ class TestFeatureStandardizationBinding:
             base_cfg,
             model=replace(
                 base_cfg.model,
-                config={
-                    **base_cfg.model.config,
-                    "feature_stats_sha256": data.feature_stats.digest,
-                },
+                config=_e2e_model_config(
+                    base_cfg.model.config,
+                    generator={"feature_stats_sha256": data.feature_stats.digest},
+                ),
             ),
         )
         model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
@@ -2438,7 +2464,9 @@ class TestFeatureStandardizationBinding:
             cfg,
             model=replace(
                 cfg.model,
-                config={**cfg.model.config, "feature_stats_sha256": "ab" * 32},
+                config=_e2e_model_config(
+                    cfg.model.config, generator={"feature_stats_sha256": "ab" * 32}
+                ),
             ),
         )
         data = te.assemble_egostitch_data(cfg)
@@ -2465,7 +2493,9 @@ class TestFeatureStandardizationBinding:
             cfg,
             model=replace(
                 cfg.model,
-                config={**cfg.model.config, "feature_standardization": "row_layernorm"},
+                config=_e2e_model_config(
+                    cfg.model.config, generator={"feature_standardization": "row_layernorm"}
+                ),
             ),
         )
         data = te.assemble_egostitch_data(cfg)

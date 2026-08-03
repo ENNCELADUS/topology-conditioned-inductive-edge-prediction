@@ -17,6 +17,11 @@ deep-learning priority on the dissociation observation: Graph Gestalt 2106.15239
 **Updated 2026-07-13:** pinned the G3 Oracle instantiation (§5.0 G3): structural CN/AA
 oracle plus a parameter-free B0 rank-fusion blend arm, PA-null top-N assembly convention,
 per-statistic MMD-ratio headroom as the stop-rule quantity.
+**Updated 2026-08-03:** B0-alt withdrawn as a baseline family by owner decision — B0
+(V3.1) is the sole baseline going forward. Removed from §2's baseline hierarchy table
+and the E3 run list; the closed G1 result (§3 E2), which used B0-alt to close the
+architecture-independence requirement, is retained unchanged as history. B0-alt's
+implementation was removed from the code tree in commit `72db72c`.
 
 This document defines the benchmark contract, baseline hierarchy, experiment matrix, evaluation
 protocol, caveats, and deliverables for this repository. It is intentionally self-contained:
@@ -161,7 +166,6 @@ Components:
 | ID | Baseline | Neutral instantiation | Isolates |
 |---|---|---|---|
 | **B0** | Independent pairwise scorer | Frozen pairwise scorer over `(x_i, x_j)` | Topology-blind edge prediction |
-| **B0-alt** | Second pairwise scorer | Alternate pairwise architecture trained under the same split | Architecture-independence of the gap |
 | **B0-e2e** | Matched-training pairwise-only arm (rev 3.0) | `Ours`'s trunk with all conditioning permanently bypassed (`∅_all_head`), trained under exactly the `Ours` data/negatives/edge-active-steps/optimizer/seed/HPO | The honest pairwise control for the e2e head: separates training-regime effects from conditioning effects. Never conflated with canonical B0 (different data regime: `e_sup`/1:5/lr 3e-4/seed 0 vs `train_plus`/1:1/lr 1e-4/seed 47) |
 | **B0+cal** | B0 + calibrated assembly | Temperature/Platt calibration + density- and degree-sequence-matched thresholding of B0 scores | Whether trivial assembly calibration recovers the topology gains. Also applied on top of `Ours` as a diagnostic |
 | **B1** | Retrieval, no generated adjacency | Retrieve neighbors around `i` and `j`, pool features, use no scaffold edges | Value of adjacency vs retrieval alone |
@@ -209,8 +213,9 @@ prioritized in Section 5 (gates first).
   normalization.
 - **Run (G1 requirements):** one frozen scorer family (same as `Ours` uses), one candidate
   universe, one canonical metric normalization, a true threshold sweep (recall/density-vs-MMD
-  curves), easy, hard (HeaRT-style), **and degree-corrected** (2405.14985) negatives, B0-alt
-  replication, the PA-null row, real-vs-real noise floor, bootstrap variance, a defined
+  curves), easy, hard (HeaRT-style), **and degree-corrected** (2405.14985) negatives, a
+  second-architecture replication (B0-alt, as actually run — see the retirement note in the
+  Result below), the PA-null row, real-vs-real noise floor, bootstrap variance, a defined
   official Graph Similarity and Relative Density over the fixed sampled subgraphs,
   an expressivity/robustness perturbation diagnostic (O'Bray 2106.01098), and the
   full-candidate-universe imbalance view.
@@ -238,7 +243,11 @@ prioritized in Section 5 (gates first).
   BFS-macro GS/RD `0.245377/0.489125`.
   The gap therefore survives an alternate architecture, hard negatives, and calibrated
   thresholds, although PA-null beats B0 in the easy and feature-hard rows and remains a
-  mandatory control.
+  mandatory control. B0-alt was G1's architecture-independence replication; by owner
+  decision (2026-08-03) it is retired from the forward baseline set (§2 lists B0 only)
+  and its implementation was removed from the code tree. The values above are the
+  closed, unaltered G1 record; provenance is in
+  [E2-pair-to-topology-gap.md](results/E2-pair-to-topology-gap.md).
 - **G2 result:** the checkpoint-aligned cached soft scorer has `Ov(P)=0.479886`, while
   `Ov_min=0.054954`
   at matched volume is sufficient to reach the reference triangle count; the full ceiling
@@ -270,7 +279,7 @@ topology gap.
 
 - **Claim:** `Ours` beats independent scoring, calibration, global refinement, static denoising,
   and all loss-shaping baselines under one protocol.
-- **Run:** B0, B0-alt, `B0+cal`, B1, B2-global, B2-static, B3, `B3-dist`, `B3-full`, B5,
+- **Run:** B0, `B0+cal`, B1, B2-global, B2-static, B3, `B3-dist`, `B3-full`, B5,
   DEAL/Graph2Gauss, `Ours`, and Oracle on the same split and operating-point policy.
 - **Metrics:** the joint edge/topology table from E1.
 - **Success:** `Ours` is on the Pareto frontier of edge AUPRC and held-out assembled realism;

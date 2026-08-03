@@ -726,7 +726,9 @@ def _evaluate_e2e_probe(
         msg_fraction=cfg.data.msg_fraction,
     )
     graph = build_g_struct(train_nodes, partition.e_msg)
-    n_ground = E2EConfig.from_mapping(cfg.model.config).n_ground
+    # Three-component refactor (design 2026-08-02 Sec 8): `n_ground` moved
+    # from the flat `E2EConfig` onto the nested `generator` sub-config.
+    n_ground = E2EConfig.from_mapping(cfg.model.config).generator.n_ground
     return evaluate_e2e_probe_artifact(
         probe_artifact_path,
         graph=graph,

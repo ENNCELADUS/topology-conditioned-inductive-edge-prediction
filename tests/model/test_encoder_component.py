@@ -276,27 +276,26 @@ def test_no_l_rel_arm_shares_initialization_with_the_full_arm() -> None:
     with an initialization difference.
     """
     from src.model.egostitch.composite import EgoStitchModel
-    from src.model.egostitch.config import E2EConfig
+    from src.model.egostitch.config import ClassifierConfig, E2EConfig, EncoderConfig
 
-    shared = {
-        "d_model": 32,
-        "encoder_layers": 1,
-        "cross_attn_layers": 2,
-        "n_heads": 2,
-        "n_inj": 1,
-        "ste_dim": 16,
-        "ste_layers": 2,
-        "xattn_heads": 2,
-    }
+    classifier_cfg = ClassifierConfig(
+        d_model=32,
+        encoder_layers=1,
+        cross_attn_layers=2,
+        n_heads=2,
+        n_inj=1,
+        xattn_heads=2,
+    )
     torch.manual_seed(0)
-    # `**dict[str, int]` unpacking can't be proven to avoid `E2EConfig`'s
-    # other, non-`int`-typed fields (e.g. `feature_standardization: str`),
-    # even though none of `shared`'s keys target one; same limitation
-    # `tests/model/test_composite.py`'s `_tiny_e2e_config` hits.
-    full = EgoStitchModel(E2EConfig(**shared, w_rel=0.25))  # type: ignore[arg-type]
+    full = EgoStitchModel(
+        E2EConfig(encoder=EncoderConfig(dim=16, layers=2, w_rel=0.25), classifier=classifier_cfg)
+    )
     torch.manual_seed(0)
-    no_l_rel = EgoStitchModel(E2EConfig(**shared, w_rel=0.0))  # type: ignore[arg-type]
+    no_l_rel = EgoStitchModel(
+        E2EConfig(encoder=EncoderConfig(dim=16, layers=2, w_rel=0.0), classifier=classifier_cfg)
+    )
 
+    assert full.encoder is not None and no_l_rel.encoder is not None
     assert full.encoder.rel_head is not None
     assert no_l_rel.encoder.rel_head is None
 

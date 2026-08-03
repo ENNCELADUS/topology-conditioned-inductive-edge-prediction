@@ -200,15 +200,17 @@ class TestPoolMethodHashCacheBinding:
 class TestE2EConfigNGroundReachesPoolBuilder:
     def test_legacy_model_config_defaults_n_ground_to_20(self) -> None:
         """An absent checkpoint/config key preserves the legacy n_ground=20 semantics."""
-        assert E2EConfig.from_mapping({}).n_ground == 20
-        assert E2EConfig.from_mapping({"n_ground": 50}).n_ground == 50
+        assert E2EConfig.from_mapping({}).generator.n_ground == 20
+        assert E2EConfig.from_mapping({"generator": {"n_ground": 50}}).generator.n_ground == 50
 
     def test_e2e_config_n_ground_round_trips_through_yaml_and_reaches_pool_builder(self) -> None:
-        """`E2EConfig(n_ground=20)` parsed from a YAML-style mapping sizes real pools."""
-        cfg = E2EConfig.from_mapping({"n_ground": 20})
-        assert cfg.n_ground == 20
+        """`generator.n_ground: 20` parsed from a YAML-style mapping sizes real pools."""
+        cfg = E2EConfig.from_mapping({"generator": {"n_ground": 20}})
+        assert cfg.generator.n_ground == 20
         rng = np.random.default_rng(3)
         nodes = [f"p{i}" for i in range(25)]
         f0 = rng.normal(size=(len(nodes), 6)).astype(np.float32)
-        pool = build_grounding_pool(f0, nodes, n_ground=cfg.n_ground, role_universe="V_fit")
+        pool = build_grounding_pool(
+            f0, nodes, n_ground=cfg.generator.n_ground, role_universe="V_fit"
+        )
         assert all(len(v) == 20 for v in pool.values())

@@ -1,12 +1,22 @@
 """``EgoStitchModel``: the three-component composite (design 2026-08-02 §3-§7).
 
 Wires `NeighborhoodGenerator` -> `GraphEncoder` -> `PairClassifier` into the
-single module that replaces `EgoStitchE2E`. For P2 the generator is always
-`EgoStitchImagineGenerator`, the encoder always `TypedMessagePassingEncoder`,
-and the classifier always `B0V31PairClassifier` -- registry-driven selection
-among alternative components is P3 (design §12).
+single module that replaces `EgoStitchE2E`. Every submodule is built through
+`src.model.egostitch.registry`'s `build_generator`/`build_encoder`/
+`build_classifier` helpers from `cfg.generator`/`cfg.encoder`/
+`cfg.classifier`'s own ``name`` field (design §3, §8, §12 P3) -- swapping a
+component is a config change, not a code change.
 
-Behaviour-preserving by construction: every method here reproduces what
+`generator.name: "null"` (`NullGenerator`, `generator/null.py`) is the one
+generator registered today that never emits a graph: `stitch` always returns
+`None`, so no `PairConditioning` is ever built and `self.encoder` is not
+constructed at all (§3.4's ``encoder: GraphEncoder | None``) -- a
+null-generator model's `state_dict` therefore carries no generator or
+encoder parameters, and its classifier runs exactly as unconditioned as the
+`f_logit` hard bypass (design §3.3, §12 P3 acceptance criterion 5).
+
+Behaviour-preserving by construction for the default (`egostitch_imagine` +
+`ste_typed` + `b0_v31`) configuration: every method here reproduces what
 `EgoStitchE2E` computed, just re-expressed through the three components'
 public contracts (`generator.encode_node`/`.stitch`, `encoder.forward`,
 `classifier.forward`). `tests/model/test_egostitch_e2e_model.py` (retargeted
@@ -38,7 +48,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import NamedTuple, cast
+from typing import Any, NamedTuple, cast
 
 import torch
 import torch.distributed as dist
@@ -46,15 +56,25 @@ from torch import nn
 from torch.nn import functional as F
 
 from src.data.feature_stats import FeatureStats
-from src.model.egostitch.classifier import B0V31PairClassifier
 from src.model.egostitch.classifier.b0_v31 import NULL_ALL_HEAD, NULL_NONE, masks_for_null
-from src.model.egostitch.classifier.base import HeadNullMasks
+from src.model.egostitch.classifier.base import HeadNullMasks, PairClassifier
 from src.model.egostitch.config import E2EConfig, EgoStitchConfig
-from src.model.egostitch.encoder import TypedMessagePassingEncoder
-from src.model.egostitch.generator import EgoStitchImagineGenerator, GeneratorNodeState
+from src.model.egostitch.encoder.base import GraphEncoder
+from src.model.egostitch.generator import (
+    EgoStitchImagineGenerator,
+    GeneratorNodeState,
+    NullGenerator,
+)
 from src.model.egostitch.generator.assemble import ScaffoldInputPerturbation
-from src.model.egostitch.generator.imagine import FeatureStandardizationMode, SlotSet
+from src.model.egostitch.generator.base import NeighborhoodGenerator
+from src.model.egostitch.generator.imagine import SlotSet
 from src.model.egostitch.graph import GraphEmbedding, ImaginedGraph, PairConditioning, PairInputs
+from src.model.egostitch.registry import (
+    build_classifier,
+    build_encoder,
+    build_generator,
+    resolve_generator_calibration,
+)
 
 
 class E2ENodeState(NamedTuple):
@@ -71,17 +91,21 @@ class E2ENodeState(NamedTuple):
             directly and never re-applies `SiameseEncoder`, so this field is
             already encoded, not a raw pass-through.
         length: Unpadded token counts for ``encoded``.
-        slots: The generator's own `SlotSet` (`GeneratorNodeState.slots`).
+        slots: The generator's own `SlotSet` (`GeneratorNodeState.slots`), or
+            `None` for a generator whose `encode_node` produces no such state
+            (`NullGenerator.encode_node` echoes its input back rather than
+            allocating one -- design §3.3, `generator/null.py`).
         projected_x: The generator's own projected features
-            (`GeneratorNodeState.projected_x`).
+            (`GeneratorNodeState.projected_x`), or `None` under the same
+            condition as `slots`.
         ground_ids: The generator's own grounding ids
             (`GeneratorNodeState.ground_ids`).
     """
 
     encoded: torch.Tensor
     length: torch.Tensor
-    slots: SlotSet
-    projected_x: torch.Tensor
+    slots: SlotSet | None
+    projected_x: torch.Tensor | None
     ground_ids: torch.Tensor | None
 
 
@@ -163,54 +187,67 @@ class EgoStitchModel(nn.Module):
     """
 
     def __init__(self, cfg: E2EConfig) -> None:
-        """Build every submodule from `cfg`.
+        """Build every submodule through the registry from `cfg`.
 
         Args:
-            cfg: The pair-trunk / conditioning / generator-calibration
-                hyperparameters (design §8; still the flat `E2EConfig` for
-                P2 -- nested per-component config is P3).
+            cfg: The nested generator / encoder / classifier hyperparameters
+                (design §8): `cfg.generator.name` / `cfg.encoder.name` /
+                `cfg.classifier.name` select the concrete implementation via
+                `src.model.egostitch.registry`.
         """
         super().__init__()
         self.cfg = cfg
-        # The internal generator keeps its own pinned `EgoStitchConfig`
-        # defaults (spec Sec 13); `cfg` carries the registered rev-3.1
-        # grounding/loss-calibration fields that supersede them for this
-        # family, exactly as `EgoStitchE2E.__init__` did.
-        generator_cfg = replace(
-            EgoStitchConfig(),
-            n_ground=cfg.n_ground,
-            tau_adj=cfg.tau_adj,
-            tau_div=cfg.tau_div,
-            l_gate_pos_weight=cfg.l_gate_pos_weight,
-            w_rel=cfg.w_rel,
+        # Computed once, independent of which generator is selected, so
+        # `generator_cfg` (below) stays meaningful -- e.g. for its
+        # `.n_ground`/`.slots` fields, read by `src/train_egostitch.py` and
+        # `src/experiments/probes.py` regardless of arm -- even for a
+        # generator such as `NullGenerator` that carries no `EgoStitchConfig`
+        # of its own. Passed into `build_generator` as the *same* object, so
+        # identity with `self.generator.cfg` is preserved for a generator
+        # that does have one (`registry.resolve_generator_calibration`).
+        #
+        # `w_rel` is folded in here, not by `resolve_generator_calibration`:
+        # it lives on `cfg.encoder` (design §8's pinned schema puts it under
+        # `encoder:`, since it gates whether `GraphEncoder` builds a
+        # relational head at all), but `EgoStitchConfig.w_rel` is also the
+        # *interior loss weight* `losses.py:643`'s `stage1_total`/
+        # `_recon_total` multiplies the encoder's own (unweighted) `rel_loss`
+        # by -- so `model.generator_cfg.w_rel` must mirror `cfg.encoder.w_rel`
+        # for that weighting to be correct, the same cross-component coupling
+        # the composite already resolves for `d_model` (task pin, below).
+        self._generator_cfg = replace(
+            resolve_generator_calibration(cfg.generator), w_rel=cfg.encoder.w_rel
         )
-        self.generator = EgoStitchImagineGenerator(
-            generator_cfg,
-            feature_standardization=cast(FeatureStandardizationMode, cfg.feature_standardization),
-            loss_family="egostitch_e2e",
+        self.generator: NeighborhoodGenerator[Any, Any, Any] = build_generator(
+            cfg.generator, generator_cfg=self._generator_cfg
         )
-        self.input_dim = generator_cfg.input_dim  # frozen feature dim (spec Sec 0 table)
-        self.node_feature_dim = generator_cfg.input_dim
+        self.input_dim = self._generator_cfg.input_dim  # frozen feature dim (spec Sec 0 table)
+        self.node_feature_dim = self._generator_cfg.input_dim
 
-        feature_dim, num_relations = _generator_graph_dims(self.generator)
-        self.encoder = TypedMessagePassingEncoder(
-            in_dim=feature_dim,
-            num_relations=num_relations,
-            d_model=cfg.d_model,
-            dim=cfg.ste_dim,
-            layers=cfg.ste_layers,
-            w_rel=cfg.w_rel,
-        )
-        self.classifier = B0V31PairClassifier(
-            input_dim=self.input_dim,
-            d_model=cfg.d_model,
-            encoder_layers=cfg.encoder_layers,
-            n_heads=cfg.n_heads,
-            cross_attn_layers=cfg.cross_attn_layers,
-            n_inj=cfg.n_inj,
-            xattn_heads=cfg.xattn_heads,
-            conditioning_ema_decay=cfg.conditioning_ema_decay,
-        )
+        self.encoder: GraphEncoder | None
+        if isinstance(self.generator, NullGenerator):
+            # Nothing is ever imagined (`NullGenerator.stitch` always returns
+            # `None`), so there is nothing to encode: no `GraphEncoder` is
+            # constructed at all. Plain `None` here (never registered as a
+            # submodule -- `nn.Module.__setattr__` only tracks `Module`
+            # instances) is what makes a null-generator `state_dict` carry no
+            # encoder parameters (design §12 P3).
+            self.encoder = None
+        else:
+            # Every other registered generator is, today, an
+            # `EgoStitchImagineGenerator` -- the one real, non-null
+            # implementation (design §2 Non-goals) -- which is the only
+            # generator `_generator_graph_dims` knows how to probe (it reads
+            # the generator's own pinned `EgoStitchConfig`).
+            assert isinstance(self.generator, EgoStitchImagineGenerator)
+            feature_dim, num_relations = _generator_graph_dims(self.generator)
+            self.encoder = build_encoder(
+                cfg.encoder,
+                in_dim=feature_dim,
+                num_relations=num_relations,
+                d_model=cfg.classifier.d_model,
+            )
+        self.classifier: PairClassifier = build_classifier(cfg.classifier, input_dim=self.input_dim)
 
     @property
     def generator_cfg(self) -> EgoStitchConfig:
@@ -220,35 +257,73 @@ class EgoStitchModel(nn.Module):
         amendment, 2026-08-03): read directly by
         `src/experiments/probes.py:820,895,985` (`.n_ground`, `.slots`),
         `src/train_egostitch.py:3875` and `src/score_universe.py:1760`.
-        Same object identity as `self.generator.cfg`.
+        Same object identity as `self.generator.cfg` for a generator that has
+        one; for a generator that does not (e.g. `NullGenerator`), this is
+        still the `cfg.generator`-derived `EgoStitchConfig` computed in
+        `__init__`, so `.n_ground`/`.slots` reads stay well-defined.
         """
-        return self.generator.cfg
+        return self._generator_cfg
 
     def set_feature_stats(self, stats: FeatureStats) -> None:
         """Pin the registered F0 standardization constants on the generator.
 
+        A no-op for a generator with nothing to standardize (`NullGenerator`
+        does not implement `set_feature_stats`: there are no features it
+        ever reads).
+
         Args:
             stats: The V_fit statistics bundle.
         """
-        self.generator.set_feature_stats(stats)
+        if isinstance(self.generator, EgoStitchImagineGenerator):
+            self.generator.set_feature_stats(stats)
 
     @property
     def feature_stats_digest_hex(self) -> str:
-        """The generator's registered `feature_stats_sha256`, or ``""``."""
-        return self.generator.feature_stats_digest_hex
+        """The generator's registered `feature_stats_sha256`, or ``""``.
+
+        Always ``""`` for a generator with no such digest (`NullGenerator`),
+        the same value `EgoStitchImagineGenerator.feature_stats_digest_hex`
+        itself returns for a stateless standardization mode.
+        """
+        if isinstance(self.generator, EgoStitchImagineGenerator):
+            return self.generator.feature_stats_digest_hex
+        return ""
 
     # ------------------------------------------------------------------ per-node state
 
     @staticmethod
-    def _generator_state(state: E2ENodeState) -> GeneratorNodeState:
-        """Extract the generator-owned fields of one `E2ENodeState`."""
+    def _generator_state(state: E2ENodeState) -> GeneratorNodeState | None:
+        """Extract the generator-owned fields of one `E2ENodeState`.
+
+        Returns `None` when `state` carries no such fields (`slots`/
+        `projected_x` are `None` together, always the case for a generator
+        whose `encode_node` produced no `GeneratorNodeState` -- see
+        `encode_node_state`). Consumed only by `self.generator.stitch`; the
+        one generator that ever sees a `None` here (`NullGenerator.stitch`)
+        ignores its `state_a`/`state_b` arguments unconditionally, so this is
+        safe.
+        """
+        if state.slots is None or state.projected_x is None:
+            return None
         return GeneratorNodeState(
             slots=state.slots, projected_x=state.projected_x, ground_ids=state.ground_ids
         )
 
     @staticmethod
-    def _merge_slots(base: SlotSet, replacement: SlotSet, rows: torch.Tensor) -> SlotSet:
-        """Replace selected batch rows while preserving autograd to both inputs."""
+    def _merge_slots(
+        base: SlotSet | None, replacement: SlotSet | None, rows: torch.Tensor
+    ) -> SlotSet | None:
+        """Replace selected batch rows while preserving autograd to both inputs.
+
+        `None` in, `None` out: a generator that never produces a `SlotSet`
+        (`NullGenerator`) has nothing to merge.
+        """
+        if base is None and replacement is None:
+            return None
+        assert base is not None and replacement is not None, (
+            "a generator's encode_node must consistently produce SlotSet or "
+            "consistently produce none across every call"
+        )
         return SlotSet(*(a.index_copy(0, rows, b) for a, b in zip(base, replacement, strict=True)))
 
     def encode_node_state(
@@ -265,14 +340,30 @@ class EgoStitchModel(nn.Module):
         `encode_tokens` are cacheable per-node phases (module docstring point
         2), so both run here, once per unique node -- not the pair-level
         `stitch`/`forward` phases, which run once per pair.
+
+        `self.generator.encode_node` is called unconditionally (protocol
+        compliance, every generator implements it), but its return value is
+        only unpacked into `slots`/`projected_x` when it is actually a
+        `GeneratorNodeState` -- `NullGenerator.encode_node` instead echoes
+        `x` back, having nothing to cache structurally (design §3.3,
+        `generator/null.py`), so `E2ENodeState.slots`/`.projected_x` stay
+        `None` in that case.
         """
         generated = self.generator.encode_node(x, ground, ground_ids)
+        if isinstance(generated, GeneratorNodeState):
+            return E2ENodeState(
+                encoded=self.classifier.encode_tokens(emb, length),
+                length=length,
+                slots=generated.slots,
+                projected_x=generated.projected_x,
+                ground_ids=generated.ground_ids,
+            )
         return E2ENodeState(
             encoded=self.classifier.encode_tokens(emb, length),
             length=length,
-            slots=generated.slots,
-            projected_x=generated.projected_x,
-            ground_ids=generated.ground_ids,
+            slots=None,
+            projected_x=None,
+            ground_ids=ground_ids,
         )
 
     def _merge_node_states(
@@ -288,11 +379,15 @@ class EgoStitchModel(nn.Module):
             ground_ids = None
         else:
             ground_ids = base.ground_ids.index_copy(0, rows, replacement.ground_ids)
+        if base.projected_x is None or replacement.projected_x is None:
+            projected_x = None
+        else:
+            projected_x = base.projected_x.index_copy(0, rows, replacement.projected_x)
         return E2ENodeState(
             encoded=encoded_base.index_copy(0, rows, encoded_replacement),
             length=base.length.index_copy(0, rows, replacement.length),
             slots=self._merge_slots(base.slots, replacement.slots, rows),
-            projected_x=base.projected_x.index_copy(0, rows, replacement.projected_x),
+            projected_x=projected_x,
             ground_ids=ground_ids,
         )
 
@@ -344,18 +439,29 @@ class EgoStitchModel(nn.Module):
         is_self: torch.Tensor,
         *,
         perturbation: ScaffoldInputPerturbation | None = None,
-    ) -> tuple[ImaginedGraph, GraphEmbedding, GraphEmbedding]:
+    ) -> tuple[ImaginedGraph | None, GraphEmbedding | None, GraphEmbedding | None]:
         """Imagine the joint graph once, then encode both AB and BA directions.
 
         The graph is built exactly once per pair (design §4): `swapped()`
         shares ``adj``/``mask``/``aux`` by reference, only ``x`` is
         relabelled for the BA stream.
+
+        Returns `(None, None, None)` when the generator imagines nothing for
+        this pair (`NullGenerator.stitch` always; design §3.3) -- `self.encoder`
+        is never called in that case, matching it not being constructed at
+        all for a null-generator model (`__init__`).
         """
         graph = self.generator.stitch(
             self._generator_state(state_a),
             self._generator_state(state_b),
             is_self,
             perturbation=perturbation,
+        )
+        if graph is None:
+            return None, None, None
+        assert self.encoder is not None, (
+            "a generator that emits a real ImaginedGraph must be paired with "
+            "a constructed encoder"
         )
         embedding_ab = self.encoder(graph)
         embedding_ba = self.encoder(graph.swapped())
@@ -382,10 +488,15 @@ class EgoStitchModel(nn.Module):
         against the *same* stitch+encode pass that produced the scored
         logits, rather than paying for a second one.
         """
-        slots_a = state_a.slots
-        batch_size, _ = slots_a.pi.shape
+        batch_size = state_a.encoded.size(0)
         if is_self.shape != (batch_size,):
             raise ValueError(f"is_self shape must be {(batch_size,)}, got {tuple(is_self.shape)}")
+        # A generator with no constructed encoder (`self.encoder is None`,
+        # `generator.name: "null"`) never has topology to build regardless of
+        # what the caller requested -- clamped here, the single place every
+        # `need_topo` path (`forward`, `build_pair_context*`) routes through,
+        # rather than duplicated at each call site.
+        need_topo = need_topo and self.encoder is not None
         topo_ab: torch.Tensor | None = None
         topo_ba: torch.Tensor | None = None
         plan: torch.Tensor | None = None
@@ -396,10 +507,12 @@ class EgoStitchModel(nn.Module):
             graph, embedding_ab, embedding_ba = self._stitch_and_encode(
                 state_a, state_b, is_self, perturbation=scaffold_input_perturbation
             )
-            plan = graph.aux["plan"]
-            log_plan = graph.aux["log_plan"]
-            topo_ab = embedding_ab.tokens
-            topo_ba = embedding_ba.tokens
+            if graph is not None:
+                assert embedding_ab is not None and embedding_ba is not None
+                plan = graph.aux["plan"]
+                log_plan = graph.aux["log_plan"]
+                topo_ab = embedding_ab.tokens
+                topo_ba = embedding_ba.tokens
         context = E2EPairContext(
             encoded_a=state_a.encoded,
             encoded_b=state_b.encoded,
@@ -459,7 +572,16 @@ class EgoStitchModel(nn.Module):
 
         Returns:
             Shape ``(B, V, d_model)`` AB-direction encoder token states.
+
+        Raises:
+            RuntimeError: For a null-generator model (`self.encoder is None`):
+                there is no encoder token state to export.
         """
+        if self.encoder is None:
+            raise RuntimeError(
+                "probe_states has no encoder token state to export: this model's "
+                "generator (generator.name: 'null') never builds one"
+            )
         context = self.build_pair_context(batch, need_topo=True)
         assert context.topo_ab is not None
         return context.topo_ab
@@ -480,13 +602,21 @@ class EgoStitchModel(nn.Module):
         ``encoded_b`` are already the classifier's own `encode_tokens` output
         (`encode_node_state`), so they are handed to `PairInputs` as-is --
         `self.classifier.forward` must not, and does not, re-encode them.
+
+        A null-generator model (`self.encoder is None`) never has topology to
+        gate: `masks.topo` is clamped off regardless of its actual values, so
+        `cond` stays `None` and the classifier runs exactly as unconditioned
+        -- this is not a caller error, so it must not raise, unlike a
+        genuinely topo-conditioned model whose caller requested topology from
+        a `context` that was never built with it (design §12 P3 acceptance
+        criterion 5).
         """
         batch_size = context.encoded_a.size(0)
         device = context.encoded_a.device
         if masks is None:
             masks = masks_for_null(NULL_NONE, batch_size, device)
         distributed_training = self.training and dist.is_available() and dist.is_initialized()
-        need_topo = bool(masks.topo.any()) or distributed_training
+        need_topo = self.encoder is not None and (bool(masks.topo.any()) or distributed_training)
         if need_topo and (context.topo_ab is None or context.topo_ba is None):
             raise ValueError("pair context does not contain topology tokens")
         cond: PairConditioning | None = None

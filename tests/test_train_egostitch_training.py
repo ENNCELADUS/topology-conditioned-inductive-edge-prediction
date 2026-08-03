@@ -18,7 +18,12 @@ import torch
 import yaml  # type: ignore[import-untyped]
 from src import train_egostitch as te
 from src.model.egostitch.composite import EgoStitchModel
-from src.model.egostitch.config import E2EConfig
+from src.model.egostitch.config import (
+    ClassifierConfig,
+    E2EConfig,
+    EncoderConfig,
+    GeneratorConfig,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -472,7 +477,7 @@ def test_prefetch_batches_propagates_producer_error_and_shutdowns() -> None:
 
 def test_e2e_lr_and_active_groups_follow_registered_phase_contract() -> None:
     config = te.EgoStitchTrainingConfig()
-    full_model = EgoStitchModel(E2EConfig(w_rel=0.25))
+    full_model = EgoStitchModel(E2EConfig(encoder=EncoderConfig(w_rel=0.25)))
     assert te._e2e_base_lr(0, 2000, config) == pytest.approx(2e-7)
     assert te._e2e_base_lr(499, 2000, config) == pytest.approx(1e-4)
     assert te._e2e_base_lr(1999, 2000, config) == pytest.approx(1e-5)
@@ -580,14 +585,15 @@ def test_e2e_weighted_bce_matches_one_and_two_rank_gradients_with_padding() -> N
 def test_e2e_parameter_groups_are_disjoint_exhaustive_and_exclude_kendall() -> None:
     model = EgoStitchModel(
         E2EConfig(
-            d_model=16,
-            encoder_layers=1,
-            cross_attn_layers=1,
-            n_heads=2,
-            n_inj=1,
-            ste_dim=8,
-            ste_layers=1,
-            xattn_heads=2,
+            encoder=EncoderConfig(dim=8, layers=1),
+            classifier=ClassifierConfig(
+                d_model=16,
+                encoder_layers=1,
+                cross_attn_layers=1,
+                n_heads=2,
+                n_inj=1,
+                xattn_heads=2,
+            ),
         )
     )
     manifest = te.build_e2e_parameter_groups(model)
@@ -618,3 +624,25 @@ def _record(epoch: int, *, mmd: float, brier: float, auprc: float = 0.6) -> te.E
         warm_reference_auprc=0.61,
         residual_ratio=1e-2,
     )
+
+
+def test_null_generator_arm_refuses_training_with_an_explanatory_error() -> None:
+    """The null-generator arm is scoring-only; training must say so, not confuse.
+
+    Its `generator` and `encoder` groups are legitimately empty, which trips the
+    non-empty parameter-group assertion. That assertion is kept -- its job is
+    catching a parameter that failed to route into any group -- so the arm gets
+    a refusal naming the real limitation instead of a message about optimizer
+    groups that reads like a bug.
+    """
+    cfg = E2EConfig(
+        generator=GeneratorConfig(name="null"),
+        encoder=EncoderConfig(dim=16, layers=1),
+        classifier=ClassifierConfig(
+            d_model=32, encoder_layers=1, cross_attn_layers=2, n_heads=2, xattn_heads=2
+        ),
+    )
+    model = EgoStitchModel(cfg)
+    assert model.encoder is None
+    with pytest.raises(RuntimeError, match="scoring-only and not yet trainable"):
+        te.build_e2e_parameter_groups(model)

@@ -26,47 +26,50 @@ from typing import Any, cast
 
 import pytest
 import torch
-from src.model.egostitch.classifier.b0_v31 import GatedCrossAttention
+from src.model.egostitch.classifier.b0_v31 import B0V31PairClassifier, GatedCrossAttention
 from src.model.egostitch.composite import EgoStitchModel
-from src.model.egostitch.config import E2EConfig
+from src.model.egostitch.config import ClassifierConfig, E2EConfig, EncoderConfig, GeneratorConfig
 from src.model.egostitch.generator import NullGenerator, StitchedGraph
 from src.model.egostitch.generator.assemble import make_scaffold_input_perturbation
 from src.model.egostitch.generator.losses import stage1_family_tensors, stage1_total
 from src.model.egostitch.graph import GraphEmbedding, PairInputs
 
 
-def _tiny_e2e_config(*, n_ground: int = 5, **overrides: object) -> E2EConfig:
-    """The shared tiny composite sizing used across this file's tests."""
-    kwargs: dict[str, object] = {
-        "d_model": 32,
-        "encoder_layers": 1,
-        "cross_attn_layers": 2,
-        "n_heads": 4,
-        "n_inj": 1,
-        "ste_dim": 16,
-        "ste_layers": 2,
-        "xattn_heads": 4,
-        "p_topo": 0.15,
-        "feature_standardization": "row_layernorm",
-        "n_ground": n_ground,
-    }
-    kwargs.update(overrides)
-    return E2EConfig(**kwargs)  # type: ignore[arg-type]
+def _tiny_e2e_config(
+    *,
+    n_ground: int = 5,
+    generator_name: str = "egostitch_imagine",
+    feature_standardization: str = "row_layernorm",
+    encoder_w_rel: float = 0.25,
+) -> E2EConfig:
+    """The shared tiny composite sizing used across this file's tests (design §8)."""
+    return E2EConfig(
+        generator=GeneratorConfig(
+            name=generator_name,
+            n_ground=n_ground,
+            feature_standardization=feature_standardization,
+        ),
+        encoder=EncoderConfig(dim=16, layers=2, w_rel=encoder_w_rel),
+        classifier=ClassifierConfig(
+            d_model=32,
+            encoder_layers=1,
+            cross_attn_layers=2,
+            n_heads=4,
+            n_inj=1,
+            xattn_heads=4,
+            p_topo=0.15,
+        ),
+    )
 
 
 def _tiny_model_and_batch(
     **config_overrides: object,
 ) -> tuple[EgoStitchModel, dict[str, torch.Tensor]]:
     torch.manual_seed(0)
-    # Same mypy limitation `_tiny_e2e_config`'s own `E2EConfig(**kwargs)` call
-    # hits (see its `# type: ignore[arg-type]` below): a `**dict[str, object]`
-    # unpack can't be proven to avoid `_tiny_e2e_config`'s one narrower-typed
-    # named parameter (`n_ground: int`), even though this call site never
-    # actually targets it.
-    cfg = _tiny_e2e_config(**config_overrides)  # type: ignore[arg-type]
+    cfg = _tiny_e2e_config(**cast(dict[str, Any], config_overrides))
     model = EgoStitchModel(cfg).eval()
     b, t, d_in = 4, 6, model.input_dim
-    n_ground = cfg.n_ground
+    n_ground = cfg.generator.n_ground
     batch = {
         "emb_a": torch.randn(b, t, d_in),
         "emb_b": torch.randn(b, t, d_in),
@@ -280,12 +283,19 @@ def test_null_generator_cond_none_matches_conditioned_model_f_logit() -> None:
     batch the conditioned model built its pair context from into
     `model.classifier(pair, None)` must reproduce exactly
     `model.decompose(batch)["f_logit"]` -- the existing eval-time hard bypass
-    -- because both paths run the classifier fully unconditioned. Registry-
-    driven `generator.name: null` wiring into `EgoStitchModel.__init__`
-    itself is P3 (design §12); this test exercises the null path at the
-    component-composition level available today.
+    -- because both paths run the classifier fully unconditioned. This test
+    exercises the null path at the component-composition level, independent
+    of config wiring;
+    `test_registry_driven_null_generator_config_matches_conditioned_model_f_logit`
+    below proves the same identity end-to-end through
+    `generator.name: "null"` (design §12 P3 acceptance criterion 5).
     """
     model, batch = _tiny_model_and_batch()
+    # `model.classifier`'s static type is the `PairClassifier` ABC now that
+    # construction is registry-driven (design §12 P3); narrow to the
+    # concrete class this file always builds to reach `.trunk`, same idiom
+    # as `tests/model/test_egostitch_e2e_model.py`'s `_classifier` helper.
+    assert isinstance(model.classifier, B0V31PairClassifier)
     # `nn.ModuleList.__getitem__` is typed to return plain `Module`; narrow to
     # the concrete type to reach `.gate` (same idiom as
     # `tests/test_train_egostitch_e2e.py`'s `_gates` helper).
@@ -315,6 +325,66 @@ def test_null_generator_cond_none_matches_conditioned_model_f_logit() -> None:
         null_logits = model.classifier(pair, cond)
 
     torch.testing.assert_close(null_logits, f_logit, rtol=0.0, atol=1e-6)
+
+
+def test_registry_driven_null_generator_config_matches_conditioned_model_f_logit() -> None:
+    """`generator.name: "null"` end-to-end reproduces the conditioned model's `f_logit`.
+
+    Proves the registry-driven wiring itself (design §12 P3 acceptance
+    criterion 5), not just the component composed by hand: building a whole
+    `EgoStitchModel` from `E2EConfig(generator=GeneratorConfig(name="null"),
+    ...)` and running it through the *public* `forward` path -- never
+    reaching into `model.classifier` directly, unlike the test above --
+    reproduces the conditioned model's `f_logit` bit-for-bit.
+
+    A null-generator model's `generator`/`encoder` allocate zero parameters
+    (`__init__` never even constructs a `GraphEncoder`), so seeding both
+    models with the same `torch.manual_seed(0)` leaves their RNG streams at
+    different offsets by the time each reaches its own classifier
+    construction -- the two classifiers therefore start with *different*
+    weights unless reconciled. `load_state_dict` reconciles them explicitly,
+    which is the honest way to isolate "does the null wiring compute the
+    right thing" from "do two independently-seeded models happen to match".
+    """
+    conditioned, batch = _tiny_model_and_batch()
+    f_logit = conditioned.decompose(batch)["f_logit"]
+
+    null_model = EgoStitchModel(_tiny_e2e_config(generator_name="null")).eval()
+    null_model.classifier.load_state_dict(conditioned.classifier.state_dict())
+
+    with torch.no_grad():
+        output = null_model(batch)
+
+    assert "graph" not in output
+    assert "embedding_ab" not in output
+    assert torch.equal(cast(torch.Tensor, output["logits"]), f_logit)
+
+
+def test_null_generator_state_dict_carries_no_generator_or_encoder_parameters() -> None:
+    """`generator.name: "null"` builds no `GraphEncoder` and a parameter-free generator.
+
+    Design §12 P3 task 4's own acceptance bar: `self.encoder` must be either
+    unconstructed or contribute no parameters, and `NullGenerator` itself
+    (design §3.3, `generator/null.py`) has no layers to allocate. Together
+    these mean every surviving `state_dict` key belongs to the classifier --
+    proven directly, not merely inferred from a raw parameter count, so a
+    regression that silently gave the null generator or a future stub
+    encoder even one buffer would fail this immediately.
+    """
+    model = EgoStitchModel(_tiny_e2e_config(generator_name="null"))
+
+    assert model.encoder is None
+    assert isinstance(model.generator, NullGenerator)
+    assert sum(p.numel() for p in model.generator.parameters()) == 0
+    assert list(model.generator.buffers()) == []
+
+    state_dict_keys = set(model.state_dict())
+    assert state_dict_keys, "expected the classifier to still contribute state"
+    assert all(key.startswith("classifier.") for key in state_dict_keys)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    classifier_params = sum(p.numel() for p in model.classifier.parameters())
+    assert total_params == classifier_params > 0
 
 
 # --------------------------------------------------------------------------- (c) perturbation
@@ -388,6 +458,7 @@ def test_forward_graph_and_embedding_ab_feed_generator_and_encoder_auxiliary_los
     graph = cast(StitchedGraph, output["graph"])
     embedding_ab = cast(GraphEmbedding, output["embedding_ab"])
     generator_losses = model.generator.auxiliary_losses(graph, batch)
+    assert model.encoder is not None
     encoder_losses = model.encoder.auxiliary_losses(embedding_ab, batch)
     recon = {
         "feat": generator_losses["feat"],

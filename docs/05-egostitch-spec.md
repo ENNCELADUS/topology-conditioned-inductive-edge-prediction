@@ -532,6 +532,16 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-08-03 (owner decision): B0-alt withdrawn as a baseline family. The mature B0
+  (V3.1) is now the sole baseline going forward; `03-experiment-protocol.md` §2's
+  baseline-hierarchy table and its E3 run list, and `04-model-proposal.md` §6.0 G1's
+  re-run requirement list, no longer name B0-alt. Its implementation
+  (`src/model/b0_alt.py`, `F0PairMLP`) was removed from the code tree in commit
+  `72db72c`. No normative content in this document changes: the two existing
+  historical B0-alt mentions — the 2026-07-14 entry below recomputing
+  `B0/B0-alt/PA-null/legacy/G3` values, and §14.4.4's measured grounding P0.2 curve —
+  record completed, already-run measurements and are retained unchanged; provenance
+  for reproducing B0-alt numbers is in `docs/results/E2-pair-to-topology-gap.md`.
 - 2026-07-30 (arm-schema migration to the v5 component-ablation set; supersedes
   the §14.4.6 eight-arm listing): the trained-arm set becomes `full`,
   `b0_e2e_f_only`, `pair_topology`, `p0`, `no_l_rel`, `row_layernorm`;

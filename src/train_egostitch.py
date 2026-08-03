@@ -61,13 +61,15 @@ from src.eval.graph_metrics import MMDConfig, clustering_histogram, mmd_squared
 from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
 from src.model.egostitch.classifier.b0_v31 import (
     NULL_ALL_HEAD,
+    B0V31PairClassifier,
     GatedCrossAttention,
     masks_for_null,
     sample_branch_masks,
 )
 from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
 from src.model.egostitch.config import E2EConfig
-from src.model.egostitch.generator import StitchedGraph
+from src.model.egostitch.encoder.base import GraphEncoder
+from src.model.egostitch.generator import EgoStitchImagineGenerator, StitchedGraph
 from src.model.egostitch.generator.imagine import (
     NULL_MODE_ALL,
     NULL_MODE_CONTENT,
@@ -75,6 +77,7 @@ from src.model.egostitch.generator.imagine import (
     SlotSet,
 )
 from src.model.egostitch.generator.losses import stage1_family_tensors, stage1_total
+from src.model.egostitch.generator.null import NullGenerator
 from src.model.egostitch.graph import GraphEmbedding
 from src.train_b0 import (
     EvalConfig,
@@ -649,7 +652,7 @@ def load_config(path: Path) -> EgoConfig:
         ):
             raise ValueError("training requires the pinned optimizer settings")
         resolved_e2e = E2EConfig.from_mapping(model_kwargs)
-        if resolved_e2e.p_topo not in (0.15, 0.0):
+        if resolved_e2e.classifier.p_topo not in (0.15, 0.0):
             raise ValueError("training requires p_topo=0.15, or 0.0 for the p0 arm")
         if mixed_precision != "bf16" or eval_cfg.eval_every != 1:
             raise ValueError("training requires mixed_precision=bf16 and eval.eval_every=1")
@@ -708,6 +711,7 @@ E2EArmName = Literal[
     "p0",
     "no_l_rel",
     "row_layernorm",
+    "null_generator",
 ]
 
 
@@ -968,7 +972,15 @@ def e2e_degree_prior_init(
     rank computes this independently, so without the sort the replicas can
     disagree in the final bit from step 0.
     """
-    generator = model.generator.stage1 if isinstance(model, EgoStitchModel) else model
+    if isinstance(model, EgoStitchModel):
+        if not isinstance(model.generator, EgoStitchImagineGenerator):
+            raise RuntimeError(
+                "the degree prior centers a real generator's degree head; "
+                "a null-generator arm has none"
+            )
+        generator = model.generator.stage1
+    else:
+        generator = model
     graph = data.target_builder.graph
     degrees = np.asarray(
         [max(int(graph.degree(node)), 1) for node in sorted(graph.nodes())],
@@ -1089,8 +1101,28 @@ def build_e2e_parameter_groups(model: EgoStitchModel) -> E2EParameterGroups:
         group: tuple(parameter for _, parameter in sorted(rows, key=lambda row: row[0]))
         for group, rows in grouped.items()
     }
-    if any(not rows for rows in parameters.values()):
-        raise RuntimeError("every E2E optimizer group must contain trainable parameters")
+    empty = sorted(group for group, rows in parameters.items() if not rows)
+    if empty:
+        # Deliberately not relaxed to "empty groups are fine". The assertion's
+        # job is to catch a parameter that failed to route into any component
+        # group, and that value is lost the moment empty groups are tolerated.
+        # A null generator legitimately contributes none -- but the rest of the
+        # training path is not ready for it either (the phase curriculum,
+        # `_e2e_family_probe`, `_e2e_active_groups` and the validation
+        # dispersion telemetry all assume a real generator and encoder), so the
+        # honest outcome is a refusal that says exactly that rather than a
+        # confusing one about optimizer groups.
+        if "generator" in empty and isinstance(model.generator, NullGenerator):
+            raise RuntimeError(
+                "the null-generator arm is scoring-only and not yet trainable: it has no "
+                "generator or encoder parameters, and the phase curriculum, family probe, "
+                "active-group schedule and validation dispersion telemetry all require "
+                "both. Use it to score or to reproduce the pairwise baseline's f_logit; "
+                "train the pairwise baseline itself through src.train_b0."
+            )
+        raise RuntimeError(
+            f"every E2E optimizer group must contain trainable parameters; empty: {empty}"
+        )
     hashes = {
         group: hashlib.sha256(("\n".join(group_names) + "\n").encode()).hexdigest()
         for group, group_names in names.items()
@@ -1567,7 +1599,7 @@ def prepare_pack(
     from src.data import packed_features
 
     e2e_model_cfg = E2EConfig.from_mapping(cfg.model.config)
-    n_ground = e2e_model_cfg.n_ground
+    n_ground = e2e_model_cfg.generator.n_ground
     manifest_path = pack_dir / _PACK_MANIFEST_FILENAME
     # The pack carries data-universe identity rather than execution-stage
     # identity. Grounding caches keep their own `role_universe` internally.
@@ -2033,10 +2065,10 @@ def assemble_egostitch_data(
     e2e_model_cfg = E2EConfig.from_mapping(cfg.model.config)
     generator_cfg = replace(
         EgoStitchConfig(),
-        n_ground=e2e_model_cfg.n_ground,
-        tau_adj=e2e_model_cfg.tau_adj,
-        tau_div=e2e_model_cfg.tau_div,
-        l_gate_pos_weight=e2e_model_cfg.l_gate_pos_weight,
+        n_ground=e2e_model_cfg.generator.n_ground,
+        tau_adj=e2e_model_cfg.generator.tau_adj,
+        tau_div=e2e_model_cfg.generator.tau_div,
+        l_gate_pos_weight=e2e_model_cfg.generator.l_gate_pos_weight,
     )
     return _assemble_e2e_data(cfg, generator_cfg, pack_dir=pack_dir)
 
@@ -2537,16 +2569,16 @@ class _CompositeStep(torch.nn.Module):
         seed = cast(int, batch["seed"])
         epoch = cast(int, batch["epoch"])
         step = cast(int, batch["step"])
-        if self.model.cfg.permanent_null == "none":
+        if self.model.cfg.classifier.permanent_null == "none":
             branch_masks = sample_branch_masks(
                 edge["label"].shape[0],
-                self.model.cfg.p_topo,
+                self.model.cfg.classifier.p_topo,
                 generator=_seeded_generator(seed, epoch, step),
                 device=edge["label"].device,
             )
         else:
             branch_masks = masks_for_null(
-                self.model.cfg.permanent_null,
+                self.model.cfg.classifier.permanent_null,
                 edge["label"].shape[0],
                 edge["label"].device,
             )
@@ -2589,7 +2621,9 @@ class _CompositeStep(torch.nn.Module):
         # key inventory.
         auxiliary_batch = {**node, **edge_view}
         generator_losses = self.model.generator.auxiliary_losses(graph, auxiliary_batch)
-        encoder_losses = self.model.encoder.auxiliary_losses(embedding_ab, auxiliary_batch)
+        encoder_losses = _require_encoder(self.model).auxiliary_losses(
+            embedding_ab, auxiliary_batch
+        )
         recon = {
             "feat": generator_losses["feat"],
             "exist": generator_losses["exist"],
@@ -2723,7 +2757,7 @@ def _e2e_gate_tanh(model: EgoStitchModel) -> dict[str, list[float]]:
         return out
 
     return {
-        "gate_topo_tanh": _values(model.classifier.trunk.topo_xattn),
+        "gate_topo_tanh": _values(_require_b0v31_classifier(model).trunk.topo_xattn),
     }
 
 
@@ -2742,8 +2776,8 @@ def _e2e_submodule_gradient_rms(model: EgoStitchModel, loss: torch.Tensor) -> di
     ``None`` afterward either way.
     """
     groups: dict[str, list[torch.nn.Parameter]] = {
-        "grad_rms_trunk": list(model.classifier.trunk.parameters()),
-        "grad_rms_ste": list(model.encoder.parameters()),
+        "grad_rms_trunk": list(_require_b0v31_classifier(model).trunk.parameters()),
+        "grad_rms_ste": list(_require_encoder(model).parameters()),
     }
     model.zero_grad(set_to_none=True)
     loss.backward(retain_graph=True)  # type: ignore[no-untyped-call]
@@ -2937,25 +2971,41 @@ def _e2e_validation_node_batch(
 
 
 def _fp32_cached_node_state(state: E2ENodeState, row: int) -> E2ENodeState:
-    """Detach one encoded node while preserving integer identity fields exactly."""
+    """Detach one encoded node while preserving integer identity fields exactly.
+
+    ``slots``/``projected_x`` are ``None`` only for a generator whose
+    ``encode_node`` allocates no ``GeneratorNodeState`` (``NullGenerator``,
+    design §3.3) -- preserved as ``None`` rather than defaulted, since a
+    null-generator arm's cache must stay legible as carrying no slot
+    geometry, not a fabricated one.
+    """
     length = state.length[row : row + 1].clone()
     true_length = int(length.item())
-    slots = SlotSet(
-        *(
-            value[row : row + 1].float().clone()
-            if value.is_floating_point()
-            else value[row : row + 1].clone()
-            for value in state.slots
+    slots = (
+        SlotSet(
+            *(
+                value[row : row + 1].float().clone()
+                if value.is_floating_point()
+                else value[row : row + 1].clone()
+                for value in state.slots
+            )
         )
+        if state.slots is not None
+        else None
     )
     ground_ids = None
     if state.ground_ids is not None:
         ground_ids = state.ground_ids[row : row + 1].clone()
+    projected_x = (
+        state.projected_x[row : row + 1].float().clone()
+        if state.projected_x is not None
+        else None
+    )
     return E2ENodeState(
         encoded=state.encoded[row : row + 1, :true_length].float().clone(),
         length=length,
         slots=slots,
-        projected_x=state.projected_x[row : row + 1].float().clone(),
+        projected_x=projected_x,
         ground_ids=ground_ids,
     )
 
@@ -2963,7 +3013,14 @@ def _fp32_cached_node_state(state: E2ENodeState, row: int) -> E2ENodeState:
 def _stack_cached_node_states(
     cache: Mapping[str, E2ENodeState], nodes: Sequence[str]
 ) -> E2ENodeState:
-    """Reconstruct one pair-endpoint state batch from the per-rank cache."""
+    """Reconstruct one pair-endpoint state batch from the per-rank cache.
+
+    ``slots``/``projected_x`` are carried through as ``None`` when every
+    state in the batch carries ``None`` (a null-generator arm), matching
+    ``ground_ids``'s existing all-or-nothing check -- a cache mixing real and
+    absent slot geometry within one batch is a real inconsistency, not a
+    valid null-generator batch.
+    """
     states = [cache[node] for node in nodes]
     width = max(state.encoded.size(1) for state in states)
     encoded = torch.cat(
@@ -2976,13 +3033,32 @@ def _stack_cached_node_states(
         ground_ids = None
     else:
         ground_ids = torch.cat([cast(torch.Tensor, state.ground_ids) for state in states])
+    slots: SlotSet | None
+    if any(state.slots is None for state in states):
+        if not all(state.slots is None for state in states):
+            raise RuntimeError("validation node cache has inconsistent slot state")
+        slots = None
+    else:
+        slots = SlotSet(
+            *(
+                torch.cat(values)
+                for values in zip(
+                    *(cast(SlotSet, state.slots) for state in states), strict=True
+                )
+            )
+        )
+    projected_x: torch.Tensor | None
+    if any(state.projected_x is None for state in states):
+        if not all(state.projected_x is None for state in states):
+            raise RuntimeError("validation node cache has inconsistent projected features")
+        projected_x = None
+    else:
+        projected_x = torch.cat([cast(torch.Tensor, state.projected_x) for state in states])
     return E2ENodeState(
         encoded=encoded,
         length=torch.cat([state.length for state in states]),
-        slots=SlotSet(
-            *(torch.cat(values) for values in zip(*(state.slots for state in states), strict=True))
-        ),
-        projected_x=torch.cat([state.projected_x for state in states]),
+        slots=slots,
+        projected_x=projected_x,
         ground_ids=ground_ids,
     )
 
@@ -3096,9 +3172,9 @@ def _validate_epoch(
             )
             masks = (
                 None
-                if model.cfg.permanent_null == "none"
+                if model.cfg.classifier.permanent_null == "none"
                 else masks_for_null(
-                    model.cfg.permanent_null,
+                    model.cfg.classifier.permanent_null,
                     len(rows),
                     accelerator.device,
                 )
@@ -3120,16 +3196,18 @@ def _validate_epoch(
                     else model.score_pair_context(context, masks=masks)
                 )
             assert context.plan is not None
+            slots_a = _require_slots(state_a)
+            slots_b = _require_slots(state_b)
             dispersion_a = _e2e_dispersion_rows(
-                state_a.slots.pi,
-                state_a.slots.h,
-                state_a.slots.adj,
+                slots_a.pi,
+                slots_a.h,
+                slots_a.adj,
                 context.plan,
             )
             dispersion_b = _e2e_dispersion_rows(
-                state_b.slots.pi,
-                state_b.slots.h,
-                state_b.slots.adj,
+                slots_b.pi,
+                slots_b.h,
+                slots_b.adj,
                 context.plan,
             )
             dispersion_rows = {
@@ -3143,8 +3221,8 @@ def _validate_epoch(
             }
             for name in ("plan_row_entropy", "plan_rank1_marginal_residual"):
                 dispersion_rows[name] = dispersion_rows[name].masked_fill(is_self, torch.nan)
-            scale_a = _e2e_scale_rows(state_a.slots.h, context.plan)
-            scale_b = _e2e_scale_rows(state_b.slots.h, context.plan)
+            scale_a = _e2e_scale_rows(slots_a.h, context.plan)
+            scale_b = _e2e_scale_rows(slots_b.h, context.plan)
             scale_rows = {
                 name: (
                     0.5 * (scale_a[name] + scale_b[name])
@@ -3326,15 +3404,65 @@ def _e2e_arm_name(model: EgoStitchModel) -> E2EArmName:
 
 
 def _e2e_arm_name_from_config(config: E2EConfig) -> E2EArmName:
-    if config.permanent_null == "all_head":
+    if config.generator.name == "null":
+        return "null_generator"
+    if config.classifier.permanent_null == "all_head":
         return "b0_e2e_f_only"
-    if config.p_topo == 0.0:
+    if config.classifier.p_topo == 0.0:
         return "p0"
-    if config.w_rel == 0.0:
+    if config.encoder.w_rel == 0.0:
         return "no_l_rel"
-    if config.feature_standardization == "row_layernorm":
+    if config.generator.feature_standardization == "row_layernorm":
         return "row_layernorm"
     return "full"
+
+
+# --------------------------------------------------------- component narrowing
+#
+# The registry (design 2026-08-02 §3, §8, §12 P3) widened `EgoStitchModel`'s
+# component attributes so a null generator is a legal composite: `.generator`
+# is the abstract `NeighborhoodGenerator`, `.encoder` is `GraphEncoder | None`
+# (`None` for `generator.name == "null"`, since nothing is ever imagined and
+# there is nothing to encode -- composite.py), and `E2ENodeState.slots` /
+# `.projected_x` are `SlotSet | None` / `Tensor | None` to match
+# (`NullGenerator.encode_node` echoes its input back rather than allocating a
+# `GeneratorNodeState`). Every function below this point that reads a real
+# generator/encoder's internals or a node's slot geometry (family probes,
+# gradient telemetry, the gate-tanh readout, the fidelity/dispersion
+# validation summary, the degree-prior center) is reachable *only* under the
+# current real-generator curriculum: `build_e2e_parameter_groups` already
+# refuses to build optimizer groups for a null-generator arm (both its
+# "generator" and "encoder" groups are empty -- P3 report), so nothing here
+# runs for that arm today. These helpers narrow the type and raise the same
+# clear message the empty-group refusal already gives, rather than let a
+# silent `cast` paper over an invariant that is not actually universal.
+def _require_encoder(model: EgoStitchModel) -> GraphEncoder:
+    """Narrow `model.encoder` to a concrete `GraphEncoder`."""
+    if model.encoder is None:
+        raise RuntimeError(
+            "this code path requires a real generator/encoder pair; "
+            "a null-generator arm has no encoder to read"
+        )
+    return model.encoder
+
+
+def _require_b0v31_classifier(model: EgoStitchModel) -> B0V31PairClassifier:
+    """Narrow `model.classifier` to the concrete `B0V31PairClassifier`."""
+    if not isinstance(model.classifier, B0V31PairClassifier):
+        raise RuntimeError(
+            f"this code path requires the b0_v31 classifier, got {type(model.classifier).__name__}"
+        )
+    return model.classifier
+
+
+def _require_slots(state: E2ENodeState) -> SlotSet:
+    """Narrow one cached node state's `slots` to a concrete `SlotSet`."""
+    if state.slots is None:
+        raise RuntimeError(
+            "slot-geometry telemetry requires a real generator's SlotSet; "
+            "a null-generator arm carries none"
+        )
+    return state.slots
 
 
 def _e2e_base_lr(step: int, total_steps: int, config: EgoStitchTrainingConfig) -> float:
@@ -3351,7 +3479,7 @@ def _e2e_base_lr(step: int, total_steps: int, config: EgoStitchTrainingConfig) -
 
 def _e2e_active_groups(phase: E2EPhaseState, model: EgoStitchModel) -> set[str]:
     groups = {"generator"}
-    if model.encoder.rel_head is not None or phase.edge_active:
+    if _require_encoder(model).rel_head is not None or phase.edge_active:
         groups.add("encoder")
     if phase.edge_active:
         groups.add("classifier")
@@ -3486,7 +3614,7 @@ def _e2e_family_probe(
     expected: dict[str, set[str]] = {
         "classifier": {"edge"} if phase.edge_active else set(),
         "generator": {"recon"} | ({"real", "ssl"} if phase.real_ssl_scale > 0.0 else set()),
-        "encoder": {"recon"} if inner.encoder.rel_head is not None else set(),
+        "encoder": {"recon"} if _require_encoder(inner).rel_head is not None else set(),
     }
     if phase.edge_active and arm != "b0_e2e_f_only":
         expected["generator"].add("edge")
@@ -3543,8 +3671,8 @@ def _e2e_current_submodule_gradient_rms(
 ) -> dict[str, float]:
     """RMS telemetry from the current synchronized fixed-replay edge backward."""
     submodules: dict[str, Sequence[torch.nn.Parameter]] = {
-        "grad_rms_trunk": tuple(model.classifier.trunk.parameters()),
-        "grad_rms_ste": tuple(model.encoder.parameters()),
+        "grad_rms_trunk": tuple(_require_b0v31_classifier(model).trunk.parameters()),
+        "grad_rms_ste": tuple(_require_encoder(model).parameters()),
     }
     result: dict[str, float] = {}
     for name, parameters in submodules.items():
@@ -4851,7 +4979,7 @@ def train_egostitch_ddp_loop(
 
 V_HOLD_VALIDATION_EVENTS_FILENAME = "v_hold_validation_events.jsonl"
 
-_MODEL_CONFIG_HASH_SCHEMA = "egostitch_e2e_model_config_v2"
+_MODEL_CONFIG_HASH_SCHEMA = "egostitch_e2e_model_config_v3"
 
 def model_config_hash(cfg: EgoConfig) -> str:
     """Hash the model-defining configuration for run provenance.
@@ -4863,7 +4991,8 @@ def model_config_hash(cfg: EgoConfig) -> str:
 
     - ``output_dir`` / ``data.root`` / every other path;
     - ``optim.epochs`` -- recorded by the plan/config identity instead;
-    - ``model.config['feature_stats_sha256']`` -- recorded alongside this digest;
+    - ``model.config['generator']['feature_stats_sha256']`` -- recorded
+      alongside this digest, at its nested location (design 2026-08-02 §8);
     - ``seed`` -- an execution parameter. The formal stage may sweep
       ``--seeds`` without changing the model definition.
 
@@ -4874,7 +5003,12 @@ def model_config_hash(cfg: EgoConfig) -> str:
         The 64-character hex digest.
     """
     model_config = {
-        key: value for key, value in cfg.model.config.items() if key != "feature_stats_sha256"
+        key: (
+            {k: v for k, v in value.items() if k != "feature_stats_sha256"}
+            if key == "generator" and isinstance(value, Mapping)
+            else value
+        )
+        for key, value in cfg.model.config.items()
     }
     payload: dict[str, object] = {
         "schema": _MODEL_CONFIG_HASH_SCHEMA,
@@ -4937,9 +5071,11 @@ def write_run_start_metadata(
         "strategy": cfg.data.strategy,
         "rho_train": data.rho_train,
         "positives_mode": cfg.data.train_positives,
-        "permanent_null": cfg.model.config.get("permanent_null", "none"),
+        "permanent_null": (
+            e2e_config.classifier.permanent_null if e2e_config is not None else "none"
+        ),
         "model_family": cfg.model.family,
-        "p_topo": cfg.model.config.get("p_topo", 0.0),
+        "p_topo": e2e_config.classifier.p_topo if e2e_config is not None else 0.0,
         "config_path": str(config_path.resolve()) if config_path is not None else None,
         "config_sha256": _sha256_file(config_path) if config_path is not None else None,
         "arm": arm,
@@ -5021,10 +5157,11 @@ def write_outputs(
 
     checkpoint_sha256 = _sha256_file(best_path)
     checkpoint_role = "debug_only" if debug else "formal_plan_selected"
+    classifier_config = cast(Mapping[str, object], cfg.model.config.get("classifier", {}))
     validation_liveness_observed = (
         result.best_epoch > 0
         and (
-            cfg.model.config.get("permanent_null") != "none"
+            classifier_config.get("permanent_null") != "none"
             or any(
                 cast(dict[str, float], entry["fidelity"]).get("topology_delta_ratio", 0.0)
                 >= 1e-3
@@ -5094,7 +5231,8 @@ def _bind_feature_standardization(
         RuntimeError: When the config pins a non-empty `feature_stats_sha256`
             that disagrees with the assembled statistics' digest.
     """
-    mode = str(cfg.model.config.get("feature_standardization", "zscore_vfit_v1"))
+    generator_config = cast(Mapping[str, object], cfg.model.config.get("generator", {}))
+    mode = str(generator_config.get("feature_standardization", "zscore_vfit_v1"))
     if mode != "zscore_vfit_v1":
         return ""
     stats = data.feature_stats
@@ -5103,7 +5241,7 @@ def _bind_feature_standardization(
             "feature standardization statistics are unavailable; "
             "rebuild the feature pack before training"
         )
-    pinned = str(cfg.model.config.get("feature_stats_sha256", ""))
+    pinned = str(generator_config.get("feature_stats_sha256", ""))
     if pinned and pinned != stats.digest:
         raise RuntimeError(
             "feature_stats_sha256 mismatch: config pins "

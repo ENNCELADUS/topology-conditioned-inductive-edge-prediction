@@ -3,14 +3,20 @@
 model:
   family: egostitch_e2e
   config:
-    ste_layers: 3
-    ste_dim: 128
-    xattn_heads: 8
-    n_inj: 1
-    p_topo: 0.15
-    permanent_null: none
-    n_ground: 50
-    feature_standardization: zscore_vfit_v1
+    generator:
+      name: egostitch_imagine
+      n_ground: 50
+      feature_standardization: zscore_vfit_v1
+    encoder:
+      name: ste_typed
+      dim: 128
+      layers: 3
+    classifier:
+      name: b0_v31
+      xattn_heads: 8
+      n_inj: 1
+      p_topo: 0.15
+      permanent_null: none
 
 data:
   root: data
