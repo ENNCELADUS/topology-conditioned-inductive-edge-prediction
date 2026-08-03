@@ -32,4 +32,4 @@ runtime:
   score_batch_size: 16384
 
 seed: 0
-output_dir: outputs/cazi_mbn_breadth_first/seed0_paper_repo_defaults
+output_dir: outputs/cazi_mbn_breadth_first/seed0_paper_consistent_repair_v2

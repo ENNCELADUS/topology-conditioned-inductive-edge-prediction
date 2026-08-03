@@ -214,7 +214,7 @@ class CAZITeacher(nn.Module):
         self.consensus = nn.Parameter(torch.empty(num_nodes, topology_dim))
         nn.init.xavier_normal_(self.consensus)
         self.latent_projection = nn.Linear(topology_dim, latent_dim)
-        endpoint_dim = topology_dim + sequence_dim
+        endpoint_dim = latent_dim + sequence_dim
         self.classifier = MoE(
             endpoint_dim,
             endpoint_dim,
@@ -247,9 +247,9 @@ class CAZITeacher(nn.Module):
         )
         discriminator_loss = F.binary_cross_entropy_with_logits(logits, labels)
         consensus_loss = (
-            F.cosine_similarity(self.consensus, positive_h, dim=1).mean()
-            + 1.0
-            - F.cosine_similarity(self.consensus, negative_h, dim=1).mean()
+            1.0
+            - F.cosine_similarity(self.consensus, positive_h, dim=1).mean()
+            + F.cosine_similarity(self.consensus, negative_h, dim=1).mean()
         )
         return discriminator_loss, consensus_loss
 
@@ -260,8 +260,9 @@ class CAZITeacher(nn.Module):
         v_idx: torch.Tensor,
     ) -> torch.Tensor:
         """Classify pairs from sequence and learned topology consensus states."""
-        u = torch.cat((sequence[u_idx], self.consensus[u_idx]), dim=1)
-        v = torch.cat((sequence[v_idx], self.consensus[v_idx]), dim=1)
+        topology_latent = self.distilled_latent()
+        u = torch.cat((sequence[u_idx], topology_latent[u_idx]), dim=1)
+        v = torch.cat((sequence[v_idx], topology_latent[v_idx]), dim=1)
         return cast(torch.Tensor, self.classifier(u, v).squeeze(1))
 
     def distilled_latent(self) -> torch.Tensor:
