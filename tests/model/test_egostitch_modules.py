@@ -1,13 +1,10 @@
-"""Tests for the EgoStitch Stage-1 modules: config, tokenize, imagine, stitch, decision."""
+"""Tests for the EgoStitch Stage-1 modules: config, tokenize, imagine, stitch."""
 
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
-from src.model.egostitch.config import E2EConfig, EgoStitchConfig, e2e_checkpoint_config
-from src.model.egostitch.decision import DecisionHead
+from src.model.egostitch.config import E2EConfig, EgoStitchConfig
 from src.model.egostitch.imagine import (
     NULL_MODE_ALL,
     NULL_MODE_CONTENT,
@@ -119,17 +116,6 @@ class TestConfig:
             {"feature_standardization": "row_layernorm", "feature_stats_sha256": "cd" * 32}
         )
         assert cfg.feature_standardization == "row_layernorm"
-
-    def test_checkpoint_config_backfills_rev31_as_row_layernorm(self) -> None:
-        restored = e2e_checkpoint_config({"n_ground": 50}, has_rel_head=False)
-        assert restored["feature_standardization"] == "row_layernorm"
-        assert restored["feature_stats_sha256"] == ""
-
-    def test_checkpoint_config_preserves_an_explicit_mode(self) -> None:
-        restored = e2e_checkpoint_config(
-            {"feature_standardization": "zscore_vfit_v1"}, has_rel_head=False
-        )
-        assert restored["feature_standardization"] == "zscore_vfit_v1"
 
 
 class TestTokenizeLite:
@@ -285,30 +271,3 @@ class TestSinkhornPlan:
         pi_j = torch.tensor([[0.5]])
         cost = stitch_cost(h_i, h_j, pi_i, pi_j)
         assert cost[0, 0, 0] == pytest.approx(5.0 / 4.0 * 25.0 + 5.0 / 16.0 * 0.5)
-
-
-class TestDecisionHead:
-    """Only the `tau_kappa` surface survives the two-stage cleanup.
-
-    `DecisionHead` stays in the tree because `EgoStitchE2E` reads
-    `generator.decision.tau_kappa` (`e2e_model.py:341`) as the temperature for
-    `scaffold.counterpart_membership`. Its own `(s0, s1, s2)` fusion --
-    `forward`, `forward_self`, `channels`, `fuse`, `_membership` -- belonged to
-    the retired frozen-s0 `egostitch` scorer and no longer has a live caller;
-    those tests were removed with it (design 2026-07-29 Sec 6.2).
-    `counterpart_membership` is covered in `tests/model/test_egostitch_e2e_model.py`.
-    """
-
-    def test_tau_kappa_initializes_to_one(self) -> None:
-        head = DecisionHead(_TINY)
-        assert float(head.tau_kappa.detach()) == pytest.approx(1.0, abs=1e-6)
-
-    def test_tau_kappa_stays_positive_under_a_negative_raw_parameter(self) -> None:
-        """It is softplus-parameterized, so it can never reach the divide-by-zero."""
-        head = DecisionHead(_TINY)
-        with torch.no_grad():
-            head.tau_kappa_raw.fill_(-50.0)
-        assert float(head.tau_kappa.detach()) > 0.0
-
-    def test_softplus_unit_init_constant(self) -> None:
-        assert math.isclose(math.log(math.expm1(1.0)), 0.5413248546129181, rel_tol=1e-9)

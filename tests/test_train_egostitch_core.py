@@ -165,8 +165,10 @@ class TestE2EConfigRejection:
             te.load_config(path)
 
     def test_e2e_permanent_null_accepts_only_registered_values(self) -> None:
-        for value in ("none", "all_head", "content_head"):
+        for value in ("none", "all_head"):
             assert E2EConfig.from_mapping({"permanent_null": value}).permanent_null == value
+        with pytest.raises(ValueError, match="permanent_null"):
+            E2EConfig.from_mapping({"permanent_null": "content_head"})
         with pytest.raises(ValueError, match="permanent_null"):
             E2EConfig.from_mapping({"permanent_null": "topo_head"})
 

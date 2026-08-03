@@ -156,13 +156,24 @@ def test_load_bare_legacy_checkpoint_with_explicit_model_metadata(tmp_path: Path
         torch.testing.assert_close(loaded_model.state_dict()[name], expected)
 
 
-def test_load_e2e_checkpoint_with_current_scaffold_without_relational_head(tmp_path: Path) -> None:
+def test_e2e_checkpoint_missing_w_rel_fails_loudly_instead_of_backfilling(
+    tmp_path: Path,
+) -> None:
+    """A config-incomplete checkpoint raises rather than being reconstructed.
+
+    The rev-3.1 `e2e_checkpoint_config` backfills were deleted with the content
+    path (design 2026-08-02 §11). A checkpoint whose recorded config omits
+    `w_rel` would now take `E2EConfig`'s default and build a relational head the
+    stored weights never had, so strict loading must reject it. Failing loudly
+    is the point: silently reinterpreting a checkpoint under a config it was
+    never trained with is the outcome this guards against.
+    """
     legacy_config = dict(_TINY_E2E_CONFIG)
     legacy_config["w_rel"] = 0.0
     source_model = score_universe.build_model("egostitch_e2e", legacy_config)
     checkpoint_config = dict(legacy_config)
     checkpoint_config.pop("w_rel")
-    checkpoint_path = tmp_path / "pre-rev31-e2e.pt"
+    checkpoint_path = tmp_path / "config-incomplete-e2e.pt"
     _write_checkpoint(
         checkpoint_path,
         model=source_model,
@@ -170,14 +181,8 @@ def test_load_e2e_checkpoint_with_current_scaffold_without_relational_head(tmp_p
         model_config=checkpoint_config,
     )
 
-    loaded_model, model_family, checkpoint_id = score_universe._load_checkpoint(checkpoint_path)
-
-    assert model_family == "egostitch_e2e"
-    assert isinstance(loaded_model, EgoStitchE2E)
-    assert loaded_model.rel_head is None
-    assert checkpoint_id == score_universe._checkpoint_id(source_model.state_dict())
-    for name, expected in source_model.state_dict().items():
-        torch.testing.assert_close(loaded_model.state_dict()[name], expected)
+    with pytest.raises(RuntimeError, match="rel_head"):
+        score_universe._load_checkpoint(checkpoint_path)
 
 
 def test_load_pre_rev31_e2e_checkpoint_rejects_legacy_scaffold_shape(tmp_path: Path) -> None:
@@ -248,12 +253,17 @@ def test_e2e_checkpoint_restores_the_feature_standardization(tmp_path: Path) -> 
     )
 
 
-def test_rev31_checkpoints_still_load_as_row_layernorm(tmp_path: Path) -> None:
-    """A checkpoint predating `feature_standardization` must not silently switch modes.
+def test_checkpoint_missing_feature_standardization_never_silently_switches_modes(
+    tmp_path: Path,
+) -> None:
+    """A checkpoint omitting `feature_standardization` raises, never reinterprets.
 
-    `e2e_checkpoint_config` backfills the missing key as `"row_layernorm"`
-    (never the current rev-3.2 default), so a rev-3.1 checkpoint keeps its
-    original stateless per-row transform under strict loading.
+    This is the surviving half of the deleted rev-3.1 backfill's purpose. That
+    backfill kept such a checkpoint loadable by pinning `"row_layernorm"`; with
+    the backfills gone (design 2026-08-02 §11) the config's own rev-3.2 default
+    would apply instead, which would score a row-LayerNorm checkpoint under
+    z-scored features. Strict loading catches it because the two modes differ in
+    state: only `zscore_vfit_v1` carries `generator.feature_norm.*` buffers.
     """
     legacy_cfg = E2EConfig(feature_standardization="row_layernorm")
     legacy = EgoStitchE2E(legacy_cfg)
@@ -262,7 +272,7 @@ def test_rev31_checkpoints_still_load_as_row_layernorm(tmp_path: Path) -> None:
         for key, value in asdict(legacy_cfg).items()
         if key not in {"feature_standardization", "feature_stats_sha256"}
     }
-    checkpoint_path = tmp_path / "pre-rev31-e2e.pt"
+    checkpoint_path = tmp_path / "config-incomplete-e2e.pt"
     _write_checkpoint(
         checkpoint_path,
         model=legacy,
@@ -270,11 +280,8 @@ def test_rev31_checkpoints_still_load_as_row_layernorm(tmp_path: Path) -> None:
         model_config=legacy_config,
     )
 
-    restored, _, _ = score_universe._load_checkpoint(checkpoint_path)
-    assert isinstance(restored, EgoStitchE2E)
-    assert restored.generator.feature_standardization == "row_layernorm"
-    for name, expected in legacy.state_dict().items():
-        torch.testing.assert_close(restored.state_dict()[name], expected)
+    with pytest.raises(RuntimeError, match="feature_norm"):
+        score_universe._load_checkpoint(checkpoint_path)
 
 
 def test_default_e2e_grounding_cache_path_is_namespaced_by_pool_configuration(
@@ -873,7 +880,7 @@ def test_validate_score_precision_refuses_a_legacy_egostitch_artifact() -> None:
 
 
 # --------------------------------------------------------------------------- egostitch_e2e scoring
-# (design rev 3 four-logit decomposition; Task 14)
+# (design rev 4 two-logit decomposition, content path removed; Task 14)
 
 _TINY_E2E_CONFIG: dict[str, object] = {
     "d_model": 32,
@@ -960,7 +967,7 @@ def test_build_model_egostitch_e2e_round_trips() -> None:
     assert model.cfg.d_model == 32
 
 
-def test_egostitch_e2e_cli_scores_four_logit_decomposition(tmp_path: Path) -> None:
+def test_egostitch_e2e_cli_scores_two_logit_decomposition(tmp_path: Path) -> None:
     data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
     output = tmp_path / "scores.npz"
     score_universe.main(_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, output))
@@ -970,12 +977,13 @@ def test_egostitch_e2e_cli_scores_four_logit_decomposition(tmp_path: Path) -> No
     assert len(artifact.logit) == len(_E2E_PAIRS)
     assert artifact.logit.dtype == np.float32
     assert artifact.f_logit is not None
-    assert artifact.pair_content is not None
-    assert artifact.pair_topology is not None
-    for arr in (artifact.f_logit, artifact.pair_content, artifact.pair_topology):
-        assert arr.dtype == np.float32
-        assert arr.shape == artifact.logit.shape
-        assert bool(np.isfinite(arr).all())
+    # Content path removed (design doc §9): new artifacts never populate the
+    # legacy v3 pair_content/pair_topology arrays.
+    assert artifact.pair_content is None
+    assert artifact.pair_topology is None
+    assert artifact.f_logit.dtype == np.float32
+    assert artifact.f_logit.shape == artifact.logit.shape
+    assert bool(np.isfinite(artifact.f_logit).all())
 
     assert artifact.meta["score_precision"] == {
         "contract": "egostitch_e2e_pair_fp32_v1",
@@ -986,26 +994,24 @@ def test_egostitch_e2e_cli_scores_four_logit_decomposition(tmp_path: Path) -> No
 
     resolution = artifact.meta["score_resolution"]
     assert isinstance(resolution, dict)
-    assert set(resolution) == {"full", "f_logit", "pair_content", "pair_topology"}
+    assert set(resolution) == {"full", "f_logit"}
     for name, arr in (
         ("full", artifact.logit),
         ("f_logit", artifact.f_logit),
-        ("pair_content", artifact.pair_content),
-        ("pair_topology", artifact.pair_topology),
     ):
         assert resolution[name] == score_universe.score_resolution_diagnostics(arr)
 
-    # Zero-init sanity check (design rev 3 Sec 3.4/3.5): GatedCrossAttention's
-    # gate parameter starts at exactly zero, so the topo/content pathways are
-    # an exact-identity bypass regardless of which one a given arm nulls out.
-    # All four logits must therefore be bit-for-bit identical at init.
+    # Zero-init sanity check: GatedCrossAttention's gate parameter starts at
+    # exactly zero, so the topo pathway is an exact-identity bypass regardless
+    # of which head a given arm nulls out. Both logits must therefore be
+    # bit-for-bit identical at init.
     np.testing.assert_array_equal(artifact.logit, artifact.f_logit)
-    np.testing.assert_array_equal(artifact.logit, artifact.pair_content)
-    np.testing.assert_array_equal(artifact.logit, artifact.pair_topology)
 
 
 def test_egostitch_e2e_permanent_null_publishes_active_primary_logit(tmp_path: Path) -> None:
-    for permanent_null, active_key in (("all_head", "f_logit"), ("content_head", "pair_topology")):
+    # content_head is deleted with the content path (design doc §9); "none"
+    # and "all_head" are the only surviving permanent_null values.
+    for permanent_null, active_key in (("all_head", "f_logit"),):
         config = {**_TINY_E2E_CONFIG, "permanent_null": permanent_null}
         data_root, checkpoint, pairs = _egostitch_e2e_setup(
             tmp_path / permanent_null, model_config=config
@@ -1029,7 +1035,7 @@ def test_egostitch_e2e_permanent_null_publishes_active_primary_logit(tmp_path: P
         assert artifact.meta["permanent_null"] == permanent_null
 
 
-@pytest.mark.parametrize("permanent_null", ["all_head", "content_head"])
+@pytest.mark.parametrize("permanent_null", ["all_head"])
 def test_egostitch_e2e_null_arm_merge_preserves_true_full_logit(
     tmp_path: Path, permanent_null: str
 ) -> None:
@@ -1136,7 +1142,7 @@ def test_egostitch_e2e_exact_f0_cache_is_shard_invariant(tmp_path: Path) -> None
             )
         )
 
-    for key in ("logit", "f_logit", "pair_content", "pair_topology"):
+    for key in ("logit", "f_logit"):
         full = getattr(unsharded, key)
         parts = [getattr(artifact, key) for artifact in shard_artifacts]
         assert full is not None and all(part is not None for part in parts)
@@ -1154,7 +1160,9 @@ def _enable_e2e_conditioning_gates(checkpoint: Path) -> None:
     model = score_universe.build_model("egostitch_e2e", dict(_TINY_E2E_CONFIG))
     assert isinstance(model, EgoStitchE2E)
     model.load_state_dict(payload["model_state"])
-    for module in [*model.trunk.topo_xattn, *model.trunk.cont_xattn]:
+    # cont_xattn is deleted with the content path (design doc §9); only the
+    # topo pathway remains to make the checkpoint sensitive to perturbations.
+    for module in [*model.trunk.topo_xattn]:
         assert isinstance(module, GatedCrossAttention)
         module.gate.data.fill_(1.0)
     payload["model_state"] = model.state_dict()
@@ -1316,7 +1324,9 @@ def test_egostitch_e2e_scoring_caches_unique_nodes_and_reuses_pair_context(
     )
     assert encoded_rows == len({node for pair in many_pairs for node in pair})
     assert 0 < context_calls < len(many_pairs)
-    assert head_calls == 4 * context_calls
+    # Two decomposition heads survive the content-path removal (design doc
+    # §9): full (unnulled) and f_logit (all-head nulled).
+    assert head_calls == 2 * context_calls
 
 
 def test_egostitch_e2e_cached_scoring_matches_uncached_decomposition(tmp_path: Path) -> None:
@@ -1375,13 +1385,11 @@ def test_egostitch_e2e_cached_scoring_matches_uncached_decomposition(tmp_path: P
         direct = model.decompose(batch)
 
     assert cached.f_logit is not None
-    assert cached.pair_content is not None
-    assert cached.pair_topology is not None
+    assert cached.pair_content is None
+    assert cached.pair_topology is None
     cached_arrays = {
         "full": cached.logit,
         "f_logit": cached.f_logit,
-        "pair_content": cached.pair_content,
-        "pair_topology": cached.pair_topology,
     }
     assert not np.array_equal(cached_arrays["full"], cached_arrays["f_logit"])
     for name, expected in direct.items():
@@ -1435,8 +1443,6 @@ def test_merge_rejects_conflicting_scaffold_control_provenance(tmp_path: Path) -
             row_start=row_start,
             meta=meta,
             f_logit=values,
-            pair_content=values,
-            pair_topology=values,
         )
 
     left = tmp_path / "left.npz"
@@ -1471,15 +1477,13 @@ def test_merge_rejects_conflicting_scaffold_control_provenance(tmp_path: Path) -
                 row_start=int(data["row_start"][()]),
                 meta=meta,
                 f_logit=data["f_logit"],
-                pair_content=data["pair_content"],
-                pair_topology=data["pair_topology"],
                 full_logit=data["logit"],
             )
         with pytest.raises(ValueError, match=key):
             score_universe.merge_scores([left, right])
 
 
-def test_egostitch_e2e_merge_preserves_four_arrays_in_manifest_order(tmp_path: Path) -> None:
+def test_egostitch_e2e_merge_preserves_two_arrays_in_manifest_order(tmp_path: Path) -> None:
     data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
     output = tmp_path / "scores.npz"
     for shard in range(2):
@@ -1508,18 +1512,16 @@ def test_egostitch_e2e_merge_preserves_four_arrays_in_manifest_order(tmp_path: P
     merged = score_universe.load_scores(merged_path)
     unsharded = score_universe.load_scores(unsharded_path)
     assert merged.f_logit is not None
-    assert merged.pair_content is not None
-    assert merged.pair_topology is not None
+    assert merged.pair_content is None
+    assert merged.pair_topology is None
     assert unsharded.f_logit is not None
-    assert unsharded.pair_content is not None
-    assert unsharded.pair_topology is not None
+    assert unsharded.pair_content is None
+    assert unsharded.pair_topology is None
     assert len(merged.f_logit) == len(_E2E_PAIRS)
-    assert len(merged.pair_content) == len(_E2E_PAIRS)
-    assert len(merged.pair_topology) == len(_E2E_PAIRS)
 
     # Merged rows are remapped onto the sorted node-id union but otherwise keep
-    # each row's own quadruple aligned; comparing by pair identity against the
-    # unsharded run confirms manifest order (row <-> quadruple) is preserved.
+    # each row's own pair aligned; comparing by pair identity against the
+    # unsharded run confirms manifest order (row <-> pair) is preserved.
     # Ordinary sharded scoring may use different pair-batch shapes, so compare
     # within the same explicit fp32 tolerance as cached-vs-direct decomposition.
     merged_index = {pair: row for row, pair in enumerate(merged.pairs())}
@@ -1529,12 +1531,6 @@ def test_egostitch_e2e_merge_preserves_four_arrays_in_manifest_order(tmp_path: P
         m_row, u_row = merged_index[pair], unsharded_index[pair]
         assert merged.logit[m_row] == pytest.approx(unsharded.logit[u_row], rel=1e-5, abs=2e-6)
         assert merged.f_logit[m_row] == pytest.approx(unsharded.f_logit[u_row], rel=1e-5, abs=2e-6)
-        assert merged.pair_content[m_row] == pytest.approx(
-            unsharded.pair_content[u_row], rel=1e-5, abs=2e-6
-        )
-        assert merged.pair_topology[m_row] == pytest.approx(
-            unsharded.pair_topology[u_row], rel=1e-5, abs=2e-6
-        )
 
 
 # --------------------------------------------------------------------------- artifact-aware
@@ -1558,7 +1554,7 @@ def test_validate_artifact_precision_raises_on_corrupted_e2e_artifact(tmp_path: 
     score_universe.main(_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs, output))
 
     artifact = score_universe.load_scores(output)
-    assert artifact.pair_content is not None
+    assert artifact.f_logit is not None
     corrupted = score_universe.ScoresArtifact(
         node_ids=artifact.node_ids,
         u_idx=artifact.u_idx,
@@ -1566,9 +1562,7 @@ def test_validate_artifact_precision_raises_on_corrupted_e2e_artifact(tmp_path: 
         logit=artifact.logit,
         label=artifact.label,
         meta=artifact.meta,
-        f_logit=artifact.f_logit,
-        pair_content=artifact.pair_content.astype(np.float64),  # dtype broken on purpose
-        pair_topology=artifact.pair_topology,
+        f_logit=artifact.f_logit.astype(np.float64),  # dtype broken on purpose
     )
     with pytest.raises(ValueError, match="must be stored as float32"):
         score_universe.validate_artifact_precision(corrupted, label="corrupted")
@@ -1581,9 +1575,10 @@ def test_validate_score_precision_old_idiom_on_e2e_artifact_points_to_new_entry_
 
     `validate_score_precision(artifact.logit, ...)` (as used by
     `src.experiments.g1_hardened_e2` for B0-family artifacts) still raises for an
-    egostitch_e2e artifact — the four-array contract can't be checked without the
-    extra arrays — but the error now points callers at validate_artifact_precision
-    instead of reading as a false "artifact is missing arrays" report.
+    egostitch_e2e artifact — the two-array contract can't be checked without the
+    extra `f_logit` array — but the error now points callers at
+    validate_artifact_precision instead of reading as a false "artifact is
+    missing arrays" report.
     """
     data_root, checkpoint, pairs = _egostitch_e2e_setup(tmp_path)
     output = tmp_path / "scores.npz"

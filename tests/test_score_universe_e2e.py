@@ -99,8 +99,6 @@ def _write_bound_score_artifact(
             "test_access_ledger": access.ledger_binding,
         },
         f_logit=values,
-        pair_content=values,
-        pair_topology=values,
     )
     return path, ledger_path
 
@@ -158,8 +156,6 @@ def test_ledger_bound_shards_load_and_merge_as_one_scoring_epoch(tmp_path: Path)
         row_start=0,
         meta=merged.meta,
         f_logit=merged.f_logit,
-        pair_content=merged.pair_content,
-        pair_topology=merged.pair_topology,
         full_logit=merged.full_logit,
     )
     loaded = score_universe.load_scores(merged_path)
@@ -461,7 +457,8 @@ def test_file_alias_of_candidate_manifest_still_requires_run_metadata(
     assert not output.exists()
 
 
-def test_e2e_artifact_physically_stores_all_four_decomposition_arrays(tmp_path: Path) -> None:
+def test_e2e_artifact_physically_stores_exactly_two_decomposition_arrays(tmp_path: Path) -> None:
+    """New (v4) artifacts publish only full/f_logit -- the content path is gone (design doc §9)."""
     output = tmp_path / "scores.npz"
     values = np.array([0.1, 0.2], dtype=np.float32)
     access = score_universe._TestAccessContext(
@@ -503,13 +500,82 @@ def test_e2e_artifact_physically_stores_all_four_decomposition_arrays(tmp_path: 
         row_start=0,
         meta=meta,
         f_logit=values + 1,
+    )
+
+    with np.load(output, allow_pickle=False) as artifact:
+        assert {"full", "f_logit"} <= set(artifact.files)
+        assert "pair_content" not in artifact.files
+        assert "pair_topology" not in artifact.files
+        np.testing.assert_array_equal(artifact["full"], artifact["logit"])
+
+    loaded = score_universe.load_scores(output)
+    assert loaded.meta["scores_meta_version"] == score_universe._SCORES_META_VERSION
+    assert loaded.pair_content is None
+    assert loaded.pair_topology is None
+
+
+def test_v3_legacy_e2e_artifact_with_four_decomposition_arrays_still_loads(
+    tmp_path: Path,
+) -> None:
+    """A pre-content-path-removal v3 artifact (four arrays) still loads.
+
+    `save_scores` only ever writes the two-array v4 schema now (content path
+    removed, design doc §9), so this constructs a v3 artifact directly rather
+    than through `save_scores` -- proving `load_scores` keeps reading
+    artifacts scored before the removal, with `pair_content`/`pair_topology`
+    populated from the file rather than always `None`.
+    """
+    output = tmp_path / "legacy-v3.npz"
+    values = np.array([0.1, 0.2], dtype=np.float32)
+    resolution = score_universe.score_resolution_diagnostics(values)
+    meta: dict[str, object] = {
+        "checkpoint_id": "checkpoint",
+        "model_family": "egostitch_e2e",
+        # "val" (not "candidate"/"test"/"file:*") deliberately: this test is
+        # only about legacy four-array loading, and a held-out pairs_source
+        # would require a genuine test-access ledger binding it has no
+        # reason to fabricate.
+        "pairs_source": "val",
+        "strategy": "toy",
+        "num_rows": 2,
+        "created_utc": "2026-07-19T00:00:00Z",
+        "torch_version": "test",
+        "permanent_null": "none",
+        "primary_logit": "full",
+        "scores_meta_version": "egostitch_e2e_scores_v3",
+        "score_precision": {
+            "contract": "egostitch_e2e_pair_fp32_v1",
+            "pair_compute_dtype": "float32",
+            "pair_autocast": False,
+            "logit_storage_dtype": "float32",
+        },
+        "score_resolution": dict.fromkeys(
+            ("full", "f_logit", "pair_content", "pair_topology"), resolution
+        ),
+    }
+    np.savez_compressed(
+        output,
+        node_ids=np.array(["a", "b"]),
+        u_idx=np.array([0, 0], dtype=np.int32),
+        v_idx=np.array([1, 1], dtype=np.int32),
+        logit=values,
+        label=np.array([-1, -1], dtype=np.int8),
+        row_start=np.int64(0),
+        meta=np.array(json.dumps(meta, sort_keys=True)),
+        full=values,
+        f_logit=values + 1,
         pair_content=values + 2,
         pair_topology=values + 3,
     )
 
-    with np.load(output, allow_pickle=False) as artifact:
-        assert {"full", "f_logit", "pair_content", "pair_topology"} <= set(artifact.files)
-        np.testing.assert_array_equal(artifact["full"], artifact["logit"])
+    artifact = score_universe.load_scores(output)
+    assert artifact.meta["scores_meta_version"] == "egostitch_e2e_scores_v3"
+    assert artifact.f_logit is not None
+    assert artifact.pair_content is not None
+    assert artifact.pair_topology is not None
+    np.testing.assert_array_equal(artifact.f_logit, values + 1)
+    np.testing.assert_array_equal(artifact.pair_content, values + 2)
+    np.testing.assert_array_equal(artifact.pair_topology, values + 3)
 
 
 def test_loader_rejects_v1_e2e_artifact_without_meta_version(tmp_path: Path) -> None:
@@ -586,3 +652,18 @@ def test_formal_v2_loader_rejects_missing_or_contradictory_full_array(tmp_path: 
     np.savez_compressed(output, **common, full=values + 1)
     with pytest.raises(ValueError, match="contradicts primary logit"):
         score_universe.load_scores(output)
+
+
+def test_legacy_content_head_artifact_is_rejected_with_a_clear_reason() -> None:
+    """A v3 pair_topology artifact fails with an explanation, not a bare KeyError.
+
+    The arm was retired with the content path (design 2026-08-02 §9). Other v3
+    arms still load; this one is explicitly unsupported and must say so.
+    """
+    with pytest.raises(ValueError, match="retired pair_topology arm"):
+        score_universe._e2e_primary_logit_key("content_head")
+
+
+def test_unknown_permanent_null_is_a_value_error_not_a_key_error() -> None:
+    with pytest.raises(ValueError, match="unknown egostitch_e2e permanent_null"):
+        score_universe._e2e_primary_logit_key("nonsense")

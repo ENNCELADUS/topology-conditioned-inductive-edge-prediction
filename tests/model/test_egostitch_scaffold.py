@@ -11,11 +11,9 @@ from src.model.egostitch.scaffold import (
     EDGE_TYPES,
     FEAT_DIM,
     N_ANCHOR_TYPES,
-    ContentProjector,
     ScaffoldTokens,
     _checkerboard_rewire,
     _stable_control_generator,
-    build_content_tokens,
     build_scaffold,
     make_scaffold_input_perturbation,
     swap_direction,
@@ -404,47 +402,9 @@ def test_shuffle_v3_rebuilds_closed_wedge_and_degree_features() -> None:
     assert not torch.equal(controlled.feats[..., 10], baseline.feats[..., 10])
 
 
-def test_content_tokens_shape_and_content_sensitivity() -> None:
-    si, sj = _slots(seed=0), _slots(seed=1)
-    matched = torch.zeros(2, 4)
-    membership = torch.arange(8, dtype=torch.float32).reshape(2, 4)
-    out = build_content_tokens(si, sj, matched, matched, membership, -membership)
-    assert out.shape == (2, 8, 8 + 4)
-    assert torch.equal(out[:, :4, -1], membership)
-    assert torch.equal(out[:, 4:, -1], -membership)
-    si_b = si._replace(h=torch.randn_like(si.h))
-    out_b = build_content_tokens(si_b, sj, matched, matched, membership, -membership)
-    assert not torch.equal(out, out_b)
-
-
-def test_content_projector_shape() -> None:
-    torch.manual_seed(0)
-    proj = ContentProjector(d_p=8, d_model=64)
-    si, sj = _slots(seed=0), _slots(seed=1)
-    zeros = torch.zeros(2, 4)
-    tokens = build_content_tokens(si, sj, zeros, zeros, zeros, zeros)
-    assert proj(tokens).shape == (2, 8, 64)
-
-
-def test_content_tokens_swap_sides_is_a_token_permutation() -> None:
-    si, sj = _slots(seed=0), _slots(seed=1)
-    matched_i, matched_j = torch.zeros(2, 4), torch.ones(2, 4)
-    membership_i = torch.arange(8, dtype=torch.float32).reshape(2, 4)
-    membership_j = -membership_i
-    ij = build_content_tokens(si, sj, matched_i, matched_j, membership_i, membership_j)
-    ji = build_content_tokens(sj, si, matched_j, matched_i, membership_j, membership_i)
-    assert torch.equal(ij[:, :4], ji[:, 4:])
-    assert torch.equal(ij[:, 4:], ji[:, :4])
-
-
-def test_scaffold_and_content_reject_shape_drift() -> None:
+def test_scaffold_rejects_shape_drift() -> None:
     si, sj = _slots(seed=0), _slots(seed=1)
     with pytest.raises(ValueError, match="plan shape"):
         build_scaffold(si, sj, torch.rand(2, 4, 3))
     with pytest.raises(ValueError, match="equal slot counts"):
         build_scaffold(si, _slots(k=3, seed=2), torch.rand(2, 4, 3))
-    zeros = torch.zeros(2, 4)
-    with pytest.raises(ValueError, match="matched_src shape"):
-        build_content_tokens(si, sj, zeros[:, :3], zeros, zeros, zeros)
-    with pytest.raises(ValueError, match="membership_dst shape"):
-        build_content_tokens(si, sj, zeros, zeros, zeros, zeros[:, :3])

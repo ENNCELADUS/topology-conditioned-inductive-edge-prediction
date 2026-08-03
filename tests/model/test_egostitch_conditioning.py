@@ -11,9 +11,7 @@ import torch.multiprocessing as mp
 from src.model.egostitch import conditioning as conditioning_module
 from src.model.egostitch.conditioning import (
     NULL_ALL_HEAD,
-    NULL_CONTENT_HEAD,
     NULL_NONE,
-    NULL_TOPO_HEAD,
     GatedCrossAttention,
     HeadNullMasks,
     masks_for_null,
@@ -104,41 +102,58 @@ def _world_size_centering_worker(
 
 def test_sample_branch_masks_shapes_and_dtype() -> None:
     gen = torch.Generator().manual_seed(0)
-    masks = sample_branch_masks(64, 0.15, 0.15, generator=gen, device=torch.device("cpu"))
+    masks = sample_branch_masks(64, 0.15, generator=gen, device=torch.device("cpu"))
     assert isinstance(masks, HeadNullMasks)
     assert masks.topo.shape == (64,) and masks.topo.dtype == torch.bool
-    assert masks.cont.shape == (64,) and masks.cont.dtype == torch.bool
 
 
 def test_sample_branch_masks_p_zero_all_active() -> None:
     gen = torch.Generator().manual_seed(0)
-    masks = sample_branch_masks(32, 0.0, 0.0, generator=gen, device=torch.device("cpu"))
-    assert bool(masks.topo.all()) and bool(masks.cont.all())
+    masks = sample_branch_masks(32, 0.0, generator=gen, device=torch.device("cpu"))
+    assert bool(masks.topo.all())
 
 
 def test_sample_branch_masks_deterministic_given_seed() -> None:
     a = sample_branch_masks(
-        128, 0.5, 0.5, generator=torch.Generator().manual_seed(7), device=torch.device("cpu")
+        128, 0.5, generator=torch.Generator().manual_seed(7), device=torch.device("cpu")
     )
     b = sample_branch_masks(
-        128, 0.5, 0.5, generator=torch.Generator().manual_seed(7), device=torch.device("cpu")
+        128, 0.5, generator=torch.Generator().manual_seed(7), device=torch.device("cpu")
     )
-    assert torch.equal(a.topo, b.topo) and torch.equal(a.cont, b.cont)
+    assert torch.equal(a.topo, b.topo)
+
+
+def test_sample_branch_masks_topo_stream_is_bit_identical_to_a_direct_draw() -> None:
+    """Content-path removal deleted the `cont` draw that used to follow `topo`.
+
+    `topo` was always drawn first from the shared generator (conditioning.py
+    §2 mask-stream ordering), so removing the second (`cont`) draw must not
+    perturb it: the mask equals the first ``torch.rand(...) >= p_topo`` draw
+    from an identically seeded generator, exactly as it did before the `cont`
+    draw existed.
+    """
+    p_topo = 0.3
+    batch_size = 256
+    masks = sample_branch_masks(
+        batch_size,
+        p_topo,
+        generator=torch.Generator().manual_seed(1234),
+        device=torch.device("cpu"),
+    )
+    direct = torch.rand(batch_size, generator=torch.Generator().manual_seed(1234)) >= p_topo
+    assert torch.equal(masks.topo, direct)
 
 
 @pytest.mark.parametrize(
-    ("null", "topo_on", "cont_on"),
+    ("null", "topo_on"),
     [
-        (NULL_NONE, True, True),
-        (NULL_ALL_HEAD, False, False),
-        (NULL_TOPO_HEAD, False, True),
-        (NULL_CONTENT_HEAD, True, False),
+        (NULL_NONE, True),
+        (NULL_ALL_HEAD, False),
     ],
 )
-def test_masks_for_null(null: str, topo_on: bool, cont_on: bool) -> None:
+def test_masks_for_null(null: str, topo_on: bool) -> None:
     masks = masks_for_null(null, 4, torch.device("cpu"))
     assert bool(masks.topo.all()) is topo_on and bool((~masks.topo).all()) is not topo_on
-    assert bool(masks.cont.all()) is cont_on and bool((~masks.cont).all()) is not cont_on
 
 
 def test_masks_for_null_rejects_unknown() -> None:

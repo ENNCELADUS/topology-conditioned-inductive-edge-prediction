@@ -55,7 +55,6 @@ _E2E_TINY_MODEL: dict[str, object] = {
     "ste_layers": 1,
     "xattn_heads": 2,
     "p_topo": 0.15,
-    "p_cont": 0.15,
     # Matches the `EgoStitchConfig()` base default used to build the paired
     # `_toy_bundle`/`_BatchFactory` fixtures in test_train_egostitch_e2e.py,
     # so `EgoStitchE2E.generator_cfg.n_ground` (E2EConfig-sourced, spec

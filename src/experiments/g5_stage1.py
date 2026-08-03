@@ -1,14 +1,17 @@
-r"""G5 E2E Stage-1 gate evaluation: the eight-arm EgoStitch screen.
+r"""G5 E2E Stage-1 gate evaluation: the seven-arm EgoStitch screen.
 
 Evaluates one training seed of the ``egostitch_e2e`` family against the frozen
 comparators (B0 recomputed from its cached artifact; the B0+cal arms from the
 committed kill-test payload) under the Stage-1 decision rules (protocol
 Sec 5.0.5/5.2):
 
-- **Eight arms**: the six trained checkpoint arms plus the two mandatory
+- **Seven arms**: the five trained checkpoint arms plus the two mandatory
   scoring-time controls ``structure_control_6a_v3`` (shuffle-within-pair) and
   ``structure_control_6e_v1`` (degree-preserving rewiring). Neither control is
-  optional; both reuse the ``full`` checkpoint.
+  optional; both reuse the ``full`` checkpoint. (The ``pair_topology`` arm was
+  retired with the content-path removal: with no content branch, a
+  topology-only arm is identical to ``full`` and pathway isolation between the
+  two is no longer computable — see ``pathway_attribution`` below.)
 - **Primary family** (point-estimate dominance, all must pass): clustering-MMD
   ratio at the canonical operating point; BFS-macro GS and RD at matched global
   simple-edge RD (per-comparator deterministic exact-quota re-assembly).
@@ -23,7 +26,7 @@ CLI::
 
     python -m src.experiments.g5_stage1 \
         --full-universe full.npz --fonly-universe f_only.npz \
-        --pt-universe pair_topology.npz --p0-universe p0.npz \
+        --p0-universe p0.npz \
         --no-l-rel-universe no_l_rel.npz --row-layernorm-universe row_layernorm.npz \
         --control-6a-universe control_6a.npz --control-6e-universe control_6e.npz \
         --run-metadata run_full.json ... \
@@ -32,9 +35,8 @@ CLI::
         --probe-artifact outputs/e2e_probe/full_probe.json \
         --data-root data --strategy breadth_first --output-dir outputs/g5_e2e_stage1
 
-The six ``--run-metadata`` paths are positional in trained-arm order
-(``full``, ``b0_e2e_f_only``, ``pair_topology``, ``p0``, ``no_l_rel``,
-``row_layernorm``).
+The five ``--run-metadata`` paths are positional in trained-arm order
+(``full``, ``b0_e2e_f_only``, ``p0``, ``no_l_rel``, ``row_layernorm``).
 
 Determinism: identical inputs produce byte-identical outputs.
 """
@@ -479,13 +481,15 @@ def _resolve_b0cal_results_path(path: Path) -> Path:
     return candidates[0]
 
 
-# --------------------------------------------------------------------------- e2e eight-arm summary
+# --------------------------------------------------------------------------- e2e seven-arm summary
 
-#: The six trained checkpoint arms this gate screens.
+#: The five trained checkpoint arms this gate screens. ``pair_topology`` was
+#: retired with the content-path removal (three-component refactor P1): with
+#: no content branch, a topology-only checkpoint arm is identical to ``full``
+#: and cannot isolate a topology-only pathway.
 _TRAINED_ARMS: tuple[str, ...] = (
     "full",
     "b0_e2e_f_only",
-    "pair_topology",
     "p0",
     "no_l_rel",
     "row_layernorm",
@@ -495,7 +499,7 @@ _CONTROL_ARMS: tuple[str, ...] = (
     "structure_control_6a_v3",
     "structure_control_6e_v1",
 )
-#: The complete eight-arm set this gate reports.
+#: The complete seven-arm set this gate reports.
 _ALL_ARMS: tuple[str, ...] = _TRAINED_ARMS + _CONTROL_ARMS
 #: Each control arm's required `meta["scaffold_control"]["mode"]`, matching
 #: `score_universe.py`'s own `_SCAFFOLD_CONTROL_ARM_NAMES` mapping in the
@@ -554,11 +558,10 @@ def _validate_e2e_universe_shape(
     Mirrors :func:`src.experiments.g1_hardened_e2.validate_universe_artifact`'s
     non-precision checks (``pairs_source``/``strategy``/row-count/label-domain)
     WITHOUT its internal ``validate_score_precision(artifact.logit, meta=...)``
-    call: that raw idiom always reports the ``f_logit``/``pair_content``/
-    ``pair_topology`` arrays as "missing" for this family, because it never
-    forwards them as ``extra_arrays`` (the exact footgun
-    :func:`validate_artifact_precision` exists to avoid — Task 14 review
-    finding). Precision is validated separately, via
+    call: that raw idiom always reports the ``f_logit`` array as "missing"
+    for this family, because it never forwards it as an ``extra_arrays``
+    entry (the exact footgun :func:`validate_artifact_precision` exists to
+    avoid — Task 14 review finding). Precision is validated separately, via
     :func:`validate_artifact_precision`, in :func:`build_e2e_arm_summary`.
 
     Args:
@@ -656,42 +659,34 @@ def _array_summary(values: NDArray[np.float32] | NDArray[np.float64]) -> dict[st
     }
 
 
-def _artifact_four_logits(artifact: ScoresArtifact) -> dict[str, NDArray[np.float32]]:
-    """Return the true aligned four-logit arrays regardless of active primary arm."""
+def _artifact_two_logits(artifact: ScoresArtifact) -> dict[str, NDArray[np.float32]]:
+    """Return the true aligned two-logit arrays regardless of active primary arm.
+
+    Post-content-path (three-component refactor P1), ``decompose()`` returns
+    exactly ``{full, f_logit}`` — the ``pair_content``/``pair_topology``
+    arrays no longer exist anywhere in the pipeline.
+    """
     primary = artifact.meta.get("primary_logit")
     full = artifact.logit if primary == "full" else artifact.full_logit
-    if (
-        full is None
-        or artifact.f_logit is None
-        or artifact.pair_content is None
-        or artifact.pair_topology is None
-    ):
-        raise ValueError("E2E artifact is missing its complete four-logit decomposition")
+    if full is None or artifact.f_logit is None:
+        raise ValueError("E2E artifact is missing its complete two-logit decomposition")
     return {
         "full": full,
         "f_logit": artifact.f_logit,
-        "pair_content": artifact.pair_content,
-        "pair_topology": artifact.pair_topology,
     }
 
 
 def _e2e_decomposition_summary(
     artifacts: Mapping[str, ScoresArtifact],
 ) -> dict[str, object]:
-    """Complete per-arm four-logit and aligned-delta evidence."""
-    arrays = {name: _artifact_four_logits(artifact) for name, artifact in artifacts.items()}
+    """Complete per-arm two-logit and aligned-delta evidence."""
+    arrays = {name: _artifact_two_logits(artifact) for name, artifact in artifacts.items()}
     arm_rows: dict[str, object] = {}
     for name, values in arrays.items():
         arm_rows[name] = {
-            "four_logits": {key: _array_summary(array) for key, array in values.items()},
+            "logits": {key: _array_summary(array) for key, array in values.items()},
             "deltas": {
                 "full_minus_f_logit": _array_summary(values["full"] - values["f_logit"]),
-                "topology_delta_full_minus_pair_content": _array_summary(
-                    values["full"] - values["pair_content"]
-                ),
-                "content_delta_full_minus_pair_topology": _array_summary(
-                    values["full"] - values["pair_topology"]
-                ),
             },
         }
     full = arrays["full"]
@@ -699,9 +694,6 @@ def _e2e_decomposition_summary(
     return {
         "arms": arm_rows,
         "cross_arm": {
-            "full_bypass_vs_trained_pair_topology": _array_summary(
-                full["pair_topology"] - artifacts["pair_topology"].logit
-            ),
             "p0_minus_full": {key: _array_summary(p0[key] - full[key]) for key in full},
         },
     }
@@ -757,23 +749,27 @@ def build_e2e_arm_summary(
     liveness_config: Mapping[str, float],
     seed: int = 0,
 ) -> dict[str, object]:
-    """Build the eight-arm ``egostitch_e2e`` Stage-1 summary table.
+    """Build the seven-arm ``egostitch_e2e`` Stage-1 summary table.
 
     Loads and validates every arm's scores artifact through
     :func:`validate_artifact_precision` (the artifact-aware entry point — never
     the raw ``validate_score_precision(artifact.logit, meta=...)`` idiom, which
-    silently drops the ``f_logit``/``pair_content``/``pair_topology`` arrays),
-    then reports each arm's canonical-operating-point assembled metrics plus
-    the ``full`` arm's within-checkpoint liveness report. Every arm artifact
-    and every trained arm's run metadata is loaded and validated in one place
-    here. This function does not itself compute the pathway-attribution or
-    structure-control decision rules (spec Sec 14, ``e2e_rules``) — those are
-    applied by :func:`run_g5_e2e_stage1_pipeline`, which consumes this table's
-    per-arm ``clustering_mmd_ratio`` values plus (for the structure-control
-    condition) the paired-bootstrap lower bound computed below.
+    silently drops the ``f_logit`` array), then reports each arm's
+    canonical-operating-point assembled metrics plus the ``full`` arm's
+    within-checkpoint liveness report. Every arm artifact and every trained
+    arm's run metadata is loaded and validated in one place here. This
+    function does not itself compute the structure-control decision rule
+    (spec Sec 14, ``e2e_rules``) — that is applied by
+    :func:`run_g5_e2e_stage1_pipeline`, which consumes this table's per-arm
+    ``clustering_mmd_ratio`` values plus (for the structure-control
+    condition) the paired-bootstrap lower bound computed below. Pathway
+    isolation between the topology-only and content-only pathways is no
+    longer computable at all (the content path, and its ``pair_topology``
+    arm, were removed by the three-component refactor P1) — see
+    :func:`run_g5_e2e_stage1_pipeline`'s ``pathway_attribution`` payload.
 
     Args:
-        arm_universe_paths: Exact six-trained-plus-two-control mapping to
+        arm_universe_paths: Exact five-trained-plus-two-control mapping to
             scored ``.npz`` artifacts.
         run_metadata_paths: Trained-arm name -> its ``run_metadata.json``.
             Scoring-time controls never have entries.
@@ -786,12 +782,12 @@ def build_e2e_arm_summary(
 
     Returns:
         A JSON-ready payload: a per-arm ``checkpoint_id`` / ``assembled`` /
-        ``degree_corrected_auprc`` row, the shared ``training_seed`` all six
+        ``degree_corrected_auprc`` row, the shared ``training_seed`` all five
         trained arms were trained under, and the ``full`` arm's
         within-checkpoint ``liveness`` report.
 
     Raises:
-        ValueError: On an invalid eight-arm composition, invalid trained-arm
+        ValueError: On an invalid seven-arm composition, invalid trained-arm
             run metadata, mismatched scoring checkpoint identities, an
             artifact whose ``model_family`` is not ``egostitch_e2e``, or an
             artifact that fails its candidate-universe shape check or
@@ -804,12 +800,12 @@ def build_e2e_arm_summary(
         raise ValueError("the 'full' arm is required to build the e2e arm summary")
     if set(arm_universe_paths) != set(_ALL_ARMS):
         raise ValueError(
-            "e2e summary requires exactly the eight registered arms "
+            "e2e summary requires exactly the seven registered arms "
             f"{list(_ALL_ARMS)}, got {sorted(arm_universe_paths)}"
         )
     if set(run_metadata_paths) != set(_TRAINED_ARMS):
         raise ValueError(
-            "e2e summary requires exactly the six trained run metadata records "
+            "e2e summary requires exactly the five trained run metadata records "
             f"{sorted(_TRAINED_ARMS)}, got {sorted(run_metadata_paths)}"
         )
 
@@ -1006,7 +1002,7 @@ def _enforce_engineering_evidence_class(payload: Mapping[str, object]) -> None:
 
 
 def render_e2e_tables_markdown(payload: Mapping[str, object]) -> str:
-    """Render the complete eight-arm, decomposition, and probe evidence tables."""
+    """Render the complete seven-arm, decomposition, and probe evidence tables."""
     arms = cast(Mapping[str, Mapping[str, object]], payload["arms"])
     lines = [
         "# G5 E2E Stage-1 gate",
@@ -1017,7 +1013,7 @@ def render_e2e_tables_markdown(payload: Mapping[str, object]) -> str:
         "",
         "Fixed-seed evaluator-stability evidence only; not significance or cross-seed robustness.",
         "",
-        "## Eight-arm summary",
+        "## Seven-arm summary",
         "",
         "| arm | checkpoint | GS | BFS-macro RD | degree MMD | clustering MMD | "
         "spectral MMD | degree-corrected AUPRC |",
@@ -1060,22 +1056,15 @@ def render_e2e_tables_markdown(payload: Mapping[str, object]) -> str:
     decomposition_arms = cast(Mapping[str, Mapping[str, object]], decomposition["arms"])
     lines += [
         "",
-        "## Four-logit decomposition deltas",
+        "## Logit decomposition deltas",
         "",
-        "| arm | full-f mean | full-f std | topology delta mean | topology delta std | "
-        "content delta mean | content delta std |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| arm | full-f mean | full-f std |",
+        "|---|---:|---:|",
     ]
     for name in _ALL_ARMS:
         deltas = cast(Mapping[str, Mapping[str, float]], decomposition_arms[name]["deltas"])
         f_delta = deltas["full_minus_f_logit"]
-        topo = deltas["topology_delta_full_minus_pair_content"]
-        content = deltas["content_delta_full_minus_pair_topology"]
-        lines.append(
-            f"| {name} | {_fmt(f_delta['mean'])} | {_fmt(f_delta['std'])} "
-            f"| {_fmt(topo['mean'])} | {_fmt(topo['std'])} "
-            f"| {_fmt(content['mean'])} | {_fmt(content['std'])} |"
-        )
+        lines.append(f"| {name} | {_fmt(f_delta['mean'])} | {_fmt(f_delta['std'])} |")
     probes = cast(Mapping[str, object], payload["probes"])
     probe_r2 = cast(Mapping[str, float], probes["linear_probe_r2"])
     partial = cast(Mapping[str, float], probes["degree_partialled_r2"])
@@ -1155,12 +1144,12 @@ def run_g5_e2e_stage1_pipeline(
     output_dir: Path,
     seed: int = 0,
 ) -> dict[str, object]:
-    """Run the binding E2E eight-arm G5 gate and write its verdict artifacts.
+    """Run the binding E2E seven-arm G5 gate and write its verdict artifacts.
 
-    One invocation screens one training seed over all eight arms (six trained
-    checkpoints plus the two mandatory scoring-time controls). The emitted
-    artifact is always ``evidence_class: "engineering"`` and is refused
-    outright if any inferential field survives
+    One invocation screens one training seed over all seven arms (five
+    trained checkpoints plus the two mandatory scoring-time controls). The
+    emitted artifact is always ``evidence_class: "engineering"`` and is
+    refused outright if any inferential field survives
     (`_enforce_engineering_evidence_class`).
     """
     output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -1285,26 +1274,18 @@ def run_g5_e2e_stage1_pipeline(
         "degree_mmd_non_regression": full_mmd["degree"] <= 1.10 * b0_row.mmd_ratio["degree"],
         "matched_edge_auprc": cast(float, full["degree_corrected_auprc"]) >= b0_auprc - 0.02,
     }
-    f_only = arms["b0_e2e_f_only"]
-    pair_topology = arms["pair_topology"]
-    f_only_clu = cast(dict[str, float], cast(dict[str, object], f_only["assembled"])["mmd_ratio"])[
-        "clustering"
-    ]
-    pair_topology_clu = cast(
-        dict[str, float], cast(dict[str, object], pair_topology["assembled"])["mmd_ratio"]
-    )["clustering"]
-    gain_full = f_only_clu - full_mmd["clustering"]
-    gain_pair_topology = f_only_clu - pair_topology_clu
     primary_all = all(primary_pass.values())
-    pathway_applies = primary_all and gain_full > 0.0
-    pathway_pass = not pathway_applies or gain_pair_topology >= 0.25 * gain_full
     structure_control = cast(dict[str, object], summary["structure_control"])
     structure_pass = cast(bool, structure_control["passed"])
-    verdict = (
-        "pass"
-        if primary_all and all(guards.values()) and pathway_pass and structure_pass
-        else "cut"
-    )
+    # Pathway isolation ("gain_pair_topology >= 0.25 * gain_full") is retired,
+    # not silently dropped: it required the trained `pair_topology` arm, which
+    # the three-component refactor's content-path removal (P1) eliminated —
+    # with no content branch, a topology-only checkpoint is identical to
+    # `full` and has no numerator to compute a gain against. The verdict rule
+    # below no longer has a pathway-isolation term; `pathway_attribution`
+    # below records that explicitly (`evaluated: False`) so a reader cannot
+    # mistake its absence for a pass.
+    verdict = "pass" if primary_all and all(guards.values()) and structure_pass else "cut"
     payload: dict[str, object] = {
         "metadata": {
             "evaluation_mode": "single_seed_e2e_screening",
@@ -1314,7 +1295,7 @@ def run_g5_e2e_stage1_pipeline(
                 "Fixed-seed evaluator-stability evidence only; not significance or cross-seed "
                 "robustness."
             ),
-            # The one training seed all six trained arms share
+            # The one training seed all five trained arms share
             # (`_assert_shared_training_seed`) and this invocation's
             # `--seed`, which drives bootstrap/regime-table sampling here.
             # Neither identifies the other: a result artifact must be able
@@ -1336,11 +1317,24 @@ def run_g5_e2e_stage1_pipeline(
         "training_diagnostics": summary["training_diagnostics"],
         "decomposition": summary["decomposition"],
         "probes": probes_report,
+        # Pathway isolation between the topology-only and content-only
+        # pathways is NOT evaluated in this schema (`evaluated: False`) —
+        # not a pass, not a skip-as-vacuous-pass. The `pair_topology` arm
+        # that supplied `gain_pair_topology`'s numerator no longer exists:
+        # the three-component refactor's content-path removal (P1) means a
+        # topology-only checkpoint would be identical to `full`, so there is
+        # nothing left to isolate against. See `_TRAINED_ARMS`.
         "pathway_attribution": {
-            "applies": pathway_applies,
-            "gain_full": gain_full,
-            "gain_pair_topology": gain_pair_topology,
-            "passed": pathway_pass,
+            "evaluated": False,
+            "reason": (
+                "the 'pair_topology' arm was removed with the content path "
+                "(three-component refactor P1); with no content branch, a "
+                "topology-only checkpoint is identical to 'full' and "
+                "'gain_pair_topology' has no numerator to compute — pathway "
+                "isolation between the topology-only and content-only "
+                "pathways is not computable in this schema, and this field "
+                "does not gate the verdict"
+            ),
         },
         "structure_control": structure_control,
         "verdict": verdict,
@@ -1392,7 +1386,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the ``g5_stage1`` argument parser."""
     parser = argparse.ArgumentParser(
         prog="python -m src.experiments.g5_stage1",
-        description="G5 E2E Stage-1 eight-arm gate evaluation.",
+        description="G5 E2E Stage-1 seven-arm gate evaluation.",
     )
     # The legacy frozen-s0 ``egostitch`` family and its ``--mode frozen_s0``
     # pipeline are gone; the flag survives only so an explicit ``--mode e2e``
@@ -1416,7 +1410,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--control-6a-universe", type=Path)
     parser.add_argument("--control-6e-universe", type=Path)
     parser.add_argument("--fonly-universe", type=Path)
-    parser.add_argument("--pt-universe", type=Path)
     parser.add_argument("--p0-universe", type=Path)
     parser.add_argument("--no-l-rel-universe", type=Path)
     parser.add_argument("--row-layernorm-universe", type=Path)
@@ -1438,7 +1431,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     arm_paths = {
         "full": args.full_universe,
         "b0_e2e_f_only": args.fonly_universe,
-        "pair_topology": args.pt_universe,
         "p0": args.p0_universe,
         "no_l_rel": args.no_l_rel_universe,
         "row_layernorm": args.row_layernorm_universe,

@@ -17,31 +17,6 @@ _ConfigT = TypeVar("_ConfigT")
 _FEATURE_STANDARDIZATION_MODES = frozenset({"row_layernorm", "zscore_vfit_v1"})
 
 
-def e2e_checkpoint_config(
-    mapping: Mapping[str, object],
-    *,
-    has_rel_head: bool,
-) -> dict[str, object]:
-    """Normalize an E2E checkpoint config across the rev-3.1 head addition only.
-
-    Checkpoints with the current rev-3.1 scaffold can omit ``w_rel`` while
-    lacking relational-head parameters. Reconstruct those with the head
-    disabled. This does not make the incompatible pre-rev-3.1 scaffold
-    (FEAT_DIM 9 / EDGE_TYPES 3) loadable under rev-3.1 code.
-
-    Checkpoints predating ``feature_standardization`` (rev-3.1 and earlier)
-    were trained with the per-row LayerNorm, not the rev-3.2 default, so a
-    missing key backfills as ``"row_layernorm"`` -- never the current
-    default -- to avoid silently re-interpreting an existing checkpoint under
-    a transform it was never trained with.
-    """
-    normalized = dict(mapping)
-    normalized.setdefault("w_rel", E2EConfig.w_rel if has_rel_head else 0.0)
-    normalized.setdefault("feature_standardization", "row_layernorm")
-    normalized.setdefault("feature_stats_sha256", "")
-    return normalized
-
-
 def _from_mapping(
     cls: type[_ConfigT],
     mapping: Mapping[str, object],
@@ -223,7 +198,7 @@ class E2EConfig:
 
     The internal Stage-1 generator keeps its own pinned `EgoStitchConfig`
     defaults (spec Sec 13); these fields size only the pair-encoder trunk and
-    its topo/content conditioning pathways (design rev 3 Sec 3.4-3.5) -- with
+    its topo conditioning pathway (design rev 3 Sec 3.4-3.5) -- with
     the rev-3.1 grounding and loss-calibration fields below supersede the
     generator's own pinned values for this family, so a v3 registration and
     checkpoint carry them explicitly while absent legacy keys retain their
@@ -234,12 +209,11 @@ class E2EConfig:
         encoder_layers: `SiameseEncoder` depth (per-item token encoder).
         cross_attn_layers: `ConditionedPairCrossAttention` depth.
         n_heads: Attention heads for the item encoder and pair trunk.
-        n_inj: Trailing trunk layers receiving gated topo/content injection.
+        n_inj: Trailing trunk layers receiving gated topo injection.
         ste_dim: Stitched-topology encoder hidden width.
         ste_layers: Stitched-topology encoder depth.
-        xattn_heads: Gated cross-attention heads (topo/content pathways).
+        xattn_heads: Gated cross-attention heads (topo pathway).
         p_topo: Training-time branch-dropout rate for the topo pathway.
-        p_cont: Training-time branch-dropout rate for the content pathway.
         n_ground: Grounding candidates per node `n_g` (spec Sec 14.4.4;
             supersedes the internal generator's own pinned `EgoStitchConfig`
             default for this family).
@@ -270,7 +244,6 @@ class E2EConfig:
     ste_layers: int = 3
     xattn_heads: int = 8
     p_topo: float = 0.15
-    p_cont: float = 0.15
     permanent_null: str = "none"
     n_ground: int = 20
     tau_adj: float = 0.5
@@ -306,10 +279,8 @@ class E2EConfig:
             )
         if not 1 <= self.n_inj <= self.cross_attn_layers:
             raise ValueError(f"n_inj must be in [1, cross_attn_layers], got {self.n_inj}")
-        for name in ("p_topo", "p_cont"):
-            value = float(getattr(self, name))
-            if not 0.0 <= value <= 1.0:
-                raise ValueError(f"{name} must be in [0, 1], got {value}")
+        if not 0.0 <= self.p_topo <= 1.0:
+            raise ValueError(f"p_topo must be in [0, 1], got {self.p_topo}")
         if not 0.0 < self.tau_adj < 1.0:
             raise ValueError(f"tau_adj must be in (0, 1), got {self.tau_adj}")
         if not -1.0 <= self.tau_div <= 1.0:
@@ -325,9 +296,9 @@ class E2EConfig:
             )
         if self.w_rel < 0.0:
             raise ValueError(f"w_rel must be non-negative, got {self.w_rel}")
-        if self.permanent_null not in ("none", "all_head", "content_head"):
+        if self.permanent_null not in ("none", "all_head"):
             raise ValueError(
-                "permanent_null must be one of 'none', 'all_head', or 'content_head', "
+                "permanent_null must be one of 'none' or 'all_head', "
                 f"got {self.permanent_null!r}"
             )
         if self.feature_standardization not in _FEATURE_STANDARDIZATION_MODES:

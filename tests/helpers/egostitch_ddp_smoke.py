@@ -86,7 +86,6 @@ _E2E_TINY_MODEL: dict[str, object] = {
     "ste_layers": 1,
     "xattn_heads": 2,
     "p_topo": 0.15,
-    "p_cont": 0.15,
     "n_ground": 20,
     # The toy bundle carries `feature_stats is None` — it never goes through
     # `assemble_egostitch_data`'s V_fit statistics path — so the registered

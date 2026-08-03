@@ -560,12 +560,10 @@ class TestE2ECompositeStep:
 
         monkeypatch.setattr(PackedFeatureTable, "from_pack", classmethod(_float_cpu_pack))
 
-    def _gates(self, model: EgoStitchE2E) -> tuple[GatedCrossAttention, GatedCrossAttention]:
+    def _gates(self, model: EgoStitchE2E) -> GatedCrossAttention:
         topo_gate = model.trunk.topo_xattn[0]
-        cont_gate = model.trunk.cont_xattn[0]
         assert isinstance(topo_gate, GatedCrossAttention)
-        assert isinstance(cont_gate, GatedCrossAttention)
-        return topo_gate, cont_gate
+        return topo_gate
 
     @staticmethod
     def _bf16_autocast() -> torch.autocast:
@@ -838,7 +836,7 @@ class TestE2ECompositeStep:
         torch.manual_seed(0)
         batch, model = self._batch_and_model(tmp_path)
         composite = te._CompositeStep(model, world_size=1)
-        topo_gate, cont_gate = self._gates(model)
+        topo_gate = self._gates(model)
 
         with self._bf16_autocast():
             out = composite(self._payload(batch, joint_weight=1.0))
@@ -847,9 +845,7 @@ class TestE2ECompositeStep:
         loss.backward()  # type: ignore[no-untyped-call]
 
         assert topo_gate.gate.grad is not None
-        assert cont_gate.gate.grad is not None
-        total_abs_grad = float(topo_gate.gate.grad.abs()) + float(cont_gate.gate.grad.abs())
-        assert total_abs_grad > 0.0
+        assert float(topo_gate.gate.grad.abs()) > 0.0
 
     def test_gates_receive_gradient_under_registered_zscore_standardization(
         self, tmp_path: Path
@@ -878,7 +874,7 @@ class TestE2ECompositeStep:
         assert model.feature_stats_digest_hex == stats.digest
 
         composite = te._CompositeStep(model, world_size=1)
-        topo_gate, cont_gate = self._gates(model)
+        topo_gate = self._gates(model)
 
         with self._bf16_autocast():
             out = composite(self._payload(batch, joint_weight=1.0))
@@ -887,9 +883,7 @@ class TestE2ECompositeStep:
         loss.backward()  # type: ignore[no-untyped-call]
 
         assert topo_gate.gate.grad is not None
-        assert cont_gate.gate.grad is not None
-        total_abs_grad = float(topo_gate.gate.grad.abs()) + float(cont_gate.gate.grad.abs())
-        assert total_abs_grad > 0.0
+        assert float(topo_gate.gate.grad.abs()) > 0.0
 
     def test_registered_precision_differential_thresholds(self) -> None:
         fp32_f = torch.full((3,), 100.0)
@@ -1364,7 +1358,7 @@ class TestE2ECompositeStep:
         batch.edge["emb_a"] = batch.edge["emb_a"].float()
         batch.edge["emb_b"] = batch.edge["emb_b"].float()
         edge_view = te._e2e_edge_view(batch.edge)
-        for null, key in (("all_head", "f_logit"), ("content_head", "pair_topology")):
+        for null, key in (("all_head", "f_logit"),):
             model.cfg = replace(model.cfg, permanent_null=null)
             expected = model.decompose(edge_view)[key]
             seen: list[torch.Tensor] = []
@@ -1394,10 +1388,9 @@ class TestE2ECompositeStep:
         torch.manual_seed(0)
         batch, model = self._batch_and_model(tmp_path)
         composite = te._CompositeStep(model, world_size=1)
-        topo_gate, cont_gate = self._gates(model)
+        topo_gate = self._gates(model)
         with torch.no_grad():
             topo_gate.gate.fill_(0.25)
-            cont_gate.gate.fill_(0.25)
 
         with self._bf16_autocast():
             out = composite(self._payload(batch, joint_weight=1.0, collect_diagnostics=True))
@@ -1408,7 +1401,7 @@ class TestE2ECompositeStep:
         assert math.isfinite(parts["recon_align"])
         assert math.isfinite(parts["recon_rel"])
 
-        for key in ("gate_topo_tanh", "gate_cont_tanh"):
+        for key in ("gate_topo_tanh",):
             assert key in out
             values = cast(list[float], out[key])
             assert len(values) == model.cfg.n_inj
@@ -1418,7 +1411,7 @@ class TestE2ECompositeStep:
         with self._bf16_autocast():
             grad_rms = te._e2e_submodule_gradient_rms(model, families["edge"])
         metrics_row: dict[str, object] = {**out, **grad_rms}
-        for key in ("grad_rms_trunk", "grad_rms_ste", "grad_rms_content"):
+        for key in ("grad_rms_trunk", "grad_rms_ste"):
             assert key in metrics_row
             assert math.isfinite(cast(float, metrics_row[key]))
             assert cast(float, metrics_row[key]) > 0.0
@@ -1455,11 +1448,10 @@ class TestE2ECompositeStep:
             pair_batch: dict[str, torch.Tensor],
             *,
             need_topo: bool = True,
-            need_cont: bool = True,
         ) -> E2EPairContext:
             nonlocal context_calls
             context_calls += 1
-            return original_build(pair_batch, need_topo=need_topo, need_cont=need_cont)
+            return original_build(pair_batch, need_topo=need_topo)
 
         def _spy_score(
             context: E2EPairContext,
@@ -1479,13 +1471,17 @@ class TestE2ECompositeStep:
         assert score_calls == 2
         assert fidelity == expected
 
-    def test_dead_decision_head_excluded_from_trainable_parameters(self, tmp_path: Path) -> None:
+    def test_frozen_random_gin_excluded_from_trainable_parameters(self, tmp_path: Path) -> None:
+        """`generator.random_gin` is frozen at construction (spec Sec 13.6) and
+        must never appear among the E2E worker's trainable parameters, even
+        though the plain `requires_grad` filter is now the only exclusion
+        mechanism (`decision.py` and its name-based special case are gone).
+        """
         _, model = self._batch_and_model(tmp_path)
         trainable_ids = {id(p) for p in te._e2e_trainable_parameters(model)}
-        decision_ids = {
-            name: id(parameter) for name, parameter in model.generator.decision.named_parameters()
-        }
-        assert trainable_ids & set(decision_ids.values()) == {decision_ids["tau_kappa_raw"]}
+        random_gin_ids = {id(p) for p in model.generator.random_gin.parameters()}
+        assert random_gin_ids, "random_gin must have parameters for this exclusion check to be real"
+        assert trainable_ids.isdisjoint(random_gin_ids)
         assert any(id(p) in trainable_ids for p in model.trunk.parameters())
 
 
@@ -1978,11 +1974,9 @@ class _ArchivedV1TrainLoopE2E:
 
         expected_ids = {id(parameter) for parameter in te._e2e_trainable_parameters(model)}
         assert expected_ids <= captured_param_ids
+        # The 4 extra captured ids are the Kendall log-variance scalars (one per
+        # family below), optimized outside `_e2e_trainable_parameters`.
         assert len(captured_param_ids - expected_ids) == 4
-        decision_ids = {
-            name: id(parameter) for name, parameter in model.generator.decision.named_parameters()
-        }
-        assert captured_param_ids & set(decision_ids.values()) == {decision_ids["tau_kappa_raw"]}
         assert result.kendall_state["active"] is True
         log_variances = cast(dict[str, float], result.kendall_state["log_variances"])
         assert set(log_variances) == {"edge", "recon", "real", "ssl"}
@@ -2005,7 +1999,7 @@ class _ArchivedV1TrainLoopE2E:
     def test_validation_uses_permanent_null_active_arm(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        for permanent_null in ("all_head", "content_head"):
+        for permanent_null in ("all_head",):
             arm_path = tmp_path / permanent_null
             arm_path.mkdir()
             e2e_cfg, data, model, accelerator = self._e2e_setup(arm_path)
@@ -2063,7 +2057,6 @@ class _ArchivedV1TrainLoopE2E:
             assert validation is not None
             assert seen and seen[0] is not None
             assert bool((~seen[0].topo).all()) == (permanent_null == "all_head")
-            assert bool((~seen[0].cont).all()) == (permanent_null in ("all_head", "content_head"))
             assert validation.fidelity["selection_tiebreak"] == 0.0
             assert validation.active_logits.dtype.str == "<f4"
             assert validation.active_logits.shape == data.val_labels.shape

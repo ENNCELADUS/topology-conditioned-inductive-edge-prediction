@@ -642,10 +642,8 @@ def load_config(path: Path) -> EgoConfig:
         ):
             raise ValueError("training requires the pinned optimizer settings")
         resolved_e2e = E2EConfig.from_mapping(model_kwargs)
-        if (resolved_e2e.p_topo, resolved_e2e.p_cont) not in ((0.15, 0.15), (0.0, 0.0)):
-            raise ValueError(
-                "training requires p_topo=p_cont=0.15, or 0.0 for the p0 arm"
-            )
+        if resolved_e2e.p_topo not in (0.15, 0.0):
+            raise ValueError("training requires p_topo=0.15, or 0.0 for the p0 arm")
         if mixed_precision != "bf16" or eval_cfg.eval_every != 1:
             raise ValueError("training requires mixed_precision=bf16 and eval.eval_every=1")
         if (
@@ -700,7 +698,6 @@ E2EPhaseName = Literal["A", "B", "C"]
 E2EArmName = Literal[
     "full",
     "b0_e2e_f_only",
-    "pair_topology",
     "p0",
     "no_l_rel",
     "row_layernorm",
@@ -1050,9 +1047,6 @@ class E2EParameterGroups:
 
 def build_e2e_parameter_groups(model: EgoStitchE2E) -> E2EParameterGroups:
     """Build the three registered groups without the retired v1 composite."""
-    for name, parameter in model.generator.decision.named_parameters():
-        if name != "tau_kappa_raw":
-            parameter.requires_grad_(False)
     live_ids = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
     grouped: dict[str, list[tuple[str, torch.nn.Parameter]]] = {
         "pair_encoder_head": [],
@@ -1062,9 +1056,7 @@ def build_e2e_parameter_groups(model: EgoStitchE2E) -> E2EParameterGroups:
     conditioning_prefixes = (
         "ste.",
         "rel_head.",
-        "content_proj.",
         "trunk.topo_xattn.",
-        "trunk.cont_xattn.",
     )
     for name, parameter in model.named_parameters():
         if id(parameter) not in live_ids:
@@ -2554,7 +2546,6 @@ class _CompositeStep(torch.nn.Module):
             branch_masks = sample_branch_masks(
                 edge["label"].shape[0],
                 self.model.cfg.p_topo,
-                self.model.cfg.p_cont,
                 generator=_seeded_generator(seed, epoch, step),
                 device=edge["label"].device,
             )
@@ -2702,11 +2693,10 @@ def _e2e_edge_view(edge: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 
 
 def _e2e_gate_tanh(model: EgoStitchE2E) -> dict[str, list[float]]:
-    """Per-injected-block ``tanh(gate)`` readout for both conditioning pathways.
+    """Per-injected-block ``tanh(gate)`` readout for the topology conditioning pathway.
 
-    Registered names (spec Sec 13.17): ``gate_topo_tanh``, ``gate_cont_tanh``.
-    A pure parameter readout -- no forward/backward pass required, safe to
-    call every step.
+    Registered name (spec Sec 13.17): ``gate_topo_tanh``. A pure parameter
+    readout -- no forward/backward pass required, safe to call every step.
     """
 
     def _values(modules: torch.nn.ModuleList) -> list[float]:
@@ -2718,27 +2708,25 @@ def _e2e_gate_tanh(model: EgoStitchE2E) -> dict[str, list[float]]:
 
     return {
         "gate_topo_tanh": _values(model.trunk.topo_xattn),
-        "gate_cont_tanh": _values(model.trunk.cont_xattn),
     }
 
 
 def _e2e_submodule_gradient_rms(model: EgoStitchE2E, loss: torch.Tensor) -> dict[str, float]:
     """Per-submodule gradient RMS from one isolated retained-graph backward.
 
-    Registered names (spec Sec 13.17): ``grad_rms_trunk``, ``grad_rms_ste``,
-    ``grad_rms_content``. Measures how much of ``loss``'s gradient reaches the
-    trunk, the stitched-topology encoder, and the content projector -- the
-    zero-init gated pathways the warm-start curriculum is designed to keep
-    dead until ``L_edge`` activates. Mirrors `_family_gradient_norms`'s
-    isolated-backward pattern: intended to be called on a dedicated probe
-    forward's output (spec Sec 13.17's fixed replay batch), not on the tensor
-    the caller is about to call its own `.backward()` on -- leaves every
-    parameter's ``.grad`` at ``None`` afterward either way.
+    Registered names (spec Sec 13.17): ``grad_rms_trunk``, ``grad_rms_ste``.
+    Measures how much of ``loss``'s gradient reaches the trunk and the
+    stitched-topology encoder -- the zero-init gated pathways the warm-start
+    curriculum is designed to keep dead until ``L_edge`` activates. Mirrors
+    `_family_gradient_norms`'s isolated-backward pattern: intended to be
+    called on a dedicated probe forward's output (spec Sec 13.17's fixed
+    replay batch), not on the tensor the caller is about to call its own
+    `.backward()` on -- leaves every parameter's ``.grad`` at ``None``
+    afterward either way.
     """
     groups: dict[str, list[torch.nn.Parameter]] = {
         "grad_rms_trunk": list(model.trunk.parameters()),
         "grad_rms_ste": list(model.ste.parameters()),
-        "grad_rms_content": list(model.content_proj.parameters()),
     }
     model.zero_grad(set_to_none=True)
     loss.backward(retain_graph=True)  # type: ignore[no-untyped-call]
@@ -2803,30 +2791,15 @@ def _e2e_null_arm_tiebreak(logits: np.ndarray) -> dict[str, float]:
 def _e2e_trainable_parameters(model: EgoStitchE2E) -> list[torch.nn.Parameter]:
     """Trainable parameters for family `egostitch_e2e`, excluding dead ones.
 
-    `EgoStitchE2E.generator` is a full `EgoStitchStage1`, which builds a
     `DecisionHead` (the frozen-s0 family's ``(s0, s1, s2)`` fusion head, spec
-    Sec 13.1) that the e2e forward path never calls -- `EgoStitchE2E.forward`
-    fuses through its own trunk/head, not `generator.pair_outputs`/
-    `self_outputs`. Left in the optimizer, `DecisionHead`'s parameters would
-    sit with permanently zero gradient every step (a silent dead-parameter
-    optimizer state, flagged in review). `generator.random_gin` has the
-    opposite disposition: it *is* exercised (via `node_losses`'s ``L_real``
+    Sec 13.1) is deleted entirely along with the content path -- there is no
+    longer a `generator.decision` submodule to special-case.
+    `generator.random_gin` *is* exercised (via `node_losses`'s ``L_real``
     energy-distance term) but is already frozen at construction
-    (`requires_grad=False`, spec Sec 13.6), so it is excluded here too, for a
-    different reason (never trainable, not merely unused).
+    (`requires_grad=False`, spec Sec 13.6), so the plain `requires_grad`
+    filter below excludes it without any name-based special case.
     """
-    # The retired scalar gate/w stay dead, but tau_kappa is now the live
-    # counterpart-membership temperature in c_content (spec Sec 5/13.17).
-    decision_ids = {
-        id(parameter)
-        for name, parameter in model.generator.decision.named_parameters()
-        if name != "tau_kappa_raw"
-    }
-    return [
-        parameter
-        for parameter in model.parameters()
-        if parameter.requires_grad and id(parameter) not in decision_ids
-    ]
+    return [parameter for parameter in model.parameters() if parameter.requires_grad]
 
 
 def _e2e_optimizer_parameters(
@@ -3336,9 +3309,7 @@ def _e2e_arm_name(model: EgoStitchE2E) -> E2EArmName:
 def _e2e_arm_name_from_config(config: E2EConfig) -> E2EArmName:
     if config.permanent_null == "all_head":
         return "b0_e2e_f_only"
-    if config.permanent_null == "content_head":
-        return "pair_topology"
-    if config.p_topo == 0.0 and config.p_cont == 0.0:
+    if config.p_topo == 0.0:
         return "p0"
     if config.w_rel == 0.0:
         return "no_l_rel"
@@ -3555,7 +3526,6 @@ def _e2e_current_submodule_gradient_rms(
     submodules: dict[str, Sequence[torch.nn.Parameter]] = {
         "grad_rms_trunk": tuple(model.trunk.parameters()),
         "grad_rms_ste": tuple(model.ste.parameters()),
-        "grad_rms_content": tuple(model.content_proj.parameters()),
     }
     result: dict[str, float] = {}
     for name, parameters in submodules.items():
@@ -4951,7 +4921,6 @@ def write_run_start_metadata(
         "permanent_null": cfg.model.config.get("permanent_null", "none"),
         "model_family": cfg.model.family,
         "p_topo": cfg.model.config.get("p_topo", 0.0),
-        "p_cont": cfg.model.config.get("p_cont", 0.0),
         "config_path": str(config_path.resolve()) if config_path is not None else None,
         "config_sha256": _sha256_file(config_path) if config_path is not None else None,
         "arm": arm,

@@ -16,8 +16,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 V3_CONFIGS = {
     "full": REPO_ROOT / "configs/egostitch_e2e_v3_full_breadth_first.yaml",
     "b0_e2e_f_only": REPO_ROOT / "configs/egostitch_e2e_v3_f_only_breadth_first.yaml",
-    "pair_topology": REPO_ROOT
-    / "configs/egostitch_e2e_v3_pair_topology_breadth_first.yaml",
+    # "pair_topology" was retired (not merely relabeled): the three-component
+    # refactor's content-path removal (P1) deleted both its v3 and non-v3
+    # configs, since with no content branch a topology-only arm is identical
+    # to "full" (design 2026-08-02 §9).
     "p0": REPO_ROOT / "configs/egostitch_e2e_v3_p0_breadth_first.yaml",
     "no_l_rel": REPO_ROOT / "configs/egostitch_e2e_v3_no_l_rel_breadth_first.yaml",
     "row_layernorm": REPO_ROOT
@@ -93,8 +95,6 @@ def test_scores_meta_version_is_written_and_older_versions_are_rejected(
             },
         },
         f_logit=values,
-        pair_content=values,
-        pair_topology=values,
     )
     artifact = score_universe.load_scores(path)
     assert artifact.meta["scores_meta_version"] == score_universe._SCORES_META_VERSION

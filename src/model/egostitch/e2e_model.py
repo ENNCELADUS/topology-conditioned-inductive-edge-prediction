@@ -2,16 +2,17 @@
 
 The rev-3.0 end-to-end conditioned encoder: an internally *trainable* Stage-1
 generator (Tokenize-lite + Imagine — no frozen s0, no s0 cache) feeds a
-stitched-topology scaffold and content tokens into the conditioned pair trunk
-via zero-init gated cross-attention (Tasks 5-10). AB/BA order is handled
-internally: the trunk runs both orders through the same
-`ConditionedPairCrossAttention` (topo tokens relabeled per side via
-`swap_direction`) and the two pair representations are fused by a
-feature-wise max before the head, mirroring `V3_1._pair_representation`
-(`B0.py:1093`). `decompose` realizes the four-logit decomposition
-(`full`/`f_logit`/`pair_content`/`pair_topology`) via the eval-time hard
-bypasses in `masks_for_null` (design rev 3 Sec 3.5) — one checkpoint, no
-retraining per arm.
+stitched-topology scaffold into the conditioned pair trunk via zero-init
+gated cross-attention (Tasks 5-10). AB/BA order is handled internally: the
+trunk runs both orders through the same `ConditionedPairCrossAttention` (topo
+tokens relabeled per side via `swap_direction`) and the two pair
+representations are fused by a feature-wise max before the head, mirroring
+`V3_1._pair_representation` (`B0.py:1093`). `decompose` realizes the
+two-logit decomposition (`full`/`f_logit`) via the eval-time hard bypass in
+`masks_for_null` (design rev 3 Sec 3.5) — one checkpoint, no retraining per
+arm. The content pathway (pair-content tokens routed around the graph
+encoder straight into the trunk) was removed with the content path
+(three-component refactor design §9).
 """
 
 from __future__ import annotations
@@ -28,9 +29,7 @@ from src.data.feature_stats import FeatureStats
 from src.model.B0 import MLPHead, SiameseEncoder
 from src.model.egostitch.conditioning import (
     NULL_ALL_HEAD,
-    NULL_CONTENT_HEAD,
     NULL_NONE,
-    NULL_TOPO_HEAD,
     HeadNullMasks,
     masks_for_null,
 )
@@ -44,12 +43,8 @@ from src.model.egostitch.losses import (
 from src.model.egostitch.matching import match_slots
 from src.model.egostitch.model import EgoStitchStage1, FeatureStandardizationMode
 from src.model.egostitch.scaffold import (
-    ContentProjector,
     ScaffoldInputPerturbation,
-    build_content_tokens,
     build_scaffold,
-    counterpart_membership,
-    grounded_identity_match,
     swap_direction,
 )
 from src.model.egostitch.ste import STEncoder
@@ -76,7 +71,6 @@ class E2EPairContext(NamedTuple):
     len_b: torch.Tensor
     topo_ab: torch.Tensor | None
     topo_ba: torch.Tensor | None
-    cont: torch.Tensor | None
     plan: torch.Tensor | None
     log_plan: torch.Tensor | None
 
@@ -85,9 +79,8 @@ class EgoStitchE2E(nn.Module):
     """The rev-3.0 end-to-end topology-conditioned pair encoder.
 
     Composes a trainable Stage-1 generator (per-node imagination), the
-    stitched-topology scaffold encoder, the content-token projector, and the
-    conditioned pair trunk into a single model supporting the four-logit
-    decomposition (`full`, `f_logit`, `pair_content`, `pair_topology`).
+    stitched-topology scaffold encoder, and the conditioned pair trunk into a
+    single model supporting the two-logit decomposition (`full`, `f_logit`).
     """
 
     def __init__(self, cfg: E2EConfig) -> None:
@@ -140,7 +133,6 @@ class EgoStitchE2E(nn.Module):
             conditioning_ema_decay=cfg.conditioning_ema_decay,
         )
         self.ste = STEncoder(cfg.d_model, cfg.ste_dim, cfg.ste_layers)
-        self.content_proj = ContentProjector(d_p=self.generator_cfg.d_p, d_model=cfg.d_model)
         self.head = MLPHead(
             input_dim=cfg.d_model,
             hidden_dims=[cfg.d_model // 2],
@@ -259,10 +251,9 @@ class EgoStitchE2E(nn.Module):
         is_self: torch.Tensor,
         *,
         need_topo: bool = True,
-        need_cont: bool = True,
         scaffold_input_perturbation: ScaffoldInputPerturbation | None = None,
     ) -> E2EPairContext:
-        """Build Stitch/STE/content once from cacheable endpoint states."""
+        """Build Stitch/STE state once from cacheable endpoint states."""
         slots_a, slots_b = state_a.slots, state_b.slots
         batch_size, slots = slots_a.pi.shape
         if is_self.shape != (batch_size,):
@@ -323,36 +314,6 @@ class EgoStitchE2E(nn.Module):
             topo_ab = self.ste(scaffold)
             topo_ba = self.ste(swap_direction(scaffold))
 
-        cont: torch.Tensor | None = None
-        if need_cont:
-            if state_a.ground_ids is not None and state_b.ground_ids is not None:
-                matched_a, matched_b = grounded_identity_match(
-                    slots_a.pointer,
-                    slots_a.gate,
-                    state_a.ground_ids,
-                    slots_b.pointer,
-                    slots_b.gate,
-                    state_b.ground_ids,
-                )
-            else:
-                matched_a = torch.zeros_like(slots_a.pi)
-                matched_b = torch.zeros_like(slots_b.pi)
-            membership_a = counterpart_membership(
-                slots_a, state_b.projected_x, self.generator.decision.tau_kappa
-            )
-            membership_b = counterpart_membership(
-                slots_b, state_a.projected_x, self.generator.decision.tau_kappa
-            )
-            cont = self.content_proj(
-                build_content_tokens(
-                    slots_a,
-                    slots_b,
-                    matched_a,
-                    matched_b,
-                    membership_a,
-                    membership_b,
-                )
-            )
         return E2EPairContext(
             encoded_a=state_a.encoded,
             encoded_b=state_b.encoded,
@@ -360,7 +321,6 @@ class EgoStitchE2E(nn.Module):
             len_b=state_b.length,
             topo_ab=topo_ab,
             topo_ba=topo_ba,
-            cont=cont,
             plan=plan,
             log_plan=log_plan,
         )
@@ -370,12 +330,11 @@ class EgoStitchE2E(nn.Module):
         batch: dict[str, torch.Tensor],
         *,
         need_topo: bool = True,
-        need_cont: bool = True,
     ) -> E2EPairContext:
         """Encode endpoints and build one reusable pair context."""
         state_a, state_b, is_self = self._pair_node_states(batch)
         return self.build_pair_context_from_states(
-            state_a, state_b, is_self, need_topo=need_topo, need_cont=need_cont
+            state_a, state_b, is_self, need_topo=need_topo
         )
 
     def relational_predictions(self, context: E2EPairContext) -> torch.Tensor:
@@ -464,7 +423,7 @@ class EgoStitchE2E(nn.Module):
         Returns:
             Shape ``(B, V, d_model)`` AB-direction STE token states.
         """
-        context = self.build_pair_context(batch, need_topo=True, need_cont=False)
+        context = self.build_pair_context(batch, need_topo=True)
         assert context.topo_ab is not None
         return context.topo_ab
 
@@ -487,19 +446,12 @@ class EgoStitchE2E(nn.Module):
             masks = masks_for_null(NULL_NONE, batch_size, device)
         distributed_training = self.training and dist.is_available() and dist.is_initialized()
         need_topo = bool(masks.topo.any()) or distributed_training
-        need_cont = bool(masks.cont.any()) or distributed_training
         if need_topo and (context.topo_ab is None or context.topo_ba is None):
             raise ValueError("pair context does not contain topology tokens")
-        if need_cont and context.cont is None:
-            raise ValueError("pair context does not contain content tokens")
         topo_tokens = None
         if need_topo:
             assert context.topo_ab is not None and context.topo_ba is not None
             topo_tokens = torch.cat((context.topo_ab, context.topo_ba))
-        cont_tokens = None
-        if need_cont:
-            assert context.cont is not None
-            cont_tokens = torch.cat((context.cont, context.cont))
         max_tokens = max(context.encoded_a.size(1), context.encoded_b.size(1))
         encoded_a = F.pad(
             context.encoded_a,
@@ -515,9 +467,7 @@ class EgoStitchE2E(nn.Module):
             torch.cat((context.len_a, context.len_b)),
             torch.cat((context.len_b, context.len_a)),
             topo_tokens=topo_tokens,
-            cont_tokens=cont_tokens,
             topo_active=torch.cat((masks.topo, masks.topo)) if need_topo else None,
-            cont_active=torch.cat((masks.cont, masks.cont)) if need_cont else None,
             edge_mask=torch.cat((edge_mask, edge_mask)) if edge_mask is not None else None,
         )
         feat_ab, feat_ba = pair_features.chunk(2)
@@ -538,8 +488,8 @@ class EgoStitchE2E(nn.Module):
             batch: Pair batch with ``emb_a``/``emb_b`` token streams,
                 ``len_a``/``len_b`` lengths, and the ``x_a``/``x_b`` per-node
                 features the Stage-1 generator's `encode_nodes` consumes.
-            masks: Optional per-pair topo/content activity masks; ``None``
-                defaults to both pathways fully active (``NULL_NONE``).
+            masks: Optional per-pair topo activity mask; ``None`` defaults to
+                the topo pathway fully active (``NULL_NONE``).
 
         Returns:
             ``{"logits": (B,)}`` fused edge logits.
@@ -551,14 +501,12 @@ class EgoStitchE2E(nn.Module):
         has_relational_targets = "rel_target" in batch
         distributed_training = self.training and dist.is_available() and dist.is_initialized()
         need_topo = bool(masks.topo.any()) or has_relational_targets or distributed_training
-        need_cont = bool(masks.cont.any()) or distributed_training
         state_a, state_b, is_self = self._pair_node_states(batch)
         context = self.build_pair_context_from_states(
             state_a,
             state_b,
             is_self,
             need_topo=need_topo,
-            need_cont=need_cont,
         )
         output = {
             "logits": self.score_pair_context(
@@ -572,31 +520,25 @@ class EgoStitchE2E(nn.Module):
         return output
 
     def decompose(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Compute the four-logit decomposition via eval-time hard bypasses.
+        """Compute the two-logit decomposition via the eval-time hard bypass.
 
         Args:
             batch: Pair batch (see :meth:`forward`).
 
         Returns:
-            ``{"full", "f_logit", "pair_content", "pair_topology"}`` logits.
+            ``{"full", "f_logit"}`` logits.
         """
         with torch.no_grad():
             context = self.build_pair_context(batch)
             return self.decompose_pair_context(context)
 
     def decompose_pair_context(self, context: E2EPairContext) -> dict[str, torch.Tensor]:
-        """Evaluate all four logits without rebuilding node or pair state."""
+        """Evaluate both logits without rebuilding node or pair state."""
         batch_size = context.encoded_a.size(0)
         device = context.encoded_a.device
         return {
             "full": self.score_pair_context(context),
             "f_logit": self.score_pair_context(
                 context, masks=masks_for_null(NULL_ALL_HEAD, batch_size, device)
-            ),
-            "pair_content": self.score_pair_context(
-                context, masks=masks_for_null(NULL_TOPO_HEAD, batch_size, device)
-            ),
-            "pair_topology": self.score_pair_context(
-                context, masks=masks_for_null(NULL_CONTENT_HEAD, batch_size, device)
             ),
         }

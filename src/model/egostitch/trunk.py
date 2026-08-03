@@ -1,8 +1,9 @@
 """Conditioned V3.1 trunk: cls-token gated cross-attention injection.
 
-PairCrossAttention subclass adding gated topo/content conditioning after the
+PairCrossAttention subclass adding gated topo conditioning after the
 final n_inj blocks (design rev 3 §3.4). B0.py is never modified; the parent
-forward loop is re-stated here with the injection.
+forward loop is re-stated here with the injection. The content pathway
+(cont_xattn) was removed with the content path (three-component refactor §9).
 """
 
 from __future__ import annotations
@@ -43,15 +44,6 @@ class ConditionedPairCrossAttention(PairCrossAttention):
             )
             for _ in range(n_inj)
         )
-        self.cont_xattn = nn.ModuleList(
-            GatedCrossAttention(
-                d_model,
-                xattn_heads,
-                xattn_dropout,
-                ema_decay=conditioning_ema_decay,
-            )
-            for _ in range(n_inj)
-        )
 
     def forward(
         self,
@@ -61,12 +53,10 @@ class ConditionedPairCrossAttention(PairCrossAttention):
         lengths_b: torch.Tensor,
         *,
         topo_tokens: torch.Tensor | None = None,
-        cont_tokens: torch.Tensor | None = None,
         topo_active: torch.Tensor | None = None,
-        cont_active: torch.Tensor | None = None,
         edge_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run the pair trunk with optional gated topo/content cls conditioning.
+        """Run the pair trunk with optional gated topo cls conditioning.
 
         Args:
             h_a: Item A hidden states ``(batch, seq_len_a, d_model)``.
@@ -75,12 +65,8 @@ class ConditionedPairCrossAttention(PairCrossAttention):
             lengths_b: Sequence lengths for B ``(batch,)``.
             topo_tokens: Optional scaffold tokens ``(batch, T, d_model)`` for
                 the topo cross-attention pathway; ``None`` is a hard bypass.
-            cont_tokens: Optional content tokens ``(batch, T, d_model)`` for
-                the content cross-attention pathway; ``None`` is a hard bypass.
             topo_active: Optional ``(batch,)`` bool mask gating the topo
                 pathway per-sample; required alongside ``topo_tokens``.
-            cont_active: Optional ``(batch,)`` bool mask gating the content
-                pathway per-sample; required alongside ``cont_tokens``.
             edge_mask: Optional ``(batch,)`` real-row mask used to exclude DDP
                 filler rows from conditioning means.
 
@@ -102,15 +88,10 @@ class ConditionedPairCrossAttention(PairCrossAttention):
         for idx, layer in enumerate(self.layers):
             h_a, h_b, cls_token = layer(h_a, h_b, cls_token, mask_a, mask_b)
             inj = idx - (n_layers - self.n_inj)
-            if inj >= 0:
-                if topo_tokens is not None and topo_active is not None:
-                    cls_token = self.topo_xattn[inj](
-                        cls_token, topo_tokens, None, topo_active, edge_mask
-                    )
-                if cont_tokens is not None and cont_active is not None:
-                    cls_token = self.cont_xattn[inj](
-                        cls_token, cont_tokens, None, cont_active, edge_mask
-                    )
+            if inj >= 0 and topo_tokens is not None and topo_active is not None:
+                cls_token = self.topo_xattn[inj](
+                    cls_token, topo_tokens, None, topo_active, edge_mask
+                )
         cls_vec = cls_token.squeeze(1)
         if self.pair_readout_mode == "pair_context_gated":
             # Full and hard-null heads differ only through the conditioned cls

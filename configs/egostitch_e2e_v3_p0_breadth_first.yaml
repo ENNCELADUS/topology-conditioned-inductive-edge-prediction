@@ -8,7 +8,6 @@ model:
     xattn_heads: 8
     n_inj: 1
     p_topo: 0.0
-    p_cont: 0.0
     permanent_null: none
     n_ground: 50
     feature_standardization: zscore_vfit_v1

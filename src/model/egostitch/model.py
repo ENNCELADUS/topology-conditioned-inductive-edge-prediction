@@ -1,12 +1,12 @@
-"""EgoStitch Stage-1 model: Tokenize-lite + Imagine + Stitch + decision head.
-
-Follows the repository forward contract (``model(batch) -> {"logits", "loss"?}``,
-the V3_1 / F0PairMLP convention) so `src.score_universe` and the training worker
-consume it uniformly. ``s0`` always arrives as a cached frozen-B0 logit
-(spec Sec 13.10); the model never computes it.
+"""EgoStitch Stage-1 model: Tokenize-lite + Imagine.
 
 The per-node pass (`encode_nodes`) is the cacheable unit (spec Sec 10.3): the
-scorer runs it once per node, then scores pair batches from the cache.
+E2E generator (`src.model.egostitch.e2e_model.EgoStitchE2E`) runs it once per
+node, then builds pair batches (Stitch + STE) from the cache. The standalone
+frozen-s0 ``(s0, s1, s2)`` decision-head fusion (`pair_outputs`/
+`self_outputs`/`forward`) belonged to the retired frozen-s0 ``egostitch``
+scorer and was removed with `decision.py` (three-component refactor design
+§9); this model class is now imagination-only.
 """
 
 from __future__ import annotations
@@ -15,11 +15,9 @@ from typing import Literal, NamedTuple, cast
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from src.data.feature_stats import FeatureStats
 from src.model.egostitch.config import EgoStitchConfig
-from src.model.egostitch.decision import DecisionHead
 from src.model.egostitch.imagine import DenoiseSlots, ImagineDecoder, SlotSet
 from src.model.egostitch.losses import (
     LossFamily,
@@ -34,7 +32,6 @@ from src.model.egostitch.losses import (
     standardized_energy_distance,
 )
 from src.model.egostitch.matching import match_slots
-from src.model.egostitch.stitch import sinkhorn_plan
 from src.model.egostitch.tokenize import TokenizeLite, TokenizeOut
 
 
@@ -210,7 +207,6 @@ class EgoStitchStage1(nn.Module):
             )
         self.tokenize = TokenizeLite(config)
         self.imagine = ImagineDecoder(config)
-        self.decision = DecisionHead(config)
         self.random_gin = RandomGIN(config)
         # rho_eval / rho_train (spec Sec 9.3); the trainer sets it at load.
         self.register_buffer("density_ratio", torch.tensor(1.0))
@@ -304,81 +300,6 @@ class EgoStitchStage1(nn.Module):
             x, tok.e, ground_x, null_mode=null_mode, extra_proj=extra_proj
         )
         return NodeEncoding(tok=tok, slots=slots, denoise=denoise)
-
-    # ------------------------------------------------------------------ scoring
-
-    def pair_outputs(
-        self,
-        enc_i: NodeEncoding,
-        enc_j: NodeEncoding,
-        x_i: torch.Tensor,
-        x_j: torch.Tensor,
-        s0: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Return fused logits and the three Stage-1 channels for diagnostics."""
-        plan = sinkhorn_plan(
-            enc_i.slots.h,
-            enc_j.slots.h,
-            enc_i.slots.pi,
-            enc_j.slots.pi,
-            enc_i.slots.mult,
-            enc_j.slots.mult,
-            eps=self.config.sinkhorn_eps,
-            iters=self.config.sinkhorn_iters,
-            tau=self.config.sinkhorn_tau,
-        )
-        proj_i = self.project_features(x_i)
-        proj_j = self.project_features(x_j)
-        channels = self.decision.channels(
-            enc_i.slots,
-            enc_j.slots,
-            plan,
-            proj_i,
-            proj_j,
-            self.d_hat(enc_i.tok),
-            self.d_hat(enc_j.tok),
-        )
-        return self.decision.fuse(s0, channels), channels
-
-    def self_outputs(
-        self, enc: NodeEncoding, x: torch.Tensor, s0: torch.Tensor
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Return self-pair logits and channels without a second imagination pass."""
-        channels = self.decision.self_channels(
-            enc.slots, self.project_features(x), self.d_hat(enc.tok)
-        )
-        return self.decision.fuse(s0, channels), channels
-
-    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Score one pair batch (the repository forward contract).
-
-        A batch with ``x_j`` present is a non-self pair batch (keys ``x_i``,
-        ``x_j``, ``ground_i``, ``ground_j``, ``s0``); a batch without ``x_j``
-        is a self-pair batch (keys ``x_i``, ``ground_i``, ``s0``). An optional
-        ``label`` adds the BCE ``loss`` entry.
-
-        Args:
-            batch: The batch dictionary.
-
-        Returns:
-            ``{"logits": (B,)}`` plus ``"loss"`` when labels are present.
-        """
-        s0 = batch["s0"]
-        if "x_j" in batch:
-            enc_i = self.encode_nodes(batch["x_i"], batch["ground_i"])
-            enc_j = self.encode_nodes(batch["x_j"], batch["ground_j"])
-            logits, channels = self.pair_outputs(enc_i, enc_j, batch["x_i"], batch["x_j"], s0)
-        else:
-            enc = self.encode_nodes(batch["x_i"], batch["ground_i"])
-            logits, channels = self.self_outputs(enc, batch["x_i"], s0)
-        out: dict[str, torch.Tensor] = {
-            "logits": logits,
-            "residual": logits - s0,
-            **channels,
-        }
-        if "label" in batch:
-            out["loss"] = F.binary_cross_entropy_with_logits(logits, batch["label"].float())
-        return out
 
     # ------------------------------------------------------------------ training losses
 

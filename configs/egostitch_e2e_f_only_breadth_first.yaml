@@ -9,7 +9,6 @@ model:
     xattn_heads: 8
     n_inj: 1
     p_topo: 0.15
-    p_cont: 0.15
     permanent_null: all_head
 
 data:

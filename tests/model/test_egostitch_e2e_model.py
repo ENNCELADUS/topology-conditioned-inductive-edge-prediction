@@ -9,8 +9,6 @@ import torch
 from src.data.feature_stats import compute_feature_stats
 from src.model.egostitch.conditioning import (
     NULL_ALL_HEAD,
-    NULL_CONTENT_HEAD,
-    NULL_TOPO_HEAD,
     GatedCrossAttention,
     masks_for_null,
 )
@@ -18,7 +16,6 @@ from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.e2e_model import E2EPairContext, EgoStitchE2E
 from src.model.egostitch.imagine import SlotSet
 from src.model.egostitch.model import NodeEncoding
-from src.model.egostitch.scaffold import counterpart_membership, grounded_identity_match
 
 
 class _DirectionalConstantAttention(torch.nn.Module):
@@ -62,14 +59,12 @@ def _tiny_e2e_config(
     *,
     feature_standardization: str = "row_layernorm",
     p_topo: float = 0.15,
-    p_cont: float = 0.15,
 ) -> E2EConfig:
     """Build the shared tiny trunk/generator sizing used across this file's tests.
 
     Args:
         feature_standardization: The registered F0 preprocessing mode.
         p_topo: Training-time branch-dropout rate for the topo pathway.
-        p_cont: Training-time branch-dropout rate for the content pathway.
 
     Returns:
         The tiny `E2EConfig`.
@@ -84,21 +79,18 @@ def _tiny_e2e_config(
         ste_layers=2,
         xattn_heads=4,
         p_topo=p_topo,
-        p_cont=p_cont,
         feature_standardization=feature_standardization,
     )
 
 
 def _tiny_model_and_batch(
-    *, p_topo: float = 0.15, p_cont: float = 0.15
+    *, p_topo: float = 0.15
 ) -> tuple[EgoStitchE2E, dict[str, torch.Tensor]]:
     torch.manual_seed(0)
     # Stateless mode: these tests exercise trunk/scaffold behavior, not the
     # registered zscore_vfit_v1 statistics, and matches the prior
     # `standardize_features=True` (LayerNorm) semantics exactly.
-    cfg = _tiny_e2e_config(
-        feature_standardization="row_layernorm", p_topo=p_topo, p_cont=p_cont
-    )
+    cfg = _tiny_e2e_config(feature_standardization="row_layernorm", p_topo=p_topo)
     model = EgoStitchE2E(cfg).eval()
     b, t, d_in = 4, 6, model.input_dim
     n_ground = 5
@@ -143,15 +135,9 @@ def _topology_injections(
 
     handle = layer.register_forward_hook(_capture)
     try:
-        model.score_pair_context(
-            context,
-            masks=masks_for_null(
-                NULL_CONTENT_HEAD,
-                context.encoded_a.size(0),
-                context.encoded_a.device,
-            ),
-            edge_mask=edge_mask,
-        )
+        # masks=None => NULL_NONE: the topo pathway is fully active (there is
+        # no content pathway left to null).
+        model.score_pair_context(context, edge_mask=edge_mask)
     finally:
         handle.remove()
     return torch.cat(captures)
@@ -196,30 +182,23 @@ def test_symmetric_trunk_updates_one_shared_ema_once_per_step() -> None:
     model, batch = _tiny_model_and_batch()
     context = model.build_pair_context(batch)
     edge_mask = torch.tensor([True, True, False, False])
-    layers = (
-        cast(GatedCrossAttention, model.trunk.topo_xattn[0]),
-        cast(GatedCrossAttention, model.trunk.cont_xattn[0]),
-    )
-    for layer in layers:
-        layer.attn = _DirectionalConstantAttention(batch_size=4, ab=1.0, ba=3.0)
+    layer = cast(GatedCrossAttention, model.trunk.topo_xattn[0])
+    layer.attn = _DirectionalConstantAttention(batch_size=4, ab=1.0, ba=3.0)
 
     model.train()
     model.score_pair_context(context, edge_mask=edge_mask)
 
-    for layer in layers:
-        assert int(layer.ema_updates.item()) == 1
-        assert torch.equal(layer.ema_mu, torch.full_like(layer.ema_mu, 2.0))
+    assert int(layer.ema_updates.item()) == 1
+    assert torch.equal(layer.ema_mu, torch.full_like(layer.ema_mu, 2.0))
 
 
 def test_pair_symmetry_all_conditions() -> None:
     model, batch = _tiny_model_and_batch()
     batch["ground_id_b"] = batch["ground_id_a"].roll(shifts=1, dims=1)
-    topo_xattn, cont_xattn = model.trunk.topo_xattn[0], model.trunk.cont_xattn[0]
+    topo_xattn = model.trunk.topo_xattn[0]
     assert isinstance(topo_xattn, GatedCrossAttention)
-    assert isinstance(cont_xattn, GatedCrossAttention)
     with torch.no_grad():
-        for p in (topo_xattn.gate, cont_xattn.gate):
-            p.fill_(0.4)  # open gates: symmetry must hold with live conditioning
+        topo_xattn.gate.fill_(0.4)  # open gate: symmetry must hold with live conditioning
     swapped = dict(batch)
     swapped["emb_a"], swapped["emb_b"] = batch["emb_b"], batch["emb_a"]
     swapped["len_a"], swapped["len_b"] = batch["len_b"], batch["len_a"]
@@ -229,21 +208,18 @@ def test_pair_symmetry_all_conditions() -> None:
         batch["ground_id_b"],
         batch["ground_id_a"],
     )
-    for null in (None, NULL_ALL_HEAD, NULL_TOPO_HEAD, NULL_CONTENT_HEAD):
+    for null in (None, NULL_ALL_HEAD):
         masks = None if null is None else masks_for_null(null, 4, torch.device("cpu"))
         out_ij = model(batch, masks=masks)["logits"]
         out_ji = model(swapped, masks=masks)["logits"]
         assert torch.allclose(out_ij, out_ji, atol=1e-5), f"asymmetry under {null}"
 
-    p0_model, p0_batch = _tiny_model_and_batch(p_topo=0.0, p_cont=0.0)
+    p0_model, p0_batch = _tiny_model_and_batch(p_topo=0.0)
     p0_batch["ground_id_b"] = p0_batch["ground_id_a"].roll(shifts=1, dims=1)
     p0_topo_xattn = p0_model.trunk.topo_xattn[0]
-    p0_cont_xattn = p0_model.trunk.cont_xattn[0]
     assert isinstance(p0_topo_xattn, GatedCrossAttention)
-    assert isinstance(p0_cont_xattn, GatedCrossAttention)
     with torch.no_grad():
         p0_topo_xattn.gate.fill_(0.4)
-        p0_cont_xattn.gate.fill_(0.4)
     p0_swapped = dict(p0_batch)
     for key_a, key_b in (
         ("emb_a", "emb_b"),
@@ -261,20 +237,13 @@ def test_pair_symmetry_all_conditions() -> None:
 def test_train_mask_equals_eval_bypass() -> None:
     model, batch = _tiny_model_and_batch()
     batch["ground_id_b"] = batch["ground_id_a"].roll(shifts=1, dims=1)
-    topo_xattn, cont_xattn = model.trunk.topo_xattn[0], model.trunk.cont_xattn[0]
+    topo_xattn = model.trunk.topo_xattn[0]
     assert isinstance(topo_xattn, GatedCrossAttention)
-    assert isinstance(cont_xattn, GatedCrossAttention)
     with torch.no_grad():
         topo_xattn.gate.fill_(0.4)
-        cont_xattn.gate.fill_(0.4)
     dec = model.decompose(batch)  # eval-time hard bypasses
-    for null, key in (
-        (NULL_ALL_HEAD, "f_logit"),
-        (NULL_TOPO_HEAD, "pair_content"),
-        (NULL_CONTENT_HEAD, "pair_topology"),
-    ):
-        masked = model(batch, masks=masks_for_null(null, 4, torch.device("cpu")))["logits"]
-        assert torch.allclose(masked, dec[key], atol=1e-6), f"mask!=bypass for {null}"
+    masked = model(batch, masks=masks_for_null(NULL_ALL_HEAD, 4, torch.device("cpu")))["logits"]
+    assert torch.allclose(masked, dec["f_logit"], atol=1e-6), "mask!=bypass for NULL_ALL_HEAD"
 
 
 def test_f_logit_invariant_to_scaffold() -> None:
@@ -294,95 +263,6 @@ def test_missing_grounding_fails_closed() -> None:
         model(batch)
 
 
-def test_matched_flags_shared_candidate() -> None:
-    """Soft identity matching is symmetric and requires shared pool ids."""
-    ids_a = torch.tensor([[10, 11], [10, 11], [10, 11], [10, 11]], dtype=torch.long)
-    ids_b = torch.tensor([[20, 10], [20, 21], [20, 10], [20, 10]], dtype=torch.long)
-    # Single slot per side; the shared id is at different pool positions.
-    pointer_a = torch.zeros(4, 1, 2)
-    pointer_a[:, :, 0] = 1.0
-    pointer_b = torch.zeros(4, 1, 2)
-    pointer_b[:, :, 1] = 1.0
-    gate_a = torch.tensor([[0.9], [0.9], [0.3], [0.9]])
-    gate_b = torch.tensor([[0.9], [0.9], [0.9], [0.3]])
-
-    matched_a, matched_b = grounded_identity_match(
-        pointer_a, gate_a, ids_a, pointer_b, gate_b, ids_b
-    )
-    expected = torch.tensor([[0.81], [0.0], [0.27], [0.27]])
-    assert torch.allclose(matched_a, expected)
-    assert torch.allclose(matched_b, expected)
-    matched_b_swapped, matched_a_swapped = grounded_identity_match(
-        pointer_b, gate_b, ids_b, pointer_a, gate_a, ids_a
-    )
-    assert torch.equal(matched_a, matched_a_swapped)
-    assert torch.equal(matched_b, matched_b_swapped)
-
-
-def test_matched_flags_gradient_reaches_head_pointer() -> None:
-    """An overlapping grounding pool carries matched-flag gradient to the pointer head."""
-    model, batch = _tiny_model_and_batch()
-    slots_a = model.generator.encode_nodes(batch["x_a"][:1], batch["ground_a"][:1]).slots
-    slots_b = model.generator.encode_nodes(batch["x_b"][:1], batch["ground_b"][:1]).slots
-    ids_a = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
-    ids_b = torch.tensor([[21, 10, 22, 23, 24]], dtype=torch.long)
-
-    matched_a, _ = grounded_identity_match(
-        slots_a.pointer,
-        slots_a.gate,
-        ids_a,
-        slots_b.pointer,
-        slots_b.gate,
-        ids_b,
-    )
-    matched_a.sum().backward()
-
-    pointer_parameters = tuple(model.generator.imagine.head_pointer.parameters())
-    assert pointer_parameters
-    for parameter in pointer_parameters:
-        assert parameter.grad is not None
-        assert torch.isfinite(parameter.grad).all()
-        assert torch.count_nonzero(parameter.grad) > 0
-
-
-def test_matched_flags_maximizes_probability_gate_product() -> None:
-    """The counterpart slot maximizes ``M[k,l] * gate_b[l]`` as one product."""
-    pointer_a = torch.tensor([[[1.0, 0.0]]])
-    pointer_b = torch.tensor([[[0.1, 0.9], [0.4, 0.6]]])
-    gate_a = torch.tensor([[0.8]])
-    gate_b = torch.tensor([[0.1, 0.9]])
-    ids_a = torch.tensor([[10, 11]], dtype=torch.long)
-    ids_b = torch.tensor([[11, 10]], dtype=torch.long)
-
-    matched_a, _ = grounded_identity_match(
-        pointer_a, gate_a, ids_a, pointer_b, gate_b, ids_b
-    )
-
-    assert torch.allclose(matched_a, torch.tensor([[0.432]]))
-
-
-def test_matched_flags_disjoint_pools_are_exact_zero_with_zero_gradient() -> None:
-    """Disjoint grounding pools produce exact zeros, including through backward."""
-    pointer_a = torch.softmax(torch.randn(1, 2, 3), dim=-1).requires_grad_()
-    pointer_b = torch.softmax(torch.randn(1, 2, 3), dim=-1).requires_grad_()
-    gate_a = torch.sigmoid(torch.randn(1, 2)).requires_grad_()
-    gate_b = torch.sigmoid(torch.randn(1, 2)).requires_grad_()
-    ids_a = torch.tensor([[10, 11, 12]], dtype=torch.long)
-    ids_b = torch.tensor([[20, 21, 22]], dtype=torch.long)
-
-    matched_a, matched_b = grounded_identity_match(
-        pointer_a, gate_a, ids_a, pointer_b, gate_b, ids_b
-    )
-    assert torch.equal(matched_a, torch.zeros_like(matched_a))
-    assert torch.equal(matched_b, torch.zeros_like(matched_b))
-
-    (matched_a.sum() + matched_b.sum()).backward()
-    for tensor in (pointer_a, pointer_b, gate_a, gate_b):
-        assert tensor.grad is not None
-        assert torch.isfinite(tensor.grad).all()
-        assert torch.count_nonzero(tensor.grad) == 0
-
-
 def test_f_logit_invariant_to_grounding() -> None:
     model, batch = _tiny_model_and_batch()
     dec_a = model.decompose(batch)
@@ -392,7 +272,7 @@ def test_f_logit_invariant_to_grounding() -> None:
     batch2["ground_id_a"] = torch.randint_like(batch["ground_id_a"], 0, 1000)
     batch2["ground_id_b"] = torch.randint_like(batch["ground_id_b"], 0, 1000)
     dec_b = model.decompose(batch2)
-    # f_logit nulls both topo and content pathways, so grounding never reaches the trunk.
+    # f_logit nulls the (only remaining) topo pathway, so grounding never reaches the trunk.
     assert torch.allclose(dec_a["f_logit"], dec_b["f_logit"], atol=1e-6)
 
 
@@ -453,31 +333,12 @@ def test_probe_states_accepts_self_pair_batch() -> None:
     assert states.shape[0] == batch["x_a"].size(0)
 
 
-def test_counterpart_membership_matches_pinned_formula_and_is_scale_safe() -> None:
-    slots = model_slots = (
-        _tiny_model_and_batch()[0]
-        .generator.encode_nodes(torch.randn(2, 1536), torch.randn(2, 20, 1536))
-        .slots
-    )
-    other = torch.randn(2, 256)
-    tau = torch.tensor(1.7)
-    actual = counterpart_membership(slots, other, tau)
-    expected = -(
-        torch.nn.functional.normalize(slots.h, dim=-1)
-        - torch.nn.functional.normalize(other, dim=-1)[:, None]
-    ).square().sum(dim=-1) / tau + torch.log((slots.pi * slots.mult).clamp_min(1e-8))
-    assert torch.allclose(actual, expected)
-    scaled = counterpart_membership(model_slots._replace(h=model_slots.h * 11.0), other * 7.0, tau)
-    assert torch.allclose(actual, scaled)
-
-
 def test_decompose_builds_pair_context_once_and_matches_explicit_heads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model, batch = _tiny_model_and_batch()
     with torch.no_grad():
         cast(GatedCrossAttention, model.trunk.topo_xattn[0]).gate.data.fill_(0.4)
-        cast(GatedCrossAttention, model.trunk.cont_xattn[0]).gate.data.fill_(0.4)
     calls = 0
     original = model.build_pair_context
 
@@ -494,12 +355,6 @@ def test_decompose_builds_pair_context_once_and_matches_explicit_heads(
         "full": model.score_pair_context(context),
         "f_logit": model.score_pair_context(
             context, masks=masks_for_null(NULL_ALL_HEAD, 4, torch.device("cpu"))
-        ),
-        "pair_content": model.score_pair_context(
-            context, masks=masks_for_null(NULL_TOPO_HEAD, 4, torch.device("cpu"))
-        ),
-        "pair_topology": model.score_pair_context(
-            context, masks=masks_for_null(NULL_CONTENT_HEAD, 4, torch.device("cpu"))
         ),
     }
     for key, value in expected.items():
@@ -575,7 +430,7 @@ def test_bf16_autocast_combines_self_and_sinkhorn_plans_in_fp32() -> None:
     )
 
     with torch.autocast("cpu", dtype=torch.bfloat16):
-        context = model.build_pair_context_from_states(state_a, state_b, is_self, need_cont=False)
+        context = model.build_pair_context_from_states(state_a, state_b, is_self)
 
     assert context.plan is not None
     assert context.plan.dtype == torch.float32
@@ -604,24 +459,6 @@ def test_bf16_autocast_returns_registered_fp32_readout_and_logits(
 
     assert head_input_dtypes == [torch.float32]
     assert output.dtype == torch.float32
-
-
-def test_membership_is_content_only_and_content_null_ablates_it() -> None:
-    model, batch = _tiny_model_and_batch()
-    with torch.no_grad():
-        cast(GatedCrossAttention, model.trunk.cont_xattn[0]).gate.data.fill_(0.7)
-    context = model.build_pair_context(batch)
-    assert context.cont is not None
-    changed = context._replace(cont=context.cont + torch.randn_like(context.cont))
-    full_a = model.score_pair_context(context)
-    full_b = model.score_pair_context(changed)
-    assert not torch.allclose(full_a, full_b)
-    mask = masks_for_null(NULL_CONTENT_HEAD, 4, torch.device("cpu"))
-    null_a = model.score_pair_context(context, masks=mask)
-    null_b = model.score_pair_context(changed, masks=mask)
-    assert torch.equal(null_a, null_b)
-    assert context.topo_ab is not None and changed.topo_ab is not None
-    assert torch.equal(context.topo_ab, changed.topo_ab)
 
 
 def test_generator_uses_the_configured_standardization_mode() -> None:
@@ -685,15 +522,13 @@ def test_zscore_vfit_v1_registered_stats_actually_reach_the_forward_pass() -> No
     }
 
     def _activate_conditioning_gates(model: EgoStitchE2E) -> None:
-        # The trunk's topo/content injections are zero-init gated cross-
-        # attention (module docstring); at a fresh init both gates are zero,
-        # so neither pathway -- and hence no F0 standardization choice --
-        # would move the logits at all. Move them off zero, exactly as
-        # test_decompose_builds_pair_context_once_and_matches_explicit_heads
-        # and test_membership_is_content_only_and_content_null_ablates_it do.
+        # The trunk's topo injection is zero-init gated cross-attention
+        # (module docstring); at a fresh init the gate is zero, so the
+        # pathway -- and hence the F0 standardization choice -- would not
+        # move the logits at all. Move it off zero, exactly as
+        # test_decompose_builds_pair_context_once_and_matches_explicit_heads does.
         with torch.no_grad():
             cast(GatedCrossAttention, model.trunk.topo_xattn[0]).gate.data.fill_(0.7)
-            cast(GatedCrossAttention, model.trunk.cont_xattn[0]).gate.data.fill_(0.7)
 
     torch.manual_seed(0)
     zscore_model = EgoStitchE2E(

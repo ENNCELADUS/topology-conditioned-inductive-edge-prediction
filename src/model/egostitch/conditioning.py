@@ -18,30 +18,25 @@ from torch.distributed.nn import functional as dist_functional
 
 NULL_NONE = "none"
 NULL_ALL_HEAD = "all_head"
-NULL_TOPO_HEAD = "topo_head"
-NULL_CONTENT_HEAD = "content_head"
-_KNOWN_NULLS = (NULL_NONE, NULL_ALL_HEAD, NULL_TOPO_HEAD, NULL_CONTENT_HEAD)
+_KNOWN_NULLS = (NULL_NONE, NULL_ALL_HEAD)
 
 
 class HeadNullMasks(NamedTuple):
     """Per-pair pathway activity masks (True = active)."""
 
     topo: torch.Tensor
-    cont: torch.Tensor
 
 
 def sample_branch_masks(
     batch_size: int,
     p_topo: float,
-    p_cont: float,
     *,
     generator: torch.Generator,
     device: torch.device,
 ) -> HeadNullMasks:
     """Sample independent per-pair branch-dropout masks (design §4)."""
     topo = torch.rand(batch_size, generator=generator) >= p_topo
-    cont = torch.rand(batch_size, generator=generator) >= p_cont
-    return HeadNullMasks(topo=topo.to(device), cont=cont.to(device))
+    return HeadNullMasks(topo=topo.to(device))
 
 
 def masks_for_null(null: str, batch_size: int, device: torch.device) -> HeadNullMasks:
@@ -50,9 +45,8 @@ def masks_for_null(null: str, batch_size: int, device: torch.device) -> HeadNull
         raise ValueError(f"unknown head-null condition: {null!r}")
     on = torch.ones(batch_size, dtype=torch.bool, device=device)
     off = torch.zeros(batch_size, dtype=torch.bool, device=device)
-    topo = off if null in (NULL_ALL_HEAD, NULL_TOPO_HEAD) else on
-    cont = off if null in (NULL_ALL_HEAD, NULL_CONTENT_HEAD) else on
-    return HeadNullMasks(topo=topo, cont=cont)
+    topo = off if null == NULL_ALL_HEAD else on
+    return HeadNullMasks(topo=topo)
 
 
 class GatedCrossAttention(nn.Module):

@@ -729,7 +729,7 @@ def produce_e2e_probe_artifact(
     from src import train_egostitch as te
     from src.data.ego_targets import EgoTargetBuilder, EgoTargets
     from src.data.packed_features import PackedFeatureTable
-    from src.model.egostitch.config import E2EConfig, e2e_checkpoint_config
+    from src.model.egostitch.config import E2EConfig
     from src.model.egostitch.e2e_model import EgoStitchE2E
     from src.model.egostitch.losses import alignment_teacher_cells
     from src.model.egostitch.matching import match_slots
@@ -745,13 +745,9 @@ def produce_e2e_probe_artifact(
     if cfg.model.family != "egostitch_e2e":
         raise ValueError("E2E probe producer requires model family egostitch_e2e")
     formal_model_cfg = E2EConfig.from_mapping(cfg.model.config)
-    if (
-        formal_model_cfg.permanent_null != "none"
-        or formal_model_cfg.p_topo != 0.15
-        or formal_model_cfg.p_cont != 0.15
-    ):
+    if formal_model_cfg.permanent_null != "none" or formal_model_cfg.p_topo != 0.15:
         raise ValueError(
-            "E2E probe producer requires full-arm permanent_null=none and p_topo=p_cont=0.15"
+            "E2E probe producer requires full-arm permanent_null=none and p_topo=0.15"
         )
     if cfg.data.root.resolve() != data_root.resolve() or cfg.data.strategy != strategy:
         raise ValueError("probe CLI data root/strategy do not match the formal config")
@@ -775,10 +771,9 @@ def produce_e2e_probe_artifact(
     payload = cast(dict[str, object], torch.load(checkpoint_path, map_location="cpu"))
     state = cast(dict[str, torch.Tensor], payload["model_state"])
     checkpoint_id = _state_digest(state)[:16]
-    checkpoint_model_cfg = e2e_checkpoint_config(
-        cast(dict[str, object], payload["model_config"]),
-        has_rel_head=any(key.startswith("rel_head.") for key in state),
-    )
+    # The rev-3.1 checkpoint-config backfills were deleted with the content path
+    # (design 2026-08-02 §11); the checkpoint carries its own complete config.
+    checkpoint_model_cfg = cast(dict[str, object], payload["model_config"])
     model = EgoStitchE2E(E2EConfig.from_mapping(checkpoint_model_cfg))
     model.load_state_dict(state)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -864,7 +859,6 @@ def produce_e2e_probe_artifact(
                 state_b,
                 is_self,
                 need_topo=True,
-                need_cont=False,
             )
             assert context.topo_ab is not None
             assert state_a.ground_ids is not None
@@ -932,7 +926,7 @@ def produce_e2e_probe_artifact(
             )
             state_a, state_b, is_self = model._pair_node_states(batch)
             context = model.build_pair_context_from_states(
-                state_a, state_b, is_self, need_topo=True, need_cont=False
+                state_a, state_b, is_self, need_topo=True
             )
             assert context.plan is not None
             assert context.topo_ab is not None

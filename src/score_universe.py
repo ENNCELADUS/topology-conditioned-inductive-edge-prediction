@@ -34,11 +34,15 @@ Artifact format (pinned — do not drift):
   ``pairs_source``, ``strategy``, ``num_rows``, ``created_utc``, ``torch_version``;
   EgoStitch artifacts additionally pin pair-pass precision provenance and
   descriptive score-resolution diagnostics.
-- ``full``/``f_logit``/``pair_content``/``pair_topology``: float32 arrays present
-  only for family ``egostitch_e2e`` (design rev 3 four-logit decomposition).
-  ``logit`` holds the active primary arm; legacy v1 artifacts may omit ``full``
-  when ``logit`` is already the true full arm, or use ``full_logit`` for a
-  permanent-null primary.
+- ``full``/``f_logit``: float32 arrays present only for family
+  ``egostitch_e2e`` (design rev 4 two-logit decomposition, content path
+  removed; ``meta.scores_meta_version == "egostitch_e2e_scores_v4"``).
+  ``logit`` holds the active primary arm; legacy v1 artifacts may omit
+  ``full`` when ``logit`` is already the true full arm, or use
+  ``full_logit`` for a permanent-null primary. Legacy v3 artifacts
+  (``scores_meta_version == "egostitch_e2e_scores_v3"``) additionally carry
+  ``pair_content``/``pair_topology``; those two arrays are a read-only
+  backward-compatibility surface -- new runs never write them.
 """
 
 from __future__ import annotations
@@ -94,8 +98,15 @@ _META_KEYS = (
 )
 _NAMED_PAIR_SOURCES = ("candidate", "test", "val")
 _EGOSTITCH_E2E_PAIR_PRECISION_CONTRACT = "egostitch_e2e_pair_fp32_v1"
-_EGOSTITCH_E2E_ARRAY_KEYS = ("full", "f_logit", "pair_content", "pair_topology")
-_SCORES_META_VERSION = "egostitch_e2e_scores_v3"
+_EGOSTITCH_E2E_ARRAY_KEYS = ("full", "f_logit")
+_SCORES_META_VERSION = "egostitch_e2e_scores_v4"
+#: The one prior scores-meta version whose artifacts remain readable. v3
+#: artifacts additionally carry ``pair_content``/``pair_topology`` (the
+#: now-deleted content-path decomposition arms); v4 never writes them. Both
+#: versions are accepted on read so existing v3 artifacts keep loading; only
+#: v4 is ever written by :func:`save_scores`.
+_LEGACY_E2E_SCORES_META_VERSION = "egostitch_e2e_scores_v3"
+_SUPPORTED_E2E_SCORES_META_VERSIONS = (_SCORES_META_VERSION, _LEGACY_E2E_SCORES_META_VERSION)
 _SCAFFOLD_CONTROL_NONE = "none"
 _SCAFFOLD_CONTROL_SHUFFLE_V3 = "shuffle_within_pair_v3"
 _SCAFFOLD_CONTROL_REWIRE_V1 = "rewire_checkerboard_v1"
@@ -119,12 +130,30 @@ _TEST_ACCESS_LEDGER_SCHEMA = "egostitch_test_access_v1"
 
 
 def _e2e_primary_logit_key(permanent_null: str) -> str:
-    """Return the published primary-logit array for an e2e permanent-null arm."""
-    return {
-        "none": "full",
-        "all_head": "f_logit",
-        "content_head": "pair_topology",
-    }[permanent_null]
+    """Return the published primary-logit array for an e2e permanent-null arm.
+
+    Raises:
+        ValueError: On ``"content_head"``. Legacy v3 artifacts from the retired
+            ``pair_topology`` arm carry that null and a ``pair_topology``
+            primary logit; the arm went away with the content path (design
+            2026-08-02 §9) and is not supported for validation or merge. This
+            says so, rather than letting the lookup raise a bare ``KeyError``
+            from inside precision validation.
+    """
+    if permanent_null == "content_head":
+        raise ValueError(
+            "permanent_null 'content_head' belongs to the retired pair_topology arm, "
+            "removed with the content path (design 2026-08-02 §9). Legacy v3 artifacts "
+            "from that arm cannot be validated or merged; re-score from a current "
+            "checkpoint. Other v3 arms still load."
+        )
+    try:
+        return {
+            "none": "full",
+            "all_head": "f_logit",
+        }[permanent_null]
+    except KeyError:
+        raise ValueError(f"unknown egostitch_e2e permanent_null: {permanent_null!r}") from None
 
 
 def _reject_superseded_scaffold_control(scaffold_control: str) -> None:
@@ -176,10 +205,13 @@ class ScoresArtifact:
         meta: Parsed artifact metadata (the pinned seven keys).
         f_logit: Shape ``(n,)`` float32 ``egostitch_e2e`` frozen-topology arm;
             ``None`` for every other family or artifact vintage.
-        pair_content: Shape ``(n,)`` float32 ``egostitch_e2e`` content-only arm;
-            ``None`` for every other family or artifact vintage.
-        pair_topology: Shape ``(n,)`` float32 ``egostitch_e2e`` topology-only arm;
-            ``None`` for every other family or artifact vintage.
+        pair_content: Shape ``(n,)`` float32 ``egostitch_e2e`` content-only arm.
+            Populated only when loading a legacy v3 artifact (content path
+            removed rev 4); ``None`` for every v4 artifact, and for every
+            other family.
+        pair_topology: Shape ``(n,)`` float32 ``egostitch_e2e`` topology-only
+            arm. Populated only when loading a legacy v3 artifact; ``None``
+            for every v4 artifact, and for every other family.
         full_logit: Optional shape ``(n,)`` float32 true full e2e arm. Present
             when ``logit`` stores a permanent-null primary instead.
     """
@@ -289,8 +321,8 @@ def validate_score_precision(
 
     Raises:
         ValueError: If an EgoStitch-E2E artifact lacks or contradicts its
-            pinned pair-pass fp32 contract, is missing one of the four
-            decomposition arrays, or its stored diagnostics are inconsistent;
+            pinned pair-pass fp32 contract, is missing its ``f_logit``
+            decomposition array, or its stored diagnostics are inconsistent;
             or if the artifact belongs to the retired frozen-s0 ``egostitch``
             family, whose validator was removed with its scorer.
     """
@@ -341,8 +373,8 @@ def validate_artifact_precision(artifact: ScoresArtifact, *, label: str = "artif
 
     Raises:
         ValueError: If an EgoStitch-E2E artifact lacks or contradicts its
-            pinned pair-pass fp32 contract, is missing one of the four
-            decomposition arrays, or its stored diagnostics are inconsistent.
+            pinned pair-pass fp32 contract, is missing its ``f_logit``
+            decomposition array, or its stored diagnostics are inconsistent.
     """
     validate_test_access_ledger_binding(artifact.meta, label=label)
     extra_arrays: dict[str, NDArray[np.float32]] = {}
@@ -503,7 +535,7 @@ def _validate_egostitch_e2e_precision(
     require_diagnostics: bool,
     extra_arrays: Mapping[str, NDArray[np.float32]],
 ) -> None:
-    """Validate the ``egostitch_e2e`` four-array pair-pass fp32 contract.
+    """Validate the ``egostitch_e2e`` two-array pair-pass fp32 contract.
 
     Args:
         logit: The published primary arm array.
@@ -511,13 +543,16 @@ def _validate_egostitch_e2e_precision(
         label: Human-readable artifact label used in errors.
         require_diagnostics: Require the persisted per-array descriptive diagnostics.
         extra_arrays: The non-primary diagnostic arrays, including
-            ``full_logit`` when the primary arm is permanently nulled.
+            ``full_logit`` when the primary arm is permanently nulled. May
+            also carry the legacy ``pair_content``/``pair_topology`` arrays
+            from a v3 artifact; those are ignored here (rev 4 has no content
+            path), but their presence does not raise.
 
     Raises:
         ValueError: If the artifact lacks or contradicts the pinned
-            ``egostitch_e2e_pair_fp32_v1`` contract, is missing one of the four
-            decomposition arrays, or its stored per-array diagnostics are
-            inconsistent.
+            ``egostitch_e2e_pair_fp32_v1`` contract, is missing its
+            ``f_logit`` decomposition array, or its stored per-array
+            diagnostics are inconsistent.
     """
     precision = meta.get("score_precision")
     if not isinstance(precision, dict):
@@ -551,23 +586,19 @@ def _validate_egostitch_e2e_precision(
     arrays: dict[str, NDArray[np.float32]] = {
         "full": full,
         "f_logit": extra_arrays.get("f_logit", logit),
-        "pair_content": extra_arrays.get("pair_content", logit),
-        "pair_topology": extra_arrays.get("pair_topology", logit),
     }
     if primary_logit != "full":
         if "full_logit" not in extra_arrays:
             raise ValueError(f"{label}: permanent-null e2e artifact requires full_logit")
         if not np.array_equal(logit, arrays[str(primary_logit)]):
             raise ValueError(f"{label}: logit does not equal its declared primary_logit arm")
-    missing = [
-        key for key in ("f_logit", "pair_content", "pair_topology") if key not in extra_arrays
-    ]
+    missing = [key for key in ("f_logit",) if key not in extra_arrays]
     if missing:
         raise ValueError(
             f"{label}: EgoStitch-E2E artifact is missing arrays: {missing}. "
-            "These arrays may already be present on the loaded ScoresArtifact "
-            "(as f_logit/pair_content/pair_topology) even though this call did "
-            "not pass them as extra_arrays; callers that only have a "
+            "This array may already be present on the loaded ScoresArtifact "
+            "(as f_logit) even though this call did "
+            "not pass it as extra_arrays; callers that only have a "
             "ScoresArtifact should use validate_artifact_precision(artifact, "
             "label=...) instead of calling validate_score_precision(logit, ...) "
             "directly."
@@ -625,11 +656,15 @@ def save_scores(
             :func:`_is_heldout_universe`); any caller-supplied ``heldout`` value
             is overwritten.
         f_logit: For family ``egostitch_e2e`` only: the frozen-topology arm,
-            shape ``(n,)`` float32. Required (with `pair_content` and
-            `pair_topology`) when `meta`'s ``model_family`` is
+            shape ``(n,)`` float32. Required when `meta`'s ``model_family`` is
             ``egostitch_e2e``; ignored otherwise.
-        pair_content: For family ``egostitch_e2e`` only: the content-only arm.
-        pair_topology: For family ``egostitch_e2e`` only: the topology-only arm.
+        pair_content: Deleted-content-path compatibility parameter. Content
+            path removed rev 4 (design doc §9) -- new artifacts never write
+            it. Must be ``None``; a non-``None`` value raises.
+        pair_topology: Deleted-content-path compatibility parameter, same
+            contract as `pair_content`. With content gone, ``pair_topology``
+            would be numerically identical to `full`, so it is retired
+            rather than kept as a redundant write.
         full_logit: For a permanent-null ``egostitch_e2e`` primary only: the
             true full-arm diagnostic. New artifacts always physically publish
             it as ``full``; this argument remains optional when `logit` carries
@@ -637,11 +672,19 @@ def save_scores(
 
     Raises:
         ValueError: If array lengths disagree, indices fall outside `node_ids`,
-            `row_start` is negative, `meta` is missing pinned keys, an
-            ``egostitch_e2e`` artifact violates the pair-pass fp32 provenance
-            contract, or an ``egostitch_e2e`` artifact is missing one of the
-            three extra decomposition arrays.
+            `row_start` is negative, `meta` is missing pinned keys, `pair_content`
+            or `pair_topology` is supplied (non-``None``), an ``egostitch_e2e``
+            artifact violates the pair-pass fp32 provenance contract, or an
+            ``egostitch_e2e`` artifact is missing its `f_logit` array.
     """
+    if pair_content is not None or pair_topology is not None:
+        raise ValueError(
+            f"{path}: pair_content/pair_topology are retired with the content path "
+            "(design doc §9) and must not be supplied to save_scores; new "
+            "egostitch_e2e artifacts publish only full/f_logit. Legacy v3 "
+            "artifacts that already carry these two arrays remain readable "
+            "via load_scores/merge_scores."
+        )
     n = len(logit)
     if not (len(u_idx) == len(v_idx) == len(label) == n):
         raise ValueError(
@@ -650,8 +693,6 @@ def save_scores(
         )
     for name, arr in (
         ("f_logit", f_logit),
-        ("pair_content", pair_content),
-        ("pair_topology", pair_topology),
         ("full_logit", full_logit),
     ):
         if arr is not None and len(arr) != n:
@@ -672,16 +713,9 @@ def save_scores(
     stored_meta["heldout"] = _is_heldout_universe(stored_meta)
     if stored_meta.get("model_family") == "egostitch_e2e":
         stored_meta["scores_meta_version"] = _SCORES_META_VERSION
-        if f_logit is None or pair_content is None or pair_topology is None:
-            raise ValueError(
-                f"{path}: egostitch_e2e artifacts require f_logit, pair_content, "
-                "and pair_topology arrays"
-            )
-        extra_arrays = {
-            "f_logit": f_logit,
-            "pair_content": pair_content,
-            "pair_topology": pair_topology,
-        }
+        if f_logit is None:
+            raise ValueError(f"{path}: egostitch_e2e artifacts require an f_logit array")
+        extra_arrays = {"f_logit": f_logit}
         if full_logit is not None:
             extra_arrays["full_logit"] = full_logit
         validate_score_precision(
@@ -696,8 +730,6 @@ def save_scores(
             for key, arr in {
                 "full": full_logit if full_logit is not None else logit,
                 "f_logit": f_logit,
-                "pair_content": pair_content,
-                "pair_topology": pair_topology,
             }.items()
         }
         validate_score_precision(
@@ -708,7 +740,7 @@ def save_scores(
         )
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    if f_logit is None and pair_content is None and pair_topology is None and full_logit is None:
+    if f_logit is None and full_logit is None:
         np.savez_compressed(
             path,
             node_ids=np.array(list(node_ids), dtype=np.str_),
@@ -720,10 +752,10 @@ def save_scores(
             meta=np.array(json.dumps(stored_meta, sort_keys=True)),
         )
     else:
-        # egostitch_e2e (the only family reaching here): all three companion
-        # arrays are required; the true full arm is either `logit` or the
-        # explicit `full_logit` array when a permanent null is primary.
-        assert f_logit is not None and pair_content is not None and pair_topology is not None
+        # egostitch_e2e (the only family reaching here): f_logit is required;
+        # the true full arm is either `logit` or the explicit `full_logit`
+        # array when a permanent null is primary.
+        assert f_logit is not None
         arrays: dict[str, Any] = {
             "node_ids": np.array(list(node_ids), dtype=np.str_),
             "u_idx": u_idx.astype(np.int32, copy=False),
@@ -736,8 +768,6 @@ def save_scores(
                 np.float32, copy=False
             ),
             "f_logit": f_logit.astype(np.float32, copy=False),
-            "pair_content": pair_content.astype(np.float32, copy=False),
-            "pair_topology": pair_topology.astype(np.float32, copy=False),
         }
         if full_logit is not None:
             arrays["full_logit"] = full_logit.astype(np.float32, copy=False)
@@ -762,10 +792,13 @@ def _load_shard(path: Path) -> _Shard:
         row_start = int(data["row_start"][()])
         meta = cast(dict[str, object], json.loads(str(data["meta"][()])))
         current_e2e = meta.get("model_family") == "egostitch_e2e"
-        if current_e2e and meta.get("scores_meta_version") != _SCORES_META_VERSION:
+        scores_meta_version_ok = (
+            meta.get("scores_meta_version") in _SUPPORTED_E2E_SCORES_META_VERSIONS
+        )
+        if current_e2e and not scores_meta_version_ok:
             raise ValueError(
-                f"{path}: scores_meta_version must be {_SCORES_META_VERSION!r}; "
-                f"got {meta.get('scores_meta_version')!r}"
+                f"{path}: scores_meta_version must be one of "
+                f"{_SUPPORTED_E2E_SCORES_META_VERSIONS!r}; got {meta.get('scores_meta_version')!r}"
             )
         if current_e2e and "full" not in data:
             raise ValueError(f"{path}: formal egostitch_e2e artifact is missing full")
@@ -952,14 +985,30 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
 
     extra: dict[str, NDArray[np.float32]] = {}
     if reference.meta.get("model_family") == "egostitch_e2e":
-        for name in ("f_logit", "pair_content", "pair_topology"):
-            parts = [getattr(shard, name) for shard in ordered]
-            if any(part is None for part in parts):
+        f_logit_parts = [shard.f_logit for shard in ordered]
+        if any(part is None for part in f_logit_parts):
+            raise ValueError(
+                "egostitch_e2e merge requires 'f_logit' in every shard "
+                f"(files: {[str(shard.path) for shard in ordered]})"
+            )
+        extra["f_logit"] = np.concatenate(cast(list[NDArray[np.float32]], f_logit_parts))
+        # pair_content/pair_topology are the retired content-path arrays
+        # (design doc §9): a v4 shard never carries them (all None here), a
+        # legacy v3 shard always does (save_scores required all three
+        # together at v3 write time). Mixing the two vintages in one merge
+        # is already rejected above by the scores_meta_version equality
+        # check, so "all present" vs. "all absent" are the only two shapes
+        # that can reach this point; the mixed branch is a defensive
+        # fail-closed guard, not an expected path.
+        for name in ("pair_content", "pair_topology"):
+            legacy_parts = [getattr(shard, name) for shard in ordered]
+            if all(part is not None for part in legacy_parts):
+                extra[name] = np.concatenate(cast(list[NDArray[np.float32]], legacy_parts))
+            elif any(part is not None for part in legacy_parts):
                 raise ValueError(
-                    f"egostitch_e2e merge requires {name!r} in every shard "
+                    f"egostitch_e2e merge has inconsistent {name!r} presence across shards "
                     f"(files: {[str(shard.path) for shard in ordered]})"
                 )
-            extra[name] = np.concatenate(cast(list[NDArray[np.float32]], parts))
         full_parts = [shard.full_logit for shard in ordered]
         if any(part is not None for part in full_parts):
             if any(part is None for part in full_parts):
@@ -1146,8 +1195,6 @@ def _load_checkpoint(
         model_state = cast(dict[str, torch.Tensor], checkpoint)
 
     if model_family == "egostitch_e2e":
-        from src.model.egostitch.config import e2e_checkpoint_config
-
         scaffold_embed = model_state.get("ste.embed.weight")
         if (
             isinstance(scaffold_embed, torch.Tensor)
@@ -1160,10 +1207,11 @@ def _load_checkpoint(
                 "are not loadable under rev-3.1 code and must be scored from a "
                 "pre-rev-3.1 commit"
             )
-        model_config = e2e_checkpoint_config(
-            model_config,
-            has_rel_head=any(key.startswith("rel_head.") for key in model_state),
-        )
+        # No checkpoint-config normalization: the rev-3.1 backfills were deleted
+        # with the content path (design 2026-08-02 §11), so a checkpoint must
+        # carry its own complete model config. One that does not fails loudly at
+        # the strict `load_state_dict` below rather than being reconstructed
+        # under a config it was never trained with.
     model = build_model(model_family, model_config)
     model.load_state_dict(model_state)
     model.eval()
@@ -1649,13 +1697,14 @@ def _score_egostitch_e2e(
     universe_pairs: Sequence[tuple[str, str]] | None = None,
     row_start: int = 0,
 ) -> dict[str, NDArray[np.float32]]:
-    """Score pairs with an `EgoStitchE2E` model's four-logit decomposition.
+    """Score pairs with an `EgoStitchE2E` model's two-logit decomposition.
 
     Encodes each unique node exactly once, caches its raw-token/generator state
     on CPU, then builds one shared pair context per pair batch and applies the
-    four hard-bypass heads to that context. The complete cache and pair passes
-    are pinned to fp32 by ``egostitch_e2e_pair_fp32_v1``; autocast is always
-    disabled for this family, regardless of any future `--amp` wiring.
+    two hard-bypass heads to that context (content path removed rev 4, design
+    doc §9). The complete cache and pair passes are pinned to fp32 by
+    ``egostitch_e2e_pair_fp32_v1``; autocast is always disabled for this
+    family, regardless of any future `--amp` wiring.
 
     Each batch is assembled with real grounding-pool candidates (spec Sec
     13.12) via the `build_f0_matrix`/`build_grounding_pool` loader:
@@ -1684,9 +1733,8 @@ def _score_egostitch_e2e(
         row_start: Global start row of `pairs` within `universe_pairs`.
 
     Returns:
-        Dict with keys ``full``, ``f_logit``, ``pair_content``, and
-        ``pair_topology``, each a shape ``(len(pairs),)`` float32 array in
-        input row order.
+        Dict with keys ``full`` and ``f_logit``, each a shape ``(len(pairs),)``
+        float32 array in input row order.
     """
     from src.data.grounding import build_grounding_pool
     from src.model.egostitch.e2e_model import E2ENodeState, EgoStitchE2E
@@ -2144,8 +2192,6 @@ def _run_score(args: argparse.Namespace) -> None:
         }
     }
     f_logit: NDArray[np.float32] | None = None
-    pair_content: NDArray[np.float32] | None = None
-    pair_topology: NDArray[np.float32] | None = None
     full_logit: NDArray[np.float32] | None = None
     score_started = perf_counter()
     if model_family == "v3_1":
@@ -2200,8 +2246,6 @@ def _run_score(args: argparse.Namespace) -> None:
         if primary_logit != "full":
             full_logit = decomposed["full"]
         f_logit = decomposed["f_logit"]
-        pair_content = decomposed["pair_content"]
-        pair_topology = decomposed["pair_topology"]
         meta_extra = {
             "score_precision": {
                 "contract": _EGOSTITCH_E2E_PAIR_PRECISION_CONTRACT,
@@ -2254,8 +2298,6 @@ def _run_score(args: argparse.Namespace) -> None:
         row_start=start,
         meta=meta,
         f_logit=f_logit,
-        pair_content=pair_content,
-        pair_topology=pair_topology,
         full_logit=full_logit,
     )
     logger.info("wrote %d scored rows to %s", len(row_pairs), output)
@@ -2274,8 +2316,6 @@ def _run_merge(args: argparse.Namespace) -> None:
         row_start=0,
         meta=merged.meta,
         f_logit=merged.f_logit,
-        pair_content=merged.pair_content,
-        pair_topology=merged.pair_topology,
         full_logit=merged.full_logit,
     )
     logger.info(

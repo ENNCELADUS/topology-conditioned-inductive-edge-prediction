@@ -15,11 +15,8 @@ from collections.abc import Callable, Sequence
 from typing import NamedTuple
 
 import torch
-from torch import nn
-from torch.nn import functional as F
 
 from src.model.egostitch.imagine import SlotSet
-from src.model.egostitch.layers import stable_log
 
 N_ANCHOR_TYPES = 4
 FEAT_DIM = 11
@@ -296,42 +293,6 @@ def make_scaffold_input_perturbation(
     return perturb
 
 
-def counterpart_membership(
-    slots: SlotSet, other_proj: torch.Tensor, tau_kappa: torch.Tensor
-) -> torch.Tensor:
-    """Return each slot's compatibility with the counterpart endpoint."""
-    slot_direction = F.normalize(slots.h, p=2.0, dim=-1)
-    other_direction = F.normalize(other_proj, p=2.0, dim=-1)
-    distance = (slot_direction - other_direction[:, None, :]).square().sum(dim=-1)
-    return -distance / tau_kappa + stable_log(slots.pi * slots.mult)
-
-
-def grounded_identity_match(
-    pointer_a: torch.Tensor,
-    gate_a: torch.Tensor,
-    ids_a: torch.Tensor,
-    pointer_b: torch.Tensor,
-    gate_b: torch.Tensor,
-    ids_b: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the differentiable soft matched flags from spec §14.4.2.
-
-    Disjoint grounding pools make the shared-id indicator zero, so both
-    outputs and their pointer/gate gradients are exactly zero rather than NaN.
-    With near-uniform untrained pointers, ``M`` is approximately
-    ``|pool overlap| / n_g²`` and the ``L_edge``-through-content gradient to
-    the pointer vanishes at initialization. B2 only repairs the gradient
-    plumbing; ``L_ptr`` and the pos-weighted ``L_gate`` do the training work.
-    """
-    shared_ids = (ids_a[:, :, None] == ids_b[:, None, :]).to(pointer_a.dtype)
-    match_probability = torch.einsum(
-        "bkg,bgh,blh->bkl", pointer_a, shared_ids, pointer_b
-    )
-    matched_a = gate_a * (match_probability * gate_b[:, None, :]).amax(dim=-1)
-    matched_b = gate_b * (match_probability * gate_a[:, :, None]).amax(dim=1)
-    return matched_a, matched_b
-
-
 def build_scaffold(
     slots_src: SlotSet,
     slots_dst: SlotSet,
@@ -450,94 +411,3 @@ def swap_direction(tokens: ScaffoldTokens) -> ScaffoldTokens:
     feats = tokens.feats.clone()
     feats[..., :N_ANCHOR_TYPES] = tokens.feats[..., perm]
     return ScaffoldTokens(feats=feats, adj=tokens.adj)
-
-
-def build_content_tokens(
-    slots_src: SlotSet,
-    slots_dst: SlotSet,
-    matched_src: torch.Tensor,
-    matched_dst: torch.Tensor,
-    membership_src: torch.Tensor,
-    membership_dst: torch.Tensor,
-) -> torch.Tensor:
-    """Content tokens: ``[h; pi; gate; identity-match; membership]``.
-
-    Args:
-        slots_src: Source-side generated slot set (spec Sec 2 heads).
-        slots_dst: Destination-side generated slot set.
-        matched_src: Shape ``(B, K)`` grounded-identity-match signal in
-            ``[0, 1]`` for the source-side slots (moved here from the anchor
-            labels per rev 3).
-        matched_dst: Shape ``(B, K)`` grounded-identity-match signal in
-            ``[0, 1]`` for the destination-side slots.
-        membership_src: Shape ``(B, K)`` counterpart-membership compatibility
-            for source-side slots (former-s1 per-slot signal).
-        membership_dst: Shape ``(B, K)`` counterpart-membership compatibility
-            for destination-side slots.
-
-    Returns:
-        Shape ``(B, 2K, d_p + 4)`` content tokens, src slots first.
-    """
-    b, k = slots_src.pi.shape
-    if slots_dst.pi.shape != (b, k):
-        raise ValueError(
-            "content sides require equal slot counts and batch size: "
-            f"{tuple(slots_src.pi.shape)} != {tuple(slots_dst.pi.shape)}"
-        )
-    named = {
-        "matched_src": matched_src,
-        "matched_dst": matched_dst,
-        "membership_src": membership_src,
-        "membership_dst": membership_dst,
-    }
-    for name, value in named.items():
-        if value.shape != (b, k):
-            raise ValueError(f"{name} shape must be {(b, k)}, got {tuple(value.shape)}")
-
-    def side(s: SlotSet, matched: torch.Tensor, membership: torch.Tensor) -> torch.Tensor:
-        out: torch.Tensor = torch.cat(
-            [
-                s.h,
-                s.pi[..., None],
-                s.gate[..., None],
-                matched[..., None],
-                membership[..., None],
-            ],
-            dim=-1,
-        )
-        return out
-
-    return torch.cat(
-        [
-            side(slots_src, matched_src, membership_src),
-            side(slots_dst, matched_dst, membership_dst),
-        ],
-        dim=1,
-    )
-
-
-class ContentProjector(nn.Module):
-    """Linear projection of content tokens into the trunk width."""
-
-    def __init__(self, d_p: int, d_model: int) -> None:
-        """Build the content-token linear projection.
-
-        Args:
-            d_p: Slot content embedding dimension (pre-projection width less
-                the 4 scalar channels).
-            d_model: Trunk model width to project into.
-        """
-        super().__init__()
-        self.proj = nn.Linear(d_p + 4, d_model)
-
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Project content tokens ``(B, 2K, d_p + 4)`` to ``(B, 2K, d_model)``.
-
-        Args:
-            tokens: Content tokens produced by :func:`build_content_tokens`.
-
-        Returns:
-            Shape ``(B, 2K, d_model)`` projected tokens.
-        """
-        out: torch.Tensor = self.proj(tokens)
-        return out

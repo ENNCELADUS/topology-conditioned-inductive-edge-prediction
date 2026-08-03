@@ -29,24 +29,19 @@ _TINY = EgoStitchConfig(
 
 # The frozen random GIN and the rev-3.1-only pointer head legitimately receive
 # no gradient under the standalone family's frozen Section-13 objective.
-_NO_GRAD_PREFIXES = ("random_gin", "imagine.head_pointer")
+# `tokenize.degree_mean_head` fed `d_hat_raw` into `EgoStitchStage1.d_hat()`,
+# which was consumed only by the retired `pair_outputs`/`self_outputs`
+# decision-fusion methods (deleted alongside `decision.py`, three-component
+# refactor design §9). It was already unreachable from `EgoStitchE2E`'s own
+# forward path (which never called `pair_outputs`/`self_outputs`/`d_hat`), so
+# this does not change any live e2e training gradient -- only this isolated
+# standalone-class unit test's coverage.
+_NO_GRAD_PREFIXES = ("random_gin", "imagine.head_pointer", "tokenize.degree_mean_head")
 
 
 def _model(seed: int = 0) -> EgoStitchStage1:
     torch.manual_seed(seed)
     return EgoStitchStage1(_TINY)
-
-
-def _pair_batch(batch: int = 3, *, seed: int = 0) -> dict[str, torch.Tensor]:
-    gen = torch.Generator().manual_seed(seed)
-    return {
-        "x_i": torch.randn(batch, _TINY.input_dim, generator=gen),
-        "x_j": torch.randn(batch, _TINY.input_dim, generator=gen),
-        "ground_i": torch.randn(batch, _TINY.n_ground, _TINY.input_dim, generator=gen),
-        "ground_j": torch.randn(batch, _TINY.n_ground, _TINY.input_dim, generator=gen),
-        "s0": torch.randn(batch, generator=gen),
-        "label": (torch.rand(batch, generator=gen) > 0.5).long(),
-    }
 
 
 def _node_batch(batch: int = 4, *, seed: int = 1) -> dict[str, torch.Tensor]:
@@ -71,7 +66,15 @@ def _node_batch(batch: int = 4, *, seed: int = 1) -> dict[str, torch.Tensor]:
     }
 
 
-class TestForwardContract:
+class TestFeatureNormalization:
+    """Feature-normalization surface of `EgoStitchStage1`.
+
+    Its own `(s0, s1, s2)` forward contract (`pair_outputs`/`self_outputs`/
+    `forward`) belonged to the retired frozen-s0 `egostitch` scorer and was
+    removed with `decision.py` (three-component refactor design §9); only
+    the feature-normalization surface below survives.
+    """
+
     def test_legacy_generator_keeps_raw_feature_semantics(self) -> None:
         model = _model()
         x = 25.0 + 7.0 * torch.randn(3, _TINY.input_dim)
@@ -91,31 +94,6 @@ class TestForwardContract:
         )
         assert tuple(model.feature_norm.parameters()) == ()
         torch.testing.assert_close(model.project_features(x), model.proj(normalized))
-
-    def test_pair_batch_logits_and_loss(self) -> None:
-        model = _model()
-        out = model(_pair_batch())
-        assert out["logits"].shape == (3,)
-        assert bool(torch.isfinite(out["logits"]).all())
-        assert "loss" in out
-        assert float(out["loss"].detach()) > 0.0
-
-    def test_self_batch_routes_single_ego_path(self) -> None:
-        model = _model()
-        batch = _pair_batch()
-        self_batch = {"x_i": batch["x_i"], "ground_i": batch["ground_i"], "s0": batch["s0"]}
-        out = model(self_batch)
-        assert out["logits"].shape == (3,)
-        assert "loss" not in out
-
-    def test_deterministic_in_eval(self) -> None:
-        model = _model()
-        model.eval()
-        batch = _pair_batch()
-        with torch.no_grad():
-            first = model(batch)["logits"]
-            second = model(batch)["logits"]
-        torch.testing.assert_close(first, second)
 
 
 class TestNodeLosses:
@@ -192,10 +170,15 @@ class TestGradientFlow:
             torch.randn_like(node["ground_x"]),
             noise=_TINY.ssl_noise_sigma * torch.randn_like(node["x"]),
         )
-        edge = model(_pair_batch())["loss"]
+        # `EgoStitchStage1` no longer scores an edge stream itself (its own
+        # `forward`/decision fusion was removed with `decision.py`, design
+        # §9); `L_edge` is now entirely the pair classifier's responsibility
+        # (`EgoStitchE2E`/`train_egostitch.py`). A constant, non-grad zero
+        # stands in for `stage1_total`'s required `edge` argument so this
+        # test still exercises gradient flow through every *other* family.
         total, _ = stage1_total(
             _TINY,
-            edge=edge,
+            edge=torch.zeros(()),
             recon=losses.recon,
             deg=losses.deg,
             real_egostat=losses.real_egostat,
@@ -212,15 +195,3 @@ class TestGradientFlow:
             if param.grad is None or not bool(torch.isfinite(param.grad).all()):
                 missing.append(name)
         assert missing == []
-
-    def test_s0_receives_no_gradient(self) -> None:
-        model = _model()
-        batch = _pair_batch()
-        batch["s0"] = batch["s0"].clone().requires_grad_(True)
-        out = model(batch)
-        out["loss"].backward()
-        # s0 is a graph leaf here, so it *would* get a pass-through gradient of
-        # d loss/d logit — the cache design (spec Sec 13.10) never exposes a
-        # trainable s0; this documents that the head adds, not transforms, s0.
-        assert batch["s0"].grad is not None
-        assert bool(torch.isfinite(batch["s0"].grad).all())

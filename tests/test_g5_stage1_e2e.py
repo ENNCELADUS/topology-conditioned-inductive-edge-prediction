@@ -1,4 +1,4 @@
-"""E2E liveness and eight-arm gate contracts."""
+"""E2E liveness and seven-arm gate contracts."""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ def _d(x: object) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- e2e family:
-# within-checkpoint liveness + eight-arm summary (Task 11)
+# within-checkpoint liveness + seven-arm summary (Task 11)
 
 
 class TestWithinCheckpointLivenessGuard:
@@ -151,8 +151,6 @@ def _write_e2e_universe_npz(
     pairs: list[tuple[str, str]],
     full: np.ndarray,
     f_logit: np.ndarray,
-    pair_content: np.ndarray,
-    pair_topology: np.ndarray,
     labels: np.ndarray,
     strategy: str = "toy",
     checkpoint_id: str = "e2e0",
@@ -161,7 +159,7 @@ def _write_e2e_universe_npz(
     primary_logit: str = "full",
     scoring_arm: str = "full",
 ) -> None:
-    """Write a toy family-``egostitch_e2e`` four-array scores artifact."""
+    """Write a toy family-``egostitch_e2e`` two-array scores artifact."""
     access = score_universe._TestAccessContext(
         ledger_path=path.parent / "test_access_ledger.jsonl",
         scoring_arm=scoring_arm,
@@ -203,8 +201,6 @@ def _write_e2e_universe_npz(
     arrays = {
         "full": full,
         "f_logit": f_logit,
-        "pair_content": pair_content,
-        "pair_topology": pair_topology,
     }
     save_scores(
         path,
@@ -216,8 +212,6 @@ def _write_e2e_universe_npz(
         row_start=0,
         meta=meta,
         f_logit=f_logit.astype(np.float32),
-        pair_content=pair_content.astype(np.float32),
-        pair_topology=pair_topology.astype(np.float32),
         full_logit=full.astype(np.float32) if primary_logit != "full" else None,
     )
 
@@ -245,8 +239,6 @@ def _rewrite_e2e_artifact(
         row_start=0,
         meta=artifact.meta,
         f_logit=artifact.f_logit,
-        pair_content=artifact.pair_content,
-        pair_topology=artifact.pair_topology,
         full_logit=artifact.full_logit,
     )
     if meta is not None:
@@ -463,15 +455,13 @@ def _write_trained_arm_metadata(
     return meta_path
 
 
-def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
-    """Toy benchmark + eight E2E arm universes + six trained-run metadata records."""
+def _seven_arm_inputs(tmp_path: Path) -> dict[str, Any]:
+    """Toy benchmark + seven E2E arm universes + five trained-run metadata records."""
     _b0_universe_path, _val_path, data_root = _b0cal_toy_inputs(tmp_path)
     pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
     rng = np.random.default_rng(42)
     full = rng.normal(size=len(pairs))
     f_logit = rng.normal(size=len(pairs))  # independent of `full` -> alive residual
-    pair_content = rng.normal(size=len(pairs))
-    pair_topology = rng.normal(size=len(pairs))
     candidate_path = data_root / "benchmark_2025_neurips" / "toy" / "candidate_test_edges.txt"
     candidate_path.write_text(
         "".join(
@@ -483,7 +473,6 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
     provenance_by_arm = {
         "full": ("none", "none", "full"),
         "b0_e2e_f_only": ("none", "all_head", "f_logit"),
-        "pair_topology": ("none", "content_head", "pair_topology"),
         "p0": ("none", "none", "full"),
         "no_l_rel": ("none", "none", "full"),
         "row_layernorm": ("none", "none", "full"),
@@ -501,8 +490,6 @@ def _eight_arm_inputs(tmp_path: Path) -> dict[str, Any]:
             pairs=pairs,
             full=full,
             f_logit=f_logit,
-            pair_content=pair_content,
-            pair_topology=pair_topology,
             labels=labels,
             checkpoint_id=checkpoint_id,
             scaffold_control=scaffold_control,
@@ -596,8 +583,8 @@ def _markdown_table(markdown: str, heading: str) -> dict[str, dict[str, str]]:
 
 
 class TestBuildE2EArmSummary:
-    def test_all_eight_arms_reported_and_rerun_is_deterministic(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
+    def test_all_seven_arms_reported_and_rerun_is_deterministic(self, tmp_path: Path) -> None:
+        inputs = _seven_arm_inputs(tmp_path)
         payload = g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
         arms = _d(payload["arms"])
@@ -618,38 +605,34 @@ class TestBuildE2EArmSummary:
         decomposition = _d(payload["decomposition"])
         assert set(_d(decomposition["arms"])) == set(g5_stage1._ALL_ARMS)
         full_deltas = _d(_d(_d(decomposition["arms"])["full"])["deltas"])
-        assert set(full_deltas) == {
-            "full_minus_f_logit",
-            "topology_delta_full_minus_pair_content",
-            "content_delta_full_minus_pair_topology",
-        }
+        assert set(full_deltas) == {"full_minus_f_logit"}
         rerun = g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
         assert json.dumps(payload, sort_keys=True) == json.dumps(rerun, sort_keys=True)
 
     def test_rejects_unknown_arm(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
+        inputs = _seven_arm_inputs(tmp_path)
         inputs["arm_universe_paths"] = dict(inputs["arm_universe_paths"])
         inputs["arm_universe_paths"]["bogus"] = inputs["arm_universe_paths"]["full"]
         with pytest.raises(ValueError, match="unrecognized"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
     def test_requires_full_arm(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
+        inputs = _seven_arm_inputs(tmp_path)
         inputs["arm_universe_paths"] = {
             k: v for k, v in inputs["arm_universe_paths"].items() if k != "full"
         }
         with pytest.raises(ValueError, match="'full' arm is required"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
-    def test_requires_exact_eight_arm_set(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
+    def test_requires_exact_seven_arm_set(self, tmp_path: Path) -> None:
+        inputs = _seven_arm_inputs(tmp_path)
         inputs["arm_universe_paths"] = dict(inputs["arm_universe_paths"])
         inputs["arm_universe_paths"].pop("p0")
-        with pytest.raises(ValueError, match="exactly the eight registered arms"):
+        with pytest.raises(ValueError, match="exactly the seven registered arms"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
     def test_rejects_candidate_pair_order_swap(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
+        inputs = _seven_arm_inputs(tmp_path)
         path = _d(inputs["arm_universe_paths"])["p0"]
         artifact = load_scores(path)
         pairs = list(artifact.pairs())
@@ -661,7 +644,7 @@ class TestBuildE2EArmSummary:
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
     def test_rejects_candidate_label_mutation(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
+        inputs = _seven_arm_inputs(tmp_path)
         path = _d(inputs["arm_universe_paths"])["p0"]
         artifact = load_scores(path)
         labels = artifact.label.copy()
@@ -680,7 +663,7 @@ class TestBuildE2EArmSummary:
         here against the current post-excision fixtures rather than the
         deleted registration-based ones.
         """
-        inputs = _eight_arm_inputs(tmp_path)
+        inputs = _seven_arm_inputs(tmp_path)
         pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
         rng = np.random.default_rng(123)
         _write_e2e_universe_npz(
@@ -689,8 +672,6 @@ class TestBuildE2EArmSummary:
             pairs=pairs,
             full=rng.normal(size=len(pairs)),
             f_logit=rng.normal(size=len(pairs)),
-            pair_content=rng.normal(size=len(pairs)),
-            pair_topology=rng.normal(size=len(pairs)),
             labels=labels,
             checkpoint_id="ckpt_not_full",
             scaffold_control="shuffle_within_pair_v3",
@@ -708,7 +689,7 @@ class TestBuildE2EArmSummary:
         requires it to match the arm slot it was supplied under
         (adversarial-review finding 3).
         """
-        inputs = _eight_arm_inputs(tmp_path)
+        inputs = _seven_arm_inputs(tmp_path)
         paths = _d(inputs["arm_universe_paths"])
         paths["structure_control_6a_v3"], paths["structure_control_6e_v1"] = (
             paths["structure_control_6e_v1"],
@@ -726,7 +707,7 @@ class TestBuildE2EArmSummary:
         full's artifact), so only the scaffold-control arm-semantic check
         catches it (adversarial-review finding 3).
         """
-        inputs = _eight_arm_inputs(tmp_path)
+        inputs = _seven_arm_inputs(tmp_path)
         paths = _d(inputs["arm_universe_paths"])
         paths["structure_control_6a_v3"] = paths["full"]
         with pytest.raises(
@@ -737,7 +718,7 @@ class TestBuildE2EArmSummary:
     def test_missing_submodule_rms_telemetry_does_not_gate_evaluation(
         self, tmp_path: Path
     ) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
+        inputs = _seven_arm_inputs(tmp_path)
         metadata_path = _d(inputs["run_metadata_paths"])["full"]
         metadata = json.loads(metadata_path.read_text())
         del metadata["training_diagnostics"]["gradient_norm_series"][0]["grad_rms_content"]
@@ -745,7 +726,7 @@ class TestBuildE2EArmSummary:
         g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
     def test_nested_worker_submodule_rms_shape_is_accepted(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
+        inputs = _seven_arm_inputs(tmp_path)
         for metadata_path in _d(inputs["run_metadata_paths"]).values():
             metadata = json.loads(metadata_path.read_text())
             row = metadata["training_diagnostics"]["gradient_norm_series"][0]
@@ -762,7 +743,7 @@ def test_formal_gate_reports_rev31_telemetry_without_changing_verdict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The real gate writer must headline all nonbinding rev-3.1 telemetry."""
-    inputs = _eight_arm_inputs(tmp_path)
+    inputs = _seven_arm_inputs(tmp_path)
     data_root = cast(Path, inputs["data_root"])
     b0_universe_path = tmp_path / "universe.npz"
     b0cal_output_dir = tmp_path / "b0cal"
@@ -950,10 +931,10 @@ class TestPairedBootstrap:
 
 
 class TestE2EGateCli:
-    def test_mode_e2e_forwards_exact_eight_arm_contract(
+    def test_mode_e2e_forwards_exact_seven_arm_contract(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
+        inputs = _seven_arm_inputs(tmp_path)
         captured: dict[str, object] = {}
         b0_path = tmp_path / "b0.npz"
         b0cal_path = tmp_path / "b0cal.json"
@@ -978,8 +959,6 @@ class TestE2EGateCli:
                 str(_d(inputs)["arm_universe_paths"]["structure_control_6e_v1"]),
                 "--fonly-universe",
                 str(_d(inputs)["arm_universe_paths"]["b0_e2e_f_only"]),
-                "--pt-universe",
-                str(_d(inputs)["arm_universe_paths"]["pair_topology"]),
                 "--p0-universe",
                 str(_d(inputs)["arm_universe_paths"]["p0"]),
                 "--no-l-rel-universe",
@@ -1003,7 +982,7 @@ class TestE2EGateCli:
         assert captured["probe_artifact_path"] == probe_path
 
     def test_rejects_wrong_model_family(self, tmp_path: Path) -> None:
-        inputs = _eight_arm_inputs(tmp_path)
+        inputs = _seven_arm_inputs(tmp_path)
         wrong_path = tmp_path / "wrong_family.npz"
         pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
         _write_universe_npz(
