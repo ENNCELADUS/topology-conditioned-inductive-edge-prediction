@@ -32,38 +32,9 @@
 # the ground-truth adjacency table rather than calling an F0 encode path
 # that `zscore_vfit_v1`'s statistics-binding step exists to normalize.
 # `row_layernorm` binds no stats digest, so no statistics binding is
-# attempted for this arm either. This is an inference from the task's
-# framing of `oracle_struct`, not a verified read of its (not-yet-written)
-# implementation -- confirm at integration that `oracle_struct` in fact has
-# no feature path that `zscore_vfit_v1` would correctly normalize before
-# treating this as settled.
-#
-# SCHEMA ASSUMPTIONS pending concurrent implementation (verify at
-# integration, spec doc §"Owner decisions flagged, not made"):
-#   - `GeneratorConfig` gains `oracle_seed: int = 0` and registry key
-#     "oracle_struct" in `GENERATOR_REGISTRY`.
-#   - `EncoderConfig` gains `rrwp_k: int`, `n_heads: int`, `seeds: int` and
-#     registry key "grit_gmt" in `ENCODER_REGISTRY`; `dim`/`layers` are
-#     reused fields (96/4 here, not the `ste_typed` 128/3 default).
-#   - `ClassifierConfig` gains `conditioning_mode: str` accepting
-#     "film_logit" / "pooled_adapter" / "xattn_cls" / "xattn_tokens", with a
-#     zero-init null-identity guarantee for the new pathway.
-#   - `_e2e_arm_name_from_config` (`train_egostitch.py:3393-3404`) and its
-#     closed `E2EArmName` Literal (`:686-693`) do not recognize this
-#     generator/encoder pair. As written today, `encoder.w_rel == 0.0` (set
-#     below) is checked *before* the `feature_standardization ==
-#     "row_layernorm"` branch and would misclassify this whole arm as the
-#     legacy `no_l_rel` arm -- silently wrong telemetry/arm-name labeling,
-#     not a parse failure. Needs an oracle/grit-aware arm name before this
-#     config is safe to run for real, not just to parse.
-#   - `training.phase_a_fraction: 0.0` below assumes the trainer's phase
-#     curriculum actually reads `training.phase_a_fraction`/
-#     `phase_b_fraction`. As of the pre-wave-1 code,
-#     `e2e_phase_boundaries` (`train_egostitch.py:706-711`) hardcodes
-#     0.2/0.1 inline and does NOT consult these config fields even though
-#     they parse and validate successfully -- verify the concurrent change
-#     wires them through, or this is a silent no-op and Phase A still runs
-#     for 20% of steps with nothing for `oracle_struct` to pretrain.
+# attempted for this arm. Verified integration: `oracle_struct`, `grit_gmt`,
+# the four conditioning modes, oracle arm naming, and configurable phase
+# fractions are all live; `phase_a_fraction: 0.0` therefore skips Phase A.
 
 model:
   family: egostitch_e2e
@@ -158,7 +129,7 @@ runtime:
   token_budget: 128
   max_pairs_per_rank: 1048576
   memory_limit_gib: 85.0
-  total_budget_seconds: 27720
+  total_budget_seconds: 44520
   pack_budget_seconds: 1200
-  train_eval_budget_seconds: 26400
+  train_eval_budget_seconds: 43200
   artifact_budget_seconds: 120

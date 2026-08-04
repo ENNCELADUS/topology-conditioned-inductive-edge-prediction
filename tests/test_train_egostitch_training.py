@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 import torch
 import yaml  # type: ignore[import-untyped]
+from accelerate import Accelerator
 from src import train_egostitch as te
 from src.model.egostitch.composite import EgoStitchModel
 from src.model.egostitch.config import (
@@ -24,6 +25,7 @@ from src.model.egostitch.config import (
     EncoderConfig,
     GeneratorConfig,
 )
+from src.model.egostitch.generator.oracle import OracleStructGenerator
 
 pytestmark = pytest.mark.unit
 
@@ -495,6 +497,8 @@ def test_e2e_lr_and_active_groups_follow_registered_phase_contract() -> None:
         "generator",
         "encoder",
     }
+    full_model.generator = OracleStructGenerator(slots=16)
+    assert te._e2e_active_groups(phase_c, full_model) == {"classifier", "encoder"}
     full_phase_a_groups = te._e2e_active_groups(phase_a, full_model)
     full_edge_groups = te._e2e_active_groups(first_edge, full_model)
     assert (
@@ -623,14 +627,8 @@ def _record(epoch: int, *, mmd: float, brier: float, auprc: float = 0.6) -> te.E
     )
 
 
-def test_null_generator_arm_trains_with_empty_component_groups() -> None:
-    """The null-generator arm trains through the shared pipeline (Wave 1, 2026-08-04).
-
-    Its `generator` and `encoder` groups are legitimately empty because the
-    components are absent; `build_e2e_parameter_groups` must accept that (the
-    R0 baseline of the oracle-scaffold experiment trains this way) while still
-    routing every classifier parameter into a group.
-    """
+def test_null_generator_has_empty_component_parameter_groups() -> None:
+    """Null components stay absent without dropping classifier parameters."""
     cfg = E2EConfig(
         generator=GeneratorConfig(name="null"),
         encoder=EncoderConfig(dim=16, layers=1),
@@ -646,3 +644,51 @@ def test_null_generator_arm_trains_with_empty_component_groups() -> None:
     grouped = {id(p) for params in groups.groups.values() for p in params}
     assert grouped == {id(p) for p in model.parameters() if p.requires_grad}
     assert len(grouped) > 0
+
+    phase_c = te.E2EPhaseState("C", 1.0, True, 1.0)
+    assert te._e2e_active_groups(phase_c, model) == {"classifier"}
+
+
+def test_group_gradient_statistics_gather_once_and_reuse_for_clipping() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+    parameter.grad = torch.tensor([3.0, 4.0])
+    groups = {"active": (parameter,), "empty": ()}
+
+    class _FakeAccelerator:
+        calls = 0
+
+        def gather(self, value: torch.Tensor) -> torch.Tensor:
+            self.calls += 1
+            return torch.cat((value, value), dim=0)
+
+    accelerator = _FakeAccelerator()
+    local, gathered_squared, gathered_nonfinite = te._gather_e2e_group_gradient_statistics(
+        groups, cast(Accelerator, accelerator)
+    )
+
+    assert accelerator.calls == 1
+    assert gathered_squared["active"].tolist() == [25.0, 25.0]
+    assert gathered_nonfinite["active"].tolist() == [0, 0]
+    assert gathered_squared["empty"].tolist() == [0.0, 0.0]
+
+    records = te.e2e_check_and_clip_gradients(
+        groups,
+        {"active"},
+        max_norm={"active": 1.0, "empty": 1.0},
+        statistics=local,
+    )
+    assert records["active"].norm == pytest.approx(5.0)
+    assert parameter.grad.tolist() == pytest.approx([0.6, 0.8])
+
+
+def test_optimizer_state_finite_check_reports_corrupt_group() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    optimizer = torch.optim.AdamW([parameter], lr=1e-3)
+    parameter.grad = torch.tensor([1.0])
+    optimizer.step()
+    groups = {"classifier": (parameter,)}
+
+    te.e2e_assert_finite_optimizer_state(groups, optimizer)
+    optimizer.state[parameter]["exp_avg"].fill_(float("nan"))
+    with pytest.raises(RuntimeError, match="optimizer state.*classifier"):
+        te.e2e_assert_finite_optimizer_state(groups, optimizer)

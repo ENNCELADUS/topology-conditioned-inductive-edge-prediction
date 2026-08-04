@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 import yaml
 from src import score_universe
+from src import train_egostitch as te
 
 pytestmark = pytest.mark.unit
 
@@ -35,13 +36,10 @@ V3_CONFIGS = {
 RETIRED_COSINE_POOL_CONFIG = (
     REPO_ROOT / "configs/egostitch_e2e_v3_cosine_pool_breadth_first.yaml"
 )
-# Wave-1 oracle-scaffold experiment arms (design 2026-08-04): R0 null-trainable
-# baseline plus the oracle x {grit_gmt conditioning ladder, ste reference}. They
-# ride the same data plumbing as the formal v3 arms and are held to the same
-# shared-pack/cache assertions below.
+# Wave-1 oracle-scaffold experiment arms (design 2026-08-04): the oracle x
+# {grit_gmt conditioning ladder, ste reference}. The comparison baseline is the
+# existing B0 result, not a separately trained null-generator arm.
 WAVE1_ORACLE_CONFIGS = {
-    "null_trainable": REPO_ROOT
-    / "configs/egostitch_e2e_v3_null_trainable_breadth_first.yaml",
     "oracle_grit_film_logit": REPO_ROOT
     / "configs/egostitch_e2e_v3_oracle_grit_film_logit_breadth_first.yaml",
     "oracle_grit_pooled_adapter": REPO_ROOT
@@ -53,6 +51,17 @@ WAVE1_ORACLE_CONFIGS = {
     "oracle_ste_ref": REPO_ROOT
     / "configs/egostitch_e2e_v3_oracle_ste_ref_breadth_first.yaml",
 }
+
+
+def test_wave1_oracle_runtime_and_supervision_contracts() -> None:
+    for name, path in WAVE1_ORACLE_CONFIGS.items():
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert payload["training"]["phase_a_fraction"] == 0.0, name
+        assert payload["runtime"]["train_eval_budget_seconds"] == 43_200, name
+        assert payload["runtime"]["total_budget_seconds"] == 44_520, name
+        te.load_config(path)
+        expected_w_rel = 0.25 if name == "oracle_ste_ref" else 0.0
+        assert payload["model"]["config"]["encoder"].get("w_rel", 0.25) == expected_w_rel, name
 
 
 def test_v3_live_arms_share_one_ng50_pack_and_grounding_cache() -> None:

@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-04
 **Status:** DRAFT (Wave-1 configs authored; not yet run)
-**Scope:** `configs/egostitch_e2e_v3_{null_trainable,oracle_*}*.yaml`,
+**Scope:** `configs/egostitch_e2e_v3_oracle_*.yaml`,
 `src/model/egostitch/{generator,encoder}/` (concurrent), `src/train_egostitch.py`
 (concurrent), `src/score_universe.py` (wave 2)
 **Builds on:** `docs/superpowers/specs/2026-08-02-three-component-refactor-design.md`
@@ -70,7 +70,7 @@ architecture do with the true graph under the same information constraint every 
 arm respects" — no test-graph leakage, no shortcut through the label itself. R2 answers
 a different question ("what is the absolute ceiling if leakage were not a constraint")
 and is explicitly a diagnostic upper bound, not a comparable arm — it must never be
-plotted or tabled alongside R0/R1 without that caveat attached, and per CLAUDE.md it
+plotted or tabled alongside B0/R1 without that caveat attached, and per CLAUDE.md it
 carries no significance claim of any kind regardless of wave.
 
 ## 4. Architecture summary
@@ -122,7 +122,7 @@ generalized to a fourth pathway shape, not invented fresh here.
 
 | Arm | Config | Generator | Encoder | Conditioning | Wave |
 |---|---|---|---|---|---|
-| R0 (trainable null) | `configs/egostitch_e2e_v3_null_trainable_breadth_first.yaml` | `null` | n/a (`cond=None`) | n/a | 1 |
+| B0 historical reference | Existing completed B0 result; no Wave-1 training config | n/a | n/a | pairwise | external context only |
 | R1 × film_logit | `configs/egostitch_e2e_v3_oracle_grit_film_logit_breadth_first.yaml` | `oracle_struct` | `grit_gmt` | `film_logit` | 1 |
 | R1 × pooled_adapter | `configs/egostitch_e2e_v3_oracle_grit_pooled_adapter_breadth_first.yaml` | `oracle_struct` | `grit_gmt` | `pooled_adapter` | 1 |
 | R1 × xattn_cls | `configs/egostitch_e2e_v3_oracle_grit_xattn_cls_breadth_first.yaml` | `oracle_struct` | `grit_gmt` | `xattn_cls` | 1 |
@@ -136,7 +136,16 @@ generalized to a fourth pathway shape, not invented fresh here.
 | Eval-side full shuffle | Existing `--scaffold-control shuffle_within_pair_v3` (`score_universe.py`, arm `structure_control_6a_v3`) | `oracle_struct` | " | " | 2 |
 | R2 diagnostic ceiling | *(`score_universe.py`-side, no training config)* | `oracle_struct` on the labeled test graph | " | " | 2 |
 
-Wave 1 is R0 plus the full R1 ladder (five training configs) and a local smoke test.
+Wave 1 is the full R1 ladder (five training configs) and a local smoke test. The
+already completed B0 result is historical external context only: its seed, sampling
+ratio, epoch count, optimizer schedule, weight decay, and label smoothing differ, so
+no B0-to-R1 delta is a controlled causal comparison. The attempted trainable-null R0 arm was
+withdrawn by the owner on 2026-08-04 because it duplicates B0; its incomplete run and
+dedicated config are not evidence and are not part of this matrix. Every remaining
+Wave-1 training config uses `training.phase_a_fraction: 0.0`: the oracle generator is
+zero-parameter and has no generator-owned auxiliary loss, so a generator-only Phase A
+would execute zero-gradient forward/backward steps and advance optimizer state without
+training any component. Phase B remains the shared 10% conditioning ramp.
 Wave 2 — the perturbation ladder that degrades the oracle's signal in controlled ways
 (edge-drop, add-matched, degree-preserving rewire, neighbor substitution) plus the
 eval-side full-shuffle control and the R2 ceiling — is scoped but not configured here;
@@ -175,9 +184,10 @@ Per CLAUDE.md's non-negotiable integrity gates, unchanged by this experiment:
 This document does not settle any of the following; it exists so they can be decided
 with the run matrix and metrics already fixed, not improvised mid-analysis.
 
-1. **Go/no-go threshold shape.** What AUPRC/MMD delta between R0 and the best R1 arm
-   counts as "the architecture can consume the signal"? This document takes no
-   position beyond noting both families must move together (§6) — a result that
+1. **Go/no-go threshold shape.** Wave 1 may compare the five R1 conditioning pathways
+   to one another and judge their absolute edge/topology metrics, but must not treat
+   the historical B0-to-R1 difference as a controlled effect. This document takes no
+   position beyond noting both metric families must move together (§6) — a result that
    improves AUPRC while regressing every MMD ratio, or vice versa, is not a clean
    "go" under the standing edge+graph joint-reporting rule and needs an owner call on
    how to weigh the tradeoff, not a formula baked into this design.
@@ -197,11 +207,10 @@ with the run matrix and metrics already fixed, not improvised mid-analysis.
    outside an internal diagnostic context (it is a leakage-permitting upper bound, not
    a comparable arm per §3) is an owner call, not a default-open one.
 
-## 8. Integration dependencies (verify before running, not owner decisions)
+## 8. Verified integration and runtime contracts
 
-Separate from §7: these are implementation facts to confirm once the concurrent work
-lands, not judgment calls. Each wave-1 config's header comment repeats the subset
-relevant to that file; consolidated here for one-place review.
+Separate from §7: these are live implementation facts verified before launch, not
+judgment calls. Each wave-1 config's header comment repeats the relevant subset.
 
 - `GeneratorConfig.oracle_seed: int = 0` and an `"oracle_struct"` entry in
   `GENERATOR_REGISTRY`.
@@ -209,33 +218,22 @@ relevant to that file; consolidated here for one-place review.
   `ENCODER_REGISTRY`; `dim`/`layers` are reused fields, not new ones.
 - `ClassifierConfig.conditioning_mode: str` over the four values in §4, with the
   zero-init null-identity guarantee actually implemented per mode.
-- Trainer support for empty optimizer parameter groups, so the R0
-  (`null_trainable`) arm can train the classifier group while the generator/encoder
-  groups are legitimately empty. As of pre-wave-1 code
-  (`train_egostitch.py:1082-1107`), a `NullGenerator` with an empty `generator` group
-  raises `RuntimeError("the null-generator arm is scoring-only and not yet
-  trainable...")` unconditionally — this must become a real training path, not a
-  relaxed assertion that silently accepts any empty group.
-- `_e2e_arm_name_from_config` (`train_egostitch.py:3393-3404`) and the closed
-  `E2EArmName` Literal (`:686-693`) predate this generator/encoder family and will
-  **silently misclassify** every wave-1 oracle arm under an existing legacy arm name
-  rather than failing to parse: the `oracle_grit_*` arms hit `encoder.w_rel == 0.0`
-  and are labeled `no_l_rel`; `oracle_ste_ref` hits
-  `feature_standardization == "row_layernorm"` and is labeled `row_layernorm`. This
-  needs an oracle-aware arm name before any wave-1 run's telemetry/checkpoint naming
-  can be trusted — it is a correctness gap, not a cosmetic one, since downstream
-  tooling keys behavior off `E2EArmName` in several places (family probe, gradient
-  telemetry).
-- `e2e_phase_boundaries` (`train_egostitch.py:706-711`) hardcodes the 0.2/0.1 phase
-  split inline and does not read `training.phase_a_fraction`/`phase_b_fraction`,
-  even though both fields parse and validate today. Every wave-1 R1 config sets
-  `phase_a_fraction: 0.0` on the premise that a zero-parameter generator has nothing
-  for Phase A to pretrain — that setting is a silent no-op until the trainer is
-  changed to consult it.
+- Trainer support for an empty generator optimizer group, because every R1 oracle
+  generator is zero-parameter while its encoder and classifier remain trainable.
+- Component-aware batch construction for the zero-parameter oracle generator: omit
+  the generator node stream, grounding-pool transfer, and generator-only targets.
+  The four GRIT arms also omit unused relational targets (`w_rel: 0`); the STE
+  reference retains them. This changes data movement only, not any arm's loss.
+- The five retained 30-epoch configs use a 12-hour train/eval hard budget instead
+  of the inherited 7-hour-20-minute cap. The previous cap was below the observed
+  full-run extrapolation and could terminate a healthy run before epoch 30.
+- `_e2e_arm_name_from_config` recognizes `generator.name: oracle_struct` before legacy
+  ablation labels, so all five arms use oracle telemetry/checkpoint semantics.
+- The training loop passes `training.phase_a_fraction`/`phase_b_fraction` into the
+  phase resolver; all five configs therefore skip Phase A exactly as declared.
 - Feature-standardization choice (config-level, not code): every oracle config pins
   `feature_standardization: row_layernorm`, mirroring the null-generator arm rather
   than the real generator's `zscore_vfit_v1` default, on the inference that
   `oracle_struct` — like `NullGenerator` — has no `EgoStitchConfig`/decoder of its own
   to bind V_fit statistics onto and reads only the ground-truth adjacency table. This
-  is inferred from this experiment's framing of `oracle_struct`, not from a read of
-  its (not-yet-written) implementation; confirm at integration.
+  is verified against the live zero-parameter `OracleStructGenerator` implementation.

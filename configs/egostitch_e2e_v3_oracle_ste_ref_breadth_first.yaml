@@ -21,24 +21,9 @@
 # rationale): `oracle_struct` is a zero-parameter table lookup with no
 # `EgoStitchConfig`/decoder of its own to bind V_fit statistics onto.
 #
-# SCHEMA ASSUMPTIONS pending concurrent implementation (verify at
-# integration, spec doc §"Owner decisions flagged, not made"):
-#   - `GeneratorConfig` gains `oracle_seed: int = 0` and registry key
-#     "oracle_struct" in `GENERATOR_REGISTRY`.
-#   - `ClassifierConfig` gains `conditioning_mode: str`.
-#   - `_e2e_arm_name_from_config` (`train_egostitch.py:3393-3404`) does not
-#     recognize `generator.name == "oracle_struct"`. Because this file keeps
-#     `encoder.w_rel` at its `ste_typed` default (0.25, not overridden), the
-#     `encoder.w_rel == 0.0` branch does NOT fire here (unlike the
-#     `oracle_grit_*` siblings) -- instead
-#     `feature_standardization == "row_layernorm"` fires, misclassifying
-#     this arm as the legacy `row_layernorm` arm. Different collision than
-#     the grit siblings', same underlying gap: no oracle-aware arm name
-#     exists yet.
-#   - `training.phase_a_fraction: 0.0` assumes the trainer's phase
-#     curriculum reads `training.phase_a_fraction`/`phase_b_fraction`
-#     (`e2e_phase_boundaries`, `train_egostitch.py:706-711`, currently
-#     hardcodes 0.2/0.1 and ignores these fields) -- verify at integration.
+# VERIFIED INTEGRATION: `oracle_struct`, oracle arm naming, conditioning-mode
+# parsing, and configurable phase fractions are live. The placeholder
+# conditioning choice above remains the only pre-launch decision for this arm.
 
 model:
   family: egostitch_e2e
@@ -130,7 +115,7 @@ runtime:
   token_budget: 128
   max_pairs_per_rank: 1048576
   memory_limit_gib: 85.0
-  total_budget_seconds: 27720
+  total_budget_seconds: 44520
   pack_budget_seconds: 1200
-  train_eval_budget_seconds: 26400
+  train_eval_budget_seconds: 43200
   artifact_budget_seconds: 120

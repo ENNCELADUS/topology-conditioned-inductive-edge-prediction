@@ -1213,8 +1213,14 @@ def e2e_check_and_clip_gradients(
     *,
     max_norm: float | Mapping[str, float] = 1.0,
     enforce_nonzero: bool = True,
+    statistics: Mapping[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
 ) -> dict[str, E2EGradientGroupRecord]:
-    """Fail closed on group gradients and independently clip active groups."""
+    """Fail closed on group gradients and independently clip active groups.
+
+    Precomputed ``(squared_norm, nonfinite_count)`` tensors let the DDP loop
+    reuse the exact statistics it already gathered for replicated-gradient
+    verification instead of scanning every gradient a second time.
+    """
     if isinstance(max_norm, Mapping):
         if set(max_norm) != set(groups) or any(value <= 0 for value in max_norm.values()):
             raise ValueError("max_norm mapping must cover every group with positive values")
@@ -1226,10 +1232,17 @@ def e2e_check_and_clip_gradients(
     unknown = active_groups - set(groups)
     if unknown:
         raise ValueError(f"unknown active optimizer groups: {sorted(unknown)}")
+    if statistics is None:
+        statistics = _e2e_group_gradient_statistics(groups)
+    if set(statistics) != set(groups):
+        raise ValueError("gradient statistics must cover every optimizer group")
     records: dict[str, E2EGradientGroupRecord] = {}
     for name, parameters in groups.items():
         all_grads = [parameter.grad for parameter in parameters if parameter.grad is not None]
-        all_nonfinite = sum(int((~torch.isfinite(grad)).sum().item()) for grad in all_grads)
+        squared_tensor, nonfinite_tensor = statistics[name]
+        summary = torch.stack((squared_tensor.double(), nonfinite_tensor.double())).detach().cpu()
+        squared_value = float(summary[0])
+        all_nonfinite = int(summary[1])
         if name not in active_groups:
             if all_nonfinite:
                 raise RuntimeError(f"non-finite gradient in inactive E2E group {name!r}")
@@ -1237,13 +1250,7 @@ def e2e_check_and_clip_gradients(
             continue
         grads = all_grads
         nonfinite = all_nonfinite
-        squared_terms = [grad.detach().double().square().sum() for grad in grads]
-        squared = (
-            torch.stack(squared_terms).sum()
-            if squared_terms
-            else torch.zeros((), dtype=torch.float64)
-        )
-        norm = float(torch.sqrt(squared).item())
+        norm = math.sqrt(squared_value)
         if nonfinite or not math.isfinite(norm):
             raise RuntimeError(f"non-finite gradient in active E2E group {name!r}")
         if norm == 0.0 and enforce_nonzero:
@@ -1331,14 +1338,33 @@ class E2EClipGuard:
 def e2e_assert_finite_optimizer_state(
     groups: Mapping[str, Sequence[torch.nn.Parameter]], optimizer: torch.optim.Optimizer
 ) -> None:
-    """Reject any non-finite post-step parameter or optimizer-state tensor."""
+    """Reject any non-finite post-step parameter or optimizer-state tensor.
+
+    The normal path performs one device-to-host synchronization for the whole
+    optimizer. A slow diagnostic pass runs only after that aggregate check
+    fails, retaining the original group-specific error message.
+    """
+    tensors: list[tuple[str, torch.Tensor]] = []
     for name, parameters in groups.items():
         for parameter in parameters:
-            if not bool(torch.isfinite(parameter).all()):
-                raise RuntimeError(f"non-finite parameter in E2E group {name!r}")
+            tensors.append((f"parameter in E2E group {name!r}", parameter))
             for value in optimizer.state.get(parameter, {}).values():
-                if isinstance(value, torch.Tensor) and not bool(torch.isfinite(value).all()):
-                    raise RuntimeError(f"non-finite optimizer state in E2E group {name!r}")
+                if isinstance(value, torch.Tensor):
+                    tensors.append((f"optimizer state in E2E group {name!r}", value))
+    if not tensors:
+        return
+    checks_by_device: dict[torch.device, list[torch.Tensor]] = {}
+    for _, value in tensors:
+        checks_by_device.setdefault(value.device, []).append(torch.isfinite(value).all())
+    if all(
+        bool(torch.stack(device_checks).all().item())
+        for device_checks in checks_by_device.values()
+    ):
+        return
+    for label, value in tensors:
+        if not bool(torch.isfinite(value).all()):
+            raise RuntimeError(f"non-finite {label}")
+    raise RuntimeError("non-finite E2E optimizer state")
 
 
 @dataclass(frozen=True)
@@ -2307,6 +2333,8 @@ class _BatchFactory:
         node_batch: int,
         rank: int,
         world_size: int,
+        generator_supervision: bool = True,
+        relational_supervision: bool = True,
     ) -> None:
         self._cfg = cfg
         self._model_cfg = model_cfg
@@ -2314,6 +2342,8 @@ class _BatchFactory:
         self._node_batch = node_batch
         self._rank = rank
         self._world = world_size
+        self._generator_supervision = generator_supervision
+        self._relational_supervision = relational_supervision
         self._node_cursor = 0
         self._node_cycle = 0
         self._node_order = self._shuffled_nodes(0)
@@ -2541,8 +2571,6 @@ class _BatchFactory:
             "x_j": self._data.f0[idx_j],
             "node_row_i": node_row_i,
             "node_row_j": node_row_j,
-            "ground_i": self._ground_rows([u for u, _, _ in padded]),
-            "ground_j": self._ground_rows([v for _, v, _ in padded]),
             "label": torch.tensor([lab for _, _, lab in padded], dtype=torch.float32),
             "is_self": torch.tensor([u == v for u, v, _ in padded], dtype=torch.bool),
             "edge_mask": torch.tensor(
@@ -2555,11 +2583,24 @@ class _BatchFactory:
         endpoints_u = [u for u, _, _ in padded]
         endpoints_v = [v for _, v, _ in padded]
         edge.update(self._token_streams(endpoints_u, endpoints_v))
-        # Same-index-space grounding ids for both endpoints (spec Sec 13.18).
-        edge["ground_id_i"] = self._ground_pool_rows(endpoints_u)
-        edge["ground_id_j"] = self._ground_pool_rows(endpoints_v)
-        edge.update(self._edge_target_tensors(padded, true_rows=true_rows, epoch=epoch))
-        edge["rel_target"] = relational_pair_targets(self._data.target_builder.graph, padded)
+        if self._generator_supervision:
+            edge["ground_i"] = self._ground_rows(endpoints_u)
+            edge["ground_j"] = self._ground_rows(endpoints_v)
+            # Same-index-space grounding ids for both endpoints (spec Sec 13.18).
+            edge["ground_id_i"] = self._ground_pool_rows(endpoints_u)
+            edge["ground_id_j"] = self._ground_pool_rows(endpoints_v)
+            edge.update(self._edge_target_tensors(padded, true_rows=true_rows, epoch=epoch))
+        else:
+            # Null and oracle generators ignore grounding features. Preserve the
+            # shared generator call signature without gathering or transferring
+            # B x n_ground x d feature tensors that no component consumes.
+            empty_shape = (len(padded), 0, self._model_cfg.input_dim)
+            edge["ground_i"] = torch.empty(empty_shape, dtype=self._data.f0.dtype)
+            edge["ground_j"] = torch.empty(empty_shape, dtype=self._data.f0.dtype)
+        if self._relational_supervision:
+            edge["rel_target"] = relational_pair_targets(
+                self._data.target_builder.graph, padded
+            )
         return edge, true_rows
 
     def epoch_batches(
@@ -2577,11 +2618,14 @@ class _BatchFactory:
         )
         edge_batch = self._cfg.data.edge_batch
         for step in range(steps):
-            nodes = self._next_nodes()
-            targets = self._data.target_builder.build(
-                nodes, np.random.default_rng((self._cfg.seed, epoch, step, self._rank, 0x7A))
-            )
-            node = self._node_tensors(nodes, targets, epoch=epoch, step=step)
+            node: dict[str, torch.Tensor] = {}
+            if self._generator_supervision:
+                nodes = self._next_nodes()
+                targets = self._data.target_builder.build(
+                    nodes,
+                    np.random.default_rng((self._cfg.seed, epoch, step, self._rank, 0x7A)),
+                )
+                node = self._node_tensors(nodes, targets, epoch=epoch, step=step)
             chunk = edge_rows[step * edge_batch : (step + 1) * edge_batch]
             edge, true_rows = self._edge_tensors(
                 chunk,
@@ -2590,17 +2634,19 @@ class _BatchFactory:
                 step=step,
             )
             global_count = _step_global_count(rows_per_rank, step, edge_batch)
-            f0_rows = (
-                node["x"].shape[0]
-                + node["ground_x"].shape[0] * node["ground_x"].shape[1]
-                + node["target_features"].shape[0] * node["target_features"].shape[1]
-                + 4 * edge["x_i"].shape[0]  # x_i, x_j and both grounding gathers
-                + sum(
+            f0_rows = 2 * edge["x_i"].shape[0]
+            if self._generator_supervision:
+                f0_rows += (
+                    node["x"].shape[0]
+                    + node["ground_x"].shape[0] * node["ground_x"].shape[1]
+                    + node["target_features"].shape[0] * node["target_features"].shape[1]
+                    + 2 * edge["x_i"].shape[0]  # both edge grounding gathers
+                    + sum(
                     edge[name].shape[0] * edge[name].shape[1]
                     for name in ("target_features_i", "target_features_j")
                     if name in edge
                 )
-            )
+                )
             yield _CompositeBatch(
                 node=node,
                 edge=edge,
@@ -2670,27 +2716,36 @@ class _CompositeStep(torch.nn.Module):
                 edge["label"].device,
             )
         edge_view = _e2e_edge_view(edge)
+        optional_auxiliary_keys = {
+            "target_features_i": "target_features_a",
+            "target_features_j": "target_features_b",
+            "target_mult_i": "target_mult_a",
+            "target_mult_j": "target_mult_b",
+            "target_adj_i": "target_adj_a",
+            "target_adj_j": "target_adj_b",
+            "target_mask_i": "target_mask_a",
+            "target_mask_j": "target_mask_b",
+            "target_node_index_i": "target_node_index_a",
+            "target_node_index_j": "target_node_index_b",
+            "rel_target": "rel_target",
+        }
         edge_view.update(
-                {
-                    "target_features_a": edge["target_features_i"],
-                    "target_features_b": edge["target_features_j"],
-                    "target_mult_a": edge["target_mult_i"],
-                    "target_mult_b": edge["target_mult_j"],
-                    "target_adj_a": edge["target_adj_i"],
-                    "target_adj_b": edge["target_adj_j"],
-                    "target_mask_a": edge["target_mask_i"],
-                    "target_mask_b": edge["target_mask_j"],
-                    "target_node_index_a": edge["target_node_index_i"],
-                    "target_node_index_b": edge["target_node_index_j"],
-                    "rel_target": edge["rel_target"],
-                    "edge_mask": edge["edge_mask"],
-                    "label": edge["label"],
-                    "loss_world_size": torch.tensor(
-                        self.world_size,
-                        device=edge["label"].device,
-                    ),
-                }
-            )
+            {
+                destination: edge[source]
+                for source, destination in optional_auxiliary_keys.items()
+                if source in edge
+            }
+        )
+        edge_view.update(
+            {
+                "edge_mask": edge["edge_mask"],
+                "label": edge["label"],
+                "loss_world_size": torch.tensor(
+                    self.world_size,
+                    device=edge["label"].device,
+                ),
+            }
+        )
         edge_output = self.model(edge_view, masks=branch_masks)
         logits = cast(torch.Tensor, edge_output["logits"])
         # `self.model.generator` is concretely `EgoStitchImagineGenerator` for
@@ -2836,10 +2891,11 @@ def _e2e_edge_view(edge: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     candidate features and their same-index-space global ids, required for
     `EgoStitchModel`'s grounded-identity-match flag to engage instead of its
     degenerate placeholder path); ``emb_a``/``emb_b``/``len_a``/``len_b``
-    already match and pass through unchanged. `_BatchFactory._edge_tensors`
-    always populates ``ground_i``/``ground_j``/``ground_id_i``/``ground_id_j``
-    for this family (Task 12/this task), so every key below is always present
-    at the one call site (`_CompositeStep.forward`'s `egostitch_e2e` branch).
+    already match and pass through unchanged. Learned generators receive the
+    full grounding features and ids. Zero-parameter oracle generators receive
+    zero-width grounding tensors and omit the ids because they do not consume
+    either input; `_CompositeStep.forward` adds the optional ids only when the
+    batch contains them.
 
     ``node_row_i``/``node_row_j`` (Wave-1 oracle-scaffold addendum) pass
     through **unrenamed**, unlike every ``_i``/``_j`` -> ``_a``/``_b`` rename
@@ -2850,7 +2906,7 @@ def _e2e_edge_view(edge: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     `NullGenerator`/`EgoStitchImagineGenerator` never need because they read
     only ``x``/``ground``.
     """
-    return {
+    view = {
         "emb_a": edge["emb_a"],
         "emb_b": edge["emb_b"],
         "len_a": edge["len_a"],
@@ -2859,12 +2915,14 @@ def _e2e_edge_view(edge: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         "x_b": edge["x_j"],
         "ground_a": edge["ground_i"],
         "ground_b": edge["ground_j"],
-        "ground_id_a": edge["ground_id_i"],
-        "ground_id_b": edge["ground_id_j"],
         "node_row_i": edge["node_row_i"],
         "node_row_j": edge["node_row_j"],
         "is_self": edge["is_self"],
     }
+    if "ground_id_i" in edge:
+        view["ground_id_a"] = edge["ground_id_i"]
+        view["ground_id_b"] = edge["ground_id_j"]
+    return view
 
 
 def _e2e_gate_tanh(model: EgoStitchModel) -> dict[str, list[float]]:
@@ -3078,19 +3136,18 @@ def _e2e_validation_node_batch(
     token_node_index: Mapping[str, int],
     nodes: Sequence[str],
     device: torch.device,
+    *,
+    generator_supervision: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Build one unique-node validation encode batch."""
     packed_rows = torch.tensor([token_node_index[node] for node in nodes], dtype=torch.long)
     boundary = max(token_table.manifest.nodes[row].length for row in packed_rows.tolist())
     emb, length = token_table.gather_nodes(packed_rows, boundary)
     node_rows = torch.tensor([data.node_index[node] for node in nodes], dtype=torch.long)
-    grounding_rows = _e2e_validation_grounding_rows(data, nodes)
     batch = {
         "emb": emb,
         "length": length,
         "x": data.f0[node_rows],
-        "ground": data.f0[torch.from_numpy(grounding_rows)],
-        "ground_ids": torch.from_numpy(grounding_rows),
         # F0 row identity per node (Wave-1 oracle-scaffold addendum, mirrors
         # the edge-batch `node_row_i`/`node_row_j` addition): lets
         # `OracleStructGenerator` resolve which real node it is encoding
@@ -3098,6 +3155,14 @@ def _e2e_validation_node_batch(
         # the training-time edge stream.
         "node_rows": node_rows,
     }
+    if generator_supervision:
+        grounding_rows = _e2e_validation_grounding_rows(data, nodes)
+        batch["ground"] = data.f0[torch.from_numpy(grounding_rows)]
+        batch["ground_ids"] = torch.from_numpy(grounding_rows)
+    else:
+        batch["ground"] = torch.empty(
+            len(nodes), 0, data.f0.shape[1], dtype=data.f0.dtype
+        )
     return cast(dict[str, torch.Tensor], _to_device(batch, device))
 
 
@@ -3259,6 +3324,7 @@ def _validate_epoch(
     # to save for backward.  `no_grad` preserves eval semantics without
     # contaminating the following optimizer step.
     with torch.no_grad():
+        generator_supervision = isinstance(model.generator, EgoStitchImagineGenerator)
         length_buckets: dict[int, list[str]] = {}
         for node in unique_nodes:
             length = token_table.manifest.nodes[token_node_index[node]].length
@@ -3271,7 +3337,12 @@ def _validate_epoch(
             for start in range(0, len(bucket_nodes), edge_batch):
                 nodes = bucket_nodes[start : start + edge_batch]
                 node_batch = _e2e_validation_node_batch(
-                    data, token_table, token_node_index, nodes, accelerator.device
+                    data,
+                    token_table,
+                    token_node_index,
+                    nodes,
+                    accelerator.device,
+                    generator_supervision=generator_supervision,
                 )
                 with torch.autocast(
                     device_type=accelerator.device.type,
@@ -3282,7 +3353,7 @@ def _validate_epoch(
                         node_batch["length"],
                         node_batch["x"],
                         node_batch["ground"],
-                        node_batch["ground_ids"],
+                        node_batch.get("ground_ids"),
                         node_batch["node_rows"],
                     )
                 for offset, node in enumerate(nodes):
@@ -3650,14 +3721,22 @@ def _e2e_active_groups(phase: E2EPhaseState, model: EgoStitchModel) -> set[str]:
     Null-safe on ``model.encoder`` (``None`` for a null-generator arm, per
     design §3.4): an absent encoder is simply never "active" outside the
     edge-active phase, the same as one whose relational head is disabled.
-    Including ``"generator"`` unconditionally is harmless for the oracle
-    (parameter-free) and null (absent) generators -- their optimizer group is
-    empty, so setting a learning rate on it is a no-op.
+    Parameter-free groups are excluded: treating an empty oracle-generator
+    group as active would emit a false zero-gradient quality failure every
+    step even though there is nothing to optimize.
     """
-    groups = {"generator"}
-    if (model.encoder is not None and model.encoder.rel_head is not None) or phase.edge_active:
+    groups: set[str] = set()
+    if any(parameter.requires_grad for parameter in model.generator.parameters()):
+        groups.add("generator")
+    if (
+        model.encoder is not None
+        and any(parameter.requires_grad for parameter in model.encoder.parameters())
+        and (model.encoder.rel_head is not None or phase.edge_active)
+    ):
         groups.add("encoder")
-    if phase.edge_active:
+    if phase.edge_active and any(
+        parameter.requires_grad for parameter in model.classifier.parameters()
+    ):
         groups.add("classifier")
     return groups
 
@@ -3704,20 +3783,56 @@ def _e2e_training_payload(
     }
 
 
+def _e2e_group_gradient_statistics(
+    groups: Mapping[str, Sequence[torch.nn.Parameter]],
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    """Compute each group's fp64 squared norm and non-finite element count once."""
+    device = next(
+        (parameter.device for parameters in groups.values() for parameter in parameters),
+        torch.device("cpu"),
+    )
+    statistics: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for name, parameters in groups.items():
+        grads = [parameter.grad.detach() for parameter in parameters if parameter.grad is not None]
+        if grads:
+            squared = torch.stack([grad.double().square().sum() for grad in grads]).sum()
+            nonfinite = torch.stack(
+                [(~torch.isfinite(grad)).sum().to(dtype=torch.float64) for grad in grads]
+            ).sum()
+        else:
+            squared = torch.zeros((), dtype=torch.float64, device=device)
+            nonfinite = torch.zeros((), dtype=torch.float64, device=device)
+        statistics[name] = (squared, nonfinite)
+    return statistics
+
+
+def _gather_e2e_group_gradient_statistics(
+    groups: Mapping[str, Sequence[torch.nn.Parameter]],
+    accelerator: Accelerator,
+) -> tuple[
+    dict[str, tuple[torch.Tensor, torch.Tensor]],
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+]:
+    """Gather every group statistic in one collective."""
+    local = _e2e_group_gradient_statistics(groups)
+    names = tuple(groups)
+    packed = torch.stack(
+        [torch.stack((local[name][0].double(), local[name][1].double())) for name in names]
+    )
+    gathered = accelerator.gather(packed).reshape(-1, len(names), 2)
+    squared = {name: gathered[:, index, 0] for index, name in enumerate(names)}
+    nonfinite = {name: gathered[:, index, 1] for index, name in enumerate(names)}
+    return local, squared, nonfinite
+
+
 def _e2e_group_squared_norms(
     groups: Mapping[str, Sequence[torch.nn.Parameter]],
     accelerator: Accelerator,
 ) -> dict[str, torch.Tensor]:
-    gathered: dict[str, torch.Tensor] = {}
-    for name, parameters in groups.items():
-        terms = [
-            parameter.grad.detach().double().square().sum()
-            for parameter in parameters
-            if parameter.grad is not None
-        ]
-        local = torch.stack(terms).sum() if terms else torch.zeros((), device=accelerator.device)
-        gathered[name] = accelerator.gather(local.reshape(1))
-    return gathered
+    """Compatibility wrapper for diagnostic family probes."""
+    _, squared, _ = _gather_e2e_group_gradient_statistics(groups, accelerator)
+    return squared
 
 
 @dataclass
@@ -4236,6 +4351,10 @@ def _train_e2e_stability_loop(
         node_batch=node_batch,
         rank=rank,
         world_size=world,
+        generator_supervision=isinstance(model.generator, EgoStitchImagineGenerator),
+        relational_supervision=(
+            model.encoder is not None and model.encoder.rel_head is not None
+        ),
     )
 
     validation_events_path = cfg.output_dir / V_HOLD_VALIDATION_EVENTS_FILENAME
@@ -4428,8 +4547,14 @@ def _train_e2e_stability_loop(
                 if int(bad_ranks.item()) > 0:
                     raise RuntimeError(f"non-finite E2E loss at optimizer step {global_step}")
                 accelerator.backward(loss)
-                gathered_squared = _e2e_group_squared_norms(parameter_groups.groups, accelerator)
+                local_gradient_statistics, gathered_squared, gathered_nonfinite = (
+                    _gather_e2e_group_gradient_statistics(
+                        parameter_groups.groups, accelerator
+                    )
+                )
                 e2e_assert_replicated_squared_norms(gathered_squared)
+                if bool(torch.stack(tuple(gathered_nonfinite.values())).ne(0).any().item()):
+                    raise RuntimeError("non-finite E2E gradient")
                 gradient_records = e2e_check_and_clip_gradients(
                     parameter_groups.groups,
                     active_groups,
@@ -4439,6 +4564,7 @@ def _train_e2e_stability_loop(
                         "encoder": training.clip_norm,
                     },
                     enforce_nonzero=enforce_quality,
+                    statistics=local_gradient_statistics,
                 )
                 gradient_row: dict[str, object] = {
                     "step": global_step + 1,

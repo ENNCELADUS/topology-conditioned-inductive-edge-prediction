@@ -449,9 +449,8 @@ def test_null_generator_every_trainable_parameter_receives_a_gradient(
 ) -> None:
     """The exact property DDP `find_unused_parameters=False` demands.
 
-    Regression guard for the P1 defect in
-    `configs/egostitch_e2e_v3_null_trainable_breadth_first.yaml`: a
-    `requires_grad=True` parameter that never participates in the forward
+    Regression guard for the null-generator component contract: a
+    `requires_grad=True` parameter that never participates in its forward
     graph gets `grad is None` after `.backward()`, which is what DDP's
     unused-parameter check rejects on the first gradient reduction. Every
     surviving trainable parameter of a null-generator model must actually be

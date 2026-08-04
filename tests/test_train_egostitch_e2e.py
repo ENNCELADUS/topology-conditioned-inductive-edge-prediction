@@ -157,7 +157,12 @@ def _write_tiny_token_pack(pack_dir: Path, nodes: list[str], *, min_length: int 
 class TestBatchFactoryE2E:
     @staticmethod
     def _target_factory(
-        tmp_path: Path, *, rank: int = 0, world_size: int = 1
+        tmp_path: Path,
+        *,
+        rank: int = 0,
+        world_size: int = 1,
+        generator_supervision: bool = True,
+        relational_supervision: bool = True,
     ) -> tuple[te._BatchFactory, EgoStitchConfig]:
         model_cfg = EgoStitchConfig()
         nodes = [f"target-node-{index:02d}" for index in range(34)]
@@ -214,9 +219,78 @@ class TestBatchFactoryE2E:
                 node_batch=4,
                 rank=rank,
                 world_size=world_size,
+                generator_supervision=generator_supervision,
+                relational_supervision=relational_supervision,
             ),
             model_cfg,
         )
+
+    def test_zero_parameter_generator_batch_omits_unused_supervision(
+        self, tmp_path: Path
+    ) -> None:
+        factory, model_cfg = self._target_factory(
+            tmp_path,
+            generator_supervision=False,
+            relational_supervision=False,
+        )
+        rows_per_rank, steps = te._epoch_step_plan(
+            len(factory._data.training_positives),
+            negative_ratio=factory._cfg.data.negative_ratio,
+            edge_batch=factory._cfg.data.edge_batch,
+            world_size=1,
+        )
+        batch = next(factory.epoch_batches(1, rows_per_rank=rows_per_rank, steps=steps))
+
+        assert batch.node == {}
+        assert batch.edge["ground_i"].shape == (
+            factory._cfg.data.edge_batch,
+            0,
+            model_cfg.input_dim,
+        )
+        assert batch.edge["ground_j"].numel() == 0
+        assert "ground_id_i" not in batch.edge
+        assert "target_features_i" not in batch.edge
+        assert "rel_target" not in batch.edge
+        assert batch.f0_rows_gathered == 2 * factory._cfg.data.edge_batch
+
+    def test_encoder_only_supervision_keeps_relational_targets(self, tmp_path: Path) -> None:
+        factory, _ = self._target_factory(
+            tmp_path,
+            generator_supervision=False,
+            relational_supervision=True,
+        )
+        edge, _ = factory._edge_tensors(
+            [("target-node-01", "target-node-02", 0)],
+            pad_to=2,
+            epoch=1,
+            step=1,
+        )
+
+        assert "rel_target" in edge
+        assert "target_features_i" not in edge
+        assert "ground_id_i" not in edge
+        assert edge["ground_i"].numel() == 0
+
+    def test_validation_batch_skips_unused_grounding(self, tmp_path: Path) -> None:
+        factory, model_cfg = self._target_factory(
+            tmp_path,
+            generator_supervision=False,
+            relational_supervision=False,
+        )
+        assert factory._token_table is not None
+        assert factory._token_node_index is not None
+        nodes = factory._data.train_nodes[:3]
+        batch = te._e2e_validation_node_batch(
+            factory._data,
+            factory._token_table,
+            factory._token_node_index,
+            nodes,
+            torch.device("cpu"),
+            generator_supervision=False,
+        )
+
+        assert batch["ground"].shape == (3, 0, model_cfg.input_dim)
+        assert "ground_ids" not in batch
 
     def test_edge_targets_are_node_partner_epoch_keyed_across_directions_and_ranks(
         self, tmp_path: Path
