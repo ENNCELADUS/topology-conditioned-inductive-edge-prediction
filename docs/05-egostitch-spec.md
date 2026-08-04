@@ -525,22 +525,33 @@ are non-publishing measurement-only paths, not production orchestration stages; 
 projection stage is deleted.
 
 The epoch count and the complete-interval budget are set by the run's config rather
-than fixed here, because they are coupled: a OneCycle schedule must run its full
-`total_steps` to reach its annealed floor, so truncating epochs changes the recipe
-rather than merely shortening it. Two recipes are currently normative:
+than fixed here, because a schedule change is a recipe change: `optim.scheduler`
+sizes OneCycle from the total step count, so the same model trained under a
+different epoch count follows a different LR trajectory, not a truncated one. Two
+recipes are currently normative:
 
 - **Constant-LR recipe (historical):** 30 epochs, warmup-then-constant LR, complete
   interval at most 60 minutes. This is the recipe every B0 artifact through
   2026-07-14 was produced under.
-- **OneCycle recipe (legacy V3.1 reproduction):** 50 epochs, `optim.scheduler.type:
+- **OneCycle recipe (legacy V3.1 reproduction):** 25 epochs, `optim.scheduler.type:
   onecycle`, `weight_decay 0.05`, `label_smoothing 0.05`, complete interval at most
-  163 minutes (`configs/b0_v31_breadth_first.yaml`).
+  63 minutes (`configs/b0_v31_breadth_first.yaml`).
+
+**Do not assume the annealed endpoint is the best model.** Measured on
+`breadth_first` seed 47 (2026-08-03), validation AUPRC peaks at roughly **half**
+of whatever OneCycle schedule it is given — epoch 21 of 50, epoch 13 of 25 — and
+decays thereafter while train loss keeps falling. There is no epoch count at which
+the final epoch is also the best epoch; **best-by-val-AUPRC checkpoint selection is
+what carries the run**, and the epoch count is chosen for calibration and cost, not
+to let the anneal "finish". Shortening 50 → 25 left AUROC/AUPRC unchanged within
+single-seed noise but improved test ECE from `0.2000` to `0.1526` and halved the
+training wall clock.
 
 `runtime.*_budget_seconds` must sum exactly to `runtime.total_budget_seconds`, and
 `train_eval_budget_seconds` is a hard subprocess timeout — under-sizing it fails the
 run rather than shortening it. Early stopping is counterfactual-only in the DDP path
-(`eval.patience` records `counterfactual_stop_epoch` and never breaks), which is what
-lets a OneCycle schedule complete.
+(`eval.patience` records `counterfactual_stop_epoch` and never breaks), so the
+configured epoch count always runs in full.
 
 Each rank owns one model/optimizer replica and one complete GPU-resident BF16 feature
 table. DataLoader workers transfer compact endpoint indices only. Training and
@@ -549,6 +560,22 @@ The checkpoint payload consumed by `score_universe` is unchanged.
 
 ## 12. Change log
 
+- 2026-08-04 (owner decision): §11's OneCycle recipe drops from 50 to **25 epochs**
+  (complete interval at most 63 minutes), and the rationale recorded in the
+  2026-08-03 entry below is **corrected**. That entry argued the epoch count could
+  not simply be lowered because "a OneCycle schedule must run its full `total_steps`
+  to reach its annealed floor". The mechanism is real but the conclusion was wrong:
+  measured on seed 47, validation AUPRC peaks at ~50% of *any* OneCycle schedule
+  (epoch 21 of 50; epoch 13 of 25) and decays afterwards, so the annealed endpoint is
+  never the selected model and best-by-val checkpoint selection is what carries the
+  run. 50 → 25 left discrimination unchanged within single-seed noise (headline test
+  AUROC `0.7162` → `0.7141`, AUPRC `0.7437` → `0.7454`) while improving ECE `0.2000`
+  → `0.1526`, lifting full-universe AUPRC `0.1260` → `0.1652`, leaving all three
+  assembled-graph MMD ratios unchanged within 2%, and halving the training wall clock
+  (2,113 s → ~1.1 ks). Budgets are re-sized from the measured ~42 s/epoch; the
+  previous 9,780 s total was ~4.6× looser than needed. Evidence is fixed-Seed-0-style
+  single-seed engineering evidence (`outputs/runs/b0_v31_onecycle_s47`,
+  `outputs/runs/b0_v31_e25_s47`) — it carries no significance or cross-seed claim.
 - 2026-08-03 (owner decision): the training-interaction **provenance digests are
   withdrawn**. The shared-interaction refactor (`6315519`) had bound every
   checkpoint, `run_metadata.json`, scores artifact, and CAZI UGT cache to a

@@ -155,7 +155,7 @@ class TestConfigIntegration:
     def test_shipped_b0_config_uses_the_legacy_recipe(self) -> None:
         """The committed B0 config carries the recipe this change exists for."""
         cfg = load_config(Path("configs/b0_v31_breadth_first.yaml"))
-        assert cfg.optim.epochs == 50
+        assert cfg.optim.epochs == 25
         assert cfg.optim.weight_decay == 0.05
         assert cfg.eval.patience == 10
         scheduler = cfg.optim.scheduler

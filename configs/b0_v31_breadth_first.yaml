@@ -39,7 +39,7 @@ data:
 optim:
   lr: 1.0e-4
   weight_decay: 0.05
-  epochs: 50
+  epochs: 25
   warmup_steps: 500 # unused while a onecycle scheduler is configured
   grad_clip: 1.0
   scheduler:
@@ -62,13 +62,13 @@ runtime:
   max_pairs_per_rank: 4096
   memory_limit_gib: 85.0
   # Stage budgets must sum exactly to total_budget_seconds (train_b0.py:722).
-  # Sized for 50 epochs at the ~122 s/epoch observed on the 23-epoch 30-epoch-config
-  # run (~6.1 ks), with headroom; train_eval_budget_seconds is a hard subprocess
-  # timeout, so under-sizing it fails the run outright.
-  total_budget_seconds: 9780
+  # Measured ~42 s/epoch (train+eval) on 4x H20, so 25 epochs is ~1.1 ks;
+  # train_eval is set to ~3x that. It is a hard subprocess timeout, so it is
+  # sized generously rather than tightly.
+  total_budget_seconds: 3780
   pack_budget_seconds: 300
   setup_probe_budget_seconds: 300
-  train_eval_budget_seconds: 9000
+  train_eval_budget_seconds: 3000
   artifact_budget_seconds: 60
   reserve_seconds: 120
   probe_warmup_steps: 10
