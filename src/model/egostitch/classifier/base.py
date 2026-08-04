@@ -112,3 +112,29 @@ class PairClassifier(nn.Module, ABC):
             Shape `(B,)` edge logits.
         """
         raise NotImplementedError
+
+    def freeze_unreachable_conditioning(self) -> None:
+        """Freeze any conditioning-only submodule that can never receive `cond`.
+
+        Called by `EgoStitchModel.__init__` (`composite.py`) exactly when the
+        composed model's generator never imagines a graph
+        (`generator.name: "null"` -> `EgoStitchModel.encoder is None`), which
+        is precisely the condition under which `score_pair_context` clamps
+        `need_topo` off and this classifier's `forward` is *always* called
+        with `cond=None`. A submodule that only activates when `cond is not
+        None` therefore never runs a single forward pass under that
+        composition, so it never receives a gradient -- DDP's
+        `find_unused_parameters=False` (CLAUDE.md P1 trap) raises on the
+        first backward otherwise.
+
+        Freezing (`requires_grad_(False)`) rather than not constructing the
+        submodule at all keeps `state_dict` key layout, parameter count, and
+        RNG draw sequence identical to the live-encoder arms (a scoring-only
+        null-generator checkpoint must keep loading), and keeps any
+        unconditional readout of the submodule (e.g. telemetry) working.
+
+        Default no-op: a classifier with no such submodule -- or one that is
+        never reachable under a null generator in the first place -- has
+        nothing to freeze. Override where applicable (`B0V31PairClassifier`).
+        """
+        return None

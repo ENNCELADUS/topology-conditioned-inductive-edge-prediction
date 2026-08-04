@@ -1935,6 +1935,7 @@ class TestE2EValidationCache:
             x: torch.Tensor,
             ground: torch.Tensor,
             ground_ids: torch.Tensor | None = None,
+            node_rows: torch.Tensor | None = None,
         ) -> E2ENodeState:
             assert ground_ids is not None
             for row in x:
@@ -1942,7 +1943,7 @@ class TestE2EValidationCache:
                 assert matches.shape == (1, 1)
                 endpoint_rows.add(int(matches.item()))
             grounding_rows.update(int(value) for value in ground_ids.flatten().tolist())
-            return original_encode(emb, length, x, ground, ground_ids)
+            return original_encode(emb, length, x, ground, ground_ids, node_rows)
 
         monkeypatch.setattr(model, "encode_node_state", _encode)
         with torch.autocast(device_type="cpu", dtype=torch.bfloat16):

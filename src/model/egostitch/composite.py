@@ -128,6 +128,17 @@ class E2EPairContext(NamedTuple):
             `None`.
         log_plan: The generator's Sinkhorn log-plan
             (``graph.aux["log_plan"]``), or `None`.
+        pooled_ab: AB-direction encoder pooled summary
+            (`GraphEmbedding.pooled`), or `None`. Trailing and optional so
+            every existing positional construction of this NamedTuple (the
+            field order is frozen -- see `E2ENodeState`) keeps working
+            unchanged. Carried because the conditioning ladder's
+            ``film_logit`` and ``pooled_adapter`` rungs read `pooled`, and an
+            encoder whose pooled summary is a *learned* readout (`grit_gmt`'s
+            PMA seed tokens) cannot be reconstructed from `topo_ab` by a mean
+            -- `score_pair_context`'s ``tokens.mean(1)`` fallback would
+            silently substitute a different quantity.
+        pooled_ba: BA-direction encoder pooled summary, or `None`.
     """
 
     encoded_a: torch.Tensor
@@ -138,42 +149,8 @@ class E2EPairContext(NamedTuple):
     topo_ba: torch.Tensor | None
     plan: torch.Tensor | None
     log_plan: torch.Tensor | None
-
-
-def _generator_graph_dims(generator: EgoStitchImagineGenerator) -> tuple[int, int]:
-    """Read ``(feature_dim, num_relations)`` from one throwaway self-row graph.
-
-    Design task 1: the encoder's input dims must be read from the graph the
-    generator actually emits, never hardcoded (`generator/assemble.py`'s
-    module-level ``FEAT_DIM = 11`` / ``EDGE_TYPES = 4`` stay private to the
-    generator package). A self-row pair short-circuits `stitch`'s Sinkhorn call
-    entirely and never touches feature standardization (`stitch` consumes
-    only already-generated `SlotSet` tensors), so this is safe to call in
-    `EgoStitchModel.__init__`, before `set_feature_stats`.
-
-    Args:
-        generator: The freshly constructed generator (weights are irrelevant
-            here -- only the scaffold's structural shape is read).
-
-    Returns:
-        ``(F, R)`` as emitted by `ImaginedGraph.feature_dim` / `.num_relations`.
-    """
-    cfg = generator.cfg
-    zero_slots = SlotSet(
-        h=torch.zeros(1, cfg.slots, cfg.d_p),
-        pi=torch.zeros(1, cfg.slots),
-        mult=torch.ones(1, cfg.slots),
-        gate=torch.zeros(1, cfg.slots),
-        pointer=torch.zeros(1, cfg.slots, cfg.n_ground),
-        adj=torch.zeros(1, cfg.slots, cfg.slots),
-        adj_logits=torch.zeros(1, cfg.slots, cfg.slots),
-    )
-    state = GeneratorNodeState(
-        slots=zero_slots, projected_x=torch.zeros(1, cfg.d_p), ground_ids=None
-    )
-    with torch.no_grad():
-        graph = generator.stitch(state, state, torch.ones(1, dtype=torch.bool))
-    return graph.feature_dim, graph.num_relations
+    pooled_ab: torch.Tensor | None = None
+    pooled_ba: torch.Tensor | None = None
 
 
 class EgoStitchModel(nn.Module):
@@ -234,13 +211,13 @@ class EgoStitchModel(nn.Module):
             # encoder parameters (design §12 P3).
             self.encoder = None
         else:
-            # Every other registered generator is, today, an
-            # `EgoStitchImagineGenerator` -- the one real, non-null
-            # implementation (design §2 Non-goals) -- which is the only
-            # generator `_generator_graph_dims` knows how to probe (it reads
-            # the generator's own pinned `EgoStitchConfig`).
-            assert isinstance(self.generator, EgoStitchImagineGenerator)
-            feature_dim, num_relations = _generator_graph_dims(self.generator)
+            # Every non-null generator answers for the shape of the graph it
+            # emits itself (`NeighborhoodGenerator.graph_dims`), so adding a
+            # generator never touches this selection logic. The old inline
+            # probe lives on as `EgoStitchImagineGenerator.graph_dims`, which
+            # is where its knowledge of that generator's `EgoStitchConfig`
+            # belongs.
+            feature_dim, num_relations = self.generator.graph_dims()
             self.encoder = build_encoder(
                 cfg.encoder,
                 in_dim=feature_dim,
@@ -248,6 +225,21 @@ class EgoStitchModel(nn.Module):
                 d_model=cfg.classifier.d_model,
             )
         self.classifier: PairClassifier = build_classifier(cfg.classifier, input_dim=self.input_dim)
+        if self.encoder is None:
+            # No `GraphEncoder` was constructed above (`generator.name:
+            # "null"`), so `score_pair_context`/`forward` always clamp
+            # `need_topo` off and `cond` is always `None` (module docstring,
+            # `_build_pair_context_and_graph`). Any classifier-owned
+            # conditioning submodule reachable only through `cond is not
+            # None` therefore never runs a forward pass under this
+            # composition and would get no gradient -- DDP's
+            # `find_unused_parameters=False` raises on the first backward
+            # otherwise (CLAUDE.md P1). Freezing here, once, at construction
+            # time (not per-caller in `train_egostitch.py`) makes every
+            # construction path -- DDP, single-process, `score_universe.py`
+            # -- carry the same `requires_grad` state on every rank before
+            # any DDP wrap happens.
+            self.classifier.freeze_unreachable_conditioning()
 
     @property
     def generator_cfg(self) -> EgoStitchConfig:
@@ -333,6 +325,7 @@ class EgoStitchModel(nn.Module):
         x: torch.Tensor,
         ground: torch.Tensor,
         ground_ids: torch.Tensor | None = None,
+        node_rows: torch.Tensor | None = None,
     ) -> E2ENodeState:
         """Run the cacheable per-node generator and classifier-token-encoder passes.
 
@@ -348,8 +341,14 @@ class EgoStitchModel(nn.Module):
         `x` back, having nothing to cache structurally (design §3.3,
         `generator/null.py`), so `E2ENodeState.slots`/`.projected_x` stay
         `None` in that case.
+
+        `node_rows` (context-local F0 row ids) is forwarded to the generator
+        when the caller has it and `None` when it does not. Passing it is the
+        caller's choice; *needing* it is the generator's contract
+        (`OracleStructGenerator` raises without it, the feature-driven
+        generators ignore it).
         """
-        generated = self.generator.encode_node(x, ground, ground_ids)
+        generated = self.generator.encode_node(x, ground, ground_ids, node_rows=node_rows)
         if isinstance(generated, GeneratorNodeState):
             return E2ENodeState(
                 encoded=self.classifier.encode_tokens(emb, length),
@@ -401,6 +400,12 @@ class EgoStitchModel(nn.Module):
         endpoint B only for non-self rows, and A's generator state is merged
         into the self rows -- safe because the batch factory guarantees
         ``x_a == x_b`` there.
+
+        Endpoint identity, when the batch carries it, rides along under
+        ``node_row_i``/``node_row_j`` (edge batches) or ``node_rows``
+        (validation node batches, where both endpoints are the same node).
+        Absent keys become `None`; a generator that needs identity says so
+        itself rather than having the composite guess.
         """
         missing = {"ground_a", "ground_b"} - batch.keys()
         if missing:
@@ -409,12 +414,16 @@ class EgoStitchModel(nn.Module):
         is_self = batch.get(
             "is_self", torch.zeros(batch_size, dtype=torch.bool, device=batch["emb_a"].device)
         )
+        shared_rows = batch.get("node_rows")
+        node_rows_a = batch.get("node_row_i", shared_rows)
+        node_rows_b = batch.get("node_row_j", shared_rows)
         state_a = self.encode_node_state(
             batch["emb_a"],
             batch["len_a"],
             batch["x_a"],
             batch["ground_a"],
             batch.get("ground_id_a"),
+            node_rows_a,
         )
         non_self = torch.nonzero(~is_self, as_tuple=False).squeeze(-1)
         if non_self.numel() == 0:
@@ -425,6 +434,7 @@ class EgoStitchModel(nn.Module):
             batch["x_b"].index_select(0, non_self),
             batch["ground_b"].index_select(0, non_self),
             (batch["ground_id_b"].index_select(0, non_self) if "ground_id_b" in batch else None),
+            (node_rows_b.index_select(0, non_self) if node_rows_b is not None else None),
         )
         if non_self.numel() == batch_size:
             return state_a, state_b_non_self, is_self
@@ -499,6 +509,8 @@ class EgoStitchModel(nn.Module):
         need_topo = need_topo and self.encoder is not None
         topo_ab: torch.Tensor | None = None
         topo_ba: torch.Tensor | None = None
+        pooled_ab: torch.Tensor | None = None
+        pooled_ba: torch.Tensor | None = None
         plan: torch.Tensor | None = None
         log_plan: torch.Tensor | None = None
         graph: ImaginedGraph | None = None
@@ -513,6 +525,8 @@ class EgoStitchModel(nn.Module):
                 log_plan = graph.aux["log_plan"]
                 topo_ab = embedding_ab.tokens
                 topo_ba = embedding_ba.tokens
+                pooled_ab = embedding_ab.pooled
+                pooled_ba = embedding_ba.pooled
         context = E2EPairContext(
             encoded_a=state_a.encoded,
             encoded_b=state_b.encoded,
@@ -522,6 +536,8 @@ class EgoStitchModel(nn.Module):
             topo_ba=topo_ba,
             plan=plan,
             log_plan=log_plan,
+            pooled_ab=pooled_ab,
+            pooled_ba=pooled_ba,
         )
         return context, graph, embedding_ab
 
@@ -622,9 +638,31 @@ class EgoStitchModel(nn.Module):
         cond: PairConditioning | None = None
         if need_topo:
             assert context.topo_ab is not None and context.topo_ba is not None
+            # Prefer the encoder's own pooled summary when the context carries
+            # it. The `tokens.mean(1)` rebuild is a *fallback* for contexts
+            # built before `pooled_ab`/`pooled_ba` existed (or by a caller that
+            # reassembled the NamedTuple positionally): for an encoder whose
+            # `pooled` is a learned readout rather than a mean -- `grit_gmt`'s
+            # PMA seeds -- the rebuild is a different quantity entirely, and
+            # silently feeding it to the `film_logit`/`pooled_adapter` rungs
+            # would test a mechanism nobody designed.
             cond = PairConditioning(
-                ab=GraphEmbedding(tokens=context.topo_ab, pooled=context.topo_ab.mean(dim=1)),
-                ba=GraphEmbedding(tokens=context.topo_ba, pooled=context.topo_ba.mean(dim=1)),
+                ab=GraphEmbedding(
+                    tokens=context.topo_ab,
+                    pooled=(
+                        context.pooled_ab
+                        if context.pooled_ab is not None
+                        else context.topo_ab.mean(dim=1)
+                    ),
+                ),
+                ba=GraphEmbedding(
+                    tokens=context.topo_ba,
+                    pooled=(
+                        context.pooled_ba
+                        if context.pooled_ba is not None
+                        else context.topo_ba.mean(dim=1)
+                    ),
+                ),
             )
         pair = PairInputs(
             tokens_a=context.encoded_a,

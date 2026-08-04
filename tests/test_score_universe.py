@@ -1317,9 +1317,13 @@ def test_real_generator_checkpoint_missing_slot_state_still_fails_loudly(
     model.eval()
 
     def _echo_x(
-        x: torch.Tensor, ground: torch.Tensor, ground_ids: torch.Tensor | None = None
+        x: torch.Tensor,
+        ground: torch.Tensor,
+        ground_ids: torch.Tensor | None = None,
+        *,
+        node_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del ground, ground_ids
+        del ground, ground_ids, node_rows
         return x
 
     monkeypatch.setattr(model.generator, "encode_node", _echo_x)
@@ -1893,9 +1897,10 @@ def test_egostitch_e2e_scorer_supplies_grounding_batch_keys(
         x: torch.Tensor,
         ground: torch.Tensor,
         ground_ids: torch.Tensor | None = None,
+        node_rows: torch.Tensor | None = None,
     ) -> E2ENodeState:
         captured.append((ground, ground_ids))
-        return original_encode(self, emb, length, x, ground, ground_ids)
+        return original_encode(self, emb, length, x, ground, ground_ids, node_rows)
 
     monkeypatch.setattr(EgoStitchModel, "encode_node_state", _spy_encode)
 

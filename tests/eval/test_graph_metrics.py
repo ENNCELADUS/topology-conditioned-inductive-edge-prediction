@@ -385,3 +385,73 @@ class TestHashSeedDeterminism:
             f"aggregate MMD depends on PYTHONHASHSEED:\n"
             f"seed 1 -> {outputs[0]}seed 2 -> {outputs[1]}seed 3 -> {outputs[2]}"
         )
+
+
+@pytest.mark.unit
+class TestGraphSimilarityMatchesPring:
+    """GS must equal PRING (arXiv:2507.05101) Eq. 4 in its Dice/F1 form."""
+
+    @staticmethod
+    def _pring_gs(g_pred: nx.Graph, g_ref: nx.Graph) -> float:
+        """Reference implementation straight from the paper's edge-set form."""
+        pred = {frozenset((u, v)) for u, v in g_pred.edges()}
+        ref = {frozenset((u, v)) for u, v in g_ref.edges()}
+        if not pred and not ref:
+            return 1.0
+        return 1.0 - len(pred ^ ref) / (len(pred) + len(ref))
+
+    def test_matches_dice_of_edge_sets(self) -> None:
+        """GS is 2|E n E'| / (|E| + |E'|)."""
+        gt = nx.Graph([("a", "b"), ("b", "c"), ("c", "d")])
+        pred = nx.Graph([("a", "b"), ("b", "c"), ("a", "d")])
+        # 2 shared of 3+3 -> 2*2/6
+        assert compute_graph_similarity(pred, gt) == pytest.approx(2 / 3)
+
+    def test_self_loops_count_as_whole_edges(self) -> None:
+        """A self-loop must weigh exactly as much as any other edge.
+
+        The adjacency-sum formulation weighted it at half, because
+        ``nx.to_numpy_array`` writes a self-loop to one diagonal cell but a
+        simple edge to two off-diagonal cells.
+        """
+        gt = nx.Graph([("a", "b"), ("c", "c")])
+        pred = nx.Graph([("a", "b")])
+        pred.add_node("c")
+        # 1 shared edge of 1 + 2 -> 2/3; the half-weighted form gave 4/5.
+        assert compute_graph_similarity(pred, gt) == pytest.approx(2 / 3)
+
+    def test_all_self_loops_identical(self) -> None:
+        """Two graphs whose only edges are the same self-loops score 1.0."""
+        gt = nx.Graph([("a", "a"), ("b", "b")])
+        pred = gt.copy()
+        assert compute_graph_similarity(pred, gt) == pytest.approx(1.0)
+
+    def test_disjoint_edge_sets_score_zero(self) -> None:
+        """No overlap -> GS 0, the bottom of the paper's stated [0, 1] range."""
+        gt = nx.Graph([("a", "b")])
+        pred = nx.Graph([("c", "d")])
+        gt.add_nodes_from(["c", "d"])
+        pred.add_nodes_from(["a", "b"])
+        assert compute_graph_similarity(pred, gt) == pytest.approx(0.0)
+
+    @pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
+    @pytest.mark.parametrize("self_loop_nodes", [0, 5, 15])
+    def test_agrees_with_paper_form_including_self_loops(
+        self, seed: int, self_loop_nodes: int
+    ) -> None:
+        """Randomized agreement with the paper's edge-set formula."""
+        pred = nx.gnp_random_graph(30, 0.2, seed=seed)
+        ref = nx.gnp_random_graph(30, 0.15, seed=seed + 100)
+        pred.add_edges_from((i, i) for i in range(self_loop_nodes))
+        ref.add_edges_from((i, i) for i in range(int(self_loop_nodes * 0.8)))
+        assert compute_graph_similarity(pred, ref) == pytest.approx(
+            self._pring_gs(pred, ref)
+        )
+
+    def test_stays_within_the_papers_stated_range(self) -> None:
+        """GS never leaves [0, 1], unlike the literal 2*Dice-1 reading."""
+        for seed in range(20):
+            pred = nx.gnp_random_graph(25, 0.35, seed=seed)
+            ref = nx.gnp_random_graph(25, 0.05, seed=seed + 50)
+            gs = compute_graph_similarity(pred, ref)
+            assert 0.0 <= gs <= 1.0

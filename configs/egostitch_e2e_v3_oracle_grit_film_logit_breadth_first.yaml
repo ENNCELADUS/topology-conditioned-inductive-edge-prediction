@@ -1,0 +1,164 @@
+# EgoStitch E2E Wave-1 oracle-scaffold R1 arm, conditioning-ladder mode
+# "film_logit" (docs/superpowers/specs/2026-08-04-oracle-scaffold-experiment-
+# design.md): `generator.name: "oracle_struct"` selects the zero-parameter
+# table generator that emits ground-truth local scaffolds read directly from
+# the training structural graph G_struct, with leave-one-out partner masking
+# applied at stitch time (the protocol-clean R1 row; NOT the labeled-test-
+# graph R2 diagnostic ceiling, which is wave-2/score_universe-side and needs
+# no training config). `encoder.name: "grit_gmt"` is the vendored GRIT +
+# Set-Transformer-PMA encoder (dense RRWP K=8, 4 GritTransformerLayers at
+# dim 96, PMA pooling with 4 seeds; tokens = 34 node + 4 seed tokens, pooled
+# = seed mean). This file pins `classifier.conditioning_mode: "film_logit"`,
+# one of four conditioning-ladder arms (see the sibling
+# `..._oracle_grit_{pooled_adapter,xattn_cls,xattn_tokens}_...` configs,
+# otherwise byte-identical to this one) plus the `..._oracle_ste_ref_...`
+# reference arm.
+#
+# `generator.n_ground: 50` matches the "real"-generator (`egostitch_imagine`)
+# arms' standard value (`full`/`f_only`/`no_l_rel`/`p0`/`row_layernorm`, and
+# the null-generator arm), not the `EgoStitchConfig` internal default of 20
+# nor the `cosine_pool` arm's 20 -- chosen so this arm shares the existing
+# `outputs/feature_packs/egostitch_e2e_v_hold_ng50` pack rather than forcing
+# a new n_ground-keyed pack build. `oracle_struct` has no other slot-count
+# knob exposed through `GeneratorConfig`.
+#
+# FEATURE-STANDARDIZATION CHOICE (flagged prominently per instruction):
+# `feature_standardization: row_layernorm`, mirroring the null-generator
+# arm's choice, NOT the real generator's `zscore_vfit_v1` default used by
+# `full`/`f_only`/etc. Rationale: `oracle_struct` is a zero-parameter table
+# lookup over `build_scaffold`'s structural channels -- like `NullGenerator`,
+# it carries no `EgoStitchConfig`/decoder of its own to bind V_fit feature
+# statistics onto, and (per this experiment's design context) it reads only
+# the ground-truth adjacency table rather than calling an F0 encode path
+# that `zscore_vfit_v1`'s statistics-binding step exists to normalize.
+# `row_layernorm` binds no stats digest, so no statistics binding is
+# attempted for this arm either. This is an inference from the task's
+# framing of `oracle_struct`, not a verified read of its (not-yet-written)
+# implementation -- confirm at integration that `oracle_struct` in fact has
+# no feature path that `zscore_vfit_v1` would correctly normalize before
+# treating this as settled.
+#
+# SCHEMA ASSUMPTIONS pending concurrent implementation (verify at
+# integration, spec doc §"Owner decisions flagged, not made"):
+#   - `GeneratorConfig` gains `oracle_seed: int = 0` and registry key
+#     "oracle_struct" in `GENERATOR_REGISTRY`.
+#   - `EncoderConfig` gains `rrwp_k: int`, `n_heads: int`, `seeds: int` and
+#     registry key "grit_gmt" in `ENCODER_REGISTRY`; `dim`/`layers` are
+#     reused fields (96/4 here, not the `ste_typed` 128/3 default).
+#   - `ClassifierConfig` gains `conditioning_mode: str` accepting
+#     "film_logit" / "pooled_adapter" / "xattn_cls" / "xattn_tokens", with a
+#     zero-init null-identity guarantee for the new pathway.
+#   - `_e2e_arm_name_from_config` (`train_egostitch.py:3393-3404`) and its
+#     closed `E2EArmName` Literal (`:686-693`) do not recognize this
+#     generator/encoder pair. As written today, `encoder.w_rel == 0.0` (set
+#     below) is checked *before* the `feature_standardization ==
+#     "row_layernorm"` branch and would misclassify this whole arm as the
+#     legacy `no_l_rel` arm -- silently wrong telemetry/arm-name labeling,
+#     not a parse failure. Needs an oracle/grit-aware arm name before this
+#     config is safe to run for real, not just to parse.
+#   - `training.phase_a_fraction: 0.0` below assumes the trainer's phase
+#     curriculum actually reads `training.phase_a_fraction`/
+#     `phase_b_fraction`. As of the pre-wave-1 code,
+#     `e2e_phase_boundaries` (`train_egostitch.py:706-711`) hardcodes
+#     0.2/0.1 inline and does NOT consult these config fields even though
+#     they parse and validate successfully -- verify the concurrent change
+#     wires them through, or this is a silent no-op and Phase A still runs
+#     for 20% of steps with nothing for `oracle_struct` to pretrain.
+
+model:
+  family: egostitch_e2e
+  config:
+    generator:
+      name: oracle_struct
+      oracle_seed: 0
+      n_ground: 50
+      feature_standardization: row_layernorm
+    encoder:
+      name: grit_gmt
+      dim: 96
+      layers: 4
+      rrwp_k: 8
+      n_heads: 8
+      seeds: 4
+      w_rel: 0.0
+    classifier:
+      name: b0_v31
+      xattn_heads: 8
+      n_inj: 1
+      p_topo: 0.15
+      permanent_null: none
+      conditioning_mode: film_logit
+
+data:
+  root: data
+  strategy: breadth_first
+  negative_ratio: 5
+  node_batch: 256
+  edge_batch: 128
+  f0_cache: outputs/feature_packs/egostitch_f0/f0_matrix.pt
+  grounding_cache: outputs/feature_packs/egostitch_f0/grounding.npz
+  pack_dir: outputs/feature_packs/egostitch_e2e_tokens
+  expected_missing_features:
+    - node_004764
+    - node_007050
+
+optim:
+  lr: 1.0e-4
+  weight_decay: 0.01
+  epochs: 30
+  warmup_steps: 500
+  grad_clip: 1.0
+
+training:
+  positive_weight: 5.0
+  phase_a_fraction: 0.0
+  phase_b_fraction: 0.1
+  lr_peak: 1.0e-4
+  min_lr: 1.0e-5
+  warmup_steps: 500
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  clip_norm: 1.0
+  pair_encoder_clip_norm: 3.0
+  generator_clip_norm: 3.0
+  clip_immediate_abort: 1.0e-3
+  clip_persistent_threshold: 0.1
+  clip_persistent_steps: 10
+  family_ratio_abort: 50.0
+  family_ratio_probes: 4
+  collapse_fraction: 0.25
+  collapse_floor: 1.0e-4
+  collapse_validations: 2
+  selection_auprc_tolerance: 0.02
+  selection_mmd_tolerance: 1.0e-6
+  residual_ratio_min: 1.0e-3
+
+diagnostics:
+  gradient_probe_interval: 50
+  gradient_imbalance_ratio: 50.0
+  gradient_imbalance_steps: 200
+  probe_s1_abs_mean_max: 1000.0
+  selection_auprc_tolerance: 0.02
+  topk_fraction: 0.01
+
+eval:
+  patience: 10
+  eval_every: 1
+
+seed: 0
+output_dir: outputs/egostitch_e2e_stage1_v3/oracle_grit_film_logit
+mixed_precision: "bf16"
+
+runtime:
+  world_size: auto
+  pack_dir: outputs/feature_packs/egostitch_e2e_v_hold_ng50
+  pack_workers: 8
+  loader_workers_per_rank: 0
+  prefetch_factor: 2
+  token_budget: 128
+  max_pairs_per_rank: 1048576
+  memory_limit_gib: 85.0
+  total_budget_seconds: 27720
+  pack_budget_seconds: 1200
+  train_eval_budget_seconds: 26400
+  artifact_budget_seconds: 120

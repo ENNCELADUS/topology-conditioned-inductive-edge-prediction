@@ -35,17 +35,39 @@ V3_CONFIGS = {
 RETIRED_COSINE_POOL_CONFIG = (
     REPO_ROOT / "configs/egostitch_e2e_v3_cosine_pool_breadth_first.yaml"
 )
+# Wave-1 oracle-scaffold experiment arms (design 2026-08-04): R0 null-trainable
+# baseline plus the oracle x {grit_gmt conditioning ladder, ste reference}. They
+# ride the same data plumbing as the formal v3 arms and are held to the same
+# shared-pack/cache assertions below.
+WAVE1_ORACLE_CONFIGS = {
+    "null_trainable": REPO_ROOT
+    / "configs/egostitch_e2e_v3_null_trainable_breadth_first.yaml",
+    "oracle_grit_film_logit": REPO_ROOT
+    / "configs/egostitch_e2e_v3_oracle_grit_film_logit_breadth_first.yaml",
+    "oracle_grit_pooled_adapter": REPO_ROOT
+    / "configs/egostitch_e2e_v3_oracle_grit_pooled_adapter_breadth_first.yaml",
+    "oracle_grit_xattn_cls": REPO_ROOT
+    / "configs/egostitch_e2e_v3_oracle_grit_xattn_cls_breadth_first.yaml",
+    "oracle_grit_xattn_tokens": REPO_ROOT
+    / "configs/egostitch_e2e_v3_oracle_grit_xattn_tokens_breadth_first.yaml",
+    "oracle_ste_ref": REPO_ROOT
+    / "configs/egostitch_e2e_v3_oracle_ste_ref_breadth_first.yaml",
+}
 
 
 def test_v3_live_arms_share_one_ng50_pack_and_grounding_cache() -> None:
-    """v5+null-generator: all seven trained arms are n_ground=50 and share one pack/cache."""
+    """v5+null-generator+wave-1: all trained arms are n_ground=50, one pack/cache."""
     config_paths = sorted(
         (REPO_ROOT / "configs").glob("egostitch_e2e_v3_*_breadth_first.yaml")
     )
     # The retired cosine_pool config stays on disk as history; no live arm uses it.
-    assert set(config_paths) == set(V3_CONFIGS.values()) | {RETIRED_COSINE_POOL_CONFIG}
+    assert set(config_paths) == (
+        set(V3_CONFIGS.values())
+        | {RETIRED_COSINE_POOL_CONFIG}
+        | set(WAVE1_ORACLE_CONFIGS.values())
+    )
     configs = []
-    for path in sorted(V3_CONFIGS.values()):
+    for path in sorted(set(V3_CONFIGS.values()) | set(WAVE1_ORACLE_CONFIGS.values())):
         payload = yaml.safe_load(path.read_text(encoding="utf-8"))
         configs.append(
             (

@@ -16,6 +16,16 @@ _ConfigT = TypeVar("_ConfigT")
 
 _FEATURE_STANDARDIZATION_MODES = frozenset({"row_layernorm", "zscore_vfit_v1"})
 
+CONDITIONING_MODES = frozenset(
+    {"film_logit", "pooled_adapter", "xattn_cls", "xattn_tokens"}
+)
+"""The conditioning-ladder rungs `ClassifierConfig.conditioning_mode` may name.
+
+Public (unlike `_FEATURE_STANDARDIZATION_MODES`) because
+`classifier/b0_v31.py` validates against the same set when constructed
+directly, and a second literal in a second file is exactly how the two drift
+apart."""
+
 
 def _from_mapping(
     cls: type[_ConfigT],
@@ -200,7 +210,18 @@ class GeneratorConfig:
         name: Registry key selecting the generator implementation
             (`registry.GENERATOR_REGISTRY`); ``"egostitch_imagine"`` for
             today's Tokenize-lite + Imagine + Stitch pipeline, ``"null"`` for
-            the parameter-free pairwise-baseline generator.
+            the parameter-free pairwise-baseline generator,
+            ``"oracle_struct"`` for the ground-truth-scaffold upper bound
+            (`generator/oracle.py`).
+        oracle_seed: Table-wide seed for ``"oracle_struct"``'s per-node hub
+            subsample. Folded into every node's
+            ``blake2b(f"{node_id}|{seed}|oracle")`` rng, so it selects *which*
+            K neighbors a hub contributes without making the table depend on
+            batching or rank. Ignored by every other generator, but part of
+            `config_hash` unconditionally -- the same field must change the
+            recorded hash whether or not the selected arm reads it, or two
+            oracle runs with different subsamples would be indistinguishable
+            in the run record.
         n_ground: Grounding candidates per node `n_g` (spec Sec 14.4.4;
             supersedes the internal generator's own pinned `EgoStitchConfig`
             default for this family).
@@ -225,6 +246,7 @@ class GeneratorConfig:
     tau_adj: float = 0.5
     tau_div: float = 0.5
     l_gate_pos_weight: float = 6.17
+    oracle_seed: int = 0
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants.
@@ -234,6 +256,8 @@ class GeneratorConfig:
         """
         if self.n_ground <= 0:
             raise ValueError(f"n_ground must be positive, got {self.n_ground}")
+        if self.oracle_seed < 0:
+            raise ValueError(f"oracle_seed must be non-negative, got {self.oracle_seed}")
         if not 0.0 < self.tau_adj < 1.0:
             raise ValueError(f"tau_adj must be in (0, 1), got {self.tau_adj}")
         if not -1.0 <= self.tau_div <= 1.0:
@@ -280,19 +304,32 @@ class EncoderConfig:
     Attributes:
         name: Registry key selecting the encoder implementation
             (`registry.ENCODER_REGISTRY`); ``"ste_typed"`` for the typed
-            message-passing port of today's `STEncoder`.
-        dim: Hidden width of the encoder's internal message-passing stack
-            (was ``ste_dim``).
-        layers: Message-passing depth (was ``ste_layers``).
+            message-passing port of today's `STEncoder`, ``"grit_gmt"`` for
+            the official-GRIT + official-PMA encoder
+            (`encoder/grit_gmt.py`).
+        dim: Hidden width of the encoder's internal stack (was ``ste_dim``).
+            Shared across encoders on purpose: it is the same knob, and
+            ``grit_gmt`` is simply run at a narrower default (``96``) than
+            ``ste_typed``'s ``128`` because its per-layer cost is higher.
+        layers: Stack depth (was ``ste_layers``).
         w_rel: Interior ``L_recon`` weight for the discarded-at-inference
             relational head; ``0`` defines the formal ``no_l_rel`` arm and
             omits the relational head entirely.
+        rrwp_k: ``grit_gmt`` only -- relative random-walk positional-encoding
+            length ``K``. The edge channel carries ``[I, P, ..., P^(K-1)]``,
+            so ``K`` bounds the walk radius the attention can distinguish.
+        n_heads: ``grit_gmt`` only -- GRIT attention heads. Must divide `dim`.
+        seeds: ``grit_gmt`` only -- PMA seed count; the encoder appends this
+            many learned graph-level summary tokens to its node tokens.
     """
 
     name: str = "ste_typed"
     dim: int = 128
     layers: int = 3
     w_rel: float = 0.25
+    rrwp_k: int = 8
+    n_heads: int = 8
+    seeds: int = 4
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants.
@@ -306,6 +343,9 @@ class EncoderConfig:
             raise ValueError(f"layers must be positive, got {self.layers}")
         if self.w_rel < 0.0:
             raise ValueError(f"w_rel must be non-negative, got {self.w_rel}")
+        for name in ("rrwp_k", "n_heads", "seeds"):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object]) -> EncoderConfig:
@@ -337,6 +377,18 @@ class ClassifierConfig:
             ``"all_head"``).
         conditioning_ema_decay: Decay for the synchronized conditioning-center
             EMA stored in rev-3.1 checkpoints (spec Sec 14.4.2).
+        conditioning_mode: Which rung of the conditioning ladder the classifier
+            builds -- exactly one, never several
+            (`classifier/b0_v31.py`). In increasing capacity:
+            ``"film_logit"`` (a scalar scale/shift on the fused pair logit,
+            from the pooled graph summary), ``"pooled_adapter"`` (a low-rank
+            pooled vector added into the trunk's token streams),
+            ``"xattn_cls"`` (today's gated cross-attention from the trunk's
+            cls token onto the graph tokens -- the default, and the only mode
+            existing checkpoints carry), ``"xattn_tokens"`` (the same gated
+            cross-attention, with every valid non-cls pair token as a query).
+            Every mode is zero-initialized, so at initialization all four are
+            bit-identical to the unconditioned path.
     """
 
     name: str = "b0_v31"
@@ -349,6 +401,7 @@ class ClassifierConfig:
     p_topo: float = 0.15
     permanent_null: str = "none"
     conditioning_ema_decay: float = 0.99
+    conditioning_mode: str = "xattn_cls"
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants.
@@ -384,6 +437,11 @@ class ClassifierConfig:
                 "conditioning_ema_decay must be in (0, 1), "
                 f"got {self.conditioning_ema_decay}"
             )
+        if self.conditioning_mode not in CONDITIONING_MODES:
+            raise ValueError(
+                f"conditioning_mode must be one of {sorted(CONDITIONING_MODES)}, "
+                f"got {self.conditioning_mode!r}"
+            )
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object]) -> ClassifierConfig:
@@ -396,7 +454,7 @@ class ClassifierConfig:
             cls,
             mapping,
             label="classifier",
-            string_fields=frozenset({"name", "permanent_null"}),
+            string_fields=frozenset({"name", "permanent_null", "conditioning_mode"}),
         )
 
 

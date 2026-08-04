@@ -39,17 +39,28 @@ from src.model.egostitch.registry import (
 # --------------------------------------------------------------------------- registry contents
 
 
-def test_generator_registry_has_exactly_the_two_registered_keys() -> None:
-    """`GENERATOR_REGISTRY` resolves `egostitch_imagine` and `null` (design §8)."""
+def test_generator_registry_has_exactly_the_three_registered_keys() -> None:
+    """`GENERATOR_REGISTRY` resolves `egostitch_imagine`, `null`, and `oracle_struct`.
+
+    (Design §8; `oracle_struct` added by the 2026-08-04 oracle-scaffold wave.)
+    """
+    from src.model.egostitch.generator.oracle import OracleStructGenerator
+
     assert {
         "egostitch_imagine": EgoStitchImagineGenerator,
         "null": NullGenerator,
+        "oracle_struct": OracleStructGenerator,
     } == GENERATOR_REGISTRY
 
 
-def test_encoder_registry_has_exactly_the_one_registered_key() -> None:
-    """`ENCODER_REGISTRY` resolves `ste_typed`."""
-    assert {"ste_typed": TypedMessagePassingEncoder} == ENCODER_REGISTRY
+def test_encoder_registry_has_exactly_the_two_registered_keys() -> None:
+    """`ENCODER_REGISTRY` resolves `ste_typed` and `grit_gmt` (2026-08-04 wave)."""
+    from src.model.egostitch.encoder.grit_gmt import GritGmtEncoder
+
+    assert {
+        "ste_typed": TypedMessagePassingEncoder,
+        "grit_gmt": GritGmtEncoder,
+    } == ENCODER_REGISTRY
 
 
 def test_classifier_registry_has_exactly_the_one_registered_key() -> None:

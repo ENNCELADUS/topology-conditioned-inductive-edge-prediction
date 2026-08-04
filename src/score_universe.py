@@ -1873,6 +1873,7 @@ def _score_egostitch_e2e(
                     matrix.index_select(0, rows).to(device),
                     matrix[pool_rows[rows]].to(device),
                     pool_rows[rows].to(device),
+                    rows.to(device),
                 )
                 if is_real_generator:
                     # A real `egostitch_imagine` generator's `encode_node`

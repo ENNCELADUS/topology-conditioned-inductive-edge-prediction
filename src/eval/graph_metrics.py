@@ -17,15 +17,47 @@ def _require_same_nodes(g_pred: nx.Graph, g_ref: nx.Graph) -> list[str]:
 
 
 def compute_graph_similarity(g_pred: nx.Graph, g_ref: nx.Graph) -> float:
-    """Return official adjacency similarity for one graph pair."""
-    nodes = _require_same_nodes(g_pred, g_ref)
-    pred_matrix = nx.to_numpy_array(g_pred, nodelist=nodes)
-    ref_matrix = nx.to_numpy_array(g_ref, nodelist=nodes)
-    denominator = float(np.sum(pred_matrix) + np.sum(ref_matrix))
-    if denominator <= 0.0:
+    """Return official PRING graph similarity (GS) for one graph pair.
+
+    PRING (arXiv:2507.05101) Eq. 4 defines
+
+        GS = 1 - ||Â - A||_1 / (|E| + |Ê|)
+
+    over a shared node set. Read literally that mixes scales — the numerator is
+    an entrywise norm over the full symmetric matrix (counting each undirected
+    edge twice) while the denominator counts *edges* — which would put GS on
+    ``[-1, 1]``. The paper states GS lies on ``[0, 1]``, and its reported values
+    settle it: PIPR/BFS reports GS 0.209 at RD 4.39, but an RD of 4.39 caps the
+    literal form at ``2*(2/5.39) - 1 = -0.257``. Only the consistently-scaled
+    reading admits their numbers, so GS is the Dice/F1 coefficient of the two
+    edge sets:
+
+        GS = 1 - |E Δ Ê| / (|E| + |Ê|) = 2|E ∩ Ê| / (|E| + |Ê|)
+
+    This is computed on **edge sets**, not adjacency sums, because the two differ
+    once self-loops are present: ``nx.to_numpy_array`` puts a simple edge on two
+    off-diagonal cells but a self-loop on a single diagonal cell, so summing the
+    adjacency matrix silently weights self-loops at half an edge. Self-loops are
+    first-class labeled queries in this benchmark and are *retained* by official
+    GS/RD (spec §9.4), so they must count exactly as much as any other edge.
+
+    Args:
+        g_pred: Predicted graph.
+        g_ref: Ground-truth graph; must span the same node set as `g_pred`.
+
+    Returns:
+        GS on ``[0.0, 1.0]``; ``1.0`` when both graphs are edgeless.
+
+    Raises:
+        ValueError: If the two graphs do not share a node set.
+    """
+    _require_same_nodes(g_pred, g_ref)
+    pred_edges = {frozenset((u, v)) for u, v in g_pred.edges()}
+    ref_edges = {frozenset((u, v)) for u, v in g_ref.edges()}
+    denominator = len(pred_edges) + len(ref_edges)
+    if denominator == 0:
         return 1.0
-    difference = float(np.abs(pred_matrix - ref_matrix).sum())
-    return float(1.0 - difference / denominator)
+    return float(1.0 - len(pred_edges ^ ref_edges) / denominator)
 
 
 def compute_relative_density(g_pred: nx.Graph, g_ref: nx.Graph) -> float:

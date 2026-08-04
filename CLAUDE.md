@@ -66,8 +66,14 @@ nodes?" (`docs/lit-review-plan.md` §5, binding for all writing.)
 - **Never claim significance or cross-seed robustness from a G5 Stage-1 screen** — it
   is fixed-Seed-0 engineering evidence; p-values/CIs/Holm must be `null`. Only E1/E3
   (≥3 seeds + Holm) carry inference.
-- **Never call an MMD composite "graph similarity" and never aggregate the three MMD
-  ratios.** Global simple-edge RD and BFS-macro RD are named separately, always.
+- **The topology result is five numbers, always reported together and never
+  aggregated: GS, RD, and the degree / clustering / spectral MMD ratios.** These are
+  PRING's five topology-aware metrics (arXiv:2507.05101 §3.2.1, Apx. D.1.4). GS↑,
+  RD→1, the three MMD ratios↓. Never collapse the three MMD ratios into one score,
+  and never invent a composite and label it "graph similarity" — **GS is a real,
+  separate metric** (edge-set Dice/F1, `src/eval/graph_metrics.py:19`), not a
+  summary of the MMD family. Global simple-edge RD and BFS-macro RD are named
+  separately, always; the same global/BFS-macro distinction applies to GS.
 - Dispositions are **owner-side decisions** — never settled by a screen, a note, or an
   agent.
 

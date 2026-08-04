@@ -623,14 +623,13 @@ def _record(epoch: int, *, mmd: float, brier: float, auprc: float = 0.6) -> te.E
     )
 
 
-def test_null_generator_arm_refuses_training_with_an_explanatory_error() -> None:
-    """The null-generator arm is scoring-only; training must say so, not confuse.
+def test_null_generator_arm_trains_with_empty_component_groups() -> None:
+    """The null-generator arm trains through the shared pipeline (Wave 1, 2026-08-04).
 
-    Its `generator` and `encoder` groups are legitimately empty, which trips the
-    non-empty parameter-group assertion. That assertion is kept -- its job is
-    catching a parameter that failed to route into any group -- so the arm gets
-    a refusal naming the real limitation instead of a message about optimizer
-    groups that reads like a bug.
+    Its `generator` and `encoder` groups are legitimately empty because the
+    components are absent; `build_e2e_parameter_groups` must accept that (the
+    R0 baseline of the oracle-scaffold experiment trains this way) while still
+    routing every classifier parameter into a group.
     """
     cfg = E2EConfig(
         generator=GeneratorConfig(name="null"),
@@ -641,5 +640,9 @@ def test_null_generator_arm_refuses_training_with_an_explanatory_error() -> None
     )
     model = EgoStitchModel(cfg)
     assert model.encoder is None
-    with pytest.raises(RuntimeError, match="scoring-only and not yet trainable"):
-        te.build_e2e_parameter_groups(model)
+    groups = te.build_e2e_parameter_groups(model)
+    assert groups.groups["generator"] == ()
+    assert groups.groups["encoder"] == ()
+    grouped = {id(p) for params in groups.groups.values() for p in params}
+    assert grouped == {id(p) for p in model.parameters() if p.requires_grad}
+    assert len(grouped) > 0

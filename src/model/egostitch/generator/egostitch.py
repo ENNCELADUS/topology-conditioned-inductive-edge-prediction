@@ -212,6 +212,8 @@ class EgoStitchImagineGenerator(
         x: torch.Tensor,
         ground: torch.Tensor,
         ground_ids: torch.Tensor | None = None,
+        *,
+        node_rows: torch.Tensor | None = None,
     ) -> GeneratorNodeState:
         """Run the cacheable per-node pass: `EgoStitchStage1.encode_nodes` + `project_features`.
 
@@ -220,10 +222,17 @@ class EgoStitchImagineGenerator(
             ground: Shape ``(B, n_g, d)`` grounding-candidate features.
             ground_ids: Optional shape ``(B, n_g)`` grounding-candidate
                 global ids, carried through unchanged.
+            node_rows: Ignored. This generator imagines from *content* -- a
+                node's frozen features and grounding pool -- and never from its
+                identity, which is exactly what makes it inductive over unseen
+                nodes. Accepting and discarding the argument keeps the base
+                signature honest without giving this generator a way to peek at
+                node identity.
 
         Returns:
             The `GeneratorNodeState` bundle.
         """
+        del node_rows
         generated = self.stage1.encode_nodes(x, ground)
         return GeneratorNodeState(
             slots=generated.slots,
@@ -331,6 +340,45 @@ class EgoStitchImagineGenerator(
             aux=aux,
             directed=True,
         )
+
+    def graph_dims(self) -> tuple[int, int]:
+        """Read ``(feature_dim, num_relations)`` from one throwaway self-row graph.
+
+        Moved here verbatim from `composite._generator_graph_dims` (design
+        task 1): the encoder's input dims must be read from the graph the
+        generator actually emits, never hardcoded
+        (`generator/assemble.py`'s module-level ``FEAT_DIM = 11`` /
+        ``EDGE_TYPES = 4`` stay private to the generator package). Asking the
+        generator rather than probing it from outside is what lets a second
+        generator answer differently without `composite.py` learning its
+        internals.
+
+        A self-row pair short-circuits `stitch`'s Sinkhorn call entirely and
+        never touches feature standardization (`stitch` consumes only
+        already-generated `SlotSet` tensors), so this is safe to call in
+        `EgoStitchModel.__init__`, before `set_feature_stats`. Weights are
+        irrelevant -- only the scaffold's structural shape is read.
+
+        Returns:
+            ``(F, R)`` as emitted by `ImaginedGraph.feature_dim` /
+            `.num_relations`.
+        """
+        cfg = self.cfg
+        zero_slots = SlotSet(
+            h=torch.zeros(1, cfg.slots, cfg.d_p),
+            pi=torch.zeros(1, cfg.slots),
+            mult=torch.ones(1, cfg.slots),
+            gate=torch.zeros(1, cfg.slots),
+            pointer=torch.zeros(1, cfg.slots, cfg.n_ground),
+            adj=torch.zeros(1, cfg.slots, cfg.slots),
+            adj_logits=torch.zeros(1, cfg.slots, cfg.slots),
+        )
+        state = GeneratorNodeState(
+            slots=zero_slots, projected_x=torch.zeros(1, cfg.d_p), ground_ids=None
+        )
+        with torch.no_grad():
+            graph = self.stitch(state, state, torch.ones(1, dtype=torch.bool))
+        return graph.feature_dim, graph.num_relations
 
     def auxiliary_losses(
         self, graph: StitchedGraph | None, batch: Mapping[str, torch.Tensor]

@@ -30,26 +30,37 @@ from src.model.egostitch.config import (
     EncoderConfig,
     GeneratorConfig,
 )
-from src.model.egostitch.encoder import TypedMessagePassingEncoder
+from src.model.egostitch.encoder import GritGmtEncoder, TypedMessagePassingEncoder
 from src.model.egostitch.encoder.base import GraphEncoder
-from src.model.egostitch.generator import EgoStitchImagineGenerator, NullGenerator
+from src.model.egostitch.generator import (
+    EgoStitchImagineGenerator,
+    NullGenerator,
+    OracleStructGenerator,
+)
 from src.model.egostitch.generator.base import NeighborhoodGenerator
 from src.model.egostitch.generator.imagine import FeatureStandardizationMode
 
 GENERATOR_REGISTRY: dict[str, type[NeighborhoodGenerator[Any, Any, Any]]] = {
     "egostitch_imagine": EgoStitchImagineGenerator,
     "null": NullGenerator,
+    "oracle_struct": OracleStructGenerator,
 }
 """Generator name -> class. ``egostitch_imagine`` is today's Tokenize-lite +
 Imagine + Stitch pipeline (`generator/egostitch.py`); ``null`` imagines
 nothing and always returns `None` from `stitch` (`generator/null.py`), which
-is what makes the pure pairwise baseline reachable by config alone."""
+is what makes the pure pairwise baseline reachable by config alone;
+``oracle_struct`` emits the *true* local scaffold from a precomputed table
+(`generator/oracle.py`), the upper bound the learned generator is measured
+against."""
 
 ENCODER_REGISTRY: dict[str, type[GraphEncoder]] = {
     "ste_typed": TypedMessagePassingEncoder,
+    "grit_gmt": GritGmtEncoder,
 }
 """Encoder name -> class. ``ste_typed`` is the typed message-passing port of
-today's `STEncoder`, with every dimension read from the graph at runtime."""
+today's `STEncoder`, with every dimension read from the graph at runtime;
+``grit_gmt`` is the official GRIT transformer stack (vendored, `src/vendor/`)
+over a dense RRWP encoding, with an official Set-Transformer PMA readout."""
 
 CLASSIFIER_REGISTRY: dict[str, type[PairClassifier]] = {
     "b0_v31": B0V31PairClassifier,
@@ -149,9 +160,16 @@ def build_generator(
             `EgoStitchImagineGenerator` unchanged. Ignored by `NullGenerator`,
             which takes no configuration -- there is nothing to imagine,
             nothing to cache, and nothing to stitch (`generator/null.py`).
+            `OracleStructGenerator` reads only its ``slots``, since the
+            scaffold comes from a table rather than from a decoder.
 
     Returns:
-        The constructed generator, not yet moved to any device.
+        The constructed generator, not yet moved to any device. For
+        ``oracle_struct`` the returned generator is not yet *usable* either:
+        the caller must install its table with
+        `OracleStructGenerator.set_oracle_context` before the first forward
+        pass. That is deliberate -- the table depends on the graph and the
+        node universe, neither of which the registry can see.
 
     Raises:
         UnknownComponentError: If `cfg.name` is not registered.
@@ -159,6 +177,8 @@ def build_generator(
     cls = _resolve(GENERATOR_REGISTRY, cfg.name, kind="generator")
     if cls is NullGenerator:
         return NullGenerator()
+    if cls is OracleStructGenerator:
+        return OracleStructGenerator(slots=generator_cfg.slots)
     return cast(
         NeighborhoodGenerator[Any, Any, Any],
         cls(
@@ -195,17 +215,21 @@ def build_encoder(
         UnknownComponentError: If `cfg.name` is not registered.
     """
     cls = _resolve(ENCODER_REGISTRY, cfg.name, kind="encoder")
-    return cast(
-        GraphEncoder,
-        cls(
-            in_dim=in_dim,
-            num_relations=num_relations,
-            d_model=d_model,
-            dim=cfg.dim,
-            layers=cfg.layers,
-            w_rel=cfg.w_rel,
-        ),
-    )
+    kwargs: dict[str, Any] = {
+        "in_dim": in_dim,
+        "num_relations": num_relations,
+        "d_model": d_model,
+        "dim": cfg.dim,
+        "layers": cfg.layers,
+        "w_rel": cfg.w_rel,
+    }
+    if cls is GritGmtEncoder:
+        # Passed only to the encoder that has them. `ste_typed`'s constructor
+        # would reject them, and widening its signature to swallow keys it
+        # ignores is exactly how an encoder ends up silently not honouring a
+        # configured value.
+        kwargs |= {"rrwp_k": cfg.rrwp_k, "n_heads": cfg.n_heads, "seeds": cfg.seeds}
+    return cast(GraphEncoder, cls(**kwargs))
 
 
 def build_classifier(cfg: ClassifierConfig, *, input_dim: int) -> PairClassifier:
@@ -235,6 +259,7 @@ def build_classifier(cfg: ClassifierConfig, *, input_dim: int) -> PairClassifier
             n_inj=cfg.n_inj,
             xattn_heads=cfg.xattn_heads,
             conditioning_ema_decay=cfg.conditioning_ema_decay,
+            conditioning_mode=cfg.conditioning_mode,
         ),
     )
 

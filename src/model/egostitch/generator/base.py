@@ -59,6 +59,8 @@ class NeighborhoodGenerator(nn.Module, ABC, Generic[NodeStateT, PerturbationT, G
         x: torch.Tensor,
         ground: torch.Tensor,
         ground_ids: torch.Tensor | None = None,
+        *,
+        node_rows: torch.Tensor | None = None,
     ) -> NodeStateT:
         """Run the cacheable per-node half of imagination for one endpoint batch.
 
@@ -75,6 +77,17 @@ class NeighborhoodGenerator(nn.Module, ABC, Generic[NodeStateT, PerturbationT, G
             ground_ids: Optional shape ``(B, n_g)`` grounding-candidate
                 global ids, carried through unchanged for the caller's own
                 bookkeeping.
+            node_rows: Optional shape ``(B,)`` int64 *context-local* F0 row
+                ids -- node identity, as opposed to node content. Added for
+                the oracle generator (`generator/oracle.py`), which is a
+                function of a node's topology and therefore has to be able
+                to say *which* node it is looking at; a generator that reads
+                only features ignores it, which is why it is optional and
+                keyword-only rather than a positional contract change. The
+                composite threads it through whenever the batch carries it
+                (`node_row_i`/`node_row_j` on edge batches, `node_rows` on
+                validation node batches) and passes `None` otherwise, so a
+                generator that requires it must say so itself.
 
         Returns:
             A generator-specific, cacheable per-node state. The concrete
@@ -146,6 +159,33 @@ class NeighborhoodGenerator(nn.Module, ABC, Generic[NodeStateT, PerturbationT, G
         state_a = self.encode_node(x_a, ground_a)
         state_b = self.encode_node(x_b, ground_b)
         return self.stitch(state_a, state_b, is_self, perturbation=perturbation)
+
+    @abstractmethod
+    def graph_dims(self) -> tuple[int, int]:
+        """Return ``(feature_dim, num_relations)`` of the graph this generator emits.
+
+        The encoder's input projections must be sized from the graph the
+        generator actually emits, never from a module-level constant (design
+        §1, §3.1) -- but the composite cannot read those dimensions off a
+        graph before the first batch exists. This is that answer, asked of the
+        generator directly.
+
+        It replaces `composite._generator_graph_dims`'s throwaway self-row
+        probe, which only ever worked for `EgoStitchImagineGenerator` (it
+        fabricated a zero `SlotSet` from that generator's own
+        `EgoStitchConfig`). Each generator now answers for itself, which is
+        what lets a second real generator be registered without touching
+        `composite.py`'s selection logic.
+
+        Returns:
+            ``(F, R)`` -- what `ImaginedGraph.feature_dim` /
+            `.num_relations` will report for every graph this generator emits.
+
+        Raises:
+            RuntimeError: For a generator that never emits a graph
+                (`NullGenerator`); there is no encoder to size.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def auxiliary_losses(

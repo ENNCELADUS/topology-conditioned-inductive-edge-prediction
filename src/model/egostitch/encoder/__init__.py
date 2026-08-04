@@ -6,6 +6,7 @@ representation.
 """
 
 from src.model.egostitch.encoder.base import GraphEncoder
+from src.model.egostitch.encoder.grit_gmt import GritGmtEncoder
 from src.model.egostitch.encoder.ste import TypedMessagePassingEncoder
 
-__all__ = ["GraphEncoder", "TypedMessagePassingEncoder"]
+__all__ = ["GraphEncoder", "GritGmtEncoder", "TypedMessagePassingEncoder"]

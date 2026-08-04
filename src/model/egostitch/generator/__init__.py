@@ -12,6 +12,11 @@ from src.model.egostitch.generator.egostitch import (
     StitchedGraph,
 )
 from src.model.egostitch.generator.null import NullGenerator
+from src.model.egostitch.generator.oracle import (
+    OracleScaffoldTable,
+    OracleStructGenerator,
+    build_oracle_table,
+)
 
 __all__ = [
     "NeighborhoodGenerator",
@@ -19,4 +24,7 @@ __all__ = [
     "GeneratorNodeState",
     "StitchedGraph",
     "NullGenerator",
+    "OracleScaffoldTable",
+    "OracleStructGenerator",
+    "build_oracle_table",
 ]

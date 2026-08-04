@@ -28,7 +28,13 @@ import pytest
 import torch
 from src.model.egostitch.classifier.b0_v31 import B0V31PairClassifier, GatedCrossAttention
 from src.model.egostitch.composite import EgoStitchModel
-from src.model.egostitch.config import ClassifierConfig, E2EConfig, EncoderConfig, GeneratorConfig
+from src.model.egostitch.config import (
+    CONDITIONING_MODES,
+    ClassifierConfig,
+    E2EConfig,
+    EncoderConfig,
+    GeneratorConfig,
+)
 from src.model.egostitch.generator import NullGenerator, StitchedGraph
 from src.model.egostitch.generator.assemble import make_scaffold_input_perturbation
 from src.model.egostitch.generator.losses import stage1_family_tensors, stage1_total
@@ -41,6 +47,7 @@ def _tiny_e2e_config(
     generator_name: str = "egostitch_imagine",
     feature_standardization: str = "row_layernorm",
     encoder_w_rel: float = 0.25,
+    conditioning_mode: str = "xattn_cls",
 ) -> E2EConfig:
     """The shared tiny composite sizing used across this file's tests (design §8)."""
     return E2EConfig(
@@ -58,6 +65,7 @@ def _tiny_e2e_config(
             n_inj=1,
             xattn_heads=4,
             p_topo=0.15,
+            conditioning_mode=conditioning_mode,
         ),
     )
 
@@ -385,6 +393,111 @@ def test_null_generator_state_dict_carries_no_generator_or_encoder_parameters() 
     total_params = sum(p.numel() for p in model.parameters())
     classifier_params = sum(p.numel() for p in model.classifier.parameters())
     assert total_params == classifier_params > 0
+
+
+def _conditioning_submodules(model: EgoStitchModel) -> list[torch.nn.Module]:
+    """Every classifier submodule reachable only through `cond is not None`."""
+    assert isinstance(model.classifier, B0V31PairClassifier)
+    modules: list[torch.nn.Module] = list(model.classifier.trunk.topo_xattn)
+    pooled_adapter = getattr(model.classifier.trunk, "pooled_adapter", None)
+    if pooled_adapter is not None:
+        modules.extend(pooled_adapter)
+    film = getattr(model.classifier, "film", None)
+    if film is not None:
+        modules.append(film)
+    return modules
+
+
+@pytest.mark.parametrize("conditioning_mode", sorted(CONDITIONING_MODES))
+def test_null_generator_freezes_every_conditioning_submodule(conditioning_mode: str) -> None:
+    """A null-generator model's conditioning rung is frozen, not merely unused.
+
+    `self.encoder` is never constructed for `generator.name: "null"`
+    (`__init__`), so `score_pair_context`/`forward` always clamp `need_topo`
+    off and `cond` stays `None` for every call
+    (`_build_pair_context_and_graph`) -- none of `trunk.topo_xattn`,
+    `trunk.pooled_adapter`, or `classifier.film` ever runs a forward pass
+    under this composition (`ConditionedPairCrossAttention.forward`'s
+    injection sites and `B0V31PairClassifier.forward`'s film branch are both
+    gated on `cond is not None`). `EgoStitchModel.__init__` must call
+    `classifier.freeze_unreachable_conditioning()` to keep those parameters
+    out of DDP's gradient reduction (CLAUDE.md P1: DDP's
+    `find_unused_parameters=False` rejects a `requires_grad=True` parameter
+    that never receives a gradient).
+    """
+    model, _ = _tiny_model_and_batch(generator_name="null", conditioning_mode=conditioning_mode)
+    assert model.encoder is None
+
+    submodules = _conditioning_submodules(model)
+    assert submodules, f"conditioning_mode={conditioning_mode!r} built no conditioning submodule"
+    for module in submodules:
+        assert all(not p.requires_grad for p in module.parameters()), (
+            f"conditioning_mode={conditioning_mode!r}: expected every parameter of "
+            f"{type(module).__name__} frozen under a null generator"
+        )
+
+    # Frozen, not omitted (CLAUDE.md/design note at `ConditionedPairCrossAttention.__init__`):
+    # `state_dict` key layout must stay exactly what a live-encoder arm would build, so a
+    # scoring-only null-generator checkpoint keeps loading.
+    live_model, _ = _tiny_model_and_batch(conditioning_mode=conditioning_mode)
+    assert set(model.classifier.state_dict()) == set(live_model.classifier.state_dict())
+
+
+@pytest.mark.parametrize("conditioning_mode", sorted(CONDITIONING_MODES))
+def test_null_generator_every_trainable_parameter_receives_a_gradient(
+    conditioning_mode: str,
+) -> None:
+    """The exact property DDP `find_unused_parameters=False` demands.
+
+    Regression guard for the P1 defect in
+    `configs/egostitch_e2e_v3_null_trainable_breadth_first.yaml`: a
+    `requires_grad=True` parameter that never participates in the forward
+    graph gets `grad is None` after `.backward()`, which is what DDP's
+    unused-parameter check rejects on the first gradient reduction. Every
+    surviving trainable parameter of a null-generator model must actually be
+    used by a real forward+backward pass -- not merely "the previously-buggy
+    modules are frozen" (the test above), which would pass even if some
+    other, unrelated parameter were wrongly unreachable.
+    """
+    model, batch = _tiny_model_and_batch(generator_name="null", conditioning_mode=conditioning_mode)
+    model.train()
+
+    output = model(batch)
+    cast(torch.Tensor, output["logits"]).sum().backward()
+
+    missing = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and parameter.grad is None
+    ]
+    assert not missing, f"parameters with no gradient (DDP would reject these): {missing}"
+
+
+@pytest.mark.parametrize("generator_name", ["egostitch_imagine", "oracle_struct"])
+@pytest.mark.parametrize("conditioning_mode", sorted(CONDITIONING_MODES))
+def test_live_encoder_arm_conditioning_parameters_stay_trainable(
+    generator_name: str, conditioning_mode: str
+) -> None:
+    """A generator with a real encoder must be bit-for-bit unaffected by the null-arm freeze.
+
+    `freeze_unreachable_conditioning` fires only when `model.encoder is None`
+    (composite.py); `egostitch_imagine` and `oracle_struct` both build a real
+    `GraphEncoder` and can genuinely produce a non-`None` `cond`, so their
+    conditioning submodules must remain exactly as trainable as before this
+    fix -- these two arms' results must not shift.
+    """
+    model, _ = _tiny_model_and_batch(
+        generator_name=generator_name, conditioning_mode=conditioning_mode
+    )
+    assert model.encoder is not None
+
+    submodules = _conditioning_submodules(model)
+    assert submodules, f"conditioning_mode={conditioning_mode!r} built no conditioning submodule"
+    for module in submodules:
+        assert all(p.requires_grad for p in module.parameters()), (
+            f"generator_name={generator_name!r} conditioning_mode={conditioning_mode!r}: "
+            f"expected every parameter of {type(module).__name__} to stay trainable"
+        )
 
 
 # --------------------------------------------------------------------------- (c) perturbation

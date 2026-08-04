@@ -77,7 +77,7 @@ from src.model.egostitch.generator.imagine import (
     SlotSet,
 )
 from src.model.egostitch.generator.losses import stage1_family_tensors, stage1_total
-from src.model.egostitch.generator.null import NullGenerator
+from src.model.egostitch.generator.oracle import OracleStructGenerator, build_oracle_table
 from src.model.egostitch.graph import GraphEmbedding
 from src.train_b0 import (
     EvalConfig,
@@ -610,13 +610,35 @@ def load_config(path: Path) -> EgoConfig:
                 "diagnostics.selection_auprc_tolerance must exactly equal "
                 "training.selection_auprc_tolerance"
             )
+        # `phase_a_fraction`/`phase_b_fraction` are the Wave-1 oracle-scaffold
+        # experiment's second carve-out from the pinned-defaults check below,
+        # exactly like `selection_auprc_tolerance` above: every R1 config sets
+        # `phase_a_fraction: 0.0` (a zero-parameter generator has nothing for
+        # Phase A to pretrain, design doc 2026-08-04 §8), which the pinned
+        # 0.2/0.1 split this gate otherwise enforces would silently reject.
+        if not math.isfinite(training.phase_a_fraction) or not (
+            0.0 <= training.phase_a_fraction <= 1.0
+        ):
+            raise ValueError("training.phase_a_fraction must be finite and in [0, 1]")
+        if not math.isfinite(training.phase_b_fraction) or not (
+            0.0 <= training.phase_b_fraction <= 1.0
+        ):
+            raise ValueError("training.phase_b_fraction must be finite and in [0, 1]")
+        if training.phase_a_fraction + training.phase_b_fraction > 1.0:
+            raise ValueError(
+                "training.phase_a_fraction + training.phase_b_fraction must not exceed 1"
+            )
         pinned_training = EgoStitchTrainingConfig()
         if replace(
             training,
             selection_auprc_tolerance=pinned_training.selection_auprc_tolerance,
+            phase_a_fraction=pinned_training.phase_a_fraction,
+            phase_b_fraction=pinned_training.phase_b_fraction,
         ) != pinned_training:
             raise ValueError(
-                f"training values must exactly match the pinned defaults; got {training!r}"
+                "training values must exactly match the pinned defaults (except "
+                f"selection_auprc_tolerance, phase_a_fraction, and phase_b_fraction); "
+                f"got {training!r}"
             )
         if data.negative_ratio != 5:
             raise ValueError("training requires data.negative_ratio=5")
@@ -690,6 +712,7 @@ E2EArmName = Literal[
     "no_l_rel",
     "row_layernorm",
     "null_generator",
+    "oracle",
 ]
 
 
@@ -703,19 +726,46 @@ class E2EPhaseState:
     real_ssl_scale: float
 
 
-def e2e_phase_boundaries(total_steps: int) -> tuple[int, int]:
-    """Return the exclusive Phase-A and Phase-B end steps."""
+def e2e_phase_boundaries(
+    total_steps: int,
+    *,
+    phase_a_fraction: float = 0.2,
+    phase_b_fraction: float = 0.1,
+) -> tuple[int, int]:
+    """Return the exclusive Phase-A and Phase-B end steps.
+
+    ``phase_a_fraction``/``phase_b_fraction`` default to the registered
+    0.2/0.1 split (every pre-oracle config pins exactly these values, so the
+    defaults are behavior-preserving). The oracle-scaffold arm's
+    ``phase_a_fraction: 0.0`` collapses Phase A to zero length: ``phase_a_end
+    == 0`` then makes ``step < phase_a_end`` false for every non-negative
+    step, so Phase A is simply skipped -- no generator pretraining steps run
+    -- and the Phase-B ramp below never divides by zero, since
+    ``phase_b_end > phase_a_end`` whenever ``phase_b_fraction > 0``.
+    """
     if total_steps <= 0:
         raise ValueError("total_steps must be positive")
-    phase_a_end = math.ceil(0.2 * total_steps)
-    return phase_a_end, phase_a_end + math.ceil(0.1 * total_steps)
+    if not 0.0 <= phase_a_fraction <= 1.0 or not 0.0 <= phase_b_fraction <= 1.0:
+        raise ValueError("phase fractions must be within [0, 1]")
+    if phase_a_fraction + phase_b_fraction > 1.0:
+        raise ValueError("phase_a_fraction + phase_b_fraction must not exceed 1")
+    phase_a_end = math.ceil(phase_a_fraction * total_steps)
+    return phase_a_end, phase_a_end + math.ceil(phase_b_fraction * total_steps)
 
 
-def e2e_phase_state(step: int, total_steps: int) -> E2EPhaseState:
+def e2e_phase_state(
+    step: int,
+    total_steps: int,
+    *,
+    phase_a_fraction: float = 0.2,
+    phase_b_fraction: float = 0.1,
+) -> E2EPhaseState:
     """Resolve the exact A/B/C behavior for one zero-based optimizer step."""
     if not 0 <= step < total_steps:
         raise ValueError(f"step must be in [0, {total_steps}), got {step}")
-    phase_a_end, phase_b_end = e2e_phase_boundaries(total_steps)
+    phase_a_end, phase_b_end = e2e_phase_boundaries(
+        total_steps, phase_a_fraction=phase_a_fraction, phase_b_fraction=phase_b_fraction
+    )
     if step < phase_a_end:
         return E2EPhaseState("A", 0.0, False, 0.0)
     if step < phase_b_end:
@@ -749,11 +799,19 @@ _E2E_RECON_COMPONENTS = (
 _E2E_FIDELITY_COMPONENTS = frozenset({"feat", "exist", "mult", "deg"})
 
 
-def e2e_recon_component_factors(step: int, total_steps: int) -> dict[str, float]:
+def e2e_recon_component_factors(
+    step: int,
+    total_steps: int,
+    *,
+    phase_a_fraction: float = 0.2,
+    phase_b_fraction: float = 0.1,
+) -> dict[str, float]:
     """Return the §14.4.1 per-component reconstruction anneal factors."""
     if not 0 <= step < total_steps:
         raise ValueError(f"step must be in [0, {total_steps}), got {step}")
-    edge_start, _ = e2e_phase_boundaries(total_steps)
+    edge_start, _ = e2e_phase_boundaries(
+        total_steps, phase_a_fraction=phase_a_fraction, phase_b_fraction=phase_b_fraction
+    )
     edge_steps = total_steps - edge_start
     if step < edge_start or edge_steps <= 1:
         fidelity_factor = 1.0
@@ -986,11 +1044,19 @@ def e2e_degree_prior_init(
     return mu0
 
 
-def e2e_first_eligible_epoch(total_steps: int, steps_per_epoch: int) -> int:
+def e2e_first_eligible_epoch(
+    total_steps: int,
+    steps_per_epoch: int,
+    *,
+    phase_a_fraction: float = 0.2,
+    phase_b_fraction: float = 0.1,
+) -> int:
     """First 1-based epoch ending after one complete Phase-C epoch."""
     if steps_per_epoch <= 0:
         raise ValueError("steps_per_epoch must be positive")
-    _, phase_b_end = e2e_phase_boundaries(total_steps)
+    _, phase_b_end = e2e_phase_boundaries(
+        total_steps, phase_a_fraction=phase_a_fraction, phase_b_fraction=phase_b_fraction
+    )
     return math.ceil((phase_b_end + steps_per_epoch) / steps_per_epoch)
 
 
@@ -1081,29 +1147,48 @@ def build_e2e_parameter_groups(model: EgoStitchModel) -> E2EParameterGroups:
     }
     empty = sorted(group for group, rows in parameters.items() if not rows)
     if empty:
-        # Deliberately not relaxed to "empty groups are fine". The assertion's
-        # job is to catch a parameter that failed to route into any component
-        # group, and that value is lost the moment empty groups are tolerated.
-        # A null generator legitimately contributes none -- but the rest of the
-        # training path is not ready for it either (the phase curriculum,
-        # `_e2e_family_probe`, `_e2e_active_groups` and the validation
-        # dispersion telemetry all assume a real generator and encoder), so the
-        # honest outcome is a refusal that says exactly that rather than a
-        # confusing one about optimizer groups.
-        if "generator" in empty and isinstance(model.generator, NullGenerator):
-            raise RuntimeError(
-                "the null-generator arm is scoring-only and not yet trainable: it has no "
-                "generator or encoder parameters, and the phase curriculum, family probe, "
-                "active-group schedule and validation dispersion telemetry all require "
-                "both. Score an already-trained-classifier checkpoint of this arm through "
-                "score_universe.py -- its `full` and `f_logit` arrays come out identical "
-                "by design (a null generator's `self.encoder is None` clamps topology off "
-                "for both heads), which is the correct reproduction of the pairwise "
-                "baseline's logit, not a degenerate result. To train the pairwise baseline "
-                "itself, use src.train_b0."
+        # An empty group is legitimate in exactly two cases (Wave-1 oracle-
+        # scaffold design): the component is *absent* (``model.encoder is
+        # None`` for a null generator -- nothing was ever imagined, so there
+        # is nothing to encode) or it is *parameter-free by construction*
+        # (``generator.name == "oracle_struct"``: a deterministic lookup
+        # table has no weights to learn, and the null generator itself is
+        # also parameter-free). Anything else empty is still the original
+        # bug this assertion exists to catch: a parameter that failed to
+        # route into any component group.
+        illegitimate = [
+            group
+            for group in empty
+            if not (
+                (group == "generator" and not any(model.generator.parameters()))
+                or (
+                    group == "encoder"
+                    and (model.encoder is None or not any(model.encoder.parameters()))
+                )
             )
-        raise RuntimeError(
-            f"every E2E optimizer group must contain trainable parameters; empty: {empty}"
+        ]
+        if illegitimate:
+            raise RuntimeError(
+                "every E2E optimizer group must contain trainable parameters unless its "
+                f"component is absent or parameter-free by construction; illegitimately "
+                f"empty: {illegitimate}"
+            )
+        # The null-generator arm used to refuse to build optimizer groups at
+        # all here (with a pointer to `src.train_b0`) because nothing else in
+        # this module was ready for a null/parameter-free generator either.
+        # Wave 1 (oracle scaffold) makes both the null-generator and the
+        # oracle-scaffold arms trainable through this same pipeline -- the
+        # phase curriculum, family probe, active-group schedule, and
+        # validation dispersion telemetry now all tolerate an absent or
+        # parameter-free generator/encoder (see `_e2e_active_groups`,
+        # `_e2e_family_probe`, `_validate_epoch`, `_enforce_e2e_initial_slot_health`).
+        # An empty group here is therefore just a fact about this arm's
+        # architecture, logged for visibility rather than refused.
+        logger.info(
+            "E2E optimizer group(s) with no trainable parameters (component absent or "
+            "parameter-free for arm=%s): %s",
+            _e2e_arm_name_from_config(model.cfg),
+            empty,
         )
     hashes = {
         group: hashlib.sha256(("\n".join(group_names) + "\n").encode()).hexdigest()
@@ -2438,9 +2523,24 @@ class _BatchFactory:
         self._record_training_nodes([node for u, v, _ in padded for node in (u, v)])
         idx_i = torch.tensor([self._data.node_index[u] for u, _, _ in padded], dtype=torch.long)
         idx_j = torch.tensor([self._data.node_index[v] for _, v, _ in padded], dtype=torch.long)
+        # F0 row identities for each endpoint (Wave-1 oracle-scaffold
+        # addendum): `OracleStructGenerator` needs to know *which* real node
+        # it is encoding to look up its scaffold, an identity `x_i`/`x_j`
+        # alone do not carry. DDP filler rows beyond `true_rows` are zeroed
+        # rather than left at their repeated real index -- `edge_mask`
+        # already excludes them from every loss downstream, so the filler
+        # value itself is inert; zeroing it keeps that inertness explicit
+        # instead of incidental on `padded[0]` always being a valid row.
+        node_row_i = idx_i.clone()
+        node_row_j = idx_j.clone()
+        if true_rows < len(padded):
+            node_row_i[true_rows:] = 0
+            node_row_j[true_rows:] = 0
         edge: dict[str, torch.Tensor] = {
             "x_i": self._data.f0[idx_i],
             "x_j": self._data.f0[idx_j],
+            "node_row_i": node_row_i,
+            "node_row_j": node_row_j,
             "ground_i": self._ground_rows([u for u, _, _ in padded]),
             "ground_j": self._ground_rows([v for _, v, _ in padded]),
             "label": torch.tensor([lab for _, _, lab in padded], dtype=torch.float32),
@@ -2594,36 +2694,63 @@ class _CompositeStep(torch.nn.Module):
         edge_output = self.model(edge_view, masks=branch_masks)
         logits = cast(torch.Tensor, edge_output["logits"])
         # `self.model.generator` is concretely `EgoStitchImagineGenerator` for
-        # P2 (registry-driven swapping is P3), whose `stitch` only ever
-        # produces a `StitchedGraph` -- match its own `auxiliary_losses`
-        # contract exactly rather than the wider base `ImaginedGraph`.
-        graph = cast(StitchedGraph, edge_output["graph"])
-        embedding_ab = cast(GraphEmbedding, edge_output["embedding_ab"])
+        # the `full`/`p0`/`no_l_rel`/`row_layernorm` arms (registry-driven
+        # swapping is P3), whose `stitch` only ever produces a
+        # `StitchedGraph`. The oracle-scaffold and null generators are the
+        # registry's other members (design 2026-08-02 §3, §8, §12 P3;
+        # Wave-1 oracle-scaffold addendum): `NullGenerator.stitch` always
+        # returns `None`, so `EgoStitchModel.forward` omits `"graph"`/
+        # `"embedding_ab"` from its output entirely rather than emitting a
+        # `None` value (`composite.py`'s `if graph is not None and
+        # embedding_ab is not None`) -- `.get(...)` (not `[...]`) is what
+        # makes that omission legal here instead of a `KeyError`.
+        graph = cast(StitchedGraph | None, edge_output.get("graph"))
+        embedding_ab = cast(GraphEmbedding | None, edge_output.get("embedding_ab"))
 
         # Every key `NeighborhoodGenerator.auxiliary_losses`/
         # `GraphEncoder.auxiliary_losses` read is either a `node`-stream key
         # (unsuffixed) or an `edge_view`-stream key (`_a`/`_b`-suffixed or
         # distinctly named), so the merge below is a disjoint union -- see
         # `generator/egostitch.py:auxiliary_losses`'s docstring for the exact
-        # key inventory.
+        # key inventory. `NullGenerator.auxiliary_losses`/a parameter-free
+        # oracle generator's `auxiliary_losses` both accept `graph is None`
+        # and return `{}` -- nothing was imagined, so nothing needs
+        # supervision -- and the encoder is skipped outright when absent
+        # (`self.model.encoder is None`, the null-generator arm's design
+        # §3.4 invariant) rather than reached through `_require_encoder`,
+        # which exists precisely to raise on that condition for callers that
+        # are not prepared to tolerate it.
         auxiliary_batch = {**node, **edge_view}
         generator_losses = self.model.generator.auxiliary_losses(graph, auxiliary_batch)
-        encoder_losses = _require_encoder(self.model).auxiliary_losses(
-            embedding_ab, auxiliary_batch
+        encoder = self.model.encoder
+        encoder_losses = (
+            encoder.auxiliary_losses(embedding_ab, auxiliary_batch)
+            if encoder is not None and embedding_ab is not None
+            else {}
         )
+        # A component that returns no loss for a given term (oracle: every
+        # term, by construction; null: every term) contributes an honest zero
+        # rather than a missing key -- `stage1_total`/`_recon_total`
+        # (`generator/losses.py`) index several of these unconditionally, so
+        # the dict below must always be complete regardless of arm.
+        zero = logits.sum() * 0.0
         recon = {
-            "feat": generator_losses["feat"],
-            "exist": generator_losses["exist"],
-            "mult": generator_losses["mult"],
-            "slotadj": generator_losses["slotadj"],
-            "gate": generator_losses["gate"],
-            "ptr": generator_losses["ptr"],
-            "div": generator_losses["div"],
-            "align": generator_losses["align"],
-            "rel": encoder_losses["rel_loss"],
+            "feat": generator_losses.get("feat", zero),
+            "exist": generator_losses.get("exist", zero),
+            "mult": generator_losses.get("mult", zero),
+            "slotadj": generator_losses.get("slotadj", zero),
+            "gate": generator_losses.get("gate", zero),
+            "ptr": generator_losses.get("ptr", zero),
+            "div": generator_losses.get("div", zero),
+            "align": generator_losses.get("align", zero),
+            "rel": encoder_losses.get("rel_loss", zero),
         }
 
-        if collect_diagnostics:
+        # Gate telemetry belongs to the conditioning pathway, not the generator
+        # family: oracle arms need it to show whether conditioning opens. The
+        # readout is mode-safe -- `trunk.topo_xattn` is an empty ModuleList for
+        # the film_logit/pooled_adapter rungs, yielding an empty list.
+        if collect_diagnostics and self.model.encoder is not None:
             extra.update(_e2e_gate_tanh(self.model))
         edge_loss = (
             e2e_weighted_bce_with_logits(
@@ -2638,11 +2765,11 @@ class _CompositeStep(torch.nn.Module):
             family="egostitch_e2e",
             edge=edge_loss,
             recon=recon,
-            deg=generator_losses["deg"],
-            real_egostat=generator_losses["real_egostat"] * real_ssl_scale,
-            real_gin=generator_losses["real_gin"] * real_ssl_scale,
-            ssl_noise=generator_losses["ssl_noise"] * real_ssl_scale,
-            ssl_pool=generator_losses["ssl_pool"] * real_ssl_scale,
+            deg=generator_losses.get("deg", zero),
+            real_egostat=generator_losses.get("real_egostat", zero) * real_ssl_scale,
+            real_gin=generator_losses.get("real_gin", zero) * real_ssl_scale,
+            ssl_noise=generator_losses.get("ssl_noise", zero) * real_ssl_scale,
+            ssl_pool=generator_losses.get("ssl_pool", zero) * real_ssl_scale,
             recon_factors=cast(
                 Mapping[str, float] | None,
                 batch.get("recon_factors"),
@@ -2653,11 +2780,11 @@ class _CompositeStep(torch.nn.Module):
             family="egostitch_e2e",
             edge=edge_loss,
             recon=recon,
-            deg=generator_losses["deg"],
-            real_egostat=generator_losses["real_egostat"] * real_ssl_scale,
-            real_gin=generator_losses["real_gin"] * real_ssl_scale,
-            ssl_noise=generator_losses["ssl_noise"] * real_ssl_scale,
-            ssl_pool=generator_losses["ssl_pool"] * real_ssl_scale,
+            deg=generator_losses.get("deg", zero),
+            real_egostat=generator_losses.get("real_egostat", zero) * real_ssl_scale,
+            real_gin=generator_losses.get("real_gin", zero) * real_ssl_scale,
+            ssl_noise=generator_losses.get("ssl_noise", zero) * real_ssl_scale,
+            ssl_pool=generator_losses.get("ssl_pool", zero) * real_ssl_scale,
             recon_factors=cast(
                 Mapping[str, float] | None,
                 batch.get("recon_factors"),
@@ -2713,6 +2840,15 @@ def _e2e_edge_view(edge: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     always populates ``ground_i``/``ground_j``/``ground_id_i``/``ground_id_j``
     for this family (Task 12/this task), so every key below is always present
     at the one call site (`_CompositeStep.forward`'s `egostitch_e2e` branch).
+
+    ``node_row_i``/``node_row_j`` (Wave-1 oracle-scaffold addendum) pass
+    through **unrenamed**, unlike every ``_i``/``_j`` -> ``_a``/``_b`` rename
+    above: `EgoStitchModel._pair_node_states` (`composite.py`) reads them
+    under exactly these names (``batch.get("node_row_i", ...)``/
+    ``batch.get("node_row_j", ...)``) to resolve which real node
+    `OracleStructGenerator.encode_node` is encoding -- an identity
+    `NullGenerator`/`EgoStitchImagineGenerator` never need because they read
+    only ``x``/``ground``.
     """
     return {
         "emb_a": edge["emb_a"],
@@ -2725,6 +2861,8 @@ def _e2e_edge_view(edge: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         "ground_b": edge["ground_j"],
         "ground_id_a": edge["ground_id_i"],
         "ground_id_b": edge["ground_id_j"],
+        "node_row_i": edge["node_row_i"],
+        "node_row_j": edge["node_row_j"],
         "is_self": edge["is_self"],
     }
 
@@ -2953,6 +3091,12 @@ def _e2e_validation_node_batch(
         "x": data.f0[node_rows],
         "ground": data.f0[torch.from_numpy(grounding_rows)],
         "ground_ids": torch.from_numpy(grounding_rows),
+        # F0 row identity per node (Wave-1 oracle-scaffold addendum, mirrors
+        # the edge-batch `node_row_i`/`node_row_j` addition): lets
+        # `OracleStructGenerator` resolve which real node it is encoding
+        # during validation, the same way `node_row_i`/`node_row_j` do for
+        # the training-time edge stream.
+        "node_rows": node_rows,
     }
     return cast(dict[str, torch.Tensor], _to_device(batch, device))
 
@@ -3139,6 +3283,7 @@ def _validate_epoch(
                         node_batch["x"],
                         node_batch["ground"],
                         node_batch["ground_ids"],
+                        node_batch["node_rows"],
                     )
                 for offset, node in enumerate(nodes):
                     node_cache[node] = _fp32_cached_node_state(encoded, offset)
@@ -3182,44 +3327,77 @@ def _validate_epoch(
                     if masks is None
                     else model.score_pair_context(context, masks=masks)
                 )
-            assert context.plan is not None
-            slots_a = _require_slots(state_a)
-            slots_b = _require_slots(state_b)
-            dispersion_a = _e2e_dispersion_rows(
-                slots_a.pi,
-                slots_a.h,
-                slots_a.adj,
-                context.plan,
-            )
-            dispersion_b = _e2e_dispersion_rows(
-                slots_b.pi,
-                slots_b.h,
-                slots_b.adj,
-                context.plan,
-            )
-            dispersion_rows = {
-                name: (
-                    0.5 * (dispersion_a[name] + dispersion_b[name])
-                    if name
-                    in {"pi_slot_std", "h_pairwise_cosine_mean", "adj_offdiag_std"}
-                    else dispersion_a[name]
+            # Slot-geometry telemetry (dispersion/scale) only exists for
+            # `EgoStitchImagineGenerator`: the oracle-scaffold and null
+            # generators carry no `SlotSet`/Sinkhorn plan at all (`context.plan
+            # is None`, `state.slots is None`, design §3.4), so they emit NaN
+            # columns here instead -- the aggregation below already treats an
+            # all-NaN column as "no signal" for the five dispersion names
+            # (falls back to 0.0) and reports NaN for the four scale names,
+            # exactly the "explicit NaN columns" convention every other
+            # generator-internals block in this module follows for these arms.
+            if isinstance(model.generator, EgoStitchImagineGenerator):
+                assert context.plan is not None
+                slots_a = _require_slots(state_a)
+                slots_b = _require_slots(state_b)
+                dispersion_a = _e2e_dispersion_rows(
+                    slots_a.pi,
+                    slots_a.h,
+                    slots_a.adj,
+                    context.plan,
                 )
-                for name in dispersion_a
-            }
-            for name in ("plan_row_entropy", "plan_rank1_marginal_residual"):
-                dispersion_rows[name] = dispersion_rows[name].masked_fill(is_self, torch.nan)
-            scale_a = _e2e_scale_rows(slots_a.h, context.plan)
-            scale_b = _e2e_scale_rows(slots_b.h, context.plan)
-            scale_rows = {
-                name: (
-                    0.5 * (scale_a[name] + scale_b[name])
-                    if name in {"h_norm_mean", "h_pairwise_sqdist_mean"}
-                    else scale_a[name]
+                dispersion_b = _e2e_dispersion_rows(
+                    slots_b.pi,
+                    slots_b.h,
+                    slots_b.adj,
+                    context.plan,
                 )
-                for name in scale_a
-            }
-            for name in ("plan_total_mass", "plan_max_cell_fraction"):
-                scale_rows[name] = scale_rows[name].masked_fill(is_self, torch.nan)
+                dispersion_rows = {
+                    name: (
+                        0.5 * (dispersion_a[name] + dispersion_b[name])
+                        if name
+                        in {"pi_slot_std", "h_pairwise_cosine_mean", "adj_offdiag_std"}
+                        else dispersion_a[name]
+                    )
+                    for name in dispersion_a
+                }
+                for name in ("plan_row_entropy", "plan_rank1_marginal_residual"):
+                    dispersion_rows[name] = dispersion_rows[name].masked_fill(is_self, torch.nan)
+                scale_a = _e2e_scale_rows(slots_a.h, context.plan)
+                scale_b = _e2e_scale_rows(slots_b.h, context.plan)
+                scale_rows = {
+                    name: (
+                        0.5 * (scale_a[name] + scale_b[name])
+                        if name in {"h_norm_mean", "h_pairwise_sqdist_mean"}
+                        else scale_a[name]
+                    )
+                    for name in scale_a
+                }
+                for name in ("plan_total_mass", "plan_max_cell_fraction"):
+                    scale_rows[name] = scale_rows[name].masked_fill(is_self, torch.nan)
+            else:
+                nan_row = torch.full(
+                    (len(rows),), float("nan"), dtype=torch.float32, device=accelerator.device
+                )
+                dispersion_rows = dict.fromkeys(
+                    (
+                        "pi_slot_std",
+                        "h_pairwise_cosine_mean",
+                        "adj_offdiag_std",
+                        "plan_row_entropy",
+                        "plan_rank1_marginal_residual",
+                    ),
+                    nan_row,
+                )
+                scale_rows = dict.fromkeys(
+                    (
+                        "plan_total_mass",
+                        "plan_max_cell_fraction",
+                        "h_norm_mean",
+                        "h_pairwise_sqdist_mean",
+                    ),
+                    nan_row,
+                )
             values_out.append(
                 torch.stack(
                     [
@@ -3393,6 +3571,8 @@ def _e2e_arm_name(model: EgoStitchModel) -> E2EArmName:
 def _e2e_arm_name_from_config(config: E2EConfig) -> E2EArmName:
     if config.generator.name == "null":
         return "null_generator"
+    if config.generator.name == "oracle_struct":
+        return "oracle"
     if config.classifier.permanent_null == "all_head":
         return "b0_e2e_f_only"
     if config.classifier.p_topo == 0.0:
@@ -3465,8 +3645,17 @@ def _e2e_base_lr(step: int, total_steps: int, config: EgoStitchTrainingConfig) -
 
 
 def _e2e_active_groups(phase: E2EPhaseState, model: EgoStitchModel) -> set[str]:
+    """Optimizer groups whose learning rate should be nonzero this step.
+
+    Null-safe on ``model.encoder`` (``None`` for a null-generator arm, per
+    design §3.4): an absent encoder is simply never "active" outside the
+    edge-active phase, the same as one whose relational head is disabled.
+    Including ``"generator"`` unconditionally is harmless for the oracle
+    (parameter-free) and null (absent) generators -- their optimizer group is
+    empty, so setting a learning rate on it is a no-op.
+    """
     groups = {"generator"}
-    if _require_encoder(model).rel_head is not None or phase.edge_active:
+    if (model.encoder is not None and model.encoder.rel_head is not None) or phase.edge_active:
         groups.add("encoder")
     if phase.edge_active:
         groups.add("classifier")
@@ -3502,7 +3691,12 @@ def _e2e_training_payload(
         "edge": _to_device(batch.edge, device),
         "edge_rows_global": batch.edge_rows_global,
         "edge_active": phase.edge_active,
-        "recon_factors": e2e_recon_component_factors(step, total_steps),
+        "recon_factors": e2e_recon_component_factors(
+            step,
+            total_steps,
+            phase_a_fraction=cfg.training.phase_a_fraction if cfg.training is not None else 0.2,
+            phase_b_fraction=cfg.training.phase_b_fraction if cfg.training is not None else 0.1,
+        ),
         "real_ssl_scale": torch.tensor(phase.real_ssl_scale, device=device),
         "seed": cfg.seed,
         "epoch": epoch,
@@ -3598,13 +3792,31 @@ def _e2e_family_probe(
         families.insert(0, "edge")
     if phase.real_ssl_scale > 0.0:
         families.extend(("real", "ssl"))
+    # A "recon"/"real"/"ssl" node-stream family is only a meaningful concept
+    # for `EgoStitchImagineGenerator`: the oracle-scaffold and null generators
+    # are both parameter-free/absent and return `{}` from `auxiliary_losses`,
+    # so `_CompositeStep.forward` zero-fills every `recon` term for them
+    # (spec: no generator-internals telemetry for those arms). Gating the
+    # expected membership here, not just relaxing the finiteness check below,
+    # keeps the probe from recording a spurious always-zero "generator recon"
+    # entry for an arm that never actually trains a generator.
+    is_imagine_generator = isinstance(inner.generator, EgoStitchImagineGenerator)
     expected: dict[str, set[str]] = {
         "classifier": {"edge"} if phase.edge_active else set(),
-        "generator": {"recon"} | ({"real", "ssl"} if phase.real_ssl_scale > 0.0 else set()),
-        "encoder": {"recon"} if _require_encoder(inner).rel_head is not None else set(),
+        "generator": (
+            {"recon"} | ({"real", "ssl"} if phase.real_ssl_scale > 0.0 else set())
+            if is_imagine_generator
+            else set()
+        ),
+        "encoder": (
+            {"recon"}
+            if inner.encoder is not None and inner.encoder.rel_head is not None
+            else set()
+        ),
     }
-    if phase.edge_active and arm != "b0_e2e_f_only":
+    if phase.edge_active and arm != "b0_e2e_f_only" and is_imagine_generator:
         expected["generator"].add("edge")
+    if phase.edge_active and arm != "b0_e2e_f_only" and inner.encoder is not None:
         expected["encoder"].add("edge")
     result: dict[str, dict[str, float]] = {group: {} for group in groups}
     submodule_rms: dict[str, float] = {}
@@ -3656,10 +3868,15 @@ def _e2e_family_probe(
 def _e2e_current_submodule_gradient_rms(
     model: EgoStitchModel, accelerator: Accelerator
 ) -> dict[str, float]:
-    """RMS telemetry from the current synchronized fixed-replay edge backward."""
+    """RMS telemetry from the current synchronized fixed-replay edge backward.
+
+    ``grad_rms_ste`` reads 0.0 for a null-generator arm's absent encoder
+    (design §3.4) rather than raising: there is no submodule to measure, and
+    an empty parameter tuple is the honest representation of that fact.
+    """
     submodules: dict[str, Sequence[torch.nn.Parameter]] = {
         "grad_rms_trunk": tuple(_require_b0v31_classifier(model).trunk.parameters()),
-        "grad_rms_ste": tuple(_require_encoder(model).parameters()),
+        "grad_rms_ste": () if model.encoder is None else tuple(model.encoder.parameters()),
     }
     result: dict[str, float] = {}
     for name, parameters in submodules.items():
@@ -3916,6 +4133,16 @@ def _enforce_e2e_initial_slot_health(
     )
     if validation_event_callback is not None:
         validation_event_callback("step_0", None, 0)
+    # The Sec 14.4.8 cosine trip line is a claim about `EgoStitchImagineGenerator`'s
+    # `SlotSet` geometry at initialization; the oracle-scaffold and null
+    # generators carry no such geometry (`_validate_epoch` reports NaN scale
+    # telemetry for them, design §3.4), so `report`'s finiteness check below
+    # would spuriously fail every run of either arm. There is nothing this
+    # guard can check for them -- skip identically on every rank (same
+    # config-derived model class everywhere, so no DDP divergence risk) after
+    # still recording the step-0 validation event above.
+    if not isinstance(model.generator, EgoStitchImagineGenerator):
+        return {}
     report: dict[str, float] = {}
     born_collapsed = 0
     nonfinite_telemetry = 0
@@ -3992,6 +4219,10 @@ def _train_e2e_stability_loop(
                 "encoder",
                 "classifier",
             )
+            # Skip a group with no trainable parameters (the oracle-scaffold
+            # generator, or the null generator's absent generator/encoder)
+            # cleanly rather than registering an empty `torch.optim` group.
+            if parameter_groups.groups[name]
         ],
         betas=training.betas,
         eps=training.eps,
@@ -4077,8 +4308,17 @@ def _train_e2e_stability_loop(
     )
     schedule_total_steps = steps_per_epoch * cfg.optim.epochs
     executed_steps = sum(epoch_step_counts)
-    phase_a_end, phase_b_end = e2e_phase_boundaries(schedule_total_steps)
-    first_eligible_epoch = e2e_first_eligible_epoch(schedule_total_steps, steps_per_epoch)
+    phase_a_end, phase_b_end = e2e_phase_boundaries(
+        schedule_total_steps,
+        phase_a_fraction=training.phase_a_fraction,
+        phase_b_fraction=training.phase_b_fraction,
+    )
+    first_eligible_epoch = e2e_first_eligible_epoch(
+        schedule_total_steps,
+        steps_per_epoch,
+        phase_a_fraction=training.phase_a_fraction,
+        phase_b_fraction=training.phase_b_fraction,
+    )
 
     if use_cuda:
         torch.cuda.reset_peak_memory_stats(accelerator.device)
@@ -4152,7 +4392,12 @@ def _train_e2e_stability_loop(
                 fetch_started = time.monotonic()
                 batch = next(batches)
                 epoch_data_wait += time.monotonic() - fetch_started
-                phase = e2e_phase_state(global_step, schedule_total_steps)
+                phase = e2e_phase_state(
+                    global_step,
+                    schedule_total_steps,
+                    phase_a_fraction=training.phase_a_fraction,
+                    phase_b_fraction=training.phase_b_fraction,
+                )
                 active_groups = _e2e_active_groups(phase, model)
                 base_lr = _e2e_base_lr(global_step, schedule_total_steps, training)
                 for group in optimizer.param_groups:
@@ -4277,7 +4522,10 @@ def _train_e2e_stability_loop(
                     probe_payload = cast(dict[str, object], _detached_clone(fixed_replay))
                     probe_payload["edge_active"] = phase.edge_active
                     probe_payload["recon_factors"] = e2e_recon_component_factors(
-                        global_step - 1, schedule_total_steps
+                        global_step - 1,
+                        schedule_total_steps,
+                        phase_a_fraction=training.phase_a_fraction,
+                        phase_b_fraction=training.phase_b_fraction,
                     )
                     probe_payload["real_ssl_scale"] = torch.tensor(
                         phase.real_ssl_scale, device=accelerator.device
@@ -4470,7 +4718,12 @@ def _train_e2e_stability_loop(
         record_validation_event("epoch_end", epoch, global_step)
         validation_seconds = epoch_validation_seconds
         epoch_wall = time.monotonic() - epoch_started
-        phase = e2e_phase_state(global_step - 1, schedule_total_steps)
+        phase = e2e_phase_state(
+            global_step - 1,
+            schedule_total_steps,
+            phase_a_fraction=training.phase_a_fraction,
+            phase_b_fraction=training.phase_b_fraction,
+        )
         collapse_failure = 0
         slot_collapse_failure = 0
         validation_nonfinite_failure = 0
@@ -4513,7 +4766,16 @@ def _train_e2e_stability_loop(
                 collapse_streak = collapse_streak + 1 if fidelity["f_logit_std"] < threshold else 0
                 if collapse_streak >= training.collapse_validations:
                     collapse_failure = 1
-            if not validation_nonfinite_failure:
+            # `h_pairwise_cosine_mean`/`plan_rank1_marginal_residual` are the
+            # NaN-defaulted-to-0.0/0.0 slot-geometry telemetry for the
+            # oracle-scaffold and null generators (`_validate_epoch`); at
+            # (0.0, 0.0) the guard's `residual < 0.05` half would spuriously
+            # read "collapsed" every epoch once conditioning is active, for a
+            # generator that has no slot geometry to collapse. Skip the guard
+            # entirely for those arms rather than accept that false signal.
+            if not validation_nonfinite_failure and isinstance(
+                model.generator, EgoStitchImagineGenerator
+            ):
                 slot_collapse_failure = int(
                     slot_collapse_guard.update(
                         fidelity,
@@ -5245,6 +5507,70 @@ def _bind_feature_standardization(
     return stats.digest
 
 
+def _install_oracle_context(model: EgoStitchModel, data: EgoStitchData) -> None:
+    """Install the oracle scaffold table for the ``oracle_struct`` generator arm.
+
+    Runs once at startup, after the model is built and `_bind_feature_standardization`
+    has called `EgoStitchModel.set_feature_stats` (Wave-1 oracle-scaffold
+    design). One table row is built per node in the F0 universe (``data.f0``
+    / ``data.node_index``, ``V_fit ∪ V_hold``), in F0-row order, so the
+    F0-row -> table-row lookup `OracleStructGenerator.set_oracle_context`
+    needs is simply the identity permutation (``arange``) -- table row ``r``
+    describes exactly the node at F0 row ``r``.
+
+    The table is built over `EgoTargetBuilder.graph` -- the protocol-clean
+    ``G_fit`` structural graph (spec Sec 9.3/9.4), not a broader graph that
+    would also carry V_hold's true structural edges. An oracle that could see
+    held-out structure at validation time would leak exactly the information
+    the inductive protocol withholds from every other generator; V_hold nodes
+    therefore get whatever `build_oracle_table` reports for a node absent
+    from ``G_fit`` (no true training-graph neighbors), the same "no more
+    information than a real generator would have" position a trained
+    `EgoStitchImagineGenerator` is in for those nodes.
+
+    Args:
+        model: The freshly constructed E2E model, already feature-stats-bound.
+        data: The assembled training data (F0 universe + `EgoTargetBuilder`).
+
+    Raises:
+        RuntimeError: If `model.generator` is not an `OracleStructGenerator`
+            (a caller bug: this must only run for ``generator.name ==
+            "oracle_struct"``), or if `data.node_index` does not densely
+            cover every F0 row (would indicate a broken universe assembly,
+            not a legal state to silently paper over).
+    """
+    if not isinstance(model.generator, OracleStructGenerator):
+        raise RuntimeError(
+            "oracle context install requires an OracleStructGenerator, got "
+            f"{type(model.generator).__name__}"
+        )
+    n_rows = int(data.f0.shape[0])
+    node_by_row: list[str | None] = [None] * n_rows
+    for node, row in data.node_index.items():
+        node_by_row[row] = node
+    missing_rows = [row for row, node in enumerate(node_by_row) if node is None]
+    if missing_rows:
+        raise RuntimeError(
+            f"F0 universe has {len(missing_rows)} row(s) with no node_index entry; "
+            f"first few: {missing_rows[:5]}"
+        )
+    ordered_node_ids = cast(list[str], node_by_row)
+    table = build_oracle_table(
+        data.target_builder.graph,
+        ordered_node_ids,
+        slots=model.generator_cfg.slots,
+        seed=model.cfg.generator.oracle_seed,
+    )
+    lookup = torch.arange(n_rows, dtype=torch.long)
+    model.generator.set_oracle_context(table, lookup)
+    logger.info(
+        "installed oracle scaffold table rows=%d slots=%d seed=%d",
+        n_rows,
+        model.generator_cfg.slots,
+        model.cfg.generator.oracle_seed,
+    )
+
+
 def _run_ddp_worker(cfg: EgoConfig, args: EgoCliArgs) -> None:
     """Dispatch an ``accelerate launch`` worker to the requested DDP mode."""
     measurement_only = args.ddp_mode in _PROBE_DISPATCH_MODES
@@ -5277,6 +5603,8 @@ def _run_ddp_worker(cfg: EgoConfig, args: EgoCliArgs) -> None:
     data = assemble_egostitch_data(cfg, pack_dir=args.pack_dir)
     model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
     feature_stats_sha256 = _bind_feature_standardization(model, cfg, data)
+    if model.cfg.generator.name == "oracle_struct":
+        _install_oracle_context(model, data)
     _run_ddp_dispatch(
         cfg,
         args,
@@ -5323,8 +5651,17 @@ def _run_ddp_dispatch(
     if args.ddp_mode != "train":
         raise ValueError(f"unsupported DDP mode: {args.ddp_mode!r}")
 
-    degree_prior = e2e_degree_prior_init(model, data)
-    logger.info("degree head centered on G_fit prior mean(log d)=%.6f", degree_prior)
+    # The degree prior centers `EgoStitchImagineGenerator`'s lognormal degree
+    # head bias; the oracle-scaffold and null generators have no such head
+    # (design §3.4), so there is nothing to center for either arm.
+    if isinstance(model.generator, EgoStitchImagineGenerator):
+        degree_prior = e2e_degree_prior_init(model, data)
+        logger.info("degree head centered on G_fit prior mean(log d)=%.6f", degree_prior)
+    else:
+        logger.info(
+            "skipping degree-prior centering: %s generator has no degree head",
+            type(model.generator).__name__,
+        )
 
     if accelerator.is_main_process:
         write_run_start_metadata(

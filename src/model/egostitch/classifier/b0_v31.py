@@ -60,6 +60,7 @@ from src.model.egostitch.classifier.layers import (
     _build_padding_mask,
     _parse_rich_pooling_components,
 )
+from src.model.egostitch.config import CONDITIONING_MODES
 from src.model.egostitch.graph import PairConditioning, PairInputs
 
 # --------------------------------------------------------------------------- head-null masks
@@ -89,6 +90,98 @@ def masks_for_null(null: str, batch_size: int, device: torch.device) -> HeadNull
     off = torch.zeros(batch_size, dtype=torch.bool, device=device)
     topo = off if null == NULL_ALL_HEAD else on
     return HeadNullMasks(topo=topo)
+
+
+# ------------------------------------------------------- shared centering machinery
+#
+# `GatedCrossAttention` owned this logic privately until the conditioning
+# ladder (`ClassifierConfig.conditioning_mode`) gave a second module -- the
+# `film_logit` conditioner -- the same job: subtract a synchronized,
+# differentiable mean over active, real rows during training, and the frozen
+# checkpointed EMA of that mean at evaluation. The two must agree exactly on
+# the all-reduce pattern or a DDP run and a single-GPU run will disagree, so
+# the logic lives here, once, as free functions.
+#
+# Deliberately *not* refactored into a shared `nn.Module`: the EMA buffers stay
+# registered on `GatedCrossAttention` itself under their existing names
+# (`ema_mu` / `ema_updates`), because every rev-3.1 checkpoint carries
+# `trunk.topo_xattn.<i>.ema_mu` and nesting them one level deeper would rename
+# the keys and break `xattn_cls` checkpoint loading for a purely cosmetic gain.
+
+
+def _include_weight(include: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+    """Reshape an inclusion mask to broadcast against `value`'s trailing dims.
+
+    Args:
+        include: Shape ``(B,)`` (per-row: the ``xattn_cls`` case) or ``(B, T)``
+            (per-token: the ``xattn_tokens`` case).
+        value: Shape ``(B, T_v, d)``.
+
+    Returns:
+        `include` viewed with `value`'s rank, trailing dims of size 1.
+    """
+    return include.view(*include.shape, *((1,) * (value.dim() - include.dim())))
+
+
+def _global_center(
+    value: torch.Tensor, include: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """Center included entries around a synchronized, differentiable mean.
+
+    Args:
+        value: Shape ``(B, T, d)`` fp32 quantity to center.
+        include: Shape ``(B,)`` or ``(B, T)`` bool. A ``(B,)`` mask counts
+            *rows*; a ``(B, T)`` mask counts *tokens*, which is what
+            ``xattn_tokens`` needs -- the returned mean must be a single
+            ``(1, 1, d)`` statistic over every valid token on every rank, not
+            a per-position one, or the frozen EMA could not stand in for it at
+            evaluation time.
+
+    Returns:
+        ``(centered, mu, has_rows)``. ``mu`` is always ``(1, 1, d)``.
+    """
+    # A `(0,)` tuple dispatches to the same ATen reduction as a bare `dim=0`,
+    # so the `(B,)` path is arithmetically identical to the pre-ladder code.
+    reduce_dims = (0,) if include.dim() == 1 else (0, 1)
+    weight = _include_weight(include, value).to(dtype=value.dtype)
+    count = weight.sum()
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(count, op=dist.ReduceOp.SUM)
+    has_rows = bool(count.item() > 0)
+    if not has_rows:
+        return torch.zeros_like(value), torch.zeros_like(value[:1, :1]), False
+
+    # Subtracting a synchronized reference before summation makes a
+    # constant attention output produce an exact zero residual even when
+    # its fp32 value is not exactly representable.
+    masked = torch.where(
+        _include_weight(include, value),
+        value.detach(),
+        torch.full_like(value, torch.inf),
+    )
+    reference = masked.amin(dim=reduce_dims, keepdim=True)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(reference, op=dist.ReduceOp.MIN)
+    deviations = value - reference
+    total_deviation = (deviations * weight).sum(dim=reduce_dims, keepdim=True)
+    if dist.is_available() and dist.is_initialized():
+        total_deviation = dist_functional.all_reduce(  # type: ignore[no-untyped-call]
+            total_deviation, op=dist.ReduceOp.SUM
+        )
+    mean_deviation = total_deviation / count
+    return deviations - mean_deviation, reference + mean_deviation, True
+
+
+def _advance_ema(
+    ema_mu: torch.Tensor, ema_updates: torch.Tensor, mu: torch.Tensor, decay: float
+) -> None:
+    """Advance a post-all-reduce EMA in place, identically on every rank."""
+    with torch.no_grad():
+        if int(ema_updates.item()) == 0:
+            ema_mu.copy_(mu.detach())
+        else:
+            ema_mu.mul_(decay).add_(mu.detach(), alpha=1.0 - decay)
+        ema_updates.add_(1)
 
 
 class GatedCrossAttention(nn.Module):
@@ -149,45 +242,18 @@ class GatedCrossAttention(nn.Module):
     def _global_center(
         attn_out: torch.Tensor, include: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, bool]:
-        """Center included rows around a synchronized, differentiable mean."""
-        weight = include.to(dtype=attn_out.dtype).view(-1, 1, 1)
-        count = weight.sum()
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(count, op=dist.ReduceOp.SUM)
-        has_rows = bool(count.item() > 0)
-        if not has_rows:
-            return torch.zeros_like(attn_out), torch.zeros_like(attn_out[:1]), False
+        """Center included rows around a synchronized, differentiable mean.
 
-        # Subtracting a synchronized reference before summation makes a
-        # constant attention output produce an exact zero residual even when
-        # its fp32 value is not exactly representable.
-        masked = torch.where(
-            include.view(-1, 1, 1),
-            attn_out.detach(),
-            torch.full_like(attn_out, torch.inf),
-        )
-        reference = masked.amin(dim=0, keepdim=True)
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(reference, op=dist.ReduceOp.MIN)
-        deviations = attn_out - reference
-        total_deviation = (deviations * weight).sum(dim=0, keepdim=True)
-        if dist.is_available() and dist.is_initialized():
-            total_deviation = dist_functional.all_reduce(  # type: ignore[no-untyped-call]
-                total_deviation, op=dist.ReduceOp.SUM
-            )
-        mean_deviation = total_deviation / count
-        return deviations - mean_deviation, reference + mean_deviation, True
+        Kept as a staticmethod delegating to the module-level `_global_center`
+        so tests that reach for `GatedCrossAttention._global_center` still
+        find it; the implementation is shared with the `film_logit` rung of
+        the conditioning ladder.
+        """
+        return _global_center(attn_out, include)
 
     def _update_ema(self, mu: torch.Tensor) -> None:
         """Update the post-all-reduce EMA identically on every rank."""
-        with torch.no_grad():
-            if int(self.ema_updates.item()) == 0:
-                self.ema_mu.copy_(mu.detach())
-            else:
-                self.ema_mu.mul_(self.ema_decay).add_(
-                    mu.detach(), alpha=1.0 - self.ema_decay
-                )
-            self.ema_updates.add_(1)
+        _advance_ema(self.ema_mu, self.ema_updates, mu, self.ema_decay)
 
     def forward(
         self,
@@ -196,11 +262,22 @@ class GatedCrossAttention(nn.Module):
         token_mask: torch.Tensor | None,
         active: torch.Tensor,
         edge_mask: torch.Tensor | None = None,
+        query_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Apply the gated cross-attention residual update to ``cls``.
+        """Apply the gated cross-attention residual update to the queries.
+
+        Generalized from a single ``cls`` query to an arbitrary query set for
+        the ``xattn_tokens`` rung of the conditioning ladder. With
+        ``query_mask=None`` -- which is what ``xattn_cls`` passes, and what
+        every existing caller passes -- the arithmetic is unchanged: the
+        inclusion mask stays ``(B,)``, so the centering statistic is still a
+        mean over *rows*, and the reduction dispatches to the same ATen op.
 
         Args:
-            cls: Shape ``(B, 1, d_model)`` query token.
+            cls: Shape ``(B, T_q, d_model)`` query tokens. ``T_q == 1`` (the
+                trunk's cls token) for ``xattn_cls``; every valid non-cls pair
+                token for ``xattn_tokens``. Named ``cls`` still, positionally,
+                because every existing call site passes it positionally.
             tokens: Shape ``(B, T, d_model)`` key/value tokens.
             token_mask: Optional shape ``(B, T)`` bool mask, True = valid
                 token; invalid tokens are excluded from attention.
@@ -208,9 +285,19 @@ class GatedCrossAttention(nn.Module):
                 sample; inactive samples get an exact identity bypass.
             edge_mask: Optional shape ``(B,)`` real-row mask. False/zero padded
                 filler rows are excluded from the centering mean.
+            query_mask: Optional shape ``(B, T_q)`` bool mask, True = the query
+                is a real (non-padding) token. When given, the centering mean
+                is taken over valid *tokens* rather than valid rows -- the
+                count all-reduce sums token counts -- while the EMA it feeds
+                stays a single ``(1, 1, d_model)`` statistic, so training and
+                evaluation still agree. Padding queries are still written
+                through unchanged by the final `torch.where`, since they are
+                excluded from `include` but not from `active`; their updated
+                values are discarded downstream by the trunk's own padding
+                masks.
 
         Returns:
-            Shape ``(B, 1, d_model)`` updated ``cls``.
+            Shape ``(B, T_q, d_model)`` updated queries.
         """
         key_padding_mask = None if token_mask is None else ~token_mask
         attn_out: torch.Tensor
@@ -230,7 +317,10 @@ class GatedCrossAttention(nn.Module):
                     if edge_mask is None
                     else edge_mask.to(dtype=torch.bool)
                 )
-                centered, mu, has_rows = self._global_center(attn32, active & real)
+                include = active & real
+                if query_mask is not None:
+                    include = include.unsqueeze(1) & query_mask
+                centered, mu, has_rows = self._global_center(attn32, include)
                 if has_rows:
                     self._update_ema(mu)
                 else:
@@ -242,11 +332,150 @@ class GatedCrossAttention(nn.Module):
             return torch.where(active.view(-1, 1, 1), updated, cls32)
 
 
+# ------------------------------------------------------------ conditioning ladder rungs
+
+
+class PooledAdapter(nn.Module):
+    """Zero-init low-rank adapter: a pooled graph summary added to every token.
+
+    The ``pooled_adapter`` rung. One bottleneck MLP per injection site,
+    ``d_model -> 32 -> d_model`` with the up-projection zero-initialized, so at
+    initialization the delta is exactly zero and the trunk is bit-identical to
+    the unconditioned path.
+
+    Weaker than cross-attention by construction: the conditioning enters as a
+    single vector broadcast over every token, so it can shift the trunk's
+    representation but cannot route different graph tokens to different pair
+    tokens. That is the point -- it is the rung between `film_logit`'s scalar
+    and `xattn_*`'s full attention.
+    """
+
+    def __init__(self, d_model: int, bottleneck: int = 32) -> None:
+        """Build the bottleneck, with the up-projection zeroed.
+
+        Args:
+            d_model: Trunk width.
+            bottleneck: Adapter rank.
+        """
+        super().__init__()
+        self.down = nn.Linear(d_model, bottleneck)
+        self.up = nn.Linear(bottleneck, d_model)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, pooled: torch.Tensor) -> torch.Tensor:
+        """Map a pooled graph summary to a per-row token delta.
+
+        Args:
+            pooled: Shape ``(B, d_model)``.
+
+        Returns:
+            Shape ``(B, 1, d_model)``, ready to broadcast over the token axis.
+        """
+        delta: torch.Tensor = self.up(F.gelu(self.down(pooled)))
+        return delta.unsqueeze(1)
+
+
+class FilmLogitConditioner(nn.Module):
+    """Zero-init FiLM on the fused pair logit -- the weakest ladder rung.
+
+    Maps the pooled graph summary to ``(s, t)``; the classifier applies
+    ``z' = z * (1 + tanh(s)) + t`` to its single fused logit. There is no path
+    by which topology can change the *representation*: it can only rescale and
+    shift the decision value. If a run improves under `xattn_cls` but not under
+    this, the gain came from representation shaping rather than from a
+    calibration signal -- precisely the confound the ladder exists to separate.
+
+    ``(s, t)`` are centered with exactly the same synchronized-mean-plus-EMA
+    machinery `GatedCrossAttention` uses (`_global_center` / `_advance_ema`,
+    shared, not forked): without it, a conditioning signal that happened to be
+    constant across the batch would act as a free global bias on every logit
+    and would be scored as "topology helped".
+
+    Its EMA buffers are its own (`ema_mu` shape ``(1, 1, 2)``), so they can
+    never collide with `GatedCrossAttention`'s ``(1, 1, d_model)`` ones in a
+    checkpoint -- the two rungs are mutually exclusive anyway.
+    """
+
+    ema_mu: torch.Tensor
+    ema_updates: torch.Tensor
+
+    def __init__(self, d_model: int, hidden: int = 64, *, ema_decay: float = 0.99) -> None:
+        """Build the zero-initialized ``(s, t)`` head.
+
+        Args:
+            d_model: Width of the pooled graph summary.
+            hidden: Bottleneck width.
+            ema_decay: Decay of the centering EMA.
+
+        Raises:
+            ValueError: If `ema_decay` is not in ``(0, 1)``.
+        """
+        super().__init__()
+        if not 0.0 < ema_decay < 1.0:
+            raise ValueError(f"ema_decay must be in (0, 1), got {ema_decay}")
+        self.ema_decay = float(ema_decay)
+        self.norm = nn.LayerNorm(d_model)
+        self.fc1 = nn.Linear(d_model, hidden)
+        self.fc2 = nn.Linear(hidden, 2)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+        self.register_buffer("ema_mu", torch.zeros(1, 1, 2))
+        self.register_buffer("ema_updates", torch.zeros((), dtype=torch.int64))
+
+    def forward(
+        self,
+        pooled: torch.Tensor,
+        active: torch.Tensor,
+        edge_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return the centered ``(s, t)`` pair for every row.
+
+        Args:
+            pooled: Shape ``(B, d_model)`` pooled graph summary, on the same
+                doubled AB/BA batch the trunk runs.
+            active: Shape ``(B,)`` bool pathway-activity mask.
+            edge_mask: Optional shape ``(B,)`` real-row mask.
+
+        Returns:
+            Shape ``(B, 2)`` centered ``(s, t)``. Exactly zero at
+            initialization, for every row, because `fc2` is zero-initialized
+            and centering a constant-zero signal yields zero.
+        """
+        with torch.autocast(device_type=pooled.device.type, enabled=False):
+            raw = self.fc2(F.gelu(self.fc1(self.norm(pooled.float())))).unsqueeze(1)
+            if self.training:
+                real = (
+                    torch.ones_like(active, dtype=torch.bool)
+                    if edge_mask is None
+                    else edge_mask.to(dtype=torch.bool)
+                )
+                centered, mu, has_rows = _global_center(raw, active & real)
+                if has_rows:
+                    _advance_ema(self.ema_mu, self.ema_updates, mu, self.ema_decay)
+                else:
+                    centered = raw - self.ema_mu
+            else:
+                centered = raw - self.ema_mu
+            return centered.squeeze(1)
+
+
 # --------------------------------------------------------------------------- conditioned trunk
 
 
 class ConditionedPairCrossAttention(PairCrossAttention):
-    """PairCrossAttention + zero-init gated cls conditioning (§3.4 pins)."""
+    """PairCrossAttention + one zero-init conditioning rung (§3.4 pins).
+
+    Exactly one rung's modules are constructed, selected by
+    `conditioning_mode`. Constructing all of them and gating at runtime would
+    leave the unselected ones as parameters that never receive gradient, which
+    DDP rejects (or, with `find_unused_parameters=True`, pays for on every
+    step) -- and would perturb the RNG stream so that two ladder arms differed
+    by more than the mechanism under test.
+
+    ``film_logit`` builds nothing here: it acts on the fused logit, which is
+    `B0V31PairClassifier`'s to apply, not the trunk's.
+    """
 
     def __init__(
         self,
@@ -255,13 +484,29 @@ class ConditionedPairCrossAttention(PairCrossAttention):
         xattn_heads: int = 8,
         xattn_dropout: float = 0.0,
         conditioning_ema_decay: float = 0.99,
+        conditioning_mode: str = "xattn_cls",
         d_model: int,
         **kwargs: object,
     ) -> None:
         super().__init__(d_model=d_model, **kwargs)  # type: ignore[arg-type]
         if not 1 <= n_inj <= len(self.layers):
             raise ValueError("n_inj must be in [1, n_layers]")
+        if conditioning_mode not in CONDITIONING_MODES:
+            raise ValueError(
+                f"conditioning_mode must be one of {sorted(CONDITIONING_MODES)}, "
+                f"got {conditioning_mode!r}"
+            )
         self.n_inj = n_inj
+        self.conditioning_mode = conditioning_mode
+        # `topo_xattn` keeps its name and its `nn.ModuleList` position, so
+        # rev-3.1 `xattn_cls` checkpoints keep loading unchanged. For the two
+        # non-cross-attention rungs it is an *empty* list rather than absent:
+        # it holds no modules and therefore contributes no parameters and no
+        # `state_dict` keys (the DDP requirement is satisfied either way), but
+        # `train_egostitch._e2e_gate_tanh` reads `trunk.topo_xattn`
+        # unconditionally for its `gate_topo_tanh` telemetry, and an absent
+        # attribute would crash those arms mid-run over a diagnostic. An empty
+        # readout is the honest answer there: those rungs have no gate.
         self.topo_xattn = nn.ModuleList(
             GatedCrossAttention(
                 d_model,
@@ -269,8 +514,64 @@ class ConditionedPairCrossAttention(PairCrossAttention):
                 xattn_dropout,
                 ema_decay=conditioning_ema_decay,
             )
-            for _ in range(n_inj)
+            for _ in range(n_inj if conditioning_mode in ("xattn_cls", "xattn_tokens") else 0)
         )
+        if conditioning_mode == "pooled_adapter":
+            self.pooled_adapter = nn.ModuleList(
+                PooledAdapter(d_model) for _ in range(n_inj)
+            )
+
+    def _inject_token_xattn(
+        self,
+        inj: int,
+        h_a: torch.Tensor,
+        h_b: torch.Tensor,
+        pad_a: torch.Tensor | None,
+        pad_b: torch.Tensor | None,
+        topo_tokens: torch.Tensor,
+        topo_active: torch.Tensor,
+        edge_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cross-attend from *every* valid pair token onto the graph tokens.
+
+        The ``xattn_tokens`` rung. Both item streams are queried in a single
+        call, concatenated along the token axis, so the whole injection site
+        still produces exactly **one** synchronized centering statistic and
+        advances its EMA exactly **once** -- the design §4 invariant that two
+        separate calls would break.
+
+        Padding queries are excluded from that statistic (via `query_mask`) but
+        still pass through the module; their outputs are discarded by the
+        trunk's own padding masks in the following layer, so including them
+        would only have polluted the mean.
+
+        Args:
+            inj: Injection-site index into `topo_xattn`.
+            h_a: Item A hidden states.
+            h_b: Item B hidden states.
+            pad_a: Item A padding mask (True = PAD, `_build_padding_mask`'s
+                convention), or `None` when no lengths were supplied.
+            pad_b: Item B padding mask.
+            topo_tokens: Graph tokens to attend over.
+            topo_active: Per-row pathway-activity mask.
+            edge_mask: Optional real-row mask.
+
+        Returns:
+            The updated ``(h_a, h_b)``.
+        """
+        split = (h_a.size(1), h_b.size(1))
+        queries = torch.cat((h_a, h_b), dim=1)
+        if pad_a is None or pad_b is None:
+            query_mask = torch.ones(
+                queries.shape[:2], dtype=torch.bool, device=queries.device
+            )
+        else:
+            query_mask = ~torch.cat((pad_a, pad_b), dim=1)
+        updated = self.topo_xattn[inj](
+            queries, topo_tokens, None, topo_active, edge_mask, query_mask
+        )
+        new_a, new_b = updated.split(split, dim=1)
+        return new_a, new_b
 
     def forward(
         self,
@@ -280,10 +581,11 @@ class ConditionedPairCrossAttention(PairCrossAttention):
         lengths_b: torch.Tensor,
         *,
         topo_tokens: torch.Tensor | None = None,
+        topo_pooled: torch.Tensor | None = None,
         topo_active: torch.Tensor | None = None,
         edge_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run the pair trunk with optional gated topo cls conditioning.
+        """Run the pair trunk with the selected zero-init conditioning rung.
 
         Args:
             h_a: Item A hidden states ``(batch, seq_len_a, d_model)``.
@@ -291,9 +593,11 @@ class ConditionedPairCrossAttention(PairCrossAttention):
             lengths_a: Sequence lengths for A ``(batch,)``.
             lengths_b: Sequence lengths for B ``(batch,)``.
             topo_tokens: Optional scaffold tokens ``(batch, T, d_model)`` for
-                the topo cross-attention pathway; ``None`` is a hard bypass.
-            topo_active: Optional ``(batch,)`` bool mask gating the topo
-                pathway per-sample; required alongside ``topo_tokens``.
+                the ``xattn_*`` pathways; ``None`` is a hard bypass.
+            topo_pooled: Optional pooled graph summary ``(batch, d_model)`` for
+                the ``pooled_adapter`` pathway; ``None`` is a hard bypass.
+            topo_active: Optional ``(batch,)`` bool mask gating the pathway
+                per-sample; required alongside either conditioning input.
             edge_mask: Optional ``(batch,)`` real-row mask used to exclude DDP
                 filler rows from conditioning means.
 
@@ -315,9 +619,24 @@ class ConditionedPairCrossAttention(PairCrossAttention):
         for idx, layer in enumerate(self.layers):
             h_a, h_b, cls_token = layer(h_a, h_b, cls_token, mask_a, mask_b)
             inj = idx - (n_layers - self.n_inj)
-            if inj >= 0 and topo_tokens is not None and topo_active is not None:
+            if inj < 0 or topo_active is None:
+                continue
+            mode = self.conditioning_mode
+            if mode == "xattn_cls" and topo_tokens is not None:
                 cls_token = self.topo_xattn[inj](
                     cls_token, topo_tokens, None, topo_active, edge_mask
+                )
+            elif mode == "xattn_tokens" and topo_tokens is not None:
+                h_a, h_b = self._inject_token_xattn(
+                    inj, h_a, h_b, mask_a, mask_b, topo_tokens, topo_active, edge_mask
+                )
+            elif mode == "pooled_adapter" and topo_pooled is not None:
+                delta = self.pooled_adapter[inj](topo_pooled)
+                h_a = h_a + torch.where(
+                    topo_active.view(-1, 1, 1), delta, torch.zeros_like(delta)
+                )
+                h_b = h_b + torch.where(
+                    topo_active.view(-1, 1, 1), delta, torch.zeros_like(delta)
                 )
         cls_vec = cls_token.squeeze(1)
         if self.pair_readout_mode == "pair_context_gated":
@@ -387,6 +706,7 @@ class B0V31PairClassifier(PairClassifier):
         n_inj: int = 1,
         xattn_heads: int = 8,
         conditioning_ema_decay: float = 0.99,
+        conditioning_mode: str = "xattn_cls",
         dropout: float = 0.1,
         token_dropout: float = 0.0,
     ) -> None:
@@ -405,10 +725,23 @@ class B0V31PairClassifier(PairClassifier):
             xattn_heads: Gated cross-attention heads (topo pathway).
             conditioning_ema_decay: Decay for the synchronized
                 conditioning-center EMA.
+            conditioning_mode: Which rung of the conditioning ladder to build
+                -- exactly one (`ClassifierConfig.conditioning_mode`). All
+                four are zero-initialized, so at initialization every one of
+                them produces bit-identical logits to the `cond=None` path.
             dropout: Shared dropout rate for the encoder, trunk, and head.
             token_dropout: `SiameseEncoder` token-level dropout rate.
+
+        Raises:
+            ValueError: On an unregistered `conditioning_mode`.
         """
         super().__init__()
+        if conditioning_mode not in CONDITIONING_MODES:
+            raise ValueError(
+                f"conditioning_mode must be one of {sorted(CONDITIONING_MODES)}, "
+                f"got {conditioning_mode!r}"
+            )
+        self.conditioning_mode = conditioning_mode
         self.encoder = SiameseEncoder(
             input_dim=input_dim,
             d_model=d_model,
@@ -427,6 +760,7 @@ class B0V31PairClassifier(PairClassifier):
             n_inj=n_inj,
             xattn_heads=xattn_heads,
             conditioning_ema_decay=conditioning_ema_decay,
+            conditioning_mode=conditioning_mode,
         )
         self.head = MLPHead(
             input_dim=d_model,
@@ -436,6 +770,36 @@ class B0V31PairClassifier(PairClassifier):
             activation="gelu",
             norm="layernorm",
         )
+        # Built here rather than in the trunk: `film_logit` modulates the fused
+        # AB/BA logit, which only exists after `forward`'s max-fuse. Built
+        # *only* for that mode, so no other arm carries a never-updated
+        # parameter (DDP unused-parameter safety).
+        if conditioning_mode == "film_logit":
+            self.film = FilmLogitConditioner(d_model, ema_decay=conditioning_ema_decay)
+
+    def freeze_unreachable_conditioning(self) -> None:
+        """Freeze whichever conditioning-ladder rung this instance built.
+
+        See `PairClassifier.freeze_unreachable_conditioning` -- this is the
+        composite's response to `generator.name: "null"`, under which
+        `self.trunk.forward`'s `need_topo` is always `False` and none of
+        these submodules ever run. Frozen, not omitted: `self.trunk.topo_xattn`
+        keeps its name, `nn.ModuleList` position, and populated-or-empty
+        shape exactly as built (the checkpoint-compatibility and
+        `train_egostitch._e2e_gate_tanh` telemetry reasons documented at
+        `ConditionedPairCrossAttention.__init__`, above), and
+        `self.trunk.pooled_adapter` / `self.film` keep their usual
+        `state_dict` keys too -- only `requires_grad` changes.
+        """
+        for module in self.trunk.topo_xattn:
+            module.requires_grad_(False)
+        pooled_adapter = getattr(self.trunk, "pooled_adapter", None)
+        if pooled_adapter is not None:
+            for module in pooled_adapter:
+                module.requires_grad_(False)
+        film = getattr(self, "film", None)
+        if film is not None:
+            film.requires_grad_(False)
 
     def encode_tokens(self, emb: torch.Tensor, length: torch.Tensor) -> torch.Tensor:
         """Run the cacheable `SiameseEncoder` pass for one endpoint batch.
@@ -481,26 +845,31 @@ class B0V31PairClassifier(PairClassifier):
         distributed_training = self.training and dist.is_available() and dist.is_initialized()
         need_topo = cond is not None and (bool(masks.topo.any()) or distributed_training)
         topo_tokens: torch.Tensor | None = None
+        topo_pooled: torch.Tensor | None = None
         if need_topo:
             assert cond is not None
-            topo_tokens = torch.cat((cond.ab.tokens, cond.ba.tokens))
+            if self.conditioning_mode in ("xattn_cls", "xattn_tokens"):
+                topo_tokens = torch.cat((cond.ab.tokens, cond.ba.tokens))
+            elif self.conditioning_mode == "pooled_adapter":
+                topo_pooled = torch.cat((cond.ab.pooled, cond.ba.pooled))
 
         max_tokens = max(encoded_a.size(1), encoded_b.size(1))
         encoded_a = F.pad(encoded_a, (0, 0, 0, max_tokens - encoded_a.size(1)))
         encoded_b = F.pad(encoded_b, (0, 0, 0, max_tokens - encoded_b.size(1)))
 
+        doubled_active = torch.cat((masks.topo, masks.topo)) if need_topo else None
+        doubled_edge_mask = (
+            torch.cat((pair.edge_mask, pair.edge_mask)) if pair.edge_mask is not None else None
+        )
         pair_features = self.trunk(
             torch.cat((encoded_a, encoded_b)),
             torch.cat((encoded_b, encoded_a)),
             torch.cat((pair.len_a, pair.len_b)),
             torch.cat((pair.len_b, pair.len_a)),
             topo_tokens=topo_tokens,
-            topo_active=torch.cat((masks.topo, masks.topo)) if need_topo else None,
-            edge_mask=(
-                torch.cat((pair.edge_mask, pair.edge_mask))
-                if pair.edge_mask is not None
-                else None
-            ),
+            topo_pooled=topo_pooled,
+            topo_active=doubled_active,
+            edge_mask=doubled_edge_mask,
         )
         feat_ab, feat_ba = pair_features.chunk(2)
         feat = torch.max(torch.stack([feat_ab, feat_ba], dim=-1), dim=-1).values
@@ -510,6 +879,23 @@ class B0V31PairClassifier(PairClassifier):
         # residual (CLAUDE.md "fp32 island"; design §4).
         with torch.autocast(device_type=feat.device.type, enabled=False):
             logits: torch.Tensor = self.head(feat.float()).squeeze(-1)
+            if self.conditioning_mode == "film_logit" and need_topo:
+                assert cond is not None and doubled_active is not None
+                pooled = torch.cat((cond.ab.pooled, cond.ba.pooled))
+                film = self.film(pooled, doubled_active, doubled_edge_mask)
+                # The FiLM parameters are produced per *direction* on the same
+                # doubled trunk batch every other rung uses, then averaged:
+                # the fused logit is symmetric in AB/BA (the max-fuse above),
+                # so an asymmetric modulation of it would silently reintroduce
+                # an endpoint order the rest of the model is careful not to
+                # have. The mean is the only symmetric fusion that is still
+                # exactly zero when both directions are zero, which is what
+                # keeps the zero-init identity bit-exact.
+                film_ab, film_ba = film.chunk(2)
+                scale, shift = (0.5 * (film_ab + film_ba)).unbind(dim=-1)
+                logits = torch.where(
+                    masks.topo, logits * (1.0 + torch.tanh(scale)) + shift, logits
+                )
         return logits
 
 
@@ -876,9 +1262,11 @@ __all__ = [
     "BEST_V3_1_CONFIG",
     "BEST_V3_1_SELECTION",
     "ConditionedPairCrossAttention",
+    "FilmLogitConditioner",
     "GatedCrossAttention",
     "NULL_ALL_HEAD",
     "NULL_NONE",
+    "PooledAdapter",
     "V3_1",
     "build_best_v3_1",
     "masks_for_null",

@@ -37,6 +37,8 @@ class NullGenerator(NeighborhoodGenerator[torch.Tensor, object, ImaginedGraph]):
         x: torch.Tensor,
         ground: torch.Tensor,
         ground_ids: torch.Tensor | None = None,
+        *,
+        node_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return the cheapest possible placeholder: `x` itself, unmodified.
 
@@ -48,11 +50,12 @@ class NullGenerator(NeighborhoodGenerator[torch.Tensor, object, ImaginedGraph]):
             x: Shape ``(B, d)`` node features, returned unchanged.
             ground: Unused.
             ground_ids: Unused.
+            node_rows: Unused.
 
         Returns:
             `x`, unchanged.
         """
-        del ground, ground_ids
+        del ground, ground_ids, node_rows
         return x
 
     def stitch(
@@ -76,6 +79,23 @@ class NullGenerator(NeighborhoodGenerator[torch.Tensor, object, ImaginedGraph]):
         """
         del state_a, state_b, is_self, perturbation
         return None
+
+    def graph_dims(self) -> tuple[int, int]:
+        """Always raise: there is no graph, so there are no dimensions to size.
+
+        The composite never calls this -- it constructs no encoder at all for
+        a null-generator model (`composite.py`'s ``self.encoder = None``
+        branch, design §12 P3). Raising rather than returning a placeholder
+        keeps that invariant checkable: if this ever fires, something built an
+        encoder for a model that has nothing to encode.
+
+        Raises:
+            RuntimeError: Unconditionally.
+        """
+        raise RuntimeError(
+            "NullGenerator emits no ImaginedGraph, so it has no graph dimensions; "
+            "a null-generator model must not construct a GraphEncoder at all"
+        )
 
     def auxiliary_losses(
         self, graph: ImaginedGraph | None, batch: Mapping[str, torch.Tensor]
