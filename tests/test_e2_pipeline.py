@@ -32,6 +32,7 @@ from src.e2_pipeline import (
 
 pytestmark = pytest.mark.unit
 
+
 @pytest.fixture(autouse=True)
 def _avoid_pack_process_pool_startup(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pipeline unit tests need pack semantics, not OS process startup."""
@@ -154,8 +155,17 @@ def test_run_command_timeout_kills_the_whole_process_group(tmp_path: Path) -> No
         "time.sleep(60)"
     )
 
+    # The budget only has to be short relative to the child's 60 s sleep -- it is
+    # never a measurement of how fast the kill is. It does have to be long enough
+    # for the child to reach `write_text`, which costs an interpreter start plus a
+    # `Popen`. At 0.5 s that raced: under `hpc/run.sh check`'s xdist workers on the
+    # H20 container the child died before writing the pid file, and the test failed
+    # with `FileNotFoundError` on `grandchild.pid` without ever reaching its
+    # assertion. Widening the budget removes the race and weakens nothing -- the
+    # grandchild still has ~55 s of sleep left when the group is killed, so a
+    # surviving grandchild is caught exactly as before.
     with pytest.raises(subprocess.TimeoutExpired):
-        run_command([sys.executable, "-c", script], 0.5)
+        run_command([sys.executable, "-c", script], 5.0)
 
     grandchild_pid = int(grandchild_pid_path.read_text())
     state = subprocess.run(
@@ -522,11 +532,7 @@ def _write_train_outputs(output_dir: Path) -> None:
     (output_dir / "metrics.jsonl").write_text(
         '{"epoch": 1, "val_auroc": 0.7}\n{"epoch": 2, "val_auroc": 0.8}\n'
     )
-    (output_dir / "run_metadata.json").write_text(
-        json.dumps(
-            {"config_hash": "abc123"}
-        )
-    )
+    (output_dir / "run_metadata.json").write_text(json.dumps({"config_hash": "abc123"}))
 
 
 def _valid_worker_profile() -> dict[str, object]:
