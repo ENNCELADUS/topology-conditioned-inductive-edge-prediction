@@ -67,8 +67,7 @@ nodes?" (`docs/lit-review-plan.md` §5, binding for all writing.)
   is fixed-Seed-0 engineering evidence; p-values/CIs/Holm must be `null`. Only E1/E3
   (≥3 seeds + Holm) carry inference.
 - **The topology result is five numbers, always reported together and never
-  aggregated: GS, RD, and the degree / clustering / spectral MMD ratios.** These are
-  PRING's five topology-aware metrics (arXiv:2507.05101 §3.2.1, Apx. D.1.4). GS↑,
+  aggregated: GS, RD, and the degree / clustering / spectral MMD ratios.** GS↑,
   RD→1, the three MMD ratios↓. Never collapse the three MMD ratios into one score,
   and never invent a composite and label it "graph similarity" — **GS is a real,
   separate metric** (edge-set Dice/F1, `src/eval/graph_metrics.py:19`), not a
