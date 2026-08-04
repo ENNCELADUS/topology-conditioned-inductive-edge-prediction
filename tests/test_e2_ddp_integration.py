@@ -268,10 +268,17 @@ def _validation_worker(output_dir: Path) -> None:
         x: torch.Tensor,
         ground: torch.Tensor,
         ground_ids: torch.Tensor | None = None,
+        # Wave-1 oracle-scaffold addendum: `encode_node_state` gained the
+        # per-node F0 row identity so `oracle_struct` can look its scaffold up.
+        # This spy has to mirror the live signature exactly -- `_validate_epoch`
+        # passes `node_rows` positionally, so omitting it here raises
+        # "takes from 5 to 6 positional arguments but 7 were given" inside the
+        # rank subprocess, where the traceback only surfaces as a returncode.
+        node_rows: torch.Tensor | None = None,
     ) -> E2ENodeState:
         nonlocal encoded_rows
         encoded_rows += int(emb.shape[0])
-        return original_encode(emb, length, x, ground, ground_ids)
+        return original_encode(emb, length, x, ground, ground_ids, node_rows)
 
     def checked_score(
         self: EgoStitchModel,
@@ -305,9 +312,7 @@ def _validation_worker(output_dir: Path) -> None:
     shard_len = (len(data.val_pairs) + accelerator.num_processes - 1) // accelerator.num_processes
     while len(shard_rows) < shard_len:
         shard_rows.append(shard_rows[0] if shard_rows else 0)
-    expected_nodes = {
-        node for row in shard_rows for node in data.val_pairs[row]
-    }
+    expected_nodes = {node for row in shard_rows for node in data.val_pairs[row]}
     (output_dir / f"validation-rank-{rank}.json").write_text(
         json.dumps(
             {
@@ -349,13 +354,11 @@ def test_two_rank_cpu_egostitch_validation_is_exact_and_deadlock_free(tmp_path: 
     assert serial_run.returncode == 0, serial_run.stderr
 
     rank_summaries = [
-        json.loads((ddp_dir / f"validation-rank-{rank}.json").read_text())
-        for rank in range(2)
+        json.loads((ddp_dir / f"validation-rank-{rank}.json").read_text()) for rank in range(2)
     ]
     assert [summary["expected_unique_nodes"] for summary in rank_summaries] == [5, 4]
     assert all(
-        summary["encoded_rows"] == summary["expected_unique_nodes"]
-        for summary in rank_summaries
+        summary["encoded_rows"] == summary["expected_unique_nodes"] for summary in rank_summaries
     )
     assert all(summary["pair_output_is_fp32"] is True for summary in rank_summaries)
     assert [summary["returned_result"] for summary in rank_summaries] == [True, False]
