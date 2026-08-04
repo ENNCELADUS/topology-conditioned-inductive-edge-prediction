@@ -2,9 +2,12 @@
 
 The key test is numerical equivalence with the live `EgoStitchModel` path:
 capturing the exact `ScaffoldTokens` `build_pair_context_from_states` builds
-internally and checking `EgoStitchImagineGenerator` reproduces it bit-for-bit
-for the same weights and inputs is the proof this is a behaviour-preserving
-port, not a reimplementation that happens to look similar.
+internally and checking `EgoStitchImagineGenerator` reproduces it to within
+floating-point equivalence for the same weights and inputs is the proof this
+is a behaviour-preserving port, not a reimplementation that happens to look
+similar. The comparison is `assert_close`, not bit-identity: the two routes
+order their ops differently, so the last ulp tracks the platform's BLAS/FMA
+contraction (see `_EQUIV_RTOL` below).
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ from typing import cast
 
 import pytest
 import torch
+import torch.testing
 from src.model.egostitch.composite import EgoStitchModel
 from src.model.egostitch.config import (
     ClassifierConfig,
@@ -40,6 +44,13 @@ from src.model.egostitch.generator.imagine import FeatureStandardizationMode, Sl
 from src.model.egostitch.generator.losses import alignment_loss, alignment_teacher_cells
 
 pytestmark = pytest.mark.unit
+
+# Component-vs-live equivalence tolerance; see the identically named constants
+# in `tests/model/test_classifier_component.py` for the full rationale. Kept at
+# 1e-5 so the assertion is portable between Apple silicon and the x86 H20
+# container while staying far tighter than any real regression.
+_EQUIV_RTOL = 1e-5
+_EQUIV_ATOL = 1e-5
 
 _TINY = EgoStitchConfig(
     input_dim=8,
@@ -354,10 +365,30 @@ def test_matches_live_e2e_build_pair_context(monkeypatch: pytest.MonkeyPatch) ->
 
     graph = generator(x_a, x_b, ground_a, ground_b, is_self=is_self)
 
-    assert torch.equal(graph.x, live_scaffold.feats)  # type: ignore[attr-defined]
-    assert torch.equal(graph.adj, live_scaffold.adj)  # type: ignore[attr-defined]
-    assert torch.equal(graph.aux["plan"], context.plan)
-    assert torch.equal(graph.aux["log_plan"], context.log_plan)
+    # Numerically equivalent, not bit-identical: the standalone component and
+    # the live model reach the same scaffold by different op orders, so the
+    # last ulp depends on the platform's BLAS/FMA contraction. `torch.equal`
+    # held on Apple silicon and failed on the x86 H20 container (verified
+    # failing at the pre-Wave-1 base `73d44ba` -- a portability defect in the
+    # assertion, not a regression in the generator). `assert_close` compares
+    # `-inf` cells in `log_plan` as equal, which is what the alignment loss
+    # requires of an impossible plan cell.
+    torch.testing.assert_close(
+        graph.x,  # type: ignore[attr-defined]
+        live_scaffold.feats,
+        rtol=_EQUIV_RTOL,
+        atol=_EQUIV_ATOL,
+    )
+    torch.testing.assert_close(
+        graph.adj,  # type: ignore[attr-defined]
+        live_scaffold.adj,
+        rtol=_EQUIV_RTOL,
+        atol=_EQUIV_ATOL,
+    )
+    torch.testing.assert_close(graph.aux["plan"], context.plan, rtol=_EQUIV_RTOL, atol=_EQUIV_ATOL)
+    torch.testing.assert_close(
+        graph.aux["log_plan"], context.log_plan, rtol=_EQUIV_RTOL, atol=_EQUIV_ATOL
+    )
 
 
 # --------------------------------------------------------------------------- two-phase caching
@@ -391,9 +422,9 @@ def test_encode_node_once_then_stitch_against_several_counterparts_matches_fused
         assert torch.equal(cached_graph.adj, fused_graph.adj), counterpart_seed
         assert torch.equal(cached_graph.mask, fused_graph.mask), counterpart_seed
         assert torch.equal(cached_graph.aux["plan"], fused_graph.aux["plan"]), counterpart_seed
-        assert torch.equal(
-            cached_graph.aux["log_plan"], fused_graph.aux["log_plan"]
-        ), counterpart_seed
+        assert torch.equal(cached_graph.aux["log_plan"], fused_graph.aux["log_plan"]), (
+            counterpart_seed
+        )
 
 
 def test_generator_node_state_survives_index_select_index_copy_and_restack() -> None:
@@ -417,9 +448,7 @@ def test_generator_node_state_survives_index_select_index_copy_and_restack() -> 
         return GeneratorNodeState(
             slots=SlotSet(*(value[row : row + 1] for value in source.slots)),
             projected_x=source.projected_x[row : row + 1],
-            ground_ids=(
-                None if source.ground_ids is None else source.ground_ids[row : row + 1]
-            ),
+            ground_ids=(None if source.ground_ids is None else source.ground_ids[row : row + 1]),
         )
 
     row0 = _row(state, 0)
@@ -427,9 +456,7 @@ def test_generator_node_state_survives_index_select_index_copy_and_restack() -> 
 
     # re-stack: rebuild a 2-row batch by concatenation, mirroring `_stack_cached`.
     restacked = GeneratorNodeState(
-        slots=SlotSet(
-            *(torch.cat(values) for values in zip(row0.slots, row2.slots, strict=True))
-        ),
+        slots=SlotSet(*(torch.cat(values) for values in zip(row0.slots, row2.slots, strict=True))),
         projected_x=torch.cat([row0.projected_x, row2.projected_x]),
         ground_ids=(
             None

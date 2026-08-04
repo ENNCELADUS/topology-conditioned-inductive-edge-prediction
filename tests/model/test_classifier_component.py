@@ -33,6 +33,27 @@ from src.model.egostitch.composite import E2EPairContext, EgoStitchModel
 from src.model.egostitch.config import ClassifierConfig, E2EConfig, EncoderConfig, GeneratorConfig
 from src.model.egostitch.graph import GraphEmbedding, PairConditioning, PairInputs
 
+# Tolerance for "the component path and the live path compute the same thing".
+#
+# These assertions compare two *independently written* routes to the same
+# quantity (`classifier(pair, ...)` against `model.decompose(...)["f_logit"]` /
+# `model.score_pair_context(...)`), not one op sequence against itself. Equal
+# mathematics reached by different op orders diverges at the last ulp or two,
+# and by how much depends on the BLAS/FMA contraction the platform picks --
+# so `rtol=0.0, atol=1e-6` held on Apple silicon but failed on the x86 H20
+# container at 1.0132789611816406e-06 (verified failing at the pre-Wave-1 base
+# `73d44ba`, i.e. this is a portability defect in the assertion, never a
+# regression in the classifier).
+#
+# 1e-5 keeps ~10x headroom over the observed divergence while staying orders of
+# magnitude tighter than any real bypass regression, which would move the logit
+# by O(0.1) or more. Do not re-tighten these to an exact/1e-6 bound: green on
+# macOS proves nothing about the container, and `hpc/run.sh check` runs
+# `set -euo pipefail`, so one failure here aborts the gate before the DDP
+# integration tests ever run.
+_EQUIV_RTOL = 1e-5
+_EQUIV_ATOL = 1e-5
+
 # --- Shared fixtures ----------------------------------------------------------
 
 
@@ -235,7 +256,7 @@ def test_conditioned_matches_score_pair_context() -> None:
     expected = model.score_pair_context(context)
     actual = classifier(pair, cond)
 
-    torch.testing.assert_close(actual, expected, rtol=0.0, atol=1e-6)
+    torch.testing.assert_close(actual, expected, rtol=_EQUIV_RTOL, atol=_EQUIV_ATOL)
 
 
 def test_unconditioned_matches_f_logit_bypass() -> None:
@@ -248,7 +269,7 @@ def test_unconditioned_matches_f_logit_bypass() -> None:
     expected = model.decompose(batch)["f_logit"]
     actual = classifier(pair, None)
 
-    torch.testing.assert_close(actual, expected, rtol=0.0, atol=1e-6)
+    torch.testing.assert_close(actual, expected, rtol=_EQUIV_RTOL, atol=_EQUIV_ATOL)
 
 
 def test_conditioned_masked_off_also_matches_f_logit() -> None:
@@ -264,7 +285,7 @@ def test_conditioned_masked_off_also_matches_f_logit() -> None:
     expected = model.decompose(batch)["f_logit"]
     actual = classifier(pair, cond, masks=masks)
 
-    torch.testing.assert_close(actual, expected, rtol=0.0, atol=1e-6)
+    torch.testing.assert_close(actual, expected, rtol=_EQUIV_RTOL, atol=_EQUIV_ATOL)
 
 
 # --- (e): `cond=None` equals the conditioned model's own `f_logit` bypass -----
