@@ -45,10 +45,10 @@ pytest.importorskip("src.model.egostitch.generator.oracle")
 from src.data.ego_targets import EgoTargetBuilder
 from src.model.egostitch.generator.egostitch import GeneratorNodeState, StitchedGraph
 from src.model.egostitch.generator.oracle import (
+    _ROW_ID_STRIDE,
     OracleScaffoldTable,
     OracleStructGenerator,
     _node_rng,
-    _ROW_ID_STRIDE,
     build_oracle_table,
 )
 

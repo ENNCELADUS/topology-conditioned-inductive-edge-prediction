@@ -718,10 +718,10 @@ class OracleStructGenerator(
         own_row: torch.Tensor,
         partner_row: torch.Tensor,
     ) -> SlotSet:
-        """Exact leave-one-out: substitute the precomputed override row when one
-        exists, else fall back to `_drop_partner_slots`'s per-slot zeroing.
+        """Exact leave-one-out: substitute the precomputed override row when one exists.
 
-        An override row exists exactly when ``own_row`` names a hub
+        Falls back to `_drop_partner_slots`'s per-slot zeroing otherwise. An
+        override row exists exactly when ``own_row`` names a hub
         (``deg > K``) and ``partner_row`` names one of its *true* neighbors --
         the only regime in which `_drop_partner_slots`'s zeroing is not
         already exact (its own docstring). The lookup is a batched
