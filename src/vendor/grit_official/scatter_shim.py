@@ -123,6 +123,11 @@ def scatter_add(
         shape = list(src.shape)
         shape[dim] = _output_size(index, dim_size)
         out = src.new_zeros(shape)
+    elif src.dtype != out.dtype:
+        # Autocast can leave attention weights in fp32 while the caller's
+        # preallocated message buffer is bf16. The destination owns the dtype
+        # for the out= form, so convert before the in-place reduction.
+        src = src.to(dtype=out.dtype)
     if dim == 0 and index.dim() == 1:
         # `index_add_` takes the 1-D index directly. That matters: the hottest
         # call site scatters `(num_edges, num_heads, out_dim)` messages, and

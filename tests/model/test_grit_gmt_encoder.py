@@ -92,6 +92,20 @@ def test_scatter_add_out_kwarg_accumulates_in_place_matching_torch_scatter() -> 
     assert got is out  # torch_scatter's out= form accumulates into and returns `out`
 
 
+@pytest.mark.parametrize("reduce", ["add", "sum"])
+def test_scatter_add_out_kwarg_casts_float_source_to_bfloat16_output(reduce: str) -> None:
+    src = torch.tensor([[0.5, 1.0], [1.5, -2.0], [2.0, 3.0]], dtype=torch.float32)
+    index = torch.tensor([0, 1, 0])
+    out = torch.ones(2, 2, dtype=torch.bfloat16)
+    expected = torch.tensor([[3.5, 5.0], [2.5, -1.0]], dtype=torch.bfloat16)
+
+    got = scatter(src, index, dim=0, out=out, reduce=reduce)
+
+    torch.testing.assert_close(got, expected)
+    assert got is out
+    assert got.dtype == torch.bfloat16
+
+
 def test_scatter_max_matches_reference_values_and_argmax() -> None:
     torch.manual_seed(2)
     src = torch.randn(20)
