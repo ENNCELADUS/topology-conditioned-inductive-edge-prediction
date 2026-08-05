@@ -222,6 +222,12 @@ class GeneratorConfig:
             recorded hash whether or not the selected arm reads it, or two
             oracle runs with different subsamples would be indistinguishable
             in the run record.
+        oracle_truth_source: Graph ``"oracle_struct"`` reads its scaffolds from.
+            ``"g_fit"`` keeps the inductive input boundary, so every held-out
+            node gets an empty scaffold. ``"g_fit_plus_v_hold"`` attaches the
+            internal validation positives as a disjoint component and is
+            therefore a diagnostic-only true-oracle ceiling, never a formal
+            experiment input.
         n_ground: Grounding candidates per node `n_g` (spec Sec 14.4.4;
             supersedes the internal generator's own pinned `EgoStitchConfig`
             default for this family).
@@ -247,6 +253,7 @@ class GeneratorConfig:
     tau_div: float = 0.5
     l_gate_pos_weight: float = 6.17
     oracle_seed: int = 0
+    oracle_truth_source: str = "g_fit"
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants.
@@ -258,6 +265,14 @@ class GeneratorConfig:
             raise ValueError(f"n_ground must be positive, got {self.n_ground}")
         if self.oracle_seed < 0:
             raise ValueError(f"oracle_seed must be non-negative, got {self.oracle_seed}")
+        if self.oracle_truth_source not in ("g_fit", "g_fit_plus_v_hold"):
+            raise ValueError(
+                "oracle_truth_source must be one of ['g_fit', 'g_fit_plus_v_hold']"
+            )
+        if self.oracle_truth_source != "g_fit" and self.name != "oracle_struct":
+            raise ValueError(
+                "oracle_truth_source='g_fit_plus_v_hold' requires name='oracle_struct'"
+            )
         if not 0.0 < self.tau_adj < 1.0:
             raise ValueError(f"tau_adj must be in (0, 1), got {self.tau_adj}")
         if not -1.0 <= self.tau_div <= 1.0:
@@ -288,7 +303,14 @@ class GeneratorConfig:
             cls,
             mapping,
             label="generator",
-            string_fields=frozenset({"name", "feature_standardization", "feature_stats_sha256"}),
+            string_fields=frozenset(
+                {
+                    "name",
+                    "feature_standardization",
+                    "feature_stats_sha256",
+                    "oracle_truth_source",
+                }
+            ),
         )
 
 

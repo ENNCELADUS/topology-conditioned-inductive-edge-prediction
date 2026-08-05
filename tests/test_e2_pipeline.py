@@ -19,8 +19,10 @@ from src.e2_pipeline import (
     V_HOLD_VALIDATION_EVENTS_FILENAME,
     PipelineArgs,
     ProbeResult,
+    _assert_no_cross_kind_completion,
     _publish_staged,
     _rollback_publication,
+    _validate_staged_artifacts,
     build_accelerate_command,
     detect_visible_gpu_count,
     main,
@@ -86,6 +88,39 @@ def test_failed_completion_sentinel_backup_does_not_delete_the_old_sentinel(
         _publish_staged(staging_dir, output_dir)
 
     assert (output_dir / "complete.json").read_text() == "old-complete"
+
+
+def test_diagnostic_cannot_replace_a_formal_output_directory(tmp_path: Path) -> None:
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    (output_dir / "complete.json").write_text("{}")
+    with pytest.raises(RuntimeError, match="different run kind"):
+        _assert_no_cross_kind_completion(output_dir, run_kind="diagnostic")
+    _assert_no_cross_kind_completion(output_dir, run_kind="formal")
+    (output_dir / "diagnostic_complete.json").write_text("{}")
+    with pytest.raises(RuntimeError, match="different run kind"):
+        _assert_no_cross_kind_completion(output_dir, run_kind="formal")
+
+
+def test_staged_metadata_role_must_match_diagnostic_execution(tmp_path: Path) -> None:
+    _write_train_outputs(tmp_path)
+    metadata_path = tmp_path / "run_metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "run_kind": "formal",
+                "checkpoint_role": "formal_plan_selected",
+                "formal_artifacts_published": True,
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="run_kind"):
+        _validate_staged_artifacts(
+            tmp_path,
+            epochs=2,
+            model_family="v3_1",
+            expected_run_kind="diagnostic",
+        )
 
 
 # --------------------------------------------------------------------------- failure artifacts
@@ -242,7 +277,7 @@ def test_pipeline_forwards_debug_max_steps_to_worker(tmp_path: Path) -> None:
     assert command[command.index("--max-steps") + 1] == "5"
 
 
-@pytest.mark.parametrize("run_kind", ["formal"])
+@pytest.mark.parametrize("run_kind", ["formal", "diagnostic"])
 def test_pipeline_forwards_run_kind_to_worker(tmp_path: Path, run_kind: str) -> None:
     args = parse_pipeline_args(
         [

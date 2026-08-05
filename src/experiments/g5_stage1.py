@@ -442,6 +442,20 @@ def _assert_shared_training_seed(
     return cast(int, next(iter(distinct)))
 
 
+def _assert_formal_run_metadata(
+    run_metadata: Mapping[str, Mapping[str, object]], trained_arms: Sequence[str]
+) -> None:
+    """Reject diagnostic/debug checkpoints from the formal G5 evidence surface."""
+    for arm in trained_arms:
+        metadata = run_metadata[arm]
+        if (
+            metadata.get("run_kind") != "formal"
+            or metadata.get("checkpoint_role") != "formal_plan_selected"
+            or metadata.get("formal_artifacts_published") is not True
+        ):
+            raise ValueError(f"{arm}: G5 requires formal published run metadata")
+
+
 def _validate_b0cal_lineage(
     payload: dict[str, object], b0_meta: dict[str, object], b0_row: AssembledRow
 ) -> None:
@@ -810,6 +824,7 @@ def build_e2e_arm_summary(
         name: cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
         for name, path in run_metadata_paths.items()
     }
+    _assert_formal_run_metadata(run_metadata, _TRAINED_ARMS)
     training_seed = _assert_shared_training_seed(run_metadata, _TRAINED_ARMS)
     training_diagnostics = _training_diagnostics([run_metadata[name] for name in _TRAINED_ARMS])
     _validate_vhold_event_ledgers(

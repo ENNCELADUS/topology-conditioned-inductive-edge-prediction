@@ -85,6 +85,11 @@ EgoStitch E2E trains on `V_fit` and validates on the single 512-node `V_hold`. I
 not open a held-out path; that boundary is checked inside the worker, and the command
 runs directly in the repository checkout.
 
+The sole exception is an explicitly configured true-Oracle diagnostic:
+`generator.oracle_truth_source: g_fit_plus_v_hold`. It consumes internal `V_hold`
+positive structure and therefore must use `--run-kind diagnostic`; it writes
+`diagnostic_complete.json`, never formal artifacts or `complete.json`.
+
 It runs through the same `hpc/run.sh train` branch as the baselines, naming the
 EgoStitch worker and run kind explicitly and pointing at one of the trained-arm
 configs (`full`, `f_only`, `pair_topology`, `p0`, `no_l_rel`, `row_layernorm`):
@@ -92,6 +97,13 @@ configs (`full`, `f_only`, `pair_topology`, `p0`, `no_l_rel`, `row_layernorm`):
 ```bash
 hpc/run.sh train configs/egostitch_e2e_v3_full_breadth_first.yaml \
   --worker-module src.train_egostitch --run-kind formal
+```
+
+For a true-Oracle diagnostic, use its dedicated config/output directory:
+
+```bash
+hpc/run.sh train configs/egostitch_e2e_v3_oracle_grit_film_logit_breadth_first.yaml \
+  --worker-module src.train_egostitch --run-kind diagnostic
 ```
 
 The two scoring-time controls (`structure_control_6a_v3`, `structure_control_6e_v1`)

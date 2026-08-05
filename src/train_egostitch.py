@@ -130,11 +130,12 @@ def build_egostitch_ddp_accelerator(
 
 
 # The complete execution-context domain: ``formal`` produces registered results,
-# and ``debug`` is *derived* from ``--max-steps``
+# ``diagnostic`` may consume explicitly declared held-out truth and publishes
+# nothing formal, and ``debug`` is *derived* from ``--max-steps``
 # by `write_run_start_metadata`/`write_outputs` rather than selected on the
 # CLI. It is named here because `run_metadata.json` publishes it and
 # `src.experiments.probes` reads it back.
-E2ERunKind = Literal["formal", "debug"]
+E2ERunKind = Literal["formal", "diagnostic", "debug"]
 
 # The single validation universe (`V_hold = V_qual union V_select`). It is also
 # the grounding-pool ``role_universe`` identity.
@@ -1459,9 +1460,13 @@ def parse_args(argv: Sequence[str] | None = None) -> EgoCliArgs:
     # actually running a bounded, non-publishing schedule.
     parser.add_argument(
         "--run-kind",
-        choices=("formal",),
+        choices=("formal", "diagnostic"),
         default=None,
-        help="E2E execution context; defaults to formal and does not alter the config hash",
+        help=(
+            "E2E execution context; defaults to formal and does not alter the config hash. "
+            "'diagnostic' permits explicitly configured held-out-truth inputs and never "
+            "publishes formal artifacts"
+        ),
     )
     namespace = parser.parse_args(argv)
     if namespace.ddp_mode is not None:
@@ -5452,6 +5457,9 @@ def write_run_start_metadata(
         "config_sha256": _sha256_file(config_path) if config_path is not None else None,
         "arm": arm,
         "feature_stats_sha256": feature_stats_sha256 or "",
+        "oracle_truth_source": (
+            e2e_config.generator.oracle_truth_source if e2e_config is not None else None
+        ),
     }
     path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
@@ -5528,7 +5536,13 @@ def write_outputs(
             handle.write(json.dumps({**entry, "epoch": int(cast(float, entry["epoch"]))}) + "\n")
 
     checkpoint_sha256 = _sha256_file(best_path)
-    checkpoint_role = "debug_only" if debug else "formal_plan_selected"
+    checkpoint_role = (
+        "debug_only"
+        if debug
+        else "diagnostic_only"
+        if expected_run_kind == "diagnostic"
+        else "formal_plan_selected"
+    )
     classifier_config = cast(Mapping[str, object], cfg.model.config.get("classifier", {}))
     validation_liveness_observed = (
         result.best_epoch > 0
@@ -5633,7 +5647,68 @@ def _bind_feature_standardization(
     return stats.digest
 
 
-def _install_oracle_context(model: EgoStitchModel, data: EgoStitchData) -> None:
+def _oracle_truth_graph(data: EgoStitchData, *, truth_source: str, run_kind: str) -> nx.Graph:
+    """Return the oracle source graph named by ``generator.oracle_truth_source``.
+
+    ``g_fit`` is the protocol-clean training structural graph (spec Sec 9.3/9.4);
+    under it every ``V_hold`` node is absent and gets an empty scaffold, which is
+    why the original R1 run was not an oracle ceiling for inductive validation.
+    ``g_fit_plus_v_hold`` attaches the internal ``V_hold`` positive graph as a
+    disjoint component so held-out nodes get their true scaffold. That is a
+    deliberate held-out-truth leak: it is accepted only under ``--run-kind
+    diagnostic`` and is stamped into `EgoStitchData.access_audit`. Stitch-time
+    leave-one-out still masks the queried partner, so the queried edge itself is
+    never handed to the classifier.
+
+    Args:
+        data: The assembled training data (`EgoTargetBuilder` + V_hold manifest).
+        truth_source: The configured `GeneratorConfig.oracle_truth_source`.
+        run_kind: Effective execution context, used to keep held-out truth out of
+            any run that publishes formal artifacts.
+
+    Returns:
+        `EgoTargetBuilder.graph` itself for ``g_fit``, or a copy extended with the
+        V_hold positive component.
+
+    Raises:
+        RuntimeError: If held-out truth is requested outside a diagnostic run, if
+            V_hold carries no positive edges, or if V_fit and V_hold share a node
+            (which would make the addition non-disjoint).
+    """
+    if truth_source == "g_fit":
+        return data.target_builder.graph
+    if run_kind != "diagnostic":
+        raise RuntimeError("oracle_truth_source='g_fit_plus_v_hold' requires --run-kind diagnostic")
+    hold_edges = data.validation_positive_edges
+    if not hold_edges:
+        raise RuntimeError("true-oracle diagnostic requires non-empty V_hold positive edges")
+    overlap = set(data.validation_nodes).intersection(data.target_builder.graph)
+    if overlap:
+        raise RuntimeError(
+            "true-oracle diagnostic requires node-disjoint V_fit/V_hold; "
+            f"found {len(overlap)} overlapping node(s)"
+        )
+    graph = nx.Graph(data.target_builder.graph)
+    graph.add_nodes_from(data.validation_nodes)
+    graph.add_edges_from(hold_edges)
+    audit = data.access_audit if data.access_audit is not None else {}
+    audit["oracle_truth"] = {
+        "source": truth_source,
+        "diagnostic_only": True,
+        "v_hold_node_count": len(data.validation_nodes),
+        "v_hold_positive_edge_count": len(hold_edges),
+        "v_hold_positive_edges_sha256": hashlib.sha256(
+            json.dumps(sorted(hold_edges), separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "queried_partner_masked_at_stitch": True,
+    }
+    data.access_audit = audit
+    return graph
+
+
+def _install_oracle_context(
+    model: EgoStitchModel, data: EgoStitchData, *, run_kind: str
+) -> None:
     """Install the oracle scaffold table for the ``oracle_struct`` generator arm.
 
     Runs once at startup, after the model is built and `_bind_feature_standardization`
@@ -5644,19 +5719,14 @@ def _install_oracle_context(model: EgoStitchModel, data: EgoStitchData) -> None:
     needs is simply the identity permutation (``arange``) -- table row ``r``
     describes exactly the node at F0 row ``r``.
 
-    The table is built over `EgoTargetBuilder.graph` -- the protocol-clean
-    ``G_fit`` structural graph (spec Sec 9.3/9.4), not a broader graph that
-    would also carry V_hold's true structural edges. An oracle that could see
-    held-out structure at validation time would leak exactly the information
-    the inductive protocol withholds from every other generator; V_hold nodes
-    therefore get whatever `build_oracle_table` reports for a node absent
-    from ``G_fit`` (no true training-graph neighbors), the same "no more
-    information than a real generator would have" position a trained
-    `EgoStitchImagineGenerator` is in for those nodes.
+    The source graph is whichever one `_oracle_truth_graph` returns for the
+    configured ``generator.oracle_truth_source``.
 
     Args:
         model: The freshly constructed E2E model, already feature-stats-bound.
         data: The assembled training data (F0 universe + `EgoTargetBuilder`).
+        run_kind: Effective execution context, forwarded to `_oracle_truth_graph`
+            to keep held-out structural truth inside diagnostic runs.
 
     Raises:
         RuntimeError: If `model.generator` is not an `OracleStructGenerator`
@@ -5681,8 +5751,9 @@ def _install_oracle_context(model: EgoStitchModel, data: EgoStitchData) -> None:
             f"first few: {missing_rows[:5]}"
         )
     ordered_node_ids = cast(list[str], node_by_row)
+    truth_source = model.cfg.generator.oracle_truth_source
     table = build_oracle_table(
-        data.target_builder.graph,
+        _oracle_truth_graph(data, truth_source=truth_source, run_kind=run_kind),
         ordered_node_ids,
         slots=model.generator_cfg.slots,
         seed=model.cfg.generator.oracle_seed,
@@ -5690,10 +5761,11 @@ def _install_oracle_context(model: EgoStitchModel, data: EgoStitchData) -> None:
     lookup = torch.arange(n_rows, dtype=torch.long)
     model.generator.set_oracle_context(table, lookup)
     logger.info(
-        "installed oracle scaffold table rows=%d slots=%d seed=%d",
+        "installed oracle scaffold table rows=%d slots=%d seed=%d truth_source=%s",
         n_rows,
         model.generator_cfg.slots,
         model.cfg.generator.oracle_seed,
+        truth_source,
     )
 
 
@@ -5730,7 +5802,7 @@ def _run_ddp_worker(cfg: EgoConfig, args: EgoCliArgs) -> None:
     model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
     feature_stats_sha256 = _bind_feature_standardization(model, cfg, data)
     if model.cfg.generator.name == "oracle_struct":
-        _install_oracle_context(model, data)
+        _install_oracle_context(model, data, run_kind=effective_run_kind)
     _run_ddp_dispatch(
         cfg,
         args,

@@ -192,7 +192,7 @@ def test_missing_validation_rejection_source_fails_before_cache_writes(
     assert not (tmp_path / "caches").exists()
 
 
-_ALL_RUN_KINDS: list[te.E2ERunKind | None] = ["formal", "debug", None]
+_ALL_RUN_KINDS: list[te.E2ERunKind | None] = ["formal", "diagnostic", "debug", None]
 
 
 # --------------------------------------------------------------------------- tests

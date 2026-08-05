@@ -1,10 +1,10 @@
-# Wave-1 oracle-scaffold LOCAL SMOKE TEST (docs/superpowers/specs/2026-08-04-
+# True-oracle diagnostic LOCAL SMOKE TEST (docs/superpowers/specs/2026-08-04-
 # oracle-scaffold-experiment-design.md): a 2-epoch, tiny-batch/tiny-token-
 # budget variant of `egostitch_e2e_v3_oracle_grit_xattn_cls_breadth_first.yaml`,
 # same schema, for verifying the config parses and the oracle_struct/grit_gmt/
 # conditioning_mode wiring runs end to end locally before spending real
 # compute. NOT a scientific arm -- do not report metrics from this config,
-# and do not reuse its `output_dir`.
+# and do not reuse its `output_dir`. Launch only with `--run-kind diagnostic`.
 #
 # Shrunk relative to the real R1 arm: `optim.epochs`/data batch sizes/
 # `runtime.token_budget`/`runtime.max_pairs_per_rank`/`runtime.*_budget_seconds`
@@ -25,6 +25,7 @@ model:
     generator:
       name: oracle_struct
       oracle_seed: 0
+      oracle_truth_source: g_fit_plus_v_hold
       n_ground: 50
       feature_standardization: row_layernorm
     encoder:
@@ -60,7 +61,7 @@ optim:
   lr: 1.0e-4
   weight_decay: 0.01
   epochs: 2
-  warmup_steps: 10
+  warmup_steps: 500
   grad_clip: 1.0
 
 training:
@@ -69,7 +70,7 @@ training:
   phase_b_fraction: 0.1
   lr_peak: 1.0e-4
   min_lr: 1.0e-5
-  warmup_steps: 10
+  warmup_steps: 500
   betas: [0.9, 0.999]
   eps: 1.0e-8
   clip_norm: 1.0
@@ -88,9 +89,9 @@ training:
   residual_ratio_min: 1.0e-3
 
 diagnostics:
-  gradient_probe_interval: 5
+  gradient_probe_interval: 50
   gradient_imbalance_ratio: 50.0
-  gradient_imbalance_steps: 20
+  gradient_imbalance_steps: 200
   probe_s1_abs_mean_max: 1000.0
   selection_auprc_tolerance: 0.02
   topk_fraction: 0.01
@@ -100,7 +101,7 @@ eval:
   eval_every: 1
 
 seed: 0
-output_dir: outputs/egostitch_e2e_smoke/oracle_grit_xattn_cls
+output_dir: outputs/egostitch_e2e_smoke/oracle_grit_xattn_cls_true_oracle_diagnostic
 mixed_precision: "bf16"
 
 runtime:

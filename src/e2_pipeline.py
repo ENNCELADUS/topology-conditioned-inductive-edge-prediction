@@ -284,11 +284,12 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument(
         "--run-kind",
-        choices=("formal",),
+        choices=("formal", "diagnostic"),
         default=None,
         help=(
             "EgoStitch E2E execution context; forwarded unchanged to the worker. "
-            "'debug' is not selectable: the worker derives it from --max-steps"
+            "'diagnostic' never publishes formal artifacts; 'debug' is not "
+            "selectable: the worker derives it from --max-steps"
         ),
     )
     parser.add_argument(
@@ -524,6 +525,10 @@ V_HOLD_VALIDATION_EVENTS_FILENAME = "v_hold_validation_events.jsonl"
 _OPTIONAL_PUBLISHED_FILENAMES = (
     V_HOLD_VALIDATION_EVENTS_FILENAME,
 )
+# One terminal sentinel per run kind, so a diagnostic run can never leave a
+# `complete.json` a reader would take for a formal result (`debug_complete.json`
+# is written by the debug branch, which never publishes through staging).
+_COMPLETION_FILENAMES = ("complete.json", "diagnostic_complete.json")
 
 
 def _validate_staged_artifacts(
@@ -533,6 +538,7 @@ def _validate_staged_artifacts(
     model_family: str,
     allow_partial: bool = False,
     require_v_hold_validation_events: bool = False,
+    expected_run_kind: str | None = None,
 ) -> None:
     """Load and validate every formal worker artifact before hashing it."""
     import torch
@@ -566,6 +572,20 @@ def _validate_staged_artifacts(
     metadata = json.loads((staging_dir / "run_metadata.json").read_text(encoding="utf-8"))
     if not isinstance(metadata, dict):
         raise ValueError("run_metadata.json must contain an object")
+    if expected_run_kind is not None:
+        expected_role = {
+            "formal": "formal_plan_selected",
+            "diagnostic": "diagnostic_only",
+            "debug": "debug_only",
+        }[expected_run_kind]
+        if metadata.get("run_kind") != expected_run_kind:
+            raise ValueError("run_metadata.json run_kind does not match pipeline execution")
+        if metadata.get("checkpoint_role") != expected_role:
+            raise ValueError("run_metadata.json checkpoint_role does not match run_kind")
+        if metadata.get("formal_artifacts_published") is not (expected_run_kind == "formal"):
+            raise ValueError(
+                "run_metadata.json formal_artifacts_published does not match run_kind"
+            )
     if require_v_hold_validation_events:
         evidence = metadata.get("v_hold_validation_evidence")
         if not isinstance(evidence, dict):
@@ -609,10 +629,11 @@ def _publish_staged(
         filename for filename in optional_names if (staging_dir / filename).is_file()
     )
     try:
-        completion = output_dir / "complete.json"
-        if completion.exists():
-            os.replace(completion, backup_dir / completion.name)
-            completion_backed_up = True
+        for completion_name in _COMPLETION_FILENAMES:
+            completion = output_dir / completion_name
+            if completion.exists():
+                os.replace(completion, backup_dir / completion.name)
+                completion_backed_up = True
         # Every optional name is backed up whether or not this run staged one, so
         # a prior run's verdict is removed rather than left to masquerade as this
         # run's; rollback restores it from the backup.
@@ -645,10 +666,20 @@ def _rollback_publication(
     for filename in published:
         (output_dir / filename).unlink(missing_ok=True)
     if remove_completion:
-        (output_dir / "complete.json").unlink(missing_ok=True)
+        for completion_name in _COMPLETION_FILENAMES:
+            (output_dir / completion_name).unlink(missing_ok=True)
     for backup in backup_dir.iterdir():
         os.replace(backup, output_dir / backup.name)
     shutil.rmtree(backup_dir, ignore_errors=True)
+
+
+def _assert_no_cross_kind_completion(output_dir: Path, *, run_kind: str) -> None:
+    """Refuse to overwrite a run completed under the other run kind."""
+    other = "complete.json" if run_kind == "diagnostic" else "diagnostic_complete.json"
+    if (output_dir / other).exists():
+        raise RuntimeError(
+            "refusing to replace an output directory completed under a different run kind"
+        )
 
 
 def run_pipeline(
@@ -874,7 +905,12 @@ def run_pipeline(
             model_family=cfg.model.family,
             allow_partial=debug_run,
             require_v_hold_validation_events=(
-                not debug_run and args.run_kind == "formal"
+                not debug_run and args.worker_module == "src.train_egostitch"
+            ),
+            expected_run_kind=(
+                ("debug" if debug_run else (args.run_kind or "formal"))
+                if args.worker_module == "src.train_egostitch"
+                else None
             ),
         )
     except Exception as error:
@@ -955,6 +991,7 @@ def run_pipeline(
     # The staging tree is now complete and validated. Publication is reversible
     # until the success sentinel lands.
     try:
+        _assert_no_cross_kind_completion(output_dir, run_kind=args.run_kind or "formal")
         backup_dir, published = _publish_staged(
             staging_dir,
             output_dir,
@@ -986,9 +1023,12 @@ def run_pipeline(
             },
         )
     try:
+        completion_name = (
+            "diagnostic_complete.json" if args.run_kind == "diagnostic" else "complete.json"
+        )
         _write_json_atomic(
-            output_dir / "complete.json",
-            {"status": "complete", "total_seconds": total_elapsed},
+            output_dir / completion_name,
+            {"status": completion_name.removesuffix(".json"), "total_seconds": total_elapsed},
         )
     except Exception as error:
         _rollback_publication(output_dir, backup_dir, published)

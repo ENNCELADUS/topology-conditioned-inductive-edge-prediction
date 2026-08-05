@@ -434,6 +434,8 @@ def _write_trained_arm_metadata(
                 "checkpoint_id": checkpoint_id,
                 "arm": name,
                 "run_kind": "formal",
+                "checkpoint_role": "formal_plan_selected",
+                "formal_artifacts_published": True,
                 "seed": 0,
                 "strategy": "toy",
                 "config_path": str(tmp_path / f"{name}.yaml"),
@@ -728,6 +730,17 @@ class TestBuildE2EArmSummary:
         del metadata["training_diagnostics"]["gradient_norm_series"][0]["grad_rms_content"]
         metadata_path.write_text(json.dumps(metadata))
         g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+
+    def test_diagnostic_checkpoint_is_rejected_from_formal_g5(self, tmp_path: Path) -> None:
+        inputs = _seven_arm_inputs(tmp_path)
+        metadata_path = _d(inputs["run_metadata_paths"])["full"]
+        metadata = json.loads(metadata_path.read_text())
+        metadata["run_kind"] = "diagnostic"
+        metadata["checkpoint_role"] = "diagnostic_only"
+        metadata["formal_artifacts_published"] = False
+        metadata_path.write_text(json.dumps(metadata))
+        with pytest.raises(ValueError, match="G5 requires formal published"):
+            g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
     def test_nested_worker_submodule_rms_shape_is_accepted(self, tmp_path: Path) -> None:
         inputs = _seven_arm_inputs(tmp_path)

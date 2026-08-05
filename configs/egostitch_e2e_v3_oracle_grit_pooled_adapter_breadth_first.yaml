@@ -1,11 +1,13 @@
-# EgoStitch E2E Wave-1 oracle-scaffold R1 arm, conditioning-ladder mode
+# EgoStitch true-oracle V_hold-truth DIAGNOSTIC arm. Launch only with
+# `--run-kind diagnostic`; these artifacts are never formal. The earlier R1
+# run used G_fit only, so every V_hold node received an empty scaffold and was
+# not a valid oracle ceiling. Query-partner leave-one-out masking still applies.
+# Conditioning-ladder mode
 # "pooled_adapter" (docs/superpowers/specs/2026-08-04-oracle-scaffold-experiment-
 # design.md): `generator.name: "oracle_struct"` selects the zero-parameter
-# table generator that emits ground-truth local scaffolds read directly from
-# the training structural graph G_struct, with leave-one-out partner masking
-# applied at stitch time (the protocol-clean R1 row; NOT the labeled-test-
-# graph R2 diagnostic ceiling, which is wave-2/score_universe-side and needs
-# no training config). `encoder.name: "grit_gmt"` is the vendored GRIT +
+# table generator populated from G_fit plus internal V_hold positive edges.
+# This deliberately leaks held-out structure as a diagnostic ceiling.
+# `encoder.name: "grit_gmt"` is the vendored GRIT +
 # Set-Transformer-PMA encoder (dense RRWP K=8, 4 GritTransformerLayers at
 # dim 96, PMA pooling with 4 seeds; tokens = 34 node + 4 seed tokens, pooled
 # = seed mean). This file pins `classifier.conditioning_mode: "pooled_adapter"`,
@@ -42,6 +44,7 @@ model:
     generator:
       name: oracle_struct
       oracle_seed: 0
+      oracle_truth_source: g_fit_plus_v_hold
       n_ground: 50
       feature_standardization: row_layernorm
     encoder:
@@ -117,7 +120,7 @@ eval:
   eval_every: 1
 
 seed: 0
-output_dir: outputs/egostitch_e2e_stage1_v3/oracle_grit_pooled_adapter
+output_dir: outputs/egostitch_e2e_stage1_v3/oracle_grit_pooled_adapter_true_oracle_diagnostic
 mixed_precision: "bf16"
 
 runtime:

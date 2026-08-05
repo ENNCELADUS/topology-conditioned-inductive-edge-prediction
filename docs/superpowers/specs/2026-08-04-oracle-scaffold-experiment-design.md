@@ -1,7 +1,8 @@
 # Oracle-Scaffold Experiment — Design (Wave 1)
 
 **Date:** 2026-08-04
-**Status:** DRAFT (Wave-1 configs authored; not yet run)
+**Status:** CORRECTED 2026-08-05 — original R1 runs invalid for the stated oracle goal;
+replacement configs are diagnostic-only true-oracle runs
 **Scope:** `configs/egostitch_e2e_v3_oracle_*.yaml`,
 `src/model/egostitch/{generator,encoder}/` (concurrent), `src/train_egostitch.py`
 (concurrent), `src/score_universe.py` (wave 2)
@@ -11,6 +12,39 @@ experiment instantiates two new members of). Does not amend that design; this is
 new experiment defined against its interfaces.
 
 ---
+
+## 0. 2026-08-05 correction
+
+The original R1 implementation built its table from `G_fit` while evaluating on the
+node-disjoint `V_hold`. Consequently every `V_hold` node was absent from the source
+graph and received an all-padding empty scaffold. That implementation was
+protocol-clean, but it was **not an oracle upper bound for inductive validation** and
+cannot answer the goal in §1. Every R1 output directory — the completed
+`oracle_grit_film_logit` run (which had published `run_kind: formal`,
+`formal_artifacts_published: true` artifacts for an invalid oracle) and the four
+failed launches — was deleted from the H20 checkout on 2026-08-05 by owner decision;
+this section is the only retained record of that design error.
+
+The repaired row sets
+`generator.oracle_truth_source: g_fit_plus_v_hold` and must be launched with
+`--run-kind diagnostic`. It adds the internal `V_hold` positive graph as a disjoint
+component of `G_fit`, while stitch-time leave-one-out still masks the queried partner.
+This is a real structural-information ceiling, but it deliberately uses held-out
+truth: its checkpoints are `diagnostic_only`, `formal_artifacts_published` is false,
+and it cannot support formal inductive-performance or significance claims. The
+runtime records the held-out node/edge counts and an edge-set digest in
+`access_audit.oracle_truth`.
+
+Launch form for each repaired GRIT arm:
+
+```bash
+hpc/run.sh train <oracle-config.yaml> \
+  --worker-module src.train_egostitch \
+  --run-kind diagnostic
+```
+
+The STE reference remains blocked until its placeholder conditioning mode is re-pinned
+to the GRIT-ladder winner.
 
 ## 1. Goal
 
@@ -25,7 +59,8 @@ If a zero-parameter oracle generator feeding a real encoder and conditioning lad
 does not measurably beat the null (pairwise) baseline, the ceiling on any *learned*
 generator is the same or lower, and further generator investment (`egostitch_imagine`,
 its slot decoder, its Sinkhorn alignment) is not justified until the conditioning
-architecture itself is fixed. If it does beat the baseline, the gap between R1's oracle
+architecture itself is fixed. If it does beat the baseline, the gap between the
+true-oracle diagnostic's
 result and today's `egostitch_imagine` arms (`full`, `row_layernorm`, etc.,
 `docs/results/E2-pair-to-topology-gap.md`) is the headroom actually available to close
 by improving generation quality, separated from headroom lost to a conditioning
@@ -50,33 +85,34 @@ evaluation-time re-ranker: it participates in the same `NeighborhoodGenerator` p
 as `egostitch_imagine` and `null` (`encode_node`/`stitch`/`forward`,
 three-component-refactor design §3.3), feeds a real `GraphEncoder`
 (`grit_gmt` or `ste_typed`), and its output is consumed by a trained `PairClassifier`
-through one of four conditioning pathways. Where G3 asked "is there headroom," R1 asks
-"can this architecture reach it." A weak R1 result despite a strong G3 result would
+through one of four conditioning pathways. Where G3 asked "is there headroom," the
+repaired diagnostic asks "can this architecture consume held-out true structure at
+all." A weak result despite a strong G3 result would
 localize the failure to the conditioning/encoder side rather than the generation side —
 the opposite of what the 2026-07-24/07-27/07-29 slot-collapse and dead-pointer
 diagnoses (`e2e-stage1-failure-diagnosis`, `rev32-slot-collapse-diagnosis-design`)
 found for the learned generator, which is exactly the ambiguity this experiment is
 designed to resolve.
 
-## 3. The two oracle rows
+## 3. Oracle rows
 
 | Row | Source graph | Partner handling | Status |
 |---|---|---|---|
-| **R1** | `G_struct` (training structural graph, spec §9.3's loopless projection) | Leave-one-out: the queried partner is explicitly masked out of the emitted scaffold at stitch time, matching the "edge-stream structural targets must explicitly remove the queried partner and decrement its degree" rule (CLAUDE.md data-contract traps) | **Wave 1 — this document, configs below** |
-| **R2** | The labeled test graph (validation/test positives included) | None — a diagnostic ceiling, not a protocol-clean arm | **Wave 2 — deferred, `score_universe.py`-side, no training config** |
+| **R1-old (invalid for goal)** | `G_fit` only | Leave-one-out | Stopped/failed; `V_hold` scaffolds were empty |
+| **R1-true-oracle diagnostic** | Disjoint union of `G_fit` and internal `V_hold` positive graph | Leave-one-out: queried partner is masked at stitch time | **Replacement Wave 1; diagnostic only** |
+| **R2** | Labeled test graph | Diagnostic ceiling | **Wave 2 — deferred, `score_universe.py`-side** |
 
-R1 is the only row with a training config in this wave. It answers "what does the
-architecture do with the true graph under the same information constraint every other
-arm respects" — no test-graph leakage, no shortcut through the label itself. R2 answers
-a different question ("what is the absolute ceiling if leakage were not a constraint")
-and is explicitly a diagnostic upper bound, not a comparable arm — it must never be
-plotted or tabled alongside B0/R1 without that caveat attached, and per CLAUDE.md it
-carries no significance claim of any kind regardless of wave.
+The replacement training configs answer only: "can the architecture consume a true
+held-out scaffold when it is supplied?" They do not share the information boundary of
+B0 or a learned inductive generator. They may be compared as conditioning-pathway
+diagnostics, but not presented as protocol-clean model improvements.
 
 ## 4. Architecture summary
 
 **Generator — `oracle_struct`.** Zero-parameter. Reads the ground-truth local scaffold
-for a node directly from `G_struct` rather than imagining one; `oracle_seed` (new
+from the graph declared by `generator.oracle_truth_source`: `G_fit` for the legacy
+protocol-clean behavior, or the disjoint `G_fit + V_hold` positive graph for this
+diagnostic. `oracle_seed` (new
 `GeneratorConfig` field, default 0) seeds any tie-breaking needed when truncating a
 node's true neighborhood to the grounding budget. Emits the same `ImaginedGraph`
 contract as `egostitch_imagine` (`x`/`adj`/`mask`/`aux`) built by the same
@@ -123,11 +159,11 @@ generalized to a fourth pathway shape, not invented fresh here.
 | Arm | Config | Generator | Encoder | Conditioning | Wave |
 |---|---|---|---|---|---|
 | B0 historical reference | Existing completed B0 result; no Wave-1 training config | n/a | n/a | pairwise | external context only |
-| R1 × film_logit | `configs/egostitch_e2e_v3_oracle_grit_film_logit_breadth_first.yaml` | `oracle_struct` | `grit_gmt` | `film_logit` | 1 |
-| R1 × pooled_adapter | `configs/egostitch_e2e_v3_oracle_grit_pooled_adapter_breadth_first.yaml` | `oracle_struct` | `grit_gmt` | `pooled_adapter` | 1 |
-| R1 × xattn_cls | `configs/egostitch_e2e_v3_oracle_grit_xattn_cls_breadth_first.yaml` | `oracle_struct` | `grit_gmt` | `xattn_cls` | 1 |
-| R1 × xattn_tokens | `configs/egostitch_e2e_v3_oracle_grit_xattn_tokens_breadth_first.yaml` | `oracle_struct` | `grit_gmt` | `xattn_tokens` | 1 |
-| R1 ste-typed reference | `configs/egostitch_e2e_v3_oracle_ste_ref_breadth_first.yaml` | `oracle_struct` | `ste_typed` | placeholder, re-pin before launch (§6) | 1 |
+| True-oracle diagnostic × film_logit | `configs/egostitch_e2e_v3_oracle_grit_film_logit_breadth_first.yaml` | `oracle_struct` | `grit_gmt` | `film_logit` | 1 |
+| True-oracle diagnostic × pooled_adapter | `configs/egostitch_e2e_v3_oracle_grit_pooled_adapter_breadth_first.yaml` | `oracle_struct` | `grit_gmt` | `pooled_adapter` | 1 |
+| True-oracle diagnostic × xattn_cls | `configs/egostitch_e2e_v3_oracle_grit_xattn_cls_breadth_first.yaml` | `oracle_struct` | `grit_gmt` | `xattn_cls` | 1 |
+| True-oracle diagnostic × xattn_tokens | `configs/egostitch_e2e_v3_oracle_grit_xattn_tokens_breadth_first.yaml` | `oracle_struct` | `grit_gmt` | `xattn_tokens` | 1 |
+| True-oracle diagnostic ste-typed reference | `configs/egostitch_e2e_v3_oracle_ste_ref_breadth_first.yaml` | `oracle_struct` | `ste_typed` | placeholder, re-pin before launch (§6) | 1 |
 | Local smoke | `configs/egostitch_e2e_v3_oracle_smoke.yaml` | `oracle_struct` | `grit_gmt` | `xattn_cls` | 1 (verification only, not scientific) |
 | Perturbation ladder: edge-drop | *(no config yet — wave 2)* | `oracle_struct` + new perturbation | `grit_gmt` (ladder winner) | ladder winner | 2 |
 | Perturbation ladder: add-matched | *(no config yet — wave 2)* | `oracle_struct` + new perturbation | " | " | 2 |
@@ -136,10 +172,12 @@ generalized to a fourth pathway shape, not invented fresh here.
 | Eval-side full shuffle | Existing `--scaffold-control shuffle_within_pair_v3` (`score_universe.py`, arm `structure_control_6a_v3`) | `oracle_struct` | " | " | 2 |
 | R2 diagnostic ceiling | *(`score_universe.py`-side, no training config)* | `oracle_struct` on the labeled test graph | " | " | 2 |
 
-Wave 1 is the full R1 ladder (five training configs) and a local smoke test. The
+Wave 1 contains four runnable GRIT true-oracle diagnostic configs plus one STE
+reference config that remains launch-blocked until the winning conditioning mode is
+re-pinned. The
 already completed B0 result is historical external context only: its seed, sampling
 ratio, epoch count, optimizer schedule, weight decay, and label smoothing differ, so
-no B0-to-R1 delta is a controlled causal comparison. The attempted trainable-null R0 arm was
+no B0-to-oracle delta is a controlled causal comparison. The attempted trainable-null R0 arm was
 withdrawn by the owner on 2026-08-04 because it duplicates B0; its incomplete run and
 dedicated config are not evidence and are not part of this matrix. Every remaining
 Wave-1 training config uses `training.phase_a_fraction: 0.0`: the oracle generator is
@@ -157,7 +195,7 @@ perturbation" amendment already load-bearing in the three-component-refactor des
 
 The ste-typed reference arm exists to separate "does the true graph help at all" from
 "does `grit_gmt` specifically help" — see its config header for why its
-`conditioning_mode` is an explicit placeholder pending the R1 ladder's winner.
+`conditioning_mode` is an explicit placeholder pending the GRIT ladder's winner.
 
 ## 6. Metrics
 
@@ -184,20 +222,16 @@ Per CLAUDE.md's non-negotiable integrity gates, unchanged by this experiment:
 This document does not settle any of the following; it exists so they can be decided
 with the run matrix and metrics already fixed, not improvised mid-analysis.
 
-1. **Go/no-go threshold shape.** Wave 1 may compare the five R1 conditioning pathways
+1. **Go/no-go threshold shape.** Wave 1 may compare the five diagnostic conditioning pathways
    to one another and judge their absolute edge/topology metrics, but must not treat
-   the historical B0-to-R1 difference as a controlled effect. This document takes no
+   the historical B0-to-oracle difference as a controlled effect. This document takes no
    position beyond noting both metric families must move together (§6) — a result that
    improves AUPRC while regressing every MMD ratio, or vice versa, is not a clean
    "go" under the standing edge+graph joint-reporting rule and needs an owner call on
    how to weigh the tradeoff, not a formula baked into this design.
-2. **Protocol addendum for oracle rows.** R1's leave-one-out masking and R2's
-   test-graph ceiling are new run *kinds* that do not fit neatly into the existing
-   G5/rev-3.x Stage-1 vocabulary (`docs/03-experiment-protocol.md` predates this
-   generator family entirely). Whether R1 needs its own named protocol addendum
-   before its numbers can be cited anywhere outside this screen, or whether it stays
-   inside the existing Stage-1 screen umbrella, is an owner call.
-3. **Whether a weak R1 result kills the generator program or just this conditioning
+2. **Reporting boundary.** The repaired rows are diagnostic by construction and may
+   not be promoted into the formal G5/rev-3.x Stage-1 evidence surface.
+3. **Whether a weak diagnostic result kills the generator program or just this conditioning
    ladder.** §1 frames the binary "no lift here means no lift from a better
    generator" reading, but a narrower reading — "these four conditioning modes
    specifically can't consume it, try others before concluding the generator ceiling
@@ -218,7 +252,7 @@ judgment calls. Each wave-1 config's header comment repeats the relevant subset.
   `ENCODER_REGISTRY`; `dim`/`layers` are reused fields, not new ones.
 - `ClassifierConfig.conditioning_mode: str` over the four values in §4, with the
   zero-init null-identity guarantee actually implemented per mode.
-- Trainer support for an empty generator optimizer group, because every R1 oracle
+- Trainer support for an empty generator optimizer group, because every oracle
   generator is zero-parameter while its encoder and classifier remain trainable.
 - Component-aware batch construction for the zero-parameter oracle generator: omit
   the generator node stream, grounding-pool transfer, and generator-only targets.

@@ -22,7 +22,8 @@ The train command drives the full packed-feature DDP training pipeline
 (`python -m src.e2_pipeline`) across all visible NVIDIA H20 GPUs via an
 automatically sized `accelerate launch`. It defaults to the B0 worker
 (`src.train_b0`); pass `--worker-module src.train_egostitch --run-kind formal`
-after the config path to train an EgoStitch E2E config
+after the config path to train a formal EgoStitch E2E config, or use
+`--run-kind diagnostic` only for a config explicitly consuming held-out truth
 (`model.family: egostitch_e2e`) instead. Direct `python -m src.train_b0
 --max-steps N` remains debug-only (bounded smoke runs); it is never a formal E2
 training run. The external CAZI-MBN reproduction is not an E2 packed-feature
