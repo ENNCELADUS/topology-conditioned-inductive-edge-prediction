@@ -440,6 +440,7 @@ def run_test_protocol(
     model_config: Path | None = None,
     allow_oracle_diagnostic: bool = False,
     report_filename: str = "test_report.json",
+    reuse_existing_scores: bool = False,
 ) -> TestProtocolResult:
     """Run the full test protocol for one published checkpoint.
 
@@ -483,6 +484,10 @@ def run_test_protocol(
             never a formal held-out result, regardless of pairs source.
         report_filename: Report name; diagnostic runs pass
             ``diagnostic_test_report.json``.
+        reuse_existing_scores: Reuse an already-written ``scores/<pairs>.npz``
+            instead of rescoring that universe. Opt-in, for resuming a run
+            whose later pass failed after earlier ones succeeded; reused
+            artifacts are still checkpoint-cross-checked like scored ones.
 
     Returns:
         The written report path and its parsed payload.
@@ -545,10 +550,20 @@ def run_test_protocol(
         # collision this used to hit. Deliberately not relying on
         # `allow_cache_subset=True` (CLAUDE.md trap: silently gathers a
         # superset cache into a different node set with no content check).
+        output = scores_dir / f"{pairs_source}.npz"
+        if reuse_existing_scores and output.is_file():
+            # Opt-in only. A scoring pass costs hours, so a rerun after a later
+            # pass failed must not redo the finished ones -- but reuse is never
+            # implicit: a silently reused artifact from a different checkpoint
+            # would be exactly the kind of wrong-but-quiet result this module
+            # exists to prevent. `_require_same_checkpoint` still cross-checks
+            # every reused artifact against the others below.
+            logger.info("reusing existing %s scores: %s", pairs_source, output)
+            return output
         args = _build_score_args(
             checkpoint=checkpoint,
             pairs=pairs_source,
-            output=scores_dir / f"{pairs_source}.npz",
+            output=output,
             data_root=data_root,
             strategy=strategy,
             run_metadata=scoring_identity_path,
@@ -804,8 +819,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--timeout-seconds",
         type=float,
-        required=True,
-        help="hard wall-clock deadline for each score shard",
+        default=None,
+        help="optional per-shard wall-clock deadline; omit to wait indefinitely",
+    )
+    parser.add_argument(
+        "--reuse-existing-scores",
+        action="store_true",
+        help="reuse already-written scores/<pairs>.npz instead of rescoring that universe",
     )
     return parser
 
@@ -854,6 +874,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         model_config=args.model_config,
         allow_oracle_diagnostic=args.allow_oracle_diagnostic,
         report_filename=args.report_filename,
+        reuse_existing_scores=args.reuse_existing_scores,
     )
     logger.info("wrote %s", result.report_path)
 

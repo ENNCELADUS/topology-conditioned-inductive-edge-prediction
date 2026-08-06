@@ -103,7 +103,7 @@ def score_sharded(
     *,
     gpu_count: int,
     python_bin: Path,
-    timeout_seconds: float,
+    timeout_seconds: float | None = None,
     command_runner: CommandRunner = run_command,
 ) -> Path:
     """Score one pairs universe across `gpu_count` GPUs and merge the shards.
@@ -119,7 +119,10 @@ def score_sharded(
             ``--num-shards``; this function owns sharding.
         gpu_count: Number of GPUs to fan out across.
         python_bin: Interpreter used to launch each shard.
-        timeout_seconds: Hard wall-clock deadline for each shard.
+        timeout_seconds: Optional hard wall-clock deadline for each shard.
+            Defaults to ``None`` (wait indefinitely): a scoring pass's cost is
+            set by its pairs universe, so a fixed budget is a guess that throws
+            away hours of finished work whenever it is too small.
         command_runner: Injectable subprocess seam.
 
     Returns:
@@ -227,8 +230,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--timeout-seconds",
         type=float,
-        required=True,
-        help="hard wall-clock deadline for each shard (and the merge)",
+        default=None,
+        help="optional per-shard wall-clock deadline; omit to wait indefinitely",
     )
     args, score_args = parser.parse_known_args(argv)
     output = score_sharded(

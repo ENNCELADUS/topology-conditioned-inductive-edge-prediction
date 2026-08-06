@@ -1,31 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
-import pytest
 import scipy.sparse as sp
 import torch
-import yaml  # type: ignore[import-untyped]
 from src.baselines.cazi_mbn import CAZIStudent, CAZITeacher
 from src.data.feature_stats import compute_feature_stats
-from src.train_cazi_mbn import _standardize_f0, compute_ugt_projection, load_config
-
-
-def test_shipped_config_carries_the_test_stage_budget() -> None:
-    """`hpc/run.sh` reads this budget to bound the chained test protocol."""
-    cfg = load_config(Path("configs/cazi_mbn_breadth_first.yaml"))
-    assert cfg.test_budget_seconds > 0
-
-
-def test_missing_test_budget_seconds_is_rejected(tmp_path: Path) -> None:
-    """The key is required: CAZI must not fall back to an implicit deadline."""
-    raw = yaml.safe_load(Path("configs/cazi_mbn_breadth_first.yaml").read_text(encoding="utf-8"))
-    del raw["runtime"]["test_budget_seconds"]
-    config_path = tmp_path / "cazi.yaml"
-    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(KeyError, match="test_budget_seconds"):
-        load_config(config_path)
+from src.train_cazi_mbn import _standardize_f0, compute_ugt_projection
 
 
 def test_teacher_and_student_contracts() -> None:

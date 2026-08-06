@@ -2147,7 +2147,7 @@ def _write_cazi_config(
             "distillation_weight": 0.5,
             "supervised_weight": 0.5,
         },
-        "runtime": {"batch_size": 4, "score_batch_size": 4, "test_budget_seconds": 60},
+        "runtime": {"batch_size": 4, "score_batch_size": 4},
         "seed": 0,
         "output_dir": str(output_dir),
     }

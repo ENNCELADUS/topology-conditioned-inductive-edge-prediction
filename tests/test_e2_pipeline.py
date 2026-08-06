@@ -657,7 +657,6 @@ def _pipeline_config_dict(
         "setup_probe_budget_seconds": 10,
         "train_eval_budget_seconds": 5,
         "artifact_budget_seconds": 3,
-        "test_budget_seconds": 6,
         "reserve_seconds": 2,
         "probe_warmup_steps": 1,
         "probe_timed_steps": 1,
@@ -665,10 +664,10 @@ def _pipeline_config_dict(
     if runtime_overrides:
         runtime.update(runtime_overrides)
         # `train_b0.load_config` asserts the five stage budgets sum to
-        # `total_budget_seconds` -- `test_budget_seconds` is deliberately
-        # excluded from that sum (the test stage runs after the total-budget
-        # gate is already decided) -- so an override of any of the five has to
-        # be re-balanced or the config is rejected before the pipeline ever runs.
+        # `total_budget_seconds`, so an override of any of the five has to be
+        # re-balanced or the config is rejected before the pipeline ever runs.
+        # The test stage has no budget at all: its cost is set by the pairs
+        # universe, not boundable up front.
         if "total_budget_seconds" not in runtime_overrides:
             runtime["total_budget_seconds"] = sum(
                 cast(int, runtime[key])
@@ -767,18 +766,18 @@ def _make_fake_runner(
     fail_mode: str | None = None,
     timeout_mode: str | None = None,
     write_v_hold_validation_ledger: bool = False,
-) -> Callable[[Sequence[str], float], subprocess.CompletedProcess[str]]:
+) -> Callable[[Sequence[str], float | None], subprocess.CompletedProcess[str]]:
     """Stand in for the single ``train`` process group the orchestrator launches."""
     resolved_train_profile: dict[str, object] = train_runtime_profile or _valid_worker_profile()
 
-    def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    def runner(command: Sequence[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
         command_list = list(command)
         mode = _arg_value(command_list, "--ddp-mode")
         profile_output = Path(_arg_value(command_list, "--profile-output"))
         out_dir = Path(_arg_value(command_list, "--output-dir"))
 
         if timeout_mode == mode:
-            raise subprocess.TimeoutExpired(cmd=command_list, timeout=timeout)
+            raise subprocess.TimeoutExpired(cmd=command_list, timeout=timeout or 0.0)
         if fail_mode == mode:
             return subprocess.CompletedProcess(command_list, returncode=1, stdout="", stderr="boom")
 
@@ -822,7 +821,7 @@ def test_orchestrator_launches_only_the_train_stage(tmp_path: Path) -> None:
     base_runner = _make_fake_runner()
     launched: list[tuple[str, str]] = []
 
-    def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    def runner(command: Sequence[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
         launched.append(
             (_arg_value(command, "--ddp-mode"), _arg_value(command, "--token-budget-per-rank"))
         )
@@ -952,7 +951,9 @@ class TestRunPipelineSuccess:
         profile["validations_completed"] = 1
         profile["per_epoch"] = cast(list[object], profile["per_epoch"])[:1]
 
-        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        def runner(
+            command: Sequence[str], timeout: float | None
+        ) -> subprocess.CompletedProcess[str]:
             result = _make_fake_runner(train_runtime_profile=profile)(command, timeout)
             if _arg_value(command, "--ddp-mode") == "train":
                 out = Path(_arg_value(command, "--output-dir"))
@@ -1075,7 +1076,7 @@ class TestRunPipelineSuccess:
                 verify_shard_sha256=verify_shard_sha256,
             )
 
-        def supervised(operation: Callable[[], None], _timeout: float) -> None:
+        def supervised(operation: Callable[[], None], _timeout: float | None) -> None:
             nonlocal inside_stage
             inside_stage = True
             try:
@@ -1092,7 +1093,9 @@ class TestRunPipelineSuccess:
         """With no candidate sweep left, an OOM is simply a failed train stage."""
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
 
-        def runner(command: Sequence[str], _timeout: float) -> subprocess.CompletedProcess[str]:
+        def runner(
+            command: Sequence[str], _timeout: float | None
+        ) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(command, 1, "", "CUDA out of memory")
 
         assert run_pipeline(args, command_runner=runner) == 2
@@ -1116,7 +1119,7 @@ class TestRunPipelineSuccess:
             (output_dir / filename).write_text("stale")
 
         def no_write_train(
-            command: Sequence[str], timeout: float
+            command: Sequence[str], timeout: float | None
         ) -> subprocess.CompletedProcess[str]:
             if _arg_value(command, "--ddp-mode") == "train":
                 return subprocess.CompletedProcess(command, 0, "", "")
@@ -1133,7 +1136,9 @@ class TestRunPipelineSuccess:
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
         base_runner = _make_fake_runner()
 
-        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        def runner(
+            command: Sequence[str], timeout: float | None
+        ) -> subprocess.CompletedProcess[str]:
             command_list = list(command)
             if _arg_value(command_list, "--ddp-mode") == "train":
                 staging = Path(_arg_value(command_list, "--output-dir"))
@@ -1388,7 +1393,9 @@ class TestRunPipelineFailures:
         args, output_dir = self._base_args_and_config(tmp_path)
         base = _make_fake_runner()
 
-        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        def runner(
+            command: Sequence[str], timeout: float | None
+        ) -> subprocess.CompletedProcess[str]:
             completed = base(command, timeout)
             if _arg_value(command, "--ddp-mode") == "train":
                 staging = Path(_arg_value(command, "--output-dir"))
@@ -1435,11 +1442,11 @@ class TestRunPipelineFailures:
 
     def test_pack_timeout_is_supervised_and_structured(self, tmp_path: Path) -> None:
         args, output_dir = self._base_args_and_config(tmp_path, pack_budget_seconds=1)
-        observed: dict[str, float] = {}
+        observed: dict[str, float | None] = {}
 
-        def timeout_stage(_operation: Callable[[], None], timeout: float) -> None:
+        def timeout_stage(_operation: Callable[[], None], timeout: float | None) -> None:
             observed["timeout"] = timeout
-            raise subprocess.TimeoutExpired(cmd="pack", timeout=timeout)
+            raise subprocess.TimeoutExpired(cmd="pack", timeout=timeout or 0.0)
 
         exit_code = run_pipeline(
             args, command_runner=_make_fake_runner(), stage_runner=timeout_stage
@@ -1456,7 +1463,9 @@ class TestRunPipelineFailures:
         args, output_dir = self._base_args_and_config(tmp_path)
         base = _make_fake_runner()
 
-        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        def runner(
+            command: Sequence[str], timeout: float | None
+        ) -> subprocess.CompletedProcess[str]:
             completed = base(command, timeout)
             profile_output = Path(_arg_value(command, "--profile-output"))
             profile_output.unlink(missing_ok=True)
@@ -1486,7 +1495,7 @@ class TestRunPipelineFailures:
         base_runner = _make_fake_runner()
 
         def corrupting_runner(
-            command: Sequence[str], timeout: float
+            command: Sequence[str], timeout: float | None
         ) -> subprocess.CompletedProcess[str]:
             if _arg_value(command, "--ddp-mode") == "train":
                 Path(_arg_value(command, "--profile-output")).write_text("partial")
@@ -1534,11 +1543,11 @@ class TestRunPipelineFailures:
         calls = 0
 
         # Two supervised stages remain: pack, then artifacts.
-        def stage_runner(operation: Callable[[], None], timeout: float) -> None:
+        def stage_runner(operation: Callable[[], None], timeout: float | None) -> None:
             nonlocal calls
             calls += 1
             if calls == 2:
-                raise subprocess.TimeoutExpired(cmd="artifacts", timeout=timeout)
+                raise subprocess.TimeoutExpired(cmd="artifacts", timeout=timeout or 0.0)
             operation()
 
         worker_profile = {
@@ -1848,32 +1857,30 @@ class TestRunPipelineTestStage:
         assert f"python -m src.e2_pipeline --config {args.config}" in failure["message"]
         assert (output_dir / "complete.json").is_file()
 
-    def test_test_stage_timeout_writes_failure_and_preserves_publication(
-        self, tmp_path: Path
-    ) -> None:
-        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
-        calls = 0
+    def test_test_stage_runs_without_a_deadline(self, tmp_path: Path) -> None:
+        """The test stage is supervised but unbounded.
 
-        # Three supervised stages remain in a successful run: pack, artifacts,
-        # then test.
-        def stage_runner(operation: Callable[[], None], timeout: float) -> None:
-            nonlocal calls
-            calls += 1
-            if calls == 3:
-                raise subprocess.TimeoutExpired(cmd="test", timeout=timeout)
+        Scoring cost is set by the pairs universe -- the candidate universe is
+        ~2.0M pairs, ~32x the test universe -- so no fixed budget can be chosen
+        up front. A wrong one silently discards hours of finished scoring, which
+        is exactly how the first real run died. Both the supervising stage and
+        the per-shard fan-out must therefore receive `None`.
+        """
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        timeouts: list[float | None] = []
+
+        def stage_runner(operation: Callable[[], None], timeout: float | None) -> None:
+            timeouts.append(timeout)
             operation()
 
         exit_code = run_pipeline(
             args, command_runner=_make_fake_runner(), stage_runner=stage_runner
         )
 
-        assert exit_code == 2
-        failure = json.loads((output_dir / "failure.json").read_text())
-        assert failure["stage"] == "test"
-        assert failure["timeout_seconds"] == 6
-        assert (output_dir / "complete.json").is_file()
-        assert (output_dir / "best.pt").is_file()
-        assert not (output_dir / "test_complete.json").exists()
+        assert exit_code == 0
+        # pack, artifacts, test -- the test stage is the last and is unbounded.
+        assert timeouts[-1] is None
+        assert (output_dir / "test_complete.json").is_file()
 
     def test_max_steps_debug_run_never_reaches_the_test_stage(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1901,7 +1908,9 @@ class TestRunPipelineTestStage:
 
         monkeypatch.setattr(test_protocol, "run_test_protocol", never_called)
 
-        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        def runner(
+            command: Sequence[str], timeout: float | None
+        ) -> subprocess.CompletedProcess[str]:
             result = _make_fake_runner(train_runtime_profile=profile)(command, timeout)
             if _arg_value(command, "--ddp-mode") == "train":
                 out = Path(_arg_value(command, "--output-dir"))
@@ -2075,11 +2084,11 @@ class TestRunPipelineTestStage:
         # `calls` only counts this SECOND run_pipeline invocation (the first
         # ran under its own stage_runner above). Three supervised stages per
         # run: pack, artifacts, then test.
-        def stage_runner(operation: Callable[[], None], timeout: float) -> None:
+        def stage_runner(operation: Callable[[], None], timeout: float | None) -> None:
             nonlocal calls
             calls += 1
             if calls == 3:
-                raise subprocess.TimeoutExpired(cmd="test", timeout=timeout)
+                raise subprocess.TimeoutExpired(cmd="test", timeout=timeout or 0.0)
             operation()
 
         exit_code = run_pipeline(

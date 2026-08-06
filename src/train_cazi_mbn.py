@@ -60,7 +60,6 @@ class CAZIConfig:
     heads: int
     batch_size: int
     score_batch_size: int
-    test_budget_seconds: int
     learning_rate: float
     weight_decay: float
     teacher_epochs: int
@@ -125,7 +124,6 @@ def load_config(path: Path) -> CAZIConfig:
         heads=int(model["heads"]),
         batch_size=int(runtime["batch_size"]),
         score_batch_size=int(runtime["score_batch_size"]),
-        test_budget_seconds=int(runtime["test_budget_seconds"]),
         learning_rate=float(optim["learning_rate"]),
         weight_decay=float(optim["weight_decay"]),
         teacher_epochs=int(optim["teacher_epochs"]),

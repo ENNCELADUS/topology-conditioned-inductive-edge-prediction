@@ -206,7 +206,6 @@ class EgoRuntimeConfig:
     pack_budget_seconds: int
     train_eval_budget_seconds: int
     artifact_budget_seconds: int
-    test_budget_seconds: int
 
 
 @dataclass(frozen=True)
@@ -463,7 +462,6 @@ def load_config(path: Path) -> EgoConfig:
             "pack_budget_seconds",
             "train_eval_budget_seconds",
             "artifact_budget_seconds",
-            "test_budget_seconds",
         )
         _check_no_unknown_keys(runtime_raw, runtime_keys, "runtime")
         world_size_raw = _require(runtime_raw, "world_size", "runtime.")
@@ -509,10 +507,6 @@ def load_config(path: Path) -> EgoConfig:
             artifact_budget_seconds=_as_int(
                 _require(runtime_raw, "artifact_budget_seconds", "runtime."),
                 "runtime.artifact_budget_seconds",
-            ),
-            test_budget_seconds=_as_int(
-                _require(runtime_raw, "test_budget_seconds", "runtime."),
-                "runtime.test_budget_seconds",
             ),
         )
         if runtime.token_budget <= 0:

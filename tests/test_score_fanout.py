@@ -24,9 +24,11 @@ class _RecordingRunner:
         self._fail_shard = fail_shard
         self._fail_merge = fail_merge
         self._lock = threading.Lock()
-        self.calls: list[tuple[list[str], float]] = []
+        self.calls: list[tuple[list[str], float | None]] = []
 
-    def __call__(self, command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    def __call__(
+        self, command: Sequence[str], timeout: float | None
+    ) -> subprocess.CompletedProcess[str]:
         command_list = list(command)
         with self._lock:
             self.calls.append((command_list, timeout))
@@ -42,10 +44,10 @@ class _RecordingRunner:
             return subprocess.CompletedProcess(command_list, 0, "", "")
         return subprocess.CompletedProcess(command_list, 0, "", "")
 
-    def merge_calls(self) -> list[tuple[list[str], float]]:
+    def merge_calls(self) -> list[tuple[list[str], float | None]]:
         return [call for call in self.calls if "merge" in call[0]]
 
-    def shard_calls(self) -> list[tuple[list[str], float]]:
+    def shard_calls(self) -> list[tuple[list[str], float | None]]:
         return [call for call in self.calls if "--shard" in call[0]]
 
 
@@ -77,7 +79,7 @@ def test_single_gpu_issues_one_unsharded_pass_and_no_merge() -> None:
 
 
 def test_single_gpu_failure_raises_runtime_error() -> None:
-    def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    def runner(command: Sequence[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(list(command), 1, "", "score failed hard")
 
     with pytest.raises(RuntimeError, match="score failed hard"):
@@ -211,7 +213,7 @@ def test_failing_merge_raises() -> None:
 
 
 def test_shard_flag_in_score_args_is_rejected() -> None:
-    def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    def runner(command: Sequence[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
         raise AssertionError("command_runner must not be called")
 
     with pytest.raises(ValueError, match="--shard"):
@@ -225,7 +227,7 @@ def test_shard_flag_in_score_args_is_rejected() -> None:
 
 
 def test_num_shards_flag_in_score_args_is_rejected() -> None:
-    def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    def runner(command: Sequence[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
         raise AssertionError("command_runner must not be called")
 
     with pytest.raises(ValueError, match="--num-shards"):
@@ -239,7 +241,7 @@ def test_num_shards_flag_in_score_args_is_rejected() -> None:
 
 
 def test_missing_output_is_rejected() -> None:
-    def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    def runner(command: Sequence[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
         raise AssertionError("command_runner must not be called")
 
     with pytest.raises(ValueError, match="--output"):
@@ -253,7 +255,7 @@ def test_missing_output_is_rejected() -> None:
 
 
 def test_non_npz_output_is_rejected() -> None:
-    def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    def runner(command: Sequence[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
         raise AssertionError("command_runner must not be called")
 
     with pytest.raises(ValueError, match=r"\.npz"):

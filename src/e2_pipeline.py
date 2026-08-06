@@ -355,8 +355,8 @@ def _pipeline_rerun_command(args: PipelineArgs) -> str:
     return " ".join(parts)
 
 
-CommandRunner = Callable[[Sequence[str], float], subprocess.CompletedProcess[str]]
-StageRunner = Callable[[Callable[[], None], float], None]
+CommandRunner = Callable[[Sequence[str], float | None], subprocess.CompletedProcess[str]]
+StageRunner = Callable[[Callable[[], None], float | None], None]
 
 
 # Set only while a `run_stage` call is supervising: the directory nested
@@ -401,7 +401,9 @@ def _kill_registered_process_groups(registry: Path) -> None:
                 os.killpg(pgid, signal.SIGKILL)
 
 
-def run_command(command: Sequence[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
+def run_command(
+    command: Sequence[str], timeout_seconds: float | None
+) -> subprocess.CompletedProcess[str]:
     """Run ``command`` in a killable process group on the fixed POSIX/Linux target.
 
     ``start_new_session=True`` gives this call its own killable group for its
@@ -415,7 +417,9 @@ def run_command(command: Sequence[str], timeout_seconds: float) -> subprocess.Co
     Args:
         command: The argv list to execute.
         timeout_seconds: Hard wall-clock timeout; raises
-            ``subprocess.TimeoutExpired`` if exceeded.
+            ``subprocess.TimeoutExpired`` if exceeded. ``None`` waits
+            indefinitely, for work whose duration is data-dependent rather
+            than boundable up front (the held-out test stage's scoring).
 
     Returns:
         The ``CompletedProcess`` (``check=False``: callers inspect ``.returncode``).
@@ -456,7 +460,7 @@ def _run_stage_child(operation: Callable[[], None], sender: Connection) -> None:
         sender.close()
 
 
-def run_stage(operation: Callable[[], None], timeout_seconds: float) -> None:
+def run_stage(operation: Callable[[], None], timeout_seconds: float | None) -> None:
     """Run a Python stage under a killable POSIX/Linux process-group deadline.
 
     Before forking, opens a nested-process-group registry directory (see
@@ -482,6 +486,9 @@ def run_stage(operation: Callable[[], None], timeout_seconds: float) -> None:
         sender.close()
         process.join(timeout_seconds)
         if process.is_alive():
+            # Only reachable with a deadline: `join(None)` returns solely when
+            # the child has exited, so an unbounded stage is never alive here.
+            assert timeout_seconds is not None
             if process.pid is None:  # pragma: no cover - start() above guarantees a PID
                 raise RuntimeError("supervised stage has no process ID")
             with suppress(ProcessLookupError):
@@ -864,7 +871,7 @@ def run_pipeline(
     validated staging tree into the canonical output directory with per-file
     atomic replaces and full rollback; and (8), only once publication has
     committed, run the published ``best.pt`` through the held-out test
-    protocol (``runtime.test_budget_seconds``), recording its duration into
+    protocol (no deadline: see the test stage), recording its duration into
     ``profile.json``'s ``stage_seconds["test"]`` and writing ``test_report.json``
     then ``test_complete.json`` last (``diagnostic_*`` names under
     ``run_kind == "diagnostic"``). Immediately before the test stage starts, any
@@ -1252,7 +1259,11 @@ def run_pipeline(
             score_args,
             gpu_count=runtime.world_size,
             python_bin=Path(sys.executable),
-            timeout_seconds=float(runtime.test_budget_seconds),
+            # No deadline. Scoring cost is set by the candidate universe
+            # (~2.0M pairs, ~32x the test universe), so any fixed budget is a
+            # guess that discards hours of finished work when it is wrong --
+            # which is exactly how the first real run died.
+            timeout_seconds=None,
             command_runner=command_runner,
         )
 
@@ -1325,13 +1336,7 @@ def run_pipeline(
         _clear_stale_test_artifacts(
             output_dir, report_filename=report_filename, test_complete_name=test_complete_name
         )
-        stage_runner(test_operation, float(runtime.test_budget_seconds))
-    except subprocess.TimeoutExpired:
-        return fail_after_publication(
-            stage="test",
-            message=f"held-out test stage timed out after {runtime.test_budget_seconds}s",
-            extra={"timeout_seconds": runtime.test_budget_seconds},
-        )
+        stage_runner(test_operation, None)
     except Exception as error:
         message = f"held-out test stage failed: {error}"
         if "requires --rescore-reason" in str(error):

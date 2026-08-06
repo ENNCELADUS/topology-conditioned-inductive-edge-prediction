@@ -554,6 +554,61 @@ class TestRunTestProtocol:
         assert not (output_dir / "test_report.json").exists()
 
 
+class TestReuseExistingScores:
+    """Resuming a run whose later pass failed must not redo the finished ones."""
+
+    def test_reuses_written_artifacts_and_only_scores_what_is_missing(self, tmp_path: Path) -> None:
+        """Mimics the real failure: v_hold and test finished, candidate did not."""
+        fixture = _build_fixture(tmp_path)
+        checkpoint = _write_checkpoint(tmp_path)
+        output_dir = tmp_path / "outputs" / "resume"
+        scores_dir = output_dir / "scores"
+        scores_dir.mkdir(parents=True)
+        for pairs_source in ("v_hold", "test"):
+            (scores_dir / f"{pairs_source}.npz").write_bytes(
+                fixture.artifacts[pairs_source].read_bytes()
+            )
+
+        runner = _FakeScoreRunner(fixture.artifacts)
+        run_test_protocol(
+            checkpoint=checkpoint,
+            output_dir=output_dir,
+            data_root=fixture.data_root,
+            strategy=_STRATEGY,
+            arm="full",
+            seed=0,
+            score_runner=runner,
+            reuse_existing_scores=True,
+        )
+
+        assert runner.pairs_order == ["candidate"]
+
+    def test_reuse_is_opt_in(self, tmp_path: Path) -> None:
+        """Implicit reuse would silently serve stale scores after a code fix."""
+        fixture = _build_fixture(tmp_path)
+        checkpoint = _write_checkpoint(tmp_path)
+        output_dir = tmp_path / "outputs" / "no_reuse"
+        scores_dir = output_dir / "scores"
+        scores_dir.mkdir(parents=True)
+        for pairs_source in ("v_hold", "test"):
+            (scores_dir / f"{pairs_source}.npz").write_bytes(
+                fixture.artifacts[pairs_source].read_bytes()
+            )
+
+        runner = _FakeScoreRunner(fixture.artifacts)
+        run_test_protocol(
+            checkpoint=checkpoint,
+            output_dir=output_dir,
+            data_root=fixture.data_root,
+            strategy=_STRATEGY,
+            arm="full",
+            seed=0,
+            score_runner=runner,
+        )
+
+        assert runner.pairs_order == ["v_hold", "test", "candidate"]
+
+
 class TestPublishedRunMetadataNeverClobbered:
     """P1 fix #2: this module must never overwrite a published run_metadata.json."""
 

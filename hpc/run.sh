@@ -39,10 +39,12 @@ src.train_cazi_mbn`, which this branch runs to completion and then chains the
 same held-out test protocol against the checkpoint it publishes.
 
 The score command is a thin passthrough to `python -m src.score_fanout`, which
-requires --timeout-seconds, auto-detects GPU count, pins --device cuda --amp
-bf16, launches one contiguous shard per visible GPU, waits for every shard, and
-strictly merges them into the requested output; this runner does not duplicate
-that sharding or validation.
+auto-detects GPU count, pins --device cuda --amp bf16, launches one contiguous
+shard per visible GPU, waits for every shard, and strictly merges them into the
+requested output; this runner does not duplicate that sharding or validation.
+Scoring has no wall-clock deadline: a pass's cost is set by its pairs universe
+(the candidate universe is ~2.0M pairs, ~32x the test universe), so a fixed
+budget only discards finished work. Pass --timeout-seconds to impose one.
 
 The test command is a thin passthrough to `python -m src.eval.test_protocol`
 for one published checkpoint: score val (V_hold) -> freeze the max-F1
@@ -123,12 +125,12 @@ case "${COMMAND}" in
       # operating point. The test protocol below is the single owner of every
       # held-out read for this arm.
       "${PYTHON_BIN}" -m src.train_cazi_mbn "${CONFIG_PATH}" --device cuda --stage train
-      read -r CAZI_OUTPUT_DIR CAZI_STRATEGY CAZI_SEED CAZI_TEST_BUDGET < <("${PYTHON_BIN}" -c '
+      read -r CAZI_OUTPUT_DIR CAZI_STRATEGY CAZI_SEED < <("${PYTHON_BIN}" -c '
 import sys
 from pathlib import Path
 from src.train_cazi_mbn import load_config
 cfg = load_config(Path(sys.argv[1]))
-print(cfg.output_dir, cfg.strategy, cfg.seed, cfg.test_budget_seconds)
+print(cfg.output_dir, cfg.strategy, cfg.seed)
 ' "${CONFIG_PATH}")
       exec "${PYTHON_BIN}" -m src.eval.test_protocol \
         --checkpoint "${CAZI_OUTPUT_DIR}/student.pt" \
@@ -138,8 +140,7 @@ print(cfg.output_dir, cfg.strategy, cfg.seed, cfg.test_budget_seconds)
         --data-root "${DATA_ROOT}" \
         --strategy "${CAZI_STRATEGY}" \
         --arm cazi_mbn \
-        --seed "${CAZI_SEED}" \
-        --timeout-seconds "${CAZI_TEST_BUDGET}"
+        --seed "${CAZI_SEED}"
     fi
     exec "${PYTHON_BIN}" -m src.e2_pipeline --config "${CONFIG_PATH}" "$@"
     ;;
