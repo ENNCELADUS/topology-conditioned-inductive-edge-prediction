@@ -26,9 +26,7 @@ class TestDeriveTrainingInteractions:
 
     def test_only_topology_projection_drops_self_pairs(self) -> None:
         interactions = derive_training_interactions([("n1", "n1"), ("n1", "n2")])
-        assert interactions.positives == frozenset(
-            {("n1", "n1"), ("n1", "n2")}
-        )
+        assert interactions.positives == frozenset({("n1", "n1"), ("n1", "n2")})
         assert interactions.topology_edges == frozenset({("n1", "n2")})
 
 

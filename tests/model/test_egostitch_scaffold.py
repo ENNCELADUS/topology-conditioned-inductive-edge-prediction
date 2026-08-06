@@ -102,12 +102,8 @@ def test_closed_wedge_feature_ignores_adjacency_diagonal() -> None:
     expected_j = torch.diagonal(plan.transpose(1, 2) @ adj_i_zero @ plan, dim1=-2, dim2=-1)
     assert torch.allclose(baseline.feats[:, 2:5, 10], expected_i, atol=1e-6)
     assert torch.allclose(baseline.feats[:, 5:8, 10], expected_j, atol=1e-6)
-    changed_i = si._replace(
-        adj=si.adj + torch.diag_embed(torch.tensor([[10.0, 20.0, 30.0]]))
-    )
-    changed_j = sj._replace(
-        adj=sj.adj + torch.diag_embed(torch.tensor([[40.0, 50.0, 60.0]]))
-    )
+    changed_i = si._replace(adj=si.adj + torch.diag_embed(torch.tensor([[10.0, 20.0, 30.0]])))
+    changed_j = sj._replace(adj=sj.adj + torch.diag_embed(torch.tensor([[40.0, 50.0, 60.0]])))
     changed = build_scaffold(changed_i, changed_j, plan)
     assert torch.allclose(changed.adj[:, 3], baseline.adj[:, 3], atol=1e-6)
     assert torch.allclose(changed.feats[..., 10], baseline.feats[..., 10], atol=1e-6)
@@ -115,12 +111,8 @@ def test_closed_wedge_feature_ignores_adjacency_diagonal() -> None:
 
 def test_closure_edge_matches_hand_built_three_slot_example() -> None:
     si, sj = _slots(b=1, k=3, seed=0), _slots(b=1, k=3, seed=1)
-    si = si._replace(
-        adj=torch.tensor([[[9.0, 1.0, 2.0], [1.0, 8.0, 3.0], [2.0, 3.0, 7.0]]])
-    )
-    sj = sj._replace(
-        adj=torch.tensor([[[6.0, 4.0, 5.0], [4.0, 5.0, 6.0], [5.0, 6.0, 4.0]]])
-    )
+    si = si._replace(adj=torch.tensor([[[9.0, 1.0, 2.0], [1.0, 8.0, 3.0], [2.0, 3.0, 7.0]]]))
+    sj = sj._replace(adj=torch.tensor([[[6.0, 4.0, 5.0], [4.0, 5.0, 6.0], [5.0, 6.0, 4.0]]]))
     plan = torch.diag_embed(torch.tensor([[1.0, 2.0, 3.0]]))
     out = build_scaffold(si, sj, plan)
     expected = torch.tensor([[[0.0, 3.0, 5.5], [4.5, 0.0, 10.5], [8.5, 12.0, 0.0]]])
@@ -157,12 +149,8 @@ def test_closure_fp32_island_preserves_values_and_gradients_under_bf16() -> None
     adj_i_zero = adj_i32 - torch.diag_embed(torch.diagonal(adj_i32, dim1=-2, dim2=-1))
     adj_j_zero = adj_j32 - torch.diag_embed(torch.diagonal(adj_j32, dim1=-2, dim2=-1))
     expected_c = 0.5 * (adj_i_zero @ plan32 + plan32 @ adj_j_zero)
-    expected_t_i = torch.diagonal(
-        plan32 @ adj_j_zero @ plan32.transpose(1, 2), dim1=-2, dim2=-1
-    )
-    expected_t_j = torch.diagonal(
-        plan32.transpose(1, 2) @ adj_i_zero @ plan32, dim1=-2, dim2=-1
-    )
+    expected_t_i = torch.diagonal(plan32 @ adj_j_zero @ plan32.transpose(1, 2), dim1=-2, dim2=-1)
+    expected_t_j = torch.diagonal(plan32.transpose(1, 2) @ adj_i_zero @ plan32, dim1=-2, dim2=-1)
     assert torch.allclose(out.adj[:, 3, 2:5, 5:8], expected_c, atol=1e-6)
     assert torch.allclose(out.feats[:, 2:5, 10], expected_t_i, atol=1e-6)
     assert torch.allclose(out.feats[:, 5:8, 10], expected_t_j, atol=1e-6)

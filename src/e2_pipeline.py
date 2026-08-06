@@ -5,12 +5,13 @@ Provides pure dataclasses and functions for:
 - write_failure(): atomic failure JSON artifact writer
 
 And the production orchestrator (``python -m src.e2_pipeline``) that drives the
-cold multi-H20 run end to end in three sub-stages — ``pack -> train ->
-publish``: pack-or-validate the BF16 feature cache, launch one clean
+cold multi-H20 run end to end in four sub-stages — ``pack -> train -> publish
+-> test``: pack-or-validate the BF16 feature cache, launch one clean
 ``accelerate launch`` ``train`` process group at the configured
 ``runtime.token_budget``, merge the worker's runtime profile with pipeline-level
-fields, and publish the validated staging tree atomically. See
-:func:`run_pipeline` for the full contract.
+fields, publish the validated staging tree atomically, then run the published
+checkpoint through the held-out test protocol. See :func:`run_pipeline` for
+the full contract.
 
 EgoStitch E2E uses this same orchestrator, selected via ``--worker-module
 src.train_egostitch``.
@@ -166,6 +167,10 @@ class PipelineArgs:
             (``load_config``, ``prepare_pack``, and the ``--ddp-mode train``
             CLI). Defaults to the formal E2 B0 worker; ``src.train_egostitch``
             selects the EgoStitch worker.
+        rescore_reason: Forwarded unchanged to the test stage's
+            ``run_test_protocol`` call. Required only when this ``(arm,
+            seed)`` has already opened a held-out scoring epoch; absent here
+            means absent there — this pipeline never synthesizes one.
     """
 
     config: Path
@@ -175,6 +180,7 @@ class PipelineArgs:
     seed: int | None = None
     max_steps: int | None = None
     run_kind: str | None = None
+    rescore_reason: str | None = None
 
 
 def build_accelerate_command(
@@ -301,6 +307,16 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
             "the EgoStitch worker)"
         ),
     )
+    parser.add_argument(
+        "--rescore-reason",
+        default=None,
+        help=(
+            "required to re-open held-out scoring for an (arm, seed) that "
+            "already has a scoring epoch; forwarded unchanged to the test "
+            "stage. Never synthesized: omit it and the test stage fails "
+            "loudly instead of silently reusing a prior epoch"
+        ),
+    )
     namespace = parser.parse_args(argv)
     return PipelineArgs(
         config=namespace.config,
@@ -310,15 +326,91 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
         seed=namespace.seed,
         max_steps=namespace.max_steps,
         run_kind=namespace.run_kind,
+        rescore_reason=namespace.rescore_reason,
     )
+
+
+def _pipeline_rerun_command(args: PipelineArgs) -> str:
+    """Render the exact CLI invocation to re-open held-out scoring for this run.
+
+    Used only to make the test-access ledger's repeat-scoring refusal
+    actionable: the operator gets a copy-pasteable command instead of having
+    to reconstruct the original invocation by hand. The reason itself is
+    always a placeholder — a synthetic reason would hollow out the ledger.
+    """
+    parts = ["python", "-m", "src.e2_pipeline", "--config", str(args.config)]
+    if args.pack_dir is not None:
+        parts += ["--pack-dir", str(args.pack_dir)]
+    if args.output_dir is not None:
+        parts += ["--output-dir", str(args.output_dir)]
+    if args.seed is not None:
+        parts += ["--seed", str(args.seed)]
+    if args.max_steps is not None:
+        parts += ["--max-steps", str(args.max_steps)]
+    if args.run_kind is not None:
+        parts += ["--run-kind", args.run_kind]
+    if args.worker_module != "src.train_b0":
+        parts += ["--worker-module", args.worker_module]
+    parts += ["--rescore-reason", "<reason for the repeat held-out scoring epoch>"]
+    return " ".join(parts)
 
 
 CommandRunner = Callable[[Sequence[str], float], subprocess.CompletedProcess[str]]
 StageRunner = Callable[[Callable[[], None], float], None]
 
 
+# Set only while a `run_stage` call is supervising: the directory nested
+# `run_command` invocations register their own (escaping) process group
+# under, so the supervising stage's timeout can reap them too. `None`
+# outside a supervised stage (e.g. the train stage's own top-level command).
+_nested_process_group_registry: Path | None = None
+
+
+def _register_nested_process_group(registry: Path | None, pgid: int) -> Path | None:
+    """Record `pgid` under `registry` for a supervising stage timeout to reap.
+
+    A no-op (returns ``None``) when `registry` is ``None`` -- i.e. this
+    ``run_command`` call is not nested inside a `run_stage` supervision.
+    """
+    if registry is None:
+        return None
+    entry = registry / f"{pgid}.pgid"
+    with suppress(OSError):
+        entry.write_text(str(pgid))
+    return entry
+
+
+def _unregister_nested_process_group(entry: Path | None) -> None:
+    """Remove a registry entry written by `_register_nested_process_group`."""
+    if entry is not None:
+        entry.unlink(missing_ok=True)
+
+
+def _kill_registered_process_groups(registry: Path) -> None:
+    """Best-effort ``SIGKILL`` every process group recorded under `registry`.
+
+    Tolerates a group that already exited (its file having since been removed
+    by `_unregister_nested_process_group`, or the pid already reaped) -- this
+    runs racing a stage's own subprocesses as they finish, so both the read
+    and the signal are advisory rather than guaranteed.
+    """
+    for entry in registry.glob("*.pgid"):
+        with suppress(OSError, ValueError):
+            pgid = int(entry.read_text())
+            with suppress(ProcessLookupError):
+                os.killpg(pgid, signal.SIGKILL)
+
+
 def run_command(command: Sequence[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
     """Run ``command`` in a killable process group on the fixed POSIX/Linux target.
+
+    ``start_new_session=True`` gives this call its own killable group for its
+    OWN timeout below. That also means the group is a *different* session
+    from any supervising `run_stage` call's forked child, so it would
+    otherwise survive that stage's own deadline entirely. While the
+    subprocess runs, this registers its group under the active
+    `_nested_process_group_registry` (set by `run_stage`, ``None`` outside
+    one) so a stage-level timeout can kill it too -- see `run_stage`.
 
     Args:
         command: The argv list to execute.
@@ -335,15 +427,19 @@ def run_command(command: Sequence[str], timeout_seconds: float) -> subprocess.Co
         stderr=subprocess.PIPE,
         text=True,
     )
+    registry_entry = _register_nested_process_group(_nested_process_group_registry, process.pid)
     try:
-        stdout, stderr = process.communicate(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired as error:
-        with suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        stdout, stderr = process.communicate()
-        raise subprocess.TimeoutExpired(
-            error.cmd, error.timeout, output=stdout, stderr=stderr
-        ) from None
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as error:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(
+                error.cmd, error.timeout, output=stdout, stderr=stderr
+            ) from None
+    finally:
+        _unregister_nested_process_group(registry_entry)
     return subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
 
 
@@ -361,28 +457,51 @@ def _run_stage_child(operation: Callable[[], None], sender: Connection) -> None:
 
 
 def run_stage(operation: Callable[[], None], timeout_seconds: float) -> None:
-    """Run a Python stage under a killable POSIX/Linux process-group deadline."""
+    """Run a Python stage under a killable POSIX/Linux process-group deadline.
+
+    Before forking, opens a nested-process-group registry directory (see
+    `run_command`) and installs it as the active
+    `_nested_process_group_registry`. The forked child inherits that value at
+    fork time, so any `run_command` call `operation` makes -- directly, or
+    several layers of ``command_runner`` indirection down, e.g. the test
+    stage's per-GPU ``score_sharded`` fan-out -- registers its own (escaping,
+    ``start_new_session=True``) process group there. On a timeout this kills
+    the forked stage's own group *and* every group recorded in the registry,
+    so a stage deadline never leaves one of `operation`'s subprocesses running
+    just because it had its own session.
+    """
+    global _nested_process_group_registry
     context = multiprocessing.get_context("fork")
     receiver, sender = context.Pipe(duplex=False)
-    process = context.Process(target=_run_stage_child, args=(operation, sender))
-    process.start()
-    sender.close()
-    process.join(timeout_seconds)
-    if process.is_alive():
-        if process.pid is None:  # pragma: no cover - start() above guarantees a PID
-            raise RuntimeError("supervised stage has no process ID")
-        with suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        process.join()
+    registry_dir = Path(tempfile.mkdtemp(prefix="e2-stage-pgroups-"))
+    previous_registry = _nested_process_group_registry
+    _nested_process_group_registry = registry_dir
+    try:
+        process = context.Process(target=_run_stage_child, args=(operation, sender))
+        process.start()
+        sender.close()
+        process.join(timeout_seconds)
+        if process.is_alive():
+            if process.pid is None:  # pragma: no cover - start() above guarantees a PID
+                raise RuntimeError("supervised stage has no process ID")
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            _kill_registered_process_groups(registry_dir)
+            process.join()
+            receiver.close()
+            raise subprocess.TimeoutExpired(cmd="python stage", timeout=timeout_seconds)
+        if not receiver.poll():
+            receiver.close()
+            raise RuntimeError(
+                f"supervised stage exited with code {process.exitcode} without a result"
+            )
+        succeeded, message = cast(tuple[bool, str], receiver.recv())
         receiver.close()
-        raise subprocess.TimeoutExpired(cmd="python stage", timeout=timeout_seconds)
-    if not receiver.poll():
-        receiver.close()
-        raise RuntimeError(f"supervised stage exited with code {process.exitcode} without a result")
-    succeeded, message = cast(tuple[bool, str], receiver.recv())
-    receiver.close()
-    if not succeeded:
-        raise RuntimeError(message)
+        if not succeeded:
+            raise RuntimeError(message)
+    finally:
+        _nested_process_group_registry = previous_registry
+        shutil.rmtree(registry_dir, ignore_errors=True)
 
 
 def _resolve_accelerate_bin() -> Path:
@@ -522,13 +641,15 @@ _PUBLISHED_FILENAMES = (
     "artifact_manifest.json",
 )
 V_HOLD_VALIDATION_EVENTS_FILENAME = "v_hold_validation_events.jsonl"
-_OPTIONAL_PUBLISHED_FILENAMES = (
-    V_HOLD_VALIDATION_EVENTS_FILENAME,
-)
+_OPTIONAL_PUBLISHED_FILENAMES = (V_HOLD_VALIDATION_EVENTS_FILENAME,)
 # One terminal sentinel per run kind, so a diagnostic run can never leave a
 # `complete.json` a reader would take for a formal result (`debug_complete.json`
 # is written by the debug branch, which never publishes through staging).
 _COMPLETION_FILENAMES = ("complete.json", "diagnostic_complete.json")
+# Mirrors `_COMPLETION_FILENAMES` one stage later: the test stage's own
+# terminal sentinel, split the same way so a diagnostic test run can never
+# leave a `test_complete.json` a reader would take for a formal result.
+_TEST_COMPLETION_FILENAMES = ("test_complete.json", "diagnostic_test_complete.json")
 
 
 def _validate_staged_artifacts(
@@ -583,9 +704,7 @@ def _validate_staged_artifacts(
         if metadata.get("checkpoint_role") != expected_role:
             raise ValueError("run_metadata.json checkpoint_role does not match run_kind")
         if metadata.get("formal_artifacts_published") is not (expected_run_kind == "formal"):
-            raise ValueError(
-                "run_metadata.json formal_artifacts_published does not match run_kind"
-            )
+            raise ValueError("run_metadata.json formal_artifacts_published does not match run_kind")
     if require_v_hold_validation_events:
         evidence = metadata.get("v_hold_validation_evidence")
         if not isinstance(evidence, dict):
@@ -614,6 +733,8 @@ def _validate_staged_artifacts(
         digest = hashlib.sha256(ledger_path.read_bytes()).hexdigest()
         if evidence.get("sha256") != digest:
             raise ValueError("V_hold validation-event ledger digest does not match metadata")
+
+
 def _publish_staged(
     staging_dir: Path,
     output_dir: Path,
@@ -682,6 +803,47 @@ def _assert_no_cross_kind_completion(output_dir: Path, *, run_kind: str) -> None
         )
 
 
+def _assert_no_cross_kind_test_completion(output_dir: Path, *, run_kind: str) -> None:
+    """Refuse to overwrite a test-stage result completed under the other run kind."""
+    other = "test_complete.json" if run_kind == "diagnostic" else "diagnostic_test_complete.json"
+    if (output_dir / other).exists():
+        raise RuntimeError(
+            "refusing to replace a test-stage result completed under a different run kind"
+        )
+
+
+def _test_stage_filenames(run_kind: str | None) -> tuple[str, str]:
+    """Return ``(report_filename, test_complete_filename)`` for this run kind.
+
+    Mirrors the formal/diagnostic split of ``_COMPLETION_FILENAMES``: a
+    diagnostic run must never write the formal test-stage names.
+    """
+    if run_kind == "diagnostic":
+        return "diagnostic_test_report.json", "diagnostic_test_complete.json"
+    return "test_report.json", "test_complete.json"
+
+
+def _clear_stale_test_artifacts(
+    output_dir: Path, *, report_filename: str, test_complete_name: str
+) -> None:
+    """Remove a prior run's same-kind test sentinel before the test stage starts.
+
+    Republishing a checkpoint (pack -> train -> publish onto an existing
+    output directory) never touches ``test_report.json``/``test_complete.json``
+    -- they live outside `_PUBLISHED_FILENAMES` and outside publish/rollback
+    entirely. Left alone, a scoring failure (or a process death) on the *new*
+    checkpoint would leave the *previous* checkpoint's completion sentinel
+    sitting beside it, falsely certifying the new one as tested.
+
+    The sentinel is unlinked first and the report second: a crash between the
+    two unlinks then leaves, at worst, a stale report with no sentinel next to
+    it -- never a sentinel a reader could mistake for certifying the
+    checkpoint currently on disk.
+    """
+    (output_dir / test_complete_name).unlink(missing_ok=True)
+    (output_dir / report_filename).unlink(missing_ok=True)
+
+
 def run_pipeline(
     args: PipelineArgs,
     *,
@@ -690,7 +852,7 @@ def run_pipeline(
 ) -> int:
     """Execute the cold E2 pipeline and return 0 on success or 2 on failure.
 
-    Sub-stages, ``pack -> train -> publish``: (1) load and validate the
+    Sub-stages, ``pack -> train -> publish -> test``: (1) load and validate the
     config/runtime; (2) record whether the pack path was initially absent;
     (3) build or strictly validate the pack within the pack budget; (4) launch
     one clean ``train`` process group at ``runtime.token_budget``; (5) validate
@@ -698,9 +860,27 @@ def run_pipeline(
     ``cfg.optim.epochs``; (6) merge stage/profile data into ``profile.json`` and write
     ``artifact_manifest.json`` with SHA-256 and byte size for ``best.pt``,
     ``last.pt``, ``metrics.jsonl``, ``run_metadata.json``, ``profile.json``, plus
-    the E2E ``v_hold_validation_events.jsonl`` when applicable; and (7)
-    publish the validated staging tree into the canonical output directory with
-    per-file atomic replaces and full rollback.
+    the E2E ``v_hold_validation_events.jsonl`` when applicable; (7) publish the
+    validated staging tree into the canonical output directory with per-file
+    atomic replaces and full rollback; and (8), only once publication has
+    committed, run the published ``best.pt`` through the held-out test
+    protocol (``runtime.test_budget_seconds``), recording its duration into
+    ``profile.json``'s ``stage_seconds["test"]`` and writing ``test_report.json``
+    then ``test_complete.json`` last (``diagnostic_*`` names under
+    ``run_kind == "diagnostic"``). Immediately before the test stage starts, any
+    same-kind ``test_report.json``/``test_complete.json`` left by a prior run on
+    this output directory is removed first, so a republish's new checkpoint can
+    never be found sitting beside a completion sentinel that certified the
+    checkpoint it replaced.
+
+    The test stage never rolls back publication: a held-out test-access ledger
+    record must not be spent on a checkpoint that is later rolled back (so
+    testing only ever runs after a committed publish), and a test-stage
+    failure must not discard an otherwise valid trained model (so its failure
+    path leaves ``complete.json`` and every published artifact untouched and
+    reports through ``failure.json`` alone). A bounded debug run
+    (``--max-steps``) returns before publication is even attempted, so it
+    never spends a held-out scoring epoch.
 
     Every subprocess call goes through ``command_runner`` with ``check=False``
     and an explicit timeout (``runtime.train_eval_budget_seconds`` for
@@ -711,8 +891,8 @@ def run_pipeline(
         args: Parsed pipeline CLI arguments.
         command_runner: Injectable subprocess seam (real subprocesses in
             production; a fake in tests).
-        stage_runner: Injectable supervised Python-stage seam for pack and
-            artifact deadlines.
+        stage_runner: Injectable supervised Python-stage seam for pack,
+            artifact, and test-stage deadlines.
 
     Returns:
         0 on success, 2 on failure (see the stage in ``failure.json``).
@@ -771,6 +951,25 @@ def run_pipeline(
             (output_dir / "failed_run_history.json").unlink(missing_ok=True)
         write_failure(output_dir, stage=stage, message=message, extra=extra)
         shutil.rmtree(staging_dir, ignore_errors=True)
+        return 2
+
+    def fail_after_publication(
+        *, stage: str, message: str, extra: Mapping[str, object] | None = None
+    ) -> int:
+        """Record a post-publication stage failure without touching publication.
+
+        ``fail()`` is written for pre-publication failures: at that point
+        ``complete.json`` does not exist yet, so removing the staging tree and
+        rescuing staged evidence is always safe. By the time the test stage
+        runs, `_publish_staged` has already committed a valid, real
+        ``complete.json`` and checkpoint; a scoring failure is a fact about the
+        *test* stage only; and a held-out test-access ledger record for this
+        ``(arm, seed)`` cannot be un-spent by rolling training back. So this
+        path never calls `_rollback_publication` and never removes anything
+        the publish stage wrote — it only records `failure.json` alongside the
+        still-valid `complete.json`.
+        """
+        write_failure(output_dir, stage=stage, message=message, extra=extra)
         return 2
 
     stage_seconds: dict[str, float] = {}
@@ -1035,8 +1234,114 @@ def run_pipeline(
         return fail(stage="publication", message=f"completion sentinel failed: {error}")
     shutil.rmtree(backup_dir, ignore_errors=True)
     shutil.rmtree(staging_dir, ignore_errors=True)
+    logger.info("E2 pipeline published: %.1fs elapsed", total_elapsed)
 
-    logger.info("E2 pipeline complete: %.1fs elapsed", total_elapsed)
+    # --- test: run the published checkpoint through the held-out test protocol ---
+    # Deferred imports, matching the import-cycle precedent at the top of this
+    # function: a bounded debug run never reaches this branch (it already
+    # returned above), so its heavier scoring/eval import graph never loads on
+    # that path, and the two modules stay free to import this one back.
+    from src.eval.test_protocol import run_test_protocol
+    from src.score_fanout import score_sharded
+
+    report_filename, test_complete_name = _test_stage_filenames(args.run_kind)
+    test_started = time.monotonic()
+
+    def score_runner(score_args: Sequence[str]) -> Path:
+        return score_sharded(
+            score_args,
+            gpu_count=runtime.world_size,
+            python_bin=Path(sys.executable),
+            timeout_seconds=float(runtime.test_budget_seconds),
+            command_runner=command_runner,
+        )
+
+    def test_operation() -> None:
+        """Score `best.pt`, then fold the stage duration into the published profile."""
+        published_metadata = json.loads(
+            (output_dir / "run_metadata.json").read_text(encoding="utf-8")
+        )
+        metadata_arm = (
+            published_metadata.get("arm") if isinstance(published_metadata, dict) else None
+        )
+        # Only egostitch_e2e run_metadata carries a real `arm`; every other
+        # worker has no experimental-arm axis, so its model family stands in
+        # as the test-report's arm identity.
+        arm = metadata_arm if isinstance(metadata_arm, str) and metadata_arm else cfg.model.family
+        run_test_protocol(
+            checkpoint=output_dir / "best.pt",
+            output_dir=output_dir,
+            data_root=cfg.data.root,
+            strategy=cfg.data.strategy,
+            arm=arm,
+            seed=cfg.seed,
+            score_runner=score_runner,
+            pack_dir=pack_dir,
+            rescore_reason=args.rescore_reason,
+            report_filename=report_filename,
+            # A diagnostic run is the true-Oracle path, whose generator consumes
+            # held-out positive structure; `score_universe` refuses this flag for
+            # any other generator, so a non-oracle diagnostic fails closed here
+            # rather than being silently scored as one.
+            allow_oracle_diagnostic=args.run_kind == "diagnostic",
+        )
+        test_duration = time.monotonic() - test_started
+        published_profile_path = output_dir / "profile.json"
+        published_profile = cast(
+            dict[str, object], json.loads(published_profile_path.read_text(encoding="utf-8"))
+        )
+        stage_seconds_value = published_profile.get("stage_seconds")
+        published_stage_seconds: dict[str, object] = (
+            dict(stage_seconds_value) if isinstance(stage_seconds_value, dict) else {}
+        )
+        published_stage_seconds["test"] = test_duration
+        published_profile["stage_seconds"] = published_stage_seconds
+        # Recomputed from the pipeline's own clock origin, not the published
+        # figure plus `test_duration`. The published figure is measured at the
+        # artifact cutoff, *before* publication, so accumulating onto it would
+        # leave `total_seconds` excluding publication entirely -- and smaller
+        # than `complete.json`'s own total whenever publication outlasts the
+        # test stage.
+        _finite_number(published_profile.get("total_seconds"), field="profile.total_seconds")
+        published_profile["total_seconds"] = time.monotonic() - pipeline_started
+        _write_json_atomic(published_profile_path, published_profile)
+        # The manifest records profile.json's own digest, so touching the
+        # profile after publication means re-hashing it here too -- otherwise
+        # the manifest would silently stop matching the bytes on disk.
+        manifest_path = output_dir / "artifact_manifest.json"
+        manifest = cast(dict[str, object], json.loads(manifest_path.read_text(encoding="utf-8")))
+        manifest["profile.json"] = {
+            "sha256": sha256_file(published_profile_path),
+            "byte_size": published_profile_path.stat().st_size,
+        }
+        _write_json_atomic(manifest_path, manifest)
+        _write_json_atomic(
+            output_dir / test_complete_name,
+            {"status": test_complete_name.removesuffix(".json")},
+        )
+
+    try:
+        _assert_no_cross_kind_test_completion(output_dir, run_kind=args.run_kind or "formal")
+        _clear_stale_test_artifacts(
+            output_dir, report_filename=report_filename, test_complete_name=test_complete_name
+        )
+        stage_runner(test_operation, float(runtime.test_budget_seconds))
+    except subprocess.TimeoutExpired:
+        return fail_after_publication(
+            stage="test",
+            message=f"held-out test stage timed out after {runtime.test_budget_seconds}s",
+            extra={"timeout_seconds": runtime.test_budget_seconds},
+        )
+    except Exception as error:
+        message = f"held-out test stage failed: {error}"
+        if "requires --rescore-reason" in str(error):
+            message += (
+                ". This (arm, seed) already has a held-out scoring epoch; re-issue "
+                f"with an explicit reason: {_pipeline_rerun_command(args)}"
+            )
+        return fail_after_publication(stage="test", message=message)
+
+    logger.info("E2 pipeline complete: %.1fs elapsed", time.monotonic() - pipeline_started)
     return 0
 
 

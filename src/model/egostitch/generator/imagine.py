@@ -511,9 +511,7 @@ class EgoStitchStage1(nn.Module):
         elif feature_standardization == "zscore_vfit_v1":
             self.feature_norm = FeatureStandardizer(config.input_dim)
         else:
-            raise ValueError(
-                f"unknown feature standardization mode {feature_standardization!r}"
-            )
+            raise ValueError(f"unknown feature standardization mode {feature_standardization!r}")
         self.tokenize = TokenizeLite(config)
         self.imagine = ImagineDecoder(config)
         self.random_gin = RandomGIN(config)

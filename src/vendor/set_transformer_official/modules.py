@@ -60,6 +60,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+
 class MAB(nn.Module):
     def __init__(self, dim_Q, dim_K, dim_V, num_heads, ln=False):
         super(MAB, self).__init__()
@@ -83,22 +84,21 @@ class MAB(nn.Module):
         V_ = torch.cat(V.split(dim_split, 2), 0)
 
         # ---- shim (2): optional key-padding mask -----------------------------
-        logits = Q_.bmm(K_.transpose(1,2))/math.sqrt(self.dim_V)
+        logits = Q_.bmm(K_.transpose(1, 2)) / math.sqrt(self.dim_V)
         if mask is not None:
             # `mask` is (B, n_keys); heads were folded into dim 0 above.
             keep = mask.to(dtype=torch.bool)
-            keep = torch.where(
-                keep.any(dim=1, keepdim=True), keep, torch.ones_like(keep)
-            )
+            keep = torch.where(keep.any(dim=1, keepdim=True), keep, torch.ones_like(keep))
             keep = keep.repeat(self.num_heads, 1).unsqueeze(1)
             logits = logits.masked_fill(~keep, float("-inf"))
         A = torch.softmax(logits, 2)
         # ---- end shim (2) ----------------------------------------------------
         O = torch.cat((Q_ + A.bmm(V_)).split(Q.size(0), 0), 2)
-        O = O if getattr(self, 'ln0', None) is None else self.ln0(O)
+        O = O if getattr(self, "ln0", None) is None else self.ln0(O)
         O = O + F.relu(self.fc_o(O))
-        O = O if getattr(self, 'ln1', None) is None else self.ln1(O)
+        O = O if getattr(self, "ln1", None) is None else self.ln1(O)
         return O
+
 
 class PMA(nn.Module):
     def __init__(self, dim, num_heads, num_seeds, ln=False):

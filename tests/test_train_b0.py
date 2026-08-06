@@ -118,6 +118,7 @@ def _runtime_dict() -> dict[str, object]:
         "setup_probe_budget_seconds": 300,
         "train_eval_budget_seconds": 2820,
         "artifact_budget_seconds": 60,
+        "test_budget_seconds": 600,
         "reserve_seconds": 120,
         "probe_warmup_steps": 10,
         "probe_timed_steps": 30,
@@ -252,10 +253,28 @@ class TestLoadConfig:
         with pytest.raises(ValueError, match="runtime stage budgets must sum to 3600"):
             load_config(config_path)
 
+    def test_loads_test_budget_seconds(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "cfg.yaml"
+        _write_yaml_config(config_path, {"runtime": _runtime_dict()})
+
+        cfg = load_config(config_path)
+
+        assert cfg.runtime is not None
+        assert cfg.runtime.test_budget_seconds == 600
+
+    def test_missing_test_budget_seconds_raises_clear_error(self, tmp_path: Path) -> None:
+        runtime = _runtime_dict()
+        del runtime["test_budget_seconds"]
+        config_path = tmp_path / "cfg.yaml"
+        _write_yaml_config(config_path, {"runtime": runtime})
+
+        with pytest.raises(
+            ValueError, match="config is missing required key 'runtime.test_budget_seconds'"
+        ):
+            load_config(config_path)
+
     @pytest.mark.parametrize("token_budget", [0, -1])
-    def test_runtime_token_budget_must_be_positive(
-        self, tmp_path: Path, token_budget: int
-    ) -> None:
+    def test_runtime_token_budget_must_be_positive(self, tmp_path: Path, token_budget: int) -> None:
         runtime = _runtime_dict()
         runtime["token_budget"] = token_budget
         config_path = tmp_path / "cfg.yaml"
@@ -882,6 +901,7 @@ class TestAssembleDataFeatureCoverageGate:
         assert assembled.degrees["node_000002"] == 1
         assert assembled.degrees["node_000003"] == 1
         assert assembled.degrees["node_000004"] == 1
+
 
 class TestV31TrainingLoader:
     def test_each_epoch_only_reorders_fixed_train_file_pairs(self, tmp_path: Path) -> None:

@@ -70,6 +70,10 @@ runtime:
   setup_probe_budget_seconds: 300
   train_eval_budget_seconds: 3000
   artifact_budget_seconds: 60
+  # Post-publish held-out test protocol (val/test/candidate scoring + graph
+  # assembly); not part of the pre-publish stage_total == total_budget_seconds
+  # invariant above.
+  test_budget_seconds: 600
   reserve_seconds: 120
   probe_warmup_steps: 10
   probe_timed_steps: 30

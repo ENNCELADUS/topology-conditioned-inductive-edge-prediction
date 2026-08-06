@@ -166,9 +166,7 @@ def test_pooled_ignores_masked_out_nodes() -> None:
     embedding_perturbed = enc(graph_perturbed)
 
     assert torch.allclose(embedding.pooled, embedding_perturbed.pooled, atol=1e-6)
-    assert not torch.allclose(
-        embedding.tokens[:, -1], embedding_perturbed.tokens[:, -1], atol=1e-6
-    )
+    assert not torch.allclose(embedding.tokens[:, -1], embedding_perturbed.tokens[:, -1], atol=1e-6)
 
 
 def test_pooled_finite_when_a_mask_row_is_all_zero() -> None:
@@ -301,9 +299,7 @@ def test_no_l_rel_arm_shares_initialization_with_the_full_arm() -> None:
 
     full_state = full.state_dict()
     shared_names = [
-        name
-        for name in no_l_rel.state_dict()
-        if not name.startswith("encoder.rel_head")
+        name for name in no_l_rel.state_dict() if not name.startswith("encoder.rel_head")
     ]
     assert shared_names, "expected shared parameters to compare"
 

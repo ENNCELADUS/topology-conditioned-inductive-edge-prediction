@@ -3,15 +3,17 @@ import importlib
 import json
 import subprocess
 import sys
+import tempfile
 import types
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import cast
 
 import pytest
 import src.data.packed_features as packed_features
+import src.eval.test_protocol as test_protocol
 import torch
 from src.data.packed_features import build_packed_features
 from src.e2_pipeline import (
@@ -20,8 +22,15 @@ from src.e2_pipeline import (
     PipelineArgs,
     ProbeResult,
     _assert_no_cross_kind_completion,
+    _assert_no_cross_kind_test_completion,
+    _clear_stale_test_artifacts,
+    _kill_registered_process_groups,
+    _pipeline_rerun_command,
     _publish_staged,
+    _register_nested_process_group,
     _rollback_publication,
+    _test_stage_filenames,
+    _unregister_nested_process_group,
     _validate_staged_artifacts,
     build_accelerate_command,
     detect_visible_gpu_count,
@@ -29,6 +38,7 @@ from src.e2_pipeline import (
     parse_pipeline_args,
     run_command,
     run_pipeline,
+    run_stage,
     write_failure,
 )
 
@@ -39,6 +49,35 @@ pytestmark = pytest.mark.unit
 def _avoid_pack_process_pool_startup(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pipeline unit tests need pack semantics, not OS process startup."""
     monkeypatch.setattr(packed_features, "ProcessPoolExecutor", ThreadPoolExecutor)
+
+
+@pytest.fixture(autouse=True)
+def _fake_test_protocol_succeeds(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Default the test stage to a fast, deterministic success.
+
+    ``run_test_protocol``'s real body is ``NotImplementedError`` (a concurrent
+    agent owns it) and even once implemented it does real GPU scoring, so
+    every pipeline test needs a fake here regardless. This autouse default
+    keeps every pre-existing pack/train/publish test working unchanged; tests
+    that exercise test-stage behavior directly override
+    ``src.eval.test_protocol.run_test_protocol`` (or inspect ``calls`` below)
+    themselves.
+    """
+    calls: dict[str, object] = {}
+
+    def fake_run_test_protocol(
+        *, output_dir: Path, report_filename: str, **kwargs: object
+    ) -> test_protocol.TestProtocolResult:
+        calls["output_dir"] = output_dir
+        calls["report_filename"] = report_filename
+        calls.update(kwargs)
+        report_path = output_dir / report_filename
+        report: dict[str, object] = {"status": "ok"}
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        return test_protocol.TestProtocolResult(report_path=report_path, report=report)
+
+    monkeypatch.setattr(test_protocol, "run_test_protocol", fake_run_test_protocol)
+    return calls
 
 
 def test_publication_revokes_and_restores_the_old_completion_sentinel_first(
@@ -211,6 +250,129 @@ def test_run_command_timeout_kills_the_whole_process_group(tmp_path: Path) -> No
     ).stdout.strip()
     assert not state or state.startswith("Z"), (
         f"grandchild process {grandchild_pid} remained live in state {state!r}"
+    )
+
+
+# --------------------------------------------------------------- nested process-group registry
+# `run_command` always launches with `start_new_session=True` so its OWN
+# timeout can kill just its own group -- but that means the group is a
+# *different* session from a supervising `run_stage` call's forked child, so
+# it would otherwise survive that stage's own deadline. These tests cover the
+# registry `run_command`/`run_stage` share to close that gap.
+
+
+def test_register_nested_process_group_writes_a_pgid_file(tmp_path: Path) -> None:
+    entry = _register_nested_process_group(tmp_path, 4321)
+    assert entry == tmp_path / "4321.pgid"
+    assert entry is not None
+    assert entry.read_text() == "4321"
+
+
+def test_register_nested_process_group_is_a_noop_without_an_active_registry() -> None:
+    assert _register_nested_process_group(None, 4321) is None
+
+
+def test_unregister_nested_process_group_removes_the_file(tmp_path: Path) -> None:
+    entry = tmp_path / "4321.pgid"
+    entry.write_text("4321")
+    _unregister_nested_process_group(entry)
+    assert not entry.exists()
+
+
+def test_unregister_nested_process_group_tolerates_none() -> None:
+    _unregister_nested_process_group(None)  # must not raise
+
+
+def test_kill_registered_process_groups_kills_every_recorded_pgid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "111.pgid").write_text("111")
+    (tmp_path / "222.pgid").write_text("222")
+    killed: list[int] = []
+    monkeypatch.setattr("src.e2_pipeline.os.killpg", lambda pgid, _sig: killed.append(pgid))
+
+    _kill_registered_process_groups(tmp_path)
+
+    assert sorted(killed) == [111, 222]
+
+
+def test_kill_registered_process_groups_tolerates_an_already_dead_pgid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "999.pgid").write_text("999")
+
+    def raising_killpg(_pgid: int, _sig: int) -> None:
+        raise ProcessLookupError()
+
+    monkeypatch.setattr("src.e2_pipeline.os.killpg", raising_killpg)
+
+    _kill_registered_process_groups(tmp_path)  # must not raise
+
+
+def test_kill_registered_process_groups_tolerates_an_empty_registry(tmp_path: Path) -> None:
+    _kill_registered_process_groups(tmp_path)  # must not raise
+
+
+def test_run_stage_cleans_up_its_nested_process_group_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every `run_stage` call, timeout or not, must leave no registry directory behind."""
+    created: list[Path] = []
+    original_mkdtemp = tempfile.mkdtemp
+
+    def recording_mkdtemp(prefix: str | None = None) -> str:
+        path = original_mkdtemp(prefix=prefix)
+        created.append(Path(path))
+        return path
+
+    monkeypatch.setattr("src.e2_pipeline.tempfile.mkdtemp", recording_mkdtemp)
+
+    run_stage(lambda: None, 5.0)
+
+    assert created
+    assert not created[-1].exists()
+
+
+def test_run_stage_timeout_reaps_a_nested_run_command_process_group(tmp_path: Path) -> None:
+    """A stage-level deadline must also kill a nested `run_command` subprocess.
+
+    This mirrors the real test stage's shape: `score_sharded` launches scoring
+    subprocesses from inside `run_stage`'s forked child, several layers of
+    `command_runner` indirection away, each with its own
+    `start_new_session=True` group. A stage deadline must reap that nested
+    group too, even though the nested command's OWN (much longer) timeout
+    never fires -- otherwise a stage timeout leaves GPU-occupying subprocesses
+    running past the reported failure.
+    """
+    grandchild_pid_path = tmp_path / "nested_grandchild.pid"
+    nested_script = (
+        "import pathlib, subprocess, sys, time; "
+        "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+        f"pathlib.Path({str(grandchild_pid_path)!r}).write_text(str(child.pid)); "
+        "time.sleep(60)"
+    )
+
+    def operation() -> None:
+        # 30 s comfortably outlasts the stage's own 10 s deadline below, so
+        # only the STAGE timeout -- not this nested command's own -- can be
+        # what kills it in this test.
+        run_command([sys.executable, "-c", nested_script], 30.0)
+
+    # See afb73ab: this only has to outlast fork + interpreter start + two
+    # nested levels of Popen, never a measurement of kill latency -- the
+    # grandchild still has ~50 s of sleep left when the stage deadline fires.
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_stage(operation, 10.0)
+
+    grandchild_pid = int(grandchild_pid_path.read_text())
+    state = subprocess.run(
+        ["ps", "-o", "state=", "-p", str(grandchild_pid)],
+        check=False,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert not state or state.startswith("Z"), (
+        f"nested grandchild process {grandchild_pid} remained live in state {state!r}"
     )
 
 
@@ -495,6 +657,7 @@ def _pipeline_config_dict(
         "setup_probe_budget_seconds": 10,
         "train_eval_budget_seconds": 5,
         "artifact_budget_seconds": 3,
+        "test_budget_seconds": 6,
         "reserve_seconds": 2,
         "probe_warmup_steps": 1,
         "probe_timed_steps": 1,
@@ -502,8 +665,10 @@ def _pipeline_config_dict(
     if runtime_overrides:
         runtime.update(runtime_overrides)
         # `train_b0.load_config` asserts the five stage budgets sum to
-        # `total_budget_seconds`, so an override of any one of them has to be
-        # re-balanced or the config is rejected before the pipeline ever runs.
+        # `total_budget_seconds` -- `test_budget_seconds` is deliberately
+        # excluded from that sum (the test stage runs after the total-budget
+        # gate is already decided) -- so an override of any of the five has to
+        # be re-balanced or the config is rejected before the pipeline ever runs.
         if "total_budget_seconds" not in runtime_overrides:
             runtime["total_budget_seconds"] = sum(
                 cast(int, runtime[key])
@@ -827,9 +992,12 @@ class TestRunPipelineSuccess:
         assert profile["cold_cache"] is True
         assert profile["token_budget"] == _RUNTIME_TOKEN_BUDGET
         assert profile["epochs_completed"] == 2
-        assert set(profile["stage_seconds"]) == {"pack", "train", "artifacts"}
+        # "test" lands only after publish, so profile.json is rewritten once
+        # more post-publication to fold its duration in alongside the rest.
+        assert set(profile["stage_seconds"]) == {"pack", "train", "artifacts", "test"}
         assert profile["total_seconds"] > 0
         assert profile["stage_seconds"]["artifacts"] >= 0
+        assert profile["stage_seconds"]["test"] >= 0
         assert profile["total_seconds"] >= sum(profile["stage_seconds"].values())
         assert profile["pack_manifest"]["source_metadata_sha256"]
         assert profile["pack_manifest"]["source_index_sha256"]
@@ -849,7 +1017,23 @@ class TestRunPipelineSuccess:
             assert entry["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
         complete = json.loads((output_dir / "complete.json").read_text())
         assert complete["status"] == "complete"
-        assert complete["total_seconds"] >= profile["total_seconds"]
+        # complete.json's total_seconds is frozen at publish time; the test
+        # stage runs after that and recomputes profile.json's figure from the
+        # same clock origin, so it always covers strictly more of the run.
+        # (It must be *recomputed*, not accumulated onto the published value:
+        # that value stops at the artifact cutoff, before publication, so
+        # `published + test_duration` loses the publication interval and can
+        # land below complete.json's total whenever publication is slower than
+        # the test stage -- an intermittent failure under parallel load.)
+        assert profile["total_seconds"] >= complete["total_seconds"]
+        # Recomputed, not accumulated: the published value stops at the artifact
+        # cutoff, so the post-test total must exceed the test stage's own
+        # duration by the whole preceding run.
+        assert profile["total_seconds"] > profile["stage_seconds"]["test"]
+        assert (output_dir / "test_report.json").is_file()
+        assert (output_dir / "test_complete.json").is_file()
+        assert not (output_dir / "diagnostic_test_report.json").exists()
+        assert not (output_dir / "diagnostic_test_complete.json").exists()
 
     def test_successful_rerun_replaces_prior_canonical_only_after_validation(
         self, tmp_path: Path
@@ -1415,6 +1599,520 @@ class TestRunPipelineFailures:
         assert failure["stage"] == "total_budget"
         assert failure["elapsed_seconds"] == 45.0
         assert failure["limit_seconds"] == 40
+
+
+# ---------------------------------------------------------------------- run_pipeline: test stage
+
+
+def test_test_stage_filenames_follow_the_formal_diagnostic_split() -> None:
+    assert _test_stage_filenames(None) == ("test_report.json", "test_complete.json")
+    assert _test_stage_filenames("formal") == ("test_report.json", "test_complete.json")
+    assert _test_stage_filenames("diagnostic") == (
+        "diagnostic_test_report.json",
+        "diagnostic_test_complete.json",
+    )
+
+
+def test_cross_kind_test_completion_guard_mirrors_the_publish_guard(tmp_path: Path) -> None:
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    (output_dir / "test_complete.json").write_text("{}")
+    with pytest.raises(RuntimeError, match="different run kind"):
+        _assert_no_cross_kind_test_completion(output_dir, run_kind="diagnostic")
+    _assert_no_cross_kind_test_completion(output_dir, run_kind="formal")
+    (output_dir / "diagnostic_test_complete.json").write_text("{}")
+    with pytest.raises(RuntimeError, match="different run kind"):
+        _assert_no_cross_kind_test_completion(output_dir, run_kind="formal")
+
+
+def test_clear_stale_test_artifacts_removes_both_same_kind_files(tmp_path: Path) -> None:
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    (output_dir / "test_complete.json").write_text("{}")
+    (output_dir / "test_report.json").write_text("{}")
+    # A different run kind's names must never be touched by this call.
+    (output_dir / "diagnostic_test_complete.json").write_text("{}")
+
+    _clear_stale_test_artifacts(
+        output_dir, report_filename="test_report.json", test_complete_name="test_complete.json"
+    )
+
+    assert not (output_dir / "test_complete.json").exists()
+    assert not (output_dir / "test_report.json").exists()
+    assert (output_dir / "diagnostic_test_complete.json").exists()
+
+
+def test_clear_stale_test_artifacts_removes_the_sentinel_before_the_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash mid-clear must never leave a sentinel without its checked report."""
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    (output_dir / "test_complete.json").write_text("{}")
+    (output_dir / "test_report.json").write_text("{}")
+    order: list[str] = []
+    original_unlink = Path.unlink
+
+    def recording_unlink(self: Path, missing_ok: bool = False) -> None:
+        order.append(self.name)
+        original_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", recording_unlink)
+
+    _clear_stale_test_artifacts(
+        output_dir, report_filename="test_report.json", test_complete_name="test_complete.json"
+    )
+
+    assert order == ["test_complete.json", "test_report.json"]
+
+
+def test_clear_stale_test_artifacts_tolerates_missing_files(tmp_path: Path) -> None:
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    _clear_stale_test_artifacts(
+        output_dir, report_filename="test_report.json", test_complete_name="test_complete.json"
+    )  # must not raise
+
+
+def test_pipeline_rerun_command_names_config_and_appends_rescore_reason(tmp_path: Path) -> None:
+    args = PipelineArgs(
+        config=tmp_path / "cfg.yaml",
+        pack_dir=None,
+        output_dir=None,
+        seed=3,
+        run_kind="diagnostic",
+        worker_module="src.train_egostitch",
+    )
+    command = _pipeline_rerun_command(args)
+    assert command.startswith(f"python -m src.e2_pipeline --config {tmp_path / 'cfg.yaml'}")
+    assert "--seed 3" in command
+    assert "--run-kind diagnostic" in command
+    assert "--worker-module src.train_egostitch" in command
+    assert command.endswith("--rescore-reason <reason for the repeat held-out scoring epoch>")
+
+
+def test_parse_pipeline_args_rescore_reason_defaults_to_none_and_is_never_synthesized(
+    tmp_path: Path,
+) -> None:
+    args = parse_pipeline_args(["--config", str(tmp_path / "cfg.yaml")])
+    assert args.rescore_reason is None
+
+    with_reason = parse_pipeline_args(
+        ["--config", str(tmp_path / "cfg.yaml"), "--rescore-reason", "replace corrupt artifact"]
+    )
+    assert with_reason.rescore_reason == "replace corrupt artifact"
+
+
+class TestRunPipelineTestStage:
+    def test_test_stage_runs_after_publish_and_sees_the_completed_publication(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The test stage must observe a real, already-committed `complete.json`."""
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        seen: dict[str, object] = {}
+
+        def fake_run_test_protocol(
+            *, output_dir: Path, report_filename: str, **_kwargs: object
+        ) -> test_protocol.TestProtocolResult:
+            seen["complete_json_is_file"] = (output_dir / "complete.json").is_file()
+            seen["best_pt_is_file"] = (output_dir / "best.pt").is_file()
+            report_path = output_dir / report_filename
+            report: dict[str, object] = {"status": "ok"}
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+            return test_protocol.TestProtocolResult(report_path=report_path, report=report)
+
+        monkeypatch.setattr(test_protocol, "run_test_protocol", fake_run_test_protocol)
+
+        exit_code = run_pipeline(
+            args,
+            command_runner=_make_fake_runner(),
+            stage_runner=lambda operation, _timeout: operation(),
+        )
+
+        assert exit_code == 0
+        assert seen["complete_json_is_file"] is True
+        assert seen["best_pt_is_file"] is True
+        assert (output_dir / "test_report.json").is_file()
+        assert (output_dir / "test_complete.json").is_file()
+
+    def test_test_stage_forwards_the_resolved_config_arm_seed_and_rescore_reason(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        args = PipelineArgs(**{**vars(args), "rescore_reason": "replace corrupt score artifact"})
+        captured: dict[str, object] = {}
+
+        def fake_run_test_protocol(**kwargs: object) -> test_protocol.TestProtocolResult:
+            captured.update(kwargs)
+            report_path = cast(Path, kwargs["output_dir"]) / cast(str, kwargs["report_filename"])
+            report: dict[str, object] = {"status": "ok"}
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+            return test_protocol.TestProtocolResult(report_path=report_path, report=report)
+
+        monkeypatch.setattr(test_protocol, "run_test_protocol", fake_run_test_protocol)
+
+        assert (
+            run_pipeline(
+                args,
+                command_runner=_make_fake_runner(),
+                stage_runner=lambda operation, _timeout: operation(),
+            )
+            == 0
+        )
+        assert captured["checkpoint"] == output_dir / "best.pt"
+        assert captured["seed"] == 47
+        # train_b0 run_metadata.json carries no "arm"; the model family stands
+        # in as the test-report's arm identity for non-E2E workers.
+        assert captured["arm"] == "v3_1"
+        assert captured["rescore_reason"] == "replace corrupt score artifact"
+        assert captured["report_filename"] == "test_report.json"
+
+    def test_absent_rescore_reason_is_never_synthesized(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        assert args.rescore_reason is None
+        captured: dict[str, object] = {}
+
+        def fake_run_test_protocol(**kwargs: object) -> test_protocol.TestProtocolResult:
+            captured.update(kwargs)
+            report_path = cast(Path, kwargs["output_dir"]) / cast(str, kwargs["report_filename"])
+            report: dict[str, object] = {"status": "ok"}
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+            return test_protocol.TestProtocolResult(report_path=report_path, report=report)
+
+        monkeypatch.setattr(test_protocol, "run_test_protocol", fake_run_test_protocol)
+
+        assert (
+            run_pipeline(
+                args,
+                command_runner=_make_fake_runner(),
+                stage_runner=lambda operation, _timeout: operation(),
+            )
+            == 0
+        )
+        assert captured["rescore_reason"] is None
+
+    def test_test_stage_failure_preserves_publication_and_returns_2(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A scoring failure must not roll back a committed publication."""
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+
+        def failing_run_test_protocol(**_kwargs: object) -> test_protocol.TestProtocolResult:
+            raise ValueError("scoring blew up")
+
+        monkeypatch.setattr(test_protocol, "run_test_protocol", failing_run_test_protocol)
+
+        exit_code = run_pipeline(
+            args,
+            command_runner=_make_fake_runner(),
+            stage_runner=lambda operation, _timeout: operation(),
+        )
+
+        assert exit_code == 2
+        failure = json.loads((output_dir / "failure.json").read_text())
+        assert failure["stage"] == "test"
+        assert "scoring blew up" in failure["message"]
+        # The publication this failure must not touch:
+        assert (output_dir / "complete.json").is_file()
+        assert (output_dir / "best.pt").is_file()
+        assert (output_dir / "last.pt").is_file()
+        assert (output_dir / "profile.json").is_file()
+        assert (output_dir / "artifact_manifest.json").is_file()
+        assert not (output_dir / "test_complete.json").exists()
+
+    def test_repeat_scoring_ledger_failure_names_the_rescore_command(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+
+        def failing_run_test_protocol(**_kwargs: object) -> test_protocol.TestProtocolResult:
+            raise ValueError(
+                "held-out scoring already has an epoch for arm='v3_1', seed=47; "
+                "repeat scoring requires --rescore-reason"
+            )
+
+        monkeypatch.setattr(test_protocol, "run_test_protocol", failing_run_test_protocol)
+
+        exit_code = run_pipeline(
+            args,
+            command_runner=_make_fake_runner(),
+            stage_runner=lambda operation, _timeout: operation(),
+        )
+
+        assert exit_code == 2
+        failure = json.loads((output_dir / "failure.json").read_text())
+        assert failure["stage"] == "test"
+        assert "--rescore-reason" in failure["message"]
+        assert f"python -m src.e2_pipeline --config {args.config}" in failure["message"]
+        assert (output_dir / "complete.json").is_file()
+
+    def test_test_stage_timeout_writes_failure_and_preserves_publication(
+        self, tmp_path: Path
+    ) -> None:
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        calls = 0
+
+        # Three supervised stages remain in a successful run: pack, artifacts,
+        # then test.
+        def stage_runner(operation: Callable[[], None], timeout: float) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise subprocess.TimeoutExpired(cmd="test", timeout=timeout)
+            operation()
+
+        exit_code = run_pipeline(
+            args, command_runner=_make_fake_runner(), stage_runner=stage_runner
+        )
+
+        assert exit_code == 2
+        failure = json.loads((output_dir / "failure.json").read_text())
+        assert failure["stage"] == "test"
+        assert failure["timeout_seconds"] == 6
+        assert (output_dir / "complete.json").is_file()
+        assert (output_dir / "best.pt").is_file()
+        assert not (output_dir / "test_complete.json").exists()
+
+    def test_max_steps_debug_run_never_reaches_the_test_stage(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A bounded debug smoke run must not spend a held-out scoring epoch."""
+        data_root = tmp_path / "data"
+        _write_feature_root(
+            data_root / "features" / "frozen_node_features_1024", {"node_a": (3, 4)}
+        )
+        formal_output = tmp_path / "out"
+        config_path = tmp_path / "cfg.yaml"
+        _write_pipeline_config(
+            config_path,
+            _pipeline_config_dict(
+                data_root=data_root, pack_dir=tmp_path / "pack", output_dir=formal_output
+            ),
+        )
+        profile = _valid_worker_profile()
+        profile["epochs_completed"] = 1
+        profile["validations_completed"] = 1
+        profile["per_epoch"] = cast(list[object], profile["per_epoch"])[:1]
+
+        def never_called(**_kwargs: object) -> test_protocol.TestProtocolResult:
+            raise AssertionError("the test stage must not run for a --max-steps debug run")
+
+        monkeypatch.setattr(test_protocol, "run_test_protocol", never_called)
+
+        def runner(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            result = _make_fake_runner(train_runtime_profile=profile)(command, timeout)
+            if _arg_value(command, "--ddp-mode") == "train":
+                out = Path(_arg_value(command, "--output-dir"))
+                best = torch.load(out / "best.pt", weights_only=False)
+                torch.save(best, out / "last.pt")
+                (out / "metrics.jsonl").write_text('{"epoch": 1, "val_auroc": 0.7}\n')
+            return result
+
+        assert (
+            run_pipeline(PipelineArgs(config_path, None, None, max_steps=1), command_runner=runner)
+            == 0
+        )
+        debug_output = tmp_path / "out_debug"
+        assert (debug_output / "debug_complete.json").is_file()
+        assert not (debug_output / "test_report.json").exists()
+        assert not (debug_output / "test_complete.json").exists()
+        assert not (debug_output / "diagnostic_test_report.json").exists()
+
+    def test_diagnostic_run_writes_diagnostic_named_test_artifacts_only(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A diagnostic run's test stage writes `diagnostic_*`, never the formal names."""
+        from src import train_b0
+
+        @dataclass(frozen=True)
+        class _FakeE2EAwareConfig(train_b0.Config):
+            run_kind: str | None = None
+
+        def fake_load_config(path: Path) -> _FakeE2EAwareConfig:
+            base = train_b0.load_config(path)
+            return _FakeE2EAwareConfig(**{f.name: getattr(base, f.name) for f in fields(base)})
+
+        class DiagnosticAwareWorker:
+            pass
+
+        DiagnosticAwareWorker.load_config = staticmethod(fake_load_config)  # type: ignore[attr-defined]
+        DiagnosticAwareWorker.prepare_pack = staticmethod(train_b0.prepare_pack)  # type: ignore[attr-defined]
+
+        data_root = tmp_path / "data"
+        _write_feature_root(
+            data_root / "features" / "frozen_node_features_1024", {"node_a": (3, 4)}
+        )
+        output_dir = tmp_path / "out"
+        config_path = tmp_path / "cfg.yaml"
+        _write_pipeline_config(
+            config_path,
+            _pipeline_config_dict(
+                data_root=data_root, pack_dir=tmp_path / "pack", output_dir=output_dir
+            ),
+        )
+
+        original_import = importlib.import_module
+        monkeypatch.setattr(
+            importlib,
+            "import_module",
+            lambda name: (
+                DiagnosticAwareWorker if name == "fake.diagnostic_worker" else original_import(name)
+            ),
+        )
+
+        args = PipelineArgs(
+            config=config_path,
+            pack_dir=None,
+            output_dir=None,
+            worker_module="fake.diagnostic_worker",
+            run_kind="diagnostic",
+        )
+
+        assert (
+            run_pipeline(
+                args,
+                command_runner=_make_fake_runner(),
+                stage_runner=lambda operation, _timeout: operation(),
+            )
+            == 0
+        )
+        assert (output_dir / "diagnostic_complete.json").is_file()
+        assert (output_dir / "diagnostic_test_report.json").is_file()
+        assert (output_dir / "diagnostic_test_complete.json").is_file()
+        assert not (output_dir / "complete.json").exists()
+        assert not (output_dir / "test_report.json").exists()
+        assert not (output_dir / "test_complete.json").exists()
+
+    def test_stage_seconds_test_reaches_profile_json_and_manifest_stays_consistent(
+        self, tmp_path: Path
+    ) -> None:
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+
+        assert (
+            run_pipeline(
+                args,
+                command_runner=_make_fake_runner(),
+                stage_runner=lambda operation, _timeout: operation(),
+            )
+            == 0
+        )
+
+        profile_path = output_dir / "profile.json"
+        profile = json.loads(profile_path.read_text())
+        assert profile["stage_seconds"]["test"] >= 0
+
+        manifest = json.loads((output_dir / "artifact_manifest.json").read_text())
+        assert (
+            manifest["profile.json"]["sha256"]
+            == hashlib.sha256(profile_path.read_bytes()).hexdigest()
+        )
+        assert manifest["profile.json"]["byte_size"] == profile_path.stat().st_size
+
+    # ------------------------------------------------------- republish: stale test sentinel
+    # A republish (pack -> train -> publish onto an existing, already-tested
+    # output directory) never touches test_report.json/test_complete.json --
+    # they sit outside publish/rollback entirely. Without an explicit clear,
+    # a failure (or death) in the NEW test stage would leave the OLD
+    # checkpoint's sentinel falsely certifying the new one.
+
+    def test_republish_removes_stale_test_completion_when_the_new_test_stage_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+
+        assert (
+            run_pipeline(
+                args,
+                command_runner=_make_fake_runner(),
+                stage_runner=lambda operation, _timeout: operation(),
+            )
+            == 0
+        )
+        assert (output_dir / "test_complete.json").is_file()
+        assert (output_dir / "test_report.json").is_file()
+
+        def failing_run_test_protocol(**_kwargs: object) -> test_protocol.TestProtocolResult:
+            raise ValueError("scoring blew up on the republished checkpoint")
+
+        monkeypatch.setattr(test_protocol, "run_test_protocol", failing_run_test_protocol)
+
+        exit_code = run_pipeline(
+            args,
+            command_runner=_make_fake_runner(),
+            stage_runner=lambda operation, _timeout: operation(),
+        )
+
+        assert exit_code == 2
+        failure = json.loads((output_dir / "failure.json").read_text())
+        assert failure["stage"] == "test"
+        # The republished checkpoint and its publication must survive...
+        assert (output_dir / "best.pt").is_file()
+        assert (output_dir / "complete.json").is_file()
+        # ...but the sentinel certifying the checkpoint it REPLACED must not.
+        assert not (output_dir / "test_complete.json").exists()
+        assert not (output_dir / "test_report.json").exists()
+
+    def test_republish_removes_stale_test_completion_when_the_new_test_stage_times_out(
+        self, tmp_path: Path
+    ) -> None:
+        """Covers the process-dies-mid-test case: no new sentinel is ever written."""
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+
+        assert (
+            run_pipeline(
+                args,
+                command_runner=_make_fake_runner(),
+                stage_runner=lambda operation, _timeout: operation(),
+            )
+            == 0
+        )
+        assert (output_dir / "test_complete.json").is_file()
+
+        calls = 0
+
+        # `calls` only counts this SECOND run_pipeline invocation (the first
+        # ran under its own stage_runner above). Three supervised stages per
+        # run: pack, artifacts, then test.
+        def stage_runner(operation: Callable[[], None], timeout: float) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise subprocess.TimeoutExpired(cmd="test", timeout=timeout)
+            operation()
+
+        exit_code = run_pipeline(
+            args, command_runner=_make_fake_runner(), stage_runner=stage_runner
+        )
+
+        assert exit_code == 2
+        failure = json.loads((output_dir / "failure.json").read_text())
+        assert failure["stage"] == "test"
+        assert (output_dir / "complete.json").is_file()
+        assert (output_dir / "best.pt").is_file()
+        assert not (output_dir / "test_complete.json").exists()
+        assert not (output_dir / "test_report.json").exists()
+
+    def test_republish_then_successful_test_leaves_exactly_one_fresh_sentinel(
+        self, tmp_path: Path
+    ) -> None:
+        """The ordinary republish-and-retest path must still end in one clean sentinel."""
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+
+        for _ in range(2):
+            assert (
+                run_pipeline(
+                    args,
+                    command_runner=_make_fake_runner(),
+                    stage_runner=lambda operation, _timeout: operation(),
+                )
+                == 0
+            )
+
+        assert (output_dir / "test_complete.json").is_file()
+        assert (output_dir / "test_report.json").is_file()
+        assert not (output_dir / "diagnostic_test_complete.json").exists()
 
 
 # --------------------------------------------------------------------------- CLI entry point

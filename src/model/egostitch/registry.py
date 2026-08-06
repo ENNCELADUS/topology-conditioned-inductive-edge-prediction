@@ -183,9 +183,7 @@ def build_generator(
         NeighborhoodGenerator[Any, Any, Any],
         cls(
             generator_cfg,
-            feature_standardization=cast(
-                FeatureStandardizationMode, cfg.feature_standardization
-            ),
+            feature_standardization=cast(FeatureStandardizationMode, cfg.feature_standardization),
             loss_family="egostitch_e2e",
         ),
     )

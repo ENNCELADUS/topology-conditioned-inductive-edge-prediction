@@ -882,8 +882,7 @@ def build_e2e_arm_summary(
         artifact_checkpoint = artifact.meta.get("checkpoint_id")
         if artifact_checkpoint != metadata_checkpoint:
             raise ValueError(
-                f"{name} checkpoint_id mismatch: "
-                f"{metadata_checkpoint!r} != {artifact_checkpoint!r}"
+                f"{name} checkpoint_id mismatch: {metadata_checkpoint!r} != {artifact_checkpoint!r}"
             )
         _validate_scaffold_control_arm_semantics(artifact, name=name, label=label)
         if list(artifact.pairs()) != candidate_pairs:
@@ -1053,16 +1052,13 @@ def render_e2e_tables_markdown(payload: Mapping[str, object]) -> str:
     ]
     for name in _TRAINED_ARMS:
         report = training_diagnostics.get(name, {})
-        fidelity_series = cast(
-            Sequence[Mapping[str, object]], report.get("fidelity_series", ())
-        )
+        fidelity_series = cast(Sequence[Mapping[str, object]], report.get("fidelity_series", ()))
         if not fidelity_series:
             lines.append(f"| {name} |  |  |")
             continue
         for validation, row in enumerate(fidelity_series, start=1):
             lines.append(
-                f"| {name} | {validation} "
-                f"| {_fmt(row.get('topology_delta_degree_correlation'))} |"
+                f"| {name} | {validation} | {_fmt(row.get('topology_delta_degree_correlation'))} |"
             )
     decomposition = cast(Mapping[str, object], payload["decomposition"])
     decomposition_arms = cast(Mapping[str, Mapping[str, object]], decomposition["arms"])

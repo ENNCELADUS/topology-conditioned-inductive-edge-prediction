@@ -208,6 +208,7 @@ class RuntimeConfig:
     setup_probe_budget_seconds: int
     train_eval_budget_seconds: int
     artifact_budget_seconds: int
+    test_budget_seconds: int
     reserve_seconds: int
     probe_warmup_steps: int
     probe_timed_steps: int
@@ -620,6 +621,7 @@ def load_config(path: Path) -> Config:
             "setup_probe_budget_seconds",
             "train_eval_budget_seconds",
             "artifact_budget_seconds",
+            "test_budget_seconds",
             "reserve_seconds",
             "probe_warmup_steps",
             "probe_timed_steps",
@@ -675,6 +677,10 @@ def load_config(path: Path) -> Config:
             artifact_budget_seconds=_as_int(
                 _require(runtime_raw, "artifact_budget_seconds", "runtime."),
                 "runtime.artifact_budget_seconds",
+            ),
+            test_budget_seconds=_as_int(
+                _require(runtime_raw, "test_budget_seconds", "runtime."),
+                "runtime.test_budget_seconds",
             ),
             reserve_seconds=_as_int(
                 _require(runtime_raw, "reserve_seconds", "runtime."),

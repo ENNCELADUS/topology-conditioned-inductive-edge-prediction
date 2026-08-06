@@ -104,9 +104,7 @@ def _e2e_training_cfg(tmp_path: Path, run_kind: te.E2ERunKind | None = None) -> 
     )
 
 
-def _write_historical_pass_artifact(
-    cfg: te.EgoConfig, *, feature_stats_sha256: str
-) -> Path:
+def _write_historical_pass_artifact(cfg: te.EgoConfig, *, feature_stats_sha256: str) -> Path:
     """Create a legacy approved artifact without using the current producer."""
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     path = cfg.output_dir / te.QUALIFICATION_FILENAME
@@ -190,9 +188,7 @@ class TestDdpRunConfigPreparation:
 class TestRunKindDomain:
     def test_run_kind_domain_includes_explicit_diagnostic_and_derived_debug(self) -> None:
         assert get_args(te.E2ERunKind) == ("formal", "diagnostic", "debug")
-        assert te.parse_args(["--config", "c.yaml", "--run-kind", "formal"]).run_kind == (
-            "formal"
-        )
+        assert te.parse_args(["--config", "c.yaml", "--run-kind", "formal"]).run_kind == ("formal")
         assert te.parse_args(["--config", "c.yaml", "--run-kind", "diagnostic"]).run_kind == (
             "diagnostic"
         )
@@ -205,19 +201,15 @@ class TestRunKindDomain:
             te.parse_args(["--config", "c.yaml", flag, "value"])
 
     def test_feature_binding_has_no_qualification_artifact_input(self) -> None:
-        assert "qualification_artifact" not in inspect.signature(
-            te._bind_feature_standardization
-        ).parameters
+        assert (
+            "qualification_artifact"
+            not in inspect.signature(te._bind_feature_standardization).parameters
+        )
 
     def test_qualification_artifact_producers_are_removed(self) -> None:
         assert not hasattr(te, "write_qualification_artifact")
         assert not hasattr(te, "validate_qualification_artifact")
         assert not hasattr(te, "qualification_verdict")
-
-
-
-
-
 
     def test_run_kind_is_not_part_of_the_scientific_config(self, tmp_path: Path) -> None:
         cfg = _e2e_training_cfg(tmp_path)
@@ -247,11 +239,6 @@ class TestFeatureDigestPinByRunKind:
                 config=_e2e_model_config(generator={"feature_standardization": "zscore_vfit_v1"}),
             ),
         )
-
-
-
-
-
 
     def test_debug_is_exempt_from_the_stage_contract(self, tmp_path: Path) -> None:
         model, data = self._model_and_data(tmp_path)
@@ -324,9 +311,7 @@ class TestModelConfigHash:
             ),
             pytest.param(lambda cfg: replace(cfg, optim=replace(cfg.optim, lr=0.5)), id="lr"),
             pytest.param(lambda cfg: replace(cfg, mixed_precision="bf16"), id="mixed_precision"),
-            pytest.param(
-                lambda cfg: replace(cfg, training=None), id="training"
-            ),
+            pytest.param(lambda cfg: replace(cfg, training=None), id="training"),
         ],
     )
     def test_model_defining_keys_change_the_digest(self, tmp_path: Path, mutate: _Mutator) -> None:

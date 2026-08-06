@@ -72,20 +72,13 @@ def test_fit_topology_and_classification_use_the_same_interactions() -> None:
     interactions = list(itertools.combinations(sorted(nodes), 2)) + [("n011", "n011")]
     result = derive_internal_holdout(nodes, interactions, holdout_size=2)
 
-    assert all(
-        u in result.v_fit and v in result.v_fit
-        for u, v in result.training_interactions_fit
-    )
+    assert all(u in result.v_fit and v in result.v_fit for u, v in result.training_interactions_fit)
     assert result.topology_fit == frozenset(
         (u, v) for u, v in result.training_interactions_fit if u != v
     )
     assert nx.number_of_selfloops(result.build_g_fit()) == 0
     assert set(result.build_g_fit().nodes) == result.v_fit
-    assert (
-        ("n011", "n011") in result.training_interactions_fit
-        if "n011" in result.v_fit
-        else True
-    )
+    assert ("n011", "n011") in result.training_interactions_fit if "n011" in result.v_fit else True
 
 
 def test_cross_partition_quarantine_counts_match_direct_count() -> None:

@@ -165,6 +165,7 @@ _RUNTIME: dict[str, Any] = {
     "pack_budget_seconds": 20,
     "train_eval_budget_seconds": 40,
     "artifact_budget_seconds": 10,
+    "test_budget_seconds": 15,
 }
 
 
@@ -216,6 +217,19 @@ class TestLoadConfig:
     def test_rejects_non_positive_token_budget(self, tmp_path: Path) -> None:
         runtime = dict(_RUNTIME, token_budget=0)
         with pytest.raises(ValueError, match="token_budget"):
+            te.load_config(_write_config(tmp_path, runtime=runtime))
+
+    def test_runtime_accepts_test_budget_seconds(self, tmp_path: Path) -> None:
+        cfg = te.load_config(_write_config(tmp_path, runtime=dict(_RUNTIME)))
+        assert cfg.runtime is not None
+        assert cfg.runtime.test_budget_seconds == 15
+
+    def test_rejects_missing_test_budget_seconds(self, tmp_path: Path) -> None:
+        runtime = dict(_RUNTIME)
+        del runtime["test_budget_seconds"]
+        with pytest.raises(
+            ValueError, match="config is missing required key 'runtime.test_budget_seconds'"
+        ):
             te.load_config(_write_config(tmp_path, runtime=runtime))
 
     def test_requires_total_runtime_budget(self, tmp_path: Path) -> None:

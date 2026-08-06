@@ -89,9 +89,7 @@ def _stable_control_generator(
     return generator
 
 
-def _stable_slot_permutation(
-    node_u: str, node_v: str, side: str, slots: int
-) -> torch.Tensor:
+def _stable_slot_permutation(node_u: str, node_v: str, side: str, slots: int) -> torch.Tensor:
     """Return the v2 canonical-pair-keyed slot permutation."""
     return torch.randperm(
         slots,
@@ -119,9 +117,7 @@ def _checkerboard_rewire(
     pair_count = slots // 2
     draws_per_round = pair_count * (pair_count - 1)
     round_count = (swap_count + draws_per_round - 1) // draws_per_round
-    row_pair, column_pair = torch.where(
-        ~torch.eye(pair_count, dtype=torch.bool)
-    )
+    row_pair, column_pair = torch.where(~torch.eye(pair_count, dtype=torch.bool))
     # Each round partitions slots into disjoint pairs and assigns every row
     # pair to every other column pair. The resulting 2x2 blocks contain only
     # off-diagonal cells and do not overlap, so all draws in a round are safe
@@ -165,9 +161,7 @@ def _checkerboard_rewire(
         .transpose(0, 1)
         .to(device=matrices.device, dtype=matrices.dtype)
     )
-    matrix_offsets = (
-        torch.arange(matrix_count, device=matrices.device)[:, None] * slots * slots
-    )
+    matrix_offsets = torch.arange(matrix_count, device=matrices.device)[:, None] * slots * slots
 
     def transfer(
         flat: torch.Tensor,
@@ -297,8 +291,7 @@ def make_scaffold_input_perturbation(
             for node_u, node_v in controlled_pairs
         ]
         plan_generators = [
-            _stable_control_generator(node_u, node_v, "plan")
-            for node_u, node_v in controlled_pairs
+            _stable_control_generator(node_u, node_v, "plan") for node_u, node_v in controlled_pairs
         ]
         rewired = _checkerboard_rewire(
             torch.cat((weighted_src, weighted_dst, canonical_plan), dim=0),
@@ -317,12 +310,8 @@ def make_scaffold_input_perturbation(
         rewired_plan = rewired[2 * batch_size :]
         rewired_src = 0.5 * (rewired_src + rewired_src.transpose(1, 2))
         rewired_dst = 0.5 * (rewired_dst + rewired_dst.transpose(1, 2))
-        perturbed_src = (
-            torch.where(weight_src > 0, rewired_src / weight_src, 0.0) + diagonal_src
-        )
-        perturbed_dst = (
-            torch.where(weight_dst > 0, rewired_dst / weight_dst, 0.0) + diagonal_dst
-        )
+        perturbed_src = torch.where(weight_src > 0, rewired_src / weight_src, 0.0) + diagonal_src
+        perturbed_dst = torch.where(weight_dst > 0, rewired_dst / weight_dst, 0.0) + diagonal_dst
         perturbed_plan = torch.where(
             canonical_src[:, None, None],
             rewired_plan,
@@ -405,9 +394,7 @@ def build_scaffold(
         adj[:, _ALIGN, s_src, s_dst] = plan32
         adj[:, _ALIGN, s_dst, s_src] = plan32.transpose(1, 2)
 
-        closure = 0.5 * (
-            torch.bmm(adj_src_zero, plan32) + torch.bmm(plan32, adj_dst_zero)
-        )
+        closure = 0.5 * (torch.bmm(adj_src_zero, plan32) + torch.bmm(plan32, adj_dst_zero))
         adj[:, _CLOSE, s_src, s_dst] = closure
         adj[:, _CLOSE, s_dst, s_src] = closure.transpose(1, 2)
 
@@ -543,11 +530,7 @@ def sinkhorn_log_plan(
                 * eps
                 * torch.logsumexp((f[:, :, None] - cost) / eps + log_a[:, :, None], dim=1)
             )
-        return (
-            (f[:, :, None] + g[:, None, :] - cost) / eps
-            + log_a[:, :, None]
-            + log_b[:, None, :]
-        )
+        return (f[:, :, None] + g[:, None, :] - cost) / eps + log_a[:, :, None] + log_b[:, None, :]
 
 
 def sinkhorn_plan(

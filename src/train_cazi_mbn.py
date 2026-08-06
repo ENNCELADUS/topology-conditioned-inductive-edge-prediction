@@ -60,6 +60,7 @@ class CAZIConfig:
     heads: int
     batch_size: int
     score_batch_size: int
+    test_budget_seconds: int
     learning_rate: float
     weight_decay: float
     teacher_epochs: int
@@ -124,6 +125,7 @@ def load_config(path: Path) -> CAZIConfig:
         heads=int(model["heads"]),
         batch_size=int(runtime["batch_size"]),
         score_batch_size=int(runtime["score_batch_size"]),
+        test_budget_seconds=int(runtime["test_budget_seconds"]),
         learning_rate=float(optim["learning_rate"]),
         weight_decay=float(optim["weight_decay"]),
         teacher_epochs=int(optim["teacher_epochs"]),
@@ -155,9 +157,7 @@ def select_device(requested: str) -> torch.device:
     return torch.device("cpu")
 
 
-def _edge_index(
-    pairs: Sequence[tuple[str, str]], node_position: Mapping[str, int]
-) -> torch.Tensor:
+def _edge_index(pairs: Sequence[tuple[str, str]], node_position: Mapping[str, int]) -> torch.Tensor:
     rows: list[int] = []
     cols: list[int] = []
     for u, v in pairs:
@@ -282,17 +282,14 @@ def _feature_coverage(
     expected = frozenset(expected_missing)
     if missing != expected:
         raise ValueError(
-            f"feature coverage drift: actual missing={sorted(missing)}, "
-            f"expected={sorted(expected)}"
+            f"feature coverage drift: actual missing={sorted(missing)}, expected={sorted(expected)}"
         )
     return missing, sorted(graph_nodes & store.node_ids)
 
 
 def _standardize_f0(rows: torch.Tensor, stats: FeatureStats) -> torch.Tensor:
     """Apply the training-universe feature statistics to fp32 F0 rows."""
-    standardized = (rows.float() - torch.from_numpy(stats.mu)) / torch.from_numpy(
-        stats.sigma
-    )
+    standardized = (rows.float() - torch.from_numpy(stats.mu)) / torch.from_numpy(stats.sigma)
     if not bool(torch.isfinite(standardized).all()):
         raise ValueError("standardized CAZI features are not finite")
     return standardized
@@ -337,9 +334,7 @@ def prepare_data(cfg: CAZIConfig) -> PreparedData:
         train_nodes,
         cache_path=cfg.output_dir / "feature_stats.npz",
     )
-    train_sequence = _standardize_f0(
-        f0[[f0_position[node] for node in train_nodes]], feature_stats
-    )
+    train_sequence = _standardize_f0(f0[[f0_position[node] for node in train_nodes]], feature_stats)
     student_val_sequence = _standardize_f0(
         f0[[f0_position[node] for node in student_val_nodes]], feature_stats
     )
@@ -373,9 +368,7 @@ def prepare_data(cfg: CAZIConfig) -> PreparedData:
     ]
     if len(negative_candidates) < len(topology_edges):
         raise ValueError("not enough frozen negatives to build the CAZI negative graph")
-    negative_choice = rng.choice(
-        len(negative_candidates), size=len(topology_edges), replace=False
-    )
+    negative_choice = rng.choice(len(negative_candidates), size=len(topology_edges), replace=False)
     negative_edges = [negative_candidates[int(i)] for i in negative_choice]
     topology = load_or_build_ugt(
         cfg.output_dir / "ugt_projection.npz",

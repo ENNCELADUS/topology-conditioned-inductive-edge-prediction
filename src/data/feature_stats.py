@@ -86,9 +86,7 @@ def feature_stats_digest(
     return digest.hexdigest()
 
 
-def compute_feature_stats(
-    rows: NDArray[np.float32], node_ids: Sequence[str]
-) -> FeatureStats:
+def compute_feature_stats(rows: NDArray[np.float32], node_ids: Sequence[str]) -> FeatureStats:
     """Compute the registered constants from one universe's rows.
 
     Args:
@@ -174,9 +172,7 @@ def save_feature_stats(stats: FeatureStats, path: Path) -> None:
     temp.replace(path)
 
 
-def load_feature_stats(
-    path: Path, *, expected_node_ids_sha256: str | None = None
-) -> FeatureStats:
+def load_feature_stats(path: Path, *, expected_node_ids_sha256: str | None = None) -> FeatureStats:
     """Load and verify cached constants, failing closed on any disagreement.
 
     Args:
@@ -200,15 +196,11 @@ def load_feature_stats(
     sigma = np.ascontiguousarray(payload["sigma"], dtype=np.float32)
     identity = str(payload["node_ids_sha256"])
     stored = str(payload["digest"])
-    recomputed = feature_stats_digest(
-        mu, sigma, method_id=method_id, node_ids_sha256=identity
-    )
+    recomputed = feature_stats_digest(mu, sigma, method_id=method_id, node_ids_sha256=identity)
     if recomputed != stored:
         raise ValueError(f"cached feature stats at {path} fail their own digest check")
     if expected_node_ids_sha256 is not None and identity != expected_node_ids_sha256:
-        raise ValueError(
-            f"cached feature stats at {path} were computed over a different universe"
-        )
+        raise ValueError(f"cached feature stats at {path} were computed over a different universe")
     return FeatureStats(
         mu=mu,
         sigma=sigma,

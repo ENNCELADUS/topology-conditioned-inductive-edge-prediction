@@ -4,23 +4,20 @@ This directory is the only HPC execution layer. It runs the implemented baseline
 and EgoStitch CLIs directly inside the pinned container; there is no scheduler, job
 array, or cluster-specific environment file. One tracked runner:
 
-- `hpc/run.sh` — the single launcher: baselines, EgoStitch E2E training, cached
-  scoring, and the G1/G2 gates all go through it.
+- `hpc/run.sh` — the single launcher: baselines, EgoStitch E2E training, held-out
+  testing, cached scoring, and the G1/G2 gates all go through it.
 
 Formal E2 training (`B0`, `configs/b0_v31_breadth_first.yaml`) runs **only** through
 `hpc/run.sh train configs/b0_v31_breadth_first.yaml`, the runner's single `train` branch,
 which always drives the production `python -m src.e2_pipeline` entry. That pipeline has
-three sub-stages, `pack -> train -> publish`: build or strictly validate the BF16 feature
-pack, launch one clean `accelerate launch` at the configured `runtime.token_budget` whose
-process count is automatically set to all visible NVIDIA H20 GPUs, then validate and
-atomically publish the staging tree. Direct `python -m src.train_b0 --max-steps N` remains
-debug-only (bounded smoke runs) and must never be used for a reported E2 experiment.
-`B0-alt` (`configs/b0_alt_breadth_first.yaml`) is outside this E2-only optimization: its
-config is not the V3.1 shape `src.e2_pipeline` expects, so it is **not** trained through
-`hpc/run.sh train` — it keeps its existing direct
-`.venv/bin/python -m src.train_b0 --config configs/b0_alt_breadth_first.yaml`
-invocation, run directly (bypassing the runner's `train` branch) inside the same
-container.
+four sub-stages, `pack -> train -> publish -> test`: build or strictly validate the BF16
+feature pack, launch one clean `accelerate launch` at the configured `runtime.token_budget`
+whose process count is automatically set to all visible NVIDIA H20 GPUs, validate and
+atomically publish the staging tree, then immediately run the held-out test protocol
+against the published checkpoint (see "Held-out testing" below). Direct
+`python -m src.train_b0 --max-steps N` remains debug-only (bounded smoke runs), skips the
+test stage entirely so it never spends a held-out scoring epoch, and must never be used
+for a reported E2 experiment.
 
 `hpc/run.sh train` also drives EgoStitch E2E: the same branch always execs
 `python -m src.e2_pipeline`, which defaults to the B0 worker (`src.train_b0`). Pass
@@ -28,18 +25,20 @@ container.
 the EgoStitch worker instead (see "EgoStitch E2E" below).
 
 The external CAZI-MBN reproduction is intentionally isolated from the E2
-`pack -> train -> publish` workers because its released teacher/student schedule is
+`pack -> train -> publish -> test` workers because its released teacher/student schedule is
 not that pipeline. It still goes through the fixed H20 runner and its environment,
-data, and GPU checks:
+data, and GPU checks, and the same `train` branch chains the held-out test protocol
+itself once training publishes a checkpoint:
 
 ```bash
 hpc/run.sh train configs/cazi_mbn_breadth_first.yaml \
   --worker-module src.train_cazi_mbn
 ```
 
-This direct branch preserves CAZI's early-stopped teacher-then-student schedule and
-writes its checkpoints, cached candidate scores, and pairwise/topology report under
-the config's `output_dir`.
+This direct branch preserves CAZI's early-stopped teacher-then-student schedule, writes
+its checkpoints and topology report under the config's `output_dir`, then runs
+`python -m src.eval.test_protocol` against the `student.pt` checkpoint it just published,
+writing `test_report.json`/`test_complete.json` under the same `output_dir`.
 
 ## Required target environment
 
@@ -61,10 +60,12 @@ to the exact count in their retained artifacts.
 Do not store the SSH password in this repository. The runner fails before executing any
 command unless at least one visible GPU is named `NVIDIA H20`, the fixed paths exist, and
 both benchmark and feature directories are present. The runner automatically exports
-all detected GPU indices. `score` creates one contiguous shard per visible GPU and
-strictly merges them into the requested artifact; `merge`, `g1`, and `g2` are
-single-process. `train` uses all visible GPUs via a matching Accelerate world size.
-G3 is a direct single-process cached-score analysis command outside `run.sh`.
+all detected GPU indices. `score` is a thin passthrough to `python -m src.score_fanout`,
+which owns GPU-count detection, `--device cuda --amp bf16`, sharding, and the strict merge;
+`merge`, `g1`, and `g2` are single-process. `test` is a thin passthrough to
+`python -m src.eval.test_protocol`. `train` uses all visible GPUs via a matching
+Accelerate world size. G3 is a direct single-process cached-score analysis command
+outside `run.sh`.
 
 ## Run order
 
@@ -79,16 +80,33 @@ hpc/run.sh check
 The check runs the lightweight suite plus the three CPU DDP smoke contracts on Linux;
 the four-H20 cold-run acceptance test remains an explicit opt-in.
 
+Every arm's formal run is now one sequence, not train followed by separate manual
+scoring commands: `hpc/run.sh train <config> ...` packs, trains, publishes, and then
+scores V_hold/test/candidate and writes the combined edge+graph `test_report.json` before
+the command returns. Nothing further is required to get an arm's held-out numbers.
+
+Only `egostitch_e2e` is ledgered against repeat scoring, because each e2e arm run spends
+two scoring epochs (test + candidate) against the same `V_hold`-derived operating point.
+Re-running an already-scored `(arm, seed)` fails with "repeat scoring requires
+--rescore-reason"; pass `--rescore-reason "<why>"` after the config path (and any
+`--worker-module`/`--run-kind` flags) to `hpc/run.sh train` to intentionally re-open it.
+There is no default reason and none is auto-generated — an operator must state one, for
+example when a checkpoint is rescored after a scoring-code fix rather than a new training
+run. `B0` and `CAZI-MBN` are not ledgered, since neither publishes an `egostitch_e2e`
+checkpoint.
+
 ## EgoStitch E2E
 
 EgoStitch E2E trains on `V_fit` and validates on the single 512-node `V_hold`. It may
-not open a held-out path; that boundary is checked inside the worker, and the command
-runs directly in the repository checkout.
+not open a held-out path during training; that boundary is checked inside the worker, and
+the command runs directly in the repository checkout.
 
 The sole exception is an explicitly configured true-Oracle diagnostic:
 `generator.oracle_truth_source: g_fit_plus_v_hold`. It consumes internal `V_hold`
 positive structure and therefore must use `--run-kind diagnostic`; it writes
-`diagnostic_complete.json`, never formal artifacts or `complete.json`.
+`diagnostic_complete.json`, never formal artifacts or `complete.json`, and its test stage
+correspondingly writes `diagnostic_test_report.json`/`diagnostic_test_complete.json`,
+never the formal `test_report.json`/`test_complete.json` names.
 
 It runs through the same `hpc/run.sh train` branch as the baselines, naming the
 EgoStitch worker and run kind explicitly and pointing at one of the trained-arm
@@ -107,7 +125,50 @@ hpc/run.sh train configs/egostitch_e2e_v3_oracle_grit_film_logit_breadth_first.y
 ```
 
 The two scoring-time controls (`structure_control_6a_v3`, `structure_control_6e_v1`)
-are not trained arms — they reuse the `full` arm's checkpoint at scoring time.
+are not trained arms and have no `train` invocation of their own — they reuse the `full`
+arm's published checkpoint (`--checkpoint` only; nothing about the control changes what
+was trained), so their held-out numbers come from calling `test` directly.
+
+`--arm` and `--scaffold-control` are not the same name and must not be set to the same
+value: `--arm` is the ledger/report identity (`structure_control_6a_v3` /
+`structure_control_6e_v1`), while `--scaffold-control` is the perturbation *mode* that
+`src.score_universe` actually knows how to parse (`shuffle_within_pair_v3` /
+`rewire_checkerboard_v1`). Passing an arm name to `--scaffold-control` fails argument
+parsing before any scoring happens, because that flag's choices are mode names only.
+
+Each control also needs its own `--output-dir`, distinct from the `full` arm's own
+directory and from each other's. `run_test_protocol` unconditionally (over)writes
+`test_protocol_run_metadata.json`, `operating_point.json`, `test_report.json`, and
+`scores/{v_hold,test,candidate}.npz` plus their per-universe `f0_cache_*`/
+`grounding_cache_*` files into whatever `--output-dir` it is given. It never writes a
+published `run_metadata.json` — it validates an existing one instead — but pointing a
+control at `outputs/egostitch_e2e_v3_full` would clobber the trained `full` arm's
+published evidence, and running the second control after the first would then clobber
+the first control's evidence too. Only `--checkpoint` points back at `full`:
+
+```bash
+hpc/run.sh test \
+  --checkpoint outputs/egostitch_e2e_v3_full/best.pt \
+  --output-dir outputs/egostitch_e2e_v3_full/structure_control_6a_v3 \
+  --data-root data --strategy breadth_first \
+  --arm structure_control_6a_v3 --seed 0 \
+  --timeout-seconds 1800 \
+  --scaffold-control shuffle_within_pair_v3 \
+  --rescore-reason "scoring-time structure control over the full checkpoint"
+
+hpc/run.sh test \
+  --checkpoint outputs/egostitch_e2e_v3_full/best.pt \
+  --output-dir outputs/egostitch_e2e_v3_full/structure_control_6e_v1 \
+  --data-root data --strategy breadth_first \
+  --arm structure_control_6e_v1 --seed 0 \
+  --timeout-seconds 1800 \
+  --scaffold-control rewire_checkerboard_v1 \
+  --rescore-reason "scoring-time structure control over the full checkpoint"
+```
+
+`--timeout-seconds` is required rather than defaulted: it is the hard per-shard deadline,
+and a silent default would truncate a legitimately long candidate-universe score. The
+`train` path never needs it — each config's `runtime.test_budget_seconds` supplies it.
 
 Non-finite state, DDP disagreement, coverage/data-boundary violations, and
 I/O/infrastructure failures remain fail-closed inside the worker and pipeline. Model-
@@ -117,14 +178,11 @@ AUPRC, dispersion, precision quality) are telemetry, recorded in `profile.json` 
 
 ## Baselines
 
-Train both frozen baselines. `B0` runs through the auto-sized H20 E2 production pipeline;
-`B0-alt` is outside this optimization and is trained directly, without the runner's
-`train` branch. The shipped configs pin BF16 and the repository-local data root:
+Train the frozen `B0` baseline through the auto-sized H20 E2 production pipeline. The
+shipped config pins BF16 and the repository-local data root:
 
 ```bash
-hpc/run.sh train configs/b0_v31_breadth_first.yaml                       # B0: auto-sized H20 pipeline
-
-.venv/bin/python -m src.train_b0 --config configs/b0_alt_breadth_first.yaml  # B0-alt: direct train_b0
+hpc/run.sh train configs/b0_v31_breadth_first.yaml
 ```
 
 `hpc/run.sh train configs/b0_v31_breadth_first.yaml` writes, under the pipeline's
@@ -132,29 +190,31 @@ output directory, `best.pt`, `last.pt`, `metrics.jsonl`, `run_metadata.json`,
 `profile.json` (per-stage timings and the configured token budget), and
 `artifact_manifest.json` (sha256 + byte size of the above). A successful atomic
 publication writes `complete.json` last; its `total_seconds` is the authoritative
-post-publication 60-minute acceptance time. It returns exit code `0` on success and `2`
-on a gated failure (for example a pack or training stage exceeding its
-`runtime.*_budget_seconds` deadline), naming the stage in `failure.json`; the runner does
-not mask this exit code.
+post-publication 60-minute acceptance time. The subsequent test stage then writes
+`test_report.json` and `test_complete.json` (or the `diagnostic_*` pair for a diagnostic
+run). It returns exit code `0` on success and `2` on a gated failure (for example a pack,
+training, or test stage exceeding its `runtime.*_budget_seconds` deadline, with the new
+`runtime.test_budget_seconds` covering the test stage), naming the stage in
+`failure.json`; the published training artifacts survive a test-stage failure, and the
+runner does not mask this exit code.
 
 ## Scoring and gates
 
-Score the candidate universe once per checkpoint. `run.sh score` defaults to
-`--device cuda --amp bf16`; on a multi-GPU node it launches one contiguous shard per GPU
-and publishes the final output only after strict `score_universe merge` validation. For
-V3.1, pass `--pack-dir` to keep the BF16 token table GPU-resident and avoid repeated
-per-pair feature-file reads.
+`hpc/run.sh score` is a thin passthrough to `python -m src.score_fanout` for scoring one
+pairs universe outside the automatic per-arm test protocol above — for example
+regenerating a candidate-universe artifact for a G1/G2 gate rerun. It requires
+`--timeout-seconds` (the hard wall-clock deadline for each shard and the merge), then
+auto-detects GPU count, pins `--device cuda --amp bf16`, and on a multi-GPU node launches
+one contiguous shard per GPU before strictly merging them; the shell no longer performs
+any of that orchestration itself. For V3.1, pass `--pack-dir` to keep the BF16 token
+table GPU-resident and avoid repeated per-pair feature-file reads.
 
 ```bash
 hpc/run.sh score \
+  --timeout-seconds 1800 \
   --checkpoint outputs/b0_v31/best.pt \
   --pairs candidate --data-root data --strategy breadth_first \
   --output scores/b0_v31_candidate.npz
-
-hpc/run.sh score \
-  --checkpoint outputs/b0_alt/best.pt \
-  --pairs candidate --data-root data --strategy breadth_first \
-  --output scores/b0_alt_candidate.npz
 ```
 
 Run the implemented gates over the cached scores:
@@ -162,7 +222,6 @@ Run the implemented gates over the cached scores:
 ```bash
 hpc/run.sh g1 \
   --universe scores/b0_v31_candidate.npz \
-  --alt-universe scores/b0_alt_candidate.npz \
   --data-root data --strategy breadth_first --output-dir outputs/g1
 
 hpc/run.sh g2 \
@@ -190,4 +249,5 @@ nohup hpc/run.sh train configs/b0_v31_breadth_first.yaml \
   > outputs/logs/b0_v31_train.log 2>&1 &
 ```
 
-`--max-steps` remains debug-only and must not be used for a reported experiment.
+`--max-steps` remains debug-only, skips the test stage, and must not be used for a
+reported experiment.

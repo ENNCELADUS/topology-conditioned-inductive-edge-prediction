@@ -217,9 +217,7 @@ class TestBuildScheduler:
         param = nn.Parameter(torch.zeros(1))
         optimizer = torch.optim.AdamW([param], lr=1.0e-4)
         total_steps = 100
-        scheduler = _build_scheduler(
-            optimizer, cfg, warmup_steps=999, total_steps=total_steps
-        )
+        scheduler = _build_scheduler(optimizer, cfg, warmup_steps=999, total_steps=total_steps)
         assert isinstance(scheduler, torch.optim.lr_scheduler.OneCycleLR)
 
         observed = [scheduler.get_last_lr()[0]]

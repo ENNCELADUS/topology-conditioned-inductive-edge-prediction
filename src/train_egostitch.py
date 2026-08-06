@@ -102,9 +102,9 @@ _PACK_GROUNDING_FILENAME = "grounding.npz"
 _PACK_VALIDATION_GROUNDING_FILENAME = "grounding_validation.npz"
 _PACK_MANIFEST_FILENAME = "manifest.json"
 _PACK_FEATURE_STATS_FILENAME = "feature_stats.npz"
-def _egostitch_ddp_kwargs(
-    *, find_unused_parameters: bool = True
-) -> DistributedDataParallelKwargs:
+
+
+def _egostitch_ddp_kwargs(*, find_unused_parameters: bool = True) -> DistributedDataParallelKwargs:
     """Return DDP settings for EgoStitch's conditionally unused heads."""
     return DistributedDataParallelKwargs(
         broadcast_buffers=False,
@@ -121,11 +121,7 @@ def build_egostitch_ddp_accelerator(
     """Build the EgoStitch distributed accelerator."""
     return Accelerator(
         mixed_precision=mixed_precision,
-        kwargs_handlers=[
-            _egostitch_ddp_kwargs(
-                find_unused_parameters=find_unused_parameters
-            )
-        ],
+        kwargs_handlers=[_egostitch_ddp_kwargs(find_unused_parameters=find_unused_parameters)],
     )
 
 
@@ -210,6 +206,7 @@ class EgoRuntimeConfig:
     pack_budget_seconds: int
     train_eval_budget_seconds: int
     artifact_budget_seconds: int
+    test_budget_seconds: int
 
 
 @dataclass(frozen=True)
@@ -466,6 +463,7 @@ def load_config(path: Path) -> EgoConfig:
             "pack_budget_seconds",
             "train_eval_budget_seconds",
             "artifact_budget_seconds",
+            "test_budget_seconds",
         )
         _check_no_unknown_keys(runtime_raw, runtime_keys, "runtime")
         world_size_raw = _require(runtime_raw, "world_size", "runtime.")
@@ -511,6 +509,10 @@ def load_config(path: Path) -> EgoConfig:
             artifact_budget_seconds=_as_int(
                 _require(runtime_raw, "artifact_budget_seconds", "runtime."),
                 "runtime.artifact_budget_seconds",
+            ),
+            test_budget_seconds=_as_int(
+                _require(runtime_raw, "test_budget_seconds", "runtime."),
+                "runtime.test_budget_seconds",
             ),
         )
         if runtime.token_budget <= 0:
@@ -630,12 +632,15 @@ def load_config(path: Path) -> EgoConfig:
                 "training.phase_a_fraction + training.phase_b_fraction must not exceed 1"
             )
         pinned_training = EgoStitchTrainingConfig()
-        if replace(
-            training,
-            selection_auprc_tolerance=pinned_training.selection_auprc_tolerance,
-            phase_a_fraction=pinned_training.phase_a_fraction,
-            phase_b_fraction=pinned_training.phase_b_fraction,
-        ) != pinned_training:
+        if (
+            replace(
+                training,
+                selection_auprc_tolerance=pinned_training.selection_auprc_tolerance,
+                phase_a_fraction=pinned_training.phase_a_fraction,
+                phase_b_fraction=pinned_training.phase_b_fraction,
+            )
+            != pinned_training
+        ):
             raise ValueError(
                 "training values must exactly match the pinned defaults (except "
                 f"selection_auprc_tolerance, phase_a_fraction, and phase_b_fraction); "
@@ -855,9 +860,9 @@ def _e2e_dispersion_rows(
             plan32, dim=(1, 2)
         ).clamp_min(1e-30)
         row_probability = plan32 / row_mass[:, :, None].clamp_min(1e-30)
-        row_entropy = -(
-            row_probability * row_probability.clamp_min(1e-30).log()
-        ).sum(dim=-1).mean(dim=-1) / math.log(slots)
+        row_entropy = -(row_probability * row_probability.clamp_min(1e-30).log()).sum(dim=-1).mean(
+            dim=-1
+        ) / math.log(slots)
     return {
         "pi_slot_std": pi32.std(dim=-1),
         "h_pairwise_cosine_mean": cosine,
@@ -986,9 +991,7 @@ def _e2e_validation_endpoint_degrees(data: EgoStitchData) -> NDArray[np.float64]
     )
 
 
-def e2e_degree_prior_init(
-    model: EgoStitchStage1 | EgoStitchModel, data: EgoStitchData
-) -> float:
+def e2e_degree_prior_init(model: EgoStitchStage1 | EgoStitchModel, data: EgoStitchData) -> float:
     """Center the lognormal degree head on the ``G_fit`` degree prior.
 
     ``deg_mu`` is a raw linear output (`generator/imagine.py`'s
@@ -1133,9 +1136,7 @@ def build_e2e_parameter_groups(model: EgoStitchModel) -> E2EParameterGroups:
             continue
         component = name.split(".", 1)[0]
         if component not in grouped:
-            raise RuntimeError(
-                f"E2E parameter {name!r} does not belong to a known component group"
-            )
+            raise RuntimeError(f"E2E parameter {name!r} does not belong to a known component group")
         grouped[component].append((name, parameter))
 
     all_ids = [id(parameter) for rows in grouped.values() for _, parameter in rows]
@@ -1358,8 +1359,7 @@ def e2e_assert_finite_optimizer_state(
     for _, value in tensors:
         checks_by_device.setdefault(value.device, []).append(torch.isfinite(value).all())
     if all(
-        bool(torch.stack(device_checks).all().item())
-        for device_checks in checks_by_device.values()
+        bool(torch.stack(device_checks).all().item()) for device_checks in checks_by_device.values()
     ):
         return
     for label, value in tensors:
@@ -1727,9 +1727,7 @@ def prepare_pack(
         )
         train_pairs, train_labels = _read_labeled_pairs(strategy_dir / "train_edges.txt")
         positives = [
-            pair
-            for pair, label in zip(train_pairs, train_labels, strict=True)
-            if int(label) == 1
+            pair for pair, label in zip(train_pairs, train_labels, strict=True) if int(label) == 1
         ]
         interactions = derive_training_interactions(positives)
         holdout = derive_internal_holdout(train_nodes_all, interactions.positives)
@@ -2507,13 +2505,9 @@ class _BatchFactory:
                 batch, slots, input_dim, dtype=torch.float32
             )
             targets[f"target_mult_{side}"] = torch.zeros(batch, slots, dtype=torch.float32)
-            targets[f"target_adj_{side}"] = torch.zeros(
-                batch, slots, slots, dtype=torch.float32
-            )
+            targets[f"target_adj_{side}"] = torch.zeros(batch, slots, slots, dtype=torch.float32)
             targets[f"target_mask_{side}"] = torch.zeros(batch, slots, dtype=torch.bool)
-            targets[f"target_node_index_{side}"] = torch.full(
-                (batch, slots), -1, dtype=torch.long
-            )
+            targets[f"target_node_index_{side}"] = torch.full((batch, slots), -1, dtype=torch.long)
 
         cached: dict[tuple[str, str], EgoTargets] = {}
         for row_index, (node_i, node_j, label) in enumerate(rows):
@@ -2603,9 +2597,7 @@ class _BatchFactory:
             edge["ground_i"] = torch.empty(empty_shape, dtype=self._data.f0.dtype)
             edge["ground_j"] = torch.empty(empty_shape, dtype=self._data.f0.dtype)
         if self._relational_supervision:
-            edge["rel_target"] = relational_pair_targets(
-                self._data.target_builder.graph, padded
-            )
+            edge["rel_target"] = relational_pair_targets(self._data.target_builder.graph, padded)
         return edge, true_rows
 
     def epoch_batches(
@@ -2647,10 +2639,10 @@ class _BatchFactory:
                     + node["target_features"].shape[0] * node["target_features"].shape[1]
                     + 2 * edge["x_i"].shape[0]  # both edge grounding gathers
                     + sum(
-                    edge[name].shape[0] * edge[name].shape[1]
-                    for name in ("target_features_i", "target_features_j")
-                    if name in edge
-                )
+                        edge[name].shape[0] * edge[name].shape[1]
+                        for name in ("target_features_i", "target_features_j")
+                        if name in edge
+                    )
                 )
             yield _CompositeBatch(
                 node=node,
@@ -2850,13 +2842,16 @@ class _CompositeStep(torch.nn.Module):
                 batch.get("recon_factors"),
             ),
         )
-        parameter_anchor = 0.0 * torch.stack(
-            tuple(
-                parameter.sum()
-                for parameter in self.model.parameters()
-                if parameter.requires_grad
-            )
-        ).sum()
+        parameter_anchor = (
+            0.0
+            * torch.stack(
+                tuple(
+                    parameter.sum()
+                    for parameter in self.model.parameters()
+                    if parameter.requires_grad
+                )
+            ).sum()
+        )
         total = total + parameter_anchor
         families = {name: family + parameter_anchor for name, family in families.items()}
         result: dict[str, object] = {
@@ -3090,9 +3085,7 @@ class _ValidationResult:
     fidelity: dict[str, float]
     scale_telemetry: dict[str, float] = field(default_factory=dict)
     timing: dict[str, float] = field(default_factory=dict)
-    active_logits: NDArray[np.float32] = field(
-        default_factory=lambda: np.empty(0, dtype="<f4")
-    )
+    active_logits: NDArray[np.float32] = field(default_factory=lambda: np.empty(0, dtype="<f4"))
 
 
 def _validation_clustering_mmd(data: EgoStitchData, logits: np.ndarray) -> float:
@@ -3165,9 +3158,7 @@ def _e2e_validation_node_batch(
         batch["ground"] = data.f0[torch.from_numpy(grounding_rows)]
         batch["ground_ids"] = torch.from_numpy(grounding_rows)
     else:
-        batch["ground"] = torch.empty(
-            len(nodes), 0, data.f0.shape[1], dtype=data.f0.dtype
-        )
+        batch["ground"] = torch.empty(len(nodes), 0, data.f0.shape[1], dtype=data.f0.dtype)
     return cast(dict[str, torch.Tensor], _to_device(batch, device))
 
 
@@ -3198,9 +3189,7 @@ def _fp32_cached_node_state(state: E2ENodeState, row: int) -> E2ENodeState:
     if state.ground_ids is not None:
         ground_ids = state.ground_ids[row : row + 1].clone()
     projected_x = (
-        state.projected_x[row : row + 1].float().clone()
-        if state.projected_x is not None
-        else None
+        state.projected_x[row : row + 1].float().clone() if state.projected_x is not None else None
     )
     return E2ENodeState(
         encoded=state.encoded[row : row + 1, :true_length].float().clone(),
@@ -3243,9 +3232,7 @@ def _stack_cached_node_states(
         slots = SlotSet(
             *(
                 torch.cat(values)
-                for values in zip(
-                    *(cast(SlotSet, state.slots) for state in states), strict=True
-                )
+                for values in zip(*(cast(SlotSet, state.slots) for state in states), strict=True)
             )
         )
     projected_x: torch.Tensor | None
@@ -3311,9 +3298,7 @@ def _validate_epoch(
     assert token_table is not None and token_node_index is not None, (
         "family egostitch_e2e requires token_table/token_node_index"
     )
-    unique_nodes = list(
-        dict.fromkeys(node for row in shard_rows for node in data.val_pairs[row])
-    )
+    unique_nodes = list(dict.fromkeys(node for row in shard_rows for node in data.val_pairs[row]))
 
     def synchronize_device() -> None:
         if accelerator.device.type == "cuda":
@@ -3399,9 +3384,7 @@ def _validate_epoch(
                     ),
                 )
                 active_logits = (
-                    full_logits
-                    if masks is None
-                    else model.score_pair_context(context, masks=masks)
+                    full_logits if masks is None else model.score_pair_context(context, masks=masks)
                 )
             # Slot-geometry telemetry (dispersion/scale) only exists for
             # `EgoStitchImagineGenerator`: the oracle-scaffold and null
@@ -3431,8 +3414,7 @@ def _validate_epoch(
                 dispersion_rows = {
                     name: (
                         0.5 * (dispersion_a[name] + dispersion_b[name])
-                        if name
-                        in {"pi_slot_std", "h_pairwise_cosine_mean", "adj_offdiag_std"}
+                        if name in {"pi_slot_std", "h_pairwise_cosine_mean", "adj_offdiag_std"}
                         else dispersion_a[name]
                     )
                     for name in dispersion_a
@@ -3543,9 +3525,7 @@ def _validate_epoch(
     )
     dispersion_summary = {
         name: (
-            float(np.mean(values[np.isfinite(values)]))
-            if bool(np.isfinite(values).any())
-            else 0.0
+            float(np.mean(values[np.isfinite(values)])) if bool(np.isfinite(values).any()) else 0.0
         )
         for name, values in zip(dispersion_names, ordered[:, 3:8].T, strict=True)
     }
@@ -3929,9 +3909,7 @@ def _e2e_family_probe(
             else set()
         ),
         "encoder": (
-            {"recon"}
-            if inner.encoder is not None and inner.encoder.rel_head is not None
-            else set()
+            {"recon"} if inner.encoder is not None and inner.encoder.rel_head is not None else set()
         ),
     }
     if phase.edge_active and arm != "b0_e2e_f_only" and is_imagine_generator:
@@ -4277,9 +4255,7 @@ def _enforce_e2e_initial_slot_health(
         }
         if not all(math.isfinite(value) for value in report.values()):
             nonfinite_telemetry = 1
-        report["quality_threshold_missed"] = float(
-            report["h_pairwise_cosine_mean"] > 0.95
-        )
+        report["quality_threshold_missed"] = float(report["h_pairwise_cosine_mean"] > 0.95)
         logger.info(
             "e2e step-0 slot health rows=%d feature_stats_sha256=%s %s",
             len(data.val_pairs),
@@ -4357,9 +4333,7 @@ def _train_e2e_stability_loop(
         rank=rank,
         world_size=world,
         generator_supervision=isinstance(model.generator, EgoStitchImagineGenerator),
-        relational_supervision=(
-            model.encoder is not None and model.encoder.rel_head is not None
-        ),
+        relational_supervision=(model.encoder is not None and model.encoder.rel_head is not None),
     )
 
     validation_events_path = cfg.output_dir / V_HOLD_VALIDATION_EVENTS_FILENAME
@@ -4553,9 +4527,7 @@ def _train_e2e_stability_loop(
                     raise RuntimeError(f"non-finite E2E loss at optimizer step {global_step}")
                 accelerator.backward(loss)
                 local_gradient_statistics, gathered_squared, gathered_nonfinite = (
-                    _gather_e2e_group_gradient_statistics(
-                        parameter_groups.groups, accelerator
-                    )
+                    _gather_e2e_group_gradient_statistics(parameter_groups.groups, accelerator)
                 )
                 e2e_assert_replicated_squared_norms(gathered_squared)
                 if bool(torch.stack(tuple(gathered_nonfinite.values())).ne(0).any().item()):
@@ -4586,10 +4558,7 @@ def _train_e2e_stability_loop(
                     step=global_step + 1,
                     phase=phase.phase,
                     enforce_immediate=enforce_quality,
-                    enforce_persistent=(
-                        not profile_only
-                        and enforce_quality
-                    ),
+                    enforce_persistent=(not profile_only and enforce_quality),
                 )
                 gradient_quality: dict[str, dict[str, bool]] = {}
                 for name, gradient_record in gradient_records.items():
@@ -4723,10 +4692,7 @@ def _train_e2e_stability_loop(
                         for group, flags in family_quality_misses.items():
                             if (
                                 flags["finite_zero_norm"]
-                                or (
-                                    len(family_norms[group]) >= 2
-                                    and not flags["ratio_defined"]
-                                )
+                                or (len(family_norms[group]) >= 2 and not flags["ratio_defined"])
                                 or flags["ratio_threshold_missed"]
                                 or flags["persistent_ratio_threshold_missed"]
                             ):
@@ -4808,9 +4774,7 @@ def _train_e2e_stability_loop(
                                     {
                                         "kind": "end_ramp_precision",
                                         "step": global_step,
-                                        "quality_failures": end_ramp_precision[
-                                            "quality_failures"
-                                        ],
+                                        "quality_failures": end_ramp_precision["quality_failures"],
                                     }
                                 )
                         except Exception as error:
@@ -4874,19 +4838,14 @@ def _train_e2e_stability_loop(
                 "f_logit_std": fidelity["f_logit_std"],
                 "f_logit_auprc": fidelity["f_logit_auprc"],
                 "h_pairwise_cosine_mean": fidelity["h_pairwise_cosine_mean"],
-                "plan_rank1_marginal_residual": fidelity[
-                    "plan_rank1_marginal_residual"
-                ],
+                "plan_rank1_marginal_residual": fidelity["plan_rank1_marginal_residual"],
             }
             validation_nonfinite_failure = int(
                 not all(math.isfinite(value) for value in validation_quality_values.values())
             )
-            if (
-                not profile_only
-                and _e2e_should_capture_eligibility_reference(
-                    phase,
-                    warm_reference_auprc=warm_reference_auprc,
-                )
+            if not profile_only and _e2e_should_capture_eligibility_reference(
+                phase,
+                warm_reference_auprc=warm_reference_auprc,
             ):
                 warm_reference_auprc = fidelity["f_logit_auprc"]
             if warm_reference_std is not None and not validation_nonfinite_failure:
@@ -4935,9 +4894,7 @@ def _train_e2e_stability_loop(
                         "step": global_step,
                         "streak": slot_collapse_guard.streak,
                         "h_pairwise_cosine_mean": fidelity["h_pairwise_cosine_mean"],
-                        "plan_rank1_marginal_residual": fidelity[
-                            "plan_rank1_marginal_residual"
-                        ],
+                        "plan_rank1_marginal_residual": fidelity["plan_rank1_marginal_residual"],
                     }
                 )
             # `history` is written only when the run completes, and the
@@ -5361,6 +5318,7 @@ V_HOLD_VALIDATION_EVENTS_FILENAME = "v_hold_validation_events.jsonl"
 
 _MODEL_CONFIG_HASH_SCHEMA = "egostitch_e2e_model_config_v3"
 
+
 def model_config_hash(cfg: EgoConfig) -> str:
     """Hash the model-defining configuration for run provenance.
 
@@ -5544,16 +5502,12 @@ def write_outputs(
         else "formal_plan_selected"
     )
     classifier_config = cast(Mapping[str, object], cfg.model.config.get("classifier", {}))
-    validation_liveness_observed = (
-        result.best_epoch > 0
-        and (
-            classifier_config.get("permanent_null") != "none"
-            or any(
-                cast(dict[str, float], entry["fidelity"]).get("topology_delta_ratio", 0.0)
-                >= 1e-3
-                for entry in result.history
-                if int(cast(float, entry["epoch"])) == result.best_epoch
-            )
+    validation_liveness_observed = result.best_epoch > 0 and (
+        classifier_config.get("permanent_null") != "none"
+        or any(
+            cast(dict[str, float], entry["fidelity"]).get("topology_delta_ratio", 0.0) >= 1e-3
+            for entry in result.history
+            if int(cast(float, entry["epoch"])) == result.best_epoch
         )
     )
     run_metadata.update(
@@ -5706,9 +5660,7 @@ def _oracle_truth_graph(data: EgoStitchData, *, truth_source: str, run_kind: str
     return graph
 
 
-def _install_oracle_context(
-    model: EgoStitchModel, data: EgoStitchData, *, run_kind: str
-) -> None:
+def _install_oracle_context(model: EgoStitchModel, data: EgoStitchData, *, run_kind: str) -> None:
     """Install the oracle scaffold table for the ``oracle_struct`` generator arm.
 
     Runs once at startup, after the model is built and `_bind_feature_standardization`

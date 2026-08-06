@@ -14,6 +14,7 @@ Usage:
   hpc/run.sh check
   hpc/run.sh train <config.yaml> [train args...]
   hpc/run.sh score <score args...>
+  hpc/run.sh test <test args...>
   hpc/run.sh merge <merge args...>
   hpc/run.sh g1 <g1 args...>
   hpc/run.sh g2 <g2 args...>
@@ -26,16 +27,33 @@ after the config path to train a formal EgoStitch E2E config, or use
 `--run-kind diagnostic` only for a config explicitly consuming held-out truth
 (`model.family: egostitch_e2e`) instead. Direct `python -m src.train_b0
 --max-steps N` remains debug-only (bounded smoke runs); it is never a formal E2
-training run. The external CAZI-MBN reproduction is not an E2 packed-feature
-worker; select its isolated runner with `--worker-module src.train_cazi_mbn`.
-B0-alt keeps its own direct `python -m src.train_b0` CLI, unaffected by this
-distributed routing.
+training run. `src.e2_pipeline` runs four stages, `pack -> train -> publish ->
+test`: the test stage scores this checkpoint's held-out V_hold/test/candidate
+universes and writes `test_report.json` immediately after publish, so scoring
+is never a separate manual follow-up command; `--max-steps` debug runs skip it.
+Only `egostitch_e2e` is ledgered against repeat scoring — re-running an
+already-scored (arm, seed) fails unless `--rescore-reason <reason>` is passed
+through after the config path. The external CAZI-MBN reproduction is not an E2
+packed-feature worker; select its isolated runner with `--worker-module
+src.train_cazi_mbn`, which this branch runs to completion and then chains the
+same held-out test protocol against the checkpoint it publishes.
 
-The score command pins --device cuda --amp bf16. With multiple visible GPUs it
-launches one contiguous shard per GPU, waits for every shard, and strictly merges
-them into the requested output. merge/g1/g2 remain single-process while train uses
-all visible NVIDIA H20 GPUs. Use nohup in the calling shell when a run must
-survive disconnects.
+The score command is a thin passthrough to `python -m src.score_fanout`, which
+requires --timeout-seconds, auto-detects GPU count, pins --device cuda --amp
+bf16, launches one contiguous shard per visible GPU, waits for every shard, and
+strictly merges them into the requested output; this runner does not duplicate
+that sharding or validation.
+
+The test command is a thin passthrough to `python -m src.eval.test_protocol`
+for one published checkpoint: score val (V_hold) -> freeze the max-F1
+operating point -> score test -> edge metrics -> score candidate -> assembled-
+graph metrics -> `test_report.json`. `train` already runs this automatically
+for every trained arm; call `test` directly only for the two scoring-time
+controls (`structure_control_6a_v3`, `structure_control_6e_v1`), which reuse
+the `full` arm's checkpoint and have no pipeline run of their own.
+
+merge/g1/g2 remain single-process while train uses all visible NVIDIA H20
+GPUs. Use nohup in the calling shell when a run must survive disconnects.
 EOF
 }
 
@@ -70,62 +88,6 @@ assert_runtime() {
   export GPU_COUNT GPU_IDS CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 }
 
-parallel_score() {
-  local -a score_args=("$@")
-  local output=""
-  local arg_index
-  for ((arg_index = 0; arg_index < ${#score_args[@]}; arg_index++)); do
-    case "${score_args[arg_index]}" in
-      --output)
-        ((arg_index + 1 < ${#score_args[@]})) || fail "--output requires a path"
-        output="${score_args[arg_index + 1]}"
-        ;;
-      --shard|--num-shards)
-        fail "hpc/run.sh score owns sharding; do not pass ${score_args[arg_index]}"
-        ;;
-    esac
-  done
-  [[ -n "${output}" ]] || fail "score requires --output"
-  [[ "${output}" == *.npz ]] || fail "score output must end in .npz"
-
-  if [[ "${GPU_COUNT}" -eq 1 ]]; then
-    exec "${PYTHON_BIN}" -m src.score_universe score --device cuda --amp bf16 \
-      "${score_args[@]}"
-  fi
-
-  local stem="${output%.npz}"
-  local gpu
-  local rc=0
-  local -a pids=()
-  local -a shard_inputs=()
-  for ((gpu = 0; gpu < GPU_COUNT; gpu++)); do
-    shard_inputs+=("${stem}.shard-${gpu}.npz")
-    echo "launching score shard ${gpu}/${GPU_COUNT} on physical GPU ${gpu}"
-    CUDA_VISIBLE_DEVICES="${gpu}" "${PYTHON_BIN}" -m src.score_universe score \
-      --device cuda --amp bf16 "${score_args[@]}" --shard "${gpu}" \
-      --num-shards "${GPU_COUNT}" >"${stem}.shard-${gpu}.log" 2>&1 &
-    pids+=("$!")
-  done
-
-  trap 'for pid in "${pids[@]}"; do kill -TERM "${pid}" 2>/dev/null || true; done' INT TERM
-  for ((gpu = 0; gpu < GPU_COUNT; gpu++)); do
-    if ! wait "${pids[gpu]}"; then
-      echo "ERROR: score shard ${gpu}/${GPU_COUNT} failed; see ${stem}.shard-${gpu}.log" >&2
-      rc=1
-      break
-    fi
-  done
-  if [[ "${rc}" -ne 0 ]]; then
-    for pid in "${pids[@]}"; do
-      kill -TERM "${pid}" 2>/dev/null || true
-    done
-    wait || true
-    return "${rc}"
-  fi
-  trap - INT TERM
-  "${PYTHON_BIN}" -m src.score_universe merge --inputs "${shard_inputs[@]}" --output "${output}"
-}
-
 export PYTHONUNBUFFERED=1
 export UV_CACHE_DIR="/2023533015/.uv/cache"
 
@@ -152,12 +114,40 @@ case "${COMMAND}" in
     shift
     [[ -f "${CONFIG_PATH}" ]] || fail "config not found: ${CONFIG_PATH}"
     if [[ $# -eq 2 && "$1" == "--worker-module" && "$2" == "src.train_cazi_mbn" ]]; then
-      exec "${PYTHON_BIN}" -m src.train_cazi_mbn "${CONFIG_PATH}" --device cuda
+      # Not exec: the CAZI runner is not an E2 pack/train/publish/test worker,
+      # so this branch chains the same held-out test protocol itself once
+      # training publishes its checkpoint.
+      # --stage train, not the default --stage all: `all` runs CAZI's own
+      # score_and_evaluate, which reads the test pairs and the candidate
+      # universe before the chained protocol has scored V_hold and frozen its
+      # operating point. The test protocol below is the single owner of every
+      # held-out read for this arm.
+      "${PYTHON_BIN}" -m src.train_cazi_mbn "${CONFIG_PATH}" --device cuda --stage train
+      read -r CAZI_OUTPUT_DIR CAZI_STRATEGY CAZI_SEED CAZI_TEST_BUDGET < <("${PYTHON_BIN}" -c '
+import sys
+from pathlib import Path
+from src.train_cazi_mbn import load_config
+cfg = load_config(Path(sys.argv[1]))
+print(cfg.output_dir, cfg.strategy, cfg.seed, cfg.test_budget_seconds)
+' "${CONFIG_PATH}")
+      exec "${PYTHON_BIN}" -m src.eval.test_protocol \
+        --checkpoint "${CAZI_OUTPUT_DIR}/student.pt" \
+        --model-family cazi_mbn \
+        --model-config "${CONFIG_PATH}" \
+        --output-dir "${CAZI_OUTPUT_DIR}" \
+        --data-root "${DATA_ROOT}" \
+        --strategy "${CAZI_STRATEGY}" \
+        --arm cazi_mbn \
+        --seed "${CAZI_SEED}" \
+        --timeout-seconds "${CAZI_TEST_BUDGET}"
     fi
     exec "${PYTHON_BIN}" -m src.e2_pipeline --config "${CONFIG_PATH}" "$@"
     ;;
   score)
-    parallel_score "$@"
+    exec "${PYTHON_BIN}" -m src.score_fanout "$@"
+    ;;
+  test)
+    exec "${PYTHON_BIN}" -m src.eval.test_protocol "$@"
     ;;
   merge)
     exec "${PYTHON_BIN}" -m src.score_universe merge "$@"

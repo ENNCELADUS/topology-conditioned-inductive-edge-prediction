@@ -517,9 +517,7 @@ class ConditionedPairCrossAttention(PairCrossAttention):
             for _ in range(n_inj if conditioning_mode in ("xattn_cls", "xattn_tokens") else 0)
         )
         if conditioning_mode == "pooled_adapter":
-            self.pooled_adapter = nn.ModuleList(
-                PooledAdapter(d_model) for _ in range(n_inj)
-            )
+            self.pooled_adapter = nn.ModuleList(PooledAdapter(d_model) for _ in range(n_inj))
 
     def _inject_token_xattn(
         self,
@@ -562,9 +560,7 @@ class ConditionedPairCrossAttention(PairCrossAttention):
         split = (h_a.size(1), h_b.size(1))
         queries = torch.cat((h_a, h_b), dim=1)
         if pad_a is None or pad_b is None:
-            query_mask = torch.ones(
-                queries.shape[:2], dtype=torch.bool, device=queries.device
-            )
+            query_mask = torch.ones(queries.shape[:2], dtype=torch.bool, device=queries.device)
         else:
             query_mask = ~torch.cat((pad_a, pad_b), dim=1)
         updated = self.topo_xattn[inj](
@@ -632,12 +628,8 @@ class ConditionedPairCrossAttention(PairCrossAttention):
                 )
             elif mode == "pooled_adapter" and topo_pooled is not None:
                 delta = self.pooled_adapter[inj](topo_pooled)
-                h_a = h_a + torch.where(
-                    topo_active.view(-1, 1, 1), delta, torch.zeros_like(delta)
-                )
-                h_b = h_b + torch.where(
-                    topo_active.view(-1, 1, 1), delta, torch.zeros_like(delta)
-                )
+                h_a = h_a + torch.where(topo_active.view(-1, 1, 1), delta, torch.zeros_like(delta))
+                h_b = h_b + torch.where(topo_active.view(-1, 1, 1), delta, torch.zeros_like(delta))
         cls_vec = cls_token.squeeze(1)
         if self.pair_readout_mode == "pair_context_gated":
             # Full and hard-null heads differ only through the conditioned cls
@@ -893,9 +885,7 @@ class B0V31PairClassifier(PairClassifier):
                 # keeps the zero-init identity bit-exact.
                 film_ab, film_ba = film.chunk(2)
                 scale, shift = (0.5 * (film_ab + film_ba)).unbind(dim=-1)
-                logits = torch.where(
-                    masks.topo, logits * (1.0 + torch.tanh(scale)) + shift, logits
-                )
+                logits = torch.where(masks.topo, logits * (1.0 + torch.tanh(scale)) + shift, logits)
         return logits
 
 
@@ -988,8 +978,7 @@ class V3_1(nn.Module):
         )
         if not 0.0 <= self.label_smoothing < 1.0:
             raise ValueError(
-                "model_config.label_smoothing must be in [0.0, 1.0), got "
-                f"{self.label_smoothing}"
+                f"model_config.label_smoothing must be in [0.0, 1.0), got {self.label_smoothing}"
             )
 
         mlp_cfg_raw = model_config.get("mlp_head")

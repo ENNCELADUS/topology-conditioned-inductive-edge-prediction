@@ -534,9 +534,9 @@ def test_zscore_vfit_v1_registered_stats_actually_reach_the_forward_pass() -> No
     # and a per-dimension zscore diverge sharply on this shape, whereas they
     # would agree (up to floating point) on a roughly isotropic input.
     mean_vector = fixture_gen.uniform(10.0, 50.0, size=d_in).astype(np.float32)
-    stats_rows = mean_vector[None, :] + 0.5 * fixture_gen.standard_normal(
-        (64, d_in)
-    ).astype(np.float32)
+    stats_rows = mean_vector[None, :] + 0.5 * fixture_gen.standard_normal((64, d_in)).astype(
+        np.float32
+    )
     stats = compute_feature_stats(stats_rows, [f"n{i}" for i in range(64)])
 
     batch_gen = torch.Generator().manual_seed(1)
@@ -570,9 +570,7 @@ def test_zscore_vfit_v1_registered_stats_actually_reach_the_forward_pass() -> No
             cast(GatedCrossAttention, _classifier(model).trunk.topo_xattn[0]).gate.data.fill_(0.7)
 
     torch.manual_seed(0)
-    zscore_model = EgoStitchModel(
-        _tiny_e2e_config(feature_standardization="zscore_vfit_v1")
-    ).eval()
+    zscore_model = EgoStitchModel(_tiny_e2e_config(feature_standardization="zscore_vfit_v1")).eval()
     zscore_model.set_feature_stats(stats)
     _activate_conditioning_gates(zscore_model)
     with torch.no_grad():

@@ -78,10 +78,7 @@ _EXISTENCE_CHANNEL = 4
 
 def _slotset_to_aux(prefix: str, slots: SlotSet) -> dict[str, torch.Tensor]:
     """Flatten a `SlotSet` into `aux`'s ``{prefix}_{field}`` keys."""
-    return {
-        f"{prefix}_{field}": value
-        for field, value in zip(slots._fields, slots, strict=True)
-    }
+    return {f"{prefix}_{field}": value for field, value in zip(slots._fields, slots, strict=True)}
 
 
 def _slotset_from_aux(aux: Mapping[str, torch.Tensor], prefix: str) -> SlotSet:

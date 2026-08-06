@@ -48,10 +48,13 @@ uv sync                                                             # dependenci
 Use `-n0` when debugging — xdist swallows breakpoints. Tests in one file share state, so
 `--dist loadfile` is required, never `--dist load`.
 
-GPU work runs only in the H20 container via `hpc/run.sh` (`check | train | score | merge | g1 | g2`);
-world size and score shards are auto-detected from visible GPUs, and there is no scheduler. Config
-keys change meaning per `model.family`; direct `python -m src.train_b0` is debug-only. Runbook:
-`hpc/README.md` and the `hpc-execution` skill.
+GPU work runs only in the H20 container via `hpc/run.sh`
+(`check | train | score | test | merge | g1 | g2`); world size and score shards are
+auto-detected from visible GPUs, and there is no scheduler. `train` runs the held-out
+test protocol automatically after publish (skipped by `--max-steps` debug runs); `test`
+is also callable directly for the two scoring-time controls, which have no training run
+of their own. Config keys change meaning per `model.family`; direct `python -m
+src.train_b0` is debug-only. Runbook: `hpc/README.md` and the `hpc-execution` skill.
 
 ```bash
 hpc/run.sh train configs/b0_v31_breadth_first.yaml                  # baseline
@@ -79,9 +82,12 @@ score-once artifacts → gate and eval analyses.
   slot is chosen by the `name` field of its config section, so adding a component is one registry
   entry, never a change to `composite.py`. No encoder may read `ImaginedGraph.aux`: it is
   generator-private, and a generator swap invalidates it wholesale.
-- `src/train_{egostitch,b0,cazi_mbn}.py` DDP workers; `src/e2_pipeline.py` orchestrates
-  pack → train → publish; `src/score_universe.py` writes score-once artifacts; `src/experiments/`
-  holds the gate analyses (`g1_hardened_e2`, `g2_ceiling`, `g3_oracle`, `g5_stage1`, `probes`,
+- `src/train_{egostitch,b0,cazi_mbn}.py` DDP workers; `src/e2_pipeline.py` orchestrates the four
+  stages pack → train → publish → test; `src/score_universe.py` writes score-once artifacts;
+  `src/score_fanout.py` fans a score pass across visible GPUs and merges the shards (owns
+  `hpc/run.sh score`); `src/eval/test_protocol.py` runs one published checkpoint's held-out
+  V_hold → test → candidate sequence into `test_report.json`; `src/experiments/` holds the gate
+  analyses (`g1_hardened_e2`, `g2_ceiling`, `g3_oracle`, `g5_stage1`, `probes`,
   `observe_e2e_formal`) and `src/eval/` the edge/graph metrics, assembly, and calibration.
 
 Experiments run directly; there is no plan, registration, or qualification gate. Model-quality signals

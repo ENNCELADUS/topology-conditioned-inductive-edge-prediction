@@ -23,19 +23,15 @@ V3_CONFIGS = {
     # to "full" (design 2026-08-02 §9).
     "p0": REPO_ROOT / "configs/egostitch_e2e_v3_p0_breadth_first.yaml",
     "no_l_rel": REPO_ROOT / "configs/egostitch_e2e_v3_no_l_rel_breadth_first.yaml",
-    "row_layernorm": REPO_ROOT
-    / "configs/egostitch_e2e_v3_row_layernorm_breadth_first.yaml",
+    "row_layernorm": REPO_ROOT / "configs/egostitch_e2e_v3_row_layernorm_breadth_first.yaml",
     # Three-component refactor (design 2026-08-02 §3.3, §8, §12 P3):
     # `generator.name: "null"` demonstrates acceptance criterion 5 (a
     # config-only pure pairwise/B0 baseline) as a seventh formal arm sharing
     # the same data/runtime plumbing as the other six.
-    "null_generator": REPO_ROOT
-    / "configs/egostitch_e2e_v3_null_generator_breadth_first.yaml",
+    "null_generator": REPO_ROOT / "configs/egostitch_e2e_v3_null_generator_breadth_first.yaml",
 }
 # Historical only: retired from the trained set in v5 but retained on disk.
-RETIRED_COSINE_POOL_CONFIG = (
-    REPO_ROOT / "configs/egostitch_e2e_v3_cosine_pool_breadth_first.yaml"
-)
+RETIRED_COSINE_POOL_CONFIG = REPO_ROOT / "configs/egostitch_e2e_v3_cosine_pool_breadth_first.yaml"
 # Wave-1 oracle-scaffold experiment arms (design 2026-08-04): the oracle x
 # {grit_gmt conditioning ladder, ste reference}. The comparison baseline is the
 # existing B0 result, not a separately trained null-generator arm.
@@ -48,8 +44,7 @@ WAVE1_ORACLE_CONFIGS = {
     / "configs/egostitch_e2e_v3_oracle_grit_xattn_cls_breadth_first.yaml",
     "oracle_grit_xattn_tokens": REPO_ROOT
     / "configs/egostitch_e2e_v3_oracle_grit_xattn_tokens_breadth_first.yaml",
-    "oracle_ste_ref": REPO_ROOT
-    / "configs/egostitch_e2e_v3_oracle_ste_ref_breadth_first.yaml",
+    "oracle_ste_ref": REPO_ROOT / "configs/egostitch_e2e_v3_oracle_ste_ref_breadth_first.yaml",
 }
 
 
@@ -66,14 +61,10 @@ def test_wave1_oracle_runtime_and_supervision_contracts() -> None:
 
 def test_v3_live_arms_share_one_ng50_pack_and_grounding_cache() -> None:
     """v5+null-generator+wave-1: all trained arms are n_ground=50, one pack/cache."""
-    config_paths = sorted(
-        (REPO_ROOT / "configs").glob("egostitch_e2e_v3_*_breadth_first.yaml")
-    )
+    config_paths = sorted((REPO_ROOT / "configs").glob("egostitch_e2e_v3_*_breadth_first.yaml"))
     # The retired cosine_pool config stays on disk as history; no live arm uses it.
     assert set(config_paths) == (
-        set(V3_CONFIGS.values())
-        | {RETIRED_COSINE_POOL_CONFIG}
-        | set(WAVE1_ORACLE_CONFIGS.values())
+        set(V3_CONFIGS.values()) | {RETIRED_COSINE_POOL_CONFIG} | set(WAVE1_ORACLE_CONFIGS.values())
     )
     configs = []
     for path in sorted(set(V3_CONFIGS.values()) | set(WAVE1_ORACLE_CONFIGS.values())):
@@ -93,9 +84,7 @@ def test_v3_live_arms_share_one_ng50_pack_and_grounding_cache() -> None:
         )
 
     assert {config[1] for config in configs} == {50}
-    assert {config[2] for config in configs} == {
-        "outputs/feature_packs/egostitch_e2e_v_hold_ng50"
-    }
+    assert {config[2] for config in configs} == {"outputs/feature_packs/egostitch_e2e_v_hold_ng50"}
     assert len({config[3] for config in configs}) == 1
     assert len({config[4] for config in configs}) == 1
     assert len({config[5] for config in configs}) == 1

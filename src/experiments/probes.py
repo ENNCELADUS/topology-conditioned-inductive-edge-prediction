@@ -61,14 +61,11 @@ def _load_train_side_probe_inputs(
     if not isinstance(split_payload, dict) or "train" not in split_payload:
         raise ValueError("split.pkl must contain a train node collection")
     train_nodes = sorted(
-        set(cast(Sequence[str], split_payload["train"]))
-        - set(expected_missing_features)
+        set(cast(Sequence[str], split_payload["train"])) - set(expected_missing_features)
     )
     train_pairs, train_labels = _read_labeled_pairs(strategy_dir / "train_edges.txt")
     positives = [
-        pair
-        for pair, label in zip(train_pairs, train_labels, strict=True)
-        if int(label) == 1
+        pair for pair, label in zip(train_pairs, train_labels, strict=True) if int(label) == 1
     ]
     return train_nodes, positives
 
@@ -140,9 +137,7 @@ def pi_grounding_chain_consistency_v1(
         plan32 = plan.float()
         grounded = (gate_a[:, :, None] > 0.5) & (gate_b[:, None, :] > 0.5)
         eligible = same_real_grounded_identity & grounded
-        return (plan32 * eligible.float()).sum(dim=(1, 2)) / plan32.sum(
-            dim=(1, 2)
-        ).clamp_min(1e-30)
+        return (plan32 * eligible.float()).sum(dim=(1, 2)) / plan32.sum(dim=(1, 2)).clamp_min(1e-30)
 
 
 def pi_alignment_consistency_v2(
@@ -153,9 +148,9 @@ def pi_alignment_consistency_v2(
     _validate_pi_consistency_inputs(plan, same_identity_teacher_cells)
     with torch.autocast(device_type=plan.device.type, enabled=False):
         plan32 = plan.float()
-        return (plan32 * same_identity_teacher_cells.float()).sum(
+        return (plan32 * same_identity_teacher_cells.float()).sum(dim=(1, 2)) / plan32.sum(
             dim=(1, 2)
-        ) / plan32.sum(dim=(1, 2)).clamp_min(1e-30)
+        ).clamp_min(1e-30)
 
 
 def slot_recall_at_n_ground(
@@ -434,10 +429,7 @@ def write_e2e_probe_artifact(
         "Pi consistency v1": np.asarray(pi_consistency_v1, dtype=np.float64),
         "Pi consistency v2": np.asarray(pi_consistency_v2, dtype=np.float64),
         "shared-neighbor count": np.asarray(shared_neighbor_count, dtype=np.float64),
-        **{
-            name: np.asarray(values, dtype=np.float64)
-            for name, values in dispersion.items()
-        },
+        **{name: np.asarray(values, dtype=np.float64) for name, values in dispersion.items()},
     }
     if set(dispersion) != set(_DISPERSION_NAMES):
         raise ValueError(f"probe dispersion must be exactly {sorted(_DISPERSION_NAMES)}")
@@ -480,9 +472,7 @@ def write_e2e_probe_artifact(
         slot_recall_at_n_ground=np.asarray(slot_recall, dtype=np.float64),
         shared_neighbor_count=np.asarray(shared_neighbor_count, dtype=np.float64),
         pi_slot_std=np.asarray(dispersion["pi_slot_std"], dtype=np.float64),
-        h_pairwise_cosine_mean=np.asarray(
-            dispersion["h_pairwise_cosine_mean"], dtype=np.float64
-        ),
+        h_pairwise_cosine_mean=np.asarray(dispersion["h_pairwise_cosine_mean"], dtype=np.float64),
         adj_offdiag_std=np.asarray(dispersion["adj_offdiag_std"], dtype=np.float64),
         plan_row_entropy=np.asarray(dispersion["plan_row_entropy"], dtype=np.float64),
     )
@@ -563,8 +553,7 @@ def evaluate_e2e_probe_artifact(
         raise ValueError("E2E probe validation requires the registered arm's positive n_ground")
     if n_ground_value != registered_n_ground:
         raise ValueError(
-            "E2E probe n_ground mismatch: "
-            f"probe={n_ground_value}, registered={registered_n_ground}"
+            f"E2E probe n_ground mismatch: probe={n_ground_value}, registered={registered_n_ground}"
         )
     for key, expected in expected_metadata.items():
         if key == "n_ground":
@@ -751,9 +740,7 @@ def produce_e2e_probe_artifact(
         formal_model_cfg.classifier.permanent_null != "none"
         or formal_model_cfg.classifier.p_topo != 0.15
     ):
-        raise ValueError(
-            "E2E probe producer requires full-arm permanent_null=none and p_topo=0.15"
-        )
+        raise ValueError("E2E probe producer requires full-arm permanent_null=none and p_topo=0.15")
     if cfg.data.root.resolve() != data_root.resolve() or cfg.data.strategy != strategy:
         raise ValueError("probe CLI data root/strategy do not match the formal config")
     # Multi-seed runs are permitted, so the model seed is only required to be a
@@ -1064,8 +1051,7 @@ def produce_e2e_probe_artifact(
         ),
         shared_neighbor_count=np.asarray(shared_neighbor_counts, dtype=np.float64),
         dispersion={
-            name: np.asarray(values, dtype=np.float64)
-            for name, values in dispersion_rows.items()
+            name: np.asarray(values, dtype=np.float64) for name, values in dispersion_rows.items()
         },
     )
 

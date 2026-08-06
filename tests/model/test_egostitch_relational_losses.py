@@ -51,17 +51,14 @@ def test_teacher_cells_follow_same_real_shared_neighbor_on_hand_built_graph() ->
     graph = nx.Graph([("u", "w"), ("v", "w"), ("u", "x")])
     node_index = {node: index for index, node in enumerate(sorted(graph.nodes))}
     feature = {
-        node: torch.tensor([float(index), float(index**2)])
-        for node, index in node_index.items()
+        node: torch.tensor([float(index), float(index**2)]) for node, index in node_index.items()
     }
 
     target_a = torch.stack([feature[node] for node in sorted(graph.neighbors("u"))])[None]
     target_b = torch.stack([feature[node] for node in sorted(graph.neighbors("v"))])[None]
     # Endpoint-a slots deliberately reverse the target order; Hungarian must recover it.
     slots_a = _slots(target_a.flip(1).clone().requires_grad_())
-    slots_b = _slots(
-        torch.cat([target_b, torch.tensor([[[99.0, 99.0]]])], dim=1).requires_grad_()
-    )
+    slots_b = _slots(torch.cat([target_b, torch.tensor([[[99.0, 99.0]]])], dim=1).requires_grad_())
     assignment_a = _match(slots_a, target_a, torch.ones(1, 2, dtype=torch.bool))
     assignment_b = _match(slots_b, target_b, torch.ones(1, 1, dtype=torch.bool))
     target_ids_a = torch.tensor(
@@ -192,12 +189,8 @@ def test_masked_alignment_reduction_ignores_duplicated_filler_rows() -> None:
 class _ToyRelationalParameters(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.align_h_a = nn.Parameter(
-            torch.tensor([[0.2, -0.1], [0.7, 0.3]], dtype=torch.float32)
-        )
-        self.align_h_b = nn.Parameter(
-            torch.tensor([[0.1, 0.4], [0.6, -0.2]], dtype=torch.float32)
-        )
+        self.align_h_a = nn.Parameter(torch.tensor([[0.2, -0.1], [0.7, 0.3]], dtype=torch.float32))
+        self.align_h_b = nn.Parameter(torch.tensor([[0.1, 0.4], [0.6, -0.2]], dtype=torch.float32))
         self.rel_head = nn.Sequential(nn.Linear(3, 4), nn.GELU(), nn.Linear(4, 2))
 
     def plans(self, pair_ids: torch.Tensor, *, ba_mask: torch.Tensor) -> torch.Tensor:
@@ -271,9 +264,9 @@ def _combined_loss(
     teacher_ab, full_targets = _world_size_teacher_and_targets()
     teacher = teacher_ab.index_select(0, pair_ids)
     teacher = torch.where(ba_mask.view(-1, 1, 1), teacher.transpose(1, 2), teacher)
-    pair_states = torch.tensor(
-        [[0.2, -0.4, 0.7], [0.5, 0.1, -0.2], [-0.3, 0.8, 0.4]]
-    ).index_select(0, pair_ids)
+    pair_states = torch.tensor([[0.2, -0.4, 0.7], [0.5, 0.1, -0.2], [-0.3, 0.8, 0.4]]).index_select(
+        0, pair_ids
+    )
     targets = full_targets.index_select(0, pair_ids)
     align = alignment_loss(
         model.plans(pair_ids, ba_mask=ba_mask),

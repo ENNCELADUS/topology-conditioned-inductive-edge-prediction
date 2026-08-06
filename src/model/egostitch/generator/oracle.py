@@ -544,9 +544,7 @@ class OracleStructGenerator(
         self._f0_row_to_table_row = f0_row_to_table_row
         self._device_cache: dict[torch.device, tuple[OracleScaffoldTable, torch.Tensor]] = {}
 
-    def _context_for(
-        self, device: torch.device
-    ) -> tuple[OracleScaffoldTable, torch.Tensor]:
+    def _context_for(self, device: torch.device) -> tuple[OracleScaffoldTable, torch.Tensor]:
         """Return the table and lookup on `device`, moving and caching on first use."""
         if self._table is None or self._f0_row_to_table_row is None:
             raise RuntimeError(
@@ -918,4 +916,3 @@ class OracleStructGenerator(
         shape depends on a learned configuration.
         """
         return FEAT_DIM, EDGE_TYPES
-

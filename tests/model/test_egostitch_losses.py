@@ -276,8 +276,14 @@ class TestReconLosses:
 
     def test_diversity_threshold_and_matched_pair_exclusion(self) -> None:
         orthogonal = torch.tensor(
-            [[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0],
-              [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]]
+            [
+                [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]
+            ]
         )
         targets = self._targets()
         one_match = Assignment([np.array([0])], [np.array([0])])

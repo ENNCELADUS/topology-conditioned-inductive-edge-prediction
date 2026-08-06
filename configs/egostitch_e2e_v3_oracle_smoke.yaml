@@ -117,3 +117,4 @@ runtime:
   pack_budget_seconds: 60
   train_eval_budget_seconds: 500
   artifact_budget_seconds: 40
+  test_budget_seconds: 120

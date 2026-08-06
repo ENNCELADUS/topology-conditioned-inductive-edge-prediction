@@ -173,9 +173,7 @@ class TestBatchFactoryE2E:
         graph.add_nodes_from(nodes)
         graph.add_edges_from((nodes[0], node) for node in nodes[1:])
         pool = {
-            node: [candidate for candidate in nodes if candidate != node][
-                : model_cfg.n_ground
-            ]
+            node: [candidate for candidate in nodes if candidate != node][: model_cfg.n_ground]
             for node in nodes
         }
         grounding_index = np.array(
@@ -225,9 +223,7 @@ class TestBatchFactoryE2E:
             model_cfg,
         )
 
-    def test_zero_parameter_generator_batch_omits_unused_supervision(
-        self, tmp_path: Path
-    ) -> None:
+    def test_zero_parameter_generator_batch_omits_unused_supervision(self, tmp_path: Path) -> None:
         factory, model_cfg = self._target_factory(
             tmp_path,
             generator_supervision=False,
@@ -377,9 +373,7 @@ class TestBatchFactoryE2E:
         assert (edge["target_node_index_i"][1:] == -1).all()
         assert (edge["target_node_index_j"][1:] == -1).all()
 
-    def test_nonedge_shared_neighbor_has_nonzero_relational_targets(
-        self, tmp_path: Path
-    ) -> None:
+    def test_nonedge_shared_neighbor_has_nonzero_relational_targets(self, tmp_path: Path) -> None:
         factory, _ = self._target_factory(tmp_path)
         # Leaves 01 and 02 are a non-edge but share hub 00.
         edge, _ = factory._edge_tensors(
@@ -713,15 +707,12 @@ class TestE2ECompositeStep:
 
         encoder = te._require_encoder(model)
         ste_gradients = [
-            parameter.grad
-            for parameter in encoder.parameters()
-            if parameter.requires_grad
+            parameter.grad for parameter in encoder.parameters() if parameter.requires_grad
         ]
         assert ste_gradients
         assert all(gradient is not None for gradient in ste_gradients)
         assert any(
-            bool(torch.count_nonzero(cast(torch.Tensor, gradient)))
-            for gradient in ste_gradients
+            bool(torch.count_nonzero(cast(torch.Tensor, gradient))) for gradient in ste_gradients
         )
         assert captured_log_plans
         assert all(log_plan.grad is not None for log_plan in captured_log_plans)
@@ -753,12 +744,9 @@ class TestE2ECompositeStep:
         )
         ste_before = [parameter.detach().clone() for parameter in encoder.parameters()]
         assert encoder.rel_head is not None
-        rel_before = [
-            parameter.detach().clone() for parameter in encoder.rel_head.parameters()
-        ]
+        rel_before = [parameter.detach().clone() for parameter in encoder.rel_head.parameters()]
         pair_before = [
-            parameter.detach().clone()
-            for parameter in parameter_groups.groups["classifier"]
+            parameter.detach().clone() for parameter in parameter_groups.groups["classifier"]
         ]
         optimizer.step()
         assert any(
@@ -778,9 +766,7 @@ class TestE2ECompositeStep:
             )
         )
 
-    def test_no_rel_head_survives_warmstart_step_and_family_probe(
-        self, tmp_path: Path
-    ) -> None:
+    def test_no_rel_head_survives_warmstart_step_and_family_probe(self, tmp_path: Path) -> None:
         torch.manual_seed(0)
         batch, model = self._batch_and_model(tmp_path, w_rel=0.0)
         assert te._require_encoder(model).rel_head is None
@@ -788,10 +774,7 @@ class TestE2ECompositeStep:
         parameter_groups = te.build_e2e_parameter_groups(model)
         phase = te.E2EPhaseState("A", 0.0, False, 0.0)
         optimizer = torch.optim.AdamW(
-            [
-                {"params": parameters, "lr": 1e-3}
-                for parameters in parameter_groups.groups.values()
-            ]
+            [{"params": parameters, "lr": 1e-3} for parameters in parameter_groups.groups.values()]
         )
 
         with self._bf16_autocast():
@@ -970,9 +953,7 @@ class TestE2ECompositeStep:
         together end to end.
         """
         torch.manual_seed(0)
-        batch, model = self._batch_and_model(
-            tmp_path, feature_standardization="zscore_vfit_v1"
-        )
+        batch, model = self._batch_and_model(tmp_path, feature_standardization="zscore_vfit_v1")
         # Offset and anisotropic per-dimension statistics so the registered
         # transform actually rescales/recenters each feature dimension
         # differently, rather than degenerating to a no-op.
@@ -1045,9 +1026,7 @@ class TestE2ECompositeStep:
         assert telemetry["quality_pass"] is False
 
     @pytest.mark.parametrize("enforce_quality", [True, False])
-    def test_precision_nonfinite_inputs_remain_hard(
-        self, enforce_quality: bool
-    ) -> None:
+    def test_precision_nonfinite_inputs_remain_hard(self, enforce_quality: bool) -> None:
         finite = torch.ones(3)
         nonfinite = torch.tensor([1.0, float("nan"), 2.0])
         with pytest.raises(te._E2EPrecisionNumericalError, match="non-finite.*input"):
@@ -1266,9 +1245,7 @@ class TestE2ECompositeStep:
                 )
                 out = cast(dict[str, object], self.inner(values))
                 families = cast(dict[str, torch.Tensor], out.get("families", {}))
-                self.previous = {
-                    name: weakref.ref(tensor) for name, tensor in families.items()
-                }
+                self.previous = {name: weakref.ref(tensor) for name, tensor in families.items()}
                 self.forwards += 1
                 return out
 
@@ -1326,9 +1303,7 @@ class TestE2ECompositeStep:
                 accelerator,
                 require_live_gradients=False,
             )
-        assert any(
-            norm == 0.0 for norms in family_norms.values() for norm in norms.values()
-        )
+        assert any(norm == 0.0 for norms in family_norms.values() for norm in norms.values())
 
     def test_profile_loop_executes_real_optimizer_and_validation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1404,9 +1379,10 @@ class TestE2ECompositeStep:
         assert step_0_guard_calls == [0], "step-0 guard must run once, before the first step"
         assert result.runtime_profile is not None
         assert result.runtime_profile["v_hold_validation_event_count"] == 2
-        assert [
-            row["kind"] for row in result.runtime_profile["v_hold_validation_events"]
-        ] == ["step_0", "epoch_end"]
+        assert [row["kind"] for row in result.runtime_profile["v_hold_validation_events"]] == [
+            "step_0",
+            "epoch_end",
+        ]
         assert result.runtime_profile["total_optimizer_steps"] > 0
         assert (
             len(result.runtime_profile["optimizer_step_gradients"])
@@ -1707,12 +1683,8 @@ def _uncached_validation_reference(
             assert context.plan is not None
             slots_a = te._require_slots(state_a)
             slots_b = te._require_slots(state_b)
-            dispersion_a = te._e2e_dispersion_rows(
-                slots_a.pi, slots_a.h, slots_a.adj, context.plan
-            )
-            dispersion_b = te._e2e_dispersion_rows(
-                slots_b.pi, slots_b.h, slots_b.adj, context.plan
-            )
+            dispersion_a = te._e2e_dispersion_rows(slots_a.pi, slots_a.h, slots_a.adj, context.plan)
+            dispersion_b = te._e2e_dispersion_rows(slots_b.pi, slots_b.h, slots_b.adj, context.plan)
             dispersion = {
                 name: (
                     0.5 * (dispersion_a[name] + dispersion_b[name])
@@ -2327,9 +2299,7 @@ def _holdout_e2e_cfg(
     cfg = _toy_cfg(tmp_path)
     return replace(
         cfg,
-        model=ModelConfig(
-            family="egostitch_e2e", config={"generator": {"n_ground": n_ground}}
-        ),
+        model=ModelConfig(family="egostitch_e2e", config={"generator": {"n_ground": n_ground}}),
         data=replace(cfg.data, pack_dir=tmp_path / "raw-token-pack"),
         training=te.EgoStitchTrainingConfig(),
     )
@@ -2377,7 +2347,6 @@ class TestPrepareAndAssembleE2E:
         )
         assert audit["training_feature_stats_rows"] == data.feature_stats.n_rows
         assert data.feature_stats.n_rows == len(data.train_nodes)
-
 
     def test_assembly_statistics_ignore_sealed_validation_rows(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2584,7 +2553,6 @@ class TestFeatureStandardizationBinding:
 
         assert te._bind_feature_standardization(model, cfg, data) == ""
         assert model.feature_stats_digest_hex == ""
-
 
     def test_binding_allows_an_empty_pin_for_the_debug_run_kind(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

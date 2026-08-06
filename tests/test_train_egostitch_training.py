@@ -110,14 +110,6 @@ def test_e2e_config_schema_is_strict_and_preserves_run_kind(tmp_path: Path) -> N
         te.load_config(bad)
 
 
-
-
-
-
-
-
-
-
 def test_formal_output_metadata_matches_scorer_contract(tmp_path: Path) -> None:
     """The only end-to-end check that ``run_metadata.json`` is well-formed.
 
@@ -210,10 +202,6 @@ def test_formal_output_metadata_matches_scorer_contract(tmp_path: Path) -> None:
     ]
 
 
-
-
-
-
 def test_e2e_three_phase_boundaries_and_first_eligibility() -> None:
     assert te.e2e_phase_boundaries(2000) == (400, 600)
     warm = te.e2e_phase_state(399, 2000)
@@ -226,10 +214,6 @@ def test_e2e_three_phase_boundaries_and_first_eligibility() -> None:
     assert te.e2e_phase_state(600, 2000) == te.E2EPhaseState("C", 1.0, True, 1.0)
     assert "pair_only" not in te.E2EPhaseState.__dataclass_fields__
     assert te.e2e_first_eligible_epoch(3000, 100) == 10
-
-
-
-
 
 
 def test_e2e_recon_anneal_factors_are_component_specific_by_name() -> None:
@@ -269,9 +253,7 @@ def test_slot_collapse_guard_telemeters_two_consecutive_quality_misses() -> None
 
     telemetry_guard = te.E2ESlotCollapseGuard()
     telemetry_guard.update(cosine_collapse, conditioning_active=True)
-    assert telemetry_guard.update(
-        cosine_collapse, conditioning_active=True, enforce_quality=False
-    )
+    assert telemetry_guard.update(cosine_collapse, conditioning_active=True, enforce_quality=False)
     with pytest.raises(RuntimeError, match="non-finite E2E slot-collapse telemetry"):
         telemetry_guard.update(
             {**healthy, "h_pairwise_cosine_mean": float("nan")},
@@ -283,9 +265,7 @@ def test_slot_collapse_guard_telemeters_two_consecutive_quality_misses() -> None
 def test_family_ratio_guard_telemeters_finite_quality_misses_but_not_nonfinite() -> None:
     zero = {"generator": {"edge": 0.0, "recon": 0.0}}
     telemetry_guard = te._E2EFamilyRatioGuard(threshold=2.0, required_probes=2)
-    assert telemetry_guard.update(zero, enabled=True, enforce_quality=False) == {
-        "generator": 0.0
-    }
+    assert telemetry_guard.update(zero, enabled=True, enforce_quality=False) == {"generator": 0.0}
     assert telemetry_guard.ratio_defined == {"generator": False}
 
     imbalanced = {"generator": {"edge": 10.0, "recon": 1.0, "ssl": 1.0}}
@@ -405,9 +385,7 @@ class TestScaleTelemetry:
         rows = te._e2e_scale_rows(h, plan)
 
         torch.testing.assert_close(rows["plan_total_mass"], torch.tensor([4.0, 3.0]))
-        torch.testing.assert_close(
-            rows["plan_max_cell_fraction"], torch.tensor([0.5, 1.0])
-        )
+        torch.testing.assert_close(rows["plan_max_cell_fraction"], torch.tensor([0.5, 1.0]))
 
     def test_scale_rows_rejects_shape_mismatch_between_h_and_plan(self) -> None:
         with pytest.raises(ValueError, match="plan shape disagrees"):
@@ -501,27 +479,12 @@ def test_e2e_lr_and_active_groups_follow_registered_phase_contract() -> None:
     assert te._e2e_active_groups(phase_c, full_model) == {"classifier", "encoder"}
     full_phase_a_groups = te._e2e_active_groups(phase_a, full_model)
     full_edge_groups = te._e2e_active_groups(first_edge, full_model)
-    assert (
-        te._e2e_optimizer_group_lr(
-            1e-4, phase_a, "encoder", full_phase_a_groups
-        )
-        == 1e-4
-    )
+    assert te._e2e_optimizer_group_lr(1e-4, phase_a, "encoder", full_phase_a_groups) == 1e-4
     assert te._e2e_optimizer_group_lr(
         1e-4, first_edge, "encoder", full_edge_groups
     ) == pytest.approx(1e-4 * first_edge.alpha)
-    assert (
-        te._e2e_optimizer_group_lr(1e-4, phase_a, "classifier", full_phase_a_groups)
-        == 0.0
-    )
-    assert (
-        te._e2e_optimizer_group_lr(1e-4, first_edge, "classifier", full_edge_groups)
-        == 1e-4
-    )
-
-
-
-
+    assert te._e2e_optimizer_group_lr(1e-4, phase_a, "classifier", full_phase_a_groups) == 0.0
+    assert te._e2e_optimizer_group_lr(1e-4, first_edge, "classifier", full_edge_groups) == 1e-4
 
 
 def test_e2e_weighted_bce_matches_one_and_two_rank_gradients_with_padding() -> None:
@@ -606,8 +569,6 @@ def test_e2e_parameter_groups_are_disjoint_exhaustive_and_exclude_kendall() -> N
         "classifier",
     }
     assert all(len(digest) == 64 for digest in manifest.sha256.values())
-
-
 
 
 def _record(epoch: int, *, mmd: float, brier: float, auprc: float = 0.6) -> te.E2ECheckpointRecord:

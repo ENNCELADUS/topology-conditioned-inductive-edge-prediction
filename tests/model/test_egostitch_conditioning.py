@@ -240,9 +240,7 @@ def test_gated_xattn_inactive_row_is_checkpoint_exact_with_ema_mu() -> None:
 
 
 def test_gated_xattn_eval_is_deterministic() -> None:
-    attention_output = torch.tensor(
-        [[[1.0, 2.0, 3.0, 4.0]], [[3.0, 4.0, 5.0, 6.0]]]
-    )
+    attention_output = torch.tensor([[[1.0, 2.0, 3.0, 4.0]], [[3.0, 4.0, 5.0, 6.0]]])
     module = GatedCrossAttention(d_model=4, n_heads=1, dropout=0.0)
     module.attn = _FixedAttention(attention_output)
     with torch.no_grad():
@@ -369,9 +367,7 @@ def test_gated_xattn_world_size_invariant_mu_and_activations(
 
 
 def test_gated_xattn_padded_filler_rows_do_not_contribute_to_mu() -> None:
-    attention_output = torch.tensor(
-        [[[1.0, 1.0, 1.0, 1.0]], [[3.0, 3.0, 3.0, 3.0]], [[999.0] * 4]]
-    )
+    attention_output = torch.tensor([[[1.0, 1.0, 1.0, 1.0]], [[3.0, 3.0, 3.0, 3.0]], [[999.0] * 4]])
     module = GatedCrossAttention(d_model=4, n_heads=1, dropout=0.0)
     module.attn = _FixedAttention(attention_output)
     module.train()

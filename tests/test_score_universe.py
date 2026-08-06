@@ -6,7 +6,9 @@ All tests are synthetic: tiny fake feature roots and pair files built under
 
 from __future__ import annotations
 
+import argparse
 import json
+import pickle
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -322,9 +324,7 @@ def test_default_e2e_grounding_cache_path_is_namespaced_by_pool_configuration(
 ) -> None:
     f0_cache = tmp_path / "f0_matrix.pt"
     universe = ["node-a", "node-b", "node-c"]
-    full = score_universe._default_grounding_cache_path(
-        f0_cache, n_ground=50, node_ids=universe
-    )
+    full = score_universe._default_grounding_cache_path(f0_cache, n_ground=50, node_ids=universe)
     narrow_pool = score_universe._default_grounding_cache_path(
         f0_cache, n_ground=20, node_ids=universe
     )
@@ -1963,3 +1963,522 @@ def test_egostitch_e2e_scorer_warns_on_n_ground_clamp(
     assert str(registered_n_ground) in message
     assert str(expected_n_ground) in message
     assert str(node_universe) in message
+
+
+# --------------------------------------------------------------------------- v_hold pairs source
+# (fix 1: the real internal-holdout validation universe, not val_edges.txt)
+
+# A 25-node ring gives one connected component large enough for two disjoint
+# `holdout_size=4` BFS draws (test_train_egostitch_boundary.py's own fixture
+# size for the identical reason), so `derive_internal_holdout` runs for real
+# rather than through a hand-rolled substitute.
+_V_HOLD_NODES = [f"h{i}" for i in range(25)]
+
+
+def _tiny_internal_holdout(monkeypatch: pytest.MonkeyPatch, *, holdout_size: int = 4) -> None:
+    """Monkeypatch `score_universe.derive_internal_holdout` to a size the ring fixture satisfies."""
+    from src.data.internal_holdout import InternalHoldoutPartition
+    from src.data.internal_holdout import derive_internal_holdout as real_derive
+
+    def tiny(train_nodes: object, training_interactions: object) -> InternalHoldoutPartition:
+        return real_derive(
+            cast("list[str]", train_nodes),
+            cast("frozenset[tuple[str, str]]", training_interactions),
+            holdout_size=holdout_size,
+        )
+
+    monkeypatch.setattr(score_universe, "derive_internal_holdout", tiny)
+
+
+def _write_v_hold_benchmark_package(tmp_path: Path, *, strategy: str = "breadth_first") -> Path:
+    """Write `split.pkl`/`train_edges.txt` for the 25-node ring under `tmp_path/data`."""
+    strategy_dir = tmp_path / "data" / "benchmark_2025_neurips" / strategy
+    strategy_dir.mkdir(parents=True, exist_ok=True)
+    with (strategy_dir / "split.pkl").open("wb") as handle:
+        pickle.dump({"train": _V_HOLD_NODES, "test": []}, handle)
+    edges = [
+        (_V_HOLD_NODES[i], _V_HOLD_NODES[(i + 1) % len(_V_HOLD_NODES)])
+        for i in range(len(_V_HOLD_NODES))
+    ]
+    (strategy_dir / "train_edges.txt").write_text(
+        "".join(f"{u}\t{v}\t1\n" for u, v in edges), encoding="utf-8"
+    )
+    return tmp_path / "data"
+
+
+def _v_hold_e2e_setup(
+    tmp_path: Path, *, model_config: dict[str, object] | None = None
+) -> tuple[Path, Path]:
+    """Feature store (25 ring nodes) + benchmark package + `egostitch_e2e` checkpoint."""
+    data_root = _write_v_hold_benchmark_package(tmp_path)
+    torch.manual_seed(0)
+    node_tokens = {node: torch.randn(3, _E2E_NODE_DIM) for node in _V_HOLD_NODES}
+    _write_feature_store(
+        data_root / "features" / "frozen_node_features_1024", node_tokens, input_dim=_E2E_NODE_DIM
+    )
+    config = dict(_TINY_E2E_CONFIG if model_config is None else model_config)
+    model = score_universe.build_model("egostitch_e2e", config)
+    checkpoint_path = tmp_path / "egostitch_e2e_v_hold.pt"
+    _write_checkpoint(
+        checkpoint_path, model=model, model_family="egostitch_e2e", model_config=config
+    )
+    return data_root, checkpoint_path
+
+
+def test_resolve_v_hold_pairs_matches_internal_holdout_manifest_bit_for_bit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--pairs v_hold` must be `derive_internal_holdout`'s own manifest, not `val_edges.txt`."""
+    from src.data.internal_holdout import derive_internal_holdout
+    from src.data.partition import derive_training_interactions
+
+    _tiny_internal_holdout(monkeypatch)
+    data_root = _write_v_hold_benchmark_package(tmp_path)
+
+    pairs, labels = score_universe._resolve_pairs("v_hold", data_root, "breadth_first")
+
+    strategy_dir = data_root / "benchmark_2025_neurips" / "breadth_first"
+    with (strategy_dir / "split.pkl").open("rb") as handle:
+        split_payload = pickle.load(handle)  # noqa: S301
+    train_pairs, train_labels = score_universe._read_pairs_tsv(strategy_dir / "train_edges.txt")
+    positives = [
+        pair for pair, label in zip(train_pairs, train_labels.tolist(), strict=True) if label == 1
+    ]
+    interactions = derive_training_interactions(positives)
+    expected = derive_internal_holdout(
+        sorted(split_payload["train"]), interactions.positives, holdout_size=4
+    )
+
+    assert pairs == list(expected.hold_manifest.pairs)
+    np.testing.assert_array_equal(labels, np.asarray(expected.hold_manifest.labels, dtype=np.int8))
+    assert expected.hold_manifest.positive_count > 0, "fixture must produce a real V_hold topology"
+    # Not the benchmark's own model-selection manifest: no val_edges.txt exists
+    # at all in this fixture, so a wrong implementation reading it would raise
+    # before ever reaching the assertions above.
+    assert not (strategy_dir / "val_edges.txt").exists()
+
+
+def test_v_hold_pairs_source_is_never_a_heldout_universe() -> None:
+    assert (
+        score_universe._is_heldout_universe(
+            {"model_family": "egostitch_e2e", "pairs_source": "v_hold"}
+        )
+        is False
+    )
+
+
+def test_v_hold_scoring_never_writes_a_ledger_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--pairs v_hold` needs no `--run-metadata` and must never touch the test-access ledger."""
+    _tiny_internal_holdout(monkeypatch)
+    data_root, checkpoint = _v_hold_e2e_setup(tmp_path)
+    output = tmp_path / "v_hold.npz"
+
+    score_universe.main(
+        [
+            "score",
+            "--checkpoint",
+            str(checkpoint),
+            "--pairs",
+            "v_hold",
+            "--data-root",
+            str(data_root),
+            "--output",
+            str(output),
+            "--token-budget",
+            "8192",
+            "--f0-cache",
+            str(tmp_path / "f0_cache.pt"),
+            "--device",
+            "cpu",
+        ]
+    )
+
+    artifact = score_universe.load_scores(output)
+    assert artifact.meta["pairs_source"] == "v_hold"
+    assert artifact.meta["heldout"] is False
+    assert "test_access_ledger" not in artifact.meta
+    assert not list(tmp_path.rglob("test_access_ledger.jsonl")), (
+        "v_hold scoring must never append to any test-access ledger"
+    )
+
+
+# --------------------------------------------------------------------------- cazi_mbn scoring
+# (fix 3: the released `{"state_dict": ...}` checkpoint format and its own
+# feature-standardization path)
+
+
+def _write_cazi_config(
+    tmp_path: Path,
+    *,
+    output_dir: Path,
+    latent_dim: int,
+    network_layers: int,
+    missing_features: list[str] | None = None,
+) -> Path:
+    """Write a minimal but fully valid CAZI-MBN training YAML (JSON is valid YAML)."""
+    config_path = tmp_path / "cazi.yaml"
+    payload = {
+        "model": {
+            "order": 2,
+            "topology_dim": 8,
+            "latent_dim": latent_dim,
+            "network_layers": network_layers,
+            "heads": 2,
+        },
+        "data": {
+            "root": "data",
+            "strategy": "breadth_first",
+            "f0_cache": str(tmp_path / "unused_f0_cache.pt"),
+            "expected_missing_features": missing_features or [],
+        },
+        "optim": {
+            "learning_rate": 1e-3,
+            "weight_decay": 0.0,
+            "teacher_epochs": 1,
+            "student_epochs": 1,
+            "patience": 1,
+        },
+        "loss": {
+            "discriminator_coef": 1.0,
+            "regularization_coef": 1.0,
+            "classification_coef": 1.0,
+            "distillation_weight": 0.5,
+            "supervised_weight": 0.5,
+        },
+        "runtime": {"batch_size": 4, "score_batch_size": 4, "test_budget_seconds": 60},
+        "seed": 0,
+        "output_dir": str(output_dir),
+    }
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    return config_path
+
+
+def _write_cazi_checkpoint_and_config(
+    tmp_path: Path,
+    *,
+    sequence_dim: int,
+    latent_dim: int,
+    network_layers: int,
+    missing_features: list[str] | None = None,
+) -> tuple[Path, Path, Path]:
+    """Released-format `student.pt` + its training YAML + a matching `feature_stats.npz`."""
+    from src.baselines.cazi_mbn import CAZIStudent
+    from src.data.feature_stats import compute_feature_stats, save_feature_stats
+
+    torch.manual_seed(0)
+    model = CAZIStudent(sequence_dim, latent_dim=latent_dim, network_layers=network_layers)
+    model.eval()
+
+    output_dir = tmp_path / "cazi_out"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # `src.train_cazi_mbn` writes `student.pt` and `feature_stats.npz` into the
+    # same run directory, and scoring resolves the statistics beside the
+    # checkpoint so an `--output-dir` override cannot pick up another run's.
+    checkpoint_path = output_dir / "student.pt"
+    torch.save({"state_dict": model.state_dict(), "best_val_auroc": 0.75}, checkpoint_path)
+
+    rng = np.random.default_rng(0)
+    rows = rng.normal(size=(4, sequence_dim)).astype(np.float32)
+    stats = compute_feature_stats(rows, [f"s{i}" for i in range(4)])
+    save_feature_stats(stats, output_dir / "feature_stats.npz")
+
+    config_path = _write_cazi_config(
+        tmp_path,
+        output_dir=output_dir,
+        latent_dim=latent_dim,
+        network_layers=network_layers,
+        missing_features=missing_features,
+    )
+    return checkpoint_path, config_path, output_dir
+
+
+def test_build_cazi_mbn_infers_architecture_from_checkpoint_state_dict() -> None:
+    from src.baselines.cazi_mbn import CAZIStudent
+
+    torch.manual_seed(0)
+    reference = CAZIStudent(6, latent_dim=3, network_layers=2)
+    inferred_config = score_universe._cazi_model_config_from_state(reference.state_dict())
+    assert inferred_config == {"sequence_dim": 6, "latent_dim": 3, "network_layers": 2}
+    rebuilt = score_universe.build_model("cazi_mbn", inferred_config)
+    assert isinstance(rebuilt, CAZIStudent)
+    rebuilt.load_state_dict(reference.state_dict())
+
+
+def test_cazi_mbn_scoring_rejects_statistics_missing_beside_the_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """An `--output-dir` override moves both files; the YAML's path is not authoritative.
+
+    Resolving `feature_stats.npz` from the config's own `output_dir` would either
+    miss the file or silently standardize with a different run's statistics —
+    wrong scores that raise nothing.
+    """
+    checkpoint_path, config_path, output_dir = _write_cazi_checkpoint_and_config(
+        tmp_path, sequence_dim=6, latent_dim=3, network_layers=2
+    )
+    (output_dir / "feature_stats.npz").unlink()
+
+    args = argparse.Namespace(checkpoint=checkpoint_path, model_config=config_path)
+    with pytest.raises(ValueError, match="beside the checkpoint"):
+        score_universe._resolve_cazi_context(args)
+
+
+def test_cazi_mbn_checkpoint_requires_the_released_state_dict_wrapper(tmp_path: Path) -> None:
+    """A bare `state_dict` (no `{"state_dict": ...}` wrapper) must fail with a clear reason."""
+    from src.baselines.cazi_mbn import CAZIStudent
+
+    torch.manual_seed(0)
+    model = CAZIStudent(6, latent_dim=3, network_layers=2)
+    checkpoint_path = tmp_path / "bad_student.pt"
+    torch.save(model.state_dict(), checkpoint_path)  # no wrapper -- the release's own format
+
+    with pytest.raises(ValueError, match="released.*state_dict.*format"):
+        score_universe._load_checkpoint(checkpoint_path, model_family="cazi_mbn", model_config={})
+
+
+def test_cazi_mbn_scoring_matches_manual_standardization_and_zeros_missing_features(
+    tmp_path: Path,
+) -> None:
+    """CAZI scoring must reuse `_standardize_f0` and zero rows for known feature gaps."""
+    from src.train_cazi_mbn import _standardize_f0
+
+    sequence_dim = INPUT_DIM
+    # `network_layers` doubles as the MoE output dimension (`CAZIStudent.pair_logits`
+    # squeezes it to a scalar), so every real config pins it to 1
+    # (`configs/cazi_mbn_breadth_first.yaml`) -- this fixture must too, or
+    # `pair_logits` returns a per-pair vector instead of a scalar.
+    checkpoint_path, config_path, output_dir = _write_cazi_checkpoint_and_config(
+        tmp_path,
+        sequence_dim=sequence_dim,
+        latent_dim=3,
+        network_layers=1,
+        missing_features=["missing_node"],
+    )
+    node_tokens = {
+        "a": torch.randn(5, sequence_dim),
+        "b": torch.randn(3, sequence_dim),
+        # "missing_node" deliberately absent from the feature store.
+    }
+    data_root = _data_root_with_features(tmp_path, node_tokens, input_dim=sequence_dim)
+    pairs_path = tmp_path / "pairs.tsv"
+    pairs_path.write_text("a\tmissing_node\t1\na\tb\t0\n", encoding="utf-8")
+    output = tmp_path / "cazi_scores.npz"
+
+    score_universe.main(
+        [
+            "score",
+            "--checkpoint",
+            str(checkpoint_path),
+            "--model-family",
+            "cazi_mbn",
+            "--model-config",
+            str(config_path),
+            "--pairs",
+            f"file:{pairs_path}",
+            "--data-root",
+            str(data_root),
+            "--output",
+            str(output),
+            "--device",
+            "cpu",
+        ]
+    )
+
+    artifact = score_universe.load_scores(output)
+    assert artifact.meta["model_family"] == "cazi_mbn"
+
+    # Independently recompute the expected logits the same way `_score_cazi_mbn`
+    # does (build_f0_matrix + zero row for the missing node + `_standardize_f0`),
+    # but through this test's own call, not through the scorer under test.
+    from src.data.feature_stats import load_feature_stats
+    from src.data.features import FeatureStore, build_f0_matrix
+
+    store = FeatureStore(data_root / "features" / "frozen_node_features_1024")
+    present_f0, present_position = build_f0_matrix(store, ["a", "b"], cache_path=None)
+    raw = torch.zeros((3, sequence_dim), dtype=torch.float32)
+    position = {"a": 0, "b": 1, "missing_node": 2}
+    raw[0] = present_f0[present_position["a"]]
+    raw[1] = present_f0[present_position["b"]]
+    stats = load_feature_stats(output_dir / "feature_stats.npz")
+    sequence = _standardize_f0(raw, stats)
+
+    checkpoint_payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    from src.baselines.cazi_mbn import CAZIStudent
+
+    reference_model = CAZIStudent(sequence_dim, latent_dim=3, network_layers=1)
+    reference_model.load_state_dict(checkpoint_payload["state_dict"])
+    reference_model.eval()
+    with torch.no_grad():
+        expected_logits = reference_model.pair_logits(
+            sequence,
+            torch.tensor([position["a"], position["a"]], dtype=torch.long),
+            torch.tensor([position["missing_node"], position["b"]], dtype=torch.long),
+        )
+
+    # `save_scores` stores rows canonicalized (min(u, v), max(u, v)), so match
+    # `artifact.pairs()`'s own row order rather than assuming input order.
+    row_by_pair = dict(zip(artifact.pairs(), artifact.logit.tolist(), strict=True))
+    expected_by_pair = {
+        canonical_pair("a", "missing_node"): float(expected_logits[0]),
+        canonical_pair("a", "b"): float(expected_logits[1]),
+    }
+    for pair, expected_value in expected_by_pair.items():
+        assert row_by_pair[pair] == pytest.approx(expected_value, abs=1e-5)
+
+
+# --------------------------------------------------------------------------- oracle_struct scoring
+# (fix 4: an airtight diagnostic-only boundary for the ground-truth-scaffold arm)
+
+_TINY_ORACLE_E2E_CONFIG: dict[str, object] = {
+    "generator": {
+        "name": "oracle_struct",
+        "feature_standardization": "row_layernorm",
+    },
+    "encoder": {
+        "dim": 16,
+        "layers": 2,
+    },
+    "classifier": {
+        "d_model": 32,
+        "encoder_layers": 1,
+        "cross_attn_layers": 2,
+        "n_heads": 4,
+        "n_inj": 1,
+        "xattn_heads": 4,
+    },
+}
+
+
+def _write_test_graph_pkl(data_root: Path, strategy: str, edges: list[tuple[str, str]]) -> Path:
+    import networkx as nx
+
+    graph = nx.Graph()
+    graph.add_edges_from(edges)
+    path = data_root / "benchmark_2025_neurips" / strategy / "test_graph.pkl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        pickle.dump(graph, handle)
+    return path
+
+
+def _write_run_metadata(tmp_path: Path, checkpoint: Path, *, arm: str = "oracle") -> Path:
+    checkpoint_payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    run_metadata_path = tmp_path / "run_metadata.json"
+    run_metadata_path.write_text(
+        json.dumps(
+            {
+                "arm": arm,
+                "seed": 0,
+                "checkpoint_id": score_universe._checkpoint_id(checkpoint_payload["model_state"]),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return run_metadata_path
+
+
+def test_oracle_truth_graph_rejects_unsupported_pairs_sources(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="no diagnostic truth graph"):
+        score_universe._oracle_truth_graph_for_scoring("val", tmp_path / "data", "breadth_first")
+
+
+def test_allow_oracle_diagnostic_flag_rejected_for_a_non_oracle_generator(tmp_path: Path) -> None:
+    """The flag must be refused, not silently ignored, when it does not apply."""
+    data_root, checkpoint, pairs_path = _egostitch_e2e_setup(tmp_path)
+    output = tmp_path / "out.npz"
+    args = [
+        *_egostitch_e2e_score_args(tmp_path, data_root, checkpoint, pairs_path, output),
+        "--allow-oracle-diagnostic",
+    ]
+    with pytest.raises(ValueError, match="valid only when"):
+        score_universe.main(args)
+    assert not output.exists()
+
+
+def test_oracle_generator_scoring_is_unreachable_without_the_diagnostic_flag(
+    tmp_path: Path,
+) -> None:
+    data_root, checkpoint, pairs_path = _egostitch_e2e_setup(
+        tmp_path, model_config=_TINY_ORACLE_E2E_CONFIG
+    )
+    strategy_dir = data_root / "benchmark_2025_neurips" / "breadth_first"
+    strategy_dir.mkdir(parents=True, exist_ok=True)
+    (strategy_dir / "test_edges.txt").write_bytes(pairs_path.read_bytes())
+    _write_test_graph_pkl(data_root, "breadth_first", _E2E_PAIRS)
+    run_metadata_path = _write_run_metadata(tmp_path, checkpoint, arm="oracle_struct")
+    output = tmp_path / "oracle.npz"
+
+    base_args = [
+        "score",
+        "--checkpoint",
+        str(checkpoint),
+        "--pairs",
+        "test",
+        "--data-root",
+        str(data_root),
+        "--output",
+        str(output),
+        "--token-budget",
+        "8192",
+        "--f0-cache",
+        str(tmp_path / "f0_cache.pt"),
+        "--device",
+        "cpu",
+        "--run-metadata",
+        str(run_metadata_path),
+    ]
+
+    with pytest.raises(ValueError, match="--allow-oracle-diagnostic"):
+        score_universe.main(base_args)
+    assert not output.exists()
+
+    score_universe.main([*base_args, "--allow-oracle-diagnostic"])
+    artifact = score_universe.load_scores(output)
+    assert artifact.meta["oracle_diagnostic"] == {
+        "generator": "oracle_struct",
+        "truth_source": "test_graph",
+        "diagnostic_only": True,
+    }
+    # A truth-consuming diagnostic can never be the formal held-out claim,
+    # even though `pairs_source == "test"` looks held-out-shaped.
+    assert artifact.meta["heldout"] is False
+    assert score_universe._is_heldout_universe(artifact.meta) is False
+    assert np.isfinite(artifact.logit).all()
+
+
+def test_oracle_v_hold_truth_diagnostic_still_writes_no_ledger_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `v_hold`-truth oracle diagnostic combines fixes 1 and 4: still no ledger access."""
+    _tiny_internal_holdout(monkeypatch)
+    data_root, checkpoint = _v_hold_e2e_setup(tmp_path, model_config=_TINY_ORACLE_E2E_CONFIG)
+    output = tmp_path / "oracle_v_hold.npz"
+
+    score_universe.main(
+        [
+            "score",
+            "--checkpoint",
+            str(checkpoint),
+            "--pairs",
+            "v_hold",
+            "--data-root",
+            str(data_root),
+            "--output",
+            str(output),
+            "--token-budget",
+            "8192",
+            "--f0-cache",
+            str(tmp_path / "f0_cache.pt"),
+            "--device",
+            "cpu",
+            "--allow-oracle-diagnostic",
+        ]
+    )
+
+    artifact = score_universe.load_scores(output)
+    oracle_diagnostic = cast(dict[str, object], artifact.meta["oracle_diagnostic"])
+    assert oracle_diagnostic["truth_source"] == "v_hold_topology_hold"
+    assert artifact.meta["heldout"] is False
+    assert not list(tmp_path.rglob("test_access_ledger.jsonl"))

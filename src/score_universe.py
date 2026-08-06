@@ -12,7 +12,7 @@ CLI::
 
     python -m src.score_universe score \
         --checkpoint outputs/b0_v31/best.pt \
-        --pairs candidate|test|val|file:<path.tsv> \
+        --pairs candidate|test|val|v_hold|file:<path.tsv> \
         --data-root data --strategy breadth_first \
         --output scores/b0_v31_candidate.npz \
         [--batch-pairs 8192] [--token-budget 131072] [--device auto|cpu|cuda|mps] \
@@ -33,7 +33,12 @@ Artifact format (pinned — do not drift):
 - ``meta``: 0-d JSON string array with keys ``checkpoint_id``, ``model_family``,
   ``pairs_source``, ``strategy``, ``num_rows``, ``created_utc``, ``torch_version``;
   EgoStitch artifacts additionally pin pair-pass precision provenance and
-  descriptive score-resolution diagnostics.
+  descriptive score-resolution diagnostics. A checkpoint whose ``egostitch_e2e``
+  generator is ``oracle_struct`` additionally carries ``oracle_diagnostic``
+  (``{"generator": "oracle_struct", "truth_source": ..., "diagnostic_only":
+  true}``) and is forced ``heldout: false`` regardless of ``pairs_source`` --
+  it consumes ground-truth topology by construction and is a ceiling
+  diagnostic, never a formal held-out result (``--allow-oracle-diagnostic``).
 - ``full``/``f_logit``: float32 arrays present only for family
   ``egostitch_e2e`` (design rev 4 two-logit decomposition, content path
   removed; ``meta.scores_meta_version == "egostitch_e2e_scores_v4"``).
@@ -54,14 +59,16 @@ import json
 import logging
 import math
 import os
+import pickle
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Any, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
+import networkx as nx
 import numpy as np
 import torch
 import yaml  # type: ignore[import-untyped]
@@ -69,8 +76,10 @@ from numpy.typing import NDArray
 from torch import nn
 
 from src.data.artifacts import canonical_pair, load_candidate_pairs
+from src.data.feature_stats import FeatureStats, load_feature_stats
 from src.data.features import FeatureStore, build_f0_matrix
 from src.data.grounding import POOL_METHOD_ID
+from src.data.internal_holdout import InternalHoldoutPartition, derive_internal_holdout
 from src.data.packed_features import PackedFeatureTable
 from src.data.pairs import (
     BUCKET_BOUNDARIES,
@@ -79,8 +88,19 @@ from src.data.pairs import (
     collate_token_pairs,
     probe_lengths,
 )
+from src.data.partition import derive_training_interactions
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.model.egostitch.generator.assemble import make_scaffold_input_perturbation
+
+if TYPE_CHECKING:
+    # `src.train_cazi_mbn` transitively imports `torch_geometric` (via
+    # `src.baselines.cazi_mbn`); every *runtime* use stays a function-local
+    # import (matching this file's existing lazy-import style for e2e-specific
+    # modules) so merely importing `score_universe` never pays that cost. This
+    # import is erased at runtime (`from __future__ import annotations` makes
+    # every annotation a string), so it exists for mypy only.
+    from src.model.egostitch.composite import EgoStitchModel
+    from src.train_cazi_mbn import CAZIConfig
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +116,7 @@ _META_KEYS = (
     "created_utc",
     "torch_version",
 )
-_NAMED_PAIR_SOURCES = ("candidate", "test", "val")
+_NAMED_PAIR_SOURCES = ("candidate", "test", "val", "v_hold")
 _EGOSTITCH_E2E_PAIR_PRECISION_CONTRACT = "egostitch_e2e_pair_fp32_v1"
 _EGOSTITCH_E2E_ARRAY_KEYS = ("full", "f_logit")
 _SCORES_META_VERSION = "egostitch_e2e_scores_v4"
@@ -254,6 +274,7 @@ class _TestAccessContext:
     shard: int
     num_shards: int
     rescore_reason: str | None
+    scoring_run_id: str | None = None
     ledger_binding: dict[str, object] | None = None
 
 
@@ -400,10 +421,23 @@ def _is_heldout_universe(meta: Mapping[str, object]) -> bool:
     Held-out access is a data-boundary property of the family and pairs
     source, not of registration: family ``egostitch_e2e`` scoring the
     ``candidate``/``test`` manifests or an arbitrary ``file:`` source reads
-    from the held-out universe. Everything else (``val``, other families) is
-    not a held-out claim.
+    from the held-out universe. Everything else (``val``, ``v_hold``, other
+    families) is not a held-out claim.
+
+    An ``oracle_diagnostic`` artifact is excluded unconditionally, even when
+    its ``pairs_source`` is ``candidate``/``test``/``file:*``: the
+    ``oracle_struct`` generator consumes ground-truth topology by
+    construction (it is fed the true test graph or the internal-holdout
+    truth at scoring time, never an imagined one), so it is always a ceiling
+    diagnostic and never the formal held-out claim this predicate gates. This
+    is what keeps such an artifact's ``heldout`` field ``False`` and its
+    ``test_access_ledger`` binding unvalidated by
+    :func:`validate_test_access_ledger_binding` -- the artifact cannot pass
+    for a formal held-out result even if fed into that validation path.
     """
     if meta.get("model_family") != "egostitch_e2e":
+        return False
+    if meta.get("oracle_diagnostic") is not None:
         return False
     pairs_source = meta.get("pairs_source")
     return isinstance(pairs_source, str) and (
@@ -735,9 +769,7 @@ def save_scores(
         validate_score_precision(
             logit, meta=stored_meta, label=str(path), extra_arrays=extra_arrays
         )
-        validate_test_access_ledger_binding(
-            stored_meta, artifact_path=path, label=str(path)
-        )
+        validate_test_access_ledger_binding(stored_meta, artifact_path=path, label=str(path))
 
     path.parent.mkdir(parents=True, exist_ok=True)
     if f_logit is None and full_logit is None:
@@ -901,6 +933,7 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
         "primary_logit",
         "scores_meta_version",
         "heldout",
+        "oracle_diagnostic",
     ):
         values = {str(shard.meta.get(key)) for shard in shards}
         if len(values) > 1:
@@ -947,16 +980,14 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
     if reference.meta.get("model_family") == "egostitch_e2e" and isinstance(
         reference.meta.get("test_access_ledger"), dict
     ):
-        bindings = [
-            cast(dict[str, object], shard.meta["test_access_ledger"])
-            for shard in ordered
-        ]
+        bindings = [cast(dict[str, object], shard.meta["test_access_ledger"]) for shard in ordered]
         common_keys = (
             "schema_version",
             "path",
             "scoring_arm",
             "seed",
             "scoring_epoch",
+            "scoring_run_id",
             "num_shards",
             "output",
         )
@@ -1075,9 +1106,61 @@ def _build_egostitch_e2e(model_config: dict[str, object]) -> nn.Module:
     return EgoStitchModel(E2EConfig.from_mapping(cast(dict[str, Any], model_config)))
 
 
+def _cazi_model_config_from_state(model_state: Mapping[str, torch.Tensor]) -> dict[str, object]:
+    """Infer `CAZIStudent`'s constructor args from its own checkpoint tensor shapes.
+
+    CAZI-MBN's own training YAML (``configs/cazi_mbn_breadth_first.yaml``) has
+    no ``model.family``/``model.config`` nesting -- it is a flat
+    ``data``/``model``/``optim``/``runtime``/``loss`` schema entirely unlike
+    every other family's checkpointed config -- so this bypasses
+    `_load_model_config` and instead reads the shapes `CAZIStudent.__init__`
+    (`src/baselines/cazi_mbn.py`) itself allocated back out of the checkpoint:
+    self-describing, and unable to drift from the checkpoint that actually
+    produced it. `--model-config` still points at the training YAML for
+    `_run_score`'s cazi_mbn scoring branch (feature standardization and the
+    release's known feature gaps), just not for this.
+
+    Args:
+        model_state: The unwrapped ``state_dict`` (already extracted from the
+            released ``{"state_dict": ..., "best_val_auroc": ...}`` checkpoint
+            wrapper by :func:`_load_checkpoint`).
+
+    Returns:
+        ``{"sequence_dim": ..., "latent_dim": ..., "network_layers": ...}``.
+
+    Raises:
+        ValueError: If the expected `CAZIStudent` parameter tensors are absent
+            or malformed.
+    """
+    weight = model_state.get("latent_projection.weight")
+    if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+        raise ValueError("cazi_mbn checkpoint is missing a 2-D latent_projection.weight tensor")
+    latent_dim, sequence_dim = (int(dim) for dim in weight.shape)
+    gate_weight = model_state.get("classifier.classifier.gating_network.weight")
+    if not isinstance(gate_weight, torch.Tensor) or gate_weight.ndim != 2:
+        raise ValueError(
+            "cazi_mbn checkpoint is missing a 2-D "
+            "classifier.classifier.gating_network.weight tensor"
+        )
+    network_layers = int(gate_weight.shape[0])
+    return {
+        "sequence_dim": sequence_dim,
+        "latent_dim": latent_dim,
+        "network_layers": network_layers,
+    }
+
+
+def _build_cazi_mbn(model_config: dict[str, object]) -> nn.Module:
+    """Build a `CAZIStudent` from the config `_cazi_model_config_from_state` inferred."""
+    from src.baselines.cazi_mbn import CAZIStudent
+
+    return CAZIStudent(**cast(dict[str, Any], model_config))
+
+
 MODEL_BUILDERS: dict[str, Callable[[dict[str, object]], nn.Module]] = {
     "v3_1": _build_v3_1,
     "egostitch_e2e": _build_egostitch_e2e,
+    "cazi_mbn": _build_cazi_mbn,
 }
 
 
@@ -1186,6 +1269,22 @@ def _load_checkpoint(
         model_family = embedded_family
         model_config = cast(dict[str, object], embedded_config)
         model_state = cast(dict[str, torch.Tensor], checkpoint["model_state"])
+    elif model_family == "cazi_mbn":
+        # The CAZI-MBN release's own `train_student`/`train_teacher`
+        # (`src/train_cazi_mbn.py`) write `{"state_dict": ..., "best_val_auroc":
+        # ...}`, never this file's Task-4 keys: unwrap the released wrapper
+        # explicitly instead of trying to `load_state_dict` it as-is (which
+        # would treat "state_dict"/"best_val_auroc" themselves as parameter
+        # names and fail confusingly).
+        state_dict = checkpoint.get("state_dict")
+        if not isinstance(state_dict, dict):
+            raise ValueError(
+                f"cazi_mbn checkpoint {path} must be the released "
+                "{'state_dict': ..., 'best_val_auroc': ...} format written by "
+                "src.train_cazi_mbn.train_student/train_teacher"
+            )
+        model_state = cast(dict[str, torch.Tensor], state_dict)
+        model_config = _cazi_model_config_from_state(model_state)
     else:
         if model_family is None or model_config is None:
             raise ValueError(
@@ -1302,9 +1401,7 @@ def _validate_test_access_records(
         try:
             record = json.loads(raw_line)
         except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"{label} is malformed at line {line_number}: {exc.msg}"
-            ) from exc
+            raise ValueError(f"{label} is malformed at line {line_number}: {exc.msg}") from exc
         if not isinstance(record, dict) or record.get("schema_version") != (
             _TEST_ACCESS_LEDGER_SCHEMA
         ):
@@ -1323,17 +1420,27 @@ def _validate_test_access_records(
 def _record_test_access(context: _TestAccessContext, *, pairs_source: str) -> dict[str, object]:
     """Append one held-out manifest read while enforcing scoring-epoch uniqueness.
 
-    Records from concurrent shards share an epoch when their arm, seed, output,
-    shard count, and re-score reason agree. A duplicate shard or a different
-    output starts another epoch and therefore requires an explicit reason.
+    An epoch's identity is its ``--scoring-run-id`` when the caller supplies
+    one, so passes that share a run id belong to the SAME scoring epoch even
+    when they score different pairs sources (e.g. ``test`` then
+    ``candidate`` for the same arm/seed, one full test-protocol invocation).
+    Without a run id, an output's own resolved path stands in for it instead
+    -- the original behavior, preserved exactly: a call scoring a different
+    output with no run id is a different, unshared run.
+
+    Within one epoch, shard bookkeeping (duplicate-shard rejection, the
+    ``shard < num_shards`` cap) is scoped to each output separately, since one
+    epoch may now span several outputs, each with its own shard count. A call
+    that does not join the latest epoch -- a mismatched run id/output, a
+    shard already recorded for its output, or that output's shard budget
+    already exhausted -- starts a new epoch and requires ``--rescore-reason``.
     """
     context.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    output_key = str(context.output.resolve())
     with context.ledger_path.open("a+", encoding="utf-8") as ledger:
         fcntl.flock(ledger.fileno(), fcntl.LOCK_EX)
         ledger.seek(0)
-        records = _validate_test_access_records(
-            ledger, label="test-access ledger"
-        )
+        records = _validate_test_access_records(ledger, label="test-access ledger")
 
         matching = [
             record
@@ -1349,11 +1456,14 @@ def _record_test_access(context: _TestAccessContext, *, pairs_source: str) -> di
                 raise ValueError("test-access ledger contains an invalid scoring_epoch")
             latest_epoch = max(cast(list[int], epoch_values))
             latest = [record for record in matching if record["scoring_epoch"] == latest_epoch]
-            used_shards = {record.get("shard") for record in latest}
+            latest_run_key = latest[0].get("scoring_run_id") or latest[0].get("output")
+            current_run_key: object = context.scoring_run_id or output_key
+            same_output = [record for record in latest if record.get("output") == output_key]
+            used_shards = {record.get("shard") for record in same_output}
             joins_latest_epoch = (
-                all(record.get("output") == str(context.output.resolve()) for record in latest)
-                and all(record.get("num_shards") == context.num_shards for record in latest)
+                current_run_key == latest_run_key
                 and all(record.get("rescore_reason") == context.rescore_reason for record in latest)
+                and all(record.get("num_shards") == context.num_shards for record in same_output)
                 and context.shard not in used_shards
                 and len(used_shards) < context.num_shards
             )
@@ -1375,14 +1485,13 @@ def _record_test_access(context: _TestAccessContext, *, pairs_source: str) -> di
             "scoring_epoch": epoch,
             "scoring_arm": context.scoring_arm,
             "seed": context.seed,
+            "scoring_run_id": context.scoring_run_id,
             "pairs_source": pairs_source,
-            "output": str(context.output.resolve()),
+            "output": output_key,
             "shard": context.shard,
             "num_shards": context.num_shards,
             "rescore_reason": context.rescore_reason,
-            "previous_record_sha256": (
-                records[-1]["record_sha256"] if records else None
-            ),
+            "previous_record_sha256": (records[-1]["record_sha256"] if records else None),
         }
         record["record_sha256"] = _ledger_record_sha256(record)
         ledger.seek(0, 2)
@@ -1396,11 +1505,161 @@ def _record_test_access(context: _TestAccessContext, *, pairs_source: str) -> di
             "scoring_arm": context.scoring_arm,
             "seed": context.seed,
             "scoring_epoch": epoch,
+            "scoring_run_id": context.scoring_run_id,
             "shard": context.shard,
             "num_shards": context.num_shards,
-            "output": str(context.output.resolve()),
+            "output": output_key,
         }
         return record
+
+
+def _load_internal_holdout(data_root: Path, strategy: str) -> InternalHoldoutPartition:
+    """Rebuild the deterministic ``V_fit``/``V_hold`` partition bit-for-bit from disk.
+
+    Mirrors ``src.train_egostitch._assemble_e2e_data``'s own derivation (that
+    module's lines ~1993-2009) exactly: the same ``split.pkl`` train-node
+    collection and ``train_edges.txt`` positives feed the same
+    :func:`~src.data.partition.derive_training_interactions` ->
+    :func:`~src.data.internal_holdout.derive_internal_holdout` pipeline
+    training itself runs, so the returned partition -- and therefore its
+    ``hold_manifest`` pair/label universe and its ``V_hold`` topology -- is
+    exactly what training validates against and never a re-derivation that
+    could quietly drift from it. Every ``egostitch_e2e`` training config
+    leaves ``data.expected_missing_features`` empty (verified across
+    ``configs/egostitch_e2e*.yaml``), so unlike ``v3_1``/``cazi_mbn``
+    scoring this reads ``split.pkl``'s ``train`` collection directly with no
+    exclusion set to apply.
+
+    Shared by the ``v_hold`` pairs source (the real internal-holdout
+    validation universe EgoStitch trains against, as opposed to the
+    benchmark's own ``val_edges.txt`` model-selection manifest) and the
+    ``v_hold``-truth oracle diagnostic graph.
+
+    Args:
+        data_root: Directory containing ``benchmark_2025_neurips/``.
+        strategy: Split strategy name (e.g. ``breadth_first``).
+
+    Returns:
+        The deterministic `InternalHoldoutPartition`.
+
+    Raises:
+        ValueError: If ``split.pkl`` does not contain a ``train`` node collection.
+    """
+    strategy_dir = data_root / _BENCHMARK_SUBDIR / strategy
+    with (strategy_dir / "split.pkl").open("rb") as handle:
+        split_payload = pickle.load(handle)  # noqa: S301 - repository benchmark artifact
+    if not isinstance(split_payload, dict) or "train" not in split_payload:
+        raise ValueError(f"{strategy_dir / 'split.pkl'} must contain a train node collection")
+    train_nodes_all = sorted(cast(Iterable[str], split_payload["train"]))
+    train_pairs, train_labels = _read_pairs_tsv(strategy_dir / "train_edges.txt")
+    positives = [
+        pair
+        for pair, label in zip(train_pairs, train_labels.tolist(), strict=True)
+        if int(label) == 1
+    ]
+    interactions = derive_training_interactions(positives)
+    return derive_internal_holdout(train_nodes_all, interactions.positives)
+
+
+def _resolve_v_hold_pairs(
+    data_root: Path, strategy: str
+) -> tuple[list[tuple[str, str]], NDArray[np.int8]]:
+    """Materialize the complete labeled ``V_hold`` pair universe EgoStitch trains against.
+
+    This is *not* ``val_edges.txt`` (the benchmark's own model-selection
+    manifest): it is the complete non-self pair/label universe over the
+    internal-holdout ``V_hold`` node set (:func:`_load_internal_holdout`'s
+    ``hold_manifest``), the actual validation topology EgoStitch's training
+    loop scores. Selecting a decision threshold on ``val_edges.txt`` and
+    calling it "V_hold-selected" is the exact confusion this source exists to
+    avoid.
+
+    Args:
+        data_root: Directory containing ``benchmark_2025_neurips/``.
+        strategy: Split strategy name (e.g. ``breadth_first``).
+
+    Returns:
+        ``(pairs, labels)``, aligned index-for-index, in the manifest's
+        canonical (sorted) row order.
+    """
+    manifest = _load_internal_holdout(data_root, strategy).hold_manifest
+    return list(manifest.pairs), np.asarray(manifest.labels, dtype=np.int8)
+
+
+def _oracle_truth_graph_for_scoring(pairs_source: str, data_root: Path, strategy: str) -> nx.Graph:
+    """Return the ground-truth topology an ``oracle_struct`` diagnostic scores against.
+
+    Only two truth sources are supported, matching
+    ``docs/superpowers/specs/2026-08-04-oracle-scaffold-experiment-design.md``
+    §3's Row R2 (the wave-2 diagnostic this module owns) and the internal
+    ``V_hold`` truth the same document's Row R1-true-oracle training
+    diagnostic reads:
+
+    - ``test``/``candidate``/``file:*``: the labeled benchmark test graph
+      (self-loop-stripped, matching ``EgoTargetBuilder``'s self-loop-free
+      requirement) -- the R2 diagnostic ceiling.
+    - ``v_hold``: the internal-holdout truth topology
+      (:func:`_load_internal_holdout`'s ``build_g_hold()``), already
+      self-loop-free by construction.
+
+    Every other pairs source has no defined truth graph here and is refused
+    rather than guessed at.
+
+    Args:
+        pairs_source: The same ``--pairs`` spec passed to :func:`_resolve_pairs`.
+        data_root: Directory containing ``benchmark_2025_neurips/``.
+        strategy: Split strategy name (e.g. ``breadth_first``).
+
+    Returns:
+        The self-loop-free ground-truth `networkx.Graph`.
+
+    Raises:
+        ValueError: If `pairs_source` has no defined oracle truth graph.
+    """
+    if pairs_source in ("test", "candidate") or pairs_source.startswith("file:"):
+        # Local imports: `src.experiments.g1_hardened_e2` imports back from this
+        # module (`ScoresArtifact`/`load_scores`/`validate_score_precision`), so
+        # a module-level import here would be circular.
+        from src.eval.graph_metrics import strip_self_loops
+        from src.experiments.g1_hardened_e2 import load_test_graph
+
+        return strip_self_loops(load_test_graph(data_root / _BENCHMARK_SUBDIR, strategy))
+    if pairs_source == "v_hold":
+        return _load_internal_holdout(data_root, strategy).build_g_hold()
+    raise ValueError(
+        f"oracle_struct scoring has no diagnostic truth graph for --pairs {pairs_source!r}; "
+        "supported sources are test/candidate/file:<path> (the labeled test graph, "
+        "oracle-scaffold design doc Row R2) and v_hold (internal-holdout truth)"
+    )
+
+
+def _install_oracle_context(
+    model: EgoStitchModel, node_ids: Sequence[str], *, truth_graph: nx.Graph
+) -> None:
+    """Build and install the ground-truth scaffold table an ``OracleStructGenerator`` needs.
+
+    Mirrors ``src.train_egostitch._install_oracle_context``'s F0-row =
+    table-row identity lookup, specialized to this scoring call's own node
+    universe (`node_ids`, already the exact row order :func:`build_f0_matrix`
+    assigned) rather than training's V_fit-union-V_hold universe.
+
+    Args:
+        model: The `EgoStitchModel`, whose ``generator`` must already be an
+            `OracleStructGenerator`.
+        node_ids: This call's F0-row-ordered node universe.
+        truth_graph: The self-loop-free ground-truth graph to read scaffolds from.
+    """
+    from src.model.egostitch.generator.oracle import OracleStructGenerator, build_oracle_table
+
+    assert isinstance(model.generator, OracleStructGenerator)
+    table = build_oracle_table(
+        truth_graph,
+        list(node_ids),
+        slots=model.generator_cfg.slots,
+        seed=model.cfg.generator.oracle_seed,
+    )
+    lookup = torch.arange(len(node_ids), dtype=torch.long)
+    model.generator.set_oracle_context(table, lookup)
 
 
 def _resolve_pairs(
@@ -1413,12 +1672,16 @@ def _resolve_pairs(
     """Resolve a ``--pairs`` spec to canonical pairs plus labels, in file row order.
 
     Args:
-        pairs_source: ``candidate``, ``test``, ``val``, or ``file:<path.tsv>``.
+        pairs_source: ``candidate``, ``test``, ``val``, ``v_hold``, or
+            ``file:<path.tsv>``.
         data_root: Directory containing ``benchmark_2025_neurips/`` and
             ``features/frozen_node_features_1024/``.
         strategy: Split strategy name (e.g. ``breadth_first``).
         test_access: Held-out scoring identity to append before the pair manifest
-            is read; ``None`` for non-held-out sources.
+            is read; ``None`` for non-held-out sources. ``v_hold`` is never
+            held-out (:func:`_is_heldout_universe`) and must always pass ``None``
+            here: it is the internal validation universe, not the benchmark's
+            held-out test/candidate manifests.
 
     Returns:
         ``(pairs, labels)``, aligned index-for-index.
@@ -1434,6 +1697,8 @@ def _resolve_pairs(
         return labeled.pairs, labeled.labels
     if pairs_source in ("test", "val"):
         return _read_pairs_tsv(benchmark_root / strategy / f"{pairs_source}_edges.txt")
+    if pairs_source == "v_hold":
+        return _resolve_v_hold_pairs(data_root, strategy)
     if pairs_source.startswith("file:"):
         return _read_pairs_tsv(Path(pairs_source[len("file:") :]))
     raise ValueError(
@@ -1691,6 +1956,80 @@ def _score_f0_mlp(
     return out
 
 
+def _score_cazi_mbn(
+    model: nn.Module,
+    pairs: Sequence[tuple[str, str]],
+    store: FeatureStore,
+    *,
+    device: torch.device,
+    batch_size: int,
+    feature_stats: FeatureStats,
+    missing_features: frozenset[str],
+) -> NDArray[np.float32]:
+    """Score pairs with a `CAZIStudent`, matching `src.train_cazi_mbn`'s own path exactly.
+
+    Reuses `src.train_cazi_mbn._standardize_f0` verbatim so standardization is
+    bit-for-bit identical to the released training/scoring code, rather than a
+    parallel reimplementation that could silently drift. Only the final
+    sigmoid is skipped -- `train_cazi_mbn.score_pairs` returns probabilities,
+    but this file's artifact contract pins ``logit`` to the raw pre-sigmoid
+    value for every family, so this calls `CAZIStudent.pair_logits` directly.
+
+    `missing_features` (the release's two known feature-store gaps,
+    `CAZIConfig.expected_missing_features`) get an all-zero raw F0 row before
+    standardization, exactly as `src.train_cazi_mbn._test_features` does for
+    the benchmark's own held-out test nodes: a node this scorer has never seen
+    raw features for still needs a row to standardize and classify, not a
+    `KeyError`.
+
+    Args:
+        model: Frozen `CAZIStudent`, in `eval()` mode (moved onto `device` here).
+        pairs: Node-id pairs in input row order.
+        store: Feature store providing per-node raw F0 rows.
+        device: Compute device.
+        batch_size: Pair rows per forward pass.
+        feature_stats: The training run's registered standardization constants
+            (its ``feature_stats.npz``, next to its checkpoint's ``output_dir``).
+        missing_features: Node ids the release's feature store never covers.
+
+    Returns:
+        Shape ``(len(pairs),)`` float32 raw logits in input row order.
+    """
+    from src.baselines.cazi_mbn import CAZIStudent
+    from src.train_cazi_mbn import _standardize_f0
+
+    assert isinstance(model, CAZIStudent)
+    model.to(device)
+    model.eval()
+    node_ids = sorted({node_id for pair in pairs for node_id in pair})
+    present = [node for node in node_ids if node not in missing_features]
+    # No F0 cache here (unlike v3_1/egostitch_e2e's `--f0-cache`): caching this
+    # matrix would need the same `allow_cache_subset` gather CLAUDE.md flags as
+    # a silent-mismatch trap, and this scorer's own universe is typically small
+    # enough that recomputing it is cheap.
+    present_f0, present_position = build_f0_matrix(store, present, cache_path=None)
+    raw = torch.zeros((len(node_ids), present_f0.shape[1]), dtype=torch.float32)
+    position = {node: i for i, node in enumerate(node_ids)}
+    for node in present:
+        raw[position[node]] = present_f0[present_position[node]]
+    sequence = _standardize_f0(raw, feature_stats).to(device)
+
+    u_idx = torch.tensor([position[u] for u, _ in pairs], dtype=torch.long)
+    v_idx = torch.tensor([position[v] for _, v in pairs], dtype=torch.long)
+    out: NDArray[np.float32] = np.empty(len(pairs), dtype=np.float32)
+    with torch.inference_mode():
+        for start in range(0, len(pairs), batch_size):
+            end = min(start + batch_size, len(pairs))
+            logits = model.pair_logits(
+                sequence,
+                u_idx[start:end].to(device),
+                v_idx[start:end].to(device),
+            )
+            out[start:end] = logits.detach().to(torch.float32).cpu().numpy().reshape(-1)
+            _log_progress(end, len(pairs), end - start)
+    return out
+
+
 def _score_egostitch_e2e(
     model: nn.Module,
     pairs: Sequence[tuple[str, str]],
@@ -1703,6 +2042,7 @@ def _score_egostitch_e2e(
     scaffold_control: str = _SCAFFOLD_CONTROL_NONE,
     universe_pairs: Sequence[tuple[str, str]] | None = None,
     row_start: int = 0,
+    oracle_truth_graph: nx.Graph | None = None,
 ) -> dict[str, NDArray[np.float32]]:
     """Score pairs with an `EgoStitchModel`'s two-logit decomposition.
 
@@ -1713,15 +2053,23 @@ def _score_egostitch_e2e(
     ``egostitch_e2e_pair_fp32_v1``; autocast is always disabled for this
     family, regardless of any future `--amp` wiring.
 
-    Supports both registered generators (design 2026-08-02 §12 P3): the real
-    `egostitch_imagine` generator, whose per-node cache carries a `SlotSet`/
-    projected features, and the null generator (`generator.name: "null"`),
-    whose per-node cache carries `slots=None`/`projected_x=None` because
-    there is nothing to imagine. For the null generator the returned ``full``
-    and ``f_logit`` arrays are identical -- the composite's `self.encoder is
-    None` clamps topology off for both heads, so this is the correct null
-    result (the topology pathway contributed nothing) rather than a
-    special-cased single array. Any other generator raises `ValueError`.
+    Supports three registered generators (design 2026-08-02 §12 P3 and the
+    2026-08-04 oracle-scaffold-experiment design): the real `egostitch_imagine`
+    generator, whose per-node cache carries a `SlotSet`/projected features; the
+    null generator (`generator.name: "null"`), whose per-node cache carries
+    `slots=None`/`projected_x=None` because there is nothing to imagine; and
+    `OracleStructGenerator` (`generator.name: "oracle_struct"`), which -- like
+    the real generator -- caches a populated `SlotSet`/projected features, but
+    reads them from `oracle_truth_graph` (a ground-truth table, installed here
+    via `_install_oracle_context`) rather than imagining them. Every oracle
+    call is therefore a truth-consuming ceiling diagnostic, never a formal
+    result: its caller (`_run_score`) gates it behind an explicit operator
+    opt-in and this function requires `oracle_truth_graph` whenever the
+    generator is an `OracleStructGenerator`. For the null generator the
+    returned ``full`` and ``f_logit`` arrays are identical -- the composite's
+    `self.encoder is None` clamps topology off for both heads, so this is the
+    correct null result (the topology pathway contributed nothing) rather than
+    a special-cased single array. Any other generator raises `ValueError`.
 
     Each batch is assembled with real grounding-pool candidates (spec Sec
     13.12) via the `build_f0_matrix`/`build_grounding_pool` loader:
@@ -1749,20 +2097,30 @@ def _score_egostitch_e2e(
         universe_pairs: Full input universe used to keep grounding pools stable
             when this scorer receives a contiguous shard.
         row_start: Global start row of `pairs` within `universe_pairs`.
+        oracle_truth_graph: The self-loop-free ground-truth graph an
+            `OracleStructGenerator` reads its scaffolds from
+            (:func:`_oracle_truth_graph_for_scoring`). Required exactly when
+            `model.generator` is an `OracleStructGenerator`; ignored otherwise.
 
     Returns:
         Dict with keys ``full`` and ``f_logit``, each a shape ``(len(pairs),)``
         float32 array in input row order.
+
+    Raises:
+        ValueError: If `model.generator` is not a registered supported
+            generator, or if it is an `OracleStructGenerator` and
+            `oracle_truth_graph` is ``None``.
     """
     from src.data.grounding import build_grounding_pool
     from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
     from src.model.egostitch.generator.egostitch import EgoStitchImagineGenerator
     from src.model.egostitch.generator.imagine import SlotSet
     from src.model.egostitch.generator.null import NullGenerator
+    from src.model.egostitch.generator.oracle import OracleStructGenerator
 
     assert isinstance(model, EgoStitchModel)
     # `EgoStitchModel.decompose_pair_context` (composite.py) is well-defined
-    # for both registered generators. For the real `egostitch_imagine`
+    # for every registered generator. For the real `egostitch_imagine`
     # generator, `full` and `f_logit` diverge once trained -- the ordinary
     # topology-conditioned decomposition. For `generator.name: "null"`
     # (design 2026-08-02 §12 P3), `self.encoder is None` unconditionally
@@ -1773,17 +2131,30 @@ def _score_egostitch_e2e(
     # node state correspondingly has no `SlotSet`/`projected_x` to cache
     # (`encode_node_state` returns `slots=None`, `projected_x=None`); this
     # scorer carries that `None` through its per-node cache explicitly
-    # (`is_real_generator` below) instead of asserting it away. Any other
-    # generator is genuinely unsupported here and must fail loudly at this
-    # point, not with an opaque `NoneType` crash deep in the node-state
-    # cache below.
+    # (`is_slot_generator` below) instead of asserting it away.
+    # `OracleStructGenerator` (2026-08-04 oracle-scaffold-experiment design)
+    # produces a populated `SlotSet`/`projected_x` exactly like the real
+    # generator -- it just reads them from a ground-truth table instead of
+    # imagining them -- so it shares the real generator's caching branch.
+    # Any other generator is genuinely unsupported here and must fail loudly
+    # at this point, not with an opaque `NoneType` crash deep in the
+    # node-state cache below.
     is_real_generator = isinstance(model.generator, EgoStitchImagineGenerator)
     is_null_generator = isinstance(model.generator, NullGenerator)
-    if not (is_real_generator or is_null_generator):
+    is_oracle_generator = isinstance(model.generator, OracleStructGenerator)
+    is_slot_generator = is_real_generator or is_oracle_generator
+    if not (is_slot_generator or is_null_generator):
         raise ValueError(
             "egostitch_e2e scoring supports only the real egostitch_imagine "
-            "generator (topology-conditioned) or the null generator "
-            f"(topology-free pairwise baseline); got {type(model.generator).__name__}"
+            "generator (topology-conditioned), the null generator "
+            "(topology-free pairwise baseline), or the oracle_struct diagnostic "
+            f"generator; got {type(model.generator).__name__}"
+        )
+    if is_oracle_generator and oracle_truth_graph is None:
+        raise ValueError(
+            "oracle_struct scoring requires oracle_truth_graph (the ground-truth "
+            "topology to install via _install_oracle_context); this is a caller bug, "
+            "not a legal degraded mode"
         )
     _reject_superseded_scaffold_control(scaffold_control)
     active_controls = (
@@ -1798,6 +2169,9 @@ def _score_egostitch_e2e(
     if not 0 <= row_start <= row_start + len(pairs) <= len(node_universe):
         raise ValueError("e2e scoring rows are outside the declared pair universe")
     node_ids = sorted({node_id for pair in node_universe for node_id in pair})
+    if is_oracle_generator:
+        assert oracle_truth_graph is not None  # checked above
+        _install_oracle_context(model, node_ids, truth_graph=oracle_truth_graph)
     f0_cache.parent.mkdir(parents=True, exist_ok=True)
     matrix, index = build_f0_matrix(store, node_ids, cache_path=f0_cache)
 
@@ -1875,16 +2249,16 @@ def _score_egostitch_e2e(
                     pool_rows[rows].to(device),
                     rows.to(device),
                 )
-                if is_real_generator:
-                    # A real `egostitch_imagine` generator's `encode_node`
-                    # always returns a `GeneratorNodeState`
+                if is_slot_generator:
+                    # A real `egostitch_imagine` or `oracle_struct` generator's
+                    # `encode_node` always returns a `GeneratorNodeState`
                     # (`EgoStitchModel.encode_node_state`), so `slots`/
                     # `projected_x` are always populated here. `None` would
                     # mean a broken generator/checkpoint pairing, not the
                     # (separately handled) null-generator arm -- this must
                     # still fail loudly rather than caching a silent `None`.
                     assert state.slots is not None and state.projected_x is not None, (
-                        "real egostitch_imagine generator produced no slot state for "
+                        "slot-producing generator produced no slot state for "
                         "this node batch -- this is a bug, not the supported "
                         "null-generator arm"
                     )
@@ -1939,12 +2313,12 @@ def _score_egostitch_e2e(
         else:
             ground_ids = None
         # `node_cache` is populated homogeneously by this call's own
-        # `is_real_generator` branch above: every cached state's `slots`/
-        # `projected_x` is populated together (real generator) or `None`
-        # together (null generator), never mixed within one scoring call.
+        # `is_slot_generator` branch above: every cached state's `slots`/
+        # `projected_x` is populated together (real or oracle generator) or
+        # `None` together (null generator), never mixed within one scoring call.
         slots: SlotSet | None
         projected_x: torch.Tensor | None
-        if is_real_generator:
+        if is_slot_generator:
             assert all(state.slots is not None for state in states)
             slots = SlotSet(
                 *(
@@ -2097,17 +2471,24 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument(
         "--model-config",
         type=Path,
-        help="training YAML containing model.config for a bare legacy checkpoint",
+        help=(
+            "training YAML containing model.config for a bare legacy checkpoint "
+            "(for cazi_mbn: its own training YAML, used only for feature "
+            "standardization and its known feature gaps -- architecture is "
+            "inferred from the checkpoint itself)"
+        ),
     )
     score.add_argument(
         "--pairs",
         required=True,
-        help="candidate | test | val | file:<path.tsv> (TSV rows: u\\tv[\\tlabel])",
+        help="candidate | test | val | v_hold | file:<path.tsv> (TSV rows: u\\tv[\\tlabel])",
     )
     score.add_argument("--data-root", type=Path, default=Path("data"))
     score.add_argument("--strategy", default="breadth_first")
     score.add_argument("--output", type=Path, required=True, help="output .npz path")
-    score.add_argument("--batch-pairs", type=int, default=8192, help="f0_mlp rows per batch")
+    score.add_argument(
+        "--batch-pairs", type=int, default=8192, help="f0_mlp/cazi_mbn rows per batch"
+    )
     score.add_argument("--token-budget", type=int, default=131_072, help="v3_1 tokens per batch")
     score.add_argument(
         "--pack-dir",
@@ -2148,10 +2529,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="required reason for a repeated egostitch_e2e held-out scoring epoch",
     )
     score.add_argument(
+        "--scoring-run-id",
+        default=None,
+        help=(
+            "shares one held-out scoring epoch across multiple --pairs sources "
+            "scored for the same arm/seed (e.g. test then candidate, one "
+            "test-protocol invocation); egostitch_e2e held-out scoring only"
+        ),
+    )
+    score.add_argument(
+        "--allow-oracle-diagnostic",
+        action="store_true",
+        help=(
+            "required to score a checkpoint whose egostitch_e2e generator is "
+            "oracle_struct: it consumes ground-truth topology by construction "
+            "(the 2026-08-04 oracle-scaffold-experiment design), so this is a "
+            "ceiling diagnostic only, never a formal result, and is refused "
+            "without this explicit acknowledgement"
+        ),
+    )
+    score.add_argument(
         "--f0-cache",
         type=Path,
         default=Path("outputs/f0_cache/f0_matrix.pt"),
-        help="F0 matrix cache path (f0_mlp only)",
+        help="F0 matrix cache path (f0_mlp/egostitch_e2e only; cazi_mbn never caches)",
     )
 
     merge = subparsers.add_parser("merge", help="merge shard outputs into one artifact")
@@ -2187,6 +2588,42 @@ def _validate_score_args(parser: argparse.ArgumentParser, args: argparse.Namespa
             parser.error(f"--shard must be in [0, {args.num_shards}), got {args.shard}")
     if args.rescore_reason is not None and not args.rescore_reason.strip():
         parser.error("--rescore-reason must contain non-whitespace text")
+    if args.scoring_run_id is not None and not args.scoring_run_id.strip():
+        parser.error("--scoring-run-id must contain non-whitespace text")
+
+
+def _resolve_cazi_context(args: argparse.Namespace) -> tuple[CAZIConfig, FeatureStats]:
+    """Load the CAZI training config and the statistics of the run being scored.
+
+    The statistics come from the checkpoint's own directory, not from the YAML's
+    ``output_dir``. ``src.train_cazi_mbn`` supports an ``--output-dir`` override
+    that writes ``student.pt`` and ``feature_stats.npz`` together into the
+    override, so reading the YAML path would either miss the file or silently
+    standardize with a different run's statistics — wrong scores that raise
+    nothing.
+
+    Args:
+        args: Parsed ``score`` arguments carrying ``checkpoint`` and ``model_config``.
+
+    Returns:
+        The CAZI config and the feature statistics beside the checkpoint.
+
+    Raises:
+        ValueError: If ``--model-config`` is absent, or no ``feature_stats.npz``
+            sits beside the checkpoint.
+    """
+    if args.model_config is None:
+        raise ValueError("cazi_mbn scoring requires --model-config (its own training YAML)")
+    from src.train_cazi_mbn import load_config as load_cazi_config
+
+    cazi_cfg = load_cazi_config(args.model_config)
+    stats_path = args.checkpoint.parent / "feature_stats.npz"
+    if not stats_path.is_file():
+        raise ValueError(
+            f"cazi_mbn scoring requires {stats_path} beside the checkpoint; "
+            "score the run that produced this checkpoint"
+        )
+    return cazi_cfg, load_feature_stats(stats_path)
 
 
 def _run_score(args: argparse.Namespace) -> None:
@@ -2196,7 +2633,7 @@ def _run_score(args: argparse.Namespace) -> None:
     logger.info("loading checkpoint %s (device %s)", args.checkpoint, device)
     model_config = (
         _load_model_config(args.model_config, args.model_family)
-        if args.model_config is not None
+        if args.model_config is not None and args.model_family != "cazi_mbn"
         else None
     )
     model, model_family, checkpoint_id = _load_checkpoint(
@@ -2204,6 +2641,53 @@ def _run_score(args: argparse.Namespace) -> None:
         model_family=args.model_family,
         model_config=model_config,
     )
+
+    cazi_context = _resolve_cazi_context(args) if model_family == "cazi_mbn" else None
+
+    # Import guarded by family, not unconditional: `src.model.egostitch.composite`
+    # transitively pulls in the `grit_gmt` encoder (and, through it,
+    # torch_geometric), a real cost `v3_1`/`f0_mlp`/`cazi_mbn` scoring must
+    # never pay. For `egostitch_e2e` this is free -- `_load_checkpoint` already
+    # imported the same module building the model above.
+    is_oracle_generator = False
+    if model_family == "egostitch_e2e":
+        from src.model.egostitch.composite import EgoStitchModel
+        from src.model.egostitch.generator.oracle import OracleStructGenerator
+
+        is_oracle_generator = isinstance(model, EgoStitchModel) and isinstance(
+            model.generator, OracleStructGenerator
+        )
+    if args.allow_oracle_diagnostic and not is_oracle_generator:
+        raise ValueError(
+            "--allow-oracle-diagnostic is valid only when the checkpoint's "
+            "egostitch_e2e generator is oracle_struct"
+        )
+    oracle_truth_graph: nx.Graph | None = None
+    if is_oracle_generator:
+        # Airtight by construction, not by trusting the checkpoint's own
+        # training-time run_metadata: the 2026-08-04 oracle-scaffold-experiment
+        # design's own §0 correction records a `run_kind: formal` checkpoint
+        # whose generator was already `oracle_struct` (the pre-correction R1
+        # run), so a checkpoint's training provenance cannot be relied on to
+        # gate this. What is always true is that *scoring* test/candidate/
+        # v_hold pairs through an oracle generator means feeding it the true
+        # topology for exactly the pairs being queried -- a truth-consuming
+        # ceiling diagnostic every time, regardless of how the checkpoint was
+        # trained. Requiring an explicit, scoring-time operator flag (rather
+        # than an automatic run_kind check) is what keeps this unreachable
+        # from any automated formal test-protocol invocation that does not
+        # itself pass it.
+        if not args.allow_oracle_diagnostic:
+            raise ValueError(
+                "checkpoint generator is oracle_struct, which consumes ground-truth "
+                "topology by construction (2026-08-04 oracle-scaffold-experiment design); "
+                "pass --allow-oracle-diagnostic to acknowledge this is a ceiling "
+                "diagnostic, never a formal result"
+            )
+        oracle_truth_graph = _oracle_truth_graph_for_scoring(
+            args.pairs, args.data_root, args.strategy
+        )
+
     heldout_e2e = model_family == "egostitch_e2e" and (
         args.pairs in {"candidate", "test"} or args.pairs.startswith("file:")
     )
@@ -2238,6 +2722,8 @@ def _run_score(args: argparse.Namespace) -> None:
         scoring_seed = seed
     if args.rescore_reason is not None and not heldout_e2e:
         raise ValueError("--rescore-reason is valid only for egostitch_e2e held-out scoring")
+    if args.scoring_run_id is not None and not heldout_e2e:
+        raise ValueError("--scoring-run-id is valid only for egostitch_e2e held-out scoring")
     if args.scaffold_control != _SCAFFOLD_CONTROL_NONE and model_family != "egostitch_e2e":
         raise ValueError("--scaffold-control is supported only for model_family 'egostitch_e2e'")
     model.to(device)
@@ -2254,6 +2740,7 @@ def _run_score(args: argparse.Namespace) -> None:
             shard=args.shard if args.shard is not None else 0,
             num_shards=args.num_shards if args.num_shards is not None else 1,
             rescore_reason=args.rescore_reason,
+            scoring_run_id=args.scoring_run_id,
         )
     pairs, labels = _resolve_pairs(
         args.pairs, args.data_root, args.strategy, test_access=test_access
@@ -2314,6 +2801,18 @@ def _run_score(args: argparse.Namespace) -> None:
             batch_pairs=args.batch_pairs,
             f0_cache=args.f0_cache,
         )
+    elif model_family == "cazi_mbn":
+        assert cazi_context is not None
+        cazi_cfg, feature_stats = cazi_context
+        logits = _score_cazi_mbn(
+            model,
+            row_pairs,
+            store,
+            device=device,
+            batch_size=args.batch_pairs,
+            feature_stats=feature_stats,
+            missing_features=frozenset(cazi_cfg.expected_missing_features),
+        )
     elif model_family == "egostitch_e2e":
         decomposed = _score_egostitch_e2e(
             model,
@@ -2326,6 +2825,7 @@ def _run_score(args: argparse.Namespace) -> None:
             scaffold_control=args.scaffold_control,
             universe_pairs=pairs,
             row_start=start,
+            oracle_truth_graph=oracle_truth_graph,
         )
         from src.model.egostitch.composite import EgoStitchModel
 
@@ -2354,6 +2854,17 @@ def _run_score(args: argparse.Namespace) -> None:
             "permanent_null": permanent_null,
             "primary_logit": primary_logit,
         }
+        if is_oracle_generator:
+            # `_is_heldout_universe` refuses this artifact `heldout: True` no
+            # matter how truth-shaped its `pairs_source` looks (module-level
+            # docstring), so it cannot pass `validate_test_access_ledger_binding`
+            # as a formal held-out result even if fed into it downstream.
+            assert oracle_truth_graph is not None
+            meta_extra["oracle_diagnostic"] = {
+                "generator": "oracle_struct",
+                "truth_source": "test_graph" if args.pairs != "v_hold" else "v_hold_topology_hold",
+                "diagnostic_only": True,
+            }
     else:  # pragma: no cover - build_model already rejects unknown families
         raise ValueError(f"no scoring path for model_family {model_family!r}")
 

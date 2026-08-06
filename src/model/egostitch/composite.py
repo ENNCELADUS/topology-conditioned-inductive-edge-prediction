@@ -470,8 +470,7 @@ class EgoStitchModel(nn.Module):
         if graph is None:
             return None, None, None
         assert self.encoder is not None, (
-            "a generator that emits a real ImaginedGraph must be paired with "
-            "a constructed encoder"
+            "a generator that emits a real ImaginedGraph must be paired with a constructed encoder"
         )
         embedding_ab = self.encoder(graph)
         embedding_ba = self.encoder(graph.swapped())
@@ -568,9 +567,7 @@ class EgoStitchModel(nn.Module):
     ) -> E2EPairContext:
         """Encode endpoints and build one reusable pair context."""
         state_a, state_b, is_self = self._pair_node_states(batch)
-        return self.build_pair_context_from_states(
-            state_a, state_b, is_self, need_topo=need_topo
-        )
+        return self.build_pair_context_from_states(state_a, state_b, is_self, need_topo=need_topo)
 
     @torch.no_grad()
     def probe_states(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:

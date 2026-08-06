@@ -388,9 +388,7 @@ class TestE2EProbeArtifact:
                 path, graph=graph, train_nodes=nodes, expected_metadata=metadata
             )
 
-    def test_consumer_rejects_n_ground_different_from_registered_arm(
-        self, tmp_path: Path
-    ) -> None:
+    def test_consumer_rejects_n_ground_different_from_registered_arm(self, tmp_path: Path) -> None:
         path, graph, nodes, metadata = self._write(tmp_path)
         registered = {**metadata, "n_ground": 50}
 
@@ -415,9 +413,7 @@ class TestE2EProbeArtifact:
         slot_recall = cast(dict[str, float | int], report["slot_recall_at_n_ground"])
         assert slot_recall["n_ground"] == 20
 
-    def test_consumer_rejects_v1_artifact_with_clear_version_error(
-        self, tmp_path: Path
-    ) -> None:
+    def test_consumer_rejects_v1_artifact_with_clear_version_error(self, tmp_path: Path) -> None:
         path, graph, nodes, metadata = self._write(tmp_path)
         with np.load(path, allow_pickle=False) as archive:
             arrays = {key: archive[key] for key in archive.files}

@@ -7,13 +7,14 @@ import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pytest
 import torch
 from src import score_universe
 
-from tests.test_score_universe import _egostitch_e2e_setup
+from tests.test_score_universe import _E2E_PAIRS, _egostitch_e2e_setup
 
 
 def _fake_loaded_e2e_model() -> torch.nn.Module:
@@ -30,22 +31,23 @@ def _test_access_context(
     shard: int = 0,
     num_shards: int = 1,
     reason: str | None = None,
+    scoring_run_id: str | None = None,
+    output: Path | None = None,
 ) -> score_universe._TestAccessContext:
     return score_universe._TestAccessContext(
         ledger_path=tmp_path / "scores" / "test_access_ledger.jsonl",
         scoring_arm="full",
         seed=0,
-        output=tmp_path / "scores" / "full.npz",
+        output=output if output is not None else tmp_path / "scores" / "full.npz",
         shard=shard,
         num_shards=num_shards,
         rescore_reason=reason,
+        scoring_run_id=scoring_run_id,
     )
 
 
 def _write_test_pairs(tmp_path: Path) -> Path:
-    path = (
-        tmp_path / "data" / "benchmark_2025_neurips" / "breadth_first" / "test_edges.txt"
-    )
+    path = tmp_path / "data" / "benchmark_2025_neurips" / "breadth_first" / "test_edges.txt"
     path.parent.mkdir(parents=True)
     path.write_text("a\tb\t1\n", encoding="utf-8")
     return path
@@ -60,8 +62,11 @@ def _write_bound_score_artifact(
     *,
     shard: int = 0,
     num_shards: int = 1,
+    output_name: str = "bound.npz",
+    pairs_source: str = "test",
+    scoring_run_id: str | None = None,
 ) -> tuple[Path, Path]:
-    output = tmp_path / "bound.npz"
+    output = tmp_path / output_name
     path = output if num_shards == 1 else score_universe._shard_output_path(output, shard)
     ledger_path = tmp_path / "test_access_ledger.jsonl"
     access = score_universe._TestAccessContext(
@@ -72,8 +77,9 @@ def _write_bound_score_artifact(
         shard=shard,
         num_shards=num_shards,
         rescore_reason=None,
+        scoring_run_id=scoring_run_id,
     )
-    score_universe._record_test_access(access, pairs_source="test")
+    score_universe._record_test_access(access, pairs_source=pairs_source)
     assert access.ledger_binding is not None
     values = np.array([0.1 + shard], dtype=np.float32)
     score_universe.save_scores(
@@ -87,7 +93,7 @@ def _write_bound_score_artifact(
         meta={
             "checkpoint_id": "checkpoint",
             "model_family": "egostitch_e2e",
-            "pairs_source": "test",
+            "pairs_source": pairs_source,
             "strategy": "toy",
             "num_rows": num_shards,
             "created_utc": "2026-07-30T00:00:00Z",
@@ -118,6 +124,7 @@ def _rewrite_artifact_meta(path: Path, mutate: Callable[[dict[str, object]], Non
 
 def test_test_access_ledger_groups_multi_gpu_shards_into_one_epoch(tmp_path: Path) -> None:
     _write_test_pairs(tmp_path)
+
     def resolve_shard(shard: int) -> None:
         score_universe._resolve_pairs(
             "test",
@@ -137,8 +144,7 @@ def test_test_access_ledger_groups_multi_gpu_shards_into_one_epoch(tmp_path: Pat
 
 def test_ledger_bound_shards_load_and_merge_as_one_scoring_epoch(tmp_path: Path) -> None:
     shard_paths = [
-        _write_bound_score_artifact(tmp_path, shard=shard, num_shards=2)[0]
-        for shard in range(2)
+        _write_bound_score_artifact(tmp_path, shard=shard, num_shards=2)[0] for shard in range(2)
     ]
 
     for path in shard_paths:
@@ -286,9 +292,7 @@ def test_scoring_full_then_both_scaffold_controls_needs_no_rescore_reason(
             {
                 "arm": "full",
                 "seed": 0,
-                "checkpoint_id": score_universe._checkpoint_id(
-                    checkpoint_payload["model_state"]
-                ),
+                "checkpoint_id": score_universe._checkpoint_id(checkpoint_payload["model_state"]),
             }
         ),
         encoding="utf-8",
@@ -342,14 +346,10 @@ def test_test_access_ledger_rejects_repeat_without_reason_and_records_reasoned_r
 ) -> None:
     _write_test_pairs(tmp_path)
     first = _test_access_context(tmp_path)
-    score_universe._resolve_pairs(
-        "test", tmp_path / "data", "breadth_first", test_access=first
-    )
+    score_universe._resolve_pairs("test", tmp_path / "data", "breadth_first", test_access=first)
 
     with pytest.raises(ValueError, match="repeat scoring requires --rescore-reason"):
-        score_universe._resolve_pairs(
-            "test", tmp_path / "data", "breadth_first", test_access=first
-        )
+        score_universe._resolve_pairs("test", tmp_path / "data", "breadth_first", test_access=first)
 
     score_universe._resolve_pairs(
         "test",
@@ -442,11 +442,7 @@ def test_file_alias_of_candidate_manifest_still_requires_run_metadata(
     checkpoint.write_bytes(b"selected checkpoint")
     checkpoint_id = "0123456789abcdef"
     candidate = (
-        tmp_path
-        / "data"
-        / "benchmark_2025_neurips"
-        / "breadth_first"
-        / "candidate_test_edges.txt"
+        tmp_path / "data" / "benchmark_2025_neurips" / "breadth_first" / "candidate_test_edges.txt"
     )
     candidate.parent.mkdir(parents=True)
     candidate.write_text("a\tb\n", encoding="utf-8")
@@ -690,3 +686,250 @@ def test_legacy_content_head_artifact_is_rejected_with_a_clear_reason() -> None:
 def test_unknown_permanent_null_is_a_value_error_not_a_key_error() -> None:
     with pytest.raises(ValueError, match="unknown egostitch_e2e permanent_null"):
         score_universe._e2e_primary_logit_key("nonsense")
+
+
+# --------------------------------------------------------------------------- fix 2:
+# --scoring-run-id shares one ledger epoch across pairs sources
+
+
+def _run_metadata_for_checkpoint(tmp_path: Path, checkpoint: Path, *, arm: str = "full") -> Path:
+    checkpoint_payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    run_metadata_path = tmp_path / "run_metadata.json"
+    run_metadata_path.write_text(
+        json.dumps(
+            {
+                "arm": arm,
+                "seed": 0,
+                "checkpoint_id": score_universe._checkpoint_id(checkpoint_payload["model_state"]),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return run_metadata_path
+
+
+def _score_cli_args(
+    checkpoint: Path,
+    data_root: Path,
+    output: Path,
+    *,
+    pairs: str,
+    run_metadata: Path,
+    scoring_run_id: str | None = None,
+) -> list[str]:
+    args = [
+        "score",
+        "--checkpoint",
+        str(checkpoint),
+        "--pairs",
+        pairs,
+        "--data-root",
+        str(data_root),
+        "--output",
+        str(output),
+        "--token-budget",
+        "8192",
+        "--f0-cache",
+        str(output.parent / "f0_cache.pt"),
+        "--device",
+        "cpu",
+        "--run-metadata",
+        str(run_metadata),
+    ]
+    if scoring_run_id is not None:
+        args += ["--scoring-run-id", scoring_run_id]
+    return args
+
+
+def _setup_test_and_candidate_sources(tmp_path: Path) -> tuple[Path, Path]:
+    """`_egostitch_e2e_setup`'s fixture, plus `test_edges.txt`/`candidate_test_edges.txt`."""
+    data_root, checkpoint, pairs_path = _egostitch_e2e_setup(tmp_path)
+    strategy_dir = data_root / "benchmark_2025_neurips" / "breadth_first"
+    strategy_dir.mkdir(parents=True, exist_ok=True)
+    (strategy_dir / "test_edges.txt").write_bytes(pairs_path.read_bytes())
+    (strategy_dir / "candidate_test_edges.txt").write_text(
+        "".join(f"{u}\t{v}\t0\n" for u, v in _E2E_PAIRS), encoding="utf-8"
+    )
+    return data_root, checkpoint
+
+
+def test_scoring_run_id_shares_one_epoch_across_test_and_candidate_pairs_sources(
+    tmp_path: Path,
+) -> None:
+    """One `--scoring-run-id` lets `test` then `candidate` complete as ONE epoch.
+
+    Before the fix, a protocol run scoring `test` then `candidate` for the
+    same arm/seed opened epoch 1 on `test` and then tripped "repeat scoring
+    requires --rescore-reason" on `candidate`, because the ledger keyed a
+    repeat purely on (arm, seed) with the output path baked into the record --
+    an initial two-source run could never complete without a misleading
+    `--rescore-reason`.
+    """
+    data_root, checkpoint = _setup_test_and_candidate_sources(tmp_path)
+    run_metadata = _run_metadata_for_checkpoint(tmp_path, checkpoint)
+
+    score_universe.main(
+        _score_cli_args(
+            checkpoint,
+            data_root,
+            tmp_path / "test.npz",
+            pairs="test",
+            run_metadata=run_metadata,
+            scoring_run_id="protocol-run-1",
+        )
+    )
+    # No --rescore-reason anywhere below: this must be accepted as part of the
+    # SAME first-time epoch, not rejected as a repeat.
+    score_universe.main(
+        _score_cli_args(
+            checkpoint,
+            data_root,
+            tmp_path / "candidate.npz",
+            pairs="candidate",
+            run_metadata=run_metadata,
+            scoring_run_id="protocol-run-1",
+        )
+    )
+
+    records = _ledger_records(tmp_path / "test_access_ledger.jsonl")
+    assert len(records) == 2
+    assert {record["scoring_epoch"] for record in records} == {1}
+    assert {record["pairs_source"] for record in records} == {"test", "candidate"}
+    assert all(record["scoring_run_id"] == "protocol-run-1" for record in records)
+
+    test_artifact = score_universe.load_scores(tmp_path / "test.npz")
+    candidate_artifact = score_universe.load_scores(tmp_path / "candidate.npz")
+    test_binding = cast(dict[str, object], test_artifact.meta["test_access_ledger"])
+    candidate_binding = cast(dict[str, object], candidate_artifact.meta["test_access_ledger"])
+    assert test_binding["scoring_epoch"] == 1
+    assert candidate_binding["scoring_epoch"] == 1
+
+
+def test_scoring_run_id_fresh_run_without_reason_still_rejected_as_repeat(
+    tmp_path: Path,
+) -> None:
+    """A genuinely new run (fresh id, no reason) must still be a rejected repeat."""
+    data_root, checkpoint = _setup_test_and_candidate_sources(tmp_path)
+    run_metadata = _run_metadata_for_checkpoint(tmp_path, checkpoint)
+
+    score_universe.main(
+        _score_cli_args(
+            checkpoint,
+            data_root,
+            tmp_path / "first.npz",
+            pairs="test",
+            run_metadata=run_metadata,
+            scoring_run_id="run-1",
+        )
+    )
+    with pytest.raises(ValueError, match="repeat scoring requires --rescore-reason"):
+        score_universe.main(
+            _score_cli_args(
+                checkpoint,
+                data_root,
+                tmp_path / "second.npz",
+                pairs="test",
+                run_metadata=run_metadata,
+                scoring_run_id="run-2",
+            )
+        )
+    assert not (tmp_path / "second.npz").exists()
+
+
+def test_mutated_ledger_record_still_invalidates_every_artifact_sharing_a_run_id(
+    tmp_path: Path,
+) -> None:
+    """The hash chain must still catch tampering when one epoch spans two outputs."""
+    test_path, ledger_path = _write_bound_score_artifact(
+        tmp_path, output_name="test.npz", pairs_source="test", scoring_run_id="shared-run"
+    )
+    candidate_path, _ = _write_bound_score_artifact(
+        tmp_path, output_name="candidate.npz", pairs_source="candidate", scoring_run_id="shared-run"
+    )
+
+    # Both artifacts load cleanly before any tampering.
+    score_universe.load_scores(test_path)
+    score_universe.load_scores(candidate_path)
+
+    records = _ledger_records(ledger_path)
+    assert len(records) == 2
+    assert {record["scoring_epoch"] for record in records} == {1}
+    assert all(record["scoring_run_id"] == "shared-run" for record in records)
+
+    mutated = dict(records[0])
+    mutated["pairs_source"] = "tampered"
+    lines = ledger_path.read_text(encoding="utf-8").splitlines()
+    lines[0] = json.dumps(mutated, sort_keys=True)
+    ledger_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # A record's own digest check fires before the chain-link check, so both
+    # artifacts fail closed reading the whole (now-corrupted) ledger file --
+    # not only the one whose own shard record was mutated.
+    with pytest.raises(ValueError, match="digest mismatch"):
+        score_universe.load_scores(test_path)
+    with pytest.raises(ValueError, match="digest mismatch"):
+        score_universe.load_scores(candidate_path)
+
+
+# --------------------------------------------------------------------------- fix 4:
+# the oracle_struct diagnostic boundary cannot masquerade as a formal artifact
+
+
+def test_oracle_diagnostic_artifact_cannot_be_spoofed_into_a_formal_heldout_result(
+    tmp_path: Path,
+) -> None:
+    """`save_scores` must force `heldout: False` for an oracle-diagnostic artifact.
+
+    Even a caller that pre-populates `meta["heldout"] = True` alongside
+    `oracle_diagnostic` cannot make the saved artifact claim formal held-out
+    status: `_is_heldout_universe` (which `save_scores` always derives
+    `heldout` from) excludes any artifact carrying `oracle_diagnostic`
+    unconditionally, so the truth-consuming diagnostic can never pass
+    downstream as the formal held-out claim `pairs_source == "test"` would
+    otherwise imply.
+    """
+    output = tmp_path / "oracle_masquerade.npz"
+    values = np.array([0.1, 0.2], dtype=np.float32)
+    meta: dict[str, object] = {
+        "checkpoint_id": "checkpoint",
+        "model_family": "egostitch_e2e",
+        "pairs_source": "test",
+        "strategy": "toy",
+        "num_rows": 2,
+        "created_utc": "2026-08-06T00:00:00Z",
+        "torch_version": "test",
+        "permanent_null": "none",
+        "primary_logit": "full",
+        "score_precision": {
+            "contract": "egostitch_e2e_pair_fp32_v1",
+            "pair_compute_dtype": "float32",
+            "pair_autocast": False,
+            "logit_storage_dtype": "float32",
+        },
+        "oracle_diagnostic": {
+            "generator": "oracle_struct",
+            "truth_source": "test_graph",
+            "diagnostic_only": True,
+        },
+        "heldout": True,  # spoofed input -- save_scores must overwrite it
+    }
+    score_universe.save_scores(
+        output,
+        node_ids=["a", "b"],
+        u_idx=np.array([0, 0], dtype=np.int32),
+        v_idx=np.array([1, 1], dtype=np.int32),
+        logit=values,
+        label=np.array([-1, -1], dtype=np.int8),
+        row_start=0,
+        meta=meta,
+        f_logit=values + 1,
+    )
+
+    loaded = score_universe.load_scores(output)
+    assert loaded.meta["heldout"] is False
+    assert score_universe._is_heldout_universe(loaded.meta) is False
+    assert "test_access_ledger" not in loaded.meta
+    # validate_artifact_precision must not treat the missing ledger binding as
+    # an error: an oracle artifact is exempt from that contract precisely
+    # because it can never satisfy it as a formal result.
+    score_universe.validate_artifact_precision(loaded, label="oracle")

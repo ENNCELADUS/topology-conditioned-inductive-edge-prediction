@@ -257,9 +257,7 @@ class TestSplitScope:
     """Self-loops are kept everywhere; only the test view is also split."""
 
     @pytest.mark.parametrize("pairs_source", ["val", "candidate"])
-    def test_non_test_views_report_headline_only(
-        self, tmp_path: Path, pairs_source: str
-    ) -> None:
+    def test_non_test_views_report_headline_only(self, tmp_path: Path, pairs_source: str) -> None:
         """Val and candidate keep self-loops but emit no split."""
         path = tmp_path / f"{pairs_source}.npz"
         _write_artifact(path, pairs_source=pairs_source)

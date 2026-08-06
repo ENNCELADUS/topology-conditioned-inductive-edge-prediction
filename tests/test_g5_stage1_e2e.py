@@ -275,10 +275,7 @@ def test_real_probe_producer_artifact_is_accepted_by_g5_evaluator(
     )
 
     torch.manual_seed(0)
-    node_tokens = {
-        node: torch.randn(3 + (index % 3), 1536)
-        for index, node in enumerate(nodes)
-    }
+    node_tokens = {node: torch.randn(3 + (index % 3), 1536) for index, node in enumerate(nodes)}
     _write_feature_store(
         data_root / te._FEATURES_SUBDIR,
         node_tokens,
@@ -397,9 +394,7 @@ def test_real_probe_producer_artifact_is_accepted_by_g5_evaluator(
         data_root=data_root,
         strategy="toy",
     )
-    assert cast(dict[str, object], report["metadata"])["format"] == (
-        "egostitch_e2e_probe_v2"
-    )
+    assert cast(dict[str, object], report["metadata"])["format"] == ("egostitch_e2e_probe_v2")
 
 
 def _validation_events(name: str, epochs: int) -> list[dict[str, object]]:
@@ -418,9 +413,7 @@ def _validation_events(name: str, epochs: int) -> list[dict[str, object]]:
     ]
 
 
-def _write_trained_arm_metadata(
-    tmp_path: Path, name: str, *, checkpoint_id: str
-) -> Path:
+def _write_trained_arm_metadata(tmp_path: Path, name: str, *, checkpoint_id: str) -> Path:
     """Write one trained arm's minimal ``run_metadata.json`` plus its V_hold ledger."""
     arm_dir = tmp_path / "runs" / name
     arm_dir.mkdir(parents=True, exist_ok=True)
@@ -597,9 +590,7 @@ class TestBuildE2EArmSummary:
         assert set(arms) == set(g5_stage1._ALL_ARMS)
         for name in g5_stage1._ALL_ARMS:
             row = _d(arms[name])
-            expected_checkpoint = (
-                "ckpt_full" if name in g5_stage1._CONTROL_ARMS else f"ckpt_{name}"
-            )
+            expected_checkpoint = "ckpt_full" if name in g5_stage1._CONTROL_ARMS else f"ckpt_{name}"
             assert row["checkpoint_id"] == expected_checkpoint
             assert "graph_similarity" in _d(row["assembled"])
         liveness = _d(payload["liveness"])
@@ -721,9 +712,7 @@ class TestBuildE2EArmSummary:
         ):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
-    def test_missing_submodule_rms_telemetry_does_not_gate_evaluation(
-        self, tmp_path: Path
-    ) -> None:
+    def test_missing_submodule_rms_telemetry_does_not_gate_evaluation(self, tmp_path: Path) -> None:
         inputs = _seven_arm_inputs(tmp_path)
         metadata_path = _d(inputs["run_metadata_paths"])["full"]
         metadata = json.loads(metadata_path.read_text())
@@ -776,9 +765,7 @@ def test_formal_gate_reports_rev31_telemetry_without_changing_verdict(
     b0cal_results_path = b0cal_output_dir / "b0cal_results.json"
 
     expected_correlations: dict[str, float] = {}
-    for index, (arm, metadata_path) in enumerate(
-        _d(inputs["run_metadata_paths"]).items(), start=1
-    ):
+    for index, (arm, metadata_path) in enumerate(_d(inputs["run_metadata_paths"]).items(), start=1):
         metadata = json.loads(metadata_path.read_text())
         correlation = index / 10
         metadata["training_diagnostics"]["fidelity_series"][0][
@@ -830,9 +817,7 @@ def test_formal_gate_reports_rev31_telemetry_without_changing_verdict(
     monkeypatch.setattr(
         g5_stage1,
         "evaluate_regime_table",
-        lambda **_kwargs: {
-            "degree_corrected": {"ratio_1": SimpleNamespace(auprc=0.5)}
-        },
+        lambda **_kwargs: {"degree_corrected": {"ratio_1": SimpleNamespace(auprc=0.5)}},
     )
 
     def run_gate(output_dir: Path, *, seed: int = 0) -> dict[str, object]:
@@ -854,9 +839,7 @@ def test_formal_gate_reports_rev31_telemetry_without_changing_verdict(
     # values in the emitted metadata are independently sourced, not one
     # field silently duplicated as the other (adversarial-review finding 4).
     reported = run_gate(reported_dir, seed=3)
-    reported_json = json.loads(
-        (reported_dir / "g5_e2e_stage1_results.json").read_text()
-    )
+    reported_json = json.loads((reported_dir / "g5_e2e_stage1_results.json").read_text())
     reported_markdown = (reported_dir / "g5_e2e_stage1_tables.md").read_text()
 
     assert _d(reported["metadata"])["training_seed"] == 0
@@ -882,9 +865,7 @@ def test_formal_gate_reports_rev31_telemetry_without_changing_verdict(
 
     degree_rows = _markdown_table(reported_markdown, "## Degree-decorrelation telemetry")
     for arm, expected in expected_correlations.items():
-        assert degree_rows[arm]["corr(full-f_logit, endpoint degree)"] == g5_stage1._fmt(
-            expected
-        )
+        assert degree_rows[arm]["corr(full-f_logit, endpoint degree)"] == g5_stage1._fmt(expected)
 
     probe_rows = _markdown_table(reported_markdown, "## Probe-v2 evidence")
     expected_probe_rows = {
@@ -911,9 +892,7 @@ def test_formal_gate_reports_rev31_telemetry_without_changing_verdict(
 
     current_summary = cast(dict[str, object], json.loads(json.dumps(summary)))
     for diagnostics_report in _d(current_summary["training_diagnostics"]).values():
-        for row in cast(
-            list[dict[str, object]], _d(diagnostics_report)["fidelity_series"]
-        ):
+        for row in cast(list[dict[str, object]], _d(diagnostics_report)["fidelity_series"]):
             row.pop("topology_delta_degree_correlation", None)
     without_telemetry = run_gate(tmp_path / "gate-without-telemetry")
     assert without_telemetry["verdict"] == reported["verdict"]

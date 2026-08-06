@@ -494,9 +494,7 @@ def test_build_loads_each_source_feature_once(
 def test_fresh_build_does_not_reread_shards_for_sha256(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source_root = _write_feature_root(
-        tmp_path / "source", {"node_a": (3, 4), "node_b": (2, 4)}
-    )
+    source_root = _write_feature_root(tmp_path / "source", {"node_a": (3, 4), "node_b": (2, 4)})
     original_sha256_file = packed_features.sha256_file
     shard_hash_reads: list[str] = []
 

@@ -103,6 +103,8 @@ def dense_rrwp(adj: torch.Tensor, k: int, mask: torch.Tensor | None = None) -> t
         powers.append(current)
         current = torch.bmm(current, transition)
     return torch.stack(powers[:k], dim=-1)
+
+
 """Degree clamp for the row normalization. Upstream zeroes ``1/deg`` at
 ``inf`` instead (`rrwp.py`: ``deg_inv[deg_inv == float('inf')] = 0``); with a
 soft adjacency an isolated row's degree is a small positive float rather than
@@ -324,9 +326,7 @@ class GritGmtEncoder(GraphEncoder):
 
     # ------------------------------------------------------------------ RRWP
 
-    def _rrwp(
-        self, adj: torch.Tensor, mask: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _rrwp(self, adj: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute the dense RRWP stack and its diagonal.
 
         Args:
@@ -435,9 +435,16 @@ class GritGmtEncoder(GraphEncoder):
             # zero-weighted sum so this branch cannot silently detach the
             # generator during a degenerate step.
             zero = graph.x.sum() * 0.0
-            tokens = torch.zeros(
-                batch, nodes + self.seeds, self.out_dim, device=graph.x.device, dtype=graph.x.dtype
-            ) + zero
+            tokens = (
+                torch.zeros(
+                    batch,
+                    nodes + self.seeds,
+                    self.out_dim,
+                    device=graph.x.device,
+                    dtype=graph.x.dtype,
+                )
+                + zero
+            )
             return GraphEmbedding(tokens=tokens, pooled=tokens[:, nodes:].mean(dim=1))
 
         flat_x = self.node_embed(node_input[batch_row, node_col])

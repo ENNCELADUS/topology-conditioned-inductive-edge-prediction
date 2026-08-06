@@ -16,9 +16,7 @@ _ConfigT = TypeVar("_ConfigT")
 
 _FEATURE_STANDARDIZATION_MODES = frozenset({"row_layernorm", "zscore_vfit_v1"})
 
-CONDITIONING_MODES = frozenset(
-    {"film_logit", "pooled_adapter", "xattn_cls", "xattn_tokens"}
-)
+CONDITIONING_MODES = frozenset({"film_logit", "pooled_adapter", "xattn_cls", "xattn_tokens"})
 """The conditioning-ladder rungs `ClassifierConfig.conditioning_mode` may name.
 
 Public (unlike `_FEATURE_STANDARDIZATION_MODES`) because
@@ -177,9 +175,7 @@ class EgoStitchConfig:
         if not -1.0 <= self.tau_div <= 1.0:
             raise ValueError(f"tau_div must be in [-1, 1], got {self.tau_div}")
         if self.l_gate_pos_weight <= 0.0:
-            raise ValueError(
-                f"l_gate_pos_weight must be positive, got {self.l_gate_pos_weight}"
-            )
+            raise ValueError(f"l_gate_pos_weight must be positive, got {self.l_gate_pos_weight}")
         for name in ("denoise_fraction", "null_dropout"):
             value = float(getattr(self, name))
             if not 0.0 <= value <= 1.0:
@@ -266,9 +262,7 @@ class GeneratorConfig:
         if self.oracle_seed < 0:
             raise ValueError(f"oracle_seed must be non-negative, got {self.oracle_seed}")
         if self.oracle_truth_source not in ("g_fit", "g_fit_plus_v_hold"):
-            raise ValueError(
-                "oracle_truth_source must be one of ['g_fit', 'g_fit_plus_v_hold']"
-            )
+            raise ValueError("oracle_truth_source must be one of ['g_fit', 'g_fit_plus_v_hold']")
         if self.oracle_truth_source != "g_fit" and self.name != "oracle_struct":
             raise ValueError(
                 "oracle_truth_source='g_fit_plus_v_hold' requires name='oracle_struct'"
@@ -278,13 +272,10 @@ class GeneratorConfig:
         if not -1.0 <= self.tau_div <= 1.0:
             raise ValueError(f"tau_div must be in [-1, 1], got {self.tau_div}")
         if self.l_gate_pos_weight <= 0.0:
-            raise ValueError(
-                f"l_gate_pos_weight must be positive, got {self.l_gate_pos_weight}"
-            )
+            raise ValueError(f"l_gate_pos_weight must be positive, got {self.l_gate_pos_weight}")
         if self.feature_standardization not in _FEATURE_STANDARDIZATION_MODES:
             raise ValueError(
-                "feature_standardization must be one of "
-                f"{sorted(_FEATURE_STANDARDIZATION_MODES)}"
+                f"feature_standardization must be one of {sorted(_FEATURE_STANDARDIZATION_MODES)}"
             )
         if self.feature_stats_sha256 and (
             len(self.feature_stats_sha256) != 64
@@ -451,13 +442,11 @@ class ClassifierConfig:
             raise ValueError(f"p_topo must be in [0, 1], got {self.p_topo}")
         if self.permanent_null not in ("none", "all_head"):
             raise ValueError(
-                "permanent_null must be one of 'none' or 'all_head', "
-                f"got {self.permanent_null!r}"
+                f"permanent_null must be one of 'none' or 'all_head', got {self.permanent_null!r}"
             )
         if not 0.0 < self.conditioning_ema_decay < 1.0:
             raise ValueError(
-                "conditioning_ema_decay must be in (0, 1), "
-                f"got {self.conditioning_ema_decay}"
+                f"conditioning_ema_decay must be in (0, 1), got {self.conditioning_ema_decay}"
             )
         if self.conditioning_mode not in CONDITIONING_MODES:
             raise ValueError(

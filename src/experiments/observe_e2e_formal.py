@@ -119,9 +119,7 @@ def report_generator_clipping(profile: Mapping[str, object]) -> list[str]:
             if coefficient < _IMMEDIATE_COEFFICIENT:
                 state["immediate_misses"] = cast(int, state["immediate_misses"]) + 1
             if coefficient < _PERSISTENT_COEFFICIENT:
-                state["persistent_step_count"] = (
-                    cast(int, state["persistent_step_count"]) + 1
-                )
+                state["persistent_step_count"] = cast(int, state["persistent_step_count"]) + 1
                 streaks[name] = streaks.get(name, 0) + 1
             else:
                 streaks[name] = 0
@@ -213,9 +211,7 @@ def report_slot_collapse(
         int(cast(float, entry.get("epoch", -1)))
         for entry in history
         if bool(
-            cast(Mapping[str, object], entry.get("quality_thresholds") or {}).get(
-                "slot_collapse"
-            )
+            cast(Mapping[str, object], entry.get("quality_thresholds") or {}).get("slot_collapse")
         )
     ]
     lines.append(f"epochs with slot_collapse predicate true: {tripped or 'none'}")
@@ -269,9 +265,7 @@ def build_report(output_dir: Path) -> str:
     if not profile_path.is_file():
         raise FileNotFoundError(f"profile.json not found under {output_dir}")
     profile = _load_json(profile_path)
-    history: list[dict[str, object]] = (
-        _load_jsonl(metrics_path) if metrics_path.is_file() else []
-    )
+    history: list[dict[str, object]] = _load_jsonl(metrics_path) if metrics_path.is_file() else []
     header = [f"EgoStitch E2E formal-run observation report: {output_dir}"]
     if metadata_path.is_file():
         metadata = _load_json(metadata_path)

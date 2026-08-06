@@ -163,12 +163,8 @@ class TestPoolMethodHashCacheBinding:
         """The same node set + n_ground under two role identities hash differently."""
         cache_fit = tmp_path / "fit.npz"
         cache_qual = tmp_path / "qual.npz"
-        build_grounding_pool(
-            _F0, _NODES, n_ground=2, role_universe="V_fit", cache_path=cache_fit
-        )
-        build_grounding_pool(
-            _F0, _NODES, n_ground=2, role_universe="V_qual", cache_path=cache_qual
-        )
+        build_grounding_pool(_F0, _NODES, n_ground=2, role_universe="V_fit", cache_path=cache_fit)
+        build_grounding_pool(_F0, _NODES, n_ground=2, role_universe="V_qual", cache_path=cache_qual)
         with np.load(cache_fit) as data_fit, np.load(cache_qual) as data_qual:
             assert str(data_fit["pool_method_hash"]) != str(data_qual["pool_method_hash"])
 

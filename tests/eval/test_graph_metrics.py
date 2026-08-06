@@ -444,9 +444,7 @@ class TestGraphSimilarityMatchesPring:
         ref = nx.gnp_random_graph(30, 0.15, seed=seed + 100)
         pred.add_edges_from((i, i) for i in range(self_loop_nodes))
         ref.add_edges_from((i, i) for i in range(int(self_loop_nodes * 0.8)))
-        assert compute_graph_similarity(pred, ref) == pytest.approx(
-            self._pring_gs(pred, ref)
-        )
+        assert compute_graph_similarity(pred, ref) == pytest.approx(self._pring_gs(pred, ref))
 
     def test_stays_within_the_papers_stated_range(self) -> None:
         """GS never leaves [0, 1], unlike the literal 2*Dice-1 reading."""

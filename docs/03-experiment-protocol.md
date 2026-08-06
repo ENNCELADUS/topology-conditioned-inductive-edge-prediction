@@ -608,6 +608,15 @@ rule).
 5. **E7** — downstream utility (load-bearing; runs with, not after, breadth).
 6. **E6** — split/benchmark generalization.
 
+Within each experiment, per-arm execution is a single sequence, not train followed by a
+separate manual scoring/reporting step: `hpc/run.sh train <config> ...` packs, trains,
+publishes, then automatically scores V_hold, freezes the max-F1 operating point, scores
+test and candidate, and writes the combined edge+graph `test_report.json` before the
+command returns (`hpc/README.md`). A debug `--max-steps` run skips this test stage
+entirely. The external CAZI-MBN baseline and the two scoring-time structure controls
+(which reuse the `full` EgoStitch arm's checkpoint and have no `train` invocation of
+their own) reach the same report through `hpc/run.sh test` directly.
+
 ### 5.2 Pre-registered decision rules (frozen before held-out metrics are opened)
 
 1. If `Ours` does not beat `B3-full` and `B0+cal` on the held-out assembled family at matched

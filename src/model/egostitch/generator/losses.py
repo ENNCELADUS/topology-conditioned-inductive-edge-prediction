@@ -131,20 +131,14 @@ def alignment_loss(
         log_plan_fp32 = log_plan.float()
         log_row_mass = torch.logsumexp(log_plan_fp32, dim=2, keepdim=True)
         log_col_mass = torch.logsumexp(log_plan_fp32, dim=1, keepdim=True)
-        conditional = 0.5 * (
-            log_plan_fp32 - log_row_mass + log_plan_fp32 - log_col_mass
-        )
+        conditional = 0.5 * (log_plan_fp32 - log_row_mass + log_plan_fp32 - log_col_mass)
         teacher_fp32 = teacher_cells.float()
         teacher_count = teacher_fp32.sum(dim=(1, 2))
         per_row = -(
-            torch.where(teacher_cells, conditional, torch.zeros_like(conditional)).sum(
-                dim=(1, 2)
-            )
+            torch.where(teacher_cells, conditional, torch.zeros_like(conditional)).sum(dim=(1, 2))
             / teacher_count.clamp_min(1.0)
         )
-        effective_mask = (
-            positive_real_mask.float() * (teacher_count > 0).float()
-        )
+        effective_mask = positive_real_mask.float() * (teacher_count > 0).float()
         return _masked_global_mean(
             per_row,
             effective_mask,
@@ -165,9 +159,7 @@ def relational_loss(
     if prediction.shape != target.shape or prediction.ndim != 2 or prediction.shape[1] != 2:
         raise ValueError("prediction and target must both have shape (B, 2)")
     with torch.autocast(device_type=prediction.device.type, enabled=False):
-        per_row = F.smooth_l1_loss(
-            prediction.float(), target.float(), reduction="none"
-        ).mean(dim=1)
+        per_row = F.smooth_l1_loss(prediction.float(), target.float(), reduction="none").mean(dim=1)
         return _masked_global_mean(
             per_row,
             real_row_mask,
@@ -622,9 +614,7 @@ def _recon_total(
     factors = dict.fromkeys(_RECON_COMPONENT_NAMES, 1.0)
     if family == "egostitch_e2e" and recon_factors is not None:
         if set(recon_factors) != set(_RECON_COMPONENT_NAMES):
-            raise ValueError(
-                "recon_factors must name exactly the ten L_recon components"
-            )
+            raise ValueError("recon_factors must name exactly the ten L_recon components")
         factors.update({name: float(value) for name, value in recon_factors.items()})
     l_recon = (
         factors["feat"] * config.w_feat * recon["feat"]

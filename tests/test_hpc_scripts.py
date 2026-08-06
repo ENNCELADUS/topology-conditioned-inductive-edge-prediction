@@ -60,7 +60,7 @@ def test_help_is_available_without_the_remote_container(bash_exe: str) -> None:
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    for command in ("check", "train", "score", "merge", "g1", "g2"):
+    for command in ("check", "train", "score", "test", "merge", "g1", "g2"):
         assert f"hpc/run.sh {command}" in result.stdout
     # `s0-score` served the retired frozen-s0 family and must not come back.
     assert "s0-score" not in result.stdout
@@ -69,6 +69,11 @@ def test_help_is_available_without_the_remote_container(bash_exe: str) -> None:
     assert "qualification.sh" not in result.stdout
     assert "src.train_egostitch" in result.stdout
     assert "src.train_cazi_mbn" in result.stdout
+    # score/test are thin passthroughs; the shell no longer owns sharding or
+    # the held-out protocol itself.
+    assert "src.score_fanout" in result.stdout
+    assert "src.eval.test_protocol" in result.stdout
+    assert "--rescore-reason" in result.stdout
 
 
 def test_cazi_uses_isolated_h20_train_worker() -> None:
@@ -76,6 +81,34 @@ def test_cazi_uses_isolated_h20_train_worker() -> None:
     text = RUNNER.read_text()
     assert '"$2" == "src.train_cazi_mbn"' in text
     assert '-m src.train_cazi_mbn "${CONFIG_PATH}" --device cuda' in text
+    # Not exec'd: training must complete before the chained test protocol runs
+    # against the checkpoint CAZI itself publishes.
+    assert 'exec "${PYTHON_BIN}" -m src.train_cazi_mbn' not in text
+
+
+def test_cazi_chains_the_held_out_test_protocol() -> None:
+    """CAZI has no pipeline `test` stage of its own, so the branch chains one."""
+    text = RUNNER.read_text()
+    assert "from src.train_cazi_mbn import load_config" in text
+    assert "-m src.eval.test_protocol" in text
+    assert '--checkpoint "${CAZI_OUTPUT_DIR}/student.pt"' in text
+    assert "--arm cazi_mbn" in text
+    # CAZI's `student.pt` is a bare state_dict, so the family and its own YAML
+    # must be named or `score_universe` cannot build the model at all.
+    assert "--model-family cazi_mbn" in text
+    assert '--model-config "${CONFIG_PATH}"' in text
+
+
+def test_cazi_trains_without_opening_held_out_data() -> None:
+    """`--stage all` would score test+candidate before V_hold freezes the threshold.
+
+    CAZI's default stage runs `score_and_evaluate`, which reads the balanced test
+    pairs and the candidate universe. Chaining the test protocol after that would
+    both duplicate the held-out result and invert the documented ordering, so the
+    training call must be train-only and the protocol must own every held-out read.
+    """
+    text = RUNNER.read_text()
+    assert '-m src.train_cazi_mbn "${CONFIG_PATH}" --device cuda --stage train' in text
 
 
 def test_runner_discovers_visible_h20s() -> None:
@@ -114,23 +147,27 @@ def test_runner_dispatches_to_the_implemented_clis() -> None:
     """Each command maps directly to one repository Python module."""
     text = RUNNER.read_text()
     assert "-m src.e2_pipeline" in text
-    assert "-m src.score_universe score --device cuda --amp bf16" in text
+    assert "-m src.score_fanout" in text
+    assert "-m src.eval.test_protocol" in text
     assert "-m src.score_universe merge" in text
     assert "-m src.experiments.g1_hardened_e2" in text
     assert "-m src.experiments.g2_ceiling" in text
     assert 'tests/test_e2_ddp_integration.py -m "integration and not slow"' in text
 
 
-def test_scoring_is_auto_sharded_and_strictly_merged() -> None:
-    """`score` owns sharding: one contiguous shard per visible GPU, then a merge."""
+def test_scoring_is_a_thin_passthrough_to_score_fanout() -> None:
+    """`score` no longer orchestrates sharding itself: `src.score_fanout` owns it."""
     text = RUNNER.read_text()
 
     assert "s0-score" not in text
     assert "outputs/s0_cache" not in text
-    assert 'fail "hpc/run.sh score owns sharding' in text
-    assert '--shard "${gpu}"' in text
-    assert '--num-shards "${GPU_COUNT}"' in text
-    assert '-m src.score_universe merge --inputs "${shard_inputs[@]}"' in text
+    # The shard/merge guard and orchestration loop moved into the Python
+    # module; the shell must not duplicate `--shard`/`--num-shards` handling.
+    assert "parallel_score" not in text
+    assert "hpc/run.sh score owns sharding" not in text
+    assert '--shard "${gpu}"' not in text
+    assert '--num-shards "${GPU_COUNT}"' not in text
+    assert 'exec "${PYTHON_BIN}" -m src.score_fanout "$@"' in text
 
 
 @pytest.mark.parametrize(
