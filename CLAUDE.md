@@ -1,159 +1,136 @@
 # CLAUDE.md
 
-Guidance for Claude Code and Codex working in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+`AGENTS.md` is a symlink to this file.
 
 ## What this is
 
-A research-paper project targeting ICLR 2027: *Topology-Conditioned Inductive Edge
-Prediction*. `README.md` is the human entry point (orientation, status, structure map).
-This file holds the *constraints*.
+Research code for an ICLR 2027 paper, *Topology-Conditioned Inductive Edge Prediction*. `README.md`
+orients, `docs/` holds the specs, this file holds the constraints. Doc authority, later refining
+earlier: `01-blueprint` → `02-methodology` → `03-experiment-protocol` → `04-model-proposal` →
+`05-egostitch-spec` → `results/*`; the model's current design is
+`docs/superpowers/specs/2026-08-02-three-component-refactor-design.md`. Keep code and spec in step
+within one change; flag genuine conflicts rather than resolving them silently.
 
-**`docs/` are binding contracts, not documentation.** `docs/05-egostitch-spec.md` was
-signed off at G4 and is frozen: code may not silently deviate — edit the spec first
-with a §12 change-log line, then the code. A spec rewrite authorizes *implementation*,
-not *execution* (§14). Authority order: `01-blueprint` → `02-methodology` →
-`03-experiment-protocol` → `04-model-proposal` → `05-egostitch-spec` → `results/*`.
-Later refines earlier, but blueprint §10 Locked Decisions and protocol §0 override
-casual changes — **flag conflicts, don't resolve them unilaterally**.
+**Core thesis — do not let it drift:** inductive edge prediction is topology-conditioned binary
+classification, not independent pairwise scoring and not graph generation. Generated local topology
+is always intermediate context; the output is always a 0/1 decision for a queried pair. Every piece
+of writing must answer "how does this help predict `edge(u, v)` for unseen nodes?"
 
-**Active design:** `docs/superpowers/specs/2026-08-02-three-component-refactor-design.md`
-governs the current EgoStitch component-interface refactor and the excision of the
-preregistration/formal-run-registration machinery (its §10). The owner has withdrawn
-the registration mechanism; experiments are run directly, without a plan/artifact
-identity gate.
+## Engineering rules
 
-## After each implementation wave
+- Do not preserve backward compatibility. Remove obsolete paths instead of adding compatibility
+  layers, fallbacks, or migrations.
+- Choose the simplest implementation that fully meets the current requirement. Avoid speculative
+  abstraction, configuration, and indirection.
+- Grow the system in layers: start from the smallest version that works end to end, and add each
+  capability on top of something that already works. Never trade a working product for unfinished
+  complexity.
+- Keep components modular and concerns clearly separated.
+- Prefer established, well-maintained libraries when they reduce complexity or improve reliability.
+  Do not reimplement common functionality without a clear reason.
+- Lean on the dependencies already in the project before writing your own implementation or adding
+  packages; check a library's docs and types before assuming it lacks a capability.
+- Make architectural decisions for the long term. No stopgap meant to be replaced later.
 
-**You run the review, not the user.** Background it to a file and read the findings
-when it finishes — output runs to ~200 KB, so never let it land in context:
+## Commands
+
+Local (macOS, CPU only): use `.venv/bin/python -m …` — `rtk` garbles `uv run` output.
 
 ```bash
-CH=<scratch>/codex-home; mkdir -p "$CH"; cp ~/.codex/auth.json "$CH/"
-printf 'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "high"\napproval_policy = "never"\nsandbox_mode = "workspace-write"\n' > "$CH/config.toml"
-CODEX_HOME="$CH" codex review --base <WAVE_BASE_SHA> > <wave>-review.txt 2>&1
+.venv/bin/python -m pytest                                          # full suite (xdist, loadfile)
+.venv/bin/python -m pytest tests/test_score_universe.py -n0 -k density   # one file / one test
+.venv/bin/python -m ruff check src tests && .venv/bin/python -m ruff format src tests
+.venv/bin/python -m mypy src tests                                  # strict
+uv sync                                                             # dependencies
 ```
 
-`/codex:review` is `disable-model-invocation`, but that blocks only the slash command
-— the `codex` CLI beneath it is yours to run.
+Use `-n0` when debugging — xdist swallows breakpoints. Tests in one file share state, so
+`--dist loadfile` is required, never `--dist load`.
 
-Runtime, for any training/scoring/gate command: the world size is **auto-detected**
-from all visible NVIDIA H20 devices via `hpc/run.sh`, and config keys change meaning
-per model family. EgoStitch e2e trains through the same `hpc/run.sh train` branch as
-the baselines, naming the worker explicitly:
-`hpc/run.sh train <config.yaml> --worker-module src.train_egostitch --run-kind formal`.
+GPU work runs only in the H20 container via `hpc/run.sh` (`check | train | score | merge | g1 | g2`);
+world size and score shards are auto-detected from visible GPUs, and there is no scheduler. Config
+keys change meaning per `model.family`; direct `python -m src.train_b0` is debug-only. Runbook:
+`hpc/README.md` and the `hpc-execution` skill.
 
-**`-c 'mcp_servers={}'` does NOT disable MCP** — `-c` merges into the config, so the
-`[mcp_servers.*]` sub-tables in `~/.codex/config.toml` survive it. Verified 2026-07-25:
-a review launched with that override still started `gitnexus/detect_changes` and hung
-there with zero output growth, which is the same failure that killed two Phase B
-reviews. A clean `CODEX_HOME` (no `[mcp_servers]` table at all) is the fix; it also
-carries model and effort, so no `-c` flags are needed. `--effort` is not a valid flag
-either — `review` takes only `--base/--scope/--model/--cwd`, and a stray value is
-parsed as focus text, which is rejected.
+```bash
+hpc/run.sh train configs/b0_v31_breadth_first.yaml                  # baseline
+hpc/run.sh train configs/egostitch_e2e_v3_full_breadth_first.yaml \
+  --worker-module src.train_egostitch --run-kind formal             # EgoStitch e2e
+```
 
-## The core thesis (do not let it drift)
+Review each implementation wave yourself: `CODEX_HOME=<scratch>/codex-home codex review --base <sha>
+> wave-review.txt 2>&1`, backgrounded — ~200 KB of output must never land in context. That home needs
+only `auth.json` and a `config.toml` pinning model/effort; `-c 'mcp_servers={}'` merges rather than
+overrides, leaving the MCP tables alive, which hangs the review with zero output.
 
-Inductive edge prediction is **topology-conditioned binary classification** — not
-independent pairwise scoring, not graph generation. Generated local topology is always
-*intermediate context*; the final task is always binary edge prediction for queried
-pairs. Every section must answer "how does this help predict `edge(u, v)` for unseen
-nodes?" (`docs/lit-review-plan.md` §5, binding for all writing.)
+## Architecture
 
-## Integrity gates and claim rules (non-negotiable — the strict protocol is the contribution)
+Flow: benchmark artifacts → node partition + grounding pools → packed bf16 features → DDP training →
+score-once artifacts → gate and eval analyses.
 
-- **Edge-level and assembled-graph metrics are always reported together.** No
-  single-metric-family claims. Protocol §E5; methodology §6.
-- **Never claim significance or cross-seed robustness from a G5 Stage-1 screen** — it
-  is fixed-Seed-0 engineering evidence; p-values/CIs/Holm must be `null`. Only E1/E3
-  (≥3 seeds + Holm) carry inference.
-- **The topology result is five numbers, always reported together and never
-  aggregated: GS, RD, and the degree / clustering / spectral MMD ratios.** GS↑,
-  RD→1, the three MMD ratios↓. Never collapse the three MMD ratios into one score,
-  and never invent a composite and label it "graph similarity" — **GS is a real,
-  separate metric** (edge-set Dice/F1, `src/eval/graph_metrics.py:19`), not a
-  summary of the MMD family. Global simple-edge RD and BFS-macro RD are named
-  separately, always; the same global/BFS-macro distinction applies to GS.
-- Dispositions are **owner-side decisions** — never settled by a screen, a note, or an
-  agent.
+- `src/data/` — `artifacts.py` verified benchmark loader; `partition.py:build_g_struct` is the only
+  legal structural graph; `grounding.py` universe-scoped candidate pools; `internal_holdout.py`
+  V_hold; `packed_features.py`/`features.py` bf16 pack and F0 cache; `pairs.py` batching.
+- `src/model/egostitch/` — three independently swappable components behind `registry.py`, composed by
+  `composite.py`, talking through `graph.py`'s dataclasses (`ImaginedGraph`, `GraphEmbedding`,
+  `PairInputs`). `generator/` imagines a graph (`egostitch_imagine`, `null`, `oracle_struct`),
+  `encoder/` encodes one (`ste_typed`, `grit_gmt`), `classifier/` decides the edge (`b0_v31`). Each
+  slot is chosen by the `name` field of its config section, so adding a component is one registry
+  entry, never a change to `composite.py`. No encoder may read `ImaginedGraph.aux`: it is
+  generator-private, and a generator swap invalidates it wholesale.
+- `src/train_{egostitch,b0,cazi_mbn}.py` DDP workers; `src/e2_pipeline.py` orchestrates
+  pack → train → publish; `src/score_universe.py` writes score-once artifacts; `src/experiments/`
+  holds the gate analyses (`g1_hardened_e2`, `g2_ceiling`, `g3_oracle`, `g5_stage1`, `probes`,
+  `observe_e2e_formal`) and `src/eval/` the edge/graph metrics, assembly, and calibration.
 
-## Data contract traps
+Experiments run directly; there is no plan, registration, or qualification gate. Model-quality signals
+(liveness, slot collapse, margins, dispersion) are telemetry in `profile.json`/`metrics.jsonl` and
+never block a run; non-finite state, DDP disagreement, data-boundary violations, and I/O failures stay
+fail-closed.
 
-- **`*_ratio5_exclusive.txt` is quarantined** (all strategies): its negatives leak
-  across the node split. No loader in `src/` reads them — keep it that way.
-  `src/data/artifacts.py:9`, spec §9.3.
-- **`train_graph.pkl` contains every val positive** (`artifacts.py:258` asserts
-  `train⁺ ∪ val⁺`). It is for split audits only. Everything structural must come from
-  `build_g_struct` (`src/data/partition.py:71`). `val_edges.txt` is model selection
-  only, never a training target.
-- **`exclude_nodes` filters only `train/val/test_pairs`** (`artifacts.py:367`) —
-  `graph`, `train_graph`, `test_graph`, and `buckets` come back unfiltered, so
-  featureless nodes silently survive into structural computations.
-- **Self-loop policy is asymmetric**: training structural targets strip self-loops;
-  canonical MMD descriptors and official GS/RD induced subgraphs *retain* them, exactly
-  as the benchmark evaluator does. Spec §9.4.
-- **Grounding pools are universe-scoped** (`V_fit` = training, `V_hold` = validation,
-  test; separately hashed, and both ladder stages share the same three). One cache may
-  never serve another; a training pass may not read a `V_hold` row. Spec §13.12.
-- **Topology and classification use the same train positives.** There is no seeded
-  message/supervision split or `data.partition_seed`/`msg_fraction` knob. Topology uses
-  the loopless projection; classification retains self-pairs. Edge-stream structural
-  targets must explicitly remove the queried partner and decrement its degree. Spec §9.3.
-- **`V_hold` stays the union of the two deterministic 256-node BFS draws** over the full
-  training topology. The 2026-08-03 shared-interaction correction changed that graph and
-  invalidated every older `V_fit` cache, pack, digest, threshold, and result.
+## Claim rules
 
-## Traps that silently corrupt results rather than raising
+- Report edge-level and assembled-graph metrics together — never one family alone.
+- The topology result is five numbers, always together and never aggregated: GS, RD, and the degree /
+  clustering / spectral MMD ratios (GS↑, RD→1, ratios↓). GS is edge-set Dice/F1
+  (`src/eval/graph_metrics.py`), not an MMD summary; global simple-edge and BFS-macro RD (and GS) are
+  always named separately.
+  
+## Data-contract traps
 
-- **`load_scores` does no precision validation** (`src/score_universe.py:648`). A
-  bf16-contaminated EgoStitch artifact loads and analyses cleanly. Call
-  `validate_artifact_precision(artifact, label=...)` yourself — it is the only correct
-  entry point; calling `validate_score_precision` directly on an `egostitch_e2e`
-  artifact spuriously raises "missing arrays".
-- **There is no checkpoint-eligibility predicate, by owner decision (2026-08-02).**
-  `e2e_checkpoint_eligible` is deleted and nothing replaces it: `select_e2e_checkpoint`
-  returns the best record by AUPRC → clustering MMD → Brier and will happily return a
-  degenerate one. No code decides whether a checkpoint is scientifically usable —
-  judge it yourself from the per-epoch rows in `metrics.jsonl`. Do not reintroduce an
-  automated eligibility gate.
-- **The fp32 island in `stitch.py:80` must promote `h`/`pi`/`m` before** cost and
-  marginal products are formed. Casting afterward keeps the bf16 ulp grid (0.03125
-  spacing at |logit| ∈ [4,8)) and silently quantizes logits. Spec §13.16.
-- **Null-head naming is inverted** at `src/model/egostitch/e2e_model.py:596`:
-  `pair_content` comes from `NULL_TOPO_HEAD`, `pair_topology` from `NULL_CONTENT_HEAD`.
-  Swapping them mislabels two published arms.
-- **F0 caches serve supersets silently**: with `allow_cache_subset=True`
-  (`features.py:130`; live at `train_egostitch.py:2245`, `probes.py:892`,
-  `score_universe.py:1624`/`:1723`) a superset cache is gathered into a *different* node
-  set with no content digest. Exact-order F0 mismatches (`features.py:140`) and grounding
-  `pool_method_hash` mismatches now raise — this subset path is the one that stays quiet.
-- **Packed-feature manifests depend on `index.json` insertion order**
-  (`packed_features.py:571`); sorting or reserializing it invalidates the pack. The F0
-  cache written during packing holds exact fp32 means taken *before* bf16 conversion,
-  so it is not reproducible from the shards.
-- **Density-matched thresholds** are computed on non-self rows (`u_idx != v_idx`)
-  against a self-loop-*stripped* reference edge count, yet self-pairs still assemble as
-  self-loops at that same threshold (`g1_hardened_e2.py:822`). Including self-pairs in
-  the quota, or dropping them from assembly, shifts every operating point.
+- `*_ratio5_exclusive.txt` is quarantined: its negatives leak across the node split, and no loader in
+  `src/` reads them.
+- `train_graph.pkl` is train⁺ ∪ val⁺ — split audits only. Structure comes from `build_g_struct`;
+  `val_edges.txt` is model selection, never a training target.
+- `exclude_nodes` filters only `train/val/test_pairs`, so featureless nodes survive in `graph`,
+  `train_graph`, `test_graph`, and `buckets`.
+- Self-loops: training structural targets strip them; canonical MMD descriptors and official GS/RD
+  subgraphs keep them, as the benchmark evaluator does.
+- Grounding pools are universe-scoped (`V_fit` train, `V_hold` validation, test): no cache crosses
+  universes, and a training pass may not read a `V_hold` row.
+- Topology and classification share the same train positives (no message/supervision split): loopless
+  projection for topology, self-pairs kept for classification, and edge-stream structural targets must
+  drop the queried partner and decrement its degree.
+- `V_hold` is the union of two deterministic 256-node BFS draws (`internal_holdout.py`); the 2026-08-03
+  shared-interaction correction changed that graph and invalidated every earlier cache, pack,
+  threshold, and result.
 
-## Numbers and naming
+## Traps that corrupt results silently instead of raising
 
-The load-bearing E2/G1/G2/G3 values are duplicated across
-`docs/results/E2-pair-to-topology-gap.md` (canonical), `docs/03-experiment-protocol.md`,
-`docs/04-model-proposal.md`, `README.md`, and `figures/e2-gap.html`. Read the canonical
-file rather than trusting a remembered number, and update all five together.
-Current G5 verdicts live in `docs/results/G5-stage1-seed0-20260717.md` (frozen-s0, `cut`
-— evidence retained; its producing code last exists at `dcae090` and is deleted in the
-current cleanup worktree pending commit) and
-`docs/results/G5-e2e-stage1-seed0-20260724.md` (rev-3.0 e2e, `cut`). The active line is
-rev-3.2 on a single formal stage, run directly (`hpc/run.sh train`) without a
-preregistration plan or artifact-identity gate — see
-`docs/superpowers/specs/2026-08-02-three-component-refactor-design.md` §10.
-
-Benchmark and baseline names (`Benchmark-A/B/C`, `B0`, `B0-alt`, `B0-e2e`, `B1`,
-`B2-*`, `B3`, `B5`, `Ours`, `Oracle`, `PA-null`) are deliberate dataset-agnostic
-placeholders. Don't substitute real dataset names unless asked, never conflate `B0`
-with `B0-e2e`, and keep `PA-null` as a mandatory control.
-
-`literature/` is a hand-curated, gitignored reference collection. Citations in
-`docs/04-model-proposal.md` §8 are verified against arXiv or a local PDF — verify new
-ones the same way before quoting them as fact.
+- `load_scores` does no precision validation, so a bf16-contaminated EgoStitch artifact loads and
+  analyses cleanly. Call `validate_artifact_precision(artifact, label=…)`; `validate_score_precision`
+  called directly on an `egostitch_e2e` artifact spuriously raises "missing arrays".
+- `select_e2e_checkpoint` ranks by AUPRC → clustering MMD → Brier and will return a degenerate
+  checkpoint. There is no eligibility predicate and none should be added — judge usability from the
+  per-epoch rows in `metrics.jsonl`.
+- The fp32 islands in `generator/assemble.py` must promote their inputs *before* cost and marginal
+  products are formed; casting afterwards keeps the bf16 ulp grid and silently quantizes logits.
+- `allow_cache_subset=True` (live in `probes.py`, `score_universe.py`) gathers a superset F0 cache
+  into a different node set with no content check. Exact-order mismatches raise; this path stays quiet.
+- Packed-feature manifests depend on `index.json` insertion order; sorting or reserializing it
+  invalidates the pack. Its F0 cache holds fp32 means taken before bf16 conversion, so it is not
+  reproducible from the shards.
+- Density-matched thresholds are computed on non-self rows against a self-loop-stripped reference edge
+  count, yet self-pairs still assemble as self-loops at that threshold (`g1_hardened_e2.py`); changing
+  either side moves every operating point.
