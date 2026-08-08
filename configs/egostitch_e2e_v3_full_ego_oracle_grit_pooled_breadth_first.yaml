@@ -57,6 +57,7 @@ optim:
   epochs: 30
   warmup_steps: 500
   grad_clip: 1.0
+  gradient_accumulation_steps: 128
 
 training:
   positive_weight: 5.0

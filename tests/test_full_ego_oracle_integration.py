@@ -72,6 +72,34 @@ def test_training_full_oracle_is_diagnostic_only() -> None:
         )
 
 
+def test_full_oracle_skips_inapplicable_initial_slot_health_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = EgoStitchModel(_model_config())
+
+    def _unexpected_validation(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("full oracle has no learned slot geometry to validate")
+
+    monkeypatch.setattr(train_egostitch, "_validate_epoch", _unexpected_validation)
+    validation_events: list[tuple[str, int | None, int]] = []
+
+    report = train_egostitch._enforce_e2e_initial_slot_health(
+        model,
+        cast(Any, SimpleNamespace(val_pairs=[("u", "v")])),
+        cast(Any, SimpleNamespace()),
+        edge_batch=1,
+        topk_fraction=0.1,
+        token_table=None,
+        token_node_index=None,
+        validation_event_callback=lambda kind, epoch, step: validation_events.append(
+            (kind, epoch, step)
+        ),
+    )
+
+    assert report == {}
+    assert validation_events == []
+
+
 def test_runnable_config_preserves_full_neighbors_with_single_pair_batches() -> None:
     path = (
         Path(__file__).parents[1]
@@ -89,6 +117,7 @@ def test_runnable_config_preserves_full_neighbors_with_single_pair_batches() -> 
     assert cfg.classifier.conditioning_mode == "pooled_adapter"
     assert payload["training"]["phase_a_fraction"] == 0.0
     assert run_cfg.data.edge_batch == 1
+    assert run_cfg.optim.gradient_accumulation_steps == 128
     assert score_universe._full_oracle_score_batch_specs(3) == [
         ([0], [(0, 0)]),
         ([1], [(1, 0)]),

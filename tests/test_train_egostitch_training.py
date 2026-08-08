@@ -101,6 +101,7 @@ def _training_config(tmp_path: Path) -> Path:
 def test_e2e_config_schema_is_strict_and_preserves_run_kind(tmp_path: Path) -> None:
     cfg = te.load_config(_training_config(tmp_path))
     assert cfg.training == te.EgoStitchTrainingConfig()
+    assert cfg.optim.gradient_accumulation_steps == 1
 
     raw = yaml.safe_load(_training_config(tmp_path).read_text(encoding="utf-8"))
     raw["training"]["positive_weight"] = 4.0
@@ -108,6 +109,27 @@ def test_e2e_config_schema_is_strict_and_preserves_run_kind(tmp_path: Path) -> N
     bad.write_text(yaml.safe_dump(raw), encoding="utf-8")
     with pytest.raises(ValueError, match="exactly match"):
         te.load_config(bad)
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_gradient_accumulation_steps_must_be_positive(tmp_path: Path, value: int) -> None:
+    raw = yaml.safe_load(_training_config(tmp_path).read_text(encoding="utf-8"))
+    raw["optim"]["gradient_accumulation_steps"] = value
+    path = tmp_path / f"accum-{value}.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="gradient_accumulation_steps must be positive"):
+        te.load_config(path)
+
+
+def test_gradient_accumulation_rejects_generators_with_auxiliary_losses(tmp_path: Path) -> None:
+    raw = yaml.safe_load(_training_config(tmp_path).read_text(encoding="utf-8"))
+    raw["optim"]["gradient_accumulation_steps"] = 2
+    path = tmp_path / "unsupported-accum.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="only supported.*full_ego_oracle"):
+        te.load_config(path)
 
 
 def test_formal_output_metadata_matches_scorer_contract(tmp_path: Path) -> None:
@@ -546,6 +568,72 @@ def test_e2e_weighted_bce_matches_one_and_two_rank_gradients_with_padding() -> N
     torch.testing.assert_close(torch.stack(rank_parameter_grads).mean(), full_parameter_grad)
 
 
+def test_accumulated_weighted_bce_matches_each_logical_batch_including_tail() -> None:
+    labels = [
+        torch.tensor([1.0, 0.0]),
+        torch.tensor([0.0, 1.0]),
+        torch.tensor([0.0, 0.0]),
+        torch.tensor([1.0, 0.0]),
+        torch.tensor([1.0, 0.0]),
+    ]
+    masks = [
+        torch.tensor([1.0, 1.0]),
+        torch.tensor([1.0, 1.0]),
+        torch.tensor([1.0, 1.0]),
+        torch.tensor([1.0, 1.0]),
+        torch.tensor([1.0, 0.0]),
+    ]
+    features = [torch.tensor([float(i + 1), float(-(i + 1))]) for i in range(5)]
+    batches = [
+        te._CompositeBatch(
+            node={},
+            edge={"label": label, "edge_mask": mask},
+            edge_rows_true=int(mask.sum()),
+            edge_rows_global=int(mask.sum()),
+            f0_rows_gathered=0,
+        )
+        for label, mask in zip(labels, masks, strict=True)
+    ]
+
+    window_sizes = te.e2e_accumulation_window_sizes(5, 2)
+    assert window_sizes == [2, 2, 1]
+    assert len(window_sizes) == 3
+    cursor = 0
+    for window_size in window_sizes:
+        window = batches[cursor : cursor + window_size]
+        positive_weight = 4.0
+        denominator = te.e2e_window_effective_weight_denominator(
+            window, positive_weight=positive_weight
+        )
+        accumulated_weight = torch.tensor(0.2, requires_grad=True)
+        accumulated_loss = torch.zeros(())
+        for offset in range(window_size):
+            index = cursor + offset
+            accumulated_loss = accumulated_loss + te.e2e_weighted_bce_with_logits(
+                accumulated_weight * features[index],
+                labels[index],
+                masks[index],
+                global_denominator=denominator,
+                positive_weight=positive_weight,
+            )
+        (accumulated_grad,) = torch.autograd.grad(accumulated_loss, accumulated_weight)
+
+        full_weight = torch.tensor(0.2, requires_grad=True)
+        full_loss = te.e2e_weighted_bce_with_logits(
+            full_weight * torch.cat(features[cursor : cursor + window_size]),
+            torch.cat(labels[cursor : cursor + window_size]),
+            torch.cat(masks[cursor : cursor + window_size]),
+            positive_weight=positive_weight,
+        )
+        (full_grad,) = torch.autograd.grad(full_loss, full_weight)
+        torch.testing.assert_close(accumulated_grad, full_grad)
+        cursor += window_size
+
+    assert cursor == 5
+    source = inspect.getsource(te._train_e2e_stability_loop)
+    assert "accelerator.no_sync(wrapped)" in source
+
+
 def test_e2e_parameter_groups_are_disjoint_exhaustive_and_exclude_kendall() -> None:
     model = EgoStitchModel(
         E2EConfig(
@@ -640,6 +728,20 @@ def test_group_gradient_statistics_gather_once_and_reuse_for_clipping() -> None:
     )
     assert records["active"].norm == pytest.approx(5.0)
     assert parameter.grad.tolist() == pytest.approx([0.6, 0.8])
+
+
+def test_nonfinite_gradient_counts_are_reported_before_squared_norm_validation() -> None:
+    gathered_nonfinite = {
+        "generator": torch.tensor([0.0, 0.0]),
+        "encoder": torch.tensor([0.0, 0.0]),
+        "classifier": torch.tensor([3.0, 5.0]),
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"non-finite E2E gradient counts by rank: \{'classifier': \[3, 5\]\}",
+    ):
+        te.e2e_assert_no_nonfinite_gradients(gathered_nonfinite)
 
 
 def test_optimizer_state_finite_check_reports_corrupt_group() -> None:

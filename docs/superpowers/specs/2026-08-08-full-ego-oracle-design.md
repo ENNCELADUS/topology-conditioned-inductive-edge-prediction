@@ -126,8 +126,14 @@ attention inputs, so time and activation memory scale as
 `O(|U_q|^2)` before layer-width factors. The config therefore fixes
 `data.edge_batch: 1`. `runtime.token_budget` governs endpoint feature-token
 packing, not the number of nodes in `H_q`, and is not a full-graph memory
-control. There is deliberately no neighbor cap or emergency truncation: an OOM
-is a failed engineering run, not permission to silently change the experiment.
+control. Singleton graph forwards must not silently change the optimizer batch:
+the trainer accumulates 128 microbatches per rank before one synchronized
+optimizer step, using one exact global weighted-BCE denominator over the whole
+window. This matches the K=16 control's `edge_batch: 128` while keeping dense
+GRIT memory bounded. LR schedules, phase boundaries, clipping, and diagnostic
+probes advance on optimizer steps, not microbatches. There is deliberately no
+neighbor cap or emergency truncation: an OOM is a failed engineering run, not
+permission to silently change the experiment.
 
 Every result must report the observed `|U_q|` distribution (at least p50, p90,
 p95, p99, and maximum), wall time, and peak memory. Metrics must also be shown

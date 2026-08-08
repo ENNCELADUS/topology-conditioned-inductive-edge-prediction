@@ -33,6 +33,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -182,6 +183,7 @@ class EgoOptimConfig:
         epochs: Fixed epoch count (counterfactual early stop is bookkeeping).
         warmup_steps: Linear LR warmup steps.
         grad_clip: Gradient-norm clip; 0 disables.
+        gradient_accumulation_steps: Physical microbatches per optimizer step.
     """
 
     lr: float
@@ -189,6 +191,7 @@ class EgoOptimConfig:
     epochs: int
     warmup_steps: int
     grad_clip: float
+    gradient_accumulation_steps: int = 1
 
 
 @dataclass(frozen=True)
@@ -375,7 +378,14 @@ def load_config(path: Path) -> EgoConfig:
         raise ValueError("data.negative_ratio must be positive")
 
     optim_raw = _as_mapping(_require(raw, "optim", ""), "optim")
-    optim_keys: tuple[str, ...] = ("lr", "weight_decay", "epochs", "warmup_steps", "grad_clip")
+    optim_keys: tuple[str, ...] = (
+        "lr",
+        "weight_decay",
+        "epochs",
+        "warmup_steps",
+        "grad_clip",
+        "gradient_accumulation_steps",
+    )
     _check_no_unknown_keys(optim_raw, optim_keys, "optim")
     optim = EgoOptimConfig(
         lr=_as_float(_require(optim_raw, "lr", "optim."), "optim.lr"),
@@ -383,9 +393,23 @@ def load_config(path: Path) -> EgoConfig:
         epochs=_as_int(_require(optim_raw, "epochs", "optim."), "optim.epochs"),
         warmup_steps=_as_int(_require(optim_raw, "warmup_steps", "optim."), "optim.warmup_steps"),
         grad_clip=_as_float(_require(optim_raw, "grad_clip", "optim."), "optim.grad_clip"),
+        gradient_accumulation_steps=_as_int(
+            optim_raw.get("gradient_accumulation_steps", 1),
+            "optim.gradient_accumulation_steps",
+        ),
     )
     if optim.epochs <= 0:
         raise ValueError("optim.epochs must be positive")
+    if optim.gradient_accumulation_steps <= 0:
+        raise ValueError("optim.gradient_accumulation_steps must be positive")
+    if (
+        optim.gradient_accumulation_steps > 1
+        and E2EConfig.from_mapping(model_kwargs).generator.name != "full_ego_oracle"
+    ):
+        raise ValueError(
+            "optim.gradient_accumulation_steps > 1 is only supported for "
+            "model.config.generator.name='full_ego_oracle'"
+        )
 
     diagnostics_raw = _as_mapping(_require(raw, "diagnostics", ""), "diagnostics")
     diagnostic_keys = (
@@ -1068,6 +1092,7 @@ def e2e_weighted_bce_with_logits(
     world_size: int = 1,
     all_reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None = None,
     positive_weight: float = 5.0,
+    global_denominator: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Exact padding-aware global weighted BCE under DDP gradient averaging.
 
@@ -1085,7 +1110,9 @@ def e2e_weighted_bce_with_logits(
     if positive_weight != 5.0:
         weights = positive_weight * labels_fp32 + (1.0 - labels_fp32)
     local_denominator = (mask_fp32 * weights).sum().detach()
-    if all_reduce_sum is not None:
+    if global_denominator is not None:
+        denominator = global_denominator
+    elif all_reduce_sum is not None:
         denominator = all_reduce_sum(local_denominator)
     elif torch.distributed.is_available() and torch.distributed.is_initialized():
         denominator = local_denominator.clone()
@@ -1098,6 +1125,29 @@ def e2e_weighted_bce_with_logits(
         logits_fp32, labels_fp32, reduction="none"
     )
     return world_size * (mask_fp32 * weights * per_row).sum() / denominator
+
+
+def e2e_accumulation_window_sizes(microsteps: int, accumulation_steps: int) -> list[int]:
+    """Return complete optimizer-window sizes, including an exact tail window."""
+    if microsteps < 0:
+        raise ValueError("microsteps must be non-negative")
+    if accumulation_steps <= 0:
+        raise ValueError("accumulation_steps must be positive")
+    full, tail = divmod(microsteps, accumulation_steps)
+    return [accumulation_steps] * full + ([tail] if tail else [])
+
+
+def e2e_window_effective_weight_denominator(
+    batches: Sequence[_CompositeBatch], *, positive_weight: float
+) -> torch.Tensor:
+    """Compute one local effective-weight denominator for a microbatch window."""
+    denominator = torch.zeros((), dtype=torch.float32)
+    for batch in batches:
+        labels = batch.edge["label"].float()
+        mask = batch.edge["edge_mask"].float()
+        weights = positive_weight * labels + (1.0 - labels)
+        denominator += (mask * weights).sum()
+    return denominator
 
 
 @dataclass(frozen=True)
@@ -1271,6 +1321,19 @@ def e2e_assert_replicated_squared_norms(
         reference = values[0].expand_as(values)
         if not bool(torch.allclose(values, reference, rtol=rtol, atol=atol)):
             raise RuntimeError(f"DDP gradient norms differ across ranks for E2E group {name!r}")
+
+
+def e2e_assert_no_nonfinite_gradients(
+    gathered_by_group: Mapping[str, torch.Tensor],
+) -> None:
+    """Raise with deterministic per-rank element counts before norm validation."""
+    counts = {
+        name: [int(value) for value in values.tolist()]
+        for name, values in gathered_by_group.items()
+        if bool(values.ne(0).any().item())
+    }
+    if counts:
+        raise RuntimeError(f"non-finite E2E gradient counts by rank: {counts}")
 
 
 @dataclass
@@ -2802,7 +2865,12 @@ class _CompositeStep(torch.nn.Module):
             extra.update(_e2e_gate_tanh(self.model))
         edge_loss = (
             e2e_weighted_bce_with_logits(
-                logits, edge["label"], edge["edge_mask"], world_size=self.world_size
+                logits,
+                edge["label"],
+                edge["edge_mask"],
+                world_size=self.world_size,
+                global_denominator=cast(torch.Tensor | None, batch.get("edge_loss_denominator")),
+                positive_weight=cast(float, batch.get("positive_weight", 5.0)),
             )
             if edge_active
             else logits.sum() * 0.0
@@ -3745,8 +3813,10 @@ def _e2e_training_payload(
     *,
     epoch: int,
     step: int,
+    micro_step: int,
     total_steps: int,
     device: torch.device,
+    edge_loss_denominator: torch.Tensor | None = None,
 ) -> dict[str, object]:
     return {
         "node": _to_device(batch.node, device),
@@ -3762,7 +3832,11 @@ def _e2e_training_payload(
         "real_ssl_scale": torch.tensor(phase.real_ssl_scale, device=device),
         "seed": cfg.seed,
         "epoch": epoch,
-        "step": step,
+        "step": micro_step,
+        "edge_loss_denominator": edge_loss_denominator,
+        "positive_weight": (
+            cfg.training.positive_weight if cfg.training is not None else 5.0
+        ),
     }
 
 
@@ -4212,12 +4286,19 @@ def _enforce_e2e_initial_slot_health(
             line. Raised on *every* rank -- `_validate_epoch` returns ``None``
             off the main process, so a rank-0-only raise is a DDP hang.
     """
+    # This guard measures learned SlotSet geometry. FullOracleGenerator has no
+    # slots, plan, or trainable generator state, so running a complete V_hold
+    # scoring pass here cannot evaluate the guard. Return before touching the
+    # validation population or model state; ordinary epoch validation remains
+    # unchanged and still supplies the diagnostic's selection metrics.
     if not data.val_pairs:
         raise RuntimeError(
             "step-0 slot guard has an empty population: this config gives "
             "_validate_epoch no validation pairs, so neither this guard nor "
             "the during-training slot-collapse guard would ever evaluate"
         )
+    if isinstance(model.generator, FullOracleGenerator):
+        return {}
     validation = _validate_epoch(
         model,
         data,
@@ -4230,13 +4311,12 @@ def _enforce_e2e_initial_slot_health(
     if validation_event_callback is not None:
         validation_event_callback("step_0", None, 0)
     # The Sec 14.4.8 cosine trip line is a claim about `EgoStitchImagineGenerator`'s
-    # `SlotSet` geometry at initialization; the oracle-scaffold and null
-    # generators carry no such geometry (`_validate_epoch` reports NaN scale
-    # telemetry for them, design §3.4), so `report`'s finiteness check below
-    # would spuriously fail every run of either arm. There is nothing this
-    # guard can check for them -- skip identically on every rank (same
-    # config-derived model class everywhere, so no DDP divergence risk) after
-    # still recording the step-0 validation event above.
+    # `SlotSet` geometry at initialization; the remaining oracle-scaffold and
+    # null generators carry no such geometry (`_validate_epoch` reports NaN
+    # scale telemetry for them, design §3.4), so `report`'s finiteness check
+    # below would spuriously fail either arm. There is nothing this guard can
+    # check for them -- skip identically on every rank after the legacy step-0
+    # validation event above. FullOracleGenerator returned before validation.
     if not isinstance(model.generator, EgoStitchImagineGenerator):
         return {}
     report: dict[str, float] = {}
@@ -4392,18 +4472,22 @@ def _train_e2e_stability_loop(
         enforce_quality=enforce_quality,
     )
 
-    rows_per_rank, steps_per_epoch = _epoch_step_plan(
+    rows_per_rank, microsteps_per_epoch = _epoch_step_plan(
         len(data.training_positives),
         negative_ratio=cfg.data.negative_ratio,
         edge_batch=cfg.data.edge_batch,
         world_size=world,
     )
+    accumulation_steps = cfg.optim.gradient_accumulation_steps
+    window_sizes = e2e_accumulation_window_sizes(microsteps_per_epoch, accumulation_steps)
+    steps_per_epoch = len(window_sizes)
     production_epoch_step_counts = [steps_per_epoch] * cfg.optim.epochs
     epoch_step_counts = (
         production_epoch_step_counts[:1] if profile_only else production_epoch_step_counts
     )
     schedule_total_steps = steps_per_epoch * cfg.optim.epochs
     executed_steps = sum(epoch_step_counts)
+    executed_microbatches = microsteps_per_epoch * len(epoch_step_counts)
     phase_a_end, phase_b_end = e2e_phase_boundaries(
         schedule_total_steps,
         phase_a_fraction=training.phase_a_fraction,
@@ -4479,14 +4563,17 @@ def _train_e2e_stability_loop(
         epoch_probes: list[dict[str, object]] = []
         epoch_validation_seconds = 0.0
         epoch_validation_timing = dict.fromkeys(total_validation_timing, 0.0)
+        epoch_window_sizes = window_sizes[:epoch_steps]
+        epoch_microsteps = sum(epoch_window_sizes)
         batch_source = iter(
-            factory.epoch_batches(epoch, rows_per_rank=rows_per_rank, steps=epoch_steps)
+            factory.epoch_batches(epoch, rows_per_rank=rows_per_rank, steps=epoch_microsteps)
         )
         batches = _prefetch_batches(batch_source, depth=prefetch_depth)
+        micro_step_in_epoch = 0
         try:
-            for _step_in_epoch in range(epoch_steps):
+            for window_size in epoch_window_sizes:
                 fetch_started = time.monotonic()
-                batch = next(batches)
+                window = [next(batches) for _ in range(window_size)]
                 epoch_data_wait += time.monotonic() - fetch_started
                 phase = e2e_phase_state(
                     global_step,
@@ -4503,33 +4590,66 @@ def _train_e2e_stability_loop(
                         group.get("name"),
                         active_groups,
                     )
-                payload = _e2e_training_payload(
-                    batch,
-                    cfg,
-                    phase,
-                    epoch=epoch,
-                    step=global_step,
-                    total_steps=schedule_total_steps,
-                    device=accelerator.device,
-                )
-                if fixed_replay is None:
-                    fixed_replay = cast(dict[str, object], _detached_clone(payload))
+                local_denominator = e2e_window_effective_weight_denominator(
+                    window, positive_weight=training.positive_weight
+                ).to(accelerator.device)
+                edge_loss_denominator = accelerator.reduce(local_denominator, reduction="sum")
+                if (
+                    not bool(torch.isfinite(edge_loss_denominator))
+                    or float(edge_loss_denominator) <= 0.0
+                ):
+                    raise RuntimeError(
+                        "global accumulated weighted-BCE denominator must be finite and positive"
+                    )
                 optimizer.zero_grad(set_to_none=True)
-                out = cast(dict[str, object], wrapped(payload))
-                loss = cast(torch.Tensor, out["loss"])
-                local_bad = not bool(torch.isfinite(loss).all())
-                bad_ranks = accelerator.reduce(
-                    torch.tensor(int(local_bad), device=accelerator.device), reduction="sum"
-                )
-                if int(bad_ranks.item()) > 0:
-                    raise RuntimeError(f"non-finite E2E loss at optimizer step {global_step}")
-                accelerator.backward(loss)
+                out: dict[str, object] | None = None
+                loss: torch.Tensor | None = None
+                window_parts: dict[str, float] = {}
+                for micro_index, batch in enumerate(window):
+                    payload = _e2e_training_payload(
+                        batch,
+                        cfg,
+                        phase,
+                        epoch=epoch,
+                        step=global_step,
+                        micro_step=micro_step_in_epoch,
+                        total_steps=schedule_total_steps,
+                        device=accelerator.device,
+                        edge_loss_denominator=edge_loss_denominator,
+                    )
+                    if fixed_replay is None:
+                        fixed_replay = cast(dict[str, object], _detached_clone(payload))
+                        fixed_replay.pop("edge_loss_denominator", None)
+                    synchronization = (
+                        accelerator.no_sync(wrapped)
+                        if micro_index + 1 < len(window)
+                        else nullcontext()
+                    )
+                    with synchronization:
+                        out = cast(dict[str, object], wrapped(payload))
+                        loss = cast(torch.Tensor, out["loss"])
+                        local_bad = not bool(torch.isfinite(loss).all())
+                        bad_ranks = accelerator.reduce(
+                            torch.tensor(int(local_bad), device=accelerator.device),
+                            reduction="sum",
+                        )
+                        if int(bad_ranks.item()) > 0:
+                            raise RuntimeError(
+                                f"non-finite E2E loss at optimizer step {global_step}"
+                            )
+                        accelerator.backward(loss)
+                    for name, value in cast(dict[str, float], out["parts"]).items():
+                        window_parts[name] = window_parts.get(name, 0.0) + value
+                    micro_step_in_epoch += 1
+                    epoch_local_pairs += batch.edge_rows_true
+                    epoch_local_tokens += batch.f0_rows_gathered
+                    epoch_global_pairs += batch.edge_rows_global
+                assert out is not None and loss is not None
                 local_gradient_statistics, gathered_squared, gathered_nonfinite = (
                     _gather_e2e_group_gradient_statistics(parameter_groups.groups, accelerator)
                 )
+                e2e_assert_no_nonfinite_gradients(gathered_nonfinite)
                 e2e_assert_replicated_squared_norms(gathered_squared)
-                if bool(torch.stack(tuple(gathered_nonfinite.values())).ne(0).any().item()):
-                    raise RuntimeError("non-finite E2E gradient")
                 gradient_records = e2e_check_and_clip_gradients(
                     parameter_groups.groups,
                     active_groups,
@@ -4603,7 +4723,7 @@ def _train_e2e_stability_loop(
                 )
                 if int(failed.item()) > 0:
                     raise RuntimeError("non-finite E2E parameter or optimizer state after step")
-                epoch_parts = cast(dict[str, float], out["parts"])
+                epoch_parts = window_parts
                 global_step += 1
 
                 # `parts` are plain floats (`stage1_total`), so nothing below
@@ -4788,9 +4908,6 @@ def _train_e2e_stability_loop(
                         context="end-ramp",
                     )
 
-                epoch_local_pairs += batch.edge_rows_true
-                epoch_local_tokens += batch.f0_rows_gathered
-                epoch_global_pairs += batch.edge_rows_global
         finally:
             batches.close()
 
@@ -5167,7 +5284,7 @@ def _train_e2e_stability_loop(
             {
                 "rank": index,
                 "pairs": int(row[0]),
-                "batches": executed_steps,
+                "batches": executed_microbatches,
                 "steps": executed_steps,
                 "tokens": int(row[1]),
                 "train_wall_seconds": float(row[2]),
@@ -5190,6 +5307,8 @@ def _train_e2e_stability_loop(
         "kendall_fallback": {"active": False, "activated_step": None, "imbalance_streak_steps": 0},
         "run_kind": run_kind,
         "arm": arm,
+        "gradient_accumulation_steps": accumulation_steps,
+        "total_microbatches": executed_microbatches,
         "total_optimizer_steps": executed_steps,
         "schedule_total_optimizer_steps": schedule_total_steps,
         "phase_boundaries": {"phase_a_end": phase_a_end, "phase_b_end": phase_b_end},
