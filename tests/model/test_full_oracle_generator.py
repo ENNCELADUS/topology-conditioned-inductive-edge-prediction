@@ -42,6 +42,32 @@ def _edge_set(graph: FullEgoGraph, batch_row: int) -> set[tuple[int, int]]:
     }
 
 
+def _reference_query(
+    truth: nx.Graph[str], src: str, dst: str
+) -> tuple[list[str], torch.Tensor, torch.Tensor]:
+    src_neighbors = set(truth.neighbors(src)) - {dst}
+    dst_neighbors = set(truth.neighbors(dst)) - {src}
+    endpoints = [src] if src == dst else [src, dst]
+    nodes = endpoints + sorted((src_neighbors | dst_neighbors) - set(endpoints))
+    index = {node_id: offset for offset, node_id in enumerate(nodes)}
+    x = torch.zeros((len(nodes), 5))
+    x[:, 4] = 1.0
+    x[index[src], 0] = 1.0
+    x[index[dst], 1] = 1.0
+    for node_id in src_neighbors:
+        x[index[node_id], 2] = 1.0
+    for node_id in dst_neighbors:
+        x[index[node_id], 3] = 1.0
+    adj = torch.zeros((len(nodes), len(nodes)))
+    for left, right in truth.subgraph(nodes).edges:
+        if {left, right} == {src, dst}:
+            continue
+        left_i, right_i = index[left], index[right]
+        adj[left_i, right_i] = 1.0
+        adj[right_i, left_i] = 1.0
+    return nodes, x, adj
+
+
 def test_emits_exact_induced_edges_after_removing_query_edge() -> None:
     truth = nx.Graph(
         [
@@ -102,6 +128,67 @@ def test_batch_padding_uses_only_current_batch_max_and_masks_padding() -> None:
     ]
     assert torch.count_nonzero(graph.x[1, 3:]).item() == 0
     assert torch.count_nonzero(graph.adj[1, :, 3:, :]).item() == 0
+
+
+def test_batched_cpu_construction_matches_independent_reference() -> None:
+    truth = nx.Graph(
+        [
+            ("a", "b"),
+            ("a", "c"),
+            ("b", "c"),
+            ("a", "d"),
+            ("b", "e"),
+            ("c", "d"),
+            ("d", "e"),
+            ("f", "g"),
+            ("f", "h"),
+            ("g", "h"),
+        ]
+    )
+    truth.add_nodes_from(["i", "j"])
+    node_ids = ["j", "a", "f", "b", "i", "c", "d", "e", "g", "h"]
+    pairs = [("a", "b"), ("f", "f"), ("i", "j"), ("c", "d")]
+    row = {node_id: offset for offset, node_id in enumerate(node_ids)}
+
+    graph = _stitch(
+        _generator(truth, node_ids),
+        [row[src] for src, _ in pairs],
+        [row[dst] for _, dst in pairs],
+    )
+
+    references = [_reference_query(truth, src, dst) for src, dst in pairs]
+    assert graph.x.shape == (len(pairs), max(len(nodes) for nodes, _, _ in references), 5)
+    for batch_row, (nodes, expected_x, expected_adj) in enumerate(references):
+        count = len(nodes)
+        assert graph.mask[batch_row].tolist() == [True] * count + [False] * (
+            graph.num_nodes - count
+        )
+        torch.testing.assert_close(graph.x[batch_row, :count], expected_x)
+        torch.testing.assert_close(graph.adj[batch_row, 0, :count, :count], expected_adj)
+        assert torch.count_nonzero(graph.x[batch_row, count:]) == 0
+        assert torch.count_nonzero(graph.adj[batch_row, :, count:, :]) == 0
+
+
+def test_stitch_does_not_extract_cuda_style_scalars_per_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    truth = nx.Graph([("0", "2"), ("1", "2"), ("3", "4")])
+    generator = _generator(truth, [str(node) for node in range(5)])
+    state_a = _encode(generator, [0, 3, 2])
+    state_b = _encode(generator, [1, 4, 2])
+    is_self = torch.tensor([False, False, True])
+
+    def fail_item(_tensor: torch.Tensor) -> object:
+        raise AssertionError("stitch must resolve the batch without Tensor.item()")
+
+    monkeypatch.setattr(torch.Tensor, "item", fail_item)
+    graph = generator.stitch(state_a, state_b, is_self)
+
+    assert graph.mask.tolist() == [
+        [True, True, True],
+        [True, True, False],
+        [True, True, True],
+    ]
 
 
 def test_swapped_exchanges_roles_and_shares_structure() -> None:

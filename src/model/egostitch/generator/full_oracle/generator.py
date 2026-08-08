@@ -37,6 +37,7 @@ class FullOracleGenerator(NeighborhoodGenerator[GeneratorNodeState, object, Full
         super().__init__()
         self._graph: nx.Graph[str] | None = None
         self._node_ids: tuple[str, ...] | None = None
+        self._neighbors: dict[str, frozenset[str]] | None = None
 
     def set_oracle_context(self, graph: nx.Graph[str], node_ids: Sequence[str]) -> None:
         """Bind a loopless truth graph and its context-local ordered node ids."""
@@ -57,6 +58,9 @@ class FullOracleGenerator(NeighborhoodGenerator[GeneratorNodeState, object, Full
 
         self._graph = graph.copy()
         self._node_ids = ordered
+        self._neighbors = {
+            node_id: frozenset(self._graph.neighbors(node_id)) for node_id in self._graph.nodes
+        }
 
     def encode_node(
         self,
@@ -100,20 +104,19 @@ class FullOracleGenerator(NeighborhoodGenerator[GeneratorNodeState, object, Full
             ground_ids=ground_ids,
         )
 
-    def _node_id(self, row: torch.Tensor) -> str:
+    def _node_id(self, row: int) -> str:
         if self._node_ids is None:
             raise RuntimeError("full oracle context is not installed")
-        value = int(row.item())
-        if value < 0 or value >= len(self._node_ids):
-            raise ValueError(f"context-local node row is missing: {value}")
-        return self._node_ids[value]
+        if row < 0 or row >= len(self._node_ids):
+            raise ValueError(f"context-local node row is missing: {row}")
+        return self._node_ids[row]
 
     def _query_graph(self, src: str, dst: str) -> tuple[list[str], set[tuple[str, str]]]:
-        if self._graph is None:
+        if self._graph is None or self._neighbors is None:
             raise RuntimeError("full oracle context is not installed")
 
-        src_neighbors = set(self._graph.neighbors(src))
-        dst_neighbors = set(self._graph.neighbors(dst))
+        src_neighbors = set(self._neighbors[src])
+        dst_neighbors = set(self._neighbors[dst])
         if src != dst:
             src_neighbors.discard(dst)
             dst_neighbors.discard(src)
@@ -140,9 +143,9 @@ class FullOracleGenerator(NeighborhoodGenerator[GeneratorNodeState, object, Full
         """Build and batch-pad exact induced query graphs on the caller's device."""
         if perturbation is not None:
             raise ValueError("FullOracleGenerator does not support scaffold perturbations")
-        if self._graph is None:
+        if self._graph is None or self._neighbors is None:
             raise RuntimeError("full oracle context is not installed")
-        truth_graph = self._graph
+        neighbors = self._neighbors
         batch_size = int(state_a.projected_x.shape[0])
         if state_b.projected_x.shape != state_a.projected_x.shape:
             raise ValueError("state_a and state_b must have matching row-identity shapes")
@@ -152,20 +155,29 @@ class FullOracleGenerator(NeighborhoodGenerator[GeneratorNodeState, object, Full
                 f"got {tuple(is_self.shape)} / {is_self.dtype}"
             )
 
+        device = state_a.projected_x.device
+        row_triples = torch.stack(
+            (
+                state_a.projected_x[:, 0],
+                state_b.projected_x[:, 0].to(device=device),
+                is_self.to(device=device, dtype=torch.int64),
+            ),
+            dim=1,
+        ).to(device="cpu", dtype=torch.int64)
+
         query_graphs: list[tuple[str, str, list[str], set[tuple[str, str]]]] = []
-        for batch_row in range(batch_size):
-            src = self._node_id(state_a.projected_x[batch_row, 0])
-            dst = self._node_id(state_b.projected_x[batch_row, 0])
-            if bool(is_self[batch_row].item()) != (src == dst):
+        for src_row, dst_row, self_flag in row_triples.tolist():
+            src = self._node_id(src_row)
+            dst = self._node_id(dst_row)
+            if bool(self_flag) != (src == dst):
                 raise ValueError("is_self disagrees with endpoint row identities")
             nodes, edges = self._query_graph(src, dst)
             query_graphs.append((src, dst, nodes, edges))
 
         max_nodes = max((len(item[2]) for item in query_graphs), default=0)
-        device = state_a.projected_x.device
-        x = torch.zeros((batch_size, max_nodes, 5), device=device)
-        adj = torch.zeros((batch_size, 1, max_nodes, max_nodes), device=device)
-        mask = torch.zeros((batch_size, max_nodes), dtype=torch.bool, device=device)
+        x = torch.zeros((batch_size, max_nodes, 5))
+        adj = torch.zeros((batch_size, 1, max_nodes, max_nodes))
+        mask = torch.zeros((batch_size, max_nodes), dtype=torch.bool)
 
         for batch_row, (src, dst, nodes, edges) in enumerate(query_graphs):
             index = {node_id: offset for offset, node_id in enumerate(nodes)}
@@ -174,9 +186,9 @@ class FullOracleGenerator(NeighborhoodGenerator[GeneratorNodeState, object, Full
             x[batch_row, :count, 4] = 1.0
             x[batch_row, index[src], 0] = 1.0
             x[batch_row, index[dst], 1] = 1.0
-            for node_id in set(truth_graph.neighbors(src)) - {dst}:
+            for node_id in neighbors[src] - {dst}:
                 x[batch_row, index[node_id], 2] = 1.0
-            for node_id in set(truth_graph.neighbors(dst)) - {src}:
+            for node_id in neighbors[dst] - {src}:
                 x[batch_row, index[node_id], 3] = 1.0
             for left, right in edges:
                 left_i, right_i = index[left], index[right]
@@ -185,9 +197,9 @@ class FullOracleGenerator(NeighborhoodGenerator[GeneratorNodeState, object, Full
 
         empty_plan = torch.empty((batch_size, 0, 0), device=device)
         return FullEgoGraph(
-            x=x,
-            adj=adj,
-            mask=mask,
+            x=x.to(device=device),
+            adj=adj.to(device=device),
+            mask=mask.to(device=device),
             aux={"plan": empty_plan, "log_plan": empty_plan},
             directed=True,
         )
