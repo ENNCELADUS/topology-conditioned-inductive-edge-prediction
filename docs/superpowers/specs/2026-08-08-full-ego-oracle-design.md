@@ -121,19 +121,24 @@ $$
 |U_q| \le 2 + \deg_{G_q^-}(u) + \deg_{G_q^-}(v),
 $$
 
-with overlap reducing the actual size. GRIT constructs dense RRWP and dense
-attention inputs, so time and activation memory scale as
-`O(|U_q|^2)` before layer-width factors. The config therefore fixes
-`data.edge_batch: 1`. `runtime.token_budget` governs endpoint feature-token
-packing, not the number of nodes in `H_q`, and is not a full-graph memory
-control. Singleton graph forwards must not silently change the optimizer batch:
-the trainer accumulates 128 microbatches per rank before one synchronized
-optimizer step, using one exact global weighted-BCE denominator over the whole
-window. This matches the K=16 control's `edge_batch: 128` while keeping dense
-GRIT memory bounded. LR schedules, phase boundaries, clipping, and diagnostic
-probes advance on optimizer steps, not microbatches. There is deliberately no
-neighbor cap or emergency truncation: an OOM is a failed engineering run, not
-permission to silently change the experiment.
+with overlap reducing the actual size. GRIT constructs RRWP using repeated
+dense matrix products, so that stage takes `O(K|U_q|^3)` time and
+`O(K|U_q|^2)` memory; subsequent dense attention is quadratic in `|U_q|`.
+The measured H20 operating point is
+`data.edge_batch: 16` with 8-way accumulation per rank: this preserves the
+logical batch of 128 pairs and its one exact global weighted-BCE denominator.
+The registered diagnostic schedule is 10 epochs to target the fixed train/eval
+budget. Training throughput alone leaves about 3.4 hours for validation and
+overhead, so the run is not known to fit until its first full B16 validation is
+timed. Any matched K=16 comparison must be rerun with the same B16 x 8 physical
+batching and 10-epoch optimizer schedule; a historical B128/30-epoch result has
+different pair-to-dropout assignment and is not a matched control.
+`runtime.token_budget` governs endpoint feature-token packing, not the number
+of nodes in `H_q`, and is not a full-graph memory control. LR schedules, phase
+boundaries, clipping, and diagnostic probes advance on optimizer steps, not
+physical batches. Scoring remains singleton. There is deliberately no neighbor
+cap or emergency truncation: an OOM is a failed engineering run, not permission
+to silently change the experiment.
 
 Every result must report the observed `|U_q|` distribution (at least p50, p90,
 p95, p99, and maximum), wall time, and peak memory. Metrics must also be shown

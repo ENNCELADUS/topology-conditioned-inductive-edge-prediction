@@ -100,7 +100,7 @@ def test_full_oracle_skips_inapplicable_initial_slot_health_validation(
     assert validation_events == []
 
 
-def test_runnable_config_preserves_full_neighbors_with_single_pair_batches() -> None:
+def test_runnable_config_uses_logical_128_training_and_singleton_scoring() -> None:
     path = (
         Path(__file__).parents[1]
         / "configs"
@@ -116,8 +116,10 @@ def test_runnable_config_preserves_full_neighbors_with_single_pair_batches() -> 
     assert cfg.encoder.w_rel == 0.0
     assert cfg.classifier.conditioning_mode == "pooled_adapter"
     assert payload["training"]["phase_a_fraction"] == 0.0
-    assert run_cfg.data.edge_batch == 1
-    assert run_cfg.optim.gradient_accumulation_steps == 128
+    assert run_cfg.data.edge_batch == 16
+    assert run_cfg.optim.gradient_accumulation_steps == 8
+    assert run_cfg.data.edge_batch * run_cfg.optim.gradient_accumulation_steps == 128
+    assert run_cfg.optim.epochs == 10
     assert score_universe._full_oracle_score_batch_specs(3) == [
         ([0], [(0, 0)]),
         ([1], [(1, 0)]),

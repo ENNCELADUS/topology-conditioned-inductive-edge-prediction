@@ -6,12 +6,13 @@
 #
 # `conditioning_mode: pooled_adapter` is the only topology-conditioning path:
 # variable-length node tokens are pooled inside GRIT, so classifier
-# cross-attention never attends to batch-padding tokens. `edge_batch: 1` is
-# deliberate. Live G_fit degree statistics are max=126 and p99=76 (G_hold
-# max=36); the held-out test graph reaches degree 263 and a measured pair ego
-# union of at least 446 nodes. Dense RRWP/GRIT work scales quadratically. A
-# batch of one in training and the full-oracle scoring path preserves every
-# neighbor while avoiding a sequence-length batcher's OOM confound.
+# cross-attention never attends to batch-padding tokens. Training uses physical
+# `edge_batch: 16` with 8-way accumulation, preserving the registered logical
+# batch of 128 pairs per rank. A two-H20 production-path benchmark measured
+# 68.4 global pairs/s at B16 versus 14.8 at B1, with 10.4 GiB peak allocation;
+# B32 improved only to 72.7 pairs/s while nearly doubling peak allocation.
+# Scoring remains singleton and never caps neighbors. The held-out test graph
+# reaches degree 263 and a measured pair ego union of at least 446 nodes.
 
 model:
   family: egostitch_e2e
@@ -43,7 +44,7 @@ data:
   strategy: breadth_first
   negative_ratio: 5
   node_batch: 256
-  edge_batch: 1
+  edge_batch: 16
   f0_cache: outputs/feature_packs/egostitch_f0/f0_matrix.pt
   grounding_cache: outputs/feature_packs/egostitch_f0/grounding.npz
   pack_dir: outputs/feature_packs/egostitch_e2e_tokens
@@ -54,10 +55,10 @@ data:
 optim:
   lr: 1.0e-4
   weight_decay: 0.01
-  epochs: 30
+  epochs: 10
   warmup_steps: 500
   grad_clip: 1.0
-  gradient_accumulation_steps: 128
+  gradient_accumulation_steps: 8
 
 training:
   positive_weight: 5.0
