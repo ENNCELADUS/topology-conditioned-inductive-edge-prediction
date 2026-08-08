@@ -8,9 +8,8 @@ up a class here, and the matching `build_*` helper turns that class plus the
 rest of the section's fields into a constructed component -- the same
 translation `EgoStitchModel.__init__` did inline before this module existed.
 
-Only two generators, one encoder and one classifier are registered today
-(design §2 Non-goals: this pass ships exactly one real version per component,
-behavior-preserving, plus a null generator -- not alternative architectures).
+Four generators, two encoders and one classifier are registered today: one
+learned generator, one null control, and two diagnostic oracle generators.
 Registering a new component later is adding one dict entry and, if its
 constructor needs a translation the existing `build_*` helper does not
 already provide, extending that helper -- never a change to `composite.py`'s
@@ -38,12 +37,14 @@ from src.model.egostitch.generator import (
     OracleStructGenerator,
 )
 from src.model.egostitch.generator.base import NeighborhoodGenerator
+from src.model.egostitch.generator.full_oracle import FullOracleGenerator
 from src.model.egostitch.generator.imagine import FeatureStandardizationMode
 
 GENERATOR_REGISTRY: dict[str, type[NeighborhoodGenerator[Any, Any, Any]]] = {
     "egostitch_imagine": EgoStitchImagineGenerator,
     "null": NullGenerator,
     "oracle_struct": OracleStructGenerator,
+    "full_ego_oracle": FullOracleGenerator,
 }
 """Generator name -> class. ``egostitch_imagine`` is today's Tokenize-lite +
 Imagine + Stitch pipeline (`generator/egostitch.py`); ``null`` imagines
@@ -51,7 +52,8 @@ nothing and always returns `None` from `stitch` (`generator/null.py`), which
 is what makes the pure pairwise baseline reachable by config alone;
 ``oracle_struct`` emits the *true* local scaffold from a precomputed table
 (`generator/oracle.py`), the upper bound the learned generator is measured
-against."""
+against; ``full_ego_oracle`` emits the uncapped true induced local graph
+(`generator/full_oracle/`) for the diagnostic topology-information ceiling."""
 
 ENCODER_REGISTRY: dict[str, type[GraphEncoder]] = {
     "ste_typed": TypedMessagePassingEncoder,
@@ -161,15 +163,15 @@ def build_generator(
             which takes no configuration -- there is nothing to imagine,
             nothing to cache, and nothing to stitch (`generator/null.py`).
             `OracleStructGenerator` reads only its ``slots``, since the
-            scaffold comes from a table rather than from a decoder.
+            scaffold comes from a table rather than from a decoder;
+            `FullOracleGenerator` takes no learned-generator arguments.
 
     Returns:
         The constructed generator, not yet moved to any device. For
-        ``oracle_struct`` the returned generator is not yet *usable* either:
-        the caller must install its table with
-        `OracleStructGenerator.set_oracle_context` before the first forward
-        pass. That is deliberate -- the table depends on the graph and the
-        node universe, neither of which the registry can see.
+        either oracle generator the returned component is not yet *usable*:
+        the caller must install its truth context before the first forward
+        pass. That context depends on the graph and node universe, neither of
+        which the registry can see.
 
     Raises:
         UnknownComponentError: If `cfg.name` is not registered.
@@ -179,6 +181,8 @@ def build_generator(
         return NullGenerator()
     if cls is OracleStructGenerator:
         return OracleStructGenerator(slots=generator_cfg.slots)
+    if cls is FullOracleGenerator:
+        return FullOracleGenerator()
     return cast(
         NeighborhoodGenerator[Any, Any, Any],
         cls(

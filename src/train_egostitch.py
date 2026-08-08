@@ -70,6 +70,7 @@ from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.encoder.base import GraphEncoder
 from src.model.egostitch.generator import EgoStitchImagineGenerator, StitchedGraph
+from src.model.egostitch.generator.full_oracle import FullOracleGenerator
 from src.model.egostitch.generator.imagine import (
     NULL_MODE_ALL,
     NULL_MODE_CONTENT,
@@ -713,6 +714,7 @@ E2EArmName = Literal[
     "row_layernorm",
     "null_generator",
     "oracle",
+    "full_ego_oracle",
 ]
 
 
@@ -3623,6 +3625,8 @@ def _e2e_arm_name_from_config(config: E2EConfig) -> E2EArmName:
         return "null_generator"
     if config.generator.name == "oracle_struct":
         return "oracle"
+    if config.generator.name == "full_ego_oracle":
+        return "full_ego_oracle"
     if config.classifier.permanent_null == "all_head":
         return "b0_e2e_f_only"
     if config.classifier.p_topo == 0.0:
@@ -5655,7 +5659,7 @@ def _oracle_truth_graph(data: EgoStitchData, *, truth_source: str, run_kind: str
 
 
 def _install_oracle_context(model: EgoStitchModel, data: EgoStitchData, *, run_kind: str) -> None:
-    """Install the oracle scaffold table for the ``oracle_struct`` generator arm.
+    """Install truth context for either registered oracle generator arm.
 
     Runs once at startup, after the model is built and `_bind_feature_standardization`
     has called `EgoStitchModel.set_feature_stats` (Wave-1 oracle-scaffold
@@ -5675,17 +5679,17 @@ def _install_oracle_context(model: EgoStitchModel, data: EgoStitchData, *, run_k
             to keep held-out structural truth inside diagnostic runs.
 
     Raises:
-        RuntimeError: If `model.generator` is not an `OracleStructGenerator`
-            (a caller bug: this must only run for ``generator.name ==
-            "oracle_struct"``), or if `data.node_index` does not densely
-            cover every F0 row (would indicate a broken universe assembly,
-            not a legal state to silently paper over).
+        RuntimeError: If `model.generator` is not a registered oracle
+            generator, if a full-ego oracle is attempted outside a diagnostic
+            run, or if `data.node_index` does not densely cover every F0 row.
     """
-    if not isinstance(model.generator, OracleStructGenerator):
+    if not isinstance(model.generator, (OracleStructGenerator, FullOracleGenerator)):
         raise RuntimeError(
-            "oracle context install requires an OracleStructGenerator, got "
+            "oracle context install requires a registered oracle generator, got "
             f"{type(model.generator).__name__}"
         )
+    if isinstance(model.generator, FullOracleGenerator) and run_kind != "diagnostic":
+        raise RuntimeError("full_ego_oracle requires --run-kind diagnostic")
     n_rows = int(data.f0.shape[0])
     node_by_row: list[str | None] = [None] * n_rows
     for node, row in data.node_index.items():
@@ -5698,19 +5702,26 @@ def _install_oracle_context(model: EgoStitchModel, data: EgoStitchData, *, run_k
         )
     ordered_node_ids = cast(list[str], node_by_row)
     truth_source = model.cfg.generator.oracle_truth_source
-    table = build_oracle_table(
-        _oracle_truth_graph(data, truth_source=truth_source, run_kind=run_kind),
-        ordered_node_ids,
-        slots=model.generator_cfg.slots,
-        seed=model.cfg.generator.oracle_seed,
-    )
-    lookup = torch.arange(n_rows, dtype=torch.long)
-    model.generator.set_oracle_context(table, lookup)
+    truth_graph = _oracle_truth_graph(data, truth_source=truth_source, run_kind=run_kind)
+    if isinstance(model.generator, OracleStructGenerator):
+        table = build_oracle_table(
+            truth_graph,
+            ordered_node_ids,
+            slots=model.generator_cfg.slots,
+            seed=model.cfg.generator.oracle_seed,
+        )
+        lookup = torch.arange(n_rows, dtype=torch.long)
+        model.generator.set_oracle_context(table, lookup)
+    else:
+        full_truth_graph = truth_graph.copy()
+        # F0 rows with zero structural degree are legitimate explicit
+        # isolates in the full-oracle truth context.
+        full_truth_graph.add_nodes_from(ordered_node_ids)
+        model.generator.set_oracle_context(full_truth_graph, ordered_node_ids)
     logger.info(
-        "installed oracle scaffold table rows=%d slots=%d seed=%d truth_source=%s",
+        "installed oracle truth context generator=%s rows=%d truth_source=%s",
+        model.cfg.generator.name,
         n_rows,
-        model.generator_cfg.slots,
-        model.cfg.generator.oracle_seed,
         truth_source,
     )
 
@@ -5747,7 +5758,7 @@ def _run_ddp_worker(cfg: EgoConfig, args: EgoCliArgs) -> None:
     data = assemble_egostitch_data(cfg, pack_dir=args.pack_dir)
     model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
     feature_stats_sha256 = _bind_feature_standardization(model, cfg, data)
-    if model.cfg.generator.name == "oracle_struct":
+    if model.cfg.generator.name in ("oracle_struct", "full_ego_oracle"):
         _install_oracle_context(model, data, run_kind=effective_run_kind)
     _run_ddp_dispatch(
         cfg,

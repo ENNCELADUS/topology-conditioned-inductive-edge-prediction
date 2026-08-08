@@ -46,6 +46,9 @@ WAVE1_ORACLE_CONFIGS = {
     / "configs/egostitch_e2e_v3_oracle_grit_xattn_tokens_breadth_first.yaml",
     "oracle_ste_ref": REPO_ROOT / "configs/egostitch_e2e_v3_oracle_ste_ref_breadth_first.yaml",
 }
+FULL_EGO_ORACLE_CONFIG = (
+    REPO_ROOT / "configs/egostitch_e2e_v3_full_ego_oracle_grit_pooled_breadth_first.yaml"
+)
 
 
 def test_wave1_oracle_runtime_and_supervision_contracts() -> None:
@@ -64,10 +67,14 @@ def test_v3_live_arms_share_one_ng50_pack_and_grounding_cache() -> None:
     config_paths = sorted((REPO_ROOT / "configs").glob("egostitch_e2e_v3_*_breadth_first.yaml"))
     # The retired cosine_pool config stays on disk as history; no live arm uses it.
     assert set(config_paths) == (
-        set(V3_CONFIGS.values()) | {RETIRED_COSINE_POOL_CONFIG} | set(WAVE1_ORACLE_CONFIGS.values())
+        set(V3_CONFIGS.values())
+        | {RETIRED_COSINE_POOL_CONFIG, FULL_EGO_ORACLE_CONFIG}
+        | set(WAVE1_ORACLE_CONFIGS.values())
     )
     configs = []
-    for path in sorted(set(V3_CONFIGS.values()) | set(WAVE1_ORACLE_CONFIGS.values())):
+    for path in sorted(
+        set(V3_CONFIGS.values()) | set(WAVE1_ORACLE_CONFIGS.values()) | {FULL_EGO_ORACLE_CONFIG}
+    ):
         payload = yaml.safe_load(path.read_text(encoding="utf-8"))
         configs.append(
             (

@@ -15,6 +15,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import cast
 
+import networkx as nx
 import numpy as np
 import pytest
 import torch
@@ -2350,6 +2351,14 @@ _TINY_ORACLE_E2E_CONFIG: dict[str, object] = {
     },
 }
 
+_TINY_FULL_ORACLE_E2E_CONFIG: dict[str, object] = {
+    **_TINY_ORACLE_E2E_CONFIG,
+    "generator": {
+        "name": "full_ego_oracle",
+        "feature_standardization": "row_layernorm",
+    },
+}
+
 
 def _write_test_graph_pkl(data_root: Path, strategy: str, edges: list[tuple[str, str]]) -> Path:
     import networkx as nx
@@ -2397,6 +2406,65 @@ def test_allow_oracle_diagnostic_flag_rejected_for_a_non_oracle_generator(tmp_pa
     assert not output.exists()
 
 
+def test_full_oracle_scoring_is_unreachable_without_the_diagnostic_flag(
+    tmp_path: Path,
+) -> None:
+    data_root, checkpoint, pairs_path = _egostitch_e2e_setup(
+        tmp_path, model_config=_TINY_FULL_ORACLE_E2E_CONFIG
+    )
+    strategy_dir = data_root / "benchmark_2025_neurips" / "breadth_first"
+    strategy_dir.mkdir(parents=True, exist_ok=True)
+    (strategy_dir / "test_edges.txt").write_bytes(pairs_path.read_bytes())
+    truth_graph_path = _write_test_graph_pkl(data_root, "breadth_first", _E2E_PAIRS)
+    run_metadata_path = _write_run_metadata(tmp_path, checkpoint, arm="full_ego_oracle")
+    output = tmp_path / "full_oracle.npz"
+    args = [
+        "score",
+        "--checkpoint",
+        str(checkpoint),
+        "--pairs",
+        "test",
+        "--data-root",
+        str(data_root),
+        "--output",
+        str(output),
+        "--token-budget",
+        "8192",
+        "--f0-cache",
+        str(tmp_path / "full_f0_cache.pt"),
+        "--device",
+        "cpu",
+        "--run-metadata",
+        str(run_metadata_path),
+    ]
+
+    with pytest.raises(ValueError, match="--allow-oracle-diagnostic"):
+        score_universe.main(args)
+    assert not output.exists()
+
+    with pytest.raises(ValueError, match="does not support scoring-time scaffold controls"):
+        score_universe.main(
+            [
+                *args,
+                "--allow-oracle-diagnostic",
+                "--scaffold-control",
+                "shuffle_within_pair_v3",
+            ]
+        )
+    assert not output.exists()
+
+    score_universe.main([*args, "--allow-oracle-diagnostic"])
+    artifact = score_universe.load_scores(output)
+    assert len(artifact.logit) == len(_E2E_PAIRS)
+    assert artifact.meta["formal"] is False
+    diagnostic = cast(dict[str, object], artifact.meta["oracle_diagnostic"])
+    assert diagnostic["generator"] == "full_ego_oracle"
+    assert diagnostic["truth_graph_sha256"] == score_universe._oracle_truth_graph_sha256(
+        nx.Graph(_E2E_PAIRS)
+    )
+    assert truth_graph_path.is_file()
+
+
 def test_oracle_generator_scoring_is_unreachable_without_the_diagnostic_flag(
     tmp_path: Path,
 ) -> None:
@@ -2436,11 +2504,17 @@ def test_oracle_generator_scoring_is_unreachable_without_the_diagnostic_flag(
 
     score_universe.main([*base_args, "--allow-oracle-diagnostic"])
     artifact = score_universe.load_scores(output)
+    truth_graph = nx.Graph(_E2E_PAIRS)
     assert artifact.meta["oracle_diagnostic"] == {
         "generator": "oracle_struct",
         "truth_source": "test_graph",
         "diagnostic_only": True,
+        "formal": False,
+        "truth_graph_sha256": score_universe._oracle_truth_graph_sha256(truth_graph),
+        "truth_graph_node_count": truth_graph.number_of_nodes(),
+        "truth_graph_edge_count": truth_graph.number_of_edges(),
     }
+    assert artifact.meta["formal"] is False
     # A truth-consuming diagnostic can never be the formal held-out claim,
     # even though `pairs_source == "test"` looks held-out-shaped.
     assert artifact.meta["heldout"] is False

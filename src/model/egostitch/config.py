@@ -207,8 +207,10 @@ class GeneratorConfig:
             (`registry.GENERATOR_REGISTRY`); ``"egostitch_imagine"`` for
             today's Tokenize-lite + Imagine + Stitch pipeline, ``"null"`` for
             the parameter-free pairwise-baseline generator,
-            ``"oracle_struct"`` for the ground-truth-scaffold upper bound
-            (`generator/oracle.py`).
+            ``"oracle_struct"`` for the fixed-slot ground-truth-scaffold
+            upper bound (`generator/oracle.py`), or ``"full_ego_oracle"``
+            for the uncapped ground-truth local-graph diagnostic
+            (`generator/full_oracle.py`).
         oracle_seed: Table-wide seed for ``"oracle_struct"``'s per-node hub
             subsample. Folded into every node's
             ``blake2b(f"{node_id}|{seed}|oracle")`` rng, so it selects *which*
@@ -218,7 +220,7 @@ class GeneratorConfig:
             recorded hash whether or not the selected arm reads it, or two
             oracle runs with different subsamples would be indistinguishable
             in the run record.
-        oracle_truth_source: Graph ``"oracle_struct"`` reads its scaffolds from.
+        oracle_truth_source: Graph an oracle generator reads its topology from.
             ``"g_fit"`` keeps the inductive input boundary, so every held-out
             node gets an empty scaffold. ``"g_fit_plus_v_hold"`` attaches the
             internal validation positives as a disjoint component and is
@@ -263,9 +265,13 @@ class GeneratorConfig:
             raise ValueError(f"oracle_seed must be non-negative, got {self.oracle_seed}")
         if self.oracle_truth_source not in ("g_fit", "g_fit_plus_v_hold"):
             raise ValueError("oracle_truth_source must be one of ['g_fit', 'g_fit_plus_v_hold']")
-        if self.oracle_truth_source != "g_fit" and self.name != "oracle_struct":
+        if self.oracle_truth_source != "g_fit" and self.name not in (
+            "oracle_struct",
+            "full_ego_oracle",
+        ):
             raise ValueError(
-                "oracle_truth_source='g_fit_plus_v_hold' requires name='oracle_struct'"
+                "oracle_truth_source='g_fit_plus_v_hold' requires name='oracle_struct' "
+                "or name='full_ego_oracle'"
             )
         if not 0.0 < self.tau_adj < 1.0:
             raise ValueError(f"tau_adj must be in (0, 1), got {self.tau_adj}")

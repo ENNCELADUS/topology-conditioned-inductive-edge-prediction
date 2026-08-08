@@ -1633,10 +1633,18 @@ def _oracle_truth_graph_for_scoring(pairs_source: str, data_root: Path, strategy
     )
 
 
+def _oracle_truth_graph_sha256(graph: nx.Graph) -> str:
+    """Return a stable digest of a complete oracle truth graph, including isolates."""
+    nodes = sorted(str(node) for node in graph.nodes)
+    edges = sorted(canonical_pair(str(node_u), str(node_v)) for node_u, node_v in graph.edges)
+    payload = json.dumps({"nodes": nodes, "edges": edges}, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _install_oracle_context(
     model: EgoStitchModel, node_ids: Sequence[str], *, truth_graph: nx.Graph
 ) -> None:
-    """Build and install the ground-truth scaffold table an ``OracleStructGenerator`` needs.
+    """Install the role-specific truth context required by an oracle generator.
 
     Mirrors ``src.train_egostitch._install_oracle_context``'s F0-row =
     table-row identity lookup, specialized to this scoring call's own node
@@ -1649,17 +1657,31 @@ def _install_oracle_context(
         node_ids: This call's F0-row-ordered node universe.
         truth_graph: The self-loop-free ground-truth graph to read scaffolds from.
     """
+    from src.model.egostitch.generator.full_oracle import FullOracleGenerator
     from src.model.egostitch.generator.oracle import OracleStructGenerator, build_oracle_table
 
-    assert isinstance(model.generator, OracleStructGenerator)
-    table = build_oracle_table(
-        truth_graph,
-        list(node_ids),
-        slots=model.generator_cfg.slots,
-        seed=model.cfg.generator.oracle_seed,
+    if isinstance(model.generator, OracleStructGenerator):
+        table = build_oracle_table(
+            truth_graph,
+            list(node_ids),
+            slots=model.generator_cfg.slots,
+            seed=model.cfg.generator.oracle_seed,
+        )
+        lookup = torch.arange(len(node_ids), dtype=torch.long)
+        model.generator.set_oracle_context(table, lookup)
+        return
+    if isinstance(model.generator, FullOracleGenerator):
+        full_truth_graph = truth_graph.copy()
+        # A queryable node with no positive incident edge is a legitimate
+        # isolate. Make that node membership explicit before the generator's
+        # strict context validation rather than weakening its graph contract.
+        full_truth_graph.add_nodes_from(node_ids)
+        model.generator.set_oracle_context(full_truth_graph, node_ids)
+        return
+    raise TypeError(
+        "oracle context install requires a registered oracle generator, got "
+        f"{type(model.generator).__name__}"
     )
-    lookup = torch.arange(len(node_ids), dtype=torch.long)
-    model.generator.set_oracle_context(table, lookup)
 
 
 def _resolve_pairs(
@@ -2114,6 +2136,7 @@ def _score_egostitch_e2e(
     from src.data.grounding import build_grounding_pool
     from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
     from src.model.egostitch.generator.egostitch import EgoStitchImagineGenerator
+    from src.model.egostitch.generator.full_oracle import FullOracleGenerator
     from src.model.egostitch.generator.imagine import SlotSet
     from src.model.egostitch.generator.null import NullGenerator
     from src.model.egostitch.generator.oracle import OracleStructGenerator
@@ -2142,17 +2165,19 @@ def _score_egostitch_e2e(
     is_real_generator = isinstance(model.generator, EgoStitchImagineGenerator)
     is_null_generator = isinstance(model.generator, NullGenerator)
     is_oracle_generator = isinstance(model.generator, OracleStructGenerator)
-    is_slot_generator = is_real_generator or is_oracle_generator
+    is_full_oracle_generator = isinstance(model.generator, FullOracleGenerator)
+    is_truth_generator = is_oracle_generator or is_full_oracle_generator
+    is_slot_generator = is_real_generator or is_truth_generator
     if not (is_slot_generator or is_null_generator):
         raise ValueError(
             "egostitch_e2e scoring supports only the real egostitch_imagine "
             "generator (topology-conditioned), the null generator "
-            "(topology-free pairwise baseline), or the oracle_struct diagnostic "
+            "(topology-free pairwise baseline), or an oracle diagnostic "
             f"generator; got {type(model.generator).__name__}"
         )
-    if is_oracle_generator and oracle_truth_graph is None:
+    if is_truth_generator and oracle_truth_graph is None:
         raise ValueError(
-            "oracle_struct scoring requires oracle_truth_graph (the ground-truth "
+            "oracle scoring requires oracle_truth_graph (the ground-truth "
             "topology to install via _install_oracle_context); this is a caller bug, "
             "not a legal degraded mode"
         )
@@ -2163,13 +2188,15 @@ def _score_egostitch_e2e(
     )
     if scaffold_control not in (_SCAFFOLD_CONTROL_NONE, *active_controls):
         raise ValueError(f"unknown scaffold control: {scaffold_control!r}")
+    if is_full_oracle_generator and scaffold_control != _SCAFFOLD_CONTROL_NONE:
+        raise ValueError("full_ego_oracle does not support scoring-time scaffold controls")
     # Grounding candidates must come from the full scored universe, not this
     # process's shard, so control (and ordinary e2e) logits are shard-invariant.
     node_universe = universe_pairs if universe_pairs is not None else pairs
     if not 0 <= row_start <= row_start + len(pairs) <= len(node_universe):
         raise ValueError("e2e scoring rows are outside the declared pair universe")
     node_ids = sorted({node_id for pair in node_universe for node_id in pair})
-    if is_oracle_generator:
+    if is_truth_generator:
         assert oracle_truth_graph is not None  # checked above
         _install_oracle_context(model, node_ids, truth_graph=oracle_truth_graph)
     f0_cache.parent.mkdir(parents=True, exist_ok=True)
@@ -2376,12 +2403,20 @@ def _score_egostitch_e2e(
             batch_specs.append((indices, output_rows))
         batch_pair_source = node_universe
     else:
-        pair_lengths = probe_lengths(store, pairs)
-        sampler = LengthBucketedBatchSampler(pair_lengths, token_budget=token_budget, shuffle=False)
-        batch_specs = [
-            (indices, [(index, position) for position, index in enumerate(indices)])
-            for indices in sampler
-        ]
+        if is_full_oracle_generator:
+            # Dense RRWP/GRIT cost follows the uncapped ego graph's N^2, not
+            # protein token length. A sequence-token sampler can therefore
+            # batch many hub egos and OOM despite training's edge_batch=1.
+            batch_specs = _full_oracle_score_batch_specs(len(pairs))
+        else:
+            pair_lengths = probe_lengths(store, pairs)
+            sampler = LengthBucketedBatchSampler(
+                pair_lengths, token_budget=token_budget, shuffle=False
+            )
+            batch_specs = [
+                (indices, [(index, position) for position, index in enumerate(indices)])
+                for indices in sampler
+            ]
         batch_pair_source = pairs
 
     for batch_indices, output_rows in batch_specs:
@@ -2412,6 +2447,15 @@ def _score_egostitch_e2e(
         processed += len(output_rows)
         _log_progress(processed, len(pairs), len(output_rows))
     return out
+
+
+def _full_oracle_score_batch_specs(
+    num_pairs: int,
+) -> list[tuple[list[int], list[tuple[int, int]]]]:
+    """Return singleton scorer batches for dense, uncapped full-ego graphs."""
+    if num_pairs < 0:
+        raise ValueError("num_pairs must be non-negative")
+    return [([index], [(index, 0)]) for index in range(num_pairs)]
 
 
 def _shard_range(num_rows: int, shard: int, num_shards: int) -> tuple[int, int]:
@@ -2542,7 +2586,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "required to score a checkpoint whose egostitch_e2e generator is "
-            "oracle_struct: it consumes ground-truth topology by construction "
+            "oracle_struct or full_ego_oracle: it consumes ground-truth topology "
+            "by construction "
             "(the 2026-08-04 oracle-scaffold-experiment design), so this is a "
             "ceiling diagnostic only, never a formal result, and is refused "
             "without this explicit acknowledgement"
@@ -2650,17 +2695,26 @@ def _run_score(args: argparse.Namespace) -> None:
     # never pay. For `egostitch_e2e` this is free -- `_load_checkpoint` already
     # imported the same module building the model above.
     is_oracle_generator = False
+    oracle_generator_name: str | None = None
     if model_family == "egostitch_e2e":
         from src.model.egostitch.composite import EgoStitchModel
+        from src.model.egostitch.generator.full_oracle import FullOracleGenerator
         from src.model.egostitch.generator.oracle import OracleStructGenerator
 
-        is_oracle_generator = isinstance(model, EgoStitchModel) and isinstance(
-            model.generator, OracleStructGenerator
-        )
+        if isinstance(model, EgoStitchModel) and isinstance(
+            model.generator, (OracleStructGenerator, FullOracleGenerator)
+        ):
+            is_oracle_generator = True
+            oracle_generator_name = model.cfg.generator.name
+    if (
+        oracle_generator_name == "full_ego_oracle"
+        and args.scaffold_control != _SCAFFOLD_CONTROL_NONE
+    ):
+        raise ValueError("full_ego_oracle does not support scoring-time scaffold controls")
     if args.allow_oracle_diagnostic and not is_oracle_generator:
         raise ValueError(
             "--allow-oracle-diagnostic is valid only when the checkpoint's "
-            "egostitch_e2e generator is oracle_struct"
+            "egostitch_e2e generator is oracle_struct or full_ego_oracle"
         )
     oracle_truth_graph: nx.Graph | None = None
     if is_oracle_generator:
@@ -2679,7 +2733,7 @@ def _run_score(args: argparse.Namespace) -> None:
         # itself pass it.
         if not args.allow_oracle_diagnostic:
             raise ValueError(
-                "checkpoint generator is oracle_struct, which consumes ground-truth "
+                f"checkpoint generator is {oracle_generator_name}, which consumes ground-truth "
                 "topology by construction (2026-08-04 oracle-scaffold-experiment design); "
                 "pass --allow-oracle-diagnostic to acknowledge this is a ceiling "
                 "diagnostic, never a formal result"
@@ -2860,10 +2914,15 @@ def _run_score(args: argparse.Namespace) -> None:
             # docstring), so it cannot pass `validate_test_access_ledger_binding`
             # as a formal held-out result even if fed into it downstream.
             assert oracle_truth_graph is not None
+            meta_extra["formal"] = False
             meta_extra["oracle_diagnostic"] = {
-                "generator": "oracle_struct",
+                "generator": oracle_generator_name,
                 "truth_source": "test_graph" if args.pairs != "v_hold" else "v_hold_topology_hold",
                 "diagnostic_only": True,
+                "formal": False,
+                "truth_graph_sha256": _oracle_truth_graph_sha256(oracle_truth_graph),
+                "truth_graph_node_count": oracle_truth_graph.number_of_nodes(),
+                "truth_graph_edge_count": oracle_truth_graph.number_of_edges(),
             }
     else:  # pragma: no cover - build_model already rejects unknown families
         raise ValueError(f"no scoring path for model_family {model_family!r}")
