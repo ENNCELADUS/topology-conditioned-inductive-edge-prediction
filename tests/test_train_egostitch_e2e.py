@@ -373,6 +373,38 @@ class TestBatchFactoryE2E:
         assert (edge["target_node_index_i"][1:] == -1).all()
         assert (edge["target_node_index_j"][1:] == -1).all()
 
+    def test_filler_rows_are_consistent_authorized_self_pairs(self, tmp_path: Path) -> None:
+        factory, _ = self._target_factory(
+            tmp_path,
+            generator_supervision=False,
+            relational_supervision=False,
+        )
+        edge, true_rows = factory._edge_tensors(
+            [("target-node-01", "target-node-02", 0)],
+            pad_to=4,
+            epoch=1,
+            step=1,
+        )
+
+        filler_node = factory._data.train_nodes[0]
+        filler_row = factory._data.node_index[filler_node]
+        assert true_rows == 1
+        assert edge["node_row_i"][1:].tolist() == [filler_row] * 3
+        assert edge["node_row_j"][1:].tolist() == [filler_row] * 3
+        assert edge["is_self"][1:].tolist() == [True, True, True]
+        assert edge["label"][1:].tolist() == [0.0, 0.0, 0.0]
+        assert edge["edge_mask"][1:].tolist() == [0.0, 0.0, 0.0]
+        expected_f0 = factory._data.f0[filler_row].expand(3, -1)
+        torch.testing.assert_close(edge["x_i"][1:], expected_f0)
+        torch.testing.assert_close(edge["x_j"][1:], expected_f0)
+
+        filler_only, empty_true_rows = factory._edge_tensors([], pad_to=4, epoch=1, step=2)
+        assert empty_true_rows == 0
+        assert filler_only["node_row_i"].tolist() == [filler_row] * 4
+        assert filler_only["node_row_j"].tolist() == [filler_row] * 4
+        assert filler_only["is_self"].tolist() == [True] * 4
+        assert filler_only["edge_mask"].tolist() == [0.0] * 4
+
     def test_nonedge_shared_neighbor_has_nonzero_relational_targets(self, tmp_path: Path) -> None:
         factory, _ = self._target_factory(tmp_path)
         # Leaves 01 and 02 are a non-edge but share hub 00.
@@ -385,7 +417,12 @@ class TestBatchFactoryE2E:
         expected = torch.tensor([math.log1p(1.0), 1.0])
         torch.testing.assert_close(edge["rel_target"][0], expected)
         assert torch.count_nonzero(edge["rel_target"][0]) == 2
-        assert torch.equal(edge["rel_target"][1], expected)
+        filler_node = factory._data.train_nodes[0]
+        expected_filler = te.relational_pair_targets(
+            factory._data.target_builder.graph,
+            [(filler_node, filler_node, 0)],
+        )[0]
+        assert torch.equal(edge["rel_target"][1], expected_filler)
         assert edge["edge_mask"].tolist() == [1.0, 0.0]
         other_rank_factory, _ = self._target_factory(tmp_path, rank=1, world_size=2)
         reversed_edge, _ = other_rank_factory._edge_tensors(

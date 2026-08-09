@@ -2603,27 +2603,22 @@ class _BatchFactory:
         del step  # Rev-3.1 target sampling is explicitly step-independent.
         true_rows = len(rows)
         padded: list[tuple[str, str, int]] = list(rows)
+        filler = (self._data.train_nodes[0], self._data.train_nodes[0], 0)
         if true_rows == 0:
-            filler = (self._data.train_nodes[0], self._data.train_nodes[0], 0)
             padded = [filler]
         while len(padded) < pad_to:
-            padded.append(padded[0])
+            padded.append(filler)
         self._record_training_nodes([node for u, v, _ in padded for node in (u, v)])
         idx_i = torch.tensor([self._data.node_index[u] for u, _, _ in padded], dtype=torch.long)
         idx_j = torch.tensor([self._data.node_index[v] for _, v, _ in padded], dtype=torch.long)
         # F0 row identities for each endpoint (Wave-1 oracle-scaffold
         # addendum): `OracleStructGenerator` needs to know *which* real node
         # it is encoding to look up its scaffold, an identity `x_i`/`x_j`
-        # alone do not carry. DDP filler rows beyond `true_rows` are zeroed
-        # rather than left at their repeated real index -- `edge_mask`
-        # already excludes them from every loss downstream, so the filler
-        # value itself is inert; zeroing it keeps that inertness explicit
-        # instead of incidental on `padded[0]` always being a valid row.
+        # alone do not carry. Filler rows use one authorized V_fit self-pair,
+        # keeping features, row identities, and `is_self` mutually consistent;
+        # `edge_mask` still excludes them from every loss downstream.
         node_row_i = idx_i.clone()
         node_row_j = idx_j.clone()
-        if true_rows < len(padded):
-            node_row_i[true_rows:] = 0
-            node_row_j[true_rows:] = 0
         edge: dict[str, torch.Tensor] = {
             "x_i": self._data.f0[idx_i],
             "x_j": self._data.f0[idx_j],
