@@ -439,6 +439,28 @@ def test_prefetch_batches_builds_ahead_without_reordering() -> None:
         batches.close()
 
 
+def test_prefetch_depth_sixteen_queues_two_accumulation_windows() -> None:
+    seventeenth_started = threading.Event()
+    release_seventeenth = threading.Event()
+
+    def source() -> Iterator[int]:
+        for value in range(17):
+            if value == 16:
+                seventeenth_started.set()
+                assert release_seventeenth.wait(timeout=1.0)
+            yield value
+
+    batches = te._prefetch_batches(source(), depth=16)
+    try:
+        assert next(batches) == 0
+        assert seventeenth_started.wait(timeout=1.0)
+        release_seventeenth.set()
+        assert list(batches) == list(range(1, 17))
+    finally:
+        release_seventeenth.set()
+        batches.close()
+
+
 def test_prefetch_batches_shutdowns_after_consumer_abort() -> None:
     second_started = threading.Event()
     release_second = threading.Event()

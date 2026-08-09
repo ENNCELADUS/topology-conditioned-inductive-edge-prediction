@@ -1386,6 +1386,71 @@ class TestRunPipelineFailures:
         assert not (output_dir / "artifact_manifest.json").exists()
         assert not (output_dir / "complete.json").exists()
 
+    def test_diagnostic_runtime_telemetry_and_engineering_deadlines_never_block(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Diagnostic truth/integrity checks remain strict; utilization is telemetry."""
+        from src import train_b0
+
+        @dataclass(frozen=True)
+        class _DiagnosticConfig(train_b0.Config):
+            run_kind: str | None = None
+
+        def fake_load_config(path: Path) -> _DiagnosticConfig:
+            base = train_b0.load_config(path)
+            return _DiagnosticConfig(**{f.name: getattr(base, f.name) for f in fields(base)})
+
+        class DiagnosticWorker:
+            pass
+
+        DiagnosticWorker.load_config = staticmethod(fake_load_config)  # type: ignore[attr-defined]
+        DiagnosticWorker.prepare_pack = staticmethod(train_b0.prepare_pack)  # type: ignore[attr-defined]
+
+        base_args, output_dir = self._base_args_and_config(tmp_path)
+        args = PipelineArgs(
+            config=base_args.config,
+            pack_dir=base_args.pack_dir,
+            output_dir=base_args.output_dir,
+            worker_module="fake.diagnostic_worker",
+            run_kind="diagnostic",
+        )
+        original_import = importlib.import_module
+        monkeypatch.setattr(
+            importlib,
+            "import_module",
+            lambda name: (
+                DiagnosticWorker if name == "fake.diagnostic_worker" else original_import(name)
+            ),
+        )
+        profile = {
+            **_valid_worker_profile(),
+            "peak_memory_gib_per_rank": [90.0, 91.0, 92.0, 93.0],
+            "steady_state_data_wait_fraction": 0.25,
+            "feature_cache_hit_rate": 0.9,
+        }
+        command_timeouts: list[float | None] = []
+        base_runner = _make_fake_runner(train_runtime_profile=profile)
+
+        def runner(
+            command: Sequence[str], timeout: float | None
+        ) -> subprocess.CompletedProcess[str]:
+            command_timeouts.append(timeout)
+            return base_runner(command, timeout)
+
+        stage_timeouts: list[float | None] = []
+
+        def stage_runner(operation: Callable[[], None], timeout: float | None) -> None:
+            stage_timeouts.append(timeout)
+            operation()
+
+        assert run_pipeline(args, command_runner=runner, stage_runner=stage_runner) == 0
+        assert command_timeouts and all(timeout is None for timeout in command_timeouts)
+        assert stage_timeouts and all(timeout is None for timeout in stage_timeouts)
+        assert (output_dir / "diagnostic_complete.json").is_file()
+        published = json.loads((output_dir / "profile.json").read_text())
+        assert published["steady_state_data_wait_fraction"] == 0.25
+        assert published["feature_cache_hit_rate"] == 0.9
+
     @pytest.mark.parametrize("corrupt", ["checkpoint", "metrics", "metadata"])
     def test_corrupt_staged_artifact_is_rejected_before_hashing(
         self, tmp_path: Path, corrupt: str

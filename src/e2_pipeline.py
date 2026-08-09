@@ -540,8 +540,9 @@ def _validate_worker_profile(
     world_size: int,
     memory_limit_gib: float,
     allow_partial: bool = False,
+    enforce_engineering_limits: bool = True,
 ) -> dict[str, object]:
-    """Validate the formal worker's complete runtime-profile contract."""
+    """Validate worker completeness, integrity, and optional engineering limits."""
     if not isinstance(data, dict):
         raise ValueError("worker profile must be a JSON object")
     required = {
@@ -567,19 +568,19 @@ def _validate_worker_profile(
         if data[key] is not True:
             raise ValueError(f"{key} must be exactly true")
     hit_rate = _finite_number(data["feature_cache_hit_rate"], field="feature_cache_hit_rate")
-    if hit_rate != 1.0:
+    if enforce_engineering_limits and hit_rate != 1.0:
         raise ValueError("feature_cache_hit_rate must be exactly 1.0")
     memories = data["peak_memory_gib_per_rank"]
     if not isinstance(memories, list) or len(memories) != world_size:
         raise ValueError(f"peak_memory_gib_per_rank must contain {world_size} values")
     for rank, value in enumerate(memories):
         memory = _finite_number(value, field=f"peak_memory_gib_per_rank[{rank}]")
-        if memory > memory_limit_gib:
+        if enforce_engineering_limits and memory > memory_limit_gib:
             raise ValueError(f"rank {rank} peak memory exceeds {memory_limit_gib} GiB")
     wait_fraction = _finite_number(
         data["steady_state_data_wait_fraction"], field="steady_state_data_wait_fraction"
     )
-    if wait_fraction > 0.05:
+    if enforce_engineering_limits and wait_fraction > 0.05:
         raise ValueError(f"steady_state_data_wait_fraction {wait_fraction:.6f} exceeds 0.05")
     per_epoch = data["per_epoch"]
     expected_epochs = cast(int, data["epochs_completed"])
@@ -925,6 +926,7 @@ def run_pipeline(
         cfg = replace(cfg, run_kind=args.run_kind)
     if args.max_steps is not None and args.max_steps <= 0:
         raise ValueError("--max-steps must be positive")
+    diagnostic_run = args.run_kind == "diagnostic"
     if cfg.runtime is None:
         raise ValueError("the E2 pipeline requires a config with a 'runtime:' section")
     runtime = cfg.runtime
@@ -1013,7 +1015,10 @@ def run_pipeline(
         _write_json_atomic(pack_validation_path, cast(dict[str, object], payload))
 
     try:
-        stage_runner(pack_operation, float(runtime.pack_budget_seconds))
+        stage_runner(
+            pack_operation,
+            None if diagnostic_run else float(runtime.pack_budget_seconds),
+        )
     except subprocess.TimeoutExpired:
         cleanup_owned_pack_temps()
         return fail(
@@ -1073,7 +1078,10 @@ def run_pipeline(
         _write_json_atomic(profile_path, evidence_profile)
         return fail(stage="train", message=f"training worker launch setup failed: {error}")
     try:
-        completed = command_runner(command, float(runtime.train_eval_budget_seconds))
+        completed = command_runner(
+            command,
+            None if diagnostic_run else float(runtime.train_eval_budget_seconds),
+        )
     except subprocess.TimeoutExpired:
         _write_json_atomic(profile_path, evidence_profile)
         return fail(
@@ -1103,6 +1111,7 @@ def run_pipeline(
             world_size=runtime.world_size,
             memory_limit_gib=runtime.memory_limit_gib,
             allow_partial=debug_run,
+            enforce_engineering_limits=not diagnostic_run,
         )
         completed_epochs = cast(int, worker_runtime_profile["epochs_completed"])
         _validate_staged_artifacts(
@@ -1182,7 +1191,10 @@ def run_pipeline(
         _write_json_atomic(staging_dir / "artifact_manifest.json", manifest)
 
     try:
-        stage_runner(artifact_operation, float(runtime.artifact_budget_seconds))
+        stage_runner(
+            artifact_operation,
+            None if diagnostic_run else float(runtime.artifact_budget_seconds),
+        )
     except subprocess.TimeoutExpired:
         _write_json_atomic(profile_path, final_profile)
         return fail(

@@ -55,7 +55,7 @@ data:
 optim:
   lr: 1.0e-4
   weight_decay: 0.01
-  epochs: 10
+  epochs: 30
   warmup_steps: 500
   grad_clip: 1.0
   gradient_accumulation_steps: 8
@@ -105,7 +105,9 @@ runtime:
   pack_dir: outputs/feature_packs/egostitch_e2e_v_hold_ng50
   pack_workers: 8
   loader_workers_per_rank: 0
-  prefetch_factor: 2
+  # One optimizer step consumes eight physical microbatches. Keep two complete
+  # logical windows queued so CPU token/F0 gathers overlap the current GPU step.
+  prefetch_factor: 16
   token_budget: 128
   max_pairs_per_rank: 1048576
   memory_limit_gib: 85.0

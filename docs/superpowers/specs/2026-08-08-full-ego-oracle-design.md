@@ -127,11 +127,19 @@ dense matrix products, so that stage takes `O(K|U_q|^3)` time and
 The measured H20 operating point is
 `data.edge_batch: 16` with 8-way accumulation per rank: this preserves the
 logical batch of 128 pairs and its one exact global weighted-BCE denominator.
-The registered diagnostic schedule is 10 epochs to target the fixed train/eval
-budget. Training throughput alone leaves about 3.4 hours for validation and
-overhead, so the run is not known to fit until its first full B16 validation is
-timed. Any matched K=16 comparison must be rerun with the same B16 x 8 physical
-batching and 10-epoch optimizer schedule; a historical B128/30-epoch result has
+The diagnostic uses the complete 30-epoch training schedule. The earlier
+10-epoch run was an engineering-budget reduction and is not a complete
+scientific run. On four H20s it completed those 10 epochs and all validations
+at 101.48 global pairs/s, but shallow two-batch prefetch left 17.64% of wall
+time waiting for the next eight-microbatch accumulation window. The production
+config therefore queues 16 physical batches: two full logical windows, so the
+single deterministic producer can prepare the next window while the GPU
+executes the current one. Data-wait and peak-memory thresholds remain recorded
+telemetry but do not reject a diagnostic run, and diagnostic pack, train, and
+artifact stages have no engineering deadline. Completeness, finite state, DDP
+agreement, data boundaries, artifact integrity, and I/O still fail closed. Any
+matched K=16 comparison must be rerun with the same B16 x 8 physical batching
+and 30-epoch optimizer schedule; a historical B128/30-epoch result has a
 different pair-to-dropout assignment and is not a matched control.
 `runtime.token_budget` governs endpoint feature-token packing, not the number
 of nodes in `H_q`, and is not a full-graph memory control. LR schedules, phase

@@ -119,7 +119,9 @@ def test_runnable_config_uses_logical_128_training_and_singleton_scoring() -> No
     assert run_cfg.data.edge_batch == 16
     assert run_cfg.optim.gradient_accumulation_steps == 8
     assert run_cfg.data.edge_batch * run_cfg.optim.gradient_accumulation_steps == 128
-    assert run_cfg.optim.epochs == 10
+    assert run_cfg.optim.epochs == 30
+    assert run_cfg.runtime is not None
+    assert run_cfg.runtime.prefetch_factor == 16
     assert score_universe._full_oracle_score_batch_specs(3) == [
         ([0], [(0, 0)]),
         ([1], [(1, 0)]),
