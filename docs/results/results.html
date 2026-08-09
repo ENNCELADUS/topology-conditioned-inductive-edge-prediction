@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Topology oracle vs. pairwise baseline — held-out test protocol</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #16181d;
+    --muted: #5c6370;
+    --rule: #16181d;
+    --hair: #d3d7de;
+    --band: #f6f7f9;
+    --h1: rgba(28, 92, 184, 0.62);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --fg: #e7e9ee;
+      --muted: #9aa2b1;
+      --rule: #e7e9ee;
+      --hair: #333842;
+      --band: #1b1e24;
+      --h1: rgba(122, 168, 236, 0.55);
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #ffffff; --fg: #16181d; --muted: #5c6370; --rule: #16181d; --hair: #d3d7de;
+    --band: #f6f7f9;
+    --h1: rgba(28, 92, 184, 0.62);
+  }
+  :root[data-theme="dark"] {
+    --bg: #14161a; --fg: #e7e9ee; --muted: #9aa2b1; --rule: #e7e9ee; --hair: #333842;
+    --band: #1b1e24;
+    --h1: rgba(122, 168, 236, 0.55);
+  }
+
+  html { background: var(--bg); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 4rem; max-width: 78rem;
+    background: var(--bg); color: var(--fg);
+    font: 400 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  h1 { font-size: 1.6rem; line-height: 1.25; margin: 0 0 .35rem; letter-spacing: -0.01em; }
+  h2 { font-size: 1.08rem; margin: 2.6rem 0 .5rem; letter-spacing: -0.005em; }
+  h3 { font-size: .95rem; margin: 1.8rem 0 .4rem; }
+  p  { margin: .55rem 0; }
+  code { font: 400 .88em/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+  .scroll { overflow-x: auto; margin: .8rem 0 .4rem; padding-bottom: .3rem; }
+  table {
+    border-collapse: collapse; font-size: 13.5px; white-space: nowrap;
+    font-variant-numeric: tabular-nums; min-width: 100%;
+  }
+  caption { caption-side: top; text-align: left; color: var(--muted); font-size: .88rem; padding-bottom: .5rem; white-space: normal; }
+  th, td { padding: .42rem .62rem; text-align: right; }
+  thead th { font-weight: 650; }
+  thead tr:first-child th { border-top: 1.5px solid var(--rule); }
+  thead tr:last-child th { border-bottom: 1px solid var(--rule); }
+  tbody tr:last-child td { border-bottom: 1.5px solid var(--rule); }
+  th.grp { text-align: center; border-bottom: 1px solid var(--hair); font-weight: 650; padding-top: .55rem; }
+  th.grp .gsub { display: block; font-weight: 400; font-size: .82em; color: var(--muted); }
+  th.lbl, td.lbl { text-align: left; }
+  td.lbl { white-space: normal; min-width: 12rem; }
+  td.cat, th.cat { text-align: left; color: var(--muted); font-size: .86rem; }
+  .sep { border-left: 1px solid var(--hair); }
+  tbody tr + tr td { border-top: 1px solid var(--hair); }
+  tbody tr.band td { background: var(--band); }
+
+  .h1c { background: var(--h1); }
+  td.fixed { color: var(--muted); }
+
+  .legend { color: var(--muted); font-size: .85rem; margin-top: .35rem; }
+</style>
+</head>
+<body>
+
+<h1>Topology oracle vs. pairwise baseline</h1>
+
+<h2>1. Headline table</h2>
+
+<div class="scroll">
+<table>
+  <caption>
+    Pairwise columns are computed on the 64,038 benchmark test pairs (self-loops included first,
+    per spec &sect;9.4): AUROC/AUPRC are threshold-free, while Accuracy/F1/MCC use a fixed 0.5 threshold.
+    Topology columns come from the predicted graph
+    assembled over the full 2,037,171-row candidate universe at each scorer's own
+    <em>density-matched assembly threshold</em>. The two blocks therefore share no threshold &mdash; see &sect;2.
+    Shading marks the better value per column.
+  </caption>
+  <thead>
+    <tr>
+      <th class="cat" rowspan="2">Category</th>
+      <th class="lbl" rowspan="2">Model</th>
+      <th class="grp sep" colspan="5">Pairwise classification &mdash; all test pairs<span class="gsub">ranking + fixed-0.5 decisions</span></th>
+      <th class="grp sep" colspan="2">Topology &mdash; global simple-edge<span class="gsub">density-matched assembly</span></th>
+      <th class="grp sep" colspan="5">Topology &mdash; BFS-macro (official)<span class="gsub">density-matched assembly</span></th>
+    </tr>
+    <tr>
+      <th class="sep">AUROC&uarr;</th><th>AUPRC&uarr;</th><th>Accuracy&uarr;</th><th>F1&uarr;</th><th>MCC&uarr;</th>
+      <th class="sep">GS&uarr;</th><th>RD&rarr;1</th>
+      <th class="sep">GS&uarr;</th><th>RD&rarr;1</th><th>Deg.&darr;</th><th>Clus.&darr;</th><th>Spectral&darr;</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr class="band">
+      <td class="cat">Baseline</td>
+      <td class="lbl">Pairwise baseline</td>
+      <td class="sep">0.7067</td><td>0.7315</td><td>0.6083</td><td>0.3987</td><td>0.3020</td>
+      <td class="sep">0.1365</td><td class="fixed">0.9977</td>
+      <td class="sep">0.3896</td><td>0.4223</td><td>13.08</td><td>11.93</td><td>18.09</td>
+    </tr>
+    <tr>
+      <td class="cat">True-oracle<br>diagnostic</td>
+      <td class="lbl">Topology oracle</td>
+      <td class="sep h1c">0.8524</td><td class="h1c">0.8698</td><td class="h1c">0.7713</td><td class="h1c">0.7599</td><td class="h1c">0.5451</td>
+      <td class="sep h1c">0.3076</td><td class="fixed h1c">1.0000</td>
+      <td class="sep h1c">0.4886</td><td class="h1c">0.7542</td><td class="h1c">5.825</td><td class="h1c">5.288</td><td class="h1c">9.302</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+<p class="legend">
+  GS&uarr; = graph similarity (edge-set Dice/F1, PRING Eq.&nbsp;4); RD&rarr;1 = relative density;
+  Deg./Clus./Spectral = MMD ratios against the real-vs-real floor. The five topology numbers are reported
+  together and never aggregated; global simple-edge and BFS-macro GS/RD are named separately and are not
+  interchangeable.
+</p>
+
+<h2>2. Operating points</h2>
+
+<h3>2.1 Threshold A &mdash; pairwise classification at a fixed 0.5</h3>
+
+<div class="scroll">
+<table>
+  <caption>Threshold fixed at 0.5 for every row. Shading marks the better value per column.</caption>
+  <thead>
+    <tr>
+      <th class="lbl" rowspan="2">Model</th>
+      <th class="grp sep" colspan="7">All test pairs</th>
+      <th class="grp sep" colspan="7">Non-self only</th>
+    </tr>
+    <tr>
+      <th class="sep">AUROC&uarr;</th><th>AUPRC&uarr;</th><th>Accuracy&uarr;</th><th>Precision</th><th>Recall</th><th>F1&uarr;</th><th>MCC&uarr;</th>
+      <th class="sep">AUROC&uarr;</th><th>AUPRC&uarr;</th><th>Accuracy&uarr;</th><th>Precision</th><th>Recall</th><th>F1&uarr;</th><th>MCC&uarr;</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr class="band">
+      <td class="lbl">Pairwise baseline</td>
+      <td class="sep">0.7067</td><td>0.7315</td><td>0.6083</td><td class="h1c">0.8574</td><td>0.2598</td><td>0.3987</td><td>0.3020</td>
+      <td class="sep">0.6883</td><td>0.6893</td><td>0.5964</td><td class="h1c">0.8229</td><td>0.2133</td><td>0.3388</td><td>0.2565</td>
+    </tr>
+    <tr>
+      <td class="lbl">Topology oracle</td>
+      <td class="sep h1c">0.8524</td><td class="h1c">0.8698</td><td class="h1c">0.7713</td><td>0.7998</td><td class="h1c">0.7239</td><td class="h1c">0.7599</td><td class="h1c">0.5451</td>
+      <td class="sep h1c">0.8431</td><td class="h1c">0.8519</td><td class="h1c">0.7644</td><td>0.7858</td><td class="h1c">0.7066</td><td class="h1c">0.7441</td><td class="h1c">0.5294</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h3>2.2 Threshold B &mdash; graph assembly</h3>
+
+<div class="scroll">
+<table>
+  <thead>
+    <tr>
+      <th class="lbl">Model</th>
+      <th>Assembly threshold</th>
+      <th>Target non-self edges</th>
+      <th>Realized non-self edges</th>
+      <th>Global RD</th>
+      <th class="sep">Self-loops predicted</th><th>Self-loops in reference</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr class="band">
+      <td class="lbl">Pairwise baseline</td>
+      <td>0.794385</td><td>30,128</td><td>30,059</td><td>0.9977</td>
+      <td class="sep">2,018</td><td>1,891</td>
+    </tr>
+    <tr>
+      <td class="lbl">Topology oracle</td>
+      <td>0.963185</td><td>30,128</td><td>30,128</td><td>1.0000</td>
+      <td class="sep">2,018</td><td>1,891</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+</body>
+</html>
