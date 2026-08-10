@@ -108,9 +108,7 @@ class TestConfig:
             }
         )
         assert cfg.generator.oracle_truth_source == "g_fit_plus_v_hold"
-        full_cfg = GeneratorConfig(
-            name="full_ego_oracle", oracle_truth_source="g_fit_plus_v_hold"
-        )
+        full_cfg = GeneratorConfig(name="full_ego_oracle", oracle_truth_source="g_fit_plus_v_hold")
         assert full_cfg.oracle_truth_source == "g_fit_plus_v_hold"
         with pytest.raises(ValueError, match="oracle_truth_source"):
             GeneratorConfig(oracle_truth_source="test_graph")

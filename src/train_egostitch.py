@@ -3829,9 +3829,7 @@ def _e2e_training_payload(
         "epoch": epoch,
         "step": micro_step,
         "edge_loss_denominator": edge_loss_denominator,
-        "positive_weight": (
-            cfg.training.positive_weight if cfg.training is not None else 5.0
-        ),
+        "positive_weight": (cfg.training.positive_weight if cfg.training is not None else 5.0),
     }
 
 
