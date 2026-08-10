@@ -18,6 +18,7 @@ selected method. Every piece of writing must explain how its context helps decid
 
 ## Engineering rules
 
+- Keep documents clean and concise: replacement edits must preserve the line count or reduce it; never increase it.
 - Do not preserve backward compatibility. Remove obsolete paths instead of adding compatibility
   layers, fallbacks, or migrations.
 - Choose the simplest implementation that fully meets the current requirement. Avoid speculative
