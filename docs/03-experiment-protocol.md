@@ -1,6 +1,6 @@
 # Experiment Protocol: Topology-Conditioned Inductive Edge Prediction
 
-**Status:** repository-local experiment plan for an abstract graph ML benchmark.
+**Status:** task/evaluation protocol; method selection is open and EgoStitch is one historical arm.
 **Updated 2026-07-09:** incorporates the approved `[protocol-Δ]` items from
 `04-model-proposal.md` revision 2.1 (approved as a design proposal; **gate G4 was
 signed off later the same day — `05-egostitch-spec.md` is now the implementation
@@ -28,12 +28,10 @@ protocol, caveats, and deliverables for this repository. It is intentionally sel
 all artifact references are relative to this repository, and all dataset/model names are neutral
 placeholders.
 
-> **Locked contract.** The method is a **per-query local scaffold**. For each queried pair
-> `(i, j)`, build a local topological context from frozen node features, condition the pair
-> classifier on that scaffold, and emit a binary 0/1 edge label. Evaluation aggregates many
-> per-query predictions into a full predicted graph and grades the assembled graph with topology
-> metrics. Per-query locality is the model boundary; graph-scale assembly is only an evaluation
-> aggregation.
+> **Locked task; open method.** For `(i,j)`, infer topology context from exactly
+> `(x_i,x_j)` and emit a binary label. Aggregate predictions only for graph-level
+> evaluation. Latent, deterministic, and explicit-scaffold representations remain
+> candidates; retrieval-grounded scaffolds are a separate support condition.
 >
 > **Known structural consequence (stated, not hidden):** under this contract the assembled
 > graph is an edge-independent construction given features. Gate G2 measures the realism
@@ -42,14 +40,14 @@ placeholders.
 
 ---
 
-## 0. Local scaffold contract
+## 0. Per-query topology-context contract
 
 The useful comparison is not "better edge classifier" alone. The benchmark asks whether a model
 can preserve edge-level quality while assembling predictions into a plausible graph.
 
 ### Method boundary
 
-For a query pair `(i, j)`, the original instantiation of the boundary was:
+For a query pair `(i, j)`, the historical retrieval-grounded instantiation was:
 
 ```text
 V_T = {i, j} union ANN_feat(i, k) union ANN_feat(j, k)
@@ -77,22 +75,24 @@ arm. The *outer* §0 boundary is again unchanged and remains locked. The pending
 frozen-s0 Stage-1 screening registration keeps its own contract (§5.0.5); the
 successor's spec/registration land after that screen publishes (spec §14).
 
+**Forward disposition (2026-08-10):** keep this EgoStitch history, but compare endpoint-only families before selecting a method.
+
 Components:
 
 | Component | Status under the contract |
 |---|---|
 | Frozen feature encoder | Reuse as frozen node features `x_i`; never fine-tune in the core protocol. |
 | Frozen pairwise scorer | Reuse as B0 and (E4.10 only) as the edge-weight/candidate proposer. Provenance audited (§E5). *(2026-07-16: the `s0`-anchor role is retired with the rev-3.0 headline; it survives only inside the frozen-s0 ablation arm.)* |
-| Scaffold construction | The method under test: generated + harmonized (`Ours`); retrieved + thresholded (E4.10). |
+| Topology representation | Open for forward selection: endpoint-only latent, endpoint-only deterministic, or retrieval-grounded explicit scaffold. |
 | Scaffold encoder plus fused decision head | Reuse as the scaffold-conditioned classifier head; identical-head convention for generator comparisons (§3 E4). |
 | Global generated graph encoding | Report only as a baseline or ablation on the locality axis. |
 | Benchmark splits, evaluator, and assembled graph metrics | Reuse consistently for all methods. |
 
-### Why local scaffolds are the primary method
+### Why per-query topology context remains the research object
 
 - They answer the inductive query directly: "given two unseen nodes and frozen features, should an
   edge exist?"
-- They avoid requiring a whole candidate universe before scoring one pair.
+- Endpoint-only variants avoid requiring a candidate universe before scoring one pair.
 - They make the global-vs-local context comparison explicit.
 - They amortize per-node work cleanly; per-pair marginal cost is reported honestly against B0
   (FLOPs/wall-clock table, §6).
@@ -179,7 +179,7 @@ Components:
 | **PA-null** | Preferential-attachment null | `s_ij = k_i·k_j` from training-side degree statistics, reported with each benchmark's degree heterogeneity σ (log-normal fit) | Validity precondition (2405.14985): under uniform negatives this null averages AUC 0.83; any method not clearly beating it has an uninformative edge metric |
 | **Odds-product** | Degree-respecting edge-independent baseline | `P_ij = σ(ℓ_i + ℓ_j)` fitted to the expected degree sequence (Chanpuriya 2111.00048 §3) | Cheapest degree-budget-honoring assembly with zero topology conditioning; also supplies the G2 overlap dial `P̃ = (1−ω)P + ωA` |
 | **DEAL / Graph2Gauss** | External attribute-only baselines | DEAL 2007.08053; Graph2Gauss 1707.03815 | Independent-scoring SOTA for the setting; falsifiable prediction: both exhibit the E2 failure mode |
-| **Ours** | Per-query generated local scaffold + conditioning | EgoStitch per `04-model-proposal.md` §4 / `05-egostitch-spec.md` | Conditioning the decision on generated, harmonized local topology |
+| **Candidate families** | Endpoint-only latent/deterministic or retrieval-grounded EgoStitch | Compare before assigning `Ours` | Method selection remains open |
 | **Oracle** | Observed-graph upper bound | Uses true held-out graph neighborhoods at evaluation time (pinned instantiation: §5.0 G3) | Headroom; violates the inductive protocol; **run first (gate G3)** |
 
 All fair baselines share the same frozen features, splits, query sets, complete training
@@ -190,8 +190,8 @@ interactions, negative-sampling protocol, and an equal, pre-registered HPO budge
 
 ## 3. Experiment matrix
 
-Each experiment lists purpose, claim, run, metrics, and success criterion. The run order is
-prioritized in Section 5 (gates first).
+Each experiment lists purpose, claim, run, metrics, and success criterion. In this
+historical matrix `Ours` means EgoStitch; future matrices name candidate families.
 
 ### E1: Main result on Benchmark-A
 
@@ -504,7 +504,8 @@ rule).
    passed matched GS but still failed matched RD/clustering and regressed degree and
    spectral MMD; it does not replace the binding checkpoint. The locked disposition
    is therefore: frozen-s0 scalar fusion becomes a motivating result and E4 ablation
-   rung; the rev-3.0 e2e conditioned encoder becomes the active G5 build line. This
+   rung; the rev-3.0 e2e conditioned encoder became the active G5 build line at that
+   time. This
    closes the frozen-s0 screen and satisfies spec §14.3(1), without binding the
    successor registration or weakening E1/E3's multi-seed inference rules. Full
    result: `docs/results/G5-stage1-seed0-20260717.md`.
@@ -601,11 +602,11 @@ rule).
 
 ### 5.1 Priority order (after gates)
 
-1. **E2 (hardened)** — establish the gap under G1 conditions.
-2. **E1 and E3** — main method and head-to-head baselines on Benchmark-A.
-3. **E4** — the ablations needed to explain E1/E3.
-4. **E5** — integrity gates completed before broad claims.
-5. **E7** — downstream utility (load-bearing; runs with, not after, breadth).
+1. **E2 (hardened)** — established the gap under G1 conditions.
+2. **Method selection** — compare endpoint-only families, B0/B3-full, and EgoStitch.
+3. **E1/E3** — selected method and baselines on Benchmark-A.
+4. **E4/E5** — mechanism ablations and integrity gates.
+5. **E7** — downstream utility (load-bearing).
 6. **E6** — split/benchmark generalization.
 
 Within each experiment, per-arm execution is a single sequence, not train followed by a
@@ -619,12 +620,9 @@ their own) reach the same report through `hpc/run.sh test` directly.
 
 ### 5.2 Pre-registered decision rules (frozen before held-out metrics are opened)
 
-1. If `Ours` does not beat `B3-full` and `B0+cal` on the held-out assembled family at matched
-   edge AUPRC (Holm-corrected, ≥ 3 seeds), the generative apparatus is declared not
-   load-bearing; the paper pivots to the benchmark/`B3-full` story.
-2. If s1/s2 knockouts cost nothing on every benchmark and stratum, `Ours → B5` is declared and
-   the honest small-paper outcome ("calibrated block-model marginals close most of the
-   pair-to-topology gap") is written.
+1. Assign `Ours` only after selection. If it does not beat `B3-full` and `B0+cal` on
+   held-out topology at matched AUPRC (Holm, ≥3 seeds), its topology is not load-bearing.
+2. If EgoStitch s1/s2 knockouts cost nothing, collapse that arm to B5 and report it.
 3. Multiple-comparison control: Holm over the held-out assembled family replaces any
    "wins on k of n metrics" language.
 4. All thresholds and rules recorded in run metadata before E1/E3 held-out metrics are opened.
@@ -632,8 +630,8 @@ their own) reach the same report through `hpc/run.sh test` directly.
 ### Caching
 
 - Cache frozen node features once per benchmark split.
-- Cache approximate-nearest-neighbor lists for grounding pools.
-- Cache per-node Tokenize/Imagine outputs (spec §1–2) for reuse across queries.
+- Cache audited, universe-scoped ANN lists only for retrieval arms; disclose support.
+- Cache Tokenize/Imagine outputs only for arms that implement them.
 - Cache pairwise scorer outputs for every candidate universe used by E2, B2-global, B2-static,
   `B0+cal`, and `Ours`.
 - Store run metadata with scorer checkpoint identifier, threshold policy, scaffold size, seed,
@@ -646,8 +644,7 @@ their own) reach the same report through `hpc/run.sh test` directly.
 - Lock the operating-point policy and decision rules before opening final held-out metrics.
 - Preserve enough metadata to regenerate [e2-gap.html](../figures/e2-gap.html) and the main
   experiment tables from repository-local artifacts.
-- Report the FLOPs/wall-clock table (per-node cached, per-pair marginal, full-universe assembly)
-  for B0, E4.10, and `Ours` at R ∈ {0, 2, 4}.
+- Report FLOPs/wall-clock for B0 and candidates; sweep `R` only for EgoStitch.
 
 ---
 
@@ -655,8 +652,8 @@ their own) reach the same report through `hpc/run.sh test` directly.
 
 1. **Gate reports (G1–G3):** G1 B0/PA-null/B0-alt, the G2 ceiling computation, and
    the G3 Oracle row are complete; the alternate architecture preserves the topology gap.
-2. **Spec freeze (G4):** signed-off `05-egostitch-spec.md`.
-3. **E1/E3 main table:** method by edge AUPRC, both assembled families, ceiling/Oracle/noise
+2. **EgoStitch reproduction contract:** signed-off `05-egostitch-spec.md`.
+3. **E1/E3 table:** compare candidate families by edge AUPRC, both assembled families, ceiling/Oracle/noise
    rows, diagnostics.
 4. **E4 ablation table:** each mechanism and its edge/topology effect; the pruned submitted
    model.
@@ -667,9 +664,9 @@ their own) reach the same report through `hpc/run.sh test` directly.
    settings-taxonomy axis (transductive / observed-neighborhood inductive / KG-inductive /
    strict zero-edge).
 
-Resolved decisions (formerly open):
+Historical EgoStitch-arm decisions (not forward method-selection decisions):
 
-- Candidate source for scaffolds: generation-primary with gated ANN grounding (04 §4.2).
+- That arm uses generation-primary scaffolds with gated ANN grounding (04 §4.2).
 - Scaffold edges are learned (generated + harmonized), not fixed from the frozen scorer;
   the frozen-scorer variant is E4.10.
 - B2-global is reported as a baseline; an "Ours-global" arm is not planned.

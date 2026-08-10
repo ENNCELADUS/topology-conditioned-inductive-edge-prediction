@@ -41,8 +41,8 @@ The predicted graph $\widehat G_{\tau}$ is compared with the hidden reference gr
 ## Hypotheses
 
 The problem definition above leaves the predictor with $x_u,x_v$ alone, yet grades it on a graph
-$\widehat G_{\tau}$. The hypotheses concern what the training graph's *structure* — not its nodes —
-contributes to that setting.
+$\widehat G_{\tau}$. The representation method remains open; grounding/retrieval is an optional arm,
+not task input or a selected method.
 
 **H1 — pair-to-topology gap.** $\widehat A$ decomposed into independent pair decisions cannot control
 the joint statistics of $\widehat E_{\tau}$. Pair scores that are individually accurate can therefore
@@ -73,7 +73,7 @@ link prediction
     ├── semi-inductive: unseen–seen
     └── fully inductive: unseen–unseen
         ├── an inference graph or observed neighbors are available
-        └── no inference topology; topology is absent or distilled at training(this project)
+        └── no observed inference topology; context inferred from endpoints or distilled (this project)
 ```
 
 This project is therefore **fully-inductive, zero-observed-edge, attributed link prediction with inferred query-local topology**. PPI adds important domain constraints—undirected physical interactions, uncertain negatives, ascertainment-biased graph truth, and the need to evaluate the assembled network.

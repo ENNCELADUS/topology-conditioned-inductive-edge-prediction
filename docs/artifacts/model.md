@@ -29,7 +29,7 @@
 
 ## 1. 三类输入：同一个节点的三种观察方式
 
-对于每个 endpoint，模型使用三类输入。
+对于这个 retrieval-grounded EgoStitch 实验臂，每个 endpoint 使用三类输入。
 
 ### 1.1 Raw token embeddings
 
@@ -457,7 +457,7 @@ $$
 
 因此这里的 inductive claim 是：
 
-> 模型不读取 deployment target edges 或 labels，但需要同侧节点 feature universe 作为 grounding reference。
+> 这个实验臂不读取 target edges/labels，但需要当前 role 的 `V_fit`、`V_hold` 或 test feature universe；这是额外 inference support，不是严格任务输入或确定方法。
 
 Generator 也不是在完全没有参考节点的世界中凭空创造 topology。它是在 feature-only grounding 的帮助下，生成对 queried-edge classification 有用的 latent local context。
 
@@ -465,7 +465,7 @@ Generator 也不是在完全没有参考节点的世界中凭空创造 topology�
 
 ## 19. 一段可直接用于 oral presentation 的总结
 
-> 对于一对未见节点，EgoStitch 同时保留两种证据。第一种是两个节点本身的 raw-token interaction，它告诉模型这两个 endpoint 在内容上是否匹配。第二种是 generated local context：模型先从同侧 feature universe 检索相似节点作为 grounding，再为每个 endpoint 生成 16 个 compressed neighbor slots。两侧 slots 经过软对齐，被拼成一张包含 star、intra、align 和 closure 关系的联合 scaffold。STEncoder 在这张 soft graph 上传递结构信息，content branch 则保留每个 slot 的语义和 grounding 可信度。最终 pair representation 先读取 topology，再读取 content，并与原始 endpoint tokens 合并，输出一个对输入顺序不敏感的 edge probability。训练期的辅助 losses 让 imagined neighborhoods 更真实、稳定并带有 shared-neighbor 语义，但 inference 最终只输出 queried pair 的二分类结果。
+> 对于一对未见节点，EgoStitch 同时保留 endpoint raw-token interaction 和 generated local context。模型先从同侧 feature universe 检索相似节点作为 grounding，再为每个 endpoint 生成 16 个 compressed neighbor slots。两侧 slots 经过软对齐，被拼成一张包含 star、intra、align 和 closure 关系的联合 scaffold。STEncoder 在这张 soft graph 上传递结构信息，最终 classifier 只读取 structure-only topology encoding，并与原始 endpoint tokens 合并，输出一个对输入顺序不敏感的 edge probability。Slot content 和 grounding 仍用于训练 generator 和构建 scaffold，但已删除独立 content-conditioning branch。训练期的辅助 losses 让 imagined neighborhoods 更真实、稳定并带有 shared-neighbor 语义；inference 最终只输出 queried pair 的二分类结果。
 
 ---
 
@@ -487,12 +487,12 @@ Pool 来自 endpoint 所属的完整 split-side feature universe，与当前 sco
 
 ## Formal implementation anchors
 
-本文的模块边界对应当前 formal implementation：
+本文的模块边界对应当前 implementation：
 
-- Generator：src/model/egostitch/imagine.py
-- Sinkhorn alignment：src/model/egostitch/stitch.py
-- Scaffold 与 content assembly：src/model/egostitch/scaffold.py
-- STEncoder：src/model/egostitch/ste.py
-- Pair trunk、conditioning 与 final heads：src/model/egostitch/e2e_model.py
-- Losses：src/model/egostitch/losses.py
+- Composite / registry：src/model/egostitch/{composite,registry}.py
+- Generator：src/model/egostitch/generator/egostitch.py
+- Imagination / assembly：src/model/egostitch/generator/{imagine,assemble}.py
+- Generator losses：src/model/egostitch/generator/losses.py
+- STEncoder：src/model/egostitch/encoder/ste.py
+- Classifier：src/model/egostitch/classifier/b0_v31.py
 - Formal full-model config：configs/egostitch_e2e_v3_full_breadth_first.yaml

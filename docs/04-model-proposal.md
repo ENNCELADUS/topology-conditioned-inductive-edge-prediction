@@ -1,12 +1,11 @@
-# Model Proposal: EgoStitch — Community-Conditioned Ego-Network Imagination with Consensus Stitching for Topology-Conditioned Inductive Edge Prediction
+# Candidate Model Record: EgoStitch — Community-Conditioned Ego-Network Imagination with Consensus Stitching
 
-**Status:** **revision 3.0** — approved as a design proposal (2026-07-09; **gate G4
-signed off 2026-07-09**), so `05-egostitch-spec.md` (including its §9 benchmark
-binding and §10–11 batch-sampler/auto-sized H20 contracts) is the active implementation
-contract. Companion to `03-experiment-protocol.md` (updated 2026-07-09 with the
+**Status:** **revision 3.0 historical EgoStitch candidate, not the selected project method.**
+Approved 2026-07-09; G4 signed off the arm-specific reproduction contract in
+`05-egostitch-spec.md`. Companion to `03-experiment-protocol.md` (updated 2026-07-09 with the
 approved [protocol-Δ] items) and `02-methodology.md`. The frozen-s0 EgoStitch
 Stage-1 screen completed on 2026-07-17 with the binding verdict `cut`; revision 3.0
-is now the active G5 build line.
+subsequently became the G5 build line before the 2026-08-10 method-selection reset.
 **Revision 3.0 (2026-07-16):** the §4.4 decision mechanism is replaced — the frozen-B0
 `s0` anchor and logit-level gated-residual fusion give way to an **end-to-end
 stitched-topology-conditioned pair encoder** (jointly trained V3.1-class trunk,
@@ -29,28 +28,26 @@ cited from abstracts only (now in the vault); all corrections are listed in the 
 change block below. All cited papers were verified against local PDFs or the arXiv
 API; papers found only by external search are marked ⊕.
 
-**One-line summary.** Replace the retrieved-and-thresholded scaffold with a *generated
+**One-line summary of this candidate arm.** Replace the retrieved-and-thresholded scaffold with a *generated
 and harmonized* one: for each queried pair `(i, j)`, each endpoint **imagines its own
 ego-network** (a set of latent neighbor slots with existence probabilities, slot–slot
 adjacency, and a degree budget) conditioned on its frozen features and a learned
 **community codebook**; the two imagined ego-networks are **stitched and jointly
 re-decoded to consensus** under scaffold-level degree-budget constraints; and the edge
 decision fuses the node-intrinsic pairwise logit with membership, closure,
-community/capacity, and scaffold-readout evidence. The per-query local boundary of the
-locked contract is preserved exactly.
+community/capacity, and scaffold-readout evidence.
 
-**The honest form of the thesis (binding for all paper text).** At test time every
-admissible model is a function of `(x_i, x_j)`, optional feature-retrieved candidates,
-and trained parameters; the generated scaffold therefore adds no test-time
-*information* over B0 — it injects **structural priors distilled from training-graph
-supervision** (real ego-net shapes, degree budgets, block rates, closure statistics)
-into each decision through an explicitly topological bottleneck. The claim is an
-**inductive-bias and supervision claim, not an information claim**: the ego-net
+**Honest interpretation.** The strict task input is `(x_i,x_j)`. Grounded EgoStitch
+also reads retrieved feature rows, so it is a separate retrieval-grounded arm and
+requires retrieval-only controls. Only its ungrounded configuration can claim no
+test-time information beyond B0; there the scaffold injects **structural priors
+distilled from training-graph supervision**. The remaining claim is about inductive
+bias and supervision: the ego-net
 bottleneck is hypothesized to be a better vehicle for learning topology-aware,
 better-calibrated per-pair marginals than direct multi-task heads on a pairwise scorer
 — and that hypothesis is falsifiable against the `B3-full` control (§6.2), which
 receives all of EgoStitch's auxiliary supervision with none of its generative
-machinery. Under the locked per-query contract the assembled graph is an
+machinery and matched endpoint-only candidates. Under the per-query contract the assembled graph is an
 **edge-independent construction given features**; mechanisms in this proposal
 constrain the *scaffold* exactly and influence the *assembly* through shaped marginals
 (§4.6, §6.0-G2).
@@ -394,7 +391,7 @@ generation. Classically: a feature-conditioned degree-corrected SBM (Karrer & Ne
 
 ---
 
-## 4. Recommended model: EgoStitch
+## 4. Historical candidate model: EgoStitch
 
 ### 4.0 Contract compliance
 
@@ -1028,10 +1025,10 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   epoch-30 checkpoint moved ranking and passed matched GS, but still failed matched
   RD/clustering and worsened degree/spectral MMD. Per the registered failure reading,
   frozen-s0 scalar fusion is retired to motivating-arm + ablation status. The rev-3.0
-  conditioned encoder is now the active G5 build line; see
+  conditioned encoder then became the active G5 build line; see
   `docs/results/G5-stage1-seed0-20260717.md`.
-  *Active successor update (rev 3.2):* the five-arm rev-3.0 scope above describes
-  the completed historical screen only. The active contract is the seven-arm
+  *Successor implementation update (rev 3.2):* the five-arm rev-3.0 scope above is
+  historical; before the 2026-08-10 reset, this arm moved to the seven-arm
   direct-run screen in spec §14.4.6–14.4.7: five trained checkpoints plus two
   scoring-time controls. The content pathway is deleted, so `pair_topology` is
   retired as identical to `full`. There is no registration or plan-identity gate, and
@@ -1041,8 +1038,8 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
 
 ### 6.1 Method rows
 
-- **`Ours` row:** EgoStitch drops into the existing E1/E3 table unchanged.
-- **Current design becomes an ablation:** generator off + grounding on + thresholded
+- **Historical `Ours` row:** now named the retrieval-grounded EgoStitch arm, not the selected method.
+- **Earlier design becomes an ablation:** generator off + grounding on + thresholded
   scorer edges reproduces the §0 contract exactly — register as ablation arm
   `E4.10: retrieved-thresholded scaffold` (also the natural bridge baseline).
 - **Frozen-s0 EgoStitch becomes an ablation [rev 3.0]:** the rev-2.2 anchored

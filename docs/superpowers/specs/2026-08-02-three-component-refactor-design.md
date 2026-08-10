@@ -1,7 +1,7 @@
 # Three-Component Model Refactor — Design
 
 **Date:** 2026-08-02
-**Status:** APPROVED (owner, 2026-08-02)
+**Status:** APPROVED (owner, 2026-08-02); historical EgoStitch arm, not the selected project method.
 **Scope:** `src/model/egostitch/`, `src/train_egostitch.py`, `src/score_universe.py`,
 `src/experiments/`, `configs/`, `hpc/`, `docs/registrations/`
 **Supersedes for the affected surfaces:** the frozen-contract regime described in
@@ -17,8 +17,8 @@ each can be replaced independently and alternative versions compared:
 
 1. **Pairwise classifier pathway** — the mature baseline. Consumes the two endpoints'
    raw token streams and, optionally, a conditioning embedding. Emits the edge logit.
-2. **Neighborhood graph generator** — *imagines the graph*. Consumes endpoint features
-   and grounding pools. Emits one graph.
+2. **Neighborhood graph generator** — this arm maps endpoints and grounding pools to
+   `ImaginedGraph`; endpoint-only families require another interface.
 3. **Graph encoder** — *encodes the graph*. Consumes a graph. Emits a graph embedding.
 
 Today none of the three is substitutable. `EgoStitchE2E.__init__`

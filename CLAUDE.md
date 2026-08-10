@@ -6,16 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 Research code for an ICLR 2027 paper, *Topology-Conditioned Inductive Edge Prediction*. `README.md`
-orients, `docs/` holds the specs, this file holds the constraints. Doc authority, later refining
-earlier: `01-blueprint` → `02-methodology` → `03-experiment-protocol` → `04-model-proposal` →
-`05-egostitch-spec` → `results/*`; the model's current design is
-`docs/superpowers/specs/2026-08-02-three-component-refactor-design.md`. Keep code and spec in step
-within one change; flag genuine conflicts rather than resolving them silently.
+orients, `docs/` holds the specs, this file holds the constraints. `01-blueprint` →
+`02-methodology` → `03-experiment-protocol` governs the task/evaluation; method selection remains
+open. `04-model-proposal`, `05-egostitch-spec`, and the 2026-08-02 refactor spec describe one
+retrieval-grounded EgoStitch arm, not the project method. Keep code and its relevant spec aligned.
 
-**Core thesis — do not let it drift:** inductive edge prediction is topology-conditioned binary
-classification, not independent pairwise scoring and not graph generation. Generated local topology
-is always intermediate context; the output is always a 0/1 decision for a queried pair. Every piece
-of writing must answer "how does this help predict `edge(u, v)` for unseen nodes?"
+**Core thesis — do not let it drift:** the strict task input is exactly `(x_u,x_v)` and the output
+is the binary decision for `edge(u,v)`. Inferred topology is intermediate context, not graph
+generation; grounding/retrieval/prototypes are optional arm-specific support, never task input or a
+selected method. Every piece of writing must explain how its context helps decide the queried edge.
 
 ## Engineering rules
 
@@ -69,11 +68,11 @@ overrides, leaving the MCP tables alive, which hangs the review with zero output
 
 ## Architecture
 
-Flow: benchmark artifacts → node partition + grounding pools → packed bf16 features → DDP training →
-score-once artifacts → gate and eval analyses.
+EgoStitch-arm flow: benchmark artifacts → partition + optional grounding → packed features → DDP
+training → score-once artifacts → evaluation. Endpoint-only families need no grounding.
 
 - `src/data/` — `artifacts.py` verified benchmark loader; `partition.py:build_g_struct` is the only
-  legal structural graph; `grounding.py` universe-scoped candidate pools; `internal_holdout.py`
+  legal structural graph; `grounding.py` is arm-specific; `internal_holdout.py`
   V_hold; `packed_features.py`/`features.py` bf16 pack and F0 cache; `pairs.py` batching.
 - `src/model/egostitch/` — three independently swappable components behind `registry.py`, composed by
   `composite.py`, talking through `graph.py`'s dataclasses (`ImaginedGraph`, `GraphEmbedding`,
@@ -113,8 +112,8 @@ fail-closed.
   `train_graph`, `test_graph`, and `buckets`.
 - Self-loops: training structural targets strip them; canonical MMD descriptors and official GS/RD
   subgraphs keep them, as the benchmark evaluator does.
-- Grounding pools are universe-scoped (`V_fit` train, `V_hold` validation, test): no cache crosses
-  universes, and a training pass may not read a `V_hold` row.
+- Grounding, when used, is universe-scoped (`V_fit`, `V_hold`, test): no cache crosses
+  universes, and training may not read `V_hold`. Other methods need no grounding.
 - Topology and classification share the same train positives (no message/supervision split): loopless
   projection for topology, self-pairs kept for classification, and edge-stream structural targets must
   drop the queried partner and decrement its degree.

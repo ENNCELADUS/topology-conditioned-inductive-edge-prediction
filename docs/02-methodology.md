@@ -1,7 +1,6 @@
 # Methodology Plan: Topology-Conditioned Inductive Edge Prediction
 
-**Status:** concise method plan for a general ML problem. Companion to
-`01-blueprint.md`.
+**Status:** concise method-selection plan; companion to `01-blueprint.md`.
 
 **Problem.** Given unseen nodes with frozen feature vectors and a queried node
 pair `(u, v)`, predict a binary edge label. For a query set, predict many pair
@@ -11,8 +10,8 @@ pairwise edge metrics and by graph-level metrics on the assembled output.
 **Core claim.** Independent pair scoring is topology-blind: it can optimize
 `P(edge | x_u, x_v)` while producing an assembled graph with implausible degree,
 density, clustering, or spectral structure. The proposed fix is to condition each
-edge decision on generated local topology, without using the target graph at test
-time.
+edge decision on a generated or inferred topology representation derived from the
+queried endpoints, without using the target graph at test time.
 
 ---
 
@@ -24,61 +23,57 @@ time.
 | Unseen node | A node held out from training supervision |
 | Query | A pair `(u, v)` or a set of candidate pairs |
 | Label | Binary edge existence label |
-| Context | Generated local topology over queried nodes and retrieved neighbors |
+| Context | Generated or inferred topology representation derived from `(x_u, x_v)` |
 | Output | Pair probability `p_uv`, then an assembled graph after thresholding/ranking |
 | Evaluation | Edge-level metrics plus graph-level assembled-output metrics |
 
-The target graph is never an inference input. Candidate retrieval, local topology
-generation, and edge classification must use frozen node features and training
-supervision only.
+The target graph is never an inference input. The primary contract receives only
+the two queried endpoints' intrinsic features. Training-graph supervision may shape
+learned parameters, but candidate retrieval, grounding pools, and external node
+identities are not task inputs and are not assumed by any endpoint-only candidate.
 
 ---
 
 ## 2. Method
 
-The model has three stages.
+The minimal model has two stages.
 
 ```text
-inputs:  queried pair (u, v), frozen features X
-step 1:  retrieve candidate neighbors C(u), C(v) from feature space
-step 2:  generate local topology T_uv over {u, v} union C(u) union C(v)
-step 3:  predict p_uv = f(x_u, x_v, X_T, T_uv)
+inputs:  queried pair (u, v), frozen endpoint features (x_u, x_v)
+step 1:  infer topology representation T_uv = g(x_u, x_v; theta_g)
+step 2:  predict p_uv = f(x_u, x_v, T_uv; theta_f)
 output:  pairwise probability, or assembled graph over many queried pairs
 ```
 
-### 2.1 Candidate Retrieval
+### 2.1 Candidate Topology-Representation Families
 
-Retrieve a small candidate-neighbor set for each queried node using only frozen
-features. Approximate nearest-neighbor search is the default implementation
-pattern, but the method only requires a graph-free retrieval mechanism. Retrieval
-is evaluated through ablations because extra nodes alone may explain some gains.
+Method selection compares three distinct families rather than presupposing a
+retrieval pipeline:
 
-### 2.2 Local Topology Generation
+- **Endpoint-only latent relational topology:** a conditional generator maps
+  `(x_u, x_v)` to identity-free neighborhood/topology variables, such as anonymous
+  slots, soft adjacency, structural tokens, or a distribution over them.
+- **Endpoint-only deterministic topology transfer:** a deterministic encoder maps
+  the endpoints to a topology-aware latent, discrete code, or structural summary.
+- **Retrieval-grounded explicit scaffold:** candidates or prototypes from a declared
+  frozen support universe are retrieved and connected into a local graph. This is
+  an optional arm with a different inference-support contract, not the default or
+  selected method.
 
-Generate a sparse adjacency scaffold over the queried nodes and retrieved
-neighbors. The scaffold is not the final output; it is input-side context for the
-edge classifier.
+All families must expose an intermediate representation that can be removed,
+randomized, or replaced in a matched control. If an explicit scaffold is used, it
+must remain local and the queried edge must be masked.
 
-Preferred mechanism:
+### 2.2 Topology-Conditioned Edge Classifier
 
-- A feature-to-adjacency generator that emits pairwise edge probabilities.
-- A sparsification step that keeps the local scaffold small and stable.
-- A differentiable relaxation so edge loss and realism loss can train the
-  topology module.
+Encode `T_uv` with a representation-appropriate encoder and score the queried pair
+using the endpoint features and topology context. The queried edge's presence
+inside any explicit or implicit adjacency target must be standardized or masked so
+the classifier cannot read the answer from the representation.
 
-Heavier graph-generation mechanisms can be used as ablations, but the default
-should stay local, sparse, and cheap enough to run per query.
-
-### 2.3 Topology-Conditioned Edge Classifier
-
-Run a graph encoder over `T_uv` and score the queried pair using the endpoint
-features, endpoint embeddings, and local structural features. The queried edge's
-presence inside `T_uv` must be standardized or masked so the classifier cannot
-read the answer from the scaffold.
-
-For a query set, generate context for each pair or for a shared local query graph,
-decode all requested pairs, and assemble the predicted graph from the resulting
-scores.
+For a query set, infer context and score each pair through the same two-endpoint
+API, then assemble the predicted graph from the resulting scores. Graph-scale
+context is not an inference input; assembly is an evaluation operation.
 
 ---
 
@@ -101,9 +96,9 @@ L = L_edge
 - `L_recon`: optional masked-edge reconstruction pretraining on training
   subgraphs.
 
-The load-bearing point is that edge loss alone under-constrains unqueried edges
-inside the scaffold. Auxiliary graph-statistic and self-supervised losses make
-the generated topology identifiable enough to be useful context.
+For explicit scaffolds, auxiliary losses constrain unqueried edges. Latent or
+deterministic candidates instead supervise their declared structural representation;
+they must not pretend that unobserved scaffold edges exist.
 
 ---
 
@@ -116,7 +111,8 @@ the generated topology identifiable enough to be useful context.
 | B2 | Post-hoc denoising of independently scored outputs | Tests whether cleanup after scoring is enough |
 | B3 | Independent scorer with graph-statistic auxiliary loss | Tests whether loss shaping replaces topology context |
 | B4 | Latent-graph learner without queried-edge conditioning | Tests generation without decision conditioning |
-| Ours | Topology-conditioned edge classifier | Full method |
+| Selected family | Topology-conditioned edge classifier under the endpoint-only contract | Headline method after matched selection |
+| Retrieval-grounded arm | Explicit scaffold from a declared frozen support universe | Tests whether external prototype support is necessary |
 | Oracle | Classifier conditioned on observed target topology | Upper bound; violates the inductive protocol |
 
 All baselines must use the same frozen features, train/validation/test split, and
@@ -166,7 +162,7 @@ clustering quality, or graph-based retrieval.
 ## 6. Integrity Gates
 
 1. Use node-disjoint train/validation/test splits for the primary claim.
-2. Ensure candidate retrieval never uses target test edges.
+2. Retrieval arms disclose/freeze support and never use target edges or labels.
 3. Ensure topology generation at test time never reads the target graph.
 4. Mask or standardize the queried edge inside the generated scaffold.
 5. Report edge metrics and assembled-output graph metrics together.
@@ -180,15 +176,17 @@ under a strict inductive protocol.
 
 ## 7. Ablations
 
-1. No topology context: collapse to B0 or B1.
-2. Retrieved-neighbor features only: remove generated adjacency.
-3. Randomized topology with the same scaffold size.
-4. Feature-nearest-neighbor topology without learned generation.
-5. Scaffold size and retrieval mechanism sweep.
+1. No topology context: collapse to B0.
+2. Identity-free latent vs deterministic structural vs explicit-scaffold context.
+3. Deterministic vs stochastic topology representation.
+4. Randomized topology with matched representation capacity.
+5. Remove queried-pair conditioning from the topology module.
 6. Remove `L_real`.
 7. Remove `L_ssl`.
 8. Remove queried-edge masking.
 9. Generation-only variant with no queried-edge supervision.
+10. Retrieval-grounded arm only: retrieval-only, shuffled-candidate, random-pool,
+    and pool/scaffold-size controls.
 
 Each ablation should answer one mechanism question: whether the gain comes from
 extra features, local topology, topology realism, or decision conditioning.
@@ -200,7 +198,7 @@ extra features, local topology, topology realism, or decision conditioning.
 | Risk | Mitigation |
 |---|---|
 | Topology generation appears to be the final task | Keep the primary target as queried-edge binary prediction |
-| Retrieval explains all gains | Include B1 and retrieval-size sweeps |
+| External retrieval explains an explicit-scaffold gain | Treat it as a separate arm and include retrieval-only and shuffled/random-pool controls |
 | Graph metrics improve only through thresholding | Use density-matched evaluation and threshold sweeps |
 | Generated topology hurts edge metrics | Report edge and graph metrics jointly; do not overclaim |
 | Scaffold is under-constrained by pair labels | Use graph-statistic and self-supervised auxiliary losses |
@@ -211,10 +209,11 @@ extra features, local topology, topology realism, or decision conditioning.
 ## 9. Deliverables
 
 - A clear problem formulation for topology-conditioned inductive edge prediction.
-- A local-scaffold edge classifier trained from frozen node features.
+- A matched selection among endpoint-only topology-representation families before
+  a headline method is fixed.
 - A baseline suite covering independent scoring, retrieval, post-hoc denoising,
   auxiliary losses, latent topology, and oracle topology.
 - An evaluation suite with pairwise edge metrics and graph-level assembled-output
   metrics.
-- An ablation suite that isolates retrieval, generated topology, and
-  topology-conditioned decision making.
+- An ablation suite that isolates topology transfer, stochastic generation,
+  optional retrieval support, and topology-conditioned decision making.

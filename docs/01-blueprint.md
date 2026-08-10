@@ -2,7 +2,7 @@
 
 **Task name:** Topology-Conditioned Inductive Edge Prediction
 
-**Method name:** Local-Graph-Generation-Augmented Edge Predictor
+**Method name:** not yet selected; grounding/retrieval is one optional comparison arm.
 
 **Working titles:**
 
@@ -10,9 +10,9 @@
 - *Local Graphs as Context for Inductive Edge Classification*
 - *Beyond Independent Pair Scores for Unseen Nodes*
 
-**Status:** research blueprint. The paper is an empirical ML method paper. It is
-not a generic graph-generation paper: local graph generation is an intermediate
-context mechanism for binary edge prediction.
+**Status:** research blueprint. The paper is an empirical ML method paper, not a
+generic graph-generation paper: inferred topology is intermediate context for
+binary edge prediction, and its representation method remains open.
 
 ---
 
@@ -23,8 +23,8 @@ context mechanism for binary edge prediction.
 | Venue | ICLR 2027 |
 | Paper type | Empirical ML method |
 | Primary task | Inductive binary edge prediction over unseen nodes |
-| Input | Queried node pairs and frozen node features |
-| Intermediate object | Generated local topology context |
+| Input | Queried pair and its two frozen endpoint features `(x_u, x_v)` |
+| Intermediate object | Generated or inferred topology representation |
 | Output | Edge probabilities and assembled predicted graphs |
 | Main comparison | Independent pair scoring vs. topology-conditioned scoring |
 | Success criterion | Strong edge metrics without implausible assembled graph topology |
@@ -35,10 +35,9 @@ context mechanism for binary edge prediction.
 
 Inductive edge prediction should be modeled as topology-conditioned binary
 classification, not as independent pairwise scoring. For each queried pair, the
-model constructs local topological context from feature-only candidate
-neighborhoods, then predicts the 0/1 edge label in that context. This preserves a
-strict inductive protocol while letting edge decisions depend on plausible local
-degree, density, clustering, and shared-neighborhood structure.
+model infers topology context from the two endpoints' intrinsic features, then
+predicts the 0/1 label. Latent, deterministic, and explicit-scaffold families remain
+candidates; retrieval is a separate arm with additional inference support.
 
 What the reader should believe after reading: the missing ingredient in
 feature-only edge prediction is not just a better scorer, threshold, or auxiliary
@@ -61,8 +60,8 @@ individually plausible edge scores can assemble into a graph with unrealistic
 density, degree distribution, clustering, components, or spectrum.
 
 **Proposed change.** Keep the final prediction target unchanged, but condition
-the edge classifier on generated local topology. The generated topology is
-context, not the final task.
+the edge classifier on a generated or inferred topology representation. That
+representation is context, not the final task.
 
 **Non-goals.**
 
@@ -78,9 +77,9 @@ context, not the final task.
 | RQ | Question | Contribution |
 |---|---|---|
 | RQ1 | Why can feature-only pair scoring fail as an assembled graph? | Pair-to-topology gap: edge metrics and graph realism can diverge |
-| RQ2 | Can generated local topology condition an edge decision without test-graph access? | Local-scaffold edge classifier |
+| RQ2 | Can topology inferred from endpoint features condition an edge decision without test-graph access? | Topology-context edge classifier |
 | RQ3 | Does topology conditioning improve edge metrics and assembled-output metrics? | Main empirical result |
-| RQ4 | Which component matters? | Ablations for retrieval, generation, topology realism, and classifier conditioning |
+| RQ4 | Which representation family and component matter? | Matched endpoint-only latent/deterministic/generative comparisons, plus a separate retrieval-grounded arm |
 | RQ5 | Does the assembled graph help generic graph ML probes? | Secondary utility evaluation |
 
 The load-bearing contributions are RQ2 and RQ3. RQ1 motivates the problem, and
@@ -90,23 +89,19 @@ RQ4 prevents the method from being mistaken for a larger feature-only scorer.
 
 ## 5. Method Summary
 
-1. **Frozen node features.** Each node has an intrinsic feature vector. These
-   features are fixed before training the edge predictor.
-2. **Candidate retrieval.** For each queried node, retrieve graph-free candidate
-   neighbors from feature space.
-3. **Local topology construction.** Generate a sparse adjacency scaffold over
-   the queried nodes and retrieved neighbors.
-4. **Topology-conditioned classifier.** Predict the queried edge label using
-   endpoint features, candidate-neighbor features, and generated topology.
-5. **Assembly.** Score many queried pairs, then threshold or rank scores to
-   assemble the predicted graph.
+1. **Input.** The complete task input is the two frozen endpoint vectors.
+2. **Context.** Infer a latent, deterministic, or explicit topology representation.
+3. **Decision.** Predict the edge from endpoint features and topology context.
+4. **Assembly.** Combine pair scores only for graph-level evaluation.
+
+Retrieval-grounded scaffolds are a separate arm whose support pool is not task input.
 
 Minimal contract:
 
 ```text
-inputs:  pair (u, v), frozen features X, candidate sets C(u), C(v)
-context: local topology T_uv over {u, v} union C(u) union C(v)
-output:  p_uv = P(edge(u, v) = 1 | x_u, x_v, X_T, T_uv)
+inputs:  pair (u, v), frozen endpoint features (x_u, x_v)
+context: inferred topology representation T_uv = g(x_u, x_v; theta_g)
+output:  p_uv = P(edge(u, v) = 1 | x_u, x_v, T_uv)
 ```
 
 Training uses queried-edge supervision as the primary loss, with optional
@@ -124,7 +119,7 @@ reconstruction on training subgraphs.
 | B2 | Post-hoc denoising of independent scores | Tests cleanup after scoring |
 | B3 | Independent scorer plus graph-statistic loss | Tests loss shaping without topology context |
 | B4 | Latent-topology model without queried-edge conditioning | Tests generation without the final decision module |
-| Ours | Topology-conditioned classifier | Full method |
+| Selected family | Topology-conditioned classifier | Headline method only after matched family selection |
 | Oracle | Classifier using observed target topology | Upper bound that violates protocol |
 
 All fair baselines should share the same frozen features, splits, query sets, and
@@ -159,10 +154,10 @@ together.
 **Ablations.**
 
 - Remove topology context.
-- Use retrieved-neighbor features only.
-- Randomize the scaffold.
-- Replace learned topology with feature-nearest-neighbor topology.
-- Sweep scaffold size and retrieval mechanism.
+- Compare latent, deterministic, and explicit-scaffold endpoint-only representations.
+- Remove or randomize the topology representation.
+- Remove queried-pair conditioning from the topology module.
+- For retrieval only: remove adjacency, shuffle candidates, and sweep pool size.
 - Remove topology-realism loss.
 - Remove topology-consistency loss.
 - Remove queried-edge masking.
@@ -182,12 +177,12 @@ retrieval on the assembled graph.
    evaluation metrics.
 3. **Problem Formulation.** Specify frozen features, queried pairs, binary edge
    labels, inductive splits, and assembled-output evaluation.
-4. **Method.** Present retrieval, local topology generation, edge classifier,
-   losses, and inference.
+4. **Method.** Present the selected topology-representation mechanism, edge
+   classifier, losses, and inference; report the matched family-selection evidence.
 5. **Experiments.** Compare baselines, report edge and graph metrics, and run
    mechanism ablations.
-6. **Discussion.** Cover retrieval sensitivity, scaffold errors, calibration,
-   compute cost, and limits of frozen features.
+6. **Discussion.** Cover representation identifiability, stochasticity, optional
+   retrieval support, calibration, compute cost, and limits of frozen features.
 
 ---
 
@@ -198,7 +193,7 @@ retrieval on the assembled graph.
 | Topology generation appears to be the main task | High | Anchor every section to queried-edge binary prediction |
 | Generated topology does not improve edge metrics | High | Report edge and graph metrics jointly; use ablations to diagnose |
 | Graph metrics improve only by threshold changes | High | Use density-matched operating points and threshold sweeps |
-| Candidate retrieval leaks target graph information | High | Restrict retrieval to frozen features and audit test-time inputs |
+| Optional candidate retrieval leaks target information or is mistaken for task input | High | Keep retrieval in a separately labeled arm, freeze and disclose its support universe, and audit every inference input |
 | Scaffold contains the queried-edge answer | High | Mask or standardize the queried edge inside the scaffold |
 | Method becomes too broad | Medium | Keep the fixed setting: unseen nodes, frozen features, queried pairs, binary labels |
 
@@ -212,4 +207,5 @@ retrieval on the assembled graph.
 4. Main comparison: independent pair scoring vs. topology-conditioned scoring.
 5. Evaluation requirement: pairwise edge metrics plus graph-level
    assembled-output metrics.
-6. Protocol requirement: no target graph access at test time.
+6. Protocol: input is exactly `(x_u,x_v)`; no target graph; representation method
+   remains open and grounding/retrieval is optional support, never task input.

@@ -1,0 +1,115 @@
+\section{Introduction}
+\label{sec:intro}
+
+Protein--protein interactions (PPIs) are the wiring diagram of the cell: they
+determine signal transduction, complex assembly, and the molecular mechanisms
+through which genetic variation becomes disease. Establishing that wiring
+experimentally remains slow, expensive, and incomplete. The human interactome is
+estimated to contain on the order of $74{,}000$--$200{,}000$ physical
+interactions, yet only $3{,}988$ interactions---between $5.3\%$ and $5.8\%$ of
+the curated total---are confidently shared across UniProt, BioGRID, and STRING,
+so even the assembled ground truth is sparse and mutually inconsistent
+\citep{zhang2025humanproteome}. The search space is quadratic and severely
+imbalanced: roughly $200$ million human protein pairs are physically possible,
+of which an estimated $0.325\%$--$1.5\%$ actually interact
+\citep{dunham2022benchmark}. Machine learning from \emph{intrinsic} protein
+features---sequence, predicted or resolved structure, and protein language model
+(pLM) embeddings---is therefore the only route that scales to a full proteome,
+and the field has begun to deliver at that scale: a recent proteome-wide screen
+evaluated all ${\sim}200$ million human pairs and reported $17{,}849$
+interactions at $90\%$ expected precision, of which $3{,}631$ were absent from
+every prior experimental screen \citep{zhang2025humanproteome}. Crucially, the
+scientific object of interest is not the isolated pair call but the
+\emph{network} it belongs to. Functional module detection, disease-gene
+prioritization, pathway reconstruction, and drug-target identification all
+consume an interactome rather than a list of independently scored pairs, and a
+prediction set that is individually plausible but collectively implausible
+serves none of them.
+
+The dominant formulation, however, is precisely a list of independently scored
+pairs. Almost all intrinsic-feature PPI predictors---from concatenated pLM
+embeddings \citep{wu2024mapeppi,szymborski2024intrepppid} to jointly encoded
+paired-sequence models \citep{liu2025plminteract,ullanat2026language} to
+structure- and interface-based scorers \citep{zhang2025humanproteome}---estimate
+$P(\mathrm{edge} \mid x_u, x_v)$ for each queried pair in isolation. This is
+cleanly inductive, but it is topology-blind, and the resulting failures are
+documented from three independent directions. First, the headline accuracies of
+this school are substantially artifacts of leaky evaluation: a baseline that
+observes nothing but node degree recovers roughly $93.3\%$--$95.5\%$ accuracy on
+standard PPI benchmarks, matching most published deep models
+\citep{bernett2024cracking}, and once leakage is genuinely removed, deep
+sequence-based predictors plateau near $0.65$ accuracy (best model $0.645$,
+$F_1$ $0.622$) against a random-forest baseline at $0.577$
+\citep{reim2025plateau}. The same benchmarks admit further confounds: because only
+${\sim}31\%$ of randomly sampled multi-species pairs share an organism, a model
+that has learned nothing but taxonomy already reaches ${\sim}85\%$ accuracy and
+$0.85$ AUROC \citep{hallee2025taxonomists}, and a sequence model's apparent edge
+over classical functional-genomic features (AUPRC $0.68$ vs.\ $0.65$) dissolves
+once the test set is stratified by degree, with the same model scoring AUC $0.59$
+on hub--lone pairs but $0.73$ on lone--lone pairs
+\citep{lannelongue2024pitfalls}. Second, and more fundamentally, accurate
+pairwise scores do not assemble into plausible networks: PRING, which reframes
+PPI prediction from pairs to graphs, reports that across every baseline it tested
+the highest graph similarity of the assembled prediction---edge-set Dice against
+the true interactome---remains below $0.5$, despite competitive pairwise numbers
+\citep{zheng2025pring}. This is not a tuning failure but a consequence of the
+formulation: edge labels in a graph are coupled, and node representations
+computed \emph{independently} are provably unable to distinguish structurally
+distinct pairs, which is why link prediction requires target-conditioned rather
+than independent representations \citep{zhang2021labeling}. Third, the graph
+learning literature has established that conditioning on topology is worth a
+great deal---on \texttt{ogbl-ppa}, modeling common-neighbor structure explicitly
+raises Hits@100 from $18.67\%$ for a plain GCN to $61.42\%$
+\citep{wang2024ncn}---but every such method reads that structure from an
+\emph{observed} graph containing the query nodes. Under a strict inductive
+protocol this is unavailable, and structural predictors collapse accordingly:
+transferred to a setting in which both endpoints are genuinely unseen, a
+state-of-the-art structural link predictor falls from $90.88\%$ to $0.01\%$
+Hits@20 on \texttt{ogbl-ddi} \citep{chatterjee2023disentangling}. The field is
+thus caught between two incomplete options---inductive but topology-blind
+pairwise scoring, or topology-aware but transductive graph-native
+prediction---and the natural repairs to the former (auxiliary graph-statistic
+losses, post-hoc denoising of the assembled graph, or abandoning topology
+entirely in favor of a stronger attribute-pair encoder) all leave the individual
+edge decision itself unconditioned on any local structure.
+
+We argue that inductive edge prediction should instead be modeled as
+\textbf{topology-conditioned binary classification}. Given a queried pair $(u,v)$
+of previously unseen proteins with frozen intrinsic features, our method
+retrieves graph-free candidate neighbors for each endpoint from feature space,
+generates a sparse local topology scaffold over the queried nodes and their
+candidates, and predicts the binary edge label \emph{in the context of that
+scaffold}. The generated topology is strictly an intermediate representation: it
+is never the output, it is never scored as the task, and the model's prediction
+remains a $0/1$ decision for the queried pair. Because the scaffold is
+constructed only from frozen features and never from the target graph, the
+protocol stays strictly inductive; because the edge classifier consumes it, the
+decision can depend on plausible local degree, density, clustering, and
+shared-neighborhood structure in a way that independent pairwise scoring cannot
+express. Using a generative module as intermediate context for a discriminative
+decision, rather than as an end in itself, has clear precedent outside
+graphs---in low-shot recognition \citep{wang2018lowshot}, zero-shot feature
+generation \citep{xian2018fgn}, and neighbor-feature augmentation for graph
+neural networks \citep{liu2022localaug}---and we adapt it to supply
+\emph{topology} rather than features. We evaluate under a node-disjoint inductive
+split and report edge-level and assembled-graph metrics jointly, following the
+joint-reporting discipline that both the PPI benchmark literature
+\citep{zheng2025pring,lannelongue2024pitfalls} and the graph generation evaluation
+literature \citep{thompson2022evaluation,obray2022evaluation} have converged on.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+    \item We formalize \emph{topology-conditioned inductive edge prediction}:
+    binary edge classification for unseen nodes in which locally generated
+    topology is input-side context, distinguishing it from both independent
+    pairwise scoring and graph generation.
+    \item We characterize the \emph{pair-to-topology gap}---the empirical
+    divergence between edge-level accuracy and assembled-graph realism---and show
+    that it is not removable by threshold selection.
+    \item We propose a local-scaffold edge classifier that retrieves candidate
+    neighborhoods from frozen features, generates local topology, and conditions
+    the edge decision on it without any target-graph access at inference.
+    \item We evaluate against topology-blind scoring, retrieval without
+    adjacency, post-hoc denoising, and graph-statistic losses under one shared
+    protocol, and report edge-level and assembled-graph metrics together.
+\end{enumerate}

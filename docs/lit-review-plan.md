@@ -21,10 +21,10 @@ training time, graphs over train nodes provide edge labels. At test time, the
 model receives previously unseen nodes and queried node pairs `(u, v)`. It must
 predict `edge(u, v) in {0, 1}` without access to the target test graph.
 
-The proposed method adds a topology-context module: retrieve candidate neighbors
-from features, construct a local topology scaffold around the queried nodes, and
-condition the edge classifier on that scaffold. Evaluation must report both
-edge-level metrics and the topology of the graph assembled from predicted edges.
+The formulation infers topology context from `(x_u,x_v)`; latent, deterministic,
+and explicit-scaffold representations remain candidates. Retrieval is a separate
+optional arm, not a required stage. Evaluation must report both edge-level
+metrics and the topology of the graph assembled from predicted edges.
 
 ---
 
@@ -97,13 +97,13 @@ strict inductive task.
 
 ### C3. Candidate-Neighbor Retrieval Without Target-Graph Leakage
 
-**Job:** Support the retrieval step that builds local candidate sets from node
-features or other graph-free signals.
+**Job:** Characterize retrieval-grounded comparison arms and their extra inference
+support; retrieval is neither task input nor the selected method.
 
 **Supports:** K2, K3.
 
 **Reviewer objection handled:** "Local context is unavailable for unseen nodes."
-Answer: candidate neighborhoods can be proposed without using target edges.
+Answer: disclose the frozen support universe and keep retrieval separate from the endpoint-only contract.
 
 ### C4. Local Topology Construction as Context
 
@@ -148,7 +148,7 @@ must preserve edge-level quality and avoid implausible assembled topology.
 4. **Include** works that address at least one of:
    - inductive edge prediction,
    - feature-only link prediction,
-   - graph-free candidate retrieval,
+   - graph-free candidate retrieval as an optional comparison condition,
    - local topology/subgraph construction,
    - topology-aware link prediction losses,
    - graph-generation evaluation metrics used for assembled predictions.

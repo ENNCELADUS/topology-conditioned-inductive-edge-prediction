@@ -2,19 +2,19 @@
 
 # Topology-Conditioned Inductive Edge Prediction
 
-### Predict edges for *unseen* nodes by conditioning each decision on generated local topology — then grade the assembled graph, not just the pairs.
+### Predict edges for *unseen* nodes by conditioning each decision on inferred topology — then grade the assembled graph, not just the pairs.
 
 <p>
   <img alt="Venue" src="https://img.shields.io/badge/target-ICLR%202027-b31b1b">
   <img alt="Type" src="https://img.shields.io/badge/paper-empirical%20ML%20method-blue">
-  <img alt="Status" src="https://img.shields.io/badge/status-G5%20e2e%20rev--3.2%20build-orange">
-  <img alt="Code" src="https://img.shields.io/badge/implementation-EgoStitch%20E2E%20single--stage-green">
+  <img alt="Status" src="https://img.shields.io/badge/status-method%20selection%20open-orange">
+  <img alt="Code" src="https://img.shields.io/badge/implemented%20arm-EgoStitch%20E2E-green">
 </p>
 
 <p>
   <a href="#the-idea">The Idea</a>
   ◆ <a href="#the-motivating-result-e2">Motivating Result</a>
-  ◆ <a href="#the-proposed-method-egostitch">Method</a>
+  ◆ <a href="#implemented-candidate-arm-egostitch">Implemented Arm</a>
   ◆ <a href="#repository-map">Repository Map</a>
   ◆ <a href="#reading-order">Reading Order</a>
   ◆ <a href="#status--roadmap">Status &amp; Roadmap</a>
@@ -55,9 +55,8 @@ Holm inference.
 > thresholds, and results are non-comparable to this corrected contract; no scientific
 > result has yet been produced under it.
 
-The active build line is **rev-3.2** of the end-to-end stitched-topology-conditioned
-pair encoder, run directly (the owner has withdrawn the preregistration/formal-run
-gating mechanism):
+The implemented **rev-3.2** retrieval-grounded EgoStitch arm is runnable directly,
+but it is not the selected project method:
 
 ```bash
 hpc/run.sh train configs/egostitch_e2e_v3_full_breadth_first.yaml \
@@ -75,8 +74,8 @@ completion, publication, scoring, or evaluation.
   (no access to the target graph at test time).
 - **Core claim:** independent pairwise scoring is *topology-blind* — it can score pairs
   well yet assemble into a structurally implausible graph.
-- **Fix:** condition each edge decision on **generated local topology** built only from
-  frozen features, and evaluate **edge-level metrics and assembled-graph metrics together**.
+- **Direction:** infer topology from exactly `(x_u,x_v)`; grounding is optional arm
+  support. Evaluate edge and assembled-graph metrics together before selecting a method.
 
 > **Agents/new contributors:** read [`CLAUDE.md`](CLAUDE.md) first — it holds the binding
 > constraints (the terminology guardrail, locked decisions, integrity gates, and the
@@ -86,9 +85,8 @@ completion, publication, scoring, or evaluation.
 
 Inductive edge prediction is framed as **topology-conditioned binary classification**,
 *not* independent pairwise scoring and *not* graph generation. For a queried pair
-`(u, v)`, the model constructs local topological context from feature-only candidate
-neighborhoods, then predicts the `0/1` edge label *in that context*. Predictions over a
-query set are assembled into a graph and graded with topology metrics.
+`(u, v)`, infer topology context from `(x_u,x_v)` and predict its `0/1` label.
+The representation family remains open; assembly is evaluated separately.
 
 > **Guardrail:** generated local topology is always **intermediate context**, never the
 > final output. The final task is always **binary edge prediction for queried pairs**.
@@ -153,12 +151,12 @@ metrics were recomputed with the official evaluator: BFS-macro GS/RD
 close the topology gap. The complete closeout package is
 [`outputs/deliverables/legacy_g1_graph_metrics_20260714/`](outputs/deliverables/legacy_g1_graph_metrics_20260714/).
 
-## The Proposed Method (EgoStitch)
+## Implemented Candidate Arm (EgoStitch)
 
-> **Status: frozen-s0 screen formally cut (2026-07-17); rev-3.0 e2e screen also
-> formally cut (2026-07-24); rev-3.2 is the active single-stage build line.**
+> **Status: retrieval-grounded candidate arm, not the selected method; both earlier
+> screens were cut, and rev-3.2 is the retained implementation.**
 > Design proposal approved and gate G4 signed off —
-> [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) is the active implementation
+> [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) is this arm's reproduction
 > contract (algorithm spec + benchmark/data contract + auto-sized H20 execution design); its
 > §13.19 defines plan-bound execution and its §14 records the approved e2e
 > headline. Design rationale:
@@ -208,8 +206,8 @@ docs/
   01-blueprint.md                top-level paper blueprint + locked decisions
   02-methodology.md              abstract method contract + training objective
   03-experiment-protocol.md      run/eval contract: baselines, E1–E7, metrics, gates G1–G5
-  04-model-proposal.md           EgoStitch model rationale  (APPROVED 2026-07-09)
-  05-egostitch-spec.md           algorithm + data + auto-sized H20 spec  ← implementation contract (G4 signed off)
+  04-model-proposal.md           historical EgoStitch candidate rationale
+  05-egostitch-spec.md           retrieval-grounded arm reproduction contract
   lit-review-plan.md             review plan, claims K1–K5, terminology guardrail
   results/
     E2-pair-to-topology-gap.md   the motivating result note
@@ -243,33 +241,34 @@ literature/                      curated reference library (gitignored)
 
 **Baseline & benchmark names are deliberately neutral placeholders** (`Benchmark-A/B/C`;
 `B0`, `B1`, `B2-global/static`, `B3`, `B5`, `Ours`, `Oracle`) so the protocol reads as a
-general graph-ML benchmark. Don't substitute real dataset names unless asked.
+general graph-ML benchmark. In pre-reset records, `Ours` means EgoStitch; no forward
+candidate uses that label before selection. Don't substitute real dataset names unless asked.
 
 ## Reading Order
 
 | # | Document | Role |
 |---|---|---|
-| 1 | [`docs/01-blueprint.md`](docs/01-blueprint.md) | Paper blueprint; **§10 Locked Decisions** are fixed |
-| 2 | [`docs/02-methodology.md`](docs/02-methodology.md) | Method contract + training objective |
-| 3 | [`docs/03-experiment-protocol.md`](docs/03-experiment-protocol.md) | **Source of truth** for what to run and how to grade it |
-| 4 | [`docs/04-model-proposal.md`](docs/04-model-proposal.md) | EgoStitch rationale (approved 2026-07-09) |
-| 5 | [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) | **Implementation contract**: algorithm, data/batch contract, auto-sized H20 execution |
+| 1 | [`docs/01-blueprint.md`](docs/01-blueprint.md) | Fixed endpoint-only task; open method selection |
+| 2 | [`docs/02-methodology.md`](docs/02-methodology.md) | Candidate method families + objective |
+| 3 | [`docs/03-experiment-protocol.md`](docs/03-experiment-protocol.md) | **Source of truth** for evaluation |
+| 4 | [`docs/04-model-proposal.md`](docs/04-model-proposal.md) | Historical EgoStitch candidate rationale |
+| 5 | [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) | EgoStitch reproduction contract |
 | 6 | [`docs/results/E2-pair-to-topology-gap.md`](docs/results/E2-pair-to-topology-gap.md) | Motivating result |
-| 7 | [`docs/results/G5-stage1-seed0-20260717.md`](docs/results/G5-stage1-seed0-20260717.md) | Binding frozen-s0 result (`cut`) and diagnostic interpretation; retained evidence, retired code |
-| 8 | [`docs/results/G5-e2e-stage1-seed0-20260724.md`](docs/results/G5-e2e-stage1-seed0-20260724.md) | Binding rev-3.0 e2e screen result (`cut`); historical evidence for the rev-3.2 successor |
-| 9 | [`hpc/README.md`](hpc/README.md) | Target environment and the experiment runbook |
-| 10 | [`docs/lit-review-plan.md`](docs/lit-review-plan.md) | Review plan, claims, terminology guardrail |
+| 7 | [`docs/results/G5-stage1-seed0-20260717.md`](docs/results/G5-stage1-seed0-20260717.md) | Historical frozen-s0 `cut` |
+| 8 | [`docs/results/G5-e2e-stage1-seed0-20260724.md`](docs/results/G5-e2e-stage1-seed0-20260724.md) | Historical rev-3.0 `cut` |
+| 9 | [`hpc/README.md`](hpc/README.md) | Target environment and runbook |
+| 10 | [`docs/lit-review-plan.md`](docs/lit-review-plan.md) | Review plan and terminology |
 
-When documents conflict, the more specific/later one refines the earlier — but locked
-decisions and the locked §0 method boundary override casual changes.
+When documents conflict, the 2026-08-10 reset governs forward method selection.
+Historical registrations/results retain their original provenance and verdicts.
 
 ## Evaluation & Integrity Gates
 
 Every claim reports **edge-level metrics** (AUROC, AUPRC, F1/MCC, calibration) **and
 assembled-graph metrics** (graph similarity, relative density, degree/clustering/spectral
 MMD) *together* — never one family alone. Non-negotiable gates (part of the contribution):
-node-disjoint train/test splits; retrieval and topology construction never touch the
-target test graph; the queried edge is masked/standardized inside the scaffold. See
+node-disjoint splits; input exactly `(x_u,x_v)`; retrieval arms disclose support and
+never use target edges/labels; queried edges are masked from topology context. See
 [`docs/03-experiment-protocol.md`](docs/03-experiment-protocol.md) §E5.
 
 ## Status & Roadmap
@@ -285,13 +284,13 @@ target test graph; the queried edge is masked/standardized inside the scaffold. 
 - [x] **EgoStitch implementation (frozen-s0 form)** — model, losses, data targets, auto-sized DDP worker, scoring, fidelity diagnostics, calibrated comparator, G5 runner, and tests were implemented under `src/`. The producing code last exists at `dcae090` and is deleted in the current cleanup worktree pending commit. The result note and `outputs/egostitch_stage1/` are retained; the registration snapshot that governed it is deleted with the rest of `docs/registrations/`.
 - [x] **E2E headline redesign (rev 3.0)** — approved 2026-07-16 after two user-as-reviewer rounds + a vault/arXiv novelty sweep: stitched-topology-conditioned pair encoder (no frozen anchor). Design record: [`docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md`](docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md); implementation summary: spec §14; Phase 0 is unblocked by the completed frozen-s0 screen: [`docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md`](docs/superpowers/plans/2026-07-16-egostitch-e2e-conditioned-encoder.md).
 - [x] **G5 frozen-s0 screening gate** — binding fixed-Seed-0 verdict `cut`: all three primary topology-dominance checks fail and both guards pass. The selected warm-start checkpoint is near S0; a diagnostic `last.pt` rerun proves later joint training moves ranking and passes matched GS, but still fails matched RD/clustering and regresses degree/spectral MMD. See the [result note](docs/results/G5-stage1-seed0-20260717.md).
-- [x] **Locked-decision disposition (2026-07-17)** — frozen-s0 scalar fusion is retired to motivating evidence; rev 3.0 was made the active G5 build line, which has since advanced to rev-3.2. Successor landing condition §14.3(1) is satisfied. The frozen-s0 code is deleted in the current cleanup worktree, so after the cleanup commit the arm is citable from published artifacts and `dcae090`, not re-runnable from the active tree.
+- [x] **Historical locked-decision disposition (2026-07-17)** — frozen-s0 scalar fusion was retired to motivating evidence; rev 3.0 was then made the active G5 build line and advanced to rev-3.2 before the 2026-08-10 reset. Successor landing condition §14.3(1) is satisfied. The frozen-s0 code is deleted in the current cleanup worktree, so after the cleanup commit the arm is citable from published artifacts and `dcae090`, not re-runnable from the active tree.
 - [x] **G5 e2e screening gate** — binding fixed-Seed-0 v2 registration completed training (valid; liveness passed), held-out fp32 scoring, and the formal gate on 2026-07-24: BFS-macro GS passes but clustering-MMD and BFS-macro RD fail, the matched-AUPRC guard fails, and pathway attribution / the structure-destruction control both fail to establish a topology-conditioning gain. Verdict `cut` (multi-label). See the [result note](docs/results/G5-e2e-stage1-seed0-20260724.md).
 - [x] **Single-stage direct-run cleanup** — qualification, preregistration, plan-identity, and every model-quality authorization gate are removed. Runs execute directly; model-quality signals are telemetry. Contract: spec §14.4.7 and the 2026-08-02 three-component refactor design §10.
-- [x] **Rev-3.0 disposition** — the owner-side discussion advanced the line through rev-3.1 to the active rev-3.2 seven-arm contract; the 2026-07-24 `cut` remains historical engineering evidence.
+- [x] **Rev-3.0 disposition** — the owner-side discussion advanced the implementation through rev-3.1 to the retained rev-3.2 seven-arm EgoStitch contract; the 2026-07-24 `cut` remains historical engineering evidence.
 - [x] **Component-ablation arm set** — five trained arms (`full`, `f_only`, `p0`, `no_l_rel`, `row_layernorm`) plus two scoring-time structure controls. The deleted content pathway makes `pair_topology` identical to `full`, so it is retired; `cosine_pool` is also retired. `row_layernorm` ablates the D0 z-scoring fix. `python -m src.experiments.observe_e2e_formal <output_dir>` reports the run-observation targets from `profile.json` telemetry.
 - [x] **Registration excision (2026-08-02)** — the preregistration/formal-run-registration/provenance-gating machinery (`docs/registrations/`, `hpc/qualification.sh`) is removed in full; the owner runs experiments directly against the trained-arm configs via `hpc/run.sh train`. Design: [`docs/superpowers/specs/2026-08-02-three-component-refactor-design.md`](docs/superpowers/specs/2026-08-02-three-component-refactor-design.md) §10.
-- [ ] **Experiments** in priority order: the rev-3.2 seven-arm formal screen, then E1/E3 multi-seed main + baselines → E4 ablations (incl. E4.15–E4.17 attribution/structure/conditioning-depth) → E5 integrity gates → E7 (load-bearing) → E6 breadth.
+- [ ] **Method selection** — compare endpoint-only candidates, B0, and EgoStitch before naming `Ours`.
 
 ## HPC execution
 

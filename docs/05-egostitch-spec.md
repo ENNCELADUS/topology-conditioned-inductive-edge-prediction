@@ -1,7 +1,7 @@
-# EgoStitch Algorithm Specification (Gate G4 deliverable — spec freeze)
+# EgoStitch Algorithm Specification (Retrieval-Grounded Experimental Arm)
 
-**Status:** **G4 signed off 2026-07-09 — this document is the active implementation
-contract.** Companion to `04-model-proposal.md` (revision 2.2); satisfies gate
+**Status:** **G4 signed off 2026-07-09 — reproduction contract for this retrieval-grounded
+arm, not the selected project method.** Companion to `04-model-proposal.md` (revision 2.2); satisfies gate
 §6.0-G4: Stitch/Harmonize pseudocode with tensor shapes, OT cost and ε, confidence and
 quantile schedule, budget tolerance, gradient estimators, and the full loss tree with
 interior weights. Neutral placeholders per repository convention; no dataset names.
@@ -10,8 +10,8 @@ parameters that document left symbolic. §§9–11 (added at sign-off) bind the 
 the local benchmark package in `data/`, define the batch-sampler / data contract, and
 fix the GPU-count-independent H20 execution design.
 
-**Freeze rule.** This spec is signed off: implementation may not silently deviate;
-any change is an edit here first, with a one-line rationale in §12 (change log).
+**Freeze rule.** This arm's implementation may not silently deviate; any change is
+an edit here first, with a one-line rationale in §12 (change log).
 
 ---
 
@@ -1330,7 +1330,7 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   screen completed under registration `97e61a7d...` and returned binding verdict
   `cut`: all three primary dominance criteria failed and both guards passed. The
   locked disposition is frozen-s0 scalar fusion → motivating arm + ablation, and
-  rev-3.0 e2e conditioning → active G5 build line. This satisfies §14.3(1) but does
+  rev-3.0 e2e conditioning → then-active G5 build line. This satisfies §14.3(1) but does
   not yet rewrite §5/§13, bind successor defaults, or authorize a formal e2e run.
 - 2026-07-17: **§5/§13 rewritten to §14** (source:
   `docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md`
