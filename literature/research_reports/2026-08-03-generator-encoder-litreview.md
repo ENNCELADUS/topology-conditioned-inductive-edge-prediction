@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-03 (restructured per owner directive: no architecture
 contracts; ranked suggestions).
-**Task framing (binding, `docs/lit-review-plan.md`):** the final task is binary
+**Task framing (archived, `literature/research_reports/2026-07-07-topology-conditioned-inductive-edge-prediction-lit-review-plan.md`):** the final task is binary
 edge prediction for a queried pair `(u, v)` of unseen nodes, with no access to
 the target graph at inference. Any generated local topology is an intermediate
 scaffold that conditions the edge decision — never the final output. The

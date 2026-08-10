@@ -22,10 +22,10 @@ binary edge prediction, and its representation method remains open.
 |---|---|
 | Venue | ICLR 2027 |
 | Paper type | Empirical ML method |
-| Primary task | Inductive binary edge prediction over unseen nodes |
-| Input | Queried pair and its two frozen endpoint features `(x_u, x_v)` |
-| Intermediate object | Generated or inferred topology representation |
-| Output | Edge probabilities and assembled predicted graphs |
+| Primary task | Fully inductive PPI prediction between two unseen proteins |
+| Input | Only frozen intrinsic endpoint features `(x_u, x_v)` |
+| Intermediate object | Inferred query-local topology representation |
+| Output | Symmetric $\widehat A_{uv}$; $\widehat G_\tau$ assembled only for evaluation |
 | Main comparison | Independent pair scoring vs. topology-conditioned scoring |
 | Success criterion | Strong edge metrics without implausible assembled graph topology |
 
@@ -33,31 +33,37 @@ binary edge prediction, and its representation method remains open.
 
 ## 2. Thesis
 
-Inductive edge prediction should be modeled as topology-conditioned binary
-classification, not as independent pairwise scoring. For each queried pair, the
-model infers topology context from the two endpoints' intrinsic features, then
-predicts the 0/1 label. Latent, deterministic, and explicit-scaffold families remain
-candidates; retrieval is a separate arm with additional inference support.
+Fully inductive PPI prediction should be topology-conditioned binary classification,
+not independent pair scoring. Training topology may teach transferable structural
+regularities, but inference receives only two unseen proteins' intrinsic features.
+The representation method remains open; retrieval is a separate support condition.
 
-What the reader should believe after reading: the missing ingredient in
-feature-only edge prediction is not just a better scorer, threshold, or auxiliary
-loss. It is local topology as input-side context for each edge decision.
+What the reader should believe: endpoint-only pair accuracy does not guarantee a
+plausible assembled PPI network; topology transfer must improve the queried-edge
+decision and the assembled graph together.
 
 ---
 
 ## 3. Research Problem
 
-**Task.** Given unseen nodes with frozen feature vectors, predict whether each
-queried pair `(u, v)` has an edge. For a set of queries, assemble the predicted
-edges into a graph and evaluate that graph as an output object.
+**Training graph.** $G_{\mathrm{train}}=(V_{\mathrm{train}},E_{\mathrm{train}})$ and
+$V_{\mathrm{train}}\cap V_{\mathrm{test}}=\varnothing$; test endpoints have no observed edges.
 
-**Incumbent formulation.** Independent pairwise scoring predicts
-`P(edge | x_u, x_v)`. This is cleanly inductive but treats edge labels as
-conditionally independent once endpoint features are known.
+**Intrinsic features.** $x_i=E_\eta(S_i,M_i)$, where $S_i$ is protein sequence and
+$M_i$ is optional monomer structure; the encoder is frozen before edge prediction.
 
-**Failure mode.** Edge labels are coupled in the graph being recovered. A set of
-individually plausible edge scores can assemble into a graph with unrealistic
-density, degree distribution, clustering, components, or spectrum.
+**Query.** For $u,v\in V_{\mathrm{test}}$, the symmetric predictor receives only $(x_u,x_v)$:
+$\widehat A_{uv}=P_\theta(Y_{uv}=1\mid x_u,x_v)=P_\theta(Y_{uv}=1\mid x_v,x_u)$.
+
+**Assembly.** Over $\mathcal Q_{\mathrm{test}}$, define $\widehat E_\tau$ by thresholding
+$\widehat A_{uv}$ and $\widehat G_\tau=(V_{\mathrm{test}},\widehat E_\tau)$, then compare
+it with hidden $G_{\mathrm{test}}=(V_{\mathrm{test}},E_{\mathrm{test}})$.
+
+**H1 — pair-to-topology gap.** Independent $\widehat A_{uv}$ values may be accurate while
+their assembly has implausible degree, clustering, density, or spectrum.
+
+**H2 — topology transfer.** Structural regularities of $E_{\mathrm{train}}$ and their
+dependence on $x$ are domain properties that may transfer to unseen proteins.
 
 **Proposed change.** Keep the final prediction target unchanged, but condition
 the edge classifier on a generated or inferred topology representation. That
@@ -76,23 +82,23 @@ representation is context, not the final task.
 
 | RQ | Question | Contribution |
 |---|---|---|
-| RQ1 | Why can feature-only pair scoring fail as an assembled graph? | Pair-to-topology gap: edge metrics and graph realism can diverge |
-| RQ2 | Can topology inferred from endpoint features condition an edge decision without test-graph access? | Topology-context edge classifier |
-| RQ3 | Does topology conditioning improve edge metrics and assembled-output metrics? | Main empirical result |
-| RQ4 | Which representation family and component matter? | Matched endpoint-only latent/deterministic/generative comparisons, plus a separate retrieval-grounded arm |
-| RQ5 | Does the assembled graph help generic graph ML probes? | Secondary utility evaluation |
+| RQ1 | Does the pair-to-topology gap hold in fully inductive PPI prediction? | Joint pair/assembled-graph diagnosis |
+| RQ2 | Can $G_{\mathrm{train}}$ topology transfer through endpoint features alone? | Zero-observed-edge topology conditioning |
+| RQ3 | Which topology representation helps $\operatorname{edge}(u,v)$? | Matched latent, deterministic, and generative comparison |
+| RQ4 | Does extra retrieval support explain an explicit-scaffold gain? | Separately labeled retrieval-grounded arm |
+| RQ5 | Does the selected method improve both prediction levels? | Joint edge/topology result |
 
-The load-bearing contributions are RQ2 and RQ3. RQ1 motivates the problem, and
-RQ4 prevents the method from being mistaken for a larger feature-only scorer.
+The load-bearing contributions are RQ2 and RQ3. RQ1 motivates the problem; RQ4
+separates topology learning from gains caused by extra inference support.
 
 ---
 
 ## 5. Method Summary
 
-1. **Input.** The complete task input is the two frozen endpoint vectors.
-2. **Context.** Infer a latent, deterministic, or explicit topology representation.
-3. **Decision.** Predict the edge from endpoint features and topology context.
-4. **Assembly.** Combine pair scores only for graph-level evaluation.
+1. **Input.** Encode only the two frozen protein representations.
+2. **Context.** Learn from $G_{\mathrm{train}}$; infer context from $(x_u,x_v)$ at test time.
+3. **Decision.** Produce a symmetric probability for the queried interaction.
+4. **Assembly.** Construct $\widehat G_\tau$ only after scoring $\mathcal Q_{\mathrm{test}}$.
 
 Retrieval-grounded scaffolds are a separate arm whose support pool is not task input.
 
@@ -100,8 +106,8 @@ Minimal contract:
 
 ```text
 inputs:  pair (u, v), frozen endpoint features (x_u, x_v)
-context: inferred topology representation T_uv = g(x_u, x_v; theta_g)
-output:  p_uv = P(edge(u, v) = 1 | x_u, x_v, T_uv)
+context: T_uv = g(x_u, x_v; theta_g), learned with G_train supervision
+output:  p_uv = p_vu = P(Y_uv = 1 | x_u, x_v, T_uv)
 ```
 
 Training uses queried-edge supervision as the primary loss, with optional
@@ -114,12 +120,12 @@ reconstruction on training subgraphs.
 
 | ID | Baseline | Interpretation |
 |---|---|---|
-| B0 | Independent pairwise scorer | Topology-blind baseline |
-| B1 | Retrieval-augmented scorer without adjacency | Tests whether extra nodes are enough |
-| B2 | Post-hoc denoising of independent scores | Tests cleanup after scoring |
-| B3 | Independent scorer plus graph-statistic loss | Tests loss shaping without topology context |
-| B4 | Latent-topology model without queried-edge conditioning | Tests generation without the final decision module |
-| Selected family | Topology-conditioned classifier | Headline method only after matched family selection |
+| B0 | Endpoint-only direct scorer | Topology-blind baseline |
+| B1 | Training-time topology transfer | Graph2Feat/LLP/CAZI-MBN-style student |
+| B2 | Deterministic structural latent | Tests topology transfer without generation |
+| B3 | Conditional latent topology generator | Tests stochastic topology context |
+| B4 | Retrieval-grounded explicit scaffold | Extra-support arm, including EgoStitch |
+| Controls | Loss shaping, denoising, retrieval-only | Tests simpler explanations |
 | Oracle | Classifier using observed target topology | Upper bound that violates protocol |
 
 All fair baselines should share the same frozen features, splits, query sets, and
@@ -129,28 +135,18 @@ evaluation protocol.
 
 ## 7. Evaluation Plan
 
-**Edge-level metrics.**
-
-- AUROC and AUPR.
-- Fixed-operating-point accuracy, F1, or balanced accuracy.
-- Per-node or per-query-group ranking metrics.
-- Calibration metrics.
-- Robustness across node-disjoint inductive splits.
+**Edge-level metrics.** Report AUROC, AUPRC, F1, MCC, and calibration under
+node-disjoint splits, uncertain-negative disclosure, and hard-negative controls.
 
 **Graph-level assembled-output metrics.**
 
-- Relative density.
-- Degree-distribution distance.
-- Clustering-coefficient distance.
-- Spectral distance.
-- Motif or orbit statistic distance.
-- Component and connectivity summaries.
-- Learned graph-feature distance.
+- BFS-macro GS and RD.
+- Degree-MMD ratio.
+- Clustering-MMD ratio.
+- Spectral-MMD ratio.
 
-Use density-matched thresholds and threshold sweeps so graph improvements cannot
-be explained only by a different operating point. Report edge and graph metrics
-together.
-
+Report these five headline values together; name global simple-edge GS/RD separately
+and never infer topology success from pair metrics alone.
 **Ablations.**
 
 - Remove topology context.
@@ -172,9 +168,8 @@ retrieval on the assembled graph.
 
 1. **Introduction.** Define the task, the pair-to-topology gap, and the proposed
    topology-conditioned formulation.
-2. **Related Work.** Cover feature-only edge prediction, inductive link
-   prediction, structure-aware graph learning, local graph generation, and graph
-   evaluation metrics.
+2. **Related Work.** Separate transductive/observed-topology, endpoint-only,
+   training-time topology transfer, and synthetic attachment methods.
 3. **Problem Formulation.** Specify frozen features, queried pairs, binary edge
    labels, inductive splits, and assembled-output evaluation.
 4. **Method.** Present the selected topology-representation mechanism, edge
@@ -190,22 +185,20 @@ retrieval on the assembled graph.
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| Topology generation appears to be the main task | High | Anchor every section to queried-edge binary prediction |
+| Topology generation appears to be the main task | High | Anchor every section to `edge(u,v)` |
 | Generated topology does not improve edge metrics | High | Report edge and graph metrics jointly; use ablations to diagnose |
 | Graph metrics improve only by threshold changes | High | Use density-matched operating points and threshold sweeps |
 | Optional candidate retrieval leaks target information or is mistaken for task input | High | Keep retrieval in a separately labeled arm, freeze and disclose its support universe, and audit every inference input |
 | Scaffold contains the queried-edge answer | High | Mask or standardize the queried edge inside the scaffold |
-| Method becomes too broad | Medium | Keep the fixed setting: unseen nodes, frozen features, queried pairs, binary labels |
+| PPI negatives or graph truth are biased | High | Disclose uncertain negatives and ascertainment limits |
 
 ---
 
 ## 10. Locked Decisions
 
-1. Primary problem: topology-conditioned inductive edge prediction.
-2. Final prediction target: binary edge label or probability for queried pairs.
-3. Generated local topology role: intermediate context, not final output.
-4. Main comparison: independent pair scoring vs. topology-conditioned scoring.
-5. Evaluation requirement: pairwise edge metrics plus graph-level
-   assembled-output metrics.
-6. Protocol: input is exactly `(x_u,x_v)`; no target graph; representation method
-   remains open and grounding/retrieval is optional support, never task input.
+1. Task: fully inductive, node-disjoint, zero-observed-edge PPI prediction.
+2. Input/output: exactly $(x_u,x_v)$ to symmetric $\widehat A_{uv}$.
+3. Structure: $G_{\mathrm{train}}$ may supervise intermediate topology context only.
+4. Assembly: score $\mathcal Q_{\mathrm{test}}$, then form $\widehat G_\tau$.
+5. Evaluation: pairwise metrics plus GS, RD, and three MMD ratios together.
+6. Method remains open; grounding/retrieval is optional support, never task input.

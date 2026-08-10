@@ -24,7 +24,7 @@ tokens); query init from ``e_u``; no CVAE token. Owns the shared projection
 ``proj: d -> d_p`` consumed by the matching cost, ``L_feat``, and ``s1``
 (spec Sec 13.7 — those consumers stop-gradient its target-side output). The
 generated ego-net is **intermediate context** for the binary edge decision,
-never a final output (docs/lit-review-plan.md Sec 5).
+never a final output (literature/research_reports/2026-07-07-topology-conditioned-inductive-edge-prediction-lit-review-plan.md Sec 5).
 
 ``EgoStitchStage1``: the per-node pass (`encode_nodes`) is the cacheable unit
 (spec Sec 10.3): the E2E generator

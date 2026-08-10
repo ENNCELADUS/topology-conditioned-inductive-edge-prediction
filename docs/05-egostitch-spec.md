@@ -1,17 +1,17 @@
-# EgoStitch Algorithm Specification (Retrieval-Grounded Experimental Arm)
+# Open Algorithm Specification — Method Pending Selection
 
-**Status:** **G4 signed off 2026-07-09 — reproduction contract for this retrieval-grounded
-arm, not the selected project method.** Companion to `04-model-proposal.md` (revision 2.2); satisfies gate
+**Status:** **OPEN — no project-wide algorithm selected; the text below is the historical
+retrieval-grounded EgoStitch reproduction contract.** It satisfied gate
 §6.0-G4: Stitch/Harmonize pseudocode with tensor shapes, OT cost and ε, confidence and
 quantile schedule, budget tolerance, gradient estimators, and the full loss tree with
 interior weights. Neutral placeholders per repository convention; no dataset names.
-Nothing here changes the model of `04-model-proposal.md` — this document pins the free
-parameters that document left symbolic. §§9–11 (added at sign-off) bind the spec to
+Nothing below promotes this arm to the selected method; it pins historical free
+parameters. §§9–11 (added at sign-off) bind the spec to
 the local benchmark package in `data/`, define the batch-sampler / data contract, and
 fix the GPU-count-independent H20 execution design.
 
-**Freeze rule.** This arm's implementation may not silently deviate; any change is
-an edit here first, with a one-line rationale in §12 (change log).
+**Scope rule.** The frozen contract applies only to the historical EgoStitch arm;
+the selected method receives a new concise specification here after comparison.
 
 ---
 
@@ -152,7 +152,7 @@ critic trained with its own BCE, gradients not propagated into h (detached input
 
 ## 5. Module 4 — Decision head (per pair)
 
-**Current headline (family `egostitch_e2e`, updated 2026-08-02):** the
+**Historical e2e implementation (family `egostitch_e2e`, updated 2026-08-02):** the
 decision head is a from-scratch V3.1-class pair encoder conditioned on the stitched
 topology — no frozen B0 anchor, no `s0`:
 
@@ -163,7 +163,7 @@ p_ij = σ( head( Trunk(tok_i, tok_j | STE(T̂_ij)) ) )
 - **Trunk:** Siamese token encoder + pair cross-attention over the raw token
   sequences `(tok_i, tok_j)` — the audited V3.1 architecture family
   (`pair_context_gated` blocks maintaining `(h_a, h_b, cls_token)`, feature-wise
-  `abba_max` over the AB and BA passes) — trained from scratch under the Ours regime.
+  `abba_max` over the AB and BA passes) — trained under the historical EgoStitch regime.
 - **STE (stitched-topology encoder):** structure-only tokens over the stitched
   scaffold `T̂_ij`. Token features: 4-type anchor labels (endpoint-i / endpoint-j /
   slot-of-i / slot-of-j), `π`, `m`, soft degrees — **no** slot content `h`, no
@@ -272,7 +272,7 @@ head receive gradient only through `L_edge`.
    §13.8). The prospective stability-screen v2 is governed by §13.19 instead:
    `L_edge(f_logit)` trains the pair trunk/head from step 0 while topology/content
    conditioning remains hard-bypassed until its registered ramp.
-- **HPO parity:** every ladder method (B0…B5, `B3-full`, `Ours`) gets the same tuning
+- **HPO parity:** every historical ladder arm (B0…B5, `B3-full`, EgoStitch) gets the same tuning
   budget: 30 configs × 3 seeds, random search over its declared grid, frozen and
   recorded in the run-metadata store before held-out metrics are opened.
 - **Determinism:** fixed seeds for CVAE samples (n_s = 4, averaged p_ij), Sinkhorn
@@ -1321,7 +1321,7 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   a conjunctive scoring-time dead-residual validity gate, and the validation-AUPRC
   near-tie fidelity tie-break. These are bound to a new single-seed experiment ID;
   §10.2 sampling and all Stage-1 success criteria are unchanged.
-- 2026-07-16: added §14 (approved successor headline — e2e stitched-topology-
+- 2026-07-16: added §14 (historical e2e stitched-topology-
   conditioned pair encoder, proposal §4.4 rev 3.0). §§1–13 remain the binding
   contract for the pending frozen-s0 screening run and its code; §14 records the
   successor architecture and its landing conditions. No §5/§13 semantics change in
@@ -1874,9 +1874,9 @@ checkpoint-policy provenance together with exact registration/config/checkpoint/
 artifact identity. The registration file itself remains immutable during a run
 and its SHA-256 remains part of every artifact chain.
 
-## 14. Approved successor headline: E2E stitched-topology-conditioned pair encoder (2026-07-16)
+## 14. Historical successor: E2E stitched-topology-conditioned pair encoder (2026-07-16)
 
-**Scope and precedence.** This section records the approved rev-3.0 headline
+**Scope and precedence.** This section records the historical rev-3.0
 architecture (proposal §4.4; full decision trail and pins in
 `docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md`).
 **§§1–13 remain the historical binding contract** for the completed frozen-s0
@@ -1970,7 +1970,7 @@ SHA-256 but does not gate on its status or nullable run-produced evidence. §13.
 the completed v2 screen's binding record; §14.4 supersedes it for rev-3.1
 only where stated.
 All generated/stitched structure remains intermediate context for the binary
-edge decision (`docs/lit-review-plan.md` §5).
+edge decision (`literature/research_reports/2026-07-07-topology-conditioned-inductive-edge-prediction-lit-review-plan.md` §5).
 
 #### 14.4.1 Loss components (fold into `L_recon`; outer objective unchanged)
 

@@ -1,7 +1,7 @@
-# Candidate Model Record: EgoStitch — Community-Conditioned Ego-Network Imagination with Consensus Stitching
+# Open Model Proposal — Method Pending Selection
 
-**Status:** **revision 3.0 historical EgoStitch candidate, not the selected project method.**
-Approved 2026-07-09; G4 signed off the arm-specific reproduction contract in
+**Status:** **OPEN — no project method selected; revision 3.0 EgoStitch below is historical provenance and ablations only.**
+Historical record approved 2026-07-09; G4 signed off the arm-specific contract in
 `05-egostitch-spec.md`. Companion to `03-experiment-protocol.md` (updated 2026-07-09 with the
 approved [protocol-Δ] items) and `02-methodology.md`. The frozen-s0 EgoStitch
 Stage-1 screen completed on 2026-07-17 with the binding verdict `cut`; revision 3.0
@@ -12,9 +12,8 @@ stitched-topology-conditioned pair encoder** (jointly trained V3.1-class trunk,
 structure-only stitched-topology encoder, zero-init tanh-gated cross-attention, and a
 three-null decomposition). Design record and decision trail:
 `docs/superpowers/specs/2026-07-16-egostitch-e2e-conditioned-encoder-design.md` (rev 3).
-Spec §§1–13 remain the historical contract for the completed frozen-s0 run and its
-retained implementation. The successor contract is summarized in spec §14; its Phase-0
-§5/§13 rewrite and fresh registration are now unblocked but are not yet normative.
+Spec §§1–14 remain the historical family-specific contract and do not constrain
+forward method selection after the 2026-08-10 reset.
 
 **Provenance.** Revision 1 was grounded in a three-track literature review run on
 2026-07-07. Revision 2 (2026-07-08) followed a full fan-out review of the local vault
@@ -336,7 +335,7 @@ retrieved + thresholded (unsupervised echo) ≠ generated + realism-trained + ha
 
 ## 3. Candidate architectures considered
 
-### Approach A (recommended): EgoStitch — dual ego-network imagination + community codebook + consensus stitching
+### Approach A (historical, not selected): EgoStitch — dual ego-network imagination + community codebook + consensus stitching
 
 Each endpoint generates its own ego-network (latent neighbor set + degree + local
 adjacency) conditioned on frozen features and a quantized community code; the two

@@ -1,27 +1,10 @@
 # Experiment Protocol: Topology-Conditioned Inductive Edge Prediction
 
-**Status:** task/evaluation protocol; method selection is open and EgoStitch is one historical arm.
-**Updated 2026-07-09:** incorporates the approved `[protocol-Δ]` items from
-`04-model-proposal.md` revision 2.1 (approved as a design proposal; **gate G4 was
-signed off later the same day — `05-egostitch-spec.md` is now the implementation
-contract**, including its §9 benchmark binding / data contract and §10–11
-batch-sampler and auto-sized H20 E2 production execution design). Changes:
-pre-implementation gates G1–G5, baseline ladder extensions (`B0+cal`, `B3-dist`,
-`B3-full`, `B5`, external attribute-only baselines), trained-on vs held-out metric
-families, ceiling and Oracle reference rows, hard-negative construction for zero-edge
-nodes, new integrity gates, Holm-corrected pre-registered decision rules, E7 promoted
-to load-bearing, and B4's disposition. The C4 framing claim is scoped throughout as:
-*the first **protocol-gated** joint edge + assembled-realism evaluation for **strict
-zero-edge inductive** edge prediction* (classical priority: ERGM goodness-of-fit;
-deep-learning priority on the dissociation observation: Graph Gestalt 2106.15239).
-**Updated 2026-07-13:** pinned the G3 Oracle instantiation (§5.0 G3): structural CN/AA
-oracle plus a parameter-free B0 rank-fusion blend arm, PA-null top-N assembly convention,
-per-statistic MMD-ratio headroom as the stop-rule quantity.
-**Updated 2026-08-03:** B0-alt withdrawn as a baseline family by owner decision — B0
-(V3.1) is the sole baseline going forward. Removed from §2's baseline hierarchy table
-and the E3 run list; the closed G1 result (§3 E2), which used B0-alt to close the
-architecture-independence requirement, is retained unchanged as history. B0-alt's
-implementation was removed from the code tree in commit `72db72c`.
+**Status:** current task/evaluation protocol; method selection remains open.
+**Forward plan (2026-08-10):** run topology-distillation baselines first, probe
+conditional latent-topology generation in parallel, and treat topology-aware output
+losses as a complementary control. EgoStitch is a historical retrieval-grounded arm.
+No candidate is `Ours` before matched endpoint-only comparison.
 
 This document defines the benchmark contract, baseline hierarchy, experiment matrix, evaluation
 protocol, caveats, and deliverables for this repository. It is intentionally self-contained:
@@ -30,8 +13,8 @@ placeholders.
 
 > **Locked task; open method.** For `(i,j)`, infer topology context from exactly
 > `(x_i,x_j)` and emit a binary label. Aggregate predictions only for graph-level
-> evaluation. Latent, deterministic, and explicit-scaffold representations remain
-> candidates; retrieval-grounded scaffolds are a separate support condition.
+> evaluation. Distillation and latent generation are endpoint-only candidates;
+> retrieval-grounded scaffolds are a separate support condition.
 >
 > **Known structural consequence (stated, not hidden):** under this contract the assembled
 > graph is an edge-independent construction given features. Gate G2 measures the realism
@@ -47,45 +30,30 @@ can preserve edge-level quality while assembling predictions into a plausible gr
 
 ### Method boundary
 
-For a query pair `(i, j)`, the historical retrieval-grounded instantiation was:
+For a query pair `(i, j)`, every context-bearing endpoint-only candidate obeys:
 
 ```text
-V_T = {i, j} union ANN_feat(i, k) union ANN_feat(j, k)
-E_T = {(a, b) in V_T x V_T : score(a, b) >= tau_pair}, with weights score(a, b)
-T_ij = (V_T, E_T without queried edge (i, j))
-H = scaffold_encoder(x_V_T, T_ij)
-p_ij = sigmoid(pair_logit(i, j) + scaffold_residual(H_i, H_j))
+T_ij = transfer_or_generate(x_i, x_j; learned_parameters)
+p_ij = classifier(x_i, x_j, T_ij)
 ```
 
-**Disposition (2026-07-09):** this retrieved-and-thresholded instantiation is retained as
-**ablation arm E4.10** (the bridge baseline). The method under test (`Ours`) is the
-generated-and-harmonized scaffold defined in `04-model-proposal.md` §4 with the frozen
-algorithm spec in `05-egostitch-spec.md`; the *outer* boundary above (per-query local
-context from frozen features → conditioned classifier → binary label) is unchanged and
-remains locked.
-
-**Disposition (2026-07-16, rev 3.0):** the headline decision mechanism is the
-**end-to-end stitched-topology-conditioned pair encoder** (`04-model-proposal.md`
-§4.4 rev 3.0): a jointly-trained V3.1-class pair encoder conditioned on a
-structure-only stitched-topology encoder via zero-init gated cross-attention, with the
-three-null (`∅_all_head` / `∅_topo_head` / `∅_content_head`) four-logit decomposition.
-The frozen pairwise scorer **loses its `s0`-anchor role**; it remains the B0 baseline
-and the E4.10 proposer. The rev-2.2 anchored-residual head is retained as an ablation
-arm. The *outer* §0 boundary is again unchanged and remains locked. The pending
-frozen-s0 Stage-1 screening registration keeps its own contract (§5.0.5); the
-successor's spec/registration land after that screen publishes (spec §14).
-
-**Forward disposition (2026-08-10):** keep this EgoStitch history, but compare endpoint-only families before selecting a method.
+Training neighborhoods may be encoded by a graph-aware teacher, but inference receives
+no observed test topology. Distillation aligns a student to teacher representations or
+relations; conditional generation models a distribution over an identity-free topology
+latent. Neither consumes neighbor identities. Structured output loss is a separate
+training-side control. Pair mode remains primary; any future set/subgraph mode
+must be declared as a different inference contract.
 
 Components:
 
 | Component | Status under the contract |
 |---|---|
 | Frozen feature encoder | Reuse as frozen node features `x_i`; never fine-tune in the core protocol. |
-| Frozen pairwise scorer | Reuse as B0 and (E4.10 only) as the edge-weight/candidate proposer. Provenance audited (§E5). *(2026-07-16: the `s0`-anchor role is retired with the rev-3.0 headline; it survives only inside the frozen-s0 ablation arm.)* |
-| Topology representation | Open for forward selection: endpoint-only latent, endpoint-only deterministic, or retrieval-grounded explicit scaffold. |
-| Scaffold encoder plus fused decision head | Reuse as the scaffold-conditioned classifier head; identical-head convention for generator comparisons (§3 E4). |
-| Global generated graph encoding | Report only as a baseline or ablation on the locality axis. |
+| Frozen pairwise scorer | Reuse as B0 and the matched endpoint-only decision trunk. |
+| Topology teacher | Encode training topology for distillation targets or latent-generation supervision. |
+| Topology representation | Open: distilled deterministic latent or conditional latent distribution. |
+| Structured objective | Complementary training control over grouped edge predictions. |
+| Retrieval/explicit scaffold | Historical separate-support arm; never presumed available. |
 | Benchmark splits, evaluator, and assembled graph metrics | Reuse consistently for all methods. |
 
 ### Why per-query topology context remains the research object
@@ -166,32 +134,28 @@ Components:
 | ID | Baseline | Neutral instantiation | Isolates |
 |---|---|---|---|
 | **B0** | Independent pairwise scorer | Frozen pairwise scorer over `(x_i, x_j)` | Topology-blind edge prediction |
-| **B0-e2e** | Matched-training pairwise-only arm (rev 3.0) | `Ours`'s trunk with all conditioning permanently bypassed (`∅_all_head`), trained under exactly the `Ours` data/negatives/edge-active-steps/optimizer/seed/HPO | The honest pairwise control for the e2e head: separates training-regime effects from conditioning effects. Never conflated with canonical B0 (both use all train positives after the 2026-08-03 correction, but their negative ratios, optimizer settings, seeds, and architecture remain different) |
-| **B0+cal** | B0 + calibrated assembly | Temperature/Platt calibration + density- and degree-sequence-matched thresholding of B0 scores | Whether trivial assembly calibration recovers the topology gains. Also applied on top of `Ours` as a diagnostic |
-| **B1** | Retrieval, no generated adjacency | Retrieve neighbors around `i` and `j`, pool features, use no scaffold edges | Value of adjacency vs retrieval alone |
-| **B2-global** | Global post-hoc refiner | Build one generated graph from pairwise scores, encode globally, decode each pair | Global context vs local context |
-| **B2-static** | Static graph denoiser | Top-k, density-matched thresholding, or other fixed sparsification over B0 scores | Whether simple graph cleanup is enough |
-| **B3** | Topology-aware loss on the pairwise scorer | Pairwise scorer trained with edge loss plus topology regularizers | Whether a topology loss alone fixes assembly |
-| **B3-dist** | Distributional-loss scorer | B0 fine-tuned with a kernel-MMD realism regularizer (Graph Gestalt 2106.15239 kernels) | Whether a one-line distributional loss closes the gap without topology conditioning |
-| **B3-full** | The Ockham arm | B0 architecture + all of `Ours`'s auxiliary supervision as multi-task heads (degree NLL, BP-NLL, ego-net statistic prediction, distributional statistic loss) + calibrated assembly | **The decisive control**: every training signal, none of the generative machinery. The E2 §5 cached preview is treated as a first-class hypothesis in this arm's favor and re-run under G1 normalization |
-| **B4** | *(disposition)* | Subsumed by ablation arm E4.11 (generation-only, no queried-edge supervision) | Recorded here so the blueprint/methodology B4 row is not silently dropped |
+| **B0+cal** | B0 + calibrated assembly | Temperature/Platt calibration + density- and degree-sequence-matched thresholding of B0 scores | Whether trivial assembly calibration recovers topology; also apply to the selected candidate |
+| **B1** | Topology distillation | Graph2Feat/LLP/CAZI-MBN-style graph-aware teacher → endpoint-only student | First runnable topology-transfer baseline |
+| **B2** | Deterministic structural latent | Endpoint-only student predicts topology-aware latent | Transfer without stochastic generation |
+| **B3** | Conditional latent-topology generator | Predict `p(T_ij | x_i,x_j)`; no neighbor identities | Explicit missing-topology imputation |
+| **B4** | Retrieval-grounded explicit scaffold | Historical EgoStitch arm with declared support universe | Extra inference support vs endpoint-only transfer |
+| **Controls** | Structured loss, static denoising, calibrated assembly, full auxiliary supervision | Output constraint and simpler explanations |
 | **B5** | Neural-SBM residual | Feature-only MLP affiliations `F_u` (NOCD Bernoulli–Poisson) + degree terms: `p_ij = σ(pair_logit + block + degree)` | Block prior alone; the project's null hypothesis. Also the first strict-inductive evaluation of the BP block prior |
 | **PA-null** | Preferential-attachment null | `s_ij = k_i·k_j` from training-side degree statistics, reported with each benchmark's degree heterogeneity σ (log-normal fit) | Validity precondition (2405.14985): under uniform negatives this null averages AUC 0.83; any method not clearly beating it has an uninformative edge metric |
 | **Odds-product** | Degree-respecting edge-independent baseline | `P_ij = σ(ℓ_i + ℓ_j)` fitted to the expected degree sequence (Chanpuriya 2111.00048 §3) | Cheapest degree-budget-honoring assembly with zero topology conditioning; also supplies the G2 overlap dial `P̃ = (1−ω)P + ωA` |
 | **DEAL / Graph2Gauss** | External attribute-only baselines | DEAL 2007.08053; Graph2Gauss 1707.03815 | Independent-scoring SOTA for the setting; falsifiable prediction: both exhibit the E2 failure mode |
-| **Candidate families** | Endpoint-only latent/deterministic or retrieval-grounded EgoStitch | Compare before assigning `Ours` | Method selection remains open |
+| **Method comparison** | B1 vs B2 vs B3, with B0 and Controls | Compare before assigning `Ours` | Method selection remains open |
 | **Oracle** | Observed-graph upper bound | Uses true held-out graph neighborhoods at evaluation time (pinned instantiation: §5.0 G3) | Headroom; violates the inductive protocol; **run first (gate G3)** |
 
-All fair baselines share the same frozen features, splits, query sets, complete training
-interactions, negative-sampling protocol, and an equal, pre-registered HPO budget (30 configs ×
-3 seeds each, recorded before held-out metrics are opened).
+All fair baselines share frozen features, splits, query sets, complete training
+interactions, negative sampling, and an equal HPO budget fixed before held-out metrics open.
 
 ---
 
-## 3. Experiment matrix
+## 3. Historical EgoStitch experiment matrix (archived)
 
-Each experiment lists purpose, claim, run, metrics, and success criterion. In this
-historical matrix `Ours` means EgoStitch; future matrices name candidate families.
+Here `Ours` means EgoStitch; these rows are provenance, not forward method selection.
+Current execution follows §5.1 and names B1/B2/B3 explicitly.
 
 ### E1: Main result on Benchmark-A
 
@@ -206,7 +170,7 @@ historical matrix `Ours` means EgoStitch; future matrices name candidate familie
   `B3-dist`, and `B3-full` with Holm-adjusted significance across ≥ 3 seeds; relative density
   moves toward 1. Failure readings per §5.2 decision rules.
 
-### E2: Pair-to-topology gap (hardened per gate G1)
+### E2: Pair-to-topology gap (closed historical G1 result)
 
 - **Claim:** an independent pairwise scorer can assemble into an implausible graph, and the
   degradation is not explained by threshold choice, negative-sampling regime, or metric
@@ -379,9 +343,9 @@ rule).
 
 ## 4. Evaluation protocol
 
-- **Edge-level task:** score held-out candidate pairs and report probability-based AUROC/AUPRC plus
-  thresholded metrics at the selected operating point; probabilities are the n_s-averaged values
-  per the spec determinism policy.
+- **Edge-level task:** score held-out candidate pairs and report AUROC/AUPRC plus
+  thresholded metrics at the selected operating point; stochastic candidates average
+  a fixed, disclosed number of samples.
 - **Assembled graph task:** assemble scored pairs into a predicted graph and evaluate both metric
   families of §1 on benchmark buckets, with noise-floor, ceiling, and Oracle rows.
 - **Operating point:** primary results use a validation-selected threshold. Secondary results use
@@ -393,18 +357,17 @@ rule).
   community familiarity, plus a harmonic-mean joint number; per-benchmark Feature
   Contribution Ratio (Cold Brew) as a headroom diagnostic; per-benchmark degree
   heterogeneity σ; supervision-starvation statistic as a motivation figure.
-- **Mechanism-transmission diagnostics (required with every headline table):** held-out
-  imagined-ego-net fidelity (slot recall@K, degree calibration, slot-adjacency vs true local
-  clustering); assembled degree-calibration curve; imagined-diversity vs real neighbor
-  diversity; mean grounding gate; s-channel correlation matrix.
+- **Mechanism diagnostics:** distillation recovery toward teacher/Oracle, latent-generator
+  calibration and diversity, or structured-loss effects, according to the candidate.
+  Retrieval/grounding diagnostics apply only to the historical separate-support arm.
 - **Reporting rule:** edge and assembled graph metrics are always reported together. No claim
   relies on one metric family alone. The held-out family is headlined.
 
 ---
 
-## 5. Run order, gates, caching, and reproducibility
+## 5. Historical gates and current run order
 
-### 5.0 Pre-implementation gates (blocking; before any model code)
+### 5.0 Historical pre-implementation gates (completed or retired; non-blocking)
 
 1. **G1 — E2 hardening** (see E2). Stop: gap closes ⇒ pivot to evaluation paper.
 2. **G2 — Edge-independence ceiling (curve semantics).** With Chanpuriya 2111.00048's exact
@@ -600,29 +563,28 @@ rule).
    (spec §12, 2026-08-03) — keeping shared-interaction runs apart from older
    80/20-partition ones is an owner-side responsibility, not a gate.
 
-### 5.1 Priority order (after gates)
+### 5.1 Forward priority order
 
 1. **E2 (hardened)** — established the gap under G1 conditions.
-2. **Method selection** — compare endpoint-only families, B0/B3-full, and EgoStitch.
-3. **E1/E3** — selected method and baselines on Benchmark-A.
-4. **E4/E5** — mechanism ablations and integrity gates.
-5. **E7** — downstream utility (load-bearing).
-6. **E6** — split/benchmark generalization.
+2. **Distillation baseline** — run B1, including CAZI-MBN, and measure Oracle-gap recovery.
+3. **Parallel probes** — compare B2/B3 and the structured-loss control against B0.
+4. **Method selection** — assign no `Ours` until the matched comparison is complete.
+5. **Selected-method study** — main result, baselines, and mechanism ablations.
+6. **Extensions** — downstream utility and split/benchmark generalization.
 
 Within each experiment, per-arm execution is a single sequence, not train followed by a
 separate manual scoring/reporting step: `hpc/run.sh train <config> ...` packs, trains,
 publishes, then automatically scores V_hold, freezes the max-F1 operating point, scores
 test and candidate, and writes the combined edge+graph `test_report.json` before the
 command returns (`hpc/README.md`). A debug `--max-steps` run skips this test stage
-entirely. The external CAZI-MBN baseline and the two scoring-time structure controls
-(which reuse the `full` EgoStitch arm's checkpoint and have no `train` invocation of
-their own) reach the same report through `hpc/run.sh test` directly.
+entirely. CAZI-MBN reaches the same report through `hpc/run.sh test`; two historical
+structure controls reuse the `full` EgoStitch checkpoint and also run through `test`.
 
-### 5.2 Pre-registered decision rules (frozen before held-out metrics are opened)
+### 5.2 Decision rules (fixed before held-out metrics are opened)
 
-1. Assign `Ours` only after selection. If it does not beat `B3-full` and `B0+cal` on
+1. Assign `Ours` only after selection. If it does not beat Controls and `B0+cal` on
    held-out topology at matched AUPRC (Holm, ≥3 seeds), its topology is not load-bearing.
-2. If EgoStitch s1/s2 knockouts cost nothing, collapse that arm to B5 and report it.
+2. If a candidate's topology-context knockout costs nothing, do not select that mechanism.
 3. Multiple-comparison control: Holm over the held-out assembled family replaces any
    "wins on k of n metrics" language.
 4. All thresholds and rules recorded in run metadata before E1/E3 held-out metrics are opened.
@@ -631,10 +593,10 @@ their own) reach the same report through `hpc/run.sh test` directly.
 
 - Cache frozen node features once per benchmark split.
 - Cache audited, universe-scoped ANN lists only for retrieval arms; disclose support.
-- Cache Tokenize/Imagine outputs only for arms that implement them.
-- Cache pairwise scorer outputs for every candidate universe used by E2, B2-global, B2-static,
-  `B0+cal`, and `Ours`.
-- Store run metadata with scorer checkpoint identifier, threshold policy, scaffold size, seed,
+- Cache teacher targets or generated latents only for candidates that implement them.
+- Cache pairwise outputs for every candidate universe used by E2, static denoising,
+  `B0+cal`, and the selected candidate.
+- Store run metadata with checkpoint identifier, threshold policy, candidate settings, seed,
   split name, metric normalization, kernel/bandwidth disclosures, HPO budget records, and the
   §5.2 decision rules.
 
@@ -644,22 +606,22 @@ their own) reach the same report through `hpc/run.sh test` directly.
 - Lock the operating-point policy and decision rules before opening final held-out metrics.
 - Preserve enough metadata to regenerate [e2-gap.html](../figures/e2-gap.html) and the main
   experiment tables from repository-local artifacts.
-- Report FLOPs/wall-clock for B0 and candidates; sweep `R` only for EgoStitch.
+- Report FLOPs/wall-clock for B0 and candidates; sweep only applicable hyperparameters.
 
 ---
 
 ## 6. Deliverables and done criteria
 
-1. **Gate reports (G1–G3):** G1 B0/PA-null/B0-alt, the G2 ceiling computation, and
+1. **Gate reports (G1–G3):** archived G1 (including historical B0-alt), G2 ceiling, and
    the G3 Oracle row are complete; the alternate architecture preserves the topology gap.
-2. **EgoStitch reproduction contract:** signed-off `05-egostitch-spec.md`.
-3. **E1/E3 table:** compare candidate families by edge AUPRC, both assembled families, ceiling/Oracle/noise
+2. **Open model/spec:** finalize `04`/`05` only after matched method selection.
+3. **Selected-method table:** compare candidates by edge AUPRC, assembled metrics, ceiling/Oracle/noise
    rows, diagnostics.
-4. **E4 ablation table:** each mechanism and its edge/topology effect; the pruned submitted
+4. **Mechanism ablation table:** each mechanism and its edge/topology effect; the pruned submitted
    model.
-5. **E5 integrity appendix:** all gates and controls.
-6. **E7 downstream-utility result:** load-bearing.
-7. **E6 extension results:** split generalization.
+5. **Integrity appendix:** all gates and controls.
+6. **Downstream-utility result:** load-bearing.
+7. **Extension results:** split generalization.
 8. **Positioning figure:** [positioning.html](../figures/positioning.html), extended with the
    settings-taxonomy axis (transductive / observed-neighborhood inductive / KG-inductive /
    strict zero-edge).

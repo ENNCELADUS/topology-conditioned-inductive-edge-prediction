@@ -90,7 +90,7 @@ The representation family remains open; assembly is evaluated separately.
 
 > **Guardrail:** generated local topology is always **intermediate context**, never the
 > final output. The final task is always **binary edge prediction for queried pairs**.
-> See [`docs/lit-review-plan.md`](docs/lit-review-plan.md) §5.
+> See [`2026-07-07 literature-review plan`](literature/research_reports/2026-07-07-topology-conditioned-inductive-edge-prediction-lit-review-plan.md) §5.
 
 The positioning is a 2×2 map — the target cell is *inductive-from-features* **and**
 *structure-aware* (see [`figures/positioning.html`](figures/positioning.html)):
@@ -208,11 +208,11 @@ docs/
   03-experiment-protocol.md      run/eval contract: baselines, E1–E7, metrics, gates G1–G5
   04-model-proposal.md           historical EgoStitch candidate rationale
   05-egostitch-spec.md           retrieval-grounded arm reproduction contract
-  lit-review-plan.md             review plan, claims K1–K5, terminology guardrail
   results/
     E2-pair-to-topology-gap.md   the motivating result note
     G5-stage1-seed0-20260717.md  binding frozen-s0 screen (`cut`) — retained evidence, retired code
     G5-e2e-stage1-seed0-20260724.md  binding rev-3.0 e2e screen (`cut`)
+literature/research_reports/2026-07-07-topology-conditioned-inductive-edge-prediction-lit-review-plan.md
 figures/
   e2-gap.html                    edge-vs-topology contrast (open in a browser)
   positioning.html               2×2 taxonomy positioning figure
@@ -257,7 +257,7 @@ candidate uses that label before selection. Don't substitute real dataset names 
 | 7 | [`docs/results/G5-stage1-seed0-20260717.md`](docs/results/G5-stage1-seed0-20260717.md) | Historical frozen-s0 `cut` |
 | 8 | [`docs/results/G5-e2e-stage1-seed0-20260724.md`](docs/results/G5-e2e-stage1-seed0-20260724.md) | Historical rev-3.0 `cut` |
 | 9 | [`hpc/README.md`](hpc/README.md) | Target environment and runbook |
-| 10 | [`docs/lit-review-plan.md`](docs/lit-review-plan.md) | Review plan and terminology |
+| 10 | [`2026-07-07 literature-review plan`](literature/research_reports/2026-07-07-topology-conditioned-inductive-edge-prediction-lit-review-plan.md) | Archived review plan and terminology |
 
 When documents conflict, the 2026-08-10 reset governs forward method selection.
 Historical registrations/results retain their original provenance and verdicts.
