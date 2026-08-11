@@ -581,10 +581,25 @@ def _markdown_table(markdown: str, heading: str) -> dict[str, dict[str, str]]:
     return rows
 
 
+@pytest.fixture(scope="module")
+def _shared_seven_arm_result(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[dict[str, Any], str]:
+    inputs = _seven_arm_inputs(tmp_path_factory.mktemp("seven-arm-result"))
+    payload = g5_stage1.build_e2e_arm_summary(
+        liveness_config=_E2E_LIVENESS_CONFIG,
+        **inputs,
+    )
+    return inputs, json.dumps(payload, sort_keys=True)
+
+
 class TestBuildE2EArmSummary:
-    def test_all_seven_arms_reported_and_rerun_is_deterministic(self, tmp_path: Path) -> None:
-        inputs = _seven_arm_inputs(tmp_path)
-        payload = g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
+    def test_all_seven_arms_reported(
+        self,
+        _shared_seven_arm_result: tuple[dict[str, Any], str],
+    ) -> None:
+        _inputs, serialized_payload = _shared_seven_arm_result
+        payload = cast(dict[str, object], json.loads(serialized_payload))
 
         arms = _d(payload["arms"])
         assert set(arms) == set(g5_stage1._ALL_ARMS)
@@ -603,8 +618,15 @@ class TestBuildE2EArmSummary:
         assert set(_d(decomposition["arms"])) == set(g5_stage1._ALL_ARMS)
         full_deltas = _d(_d(_d(decomposition["arms"])["full"])["deltas"])
         assert set(full_deltas) == {"full_minus_f_logit"}
+
+    @pytest.mark.slow
+    def test_rerun_is_deterministic(
+        self,
+        _shared_seven_arm_result: tuple[dict[str, Any], str],
+    ) -> None:
+        inputs, serialized_payload = _shared_seven_arm_result
         rerun = g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
-        assert json.dumps(payload, sort_keys=True) == json.dumps(rerun, sort_keys=True)
+        assert serialized_payload == json.dumps(rerun, sort_keys=True)
 
     def test_rejects_unknown_arm(self, tmp_path: Path) -> None:
         inputs = _seven_arm_inputs(tmp_path)
@@ -637,6 +659,8 @@ class TestBuildE2EArmSummary:
         labels = artifact.label.copy()
         labels[[0, 1]] = labels[[1, 0]]
         _rewrite_e2e_artifact(path, pairs=pairs, labels=labels)
+        paths = _d(inputs["arm_universe_paths"])
+        inputs["arm_universe_paths"] = {"p0": paths["p0"], **paths}
         with pytest.raises(ValueError, match="pair identity/order"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
@@ -647,6 +671,8 @@ class TestBuildE2EArmSummary:
         labels = artifact.label.copy()
         labels[0] = 1 - labels[0]
         _rewrite_e2e_artifact(path, labels=labels)
+        paths = _d(inputs["arm_universe_paths"])
+        inputs["arm_universe_paths"] = {"p0": paths["p0"], **paths}
         with pytest.raises(ValueError, match="candidate labels"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
@@ -674,6 +700,11 @@ class TestBuildE2EArmSummary:
             scaffold_control="shuffle_within_pair_v3",
             scoring_arm="structure_control_6a_v3",
         )
+        paths = _d(inputs["arm_universe_paths"])
+        inputs["arm_universe_paths"] = {
+            "structure_control_6a_v3": paths["structure_control_6a_v3"],
+            **paths,
+        }
         with pytest.raises(ValueError, match="structure_control_6a_v3 checkpoint_id"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
@@ -692,6 +723,10 @@ class TestBuildE2EArmSummary:
             paths["structure_control_6e_v1"],
             paths["structure_control_6a_v3"],
         )
+        inputs["arm_universe_paths"] = {
+            "structure_control_6a_v3": paths["structure_control_6a_v3"],
+            **paths,
+        }
         with pytest.raises(
             ValueError, match="structure_control_6a_v3.*requires scaffold_control.mode"
         ):
@@ -707,6 +742,10 @@ class TestBuildE2EArmSummary:
         inputs = _seven_arm_inputs(tmp_path)
         paths = _d(inputs["arm_universe_paths"])
         paths["structure_control_6a_v3"] = paths["full"]
+        inputs["arm_universe_paths"] = {
+            "structure_control_6a_v3": paths["structure_control_6a_v3"],
+            **paths,
+        }
         with pytest.raises(
             ValueError, match="structure_control_6a_v3.*requires scaffold_control.mode"
         ):
@@ -744,6 +783,7 @@ class TestBuildE2EArmSummary:
         g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 
 
+@pytest.mark.slow
 def test_formal_gate_reports_rev31_telemetry_without_changing_verdict(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -992,6 +1032,8 @@ class TestE2EGateCli:
         )
         inputs["arm_universe_paths"] = dict(inputs["arm_universe_paths"])
         inputs["arm_universe_paths"]["p0"] = wrong_path
+        paths = _d(inputs["arm_universe_paths"])
+        inputs["arm_universe_paths"] = {"p0": paths["p0"], **paths}
         with pytest.raises(ValueError, match="model_family"):
             g5_stage1.build_e2e_arm_summary(liveness_config=_E2E_LIVENESS_CONFIG, **inputs)
 

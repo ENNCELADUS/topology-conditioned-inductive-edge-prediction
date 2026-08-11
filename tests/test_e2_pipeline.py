@@ -220,6 +220,8 @@ def test_detect_visible_gpu_count_uses_cuda_visible_devices(
     assert detect_visible_gpu_count() == 2
 
 
+@pytest.mark.integration
+@pytest.mark.slow
 def test_run_command_timeout_kills_the_whole_process_group(tmp_path: Path) -> None:
     grandchild_pid_path = tmp_path / "grandchild.pid"
     script = (
@@ -333,6 +335,8 @@ def test_run_stage_cleans_up_its_nested_process_group_registry(
     assert not created[-1].exists()
 
 
+@pytest.mark.integration
+@pytest.mark.slow
 def test_run_stage_timeout_reaps_a_nested_run_command_process_group(tmp_path: Path) -> None:
     """A stage-level deadline must also kill a nested `run_command` subprocess.
 

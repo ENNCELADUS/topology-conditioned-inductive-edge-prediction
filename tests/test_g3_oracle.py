@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import pickle
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -162,19 +164,47 @@ def _toy_inputs(tmp_path: Path) -> tuple[Path, Path]:
     return universe_path, data_root
 
 
+@dataclass(frozen=True)
+class _SuccessfulG3Run:
+    universe_path: Path
+    data_root: Path
+    output_dir: Path
+    payload_bytes: bytes
+    results_bytes: bytes
+    tables_text: str
+
+    def payload(self) -> dict[str, Any]:
+        """Return a fresh payload so tests cannot mutate shared fixture state."""
+        return cast(dict[str, Any], pickle.loads(self.payload_bytes))
+
+
+@pytest.fixture(scope="module")
+def successful_g3_run(tmp_path_factory: pytest.TempPathFactory) -> _SuccessfulG3Run:
+    root = tmp_path_factory.mktemp("successful_g3")
+    universe_path, data_root = _toy_inputs(root)
+    output_dir = root / "g3"
+    payload = g3.run_g3_pipeline(
+        universe_path=universe_path,
+        data_root=data_root,
+        strategy="toy",
+        output_dir=output_dir,
+        seed=0,
+        skip_perturbation_check=True,
+    )
+    return _SuccessfulG3Run(
+        universe_path=universe_path,
+        data_root=data_root,
+        output_dir=output_dir,
+        payload_bytes=pickle.dumps(payload),
+        results_bytes=(output_dir / "g3_results.json").read_bytes(),
+        tables_text=(output_dir / "g3_tables.md").read_text(encoding="utf-8"),
+    )
+
+
 class TestRunG3Pipeline:
-    def test_end_to_end_payload_shape(self, tmp_path: Path) -> None:
-        universe_path, data_root = _toy_inputs(tmp_path)
-        out_dir = tmp_path / "g3"
-        payload = g3.run_g3_pipeline(
-            universe_path=universe_path,
-            data_root=data_root,
-            strategy="toy",
-            output_dir=out_dir,
-            seed=0,
-            skip_perturbation_check=True,
-        )
-        assert (out_dir / "g3_results.json").exists()
+    def test_end_to_end_payload_shape(self, successful_g3_run: _SuccessfulG3Run) -> None:
+        payload = successful_g3_run.payload()
+        assert (successful_g3_run.output_dir / "g3_results.json").exists()
         for scorer in ("b0", "oracle_topo", "oracle_blend"):
             assert scorer in _d(payload["regime_table"])
             assert scorer in _d(payload["assembled"])
@@ -192,16 +222,10 @@ class TestRunG3Pipeline:
         assert _d(_d(payload["metadata"])["perturbation_check"])["skipped"] is True
         assert 0.0 <= cast(float, assembled["b0"]["graph_similarity"]) <= 1.0
 
-    def test_oracle_arms_assemble_no_self_loops_and_exact_edge_count(self, tmp_path: Path) -> None:
-        universe_path, data_root = _toy_inputs(tmp_path)
-        payload = g3.run_g3_pipeline(
-            universe_path=universe_path,
-            data_root=data_root,
-            strategy="toy",
-            output_dir=tmp_path / "g3",
-            seed=0,
-            skip_perturbation_check=True,
-        )
+    def test_oracle_arms_assemble_no_self_loops_and_exact_edge_count(
+        self, successful_g3_run: _SuccessfulG3Run
+    ) -> None:
+        payload = successful_g3_run.payload()
         assembled = cast(dict[str, dict[str, object]], payload["assembled"])
         for arm in ("oracle_topo", "oracle_blend"):
             assert assembled[arm]["self_loops_pred"] == 0
@@ -224,20 +248,14 @@ class TestRunG3Pipeline:
         actual = g3.oracle_topo_scores(g_simple, universe)
         np.testing.assert_allclose(actual, expected)
 
-    def test_b0_row_reproduces_g1_pipeline(self, tmp_path: Path) -> None:
-        universe_path, data_root = _toy_inputs(tmp_path)
-        g3_payload = g3.run_g3_pipeline(
-            universe_path=universe_path,
-            data_root=data_root,
-            strategy="toy",
-            output_dir=tmp_path / "g3",
-            seed=0,
-            skip_perturbation_check=True,
-        )
+    def test_b0_row_reproduces_g1_pipeline(
+        self, tmp_path: Path, successful_g3_run: _SuccessfulG3Run
+    ) -> None:
+        g3_payload = successful_g3_run.payload()
         g1_payload = run_g1_pipeline(
-            universe_path=universe_path,
+            universe_path=successful_g3_run.universe_path,
             alt_universe_path=None,
-            data_root=data_root,
+            data_root=successful_g3_run.data_root,
             strategy="toy",
             output_dir=tmp_path / "g1",
             seed=0,
@@ -246,20 +264,19 @@ class TestRunG3Pipeline:
         assert _d(g3_payload["assembled"])["b0"] == _d(g1_payload["assembled"])["b0"]
         assert _d(g3_payload["regime_table"])["b0"] == _d(g1_payload["regime_table"])["b0"]
 
-    def test_byte_identical_reruns(self, tmp_path: Path) -> None:
-        universe_path, data_root = _toy_inputs(tmp_path)
-        out_a = tmp_path / "a"
-        out_b = tmp_path / "b"
-        for out in (out_a, out_b):
-            g3.run_g3_pipeline(
-                universe_path=universe_path,
-                data_root=data_root,
-                strategy="toy",
-                output_dir=out,
-                seed=0,
-                skip_perturbation_check=True,
-            )
-        assert (out_a / "g3_results.json").read_bytes() == (out_b / "g3_results.json").read_bytes()
+    def test_byte_identical_reruns(
+        self, tmp_path: Path, successful_g3_run: _SuccessfulG3Run
+    ) -> None:
+        out_dir = tmp_path / "rerun"
+        g3.run_g3_pipeline(
+            universe_path=successful_g3_run.universe_path,
+            data_root=successful_g3_run.data_root,
+            strategy="toy",
+            output_dir=out_dir,
+            seed=0,
+            skip_perturbation_check=True,
+        )
+        assert successful_g3_run.results_bytes == (out_dir / "g3_results.json").read_bytes()
 
     def test_validation_rejects_non_candidate_artifact(self, tmp_path: Path) -> None:
         g = _make_reference_graph()
@@ -290,16 +307,8 @@ class TestRunG3Pipeline:
 
 
 class TestRenderTables:
-    def test_sections_present(self, tmp_path: Path) -> None:
-        universe_path, data_root = _toy_inputs(tmp_path)
-        payload = g3.run_g3_pipeline(
-            universe_path=universe_path,
-            data_root=data_root,
-            strategy="toy",
-            output_dir=tmp_path / "g3",
-            seed=0,
-            skip_perturbation_check=True,
-        )
+    def test_sections_present(self, successful_g3_run: _SuccessfulG3Run) -> None:
+        payload = successful_g3_run.payload()
         text = g3.render_tables_markdown(payload)
         for heading in (
             "# G3 Oracle gate tables",
@@ -313,7 +322,7 @@ class TestRenderTables:
         for scorer in ("b0", "oracle_topo", "oracle_blend"):
             assert scorer in text
         # tables file is written by the pipeline itself
-        assert (tmp_path / "g3" / "g3_tables.md").read_text(encoding="utf-8") == text
+        assert successful_g3_run.tables_text == text
 
 
 class TestCli:

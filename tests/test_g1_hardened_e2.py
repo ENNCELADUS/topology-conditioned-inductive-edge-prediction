@@ -6,7 +6,7 @@ import json
 import math
 import pickle
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import networkx as nx
 import numpy as np
@@ -210,6 +210,41 @@ def _write_feature_root(tmp_path: Path) -> Path:
 def _d(x: object) -> dict[str, Any]:
     """Cast a JSON-payload value known to be a dict, for concise test assertions."""
     return cast(dict[str, Any], x)
+
+
+class _SuccessfulToyPipelineResult(NamedTuple):
+    returned_json: str
+    written_json: str
+
+
+@pytest.fixture(scope="module")
+def successful_toy_g1_pipeline(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> _SuccessfulToyPipelineResult:
+    tmp_path = tmp_path_factory.mktemp("successful_toy_g1_pipeline")
+    g = _make_reference_graph()
+    buckets = _small_buckets(_NODES, size=5, n_samples=4, seed=12)
+    data_root = _write_benchmark(tmp_path, "toy", g, buckets)
+    output_dir = tmp_path / "out"
+    payload = g1.run_g1_pipeline(
+        universe_path=_reference_universe_path(tmp_path),
+        alt_universe_path=None,
+        data_root=data_root,
+        strategy="toy",
+        output_dir=output_dir,
+        seed=0,
+        skip_perturbation_check=True,
+    )
+    return _SuccessfulToyPipelineResult(
+        returned_json=json.dumps(payload),
+        written_json=(output_dir / "g1_results.json").read_text(),
+    )
+
+
+def _deserialize_successful_toy_pipeline(
+    result: _SuccessfulToyPipelineResult,
+) -> dict[str, object]:
+    return cast(dict[str, object], json.loads(result.returned_json))
 
 
 # --------------------------------------------------------------------------- validation
@@ -1009,42 +1044,20 @@ class TestPerturbationDiagnostic:
         assert 0.0 <= cast(float, _d(assembled["b0"])["graph_similarity"]) <= 1.0
         assert 0.0 <= cast(float, _d(assembled["pa_null"])["graph_similarity"]) <= 1.0
 
-    def test_skip_perturbation_check_keeps_official_metrics(self, tmp_path: Path) -> None:
-        g = _make_reference_graph()
-        buckets = _small_buckets(_NODES, size=5, n_samples=3, seed=2)
-        data_root = _write_benchmark(tmp_path, "toy", g, buckets)
-        universe_path = _reference_universe_path(tmp_path)
-
-        payload = g1.run_g1_pipeline(
-            universe_path=universe_path,
-            alt_universe_path=None,
-            data_root=data_root,
-            strategy="toy",
-            output_dir=tmp_path / "out",
-            seed=0,
-            skip_perturbation_check=True,
-        )
+    def test_skip_perturbation_check_keeps_official_metrics(
+        self, successful_toy_g1_pipeline: _SuccessfulToyPipelineResult
+    ) -> None:
+        payload = _deserialize_successful_toy_pipeline(successful_toy_g1_pipeline)
         metadata = _d(payload["metadata"])
         assert _d(metadata["perturbation_check"])["skipped"] is True
         assert 0.0 <= cast(float, _d(_d(payload["assembled"])["b0"])["graph_similarity"]) <= 1.0
 
 
 class TestThresholdPolicyMetadata:
-    def test_mentions_non_self_pair_convention(self, tmp_path: Path) -> None:
-        g = _make_reference_graph()
-        buckets = _small_buckets(_NODES, size=5, n_samples=3, seed=8)
-        data_root = _write_benchmark(tmp_path, "toy", g, buckets)
-        universe_path = _reference_universe_path(tmp_path)
-
-        payload = g1.run_g1_pipeline(
-            universe_path=universe_path,
-            alt_universe_path=None,
-            data_root=data_root,
-            strategy="toy",
-            output_dir=tmp_path / "out",
-            seed=0,
-            skip_perturbation_check=True,
-        )
+    def test_mentions_non_self_pair_convention(
+        self, successful_toy_g1_pipeline: _SuccessfulToyPipelineResult
+    ) -> None:
+        payload = _deserialize_successful_toy_pipeline(successful_toy_g1_pipeline)
         policy = cast(str, _d(payload["metadata"])["threshold_policy"])
         assert "non-self-pair rows" in policy
         assert "simple reference edge count" in policy
@@ -1053,24 +1066,11 @@ class TestThresholdPolicyMetadata:
 
 class TestSelfPairEdgeMetricsInPipeline:
     def test_present_per_scorer_with_exact_n_and_null_reason_on_toy_universe(
-        self, tmp_path: Path
+        self, successful_toy_g1_pipeline: _SuccessfulToyPipelineResult
     ) -> None:
         # The 8-node toy fixture's 5 positive edges never include a self-pair, so
         # all 8 self-pairs (n1,n1)..(n8,n8) are label-0 -- single-class -> null.
-        g = _make_reference_graph()
-        buckets = _small_buckets(_NODES, size=5, n_samples=3, seed=6)
-        data_root = _write_benchmark(tmp_path, "toy", g, buckets)
-        universe_path = _reference_universe_path(tmp_path)
-
-        payload = g1.run_g1_pipeline(
-            universe_path=universe_path,
-            alt_universe_path=None,
-            data_root=data_root,
-            strategy="toy",
-            output_dir=tmp_path / "out",
-            seed=0,
-            skip_perturbation_check=True,
-        )
+        payload = _deserialize_successful_toy_pipeline(successful_toy_g1_pipeline)
         self_pair = _d(payload["self_pair_edge_metrics"])
         assert self_pair["b0_alt"] is None
         for scorer in ("b0", "pa_null"):
@@ -1082,21 +1082,10 @@ class TestSelfPairEdgeMetricsInPipeline:
             assert "single-class" in cast(str, entry["reason"])
 
 
-def test_pipeline_exposes_only_normalized_mmd_schema(tmp_path: Path) -> None:
-    g = _make_reference_graph()
-    buckets = _small_buckets(_NODES, size=5, n_samples=4, seed=12)
-    data_root = _write_benchmark(tmp_path, "toy", g, buckets)
-    universe_path = _reference_universe_path(tmp_path)
-    output_dir = tmp_path / "out"
-    payload = g1.run_g1_pipeline(
-        universe_path=universe_path,
-        alt_universe_path=None,
-        data_root=data_root,
-        strategy="toy",
-        output_dir=output_dir,
-        seed=0,
-        skip_perturbation_check=True,
-    )
+def test_pipeline_exposes_only_normalized_mmd_schema(
+    successful_toy_g1_pipeline: _SuccessfulToyPipelineResult,
+) -> None:
+    payload = _deserialize_successful_toy_pipeline(successful_toy_g1_pipeline)
     row = _d(_d(payload["assembled"])["b0"])
     assert set(_d(row["mmd_ratio"])) == set(STATISTICS)
     assert set(_d(row["raw_mmd2"])) == set(STATISTICS)
@@ -1116,9 +1105,7 @@ def test_pipeline_exposes_only_normalized_mmd_schema(tmp_path: Path) -> None:
     assert "composite" not in metadata
     assert _d(metadata["graph_similarity"])["self_loops"] == "retained"
     assert _d(metadata["relative_density"])["self_loops"] == "retained"
-    written_payload = cast(
-        dict[str, object], json.loads((output_dir / "g1_results.json").read_text())
-    )
+    written_payload = cast(dict[str, object], json.loads(successful_toy_g1_pipeline.written_json))
     assert "tau" not in written_payload
     assert "composite" not in _d(written_payload["metadata"])
     assert metadata["metric_normalization"] == "ratio_of_size_mean_mmd2"

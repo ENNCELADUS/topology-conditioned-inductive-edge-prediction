@@ -105,6 +105,18 @@ def _run(tmp_path: Path) -> dict[str, object]:
     )
 
 
+@pytest.fixture(scope="module")
+def _successful_result_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    tmp_path = tmp_path_factory.mktemp("b0_cal_success")
+    _run(tmp_path)
+    return tmp_path / "b0cal" / "b0cal_results.json"
+
+
+@pytest.fixture
+def _successful_payload(_successful_result_path: Path) -> dict[str, object]:
+    return cast(dict[str, object], json.loads(_successful_result_path.read_text()))
+
+
 # --------------------------------------------------------------------------- validation
 
 
@@ -192,8 +204,8 @@ class TestRunB0CalPipeline:
         assert payload["gap_closure"] is None
         assert payload["decision"] is None
 
-    def test_cal_density_reproduces_b0_row(self, tmp_path: Path) -> None:
-        payload = _run(tmp_path)
+    def test_cal_density_reproduces_b0_row(self, _successful_payload: dict[str, object]) -> None:
+        payload = _successful_payload
         assembled = cast(dict[str, dict[str, object]], payload["assembled"])
         notes = _d(_d(payload["metadata"])["notes"])
         assert notes["b0_cal_density_identical_edge_set"] is True
@@ -203,16 +215,10 @@ class TestRunB0CalPipeline:
             assembled["b0_cal_density"]["graph_similarity"] == assembled["b0"]["graph_similarity"]
         )
 
-    def test_degseq_quota_sum_matches_reference_degree_sum(self, tmp_path: Path) -> None:
-        universe_path, val_path, data_root = _toy_inputs(tmp_path)
-        payload = b0_cal.run_b0_cal_pipeline(
-            universe_path=universe_path,
-            val_scores_path=val_path,
-            data_root=data_root,
-            strategy="toy",
-            output_dir=tmp_path / "b0cal",
-            skip_perturbation_check=True,
-        )
+    def test_degseq_quota_sum_matches_reference_degree_sum(
+        self, _successful_payload: dict[str, object]
+    ) -> None:
+        payload = _successful_payload
         quota_stats = _d(payload["quota_stats"])
         # Reference simple graph has 5 edges -> degree sum 10 -> target 5.
         assert quota_stats["target_edges"] == len(_POSITIVE_EDGES)
@@ -285,8 +291,10 @@ class TestRunB0CalPipeline:
         ).read_bytes()
         assert (out_a / "b0cal_tables.md").read_bytes() == (out_b / "b0cal_tables.md").read_bytes()
 
-    def test_calibration_improves_or_preserves_val_nll(self, tmp_path: Path) -> None:
-        payload = _run(tmp_path)
+    def test_calibration_improves_or_preserves_val_nll(
+        self, _successful_payload: dict[str, object]
+    ) -> None:
+        payload = _successful_payload
         temp = _d(_d(payload["calibration"])["temperature"])
         assert temp["val_nll_after"] <= temp["val_nll_before"] + 1e-12
 

@@ -38,7 +38,7 @@ selected method. Every piece of writing must explain how its context helps decid
 Local (macOS, CPU only): use `.venv/bin/python -m …` — `rtk` garbles `uv run` output.
 
 ```bash
-.venv/bin/python -m pytest                                          # full suite (xdist, loadfile)
+.venv/bin/python -m pytest                                          # full; add -m "not slow and not integration" for fast local
 .venv/bin/python -m pytest tests/test_score_universe.py -n0 -k density   # one file / one test
 .venv/bin/python -m ruff check src tests && .venv/bin/python -m ruff format src tests
 .venv/bin/python -m mypy src tests                                  # strict

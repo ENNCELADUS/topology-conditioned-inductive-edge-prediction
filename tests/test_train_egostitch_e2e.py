@@ -2206,6 +2206,8 @@ class _ArchivedV1TrainLoopE2E:
             assert validation.active_logits.shape == data.val_labels.shape
 
 
+@pytest.mark.integration
+@pytest.mark.slow
 def test_phase_a_end_and_epoch_end_are_distinct_validation_events(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

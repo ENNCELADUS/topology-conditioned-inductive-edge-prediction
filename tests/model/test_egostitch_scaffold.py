@@ -310,6 +310,8 @@ def test_rewire_checkerboard_vectorizes_cell_disjoint_draws() -> None:
     assert scatter_events[0].input_shapes == [[256], [], [224], [224]]
 
 
+@pytest.mark.integration
+@pytest.mark.slow
 def test_scaffold_controls_are_cross_process_deterministic_and_pair_keyed() -> None:
     code = """
 import json
