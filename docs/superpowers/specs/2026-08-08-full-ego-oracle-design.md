@@ -57,7 +57,7 @@ closure-edge synthesis.
 
 The five input channels mark source endpoint, destination endpoint, source
 neighbor, destination neighbor, and valid-node presence. Ground-truth node IDs
-are used only to construct and deduplicate `H_q`; no identity, protein ID, or
+are used only to construct and deduplicate `H_q`; no identity, node ID, or
 oracle label is passed as an encoder feature. `grit_gmt` encodes the adjacency
 and these role features; `b0_v31` combines the pooled topology representation
 with the ordinary pair features and emits one edge logit.

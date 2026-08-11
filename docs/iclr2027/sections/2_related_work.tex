@@ -1,215 +1,82 @@
 \section{Related Work}
 \label{sec:related}
 
-\paragraph{Interaction prediction from intrinsic protein features.}
-The school closest to our task predicts interaction from the two proteins alone,
-with no interaction graph as input, and divides into four mechanisms.
-\emph{Pooled pair scorers} embed each protein independently with a pLM and
-combine the two vectors through concatenation, difference, or a small interaction
-head; MAPE-PPI builds per-residue microenvironment codebooks before pooling
-\citep{wu2024mapeppi}, and uncertainty-aware and explainability-oriented variants
-follow the same template. \emph{Jointly encoded paired-sequence models} instead
-attend across both chains at once, giving the encoder access to cross-chain
-evidence that concatenation cannot represent
-\citep{liu2025plminteract,ullanat2026language}. \emph{Structure- and
-interface-based scorers} use resolved or predicted three-dimensional structure of
-the queried pair, culminating in proteome-scale screens that combine structural
-modeling with sequence signal \citep{zhang2025humanproteome}.
-\emph{Retrieval and factorization methods} attack the quadratic cost of
-proteome-scale scoring directly: RaftPPI reports that screening the human
-proteome with a paired-sequence model costs $148.47$ A100 GPU-days, and reduces
-top-$20\%$ retrieval over ${\sim}200$ million pairs to minutes through
-residue-level factorization \citep{zhao2026raftppi}. A fifth line addresses
-cross-species generalization through orthologue-informed training
-\citep{szymborski2024intrepppid}. All five share the property our thesis targets:
-each pair is scored independently, and no mechanism in any of them makes the
-decision for $(u,v)$ depend on the predicted structure around $u$ and $v$.
-
-Two works partially escape this characterization and deserve explicit
-differentiation. DNE learns protein embeddings directly from PPI network
-adjacency and evaluates both link prediction and functional-module recovery,
-making it genuinely topology-conditioned \citep{yan2024dne}; SCMPPI similarly
-injects precomputed network embeddings from a known interactome as an auxiliary
-modality \citep{xu2026scmppi}. Both are \emph{transductive}: every queried
-protein must already be a node in the training-time graph, so neither can score a
-pair in which an endpoint was never observed. Removing exactly that requirement
-while keeping topology inside the decision is what our formulation provides.
-
-\paragraph{Benchmarks, leakage, and the shift from pairs to graphs.}
-A now-substantial critical literature shows that reported PPI accuracies have
-been driven by evaluation protocol rather than by modeling. Random or
-identifier-based splits leak the large majority of test cases back into training,
-and even sequence-similarity splitting---the field's standard
-mitigation---leaves substantial residual leakage \citep{bushuiev2024leakage};
-leakage can additionally enter through the \emph{frozen encoder}, since pLMs
-pretrained on proteins that later appear in the PPI test set inflate downstream
-MCC by $9.14\%$ with the downstream split held identically clean
-\citep{szymborski2026flaw}. \citet{bernett2024cracking} show that degree alone
-reproduces most published accuracies, and a leakage-free re-evaluation finds deep
-sequence models plateauing near $0.65$ accuracy \citep{reim2025plateau}. Negative
-sampling is a second structural problem: essentially no verified non-interactions
-exist at scale---Negatome lists $2{,}424$ human non-interactions in
-total---which forces reliance on sampling heuristics, and the framing of PPI
-prediction as positive-unlabeled rather than binary classification predates the
-deep learning era \citep{kilic2012pu}. Topology-driven negative sampling
-constructs roughly three million hard negatives from $L_3$-path structure and
-demonstrates that predictors performing exceptionally well transductively
-collapse under genuinely inductive, unseen-node evaluation
-\citep{chatterjee2025tppni}. These findings jointly justify the strict
-node-disjoint inductive protocol we adopt.
-
-The most direct antecedent of our evaluation is PRING, which reframes PPI
-prediction from pairs to graphs and evaluates the \emph{assembled} prediction
-with five topology metrics reported together: graph similarity (GS, edge-set Dice
-against the true graph), relative density (RD, target $\rightarrow 1$), and MMD
-ratios over the degree, clustering-coefficient, and Laplacian-spectral
-distributions \citep{zheng2025pring}. PRING's central finding---that no tested
-baseline exceeds GS $0.5$ despite strong pairwise scores---is the empirical
-statement of the gap our method addresses, and its five-metric reporting
-convention is the one we adopt. Relatedly, \citet{lannelongue2024pitfalls} argue
-that a single global AUPRC is uninterpretable without the degree composition of
-the evaluation set, motivating topology-stratified rather than aggregate
-reporting.
-
-\paragraph{Structure-aware link prediction.}
-The graph learning literature has established both that topology conditioning is
-decisive for link prediction and \emph{how} to do it, provided a graph is given.
-SEAL frames link prediction as classification over an extracted enclosing
-subgraph \citep{zhang2018seal}; distance encoding and position-aware graph neural
-networks supply structural features that plain message passing cannot compute
-\citep{li2020distance,you2019pgnn}; and the labeling trick establishes the
-theoretical anchor that graph neural networks computing node representations
-\emph{independently} cannot distinguish structurally distinct node pairs, so
-target-conditioned representations are necessary as well as sufficient
-\citep{zhang2021labeling}. Efficiency-oriented successors---Neo-GNN, BUDDY,
-NCN/NCNC, and LPFormer---retain explicit neighborhood-overlap modeling while
-avoiding per-pair subgraph extraction
-\citep{yun2021neognn,chamberlain2023buddy,wang2024ncn,shomer2024lpformer}. Two
-evaluation critiques bound what these gains mean: HeaRT shows that standard
-benchmarks use trivially easy, non-personalized negatives, and hardening them
-substantially reranks methods \citep{li2023heart}, while
-\citet{aiyappa2024degree} show that standard positive sampling is degree-biased
-enough that a degree-only null model (AUC ${\approx}0.83$) outperforms more than
-half of $26$ published methods across $90$ graphs. Every method in this family,
-however, reads structure from an observed graph containing the query nodes. That
-assumption is exactly what an unseen protein violates, and it is why this
-literature---despite being the source of the ``topology matters'' evidence we
-rely on---cannot be applied to our task without changing the protocol.
+\paragraph{Observed-topology link prediction.}
+Graph-native link predictors condition on paths, enclosing subgraphs, distance
+labels, or neighborhood overlap. SEAL extracts a query-centered subgraph
+\citep{zhang2018seal}; distance encoding and the labeling trick explain why
+target-conditioned representations can distinguish pairs that independently
+computed node embeddings cannot \citep{li2020distance,zhang2021labeling}; and
+Neo-GNN, BUDDY, NCN/NCNC, and LPFormer make related structural signals scalable
+\citep{yun2021neognn,chamberlain2023buddy,wang2024ncn,shomer2024lpformer}.
+These methods establish that topology is useful, but they read it from a graph
+that already contains the query endpoints.
 
 \paragraph{Inductive and cold-start link prediction.}
-A smaller literature relaxes the observed-graph assumption. GraphSAGE established
-inductive node representations via neighborhood sampling and aggregation
-\citep{hamilton2017graphsage}, and Graph2Gauss ranks inductive embeddings from
-attributes \citep{bojchevski2018graph2gauss}. GLNN and Cold Brew distill a graph
-neural network's structural knowledge into a graph-free student so that inference
-needs no neighborhood at all \citep{zhang2022glnn,zheng2022coldbrew}, and NodeDup
-augments low-degree nodes for cold-start link prediction \citep{guo2025nodedup}.
-The three closest works to our setting each retain an assumption we cannot make.
-DEAL predicts links for nodes carrying only attribute information
-\citep{hao2020deal}, but always scores the new node against a counterpart whose
-structural embedding was trained on the observed graph---never both endpoints
-unseen. New-node prediction predicts all links of an isolated node
-\citep{zanardini2024newnode}, but explicitly against a fully observed training
-graph from which candidate partners are drawn. \citet{chatterjee2023disentangling}
-do formalize the fully-mutually-unseen case and quantify the collapse of
-structural predictors within it, but their remedy abandons topology conditioning
-altogether in favor of a pure attribute-pair scorer---the topology-blind
-alternative our thesis argues against. The inductive knowledge graph lineage
-achieves entity-inductive reasoning through relational structure
-\citep{zhang2020igmc,teru2020grail,zhu2021nbfnet,galkin2024ultra}, but relies on
-relation types and an observed relational neighborhood connecting the query pair,
-neither of which exists for two proteins with no edges.
+GraphSAGE introduced transferable neighborhood aggregation
+\citep{hamilton2017graphsage}, while Graph2Gauss maps attributes to inductive
+embeddings \citep{bojchevski2018graph2gauss}. Graph-free students can distill a
+graph model into an attribute-only predictor
+\citep{zhang2022glnn,zheng2022coldbrew}, and cold-start methods can attach a new
+node to an observed graph. These settings differ from the mutually unseen case:
+our endpoints have no observed incident edges and no inference graph is supplied.
+Direct endpoint-feature scorers satisfy that restriction, but generally score
+each pair independently.
 
-\paragraph{Graph structure learning and latent graph inference.}
-Graph structure learning (GSL) learns a graph rather than accepting one, and is
-therefore the closest mechanism precedent for our scaffold generator. Latent
-adjacency inference optimizes a discrete or continuous structure jointly with a
-downstream graph neural network---LDS via bilevel optimization over Bernoulli
-edge variables \citep{franceschi2019lds}, IDGL by alternating metric-learned
-refinement and embedding updates \citep{chen2020idgl}, and NodeFormer and DGM by
-making structure differentiable and scalable
-\citep{wu2022nodeformer,kazi2023dgm}. Self-supervised variants remove the label
-dependence \citep{liu2022sublime}, and a robustness-oriented branch purifies an
-observed adjacency against noise or attack
-\citep{jin2020prognn,zhang2020gnnguard}. Masked graph autoencoding forms a
-parallel line in which structure itself is the pretraining signal, from VGAE
-\citep{kipf2016vgae} through GraphMAE and MaskGAE
-\citep{hou2022graphmae,li2023maskgae}. Surveys map this space
-\citep{zhu2021gslsurvey}.
+\paragraph{Training-time topology transfer.}
+Attribute-to-embedding mappings and teacher--student objectives use a training
+graph as supervision while keeping inference graph-free. This family is the
+closest protocol precedent because structural information can be absorbed into
+parameters without exposing test topology. Our question is narrower: whether a
+query-conditioned topology representation improves both the binary decision and
+the graph assembled from all such decisions.
 
-None of this family solves our task, for four separable reasons. (i) The
-robustness branch presupposes a given graph containing the query nodes and
-refines it; this is our post-hoc denoising baseline, not a generator. (ii) The
-latent-adjacency branch optimizes structure indexed by node identity over one
-closed node set, and that structure is never recomputed from frozen features for
-a node the optimization never saw. (iii) The downstream task is almost always
-node classification, so the generated structure is validated as a message-passing
-substrate and never as evidence for an $\mathrm{edge}(u,v)$ decision. (iv) The
-masked-autoencoding branch masks edges of nodes already inside the training
-adjacency, which is transductive link completion rather than induction to unseen
-nodes.
+\paragraph{Graph structure learning and latent inference.}
+Graph structure learning estimates an adjacency for a downstream task. LDS uses
+bilevel optimization over edge variables \citep{franceschi2019lds}; IDGL
+alternates metric learning and graph refinement \citep{chen2020idgl}; and
+NodeFormer and DGM provide scalable differentiable construction
+\citep{wu2022nodeformer,kazi2023dgm}. Most work optimizes one closed node set or
+refines an observed graph. It does not infer query-local context from two unseen
+endpoint features for an unchanged binary edge target.
 
 \paragraph{Generated structure as intermediate context.}
-Our scaffold generator draws on graph generation for machinery, not for the task.
-Autoregressive generators \citep{you2018graphrnn} and discrete diffusion models
-\citep{vignac2023digress} supply conditional sparse-adjacency construction, and
-\citet{chanpuriya2021edge} give the formal reason a generator is needed at all
-rather than a factorized score: any edge-independent model provably cannot
-achieve realistic triangle and clustering density without approaching
-memorization, so clustering structure cannot emerge from independent pairwise
-probabilities. Neural relational inference is the cleanest cross-domain statement
-of latent structure inferred to serve a downstream predictive task
-\citep{kipf2018nri}. Outside graphs, the pattern of a generative module supplying
-intermediate context to a discriminative decision is well established:
-hallucinated examples for low-shot recognition \citep{wang2018lowshot}, generated
-features for zero-shot classification \citep{xian2018fgn,xian2019fvaegan}, and
-CVAE-generated neighbor \emph{features} conditioned on a center node's own
-features, resampled each iteration and never themselves scored
-\citep{liu2022localaug}. We instantiate that pattern for topology rather than
-features.
+Autoregressive and diffusion graph models provide machinery for constructing
+sparse adjacency \citep{you2018graphrnn,vignac2023digress}. Neural relational
+inference demonstrates the broader pattern of latent structure serving a
+downstream prediction \citep{kipf2018nri}. In our setting, generation is only one
+candidate representation family. Any inferred structure must remain upstream of
+the edge classifier and must not introduce node identities or target-graph
+observations unavailable under the endpoint-only contract.
 
-Two contrasts sharpen the boundary. Latent graph diffusion collapses
-classification into conditional generation by diffusing toward the label
-\citep{zhou2024latentgraphdiffusion}, the opposite of our design, in which the
-generative step is strictly upstream of an unchanged binary decision. FLEX is the
-closest published mechanism: it generates a counterfactual subgraph conditioned
-on a queried link to improve out-of-distribution link prediction
-\citep{revolinsky2025flex}. It differs on two axes that matter---its generated
-subgraph is a \emph{training-time} augmentation rather than inference-time
-per-query context, and its nodes remain exposed to observed graph structure
-rather than being feature-only and unseen. Finally, the graph generation
-evaluation literature grounds our reporting rules: per-statistic MMD over degree,
-clustering, and orbit descriptors is the standard realism battery, but
-\citet{thompson2022evaluation} show it is measurably blind to mode collapse and
-sensitive to unstandardized kernel bandwidth, and \citet{obray2022evaluation}
-formalize expressivity, robustness, and efficiency as the desiderata any such
-metric must meet. We therefore report GS, RD, and the three MMD ratios separately
-and never aggregate them into a single score.
+\paragraph{Assembled-graph evaluation.}
+Graph-generation evaluation commonly compares degree, clustering, and spectral
+descriptors. Prior work shows that such statistics have distinct sensitivities
+and should not be collapsed into one score
+\citep{thompson2022evaluation,obray2022evaluation}. We accordingly report GS,
+RD, and three MMD ratios separately, together with edge-level discrimination and
+calibration metrics.
 
 \paragraph{Positioning.}
-Table~\ref{tab:positioning} places these families along the five axes that define
-our task. The empty cell is neither ``better pairwise scoring'' nor ``graph
-generation'': it is edge prediction for unseen nodes, conditioned on local
-topology constructed without the target graph.
+Table~\ref{tab:positioning} separates methods by inference-time topology source
+and output contract. The target setting is edge prediction for two unseen nodes,
+conditioned on topology inferred without access to the target graph.
 
 \begin{table}[t]
-\caption{Positioning of related families along the axes that define
-topology-conditioned inductive edge prediction.}
+\caption{Positioning of related families.}
 \label{tab:positioning}
 \begin{center}
 \small
 \begin{tabular}{lccccc}
 \toprule
-\textbf{Family} & \textbf{Inductive} & \textbf{Needs target} & \textbf{Topology-} & \textbf{Output is} & \textbf{Graph} \\
- & \textbf{to unseen} & \textbf{graph at} & \textbf{conditioned} & \textbf{an edge} & \textbf{metrics} \\
- & \textbf{nodes} & \textbf{inference} & & \textbf{label} & \textbf{reported} \\
+\textbf{Family} & \textbf{Unseen} & \textbf{Needs target} & \textbf{Topology-} & \textbf{Edge} & \textbf{Graph} \\
+ & \textbf{nodes} & \textbf{graph} & \textbf{conditioned} & \textbf{output} & \textbf{metrics} \\
 \midrule
-Intrinsic-feature PPI scorers        & yes     & no         & no      & yes         & no \\
-Network-embedding PPI models         & no      & yes        & yes     & yes         & partial \\
-Structure-aware link prediction      & no      & yes        & yes     & yes         & no \\
-Cold-start / attribute-only LP       & partial & usually    & partial & yes         & no \\
-Graph structure learning             & no      & usually    & yes     & no          & no \\
-Graph generation                     & ---     & no         & yes     & no          & yes \\
+Endpoint-feature scorers             & yes     & no      & no      & yes & no \\
+Observed-topology predictors         & partial & yes     & yes     & yes & no \\
+Training-time topology transfer      & yes     & no      & partial & yes & no \\
+Graph structure learning             & varies  & usually & yes     & no  & no \\
+Graph generation                     & ---     & no      & ---     & no  & yes \\
 \midrule
 \textbf{This work}                   & \textbf{yes} & \textbf{no} & \textbf{yes} & \textbf{yes} & \textbf{yes} \\
 \bottomrule

@@ -77,7 +77,7 @@ Components:
   the edge prediction task only; graph topology is evaluated after assembling predictions.
 - **Splits and integrity:** training and test nodes are disjoint. Any near-duplicate or overlap
   filter used by the benchmark must be reported with the run. The same complete train-side
-  positive interactions supply both structural topology and edge-loss classification; the
+  positive edges supply both structural topology and edge-loss classification; the
   topology projection alone removes self-pairs (spec §§6, 9.3).
 - **Edge-level metrics:** AUROC, AUPRC, accuracy, sensitivity, specificity, precision, recall, F1,
   MCC at the selected operating point; calibration (ECE, Brier) on averaged probabilities.
@@ -148,7 +148,7 @@ Components:
 | **Oracle** | Observed-graph upper bound | Uses true held-out graph neighborhoods at evaluation time (pinned instantiation: §5.0 G3) | Headroom; violates the inductive protocol; **run first (gate G3)** |
 
 All fair baselines share frozen features, splits, query sets, complete training
-interactions, negative sampling, and an equal HPO budget fixed before held-out metrics open.
+edges, negative sampling, and an equal HPO budget fixed before held-out metrics open.
 
 ---
 
@@ -303,7 +303,7 @@ rule).
 - **Node-disjoint gate:** train/test nodes must be disjoint.
 - **Near-duplicate gate:** report benchmark-provided duplicate filtering or run a repository-local
   nearest-neighbor overlap check.
-- **Shared-interaction gate:** topology and classification cover the same train positives;
+- **Shared-edge gate:** topology and classification cover the same train positives;
   the topology projection alone removes self-pairs, and explicit leave-one-out corrections
   are verified for every in-batch positive pair.
 - **B0 provenance gate:** the frozen scorer must never have seen validation/test pairs.
@@ -560,7 +560,7 @@ rule).
    `pair_topology` identical to `full`, so that arm is retired; `cosine_pool` is
    also retired. Runs execute directly without a registration or plan-identity
    gate, and checkpoints/score artifacts carry no training-data identity field
-   (spec §12, 2026-08-03) — keeping shared-interaction runs apart from older
+   (spec §12, 2026-08-03) — keeping shared-edge runs apart from older
    80/20-partition ones is an owner-side responsibility, not a gate.
 
 ### 5.1 Forward priority order

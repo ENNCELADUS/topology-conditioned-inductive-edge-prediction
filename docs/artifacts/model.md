@@ -41,7 +41,7 @@
 
 **为什么这样设计？**
 
-两个节点是否连接，可能只取决于少数关键 token。过早做平均会丢失这些局部信号，因此 raw-token branch 一直保留到后面的 pair interaction 和 readout。
+两个节点是否连接，可能只取决于少数关键 token。过早做平均会丢失这些局部信号，因此 raw-token branch 一直保留到后面的 pair cross-attention 和 readout。
 
 ### 1.2 Mean-pooled node embedding
 
@@ -465,7 +465,7 @@ Generator 也不是在完全没有参考节点的世界中凭空创造 topology�
 
 ## 19. 一段可直接用于 oral presentation 的总结
 
-> 对于一对未见节点，EgoStitch 同时保留 endpoint raw-token interaction 和 generated local context。模型先从同侧 feature universe 检索相似节点作为 grounding，再为每个 endpoint 生成 16 个 compressed neighbor slots。两侧 slots 经过软对齐，被拼成一张包含 star、intra、align 和 closure 关系的联合 scaffold。STEncoder 在这张 soft graph 上传递结构信息，最终 classifier 只读取 structure-only topology encoding，并与原始 endpoint tokens 合并，输出一个对输入顺序不敏感的 edge probability。Slot content 和 grounding 仍用于训练 generator 和构建 scaffold，但已删除独立 content-conditioning branch。训练期的辅助 losses 让 imagined neighborhoods 更真实、稳定并带有 shared-neighbor 语义；inference 最终只输出 queried pair 的二分类结果。
+> 对于一对未见节点，EgoStitch 同时保留 endpoint raw-token cross-attention 和 generated local context。模型先从同侧 feature universe 检索相似节点作为 grounding，再为每个 endpoint 生成 16 个 compressed neighbor slots。两侧 slots 经过软对齐，被拼成一张包含 star、intra、align 和 closure 关系的联合 scaffold。STEncoder 在这张 soft graph 上传递结构信息，最终 classifier 只读取 structure-only topology encoding，并与原始 endpoint tokens 合并，输出一个对输入顺序不敏感的 edge probability。Slot content 和 grounding 仍用于训练 generator 和构建 scaffold，但已删除独立 content-conditioning branch。训练期的辅助 losses 让 imagined neighborhoods 更真实、稳定并带有 shared-neighbor 语义；inference 最终只输出 queried pair 的二分类结果。
 
 ---
 

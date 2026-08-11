@@ -22,7 +22,7 @@ binary edge prediction, and its representation method remains open.
 |---|---|
 | Venue | ICLR 2027 |
 | Paper type | Empirical ML method |
-| Primary task | Fully inductive PPI prediction between two unseen proteins |
+| Primary task | Fully inductive edge prediction between two unseen nodes |
 | Input | Only frozen intrinsic endpoint features `(x_u, x_v)` |
 | Intermediate object | Inferred query-local topology representation |
 | Output | Symmetric $\widehat A_{uv}$; $\widehat G_\tau$ assembled only for evaluation |
@@ -33,13 +33,13 @@ binary edge prediction, and its representation method remains open.
 
 ## 2. Thesis
 
-Fully inductive PPI prediction should be topology-conditioned binary classification,
+Fully inductive edge prediction should be topology-conditioned binary classification,
 not independent pair scoring. Training topology may teach transferable structural
-regularities, but inference receives only two unseen proteins' intrinsic features.
+regularities, but inference receives only two unseen nodes' intrinsic features.
 The representation method remains open; retrieval is a separate support condition.
 
 What the reader should believe: endpoint-only pair accuracy does not guarantee a
-plausible assembled PPI network; topology transfer must improve the queried-edge
+plausible assembled graph; topology transfer must improve the queried-edge
 decision and the assembled graph together.
 
 ---
@@ -49,8 +49,8 @@ decision and the assembled graph together.
 **Training graph.** $G_{\mathrm{train}}=(V_{\mathrm{train}},E_{\mathrm{train}})$ and
 $V_{\mathrm{train}}\cap V_{\mathrm{test}}=\varnothing$; test endpoints have no observed edges.
 
-**Intrinsic features.** $x_i=E_\eta(S_i,M_i)$, where $S_i$ is protein sequence and
-$M_i$ is optional monomer structure; the encoder is frozen before edge prediction.
+**Intrinsic features.** $x_i=E_\eta(a_i)$, where $a_i$ contains the node attributes;
+the encoder is frozen before edge prediction.
 
 **Query.** For $u,v\in V_{\mathrm{test}}$, the symmetric predictor receives only $(x_u,x_v)$:
 $\widehat A_{uv}=P_\theta(Y_{uv}=1\mid x_u,x_v)=P_\theta(Y_{uv}=1\mid x_v,x_u)$.
@@ -63,7 +63,7 @@ it with hidden $G_{\mathrm{test}}=(V_{\mathrm{test}},E_{\mathrm{test}})$.
 their assembly has implausible degree, clustering, density, or spectrum.
 
 **H2 — topology transfer.** Structural regularities of $E_{\mathrm{train}}$ and their
-dependence on $x$ are domain properties that may transfer to unseen proteins.
+dependence on $x$ are domain properties that may transfer to unseen nodes.
 
 **Proposed change.** Keep the final prediction target unchanged, but condition
 the edge classifier on a generated or inferred topology representation. That
@@ -82,7 +82,7 @@ representation is context, not the final task.
 
 | RQ | Question | Contribution |
 |---|---|---|
-| RQ1 | Does the pair-to-topology gap hold in fully inductive PPI prediction? | Joint pair/assembled-graph diagnosis |
+| RQ1 | Does the pair-to-topology gap hold in fully inductive edge prediction? | Joint pair/assembled-graph diagnosis |
 | RQ2 | Can $G_{\mathrm{train}}$ topology transfer through endpoint features alone? | Zero-observed-edge topology conditioning |
 | RQ3 | Which topology representation helps $\operatorname{edge}(u,v)$? | Matched latent, deterministic, and generative comparison |
 | RQ4 | Does extra retrieval support explain an explicit-scaffold gain? | Separately labeled retrieval-grounded arm |
@@ -95,9 +95,9 @@ separates topology learning from gains caused by extra inference support.
 
 ## 5. Method Summary
 
-1. **Input.** Encode only the two frozen protein representations.
+1. **Input.** Encode only the two frozen node representations.
 2. **Context.** Learn from $G_{\mathrm{train}}$; infer context from $(x_u,x_v)$ at test time.
-3. **Decision.** Produce a symmetric probability for the queried interaction.
+3. **Decision.** Produce a symmetric probability for the queried edge.
 4. **Assembly.** Construct $\widehat G_\tau$ only after scoring $\mathcal Q_{\mathrm{test}}$.
 
 Retrieval-grounded scaffolds are a separate arm whose support pool is not task input.
@@ -190,13 +190,13 @@ retrieval on the assembled graph.
 | Graph metrics improve only by threshold changes | High | Use density-matched operating points and threshold sweeps |
 | Optional candidate retrieval leaks target information or is mistaken for task input | High | Keep retrieval in a separately labeled arm, freeze and disclose its support universe, and audit every inference input |
 | Scaffold contains the queried-edge answer | High | Mask or standardize the queried edge inside the scaffold |
-| PPI negatives or graph truth are biased | High | Disclose uncertain negatives and ascertainment limits |
+| Negative labels or graph truth are biased | High | Disclose uncertain negatives and observation limits |
 
 ---
 
 ## 10. Locked Decisions
 
-1. Task: fully inductive, node-disjoint, zero-observed-edge PPI prediction.
+1. Task: fully inductive, node-disjoint, zero-observed-edge prediction.
 2. Input/output: exactly $(x_u,x_v)$ to symmetric $\widehat A_{uv}$.
 3. Structure: $G_{\mathrm{train}}$ may supervise intermediate topology context only.
 4. Assembly: score $\mathcal Q_{\mathrm{test}}$, then form $\widehat G_\tau$.

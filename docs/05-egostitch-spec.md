@@ -212,20 +212,20 @@ channel correlation matrix on `(s0..s4)` only for interpreting that old result.
 
 ## 6. Data partitions and leakage rules
 
-- **The same complete set of train-side positive interactions is used for topology
+- **The same complete set of train-side positive edges is used for topology
   learning and edge classification.** Structural targets (reconstruction, degree NLL,
   BP-NLL, code stats, seam references, critic training) and `L_edge` positives are both
   derived from `E_train+`; there is no message/supervision partition. The loopless
   topology projection drops self-pairs, while classification retains them (§9.4).
   Leave-one-out remains mandatory: when a positive pair (u,v) is in the batch, v is
   excluded from u's reconstruction targets and |N(u)| decremented.
-- Seam references: unions of training-interaction ego-net pairs sampled 50/50
+- Seam references: unions of training-edge ego-net pairs sampled 50/50
   adjacent/random with labels marginalized.
 - B0 provenance audit is an E5 gate precondition. The E2 B0 scorer is
   pinned to the audited V3.1 `pair_context_gated` / `abba_max` / no-cross checkpoint
   family (`d_model = 512`, no spectral normalization) and trains from the fixed
   balanced `train_edges.txt` rows when a local retrain is required.
-- **Benchmark binding:** how the shipped artifacts map onto shared training interactions/val,
+- **Benchmark binding:** how the shipped artifacts map onto shared training edges/val,
   which shipped files are quarantined, and the self-loop policy are fixed in §9 —
   §9 is normative wherever the shipped artifacts differ from the abstract wording
   above.
@@ -345,15 +345,15 @@ indexed nodes). `index.json` maps node id → content-addressed `.pt` path.
 3 train pairs + 1 val pair touch them → dropped at load, counts logged). The 105
 indexed nodes absent from the graph are inert.
 
-### 9.3 Training-interaction and validation binding
+### 9.3 Training-edge and validation binding
 
-The shipped train rows bind one shared positive-interaction set:
+The shipped train rows bind one shared positive-edge set:
 
 ```text
 E_train⁺ := positives of train_edges.txt            (per strategy)
 E_topo   := E_train⁺ \ self-loops                    # loopless topology projection
 G_struct := simple graph (V_train, E_topo)           # ALL structural targets
-L_edge positives := E_train⁺                         # same interactions; self-pairs retained
+L_edge positives := E_train⁺                         # same edges; self-pairs retained
 val_edges.txt    := model selection only (VAL-CRITERION, §8) — never a target
 ```
 
@@ -382,15 +382,15 @@ V_select`** is the single 512-node validation holdout used by the formal plan.
 Because `V_hold` is exactly this union,
 defining it changes nothing about `V_fit`: **`V_fit`, `E_train⁺[V_fit]`,
 `G_fit`, and `rho_train` are unchanged relative to the former two-holdout
-definition under this same shared-interaction contract**. The 2026-08-03 removal of
+definition under this same shared-edge contract**. The 2026-08-03 removal of
 the 80/20 split itself changes the holdout graph and therefore invalidates all older
 `V_fit`-side caches, packs, feature-statistics digests, and result comparability. (The
 `V_qual`/`V_select` grounding universes are themselves replaced by `V_hold` at
 §13.12 — a deliberate role-universe change, not an invalidation of `V_fit`-side
 state.) The v2 training contract replaces `G_struct` with the induced
 `G_fit=(V_fit, E_train⁺[V_fit] \ self-loops)` and restricts classification positives
-to the same interactions with both endpoints in `V_fit`; all `V_fit`↔`V_hold`
-cross-partition interactions — i.e. positives with exactly one endpoint in `V_hold` —
+to the same edges with both endpoints in `V_fit`; all `V_fit`↔`V_hold`
+cross-partition edges — i.e. positives with exactly one endpoint in `V_hold` —
 are quarantined from training. The within-holdout cross-side edges (between `V_qual` and
 `V_select`) are **not** quarantined; they are `V_hold`'s evaluation-only topology
 labels, exactly like the within-`V_qual` and within-`V_select` edges. `E_topo[V_hold]`
@@ -511,7 +511,7 @@ with per-epoch order shuffling but no negative resampling.
   `num_workers = 4`, `persistent_workers`, `prefetch_factor = 4`, pinned memory.
 - Hungarian matching runs per node on K×K ≤ 16×16 cost matrices
   (`scipy.linear_sum_assignment` on CPU from GPU-computed costs); no inter-process
-  interaction.
+  edge.
 
 ## 11. E2 production execution design (auto-sized H20, Hugging Face Accelerate DDP)
 
@@ -576,8 +576,8 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   previous 9,780 s total was ~4.6× looser than needed. Evidence is fixed-Seed-0-style
   single-seed engineering evidence (`outputs/runs/b0_v31_onecycle_s47`,
   `outputs/runs/b0_v31_e25_s47`) — it carries no significance or cross-seed claim.
-- 2026-08-03 (owner decision): the training-interaction **provenance digests are
-  withdrawn**. The shared-interaction refactor (`6315519`) had bound every
+- 2026-08-03 (owner decision): the training-edge **provenance digests are
+  withdrawn**. The shared-edge refactor (`6315519`) had bound every
   checkpoint, `run_metadata.json`, scores artifact, and CAZI UGT cache to a
   `data_contract = shared_train_positives_v1` tag plus `training_interactions_sha256`
   and `training_topology_sha256`, and made `src/e2_pipeline.py`,
@@ -632,7 +632,7 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   self-loop-including `0.7067` / `0.7316`.
 - 2026-08-03 (owner decision; data-contract correction): removed the seeded 80/20
   message/supervision split. Topology learning and edge classification now consume the
-  same complete `E_train+` interaction set; only the already-pinned loopless topology
+  same complete `E_train+` edge set; only the already-pinned loopless topology
   projection removes self-pairs. The internal `V_hold` is consequently derived from the
   full training topology. This supersedes every contrary message/supervision clause in
   this document and invalidates all packs, caches, digests, thresholds, and results
@@ -661,7 +661,7 @@ The checkpoint payload consumed by `score_universe` is unchanged.
   rule requires. The two scoring-time controls are unchanged. Probe
   (`egostitch_e2e_probe_v2`) and scores-meta (`egostitch_e2e_scores_v3`)
   versions did not bump at that time. This historical registration-era claim
-  is retired by the 2026-08-03 shared-interaction contract and the current
+  is retired by the 2026-08-03 shared-edge contract and the current
   `egostitch_e2e_scores_v4` provenance checks. Rationale at the time: the
   formal screen must attribute each critical mechanism — conditioning as a
   whole, the content pathway, branch dropout, `L_rel`, and D0 feature
@@ -1387,7 +1387,7 @@ the codebase under the two-stage cleanup (§12, 2026-07-29 entry). This
 section remains citable and comprehensible as the record of what that screen
 ran; no future run may cite it as authorization. Its 80/20
 message/supervision-partition data contract is retired and its results are not
-comparable to the shared-training-interaction contract adopted 2026-08-03.
+comparable to the shared-training-edge contract adopted 2026-08-03.
 
 Gate G5 (protocol §5.0.5) builds the model in three mechanism stages. The frozen
 sections above pin the *full* model; this section pins the **Stage-1 subset** —
@@ -2069,7 +2069,7 @@ No reranker. The former P0.2 curve (`e_sup` pair ceilings 0.095 / 0.134 /
 0.179 for cosine top-20/50/100; B0-alt rerank ≈ cosine at 2.5× pool size) was
 measured under the retired 80/20 contract. It remains historical evidence for
 the earlier design decision but is **non-binding and non-comparable** under the
-shared-interaction contract; the current grounding ceiling must be remeasured
+shared-edge contract; the current grounding ceiling must be remeasured
 before it supports any new claim.
 Pool caches bind `pool_method_hash = H(method id, n_g, shortlist M when
 present, ordered F0/source-feature-pack digest, role-universe identity)`;
@@ -2124,7 +2124,7 @@ Five trained checkpoints — `full`, `b0_e2e_f_only`, `p0`, `no_l_rel`, and
 `full`'s checkpoint. The removed content pathway makes `pair_topology`
 identical to `full`, so that arm is retired. Checkpoints and score artifacts
 carry **no training-data identity field** (§12, 2026-08-03): nothing in the code
-distinguishes an artifact trained under the shared-interaction contract from an
+distinguishes an artifact trained under the shared-edge contract from an
 older 80/20-partition one, so keeping the two apart is an owner-side
 responsibility discharged by run directory and commit, not by a gate.
 
@@ -2139,11 +2139,11 @@ telemetry at each formal validation. They do not authorize or block training,
 checkpoint publication, scoring, evaluation, or plan binding.
 
 The formal run executes directly on `V_fit` and validates on `V_hold`. It uses
-the same complete `V_fit` training interactions for topology and
+the same complete `V_fit` training edges for topology and
 classification, with per-query leave-one-out only when constructing the target
 for that queried positive. There is no preregistration or artifact-identity
 gate, and nothing in the checkpoint or scoring path enforces the §9.3
-shared-interaction data contract — it holds by construction in
+shared-edge data contract — it holds by construction in
 `derive_training_interactions`, and stale artifacts are excluded by hand (§12,
 2026-08-03).
 

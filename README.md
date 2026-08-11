@@ -50,7 +50,7 @@ Holm inference.
 
 > **Data-contract correction (2026-08-03):** those historical screens used the retired
 > 80/20 message/supervision split. The active implementation now uses the same complete
-> train-side positive interactions for topology learning and edge classification (with
+> train-side positive edges for topology learning and edge classification (with
 > explicit per-query leave-one-out reconstruction targets). All older packs, caches,
 > thresholds, and results are non-comparable to this corrected contract; no scientific
 > result has yet been produced under it.
@@ -63,7 +63,7 @@ hpc/run.sh train configs/egostitch_e2e_v3_full_breadth_first.yaml \
   --worker-module src.train_egostitch --run-kind formal   # or another trained-arm config
 ```
 
-The run trains topology and classification on the same interactions induced within
+The run trains topology and classification on the same edges induced within
 `V_fit`, validates on the single 512-node `V_hold`, and executes
 `pack → train → publish` through the shared orchestrator. Quality telemetry
 (eligibility, liveness, slot collapse, margins) is recorded but never blocks

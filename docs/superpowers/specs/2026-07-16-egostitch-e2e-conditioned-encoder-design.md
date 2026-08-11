@@ -2,7 +2,7 @@
 
 > **2026-08-03 data-contract disposition:** every 80/20 message/supervision split in
 > this historical design is superseded by spec §9.3. Topology and classification now
-> use the same complete train-side positive interactions.
+> use the same complete train-side positive edges.
 
 > **2026-07-19 training-contract disposition:** the architecture and attribution
 > design in this note remain approved, but its reconstruction-only warm-start wording

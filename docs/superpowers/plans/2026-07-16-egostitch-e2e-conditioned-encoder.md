@@ -2,7 +2,7 @@
 
 > **2026-08-03 data-contract disposition:** every 80/20 message/supervision split in
 > this historical plan is superseded by spec §9.3. Topology and classification now use
-> the same complete train-side positive interactions.
+> the same complete train-side positive edges.
 
 > **2026-07-19 disposition:** this plan records the v1 implementation landing. Its
 > `L_edge`-inactive warm-start and v1 config/registration commands are superseded for

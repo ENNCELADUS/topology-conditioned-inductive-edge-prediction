@@ -2,7 +2,7 @@
 
 > **2026-08-03 data-contract disposition:** every message/supervision split in this
 > historical design is superseded by spec §9.3. Topology and classification now use the
-> same complete train-side positive interactions.
+> same complete train-side positive edges.
 
 **Status: DECIDED (owner-delegated, 2026-07-25).** This document specifies the
 rev-3.1 repair of the rev-3.0 e2e conditioned encoder after the binding
@@ -722,7 +722,7 @@ comparison at that point.
   own merits (§7.1.1), not as a starvation fallback.
 - **F.1 shortcutting:** `L_rel` satisfiable by degree if targets correlate with
   degree — mitigated by the Jaccard target and gated by G3.3.
-- **C1/L_feat interaction:** diversity vs faithful same-community slots —
+- **C1/L_feat coupling:** diversity vs faithful same-community slots —
   bounded by the matched-pair exclusion; measured in the first dev run.
 - **Threshold transfer V_fit → V_qual (r3):** gates calibrated on `G_fit` may
   miss on the disjoint `V_qual` topology; the rehearsal budget is **≤3

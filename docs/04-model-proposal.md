@@ -92,7 +92,7 @@ Devil's Advocate):
 - **(e) Hub policy for set decoding** [R3-W1/W2]: importance-weighted target
   subsampling with community-multiplicity counts, compound matching costs, denoising
   queries, and a budget trigger redefined in K-representable terms.
-- **(f) Shared interactions with leave-one-out** [R1-W5]: structural targets (BP-NLL,
+- **(f) Shared edges with leave-one-out** [R1-W5]: structural targets (BP-NLL,
   degree NLL, reconstruction) and `L_edge` use the same complete train positives;
   the queried partner is explicitly removed from per-pair reconstruction targets and
   degree counts. Seam references are sampled label-agnostically; B0 provenance is an E5 gate.
@@ -206,7 +206,7 @@ delivered without the topological bottleneck.
 ### 1.2 Retrieval conflates similarity with adjacency
 
 `ANN_feat` retrieves *peers* (nodes similar to `i`), not *plausible partners* (nodes
-likely adjacent to `i`). In heterophilous or interaction-type graphs these are different
+likely adjacent to `i`). In heterophilous or edge-type graphs these are different
 sets. The scaffold therefore tends toward two near-cliques of look-alikes around each
 endpoint — a nearly query-invariant topology carrying little discriminative structural
 signal. This predicts collapse toward B1 (retrieval features, no adjacency) in ablations
@@ -323,7 +323,7 @@ retrieved + thresholded (unsupervised echo) ≠ generated + realism-trained + ha
 | R6 | Carry explicit **degree budgets** and **community/block priors** into every decision; enforce the budget as a hard constraint **at the scaffold level** and measure its transmission to assembly | §1.6, §1.7; NOCD 1909.12201; EDGE 2305.04111 (degree-first factorization); MaskGAE degree decoder 2205.10053; DC-SBM (Karrer & Newman 2011) as the classical ancestor of the `d̂`+block channel |
 | R7 | Apply the **labeling trick** on the scaffold (anchor labels for `i`,`j`) — the most expressive pair-aware readout *of the generated context* (§5.4) and the theoretically grounded implementation of the queried-edge masking gate | §1.9; 2010.16103; Distance Encoding 2009.00142 ⊕ |
 | R8 | Generation must be **label-agnostic** (no edge-hypothesis conditioning), including all realism-loss reference sampling | TDE 2002.11949; SGG bias evidence 1711.06640; §4.5 seam-reference rule |
-| R9 | Negative sampling **after** masking; queried endpoint explicitly removed from reconstruction targets; topology and classification otherwise use the **same complete training interactions** | vault masked-edge report; [R1-W5] |
+| R9 | Negative sampling **after** masking; queried endpoint explicitly removed from reconstruction targets; topology and classification otherwise use the **same complete training edges** | vault masked-edge report; [R1-W5] |
 | R10 | Per-node computation should be **cacheable across queries** (amortization), with the per-pair marginal cost stated honestly against B0, not against the old scaffold | protocol §0; [R3-W9] |
 | R11 | The stitched scaffold must be **seam-consistent**, via a *trained* joint refinement procedure (train/test-matched conditionals) | RePaint 2201.09865; MaskGIT 2202.04200; [R3-W4] |
 | R12 | The reconstruction pretext must be **train/test-matched**: mask *entire* ego-networks (the zero-edge inference condition), mask structurally coherent units, and train all conditioning patterns used at inference (including cross-ego conditionals and dropout nulls) | pix2gestalt 2401.14398; MAE 2111.06377; MaskGAE Prop. 1; [R3-W4] |
@@ -716,7 +716,7 @@ HPO-parity protocol (§6.5):
   + **VQ commitment/codebook losses** + **code-supervision head** (ego-net statistics
   from `z_u`) + **code-usage entropy regularizer** (the two former orphans, now owned
   here) + the joint two-ego harmonization task (§4.3b). All structural targets on the
-  shared training interactions, using their loopless topology projection (R9).
+  shared training edges, using their loopless topology projection (R9).
 - `λ_real · L_real` (distributional): energy distance between generated and real
   ego-net statistic vectors (degree, clustering, code histogram, motif conductance);
   energy distance in untrained random-GIN embedding space (2201.09871); the **seam
@@ -854,7 +854,7 @@ information and is the regime where all observed-context machinery is undefined.
 | **NCNC** (ICLR 2024, 2302.00890) | completes unobserved common-neighbor structure with a link predictor, then scores | transductive completion among observed nodes; no latent neighbor generation, budget, community prior, or assembled evaluation. Its incompleteness finding is *evidence for* our premise |
 | **Cold Brew** (ICLR 2022, 2111.04840) | virtual neighborhoods for zero-edge nodes = attention over existing training-node embeddings | no generated structure (no slot adjacency, no existence probabilities, no budget); node-level embeddings, not per-pair decisions; no realism objective |
 | **DEAL** (IJCAI 2020, 2007.08053) / **Graph2Gauss** ⊕ (ICLR 2018, 1707.03815) | attribute-only inductive LP; independent pairwise similarity at inference | the B0 template family (Graph2Gauss predates DEAL); no scaffold, no generation, no assembled metrics; mandatory baselines with the falsifiable prediction that they exhibit the E2 failure mode |
-| **NRI** ⊕ (ICML 2018, 1802.04687) | infers interaction graphs over entity sets from observed *trajectories*, evaluated as a graph | the canon's closest "imagine topology from features" relative; but it requires per-instance dynamical observations (trajectories) as test-time evidence, infers one latent graph per system rather than per-query context for a binary pair decision, and has no inductive zero-edge pair protocol |
+| **NRI** ⊕ (ICML 2018, 1802.04687) | infers graphs over entity sets from observed *trajectories*, evaluated as a graph | the canon's closest "imagine topology from features" relative; but it requires per-instance dynamical observations (trajectories) as test-time evidence, infers one latent graph per system rather than per-query context for a binary pair decision, and has no inductive zero-edge pair protocol |
 | **Latent Graph Diffusion** (NeurIPS 2024, 2402.02518) | "unifies generation and prediction": prediction = conditional generation (graph inpainting) in a whole-graph latent space | conditions on *observed test-graph adjacency* (inadmissible under our protocol); one whole-graph latent, "predict once per graph"; prediction experiments in the main text are graph regression and transductive node classification [verify against camera-ready before submission — flagged, not yet page-verified] |
 | **FLEX** ⊕ (2507.11710, preprint) | GGM for OOD link prediction: SEAL-labeled k-hop subgraphs around *training* links generated by a SIGVAE, counterfactually shifted (KL-target penalty), adversarially co-training a GNN — verbatim "we apply graph generation as a data augmentation method"; GGM not invoked at inference | full-text verified: generation is train-time augmentation from *observed* neighborhoods; test queries answered by the tuned GNN on an observed (shifted) graph; Hits@K only, no assembled-graph grading. Bonus: FLEX documents that naive generated subgraphs are uniformly over-dense and fixes it with a probability threshold — independent evidence for our hard degree budgets |
 | **EDGE** (ICML 2023, 2305.04111) | degree-first factorization `p(A,d)=p(d)p(A|d)` with hard degree masking | whole-graph unconditional generation; our budget is **EDGE's principle amortized**: feature-conditional, per-endpoint, per-query, inductive, at ego scale, used as classifier evidence |
@@ -1032,7 +1032,7 @@ verdict into process [DA verdict, EIC concern 1, R1-W8].
   scoring-time controls. The content pathway is deleted, so `pair_topology` is
   retired as identical to `full`. There is no registration or plan-identity gate, and
   no training-data identity field on checkpoints or score artifacts (spec §12,
-  2026-08-03); separating shared-interaction runs from older 80/20-partition ones is
+  2026-08-03); separating shared-edge runs from older 80/20-partition ones is
   owner-side.
 
 ### 6.1 Method rows
@@ -1178,7 +1178,7 @@ quality).
 ### 6.5 Integrity, parity, and decision rules **[protocol-Δ]**
 
 - All five existing gates hold; gate 4 is strengthened (label-agnostic generation +
-  endpoint removal + anchor labeling). New gates: **shared training-interaction identity
+  endpoint removal + anchor labeling). New gates: **shared training-edge identity
   plus per-query leave-one-out** for all structural losses [R1-W5-i]; **label-agnostic seam references**
   [R1-W5-ii]; **B0 provenance audit** (the frozen scorer must never have seen
   validation/test pairs) [R1-W5-iii].
@@ -1219,7 +1219,7 @@ block-model marginals close most of the pair-to-topology gap") if the controls w
 | CVAE posterior collapse / mode-seeking imagination | free-bits + KL annealing; diversity diagnostic; SIG-VAE-style richer posterior as fallback; s1–s3 correlation watch |
 | Generator becomes `L_edge`'s covert channel (realistic-looking but discriminatively-warped ego-nets) | held-out ego-net fidelity diagnostics (§6.4.8a) reported alongside headline metrics; `L_recon` weight floor; G5 staging isolates when it happens |
 | Imagined neighbors leak the queried label | label-agnostic generation; queried endpoint explicitly removed from targets; `∅_content` counterfactual reported |
-| s3 train-time quasi-oracle (the classified interaction is present in the shared topology) | explicit per-query leave-one-out targets and degree correction (R9); E5 gate |
+| s3 train-time quasi-oracle (the classified edge is present in the shared topology) | explicit per-query leave-one-out targets and degree correction (R9); E5 gate |
 | Community prior shortcut (context overrides pair) | gated fusion + counterfactual control; hard negatives |
 | Content pathway carries the win / topology gates stay dead [rev 3.0] | pathway-attribution rule (§4.4) is a headline requirement; gate-magnitude + per-branch gradient telemetry; branch dropout; FCR-stratified pre-registered prediction; §6.5 decision rule (ii) |
 | STE encodes a latent code disguised as a graph (π/m/Â/Π are feature-derived) [rev 3.0] | degree-preserving rewiring is the decisive control; edge-shuffle / DeepSets-reduction / matched-capacity-no-MP battery; degree-partialled representation probes |

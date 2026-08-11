@@ -29,7 +29,7 @@ work at graph scale:
 | Cluster | Question | Useful design pattern |
 |---|---|---|
 | Retrieval-scale edge scoring | How can a model avoid exhaustive all-pairs scoring? | Factorize pair scoring into node-side or substructure-side representations, then use approximate nearest-neighbor retrieval. |
-| Interaction-aware representation learning | How can a model represent pair context rather than independent endpoints only? | Use cross-attention, paired pretraining, or context-conditioned encoders before edge scoring. |
+| edge-aware representation learning | How can a model represent pair context rather than independent endpoints only? | Use cross-attention, paired pretraining, or context-conditioned encoders before edge scoring. |
 | Leakage-resistant evaluation | Do reported gains survive strict split rules? | Split by entities, near-duplicates, groups, or graph regions; audit shortcut features before claiming generalization. |
 | Negative sampling | Are negatives realistic, too easy, or contaminated? | Compare random, hard, topology-aware, and positive-unlabeled protocols. |
 | Graph-level evaluation | Does the predicted edge set preserve global structure? | Report density, degree, clustering, component, spectral, and modularity statistics in addition to AUROC or AUPR. |
