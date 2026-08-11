@@ -242,6 +242,45 @@ The claim should remain qualified until a broader database search or independent
 - CAZI-MBN is highly relevant and domain-matched, but its paper contains an internally inconsistent stated split percentage; its implementation and leakage contract require separate audit.
 - The target graph is incomplete and observation-biased. Even a well-calibrated latent may learn collection artifacts rather than target topology; this review establishes ancestry and design boundaries, not empirical validity.
 
-## 7. AI-assisted research disclosure
+## 7. Generative machinery for q(T|x) (2026-08-11 addendum)
 
-This report was produced with AI-assisted literature search, source triage, synthesis, and adversarial checking. Six GPT-5.6-Sol subagents at medium reasoning effort performed independent topical sweeps and a primary-source citation audit. The main agent reran arXiv searches, reconciled conflicts, and wrote the final synthesis. Bibliographic identities and technical boundaries were checked against primary papers or official venue records where accessible. Remaining unresolved boundaries are marked in Sections 3 and 6; no unresolved claim is used as direct-match evidence.
+Two targeted sweeps (latent-space graph generative models; conditional/distributional structure generation) mapped the machinery for the route. **Verdict: buildable.** No verified model performs feature-conditioned, identity-free neighborhood generation, but every component is separately proven; the open seam is exactly "identity-free latent slots × external-feature conditioning".
+
+### 7.1 Identity-free latent formats (verified, with generative prior)
+
+| Format | Exemplar | Why it fits |
+|---|---|---|
+| Permutation-equivariant quantized slot codes | [GLAD, arXiv:2403.16883](https://arxiv.org/abs/2403.16883) (AAAI 2025) | Anonymous discrete per-slot codes with equivariant adjacency decoder; benchmarked at ego-small scale; needs a conditioning channel and a cheaper prior. |
+| Fixed-K anonymous "graph words" | [GraphsGPT, arXiv:2402.02464](https://arxiv.org/abs/2402.02464) (ICML 2024) | Fixed-size Euclidean latent the classifier can consume **without decoding**; decoder kept only for GS/RD/MMD audits; strongest reconstruction-at-scale evidence. |
+| Truncated spectral latents | [SPECTRE, arXiv:2204.01613](https://arxiv.org/abs/2204.01613) (ICML 2022); [GSDM, arXiv:2211.08892](https://arxiv.org/abs/2211.08892) (TPAMI); [GGSD, arXiv:2402.18974](https://arxiv.org/abs/2402.18974) | One-shot sampling (cheapest); natively aligned with the spectral-MMD evaluation; weaker local detail. |
+| Per-node continuous latents + diffusion/flow | [LGD, arXiv:2402.02518](https://arxiv.org/abs/2402.02518) (NeurIPS 2024); [Laplacian-AE latent diffusion, arXiv:2601.13780](https://arxiv.org/abs/2601.13780) (preprint) | LGD already casts edge prediction as **conditional latent generation with cross-attention** — the mechanism precedent; its latents are node-aligned (identity-bearing), which is the part to replace. |
+| Structure-token sequences (explicit, not latent) | [G2PT, arXiv:2501.01073](https://arxiv.org/abs/2501.01073) (ICML 2025); [AutoGraph, arXiv:2502.02216](https://arxiv.org/abs/2502.02216) (NeurIPS 2025); [GVT, arXiv:2512.02667](https://arxiv.org/abs/2512.02667) (AAAI 2026) | Cheapest strong explicit generators at 5–50 nodes; condition by prefixing x-derived tokens; GVT shows VQ+AR beats diffusion on speed. |
+
+### 7.2 Conditioning mechanisms (mechanism → strongest exemplar)
+
+Descriptor-vector into latent diffusion — [NGG, arXiv:2403.01535](https://arxiv.org/abs/2403.01535) (preprint); classifier-free condition injection with dropout — [FreeGress, arXiv:2312.17397](https://arxiv.org/abs/2312.17397); condition-encoder + DiT denoiser — [Graph DiT, arXiv:2401.13858](https://arxiv.org/abs/2401.13858) (NeurIPS 2024); async factorization with the edge denoiser reading clean conditions, explicit P(A|X) — [GraphMaker, arXiv:2310.13833](https://arxiv.org/abs/2310.13833) (TMLR 2024); anchored inpainting (fix roots, diffuse the rest) — [SGDIFF, arXiv:2409.08487](https://arxiv.org/abs/2409.08487); amortized permutation-equivariant variational posterior — [AVICI, arXiv:2205.12934](https://arxiv.org/abs/2205.12934) (NeurIPS 2022), cross-graph transfer [GraphGLOW, arXiv:2306.11264](https://arxiv.org/abs/2306.11264) (KDD 2023); sampling-time reward guidance — [GGDiff, arXiv:2505.19685](https://arxiv.org/abs/2505.19685) (NeurIPS 2025), too expensive per query; external-embedding-conditioned latent prior — [3M-Diffusion, arXiv:2403.07179](https://arxiv.org/abs/2403.07179); co-diffused condition flows — [Twigs, arXiv:2410.24012](https://arxiv.org/abs/2410.24012) (NeurIPS 2024).
+
+### 7.3 Near-misses triangulating q(T|x)
+
+Each misses exactly one leg; together they show the composition is unclaimed but assemblable:
+
+- [Cold Brew](https://arxiv.org/abs/2111.04840) (ICLR 2022): x → identity-free neighborhood latent, but a deterministic distillation point estimate.
+- [BAEGD, arXiv:2602.05232](https://arxiv.org/abs/2602.05232) (preprint 2026): the only true ego-graph generative model found (discrete diffusion over rooted ego-graphs) — class-conditioned, not per-unit x.
+- GraphMaker (above): explicit A|X head, but whole-graph over a fixed node set.
+- SGDIFF / [FLEX](https://arxiv.org/abs/2507.11710) / [D-GDA](https://openreview.net/forum?id=118382) (NeurIPS 2025): anchored/local generation for link prediction, but conditioned on observed structure, not features alone. FLEX is the precedent that generated topology context measurably helps OOD link prediction.
+
+Recorded empty searches: "ego network generation", "local subgraph generation", MDN/flow over degree/motif/spectral summaries conditioned on unit covariates — all zero on-target hits; Graph2Gauss has no modern generative descendant over neighborhood structure.
+
+### 7.4 Cost and candidate designs
+
+At millions of edge queries (T amortizable per node, not per pair): one-shot heads ≫ few-step flow/consistency ≫ AR-at-ego-scale ≫ full diffusion; sampling-time guidance families are ruled out. Three builds, cheapest-first, all consistent with §4.4's staging:
+
+1. **Amortized factorized posterior / mixture head over structural summaries** (AVICI/NRI-style encoder or MDN; single forward pass) — every component proven, the exact combination unclaimed; this is §4.4's diagnostic made into a model.
+2. **Conditional few-step prior over GLAD-style identity-free slot codes** (FreeGress-style x-injection, consistency/flow-matching prior) — the full relational-object arm, satisfying §4.1's decoder requirement.
+3. **One-shot spectral latent from pooled endpoint features** (SPECTRE lineage) — cheapest relational option, directly aligned with the spectral-MMD claim metric.
+
+Pair conditioning uses anchored two-root inpainting (SGDIFF mechanism) with the roots fixed by `(x_u,x_v)` and no observed structure.
+
+## 8. AI-assisted research disclosure
+
+This report was produced with AI-assisted literature search, source triage, synthesis, and adversarial checking. Six GPT-5.6-Sol subagents at medium reasoning effort performed independent topical sweeps and a primary-source citation audit; two Claude subagents added the 2026-08-11 machinery sweeps (arXiv/Semantic Scholar/OpenReview verification). The main agent reran arXiv searches, reconciled conflicts, and wrote the final synthesis. Bibliographic identities and technical boundaries were checked against primary papers or official venue records where accessible; unverifiable records were dropped. Remaining unresolved boundaries are marked in Sections 3 and 6; no unresolved claim is used as direct-match evidence.

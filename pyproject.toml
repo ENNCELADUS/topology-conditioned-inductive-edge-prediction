@@ -41,6 +41,7 @@ dev = [
 
 [tool.uv]
 package = false
+managed = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
