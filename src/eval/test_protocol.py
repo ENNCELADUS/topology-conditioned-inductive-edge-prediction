@@ -2,18 +2,14 @@
 
 Owns the whole post-train sequence for one arm and nothing else::
 
-    score V_hold -> select operating point -> freeze it into the report
-        -> score test      -> edge metrics
-        -> score candidate -> assembled-graph metrics
+    score test      -> edge metrics at fixed threshold 0.5
+    score candidate -> assembled-graph metrics at global density control
         -> test_report.json
 
-The operating point is selected on the real internal-holdout ``V_hold`` universe
-(``--pairs v_hold``, the complete non-self pair/label set over
-`src.data.internal_holdout.derive_internal_holdout`'s partition -- NOT the
-benchmark's own ``val_edges.txt`` model-selection manifest, a different node
-set with different labels) and serialized *before* any held-out row is
-computed, so it provably cannot see held-out data. Both metric families are
-always reported together; a partial report is never written.
+Classification and topology use separate operating points: the former is
+fixed at 0.5, while the latter matches the global simple-edge reference density
+over the candidate universe. Both metric families are always reported together;
+a partial report is never written.
 
 This module composes existing analysis primitives; it never rescores a pair or
 reimplements a metric. It never calls ``validate_score_precision`` directly on
@@ -38,10 +34,8 @@ from typing import Protocol, cast
 import networkx as nx
 import numpy as np
 from numpy.typing import NDArray
-from sklearn.metrics import precision_recall_curve
 
 from src.eval.assembly import assemble_graph, density_matched_threshold, threshold_sweep
-from src.eval.edge_metrics import compute_edge_metrics
 from src.eval.graph_metrics import (
     MMDConfig,
     compute_graph_similarity,
@@ -59,6 +53,7 @@ from src.experiments.g1_hardened_e2 import (
 from src.score_universe import (
     MODEL_BUILDERS,
     ScoresArtifact,
+    _checkpoint_id,
     load_scores,
     validate_artifact_precision,
 )
@@ -67,10 +62,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["ScoreRunner", "TestProtocolResult", "build_parser", "main", "run_test_protocol"]
 
-#: Row label written by `src.score_universe` for a pair it could not label.
-_UNLABELED = -1
-_SCHEMA_VERSION = "test_protocol_v1"
-_OPERATING_POINT_FILENAME = "operating_point.json"
+_SCHEMA_VERSION = "test_protocol_v2"
 #: The filename `src.e2_pipeline` (and `src.train_egostitch`/`src.train_b0`)
 #: publish training provenance into: checkpoint identity, publication status,
 #: and access-audit fields no scoring call may destroy. This module never
@@ -135,32 +127,53 @@ def _require_full_universe(artifact: ScoresArtifact, *, label: str) -> None:
         )
 
 
-def _reject_unlabeled(labels: NDArray[np.int64], *, label: str) -> None:
-    """Raise if any row of `labels` is the unlabeled sentinel (-1)."""
-    n_unlabeled = int((labels == _UNLABELED).sum())
-    if n_unlabeled:
-        raise ValueError(
-            f"{label}: {n_unlabeled} rows are unlabeled (-1); cannot select an operating point"
-        )
-
-
-def _require_same_checkpoint(
-    *, v_hold: ScoresArtifact, test: ScoresArtifact, candidate: ScoresArtifact
-) -> None:
-    """Raise unless all three passes scored the identical checkpoint and family.
-
-    A data-boundary sanity check: the V_hold/test/candidate passes must be three
-    views of the *same* frozen checkpoint, never three different ones.
-    """
-    checkpoint_ids = {artifact.meta.get("checkpoint_id") for artifact in (v_hold, test, candidate)}
+def _require_same_checkpoint(*, test: ScoresArtifact, candidate: ScoresArtifact) -> None:
+    """Raise unless both held-out passes scored the same checkpoint and family."""
+    checkpoint_ids = {artifact.meta.get("checkpoint_id") for artifact in (test, candidate)}
     if len(checkpoint_ids) != 1:
         raise ValueError(
-            f"v_hold/test/candidate scoring passes used different checkpoints: {checkpoint_ids}"
+            f"test/candidate scoring passes used different checkpoints: {checkpoint_ids}"
         )
-    model_families = {artifact.meta.get("model_family") for artifact in (v_hold, test, candidate)}
+    model_families = {artifact.meta.get("model_family") for artifact in (test, candidate)}
     if len(model_families) != 1:
         raise ValueError(
-            f"v_hold/test/candidate scoring passes disagree on model_family: {model_families}"
+            f"test/candidate scoring passes disagree on model_family: {model_families}"
+        )
+
+
+def _expected_checkpoint_id(checkpoint: Path) -> str | None:
+    """Return the score-artifact id for a real checkpoint, if it carries state."""
+    import torch
+
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict):
+        return None
+    state = payload.get("model_state", payload.get("state_dict"))
+    if state is None and payload and all(
+        isinstance(value, torch.Tensor) for value in payload.values()
+    ):
+        state = payload
+    if not isinstance(state, dict) or not state:
+        return None
+    if not all(
+        isinstance(key, str) and isinstance(value, torch.Tensor) for key, value in state.items()
+    ):
+        return None
+    return _checkpoint_id(cast(dict[str, torch.Tensor], state))
+
+
+def _require_scoring_identity(
+    *, artifact: ScoresArtifact, checkpoint_id: str | None, strategy: str, label: str
+) -> None:
+    """Bind a scored or reused artifact to this invocation's checkpoint and split."""
+    if checkpoint_id is not None and artifact.meta.get("checkpoint_id") != checkpoint_id:
+        raise ValueError(
+            f"{label}: checkpoint_id {artifact.meta.get('checkpoint_id')!r} does not match "
+            f"the requested checkpoint {checkpoint_id!r}"
+        )
+    if artifact.meta.get("strategy") != strategy:
+        raise ValueError(
+            f"{label}: strategy {artifact.meta.get('strategy')!r} does not match {strategy!r}"
         )
 
 
@@ -172,42 +185,6 @@ def _ledger_record_sha256(meta: Mapping[str, object]) -> str | None:
         if isinstance(digest, str):
             return digest
     return None
-
-
-def _select_max_f1_threshold(labels: NDArray[np.int64], probs: NDArray[np.float64]) -> float:
-    """Select the decision threshold that maximizes F1 on `labels`/`probs`.
-
-    Scans every threshold `sklearn.metrics.precision_recall_curve` considers (the
-    sorted unique probability values, using the same ``prob >= threshold``
-    convention as :func:`src.eval.edge_metrics.compute_edge_metrics`). Ties in F1
-    are broken by the smallest threshold achieving the maximum (``np.argmax``
-    returns the first occurrence over the ascending `thresholds` array), so the
-    selection is fully deterministic.
-
-    Args:
-        labels: 1-D array of binary labels (0/1).
-        probs: 1-D array of predicted probabilities, same length as `labels`.
-
-    Returns:
-        The selected threshold.
-
-    Raises:
-        ValueError: If `labels` contains only one class.
-    """
-    n_pos = int((labels == 1).sum())
-    n_neg = int((labels == 0).sum())
-    if n_pos == 0 or n_neg == 0:
-        raise ValueError(
-            "V_hold labels must contain both classes to select a max-F1 operating point; "
-            f"got n_pos={n_pos}, n_neg={n_neg}"
-        )
-    precision, recall, thresholds = precision_recall_curve(labels, probs)
-    precision = precision[:-1]
-    recall = recall[:-1]
-    denom = precision + recall
-    f1 = np.divide(2.0 * precision * recall, denom, out=np.zeros_like(denom), where=denom > 0)
-    best_index = int(np.argmax(f1))
-    return float(thresholds[best_index])
 
 
 def _self_described_model_family(checkpoint: Path) -> str | None:
@@ -336,16 +313,13 @@ def _build_score_args(
 ) -> list[str]:
     """Build the ``score_universe score`` argument list for one pairs source.
 
-    ``--run-metadata`` is always forwarded: `src.score_universe` only reads it
-    for an ``egostitch_e2e`` held-out (``test``/``candidate``) pass, so passing
-    it for ``v_hold`` too is inert. ``--f0-cache``/``--grounding-cache`` are
-    likewise always forwarded with this call's own universe-scoped paths (see
+    ``--run-metadata`` is always forwarded for the held-out passes.
+    ``--f0-cache``/``--grounding-cache`` are likewise always forwarded with
+    this call's own universe-scoped paths (see
     `run_test_protocol`): they are read only for ``f0_mlp``/``egostitch_e2e``
     scoring, so passing them for ``v3_1``/``cazi_mbn`` is equally inert.
-    ``--rescore-reason``/``--scoring-run-id`` are deliberately the caller's
-    responsibility to omit for ``v_hold`` (see `run_test_protocol`):
-    `src.score_universe` rejects a non-``None`` value for either on any pass
-    that is not egostitch_e2e held-out scoring, which ``v_hold`` never is.
+    ``--rescore-reason``/``--scoring-run-id`` are forwarded only for held-out
+    EgoStitch scoring.
     """
     args = [
         "--checkpoint",
@@ -457,10 +431,7 @@ def run_test_protocol(
         pack_dir: Optional GPU-resident packed BF16 feature directory.
         scaffold_control: Optional scoring-time structure control.
         rescore_reason: Required by the test-access ledger when this
-            ``(arm, seed)`` has already opened held-out data. Forwarded only to
-            the ``test``/``candidate`` passes: ``src.score_universe`` rejects a
-            non-``None`` reason on a pass that is not egostitch_e2e held-out
-            scoring, which ``v_hold`` never is.
+            ``(arm, seed)`` has already opened held-out data.
         model_family: Explicit model family for a bare legacy checkpoint (only
             ``cazi_mbn`` today, whose released
             ``{"state_dict": ..., "best_val_auroc": ...}`` checkpoint does not
@@ -507,6 +478,10 @@ def run_test_protocol(
     output_dir.mkdir(parents=True, exist_ok=True)
     scores_dir = output_dir / "scores"
     scores_dir.mkdir(parents=True, exist_ok=True)
+    legacy_artifacts = [output_dir / "operating_point.json", scores_dir / "v_hold.npz"]
+    stale = [str(path) for path in legacy_artifacts if path.exists()]
+    if stale:
+        raise ValueError(f"remove obsolete max-F1/V_hold test artifacts before scoring: {stale}")
 
     # Fix for the P1 defect where this module clobbered a published
     # run_metadata.json: validate it in place (if present) and write this
@@ -517,6 +492,7 @@ def run_test_protocol(
     scoring_identity_path = _write_scoring_identity(output_dir, arm=arm, seed=seed)
 
     checkpoint_sha256 = _sha256_file(checkpoint)
+    expected_checkpoint_id = _expected_checkpoint_id(checkpoint)
 
     # egostitch_e2e held-out scoring (test/candidate) is the only case
     # `--scoring-run-id` is valid for; every other family/pairs-source
@@ -543,9 +519,8 @@ def run_test_protocol(
         include_scoring_run_id: bool,
     ) -> Path:
         # Universe-scoped F0/grounding caches (P1 fix): each pairs source gets
-        # its own cache file, so the v_hold pass populating a cache keyed to
-        # V_hold's node set can never collide with the test/candidate passes'
-        # different (and mutually different) benchmark-universe node sets --
+        # its own cache file, so test and candidate never collide despite
+        # using different benchmark-universe node sets --
         # the exact-match `build_f0_matrix(..., allow_cache_subset=False)`
         # collision this used to hit. Deliberately not relying on
         # `allow_cache_subset=True` (CLAUDE.md trap: silently gathers a
@@ -579,34 +554,7 @@ def run_test_protocol(
         )
         return score_runner(args)
 
-    # 1. Score the real internal-holdout V_hold universe. Never held-out,
-    # never carries a rescore reason or a scoring-run id.
-    v_hold_path = _score("v_hold", allow_rescore_reason=False, include_scoring_run_id=False)
-    v_hold_artifact = load_scores(v_hold_path)
-    validate_artifact_precision(v_hold_artifact, label=str(v_hold_path))
-    _require_pairs_source(v_hold_artifact, "v_hold", label=str(v_hold_path))
-    _require_full_universe(v_hold_artifact, label=str(v_hold_path))
-
-    v_hold_labels = v_hold_artifact.label.astype(np.int64)
-    v_hold_probs = v_hold_artifact.probs()
-    _reject_unlabeled(v_hold_labels, label=str(v_hold_path))
-
-    threshold = _select_max_f1_threshold(v_hold_labels, v_hold_probs)
-    operating_point: dict[str, object] = {
-        "rule": "max_f1_on_v_hold",
-        "threshold": threshold,
-        "metrics": asdict(compute_edge_metrics(v_hold_labels, v_hold_probs, threshold=threshold)),
-    }
-
-    # 2. Freeze the operating point to disk BEFORE any held-out row is scored.
-    # This file's existence -- and its mtime relative to the test/candidate
-    # score_runner calls below -- is the leakage guarantee: the threshold is
-    # committed to disk before test/candidate can have seen a single
-    # held-out label.
-    operating_point_path = output_dir / _OPERATING_POINT_FILENAME
-    operating_point_path.write_text(json.dumps(operating_point, indent=2) + "\n", encoding="utf-8")
-
-    # 3. Score test, then candidate. Both held-out passes happen only now,
+    # 1. Score test, then candidate. Both held-out passes share one scoring run,
     # sharing one scoring-run id (when this checkpoint is egostitch_e2e) so
     # they join the SAME test-access-ledger epoch.
     test_path = _score(
@@ -616,9 +564,8 @@ def run_test_protocol(
         "candidate", allow_rescore_reason=True, include_scoring_run_id=is_egostitch_e2e_family
     )
 
-    # 4. Edge metrics: the pinned report_edge_metrics shape, verbatim, at the
-    # frozen operating point.
-    edge_report = report_edge_metrics(test_path, expect_pairs_source="test", threshold=threshold)
+    # 2. Classification uses the fixed 0.5 decision threshold for every arm.
+    edge_report = report_edge_metrics(test_path, expect_pairs_source="test", threshold=0.5)
 
     # Reload test/candidate directly (report_edge_metrics only returns a
     # metrics summary, not the raw artifact) so their meta is available for the
@@ -626,18 +573,27 @@ def run_test_protocol(
     test_artifact = load_scores(test_path)
     validate_artifact_precision(test_artifact, label=str(test_path))
     _require_full_universe(test_artifact, label=str(test_path))
+    _require_scoring_identity(
+        artifact=test_artifact,
+        checkpoint_id=expected_checkpoint_id,
+        strategy=strategy,
+        label=str(test_path),
+    )
 
     candidate_artifact = load_scores(candidate_path)
     validate_artifact_precision(candidate_artifact, label=str(candidate_path))
     _require_pairs_source(candidate_artifact, "candidate", label=str(candidate_path))
     _require_full_universe(candidate_artifact, label=str(candidate_path))
-
-    _require_same_checkpoint(
-        v_hold=v_hold_artifact, test=test_artifact, candidate=candidate_artifact
+    _require_scoring_identity(
+        artifact=candidate_artifact,
+        checkpoint_id=expected_checkpoint_id,
+        strategy=strategy,
+        label=str(candidate_path),
     )
 
-    # 5. Assembled-graph metrics, at both the frozen V_hold-selected threshold
-    # and the density-matched threshold (secondary view, protocol §4).
+    _require_same_checkpoint(test=test_artifact, candidate=candidate_artifact)
+
+    # 3. Topology uses only the global density-matched assembly threshold.
     benchmark_root = data_root / _BENCHMARK_SUBDIR
     g_ref = load_test_graph(benchmark_root, strategy)
     buckets = load_test_node_buckets(benchmark_root, strategy)
@@ -658,16 +614,6 @@ def run_test_protocol(
     density_threshold = density_matched_threshold(probs[non_self_mask], target_edges)
 
     graph_report: dict[str, object] = {
-        "v_hold_selected_threshold": _graph_block(
-            threshold=threshold,
-            pairs=pairs,
-            probs=probs,
-            nodes=nodes,
-            g_ref=g_ref,
-            g_ref_simple=g_ref_simple,
-            buckets=buckets,
-            config=config,
-        ),
         "density_matched_threshold": {
             **_graph_block(
                 threshold=density_threshold,
@@ -683,17 +629,15 @@ def run_test_protocol(
         },
     }
 
-    # 6. Threshold-sweep secondary view (protocol §4): the density-matched
-    # point plus pinned percentiles of the candidate probability distribution,
-    # unioned with the frozen V_hold-selected threshold.
-    grid = sorted({threshold, *build_threshold_grid(probs, density_threshold)})
+    # 4. Threshold-sweep secondary view contains the density-matched point and
+    # pinned percentiles of the candidate probability distribution.
+    grid = build_threshold_grid(probs, density_threshold)
     sweep_points = threshold_sweep(
         pairs, probs, thresholds=grid, g_ref=g_ref, buckets=buckets, config=config
     )
     sweep_report: list[dict[str, object]] = [asdict(point) for point in sweep_points]
 
-    # 7. Arm identity: config-independent, sourced from the candidate artifact
-    # (equivalent to v_hold/test after the checkpoint-identity check above).
+    # 5. Arm identity: config-independent, sourced from the candidate artifact.
     meta = candidate_artifact.meta
     arm_report: dict[str, object] = {
         "arm": arm,
@@ -712,11 +656,6 @@ def run_test_protocol(
     }
 
     provenance: dict[str, object] = {
-        "v_hold": {
-            "path": str(v_hold_path),
-            "sha256": _sha256_file(v_hold_path),
-            "test_access_ledger_record_sha256": _ledger_record_sha256(v_hold_artifact.meta),
-        },
         "test": {
             "path": str(test_path),
             "sha256": _sha256_file(test_path),
@@ -729,7 +668,7 @@ def run_test_protocol(
         },
     }
 
-    # 8. Assemble and write. Every block above must already exist in memory --
+    # 6. Assemble and write. Every block above must already exist in memory --
     # nothing is written incrementally -- so a failure anywhere above (a
     # candidate-pass score_runner error, a graph-evaluation ValueError, ...)
     # leaves no report file at all. Edge and graph metrics are always reported
@@ -738,7 +677,6 @@ def run_test_protocol(
     report: dict[str, object] = {
         "schema_version": _SCHEMA_VERSION,
         "arm": arm_report,
-        "operating_point": operating_point,
         "edge": edge_report,
         "graph": graph_report,
         "sweep": sweep_report,
@@ -758,9 +696,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m src.eval.test_protocol",
         description=(
-            "Run the post-train test protocol for one arm: score V_hold/test/candidate, "
-            "freeze the V_hold max-F1 operating point before any held-out row is "
-            "computed, and report edge and graph metrics together."
+            "Run the post-train test protocol for one arm: score test/candidate, "
+            "report test classification at threshold 0.5 and candidate topology "
+            "at the global density-matched assembly threshold."
         ),
     )
     parser.add_argument("--checkpoint", type=Path, required=True, help="published checkpoint")

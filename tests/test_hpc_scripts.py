@@ -100,7 +100,7 @@ def test_cazi_chains_the_held_out_test_protocol() -> None:
 
 
 def test_cazi_trains_without_opening_held_out_data() -> None:
-    """`--stage all` would score test+candidate before V_hold freezes the threshold.
+    """`--stage all` would duplicate test/candidate before the protocol owns them.
 
     CAZI's default stage runs `score_and_evaluate`, which reads the balanced test
     pairs and the candidate universe. Chaining the test protocol after that would
@@ -117,12 +117,20 @@ def test_runner_discovers_visible_h20s() -> None:
         "/2023533015/topology-conditioned-inductive-edge-prediction",
         "/2023533015/.uv/bin/uv",
         "NVIDIA H20",
+        "NVIDIA H20-3e",
         "expected at least one visible GPU",
         'CUDA_VISIBLE_DEVICES="${GPU_IDS}"',
     ):
         assert value in text
     assert "-m src.e2_pipeline" in text
     assert "automatically" in (HPC_DIR / "README.md").read_text()
+
+
+def test_runner_launches_exact_v_hold_checkpoint_recovery_with_all_gpus() -> None:
+    text = RUNNER.read_text()
+    assert "recover-v-hold)" in text
+    assert "--num_processes \"${GPU_COUNT}\" --mixed_precision bf16" in text
+    assert "-m src.experiments.v_hold_checkpoint_recovery" in text
 
 
 def test_docs_describe_auto_sized_h20_runtime() -> None:

@@ -82,11 +82,12 @@ the four-H20 cold-run acceptance test remains an explicit opt-in.
 
 Every arm's formal run is now one sequence, not train followed by separate manual
 scoring commands: `hpc/run.sh train <config> ...` packs, trains, publishes, and then
-scores V_hold/test/candidate and writes the combined edge+graph `test_report.json` before
+scores test/candidate and writes the combined edge+graph `test_report.json` before
 the command returns. Nothing further is required to get an arm's held-out numbers.
 
-Only `egostitch_e2e` is ledgered against repeat scoring, because each e2e arm run spends
-two scoring epochs (test + candidate) against the same `V_hold`-derived operating point.
+Only `egostitch_e2e` is ledgered against repeat scoring. Each e2e arm run performs two
+scoring passes in one ledger epoch: fixed-0.5 test classification and density-controlled
+candidate topology.
 Re-running an already-scored `(arm, seed)` fails with "repeat scoring requires
 --rescore-reason"; pass `--rescore-reason "<why>"` after the config path (and any
 `--worker-module`/`--run-kind` flags) to `hpc/run.sh train` to intentionally re-open it.
@@ -138,8 +139,8 @@ parsing before any scoring happens, because that flag's choices are mode names o
 
 Each control also needs its own `--output-dir`, distinct from the `full` arm's own
 directory and from each other's. `run_test_protocol` unconditionally (over)writes
-`test_protocol_run_metadata.json`, `operating_point.json`, `test_report.json`, and
-`scores/{v_hold,test,candidate}.npz` plus their per-universe `f0_cache_*`/
+`test_protocol_run_metadata.json`, `test_report.json`, and
+`scores/{test,candidate}.npz` plus their per-universe `f0_cache_*`/
 `grounding_cache_*` files into whatever `--output-dir` it is given. It never writes a
 published `run_metadata.json` — it validates an existing one instead — but pointing a
 control at `outputs/egostitch_e2e_v3_full` would clobber the trained `full` arm's

@@ -3410,6 +3410,15 @@ def _validate_epoch(
         synchronize_device()
         node_cache_seconds = time.monotonic() - node_cache_started
         pair_scoring_started = time.monotonic()
+        shard_rows.sort(
+            key=lambda row: (
+                max(
+                    node_cache[data.val_pairs[row][0]].encoded.size(1),
+                    node_cache[data.val_pairs[row][1]].encoded.size(1),
+                ),
+                row,
+            )
+        )
         for start in range(0, shard_len, edge_batch):
             chunk = shard_rows[start : start + edge_batch]
             rows = [(*data.val_pairs[i], int(data.val_labels[i])) for i in chunk]

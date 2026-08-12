@@ -29,7 +29,7 @@ after the config path to train a formal EgoStitch E2E config, or use
 (`model.family: egostitch_e2e`) instead. Direct `python -m src.train_b0
 --max-steps N` remains debug-only (bounded smoke runs); it is never a formal E2
 training run. `src.e2_pipeline` runs four stages, `pack -> train -> publish ->
-test`: the test stage scores this checkpoint's held-out V_hold/test/candidate
+test`: the test stage scores this checkpoint's held-out test/candidate
 universes and writes `test_report.json` immediately after publish, so scoring
 is never a separate manual follow-up command; `--max-steps` debug runs skip it.
 Only `egostitch_e2e` is ledgered against repeat scoring — re-running an
@@ -48,9 +48,9 @@ Scoring has no wall-clock deadline: a pass's cost is set by its pairs universe
 budget only discards finished work. Pass --timeout-seconds to impose one.
 
 The test command is a thin passthrough to `python -m src.eval.test_protocol`
-for one published checkpoint: score val (V_hold) -> freeze the max-F1
-operating point -> score test -> edge metrics -> score candidate -> assembled-
-graph metrics -> `test_report.json`. `train` already runs this automatically
+for one published checkpoint: score test -> fixed-0.5 edge metrics -> score
+candidate -> global density-matched graph metrics -> `test_report.json`.
+`train` already runs this automatically
 for every trained arm; call `test` directly only for the two scoring-time
 controls (`structure_control_6a_v3`, `structure_control_6e_v1`), which reuse
 the `full` arm's checkpoint and have no pipeline run of their own.
@@ -122,8 +122,8 @@ case "${COMMAND}" in
       # training publishes its checkpoint.
       # --stage train, not the default --stage all: `all` runs CAZI's own
       # score_and_evaluate, which reads the test pairs and the candidate
-      # universe before the chained protocol has scored V_hold and frozen its
-      # operating point. The test protocol below is the single owner of every
+      # universe before the chained protocol scores it. The test protocol
+      # below is the single owner of every
       # held-out read for this arm.
       "${PYTHON_BIN}" -m src.train_cazi_mbn "${CONFIG_PATH}" --device cuda --stage train
       read -r CAZI_OUTPUT_DIR CAZI_STRATEGY CAZI_SEED < <("${PYTHON_BIN}" -c '

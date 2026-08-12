@@ -71,6 +71,7 @@ class InternalHoldoutPartition:
 
     v_fit: frozenset[str]
     v_hold: frozenset[str]
+    holdout_draws: tuple[frozenset[str], frozenset[str]]
     training_interactions_fit: frozenset[Pair]
     topology_fit: frozenset[Pair]
     topology_hold: frozenset[Pair]
@@ -197,6 +198,7 @@ def derive_internal_holdout(
     return InternalHoldoutPartition(
         v_fit=v_fit,
         v_hold=v_hold,
+        holdout_draws=(first_draw, second_draw),
         training_interactions_fit=training_interactions_fit,
         topology_fit=topology_fit,
         topology_hold=topology_hold,

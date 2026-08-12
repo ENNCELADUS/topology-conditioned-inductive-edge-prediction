@@ -1,6 +1,6 @@
 """Tests for src.eval.test_protocol: the per-arm held-out test protocol.
 
-Builds synthetic v_hold/test/candidate artifacts and a tiny benchmark fixture
+Builds synthetic test/candidate artifacts and a tiny benchmark fixture
 (reusing the artifact/graph builders already committed for
 `tests.test_g1_hardened_e2`), then drives `run_test_protocol` with a fake
 `score_runner` so nothing here depends on `src.score_fanout.score_sharded`
@@ -24,7 +24,6 @@ import pytest
 import torch
 from numpy.typing import NDArray
 from src.eval import test_protocol
-from src.eval.edge_metrics import compute_edge_metrics
 from src.eval.test_protocol import run_test_protocol
 from src.score_universe import ScoresArtifact, validate_artifact_precision
 
@@ -87,7 +86,6 @@ class _FakeScoreRunner:
 class _Fixture:
     data_root: Path
     artifacts: dict[str, Path]
-    expected_threshold: float
 
 
 def _build_candidate_and_test_probs(pairs: list[tuple[str, str]]) -> NDArray[np.float64]:
@@ -104,25 +102,8 @@ def _build_candidate_and_test_probs(pairs: list[tuple[str, str]]) -> NDArray[np.
     return np.array(probs, dtype=np.float64)
 
 
-def _reference_max_f1_threshold(labels: NDArray[np.int64], probs: NDArray[np.float64]) -> float:
-    """Independent reference for the max-F1 threshold: scan every unique prob.
-
-    Ties broken toward the smallest threshold, matching
-    `test_protocol._select_max_f1_threshold`'s documented tie-break.
-    """
-    best_threshold: float | None = None
-    best_f1 = -1.0
-    for t in sorted(set(probs.tolist())):
-        metrics = compute_edge_metrics(labels, probs, threshold=t)
-        if metrics.f1 > best_f1:
-            best_f1 = metrics.f1
-            best_threshold = t
-    assert best_threshold is not None
-    return best_threshold
-
-
 def _build_fixture(tmp_path: Path) -> _Fixture:
-    """Build a full v_hold/test/candidate + benchmark fixture sharing one node universe."""
+    """Build a full test/candidate + benchmark fixture sharing one node universe."""
     g_ref = _make_reference_graph()
     buckets = _small_buckets(_NODES, size=5, n_samples=4, seed=0)
     data_root = _write_benchmark(tmp_path, _STRATEGY, g_ref, buckets)
@@ -155,31 +136,9 @@ def _build_fixture(tmp_path: Path) -> _Fixture:
         checkpoint_id=_CHECKPOINT_ID,
     )
 
-    # V_hold: a small, independently labeled set with a non-trivial max-F1
-    # threshold (a false positive sits strictly between two true positives).
-    v_hold_labels = np.array([1, 1, 1, 0, 0, 0, 0], dtype=np.int8)
-    v_hold_probs = np.array([0.9, 0.8, 0.6, 0.7, 0.4, 0.3, 0.1])
-    v_hold_logits = np.array([_logit_for_prob(p) for p in v_hold_probs], dtype=np.float32)
-    v_hold_pairs = [(f"v{i}", f"v{i}_partner") for i in range(len(v_hold_labels))]
-    v_hold_node_ids = sorted({node for pair in v_hold_pairs for node in pair})
-    v_hold_path = scores_dir / "v_hold.npz"
-    _write_universe_npz(
-        v_hold_path,
-        node_ids=v_hold_node_ids,
-        pairs=v_hold_pairs,
-        logits=v_hold_logits,
-        labels=v_hold_labels,
-        strategy=_STRATEGY,
-        pairs_source="v_hold",
-        checkpoint_id=_CHECKPOINT_ID,
-    )
-
-    expected_threshold = _reference_max_f1_threshold(v_hold_labels.astype(np.int64), v_hold_probs)
-
     return _Fixture(
         data_root=data_root,
-        artifacts={"v_hold": v_hold_path, "test": test_path, "candidate": candidate_path},
-        expected_threshold=expected_threshold,
+        artifacts={"test": test_path, "candidate": candidate_path},
     )
 
 
@@ -216,21 +175,15 @@ class TestRunTestProtocol:
             score_runner=runner,
         )
 
-        # 1. Pass ordering: v_hold strictly before test and candidate, test before candidate.
-        assert runner.pairs_order == ["v_hold", "test", "candidate"]
-
-        # 2. The operating point is frozen to disk; this file's existence at all
-        # is the leakage guarantee (it can only have been written by the code
-        # that ran between the v_hold and test score_runner calls).
-        op_point_path = output_dir / "operating_point.json"
-        assert op_point_path.exists()
-        on_disk_op_point = json.loads(op_point_path.read_text(encoding="utf-8"))
-        assert on_disk_op_point["threshold"] == pytest.approx(fixture.expected_threshold)
+        # 1. No V_hold pass: test classification and candidate topology use
+        # independent fixed/density-controlled operating points.
+        assert runner.pairs_order == ["test", "candidate"]
+        assert not (output_dir / "operating_point.json").exists()
 
         # 3. --data-root/--strategy/--checkpoint and --run-metadata forwarded to every
         # pass, pointed at this module's own scoring-identity file (never the
         # published run_metadata.json -- see test_never_overwrites_published_run_metadata).
-        for pairs_source in ("v_hold", "test", "candidate"):
+        for pairs_source in ("test", "candidate"):
             call = runner.call_for(pairs_source)
             assert _arg_value(call, "--checkpoint") == str(checkpoint)
             assert _arg_value(call, "--data-root") == str(fixture.data_root)
@@ -248,13 +201,12 @@ class TestRunTestProtocol:
         assert list(report.keys()) == [
             "schema_version",
             "arm",
-            "operating_point",
             "edge",
             "graph",
             "sweep",
             "provenance",
         ]
-        assert report["schema_version"] == "test_protocol_v1"
+        assert report["schema_version"] == "test_protocol_v2"
 
         arm_block = report["arm"]
         assert isinstance(arm_block, dict)
@@ -264,16 +216,7 @@ class TestRunTestProtocol:
         assert arm_block["checkpoint_id"] == _CHECKPOINT_ID
         assert arm_block["checkpoint_sha256"] == test_protocol._sha256_file(checkpoint)
 
-        # 5. Operating point: rule, threshold, and the V_hold metrics behind it.
-        op = report["operating_point"]
-        assert isinstance(op, dict)
-        assert op["rule"] == "max_f1_on_v_hold"
-        assert op["threshold"] == pytest.approx(fixture.expected_threshold)
-        op_metrics = op["metrics"]
-        assert isinstance(op_metrics, dict)
-        assert op_metrics["threshold"] == pytest.approx(fixture.expected_threshold)
-
-        # 6. Edge block: report_edge_metrics's exact shape, self-loop headline first.
+        # 5. Edge block: fixed 0.5 decisions, self-loop headline first.
         edge = report["edge"]
         assert isinstance(edge, dict)
         assert edge["pairs_source"] == "test"
@@ -287,19 +230,19 @@ class TestRunTestProtocol:
         # explicit null rather than dropping the key.
         assert edge["metrics_self"] is None
         assert edge["metrics_non_self"] is not None
+        assert edge["metrics"]["threshold"] == pytest.approx(0.5)
 
-        # 7. Graph block: both metric families, both thresholds, five numbers
-        # each, GS/RD named separately at the global-simple-edge and
+        # 6. Graph block: only global density control, with five numbers;
+        # GS/RD are named separately at the global-simple-edge and
         # BFS-macro granularity, never aggregated into a summary score.
         graph = report["graph"]
         assert isinstance(graph, dict)
-        assert set(graph.keys()) == {"v_hold_selected_threshold", "density_matched_threshold"}
-        for block_name in ("v_hold_selected_threshold", "density_matched_threshold"):
-            block = graph[block_name]
-            assert isinstance(block, dict)
-            assert set(block["graph_similarity"]) == {"global_simple_edge", "bfs_macro"}
-            assert set(block["relative_density"]) == {"global_simple_edge", "bfs_macro"}
-            assert set(block["mmd_ratio"]) == {"degree", "clustering", "spectral"}
+        assert set(graph.keys()) == {"density_matched_threshold"}
+        block = graph["density_matched_threshold"]
+        assert isinstance(block, dict)
+        assert set(block["graph_similarity"]) == {"global_simple_edge", "bfs_macro"}
+        assert set(block["relative_density"]) == {"global_simple_edge", "bfs_macro"}
+        assert set(block["mmd_ratio"]) == {"degree", "clustering", "spectral"}
 
         dm = graph["density_matched_threshold"]
         assert dm["target_edges"] == 5
@@ -309,10 +252,7 @@ class TestRunTestProtocol:
         assert dm["graph_similarity"]["global_simple_edge"] == pytest.approx(1.0)
         assert dm["relative_density"]["global_simple_edge"] == pytest.approx(1.0)
 
-        vs = graph["v_hold_selected_threshold"]
-        assert vs["threshold"] == pytest.approx(fixture.expected_threshold)
-
-        # 8. Sweep rows present.
+        # 7. Sweep rows present.
         assert isinstance(report["sweep"], list)
         assert len(report["sweep"]) > 0
         for row in report["sweep"]:
@@ -320,7 +260,7 @@ class TestRunTestProtocol:
                 set(row)
             )
 
-        # 9. Provenance: three artifact paths, sha256, and ledger digests
+        # 8. Provenance: two artifact paths, sha256, and ledger digests
         # (null here -- v3_1 never claims the held-out E2E universe).
         provenance = report["provenance"]
         assert isinstance(provenance, dict)
@@ -347,10 +287,8 @@ class TestRunTestProtocol:
                 score_runner=runner,
             )
 
-        # v_hold and test both ran (and test's edge report was at least attempted
-        # to be built up to the point candidate failed); the report is absent.
-        assert runner.pairs_order == ["v_hold", "test", "candidate"]
-        assert (output_dir / "operating_point.json").exists()
+        assert runner.pairs_order == ["test", "candidate"]
+        assert not (output_dir / "operating_point.json").exists()
         assert not (output_dir / "test_report.json").exists()
 
     def test_failing_test_pass_leaves_no_report_written(self, tmp_path: Path) -> None:
@@ -370,8 +308,8 @@ class TestRunTestProtocol:
                 score_runner=runner,
             )
 
-        assert runner.pairs_order == ["v_hold", "test"]
-        assert (output_dir / "operating_point.json").exists()
+        assert runner.pairs_order == ["test"]
+        assert not (output_dir / "operating_point.json").exists()
         assert not (output_dir / "test_report.json").exists()
 
     def test_forwards_optional_flags_with_rescore_reason_only_on_heldout_passes(
@@ -397,13 +335,11 @@ class TestRunTestProtocol:
             rescore_reason="repeat scoring for gate re-run",
         )
 
-        for pairs_source in ("v_hold", "test", "candidate"):
+        for pairs_source in ("test", "candidate"):
             call = runner.call_for(pairs_source)
             assert _arg_value(call, "--pack-dir") == str(pack_dir)
             assert _arg_value(call, "--scaffold-control") == "shuffle_within_pair_v3"
 
-        v_hold_call = runner.call_for("v_hold")
-        assert "--rescore-reason" not in v_hold_call
         for pairs_source in ("test", "candidate"):
             call = runner.call_for(pairs_source)
             assert _arg_value(call, "--rescore-reason") == "repeat scoring for gate re-run"
@@ -472,12 +408,11 @@ class TestRunTestProtocol:
             score_runner=runner,
         )
 
-        # run_test_protocol itself validates v_hold, the reloaded test artifact,
-        # and candidate -- report_edge_metrics validates test a second time
+        # run_test_protocol validates the reloaded test artifact and candidate;
+        # report_edge_metrics validates test a second time
         # through its own bound import, which this spy (patched only on
         # test_protocol's namespace) does not observe.
         assert calls == [
-            str(fixture.artifacts["v_hold"]),
             str(fixture.artifacts["test"]),
             str(fixture.artifacts["candidate"]),
         ]
@@ -518,32 +453,39 @@ class TestRunTestProtocol:
             )
         assert not (output_dir / "test_report.json").exists()
 
-    def test_rejects_v_hold_artifact_with_wrong_pairs_source(self, tmp_path: Path) -> None:
+    def test_rejects_mutually_consistent_scores_from_another_checkpoint(
+        self, tmp_path: Path
+    ) -> None:
         fixture = _build_fixture(tmp_path)
-        checkpoint = _write_checkpoint(tmp_path)
-        output_dir = tmp_path / "outputs" / "full_seed0"
-
-        pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
-        probs = _build_candidate_and_test_probs(pairs)
-        logits = np.array([_logit_for_prob(p) for p in probs], dtype=np.float32)
-        wrong_source_v_hold = tmp_path / "prebuilt_scores" / "v_hold_wrong_source.npz"
-        _write_universe_npz(
-            wrong_source_v_hold,
-            node_ids=_NODES,
-            pairs=pairs,
-            logits=logits,
-            labels=labels,
-            strategy=_STRATEGY,
-            pairs_source="candidate",  # wrong: run_test_protocol expects "v_hold"
-            checkpoint_id=_CHECKPOINT_ID,
+        checkpoint = tmp_path / "real_checkpoint.pt"
+        torch.save(
+            {"model_family": "v3_1", "model_config": {}, "model_state": {"w": torch.ones(1)}},
+            checkpoint,
         )
-        artifacts = dict(fixture.artifacts)
-        artifacts["v_hold"] = wrong_source_v_hold
-        runner = _FakeScoreRunner(artifacts)
+        runner = _FakeScoreRunner(fixture.artifacts)
 
-        with pytest.raises(ValueError, match="pairs_source"):
+        with pytest.raises(ValueError, match="requested checkpoint"):
             run_test_protocol(
                 checkpoint=checkpoint,
+                output_dir=tmp_path / "outputs" / "stale",
+                data_root=fixture.data_root,
+                strategy=_STRATEGY,
+                arm="full",
+                seed=0,
+                score_runner=runner,
+                reuse_existing_scores=True,
+            )
+
+    def test_rejects_legacy_max_f1_artifacts_before_scoring(self, tmp_path: Path) -> None:
+        fixture = _build_fixture(tmp_path)
+        output_dir = tmp_path / "outputs" / "legacy"
+        output_dir.mkdir(parents=True)
+        (output_dir / "operating_point.json").write_text("{}\n", encoding="utf-8")
+        runner = _FakeScoreRunner(fixture.artifacts)
+
+        with pytest.raises(ValueError, match="obsolete max-F1/V_hold"):
+            run_test_protocol(
+                checkpoint=_write_checkpoint(tmp_path),
                 output_dir=output_dir,
                 data_root=fixture.data_root,
                 strategy=_STRATEGY,
@@ -551,23 +493,19 @@ class TestRunTestProtocol:
                 seed=0,
                 score_runner=runner,
             )
-        assert not (output_dir / "test_report.json").exists()
-
+        assert runner.calls == []
 
 class TestReuseExistingScores:
     """Resuming a run whose later pass failed must not redo the finished ones."""
 
     def test_reuses_written_artifacts_and_only_scores_what_is_missing(self, tmp_path: Path) -> None:
-        """Mimics the real failure: v_hold and test finished, candidate did not."""
+        """Mimics the real failure: test finished, candidate did not."""
         fixture = _build_fixture(tmp_path)
         checkpoint = _write_checkpoint(tmp_path)
         output_dir = tmp_path / "outputs" / "resume"
         scores_dir = output_dir / "scores"
         scores_dir.mkdir(parents=True)
-        for pairs_source in ("v_hold", "test"):
-            (scores_dir / f"{pairs_source}.npz").write_bytes(
-                fixture.artifacts[pairs_source].read_bytes()
-            )
+        (scores_dir / "test.npz").write_bytes(fixture.artifacts["test"].read_bytes())
 
         runner = _FakeScoreRunner(fixture.artifacts)
         run_test_protocol(
@@ -590,10 +528,7 @@ class TestReuseExistingScores:
         output_dir = tmp_path / "outputs" / "no_reuse"
         scores_dir = output_dir / "scores"
         scores_dir.mkdir(parents=True)
-        for pairs_source in ("v_hold", "test"):
-            (scores_dir / f"{pairs_source}.npz").write_bytes(
-                fixture.artifacts[pairs_source].read_bytes()
-            )
+        (scores_dir / "test.npz").write_bytes(fixture.artifacts["test"].read_bytes())
 
         runner = _FakeScoreRunner(fixture.artifacts)
         run_test_protocol(
@@ -606,7 +541,7 @@ class TestReuseExistingScores:
             score_runner=runner,
         )
 
-        assert runner.pairs_order == ["v_hold", "test", "candidate"]
+        assert runner.pairs_order == ["test", "candidate"]
 
 
 class TestPublishedRunMetadataNeverClobbered:
@@ -645,7 +580,7 @@ class TestPublishedRunMetadataNeverClobbered:
         scoring_identity_path = output_dir / "test_protocol_run_metadata.json"
         assert scoring_identity_path.exists()
         assert scoring_identity_path != published_path
-        for pairs_source in ("v_hold", "test", "candidate"):
+        for pairs_source in ("test", "candidate"):
             call = runner.call_for(pairs_source)
             assert _arg_value(call, "--run-metadata") == str(scoring_identity_path)
         assert json.loads(scoring_identity_path.read_text(encoding="utf-8")) == {
@@ -774,11 +709,11 @@ class TestPublishedRunMetadataNeverClobbered:
         )
 
         assert published_path.read_bytes() == published_bytes_before
-        assert runner.pairs_order == ["v_hold", "test", "candidate"]
+        assert runner.pairs_order == ["test", "candidate"]
 
 
 class TestUniverseScopedCaches:
-    """P1 fix #3: v_hold/test/candidate must never share an F0/grounding cache."""
+    """P1 fix #3: test/candidate must never share an F0/grounding cache."""
 
     def test_three_passes_get_three_distinct_cache_paths(self, tmp_path: Path) -> None:
         fixture = _build_fixture(tmp_path)
@@ -798,16 +733,16 @@ class TestUniverseScopedCaches:
 
         f0_caches = {
             pairs_source: _arg_value(runner.call_for(pairs_source), "--f0-cache")
-            for pairs_source in ("v_hold", "test", "candidate")
+            for pairs_source in ("test", "candidate")
         }
         grounding_caches = {
             pairs_source: _arg_value(runner.call_for(pairs_source), "--grounding-cache")
-            for pairs_source in ("v_hold", "test", "candidate")
+            for pairs_source in ("test", "candidate")
         }
         assert None not in f0_caches.values()
         assert None not in grounding_caches.values()
-        assert len(set(f0_caches.values())) == 3
-        assert len(set(grounding_caches.values())) == 3
+        assert len(set(f0_caches.values())) == 2
+        assert len(set(grounding_caches.values())) == 2
         # Namespaced by pairs source, not merely random/unique, so the mapping
         # from cache file to universe is auditable from the filename alone.
         for pairs_source, path in f0_caches.items():
@@ -819,7 +754,7 @@ class TestUniverseScopedCaches:
 
 
 class TestOneLedgerEpochPerProtocolRun:
-    """P1 fix #4: test and candidate must share one scoring-run id; v_hold gets none."""
+    """P1 fix #4: test and candidate must share one scoring-run id."""
 
     def test_scoring_run_id_shared_by_test_and_candidate_only_for_egostitch_e2e(
         self, tmp_path: Path
@@ -840,10 +775,8 @@ class TestOneLedgerEpochPerProtocolRun:
             model_family="egostitch_e2e",
         )
 
-        v_hold_call = runner.call_for("v_hold")
         test_call = runner.call_for("test")
         candidate_call = runner.call_for("candidate")
-        assert "--scoring-run-id" not in v_hold_call
         test_run_id = _arg_value(test_call, "--scoring-run-id")
         candidate_run_id = _arg_value(candidate_call, "--scoring-run-id")
         assert test_run_id is not None
@@ -956,7 +889,7 @@ class TestOracleAndCaziForwarding:
             allow_oracle_diagnostic=True,
         )
 
-        for pairs_source in ("v_hold", "test", "candidate"):
+        for pairs_source in ("test", "candidate"):
             assert "--allow-oracle-diagnostic" in runner.call_for(pairs_source)
 
     def test_model_family_and_model_config_forwarded_to_every_pass(self, tmp_path: Path) -> None:
@@ -979,7 +912,7 @@ class TestOracleAndCaziForwarding:
             model_config=model_config,
         )
 
-        for pairs_source in ("v_hold", "test", "candidate"):
+        for pairs_source in ("test", "candidate"):
             call = runner.call_for(pairs_source)
             assert _arg_value(call, "--model-family") == "cazi_mbn"
             assert _arg_value(call, "--model-config") == str(model_config)

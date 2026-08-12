@@ -80,7 +80,7 @@ Components:
   positive edges supply both structural topology and edge-loss classification; the
   topology projection alone removes self-pairs (spec §§6, 9.3).
 - **Edge-level metrics:** AUROC, AUPRC, accuracy, sensitivity, specificity, precision, recall, F1,
-  MCC at the selected operating point; calibration (ECE, Brier) on averaged probabilities.
+  MCC at fixed threshold 0.5; calibration (ECE, Brier) on averaged probabilities.
 - **Assembled graph metrics — two families (binding):**
   - *Trained-on family* (may appear inside training losses): degree-distribution MMD,
     clustering-coefficient MMD, code-histogram/motif-conductance distances, random-GIN
@@ -344,12 +344,12 @@ rule).
 ## 4. Evaluation protocol
 
 - **Edge-level task:** score held-out candidate pairs and report AUROC/AUPRC plus
-  thresholded metrics at the selected operating point; stochastic candidates average
+  thresholded metrics at fixed 0.5; stochastic candidates average
   a fixed, disclosed number of samples.
 - **Assembled graph task:** assemble scored pairs into a predicted graph and evaluate both metric
   families of §1 on benchmark buckets, with noise-floor, ceiling, and Oracle rows.
-- **Operating point:** primary results use a validation-selected threshold. Secondary results use
-  density-matched and threshold-sweep views to distinguish score quality from assembly density.
+- **Operating points:** classification uses fixed 0.5; topology uses global density matching.
+  Threshold sweeps distinguish score quality from assembly density.
 - **Imbalance view:** report PR curves or operating-point summaries under the full candidate
   universe when it differs from balanced edge evaluation.
 - **Stratified reporting:** edge metrics by degree (head/tail), by Topological Concentration
@@ -574,8 +574,8 @@ rule).
 
 Within each experiment, per-arm execution is a single sequence, not train followed by a
 separate manual scoring/reporting step: `hpc/run.sh train <config> ...` packs, trains,
-publishes, then automatically scores V_hold, freezes the max-F1 operating point, scores
-test and candidate, and writes the combined edge+graph `test_report.json` before the
+publishes, then automatically scores test at fixed 0.5 and candidate at a global
+density-matched threshold, and writes the combined edge+graph `test_report.json` before the
 command returns (`hpc/README.md`). A debug `--max-steps` run skips this test stage
 entirely. CAZI-MBN reaches the same report through `hpc/run.sh test`; two historical
 structure controls reuse the `full` EgoStitch checkpoint and also run through `test`.
