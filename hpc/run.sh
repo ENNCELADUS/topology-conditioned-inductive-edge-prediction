@@ -6,7 +6,7 @@ readonly EXPECTED_REPO_ROOT="/2023533015/topology-conditioned-inductive-edge-pre
 readonly UV_BIN="/2023533015/.uv/bin/uv"
 readonly PYTHON_BIN="${EXPECTED_REPO_ROOT}/.venv/bin/python"
 readonly DATA_ROOT="${EXPECTED_REPO_ROOT}/data"
-readonly EXPECTED_GPU_NAME="NVIDIA H20"
+readonly EXPECTED_GPU_NAMES="NVIDIA H20 NVIDIA H20-3e"
 
 usage() {
   cat <<'EOF'
@@ -14,6 +14,7 @@ Usage:
   hpc/run.sh check
   hpc/run.sh train <config.yaml> [train args...]
   hpc/run.sh score <score args...>
+  hpc/run.sh recover-v-hold <recovery args...>
   hpc/run.sh test <test args...>
   hpc/run.sh merge <merge args...>
   hpc/run.sh g1 <g1 args...>
@@ -82,8 +83,8 @@ assert_runtime() {
   mapfile -t gpu_names < <(nvidia-smi --query-gpu=name --format=csv,noheader)
   [[ "${#gpu_names[@]}" -ge 1 ]] || fail "expected at least one visible GPU"
   for gpu_name in "${gpu_names[@]}"; do
-    [[ "${gpu_name}" == "${EXPECTED_GPU_NAME}" ]] || \
-      fail "expected all GPUs to be ${EXPECTED_GPU_NAME}, found ${gpu_name}"
+    [[ " ${EXPECTED_GPU_NAMES} " == *" ${gpu_name} "* ]] || \
+      fail "expected all GPUs to be one of ${EXPECTED_GPU_NAMES}, found ${gpu_name}"
   done
   GPU_COUNT="${#gpu_names[@]}"
   GPU_IDS="$(seq -s, 0 "$((GPU_COUNT - 1))")"
@@ -102,7 +103,7 @@ case "${COMMAND}" in
     "${UV_BIN}" --version
     nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader
     "${PYTHON_BIN}" -c \
-      'import os, torch; n=int(os.environ["GPU_COUNT"]); assert torch.cuda.device_count() == n; assert all(torch.cuda.get_device_name(i) == "NVIDIA H20" for i in range(n)); print(f"python/torch/cuda={torch.__version__}/{torch.version.cuda}; gpus={[torch.cuda.get_device_name(i) for i in range(n)]}")'
+      'import os, torch; n=int(os.environ["GPU_COUNT"]); allowed={"NVIDIA H20", "NVIDIA H20-3e"}; assert torch.cuda.device_count() == n; assert all(torch.cuda.get_device_name(i) in allowed for i in range(n)); print(f"python/torch/cuda={torch.__version__}/{torch.version.cuda}; gpus={[torch.cuda.get_device_name(i) for i in range(n)]}")'
     "${PYTHON_BIN}" -c \
       'from pathlib import Path; from src.data.artifacts import verify_benchmark; print(verify_benchmark(Path("data/benchmark_2025_neurips"), "breadth_first"))'
     "${PYTHON_BIN}" -c \
@@ -146,6 +147,11 @@ print(cfg.output_dir, cfg.strategy, cfg.seed)
     ;;
   score)
     exec "${PYTHON_BIN}" -m src.score_fanout "$@"
+    ;;
+  recover-v-hold)
+    exec "${PYTHON_BIN}" -m accelerate.commands.launch \
+      --num_processes "${GPU_COUNT}" --mixed_precision bf16 \
+      -m src.experiments.v_hold_checkpoint_recovery "$@"
     ;;
   test)
     exec "${PYTHON_BIN}" -m src.eval.test_protocol "$@"

@@ -50,7 +50,7 @@ to the exact count in their retained artifacts.
 |---|---|
 | SSH | `ssh -p 30838 root@10.15.171.204` |
 | Repository | `/2023533015/topology-conditioned-inductive-edge-prediction` |
-| GPU | 1 or more NVIDIA H20, 97,871 MiB each |
+| GPU | 1 or more NVIDIA H20/H20-3e |
 | NVIDIA driver | 550.144.03 |
 | Python | 3.11.15 from the repository `.venv` |
 | PyTorch / CUDA runtime | `2.10.0+cu128` / `12.8` |
@@ -58,7 +58,7 @@ to the exact count in their retained artifacts.
 | Data | repository-local `data/` (26 GB; benchmark + frozen feature cache) |
 
 Do not store the SSH password in this repository. The runner fails before executing any
-command unless at least one visible GPU is named `NVIDIA H20`, the fixed paths exist, and
+command unless at least one visible GPU is named `NVIDIA H20` or `NVIDIA H20-3e`, the fixed paths exist, and
 both benchmark and feature directories are present. The runner automatically exports
 all detected GPU indices. `score` is a thin passthrough to `python -m src.score_fanout`,
 which owns GPU-count detection, `--device cuda --amp bf16`, sharding, and the strict merge;
