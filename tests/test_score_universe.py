@@ -36,6 +36,22 @@ from src.model.egostitch.generator.egostitch import EgoStitchImagineGenerator
 INPUT_DIM = 4
 
 
+def test_gpu_table_gather_uses_batch_local_width() -> None:
+    encoded_table = torch.arange(3 * 7 * 2, dtype=torch.float32).reshape(3, 7, 2)
+    length_table = torch.tensor([7, 2, 3])
+    rows = torch.tensor([1, 2])
+
+    encoded, lengths = score_universe._gather_padded_node_rows(
+        encoded_table, length_table, rows, width=3
+    )
+
+    assert encoded.shape == (2, 3, 2)
+    torch.testing.assert_close(encoded, encoded_table[rows, :3])
+    torch.testing.assert_close(lengths, torch.tensor([2, 3]))
+    with pytest.raises(ValueError, match="shorter than a selected node state"):
+        score_universe._gather_padded_node_rows(encoded_table, length_table, rows, width=2)
+
+
 def _write_feature_store(
     root: Path, node_tokens: dict[str, torch.Tensor], *, input_dim: int = INPUT_DIM
 ) -> None:
@@ -731,6 +747,23 @@ def test_shard_and_merge_matches_unsharded_run(tmp_path: Path) -> None:
     assert merged.meta["model_family"] == unsharded.meta["model_family"]
     assert merged.meta["pairs_source"] == unsharded.meta["pairs_source"]
     assert merged.meta["num_rows"] == unsharded.meta["num_rows"] == 23
+
+
+def test_balanced_shard_range_is_contiguous_covering_and_deterministic() -> None:
+    costs = [100, 4, 9, 1, 7, 2, 20, 3, 5]
+    ranges = [score_universe._balanced_shard_range(costs, shard, 4) for shard in range(4)]
+    assert ranges == [score_universe._balanced_shard_range(costs, shard, 4) for shard in range(4)]
+    assert ranges[0][0] == 0
+    assert ranges[-1][1] == len(costs)
+    assert all(left[1] == right[0] for left, right in zip(ranges, ranges[1:], strict=False))
+
+
+def test_balanced_shard_range_evenly_splits_uniform_costs() -> None:
+    assert [score_universe._balanced_shard_range([1] * 12, shard, 3) for shard in range(3)] == [
+        (0, 4),
+        (4, 8),
+        (8, 12),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -2463,6 +2496,132 @@ def test_full_oracle_scoring_is_unreachable_without_the_diagnostic_flag(
         nx.Graph(_E2E_PAIRS)
     )
     assert truth_graph_path.is_file()
+    sidecar = output.with_name(f"{output.stem}.telemetry.json")
+    telemetry = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert telemetry["rows"] == len(_E2E_PAIRS)
+    assert telemetry["ego_size"] == {
+        "max": 3,
+        "p50": 3.0,
+        "p90": 3.0,
+        "p95": 3.0,
+        "p99": 3.0,
+    }
+    assert telemetry["budgets"]["cell_budget"] == score_universe._FULL_ORACLE_CELL_BUDGET
+    assert telemetry["producer_wait_seconds"] >= 0.0
+    assert telemetry["max_memory_allocated_bytes"] == 0
+    score_profile = cast(dict[str, object], artifact.meta["score_profile"])
+    assert score_profile["peak_memory_allocated_bytes"] == 0
+
+
+def test_full_oracle_batched_scoring_matches_singleton_and_inline_prefetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root, checkpoint, _ = _egostitch_e2e_setup(
+        tmp_path, model_config=_TINY_FULL_ORACLE_E2E_CONFIG
+    )
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    model = score_universe.build_model("egostitch_e2e", _TINY_FULL_ORACLE_E2E_CONFIG)
+    model.load_state_dict(payload["model_state"])
+    model.eval()
+    truth_graph = nx.Graph(_E2E_PAIRS)
+    store = FeatureStore(data_root / "features" / "frozen_node_features_1024")
+
+    def score() -> dict[str, np.ndarray]:
+        return score_universe._score_egostitch_e2e(
+            model,
+            _E2E_PAIRS,
+            store,
+            device=torch.device("cpu"),
+            token_budget=8192,
+            f0_cache=tmp_path / "full-oracle-equivalence-f0.pt",
+            grounding_cache=tmp_path / "full-oracle-equivalence-grounding.npz",
+            oracle_truth_graph=truth_graph,
+        )
+
+    monkeypatch.setattr(score_universe, "_FULL_ORACLE_MAX_BATCH_PAIRS", 1)
+    monkeypatch.setattr(score_universe, "_FULL_ORACLE_PREFETCH_DEPTH", 0)
+    singleton = score()
+
+    monkeypatch.setattr(score_universe, "_FULL_ORACLE_MAX_BATCH_PAIRS", 1024)
+    inline = score()
+    monkeypatch.setattr(score_universe, "_FULL_ORACLE_PREFETCH_DEPTH", 4)
+    prefetched = score()
+
+    for key in score_universe._EGOSTITCH_E2E_ARRAY_KEYS:
+        np.testing.assert_allclose(inline[key], singleton[key], rtol=1e-6, atol=1e-6)
+        np.testing.assert_array_equal(prefetched[key], inline[key])
+
+
+def test_full_oracle_balanced_shards_merge_to_unsharded_with_empty_shard(
+    tmp_path: Path,
+) -> None:
+    pairs = [("n0", "n1"), ("n2", "n3"), ("n2", "n2")]
+    data_root, checkpoint, pairs_path = _egostitch_e2e_setup(
+        tmp_path, model_config=_TINY_FULL_ORACLE_E2E_CONFIG
+    )
+    pairs_path.write_text("".join(f"{u}\t{v}\n" for u, v in pairs), encoding="utf-8")
+    strategy_dir = data_root / "benchmark_2025_neurips" / "breadth_first"
+    strategy_dir.mkdir(parents=True, exist_ok=True)
+    (strategy_dir / "test_edges.txt").write_bytes(pairs_path.read_bytes())
+    truth = nx.Graph([("n0", "n1"), ("n2", "n3")])
+    truth.add_edges_from(("n0", f"hub-{index:02d}") for index in range(68))
+    _write_test_graph_pkl(data_root, "breadth_first", list(truth.edges))
+    run_metadata = _write_run_metadata(tmp_path, checkpoint, arm="full_ego_oracle")
+    common = [
+        "score",
+        "--checkpoint",
+        str(checkpoint),
+        "--pairs",
+        "test",
+        "--data-root",
+        str(data_root),
+        "--token-budget",
+        "8192",
+        "--f0-cache",
+        str(tmp_path / "balanced-f0.pt"),
+        "--grounding-cache",
+        str(tmp_path / "balanced-grounding.npz"),
+        "--device",
+        "cpu",
+        "--run-metadata",
+        str(run_metadata),
+        "--allow-oracle-diagnostic",
+    ]
+
+    unsharded_path = tmp_path / "balanced-unsharded.npz"
+    score_universe.main([*common, "--output", str(unsharded_path), "--scoring-run-id", "unsharded"])
+    shard_base = tmp_path / "balanced-shards.npz"
+    shard_paths: list[Path] = []
+    for shard in range(2):
+        score_universe.main(
+            [
+                *common,
+                "--output",
+                str(shard_base),
+                "--shard",
+                str(shard),
+                "--num-shards",
+                "2",
+                "--scoring-run-id",
+                "balanced-shards",
+                "--rescore-reason",
+                "balanced shard merge regression",
+            ]
+        )
+        shard_paths.append(tmp_path / f"balanced-shards.shard-{shard}.npz")
+
+    assert len(score_universe.load_scores(shard_paths[0]).logit) == 0
+    merged_path = tmp_path / "balanced-merged.npz"
+    score_universe.main(
+        ["merge", "--inputs", *[str(path) for path in shard_paths], "--output", str(merged_path)]
+    )
+    unsharded = score_universe.load_scores(unsharded_path)
+    merged = score_universe.load_scores(merged_path)
+    assert list(merged.pairs()) == list(unsharded.pairs())
+    np.testing.assert_allclose(merged.logit, unsharded.logit, rtol=1e-6, atol=1e-6)
+    assert merged.f_logit is not None and unsharded.f_logit is not None
+    np.testing.assert_allclose(merged.f_logit, unsharded.f_logit, rtol=1e-6, atol=1e-6)
+    assert merged.meta["num_rows"] == unsharded.meta["num_rows"] == len(pairs)
 
 
 def test_oracle_generator_scoring_is_unreachable_without_the_diagnostic_flag(

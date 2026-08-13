@@ -169,6 +169,18 @@ def test_batched_cpu_construction_matches_independent_reference() -> None:
         assert torch.count_nonzero(graph.adj[batch_row, :, count:, :]) == 0
 
 
+def test_nonself_endpoint_order_preserves_source_then_destination() -> None:
+    truth = nx.Graph([("j", "b"), ("a", "c"), ("b", "c")])
+    node_ids = ["a", "b", "c", "j"]
+
+    graph = _stitch(_generator(truth, node_ids), [3], [0])
+
+    nodes, expected_x, expected_adj = _reference_query(truth, "j", "a")
+    assert nodes[:2] == ["j", "a"]
+    torch.testing.assert_close(graph.x[0], expected_x)
+    torch.testing.assert_close(graph.adj[0, 0], expected_adj)
+
+
 def test_stitch_does_not_extract_cuda_style_scalars_per_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -234,6 +246,13 @@ def test_context_and_row_failures_are_fail_closed() -> None:
         generator.encode_node(x, ground)
     with pytest.raises(ValueError, match="rows are missing"):
         generator.encode_node(x, ground, node_rows=torch.tensor([2]))
+
+    state_0 = _encode(generator, [0])
+    state_1 = _encode(generator, [1])
+    with pytest.raises(ValueError, match="is_self disagrees"):
+        generator.stitch(state_0, state_1, torch.tensor([True]))
+    with pytest.raises(ValueError, match="is_self disagrees"):
+        generator.stitch(state_0, state_0, torch.tensor([False]))
 
 
 def test_rejects_non_loopless_or_non_undirected_context() -> None:

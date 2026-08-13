@@ -100,7 +100,7 @@ def test_full_oracle_skips_inapplicable_initial_slot_health_validation(
     assert validation_events == []
 
 
-def test_runnable_config_uses_logical_128_training_and_singleton_scoring() -> None:
+def test_runnable_config_uses_logical_128_training_and_bucketed_scoring() -> None:
     path = (
         Path(__file__).parents[1]
         / "configs"
@@ -122,8 +122,65 @@ def test_runnable_config_uses_logical_128_training_and_singleton_scoring() -> No
     assert run_cfg.optim.epochs == 30
     assert run_cfg.runtime is not None
     assert run_cfg.runtime.prefetch_factor == 16
-    assert score_universe._full_oracle_score_batch_specs(3) == [
-        ([0], [(0, 0)]),
-        ([1], [(1, 0)]),
-        ([2], [(2, 0)]),
-    ]
+    batches = score_universe._full_oracle_score_batch_specs(
+        [9, 3, 5],
+        [20, 10, 12],
+        token_budget=100,
+        cell_budget=200,
+        max_batch_pairs=4,
+    )
+    assert batches == [([0, 2], [(0, 0), (2, 1)]), ([1], [(1, 0)])]
+
+
+def test_full_oracle_batch_builder_is_budgeted_deterministic_and_complete() -> None:
+    ego_sizes = [500, 8, 20, 20, 5, 12, 4]
+    token_lengths = [200, 10, 40, 20, 5, 30, 4]
+    kwargs = {
+        "token_budget": 100,
+        "cell_budget": 1_000,
+        "max_batch_pairs": 3,
+    }
+
+    batches = score_universe._full_oracle_score_batch_specs(ego_sizes, token_lengths, **kwargs)
+    assert batches == score_universe._full_oracle_score_batch_specs(
+        ego_sizes, token_lengths, **kwargs
+    )
+    assert batches[0] == ([0], [(0, 0)])  # over-budget hub remains exact as a singleton
+    covered = [index for indices, _ in batches for index in indices]
+    assert sorted(covered) == list(range(len(ego_sizes)))
+    assert len(covered) == len(set(covered))
+    batch_n_max = [max(ego_sizes[index] for index in indices) for indices, _ in batches]
+    assert batch_n_max == sorted(batch_n_max, reverse=True)
+    for indices, output_rows in batches:
+        assert output_rows == [
+            (output_row, position) for position, output_row in enumerate(indices)
+        ]
+        if len(indices) == 1:
+            continue
+        count = len(indices)
+        assert count <= kwargs["max_batch_pairs"]
+        assert count * max(ego_sizes[index] for index in indices) ** 2 <= kwargs["cell_budget"]
+        assert count * max(token_lengths[index] for index in indices) <= kwargs["token_budget"]
+
+
+def test_full_oracle_ego_sizes_are_exact_for_all_pair_relationships() -> None:
+    truth = nx.Graph([("a", "b"), ("a", "c"), ("b", "c"), ("b", "d"), ("c", "d")])
+    truth.add_node("e")
+
+    assert score_universe._full_oracle_ego_sizes(
+        truth,
+        [("a", "b"), ("a", "d"), ("a", "a"), ("e", "a")],
+    ) == [4, 4, 3, 4]
+    with pytest.raises(ValueError, match="endpoint is absent"):
+        score_universe._full_oracle_ego_sizes(truth, [("missing", "a")])
+
+
+def test_full_oracle_batch_builder_accepts_empty_input() -> None:
+    assert score_universe._full_oracle_score_batch_specs([], [], token_budget=1) == []
+
+
+def test_full_oracle_cpu_thread_scope_restores_process_setting() -> None:
+    previous = score_universe.torch.get_num_threads()
+    with score_universe._torch_intraop_threads(2):
+        assert score_universe.torch.get_num_threads() == 2
+    assert score_universe.torch.get_num_threads() == previous

@@ -30,14 +30,12 @@ import math
 import os
 import pickle
 import time
-from collections import deque
-from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, TypeVar, cast
+from typing import Literal, cast
 
 import networkx as nx
 import numpy as np
@@ -57,6 +55,7 @@ from src.data.internal_holdout import InternalHoldoutPartition, derive_internal_
 from src.data.packed_features import PackedFeatureManifest, PackedFeatureTable
 from src.data.pairs import NegativeSampler
 from src.data.partition import derive_training_interactions
+from src.data.prefetch import _prefetch_batches
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.eval.graph_metrics import MMDConfig, clustering_histogram, mmd_squared
 from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
@@ -2312,38 +2311,6 @@ class _CompositeBatch:
     edge_rows_true: int
     edge_rows_global: int
     f0_rows_gathered: int
-
-
-_BatchT = TypeVar("_BatchT")
-
-
-def _prefetch_batches(batches: Iterator[_BatchT], *, depth: int) -> Generator[_BatchT, None, None]:
-    """Build bounded deterministic CPU batches ahead of GPU consumption."""
-    if depth <= 0:
-        yield from batches
-        return
-
-    iterator = iter(batches)
-
-    def read_next() -> _BatchT:
-        return next(iterator)
-
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="egostitch-batch")
-    futures: deque[Future[_BatchT]] = deque(executor.submit(read_next) for _ in range(depth))
-    try:
-        while futures:
-            future = futures.popleft()
-            try:
-                batch = future.result()
-            except StopIteration:
-                return
-            futures.append(executor.submit(read_next))
-            yield batch
-    finally:
-        for future in futures:
-            future.cancel()
-        executor.shutdown(wait=True, cancel_futures=True)
-
 
 _EGOSTITCH_E2E_FAMILY = "egostitch_e2e"
 

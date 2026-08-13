@@ -449,6 +449,7 @@ class EgoStitchModel(nn.Module):
         is_self: torch.Tensor,
         *,
         perturbation: ScaffoldInputPerturbation | None = None,
+        precomputed_graph: ImaginedGraph | None = None,
     ) -> tuple[ImaginedGraph | None, GraphEmbedding | None, GraphEmbedding | None]:
         """Imagine the joint graph once, then encode both AB and BA directions.
 
@@ -461,12 +462,20 @@ class EgoStitchModel(nn.Module):
         is never called in that case, matching it not being constructed at
         all for a null-generator model (`__init__`).
         """
-        graph = self.generator.stitch(
-            self._generator_state(state_a),
-            self._generator_state(state_b),
-            is_self,
-            perturbation=perturbation,
-        )
+        graph: ImaginedGraph | None
+        if precomputed_graph is not None:
+            if perturbation is not None:
+                raise ValueError("precomputed_graph cannot be combined with a perturbation")
+            if self.encoder is None:
+                raise ValueError("precomputed_graph requires a constructed graph encoder")
+            graph = precomputed_graph
+        else:
+            graph = self.generator.stitch(
+                self._generator_state(state_a),
+                self._generator_state(state_b),
+                is_self,
+                perturbation=perturbation,
+            )
         if graph is None:
             return None, None, None
         assert self.encoder is not None, (
@@ -484,6 +493,7 @@ class EgoStitchModel(nn.Module):
         *,
         need_topo: bool,
         scaffold_input_perturbation: ScaffoldInputPerturbation | None = None,
+        precomputed_graph: ImaginedGraph | None = None,
     ) -> tuple[E2EPairContext, ImaginedGraph | None, GraphEmbedding | None]:
         """Shared implementation behind `build_pair_context_from_states`.
 
@@ -500,6 +510,10 @@ class EgoStitchModel(nn.Module):
         batch_size = state_a.encoded.size(0)
         if is_self.shape != (batch_size,):
             raise ValueError(f"is_self shape must be {(batch_size,)}, got {tuple(is_self.shape)}")
+        if precomputed_graph is not None and scaffold_input_perturbation is not None:
+            raise ValueError("precomputed_graph cannot be combined with a perturbation")
+        if precomputed_graph is not None and self.encoder is None:
+            raise ValueError("precomputed_graph requires a constructed graph encoder")
         # A generator with no constructed encoder (`self.encoder is None`,
         # `generator.name: "null"`) never has topology to build regardless of
         # what the caller requested -- clamped here, the single place every
@@ -516,7 +530,11 @@ class EgoStitchModel(nn.Module):
         embedding_ab: GraphEmbedding | None = None
         if need_topo:
             graph, embedding_ab, embedding_ba = self._stitch_and_encode(
-                state_a, state_b, is_self, perturbation=scaffold_input_perturbation
+                state_a,
+                state_b,
+                is_self,
+                perturbation=scaffold_input_perturbation,
+                precomputed_graph=precomputed_graph,
             )
             if graph is not None:
                 assert embedding_ab is not None and embedding_ba is not None
@@ -548,6 +566,7 @@ class EgoStitchModel(nn.Module):
         *,
         need_topo: bool = True,
         scaffold_input_perturbation: ScaffoldInputPerturbation | None = None,
+        precomputed_graph: ImaginedGraph | None = None,
     ) -> E2EPairContext:
         """Build the shared pair context once from cacheable endpoint states."""
         context, _, _ = self._build_pair_context_and_graph(
@@ -556,6 +575,7 @@ class EgoStitchModel(nn.Module):
             is_self,
             need_topo=need_topo,
             scaffold_input_perturbation=scaffold_input_perturbation,
+            precomputed_graph=precomputed_graph,
         )
         return context
 

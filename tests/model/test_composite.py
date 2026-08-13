@@ -542,6 +542,64 @@ def test_perturbation_reaches_the_generator_through_build_pair_context_from_stat
     assert baseline.plan is not None and perturbed.plan is not None
 
 
+def test_precomputed_graph_matches_inline_stitch_bitwise() -> None:
+    model, batch = _tiny_model_and_batch()
+    state_a, state_b, is_self = model._pair_node_states(batch)
+    graph = model.generator.stitch(
+        model._generator_state(state_a),
+        model._generator_state(state_b),
+        is_self,
+    )
+    assert graph is not None
+
+    inline = model.build_pair_context_from_states(state_a, state_b, is_self)
+    precomputed = model.build_pair_context_from_states(
+        state_a,
+        state_b,
+        is_self,
+        precomputed_graph=graph,
+    )
+    for field in inline._fields:
+        inline_value = getattr(inline, field)
+        precomputed_value = getattr(precomputed, field)
+        if inline_value is None:
+            assert precomputed_value is None
+        else:
+            torch.testing.assert_close(inline_value, precomputed_value, rtol=0.0, atol=0.0)
+
+
+def test_precomputed_graph_rejects_perturbation_and_null_encoder() -> None:
+    model, batch = _tiny_model_and_batch()
+    state_a, state_b, is_self = model._pair_node_states(batch)
+    graph = model.generator.stitch(
+        model._generator_state(state_a),
+        model._generator_state(state_b),
+        is_self,
+    )
+    assert graph is not None
+    pairs = [(f"u{row}", f"v{row}") for row in range(batch["x_a"].size(0))]
+    perturbation = make_scaffold_input_perturbation("shuffle_within_pair_v3", pairs)
+
+    with pytest.raises(ValueError, match="cannot be combined with a perturbation"):
+        model.build_pair_context_from_states(
+            state_a,
+            state_b,
+            is_self,
+            scaffold_input_perturbation=perturbation,
+            precomputed_graph=graph,
+        )
+
+    null_model, null_batch = _tiny_model_and_batch(generator_name="null")
+    null_a, null_b, null_is_self = null_model._pair_node_states(null_batch)
+    with pytest.raises(ValueError, match="requires a constructed graph encoder"):
+        null_model.build_pair_context_from_states(
+            null_a,
+            null_b,
+            null_is_self,
+            precomputed_graph=graph,
+        )
+
+
 # --------------------------------------------------------------------------- (d) loss composition
 #
 # `EgoStitchModel` deliberately has no `aggregate_losses` (composite.py's

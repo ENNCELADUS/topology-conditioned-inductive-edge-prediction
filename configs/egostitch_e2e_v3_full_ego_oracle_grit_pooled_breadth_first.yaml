@@ -11,8 +11,8 @@
 # batch of 128 pairs per rank. A two-H20 production-path benchmark measured
 # 68.4 global pairs/s at B16 versus 14.8 at B1, with 10.4 GiB peak allocation;
 # B32 improved only to 72.7 pairs/s while nearly doubling peak allocation.
-# Scoring remains singleton and never caps neighbors. The held-out test graph
-# reaches degree 263 and a measured pair ego union of at least 446 nodes.
+# Scoring batches exact egos under fixed cell/token budgets with no neighbor cap.
+# The held-out test graph reaches degree 263 and a measured pair ego union of at least 446 nodes.
 
 model:
   family: egostitch_e2e

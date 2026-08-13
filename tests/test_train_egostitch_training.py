@@ -18,6 +18,7 @@ import torch
 import yaml  # type: ignore[import-untyped]
 from accelerate import Accelerator
 from src import train_egostitch as te
+from src.data.prefetch import _prefetch_batches
 from src.model.egostitch.composite import EgoStitchModel
 from src.model.egostitch.config import (
     ClassifierConfig,
@@ -426,7 +427,7 @@ def test_prefetch_batches_builds_ahead_without_reordering() -> None:
         assert release_second.wait(timeout=1.0)
         yield 2
 
-    batches = te._prefetch_batches(source(), depth=2)
+    batches = _prefetch_batches(source(), depth=2)
     try:
         assert next(batches) == 1
         assert second_started.wait(timeout=1.0)
@@ -450,7 +451,7 @@ def test_prefetch_depth_sixteen_queues_two_accumulation_windows() -> None:
                 assert release_seventeenth.wait(timeout=1.0)
             yield value
 
-    batches = te._prefetch_batches(source(), depth=16)
+    batches = _prefetch_batches(source(), depth=16)
     try:
         assert next(batches) == 0
         assert seventeenth_started.wait(timeout=1.0)
@@ -471,7 +472,7 @@ def test_prefetch_batches_shutdowns_after_consumer_abort() -> None:
         assert release_second.wait(timeout=1.0)
         yield 2
 
-    batches = te._prefetch_batches(source(), depth=2)
+    batches = _prefetch_batches(source(), depth=2)
     try:
         assert next(batches) == 1
         assert second_started.wait(timeout=1.0)
@@ -487,7 +488,7 @@ def test_prefetch_batches_propagates_producer_error_and_shutdowns() -> None:
         yield 1
         raise ValueError("batch construction failed")
 
-    batches = te._prefetch_batches(source(), depth=2)
+    batches = _prefetch_batches(source(), depth=2)
     assert next(batches) == 1
     with pytest.raises(ValueError, match="batch construction failed"):
         next(batches)

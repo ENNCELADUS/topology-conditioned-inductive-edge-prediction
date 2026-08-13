@@ -60,9 +60,10 @@ import logging
 import math
 import os
 import pickle
+from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import nullcontext
-from dataclasses import dataclass
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
@@ -99,7 +100,8 @@ if TYPE_CHECKING:
     # modules) so merely importing `score_universe` never pays that cost. This
     # import is erased at runtime (`from __future__ import annotations` makes
     # every annotation a string), so it exists for mypy only.
-    from src.model.egostitch.composite import EgoStitchModel
+    from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
+    from src.model.egostitch.generator.full_oracle import FullEgoGraph
     from src.train_cazi_mbn import CAZIConfig
 
 logger = logging.getLogger(__name__)
@@ -147,6 +149,11 @@ _SCAFFOLD_CONTROL_ARM_NAMES: dict[str, str] = {
 }
 _TEST_ACCESS_LEDGER_FILENAME = "test_access_ledger.jsonl"
 _TEST_ACCESS_LEDGER_SCHEMA = "egostitch_test_access_v1"
+_FULL_ORACLE_CELL_BUDGET = 12_000_000
+_FULL_ORACLE_MAX_BATCH_PAIRS = 1024
+_FULL_ORACLE_PREFETCH_DEPTH = 4
+_FULL_ORACLE_SHARD_COST_FLOOR = 4096
+_FULL_ORACLE_CPU_THREADS = 2
 
 
 def _e2e_primary_logit_key(permanent_null: str) -> str:
@@ -293,6 +300,60 @@ class _Shard(NamedTuple):
     pair_content: NDArray[np.float32] | None = None
     pair_topology: NDArray[np.float32] | None = None
     full_logit: NDArray[np.float32] | None = None
+
+
+@dataclass
+class _FullOracleScoreTelemetry:
+    """Mutable full-ego scorer measurements returned to `_run_score`."""
+
+    ego_sizes: list[int] = field(default_factory=list)
+    batch_sizes: list[int] = field(default_factory=list)
+    batch_max_ego_sizes: list[int] = field(default_factory=list)
+    producer_wait_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class _PreparedFullOracleBatch:
+    """One CPU-stitched batch ready for asynchronous device transfer."""
+
+    output_rows: list[tuple[int, int]]
+    node_rows_a: torch.Tensor
+    node_rows_b: torch.Tensor
+    encoded_width: int
+    state_a: E2ENodeState | None
+    state_b: E2ENodeState | None
+    is_self: torch.Tensor
+    graph: FullEgoGraph
+
+
+@contextmanager
+def _torch_intraop_threads(count: int) -> Iterator[None]:
+    """Temporarily cap Torch CPU workers for a scoped mixed CPU/GPU pipeline."""
+    if count <= 0:
+        raise ValueError("Torch intra-op thread count must be positive")
+    previous = torch.get_num_threads()
+    torch.set_num_threads(count)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
+def _gather_padded_node_rows(
+    encoded_table: torch.Tensor,
+    length_table: torch.Tensor,
+    node_rows: torch.Tensor,
+    *,
+    width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather padded node states without widening beyond the batch-local maximum."""
+    if width <= 0 or width > encoded_table.shape[1]:
+        raise ValueError("gather width must be within the padded node-state table")
+    rows = node_rows.to(device=encoded_table.device, non_blocking=True)
+    lengths = length_table.index_select(0, rows)
+    if lengths.device.type == "cpu" and bool((lengths > width).any()):
+        raise ValueError("gather width is shorter than a selected node state")
+    return encoded_table[:, :width].index_select(0, rows), lengths
 
 
 def score_resolution_diagnostics(logit: NDArray[np.float32]) -> dict[str, int | float]:
@@ -2065,6 +2126,8 @@ def _score_egostitch_e2e(
     universe_pairs: Sequence[tuple[str, str]] | None = None,
     row_start: int = 0,
     oracle_truth_graph: nx.Graph | None = None,
+    full_oracle_ego_sizes: Sequence[int] | None = None,
+    full_oracle_telemetry: _FullOracleScoreTelemetry | None = None,
 ) -> dict[str, NDArray[np.float32]]:
     """Score pairs with an `EgoStitchModel`'s two-logit decomposition.
 
@@ -2123,6 +2186,10 @@ def _score_egostitch_e2e(
             `OracleStructGenerator` reads its scaffolds from
             (:func:`_oracle_truth_graph_for_scoring`). Required exactly when
             `model.generator` is an `OracleStructGenerator`; ignored otherwise.
+        full_oracle_ego_sizes: Optional precomputed exact ego sizes aligned to
+            `pairs`; used by cost-balanced full-oracle shards.
+        full_oracle_telemetry: Optional mutable receiver for full-oracle batch
+            composition and producer-wait measurements.
 
     Returns:
         Dict with keys ``full`` and ``f_logit``, each a shape ``(len(pairs),)``
@@ -2134,9 +2201,13 @@ def _score_egostitch_e2e(
             `oracle_truth_graph` is ``None``.
     """
     from src.data.grounding import build_grounding_pool
+    from src.data.prefetch import _prefetch_batches
     from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
-    from src.model.egostitch.generator.egostitch import EgoStitchImagineGenerator
-    from src.model.egostitch.generator.full_oracle import FullOracleGenerator
+    from src.model.egostitch.generator.egostitch import (
+        EgoStitchImagineGenerator,
+        GeneratorNodeState,
+    )
+    from src.model.egostitch.generator.full_oracle import FullEgoGraph, FullOracleGenerator
     from src.model.egostitch.generator.imagine import SlotSet
     from src.model.egostitch.generator.null import NullGenerator
     from src.model.egostitch.generator.oracle import OracleStructGenerator
@@ -2327,16 +2398,36 @@ def _score_egostitch_e2e(
                         ground_ids=ground_ids,
                     )
 
-    def _stack_cached(nodes: Sequence[str]) -> E2ENodeState:
+    full_oracle_encoded_table: torch.Tensor | None = None
+    full_oracle_length_table: torch.Tensor | None = None
+    if is_full_oracle_generator and device.type == "cuda" and node_ids:
+        max_length = max(int(node_cache[node_id].encoded.shape[1]) for node_id in node_ids)
+        encoded_dim = int(node_cache[node_ids[0]].encoded.shape[2])
+        encoded_host = torch.zeros(
+            (len(node_ids), max_length, encoded_dim),
+            dtype=torch.float32,
+            pin_memory=True,
+        )
+        for row, node_id in enumerate(node_ids):
+            encoded = node_cache[node_id].encoded.squeeze(0)
+            encoded_host[row, : encoded.shape[0]].copy_(encoded)
+        length_host = torch.cat(
+            [node_cache[node_id].length for node_id in node_ids], dim=0
+        ).pin_memory()
+        full_oracle_encoded_table = encoded_host.to(device=device, non_blocking=True)
+        full_oracle_length_table = length_host.to(device=device, non_blocking=True)
+        torch.cuda.synchronize(device)
+
+    def _stack_cached_cpu(nodes: Sequence[str]) -> E2ENodeState:
         states = [node_cache[node_id] for node_id in nodes]
         encoded = torch.nn.utils.rnn.pad_sequence(
             [state.encoded.squeeze(0) for state in states], batch_first=True
-        ).to(device)
+        )
         ground_ids: torch.Tensor | None
         if all(state.ground_ids is not None for state in states):
             ground_ids = torch.cat(
                 [cast(torch.Tensor, state.ground_ids) for state in states], dim=0
-            ).to(device)
+            )
         else:
             ground_ids = None
         # `node_cache` is populated homogeneously by this call's own
@@ -2349,7 +2440,7 @@ def _score_egostitch_e2e(
             assert all(state.slots is not None for state in states)
             slots = SlotSet(
                 *(
-                    torch.cat(values, dim=0).to(device)
+                    torch.cat(values, dim=0)
                     for values in zip(
                         *(cast(SlotSet, state.slots) for state in states), strict=True
                     )
@@ -2358,7 +2449,7 @@ def _score_egostitch_e2e(
             assert all(state.projected_x is not None for state in states)
             projected_x = torch.cat(
                 [cast(torch.Tensor, state.projected_x) for state in states], dim=0
-            ).to(device)
+            )
         else:
             assert all(state.slots is None for state in states)
             assert all(state.projected_x is None for state in states)
@@ -2366,10 +2457,92 @@ def _score_egostitch_e2e(
             projected_x = None
         return E2ENodeState(
             encoded=encoded,
-            length=torch.cat([state.length for state in states], dim=0).to(device),
+            length=torch.cat([state.length for state in states], dim=0),
             slots=slots,
             projected_x=projected_x,
             ground_ids=ground_ids,
+        )
+
+    def _stack_full_oracle_generator_state(nodes: Sequence[str]) -> GeneratorNodeState:
+        """Stack only the tiny row-identity state consumed by the oracle stitcher."""
+        states = [node_cache[node_id] for node_id in nodes]
+        assert all(state.slots is not None and state.projected_x is not None for state in states)
+        return GeneratorNodeState(
+            slots=SlotSet(
+                *(
+                    torch.cat(values, dim=0)
+                    for values in zip(
+                        *(cast(SlotSet, state.slots) for state in states), strict=True
+                    )
+                )
+            ),
+            projected_x=torch.cat(
+                [cast(torch.Tensor, state.projected_x) for state in states], dim=0
+            ),
+            ground_ids=None,
+        )
+
+    def _gather_full_oracle_device_state(
+        node_rows: torch.Tensor, *, encoded_width: int
+    ) -> E2ENodeState:
+        """Gather endpoint states from the one-time GPU-resident padded table."""
+        assert full_oracle_encoded_table is not None
+        assert full_oracle_length_table is not None
+        encoded, lengths = _gather_padded_node_rows(
+            full_oracle_encoded_table,
+            full_oracle_length_table,
+            node_rows,
+            width=encoded_width,
+        )
+        return E2ENodeState(
+            encoded=encoded,
+            length=lengths,
+            slots=None,
+            projected_x=None,
+            ground_ids=None,
+        )
+
+    def _move_cached(state: E2ENodeState, *, non_blocking: bool = False) -> E2ENodeState:
+        slots = (
+            SlotSet(*(value.to(device=device, non_blocking=non_blocking) for value in state.slots))
+            if state.slots is not None
+            else None
+        )
+        return E2ENodeState(
+            encoded=state.encoded.to(device=device, non_blocking=non_blocking),
+            length=state.length.to(device=device, non_blocking=non_blocking),
+            slots=slots,
+            projected_x=(
+                state.projected_x.to(device=device, non_blocking=non_blocking)
+                if state.projected_x is not None
+                else None
+            ),
+            ground_ids=(
+                state.ground_ids.to(device=device, non_blocking=non_blocking)
+                if state.ground_ids is not None
+                else None
+            ),
+        )
+
+    def _pin_graph(graph: FullEgoGraph) -> FullEgoGraph:
+        return FullEgoGraph(
+            x=graph.x.pin_memory(),
+            adj=graph.adj.pin_memory(),
+            mask=graph.mask.pin_memory(),
+            aux={key: value.pin_memory() for key, value in graph.aux.items()},
+            directed=graph.directed,
+        )
+
+    def _move_graph(graph: FullEgoGraph, *, non_blocking: bool) -> FullEgoGraph:
+        return FullEgoGraph(
+            x=graph.x.to(device=device, non_blocking=non_blocking),
+            adj=graph.adj.to(device=device, non_blocking=non_blocking),
+            mask=graph.mask.to(device=device, non_blocking=non_blocking),
+            aux={
+                key: value.to(device=device, non_blocking=non_blocking)
+                for key, value in graph.aux.items()
+            },
+            directed=graph.directed,
         )
 
     out: dict[str, NDArray[np.float32]] = {
@@ -2404,10 +2577,30 @@ def _score_egostitch_e2e(
         batch_pair_source = node_universe
     else:
         if is_full_oracle_generator:
-            # Dense RRWP/GRIT cost follows the uncapped ego graph's N^2, not
-            # protein token length. A sequence-token sampler can therefore
-            # batch many hub egos and OOM despite training's edge_batch=1.
-            batch_specs = _full_oracle_score_batch_specs(len(pairs))
+            assert oracle_truth_graph is not None
+            ego_sizes = (
+                list(full_oracle_ego_sizes)
+                if full_oracle_ego_sizes is not None
+                else _full_oracle_ego_sizes(oracle_truth_graph, pairs)
+            )
+            if len(ego_sizes) != len(pairs):
+                raise ValueError("full_oracle_ego_sizes must align with scored pairs")
+            pair_token_lengths = [
+                2 * max(node_lengths[node_u], node_lengths[node_v]) for node_u, node_v in pairs
+            ]
+            batch_specs = _full_oracle_score_batch_specs(
+                ego_sizes,
+                pair_token_lengths,
+                token_budget=token_budget,
+                cell_budget=_FULL_ORACLE_CELL_BUDGET,
+                max_batch_pairs=_FULL_ORACLE_MAX_BATCH_PAIRS,
+            )
+            if full_oracle_telemetry is not None:
+                full_oracle_telemetry.ego_sizes = ego_sizes
+                full_oracle_telemetry.batch_sizes = [len(indices) for indices, _ in batch_specs]
+                full_oracle_telemetry.batch_max_ego_sizes = [
+                    max(ego_sizes[index] for index in indices) for indices, _ in batch_specs
+                ]
         else:
             pair_lengths = probe_lengths(store, pairs)
             sampler = LengthBucketedBatchSampler(
@@ -2419,43 +2612,232 @@ def _score_egostitch_e2e(
             ]
         batch_pair_source = pairs
 
-    for batch_indices, output_rows in batch_specs:
-        batch_pairs = [batch_pair_source[row] for row in batch_indices]
-        state_a = _stack_cached([pair[0] for pair in batch_pairs])
-        state_b = _stack_cached([pair[1] for pair in batch_pairs])
-        is_self = torch.tensor(
-            [node_u == node_v for node_u, node_v in batch_pairs],
-            dtype=torch.bool,
-            device=device,
+    def _store_decomposed(
+        decomposed: Mapping[str, torch.Tensor], output_rows: Sequence[tuple[int, int]]
+    ) -> None:
+        output_indices = np.fromiter((output_row for output_row, _ in output_rows), dtype=np.int64)
+        batch_positions = np.fromiter(
+            (batch_position for _, batch_position in output_rows), dtype=np.int64
         )
-        perturbation = (
-            None
-            if scaffold_control == _SCAFFOLD_CONTROL_NONE
-            else make_scaffold_input_perturbation(scaffold_control, batch_pairs)
+        for key in _EGOSTITCH_E2E_ARRAY_KEYS:
+            values = decomposed[key].detach().to(dtype=torch.float32, device="cpu").numpy()
+            out[key][output_indices] = values[batch_positions]
+
+    if is_full_oracle_generator:
+
+        def _prepare_full_oracle_batches() -> Iterator[_PreparedFullOracleBatch]:
+            for batch_indices, output_rows in batch_specs:
+                batch_pairs = [batch_pair_source[row] for row in batch_indices]
+                nodes_a = [pair[0] for pair in batch_pairs]
+                nodes_b = [pair[1] for pair in batch_pairs]
+                encoded_width = max(
+                    max(node_lengths[node_id] for node_id in nodes_a),
+                    max(node_lengths[node_id] for node_id in nodes_b),
+                )
+                node_rows_a = torch.tensor([index[node_id] for node_id in nodes_a])
+                node_rows_b = torch.tensor([index[node_id] for node_id in nodes_b])
+                is_self = torch.tensor(
+                    [node_u == node_v for node_u, node_v in batch_pairs], dtype=torch.bool
+                )
+                graph = model.generator.stitch(
+                    _stack_full_oracle_generator_state(nodes_a),
+                    _stack_full_oracle_generator_state(nodes_b),
+                    is_self,
+                )
+                if not isinstance(graph, FullEgoGraph):
+                    raise TypeError("full oracle generator returned a non-full-ego graph")
+                state_a: E2ENodeState | None = None
+                state_b: E2ENodeState | None = None
+                if device.type == "cuda":
+                    node_rows_a = node_rows_a.pin_memory()
+                    node_rows_b = node_rows_b.pin_memory()
+                    is_self = is_self.pin_memory()
+                    graph = _pin_graph(graph)
+                else:
+                    state_a = _stack_cached_cpu(nodes_a)
+                    state_b = _stack_cached_cpu(nodes_b)
+                yield _PreparedFullOracleBatch(
+                    output_rows=output_rows,
+                    node_rows_a=node_rows_a,
+                    node_rows_b=node_rows_b,
+                    encoded_width=encoded_width,
+                    state_a=state_a,
+                    state_b=state_b,
+                    is_self=is_self,
+                    graph=graph,
+                )
+
+        prepared_batches = _prefetch_batches(
+            iter(_prepare_full_oracle_batches()), depth=_FULL_ORACLE_PREFETCH_DEPTH
         )
-        with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=False):
-            context = model.build_pair_context_from_states(
-                state_a,
-                state_b,
-                is_self,
-                scaffold_input_perturbation=perturbation,
+        try:
+            while True:
+                wait_started = perf_counter()
+                try:
+                    prepared = next(prepared_batches)
+                except StopIteration:
+                    break
+                if full_oracle_telemetry is not None:
+                    full_oracle_telemetry.producer_wait_seconds += perf_counter() - wait_started
+                non_blocking = device.type == "cuda"
+                if device.type == "cuda":
+                    state_a = _gather_full_oracle_device_state(
+                        prepared.node_rows_a, encoded_width=prepared.encoded_width
+                    )
+                    state_b = _gather_full_oracle_device_state(
+                        prepared.node_rows_b, encoded_width=prepared.encoded_width
+                    )
+                else:
+                    assert prepared.state_a is not None and prepared.state_b is not None
+                    state_a = _move_cached(prepared.state_a)
+                    state_b = _move_cached(prepared.state_b)
+                is_self = prepared.is_self.to(device=device, non_blocking=non_blocking)
+                graph = _move_graph(prepared.graph, non_blocking=non_blocking)
+                with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=False):
+                    context = model.build_pair_context_from_states(
+                        state_a,
+                        state_b,
+                        is_self,
+                        precomputed_graph=graph,
+                    )
+                    decomposed = model.decompose_pair_context(context)
+                _store_decomposed(decomposed, prepared.output_rows)
+                processed += len(prepared.output_rows)
+                _log_progress(processed, len(pairs), len(prepared.output_rows))
+        finally:
+            prepared_batches.close()
+    else:
+        for batch_indices, output_rows in batch_specs:
+            batch_pairs = [batch_pair_source[row] for row in batch_indices]
+            state_a = _move_cached(_stack_cached_cpu([pair[0] for pair in batch_pairs]))
+            state_b = _move_cached(_stack_cached_cpu([pair[1] for pair in batch_pairs]))
+            is_self = torch.tensor(
+                [node_u == node_v for node_u, node_v in batch_pairs],
+                dtype=torch.bool,
+                device=device,
             )
-            decomposed = model.decompose_pair_context(context)
-        for output_row, batch_position in output_rows:
-            for key in _EGOSTITCH_E2E_ARRAY_KEYS:
-                out[key][output_row] = decomposed[key][batch_position].detach().float().cpu().item()
-        processed += len(output_rows)
-        _log_progress(processed, len(pairs), len(output_rows))
+            perturbation = (
+                None
+                if scaffold_control == _SCAFFOLD_CONTROL_NONE
+                else make_scaffold_input_perturbation(scaffold_control, batch_pairs)
+            )
+            with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=False):
+                context = model.build_pair_context_from_states(
+                    state_a,
+                    state_b,
+                    is_self,
+                    scaffold_input_perturbation=perturbation,
+                )
+                decomposed = model.decompose_pair_context(context)
+            _store_decomposed(decomposed, output_rows)
+            processed += len(output_rows)
+            _log_progress(processed, len(pairs), len(output_rows))
     return out
 
 
+def _full_oracle_ego_sizes(
+    truth_graph: nx.Graph[str], pairs: Sequence[tuple[str, str]]
+) -> list[int]:
+    """Return exact query-graph node counts via packed neighbor intersections."""
+    graph_nodes = tuple(sorted(truth_graph.nodes))
+    graph_row = {node_id: row for row, node_id in enumerate(graph_nodes)}
+    try:
+        src_rows = np.fromiter(
+            (graph_row[node_u] for node_u, _ in pairs), dtype=np.int64, count=len(pairs)
+        )
+        dst_rows = np.fromiter(
+            (graph_row[node_v] for _, node_v in pairs), dtype=np.int64, count=len(pairs)
+        )
+    except KeyError as exc:
+        raise ValueError(
+            f"full-oracle pair endpoint is absent from the truth graph: {exc.args[0]!r}"
+        ) from exc
+
+    bytes_per_row = (len(graph_nodes) + 7) // 8
+    packed_neighbors = np.zeros((len(graph_nodes), bytes_per_row), dtype=np.uint8)
+    edges = np.asarray(
+        [(graph_row[node_u], graph_row[node_v]) for node_u, node_v in truth_graph.edges],
+        dtype=np.int64,
+    ).reshape(-1, 2)
+    if len(edges):
+        for left, right in ((edges[:, 0], edges[:, 1]), (edges[:, 1], edges[:, 0])):
+            bit_values = np.left_shift(np.uint8(1), (right & 7).astype(np.uint8, copy=False))
+            np.bitwise_or.at(packed_neighbors, (left, right >> 3), bit_values)
+
+    degrees = np.bitwise_count(packed_neighbors).sum(axis=1, dtype=np.int64)
+    sizes = np.empty(len(pairs), dtype=np.int64)
+    target_chunk_bytes = 32 * 1024 * 1024
+    chunk_rows = max(1, target_chunk_bytes // max(bytes_per_row, 1))
+    for start in range(0, len(pairs), chunk_rows):
+        end = min(len(pairs), start + chunk_rows)
+        src = src_rows[start:end]
+        dst = dst_rows[start:end]
+        common = np.bitwise_count(packed_neighbors[src] & packed_neighbors[dst]).sum(
+            axis=1, dtype=np.int64
+        )
+        adjacent = (
+            packed_neighbors[src, dst >> 3]
+            & np.left_shift(np.uint8(1), (dst & 7).astype(np.uint8, copy=False))
+        ) != 0
+        self_pair = src == dst
+        union_size = degrees[src] + degrees[dst] - common
+        sizes[start:end] = union_size + self_pair.astype(np.int64) + 2 * (~self_pair & ~adjacent)
+    return sizes.tolist()
+
+
 def _full_oracle_score_batch_specs(
-    num_pairs: int,
+    ego_sizes: Sequence[int],
+    token_lengths: Sequence[int],
+    *,
+    token_budget: int,
+    cell_budget: int = _FULL_ORACLE_CELL_BUDGET,
+    max_batch_pairs: int = _FULL_ORACLE_MAX_BATCH_PAIRS,
 ) -> list[tuple[list[int], list[tuple[int, int]]]]:
-    """Return singleton scorer batches for dense, uncapped full-ego graphs."""
-    if num_pairs < 0:
-        raise ValueError("num_pairs must be non-negative")
-    return [([index], [(index, 0)]) for index in range(num_pairs)]
+    """Greedily bucket full-ego pairs under dense-cell and token budgets."""
+    if len(ego_sizes) != len(token_lengths):
+        raise ValueError("ego_sizes and token_lengths must have equal length")
+    if token_budget <= 0 or cell_budget <= 0 or max_batch_pairs <= 0:
+        raise ValueError("full-oracle batch budgets must be positive")
+    if any(size <= 0 for size in ego_sizes):
+        raise ValueError("full-oracle ego sizes must be positive")
+    if any(length <= 0 for length in token_lengths):
+        raise ValueError("full-oracle token lengths must be positive")
+
+    order = sorted(range(len(ego_sizes)), key=lambda index: (-ego_sizes[index], index))
+    batches: list[tuple[list[int], list[tuple[int, int]]]] = []
+    current: list[int] = []
+    current_n_max = 0
+    current_t_max = 0
+
+    def finish_current() -> None:
+        if current:
+            indices = list(current)
+            batches.append(
+                (indices, [(output_row, position) for position, output_row in enumerate(indices)])
+            )
+
+    for index in order:
+        if not current:
+            current = [index]
+            current_n_max = ego_sizes[index]
+            current_t_max = token_lengths[index]
+            continue
+        candidate_count = len(current) + 1
+        candidate_t_max = max(current_t_max, token_lengths[index])
+        if (
+            candidate_count > max_batch_pairs
+            or candidate_count * current_n_max * current_n_max > cell_budget
+            or candidate_count * candidate_t_max > token_budget
+        ):
+            finish_current()
+            current = [index]
+            current_n_max = ego_sizes[index]
+            current_t_max = token_lengths[index]
+        else:
+            current.append(index)
+            current_t_max = candidate_t_max
+    finish_current()
+    return batches
 
 
 def _shard_range(num_rows: int, shard: int, num_shards: int) -> tuple[int, int]:
@@ -2476,6 +2858,64 @@ def _shard_range(num_rows: int, shard: int, num_shards: int) -> tuple[int, int]:
     start = min(shard * chunk, num_rows)
     end = min(start + chunk, num_rows)
     return start, end
+
+
+def _balanced_shard_range(costs: Sequence[int], shard: int, num_shards: int) -> tuple[int, int]:
+    """Split ordered rows at deterministic cumulative-cost quantiles."""
+    if num_shards < 1 or not 0 <= shard < num_shards:
+        raise ValueError("invalid shard index/count")
+    values = np.asarray(costs, dtype=np.int64)
+    if values.ndim != 1 or bool((values < 0).any()):
+        raise ValueError("shard costs must be a one-dimensional non-negative sequence")
+    if not len(values) or not int(values.sum()):
+        return _shard_range(len(values), shard, num_shards)
+    cumulative = np.cumsum(values, dtype=np.int64)
+    total = int(cumulative[-1])
+
+    def boundary(part: int) -> int:
+        if part == 0:
+            return 0
+        if part == num_shards:
+            return len(values)
+        target = total * part / num_shards
+        return int(np.searchsorted(cumulative, target, side="right"))
+
+    return boundary(shard), boundary(shard + 1)
+
+
+def _full_oracle_high_degree_summary(
+    truth_graph: nx.Graph[str],
+    pairs: Sequence[tuple[str, str]],
+    ego_sizes: Sequence[int],
+) -> dict[str, object]:
+    """Summarize rows whose query-removed endpoint degree exceeds 16."""
+    selected_sizes: list[int] = []
+    for (node_u, node_v), ego_size in zip(pairs, ego_sizes, strict=True):
+        query_present = node_u != node_v and truth_graph.has_edge(node_u, node_v)
+        degree_u = int(truth_graph.degree(node_u)) - int(query_present)
+        degree_v = int(truth_graph.degree(node_v)) - int(query_present)
+        if max(degree_u, degree_v) > 16:
+            selected_sizes.append(ego_size)
+    return {
+        "count": len(selected_sizes),
+        "fraction": len(selected_sizes) / len(pairs) if pairs else 0.0,
+        "ego_size": (_full_oracle_distribution(selected_sizes) if selected_sizes else None),
+    }
+
+
+def _full_oracle_distribution(values: Sequence[int]) -> dict[str, float | int]:
+    """Reuse the diagnostic's pinned |U_q| distribution implementation."""
+    from src.experiments.full_ego_oracle.telemetry import _distribution
+
+    if not values:
+        raise ValueError("full-oracle distribution requires at least one value")
+    return _distribution(values)
+
+
+def _histogram(values: Sequence[int]) -> dict[str, int]:
+    """Return a stable JSON histogram with numeric keys rendered as strings."""
+    counts = Counter(values)
+    return {str(value): counts[value] for value in sorted(counts)}
 
 
 def _shard_output_path(output: Path, shard: int) -> Path:
@@ -2801,9 +3241,20 @@ def _run_score(args: argparse.Namespace) -> None:
     )
     total_rows = len(pairs)
     logger.info("resolved %d pairs from %s", total_rows, args.pairs)
+    all_full_oracle_ego_sizes: list[int] | None = None
+    if oracle_generator_name == "full_ego_oracle":
+        assert oracle_truth_graph is not None
+        all_full_oracle_ego_sizes = _full_oracle_ego_sizes(oracle_truth_graph, pairs)
 
     if args.shard is not None:
-        start, end = _shard_range(total_rows, args.shard, args.num_shards)
+        if all_full_oracle_ego_sizes is not None:
+            costs = [
+                ego_size * ego_size + _FULL_ORACLE_SHARD_COST_FLOOR
+                for ego_size in all_full_oracle_ego_sizes
+            ]
+            start, end = _balanced_shard_range(costs, args.shard, args.num_shards)
+        else:
+            start, end = _shard_range(total_rows, args.shard, args.num_shards)
         output = _shard_output_path(args.output, args.shard)
         logger.info(
             "shard %d/%d: rows [%d, %d) -> %s", args.shard, args.num_shards, start, end, output
@@ -2824,6 +3275,11 @@ def _run_score(args: argparse.Namespace) -> None:
     }
     f_logit: NDArray[np.float32] | None = None
     full_logit: NDArray[np.float32] | None = None
+    full_oracle_telemetry = (
+        _FullOracleScoreTelemetry() if oracle_generator_name == "full_ego_oracle" else None
+    )
+    if full_oracle_telemetry is not None and device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     score_started = perf_counter()
     if model_family == "v3_1":
         if args.pack_dir is None:
@@ -2868,19 +3324,31 @@ def _run_score(args: argparse.Namespace) -> None:
             missing_features=frozenset(cazi_cfg.expected_missing_features),
         )
     elif model_family == "egostitch_e2e":
-        decomposed = _score_egostitch_e2e(
-            model,
-            row_pairs,
-            store,
-            device=device,
-            token_budget=args.token_budget,
-            f0_cache=args.f0_cache,
-            grounding_cache=args.grounding_cache,
-            scaffold_control=args.scaffold_control,
-            universe_pairs=pairs,
-            row_start=start,
-            oracle_truth_graph=oracle_truth_graph,
+        thread_count = (
+            _FULL_ORACLE_CPU_THREADS
+            if oracle_generator_name == "full_ego_oracle"
+            else torch.get_num_threads()
         )
+        with _torch_intraop_threads(thread_count):
+            decomposed = _score_egostitch_e2e(
+                model,
+                row_pairs,
+                store,
+                device=device,
+                token_budget=args.token_budget,
+                f0_cache=args.f0_cache,
+                grounding_cache=args.grounding_cache,
+                scaffold_control=args.scaffold_control,
+                universe_pairs=pairs,
+                row_start=start,
+                oracle_truth_graph=oracle_truth_graph,
+                full_oracle_ego_sizes=(
+                    all_full_oracle_ego_sizes[start:end]
+                    if all_full_oracle_ego_sizes is not None
+                    else None
+                ),
+                full_oracle_telemetry=full_oracle_telemetry,
+            )
         from src.model.egostitch.composite import EgoStitchModel
 
         assert isinstance(model, EgoStitchModel)
@@ -2940,6 +3408,56 @@ def _run_score(args: argparse.Namespace) -> None:
         "unique_nodes": len(node_ids),
         "measurement": "single_process_compute_wall_seconds",
     }
+    full_oracle_sidecar: dict[str, object] | None = None
+    if full_oracle_telemetry is not None:
+        assert oracle_truth_graph is not None
+        peak_allocated = (
+            int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0
+        )
+        peak_reserved = int(torch.cuda.max_memory_reserved(device)) if device.type == "cuda" else 0
+        device_memory = (
+            int(torch.cuda.get_device_properties(device).total_memory)
+            if device.type == "cuda"
+            else 0
+        )
+        score_profile = cast(dict[str, object], meta_extra["score_profile"])
+        score_profile["peak_memory_allocated_bytes"] = peak_allocated
+        full_oracle_sidecar = {
+            "rows": len(row_pairs),
+            "wall_seconds": score_wall_seconds,
+            "pairs_per_second": (
+                len(row_pairs) / score_wall_seconds if score_wall_seconds > 0.0 else 0.0
+            ),
+            "ego_size": (
+                _full_oracle_distribution(full_oracle_telemetry.ego_sizes)
+                if full_oracle_telemetry.ego_sizes
+                else None
+            ),
+            "high_degree_gt16": _full_oracle_high_degree_summary(
+                oracle_truth_graph,
+                row_pairs,
+                full_oracle_telemetry.ego_sizes,
+            ),
+            "batch_size_histogram": _histogram(full_oracle_telemetry.batch_sizes),
+            "batch_n_max_histogram": _histogram(full_oracle_telemetry.batch_max_ego_sizes),
+            "budgets": {
+                "cell_budget": _FULL_ORACLE_CELL_BUDGET,
+                "token_budget": args.token_budget,
+                "max_batch_pairs": _FULL_ORACLE_MAX_BATCH_PAIRS,
+                "prefetch_depth": _FULL_ORACLE_PREFETCH_DEPTH,
+                "cpu_threads": _FULL_ORACLE_CPU_THREADS,
+            },
+            "max_memory_allocated_bytes": peak_allocated,
+            "max_memory_reserved_bytes": peak_reserved,
+            "device_total_memory_bytes": device_memory,
+            "peak_allocated_fraction": (peak_allocated / device_memory if device_memory else 0.0),
+            "producer_wait_seconds": full_oracle_telemetry.producer_wait_seconds,
+            "producer_wait_fraction": (
+                full_oracle_telemetry.producer_wait_seconds / score_wall_seconds
+                if score_wall_seconds > 0.0
+                else 0.0
+            ),
+        }
     node_position = {node_id: i for i, node_id in enumerate(node_ids)}
     meta: dict[str, object] = {
         "checkpoint_id": checkpoint_id,
@@ -2963,6 +3481,13 @@ def _run_score(args: argparse.Namespace) -> None:
         f_logit=f_logit,
         full_logit=full_logit,
     )
+    if full_oracle_sidecar is not None:
+        sidecar = output.with_name(f"{output.stem}.telemetry.json")
+        sidecar.write_text(
+            json.dumps(full_oracle_sidecar, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        logger.info("wrote full-oracle score telemetry to %s", sidecar)
     logger.info("wrote %d scored rows to %s", len(row_pairs), output)
 
 
