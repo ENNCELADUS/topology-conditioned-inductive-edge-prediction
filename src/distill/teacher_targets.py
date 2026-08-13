@@ -60,6 +60,7 @@ from src.score_universe import (
     _file_sha256,
     _install_oracle_context,
     _load_checkpoint,
+    _load_model_config,
     _oracle_truth_graph_sha256,
     _shard_range,
 )
@@ -539,6 +540,17 @@ def verify_sample(
 # --------------------------------------------------------------------------- CLI
 
 
+def _load_teacher_checkpoint(args: argparse.Namespace) -> tuple[torch.nn.Module, str, str]:
+    """Rebuild the teacher, accepting bare eligible-epoch checkpoints via ``--model-config``."""
+    if args.model_config is None:
+        return _load_checkpoint(args.checkpoint)
+    return _load_checkpoint(
+        args.checkpoint,
+        model_family="egostitch_e2e",
+        model_config=_load_model_config(args.model_config, "egostitch_e2e"),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the `python -m src.distill.teacher_targets` argument parser."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -550,6 +562,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--k-rand", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument(
+        "--model-config",
+        type=Path,
+        default=None,
+        help=(
+            "Training YAML whose model.config rebuilds a bare eligible-epoch "
+            "checkpoint; published best.pt/last.pt embed it and need no override"
+        ),
+    )
     parser.add_argument("--token-budget", type=int, default=_DEFAULT_TOKEN_BUDGET)
     parser.add_argument("--batch-pairs", type=int, default=_DEFAULT_BATCH_PAIRS)
     parser.add_argument("--f0-cache", type=Path, default=None)
@@ -596,7 +617,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         shard_range = (start, end, num_shards)
 
     device = torch.device(args.device)
-    model, model_family, checkpoint_id = _load_checkpoint(args.checkpoint)
+    model, model_family, checkpoint_id = _load_teacher_checkpoint(args)
     if model_family != "egostitch_e2e" or not isinstance(model, EgoStitchModel):
         raise ValueError(
             f"KD teacher targets require model_family 'egostitch_e2e', got {model_family!r}"
@@ -684,7 +705,7 @@ def _finish_merge(
     if checkpoint_override is not None:
         _, checkpoint_id = checkpoint_override
     else:
-        _, model_family, checkpoint_id = _load_checkpoint(args.checkpoint)
+        _, model_family, checkpoint_id = _load_teacher_checkpoint(args)
         if model_family != "egostitch_e2e":
             raise ValueError(
                 f"KD teacher targets require model_family 'egostitch_e2e', got {model_family!r}"
