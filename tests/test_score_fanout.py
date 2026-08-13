@@ -6,6 +6,19 @@ from pathlib import Path
 import pytest
 from src.score_fanout import score_sharded
 
+
+@pytest.fixture(autouse=True)
+def _clear_inherited_gpu_mask(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate from the host's CUDA_VISIBLE_DEVICES.
+
+    `_visible_device_ids` deliberately honors an inherited mask, so on a real
+    GPU host (e.g. `hpc/run.sh check`, which exports the container's ids) any
+    test requesting more shards than the mask names would fail spuriously.
+    Tests that exercise the mask behavior set it explicitly.
+    """
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
+
 pytestmark = pytest.mark.unit
 
 _PYTHON_BIN = Path("/fake/python")
