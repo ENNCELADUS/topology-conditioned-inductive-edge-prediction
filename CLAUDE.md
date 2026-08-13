@@ -31,6 +31,10 @@ selected method. Every piece of writing must explain how its context helps decid
 - Lean on the dependencies already in the project before writing your own implementation or adding
   packages; check a library's docs and types before assuming it lacks a capability.
 - Make architectural decisions for the long term. No stopgap meant to be replaced later.
+- No formalism gates: never add sha256/digest pinning, artifact- or text-contract verifiers, or
+  similar ceremony that blocks a run. Write provenance metadata freely; matching artifacts to the
+  current split is the operator's job. Fail closed only on non-finite state, DDP disagreement,
+  data-boundary violations, and I/O failures.
 
 ## Commands
 
