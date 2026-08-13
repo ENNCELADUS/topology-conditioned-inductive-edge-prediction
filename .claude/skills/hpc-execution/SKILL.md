@@ -37,8 +37,8 @@ visible GPU before dispatching any subcommand.
 hpc/run.sh check
 ```
 
-`check` runs environment/data checks, the full non-integration test suite, and the Linux
-DDP integration tests. Do not describe it as a lightweight smoke test.
+`check` is a fast environment/data validation (uv, GPUs, benchmark, feature shapes).
+It runs no test suite; tests run locally, never as an HPC recheck.
 
 ## Let the runner size the job
 

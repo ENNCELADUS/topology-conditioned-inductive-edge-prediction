@@ -160,7 +160,9 @@ def test_runner_dispatches_to_the_implemented_clis() -> None:
     assert "-m src.score_universe merge" in text
     assert "-m src.experiments.g1_hardened_e2" in text
     assert "-m src.experiments.g2_ceiling" in text
-    assert 'tests/test_e2_ddp_integration.py -m "integration and not slow"' in text
+    # `check` is environment/data validation only; the test suites run locally,
+    # never as an hpc/run.sh recheck.
+    assert "-m pytest" not in text
 
 
 def test_scoring_is_a_thin_passthrough_to_score_fanout() -> None:

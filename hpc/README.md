@@ -77,8 +77,8 @@ cd /2023533015/topology-conditioned-inductive-edge-prediction
 hpc/run.sh check
 ```
 
-The check runs the lightweight suite plus the three CPU DDP smoke contracts on Linux;
-the four-H20 cold-run acceptance test remains an explicit opt-in.
+The check is fast environment/data validation only (uv, GPUs, benchmark, feature
+shapes); test suites run locally, never as an HPC recheck.
 
 Every arm's formal run is now one sequence, not train followed by separate manual
 scoring commands: `hpc/run.sh train <config> ...` packs, trains, publishes, and then
