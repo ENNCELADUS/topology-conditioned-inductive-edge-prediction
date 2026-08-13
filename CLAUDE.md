@@ -6,10 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 Research code for an ICLR 2027 paper, *Topology-Conditioned Inductive Edge Prediction*. `README.md`
-orients, `docs/` holds the specs, this file holds the constraints. `01-blueprint` →
-`02-methodology` → `03-experiment-protocol` governs the task/evaluation; method selection remains
-open. `04-model-proposal`, `05-egostitch-spec`, and the 2026-08-02 refactor spec describe one
-retrieval-grounded EgoStitch arm, not the project method. Keep code and its relevant spec aligned.
+orients, `docs/` holds the specs, this file holds the constraints. `01-project-definition` and
+`03-experiment-protocol` govern the task/evaluation; `02-methodology` records open method-selection
+constraints. Keep code and its relevant spec aligned.
 
 **Core thesis — do not let it drift:** the strict task input is exactly `(x_u,x_v)` and the output
 is the binary decision for `edge(u,v)`. Inferred topology is intermediate context, not graph

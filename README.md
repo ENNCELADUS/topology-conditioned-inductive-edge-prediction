@@ -194,7 +194,7 @@ step 3  stitch                T̂_ij = Stitch(S_i, S_j, {i, j})                 
 step 4  encode + decide       t = STE(T̂_ij);  p_ij = σ(head(Trunk(tok_i, tok_j | t)))
 ```
 
-Training objective (maps onto the methodology plan's four terms):
+Historical EgoStitch training objective:
 `L = L_edge + λ_real·L_real + λ_ssl·L_ssl + λ_recon·L_recon`.
 
 ## Repository Map
@@ -203,8 +203,8 @@ Training objective (maps onto the methodology plan's four terms):
 README.md                        you are here — orientation hub
 CLAUDE.md                        binding constraints for agents (read this first)
 docs/
-  01-blueprint.md                top-level paper blueprint + locked decisions
-  02-methodology.md              abstract method contract + training objective
+  01-project-definition.md       research definition, plan, hypotheses, and related work
+  02-methodology.md              method-selection constraints; no formal design yet
   03-experiment-protocol.md      run/eval contract: baselines, E1–E7, metrics, gates G1–G5
   04-model-proposal.md           historical EgoStitch candidate rationale
   05-egostitch-spec.md           retrieval-grounded arm reproduction contract
@@ -248,8 +248,8 @@ candidate uses that label before selection. Don't substitute real dataset names 
 
 | # | Document | Role |
 |---|---|---|
-| 1 | [`docs/01-blueprint.md`](docs/01-blueprint.md) | Fixed endpoint-only task; open method selection |
-| 2 | [`docs/02-methodology.md`](docs/02-methodology.md) | Candidate method families + objective |
+| 1 | [`docs/01-project-definition.md`](docs/01-project-definition.md) | Fixed endpoint-only task, research plan, and related work |
+| 2 | [`docs/02-methodology.md`](docs/02-methodology.md) | Open design status and method-selection constraints |
 | 3 | [`docs/03-experiment-protocol.md`](docs/03-experiment-protocol.md) | **Source of truth** for evaluation |
 | 4 | [`docs/04-model-proposal.md`](docs/04-model-proposal.md) | Historical EgoStitch candidate rationale |
 | 5 | [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) | EgoStitch reproduction contract |
@@ -274,7 +274,7 @@ never use target edges/labels; queried edges are masked from topology context. S
 ## Status & Roadmap
 
 - [x] **E2 — pair-to-topology gap** established (motivating result + figure).
-- [x] **Blueprint, methodology, and experiment protocol** written and locked.
+- [x] **Research project and experiment protocol** documented; method selection remains open.
 - [x] **EgoStitch proposal** — approved 2026-07-09; reviewed via novelty check + 5-persona panel.
 - [x] **G4 spec freeze** — [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) signed off (algorithm + benchmark data contract + batch sampler + auto-sized H20 execution).
 - [x] **Baseline + gate pipeline** — benchmark/features, B0/B0-alt training, cached scoring, G1/G2/G3 analyses, and tests are implemented.

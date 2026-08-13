@@ -144,12 +144,12 @@ different pair-to-dropout assignment and is not a matched control.
 `runtime.token_budget` governs endpoint feature-token packing, not the number
 of nodes in `H_q`, and is not a full-graph memory control. LR schedules, phase
 boundaries, clipping, and diagnostic probes advance on optimizer steps, not
-physical batches. Scoring remains singleton. There is deliberately no neighbor
-cap or emergency truncation: an OOM is a failed engineering run, not permission
-to silently change the experiment.
+physical batches. Scoring batches pairs by ego size under a fixed memory
+budget. There is deliberately no neighbor cap or emergency truncation: an OOM
+is a failed engineering run, not permission to silently change the experiment.
 
-Every result must report the observed `|U_q|` distribution (at least p50, p90,
-p95, p99, and maximum), wall time, and peak memory. Metrics must also be shown
+Every score shard writes a telemetry sidecar reporting the observed `|U_q|`
+distribution (p50, p90, p95, p99, and maximum), wall time, and peak memory. Result metrics
 for the high-degree stratum in which at least one endpoint has more than 16
 neighbors after query removal, alongside its row count. This identifies where
 the full arm actually receives information unavailable to K=16.
