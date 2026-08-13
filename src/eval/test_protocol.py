@@ -149,8 +149,10 @@ def _expected_checkpoint_id(checkpoint: Path) -> str | None:
     if not isinstance(payload, dict):
         return None
     state = payload.get("model_state", payload.get("state_dict"))
-    if state is None and payload and all(
-        isinstance(value, torch.Tensor) for value in payload.values()
+    if (
+        state is None
+        and payload
+        and all(isinstance(value, torch.Tensor) for value in payload.values())
     ):
         state = payload
     if not isinstance(state, dict) or not state:

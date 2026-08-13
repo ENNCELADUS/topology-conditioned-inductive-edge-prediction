@@ -60,6 +60,7 @@ from src.model.egostitch.classifier.layers import (
     _build_padding_mask,
     _parse_rich_pooling_components,
 )
+from src.model.egostitch.classifier.node_factor import NodeFactorBottleneck, NodeFactorOutputs
 from src.model.egostitch.config import CONDITIONING_MODES
 from src.model.egostitch.graph import PairConditioning, PairInputs
 
@@ -701,6 +702,7 @@ class B0V31PairClassifier(PairClassifier):
         conditioning_mode: str = "xattn_cls",
         dropout: float = 0.1,
         token_dropout: float = 0.0,
+        node_factor_dim: int = 0,
     ) -> None:
         """Build the encoder, conditioned trunk, and head.
 
@@ -723,6 +725,11 @@ class B0V31PairClassifier(PairClassifier):
                 them produces bit-identical logits to the `cond=None` path.
             dropout: Shared dropout rate for the encoder, trunk, and head.
             token_dropout: `SiameseEncoder` token-level dropout rate.
+            node_factor_dim: Width of the `NodeFactorBottleneck` low-rank
+                node-factor path (`ClassifierConfig.node_factor_dim`, B1 KD
+                plan). ``0`` builds no node factor at all -- DDP
+                unused-parameter safety, the same conditional-build pattern
+                as the `film_logit` rung below.
 
         Raises:
             ValueError: On an unregistered `conditioning_mode`.
@@ -768,6 +775,14 @@ class B0V31PairClassifier(PairClassifier):
         # parameter (DDP unused-parameter safety).
         if conditioning_mode == "film_logit":
             self.film = FilmLogitConditioner(d_model, ema_decay=conditioning_ema_decay)
+        # Content-path, not conditioning-ladder: built independent of
+        # `conditioning_mode`/`generator.name` and never frozen by
+        # `freeze_unreachable_conditioning` below -- a null-generator model
+        # still has real, undoubled per-endpoint tokens to pool, so the
+        # factor path is exactly as reachable there as anywhere else.
+        self.node_factor: NodeFactorBottleneck | None = (
+            NodeFactorBottleneck(d_model, node_factor_dim) if node_factor_dim > 0 else None
+        )
 
     def freeze_unreachable_conditioning(self) -> None:
         """Freeze whichever conditioning-ladder rung this instance built.
@@ -782,6 +797,12 @@ class B0V31PairClassifier(PairClassifier):
         `ConditionedPairCrossAttention.__init__`, above), and
         `self.trunk.pooled_adapter` / `self.film` keep their usual
         `state_dict` keys too -- only `requires_grad` changes.
+
+        `self.node_factor` is deliberately untouched: it runs on the
+        undoubled per-endpoint tokens `encode_tokens` produces regardless of
+        `cond`, so a null-generator model reaches it exactly as any other
+        arm does -- it is never "unreachable" the way the conditioning
+        ladder is under `generator.name: "null"`.
         """
         for module in self.trunk.topo_xattn:
             module.requires_grad_(False)
@@ -805,12 +826,42 @@ class B0V31PairClassifier(PairClassifier):
         # the module actually returns rather than widening the contract.
         return cast(torch.Tensor, self.encoder(emb, length))
 
+    def node_factor_outputs(
+        self,
+        tokens_a: torch.Tensor,
+        tokens_b: torch.Tensor,
+        len_a: torch.Tensor,
+        len_b: torch.Tensor,
+    ) -> NodeFactorOutputs | None:
+        """Run the node-factor path on undoubled per-endpoint tokens, or `None` if unbuilt.
+
+        Public so `EgoStitchModel.decompose_pair_context` (composite.py) can
+        recover the `"content_bias"`/`"content_factor"` decomposition arms
+        from the same `r`/`b_a`/`b_b` `forward` itself adds to the logit --
+        without a third scoring pass.
+
+        Args:
+            tokens_a: Shape ``(B, T_a, d_model)`` endpoint-A tokens, e.g.
+                `PairInputs.tokens_a` -- undoubled, before the AB/BA
+                concatenation `forward` builds below.
+            tokens_b: Shape ``(B, T_b, d_model)`` endpoint-B tokens.
+            len_a: Shape ``(B,)`` unpadded token counts for A.
+            len_b: Shape ``(B,)`` unpadded token counts for B.
+        """
+        if self.node_factor is None:
+            return None
+        # `nn.Module.__call__` is typed to return `Any`; `NodeFactorBottleneck.forward`
+        # itself is annotated `-> NodeFactorOutputs`, so this narrows back to
+        # what the module actually returns (same idiom as `encode_tokens`, above).
+        return cast(NodeFactorOutputs, self.node_factor(tokens_a, tokens_b, len_a, len_b))
+
     def forward(
         self,
         pair: PairInputs,
         cond: PairConditioning | None,
         *,
         masks: HeadNullMasks | None = None,
+        node_factor_active: bool = True,
     ) -> torch.Tensor:
         """Score one pair batch (see `PairClassifier.forward`).
 
@@ -820,6 +871,18 @@ class B0V31PairClassifier(PairClassifier):
         `cond`. Consumes `pair.tokens_a`/`tokens_b` directly -- never calls
         `self.encoder` (that is `encode_tokens`'s job, exactly once per
         unique node, not once per pair).
+
+        Args:
+            pair: See `PairClassifier.forward`.
+            cond: See `PairClassifier.forward`.
+            masks: See `PairClassifier.forward`.
+            node_factor_active: Gates `self.node_factor`'s residual
+                (`ClassifierConfig.node_factor_dim > 0`), independent of
+                `cond`/`masks.topo` -- the node factor is a content-path
+                addition, not a rung of the topo conditioning ladder. Has no
+                effect when `self.node_factor is None`, so the default
+                path is identical in behavior for every model without a
+                node factor.
         """
         batch_size = pair.tokens_a.size(0)
         device = pair.tokens_a.device
@@ -886,6 +949,16 @@ class B0V31PairClassifier(PairClassifier):
                 film_ab, film_ba = film.chunk(2)
                 scale, shift = (0.5 * (film_ab + film_ba)).unbind(dim=-1)
                 logits = torch.where(masks.topo, logits * (1.0 + torch.tanh(scale)) + shift, logits)
+            if self.node_factor is not None and node_factor_active:
+                # Undoubled `pair.tokens_a`/`tokens_b` (design §4's AB/BA
+                # invariant does not apply here: `r`/`b_a`/`b_b` are
+                # symmetric in the endpoints by construction, so there is
+                # nothing an AB/BA doubled pass would add).
+                node_factor = self.node_factor_outputs(
+                    pair.tokens_a.float(), pair.tokens_b.float(), pair.len_a, pair.len_b
+                )
+                assert node_factor is not None
+                logits = logits + node_factor.residual
         return logits
 
 

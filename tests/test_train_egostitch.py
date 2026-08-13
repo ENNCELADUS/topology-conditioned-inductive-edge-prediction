@@ -28,6 +28,7 @@ from src.data.artifacts import canonical_pair
 from src.data.ego_targets import EgoTargetBuilder
 from src.data.pairs import NegativeSampler
 from src.model.egostitch import EgoStitchConfig
+from src.model.egostitch.config import ClassifierConfig, DistillConfig, E2EConfig, GeneratorConfig
 
 pytestmark = pytest.mark.unit
 
@@ -278,6 +279,144 @@ class TestParseArgs:
     def test_direct_training_entry_is_rejected(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="e2_pipeline"):
             te.main(["--config", str(_write_config(tmp_path))])
+
+
+# --------------------------------------------------------------------------- B1 KD config (Wave 1)
+
+
+class TestDistillConfig:
+    """`DistillConfig` (B1 training-time topology-distillation plan, `config.py`)."""
+
+    def test_defaults_are_all_zero_weight(self) -> None:
+        cfg = DistillConfig()
+        assert (cfg.w_label, cfg.w_logit, cfg.w_rank, cfg.w_dist, cfg.w_gram) == (0.0,) * 5
+
+    def test_rejects_unknown_keys(self) -> None:
+        with pytest.raises(ValueError, match="unknown distill config keys"):
+            DistillConfig.from_mapping({"bogus": 1.0})
+
+    def test_from_mapping_round_trip(self) -> None:
+        cfg = DistillConfig.from_mapping(
+            {"targets_path": "targets.npz", "w_label": 1.0, "temperature": 3.0}
+        )
+        assert cfg.targets_path == "targets.npz"
+        assert cfg.w_label == 1.0
+        assert cfg.temperature == 3.0
+
+    @pytest.mark.parametrize(
+        "nonzero",
+        [
+            {},
+            {"w_label": 1.0},
+            {"w_logit": 1.0},
+            {"w_rank": 1.0, "w_dist": 1.0},
+            {"w_gram": 1.0},
+        ],
+        ids=["all_zero", "kd_control", "kd_d1", "kd_d2", "kd_d3"],
+    )
+    def test_accepts_the_five_legal_weight_patterns(self, nonzero: dict[str, float]) -> None:
+        cfg = DistillConfig(**cast(dict[str, Any], nonzero))
+        for name, value in nonzero.items():
+            assert getattr(cfg, name) == value
+
+    @pytest.mark.parametrize(
+        "nonzero",
+        [
+            {"w_rank": 1.0},
+            {"w_dist": 1.0},
+            {"w_label": 1.0, "w_logit": 1.0},
+            {"w_logit": 1.0, "w_gram": 1.0},
+        ],
+        ids=["rank_only", "dist_only", "label_and_logit", "logit_and_gram"],
+    )
+    def test_rejects_every_illegal_weight_pattern(self, nonzero: dict[str, float]) -> None:
+        with pytest.raises(ValueError, match="exactly one arm group"):
+            DistillConfig(**cast(dict[str, Any], nonzero))
+
+    def test_rejects_negative_weight(self) -> None:
+        with pytest.raises(ValueError, match="must be non-negative"):
+            DistillConfig(w_label=-1.0)
+
+    def test_rejects_non_positive_temperature(self) -> None:
+        with pytest.raises(ValueError, match="temperature must be positive"):
+            DistillConfig(temperature=0.0)
+
+    def test_rejects_non_positive_margin(self) -> None:
+        with pytest.raises(ValueError, match="margin must be positive"):
+            DistillConfig(margin=0.0)
+
+    def test_rejects_non_positive_anchors_per_step(self) -> None:
+        with pytest.raises(ValueError, match="anchors_per_step must be"):
+            DistillConfig(anchors_per_step=0)
+
+
+class TestE2EConfigDistillSection:
+    """`E2EConfig`'s fourth, optional `distill:` section and its cross-section gate."""
+
+    def test_absent_distill_section_keeps_existing_configs_loading(self) -> None:
+        """Every pre-B1 config (no `distill:` key at all) still loads, unchanged."""
+        cfg = E2EConfig.from_mapping(dict(_E2E_TINY_MODEL))
+        assert cfg.distill == DistillConfig()
+
+    def test_nonzero_weight_without_targets_path_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="requires both distill.targets_path"):
+            E2EConfig(
+                classifier=ClassifierConfig(node_factor_dim=64),
+                distill=DistillConfig(w_label=1.0, targets_path=""),
+            )
+
+    def test_nonzero_weight_without_node_factor_dim_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="requires both distill.targets_path"):
+            E2EConfig(
+                classifier=ClassifierConfig(node_factor_dim=0),
+                distill=DistillConfig(w_label=1.0, targets_path="targets.npz"),
+            )
+
+    def test_nonzero_weight_with_both_requirements_is_accepted(self) -> None:
+        cfg = E2EConfig(
+            classifier=ClassifierConfig(node_factor_dim=64),
+            distill=DistillConfig(w_label=1.0, targets_path="targets.npz"),
+        )
+        assert cfg.distill.w_label == 1.0
+
+
+class TestE2EArmNameKD:
+    """`_e2e_arm_name_from_config`'s KD branch -- must precede any formal KD run."""
+
+    @pytest.mark.parametrize(
+        ("distill_kwargs", "expected_arm"),
+        [
+            ({"w_label": 1.0}, "kd_control"),
+            ({"w_logit": 1.0}, "kd_d1"),
+            ({"w_rank": 1.0, "w_dist": 1.0}, "kd_d2"),
+            ({"w_gram": 1.0}, "kd_d3"),
+        ],
+    )
+    def test_node_factor_dim_derives_the_four_kd_arm_names(
+        self, distill_kwargs: dict[str, float], expected_arm: str
+    ) -> None:
+        cfg = E2EConfig(
+            generator=GeneratorConfig(name="null"),
+            classifier=ClassifierConfig(node_factor_dim=64),
+            distill=DistillConfig(
+                targets_path="targets.npz", **cast(dict[str, Any], distill_kwargs)
+            ),
+        )
+        arm = te._e2e_arm_name_from_config(cfg)
+        assert arm == expected_arm
+        # The whole point of the KD branch (plan "Known risks" #1): four
+        # `generator.name: "null"` KD configs must never collide on the
+        # single legacy null-generator arm name in the (arm, seed) ledger.
+        assert arm != "null_generator"
+
+    def test_node_factor_dim_with_all_zero_distill_weights_raises(self) -> None:
+        """`DistillConfig()`'s all-zero pattern is itself legal, but names no arm."""
+        cfg = E2EConfig(
+            generator=GeneratorConfig(name="null"),
+            classifier=ClassifierConfig(node_factor_dim=64),
+        )
+        with pytest.raises(ValueError, match="exactly one nonzero distill arm group"):
+            te._e2e_arm_name_from_config(cfg)
 
 
 # --------------------------------------------------------------------------- toy data bundle

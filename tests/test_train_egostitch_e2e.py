@@ -37,20 +37,31 @@ from src.data.packed_features import (
     write_packed_manifest,
 )
 from src.data.pairs import NegativeSampler
+from src.data.prefetch import _prefetch_batches
+from src.distill.artifacts import write_kd_targets
+from src.distill.teacher_targets import truth_graph_for_kd
 from src.eval.edge_metrics import EdgeMetrics
 from src.model.egostitch import EgoStitchConfig
-from src.model.egostitch.classifier.b0_v31 import GatedCrossAttention
+from src.model.egostitch.classifier.b0_v31 import B0V31PairClassifier, GatedCrossAttention
 from src.model.egostitch.classifier.base import HeadNullMasks
 from src.model.egostitch.composite import E2ENodeState, E2EPairContext, EgoStitchModel
-from src.model.egostitch.config import E2EConfig
+from src.model.egostitch.config import (
+    ClassifierConfig,
+    DistillConfig,
+    E2EConfig,
+    EncoderConfig,
+    GeneratorConfig,
+)
 from src.model.egostitch.generator import EgoStitchImagineGenerator
 from src.model.egostitch.generator import egostitch as e2e_module
 from src.model.egostitch.generator.imagine import SlotSet
+from src.score_universe import _oracle_truth_graph_sha256
 from src.train_b0 import ModelConfig
 
 from tests.test_train_egostitch import (
     _E2E_TINY_MODEL,
     _NODES,
+    _POSITIVES,
     _e2e_model_config,
     _toy_bundle,
     _toy_cfg,
@@ -152,6 +163,114 @@ def _write_tiny_token_pack(pack_dir: Path, nodes: list[str], *, min_length: int 
         build_seconds=0.0,
     )
     write_packed_manifest(pack_dir, manifest)
+
+
+def _write_kd_artifact(
+    output_dir: Path,
+    nodes: Sequence[str],
+    *,
+    k_near: int,
+    k_rand: int,
+    pooled_dim: int,
+    seed: int = 0,
+    truth_graph_sha256: str = "0" * 64,
+) -> tuple[Path, str]:
+    """Write a tiny hand-built KD teacher-target artifact over `nodes` (B1 plan format).
+
+    Every anchor's context group is `nodes` minus itself, capped at
+    `k_near + k_rand` (near-first, then random) -- a deterministic stand-in
+    for the real Wave-2 `context_sampler`/`teacher_targets` dumper, which is
+    out of this wave's scope. Returns the artifact directory and its
+    `manifest.json` `npz_sha256` digest (what `DistillConfig.targets_sha256`
+    pins). `truth_graph_sha256` defaults to an inert placeholder -- callers
+    that exercise `_BatchFactory`'s truth-graph binding check must pass the
+    real digest of the graph they attach via `EgoStitchData.internal_holdout`
+    (`_toy_internal_holdout`'s digest, below).
+    """
+    rng = np.random.default_rng(seed)
+    ordered = list(nodes)
+    anchor_idx: list[int] = []
+    partner_idx: list[int] = []
+    is_near: list[int] = []
+    teacher_logit: list[float] = []
+    pooled_ab: list[np.ndarray] = []
+    pooled_ba: list[np.ndarray] = []
+    pair_label: list[int] = []
+    offsets = [0]
+    for anchor_pos, _anchor in enumerate(ordered):
+        candidates = [pos for pos in range(len(ordered)) if pos != anchor_pos]
+        near = candidates[:k_near]
+        rand = candidates[k_near : k_near + k_rand]
+        group = near + rand
+        for group_pos, partner_pos in enumerate(group):
+            anchor_idx.append(anchor_pos)
+            partner_idx.append(partner_pos)
+            is_near.append(1 if group_pos < len(near) else 0)
+            teacher_logit.append(float(rng.normal()))
+            pooled_ab.append(rng.normal(size=pooled_dim).astype(np.float32))
+            pooled_ba.append(rng.normal(size=pooled_dim).astype(np.float32))
+            pair_label.append(int(rng.integers(0, 2)))
+        offsets.append(offsets[-1] + len(group))
+
+    write_kd_targets(
+        output_dir,
+        node_ids=ordered,
+        pair_anchor_idx=np.asarray(anchor_idx, dtype=np.int32),
+        pair_partner_idx=np.asarray(partner_idx, dtype=np.int32),
+        anchor_offsets=np.asarray(offsets, dtype=np.int64),
+        teacher_logit=np.asarray(teacher_logit, dtype=np.float32),
+        teacher_pooled_ab=np.stack(pooled_ab).astype(np.float32),
+        teacher_pooled_ba=np.stack(pooled_ba).astype(np.float32),
+        is_near=np.asarray(is_near, dtype=np.uint8),
+        pair_label=np.asarray(pair_label, dtype=np.int8),
+        truth_graph_sha256=truth_graph_sha256,
+        checkpoint_path=output_dir / "checkpoint.pt",
+        checkpoint_sha256="0" * 64,
+        checkpoint_id=None,
+        k_near=k_near,
+        k_rand=k_rand,
+        seed=seed,
+    )
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    return output_dir, str(manifest["npz_sha256"])
+
+
+def _minimal_internal_holdout(nodes: Sequence[str]) -> internal_holdout.InternalHoldoutPartition:
+    """An `InternalHoldoutPartition` with `v_fit=nodes` and no topology.
+
+    `_BatchFactory`'s KD truth-graph binding check reads only `v_fit`/
+    `topology_fit` (via `build_g_fit`/`truth_graph_for_kd`); every other
+    field here is a structurally-valid placeholder, not exercised.
+    """
+    return internal_holdout.InternalHoldoutPartition(
+        v_fit=frozenset(nodes),
+        v_hold=frozenset(),
+        holdout_draws=(frozenset(), frozenset()),
+        training_interactions_fit=frozenset(),
+        topology_fit=frozenset(),
+        topology_hold=frozenset(),
+        hold_manifest=internal_holdout.PairLabelManifest(
+            nodes=(),
+            positive_edges=(),
+            pairs=(),
+            labels=(),
+            nodes_sha256="",
+            positive_edges_sha256="",
+            pair_labels_sha256="",
+        ),
+        quarantine_counts=internal_holdout.QuarantineCounts(training_interactions={}),
+        overlap_proof=internal_holdout.OverlapProof(node={}, label_edge={}),
+    )
+
+
+def _toy_internal_holdout() -> internal_holdout.InternalHoldoutPartition:
+    """`InternalHoldoutPartition` whose `build_g_fit()` matches `_toy_bundle`'s graph exactly."""
+    topology_fit = frozenset(canonical_pair(u, v) for u, v in _POSITIVES[:6] if u != v)
+    return replace(
+        _minimal_internal_holdout(_NODES),
+        training_interactions_fit=topology_fit,
+        topology_fit=topology_fit,
+    )
 
 
 class TestBatchFactoryE2E:
@@ -582,7 +701,7 @@ class TestBatchFactoryE2E:
                 e2e_cfg, model_cfg, data, node_batch=4, rank=rank, world_size=2
             )
             prefetched = list(
-                te._prefetch_batches(
+                _prefetch_batches(
                     iter(
                         prefetch_factory.epoch_batches(
                             1, rows_per_rank=rows_per_rank, steps=epoch_steps
@@ -600,6 +719,209 @@ class TestBatchFactoryE2E:
 
             assert_batches_equal(direct, prefetched)
             assert prefetch_state == direct_state
+
+
+class TestBatchFactoryKD:
+    """`_BatchFactory`'s KD artifact loading and `_kd_tensors` (B1 plan Wave 3)."""
+
+    _K_NEAR = 2
+    _K_RAND = 1
+    _POOLED_DIM = 5
+
+    @classmethod
+    def _factory(
+        cls,
+        tmp_path: Path,
+        *,
+        rank: int = 0,
+        world_size: int = 1,
+        anchors_per_step: int = 2,
+        w_label: float = 1.0,
+        nodes: Sequence[str] | None = None,
+        targets_sha256_override: str | None = None,
+        truth_graph_sha256_override: str | None = None,
+        attach_internal_holdout: bool = True,
+        train_nodes_override: Sequence[str] | None = None,
+    ) -> te._BatchFactory:
+        model_cfg = EgoStitchConfig()
+        data = _toy_bundle(tmp_path, model_cfg)
+        # `train_nodes_override` shrinks the *training* universe itself (e.g.
+        # the short-group padding test's 3-node universe); the default
+        # `_toy_internal_holdout` instead matches `_toy_bundle`'s full 8-node
+        # graph exactly, which is what the digest-binding tests need.
+        holdout = (
+            _minimal_internal_holdout(train_nodes_override)
+            if train_nodes_override is not None
+            else _toy_internal_holdout()
+        )
+        if train_nodes_override is not None:
+            data = replace(data, train_nodes=list(train_nodes_override))
+        if attach_internal_holdout:
+            data = replace(data, internal_holdout=holdout)
+        pack_dir = tmp_path / f"kd-pack-{rank}"
+        _write_tiny_token_pack(pack_dir, _NODES)
+        artifact_dir, npz_sha256 = _write_kd_artifact(
+            tmp_path / "kd_targets",
+            nodes if nodes is not None else _NODES,
+            k_near=cls._K_NEAR,
+            k_rand=cls._K_RAND,
+            pooled_dim=cls._POOLED_DIM,
+            truth_graph_sha256=(
+                truth_graph_sha256_override
+                if truth_graph_sha256_override is not None
+                else _oracle_truth_graph_sha256(truth_graph_for_kd(holdout))
+            ),
+        )
+        cfg = _toy_cfg(tmp_path)
+        e2e_cfg = replace(
+            cfg,
+            model=ModelConfig(family="egostitch_e2e", config={}),
+            data=replace(cfg.data, pack_dir=pack_dir),
+        )
+        distill = DistillConfig(
+            targets_path=str(artifact_dir),
+            targets_sha256=(
+                targets_sha256_override if targets_sha256_override is not None else npz_sha256
+            ),
+            w_label=w_label,
+            anchors_per_step=anchors_per_step,
+        )
+        return te._BatchFactory(
+            e2e_cfg,
+            model_cfg,
+            data,
+            node_batch=4,
+            rank=rank,
+            world_size=world_size,
+            distill=distill,
+        )
+
+    def test_absent_distill_produces_no_kd_tensors(self, tmp_path: Path) -> None:
+        model_cfg = EgoStitchConfig()
+        data = _toy_bundle(tmp_path, model_cfg)
+        pack_dir = tmp_path / "kd-pack-none"
+        _write_tiny_token_pack(pack_dir, _NODES)
+        cfg = _toy_cfg(tmp_path)
+        e2e_cfg = replace(
+            cfg,
+            model=ModelConfig(family="egostitch_e2e", config={}),
+            data=replace(cfg.data, pack_dir=pack_dir),
+        )
+        factory = te._BatchFactory(e2e_cfg, model_cfg, data, node_batch=4, rank=0, world_size=1)
+        assert factory._kd_tensors(1, 0) is None
+
+    def test_fails_closed_on_empty_targets_sha256(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="targets_sha256"):
+            self._factory(tmp_path, targets_sha256_override="")
+
+    def test_fails_closed_on_mismatched_targets_sha256(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="digest"):
+            self._factory(tmp_path, targets_sha256_override="0" * 64)
+
+    def test_artifact_node_outside_v_fit_is_rejected_at_construction(self, tmp_path: Path) -> None:
+        # A superset (one foreign node beyond the current V_fit universe) is
+        # caught by the same order-sensitive equality gate as a permutation
+        # or a subset (below) -- individual membership alone is not enough.
+        with pytest.raises(ValueError, match="does not match the current sorted V_fit universe"):
+            self._factory(tmp_path, nodes=[*_NODES, "foreign-node"])
+
+    @pytest.mark.parametrize(
+        "artifact_nodes",
+        [list(reversed(_NODES)), _NODES[:-1]],
+        ids=["permutation", "subset"],
+    )
+    def test_node_universe_permutation_or_subset_is_rejected(
+        self, tmp_path: Path, artifact_nodes: list[str]
+    ) -> None:
+        """Index arrays are positional: a same-membership reorder is exactly as unsafe as a drop."""
+        with pytest.raises(ValueError, match="does not match the current sorted V_fit universe"):
+            self._factory(tmp_path, nodes=artifact_nodes)
+
+    def test_truth_graph_digest_mismatch_is_rejected(self, tmp_path: Path) -> None:
+        """A digest-valid, node-set-valid artifact from a *different* training graph still fails.
+
+        Regression guard for the silent-corruption trap CLAUDE.md's
+        2026-08-03 shared-interaction correction describes: same node
+        universe, same artifact digest, wrong teacher targets because the
+        graph the dumper scored against has since changed.
+        """
+        with pytest.raises(ValueError, match="truth-graph digest"):
+            self._factory(tmp_path, truth_graph_sha256_override="a" * 64)
+
+    def test_missing_internal_holdout_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(RuntimeError, match="internal_holdout"):
+            self._factory(tmp_path, attach_internal_holdout=False)
+
+    def test_deterministic_for_fixed_seed_epoch_step_rank(self, tmp_path: Path) -> None:
+        factory = self._factory(tmp_path)
+        first = factory._kd_tensors(2, 3)
+        second = factory._kd_tensors(2, 3)
+        assert first is not None and second is not None
+        assert first.keys() == second.keys()
+        for name in first:
+            torch.testing.assert_close(first[name], second[name])
+
+    def test_shapes_fixed_across_steps_regardless_of_short_groups(self, tmp_path: Path) -> None:
+        # k_near + k_rand = 3, but every anchor in an 8-node universe only has
+        # 7 candidates -- well above 3, so every group is full here; the
+        # padding contract is checked directly by the next test instead.
+        factory = self._factory(tmp_path, anchors_per_step=2)
+        expected_rows = 2 * (self._K_NEAR + self._K_RAND)
+        for epoch, step in ((1, 0), (1, 1), (5, 0)):
+            kd = factory._kd_tensors(epoch, step)
+            assert kd is not None
+            for name in ("kd_mask", "kd_teacher_logit", "kd_pair_label", "kd_group"):
+                assert kd[name].shape == (expected_rows,)
+            assert kd["kd_teacher_pooled"].shape == (expected_rows, self._POOLED_DIM)
+            assert kd["kd_pair_endpoints"].shape == (expected_rows, 2)
+
+    def test_short_group_padding_is_masked_and_filler_rows_are_self_pairs(
+        self, tmp_path: Path
+    ) -> None:
+        # A 3-node universe has only 2 candidates per anchor; k_near=2,
+        # k_rand=1 asks for 3, so every anchor's group is short by 1 (the
+        # known short-group case, B1 plan "Known risks" #3).
+        small_nodes = _NODES[:3]
+        factory = self._factory(
+            tmp_path, anchors_per_step=1, nodes=small_nodes, train_nodes_override=small_nodes
+        )
+        kd = factory._kd_tensors(1, 0)
+        assert kd is not None
+        context_size = self._K_NEAR + self._K_RAND
+        assert kd["kd_mask"].shape == (context_size,)
+        assert int(kd["kd_mask"].sum()) == 2
+        filler = kd["kd_mask"] == 0.0
+        assert bool(filler.any())
+        assert bool(kd["node_row_i"][filler].equal(kd["node_row_j"][filler]))
+
+    def test_group_ids_are_consistent_within_and_distinct_across_anchors(
+        self, tmp_path: Path
+    ) -> None:
+        factory = self._factory(tmp_path, anchors_per_step=2)
+        kd = factory._kd_tensors(1, 0)
+        assert kd is not None
+        context_size = self._K_NEAR + self._K_RAND
+        groups = kd["kd_group"].tolist()
+        first_group = groups[:context_size]
+        second_group = groups[context_size : 2 * context_size]
+        assert len(set(first_group)) == 1
+        assert len(set(second_group)) == 1
+        assert first_group[0] != second_group[0]
+
+    def test_gathered_nodes_pass_the_v_fit_audit(self, tmp_path: Path) -> None:
+        factory = self._factory(tmp_path)
+        kd = factory._kd_tensors(1, 0)
+        assert kd is not None
+        assert factory.training_nodes_read
+        assert factory.training_nodes_read <= factory._allowed_training_nodes
+        assert factory.training_f0_rows_read <= factory._allowed_training_rows
+
+    def test_rank_disjoint_anchor_selection(self, tmp_path: Path) -> None:
+        rank0 = self._factory(tmp_path, rank=0, world_size=2, anchors_per_step=1)
+        rank1 = self._factory(tmp_path, rank=1, world_size=2, anchors_per_step=1)
+        positions0 = rank0._kd_step_anchor_positions(1, 0)
+        positions1 = rank1._kd_step_anchor_positions(1, 0)
+        assert set(positions0).isdisjoint(positions1)
 
 
 class TestE2ECompositeStep:
@@ -1619,6 +1941,217 @@ class TestE2ECompositeStep:
             id(p) in trainable_ids for p in te._require_b0v31_classifier(model).trunk.parameters()
         )
 
+    def test_control_batch_without_node_factor_carries_no_kd_or_nf_parts(
+        self, tmp_path: Path
+    ) -> None:
+        """Pre-Wave-3 baseline: no `kd` payload + `node_factor_dim=0` -> `parts` unchanged.
+
+        Deliberately asserts absence rather than exact-zero placeholders: a
+        classifier with no `NodeFactorBottleneck` has nothing for `nf_*` to
+        describe, and a batch with no `"kd"` key never enters the KD branch
+        at all (B1 plan control-equivalence requirement).
+        """
+        batch, model = self._batch_and_model(tmp_path)
+        assert model.classifier.node_factor is None
+        composite = te._CompositeStep(model, world_size=1)
+        with self._bf16_autocast():
+            out = composite(self._payload(batch, joint_weight=1.0, collect_diagnostics=True))
+        parts = cast(dict[str, float], out["parts"])
+        assert not any(name.startswith(("kd_", "nf_")) for name in parts)
+        families = cast(dict[str, torch.Tensor], out["families"])
+        assert "kd" not in families
+
+
+class TestE2ECompositeStepKD:
+    """B1 KD stream inside `_CompositeStep.forward` (null-generator + node-factor arms)."""
+
+    _POOLED_DIM = 5
+    _ARM_WEIGHTS: dict[str, dict[str, float]] = {
+        "kd_control": {"w_label": 1.0},
+        "kd_d1": {"w_logit": 1.0},
+        "kd_d2": {"w_rank": 1.0, "w_dist": 1.0},
+        "kd_d3": {"w_gram": 1.0},
+    }
+    # `diag_w` is zero-init, so `dr/dz = diag_w * z = 0` at step 0: the three
+    # logit-space arms (their loss depends on `kd_logits`, hence on `r`) see
+    # the documented *direct per-coordinate* gradient on `diag_w` itself
+    # (node_factor.py's zero-init rationale), not on `z_a`/`z_b` -- gradient
+    # reaches `w_z` only once `diag_w` has moved. `kd_gram_loss`'s embedding-
+    # space feature (`z_a (*) z_b`) bypasses `r`/`diag_w` entirely, so D3 is
+    # the mirror case: it reaches `w_z` immediately and never `diag_w`.
+    _ARM_GRADIENT_PARAM: dict[str, str] = {
+        "kd_control": "diag_w",
+        "kd_d1": "diag_w",
+        "kd_d2": "diag_w",
+        "kd_d3": "w_z",
+    }
+
+    def _factory_and_batch(
+        self, tmp_path: Path
+    ) -> tuple[te._BatchFactory, te._CompositeBatch, EgoStitchConfig]:
+        model_cfg = EgoStitchConfig()
+        cfg = _toy_cfg(tmp_path)
+        data = _toy_bundle(tmp_path, model_cfg)
+        pack_dir = tmp_path / "kd_composite_pack"
+        _write_tiny_token_pack(pack_dir, _NODES, min_length=3)
+        e2e_cfg = replace(
+            cfg,
+            model=ModelConfig(family="egostitch_e2e", config={}),
+            data=replace(cfg.data, pack_dir=pack_dir),
+        )
+        rows, steps = te._epoch_step_plan(
+            len(data.training_positives),
+            negative_ratio=e2e_cfg.data.negative_ratio,
+            edge_batch=e2e_cfg.data.edge_batch,
+            world_size=1,
+        )
+        factory = te._BatchFactory(
+            e2e_cfg,
+            model_cfg,
+            data,
+            node_batch=4,
+            rank=0,
+            world_size=1,
+            generator_supervision=False,
+            relational_supervision=False,
+        )
+        batch = next(iter(factory.epoch_batches(1, rows_per_rank=rows, steps=steps)))
+        return factory, batch, model_cfg
+
+    def _model(self, *, node_factor_dim: int, distill: DistillConfig) -> EgoStitchModel:
+        return EgoStitchModel(
+            E2EConfig(
+                generator=GeneratorConfig(name="null"),
+                encoder=EncoderConfig(dim=8, layers=1),
+                classifier=ClassifierConfig(
+                    d_model=16,
+                    encoder_layers=1,
+                    cross_attn_layers=1,
+                    n_heads=2,
+                    n_inj=1,
+                    xattn_heads=2,
+                    p_topo=0.15,
+                    node_factor_dim=node_factor_dim,
+                ),
+                distill=distill,
+            )
+        )
+
+    def _kd_dict(self, factory: te._BatchFactory) -> dict[str, torch.Tensor]:
+        """Four hand-picked rows, two disjoint anchor groups, no shared endpoints across them.
+
+        Guarantees `kd_gram_loss`'s shared-endpoint exclusion still leaves at
+        least one live off-diagonal pair (row 0 vs row 2: endpoints
+        ``{n0, n1}`` vs ``{n2, n4}`` never coincide) -- a randomly sampled
+        tiny context could mask every cross-group pair and make the D3 arm's
+        gradient-flow assertion vacuous.
+        """
+        anchors = ["n0", "n0", "n2", "n2"]
+        partners = ["n1", "n3", "n4", "n5"]
+        idx_i = torch.tensor([factory._data.node_index[n] for n in anchors], dtype=torch.long)
+        idx_j = torch.tensor([factory._data.node_index[n] for n in partners], dtype=torch.long)
+        empty_shape = (4, 0, factory._model_cfg.input_dim)
+        kd: dict[str, torch.Tensor] = {
+            "x_i": factory._data.f0[idx_i],
+            "x_j": factory._data.f0[idx_j],
+            "node_row_i": idx_i.clone(),
+            "node_row_j": idx_j.clone(),
+            "is_self": torch.zeros(4, dtype=torch.bool),
+            "ground_i": torch.empty(empty_shape, dtype=factory._data.f0.dtype),
+            "ground_j": torch.empty(empty_shape, dtype=factory._data.f0.dtype),
+            "kd_teacher_logit": torch.tensor([1.5, -0.5, 0.3, 2.0], dtype=torch.float32),
+            "kd_teacher_pooled": torch.randn(4, self._POOLED_DIM, dtype=torch.float32),
+            "kd_pair_label": torch.tensor([1.0, 0.0, 0.0, 1.0], dtype=torch.float32),
+            "kd_group": torch.tensor([0, 0, 1, 1], dtype=torch.int64),
+            "kd_mask": torch.tensor([1.0, 1.0, 1.0, 1.0], dtype=torch.float32),
+            "kd_pair_endpoints": torch.stack([idx_i, idx_j], dim=-1),
+        }
+        kd.update(factory._token_streams(anchors, partners))
+        return kd
+
+    def _payload(
+        self,
+        batch: te._CompositeBatch,
+        kd: dict[str, torch.Tensor] | None,
+        *,
+        edge_active: bool = True,
+    ) -> dict[str, object]:
+        return {
+            "node": batch.node,
+            "edge": batch.edge,
+            "kd": kd,
+            "edge_active": edge_active,
+            "real_ssl_scale": torch.tensor(1.0 if edge_active else 0.0),
+            "edge_rows_global": batch.edge_rows_global,
+            "seed": 0,
+            "epoch": 1,
+            "step": 0,
+            "collect_diagnostics": True,
+        }
+
+    @staticmethod
+    def _bf16_autocast() -> torch.autocast:
+        return torch.autocast(device_type="cpu", dtype=torch.bfloat16)
+
+    def _distill_for_arm(self, arm: str) -> DistillConfig:
+        weights = self._ARM_WEIGHTS[arm]
+        return DistillConfig(
+            targets_path="unused.npz",
+            anchors_per_step=2,
+            w_label=weights.get("w_label", 0.0),
+            w_logit=weights.get("w_logit", 0.0),
+            w_rank=weights.get("w_rank", 0.0),
+            w_dist=weights.get("w_dist", 0.0),
+            w_gram=weights.get("w_gram", 0.0),
+        )
+
+    @pytest.mark.parametrize("arm", ["kd_control", "kd_d1", "kd_d2", "kd_d3"])
+    def test_kd_parts_families_backward_and_node_factor_gradient(
+        self, tmp_path: Path, arm: str
+    ) -> None:
+        torch.manual_seed(0)
+        distill = self._distill_for_arm(arm)
+        factory, batch, _ = self._factory_and_batch(tmp_path)
+        model = self._model(node_factor_dim=4, distill=distill)
+        kd = self._kd_dict(factory)
+        composite = te._CompositeStep(model, world_size=1)
+        with self._bf16_autocast():
+            out = composite(self._payload(batch, kd))
+        parts = cast(dict[str, float], out["parts"])
+        for name in ("kd_label", "kd_logit", "kd_rank", "kd_dist", "kd_gram", "kd_total"):
+            assert name in parts
+        for name in ("nf_w_l1", "nf_r_var", "nf_residual_absmean"):
+            assert name in parts
+        families = cast(dict[str, torch.Tensor], out["families"])
+        assert "kd" in families
+        loss = cast(torch.Tensor, out["loss"])
+        assert bool(torch.isfinite(loss))
+        loss.backward()  # type: ignore[no-untyped-call]
+        assert isinstance(model.classifier, B0V31PairClassifier)
+        node_factor = model.classifier.node_factor
+        assert node_factor is not None
+        gradient = (
+            node_factor.diag_w.grad
+            if self._ARM_GRADIENT_PARAM[arm] == "diag_w"
+            else node_factor.w_z.weight.grad
+        )
+        assert gradient is not None
+        assert bool(torch.count_nonzero(gradient))
+
+    def test_kd_contributes_zero_when_edge_phase_inactive(self, tmp_path: Path) -> None:
+        torch.manual_seed(0)
+        distill = DistillConfig(targets_path="unused.npz", anchors_per_step=2, w_label=1.0)
+        factory, batch, _ = self._factory_and_batch(tmp_path)
+        model = self._model(node_factor_dim=4, distill=distill)
+        kd = self._kd_dict(factory)
+        composite = te._CompositeStep(model, world_size=1)
+        with self._bf16_autocast():
+            out = composite(self._payload(batch, kd, edge_active=False))
+        parts = cast(dict[str, float], out["parts"])
+        assert parts["kd_total"] == 0.0
+        families = cast(dict[str, torch.Tensor], out["families"])
+        assert float(families["kd"].detach()) == pytest.approx(0.0)
+
 
 def _float_node_state(state: E2ENodeState) -> E2ENodeState:
     """Detach the cacheable fields exactly where validation enters its fp32 island."""
@@ -1907,7 +2440,7 @@ class TestE2EValidationCache:
                     [bool(value) for value in is_self.tolist()],
                 )
             )
-            return original_build(state_a, state_b, is_self, **kwargs)
+            return original_build(state_a, state_b, is_self, **kwargs)  # type: ignore[arg-type]
 
         def _score(context: E2EPairContext, **kwargs: object) -> torch.Tensor:
             assert not torch.is_autocast_enabled("cpu")
@@ -2285,6 +2818,78 @@ def _e2e_pipeline_benchmark() -> Benchmark:
         positive_edges=positive_edges,
         split=split,
     )
+
+
+class TestE2EValidationDecomposition:
+    """B1 plan: `_validate_epoch`'s 4-way node-factor decomposition columns."""
+
+    @staticmethod
+    def _setup(
+        tmp_path: Path, *, node_factor_dim: int
+    ) -> tuple[te.EgoStitchData, EgoStitchModel, Accelerator, PackedFeatureTable, dict[str, int]]:
+        torch.manual_seed(0)
+        data = replace(
+            _toy_bundle(tmp_path, EgoStitchConfig()),
+            val_pairs=[("n0", "n1"), ("n1", "n0"), ("n2", "n2"), ("n0", "n2")],
+            val_labels=np.asarray([1, 0, 1, 0], dtype=np.int8),
+        )
+        pack_dir = tmp_path / "validation-decomposition-token-pack"
+        _write_tiny_token_pack(pack_dir, _NODES, min_length=3)
+        table = PackedFeatureTable.from_pack(pack_dir, torch.device("cpu"))
+        model = EgoStitchModel(
+            E2EConfig(
+                generator=GeneratorConfig(name="null"),
+                encoder=EncoderConfig(dim=8, layers=1),
+                classifier=ClassifierConfig(
+                    d_model=16,
+                    encoder_layers=1,
+                    cross_attn_layers=1,
+                    n_heads=2,
+                    n_inj=1,
+                    xattn_heads=2,
+                    p_topo=0.15,
+                    node_factor_dim=node_factor_dim,
+                ),
+            )
+        )
+        return data, model, Accelerator(cpu=True), table, table.manifest.node_index()
+
+    def test_node_factor_model_gains_per_component_columns_equal_to_full_at_init(
+        self, tmp_path: Path
+    ) -> None:
+        data, model, accelerator, table, index = self._setup(tmp_path, node_factor_dim=4)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            result = te._validate_epoch(
+                model,
+                data,
+                accelerator,
+                edge_batch=2,
+                topk_fraction=0.25,
+                token_table=table,
+                token_node_index=index,
+            )
+        assert result is not None
+        for suffix in ("content", "content_bias", "content_factor"):
+            assert result.fidelity[f"auroc_{suffix}"] == pytest.approx(result.metrics.auroc)
+            assert result.fidelity[f"auprc_{suffix}"] == pytest.approx(result.metrics.auprc)
+
+    def test_model_without_node_factor_carries_no_decomposition_columns(
+        self, tmp_path: Path
+    ) -> None:
+        data, model, accelerator, table, index = self._setup(tmp_path, node_factor_dim=0)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            result = te._validate_epoch(
+                model,
+                data,
+                accelerator,
+                edge_batch=2,
+                topk_fraction=0.25,
+                token_table=table,
+                token_node_index=index,
+            )
+        assert result is not None
+        assert not any(name.startswith("auroc_content") for name in result.fidelity)
+        assert not any(name.startswith("auprc_content") for name in result.fidelity)
 
 
 def _write_e2e_feature_root(tmp_path: Path, nodes: list[str], *, input_dim: int = 1536) -> None:

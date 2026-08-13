@@ -19,6 +19,7 @@ Usage:
   hpc/run.sh merge <merge args...>
   hpc/run.sh g1 <g1 args...>
   hpc/run.sh g2 <g2 args...>
+  hpc/run.sh kd-targets <kd-targets args...>
 
 The train command drives the full packed-feature DDP training pipeline
 (`python -m src.e2_pipeline`) across all visible NVIDIA H20 GPUs via an
@@ -55,8 +56,17 @@ for every trained arm; call `test` directly only for the two scoring-time
 controls (`structure_control_6a_v3`, `structure_control_6e_v1`), which reuse
 the `full` arm's checkpoint and have no pipeline run of their own.
 
-merge/g1/g2 remain single-process while train uses all visible NVIDIA H20
-GPUs. Use nohup in the calling shell when a run must survive disconnects.
+The kd-targets command is a thin passthrough to `python -m
+src.distill.teacher_targets` (B1 plan), which dumps the Full-Ego Pooled Oracle
+KD teacher-target artifact over V_fit-only anchor/context pairs from one
+published `full_ego_oracle` checkpoint. It scores on a single GPU -- there is
+no world-size fan-out to size, unlike `train`/`score` -- so pass `--device
+cuda` explicitly; `--data-root`/`--strategy` default to this repository's data
+root and `breadth_first` but may be overridden after the command's own args.
+
+merge/g1/g2/kd-targets remain single-process while train uses all visible
+NVIDIA H20 GPUs. Use nohup in the calling shell when a run must survive
+disconnects.
 EOF
 }
 
@@ -164,6 +174,10 @@ print(cfg.output_dir, cfg.strategy, cfg.seed)
     ;;
   g2)
     exec "${PYTHON_BIN}" -m src.experiments.g2_ceiling "$@"
+    ;;
+  kd-targets)
+    exec "${PYTHON_BIN}" -m src.distill.teacher_targets \
+      --data-root "${DATA_ROOT}" --strategy breadth_first "$@"
     ;;
   *)
     usage >&2

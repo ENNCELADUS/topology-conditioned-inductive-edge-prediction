@@ -495,6 +495,7 @@ class TestRunTestProtocol:
             )
         assert runner.calls == []
 
+
 class TestReuseExistingScores:
     """Resuming a run whose later pass failed must not redo the finished ones."""
 

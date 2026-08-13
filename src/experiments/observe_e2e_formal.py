@@ -149,10 +149,13 @@ def report_generator_clipping(profile: Mapping[str, object]) -> list[str]:
             else:
                 flat.append((key, value))
         for key, value in flat:
-            if isinstance(value, (int, float)) and math.isfinite(float(value)):
-                if float(value) > worst_ratio:
-                    worst_ratio = float(value)
-                    worst_ratio_probe = (probe.get("step"), key)
+            if (
+                isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                and float(value) > worst_ratio
+            ):
+                worst_ratio = float(value)
+                worst_ratio_probe = (probe.get("step"), key)
     if worst_ratio > float("-inf"):
         lines.append(
             f"family probes: {len(series)}; worst family ratio {_fmt(worst_ratio)} "
@@ -292,9 +295,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("output_dir", type=Path, help="formal-run output directory")
     args = parser.parse_args(argv)
     try:
-        print(build_report(args.output_dir))
+        print(build_report(args.output_dir))  # noqa: T201 -- CLI report goes to stdout
     except FileNotFoundError as error:
-        print(f"ERROR: {error}", file=sys.stderr)
+        print(f"ERROR: {error}", file=sys.stderr)  # noqa: T201 -- CLI error path
         raise SystemExit(1) from error
 
 

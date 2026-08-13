@@ -129,7 +129,7 @@ def test_runner_discovers_visible_h20s() -> None:
 def test_runner_launches_exact_v_hold_checkpoint_recovery_with_all_gpus() -> None:
     text = RUNNER.read_text()
     assert "recover-v-hold)" in text
-    assert "--num_processes \"${GPU_COUNT}\" --mixed_precision bf16" in text
+    assert '--num_processes "${GPU_COUNT}" --mixed_precision bf16' in text
     assert "-m src.experiments.v_hold_checkpoint_recovery" in text
 
 
@@ -200,15 +200,6 @@ def test_primary_docs_reference_only_the_direct_hpc_layer() -> None:
         assert "sbatch" not in text.lower()
 
 
-def test_specs_pin_auto_sized_h20_e2_training() -> None:
-    spec = (REPO_ROOT / "docs" / "05-egostitch-spec.md").read_text()
-    protocol = (REPO_ROOT / "docs" / "03-experiment-protocol.md").read_text()
-
-    assert "all visible NVIDIA H20" in spec
-    assert "automatically detected" in spec
-    assert "GPU-count-independent H20 execution design" in spec
-    assert "60 minutes" in spec
-    assert "30 epochs" in spec
-    assert "validation after every epoch" in spec
-    assert "fixed 30-epoch" in protocol
-    assert "quality is reported but is not the throughput acceptance gate" in protocol
+# test_specs_pin_auto_sized_h20_e2_training was removed with docs/05-egostitch-spec.md
+# (deleted in 60dfc25) and the 03-experiment-protocol rewrite that dropped its pinned
+# sentences; the runtime behavior it guarded is asserted by the config tests above.

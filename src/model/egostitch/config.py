@@ -408,6 +408,12 @@ class ClassifierConfig:
             cross-attention, with every valid non-cls pair token as a query).
             Every mode is zero-initialized, so at initialization all four are
             bit-identical to the unconditioned path.
+        node_factor_dim: Width `dim` of the `NodeFactorBottleneck` low-rank
+            node-factor path (`classifier/node_factor.py`, B1 KD plan). ``0``
+            (default) builds no node factor at all -- DDP unused-parameter
+            safety, the same conditional-build convention as `film_logit`.
+            Independent of `conditioning_mode`: the node factor is a
+            content-path residual, never gated by topo conditioning.
     """
 
     name: str = "b0_v31"
@@ -421,6 +427,7 @@ class ClassifierConfig:
     permanent_null: str = "none"
     conditioning_ema_decay: float = 0.99
     conditioning_mode: str = "xattn_cls"
+    node_factor_dim: int = 0
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants.
@@ -459,6 +466,8 @@ class ClassifierConfig:
                 f"conditioning_mode must be one of {sorted(CONDITIONING_MODES)}, "
                 f"got {self.conditioning_mode!r}"
             )
+        if self.node_factor_dim < 0:
+            raise ValueError(f"node_factor_dim must be non-negative, got {self.node_factor_dim}")
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object]) -> ClassifierConfig:
@@ -475,7 +484,105 @@ class ClassifierConfig:
         )
 
 
-_E2E_TOP_LEVEL_KEYS = frozenset({"generator", "encoder", "classifier"})
+@dataclass(frozen=True)
+class DistillConfig:
+    """B1 training-time topology-distillation knobs (fourth optional `E2EConfig` section).
+
+    All-zero-weight defaults keep every existing config valid with no
+    ``distill:`` section at all (`E2EConfig.from_mapping`'s absent-section ->
+    defaults rule) and stay out of the pinned ``training:`` gate
+    (`train_egostitch.py`). Exactly one arm group's weight(s) may be nonzero
+    at a time -- ``kd_control`` (`w_label`), ``kd_d1`` (`w_logit`), ``kd_d2``
+    (`w_rank` and `w_dist` together), ``kd_d3`` (`w_gram`) -- so a config can
+    never straddle two KD mechanisms;
+    `train_egostitch._e2e_arm_name_from_config` reads this same pattern to
+    name the run.
+
+    Attributes:
+        targets_path: Path to the dumped teacher-target artifact
+            (`src/distill/teacher_targets.py`, Wave 2). Required whenever any
+            weight below is nonzero.
+        targets_sha256: Digest pinning the exact artifact `targets_path`
+            must resolve to.
+        w_label: ``kd_control`` weight -- BCE against the KD stream's own
+            ``pair_label`` (the matched control: same stream as every other
+            arm, label supervision instead of a teacher signal).
+        w_logit: ``kd_d1`` weight -- pointwise logit KD against the
+            teacher's soft score (GLNN).
+        w_rank: ``kd_d2`` weight -- margin-rank loss over per-anchor teacher
+            rows (LLP_R, LLP ICML'23). Paired with `w_dist`.
+        w_dist: ``kd_d2`` weight -- temperature-KL over per-anchor teacher
+            rows (LLP_D). Paired with `w_rank`.
+        w_gram: ``kd_d3`` weight -- pair-space cosine-Gram matching against
+            the teacher's pooled embeddings (Graph2Feat/CAZI family).
+        temperature: Softmax/KL temperature for `w_dist` (LLP reference pins 1.0).
+        margin: Margin for the `w_rank` pairwise ranking loss.
+        anchors_per_step: KD anchor groups drawn per optimizer microstep.
+    """
+
+    targets_path: str = ""
+    targets_sha256: str = ""
+    w_label: float = 0.0
+    w_logit: float = 0.0
+    w_rank: float = 0.0
+    w_dist: float = 0.0
+    w_gram: float = 0.0
+    temperature: float = 1.0
+    margin: float = 0.1
+    anchors_per_step: int = 2
+
+    def __post_init__(self) -> None:
+        """Validate weight signs/ranges and the single-arm-group pattern.
+
+        Raises:
+            ValueError: On a negative weight, a non-positive
+                `temperature`/`margin`, a non-positive `anchors_per_step`, or
+                a nonzero-weight pattern outside the five legal arm groups.
+        """
+        for name in ("w_label", "w_logit", "w_rank", "w_dist", "w_gram"):
+            if float(getattr(self, name)) < 0.0:
+                raise ValueError(f"{name} must be non-negative, got {getattr(self, name)}")
+        if self.temperature <= 0.0:
+            raise ValueError(f"temperature must be positive, got {self.temperature}")
+        if self.margin <= 0.0:
+            raise ValueError(f"margin must be positive, got {self.margin}")
+        if self.anchors_per_step < 1:
+            raise ValueError(f"anchors_per_step must be >= 1, got {self.anchors_per_step}")
+        nonzero = frozenset(
+            name
+            for name in ("w_label", "w_logit", "w_rank", "w_dist", "w_gram")
+            if float(getattr(self, name)) > 0.0
+        )
+        legal_patterns: tuple[frozenset[str], ...] = (
+            frozenset(),
+            frozenset({"w_label"}),
+            frozenset({"w_logit"}),
+            frozenset({"w_rank", "w_dist"}),
+            frozenset({"w_gram"}),
+        )
+        if nonzero not in legal_patterns:
+            raise ValueError(
+                "distill weights must follow exactly one arm group -- all zero, only "
+                "w_label (kd_control), only w_logit (kd_d1), w_rank and w_dist together "
+                f"(kd_d2), or only w_gram (kd_d3); got nonzero weights {sorted(nonzero)}"
+            )
+
+    @classmethod
+    def from_mapping(cls, mapping: Mapping[str, object]) -> DistillConfig:
+        """Build a `distill:` config section from a YAML mapping.
+
+        Raises:
+            ValueError: On unknown keys or invalid values.
+        """
+        return _from_mapping(
+            cls,
+            mapping,
+            label="distill",
+            string_fields=frozenset({"targets_path", "targets_sha256"}),
+        )
+
+
+_E2E_TOP_LEVEL_KEYS = frozenset({"generator", "encoder", "classifier", "distill"})
 
 # Every field name that lived directly on the pre-P3 flat `E2EConfig`
 # (design 2026-08-02 §8/§12 P3). A mapping presenting any of these at the top
@@ -530,21 +637,45 @@ class E2EConfig:
         generator: Neighborhood-generator selection and calibration.
         encoder: Graph-encoder selection and sizing.
         classifier: Pairwise-classifier selection and pair-trunk sizing.
+        distill: B1 training-time topology-distillation knobs (optional;
+            absent ``distill:`` section -> all-zero-weight defaults, so every
+            pre-B1 config stays valid unchanged).
     """
 
     generator: GeneratorConfig = field(default_factory=GeneratorConfig)
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
     classifier: ClassifierConfig = field(default_factory=ClassifierConfig)
+    distill: DistillConfig = field(default_factory=DistillConfig)
+
+    def __post_init__(self) -> None:
+        """Validate the cross-section KD-architecture requirement.
+
+        Raises:
+            ValueError: If any `distill` weight is nonzero while
+                `distill.targets_path` is empty or `classifier.node_factor_dim`
+                is `0` -- a KD loss with no teacher artifact or no node-factor
+                path to train would silently be a no-op.
+        """
+        distill_active = any(
+            getattr(self.distill, name) > 0.0
+            for name in ("w_label", "w_logit", "w_rank", "w_dist", "w_gram")
+        )
+        node_factor_configured = self.classifier.node_factor_dim > 0
+        if distill_active and not (self.distill.targets_path and node_factor_configured):
+            raise ValueError(
+                "a nonzero distill weight requires both distill.targets_path and "
+                "classifier.node_factor_dim > 0"
+            )
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object]) -> E2EConfig:
         """Build a config from a YAML ``model.config`` mapping.
 
         Args:
-            mapping: Must carry only ``generator``/``encoder``/``classifier``
-                keys, each itself a mapping validated by that component's own
-                `from_mapping` (unknown keys rejected per component, the
-                train_b0 strict-config convention).
+            mapping: Must carry only ``generator``/``encoder``/``classifier``/
+                ``distill`` keys, each itself a mapping validated by that
+                component's own `from_mapping` (unknown keys rejected per
+                component, the train_b0 strict-config convention).
 
         Returns:
             The validated `E2EConfig`.
@@ -569,4 +700,5 @@ class E2EConfig:
             generator=GeneratorConfig.from_mapping(_as_section_mapping(mapping, "generator")),
             encoder=EncoderConfig.from_mapping(_as_section_mapping(mapping, "encoder")),
             classifier=ClassifierConfig.from_mapping(_as_section_mapping(mapping, "classifier")),
+            distill=DistillConfig.from_mapping(_as_section_mapping(mapping, "distill")),
         )

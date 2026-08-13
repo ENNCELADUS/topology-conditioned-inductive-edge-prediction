@@ -48,6 +48,7 @@ def _tiny_e2e_config(
     feature_standardization: str = "row_layernorm",
     encoder_w_rel: float = 0.25,
     conditioning_mode: str = "xattn_cls",
+    node_factor_dim: int = 0,
 ) -> E2EConfig:
     """The shared tiny composite sizing used across this file's tests (design §8)."""
     return E2EConfig(
@@ -66,6 +67,7 @@ def _tiny_e2e_config(
             xattn_heads=4,
             p_topo=0.15,
             conditioning_mode=conditioning_mode,
+            node_factor_dim=node_factor_dim,
         ),
     )
 
@@ -462,7 +464,7 @@ def test_null_generator_every_trainable_parameter_receives_a_gradient(
     model.train()
 
     output = model(batch)
-    cast(torch.Tensor, output["logits"]).sum().backward()
+    cast(torch.Tensor, output["logits"]).sum().backward()  # type: ignore[no-untyped-call]
 
     missing = [
         name
@@ -708,3 +710,97 @@ def test_forward_graph_reused_by_auxiliary_losses_does_not_stitch_again(
     model.generator.auxiliary_losses(cast(StitchedGraph, output["graph"]), batch)
 
     assert calls == 1
+
+
+# --------------------------------------------------------------------------- (e) node factor
+#
+# `ClassifierConfig.node_factor_dim > 0` builds a `NodeFactorBottleneck`
+# (`classifier/node_factor.py`, B1 KD plan): a content-path residual on the
+# fused logit, independent of the topo conditioning ladder. These tests pin
+# the composite-level half of the plan's Wave-1 invariants -- the module's
+# own properties (unit-norm `z`, `r` symmetry, the diag_w-vs-w_z gradient
+# split) are pinned directly in `tests/model/test_node_factor.py`.
+
+
+def test_node_factor_dim_produces_bit_identical_logits_to_no_node_factor_at_init() -> None:
+    """`diag_w`/`bias_head` zero-init: the node factor's residual is exactly 0 at init.
+
+    Mirrors `test_registry_driven_null_generator_config_matches_conditioned_model_f_logit`'s
+    seed-then-build idiom: `_tiny_model_and_batch` reseeds to the same
+    `torch.manual_seed(0)` internally, and `NodeFactorBottleneck` is built
+    strictly *after* every other classifier submodule in
+    `B0V31PairClassifier.__init__`, so its extra RNG draws cannot perturb any
+    weight this comparison depends on.
+    """
+    baseline_model, batch = _tiny_model_and_batch()
+
+    torch.manual_seed(0)
+    node_factor_model = EgoStitchModel(_tiny_e2e_config(node_factor_dim=64)).eval()
+    assert isinstance(node_factor_model.classifier, B0V31PairClassifier)
+    assert node_factor_model.classifier.node_factor is not None
+
+    with torch.no_grad():
+        baseline_logits = baseline_model(batch)["logits"]
+        node_factor_logits = node_factor_model(batch)["logits"]
+
+    torch.testing.assert_close(
+        cast(torch.Tensor, baseline_logits),
+        cast(torch.Tensor, node_factor_logits),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def test_node_factor_every_trainable_parameter_receives_a_gradient() -> None:
+    """The same DDP `find_unused_parameters=False` property as `test_null_generator_*` above.
+
+    `self.node_factor` is content-path (never frozen, see
+    `B0V31PairClassifier.freeze_unreachable_conditioning`), so every one of
+    its parameters must actually receive a gradient -- including `w_z`,
+    whose gradient through `r` is exactly `0` at init (`diag_w == 0`) but
+    must still be a real zero tensor, not an absent one. Built on
+    `generator_name="null"` -- the B1 KD student's actual architecture (plan
+    "Student" section) -- so a bare `logits.sum().backward()` is enough:
+    `egostitch_imagine`'s own auxiliary heads (degree/gate/pointer/rel) need
+    `auxiliary_losses`, not `forward`, to receive gradient, which is a
+    pre-existing property of that generator unrelated to the node factor.
+    """
+    model, batch = _tiny_model_and_batch(generator_name="null", node_factor_dim=64)
+    model.train()
+
+    output = model(batch)
+    cast(torch.Tensor, output["logits"]).sum().backward()  # type: ignore[no-untyped-call]
+
+    missing = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and parameter.grad is None
+    ]
+    assert not missing, f"parameters with no gradient (DDP would reject these): {missing}"
+
+
+def test_decompose_pair_context_with_node_factor_emits_four_way_decomposition_equal_at_init() -> (
+    None
+):
+    """A node-factor model's `decompose_pair_context` gains the descriptive 4-way keys.
+
+    `"content"` (node factor off), `"content_bias"` (``c + b_a + b_b``), and
+    `"content_factor"` (``c + r``) join `"full"`/`"f_logit"`; at init the
+    residual is exactly 0, so all three new keys equal `"full"` bit-for-bit.
+    """
+    model, batch = _tiny_model_and_batch(node_factor_dim=64)
+    context = model.build_pair_context(batch)
+
+    decomposition = model.decompose_pair_context(context)
+
+    assert set(decomposition) == {"full", "f_logit", "content", "content_bias", "content_factor"}
+    for key in ("content", "content_bias", "content_factor"):
+        torch.testing.assert_close(decomposition[key], decomposition["full"], rtol=0.0, atol=0.0)
+
+
+def test_decompose_pair_context_without_node_factor_is_unchanged() -> None:
+    """`node_factor_dim == 0` keeps the pre-B1 two-key `decompose_pair_context` contract."""
+    model, batch = _tiny_model_and_batch()
+    context = model.build_pair_context(batch)
+
+    assert set(model.decompose_pair_context(context)) == {"full", "f_logit"}
