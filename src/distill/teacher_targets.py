@@ -596,7 +596,13 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     holdout, test_nodes = _load_v_fit_holdout(args.data_root, args.strategy)
     truth_graph = truth_graph_for_kd(holdout)
-    node_ids = sorted(holdout.v_fit)
+    store = FeatureStore(args.data_root / _FEATURES_SUBDIR)
+    featureless = sorted(set(holdout.v_fit) - store.node_ids)
+    if featureless:
+        # exclude_nodes filters only the pair files, so featureless nodes
+        # survive in the graph; they cannot be scored or trained on.
+        logger.info("dropping %d V_fit nodes without stored features", len(featureless))
+    node_ids = sorted(set(holdout.v_fit) - set(featureless))
     assert_v_fit_only(node_ids, truth_graph, holdout, test_nodes)
 
     context = sample_context_sets(
@@ -627,7 +633,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     model.eval()
     _install_oracle_context(model, node_ids, truth_graph=truth_graph)
 
-    store = FeatureStore(args.data_root / _FEATURES_SUBDIR)
     f0_cache = args.f0_cache if args.f0_cache is not None else args.output / "f0_cache.pt"
     node_cache = encode_all_nodes(
         model, store, node_ids, device=device, token_budget=args.token_budget, f0_cache=f0_cache

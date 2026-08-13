@@ -39,7 +39,6 @@ from src.data.packed_features import (
 from src.data.pairs import NegativeSampler
 from src.data.prefetch import _prefetch_batches
 from src.distill.artifacts import write_kd_targets
-from src.distill.teacher_targets import truth_graph_for_kd
 from src.eval.edge_metrics import EdgeMetrics
 from src.model.egostitch import EgoStitchConfig
 from src.model.egostitch.classifier.b0_v31 import B0V31PairClassifier, GatedCrossAttention
@@ -55,13 +54,11 @@ from src.model.egostitch.config import (
 from src.model.egostitch.generator import EgoStitchImagineGenerator
 from src.model.egostitch.generator import egostitch as e2e_module
 from src.model.egostitch.generator.imagine import SlotSet
-from src.score_universe import _oracle_truth_graph_sha256
 from src.train_b0 import ModelConfig
 
 from tests.test_train_egostitch import (
     _E2E_TINY_MODEL,
     _NODES,
-    _POSITIVES,
     _e2e_model_config,
     _toy_bundle,
     _toy_cfg,
@@ -173,7 +170,6 @@ def _write_kd_artifact(
     k_rand: int,
     pooled_dim: int,
     seed: int = 0,
-    truth_graph_sha256: str = "0" * 64,
 ) -> tuple[Path, str]:
     """Write a tiny hand-built KD teacher-target artifact over `nodes` (B1 plan format).
 
@@ -181,11 +177,10 @@ def _write_kd_artifact(
     `k_near + k_rand` (near-first, then random) -- a deterministic stand-in
     for the real Wave-2 `context_sampler`/`teacher_targets` dumper, which is
     out of this wave's scope. Returns the artifact directory and its
-    `manifest.json` `npz_sha256` digest (what `DistillConfig.targets_sha256`
-    pins). `truth_graph_sha256` defaults to an inert placeholder -- callers
-    that exercise `_BatchFactory`'s truth-graph binding check must pass the
-    real digest of the graph they attach via `EgoStitchData.internal_holdout`
-    (`_toy_internal_holdout`'s digest, below).
+    `manifest.json` `npz_sha256` digest -- inert provenance metadata that
+    neither `write_kd_targets` nor `load_kd_targets` verify (user decision,
+    2026-08-13: digest/graph-binding verification was removed from the KD
+    path entirely; only the V_fit data-boundary audit still fails closed).
     """
     rng = np.random.default_rng(seed)
     ordered = list(nodes)
@@ -223,7 +218,7 @@ def _write_kd_artifact(
         teacher_pooled_ba=np.stack(pooled_ba).astype(np.float32),
         is_near=np.asarray(is_near, dtype=np.uint8),
         pair_label=np.asarray(pair_label, dtype=np.int8),
-        truth_graph_sha256=truth_graph_sha256,
+        truth_graph_sha256="0" * 64,
         checkpoint_path=output_dir / "checkpoint.pt",
         checkpoint_sha256="0" * 64,
         checkpoint_id=None,
@@ -233,44 +228,6 @@ def _write_kd_artifact(
     )
     manifest = json.loads((output_dir / "manifest.json").read_text())
     return output_dir, str(manifest["npz_sha256"])
-
-
-def _minimal_internal_holdout(nodes: Sequence[str]) -> internal_holdout.InternalHoldoutPartition:
-    """An `InternalHoldoutPartition` with `v_fit=nodes` and no topology.
-
-    `_BatchFactory`'s KD truth-graph binding check reads only `v_fit`/
-    `topology_fit` (via `build_g_fit`/`truth_graph_for_kd`); every other
-    field here is a structurally-valid placeholder, not exercised.
-    """
-    return internal_holdout.InternalHoldoutPartition(
-        v_fit=frozenset(nodes),
-        v_hold=frozenset(),
-        holdout_draws=(frozenset(), frozenset()),
-        training_interactions_fit=frozenset(),
-        topology_fit=frozenset(),
-        topology_hold=frozenset(),
-        hold_manifest=internal_holdout.PairLabelManifest(
-            nodes=(),
-            positive_edges=(),
-            pairs=(),
-            labels=(),
-            nodes_sha256="",
-            positive_edges_sha256="",
-            pair_labels_sha256="",
-        ),
-        quarantine_counts=internal_holdout.QuarantineCounts(training_interactions={}),
-        overlap_proof=internal_holdout.OverlapProof(node={}, label_edge={}),
-    )
-
-
-def _toy_internal_holdout() -> internal_holdout.InternalHoldoutPartition:
-    """`InternalHoldoutPartition` whose `build_g_fit()` matches `_toy_bundle`'s graph exactly."""
-    topology_fit = frozenset(canonical_pair(u, v) for u, v in _POSITIVES[:6] if u != v)
-    return replace(
-        _minimal_internal_holdout(_NODES),
-        training_interactions_fit=topology_fit,
-        topology_fit=topology_fit,
-    )
 
 
 class TestBatchFactoryE2E:
@@ -738,39 +695,17 @@ class TestBatchFactoryKD:
         anchors_per_step: int = 2,
         w_label: float = 1.0,
         nodes: Sequence[str] | None = None,
-        targets_sha256_override: str | None = None,
-        truth_graph_sha256_override: str | None = None,
-        attach_internal_holdout: bool = True,
-        train_nodes_override: Sequence[str] | None = None,
     ) -> te._BatchFactory:
         model_cfg = EgoStitchConfig()
         data = _toy_bundle(tmp_path, model_cfg)
-        # `train_nodes_override` shrinks the *training* universe itself (e.g.
-        # the short-group padding test's 3-node universe); the default
-        # `_toy_internal_holdout` instead matches `_toy_bundle`'s full 8-node
-        # graph exactly, which is what the digest-binding tests need.
-        holdout = (
-            _minimal_internal_holdout(train_nodes_override)
-            if train_nodes_override is not None
-            else _toy_internal_holdout()
-        )
-        if train_nodes_override is not None:
-            data = replace(data, train_nodes=list(train_nodes_override))
-        if attach_internal_holdout:
-            data = replace(data, internal_holdout=holdout)
         pack_dir = tmp_path / f"kd-pack-{rank}"
         _write_tiny_token_pack(pack_dir, _NODES)
-        artifact_dir, npz_sha256 = _write_kd_artifact(
+        artifact_dir, _npz_sha256 = _write_kd_artifact(
             tmp_path / "kd_targets",
             nodes if nodes is not None else _NODES,
             k_near=cls._K_NEAR,
             k_rand=cls._K_RAND,
             pooled_dim=cls._POOLED_DIM,
-            truth_graph_sha256=(
-                truth_graph_sha256_override
-                if truth_graph_sha256_override is not None
-                else _oracle_truth_graph_sha256(truth_graph_for_kd(holdout))
-            ),
         )
         cfg = _toy_cfg(tmp_path)
         e2e_cfg = replace(
@@ -780,9 +715,6 @@ class TestBatchFactoryKD:
         )
         distill = DistillConfig(
             targets_path=str(artifact_dir),
-            targets_sha256=(
-                targets_sha256_override if targets_sha256_override is not None else npz_sha256
-            ),
             w_label=w_label,
             anchors_per_step=anchors_per_step,
         )
@@ -810,47 +742,15 @@ class TestBatchFactoryKD:
         factory = te._BatchFactory(e2e_cfg, model_cfg, data, node_batch=4, rank=0, world_size=1)
         assert factory._kd_tensors(1, 0) is None
 
-    def test_fails_closed_on_empty_targets_sha256(self, tmp_path: Path) -> None:
-        with pytest.raises(ValueError, match="targets_sha256"):
-            self._factory(tmp_path, targets_sha256_override="")
-
-    def test_fails_closed_on_mismatched_targets_sha256(self, tmp_path: Path) -> None:
-        with pytest.raises(ValueError, match="digest"):
-            self._factory(tmp_path, targets_sha256_override="0" * 64)
-
     def test_artifact_node_outside_v_fit_is_rejected_at_construction(self, tmp_path: Path) -> None:
-        # A superset (one foreign node beyond the current V_fit universe) is
-        # caught by the same order-sensitive equality gate as a permutation
-        # or a subset (below) -- individual membership alone is not enough.
-        with pytest.raises(ValueError, match="does not match the current sorted V_fit universe"):
-            self._factory(tmp_path, nodes=[*_NODES, "foreign-node"])
+        """The V_fit data-boundary audit stays fail-closed even with digest/graph-binding gone.
 
-    @pytest.mark.parametrize(
-        "artifact_nodes",
-        [list(reversed(_NODES)), _NODES[:-1]],
-        ids=["permutation", "subset"],
-    )
-    def test_node_universe_permutation_or_subset_is_rejected(
-        self, tmp_path: Path, artifact_nodes: list[str]
-    ) -> None:
-        """Index arrays are positional: a same-membership reorder is exactly as unsafe as a drop."""
-        with pytest.raises(ValueError, match="does not match the current sorted V_fit universe"):
-            self._factory(tmp_path, nodes=artifact_nodes)
-
-    def test_truth_graph_digest_mismatch_is_rejected(self, tmp_path: Path) -> None:
-        """A digest-valid, node-set-valid artifact from a *different* training graph still fails.
-
-        Regression guard for the silent-corruption trap CLAUDE.md's
-        2026-08-03 shared-interaction correction describes: same node
-        universe, same artifact digest, wrong teacher targets because the
-        graph the dumper scored against has since changed.
+        Digest and truth-graph verification were removed from the KD load
+        path entirely (user decision, 2026-08-13); `_record_training_nodes`
+        is the one check left standing.
         """
-        with pytest.raises(ValueError, match="truth-graph digest"):
-            self._factory(tmp_path, truth_graph_sha256_override="a" * 64)
-
-    def test_missing_internal_holdout_is_rejected(self, tmp_path: Path) -> None:
-        with pytest.raises(RuntimeError, match="internal_holdout"):
-            self._factory(tmp_path, attach_internal_holdout=False)
+        with pytest.raises(RuntimeError, match="escaped V_fit"):
+            self._factory(tmp_path, nodes=[*_NODES, "foreign-node"])
 
     def test_deterministic_for_fixed_seed_epoch_step_rank(self, tmp_path: Path) -> None:
         factory = self._factory(tmp_path)
@@ -882,9 +782,7 @@ class TestBatchFactoryKD:
         # k_rand=1 asks for 3, so every anchor's group is short by 1 (the
         # known short-group case, B1 plan "Known risks" #3).
         small_nodes = _NODES[:3]
-        factory = self._factory(
-            tmp_path, anchors_per_step=1, nodes=small_nodes, train_nodes_override=small_nodes
-        )
+        factory = self._factory(tmp_path, anchors_per_step=1, nodes=small_nodes)
         kd = factory._kd_tensors(1, 0)
         assert kd is not None
         context_size = self._K_NEAR + self._K_RAND

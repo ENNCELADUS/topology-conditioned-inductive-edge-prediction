@@ -185,21 +185,13 @@ def test_write_load_roundtrip(tmp_path: Path) -> None:
     assert loaded.manifest["checkpoint_id"] == "abc123"
 
 
-def test_load_rejects_a_corrupted_npz(tmp_path: Path) -> None:
+def test_load_rejects_a_missing_npz(tmp_path: Path) -> None:
     artifact_dir = tmp_path / "artifact"
     _write_toy_artifact(artifact_dir)
-    (artifact_dir / "targets.npz").write_bytes(b"not actually an npz")
+    (artifact_dir / "targets.npz").unlink()
 
-    with pytest.raises(ValueError, match="digest"):
+    with pytest.raises(ValueError, match="missing"):
         load_kd_targets(artifact_dir)
-
-
-def test_load_rejects_a_mismatched_expected_sha256(tmp_path: Path) -> None:
-    artifact_dir = tmp_path / "artifact"
-    _write_toy_artifact(artifact_dir)
-
-    with pytest.raises(ValueError, match="does not match expected"):
-        load_kd_targets(artifact_dir, expected_sha256="0" * 64)
 
 
 def test_write_rejects_mismatched_array_lengths(tmp_path: Path) -> None:

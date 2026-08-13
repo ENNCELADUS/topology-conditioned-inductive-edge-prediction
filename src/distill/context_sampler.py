@@ -151,7 +151,9 @@ def _sample_near_positions(
 ) -> list[int]:
     """Return up to `k_near` <=2-hop partner positions, sampled without replacement."""
     hop_lengths = nx.single_source_shortest_path_length(g_fit, anchor, cutoff=_HOP_CUTOFF)
-    candidates = sorted(node for node in hop_lengths if node != anchor)
+    # Membership filter: the truth graph may hold nodes outside `node_ids`
+    # (e.g. V_fit nodes without stored features, dropped by the dumper).
+    candidates = sorted(node for node in hop_lengths if node != anchor and node in node_to_pos)
     n_selected = min(k_near, len(candidates))
     if n_selected == 0:
         return []

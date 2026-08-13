@@ -502,8 +502,6 @@ class DistillConfig:
         targets_path: Path to the dumped teacher-target artifact
             (`src/distill/teacher_targets.py`, Wave 2). Required whenever any
             weight below is nonzero.
-        targets_sha256: Digest pinning the exact artifact `targets_path`
-            must resolve to.
         w_label: ``kd_control`` weight -- BCE against the KD stream's own
             ``pair_label`` (the matched control: same stream as every other
             arm, label supervision instead of a teacher signal).
@@ -521,7 +519,6 @@ class DistillConfig:
     """
 
     targets_path: str = ""
-    targets_sha256: str = ""
     w_label: float = 0.0
     w_logit: float = 0.0
     w_rank: float = 0.0
@@ -578,7 +575,7 @@ class DistillConfig:
             cls,
             mapping,
             label="distill",
-            string_fields=frozenset({"targets_path", "targets_sha256"}),
+            string_fields=frozenset({"targets_path"}),
         )
 
 

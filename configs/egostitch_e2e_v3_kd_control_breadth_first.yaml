@@ -26,9 +26,6 @@ model:
       node_factor_dim: 64
     distill:
       targets_path: outputs/distill/kd_targets_breadth_first_seed0
-      # MUST be pinned from the dumper's manifest.json before launch -- the
-      # trainer fails closed on an empty digest.
-      targets_sha256: ""
       w_label: 1.0
       anchors_per_step: 2
 

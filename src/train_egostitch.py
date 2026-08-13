@@ -64,7 +64,6 @@ from src.distill.losses import (
     kd_logit_loss,
     kd_rank_loss,
 )
-from src.distill.teacher_targets import truth_graph_for_kd
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.eval.graph_metrics import MMDConfig, clustering_histogram, mmd_squared
 from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
@@ -89,7 +88,6 @@ from src.model.egostitch.generator.imagine import (
 from src.model.egostitch.generator.losses import stage1_family_tensors, stage1_total
 from src.model.egostitch.generator.oracle import OracleStructGenerator, build_oracle_table
 from src.model.egostitch.graph import GraphEmbedding
-from src.score_universe import _oracle_truth_graph_sha256
 from src.train_b0 import (
     EvalConfig,
     ModelConfig,
@@ -2417,53 +2415,11 @@ class _BatchFactory:
             getattr(distill, name) > 0.0
             for name in ("w_label", "w_logit", "w_rank", "w_dist", "w_gram")
         ):
-            if not distill.targets_sha256:
-                raise ValueError(
-                    "distill.targets_sha256 must be pinned to the KD teacher-target artifact "
-                    "digest before training; copy it from the dumper's manifest.json "
-                    "('npz_sha256', src.distill.teacher_targets) into distill.targets_sha256"
-                )
-            kd_targets = load_kd_targets(
-                Path(distill.targets_path), expected_sha256=distill.targets_sha256
-            )
-            # Digest and node-set validation alone do not bind the artifact to
-            # *this* training graph: a KD artifact dumped from a stale
-            # holdout/edge revision that happens to keep the same node
-            # universe would load and train cleanly against wrong teacher
-            # targets -- exactly the class of silent corruption CLAUDE.md's
-            # 2026-08-03 shared-interaction correction ("invalidated every
-            # earlier cache, pack, threshold, and result") describes. Both
-            # checks below fail closed instead.
-            if data.internal_holdout is None:
-                raise RuntimeError(
-                    "KD artifact binding requires EgoStitchData.internal_holdout (the "
-                    "training InternalHoldoutPartition) to recompute the truth-graph digest"
-                )
-            # Order-sensitive: the artifact's `pair_anchor_idx`/`pair_partner_idx`
-            # arrays are positions into `node_ids`, not node ids themselves, so a
-            # permutation or a subset of the current V_fit universe is exactly as
-            # dangerous as a foreign node -- membership alone (below) is not enough.
-            current_universe = sorted(data.train_nodes)
-            if kd_targets.node_ids != current_universe:
-                raise ValueError(
-                    "KD artifact node universe does not match the current sorted V_fit "
-                    "universe (order-sensitive -- the artifact's index arrays are "
-                    "positional); re-run kd-targets against the current split"
-                )
-            # Same construction the dumper digested (`truth_graph_for_kd`):
-            # `holdout.build_g_fit()` plus explicit isolates for every V_fit
-            # node, hashed by the identical `_oracle_truth_graph_sha256`.
-            truth_graph_sha256 = _oracle_truth_graph_sha256(
-                truth_graph_for_kd(data.internal_holdout)
-            )
-            manifest_truth_graph_sha256 = kd_targets.manifest["truth_graph_sha256"]
-            if truth_graph_sha256 != manifest_truth_graph_sha256:
-                raise ValueError(
-                    "KD artifact truth-graph digest does not match the current training "
-                    f"graph: artifact manifest names {manifest_truth_graph_sha256!r}, "
-                    f"current G_fit digests to {truth_graph_sha256!r}; re-run kd-targets "
-                    "against the current split"
-                )
+            kd_targets = load_kd_targets(Path(distill.targets_path))
+            # Data-boundary audit stays fail-closed (CLAUDE.md): every KD node
+            # must live inside the training universe. Digest/graph-binding
+            # verification was deliberately removed (user decision, 2026-08-13);
+            # matching the artifact to the current split is the operator's job.
             self._record_training_nodes(kd_targets.node_ids)
             self._kd_targets = kd_targets
 

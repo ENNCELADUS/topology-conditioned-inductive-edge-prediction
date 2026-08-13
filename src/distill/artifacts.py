@@ -176,18 +176,14 @@ def write_kd_targets(
     )
 
 
-def load_kd_targets(path: Path, *, expected_sha256: str | None = None) -> KDTargets:
-    """Load and digest-validate one KD teacher-target artifact directory.
+def load_kd_targets(path: Path) -> KDTargets:
+    """Load one KD teacher-target artifact directory.
 
-    Args:
-        path: The artifact directory `write_kd_targets` wrote.
-        expected_sha256: When given, the artifact's `targets.npz` digest must
-            equal this value (a caller pinning a specific artifact version,
-            e.g. `DistillConfig.targets_sha256`).
+    Digest/format verification was deliberately removed (user decision,
+    2026-08-13): the manifest is provenance metadata, not a gate.
 
     Raises:
-        ValueError: If the manifest format/truth-source tag is wrong, any
-            digest fails to validate, or the npz array set is wrong.
+        ValueError: If a file is missing or the npz array set is wrong.
     """
     manifest_path = path / _MANIFEST_NAME
     node_ids_path = path / _NODE_IDS_NAME
@@ -195,32 +191,11 @@ def load_kd_targets(path: Path, *, expected_sha256: str | None = None) -> KDTarg
     if not manifest_path.is_file():
         raise ValueError(f"KD target artifact {path} is missing {_MANIFEST_NAME}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("format") != KD_TARGETS_FORMAT:
-        raise ValueError(
-            f"KD target artifact {path} has format {manifest.get('format')!r}; "
-            f"expected {KD_TARGETS_FORMAT!r}"
-        )
-    if manifest.get("truth_source") != TRUTH_SOURCE:
-        raise ValueError(
-            f"KD target artifact {path} truth_source must be {TRUTH_SOURCE!r}, "
-            f"got {manifest.get('truth_source')!r}"
-        )
     if not npz_path.is_file():
         raise ValueError(f"KD target artifact {path} is missing {_NPZ_NAME}")
-    actual_npz_sha256 = _sha256_file(npz_path)
-    if actual_npz_sha256 != manifest.get("npz_sha256"):
-        raise ValueError(f"KD target artifact {path}: npz digest does not match manifest")
-    if expected_sha256 is not None and actual_npz_sha256 != expected_sha256:
-        raise ValueError(
-            f"KD target artifact {path}: npz digest {actual_npz_sha256} does not match "
-            f"expected {expected_sha256}"
-        )
     if not node_ids_path.is_file():
         raise ValueError(f"KD target artifact {path} is missing {_NODE_IDS_NAME}")
-    node_ids_bytes = node_ids_path.read_bytes()
-    if _sha256_bytes(node_ids_bytes) != manifest.get("node_ids_sha256"):
-        raise ValueError(f"KD target artifact {path}: node_ids digest does not match manifest")
-    node_ids = json.loads(node_ids_bytes.decode("utf-8"))
+    node_ids = json.loads(node_ids_path.read_text(encoding="utf-8"))
 
     with np.load(npz_path) as archive:
         required = set(_ARRAY_DTYPES)
