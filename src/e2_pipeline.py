@@ -751,8 +751,8 @@ _PUBLISHED_FILENAMES = (
     "profile.json",
     "artifact_manifest.json",
 )
-V_HOLD_VALIDATION_EVENTS_FILENAME = "v_hold_validation_events.jsonl"
-_OPTIONAL_PUBLISHED_FILENAMES = (V_HOLD_VALIDATION_EVENTS_FILENAME,)
+VAL_REGION_VALIDATION_EVENTS_FILENAME = "val_region_validation_events.jsonl"
+_OPTIONAL_PUBLISHED_FILENAMES = (VAL_REGION_VALIDATION_EVENTS_FILENAME,)
 # One terminal sentinel per run kind, so a diagnostic run can never leave a
 # `complete.json` a reader would take for a formal result (`debug_complete.json`
 # is written by the debug branch, which never publishes through staging).
@@ -769,7 +769,7 @@ def _validate_staged_artifacts(
     epochs: int,
     model_family: str,
     allow_partial: bool = False,
-    require_v_hold_validation_events: bool = False,
+    require_val_region_validation_events: bool = False,
     expected_run_kind: str | None = None,
 ) -> None:
     """Load and validate every formal worker artifact before hashing it."""
@@ -816,34 +816,34 @@ def _validate_staged_artifacts(
             raise ValueError("run_metadata.json checkpoint_role does not match run_kind")
         if metadata.get("formal_artifacts_published") is not (expected_run_kind == "formal"):
             raise ValueError("run_metadata.json formal_artifacts_published does not match run_kind")
-    if require_v_hold_validation_events:
-        evidence = metadata.get("v_hold_validation_evidence")
+    if require_val_region_validation_events:
+        evidence = metadata.get("val_region_validation_evidence")
         if not isinstance(evidence, dict):
-            raise ValueError("run_metadata.json is missing V_hold validation evidence")
-        if evidence.get("schema") != "egostitch_e2e_v_hold_validation_events_v1":
-            raise ValueError("V_hold validation-event evidence has an invalid schema")
-        if evidence.get("path") != V_HOLD_VALIDATION_EVENTS_FILENAME:
-            raise ValueError("V_hold validation-event evidence has an invalid path")
+            raise ValueError("run_metadata.json is missing V_val validation evidence")
+        if evidence.get("schema") != "egostitch_e2e_val_region_validation_events_v1":
+            raise ValueError("V_val validation-event evidence has an invalid schema")
+        if evidence.get("path") != VAL_REGION_VALIDATION_EVENTS_FILENAME:
+            raise ValueError("V_val validation-event evidence has an invalid path")
         count = evidence.get("count")
         if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
-            raise ValueError("V_hold validation-event evidence has an invalid count")
-        ledger_path = staging_dir / V_HOLD_VALIDATION_EVENTS_FILENAME
+            raise ValueError("V_val validation-event evidence has an invalid count")
+        ledger_path = staging_dir / VAL_REGION_VALIDATION_EVENTS_FILENAME
         if not ledger_path.is_file() or ledger_path.stat().st_size <= 0:
-            raise ValueError(f"{V_HOLD_VALIDATION_EVENTS_FILENAME} is missing or empty")
+            raise ValueError(f"{VAL_REGION_VALIDATION_EVENTS_FILENAME} is missing or empty")
         ledger_rows: list[object] = []
         with ledger_path.open(encoding="utf-8") as handle:
             for line in handle:
                 if not line.strip():
-                    raise ValueError("V_hold validation-event ledger contains a blank row")
+                    raise ValueError("V_val validation-event ledger contains a blank row")
                 row = json.loads(line)
                 if not isinstance(row, dict):
-                    raise ValueError("V_hold validation-event ledger row must be an object")
+                    raise ValueError("V_val validation-event ledger row must be an object")
                 ledger_rows.append(row)
         if len(ledger_rows) != count:
-            raise ValueError("V_hold validation-event ledger count does not match metadata")
+            raise ValueError("V_val validation-event ledger count does not match metadata")
         digest = hashlib.sha256(ledger_path.read_bytes()).hexdigest()
         if evidence.get("sha256") != digest:
-            raise ValueError("V_hold validation-event ledger digest does not match metadata")
+            raise ValueError("V_val validation-event ledger digest does not match metadata")
 
 
 def _publish_staged(
@@ -978,7 +978,7 @@ def _run_pipeline_unlocked(
     ``cfg.optim.epochs``; (6) merge stage/profile data into ``profile.json`` and write
     ``artifact_manifest.json`` with SHA-256 and byte size for ``best.pt``,
     ``last.pt``, ``metrics.jsonl``, ``run_metadata.json``, ``profile.json``, plus
-    the E2E ``v_hold_validation_events.jsonl`` when applicable; (7) publish the
+    the E2E ``val_region_validation_events.jsonl`` when applicable; (7) publish the
     validated attempt artifact tree into the canonical output directory with per-file
     atomic replaces and full rollback; and (8), only once publication has
     committed, run the published ``best.pt`` through the held-out test
@@ -1374,7 +1374,7 @@ def _run_pipeline_unlocked(
             epochs=completed_epochs if debug_run else cfg.optim.epochs,
             model_family=cfg.model.family,
             allow_partial=debug_run,
-            require_v_hold_validation_events=(
+            require_val_region_validation_events=(
                 not debug_run and args.worker_module == "src.train_egostitch"
             ),
             expected_run_kind=(

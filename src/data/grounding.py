@@ -19,7 +19,7 @@ the wrong role universe) could be read back through a stale cache path with
 no error.
 
 This change invalidates every existing grounding cache on disk: all three
-spec Sec 13.12 role universes (``V_fit``, ``V_hold``, ``test``)
+spec Sec 13.12 role universes (``train``, ``V_val``, ``test``)
 for every strategy this family is run under (currently ``breadth_first`` is
 the only strategy wired into an `egostitch_e2e` config). Regenerating those
 caches is an execution step, out of scope for this change -- the first warm
@@ -106,7 +106,7 @@ def build_grounding_pool(
         node_ids: The side's node ids (defines both queries and candidates).
         n_ground: Pool size ``n_g``; must satisfy ``n_ground <= N - 1``.
         role_universe: The caller's role-universe identity (spec Sec 13.12:
-            ``V_fit``/``V_hold``/``test``). Folded into the
+            ``train``/``V_val``/``test``). Folded into the
             cache's `pool_method_hash` so two roles can never share a cache
             path undetected.
         cache_path: Optional ``.npz`` cache location.

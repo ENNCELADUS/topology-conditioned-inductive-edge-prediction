@@ -78,8 +78,8 @@ EgoStitch-arm flow: benchmark artifacts → partition + optional grounding → p
 training → score-once artifacts → evaluation. Endpoint-only families need no grounding.
 
 - `src/data/` — `artifacts.py` verified benchmark loader; `partition.py:build_g_struct` is the only
-  legal structural graph; `grounding.py` is arm-specific; `internal_holdout.py`
-  V_hold; `packed_features.py`/`features.py` bf16 pack and F0 cache; `pairs.py` batching.
+  legal structural graph; `grounding.py` is arm-specific; `val_region.py` derives the V_val
+  region split; `packed_features.py`/`features.py` bf16 pack and F0 cache; `pairs.py` batching.
 - `src/model/egostitch/` — three independently swappable components behind `registry.py`, composed by
   `composite.py`, talking through `graph.py`'s dataclasses (`ImaginedGraph`, `GraphEmbedding`,
   `PairInputs`). `generator/` imagines a graph (`egostitch_imagine`, `null`, `oracle_struct`),
@@ -89,11 +89,10 @@ training → score-once artifacts → evaluation. Endpoint-only families need no
   generator-private, and a generator swap invalidates it wholesale.
 - `src/train_{egostitch,b0,cazi_mbn}.py` DDP workers — B1 KD arms ride `train_b0` + `src/distill/`;
   `src/e2_pipeline.py` runs pack → train → publish → test; `src/score_universe.py` score-once artifacts;
-  `src/score_fanout.py` fans a score pass across visible GPUs and merges the shards (owns
-  `hpc/run.sh score`); `src/eval/test_protocol.py` runs one published checkpoint's held-out
-  V_hold → test → candidate sequence into `test_report.json`; `src/experiments/` holds the gate
-  analyses (`g1_hardened_e2`, `g2_ceiling`, `g3_oracle`, `g5_stage1`, `probes`,
-  `observe_e2e_formal`) and `src/eval/` the edge/graph metrics, assembly, and calibration.
+  `src/score_fanout.py` fans a score pass across visible GPUs and merges the shards (owns `hpc/run.sh
+  score`); `src/eval/test_protocol.py` runs one published checkpoint's test → candidate sequence into
+  `test_report.json`; `src/experiments/` holds the gate analyses (`g1_hardened_e2`, `g2_ceiling`,
+  `g3_oracle`, `observe_e2e_formal`) and `src/eval/` the edge/graph metrics, assembly, and calibration.
 
 Experiments run directly; there is no plan, registration, or qualification gate. Model-quality signals
 (liveness, slot collapse, margins, dispersion) are telemetry in `profile.json`/`metrics.jsonl` and
@@ -112,33 +111,34 @@ fail-closed.
 
 - `*_ratio5_exclusive.txt` is quarantined: its negatives leak across the node split, and no loader in
   `src/` reads them.
-- `train_graph.pkl` is train⁺ ∪ val⁺ — split audits only. Structure comes from `build_g_struct`;
-  `val_edges.txt` is model selection, never a training target.
+- `train_graph.pkl` (train⁺∪val⁺) is the V_val split substrate (`val_region.py` grows the region
+  on its loopless giant component); `train_edges.txt`/`val_edges.txt` retire as raw derivation input.
 - `exclude_nodes` filters only `train/val/test_pairs`, so featureless nodes survive in `graph`,
   `train_graph`, `test_graph`, and `buckets`.
 - Self-loops: training structural targets strip them; canonical MMD descriptors and official GS/RD
   subgraphs keep them, as the benchmark evaluator does.
-- Grounding, when used, is universe-scoped (`V_fit`, `V_hold`, test): no cache crosses
-  universes, and training may not read `V_hold`. Other methods need no grounding.
+- Grounding, when used, is universe-scoped (`train`, `V_val`, test): no cache crosses universes;
+  training may not read V_val-internal pairs (cross-boundary edges do train). Other methods need none.
 - Topology and classification share the same train positives (no message/supervision split): loopless
   projection for topology, self-pairs kept for classification, and edge-stream structural targets must
   drop the queried partner and decrement its degree.
-- `V_hold` is the union of two deterministic 256-node BFS draws (`internal_holdout.py`); the 2026-08-03
-  shared-interaction correction changed that graph and invalidated every earlier cache, pack,
-  threshold, and result.
+- `V_val` (`val_region.py`): K=5 dispersed-seed hashed-frontier BFS on `train_graph.pkl`'s loopless
+  giant component, stopped at 20% induced loopless edges — pair-disjoint only (V_val-internal pairs
+  quarantined; cross edges train), never call it fully inductive. Invalidated every earlier
+  V_hold-keyed cache, pack, threshold, and result.
 
 ## Traps that corrupt results silently instead of raising
 
 - `load_scores` does no precision validation, so a bf16-contaminated EgoStitch artifact loads and
   analyses cleanly. Call `validate_artifact_precision(artifact, label=…)`; `validate_score_precision`
   called directly on an `egostitch_e2e` artifact spuriously raises "missing arrays".
-- Checkpoint selection (`src/eval/checkpoint_selection.py`) mean-ranks AUPRC plus all five topology
-  metrics and can still return a weak checkpoint. There is no eligibility predicate and none should
-  be added — judge usability from the per-epoch rows in `metrics.jsonl`.
+- Checkpoint selection (`src/eval/checkpoint_selection.py`) mean-ranks AUPRC plus all five V_val
+  bucket-topology metrics (BFS-macro GS/RD, three MMD ratios) and can still return a weak checkpoint.
+  There is no eligibility predicate and none should be added — judge usability from `metrics.jsonl`.
 - The fp32 islands in `generator/assemble.py` must promote their inputs *before* cost and marginal
   products are formed; casting afterwards keeps the bf16 ulp grid and silently quantizes logits.
-- `allow_cache_subset=True` (live in `probes.py`, `score_universe.py`) gathers a superset F0 cache
-  into a different node set with no content check. Exact-order mismatches raise; this path stays quiet.
+- `allow_cache_subset=True` (live in `score_universe.py`) gathers a superset F0 cache into a
+  different node set with no content check. Exact-order mismatches raise; this path stays quiet.
 - Packed-feature manifests depend on `index.json` insertion order; sorting or reserializing it
   invalidates the pack. Its F0 cache holds fp32 means taken before bf16 conversion, so it is not
   reproducible from the shards.

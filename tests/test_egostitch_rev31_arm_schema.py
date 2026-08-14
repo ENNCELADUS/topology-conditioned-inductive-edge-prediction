@@ -91,7 +91,7 @@ def test_v3_live_arms_share_one_ng50_pack_and_grounding_cache() -> None:
         )
 
     assert {config[1] for config in configs} == {50}
-    assert {config[2] for config in configs} == {"outputs/feature_packs/egostitch_e2e_v_hold_ng50"}
+    assert {config[2] for config in configs} == {"outputs/feature_packs/egostitch_e2e_v_val_ng50"}
     assert len({config[3] for config in configs}) == 1
     assert len({config[4] for config in configs}) == 1
     assert len({config[5] for config in configs}) == 1

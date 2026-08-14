@@ -327,27 +327,30 @@ class TestModelConfigHash:
 
     def test_oracle_truth_source_changes_the_digest(self, tmp_path: Path) -> None:
         cfg = _e2e_training_cfg(tmp_path)
-        fit_only = replace(
+        training_only = replace(
             cfg,
             model=replace(
                 cfg.model,
                 config=_e2e_model_config(
                     cfg.model.config,
-                    generator={"name": "oracle_struct", "oracle_truth_source": "g_fit"},
+                    generator={
+                        "name": "oracle_struct",
+                        "oracle_truth_source": "training_structure",
+                    },
                 ),
             ),
         )
-        with_hold_truth = replace(
-            fit_only,
+        with_val_truth = replace(
+            training_only,
             model=replace(
-                fit_only.model,
+                training_only.model,
                 config=_e2e_model_config(
-                    fit_only.model.config,
-                    generator={"oracle_truth_source": "g_fit_plus_v_hold"},
+                    training_only.model.config,
+                    generator={"oracle_truth_source": "training_structure_plus_g_val"},
                 ),
             ),
         )
-        assert te.model_config_hash(with_hold_truth) != te.model_config_hash(fit_only)
+        assert te.model_config_hash(with_val_truth) != te.model_config_hash(training_only)
 
     def test_every_diagnostic_field_changes_the_digest(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -437,11 +440,11 @@ class TestOracleTruthGraph:
         data.validation_positive_edges = (("n6", "n7"),)
         return data
 
-    def test_true_oracle_adds_nonempty_v_hold_and_records_provenance(self, tmp_path: Path) -> None:
+    def test_true_oracle_adds_nonempty_v_val_and_records_provenance(self, tmp_path: Path) -> None:
         data = self._data(tmp_path)
         graph = te._oracle_truth_graph(
             data,
-            truth_source="g_fit_plus_v_hold",
+            truth_source="training_structure_plus_g_val",
             run_kind="diagnostic",
         )
         assert graph.has_edge("n6", "n7")
@@ -449,24 +452,26 @@ class TestOracleTruthGraph:
         assert data.access_audit is not None
         audit = data.access_audit["oracle_truth"]
         assert audit["diagnostic_only"] is True
-        assert audit["v_hold_node_count"] == 2
-        assert audit["v_hold_positive_edge_count"] == 1
-        assert len(audit["v_hold_positive_edges_sha256"]) == 64
+        assert audit["val_region_node_count"] == 2
+        assert audit["val_region_positive_edge_count"] == 1
+        assert len(audit["val_region_positive_edges_sha256"]) == 64
 
-    def test_g_fit_source_is_the_untouched_training_graph(self, tmp_path: Path) -> None:
+    def test_training_structure_source_is_the_untouched_training_graph(
+        self, tmp_path: Path
+    ) -> None:
         data = self._data(tmp_path)
-        graph = te._oracle_truth_graph(data, truth_source="g_fit", run_kind="formal")
+        graph = te._oracle_truth_graph(data, truth_source="training_structure", run_kind="formal")
         assert graph is data.target_builder.graph
         assert data.access_audit is None or "oracle_truth" not in data.access_audit
 
-    def test_installed_true_oracle_table_has_a_nonempty_v_hold_row(self, tmp_path: Path) -> None:
+    def test_installed_true_oracle_table_has_a_nonempty_v_val_row(self, tmp_path: Path) -> None:
         data = self._data(tmp_path)
         model = EgoStitchModel(
             E2EConfig.from_mapping(
                 {
                     "generator": {
                         "name": "oracle_struct",
-                        "oracle_truth_source": "g_fit_plus_v_hold",
+                        "oracle_truth_source": "training_structure_plus_g_val",
                     }
                 }
             )
@@ -499,18 +504,8 @@ class TestOracleTruthGraph:
         with pytest.raises(RuntimeError, match="requires --run-kind diagnostic"):
             te._oracle_truth_graph(
                 self._data(tmp_path),
-                truth_source="g_fit_plus_v_hold",
+                truth_source="training_structure_plus_g_val",
                 run_kind="formal",
-            )
-
-    def test_true_oracle_refuses_fit_hold_node_overlap(self, tmp_path: Path) -> None:
-        data = self._data(tmp_path)
-        data.target_builder.graph.add_node("n6")
-        with pytest.raises(RuntimeError, match="node-disjoint"):
-            te._oracle_truth_graph(
-                data,
-                truth_source="g_fit_plus_v_hold",
-                run_kind="diagnostic",
             )
 
 

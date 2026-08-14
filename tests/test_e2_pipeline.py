@@ -21,7 +21,7 @@ import torch
 from src.data.packed_features import build_packed_features
 from src.e2_pipeline import (
     _PUBLISHED_FILENAMES,
-    V_HOLD_VALIDATION_EVENTS_FILENAME,
+    VAL_REGION_VALIDATION_EVENTS_FILENAME,
     PipelineArgs,
     ProbeResult,
     _assert_no_cross_kind_completion,
@@ -851,7 +851,7 @@ def _make_fake_runner(
     train_runtime_profile: dict[str, object] | None = None,
     fail_mode: str | None = None,
     timeout_mode: str | None = None,
-    write_v_hold_validation_ledger: bool = False,
+    write_val_region_validation_ledger: bool = False,
 ) -> Callable[[Sequence[str], float | None, Path], subprocess.CompletedProcess[str]]:
     """Stand in for the single ``train`` process group the orchestrator launches."""
     resolved_train_profile: dict[str, object] = train_runtime_profile or _valid_worker_profile()
@@ -873,8 +873,8 @@ def _make_fake_runner(
 
         if mode == "train":
             _write_train_outputs(out_dir)
-            if write_v_hold_validation_ledger:
-                ledger_path = out_dir / V_HOLD_VALIDATION_EVENTS_FILENAME
+            if write_val_region_validation_ledger:
+                ledger_path = out_dir / VAL_REGION_VALIDATION_EVENTS_FILENAME
                 ledger_path.write_text(
                     json.dumps(
                         {
@@ -884,7 +884,7 @@ def _make_fake_runner(
                             "optimizer_step": 1,
                             "run_kind": "formal",
                             "arm": "full",
-                            "validation_role": "V_hold",
+                            "validation_role": "V_val",
                         },
                         sort_keys=True,
                     )
@@ -892,10 +892,10 @@ def _make_fake_runner(
                 )
                 metadata_path = out_dir / "run_metadata.json"
                 metadata = json.loads(metadata_path.read_text())
-                metadata["v_hold_validation_evidence"] = {
-                    "schema": "egostitch_e2e_v_hold_validation_events_v1",
+                metadata["val_region_validation_evidence"] = {
+                    "schema": "egostitch_e2e_val_region_validation_events_v1",
                     "count": 1,
-                    "path": V_HOLD_VALIDATION_EVENTS_FILENAME,
+                    "path": VAL_REGION_VALIDATION_EVENTS_FILENAME,
                     "sha256": hashlib.sha256(ledger_path.read_bytes()).hexdigest(),
                 }
                 metadata_path.write_text(json.dumps(metadata))

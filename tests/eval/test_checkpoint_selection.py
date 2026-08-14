@@ -9,15 +9,11 @@ so no single degenerate criterion can select an untrained checkpoint.
 
 from __future__ import annotations
 
-import math
-
-import numpy as np
 import pytest
 from src.eval.checkpoint_selection import (
     CheckpointCandidate,
     TopologyValidationMetrics,
     select_checkpoint,
-    validation_topology_metrics,
 )
 
 
@@ -97,94 +93,3 @@ class TestSelectCheckpoint:
         )
         selected = select_checkpoint([near_one, sparse])
         assert selected is not None and selected.epoch == 1
-
-
-class TestValidationTopologyMetrics:
-    NODES = ("a", "b", "c", "d")
-    PAIRS = (
-        ("a", "b"),
-        ("a", "c"),
-        ("a", "d"),
-        ("b", "c"),
-        ("b", "d"),
-        ("c", "d"),
-    )
-    POSITIVES = (("a", "b"), ("c", "d"))
-
-    def test_perfect_scores(self) -> None:
-        logits = np.array([4.0, -2.0, -3.0, -4.0, -5.0, 3.0])
-        topo = validation_topology_metrics(
-            pairs=self.PAIRS,
-            logits=logits,
-            positive_edges=self.POSITIVES,
-            nodes=self.NODES,
-        )
-        assert topo.gs == 1.0
-        assert topo.rd == 1.0
-        assert topo.degree_mmd == pytest.approx(0.0, abs=1e-12)
-        assert topo.clustering_mmd == pytest.approx(0.0, abs=1e-12)
-        assert topo.spectral_mmd == pytest.approx(0.0, abs=1e-12)
-
-    def test_inverted_scores(self) -> None:
-        logits = np.array([-4.0, 2.0, -3.0, -4.0, 3.0, -3.0])
-        topo = validation_topology_metrics(
-            pairs=self.PAIRS,
-            logits=logits,
-            positive_edges=self.POSITIVES,
-            nodes=self.NODES,
-        )
-        assert topo.gs == 0.0
-        assert topo.degree_mmd >= 0.0
-
-    def test_rd_counts_positive_logits_against_gold_count(self) -> None:
-        logits = np.array([1.0, 2.0, 3.0, 4.0, -1.0, -2.0])
-        topo = validation_topology_metrics(
-            pairs=self.PAIRS,
-            logits=logits,
-            positive_edges=self.POSITIVES,
-            nodes=self.NODES,
-        )
-        assert topo.rd == pytest.approx(2.0)
-
-    def test_rd_counts_zero_logit_as_positive(self) -> None:
-        """Logit 0 is probability 0.5, a positive under the house `>= 0.5` rule."""
-        logits = np.array([0.0, -1.0, -1.0, -1.0, -1.0, -1.0])
-        topo = validation_topology_metrics(
-            pairs=self.PAIRS,
-            logits=logits,
-            positive_edges=self.POSITIVES,
-            nodes=self.NODES,
-        )
-        assert topo.rd == pytest.approx(0.5)
-
-    def test_no_positive_edges_raises(self) -> None:
-        with pytest.raises(ValueError, match="positive"):
-            validation_topology_metrics(
-                pairs=self.PAIRS,
-                logits=np.zeros(6),
-                positive_edges=(),
-                nodes=self.NODES,
-            )
-
-    def test_non_finite_logit_raises(self) -> None:
-        logits = np.array([1.0, 2.0, math.inf, 4.0, -1.0, -2.0])
-        with pytest.raises(ValueError, match="non-finite"):
-            validation_topology_metrics(
-                pairs=self.PAIRS,
-                logits=logits,
-                positive_edges=self.POSITIVES,
-                nodes=self.NODES,
-            )
-
-    def test_equal_logits_break_ties_by_pair_id(self) -> None:
-        """The assembly tie-break is (-logit, pair), matching the E2E convention."""
-        logits = np.zeros(6)
-        topo = validation_topology_metrics(
-            pairs=self.PAIRS,
-            logits=logits,
-            positive_edges=self.POSITIVES,
-            nodes=self.NODES,
-        )
-        # Ties resolve lexicographically: ("a","b") then ("a","c") are kept,
-        # so exactly one gold edge ("a","b") lands in the assembly.
-        assert topo.gs == pytest.approx(0.5)

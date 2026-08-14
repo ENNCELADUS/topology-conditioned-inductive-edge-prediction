@@ -1,12 +1,12 @@
-# EgoStitch true-oracle V_hold-truth DIAGNOSTIC arm. Launch only with
-# `--run-kind diagnostic`; these artifacts are never formal. The earlier R1
-# run used G_fit only, so every V_hold node received an empty scaffold and was
-# not a valid oracle ceiling. Query-partner leave-one-out masking still applies.
-# Conditioning-ladder mode
-# "film_logit" (docs/superpowers/specs/2026-08-04-oracle-scaffold-experiment-
-# design.md): `generator.name: "oracle_struct"` selects the zero-parameter
-# table generator populated from G_fit plus internal V_hold positive edges.
-# This deliberately leaks held-out structure as a diagnostic ceiling.
+# EgoStitch true-oracle V_val-truth DIAGNOSTIC arm. Launch only with
+# `--run-kind diagnostic`; these artifacts are never formal.
+# `training_structure` already carries every V_val node via its legal
+# cross-boundary edges; this arm's `oracle_truth_source` overlay leaks the
+# V_val-internal positives training_structure excludes by construction, as a
+# diagnostic ceiling only. Query-partner leave-one-out masking still
+# applies. Conditioning-ladder mode "film_logit" (docs/superpowers/specs/
+# 2026-08-04-oracle-scaffold-experiment-design.md): `generator.name:
+# "oracle_struct"` selects the zero-parameter table generator.
 # `encoder.name: "grit_gmt"` is the vendored GRIT +
 # Set-Transformer-PMA encoder (dense RRWP K=8, 4 GritTransformerLayers at
 # dim 96, PMA pooling with 4 seeds; tokens = 34 node + 4 seed tokens, pooled
@@ -20,7 +20,7 @@
 # arms' standard value (`full`/`f_only`/`no_l_rel`/`p0`/`row_layernorm`, and
 # the null-generator arm), not the `EgoStitchConfig` internal default of 20
 # nor the `cosine_pool` arm's 20 -- chosen so this arm shares the existing
-# `outputs/feature_packs/egostitch_e2e_v_hold_ng50` pack rather than forcing
+# `outputs/feature_packs/egostitch_e2e_v_val_ng50` pack rather than forcing
 # a new n_ground-keyed pack build. `oracle_struct` has no other slot-count
 # knob exposed through `GeneratorConfig`.
 #
@@ -44,7 +44,7 @@ model:
     generator:
       name: oracle_struct
       oracle_seed: 0
-      oracle_truth_source: g_fit_plus_v_hold
+      oracle_truth_source: training_structure_plus_g_val
       n_ground: 50
       feature_standardization: row_layernorm
     encoder:
@@ -122,7 +122,7 @@ mixed_precision: "bf16"
 
 runtime:
   world_size: auto
-  pack_dir: outputs/feature_packs/egostitch_e2e_v_hold_ng50
+  pack_dir: outputs/feature_packs/egostitch_e2e_v_val_ng50
   pack_workers: 8
   loader_workers_per_rank: 0
   prefetch_factor: 2

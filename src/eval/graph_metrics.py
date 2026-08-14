@@ -256,6 +256,148 @@ def evaluate_assembled_graph(
     )
 
 
+@dataclass(frozen=True)
+class BucketReference:
+    """Precomputed reference-side state for `evaluate_assembled_graph_with_reference`.
+
+    Holds only what is independent of the predicted graph: the bucket node
+    sets, the induced reference subgraphs, and their descriptor histograms
+    (the 500-ball spectral `eigvalsh` is the expensive part). The MMD kernel
+    math itself is config-dependent and is recomputed fresh on every
+    `evaluate_assembled_graph_with_reference` call from these stored
+    descriptors, so a `BucketReference` is reusable across any `MMDConfig`.
+    """
+
+    node_sets: dict[int, list[set[str]]]
+    ref_subgraphs: dict[int, list[nx.Graph]]
+    ref_descriptors: dict[int, list[dict[str, np.ndarray]]]
+    self_loops_ref: int
+
+
+def precompute_bucket_reference(
+    g_ref: nx.Graph,
+    buckets: dict[int, list[set[str]]],
+    config: MMDConfig,
+) -> BucketReference:
+    """Precompute `evaluate_assembled_graph_with_reference`'s reference-side state.
+
+    Args:
+        g_ref: The reference graph (self-loops kept).
+        buckets: Bucket size -> list of node sets.
+        config: Accepted for a uniform builder signature; the descriptors
+            precomputed here do not depend on it (see `BucketReference`).
+
+    Returns:
+        The `BucketReference`.
+
+    Raises:
+        ValueError: If any bucket has fewer than two reference samples.
+    """
+    del config
+    node_sets: dict[int, list[set[str]]] = {}
+    ref_subgraphs: dict[int, list[nx.Graph]] = {}
+    ref_descriptors: dict[int, list[dict[str, np.ndarray]]] = {}
+    for size, sets in buckets.items():
+        if len(sets) < 2:
+            raise ValueError(f"bucket {size} requires at least two reference samples")
+        node_sets[size] = list(sets)
+        subgraphs = [_induced_subgraph(g_ref, nodes) for nodes in sets]
+        ref_subgraphs[size] = subgraphs
+        ref_descriptors[size] = [_descriptors(subgraph) for subgraph in subgraphs]
+    return BucketReference(
+        node_sets=node_sets,
+        ref_subgraphs=ref_subgraphs,
+        ref_descriptors=ref_descriptors,
+        self_loops_ref=nx.number_of_selfloops(g_ref),
+    )
+
+
+def evaluate_assembled_graph_with_reference(
+    g_pred: nx.Graph,
+    reference: BucketReference,
+    config: MMDConfig,
+) -> BucketedMMDReport:
+    """Evaluate a predicted graph against a precomputed `BucketReference`.
+
+    Produces results identical to `evaluate_assembled_graph(g_pred, g_ref,
+    buckets, config)` when `reference` was built from that same `(g_ref,
+    buckets)` via `precompute_bucket_reference` — only the predicted-side work
+    (induced subgraphs, descriptors) is redone here; the reference side is
+    reused verbatim.
+
+    Args:
+        g_pred: Predicted graph.
+        reference: Precomputed reference-side state.
+        config: Shared MMD/descriptor configuration.
+
+    Returns:
+        The `BucketedMMDReport`.
+    """
+    self_loops_pred = nx.number_of_selfloops(g_pred)
+
+    per_size_graph_similarity: dict[int, list[float]] = {}
+    per_size_relative_density: dict[int, list[float]] = {}
+    per_size_raw: dict[int, dict[str, float]] = {}
+    per_size_reference: dict[int, dict[str, float]] = {}
+    for size, node_sets in reference.node_sets.items():
+        ref_subgraphs = reference.ref_subgraphs[size]
+        ref_descs = reference.ref_descriptors[size]
+        pred_descs: dict[str, list[np.ndarray]] = {stat: [] for stat in STATISTICS}
+        graph_similarities: list[float] = []
+        relative_densities: list[float] = []
+        for nodes, ref_subgraph in zip(node_sets, ref_subgraphs, strict=True):
+            pred_subgraph = _induced_subgraph(g_pred, nodes)
+            graph_similarities.append(compute_graph_similarity(pred_subgraph, ref_subgraph))
+            relative_densities.append(compute_relative_density(pred_subgraph, ref_subgraph))
+            pred_d = _descriptors(pred_subgraph)
+            for stat in STATISTICS:
+                pred_descs[stat].append(pred_d[stat])
+        per_size_graph_similarity[size] = graph_similarities
+        per_size_relative_density[size] = relative_densities
+        per_size_raw[size] = {
+            stat: mmd_squared(pred_descs[stat], [d[stat] for d in ref_descs], config)
+            for stat in STATISTICS
+        }
+        per_size_reference[size] = {
+            stat: mmd_squared(
+                [d[stat] for d in ref_descs][::2], [d[stat] for d in ref_descs][1::2], config
+            )
+            for stat in STATISTICS
+        }
+
+    raw_mmd2 = {
+        stat: float(np.mean([per_size_raw[size][stat] for size in per_size_raw]))
+        for stat in STATISTICS
+    }
+    reference_mmd2 = {
+        stat: float(np.mean([per_size_reference[size][stat] for size in per_size_reference]))
+        for stat in STATISTICS
+    }
+    mmd_ratio = {
+        stat: raw_mmd2[stat] / max(reference_mmd2[stat], config.reference_epsilon)
+        for stat in STATISTICS
+    }
+    graph_similarity = float(
+        np.mean([value for values in per_size_graph_similarity.values() for value in values])
+    )
+    relative_density = float(
+        np.mean([value for values in per_size_relative_density.values() for value in values])
+    )
+    return BucketedMMDReport(
+        per_size_graph_similarity=per_size_graph_similarity,
+        per_size_relative_density=per_size_relative_density,
+        per_size_raw_mmd2=per_size_raw,
+        per_size_reference_mmd2=per_size_reference,
+        graph_similarity=graph_similarity,
+        raw_mmd2=raw_mmd2,
+        reference_mmd2=reference_mmd2,
+        mmd_ratio=mmd_ratio,
+        relative_density=relative_density,
+        self_loops_pred=self_loops_pred,
+        self_loops_ref=reference.self_loops_ref,
+    )
+
+
 def noise_floor(
     g_ref: nx.Graph,
     buckets: dict[int, list[set[str]]],

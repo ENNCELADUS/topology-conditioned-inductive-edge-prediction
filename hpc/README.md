@@ -97,16 +97,16 @@ checkpoint.
 
 ## EgoStitch E2E
 
-EgoStitch E2E trains on `V_fit` and validates on the single 512-node `V_hold`. It may
-not open a held-out path during training; that boundary is checked inside the worker, and
-the command runs directly in the repository checkout.
+EgoStitch E2E trains on train-side positives outside V_val and validates on the V_val region split
+(pair-disjoint, not node-disjoint). It may not read V_val-internal pairs during training; that
+boundary is checked inside the worker, and the command runs directly in the repository checkout.
 
 The sole exception is an explicitly configured true-Oracle diagnostic:
-`generator.oracle_truth_source: g_fit_plus_v_hold`. It consumes internal `V_hold`
-positive structure and therefore must use `--run-kind diagnostic`; it writes
-`diagnostic_complete.json`, never formal artifacts or `complete.json`, and its test stage
-correspondingly writes `diagnostic_test_report.json`/`diagnostic_test_complete.json`,
-never the formal `test_report.json`/`test_complete.json` names.
+`generator.oracle_truth_source: training_structure_plus_g_val`. It consumes the V_val-internal G_val
+overlay structure and must use `--run-kind diagnostic`; it writes `diagnostic_complete.json`, never
+formal artifacts or `complete.json`, and its test stage correspondingly writes
+`diagnostic_test_report.json`/`diagnostic_test_complete.json`, never the formal
+`test_report.json`/`test_complete.json` names.
 
 It runs through the same `hpc/run.sh train` branch as the baselines, naming the
 EgoStitch worker and run kind explicitly and pointing at one of the trained-arm

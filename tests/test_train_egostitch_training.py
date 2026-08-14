@@ -164,9 +164,9 @@ def test_formal_output_metadata_matches_scorer_contract(tmp_path: Path) -> None:
         output_dir=tmp_path / "formal",
         run_kind="formal",
     )
-    # The plan pins a single `V_hold` manifest, so `V_hold` is the only role
+    # The plan pins a single `V_val` region, so `V_val` is the only role
     # production can emit
-    # (`_E2E_VALIDATION_ROLE`, typed `Literal["V_hold"] | None`). The stub is
+    # (`_E2E_VALIDATION_ROLE`, typed `Literal["V_val"] | None`). The stub is
     # pinned to that constant rather than to a hand-written string, so a role
     # rename cannot leave this fixture asserting a value the worker never
     # writes.
@@ -230,8 +230,8 @@ def test_formal_output_metadata_matches_scorer_contract(tmp_path: Path) -> None:
     assert metadata["arm"] == "full"
     assert metadata["config_sha256"] == te._sha256_file(config_path)
     assert metadata["checkpoint_sha256"] == te._sha256_file(cfg.output_dir / "best.pt")
-    assert te._E2E_VALIDATION_ROLE == "V_hold"
-    assert metadata["validation_role"] == "V_hold"
+    assert te._E2E_VALIDATION_ROLE == "V_val"
+    assert metadata["validation_role"] == "V_val"
     assert metadata["run_kind"] == "formal"
     assert metadata["world_size"] == 4
     assert metadata["rho_train"] == data.rho_train

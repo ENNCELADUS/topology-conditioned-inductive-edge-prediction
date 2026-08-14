@@ -80,7 +80,7 @@ runtime:
   # The F0/grounding pack is keyed on n_ground and the pack manifest rejects a
   # mismatch outright, so this arm cannot share the n_ground=50 pack the other
   # five arms build. One pack per n_ground, shared by both stages of the ladder.
-  pack_dir: outputs/feature_packs/egostitch_e2e_v_hold_ng20
+  pack_dir: outputs/feature_packs/egostitch_e2e_v_val_ng20
   pack_workers: 8
   loader_workers_per_rank: 0
   prefetch_factor: 2

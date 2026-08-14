@@ -57,8 +57,8 @@ _E2E_TINY_MODEL: dict[str, object] = {
         # rev-3.1 default (50).
         "n_ground": 20,
         # `_toy_bundle` builds an in-memory `EgoStitchData` with `feature_stats
-        # is None` -- it never goes through `assemble_egostitch_data`'s V_fit
-        # statistics path (Task 6), so the `zscore_vfit_v1` default would raise
+        # is None` -- it never goes through `assemble_egostitch_data`'s
+        # training-universe statistics path (Task 6), so the `zscore_vfit_v1` default would raise
         # unless a test explicitly registers statistics first. The
         # `TestE2ECompositeStep`/`TestPrepareAndAssembleE2E`-adjacent suites that
         # build models from this dict exercise the composite optimizer step,

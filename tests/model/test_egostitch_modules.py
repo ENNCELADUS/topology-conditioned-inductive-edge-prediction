@@ -96,24 +96,26 @@ class TestConfig:
     def test_feature_standardization_defaults_to_the_rev32_mode(self) -> None:
         assert E2EConfig().generator.feature_standardization == "zscore_vfit_v1"
         assert E2EConfig().generator.feature_stats_sha256 == ""
-        assert E2EConfig().generator.oracle_truth_source == "g_fit"
+        assert E2EConfig().generator.oracle_truth_source == "training_structure"
 
     def test_held_out_oracle_truth_is_explicit_and_oracle_only(self) -> None:
         cfg = E2EConfig.from_mapping(
             {
                 "generator": {
                     "name": "oracle_struct",
-                    "oracle_truth_source": "g_fit_plus_v_hold",
+                    "oracle_truth_source": "training_structure_plus_g_val",
                 }
             }
         )
-        assert cfg.generator.oracle_truth_source == "g_fit_plus_v_hold"
-        full_cfg = GeneratorConfig(name="full_ego_oracle", oracle_truth_source="g_fit_plus_v_hold")
-        assert full_cfg.oracle_truth_source == "g_fit_plus_v_hold"
+        assert cfg.generator.oracle_truth_source == "training_structure_plus_g_val"
+        full_cfg = GeneratorConfig(
+            name="full_ego_oracle", oracle_truth_source="training_structure_plus_g_val"
+        )
+        assert full_cfg.oracle_truth_source == "training_structure_plus_g_val"
         with pytest.raises(ValueError, match="oracle_truth_source"):
             GeneratorConfig(oracle_truth_source="test_graph")
         with pytest.raises(ValueError, match="requires name='oracle_struct'"):
-            GeneratorConfig(oracle_truth_source="g_fit_plus_v_hold")
+            GeneratorConfig(oracle_truth_source="training_structure_plus_g_val")
 
     def test_feature_standardization_allowlist(self) -> None:
         cfg = E2EConfig(generator=GeneratorConfig(feature_standardization="row_layernorm"))

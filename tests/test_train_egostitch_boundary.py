@@ -22,11 +22,13 @@ from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
+import networkx as nx
 import numpy as np
 import pytest
 import torch
 from src import train_egostitch as te
-from src.data import internal_holdout
+from src.data.artifacts import canonical_pair
+from src.data.val_region import ValRegionParams
 from src.train_b0 import EvalConfig, ModelConfig
 
 _NODES = [f"n{i}" for i in range(25)]
@@ -63,17 +65,28 @@ def _write_feature_root(tmp_path: Path) -> None:
 
 
 def _write_train_side_root(tmp_path: Path) -> Path:
-    """Write the three train-side inputs the two-stage assembly opens."""
+    """Write the train-side inputs the two-stage assembly opens."""
     strategy_dir = tmp_path / "data" / te._BENCHMARK_SUBDIR / _STRATEGY
     strategy_dir.mkdir(parents=True, exist_ok=True)
     with (strategy_dir / "split.pkl").open("wb") as handle:
         pickle.dump({"train": _NODES, "test": []}, handle)
     edges = [(_NODES[i], _NODES[(i + 1) % len(_NODES)]) for i in range(len(_NODES))]
+    val_positive = (_NODES[0], _NODES[7])
     (strategy_dir / "train_edges.txt").write_text(
         "".join(f"{u}\t{v}\t1\n" for u, v in edges), encoding="utf-8"
     )
     (strategy_dir / "val_edges.txt").write_text(
-        f"{_NODES[0]}\t{_NODES[7]}\t1\n{_NODES[1]}\t{_NODES[9]}\t0\n", encoding="utf-8"
+        f"{val_positive[0]}\t{val_positive[1]}\t1\n{_NODES[1]}\t{_NODES[9]}\t0\n", encoding="utf-8"
+    )
+    train_graph = nx.Graph()
+    train_graph.add_nodes_from(_NODES)
+    train_graph.add_edges_from(edges)
+    train_graph.add_edge(*val_positive)
+    with (strategy_dir / "train_graph.pkl").open("wb") as handle:
+        pickle.dump(train_graph, handle)
+    positive_pairs = sorted({canonical_pair(u, v) for u, v in (*edges, val_positive)})
+    (tmp_path / "data" / te._BENCHMARK_SUBDIR / "positive_edges.txt").write_text(
+        "".join(f"{u}\t{v}\n" for u, v in positive_pairs), encoding="utf-8"
     )
     return strategy_dir
 
@@ -122,18 +135,39 @@ def _cfg(tmp_path: Path, *, strategy: str = _STRATEGY, training: bool = True) ->
     )
 
 
-def _tiny_holdout(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Run the real BFS holdout at a size the 25-node fixture can satisfy."""
+# Toy-scale V_val derivation the 25-node ring fixture can satisfy (this
+# module is deliberately self-contained, so it does not share
+# `test_train_egostitch_e2e.py`'s equivalent constant).
+_TINY_VAL_REGION_PARAMS = ValRegionParams(
+    edge_fraction=0.4,
+    n_regions=2,
+    salt="boundary-toy-val-region|",
+    bucket_sizes=(2, 3),
+    buckets_per_size=2,
+    negative_seed=0,
+)
 
-    def tiny(
-        train_nodes: list[str],
-        training_interactions: frozenset[tuple[str, str]],
-    ) -> internal_holdout.InternalHoldoutPartition:
-        return internal_holdout.derive_internal_holdout(
-            train_nodes, training_interactions, holdout_size=4
-        )
 
-    monkeypatch.setattr(te, "derive_internal_holdout", tiny)
+def _use_tiny_val_region_params(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bind `_TINY_VAL_REGION_PARAMS` to every `assemble_egostitch_data`/`prepare_pack` call.
+
+    Replaces the old `derive_internal_holdout` monkeypatch: both entry points
+    thread `val_region_params` through as a keyword seam with a production
+    default, so this binds it once instead of touching every call site.
+    """
+    original_assemble = te.assemble_egostitch_data
+    original_prepare = te.prepare_pack
+
+    def assemble(cfg: te.EgoConfig, **kwargs: object) -> te.EgoStitchData:
+        kwargs.setdefault("val_region_params", _TINY_VAL_REGION_PARAMS)
+        return original_assemble(cfg, **kwargs)  # type: ignore[arg-type]
+
+    def prepare(cfg: te.EgoConfig, pack_dir: Path, **kwargs: object) -> dict[str, object]:
+        kwargs.setdefault("val_region_params", _TINY_VAL_REGION_PARAMS)
+        return original_prepare(cfg, pack_dir, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(te, "assemble_egostitch_data", assemble)
+    monkeypatch.setattr(te, "prepare_pack", prepare)
 
 
 def _alias_train_edges_onto_test_edges(strategy_dir: Path) -> None:
@@ -183,7 +217,7 @@ def test_missing_validation_rejection_source_fails_before_cache_writes(
 ) -> None:
     strategy_dir = _write_train_side_root(tmp_path)
     (strategy_dir / "val_edges.txt").unlink()
-    _tiny_holdout(monkeypatch)
+    _use_tiny_val_region_params(monkeypatch)
 
     with pytest.raises(FileNotFoundError, match="validation-positive rejection source"):
         te.assemble_egostitch_data(_cfg(tmp_path))
@@ -216,7 +250,7 @@ class TestBoundaryPrecedesTheFirstOpen:
         """
         strategy_dir = _write_train_side_root(tmp_path)
         _write_feature_root(tmp_path)
-        _tiny_holdout(monkeypatch)
+        _use_tiny_val_region_params(monkeypatch)
         _alias_train_edges_onto_test_edges(strategy_dir)
         cfg = replace(_cfg(tmp_path), run_kind=run_kind)
 
@@ -240,7 +274,7 @@ class TestBoundaryPrecedesTheFirstOpen:
         """`prepare_pack` had no boundary at all: it consumed held-out rows one stage early."""
         strategy_dir = _write_train_side_root(tmp_path)
         _write_feature_root(tmp_path)
-        _tiny_holdout(monkeypatch)
+        _use_tiny_val_region_params(monkeypatch)
         _alias_train_edges_onto_test_edges(strategy_dir)
         cfg = replace(_cfg(tmp_path), run_kind=run_kind)
         pack_dir = tmp_path / "pack"
@@ -267,7 +301,7 @@ class TestBoundaryPrecedesTheFirstOpen:
         """
         strategy_dir = _write_train_side_root(tmp_path)
         _write_feature_root(tmp_path)
-        _tiny_holdout(monkeypatch)
+        _use_tiny_val_region_params(monkeypatch)
         _alias_train_edges_onto_test_edges(strategy_dir)
         alias = strategy_dir.parent / "alias"
         alias.symlink_to(Path(_STRATEGY), target_is_directory=True)
@@ -282,7 +316,7 @@ class TestBoundaryPrecedesTheFirstOpen:
         """`toy/../toy` names the same directory; `Path.resolve` must collapse it."""
         strategy_dir = _write_train_side_root(tmp_path)
         _write_feature_root(tmp_path)
-        _tiny_holdout(monkeypatch)
+        _use_tiny_val_region_params(monkeypatch)
         _alias_train_edges_onto_test_edges(strategy_dir)
         cfg = replace(_cfg(tmp_path, strategy=f"{_STRATEGY}/../{_STRATEGY}"), run_kind="formal")
 
@@ -300,7 +334,7 @@ class TestBoundaryPrecedesTheFirstOpen:
         """
         strategy_dir = _write_train_side_root(tmp_path)
         _write_feature_root(tmp_path)
-        _tiny_holdout(monkeypatch)
+        _use_tiny_val_region_params(monkeypatch)
         train_edges = strategy_dir / "train_edges.txt"
         held_out = strategy_dir / "test_edges.txt"
         held_out.write_text(train_edges.read_text(encoding="utf-8"), encoding="utf-8")
@@ -328,7 +362,7 @@ class TestBoundaryIsPathScopedNotPresenceScoped:
         """
         strategy_dir = _write_train_side_root(tmp_path)
         _write_feature_root(tmp_path)
-        _tiny_holdout(monkeypatch)
+        _use_tiny_val_region_params(monkeypatch)
         for name in te._HELD_OUT_FILENAMES:
             (strategy_dir / name).write_text("sealed\n", encoding="utf-8")
         cfg = replace(_cfg(tmp_path), run_kind="formal")
@@ -347,7 +381,7 @@ class TestBoundaryIsPathScopedNotPresenceScoped:
         """The same for the assembly, in the run kind the old guard exempted."""
         strategy_dir = _write_train_side_root(tmp_path)
         _write_feature_root(tmp_path)
-        _tiny_holdout(monkeypatch)
+        _use_tiny_val_region_params(monkeypatch)
         for name in te._HELD_OUT_FILENAMES:
             (strategy_dir / name).write_text("sealed\n", encoding="utf-8")
         cfg = replace(_cfg(tmp_path), run_kind="formal")
@@ -371,7 +405,7 @@ class TestBoundaryEnumerationCoversEveryRead:
         """
         _write_train_side_root(tmp_path)
         _write_feature_root(tmp_path)
-        _tiny_holdout(monkeypatch)
+        _use_tiny_val_region_params(monkeypatch)
         cfg = replace(_cfg(tmp_path), run_kind="formal")
 
         with _recorded_opens(monkeypatch) as opened:
@@ -386,7 +420,7 @@ class TestBoundaryEnumerationCoversEveryRead:
     ) -> None:
         _write_train_side_root(tmp_path)
         _write_feature_root(tmp_path)
-        _tiny_holdout(monkeypatch)
+        _use_tiny_val_region_params(monkeypatch)
         cfg = replace(_cfg(tmp_path), run_kind="formal")
 
         with _recorded_opens(monkeypatch) as opened:

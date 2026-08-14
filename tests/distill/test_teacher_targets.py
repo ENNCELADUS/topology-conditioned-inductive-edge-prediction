@@ -1,7 +1,8 @@
 """Contracts for `src.distill.teacher_targets`.
 
-Covers the scoring core against direct recomputation, V_fit-only legality
-refusal, and pair-label correctness.
+Covers the scoring core against direct recomputation, training-side legality
+refusal (test-split leakage, off-universe nodes, V_val-internal truth edges),
+and pair-label correctness.
 """
 
 from __future__ import annotations
@@ -13,8 +14,9 @@ import networkx as nx
 import numpy as np
 import pytest
 import torch
+from src.data.artifacts import canonical_pair
 from src.data.features import FeatureStore
-from src.data.internal_holdout import InternalHoldoutPartition, derive_internal_holdout
+from src.data.val_region import ValRegionParams, ValRegionSplit, derive_val_region_split
 from src.distill import teacher_targets as tt
 from src.distill.artifacts import load_kd_targets, write_kd_targets
 from src.distill.context_sampler import ContextSets, sample_context_sets
@@ -180,8 +182,8 @@ def test_write_load_roundtrip(tmp_path: Path) -> None:
     np.testing.assert_array_equal(loaded.pair_partner_idx, [1, 2, 2])
     np.testing.assert_array_equal(loaded.anchor_offsets, [0, 2, 3, 3])
     np.testing.assert_array_equal(loaded.pair_label, [1, 0, 0])
-    assert loaded.manifest["truth_source"] == "g_fit_only"
-    assert loaded.manifest["format"] == "kd_targets_v1"
+    assert loaded.manifest["truth_source"] == "training_structure"
+    assert loaded.manifest["format"] == "kd_targets_v2"
     assert loaded.manifest["checkpoint_id"] == "abc123"
 
 
@@ -217,55 +219,85 @@ def test_write_rejects_mismatched_array_lengths(tmp_path: Path) -> None:
         )
 
 
-# --------------------------------------------------------------------------- V_fit legality
+# --------------------------------------------------------------------------- training-side legality
 
 
-def _toy_holdout() -> InternalHoldoutPartition:
-    train_nodes = [f"n{i}" for i in range(60)]
-    positives = [(train_nodes[i], train_nodes[i + 1]) for i in range(len(train_nodes) - 1)]
-    return derive_internal_holdout(train_nodes, positives, holdout_size=10)
+def _grid_nodes(rows: int, cols: int) -> list[str]:
+    return [f"n{r:02d}_{c:02d}" for r in range(rows) for c in range(cols)]
 
 
-def test_refuses_a_truth_graph_node_outside_v_fit() -> None:
-    holdout = _toy_holdout()
-    node_ids = sorted(holdout.v_fit)
-    truth = tt.truth_graph_for_kd(holdout)
-    truth.add_node("phantom-outside-v-fit")
+def _grid_edges(rows: int, cols: int) -> list[tuple[str, str]]:
+    edges: list[tuple[str, str]] = []
+    for r in range(rows):
+        for c in range(cols):
+            node = f"n{r:02d}_{c:02d}"
+            if c + 1 < cols:
+                edges.append((node, f"n{r:02d}_{c + 1:02d}"))
+            if r + 1 < rows:
+                edges.append((node, f"n{r + 1:02d}_{c:02d}"))
+    return edges
 
-    with pytest.raises(ValueError, match="outside V_fit"):
-        tt.assert_v_fit_only(node_ids, truth, holdout, frozenset())
+
+def _toy_split() -> ValRegionSplit:
+    """A tiny grid-graph split whose V_val region has >=2 nodes and cross-boundary edges."""
+    nodes = _grid_nodes(5, 5)
+    edges = _grid_edges(5, 5)
+    global_positives = frozenset(canonical_pair(u, v) for u, v in edges)
+    params = ValRegionParams(
+        edge_fraction=0.15,
+        n_regions=1,
+        salt="teacher-targets-toy|",
+        bucket_sizes=(2, 3),
+        buckets_per_size=1,
+    )
+    split = derive_val_region_split(nodes, edges, [], global_positives, params=params)
+    assert len(split.v_val) >= 2, "test fixture must produce a multi-node V_val region"
+    return split
 
 
-def test_refuses_a_node_universe_overlapping_v_hold() -> None:
-    holdout = _toy_holdout()
-    truth = tt.truth_graph_for_kd(holdout)
-    node_ids = [*sorted(holdout.v_fit), next(iter(holdout.v_hold))]
+def test_refuses_a_truth_graph_node_outside_the_training_universe() -> None:
+    split = _toy_split()
+    node_ids = sorted(split.train_nodes)
+    truth = tt.truth_graph_for_kd(split)
+    truth.add_node("phantom-outside-training-universe")
 
-    with pytest.raises(ValueError, match="V_hold"):
-        tt.assert_v_fit_only(node_ids, truth, holdout, frozenset())
+    with pytest.raises(ValueError, match="outside the training universe"):
+        tt.assert_training_side_only(node_ids, truth, split, frozenset())
 
 
 def test_refuses_a_node_universe_overlapping_the_test_split() -> None:
-    holdout = _toy_holdout()
-    truth = tt.truth_graph_for_kd(holdout)
-    node_ids = [*sorted(holdout.v_fit), "held-out-test-node"]
+    split = _toy_split()
+    truth = tt.truth_graph_for_kd(split)
+    node_ids = [*sorted(split.train_nodes), "held-out-test-node"]
 
     with pytest.raises(ValueError, match="test-split"):
-        tt.assert_v_fit_only(node_ids, truth, holdout, frozenset({"held-out-test-node"}))
+        tt.assert_training_side_only(node_ids, truth, split, frozenset({"held-out-test-node"}))
 
 
-def test_accepts_a_legal_g_fit_only_universe() -> None:
-    holdout = _toy_holdout()
-    truth = tt.truth_graph_for_kd(holdout)
-    node_ids = sorted(holdout.v_fit)
+def test_refuses_a_truth_graph_containing_a_v_val_internal_edge() -> None:
+    split = _toy_split()
+    node_ids = sorted(split.train_nodes)
+    truth = tt.truth_graph_for_kd(split)
+    a, b = sorted(split.v_val)[:2]
+    truth.add_edge(a, b)
 
-    tt.assert_v_fit_only(node_ids, truth, holdout, frozenset())  # must not raise
+    with pytest.raises(ValueError, match="V_val-internal edge"):
+        tt.assert_training_side_only(node_ids, truth, split, frozenset())
+
+
+def test_accepts_a_clean_training_universe_that_legitimately_contains_v_val_nodes() -> None:
+    split = _toy_split()
+    node_ids = sorted(split.train_nodes)
+    truth = tt.truth_graph_for_kd(split)
+
+    assert split.v_val & set(node_ids), "V_val nodes must remain part of the training universe"
+    tt.assert_training_side_only(node_ids, truth, split, frozenset())  # must not raise
 
 
 # --------------------------------------------------------------------------- pair labels
 
 
-def test_pair_labels_match_g_fit_edges() -> None:
+def test_pair_labels_match_truth_graph_edges() -> None:
     graph = nx.Graph([("a", "b"), ("b", "c")])
     node_ids = ["a", "b", "c"]
     context = ContextSets(

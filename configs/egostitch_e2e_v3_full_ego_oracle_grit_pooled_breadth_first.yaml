@@ -20,7 +20,7 @@ model:
     generator:
       name: full_ego_oracle
       oracle_seed: 0
-      oracle_truth_source: g_fit_plus_v_hold
+      oracle_truth_source: training_structure_plus_g_val
       n_ground: 50
       feature_standardization: row_layernorm
     encoder:
@@ -99,7 +99,7 @@ mixed_precision: "bf16"
 
 runtime:
   world_size: auto
-  pack_dir: outputs/feature_packs/egostitch_e2e_v_hold_ng50
+  pack_dir: outputs/feature_packs/egostitch_e2e_v_val_ng50
   pack_workers: 8
   loader_workers_per_rank: 0
   # One optimizer step consumes eight physical microbatches. Keep two complete

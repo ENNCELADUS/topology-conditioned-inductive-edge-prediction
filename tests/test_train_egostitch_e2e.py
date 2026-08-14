@@ -18,7 +18,6 @@ import pytest
 import torch
 from accelerate import Accelerator
 from src import train_egostitch as te
-from src.data import internal_holdout
 from src.data.artifacts import Benchmark, LabeledPairs, SplitArtifacts, canonical_pair
 from src.data.ego_targets import EgoTargetBuilder
 from src.data.feature_stats import (
@@ -38,6 +37,7 @@ from src.data.packed_features import (
 )
 from src.data.pairs import NegativeSampler
 from src.data.prefetch import _prefetch_batches
+from src.data.val_region import ValRegionParams
 from src.eval.edge_metrics import EdgeMetrics
 from src.model.egostitch import EgoStitchConfig
 from src.model.egostitch.classifier.b0_v31 import GatedCrossAttention
@@ -76,11 +76,11 @@ _EXPECTED_FIDELITY_KEYS = {
     "topology_delta_std",
     "topology_delta_ratio",
     "selection_tiebreak",
-    "gs",
-    "rd",
-    "degree_mmd",
-    "clustering_mmd",
-    "spectral_mmd",
+    "gs_bfs",
+    "rd_bfs",
+    "degree_mmd_ratio",
+    "clustering_mmd_ratio",
+    "spectral_mmd_ratio",
     "prevalence",
     "pi_slot_std",
     "h_pairwise_cosine_mean",
@@ -1420,8 +1420,8 @@ class TestE2ECompositeStep:
 
         assert step_0_guard_calls == [0], "step-0 guard must run once, before the first step"
         assert result.runtime_profile is not None
-        assert result.runtime_profile["v_hold_validation_event_count"] == 2
-        assert [row["kind"] for row in result.runtime_profile["v_hold_validation_events"]] == [
+        assert result.runtime_profile["val_region_validation_event_count"] == 2
+        assert [row["kind"] for row in result.runtime_profile["val_region_validation_events"]] == [
             "step_0",
             "epoch_end",
         ]
@@ -1462,7 +1462,10 @@ class TestE2ECompositeStep:
                 min(1.0, ceiling / (record["norm"] + 1e-12))
             )
         assert (
-            result.runtime_profile["observed_training_access"][0]["all_nodes_within_v_fit"] is True
+            result.runtime_profile["observed_training_access"][0][
+                "all_nodes_within_training_universe"
+            ]
+            is True
         )
         assert result.runtime_profile["validation_coverage_exact"] is True
         assert result.runtime_profile["training_coverage_exact"] is True
@@ -1829,7 +1832,7 @@ def _uncached_validation_reference(
 
 
 class TestE2EValidationCache:
-    """The per-call V_hold node cache and fp32 pair-pass contract."""
+    """The per-call V_val node cache and fp32 pair-pass contract."""
 
     @staticmethod
     def _setup(
@@ -1935,6 +1938,7 @@ class TestE2EValidationCache:
             "node_cache_encode_seconds",
             "pair_scoring_seconds",
             "gather_metrics_seconds",
+            "val_universe_scoring_seconds",
         }
         assert all(value >= 0.0 for value in result.timing.values())
 
@@ -1986,7 +1990,7 @@ class TestE2EValidationCache:
             atol=2e-5,
         )
 
-    def test_validation_encoding_reads_only_v_hold_rows(
+    def test_validation_encoding_reads_only_v_val_rows(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         data, model, accelerator, table, index = self._setup(tmp_path)
@@ -2007,7 +2011,7 @@ class TestE2EValidationCache:
             data,
             train_nodes=["n3", "n4", "n5", "n6"],
             train_pos={node: offset for offset, node in enumerate(("n3", "n4", "n5", "n6"))},
-            validation_role="V_hold",
+            validation_role="V_val",
             validation_nodes=validation_nodes,
             validation_positive_edges=(("n0", "n1"),),
             validation_grounding_index=grounding,
@@ -2127,8 +2131,8 @@ class _ArchivedV1TrainLoopE2E:
         log_variances = cast(dict[str, float], result.kendall_state["log_variances"])
         assert set(log_variances) == {"edge", "recon", "real", "ssl"}
         assert any(abs(value) > 0.0 for value in log_variances.values())
-        validation_events = result.runtime_profile["v_hold_validation_events"]
-        assert result.runtime_profile["v_hold_validation_event_count"] == cfg.optim.epochs + 2
+        validation_events = result.runtime_profile["val_region_validation_events"]
+        assert result.runtime_profile["val_region_validation_event_count"] == cfg.optim.epochs + 2
         assert [row["kind"] for row in validation_events] == [
             "step_0",
             "phase_a_end",
@@ -2246,8 +2250,8 @@ def test_phase_a_end_and_epoch_end_are_distinct_validation_events(
     )
     cfg, _, _, result = helper._run(tmp_path)
 
-    events = result.runtime_profile["v_hold_validation_events"]
-    assert result.runtime_profile["v_hold_validation_event_count"] == cfg.optim.epochs + 2
+    events = result.runtime_profile["val_region_validation_events"]
+    assert result.runtime_profile["val_region_validation_event_count"] == cfg.optim.epochs + 2
     assert [row["kind"] for row in events] == [
         "step_0",
         "phase_a_end",
@@ -2311,10 +2315,39 @@ def _write_e2e_feature_root(tmp_path: Path, nodes: list[str], *, input_dim: int 
     )
 
 
+# Toy-scale V_val derivation for the 25-node ring fixture: small enough that
+# region growth and bucket sampling both succeed over so few nodes/edges.
+_TOY_VAL_REGION_PARAMS = ValRegionParams(
+    edge_fraction=0.4,
+    n_regions=2,
+    salt="toy-e2e-val-region|",
+    bucket_sizes=(2, 3),
+    buckets_per_size=2,
+    negative_seed=0,
+)
+
+
+def _use_tiny_val_region_params(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bind `_TOY_VAL_REGION_PARAMS` to every `assemble_egostitch_data` call.
+
+    Replaces the old `derive_internal_holdout` monkeypatch: `assemble_egostitch_data`
+    threads `val_region_params` through as a keyword seam with a production
+    default, so this binds it once here instead of touching every one of this
+    module's many `te.assemble_egostitch_data(cfg)` call sites.
+    """
+    original = te.assemble_egostitch_data
+
+    def assemble(cfg: te.EgoConfig, **kwargs: object) -> te.EgoStitchData:
+        kwargs.setdefault("val_region_params", _TOY_VAL_REGION_PARAMS)
+        return original(cfg, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(te, "assemble_egostitch_data", assemble)
+
+
 def _holdout_e2e_cfg(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, n_ground: int = 3
 ) -> te.EgoConfig:
-    """Build an active E2E config over a small real internal holdout."""
+    """Build an active E2E config over a small real V_val region."""
     _write_e2e_feature_root(tmp_path, _E2E_PIPELINE_NODES)
     strategy_dir = tmp_path / "data" / te._BENCHMARK_SUBDIR / "toy"
     strategy_dir.mkdir(parents=True, exist_ok=True)
@@ -2322,24 +2355,27 @@ def _holdout_e2e_cfg(
         pickle.dump({"train": _E2E_PIPELINE_NODES, "test": []}, handle)
     n = len(_E2E_PIPELINE_NODES)
     edges = [(_E2E_PIPELINE_NODES[i], _E2E_PIPELINE_NODES[(i + 1) % n]) for i in range(n)]
+    val_positive = (_E2E_PIPELINE_NODES[0], _E2E_PIPELINE_NODES[5])
     (strategy_dir / "train_edges.txt").write_text(
         "".join(f"{u}\t{v}\t1\n" for u, v in edges), encoding="utf-8"
     )
     (strategy_dir / "val_edges.txt").write_text(
-        f"{_E2E_PIPELINE_NODES[0]}\t{_E2E_PIPELINE_NODES[5]}\t1\n"
+        f"{val_positive[0]}\t{val_positive[1]}\t1\n"
         f"{_E2E_PIPELINE_NODES[1]}\t{_E2E_PIPELINE_NODES[6]}\t0\n",
         encoding="utf-8",
     )
+    train_graph = nx.Graph()
+    train_graph.add_nodes_from(_E2E_PIPELINE_NODES)
+    train_graph.add_edges_from(edges)
+    train_graph.add_edge(*val_positive)
+    with (strategy_dir / "train_graph.pkl").open("wb") as handle:
+        pickle.dump(train_graph, handle)
+    positive_pairs = sorted({canonical_pair(u, v) for u, v in (*edges, val_positive)})
+    (tmp_path / "data" / te._BENCHMARK_SUBDIR / "positive_edges.txt").write_text(
+        "".join(f"{u}\t{v}\n" for u, v in positive_pairs), encoding="utf-8"
+    )
 
-    def tiny_holdout(
-        train_nodes: list[str],
-        training_interactions: frozenset[tuple[str, str]],
-    ) -> internal_holdout.InternalHoldoutPartition:
-        return internal_holdout.derive_internal_holdout(
-            train_nodes, training_interactions, holdout_size=4
-        )
-
-    monkeypatch.setattr(te, "derive_internal_holdout", tiny_holdout)
+    _use_tiny_val_region_params(monkeypatch)
     cfg = _toy_cfg(tmp_path)
     return replace(
         cfg,
@@ -2366,25 +2402,29 @@ class TestPrepareAndAssembleE2E:
     def _assemble_holdout_e2e_data(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, n_ground: int = 3
     ) -> te.EgoStitchData:
-        """Assemble e2e data through the real V_fit/V_qual/V_select holdout path.
+        """Assemble e2e data through the real derived-V_val-region path.
 
-        See the module-level `_holdout_e2e_cfg` for why the holdout size and
+        See the module-level `_holdout_e2e_cfg` for why the region size and
         node counts are what they are.
         """
-        return te.assemble_egostitch_data(
-            _holdout_e2e_cfg(tmp_path, monkeypatch, n_ground=n_ground)
-        )
+        # `_holdout_e2e_cfg` monkeypatches `te.assemble_egostitch_data` as a
+        # side effect, so it must run in its own statement: fusing this into
+        # `te.assemble_egostitch_data(_holdout_e2e_cfg(...))` resolves the
+        # (still-unpatched) callable before the argument -- and the patch --
+        # ever runs.
+        cfg = _holdout_e2e_cfg(tmp_path, monkeypatch, n_ground=n_ground)
+        return te.assemble_egostitch_data(cfg)
 
-    def test_assembly_registers_v_fit_feature_statistics(
+    def test_assembly_registers_training_universe_feature_statistics(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The registered constants are computed and audited against V_fit."""
+        """The registered constants are computed and audited against the training universe."""
         data = self._assemble_holdout_e2e_data(tmp_path, monkeypatch)
 
         assert data.feature_stats is not None
         audit = data.access_audit or {}
         assert audit["training_feature_stats_sha256"] == data.feature_stats.digest
-        # The statistics universe is exactly the audited V_fit id list.
+        # The statistics universe is exactly the audited training-node id list.
         assert (
             audit["training_feature_stats_universe_sha256"]
             == audit["training_feature_nodes_sha256"]
@@ -2392,13 +2432,14 @@ class TestPrepareAndAssembleE2E:
         assert audit["training_feature_stats_rows"] == data.feature_stats.n_rows
         assert data.feature_stats.n_rows == len(data.train_nodes)
 
-    def test_assembly_statistics_ignore_sealed_validation_rows(
+    def test_assembly_statistics_span_the_full_training_universe(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The loaded matrix carries V_select rows; the constants must not see them."""
+        """V_val is a training-universe subset now, so its rows are included, not excluded."""
         data = self._assemble_holdout_e2e_data(tmp_path, monkeypatch)
         assert data.feature_stats is not None
-        assert data.validation_nodes  # precondition: sealed rows really are in the matrix
+        assert data.validation_nodes  # precondition: V_val rows really are in the matrix
+        assert set(data.validation_nodes) <= set(data.train_nodes)
 
         expected = compute_feature_stats(
             np.asarray(
@@ -2412,7 +2453,7 @@ class TestPrepareAndAssembleE2E:
     def test_assembly_rejects_an_f0_cache_superset(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """V_fit union V_hold must match the cached row identity exactly."""
+        """The training universe must match the cached row identity exactly."""
         cfg = _holdout_e2e_cfg(tmp_path, monkeypatch)
         data = te.assemble_egostitch_data(cfg)
         cache_path = cfg.data.f0_cache
@@ -2434,7 +2475,7 @@ class TestPrepareAndAssembleE2E:
         with pytest.raises(ValueError, match="node ordering"):
             te.assemble_egostitch_data(cfg)
 
-    def test_assembly_raises_when_feature_stats_universe_diverges_from_v_fit(
+    def test_assembly_raises_when_feature_stats_universe_diverges_from_training(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A universe drift (same members, different order) must fail closed.
@@ -2466,7 +2507,7 @@ class TestPrepareAndAssembleE2E:
 
         monkeypatch.setattr(te, "feature_stats_for_universe", shuffled_universe_feature_stats)
 
-        with pytest.raises(RuntimeError, match="V_fit"):
+        with pytest.raises(RuntimeError, match="training universe"):
             self._assemble_holdout_e2e_data(tmp_path, monkeypatch)
 
 
@@ -2529,7 +2570,7 @@ class TestFeatureStandardizationBinding:
     def test_binding_pins_the_statistics_and_returns_the_digest(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The formal plan binds the V_fit-derived statistics digest."""
+        """The formal plan binds the training-universe-derived statistics digest."""
         base_cfg = replace(_holdout_e2e_cfg(tmp_path, monkeypatch), run_kind="formal")
         data = te.assemble_egostitch_data(base_cfg)
         assert data.feature_stats is not None

@@ -8,9 +8,11 @@ joint-pair stream joins in Stage 3). ``--token-budget-per-rank`` is
 reinterpreted for this family as the per-rank node-stream batch size ``B_n``
 (spec Sec 13.13); the runtime budget is config-driven, not the E2 60-minute pin.
 
-The worker executes the plan-bound formal schedule on ``V_fit`` and validates
-on ``V_hold``. Model-quality diagnostics are recorded as telemetry; they do not
-authorize or block checkpoint publication, scoring, or evaluation.
+The worker executes the plan-bound formal schedule on the training universe and
+validates on ``V_val``, a full-density node region carved out of
+`train_graph.pkl` (`src/data/val_region.py`). Model-quality diagnostics are
+recorded as telemetry; they do not authorize or block checkpoint publication,
+scoring, or evaluation.
 
 Launch (formal):
 
@@ -51,18 +53,26 @@ from src.data.ego_targets import EgoTargetBuilder, EgoTargets
 from src.data.feature_stats import FeatureStats, feature_stats_for_universe
 from src.data.features import FeatureStore, build_f0_matrix
 from src.data.grounding import build_grounding_pool
-from src.data.internal_holdout import InternalHoldoutPartition, derive_internal_holdout
 from src.data.packed_features import PackedFeatureManifest, PackedFeatureTable
 from src.data.pairs import NegativeSampler
-from src.data.partition import derive_training_interactions
 from src.data.prefetch import _prefetch_batches
+from src.data.val_region import (
+    ValRegionParams,
+    ValRegionSplit,
+    derive_val_region_split,
+    val_universe_arrays,
+)
 from src.eval.checkpoint_selection import (
     CheckpointCandidate,
     TopologyValidationMetrics,
     select_checkpoint,
-    validation_topology_metrics,
 )
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
+from src.eval.val_topology import (
+    ValTopologyReference,
+    build_val_topology_reference,
+    val_region_topology_metrics,
+)
 from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
 from src.model.egostitch.classifier.b0_v31 import (
     NULL_ALL_HEAD,
@@ -97,6 +107,7 @@ from src.train_b0 import (
     _require,
     _state_digest,
     _write_json_rank_zero,
+    validate_gathered_validation,
 )
 
 logger = logging.getLogger(__name__)
@@ -139,9 +150,10 @@ def build_egostitch_ddp_accelerator(
 # `src.experiments.probes` reads it back.
 E2ERunKind = Literal["formal", "diagnostic", "debug"]
 
-# The single validation universe (`V_hold = V_qual union V_select`). It is also
-# the grounding-pool ``role_universe`` identity.
-_E2E_VALIDATION_ROLE: Literal["V_hold"] = "V_hold"
+# The single validation universe: the V_val node region carved out of
+# `train_graph.pkl` (`src/data/val_region.py`). It is also the grounding-pool
+# ``role_universe`` identity.
+_E2E_VALIDATION_ROLE: Literal["V_val"] = "V_val"
 
 
 # --------------------------------------------------------------------------- config
@@ -984,11 +996,11 @@ def _e2e_validation_endpoint_degrees(data: EgoStitchData) -> NDArray[np.float64]
 
 
 def e2e_degree_prior_init(model: EgoStitchStage1 | EgoStitchModel, data: EgoStitchData) -> float:
-    """Center the lognormal degree head on the ``G_fit`` degree prior.
+    """Center the lognormal degree head on the ``G_train`` degree prior.
 
     ``deg_mu`` is a raw linear output (`generator/imagine.py`'s
     `TokenizeLite.degree_dist_head`) born near 0, while
-    ``mean(log d)`` on ``G_fit`` sits several nats above it. `degree_nll`'s
+    ``mean(log d)`` on ``G_train`` sits several nats above it. `degree_nll`'s
     ``1/sigma**2`` factor turns that standing residual into a generator gradient
     above the Sec 13.19 clip threshold on *every* step from step 1 -- the
     2026-07-28 `persistent clipping` abort, whose streak needs a term that is
@@ -997,12 +1009,12 @@ def e2e_degree_prior_init(model: EgoStitchStage1 | EgoStitchModel, data: EgoStit
     instead of ``mu`` measures worse, because it shrinks the denominator while
     the numerator is what is wrong.
 
-    ``sorted`` is load-bearing, not cosmetic: ``build_g_fit`` adds nodes from a
-    ``frozenset[str]``, whose iteration order depends on ``PYTHONHASHSEED``
-    (pinned nowhere in this repo), and ``np.log(...).mean()`` uses pairwise
-    summation, so an unsorted traversal makes the last ulp order-dependent. Each
-    rank computes this independently, so without the sort the replicas can
-    disagree in the final bit from step 0.
+    ``sorted`` is load-bearing, not cosmetic: ``build_training_graph`` adds
+    nodes from a ``frozenset[str]``, whose iteration order depends on
+    ``PYTHONHASHSEED`` (pinned nowhere in this repo), and ``np.log(...).mean()``
+    uses pairwise summation, so an unsorted traversal makes the last ulp
+    order-dependent. Each rank computes this independently, so without the
+    sort the replicas can disagree in the final bit from step 0.
     """
     if isinstance(model, EgoStitchModel):
         if not isinstance(model.generator, EgoStitchImagineGenerator):
@@ -1019,7 +1031,7 @@ def e2e_degree_prior_init(model: EgoStitchStage1 | EgoStitchModel, data: EgoStit
         dtype=np.float64,
     )
     if degrees.size == 0:
-        raise RuntimeError("G_fit carries no nodes for the degree prior")
+        raise RuntimeError("G_train carries no nodes for the degree prior")
     mu0 = float(np.log(degrees).mean())
     if not math.isfinite(mu0):
         raise RuntimeError(f"degree prior mean(log d) is not finite: {mu0}")
@@ -1603,7 +1615,13 @@ _HELD_OUT_FILENAMES = ("candidate_test_edges.txt", "test_edges.txt", "test_graph
 # training branch open the train-side three; the `cfg.training is None` sibling
 # assembles through `load_benchmark` + `verify_benchmark`
 # (`src/data/artifacts.py:205-311, 350-384`), which open the rest.
-_E2E_TRAIN_SIDE_INPUTS = ("split.pkl", "train_edges.txt", "val_edges.txt")
+_E2E_TRAIN_SIDE_INPUTS = (
+    "split.pkl",
+    "train_edges.txt",
+    "val_edges.txt",
+    "train_graph.pkl",
+    "positive_edges.txt",
+)
 _BENCHMARK_PACKAGE_ROOT_INPUTS = ("graph.pkl", "positive_edges.txt")
 _BENCHMARK_PACKAGE_STRATEGY_INPUTS = (
     "split.pkl",
@@ -1705,7 +1723,12 @@ def required_pack_paths(cfg: EgoConfig, pack_dir: Path) -> tuple[Path, ...]:
 
 
 def prepare_pack(
-    cfg: EgoConfig, pack_dir: Path, *, cold_cache: bool, temp_prefix: str = ""
+    cfg: EgoConfig,
+    pack_dir: Path,
+    *,
+    cold_cache: bool,
+    temp_prefix: str = "",
+    val_region_params: ValRegionParams | None = None,
 ) -> dict[str, object]:
     """Build (cold) or strictly validate (warm) this family's feature pack.
 
@@ -1720,6 +1743,8 @@ def prepare_pack(
         cold_cache: ``True`` builds from scratch; ``False`` validates.
         temp_prefix: Unused for this family (single-directory build); accepted
             for orchestrator-seam parity.
+        val_region_params: V_val derivation parameters; defaults to
+            `ValRegionParams()`. The test seam small toy fixtures override.
 
     Returns:
         ``{"pack_manifest": {...}, "pack_identity_sha256": <sha of manifest.json>}``.
@@ -1735,8 +1760,12 @@ def prepare_pack(
     # assembly let the pack consume held-out rows and bake them into the F0,
     # grounding and feature-statistics caches the assembly then reuses.
     strategy_dir = _assert_input_boundary(cfg)
-    # Fail before any cache is written if assembly's rejection source is unusable.
-    _validation_positives(strategy_dir)
+    # Derive the split before any cache is written: this reads every
+    # train-side input `derive_val_region_split` needs and so fails before the
+    # pack directory (or raw-token pack) exists if any of them is unusable.
+    split = _derive_e2e_val_region_split(
+        cfg, strategy_dir, val_region_params=val_region_params or ValRegionParams()
+    )
     # Call-time import preserves the pack builder/validator monkeypatch seam.
     from src.data import packed_features
 
@@ -1745,7 +1774,7 @@ def prepare_pack(
     manifest_path = pack_dir / _PACK_MANIFEST_FILENAME
     # The pack carries data-universe identity rather than execution-stage
     # identity. Grounding caches keep their own `role_universe` internally.
-    role: Literal["V_hold"] = _E2E_VALIDATION_ROLE
+    role: Literal["V_val"] = _E2E_VALIDATION_ROLE
     f0_cold = not pack_dir.exists()
     raw_manifest: PackedFeatureManifest | None = None
     raw_pack_dir = cfg.data.pack_dir
@@ -1759,23 +1788,13 @@ def prepare_pack(
     if f0_cold:
         pack_dir.mkdir(parents=True, exist_ok=True)
         store = FeatureStore(cfg.data.root / _FEATURES_SUBDIR)
-        with (strategy_dir / "split.pkl").open("rb") as handle:
-            split_payload = pickle.load(handle)  # noqa: S301 - repository benchmark artifact
-        if not isinstance(split_payload, dict) or "train" not in split_payload:
-            raise ValueError("split.pkl must contain a train node collection")
-        train_nodes_all = sorted(
-            set(cast(Sequence[str], split_payload["train"]))
-            - set(cfg.data.expected_missing_features)
-        )
-        train_pairs, train_labels = _read_labeled_pairs(strategy_dir / "train_edges.txt")
-        positives = [
-            pair for pair, label in zip(train_pairs, train_labels, strict=True) if int(label) == 1
-        ]
-        interactions = derive_training_interactions(positives)
-        holdout = derive_internal_holdout(train_nodes_all, interactions.positives)
-        validation_nodes = holdout.hold_manifest.nodes
-        train_nodes = sorted(holdout.v_fit)
-        operative = sorted(set(train_nodes) | set(validation_nodes))
+        train_nodes = sorted(split.train_nodes)
+        validation_nodes = sorted(split.v_val)
+        # V_val is a subset of the training universe by construction (cross-
+        # boundary edges stay legal training-side signal), so the operative F0
+        # set is exactly the training universe -- no separate union is needed
+        # the way the retired V_fit/V_hold disjoint split required.
+        operative = train_nodes
         if raw_cold:
             assert raw_pack_dir is not None
             raw_manifest = packed_features.build_packed_features(
@@ -1794,7 +1813,7 @@ def prepare_pack(
             train_rows,
             train_nodes,
             n_ground=n_ground,
-            role_universe="V_fit",
+            role_universe="train",
             cache_path=pack_dir / _PACK_GROUNDING_FILENAME,
         )
         feature_stats_for_universe(
@@ -1939,9 +1958,10 @@ class EgoStitchData:
     """Everything the training loop consumes.
 
     Attributes:
-        train_nodes: Sorted train-side node ids with F0 rows.
+        train_nodes: Sorted train-side node ids with F0 rows (the complete
+            training universe; V_val is a subset of it, not disjoint).
         training_positives: Canonical shared training positives (self-pairs included).
-        val_pairs: Validation pairs in canonical V_hold non-self manifest order.
+        val_pairs: Classification-validation pairs (`ValRegionSplit.val_cls_pairs`).
         val_labels: Aligned validation labels.
         f0: Shape ``(N, d)`` float32 CPU matrix.
         node_index: Node id -> `f0` row.
@@ -1951,7 +1971,11 @@ class EgoStitchData:
         target_builder: The `EgoTargetBuilder` over ``G_struct``.
         sampler: The pinned negative sampler.
         rho_train: Shared training-topology edge density (spec Sec 9.3).
-        feature_stats: Registered V_fit-only standardization constants.
+        val_split: The derived V_val region split, or `None` for toy fixtures
+            that build validation pairs by hand.
+        val_topology_reference: The once-per-run topology-validation reference
+            built from `val_split`, or `None` when `val_split` is absent.
+        feature_stats: Registered training-universe standardization constants.
     """
 
     train_nodes: list[str]
@@ -1965,8 +1989,9 @@ class EgoStitchData:
     target_builder: EgoTargetBuilder
     sampler: NegativeSampler
     rho_train: float
-    internal_holdout: InternalHoldoutPartition | None = None
-    validation_role: Literal["V_hold"] | None = None
+    val_split: ValRegionSplit | None = None
+    val_topology_reference: ValTopologyReference | None = None
+    validation_role: Literal["V_val"] | None = None
     access_audit: dict[str, object] | None = None
     validation_nodes: tuple[str, ...] = ()
     validation_positive_edges: tuple[tuple[str, str], ...] = ()
@@ -1992,20 +2017,75 @@ def _read_labeled_pairs(path: Path) -> tuple[list[tuple[str, str]], NDArray[np.i
     return pairs, np.asarray(labels, dtype=np.int8)
 
 
-def _validation_positives(strategy_dir: Path) -> set[tuple[str, str]]:
-    """Read the val-positive set assembly uses only to reject sampled negatives.
+def _read_pair_rows(path: Path) -> list[tuple[str, str]]:
+    r"""Read a plain tab-separated ``u\tv`` file (e.g. `positive_edges.txt`)."""
+    pairs: list[tuple[str, str]] = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.rstrip("\n")
+            if not stripped:
+                continue
+            u, v = stripped.split("\t")
+            pairs.append((u, v))
+    return pairs
+
+
+def _read_val_region_inputs(
+    strategy_dir: Path, benchmark_root: Path, expected_missing_features: Sequence[str]
+) -> tuple[list[str], list[tuple[str, str]], list[tuple[str, str]], frozenset[tuple[str, str]]]:
+    """Read the four train-side inputs `derive_val_region_split` needs.
+
+    Returns:
+        ``(train_nodes_all, truth_edges, benchmark_negatives, global_positive_edges)``.
 
     Raises:
-        FileNotFoundError: If ``val_edges.txt`` is absent, which would silently
-            weaken negative rejection instead of failing the run.
+        FileNotFoundError: If ``val_edges.txt`` (the negative-rejection source)
+            is absent, which would otherwise fail with a bare `open()` traceback
+            instead of an actionable message.
+        ValueError: If ``split.pkl`` carries no train node collection.
     """
     val_path = strategy_dir / "val_edges.txt"
     if not val_path.is_file():
         raise FileNotFoundError(
             f"required validation-positive rejection source is missing: {val_path}"
         )
-    pairs, labels = _read_labeled_pairs(val_path)
-    return {pair for pair, label in zip(pairs, labels, strict=True) if int(label) == 1}
+    with (strategy_dir / "split.pkl").open("rb") as handle:
+        split_payload = pickle.load(handle)  # noqa: S301 - repository benchmark artifact
+    if not isinstance(split_payload, dict) or "train" not in split_payload:
+        raise ValueError("split.pkl must contain a train node collection")
+    train_nodes_all = sorted(
+        set(cast(Sequence[str], split_payload["train"])) - set(expected_missing_features)
+    )
+    with (strategy_dir / "train_graph.pkl").open("rb") as handle:
+        train_graph = pickle.load(handle)  # noqa: S301 - repository benchmark artifact
+    truth_edges = list(train_graph.edges())
+    train_pairs, train_labels = _read_labeled_pairs(strategy_dir / "train_edges.txt")
+    val_pairs, val_labels = _read_labeled_pairs(val_path)
+    benchmark_negatives = [
+        pair for pair, label in zip(train_pairs, train_labels, strict=True) if int(label) == 0
+    ] + [pair for pair, label in zip(val_pairs, val_labels, strict=True) if int(label) == 0]
+    global_positive_edges = frozenset(
+        canonical_pair(u, v) for u, v in _read_pair_rows(benchmark_root / "positive_edges.txt")
+    )
+    return train_nodes_all, truth_edges, benchmark_negatives, global_positive_edges
+
+
+def _derive_e2e_val_region_split(
+    cfg: EgoConfig, strategy_dir: Path, *, val_region_params: ValRegionParams
+) -> ValRegionSplit:
+    """Derive the deterministic V_val split from this config's train-side inputs."""
+    train_nodes_all, truth_edges, benchmark_negatives, global_positive_edges = (
+        _read_val_region_inputs(
+            strategy_dir, cfg.data.root / _BENCHMARK_SUBDIR, cfg.data.expected_missing_features
+        )
+    )
+    return derive_val_region_split(
+        train_nodes_all,
+        truth_edges,
+        benchmark_negatives,
+        global_positive_edges,
+        params=val_region_params,
+    )
 
 
 def _assemble_e2e_data(
@@ -2013,13 +2093,16 @@ def _assemble_e2e_data(
     generator_cfg: EgoStitchConfig,
     *,
     pack_dir: Path | None,
+    val_region_params: ValRegionParams | None = None,
 ) -> EgoStitchData:
-    """Assemble E2E training data from train-side files only, with role-isolated holdouts.
+    """Assemble E2E training data from train-side files only, with the V_val boundary held.
 
     Raises:
         RuntimeError: When any benchmark input this assembly would open is held
             out -- checked before the first open, so nothing held out is read
-            and no derived cache is written on the way to the raise.
+            and no derived cache is written on the way to the raise. Also
+            raised when a V_val-internal pair reaches the training positives
+            (data-boundary fail-closed).
     """
     # [H] Path-scoped held-out boundary (design 2026-07-29 Sec 3.1), first
     # statement of the function. It sat at the *end* of the assembly until
@@ -2027,29 +2110,23 @@ def _assemble_e2e_data(
     # were already read and the F0 / feature-statistics / grounding caches were
     # already written by the time it fired -- a post-mortem, not a guard.
     strategy_dir = _assert_input_boundary(cfg)
-    split_path = strategy_dir / "split.pkl"
-    with split_path.open("rb") as handle:
-        split_payload = pickle.load(handle)  # noqa: S301 - repository benchmark artifact
-    if not isinstance(split_payload, dict) or "train" not in split_payload:
-        raise ValueError("split.pkl must contain a train node collection")
-    train_nodes_all = sorted(
-        set(cast(Sequence[str], split_payload["train"])) - set(cfg.data.expected_missing_features)
+    split = _derive_e2e_val_region_split(
+        cfg, strategy_dir, val_region_params=val_region_params or ValRegionParams()
     )
-    train_pairs, train_labels = _read_labeled_pairs(strategy_dir / "train_edges.txt")
-    positives = [
-        pair for pair, label in zip(train_pairs, train_labels, strict=True) if int(label) == 1
-    ]
-    benchmark_val_positives = _validation_positives(strategy_dir)
-    interactions = derive_training_interactions(positives)
-    holdout = derive_internal_holdout(train_nodes_all, interactions.positives)
     # One universe pair for both stages (design 2026-07-29 Sec 2): training is
-    # always the full V_fit, validation is always V_hold. Nothing here reads
-    # `run_kind` any more, which is exactly what makes the two stages share a
-    # pack, a grounding cache and a `feature_stats_sha256`.
+    # always the full training universe, validation is always V_val. Nothing
+    # here reads `run_kind` any more, which is exactly what makes the two
+    # stages share a pack, a grounding cache and a `feature_stats_sha256`.
     run_kind = cfg.run_kind or "formal"
-    role: Literal["V_hold"] = _E2E_VALIDATION_ROLE
-    validation = holdout.hold_manifest
-    allowed_nodes = sorted(set(holdout.v_fit) | set(validation.nodes))
+    role: Literal["V_val"] = _E2E_VALIDATION_ROLE
+    train_nodes = sorted(split.train_nodes)
+    validation_nodes: tuple[str, ...] = tuple(sorted(split.v_val))
+    validation_positive_edges: tuple[tuple[str, str], ...] = split.val_positives
+    # V_val is a subset of the training universe by construction (cross-
+    # boundary edges stay legal training-side signal), so the F0 universe this
+    # assembly needs is exactly the training universe -- no separate union of
+    # a disjoint fit/hold split.
+    allowed_nodes = train_nodes
 
     store = FeatureStore(cfg.data.root / _FEATURES_SUBDIR)
     f0_cache = (pack_dir / _PACK_F0_FILENAME) if pack_dir is not None else cfg.data.f0_cache
@@ -2060,9 +2137,8 @@ def _assemble_e2e_data(
         cache_path=f0_cache,
         allow_cache_subset=False,
     )
-    fit_nodes = sorted(holdout.v_fit)
-    fit_rows = np.asarray(
-        matrix.numpy()[[node_index[node] for node in fit_nodes]], dtype=np.float32
+    train_rows = np.asarray(
+        matrix.numpy()[[node_index[node] for node in train_nodes]], dtype=np.float32
     )
     feature_stats_cache = (
         (pack_dir / _PACK_FEATURE_STATS_FILENAME)
@@ -2072,24 +2148,22 @@ def _assemble_e2e_data(
     feature_stats = feature_stats_for_universe(
         np.asarray(matrix.numpy(), dtype=np.float32),
         node_index,
-        fit_nodes,
+        train_nodes,
         cache_path=feature_stats_cache,
     )
     grounding_cache = (
         (pack_dir / _PACK_GROUNDING_FILENAME) if pack_dir is not None else cfg.data.grounding_cache
     )
     pool = build_grounding_pool(
-        fit_rows,
-        fit_nodes,
+        train_rows,
+        train_nodes,
         n_ground=generator_cfg.n_ground,
-        role_universe="V_fit",
+        role_universe="train",
         cache_path=grounding_cache,
     )
     grounding_index = np.asarray(
-        [[node_index[neighbor] for neighbor in pool[node]] for node in fit_nodes], dtype=np.int64
+        [[node_index[neighbor] for neighbor in pool[node]] for node in train_nodes], dtype=np.int64
     )
-    validation_nodes: tuple[str, ...] = validation.nodes
-    validation_positive_edges: tuple[tuple[str, str], ...] = validation.positive_edges
     validation_rows = np.asarray(
         matrix.numpy()[[node_index[node] for node in validation_nodes]], dtype=np.float32
     )
@@ -2110,60 +2184,81 @@ def _assemble_e2e_data(
         dtype=np.int64,
     )
     validation_pos: dict[str, int] = {node: index for index, node in enumerate(validation_nodes)}
-    g_fit = holdout.build_g_fit()
+    g_train = split.build_training_graph()
     target_builder = EgoTargetBuilder(
-        g_fit,
+        g_train,
         np.asarray(matrix.numpy(), dtype=np.float32),
         node_index,
         pool,
         slots=generator_cfg.slots,
     )
-    degrees = {node: int(g_fit.degree(node)) for node in fit_nodes}
-    rejection_positives = interactions.positives | benchmark_val_positives
-    sampler = NegativeSampler(fit_nodes, degrees, frozenset(rejection_positives))
-    n_fit = len(fit_nodes)
-    rho_train = g_fit.number_of_edges() / (math.comb(n_fit, 2) + n_fit)
+    degrees = {node: int(g_train.degree(node)) for node in train_nodes}
+    # The truth-edge set is train_graph.pkl's edge set, expressed once: the
+    # split partitions it disjointly into `training_positives`/`val_positives`,
+    # so their union reconstructs it exactly. Rejecting every truth edge --
+    # not only the training-side ones -- keeps a sampled negative from
+    # secretly being a V_val-internal positive.
+    truth_edges = frozenset(split.training_positives) | frozenset(split.val_positives)
+    sampler = NegativeSampler(
+        train_nodes, degrees, truth_edges, forbidden_internal_nodes=split.v_val
+    )
+    n_train = len(train_nodes)
+    rho_train = g_train.number_of_edges() / (math.comb(n_train, 2) + n_train)
     forbidden_files_absent = {
         name: not (strategy_dir / name).exists() for name in _HELD_OUT_FILENAMES
     }
+    v_val_set = split.v_val
+    n_val_internal_rows_in_training = sum(
+        1 for u, v in split.training_positives if u in v_val_set and v in v_val_set
+    )
+    cross_boundary_edge_count = sum(
+        1 for u, v in split.training_positives if (u in v_val_set) != (v in v_val_set)
+    )
     audit: dict[str, object] = {
         "run_kind": run_kind,
         "validation_role": role,
         "training_feature_nodes_sha256": hashlib.sha256(
-            "".join(f"{node}\n" for node in fit_nodes).encode()
+            "".join(f"{node}\n" for node in train_nodes).encode()
         ).hexdigest(),
-        "validation_feature_nodes_sha256": validation.nodes_sha256,
-        "training_endpoints_within_v_fit": True,
-        "structural_target_equals_nonself_training_interactions": {
-            canonical_pair(u, v) for u, v in g_fit.edges()
-        }
-        == set(holdout.topology_fit),
-        "validation_positive_membership_used_for_negative_rejection_only": True,
+        "validation_feature_nodes_sha256": hashlib.sha256(
+            "".join(f"{node}\n" for node in validation_nodes).encode()
+        ).hexdigest(),
         "forbidden_files_absent": forbidden_files_absent,
-        "quarantine_counts": asdict(holdout.quarantine_counts),
-        "overlap_proof": asdict(holdout.overlap_proof),
+        "n_val_internal_rows_in_training": n_val_internal_rows_in_training,
+        "cross_boundary_edge_count": cross_boundary_edge_count,
         "training_feature_stats_sha256": feature_stats.digest,
         "training_feature_stats_universe_sha256": feature_stats.node_ids_sha256,
         "training_feature_stats_rows": feature_stats.n_rows,
     }
+    if n_val_internal_rows_in_training != 0:
+        # [H] Data-boundary fail-closed: `ValRegionSplit` guarantees this is
+        # zero by construction, so tripping this is a real corruption, not a
+        # reachable steady state.
+        raise RuntimeError(
+            f"{n_val_internal_rows_in_training} V_val-internal pair(s) reached "
+            "the training positives (data-boundary violation)"
+        )
     if audit["training_feature_stats_universe_sha256"] != audit["training_feature_nodes_sha256"]:
         raise RuntimeError(
-            "feature standardization statistics were computed over a universe other than V_fit"
+            "feature standardization statistics were computed over a universe "
+            "other than the training universe"
         )
+    val_topology_reference = build_val_topology_reference(split)
     data = EgoStitchData(
-        train_nodes=fit_nodes,
-        training_positives=sorted(holdout.training_interactions_fit),
-        val_pairs=list(validation.pairs),
-        val_labels=np.asarray(validation.labels, dtype=np.int8),
+        train_nodes=train_nodes,
+        training_positives=sorted(split.training_positives),
+        val_pairs=split.val_cls_pairs,
+        val_labels=np.asarray(split.val_cls_labels, dtype=np.int8),
         f0=matrix,
         node_index=node_index,
         grounding_index=grounding_index,
-        train_pos={node: i for i, node in enumerate(fit_nodes)},
+        train_pos={node: i for i, node in enumerate(train_nodes)},
         target_builder=target_builder,
         sampler=sampler,
         rho_train=rho_train,
         feature_stats=feature_stats,
-        internal_holdout=holdout,
+        val_split=split,
+        val_topology_reference=val_topology_reference,
         validation_role=role,
         access_audit=audit,
         validation_nodes=validation_nodes,
@@ -2178,6 +2273,7 @@ def assemble_egostitch_data(
     cfg: EgoConfig,
     *,
     pack_dir: Path | None = None,
+    val_region_params: ValRegionParams | None = None,
 ) -> EgoStitchData:
     """Assemble the full training data bundle from the frozen artifacts.
 
@@ -2187,6 +2283,8 @@ def assemble_egostitch_data(
             uses ``cfg.data.f0_cache`` / ``cfg.data.grounding_cache``.
             The node stream uses the internal trainable generator and its
             registered rev-3.1 grounding/loss-calibration fields.
+        val_region_params: V_val derivation parameters; defaults to
+            `ValRegionParams()`. The test seam small toy fixtures override.
 
     Returns:
         The `EgoStitchData` bundle.
@@ -2206,7 +2304,9 @@ def assemble_egostitch_data(
         tau_div=e2e_model_cfg.generator.tau_div,
         l_gate_pos_weight=e2e_model_cfg.generator.l_gate_pos_weight,
     )
-    return _assemble_e2e_data(cfg, generator_cfg, pack_dir=pack_dir)
+    return _assemble_e2e_data(
+        cfg, generator_cfg, pack_dir=pack_dir, val_region_params=val_region_params
+    )
 
 
 # --------------------------------------------------------------------------- batches
@@ -2270,7 +2370,7 @@ def relational_pair_targets(
     targets = torch.zeros(len(rows), 2, dtype=torch.float32)
     for row, (node_u, node_v, _) in enumerate(rows):
         if node_u not in graph or node_v not in graph:
-            raise ValueError("relational target pair contains a node outside G_fit")
+            raise ValueError("relational target pair contains a node outside G_train")
         neighbors_u = set(graph.neighbors(node_u))
         neighbors_v = set(graph.neighbors(node_v))
         neighbors_u.discard(node_v)
@@ -2416,14 +2516,18 @@ class _BatchFactory:
     def _record_training_nodes(self, nodes: Sequence[str]) -> None:
         invalid = set(nodes) - self._allowed_training_nodes
         if invalid:
-            raise RuntimeError(f"training feature/token read escaped V_fit: {sorted(invalid)[:3]}")
+            raise RuntimeError(
+                f"training feature/token read escaped the training universe: {sorted(invalid)[:3]}"
+            )
         self.training_nodes_read.update(nodes)
         self._record_training_rows([self._data.node_index[node] for node in nodes])
 
     def _record_training_rows(self, rows: Sequence[int]) -> None:
         invalid = set(rows) - self._allowed_training_rows
         if invalid:
-            raise RuntimeError(f"training F0 read escaped V_fit: {sorted(invalid)[:3]}")
+            raise RuntimeError(
+                f"training F0 read escaped the training universe: {sorted(invalid)[:3]}"
+            )
         self.training_f0_rows_read.update(rows)
         self.training_nodes_read.update(self._training_node_by_row[row] for row in rows)
 
@@ -2566,9 +2670,9 @@ class _BatchFactory:
         # F0 row identities for each endpoint (Wave-1 oracle-scaffold
         # addendum): `OracleStructGenerator` needs to know *which* real node
         # it is encoding to look up its scaffold, an identity `x_i`/`x_j`
-        # alone do not carry. Filler rows use one authorized V_fit self-pair,
-        # keeping features, row identities, and `is_self` mutually consistent;
-        # `edge_mask` still excludes them from every loss downstream.
+        # alone do not carry. Filler rows use one authorized training-universe
+        # self-pair, keeping features, row identities, and `is_self` mutually
+        # consistent; `edge_mask` still excludes them from every loss downstream.
         node_row_i = idx_i.clone()
         node_row_j = idx_j.clone()
         edge: dict[str, torch.Tensor] = {
@@ -3099,35 +3203,26 @@ class _ValidationResult:
     active_logits: NDArray[np.float32] = field(default_factory=lambda: np.empty(0, dtype="<f4"))
 
 
-def _validation_topology_metrics(
-    data: EgoStitchData, logits: np.ndarray
-) -> TopologyValidationMetrics:
-    """All five topology metrics at the exact held-out gold edge count."""
-    if not data.validation_nodes or not data.validation_positive_edges:
-        return TopologyValidationMetrics(
-            gs=0.0, rd=0.0, degree_mmd=0.0, clustering_mmd=0.0, spectral_mmd=0.0
-        )
-    return validation_topology_metrics(
-        pairs=data.val_pairs,
-        logits=logits,
-        positive_edges=data.validation_positive_edges,
-        nodes=data.validation_nodes,
-    )
-
-
 def _e2e_validation_grounding_rows(
     data: EgoStitchData,
     nodes: Sequence[str],
 ) -> NDArray[np.int64]:
-    """Resolve role-specific validation grounding to global F0 row ids."""
+    """Resolve role-specific validation grounding to global F0 row ids.
+
+    The V_val pool is checked first, not `train_pos`: V_val is a subset of
+    the training universe (unlike the retired disjoint V_fit/V_hold split),
+    so every production validation node is *also* in `train_pos` and would
+    otherwise always take the wrong branch, silently reading the train-role
+    pool instead of the role-isolated V_val one the pack built for it.
+    """
     validation_index = data.validation_grounding_index
     validation_pos = data.validation_pos or {}
     rows: list[NDArray[np.int64]] = []
     for node in nodes:
-        if node in data.train_pos:
-            rows.append(data.grounding_index[data.train_pos[node]])
-        elif validation_index is not None and node in validation_pos:
+        if validation_index is not None and node in validation_pos:
             rows.append(validation_index[validation_pos[node]])
+        elif node in data.train_pos:
+            rows.append(data.grounding_index[data.train_pos[node]])
         else:
             raise RuntimeError(f"no role-specific grounding row for validation node {node!r}")
     return np.stack(rows).astype(np.int64, copy=False)
@@ -3263,6 +3358,142 @@ def _e2e_validation_slice_rows(n_val: int) -> tuple[int, ...]:
     return tuple(range(max(1, math.ceil(0.01 * n_val))))
 
 
+def _e2e_encode_node_cache(
+    model: EgoStitchModel,
+    data: EgoStitchData,
+    token_table: PackedFeatureTable,
+    token_node_index: Mapping[str, int],
+    nodes: Sequence[str],
+    accelerator: Accelerator,
+    *,
+    edge_batch: int,
+    generator_supervision: bool,
+) -> dict[str, E2ENodeState]:
+    """Encode `nodes` once into a length-bucketed fp32 cache, no_grad.
+
+    Shared by the classification and topology-universe validation passes in
+    `_validate_epoch`, so every node is encoded exactly once per epoch rather
+    than once per pass.
+    """
+    node_cache: dict[str, E2ENodeState] = {}
+    with torch.no_grad():
+        length_buckets: dict[int, list[str]] = {}
+        for node in nodes:
+            length = token_table.manifest.nodes[token_node_index[node]].length
+            bucket = next(
+                (boundary for boundary in (128, 256, 384, 512, 768, 1024) if length <= boundary),
+                length,
+            )
+            length_buckets.setdefault(bucket, []).append(node)
+        for bucket_nodes in length_buckets.values():
+            for start in range(0, len(bucket_nodes), edge_batch):
+                chunk_nodes = bucket_nodes[start : start + edge_batch]
+                node_batch = _e2e_validation_node_batch(
+                    data,
+                    token_table,
+                    token_node_index,
+                    chunk_nodes,
+                    accelerator.device,
+                    generator_supervision=generator_supervision,
+                )
+                with torch.autocast(
+                    device_type=accelerator.device.type,
+                    dtype=torch.bfloat16,
+                ):
+                    encoded = model.encode_node_state(
+                        node_batch["emb"],
+                        node_batch["length"],
+                        node_batch["x"],
+                        node_batch["ground"],
+                        node_batch.get("ground_ids"),
+                        node_batch["node_rows"],
+                    )
+                for offset, node in enumerate(chunk_nodes):
+                    node_cache[node] = _fp32_cached_node_state(encoded, offset)
+    return node_cache
+
+
+def _score_val_universe_logits(
+    model: EgoStitchModel,
+    node_cache: Mapping[str, E2ENodeState],
+    reference: ValTopologyReference,
+    accelerator: Accelerator,
+    *,
+    edge_batch: int,
+) -> NDArray[np.float64] | None:
+    """Score the complete V_val pair universe's active-arm logits, exact DDP coverage.
+
+    Rank-strided over the ``u_idx``/``v_idx`` row order `val_universe_arrays`
+    fixes; every rank gathers and checks coverage identically (DDP fail-closed
+    -- a partial gather must never silently assemble the topology graph from a
+    subset of the universe). Active-arm logit only: no full/f_logit/dispersion
+    columns, since only the assembled graph is read from this pass.
+
+    Returns:
+        The row-ordered logit array on the main process; ``None`` elsewhere.
+
+    Raises:
+        ValueError: If the gathered rows do not cover the complete universe
+            exactly once, on every rank.
+    """
+    u_idx, v_idx = val_universe_arrays(reference.nodes)
+    n_rows = u_idx.shape[0]
+    rank, world = accelerator.process_index, accelerator.num_processes
+    row_ids = np.arange(rank, n_rows, world, dtype=np.int64)
+
+    logits_out: list[torch.Tensor] = []
+    with torch.no_grad():
+        for start in range(0, row_ids.shape[0], edge_batch):
+            chunk_rows = row_ids[start : start + edge_batch]
+            chunk_u = u_idx[chunk_rows]
+            chunk_v = v_idx[chunk_rows]
+            state_a = _stack_cached_node_states(node_cache, [reference.nodes[i] for i in chunk_u])
+            state_b = _stack_cached_node_states(node_cache, [reference.nodes[i] for i in chunk_v])
+            is_self = torch.from_numpy(chunk_u == chunk_v).to(accelerator.device)
+            masks = (
+                None
+                if model.cfg.classifier.permanent_null == "none"
+                else masks_for_null(
+                    model.cfg.classifier.permanent_null, len(chunk_rows), accelerator.device
+                )
+            )
+            with torch.autocast(device_type=accelerator.device.type, enabled=False):
+                context = model.build_pair_context_from_states(state_a, state_b, is_self)
+                active_logits = (
+                    model.score_pair_context(context)
+                    if masks is None
+                    else model.score_pair_context(context, masks=masks)
+                )
+            logits_out.append(active_logits.float())
+
+    local_logits = (
+        torch.cat(logits_out) if logits_out else torch.zeros(0, device=accelerator.device)
+    )
+    local_row_ids = torch.from_numpy(row_ids).to(accelerator.device)
+    padded_row_ids = accelerator.pad_across_processes(local_row_ids, dim=0, pad_index=-1)
+    padded_logits = accelerator.pad_across_processes(local_logits, dim=0, pad_index=0.0)
+    gathered_row_ids = accelerator.gather(padded_row_ids)
+    gathered_logits = accelerator.gather(padded_logits)
+
+    row_ids_np = gathered_row_ids.cpu().numpy()
+    logits_np = gathered_logits.cpu().numpy().astype(np.float64)
+    keep = row_ids_np >= 0
+    row_ids_np = row_ids_np[keep]
+    logits_np = logits_np[keep]
+    # `validate_gathered_validation` is the generic train_b0 DDP coverage
+    # check; it is labels-shaped by contract, so a zero dummy array stands in
+    # for the label return this scoring pass has no use for.
+    _, logits_sorted = validate_gathered_validation(
+        row_ids=row_ids_np,
+        labels=np.zeros_like(logits_np),
+        logits=logits_np,
+        expected_row_ids=np.arange(n_rows, dtype=np.int64),
+    )
+    if not accelerator.is_main_process:
+        return None
+    return logits_sorted
+
+
 def _validate_epoch(
     model: EgoStitchModel,
     data: EgoStitchData,
@@ -3290,6 +3521,14 @@ def _validate_epoch(
     `topology_delta_std` telemetry and checkpoint-selection tie-break apply
     only to the full ``none`` arm; permanent-null arms select by active-arm
     AUPRC without that topology tie-break.
+
+    A second, lean pass follows the classification one when
+    `data.val_topology_reference` is set (absent only for toy fixtures that
+    hand-build `val_pairs` with no derived V_val region): it scores the
+    complete V_val pair universe's active-arm logit (`_score_val_universe_logits`)
+    and feeds `val_region_topology_metrics` for the five topology metrics.
+    Both passes share one node-encoding cache built once over the complete
+    V_val region.
     """
     was_training = model.training
     model.eval()
@@ -3303,7 +3542,15 @@ def _validate_epoch(
     assert token_table is not None and token_node_index is not None, (
         "family egostitch_e2e requires token_table/token_node_index"
     )
-    unique_nodes = list(dict.fromkeys(node for row in shard_rows for node in data.val_pairs[row]))
+    # The complete V_val region when one was derived; the toy-fixture fallback
+    # (no `val_split`) keeps the old shard-local touched-node set, since those
+    # fixtures build `val_pairs` by hand with no V_val region behind them.
+    reference = data.val_topology_reference
+    encode_nodes = (
+        list(reference.nodes)
+        if reference is not None
+        else list(dict.fromkeys(node for row in shard_rows for node in data.val_pairs[row]))
+    )
 
     def synchronize_device() -> None:
         if accelerator.device.type == "cuda":
@@ -3311,7 +3558,22 @@ def _validate_epoch(
 
     synchronize_device()
     node_cache_started = time.monotonic()
-    node_cache: dict[str, E2ENodeState] = {}
+    generator_supervision = isinstance(model.generator, EgoStitchImagineGenerator)
+    # Shared by the classification pass below and the topology-universe pass
+    # after it, so every V_val node is encoded exactly once per epoch.
+    node_cache = _e2e_encode_node_cache(
+        model,
+        data,
+        token_table,
+        token_node_index,
+        encode_nodes,
+        accelerator,
+        edge_batch=edge_batch,
+        generator_supervision=generator_supervision,
+    )
+    synchronize_device()
+    node_cache_seconds = time.monotonic() - node_cache_started
+
     values_out: list[torch.Tensor] = []
     # Validation may run inside an outer autocast context (for example the
     # CPU bf16 contract test).  `inference_mode` can then seed autocast's
@@ -3319,42 +3581,6 @@ def _validate_epoch(
     # to save for backward.  `no_grad` preserves eval semantics without
     # contaminating the following optimizer step.
     with torch.no_grad():
-        generator_supervision = isinstance(model.generator, EgoStitchImagineGenerator)
-        length_buckets: dict[int, list[str]] = {}
-        for node in unique_nodes:
-            length = token_table.manifest.nodes[token_node_index[node]].length
-            bucket = next(
-                (boundary for boundary in (128, 256, 384, 512, 768, 1024) if length <= boundary),
-                length,
-            )
-            length_buckets.setdefault(bucket, []).append(node)
-        for bucket_nodes in length_buckets.values():
-            for start in range(0, len(bucket_nodes), edge_batch):
-                nodes = bucket_nodes[start : start + edge_batch]
-                node_batch = _e2e_validation_node_batch(
-                    data,
-                    token_table,
-                    token_node_index,
-                    nodes,
-                    accelerator.device,
-                    generator_supervision=generator_supervision,
-                )
-                with torch.autocast(
-                    device_type=accelerator.device.type,
-                    dtype=torch.bfloat16,
-                ):
-                    encoded = model.encode_node_state(
-                        node_batch["emb"],
-                        node_batch["length"],
-                        node_batch["x"],
-                        node_batch["ground"],
-                        node_batch.get("ground_ids"),
-                        node_batch["node_rows"],
-                    )
-                for offset, node in enumerate(nodes):
-                    node_cache[node] = _fp32_cached_node_state(encoded, offset)
-        synchronize_device()
-        node_cache_seconds = time.monotonic() - node_cache_started
         pair_scoring_started = time.monotonic()
         shard_rows.sort(
             key=lambda row: (
@@ -3508,6 +3734,20 @@ def _validate_epoch(
     pair_scoring_seconds = float(phase_timing_rows[:, 1].max().item())
     gathered_values = accelerator.gather(local_values)
     gathered_rows = accelerator.gather(local_rows)
+
+    # Lean topology-universe pass: active-arm logit only, over the complete
+    # V_val pair universe. Runs on every rank (its own rank-strided gather and
+    # exact-coverage check), mirroring the classification pass's DDP-fail-
+    # closed discipline -- a partial gather here would silently assemble the
+    # topology graph from a subset of the universe.
+    universe_started = time.monotonic()
+    universe_logits = (
+        _score_val_universe_logits(model, node_cache, reference, accelerator, edge_batch=edge_batch)
+        if reference is not None
+        else None
+    )
+    universe_seconds = time.monotonic() - universe_started
+
     if was_training:
         model.train()
     if not accelerator.is_main_process:
@@ -3558,7 +3798,15 @@ def _validate_epoch(
         for name, values in zip(scale_names, ordered[:, 8:12].T, strict=True)
     }
     endpoint_degree = _e2e_validation_endpoint_degrees(data)
-    validation_topology = _validation_topology_metrics(data, logits_np)
+    if reference is not None and universe_logits is not None:
+        u_idx, v_idx = val_universe_arrays(reference.nodes)
+        validation_topology = val_region_topology_metrics(
+            u_idx=u_idx, v_idx=v_idx, logits=universe_logits, reference=reference
+        )
+    else:
+        validation_topology = TopologyValidationMetrics(
+            gs=0.0, rd=0.0, degree_mmd=0.0, clustering_mmd=0.0, spectral_mmd=0.0
+        )
     fidelity = {
         "active_logit_std": active_std,
         "f_logit_std": f_std,
@@ -3566,11 +3814,11 @@ def _validate_epoch(
         "topology_delta_std": residual_std,
         "topology_delta_ratio": residual_std / max(f_std, 1e-12),
         "selection_tiebreak": 0.0,
-        "gs": validation_topology.gs,
-        "rd": validation_topology.rd,
-        "degree_mmd": validation_topology.degree_mmd,
-        "clustering_mmd": validation_topology.clustering_mmd,
-        "spectral_mmd": validation_topology.spectral_mmd,
+        "gs_bfs": validation_topology.gs,
+        "rd_bfs": validation_topology.rd,
+        "degree_mmd_ratio": validation_topology.degree_mmd,
+        "clustering_mmd_ratio": validation_topology.clustering_mmd,
+        "spectral_mmd_ratio": validation_topology.spectral_mmd,
         "prevalence": float(np.mean(data.val_labels)),
         **dispersion_summary,
         **e2e_degree_decorrelation_telemetry(endpoint_degree, full_np - f_np),
@@ -3585,6 +3833,7 @@ def _validate_epoch(
             "node_cache_encode_seconds": node_cache_seconds,
             "pair_scoring_seconds": pair_scoring_seconds,
             "gather_metrics_seconds": gather_metrics_seconds,
+            "val_universe_scoring_seconds": universe_seconds,
         },
         active_logits=np.asarray(logits_np, dtype="<f4"),
     )
@@ -4217,7 +4466,7 @@ def _enforce_e2e_initial_slot_health(
             off the main process, so a rank-0-only raise is a DDP hang.
     """
     # This guard measures learned SlotSet geometry. FullOracleGenerator has no
-    # slots, plan, or trainable generator state, so running a complete V_hold
+    # slots, plan, or trainable generator state, so running a complete V_val
     # scoring pass here cannot evaluate the guard. Return before touching the
     # validation population or model state; ordinary epoch validation remains
     # unchanged and still supplies the diagnostic's selection metrics.
@@ -4344,12 +4593,12 @@ def _train_e2e_stability_loop(
         relational_supervision=(model.encoder is not None and model.encoder.rel_head is not None),
     )
 
-    validation_events_path = cfg.output_dir / V_HOLD_VALIDATION_EVENTS_FILENAME
+    validation_events_path = cfg.output_dir / VAL_REGION_VALIDATION_EVENTS_FILENAME
     if accelerator.is_main_process:
         cfg.output_dir.mkdir(parents=True, exist_ok=True)
         if validation_events_path.exists():
             raise FileExistsError(
-                f"V_hold validation-event ledger already exists: {validation_events_path}"
+                f"V_val validation-event ledger already exists: {validation_events_path}"
             )
         validation_events_path.touch()
     accelerator.wait_for_everyone()
@@ -4372,10 +4621,10 @@ def _train_e2e_stability_loop(
             metadata_path = cfg.output_dir / "run_metadata.json"
             if metadata_path.is_file():
                 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                metadata["v_hold_validation_evidence"] = {
-                    "schema": "egostitch_e2e_v_hold_validation_events_v1",
+                metadata["val_region_validation_evidence"] = {
+                    "schema": "egostitch_e2e_val_region_validation_events_v1",
                     "count": len(validation_events),
-                    "path": V_HOLD_VALIDATION_EVENTS_FILENAME,
+                    "path": VAL_REGION_VALIDATION_EVENTS_FILENAME,
                     "sha256": _sha256_file(validation_events_path),
                 }
                 metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
@@ -4388,8 +4637,9 @@ def _train_e2e_stability_loop(
     #
     # It is deliberately not gated on `profile_only`: a guard a flag can skip
     # is a guard that fails open. The cost is one extra full validation pass
-    # over C(|V_hold|, 2) rows per run, charged before the peak-memory counter
-    # is reset below and therefore outside the measured training peak.
+    # over the complete V_val pair universe per run, charged before the
+    # peak-memory counter is reset below and therefore outside the measured
+    # training peak.
     initial_slot_health = _enforce_e2e_initial_slot_health(
         model,
         data,
@@ -4879,11 +5129,11 @@ def _train_e2e_stability_loop(
                 "brier": metrics.brier,
                 "prevalence": fidelity["prevalence"],
                 "active_logit_std": fidelity["active_logit_std"],
-                "gs": fidelity["gs"],
-                "rd": fidelity["rd"],
-                "degree_mmd": fidelity["degree_mmd"],
-                "clustering_mmd": fidelity["clustering_mmd"],
-                "spectral_mmd": fidelity["spectral_mmd"],
+                "gs_bfs": fidelity["gs_bfs"],
+                "rd_bfs": fidelity["rd_bfs"],
+                "degree_mmd_ratio": fidelity["degree_mmd_ratio"],
+                "clustering_mmd_ratio": fidelity["clustering_mmd_ratio"],
+                "spectral_mmd_ratio": fidelity["spectral_mmd_ratio"],
                 "f_logit_std": fidelity["f_logit_std"],
                 "f_logit_auprc": fidelity["f_logit_auprc"],
                 "h_pairwise_cosine_mean": fidelity["h_pairwise_cosine_mean"],
@@ -4976,11 +5226,11 @@ def _train_e2e_stability_loop(
                 auprc=metrics.auprc,
                 prevalence=fidelity["prevalence"],
                 active_logit_std=fidelity["active_logit_std"],
-                gs=fidelity["gs"],
-                rd=fidelity["rd"],
-                degree_mmd=fidelity["degree_mmd"],
-                clustering_mmd=fidelity["clustering_mmd"],
-                spectral_mmd=fidelity["spectral_mmd"],
+                gs=fidelity["gs_bfs"],
+                rd=fidelity["rd_bfs"],
+                degree_mmd=fidelity["degree_mmd_ratio"],
+                clustering_mmd=fidelity["clustering_mmd_ratio"],
+                spectral_mmd=fidelity["spectral_mmd_ratio"],
                 brier=metrics.brier,
                 warm_reference_std=warm_reference_std,
                 warm_reference_auprc=warm_reference_auprc,
@@ -5193,7 +5443,7 @@ def _train_e2e_stability_loop(
             "nodes_sha256": bytes(access_digest_rows[index].tolist()).hex(),
             "f0_row_count": int(row_access_counts[index]),
             "f0_rows_sha256": bytes(row_access_digest_rows[index].tolist()).hex(),
-            "all_nodes_within_v_fit": bool(access_valid[index]),
+            "all_nodes_within_training_universe": bool(access_valid[index]),
         }
         for index in range(world)
     ]
@@ -5203,8 +5453,8 @@ def _train_e2e_stability_loop(
     runtime_profile: dict[str, object] = {
         "epochs_completed": len(epoch_step_counts),
         "validations_completed": len(epoch_step_counts),
-        "v_hold_validation_event_count": len(validation_events),
-        "v_hold_validation_events": validation_events,
+        "val_region_validation_event_count": len(validation_events),
+        "val_region_validation_events": validation_events,
         "peak_memory_gib_per_rank": [float(row[4]) for row in rank_stats],
         "steady_state_data_wait_fraction": max(
             float(row[3] / row[2]) if row[2] > 0 else 0.0 for row in rank_stats
@@ -5364,7 +5614,7 @@ def train_egostitch_ddp_loop(
 # --------------------------------------------------------------------------- artifacts
 
 
-V_HOLD_VALIDATION_EVENTS_FILENAME = "v_hold_validation_events.jsonl"
+VAL_REGION_VALIDATION_EVENTS_FILENAME = "val_region_validation_events.jsonl"
 
 _MODEL_CONFIG_HASH_SCHEMA = "egostitch_e2e_model_config_v3"
 
@@ -5490,8 +5740,8 @@ def write_outputs(
     expected_run_kind = "debug" if debug else (cfg.run_kind or "formal")
     if run_metadata.get("run_kind") != expected_run_kind:
         raise RuntimeError("run kind changed after run start; refusing to finalize artifacts")
-    validation_events = result.runtime_profile.get("v_hold_validation_events")
-    validation_event_count = result.runtime_profile.get("v_hold_validation_event_count")
+    validation_events = result.runtime_profile.get("val_region_validation_events")
+    validation_event_count = result.runtime_profile.get("val_region_validation_event_count")
     validation_evidence: dict[str, object] | None = None
     if validation_events is not None or validation_event_count is not None:
         if (
@@ -5500,21 +5750,21 @@ def write_outputs(
             or not isinstance(validation_event_count, int)
             or validation_event_count != len(validation_events)
         ):
-            raise RuntimeError("invalid V_hold validation-event count in runtime profile")
-        validation_events_path = output_dir / V_HOLD_VALIDATION_EVENTS_FILENAME
+            raise RuntimeError("invalid V_val validation-event count in runtime profile")
+        validation_events_path = output_dir / VAL_REGION_VALIDATION_EVENTS_FILENAME
         if not validation_events_path.is_file():
-            raise RuntimeError("V_hold validation-event ledger is missing")
+            raise RuntimeError("V_val validation-event ledger is missing")
         persisted_events = [
             json.loads(line)
             for line in validation_events_path.read_text(encoding="utf-8").splitlines()
             if line
         ]
         if persisted_events != validation_events:
-            raise RuntimeError("V_hold validation-event ledger disagrees with runtime profile")
+            raise RuntimeError("V_val validation-event ledger disagrees with runtime profile")
         validation_evidence = {
-            "schema": "egostitch_e2e_v_hold_validation_events_v1",
+            "schema": "egostitch_e2e_val_region_validation_events_v1",
             "count": validation_event_count,
-            "path": V_HOLD_VALIDATION_EVENTS_FILENAME,
+            "path": VAL_REGION_VALIDATION_EVENTS_FILENAME,
             "sha256": _sha256_file(validation_events_path),
         }
 
@@ -5571,7 +5821,7 @@ def write_outputs(
             "diagnostic_checkpoint_epoch": None,
             "validation_liveness_pass": validation_liveness_observed,
             "validation_role": data.validation_role,
-            "v_hold_validation_evidence": validation_evidence,
+            "val_region_validation_evidence": validation_evidence,
             "access_audit": data.access_audit,
             "kendall_fallback": result.kendall_state,
             "training_diagnostics": {
@@ -5608,7 +5858,7 @@ def _bind_feature_standardization(
     Args:
         model: The freshly constructed E2E model.
         cfg: The loaded run configuration.
-        data: The assembled training data, carrying the V_fit statistics.
+        data: The assembled training data, carrying the training-universe statistics.
 
     Returns:
         The bound `feature_stats_sha256`, or ``""`` for the `row_layernorm`
@@ -5654,55 +5904,53 @@ def _bind_feature_standardization(
 def _oracle_truth_graph(data: EgoStitchData, *, truth_source: str, run_kind: str) -> nx.Graph:
     """Return the oracle source graph named by ``generator.oracle_truth_source``.
 
-    ``g_fit`` is the protocol-clean training structural graph (spec Sec 9.3/9.4);
-    under it every ``V_hold`` node is absent and gets an empty scaffold, which is
-    why the original R1 run was not an oracle ceiling for inductive validation.
-    ``g_fit_plus_v_hold`` attaches the internal ``V_hold`` positive graph as a
-    disjoint component so held-out nodes get their true scaffold. That is a
-    deliberate held-out-truth leak: it is accepted only under ``--run-kind
-    diagnostic`` and is stamped into `EgoStitchData.access_audit`. Stitch-time
-    leave-one-out still masks the queried partner, so the queried edge itself is
-    never handed to the classifier.
+    ``training_structure`` is the protocol-clean training structural graph
+    (spec Sec 9.3/9.4); it already carries every V_val node via its legal
+    cross-boundary edges, so a V_val node's cross-boundary scaffold is visible
+    under this source alone. ``training_structure_plus_g_val`` additionally
+    overlays the V_val-internal positives the training graph excludes by
+    construction, so a V_val node's within-region neighbors also appear. That
+    overlay is a deliberate held-out-truth leak: it is accepted only under
+    ``--run-kind diagnostic`` and is stamped into `EgoStitchData.access_audit`.
+    Stitch-time leave-one-out still masks the queried partner, so the queried
+    edge itself is never handed to the classifier.
 
     Args:
-        data: The assembled training data (`EgoTargetBuilder` + V_hold manifest).
+        data: The assembled training data (`EgoTargetBuilder` + V_val split).
         truth_source: The configured `GeneratorConfig.oracle_truth_source`.
         run_kind: Effective execution context, used to keep held-out truth out of
             any run that publishes formal artifacts.
 
     Returns:
-        `EgoTargetBuilder.graph` itself for ``g_fit``, or a copy extended with the
-        V_hold positive component.
+        `EgoTargetBuilder.graph` itself for ``training_structure``, or a copy
+        extended with the loopless V_val positive overlay.
 
     Raises:
-        RuntimeError: If held-out truth is requested outside a diagnostic run, if
-            V_hold carries no positive edges, or if V_fit and V_hold share a node
-            (which would make the addition non-disjoint).
+        RuntimeError: If held-out truth is requested outside a diagnostic run,
+            or if V_val carries no positive edges.
     """
-    if truth_source == "g_fit":
+    if truth_source == "training_structure":
         return data.target_builder.graph
     if run_kind != "diagnostic":
-        raise RuntimeError("oracle_truth_source='g_fit_plus_v_hold' requires --run-kind diagnostic")
-    hold_edges = data.validation_positive_edges
-    if not hold_edges:
-        raise RuntimeError("true-oracle diagnostic requires non-empty V_hold positive edges")
-    overlap = set(data.validation_nodes).intersection(data.target_builder.graph)
-    if overlap:
         raise RuntimeError(
-            "true-oracle diagnostic requires node-disjoint V_fit/V_hold; "
-            f"found {len(overlap)} overlapping node(s)"
+            "oracle_truth_source='training_structure_plus_g_val' requires --run-kind diagnostic"
         )
+    val_edges = data.validation_positive_edges
+    if not val_edges:
+        raise RuntimeError("true-oracle diagnostic requires non-empty V_val positive edges")
     graph = nx.Graph(data.target_builder.graph)
     graph.add_nodes_from(data.validation_nodes)
-    graph.add_edges_from(hold_edges)
+    # Loopless: the structural overlay carries no self-loops, matching
+    # `ValRegionSplit.build_training_graph`'s own convention.
+    graph.add_edges_from((u, v) for u, v in val_edges if u != v)
     audit = data.access_audit if data.access_audit is not None else {}
     audit["oracle_truth"] = {
         "source": truth_source,
         "diagnostic_only": True,
-        "v_hold_node_count": len(data.validation_nodes),
-        "v_hold_positive_edge_count": len(hold_edges),
-        "v_hold_positive_edges_sha256": hashlib.sha256(
-            json.dumps(sorted(hold_edges), separators=(",", ":")).encode("utf-8")
+        "val_region_node_count": len(data.validation_nodes),
+        "val_region_positive_edge_count": len(val_edges),
+        "val_region_positive_edges_sha256": hashlib.sha256(
+            json.dumps(sorted(val_edges), separators=(",", ":")).encode("utf-8")
         ).hexdigest(),
         "queried_partner_masked_at_stitch": True,
     }
@@ -5716,10 +5964,11 @@ def _install_oracle_context(model: EgoStitchModel, data: EgoStitchData, *, run_k
     Runs once at startup, after the model is built and `_bind_feature_standardization`
     has called `EgoStitchModel.set_feature_stats` (Wave-1 oracle-scaffold
     design). One table row is built per node in the F0 universe (``data.f0``
-    / ``data.node_index``, ``V_fit ∪ V_hold``), in F0-row order, so the
-    F0-row -> table-row lookup `OracleStructGenerator.set_oracle_context`
-    needs is simply the identity permutation (``arange``) -- table row ``r``
-    describes exactly the node at F0 row ``r``.
+    / ``data.node_index``, the training universe -- which already contains
+    every V_val node), in F0-row order, so the F0-row -> table-row lookup
+    `OracleStructGenerator.set_oracle_context` needs is simply the identity
+    permutation (``arange``) -- table row ``r`` describes exactly the node at
+    F0 row ``r``.
 
     The source graph is whichever one `_oracle_truth_graph` returns for the
     configured ``generator.oracle_truth_source``.
@@ -5863,7 +6112,7 @@ def _run_ddp_dispatch(
     # (design §3.4), so there is nothing to center for either arm.
     if isinstance(model.generator, EgoStitchImagineGenerator):
         degree_prior = e2e_degree_prior_init(model, data)
-        logger.info("degree head centered on G_fit prior mean(log d)=%.6f", degree_prior)
+        logger.info("degree head centered on G_train prior mean(log d)=%.6f", degree_prior)
     else:
         logger.info(
             "skipping degree-prior centering: %s generator has no degree head",

@@ -480,10 +480,10 @@ def run_test_protocol(
     output_dir.mkdir(parents=True, exist_ok=True)
     scores_dir = output_dir / "scores"
     scores_dir.mkdir(parents=True, exist_ok=True)
-    legacy_artifacts = [output_dir / "operating_point.json", scores_dir / "v_hold.npz"]
+    legacy_artifacts = [output_dir / "operating_point.json"]
     stale = [str(path) for path in legacy_artifacts if path.exists()]
     if stale:
-        raise ValueError(f"remove obsolete max-F1/V_hold test artifacts before scoring: {stale}")
+        raise ValueError(f"remove obsolete max-F1 test artifacts before scoring: {stale}")
 
     # Fix for the P1 defect where this module clobbered a published
     # run_metadata.json: validate it in place (if present) and write this

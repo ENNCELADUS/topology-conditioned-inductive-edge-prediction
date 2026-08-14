@@ -2,11 +2,10 @@
 
 Written by `src.distill.teacher_targets` and read by the KD trainer
 (`src/train_egostitch.py`'s `_BatchFactory`, a later wave). Format tag
-``"kd_targets_v1"``. `truth_source` is always ``"g_fit_only"``: the
-teacher-scoring dumper refuses to bind any other truth graph, so an artifact
-claiming a different source is not one this loader can trust and is rejected
-rather than silently accepted (mirrors the validation style of
-`src.experiments.probes.write_e2e_probe_artifact`/`evaluate_e2e_probe_artifact`).
+``"kd_targets_v2"``. `truth_source` is always ``"training_structure"``: the
+V_val-quarantined training graph over all train nodes (cross-boundary edges
+included, V_val-internal pairs excluded); pre-V_val ``"g_fit_only"`` artifacts
+carry a different stamp so the two teacher semantics stay distinguishable.
 """
 
 from __future__ import annotations
@@ -21,8 +20,8 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
-KD_TARGETS_FORMAT = "kd_targets_v1"
-TRUTH_SOURCE = "g_fit_only"
+KD_TARGETS_FORMAT = "kd_targets_v2"
+TRUTH_SOURCE = "training_structure"
 
 _NPZ_NAME = "targets.npz"
 _MANIFEST_NAME = "manifest.json"

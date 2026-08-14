@@ -126,13 +126,6 @@ def test_runner_discovers_visible_h20s() -> None:
     assert "automatically" in (HPC_DIR / "README.md").read_text()
 
 
-def test_runner_launches_exact_v_hold_checkpoint_recovery_with_all_gpus() -> None:
-    text = RUNNER.read_text()
-    assert "recover-v-hold)" in text
-    assert '--num_processes "${GPU_COUNT}" --mixed_precision bf16' in text
-    assert "-m src.experiments.v_hold_checkpoint_recovery" in text
-
-
 def test_docs_describe_auto_sized_h20_runtime() -> None:
     hpc = (HPC_DIR / "README.md").read_text()
     readme = (REPO_ROOT / "README.md").read_text()

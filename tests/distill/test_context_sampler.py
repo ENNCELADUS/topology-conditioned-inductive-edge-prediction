@@ -115,7 +115,7 @@ def test_rejects_a_node_universe_that_is_not_sorted() -> None:
         sample_context_sets(graph, node_ids, seed=0, k_near=1, k_rand=1)
 
 
-def test_rejects_a_node_missing_from_g_fit() -> None:
+def test_rejects_a_node_missing_from_truth_graph() -> None:
     graph = _chain_graph(5)
     node_ids = [*sorted(graph.nodes), "phantom"]
     with pytest.raises(ValueError, match="absent"):
@@ -132,3 +132,75 @@ def test_small_universe_caps_rand_context_without_crashing() -> None:
     for anchor_position in range(len(node_ids)):
         start, end = _group(context, anchor_position)
         assert end - start <= len(node_ids) - 1
+
+
+# --------------------------------------------------------------------------- forbidden_internal
+
+
+def _relay_graph() -> nx.Graph:
+    """`v_a` and `v_b` are 2 hops apart only via the non-member `relay`.
+
+    `v_a` also has a direct (1-hop) non-member neighbor `x1`, and six more
+    nodes `y0..y5` sit outside both the near reach of `v_a` and the
+    `{v_a, v_b}` quarantined set, so they are the only legal random-pool
+    candidates for `v_a` once `relay`/`x1` are claimed by its near pool.
+    """
+    graph = nx.Graph()
+    graph.add_edges_from([("v_a", "relay"), ("relay", "v_b"), ("v_a", "x1")])
+    graph.add_nodes_from([f"y{i}" for i in range(6)])
+    return graph
+
+
+def test_forbidden_internal_excludes_a_two_hop_relay_partner_from_near_and_random_pools() -> None:
+    graph = _relay_graph()
+    node_ids = sorted(graph.nodes)
+    forbidden_internal = frozenset({"v_a", "v_b"})
+
+    context = sample_context_sets(
+        graph, node_ids, seed=0, k_near=10, k_rand=10, forbidden_internal=forbidden_internal
+    )
+
+    anchor_position = node_ids.index("v_a")
+    start, end = _group(context, anchor_position)
+    near_partners = {
+        node_ids[context.partner_idx[row]] for row in range(start, end) if context.is_near[row]
+    }
+    random_partners = {
+        node_ids[context.partner_idx[row]] for row in range(start, end) if not context.is_near[row]
+    }
+
+    # v_b is a <=2-hop candidate (via relay) that the quarantine must drop
+    # from both pools; relay and x1 are non-members and stay eligible.
+    assert "v_b" not in near_partners
+    assert "v_b" not in random_partners
+    assert near_partners == {"relay", "x1"}
+    assert random_partners == {f"y{i}" for i in range(6)}
+
+
+def test_forbidden_internal_leaves_a_non_member_anchor_unaffected() -> None:
+    graph = _relay_graph()
+    node_ids = sorted(graph.nodes)
+    forbidden_internal = frozenset({"v_a", "v_b"})
+
+    context = sample_context_sets(
+        graph, node_ids, seed=0, k_near=10, k_rand=10, forbidden_internal=forbidden_internal
+    )
+
+    # `relay` is not itself a quarantined member, so pairing it with v_a/v_b
+    # is a legal cross-boundary context row -- the guard must not touch it.
+    anchor_position = node_ids.index("relay")
+    start, end = _group(context, anchor_position)
+    near_partners = {node_ids[context.partner_idx[row]] for row in range(start, end)}
+    assert {"v_a", "v_b"} <= near_partners
+
+
+def test_forbidden_internal_defaults_to_no_exclusion() -> None:
+    graph = _relay_graph()
+    node_ids = sorted(graph.nodes)
+
+    with_default = sample_context_sets(graph, node_ids, seed=0, k_near=10, k_rand=10)
+    with_empty = sample_context_sets(
+        graph, node_ids, seed=0, k_near=10, k_rand=10, forbidden_internal=frozenset()
+    )
+
+    np.testing.assert_array_equal(with_default.partner_idx, with_empty.partner_idx)

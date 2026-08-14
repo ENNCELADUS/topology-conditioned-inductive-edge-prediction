@@ -53,15 +53,15 @@ engineering validity, and the scientific verdict are reported separately.
 
 ### 2.2 Universes and operating points
 
-- Training and held-out nodes are disjoint. `V_hold` is the deterministic 512-node
-  internal holdout and is never training input.
+- Training and test nodes are disjoint. `V_val` is a pair-disjoint (not node-disjoint) BFS-grown internal
+  region: cross-boundary edges train; only V_val-internal pairs are withheld, never fully inductive, unlike test.
 - Pairwise metrics use the fixed benchmark test-pair artifact. AUROC and AUPRC are
   threshold-free; Accuracy, F1, and MCC use threshold 0.5.
 - Graph metrics use the full candidate universe. The canonical baseline/oracle table
   uses each scorer's density-matched threshold. S1 uses the same 30,128 non-self-edge
   target and fixes the self-loop treatment across arms.
 - Threshold selection, quota construction, and any learned coupling must be fixed on
-  training data or `V_hold`. The evaluator-provided reference edge count may define a
+  training data or `V_val`. The evaluator-provided reference edge count may define a
   density-matched operating point; hidden labels, node degrees, and other test topology
   may influence predictions only in an explicitly diagnostic oracle.
 
@@ -253,7 +253,7 @@ allocation while retaining the two-endpoint inference contract.
    threshold or aggregate substitutes for a fixed gate.
 2. Preserve provenance. Oracle, S0, S0-R, S1-R, and any test-informed follow-up remain
    `formal:false` even when their execution is valid.
-3. Fit model selection and legal assembly choices on training data or `V_hold`, then
+3. Fit model selection and legal assembly choices on training data or `V_val`, then
    evaluate test/candidate artifacts once. Never tune on test topology.
 4. Bind every comparison to the same frozen features, node split, candidate universe,
    self-loop convention, checkpoint, and edge-count policy.

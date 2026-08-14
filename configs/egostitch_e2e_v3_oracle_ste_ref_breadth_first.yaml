@@ -1,8 +1,8 @@
-# EgoStitch true-oracle V_hold-truth DIAGNOSTIC reference arm (docs/superpowers/
+# EgoStitch true-oracle V_val-truth DIAGNOSTIC reference arm (docs/superpowers/
 # specs/2026-08-04-oracle-scaffold-experiment-design.md): same
-# `generator.name: "oracle_struct"` (G_fit plus internal V_hold positives,
-# leave-one-out partner masking at stitch time) as the `..._oracle_grit_*_...`
-# ladder, but paired
+# `generator.name: "oracle_struct"` (training_structure plus internal V_val
+# positives, leave-one-out partner masking at stitch time) as the
+# `..._oracle_grit_*_...` ladder, but paired
 # with the existing `ste_typed` encoder at its standard dims (128/3, same
 # as `full`/`null_generator`/etc.) instead of the new `grit_gmt` encoder.
 # This arm exists to separate "does the oracle signal help at all" from
@@ -32,7 +32,7 @@ model:
     generator:
       name: oracle_struct
       oracle_seed: 0
-      oracle_truth_source: g_fit_plus_v_hold
+      oracle_truth_source: training_structure_plus_g_val
       n_ground: 50
       feature_standardization: row_layernorm
     encoder:
@@ -107,7 +107,7 @@ mixed_precision: "bf16"
 
 runtime:
   world_size: auto
-  pack_dir: outputs/feature_packs/egostitch_e2e_v_hold_ng50
+  pack_dir: outputs/feature_packs/egostitch_e2e_v_val_ng50
   pack_workers: 8
   loader_workers_per_rank: 0
   prefetch_factor: 2

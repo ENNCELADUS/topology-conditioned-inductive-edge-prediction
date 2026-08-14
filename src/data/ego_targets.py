@@ -1,10 +1,10 @@
 """Ego-net structural targets from ``G_struct`` (spec Sec 6, Sec 9.3, Sec 13.4/13.6).
 
-Everything structural derives from the shared training-interaction ``G_struct`` — never
-from ``train_graph.pkl`` (quarantined, spec Sec 9.3). Self-loops are already
-absent (`build_g_struct` strips them). Edge-stream callers enforce leave-one-out
-(spec Sec 6) explicitly by passing each queried partner through
-``exclude_neighbors``; node-stream targets use the complete topology.
+Everything structural derives from the shared training-interaction ``G_struct`` — never from
+``train_graph.pkl`` directly (the V_val split substrate; barred from structural-target
+supervision). Self-loops are already absent (`build_g_struct` strips them). Edge-stream
+callers enforce leave-one-out (spec Sec 6) explicitly by passing each queried partner
+through ``exclude_neighbors``; node-stream targets use the complete topology.
 
 Hub policy (spec Sec 13.4): when ``|N(u)| > K``, neighbors are stratified by
 ``deg_G_struct`` log2 bucket; largest-remainder proportional allocation capped

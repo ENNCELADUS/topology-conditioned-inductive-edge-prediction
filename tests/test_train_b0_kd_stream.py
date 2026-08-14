@@ -79,12 +79,14 @@ def _stream(
     rank: int = 0,
     world_size: int = 1,
     allowed_nodes: frozenset[str] | None = None,
+    forbidden_internal_nodes: frozenset[str] = frozenset(),
 ) -> KDStream:
     return KDStream(
         distill,
         _targets(),
         cast(PackedFeatureTable, _FakeTable()),
         allowed_nodes=allowed_nodes if allowed_nodes is not None else frozenset(_NODE_IDS),
+        forbidden_internal_nodes=forbidden_internal_nodes,
         seed=0,
         rank=rank,
         world_size=world_size,
@@ -93,8 +95,18 @@ def _stream(
 
 def test_targets_outside_training_universe_fail_closed() -> None:
     distill = DistillConfig(targets_path="t", w_label=1.0)
-    with pytest.raises(ValueError, match="outside the V_fit training universe"):
+    with pytest.raises(ValueError, match="outside the training universe"):
         _stream(distill, allowed_nodes=frozenset({"node_a", "node_b"}))
+
+
+def test_target_pair_inside_v_val_fails_closed() -> None:
+    # _targets()'s anchor 0 (node_a) has partner rows to node_b and node_c
+    # (partner = (anchor + 1/2) % 4); a V_val region covering node_a and
+    # node_b must be refused at the pair level even though every individual
+    # node is inside `allowed_nodes`.
+    distill = DistillConfig(targets_path="t", w_label=1.0)
+    with pytest.raises(ValueError, match="KD target pair inside the V_val validation region"):
+        _stream(distill, forbidden_internal_nodes=frozenset({"node_a", "node_b"}))
 
 
 def test_anchor_positions_are_deterministic_and_rank_disjoint() -> None:

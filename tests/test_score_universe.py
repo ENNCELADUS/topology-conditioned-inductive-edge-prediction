@@ -28,6 +28,7 @@ from src.data.feature_stats import compute_feature_stats
 from src.data.features import FeatureStore, build_f0_matrix
 from src.data.grounding import build_grounding_pool
 from src.data.packed_features import PackedFeatureTable, build_packed_features
+from src.data.val_region import ValRegionParams, derive_val_region_split, val_universe_arrays
 from src.model.egostitch.classifier.b0_v31 import V3_1, B0V31PairClassifier, GatedCrossAttention
 from src.model.egostitch.composite import E2ENodeState, E2EPairContext, EgoStitchModel
 from src.model.egostitch.config import E2EConfig, GeneratorConfig
@@ -1030,15 +1031,28 @@ def _egostitch_e2e_setup(
 def _egostitch_e2e_score_args(
     tmp_path: Path, data_root: Path, checkpoint: Path, pairs: Path, output: Path
 ) -> list[str]:
-    val_pairs = data_root / "benchmark_2025_neurips" / "breadth_first" / "val_edges.txt"
-    val_pairs.parent.mkdir(parents=True, exist_ok=True)
-    val_pairs.write_bytes(pairs.read_bytes())
+    """Build a `score` CLI arg list for a generic (not held-out-focused) e2e test.
+
+    `val` (val_edges.txt) is retired, so every named source now requires the
+    held-out test-access ledger. Writes `pairs` to `test_edges.txt` and mints
+    a fresh, `output`-scoped `--run-metadata` (arm keyed by `output.stem`, so
+    two different `output` paths never collide on the same ledger epoch even
+    though they share one ledger file per directory).
+    """
+    test_pairs = data_root / "benchmark_2025_neurips" / "breadth_first" / "test_edges.txt"
+    test_pairs.parent.mkdir(parents=True, exist_ok=True)
+    test_pairs.write_bytes(pairs.read_bytes())
+    output.parent.mkdir(parents=True, exist_ok=True)
+    run_metadata = output.parent / f"{output.stem}_run_metadata.json"
+    run_metadata.write_text(
+        json.dumps({"arm": f"score_args_{output.stem}", "seed": 0}), encoding="utf-8"
+    )
     return [
         "score",
         "--checkpoint",
         str(checkpoint),
         "--pairs",
-        "val",
+        "test",
         "--data-root",
         str(data_root),
         "--output",
@@ -1049,6 +1063,8 @@ def _egostitch_e2e_score_args(
         str(tmp_path / "f0_cache.pt"),
         "--device",
         "cpu",
+        "--run-metadata",
+        str(run_metadata),
     ]
 
 
@@ -1152,7 +1168,12 @@ def test_egostitch_e2e_null_arm_merge_preserves_true_full_logit(
     shard_paths = [
         output.with_name(f"{output.stem}.shard-{shard}{output.suffix}") for shard in range(2)
     ]
-    merged_path = tmp_path / f"{permanent_null}-merged.npz"
+    # Merge destination must equal the shards' own unsharded `--output`
+    # reference (the production convention `src/score_fanout.py` follows):
+    # the held-out test-access ledger binds each shard's record to that exact
+    # path, and `save_scores` re-validates the binding against wherever the
+    # merged artifact is actually written.
+    merged_path = output
     score_universe.main(
         ["merge", "--inputs", *(str(path) for path in shard_paths), "--output", str(merged_path)]
     )
@@ -1809,7 +1830,12 @@ def test_egostitch_e2e_merge_preserves_two_arrays_in_manifest_order(tmp_path: Pa
     shard_paths = [
         output.with_name(f"{output.stem}.shard-{shard}{output.suffix}") for shard in range(2)
     ]
-    merged_path = tmp_path / "merged.npz"
+    # Merge destination must equal the shards' own unsharded `--output`
+    # reference (the production convention `src/score_fanout.py` follows):
+    # the held-out test-access ledger binds each shard's record to that exact
+    # path, and `save_scores` re-validates the binding against wherever the
+    # merged artifact is actually written.
+    merged_path = output
     score_universe.main(
         ["merge", "--inputs", *(str(path) for path in shard_paths), "--output", str(merged_path)]
     )
@@ -1999,115 +2025,158 @@ def test_egostitch_e2e_scorer_warns_on_n_ground_clamp(
     assert str(node_universe) in message
 
 
-# --------------------------------------------------------------------------- v_hold pairs source
-# (fix 1: the real internal-holdout validation universe, not val_edges.txt)
+# --------------------------------------------------------------------------- val_region pairs
+# source (fix 1: the real V_val validation-region universe, not val_edges.txt)
 
-# A 25-node ring gives one connected component large enough for two disjoint
-# `holdout_size=4` BFS draws (test_train_egostitch_boundary.py's own fixture
-# size for the identical reason), so `derive_internal_holdout` runs for real
-# rather than through a hand-rolled substitute.
-_V_HOLD_NODES = [f"h{i}" for i in range(25)]
-
-
-def _tiny_internal_holdout(monkeypatch: pytest.MonkeyPatch, *, holdout_size: int = 4) -> None:
-    """Monkeypatch `score_universe.derive_internal_holdout` to a size the ring fixture satisfies."""
-    from src.data.internal_holdout import InternalHoldoutPartition
-    from src.data.internal_holdout import derive_internal_holdout as real_derive
-
-    def tiny(train_nodes: object, training_interactions: object) -> InternalHoldoutPartition:
-        return real_derive(
-            cast("list[str]", train_nodes),
-            cast("frozenset[tuple[str, str]]", training_interactions),
-            holdout_size=holdout_size,
-        )
-
-    monkeypatch.setattr(score_universe, "derive_internal_holdout", tiny)
+# A 12-node ring (with one self-loop, so a self row exercises the positive
+# label branch too) gives one connected component small enough for a tiny
+# `ValRegionParams` to grow a real, deterministic V_val region rather than
+# through a hand-rolled substitute.
+_VAL_REGION_NODES = [f"h{i}" for i in range(12)]
+_VAL_REGION_TEST_PARAMS = ValRegionParams(
+    edge_fraction=0.4,
+    n_regions=2,
+    salt="test-val-region|",
+    bucket_sizes=(2, 3),
+    buckets_per_size=2,
+    negative_seed=0,
+)
 
 
-def _write_v_hold_benchmark_package(tmp_path: Path, *, strategy: str = "breadth_first") -> Path:
-    """Write `split.pkl`/`train_edges.txt` for the 25-node ring under `tmp_path/data`."""
+def _write_val_region_benchmark_package(tmp_path: Path, *, strategy: str = "breadth_first") -> Path:
+    """Write split.pkl/train_graph.pkl/train_edges.txt/val_edges.txt/positive_edges.txt.
+
+    A 12-node ring under `tmp_path/data`, split across `train_edges.txt` (the
+    first half of the ring's edges, plus label-0 rows) and `val_edges.txt`
+    (the other half, plus a self-loop row) -- mirroring the benchmark's own
+    train+/val+ = train_graph convention closely enough to exercise
+    `_load_val_region_split`'s real read-from-disk mirror.
+    """
     strategy_dir = tmp_path / "data" / "benchmark_2025_neurips" / strategy
     strategy_dir.mkdir(parents=True, exist_ok=True)
     with (strategy_dir / "split.pkl").open("wb") as handle:
-        pickle.dump({"train": _V_HOLD_NODES, "test": []}, handle)
-    edges = [
-        (_V_HOLD_NODES[i], _V_HOLD_NODES[(i + 1) % len(_V_HOLD_NODES)])
-        for i in range(len(_V_HOLD_NODES))
+        pickle.dump({"train": _VAL_REGION_NODES, "test": []}, handle)
+
+    ring_edges = [
+        (_VAL_REGION_NODES[i], _VAL_REGION_NODES[(i + 1) % len(_VAL_REGION_NODES)])
+        for i in range(len(_VAL_REGION_NODES))
     ]
+    self_loop_node = _VAL_REGION_NODES[0]
+    graph = nx.Graph()
+    graph.add_nodes_from(_VAL_REGION_NODES)
+    graph.add_edges_from(ring_edges)
+    graph.add_edge(self_loop_node, self_loop_node)
+    with (strategy_dir / "train_graph.pkl").open("wb") as handle:
+        pickle.dump(graph, handle)
+
+    negatives = [(_VAL_REGION_NODES[i], _VAL_REGION_NODES[i + 6]) for i in range(0, 6, 2)]
     (strategy_dir / "train_edges.txt").write_text(
-        "".join(f"{u}\t{v}\t1\n" for u, v in edges), encoding="utf-8"
+        "".join(f"{u}\t{v}\t1\n" for u, v in ring_edges[:6])
+        + "".join(f"{u}\t{v}\t0\n" for u, v in negatives),
+        encoding="utf-8",
+    )
+    (strategy_dir / "val_edges.txt").write_text(
+        "".join(f"{u}\t{v}\t1\n" for u, v in ring_edges[6:])
+        + f"{self_loop_node}\t{self_loop_node}\t1\n",
+        encoding="utf-8",
+    )
+    positive_pairs = sorted(
+        {canonical_pair(u, v) for u, v in [*ring_edges, (self_loop_node, self_loop_node)]}
+    )
+    (tmp_path / "data" / "benchmark_2025_neurips" / "positive_edges.txt").write_text(
+        "".join(f"{u}\t{v}\n" for u, v in positive_pairs), encoding="utf-8"
     )
     return tmp_path / "data"
 
 
-def _v_hold_e2e_setup(
+def _val_region_e2e_setup(
     tmp_path: Path, *, model_config: dict[str, object] | None = None
 ) -> tuple[Path, Path]:
-    """Feature store (25 ring nodes) + benchmark package + `egostitch_e2e` checkpoint."""
-    data_root = _write_v_hold_benchmark_package(tmp_path)
+    """Feature store (12 ring nodes) + benchmark package + `egostitch_e2e` checkpoint."""
+    data_root = _write_val_region_benchmark_package(tmp_path)
     torch.manual_seed(0)
-    node_tokens = {node: torch.randn(3, _E2E_NODE_DIM) for node in _V_HOLD_NODES}
+    node_tokens = {node: torch.randn(3, _E2E_NODE_DIM) for node in _VAL_REGION_NODES}
     _write_feature_store(
         data_root / "features" / "frozen_node_features_1024", node_tokens, input_dim=_E2E_NODE_DIM
     )
     config = dict(_TINY_E2E_CONFIG if model_config is None else model_config)
     model = score_universe.build_model("egostitch_e2e", config)
-    checkpoint_path = tmp_path / "egostitch_e2e_v_hold.pt"
+    checkpoint_path = tmp_path / "egostitch_e2e_val_region.pt"
     _write_checkpoint(
         checkpoint_path, model=model, model_family="egostitch_e2e", model_config=config
     )
     return data_root, checkpoint_path
 
 
-def test_resolve_v_hold_pairs_matches_internal_holdout_manifest_bit_for_bit(
+def test_resolve_val_region_pairs_matches_direct_derivation_bit_for_bit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`--pairs v_hold` must be `derive_internal_holdout`'s own manifest, not `val_edges.txt`."""
-    from src.data.internal_holdout import derive_internal_holdout
-    from src.data.partition import derive_training_interactions
+    """`--pairs val_region` must reproduce a from-scratch derivation exactly.
 
-    _tiny_internal_holdout(monkeypatch)
-    data_root = _write_v_hold_benchmark_package(tmp_path)
+    Both the universe (pairs, row order) and the labels must match.
+    """
+    monkeypatch.setattr(score_universe, "_VAL_REGION_PARAMS", _VAL_REGION_TEST_PARAMS)
+    data_root = _write_val_region_benchmark_package(tmp_path)
 
-    pairs, labels = score_universe._resolve_pairs("v_hold", data_root, "breadth_first")
+    pairs, labels = score_universe._resolve_pairs("val_region", data_root, "breadth_first")
 
     strategy_dir = data_root / "benchmark_2025_neurips" / "breadth_first"
     with (strategy_dir / "split.pkl").open("rb") as handle:
         split_payload = pickle.load(handle)  # noqa: S301
+    with (strategy_dir / "train_graph.pkl").open("rb") as handle:
+        train_graph = pickle.load(handle)  # noqa: S301
     train_pairs, train_labels = score_universe._read_pairs_tsv(strategy_dir / "train_edges.txt")
-    positives = [
-        pair for pair, label in zip(train_pairs, train_labels.tolist(), strict=True) if label == 1
+    val_pairs_raw, val_labels_raw = score_universe._read_pairs_tsv(strategy_dir / "val_edges.txt")
+    benchmark_negatives = [
+        pair for pair, label in zip(train_pairs, train_labels.tolist(), strict=True) if label == 0
+    ] + [
+        pair
+        for pair, label in zip(val_pairs_raw, val_labels_raw.tolist(), strict=True)
+        if label == 0
     ]
-    interactions = derive_training_interactions(positives)
-    expected = derive_internal_holdout(
-        sorted(split_payload["train"]), interactions.positives, holdout_size=4
+    positive_pairs, _ = score_universe._read_pairs_tsv(
+        data_root / "benchmark_2025_neurips" / "positive_edges.txt"
     )
 
-    assert pairs == list(expected.hold_manifest.pairs)
-    np.testing.assert_array_equal(labels, np.asarray(expected.hold_manifest.labels, dtype=np.int8))
-    assert expected.hold_manifest.positive_count > 0, "fixture must produce a real V_hold topology"
-    # Not the benchmark's own model-selection manifest: no val_edges.txt exists
-    # at all in this fixture, so a wrong implementation reading it would raise
-    # before ever reaching the assertions above.
-    assert not (strategy_dir / "val_edges.txt").exists()
+    expected_split = derive_val_region_split(
+        sorted(split_payload["train"]),
+        list(train_graph.edges()),
+        benchmark_negatives,
+        frozenset(positive_pairs),
+        params=_VAL_REGION_TEST_PARAMS,
+    )
+    expected_nodes = sorted(expected_split.v_val)
+    expected_u, expected_v = val_universe_arrays(expected_split.v_val)
+    expected_pairs = [
+        (expected_nodes[u], expected_nodes[v])
+        for u, v in zip(expected_u.tolist(), expected_v.tolist(), strict=True)
+    ]
+    expected_positives = frozenset(expected_split.val_positives)
+    expected_labels = np.array(
+        [1 if pair in expected_positives else 0 for pair in expected_pairs], dtype=np.int8
+    )
+
+    assert pairs == expected_pairs
+    np.testing.assert_array_equal(labels, expected_labels)
+    assert len(expected_split.val_positives) > 0, "fixture must produce a real V_val topology"
 
 
-def test_v_hold_pairs_source_is_never_a_heldout_universe() -> None:
+def test_val_region_pairs_source_is_never_a_heldout_universe() -> None:
     assert (
         score_universe._is_heldout_universe(
-            {"model_family": "egostitch_e2e", "pairs_source": "v_hold"}
+            {"model_family": "egostitch_e2e", "pairs_source": "val_region"}
         )
         is False
     )
 
 
-def test_v_hold_scoring_never_writes_a_ledger_record(
+def test_val_region_scoring_never_writes_a_ledger_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`--pairs v_hold` needs no `--run-metadata` and must never touch the test-access ledger."""
-    _tiny_internal_holdout(monkeypatch)
-    data_root, checkpoint = _v_hold_e2e_setup(tmp_path)
-    output = tmp_path / "v_hold.npz"
+    """`--pairs val_region` needs no `--run-metadata` and never touches the test-access ledger."""
+    monkeypatch.setattr(score_universe, "_VAL_REGION_PARAMS", _VAL_REGION_TEST_PARAMS)
+    data_root, checkpoint = _val_region_e2e_setup(tmp_path)
+    output = tmp_path / "val_region.npz"
 
     score_universe.main(
         [
@@ -2115,7 +2184,7 @@ def test_v_hold_scoring_never_writes_a_ledger_record(
             "--checkpoint",
             str(checkpoint),
             "--pairs",
-            "v_hold",
+            "val_region",
             "--data-root",
             str(data_root),
             "--output",
@@ -2130,12 +2199,18 @@ def test_v_hold_scoring_never_writes_a_ledger_record(
     )
 
     artifact = score_universe.load_scores(output)
-    assert artifact.meta["pairs_source"] == "v_hold"
+    assert artifact.meta["pairs_source"] == "val_region"
     assert artifact.meta["heldout"] is False
     assert "test_access_ledger" not in artifact.meta
     assert not list(tmp_path.rglob("test_access_ledger.jsonl")), (
-        "v_hold scoring must never append to any test-access ledger"
+        "val_region scoring must never append to any test-access ledger"
     )
+
+
+def test_val_pairs_source_no_longer_resolves(tmp_path: Path) -> None:
+    """`val` (val_edges.txt) is retired; only `val_region` names the validation universe."""
+    with pytest.raises(ValueError, match=r"unsupported --pairs value 'val'"):
+        score_universe._resolve_pairs("val", tmp_path / "data", "breadth_first")
 
 
 # --------------------------------------------------------------------------- cazi_mbn scoring
@@ -2423,7 +2498,9 @@ def _write_run_metadata(tmp_path: Path, checkpoint: Path, *, arm: str = "oracle"
 
 def test_oracle_truth_graph_rejects_unsupported_pairs_sources(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="no diagnostic truth graph"):
-        score_universe._oracle_truth_graph_for_scoring("val", tmp_path / "data", "breadth_first")
+        score_universe._oracle_truth_graph_for_scoring(
+            "unsupported", tmp_path / "data", "breadth_first"
+        )
 
 
 def test_allow_oracle_diagnostic_flag_rejected_for_a_non_oracle_generator(tmp_path: Path) -> None:
@@ -2681,13 +2758,13 @@ def test_oracle_generator_scoring_is_unreachable_without_the_diagnostic_flag(
     assert np.isfinite(artifact.logit).all()
 
 
-def test_oracle_v_hold_truth_diagnostic_still_writes_no_ledger_record(
+def test_oracle_val_region_truth_diagnostic_still_writes_no_ledger_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The `v_hold`-truth oracle diagnostic combines fixes 1 and 4: still no ledger access."""
-    _tiny_internal_holdout(monkeypatch)
-    data_root, checkpoint = _v_hold_e2e_setup(tmp_path, model_config=_TINY_ORACLE_E2E_CONFIG)
-    output = tmp_path / "oracle_v_hold.npz"
+    """The `val_region`-truth oracle diagnostic combines fixes 1 and 4: still no ledger access."""
+    monkeypatch.setattr(score_universe, "_VAL_REGION_PARAMS", _VAL_REGION_TEST_PARAMS)
+    data_root, checkpoint = _val_region_e2e_setup(tmp_path, model_config=_TINY_ORACLE_E2E_CONFIG)
+    output = tmp_path / "oracle_val_region.npz"
 
     score_universe.main(
         [
@@ -2695,7 +2772,7 @@ def test_oracle_v_hold_truth_diagnostic_still_writes_no_ledger_record(
             "--checkpoint",
             str(checkpoint),
             "--pairs",
-            "v_hold",
+            "val_region",
             "--data-root",
             str(data_root),
             "--output",
@@ -2712,6 +2789,6 @@ def test_oracle_v_hold_truth_diagnostic_still_writes_no_ledger_record(
 
     artifact = score_universe.load_scores(output)
     oracle_diagnostic = cast(dict[str, object], artifact.meta["oracle_diagnostic"])
-    assert oracle_diagnostic["truth_source"] == "v_hold_topology_hold"
+    assert oracle_diagnostic["truth_source"] == "val_region_g_val"
     assert artifact.meta["heldout"] is False
     assert not list(tmp_path.rglob("test_access_ledger.jsonl"))

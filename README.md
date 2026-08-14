@@ -63,11 +63,11 @@ hpc/run.sh train configs/egostitch_e2e_v3_full_breadth_first.yaml \
   --worker-module src.train_egostitch --run-kind formal   # or another trained-arm config
 ```
 
-The run trains topology and classification on the same edges induced within
-`V_fit`, validates on the single 512-node `V_hold`, and executes
-`pack → train → publish` through the shared orchestrator. Quality telemetry
-(eligibility, liveness, slot collapse, margins) is recorded but never blocks
-completion, publication, scoring, or evaluation.
+The run trains topology and classification on the train-side positive edges minus
+V_val-internal pairs, validates on the V_val region split (pair-disjoint BFS growth to
+the nearest 20% induced edges), and executes `pack → train → publish` through the
+shared orchestrator. Quality telemetry (eligibility, liveness, slot collapse, margins)
+is recorded but never blocks completion, publication, scoring, or evaluation.
 
 - **Task:** given two *unseen* nodes with frozen feature vectors, predict whether an
   edge exists between them (binary classification), under a strict inductive protocol
@@ -221,11 +221,11 @@ data/
   benchmark_2025_neurips/        graph, edge lists, split artifacts, evaluation buckets
   features/                      neutral node-feature index
 src/
-  data/                          verified benchmark/features + pair batching + V_fit/V_hold partition
+  data/                          verified benchmark/features + pair batching + V_val region split
   eval/                          edge and assembled-graph metrics
   model/                         B0-V3.1 pairwise baseline + EgoStitch three-component model
                                   (generator/encoder/classifier, each independently swappable)
-  experiments/                   G1/G2/G3 analyses + G5 e2e gate + probes
+  experiments/                   G1/G2/G3 analyses + observe_e2e_formal telemetry
   train_b0.py                    baseline training CLI
   train_egostitch.py             auto-sized DDP EgoStitch e2e training worker
   e2_pipeline.py                 production orchestrator: pack → train → publish
@@ -311,9 +311,9 @@ that exact hardware shape. There is no job scheduler (e.g. Slurm).
 
 **EgoStitch e2e training runs through the same `hpc/run.sh train` branch as the
 baselines**, over the five active trained arms (`full`, `f_only`, `p0`, `no_l_rel`,
-`row_layernorm`). It uses the
-auto-detected multi-GPU orchestrator and `src.train_egostitch`, runs `pack → train →
-publish`, trains on `V_fit`, validates on `V_hold`, and may not open a held-out path.
+`row_layernorm`). It uses the auto-detected multi-GPU orchestrator and
+`src.train_egostitch`, runs `pack → train → publish`, trains on train positives outside
+V_val, validates on the V_val split, and may not open the held-out test path.
 
 ```bash
 hpc/run.sh train configs/egostitch_e2e_v3_full_breadth_first.yaml \

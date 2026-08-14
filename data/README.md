@@ -34,13 +34,13 @@ Each split-strategy directory contains:
 |---|---|
 | `split.pkl` | Node membership for the split strategy. |
 | `train_edges.txt` | Labeled train pairs. |
-| `val_edges.txt` | Labeled validation pairs. |
+| `val_edges.txt` | Raw material for the derived internal V_val split; retired as a selection artifact. |
 | `test_edges.txt` | Labeled test pairs. |
 | `train_edges_ratio5_exclusive.txt` | **QUARANTINED** (spec §9.3: negatives leak across the split) — never use for training, model selection, or evaluation. |
 | `val_edges_ratio5_exclusive.txt` | **QUARANTINED** — same prohibition as above. |
 | `test_edges_ratio5_exclusive.txt` | **QUARANTINED** — same prohibition as above. |
 | `candidate_test_edges.txt` | Candidate-pair universe for held-out assembled-graph evaluation. |
-| `train_graph.pkl` | Reference graph over train nodes for topology-aware supervision. |
+| `train_graph.pkl` | Split substrate: `val_region.py` grows the V_val region on its loopless giant component. |
 | `test_graph.pkl` | Held-out reference graph for final assembled-graph evaluation. |
 | `test_node_buckets.pkl` | Node buckets used for assembled-graph metrics. |
 

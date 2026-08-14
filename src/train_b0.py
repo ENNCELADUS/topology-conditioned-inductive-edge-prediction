@@ -57,7 +57,6 @@ from src.data.distributed_pairs import (
     identity_compact_batch,
 )
 from src.data.features import FeatureStore, build_f0_matrix
-from src.data.internal_holdout import derive_internal_holdout
 from src.data.packed_features import PackedFeatureTable
 from src.data.pairs import (
     LengthBucketedBatchSampler,
@@ -65,7 +64,14 @@ from src.data.pairs import (
     TokenPairDataset,
     collate_token_pairs,
 )
-from src.data.partition import build_g_struct, derive_training_interactions
+from src.data.partition import build_g_struct
+from src.data.val_region import (
+    Pair,
+    ValRegionParams,
+    ValRegionSplit,
+    derive_val_region_split,
+    val_universe_arrays,
+)
 from src.distill.artifacts import KDTargets, load_kd_targets
 from src.distill.config import DistillConfig
 from src.distill.losses import (
@@ -80,9 +86,13 @@ from src.eval.checkpoint_selection import (
     CheckpointCandidate,
     TopologyValidationMetrics,
     select_checkpoint,
-    validation_topology_metrics,
 )
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
+from src.eval.val_topology import (
+    ValTopologyReference,
+    build_val_topology_reference,
+    val_region_topology_metrics,
+)
 from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
 
 logger = logging.getLogger(__name__)
@@ -94,21 +104,6 @@ Batch = dict[str, torch.Tensor]
 LoaderFactory = Callable[[int], Iterable[Batch]]
 PackedLoaderFactory = Callable[[int], Iterable[Batch]]
 OnEval = Callable[[dict[str, object], bool, EdgeMetrics], None]
-
-
-@dataclass(frozen=True)
-class ValidationTopologyContext:
-    """Fixed validation-side inputs for the five topology metrics.
-
-    Attributes:
-        pairs: The full ordered validation pair list (row-ID order).
-        positive_edges: The gold edges among `pairs` (label 1 rows).
-        nodes: The validation node universe (all pair endpoints).
-    """
-
-    pairs: tuple[tuple[str, str], ...]
-    positive_edges: tuple[tuple[str, str], ...]
-    nodes: tuple[str, ...]
 
 
 class ValidationOutcome(NamedTuple):
@@ -961,8 +956,10 @@ class AssembledData:
     Attributes:
         benchmark: Loaded benchmark (featureless-node pairs already dropped).
         store: Frozen per-node token-sequence feature store.
-        training_positives: All positive train-side interactions.
-        degrees: Simple-graph degrees from all loopless training interactions.
+        val_split: The derived V_val region and training/validation partition.
+        training_positives: V_val-partitioned training positives, minus rows
+            touching `exclude_nodes` (self-pairs included, sorted).
+        degrees: Simple-graph degrees over the loopless training positives.
         dropped_pair_counts: Rows dropped per labeled file due to missing features.
         operative_node_ids: Sorted node ids in both the graph and the feature index.
         operative_node_count: ``len(operative_node_ids)``.
@@ -971,6 +968,7 @@ class AssembledData:
 
     benchmark: Benchmark
     store: FeatureStore
+    val_split: ValRegionSplit
     training_positives: list[tuple[str, str]]
     degrees: dict[str, int]
     dropped_pair_counts: dict[str, int]
@@ -985,7 +983,43 @@ def _count_rows(path: Path) -> int:
         return sum(1 for line in f if line.strip())
 
 
-def assemble_data(cfg: Config, *, verify: bool = True) -> AssembledData:
+def _drop_touching(pairs: Iterable[Pair], exclude_nodes: frozenset[str]) -> list[Pair]:
+    """Drop pairs with either endpoint in `exclude_nodes`."""
+    return [pair for pair in pairs if pair[0] not in exclude_nodes and pair[1] not in exclude_nodes]
+
+
+def _training_rows(
+    val_split: ValRegionSplit, exclude_nodes: frozenset[str]
+) -> tuple[list[Pair], list[Pair]]:
+    """Return `(positives, negatives)`: the V_val-partitioned training rows.
+
+    Rows touching `exclude_nodes` are dropped. Positives are sorted for
+    determinism (the split stores them as a frozenset); negatives keep the
+    split's file order.
+    """
+    positives = _drop_touching(sorted(val_split.training_positives), exclude_nodes)
+    negatives = _drop_touching(val_split.training_negatives, exclude_nodes)
+    return positives, negatives
+
+
+def _val_cls_rows(
+    val_split: ValRegionSplit, exclude_nodes: frozenset[str]
+) -> tuple[list[Pair], list[int]]:
+    """Return `(pairs, labels)`: the V_val classification-validation rows.
+
+    Rows touching `exclude_nodes` are dropped.
+    """
+    kept = [
+        (pair, label)
+        for pair, label in zip(val_split.val_cls_pairs, val_split.val_cls_labels, strict=True)
+        if pair[0] not in exclude_nodes and pair[1] not in exclude_nodes
+    ]
+    return [pair for pair, _ in kept], [label for _, label in kept]
+
+
+def assemble_data(
+    cfg: Config, *, verify: bool = True, val_region_params: ValRegionParams | None = None
+) -> AssembledData:
     """Assemble benchmark + features for training, enforcing the coverage gate.
 
     Feature-coverage gate: after computing ``exclude = graph_nodes -
@@ -993,10 +1027,16 @@ def assemble_data(cfg: Config, *, verify: bool = True) -> AssembledData:
     ``data.expected_missing_features`` exactly, and logs the operative node count
     ``|graph_nodes ∩ store.node_ids|`` (10,088 on the real package).
 
+    The V_val region split is derived from the raw, unfiltered artifacts (its
+    node universe and truth graph are exclude-node-independent); `exclude_nodes`
+    row filtering is applied afterward wherever a caller consumes split rows.
+
     Args:
         cfg: The full training config.
         verify: Forwarded to :func:`~src.data.artifacts.load_benchmark`; when True
             the raw artifacts are verified against the pinned constants first.
+        val_region_params: V_val derivation parameters; `None` uses the pinned
+            production defaults. Tests pass tiny values instead of monkeypatching.
 
     Returns:
         The `AssembledData` bundle.
@@ -1041,20 +1081,40 @@ def assemble_data(cfg: Config, *, verify: bool = True) -> AssembledData:
         - len(bench.split.test_pairs.pairs),
     }
 
-    train_pairs = bench.split.train_pairs
-    train_plus = [
+    # V_val derivation needs the raw label-0 rows; the `bench` above already
+    # dropped exclude_nodes-touching rows, so re-read train/val_edges.txt
+    # unfiltered here (train_graph.pkl and train_nodes are never exclude-node
+    # filtered, so `bench.split` already carries those unfiltered).
+    raw_bench = load_benchmark(benchmark_root, cfg.data.strategy, verify=False)
+    raw_negatives = [
         pair
-        for pair, label in zip(train_pairs.pairs, train_pairs.labels, strict=True)
-        if label == 1
+        for pair, label in zip(
+            raw_bench.split.train_pairs.pairs, raw_bench.split.train_pairs.labels, strict=True
+        )
+        if label == 0
+    ] + [
+        pair
+        for pair, label in zip(
+            raw_bench.split.val_pairs.pairs, raw_bench.split.val_pairs.labels, strict=True
+        )
+        if label == 0
     ]
-    interactions = derive_training_interactions(train_plus)
-    training_positives = sorted(interactions.positives)
-    g_struct = build_g_struct(bench.split.train_nodes, interactions.topology_edges)
+    val_split = derive_val_region_split(
+        bench.split.train_nodes,
+        bench.split.train_graph.edges(),
+        raw_negatives,
+        bench.positive_edges,
+        params=val_region_params,
+    )
+
+    training_positives, _ = _training_rows(val_split, exclude)
+    g_struct = build_g_struct(bench.split.train_nodes, training_positives)
     degrees = {str(node): int(degree) for node, degree in g_struct.degree()}
 
     return AssembledData(
         benchmark=bench,
         store=store,
+        val_split=val_split,
         training_positives=training_positives,
         degrees=degrees,
         dropped_pair_counts=dropped_pair_counts,
@@ -1484,27 +1544,26 @@ def _shuffled_pairs_and_labels(
 
 
 def _build_negative_sampler(assembled: AssembledData) -> NegativeSampler:
-    """Build the degree-corrected negative sampler over featureful train nodes."""
+    """Build the degree-corrected negative sampler over featureful train nodes.
+
+    Rejects V_val-internal pairs like a global positive.
+    """
     train_universe = sorted(set(assembled.benchmark.split.train_nodes) - assembled.exclude_nodes)
-    return NegativeSampler(train_universe, assembled.degrees, assembled.benchmark.positive_edges)
+    return NegativeSampler(
+        train_universe,
+        assembled.degrees,
+        assembled.benchmark.positive_edges,
+        forbidden_internal_nodes=assembled.val_split.v_val,
+    )
 
 
 def _build_v3_1_loaders(
     cfg: Config, assembled: AssembledData
 ) -> tuple[LoaderFactory, Iterable[Batch]]:
-    """Build loaders using the fixed labeled training pairs from ``train_edges.txt``."""
+    """Build loaders over the V_val training/validation partition."""
     store = assembled.store
-    train_pairs = assembled.benchmark.split.train_pairs
-    positives = [
-        pair
-        for pair, label in zip(train_pairs.pairs, train_pairs.labels, strict=True)
-        if label == 1
-    ]
-    negatives = [
-        pair
-        for pair, label in zip(train_pairs.pairs, train_pairs.labels, strict=True)
-        if label == 0
-    ]
+    val_split = assembled.val_split
+    positives, negatives = _training_rows(val_split, assembled.exclude_nodes)
     length_cache: dict[str, int] = {}
 
     def length_of(node_id: str) -> int:
@@ -1519,10 +1578,9 @@ def _build_v3_1_loaders(
     def lengths_for(pairs: Sequence[tuple[str, str]]) -> list[tuple[int, int]]:
         return [(length_of(u), length_of(v)) for u, v in pairs]
 
-    val_pairs = assembled.benchmark.split.val_pairs
-    val_labels = [int(label) for label in val_pairs.labels]
-    val_lengths = lengths_for(val_pairs.pairs)
-    val_dataset = TokenPairDataset(val_pairs.pairs, val_labels, store, lengths=val_lengths)
+    val_pairs, val_labels = _val_cls_rows(val_split, assembled.exclude_nodes)
+    val_lengths = lengths_for(val_pairs)
+    val_dataset = TokenPairDataset(val_pairs, val_labels, store, lengths=val_lengths)
     val_loader: DataLoader[Batch] = DataLoader(
         val_dataset,
         batch_sampler=LengthBucketedBatchSampler(
@@ -1570,8 +1628,8 @@ def _build_f0_loaders(
         label_tensor = torch.tensor(labels, dtype=torch.float32)
         return _F0PairBatches(matrix, a_indices, b_indices, label_tensor, cfg.data.batch_pairs)
 
-    val_pairs = assembled.benchmark.split.val_pairs
-    val_loader = batches_for(val_pairs.pairs, [int(label) for label in val_pairs.labels])
+    val_pairs, val_labels = _val_cls_rows(assembled.val_split, assembled.exclude_nodes)
+    val_loader = batches_for(val_pairs, val_labels)
 
     def factory(epoch: int) -> _F0PairBatches:
         negatives = sampler.sample(
@@ -1799,10 +1857,10 @@ def _build_packed_v3_1_loaders(
     """Build packed, multi-worker ``v3_1`` train/val loaders for one DDP rank.
 
     Endpoint integer ids and true token lengths come from ``table.manifest`` only —
-    no feature tensors are read to plan batches. The fixed labeled
-    ``train_edges.txt`` rows are replanned into per-rank compact batches every
-    epoch via :func:`~src.data.distributed_pairs.build_distributed_epoch_plan`; the
-    fixed validation rows are planned once, unshuffled. DataLoader workers hand
+    no feature tensors are read to plan batches. The V_val-partitioned training
+    rows are replanned into per-rank compact batches every epoch via
+    :func:`~src.data.distributed_pairs.build_distributed_epoch_plan`; the fixed
+    V_val classification-validation rows are planned once, unshuffled. DataLoader workers hand
     back :class:`~src.data.distributed_pairs.CompactPairBatch` values only — the
     returned iterables assemble feature tensors from ``table`` in the main process.
 
@@ -1829,17 +1887,15 @@ def _build_packed_v3_1_loaders(
     node_index = table.manifest.node_index()
     lengths_by_node = {record.node_id: record.length for record in table.manifest.nodes}
 
-    train_pairs_bundle = assembled.benchmark.split.train_pairs
-    train_pairs = list(train_pairs_bundle.pairs)
-    train_labels = [int(label) for label in train_pairs_bundle.labels]
+    positives, negatives = _training_rows(assembled.val_split, assembled.exclude_nodes)
+    train_pairs = positives + negatives
+    train_labels = [1] * len(positives) + [0] * len(negatives)
     train_lengths = _pair_lengths_from_manifest(train_pairs, lengths_by_node)
     train_row_ids, train_node_a, train_node_b, train_label_tensor = _compact_pair_columns(
         train_pairs, train_labels, node_index
     )
 
-    val_pairs_bundle = assembled.benchmark.split.val_pairs
-    val_pairs = list(val_pairs_bundle.pairs)
-    val_labels = [int(label) for label in val_pairs_bundle.labels]
+    val_pairs, val_labels = _val_cls_rows(assembled.val_split, assembled.exclude_nodes)
     val_lengths = _pair_lengths_from_manifest(val_pairs, lengths_by_node)
     val_row_ids, val_node_a, val_node_b, val_label_tensor = _compact_pair_columns(
         val_pairs, val_labels, node_index
@@ -2061,9 +2117,8 @@ def _evaluate_distributed(
     accelerator: Accelerator,
     *,
     expected_row_ids: np.ndarray | None = None,
-    topology_context: ValidationTopologyContext | None = None,
 ) -> ValidationOutcome:
-    """Score the fixed validation set across all ranks and agree on the metrics.
+    """Score the fixed cls validation set across all ranks and agree on the metrics.
 
     Each rank scores its slice; the slices are padded to a common length and
     gathered onto every rank. Every rank then masks the padding and verifies
@@ -2071,7 +2126,8 @@ def _evaluate_distributed(
     coverage violation raises identically on all ranks (never a rank-zero-only
     death that leaves the others deadlocked in the broadcast). Rank zero
     computes the metrics and the dict is broadcast so every rank makes the same
-    best-epoch decision.
+    best-epoch decision. This is the cls-only pass; `_evaluate_two_pass` merges
+    it with the separate V_val topology pass.
 
     Args:
         model: The scorer (restored to train mode before returning).
@@ -2081,11 +2137,9 @@ def _evaluate_distributed(
             derived as ``arange`` over the gathered row count — a self-contained
             fallback that still catches duplicates and interior gaps; production
             binds the true set so truncation is caught too.
-        topology_context: Fixed validation pairs/gold-edges/nodes for the five
-            topology metrics; ``None`` (unit-test injection) skips them.
 
     Returns:
-        The `ValidationOutcome`, identical on every rank.
+        The `ValidationOutcome` with `topology=None`, identical on every rank.
 
     Raises:
         ValueError: On any duplicate or missing validation row (all ranks).
@@ -2160,28 +2214,14 @@ def _evaluate_distributed(
     if accelerator.is_main_process:
         probs = _stable_sigmoid(logits_sorted.astype(np.float64))
         metrics = compute_edge_metrics(labels_sorted.astype(np.float64), probs)
-        topology = (
-            asdict(
-                validation_topology_metrics(
-                    pairs=topology_context.pairs,
-                    logits=logits_sorted.astype(np.float64),
-                    positive_edges=topology_context.positive_edges,
-                    nodes=topology_context.nodes,
-                )
-            )
-            if topology_context is not None
-            else None
-        )
-        outcome_payload[0] = {"metrics": asdict(metrics), "topology": topology}
+        outcome_payload[0] = {"metrics": asdict(metrics)}
 
     broadcast_object_list(outcome_payload, from_process=0)
     payload = outcome_payload[0]
     if payload is None:  # pragma: no cover - broadcast always populates rank>0
         raise RuntimeError("distributed validation failed to broadcast metrics")
-    topology_dict = cast(dict[str, float] | None, payload["topology"])
     return ValidationOutcome(
-        metrics=EdgeMetrics(**cast(dict[str, Any], payload["metrics"])),
-        topology=None if topology_dict is None else TopologyValidationMetrics(**topology_dict),
+        metrics=EdgeMetrics(**cast(dict[str, Any], payload["metrics"])), topology=None
     )
 
 
@@ -2195,23 +2235,153 @@ def _stable_sigmoid(logit: np.ndarray) -> np.ndarray:
     return out
 
 
+TopologyEvalFn = Callable[[nn.Module, Accelerator], TopologyValidationMetrics]
+
+
+def _evaluate_val_universe(
+    model: nn.Module,
+    accelerator: Accelerator,
+    *,
+    table: PackedFeatureTable,
+    node_a_all: torch.Tensor,
+    node_b_all: torch.Tensor,
+    boundary: int,
+    batch_pairs: int,
+    u_idx: np.ndarray,
+    v_idx: np.ndarray,
+    reference: ValTopologyReference,
+) -> TopologyValidationMetrics:
+    """Score the complete V_val pair universe and compute the five topology metrics.
+
+    Mirrors `_evaluate_distributed`'s DDP fail-closed gather discipline: every
+    rank scores its `range(rank, n, world)` shard through the same packed-table
+    forward path as the cls pairs, the padded logits are gathered onto every
+    rank, and `validate_gathered_validation` enforces exact once-per-row
+    coverage on every rank before rank zero computes the metrics and the result
+    is broadcast so every rank agrees.
+
+    Args:
+        model: The scorer (restored to train mode before returning).
+        accelerator: The DDP accelerator.
+        table: Packed feature table resident on the training device.
+        node_a_all: `(n_rows,)` packed row index of `u_idx` for every V_val
+            universe row, row-ID order.
+        node_b_all: `(n_rows,)` packed row index of `v_idx`, row-ID order.
+        boundary: Token-sequence padding boundary shared by every V_val node.
+        batch_pairs: Rows scored per no-grad forward call.
+        u_idx: `(n_rows,)` `reference.nodes` index, row-ID order (from
+            `val_universe_arrays`).
+        v_idx: `(n_rows,)` `reference.nodes` index, row-ID order.
+        reference: The once-per-run `ValTopologyReference`.
+
+    Returns:
+        The `TopologyValidationMetrics`, identical on every rank.
+
+    Raises:
+        ValueError: On any duplicate or missing universe row (all ranks).
+    """
+    world_size = accelerator.num_processes
+    rank = accelerator.process_index
+    n_rows = int(node_a_all.shape[0])
+    device = accelerator.device
+
+    row_ids = torch.arange(rank, n_rows, world_size, dtype=torch.int64)
+    model.eval()
+    logit_parts: list[torch.Tensor] = []
+    with torch.no_grad():
+        for start in range(0, row_ids.shape[0], batch_pairs):
+            rows = row_ids[start : start + batch_pairs]
+            emb_a, len_a = table.gather_nodes(node_a_all.index_select(0, rows), boundary)
+            emb_b, len_b = table.gather_nodes(node_b_all.index_select(0, rows), boundary)
+            output = model({"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b})
+            logits = output["logits"]
+            if logits.dim() > 1 and logits.size(-1) == 1:
+                logits = logits.squeeze(-1)
+            logit_parts.append(logits.detach().to(torch.float32))
+    model.train()
+
+    local_row_ids = row_ids.to(device)
+    local_logits = (
+        torch.cat(logit_parts)
+        if logit_parts
+        else torch.empty(0, dtype=torch.float32, device=device)
+    )
+
+    padded_row_ids = accelerator.pad_across_processes(local_row_ids, dim=0, pad_index=-1)
+    padded_logits = accelerator.pad_across_processes(local_logits, dim=0, pad_index=0)
+    gathered_row_ids = accelerator.gather(padded_row_ids)
+    gathered_logits = accelerator.gather(padded_logits)
+
+    # Symmetric on every rank, exactly like `_evaluate_distributed`: a
+    # duplicate/missing row raises identically everywhere rather than a
+    # rank-zero-only death that deadlocks the others in the broadcast below.
+    row_ids_np = gathered_row_ids.cpu().numpy()
+    logits_np = gathered_logits.cpu().numpy()
+    keep = row_ids_np >= 0
+    row_ids_np = row_ids_np[keep]
+    logits_np = logits_np[keep]
+    # `validate_gathered_validation` also reorders a `labels` array; the
+    # universe pass has no per-row label, so a zero placeholder rides along
+    # and is discarded once the coverage check passes.
+    _, logits_sorted = validate_gathered_validation(
+        row_ids=row_ids_np,
+        labels=np.zeros_like(row_ids_np, dtype=np.float64),
+        logits=logits_np,
+        expected_row_ids=np.arange(n_rows, dtype=np.int64),
+    )
+
+    payload: list[dict[str, float] | None] = [None]
+    if accelerator.is_main_process:
+        metrics = val_region_topology_metrics(
+            u_idx=u_idx, v_idx=v_idx, logits=logits_sorted.astype(np.float64), reference=reference
+        )
+        payload[0] = asdict(metrics)
+
+    broadcast_object_list(payload, from_process=0)
+    result = payload[0]
+    if result is None:  # pragma: no cover - broadcast always populates rank>0
+        raise RuntimeError("distributed V_val topology evaluation failed to broadcast metrics")
+    return TopologyValidationMetrics(**result)
+
+
+def _evaluate_two_pass(
+    model: nn.Module,
+    val_loader: Iterable[Batch],
+    accelerator: Accelerator,
+    *,
+    expected_row_ids: np.ndarray,
+    topology_eval_fn: TopologyEvalFn,
+) -> ValidationOutcome:
+    """Run the cls and V_val-topology validation passes and merge their outcomes."""
+    cls_outcome = _evaluate_distributed(
+        model, val_loader, accelerator, expected_row_ids=expected_row_ids
+    )
+    topology = topology_eval_fn(model, accelerator)
+    return ValidationOutcome(metrics=cls_outcome.metrics, topology=topology)
+
+
 def _topology_from_metrics_row(row: dict[str, object]) -> TopologyValidationMetrics | None:
-    """Reconstruct selector topology metrics from one persisted epoch row."""
+    """Reconstruct selector topology metrics from one persisted epoch row.
+
+    Returns `None` for a pre-V_val row (old key names): resume then falls back
+    to `require_topology`'s fail-closed behavior rather than silently mixing
+    metric semantics.
+    """
     keys = (
-        "val_gs",
-        "val_rd",
-        "val_degree_mmd",
-        "val_clustering_mmd",
-        "val_spectral_mmd",
+        "val_gs_bfs",
+        "val_rd_bfs",
+        "val_degree_mmd_ratio",
+        "val_clustering_mmd_ratio",
+        "val_spectral_mmd_ratio",
     )
     if not all(key in row for key in keys):
         return None
     return TopologyValidationMetrics(
-        gs=float(cast(float, row["val_gs"])),
-        rd=float(cast(float, row["val_rd"])),
-        degree_mmd=float(cast(float, row["val_degree_mmd"])),
-        clustering_mmd=float(cast(float, row["val_clustering_mmd"])),
-        spectral_mmd=float(cast(float, row["val_spectral_mmd"])),
+        gs=float(cast(float, row["val_gs_bfs"])),
+        rd=float(cast(float, row["val_rd_bfs"])),
+        degree_mmd=float(cast(float, row["val_degree_mmd_ratio"])),
+        clustering_mmd=float(cast(float, row["val_clustering_mmd_ratio"])),
+        spectral_mmd=float(cast(float, row["val_spectral_mmd_ratio"])),
     )
 
 
@@ -2234,6 +2404,7 @@ class KDStream:
         table: PackedFeatureTable,
         *,
         allowed_nodes: frozenset[str],
+        forbidden_internal_nodes: frozenset[str],
         seed: int,
         rank: int,
         world_size: int,
@@ -2244,14 +2415,29 @@ class KDStream:
         self._seed = seed
         self._rank = rank
         # Data boundary (fail closed): every teacher-target node — anchors and
-        # partners both index `node_ids` — must lie inside the V_fit training
-        # universe. A stale/foreign artifact must never train on V_hold or
+        # partners both index `node_ids` — must lie inside the training
+        # universe. A stale/foreign artifact must never train on V_val or
         # test-side embeddings.
         outside = sorted(set(targets.node_ids) - allowed_nodes)
         if outside:
             raise ValueError(
-                f"KD teacher-target nodes outside the V_fit training universe: {outside[:5]}"
+                f"KD teacher-target nodes outside the training universe: {outside[:5]}"
             )
+        # Pair-level boundary: a row whose anchor AND partner both fall inside
+        # the V_val validation region would leak validation topology into
+        # training. The builder filters these out too, but this consumer
+        # check stays independent so a stale pre-V_val artifact fails closed.
+        node_ids_arr = np.asarray(targets.node_ids)
+        anchor_nodes = node_ids_arr[targets.pair_anchor_idx]
+        partner_nodes = node_ids_arr[targets.pair_partner_idx]
+        forbidden_list = list(forbidden_internal_nodes)
+        both_forbidden = np.isin(anchor_nodes, forbidden_list) & np.isin(
+            partner_nodes, forbidden_list
+        )
+        if both_forbidden.any():
+            bad_rows = np.nonzero(both_forbidden)[0][:5]
+            bad_pairs = [(str(anchor_nodes[i]), str(partner_nodes[i])) for i in bad_rows]
+            raise ValueError(f"KD target pair inside the V_val validation region: {bad_pairs}")
         node_index = table.manifest.node_index()
         missing = [node for node in targets.node_ids if node not in node_index]
         if missing:
@@ -2409,6 +2595,7 @@ def train_ddp_loop(
     schedule_total_steps: int | None = None,
     evaluate_fn: EvaluateFn = _evaluate_distributed,
     kd_loss_fn: KDLossFn | None = None,
+    require_topology: bool = False,
 ) -> TrainResult:
     """Run fixed-epoch E2 DDP training and return rank-consistent metrics.
 
@@ -2436,6 +2623,10 @@ def train_ddp_loop(
             Unit tests inject a deterministic metric source.
         kd_loss_fn: Optional per-step KD loss (`KDStream.loss`); its value is
             added to the scaled supervised loss before the shared backward.
+        require_topology: When True, selection raises instead of falling back
+            to max-AUPRC if any epoch has no topology metrics (production,
+            e.g. a resume across the V_val protocol change). Unit-test stubs
+            that inject an `evaluate_fn` without topology keep `False`.
 
     Returns:
         The `TrainResult`, identical across ranks except for the main-rank-only
@@ -2828,11 +3019,11 @@ def train_ddp_loop(
         if outcome.topology is not None:
             entry.update(
                 {
-                    "val_gs": outcome.topology.gs,
-                    "val_rd": outcome.topology.rd,
-                    "val_degree_mmd": outcome.topology.degree_mmd,
-                    "val_clustering_mmd": outcome.topology.clustering_mmd,
-                    "val_spectral_mmd": outcome.topology.spectral_mmd,
+                    "val_gs_bfs": outcome.topology.gs,
+                    "val_rd_bfs": outcome.topology.rd,
+                    "val_degree_mmd_ratio": outcome.topology.degree_mmd,
+                    "val_clustering_mmd_ratio": outcome.topology.clustering_mmd,
+                    "val_spectral_mmd_ratio": outcome.topology.spectral_mmd,
                 }
             )
         history.append(entry)
@@ -3058,6 +3249,10 @@ def train_ddp_loop(
         )
         assert selected is not None
         best_epoch = selected.epoch
+    elif require_topology:
+        raise RuntimeError(
+            "resume across the V_val protocol change unsupported; start a fresh attempt dir"
+        )
     else:
         best_epoch = max(
             sorted(metrics_by_epoch),
@@ -3420,6 +3615,9 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         )
     if cfg.model.family != "v3_1":
         raise ValueError(f"DDP worker modes only support the v3_1 family, got {cfg.model.family!r}")
+    if cfg.runtime is None:
+        raise ValueError("DDP worker modes require a configured cfg.runtime")
+    runtime = cfg.runtime
 
     accelerator = build_ddp_accelerator(cfg.mixed_precision)
     set_seed(cfg.seed)
@@ -3454,37 +3652,48 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         )
         return
 
-    val_labeled = assembled.benchmark.split.val_pairs
-    num_val_rows = len(val_labeled.pairs)
-    topology_context = ValidationTopologyContext(
-        pairs=tuple(val_labeled.pairs),
-        positive_edges=tuple(
-            pair
-            for pair, label in zip(val_labeled.pairs, val_labeled.labels, strict=True)
-            if int(label) == 1
-        ),
-        nodes=tuple(sorted({node for pair in val_labeled.pairs for node in pair})),
-    )
+    val_split = assembled.val_split
+    reference = build_val_topology_reference(val_split)
+    u_idx, v_idx = val_universe_arrays(val_split.v_val)
+    node_index = table.manifest.node_index()
+    lengths_by_node = {record.node_id: record.length for record in table.manifest.nodes}
+    node_positions = np.array([node_index[node] for node in reference.nodes], dtype=np.int64)
+    node_a_all = torch.from_numpy(node_positions[u_idx]).to(torch.int64)
+    node_b_all = torch.from_numpy(node_positions[v_idx]).to(torch.int64)
+    universe_boundary = max(lengths_by_node[node] for node in reference.nodes)
+
+    val_cls_pairs, _val_cls_labels = _val_cls_rows(val_split, assembled.exclude_nodes)
+    num_val_rows = len(val_cls_pairs)
     evaluate_fn = cast(
         EvaluateFn,
         functools.partial(
-            _evaluate_distributed,
+            _evaluate_two_pass,
             expected_row_ids=np.arange(num_val_rows, dtype=np.int64),
-            topology_context=topology_context,
+            topology_eval_fn=cast(
+                TopologyEvalFn,
+                functools.partial(
+                    _evaluate_val_universe,
+                    table=table,
+                    node_a_all=node_a_all,
+                    node_b_all=node_b_all,
+                    boundary=universe_boundary,
+                    batch_pairs=runtime.max_pairs_per_rank,
+                    u_idx=u_idx,
+                    v_idx=v_idx,
+                    reference=reference,
+                ),
+            ),
         ),
     )
 
     kd_loss_fn: KDLossFn | None = None
     if cfg.distill is not None and cfg.distill.active:
-        holdout = derive_internal_holdout(
-            assembled.benchmark.split.train_nodes,
-            derive_training_interactions(assembled.training_positives).positives,
-        )
         kd_stream = KDStream(
             cfg.distill,
             load_kd_targets(Path(cfg.distill.targets_path)),
             table,
-            allowed_nodes=holdout.v_fit,
+            allowed_nodes=val_split.train_nodes,
+            forbidden_internal_nodes=val_split.v_val,
             seed=cfg.seed,
             rank=accelerator.process_index,
             world_size=accelerator.num_processes,
@@ -3530,6 +3739,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                     schedule_total_steps=schedule_total_steps,
                     evaluate_fn=evaluate_fn,
                     kd_loss_fn=kd_loss_fn,
+                    require_topology=True,
                 ),
             )
         except BaseException:
@@ -3568,6 +3778,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         schedule_total_steps=schedule_total_steps,
         evaluate_fn=evaluate_fn,
         kd_loss_fn=kd_loss_fn,
+        require_topology=True,
     )
     finalization_error: list[str | None] = [None]
     if accelerator.is_main_process:

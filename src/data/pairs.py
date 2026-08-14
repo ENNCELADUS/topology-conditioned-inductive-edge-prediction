@@ -273,6 +273,8 @@ class NegativeSampler:
         train_nodes: Sequence[str],
         degrees: Mapping[str, int],
         global_positives: frozenset[tuple[str, str]],
+        *,
+        forbidden_internal_nodes: frozenset[str] = frozenset(),
     ) -> None:
         """Build a negative sampler over a fixed train-node universe.
 
@@ -282,6 +284,9 @@ class NegativeSampler:
                 from the mapping are treated as degree 0. If every node has degree 0,
                 the degree-corrected replacement draw falls back to uniform.
             global_positives: Canonicalized global positive pairs; never sampled.
+            forbidden_internal_nodes: A pair with *both* endpoints in this set (e.g.
+                a V_val validation region) is rejected like a global positive; a pair
+                with only one endpoint in the set is unaffected.
 
         Raises:
             ValueError: If ``train_nodes`` is empty.
@@ -291,6 +296,7 @@ class NegativeSampler:
         self._train_nodes = list(train_nodes)
         self._n = len(self._train_nodes)
         self._global_positives = global_positives
+        self._forbidden_internal_nodes = forbidden_internal_nodes
 
         weights = np.array(
             [float(degrees.get(node, 0)) for node in self._train_nodes], dtype=np.float64
@@ -361,6 +367,11 @@ class NegativeSampler:
 
             canonical = self._canonicalize(*pair)
             if canonical in self._global_positives or canonical in seen:
+                continue
+            if (
+                canonical[0] in self._forbidden_internal_nodes
+                and canonical[1] in self._forbidden_internal_nodes
+            ):
                 continue
             seen.add(canonical)
             result.append(canonical)

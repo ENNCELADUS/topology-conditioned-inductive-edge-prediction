@@ -77,7 +77,7 @@ mixed_precision: "bf16"
 
 runtime:
   world_size: auto
-  pack_dir: outputs/feature_packs/egostitch_e2e_v_hold_ng50
+  pack_dir: outputs/feature_packs/egostitch_e2e_v_val_ng50
   pack_workers: 8
   loader_workers_per_rank: 0
   prefetch_factor: 2

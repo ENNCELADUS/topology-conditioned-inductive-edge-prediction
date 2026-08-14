@@ -1,4 +1,4 @@
-r"""Dump Full-Ego Pooled Oracle KD teacher targets over V_fit-only anchor/context pairs.
+r"""Dump Full-Ego Pooled Oracle KD teacher targets over the training universe.
 
 CLI (design B1 plan, "KD sampler + teacher-target artifact"):
 
@@ -10,9 +10,9 @@ Architecture (see the B1 plan's "Architecture decisions" -- why this is a
 dedicated module, not a `score_universe.py` extension): `score_universe.py`'s
 ``file:``/``candidate``/``test`` pair sources are held-out-ledgered and its
 grounding pools are rebuilt with ``role_universe="test"``, both wrong for a
-strictly train-side (V_fit-only) teacher pass. This module instead reuses
-`score_universe.py`'s lower-level, universe-agnostic building blocks directly
-(`_load_checkpoint`, `_install_oracle_context`, `_file_sha256`, `_shard_range`,
+training-side teacher pass. This module instead reuses `score_universe.py`'s
+lower-level, universe-agnostic building blocks directly (`_load_checkpoint`,
+`_install_oracle_context`, `_file_sha256`, `_shard_range`,
 `_oracle_truth_graph_sha256`) and mirrors its per-node encode-once cache +
 `build_pair_context_from_states`/`score_pair_context` pattern
 (``_score_egostitch_e2e``, score_universe.py:2330-2399) rather than duplicating
@@ -24,12 +24,18 @@ Every pair is scored fp32 with no autocast on the pair pass, matching the
 consistent with what a training-time rescoring of the same checkpoint would
 produce, not merely close.
 
-Legality (never bind anything but a G_fit-only truth graph): the truth graph is
-`InternalHoldoutPartition.build_g_fit()` plus explicit isolates for every
-V_fit node; `_assert_v_fit_only` hard-refuses if any V_hold or test-split node
-reaches the truth graph or the sampled node universe. No pre-existing oracle
-cache is ever read -- the training-side `g_fit_plus_v_hold` diagnostic caches
-would be leakage here.
+Legality (never bind anything but a truth graph free of V_val-internal edges):
+the truth graph is `ValRegionSplit.build_training_graph()` -- loopless training
+positives over every train node, so V_val nodes appear only through their
+cross-boundary neighbors, never through a V_val-internal edge, by construction.
+`assert_training_side_only` hard-refuses if a benchmark test-split node reaches
+the truth graph or the sampled node universe, or if the truth graph somehow
+carries a V_val-internal edge. `sample_context_sets`' `forbidden_internal`
+(this module always passes `split.v_val`) additionally keeps a V_val anchor
+from drawing another V_val node into its near/random context pool through a
+cross-boundary relay: the quarantine this module enforces is pair-level, not
+node-level -- V_val nodes are a legitimate, expected part of the sampled node
+universe. No pre-existing oracle cache is ever read.
 """
 
 from __future__ import annotations
@@ -48,9 +54,8 @@ from numpy.typing import NDArray
 
 from src.data.artifacts import load_benchmark
 from src.data.features import FeatureStore, build_f0_matrix
-from src.data.internal_holdout import InternalHoldoutPartition, derive_internal_holdout
 from src.data.pairs import BUCKET_BOUNDARIES, probe_lengths
-from src.data.partition import derive_training_interactions
+from src.data.val_region import ValRegionSplit, derive_val_region_split
 from src.distill.artifacts import write_kd_targets
 from src.distill.context_sampler import ContextSets, sample_context_sets
 from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
@@ -74,81 +79,101 @@ _DEFAULT_TOKEN_BUDGET = 32_768
 _DEFAULT_BATCH_PAIRS = 32
 
 
-# --------------------------------------------------------------------------- V_fit legality
+# --------------------------------------------------------------------------- training-side legality
 
 
-def _load_v_fit_holdout(
-    data_root: Path, strategy: str
-) -> tuple[InternalHoldoutPartition, frozenset[str]]:
-    """Load `InternalHoldoutPartition` exactly as the training path derives it.
+def _load_val_region_split(data_root: Path, strategy: str) -> tuple[ValRegionSplit, frozenset[str]]:
+    """Load `ValRegionSplit` exactly as the training path derives it.
 
     Returns:
-        The holdout partition and the benchmark's held-out test-split nodes
-        (a second, separate universe `_assert_v_fit_only` must also refuse).
+        The split and the benchmark's held-out test-split nodes (a second,
+        separate universe `assert_training_side_only` must also refuse).
     """
     benchmark = load_benchmark(data_root / _BENCHMARK_SUBDIR, strategy)
-    positives = [
+    truth_edges = list(benchmark.split.train_graph.edges())
+    benchmark_negatives = [
         pair
         for pair, label in zip(
             benchmark.split.train_pairs.pairs,
             benchmark.split.train_pairs.labels.tolist(),
             strict=True,
         )
-        if int(label) == 1
+        if int(label) == 0
+    ] + [
+        pair
+        for pair, label in zip(
+            benchmark.split.val_pairs.pairs, benchmark.split.val_pairs.labels.tolist(), strict=True
+        )
+        if int(label) == 0
     ]
-    interactions = derive_training_interactions(positives)
-    holdout = derive_internal_holdout(sorted(benchmark.split.train_nodes), interactions.positives)
-    return holdout, frozenset(benchmark.split.test_nodes)
+    split = derive_val_region_split(
+        benchmark.split.train_nodes, truth_edges, benchmark_negatives, benchmark.positive_edges
+    )
+    return split, frozenset(benchmark.split.test_nodes)
 
 
-def truth_graph_for_kd(holdout: InternalHoldoutPartition) -> nx.Graph:
-    """G_fit-only truth graph: loopless V_fit training topology plus explicit isolates."""
-    graph = holdout.build_g_fit().copy()
-    graph.add_nodes_from(sorted(holdout.v_fit))
-    return graph
+def truth_graph_for_kd(split: ValRegionSplit) -> nx.Graph:
+    """Training-side truth graph: loopless training positives over every train node.
+
+    By construction (`ValRegionSplit.training_positives` excludes any pair
+    with both endpoints in `split.v_val`), this graph has zero V_val-internal
+    edges: V_val nodes appear here only through their cross-boundary
+    neighbors.
+    """
+    return split.build_training_graph()
 
 
-def assert_v_fit_only(
+def assert_training_side_only(
     node_ids: Sequence[str],
     truth_graph: nx.Graph,
-    holdout: InternalHoldoutPartition,
+    split: ValRegionSplit,
     test_nodes: frozenset[str],
 ) -> None:
-    """Hard-refuse any V_hold or test-split node in the truth graph or node universe.
+    """Hard-refuse test-split leakage, an off-universe node, or a V_val-internal truth edge.
+
+    V_val nodes are legitimately part of `split.train_nodes` and `truth_graph`
+    (cross-boundary edges are not quarantined); only a V_val-*internal* edge
+    or pair is illegal, so this check is pair-level, not node-level, for the
+    V_val boundary specifically.
 
     Raises:
-        ValueError: If the truth graph or `node_ids` contains a node outside
-            V_fit, or `node_ids` overlaps V_hold or the benchmark test split.
+        ValueError: If `node_ids` overlaps the benchmark test split; `node_ids`
+            or `truth_graph` contains a node outside `split.train_nodes`; or
+            `truth_graph` contains an edge with both endpoints inside
+            `split.v_val`.
     """
-    # V_hold/test-split membership is checked before the generic "outside
-    # V_fit" fallback: both partitions are disjoint from V_fit by construction
-    # (`derive_internal_holdout`), so a V_hold or test node is always also
-    # "outside V_fit" -- checking the specific partitions first gives the more
-    # diagnostic message instead of always being shadowed by the generic one.
-    v_fit = holdout.v_fit
-    foreign_truth = sorted(set(truth_graph.nodes) - v_fit)
-    if foreign_truth:
-        raise ValueError(
-            f"KD truth graph contains {len(foreign_truth)} node(s) outside V_fit "
-            f"(first few: {foreign_truth[:5]}); only g_fit_only truth is legal here"
-        )
-    hold_overlap = sorted(set(node_ids) & holdout.v_hold)
-    if hold_overlap:
-        raise ValueError(
-            f"KD node universe contains {len(hold_overlap)} V_hold node(s) "
-            f"(first few: {hold_overlap[:5]}); this is training-side leakage"
-        )
+    # Test-split membership is checked before the generic "outside the
+    # training universe" fallback: the test split is disjoint from
+    # `split.train_nodes` by construction, so a test node is always also
+    # "outside the training universe" -- checking the specific partition
+    # first gives the more diagnostic message instead of always being
+    # shadowed by the generic one.
     test_overlap = sorted(set(node_ids) & test_nodes)
     if test_overlap:
         raise ValueError(
             f"KD node universe contains {len(test_overlap)} benchmark test-split node(s) "
             f"(first few: {test_overlap[:5]})"
         )
-    foreign_universe = sorted(set(node_ids) - v_fit)
+    foreign_universe = sorted(set(node_ids) - split.train_nodes)
     if foreign_universe:
         raise ValueError(
-            f"KD node universe contains {len(foreign_universe)} node(s) outside V_fit "
-            f"(first few: {foreign_universe[:5]})"
+            f"KD node universe contains {len(foreign_universe)} node(s) outside the training "
+            f"universe (first few: {foreign_universe[:5]})"
+        )
+    foreign_truth = sorted(set(truth_graph.nodes) - split.train_nodes)
+    if foreign_truth:
+        raise ValueError(
+            f"KD truth graph contains {len(foreign_truth)} node(s) outside the training "
+            f"universe (first few: {foreign_truth[:5]}); only training-side truth is legal here"
+        )
+    internal_edges = sorted(
+        (u, v) for u, v in truth_graph.edges() if u in split.v_val and v in split.v_val
+    )
+    if internal_edges:
+        raise ValueError(
+            f"KD truth graph contains {len(internal_edges)} V_val-internal edge(s) "
+            f"(first few: {internal_edges[:5]}); the validation region is quarantined "
+            "from supervision"
         )
 
 
@@ -342,13 +367,15 @@ def score_kd_context(
     return teacher_logit, pooled_ab, cast(NDArray[np.float16], pooled_ba)
 
 
-def pair_labels(node_ids: Sequence[str], context: ContextSets, g_fit: nx.Graph) -> NDArray[np.int8]:
-    """Return 1 for a context pair that is a `g_fit` edge, else 0."""
+def pair_labels(
+    node_ids: Sequence[str], context: ContextSets, truth_graph: nx.Graph
+) -> NDArray[np.int8]:
+    """Return 1 for a context pair that is a `truth_graph` edge, else 0."""
     labels = np.zeros(len(context.anchor_idx), dtype=np.int8)
     for row, (anchor, partner) in enumerate(
         zip(context.anchor_idx.tolist(), context.partner_idx.tolist(), strict=True)
     ):
-        labels[row] = int(g_fit.has_edge(node_ids[anchor], node_ids[partner]))
+        labels[row] = int(truth_graph.has_edge(node_ids[anchor], node_ids[partner]))
     return labels
 
 
@@ -356,15 +383,25 @@ def pair_labels(node_ids: Sequence[str], context: ContextSets, g_fit: nx.Graph) 
 
 
 def build_stats_report(
-    teacher_logit: NDArray[np.float32], pair_label: NDArray[np.int8], is_near: NDArray[np.uint8]
+    teacher_logit: NDArray[np.float32],
+    pair_label: NDArray[np.int8],
+    is_near: NDArray[np.uint8],
+    *,
+    n_forbidden_internal_rows_excluded: int,
 ) -> dict[str, object]:
-    """The B1 plan's pre-check gate: entropy/calibration/hop-stratified summary stats."""
+    """The B1 plan's pre-check gate: entropy/calibration/hop-stratified summary stats.
+
+    `n_forbidden_internal_rows_excluded` is provenance only (never gates): the
+    number of V_val-internal candidate rows `sample_context_sets`'
+    `forbidden_internal` kept out of this artifact.
+    """
     logit64 = teacher_logit.astype(np.float64)
     prob = 1.0 / (1.0 + np.exp(-logit64))
     entropy = -(prob * np.log(prob + _STATS_EPS) + (1 - prob) * np.log(1 - prob + _STATS_EPS))
 
     report: dict[str, object] = {
         "n_pairs": int(len(teacher_logit)),
+        "n_forbidden_internal_rows_excluded": n_forbidden_internal_rows_excluded,
         "teacher_logit_overall": _histogram(logit64),
         "teacher_logit_negatives": _histogram(logit64[pair_label == 0]),
         "sigmoid_entropy": _histogram(entropy),
@@ -594,19 +631,24 @@ def main(argv: Sequence[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO)
     args = build_parser().parse_args(argv)
 
-    holdout, test_nodes = _load_v_fit_holdout(args.data_root, args.strategy)
-    truth_graph = truth_graph_for_kd(holdout)
+    split, test_nodes = _load_val_region_split(args.data_root, args.strategy)
+    truth_graph = truth_graph_for_kd(split)
     store = FeatureStore(args.data_root / _FEATURES_SUBDIR)
-    featureless = sorted(set(holdout.v_fit) - store.node_ids)
+    featureless = sorted(set(split.train_nodes) - store.node_ids)
     if featureless:
         # exclude_nodes filters only the pair files, so featureless nodes
         # survive in the graph; they cannot be scored or trained on.
-        logger.info("dropping %d V_fit nodes without stored features", len(featureless))
-    node_ids = sorted(set(holdout.v_fit) - set(featureless))
-    assert_v_fit_only(node_ids, truth_graph, holdout, test_nodes)
+        logger.info("dropping %d training nodes without stored features", len(featureless))
+    node_ids = sorted(set(split.train_nodes) - set(featureless))
+    assert_training_side_only(node_ids, truth_graph, split, test_nodes)
 
     context = sample_context_sets(
-        truth_graph, node_ids, seed=args.seed, k_near=args.k_near, k_rand=args.k_rand
+        truth_graph,
+        node_ids,
+        seed=args.seed,
+        k_near=args.k_near,
+        k_rand=args.k_rand,
+        forbidden_internal=split.v_val,
     )
 
     if args.merge:
@@ -684,6 +726,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         node_ids,
         context,
         truth_graph,
+        split.v_val,
         teacher_logit,
         pooled_ab,
         pooled_ba,
@@ -715,14 +758,15 @@ def _finish_merge(
             raise ValueError(
                 f"KD teacher targets require model_family 'egostitch_e2e', got {model_family!r}"
             )
-    holdout, test_nodes = _load_v_fit_holdout(args.data_root, args.strategy)
-    truth_graph = truth_graph_for_kd(holdout)
-    assert_v_fit_only(node_ids, truth_graph, holdout, test_nodes)
+    split, test_nodes = _load_val_region_split(args.data_root, args.strategy)
+    truth_graph = truth_graph_for_kd(split)
+    assert_training_side_only(node_ids, truth_graph, split, test_nodes)
     _finalize_artifact(
         args,
         node_ids,
         context,
         truth_graph,
+        split.v_val,
         teacher_logit,
         pooled_ab,
         pooled_ba,
@@ -731,11 +775,38 @@ def _finish_merge(
     )
 
 
+def _count_forbidden_internal_rows_excluded(
+    truth_graph: nx.Graph,
+    node_ids: Sequence[str],
+    v_val: frozenset[str],
+    *,
+    seed: int,
+    k_near: int,
+    k_rand: int,
+) -> int:
+    """Count V_val-internal rows `forbidden_internal=v_val` kept out of context sampling.
+
+    Provenance-only diagnostic (never gates): re-samples the identical
+    deterministic context with no exclusion and counts the rows both of whose
+    endpoints fall inside `v_val` -- exactly the rows a `forbidden_internal=v_val`
+    pass structurally cannot produce.
+    """
+    unguarded = sample_context_sets(truth_graph, node_ids, seed=seed, k_near=k_near, k_rand=k_rand)
+    anchor_in_v_val = np.fromiter(
+        (node_ids[i] in v_val for i in unguarded.anchor_idx.tolist()), dtype=bool
+    )
+    partner_in_v_val = np.fromiter(
+        (node_ids[j] in v_val for j in unguarded.partner_idx.tolist()), dtype=bool
+    )
+    return int(np.count_nonzero(anchor_in_v_val & partner_in_v_val))
+
+
 def _finalize_artifact(
     args: argparse.Namespace,
     node_ids: Sequence[str],
     context: ContextSets,
     truth_graph: nx.Graph,
+    v_val: frozenset[str],
     teacher_logit: NDArray[np.float32],
     pooled_ab: NDArray[np.float16],
     pooled_ba: NDArray[np.float16],
@@ -762,7 +833,15 @@ def _finalize_artifact(
         k_rand=args.k_rand,
         seed=args.seed,
     )
-    report = build_stats_report(teacher_logit, labels, context.is_near)
+    n_forbidden_internal_rows_excluded = _count_forbidden_internal_rows_excluded(
+        truth_graph, node_ids, v_val, seed=args.seed, k_near=args.k_near, k_rand=args.k_rand
+    )
+    report = build_stats_report(
+        teacher_logit,
+        labels,
+        context.is_near,
+        n_forbidden_internal_rows_excluded=n_forbidden_internal_rows_excluded,
+    )
     write_stats_report(args.output, report)
 
 

@@ -1,21 +1,19 @@
 """Benchmark artifact loading, feature access, partitions, and pair sampling."""
 
-from src.data.internal_holdout import (
-    InternalHoldoutPartition,
-    OverlapProof,
-    PairLabelManifest,
-    QuarantineCounts,
-    build_pair_label_manifest,
-    canonical_pair_label_sha256,
-    derive_internal_holdout,
+from src.data.val_region import (
+    ValRegionParams,
+    ValRegionSplit,
+    derive_val_region_split,
+    region_fidelity_stats,
+    sample_bfs_ball_buckets,
+    val_universe_arrays,
 )
 
 __all__ = [
-    "InternalHoldoutPartition",
-    "OverlapProof",
-    "PairLabelManifest",
-    "QuarantineCounts",
-    "build_pair_label_manifest",
-    "canonical_pair_label_sha256",
-    "derive_internal_holdout",
+    "ValRegionParams",
+    "ValRegionSplit",
+    "derive_val_region_split",
+    "region_fidelity_stats",
+    "sample_bfs_ball_buckets",
+    "val_universe_arrays",
 ]

@@ -14,7 +14,6 @@ Usage:
   hpc/run.sh check
   hpc/run.sh train <config.yaml> [train args...]
   hpc/run.sh score <score args...>
-  hpc/run.sh recover-v-hold <recovery args...>
   hpc/run.sh test <test args...>
   hpc/run.sh merge <merge args...>
   hpc/run.sh g1 <g1 args...>
@@ -58,8 +57,9 @@ the `full` arm's checkpoint and have no pipeline run of their own.
 
 The kd-targets command is a thin passthrough to `python -m
 src.distill.teacher_targets` (B1 plan), which dumps the Full-Ego Pooled Oracle
-KD teacher-target artifact over V_fit-only anchor/context pairs from one
-published `full_ego_oracle` checkpoint. It scores on a single GPU -- there is
+KD teacher-target artifact over the training universe's anchor/context pairs
+(V_val-internal pairs quarantined) from one published `full_ego_oracle`
+checkpoint. It scores on a single GPU -- there is
 no world-size fan-out to size, unlike `train`/`score` -- so pass `--device
 cuda` explicitly; `--data-root`/`--strategy` default to this repository's data
 root and `breadth_first` but may be overridden after the command's own args.
@@ -155,11 +155,6 @@ print(cfg.output_dir, cfg.strategy, cfg.seed)
     ;;
   score)
     exec "${PYTHON_BIN}" -m src.score_fanout "$@"
-    ;;
-  recover-v-hold)
-    exec "${PYTHON_BIN}" -m accelerate.commands.launch \
-      --num_processes "${GPU_COUNT}" --mixed_precision bf16 \
-      -m src.experiments.v_hold_checkpoint_recovery "$@"
     ;;
   test)
     exec "${PYTHON_BIN}" -m src.eval.test_protocol "$@"

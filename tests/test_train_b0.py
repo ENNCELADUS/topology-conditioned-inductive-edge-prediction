@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import pickle
 import shutil
@@ -26,7 +27,10 @@ from src.data.artifacts import ArtifactVerificationError
 from src.data.distributed_pairs import CompactPairBatchDataset, PairBatchSpec
 from src.data.packed_features import PackedFeatureTable, build_packed_features
 from src.data.pairs import TokenPairDataset
+from src.data.val_region import ValRegionParams, val_universe_arrays
+from src.eval.checkpoint_selection import TopologyValidationMetrics
 from src.eval.edge_metrics import EdgeMetrics
+from src.eval.val_topology import ValTopologyReference, build_val_topology_reference
 from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
 from src.model.egostitch.classifier.layers import MLPHead
 from src.train_b0 import (
@@ -42,11 +46,16 @@ from src.train_b0 import (
     _cycle_assembled_batches,
     _EpochGpuBatchIterable,
     _evaluate_distributed,
+    _evaluate_two_pass,
+    _evaluate_val_universe,
     _interleave_bucket_specs,
     _run_ddp_worker,
     _run_probe_mode,
     _run_rank_symmetric,
     _run_timed_epoch_probe,
+    _topology_from_metrics_row,
+    _training_rows,
+    _val_cls_rows,
     _validate_distributed_plan,
     apply_overrides,
     assemble_data,
@@ -66,6 +75,14 @@ from src.train_b0 import (
 from torch.utils.data import DataLoader
 
 pytestmark = pytest.mark.unit
+
+# Tiny V_val seam: n_regions=1 keeps growth on the fixture's single path
+# component; buckets_per_size=2 is `precompute_bucket_reference`'s minimum for
+# an odd/even floor split. See `_build_synthetic_benchmark` for the fixture
+# this is derived against.
+_TINY_VAL_REGION_PARAMS = ValRegionParams(
+    n_regions=1, edge_fraction=0.3, bucket_sizes=(2, 3), buckets_per_size=2, negative_seed=0
+)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -750,48 +767,53 @@ def _write_edge_list_file(path: Path, pairs: list[tuple[str, str]]) -> None:
 
 
 def _build_synthetic_benchmark(root: Path, strategy: str) -> None:
-    """Write a tiny, internally-consistent benchmark package (no verify_benchmark)."""
+    """Write a tiny, internally-consistent benchmark package (no verify_benchmark).
+
+    Train side is a 10-node path (`node_000001`-`node_000010`, 9 edges) so
+    `_TINY_VAL_REGION_PARAMS` (n_regions=1, edge_fraction=0.3) grows a
+    deterministic 4-node/3-edge V_val region {node_000001..node_000004} off
+    one path end: each claimed node contributes exactly one new edge to a
+    contiguous sub-path, so growth crosses `0.3 * 9 = 2.7` at exactly 4 nodes
+    regardless of hashed seed/frontier order. Test side is two disconnected
+    nodes, matching the original fixture's shape.
+    """
     graph = nx.Graph()
-    graph.add_nodes_from([f"node_{i:06d}" for i in range(1, 8)])
-    graph.add_edges_from(
-        [
-            ("node_000001", "node_000002"),
-            ("node_000003", "node_000004"),
-            ("node_000005", "node_000006"),
-        ]
-    )
+    graph.add_nodes_from([f"node_{i:06d}" for i in range(1, 13)])
+    path_edges = [(f"node_{i:06d}", f"node_{i + 1:06d}") for i in range(1, 10)]
+    graph.add_edges_from(path_edges)
     with (root / "graph.pkl").open("wb") as f:
         pickle.dump(graph, f)
-    _write_edge_list_file(
-        root / "positive_edges.txt",
-        [("node_000001", "node_000002"), ("node_000003", "node_000004")],
-    )
+    _write_edge_list_file(root / "positive_edges.txt", path_edges)
 
     strategy_dir = root / strategy
     strategy_dir.mkdir(parents=True)
-    train_nodes = {f"node_{i:06d}" for i in range(1, 6)}
-    test_nodes = {"node_000006", "node_000007"}
+    train_nodes = {f"node_{i:06d}" for i in range(1, 11)}
+    test_nodes = {"node_000011", "node_000012"}
     with (strategy_dir / "split.pkl").open("wb") as f:
         pickle.dump({"train": train_nodes, "test": test_nodes}, f)
 
     _write_pairs_file(
         strategy_dir / "train_edges.txt",
         [
-            ("node_000001", "node_000002", 1),
-            ("node_000003", "node_000004", 1),
-            ("node_000002", "node_000005", 0),
-            ("node_000001", "node_000004", 0),
+            ("node_000004", "node_000005", 1),
+            ("node_000006", "node_000007", 1),
+            ("node_000005", "node_000009", 0),  # both outside V_val
+            ("node_000001", "node_000004", 0),  # V_val-internal
         ],
     )
     _write_pairs_file(
         strategy_dir / "val_edges.txt",
-        [("node_000001", "node_000003", 0), ("node_000004", "node_000005", 0)],
+        [
+            ("node_000008", "node_000009", 1),
+            ("node_000002", "node_000004", 0),  # V_val-internal
+            ("node_000006", "node_000010", 0),  # both outside V_val
+        ],
     )
-    _write_pairs_file(strategy_dir / "test_edges.txt", [("node_000006", "node_000007", 0)])
+    _write_pairs_file(strategy_dir / "test_edges.txt", [("node_000011", "node_000012", 0)])
 
     train_graph = nx.Graph()
     train_graph.add_nodes_from(train_nodes)
-    train_graph.add_edges_from([("node_000001", "node_000002"), ("node_000003", "node_000004")])
+    train_graph.add_edges_from(path_edges)
     with (strategy_dir / "train_graph.pkl").open("wb") as f:
         pickle.dump(train_graph, f)
 
@@ -854,13 +876,13 @@ class TestAssembleDataFeatureCoverageGate:
         benchmark_root.mkdir(parents=True)
         _build_synthetic_benchmark(benchmark_root, "synthetic")
         features_root = data_root / "features" / "frozen_node_features_1024"
-        # All graph nodes have features EXCEPT node_000007 -> exclude == {node_000007}
-        all_nodes = [f"node_{i:06d}" for i in range(1, 7)]
+        # All graph nodes have features EXCEPT node_000012 -> exclude == {node_000012}
+        all_nodes = [f"node_{i:06d}" for i in range(1, 12)]
         _write_feature_store(features_root, all_nodes)
 
         cfg = _synthetic_data_config(data_root, expected_missing_features=[])
 
-        with pytest.raises(ArtifactVerificationError, match="node_000007"):
+        with pytest.raises(ArtifactVerificationError, match="node_000012"):
             assemble_data(cfg, verify=False)
 
     def test_passes_when_exclude_set_matches_expected(self, tmp_path: Path) -> None:
@@ -869,22 +891,32 @@ class TestAssembleDataFeatureCoverageGate:
         benchmark_root.mkdir(parents=True)
         _build_synthetic_benchmark(benchmark_root, "synthetic")
         features_root = data_root / "features" / "frozen_node_features_1024"
-        all_nodes = [f"node_{i:06d}" for i in range(1, 7)]
+        all_nodes = [f"node_{i:06d}" for i in range(1, 12)]
         _write_feature_store(features_root, all_nodes)
 
-        cfg = _synthetic_data_config(data_root, expected_missing_features=["node_000007"])
+        cfg = _synthetic_data_config(data_root, expected_missing_features=["node_000012"])
 
-        assembled = assemble_data(cfg, verify=False)
+        assembled = assemble_data(cfg, verify=False, val_region_params=_TINY_VAL_REGION_PARAMS)
 
         assert isinstance(assembled, AssembledData)
-        assert assembled.operative_node_count == 6
-        # node_000007 is test-side only and touches zero train/val pairs here.
+        assert assembled.operative_node_count == 11
+        # node_000012 is test-side only and touches zero train/val pairs here.
         assert assembled.dropped_pair_counts["train_edges.txt"] == 0
         assert assembled.dropped_pair_counts["val_edges.txt"] == 0
-        assert len(assembled.training_positives) == 2  # the two train+ positives
-        assert assembled.degrees["node_000001"] == 1
-        assert assembled.degrees["node_000002"] == 1
-        assert assembled.degrees["node_000003"] == 1
+        # V_val grows to {node_000001..node_000004} (see _build_synthetic_benchmark);
+        # the remaining 6-edge subpath node_000004-node_000010 is left for training,
+        # so node_000001-3 (V_val-internal only) are isolated in g_struct and
+        # node_000004 (the cross-boundary node) keeps degree 1.
+        assert assembled.val_split.v_val == {
+            "node_000001",
+            "node_000002",
+            "node_000003",
+            "node_000004",
+        }
+        assert len(assembled.training_positives) == 6
+        assert assembled.degrees["node_000001"] == 0
+        assert assembled.degrees["node_000002"] == 0
+        assert assembled.degrees["node_000003"] == 0
         assert assembled.degrees["node_000004"] == 1
 
 
@@ -895,20 +927,15 @@ class TestV31TrainingLoader:
         benchmark_root.mkdir(parents=True)
         _build_synthetic_benchmark(benchmark_root, "synthetic")
         features_root = data_root / "features" / "frozen_node_features_1024"
-        all_nodes = [f"node_{i:06d}" for i in range(1, 7)]
+        all_nodes = [f"node_{i:06d}" for i in range(1, 12)]
         _write_feature_store(features_root, all_nodes)
-        cfg = _synthetic_data_config(data_root, expected_missing_features=["node_000007"])
+        cfg = _synthetic_data_config(data_root, expected_missing_features=["node_000012"])
         cfg = replace(cfg, model=replace(cfg.model, family="v3_1"))
-        assembled = assemble_data(cfg, verify=False)
+        assembled = assemble_data(cfg, verify=False, val_region_params=_TINY_VAL_REGION_PARAMS)
 
         factory, _ = _build_v3_1_loaders(cfg, assembled)
-        expected = Counter(
-            zip(
-                assembled.benchmark.split.train_pairs.pairs,
-                assembled.benchmark.split.train_pairs.labels.tolist(),
-                strict=True,
-            )
-        )
+        positives, negatives = _training_rows(assembled.val_split, assembled.exclude_nodes)
+        expected = Counter([(pair, 1) for pair in positives] + [(pair, 0) for pair in negatives])
 
         for epoch in (0, 1):
             loader = factory(epoch)
@@ -918,12 +945,14 @@ class TestV31TrainingLoader:
             assert dataset._labels is not None
             observed = Counter(zip(dataset._pairs, dataset._labels, strict=True))
             assert observed == expected
-            assert Counter(dataset._labels) == {0: 2, 1: 2}
+            assert Counter(dataset._labels) == {0: len(negatives), 1: len(positives)}
 
 
 def _synthetic_v31_pack_fixture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    input_dim: int = 4,
 ) -> tuple[Config, AssembledData, Path]:
     """Build a synthetic benchmark + feature store + packed feature table."""
     data_root = tmp_path / "data"
@@ -931,7 +960,9 @@ def _synthetic_v31_pack_fixture(
     benchmark_root.mkdir(parents=True)
     _build_synthetic_benchmark(benchmark_root, "synthetic")
     source_root = data_root / "features" / "frozen_node_features_1024"
-    _write_feature_store(source_root, [f"node_{index:06d}" for index in range(1, 7)])
+    _write_feature_store(
+        source_root, [f"node_{index:06d}" for index in range(1, 12)], input_dim=input_dim
+    )
     cfg = load_config(Path("configs/b0_v31_breadth_first.yaml"))
     assert cfg.runtime is not None
     cfg = replace(
@@ -940,7 +971,7 @@ def _synthetic_v31_pack_fixture(
             cfg.data,
             root=data_root,
             strategy="synthetic",
-            expected_missing_features=["node_000007"],
+            expected_missing_features=["node_000012"],
         ),
         runtime=replace(
             cfg.runtime,
@@ -949,7 +980,7 @@ def _synthetic_v31_pack_fixture(
         ),
         output_dir=tmp_path / "outputs",
     )
-    assembled = assemble_data(cfg, verify=False)
+    assembled = assemble_data(cfg, verify=False, val_region_params=_TINY_VAL_REGION_PARAMS)
     pack_root = tmp_path / "pack"
     monkeypatch.setattr(packed_features, "ProcessPoolExecutor", ThreadPoolExecutor)
     build_packed_features(source_root, pack_root, workers=1)
@@ -1002,8 +1033,10 @@ def test_packed_loader_multi_worker_ranks_cover_all_rows(
     assert cfg.runtime is not None
     table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
     # All synthetic features are length 3 -> every pair lands in bucket 128, and the
-    # train (4 rows) and val (2 rows) buckets both satisfy the >= world_size planner gate.
-    expected_row_ids = list(range(len(assembled.benchmark.split.train_pairs.pairs)))
+    # train (6 positives + 2 negatives) and val (6 rows) buckets both satisfy the
+    # >= world_size planner gate.
+    positives, negatives = _training_rows(assembled.val_split, assembled.exclude_nodes)
+    expected_row_ids = list(range(len(positives) + len(negatives)))
     seen_row_ids: list[int] = []
     for process_index in (0, 1):
         multi_worker_factory, _, _, _ = _build_packed_v3_1_loaders(
@@ -1081,6 +1114,74 @@ def test_packed_loader_enables_persistent_workers_and_reuses_loader(
     assert epoch_two._source is loader
     assert loader.num_workers == 1
     assert loader.persistent_workers is True
+
+
+def test_two_pass_evaluate_fn_produces_cls_metrics_and_finite_topology(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Check the two-pass `evaluate_fn` wiring end to end, DDP-free.
+
+    A real V3.1 model over a real (tiny) packed table scores both the cls
+    validation pass and the V_val topology universe pass, exactly as
+    `_run_ddp_worker` composes `evaluate_fn` in production.
+    """
+    # input_dim=8 matches _tiny_v3_1_model(); the shared packed-loader fixture
+    # defaults to input_dim=4 for its own (model-forward-free) tests.
+    cfg, assembled, pack_root = _synthetic_v31_pack_fixture(tmp_path, monkeypatch, input_dim=8)
+    table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
+    _factory, val_loader, _warmup_steps, _schedule_total_steps = _build_packed_v3_1_loaders(
+        cfg, assembled, table, token_budget_per_rank=1024, process_index=0, world_size=1
+    )
+
+    val_split = assembled.val_split
+    reference = build_val_topology_reference(val_split)
+    u_idx, v_idx = val_universe_arrays(val_split.v_val)
+    node_index = table.manifest.node_index()
+    lengths_by_node = {record.node_id: record.length for record in table.manifest.nodes}
+    node_positions = np.array([node_index[node] for node in reference.nodes], dtype=np.int64)
+    node_a_all = torch.from_numpy(node_positions[u_idx]).to(torch.int64)
+    node_b_all = torch.from_numpy(node_positions[v_idx]).to(torch.int64)
+    boundary = max(lengths_by_node[node] for node in reference.nodes)
+
+    val_cls_pairs, _val_cls_labels = _val_cls_rows(val_split, assembled.exclude_nodes)
+    evaluate_fn = functools.partial(
+        _evaluate_two_pass,
+        expected_row_ids=np.arange(len(val_cls_pairs), dtype=np.int64),
+        topology_eval_fn=functools.partial(
+            _evaluate_val_universe,
+            table=table,
+            node_a_all=node_a_all,
+            node_b_all=node_b_all,
+            boundary=boundary,
+            batch_pairs=8,
+            u_idx=u_idx,
+            v_idx=v_idx,
+            reference=reference,
+        ),
+    )
+
+    # bf16 packed features need an autocast forward, exactly as the real bf16
+    # `mixed_precision` run gets from `accelerator.prepare`; a bare `Accelerator()`
+    # here avoids re-initializing the process-wide `AcceleratorState` that
+    # earlier tests in this module may have already locked to "no".
+    accelerator = Accelerator()
+    model = _tiny_v3_1_model()
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        outcome = evaluate_fn(model, val_loader, accelerator)
+
+    assert isinstance(outcome.metrics, EdgeMetrics)
+    assert outcome.topology is not None
+    assert all(
+        np.isfinite(value)
+        for value in (
+            outcome.topology.gs,
+            outcome.topology.rd,
+            outcome.topology.degree_mmd,
+            outcome.topology.clustering_mmd,
+            outcome.topology.spectral_mmd,
+        )
+    )
 
 
 def test_distributed_plan_rejects_duplicate_and_missing_rows() -> None:
@@ -1373,10 +1474,34 @@ def test_epoch_probe_uses_disposable_artifact_directory(
         lambda config: SimpleNamespace(
             benchmark=SimpleNamespace(
                 split=SimpleNamespace(val_pairs=SimpleNamespace(pairs=(("a", "b"),), labels=(1,)))
+            ),
+            val_split=SimpleNamespace(
+                val_cls_pairs=[("a", "b")], val_cls_labels=[1], v_val=frozenset({"node_a"})
+            ),
+            exclude_nodes=frozenset(),
+        ),
+    )
+    # The V_val topology-reference build reads real graph/bucket structure off
+    # `val_split`; stubbed here since this test only exercises artifact-directory
+    # isolation (`evaluate_fn` is bound but never invoked -- `train_ddp_loop`
+    # itself is faked below).
+    monkeypatch.setattr(
+        "src.train_b0.build_val_topology_reference",
+        lambda val_split: SimpleNamespace(nodes=("node_a",)),
+    )
+    monkeypatch.setattr(
+        "src.train_b0.val_universe_arrays",
+        lambda v_val: (np.array([0], dtype=np.int32), np.array([0], dtype=np.int32)),
+    )
+    monkeypatch.setattr(
+        "src.train_b0.PackedFeatureTable.from_pack",
+        lambda path, device: SimpleNamespace(
+            manifest=SimpleNamespace(
+                node_index=lambda: {"node_a": 0},
+                nodes=[SimpleNamespace(node_id="node_a", length=1)],
             )
         ),
     )
-    monkeypatch.setattr("src.train_b0.PackedFeatureTable.from_pack", lambda path, device: object())
     monkeypatch.setattr(
         "src.train_b0._build_packed_v3_1_loaders",
         lambda *args, **kwargs: (lambda epoch: [], [], 1, 1),
@@ -1573,6 +1698,78 @@ def test_evaluate_distributed_coverage_failure_raises_on_non_main_rank() -> None
         )
 
 
+class _FakeUniverseTable:
+    """Duck-typed packed-table stand-in for `_evaluate_val_universe` (tokens unused)."""
+
+    def __init__(self, dim: int = 4) -> None:
+        self.tokens = torch.zeros(1, dim)
+        self._dim = dim
+
+    def gather_nodes(
+        self, node_indices: torch.Tensor, boundary: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        emb = torch.zeros(node_indices.numel(), boundary, self._dim)
+        lengths = torch.ones(node_indices.numel(), dtype=torch.long)
+        return emb, lengths
+
+
+class _StubUniverseModel(nn.Module):
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {"logits": torch.zeros(batch["emb_a"].shape[0])}
+
+
+def test_evaluate_val_universe_coverage_failure_raises_on_non_main_rank() -> None:
+    # Mirrors test_evaluate_distributed_coverage_failure_raises_on_non_main_rank:
+    # with an identity gather/pad and a simulated 2-rank world, this single call
+    # only ever sees rank 1's own strided shard, so the coverage check must
+    # raise on every rank rather than silently scoring a partial universe.
+    model = _StubUniverseModel()
+    table = cast(PackedFeatureTable, _FakeUniverseTable())
+    node_a_all = torch.arange(4, dtype=torch.int64)
+    node_b_all = torch.arange(4, dtype=torch.int64)
+    accelerator = cast(Accelerator, _NonMainGatherAccelerator())
+    u_idx = np.array([0, 0, 1, 2], dtype=np.int32)
+    v_idx = np.array([1, 2, 2, 3], dtype=np.int32)
+
+    with pytest.raises(ValueError, match="do not cover the fixed validation set"):
+        _evaluate_val_universe(
+            model,
+            accelerator,
+            table=table,
+            node_a_all=node_a_all,
+            node_b_all=node_b_all,
+            boundary=1,
+            batch_pairs=4,
+            u_idx=u_idx,
+            v_idx=v_idx,
+            reference=cast(ValTopologyReference, None),
+        )
+
+
+def test_topology_from_metrics_row_ignores_old_style_keys() -> None:
+    old_row: dict[str, object] = {
+        "val_gs": 0.5,
+        "val_rd": 1.0,
+        "val_degree_mmd": 0.1,
+        "val_clustering_mmd": 0.2,
+        "val_spectral_mmd": 0.3,
+    }
+    assert _topology_from_metrics_row(old_row) is None
+
+
+def test_topology_from_metrics_row_parses_new_keys() -> None:
+    row: dict[str, object] = {
+        "val_gs_bfs": 0.5,
+        "val_rd_bfs": 1.0,
+        "val_degree_mmd_ratio": 0.1,
+        "val_clustering_mmd_ratio": 0.2,
+        "val_spectral_mmd_ratio": 0.3,
+    }
+    assert _topology_from_metrics_row(row) == TopologyValidationMetrics(
+        gs=0.5, rd=1.0, degree_mmd=0.1, clustering_mmd=0.2, spectral_mmd=0.3
+    )
+
+
 def test_ddp_loop_records_counterfactual_stop_but_runs_all_epochs(tmp_path: Path) -> None:
     config_path = tmp_path / "cfg.yaml"
     _write_yaml_config(config_path, {"optim.epochs": 4, "eval.patience": 1})
@@ -1623,6 +1820,33 @@ def test_ddp_loop_records_counterfactual_stop_but_runs_all_epochs(tmp_path: Path
     assert len(result.history) == 4
     assert [entry["epoch"] for entry in result.history] == [1, 2, 3, 4]
     assert len(cast(list[object], result.runtime_profile["per_epoch"])) == 4
+
+
+def test_ddp_loop_require_topology_raises_when_an_epoch_has_no_topology(tmp_path: Path) -> None:
+    config_path = tmp_path / "cfg.yaml"
+    _write_yaml_config(config_path, {"optim.epochs": 2, "eval.patience": 5})
+    cfg = load_config(config_path)
+    model = _TinyPairMLP(input_dim=4, hidden_dims=(8,), dropout=0.0)
+    batch = _batch_of(_make_synthetic_pair_dataset(8))
+    batch["_local_pair_count"] = torch.tensor(8)
+    batch["_global_pair_count"] = torch.tensor(8)
+    batch["_row_id"] = torch.arange(8)
+
+    with pytest.raises(RuntimeError, match="resume across the V_val protocol change unsupported"):
+        train_ddp_loop(
+            model,
+            lambda epoch: [batch],
+            [batch],
+            cfg,
+            Accelerator(),
+            warmup_steps=1,
+            artifact_dir=tmp_path / "attempt",
+            profile_output=tmp_path / "attempt" / "worker_profile.json",
+            evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(
+                _constant_metrics(), None
+            ),
+            require_topology=True,
+        )
 
 
 class _BatchValueLossModel(nn.Module):

@@ -22,7 +22,7 @@ def _model_config() -> E2EConfig:
         {
             "generator": {
                 "name": "full_ego_oracle",
-                "oracle_truth_source": "g_fit_plus_v_hold",
+                "oracle_truth_source": "training_structure_plus_g_val",
                 "feature_standardization": "row_layernorm",
             },
             "encoder": {"name": "grit_gmt", "w_rel": 0.0},
@@ -43,9 +43,11 @@ def test_full_oracle_config_registry_and_arm_are_distinct() -> None:
     assert train_egostitch._e2e_arm_name_from_config(cfg) == "full_ego_oracle"
 
 
-def test_non_oracle_cannot_request_v_hold_truth() -> None:
+def test_non_oracle_cannot_request_v_val_truth() -> None:
     with pytest.raises(ValueError, match="requires name='oracle_struct'"):
-        GeneratorConfig(name="egostitch_imagine", oracle_truth_source="g_fit_plus_v_hold")
+        GeneratorConfig(
+            name="egostitch_imagine", oracle_truth_source="training_structure_plus_g_val"
+        )
 
 
 def test_scoring_installs_full_truth_graph_without_slot_table() -> None:
@@ -111,7 +113,7 @@ def test_runnable_config_uses_logical_128_training_and_bucketed_scoring() -> Non
     cfg = E2EConfig.from_mapping(payload["model"]["config"])
 
     assert cfg.generator.name == "full_ego_oracle"
-    assert cfg.generator.oracle_truth_source == "g_fit_plus_v_hold"
+    assert cfg.generator.oracle_truth_source == "training_structure_plus_g_val"
     assert cfg.encoder.name == "grit_gmt"
     assert cfg.encoder.w_rel == 0.0
     assert cfg.classifier.conditioning_mode == "pooled_adapter"

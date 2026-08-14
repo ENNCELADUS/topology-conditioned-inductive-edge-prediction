@@ -483,7 +483,7 @@ class TestRunTestProtocol:
         (output_dir / "operating_point.json").write_text("{}\n", encoding="utf-8")
         runner = _FakeScoreRunner(fixture.artifacts)
 
-        with pytest.raises(ValueError, match="obsolete max-F1/V_hold"):
+        with pytest.raises(ValueError, match="obsolete max-F1"):
             run_test_protocol(
                 checkpoint=_write_checkpoint(tmp_path),
                 output_dir=output_dir,

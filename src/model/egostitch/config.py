@@ -221,11 +221,13 @@ class GeneratorConfig:
             oracle runs with different subsamples would be indistinguishable
             in the run record.
         oracle_truth_source: Graph an oracle generator reads its topology from.
-            ``"g_fit"`` keeps the inductive input boundary, so every held-out
-            node gets an empty scaffold. ``"g_fit_plus_v_hold"`` attaches the
-            internal validation positives as a disjoint component and is
-            therefore a diagnostic-only true-oracle ceiling, never a formal
-            experiment input.
+            ``"training_structure"`` is the training graph alone, which already
+            carries every V_val node via its legal cross-boundary edges.
+            ``"training_structure_plus_g_val"`` additionally overlays the
+            V_val-internal positives the training graph excludes by
+            construction, so a V_val node's within-region neighbors also
+            appear; it is therefore a diagnostic-only true-oracle ceiling,
+            never a formal experiment input.
         n_ground: Grounding candidates per node `n_g` (spec Sec 14.4.4;
             supersedes the internal generator's own pinned `EgoStitchConfig`
             default for this family).
@@ -251,7 +253,7 @@ class GeneratorConfig:
     tau_div: float = 0.5
     l_gate_pos_weight: float = 6.17
     oracle_seed: int = 0
-    oracle_truth_source: str = "g_fit"
+    oracle_truth_source: str = "training_structure"
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants.
@@ -263,15 +265,21 @@ class GeneratorConfig:
             raise ValueError(f"n_ground must be positive, got {self.n_ground}")
         if self.oracle_seed < 0:
             raise ValueError(f"oracle_seed must be non-negative, got {self.oracle_seed}")
-        if self.oracle_truth_source not in ("g_fit", "g_fit_plus_v_hold"):
-            raise ValueError("oracle_truth_source must be one of ['g_fit', 'g_fit_plus_v_hold']")
-        if self.oracle_truth_source != "g_fit" and self.name not in (
+        if self.oracle_truth_source not in (
+            "training_structure",
+            "training_structure_plus_g_val",
+        ):
+            raise ValueError(
+                "oracle_truth_source must be one of "
+                "['training_structure', 'training_structure_plus_g_val']"
+            )
+        if self.oracle_truth_source != "training_structure" and self.name not in (
             "oracle_struct",
             "full_ego_oracle",
         ):
             raise ValueError(
-                "oracle_truth_source='g_fit_plus_v_hold' requires name='oracle_struct' "
-                "or name='full_ego_oracle'"
+                "oracle_truth_source='training_structure_plus_g_val' requires "
+                "name='oracle_struct' or name='full_ego_oracle'"
             )
         if not 0.0 < self.tau_adj < 1.0:
             raise ValueError(f"tau_adj must be in (0, 1), got {self.tau_adj}")

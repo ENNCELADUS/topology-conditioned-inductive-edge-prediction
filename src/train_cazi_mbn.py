@@ -28,8 +28,8 @@ from src.baselines.cazi_mbn import CAZIStudent, CAZITeacher
 from src.data.artifacts import Benchmark, LabeledPairs, load_benchmark, load_candidate_pairs
 from src.data.feature_stats import FeatureStats, feature_stats_for_universe
 from src.data.features import FeatureStore, build_f0_matrix
-from src.data.internal_holdout import derive_internal_holdout
-from src.data.partition import build_g_struct, derive_training_interactions
+from src.data.partition import build_g_struct
+from src.data.val_region import derive_val_region_split, val_universe_arrays
 from src.eval.assembly import assemble_graph, density_matched_threshold
 from src.eval.edge_metrics import compute_edge_metrics
 from src.eval.graph_metrics import MMDConfig, strip_self_loops
@@ -307,22 +307,37 @@ def prepare_data(cfg: CAZIConfig) -> PreparedData:
         verify=True,
         exclude_nodes=missing,
     )
-    cfg.f0_cache.parent.mkdir(parents=True, exist_ok=True)
-    f0, f0_position = build_f0_matrix(store, operative_nodes, cache_path=cfg.f0_cache)
-    all_train_nodes = sorted(set(benchmark.split.train_nodes) - missing)
-    all_train_positive = {
+    # V_val derivation needs the raw label-0 rows; `benchmark` above already
+    # dropped `missing`-touching rows, so re-read train/val_edges.txt unfiltered
+    # here (train_graph.pkl and train_nodes are never exclude-node filtered).
+    raw_benchmark = load_benchmark(benchmark_root, cfg.strategy, verify=False)
+    raw_negatives = [
         pair
         for pair, label in zip(
-            benchmark.split.train_pairs.pairs,
-            benchmark.split.train_pairs.labels,
+            raw_benchmark.split.train_pairs.pairs,
+            raw_benchmark.split.train_pairs.labels,
             strict=True,
         )
-        if label == 1
-    }
-    interactions = derive_training_interactions(sorted(all_train_positive))
-    holdout = derive_internal_holdout(all_train_nodes, interactions.positives)
-    train_nodes = sorted(holdout.v_fit)
-    student_val_nodes = sorted(holdout.v_hold)
+        if label == 0
+    ] + [
+        pair
+        for pair, label in zip(
+            raw_benchmark.split.val_pairs.pairs,
+            raw_benchmark.split.val_pairs.labels,
+            strict=True,
+        )
+        if label == 0
+    ]
+    val_split = derive_val_region_split(
+        benchmark.split.train_nodes,
+        benchmark.split.train_graph.edges(),
+        raw_negatives,
+        benchmark.positive_edges,
+    )
+    cfg.f0_cache.parent.mkdir(parents=True, exist_ok=True)
+    f0, f0_position = build_f0_matrix(store, operative_nodes, cache_path=cfg.f0_cache)
+    train_nodes = sorted(val_split.train_nodes - missing)
+    student_val_nodes = sorted(val_split.v_val)
     train_node_position = {node: i for i, node in enumerate(train_nodes)}
     student_val_position = {node: i for i, node in enumerate(student_val_nodes)}
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
@@ -337,24 +352,22 @@ def prepare_data(cfg: CAZIConfig) -> PreparedData:
         f0[[f0_position[node] for node in student_val_nodes]], feature_stats
     )
 
-    fit_pair_rows: list[tuple[str, str]] = []
-    fit_pair_labels: list[int] = []
-    for pair, label in zip(
-        benchmark.split.train_pairs.pairs,
-        benchmark.split.train_pairs.labels,
-        strict=True,
-    ):
-        if pair[0] in holdout.v_fit and pair[1] in holdout.v_fit:
-            fit_pair_rows.append(pair)
-            fit_pair_labels.append(int(label))
-    fit_labels = np.asarray(fit_pair_labels, dtype=np.int8)
-    fit_positive_rows = {
-        pair for pair, label in zip(fit_pair_rows, fit_labels, strict=True) if label == 1
-    }
-    if fit_positive_rows != set(holdout.training_interactions_fit):
-        raise AssertionError("CAZI classification and topology positives disagree on V_fit")
-    g_struct = build_g_struct(train_nodes, holdout.topology_fit)
+    training_positives = sorted(
+        pair
+        for pair in val_split.training_positives
+        if pair[0] not in missing and pair[1] not in missing
+    )
+    training_negatives = [
+        pair
+        for pair in val_split.training_negatives
+        if pair[0] not in missing and pair[1] not in missing
+    ]
+    g_struct = build_g_struct(train_nodes, training_positives)
     topology_edges = sorted(cast(Iterable[tuple[str, str]], g_struct.edges()))
+    fit_pair_rows = training_positives + training_negatives
+    fit_labels = np.asarray(
+        [1] * len(training_positives) + [0] * len(training_negatives), dtype=np.int8
+    )
     rng = np.random.default_rng(cfg.seed)
     permutation = rng.permutation(len(fit_pair_rows))
     train_pairs = [fit_pair_rows[int(i)] for i in permutation]
@@ -376,18 +389,19 @@ def prepare_data(cfg: CAZIConfig) -> PreparedData:
         feature_length=cfg.topology_dim,
         seed=cfg.seed,
     )
-    teacher_val_pairs: list[tuple[str, str]] = []
-    teacher_val_labels: list[int] = []
-    for pair, label in zip(
-        benchmark.split.val_pairs.pairs,
-        benchmark.split.val_pairs.labels,
-        strict=True,
-    ):
-        if pair[0] in holdout.v_fit and pair[1] in holdout.v_fit:
-            teacher_val_pairs.append(pair)
-            teacher_val_labels.append(int(label))
-    if not teacher_val_pairs or len(set(teacher_val_labels)) != 2:
-        raise ValueError("CAZI teacher validation must contain both classes on V_fit")
+    teacher_val_pairs = list(val_split.val_cls_pairs)
+    teacher_val_labels = np.asarray(val_split.val_cls_labels, dtype=np.int8)
+    if not teacher_val_pairs or len(set(teacher_val_labels.tolist())) != 2:
+        raise ValueError("CAZI teacher validation must contain both classes on V_val")
+    u_idx, v_idx = val_universe_arrays(val_split.v_val)
+    g_val = val_split.build_g_val()
+    student_val_pairs = [
+        (student_val_nodes[int(u)], student_val_nodes[int(v)])
+        for u, v in zip(u_idx, v_idx, strict=True)
+    ]
+    student_val_labels = np.asarray(
+        [1 if g_val.has_edge(a, b) else 0 for a, b in student_val_pairs], dtype=np.int8
+    )
     return PreparedData(
         benchmark=benchmark,
         train_nodes=train_nodes,
@@ -398,11 +412,11 @@ def prepare_data(cfg: CAZIConfig) -> PreparedData:
         train_pairs=train_pairs,
         train_labels=train_labels,
         teacher_val_pairs=teacher_val_pairs,
-        teacher_val_labels=np.asarray(teacher_val_labels, dtype=np.int8),
+        teacher_val_labels=teacher_val_labels,
         student_val_nodes=student_val_nodes,
         student_val_sequence=student_val_sequence,
-        student_val_pairs=list(holdout.hold_manifest.pairs),
-        student_val_labels=np.asarray(holdout.hold_manifest.labels, dtype=np.int8),
+        student_val_pairs=student_val_pairs,
+        student_val_labels=student_val_labels,
         student_val_position=student_val_position,
         train_node_position=train_node_position,
         feature_stats=feature_stats,

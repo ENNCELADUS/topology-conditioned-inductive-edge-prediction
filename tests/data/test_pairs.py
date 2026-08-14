@@ -390,3 +390,19 @@ class TestNegativeSampler:
         sampler = NegativeSampler(train_nodes, degrees, frozenset())
 
         assert sampler.sample([], ratio=5, seed=0, epoch=0, rank=0) == []
+
+    def test_forbidden_internal_nodes_rejects_both_endpoints_internal(self) -> None:
+        train_nodes = [f"node_{i:06d}" for i in range(1, 21)]
+        degrees = dict.fromkeys(train_nodes, 1)
+        positives = [("node_000001", "node_000002")]
+        global_positives = frozenset(_canonical(p) for p in positives)
+        forbidden = frozenset(train_nodes[:10])
+        sampler = NegativeSampler(
+            train_nodes, degrees, global_positives, forbidden_internal_nodes=forbidden
+        )
+
+        negatives = sampler.sample(positives, ratio=20, seed=0, epoch=0, rank=0)
+
+        assert len(negatives) == 20 * len(positives)
+        assert not any(u in forbidden and v in forbidden for u, v in negatives)
+        assert any((u in forbidden) != (v in forbidden) for u, v in negatives)

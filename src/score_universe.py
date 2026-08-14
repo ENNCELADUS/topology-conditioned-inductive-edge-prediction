@@ -12,7 +12,7 @@ CLI::
 
     python -m src.score_universe score \
         --checkpoint outputs/b0_v31/best.pt \
-        --pairs candidate|test|val|v_hold|file:<path.tsv> \
+        --pairs candidate|test|val_region|file:<path.tsv> \
         --data-root data --strategy breadth_first \
         --output scores/b0_v31_candidate.npz \
         [--batch-pairs 8192] [--token-budget 131072] [--device auto|cpu|cuda|mps] \
@@ -80,7 +80,6 @@ from src.data.artifacts import canonical_pair, load_candidate_pairs
 from src.data.feature_stats import FeatureStats, load_feature_stats
 from src.data.features import FeatureStore, build_f0_matrix
 from src.data.grounding import POOL_METHOD_ID
-from src.data.internal_holdout import InternalHoldoutPartition, derive_internal_holdout
 from src.data.packed_features import PackedFeatureTable
 from src.data.pairs import (
     BUCKET_BOUNDARIES,
@@ -89,7 +88,12 @@ from src.data.pairs import (
     collate_token_pairs,
     probe_lengths,
 )
-from src.data.partition import derive_training_interactions
+from src.data.val_region import (
+    ValRegionParams,
+    ValRegionSplit,
+    derive_val_region_split,
+    val_universe_arrays,
+)
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.model.egostitch.generator.assemble import make_scaffold_input_perturbation
 
@@ -118,7 +122,12 @@ _META_KEYS = (
     "created_utc",
     "torch_version",
 )
-_NAMED_PAIR_SOURCES = ("candidate", "test", "val", "v_hold")
+_NAMED_PAIR_SOURCES = ("candidate", "test", "val_region")
+#: `derive_val_region_split`'s parameters for `_load_val_region_split`'s
+#: production re-derivation; the test seam a small monkeypatched value lets
+#: synthetic fixtures satisfy (`ValRegionParams`'s own defaults assume a
+#: real-package-scale train universe).
+_VAL_REGION_PARAMS = ValRegionParams()
 _EGOSTITCH_E2E_PAIR_PRECISION_CONTRACT = "egostitch_e2e_pair_fp32_v1"
 _EGOSTITCH_E2E_ARRAY_KEYS = ("full", "f_logit")
 _SCORES_META_VERSION = "egostitch_e2e_scores_v4"
@@ -482,13 +491,13 @@ def _is_heldout_universe(meta: Mapping[str, object]) -> bool:
     Held-out access is a data-boundary property of the family and pairs
     source, not of registration: family ``egostitch_e2e`` scoring the
     ``candidate``/``test`` manifests or an arbitrary ``file:`` source reads
-    from the held-out universe. Everything else (``val``, ``v_hold``, other
+    from the held-out universe. Everything else (``val_region``, other
     families) is not a held-out claim.
 
     An ``oracle_diagnostic`` artifact is excluded unconditionally, even when
     its ``pairs_source`` is ``candidate``/``test``/``file:*``: the
     ``oracle_struct`` generator consumes ground-truth topology by
-    construction (it is fed the true test graph or the internal-holdout
+    construction (it is fed the true test graph or the V_val validation-region
     truth at scoring time, never an imagined one), so it is always a ceiling
     diagnostic and never the formal held-out claim this predicate gates. This
     is what keeps such an artifact's ``heldout`` field ``False`` and its
@@ -1574,34 +1583,28 @@ def _record_test_access(context: _TestAccessContext, *, pairs_source: str) -> di
         return record
 
 
-def _load_internal_holdout(data_root: Path, strategy: str) -> InternalHoldoutPartition:
-    """Rebuild the deterministic ``V_fit``/``V_hold`` partition bit-for-bit from disk.
+def _load_val_region_split(data_root: Path, strategy: str) -> ValRegionSplit:
+    """Rebuild the deterministic ``V_val`` region split bit-for-bit from disk.
 
-    Mirrors ``src.train_egostitch._assemble_e2e_data``'s own derivation (that
-    module's lines ~1993-2009) exactly: the same ``split.pkl`` train-node
-    collection and ``train_edges.txt`` positives feed the same
-    :func:`~src.data.partition.derive_training_interactions` ->
-    :func:`~src.data.internal_holdout.derive_internal_holdout` pipeline
-    training itself runs, so the returned partition -- and therefore its
-    ``hold_manifest`` pair/label universe and its ``V_hold`` topology -- is
-    exactly what training validates against and never a re-derivation that
-    could quietly drift from it. Every ``egostitch_e2e`` training config
-    leaves ``data.expected_missing_features`` empty (verified across
-    ``configs/egostitch_e2e*.yaml``), so unlike ``v3_1``/``cazi_mbn``
-    scoring this reads ``split.pkl``'s ``train`` collection directly with no
-    exclusion set to apply.
+    Mirrors the training-side derivation exactly: the same ``split.pkl``
+    train-node collection, ``train_graph.pkl`` edge set, ``train_edges.txt``
+    plus ``val_edges.txt`` label-0 rows (in file order), and
+    ``positive_edges.txt`` global positive set feed the same
+    :func:`~src.data.val_region.derive_val_region_split` call training itself
+    runs, so the returned split -- and therefore its ``v_val`` region and
+    validation topology -- is exactly what training validates against and
+    never a re-derivation that could quietly drift from it.
 
-    Shared by the ``v_hold`` pairs source (the real internal-holdout
-    validation universe EgoStitch trains against, as opposed to the
-    benchmark's own ``val_edges.txt`` model-selection manifest) and the
-    ``v_hold``-truth oracle diagnostic graph.
+    Shared by the ``val_region`` pairs source (the real validation-region
+    universe EgoStitch trains against) and the ``val_region``-truth oracle
+    diagnostic graph.
 
     Args:
         data_root: Directory containing ``benchmark_2025_neurips/``.
         strategy: Split strategy name (e.g. ``breadth_first``).
 
     Returns:
-        The deterministic `InternalHoldoutPartition`.
+        The deterministic `ValRegionSplit`.
 
     Raises:
         ValueError: If ``split.pkl`` does not contain a ``train`` node collection.
@@ -1611,40 +1614,60 @@ def _load_internal_holdout(data_root: Path, strategy: str) -> InternalHoldoutPar
         split_payload = pickle.load(handle)  # noqa: S301 - repository benchmark artifact
     if not isinstance(split_payload, dict) or "train" not in split_payload:
         raise ValueError(f"{strategy_dir / 'split.pkl'} must contain a train node collection")
-    train_nodes_all = sorted(cast(Iterable[str], split_payload["train"]))
-    train_pairs, train_labels = _read_pairs_tsv(strategy_dir / "train_edges.txt")
-    positives = [
-        pair
-        for pair, label in zip(train_pairs, train_labels.tolist(), strict=True)
-        if int(label) == 1
-    ]
-    interactions = derive_training_interactions(positives)
-    return derive_internal_holdout(train_nodes_all, interactions.positives)
+    train_nodes = cast(Iterable[str], split_payload["train"])
+
+    with (strategy_dir / "train_graph.pkl").open("rb") as handle:
+        train_graph = pickle.load(handle)  # noqa: S301 - repository benchmark artifact
+    truth_edges = list(train_graph.edges())
+
+    benchmark_negatives: list[tuple[str, str]] = []
+    for filename in ("train_edges.txt", "val_edges.txt"):
+        pairs, labels = _read_pairs_tsv(strategy_dir / filename)
+        benchmark_negatives.extend(
+            pair for pair, label in zip(pairs, labels.tolist(), strict=True) if label == 0
+        )
+
+    positive_pairs, _ = _read_pairs_tsv(data_root / _BENCHMARK_SUBDIR / "positive_edges.txt")
+
+    return derive_val_region_split(
+        train_nodes,
+        truth_edges,
+        benchmark_negatives,
+        frozenset(positive_pairs),
+        params=_VAL_REGION_PARAMS,
+    )
 
 
-def _resolve_v_hold_pairs(
+def _resolve_val_region_pairs(
     data_root: Path, strategy: str
 ) -> tuple[list[tuple[str, str]], NDArray[np.int8]]:
-    """Materialize the complete labeled ``V_hold`` pair universe EgoStitch trains against.
+    """Materialize the complete labeled ``V_val`` pair universe EgoStitch trains against.
 
     This is *not* ``val_edges.txt`` (the benchmark's own model-selection
-    manifest): it is the complete non-self pair/label universe over the
-    internal-holdout ``V_hold`` node set (:func:`_load_internal_holdout`'s
-    ``hold_manifest``), the actual validation topology EgoStitch's training
-    loop scores. Selecting a decision threshold on ``val_edges.txt`` and
-    calling it "V_hold-selected" is the exact confusion this source exists to
-    avoid.
+    manifest): it is the complete ``C(n,2)+n`` pair/label universe over the
+    validation-region ``V_val`` node set (:func:`_load_val_region_split`'s
+    ``v_val``, in :func:`~src.data.val_region.val_universe_arrays`'s
+    canonical row order), the actual validation topology EgoStitch's training
+    loop scores -- self rows included, mirroring the candidate universe's own
+    ``C(n,2)+n`` convention rather than the old self-loop-free ``V_hold``
+    universe. A row is positive exactly when it is a member of
+    :meth:`~src.data.val_region.ValRegionSplit.build_g_val`'s edge set (a self
+    row is positive exactly where the truth graph carries that self-loop).
 
     Args:
         data_root: Directory containing ``benchmark_2025_neurips/``.
         strategy: Split strategy name (e.g. ``breadth_first``).
 
     Returns:
-        ``(pairs, labels)``, aligned index-for-index, in the manifest's
-        canonical (sorted) row order.
+        ``(pairs, labels)``, aligned index-for-index, in canonical row order.
     """
-    manifest = _load_internal_holdout(data_root, strategy).hold_manifest
-    return list(manifest.pairs), np.asarray(manifest.labels, dtype=np.int8)
+    split = _load_val_region_split(data_root, strategy)
+    nodes = sorted(split.v_val)
+    u_idx, v_idx = val_universe_arrays(split.v_val)
+    pairs = [(nodes[u], nodes[v]) for u, v in zip(u_idx.tolist(), v_idx.tolist(), strict=True)]
+    positives = frozenset(split.val_positives)
+    labels = np.array([1 if pair in positives else 0 for pair in pairs], dtype=np.int8)
+    return pairs, labels
 
 
 def _oracle_truth_graph_for_scoring(pairs_source: str, data_root: Path, strategy: str) -> nx.Graph:
@@ -1652,15 +1675,15 @@ def _oracle_truth_graph_for_scoring(pairs_source: str, data_root: Path, strategy
 
     Only two truth sources are supported, matching
     ``docs/superpowers/specs/2026-08-04-oracle-scaffold-experiment-design.md``
-    §3's Row R2 (the wave-2 diagnostic this module owns) and the internal
-    ``V_hold`` truth the same document's Row R1-true-oracle training
+    §3's Row R2 (the wave-2 diagnostic this module owns) and the V_val
+    validation-region truth the same document's Row R1-true-oracle training
     diagnostic reads:
 
     - ``test``/``candidate``/``file:*``: the labeled benchmark test graph
       (self-loop-stripped, matching ``EgoTargetBuilder``'s self-loop-free
       requirement) -- the R2 diagnostic ceiling.
-    - ``v_hold``: the internal-holdout truth topology
-      (:func:`_load_internal_holdout`'s ``build_g_hold()``), already
+    - ``val_region``: the V_val validation-region truth topology
+      (:func:`_load_val_region_split`'s ``build_g_val_simple()``), already
       self-loop-free by construction.
 
     Every other pairs source has no defined truth graph here and is refused
@@ -1685,12 +1708,12 @@ def _oracle_truth_graph_for_scoring(pairs_source: str, data_root: Path, strategy
         from src.experiments.g1_hardened_e2 import load_test_graph
 
         return strip_self_loops(load_test_graph(data_root / _BENCHMARK_SUBDIR, strategy))
-    if pairs_source == "v_hold":
-        return _load_internal_holdout(data_root, strategy).build_g_hold()
+    if pairs_source == "val_region":
+        return _load_val_region_split(data_root, strategy).build_g_val_simple()
     raise ValueError(
         f"oracle_struct scoring has no diagnostic truth graph for --pairs {pairs_source!r}; "
         "supported sources are test/candidate/file:<path> (the labeled test graph, "
-        "oracle-scaffold design doc Row R2) and v_hold (internal-holdout truth)"
+        "oracle-scaffold design doc Row R2) and val_region (V_val validation-region truth)"
     )
 
 
@@ -1710,7 +1733,7 @@ def _install_oracle_context(
     Mirrors ``src.train_egostitch._install_oracle_context``'s F0-row =
     table-row identity lookup, specialized to this scoring call's own node
     universe (`node_ids`, already the exact row order :func:`build_f0_matrix`
-    assigned) rather than training's V_fit-union-V_hold universe.
+    assigned) rather than training's all-train-nodes universe.
 
     Args:
         model: The `EgoStitchModel`, whose ``generator`` must already be an
@@ -1755,13 +1778,13 @@ def _resolve_pairs(
     """Resolve a ``--pairs`` spec to canonical pairs plus labels, in file row order.
 
     Args:
-        pairs_source: ``candidate``, ``test``, ``val``, ``v_hold``, or
+        pairs_source: ``candidate``, ``test``, ``val_region``, or
             ``file:<path.tsv>``.
         data_root: Directory containing ``benchmark_2025_neurips/`` and
             ``features/frozen_node_features_1024/``.
         strategy: Split strategy name (e.g. ``breadth_first``).
         test_access: Held-out scoring identity to append before the pair manifest
-            is read; ``None`` for non-held-out sources. ``v_hold`` is never
+            is read; ``None`` for non-held-out sources. ``val_region`` is never
             held-out (:func:`_is_heldout_universe`) and must always pass ``None``
             here: it is the internal validation universe, not the benchmark's
             held-out test/candidate manifests.
@@ -1778,10 +1801,10 @@ def _resolve_pairs(
     if pairs_source == "candidate":
         labeled = load_candidate_pairs(benchmark_root, strategy)
         return labeled.pairs, labeled.labels
-    if pairs_source in ("test", "val"):
+    if pairs_source == "test":
         return _read_pairs_tsv(benchmark_root / strategy / f"{pairs_source}_edges.txt")
-    if pairs_source == "v_hold":
-        return _resolve_v_hold_pairs(data_root, strategy)
+    if pairs_source == "val_region":
+        return _resolve_val_region_pairs(data_root, strategy)
     if pairs_source.startswith("file:"):
         return _read_pairs_tsv(Path(pairs_source[len("file:") :]))
     raise ValueError(
@@ -2122,6 +2145,7 @@ def _score_egostitch_e2e(
     token_budget: int,
     f0_cache: Path,
     grounding_cache: Path | None = None,
+    role_universe: str = "test",
     scaffold_control: str = _SCAFFOLD_CONTROL_NONE,
     universe_pairs: Sequence[tuple[str, str]] | None = None,
     row_start: int = 0,
@@ -2178,6 +2202,9 @@ def _score_egostitch_e2e(
             generator inputs (f0_mlp semantics).
         grounding_cache: Grounding-pool cache path (derived from `f0_cache`
             when ``None``).
+        role_universe: The scored universe's role identity, namespacing the
+            grounding-pool cache so it matches the training-side pool: `"test"`
+            for the test/candidate/file sources, `"V_val"` for `val_region`.
         scaffold_control: Optional registered within-pair scaffold perturbation.
         universe_pairs: Full input universe used to keep grounding pools stable
             when this scorer receives a contiguous shard.
@@ -2279,6 +2306,7 @@ def _score_egostitch_e2e(
             f0_cache,
             n_ground=registered_n_ground,
             node_ids=node_ids,
+            role_universe=role_universe,
         )
     # The e2e generator's own-split n_ground default (spec Sec 13) assumes a
     # real candidate-universe scale (thousands of nodes); clamp to what this
@@ -2300,7 +2328,7 @@ def _score_egostitch_e2e(
         np.asarray(matrix.numpy(), dtype=np.float32),
         node_ids,
         n_ground=n_ground,
-        role_universe="test",
+        role_universe=role_universe,
         cache_path=grounding_cache,
     )
     pool_rows = torch.tensor(
@@ -2965,7 +2993,7 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument(
         "--pairs",
         required=True,
-        help="candidate | test | val | v_hold | file:<path.tsv> (TSV rows: u\\tv[\\tlabel])",
+        help="candidate | test | val_region | file:<path.tsv> (TSV rows: u\\tv[\\tlabel])",
     )
     score.add_argument("--data-root", type=Path, default=Path("data"))
     score.add_argument("--strategy", default="breadth_first")
@@ -3164,7 +3192,7 @@ def _run_score(args: argparse.Namespace) -> None:
         # whose generator was already `oracle_struct` (the pre-correction R1
         # run), so a checkpoint's training provenance cannot be relied on to
         # gate this. What is always true is that *scoring* test/candidate/
-        # v_hold pairs through an oracle generator means feeding it the true
+        # val_region pairs through an oracle generator means feeding it the true
         # topology for exactly the pairs being queried -- a truth-consuming
         # ceiling diagnostic every time, regardless of how the checkpoint was
         # trained. Requiring an explicit, scoring-time operator flag (rather
@@ -3338,6 +3366,7 @@ def _run_score(args: argparse.Namespace) -> None:
                 token_budget=args.token_budget,
                 f0_cache=args.f0_cache,
                 grounding_cache=args.grounding_cache,
+                role_universe="V_val" if args.pairs == "val_region" else "test",
                 scaffold_control=args.scaffold_control,
                 universe_pairs=pairs,
                 row_start=start,
@@ -3385,7 +3414,9 @@ def _run_score(args: argparse.Namespace) -> None:
             meta_extra["formal"] = False
             meta_extra["oracle_diagnostic"] = {
                 "generator": oracle_generator_name,
-                "truth_source": "test_graph" if args.pairs != "v_hold" else "v_hold_topology_hold",
+                "truth_source": (
+                    "val_region_g_val" if args.pairs == "val_region" else "test_graph"
+                ),
                 "diagnostic_only": True,
                 "formal": False,
                 "truth_graph_sha256": _oracle_truth_graph_sha256(oracle_truth_graph),

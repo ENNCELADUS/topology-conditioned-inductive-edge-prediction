@@ -81,9 +81,9 @@ _E2E_TINY_MODEL: dict[str, object] = {
     "generator": {
         "n_ground": 20,
         # The toy bundle carries `feature_stats is None` — it never goes through
-        # `assemble_egostitch_data`'s V_fit statistics path — so the registered
-        # `zscore_vfit_v1` transform would raise for want of constants. The guard
-        # under test reads slot geometry, not standardization.
+        # `assemble_egostitch_data`'s training-universe statistics path — so the
+        # registered `zscore_vfit_v1` transform would raise for want of
+        # constants. The guard under test reads slot geometry, not standardization.
         "feature_standardization": "row_layernorm",
     },
     "encoder": {
