@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 
 import networkx as nx
 import numpy as np
@@ -66,6 +67,27 @@ class CheckpointCandidate:
     topology: TopologyValidationMetrics
 
 
+@lru_cache(maxsize=8)
+def _gold_reference(
+    nodes: tuple[str, ...], positive_edges: tuple[tuple[str, str], ...]
+) -> tuple[nx.Graph, dict[str, NDArray[np.float64]]]:
+    """The fixed gold graph and its descriptor histograms, computed once.
+
+    The gold side never changes across a run's epochs, and its Laplacian
+    spectrum is the expensive descriptor (dense ``eigvalsh``), so it is
+    cached on the exact ``(nodes, positive_edges)`` identity.
+    """
+    gold = nx.Graph()
+    gold.add_nodes_from(nodes)
+    gold.add_edges_from(positive_edges)
+    histograms = {
+        "degree": degree_histogram(gold),
+        "clustering": clustering_histogram(gold),
+        "spectral": laplacian_spectrum_histogram(gold),
+    }
+    return gold, histograms
+
+
 def validation_topology_metrics(
     *,
     pairs: Sequence[tuple[str, str]],
@@ -93,9 +115,7 @@ def validation_topology_metrics(
     if not np.all(np.isfinite(logits)):
         raise ValueError("non-finite validation logits")
 
-    gold = nx.Graph()
-    gold.add_nodes_from(nodes)
-    gold.add_edges_from(positive_edges)
+    gold, gold_histograms = _gold_reference(tuple(nodes), tuple(positive_edges))
     target_edges = gold.number_of_edges()
     if target_edges == 0:
         raise ValueError("validation universe has no positive edges")
@@ -108,14 +128,16 @@ def validation_topology_metrics(
     config = MMDConfig()
     return TopologyValidationMetrics(
         gs=compute_graph_similarity(predicted, gold),
-        rd=float(np.count_nonzero(np.asarray(logits) > 0.0)) / float(target_edges),
-        degree_mmd=mmd_squared([degree_histogram(predicted)], [degree_histogram(gold)], config),
+        # `>= 0`: a zero logit is probability 0.5, which the evaluator counts
+        # as a positive prediction (`probs >= 0.5`) everywhere else.
+        rd=float(np.count_nonzero(np.asarray(logits) >= 0.0)) / float(target_edges),
+        degree_mmd=mmd_squared([degree_histogram(predicted)], [gold_histograms["degree"]], config),
         clustering_mmd=mmd_squared(
-            [clustering_histogram(predicted)], [clustering_histogram(gold)], config
+            [clustering_histogram(predicted)], [gold_histograms["clustering"]], config
         ),
         spectral_mmd=mmd_squared(
             [laplacian_spectrum_histogram(predicted)],
-            [laplacian_spectrum_histogram(gold)],
+            [gold_histograms["spectral"]],
             config,
         ),
     )

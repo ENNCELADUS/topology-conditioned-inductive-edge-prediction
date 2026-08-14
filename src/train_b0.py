@@ -53,6 +53,7 @@ from src.data.distributed_pairs import (
     identity_compact_batch,
 )
 from src.data.features import FeatureStore, build_f0_matrix
+from src.data.internal_holdout import derive_internal_holdout
 from src.data.packed_features import PackedFeatureTable
 from src.data.pairs import (
     LengthBucketedBatchSampler,
@@ -2200,6 +2201,7 @@ class KDStream:
         targets: KDTargets,
         table: PackedFeatureTable,
         *,
+        allowed_nodes: frozenset[str],
         seed: int,
         rank: int,
         world_size: int,
@@ -2209,6 +2211,15 @@ class KDStream:
         self._table = table
         self._seed = seed
         self._rank = rank
+        # Data boundary (fail closed): every teacher-target node — anchors and
+        # partners both index `node_ids` — must lie inside the V_fit training
+        # universe. A stale/foreign artifact must never train on V_hold or
+        # test-side embeddings.
+        outside = sorted(set(targets.node_ids) - allowed_nodes)
+        if outside:
+            raise ValueError(
+                f"KD teacher-target nodes outside the V_fit training universe: {outside[:5]}"
+            )
         node_index = table.manifest.node_index()
         missing = [node for node in targets.node_ids if node not in node_index]
         if missing:
@@ -3000,10 +3011,15 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
 
     kd_loss_fn: KDLossFn | None = None
     if cfg.distill is not None and cfg.distill.active:
+        holdout = derive_internal_holdout(
+            assembled.benchmark.split.train_nodes,
+            derive_training_interactions(assembled.training_positives).positives,
+        )
         kd_stream = KDStream(
             cfg.distill,
             load_kd_targets(Path(cfg.distill.targets_path)),
             table,
+            allowed_nodes=holdout.v_fit,
             seed=cfg.seed,
             rank=accelerator.process_index,
             world_size=accelerator.num_processes,

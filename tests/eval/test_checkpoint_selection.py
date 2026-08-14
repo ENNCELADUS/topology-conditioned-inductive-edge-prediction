@@ -146,6 +146,17 @@ class TestValidationTopologyMetrics:
         )
         assert topo.rd == pytest.approx(2.0)
 
+    def test_rd_counts_zero_logit_as_positive(self) -> None:
+        """Logit 0 is probability 0.5, a positive under the house `>= 0.5` rule."""
+        logits = np.array([0.0, -1.0, -1.0, -1.0, -1.0, -1.0])
+        topo = validation_topology_metrics(
+            pairs=self.PAIRS,
+            logits=logits,
+            positive_edges=self.POSITIVES,
+            nodes=self.NODES,
+        )
+        assert topo.rd == pytest.approx(0.5)
+
     def test_no_positive_edges_raises(self) -> None:
         with pytest.raises(ValueError, match="positive"):
             validation_topology_metrics(

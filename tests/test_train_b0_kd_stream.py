@@ -73,15 +73,28 @@ def _targets() -> KDTargets:
     )
 
 
-def _stream(distill: DistillConfig, *, rank: int = 0, world_size: int = 1) -> KDStream:
+def _stream(
+    distill: DistillConfig,
+    *,
+    rank: int = 0,
+    world_size: int = 1,
+    allowed_nodes: frozenset[str] | None = None,
+) -> KDStream:
     return KDStream(
         distill,
         _targets(),
         cast(PackedFeatureTable, _FakeTable()),
+        allowed_nodes=allowed_nodes if allowed_nodes is not None else frozenset(_NODE_IDS),
         seed=0,
         rank=rank,
         world_size=world_size,
     )
+
+
+def test_targets_outside_training_universe_fail_closed() -> None:
+    distill = DistillConfig(targets_path="t", w_label=1.0)
+    with pytest.raises(ValueError, match="outside the V_fit training universe"):
+        _stream(distill, allowed_nodes=frozenset({"node_a", "node_b"}))
 
 
 def test_anchor_positions_are_deterministic_and_rank_disjoint() -> None:
