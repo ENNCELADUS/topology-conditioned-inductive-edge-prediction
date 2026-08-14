@@ -26,8 +26,12 @@ import functools
 import hashlib
 import json
 import logging
+import os
 import pickle
+import random
+import shutil
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence, Sized
 from dataclasses import asdict, dataclass, field, replace
@@ -41,7 +45,7 @@ import torch
 import torch.nn as nn
 import yaml  # type: ignore[import-untyped,unused-ignore]
 from accelerate import Accelerator, DistributedDataParallelKwargs
-from accelerate.utils import broadcast_object_list, set_seed
+from accelerate.utils import broadcast_object_list, gather_object, set_seed
 from torch.utils.data import DataLoader, Sampler
 
 from src.data.artifacts import ArtifactVerificationError, Benchmark, load_benchmark
@@ -89,7 +93,7 @@ MIXED_PRECISION_MODES = ("no", "bf16")
 Batch = dict[str, torch.Tensor]
 LoaderFactory = Callable[[int], Iterable[Batch]]
 PackedLoaderFactory = Callable[[int], Iterable[Batch]]
-OnEval = Callable[[dict[str, float], bool, EdgeMetrics], None]
+OnEval = Callable[[dict[str, object], bool, EdgeMetrics], None]
 
 
 @dataclass(frozen=True)
@@ -291,12 +295,13 @@ class CliArgs:
         output_dir: Optional output-dir override (wins over the config).
         max_steps: DEBUG ONLY — stop after this many optimizer steps.
         ddp_mode: Internal multi-H20 worker mode (``probe``/``epoch-probe``/``train``)
-            launched by ``accelerate launch``; ``None`` selects the legacy
+            launched by ``accelerate launch``; ``None`` selects the direct debug
             single-process path. Requires ``pack_dir``, ``token_budget_per_rank``,
             and ``profile_output`` when set.
         pack_dir: Packed-feature directory the DDP worker loads onto its device.
         token_budget_per_rank: Per-rank token budget for the distributed batch plan.
-        profile_output: Path the rank-zero worker writes its JSON profile artifact to.
+    profile_output: Path the rank-zero worker writes its JSON profile artifact to.
+        resume_attempt: Prior attempt directory to resume at its completed epoch.
     """
 
     config: Path
@@ -307,6 +312,7 @@ class CliArgs:
     pack_dir: Path | None = None
     token_budget_per_rank: int | None = None
     profile_output: Path | None = None
+    resume_attempt: Path | None = None
 
 
 def _require(mapping: dict[str, object], key: str, context: str) -> object:
@@ -824,6 +830,12 @@ def parse_args(argv: Sequence[str] | None = None) -> CliArgs:
         default=None,
         help="path the rank-zero DDP worker writes its JSON profile artifact to.",
     )
+    parser.add_argument(
+        "--resume-attempt",
+        type=Path,
+        default=None,
+        help="prior attempt directory containing an epoch-boundary training snapshot",
+    )
     namespace = parser.parse_args(argv)
     if namespace.ddp_mode is not None:
         missing = [
@@ -847,6 +859,7 @@ def parse_args(argv: Sequence[str] | None = None) -> CliArgs:
         pack_dir=namespace.pack_dir,
         token_budget_per_rank=namespace.token_budget_per_rank,
         profile_output=namespace.profile_output,
+        resume_attempt=namespace.resume_attempt,
     )
 
 
@@ -1068,11 +1081,11 @@ class TrainResult:
         history: One entry per evaluation: epoch, train_loss, val_auroc, val_auprc.
         stopped_early: Whether early stopping fired before ``optim.epochs``.
         counterfactual_stop_epoch: Epoch at which patience *would* have stopped the
-            run, recorded without ever stopping it (``None`` on the legacy
+            run, recorded without ever stopping it (``None`` on the direct debug
             single-GPU :func:`train_loop`, which really does stop early). The
             fixed-epoch DDP loop always trains ``optim.epochs`` epochs.
         runtime_profile: Rank-zero timing/coverage payload for the fixed-epoch DDP
-            run (empty on the legacy :func:`train_loop`). Keys are pinned by the
+            run (empty on the direct debug :func:`train_loop`). Keys are pinned by the
             Task-12 acceptance test.
     """
 
@@ -1082,7 +1095,7 @@ class TrainResult:
     last_state_dict: dict[str, torch.Tensor]
     last_epoch: int
     last_val_metrics: EdgeMetrics
-    history: list[dict[str, float]]
+    history: list[dict[str, object]]
     stopped_early: bool
     counterfactual_stop_epoch: int | None = None
     runtime_profile: dict[str, object] = field(default_factory=dict)
@@ -1172,7 +1185,7 @@ def train_loop(
         total_steps=schedule_total_steps,
     )
 
-    history: list[dict[str, float]] = []
+    history: list[dict[str, object]] = []
     best_state: dict[str, torch.Tensor] | None = None
     best_metrics: EdgeMetrics | None = None
     best_epoch = 0
@@ -1217,7 +1230,7 @@ def train_loop(
         if epoch % cfg.eval.eval_every == 0 or is_final:
             metrics = _evaluate(model, val_loader, accelerator)
             last_metrics = metrics
-            entry: dict[str, float] = {
+            entry: dict[str, object] = {
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "val_auroc": metrics.auroc,
@@ -1309,12 +1322,13 @@ def write_outputs(
 ) -> None:
     """Write the pinned run artifacts into ``cfg.output_dir``.
 
-    Writes ``best.pt`` / ``last.pt`` (payload keys exactly ``model_state``,
+    Finalizes ``best.pt`` / ``last.pt`` (payload keys exactly ``model_state``,
     ``model_family``, ``model_config``, ``epoch``, ``val_metrics``, ``seed``,
-    ``config``), ``metrics.jsonl`` (one line per eval), and ``run_metadata.json``
-    (config hash, checkpoint id = first 16 hex of the sha256 over the best
+    ``config``) and ``run_metadata.json`` (config hash, checkpoint id = first
+    16 hex of the sha256 over the best
     checkpoint's model_state tensor bytes, torch version, timestamp, dropped-pair
-    counts, positives mode).
+    counts, positives mode). The training loop owns incremental ``metrics.jsonl``;
+    finalization never rewrites it.
 
     Args:
         result: The finished training result.
@@ -1326,7 +1340,7 @@ def write_outputs(
     output_dir.mkdir(parents=True, exist_ok=True)
     config_dict = config_to_dict(cfg)
 
-    torch.save(
+    _torch_save_atomic(
         _checkpoint_payload(
             result.best_state_dict,
             cfg,
@@ -1337,7 +1351,7 @@ def write_outputs(
         ),
         output_dir / "best.pt",
     )
-    torch.save(
+    _torch_save_atomic(
         _checkpoint_payload(
             result.last_state_dict,
             cfg,
@@ -1348,10 +1362,6 @@ def write_outputs(
         ),
         output_dir / "last.pt",
     )
-
-    with (output_dir / "metrics.jsonl").open("w", encoding="utf-8") as f:
-        for entry in result.history:
-            f.write(json.dumps(entry) + "\n")
 
     run_metadata = {
         "config_hash": hashlib.sha256(
@@ -1367,9 +1377,7 @@ def write_outputs(
         ),
         "selected_epoch": result.best_epoch,
     }
-    (output_dir / "run_metadata.json").write_text(
-        json.dumps(run_metadata, indent=2) + "\n", encoding="utf-8"
-    )
+    _write_json_atomic(output_dir / "run_metadata.json", run_metadata)
     logger.info(
         "wrote artifacts to %s (checkpoint_id %s)", output_dir, run_metadata["checkpoint_id"]
     )
@@ -1604,7 +1612,7 @@ def compute_sample_warmup_steps(
 ) -> int:
     """Return the new-schedule step count needed to preserve warmup pair exposure.
 
-    ``baseline_batch_sizes`` is the legacy single-GPU per-step batch-size sequence;
+    ``baseline_batch_sizes`` is the direct-debug per-step batch-size sequence;
     cycling it for ``baseline_steps`` steps defines the target number of pair
     samples the original warmup schedule saw. This returns how many steps of the
     new (larger, distributed) global-batch-size sequence — also cycled — are
@@ -1614,7 +1622,7 @@ def compute_sample_warmup_steps(
         baseline_batch_sizes: Legacy per-step batch sizes (one epoch's worth).
         new_global_batch_sizes: New per-step *global* (summed across ranks) batch
             sizes (one epoch's worth).
-        baseline_steps: Number of legacy warmup steps to reproduce the exposure of.
+        baseline_steps: Number of direct-debug warmup steps to reproduce the exposure of.
 
     Returns:
         The number of new-schedule steps whose cumulative pair count first
@@ -1753,6 +1761,8 @@ def _wrap_compact_loader(
     # torch's DataLoader stub types collate_fn as Callable[[list[T]], Any] even when
     # batch_size=None (no list wrapping occurs); identity_compact_batch's precise
     # Callable[[CompactPairBatch], CompactPairBatch] signature is correct at runtime.
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(cfg.seed)
     if world_size == 1:
         return DataLoader(
             dataset,
@@ -1760,6 +1770,7 @@ def _wrap_compact_loader(
             sampler=sampler,
             num_workers=0,
             collate_fn=identity_compact_batch,  # type: ignore[arg-type]
+            generator=loader_generator,
         )
     runtime = cfg.runtime
     if runtime is None:
@@ -1771,6 +1782,7 @@ def _wrap_compact_loader(
         num_workers=runtime.loader_workers_per_rank,
         persistent_workers=True,
         prefetch_factor=runtime.prefetch_factor,
+        generator=loader_generator,
         collate_fn=identity_compact_batch,  # type: ignore[arg-type]
     )
 
@@ -2183,6 +2195,26 @@ def _stable_sigmoid(logit: np.ndarray) -> np.ndarray:
     return out
 
 
+def _topology_from_metrics_row(row: dict[str, object]) -> TopologyValidationMetrics | None:
+    """Reconstruct selector topology metrics from one persisted epoch row."""
+    keys = (
+        "val_gs",
+        "val_rd",
+        "val_degree_mmd",
+        "val_clustering_mmd",
+        "val_spectral_mmd",
+    )
+    if not all(key in row for key in keys):
+        return None
+    return TopologyValidationMetrics(
+        gs=float(cast(float, row["val_gs"])),
+        rd=float(cast(float, row["val_rd"])),
+        degree_mmd=float(cast(float, row["val_degree_mmd"])),
+        clustering_mmd=float(cast(float, row["val_clustering_mmd"])),
+        spectral_mmd=float(cast(float, row["val_spectral_mmd"])),
+    )
+
+
 class KDStream:
     """Deterministic per-(epoch, step, rank) KD anchor-context stream (B1 plan).
 
@@ -2337,6 +2369,15 @@ class KDStream:
             )
         return total
 
+    def resume_state(self, *, epoch: int, global_step: int) -> dict[str, int]:
+        """Return the position needed to reproduce this stateless KD stream."""
+        return {
+            "seed": self._seed,
+            "rank": self._rank,
+            "epoch": epoch,
+            "global_step": global_step,
+        }
+
 
 KDLossFn = Callable[[nn.Module, int, int], torch.Tensor]
 
@@ -2362,9 +2403,11 @@ def train_ddp_loop(
     accelerator: Accelerator,
     *,
     warmup_steps: int,
+    artifact_dir: Path,
+    profile_output: Path | None = None,
+    resume_attempt: Path | None = None,
     schedule_total_steps: int | None = None,
     evaluate_fn: EvaluateFn = _evaluate_distributed,
-    on_eval: OnEval | None = None,
     kd_loss_fn: KDLossFn | None = None,
 ) -> TrainResult:
     """Run fixed-epoch E2 DDP training and return rank-consistent metrics.
@@ -2375,7 +2418,7 @@ def train_ddp_loop(
     but the run never stops early. Tail batches are loss-scaled with
     :func:`scale_ddp_mean_loss`; a non-finite loss on any rank aborts all ranks;
     and every epoch boundary asserts all ranks ran the same number of steps.
-    Only the main rank snapshots checkpoint state or runs ``on_eval``.
+    Rank zero persists the completed epoch before the next epoch begins.
 
     Args:
         model: The scorer (not yet prepared by the accelerator).
@@ -2384,11 +2427,13 @@ def train_ddp_loop(
         cfg: The full training config.
         accelerator: DDP accelerator (see :func:`build_ddp_accelerator`).
         warmup_steps: Linear-warmup step count (then constant LR).
+        artifact_dir: Persistent active-attempt directory owned by rank zero.
+        profile_output: Atomic worker-profile snapshot path, when requested.
+        resume_attempt: Prior attempt supplying the exact epoch-boundary state.
         schedule_total_steps: Exact optimizer-step count over all epochs, used to
             size a ``optim.scheduler`` OneCycle schedule; unused otherwise.
         evaluate_fn: Validation function; defaults to distributed validation.
             Unit tests inject a deterministic metric source.
-        on_eval: Optional main-rank-only callback after each evaluation.
         kd_loss_fn: Optional per-step KD loss (`KDStream.loss`); its value is
             added to the scaled supervised loss before the shared backward.
 
@@ -2412,8 +2457,7 @@ def train_ddp_loop(
     world_size = accelerator.num_processes
     use_cuda = accelerator.device.type == "cuda"
 
-    history: list[dict[str, float]] = []
-    state_by_epoch: dict[int, dict[str, torch.Tensor]] = {}
+    history: list[dict[str, object]] = []
     metrics_by_epoch: dict[int, EdgeMetrics] = {}
     topology_by_epoch: dict[int, TopologyValidationMetrics | None] = {}
     best_auprc: float | None = None
@@ -2432,7 +2476,179 @@ def train_ddp_loop(
     total_steps = 0
     local_peak_memory_gib = 0.0
 
-    for epoch in range(1, cfg.optim.epochs + 1):
+    setup_error: list[str | None] = [None]
+    if accelerator.is_main_process:
+        try:
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            (artifact_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+            if resume_attempt is None:
+                (artifact_dir / "metrics.jsonl").unlink(missing_ok=True)
+        except Exception as error:
+            setup_error[0] = f"{type(error).__name__}: {error}"
+    broadcast_object_list(setup_error, from_process=0)
+    if setup_error[0] is not None:
+        raise RuntimeError(f"rank-zero attempt setup failed: {setup_error[0]}")
+
+    start_epoch = 1
+    if resume_attempt is not None:
+        snapshot = _run_rank_symmetric(
+            accelerator,
+            "resume snapshot load",
+            lambda: cast(
+                dict[str, object],
+                torch.load(
+                    resume_attempt / "training_state.pt",
+                    map_location="cpu",
+                    weights_only=False,
+                ),
+            ),
+        )
+        completed_epoch = cast(int, snapshot["epoch"])
+        rng_by_rank = cast(list[dict[str, object]], snapshot["rng_by_rank"])
+        runtime_by_rank = cast(list[dict[str, object]], snapshot["runtime_by_rank"])
+        saved_kd_by_rank = cast(list[dict[str, int] | None], snapshot["kd_by_rank"])
+
+        def restore_rank_state() -> None:
+            if snapshot.get("resume_supported") is not True:
+                raise RuntimeError("attempt does not contain a supported resume snapshot")
+            saved_config = snapshot.get("config")
+            if not isinstance(saved_config, dict):
+                raise RuntimeError("resume snapshot is missing its training configuration")
+            saved_resume_config = dict(saved_config)
+            current_resume_config = config_to_dict(cfg)
+            saved_resume_config.pop("output_dir", None)
+            current_resume_config.pop("output_dir", None)
+            if saved_resume_config != current_resume_config:
+                raise ValueError("resume configuration does not match the current training run")
+            if snapshot.get("world_size") != world_size:
+                raise ValueError("resume world size does not match the current training run")
+            if snapshot.get("warmup_steps") != warmup_steps:
+                raise ValueError("resume warmup schedule does not match the current training run")
+            if snapshot.get("schedule_total_steps") != schedule_total_steps:
+                raise ValueError("resume step schedule does not match the current training run")
+            if completed_epoch < 1 or completed_epoch > cfg.optim.epochs:
+                raise ValueError(
+                    "resume snapshot epoch must be within the configured run: "
+                    f"got {completed_epoch}, target epochs {cfg.optim.epochs}"
+                )
+            if len(rng_by_rank) != world_size or len(runtime_by_rank) != world_size:
+                raise RuntimeError(
+                    "resume snapshot world-size mismatch: "
+                    f"snapshot={len(rng_by_rank)}, current={world_size}"
+                )
+            accelerator.unwrap_model(model).load_state_dict(snapshot["model_state"])
+            optimizer.load_state_dict(snapshot["optimizer"])
+            scheduler.load_state_dict(cast(dict[str, Any], snapshot["scheduler"]))
+            scaler_state = snapshot.get("scaler")
+            if scaler_state is not None:
+                if accelerator.scaler is None:
+                    raise RuntimeError(
+                        "resume snapshot has scaler state but this worker has no scaler"
+                    )
+                accelerator.scaler.load_state_dict(cast(dict[str, Any], scaler_state))
+            _restore_local_rng_state(rng_by_rank[accelerator.process_index], accelerator.device)
+            current_kd_state = _kd_resume_state(
+                kd_loss_fn, completed_epoch, cast(int, snapshot["global_step"])
+            )
+            if (
+                len(saved_kd_by_rank) != world_size
+                or saved_kd_by_rank[accelerator.process_index] != current_kd_state
+            ):
+                raise ValueError("resume snapshot KD stream does not match the current worker")
+
+        _run_rank_symmetric(accelerator, "resume state restore", restore_rank_state)
+
+        def load_rank_runtime() -> dict[str, int | float]:
+            rank_runtime = runtime_by_rank[accelerator.process_index]
+            return {
+                "total_rank_local_pairs": int(rank_runtime["total_rank_local_pairs"]),
+                "total_global_pairs": int(rank_runtime["total_global_pairs"]),
+                "total_local_tokens": int(rank_runtime["total_local_tokens"]),
+                "total_steps": int(rank_runtime["total_steps"]),
+                "total_train_wall_seconds": float(rank_runtime["total_train_wall_seconds"]),
+                "total_data_wait_seconds": float(rank_runtime["total_data_wait_seconds"]),
+                "total_validation_seconds": float(rank_runtime["total_validation_seconds"]),
+                "local_peak_memory_gib": float(rank_runtime["local_peak_memory_gib"]),
+            }
+
+        resumed_runtime = _run_rank_symmetric(
+            accelerator, "resume runtime restore", load_rank_runtime
+        )
+        total_rank_local_pairs = int(resumed_runtime["total_rank_local_pairs"])
+        total_global_pairs = int(resumed_runtime["total_global_pairs"])
+        total_local_tokens = int(resumed_runtime["total_local_tokens"])
+        total_steps = int(resumed_runtime["total_steps"])
+        total_train_wall_seconds = float(resumed_runtime["total_train_wall_seconds"])
+        total_data_wait_seconds = float(resumed_runtime["total_data_wait_seconds"])
+        total_validation_seconds = float(resumed_runtime["total_validation_seconds"])
+        local_peak_memory_gib = float(resumed_runtime["local_peak_memory_gib"])
+        global_step = cast(int, snapshot["global_step"])
+        per_epoch_profiles = cast(list[dict[str, object]], snapshot["per_epoch_profiles"])
+        evals_without_improvement = cast(int, snapshot["evals_without_improvement"])
+        counterfactual_stop_epoch = cast(int | None, snapshot["counterfactual_stop_epoch"])
+        metrics_rows = _run_rank_symmetric(
+            accelerator,
+            "resume metrics load",
+            lambda: [
+                json.loads(line)
+                for line in (artifact_dir / "metrics.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ],
+        )
+        if len(metrics_rows) < completed_epoch:
+            raise RuntimeError(
+                "resume metrics/checkpoint prefix is incomplete: "
+                f"expected at least {completed_epoch} rows, got {len(metrics_rows)}"
+            )
+        metrics_rows = metrics_rows[:completed_epoch]
+        resume_cleanup_error: list[str | None] = [None]
+        if accelerator.is_main_process:
+            try:
+                _write_jsonl_atomic(
+                    artifact_dir / "metrics.jsonl",
+                    [cast(dict[str, object], row) for row in metrics_rows],
+                )
+                for orphan in (artifact_dir / "checkpoints").glob("epoch-*.pt"):
+                    if int(orphan.stem.removeprefix("epoch-")) > completed_epoch:
+                        orphan.unlink()
+            except Exception as error:
+                resume_cleanup_error[0] = f"{type(error).__name__}: {error}"
+        broadcast_object_list(resume_cleanup_error, from_process=0)
+        if resume_cleanup_error[0] is not None:
+            raise RuntimeError(f"rank-zero resume-prefix cleanup failed: {resume_cleanup_error[0]}")
+        for prior_epoch, prior_entry in enumerate(metrics_rows, start=1):
+
+            def load_candidate(
+                epoch: int = prior_epoch, entry: object = prior_entry
+            ) -> dict[str, object]:
+                candidate = cast(
+                    dict[str, object],
+                    torch.load(
+                        artifact_dir / "checkpoints" / f"epoch-{epoch:04d}.pt",
+                        map_location="cpu",
+                        weights_only=False,
+                    ),
+                )
+                if cast(int, candidate["epoch"]) != epoch:
+                    raise RuntimeError(f"resume candidate epoch mismatch at epoch {epoch}")
+                if candidate.get("selection_metrics") != entry:
+                    raise RuntimeError(f"resume metric/candidate mismatch at epoch {epoch}")
+                return candidate
+
+            candidate = _run_rank_symmetric(
+                accelerator, f"resume candidate {prior_epoch} load", load_candidate
+            )
+            prior_metrics = EdgeMetrics(**cast(dict[str, Any], candidate["val_metrics"]))
+            history.append(cast(dict[str, object], prior_entry))
+            metrics_by_epoch[prior_epoch] = prior_metrics
+            topology_by_epoch[prior_epoch] = _topology_from_metrics_row(prior_entry)
+        last_metrics = metrics_by_epoch[completed_epoch]
+        best_auprc = max(metrics.auprc for metrics in metrics_by_epoch.values())
+        start_epoch = completed_epoch + 1
+
+    last_heartbeat = time.monotonic()
+    for epoch in range(start_epoch, cfg.optim.epochs + 1):
         model.train()
         local_loss_sum = 0.0
         epoch_kd_loss_sum = 0.0
@@ -2499,6 +2715,17 @@ def train_ddp_loop(
                 epoch_local_tokens += int(
                     (batch["len_a"].to(torch.int64) + batch["len_b"].to(torch.int64)).sum().item()
                 )
+            heartbeat_now = time.monotonic()
+            if accelerator.is_main_process and heartbeat_now - last_heartbeat >= 60.0:
+                logger.info(
+                    "ddp heartbeat epoch=%d/%d global_step=%d loss=%.4f lr=%.3e",
+                    epoch,
+                    cfg.optim.epochs,
+                    global_step,
+                    float(local_mean_loss.detach().float().item()),
+                    float(scheduler.get_last_lr()[0]),
+                )
+                last_heartbeat = heartbeat_now
 
         if use_cuda:
             torch.cuda.synchronize(accelerator.device)
@@ -2586,8 +2813,12 @@ def train_ddp_loop(
         validation_seconds = float(validation_times.max().item())
         total_validation_seconds += validation_seconds
         last_metrics = metrics
-        entry: dict[str, float] = {
+        entry: dict[str, object] = {
             "epoch": epoch,
+            "attempt_id": artifact_dir.name,
+            "global_step": global_step,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "learning_rate": float(scheduler.get_last_lr()[0]),
             "train_loss": train_loss,
             "val_auroc": metrics.auroc,
             "val_auprc": metrics.auprc,
@@ -2607,9 +2838,6 @@ def train_ddp_loop(
         history.append(entry)
         metrics_by_epoch[epoch] = metrics
         topology_by_epoch[epoch] = outcome.topology
-        if accelerator.is_main_process:
-            state_by_epoch[epoch] = _cpu_state_dict(accelerator, model)
-
         improved = best_auprc is None or metrics.auprc > best_auprc
         if improved:
             best_auprc = metrics.auprc
@@ -2619,18 +2847,16 @@ def train_ddp_loop(
             if evals_without_improvement >= cfg.eval.patience and counterfactual_stop_epoch is None:
                 counterfactual_stop_epoch = epoch
 
-        logger.info(
-            "ddp eval epoch %d/%d: train_loss %.4f val_auroc %.4f val_auprc %.4f%s",
-            epoch,
-            cfg.optim.epochs,
-            train_loss,
-            metrics.auroc,
-            metrics.auprc,
-            " (new AUPRC high)" if improved else "",
-        )
-        if accelerator.is_main_process and on_eval is not None:
-            on_eval(entry, improved, metrics)
-
+        if accelerator.is_main_process:
+            logger.info(
+                "ddp eval epoch %d/%d: train_loss %.4f val_auroc %.4f val_auprc %.4f%s",
+                epoch,
+                cfg.optim.epochs,
+                train_loss,
+                metrics.auroc,
+                metrics.auprc,
+                " (new AUPRC high)" if improved else "",
+            )
         per_epoch_profiles.append(
             {
                 "epoch": epoch,
@@ -2644,7 +2870,111 @@ def train_ddp_loop(
                 "validation_seconds": validation_seconds,
             }
         )
+        entry.update(
+            {
+                "epoch_steps": epoch_steps,
+                "epoch_global_pairs": epoch_global_pairs,
+                "epoch_local_pairs": epoch_local_pairs,
+                "epoch_local_tokens": epoch_local_tokens,
+                "epoch_wall_seconds": epoch_wall_seconds,
+                "epoch_data_wait_seconds": epoch_data_wait_seconds,
+                "epoch_compute_seconds": epoch_compute_seconds,
+                "validation_seconds": validation_seconds,
+                "global_pairs_per_second": (
+                    epoch_global_pairs / epoch_wall_seconds if epoch_wall_seconds > 0 else 0.0
+                ),
+            }
+        )
 
+        rng_by_rank = _gather_rank_objects(accelerator, _local_rng_state(accelerator.device))
+        kd_by_rank = _gather_rank_objects(
+            accelerator, _kd_resume_state(kd_loss_fn, epoch, global_step)
+        )
+        runtime_by_rank = _gather_rank_objects(
+            accelerator,
+            {
+                "total_rank_local_pairs": total_rank_local_pairs,
+                "total_global_pairs": total_global_pairs,
+                "total_local_tokens": total_local_tokens,
+                "total_steps": total_steps,
+                "total_train_wall_seconds": total_train_wall_seconds,
+                "total_data_wait_seconds": total_data_wait_seconds,
+                "total_validation_seconds": total_validation_seconds,
+                "local_peak_memory_gib": local_peak_memory_gib,
+            },
+        )
+        io_error: list[str | None] = [None]
+        if accelerator.is_main_process:
+            try:
+                checkpoint_path = artifact_dir / "checkpoints" / f"epoch-{epoch:04d}.pt"
+                model_state = _cpu_state_dict(accelerator, model)
+                checkpoint = _checkpoint_payload(
+                    model_state,
+                    cfg,
+                    resolve_model_kwargs(cfg.model),
+                    epoch,
+                    metrics,
+                    config_to_dict(cfg),
+                )
+                checkpoint["selection_metrics"] = entry
+                _torch_save_atomic(checkpoint, checkpoint_path)
+                _append_jsonl_durable(artifact_dir / "metrics.jsonl", entry)
+                if profile_output is not None:
+                    _write_json_atomic(
+                        profile_output,
+                        {
+                            "status": "running",
+                            "epochs_completed": epoch,
+                            "validations_completed": epoch,
+                            "global_step": global_step,
+                            "counterfactual_stop_epoch": counterfactual_stop_epoch,
+                            "per_epoch": per_epoch_profiles,
+                        },
+                    )
+                _write_json_atomic(
+                    artifact_dir / "progress.json",
+                    {
+                        "status": "running",
+                        "last_completed_epoch": epoch,
+                        "epochs_total": cfg.optim.epochs,
+                        "global_step": global_step,
+                        "updated_at": datetime.now(UTC).isoformat(),
+                    },
+                )
+                # This atomic replacement is the epoch commit record and must be
+                # last: any earlier orphan candidate/metric can be ignored using
+                # the completed epoch stored here.
+                _torch_save_atomic(
+                    {
+                        "resume_supported": True,
+                        "config": config_to_dict(cfg),
+                        "world_size": world_size,
+                        "warmup_steps": warmup_steps,
+                        "schedule_total_steps": schedule_total_steps,
+                        "model_state": model_state,
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
+                        "scaler": (
+                            accelerator.scaler.state_dict()
+                            if accelerator.scaler is not None
+                            else None
+                        ),
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "rng_by_rank": rng_by_rank,
+                        "kd_by_rank": kd_by_rank,
+                        "runtime_by_rank": runtime_by_rank,
+                        "per_epoch_profiles": per_epoch_profiles,
+                        "evals_without_improvement": evals_without_improvement,
+                        "counterfactual_stop_epoch": counterfactual_stop_epoch,
+                    },
+                    artifact_dir / "training_state.pt",
+                )
+            except Exception as error:
+                io_error[0] = f"{type(error).__name__}: {error}"
+        broadcast_object_list(io_error, from_process=0)
+        if io_error[0] is not None:
+            raise RuntimeError(f"rank-zero epoch artifact write failed: {io_error[0]}")
     if not metrics_by_epoch or last_metrics is None:
         raise RuntimeError("DDP training ended without a single evaluation")
 
@@ -2688,6 +3018,8 @@ def train_ddp_loop(
     global_tokens = int(rank_totals[:, 2].sum().item())
     steady_state_data_wait_fraction = max(data_wait_fractions, default=0.0)
     runtime_profile: dict[str, object] = {
+        "status": "trained",
+        "global_step": global_step,
         "epochs_completed": cfg.optim.epochs,
         "validations_completed": cfg.optim.epochs,
         "peak_memory_gib_per_rank": peak_memory_gib_per_rank,
@@ -2733,12 +3065,36 @@ def train_ddp_loop(
         )
     best_metrics = metrics_by_epoch[best_epoch]
 
+    last_state: dict[str, torch.Tensor] = {}
+    best_state: dict[str, torch.Tensor] = {}
+    final_io_error: list[str | None] = [None]
     if accelerator.is_main_process:
-        last_state = _cpu_state_dict(accelerator, model)
-        best_state = state_by_epoch.get(best_epoch, last_state)
-    else:
-        last_state = {}
-        best_state = {}
+        try:
+            last_state = _cpu_state_dict(accelerator, model)
+            selected_checkpoint = torch.load(
+                artifact_dir / "checkpoints" / f"epoch-{best_epoch:04d}.pt",
+                map_location="cpu",
+                weights_only=False,
+            )
+            best_state = cast(dict[str, torch.Tensor], selected_checkpoint["model_state"])
+            _write_json_atomic(
+                artifact_dir / "progress.json",
+                {
+                    "status": "trained",
+                    "last_completed_epoch": cfg.optim.epochs,
+                    "epochs_total": cfg.optim.epochs,
+                    "global_step": global_step,
+                    "selected_epoch": best_epoch,
+                    "updated_at": datetime.now(UTC).isoformat(),
+                },
+            )
+            if profile_output is not None:
+                _write_json_atomic(profile_output, runtime_profile)
+        except Exception as error:
+            final_io_error[0] = f"{type(error).__name__}: {error}"
+    broadcast_object_list(final_io_error, from_process=0)
+    if final_io_error[0] is not None:
+        raise RuntimeError(f"rank-zero training finalization failed: {final_io_error[0]}")
 
     return TrainResult(
         best_state_dict=best_state,
@@ -2769,14 +3125,123 @@ def _maybe_cuda_events(
 # --------------------------------------------------------------------------- DDP worker modes
 
 
-def _write_json_rank_zero(accelerator: Accelerator, path: Path, payload: dict[str, object]) -> None:
-    """Write ``payload`` as pretty JSON from the main rank only (atomically)."""
-    if not accelerator.is_main_process:
-        return
+def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    """Atomically replace a JSON artifact."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_suffix(path.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    with temp_path.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, indent=2) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     temp_path.replace(path)
+    _fsync_directory(path.parent)
+
+
+def _write_jsonl_atomic(path: Path, rows: Sequence[dict[str, object]]) -> None:
+    """Atomically replace a JSONL prefix used to seed a resumed attempt."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with temp_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    temp_path.replace(path)
+    _fsync_directory(path.parent)
+
+
+def _write_json_rank_zero(accelerator: Accelerator, path: Path, payload: dict[str, object]) -> None:
+    """Write ``payload`` as pretty JSON from the main rank only (atomically)."""
+    if accelerator.is_main_process:
+        _write_json_atomic(path, payload)
+
+
+def _append_jsonl_durable(path: Path, payload: dict[str, object]) -> None:
+    """Append one complete JSONL record and force it to stable storage."""
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    _fsync_directory(path.parent)
+
+
+def _torch_save_atomic(payload: dict[str, object], path: Path) -> None:
+    """Write a torch payload without exposing a partially serialized checkpoint."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temp_path)
+    with temp_path.open("rb") as handle:
+        os.fsync(handle.fileno())
+    temp_path.replace(path)
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist directory-entry changes after an atomic artifact replacement."""
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _local_rng_state(device: torch.device) -> dict[str, object]:
+    """Capture this rank's stochastic state for an exact future resume."""
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state(device) if device.type == "cuda" else None,
+    }
+
+
+def _restore_local_rng_state(state: dict[str, object], device: torch.device) -> None:
+    """Restore the stochastic state captured for this DDP rank."""
+    random.setstate(cast(tuple[Any, ...], state["python"]))
+    np.random.set_state(cast(tuple[Any, ...], state["numpy"]))
+    torch.set_rng_state(cast(torch.Tensor, state["torch_cpu"]))
+    cuda_state = cast(torch.Tensor | None, state["torch_cuda"])
+    if cuda_state is not None:
+        if device.type != "cuda":
+            raise RuntimeError("CUDA RNG state cannot be restored on a CPU worker")
+        torch.cuda.set_rng_state(cuda_state, device)
+
+
+def _kd_resume_state(
+    kd_loss_fn: KDLossFn | None, epoch: int, global_step: int
+) -> dict[str, int] | None:
+    """Capture a bound KD stream position when the loss hook exposes one."""
+    owner = getattr(kd_loss_fn, "__self__", None)
+    if not isinstance(owner, KDStream):
+        return None
+    return owner.resume_state(epoch=epoch, global_step=global_step)
+
+
+def _gather_rank_objects(accelerator: Accelerator, payload: T) -> list[T]:
+    """Return one gathered object per rank, normalizing Accelerate's local case."""
+    gathered = gather_object([payload])
+    result = cast(list[T], gathered)
+    if len(result) != accelerator.num_processes:
+        raise RuntimeError(
+            "rank recovery-state gather mismatch: "
+            f"expected {accelerator.num_processes}, got {len(result)}"
+        )
+    return result
+
+
+def _run_rank_symmetric(accelerator: Accelerator, context: str, operation: Callable[[], T]) -> T:
+    """Run rank-local resume work and turn any rank's failure into an all-rank error."""
+    result: T | None = None
+    local_error: str | None = None
+    try:
+        result = operation()
+    except Exception as error:
+        local_error = f"rank {accelerator.process_index}: {type(error).__name__}: {error}"
+    errors = _gather_rank_objects(accelerator, local_error)
+    failures = [error for error in errors if error is not None]
+    if failures:
+        raise RuntimeError(f"{context} failed on at least one rank: {'; '.join(failures)}")
+    return cast(T, result)
 
 
 def _cycle_assembled_batches(factory: PackedLoaderFactory) -> Iterator[Batch]:
@@ -3025,29 +3490,61 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             world_size=accelerator.num_processes,
         )
         kd_loss_fn = kd_stream.loss
-        logger.info(
-            "KD stream active: arm=%s anchors_per_step=%d targets=%s",
-            cfg.distill.arm,
-            cfg.distill.anchors_per_step,
-            cfg.distill.targets_path,
-        )
+        if accelerator.is_main_process:
+            logger.info(
+                "KD stream active: arm=%s anchors_per_step=%d targets=%s",
+                cfg.distill.arm,
+                cfg.distill.anchors_per_step,
+                cfg.distill.targets_path,
+            )
 
     if args.ddp_mode == "epoch-probe":
         one_epoch_cfg = replace(cfg, optim=replace(cfg.optim, epochs=1))
-        result, elapsed = _run_timed_epoch_probe(
-            accelerator,
-            lambda: train_ddp_loop(
-                model,
-                factory,
-                val_loader,
-                one_epoch_cfg,
+        probe_setup: list[dict[str, str | None]] = [{"path": None, "error": None}]
+        if accelerator.is_main_process:
+            try:
+                args.profile_output.parent.mkdir(parents=True, exist_ok=True)
+                probe_setup[0]["path"] = tempfile.mkdtemp(
+                    prefix=".epoch-probe-", dir=args.profile_output.parent
+                )
+            except Exception as error:
+                probe_setup[0]["error"] = f"{type(error).__name__}: {error}"
+        broadcast_object_list(probe_setup, from_process=0)
+        if probe_setup[0]["error"] is not None:
+            raise RuntimeError(f"rank-zero epoch-probe setup failed: {probe_setup[0]['error']}")
+        probe_path = probe_setup[0]["path"]
+        if probe_path is None:
+            raise RuntimeError("rank-zero epoch-probe setup returned no artifact path")
+        probe_artifact_dir = Path(probe_path)
+        try:
+            result, elapsed = _run_timed_epoch_probe(
                 accelerator,
-                warmup_steps=warmup_steps,
-                schedule_total_steps=schedule_total_steps,
-                evaluate_fn=evaluate_fn,
-                kd_loss_fn=kd_loss_fn,
-            ),
-        )
+                lambda: train_ddp_loop(
+                    model,
+                    factory,
+                    val_loader,
+                    one_epoch_cfg,
+                    accelerator,
+                    warmup_steps=warmup_steps,
+                    artifact_dir=probe_artifact_dir,
+                    schedule_total_steps=schedule_total_steps,
+                    evaluate_fn=evaluate_fn,
+                    kd_loss_fn=kd_loss_fn,
+                ),
+            )
+        except BaseException:
+            if accelerator.is_main_process:
+                shutil.rmtree(probe_artifact_dir, ignore_errors=True)
+            raise
+        cleanup_error: list[str | None] = [None]
+        if accelerator.is_main_process:
+            try:
+                shutil.rmtree(probe_artifact_dir)
+            except Exception as error:
+                cleanup_error[0] = f"{type(error).__name__}: {error}"
+        broadcast_object_list(cleanup_error, from_process=0)
+        if cleanup_error[0] is not None:
+            raise RuntimeError(f"rank-zero epoch-probe cleanup failed: {cleanup_error[0]}")
         _write_json_rank_zero(
             accelerator,
             args.profile_output,
@@ -3065,19 +3562,42 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         cfg,
         accelerator,
         warmup_steps=warmup_steps,
+        artifact_dir=cfg.output_dir,
+        profile_output=args.profile_output,
+        resume_attempt=args.resume_attempt,
         schedule_total_steps=schedule_total_steps,
         evaluate_fn=evaluate_fn,
         kd_loss_fn=kd_loss_fn,
     )
+    finalization_error: list[str | None] = [None]
     if accelerator.is_main_process:
-        write_outputs(result, cfg, model_kwargs, assembled.dropped_pair_counts)
-    _write_json_rank_zero(accelerator, args.profile_output, result.runtime_profile)
-    logger.info(
-        "ddp train complete: best epoch %d val AUPRC %.4f (counterfactual_stop_epoch=%s)",
-        result.best_epoch,
-        result.best_val_metrics.auprc,
-        result.counterfactual_stop_epoch,
-    )
+        try:
+            write_outputs(result, cfg, model_kwargs, assembled.dropped_pair_counts)
+            result.runtime_profile["status"] = "complete"
+            _write_json_atomic(args.profile_output, result.runtime_profile)
+            _write_json_atomic(
+                cfg.output_dir / "progress.json",
+                {
+                    "status": "complete",
+                    "last_completed_epoch": result.last_epoch,
+                    "epochs_total": cfg.optim.epochs,
+                    "global_step": result.runtime_profile["global_step"],
+                    "selected_epoch": result.best_epoch,
+                    "updated_at": datetime.now(UTC).isoformat(),
+                },
+            )
+        except Exception as error:
+            finalization_error[0] = f"{type(error).__name__}: {error}"
+    broadcast_object_list(finalization_error, from_process=0)
+    if finalization_error[0] is not None:
+        raise RuntimeError(f"rank-zero final artifact write failed: {finalization_error[0]}")
+    if accelerator.is_main_process:
+        logger.info(
+            "ddp train complete: best epoch %d val AUPRC %.4f (counterfactual_stop_epoch=%s)",
+            result.best_epoch,
+            result.best_val_metrics.auprc,
+            result.counterfactual_stop_epoch,
+        )
 
 
 # --------------------------------------------------------------------------- CLI entry point
@@ -3104,7 +3624,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if cfg.distill is not None and cfg.distill.active:
         raise ValueError(
             "distill training runs only through the DDP pipeline path "
-            "(hpc/run.sh train <config>), not the legacy single-process CLI"
+            "(hpc/run.sh train <config>), not the direct single-process debug CLI"
         )
 
     set_seed(cfg.seed)
@@ -3140,18 +3660,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     metrics_path.unlink(missing_ok=True)
     config_dict = config_to_dict(cfg)
 
-    def on_eval(entry: dict[str, float], improved: bool, metrics: EdgeMetrics) -> None:
+    def on_eval(entry: dict[str, object], improved: bool, metrics: EdgeMetrics) -> None:
         """Append a metrics line and persist checkpoints incrementally."""
-        with metrics_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
+        _append_jsonl_durable(metrics_path, entry)
         state = _cpu_state_dict(accelerator, model)
-        epoch = int(entry["epoch"])
-        torch.save(
+        epoch = int(cast(int, entry["epoch"]))
+        _torch_save_atomic(
             _checkpoint_payload(state, cfg, model_kwargs, epoch, metrics, config_dict),
             cfg.output_dir / "last.pt",
         )
         if improved:
-            torch.save(
+            _torch_save_atomic(
                 _checkpoint_payload(state, cfg, model_kwargs, epoch, metrics, config_dict),
                 cfg.output_dir / "best.pt",
             )

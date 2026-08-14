@@ -26,7 +26,7 @@ model:
       spectral_norm: false
     mixing:
       mode: none
-    label_smoothing: 0.05 # symmetric BCE smoothing, legacy V3.1 recipe
+    label_smoothing: 0.05 # symmetric BCE smoothing, fixed V3.1 recipe
 data:
   root: data
   strategy: breadth_first

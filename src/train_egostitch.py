@@ -41,7 +41,7 @@ import networkx as nx
 import numpy as np
 import torch
 import torch.nn.functional as F
-import yaml  # type: ignore[import-untyped]
+import yaml  # type: ignore[import-untyped,unused-ignore]
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 from numpy.typing import NDArray
@@ -3614,29 +3614,6 @@ def _cpu_state_dict(accelerator: Accelerator, wrapped: torch.nn.Module) -> dict[
     inner = accelerator.unwrap_model(wrapped)
     model = inner.model if isinstance(inner, _CompositeStep) else inner
     return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-
-
-def _write_failed_run_history(
-    output_dir: Path,
-    *,
-    run_kind: str,
-    arm: str,
-    history: Sequence[Mapping[str, object]],
-) -> None:
-    """Retain per-epoch validation evidence when checkpoint selection fails.
-
-    Best-effort by design: evidence retention must never mask the primary
-    no-eligible-checkpoint failure, so I/O and serialization errors are
-    logged and swallowed.
-    """
-    try:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        payload = {"run_kind": run_kind, "arm": arm, "history": list(history)}
-        (output_dir / "failed_run_history.json").write_text(
-            json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
-        )
-    except (OSError, TypeError, ValueError) as error:
-        logger.error("failed to retain per-epoch failure history: %s", error)
 
 
 def _e2e_arm_name(model: EgoStitchModel) -> E2EArmName:

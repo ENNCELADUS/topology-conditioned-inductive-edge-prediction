@@ -9,7 +9,7 @@ cold multi-H20 run end to end in four sub-stages — ``pack -> train -> publish
 -> test``: pack-or-validate the BF16 feature cache, launch one clean
 ``accelerate launch`` ``train`` process group at the configured
 ``runtime.token_budget``, merge the worker's runtime profile with pipeline-level
-fields, publish the validated staging tree atomically, then run the published
+fields, publish the validated attempt artifact tree atomically, then run the published
 checkpoint through the held-out test protocol. See :func:`run_pipeline` for
 the full contract.
 
@@ -18,6 +18,7 @@ src.train_egostitch``.
 """
 
 import argparse
+import fcntl
 import hashlib
 import json
 import logging
@@ -29,10 +30,13 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
+from io import BufferedReader
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import cast
@@ -181,6 +185,7 @@ class PipelineArgs:
     max_steps: int | None = None
     run_kind: str | None = None
     rescore_reason: str | None = None
+    resume_attempt: Path | None = None
 
 
 def build_accelerate_command(
@@ -197,6 +202,7 @@ def build_accelerate_command(
     seed: int | None = None,
     max_steps: int | None = None,
     run_kind: str | None = None,
+    resume_attempt: Path | None = None,
 ) -> list[str]:
     """Build the pinned ``accelerate launch -m <worker>`` worker command.
 
@@ -218,6 +224,8 @@ def build_accelerate_command(
         max_steps: Optional DEBUG-ONLY bounded worker-step limit.
         run_kind: Optional EgoStitch-E2E execution context forwarded unchanged
             to the worker.
+        resume_attempt: Optional prior attempt directory whose completed
+            epoch-boundary state the worker resumes from.
 
     Returns:
         The exact ``accelerate launch --num_processes <world_size> --mixed_precision bf16
@@ -251,6 +259,8 @@ def build_accelerate_command(
         command.extend(("--max-steps", str(max_steps)))
     if run_kind is not None:
         command.extend(("--run-kind", run_kind))
+    if resume_attempt is not None:
+        command.extend(("--resume-attempt", str(resume_attempt)))
     return command
 
 
@@ -288,6 +298,7 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--resume-attempt", type=Path, default=None)
     parser.add_argument(
         "--run-kind",
         choices=("formal", "diagnostic"),
@@ -327,6 +338,7 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
         max_steps=namespace.max_steps,
         run_kind=namespace.run_kind,
         rescore_reason=namespace.rescore_reason,
+        resume_attempt=namespace.resume_attempt,
     )
 
 
@@ -349,6 +361,8 @@ def _pipeline_rerun_command(args: PipelineArgs) -> str:
         parts += ["--max-steps", str(args.max_steps)]
     if args.run_kind is not None:
         parts += ["--run-kind", args.run_kind]
+    if args.resume_attempt is not None:
+        parts += ["--resume-attempt", str(args.resume_attempt)]
     if args.worker_module != "src.train_b0":
         parts += ["--worker-module", args.worker_module]
     parts += ["--rescore-reason", "<reason for the repeat held-out scoring epoch>"]
@@ -356,6 +370,9 @@ def _pipeline_rerun_command(args: PipelineArgs) -> str:
 
 
 CommandRunner = Callable[[Sequence[str], float | None], subprocess.CompletedProcess[str]]
+TrainingCommandRunner = Callable[
+    [Sequence[str], float | None, Path], subprocess.CompletedProcess[str]
+]
 StageRunner = Callable[[Callable[[], None], float | None], None]
 
 
@@ -445,6 +462,92 @@ def run_command(
     finally:
         _unregister_nested_process_group(registry_entry)
     return subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
+
+
+def run_logged_command(
+    command: Sequence[str], timeout_seconds: float | None, log_path: Path
+) -> subprocess.CompletedProcess[str]:
+    """Run a process group while the parent durably streams merged output to disk."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = log_path.open("ab", buffering=0)
+    child_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    try:
+        process = subprocess.Popen(
+            list(command),
+            start_new_session=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=child_env,
+        )
+    except BaseException:
+        log_handle.close()
+        raise
+    registry_entry = _register_nested_process_group(_nested_process_group_registry, process.pid)
+    output_pipe = cast(BufferedReader, process.stdout)
+    reader_error: list[BaseException] = []
+
+    def read_output() -> None:
+        try:
+            while chunk := output_pipe.read1(65536):
+                log_handle.write(chunk)
+        except BaseException as error:
+            reader_error.append(error)
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
+    timed_out = False
+    deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+    try:
+        while process.poll() is None:
+            if reader_error:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                timed_out = True
+                break
+            time.sleep(0.05)
+        if process.poll() is None:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+    except BaseException:
+        if process.poll() is None:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        raise
+    finally:
+        reader.join(timeout=0.2)
+        if reader.is_alive():
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            reader.join(timeout=2.0)
+        if reader.is_alive():
+            with suppress(OSError):
+                os.close(output_pipe.fileno())
+            reader.join(timeout=2.0)
+        if reader.is_alive():
+            reader_error.append(TimeoutError("training output pipe did not close"))
+        log_handle.close()
+        _unregister_nested_process_group(registry_entry)
+    if reader_error:
+        raise OSError(f"failed to persist training output: {reader_error[0]}")
+    if timed_out:
+        assert timeout_seconds is not None
+        raise subprocess.TimeoutExpired(list(command), timeout_seconds)
+    return subprocess.CompletedProcess(list(command), process.returncode, "", "")
+
+
+def _read_log_tail(path: Path, *, max_bytes: int = 16384, max_lines: int = 50) -> str:
+    """Read a bounded UTF-8 tail without loading an arbitrarily large log."""
+    with path.open("rb") as handle:
+        size = handle.seek(0, os.SEEK_END)
+        start = max(0, size - max_bytes)
+        handle.seek(start)
+        data = handle.read(max_bytes)
+    text = data.decode("utf-8", errors="replace")
+    if start > 0 and "\n" in text:
+        text = text.split("\n", 1)[1]
+    return "\n".join(text.splitlines()[-max_lines:])
 
 
 def _run_stage_child(operation: Callable[[], None], sender: Connection) -> None:
@@ -779,6 +882,7 @@ def _publish_staged(
             backup_dir,
             published,
             remove_completion=completion_backed_up,
+            restore_dir=staging_dir,
         )
         raise
     return backup_dir, published
@@ -790,10 +894,15 @@ def _rollback_publication(
     published: Sequence[str],
     *,
     remove_completion: bool = True,
+    restore_dir: Path | None = None,
 ) -> None:
     """Remove newly published files and atomically restore the prior canonical run."""
     for filename in published:
-        (output_dir / filename).unlink(missing_ok=True)
+        published_path = output_dir / filename
+        if restore_dir is None:
+            published_path.unlink(missing_ok=True)
+        elif published_path.exists():
+            os.replace(published_path, restore_dir / filename)
     if remove_completion:
         for completion_name in _COMPLETION_FILENAMES:
             (output_dir / completion_name).unlink(missing_ok=True)
@@ -852,10 +961,11 @@ def _clear_stale_test_artifacts(
     (output_dir / report_filename).unlink(missing_ok=True)
 
 
-def run_pipeline(
+def _run_pipeline_unlocked(
     args: PipelineArgs,
     *,
     command_runner: CommandRunner = run_command,
+    training_command_runner: TrainingCommandRunner = run_logged_command,
     stage_runner: StageRunner = run_stage,
 ) -> int:
     """Execute the cold E2 pipeline and return 0 on success or 2 on failure.
@@ -869,7 +979,7 @@ def run_pipeline(
     ``artifact_manifest.json`` with SHA-256 and byte size for ``best.pt``,
     ``last.pt``, ``metrics.jsonl``, ``run_metadata.json``, ``profile.json``, plus
     the E2E ``v_hold_validation_events.jsonl`` when applicable; (7) publish the
-    validated staging tree into the canonical output directory with per-file
+    validated attempt artifact tree into the canonical output directory with per-file
     atomic replaces and full rollback; and (8), only once publication has
     committed, run the published ``best.pt`` through the held-out test
     protocol (no deadline: see the test stage), recording its duration into
@@ -890,15 +1000,19 @@ def run_pipeline(
     (``--max-steps``) returns before publication is even attempted, so it
     never spends a held-out scoring epoch.
 
-    Every subprocess call goes through ``command_runner`` with ``check=False``
-    and an explicit timeout (``runtime.train_eval_budget_seconds`` for
-    training). Every failure after training starts stops immediately; nothing is
-    published until the whole staging tree has been validated.
+    Every scoring subprocess call goes through ``command_runner`` with
+    ``check=False``. Training goes through ``training_command_runner`` so worker
+    output is durably streamed into the attempt's ``train.log`` under the
+    configured timeout. Every failure after training starts stops immediately;
+    nothing is published until the whole attempt artifact tree has been
+    validated.
 
     Args:
         args: Parsed pipeline CLI arguments.
         command_runner: Injectable subprocess seam (real subprocesses in
-            production; a fake in tests).
+            production; a fake in tests) for scoring fan-out.
+        training_command_runner: Injectable training subprocess seam; production
+            uses a durable merged-output ``train.log`` writer.
         stage_runner: Injectable supervised Python-stage seam for pack,
             artifact, and test-stage deadlines.
 
@@ -942,24 +1056,55 @@ def run_pipeline(
     )
     cfg = replace(cfg, output_dir=output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    staging_dir = Path(tempfile.mkdtemp(prefix=".e2-run-", dir=output_dir))
+    attempt_id = uuid.uuid4().hex
+    attempt_dir = output_dir / "attempts" / attempt_id
+    attempt_dir.mkdir(parents=True)
+    train_log_path = attempt_dir / "train.log"
+    train_log_path.touch()
+    attempt_status_path = attempt_dir / "status.json"
+    current_attempt_path = output_dir / "current_attempt.json"
+    attempt_status: dict[str, object] = {
+        "attempt_id": attempt_id,
+        "status": "running",
+        "started_at_unix_seconds": time.time(),
+    }
+    resolved_resume_attempt: Path | None = None
+    if args.resume_attempt is not None:
+        attempt_status["resume_attempt"] = str(args.resume_attempt)
+    _write_json_atomic(attempt_status_path, attempt_status)
+    _write_json_atomic(current_attempt_path, attempt_status)
+    (output_dir / "failure.json").unlink(missing_ok=True)
     pack_dir = args.pack_dir if args.pack_dir is not None else runtime.pack_dir
 
+    def attempt_failure_extra(extra: Mapping[str, object] | None) -> dict[str, object]:
+        progress: object | None = None
+        progress_path = attempt_dir / "progress.json"
+        if progress_path.is_file():
+            with suppress(OSError, json.JSONDecodeError):
+                progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        log_tail = ""
+        with suppress(OSError):
+            log_tail = _read_log_tail(train_log_path)
+        attempt_relative = Path("attempts") / attempt_id
+        failure_extra: dict[str, object] = dict(extra or {})
+        failure_extra.update(
+            {
+                "attempt_id": attempt_id,
+                "attempt_path": str(attempt_relative),
+                "log_path": str(attempt_relative / "train.log"),
+                "log_tail": log_tail,
+                "last_progress": progress,
+            }
+        )
+        return failure_extra
+
     def fail(*, stage: str, message: str, extra: Mapping[str, object] | None = None) -> int:
-        staged_profile = staging_dir / "profile.json"
-        if staged_profile.is_file():
-            with suppress(OSError):
-                os.replace(staged_profile, output_dir / "failed_run_profile.json")
-        staged_history = staging_dir / "failed_run_history.json"
-        if staged_history.is_file():
-            with suppress(OSError):
-                os.replace(staged_history, output_dir / "failed_run_history.json")
-        else:
-            # A failure before training produces no history; a prior run's
-            # retained history must not masquerade as this failure's evidence.
-            (output_dir / "failed_run_history.json").unlink(missing_ok=True)
-        write_failure(output_dir, stage=stage, message=message, extra=extra)
-        shutil.rmtree(staging_dir, ignore_errors=True)
+        failure_extra = attempt_failure_extra(extra)
+        terminal_status = {**attempt_status, "status": "failed", "stage": stage}
+        _write_json_atomic(attempt_status_path, terminal_status)
+        _write_json_atomic(current_attempt_path, terminal_status)
+        write_failure(attempt_dir, stage=stage, message=message, extra=failure_extra)
+        write_failure(output_dir, stage=stage, message=message, extra=failure_extra)
         return 2
 
     def fail_after_publication(
@@ -968,8 +1113,8 @@ def run_pipeline(
         """Record a post-publication stage failure without touching publication.
 
         ``fail()`` is written for pre-publication failures: at that point
-        ``complete.json`` does not exist yet, so removing the staging tree and
-        rescuing staged evidence is always safe. By the time the test stage
+        ``complete.json`` does not exist yet, so retaining the attempt directory
+        is the complete failure evidence. By the time the test stage
         runs, `_publish_staged` has already committed a valid, real
         ``complete.json`` and checkpoint; a scoring failure is a fact about the
         *test* stage only; and a held-out test-access ledger record for this
@@ -978,8 +1123,116 @@ def run_pipeline(
         the publish stage wrote — it only records `failure.json` alongside the
         still-valid `complete.json`.
         """
-        write_failure(output_dir, stage=stage, message=message, extra=extra)
+        failure_extra = attempt_failure_extra(extra)
+        terminal_status = {**attempt_status, "status": "failed", "stage": stage}
+        _write_json_atomic(attempt_status_path, terminal_status)
+        _write_json_atomic(current_attempt_path, terminal_status)
+        write_failure(attempt_dir, stage=stage, message=message, extra=failure_extra)
+        write_failure(output_dir, stage=stage, message=message, extra=failure_extra)
         return 2
+
+    if args.resume_attempt is not None:
+        try:
+            import torch
+
+            resume_attempt = args.resume_attempt.resolve(strict=True)
+            resolved_resume_attempt = resume_attempt
+            attempts_root = (output_dir / "attempts").resolve()
+            if not resume_attempt.is_dir() or resume_attempt.parent != attempts_root:
+                raise ValueError("--resume-attempt must be a direct child of output_dir/attempts")
+            if resume_attempt == attempt_dir.resolve():
+                raise ValueError("--resume-attempt must identify a prior attempt")
+            source_status = json.loads((resume_attempt / "status.json").read_text(encoding="utf-8"))
+            if not isinstance(source_status, dict):
+                raise ValueError("resume attempt must have failed or abandoned terminal status")
+            if source_status.get("status") == "running":
+                source_status.update({"status": "abandoned", "abandoned_by_attempt_id": attempt_id})
+                _write_json_atomic(resume_attempt / "status.json", source_status)
+            elif source_status.get("status") not in {"failed", "abandoned"}:
+                raise ValueError("resume attempt must be failed, abandoned, or orphaned running")
+            state_path = resume_attempt / "training_state.pt"
+            metrics_path = resume_attempt / "metrics.jsonl"
+            checkpoints_dir = resume_attempt / "checkpoints"
+            if (
+                not state_path.is_file()
+                or not metrics_path.is_file()
+                or not checkpoints_dir.is_dir()
+            ):
+                raise ValueError(
+                    "resume attempt is missing training_state.pt, metrics.jsonl, or checkpoints"
+                )
+            state = torch.load(state_path, map_location="cpu", weights_only=False)
+            if not isinstance(state, dict) or state.get("resume_supported") is not True:
+                raise ValueError("training_state.pt does not contain resumable state")
+            required_state = {
+                "config",
+                "model_state",
+                "optimizer",
+                "scheduler",
+                "world_size",
+                "warmup_steps",
+                "schedule_total_steps",
+                "epoch",
+                "global_step",
+                "rng_by_rank",
+                "kd_by_rank",
+                "runtime_by_rank",
+                "per_epoch_profiles",
+                "evals_without_improvement",
+                "counterfactual_stop_epoch",
+            }
+            if not required_state.issubset(state):
+                raise ValueError("training_state.pt is incomplete")
+            if state["world_size"] != runtime.world_size:
+                raise ValueError("training_state.pt does not match the current world size")
+            completed_epoch = state["epoch"]
+            if (
+                isinstance(completed_epoch, bool)
+                or not isinstance(completed_epoch, int)
+                or not 1 <= completed_epoch <= cfg.optim.epochs
+            ):
+                raise ValueError("training_state.pt epoch is not resumable for this config")
+            if not isinstance(state["global_step"], int) or state["global_step"] <= 0:
+                raise ValueError("training_state.pt global_step is invalid")
+            for field in ("rng_by_rank", "kd_by_rank", "runtime_by_rank"):
+                value = state[field]
+                if not isinstance(value, list) or len(value) != runtime.world_size:
+                    raise ValueError(f"training_state.pt {field} does not match world size")
+            metric_rows = metrics_path.read_text(encoding="utf-8").splitlines()
+            if len(metric_rows) < completed_epoch:
+                raise ValueError("resume metrics.jsonl does not match the completed epoch")
+            metric_rows = metric_rows[:completed_epoch]
+            parsed_metric_rows: list[dict[str, object]] = []
+            for expected_epoch, line in enumerate(metric_rows, start=1):
+                row = json.loads(line)
+                if not isinstance(row, dict) or row.get("epoch") != expected_epoch:
+                    raise ValueError("resume metrics.jsonl epoch sequence is invalid")
+                parsed_metric_rows.append(row)
+            expected_checkpoints = [
+                checkpoints_dir / f"epoch-{epoch:04d}.pt" for epoch in range(1, completed_epoch + 1)
+            ]
+            if any(not path.is_file() for path in expected_checkpoints):
+                raise ValueError("resume attempt has an incomplete checkpoint sequence")
+            for expected_epoch, checkpoint in enumerate(expected_checkpoints, start=1):
+                candidate = torch.load(checkpoint, map_location="cpu", weights_only=False)
+                if (
+                    not isinstance(candidate, dict)
+                    or candidate.get("epoch") != expected_epoch
+                    or candidate.get("selection_metrics") != parsed_metric_rows[expected_epoch - 1]
+                ):
+                    raise ValueError("resume checkpoint candidate does not match metrics prefix")
+            (attempt_dir / "metrics.jsonl").write_text(
+                "\n".join(metric_rows) + "\n", encoding="utf-8"
+            )
+            seeded_checkpoints = attempt_dir / "checkpoints"
+            seeded_checkpoints.mkdir()
+            for checkpoint in expected_checkpoints:
+                os.link(checkpoint, seeded_checkpoints / checkpoint.name)
+            attempt_status["resumed_from_attempt_id"] = resume_attempt.name
+            _write_json_atomic(attempt_status_path, attempt_status)
+            _write_json_atomic(current_attempt_path, attempt_status)
+        except Exception as error:
+            return fail(stage="train", message=f"resume attempt validation failed: {error}")
 
     stage_seconds: dict[str, float] = {}
 
@@ -997,8 +1250,8 @@ def run_pipeline(
         return fail(stage="pack", message="worker returned invalid required pack paths")
     cold_cache = any(not path.exists() for path in pack_paths)
     pack_started = time.monotonic()
-    pack_validation_path = staging_dir / "pack_validation.json"
-    pack_temp_prefix = f".{pack_dir.name}.{staging_dir.name}.pack-"
+    pack_validation_path = attempt_dir / "pack_validation.json"
+    pack_temp_prefix = f".{pack_dir.name}.{attempt_id}.pack-"
 
     def cleanup_owned_pack_temps() -> None:
         for parent in {path.parent for path in pack_paths}:
@@ -1043,7 +1296,7 @@ def run_pipeline(
     pack_validation_path.unlink(missing_ok=True)
     pack_evidence = cast(dict[str, object], pack_validation.get("packs", {}))
 
-    profile_path = staging_dir / "profile.json"
+    profile_path = attempt_dir / "profile.json"
     evidence_profile: dict[str, object] = {
         "cold_cache": cold_cache,
         "stage_seconds": dict(stage_seconds),
@@ -1057,7 +1310,7 @@ def run_pipeline(
 
     # --- train: one clean process group at the configured token budget ---
     train_started = time.monotonic()
-    worker_profile_path = staging_dir / "train_worker_profile.json"
+    worker_profile_path = attempt_dir / "worker_profile.json"
     worker_profile_path.unlink(missing_ok=True)
     try:
         command = build_accelerate_command(
@@ -1065,7 +1318,7 @@ def run_pipeline(
             config_path=args.config,
             mode="train",
             pack_dir=pack_dir,
-            output_dir=output_dir if debug_run else staging_dir,
+            output_dir=attempt_dir,
             token_budget=runtime.token_budget,
             profile_output=worker_profile_path,
             world_size=runtime.world_size,
@@ -1073,14 +1326,16 @@ def run_pipeline(
             seed=args.seed,
             max_steps=args.max_steps,
             run_kind=args.run_kind,
+            resume_attempt=resolved_resume_attempt,
         )
     except Exception as error:
         _write_json_atomic(profile_path, evidence_profile)
         return fail(stage="train", message=f"training worker launch setup failed: {error}")
     try:
-        completed = command_runner(
+        completed = training_command_runner(
             command,
             None if diagnostic_run else float(runtime.train_eval_budget_seconds),
+            train_log_path,
         )
     except subprocess.TimeoutExpired:
         _write_json_atomic(profile_path, evidence_profile)
@@ -1097,7 +1352,7 @@ def run_pipeline(
         return fail(
             stage="train",
             message=f"training subprocess exited with code {completed.returncode}",
-            extra={"returncode": completed.returncode, "stderr": completed.stderr},
+            extra={"returncode": completed.returncode},
         )
     stage_seconds["train"] = time.monotonic() - train_started
 
@@ -1115,7 +1370,7 @@ def run_pipeline(
         )
         completed_epochs = cast(int, worker_runtime_profile["epochs_completed"])
         _validate_staged_artifacts(
-            output_dir if debug_run else staging_dir,
+            attempt_dir,
             epochs=completed_epochs if debug_run else cfg.optim.epochs,
             model_family=cfg.model.family,
             allow_partial=debug_run,
@@ -1137,8 +1392,6 @@ def run_pipeline(
             stage="artifacts",
             message=f"worker profile is missing or malformed: {error}",
         )
-    worker_profile_path.unlink(missing_ok=True)
-
     final_profile: dict[str, object] = {
         **worker_runtime_profile,
         **evidence_profile,
@@ -1146,8 +1399,12 @@ def run_pipeline(
     if debug_run:
         final_profile["run_kind"] = "debug"
         _write_json_atomic(output_dir / "profile.json", final_profile)
+        for filename in ("best.pt", "last.pt", "metrics.jsonl", "run_metadata.json"):
+            shutil.copy2(attempt_dir / filename, output_dir / filename)
         _write_json_atomic(output_dir / "debug_complete.json", {"status": "debug_complete"})
-        shutil.rmtree(staging_dir, ignore_errors=True)
+        terminal_status = {**attempt_status, "status": "debug_complete"}
+        _write_json_atomic(attempt_status_path, terminal_status)
+        _write_json_atomic(current_attempt_path, terminal_status)
         return 0
     _write_json_atomic(profile_path, final_profile)
     artifacts_started = time.monotonic()
@@ -1165,11 +1422,11 @@ def run_pipeline(
             *(
                 filename
                 for filename in optional_published_filenames
-                if (staging_dir / filename).is_file()
+                if (attempt_dir / filename).is_file()
             ),
         )
         for filename in non_profile_filenames:
-            artifact_path = staging_dir / filename
+            artifact_path = attempt_dir / filename
             manifest[filename] = {
                 "sha256": sha256_file(artifact_path),
                 "byte_size": artifact_path.stat().st_size,
@@ -1188,7 +1445,7 @@ def run_pipeline(
             "sha256": sha256_file(profile_path),
             "byte_size": profile_path.stat().st_size,
         }
-        _write_json_atomic(staging_dir / "artifact_manifest.json", manifest)
+        _write_json_atomic(attempt_dir / "artifact_manifest.json", manifest)
 
     try:
         stage_runner(
@@ -1206,20 +1463,29 @@ def run_pipeline(
         _write_json_atomic(profile_path, final_profile)
         return fail(stage="artifacts", message=f"artifact merge/manifest failed: {error}")
 
-    # The staging tree is now complete and validated. Publication is reversible
-    # until the success sentinel lands.
+    # Publish hardlinks from a temporary tree, leaving the complete attempt
+    # evidence untouched. Publication remains reversible until its sentinel lands.
+    publication_dir = Path(tempfile.mkdtemp(prefix=".e2-publish-", dir=output_dir))
+    filenames_to_publish = _PUBLISHED_FILENAMES + tuple(
+        filename for filename in optional_published_filenames if (attempt_dir / filename).is_file()
+    )
+    try:
+        for filename in filenames_to_publish:
+            os.link(attempt_dir / filename, publication_dir / filename)
+    except Exception as error:
+        shutil.rmtree(publication_dir, ignore_errors=True)
+        return fail(stage="publication", message=f"publication staging failed: {error}")
     try:
         _assert_no_cross_kind_completion(output_dir, run_kind=args.run_kind or "formal")
         backup_dir, published = _publish_staged(
-            staging_dir,
+            publication_dir,
             output_dir,
             optional_filenames=optional_published_filenames,
         )
     except Exception as error:
+        shutil.rmtree(publication_dir, ignore_errors=True)
         return fail(stage="publication", message=f"canonical publication failed: {error}")
     (output_dir / "failure.json").unlink(missing_ok=True)
-    (output_dir / "failed_run_profile.json").unlink(missing_ok=True)
-    (output_dir / "failed_run_history.json").unlink(missing_ok=True)
     total_elapsed = time.monotonic() - pipeline_started
     b0_formal_cold = (
         not debug_run
@@ -1228,7 +1494,8 @@ def run_pipeline(
         and args.run_kind is None
     )
     if b0_formal_cold and total_elapsed > runtime.total_budget_seconds:
-        _rollback_publication(output_dir, backup_dir, published)
+        _rollback_publication(output_dir, backup_dir, published, restore_dir=publication_dir)
+        shutil.rmtree(publication_dir, ignore_errors=True)
         return fail(
             stage="total_budget",
             message=(
@@ -1246,13 +1513,18 @@ def run_pipeline(
         )
         _write_json_atomic(
             output_dir / completion_name,
-            {"status": completion_name.removesuffix(".json"), "total_seconds": total_elapsed},
+            {
+                "status": completion_name.removesuffix(".json"),
+                "attempt_id": attempt_id,
+                "total_seconds": total_elapsed,
+            },
         )
     except Exception as error:
-        _rollback_publication(output_dir, backup_dir, published)
+        _rollback_publication(output_dir, backup_dir, published, restore_dir=publication_dir)
+        shutil.rmtree(publication_dir, ignore_errors=True)
         return fail(stage="publication", message=f"completion sentinel failed: {error}")
     shutil.rmtree(backup_dir, ignore_errors=True)
-    shutil.rmtree(staging_dir, ignore_errors=True)
+    shutil.rmtree(publication_dir, ignore_errors=True)
     logger.info("E2 pipeline published: %.1fs elapsed", total_elapsed)
 
     # --- test: run the published checkpoint through the held-out test protocol ---
@@ -1358,8 +1630,48 @@ def run_pipeline(
             )
         return fail_after_publication(stage="test", message=message)
 
+    terminal_status = {**attempt_status, "status": "complete"}
+    _write_json_atomic(attempt_dir / "complete.json", terminal_status)
+    _write_json_atomic(attempt_status_path, terminal_status)
+    _write_json_atomic(current_attempt_path, terminal_status)
     logger.info("E2 pipeline complete: %.1fs elapsed", time.monotonic() - pipeline_started)
     return 0
+
+
+def run_pipeline(
+    args: PipelineArgs,
+    *,
+    command_runner: CommandRunner = run_command,
+    training_command_runner: TrainingCommandRunner = run_logged_command,
+    stage_runner: StageRunner = run_stage,
+) -> int:
+    """Run one exclusive pipeline attempt for the resolved output directory."""
+    import importlib
+
+    worker = importlib.import_module(args.worker_module)
+    cfg = worker.load_config(args.config)
+    formal_output_dir = args.output_dir if args.output_dir is not None else cfg.output_dir
+    output_dir = (
+        formal_output_dir.with_name(f"{formal_output_dir.name}_debug")
+        if args.max_steps is not None
+        else formal_output_dir
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / ".pipeline.lock").open("a+b") as lock_handle:
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logger.error("another pipeline is active for %s", output_dir)
+            return 2
+        try:
+            return _run_pipeline_unlocked(
+                args,
+                command_runner=command_runner,
+                training_command_runner=training_command_runner,
+                stage_runner=stage_runner,
+            )
+        finally:
+            fcntl.flock(lock_handle, fcntl.LOCK_UN)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

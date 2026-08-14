@@ -1,6 +1,6 @@
 """Tests for the B0 ``optim.scheduler`` block and V3.1 loss label smoothing.
 
-Both features exist to reproduce the legacy V3.1 training recipe (OneCycle LR +
+Both features implement the fixed V3.1 training recipe (OneCycle LR +
 0.05 label smoothing). The invariants that matter here are: a config *without* a
 scheduler block must keep the historical warmup-then-constant schedule bit for
 bit, OneCycle must be sized from an exact step count rather than an extrapolated
@@ -83,7 +83,7 @@ class TestParseScheduler:
         """No scheduler block selects the historical schedule."""
         assert _parse_scheduler(None) is None
 
-    def test_parses_the_legacy_onecycle_block(self) -> None:
+    def test_parses_the_onecycle_block(self) -> None:
         """A well-formed block round-trips into `SchedulerConfig`."""
         parsed = _parse_scheduler(dict(ONECYCLE_BLOCK))
         assert parsed == SchedulerConfig(
@@ -141,7 +141,7 @@ class TestConfigIntegration:
     """The block flows through `load_config` and `config_to_dict`."""
 
     def test_config_without_block_has_none(self, tmp_path: Path) -> None:
-        """Existing configs keep `scheduler=None` (backward compatible)."""
+        """A config without a scheduler block selects the default schedule."""
         cfg = _config_with_scheduler(tmp_path, None)
         assert cfg.optim.scheduler is None
 
@@ -152,7 +152,7 @@ class TestConfigIntegration:
         assert as_dict["optim"]["scheduler"] == ONECYCLE_BLOCK
         json.dumps(as_dict)  # must stay JSON-serializable for the config hash
 
-    def test_shipped_b0_config_uses_the_legacy_recipe(self) -> None:
+    def test_shipped_b0_config_uses_the_fixed_recipe(self) -> None:
         """The committed B0 config carries the recipe this change exists for."""
         cfg = load_config(Path("configs/b0_v31_breadth_first.yaml"))
         assert cfg.optim.epochs == 25

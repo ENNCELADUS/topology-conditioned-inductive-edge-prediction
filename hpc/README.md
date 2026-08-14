@@ -13,11 +13,10 @@ which always drives the production `python -m src.e2_pipeline` entry. That pipel
 four sub-stages, `pack -> train -> publish -> test`: build or strictly validate the BF16
 feature pack, launch one clean `accelerate launch` at the configured `runtime.token_budget`
 whose process count is automatically set to all visible NVIDIA H20 GPUs, validate and
-atomically publish the staging tree, then immediately run the held-out test protocol
-against the published checkpoint (see "Held-out testing" below). Direct
+retain evidence under `attempts/<attempt_id>/`, atomically publish successful artifacts,
+then run the held-out test protocol against the checkpoint (see "Held-out testing"). Direct
 `python -m src.train_b0 --max-steps N` remains debug-only (bounded smoke runs), skips the
-test stage entirely so it never spends a held-out scoring epoch, and must never be used
-for a reported E2 experiment.
+test stage and must never be used for a reported E2 experiment.
 
 `hpc/run.sh train` also drives EgoStitch E2E: the same branch always execs
 `python -m src.e2_pipeline`, which defaults to the B0 worker (`src.train_b0`). Pass
@@ -183,24 +182,25 @@ AUPRC, dispersion, precision quality) are telemetry, recorded in `profile.json` 
 
 ## Baselines
 
-Train the frozen `B0` baseline through the auto-sized H20 E2 production pipeline. The
-shipped config pins BF16 and the repository-local data root:
+Train the frozen `B0` baseline through the auto-sized H20 E2 production pipeline; its config pins BF16 and the repository-local data root:
 
 ```bash
 hpc/run.sh train configs/b0_v31_breadth_first.yaml
 ```
 
-`hpc/run.sh train configs/b0_v31_breadth_first.yaml` writes, under the pipeline's
-output directory, `best.pt`, `last.pt`, `metrics.jsonl`, `run_metadata.json`,
-`profile.json` (per-stage timings and the configured token budget), and
-`artifact_manifest.json` (sha256 + byte size of the above). A successful atomic
-publication writes `complete.json` last; its `total_seconds` is the authoritative
-post-publication 60-minute acceptance time. The subsequent test stage then writes
-`test_report.json` and `test_complete.json` (or the `diagnostic_*` pair for a diagnostic
-run). It returns exit code `0` on success and `2` on a gated failure (for example a pack,
-training stage exceeding its `runtime.*_budget_seconds` deadline; the test stage has no
-deadline), naming the stage in `failure.json`; the published training artifacts survive a test-stage failure, and the
-runner does not mask this exit code.
+`hpc/run.sh train configs/b0_v31_breadth_first.yaml` creates one durable `attempts/<attempt_id>/` directory per invocation; the pipeline
+streams worker output to its `train.log`. After each validation, rank 0 writes a model-only
+`checkpoints/epoch-XXXX.pt`, appends and fsyncs `metrics.jsonl`, replaces
+`worker_profile.json`, updates `progress.json`, then commits resumable `training_state.pt`.
+The recovery state includes model, optimizer, scheduler, scaler, global step, per-rank
+Python/NumPy/torch CPU/current-device CUDA RNG, KD stream, and cumulative profile. Resume or finish finalization only under
+the identical training config with `hpc/run.sh train <config> --resume-attempt <attempt>` into a new attempt.
+A failed attempt remains intact; root `failure.json` records its paths and latest progress without replacing an earlier success.
+A successful attempt atomically publishes root `best.pt`, `last.pt`, `metrics.jsonl`,
+`run_metadata.json`, `profile.json`, and `artifact_manifest.json`, clears stale failure
+state, and writes `complete.json` last. The test stage writes `test_report.json` and
+`test_complete.json` (or the `diagnostic_*` pair); its failure preserves the published
+training artifacts. The runner returns `0` on success and `2` on failure without masking it.
 
 ## Scoring and gates
 
@@ -254,4 +254,4 @@ nohup hpc/run.sh train configs/b0_v31_breadth_first.yaml \
 ```
 
 `--max-steps` remains debug-only, skips the test stage, and must not be used for a
-reported experiment.
+reported experiment; attempt `train.log` is authoritative and the redirect records launcher output.

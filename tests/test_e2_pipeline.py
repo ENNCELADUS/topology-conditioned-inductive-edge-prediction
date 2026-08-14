@@ -1,9 +1,12 @@
+import fcntl
 import hashlib
 import importlib
 import json
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -27,6 +30,7 @@ from src.e2_pipeline import (
     _kill_registered_process_groups,
     _pipeline_rerun_command,
     _publish_staged,
+    _read_log_tail,
     _register_nested_process_group,
     _rollback_publication,
     _test_stage_filenames,
@@ -37,12 +41,65 @@ from src.e2_pipeline import (
     main,
     parse_pipeline_args,
     run_command,
+    run_logged_command,
     run_pipeline,
     run_stage,
     write_failure,
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_run_logged_command_persists_output_before_process_exit(tmp_path: Path) -> None:
+    log_path = tmp_path / "train.log"
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import sys,time; "
+            "print('stdout-ready'); "
+            "print('stderr-ready', file=sys.stderr, flush=True); "
+            "time.sleep(1)"
+        ),
+    ]
+    result: list[subprocess.CompletedProcess[str]] = []
+    thread = threading.Thread(
+        target=lambda: result.append(run_logged_command(command, 5.0, log_path))
+    )
+
+    thread.start()
+    deadline = time.monotonic() + 0.8
+    while time.monotonic() < deadline:
+        if log_path.exists() and "stderr-ready" in log_path.read_text():
+            break
+        time.sleep(0.01)
+    assert thread.is_alive()
+    assert log_path.read_text().splitlines() == ["stdout-ready", "stderr-ready"]
+    thread.join(timeout=2)
+    assert result[0].returncode == 0
+
+
+def test_read_log_tail_is_bounded_to_the_last_lines(tmp_path: Path) -> None:
+    log_path = tmp_path / "train.log"
+    log_path.write_text("discard\n" * 10000 + "last-one\nlast-two\n")
+
+    assert _read_log_tail(log_path, max_bytes=128, max_lines=2) == "last-one\nlast-two"
+
+
+def test_run_logged_command_reaps_descendant_holding_output_pipe(tmp_path: Path) -> None:
+    log_path = tmp_path / "train.log"
+    script = (
+        "import subprocess,sys; "
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+        "print('launcher-exit')"
+    )
+    started = time.monotonic()
+
+    completed = run_logged_command([sys.executable, "-c", script], 5.0, log_path)
+
+    assert completed.returncode == 0
+    assert time.monotonic() - started < 3.0
+    assert "launcher-exit" in log_path.read_text()
 
 
 @pytest.fixture(autouse=True)
@@ -546,6 +603,23 @@ def test_build_accelerate_command_seed_override(tmp_path: Path) -> None:
     assert command[command.index("--seed") + 1] == "2"
 
 
+def test_build_accelerate_command_forwards_explicit_resume_attempt(tmp_path: Path) -> None:
+    resume_attempt = tmp_path / "out" / "attempts" / "prior"
+    command = build_accelerate_command(
+        accelerate_bin=tmp_path / "accelerate",
+        config_path=tmp_path / "cfg.yaml",
+        mode="train",
+        pack_dir=tmp_path / "pack",
+        output_dir=tmp_path / "out" / "attempts" / "new",
+        token_budget=256,
+        profile_output=tmp_path / "worker_profile.json",
+        world_size=2,
+        resume_attempt=resume_attempt,
+    )
+
+    assert command[command.index("--resume-attempt") + 1] == str(resume_attempt)
+
+
 # ------------------------------------------------------------------- ProbeResult payload contract
 # The orchestrator no longer sweeps token budgets, but the workers' own
 # ``--ddp-mode probe`` path still emits this payload, so its strict reader has
@@ -719,6 +793,14 @@ def _arg_value(command: Sequence[str], flag: str) -> str:
     return command_list[command_list.index(flag) + 1]
 
 
+def _failed_attempt_profile(output_dir: Path) -> dict[str, object]:
+    failure = json.loads((output_dir / "failure.json").read_text())
+    return cast(
+        dict[str, object],
+        json.loads((output_dir / failure["attempt_path"] / "profile.json").read_text()),
+    )
+
+
 def _write_train_outputs(output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = {
@@ -770,19 +852,23 @@ def _make_fake_runner(
     fail_mode: str | None = None,
     timeout_mode: str | None = None,
     write_v_hold_validation_ledger: bool = False,
-) -> Callable[[Sequence[str], float | None], subprocess.CompletedProcess[str]]:
+) -> Callable[[Sequence[str], float | None, Path], subprocess.CompletedProcess[str]]:
     """Stand in for the single ``train`` process group the orchestrator launches."""
     resolved_train_profile: dict[str, object] = train_runtime_profile or _valid_worker_profile()
 
-    def runner(command: Sequence[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
+    def runner(
+        command: Sequence[str], timeout: float | None, log_path: Path
+    ) -> subprocess.CompletedProcess[str]:
         command_list = list(command)
         mode = _arg_value(command_list, "--ddp-mode")
         profile_output = Path(_arg_value(command_list, "--profile-output"))
         out_dir = Path(_arg_value(command_list, "--output-dir"))
 
         if timeout_mode == mode:
+            log_path.write_text("epoch 1 complete\nworker stalled\n")
             raise subprocess.TimeoutExpired(cmd=command_list, timeout=timeout or 0.0)
         if fail_mode == mode:
+            log_path.write_text("boom\n")
             return subprocess.CompletedProcess(command_list, returncode=1, stdout="", stderr="boom")
 
         if mode == "train":
@@ -825,13 +911,15 @@ def test_orchestrator_launches_only_the_train_stage(tmp_path: Path) -> None:
     base_runner = _make_fake_runner()
     launched: list[tuple[str, str]] = []
 
-    def runner(command: Sequence[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
+    def runner(
+        command: Sequence[str], timeout: float | None, log_path: Path
+    ) -> subprocess.CompletedProcess[str]:
         launched.append(
             (_arg_value(command, "--ddp-mode"), _arg_value(command, "--token-budget-per-rank"))
         )
-        return base_runner(command, timeout)
+        return base_runner(command, timeout, log_path)
 
-    assert run_pipeline(args, command_runner=runner) == 0
+    assert run_pipeline(args, training_command_runner=runner) == 0
     assert launched == [("train", str(_RUNTIME_TOKEN_BUDGET))]
     profile = json.loads((output_dir / "profile.json").read_text())
     assert profile["token_budget"] == _RUNTIME_TOKEN_BUDGET
@@ -845,6 +933,109 @@ def test_orchestrator_launches_only_the_train_stage(tmp_path: Path) -> None:
 
 
 class TestRunPipelineSuccess:
+    def test_explicit_resume_seeds_a_new_attempt_and_forwards_source(self, tmp_path: Path) -> None:
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        prior = output_dir / "attempts" / "prior-attempt"
+        checkpoints = prior / "checkpoints"
+        checkpoints.mkdir(parents=True)
+        (prior / "status.json").write_text('{"status": "running"}')
+        (prior / "metrics.jsonl").write_text('{"epoch": 1}\n{"epoch": 2, "partial": true}\n')
+        torch.save(
+            {"epoch": 1, "selection_metrics": {"epoch": 1}},
+            checkpoints / "epoch-0001.pt",
+        )
+        (checkpoints / "epoch-0002.pt").write_bytes(b"uncommitted")
+        torch.save(
+            {
+                "resume_supported": True,
+                "config": {},
+                "model_state": {},
+                "optimizer": {},
+                "scheduler": {},
+                "world_size": 4,
+                "warmup_steps": 1,
+                "schedule_total_steps": 25,
+                "epoch": 1,
+                "global_step": 4,
+                "rng_by_rank": [{} for _ in range(4)],
+                "kd_by_rank": [{} for _ in range(4)],
+                "runtime_by_rank": [{} for _ in range(4)],
+                "per_epoch_profiles": [{}],
+                "evals_without_improvement": 0,
+                "counterfactual_stop_epoch": None,
+            },
+            prior / "training_state.pt",
+        )
+        base_runner = _make_fake_runner()
+
+        def runner(
+            command: Sequence[str], timeout: float | None, log_path: Path
+        ) -> subprocess.CompletedProcess[str]:
+            new_attempt = Path(_arg_value(command, "--output-dir"))
+            assert _arg_value(command, "--resume-attempt") == str(prior)
+            assert new_attempt != prior
+            assert (new_attempt / "metrics.jsonl").read_text() == '{"epoch": 1}\n'
+            assert (new_attempt / "checkpoints" / "epoch-0001.pt").is_file()
+            assert not (new_attempt / "checkpoints" / "epoch-0002.pt").exists()
+            return base_runner(command, timeout, log_path)
+
+        resumed_args = PipelineArgs(**{**vars(args), "resume_attempt": prior})
+        assert run_pipeline(resumed_args, training_command_runner=runner) == 0
+        complete = json.loads((output_dir / "complete.json").read_text())
+        new_attempt = output_dir / "attempts" / complete["attempt_id"]
+        assert new_attempt != prior
+        assert json.loads((new_attempt / "status.json").read_text())["status"] == "complete"
+        prior_status = json.loads((prior / "status.json").read_text())
+        assert prior_status["status"] == "abandoned"
+        assert prior_status["abandoned_by_attempt_id"] == complete["attempt_id"]
+
+    def test_resume_accepts_completed_snapshot_for_finalization_only(self, tmp_path: Path) -> None:
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        prior = output_dir / "attempts" / "completed-training"
+        checkpoints = prior / "checkpoints"
+        checkpoints.mkdir(parents=True)
+        (prior / "status.json").write_text('{"status": "failed"}')
+        metric_rows = [{"epoch": 1}, {"epoch": 2}]
+        (prior / "metrics.jsonl").write_text("".join(json.dumps(row) + "\n" for row in metric_rows))
+        for row in metric_rows:
+            torch.save(
+                {"epoch": row["epoch"], "selection_metrics": row},
+                checkpoints / f"epoch-{row['epoch']:04d}.pt",
+            )
+        torch.save(
+            {
+                "resume_supported": True,
+                "config": {},
+                "model_state": {},
+                "optimizer": {},
+                "scheduler": {},
+                "world_size": 4,
+                "warmup_steps": 1,
+                "schedule_total_steps": 2,
+                "epoch": 2,
+                "global_step": 8,
+                "rng_by_rank": [{} for _ in range(4)],
+                "kd_by_rank": [{} for _ in range(4)],
+                "runtime_by_rank": [{} for _ in range(4)],
+                "per_epoch_profiles": [{}, {}],
+                "evals_without_improvement": 0,
+                "counterfactual_stop_epoch": None,
+            },
+            prior / "training_state.pt",
+        )
+        base_runner = _make_fake_runner()
+
+        def runner(
+            command: Sequence[str], timeout: float | None, log_path: Path
+        ) -> subprocess.CompletedProcess[str]:
+            new_attempt = Path(_arg_value(command, "--output-dir"))
+            assert len((new_attempt / "metrics.jsonl").read_text().splitlines()) == 2
+            assert len(list((new_attempt / "checkpoints").glob("epoch-*.pt"))) == 2
+            return base_runner(command, timeout, log_path)
+
+        resumed_args = PipelineArgs(**{**vars(args), "resume_attempt": prior})
+        assert run_pipeline(resumed_args, training_command_runner=runner) == 0
+
     def test_generic_pack_stage_builds_and_reuses_all_worker_pack_paths(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -923,7 +1114,7 @@ class TestRunPipelineSuccess:
         assert (
             run_pipeline(
                 args,
-                command_runner=_make_fake_runner(),
+                training_command_runner=_make_fake_runner(),
             )
             == 0
         )
@@ -932,7 +1123,7 @@ class TestRunPipelineSuccess:
         assert cold_profile["pack_evidence"]["raw_tokens"]["cold"] is True
         assert (raw_pack / "manifest.json").is_file()
 
-        assert run_pipeline(args, command_runner=_make_fake_runner()) == 0
+        assert run_pipeline(args, training_command_runner=_make_fake_runner()) == 0
         warm_profile = json.loads((output_dir / "profile.json").read_text())
         assert warm_profile["cold_cache"] is False
         assert warm_profile["pack_evidence"]["raw_tokens"]["cold"] is False
@@ -956,9 +1147,9 @@ class TestRunPipelineSuccess:
         profile["per_epoch"] = cast(list[object], profile["per_epoch"])[:1]
 
         def runner(
-            command: Sequence[str], timeout: float | None
+            command: Sequence[str], timeout: float | None, log_path: Path
         ) -> subprocess.CompletedProcess[str]:
-            result = _make_fake_runner(train_runtime_profile=profile)(command, timeout)
+            result = _make_fake_runner(train_runtime_profile=profile)(command, timeout, log_path)
             if _arg_value(command, "--ddp-mode") == "train":
                 out = Path(_arg_value(command, "--output-dir"))
                 best = torch.load(out / "best.pt", weights_only=False)
@@ -967,7 +1158,9 @@ class TestRunPipelineSuccess:
             return result
 
         assert (
-            run_pipeline(PipelineArgs(config_path, None, None, max_steps=1), command_runner=runner)
+            run_pipeline(
+                PipelineArgs(config_path, None, None, max_steps=1), training_command_runner=runner
+            )
             == 0
         )
         debug_output = tmp_path / "out_debug"
@@ -989,7 +1182,7 @@ class TestRunPipelineSuccess:
         )
         args = PipelineArgs(config=config_path, pack_dir=None, output_dir=None)
 
-        exit_code = run_pipeline(args, command_runner=_make_fake_runner())
+        exit_code = run_pipeline(args, training_command_runner=_make_fake_runner())
 
         assert exit_code == 0
         assert not (output_dir / "failure.json").exists()
@@ -1022,6 +1215,14 @@ class TestRunPipelineSuccess:
             assert entry["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
         complete = json.loads((output_dir / "complete.json").read_text())
         assert complete["status"] == "complete"
+        attempt_dir = output_dir / "attempts" / complete["attempt_id"]
+        assert attempt_dir.is_dir()
+        assert (attempt_dir / "train.log").is_file()
+        assert (attempt_dir / "metrics.jsonl").is_file()
+        assert (attempt_dir / "profile.json").is_file()
+        assert (attempt_dir / "worker_profile.json").is_file()
+        assert (attempt_dir / "run_metadata.json").is_file()
+        assert (attempt_dir / "complete.json").is_file()
         # complete.json's total_seconds is frozen at publish time; the test
         # stage runs after that and recomputes profile.json's figure from the
         # same clock origin, so it always covers strictly more of the run.
@@ -1046,7 +1247,7 @@ class TestRunPipelineSuccess:
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
         before = TestRunPipelineFailures._seed_canonical(output_dir)
 
-        assert run_pipeline(args, command_runner=_make_fake_runner()) == 0
+        assert run_pipeline(args, training_command_runner=_make_fake_runner()) == 0
 
         for filename, old_bytes in before.items():
             assert (output_dir / filename).read_bytes() != old_bytes
@@ -1089,7 +1290,10 @@ class TestRunPipelineSuccess:
                 inside_stage = False
 
         monkeypatch.setattr(packed_features, "validate_packed_manifest", checked_validate)
-        assert run_pipeline(args, command_runner=_make_fake_runner(), stage_runner=supervised) == 0
+        assert (
+            run_pipeline(args, training_command_runner=_make_fake_runner(), stage_runner=supervised)
+            == 0
+        )
         assert validation_calls == 1  # the cold builder's publication validation only
         assert (output_dir / "profile.json").exists()
 
@@ -1098,14 +1302,16 @@ class TestRunPipelineSuccess:
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
 
         def runner(
-            command: Sequence[str], _timeout: float | None
+            command: Sequence[str], _timeout: float | None, log_path: Path
         ) -> subprocess.CompletedProcess[str]:
+            log_path.write_text("CUDA out of memory\n")
             return subprocess.CompletedProcess(command, 1, "", "CUDA out of memory")
 
-        assert run_pipeline(args, command_runner=runner) == 2
+        assert run_pipeline(args, training_command_runner=runner) == 2
         failure = json.loads((output_dir / "failure.json").read_text())
         assert failure["stage"] == "train"
-        assert "CUDA out of memory" in failure["stderr"]
+        assert "CUDA out of memory" in failure["log_tail"]
+        assert (output_dir / failure["log_path"]).read_text() == "CUDA out of memory\n"
 
     def test_successful_rerun_cannot_reuse_stale_worker_outputs(self, tmp_path: Path) -> None:
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
@@ -1116,76 +1322,51 @@ class TestRunPipelineSuccess:
             "metrics.jsonl",
             "run_metadata.json",
             "profile.json",
-            "train_worker_profile.json",
             "artifact_manifest.json",
             "complete.json",
         ):
             (output_dir / filename).write_text("stale")
 
         def no_write_train(
-            command: Sequence[str], timeout: float | None
+            command: Sequence[str], timeout: float | None, log_path: Path
         ) -> subprocess.CompletedProcess[str]:
             if _arg_value(command, "--ddp-mode") == "train":
                 return subprocess.CompletedProcess(command, 0, "", "")
-            return _make_fake_runner()(command, timeout)
+            return _make_fake_runner()(command, timeout, log_path)
 
-        assert run_pipeline(args, command_runner=no_write_train) == 2
+        assert run_pipeline(args, training_command_runner=no_write_train) == 2
         failure = json.loads((output_dir / "failure.json").read_text())
         assert failure["stage"] == "artifacts"
         assert (output_dir / "best.pt").read_text() == "stale"
         assert (output_dir / "complete.json").read_text() == "stale"
 
-    def test_failed_train_rescues_worker_history_evidence(self, tmp_path: Path) -> None:
-        """A worker-side failed_run_history.json survives staging-dir teardown."""
+    def test_failed_train_preserves_attempt_progress_log_and_checkpoints(
+        self, tmp_path: Path
+    ) -> None:
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
-        base_runner = _make_fake_runner()
 
         def runner(
-            command: Sequence[str], timeout: float | None
+            command: Sequence[str], _timeout: float | None, log_path: Path
         ) -> subprocess.CompletedProcess[str]:
             command_list = list(command)
-            if _arg_value(command_list, "--ddp-mode") == "train":
-                staging = Path(_arg_value(command_list, "--output-dir"))
-                (staging / "failed_run_history.json").write_text('{"history": []}')
-                return subprocess.CompletedProcess(command_list, 1, "", "no eligible checkpoint")
-            return base_runner(command, timeout)
+            attempt_dir = Path(_arg_value(command_list, "--output-dir"))
+            (attempt_dir / "progress.json").write_text(
+                json.dumps({"last_completed_epoch": 3, "global_step": 12})
+            )
+            checkpoints = attempt_dir / "checkpoints"
+            checkpoints.mkdir()
+            (checkpoints / "epoch-0003.pt").write_bytes(b"recovery")
+            log_path.write_text("epoch 3 complete\nrank 2 OOM\n")
+            return subprocess.CompletedProcess(command_list, 1, "", "rank 2 OOM")
 
-        assert run_pipeline(args, command_runner=runner) == 2
-        assert json.loads((output_dir / "failure.json").read_text())["stage"] == "train"
-        assert json.loads((output_dir / "failed_run_history.json").read_text()) == {"history": []}
-
-    def test_failed_rerun_without_new_history_removes_stale_history(self, tmp_path: Path) -> None:
-        """A pre-train failure must not leave a prior run's history as evidence."""
-        args, output_dir = TestRunPipelineFailures()._base_args_and_config(
-            tmp_path, pack_budget_seconds=0
-        )
-        output_dir.mkdir()
-        (output_dir / "failed_run_history.json").write_text('{"history": ["stale"]}')
-
-        assert run_pipeline(args, command_runner=_make_fake_runner()) == 2
-        assert json.loads((output_dir / "failure.json").read_text())["stage"] == "pack"
-        assert not (output_dir / "failed_run_history.json").exists()
-
-    def test_successful_rerun_removes_stale_history_evidence(self, tmp_path: Path) -> None:
-        data_root = tmp_path / "data"
-        _write_feature_root(
-            data_root / "features" / "frozen_node_features_1024", {"node_a": (3, 4)}
-        )
-        pack_dir = tmp_path / "pack"
-        output_dir = tmp_path / "out"
-        output_dir.mkdir()
-        (output_dir / "failed_run_history.json").write_text('{"history": []}')
-        config_path = tmp_path / "cfg.yaml"
-        _write_pipeline_config(
-            config_path,
-            _pipeline_config_dict(data_root=data_root, pack_dir=pack_dir, output_dir=output_dir),
-        )
-
-        assert (
-            run_pipeline(PipelineArgs(config_path, None, None), command_runner=_make_fake_runner())
-            == 0
-        )
-        assert not (output_dir / "failed_run_history.json").exists()
+        assert run_pipeline(args, training_command_runner=runner) == 2
+        failure = json.loads((output_dir / "failure.json").read_text())
+        attempt_dir = output_dir / failure["attempt_path"]
+        assert failure["stage"] == "train"
+        assert failure["last_progress"] == {"last_completed_epoch": 3, "global_step": 12}
+        assert failure["log_tail"].endswith("rank 2 OOM")
+        assert (attempt_dir / "failure.json").is_file()
+        assert (attempt_dir / "checkpoints" / "epoch-0003.pt").read_bytes() == b"recovery"
 
     def test_successful_rerun_removes_stale_failure_marker(self, tmp_path: Path) -> None:
         data_root = tmp_path / "data"
@@ -1203,7 +1384,9 @@ class TestRunPipelineSuccess:
         )
 
         assert (
-            run_pipeline(PipelineArgs(config_path, None, None), command_runner=_make_fake_runner())
+            run_pipeline(
+                PipelineArgs(config_path, None, None), training_command_runner=_make_fake_runner()
+            )
             == 0
         )
         assert not (output_dir / "failure.json").exists()
@@ -1223,7 +1406,7 @@ class TestRunPipelineSuccess:
         )
         args = PipelineArgs(config=config_path, pack_dir=None, output_dir=None)
 
-        exit_code = run_pipeline(args, command_runner=_make_fake_runner())
+        exit_code = run_pipeline(args, training_command_runner=_make_fake_runner())
 
         assert exit_code == 0
         profile = json.loads((output_dir / "profile.json").read_text())
@@ -1249,7 +1432,7 @@ class TestRunPipelineSuccess:
             config=config_path, pack_dir=override_pack_dir, output_dir=override_output_dir
         )
 
-        exit_code = run_pipeline(args, command_runner=_make_fake_runner())
+        exit_code = run_pipeline(args, training_command_runner=_make_fake_runner())
 
         assert exit_code == 0
         assert override_pack_dir.exists()
@@ -1307,10 +1490,29 @@ class TestRunPipelineFailures:
         args, output_dir = self._base_args_and_config(tmp_path)
         before = self._seed_canonical(output_dir)
 
-        assert run_pipeline(args, command_runner=_make_fake_runner(fail_mode="train")) == 2
+        assert run_pipeline(args, training_command_runner=_make_fake_runner(fail_mode="train")) == 2
 
         self._assert_canonical_unchanged(output_dir, before)
         assert (output_dir / "failure.json").exists()
+
+    def test_resume_rejects_a_path_outside_this_outputs_attempts(self, tmp_path: Path) -> None:
+        args, output_dir = self._base_args_and_config(tmp_path)
+        outside = tmp_path / "other" / "prior"
+        outside.mkdir(parents=True)
+        resumed_args = PipelineArgs(**{**vars(args), "resume_attempt": outside})
+
+        assert run_pipeline(resumed_args, training_command_runner=_make_fake_runner()) == 2
+
+        failure = json.loads((output_dir / "failure.json").read_text())
+        assert failure["stage"] == "train"
+        assert "direct child" in failure["message"]
+
+    def test_concurrent_pipeline_for_the_same_output_is_rejected(self, tmp_path: Path) -> None:
+        args, output_dir = self._base_args_and_config(tmp_path)
+        output_dir.mkdir()
+        with (output_dir / ".pipeline.lock").open("a+b") as lock_handle:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            assert run_pipeline(args, training_command_runner=_make_fake_runner()) == 2
 
     def test_prior_canonical_survives_pack_failure(self, tmp_path: Path) -> None:
         data_root = tmp_path / "missing"
@@ -1354,7 +1556,7 @@ class TestRunPipelineFailures:
         assert (
             run_pipeline(
                 args,
-                command_runner=_make_fake_runner(),
+                training_command_runner=_make_fake_runner(),
                 stage_runner=lambda operation, _timeout: operation(),
             )
             == 2
@@ -1381,11 +1583,14 @@ class TestRunPipelineFailures:
         profile = {**_valid_worker_profile(), **profile_update}
 
         assert (
-            run_pipeline(args, command_runner=_make_fake_runner(train_runtime_profile=profile)) == 2
+            run_pipeline(
+                args, training_command_runner=_make_fake_runner(train_runtime_profile=profile)
+            )
+            == 2
         )
 
         assert json.loads((output_dir / "failure.json").read_text())["stage"] == "artifacts"
-        failed_profile = json.loads((output_dir / "failed_run_profile.json").read_text())
+        failed_profile = _failed_attempt_profile(output_dir)
         assert failed_profile["rejected_worker_profile"] == profile
         assert not (output_dir / "artifact_manifest.json").exists()
         assert not (output_dir / "complete.json").exists()
@@ -1436,10 +1641,10 @@ class TestRunPipelineFailures:
         base_runner = _make_fake_runner(train_runtime_profile=profile)
 
         def runner(
-            command: Sequence[str], timeout: float | None
+            command: Sequence[str], timeout: float | None, log_path: Path
         ) -> subprocess.CompletedProcess[str]:
             command_timeouts.append(timeout)
-            return base_runner(command, timeout)
+            return base_runner(command, timeout, log_path)
 
         stage_timeouts: list[float | None] = []
 
@@ -1447,7 +1652,7 @@ class TestRunPipelineFailures:
             stage_timeouts.append(timeout)
             operation()
 
-        assert run_pipeline(args, command_runner=runner, stage_runner=stage_runner) == 0
+        assert run_pipeline(args, training_command_runner=runner, stage_runner=stage_runner) == 0
         assert command_timeouts and all(timeout is None for timeout in command_timeouts)
         assert stage_timeouts and all(timeout is None for timeout in stage_timeouts)
         assert (output_dir / "diagnostic_complete.json").is_file()
@@ -1463,9 +1668,9 @@ class TestRunPipelineFailures:
         base = _make_fake_runner()
 
         def runner(
-            command: Sequence[str], timeout: float | None
+            command: Sequence[str], timeout: float | None, log_path: Path
         ) -> subprocess.CompletedProcess[str]:
-            completed = base(command, timeout)
+            completed = base(command, timeout, log_path)
             if _arg_value(command, "--ddp-mode") == "train":
                 staging = Path(_arg_value(command, "--output-dir"))
                 if corrupt == "checkpoint":
@@ -1476,7 +1681,7 @@ class TestRunPipelineFailures:
                     (staging / "run_metadata.json").write_text("[]")
             return completed
 
-        assert run_pipeline(args, command_runner=runner) == 2
+        assert run_pipeline(args, training_command_runner=runner) == 2
         assert json.loads((output_dir / "failure.json").read_text())["stage"] == "artifacts"
         assert not (output_dir / "artifact_manifest.json").exists()
 
@@ -1492,7 +1697,7 @@ class TestRunPipelineFailures:
         )
         args = PipelineArgs(config=config_path, pack_dir=None, output_dir=None)
 
-        exit_code = run_pipeline(args, command_runner=_make_fake_runner())
+        exit_code = run_pipeline(args, training_command_runner=_make_fake_runner())
 
         assert exit_code == 2
         failure = json.loads((output_dir / "failure.json").read_text())
@@ -1503,7 +1708,7 @@ class TestRunPipelineFailures:
     ) -> None:
         args, output_dir = self._base_args_and_config(tmp_path, pack_budget_seconds=0)
 
-        exit_code = run_pipeline(args, command_runner=_make_fake_runner())
+        exit_code = run_pipeline(args, training_command_runner=_make_fake_runner())
 
         assert exit_code == 2
         failure = json.loads((output_dir / "failure.json").read_text())
@@ -1518,7 +1723,7 @@ class TestRunPipelineFailures:
             raise subprocess.TimeoutExpired(cmd="pack", timeout=timeout or 0.0)
 
         exit_code = run_pipeline(
-            args, command_runner=_make_fake_runner(), stage_runner=timeout_stage
+            args, training_command_runner=_make_fake_runner(), stage_runner=timeout_stage
         )
 
         assert exit_code == 2
@@ -1533,27 +1738,28 @@ class TestRunPipelineFailures:
         base = _make_fake_runner()
 
         def runner(
-            command: Sequence[str], timeout: float | None
+            command: Sequence[str], timeout: float | None, log_path: Path
         ) -> subprocess.CompletedProcess[str]:
-            completed = base(command, timeout)
+            completed = base(command, timeout, log_path)
             profile_output = Path(_arg_value(command, "--profile-output"))
             profile_output.unlink(missing_ok=True)
             if payload is not None:
                 profile_output.write_text(payload)
             return completed
 
-        assert run_pipeline(args, command_runner=runner) == 2
+        assert run_pipeline(args, training_command_runner=runner) == 2
         failure = json.loads((output_dir / "failure.json").read_text())
         assert failure["stage"] == "artifacts"
         assert "profile" in failure["message"]
-        evidence = json.loads((output_dir / "failed_run_profile.json").read_text())
+        evidence = _failed_attempt_profile(output_dir)
         assert evidence["token_budget"] == _RUNTIME_TOKEN_BUDGET
-        assert evidence["stage_seconds"]["pack"] >= 0
+        stage_seconds = cast(dict[str, float], evidence["stage_seconds"])
+        assert stage_seconds["pack"] >= 0
 
     def test_train_subprocess_failure_writes_failure_and_returns_2(self, tmp_path: Path) -> None:
         args, output_dir = self._base_args_and_config(tmp_path)
 
-        exit_code = run_pipeline(args, command_runner=_make_fake_runner(fail_mode="train"))
+        exit_code = run_pipeline(args, training_command_runner=_make_fake_runner(fail_mode="train"))
 
         assert exit_code == 2
         failure = json.loads((output_dir / "failure.json").read_text())
@@ -1564,27 +1770,64 @@ class TestRunPipelineFailures:
         base_runner = _make_fake_runner()
 
         def corrupting_runner(
-            command: Sequence[str], timeout: float | None
+            command: Sequence[str], timeout: float | None, log_path: Path
         ) -> subprocess.CompletedProcess[str]:
             if _arg_value(command, "--ddp-mode") == "train":
                 Path(_arg_value(command, "--profile-output")).write_text("partial")
                 return subprocess.CompletedProcess(command, 1, "", "boom")
-            return base_runner(command, timeout)
+            return base_runner(command, timeout, log_path)
 
-        assert run_pipeline(args, command_runner=corrupting_runner) == 2
-        profile = json.loads((output_dir / "failed_run_profile.json").read_text())
+        assert run_pipeline(args, training_command_runner=corrupting_runner) == 2
+        profile = _failed_attempt_profile(output_dir)
         assert profile["token_budget"] == _RUNTIME_TOKEN_BUDGET
-        assert profile["stage_seconds"]["pack"] >= 0
+        stage_seconds = cast(dict[str, float], profile["stage_seconds"])
+        assert stage_seconds["pack"] >= 0
         assert profile["cold_cache"] is True
 
     def test_train_subprocess_timeout_writes_failure_and_returns_2(self, tmp_path: Path) -> None:
         args, output_dir = self._base_args_and_config(tmp_path)
 
-        exit_code = run_pipeline(args, command_runner=_make_fake_runner(timeout_mode="train"))
+        exit_code = run_pipeline(
+            args, training_command_runner=_make_fake_runner(timeout_mode="train")
+        )
 
         assert exit_code == 2
         failure = json.loads((output_dir / "failure.json").read_text())
         assert failure["stage"] == "train"
+        assert failure["timeout_seconds"] == 5
+        assert failure["log_tail"].endswith("worker stalled")
+        assert failure["last_progress"] is None
+        assert (output_dir / failure["log_path"]).is_file()
+
+    def test_failed_new_attempt_keeps_prior_completion_unambiguous(self, tmp_path: Path) -> None:
+        args, output_dir = self._base_args_and_config(tmp_path)
+        assert run_pipeline(args, training_command_runner=_make_fake_runner()) == 0
+        prior_attempt_id = json.loads((output_dir / "complete.json").read_text())["attempt_id"]
+        canonical_before = {
+            filename: (output_dir / filename).read_bytes()
+            for filename in (
+                "best.pt",
+                "last.pt",
+                "metrics.jsonl",
+                "run_metadata.json",
+                "profile.json",
+                "artifact_manifest.json",
+                "complete.json",
+            )
+        }
+
+        assert (
+            run_pipeline(
+                args,
+                training_command_runner=_make_fake_runner(fail_mode="train"),
+            )
+            == 2
+        )
+
+        self._assert_canonical_unchanged(output_dir, canonical_before)
+        failure = json.loads((output_dir / "failure.json").read_text())
+        assert failure["attempt_id"] != prior_attempt_id
+        assert (output_dir / failure["attempt_path"] / "failure.json").is_file()
 
     @pytest.mark.parametrize(
         "worker_profile",
@@ -1594,14 +1837,14 @@ class TestRunPipelineFailures:
             {"epochs_completed": 2, "validations_completed": True},
         ],
     )
-    def test_train_worker_profile_requires_exact_epoch_and_validation_completion(
+    def test_worker_profile_requires_exact_epoch_and_validation_completion(
         self, tmp_path: Path, worker_profile: dict[str, object]
     ) -> None:
         args, output_dir = self._base_args_and_config(tmp_path)
         assert (
             run_pipeline(
                 args,
-                command_runner=_make_fake_runner(train_runtime_profile=worker_profile),
+                training_command_runner=_make_fake_runner(train_runtime_profile=worker_profile),
             )
             == 2
         )
@@ -1640,16 +1883,17 @@ class TestRunPipelineFailures:
         assert (
             run_pipeline(
                 args,
-                command_runner=_make_fake_runner(train_runtime_profile=worker_profile),
+                training_command_runner=_make_fake_runner(train_runtime_profile=worker_profile),
                 stage_runner=stage_runner,
             )
             == 2
         )
         failure = json.loads((output_dir / "failure.json").read_text())
         assert failure["stage"] == "artifacts"
-        profile = json.loads((output_dir / "failed_run_profile.json").read_text())
+        profile = _failed_attempt_profile(output_dir)
         assert profile["counterfactual_stop_epoch"] == 1
-        assert profile["per_rank"][0]["pairs_per_second"] == 42.0
+        per_rank = cast(list[dict[str, object]], profile["per_rank"])
+        assert per_rank[0]["pairs_per_second"] == 42.0
         assert profile["token_budget"] == _RUNTIME_TOKEN_BUDGET
 
     def test_cold_b0_total_budget_includes_publication_and_rolls_back(
@@ -1660,13 +1904,13 @@ class TestRunPipelineFailures:
         ticks = iter((0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 45.0))
         monkeypatch.setattr(
             "src.e2_pipeline.time",
-            types.SimpleNamespace(monotonic=lambda: next(ticks)),
+            types.SimpleNamespace(monotonic=lambda: next(ticks), time=lambda: 123.0),
         )
 
         assert (
             run_pipeline(
                 args,
-                command_runner=_make_fake_runner(),
+                training_command_runner=_make_fake_runner(),
                 stage_runner=lambda operation, _timeout: operation(),
             )
             == 2
@@ -1803,7 +2047,7 @@ class TestRunPipelineTestStage:
 
         exit_code = run_pipeline(
             args,
-            command_runner=_make_fake_runner(),
+            training_command_runner=_make_fake_runner(),
             stage_runner=lambda operation, _timeout: operation(),
         )
 
@@ -1832,7 +2076,7 @@ class TestRunPipelineTestStage:
         assert (
             run_pipeline(
                 args,
-                command_runner=_make_fake_runner(),
+                training_command_runner=_make_fake_runner(),
                 stage_runner=lambda operation, _timeout: operation(),
             )
             == 0
@@ -1864,7 +2108,7 @@ class TestRunPipelineTestStage:
         assert (
             run_pipeline(
                 args,
-                command_runner=_make_fake_runner(),
+                training_command_runner=_make_fake_runner(),
                 stage_runner=lambda operation, _timeout: operation(),
             )
             == 0
@@ -1884,7 +2128,7 @@ class TestRunPipelineTestStage:
 
         exit_code = run_pipeline(
             args,
-            command_runner=_make_fake_runner(),
+            training_command_runner=_make_fake_runner(),
             stage_runner=lambda operation, _timeout: operation(),
         )
 
@@ -1915,7 +2159,7 @@ class TestRunPipelineTestStage:
 
         exit_code = run_pipeline(
             args,
-            command_runner=_make_fake_runner(),
+            training_command_runner=_make_fake_runner(),
             stage_runner=lambda operation, _timeout: operation(),
         )
 
@@ -1943,7 +2187,7 @@ class TestRunPipelineTestStage:
             operation()
 
         exit_code = run_pipeline(
-            args, command_runner=_make_fake_runner(), stage_runner=stage_runner
+            args, training_command_runner=_make_fake_runner(), stage_runner=stage_runner
         )
 
         assert exit_code == 0
@@ -1978,9 +2222,9 @@ class TestRunPipelineTestStage:
         monkeypatch.setattr(test_protocol, "run_test_protocol", never_called)
 
         def runner(
-            command: Sequence[str], timeout: float | None
+            command: Sequence[str], timeout: float | None, log_path: Path
         ) -> subprocess.CompletedProcess[str]:
-            result = _make_fake_runner(train_runtime_profile=profile)(command, timeout)
+            result = _make_fake_runner(train_runtime_profile=profile)(command, timeout, log_path)
             if _arg_value(command, "--ddp-mode") == "train":
                 out = Path(_arg_value(command, "--output-dir"))
                 best = torch.load(out / "best.pt", weights_only=False)
@@ -1989,7 +2233,9 @@ class TestRunPipelineTestStage:
             return result
 
         assert (
-            run_pipeline(PipelineArgs(config_path, None, None, max_steps=1), command_runner=runner)
+            run_pipeline(
+                PipelineArgs(config_path, None, None, max_steps=1), training_command_runner=runner
+            )
             == 0
         )
         debug_output = tmp_path / "out_debug"
@@ -2051,7 +2297,7 @@ class TestRunPipelineTestStage:
         assert (
             run_pipeline(
                 args,
-                command_runner=_make_fake_runner(),
+                training_command_runner=_make_fake_runner(),
                 stage_runner=lambda operation, _timeout: operation(),
             )
             == 0
@@ -2071,7 +2317,7 @@ class TestRunPipelineTestStage:
         assert (
             run_pipeline(
                 args,
-                command_runner=_make_fake_runner(),
+                training_command_runner=_make_fake_runner(),
                 stage_runner=lambda operation, _timeout: operation(),
             )
             == 0
@@ -2103,7 +2349,7 @@ class TestRunPipelineTestStage:
         assert (
             run_pipeline(
                 args,
-                command_runner=_make_fake_runner(),
+                training_command_runner=_make_fake_runner(),
                 stage_runner=lambda operation, _timeout: operation(),
             )
             == 0
@@ -2118,7 +2364,7 @@ class TestRunPipelineTestStage:
 
         exit_code = run_pipeline(
             args,
-            command_runner=_make_fake_runner(),
+            training_command_runner=_make_fake_runner(),
             stage_runner=lambda operation, _timeout: operation(),
         )
 
@@ -2141,7 +2387,7 @@ class TestRunPipelineTestStage:
         assert (
             run_pipeline(
                 args,
-                command_runner=_make_fake_runner(),
+                training_command_runner=_make_fake_runner(),
                 stage_runner=lambda operation, _timeout: operation(),
             )
             == 0
@@ -2161,7 +2407,7 @@ class TestRunPipelineTestStage:
             operation()
 
         exit_code = run_pipeline(
-            args, command_runner=_make_fake_runner(), stage_runner=stage_runner
+            args, training_command_runner=_make_fake_runner(), stage_runner=stage_runner
         )
 
         assert exit_code == 2
@@ -2182,7 +2428,7 @@ class TestRunPipelineTestStage:
             assert (
                 run_pipeline(
                     args,
-                    command_runner=_make_fake_runner(),
+                    training_command_runner=_make_fake_runner(),
                     stage_runner=lambda operation, _timeout: operation(),
                 )
                 == 0

@@ -118,6 +118,35 @@ def test_two_rank_cpu_runs_real_ddp_train_eval_and_rank_zero_outputs(tmp_path: P
 
 
 @pytest.mark.integration
+def test_two_rank_cpu_propagates_rank_zero_epoch_io_failure(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc_per_node=2",
+            "tests/helpers/e2_ddp_smoke.py",
+            "--mode",
+            "train-io-failure",
+            "--output-dir",
+            str(tmp_path),
+        ],
+        cwd=REPO_ROOT,
+        env=_low_thread_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    failures = [
+        json.loads((tmp_path / f"io-failure-rank-{rank}.json").read_text()) for rank in range(2)
+    ]
+    assert all("injected rank-zero disk failure" in failure["error"] for failure in failures)
+
+
+@pytest.mark.integration
 @pytest.mark.slow
 @pytest.mark.skipif(
     os.environ.get("RUN_E2_H20_ACCEPTANCE") != "1",

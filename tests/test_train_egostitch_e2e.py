@@ -2621,28 +2621,6 @@ class TestFeatureStandardizationBinding:
         assert model.feature_stats_digest_hex == digest
 
 
-class TestFailedSelectionHistory:
-    """`_write_failed_run_history` -- the forensic trail a failed run leaves."""
-
-    def test_failed_selection_history_is_retained(self, tmp_path: Path) -> None:
-        history: list[dict[str, object]] = [
-            {"epoch": 1.0, "auprc": 0.5, "fidelity": {"topology_delta_ratio": 0.0}}
-        ]
-        te._write_failed_run_history(
-            tmp_path / "out", run_kind="formal", arm="full", history=history
-        )
-        payload = json.loads((tmp_path / "out" / "failed_run_history.json").read_text())
-        assert payload["run_kind"] == "formal"
-        assert payload["arm"] == "full"
-        assert payload["history"] == history
-
-    def test_failed_selection_history_write_never_masks_the_failure(self, tmp_path: Path) -> None:
-        blocked = tmp_path / "blocked"
-        blocked.write_text("a file where the output directory should be")
-        te._write_failed_run_history(blocked, run_kind="formal", arm="full", history=[])
-        assert blocked.is_file()
-
-
 class TestInitialSlotHealthGuard:
     """`_enforce_e2e_initial_slot_health` -- the step-0 death guard.
 

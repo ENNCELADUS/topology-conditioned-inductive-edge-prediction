@@ -69,7 +69,7 @@ def _batch(row_ids: list[int], *, global_count: int) -> dict[str, torch.Tensor]:
     }
 
 
-def _run_train(output_dir: Path, rank: int) -> None:
+def _run_train(output_dir: Path, rank: int, *, fail_epoch_io: bool = False) -> None:
     accelerator = Accelerator(cpu=True)
     model = _TinyPairModel()
     rank_rows = ([0, 1], [4, 5]) if rank == 0 else ([2, 3], [6, 7])
@@ -108,24 +108,41 @@ def _run_train(output_dir: Path, rank: int) -> None:
         mixed_precision="no",
     )
 
-    result = train_ddp_loop(
-        model,
-        lambda epoch: DataLoader(
-            _BatchDataset(train_batches),
-            batch_size=None,
-            num_workers=0,
-        ),
-        val_loader,
-        cfg,
-        accelerator,
-        warmup_steps=1,
-        evaluate_fn=lambda prepared, loader, acc: _evaluate_distributed(
-            prepared,
-            loader,
-            acc,
-            expected_row_ids=torch.arange(4).numpy(),
-        ),
-    )
+    if fail_epoch_io and accelerator.is_main_process:
+        import src.train_b0 as train_b0_module
+
+        def fail_save(payload: dict[str, object], path: Path) -> None:
+            raise OSError("injected rank-zero disk failure")
+
+        train_b0_module._torch_save_atomic = fail_save
+
+    try:
+        result = train_ddp_loop(
+            model,
+            lambda epoch: DataLoader(
+                _BatchDataset(train_batches),
+                batch_size=None,
+                num_workers=0,
+            ),
+            val_loader,
+            cfg,
+            accelerator,
+            warmup_steps=1,
+            artifact_dir=cfg.output_dir,
+            evaluate_fn=lambda prepared, loader, acc: _evaluate_distributed(
+                prepared,
+                loader,
+                acc,
+                expected_row_ids=torch.arange(4).numpy(),
+            ),
+        )
+    except RuntimeError as error:
+        if not fail_epoch_io or "injected rank-zero disk failure" not in str(error):
+            raise
+        (output_dir / f"io-failure-rank-{rank}.json").write_text(json.dumps({"error": str(error)}))
+        return
+    if fail_epoch_io:
+        raise AssertionError("injected rank-zero artifact failure did not propagate")
 
     local_weight = model.scorer.weight.detach().reshape(1)
     gathered_weights = accelerator.gather(local_weight)
@@ -138,6 +155,13 @@ def _run_train(output_dir: Path, rank: int) -> None:
             {},
         )
     dist.barrier()
+    metric_rows = [
+        json.loads(line)
+        for line in (cfg.output_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    candidate_names = sorted(
+        path.name for path in (cfg.output_dir / "checkpoints").glob("epoch-*.pt")
+    )
     summary = {
         "epochs_completed": result.runtime_profile["epochs_completed"],
         "validations_completed": result.runtime_profile["validations_completed"],
@@ -145,6 +169,8 @@ def _run_train(output_dir: Path, rank: int) -> None:
         "validation_coverage_exact": result.runtime_profile["validation_coverage_exact"],
         "best_epoch": result.best_epoch,
         "weights_synchronized": weights_synchronized,
+        "metric_epochs": [row["epoch"] for row in metric_rows],
+        "candidate_names": candidate_names,
     }
     (output_dir / f"train-rank-{rank}.json").write_text(json.dumps(summary))
 
@@ -152,14 +178,14 @@ def _run_train(output_dir: Path, rank: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--mode", choices=("plan", "train"), default="plan")
+    parser.add_argument("--mode", choices=("plan", "train", "train-io-failure"), default="plan")
     args = parser.parse_args()
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     dist.init_process_group("gloo")
-    if args.mode == "train":
+    if args.mode in {"train", "train-io-failure"}:
         args.output_dir.mkdir(parents=True, exist_ok=True)
-        _run_train(args.output_dir, rank)
+        _run_train(args.output_dir, rank, fail_epoch_io=args.mode == "train-io-failure")
         dist.destroy_process_group()
         return
     plan = build_distributed_epoch_plan(

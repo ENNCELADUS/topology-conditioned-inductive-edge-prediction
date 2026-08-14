@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import pickle
+import shutil
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import Mock
 
@@ -29,6 +31,7 @@ from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
 from src.model.egostitch.classifier.layers import MLPHead
 from src.train_b0 import (
     AssembledData,
+    CliArgs,
     Config,
     GpuBatchIterable,
     TrainResult,
@@ -40,7 +43,9 @@ from src.train_b0 import (
     _EpochGpuBatchIterable,
     _evaluate_distributed,
     _interleave_bucket_specs,
+    _run_ddp_worker,
     _run_probe_mode,
+    _run_rank_symmetric,
     _run_timed_epoch_probe,
     _validate_distributed_plan,
     apply_overrides,
@@ -688,6 +693,9 @@ class TestWriteOutputs:
             stopped_early=False,
         )
         assembled_dropped_counts = {"train_edges.txt": 0, "val_edges.txt": 0, "test_edges.txt": 0}
+        output_dir.mkdir(parents=True)
+        incremental_metrics = '{"epoch": 1, "train_loss": 0.5}\n'
+        (output_dir / "metrics.jsonl").write_text(incremental_metrics, encoding="utf-8")
 
         write_outputs(
             result,
@@ -714,10 +722,7 @@ class TestWriteOutputs:
         assert best_payload["model_family"] == "f0_mlp"
         assert best_payload["epoch"] == 2
 
-        with (output_dir / "metrics.jsonl").open() as f:
-            lines = [json.loads(line) for line in f]
-        assert len(lines) == 2
-        assert lines[0]["epoch"] == 1
+        assert (output_dir / "metrics.jsonl").read_text(encoding="utf-8") == incremental_metrics
 
         run_metadata = json.loads((output_dir / "run_metadata.json").read_text())
         assert "config_hash" in run_metadata
@@ -975,7 +980,15 @@ def test_packed_loader_does_not_call_feature_store(
         world_size=1,
     )
 
-    batch = next(iter(factory(1)))
+    train_iterable = factory(1)
+    assert isinstance(train_iterable, _EpochGpuBatchIterable)
+    train_source = train_iterable._source
+    assert isinstance(train_source, DataLoader)
+    assert train_source.generator is not None
+    torch.manual_seed(12345)
+    model_rng_before_loader_start = torch.random.get_rng_state()
+    batch = next(iter(train_iterable))
+    torch.testing.assert_close(torch.random.get_rng_state(), model_rng_before_loader_start)
     assert set(batch) >= {"emb_a", "emb_b", "len_a", "len_b", "label"}
     assert next(iter(val_loader))["_row_id"].numel() > 0
     assert warmup_steps >= 1
@@ -1011,6 +1024,7 @@ def test_packed_loader_multi_worker_ranks_cover_all_rows(
         assert loader.persistent_workers is True
         assert loader.prefetch_factor == cfg.runtime.prefetch_factor
         assert loader.batch_size is None
+        assert loader.generator is not None
 
         dataset = loader.dataset
         assert isinstance(dataset, CompactPairBatchDataset)
@@ -1296,6 +1310,9 @@ def test_probe_marks_backward_oom_before_reraising(
 
 class _EpochProbeClockAccelerator:
     device = torch.device("cpu")
+    process_index = 0
+    num_processes = 1
+    is_main_process = True
 
     def __init__(self) -> None:
         self.barriers = 0
@@ -1327,6 +1344,96 @@ def test_epoch_probe_barriers_before_training_and_reports_slowest_rank(
     assert result == "result"
     assert events == ["train-after-1"]
     assert elapsed == pytest.approx(7.5)
+
+
+def test_epoch_probe_uses_disposable_artifact_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "cfg.yaml"
+    formal_output = tmp_path / "formal-output"
+    _write_yaml_config(
+        config_path,
+        {
+            "model.family": "v3_1",
+            "model.config": BEST_V3_1_CONFIG,
+            "runtime": _runtime_dict(),
+            "output_dir": str(formal_output),
+        },
+    )
+    cfg = load_config(config_path)
+    formal_output.mkdir()
+    sentinel = formal_output / "metrics.jsonl"
+    sentinel.write_text("published evidence\n")
+    accelerator = _EpochProbeClockAccelerator()
+    seen_artifact_dirs: list[Path] = []
+
+    monkeypatch.setattr("src.train_b0.build_ddp_accelerator", lambda precision: accelerator)
+    monkeypatch.setattr(
+        "src.train_b0.assemble_data",
+        lambda config: SimpleNamespace(
+            benchmark=SimpleNamespace(
+                split=SimpleNamespace(val_pairs=SimpleNamespace(pairs=(("a", "b"),), labels=(1,)))
+            )
+        ),
+    )
+    monkeypatch.setattr("src.train_b0.PackedFeatureTable.from_pack", lambda path, device: object())
+    monkeypatch.setattr(
+        "src.train_b0._build_packed_v3_1_loaders",
+        lambda *args, **kwargs: (lambda epoch: [], [], 1, 1),
+    )
+    monkeypatch.setattr("src.train_b0.build_model", lambda config: nn.Linear(1, 1))
+
+    def fake_train(*args: object, artifact_dir: Path, **kwargs: object) -> SimpleNamespace:
+        seen_artifact_dirs.append(artifact_dir)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / "metrics.jsonl").write_text("probe evidence\n")
+        return SimpleNamespace(runtime_profile={"epochs_completed": 1})
+
+    monkeypatch.setattr("src.train_b0.train_ddp_loop", fake_train)
+    profile_path = tmp_path / "probe" / "epoch-profile.json"
+    _run_ddp_worker(
+        cfg,
+        CliArgs(
+            config=config_path,
+            seed=None,
+            output_dir=formal_output,
+            max_steps=None,
+            ddp_mode="epoch-probe",
+            pack_dir=tmp_path / "pack",
+            token_budget_per_rank=1024,
+            profile_output=profile_path,
+        ),
+    )
+
+    assert sentinel.read_text() == "published evidence\n"
+    assert seen_artifact_dirs and seen_artifact_dirs[0] != formal_output
+    assert not seen_artifact_dirs[0].exists()
+    assert json.loads(profile_path.read_text())["runtime_profile"]["epochs_completed"] == 1
+
+    failed_artifact_dirs: list[Path] = []
+
+    def fail_train(*args: object, artifact_dir: Path, **kwargs: object) -> SimpleNamespace:
+        failed_artifact_dirs.append(artifact_dir)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / "metrics.jsonl").write_text("failed probe evidence\n")
+        raise RuntimeError("coordinated probe failure")
+
+    monkeypatch.setattr("src.train_b0.train_ddp_loop", fail_train)
+    with pytest.raises(RuntimeError, match="coordinated probe failure"):
+        _run_ddp_worker(
+            cfg,
+            CliArgs(
+                config=config_path,
+                seed=None,
+                output_dir=formal_output,
+                max_steps=None,
+                ddp_mode="epoch-probe",
+                pack_dir=tmp_path / "pack",
+                token_budget_per_rank=1024,
+                profile_output=profile_path,
+            ),
+        )
+    assert failed_artifact_dirs and not failed_artifact_dirs[0].exists()
 
 
 # ------------------------------------------------------- fixed-epoch DDP train/eval semantics
@@ -1503,6 +1610,8 @@ def test_ddp_loop_records_counterfactual_stop_but_runs_all_epochs(tmp_path: Path
         cfg,
         Accelerator(),
         warmup_steps=1,
+        artifact_dir=tmp_path / "attempt",
+        profile_output=tmp_path / "attempt" / "worker_profile.json",
         evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(metrics, None),
     )
     assert result.last_epoch == 4
@@ -1523,6 +1632,16 @@ class _BatchValueLossModel(nn.Module):
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {"loss": self.weight * 0.0 + batch["loss_value"].mean()}
+
+
+class _StochasticLossModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(0.5))
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        prediction = self.weight * torch.rand_like(batch["loss_value"])
+        return {"loss": torch.square(prediction - batch["loss_value"]).mean()}
 
 
 def _constant_metrics() -> EdgeMetrics:
@@ -1568,6 +1687,8 @@ def test_ddp_loop_reports_global_sample_weighted_train_loss(tmp_path: Path) -> N
         cfg,
         Accelerator(),
         warmup_steps=1,
+        artifact_dir=tmp_path / "attempt",
+        profile_output=tmp_path / "attempt" / "worker_profile.json",
         evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(_constant_metrics(), None),
     )
 
@@ -1593,6 +1714,8 @@ def test_ddp_loop_adds_kd_loss_and_logs_epoch_mean(tmp_path: Path) -> None:
         cfg,
         Accelerator(cpu=True),
         warmup_steps=1,
+        artifact_dir=tmp_path / "attempt",
+        profile_output=tmp_path / "attempt" / "worker_profile.json",
         evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(_constant_metrics(), None),
         kd_loss_fn=kd_loss_fn,
     )
@@ -1615,6 +1738,8 @@ def test_ddp_loop_rejects_duplicate_and_missing_training_rows(tmp_path: Path) ->
             cfg,
             Accelerator(),
             warmup_steps=1,
+            artifact_dir=tmp_path / "attempt",
+            profile_output=tmp_path / "attempt" / "worker_profile.json",
             evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(
                 _constant_metrics(), None
             ),
@@ -1654,6 +1779,8 @@ def test_ddp_loop_runtime_profile_has_task12_keys(tmp_path: Path) -> None:
         cfg,
         Accelerator(),
         warmup_steps=1,
+        artifact_dir=tmp_path / "attempt",
+        profile_output=tmp_path / "attempt" / "worker_profile.json",
         evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(metrics, None),
     )
     profile = result.runtime_profile
@@ -1676,3 +1803,235 @@ def test_ddp_loop_runtime_profile_has_task12_keys(tmp_path: Path) -> None:
     assert profile["epochs_completed"] == 2
     assert profile["validations_completed"] == 2
     assert len(cast(list[object], profile["per_epoch"])) == 2
+
+
+def test_ddp_loop_persists_completed_epochs_before_later_failure(tmp_path: Path) -> None:
+    config_path = tmp_path / "cfg.yaml"
+    _write_yaml_config(config_path, {"optim.epochs": 3, "eval.patience": 8})
+    cfg = load_config(config_path)
+    attempt_dir = tmp_path / "attempt"
+    batch = _loss_batch(1.0, [0, 1, 2, 3])
+    evaluations = 0
+
+    def evaluate(
+        model: nn.Module, loader: Iterable[dict[str, torch.Tensor]], accelerator: Accelerator
+    ) -> ValidationOutcome:
+        nonlocal evaluations
+        evaluations += 1
+        if evaluations == 3:
+            raise RuntimeError("injected epoch-three failure")
+        return ValidationOutcome(_constant_metrics(), None)
+
+    with pytest.raises(RuntimeError, match="injected epoch-three failure"):
+        train_ddp_loop(
+            _BatchValueLossModel(),
+            lambda epoch: [batch],
+            [batch],
+            cfg,
+            Accelerator(),
+            warmup_steps=1,
+            artifact_dir=attempt_dir,
+            profile_output=attempt_dir / "worker_profile.json",
+            evaluate_fn=evaluate,
+        )
+
+    metrics = [
+        json.loads(line)
+        for line in (attempt_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [entry["epoch"] for entry in metrics] == [1, 2]
+    progress = json.loads((attempt_dir / "progress.json").read_text(encoding="utf-8"))
+    assert progress["status"] == "running"
+    assert progress["last_completed_epoch"] == 2
+    assert progress["global_step"] == 2
+    profile = json.loads((attempt_dir / "worker_profile.json").read_text(encoding="utf-8"))
+    assert profile["epochs_completed"] == 2
+    assert [row["epoch"] for row in profile["per_epoch"]] == [1, 2]
+
+    checkpoints = sorted((attempt_dir / "checkpoints").glob("epoch-*.pt"))
+    assert [path.name for path in checkpoints] == ["epoch-0001.pt", "epoch-0002.pt"]
+    checkpoint = torch.load(checkpoints[-1], weights_only=False)
+    assert checkpoint["epoch"] == 2
+    assert "training_state" not in checkpoint
+    recovery = torch.load(attempt_dir / "training_state.pt", weights_only=False)
+    assert recovery["epoch"] == 2
+    assert recovery["global_step"] == 2
+    assert recovery["resume_supported"] is True
+    assert recovery["optimizer"]
+    assert recovery["scheduler"] is not None
+    assert len(recovery["rng_by_rank"]) == 1
+    assert recovery["kd_by_rank"] == [None]
+    assert set(metrics[-1]) >= {
+        "attempt_id",
+        "epoch",
+        "global_step",
+        "timestamp",
+        "learning_rate",
+        "epoch_wall_seconds",
+        "validation_seconds",
+        "global_pairs_per_second",
+    }
+
+
+def test_ddp_loop_resume_matches_uninterrupted_epoch_boundary(tmp_path: Path) -> None:
+    config_path = tmp_path / "cfg.yaml"
+    _write_yaml_config(config_path, {"optim.epochs": 4, "eval.patience": 8})
+    cfg = load_config(config_path)
+    batch = _loss_batch(1.0, [0, 1, 2, 3])
+
+    def constant_evaluate(
+        model: nn.Module, loader: Iterable[dict[str, torch.Tensor]], accelerator: Accelerator
+    ) -> ValidationOutcome:
+        return ValidationOutcome(_constant_metrics(), None)
+
+    torch.manual_seed(91)
+    uninterrupted_dir = tmp_path / "uninterrupted"
+    uninterrupted = train_ddp_loop(
+        _StochasticLossModel(),
+        lambda epoch: [batch],
+        [batch],
+        cfg,
+        Accelerator(),
+        warmup_steps=1,
+        artifact_dir=uninterrupted_dir,
+        evaluate_fn=constant_evaluate,
+    )
+
+    prior_dir = tmp_path / "prior"
+    evaluations = 0
+
+    def fail_after_two(
+        model: nn.Module, loader: Iterable[dict[str, torch.Tensor]], accelerator: Accelerator
+    ) -> ValidationOutcome:
+        nonlocal evaluations
+        evaluations += 1
+        if evaluations == 3:
+            raise RuntimeError("interrupted")
+        return ValidationOutcome(_constant_metrics(), None)
+
+    torch.manual_seed(91)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        train_ddp_loop(
+            _StochasticLossModel(),
+            lambda epoch: [batch],
+            [batch],
+            cfg,
+            Accelerator(),
+            warmup_steps=1,
+            artifact_dir=prior_dir,
+            evaluate_fn=fail_after_two,
+        )
+
+    resumed_dir = tmp_path / "resumed"
+    (resumed_dir / "checkpoints").mkdir(parents=True)
+    shutil.copy2(prior_dir / "metrics.jsonl", resumed_dir / "metrics.jsonl")
+    for candidate in (prior_dir / "checkpoints").glob("epoch-*.pt"):
+        shutil.copy2(candidate, resumed_dir / "checkpoints" / candidate.name)
+    resumed = train_ddp_loop(
+        _StochasticLossModel(),
+        lambda epoch: [batch],
+        [batch],
+        cfg,
+        Accelerator(),
+        warmup_steps=1,
+        artifact_dir=resumed_dir,
+        resume_attempt=prior_dir,
+        evaluate_fn=constant_evaluate,
+    )
+
+    assert [row["epoch"] for row in resumed.history] == [1, 2, 3, 4]
+    assert len((resumed_dir / "metrics.jsonl").read_text().splitlines()) == 4
+    assert sorted(path.name for path in (resumed_dir / "checkpoints").glob("epoch-*.pt")) == [
+        "epoch-0001.pt",
+        "epoch-0002.pt",
+        "epoch-0003.pt",
+        "epoch-0004.pt",
+    ]
+    assert resumed.best_epoch == uninterrupted.best_epoch
+    for name, expected in uninterrupted.last_state_dict.items():
+        torch.testing.assert_close(resumed.last_state_dict[name], expected, rtol=0.0, atol=0.0)
+
+    incompatible_dir = tmp_path / "incompatible"
+    (incompatible_dir / "checkpoints").mkdir(parents=True)
+    shutil.copy2(prior_dir / "metrics.jsonl", incompatible_dir / "metrics.jsonl")
+    for candidate in (prior_dir / "checkpoints").glob("epoch-*.pt"):
+        shutil.copy2(candidate, incompatible_dir / "checkpoints" / candidate.name)
+    with pytest.raises(RuntimeError, match="resume configuration does not match"):
+        train_ddp_loop(
+            _StochasticLossModel(),
+            lambda epoch: [batch],
+            [batch],
+            replace(cfg, seed=cfg.seed + 1),
+            Accelerator(),
+            warmup_steps=1,
+            artifact_dir=incompatible_dir,
+            resume_attempt=prior_dir,
+            evaluate_fn=constant_evaluate,
+        )
+
+    finalization_dir = tmp_path / "finalization-only"
+    (finalization_dir / "checkpoints").mkdir(parents=True)
+    shutil.copy2(uninterrupted_dir / "metrics.jsonl", finalization_dir / "metrics.jsonl")
+    for candidate in (uninterrupted_dir / "checkpoints").glob("epoch-*.pt"):
+        shutil.copy2(candidate, finalization_dir / "checkpoints" / candidate.name)
+
+    def unexpected_evaluate(
+        model: nn.Module, loader: Iterable[dict[str, torch.Tensor]], accelerator: Accelerator
+    ) -> ValidationOutcome:
+        raise AssertionError("a completed snapshot must not train or evaluate another epoch")
+
+    finalization_only = train_ddp_loop(
+        _StochasticLossModel(),
+        lambda epoch: [batch],
+        [batch],
+        cfg,
+        Accelerator(),
+        warmup_steps=1,
+        artifact_dir=finalization_dir,
+        resume_attempt=uninterrupted_dir,
+        evaluate_fn=unexpected_evaluate,
+    )
+    assert [row["epoch"] for row in finalization_only.history] == [1, 2, 3, 4]
+    assert finalization_only.best_epoch == uninterrupted.best_epoch
+
+
+def test_ddp_loop_surfaces_rank_zero_epoch_io_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "cfg.yaml"
+    _write_yaml_config(config_path, {"optim.epochs": 1})
+    cfg = load_config(config_path)
+    batch = _loss_batch(1.0, [0, 1, 2, 3])
+
+    def fail_save(payload: dict[str, object], path: Path) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("src.train_b0._torch_save_atomic", fail_save)
+    with pytest.raises(
+        RuntimeError, match="rank-zero epoch artifact write failed: OSError: disk full"
+    ):
+        train_ddp_loop(
+            _BatchValueLossModel(),
+            lambda epoch: [batch],
+            [batch],
+            cfg,
+            Accelerator(),
+            warmup_steps=1,
+            artifact_dir=tmp_path / "attempt",
+            evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(
+                _constant_metrics(), None
+            ),
+        )
+
+
+def test_rank_symmetric_resume_operation_raises_remote_rank_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accelerator = Mock(num_processes=2, process_index=0)
+
+    def gathered(payload: list[str | None]) -> list[str | None]:
+        return [payload[0], "rank 1: RuntimeError: corrupt CUDA RNG state"]
+
+    monkeypatch.setattr("src.train_b0.gather_object", gathered)
+    with pytest.raises(RuntimeError, match="corrupt CUDA RNG state"):
+        _run_rank_symmetric(cast(Accelerator, accelerator), "resume state restore", lambda: None)
