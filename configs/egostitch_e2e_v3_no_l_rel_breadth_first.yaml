@@ -59,8 +59,6 @@ training:
   collapse_fraction: 0.25
   collapse_floor: 1.0e-4
   collapse_validations: 2
-  selection_auprc_tolerance: 0.02
-  selection_mmd_tolerance: 1.0e-6
   residual_ratio_min: 1.0e-3
 
 diagnostics:
@@ -68,7 +66,6 @@ diagnostics:
   gradient_imbalance_ratio: 50.0
   gradient_imbalance_steps: 200
   probe_s1_abs_mean_max: 1000.0
-  selection_auprc_tolerance: 0.02
   topk_fraction: 0.01
 
 eval:

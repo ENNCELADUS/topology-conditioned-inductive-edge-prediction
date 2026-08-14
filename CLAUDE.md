@@ -35,6 +35,8 @@ selected method. Every piece of writing must explain how its context helps decid
   similar ceremony that blocks a run. Write provenance metadata freely; matching artifacts to the
   current split is the operator's job. Fail closed only on non-finite state, DDP disagreement,
   data-boundary violations, and I/O failures.
+- Sync code between machines with git only (commit → push → pull on the H20 checkout); never
+  rsync/scp/tar working trees.
 
 ## Commands
 
@@ -61,9 +63,9 @@ src.train_b0` is debug-only. Runbook: `hpc/README.md` and the `hpc-execution` sk
 
 ```bash
 hpc/run.sh train configs/b0_v31_breadth_first.yaml                  # baseline
-hpc/run.sh train configs/egostitch_e2e_v3_full_breadth_first.yaml \
-  --worker-module src.train_egostitch --run-kind formal             # EgoStitch e2e
+hpc/run.sh train configs/b1_kd_d2_breadth_first.yaml                # B1 KD arm (simple protocol)
 ```
+EgoStitch e2e (`--worker-module src.train_egostitch`) remains only for oracle diagnostics.
 
 Review each implementation wave yourself: `CODEX_HOME=<scratch>/codex-home codex review --base <sha>
 > wave-review.txt 2>&1`, backgrounded — ~200 KB of output must never land in context. That home needs
@@ -85,8 +87,8 @@ training → score-once artifacts → evaluation. Endpoint-only families need no
   slot is chosen by the `name` field of its config section, so adding a component is one registry
   entry, never a change to `composite.py`. No encoder may read `ImaginedGraph.aux`: it is
   generator-private, and a generator swap invalidates it wholesale.
-- `src/train_{egostitch,b0,cazi_mbn}.py` DDP workers; `src/e2_pipeline.py` orchestrates the four
-  stages pack → train → publish → test; `src/score_universe.py` writes score-once artifacts;
+- `src/train_{egostitch,b0,cazi_mbn}.py` DDP workers — B1 KD arms ride `train_b0` + `src/distill/`;
+  `src/e2_pipeline.py` runs pack → train → publish → test; `src/score_universe.py` score-once artifacts;
   `src/score_fanout.py` fans a score pass across visible GPUs and merges the shards (owns
   `hpc/run.sh score`); `src/eval/test_protocol.py` runs one published checkpoint's held-out
   V_hold → test → candidate sequence into `test_report.json`; `src/experiments/` holds the gate
@@ -130,9 +132,9 @@ fail-closed.
 - `load_scores` does no precision validation, so a bf16-contaminated EgoStitch artifact loads and
   analyses cleanly. Call `validate_artifact_precision(artifact, label=…)`; `validate_score_precision`
   called directly on an `egostitch_e2e` artifact spuriously raises "missing arrays".
-- `select_e2e_checkpoint` ranks by AUPRC → clustering MMD → Brier and will return a degenerate
-  checkpoint. There is no eligibility predicate and none should be added — judge usability from the
-  per-epoch rows in `metrics.jsonl`.
+- Checkpoint selection (`src/eval/checkpoint_selection.py`) mean-ranks AUPRC plus all five topology
+  metrics and can still return a weak checkpoint. There is no eligibility predicate and none should
+  be added — judge usability from the per-epoch rows in `metrics.jsonl`.
 - The fp32 islands in `generator/assemble.py` must promote their inputs *before* cost and marginal
   products are formed; casting afterwards keeps the bf16 ulp grid and silently quantizes logits.
 - `allow_cache_subset=True` (live in `probes.py`, `score_universe.py`) gathers a superset F0 cache

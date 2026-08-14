@@ -39,6 +39,26 @@ def test_quality_miss_uses_completed_final_epoch_instead_of_aborting() -> None:
     assert "enforce_quality = False" in source
 
 
+def _record(
+    epoch: int, *, auprc: float, gs: float, rd: float, mmd: float
+) -> te.E2ECheckpointRecord:
+    return te.E2ECheckpointRecord(
+        epoch=epoch,
+        phase="C",
+        full_joint_epochs_completed=epoch,
+        guards_passed=False,
+        auprc=auprc,
+        prevalence=0.1,
+        active_logit_std=0.0,
+        gs=gs,
+        rd=rd,
+        degree_mmd=mmd,
+        clustering_mmd=mmd,
+        spectral_mmd=mmd,
+        brier=1.0,
+    )
+
+
 def test_selection_returns_the_best_record_with_no_eligibility_predicate() -> None:
     """A degenerate record is still selected: eligibility is an owner judgement.
 
@@ -46,18 +66,15 @@ def test_selection_returns_the_best_record_with_no_eligibility_predicate() -> No
     nothing in code decides whether a checkpoint is scientifically usable.
     """
     assert not hasattr(te, "e2e_checkpoint_eligible")
-    record = te.E2ECheckpointRecord(
-        epoch=30,
-        phase="C",
-        full_joint_epochs_completed=20,
-        guards_passed=False,
-        auprc=0.0,
-        prevalence=0.1,
-        active_logit_std=0.0,
-        clustering_mmd=1.0,
-        brier=1.0,
-    )
+    record = _record(30, auprc=0.0, gs=0.0, rd=0.0, mmd=1.0)
     assert te.select_e2e_checkpoint([record], "full") == record
+
+
+def test_selection_ranks_auprc_and_all_five_topology_metrics_jointly() -> None:
+    """The single-MMD trap: an untrained epoch winning one MMD must not be selected."""
+    untrained = _record(1, auprc=0.0084, gs=0.05, rd=0.0, mmd=0.14)
+    trained = _record(25, auprc=0.0213, gs=0.30, rd=0.9, mmd=0.19)
+    assert te.select_e2e_checkpoint([untrained, trained], "full") == trained
 
 
 def _training_config(tmp_path: Path) -> Path:
@@ -85,7 +102,6 @@ def _training_config(tmp_path: Path) -> Path:
             "gradient_imbalance_ratio": 50.0,
             "gradient_imbalance_steps": 200,
             "probe_s1_abs_mean_max": 1000.0,
-            "selection_auprc_tolerance": 0.02,
             "topk_fraction": 0.01,
         },
         "eval": {"patience": 30, "eval_every": 1},
@@ -680,23 +696,6 @@ def test_e2e_parameter_groups_are_disjoint_exhaustive_and_exclude_kendall() -> N
         "classifier",
     }
     assert all(len(digest) == 64 for digest in manifest.sha256.values())
-
-
-def _record(epoch: int, *, mmd: float, brier: float, auprc: float = 0.6) -> te.E2ECheckpointRecord:
-    return te.E2ECheckpointRecord(
-        epoch=epoch,
-        phase="C",
-        full_joint_epochs_completed=epoch,
-        guards_passed=True,
-        auprc=auprc,
-        prevalence=0.2,
-        active_logit_std=0.2,
-        clustering_mmd=mmd,
-        brier=brier,
-        warm_reference_std=0.4,
-        warm_reference_auprc=0.61,
-        residual_ratio=1e-2,
-    )
 
 
 def test_null_generator_has_empty_component_parameter_groups() -> None:

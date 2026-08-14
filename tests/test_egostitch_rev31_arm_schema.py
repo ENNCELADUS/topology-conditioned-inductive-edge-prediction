@@ -49,12 +49,6 @@ WAVE1_ORACLE_CONFIGS = {
 FULL_EGO_ORACLE_CONFIG = (
     REPO_ROOT / "configs/egostitch_e2e_v3_full_ego_oracle_grit_pooled_breadth_first.yaml"
 )
-# B1 training-time distillation arms (plan 2026-08-13): null-generator students with the
-# node-factor path, sharing the null_generator arm's pack/cache plumbing.
-KD_CONFIGS = {
-    arm: REPO_ROOT / f"configs/egostitch_e2e_v3_kd_{arm}_breadth_first.yaml"
-    for arm in ("control", "d1", "d2", "d3")
-}
 
 
 def test_wave1_oracle_runtime_and_supervision_contracts() -> None:
@@ -76,14 +70,10 @@ def test_v3_live_arms_share_one_ng50_pack_and_grounding_cache() -> None:
         set(V3_CONFIGS.values())
         | {RETIRED_COSINE_POOL_CONFIG, FULL_EGO_ORACLE_CONFIG}
         | set(WAVE1_ORACLE_CONFIGS.values())
-        | set(KD_CONFIGS.values())
     )
     configs = []
     for path in sorted(
-        set(V3_CONFIGS.values())
-        | set(WAVE1_ORACLE_CONFIGS.values())
-        | {FULL_EGO_ORACLE_CONFIG}
-        | set(KD_CONFIGS.values())
+        set(V3_CONFIGS.values()) | set(WAVE1_ORACLE_CONFIGS.values()) | {FULL_EGO_ORACLE_CONFIG}
     ):
         payload = yaml.safe_load(path.read_text(encoding="utf-8"))
         configs.append(

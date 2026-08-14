@@ -112,7 +112,6 @@ def _cfg(tmp_path: Path, *, strategy: str = _STRATEGY, training: bool = True) ->
             gradient_imbalance_ratio=50.0,
             gradient_imbalance_steps=2,
             probe_s1_abs_mean_max=1.0,
-            selection_auprc_tolerance=0.02,
             topk_fraction=0.1,
         ),
         eval=EvalConfig(patience=2, eval_every=1),

@@ -34,7 +34,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from itertools import cycle, islice
 from pathlib import Path
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, Literal, NamedTuple, TypeVar, cast
 
 import numpy as np
 import torch
@@ -61,7 +61,22 @@ from src.data.pairs import (
     collate_token_pairs,
 )
 from src.data.partition import build_g_struct, derive_training_interactions
+from src.distill.artifacts import KDTargets, load_kd_targets
+from src.distill.config import DistillConfig
+from src.distill.losses import (
+    kd_dist_loss,
+    kd_gram_loss,
+    kd_label_loss,
+    kd_logit_loss,
+    kd_rank_loss,
+)
 from src.e2_pipeline import ProbeResult
+from src.eval.checkpoint_selection import (
+    CheckpointCandidate,
+    TopologyValidationMetrics,
+    select_checkpoint,
+    validation_topology_metrics,
+)
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
 
@@ -74,7 +89,31 @@ Batch = dict[str, torch.Tensor]
 LoaderFactory = Callable[[int], Iterable[Batch]]
 PackedLoaderFactory = Callable[[int], Iterable[Batch]]
 OnEval = Callable[[dict[str, float], bool, EdgeMetrics], None]
-EvaluateFn = Callable[[nn.Module, Iterable[Batch], Accelerator], EdgeMetrics]
+
+
+@dataclass(frozen=True)
+class ValidationTopologyContext:
+    """Fixed validation-side inputs for the five topology metrics.
+
+    Attributes:
+        pairs: The full ordered validation pair list (row-ID order).
+        positive_edges: The gold edges among `pairs` (label 1 rows).
+        nodes: The validation node universe (all pair endpoints).
+    """
+
+    pairs: tuple[tuple[str, str], ...]
+    positive_edges: tuple[tuple[str, str], ...]
+    nodes: tuple[str, ...]
+
+
+class ValidationOutcome(NamedTuple):
+    """One validation pass: edge metrics plus optional topology metrics."""
+
+    metrics: EdgeMetrics
+    topology: TopologyValidationMetrics | None
+
+
+EvaluateFn = Callable[[nn.Module, Iterable[Batch], Accelerator], ValidationOutcome]
 DDP_MODES = ("probe", "epoch-probe", "train")
 T = TypeVar("T")
 
@@ -225,6 +264,9 @@ class Config:
         seed: Global seed.
         output_dir: Directory for checkpoints, metrics, and run metadata.
         mixed_precision: ``"no"`` or ``"bf16"``.
+        runtime: Optional DDP runtime contract.
+        distill: Optional B1 KD section; ``None`` or all-zero weights keep the
+            plain supervised protocol.
     """
 
     model: ModelConfig
@@ -235,6 +277,7 @@ class Config:
     output_dir: Path
     mixed_precision: str
     runtime: RuntimeConfig | None = None
+    distill: DistillConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -527,7 +570,17 @@ def load_config(path: Path) -> Config:
     raw = _as_mapping(raw_obj, "<top level>")
     _check_no_unknown_keys(
         raw,
-        ("model", "data", "optim", "eval", "seed", "output_dir", "mixed_precision", "runtime"),
+        (
+            "model",
+            "data",
+            "optim",
+            "eval",
+            "seed",
+            "output_dir",
+            "mixed_precision",
+            "runtime",
+            "distill",
+        ),
         "<top level>",
     )
 
@@ -707,6 +760,10 @@ def load_config(path: Path) -> Config:
         if runtime.token_budget <= 0:
             raise ValueError("runtime.token_budget must be positive")
 
+    distill: DistillConfig | None = None
+    if "distill" in raw:
+        distill = DistillConfig.from_mapping(_as_mapping(raw["distill"], "distill"))
+
     return Config(
         model=model,
         data=data,
@@ -716,6 +773,7 @@ def load_config(path: Path) -> Config:
         output_dir=Path(_as_str(_require(raw, "output_dir", ""), "output_dir")),
         mixed_precision=mixed_precision,
         runtime=runtime,
+        distill=distill,
     )
 
 
@@ -1303,6 +1361,10 @@ def write_outputs(
         "timestamp": datetime.now(UTC).isoformat(),
         "dropped_pair_counts": dropped_pair_counts,
         "training_interactions": "all_train_positives",
+        "arm": (
+            cfg.distill.arm if cfg.distill is not None and cfg.distill.active else cfg.model.family
+        ),
+        "selected_epoch": result.best_epoch,
     }
     (output_dir / "run_metadata.json").write_text(
         json.dumps(run_metadata, indent=2) + "\n", encoding="utf-8"
@@ -1986,7 +2048,8 @@ def _evaluate_distributed(
     accelerator: Accelerator,
     *,
     expected_row_ids: np.ndarray | None = None,
-) -> EdgeMetrics:
+    topology_context: ValidationTopologyContext | None = None,
+) -> ValidationOutcome:
     """Score the fixed validation set across all ranks and agree on the metrics.
 
     Each rank scores its slice; the slices are padded to a common length and
@@ -2005,9 +2068,11 @@ def _evaluate_distributed(
             derived as ``arange`` over the gathered row count — a self-contained
             fallback that still catches duplicates and interior gaps; production
             binds the true set so truncation is caught too.
+        topology_context: Fixed validation pairs/gold-edges/nodes for the five
+            topology metrics; ``None`` (unit-test injection) skips them.
 
     Returns:
-        The `EdgeMetrics`, identical on every rank.
+        The `ValidationOutcome`, identical on every rank.
 
     Raises:
         ValueError: On any duplicate or missing validation row (all ranks).
@@ -2078,17 +2143,33 @@ def _evaluate_distributed(
         expected_row_ids=expected,
     )
 
-    metrics_payload: list[dict[str, object] | None] = [None]
+    outcome_payload: list[dict[str, object] | None] = [None]
     if accelerator.is_main_process:
         probs = _stable_sigmoid(logits_sorted.astype(np.float64))
         metrics = compute_edge_metrics(labels_sorted.astype(np.float64), probs)
-        metrics_payload[0] = asdict(metrics)
+        topology = (
+            asdict(
+                validation_topology_metrics(
+                    pairs=topology_context.pairs,
+                    logits=logits_sorted.astype(np.float64),
+                    positive_edges=topology_context.positive_edges,
+                    nodes=topology_context.nodes,
+                )
+            )
+            if topology_context is not None
+            else None
+        )
+        outcome_payload[0] = {"metrics": asdict(metrics), "topology": topology}
 
-    broadcast_object_list(metrics_payload, from_process=0)
-    payload = metrics_payload[0]
+    broadcast_object_list(outcome_payload, from_process=0)
+    payload = outcome_payload[0]
     if payload is None:  # pragma: no cover - broadcast always populates rank>0
         raise RuntimeError("distributed validation failed to broadcast metrics")
-    return EdgeMetrics(**cast(dict[str, Any], payload))
+    topology_dict = cast(dict[str, float] | None, payload["topology"])
+    return ValidationOutcome(
+        metrics=EdgeMetrics(**cast(dict[str, Any], payload["metrics"])),
+        topology=None if topology_dict is None else TopologyValidationMetrics(**topology_dict),
+    )
 
 
 def _stable_sigmoid(logit: np.ndarray) -> np.ndarray:
@@ -2099,6 +2180,154 @@ def _stable_sigmoid(logit: np.ndarray) -> np.ndarray:
     exp_l = np.exp(logit[~positive])
     out[~positive] = exp_l / (1.0 + exp_l)
     return out
+
+
+class KDStream:
+    """Deterministic per-(epoch, step, rank) KD anchor-context stream (B1 plan).
+
+    Every rank draws ``distill.anchors_per_step`` anchors from its own
+    ``[rank::world]`` slice of the teacher-target node universe -- a pure
+    function of ``(seed, epoch, step, rank)``, so no communication keeps
+    ranks disjoint -- gathers each anchor's dumped context-row group, pads
+    short groups with ``mask = 0`` filler rows to the fixed
+    ``k_near + k_rand`` context size, scores the rows with the student, and
+    returns the weighted KD loss for that optimizer step.
+    """
+
+    def __init__(
+        self,
+        distill: DistillConfig,
+        targets: KDTargets,
+        table: PackedFeatureTable,
+        *,
+        seed: int,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        self._distill = distill
+        self._targets = targets
+        self._table = table
+        self._seed = seed
+        self._rank = rank
+        node_index = table.manifest.node_index()
+        missing = [node for node in targets.node_ids if node not in node_index]
+        if missing:
+            raise ValueError(
+                f"KD teacher-target nodes missing from the feature pack: {missing[:5]}"
+            )
+        self._packed_rows = np.array(
+            [node_index[node] for node in targets.node_ids], dtype=np.int64
+        )
+        self._context_size = int(cast(int, targets.manifest["k_near"])) + int(
+            cast(int, targets.manifest["k_rand"])
+        )
+        self._shard = list(range(rank, len(targets.node_ids), world_size))
+        if not self._shard:
+            raise RuntimeError("KD artifact node universe is smaller than the DDP world size")
+
+    def _anchor_positions(self, epoch: int, step: int) -> list[int]:
+        """This rank's `anchors_per_step` artifact node positions for one step."""
+        k = self._distill.anchors_per_step
+        rng = np.random.default_rng((self._seed, epoch, step, self._rank, 0x4B44))
+        reps = -(-k // len(self._shard))
+        positions = np.concatenate([rng.permutation(len(self._shard)) for _ in range(reps)])[:k]
+        return [self._shard[int(i)] for i in positions]
+
+    def _gather(self, rows: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        device = self._table.tokens.device
+        rows_tensor = torch.tensor(rows, dtype=torch.long, device=device)
+        boundary = max(self._table.manifest.nodes[row].length for row in rows)
+        return self._table.gather_nodes(rows_tensor, boundary)
+
+    def loss(self, model: nn.Module, epoch: int, step: int) -> torch.Tensor:
+        """Score this step's KD rows and return the weighted KD loss."""
+        targets = self._targets
+        distill = self._distill
+        anchor_rows: list[int] = []
+        partner_rows: list[int] = []
+        teacher_logit: list[float] = []
+        teacher_pooled: list[np.ndarray] = []
+        pair_label: list[float] = []
+        group: list[int] = []
+        mask: list[float] = []
+        pooled_dim = targets.teacher_pooled_ab.shape[-1]
+        for anchor_pos in self._anchor_positions(epoch, step):
+            start = int(targets.anchor_offsets[anchor_pos])
+            end = int(targets.anchor_offsets[anchor_pos + 1])
+            row_count = min(end - start, self._context_size)
+            anchor_row = int(self._packed_rows[anchor_pos])
+            for offset in range(self._context_size):
+                if offset < row_count:
+                    csr = start + offset
+                    anchor_rows.append(anchor_row)
+                    partner_rows.append(int(self._packed_rows[int(targets.pair_partner_idx[csr])]))
+                    teacher_logit.append(float(targets.teacher_logit[csr]))
+                    teacher_pooled.append(
+                        0.5
+                        * (
+                            targets.teacher_pooled_ab[csr].astype(np.float32)
+                            + targets.teacher_pooled_ba[csr].astype(np.float32)
+                        )
+                    )
+                    pair_label.append(float(targets.pair_label[csr]))
+                    group.append(anchor_pos)
+                    mask.append(1.0)
+                else:
+                    anchor_rows.append(anchor_row)
+                    partner_rows.append(anchor_row)
+                    teacher_logit.append(0.0)
+                    teacher_pooled.append(np.zeros(pooled_dim, dtype=np.float32))
+                    pair_label.append(0.0)
+                    group.append(anchor_pos)
+                    mask.append(0.0)
+
+        emb_a, len_a = self._gather(anchor_rows)
+        emb_b, len_b = self._gather(partner_rows)
+        output = cast(
+            dict[str, torch.Tensor],
+            model({"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b}),
+        )
+        logits = output["logits"]
+        if logits.dim() > 1 and logits.size(-1) == 1:
+            logits = logits.squeeze(-1)
+        logits = logits.float()
+        device = logits.device
+        teacher = torch.tensor(teacher_logit, dtype=torch.float32, device=device)
+        kd_mask = torch.tensor(mask, dtype=torch.float32, device=device)
+        kd_group = torch.tensor(group, dtype=torch.int64, device=device)
+        total = logits.new_zeros(())
+        if distill.w_label > 0.0:
+            labels = torch.tensor(pair_label, dtype=torch.float32, device=device)
+            total = total + distill.w_label * kd_label_loss(logits, labels, kd_mask)
+        if distill.w_logit > 0.0:
+            total = total + distill.w_logit * kd_logit_loss(logits, teacher, kd_mask)
+        if distill.w_rank > 0.0:
+            total = total + distill.w_rank * kd_rank_loss(
+                logits, teacher, kd_group, kd_mask, margin=distill.margin
+            )
+        if distill.w_dist > 0.0:
+            total = total + distill.w_dist * kd_dist_loss(
+                logits, teacher, kd_group, kd_mask, temperature=distill.temperature
+            )
+        if distill.w_gram > 0.0:
+            pair_feature = output.get("node_factor_pair")
+            if pair_feature is None:
+                raise RuntimeError("distill.w_gram requires model.config.node_factor_dim > 0")
+            endpoints = torch.stack(
+                [
+                    torch.tensor(anchor_rows, dtype=torch.int64, device=device),
+                    torch.tensor(partner_rows, dtype=torch.int64, device=device),
+                ],
+                dim=-1,
+            )
+            pooled = torch.tensor(np.stack(teacher_pooled), dtype=torch.float32, device=device)
+            total = total + distill.w_gram * kd_gram_loss(
+                pair_feature.float(), pooled, endpoints, kd_mask
+            )
+        return total
+
+
+KDLossFn = Callable[[nn.Module, int, int], torch.Tensor]
 
 
 def _batch_pair_counts(batch: Batch, world_size: int) -> tuple[int, int]:
@@ -2125,6 +2354,7 @@ def train_ddp_loop(
     schedule_total_steps: int | None = None,
     evaluate_fn: EvaluateFn = _evaluate_distributed,
     on_eval: OnEval | None = None,
+    kd_loss_fn: KDLossFn | None = None,
 ) -> TrainResult:
     """Run fixed-epoch E2 DDP training and return rank-consistent metrics.
 
@@ -2148,6 +2378,8 @@ def train_ddp_loop(
         evaluate_fn: Validation function; defaults to distributed validation.
             Unit tests inject a deterministic metric source.
         on_eval: Optional main-rank-only callback after each evaluation.
+        kd_loss_fn: Optional per-step KD loss (`KDStream.loss`); its value is
+            added to the scaled supervised loss before the shared backward.
 
     Returns:
         The `TrainResult`, identical across ranks except for the main-rank-only
@@ -2170,9 +2402,10 @@ def train_ddp_loop(
     use_cuda = accelerator.device.type == "cuda"
 
     history: list[dict[str, float]] = []
-    best_state: dict[str, torch.Tensor] = {}
-    best_metrics: EdgeMetrics | None = None
-    best_epoch = 0
+    state_by_epoch: dict[int, dict[str, torch.Tensor]] = {}
+    metrics_by_epoch: dict[int, EdgeMetrics] = {}
+    topology_by_epoch: dict[int, TopologyValidationMetrics | None] = {}
+    best_auprc: float | None = None
     last_metrics: EdgeMetrics | None = None
     evals_without_improvement = 0
     counterfactual_stop_epoch: int | None = None
@@ -2191,6 +2424,7 @@ def train_ddp_loop(
     for epoch in range(1, cfg.optim.epochs + 1):
         model.train()
         local_loss_sum = 0.0
+        epoch_kd_loss_sum = 0.0
         epoch_steps = 0
         epoch_local_pairs = 0
         epoch_global_pairs = 0
@@ -2224,6 +2458,10 @@ def train_ddp_loop(
                 global_count=global_count,
                 world_size=world_size,
             )
+            if kd_loss_fn is not None:
+                kd_loss = kd_loss_fn(model, epoch, global_step + 1)
+                loss = loss + kd_loss
+                epoch_kd_loss_sum += float(kd_loss.detach().float().item())
 
             if not _all_ranks_loss_finite(loss, accelerator):
                 raise RuntimeError(f"non-finite training loss on at least one rank (epoch {epoch})")
@@ -2326,7 +2564,8 @@ def train_ddp_loop(
             else float("nan")
         )
         validation_start = time.monotonic()
-        metrics = evaluate_fn(model, val_loader, accelerator)
+        outcome = evaluate_fn(model, val_loader, accelerator)
+        metrics = outcome.metrics
         if use_cuda:
             torch.cuda.synchronize(accelerator.device)
         local_validation_seconds = time.monotonic() - validation_start
@@ -2342,15 +2581,28 @@ def train_ddp_loop(
             "val_auroc": metrics.auroc,
             "val_auprc": metrics.auprc,
         }
+        if kd_loss_fn is not None and epoch_steps > 0:
+            entry["train_kd_loss"] = epoch_kd_loss_sum / epoch_steps
+        if outcome.topology is not None:
+            entry.update(
+                {
+                    "val_gs": outcome.topology.gs,
+                    "val_rd": outcome.topology.rd,
+                    "val_degree_mmd": outcome.topology.degree_mmd,
+                    "val_clustering_mmd": outcome.topology.clustering_mmd,
+                    "val_spectral_mmd": outcome.topology.spectral_mmd,
+                }
+            )
         history.append(entry)
+        metrics_by_epoch[epoch] = metrics
+        topology_by_epoch[epoch] = outcome.topology
+        if accelerator.is_main_process:
+            state_by_epoch[epoch] = _cpu_state_dict(accelerator, model)
 
-        improved = best_metrics is None or metrics.auprc > best_metrics.auprc
+        improved = best_auprc is None or metrics.auprc > best_auprc
         if improved:
-            best_metrics = metrics
-            best_epoch = epoch
+            best_auprc = metrics.auprc
             evals_without_improvement = 0
-            if accelerator.is_main_process:
-                best_state = _cpu_state_dict(accelerator, model)
         else:
             evals_without_improvement += 1
             if evals_without_improvement >= cfg.eval.patience and counterfactual_stop_epoch is None:
@@ -2363,7 +2615,7 @@ def train_ddp_loop(
             train_loss,
             metrics.auroc,
             metrics.auprc,
-            " (new best)" if improved else "",
+            " (new AUPRC high)" if improved else "",
         )
         if accelerator.is_main_process and on_eval is not None:
             on_eval(entry, improved, metrics)
@@ -2382,7 +2634,7 @@ def train_ddp_loop(
             }
         )
 
-    if best_metrics is None or last_metrics is None:
+    if not metrics_by_epoch or last_metrics is None:
         raise RuntimeError("DDP training ended without a single evaluation")
 
     peak_memory_tensor = accelerator.gather(
@@ -2446,12 +2698,36 @@ def train_ddp_loop(
         "per_epoch": per_epoch_profiles,
     }
 
+    # Selection over the whole run: mean rank on AUPRC plus all five topology
+    # metrics when every epoch carries them (production), best AUPRC otherwise
+    # (unit tests inject evaluate_fn stubs without a topology context).
+    topologies = [topology_by_epoch[epoch] for epoch in sorted(topology_by_epoch)]
+    if topologies and all(topology is not None for topology in topologies):
+        selected = select_checkpoint(
+            [
+                CheckpointCandidate(
+                    epoch=epoch,
+                    auprc=metrics_by_epoch[epoch].auprc,
+                    topology=cast(TopologyValidationMetrics, topology_by_epoch[epoch]),
+                )
+                for epoch in sorted(metrics_by_epoch)
+            ]
+        )
+        assert selected is not None
+        best_epoch = selected.epoch
+    else:
+        best_epoch = max(
+            sorted(metrics_by_epoch),
+            key=lambda epoch: (metrics_by_epoch[epoch].auprc, epoch),
+        )
+    best_metrics = metrics_by_epoch[best_epoch]
+
     if accelerator.is_main_process:
         last_state = _cpu_state_dict(accelerator, model)
-        if not best_state:
-            best_state = last_state
+        best_state = state_by_epoch.get(best_epoch, last_state)
     else:
         last_state = {}
+        best_state = {}
 
     return TrainResult(
         best_state_dict=best_state,
@@ -2702,14 +2978,43 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         )
         return
 
-    num_val_rows = len(assembled.benchmark.split.val_pairs.pairs)
+    val_labeled = assembled.benchmark.split.val_pairs
+    num_val_rows = len(val_labeled.pairs)
+    topology_context = ValidationTopologyContext(
+        pairs=tuple(val_labeled.pairs),
+        positive_edges=tuple(
+            pair
+            for pair, label in zip(val_labeled.pairs, val_labeled.labels, strict=True)
+            if int(label) == 1
+        ),
+        nodes=tuple(sorted({node for pair in val_labeled.pairs for node in pair})),
+    )
     evaluate_fn = cast(
         EvaluateFn,
         functools.partial(
             _evaluate_distributed,
             expected_row_ids=np.arange(num_val_rows, dtype=np.int64),
+            topology_context=topology_context,
         ),
     )
+
+    kd_loss_fn: KDLossFn | None = None
+    if cfg.distill is not None and cfg.distill.active:
+        kd_stream = KDStream(
+            cfg.distill,
+            load_kd_targets(Path(cfg.distill.targets_path)),
+            table,
+            seed=cfg.seed,
+            rank=accelerator.process_index,
+            world_size=accelerator.num_processes,
+        )
+        kd_loss_fn = kd_stream.loss
+        logger.info(
+            "KD stream active: arm=%s anchors_per_step=%d targets=%s",
+            cfg.distill.arm,
+            cfg.distill.anchors_per_step,
+            cfg.distill.targets_path,
+        )
 
     if args.ddp_mode == "epoch-probe":
         one_epoch_cfg = replace(cfg, optim=replace(cfg.optim, epochs=1))
@@ -2724,6 +3029,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                 warmup_steps=warmup_steps,
                 schedule_total_steps=schedule_total_steps,
                 evaluate_fn=evaluate_fn,
+                kd_loss_fn=kd_loss_fn,
             ),
         )
         _write_json_rank_zero(
@@ -2745,6 +3051,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         warmup_steps=warmup_steps,
         schedule_total_steps=schedule_total_steps,
         evaluate_fn=evaluate_fn,
+        kd_loss_fn=kd_loss_fn,
     )
     if accelerator.is_main_process:
         write_outputs(result, cfg, model_kwargs, assembled.dropped_pair_counts)
@@ -2777,6 +3084,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             "--max-steps %d is a DEBUG-ONLY flag for bounded smoke runs; "
             "never use it for real training",
             args.max_steps,
+        )
+    if cfg.distill is not None and cfg.distill.active:
+        raise ValueError(
+            "distill training runs only through the DDP pipeline path "
+            "(hpc/run.sh train <config>), not the legacy single-process CLI"
         )
 
     set_seed(cfg.seed)

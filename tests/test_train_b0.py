@@ -32,6 +32,7 @@ from src.train_b0 import (
     Config,
     GpuBatchIterable,
     TrainResult,
+    ValidationOutcome,
     _all_ranks_loss_finite,
     _build_packed_v3_1_loaders,
     _build_v3_1_loaders,
@@ -1502,7 +1503,7 @@ def test_ddp_loop_records_counterfactual_stop_but_runs_all_epochs(tmp_path: Path
         cfg,
         Accelerator(),
         warmup_steps=1,
-        evaluate_fn=lambda model, loader, accelerator: metrics,
+        evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(metrics, None),
     )
     assert result.last_epoch == 4
     assert result.stopped_early is False
@@ -1567,10 +1568,37 @@ def test_ddp_loop_reports_global_sample_weighted_train_loss(tmp_path: Path) -> N
         cfg,
         Accelerator(),
         warmup_steps=1,
-        evaluate_fn=lambda model, loader, accelerator: _constant_metrics(),
+        evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(_constant_metrics(), None),
     )
 
     assert result.history[0]["train_loss"] == pytest.approx(2.5)
+
+
+def test_ddp_loop_adds_kd_loss_and_logs_epoch_mean(tmp_path: Path) -> None:
+    """The KD hook joins the step loss and lands as `train_kd_loss` in history."""
+    config_path = tmp_path / "cfg.yaml"
+    _write_yaml_config(config_path, {"optim.epochs": 1})
+    cfg = load_config(config_path)
+    batches = [_loss_batch(1.0, [0]), _loss_batch(3.0, [1, 2, 3])]
+    kd_calls: list[tuple[int, int]] = []
+
+    def kd_loss_fn(model: nn.Module, epoch: int, step: int) -> torch.Tensor:
+        kd_calls.append((epoch, step))
+        return torch.tensor(0.25)
+
+    result = train_ddp_loop(
+        _BatchValueLossModel(),
+        lambda epoch: batches,
+        batches,
+        cfg,
+        Accelerator(cpu=True),
+        warmup_steps=1,
+        evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(_constant_metrics(), None),
+        kd_loss_fn=kd_loss_fn,
+    )
+
+    assert kd_calls == [(1, 1), (1, 2)]
+    assert result.history[0]["train_kd_loss"] == pytest.approx(0.25)
 
 
 def test_ddp_loop_rejects_duplicate_and_missing_training_rows(tmp_path: Path) -> None:
@@ -1587,7 +1615,9 @@ def test_ddp_loop_rejects_duplicate_and_missing_training_rows(tmp_path: Path) ->
             cfg,
             Accelerator(),
             warmup_steps=1,
-            evaluate_fn=lambda model, loader, accelerator: _constant_metrics(),
+            evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(
+                _constant_metrics(), None
+            ),
         )
 
 
@@ -1624,7 +1654,7 @@ def test_ddp_loop_runtime_profile_has_task12_keys(tmp_path: Path) -> None:
         cfg,
         Accelerator(),
         warmup_steps=1,
-        evaluate_fn=lambda model, loader, accelerator: metrics,
+        evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(metrics, None),
     )
     profile = result.runtime_profile
     assert set(profile) >= {

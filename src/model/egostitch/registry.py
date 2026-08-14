@@ -262,7 +262,6 @@ def build_classifier(cfg: ClassifierConfig, *, input_dim: int) -> PairClassifier
             xattn_heads=cfg.xattn_heads,
             conditioning_ema_decay=cfg.conditioning_ema_decay,
             conditioning_mode=cfg.conditioning_mode,
-            node_factor_dim=cfg.node_factor_dim,
         ),
     )
 

@@ -59,7 +59,6 @@ from src.data.feature_stats import FeatureStats
 from src.model.egostitch.classifier.b0_v31 import (
     NULL_ALL_HEAD,
     NULL_NONE,
-    B0V31PairClassifier,
     masks_for_null,
 )
 from src.model.egostitch.classifier.base import HeadNullMasks, PairClassifier
@@ -630,7 +629,6 @@ class EgoStitchModel(nn.Module):
         *,
         masks: HeadNullMasks | None = None,
         edge_mask: torch.Tensor | None = None,
-        node_factor_active: bool = True,
     ) -> torch.Tensor:
         """Evaluate one hard-bypass head from a shared pair context.
 
@@ -654,10 +652,6 @@ class EgoStitchModel(nn.Module):
             context: See above.
             masks: See above.
             edge_mask: See above.
-            node_factor_active: Threaded straight through to
-                `PairClassifier.forward`'s own kwarg of the same name (B1 KD
-                plan); a no-op for a classifier with no `node_factor`
-                (`B0V31PairClassifier.node_factor is None`).
         """
         batch_size = context.encoded_a.size(0)
         device = context.encoded_a.device
@@ -706,10 +700,7 @@ class EgoStitchModel(nn.Module):
         # `nn.Module.__call__` is typed to return `Any`; `PairClassifier.forward`
         # itself is annotated `-> torch.Tensor`, so this narrows back to what
         # the module actually returns rather than widening the contract.
-        return cast(
-            torch.Tensor,
-            self.classifier(pair, cond, masks=masks, node_factor_active=node_factor_active),
-        )
+        return cast(torch.Tensor, self.classifier(pair, cond, masks=masks))
 
     def forward(
         self, batch: Mapping[str, torch.Tensor], *, masks: HeadNullMasks | None = None
@@ -776,47 +767,17 @@ class EgoStitchModel(nn.Module):
     def decompose_pair_context(self, context: E2EPairContext) -> dict[str, torch.Tensor]:
         """Evaluate both logits without rebuilding node or pair state.
 
-        Returns ``{"full", "f_logit"}`` for every classifier. When
-        `self.classifier` also carries a `NodeFactorBottleneck`
-        (`ClassifierConfig.node_factor_dim > 0`, B1 KD plan), additionally
-        returns the descriptive 4-way output decomposition -- ``"content"``
-        (``c``, node factor off), ``"content_bias"`` (``c + b_a + b_b``),
-        ``"content_factor"`` (``c + r``) alongside ``"full"`` (``c + r + b_a
-        + b_b``) -- reconstructed from exactly two scoring passes
-        (`node_factor_active` True/False) plus the same `r`/`b_a`/`b_b`
-        `forward` itself would add, read via `node_factor_outputs` rather
-        than recomputed by a third pass. Descriptive, not causal
-        attribution (design coordinator note, B1 plan adversarial review #4):
-        the factor path is a structured parameterization, not evidence of
-        cross-pair inference.
-
-        For a classifier without a node factor this is unchanged from the
-        pre-B1 two-key contract; `score_universe.py`'s save contract, which
-        reads only ``"full"``/``"f_logit"``, is therefore unaffected.
+        Returns ``{"full", "f_logit"}`` -- the contract `score_universe.py`'s
+        save path reads.
         """
         batch_size = context.encoded_a.size(0)
         device = context.encoded_a.device
-        result = {
+        return {
             "full": self.score_pair_context(context),
             "f_logit": self.score_pair_context(
                 context, masks=masks_for_null(NULL_ALL_HEAD, batch_size, device)
             ),
         }
-        has_node_factor = (
-            isinstance(self.classifier, B0V31PairClassifier)
-            and self.classifier.node_factor is not None
-        )
-        if has_node_factor:
-            assert isinstance(self.classifier, B0V31PairClassifier)
-            content = self.score_pair_context(context, node_factor_active=False)
-            node_factor = self.classifier.node_factor_outputs(
-                context.encoded_a.float(), context.encoded_b.float(), context.len_a, context.len_b
-            )
-            assert node_factor is not None
-            result["content"] = content
-            result["content_bias"] = content + node_factor.b_a + node_factor.b_b
-            result["content_factor"] = content + node_factor.r
-        return result
 
     # ------------------------------------------------------------------ loss aggregation
     #

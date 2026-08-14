@@ -208,7 +208,11 @@ def recover(args: argparse.Namespace) -> None:
                     auprc=metrics.auprc,
                     prevalence=fidelity["prevalence"],
                     active_logit_std=fidelity["active_logit_std"],
+                    gs=fidelity["gs"],
+                    rd=fidelity["rd"],
+                    degree_mmd=fidelity["degree_mmd"],
                     clustering_mmd=fidelity["clustering_mmd"],
+                    spectral_mmd=fidelity["spectral_mmd"],
                     brier=metrics.brier,
                     warm_reference_std=None,
                     warm_reference_auprc=None,
@@ -227,14 +231,7 @@ def recover(args: argparse.Namespace) -> None:
     if not accelerator.is_main_process:
         accelerator.end_training()
         return
-    training = cfg.training
-    assert training is not None
-    selected = select_e2e_checkpoint(
-        records,
-        "full",
-        auprc_tolerance=training.selection_auprc_tolerance,
-        mmd_tolerance=training.selection_mmd_tolerance,
-    )
+    selected = select_e2e_checkpoint(records, "full")
     assert selected is not None
     metadata = {
         "schema": "egostitch_v_hold_checkpoint_recovery_v1",
@@ -258,8 +255,7 @@ def recover(args: argparse.Namespace) -> None:
             "scope": "best_of_sampled_epochs_only",
             "not_official_full_run_selection": True,
             "selected_epoch": selected.epoch,
-            "auprc_tolerance": training.selection_auprc_tolerance,
-            "mmd_tolerance": training.selection_mmd_tolerance,
+            "rule": "mean_rank_auprc_plus_five_topology",
         },
         "checkpoints": checkpoint_rows,
     }

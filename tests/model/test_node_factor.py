@@ -2,7 +2,7 @@
 
 Pins the properties the plan's design rationale depends on: the residual is
 exactly zero at init (bit-identical to the `node_factor_dim=0` baseline,
-proven again at the composite level in `tests/model/test_composite.py`), `r`
+proven again at the model level in `tests/model/test_v31_node_factor.py`), `r`
 is symmetric in the two endpoints by construction, and the zero-init `diag_w`
 gives every coordinate a direct, nonzero step-0 gradient while `w_z` gets
 none through that same path -- the "no scalar-gate saddle" claim

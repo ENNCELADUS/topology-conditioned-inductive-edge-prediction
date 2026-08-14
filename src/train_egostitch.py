@@ -56,16 +56,13 @@ from src.data.packed_features import PackedFeatureManifest, PackedFeatureTable
 from src.data.pairs import NegativeSampler
 from src.data.partition import derive_training_interactions
 from src.data.prefetch import _prefetch_batches
-from src.distill.artifacts import KDTargets, load_kd_targets
-from src.distill.losses import (
-    kd_dist_loss,
-    kd_gram_loss,
-    kd_label_loss,
-    kd_logit_loss,
-    kd_rank_loss,
+from src.eval.checkpoint_selection import (
+    CheckpointCandidate,
+    TopologyValidationMetrics,
+    select_checkpoint,
+    validation_topology_metrics,
 )
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
-from src.eval.graph_metrics import MMDConfig, clustering_histogram, mmd_squared
 from src.model.egostitch import EgoStitchConfig, EgoStitchStage1
 from src.model.egostitch.classifier.b0_v31 import (
     NULL_ALL_HEAD,
@@ -74,8 +71,8 @@ from src.model.egostitch.classifier.b0_v31 import (
     masks_for_null,
     sample_branch_masks,
 )
-from src.model.egostitch.composite import E2ENodeState, E2EPairContext, EgoStitchModel
-from src.model.egostitch.config import DistillConfig, E2EConfig
+from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
+from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.encoder.base import GraphEncoder
 from src.model.egostitch.generator import EgoStitchImagineGenerator, StitchedGraph
 from src.model.egostitch.generator.full_oracle import FullOracleGenerator
@@ -227,7 +224,6 @@ class EgoDiagnosticsConfig:
     gradient_imbalance_ratio: float
     gradient_imbalance_steps: int
     probe_s1_abs_mean_max: float
-    selection_auprc_tolerance: float
     topk_fraction: float
 
 
@@ -259,8 +255,6 @@ class EgoStitchTrainingConfig:
     collapse_fraction: float = 0.25
     collapse_floor: float = 1e-4
     collapse_validations: int = 2
-    selection_auprc_tolerance: float = 0.02
-    selection_mmd_tolerance: float = 1e-6
     residual_ratio_min: float = 1e-3
 
 
@@ -424,7 +418,6 @@ def load_config(path: Path) -> EgoConfig:
         "gradient_imbalance_ratio",
         "gradient_imbalance_steps",
         "probe_s1_abs_mean_max",
-        "selection_auprc_tolerance",
         "topk_fraction",
     )
     _check_no_unknown_keys(diagnostics_raw, diagnostic_keys, "diagnostics")
@@ -445,10 +438,6 @@ def load_config(path: Path) -> EgoConfig:
             _require(diagnostics_raw, "probe_s1_abs_mean_max", "diagnostics."),
             "diagnostics.probe_s1_abs_mean_max",
         ),
-        selection_auprc_tolerance=_as_float(
-            _require(diagnostics_raw, "selection_auprc_tolerance", "diagnostics."),
-            "diagnostics.selection_auprc_tolerance",
-        ),
         topk_fraction=_as_float(
             _require(diagnostics_raw, "topk_fraction", "diagnostics."),
             "diagnostics.topk_fraction",
@@ -460,10 +449,6 @@ def load_config(path: Path) -> EgoConfig:
         raise ValueError("diagnostics.gradient_imbalance_ratio must exceed 1")
     if diagnostics.probe_s1_abs_mean_max <= 0:
         raise ValueError("diagnostics.probe_s1_abs_mean_max must be positive")
-    if not math.isfinite(diagnostics.selection_auprc_tolerance) or not (
-        0.0 <= diagnostics.selection_auprc_tolerance <= 1.0
-    ):
-        raise ValueError("diagnostics.selection_auprc_tolerance must be finite and in [0, 1]")
     if not 0.0 < diagnostics.topk_fraction <= 1.0:
         raise ValueError("diagnostics.topk_fraction must be in (0, 1]")
 
@@ -618,33 +603,15 @@ def load_config(path: Path) -> EgoConfig:
             collapse_validations=_as_int(
                 training_raw.get("collapse_validations", 2), "training.collapse_validations"
             ),
-            selection_auprc_tolerance=_as_float(
-                training_raw.get("selection_auprc_tolerance", 0.02),
-                "training.selection_auprc_tolerance",
-            ),
-            selection_mmd_tolerance=_as_float(
-                training_raw.get("selection_mmd_tolerance", 1e-6),
-                "training.selection_mmd_tolerance",
-            ),
             residual_ratio_min=_as_float(
                 training_raw.get("residual_ratio_min", 1e-3), "training.residual_ratio_min"
             ),
         )
-        if not math.isfinite(training.selection_auprc_tolerance) or not (
-            0.0 <= training.selection_auprc_tolerance <= 1.0
-        ):
-            raise ValueError("training.selection_auprc_tolerance must be finite and in [0, 1]")
-        if diagnostics.selection_auprc_tolerance != training.selection_auprc_tolerance:
-            raise ValueError(
-                "diagnostics.selection_auprc_tolerance must exactly equal "
-                "training.selection_auprc_tolerance"
-            )
         # `phase_a_fraction`/`phase_b_fraction` are the Wave-1 oracle-scaffold
-        # experiment's second carve-out from the pinned-defaults check below,
-        # exactly like `selection_auprc_tolerance` above: every R1 config sets
-        # `phase_a_fraction: 0.0` (a zero-parameter generator has nothing for
-        # Phase A to pretrain, design doc 2026-08-04 §8), which the pinned
-        # 0.2/0.1 split this gate otherwise enforces would silently reject.
+        # experiment's carve-out from the pinned-defaults check below: every R1
+        # config sets `phase_a_fraction: 0.0` (a zero-parameter generator has
+        # nothing for Phase A to pretrain, design doc 2026-08-04 §8), which the
+        # pinned 0.2/0.1 split this gate otherwise enforces would reject.
         if not math.isfinite(training.phase_a_fraction) or not (
             0.0 <= training.phase_a_fraction <= 1.0
         ):
@@ -661,7 +628,6 @@ def load_config(path: Path) -> EgoConfig:
         if (
             replace(
                 training,
-                selection_auprc_tolerance=pinned_training.selection_auprc_tolerance,
                 phase_a_fraction=pinned_training.phase_a_fraction,
                 phase_b_fraction=pinned_training.phase_b_fraction,
             )
@@ -669,8 +635,7 @@ def load_config(path: Path) -> EgoConfig:
         ):
             raise ValueError(
                 "training values must exactly match the pinned defaults (except "
-                f"selection_auprc_tolerance, phase_a_fraction, and phase_b_fraction); "
-                f"got {training!r}"
+                f"phase_a_fraction and phase_b_fraction); got {training!r}"
             )
         if data.negative_ratio != 5:
             raise ValueError("training requires data.negative_ratio=5")
@@ -746,10 +711,6 @@ E2EArmName = Literal[
     "null_generator",
     "oracle",
     "full_ego_oracle",
-    "kd_control",
-    "kd_d1",
-    "kd_d2",
-    "kd_d3",
 ]
 
 
@@ -1449,7 +1410,11 @@ class E2ECheckpointRecord:
     auprc: float
     prevalence: float
     active_logit_std: float
+    gs: float
+    rd: float
+    degree_mmd: float
     clustering_mmd: float
+    spectral_mmd: float
     brier: float
     warm_reference_std: float | None = None
     warm_reference_auprc: float | None = None
@@ -1460,28 +1425,35 @@ class E2ECheckpointRecord:
 def select_e2e_checkpoint(
     records: Sequence[E2ECheckpointRecord],
     arm: E2EArmName,
-    *,
-    auprc_tolerance: float = 0.02,
-    mmd_tolerance: float = 1e-6,
 ) -> E2ECheckpointRecord | None:
-    """Select the best-ranked checkpoint: AUPRC, then clustering MMD, then Brier.
+    """Select by mean rank over AUPRC and all five topology metrics.
 
-    There is no eligibility predicate. Whether a selected checkpoint is
-    scientifically usable is an owner-side judgement made from the raw
-    per-epoch metrics in ``metrics.jsonl``, not something this function or any
-    other code path decides. ``arm`` is accepted only to keep one call
-    signature across arms.
+    Delegates to :func:`src.eval.checkpoint_selection.select_checkpoint`
+    (AUPRC↑, GS↑, RD→1, degree/clustering/spectral MMD↓, ties on higher
+    AUPRC then later epoch). There is still no eligibility predicate:
+    whether the selected checkpoint is scientifically usable remains an
+    owner-side judgement made from ``metrics.jsonl``. ``arm`` is accepted
+    only to keep one call signature across arms.
     """
     del arm
-    if not records:
-        return None
-    best_auprc = max(record.auprc for record in records)
-    candidates = [record for record in records if record.auprc >= best_auprc - auprc_tolerance]
-    best_mmd = min(record.clustering_mmd for record in candidates)
-    candidates = [
-        record for record in candidates if record.clustering_mmd <= best_mmd + mmd_tolerance
-    ]
-    return min(candidates, key=lambda record: (record.brier, record.epoch))
+    by_epoch = {record.epoch: record for record in records}
+    selected = select_checkpoint(
+        [
+            CheckpointCandidate(
+                epoch=record.epoch,
+                auprc=record.auprc,
+                topology=TopologyValidationMetrics(
+                    gs=record.gs,
+                    rd=record.rd,
+                    degree_mmd=record.degree_mmd,
+                    clustering_mmd=record.clustering_mmd,
+                    spectral_mmd=record.spectral_mmd,
+                ),
+            )
+            for record in records
+        ]
+    )
+    return None if selected is None else by_epoch[selected.epoch]
 
 
 _PROBE_DISPATCH_MODES = ("probe", "epoch-probe")
@@ -2315,9 +2287,7 @@ class _CompositeBatch:
     """One composite optimizer-step batch (CPU tensors; moved by the caller).
 
     Edge rows are padded to ``B_e`` with ``edge_mask = 0`` rows so every rank
-    executes the same step count. ``kd`` (B1 KD plan) is the parallel
-    anchor-context stream -- ``None`` whenever no distill weight is active,
-    padded to a fixed per-step size with ``kd_mask`` otherwise (`_kd_tensors`).
+    executes the same step count.
     """
 
     node: dict[str, torch.Tensor]
@@ -2325,7 +2295,6 @@ class _CompositeBatch:
     edge_rows_true: int
     edge_rows_global: int
     f0_rows_gathered: int
-    kd: dict[str, torch.Tensor] | None = None
 
 
 _EGOSTITCH_E2E_FAMILY = "egostitch_e2e"
@@ -2380,7 +2349,6 @@ class _BatchFactory:
         world_size: int,
         generator_supervision: bool = True,
         relational_supervision: bool = True,
-        distill: DistillConfig | None = None,
     ) -> None:
         self._cfg = cfg
         self._model_cfg = model_cfg
@@ -2409,19 +2377,6 @@ class _BatchFactory:
                 raise ValueError("data.pack_dir is required when model.family == 'egostitch_e2e'")
             self._token_table = PackedFeatureTable.from_pack(cfg.data.pack_dir, torch.device("cpu"))
             self._token_node_index = self._token_table.manifest.node_index()
-        self._distill = distill
-        self._kd_targets: KDTargets | None = None
-        if distill is not None and any(
-            getattr(distill, name) > 0.0
-            for name in ("w_label", "w_logit", "w_rank", "w_dist", "w_gram")
-        ):
-            kd_targets = load_kd_targets(Path(distill.targets_path))
-            # Data-boundary audit stays fail-closed (CLAUDE.md): every KD node
-            # must live inside the training universe. Digest/graph-binding
-            # verification was deliberately removed (user decision, 2026-08-13);
-            # matching the artifact to the current split is the operator's job.
-            self._record_training_nodes(kd_targets.node_ids)
-            self._kd_targets = kd_targets
 
     # ---- node stream (cycles independently, spec Sec 10.1)
 
@@ -2651,118 +2606,6 @@ class _BatchFactory:
             edge["rel_target"] = relational_pair_targets(self._data.target_builder.graph, padded)
         return edge, true_rows
 
-    def _kd_step_anchor_positions(self, epoch: int, step: int) -> list[int]:
-        """This rank's `distill.anchors_per_step` KD artifact node positions.
-
-        Rank-disjoint by construction (mirrors `_shuffled_nodes`): every rank
-        draws only from its own ``[rank::world]`` slice of the artifact's node
-        universe, so no communication is needed to keep ranks from selecting
-        the same anchor in one step. Within its slice, each rank's selection
-        is a pure function of ``(seed, epoch, step, rank)`` -- no persistent
-        cursor -- via a distinct salt from the other node/edge RNG idioms.
-        """
-        assert self._kd_targets is not None and self._distill is not None
-        node_ids = self._kd_targets.node_ids
-        shard = list(range(self._rank, len(node_ids), self._world))
-        if not shard:
-            raise RuntimeError("KD artifact node universe is smaller than the DDP world size")
-        k = self._distill.anchors_per_step
-        rng = np.random.default_rng((self._cfg.seed, epoch, step, self._rank, 0x4B44))
-        reps = -(-k // len(shard))
-        positions = np.concatenate([rng.permutation(len(shard)) for _ in range(reps)])[:k]
-        return [shard[int(i)] for i in positions]
-
-    def _kd_tensors(self, epoch: int, step: int) -> dict[str, torch.Tensor] | None:
-        """Deterministic per-(epoch, step, rank) KD anchor-context batch (B1 plan).
-
-        `None` when no distill weight is active. Otherwise selects
-        `distill.anchors_per_step` anchors (`_kd_step_anchor_positions`) and
-        gathers each anchor's full dumped context-row group (<=2-hop near +
-        random, `src.distill.context_sampler`, baked into the artifact by the
-        Wave-2 dumper), padded to the artifact's fixed ``k_near + k_rand``
-        context size with ``kd_mask = 0`` filler rows -- short groups (an
-        anchor with fewer than `k_near` 2-hop candidates) are a known case,
-        not an error (B1 plan "Known risks" #3). Every rank therefore emits
-        exactly ``anchors_per_step * (k_near + k_rand)`` rows every step,
-        regardless of which anchors were drawn.
-
-        Returns the same endpoint keys `_edge_tensors` produces (token
-        streams, ``x_i``/``x_j``, ``node_row_i``/``node_row_j``, zero-width
-        grounding, ``is_self``) plus the KD-specific ``kd_*`` targets/mask.
-        """
-        if self._kd_targets is None:
-            return None
-        assert self._distill is not None
-        targets = self._kd_targets
-        context_size = int(cast(int, targets.manifest["k_near"])) + int(
-            cast(int, targets.manifest["k_rand"])
-        )
-        node_ids = targets.node_ids
-        anchor_positions = self._kd_step_anchor_positions(epoch, step)
-
-        anchor_nodes: list[str] = []
-        partner_nodes: list[str] = []
-        teacher_logit: list[float] = []
-        teacher_pooled: list[NDArray[np.float32]] = []
-        pair_label: list[float] = []
-        kd_group: list[int] = []
-        kd_mask: list[float] = []
-        pooled_dim = targets.teacher_pooled_ab.shape[-1]
-        for anchor_pos in anchor_positions:
-            anchor_node = node_ids[anchor_pos]
-            start = int(targets.anchor_offsets[anchor_pos])
-            end = int(targets.anchor_offsets[anchor_pos + 1])
-            row_count = min(end - start, context_size)
-            for offset in range(context_size):
-                if offset < row_count:
-                    csr_index = start + offset
-                    anchor_nodes.append(anchor_node)
-                    partner_nodes.append(node_ids[int(targets.pair_partner_idx[csr_index])])
-                    teacher_logit.append(float(targets.teacher_logit[csr_index]))
-                    teacher_pooled.append(
-                        0.5
-                        * (
-                            targets.teacher_pooled_ab[csr_index].astype(np.float32)
-                            + targets.teacher_pooled_ba[csr_index].astype(np.float32)
-                        )
-                    )
-                    pair_label.append(float(targets.pair_label[csr_index]))
-                    kd_group.append(anchor_pos)
-                    kd_mask.append(1.0)
-                else:
-                    anchor_nodes.append(anchor_node)
-                    partner_nodes.append(anchor_node)
-                    teacher_logit.append(0.0)
-                    teacher_pooled.append(np.zeros(pooled_dim, dtype=np.float32))
-                    pair_label.append(0.0)
-                    kd_group.append(anchor_pos)
-                    kd_mask.append(0.0)
-
-        self._record_training_nodes(sorted({*anchor_nodes, *partner_nodes}))
-        idx_i = torch.tensor([self._data.node_index[n] for n in anchor_nodes], dtype=torch.long)
-        idx_j = torch.tensor([self._data.node_index[n] for n in partner_nodes], dtype=torch.long)
-        empty_shape = (len(anchor_nodes), 0, self._model_cfg.input_dim)
-        kd: dict[str, torch.Tensor] = {
-            "x_i": self._data.f0[idx_i],
-            "x_j": self._data.f0[idx_j],
-            "node_row_i": idx_i.clone(),
-            "node_row_j": idx_j.clone(),
-            "is_self": torch.tensor(
-                [u == v for u, v in zip(anchor_nodes, partner_nodes, strict=True)],
-                dtype=torch.bool,
-            ),
-            "ground_i": torch.empty(empty_shape, dtype=self._data.f0.dtype),
-            "ground_j": torch.empty(empty_shape, dtype=self._data.f0.dtype),
-            "kd_teacher_logit": torch.tensor(teacher_logit, dtype=torch.float32),
-            "kd_teacher_pooled": torch.tensor(np.stack(teacher_pooled), dtype=torch.float32),
-            "kd_pair_label": torch.tensor(pair_label, dtype=torch.float32),
-            "kd_group": torch.tensor(kd_group, dtype=torch.int64),
-            "kd_mask": torch.tensor(kd_mask, dtype=torch.float32),
-            "kd_pair_endpoints": torch.stack([idx_i, idx_j], dim=-1),
-        }
-        kd.update(self._token_streams(anchor_nodes, partner_nodes))
-        return kd
-
     def epoch_batches(
         self, epoch: int, *, rows_per_rank: Sequence[int], steps: int
     ) -> Iterator[_CompositeBatch]:
@@ -2793,11 +2636,8 @@ class _BatchFactory:
                 epoch=epoch,
                 step=step,
             )
-            kd = self._kd_tensors(epoch, step)
             global_count = _step_global_count(rows_per_rank, step, edge_batch)
             f0_rows = 2 * edge["x_i"].shape[0]
-            if kd is not None:
-                f0_rows += 2 * kd["x_i"].shape[0]
             if self._generator_supervision:
                 f0_rows += (
                     node["x"].shape[0]
@@ -2816,7 +2656,6 @@ class _BatchFactory:
                 edge_rows_true=true_rows,
                 edge_rows_global=max(global_count, 1),
                 f0_rows_gathered=f0_rows,
-                kd=kd,
             )
 
 
@@ -2910,82 +2749,21 @@ class _CompositeStep(torch.nn.Module):
                 ),
             }
         )
-        classifier = self.model.classifier
-        has_node_factor = (
-            isinstance(classifier, B0V31PairClassifier) and classifier.node_factor is not None
-        )
-        edge_context: E2EPairContext | None = None
-        graph: StitchedGraph | None
-        embedding_ab: GraphEmbedding | None
-        if has_node_factor and self.model.encoder is None:
-            # A node-factor model is a KD arm (B1 plan), always endpoint-only
-            # (`generator.name: "null"`, no encoder): `model.forward` would
-            # clamp `need_topo` off internally anyway, so building the pair
-            # context directly here is numerically identical and keeps the
-            # one encoded context around for the node-factor telemetry below
-            # -- a second `classifier.encode_tokens` pass would otherwise
-            # double the edge stream's SiameseEncoder cost every step just to
-            # read `r`/`residual`.
-            edge_context = self.model.build_pair_context(edge_view, need_topo=False)
-            logits = self.model.score_pair_context(
-                edge_context, masks=branch_masks, edge_mask=edge["edge_mask"]
-            )
-            graph = None
-            embedding_ab = None
-        else:
-            edge_output = self.model(edge_view, masks=branch_masks)
-            logits = cast(torch.Tensor, edge_output["logits"])
-            # `self.model.generator` is concretely `EgoStitchImagineGenerator` for
-            # the `full`/`p0`/`no_l_rel`/`row_layernorm` arms (registry-driven
-            # swapping is P3), whose `stitch` only ever produces a
-            # `StitchedGraph`. The oracle-scaffold and null generators are the
-            # registry's other members (design 2026-08-02 §3, §8, §12 P3;
-            # Wave-1 oracle-scaffold addendum): `NullGenerator.stitch` always
-            # returns `None`, so `EgoStitchModel.forward` omits `"graph"`/
-            # `"embedding_ab"` from its output entirely rather than emitting a
-            # `None` value (`composite.py`'s `if graph is not None and
-            # embedding_ab is not None`) -- `.get(...)` (not `[...]`) is what
-            # makes that omission legal here instead of a `KeyError`.
-            graph = cast(StitchedGraph | None, edge_output.get("graph"))
-            embedding_ab = cast(GraphEmbedding | None, edge_output.get("embedding_ab"))
-
-        # Node-factor telemetry (B1 plan), every step the factor path exists:
-        # a pure readout, no gradient. `nf_w_l1` is a parameter norm; `nf_r_var`/
-        # `nf_residual_absmean` read the EDGE stream's own `r`/`residual` over
-        # its true (non-filler) rows, reusing `edge_context` when the branch
-        # above already built one.
-        nf_parts: dict[str, float] = {}
-        if has_node_factor:
-            node_factor_context = (
-                edge_context
-                if edge_context is not None
-                else self.model.build_pair_context(edge_view, need_topo=False)
-            )
-            node_factor_classifier = cast(B0V31PairClassifier, classifier)
-            node_factor_module = node_factor_classifier.node_factor
-            assert node_factor_module is not None
-            node_factor = node_factor_classifier.node_factor_outputs(
-                node_factor_context.encoded_a.float(),
-                node_factor_context.encoded_b.float(),
-                node_factor_context.len_a,
-                node_factor_context.len_b,
-            )
-            assert node_factor is not None
-            true_rows = edge["edge_mask"] > 0
-            n_true = int(true_rows.sum())
-            nf_parts = {
-                "nf_w_l1": float(node_factor_module.diag_w.detach().abs().sum()),
-                "nf_r_var": (
-                    float(node_factor.r[true_rows].detach().var(unbiased=False).item())
-                    if n_true > 0
-                    else 0.0
-                ),
-                "nf_residual_absmean": (
-                    float(node_factor.residual[true_rows].detach().abs().mean().item())
-                    if n_true > 0
-                    else 0.0
-                ),
-            }
+        edge_output = self.model(edge_view, masks=branch_masks)
+        logits = cast(torch.Tensor, edge_output["logits"])
+        # `self.model.generator` is concretely `EgoStitchImagineGenerator` for
+        # the `full`/`p0`/`no_l_rel`/`row_layernorm` arms (registry-driven
+        # swapping is P3), whose `stitch` only ever produces a
+        # `StitchedGraph`. The oracle-scaffold and null generators are the
+        # registry's other members (design 2026-08-02 §3, §8, §12 P3;
+        # Wave-1 oracle-scaffold addendum): `NullGenerator.stitch` always
+        # returns `None`, so `EgoStitchModel.forward` omits `"graph"`/
+        # `"embedding_ab"` from its output entirely rather than emitting a
+        # `None` value (`composite.py`'s `if graph is not None and
+        # embedding_ab is not None`) -- `.get(...)` (not `[...]`) is what
+        # makes that omission legal here instead of a `KeyError`.
+        graph = cast(StitchedGraph | None, edge_output.get("graph"))
+        embedding_ab = cast(GraphEmbedding | None, edge_output.get("embedding_ab"))
 
         # Every key `NeighborhoodGenerator.auxiliary_losses`/
         # `GraphEncoder.auxiliary_losses` read is either a `node`-stream key
@@ -3045,61 +2823,6 @@ class _CompositeStep(torch.nn.Module):
             else logits.sum() * 0.0
         )
 
-        # B1 KD stream: one additional model call on the KD anchor-context
-        # view, gated by the same `edge_active` phase condition as `L_edge`
-        # (`_e2e_training_payload`/`_epoch_step_plan` keep its shape fixed
-        # across steps regardless of phase). `kd is None` for every
-        # pre-B1/non-KD arm -- the batch simply carries no `"kd"` key.
-        kd = cast(dict[str, torch.Tensor] | None, batch.get("kd"))
-        kd_total_tensor: torch.Tensor | None = None
-        kd_parts: dict[str, float] = {}
-        if kd is not None:
-            distill = self.model.cfg.distill
-            kd_context = self.model.build_pair_context(_e2e_edge_view(kd), need_topo=False)
-            kd_logits = self.model.score_pair_context(kd_context, edge_mask=kd["kd_mask"])
-            kd_node_factor = cast(B0V31PairClassifier, classifier).node_factor_outputs(
-                kd_context.encoded_a.float(),
-                kd_context.encoded_b.float(),
-                kd_context.len_a,
-                kd_context.len_b,
-            )
-            assert kd_node_factor is not None
-            kd_mask = kd["kd_mask"]
-            kd_label = kd_label_loss(kd_logits, kd["kd_pair_label"], kd_mask)
-            kd_logit = kd_logit_loss(kd_logits, kd["kd_teacher_logit"], kd_mask)
-            kd_rank = kd_rank_loss(
-                kd_logits, kd["kd_teacher_logit"], kd["kd_group"], kd_mask, margin=distill.margin
-            )
-            kd_dist = kd_dist_loss(
-                kd_logits,
-                kd["kd_teacher_logit"],
-                kd["kd_group"],
-                kd_mask,
-                temperature=distill.temperature,
-            )
-            kd_gram = kd_gram_loss(
-                kd_node_factor.z_a * kd_node_factor.z_b,
-                kd["kd_teacher_pooled"],
-                kd["kd_pair_endpoints"],
-                kd_mask,
-            )
-            kd_weighted = (
-                distill.w_label * kd_label
-                + distill.w_logit * kd_logit
-                + distill.w_rank * kd_rank
-                + distill.w_dist * kd_dist
-                + distill.w_gram * kd_gram
-            )
-            kd_total_tensor = kd_weighted if edge_active else kd_weighted * 0.0
-            kd_parts = {
-                "kd_label": float(kd_label.detach()),
-                "kd_logit": float(kd_logit.detach()),
-                "kd_rank": float(kd_rank.detach()),
-                "kd_dist": float(kd_dist.detach()),
-                "kd_gram": float(kd_gram.detach()),
-                "kd_total": float(kd_total_tensor.detach()),
-            }
-
         total, parts = stage1_total(
             self.model.generator_cfg,
             family="egostitch_e2e",
@@ -3130,9 +2853,6 @@ class _CompositeStep(torch.nn.Module):
                 batch.get("recon_factors"),
             ),
         )
-        if kd_total_tensor is not None:
-            total = total + kd_total_tensor
-            families["kd"] = kd_total_tensor
         parameter_anchor = (
             0.0
             * torch.stack(
@@ -3145,8 +2865,6 @@ class _CompositeStep(torch.nn.Module):
         )
         total = total + parameter_anchor
         families = {name: family + parameter_anchor for name, family in families.items()}
-        parts.update(kd_parts)
-        parts.update(nf_parts)
         result: dict[str, object] = {
             "loss": total,
             "parts": parts,
@@ -3381,25 +3099,19 @@ class _ValidationResult:
     active_logits: NDArray[np.float32] = field(default_factory=lambda: np.empty(0, dtype="<f4"))
 
 
-def _validation_clustering_mmd(data: EgoStitchData, logits: np.ndarray) -> float:
-    """Raw single-graph clustering MMD at the exact held-out gold edge count."""
-    if not data.validation_nodes:
-        return 0.0
-    target_edges = len(data.validation_positive_edges)
-    ranked = sorted(
-        range(len(data.val_pairs)),
-        key=lambda index: (-float(logits[index]), data.val_pairs[index]),
-    )
-    predicted = nx.Graph()
-    predicted.add_nodes_from(data.validation_nodes)
-    predicted.add_edges_from(data.val_pairs[index] for index in ranked[:target_edges])
-    gold = nx.Graph()
-    gold.add_nodes_from(data.validation_nodes)
-    gold.add_edges_from(data.validation_positive_edges)
-    return mmd_squared(
-        [clustering_histogram(predicted)],
-        [clustering_histogram(gold)],
-        MMDConfig(),
+def _validation_topology_metrics(
+    data: EgoStitchData, logits: np.ndarray
+) -> TopologyValidationMetrics:
+    """All five topology metrics at the exact held-out gold edge count."""
+    if not data.validation_nodes or not data.validation_positive_edges:
+        return TopologyValidationMetrics(
+            gs=0.0, rd=0.0, degree_mmd=0.0, clustering_mmd=0.0, spectral_mmd=0.0
+        )
+    return validation_topology_metrics(
+        pairs=data.val_pairs,
+        logits=logits,
+        positive_edges=data.validation_positive_edges,
+        nodes=data.validation_nodes,
     )
 
 
@@ -3592,14 +3304,6 @@ def _validate_epoch(
         "family egostitch_e2e requires token_table/token_node_index"
     )
     unique_nodes = list(dict.fromkeys(node for row in shard_rows for node in data.val_pairs[row]))
-    # B1 KD plan: score the 4-way `content`/`content_bias`/`content_factor`
-    # decomposition (`EgoStitchModel.decompose_pair_context`) only for a
-    # node-factor classifier -- every non-KD arm's validation stays exactly
-    # the pre-B1 three-column (`active`/`full`/`f_logit`) contract.
-    has_node_factor = (
-        isinstance(model.classifier, B0V31PairClassifier)
-        and model.classifier.node_factor is not None
-    )
 
     def synchronize_device() -> None:
         if accelerator.device.type == "cuda":
@@ -3696,25 +3400,6 @@ def _validate_epoch(
                 active_logits = (
                     full_logits if masks is None else model.score_pair_context(context, masks=masks)
                 )
-                if has_node_factor:
-                    node_factor_classifier = cast(B0V31PairClassifier, model.classifier)
-                    content_logits = model.score_pair_context(context, node_factor_active=False)
-                    node_factor = node_factor_classifier.node_factor_outputs(
-                        context.encoded_a.float(),
-                        context.encoded_b.float(),
-                        context.len_a,
-                        context.len_b,
-                    )
-                    assert node_factor is not None
-                    content_bias_logits = content_logits + node_factor.b_a + node_factor.b_b
-                    content_factor_logits = content_logits + node_factor.r
-                else:
-                    nan_col = torch.full(
-                        (len(rows),), float("nan"), dtype=torch.float32, device=accelerator.device
-                    )
-                    content_logits = nan_col
-                    content_bias_logits = nan_col
-                    content_factor_logits = nan_col
             # Slot-geometry telemetry (dispersion/scale) only exists for
             # `EgoStitchImagineGenerator`: the oracle-scaffold and null
             # generators carry no `SlotSet`/Sinkhorn plan at all (`context.plan
@@ -3800,16 +3485,13 @@ def _validate_epoch(
                         scale_rows["plan_max_cell_fraction"],
                         scale_rows["h_norm_mean"],
                         scale_rows["h_pairwise_sqdist_mean"],
-                        content_logits.float(),
-                        content_bias_logits.float(),
-                        content_factor_logits.float(),
                     ],
                     dim=-1,
                 )
             )
         synchronize_device()
         pair_scoring_seconds = time.monotonic() - pair_scoring_started
-    n_cols = 15
+    n_cols = 12
     local_values = (
         torch.cat(values_out) if values_out else torch.zeros((0, n_cols), device=accelerator.device)
     )
@@ -3876,6 +3558,7 @@ def _validate_epoch(
         for name, values in zip(scale_names, ordered[:, 8:12].T, strict=True)
     }
     endpoint_degree = _e2e_validation_endpoint_degrees(data)
+    validation_topology = _validation_topology_metrics(data, logits_np)
     fidelity = {
         "active_logit_std": active_std,
         "f_logit_std": f_std,
@@ -3883,23 +3566,15 @@ def _validate_epoch(
         "topology_delta_std": residual_std,
         "topology_delta_ratio": residual_std / max(f_std, 1e-12),
         "selection_tiebreak": 0.0,
-        "clustering_mmd": _validation_clustering_mmd(data, logits_np),
+        "gs": validation_topology.gs,
+        "rd": validation_topology.rd,
+        "degree_mmd": validation_topology.degree_mmd,
+        "clustering_mmd": validation_topology.clustering_mmd,
+        "spectral_mmd": validation_topology.spectral_mmd,
         "prevalence": float(np.mean(data.val_labels)),
         **dispersion_summary,
         **e2e_degree_decorrelation_telemetry(endpoint_degree, full_np - f_np),
     }
-    if has_node_factor:
-        # Descriptive per-component AUROC/AUPRC (B1 plan): at init `r`/`b_a`/
-        # `b_b` are exactly 0 (`NodeFactorBottleneck` zero-init), so every
-        # component equals `full`'s metrics until the factor path trains.
-        # `select_e2e_checkpoint` reads only `metrics.auroc`/`.auprc`
-        # (unchanged above), never these -- purely additional telemetry.
-        labels_int = data.val_labels.astype(np.int64)
-        for suffix, column in (("content", 12), ("content_bias", 13), ("content_factor", 14)):
-            component_probs = 1.0 / (1.0 + np.exp(-ordered[:, column]))
-            component_metrics = compute_edge_metrics(labels_int, component_probs)
-            fidelity[f"auroc_{suffix}"] = component_metrics.auroc
-            fidelity[f"auprc_{suffix}"] = component_metrics.auprc
     active_metrics = compute_edge_metrics(data.val_labels.astype(np.int64), probs)
     gather_metrics_seconds = time.monotonic() - gather_metrics_started
     return _ValidationResult(
@@ -3969,27 +3644,6 @@ def _e2e_arm_name(model: EgoStitchModel) -> E2EArmName:
 
 
 def _e2e_arm_name_from_config(config: E2EConfig) -> E2EArmName:
-    if config.classifier.node_factor_dim > 0:
-        # A node-factor model is always a KD arm (B1 plan): without this
-        # check every one of the four KD configs -- all `generator.name:
-        # "null"` -- would collide on `"null_generator"` in the (arm, seed)
-        # test-access ledger. `DistillConfig.__post_init__` already refuses
-        # more than one weight group nonzero at once, so at most one branch
-        # below is ever reachable for a valid config.
-        distill = config.distill
-        if distill.w_label > 0.0:
-            return "kd_control"
-        if distill.w_logit > 0.0:
-            return "kd_d1"
-        if distill.w_rank > 0.0 and distill.w_dist > 0.0:
-            return "kd_d2"
-        if distill.w_gram > 0.0:
-            return "kd_d3"
-        raise ValueError(
-            "classifier.node_factor_dim > 0 requires exactly one nonzero distill arm "
-            "group: distill.w_label (kd_control), distill.w_logit (kd_d1), "
-            "distill.w_rank and distill.w_dist together (kd_d2), or distill.w_gram (kd_d3)"
-        )
     if config.generator.name == "null":
         return "null_generator"
     if config.generator.name == "oracle_struct":
@@ -4122,7 +3776,6 @@ def _e2e_training_payload(
     return {
         "node": _to_device(batch.node, device),
         "edge": _to_device(batch.edge, device),
-        "kd": _to_device(batch.kd, device) if batch.kd is not None else None,
         "edge_rows_global": batch.edge_rows_global,
         "edge_active": phase.edge_active,
         "recon_factors": e2e_recon_component_factors(
@@ -4264,12 +3917,6 @@ def _e2e_family_probe(
         families.insert(0, "edge")
     if phase.real_ssl_scale > 0.0:
         families.extend(("real", "ssl"))
-    # B1 KD plan: "kd" is expected exactly when this arm's batch actually
-    # carries a KD payload (a nonzero-distill-weight arm) and the edge phase
-    # is active -- the same gate `_CompositeStep.forward` uses for `L_edge`.
-    kd_family_active = phase.edge_active and payload.get("kd") is not None
-    if kd_family_active:
-        families.append("kd")
     # A "recon"/"real"/"ssl" node-stream family is only a meaningful concept
     # for `EgoStitchImagineGenerator`: the oracle-scaffold and null generators
     # are both parameter-free/absent and return `{}` from `auxiliary_losses`,
@@ -4280,8 +3927,7 @@ def _e2e_family_probe(
     # entry for an arm that never actually trains a generator.
     is_imagine_generator = isinstance(inner.generator, EgoStitchImagineGenerator)
     expected: dict[str, set[str]] = {
-        "classifier": ({"edge"} if phase.edge_active else set())
-        | ({"kd"} if kd_family_active else set()),
+        "classifier": {"edge"} if phase.edge_active else set(),
         "generator": (
             {"recon"} | ({"real", "ssl"} if phase.real_ssl_scale > 0.0 else set())
             if is_imagine_generator
@@ -4719,7 +4365,6 @@ def _train_e2e_stability_loop(
         world_size=world,
         generator_supervision=isinstance(model.generator, EgoStitchImagineGenerator),
         relational_supervision=(model.encoder is not None and model.encoder.rel_head is not None),
-        distill=model.cfg.distill,
     )
 
     validation_events_path = cfg.output_dir / V_HOLD_VALIDATION_EVENTS_FILENAME
@@ -5257,7 +4902,11 @@ def _train_e2e_stability_loop(
                 "brier": metrics.brier,
                 "prevalence": fidelity["prevalence"],
                 "active_logit_std": fidelity["active_logit_std"],
+                "gs": fidelity["gs"],
+                "rd": fidelity["rd"],
+                "degree_mmd": fidelity["degree_mmd"],
                 "clustering_mmd": fidelity["clustering_mmd"],
+                "spectral_mmd": fidelity["spectral_mmd"],
                 "f_logit_std": fidelity["f_logit_std"],
                 "f_logit_auprc": fidelity["f_logit_auprc"],
                 "h_pairwise_cosine_mean": fidelity["h_pairwise_cosine_mean"],
@@ -5350,7 +4999,11 @@ def _train_e2e_stability_loop(
                 auprc=metrics.auprc,
                 prevalence=fidelity["prevalence"],
                 active_logit_std=fidelity["active_logit_std"],
+                gs=fidelity["gs"],
+                rd=fidelity["rd"],
+                degree_mmd=fidelity["degree_mmd"],
                 clustering_mmd=fidelity["clustering_mmd"],
+                spectral_mmd=fidelity["spectral_mmd"],
                 brier=metrics.brier,
                 warm_reference_std=warm_reference_std,
                 warm_reference_auprc=warm_reference_auprc,
@@ -5435,12 +5088,7 @@ def _train_e2e_stability_loop(
             best_state = last_state
             best_metrics = last_metrics
         else:
-            selected = select_e2e_checkpoint(
-                records,
-                arm,
-                auprc_tolerance=training.selection_auprc_tolerance,
-                mmd_tolerance=training.selection_mmd_tolerance,
-            )
+            selected = select_e2e_checkpoint(records, arm)
             if selected is not None:
                 selected_epoch_local = selected.epoch
                 best_state = cast(

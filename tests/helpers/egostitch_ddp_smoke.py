@@ -176,7 +176,6 @@ def _toy_config(output_dir: Path, pack_dir: Path) -> te.EgoConfig:
             gradient_imbalance_ratio=50.0,
             gradient_imbalance_steps=200,
             probe_s1_abs_mean_max=1000.0,
-            selection_auprc_tolerance=0.02,
             topk_fraction=0.01,
         ),
         eval=EvalConfig(patience=2, eval_every=1),

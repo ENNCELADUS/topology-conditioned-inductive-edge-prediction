@@ -4,11 +4,10 @@ Distillation cannot add per-pair information (`(x_u, x_v)` is still the
 strict task input); this module installs a topology-supervised *structured
 inductive bias* instead -- a low-rank per-node factorization whose row
 ordering, activity biases, and pair-embedding geometry are shaped by teacher
-targets in `src/distill/` (Wave 2+). It is additive on the fused pair logit
-and lives entirely on the content path: built by `B0V31PairClassifier`
-whenever `ClassifierConfig.node_factor_dim > 0`, independent of the topo
-conditioning ladder (`CONDITIONING_MODES`) and never frozen by
-`freeze_unreachable_conditioning`.
+targets in `src/distill/`. It is additive on the fused pair logit and lives
+entirely on the content path: built by the B1 student `V3_1` (`b0_v31.py`)
+whenever ``model_config["node_factor_dim"] > 0``, independent of every
+conditioning pathway.
 
 ``diag_w`` is zero-initialized and there is no scalar gate. A scalar gate
 ``gamma`` at ``0`` is a saddle: ``E[dL/dgamma] ~= 0`` under random ``z``, so

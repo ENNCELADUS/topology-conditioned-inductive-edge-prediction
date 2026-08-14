@@ -1,6 +1,6 @@
 # Experiment Protocol: Topology-Conditioned Inductive Edge Prediction
 
-**Status (2026-08-12):** current forward protocol and selected evidence. Method
+**Status (2026-08-13):** current forward protocol and selected evidence. Method
 selection remains open. Historical gates are archived by reference rather than repeated.
 
 ## 1. Locked task contract
@@ -93,29 +93,29 @@ therefore violates the task contract.
 |---|---|---:|---:|---:|---:|---:|
 | Pairwise baseline | Frozen comparator | 0.7067 | 0.7315 | 0.6083 | 0.3987 | 0.3020 |
 | Token-XAttn Oracle | True-topology diagnostic | 0.8524 | 0.8698 | 0.7713 | 0.7599 | 0.5451 |
-| Full-Ego Pooled Oracle | Running diagnostic | — | — | — | — | — |
+| Full-Ego Pooled Oracle | True-topology diagnostic | 0.9356 | 0.9396 | 0.8521 | 0.8451 | 0.7071 |
 
 | Model | Global GS | Global RD | BFS GS | BFS RD | Degree | Clustering | Spectral |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | Pairwise baseline | 0.1365 | 0.9977 | 0.3896 | 0.4223 | 13.08 | 11.93 | 18.09 |
 | Token-XAttn Oracle | 0.3076 | 1.0000 | 0.4886 | 0.7542 | 5.825 | 5.288 | 9.302 |
-| Full-Ego Pooled Oracle | — | — | — | — | — | — | — |
+| Full-Ego Pooled Oracle | 0.4635 | 1.0000 | 0.5904 | 0.9027 | 5.434 | 5.176 | 11.668 |
 
-**Finding.** Strong pairwise performance and matched global density do not imply a
-plausible assembled graph. True relational topology supplies substantial edge and graph
-headroom. This held-out-protocol Oracle is diagnostic evidence, not a formal model
-result or a fair baseline.
+**Finding.** Full-Ego Pooled Oracle gives the strongest edge discrimination and GS while
+matching global density, but its MMD ratios remain far above the real-vs-real floor and
+its spectral ratio is worse than Token-XAttn Oracle. Hidden relational topology supplies
+substantial headroom, but neither Oracle is a formal result or a fair baseline.
 
 Exact identities: the baseline is frozen V3.1 checkpoint `e092537d8cf1e208` from
 `outputs/deliverables/b0_v31_breadth_first_20260711`. **Token-XAttn Oracle** is
 checkpoint `48f686df9029cf63`: a fixed oracle scaffold encoded by GRIT and consumed by
-token cross-attention. **Full-Ego Pooled Oracle** is the running full-neighborhood
-diagnostic: variable-length full ego topology is pooled inside GRIT and passed through
-a pooled adapter. The table uses the current in-repo held-out evaluator and is distinct
-from the archived G1 B0 and G3 `oracle_topo` / `oracle_blend` rows. Headline table,
-report, and operating points:
-[results/results.html](results/results.html) and
-[diagnostic_test_report.json](../outputs/egostitch_e2e_stage1_v3/oracle_grit_xattn_tokens_true_oracle_diagnostic/diagnostic_test_report.json).
+token cross-attention. **Full-Ego Pooled Oracle** is checkpoint `926dab5c82beca55`
+(epoch 2): variable-length full ego topology is pooled inside GRIT and passed through a
+pooled adapter. Its completed optimized evaluation uses threshold 0.5 for classification
+and a 30,128-edge global density-controlled topology assembly. The table uses the current
+in-repo held-out evaluator and is distinct from archived G1/G3 rows. Existing baseline /
+Token-XAttn page and report: [results/results.html](results/results.html) and
+[diagnostic_test_report.json](../outputs/egostitch_e2e_stage1_v3/oracle_grit_xattn_tokens_true_oracle_diagnostic/diagnostic_test_report.json). Full-Ego report: `outputs/full_ego_oracle_scoring_optimization_20260813/protocol/diagnostic_test_report.json` on the H20 checkout.
 
 ### 3.1 Archived completed evidence
 
