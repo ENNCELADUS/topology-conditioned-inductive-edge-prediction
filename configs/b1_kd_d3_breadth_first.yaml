@@ -68,13 +68,13 @@ runtime:
   max_pairs_per_rank: 4096
   memory_limit_gib: 85.0
   # Stage budgets must sum exactly to total_budget_seconds (train_b0.py:722).
-  # Measured ~42 s/epoch (train+eval) on 4x H20, so 25 epochs is ~1.1 ks;
-  # train_eval is set to ~3x that. It is a hard subprocess timeout, so it is
-  # sized generously rather than tightly.
-  total_budget_seconds: 6780
+  # Measured ~814 s/epoch on 4x H20 under the V_val protocol (~42 s train +
+  # ~772 s two-pass validation over the 3.26M-row internal universe), so 25
+  # epochs is ~20.4 ks; train_eval carries ~47% margin over that hard timeout.
+  total_budget_seconds: 30660
   pack_budget_seconds: 300
   setup_probe_budget_seconds: 300
-  train_eval_budget_seconds: 6000
+  train_eval_budget_seconds: 30000
   artifact_budget_seconds: 60
   # Post-publish held-out test protocol (val/test/candidate scoring + graph
   # assembly); not part of the pre-publish stage_total == total_budget_seconds

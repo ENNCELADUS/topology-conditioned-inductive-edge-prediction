@@ -48,7 +48,7 @@ data:
 optim:
   lr: 1.0e-4
   weight_decay: 0.01
-  epochs: 30
+  epochs: 12
   warmup_steps: 500
   grad_clip: 1.0
   gradient_accumulation_steps: 8
