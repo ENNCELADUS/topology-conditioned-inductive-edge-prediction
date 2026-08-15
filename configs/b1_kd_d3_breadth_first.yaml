@@ -86,6 +86,6 @@ seed: 0
 output_dir: outputs/b1_stage/kd_d3
 mixed_precision: "bf16" # pinned for the H20 E2 target
 distill:
-  targets_path: outputs/distill/kd_targets_breadth_first_seed0
+  targets_path: outputs/distill/kd_targets_breadth_first_seed0_v2
   w_gram: 1.0                      # pair-space cosine-Gram matching (Graph2Feat/CAZI)
   anchors_per_step: 2

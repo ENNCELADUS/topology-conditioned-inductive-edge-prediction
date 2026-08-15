@@ -86,7 +86,7 @@ seed: 0
 output_dir: outputs/b1_stage/kd_d2
 mixed_precision: "bf16" # pinned for the H20 E2 target
 distill:
-  targets_path: outputs/distill/kd_targets_breadth_first_seed0
+  targets_path: outputs/distill/kd_targets_breadth_first_seed0_v2
   w_rank: 1.0                      # LLP_R margin-rank over per-anchor teacher rows
   w_dist: 1.0                      # LLP_D temperature-KL over per-anchor teacher rows
   temperature: 1.0                 # LLP reference pins T=1 (see src/distill/losses.py)
