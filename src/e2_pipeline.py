@@ -369,104 +369,29 @@ def _pipeline_rerun_command(args: PipelineArgs) -> str:
     return " ".join(parts)
 
 
-CommandRunner = Callable[[Sequence[str], float | None], subprocess.CompletedProcess[str]]
-TrainingCommandRunner = Callable[
-    [Sequence[str], float | None, Path], subprocess.CompletedProcess[str]
-]
-StageRunner = Callable[[Callable[[], None], float | None], None]
+CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+TrainingCommandRunner = Callable[[Sequence[str], Path], subprocess.CompletedProcess[str]]
+StageRunner = Callable[[Callable[[], None]], None]
 
 
-# Set only while a `run_stage` call is supervising: the directory nested
-# `run_command` invocations register their own (escaping) process group
-# under, so the supervising stage's timeout can reap them too. `None`
-# outside a supervised stage (e.g. the train stage's own top-level command).
-_nested_process_group_registry: Path | None = None
-
-
-def _register_nested_process_group(registry: Path | None, pgid: int) -> Path | None:
-    """Record `pgid` under `registry` for a supervising stage timeout to reap.
-
-    A no-op (returns ``None``) when `registry` is ``None`` -- i.e. this
-    ``run_command`` call is not nested inside a `run_stage` supervision.
-    """
-    if registry is None:
-        return None
-    entry = registry / f"{pgid}.pgid"
-    with suppress(OSError):
-        entry.write_text(str(pgid))
-    return entry
-
-
-def _unregister_nested_process_group(entry: Path | None) -> None:
-    """Remove a registry entry written by `_register_nested_process_group`."""
-    if entry is not None:
-        entry.unlink(missing_ok=True)
-
-
-def _kill_registered_process_groups(registry: Path) -> None:
-    """Best-effort ``SIGKILL`` every process group recorded under `registry`.
-
-    Tolerates a group that already exited (its file having since been removed
-    by `_unregister_nested_process_group`, or the pid already reaped) -- this
-    runs racing a stage's own subprocesses as they finish, so both the read
-    and the signal are advisory rather than guaranteed.
-    """
-    for entry in registry.glob("*.pgid"):
-        with suppress(OSError, ValueError):
-            pgid = int(entry.read_text())
-            with suppress(ProcessLookupError):
-                os.killpg(pgid, signal.SIGKILL)
-
-
-def run_command(
-    command: Sequence[str], timeout_seconds: float | None
-) -> subprocess.CompletedProcess[str]:
-    """Run ``command`` in a killable process group on the fixed POSIX/Linux target.
-
-    ``start_new_session=True`` gives this call its own killable group for its
-    OWN timeout below. That also means the group is a *different* session
-    from any supervising `run_stage` call's forked child, so it would
-    otherwise survive that stage's own deadline entirely. While the
-    subprocess runs, this registers its group under the active
-    `_nested_process_group_registry` (set by `run_stage`, ``None`` outside
-    one) so a stage-level timeout can kill it too -- see `run_stage`.
+def run_command(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    """Run ``command`` to completion on the fixed POSIX/Linux target.
 
     Args:
         command: The argv list to execute.
-        timeout_seconds: Hard wall-clock timeout; raises
-            ``subprocess.TimeoutExpired`` if exceeded. ``None`` waits
-            indefinitely, for work whose duration is data-dependent rather
-            than boundable up front (the held-out test stage's scoring).
 
     Returns:
         The ``CompletedProcess`` (``check=False``: callers inspect ``.returncode``).
     """
-    process = subprocess.Popen(
+    return subprocess.run(
         list(command),
-        start_new_session=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        check=False,
+        capture_output=True,
         text=True,
     )
-    registry_entry = _register_nested_process_group(_nested_process_group_registry, process.pid)
-    try:
-        try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired as error:
-            with suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-            stdout, stderr = process.communicate()
-            raise subprocess.TimeoutExpired(
-                error.cmd, error.timeout, output=stdout, stderr=stderr
-            ) from None
-    finally:
-        _unregister_nested_process_group(registry_entry)
-    return subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
 
 
-def run_logged_command(
-    command: Sequence[str], timeout_seconds: float | None, log_path: Path
-) -> subprocess.CompletedProcess[str]:
+def run_logged_command(command: Sequence[str], log_path: Path) -> subprocess.CompletedProcess[str]:
     """Run a process group while the parent durably streams merged output to disk."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_handle = log_path.open("ab", buffering=0)
@@ -482,7 +407,6 @@ def run_logged_command(
     except BaseException:
         log_handle.close()
         raise
-    registry_entry = _register_nested_process_group(_nested_process_group_registry, process.pid)
     output_pipe = cast(BufferedReader, process.stdout)
     reader_error: list[BaseException] = []
 
@@ -495,14 +419,9 @@ def run_logged_command(
 
     reader = threading.Thread(target=read_output, daemon=True)
     reader.start()
-    timed_out = False
-    deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
     try:
         while process.poll() is None:
             if reader_error:
-                break
-            if deadline is not None and time.monotonic() >= deadline:
-                timed_out = True
                 break
             time.sleep(0.05)
         if process.poll() is None:
@@ -528,12 +447,8 @@ def run_logged_command(
         if reader.is_alive():
             reader_error.append(TimeoutError("training output pipe did not close"))
         log_handle.close()
-        _unregister_nested_process_group(registry_entry)
     if reader_error:
         raise OSError(f"failed to persist training output: {reader_error[0]}")
-    if timed_out:
-        assert timeout_seconds is not None
-        raise subprocess.TimeoutExpired(list(command), timeout_seconds)
     return subprocess.CompletedProcess(list(command), process.returncode, "", "")
 
 
@@ -551,8 +466,7 @@ def _read_log_tail(path: Path, *, max_bytes: int = 16384, max_lines: int = 50) -
 
 
 def _run_stage_child(operation: Callable[[], None], sender: Connection) -> None:
-    """Execute a Python stage in its own session and report its exception."""
-    os.setsid()
+    """Execute a Python stage and report its exception."""
     try:
         operation()
     except BaseException as error:
@@ -563,55 +477,25 @@ def _run_stage_child(operation: Callable[[], None], sender: Connection) -> None:
         sender.close()
 
 
-def run_stage(operation: Callable[[], None], timeout_seconds: float | None) -> None:
-    """Run a Python stage under a killable POSIX/Linux process-group deadline.
-
-    Before forking, opens a nested-process-group registry directory (see
-    `run_command`) and installs it as the active
-    `_nested_process_group_registry`. The forked child inherits that value at
-    fork time, so any `run_command` call `operation` makes -- directly, or
-    several layers of ``command_runner`` indirection down, e.g. the test
-    stage's per-GPU ``score_sharded`` fan-out -- registers its own (escaping,
-    ``start_new_session=True``) process group there. On a timeout this kills
-    the forked stage's own group *and* every group recorded in the registry,
-    so a stage deadline never leaves one of `operation`'s subprocesses running
-    just because it had its own session.
-    """
-    global _nested_process_group_registry
+def run_stage(operation: Callable[[], None]) -> None:
+    """Run a Python stage in a child process and propagate its result."""
     context = multiprocessing.get_context("fork")
     receiver, sender = context.Pipe(duplex=False)
-    registry_dir = Path(tempfile.mkdtemp(prefix="e2-stage-pgroups-"))
-    previous_registry = _nested_process_group_registry
-    _nested_process_group_registry = registry_dir
+    process = context.Process(target=_run_stage_child, args=(operation, sender))
+    process.start()
+    sender.close()
+    result: tuple[bool, str] | None = None
     try:
-        process = context.Process(target=_run_stage_child, args=(operation, sender))
-        process.start()
-        sender.close()
-        process.join(timeout_seconds)
-        if process.is_alive():
-            # Only reachable with a deadline: `join(None)` returns solely when
-            # the child has exited, so an unbounded stage is never alive here.
-            assert timeout_seconds is not None
-            if process.pid is None:  # pragma: no cover - start() above guarantees a PID
-                raise RuntimeError("supervised stage has no process ID")
-            with suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-            _kill_registered_process_groups(registry_dir)
-            process.join()
-            receiver.close()
-            raise subprocess.TimeoutExpired(cmd="python stage", timeout=timeout_seconds)
-        if not receiver.poll():
-            receiver.close()
-            raise RuntimeError(
-                f"supervised stage exited with code {process.exitcode} without a result"
-            )
-        succeeded, message = cast(tuple[bool, str], receiver.recv())
-        receiver.close()
-        if not succeeded:
-            raise RuntimeError(message)
+        with suppress(EOFError):
+            result = cast(tuple[bool, str], receiver.recv())
     finally:
-        _nested_process_group_registry = previous_registry
-        shutil.rmtree(registry_dir, ignore_errors=True)
+        receiver.close()
+        process.join()
+    if result is None:
+        raise RuntimeError(f"supervised stage exited with code {process.exitcode} without a result")
+    succeeded, message = result
+    if not succeeded:
+        raise RuntimeError(message)
 
 
 def _resolve_accelerate_bin() -> Path:
@@ -972,7 +856,7 @@ def _run_pipeline_unlocked(
 
     Sub-stages, ``pack -> train -> publish -> test``: (1) load and validate the
     config/runtime; (2) record whether the pack path was initially absent;
-    (3) build or strictly validate the pack within the pack budget; (4) launch
+    (3) build or strictly validate the pack; (4) launch
     one clean ``train`` process group at ``runtime.token_budget``; (5) validate
     the worker's runtime profile and every staged artifact against
     ``cfg.optim.epochs``; (6) merge stage/profile data into ``profile.json`` and write
@@ -982,7 +866,7 @@ def _run_pipeline_unlocked(
     validated attempt artifact tree into the canonical output directory with per-file
     atomic replaces and full rollback; and (8), only once publication has
     committed, run the published ``best.pt`` through the held-out test
-    protocol (no deadline: see the test stage), recording its duration into
+    protocol, recording its duration into
     ``profile.json``'s ``stage_seconds["test"]`` and writing ``test_report.json``
     then ``test_complete.json`` last (``diagnostic_*`` names under
     ``run_kind == "diagnostic"``). Immediately before the test stage starts, any
@@ -1002,8 +886,8 @@ def _run_pipeline_unlocked(
 
     Every scoring subprocess call goes through ``command_runner`` with
     ``check=False``. Training goes through ``training_command_runner`` so worker
-    output is durably streamed into the attempt's ``train.log`` under the
-    configured timeout. Every failure after training starts stops immediately;
+    output is durably streamed into the attempt's ``train.log``. Every failure
+    after training starts stops immediately;
     nothing is published until the whole attempt artifact tree has been
     validated.
 
@@ -1014,7 +898,7 @@ def _run_pipeline_unlocked(
         training_command_runner: Injectable training subprocess seam; production
             uses a durable merged-output ``train.log`` writer.
         stage_runner: Injectable supervised Python-stage seam for pack,
-            artifact, and test-stage deadlines.
+            artifact, and test execution.
 
     Returns:
         0 on success, 2 on failure (see the stage in ``failure.json``).
@@ -1236,7 +1120,7 @@ def _run_pipeline_unlocked(
 
     stage_seconds: dict[str, float] = {}
 
-    # --- pack: build (cold) or strictly validate (warm) within the pack budget ---
+    # --- pack: build (cold) or strictly validate (warm) ---
     required_pack_paths = getattr(worker, "required_pack_paths", None)
     try:
         pack_paths = (
@@ -1268,17 +1152,7 @@ def _run_pipeline_unlocked(
         _write_json_atomic(pack_validation_path, cast(dict[str, object], payload))
 
     try:
-        stage_runner(
-            pack_operation,
-            None if diagnostic_run else float(runtime.pack_budget_seconds),
-        )
-    except subprocess.TimeoutExpired:
-        cleanup_owned_pack_temps()
-        return fail(
-            stage="pack",
-            message=f"feature pack stage timed out after {runtime.pack_budget_seconds}s",
-            extra={"timeout_seconds": runtime.pack_budget_seconds},
-        )
+        stage_runner(pack_operation)
     except Exception as error:
         cleanup_owned_pack_temps()
         return fail(stage="pack", message=f"feature pack stage failed: {error}")
@@ -1332,18 +1206,7 @@ def _run_pipeline_unlocked(
         _write_json_atomic(profile_path, evidence_profile)
         return fail(stage="train", message=f"training worker launch setup failed: {error}")
     try:
-        completed = training_command_runner(
-            command,
-            None if diagnostic_run else float(runtime.train_eval_budget_seconds),
-            train_log_path,
-        )
-    except subprocess.TimeoutExpired:
-        _write_json_atomic(profile_path, evidence_profile)
-        return fail(
-            stage="train",
-            message=f"training timed out after {runtime.train_eval_budget_seconds}s",
-            extra={"timeout_seconds": runtime.train_eval_budget_seconds},
-        )
+        completed = training_command_runner(command, train_log_path)
     except Exception as error:
         _write_json_atomic(profile_path, evidence_profile)
         return fail(stage="train", message=f"training worker launch failed: {error}")
@@ -1448,17 +1311,7 @@ def _run_pipeline_unlocked(
         _write_json_atomic(attempt_dir / "artifact_manifest.json", manifest)
 
     try:
-        stage_runner(
-            artifact_operation,
-            None if diagnostic_run else float(runtime.artifact_budget_seconds),
-        )
-    except subprocess.TimeoutExpired:
-        _write_json_atomic(profile_path, final_profile)
-        return fail(
-            stage="artifacts",
-            message=f"artifact stage timed out after {runtime.artifact_budget_seconds}s",
-            extra={"timeout_seconds": runtime.artifact_budget_seconds},
-        )
+        stage_runner(artifact_operation)
     except Exception as error:
         _write_json_atomic(profile_path, final_profile)
         return fail(stage="artifacts", message=f"artifact merge/manifest failed: {error}")
@@ -1487,26 +1340,6 @@ def _run_pipeline_unlocked(
         return fail(stage="publication", message=f"canonical publication failed: {error}")
     (output_dir / "failure.json").unlink(missing_ok=True)
     total_elapsed = time.monotonic() - pipeline_started
-    b0_formal_cold = (
-        not debug_run
-        and cold_cache
-        and cfg.model.family in ("v3_1", "f0_mlp")
-        and args.run_kind is None
-    )
-    if b0_formal_cold and total_elapsed > runtime.total_budget_seconds:
-        _rollback_publication(output_dir, backup_dir, published, restore_dir=publication_dir)
-        shutil.rmtree(publication_dir, ignore_errors=True)
-        return fail(
-            stage="total_budget",
-            message=(
-                f"cold formal pipeline elapsed {total_elapsed:.1f}s exceeds "
-                f"{runtime.total_budget_seconds}s"
-            ),
-            extra={
-                "elapsed_seconds": total_elapsed,
-                "limit_seconds": runtime.total_budget_seconds,
-            },
-        )
     try:
         completion_name = (
             "diagnostic_complete.json" if args.run_kind == "diagnostic" else "complete.json"
@@ -1543,11 +1376,6 @@ def _run_pipeline_unlocked(
             score_args,
             gpu_count=runtime.world_size,
             python_bin=Path(sys.executable),
-            # No deadline. Scoring cost is set by the candidate universe
-            # (~2.0M pairs, ~32x the test universe), so any fixed budget is a
-            # guess that discards hours of finished work when it is wrong --
-            # which is exactly how the first real run died.
-            timeout_seconds=None,
             command_runner=command_runner,
         )
 
@@ -1620,7 +1448,7 @@ def _run_pipeline_unlocked(
         _clear_stale_test_artifacts(
             output_dir, report_filename=report_filename, test_complete_name=test_complete_name
         )
-        stage_runner(test_operation, None)
+        stage_runner(test_operation)
     except Exception as error:
         message = f"held-out test stage failed: {error}"
         if "requires --rescore-reason" in str(error):

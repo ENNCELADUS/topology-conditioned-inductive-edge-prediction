@@ -20,10 +20,9 @@ Per the spec freeze rule, the code-facing items landed through
 This implementation status authorizes no execution: the v4 registration remains
 `DRAFT`. §7 records the required documentation edits.
 
-Two delete-list items are sanctioned retentions rather than incomplete cleanup:
+One delete-list item is a sanctioned retention rather than incomplete cleanup:
 the non-publishing `probe`/`epoch-probe` dispatch used to measure
-`feature_stats_sha256`, and `runtime.total_budget_seconds` as the invariant sum of
-the remaining stage budgets. The authoritative rationale is recorded in
+`feature_stats_sha256`. The authoritative rationale is recorded in
 `docs/05-egostitch-spec.md` §12 (2026-07-29, second entry); §4 below reflects it.
 
 **Review trail.** r1 (2026-07-29) drafted a ~2,000-node BFS-ball Stage 1 with a
@@ -301,13 +300,10 @@ before the held-out path is read.
 and `_run_init_probe`; `select_probe_result`,
 `conservative_e2e_epoch_seconds`, and `project_total_seconds`.
 
-Two load-bearing pieces are retained under the §12 change-log exception. The
+One load-bearing piece is retained under the §12 change-log exception. The
 `probe`/`epoch-probe` entries in `_PROBE_DISPATCH_MODES` and
 `--ddp-mode epoch-probe` survive only as a non-publishing measurement dispatch for
-the pre-run `feature_stats_sha256`; they are not pipeline sub-stages. Likewise,
-`runtime.total_budget_seconds` remains the declared wall-clock total whose value
-must equal the sum of the remaining stage budgets; the projection sub-stage that
-formerly consumed part of it is deleted.
+the pre-run `feature_stats_sha256`; they are not pipeline sub-stages.
 
 The budget probe goes because it did not prevent the OOM it exists to prevent —
 the rev-3.1 OOM was `_e2e_family_probe` double-buffering autograd graphs, a path
@@ -349,7 +345,7 @@ non-main ranks, so a rank-0-only raise is a DDP hang. Placement is inside
 
 Step 0 also costs a full validation pass over C(512,2) = 130,816 pairs on every
 run, at the same time as §4 deletes the projection stage that used to account for
-runtime. Budget it explicitly.
+runtime. Record that cost as operational telemetry.
 
 ## 5. Model changes landing with this
 

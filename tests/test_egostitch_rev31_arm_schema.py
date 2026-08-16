@@ -49,17 +49,13 @@ WAVE1_ORACLE_CONFIGS = {
 FULL_EGO_ORACLE_CONFIG = (
     REPO_ROOT / "configs/egostitch_e2e_v3_full_ego_oracle_grit_pooled_breadth_first.yaml"
 )
-FULL_EGO_TEACHER_CONFIG = (
-    REPO_ROOT / "configs/egostitch_e2e_v3_full_ego_teacher_breadth_first.yaml"
-)
+FULL_EGO_TEACHER_CONFIG = REPO_ROOT / "configs/egostitch_e2e_v3_full_ego_teacher_breadth_first.yaml"
 
 
 def test_wave1_oracle_runtime_and_supervision_contracts() -> None:
     for name, path in WAVE1_ORACLE_CONFIGS.items():
         payload = yaml.safe_load(path.read_text(encoding="utf-8"))
         assert payload["training"]["phase_a_fraction"] == 0.0, name
-        assert payload["runtime"]["train_eval_budget_seconds"] == 43_200, name
-        assert payload["runtime"]["total_budget_seconds"] == 44_520, name
         te.load_config(path)
         expected_w_rel = 0.25 if name == "oracle_ste_ref" else 0.0
         assert payload["model"]["config"]["encoder"].get("w_rel", 0.25) == expected_w_rel, name

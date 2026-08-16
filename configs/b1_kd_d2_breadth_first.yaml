@@ -1,6 +1,6 @@
 # B1 KD-D2 (primary) arm on the simple B0 protocol: V3.1 student + zero-init
 # NodeFactorBottleneck (node_factor_dim: 64) + the shared KD anchor-context
-# stream from outputs/distill/kd_targets_breadth_first_seed0
+# stream from outputs/distill/kd_targets_breadth_first_seed0_v2
 # (python -m src.distill.teacher_targets). Arms differ ONLY in the distill
 # weights below (variable-control protocol); run one arm at a time via
 # hpc/run.sh train <this config>.
@@ -67,23 +67,10 @@ runtime:
   token_budget: 524288
   max_pairs_per_rank: 4096
   memory_limit_gib: 85.0
-  # Stage budgets must sum exactly to total_budget_seconds (train_b0.py:722).
-  # Measured ~814 s/epoch on 4x H20 under the V_val protocol (~42 s train +
-  # ~772 s two-pass validation over the 3.26M-row internal universe), so 25
-  # epochs is ~20.4 ks; train_eval carries ~47% margin over that hard timeout.
-  total_budget_seconds: 30660
-  pack_budget_seconds: 300
-  setup_probe_budget_seconds: 300
-  train_eval_budget_seconds: 30000
-  artifact_budget_seconds: 60
-  # Post-publish held-out test protocol (val/test/candidate scoring + graph
-  # assembly); not part of the pre-publish stage_total == total_budget_seconds
-  # invariant above.
-  reserve_seconds: 120
   probe_warmup_steps: 10
   probe_timed_steps: 30
 seed: 0
-output_dir: outputs/b1_stage/kd_d2
+output_dir: outputs/b1_stage_v2/kd_d2
 mixed_precision: "bf16" # pinned for the H20 E2 target
 distill:
   targets_path: outputs/distill/kd_targets_breadth_first_seed0_v2

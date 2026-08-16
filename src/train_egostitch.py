@@ -6,7 +6,7 @@ and Task-4 checkpoint payload as ``src.train_b0``, over the EgoStitch two-stream
 composite step (node stream -> L_recon/L_ssl/L_real; edge stream -> L_edge; the
 joint-pair stream joins in Stage 3). ``--token-budget-per-rank`` is
 reinterpreted for this family as the per-rank node-stream batch size ``B_n``
-(spec Sec 13.13); the runtime budget is config-driven, not the E2 60-minute pin.
+(spec Sec 13.13).
 
 The worker executes the plan-bound formal schedule on the training universe and
 validates on ``V_val``, a full-density node region carved out of
@@ -222,10 +222,6 @@ class EgoRuntimeConfig:
     token_budget: int
     max_pairs_per_rank: int
     memory_limit_gib: float
-    total_budget_seconds: int
-    pack_budget_seconds: int
-    train_eval_budget_seconds: int
-    artifact_budget_seconds: int
 
 
 @dataclass(frozen=True)
@@ -487,10 +483,6 @@ def load_config(path: Path) -> EgoConfig:
             "token_budget",
             "max_pairs_per_rank",
             "memory_limit_gib",
-            "total_budget_seconds",
-            "pack_budget_seconds",
-            "train_eval_budget_seconds",
-            "artifact_budget_seconds",
         )
         _check_no_unknown_keys(runtime_raw, runtime_keys, "runtime")
         world_size_raw = _require(runtime_raw, "world_size", "runtime.")
@@ -521,38 +513,11 @@ def load_config(path: Path) -> EgoConfig:
             memory_limit_gib=_as_float(
                 _require(runtime_raw, "memory_limit_gib", "runtime."), "runtime.memory_limit_gib"
             ),
-            total_budget_seconds=_as_int(
-                _require(runtime_raw, "total_budget_seconds", "runtime."),
-                "runtime.total_budget_seconds",
-            ),
-            pack_budget_seconds=_as_int(
-                _require(runtime_raw, "pack_budget_seconds", "runtime."),
-                "runtime.pack_budget_seconds",
-            ),
-            train_eval_budget_seconds=_as_int(
-                _require(runtime_raw, "train_eval_budget_seconds", "runtime."),
-                "runtime.train_eval_budget_seconds",
-            ),
-            artifact_budget_seconds=_as_int(
-                _require(runtime_raw, "artifact_budget_seconds", "runtime."),
-                "runtime.artifact_budget_seconds",
-            ),
         )
         if runtime.token_budget <= 0:
             raise ValueError(
                 "runtime.token_budget must be a positive node-batch (B_n) size for this family"
             )
-        stage_total = (
-            runtime.pack_budget_seconds
-            + runtime.train_eval_budget_seconds
-            + runtime.artifact_budget_seconds
-        )
-        if stage_total != runtime.total_budget_seconds:
-            raise ValueError(
-                f"runtime stage budgets must sum to {runtime.total_budget_seconds}; "
-                f"got {stage_total}"
-            )
-
     training: EgoStitchTrainingConfig | None = None
     if raw.get("training") is not None:
         if family != _EGOSTITCH_E2E_FAMILY:

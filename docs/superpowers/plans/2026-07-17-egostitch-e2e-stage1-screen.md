@@ -267,7 +267,7 @@ git commit -m "docs(spec): rewrite §5/§13 to the rev-3.0 e2e head; within-chec
 
 **Interfaces:**
 - Consumes: `configs/egostitch_stage1_breadth_first.yaml` (base recipe — data,
-  optimizer, diagnostics, runtime budget machinery all carry over).
+  optimizer and diagnostics carry over).
 - Produces: configs consumed by `hpc/run.sh train … --worker-module
   src.train_egostitch`; keys `model.family: egostitch_e2e`,
   `model.config.{ste_layers,ste_dim,xattn_heads,n_inj,p_topo,p_cont,
@@ -342,12 +342,6 @@ runtime:
   token_budget_candidates: [128, 256, 512]
   max_pairs_per_rank: 1048576
   memory_limit_gib: 85.0
-  total_budget_seconds: 14400       # PROVISIONAL — replaced by Task 8 measured profile
-  pack_budget_seconds: 1200
-  setup_probe_budget_seconds: 900
-  train_eval_budget_seconds: 11700
-  artifact_budget_seconds: 120
-  reserve_seconds: 480
   probe_warmup_steps: 5
   probe_timed_steps: 15
 ```
@@ -747,9 +741,7 @@ must not exist yet when Task 10 starts.
   `profile.json` / logs: per-step wall (mean of timed steps), peak GPU memory,
   detected world size, selected `B_n`.
 - [ ] **Step 4:** Extrapolate: `steps_per_epoch × 30 × per-step wall` per
-  training arm (× 4 arms); compare against `runtime.total_budget_seconds`
-  (14400 provisional) and adjust the four configs if the measurement demands
-  it (config edit + commit, allowed — registration is still DRAFT).
+  training arm (× 4 arms) and record the estimate as operational telemetry.
 - [ ] **Step 5:** Scoring latency probe: score a 10k-row pair file fp32
   (`hpc/run.sh score --checkpoint <debug ckpt> --pairs file:<10k tsv> --output outputs/egostitch_e2e_stage1/full_debug/probe.npz`),
   record rows/s → extrapolated 2,037,171-row wall per artifact (× 5 passes).

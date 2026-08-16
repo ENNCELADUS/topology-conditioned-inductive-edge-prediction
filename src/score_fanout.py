@@ -5,7 +5,6 @@ and the pipeline's ``test`` stage call :func:`score_sharded`; the shell no
 longer orchestrates shards.
 """
 
-import argparse
 import logging
 import os
 import sys
@@ -103,14 +102,13 @@ def score_sharded(
     *,
     gpu_count: int,
     python_bin: Path,
-    timeout_seconds: float | None = None,
     command_runner: CommandRunner = run_command,
 ) -> Path:
     """Score one pairs universe across `gpu_count` GPUs and merge the shards.
 
     Launches one contiguous shard per GPU with ``CUDA_VISIBLE_DEVICES`` pinned,
-    waits for all of them, kills the survivors on the first failure, then merges
-    strictly via ``score_universe merge``. With ``gpu_count == 1`` it runs a
+    waits for all of them, then merges strictly via ``score_universe merge``.
+    With ``gpu_count == 1`` it runs a
     single unsharded pass and no merge.
 
     Args:
@@ -119,10 +117,6 @@ def score_sharded(
             ``--num-shards``; this function owns sharding.
         gpu_count: Number of GPUs to fan out across.
         python_bin: Interpreter used to launch each shard.
-        timeout_seconds: Optional hard wall-clock deadline for each shard.
-            Defaults to ``None`` (wait indefinitely): a scoring pass's cost is
-            set by its pairs universe, so a fixed budget is a guess that throws
-            away hours of finished work whenever it is too small.
         command_runner: Injectable subprocess seam.
 
     Returns:
@@ -150,7 +144,7 @@ def score_sharded(
     ]
 
     if gpu_count == 1:
-        result = command_runner(base_command, timeout_seconds)
+        result = command_runner(base_command)
         if result.returncode != 0:
             raise RuntimeError(
                 f"score failed with exit code {result.returncode}: {result.stderr.strip()}"
@@ -172,17 +166,10 @@ def score_sharded(
         for shard in range(gpu_count)
     ]
 
-    # command_runner is a blocking (command, timeout) -> CompletedProcess seam
-    # with no process handle exposed, so a running shard cannot be forcibly
-    # killed from here the way the bash `kill -TERM "${pids[@]}"` could; each
-    # survivor still runs to its own timeout_seconds deadline before this
-    # function's exception can propagate. Shards are inspected in launch
-    # order (matching the bash `wait` loop, which also reports the first
-    # index-order failure rather than the first-to-finish failure).
+    # Shards are inspected in launch order, matching the former bash `wait`
+    # loop's first index-order failure behavior.
     with ThreadPoolExecutor(max_workers=gpu_count) as executor:
-        futures = [
-            executor.submit(command_runner, command, timeout_seconds) for command in shard_commands
-        ]
+        futures = [executor.submit(command_runner, command) for command in shard_commands]
         for shard, future in enumerate(futures):
             try:
                 result = future.result()
@@ -204,7 +191,7 @@ def score_sharded(
         "--output",
         str(output),
     ]
-    merge_result = command_runner(merge_command, timeout_seconds)
+    merge_result = command_runner(merge_command)
     if merge_result.returncode != 0:
         raise RuntimeError(
             f"score merge failed with exit code "
@@ -216,8 +203,8 @@ def score_sharded(
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point for ``python -m src.score_fanout``.
 
-    Auto-detects the visible GPU count and forwards every argument it does not
-    recognize verbatim to :func:`score_sharded` as ``score_args``. This is
+    Auto-detects the visible GPU count and forwards every argument verbatim to
+    :func:`score_sharded` as ``score_args``. This is
     what ``hpc/run.sh score`` calls in place of its former bash fan-out.
 
     Args:
@@ -226,19 +213,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     Returns:
         0 on success.
     """
-    parser = argparse.ArgumentParser(prog="python -m src.score_fanout")
-    parser.add_argument(
-        "--timeout-seconds",
-        type=float,
-        default=None,
-        help="optional per-shard wall-clock deadline; omit to wait indefinitely",
-    )
-    args, score_args = parser.parse_known_args(argv)
+    score_args = list(sys.argv[1:] if argv is None else argv)
     output = score_sharded(
         score_args,
         gpu_count=detect_visible_gpu_count(),
         python_bin=Path(sys.executable),
-        timeout_seconds=args.timeout_seconds,
     )
     logger.info("wrote merged scores artifact: %s", output)
     return 0

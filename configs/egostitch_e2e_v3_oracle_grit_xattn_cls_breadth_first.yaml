@@ -129,7 +129,3 @@ runtime:
   token_budget: 128
   max_pairs_per_rank: 1048576
   memory_limit_gib: 85.0
-  total_budget_seconds: 44520
-  pack_budget_seconds: 1200
-  train_eval_budget_seconds: 43200
-  artifact_budget_seconds: 120

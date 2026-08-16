@@ -228,7 +228,7 @@ class EvalConfig:
 
 @dataclass(frozen=True)
 class RuntimeConfig:
-    """Runtime and wall-clock budget contract for formal distributed training.
+    """Runtime contract for formal distributed training.
 
     ``world_size == 0`` means that the orchestrator must use every visible H20.
     Positive values remain supported for explicit reproducibility checks.
@@ -242,12 +242,6 @@ class RuntimeConfig:
     token_budget: int
     max_pairs_per_rank: int
     memory_limit_gib: float
-    total_budget_seconds: int
-    pack_budget_seconds: int
-    setup_probe_budget_seconds: int
-    train_eval_budget_seconds: int
-    artifact_budget_seconds: int
-    reserve_seconds: int
     probe_warmup_steps: int
     probe_timed_steps: int
 
@@ -670,12 +664,6 @@ def load_config(path: Path) -> Config:
             "token_budget",
             "max_pairs_per_rank",
             "memory_limit_gib",
-            "total_budget_seconds",
-            "pack_budget_seconds",
-            "setup_probe_budget_seconds",
-            "train_eval_budget_seconds",
-            "artifact_budget_seconds",
-            "reserve_seconds",
             "probe_warmup_steps",
             "probe_timed_steps",
         )
@@ -711,30 +699,6 @@ def load_config(path: Path) -> Config:
                 _require(runtime_raw, "memory_limit_gib", "runtime."),
                 "runtime.memory_limit_gib",
             ),
-            total_budget_seconds=_as_int(
-                _require(runtime_raw, "total_budget_seconds", "runtime."),
-                "runtime.total_budget_seconds",
-            ),
-            pack_budget_seconds=_as_int(
-                _require(runtime_raw, "pack_budget_seconds", "runtime."),
-                "runtime.pack_budget_seconds",
-            ),
-            setup_probe_budget_seconds=_as_int(
-                _require(runtime_raw, "setup_probe_budget_seconds", "runtime."),
-                "runtime.setup_probe_budget_seconds",
-            ),
-            train_eval_budget_seconds=_as_int(
-                _require(runtime_raw, "train_eval_budget_seconds", "runtime."),
-                "runtime.train_eval_budget_seconds",
-            ),
-            artifact_budget_seconds=_as_int(
-                _require(runtime_raw, "artifact_budget_seconds", "runtime."),
-                "runtime.artifact_budget_seconds",
-            ),
-            reserve_seconds=_as_int(
-                _require(runtime_raw, "reserve_seconds", "runtime."),
-                "runtime.reserve_seconds",
-            ),
             probe_warmup_steps=_as_int(
                 _require(runtime_raw, "probe_warmup_steps", "runtime."),
                 "runtime.probe_warmup_steps",
@@ -745,20 +709,8 @@ def load_config(path: Path) -> Config:
             ),
         )
 
-        stage_total = (
-            runtime.pack_budget_seconds
-            + runtime.setup_probe_budget_seconds
-            + runtime.train_eval_budget_seconds
-            + runtime.artifact_budget_seconds
-            + runtime.reserve_seconds
-        )
         if runtime.world_size < 0:
             raise ValueError("runtime.world_size must be 'auto' or a positive integer")
-        if stage_total != runtime.total_budget_seconds:
-            raise ValueError(
-                f"runtime stage budgets must sum to {runtime.total_budget_seconds}; "
-                f"got {stage_total}"
-            )
         if runtime.token_budget <= 0:
             raise ValueError("runtime.token_budget must be positive")
 

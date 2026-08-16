@@ -757,12 +757,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="interpreter used to launch each score shard",
     )
     parser.add_argument(
-        "--timeout-seconds",
-        type=float,
-        default=None,
-        help="optional per-shard wall-clock deadline; omit to wait indefinitely",
-    )
-    parser.add_argument(
         "--reuse-existing-scores",
         action="store_true",
         help="reuse already-written scores/<pairs>.npz instead of rescoring that universe",
@@ -796,7 +790,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             score_args,
             gpu_count=gpu_count,
             python_bin=args.python_bin,
-            timeout_seconds=args.timeout_seconds,
         )
 
     result = run_test_protocol(

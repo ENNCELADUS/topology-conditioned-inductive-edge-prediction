@@ -1,3 +1,4 @@
+import inspect
 import subprocess
 import threading
 from collections.abc import Sequence
@@ -22,7 +23,6 @@ def _clear_inherited_gpu_mask(monkeypatch: pytest.MonkeyPatch) -> None:
 pytestmark = pytest.mark.unit
 
 _PYTHON_BIN = Path("/fake/python")
-_TIMEOUT = 123.0
 
 
 def _arg_value(command: Sequence[str], flag: str) -> str:
@@ -37,14 +37,12 @@ class _RecordingRunner:
         self._fail_shard = fail_shard
         self._fail_merge = fail_merge
         self._lock = threading.Lock()
-        self.calls: list[tuple[list[str], float | None]] = []
+        self.calls: list[list[str]] = []
 
-    def __call__(
-        self, command: Sequence[str], timeout: float | None
-    ) -> subprocess.CompletedProcess[str]:
+    def __call__(self, command: Sequence[str]) -> subprocess.CompletedProcess[str]:
         command_list = list(command)
         with self._lock:
-            self.calls.append((command_list, timeout))
+            self.calls.append(command_list)
 
         if "score" in command_list and "--shard" in command_list:
             shard = int(_arg_value(command_list, "--shard"))
@@ -57,11 +55,11 @@ class _RecordingRunner:
             return subprocess.CompletedProcess(command_list, 0, "", "")
         return subprocess.CompletedProcess(command_list, 0, "", "")
 
-    def merge_calls(self) -> list[tuple[list[str], float | None]]:
-        return [call for call in self.calls if "merge" in call[0]]
+    def merge_calls(self) -> list[list[str]]:
+        return [call for call in self.calls if "merge" in call]
 
-    def shard_calls(self) -> list[tuple[list[str], float | None]]:
-        return [call for call in self.calls if "--shard" in call[0]]
+    def shard_calls(self) -> list[list[str]]:
+        return [call for call in self.calls if "--shard" in call]
 
 
 def test_single_gpu_issues_one_unsharded_pass_and_no_merge() -> None:
@@ -71,14 +69,12 @@ def test_single_gpu_issues_one_unsharded_pass_and_no_merge() -> None:
         ["--checkpoint", "ckpt.pt", "--output", "scores/out.npz"],
         gpu_count=1,
         python_bin=_PYTHON_BIN,
-        timeout_seconds=_TIMEOUT,
         command_runner=runner,
     )
 
     assert output == Path("scores/out.npz")
     assert len(runner.calls) == 1
-    command, timeout = runner.calls[0]
-    assert timeout == _TIMEOUT
+    command = runner.calls[0]
     assert command[0] == str(_PYTHON_BIN)
     assert command[1:4] == ["-m", "src.score_universe", "score"]
     assert "--device" in command and _arg_value(command, "--device") == "cuda"
@@ -91,8 +87,17 @@ def test_single_gpu_issues_one_unsharded_pass_and_no_merge() -> None:
     assert runner.merge_calls() == []
 
 
+def test_score_fanout_api_has_no_configured_time_limit() -> None:
+    assert tuple(inspect.signature(score_sharded).parameters) == (
+        "score_args",
+        "gpu_count",
+        "python_bin",
+        "command_runner",
+    )
+
+
 def test_single_gpu_failure_raises_runtime_error() -> None:
-    def runner(command: Sequence[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(list(command), 1, "", "score failed hard")
 
     with pytest.raises(RuntimeError, match="score failed hard"):
@@ -100,7 +105,6 @@ def test_single_gpu_failure_raises_runtime_error() -> None:
             ["--checkpoint", "ckpt.pt", "--output", "scores/out.npz"],
             gpu_count=1,
             python_bin=_PYTHON_BIN,
-            timeout_seconds=_TIMEOUT,
             command_runner=runner,
         )
 
@@ -112,7 +116,6 @@ def test_multi_gpu_launches_one_shard_per_gpu_and_merges_in_order() -> None:
         ["--checkpoint", "ckpt.pt", "--output", "scores/out.npz"],
         gpu_count=3,
         python_bin=_PYTHON_BIN,
-        timeout_seconds=_TIMEOUT,
         command_runner=runner,
     )
 
@@ -121,8 +124,7 @@ def test_multi_gpu_launches_one_shard_per_gpu_and_merges_in_order() -> None:
     assert len(shard_calls) == 3
 
     seen_shards = set()
-    for command, timeout in shard_calls:
-        assert timeout == _TIMEOUT
+    for command in shard_calls:
         shard = int(_arg_value(command, "--shard"))
         seen_shards.add(shard)
         assert _arg_value(command, "--num-shards") == "3"
@@ -139,8 +141,7 @@ def test_multi_gpu_launches_one_shard_per_gpu_and_merges_in_order() -> None:
 
     merge_calls = runner.merge_calls()
     assert len(merge_calls) == 1
-    merge_command, merge_timeout = merge_calls[0]
-    assert merge_timeout == _TIMEOUT
+    merge_command = merge_calls[0]
     assert merge_command[0] == str(_PYTHON_BIN)
     assert merge_command[1:4] == ["-m", "src.score_universe", "merge"]
     inputs_index = merge_command.index("--inputs")
@@ -167,13 +168,10 @@ def test_shards_pin_the_inherited_visible_device_ids(monkeypatch: pytest.MonkeyP
         ["--output", "scores/out.npz"],
         gpu_count=2,
         python_bin=_PYTHON_BIN,
-        timeout_seconds=_TIMEOUT,
         command_runner=runner,
     )
 
-    pinned = {
-        int(_arg_value(command, "--shard")): command[1] for command, _ in runner.shard_calls()
-    }
+    pinned = {int(_arg_value(command, "--shard")): command[1] for command in runner.shard_calls()}
     assert pinned == {0: "CUDA_VISIBLE_DEVICES=1", 1: "CUDA_VISIBLE_DEVICES=3"}
 
 
@@ -189,7 +187,6 @@ def test_rejects_a_mask_smaller_than_the_requested_shard_count(
             ["--output", "scores/out.npz"],
             gpu_count=3,
             python_bin=_PYTHON_BIN,
-            timeout_seconds=_TIMEOUT,
             command_runner=runner,
         )
     assert runner.calls == []
@@ -203,7 +200,6 @@ def test_failing_shard_raises_and_issues_no_merge() -> None:
             ["--checkpoint", "ckpt.pt", "--output", "scores/out.npz"],
             gpu_count=3,
             python_bin=_PYTHON_BIN,
-            timeout_seconds=_TIMEOUT,
             command_runner=runner,
         )
 
@@ -218,7 +214,6 @@ def test_failing_merge_raises() -> None:
             ["--checkpoint", "ckpt.pt", "--output", "scores/out.npz"],
             gpu_count=2,
             python_bin=_PYTHON_BIN,
-            timeout_seconds=_TIMEOUT,
             command_runner=runner,
         )
 
@@ -226,7 +221,7 @@ def test_failing_merge_raises() -> None:
 
 
 def test_shard_flag_in_score_args_is_rejected() -> None:
-    def runner(command: Sequence[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
         raise AssertionError("command_runner must not be called")
 
     with pytest.raises(ValueError, match="--shard"):
@@ -234,13 +229,12 @@ def test_shard_flag_in_score_args_is_rejected() -> None:
             ["--output", "scores/out.npz", "--shard", "0"],
             gpu_count=2,
             python_bin=_PYTHON_BIN,
-            timeout_seconds=_TIMEOUT,
             command_runner=runner,
         )
 
 
 def test_num_shards_flag_in_score_args_is_rejected() -> None:
-    def runner(command: Sequence[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
         raise AssertionError("command_runner must not be called")
 
     with pytest.raises(ValueError, match="--num-shards"):
@@ -248,13 +242,12 @@ def test_num_shards_flag_in_score_args_is_rejected() -> None:
             ["--output", "scores/out.npz", "--num-shards", "2"],
             gpu_count=2,
             python_bin=_PYTHON_BIN,
-            timeout_seconds=_TIMEOUT,
             command_runner=runner,
         )
 
 
 def test_missing_output_is_rejected() -> None:
-    def runner(command: Sequence[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
         raise AssertionError("command_runner must not be called")
 
     with pytest.raises(ValueError, match="--output"):
@@ -262,13 +255,12 @@ def test_missing_output_is_rejected() -> None:
             ["--checkpoint", "ckpt.pt"],
             gpu_count=1,
             python_bin=_PYTHON_BIN,
-            timeout_seconds=_TIMEOUT,
             command_runner=runner,
         )
 
 
 def test_non_npz_output_is_rejected() -> None:
-    def runner(command: Sequence[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
         raise AssertionError("command_runner must not be called")
 
     with pytest.raises(ValueError, match=r"\.npz"):
@@ -276,21 +268,5 @@ def test_non_npz_output_is_rejected() -> None:
             ["--checkpoint", "ckpt.pt", "--output", "scores/out.txt"],
             gpu_count=1,
             python_bin=_PYTHON_BIN,
-            timeout_seconds=_TIMEOUT,
             command_runner=runner,
         )
-
-
-def test_timeout_is_forwarded_to_every_call() -> None:
-    runner = _RecordingRunner()
-
-    score_sharded(
-        ["--checkpoint", "ckpt.pt", "--output", "scores/out.npz"],
-        gpu_count=4,
-        python_bin=_PYTHON_BIN,
-        timeout_seconds=987.5,
-        command_runner=runner,
-    )
-
-    assert len(runner.calls) == 5  # 4 shards + 1 merge
-    assert all(timeout == 987.5 for _, timeout in runner.calls)

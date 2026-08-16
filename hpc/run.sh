@@ -43,10 +43,6 @@ The score command is a thin passthrough to `python -m src.score_fanout`, which
 auto-detects GPU count, pins --device cuda --amp bf16, launches one contiguous
 shard per visible GPU, waits for every shard, and strictly merges them into the
 requested output; this runner does not duplicate that sharding or validation.
-Scoring has no wall-clock deadline: a pass's cost is set by its pairs universe
-(the candidate universe is ~2.0M pairs, ~32x the test universe), so a fixed
-budget only discards finished work. Pass --timeout-seconds to impose one.
-
 The test command is a thin passthrough to `python -m src.eval.test_protocol`
 for one published checkpoint: score test -> fixed-0.5 edge metrics -> score
 candidate -> global density-matched graph metrics -> `test_report.json`.

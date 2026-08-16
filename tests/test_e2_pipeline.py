@@ -1,13 +1,13 @@
 import fcntl
 import hashlib
 import importlib
+import inspect
 import json
+import os
 import subprocess
 import sys
-import tempfile
 import threading
 import time
-import types
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, fields
@@ -27,14 +27,11 @@ from src.e2_pipeline import (
     _assert_no_cross_kind_completion,
     _assert_no_cross_kind_test_completion,
     _clear_stale_test_artifacts,
-    _kill_registered_process_groups,
     _pipeline_rerun_command,
     _publish_staged,
     _read_log_tail,
-    _register_nested_process_group,
     _rollback_publication,
     _test_stage_filenames,
-    _unregister_nested_process_group,
     _validate_staged_artifacts,
     build_accelerate_command,
     detect_visible_gpu_count,
@@ -63,9 +60,7 @@ def test_run_logged_command_persists_output_before_process_exit(tmp_path: Path) 
         ),
     ]
     result: list[subprocess.CompletedProcess[str]] = []
-    thread = threading.Thread(
-        target=lambda: result.append(run_logged_command(command, 5.0, log_path))
-    )
+    thread = threading.Thread(target=lambda: result.append(run_logged_command(command, log_path)))
 
     thread.start()
     deadline = time.monotonic() + 0.8
@@ -95,7 +90,7 @@ def test_run_logged_command_reaps_descendant_holding_output_pipe(tmp_path: Path)
     )
     started = time.monotonic()
 
-    completed = run_logged_command([sys.executable, "-c", script], 5.0, log_path)
+    completed = run_logged_command([sys.executable, "-c", script], log_path)
 
     assert completed.returncode == 0
     assert time.monotonic() - started < 3.0
@@ -277,164 +272,37 @@ def test_detect_visible_gpu_count_uses_cuda_visible_devices(
     assert detect_visible_gpu_count() == 2
 
 
-@pytest.mark.integration
-@pytest.mark.slow
-def test_run_command_timeout_kills_the_whole_process_group(tmp_path: Path) -> None:
-    grandchild_pid_path = tmp_path / "grandchild.pid"
-    script = (
-        "import pathlib, subprocess, sys, time; "
-        "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
-        f"pathlib.Path({str(grandchild_pid_path)!r}).write_text(str(child.pid)); "
-        "time.sleep(60)"
-    )
+def test_run_command_waits_for_completion() -> None:
+    result = run_command([sys.executable, "-c", "print('done')"])
 
-    # The budget only has to be short relative to the child's 60 s sleep -- it is
-    # never a measurement of how fast the kill is. It does have to be long enough
-    # for the child to reach `write_text`, which costs an interpreter start plus a
-    # `Popen`. At 0.5 s that raced: under `hpc/run.sh check`'s xdist workers on the
-    # H20 container the child died before writing the pid file, and the test failed
-    # with `FileNotFoundError` on `grandchild.pid` without ever reaching its
-    # assertion. Widening the budget removes the race and weakens nothing -- the
-    # grandchild still has ~55 s of sleep left when the group is killed, so a
-    # surviving grandchild is caught exactly as before.
-    with pytest.raises(subprocess.TimeoutExpired):
-        run_command([sys.executable, "-c", script], 5.0)
-
-    grandchild_pid = int(grandchild_pid_path.read_text())
-    state = subprocess.run(
-        ["ps", "-o", "state=", "-p", str(grandchild_pid)],
-        check=False,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    assert not state or state.startswith("Z"), (
-        f"grandchild process {grandchild_pid} remained live in state {state!r}"
-    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == "done"
 
 
-# --------------------------------------------------------------- nested process-group registry
-# `run_command` always launches with `start_new_session=True` so its OWN
-# timeout can kill just its own group -- but that means the group is a
-# *different* session from a supervising `run_stage` call's forked child, so
-# it would otherwise survive that stage's own deadline. These tests cover the
-# registry `run_command`/`run_stage` share to close that gap.
+def test_runner_apis_accept_only_work_inputs() -> None:
+    assert tuple(inspect.signature(run_command).parameters) == ("command",)
+    assert tuple(inspect.signature(run_logged_command).parameters) == ("command", "log_path")
+    assert tuple(inspect.signature(run_stage).parameters) == ("operation",)
 
 
-def test_register_nested_process_group_writes_a_pgid_file(tmp_path: Path) -> None:
-    entry = _register_nested_process_group(tmp_path, 4321)
-    assert entry == tmp_path / "4321.pgid"
-    assert entry is not None
-    assert entry.read_text() == "4321"
+def test_run_stage_propagates_an_exception_larger_than_the_pipe_buffer() -> None:
+    message = "x" * 1_000_000
+
+    def fail() -> None:
+        raise RuntimeError(message)
+
+    with pytest.raises(RuntimeError) as error:
+        run_stage(fail)
+
+    assert str(error.value) == f"RuntimeError: {message}"
 
 
-def test_register_nested_process_group_is_a_noop_without_an_active_registry() -> None:
-    assert _register_nested_process_group(None, 4321) is None
+def test_run_stage_reports_a_child_that_exits_without_a_result() -> None:
+    def exit_without_result() -> None:
+        os._exit(7)
 
-
-def test_unregister_nested_process_group_removes_the_file(tmp_path: Path) -> None:
-    entry = tmp_path / "4321.pgid"
-    entry.write_text("4321")
-    _unregister_nested_process_group(entry)
-    assert not entry.exists()
-
-
-def test_unregister_nested_process_group_tolerates_none() -> None:
-    _unregister_nested_process_group(None)  # must not raise
-
-
-def test_kill_registered_process_groups_kills_every_recorded_pgid(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    (tmp_path / "111.pgid").write_text("111")
-    (tmp_path / "222.pgid").write_text("222")
-    killed: list[int] = []
-    monkeypatch.setattr("src.e2_pipeline.os.killpg", lambda pgid, _sig: killed.append(pgid))
-
-    _kill_registered_process_groups(tmp_path)
-
-    assert sorted(killed) == [111, 222]
-
-
-def test_kill_registered_process_groups_tolerates_an_already_dead_pgid(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    (tmp_path / "999.pgid").write_text("999")
-
-    def raising_killpg(_pgid: int, _sig: int) -> None:
-        raise ProcessLookupError()
-
-    monkeypatch.setattr("src.e2_pipeline.os.killpg", raising_killpg)
-
-    _kill_registered_process_groups(tmp_path)  # must not raise
-
-
-def test_kill_registered_process_groups_tolerates_an_empty_registry(tmp_path: Path) -> None:
-    _kill_registered_process_groups(tmp_path)  # must not raise
-
-
-def test_run_stage_cleans_up_its_nested_process_group_registry(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Every `run_stage` call, timeout or not, must leave no registry directory behind."""
-    created: list[Path] = []
-    original_mkdtemp = tempfile.mkdtemp
-
-    def recording_mkdtemp(prefix: str | None = None) -> str:
-        path = original_mkdtemp(prefix=prefix)
-        created.append(Path(path))
-        return path
-
-    monkeypatch.setattr("src.e2_pipeline.tempfile.mkdtemp", recording_mkdtemp)
-
-    run_stage(lambda: None, 5.0)
-
-    assert created
-    assert not created[-1].exists()
-
-
-@pytest.mark.integration
-@pytest.mark.slow
-def test_run_stage_timeout_reaps_a_nested_run_command_process_group(tmp_path: Path) -> None:
-    """A stage-level deadline must also kill a nested `run_command` subprocess.
-
-    This mirrors the real test stage's shape: `score_sharded` launches scoring
-    subprocesses from inside `run_stage`'s forked child, several layers of
-    `command_runner` indirection away, each with its own
-    `start_new_session=True` group. A stage deadline must reap that nested
-    group too, even though the nested command's OWN (much longer) timeout
-    never fires -- otherwise a stage timeout leaves GPU-occupying subprocesses
-    running past the reported failure.
-    """
-    grandchild_pid_path = tmp_path / "nested_grandchild.pid"
-    nested_script = (
-        "import pathlib, subprocess, sys, time; "
-        "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
-        f"pathlib.Path({str(grandchild_pid_path)!r}).write_text(str(child.pid)); "
-        "time.sleep(60)"
-    )
-
-    def operation() -> None:
-        # 30 s comfortably outlasts the stage's own 10 s deadline below, so
-        # only the STAGE timeout -- not this nested command's own -- can be
-        # what kills it in this test.
-        run_command([sys.executable, "-c", nested_script], 30.0)
-
-    # See afb73ab: this only has to outlast fork + interpreter start + two
-    # nested levels of Popen, never a measurement of kill latency -- the
-    # grandchild still has ~50 s of sleep left when the stage deadline fires.
-    with pytest.raises(subprocess.TimeoutExpired):
-        run_stage(operation, 10.0)
-
-    grandchild_pid = int(grandchild_pid_path.read_text())
-    state = subprocess.run(
-        ["ps", "-o", "state=", "-p", str(grandchild_pid)],
-        check=False,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    assert not state or state.startswith("Z"), (
-        f"nested grandchild process {grandchild_pid} remained live in state {state!r}"
-    )
+    with pytest.raises(RuntimeError, match="exited with code 7 without a result"):
+        run_stage(exit_without_result)
 
 
 # --------------------------------------------------------------------------- CLI parsing
@@ -730,33 +598,11 @@ def _pipeline_config_dict(
         "token_budget": _RUNTIME_TOKEN_BUDGET,
         "max_pairs_per_rank": 4096,
         "memory_limit_gib": 85.0,
-        "total_budget_seconds": 40,
-        "pack_budget_seconds": 20,
-        "setup_probe_budget_seconds": 10,
-        "train_eval_budget_seconds": 5,
-        "artifact_budget_seconds": 3,
-        "reserve_seconds": 2,
         "probe_warmup_steps": 1,
         "probe_timed_steps": 1,
     }
     if runtime_overrides:
         runtime.update(runtime_overrides)
-        # `train_b0.load_config` asserts the five stage budgets sum to
-        # `total_budget_seconds`, so an override of any of the five has to be
-        # re-balanced or the config is rejected before the pipeline ever runs.
-        # The test stage has no budget at all: its cost is set by the pairs
-        # universe, not boundable up front.
-        if "total_budget_seconds" not in runtime_overrides:
-            runtime["total_budget_seconds"] = sum(
-                cast(int, runtime[key])
-                for key in (
-                    "pack_budget_seconds",
-                    "setup_probe_budget_seconds",
-                    "train_eval_budget_seconds",
-                    "artifact_budget_seconds",
-                    "reserve_seconds",
-                )
-            )
     return {
         "model": {"family": "v3_1", "config": {}},
         "data": {
@@ -850,23 +696,17 @@ def _make_fake_runner(
     *,
     train_runtime_profile: dict[str, object] | None = None,
     fail_mode: str | None = None,
-    timeout_mode: str | None = None,
     write_val_region_validation_ledger: bool = False,
-) -> Callable[[Sequence[str], float | None, Path], subprocess.CompletedProcess[str]]:
+) -> Callable[[Sequence[str], Path], subprocess.CompletedProcess[str]]:
     """Stand in for the single ``train`` process group the orchestrator launches."""
     resolved_train_profile: dict[str, object] = train_runtime_profile or _valid_worker_profile()
 
-    def runner(
-        command: Sequence[str], timeout: float | None, log_path: Path
-    ) -> subprocess.CompletedProcess[str]:
+    def runner(command: Sequence[str], log_path: Path) -> subprocess.CompletedProcess[str]:
         command_list = list(command)
         mode = _arg_value(command_list, "--ddp-mode")
         profile_output = Path(_arg_value(command_list, "--profile-output"))
         out_dir = Path(_arg_value(command_list, "--output-dir"))
 
-        if timeout_mode == mode:
-            log_path.write_text("epoch 1 complete\nworker stalled\n")
-            raise subprocess.TimeoutExpired(cmd=command_list, timeout=timeout or 0.0)
         if fail_mode == mode:
             log_path.write_text("boom\n")
             return subprocess.CompletedProcess(command_list, returncode=1, stdout="", stderr="boom")
@@ -911,13 +751,11 @@ def test_orchestrator_launches_only_the_train_stage(tmp_path: Path) -> None:
     base_runner = _make_fake_runner()
     launched: list[tuple[str, str]] = []
 
-    def runner(
-        command: Sequence[str], timeout: float | None, log_path: Path
-    ) -> subprocess.CompletedProcess[str]:
+    def runner(command: Sequence[str], log_path: Path) -> subprocess.CompletedProcess[str]:
         launched.append(
             (_arg_value(command, "--ddp-mode"), _arg_value(command, "--token-budget-per-rank"))
         )
-        return base_runner(command, timeout, log_path)
+        return base_runner(command, log_path)
 
     assert run_pipeline(args, training_command_runner=runner) == 0
     assert launched == [("train", str(_RUNTIME_TOKEN_BUDGET))]
@@ -968,16 +806,14 @@ class TestRunPipelineSuccess:
         )
         base_runner = _make_fake_runner()
 
-        def runner(
-            command: Sequence[str], timeout: float | None, log_path: Path
-        ) -> subprocess.CompletedProcess[str]:
+        def runner(command: Sequence[str], log_path: Path) -> subprocess.CompletedProcess[str]:
             new_attempt = Path(_arg_value(command, "--output-dir"))
             assert _arg_value(command, "--resume-attempt") == str(prior)
             assert new_attempt != prior
             assert (new_attempt / "metrics.jsonl").read_text() == '{"epoch": 1}\n'
             assert (new_attempt / "checkpoints" / "epoch-0001.pt").is_file()
             assert not (new_attempt / "checkpoints" / "epoch-0002.pt").exists()
-            return base_runner(command, timeout, log_path)
+            return base_runner(command, log_path)
 
         resumed_args = PipelineArgs(**{**vars(args), "resume_attempt": prior})
         assert run_pipeline(resumed_args, training_command_runner=runner) == 0
@@ -1025,13 +861,11 @@ class TestRunPipelineSuccess:
         )
         base_runner = _make_fake_runner()
 
-        def runner(
-            command: Sequence[str], timeout: float | None, log_path: Path
-        ) -> subprocess.CompletedProcess[str]:
+        def runner(command: Sequence[str], log_path: Path) -> subprocess.CompletedProcess[str]:
             new_attempt = Path(_arg_value(command, "--output-dir"))
             assert len((new_attempt / "metrics.jsonl").read_text().splitlines()) == 2
             assert len(list((new_attempt / "checkpoints").glob("epoch-*.pt"))) == 2
-            return base_runner(command, timeout, log_path)
+            return base_runner(command, log_path)
 
         resumed_args = PipelineArgs(**{**vars(args), "resume_attempt": prior})
         assert run_pipeline(resumed_args, training_command_runner=runner) == 0
@@ -1146,10 +980,8 @@ class TestRunPipelineSuccess:
         profile["validations_completed"] = 1
         profile["per_epoch"] = cast(list[object], profile["per_epoch"])[:1]
 
-        def runner(
-            command: Sequence[str], timeout: float | None, log_path: Path
-        ) -> subprocess.CompletedProcess[str]:
-            result = _make_fake_runner(train_runtime_profile=profile)(command, timeout, log_path)
+        def runner(command: Sequence[str], log_path: Path) -> subprocess.CompletedProcess[str]:
+            result = _make_fake_runner(train_runtime_profile=profile)(command, log_path)
             if _arg_value(command, "--ddp-mode") == "train":
                 out = Path(_arg_value(command, "--output-dir"))
                 best = torch.load(out / "best.pt", weights_only=False)
@@ -1281,7 +1113,7 @@ class TestRunPipelineSuccess:
                 verify_shard_sha256=verify_shard_sha256,
             )
 
-        def supervised(operation: Callable[[], None], _timeout: float | None) -> None:
+        def supervised(operation: Callable[[], None]) -> None:
             nonlocal inside_stage
             inside_stage = True
             try:
@@ -1301,9 +1133,7 @@ class TestRunPipelineSuccess:
         """With no candidate sweep left, an OOM is simply a failed train stage."""
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
 
-        def runner(
-            command: Sequence[str], _timeout: float | None, log_path: Path
-        ) -> subprocess.CompletedProcess[str]:
+        def runner(command: Sequence[str], log_path: Path) -> subprocess.CompletedProcess[str]:
             log_path.write_text("CUDA out of memory\n")
             return subprocess.CompletedProcess(command, 1, "", "CUDA out of memory")
 
@@ -1328,11 +1158,11 @@ class TestRunPipelineSuccess:
             (output_dir / filename).write_text("stale")
 
         def no_write_train(
-            command: Sequence[str], timeout: float | None, log_path: Path
+            command: Sequence[str], log_path: Path
         ) -> subprocess.CompletedProcess[str]:
             if _arg_value(command, "--ddp-mode") == "train":
                 return subprocess.CompletedProcess(command, 0, "", "")
-            return _make_fake_runner()(command, timeout, log_path)
+            return _make_fake_runner()(command, log_path)
 
         assert run_pipeline(args, training_command_runner=no_write_train) == 2
         failure = json.loads((output_dir / "failure.json").read_text())
@@ -1345,9 +1175,7 @@ class TestRunPipelineSuccess:
     ) -> None:
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
 
-        def runner(
-            command: Sequence[str], _timeout: float | None, log_path: Path
-        ) -> subprocess.CompletedProcess[str]:
+        def runner(command: Sequence[str], log_path: Path) -> subprocess.CompletedProcess[str]:
             command_list = list(command)
             attempt_dir = Path(_arg_value(command_list, "--output-dir"))
             (attempt_dir / "progress.json").write_text(
@@ -1530,7 +1358,7 @@ class TestRunPipelineFailures:
 
         self._assert_canonical_unchanged(output_dir, before)
 
-    def test_pack_timeout_removes_the_owned_pack_temporary_tree(
+    def test_pack_failure_removes_the_owned_pack_temporary_tree(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         args, output_dir = self._base_args_and_config(tmp_path)
@@ -1549,7 +1377,7 @@ class TestRunPipelineFailures:
             leaked = pack_root.parent / f"{temp_prefix}leaked"
             leaked.mkdir(parents=True)
             created.append(leaked)
-            raise subprocess.TimeoutExpired(cmd="pack", timeout=1)
+            raise OSError("pack failed")
 
         monkeypatch.setattr(packed_features, "build_packed_features", leaking_build)
 
@@ -1557,7 +1385,7 @@ class TestRunPipelineFailures:
             run_pipeline(
                 args,
                 training_command_runner=_make_fake_runner(),
-                stage_runner=lambda operation, _timeout: operation(),
+                stage_runner=lambda operation: operation(),
             )
             == 2
         )
@@ -1595,7 +1423,7 @@ class TestRunPipelineFailures:
         assert not (output_dir / "artifact_manifest.json").exists()
         assert not (output_dir / "complete.json").exists()
 
-    def test_diagnostic_runtime_telemetry_and_engineering_deadlines_never_block(
+    def test_diagnostic_runtime_telemetry_and_engineering_limits_never_block(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Diagnostic truth/integrity checks remain strict; utilization is telemetry."""
@@ -1637,24 +1465,24 @@ class TestRunPipelineFailures:
             "steady_state_data_wait_fraction": 0.25,
             "feature_cache_hit_rate": 0.9,
         }
-        command_timeouts: list[float | None] = []
+        command_calls = 0
         base_runner = _make_fake_runner(train_runtime_profile=profile)
 
-        def runner(
-            command: Sequence[str], timeout: float | None, log_path: Path
-        ) -> subprocess.CompletedProcess[str]:
-            command_timeouts.append(timeout)
-            return base_runner(command, timeout, log_path)
+        def runner(command: Sequence[str], log_path: Path) -> subprocess.CompletedProcess[str]:
+            nonlocal command_calls
+            command_calls += 1
+            return base_runner(command, log_path)
 
-        stage_timeouts: list[float | None] = []
+        stage_calls = 0
 
-        def stage_runner(operation: Callable[[], None], timeout: float | None) -> None:
-            stage_timeouts.append(timeout)
+        def stage_runner(operation: Callable[[], None]) -> None:
+            nonlocal stage_calls
+            stage_calls += 1
             operation()
 
         assert run_pipeline(args, training_command_runner=runner, stage_runner=stage_runner) == 0
-        assert command_timeouts and all(timeout is None for timeout in command_timeouts)
-        assert stage_timeouts and all(timeout is None for timeout in stage_timeouts)
+        assert command_calls == 1
+        assert stage_calls == 3
         assert (output_dir / "diagnostic_complete.json").is_file()
         published = json.loads((output_dir / "profile.json").read_text())
         assert published["steady_state_data_wait_fraction"] == 0.25
@@ -1667,10 +1495,8 @@ class TestRunPipelineFailures:
         args, output_dir = self._base_args_and_config(tmp_path)
         base = _make_fake_runner()
 
-        def runner(
-            command: Sequence[str], timeout: float | None, log_path: Path
-        ) -> subprocess.CompletedProcess[str]:
-            completed = base(command, timeout, log_path)
+        def runner(command: Sequence[str], log_path: Path) -> subprocess.CompletedProcess[str]:
+            completed = base(command, log_path)
             if _arg_value(command, "--ddp-mode") == "train":
                 staging = Path(_arg_value(command, "--output-dir"))
                 if corrupt == "checkpoint":
@@ -1703,33 +1529,6 @@ class TestRunPipelineFailures:
         failure = json.loads((output_dir / "failure.json").read_text())
         assert failure["stage"] == "pack"
 
-    def test_pack_stage_exceeding_its_budget_writes_failure_and_returns_2(
-        self, tmp_path: Path
-    ) -> None:
-        args, output_dir = self._base_args_and_config(tmp_path, pack_budget_seconds=0)
-
-        exit_code = run_pipeline(args, training_command_runner=_make_fake_runner())
-
-        assert exit_code == 2
-        failure = json.loads((output_dir / "failure.json").read_text())
-        assert failure["stage"] == "pack"
-
-    def test_pack_timeout_is_supervised_and_structured(self, tmp_path: Path) -> None:
-        args, output_dir = self._base_args_and_config(tmp_path, pack_budget_seconds=1)
-        observed: dict[str, float | None] = {}
-
-        def timeout_stage(_operation: Callable[[], None], timeout: float | None) -> None:
-            observed["timeout"] = timeout
-            raise subprocess.TimeoutExpired(cmd="pack", timeout=timeout or 0.0)
-
-        exit_code = run_pipeline(
-            args, training_command_runner=_make_fake_runner(), stage_runner=timeout_stage
-        )
-
-        assert exit_code == 2
-        assert observed["timeout"] == 1
-        assert json.loads((output_dir / "failure.json").read_text())["stage"] == "pack"
-
     @pytest.mark.parametrize("payload", [None, "not-json", "{}"])
     def test_missing_or_malformed_train_profile_is_a_structured_artifact_failure(
         self, tmp_path: Path, payload: str | None
@@ -1737,10 +1536,8 @@ class TestRunPipelineFailures:
         args, output_dir = self._base_args_and_config(tmp_path)
         base = _make_fake_runner()
 
-        def runner(
-            command: Sequence[str], timeout: float | None, log_path: Path
-        ) -> subprocess.CompletedProcess[str]:
-            completed = base(command, timeout, log_path)
+        def runner(command: Sequence[str], log_path: Path) -> subprocess.CompletedProcess[str]:
+            completed = base(command, log_path)
             profile_output = Path(_arg_value(command, "--profile-output"))
             profile_output.unlink(missing_ok=True)
             if payload is not None:
@@ -1770,12 +1567,12 @@ class TestRunPipelineFailures:
         base_runner = _make_fake_runner()
 
         def corrupting_runner(
-            command: Sequence[str], timeout: float | None, log_path: Path
+            command: Sequence[str], log_path: Path
         ) -> subprocess.CompletedProcess[str]:
             if _arg_value(command, "--ddp-mode") == "train":
                 Path(_arg_value(command, "--profile-output")).write_text("partial")
                 return subprocess.CompletedProcess(command, 1, "", "boom")
-            return base_runner(command, timeout, log_path)
+            return base_runner(command, log_path)
 
         assert run_pipeline(args, training_command_runner=corrupting_runner) == 2
         profile = _failed_attempt_profile(output_dir)
@@ -1783,21 +1580,6 @@ class TestRunPipelineFailures:
         stage_seconds = cast(dict[str, float], profile["stage_seconds"])
         assert stage_seconds["pack"] >= 0
         assert profile["cold_cache"] is True
-
-    def test_train_subprocess_timeout_writes_failure_and_returns_2(self, tmp_path: Path) -> None:
-        args, output_dir = self._base_args_and_config(tmp_path)
-
-        exit_code = run_pipeline(
-            args, training_command_runner=_make_fake_runner(timeout_mode="train")
-        )
-
-        assert exit_code == 2
-        failure = json.loads((output_dir / "failure.json").read_text())
-        assert failure["stage"] == "train"
-        assert failure["timeout_seconds"] == 5
-        assert failure["log_tail"].endswith("worker stalled")
-        assert failure["last_progress"] is None
-        assert (output_dir / failure["log_path"]).is_file()
 
     def test_failed_new_attempt_keeps_prior_completion_unambiguous(self, tmp_path: Path) -> None:
         args, output_dir = self._base_args_and_config(tmp_path)
@@ -1850,77 +1632,35 @@ class TestRunPipelineFailures:
         )
         assert json.loads((output_dir / "failure.json").read_text())["stage"] == "artifacts"
 
-    def test_artifact_timeout_preserves_worker_and_pipeline_evidence(self, tmp_path: Path) -> None:
+    def test_production_runner_apis_take_only_work_inputs(self, tmp_path: Path) -> None:
         args, output_dir = self._base_args_and_config(tmp_path)
-        calls = 0
+        command_calls = 0
+        stage_calls = 0
+        base_runner = _make_fake_runner()
 
-        # Two supervised stages remain: pack, then artifacts.
-        def stage_runner(operation: Callable[[], None], timeout: float | None) -> None:
-            nonlocal calls
-            calls += 1
-            if calls == 2:
-                raise subprocess.TimeoutExpired(cmd="artifacts", timeout=timeout or 0.0)
+        def training_runner(
+            command: Sequence[str], log_path: Path
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal command_calls
+            command_calls += 1
+            return base_runner(command, log_path)
+
+        def stage_runner(operation: Callable[[], None]) -> None:
+            nonlocal stage_calls
+            stage_calls += 1
             operation()
 
-        worker_profile = {
-            **_valid_worker_profile(),
-            "counterfactual_stop_epoch": 1,
-            "per_rank": [
-                {
-                    "rank": rank,
-                    "pairs": 2,
-                    "batches": 1,
-                    "steps": 1,
-                    "tokens": 8,
-                    "train_wall_seconds": 1.0,
-                    "data_wait_seconds": 0.01,
-                    "pairs_per_second": 42.0,
-                    "tokens_per_second": 8.0,
-                }
-                for rank in range(4)
-            ],
-        }
         assert (
             run_pipeline(
                 args,
-                training_command_runner=_make_fake_runner(train_runtime_profile=worker_profile),
+                training_command_runner=training_runner,
                 stage_runner=stage_runner,
             )
-            == 2
+            == 0
         )
-        failure = json.loads((output_dir / "failure.json").read_text())
-        assert failure["stage"] == "artifacts"
-        profile = _failed_attempt_profile(output_dir)
-        assert profile["counterfactual_stop_epoch"] == 1
-        per_rank = cast(list[dict[str, object]], profile["per_rank"])
-        assert per_rank[0]["pairs_per_second"] == 42.0
-        assert profile["token_budget"] == _RUNTIME_TOKEN_BUDGET
-
-    def test_cold_b0_total_budget_includes_publication_and_rolls_back(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        args, output_dir = self._base_args_and_config(tmp_path)
-        before = self._seed_canonical(output_dir)
-        ticks = iter((0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 45.0))
-        monkeypatch.setattr(
-            "src.e2_pipeline.time",
-            types.SimpleNamespace(monotonic=lambda: next(ticks), time=lambda: 123.0),
-        )
-
-        assert (
-            run_pipeline(
-                args,
-                training_command_runner=_make_fake_runner(),
-                stage_runner=lambda operation, _timeout: operation(),
-            )
-            == 2
-        )
-
-        self._assert_canonical_unchanged(output_dir, before)
-        failure = json.loads((output_dir / "failure.json").read_text())
-        assert failure["stage"] == "total_budget"
-        assert failure["elapsed_seconds"] == 45.0
-        assert failure["limit_seconds"] == 40
+        assert command_calls == 1
+        assert stage_calls == 3
+        assert (output_dir / "complete.json").is_file()
 
 
 # ---------------------------------------------------------------------- run_pipeline: test stage
@@ -2048,7 +1788,7 @@ class TestRunPipelineTestStage:
         exit_code = run_pipeline(
             args,
             training_command_runner=_make_fake_runner(),
-            stage_runner=lambda operation, _timeout: operation(),
+            stage_runner=lambda operation: operation(),
         )
 
         assert exit_code == 0
@@ -2077,7 +1817,7 @@ class TestRunPipelineTestStage:
             run_pipeline(
                 args,
                 training_command_runner=_make_fake_runner(),
-                stage_runner=lambda operation, _timeout: operation(),
+                stage_runner=lambda operation: operation(),
             )
             == 0
         )
@@ -2109,7 +1849,7 @@ class TestRunPipelineTestStage:
             run_pipeline(
                 args,
                 training_command_runner=_make_fake_runner(),
-                stage_runner=lambda operation, _timeout: operation(),
+                stage_runner=lambda operation: operation(),
             )
             == 0
         )
@@ -2129,7 +1869,7 @@ class TestRunPipelineTestStage:
         exit_code = run_pipeline(
             args,
             training_command_runner=_make_fake_runner(),
-            stage_runner=lambda operation, _timeout: operation(),
+            stage_runner=lambda operation: operation(),
         )
 
         assert exit_code == 2
@@ -2160,7 +1900,7 @@ class TestRunPipelineTestStage:
         exit_code = run_pipeline(
             args,
             training_command_runner=_make_fake_runner(),
-            stage_runner=lambda operation, _timeout: operation(),
+            stage_runner=lambda operation: operation(),
         )
 
         assert exit_code == 2
@@ -2170,20 +1910,13 @@ class TestRunPipelineTestStage:
         assert f"python -m src.e2_pipeline --config {args.config}" in failure["message"]
         assert (output_dir / "complete.json").is_file()
 
-    def test_test_stage_runs_without_a_deadline(self, tmp_path: Path) -> None:
-        """The test stage is supervised but unbounded.
-
-        Scoring cost is set by the pairs universe -- the candidate universe is
-        ~2.0M pairs, ~32x the test universe -- so no fixed budget can be chosen
-        up front. A wrong one silently discards hours of finished scoring, which
-        is exactly how the first real run died. Both the supervising stage and
-        the per-shard fan-out must therefore receive `None`.
-        """
+    def test_test_stage_runs_through_stage_runner(self, tmp_path: Path) -> None:
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
-        timeouts: list[float | None] = []
+        stage_calls = 0
 
-        def stage_runner(operation: Callable[[], None], timeout: float | None) -> None:
-            timeouts.append(timeout)
+        def stage_runner(operation: Callable[[], None]) -> None:
+            nonlocal stage_calls
+            stage_calls += 1
             operation()
 
         exit_code = run_pipeline(
@@ -2191,8 +1924,7 @@ class TestRunPipelineTestStage:
         )
 
         assert exit_code == 0
-        # pack, artifacts, test -- the test stage is the last and is unbounded.
-        assert timeouts[-1] is None
+        assert stage_calls == 3  # pack, artifacts, test
         assert (output_dir / "test_complete.json").is_file()
 
     def test_max_steps_debug_run_never_reaches_the_test_stage(
@@ -2221,10 +1953,8 @@ class TestRunPipelineTestStage:
 
         monkeypatch.setattr(test_protocol, "run_test_protocol", never_called)
 
-        def runner(
-            command: Sequence[str], timeout: float | None, log_path: Path
-        ) -> subprocess.CompletedProcess[str]:
-            result = _make_fake_runner(train_runtime_profile=profile)(command, timeout, log_path)
+        def runner(command: Sequence[str], log_path: Path) -> subprocess.CompletedProcess[str]:
+            result = _make_fake_runner(train_runtime_profile=profile)(command, log_path)
             if _arg_value(command, "--ddp-mode") == "train":
                 out = Path(_arg_value(command, "--output-dir"))
                 best = torch.load(out / "best.pt", weights_only=False)
@@ -2298,7 +2028,7 @@ class TestRunPipelineTestStage:
             run_pipeline(
                 args,
                 training_command_runner=_make_fake_runner(),
-                stage_runner=lambda operation, _timeout: operation(),
+                stage_runner=lambda operation: operation(),
             )
             == 0
         )
@@ -2318,7 +2048,7 @@ class TestRunPipelineTestStage:
             run_pipeline(
                 args,
                 training_command_runner=_make_fake_runner(),
-                stage_runner=lambda operation, _timeout: operation(),
+                stage_runner=lambda operation: operation(),
             )
             == 0
         )
@@ -2350,7 +2080,7 @@ class TestRunPipelineTestStage:
             run_pipeline(
                 args,
                 training_command_runner=_make_fake_runner(),
-                stage_runner=lambda operation, _timeout: operation(),
+                stage_runner=lambda operation: operation(),
             )
             == 0
         )
@@ -2365,7 +2095,7 @@ class TestRunPipelineTestStage:
         exit_code = run_pipeline(
             args,
             training_command_runner=_make_fake_runner(),
-            stage_runner=lambda operation, _timeout: operation(),
+            stage_runner=lambda operation: operation(),
         )
 
         assert exit_code == 2
@@ -2375,46 +2105,6 @@ class TestRunPipelineTestStage:
         assert (output_dir / "best.pt").is_file()
         assert (output_dir / "complete.json").is_file()
         # ...but the sentinel certifying the checkpoint it REPLACED must not.
-        assert not (output_dir / "test_complete.json").exists()
-        assert not (output_dir / "test_report.json").exists()
-
-    def test_republish_removes_stale_test_completion_when_the_new_test_stage_times_out(
-        self, tmp_path: Path
-    ) -> None:
-        """Covers the process-dies-mid-test case: no new sentinel is ever written."""
-        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
-
-        assert (
-            run_pipeline(
-                args,
-                training_command_runner=_make_fake_runner(),
-                stage_runner=lambda operation, _timeout: operation(),
-            )
-            == 0
-        )
-        assert (output_dir / "test_complete.json").is_file()
-
-        calls = 0
-
-        # `calls` only counts this SECOND run_pipeline invocation (the first
-        # ran under its own stage_runner above). Three supervised stages per
-        # run: pack, artifacts, then test.
-        def stage_runner(operation: Callable[[], None], timeout: float | None) -> None:
-            nonlocal calls
-            calls += 1
-            if calls == 3:
-                raise subprocess.TimeoutExpired(cmd="test", timeout=timeout or 0.0)
-            operation()
-
-        exit_code = run_pipeline(
-            args, training_command_runner=_make_fake_runner(), stage_runner=stage_runner
-        )
-
-        assert exit_code == 2
-        failure = json.loads((output_dir / "failure.json").read_text())
-        assert failure["stage"] == "test"
-        assert (output_dir / "complete.json").is_file()
-        assert (output_dir / "best.pt").is_file()
         assert not (output_dir / "test_complete.json").exists()
         assert not (output_dir / "test_report.json").exists()
 
@@ -2429,7 +2119,7 @@ class TestRunPipelineTestStage:
                 run_pipeline(
                     args,
                     training_command_runner=_make_fake_runner(),
-                    stage_runner=lambda operation, _timeout: operation(),
+                    stage_runner=lambda operation: operation(),
                 )
                 == 0
             )

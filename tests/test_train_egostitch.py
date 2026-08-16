@@ -160,10 +160,6 @@ _RUNTIME: dict[str, Any] = {
     "token_budget": 4,
     "max_pairs_per_rank": 1024,
     "memory_limit_gib": 85.0,
-    "total_budget_seconds": 70,
-    "pack_budget_seconds": 20,
-    "train_eval_budget_seconds": 40,
-    "artifact_budget_seconds": 10,
 }
 
 
@@ -217,20 +213,24 @@ class TestLoadConfig:
         with pytest.raises(ValueError, match="token_budget"):
             te.load_config(_write_config(tmp_path, runtime=runtime))
 
-    def test_requires_total_runtime_budget(self, tmp_path: Path) -> None:
-        runtime = dict(_RUNTIME)
-        del runtime["total_budget_seconds"]
-        with pytest.raises(ValueError, match="total_budget_seconds"):
-            te.load_config(_write_config(tmp_path, runtime=runtime))
-
-    def test_rejects_runtime_stage_budget_sum_mismatch(self, tmp_path: Path) -> None:
-        runtime = dict(_RUNTIME, total_budget_seconds=71)
-        with pytest.raises(ValueError, match="stage budgets must sum"):
-            te.load_config(_write_config(tmp_path, runtime=runtime))
-
-    @pytest.mark.parametrize("retired_key", ["setup_probe_budget_seconds", "probe_warmup_steps"])
-    def test_rejects_retired_runtime_keys(self, tmp_path: Path, retired_key: str) -> None:
+    @pytest.mark.parametrize(
+        "retired_key",
+        [
+            "total" + "_budget_seconds",
+            "pack" + "_budget_seconds",
+            "setup_probe" + "_budget_seconds",
+            "train_eval" + "_budget_seconds",
+            "artifact" + "_budget_seconds",
+            "reserve" + "_seconds",
+        ],
+    )
+    def test_rejects_removed_runtime_time_keys(self, tmp_path: Path, retired_key: str) -> None:
         runtime = dict(_RUNTIME, **{retired_key: 1})
+        with pytest.raises(ValueError, match="unknown config keys"):
+            te.load_config(_write_config(tmp_path, runtime=runtime))
+
+    def test_rejects_retired_runtime_probe_key(self, tmp_path: Path) -> None:
+        runtime = dict(_RUNTIME, probe_warmup_steps=1)
         with pytest.raises(ValueError, match="unknown config keys"):
             te.load_config(_write_config(tmp_path, runtime=runtime))
 

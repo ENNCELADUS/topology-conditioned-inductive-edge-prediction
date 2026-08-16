@@ -152,7 +152,6 @@ hpc/run.sh test \
   --output-dir outputs/egostitch_e2e_v3_full/structure_control_6a_v3 \
   --data-root data --strategy breadth_first \
   --arm structure_control_6a_v3 --seed 0 \
-  --timeout-seconds 1800 \
   --scaffold-control shuffle_within_pair_v3 \
   --rescore-reason "scoring-time structure control over the full checkpoint"
 
@@ -161,15 +160,10 @@ hpc/run.sh test \
   --output-dir outputs/egostitch_e2e_v3_full/structure_control_6e_v1 \
   --data-root data --strategy breadth_first \
   --arm structure_control_6e_v1 --seed 0 \
-  --timeout-seconds 1800 \
   --scaffold-control rewire_checkerboard_v1 \
   --rescore-reason "scoring-time structure control over the full checkpoint"
 ```
 
-Scoring has no wall-clock deadline. A pass's cost is set by its pairs universe — the
-candidate universe is 2,037,171 pairs, ~32x the test universe's 64,038, and takes hours
-per shard — so any fixed budget is a guess that discards finished work when it is too
-small. `--timeout-seconds` remains available on `score`/`test` to impose one deliberately.
 A rerun after a later pass failed can pass `--reuse-existing-scores` to keep the
 already-written `scores/<pairs>.npz` files instead of rescoring those universes; reused
 artifacts are still cross-checked against the others for checkpoint identity.
@@ -206,16 +200,14 @@ training artifacts. The runner returns `0` on success and `2` on failure without
 
 `hpc/run.sh score` is a thin passthrough to `python -m src.score_fanout` for scoring one
 pairs universe outside the automatic per-arm test protocol above — for example
-regenerating a candidate-universe artifact for a G1/G2 gate rerun. It requires
-`--timeout-seconds` (the hard wall-clock deadline for each shard and the merge), then
-auto-detects GPU count, pins `--device cuda --amp bf16`, and on a multi-GPU node launches
+regenerating a candidate-universe artifact for a G1/G2 gate rerun. It auto-detects GPU
+count, pins `--device cuda --amp bf16`, and on a multi-GPU node launches
 one contiguous shard per GPU before strictly merging them; the shell no longer performs
 any of that orchestration itself. For V3.1, pass `--pack-dir` to keep the BF16 token
 table GPU-resident and avoid repeated per-pair feature-file reads.
 
 ```bash
 hpc/run.sh score \
-  --timeout-seconds 1800 \
   --checkpoint outputs/b0_v31/best.pt \
   --pairs candidate --data-root data --strategy breadth_first \
   --output scores/b0_v31_candidate.npz

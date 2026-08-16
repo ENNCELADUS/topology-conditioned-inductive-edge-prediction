@@ -75,6 +75,14 @@ from src.train_b0 import (
 from torch.utils.data import DataLoader
 
 pytestmark = pytest.mark.unit
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SHIPPED_B0_KD_CONFIGS = (
+    "b0_v31_breadth_first.yaml",
+    "b1_kd_control_breadth_first.yaml",
+    "b1_kd_d1_breadth_first.yaml",
+    "b1_kd_d2_breadth_first.yaml",
+    "b1_kd_d3_breadth_first.yaml",
+)
 
 # Tiny V_val seam: n_regions=1 keeps growth on the fixture's single path
 # component; buckets_per_size=2 is `precompute_bucket_reference`'s minimum for
@@ -136,12 +144,6 @@ def _runtime_dict() -> dict[str, object]:
         "token_budget": 524288,
         "max_pairs_per_rank": 4096,
         "memory_limit_gib": 85.0,
-        "total_budget_seconds": 3600,
-        "pack_budget_seconds": 300,
-        "setup_probe_budget_seconds": 300,
-        "train_eval_budget_seconds": 2820,
-        "artifact_budget_seconds": 60,
-        "reserve_seconds": 120,
         "probe_warmup_steps": 10,
         "probe_timed_steps": 30,
     }
@@ -220,6 +222,10 @@ class _TinyPairMLP(nn.Module):
 
 
 class TestLoadConfig:
+    @pytest.mark.parametrize("config_name", SHIPPED_B0_KD_CONFIGS)
+    def test_shipped_b0_and_kd_configs_load(self, config_name: str) -> None:
+        load_config(REPO_ROOT / "configs" / config_name)
+
     def test_valid_config_loads_all_fields(self, tmp_path: Path) -> None:
         config_path = tmp_path / "cfg.yaml"
         _write_yaml_config(config_path)
@@ -264,15 +270,24 @@ class TestLoadConfig:
         assert cfg.runtime is not None
         assert cfg.runtime.world_size == 0
         assert cfg.runtime.token_budget == 524288
-        assert cfg.runtime.total_budget_seconds == 3600
 
-    def test_runtime_budget_must_sum_to_total(self, tmp_path: Path) -> None:
-        runtime = _runtime_dict()
-        runtime["reserve_seconds"] = 119
+    @pytest.mark.parametrize(
+        "retired_key",
+        [
+            "total" + "_budget_seconds",
+            "pack" + "_budget_seconds",
+            "setup_probe" + "_budget_seconds",
+            "train_eval" + "_budget_seconds",
+            "artifact" + "_budget_seconds",
+            "reserve" + "_seconds",
+        ],
+    )
+    def test_rejects_removed_runtime_time_keys(self, tmp_path: Path, retired_key: str) -> None:
+        runtime = {**_runtime_dict(), retired_key: 1}
         config_path = tmp_path / "cfg.yaml"
         _write_yaml_config(config_path, {"runtime": runtime})
 
-        with pytest.raises(ValueError, match="runtime stage budgets must sum to 3600"):
+        with pytest.raises(ValueError, match="unknown config keys"):
             load_config(config_path)
 
     @pytest.mark.parametrize("token_budget", [0, -1])
