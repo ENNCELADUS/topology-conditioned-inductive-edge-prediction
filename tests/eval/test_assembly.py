@@ -8,6 +8,7 @@ from src.eval.assembly import (
     assemble_degree_quota,
     assemble_graph,
     density_matched_threshold,
+    estimated_density_matched_threshold,
     rank_matched_degree_quotas,
     threshold_sweep,
 )
@@ -83,6 +84,109 @@ class TestDensityMatchedThreshold:
         t = density_matched_threshold(probs, target_edges=3)
         assert t == pytest.approx(0.5)
         assert int((probs >= t).sum()) == 3
+
+
+@pytest.mark.unit
+class TestEstimatedDensityMatchedThreshold:
+    def test_exact_equivalence_when_sample_covers_full_complement(self) -> None:
+        rng = np.random.default_rng(11)
+        for target in (0, 1, 3, 7, 15, 25, 1000):
+            probs = rng.uniform(0.0, 1.0, size=20)
+            exact, sample = probs[:8], probs[8:]
+            expected = density_matched_threshold(probs, target_edges=target)
+            actual = estimated_density_matched_threshold(
+                exact, sample, sampled_total=len(sample), target_edges=target
+            )
+            assert actual == pytest.approx(expected)
+
+    def test_exact_equivalence_tie_heavy(self) -> None:
+        probs = np.array([0.9, 0.5, 0.5, 0.5, 0.1, 0.1, 0.9])
+        exact, sample = probs[:3], probs[3:]
+        for target in (0, 1, 2, 3, 4, 5, 6, 100):
+            expected = density_matched_threshold(probs, target_edges=target)
+            actual = estimated_density_matched_threshold(
+                exact, sample, sampled_total=len(sample), target_edges=target
+            )
+            assert actual == pytest.approx(expected)
+
+    def test_tie_atomic_across_arrays(self) -> None:
+        # Value 0.5 appears in both arrays; combined weighted count for 0.5's
+        # tie-group is 1 (exact) + 2 (sampled, weight sampled_total/len(sample)
+        # = 2/1 = 2) = 3, on top of 0.9's weight-1 group -> total weight 4.
+        exact = np.array([0.9, 0.5])
+        sample = np.array([0.5])
+        # target=4 admits the full weighted population -> the 0.5 group included.
+        t = estimated_density_matched_threshold(exact, sample, sampled_total=2, target_edges=4)
+        assert t == pytest.approx(0.5)
+        # target=3 cannot fit the 0.5 group's weight-3 tie (cumulative would be
+        # 4) -> only the top group (weight 1) admits.
+        t2 = estimated_density_matched_threshold(exact, sample, sampled_total=2, target_edges=3)
+        assert t2 == pytest.approx(0.9)
+
+    def test_target_zero_or_negative_excludes_all(self) -> None:
+        exact = np.array([0.9, 0.5, 0.1])
+        sample = np.array([0.7, 0.3])
+        overall_max = 0.9
+        for target in (0, -5):
+            t = estimated_density_matched_threshold(
+                exact, sample, sampled_total=4, target_edges=target
+            )
+            assert t > overall_max
+            assert t == pytest.approx(float(np.nextafter(overall_max, np.inf)))
+
+    def test_target_very_large_includes_all(self) -> None:
+        exact = np.array([0.9, 0.5, 0.1])
+        sample = np.array([0.7, 0.3])
+        t = estimated_density_matched_threshold(exact, sample, sampled_total=4, target_edges=10_000)
+        assert t == pytest.approx(0.1)
+
+    def test_sampled_total_zero_delegates_to_density_matched_threshold(self) -> None:
+        exact = np.array([0.9, 0.5, 0.1, 0.3])
+        expected = density_matched_threshold(exact, target_edges=2)
+        actual = estimated_density_matched_threshold(
+            exact, np.array([]), sampled_total=0, target_edges=2
+        )
+        assert actual == pytest.approx(expected)
+
+    def test_empty_exact_probs_raises(self) -> None:
+        with pytest.raises(ValueError, match="exact_probs"):
+            estimated_density_matched_threshold(
+                np.array([]), np.array([0.5]), sampled_total=1, target_edges=1
+            )
+
+    def test_negative_sampled_total_raises(self) -> None:
+        with pytest.raises(ValueError, match="sampled_total"):
+            estimated_density_matched_threshold(
+                np.array([0.5]), np.array([]), sampled_total=-1, target_edges=1
+            )
+
+    def test_positive_sampled_total_with_empty_sample_raises(self) -> None:
+        with pytest.raises(ValueError, match="sampled_probs"):
+            estimated_density_matched_threshold(
+                np.array([0.5]), np.array([]), sampled_total=5, target_edges=1
+            )
+
+    def test_sample_larger_than_sampled_total_raises(self) -> None:
+        with pytest.raises(ValueError, match="sampled_total"):
+            estimated_density_matched_threshold(
+                np.array([0.5]), np.array([0.1, 0.2, 0.3]), sampled_total=2, target_edges=1
+            )
+
+    def test_statistical_sanity_large_population(self) -> None:
+        rng = np.random.default_rng(42)
+        population = rng.uniform(0.0, 1.0, size=200_000)
+        exact_size = 20_000
+        exact = population[:exact_size]
+        rest = population[exact_size:]
+        sample_size = int(0.1 * len(rest))
+        sample = rng.choice(rest, size=sample_size, replace=False)
+
+        target = 9_000
+        t = estimated_density_matched_threshold(
+            exact, sample, sampled_total=len(rest), target_edges=target
+        )
+        realized = int((population >= t).sum())
+        assert abs(realized - target) / target < 0.05
 
 
 def _seeded_graph_pairs_probs_buckets() -> tuple[

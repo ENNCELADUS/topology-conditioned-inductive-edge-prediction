@@ -27,10 +27,14 @@ from src.data.artifacts import ArtifactVerificationError
 from src.data.distributed_pairs import CompactPairBatchDataset, PairBatchSpec
 from src.data.packed_features import PackedFeatureTable, build_packed_features
 from src.data.pairs import TokenPairDataset
-from src.data.val_region import ValRegionParams, val_universe_arrays
+from src.data.val_region import ValRegionParams, val_ball_union_universe
 from src.eval.checkpoint_selection import TopologyValidationMetrics
 from src.eval.edge_metrics import EdgeMetrics
-from src.eval.val_topology import ValTopologyReference, build_val_topology_reference
+from src.eval.val_topology import (
+    ValTopologyReference,
+    ValTopologyResult,
+    build_val_topology_reference,
+)
 from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
 from src.model.egostitch.classifier.layers import MLPHead
 from src.train_b0 import (
@@ -40,6 +44,7 @@ from src.train_b0 import (
     GpuBatchIterable,
     TrainResult,
     ValidationOutcome,
+    ValThresholdTransfer,
     _all_ranks_loss_finite,
     _build_packed_v3_1_loaders,
     _build_v3_1_loaders,
@@ -764,6 +769,64 @@ class TestWriteOutputs:
         assert "timestamp" in run_metadata
         assert run_metadata["dropped_pair_counts"] == assembled_dropped_counts
         assert run_metadata["training_interactions"] == "all_train_positives"
+        # No topology ran (unit-test TrainResult), so the transfer block is omitted.
+        assert "val_threshold_transfer" not in run_metadata
+
+    def test_writes_val_threshold_transfer_when_topology_present(self, tmp_path: Path) -> None:
+        output_dir = tmp_path / "run"
+        cfg = _tiny_config(epochs=1)
+        cfg = Config(
+            model=cfg.model,
+            data=cfg.data,
+            optim=cfg.optim,
+            eval=cfg.eval,
+            seed=cfg.seed,
+            output_dir=output_dir,
+            mixed_precision=cfg.mixed_precision,
+        )
+        model = _TinyPairMLP(input_dim=4, hidden_dims=(8,), dropout=0.0)
+        state_dict = {k: v.clone() for k, v in model.state_dict().items()}
+        metrics = EdgeMetrics(
+            auroc=0.9,
+            auprc=0.85,
+            accuracy=0.8,
+            sensitivity=0.7,
+            specificity=0.9,
+            precision=0.75,
+            recall=0.7,
+            f1=0.72,
+            mcc=0.5,
+            ece=0.05,
+            brier=0.1,
+            threshold=0.5,
+            n_pos=10,
+            n_neg=10,
+        )
+        result = TrainResult(
+            best_state_dict=state_dict,
+            best_epoch=1,
+            best_val_metrics=metrics,
+            last_state_dict=state_dict,
+            last_epoch=1,
+            last_val_metrics=metrics,
+            history=[{"epoch": 1, "train_loss": 0.5, "val_auroc": 0.8, "val_auprc": 0.75}],
+            stopped_early=False,
+            val_threshold_transfer=ValThresholdTransfer(
+                n_val=17, gold_loopless_edges=42, threshold=0.37, admitted_non_self_fraction=0.021
+            ),
+        )
+        output_dir.mkdir(parents=True)
+        (output_dir / "metrics.jsonl").write_text('{"epoch": 1}\n', encoding="utf-8")
+
+        write_outputs(result, cfg, {"input_dim": 4, "hidden_dims": [8], "dropout": 0.0}, {})
+
+        run_metadata = json.loads((output_dir / "run_metadata.json").read_text())
+        assert run_metadata["val_threshold_transfer"] == {
+            "n_val": 17,
+            "gold_loopless_edges": 42,
+            "threshold": 0.37,
+            "admitted_non_self_fraction": 0.021,
+        }
 
 
 # ------------------------------------------------- assemble_data (feature-coverage gate)
@@ -1150,12 +1213,16 @@ def test_two_pass_evaluate_fn_produces_cls_metrics_and_finite_topology(
 
     val_split = assembled.val_split
     reference = build_val_topology_reference(val_split)
-    u_idx, v_idx = val_universe_arrays(val_split.v_val)
+    universe = val_ball_union_universe(val_split)
+    u_idx, v_idx = universe.u_idx, universe.v_idx
+    n_u = len(u_idx)
     node_index = table.manifest.node_index()
     lengths_by_node = {record.node_id: record.length for record in table.manifest.nodes}
     node_positions = np.array([node_index[node] for node in reference.nodes], dtype=np.int64)
-    node_a_all = torch.from_numpy(node_positions[u_idx]).to(torch.int64)
-    node_b_all = torch.from_numpy(node_positions[v_idx]).to(torch.int64)
+    all_u_idx = np.concatenate([universe.u_idx, universe.sample_u_idx])
+    all_v_idx = np.concatenate([universe.v_idx, universe.sample_v_idx])
+    node_a_all = torch.from_numpy(node_positions[all_u_idx]).to(torch.int64)
+    node_b_all = torch.from_numpy(node_positions[all_v_idx]).to(torch.int64)
     boundary = max(lengths_by_node[node] for node in reference.nodes)
 
     val_cls_pairs, _val_cls_labels = _val_cls_rows(val_split, assembled.exclude_nodes)
@@ -1171,6 +1238,8 @@ def test_two_pass_evaluate_fn_produces_cls_metrics_and_finite_topology(
             batch_pairs=8,
             u_idx=u_idx,
             v_idx=v_idx,
+            n_u=n_u,
+            complement_total=universe.complement_total,
             reference=reference,
         ),
     )
@@ -1190,11 +1259,13 @@ def test_two_pass_evaluate_fn_produces_cls_metrics_and_finite_topology(
     assert all(
         np.isfinite(value)
         for value in (
-            outcome.topology.gs,
-            outcome.topology.rd,
-            outcome.topology.degree_mmd,
-            outcome.topology.clustering_mmd,
-            outcome.topology.spectral_mmd,
+            outcome.topology.metrics.gs,
+            outcome.topology.metrics.rd,
+            outcome.topology.metrics.degree_mmd,
+            outcome.topology.metrics.clustering_mmd,
+            outcome.topology.metrics.spectral_mmd,
+            outcome.topology.threshold,
+            outcome.topology.admitted_non_self_fraction,
         )
     )
 
@@ -1505,8 +1576,14 @@ def test_epoch_probe_uses_disposable_artifact_directory(
         lambda val_split: SimpleNamespace(nodes=("node_a",)),
     )
     monkeypatch.setattr(
-        "src.train_b0.val_universe_arrays",
-        lambda v_val: (np.array([0], dtype=np.int32), np.array([0], dtype=np.int32)),
+        "src.train_b0.val_ball_union_universe",
+        lambda val_split, **kwargs: SimpleNamespace(
+            u_idx=np.array([0], dtype=np.int32),
+            v_idx=np.array([0], dtype=np.int32),
+            sample_u_idx=np.array([], dtype=np.int32),
+            sample_v_idx=np.array([], dtype=np.int32),
+            complement_total=0,
+        ),
     )
     monkeypatch.setattr(
         "src.train_b0.PackedFeatureTable.from_pack",
@@ -1757,8 +1834,100 @@ def test_evaluate_val_universe_coverage_failure_raises_on_non_main_rank() -> Non
             batch_pairs=4,
             u_idx=u_idx,
             v_idx=v_idx,
+            n_u=4,
+            complement_total=0,
             reference=cast(ValTopologyReference, None),
         )
+
+
+class _EchoUniverseTable:
+    """Duck-typed packed-table stand-in whose embedding echoes the node index.
+
+    Lets a test recover exactly which node each scored row carried, so the
+    U-vs-complement-sample split point (`n_u`) can be checked directly.
+    """
+
+    def gather_nodes(
+        self, node_indices: torch.Tensor, boundary: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        emb = torch.zeros(node_indices.numel(), boundary, 1)
+        emb[:, 0, 0] = node_indices.to(torch.float32)
+        lengths = torch.ones(node_indices.numel(), dtype=torch.long)
+        return emb, lengths
+
+
+class _EchoUniverseModel(nn.Module):
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {"logits": batch["emb_a"][:, 0, 0]}
+
+
+def test_evaluate_val_universe_splits_gathered_logits_at_n_u(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gathered, row-ID-sorted logits must split U-rows-first at `n_u`.
+
+    `node_a_all` concatenates 3 U rows then 2 pinned complement-sample rows;
+    the echo model reports each row's node index as its logit, so the split
+    is verified by which values reach `val_region_topology_metrics` as
+    `logits` (U) vs `sample_logits` (complement).
+    """
+    captured: dict[str, object] = {}
+
+    def fake_val_region_topology_metrics(
+        *,
+        u_idx: np.ndarray,
+        v_idx: np.ndarray,
+        logits: np.ndarray,
+        sample_logits: np.ndarray,
+        complement_total: int,
+        reference: object,
+    ) -> ValTopologyResult:
+        captured["u_idx"] = u_idx
+        captured["v_idx"] = v_idx
+        captured["logits"] = logits
+        captured["sample_logits"] = sample_logits
+        captured["complement_total"] = complement_total
+        return ValTopologyResult(
+            metrics=TopologyValidationMetrics(
+                gs=1.0, rd=1.0, degree_mmd=0.0, clustering_mmd=0.0, spectral_mmd=0.0
+            ),
+            threshold=0.5,
+            admitted_non_self_fraction=0.1,
+        )
+
+    monkeypatch.setattr(
+        "src.train_b0.val_region_topology_metrics", fake_val_region_topology_metrics
+    )
+
+    model = _EchoUniverseModel()
+    table = cast(PackedFeatureTable, _EchoUniverseTable())
+    # U rows carry node indices 10, 20, 30; the complement sample carries 900, 901.
+    node_a_all = torch.tensor([10, 20, 30, 900, 901], dtype=torch.int64)
+    node_b_all = torch.zeros(5, dtype=torch.int64)
+    u_idx = np.array([0, 1, 2], dtype=np.int32)
+    v_idx = np.array([0, 1, 2], dtype=np.int32)
+
+    result = _evaluate_val_universe(
+        model,
+        Accelerator(),
+        table=table,
+        node_a_all=node_a_all,
+        node_b_all=node_b_all,
+        boundary=1,
+        batch_pairs=5,
+        u_idx=u_idx,
+        v_idx=v_idx,
+        n_u=3,
+        complement_total=2,
+        reference=cast(ValTopologyReference, None),
+    )
+
+    np.testing.assert_array_equal(cast(np.ndarray, captured["logits"]), [10.0, 20.0, 30.0])
+    np.testing.assert_array_equal(cast(np.ndarray, captured["sample_logits"]), [900.0, 901.0])
+    assert captured["complement_total"] == 2
+    assert result.threshold == pytest.approx(0.5)
+    assert result.admitted_non_self_fraction == pytest.approx(0.1)
+    assert result.metrics.gs == pytest.approx(1.0)
 
 
 def test_topology_from_metrics_row_ignores_old_style_keys() -> None:
@@ -1779,10 +1948,31 @@ def test_topology_from_metrics_row_parses_new_keys() -> None:
         "val_degree_mmd_ratio": 0.1,
         "val_clustering_mmd_ratio": 0.2,
         "val_spectral_mmd_ratio": 0.3,
+        "val_threshold": 0.42,
+        "val_admitted_non_self_fraction": 0.01,
     }
-    assert _topology_from_metrics_row(row) == TopologyValidationMetrics(
-        gs=0.5, rd=1.0, degree_mmd=0.1, clustering_mmd=0.2, spectral_mmd=0.3
+    assert _topology_from_metrics_row(row) == ValTopologyResult(
+        metrics=TopologyValidationMetrics(
+            gs=0.5, rd=1.0, degree_mmd=0.1, clustering_mmd=0.2, spectral_mmd=0.3
+        ),
+        threshold=0.42,
+        admitted_non_self_fraction=0.01,
     )
+
+
+def test_topology_from_metrics_row_rejects_row_missing_threshold_transfer_fields() -> None:
+    # A pre-ball-union-universe V_val row: the five topology metrics are
+    # present but `val_threshold`/`val_admitted_non_self_fraction` are not.
+    # This must fail closed the same way an old-style (pre-V_val) row does,
+    # never silently parse a stale-schema row.
+    row: dict[str, object] = {
+        "val_gs_bfs": 0.5,
+        "val_rd_bfs": 1.0,
+        "val_degree_mmd_ratio": 0.1,
+        "val_clustering_mmd_ratio": 0.2,
+        "val_spectral_mmd_ratio": 0.3,
+    }
+    assert _topology_from_metrics_row(row) is None
 
 
 def test_ddp_loop_records_counterfactual_stop_but_runs_all_epochs(tmp_path: Path) -> None:
@@ -2232,6 +2422,171 @@ def test_ddp_loop_resume_matches_uninterrupted_epoch_boundary(tmp_path: Path) ->
     )
     assert [row["epoch"] for row in finalization_only.history] == [1, 2, 3, 4]
     assert finalization_only.best_epoch == uninterrupted.best_epoch
+
+
+def test_ddp_loop_resume_round_trips_threshold_transfer_fields(tmp_path: Path) -> None:
+    """Check `val_threshold`/`val_admitted_non_self_fraction` survive a resume.
+
+    Round-tripped through metrics.jsonl and reconstructed by
+    `_topology_from_metrics_row`.
+    """
+    config_path = tmp_path / "cfg.yaml"
+    _write_yaml_config(config_path, {"optim.epochs": 3, "eval.patience": 8})
+    cfg = load_config(config_path)
+    batch = _loss_batch(1.0, [0, 1, 2, 3])
+
+    def topology_for(epoch: int) -> ValTopologyResult:
+        return ValTopologyResult(
+            metrics=TopologyValidationMetrics(
+                gs=0.5 + 0.01 * epoch,
+                rd=1.0,
+                degree_mmd=0.1,
+                clustering_mmd=0.1,
+                spectral_mmd=0.1,
+            ),
+            threshold=0.3 + 0.01 * epoch,
+            admitted_non_self_fraction=0.02 + 0.001 * epoch,
+        )
+
+    prior_dir = tmp_path / "prior"
+    evaluations = 0
+
+    def fail_after_two(
+        model: nn.Module, loader: Iterable[dict[str, torch.Tensor]], accelerator: Accelerator
+    ) -> ValidationOutcome:
+        nonlocal evaluations
+        evaluations += 1
+        if evaluations == 3:
+            raise RuntimeError("interrupted")
+        return ValidationOutcome(_constant_metrics(), topology_for(evaluations))
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        train_ddp_loop(
+            _StochasticLossModel(),
+            lambda epoch: [batch],
+            [batch],
+            cfg,
+            Accelerator(),
+            warmup_steps=1,
+            artifact_dir=prior_dir,
+            evaluate_fn=fail_after_two,
+            require_topology=True,
+        )
+
+    prior_rows = [
+        json.loads(line) for line in (prior_dir / "metrics.jsonl").read_text().splitlines()
+    ]
+    assert prior_rows[0]["val_threshold"] == pytest.approx(topology_for(1).threshold)
+    assert prior_rows[0]["val_admitted_non_self_fraction"] == pytest.approx(
+        topology_for(1).admitted_non_self_fraction
+    )
+
+    resumed_dir = tmp_path / "resumed"
+    (resumed_dir / "checkpoints").mkdir(parents=True)
+    shutil.copy2(prior_dir / "metrics.jsonl", resumed_dir / "metrics.jsonl")
+    for candidate in (prior_dir / "checkpoints").glob("epoch-*.pt"):
+        shutil.copy2(candidate, resumed_dir / "checkpoints" / candidate.name)
+
+    evaluations_resumed = 2  # two epochs already persisted by the prior attempt
+
+    def resume_evaluate(
+        model: nn.Module, loader: Iterable[dict[str, torch.Tensor]], accelerator: Accelerator
+    ) -> ValidationOutcome:
+        nonlocal evaluations_resumed
+        evaluations_resumed += 1
+        return ValidationOutcome(_constant_metrics(), topology_for(evaluations_resumed))
+
+    resumed = train_ddp_loop(
+        _StochasticLossModel(),
+        lambda epoch: [batch],
+        [batch],
+        cfg,
+        Accelerator(),
+        warmup_steps=1,
+        artifact_dir=resumed_dir,
+        resume_attempt=prior_dir,
+        evaluate_fn=resume_evaluate,
+        require_topology=True,
+    )
+
+    assert [row["epoch"] for row in resumed.history] == [1, 2, 3]
+    for epoch, entry in enumerate(resumed.history, start=1):
+        assert entry["val_threshold"] == pytest.approx(topology_for(epoch).threshold)
+        assert entry["val_admitted_non_self_fraction"] == pytest.approx(
+            topology_for(epoch).admitted_non_self_fraction
+        )
+    resumed_rows = [
+        json.loads(line) for line in (resumed_dir / "metrics.jsonl").read_text().splitlines()
+    ]
+    assert len(resumed_rows) == 3
+    for epoch, row in enumerate(resumed_rows, start=1):
+        assert row["val_threshold"] == pytest.approx(topology_for(epoch).threshold)
+        assert row["val_admitted_non_self_fraction"] == pytest.approx(
+            topology_for(epoch).admitted_non_self_fraction
+        )
+
+
+def test_ddp_loop_resume_rejects_epoch_missing_threshold_transfer_fields(
+    tmp_path: Path,
+) -> None:
+    """Check that resuming a topology-free attempt fails closed under `require_topology`.
+
+    A fully-completed attempt whose metrics rows carry no topology at all (an
+    older, pre-topology attempt directory) must fail closed under
+    `require_topology=True` rather than silently selecting on AUPRC alone.
+    (`_topology_from_metrics_row`'s own unit tests cover the narrower case of
+    a row with the five topology metrics but missing just the two new
+    threshold-transfer fields -- both are rejected by the same `all(key in
+    row ...)` check.)
+    """
+    config_path = tmp_path / "cfg.yaml"
+    _write_yaml_config(config_path, {"optim.epochs": 2, "eval.patience": 8})
+    cfg = load_config(config_path)
+    batch = _loss_batch(1.0, [0, 1, 2, 3])
+
+    prior_dir = tmp_path / "prior"
+
+    def evaluate_without_topology(
+        model: nn.Module, loader: Iterable[dict[str, torch.Tensor]], accelerator: Accelerator
+    ) -> ValidationOutcome:
+        return ValidationOutcome(_constant_metrics(), None)
+
+    train_ddp_loop(
+        _StochasticLossModel(),
+        lambda epoch: [batch],
+        [batch],
+        cfg,
+        Accelerator(),
+        warmup_steps=1,
+        artifact_dir=prior_dir,
+        evaluate_fn=evaluate_without_topology,
+        require_topology=False,
+    )
+
+    def resume_evaluate(
+        model: nn.Module, loader: Iterable[dict[str, torch.Tensor]], accelerator: Accelerator
+    ) -> ValidationOutcome:
+        raise AssertionError("resume must fail before training another epoch")
+
+    resumed_dir = tmp_path / "resumed"
+    (resumed_dir / "checkpoints").mkdir(parents=True)
+    shutil.copy2(prior_dir / "metrics.jsonl", resumed_dir / "metrics.jsonl")
+    for candidate in (prior_dir / "checkpoints").glob("epoch-*.pt"):
+        shutil.copy2(candidate, resumed_dir / "checkpoints" / candidate.name)
+
+    with pytest.raises(RuntimeError, match="resume across the V_val protocol change unsupported"):
+        train_ddp_loop(
+            _StochasticLossModel(),
+            lambda epoch: [batch],
+            [batch],
+            cfg,
+            Accelerator(),
+            warmup_steps=1,
+            artifact_dir=resumed_dir,
+            resume_attempt=prior_dir,
+            evaluate_fn=resume_evaluate,
+            require_topology=True,
+        )
 
 
 def test_ddp_loop_surfaces_rank_zero_epoch_io_failure(

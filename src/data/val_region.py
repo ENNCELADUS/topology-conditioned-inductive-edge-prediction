@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import heapq
 import json
+import math
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -452,6 +453,113 @@ def val_universe_arrays(v_val: Iterable[str]) -> tuple[NDArray[np.int32], NDArra
     return u_idx, v_idx
 
 
+_COMPLEMENT_SAMPLE_SEED: int = 424242
+BALL_UNION_COMPLEMENT_SAMPLE_SIZE: int = 200_000
+
+
+@dataclass(frozen=True)
+class ValBallUnionUniverse:
+    """The deduplicated within-ball pair union plus a pinned complement sample.
+
+    Attributes:
+        u_idx: Row endpoint one of every deduplicated within-ball pair
+            (self-pairs included), canonical `u_idx <= v_idx`, sorted
+            lexicographically by `(u_idx, v_idx)`.
+        v_idx: Row endpoint two, aligned with `u_idx`.
+        sample_u_idx: Row endpoint one of the pinned uniform complement
+            sample (non-self pairs outside the within-ball union), sorted
+            lexicographically.
+        sample_v_idx: Row endpoint two, aligned with `sample_u_idx`.
+        complement_total: Total count of non-self pairs outside the
+            within-ball union (before sampling).
+    """
+
+    u_idx: NDArray[np.int32]
+    v_idx: NDArray[np.int32]
+    sample_u_idx: NDArray[np.int32]
+    sample_v_idx: NDArray[np.int32]
+    complement_total: int
+
+
+def val_ball_union_universe(
+    split: ValRegionSplit, *, sample_size: int = BALL_UNION_COMPLEMENT_SAMPLE_SIZE
+) -> ValBallUnionUniverse:
+    """Return the within-ball pair union plus a pinned uniform complement sample.
+
+    The union `U` covers every unordered pair (self-pairs included) whose
+    endpoints share at least one common ball of `split.buckets`, deduplicated
+    globally across balls. The complement is every non-self pair over
+    `sorted(split.v_val)` NOT in `U`; it feeds threshold estimation only, so a
+    fixed-size pinned uniform sample (without replacement) stands in for it.
+
+    Indices are int32 positions into `sorted(split.v_val)`, the same index
+    space `val_universe_arrays` uses.
+
+    Args:
+        split: The derived V_val region split; `split.buckets` must be
+            non-empty.
+        sample_size: Complement sample size; capped at `complement_total`.
+
+    Returns:
+        The `ValBallUnionUniverse`.
+
+    Raises:
+        ValueError: If `sample_size < 0` or `split.buckets` is empty.
+    """
+    if sample_size < 0:
+        raise ValueError(f"sample_size must be >= 0, got {sample_size}")
+    if not split.buckets:
+        raise ValueError("split.buckets must be non-empty")
+
+    nodes = sorted(split.v_val)
+    n = len(nodes)
+    index = {node: i for i, node in enumerate(nodes)}
+
+    encoded_chunks: list[NDArray[np.int64]] = []
+    for balls in split.buckets.values():
+        for ball in balls:
+            ball_idx = np.array(sorted(index[node] for node in ball), dtype=np.int64)
+            if ball_idx.size == 0:
+                continue
+            tri_i, tri_j = np.triu_indices(ball_idx.size, k=0)
+            encoded_chunks.append(ball_idx[tri_i] * n + ball_idx[tri_j])
+
+    encoded_union = (
+        np.unique(np.concatenate(encoded_chunks)) if encoded_chunks else np.empty(0, dtype=np.int64)
+    )
+    u_idx = (encoded_union // n).astype(np.int32)
+    v_idx = (encoded_union % n).astype(np.int32)
+
+    nonself_mask = encoded_union % n != encoded_union // n
+    union_nonself_encoded = encoded_union[nonself_mask]
+
+    tri_u, tri_v = np.triu_indices(n, k=1)
+    full_nonself_encoded = tri_u.astype(np.int64) * n + tri_v.astype(np.int64)
+    complement_encoded = np.setdiff1d(
+        full_nonself_encoded, union_nonself_encoded, assume_unique=True
+    )
+
+    complement_total = math.comb(n, 2) - int(union_nonself_encoded.size)
+
+    sample_count = min(sample_size, complement_total)
+    if sample_count > 0:
+        rng = np.random.default_rng(_COMPLEMENT_SAMPLE_SEED)
+        sampled_encoded = np.sort(rng.choice(complement_encoded, size=sample_count, replace=False))
+        sample_u_idx = (sampled_encoded // n).astype(np.int32)
+        sample_v_idx = (sampled_encoded % n).astype(np.int32)
+    else:
+        sample_u_idx = np.empty(0, dtype=np.int32)
+        sample_v_idx = np.empty(0, dtype=np.int32)
+
+    return ValBallUnionUniverse(
+        u_idx=u_idx,
+        v_idx=v_idx,
+        sample_u_idx=sample_u_idx,
+        sample_v_idx=sample_v_idx,
+        complement_total=complement_total,
+    )
+
+
 def _bfs_ball(
     graph: nx.Graph, seed: str, size: int, order_key: Callable[[str], tuple[bytes, str]]
 ) -> set[str]:
@@ -680,11 +788,14 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "BALL_UNION_COMPLEMENT_SAMPLE_SIZE",
     "Pair",
+    "ValBallUnionUniverse",
     "ValRegionParams",
     "ValRegionSplit",
     "derive_val_region_split",
     "region_fidelity_stats",
     "sample_bfs_ball_buckets",
+    "val_ball_union_universe",
     "val_universe_arrays",
 ]

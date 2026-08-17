@@ -55,15 +55,15 @@ engineering validity, and the scientific verdict are reported separately.
 
 - Training and test nodes are disjoint. `V_val` is a pair-disjoint (not node-disjoint) BFS-grown internal
   region: cross-boundary edges train; only V_val-internal pairs are withheld, never fully inductive, unlike test.
-- Pairwise metrics use the fixed benchmark test-pair artifact. AUROC and AUPRC are
-  threshold-free; Accuracy, F1, and MCC use threshold 0.5.
-- Graph metrics use the full candidate universe. The canonical baseline/oracle table
-  uses each scorer's density-matched threshold. S1 uses the same 30,128 non-self-edge
-  target and fixes the self-loop treatment across arms.
-- Threshold selection, quota construction, and any learned coupling must be fixed on
-  training data or `V_val`. The evaluator-provided reference edge count may define a
-  density-matched operating point; hidden labels, node degrees, and other test topology
-  may influence predictions only in an explicitly diagnostic oracle.
+- Pairwise metrics use the fixed benchmark test-pair artifact; AUROC and AUPRC are threshold-free; Accuracy, F1, and MCC use threshold 0.5.
+- Graph metrics use the full candidate universe at each scorer's density-matched threshold; S1
+  shares the 30,128 non-self-edge target and self-loop handling. Per-epoch `V_val` topology validation
+  scores the pinned 500-ball pair union plus a pinned complement sample used only to estimate the
+  full-universe density-matched threshold; buckets assemble union rows alone.
+- Threshold selection, quota construction, and any learned coupling must be fixed on training
+  data or `V_val`; the evaluator-provided reference edge count may define a density-matched
+  operating point, other hidden test topology only in explicitly diagnostic oracles. Published
+  checkpoints record `val_threshold_transfer` for a future degree-density test operating point.
 
 ### 2.3 Required metrics
 

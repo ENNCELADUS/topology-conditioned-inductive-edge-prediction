@@ -57,10 +57,11 @@ from src.data.packed_features import PackedFeatureManifest, PackedFeatureTable
 from src.data.pairs import NegativeSampler
 from src.data.prefetch import _prefetch_batches
 from src.data.val_region import (
+    ValBallUnionUniverse,
     ValRegionParams,
     ValRegionSplit,
     derive_val_region_split,
-    val_universe_arrays,
+    val_ball_union_universe,
 )
 from src.eval.checkpoint_selection import (
     CheckpointCandidate,
@@ -1940,6 +1941,9 @@ class EgoStitchData:
             that build validation pairs by hand.
         val_topology_reference: The once-per-run topology-validation reference
             built from `val_split`, or `None` when `val_split` is absent.
+        val_ball_union: The once-per-run ball-union pair universe plus pinned
+            complement sample, built from `val_split`, or `None` when
+            `val_split` is absent.
         feature_stats: Registered training-universe standardization constants.
     """
 
@@ -1956,6 +1960,7 @@ class EgoStitchData:
     rho_train: float
     val_split: ValRegionSplit | None = None
     val_topology_reference: ValTopologyReference | None = None
+    val_ball_union: ValBallUnionUniverse | None = None
     validation_role: Literal["V_val"] | None = None
     access_audit: dict[str, object] | None = None
     validation_nodes: tuple[str, ...] = ()
@@ -2209,6 +2214,7 @@ def _assemble_e2e_data(
             "other than the training universe"
         )
     val_topology_reference = build_val_topology_reference(split)
+    val_ball_union = val_ball_union_universe(split)
     data = EgoStitchData(
         train_nodes=train_nodes,
         training_positives=sorted(split.training_positives),
@@ -2224,6 +2230,7 @@ def _assemble_e2e_data(
         feature_stats=feature_stats,
         val_split=split,
         val_topology_reference=val_topology_reference,
+        val_ball_union=val_ball_union,
         validation_role=role,
         access_audit=audit,
         validation_nodes=validation_nodes,
@@ -3382,26 +3389,30 @@ def _score_val_universe_logits(
     model: EgoStitchModel,
     node_cache: Mapping[str, E2ENodeState],
     reference: ValTopologyReference,
+    universe: ValBallUnionUniverse,
     accelerator: Accelerator,
     *,
     edge_batch: int,
 ) -> NDArray[np.float64] | None:
-    """Score the complete V_val pair universe's active-arm logits, exact DDP coverage.
+    """Score the ball-union U plus pinned complement sample's active-arm logits, exact DDP coverage.
 
-    Rank-strided over the ``u_idx``/``v_idx`` row order `val_universe_arrays`
-    fixes; every rank gathers and checks coverage identically (DDP fail-closed
-    -- a partial gather must never silently assemble the topology graph from a
-    subset of the universe). Active-arm logit only: no full/f_logit/dispersion
-    columns, since only the assembled graph is read from this pass.
+    Rank-strided over the concatenation of `universe`'s U rows followed by its
+    complement-sample rows; every rank gathers and checks coverage identically
+    (DDP fail-closed -- a partial gather must never silently assemble the
+    topology graph from a subset of the universe). Active-arm logit only: no
+    full/f_logit/dispersion columns, since only the assembled graph is read
+    from this pass.
 
     Returns:
-        The row-ordered logit array on the main process; ``None`` elsewhere.
+        The row-ordered logit array (U rows then sample rows) on the main
+        process; ``None`` elsewhere.
 
     Raises:
-        ValueError: If the gathered rows do not cover the complete universe
+        ValueError: If the gathered rows do not cover the complete row set
             exactly once, on every rank.
     """
-    u_idx, v_idx = val_universe_arrays(reference.nodes)
+    u_idx = np.concatenate([universe.u_idx, universe.sample_u_idx])
+    v_idx = np.concatenate([universe.v_idx, universe.sample_v_idx])
     n_rows = u_idx.shape[0]
     rank, world = accelerator.process_index, accelerator.num_processes
     row_ids = np.arange(rank, n_rows, world, dtype=np.int64)
@@ -3488,12 +3499,13 @@ def _validate_epoch(
     AUPRC without that topology tie-break.
 
     A second, lean pass follows the classification one when
-    `data.val_topology_reference` is set (absent only for toy fixtures that
-    hand-build `val_pairs` with no derived V_val region): it scores the
-    complete V_val pair universe's active-arm logit (`_score_val_universe_logits`)
-    and feeds `val_region_topology_metrics` for the five topology metrics.
-    Both passes share one node-encoding cache built once over the complete
-    V_val region.
+    `data.val_topology_reference`/`data.val_ball_union` are set (absent only
+    for toy fixtures that hand-build `val_pairs` with no derived V_val
+    region): it scores the deduplicated ball-union pairs U plus a pinned
+    complement sample's active-arm logit (`_score_val_universe_logits`) and
+    feeds `val_region_topology_metrics` for the five topology metrics. Both
+    passes share one node-encoding cache built once over the complete V_val
+    region.
     """
     was_training = model.training
     model.eval()
@@ -3700,15 +3712,19 @@ def _validate_epoch(
     gathered_values = accelerator.gather(local_values)
     gathered_rows = accelerator.gather(local_rows)
 
-    # Lean topology-universe pass: active-arm logit only, over the complete
-    # V_val pair universe. Runs on every rank (its own rank-strided gather and
-    # exact-coverage check), mirroring the classification pass's DDP-fail-
-    # closed discipline -- a partial gather here would silently assemble the
-    # topology graph from a subset of the universe.
+    # Lean topology-universe pass: active-arm logit only, over the
+    # deduplicated ball-union pairs U plus a pinned complement sample. Runs on
+    # every rank (its own rank-strided gather and exact-coverage check),
+    # mirroring the classification pass's DDP-fail-closed discipline -- a
+    # partial gather here would silently assemble the topology graph from a
+    # subset of the row set.
+    ball_union = data.val_ball_union
     universe_started = time.monotonic()
     universe_logits = (
-        _score_val_universe_logits(model, node_cache, reference, accelerator, edge_batch=edge_batch)
-        if reference is not None
+        _score_val_universe_logits(
+            model, node_cache, reference, ball_union, accelerator, edge_batch=edge_batch
+        )
+        if reference is not None and ball_union is not None
         else None
     )
     universe_seconds = time.monotonic() - universe_started
@@ -3763,11 +3779,21 @@ def _validate_epoch(
         for name, values in zip(scale_names, ordered[:, 8:12].T, strict=True)
     }
     endpoint_degree = _e2e_validation_endpoint_degrees(data)
-    if reference is not None and universe_logits is not None:
-        u_idx, v_idx = val_universe_arrays(reference.nodes)
-        validation_topology = val_region_topology_metrics(
-            u_idx=u_idx, v_idx=v_idx, logits=universe_logits, reference=reference
+    val_threshold = 0.0
+    val_admitted_non_self_fraction = 0.0
+    if reference is not None and ball_union is not None and universe_logits is not None:
+        n_u = ball_union.u_idx.shape[0]
+        topology_result = val_region_topology_metrics(
+            u_idx=ball_union.u_idx,
+            v_idx=ball_union.v_idx,
+            logits=universe_logits[:n_u],
+            sample_logits=universe_logits[n_u:],
+            complement_total=ball_union.complement_total,
+            reference=reference,
         )
+        validation_topology = topology_result.metrics
+        val_threshold = topology_result.threshold
+        val_admitted_non_self_fraction = topology_result.admitted_non_self_fraction
     else:
         validation_topology = TopologyValidationMetrics(
             gs=0.0, rd=0.0, degree_mmd=0.0, clustering_mmd=0.0, spectral_mmd=0.0
@@ -3784,6 +3810,8 @@ def _validate_epoch(
         "degree_mmd_ratio": validation_topology.degree_mmd,
         "clustering_mmd_ratio": validation_topology.clustering_mmd,
         "spectral_mmd_ratio": validation_topology.spectral_mmd,
+        "val_threshold": val_threshold,
+        "val_admitted_non_self_fraction": val_admitted_non_self_fraction,
         "prevalence": float(np.mean(data.val_labels)),
         **dispersion_summary,
         **e2e_degree_decorrelation_telemetry(endpoint_degree, full_np - f_np),

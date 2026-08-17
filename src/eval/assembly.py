@@ -96,6 +96,84 @@ def density_matched_threshold(probs: np.ndarray, target_edges: int) -> float:
     return chosen
 
 
+def estimated_density_matched_threshold(
+    exact_probs: np.ndarray,
+    sampled_probs: np.ndarray,
+    sampled_total: int,
+    target_edges: int,
+) -> float:
+    """Estimate `density_matched_threshold` over a partially-sampled population.
+
+    The full population is `exact_probs` (fully observed) plus a further
+    `sampled_total` values observed only through the uniform
+    without-replacement sample `sampled_probs`. Each sampled row is reweighted
+    by `sampled_total / len(sampled_probs)` so the admitted-count tally
+    `admitted(t) = #(exact_probs >= t) + weight * #(sampled_probs >= t)`
+    estimates the count the full population would have realized at `t`.
+
+    Args:
+        exact_probs: Fully observed probabilities; must be non-empty.
+        sampled_probs: Uniform without-replacement sample of the remaining,
+            unobserved population.
+        sampled_total: True size of the population `sampled_probs` was drawn
+            from (`>= len(sampled_probs)`). `0` means there is no unobserved
+            population and this delegates to `density_matched_threshold` on
+            `exact_probs` alone.
+        target_edges: The maximum estimated admitted count.
+
+    Returns:
+        The threshold value. Ties are atomic across the two arrays: a value
+        present in both `exact_probs` and `sampled_probs` is one combined
+        weighted group, included or excluded together. The returned value is
+        the smallest observed value (from the union of both arrays) whose
+        estimated admitted count is still `<= target_edges`.
+
+        Edge cases mirror `density_matched_threshold`: if `target_edges <= 0`,
+        or no observed value's estimated admitted count is `<= target_edges`,
+        the threshold falls back to `np.nextafter(max, np.inf)` over the union
+        of both arrays (0 estimated admitted). If even the smallest observed
+        value's estimated admitted count is `<= target_edges`, that minimum is
+        returned (everyone included).
+
+    Raises:
+        ValueError: If `exact_probs` is empty; `sampled_total` is negative;
+            `sampled_total > 0` and `sampled_probs` is empty; or
+            `len(sampled_probs) > sampled_total`.
+    """
+    exact_probs = np.asarray(exact_probs, dtype=np.float64)
+    sampled_probs = np.asarray(sampled_probs, dtype=np.float64)
+    if exact_probs.size == 0:
+        raise ValueError("exact_probs must be non-empty")
+    if sampled_total < 0:
+        raise ValueError(f"sampled_total must be non-negative, got {sampled_total}")
+    if sampled_total > 0 and sampled_probs.size == 0:
+        raise ValueError("sampled_probs must be non-empty when sampled_total > 0")
+    if sampled_probs.size > sampled_total:
+        raise ValueError(
+            f"sampled_probs has {sampled_probs.size} rows, exceeding sampled_total={sampled_total}"
+        )
+    if sampled_total == 0:
+        return density_matched_threshold(exact_probs, target_edges)
+
+    weight = sampled_total / sampled_probs.size
+    values = np.concatenate([exact_probs, sampled_probs])
+    row_weights = np.concatenate(
+        [np.ones(exact_probs.size, dtype=np.float64), np.full(sampled_probs.size, weight)]
+    )
+
+    vals, inverse = np.unique(values, return_inverse=True)
+    grouped_weights = np.zeros(vals.size, dtype=np.float64)
+    np.add.at(grouped_weights, inverse.ravel(), row_weights)
+
+    vals_desc = vals[::-1]
+    cum_desc = np.cumsum(grouped_weights[::-1])
+    admissible = np.nonzero(cum_desc <= target_edges)[0]
+
+    if admissible.size == 0:
+        return float(np.nextafter(vals_desc[0], np.inf))
+    return float(vals_desc[admissible[-1]])
+
+
 def rank_matched_degree_quotas(
     expected_degree: Mapping[str, float],
     reference_degrees: Sequence[int],
