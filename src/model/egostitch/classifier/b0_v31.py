@@ -1122,8 +1122,17 @@ class V3_1(nn.Module):
         node_factor_dim = _to_int(
             model_config.get("node_factor_dim", 0), "model_config.node_factor_dim"
         )
+        # Optional embedding-KD alignment head riding the same bottleneck;
+        # meaningless without a node-factor path to project out of.
+        node_factor_align_dim = _to_int(
+            model_config.get("node_factor_align_dim", 0), "model_config.node_factor_align_dim"
+        )
+        if node_factor_align_dim > 0 and node_factor_dim == 0:
+            raise ValueError("model_config.node_factor_align_dim > 0 requires node_factor_dim > 0")
         self.node_factor: NodeFactorBottleneck | None = (
-            NodeFactorBottleneck(self.d_model, node_factor_dim) if node_factor_dim > 0 else None
+            NodeFactorBottleneck(self.d_model, node_factor_dim, node_factor_align_dim)
+            if node_factor_dim > 0
+            else None
         )
 
     def _apply_output_head_spectral_norm(self) -> None:
@@ -1204,7 +1213,11 @@ class V3_1(nn.Module):
             residual = factors.residual.reshape(logits.shape).to(dtype=logits.dtype)
             logits = logits + residual
             output["logits"] = logits
-            output["node_factor_pair"] = factors.z_a * factors.z_b
+            pair_factor = factors.z_a * factors.z_b
+            output["node_factor_pair"] = pair_factor
+            output["node_factor_residual"] = factors.residual
+            if self.node_factor.align_head is not None:
+                output["node_factor_align"] = self.node_factor.align_head(pair_factor)
         if "label" in merged:
             labels = merged["label"].float()
             logits_for_loss = (

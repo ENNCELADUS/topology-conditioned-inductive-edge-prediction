@@ -1,15 +1,22 @@
-"""Contracts for the pure KD loss functions in `src.distill.losses`."""
+"""Contracts for the pure KD loss functions in `src.distill.losses`.
+
+Covers `kd_control`/`kd_d1`/`kd_d2`/`kd_d3`/`kd_d4`/`kd_d5`; `kd_d6` and
+`kd_d7a` reuse `kd_rank_loss`/`kd_dist_loss`/`kd_gram_loss` unchanged and add
+no new loss functions to test here.
+"""
 
 from __future__ import annotations
 
 import pytest
 import torch
 from src.distill.losses import (
+    kd_align_loss,
     kd_dist_loss,
     kd_gram_loss,
     kd_label_loss,
     kd_logit_loss,
     kd_rank_loss,
+    kd_residual_loss,
 )
 
 pytestmark = pytest.mark.unit
@@ -282,3 +289,152 @@ def test_gram_loss_is_batch_size_invariant_given_the_same_valid_entries() -> Non
         padded_mask = torch.cat([torch.ones(3), torch.zeros(n_padding)], dim=0)
         padded_loss = kd_gram_loss(padded_feat, padded_teacher, padded_endpoints, padded_mask)
         torch.testing.assert_close(padded_loss, base_loss)
+
+
+# --------------------------------------------------------------------------- kd_align_loss
+
+
+def test_align_loss_is_zero_for_identical_directions() -> None:
+    torch.manual_seed(5)
+    student = torch.randn(4, 6)
+    mask = torch.ones(4)
+
+    result = kd_align_loss(student, student.clone(), mask)
+    assert float(result) == pytest.approx(0.0, abs=1e-5)
+
+
+def test_align_loss_is_two_for_exactly_opposite_directions() -> None:
+    torch.manual_seed(6)
+    student = torch.randn(3, 5)
+    teacher = -student
+    mask = torch.ones(3)
+
+    result = kd_align_loss(student, teacher, mask)
+    assert float(result) == pytest.approx(2.0, abs=1e-5)
+
+
+def test_align_loss_ignores_padded_rows() -> None:
+    torch.manual_seed(7)
+    student = torch.randn(3, 4)
+    teacher = torch.randn(3, 4)
+    mask = torch.tensor([1.0, 1.0, 0.0])
+
+    padded = kd_align_loss(student, teacher, mask)
+    unpadded = kd_align_loss(student[:2], teacher[:2], torch.ones(2))
+    torch.testing.assert_close(padded, unpadded)
+
+
+def test_align_loss_is_exact_zero_for_an_empty_mask() -> None:
+    torch.manual_seed(8)
+    student = torch.randn(3, 4)
+    teacher = torch.randn(3, 4)
+    mask = torch.zeros(3)
+
+    result = kd_align_loss(student, teacher, mask)
+    assert float(result) == 0.0
+    assert torch.isfinite(result)
+
+
+def test_align_loss_gradient_is_finite_for_an_empty_mask() -> None:
+    torch.manual_seed(8)
+    student = torch.randn(3, 4, requires_grad=True)
+    teacher = torch.randn(3, 4)
+    mask = torch.zeros(3)
+
+    result = kd_align_loss(student, teacher, mask)
+    result.backward()  # type: ignore[no-untyped-call]
+    assert student.grad is not None
+    assert torch.isfinite(student.grad).all()
+
+
+def test_align_loss_is_batch_size_invariant_given_the_same_valid_rows() -> None:
+    torch.manual_seed(9)
+    student = torch.randn(3, 4)
+    teacher = torch.randn(3, 4)
+    base_loss = kd_align_loss(student, teacher, torch.ones(3))
+
+    for n_padding in (1, 5):
+        padded_student = torch.cat([student, torch.randn(n_padding, 4)], dim=0)
+        padded_teacher = torch.cat([teacher, torch.randn(n_padding, 4)], dim=0)
+        padded_mask = torch.cat([torch.ones(3), torch.zeros(n_padding)], dim=0)
+        padded_loss = kd_align_loss(padded_student, padded_teacher, padded_mask)
+        torch.testing.assert_close(padded_loss, base_loss)
+
+
+def test_align_loss_handles_bf16_teacher_input() -> None:
+    torch.manual_seed(10)
+    student = torch.randn(4, 6)
+    teacher_bf16 = torch.randn(4, 6).to(dtype=torch.bfloat16)
+    mask = torch.ones(4)
+
+    result = kd_align_loss(student, teacher_bf16, mask)
+    assert result.dtype == student.dtype
+    assert torch.isfinite(result)
+
+
+# --------------------------------------------------------------------------- kd_residual_loss
+
+
+def test_residual_loss_matches_manual_smooth_l1_on_a_small_example() -> None:
+    student_residual = torch.tensor([0.5, -1.5, 3.0])
+    delta_target = torch.tensor([0.0, 0.0, 0.0])
+    mask = torch.ones(3)
+
+    expected = torch.nn.functional.smooth_l1_loss(student_residual, delta_target, beta=1.0)
+    result = kd_residual_loss(student_residual, delta_target, mask, beta=1.0)
+    torch.testing.assert_close(result, expected)
+
+
+def test_residual_loss_ignores_padded_rows() -> None:
+    student_residual = torch.tensor([0.5, -1.5, 999.0])
+    delta_target = torch.tensor([0.2, -1.0, -999.0])
+    mask = torch.tensor([1.0, 1.0, 0.0])
+
+    padded = kd_residual_loss(student_residual, delta_target, mask)
+    unpadded = kd_residual_loss(student_residual[:2], delta_target[:2], torch.ones(2))
+    torch.testing.assert_close(padded, unpadded)
+
+
+def test_residual_loss_is_exact_zero_for_an_empty_mask() -> None:
+    student_residual = torch.tensor([0.5, -1.5])
+    delta_target = torch.tensor([3.0, -3.0])
+    mask = torch.zeros(2)
+
+    result = kd_residual_loss(student_residual, delta_target, mask)
+    assert float(result) == 0.0
+    assert torch.isfinite(result)
+
+
+def test_residual_loss_gradient_is_finite_for_an_empty_mask() -> None:
+    student_residual = torch.tensor([0.5, -1.5], requires_grad=True)
+    delta_target = torch.tensor([3.0, -3.0])
+    mask = torch.zeros(2)
+
+    result = kd_residual_loss(student_residual, delta_target, mask)
+    result.backward()  # type: ignore[no-untyped-call]
+    assert student_residual.grad is not None
+    assert torch.isfinite(student_residual.grad).all()
+
+
+def test_residual_loss_is_batch_size_invariant_given_the_same_valid_rows() -> None:
+    torch.manual_seed(11)
+    student_residual = torch.randn(3)
+    delta_target = torch.randn(3)
+    base_loss = kd_residual_loss(student_residual, delta_target, torch.ones(3))
+
+    for n_padding in (1, 6):
+        padded_student = torch.cat([student_residual, torch.randn(n_padding)], dim=0)
+        padded_delta = torch.cat([delta_target, torch.randn(n_padding)], dim=0)
+        padded_mask = torch.cat([torch.ones(3), torch.zeros(n_padding)], dim=0)
+        padded_loss = kd_residual_loss(padded_student, padded_delta, padded_mask)
+        torch.testing.assert_close(padded_loss, base_loss)
+
+
+def test_residual_loss_handles_bf16_delta_target_input() -> None:
+    student_residual = torch.tensor([0.5, -1.5, 2.0])
+    delta_target_bf16 = torch.tensor([0.3, -1.0, 1.8]).to(dtype=torch.bfloat16)
+    mask = torch.ones(3)
+
+    result = kd_residual_loss(student_residual, delta_target_bf16, mask)
+    assert result.dtype == student_residual.dtype
+    assert torch.isfinite(result)

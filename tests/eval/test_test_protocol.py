@@ -640,6 +640,123 @@ class TestPublishedRunMetadataNeverClobbered:
         assert isinstance(arm_block, dict)
         assert arm_block["run_kind"] is None
 
+    def test_selected_epoch_comes_from_the_published_metadata(self, tmp_path: Path) -> None:
+        """Closes the checkpoint-selection audit gap: which epoch published."""
+        fixture = _build_fixture(tmp_path)
+        checkpoint = _write_checkpoint(tmp_path)
+        output_dir = tmp_path / "outputs" / "full_seed0"
+        output_dir.mkdir(parents=True)
+        (output_dir / "run_metadata.json").write_text(
+            json.dumps(
+                {"arm": "full", "seed": 0, "checkpoint_id": _CHECKPOINT_ID, "selected_epoch": 17}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = run_test_protocol(
+            checkpoint=checkpoint,
+            output_dir=output_dir,
+            data_root=fixture.data_root,
+            strategy=_STRATEGY,
+            arm="full",
+            seed=0,
+            score_runner=_FakeScoreRunner(fixture.artifacts),
+        )
+
+        arm_block = result.report["arm"]
+        assert isinstance(arm_block, dict)
+        assert arm_block["selected_epoch"] == 17
+
+    def test_selected_epoch_is_none_without_published_metadata(self, tmp_path: Path) -> None:
+        """A standalone scoring run (no published training dir) has no selected epoch."""
+        fixture = _build_fixture(tmp_path)
+        checkpoint = _write_checkpoint(tmp_path)
+        output_dir = tmp_path / "outputs" / "control_6a"
+        output_dir.mkdir(parents=True)
+
+        result = run_test_protocol(
+            checkpoint=checkpoint,
+            output_dir=output_dir,
+            data_root=fixture.data_root,
+            strategy=_STRATEGY,
+            arm="full",
+            seed=0,
+            score_runner=_FakeScoreRunner(fixture.artifacts),
+        )
+
+        arm_block = result.report["arm"]
+        assert isinstance(arm_block, dict)
+        assert arm_block["selected_epoch"] is None
+
+    def test_selected_epoch_is_none_when_key_missing_from_published_metadata(
+        self, tmp_path: Path
+    ) -> None:
+        """Older published metadata predating this field must not raise or fabricate."""
+        fixture = _build_fixture(tmp_path)
+        checkpoint = _write_checkpoint(tmp_path)
+        output_dir = tmp_path / "outputs" / "full_seed0"
+        output_dir.mkdir(parents=True)
+        (output_dir / "run_metadata.json").write_text(
+            json.dumps(
+                {
+                    "arm": "full",
+                    "seed": 0,
+                    "checkpoint_id": _CHECKPOINT_ID,
+                    "run_kind": "diagnostic",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = run_test_protocol(
+            checkpoint=checkpoint,
+            output_dir=output_dir,
+            data_root=fixture.data_root,
+            strategy=_STRATEGY,
+            arm="full",
+            seed=0,
+            score_runner=_FakeScoreRunner(fixture.artifacts),
+        )
+
+        arm_block = result.report["arm"]
+        assert isinstance(arm_block, dict)
+        assert arm_block["selected_epoch"] is None
+
+    def test_selected_epoch_is_none_for_a_different_checkpoint(self, tmp_path: Path) -> None:
+        """A checkpoint the metadata does not describe must not inherit its epoch."""
+        fixture = _build_fixture(tmp_path)
+        checkpoint = _write_checkpoint(tmp_path)
+        output_dir = tmp_path / "outputs" / "full_seed0"
+        output_dir.mkdir(parents=True)
+        (output_dir / "run_metadata.json").write_text(
+            json.dumps(
+                {
+                    "arm": "full",
+                    "seed": 0,
+                    "checkpoint_id": "0000000000000000",
+                    "selected_epoch": 17,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = run_test_protocol(
+            checkpoint=checkpoint,
+            output_dir=output_dir,
+            data_root=fixture.data_root,
+            strategy=_STRATEGY,
+            arm="full",
+            seed=0,
+            score_runner=_FakeScoreRunner(fixture.artifacts),
+        )
+
+        arm_block = result.report["arm"]
+        assert isinstance(arm_block, dict)
+        assert arm_block["selected_epoch"] is None
+
     def test_mismatched_published_arm_raises_before_any_scoring(self, tmp_path: Path) -> None:
         fixture = _build_fixture(tmp_path)
         checkpoint = _write_checkpoint(tmp_path)

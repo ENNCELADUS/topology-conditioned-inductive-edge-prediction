@@ -65,15 +65,20 @@ class NodeFactorBottleneck(nn.Module):
     bias_head(pool(H_i))``. Pooling reuses `classifier.layers.masked_mean`
     over `classifier.layers.inner_token_mask` -- the same inner-token mean
     the ``mean`` rich-pooling component uses -- so the factor path reads the
-    same per-node summary the rest of the trunk does.
+    same per-node summary the rest of the trunk does. When ``align_dim > 0``,
+    the module also owns ``align_head``, a linear projection of ``z_a * z_b``
+    to the teacher's embedding-KD width; the caller (`b0_v31.py`) applies it,
+    keeping `NodeFactorOutputs` a fixed-shape record of the residual path.
     """
 
-    def __init__(self, d_model: int, dim: int) -> None:
+    def __init__(self, d_model: int, dim: int, align_dim: int = 0) -> None:
         """Build the bottleneck, with `diag_w` and `bias_head` zero-initialized.
 
         Args:
             d_model: Width of the encoded per-token endpoint states.
             dim: Factor-embedding width `dim`.
+            align_dim: Width of the optional embedding-KD alignment head; `0`
+                (default) builds no head.
 
         Raises:
             ValueError: If `dim` is not positive.
@@ -87,6 +92,10 @@ class NodeFactorBottleneck(nn.Module):
         self.bias_head = nn.Linear(d_model, 1)
         nn.init.zeros_(self.bias_head.weight)
         nn.init.zeros_(self.bias_head.bias)
+        # Standard (non-zero) init: unlike `diag_w`, this head has no logit
+        # path to protect at step 0, and zero-init would zero the projected
+        # vector and kill the cosine gradient of the alignment KD loss.
+        self.align_head: nn.Linear | None = nn.Linear(dim, align_dim) if align_dim > 0 else None
 
     def _pool(self, tokens: torch.Tensor, length: torch.Tensor) -> torch.Tensor:
         """Masked mean over inner tokens (excludes BOS/EOS/padding)."""

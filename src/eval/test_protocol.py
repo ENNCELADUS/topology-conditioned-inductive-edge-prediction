@@ -655,6 +655,19 @@ def run_test_protocol(
         ),
         "checkpoint_id": meta.get("checkpoint_id"),
         "checkpoint_sha256": checkpoint_sha256,
+        # Closes the checkpoint-selection audit gap: reports previously did not
+        # say which epoch published. Same provenance source as `run_kind`
+        # above -- absent when there is no published training dir (the two
+        # scoring-time controls), when that dir's metadata predates this field,
+        # or when the metadata describes a different checkpoint than the one
+        # scored (scoring last.pt or a copied checkpoint in a published dir
+        # must not inherit the best checkpoint's epoch).
+        "selected_epoch": (
+            published_run_metadata.get("selected_epoch")
+            if published_run_metadata is not None
+            and published_run_metadata.get("checkpoint_id") == meta.get("checkpoint_id")
+            else None
+        ),
     }
 
     provenance: dict[str, object] = {

@@ -65,3 +65,46 @@ def test_node_factor_residual_becomes_live_after_diag_w_moves() -> None:
         student.node_factor.diag_w.add_(1.0)
         after = student(batch)["logits"]
     assert not torch.equal(before, after)
+
+
+def test_node_factor_residual_present_and_matches_factors() -> None:
+    torch.manual_seed(0)
+    student = V3_1(**_TINY_CONFIG, node_factor_dim=4)
+    student.eval()
+    batch = _batch()
+    with torch.no_grad():
+        output = student(batch)
+        assert student.node_factor is not None
+        factors = student.node_factor(
+            student.encoder(batch["emb_a"], batch["len_a"]),
+            student.encoder(batch["emb_b"], batch["len_b"]),
+            batch["len_a"],
+            batch["len_b"],
+        )
+    assert "node_factor_residual" in output
+    assert output["node_factor_residual"].shape == (3,)
+    torch.testing.assert_close(output["node_factor_residual"], factors.residual)
+
+
+def test_align_head_output_present_with_align_dim() -> None:
+    torch.manual_seed(0)
+    student = V3_1(**_TINY_CONFIG, node_factor_dim=4, node_factor_align_dim=512)
+    student.eval()
+    batch = _batch()
+    with torch.no_grad():
+        output = student(batch)
+    assert output["node_factor_align"].shape == (3, 512)
+
+
+def test_align_dim_zero_omits_align_key_but_keeps_residual() -> None:
+    student = V3_1(**_TINY_CONFIG, node_factor_dim=4)
+    student.eval()
+    with torch.no_grad():
+        output = student(_batch())
+    assert "node_factor_align" not in output
+    assert "node_factor_residual" in output
+
+
+def test_align_dim_positive_without_node_factor_dim_raises() -> None:
+    with pytest.raises(ValueError, match="node_factor_align_dim"):
+        V3_1(**_TINY_CONFIG, node_factor_align_dim=8)

@@ -129,3 +129,22 @@ def test_output_stays_fp32_under_bf16_autocast() -> None:
 def test_rejects_non_positive_dim() -> None:
     with pytest.raises(ValueError, match="dim must be positive"):
         NodeFactorBottleneck(_D_MODEL, 0)
+
+
+def test_align_head_absent_when_align_dim_zero() -> None:
+    model = NodeFactorBottleneck(_D_MODEL, _DIM)
+    assert model.align_head is None
+    assert "align_head" not in dict(model.state_dict())
+
+
+def test_align_head_present_and_standard_init_when_align_dim_positive() -> None:
+    torch.manual_seed(0)
+    align_dim = 3
+    model = NodeFactorBottleneck(_D_MODEL, _DIM, align_dim=align_dim)
+
+    assert model.align_head is not None
+    assert model.align_head.weight.shape == (align_dim, _DIM)
+    assert model.align_head.weight.requires_grad
+    assert model.align_head.bias.requires_grad
+    # Standard (non-zero) init, unlike `diag_w`/`bias_head`.
+    assert torch.count_nonzero(model.align_head.weight) > 0

@@ -1,11 +1,22 @@
 """KD teacher-target artifact: `targets.npz` + `manifest.json` + `node_ids.json`.
 
-Written by `src.distill.teacher_targets` and read by the KD trainer
-(`src/train_egostitch.py`'s `_BatchFactory`, a later wave). Format tag
-``"kd_targets_v2"``. `truth_source` is always ``"training_structure"``: the
-V_val-quarantined training graph over all train nodes (cross-boundary edges
-included, V_val-internal pairs excluded); pre-V_val ``"g_fit_only"`` artifacts
-carry a different stamp so the two teacher semantics stay distinguishable.
+Written by `src.distill.teacher_targets` (and its `src.distill.content_logit`/
+`src.distill.heuristic_targets` derivatives) and read by the KD trainer
+(`src/train_b0.py`'s `KDStream`). Format tag ``"kd_targets_v2"``, or
+``"kd_targets_v3"`` when `content_logit` is written (write-side stamp only;
+`load_kd_targets` performs no format check). `truth_source` is always
+``"training_structure"``: the V_val-quarantined training graph over all train
+nodes (cross-boundary edges included, V_val-internal pairs excluded);
+pre-V_val ``"g_fit_only"`` artifacts carry a different stamp so the two
+teacher semantics stay distinguishable.
+
+`targets.npz` arrays, one row per context pair (dtype pinned per array; see
+`_ARRAY_DTYPES`): ``pair_anchor_idx``/``pair_partner_idx`` int32 node
+indices, ``anchor_offsets`` int64 CSR row starts, ``teacher_logit`` fp32,
+``teacher_pooled_ab``/``teacher_pooled_ba`` fp16 (~1 GB budget), ``is_near``
+uint8, ``pair_label`` int8. ``content_logit`` fp32 is optional (kd_targets_v3
+only): the same rows scored by a content-only baseline checkpoint, consumed
+by the D5 residual-distillation arm as ``teacher_logit - content_logit``.
 """
 
 from __future__ import annotations
@@ -16,16 +27,19 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
 KD_TARGETS_FORMAT = "kd_targets_v2"
+KD_TARGETS_FORMAT_V3 = "kd_targets_v3"
 TRUTH_SOURCE = "training_structure"
 
 _NPZ_NAME = "targets.npz"
 _MANIFEST_NAME = "manifest.json"
 _NODE_IDS_NAME = "node_ids.json"
+_CONTENT_LOGIT_KEY = "content_logit"
 
 # dtype pinned per array (B1 plan "KD sampler + teacher-target artifact"):
 # int32 pair indices, int64 CSR offsets, fp32 teacher logits, fp16 pooled
@@ -56,6 +70,7 @@ class KDTargets:
     is_near: NDArray[np.uint8]
     pair_label: NDArray[np.int8]
     manifest: dict[str, object]
+    content_logit: NDArray[np.float32] | None = None
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -89,14 +104,22 @@ def write_kd_targets(
     k_near: int,
     k_rand: int,
     seed: int,
+    content_logit: NDArray[np.floating] | None = None,
 ) -> None:
     """Write one validated KD teacher-target artifact directory.
+
+    `content_logit`, when given, is an optional fp32 array (same pair count
+    as the other rows) written alongside `teacher_logit`; its presence bumps
+    the written manifest ``"format"`` from ``KD_TARGETS_FORMAT`` to
+    ``KD_TARGETS_FORMAT_V3`` (write-side stamp only -- `load_kd_targets`
+    performs no format check).
 
     Raises:
         ValueError: If the pair arrays disagree on length, `anchor_offsets`
             is not a valid non-decreasing CSR row-start array terminating at
-            the pair count, any index is out of range, or `teacher_logit`
-            contains a non-finite value.
+            the pair count, any index is out of range, `teacher_logit`
+            contains a non-finite value, or `content_logit` is given with a
+            mismatched pair count or a non-finite value.
     """
     n_pairs = len(pair_anchor_idx)
     if not (
@@ -124,6 +147,11 @@ def write_kd_targets(
         raise ValueError("pair_anchor_idx/pair_partner_idx contain an out-of-range node index")
     if not np.isfinite(np.asarray(teacher_logit, dtype=np.float64)).all():
         raise ValueError("teacher_logit contains non-finite values")
+    if content_logit is not None:
+        if len(content_logit) != n_pairs:
+            raise ValueError("content_logit must have the same pair count as the other arrays")
+        if not np.isfinite(np.asarray(content_logit, dtype=np.float64)).all():
+            raise ValueError("content_logit contains non-finite values")
     label_arr = np.asarray(pair_label)
     if n_pairs and bool(((label_arr != 0) & (label_arr != 1)).any()):
         raise ValueError("pair_label must be binary")
@@ -135,17 +163,19 @@ def write_kd_targets(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     npz_path = output_dir / _NPZ_NAME
-    np.savez(
-        npz_path,
-        pair_anchor_idx=np.asarray(pair_anchor_idx, dtype=np.int32),
-        pair_partner_idx=np.asarray(pair_partner_idx, dtype=np.int32),
-        anchor_offsets=np.asarray(anchor_offsets, dtype=np.int64),
-        teacher_logit=np.asarray(teacher_logit, dtype=np.float32),
-        teacher_pooled_ab=np.asarray(teacher_pooled_ab, dtype=np.float16),
-        teacher_pooled_ba=np.asarray(teacher_pooled_ba, dtype=np.float16),
-        is_near=np.asarray(is_near, dtype=np.uint8),
-        pair_label=np.asarray(pair_label, dtype=np.int8),
-    )
+    arrays: dict[str, NDArray[np.generic]] = {
+        "pair_anchor_idx": np.asarray(pair_anchor_idx, dtype=np.int32),
+        "pair_partner_idx": np.asarray(pair_partner_idx, dtype=np.int32),
+        "anchor_offsets": np.asarray(anchor_offsets, dtype=np.int64),
+        "teacher_logit": np.asarray(teacher_logit, dtype=np.float32),
+        "teacher_pooled_ab": np.asarray(teacher_pooled_ab, dtype=np.float16),
+        "teacher_pooled_ba": np.asarray(teacher_pooled_ba, dtype=np.float16),
+        "is_near": np.asarray(is_near, dtype=np.uint8),
+        "pair_label": np.asarray(pair_label, dtype=np.int8),
+    }
+    if content_logit is not None:
+        arrays[_CONTENT_LOGIT_KEY] = np.asarray(content_logit, dtype=np.float32)
+    np.savez(npz_path, **cast(dict[str, Any], arrays))
     npz_sha256 = _sha256_file(npz_path)
 
     node_ids_path = output_dir / _NODE_IDS_NAME
@@ -153,7 +183,7 @@ def write_kd_targets(
     node_ids_path.write_bytes(node_ids_bytes)
 
     manifest = {
-        "format": KD_TARGETS_FORMAT,
+        "format": KD_TARGETS_FORMAT if content_logit is None else KD_TARGETS_FORMAT_V3,
         "truth_source": TRUTH_SOURCE,
         "truth_graph_sha256": truth_graph_sha256,
         "checkpoint_path": str(checkpoint_path),
@@ -198,10 +228,11 @@ def load_kd_targets(path: Path) -> KDTargets:
 
     with np.load(npz_path) as archive:
         required = set(_ARRAY_DTYPES)
-        if set(archive.files) != required:
+        allowed = (required, required | {_CONTENT_LOGIT_KEY})
+        if set(archive.files) not in allowed:
             raise ValueError(
-                f"KD target artifact {path} arrays must be exactly {sorted(required)}, "
-                f"got {sorted(archive.files)}"
+                f"KD target artifact {path} arrays must be exactly {sorted(required)} "
+                f"(optionally plus {_CONTENT_LOGIT_KEY!r}), got {sorted(archive.files)}"
             )
         pair_anchor_idx = np.asarray(archive["pair_anchor_idx"], dtype=np.int32)
         pair_partner_idx = np.asarray(archive["pair_partner_idx"], dtype=np.int32)
@@ -211,6 +242,11 @@ def load_kd_targets(path: Path) -> KDTargets:
         teacher_pooled_ba = np.asarray(archive["teacher_pooled_ba"], dtype=np.float16)
         is_near = np.asarray(archive["is_near"], dtype=np.uint8)
         pair_label = np.asarray(archive["pair_label"], dtype=np.int8)
+        content_logit = (
+            np.asarray(archive[_CONTENT_LOGIT_KEY], dtype=np.float32)
+            if _CONTENT_LOGIT_KEY in archive.files
+            else None
+        )
 
     return KDTargets(
         node_ids=node_ids,
@@ -223,7 +259,15 @@ def load_kd_targets(path: Path) -> KDTargets:
         is_near=is_near,
         pair_label=pair_label,
         manifest=manifest,
+        content_logit=content_logit,
     )
 
 
-__all__ = ["KD_TARGETS_FORMAT", "TRUTH_SOURCE", "KDTargets", "load_kd_targets", "write_kd_targets"]
+__all__ = [
+    "KD_TARGETS_FORMAT",
+    "KD_TARGETS_FORMAT_V3",
+    "TRUTH_SOURCE",
+    "KDTargets",
+    "load_kd_targets",
+    "write_kd_targets",
+]

@@ -1,4 +1,4 @@
-"""Pure tensor KD loss functions for the B1 arms (`kd_control`/`kd_d1`/`kd_d2`/`kd_d3`).
+"""Pure tensor KD loss functions for the B1 arms (`kd_control`/`kd_d1`/.../`kd_d5`).
 
 Every function is a stateless tensor->tensor reduction with an explicit `mask`
 (no model imports, no config reads): the trainer (`src.train_egostitch`,
@@ -12,6 +12,17 @@ contributes exactly zero -- never NaN, regardless of group size.
   "Linkless Link Prediction via Relational Distillation", ICML 2023).
 - `kd_gram_loss` is `kd_d3` (pair-space cosine-Gram matching, Graph2Feat/CAZI
   family).
+- `kd_align_loss` is `kd_d4` (SA-MLP/SALE-MLP-style projected representation
+  alignment: a learnable head answers the rotation/non-identifiability
+  objection to raw coordinate MSE).
+- `kd_residual_loss` is `kd_d5` (topology-residual distillation: the
+  student's node-factor residual against the teacher's beyond-content
+  residual, `teacher_logit - content_logit`).
+- `kd_d6` is `kd_rank_loss` + `kd_dist_loss` + `kd_gram_loss` run together
+  (the D2+D3 interaction test) -- no new loss code.
+- `kd_d7a` is `kd_d2`'s exact losses (`kd_rank_loss` + `kd_dist_loss`) run
+  over a heuristic-teacher targets artifact instead of the learned oracle --
+  also no new loss code, only a different `teacher_logit` source.
 
 LLP constants, verified against the paper's released code
 (https://github.com/snap-research/linkless-link-prediction/blob/main/src/main.py,
@@ -222,12 +233,63 @@ def kd_gram_loss(
     return _masked_mean(diff2, valid)
 
 
+def kd_align_loss(
+    student_align: torch.Tensor,
+    teacher_feat: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Masked-mean per-row cosine distance, ``1 - cos(student_align, teacher_feat)`` (`kd_d4`).
+
+    ``student_align`` is the model's `align_head`-projected pair feature
+    (shape ``(B, D)``); ``teacher_feat`` is the symmetrized fp32 teacher
+    pooled embedding, ``½(pooled_ab + pooled_ba)``, cast to `student_align`'s
+    dtype before normalizing. Both are row-normalized (eps-guarded
+    `F.normalize`) before the rowwise dot product, so the result is 0 for
+    identical directions and 2 for exactly opposite ones, regardless of
+    either vector's scale.
+    """
+    student_norm = F.normalize(student_align, p=2, dim=-1, eps=eps)
+    teacher_norm = F.normalize(teacher_feat.to(dtype=student_align.dtype), p=2, dim=-1, eps=eps)
+    cosine = (student_norm * teacher_norm).sum(dim=-1)
+    per_row = 1.0 - cosine
+    return _masked_mean(per_row, mask)
+
+
+def kd_residual_loss(
+    student_residual: torch.Tensor,
+    delta_target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    beta: float = 1.0,
+) -> torch.Tensor:
+    """Masked-mean Huber loss between the student's residual and `delta_target` (`kd_d5`).
+
+    ``student_residual`` is the model's node-factor residual
+    (``output["node_factor_residual"]``, shape ``(B,)``); ``delta_target`` is
+    the caller-computed ``teacher_logit - content_logit`` -- the teacher's
+    beyond-content signal, cast to `student_residual`'s dtype. Smooth L1
+    (Huber, half-width `beta`) rather than plain MSE bounds the gradient
+    against the occasional large-magnitude residual outlier.
+    """
+    per_row = F.smooth_l1_loss(
+        student_residual,
+        delta_target.to(dtype=student_residual.dtype),
+        beta=beta,
+        reduction="none",
+    )
+    return _masked_mean(per_row, mask)
+
+
 __all__ = [
     "DEFAULT_MARGIN",
     "DEFAULT_TEMPERATURE",
+    "kd_align_loss",
     "kd_dist_loss",
     "kd_gram_loss",
     "kd_label_loss",
     "kd_logit_loss",
     "kd_rank_loss",
+    "kd_residual_loss",
 ]

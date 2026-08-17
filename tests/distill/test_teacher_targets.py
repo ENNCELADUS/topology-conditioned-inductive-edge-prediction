@@ -149,7 +149,7 @@ def test_require_full_ego_oracle_refuses_a_null_generator() -> None:
 # --------------------------------------------------------------------------- artifact roundtrip
 
 
-def _write_toy_artifact(path: Path) -> None:
+def _write_toy_artifact(path: Path, *, content_logit: np.ndarray | None = None) -> None:
     rng = np.random.default_rng(0)
     write_kd_targets(
         path,
@@ -169,6 +169,7 @@ def _write_toy_artifact(path: Path) -> None:
         k_near=2,
         k_rand=2,
         seed=0,
+        content_logit=content_logit,
     )
 
 
@@ -185,6 +186,31 @@ def test_write_load_roundtrip(tmp_path: Path) -> None:
     assert loaded.manifest["truth_source"] == "training_structure"
     assert loaded.manifest["format"] == "kd_targets_v2"
     assert loaded.manifest["checkpoint_id"] == "abc123"
+    assert loaded.content_logit is None
+
+
+def test_write_load_roundtrip_with_content_logit(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifact"
+    content_logit = np.array([0.1, -0.2, 0.3], dtype=np.float32)
+    _write_toy_artifact(artifact_dir, content_logit=content_logit)
+
+    loaded = load_kd_targets(artifact_dir)
+    assert loaded.content_logit is not None
+    np.testing.assert_array_equal(loaded.content_logit, content_logit)
+    assert loaded.manifest["format"] == "kd_targets_v3"
+
+
+def test_write_rejects_mismatched_content_logit_length(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="content_logit"):
+        _write_toy_artifact(tmp_path / "bad", content_logit=np.array([0.1, 0.2], dtype=np.float32))
+
+
+def test_write_rejects_non_finite_content_logit(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="content_logit"):
+        _write_toy_artifact(
+            tmp_path / "bad",
+            content_logit=np.array([0.1, float("nan"), 0.3], dtype=np.float32),
+        )
 
 
 def test_load_rejects_a_missing_npz(tmp_path: Path) -> None:

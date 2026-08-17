@@ -7,10 +7,12 @@ from typing import cast
 
 import numpy as np
 import pytest
+import src.train_b0 as train_b0
 import torch
 from src.data.packed_features import PackedFeatureTable
 from src.distill.artifacts import KDTargets
 from src.distill.config import DistillConfig
+from src.distill.losses import kd_align_loss, kd_residual_loss
 from src.train_b0 import KDStream
 from torch import nn
 
@@ -50,10 +52,15 @@ class _StubModel(nn.Module):
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         logits = self.scale * batch["emb_a"].mean(dim=(1, 2))
         pair = torch.stack([logits, logits], dim=-1)
-        return {"logits": logits.unsqueeze(-1), "node_factor_pair": pair}
+        return {
+            "logits": logits.unsqueeze(-1),
+            "node_factor_pair": pair,
+            "node_factor_align": pair,
+            "node_factor_residual": logits,
+        }
 
 
-def _targets() -> KDTargets:
+def _targets(*, content_logit: np.ndarray | None = None) -> KDTargets:
     # Two context rows per anchor over 4 anchors: partner = (anchor + 1/2) % 4.
     pair_anchor = np.repeat(np.arange(4, dtype=np.int32), 2)
     pair_partner = np.array(
@@ -69,6 +76,7 @@ def _targets() -> KDTargets:
         teacher_pooled_ba=np.ones((8, 2), dtype=np.float16),
         is_near=np.ones(8, dtype=np.uint8),
         pair_label=np.array([1, 0] * 4, dtype=np.int8),
+        content_logit=content_logit,
         manifest={"k_near": 1, "k_rand": 1},
     )
 
@@ -80,10 +88,11 @@ def _stream(
     world_size: int = 1,
     allowed_nodes: frozenset[str] | None = None,
     forbidden_internal_nodes: frozenset[str] = frozenset(),
+    content_logit: np.ndarray | None = None,
 ) -> KDStream:
     return KDStream(
         distill,
-        _targets(),
+        _targets(content_logit=content_logit),
         cast(PackedFeatureTable, _FakeTable()),
         allowed_nodes=allowed_nodes if allowed_nodes is not None else frozenset(_NODE_IDS),
         forbidden_internal_nodes=forbidden_internal_nodes,
@@ -130,15 +139,16 @@ def test_anchor_positions_are_deterministic_and_rank_disjoint() -> None:
         {"w_logit": 1.0},
         {"w_rank": 1.0, "w_dist": 1.0},
         {"w_gram": 1.0},
+        {"w_align": 1.0},
     ],
 )
 def test_loss_is_finite_and_differentiable_for_every_arm(weights: dict[str, float]) -> None:
-    distill = DistillConfig(targets_path="t", anchors_per_step=2, **weights)
+    distill = DistillConfig.from_mapping({"targets_path": "t", "anchors_per_step": 2, **weights})
     stream = _stream(distill)
     model = _StubModel()
     loss = stream.loss(model, epoch=1, step=1)
     assert torch.isfinite(loss)
-    loss.backward()
+    loss.backward()  # type: ignore[no-untyped-call]
     assert model.scale.grad is not None
 
 
@@ -158,3 +168,129 @@ def test_world_size_larger_than_universe_fails_closed() -> None:
     distill = DistillConfig(targets_path="t", w_label=1.0)
     with pytest.raises(RuntimeError, match="smaller than the DDP world size"):
         _stream(distill, rank=4, world_size=5)
+
+
+def test_align_arm_requires_node_factor_align() -> None:
+    distill = DistillConfig(targets_path="t", w_align=1.0, anchors_per_step=1)
+    stream = _stream(distill)
+
+    class _NoAlign(nn.Module):
+        def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            return {"logits": batch["emb_a"].mean(dim=(1, 2))}
+
+    with pytest.raises(RuntimeError, match="node_factor_align_dim"):
+        stream.loss(_NoAlign(), epoch=1, step=1)
+
+
+def test_align_arm_calls_kd_align_loss_with_hoisted_pooled_teacher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # teacher_pooled_ab/ba are all-ones in the fixture, so the symmetrized
+    # pooled tensor is exactly 1.0 on every live (mask=1) row and 0.0 on
+    # every padding row -- a value independent of the (random) student
+    # embeddings, so it can be checked without reproducing row assembly.
+    distill = DistillConfig(targets_path="t", w_align=1.0, anchors_per_step=2)
+    stream = _stream(distill)
+    model = _StubModel()
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def _spy(
+        student_align: torch.Tensor,
+        teacher_feat: torch.Tensor,
+        mask: torch.Tensor,
+        **kwargs: float,
+    ) -> torch.Tensor:
+        captured["teacher_feat"] = teacher_feat
+        captured["mask"] = mask
+        return kd_align_loss(student_align, teacher_feat, mask, **kwargs)
+
+    monkeypatch.setattr(train_b0, "kd_align_loss", _spy)
+    loss = stream.loss(model, epoch=1, step=1)
+    assert torch.isfinite(loss)
+
+    pooled = captured["teacher_feat"]
+    mask = captured["mask"]
+    expected = mask.unsqueeze(-1).expand(-1, pooled.shape[-1])
+    assert torch.allclose(pooled, expected)
+
+
+def test_residual_arm_requires_node_factor_residual() -> None:
+    distill = DistillConfig(targets_path="t", w_residual=1.0, anchors_per_step=1)
+    stream = _stream(distill, content_logit=np.zeros(8, dtype=np.float32))
+
+    class _NoResidual(nn.Module):
+        def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            return {"logits": batch["emb_a"].mean(dim=(1, 2))}
+
+    with pytest.raises(RuntimeError, match="node_factor_dim"):
+        stream.loss(_NoResidual(), epoch=1, step=1)
+
+
+def test_residual_arm_requires_content_logit_in_targets() -> None:
+    distill = DistillConfig(targets_path="t", w_residual=1.0, anchors_per_step=1)
+    with pytest.raises(RuntimeError, match="content_logit"):
+        _stream(distill)
+
+
+def test_residual_arm_computes_teacher_minus_content_delta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # content_logit is teacher_logit offset by a constant, so the delta
+    # target is exactly 0.5 on every live row regardless of which context
+    # rows were sampled, and exactly 0.0 on every padding row (both the
+    # padded teacher_logit and the padded content_logit are appended as
+    # 0.0) -- both checkable without reproducing row assembly.
+    teacher_logit = np.linspace(-2.0, 2.0, 8, dtype=np.float32)
+    content_logit = (teacher_logit - 0.5).astype(np.float32)
+    distill = DistillConfig(targets_path="t", w_residual=1.0, anchors_per_step=2)
+    stream = _stream(distill, content_logit=content_logit)
+    model = _StubModel()
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def _spy(
+        student_residual: torch.Tensor,
+        delta_target: torch.Tensor,
+        mask: torch.Tensor,
+        **kwargs: float,
+    ) -> torch.Tensor:
+        captured["delta_target"] = delta_target
+        captured["mask"] = mask
+        return kd_residual_loss(student_residual, delta_target, mask, **kwargs)
+
+    monkeypatch.setattr(train_b0, "kd_residual_loss", _spy)
+    loss = stream.loss(model, epoch=1, step=1)
+    assert torch.isfinite(loss)
+    loss.backward()  # type: ignore[no-untyped-call]
+    assert model.scale.grad is not None
+
+    delta = captured["delta_target"]
+    mask = captured["mask"]
+    live_delta = delta[mask == 1.0]
+    pad_delta = delta[mask == 0.0]
+    assert torch.allclose(live_delta, torch.full_like(live_delta, 0.5))
+    assert torch.allclose(pad_delta, torch.zeros_like(pad_delta))
+
+
+def test_rank_dist_gram_pattern_sums_the_three_terms() -> None:
+    # w_rank + w_dist + w_gram compose additively already (each is an
+    # independent `if` branch adding into `total`), so this exercises the
+    # combined pattern rather than any new trainer wiring.
+    distill_combo = DistillConfig(
+        targets_path="t", w_rank=1.0, w_dist=1.0, w_gram=1.0, anchors_per_step=2
+    )
+    model = _StubModel()
+
+    torch.manual_seed(0)
+    combined = _stream(distill_combo).loss(model, epoch=1, step=1)
+
+    total_individual = torch.zeros(())
+    for weights in ({"w_rank": 1.0, "w_dist": 1.0}, {"w_gram": 1.0}):
+        distill_legal = DistillConfig.from_mapping(
+            {"targets_path": "t", "anchors_per_step": 2, **weights}
+        )
+        torch.manual_seed(0)
+        total_individual = total_individual + _stream(distill_legal).loss(model, epoch=1, step=1)
+
+    assert torch.allclose(combined, total_individual, atol=1e-5)

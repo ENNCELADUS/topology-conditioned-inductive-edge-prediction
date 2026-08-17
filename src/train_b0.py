@@ -75,11 +75,13 @@ from src.data.val_region import (
 from src.distill.artifacts import KDTargets, load_kd_targets
 from src.distill.config import DistillConfig
 from src.distill.losses import (
+    kd_align_loss,
     kd_dist_loss,
     kd_gram_loss,
     kd_label_loss,
     kd_logit_loss,
     kd_rank_loss,
+    kd_residual_loss,
 )
 from src.e2_pipeline import ProbeResult
 from src.eval.checkpoint_selection import (
@@ -2471,6 +2473,11 @@ class KDStream:
         self._shard = list(range(rank, len(targets.node_ids), world_size))
         if not self._shard:
             raise RuntimeError("KD artifact node universe is smaller than the DDP world size")
+        if distill.w_residual > 0.0 and targets.content_logit is None:
+            raise RuntimeError(
+                "distill.w_residual requires a KD targets artifact with content_logit "
+                "(kd_targets v3)"
+            )
 
     def _anchor_positions(self, epoch: int, step: int) -> list[int]:
         """This rank's `anchors_per_step` artifact node positions for one step."""
@@ -2497,6 +2504,11 @@ class KDStream:
         pair_label: list[float] = []
         group: list[int] = []
         mask: list[float] = []
+        content_logit_list: list[float] = []
+        collect_content = distill.w_residual > 0.0
+        content_logit_arr = targets.content_logit
+        if collect_content:
+            assert content_logit_arr is not None  # validated in __init__
         pooled_dim = targets.teacher_pooled_ab.shape[-1]
         for anchor_pos in self._anchor_positions(epoch, step):
             start = int(targets.anchor_offsets[anchor_pos])
@@ -2519,6 +2531,9 @@ class KDStream:
                     pair_label.append(float(targets.pair_label[csr]))
                     group.append(anchor_pos)
                     mask.append(1.0)
+                    if collect_content:
+                        assert content_logit_arr is not None
+                        content_logit_list.append(float(content_logit_arr[csr]))
                 else:
                     anchor_rows.append(anchor_row)
                     partner_rows.append(anchor_row)
@@ -2527,6 +2542,8 @@ class KDStream:
                     pair_label.append(0.0)
                     group.append(anchor_pos)
                     mask.append(0.0)
+                    if collect_content:
+                        content_logit_list.append(0.0)
 
         emb_a, len_a = self._gather(anchor_rows)
         emb_b, len_b = self._gather(partner_rows)
@@ -2556,7 +2573,11 @@ class KDStream:
             total = total + distill.w_dist * kd_dist_loss(
                 logits, teacher, kd_group, kd_mask, temperature=distill.temperature
             )
+        pooled: torch.Tensor | None = None
+        if distill.w_gram > 0.0 or distill.w_align > 0.0:
+            pooled = torch.tensor(np.stack(teacher_pooled), dtype=torch.float32, device=device)
         if distill.w_gram > 0.0:
+            assert pooled is not None
             pair_feature = output.get("node_factor_pair")
             if pair_feature is None:
                 raise RuntimeError("distill.w_gram requires model.config.node_factor_dim > 0")
@@ -2567,9 +2588,24 @@ class KDStream:
                 ],
                 dim=-1,
             )
-            pooled = torch.tensor(np.stack(teacher_pooled), dtype=torch.float32, device=device)
             total = total + distill.w_gram * kd_gram_loss(
                 pair_feature.float(), pooled, endpoints, kd_mask
+            )
+        if distill.w_align > 0.0:
+            assert pooled is not None
+            feat = output.get("node_factor_align")
+            if feat is None:
+                raise RuntimeError(
+                    "distill.w_align requires model.config.node_factor_align_dim > 0"
+                )
+            total = total + distill.w_align * kd_align_loss(feat.float(), pooled, kd_mask)
+        if distill.w_residual > 0.0:
+            res = output.get("node_factor_residual")
+            if res is None:
+                raise RuntimeError("distill.w_residual requires model.config.node_factor_dim > 0")
+            content = torch.tensor(content_logit_list, dtype=torch.float32, device=device)
+            total = total + distill.w_residual * kd_residual_loss(
+                res.float(), teacher - content, kd_mask
             )
         return total
 
