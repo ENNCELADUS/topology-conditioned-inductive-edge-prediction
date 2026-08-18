@@ -41,6 +41,7 @@ import torch
 
 from src.data.features import FeatureStore
 from src.experiments.g1_hardened_e2 import _BENCHMARK_SUBDIR
+from src.experiments.s2_latent_topology.data import S2_SIZES
 from src.experiments.s3_set_residual.data import (
     build_s3_corpus,
     build_vval_eval,
@@ -62,6 +63,12 @@ logger = logging.getLogger(__name__)
 
 _STAGES: tuple[str, ...] = ("cache", "train", "eval")
 _FEATURES_SUBDIR = Path("features") / "frozen_node_features_1024"
+_DEFAULT_SIZES = ",".join(str(size) for size in S2_SIZES)
+
+
+def _parse_sizes(raw: str) -> tuple[int, ...]:
+    """Parse a comma-separated `--sizes`/`--vval-sizes` value into a size tuple."""
+    return tuple(int(token) for token in raw.split(","))
 
 
 def _load_train_graph(benchmark_root: Path, strategy: str) -> nx.Graph:
@@ -81,9 +88,23 @@ def _base_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _add_cache_args(parser: argparse.ArgumentParser) -> None:
+def _add_shared_args(parser: argparse.ArgumentParser) -> None:
+    """Flags every stage shares, registered exactly once (never per-stage).
+
+    `--data-root`/`--strategy` are read by `cache` and (via `run_eval`) `eval`;
+    `--seed` by `train` and `eval`; `--device` by all three. Registering these
+    once at the top level -- rather than letting each stage (or, for `eval`,
+    Task 4's `register_eval_args`) declare its own copy -- is what keeps
+    `argparse.ArgumentParser.add_argument` from raising a duplicate-option
+    `ArgumentError` when two owners both want `--device`.
+    """
     parser.add_argument("--data-root", type=Path, default=Path("data"))
     parser.add_argument("--strategy", default="breadth_first")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", default="cuda")
+
+
+def _add_cache_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -99,15 +120,29 @@ def _add_cache_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--regions-per-size", type=int, default=150)
     parser.add_argument("--vval-per-size", type=int, default=20)
     parser.add_argument("--neg-ratio", type=int, default=5)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--sizes",
+        default=_DEFAULT_SIZES,
+        help=(
+            "Comma-separated training-region node-count sizes for build_s3_corpus "
+            "(default: S2's own S2_SIZES). Does not affect the canonical V_val node-set "
+            "derivation, which always uses its own fixed ValRegionParams defaults."
+        ),
+    )
+    parser.add_argument(
+        "--vval-sizes",
+        default=_DEFAULT_SIZES,
+        help=(
+            "Comma-separated V_val bucket node-count sizes for build_vval_eval "
+            "(default: S2_SIZES). Same independence from ValRegionParams as --sizes."
+        ),
+    )
 
 
 def _add_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--arm", required=True, choices=("res", "pair", "diag"))
-    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--cache-dir", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--device", default="cuda")
 
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch-regions", type=int, default=32)
@@ -131,6 +166,10 @@ def build_parser(stage: str) -> argparse.ArgumentParser:
 
     `stage="eval"` lazily imports `evaluate.register_eval_args` to add its
     args -- `evaluate.py` is never imported for `stage in ("cache", "train")`.
+    `register_eval_args` owns every eval-exclusive flag itself, including
+    `--run-dir` (optional there, since `--aggregate`-only invocations need no
+    run dir): this function must never re-register any flag it also adds, or
+    `argparse` raises a duplicate-option `ArgumentError`.
 
     Args:
         stage: One of `"cache"`, `"train"`, `"eval"`.
@@ -143,12 +182,12 @@ def build_parser(stage: str) -> argparse.ArgumentParser:
         description="S3 set-residual diagnostic: build the cache, train one arm, evaluate.",
     )
     parser.add_argument("--stage", required=True, choices=_STAGES)
+    _add_shared_args(parser)
     if stage == "cache":
         _add_cache_args(parser)
     elif stage == "train":
         _add_train_args(parser)
     else:
-        parser.add_argument("--run-dir", type=Path, required=True)
         from src.experiments.s3_set_residual.evaluate import register_eval_args
 
         register_eval_args(parser)
@@ -171,6 +210,7 @@ def _stage_cache(args: argparse.Namespace) -> None:
         train_graph,
         store,
         checkpoint=args.checkpoint,
+        sizes=_parse_sizes(args.sizes),
         per_size=args.regions_per_size,
         neg_ratio=args.neg_ratio,
         cache_dir=output_dir,
@@ -183,6 +223,7 @@ def _stage_cache(args: argparse.Namespace) -> None:
         train_graph,
         store,
         checkpoint=args.checkpoint,
+        sizes=_parse_sizes(args.vval_sizes),
         per_size=args.vval_per_size,
         cache_dir=output_dir,
         device=device,

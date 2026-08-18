@@ -1,25 +1,32 @@
-"""End-to-end smoke test: S3's cache -> train pipeline on a fully synthetic universe.
+"""End-to-end smoke tests: S3's cache -> train pipeline, at the library level and via the CLI.
 
-Drives the same library entry points `cli.py`'s `cache`/`train` stages call
-(`build_s3_corpus`, `build_vval_eval`, `build_vval_features`, `train_arm`) against
-a tiny synthetic graph, a synthetic `FeatureStore`, and a tiny real `v3_1`
-checkpoint (`score_universe.build_model`, mirroring `test_s3_residual_data.py`'s
-fixture pattern -- duplicated here rather than imported, per house convention).
+Two test classes, sharing the same checkpoint/FeatureStore fixture helpers
+(mirroring `test_s3_residual_data.py`'s pattern -- duplicated here rather than
+imported, per house convention):
 
-Deliberately bypasses `cli.main`'s argv parsing for the cache step: the CLI's
-`cache` stage has no `--sizes`/`--vval-sizes` override (by design -- production
-runs use S2's real `S2_SIZES`, up to 200-node buckets), which a 60-node test
-graph cannot satisfy. `build_s3_corpus`/`build_vval_eval` take `sizes`/
-`vval_nodes` overrides directly (the same override Task 1's own tests use for
-small graphs), so this test calls them directly; `train_arm` is exercised
-exactly as `cli._stage_train` calls it, after a save/load round trip through
-the same cache files `cli._stage_cache` would have written.
+- `TestS3CacheToTrain` drives the library entry points `cli.py`'s `cache`/
+  `train` stages call directly (`build_s3_corpus`, `build_vval_eval`,
+  `build_vval_features`, `train_arm`) against a small 60-node synthetic graph
+  with an explicit `vval_nodes` override -- the same override Task 1's own
+  tests use for graphs too small for the canonical V_val derivation.
+- `TestS3CliEndToEnd` drives `cli.main` itself (argv parsing + stage dispatch,
+  including the `--sizes`/`--vval-sizes` overrides) against a *larger*
+  ~1200-node graph. The `--sizes`/`--vval-sizes` CLI flags only control
+  `build_s3_corpus`/`build_vval_eval`'s own region/bucket sampling; the
+  canonical V_val node-set derivation the `cache` stage always runs first
+  (`derive_vval_nodes`, no CLI override) internally calls
+  `sample_bfs_ball_buckets` with `ValRegionParams()`'s own fixed
+  `bucket_sizes` (up to 200 nodes), so the graph must be large enough for
+  that regardless of `--sizes`/`--vval-sizes` -- a ~1200-node graph reliably
+  derives a several-hundred-node V_val region (verified empirically: this
+  derivation itself takes well under a second, it is pure graph traversal).
 """
 
 from __future__ import annotations
 
 import json
 import math
+import pickle
 from pathlib import Path
 
 import networkx as nx
@@ -28,6 +35,7 @@ import pytest
 import torch
 from src import score_universe
 from src.data.features import FeatureStore
+from src.experiments.s3_set_residual import cli as s3_cli
 from src.experiments.s3_set_residual import data as s3_data
 from src.experiments.s3_set_residual import train as train_mod
 from src.experiments.s3_set_residual.model import ResidualConfig
@@ -219,6 +227,8 @@ class TestS3CacheToTrain:
         assert epoch0["vval_delta_auprc"] == 0.0
         assert epoch0["delta_variance"] == 0.0
         assert epoch0["margin_share"] == 0.0
+        assert epoch0["n_sets_used"] > 0
+        assert epoch0["n_sets_skipped_single_class"] >= 0
 
         # -- every subsequent record is well-formed and finite --
         for line in lines[1:]:
@@ -228,6 +238,8 @@ class TestS3CacheToTrain:
             assert _finite(record["vval_delta_auprc"])
             assert _finite(record["delta_variance"])
             assert _finite(record["margin_share"])
+            assert record["n_sets_used"] > 0
+            assert record["n_sets_skipped_single_class"] >= 0
 
         # -- run_metadata.json is well-formed and finite --
         metadata = json.loads(metadata_path.read_text())
@@ -258,3 +270,237 @@ class TestS3CacheToTrain:
         out = best_model(x, mask, pairs)
         assert out.shape == (2,)
         assert torch.isfinite(out).all()
+
+
+# --------------------------------------------------------------------------- CLI-driven (finding 3)
+
+_STRATEGY = "breadth_first"
+
+
+def _write_cli_feature_root(data_root: Path, node_ids: list[str]) -> None:
+    """Write a synthetic FeatureStore root at the exact path `cli._stage_cache` reads."""
+    root = data_root / "features" / "frozen_node_features_1024"
+    embeddings_dir = root / "embeddings"
+    embeddings_dir.mkdir(parents=True)
+    rng = np.random.default_rng(0)
+    index: dict[str, str] = {}
+    for node_id in node_ids:
+        tensor = torch.tensor(rng.standard_normal((TOKEN_LEN, INPUT_DIM)), dtype=torch.float32)
+        rel_path = f"embeddings/{node_id}.pt"
+        torch.save(tensor, root / rel_path)
+        index[node_id] = rel_path
+    (root / "index.json").write_text(json.dumps(index))
+    (root / "metadata.json").write_text(
+        json.dumps(
+            {"format": "torch_pt_per_node", "input_dim": INPUT_DIM, "max_sequence_length": 1024}
+        )
+    )
+
+
+def _write_cli_checkpoint(path: Path) -> None:
+    torch.manual_seed(0)
+    model = score_universe.build_model("v3_1", _tiny_v3_1_config())
+    _write_checkpoint(path, model=model, model_family="v3_1", model_config=_tiny_v3_1_config())
+
+
+def _write_train_graph(data_root: Path, strategy: str, graph: nx.Graph) -> None:
+    strategy_dir = data_root / "benchmark_2025_neurips" / strategy
+    strategy_dir.mkdir(parents=True)
+    with (strategy_dir / "train_graph.pkl").open("wb") as f:
+        pickle.dump(graph, f)
+
+
+def _make_large_graph(n: int = 1200) -> nx.Graph:
+    """A graph large enough for the canonical V_val derivation to succeed.
+
+    Its own fixed `ValRegionParams().bucket_sizes` (up to 200 nodes) needs a
+    V_val region of at least 200 nodes; empirically a 1200-node Watts-Strogatz
+    graph derives one several hundred nodes wide (see module docstring),
+    comfortably clearing that floor.
+    """
+    base = nx.connected_watts_strogatz_graph(n, k=4, p=0.3, seed=0)
+    return nx.relabel_nodes(base, {i: f"node_{i:06d}" for i in base.nodes()})
+
+
+class TestS3CliEndToEnd:
+    """Drives `cli.main` itself: argv parsing, `--sizes`/`--vval-sizes`, stage dispatch."""
+
+    def test_cache_then_train_via_cli_main(self, tmp_path: Path) -> None:
+        data_root = tmp_path / "data"
+        graph = _make_large_graph()
+        node_ids = sorted(graph.nodes())
+        _write_train_graph(data_root, _STRATEGY, graph)
+        _write_cli_feature_root(data_root, node_ids)
+        checkpoint_path = tmp_path / "ckpt.pt"
+        _write_cli_checkpoint(checkpoint_path)
+
+        cache_dir = tmp_path / "cache"
+        exit_code = s3_cli.main(
+            [
+                "--stage",
+                "cache",
+                "--data-root",
+                str(data_root),
+                "--strategy",
+                _STRATEGY,
+                "--checkpoint",
+                str(checkpoint_path),
+                "--output-dir",
+                str(cache_dir),
+                "--sizes",
+                "6,8",
+                "--vval-sizes",
+                "6,8",
+                "--regions-per-size",
+                "3",
+                "--vval-per-size",
+                "2",
+                "--neg-ratio",
+                "2",
+                "--device",
+                "cpu",
+            ]
+        )
+        assert exit_code == 0
+        assert (cache_dir / "corpus.pt").exists()
+        assert (cache_dir / "vval.pkl").exists()
+        assert (cache_dir / "vval_features.pt").exists()
+
+        run_dir = tmp_path / "run"
+        exit_code = s3_cli.main(
+            [
+                "--stage",
+                "train",
+                "--arm",
+                "res",
+                "--seed",
+                "0",
+                "--cache-dir",
+                str(cache_dir),
+                "--run-dir",
+                str(run_dir),
+                "--device",
+                "cpu",
+                "--epochs",
+                "2",
+                "--batch-regions",
+                "3",
+                "--d-in",
+                str(INPUT_DIM),
+                "--d-model",
+                "16",
+                "--sab-layers",
+                "1",
+                "--heads",
+                "2",
+                "--pma-seeds",
+                "2",
+                "--p-dim",
+                "6",
+                "--head-hidden",
+                "12",
+            ]
+        )
+        assert exit_code == 0
+
+        assert (run_dir / "best.pt").exists()
+        assert (run_dir / "last.pt").exists()
+        metadata = json.loads((run_dir / "run_metadata.json").read_text())
+        assert metadata["arm"] == "res"
+        assert 1 <= metadata["published_epoch"] <= 2
+
+        lines = (run_dir / "metrics.jsonl").read_text().strip().splitlines()
+        assert len(lines) == 3  # epoch 0, 1, 2
+        epoch0 = json.loads(lines[0])
+        assert epoch0["epoch"] == 0
+        assert epoch0["vval_delta_auprc"] == 0.0
+        for line in lines:
+            record = json.loads(line)
+            assert _finite(record["n_sets_used"])
+            assert _finite(record["n_sets_skipped_single_class"])
+
+
+class TestS3CliEvalWiring:
+    """Pins the `--stage eval` argv-parsing + delegation contract (findings 4-6).
+
+    Does not exercise `run_eval`'s body -- Task 4 owns that. `evaluate.py`'s
+    `run_eval` is monkeypatched to a capturing stub so this test only proves:
+    (a) `cli.main(["--stage", "eval", ...])` parses without the duplicate
+    `--run-dir`/missing-shared-flags errors the review caught, and (b) the
+    namespace `run_eval` receives carries every field it reads
+    (`data_root`, `strategy`, `device`, `seed`, `run_dir`, `b0_universe`).
+    """
+
+    def test_eval_stage_invokes_run_eval_with_complete_namespace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.experiments.s3_set_residual import evaluate as s3_evaluate
+
+        captured: dict[str, object] = {}
+
+        def _fake_run_eval(args: object) -> Path:
+            captured["data_root"] = args.data_root  # type: ignore[attr-defined]
+            captured["strategy"] = args.strategy  # type: ignore[attr-defined]
+            captured["device"] = args.device  # type: ignore[attr-defined]
+            captured["seed"] = args.seed  # type: ignore[attr-defined]
+            captured["run_dir"] = args.run_dir  # type: ignore[attr-defined]
+            captured["b0_universe"] = args.b0_universe  # type: ignore[attr-defined]
+            return tmp_path / "report.json"
+
+        monkeypatch.setattr(s3_evaluate, "run_eval", _fake_run_eval)
+
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        b0_path = tmp_path / "b0.npz"
+        b0_path.write_bytes(b"")  # never read -- run_eval is stubbed above
+
+        exit_code = s3_cli.main(
+            [
+                "--stage",
+                "eval",
+                "--data-root",
+                str(tmp_path / "data"),
+                "--strategy",
+                "breadth_first",
+                "--device",
+                "cpu",
+                "--seed",
+                "3",
+                "--run-dir",
+                str(run_dir),
+                "--b0-universe",
+                str(b0_path),
+            ]
+        )
+
+        assert exit_code == 0
+        assert captured["data_root"] == tmp_path / "data"
+        assert captured["strategy"] == "breadth_first"
+        assert captured["device"] == "cpu"
+        assert captured["seed"] == 3
+        assert captured["run_dir"] == run_dir
+        assert captured["b0_universe"] == b0_path
+
+    def test_aggregate_only_invocation_needs_no_run_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--run-dir` must stay optional at the CLI level (finding 6)."""
+        from src.experiments.s3_set_residual import evaluate as s3_evaluate
+
+        captured: dict[str, object] = {}
+
+        def _fake_run_eval(args: object) -> Path:
+            captured["run_dir"] = args.run_dir  # type: ignore[attr-defined]
+            captured["aggregate"] = args.aggregate  # type: ignore[attr-defined]
+            return tmp_path / "pooled_report.json"
+
+        monkeypatch.setattr(s3_evaluate, "run_eval", _fake_run_eval)
+
+        report_a = tmp_path / "a.json"
+        report_a.write_text("{}")
+
+        exit_code = s3_cli.main(["--stage", "eval", "--aggregate", str(report_a)])
+
+        assert exit_code == 0
+        assert captured["run_dir"] is None
+        assert captured["aggregate"] == [report_a]

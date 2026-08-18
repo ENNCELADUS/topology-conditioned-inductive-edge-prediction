@@ -12,14 +12,18 @@ Selection is two-staged:
 
 1. **Per epoch**, `_validate` runs the model over every `VvalEval` bucket's full
    `i < j` pair matrix and reports the paired macro ΔAUPRC (`AUPRC(base + delta) -
-   AUPRC(base)`, meaned over sets with both classes present) plus two telemetry-only
-   readouts (delta variance, share of pairs where `|delta| > |base|`) -- logged to
-   `metrics.jsonl`. An explicit epoch-0 pass runs *before* the first optimizer step;
-   at zero-init `delta` is exactly `0` for every pair (`model.py`'s contract), so
-   `base + delta` is bit-identical to `base` and the epoch-0 ΔAUPRC is exactly `0.0`,
-   not merely close to it. The top `cfg.top_k_checkpoints` training epochs (by this
-   metric, epoch 0 excluded) are kept as `epoch_<E>.pt`; the rest are pruned as the
-   frontier moves. `last.pt` is overwritten every epoch regardless of rank.
+   AUPRC(base)`, meaned over sets with both classes present) plus telemetry-only
+   readouts (delta variance; share of pairs where `|delta| > |base|`; the count of
+   sets that contributed to ΔAUPRC vs. were skipped for being single-class) --
+   logged to `metrics.jsonl`. Fail-closed: if *every* bucket set is single-class,
+   ΔAUPRC is undefined and `_validate` raises `RuntimeError` rather than returning
+   `NaN` into downstream top-k/early-stop/selection math. An explicit epoch-0 pass
+   runs *before* the first optimizer step; at zero-init `delta` is exactly `0` for
+   every pair (`model.py`'s contract), so `base + delta` is bit-identical to `base`
+   and the epoch-0 ΔAUPRC is exactly `0.0`, not merely close to it. The top
+   `cfg.top_k_checkpoints` training epochs (by this metric, epoch 0 excluded) are
+   kept as `epoch_<E>.pt`; the rest are pruned as the frontier moves. `last.pt` is
+   overwritten every epoch regardless of rank.
 2. **After training**, each of the top-K checkpoints' five-number topology (BFS-macro
    GS, RD, and the degree/clustering/spectral MMD ratios -- `_topology_five_numbers`,
    built from the same public `src.eval.assembly`/`src.eval.graph_metrics` primitives
@@ -212,23 +216,33 @@ def _vval_forward(
 
 def _validate(
     model: SetResidualModel, vval: VvalEval, features: VvalFeatures, device: torch.device
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, int, int]:
     """Paired macro ΔAUPRC over every V_val bucket, plus delta telemetry.
 
     Returns:
-        `(macro_delta_auprc, delta_variance, margin_share)`:
-        `macro_delta_auprc` is the mean of `AUPRC(base + delta) - AUPRC(base)`
-        over every bucket set with both classes present in its `i < j` labels
-        (`nan` if none qualify); `delta_variance` is the population variance of
-        every pair's delta across every bucket; `margin_share` is the fraction
-        of pairs where `|delta| > |base|`. The latter two are telemetry only,
-        never gating.
+        `(macro_delta_auprc, delta_variance, margin_share, n_sets_used,
+        n_sets_skipped_single_class)`: `macro_delta_auprc` is the mean of
+        `AUPRC(base + delta) - AUPRC(base)` over every bucket set with both
+        classes present in its `i < j` labels; `delta_variance` is the
+        population variance of every pair's delta across every bucket (all
+        sets, used or skipped); `margin_share` is the fraction of pairs where
+        `|delta| > |base|` (all sets); `n_sets_used`/
+        `n_sets_skipped_single_class` count how many bucket sets did/didn't
+        contribute to `macro_delta_auprc`. The variance/margin/count fields
+        are telemetry only, never gating.
+
+    Raises:
+        RuntimeError: If every V_val bucket set is single-class, so
+            `macro_delta_auprc` would otherwise be an undefined mean of zero
+            values -- fail-closed rather than silently returning `NaN` into
+            downstream top-k/early-stop/selection math.
     """
     deltas_by_size = _vval_forward(model, vval, features, device)
     diffs: list[float] = []
     all_deltas: list[float] = []
     margin_hits = 0
     margin_total = 0
+    n_skipped = 0
     for size in vval.sizes:
         iu, iv = np.triu_indices(size, k=1)
         for k in range(len(vval.node_ids[size])):
@@ -239,14 +253,21 @@ def _validate(
             margin_hits += int(np.sum(np.abs(delta) > np.abs(base)))
             margin_total += delta.shape[0]
             if len(set(true.tolist())) < 2:
+                n_skipped += 1
                 continue
             auprc_model = average_precision_score(true, base + delta)
             auprc_base = average_precision_score(true, base)
             diffs.append(float(auprc_model - auprc_base))
-    macro_delta_auprc = float(np.mean(diffs)) if diffs else float("nan")
+    if not diffs:
+        raise RuntimeError(
+            "S3 _validate: every V_val bucket set is single-class (no positive or no "
+            "negative true label) -- ΔAUPRC is undefined for this checkpoint; refusing "
+            "to return NaN into top-k/early-stop/selection math (fail-closed)."
+        )
+    macro_delta_auprc = float(np.mean(diffs))
     delta_variance = float(np.var(all_deltas)) if all_deltas else 0.0
     margin_share = float(margin_hits / margin_total) if margin_total else 0.0
-    return macro_delta_auprc, delta_variance, margin_share
+    return macro_delta_auprc, delta_variance, margin_share, len(diffs), n_skipped
 
 
 # --------------------------------------------------------------------------- five-number topology
@@ -451,10 +472,18 @@ def _save_checkpoint(
     epoch: int,
     delta_auprc: float,
 ) -> None:
+    """Save one checkpoint per the Task 3/4 contract: `model_state` + `config` keys.
+
+    `evaluate.load_residual_checkpoint` hard-requires exactly these two key
+    names (`model_state`: the state dict; `config`:
+    `dataclasses.asdict(ResidualConfig)`) to load `best.pt`; the extra
+    `epoch`/`vval_delta_auprc` fields are S3-internal bookkeeping Task 4 does
+    not read.
+    """
     torch.save(
         {
-            "model": model.state_dict(),
-            "model_config": dataclasses.asdict(model_cfg),
+            "model_state": model.state_dict(),
+            "config": dataclasses.asdict(model_cfg),
             "epoch": epoch,
             "vval_delta_auprc": delta_auprc,
         },
@@ -465,7 +494,7 @@ def _save_checkpoint(
 def _load_model(path: Path, model_cfg: ResidualConfig, device: torch.device) -> SetResidualModel:
     payload = cast(dict[str, object], torch.load(path, map_location="cpu", weights_only=True))
     model = SetResidualModel(model_cfg).to(device)
-    model.load_state_dict(cast(dict[str, torch.Tensor], payload["model"]))
+    model.load_state_dict(cast(dict[str, torch.Tensor], payload["model_state"]))
     model.eval()
     return model
 
@@ -512,7 +541,9 @@ def train_arm(
 
     # Epoch 0: pre-training sanity pass. At zero-init `delta` is exactly 0 for every
     # pair, so `base + delta` is bit-identical to `base` and this ΔAUPRC is exactly 0.0.
-    delta_auprc0, delta_var0, margin0 = _validate(model, vval, vval_features, device)
+    delta_auprc0, delta_var0, margin0, n_used0, n_skip0 = _validate(
+        model, vval, vval_features, device
+    )
     append_jsonl(
         metrics_path,
         {
@@ -521,6 +552,8 @@ def train_arm(
             "vval_delta_auprc": delta_auprc0,
             "delta_variance": delta_var0,
             "margin_share": margin0,
+            "n_sets_used": n_used0,
+            "n_sets_skipped_single_class": n_skip0,
         },
     )
 
@@ -559,7 +592,9 @@ def train_arm(
             else float("nan")
         )
 
-        delta_auprc, delta_var, margin_share = _validate(model, vval, vval_features, device)
+        delta_auprc, delta_var, margin_share, n_used, n_skip = _validate(
+            model, vval, vval_features, device
+        )
         append_jsonl(
             metrics_path,
             {
@@ -568,6 +603,8 @@ def train_arm(
                 "vval_delta_auprc": delta_auprc,
                 "delta_variance": delta_var,
                 "margin_share": margin_share,
+                "n_sets_used": n_used,
+                "n_sets_skipped_single_class": n_skip,
             },
         )
 

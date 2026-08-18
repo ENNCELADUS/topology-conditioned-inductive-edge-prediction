@@ -9,6 +9,7 @@ separately by `test_s3_residual_end_to_end.py`.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 from typing import cast
@@ -45,21 +46,35 @@ def _tiny_model_cfg(mode: str) -> ResidualConfig:
     )
 
 
-def _make_vval(node_count: int = 6, draws: int = 2) -> tuple[VvalEval, train_mod.VvalFeatures]:
-    """A tiny hand-built `VvalEval` + `VvalFeatures`: one size, `draws` identical draws."""
+def _watts_strogatz_real_adj(node_count: int) -> tuple[nx.Graph, list[str], torch.Tensor]:
+    """A small connected Watts-Strogatz graph plus its `(n, n)` 0/1 loopless adjacency."""
     graph = nx.watts_strogatz_graph(node_count, k=4, p=0.3, seed=0)
     graph = nx.relabel_nodes(graph, {i: f"v{i:02d}" for i in graph.nodes()})
     node_order = sorted(graph.nodes())
-    n = node_count
-
-    buckets = {n: [set(node_order) for _ in range(draws)]}
-    bucket_ref = precompute_bucket_reference(graph, buckets, MMDConfig())
-
-    adj = torch.zeros(n, n)
+    adj = torch.zeros(node_count, node_count)
     for u, v in graph.edges():
         i, j = node_order.index(u), node_order.index(v)
         adj[i, j] = 1.0
         adj[j, i] = 1.0
+    return graph, node_order, adj
+
+
+def _make_vval_with_true_adjs(
+    node_count: int, true_adjs: list[torch.Tensor]
+) -> tuple[VvalEval, train_mod.VvalFeatures]:
+    """A hand-built `VvalEval` + `VvalFeatures`: one size, one draw per `true_adjs` entry.
+
+    `true_adjs` lets callers control exactly which draws are single-class (for
+    `_validate`'s skip-counting / all-single-class-raises tests) independent of
+    `bucket_ref`, which is still built from the real graph's own edges (only
+    `_topology_five_numbers` reads `bucket_ref`; `_validate` never does).
+    """
+    graph, node_order, _real_adj = _watts_strogatz_real_adj(node_count)
+    draws = len(true_adjs)
+    n = node_count
+
+    buckets = {n: [set(node_order) for _ in range(draws)]}
+    bucket_ref = precompute_bucket_reference(graph, buckets, MMDConfig())
 
     rng = np.random.default_rng(0)
     base_mats = []
@@ -76,7 +91,7 @@ def _make_vval(node_count: int = 6, draws: int = 2) -> tuple[VvalEval, train_mod
         sizes=(n,),
         node_ids={n: [node_order for _ in range(draws)]},
         base_logits={n: base_mats},
-        true_adj={n: [adj.clone() for _ in range(draws)]},
+        true_adj={n: [adj.clone() for adj in true_adjs]},
         bucket_ref=bucket_ref,
         checkpoint_id="tiny-checkpoint",
     )
@@ -85,6 +100,12 @@ def _make_vval(node_count: int = 6, draws: int = 2) -> tuple[VvalEval, train_mod
         features=torch.tensor(rng.normal(size=(n, D_IN)), dtype=torch.float32),
     )
     return vval, features
+
+
+def _make_vval(node_count: int = 6, draws: int = 2) -> tuple[VvalEval, train_mod.VvalFeatures]:
+    """A tiny hand-built `VvalEval` + `VvalFeatures`: one size, `draws` real-edge draws."""
+    _graph, _node_order, real_adj = _watts_strogatz_real_adj(node_count)
+    return _make_vval_with_true_adjs(node_count, [real_adj.clone() for _ in range(draws)])
 
 
 def _make_corpus(d_in: int = D_IN) -> S3Corpus:
@@ -274,10 +295,14 @@ class TestValidate:
     def test_zero_init_delta_auprc_is_exact_zero(self) -> None:
         vval, features = _make_vval()
         model = SetResidualModel(_tiny_model_cfg("res"))
-        delta_auprc, delta_var, margin_share = train_mod._validate(model, vval, features, CPU)
+        delta_auprc, delta_var, margin_share, n_used, n_skipped = train_mod._validate(
+            model, vval, features, CPU
+        )
         assert delta_auprc == 0.0
         assert delta_var == 0.0
         assert margin_share == 0.0
+        assert n_used == 2
+        assert n_skipped == 0
 
     def test_perturbed_model_gives_finite_nonzero_variance(self) -> None:
         vval, features = _make_vval()
@@ -286,10 +311,33 @@ class TestValidate:
         with torch.no_grad():
             for p in model.pair_out.parameters():
                 p.add_(torch.randn_like(p) * 0.5)
-        delta_auprc, delta_var, margin_share = train_mod._validate(model, vval, features, CPU)
+        delta_auprc, delta_var, margin_share, n_used, n_skipped = train_mod._validate(
+            model, vval, features, CPU
+        )
         assert math_finite(delta_auprc)
         assert delta_var > 0.0
         assert 0.0 <= margin_share <= 1.0
+        assert n_used == 2
+        assert n_skipped == 0
+
+    def test_counts_used_and_skipped_single_class_sets(self) -> None:
+        _graph, _node_order, real_adj = _watts_strogatz_real_adj(6)
+        # One multi-class draw (real graph edges) + one single-class draw (no
+        # edges at all -- every label is 0).
+        vval, features = _make_vval_with_true_adjs(6, [real_adj, torch.zeros(6, 6)])
+        model = SetResidualModel(_tiny_model_cfg("res"))
+        delta_auprc, _delta_var, _margin_share, n_used, n_skipped = train_mod._validate(
+            model, vval, features, CPU
+        )
+        assert math_finite(delta_auprc)
+        assert n_used == 1
+        assert n_skipped == 1
+
+    def test_raises_when_every_set_is_single_class(self) -> None:
+        vval, features = _make_vval_with_true_adjs(6, [torch.zeros(6, 6), torch.zeros(6, 6)])
+        model = SetResidualModel(_tiny_model_cfg("res"))
+        with pytest.raises(RuntimeError, match="single-class"):
+            train_mod._validate(model, vval, features, CPU)
 
 
 def math_finite(value: float) -> bool:
@@ -366,6 +414,11 @@ class TestCheckpointHelpers:
         torch.testing.assert_close(model(x, mask, pairs).detach(), loaded(x, mask, pairs).detach())
 
         payload = cast(dict[str, object], torch.load(path, map_location="cpu", weights_only=True))
+        # Task 4's `evaluate.load_residual_checkpoint` hard-requires exactly these two
+        # key names to load `best.pt` -- pin them here as a contract test.
+        assert "model_state" in payload
+        assert "config" in payload
+        assert payload["config"] == dataclasses.asdict(cfg)
         assert payload["epoch"] == 1
         assert payload["vval_delta_auprc"] == 0.1
 
@@ -408,7 +461,15 @@ class TestTrainArm:
         assert first_record["epoch"] == 0
         assert first_record["vval_delta_auprc"] == 0.0
         assert first_record["train_loss"] is None
+        # `_make_vval`'s 2 draws are both multi-class -> both used at epoch 0.
+        assert first_record["n_sets_used"] == 2
+        assert first_record["n_sets_skipped_single_class"] == 0
         assert len(lines) == cfg.epochs + 1
+        for line in lines:
+            record = json.loads(line)
+            assert "n_sets_used" in record
+            assert "n_sets_skipped_single_class" in record
+            assert record["n_sets_used"] + record["n_sets_skipped_single_class"] == 2
 
     def test_raises_on_non_finite_loss(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
