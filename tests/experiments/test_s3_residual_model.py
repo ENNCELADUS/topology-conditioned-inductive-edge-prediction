@@ -225,6 +225,35 @@ def test_res_mode_delta_is_not_invariant_to_other_nodes_features() -> None:
     assert not torch.allclose(delta, delta_changed)
 
 
+@pytest.mark.parametrize("mode", ["res", "diag"])
+def test_padded_nodes_do_not_leak_into_valid_pair_delta(mode: str) -> None:
+    """A valid pair's delta must not move when PADDED rows are replaced with garbage.
+
+    Pins the `key_mask` threading in `res` (masked-out keys get `-inf`
+    attention logits, so their `V` never contributes) and the size-1-set
+    reshape in `diag` (each node only ever sees itself, padded or not)
+    against padding regressions -- the only test in this module that
+    exercises a heterogeneous (mixed valid/padded) batch.
+    """
+    torch.manual_seed(0)
+    model = SetResidualModel(_cfg(mode))
+    for p in model.parameters():
+        torch.nn.init.normal_(p, std=0.1)
+    batch, n = 2, 6
+    x, mask = _inputs(batch, n, seed=9)
+    mask[0, 4:] = 0.0  # set 0: nodes 4, 5 are padding; set 1 fully valid.
+    pairs = torch.tensor([[0, 0, 1]], dtype=torch.long)
+
+    x_garbage = x.clone()
+    x_garbage[0, 4:] = torch.randn(2, _D_IN) * 100.0
+
+    with torch.no_grad():
+        delta = model(x, mask, pairs)
+        delta_garbage = model(x_garbage, mask, pairs)
+
+    torch.testing.assert_close(delta, delta_garbage, atol=1e-5, rtol=1e-5)
+
+
 # ------------------------------------------------------------------- SHUF: p-side unaffected
 
 
@@ -276,8 +305,20 @@ def test_pair_mode_ignores_x_set() -> None:
 
 @pytest.mark.parametrize("mode", ["res", "diag", "pair"])
 def test_gradients_are_finite(mode: str) -> None:
+    """Gradients are finite AND actually reach the encoder -- not vacuously zero.
+
+    At zero-init, `delta` is identically 0 for every input, so
+    `dL/ddelta == 0` and every parameter's gradient would be trivially zero
+    (and therefore trivially "finite") even if gradient flow into the encoder
+    were completely broken. Perturbing `pair_out` away from zero first (as
+    `test_delta_is_symmetric_under_i_j_swap` already does) makes `delta`
+    input-dependent, so a nonzero encoder/projection gradient here is real
+    evidence the backward pass reaches those modules.
+    """
     torch.manual_seed(0)
     model = SetResidualModel(_cfg(mode))
+    for p in model.pair_out.parameters():
+        torch.nn.init.normal_(p, std=0.1)
     n = 5
     x, mask = _inputs(2, n, seed=6)
     pairs = _all_pairs(2, n)
@@ -289,6 +330,15 @@ def test_gradients_are_finite(mode: str) -> None:
     for p in model.parameters():
         if p.grad is not None:
             assert torch.isfinite(p.grad).all()
+
+    encoder_grad_norm = sum(
+        p.grad.abs().sum().item() for p in model.backbone.parameters() if p.grad is not None
+    )
+    proj_grad_norm = sum(
+        p.grad.abs().sum().item() for p in model.input_proj.parameters() if p.grad is not None
+    )
+    assert encoder_grad_norm > 0.0
+    assert proj_grad_norm > 0.0
 
 
 @pytest.mark.parametrize("mode", ["res", "diag", "pair"])
