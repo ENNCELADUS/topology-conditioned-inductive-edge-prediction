@@ -777,20 +777,36 @@ def aggregate_reports(paths: Sequence[Path]) -> dict[str, Any]:
     (the raw per-set deltas `run_s3_eval` persists, not just their aggregated
     mean/CI) sharing a `(contrast, metric, size)` key, then re-bootstraps at
     the pooled scale -- a true set-level pool across seeds/arms, not a pool of
-    per-report means.
+    per-report means. All inputs must share one `meta.mode` (e.g. all `res`,
+    or all `pair`): pooling reports from different arms would silently mix
+    incomparable deltas into one CI, so a mode mismatch raises instead of
+    pooling -- a cross-arm contrast is a separate analysis, not this function.
 
     Args:
-        paths: `report.json` paths to pool (e.g. one per seed).
+        paths: `report.json` paths to pool (e.g. one per seed, same arm).
 
     Returns:
-        `{"source_reports": [...], "paired_deltas": {contrast: {metric: {"by_size": ...,
-        "pooled": ...}}}}`.
+        `{"source_reports": [...], "mode": <shared meta.mode>, "paired_deltas":
+        {contrast: {metric: {"by_size": ..., "pooled": ...}}}}`.
+
+    Raises:
+        ValueError: If the input reports' `meta.mode` values are not all equal.
     """
+    reports = [json.loads(Path(path).read_text()) for path in paths]
+    modes = {report.get("meta", {}).get("mode") for report in reports}
+    if len(modes) > 1:
+        found = sorted(modes, key=str)
+        raise ValueError(
+            f"aggregate_reports: input reports have mixed meta.mode values {found!r} -- "
+            "pooling across arms is scientifically invalid (cross-arm contrasts are a "
+            "separate analysis, not this function)"
+        )
+    mode = next(iter(modes), None)
+
     pooled_raw: dict[tuple[str, str], dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
     )
-    for path in paths:
-        report = json.loads(Path(path).read_text())
+    for report in reports:
         for contrast, metrics in report.get("paired_deltas", {}).items():
             for metric, block in metrics.items():
                 for size_key, entry in block.get("by_size", {}).items():
@@ -812,7 +828,7 @@ def aggregate_reports(paths: Sequence[Path]) -> dict[str, Any]:
             "pooled": _ci_entry(pooled_values, arm_code=arm_code, size=0, metric_code=metric_code),
         }
 
-    return {"source_reports": [str(p) for p in paths], "paired_deltas": contrasts}
+    return {"source_reports": [str(p) for p in paths], "mode": mode, "paired_deltas": contrasts}
 
 
 # --------------------------------------------------------------------------- CLI

@@ -207,6 +207,14 @@ class TestRank:
     def test_ascending_ranks_lowest_first(self) -> None:
         assert train_mod._rank([0.1, 0.9, 0.5], descending=False) == [1.0, 3.0, 2.0]
 
+    def test_descending_exact_tie_gets_fractional_rank(self) -> None:
+        # [0.5, 0.5, 0.3] descending: the two 0.5s tie for 1st/2nd -> both get
+        # the average rank 1.5; the 0.3 is unambiguously 3rd.
+        assert train_mod._rank([0.5, 0.5, 0.3], descending=True) == [1.5, 1.5, 3.0]
+
+    def test_ascending_exact_tie_gets_fractional_rank(self) -> None:
+        assert train_mod._rank([0.3, 0.5, 0.5], descending=False) == [1.0, 2.5, 2.5]
+
 
 class TestSelectBest:
     def test_matches_manual_mean_rank(self) -> None:
@@ -272,6 +280,46 @@ class TestSelectBest:
         best_epoch, table = train_mod._select_best(candidates)
         rows = {row["epoch"]: row for row in table}
         assert rows[5]["mean_rank"] == pytest.approx(rows[2]["mean_rank"])
+        assert best_epoch == 2
+
+    def test_exact_metric_tie_uses_fractional_rank_in_mean(self) -> None:
+        # epoch 1 and epoch 2 tie exactly on delta_auprc (0.30); every other
+        # metric is distinct across all three. Hand-computed per-column ranks
+        # (1=best): delta_auprc [1.5, 1.5, 3], gs [2, 1, 3], abs_rd_minus_1
+        # [1, 2, 3], and all three MMD ratios [2, 1, 3] -> mean ranks
+        # epoch1=10.5/6=1.75, epoch2=7.5/6=1.25, epoch3=18/6=3.0. If ties were
+        # instead broken by input order (old behavior), epoch 1 would get
+        # delta_auprc rank 1 and epoch 2 rank 2, understating epoch 2's mean
+        # rank advantage.
+        five_epoch1 = {
+            "gs": 0.5,
+            "rd": 1.0,  # |rd - 1| = 0.0
+            "degree_mmd_ratio": 2.0,
+            "clustering_mmd_ratio": 2.0,
+            "spectral_mmd_ratio": 2.0,
+        }
+        five_epoch2 = {
+            "gs": 0.9,
+            "rd": 1.5,  # |rd - 1| = 0.5
+            "degree_mmd_ratio": 1.0,
+            "clustering_mmd_ratio": 1.0,
+            "spectral_mmd_ratio": 1.0,
+        }
+        five_epoch3 = {
+            "gs": 0.3,
+            "rd": 2.0,  # |rd - 1| = 1.0
+            "degree_mmd_ratio": 3.0,
+            "clustering_mmd_ratio": 3.0,
+            "spectral_mmd_ratio": 3.0,
+        }
+        candidates = [(1, 0.30, five_epoch1), (2, 0.30, five_epoch2), (3, 0.10, five_epoch3)]
+
+        best_epoch, table = train_mod._select_best(candidates)
+
+        rows = {row["epoch"]: row for row in table}
+        assert rows[1]["mean_rank"] == pytest.approx(1.75)
+        assert rows[2]["mean_rank"] == pytest.approx(1.25)
+        assert rows[3]["mean_rank"] == pytest.approx(3.0)
         assert best_epoch == 2
 
 

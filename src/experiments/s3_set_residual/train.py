@@ -370,11 +370,25 @@ def _topology_five_numbers(
 
 
 def _rank(values: list[float], *, descending: bool) -> list[float]:
-    """Rank `values` (1 = best); ties are impossible here (finite, distinct floats expected)."""
+    """Rank `values` (1 = best) with fractional (average) ranks for exact ties.
+
+    Exact ties are expected, not an edge case: density-matched RD is often
+    checkpoint-independent and the discrete GS/MMD metrics repeat. A tied block
+    gets the mean of the positions it spans (e.g. two-way tie for 1st/2nd both
+    get 1.5) so no tie is silently biased toward input order.
+    """
     order = sorted(range(len(values)), key=lambda i: -values[i] if descending else values[i])
     ranks = [0.0] * len(values)
-    for position, idx in enumerate(order):
-        ranks[idx] = float(position + 1)
+    n = len(order)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        avg_rank = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg_rank
+        i = j + 1
     return ranks
 
 

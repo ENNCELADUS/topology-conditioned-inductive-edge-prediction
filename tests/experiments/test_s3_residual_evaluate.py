@@ -800,3 +800,45 @@ def test_aggregate_reports_matches_run_eval_aggregate_path(tmp_path: Path) -> No
 
     assert result["source_reports"] == [str(report_a)]
     assert result["paired_deltas"]["model_minus_b0"]["gs"]["pooled"]["values"] == [0.5]
+
+
+def test_aggregate_reports_same_mode_pools_and_records_mode(tmp_path: Path) -> None:
+    report_a = tmp_path / "a" / "report.json"
+    report_b = tmp_path / "b" / "report.json"
+    for path, values in ((report_a, [0.1, 0.2]), (report_b, [0.3])):
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "meta": {"mode": "res"},
+                    "paired_deltas": {
+                        "model_minus_b0": {"gs": {"by_size": {"4": {"values": values}}}}
+                    },
+                }
+            )
+        )
+
+    result = s3eval.aggregate_reports([report_a, report_b])
+
+    assert result["mode"] == "res"
+    assert result["paired_deltas"]["model_minus_b0"]["gs"]["pooled"]["n"] == 3
+
+
+def test_aggregate_reports_mixed_mode_raises(tmp_path: Path) -> None:
+    report_a = tmp_path / "a" / "report.json"
+    report_b = tmp_path / "b" / "report.json"
+    for path, mode, values in ((report_a, "res", [0.1]), (report_b, "pair", [0.3])):
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "meta": {"mode": mode},
+                    "paired_deltas": {
+                        "model_minus_b0": {"gs": {"by_size": {"4": {"values": values}}}}
+                    },
+                }
+            )
+        )
+
+    with pytest.raises(ValueError, match="res"):
+        s3eval.aggregate_reports([report_a, report_b])
