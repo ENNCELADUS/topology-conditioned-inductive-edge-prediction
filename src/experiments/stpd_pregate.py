@@ -10,6 +10,7 @@ import dataclasses
 import hashlib
 import json
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -23,6 +24,7 @@ from torch.nn.utils import clip_grad_norm_
 
 from src.data.features import FeatureStore
 from src.experiments.s2_latent_topology.data import RegionCorpus, build_region_corpus
+from src.score_universe import _load_checkpoint, _score_v3_1
 
 
 def _stable_seed(*parts: str) -> int:
@@ -762,3 +764,147 @@ def train_probe(
     )
 
     return {"best_epoch": float(best_epoch), "best_val_macro_paired_acc": best_val_macro}
+
+
+# --------------------------------------------------------------------------- frozen-B0 baseline arm
+
+_B0_TOKEN_BUDGET = 32_768  # mirrors src.distill.content_logit._DEFAULT_TOKEN_BUDGET
+
+
+def collect_eval_pairs(corpus: PregateCorpus) -> list[tuple[str, str]]:
+    """Deduplicated, sorted node-id pairs judged across every held-out comparison cell.
+
+    A held-out cell is a `(region index, severity)` key of `corpus.provenance` whose
+    region index is in `corpus.regions.val_idx` (train-only and dropped cells never
+    contribute). Every pair from `quad_comparison_pairs(prov)` -- both the true and
+    false side of every quad -- is mapped from the cell's local indices to global
+    node-id strings via `corpus.regions.regions[region_idx]` and
+    `corpus.regions.node_ids`, then normalized as `tuple(sorted((u_id, v_id)))`.
+
+    Args:
+        corpus: The swap-corrupted region corpus (`build_pregate_corpus`'s output).
+
+    Returns:
+        The deduplicated union of sorted node-id pairs across every held-out cell, in
+        sorted (deterministic) order.
+    """
+    val_idx_set = set(corpus.regions.val_idx)
+    pairs: set[tuple[str, str]] = set()
+    for (region_idx, _severity), prov in corpus.provenance.items():
+        if region_idx not in val_idx_set:
+            continue
+        region = corpus.regions.regions[region_idx]
+        true_pairs, false_pairs = quad_comparison_pairs(prov)
+        for local_pairs in (true_pairs, false_pairs):
+            for i, j in local_pairs.tolist():
+                u_id = corpus.regions.node_ids[region[int(i)]]
+                v_id = corpus.regions.node_ids[region[int(j)]]
+                a, b = sorted((u_id, v_id))
+                pairs.add((a, b))
+    return sorted(pairs)
+
+
+@dataclass(frozen=True)
+class B0Scores:
+    """Frozen-B0 baseline scoring output: per-pair fp32 logits and the checkpoint's id.
+
+    Attributes:
+        logits: `(len(pairs),)` fp32 logits, row-aligned with the input pairs.
+        checkpoint_id: The scoring checkpoint's `_load_checkpoint`-derived id, for
+            report metadata.
+    """
+
+    logits: NDArray[np.float32]
+    checkpoint_id: str
+
+
+def score_b0_pairs(
+    checkpoint_path: Path,
+    pairs: Sequence[tuple[str, str]],
+    store: FeatureStore,
+    *,
+    device: torch.device,
+) -> B0Scores:
+    """Score `pairs` once with a published `v3_1` checkpoint, fp32, no autocast.
+
+    Args:
+        checkpoint_path: Path to a published B0 v3.1 checkpoint.
+        pairs: Node-id pairs in input row order (orientation irrelevant to the model).
+        store: Feature store providing per-node token sequences.
+        device: Compute device.
+
+    Returns:
+        The `B0Scores`.
+
+    Raises:
+        ValueError: If the checkpoint's model family is not `v3_1`, or any produced
+            logit is non-finite.
+    """
+    model, model_family, checkpoint_id = _load_checkpoint(checkpoint_path)
+    if model_family != "v3_1":
+        raise ValueError(
+            f"score_b0_pairs requires a 'v3_1' checkpoint, got model_family={model_family!r}"
+        )
+    model.to(device)
+    model.eval()
+
+    logits = _score_v3_1(
+        model, pairs, store, device=device, amp="off", token_budget=_B0_TOKEN_BUDGET
+    )
+    if not np.isfinite(logits).all():
+        raise ValueError(
+            f"score_b0_pairs produced a non-finite logit: checkpoint={checkpoint_path}"
+        )
+    return B0Scores(logits=logits.astype(np.float32), checkpoint_id=checkpoint_id)
+
+
+def save_b0_scores(
+    path: Path,
+    pairs: Sequence[tuple[str, str]],
+    logits: NDArray[np.float32],
+    *,
+    checkpoint_id: str,
+) -> None:
+    """Save `score_b0_pairs` output as an `.npz` artifact.
+
+    Args:
+        path: Output `.npz` path (`np.savez` appends the suffix if absent).
+        pairs: Node-id pairs, row-aligned with `logits`.
+        logits: `(len(pairs),)` fp32 logits.
+        checkpoint_id: The scoring checkpoint's id.
+    """
+    np.savez(
+        path,
+        u_ids=np.array([u for u, _v in pairs]),
+        v_ids=np.array([v for _u, v in pairs]),
+        logit=logits.astype(np.float32),
+        checkpoint_id=np.array(checkpoint_id),
+    )
+
+
+def load_b0_scores(path: Path) -> tuple[dict[tuple[str, str], float], str]:
+    """Load a `save_b0_scores` artifact.
+
+    Lookup semantics: keys are the SORTED node-id pair `tuple(sorted((u, v)))` --
+    `collect_eval_pairs` already normalizes every scored pair this way, so a caller
+    holding an unordered pair must sort it before looking it up; either original
+    orientation resolves to the same entry.
+
+    Args:
+        path: Path previously written by `save_b0_scores`.
+
+    Returns:
+        `(scores, checkpoint_id)`: `scores` maps each sorted node-id pair to its fp32
+        logit (as a Python `float`); `checkpoint_id` is the scoring checkpoint's id.
+    """
+    with np.load(path) as npz:
+        u_ids = npz["u_ids"]
+        v_ids = npz["v_ids"]
+        logit = npz["logit"]
+        checkpoint_id = str(npz["checkpoint_id"])
+
+    scores: dict[tuple[str, str], float] = {}
+    for u, v, value in zip(u_ids, v_ids, logit, strict=True):
+        a, b = sorted((str(u), str(v)))
+        scores[a, b] = float(value)
+    return scores, checkpoint_id

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 from pathlib import Path
@@ -11,9 +12,11 @@ import numpy as np
 import pytest
 import torch
 from numpy.typing import NDArray
+from src import score_universe
 from src.data.features import FeatureStore
 from src.distill.heuristic_targets import heuristic_score
 from src.experiments.stpd_pregate import (
+    B0Scores,
     PregateConfig,
     PregateProbe,
     SwapProvenance,
@@ -21,14 +24,18 @@ from src.experiments.stpd_pregate import (
     bucketed_macro,
     build_cell_context,
     build_pregate_corpus,
+    collect_eval_pairs,
     corrupted_edges_of,
+    load_b0_scores,
     load_pregate_corpus,
     pair_context_features,
     paired_accuracy,
     probe_pair_inputs,
     provenance_swaps,
     quad_comparison_pairs,
+    save_b0_scores,
     save_pregate_corpus,
+    score_b0_pairs,
     structure_scores,
     train_probe,
     trusted_rows,
@@ -674,3 +681,160 @@ def test_train_probe_deterministic_same_seed(
     )
 
     assert metrics_a.read_text() == metrics_b.read_text()
+
+
+# --------------------------------------------------------------------------- collect_eval_pairs
+
+
+def test_collect_eval_pairs_matches_manual_union_sorted_unique(
+    _pregate_setup: tuple[nx.Graph, FeatureStore, PregateConfig, Path],
+) -> None:
+    graph, store, cfg, cache_dir = _pregate_setup
+    corpus = build_pregate_corpus(graph, store, cfg, cache_dir=cache_dir)
+    val_idx_set = set(corpus.regions.val_idx)
+    assert val_idx_set  # sanity: the fixture actually produces held-out regions
+
+    expected: set[tuple[str, str]] = set()
+    for (region_idx, _severity), prov in corpus.provenance.items():
+        if region_idx not in val_idx_set:
+            continue
+        region = corpus.regions.regions[region_idx]
+        true_pairs, false_pairs = quad_comparison_pairs(prov)
+        for arr in (true_pairs, false_pairs):
+            for i, j in arr.tolist():
+                u = corpus.regions.node_ids[region[int(i)]]
+                v = corpus.regions.node_ids[region[int(j)]]
+                lo, hi = sorted((u, v))
+                expected.add((lo, hi))
+
+    actual = collect_eval_pairs(corpus)
+
+    # Reconstructing every held-out cell's expected pairs by hand reproduces the
+    # function's output exactly.
+    assert actual == sorted(expected)
+    # Sorted and unique.
+    assert actual == sorted(set(actual))
+    assert all(u <= v for u, v in actual)
+
+
+def test_collect_eval_pairs_excludes_train_only_regions(
+    _pregate_setup: tuple[nx.Graph, FeatureStore, PregateConfig, Path],
+) -> None:
+    graph, store, cfg, cache_dir = _pregate_setup
+    corpus = build_pregate_corpus(graph, store, cfg, cache_dir=cache_dir)
+    val_idx_set = set(corpus.regions.val_idx)
+
+    # A corpus whose provenance keeps only train-region cells (val cells and dropped
+    # cells alike differ from the original) must yield zero eval pairs: train and val
+    # regions genuinely differ here, and collect_eval_pairs must never draw from the
+    # train-only side.
+    train_only_provenance = {
+        key: prov for key, prov in corpus.provenance.items() if key[0] not in val_idx_set
+    }
+    assert train_only_provenance  # sanity: the fixture has train cells too
+    train_only_corpus = dataclasses.replace(corpus, provenance=train_only_provenance)
+    assert collect_eval_pairs(train_only_corpus) == []
+
+    # The full corpus (train + held-out cells) returns a non-empty result.
+    assert collect_eval_pairs(corpus) != []
+
+
+# --------------------------------------------------------------------------- frozen-B0 scoring
+
+
+def _tiny_v3_1_config(input_dim: int = 8) -> dict[str, object]:
+    return {
+        "input_dim": input_dim,
+        "d_model": 8,
+        "encoder_layers": 1,
+        "cross_attn_layers": 1,
+        "n_heads": 2,
+        "mlp_head": {"hidden_dims": [8], "dropout": 0.0, "activation": "gelu", "norm": "layernorm"},
+        "regularization": {"dropout": 0.0},
+    }
+
+
+def _write_v3_1_checkpoint(
+    path: Path, *, model: torch.nn.Module, model_family: str, model_config: dict[str, object]
+) -> None:
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "model_family": model_family,
+            "model_config": model_config,
+            "epoch": 0,
+            "val_metrics": {},
+            "seed": 0,
+            "config": {},
+        },
+        path,
+    )
+
+
+def test_score_b0_pairs_finite_shape_and_checkpoint_id(tmp_path: Path) -> None:
+    node_ids = ["node_000000", "node_000001", "node_000002", "node_000003"]
+    store = _write_feature_store(tmp_path / "features", node_ids)
+    torch.manual_seed(0)
+    model = score_universe.build_model("v3_1", _tiny_v3_1_config())
+    checkpoint_path = tmp_path / "ckpt.pt"
+    _write_v3_1_checkpoint(
+        checkpoint_path, model=model, model_family="v3_1", model_config=_tiny_v3_1_config()
+    )
+
+    pairs = [("node_000000", "node_000001"), ("node_000002", "node_000003")]
+    result = score_b0_pairs(checkpoint_path, pairs, store, device=torch.device("cpu"))
+
+    assert isinstance(result, B0Scores)
+    assert result.logits.shape == (2,)
+    assert result.logits.dtype == np.float32
+    assert np.isfinite(result.logits).all()
+    assert isinstance(result.checkpoint_id, str)
+    assert result.checkpoint_id
+
+
+def test_score_b0_pairs_rejects_wrong_family(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _build_fake_family(_model_config: dict[str, object]) -> torch.nn.Module:
+        return torch.nn.Linear(1, 1)
+
+    monkeypatch.setitem(score_universe.MODEL_BUILDERS, "fake_family", _build_fake_family)
+
+    node_ids = ["node_000000", "node_000001"]
+    store = _write_feature_store(tmp_path / "features", node_ids)
+    model = _build_fake_family({})
+    checkpoint_path = tmp_path / "ckpt.pt"
+    _write_v3_1_checkpoint(
+        checkpoint_path, model=model, model_family="fake_family", model_config={}
+    )
+
+    with pytest.raises(ValueError, match="v3_1"):
+        score_b0_pairs(
+            checkpoint_path,
+            [("node_000000", "node_000001")],
+            store,
+            device=torch.device("cpu"),
+        )
+
+
+# --------------------------------------------------------------------------- b0 score round-trip
+
+
+def test_save_load_b0_scores_round_trip(tmp_path: Path) -> None:
+    pairs = [("node_a", "node_b"), ("node_c", "node_d")]
+    logits = np.array([0.5, -1.25], dtype=np.float32)
+    path = tmp_path / "b0_scores.npz"
+
+    save_b0_scores(path, pairs, logits, checkpoint_id="deadbeef1234")
+    loaded_scores, loaded_checkpoint_id = load_b0_scores(path)
+
+    assert loaded_checkpoint_id == "deadbeef1234"
+    assert loaded_scores == {
+        ("node_a", "node_b"): 0.5,
+        ("node_c", "node_d"): -1.25,
+    }
+    # Orientation independence: both original orderings sort to the same key.
+    lo_ab, hi_ab = sorted(("node_b", "node_a"))
+    lo_cd, hi_cd = sorted(("node_d", "node_c"))
+    assert loaded_scores[lo_ab, hi_ab] == pytest.approx(0.5)
+    assert loaded_scores[lo_cd, hi_cd] == pytest.approx(-1.25)
