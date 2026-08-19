@@ -19,8 +19,10 @@ H20, `outputs/s2` (full decoder) and `outputs/s2_act` (activity-only ablation);
 Evaluation: `test_node_buckets.pkl`, 10 sizes × 50 node-disjoint test sets — every
 forward is one 20–200-node sampled set; the full test region is never forwarded
 (the whole-region code path is deleted: it is out of distribution for set models).
-B0 scores: published v3.1 candidate universe (checkpoint `e092537d8cf1e208`),
-fp32-validated.
+Every arm reports two assembly operating points from the same per-set probabilities:
+per-set density-matched (RD-matched, `gs`/`rd`/`mmd`) and fixed 0.5
+(`gs_t05`/`rd_t05`/`mmd_t05`). B0 scores: published v3.1 candidate universe
+(checkpoint `e092537d8cf1e208`), fp32-validated.
 
 ### Primary endpoint — node-aligned identification (macro over sizes, full run)
 
