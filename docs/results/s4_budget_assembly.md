@@ -1,6 +1,9 @@
 # S4/S5/S6 — node-aligned degree budgets at full capacity: results
 
-**Status: S4 ceiling re-established; S5/S6 probes implemented, runs pending.** The
+**Verdict so far: negative for feature-predicted budgets, with capacity excluded.**
+Deep full-capacity degree regressors match the historical ridge arm exactly and
+leave RD and all three MMD ratios worse than the control (§ S4 pass B). S6 and D8
+runs are still outstanding. The
 B1 KD arms (D1–D7a) distill only row-normalized or pointwise projections of the
 full-ego oracle teacher and moved GS-BFS by at most +0.0017. The accepted review
 (`docs/tmp/kd_review.md`) locates the miss: the oracle's value is node-aligned,
@@ -66,27 +69,80 @@ large, and reachable by assembly alone. What S4 cannot say is whether any
 *feature-predicted* budget gets there — that is S5's question, and it enters this
 table as `predicted_hard_<variant>` arms in pass B.
 
-## S5 — deep degree regressor (pending run)
+## S5 — deep degree regressor (6 jobs, 2026-08-19)
 
-Implemented and unit-tested; the six jobs ({warm, scratch} × seeds 0/1/2) run on
-the H20. Target convention `y = log1p(deg(strip_self_loops(train_graph.pkl)))`
-over the full train⁺∪val⁺ substrate — the V_val quarantine is a pair-level rule,
-not a node-degree rule. Held-out split is 10% of a seeded permutation and is a
-*selection device only*: held-out and training nodes share graph edges, so their
-degree targets are statistically coupled. That leakage is disclosed, not fixed.
+Target convention `y = log1p(deg(strip_self_loops(train_graph.pkl)))` over the
+full train⁺∪val⁺ substrate — the V_val quarantine is a pair-level rule, not a
+node-degree rule. 8,070 feature-backed nodes → 7,263 train / 807 held out. The
+held-out split is a *selection device only*: held-out and training nodes share
+graph edges, so their degree targets are coupled. Disclosed, not fixed.
 
-Trunk architecture is read from the checkpoint's own `model_config`, not from
-`configs/b0_v31_breadth_first.yaml`. The shipped config declares `d_model: 512`
-while every published v3_1 checkpoint carries `d_model: 256`; a hardcoded 512
-would make `--init warm` fail a strict load at runtime. Warm and scratch
-therefore share an identical architecture, which is what makes scratch a control.
+Trunk architecture is read from the checkpoint's own `model_config`. The shipped
+`configs/b0_v31_breadth_first.yaml` declares `d_model: 512` while every published
+v3_1 checkpoint carries `d_model: 256`; a hardcoded 512 fails `--init warm`'s
+strict load at runtime. Warm and scratch share one architecture (40 encoder
+tensors transferred for warm), which is what makes scratch a control.
 
-Decision readout, once run: held-out Spearman/R² against the ridge baseline, and
-S4 `predicted_hard_*` GS against **0.399** (ridge) and **0.4386** (oracle), with
-quota shortfall against the ridge arm's 8.43%. Deep ≈ ridge ⇒ node-aligned degree
-is not in the features at any capacity, and the missing signal is
-realization-specific — which supports the joint-allocation thesis. Deep ≫ ridge
-with GS → oracle ⇒ a legal budget method exists.
+| variant | held Spearman | held R² | held MAE | train Spearman | best epoch |
+|---|---|---|---|---|---|
+| warm_s0 | 0.4472 | 0.2442 | 0.7915 | 0.6586 | 28 |
+| warm_s1 | 0.5170 | 0.3341 | 0.7362 | 0.6717 | 33 |
+| warm_s2 | 0.4893 | 0.2926 | 0.7705 | 0.5894 | 19 |
+| scratch_s0 | 0.4450 | 0.2159 | 0.8045 | 0.6910 | 22 |
+| scratch_s1 | 0.4938 | 0.3008 | 0.7422 | 0.6463 | 21 |
+| scratch_s2 | 0.4826 | 0.2504 | 0.7794 | 0.5931 | 14 |
+
+warm 0.4845 ± 0.0287 Spearman / 0.2903 ± 0.0367 R²; scratch 0.4738 ± 0.0208 /
+0.2557 ± 0.0348 (population sd over 3 seeds). Every job early-stopped.
+
+**Warm ≈ scratch, inside one seed sd.** The B0 pretrained trunk buys essentially
+nothing for degree prediction over a randomly initialized copy of the same
+architecture, so whatever degree signal exists is in the raw features, not in the
+representation B0 learned. Absolute level is modest: R² ≈ 0.25–0.29 on log1p
+degree, with a train-side R² of 0.40–0.52 (gap ~0.2, early stop holding).
+
+## S4 — pass B: feature-predicted budgets (2026-08-19)
+
+The six S5 `predictions.json` files enter as `predicted_hard_<variant>` arms
+against the same frozen control and oracle. Same universe, same self-loop policy.
+
+| arm | GS-BFS | RD-BFS | MMD-deg | MMD-clu | MMD-spe | shortfall |
+|---|---|---|---|---|---|---|
+| `b0_exact_n` (control) | 0.3898 | 0.4231 | 13.032 | 11.861 | 18.070 | — |
+| `oracle_hard` | **0.4386** | **0.6220** | **4.064** | **5.442** | **7.650** | 1.6% |
+| `predicted_hard_warm_s0` | 0.4005 | 0.4017 | 15.486 | 14.434 | 19.775 | 12.1% |
+| `predicted_hard_warm_s1` | 0.3967 | 0.4001 | 14.703 | 13.980 | 18.533 | 11.7% |
+| `predicted_hard_warm_s2` | 0.3992 | 0.4019 | 15.041 | 14.146 | 18.771 | 10.9% |
+| `predicted_hard_scratch_s0` | 0.3972 | 0.3986 | 15.333 | 14.458 | 19.250 | 11.8% |
+| `predicted_hard_scratch_s1` | 0.3945 | 0.3974 | 15.348 | 14.613 | 19.157 | 14.8% |
+| `predicted_hard_scratch_s2` | 0.3983 | 0.3904 | 17.048 | 15.340 | 21.413 | 15.1% |
+
+Every predicted arm is flagged `lower_bound_only` (shortfall > 2%); the oracle is
+not. Quota `l1` error: oracle 976, predicted 6,592–9,080.
+
+Edge-level, alongside the graph family: control P/R 0.1366/0.1366, GS-global
+0.1366; oracle 0.2159/0.2124, 0.2142; predicted 0.168–0.184 / 0.148–0.157,
+GS-global 0.158–0.169.
+
+**Verdict: negative, and capacity is excluded as the cause.** Full-capacity deep
+regressors land at GS-BFS 0.3945–0.4005 (warm mean 0.3988, scratch mean 0.3967)
+— indistinguishable from the historical **ridge** arm's 0.399, against an oracle
+of 0.4386. Model class was never the binding constraint.
+
+The five numbers must be read together, and they do not point the same way. GS-BFS
+closes 10–22% of the control→oracle gap, but **RD-BFS and all three MMD ratios move
+away from the oracle**: RD falls to 0.390–0.402 from the control's 0.423 (oracle
+0.622), and every MMD ratio rises above the control (degree 14.7–17.0 vs 13.0).
+Gap closure is negative on all four of those axes. A feature-predicted budget is
+therefore not "partway to the oracle" — it buys a small edge-set gain while making
+the degree, clustering and spectral distributions worse than doing nothing. The
+predicted arms are also *less* satisfiable than ridge was (10.9–15.1% shortfall vs
+8.43%), so their GS is a lower bound on a mis-specified quota set.
+
+Read with the oracle's own result — true node-aligned quotas lift GS by +0.0488 and
+cut every MMD ratio 2.4–3.2× — this says the recoverable slice of node-aligned
+degree is not a function of `(x_u, x_v)` at any capacity. The oracle's advantage is
+realization-specific, which is what the joint-allocation thesis predicts.
 
 ## S6 — pair-residual identifiability probe (pending run)
 
