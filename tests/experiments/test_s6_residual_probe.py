@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pytest
@@ -618,3 +619,56 @@ def test_best_epoch_state_is_restored_not_the_last_epoch(
         4096,
     )
     np.testing.assert_allclose(restored_predictions, best_predictions, rtol=1e-6, atol=1e-6)
+
+
+def test_zeroed_head_survives_a_state_dict_round_trip() -> None:
+    """The zeroed head must not leave a stale spectral-norm load hook behind.
+
+    `torch.nn.utils.remove_spectral_norm` drops the forward pre-hook and the
+    `weight_orig`/`weight_u`/`weight_v` entries but leaves its
+    `_load_state_dict_pre_hook` installed, so the module keeps demanding those
+    keys and every later `load_state_dict` raises -- which killed the
+    best-epoch restore at the very end of a real training run, after the whole
+    epoch budget had been spent. `state_dict()`, `named_parameters()` and
+    `named_buffers()` all look correct in that state, so only an actual
+    round-trip catches it.
+    """
+    torch.manual_seed(0)
+    model = build_model("v3_1", _tiny_v3_1_config(spectral_norm=True))
+    assert zero_output_head(model) is True  # type: ignore[arg-type]
+
+    state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    model.load_state_dict(state)  # must not raise
+
+    layers = cast(torch.nn.Sequential, model.output_head.layers)  # type: ignore[union-attr]
+    final = layers[-1]
+    assert isinstance(final, torch.nn.Linear)
+    names = {name for name, _ in final.named_parameters()}
+    assert not any(n.startswith("weight_orig") for n in names)
+    assert not list(final.named_buffers())
+
+
+def test_best_state_restore_works_on_a_spectral_normed_head(tmp_path: Path) -> None:
+    """End-to-end: build warm from a spectral-normed checkpoint, then restore a state dict."""
+    torch.manual_seed(0)
+    config = _tiny_v3_1_config(spectral_norm=True)
+    source = build_model("v3_1", config)
+    checkpoint_path = tmp_path / "ckpt.pt"
+    torch.save(
+        {
+            "model_state": source.state_dict(),
+            "model_family": "v3_1",
+            "model_config": config,
+            "epoch": 0,
+            "val_metrics": {},
+            "seed": 0,
+            "config": {},
+        },
+        checkpoint_path,
+    )
+    model, _cid, removed = build_residual_model(
+        checkpoint_path, init="warm", device=torch.device("cpu")
+    )
+    assert removed is True
+    snapshot = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    model.load_state_dict(snapshot)  # the training loop's best-epoch restore

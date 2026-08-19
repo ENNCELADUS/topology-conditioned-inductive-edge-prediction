@@ -22,8 +22,11 @@ Zero-init control: the final ``output_head`` linear is zeroed so the model's
 first prediction is exactly the predict-zero baseline, making "did training
 help at all" answerable without a separate run. The published v3_1 checkpoints
 carry ``mlp_head.spectral_norm: True``, and a spectral-normed linear cannot be
-zeroed in place -- ``weight = weight_orig / sigma`` becomes ``0 / 0 = NaN``. The
-parametrization is therefore removed from that one final linear before zeroing
+zeroed in place -- ``weight = weight_orig / sigma`` becomes ``0 / 0 = NaN``.
+Stripping it with `torch.nn.utils.remove_spectral_norm` is also unsafe: it
+leaves a stale ``_load_state_dict_pre_hook`` that keeps demanding
+``weight_orig``/``weight_u``, so every later `load_state_dict` raises. That one
+final linear is therefore *replaced* with a fresh zeroed `torch.nn.Linear`
 (recorded in the report). This changes only the probe's own head, never the
 shipped classifier.
 
@@ -65,7 +68,6 @@ import torch
 from numpy.typing import NDArray
 from scipy.stats import spearmanr
 from torch import nn
-from torch.nn.utils import remove_spectral_norm
 
 from src.data.features import FeatureStore
 from src.data.pairs import (
@@ -211,15 +213,24 @@ def anchor_holdout_split(
 def zero_output_head(model: V3_1) -> bool:
     """Zero the final ``output_head`` linear so the model's first prediction is exactly 0.
 
-    A spectral-normed linear cannot be zeroed in place (``weight_orig / sigma``
-    becomes ``0 / 0``), so the parametrization is removed from this one layer
-    first.
+    A spectral-normed linear cannot simply be zeroed in place: ``weight_orig /
+    sigma`` becomes ``0 / 0 = NaN``. Nor can the parametrization be stripped with
+    `torch.nn.utils.remove_spectral_norm`, which drops the forward pre-hook and
+    the ``weight_orig``/``weight_u``/``weight_v`` entries but leaves its
+    ``_load_state_dict_pre_hook`` installed -- so the module still *demands*
+    those keys and every later `load_state_dict` raises, including the
+    best-epoch restore at the end of training. The final linear is therefore
+    replaced outright with a fresh, unparametrized, zeroed `torch.nn.Linear`,
+    which carries no hooks and round-trips through `state_dict` cleanly.
+
+    Only the probe's own final layer changes; the shipped classifier and the
+    earlier spectral-normed head layers are untouched.
 
     Args:
         model: The probe's `V3_1` instance, modified in place.
 
     Returns:
-        Whether a spectral-norm parametrization had to be removed.
+        Whether the replaced layer had been spectral-normed.
 
     Raises:
         TypeError: If the output head does not end in a `torch.nn.Linear`.
@@ -227,14 +238,22 @@ def zero_output_head(model: V3_1) -> bool:
     final = model.output_head.layers[-1]
     if not isinstance(final, nn.Linear):
         raise TypeError(f"output_head must end in nn.Linear, got {type(final)!r}")
-    removed = any(name.startswith("weight_orig") for name, _ in final.named_parameters())
-    if removed:
-        remove_spectral_norm(final)
+    was_spectral_normed = any(
+        name.startswith("weight_orig") for name, _ in final.named_parameters()
+    )
+    replacement = nn.Linear(
+        final.in_features,
+        final.out_features,
+        bias=final.bias is not None,
+        device=final.weight.device,
+        dtype=final.weight.dtype,
+    )
     with torch.no_grad():
-        final.weight.zero_()
-        if final.bias is not None:
-            final.bias.zero_()
-    return removed
+        replacement.weight.zero_()
+        if replacement.bias is not None:
+            replacement.bias.zero_()
+    model.output_head.layers[-1] = replacement
+    return was_spectral_normed
 
 
 def build_residual_model(
