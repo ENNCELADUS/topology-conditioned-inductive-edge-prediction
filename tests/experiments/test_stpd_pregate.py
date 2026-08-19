@@ -3,21 +3,28 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import networkx as nx
 import numpy as np
 import pytest
 import torch
+from numpy.typing import NDArray
 from src.data.features import FeatureStore
+from src.distill.heuristic_targets import heuristic_score
 from src.experiments.stpd_pregate import (
     PregateConfig,
     SwapProvenance,
     _stable_seed,
+    build_cell_context,
     build_pregate_corpus,
+    corrupted_edges_of,
     load_pregate_corpus,
+    pair_context_features,
     provenance_swaps,
     save_pregate_corpus,
+    structure_scores,
 )
 
 pytestmark = pytest.mark.unit
@@ -309,3 +316,135 @@ def test_save_load_round_trip(
     assert loaded.regions.train_idx == corpus.regions.train_idx
     assert loaded.regions.val_idx == corpus.regions.val_idx
     assert loaded.regions.dropped_featureless_regions == corpus.regions.dropped_featureless_regions
+
+
+# --------------------------------------------------------------------------- cell context fixtures
+
+
+def _corrupted_cell(
+    seed_label: str, *, fraction: float = 0.15, d: int = 5
+) -> tuple[int, NDArray[np.int64], SwapProvenance, torch.Tensor]:
+    """A corrupted cell (n, corrupted edges, provenance, random fp32 features)."""
+    edges = _region_edges()
+    n = max(max(e) for e in edges) + 1
+    rng = np.random.default_rng(_stable_seed(seed_label))
+    prov = provenance_swaps(edges, fraction=fraction, rng=rng)
+    assert prov is not None
+    corrupted_edges = corrupted_edges_of(prov)
+    feat_rng = np.random.default_rng(0)
+    features = torch.tensor(feat_rng.standard_normal((n, d)), dtype=torch.float32)
+    return n, corrupted_edges, prov, features
+
+
+def _sample_pairs(
+    prov: SwapProvenance, corrupted_edges: NDArray[np.int64]
+) -> list[tuple[int, int]]:
+    """Sample pairs including one PRESENT (inserted) and one ABSENT (deleted) pair."""
+    inserted_pair = (int(prov.inserted[0, 0]), int(prov.inserted[0, 1]))
+    deleted_pair = (int(prov.deleted[0, 0]), int(prov.deleted[0, 1]))
+    extra = [(int(i), int(j)) for i, j in corrupted_edges[: min(5, len(corrupted_edges))]]
+
+    seen: set[tuple[int, int]] = set()
+    unique_pairs: list[tuple[int, int]] = []
+    for pair in (inserted_pair, deleted_pair, *extra):
+        if pair not in seen:
+            seen.add(pair)
+            unique_pairs.append(pair)
+    return unique_pairs
+
+
+# --------------------------------------------------------------------------- corrupted_edges_of
+
+
+def test_corrupted_edges_of_is_kept_union_inserted() -> None:
+    _n, corrupted_edges, prov, _features = _corrupted_cell("corrupted-edges-of")
+    expected = _as_tuple_set(prov.kept) | _as_tuple_set(prov.inserted)
+    assert _as_tuple_set(corrupted_edges) == expected
+    assert corrupted_edges.dtype == np.int64
+    assert corrupted_edges.shape[1] == 2
+
+
+# --------------------------------------------------------------------------- pair_context_features
+
+
+def test_pair_context_features_matches_naive_recompute() -> None:
+    n, corrupted_edges, prov, features = _corrupted_cell("context-equivalence", d=5)
+    d = features.shape[1]
+    ctx = build_cell_context(n, corrupted_edges, features)
+
+    sample_pairs = _sample_pairs(prov, corrupted_edges)
+    pairs_tensor = torch.tensor(sample_pairs, dtype=torch.long)
+    actual = pair_context_features(ctx, pairs_tensor)
+
+    corrupted_graph = nx.Graph()
+    corrupted_graph.add_nodes_from(range(n))
+    corrupted_graph.add_edges_from((int(i), int(j)) for i, j in corrupted_edges)
+
+    expected_rows = []
+    for u, v in sample_pairs:
+        g = corrupted_graph.copy()
+        if g.has_edge(u, v):
+            g.remove_edge(u, v)
+        deg_u = g.degree(u)
+        deg_v = g.degree(v)
+        common = set(nx.common_neighbors(g, u, v))
+        cn = len(common)
+        ra = sum(1.0 / g.degree(w) for w in common if g.degree(w) > 1)
+        if deg_u > 0:
+            mean_u = sum((features[w] for w in g.neighbors(u)), torch.zeros(d)) / deg_u
+        else:
+            mean_u = torch.zeros(d)
+        if deg_v > 0:
+            mean_v = sum((features[w] for w in g.neighbors(v)), torch.zeros(d)) / deg_v
+        else:
+            mean_v = torch.zeros(d)
+        row = torch.cat(
+            [
+                torch.tensor(
+                    [math.log1p(deg_u), math.log1p(deg_v), math.log1p(cn), ra],
+                    dtype=torch.float32,
+                ),
+                mean_u,
+                mean_v,
+            ]
+        )
+        expected_rows.append(row)
+    expected = torch.stack(expected_rows)
+
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_structure_scores_ra_matches_heuristic_targets_reference() -> None:
+    n, corrupted_edges, prov, features = _corrupted_cell("context-ra-reference", d=3)
+    ctx = build_cell_context(n, corrupted_edges, features)
+
+    node_names = [f"n{i}" for i in range(n)]
+    graph = nx.Graph()
+    graph.add_nodes_from(node_names)
+    graph.add_edges_from((node_names[int(i)], node_names[int(j)]) for i, j in corrupted_edges)
+
+    sample_pairs = _sample_pairs(prov, corrupted_edges)
+    pairs_tensor = torch.tensor(sample_pairs, dtype=torch.long)
+    ra_scores, _cn_scores = structure_scores(ctx, pairs_tensor)
+
+    for row, (u, v) in enumerate(sample_pairs):
+        expected_ra = heuristic_score(graph, node_names[u], node_names[v], "ra")
+        assert ra_scores[row].item() == pytest.approx(expected_ra, abs=1e-5)
+
+
+def test_pair_context_features_masked_degree_zero_isolates_endpoint() -> None:
+    # Node 1's only edge is (0, 1): masking the queried pair isolates it.
+    n = 4
+    corrupted_edges = np.array([[0, 1], [0, 2], [0, 3], [2, 3]], dtype=np.int64)
+    d = 3
+    feat_rng = np.random.default_rng(2)
+    features = torch.tensor(feat_rng.standard_normal((n, d)), dtype=torch.float32)
+    ctx = build_cell_context(n, corrupted_edges, features)
+
+    pairs = torch.tensor([[0, 1]], dtype=torch.long)
+    result = pair_context_features(ctx, pairs)
+
+    masked_deg_v = result[0, 1]
+    mean_v = result[0, 4 + d : 4 + 2 * d]
+    assert masked_deg_v.item() == pytest.approx(0.0, abs=1e-6)
+    assert torch.allclose(mean_v, torch.zeros(d), atol=1e-6)

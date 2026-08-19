@@ -274,6 +274,122 @@ def build_pregate_corpus(
     return PregateCorpus(regions=regions, provenance=provenance, dropped_cells=tuple(dropped_cells))
 
 
+def corrupted_edges_of(prov: SwapProvenance) -> NDArray[np.int64]:
+    """Rebuild a cell's corrupted edge set: `kept` union `inserted`, local `i < j`."""
+    return cast(NDArray[np.int64], np.concatenate([prov.kept, prov.inserted]))
+
+
+@dataclass(frozen=True)
+class CellContext:
+    """Precomputed unmasked dense structural context for one corrupted (region, severity) cell.
+
+    All tensors are LOCAL-index, torch fp32, dense; regions have `n <= 200` so this is
+    cheap. Removing the queried pair `(u, v)` never changes which nodes are common
+    neighbors of `u` and `v`, nor any node's degree other than `u`'s and `v`'s -- so
+    pair-level `cn`/`ra` read directly off these unmasked matrices already equal their
+    masked (queried-edge-removed) values; only the endpoint degrees and endpoint
+    neighbor-feature aggregates need the masking correction done in
+    `pair_context_features`.
+
+    Attributes:
+        features: `(n, d)` fp32 region node features, held for masked neighbor-mean
+            queries.
+        adj: `(n, n)` symmetric 0/1 fp32 adjacency, zero diagonal.
+        deg: `(n,)` unmasked degree, `adj.sum(1)`.
+        nbr_sum: `(n, d)` unmasked neighbor feature sum, `adj @ features`.
+        cn: `(n, n)` unmasked common-neighbor count, `adj @ adj`.
+        ra: `(n, n)` unmasked resource-allocation sum, `adj @ diag(r) @ adj` with
+            `r[w] = 1 / deg[w]` when `deg[w] > 1`, else `0` (`_ra_term`'s guard).
+    """
+
+    features: torch.Tensor
+    adj: torch.Tensor
+    deg: torch.Tensor
+    nbr_sum: torch.Tensor
+    cn: torch.Tensor
+    ra: torch.Tensor
+
+
+def build_cell_context(
+    n: int,
+    corrupted_edges: NDArray[np.int64],
+    features: torch.Tensor,
+) -> CellContext:
+    """Precompute one cell's dense unmasked structural context.
+
+    Args:
+        n: Region node count.
+        corrupted_edges: `(E, 2)` local `i < j` corrupted edges (kept union inserted
+            from a `SwapProvenance`, see `corrupted_edges_of`).
+        features: `(n, d)` fp32 region node features.
+
+    Returns:
+        The `CellContext`.
+    """
+    adj = torch.zeros(n, n, dtype=torch.float32)
+    if corrupted_edges.shape[0] > 0:
+        src = torch.from_numpy(corrupted_edges[:, 0]).long()
+        dst = torch.from_numpy(corrupted_edges[:, 1]).long()
+        adj[src, dst] = 1.0
+        adj[dst, src] = 1.0
+
+    deg = adj.sum(1)
+    nbr_sum = adj @ features
+    cn = adj @ adj
+    r = torch.where(deg > 1, 1.0 / deg, torch.zeros_like(deg))
+    ra = adj @ torch.diag(r) @ adj
+
+    return CellContext(features=features, adj=adj, deg=deg, nbr_sum=nbr_sum, cn=cn, ra=ra)
+
+
+def pair_context_features(ctx: CellContext, pairs: torch.Tensor) -> torch.Tensor:
+    """Per-pair masked structural context features, the queried edge removed first.
+
+    Args:
+        ctx: A cell's precomputed `CellContext`.
+        pairs: `(P, 2)` int64 local `(u, v)` indices.
+
+    Returns:
+        `(P, 4 + 2d)` fp32: `log1p(masked_deg_u)`, `log1p(masked_deg_v)`,
+        `log1p(cn[u,v])`, `ra[u,v]`, masked neighbor-feature mean of `u`, then of `v`.
+    """
+    u, v = pairs[:, 0], pairs[:, 1]
+    edge_uv = ctx.adj[u, v]
+
+    masked_deg_u = ctx.deg[u] - edge_uv
+    masked_deg_v = ctx.deg[v] - edge_uv
+    denom_u = masked_deg_u.clamp(min=1.0).unsqueeze(1)
+    denom_v = masked_deg_v.clamp(min=1.0).unsqueeze(1)
+    mean_u = (ctx.nbr_sum[u] - edge_uv.unsqueeze(1) * ctx.features[v]) / denom_u
+    mean_v = (ctx.nbr_sum[v] - edge_uv.unsqueeze(1) * ctx.features[u]) / denom_v
+
+    return torch.cat(
+        [
+            torch.log1p(masked_deg_u).unsqueeze(1),
+            torch.log1p(masked_deg_v).unsqueeze(1),
+            torch.log1p(ctx.cn[u, v]).unsqueeze(1),
+            ctx.ra[u, v].unsqueeze(1),
+            mean_u,
+            mean_v,
+        ],
+        dim=1,
+    )
+
+
+def structure_scores(ctx: CellContext, pairs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Structure-only control arm scores: `(ra[u,v], cn[u,v])` per pair, unmasked-equal.
+
+    Args:
+        ctx: A cell's precomputed `CellContext`.
+        pairs: `(P, 2)` int64 local `(u, v)` indices.
+
+    Returns:
+        `(ra_scores, cn_scores)`, each `(P,)` fp32.
+    """
+    u, v = pairs[:, 0], pairs[:, 1]
+    return ctx.ra[u, v], ctx.cn[u, v]
+
+
 def save_pregate_corpus(corpus: PregateCorpus, path: Path) -> None:
     """Save a `PregateCorpus` as a plain-dict `torch` checkpoint at `path`."""
     torch.save(
