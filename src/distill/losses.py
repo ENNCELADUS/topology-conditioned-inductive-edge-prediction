@@ -23,6 +23,10 @@ contributes exactly zero -- never NaN, regardless of group size.
 - `kd_d7a` is `kd_d2`'s exact losses (`kd_rank_loss` + `kd_dist_loss`) run
   over a heuristic-teacher targets artifact instead of the learned oracle --
   also no new loss code, only a different `teacher_logit` source.
+- `kd_rowmass_loss` is `kd_d8` (absolute row-mass distillation: per-anchor
+  summed `sigmoid(logit)` mass, matched student-to-teacher by Huber loss --
+  the absolute-scale counterpart to `kd_dist_loss`'s scale-invariant
+  per-anchor softmax-KL).
 
 LLP constants, verified against the paper's released code
 (https://github.com/snap-research/linkless-link-prediction/blob/main/src/main.py,
@@ -282,6 +286,57 @@ def kd_residual_loss(
     return _masked_mean(per_row, mask)
 
 
+def kd_rowmass_loss(
+    student_logit: torch.Tensor,
+    teacher_logit: torch.Tensor,
+    group_idx: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    beta: float = 1.0,
+) -> torch.Tensor:
+    """Masked-mean Huber loss between per-anchor-group summed row mass (`kd_d8`).
+
+    For each `group_idx` (an anchor id), ``m = sum(mask * sigmoid(logit))``
+    over that group's rows -- computed once for `student_logit` and once for
+    `teacher_logit` -- and the per-group term is
+    ``smooth_l1(m_student, m_teacher, beta)``, masked-mean-reduced over
+    groups with at least one live row (an empty/all-dead group contributes
+    exact 0, never NaN, via the same masked-mean-over-live-groups idiom
+    `kd_dist_loss` uses).
+
+    The discriminating property vs `kd_dist_loss`: that loss is a per-anchor
+    softmax-KL, invariant to a constant shift applied to every row's logit
+    within a group (softmax cancels an additive constant). This loss sums
+    absolute per-row probabilities, so the same constant within-group shift
+    changes every `sigmoid(logit)` term and therefore moves `m` and the
+    loss -- `kd_rowmass_loss` is sensitive to absolute logit scale where
+    `kd_dist_loss` is not.
+    """
+    device = student_logit.device
+    dtype = student_logit.dtype
+    live = mask.to(dtype=torch.bool)
+    groups, inverse = torch.unique(group_idx, return_inverse=True)
+    n_groups = int(groups.numel())
+
+    student_prob = torch.where(live, torch.sigmoid(student_logit), torch.zeros_like(student_logit))
+    teacher_prob = torch.where(
+        live, torch.sigmoid(teacher_logit.to(dtype=dtype)), torch.zeros_like(student_logit)
+    )
+    m_student = torch.zeros(n_groups, dtype=dtype, device=device).scatter_add_(
+        0, inverse, student_prob
+    )
+    m_teacher = torch.zeros(n_groups, dtype=dtype, device=device).scatter_add_(
+        0, inverse, teacher_prob
+    )
+    live_count = torch.zeros(n_groups, dtype=dtype, device=device).scatter_add_(
+        0, inverse, live.to(dtype=dtype)
+    )
+    valid_group = live_count >= 1
+
+    per_group = F.smooth_l1_loss(m_student, m_teacher, beta=beta, reduction="none")
+    return _masked_mean(per_group, valid_group)
+
+
 __all__ = [
     "DEFAULT_MARGIN",
     "DEFAULT_TEMPERATURE",
@@ -292,4 +347,5 @@ __all__ = [
     "kd_logit_loss",
     "kd_rank_loss",
     "kd_residual_loss",
+    "kd_rowmass_loss",
 ]

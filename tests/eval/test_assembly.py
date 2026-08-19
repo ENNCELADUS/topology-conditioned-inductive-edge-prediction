@@ -7,8 +7,10 @@ from src.eval.assembly import (
     SweepPoint,
     assemble_degree_quota,
     assemble_graph,
+    degree_quota_error,
     density_matched_threshold,
     estimated_density_matched_threshold,
+    largest_remainder_quotas,
     rank_matched_degree_quotas,
     threshold_sweep,
 )
@@ -334,3 +336,55 @@ class TestAssembleDegreeQuota:
         g2, s2 = assemble_degree_quota(pairs, u_idx, v_idx, scores.copy(), dict(quotas), nodes)
         assert set(map(frozenset, g1.edges())) == set(map(frozenset, g2.edges()))
         assert s1 == s2
+
+
+@pytest.mark.unit
+class TestLargestRemainderQuotas:
+    def test_sum_preservation(self) -> None:
+        targets = np.array([1.6, 1.3, 1.1, 4.0, 0.05])
+        quotas = largest_remainder_quotas(targets)
+        assert int(quotas.sum()) == round(float(targets.sum()))
+
+    def test_largest_fraction_allocation(self) -> None:
+        # floors [1, 1, 1] sum to 3; one unit of remainder goes to the largest
+        # fractional part (index 0, fraction 0.6).
+        targets = np.array([1.6, 1.3, 1.1])
+        quotas = largest_remainder_quotas(targets)
+        np.testing.assert_array_equal(quotas, [2, 1, 1])
+
+    def test_ascending_index_tie_determinism(self) -> None:
+        # Every fractional part ties at 0.5; the two remainder units go to the
+        # lowest indices (0, 1), never chosen by array order or magnitude.
+        targets = np.array([0.5, 0.5, 0.5, 0.5])
+        quotas = largest_remainder_quotas(targets)
+        np.testing.assert_array_equal(quotas, [1, 1, 0, 0])
+
+    def test_negative_raises(self) -> None:
+        with pytest.raises(ValueError, match="nonnegative"):
+            largest_remainder_quotas(np.array([1.0, -0.5]))
+
+
+@pytest.mark.unit
+class TestDegreeQuotaError:
+    def _hand_graph(self) -> nx.Graph:
+        # a-b, b-c plus a self-loop on a; self-loops must be stripped before
+        # degrees are compared (simple degrees: a=1, b=2, c=1, d=0).
+        g = nx.Graph()
+        g.add_nodes_from(["a", "b", "c", "d"])
+        g.add_edges_from([("a", "b"), ("b", "c")])
+        g.add_edge("a", "a")
+        return g
+
+    def test_exact_quotas_zero_error(self) -> None:
+        g = self._hand_graph()
+        error = degree_quota_error(g, {"a": 1, "b": 2, "c": 1, "d": 0})
+        assert error == {"l1": 0.0, "linf": 0.0, "exact_fraction": 1.0}
+
+    def test_l1_linf_exact_fraction_on_mismatch(self) -> None:
+        g = self._hand_graph()
+        # gaps: a |1-2|=1, b |2-2|=0, c |1-0|=1, d |0-1|=1 -> l1=3, linf=1,
+        # exact_fraction=1/4 (only b matches exactly).
+        error = degree_quota_error(g, {"a": 2, "b": 2, "c": 0, "d": 1})
+        assert error["l1"] == pytest.approx(3.0)
+        assert error["linf"] == pytest.approx(1.0)
+        assert error["exact_fraction"] == pytest.approx(0.25)

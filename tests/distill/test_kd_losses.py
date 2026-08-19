@@ -1,8 +1,8 @@
 """Contracts for the pure KD loss functions in `src.distill.losses`.
 
-Covers `kd_control`/`kd_d1`/`kd_d2`/`kd_d3`/`kd_d4`/`kd_d5`; `kd_d6` and
-`kd_d7a` reuse `kd_rank_loss`/`kd_dist_loss`/`kd_gram_loss` unchanged and add
-no new loss functions to test here.
+Covers `kd_control`/`kd_d1`/`kd_d2`/`kd_d3`/`kd_d4`/`kd_d5`/`kd_d8`; `kd_d6`
+and `kd_d7a` reuse `kd_rank_loss`/`kd_dist_loss`/`kd_gram_loss` unchanged and
+add no new loss functions to test here.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from src.distill.losses import (
     kd_logit_loss,
     kd_rank_loss,
     kd_residual_loss,
+    kd_rowmass_loss,
 )
 
 pytestmark = pytest.mark.unit
@@ -438,3 +439,82 @@ def test_residual_loss_handles_bf16_delta_target_input() -> None:
     result = kd_residual_loss(student_residual, delta_target_bf16, mask)
     assert result.dtype == student_residual.dtype
     assert torch.isfinite(result)
+
+
+# --------------------------------------------------------------------------- kd_rowmass_loss
+
+
+def test_rowmass_loss_matches_hand_computed_group_sums() -> None:
+    student = torch.tensor([0.0, 1.0, -1.0, 2.0])
+    teacher = torch.tensor([0.5, -0.5, 1.0, 0.0])
+    group_idx = torch.tensor([0, 0, 1, 1])
+    mask = torch.ones(4)
+
+    group0 = torch.nn.functional.smooth_l1_loss(
+        torch.sigmoid(student[:2]).sum(), torch.sigmoid(teacher[:2]).sum(), beta=1.0
+    )
+    group1 = torch.nn.functional.smooth_l1_loss(
+        torch.sigmoid(student[2:]).sum(), torch.sigmoid(teacher[2:]).sum(), beta=1.0
+    )
+    expected = (group0 + group1) / 2
+
+    result = kd_rowmass_loss(student, teacher, group_idx, mask, beta=1.0)
+    torch.testing.assert_close(result, expected)
+
+
+def test_rowmass_loss_is_sensitive_to_a_constant_within_group_shift() -> None:
+    """The discriminating property vs `kd_dist_loss` (`kd_d2`'s LLP_D term).
+
+    `kd_dist_loss` is a per-anchor softmax-KL, invariant to a constant shift
+    applied to every row's logit within a group. `kd_rowmass_loss` sums
+    absolute per-row probabilities, so the same shift moves it.
+    """
+    teacher = torch.tensor([1.0, -1.0, 2.0, 0.5])
+    student = torch.tensor([0.5, -0.5, 1.5, 0.0])
+    group_idx = torch.tensor([0, 0, 1, 1])
+    mask = torch.ones(4)
+    # Constant shift applied only within group 0's rows; group 1 untouched.
+    shift = torch.tensor([3.0, 3.0, 0.0, 0.0])
+    shifted_student = student + shift
+
+    base_rowmass = kd_rowmass_loss(student, teacher, group_idx, mask)
+    shifted_rowmass = kd_rowmass_loss(shifted_student, teacher, group_idx, mask)
+    assert abs(float(base_rowmass) - float(shifted_rowmass)) > 1e-3
+
+    base_dist = kd_dist_loss(student, teacher, group_idx, mask)
+    shifted_dist = kd_dist_loss(shifted_student, teacher, group_idx, mask)
+    torch.testing.assert_close(base_dist, shifted_dist)
+
+
+def test_rowmass_loss_ignores_padded_rows() -> None:
+    student = torch.tensor([0.5, -1.2, 999.0])
+    teacher = torch.tensor([0.3, -1.0, -999.0])
+    group_idx = torch.tensor([0, 0, 0])
+    mask = torch.tensor([1.0, 1.0, 0.0])
+
+    padded = kd_rowmass_loss(student, teacher, group_idx, mask)
+    unpadded = kd_rowmass_loss(student[:2], teacher[:2], group_idx[:2], torch.ones(2))
+    torch.testing.assert_close(padded, unpadded)
+
+
+def test_rowmass_loss_is_exact_zero_for_an_all_dead_group() -> None:
+    student = torch.tensor([5.0, -5.0])
+    teacher = torch.tensor([-5.0, 5.0])
+    group_idx = torch.tensor([0, 0])
+    mask = torch.zeros(2)
+
+    result = kd_rowmass_loss(student, teacher, group_idx, mask)
+    assert float(result) == 0.0
+    assert torch.isfinite(result)
+
+
+def test_rowmass_loss_gradient_is_finite_through_dead_groups() -> None:
+    student = torch.tensor([0.2, -0.5, 0.1, 0.1], requires_grad=True)
+    teacher = torch.tensor([1.0, -1.0, 0.3, 0.3])
+    group_idx = torch.tensor([0, 0, 1, 1])
+    mask = torch.tensor([1.0, 1.0, 0.0, 0.0])  # group 1 fully masked out
+
+    result = kd_rowmass_loss(student, teacher, group_idx, mask)
+    result.backward()  # type: ignore[no-untyped-call]
+    assert student.grad is not None
+    assert torch.isfinite(student.grad).all()

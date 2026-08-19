@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import networkx as nx
 import numpy as np
+from numpy.typing import NDArray
 
 from src.eval.graph_metrics import MMDConfig, evaluate_assembled_graph, strip_self_loops
 
@@ -356,3 +357,57 @@ def threshold_sweep(
             )
         )
     return points
+
+
+def largest_remainder_quotas(targets: NDArray[np.float64]) -> NDArray[np.int64]:
+    """Round nonnegative float degree targets to integers preserving ``round(sum)``.
+
+    Floor everything, then distribute the remaining units to the largest
+    fractional parts (ties broken by ascending index) — the
+    ``_largest_remainder_allocation`` convention from `src.data.ego_targets`.
+
+    Args:
+        targets: Nonnegative float degree targets.
+
+    Returns:
+        Integer quotas, same shape as `targets`, summing to
+        ``round(sum(targets))``.
+
+    Raises:
+        ValueError: If any target is negative.
+    """
+    targets64 = np.asarray(targets, dtype=np.float64).reshape(-1)
+    if np.any(targets64 < 0):
+        raise ValueError("degree targets must be nonnegative")
+    total = int(round(float(targets64.sum())))
+    floors = np.floor(targets64).astype(np.int64)
+    remainder = total - int(floors.sum())
+    if remainder > 0:
+        fractions = targets64 - floors
+        order = np.lexsort((np.arange(targets64.shape[0]), -fractions))
+        floors[order[:remainder]] += 1
+    return floors
+
+
+def degree_quota_error(graph: nx.Graph, quotas: Mapping[str, int]) -> dict[str, float]:
+    """Realized-vs-target degree error of a quota assembly (self-loops stripped).
+
+    Args:
+        graph: The assembled graph (self-loops stripped before comparison).
+        quotas: Node id -> degree quota the assembly targeted.
+
+    Returns:
+        The L1 sum, L-infinity max, and the fraction of nodes whose realized
+        degree equals their quota exactly — the enforcement proof any
+        hard-degree quota assembly must disclose.
+    """
+    simple = strip_self_loops(graph)
+    gaps = [
+        abs(float(simple.degree(node) if node in simple else 0) - float(quota))
+        for node, quota in quotas.items()
+    ]
+    return {
+        "l1": float(np.sum(gaps)),
+        "linf": float(np.max(gaps)) if gaps else 0.0,
+        "exact_fraction": float(np.mean([gap == 0.0 for gap in gaps])) if gaps else 1.0,
+    }

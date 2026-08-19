@@ -82,6 +82,7 @@ from src.distill.losses import (
     kd_logit_loss,
     kd_rank_loss,
     kd_residual_loss,
+    kd_rowmass_loss,
 )
 from src.e2_pipeline import ProbeResult
 from src.eval.checkpoint_selection import (
@@ -2607,6 +2608,8 @@ class KDStream:
             total = total + distill.w_residual * kd_residual_loss(
                 res.float(), teacher - content, kd_mask
             )
+        if distill.w_rowmass > 0.0:
+            total = total + distill.w_rowmass * kd_rowmass_loss(logits, teacher, kd_group, kd_mask)
         return total
 
     def resume_state(self, *, epoch: int, global_step: int) -> dict[str, int]:

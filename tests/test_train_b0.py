@@ -87,6 +87,7 @@ SHIPPED_B0_KD_CONFIGS = (
     "b1_kd_d1_breadth_first.yaml",
     "b1_kd_d2_breadth_first.yaml",
     "b1_kd_d3_breadth_first.yaml",
+    "b1_kd_d8_breadth_first.yaml",
 )
 
 # Tiny V_val seam: n_regions=1 keeps growth on the fixture's single path

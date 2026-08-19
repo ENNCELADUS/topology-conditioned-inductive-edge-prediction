@@ -60,7 +60,9 @@ class _StubModel(nn.Module):
         }
 
 
-def _targets(*, content_logit: np.ndarray | None = None) -> KDTargets:
+def _targets(
+    *, content_logit: np.ndarray | None = None, teacher_logit: np.ndarray | None = None
+) -> KDTargets:
     # Two context rows per anchor over 4 anchors: partner = (anchor + 1/2) % 4.
     pair_anchor = np.repeat(np.arange(4, dtype=np.int32), 2)
     pair_partner = np.array(
@@ -71,7 +73,11 @@ def _targets(*, content_logit: np.ndarray | None = None) -> KDTargets:
         pair_anchor_idx=pair_anchor,
         pair_partner_idx=pair_partner,
         anchor_offsets=np.array([0, 2, 4, 6, 8], dtype=np.int64),
-        teacher_logit=np.linspace(-2.0, 2.0, 8, dtype=np.float32),
+        teacher_logit=(
+            teacher_logit
+            if teacher_logit is not None
+            else np.linspace(-2.0, 2.0, 8, dtype=np.float32)
+        ),
         teacher_pooled_ab=np.ones((8, 2), dtype=np.float16),
         teacher_pooled_ba=np.ones((8, 2), dtype=np.float16),
         is_near=np.ones(8, dtype=np.uint8),
@@ -89,10 +95,11 @@ def _stream(
     allowed_nodes: frozenset[str] | None = None,
     forbidden_internal_nodes: frozenset[str] = frozenset(),
     content_logit: np.ndarray | None = None,
+    teacher_logit: np.ndarray | None = None,
 ) -> KDStream:
     return KDStream(
         distill,
-        _targets(content_logit=content_logit),
+        _targets(content_logit=content_logit, teacher_logit=teacher_logit),
         cast(PackedFeatureTable, _FakeTable()),
         allowed_nodes=allowed_nodes if allowed_nodes is not None else frozenset(_NODE_IDS),
         forbidden_internal_nodes=forbidden_internal_nodes,
@@ -140,6 +147,7 @@ def test_anchor_positions_are_deterministic_and_rank_disjoint() -> None:
         {"w_rank": 1.0, "w_dist": 1.0},
         {"w_gram": 1.0},
         {"w_align": 1.0},
+        {"w_rowmass": 1.0},
     ],
 )
 def test_loss_is_finite_and_differentiable_for_every_arm(weights: dict[str, float]) -> None:
@@ -294,3 +302,24 @@ def test_rank_dist_gram_pattern_sums_the_three_terms() -> None:
         total_individual = total_individual + _stream(distill_legal).loss(model, epoch=1, step=1)
 
     assert torch.allclose(combined, total_individual, atol=1e-5)
+
+
+def test_rowmass_arm_responds_to_teacher_mass_changes() -> None:
+    # Same student model, same anchors, same (seeded) student embeddings --
+    # only the teacher's per-row logits change (raising every row's
+    # sigmoid(logit) mass). kd_d8 (absolute row-mass distillation) must move
+    # in response; a stream wired to ignore the teacher would not.
+    distill = DistillConfig(targets_path="t", w_rowmass=1.0, anchors_per_step=2)
+    model = _StubModel()
+
+    low_teacher = np.full(8, -5.0, dtype=np.float32)
+    torch.manual_seed(0)
+    loss_low = _stream(distill, teacher_logit=low_teacher).loss(model, epoch=1, step=1)
+
+    high_teacher = np.full(8, 5.0, dtype=np.float32)
+    torch.manual_seed(0)
+    loss_high = _stream(distill, teacher_logit=high_teacher).loss(model, epoch=1, step=1)
+
+    assert torch.isfinite(loss_low)
+    assert torch.isfinite(loss_high)
+    assert not torch.allclose(loss_low, loss_high)

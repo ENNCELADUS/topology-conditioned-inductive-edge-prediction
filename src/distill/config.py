@@ -4,10 +4,10 @@ Consumed by the simple B0-protocol trainer (`src.train_b0`) as the optional
 top-level ``distill:`` config section. Exactly one arm group's weight(s) may
 be nonzero at a time -- ``kd_control`` (`w_label`), ``kd_d1`` (`w_logit`),
 ``kd_d2`` (`w_rank` and `w_dist` together), ``kd_d3`` (`w_gram`), ``kd_d4``
-(`w_align`), ``kd_d5`` (`w_residual`) -- with one deliberate exception,
-``kd_d6`` (`w_rank`, `w_dist`, and `w_gram` together, the interaction test of
-`kd_d2` + `kd_d3`) -- so a config can never straddle two KD mechanisms
-outside that one named combination.
+(`w_align`), ``kd_d5`` (`w_residual`), ``kd_d8`` (`w_rowmass`) -- with one
+deliberate exception, ``kd_d6`` (`w_rank`, `w_dist`, and `w_gram` together,
+the interaction test of `kd_d2` + `kd_d3`) -- so a config can never straddle
+two KD mechanisms outside that one named combination.
 """
 
 from __future__ import annotations
@@ -15,7 +15,16 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 
-_WEIGHT_NAMES = ("w_label", "w_logit", "w_rank", "w_dist", "w_gram", "w_align", "w_residual")
+_WEIGHT_NAMES = (
+    "w_label",
+    "w_logit",
+    "w_rank",
+    "w_dist",
+    "w_gram",
+    "w_align",
+    "w_residual",
+    "w_rowmass",
+)
 
 
 @dataclass(frozen=True)
@@ -43,6 +52,9 @@ class DistillConfig:
         w_residual: ``kd_d5`` weight -- Huber loss between the student's
             node-factor residual and the teacher's beyond-content residual
             (`teacher_logit - content_logit`).
+        w_rowmass: ``kd_d8`` weight -- Huber loss between student and teacher
+            per-anchor summed `sigmoid(logit)` row mass; unlike `w_dist`'s
+            per-anchor softmax-KL, sensitive to absolute logit scale.
         temperature: Softmax/KL temperature for `w_dist` (LLP reference pins 1.0).
         margin: Margin for the `w_rank` pairwise ranking loss.
         anchors_per_step: KD anchor groups drawn per optimizer step per rank.
@@ -60,6 +72,7 @@ class DistillConfig:
     w_gram: float = 0.0
     w_align: float = 0.0
     w_residual: float = 0.0
+    w_rowmass: float = 0.0
     temperature: float = 1.0
     margin: float = 0.1
     anchors_per_step: int = 2
@@ -92,6 +105,7 @@ class DistillConfig:
             frozenset({"w_gram"}),
             frozenset({"w_align"}),
             frozenset({"w_residual"}),
+            frozenset({"w_rowmass"}),
             frozenset({"w_rank", "w_dist", "w_gram"}),
         )
         if nonzero not in legal_patterns:
@@ -99,8 +113,8 @@ class DistillConfig:
                 "distill weights must follow exactly one arm group -- all zero, only "
                 "w_label (kd_control), only w_logit (kd_d1), w_rank and w_dist together "
                 "(kd_d2), only w_gram (kd_d3), only w_align (kd_d4), only w_residual "
-                "(kd_d5), or w_rank, w_dist, and w_gram together (kd_d6); got nonzero "
-                f"weights {sorted(nonzero)}"
+                "(kd_d5), only w_rowmass (kd_d8), or w_rank, w_dist, and w_gram together "
+                f"(kd_d6); got nonzero weights {sorted(nonzero)}"
             )
         if nonzero and not self.targets_path:
             raise ValueError("distill.targets_path is required when any weight is nonzero")
@@ -133,6 +147,7 @@ class DistillConfig:
             frozenset({"w_gram"}): "kd_d3",
             frozenset({"w_align"}): "kd_d4",
             frozenset({"w_residual"}): "kd_d5",
+            frozenset({"w_rowmass"}): "kd_d8",
             frozenset({"w_rank", "w_dist", "w_gram"}): "kd_d6",
         }[nonzero]
         return self.arm_label if (self.arm_label and self.active) else mapped
