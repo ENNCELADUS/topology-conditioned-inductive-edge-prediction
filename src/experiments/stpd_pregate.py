@@ -8,9 +8,16 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from pathlib import Path
+from typing import cast
 
+import networkx as nx
 import numpy as np
+import torch
 from numpy.typing import NDArray
+
+from src.data.features import FeatureStore
+from src.experiments.s2_latent_topology.data import RegionCorpus, build_region_corpus
 
 
 def _stable_seed(*parts: str) -> int:
@@ -164,4 +171,144 @@ def provenance_swaps(
         deleted=np.array(deleted_rows, dtype=np.int64).reshape(-1, 2),
         inserted=np.array(inserted_rows, dtype=np.int64).reshape(-1, 2),
         kept=np.array(kept_rows, dtype=np.int64).reshape(-1, 2),
+    )
+
+
+@dataclass(frozen=True)
+class PregateConfig:
+    """Experiment constants for the STPD pre-gate probe (paths/device stay CLI-level).
+
+    Attributes:
+        sizes: Region node-count sizes to sample.
+        per_size: Regions drawn per size.
+        holdout_frac: Per-size fraction of kept regions held out for validation.
+        severities: `(name, swap_fraction)` corruption severities, in build order.
+        seeds: Training seeds a later task iterates over.
+        salt: Hash-ordering salt for both region sampling and swap-seed derivation.
+        lr: Optimizer learning rate (consumed by a later task).
+        weight_decay: Optimizer weight decay (consumed by a later task).
+        grad_clip: Gradient-norm clip (consumed by a later task).
+        epochs: Training epoch budget (consumed by a later task).
+        regions_per_step: Regions per training step (consumed by a later task).
+    """
+
+    sizes: tuple[int, ...] = (64, 96, 128, 160, 200)
+    per_size: int = 120
+    holdout_frac: float = 0.2
+    severities: tuple[tuple[str, float], ...] = (
+        ("light", 0.05),
+        ("moderate", 0.15),
+        ("heavy", 0.30),
+    )
+    seeds: tuple[int, ...] = (0, 1, 2)
+    salt: str = "stpd_pregate_v1"
+    lr: float = 3e-4
+    weight_decay: float = 0.01
+    grad_clip: float = 1.0
+    epochs: int = 30
+    regions_per_step: int = 16
+
+
+@dataclass(frozen=True)
+class PregateCorpus:
+    """The S2 region corpus plus per-(region, severity) swap-corruption provenance.
+
+    Attributes:
+        regions: The S2 `RegionCorpus` (unmodified region sampling and features).
+        provenance: `(region index into regions.regions, severity name)` -> the
+            completed `SwapProvenance` for that cell. Only non-dropped cells present.
+        dropped_cells: `(region index, severity name)` cells where `provenance_swaps`
+            returned `None`, in deterministic build order.
+    """
+
+    regions: RegionCorpus
+    provenance: dict[tuple[int, str], SwapProvenance]
+    dropped_cells: tuple[tuple[int, str], ...]
+
+
+def build_pregate_corpus(
+    train_graph: nx.Graph,
+    store: FeatureStore,
+    cfg: PregateConfig,
+    *,
+    cache_dir: Path,
+) -> PregateCorpus:
+    """Sample the S2 region corpus and apply degree-preserving swaps per (region, severity).
+
+    For every region (train and holdout alike) and every configured severity, derives a
+    salted seed from `(cfg.salt, "swap", region index, severity name)` and calls
+    `provenance_swaps` on that region's induced edges (converted to the caller-sorted
+    `list[tuple[int, int]]` form, preserving the S2 corpus's stored local order).
+
+    Args:
+        train_graph: Training truth graph, passed through to `build_region_corpus`.
+        store: Frozen per-node feature store, passed through to `build_region_corpus`.
+        cfg: Experiment constants; only the region-sampling and salt fields are read.
+        cache_dir: F0 feature cache directory, passed through to `build_region_corpus`.
+
+    Returns:
+        The `PregateCorpus`.
+    """
+    regions = build_region_corpus(
+        train_graph,
+        store,
+        sizes=cfg.sizes,
+        per_size=cfg.per_size,
+        salt=cfg.salt,
+        holdout_frac=cfg.holdout_frac,
+        cache_dir=cache_dir,
+    )
+
+    provenance: dict[tuple[int, str], SwapProvenance] = {}
+    dropped_cells: list[tuple[int, str]] = []
+    for region_idx, edges_tensor in enumerate(regions.edges):
+        region_edges = [(int(i), int(j)) for i, j in edges_tensor.tolist()]
+        for name, fraction in cfg.severities:
+            rng = np.random.default_rng(_stable_seed(cfg.salt, "swap", str(region_idx), name))
+            prov = provenance_swaps(region_edges, fraction, rng)
+            if prov is None:
+                dropped_cells.append((region_idx, name))
+            else:
+                provenance[(region_idx, name)] = prov
+
+    return PregateCorpus(regions=regions, provenance=provenance, dropped_cells=tuple(dropped_cells))
+
+
+def save_pregate_corpus(corpus: PregateCorpus, path: Path) -> None:
+    """Save a `PregateCorpus` as a plain-dict `torch` checkpoint at `path`."""
+    torch.save(
+        {
+            "regions": {
+                "node_ids": corpus.regions.node_ids,
+                "features": corpus.regions.features,
+                "regions": corpus.regions.regions,
+                "edges": corpus.regions.edges,
+                "train_idx": corpus.regions.train_idx,
+                "val_idx": corpus.regions.val_idx,
+                "dropped_featureless_regions": corpus.regions.dropped_featureless_regions,
+            },
+            "provenance": corpus.provenance,
+            "dropped_cells": corpus.dropped_cells,
+        },
+        path,
+    )
+
+
+def load_pregate_corpus(path: Path) -> PregateCorpus:
+    """Load a `PregateCorpus` previously written by `save_pregate_corpus`."""
+    payload = cast(dict[str, object], torch.load(path, map_location="cpu", weights_only=False))
+    regions_payload = cast(dict[str, object], payload["regions"])
+    regions = RegionCorpus(
+        node_ids=cast(list[str], regions_payload["node_ids"]),
+        features=cast(torch.Tensor, regions_payload["features"]),
+        regions=cast(list[tuple[int, ...]], regions_payload["regions"]),
+        edges=cast(list[torch.Tensor], regions_payload["edges"]),
+        train_idx=cast(list[int], regions_payload["train_idx"]),
+        val_idx=cast(list[int], regions_payload["val_idx"]),
+        dropped_featureless_regions=cast(int, regions_payload["dropped_featureless_regions"]),
+    )
+    return PregateCorpus(
+        regions=regions,
+        provenance=cast(dict[tuple[int, str], SwapProvenance], payload["provenance"]),
+        dropped_cells=cast(tuple[tuple[int, str], ...], payload["dropped_cells"]),
     )

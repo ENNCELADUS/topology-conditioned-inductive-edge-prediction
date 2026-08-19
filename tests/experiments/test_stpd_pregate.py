@@ -1,11 +1,24 @@
-"""Tests for `src/experiments/stpd_pregate.py`'s corruption core."""
+"""Tests for `src/experiments/stpd_pregate.py`'s corruption core and corpus layer."""
 
 from __future__ import annotations
+
+import json
+from pathlib import Path
 
 import networkx as nx
 import numpy as np
 import pytest
-from src.experiments.stpd_pregate import SwapProvenance, _stable_seed, provenance_swaps
+import torch
+from src.data.features import FeatureStore
+from src.experiments.stpd_pregate import (
+    PregateConfig,
+    SwapProvenance,
+    _stable_seed,
+    build_pregate_corpus,
+    load_pregate_corpus,
+    provenance_swaps,
+    save_pregate_corpus,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -171,3 +184,128 @@ def test_swap_provenance_rejects_i_ge_j() -> None:
             inserted=np.zeros((0, 2), dtype=np.int64),
             kept=np.array([[2, 1]], dtype=np.int64),
         )
+
+
+# --------------------------------------------------------------------------- corpus fixtures
+
+
+def _pregate_train_graph(n: int = 60, k: int = 6, p: float = 0.3, seed: int = 0) -> nx.Graph:
+    """A deterministic connected Watts-Strogatz graph with `node_%06d` ids."""
+    base = nx.connected_watts_strogatz_graph(n, k, p, seed=seed)
+    return nx.relabel_nodes(base, {i: f"node_{i:06d}" for i in base.nodes()})
+
+
+def _write_feature_store(root: Path, node_ids: list[str], *, input_dim: int = 8) -> FeatureStore:
+    """A tiny synthetic `FeatureStore` root covering every id in `node_ids`."""
+    embeddings_dir = root / "embeddings"
+    embeddings_dir.mkdir(parents=True)
+    rng = np.random.default_rng(0)
+    index: dict[str, str] = {}
+    for node_id in node_ids:
+        tensor = torch.tensor(rng.standard_normal((5, input_dim)), dtype=torch.float32)
+        rel_path = f"embeddings/{node_id}.pt"
+        torch.save(tensor, root / rel_path)
+        index[node_id] = rel_path
+    (root / "index.json").write_text(json.dumps(index))
+    (root / "metadata.json").write_text(
+        json.dumps(
+            {"format": "torch_pt_per_node", "input_dim": input_dim, "max_sequence_length": 1024}
+        )
+    )
+    return FeatureStore(root)
+
+
+@pytest.fixture
+def _pregate_setup(tmp_path: Path) -> tuple[nx.Graph, FeatureStore, PregateConfig, Path]:
+    graph = _pregate_train_graph()
+    store = _write_feature_store(tmp_path / "features", sorted(graph.nodes()))
+    cfg = PregateConfig(sizes=(12, 16), per_size=4, holdout_frac=0.25, salt="test_pregate_salt")
+    cache_dir = tmp_path / "cache"
+    return graph, store, cfg, cache_dir
+
+
+# --------------------------------------------------------------------------- PregateCorpus build
+
+
+def test_build_pregate_corpus_degree_preserved(
+    _pregate_setup: tuple[nx.Graph, FeatureStore, PregateConfig, Path],
+) -> None:
+    graph, store, cfg, cache_dir = _pregate_setup
+    corpus = build_pregate_corpus(graph, store, cfg, cache_dir=cache_dir)
+
+    assert len(corpus.regions.regions) > 0
+    assert len(corpus.provenance) + len(corpus.dropped_cells) == len(corpus.regions.regions) * len(
+        cfg.severities
+    )
+
+    for (region_idx, _severity), prov in corpus.provenance.items():
+        n_nodes = len(corpus.regions.regions[region_idx])
+        original_edges = [(int(i), int(j)) for i, j in corpus.regions.edges[region_idx].tolist()]
+        original_degree = _degrees(original_edges, n_nodes)
+
+        corrupted_edges = list(_as_tuple_set(prov.kept) | _as_tuple_set(prov.inserted))
+        corrupted_degree = _degrees(corrupted_edges, n_nodes)
+        np.testing.assert_array_equal(original_degree, corrupted_degree)
+
+
+def test_holdout_disjointness(
+    _pregate_setup: tuple[nx.Graph, FeatureStore, PregateConfig, Path],
+) -> None:
+    graph, store, cfg, cache_dir = _pregate_setup
+    corpus = build_pregate_corpus(graph, store, cfg, cache_dir=cache_dir)
+    regions = corpus.regions
+
+    train_set = set(regions.train_idx)
+    val_set = set(regions.val_idx)
+    assert train_set.isdisjoint(val_set)
+
+    for size in cfg.sizes:
+        size_indices = {i for i, region in enumerate(regions.regions) if len(region) == size}
+        assert size_indices  # sanity: this fixture yields regions of every configured size
+        assert (train_set | val_set) & size_indices == size_indices
+
+
+def test_build_pregate_corpus_deterministic(
+    _pregate_setup: tuple[nx.Graph, FeatureStore, PregateConfig, Path],
+) -> None:
+    graph, store, cfg, cache_dir = _pregate_setup
+    corpus_a = build_pregate_corpus(graph, store, cfg, cache_dir=cache_dir / "a")
+    corpus_b = build_pregate_corpus(graph, store, cfg, cache_dir=cache_dir / "b")
+
+    assert corpus_a.dropped_cells == corpus_b.dropped_cells
+    assert set(corpus_a.provenance.keys()) == set(corpus_b.provenance.keys())
+    for key, prov_a in corpus_a.provenance.items():
+        prov_b = corpus_b.provenance[key]
+        np.testing.assert_array_equal(prov_a.quads, prov_b.quads)
+        np.testing.assert_array_equal(prov_a.deleted, prov_b.deleted)
+        np.testing.assert_array_equal(prov_a.inserted, prov_b.inserted)
+        np.testing.assert_array_equal(prov_a.kept, prov_b.kept)
+
+
+def test_save_load_round_trip(
+    _pregate_setup: tuple[nx.Graph, FeatureStore, PregateConfig, Path], tmp_path: Path
+) -> None:
+    graph, store, cfg, cache_dir = _pregate_setup
+    corpus = build_pregate_corpus(graph, store, cfg, cache_dir=cache_dir)
+
+    path = tmp_path / "pregate_corpus.pt"
+    save_pregate_corpus(corpus, path)
+    loaded = load_pregate_corpus(path)
+
+    assert loaded.dropped_cells == corpus.dropped_cells
+    assert set(loaded.provenance.keys()) == set(corpus.provenance.keys())
+    for key, prov in corpus.provenance.items():
+        loaded_prov = loaded.provenance[key]
+        np.testing.assert_array_equal(loaded_prov.quads, prov.quads)
+        np.testing.assert_array_equal(loaded_prov.deleted, prov.deleted)
+        np.testing.assert_array_equal(loaded_prov.inserted, prov.inserted)
+        np.testing.assert_array_equal(loaded_prov.kept, prov.kept)
+
+    assert loaded.regions.node_ids == corpus.regions.node_ids
+    assert torch.equal(loaded.regions.features, corpus.regions.features)
+    assert loaded.regions.regions == corpus.regions.regions
+    for loaded_edges, orig_edges in zip(loaded.regions.edges, corpus.regions.edges, strict=True):
+        assert torch.equal(loaded_edges, orig_edges)
+    assert loaded.regions.train_idx == corpus.regions.train_idx
+    assert loaded.regions.val_idx == corpus.regions.val_idx
+    assert loaded.regions.dropped_featureless_regions == corpus.regions.dropped_featureless_regions
