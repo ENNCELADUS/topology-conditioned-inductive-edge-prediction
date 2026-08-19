@@ -151,6 +151,32 @@ falsification bar. RD-global sits at ≈1 by construction (density matching); RD
 informative one and stays far below 1 for every arm, i.e. assembled ego-neighbourhoods remain much
 sparser than reference.
 
+## Assembled-graph results at the fixed 0.5 threshold (no density oracle)
+
+`src/experiments/fixed_threshold_replay.py` over the same cached candidate universes
+(`outputs/t05_replay/fixed_threshold_results.json`, 2026-08-19): assembly at p ≥ 0.5 — the operating
+point the edge-level table already uses — with no density matching. Every self-pair clears 0.5 in
+every arm (2,018 self-loops assembled; reference keeps 1,891).
+
+| arm | GS global | GS BFS-macro | RD global | RD BFS-macro | MMD degree | MMD clustering | MMD spectral | edge precision | edge recall |
+|---|---|---|---|---|---|---|---|---|---|
+| `kd_control` | 0.1398 | **0.4333** | 3.14 | 0.8052 | 4.99 | 4.68 | 8.45 | 0.0921 | 0.2897 |
+| D1 | 0.0658 | 0.3920 | 16.19 | 2.7324 | 16.42 | 15.91 | 11.28 | 0.0349 | **0.5655** |
+| D2 | 0.0776 | 0.4052 | 11.73 | 2.0444 | 8.86 | 10.10 | 8.50 | 0.0421 | 0.4941 |
+| D3 | 0.0906 | 0.4144 | 8.42 | 1.6538 | 7.31 | 7.95 | 5.96 | 0.0507 | 0.4264 |
+| D4 | 0.0714 | 0.4001 | 14.05 | 2.4435 | 14.54 | 13.91 | 9.53 | 0.0382 | 0.5373 |
+| D5 | **0.1613** | 0.4205 | **1.61** | 0.5786 | 8.00 | 6.94 | 12.44 | **0.1309** | 0.2102 |
+| D6 | 0.0794 | 0.4076 | 11.43 | 2.0101 | 8.74 | 10.20 | 8.26 | 0.0432 | 0.4934 |
+| D7a | 0.1081 | 0.4261 | 5.70 | 1.1435 | **3.41** | 4.51 | 6.41 | 0.0636 | 0.3622 |
+
+Free-running, every KD arm over-assembles: 5.7–16.2× the true global edge count vs the control's
+3.1× — soft-label/listwise KD pushes probability mass above 0.5 wholesale, so the arms' ECE wins do
+not translate into a usable free operating point. The two exceptions are instructive: D5 (the ECE
+loser, 0.32) lands nearest true density (1.61×) and takes the best global GS/precision, and D7a's
+RD-BFS 1.14 gives it the best degree MMD (3.41). The control's GS-BFS 0.4333 exceeds every
+density-matched value above — its ~3× over-density inflates per-subgraph Dice recall — so fixed-0.5
+GS is not comparable to the density-matched table and is reported only within this one.
+
 ## D5's residual target is not degenerate
 
 Over the 74,692 rows of `kd_targets_breadth_first_seed0_v3`: `|Δ_T|` mean 3.034, median 2.429,

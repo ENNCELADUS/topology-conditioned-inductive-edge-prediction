@@ -16,9 +16,11 @@ Design: `docs/tmp/s2_set_generation_experiment.md`. Implementation:
 `src/experiments/s2_latent_topology/` (commit `730d197`). Run: 2026-08-17 on one
 H20, `outputs/s2` (full decoder) and `outputs/s2_act` (activity-only ablation);
 `evidence_class=diagnostic`, `formal:false`, seed 0, K=32 draws, 32 flow steps.
-Evaluation: `test_node_buckets.pkl`, 10 sizes × 50 node-disjoint test sets;
-optional full-region eval not run. B0 scores: published v3.1 candidate universe
-(checkpoint `e092537d8cf1e208`), fp32-validated.
+Evaluation: `test_node_buckets.pkl`, 10 sizes × 50 node-disjoint test sets — every
+forward is one 20–200-node sampled set; the full test region is never forwarded
+(the whole-region code path is deleted: it is out of distribution for set models).
+B0 scores: published v3.1 candidate universe (checkpoint `e092537d8cf1e208`),
+fp32-validated.
 
 ### Primary endpoint — node-aligned identification (macro over sizes, full run)
 
@@ -52,6 +54,30 @@ graphs assemble non-self pairs only while bucket references keep self-loops; it 
 not an arm-quality signal. Free-running density (secondary): GEN implies 0.52× the
 true edge count, DET 1.72× (its RD 0.513 reflects that miscalibration surviving
 matched assembly).
+
+### Fixed threshold 0.5 per set (no density oracle; rerun 2026-08-19)
+
+Eval-stage rerun on the same frozen checkpoints/seed/draws (`outputs/s2/s2_results.json`;
+the prior payload is `s2_results.pre_t05.json`, and every pre-existing number reproduces
+to ≤ 1.2e-6 — GPU forward fp32 tail only). Each 20–200-node set assembles its own
+probabilities at p ≥ 0.5; MARG assembles by degree quota, not threshold, so it has no
+row here (disclosed absence). Hard density = `(p ≥ 0.5)` edge count over the true count.
+
+| arm | GS | RD | degree | clustering | spectral | hard density |
+|---|---|---|---|---|---|---|
+| GEN | 0.076 | 0.062 | 15.71 | 7.97 | 16.93 | 0.066 |
+| UNC | 0.000 | 0.000 | 34.16 | 20.87 | 38.35 | 0.000 |
+| SHUF | 0.034 | 0.062 | 16.38 | 8.19 | 17.47 | 0.066 |
+| DET | 0.181 | 1.441 | 20.95 | 13.83 | 21.96 | 1.717 |
+| AE | 0.835 | 0.785 | 5.20 | 1.03 | 5.07 | 0.936 |
+| B0 | 0.232 | 0.563 | 9.06 | 3.98 | 10.70 | 0.669 |
+
+Without the density oracle the generative arms produce almost nothing: GEN realizes
+0.066× the true edge count (GS 0.242 → 0.076) and UNC is exactly empty, while AE stays
+near truth (0.94×) and B0 degrades gently (0.67×, GS 0.282 → 0.232). DET's GS *rises*
+(0.108 → 0.181) because its 1.7× over-density buys Dice recall — miscalibration, not
+alignment. The matched-threshold ordering (AE ≫ B0 > GEN > SHUF > UNC) survives at 0.5,
+so the density oracle was flattering every conditional arm rather than reordering them.
 
 ### Coherence — is the joint model actually joint?
 
