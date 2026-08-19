@@ -6,6 +6,7 @@ import dataclasses
 import json
 import math
 from pathlib import Path
+from typing import cast
 
 import networkx as nx
 import numpy as np
@@ -14,12 +15,15 @@ import torch
 from numpy.typing import NDArray
 from src import score_universe
 from src.data.features import FeatureStore
+from src.data.val_region import ValRegionParams, derive_val_region_split
 from src.distill.heuristic_targets import heuristic_score
+from src.experiments import stpd_pregate
 from src.experiments.stpd_pregate import (
     B0Scores,
     PregateConfig,
     PregateProbe,
     SwapProvenance,
+    _auroc,
     _stable_seed,
     bucketed_macro,
     build_cell_context,
@@ -838,3 +842,186 @@ def test_save_load_b0_scores_round_trip(tmp_path: Path) -> None:
     lo_cd, hi_cd = sorted(("node_d", "node_c"))
     assert loaded_scores[lo_ab, hi_ab] == pytest.approx(0.5)
     assert loaded_scores[lo_cd, hi_cd] == pytest.approx(-1.25)
+
+
+# --------------------------------------------------------------------------- _auroc
+
+
+def test_auroc_known_value_no_ties() -> None:
+    scores = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    labels = np.array([0, 1, 0, 1], dtype=np.int8)
+    # pairs (pos, neg): (2,1) win, (2,3) lose, (4,1) win, (4,3) win -> 3/4
+    assert _auroc(scores, labels) == pytest.approx(0.75)
+
+
+def test_auroc_known_value_with_ties() -> None:
+    scores = np.array([1.0, 1.0, 2.0, 2.0], dtype=np.float32)
+    labels = np.array([0, 1, 0, 1], dtype=np.int8)
+    # tied ranks average to 1.5/1.5/3.5/3.5; hand-verified pairwise value is 0.5.
+    assert _auroc(scores, labels) == pytest.approx(0.5)
+
+
+def test_auroc_degenerate_single_class_is_nan() -> None:
+    scores = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    labels = np.array([1, 1, 1], dtype=np.int8)
+    assert math.isnan(_auroc(scores, labels))
+
+
+# --------------------------------------------------------------------------- end-to-end
+
+
+def _tiny_v3_1_config_for(input_dim: int) -> dict[str, object]:
+    return {
+        "input_dim": input_dim,
+        "d_model": 8,
+        "encoder_layers": 1,
+        "cross_attn_layers": 1,
+        "n_heads": 2,
+        "mlp_head": {"hidden_dims": [8], "dropout": 0.0, "activation": "gelu", "norm": "layernorm"},
+        "regularization": {"dropout": 0.0},
+    }
+
+
+@pytest.fixture
+def _pregate_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[PregateConfig, Path]:
+    """Cache + train a CPU-tiny end-to-end STPD pre-gate run; returns `(cfg, output_dir)`.
+
+    `stpd_pregate._load_val_region_split` is monkeypatched to skip `load_benchmark`'s disk
+    I/O, but the `ValRegionSplit` it returns is built by the REAL `derive_val_region_split`
+    (the `tests/data/test_val_region.py`/S3 precedent for a tiny toy-graph split) -- so
+    `assert_training_side_only`'s quarantine wiring inside `run_cache` runs against a
+    genuine split, only the benchmark-loading step is stubbed.
+    """
+    graph = _pregate_train_graph()
+    node_ids = sorted(graph.nodes())
+    data_root = tmp_path / "data"
+    _write_feature_store(data_root / "features" / "frozen_node_features_1024", node_ids)
+
+    params = ValRegionParams(
+        edge_fraction=0.2, n_regions=2, salt="pregate-e2e|", bucket_sizes=(3, 5), buckets_per_size=2
+    )
+    split = derive_val_region_split(node_ids, list(graph.edges()), [], frozenset(), params=params)
+    monkeypatch.setattr(
+        stpd_pregate,
+        "_load_val_region_split",
+        lambda data_root, strategy: (split, frozenset()),
+    )
+
+    torch.manual_seed(0)
+    b0_model = score_universe.build_model("v3_1", _tiny_v3_1_config_for(8))
+    checkpoint_path = tmp_path / "b0.pt"
+    _write_v3_1_checkpoint(
+        checkpoint_path, model=b0_model, model_family="v3_1", model_config=_tiny_v3_1_config_for(8)
+    )
+
+    cfg = PregateConfig(
+        sizes=(12, 16),
+        per_size=4,
+        holdout_frac=0.25,
+        seeds=(0, 1),
+        salt="pregate-e2e-cfg|",
+        epochs=2,
+    )
+    output_dir = tmp_path / "out"
+
+    stpd_pregate.run_cache(
+        cfg,
+        data_root=data_root,
+        strategy="breadth_first",
+        output_dir=output_dir,
+        b0_checkpoint=checkpoint_path,
+        device=torch.device("cpu"),
+    )
+    stpd_pregate.run_train(cfg, output_dir=output_dir, device=torch.device("cpu"))
+    return cfg, output_dir
+
+
+_ARM_NAMES = ("b0_frozen", "structure_ra", "structure_cn", "probe_p", "probe_s")
+
+
+def test_run_cache_train_eval_end_to_end(
+    _pregate_e2e: tuple[PregateConfig, Path],
+) -> None:
+    cfg, output_dir = _pregate_e2e
+    payload = stpd_pregate.run_eval(cfg, output_dir=output_dir)
+
+    report_path = output_dir / "report.json"
+    tables_path = output_dir / "tables.md"
+    assert report_path.exists()
+    loaded = json.loads(report_path.read_text())
+    # `payload` still holds tuples (e.g. `cfg.severities`); compare via re-serialization
+    # rather than Python equality, which would spuriously fail on tuple-vs-list.
+    assert json.dumps(loaded, sort_keys=True) == json.dumps(payload, sort_keys=True)
+
+    arms = cast(dict[str, object], payload["arms"])
+    for arm_name in _ARM_NAMES:
+        assert arm_name in arms
+
+    for arm_name in ("b0_frozen", "structure_ra", "structure_cn"):
+        entry = cast(dict[str, object], arms[arm_name])
+        assert 0.0 <= cast(float, entry["macro"]) <= 1.0
+        for value in cast(dict[str, float], entry["buckets"]).values():
+            assert 0.0 <= value <= 1.0
+
+    for arm_name in ("probe_p", "probe_s"):
+        entry = cast(dict[str, object], arms[arm_name])
+        mean = cast(dict[str, object], entry["mean"])
+        assert 0.0 <= cast(float, mean["macro"]) <= 1.0
+        for seed_block in cast(dict[str, object], entry["per_seed"]).values():
+            assert 0.0 <= cast(float, cast(dict[str, object], seed_block)["macro"]) <= 1.0
+
+    decision = cast(dict[str, object], payload["decision"])
+    for key in (
+        "rule",
+        "margin",
+        "probe_s_moderate",
+        "b0_moderate",
+        "structure_ra_moderate",
+        "margin_vs_b0",
+        "margin_vs_structure",
+        "verdict",
+    ):
+        assert key in decision
+    assert decision["verdict"] in ("edge_identity_supported", "edge_identity_killed")
+
+    assert tables_path.exists()
+    tables_text = tables_path.read_text()
+    assert tables_text
+    for arm_name in _ARM_NAMES:
+        assert arm_name in tables_text
+
+
+def test_run_eval_byte_deterministic(_pregate_e2e: tuple[PregateConfig, Path]) -> None:
+    cfg, output_dir = _pregate_e2e
+
+    stpd_pregate.run_eval(cfg, output_dir=output_dir)
+    report_a = (output_dir / "report.json").read_bytes()
+    tables_a = (output_dir / "tables.md").read_bytes()
+
+    stpd_pregate.run_eval(cfg, output_dir=output_dir)
+    report_b = (output_dir / "report.json").read_bytes()
+    tables_b = (output_dir / "tables.md").read_bytes()
+
+    assert report_a == report_b
+    assert tables_a == tables_b
+
+
+# --------------------------------------------------------------------------- CLI stage guards
+
+
+def test_main_eval_without_cache_errors(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    empty_dir = tmp_path / "empty_output"
+    with pytest.raises(SystemExit):
+        stpd_pregate.main(["--stage", "eval", "--output-dir", str(empty_dir)])
+    captured = capsys.readouterr()
+    assert "cache" in captured.err
+
+
+def test_main_train_without_cache_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    empty_dir = tmp_path / "empty_output"
+    with pytest.raises(SystemExit):
+        stpd_pregate.main(["--stage", "train", "--output-dir", str(empty_dir)])
+    captured = capsys.readouterr()
+    assert "cache" in captured.err

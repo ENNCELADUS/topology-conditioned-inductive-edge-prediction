@@ -1,19 +1,20 @@
 """STPD pre-gate probe: degree-matched partner discrimination on corrupted training regions.
 
-evidence_class=diagnostic, formal=false; fp32, single GPU, no DDP. (Later tasks extend it; keep
-the docstring short.)
+evidence_class=diagnostic, formal=false; fp32, single GPU, no DDP.
 """
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import hashlib
 import json
+import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import networkx as nx
 import numpy as np
@@ -23,8 +24,14 @@ from numpy.typing import NDArray
 from torch.nn.utils import clip_grad_norm_
 
 from src.data.features import FeatureStore
+from src.distill.teacher_targets import _load_val_region_split, assert_training_side_only
 from src.experiments.s2_latent_topology.data import RegionCorpus, build_region_corpus
 from src.score_universe import _load_checkpoint, _score_v3_1
+
+logger = logging.getLogger(__name__)
+
+_FEATURES_SUBDIR = Path("features") / "frozen_node_features_1024"
+_DEFAULT_B0_CHECKPOINT = Path("outputs/deliverables/b0_v31_breadth_first_20260711/model/best.pt")
 
 
 def _stable_seed(*parts: str) -> int:
@@ -908,3 +915,586 @@ def load_b0_scores(path: Path) -> tuple[dict[tuple[str, str], float], str]:
         a, b = sorted((str(u), str(v)))
         scores[a, b] = float(value)
     return scores, checkpoint_id
+
+
+# --------------------------------------------------------------------------- stage: cache
+
+
+def run_cache(
+    cfg: PregateConfig,
+    *,
+    data_root: Path,
+    strategy: str,
+    output_dir: Path,
+    b0_checkpoint: Path,
+    device: torch.device,
+) -> None:
+    """Stage `cache`: sample the corpus, enforce the quarantine, score the frozen-B0 arm.
+
+    Loads the training-side `ValRegionSplit` exactly as training does, samples
+    `PregateCorpus`, hard-refuses any test-split/foreign/V_val-internal leakage over
+    every node id appearing in a sampled region, then writes `corpus.pt`,
+    `b0_scores.npz`, and a small `cache_meta.json` (the `b0_checkpoint` path -- the only
+    piece of `run_cache`'s provenance `run_eval` cannot otherwise recover from disk).
+
+    Args:
+        cfg: Experiment constants.
+        data_root: Benchmark/feature-store root.
+        strategy: Split strategy name.
+        output_dir: This run's output directory (created if absent).
+        b0_checkpoint: Path to a published `v3_1` checkpoint for the frozen-B0 arm.
+        device: Scoring device for the frozen-B0 pass.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    split, test_nodes = _load_val_region_split(data_root, strategy)
+    train_graph = split.build_training_graph()
+    store = FeatureStore(data_root / _FEATURES_SUBDIR)
+
+    corpus = build_pregate_corpus(train_graph, store, cfg, cache_dir=output_dir / "cache")
+
+    node_ids = sorted(
+        {corpus.regions.node_ids[i] for region in corpus.regions.regions for i in region}
+    )
+    assert_training_side_only(node_ids, train_graph, split, test_nodes)
+
+    save_pregate_corpus(corpus, output_dir / "corpus.pt")
+    logger.info(
+        "cached %d regions (%d dropped cells)",
+        len(corpus.regions.regions),
+        len(corpus.dropped_cells),
+    )
+
+    pairs = collect_eval_pairs(corpus)
+    scores = score_b0_pairs(b0_checkpoint, pairs, store, device=device)
+    save_b0_scores(
+        output_dir / "b0_scores.npz", pairs, scores.logits, checkpoint_id=scores.checkpoint_id
+    )
+    (output_dir / "cache_meta.json").write_text(
+        json.dumps({"b0_checkpoint": str(b0_checkpoint)}, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+# --------------------------------------------------------------------------- stage: train
+
+
+def run_train(cfg: PregateConfig, *, output_dir: Path, device: torch.device) -> None:
+    """Stage `train`: train both variants at every configured seed.
+
+    Deletes a pre-existing `metrics_<variant>_s<seed>.jsonl` before each run so a rerun
+    never appends to stale lines (`train_probe` itself only ever appends).
+
+    Args:
+        cfg: Experiment constants (`cfg.seeds` iterated, `("p", "s")` variants).
+        output_dir: Directory holding `corpus.pt` (written by `run_cache`); checkpoints
+            and metrics are written here too.
+        device: Training device.
+    """
+    corpus = load_pregate_corpus(output_dir / "corpus.pt")
+    for variant in ("p", "s"):
+        for seed in cfg.seeds:
+            metrics_path = output_dir / f"metrics_{variant}_s{seed}.jsonl"
+            metrics_path.unlink(missing_ok=True)
+            result = train_probe(
+                corpus,
+                cfg,
+                variant=variant,
+                seed=seed,
+                device=device,
+                out_path=output_dir / f"probe_{variant}_s{seed}.pt",
+                metrics_path=metrics_path,
+            )
+            logger.info("trained variant=%s seed=%d: %s", variant, seed, result)
+
+
+# --------------------------------------------------------------------------- stage: eval
+
+
+def _auroc(scores: NDArray[Any], labels: NDArray[Any]) -> float:
+    """Rank-based AUROC (Mann-Whitney U form), ties resolved via average rank.
+
+    Args:
+        scores: `(N,)` scores; higher means more likely positive.
+        labels: `(N,)` binary labels (`1` positive, `0` negative; any numeric dtype).
+
+    Returns:
+        AUROC in `[0, 1]`, or `NaN` if either class is empty.
+    """
+    scores_arr = np.asarray(scores, dtype=np.float64)
+    labels_arr = np.asarray(labels)
+    n_pos = int(np.sum(labels_arr == 1))
+    n_neg = int(np.sum(labels_arr == 0))
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+
+    order = np.argsort(scores_arr, kind="mergesort")
+    sorted_scores = scores_arr[order]
+    ranks = np.empty(len(scores_arr), dtype=np.float64)
+    i = 0
+    while i < len(sorted_scores):
+        j = i
+        while j + 1 < len(sorted_scores) and sorted_scores[j + 1] == sorted_scores[i]:
+            j += 1
+        ranks[order[i : j + 1]] = (i + 1 + j + 1) / 2.0
+        i = j + 1
+
+    sum_ranks_pos = float(ranks[labels_arr == 1].sum())
+    return (sum_ranks_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+
+
+def _pair_ids(
+    region: tuple[int, ...], node_ids: list[str], pairs: NDArray[np.int64]
+) -> list[tuple[str, str]]:
+    """Map a cell's local `(i, j)` pairs to sorted global node-id pairs."""
+    result: list[tuple[str, str]] = []
+    for i, j in pairs:
+        a, b = sorted((node_ids[region[int(i)]], node_ids[region[int(j)]]))
+        result.append((a, b))
+    return result
+
+
+def _lookup_b0(
+    b0_scores: dict[tuple[str, str], float], pair_ids: list[tuple[str, str]]
+) -> torch.Tensor:
+    """Look up `pair_ids` in `b0_scores`; a missing pair is a hard error (cannot happen)."""
+    missing = [pid for pid in pair_ids if pid not in b0_scores]
+    if missing:
+        raise KeyError(
+            f"b0 score missing for {len(missing)} held-out comparison pair(s) "
+            f"(first few: {missing[:5]}) -- collect_eval_pairs should have covered these"
+        )
+    return torch.tensor([b0_scores[pid] for pid in pair_ids], dtype=torch.float32)
+
+
+def _split_buckets(raw: dict[str, float]) -> tuple[dict[str, float], float]:
+    """Split a `bucketed_macro` result into `(buckets_without_macro, macro)`."""
+    buckets = {key: value for key, value in raw.items() if key != "macro"}
+    return buckets, raw["macro"]
+
+
+def _per_severity_means(buckets: dict[str, float], severities: Sequence[str]) -> dict[str, float]:
+    """Unweighted mean over each severity's size buckets."""
+    result: dict[str, float] = {}
+    for severity in severities:
+        values = [value for key, value in buckets.items() if key.startswith(f"{severity}|")]
+        result[severity] = float(np.mean(values)) if values else float("nan")
+    return result
+
+
+def _arm_block(
+    per_cell: dict[tuple[int, str], float],
+    cell_size: dict[int, int],
+    severities: Sequence[str],
+    auroc_trusted: float | None,
+) -> dict[str, Any]:
+    """Assemble one non-probe arm's `{buckets, per_severity, macro, auroc_trusted}` block."""
+    raw = bucketed_macro(per_cell, cell_size)
+    buckets, macro = _split_buckets(raw)
+    return {
+        "buckets": buckets,
+        "per_severity": _per_severity_means(buckets, severities),
+        "macro": macro,
+        "auroc_trusted": auroc_trusted,
+    }
+
+
+def _mean_sd_over_seeds(
+    per_seed: dict[str, dict[str, Any]], severities: Sequence[str]
+) -> tuple[dict[str, Any], dict[str, float]]:
+    """Seed-mean `{per_severity, macro, auroc_trusted}` and seed-sd `{macro}` for a probe arm."""
+    blocks = list(per_seed.values())
+    macros = [cast(float, block["macro"]) for block in blocks]
+    aurocs = [cast(float, block["auroc_trusted"]) for block in blocks]
+    mean_per_severity = {
+        severity: float(
+            np.mean([cast(dict[str, float], b["per_severity"])[severity] for b in blocks])
+        )
+        for severity in severities
+    }
+    mean = {
+        "per_severity": mean_per_severity,
+        "macro": float(np.mean(macros)),
+        "auroc_trusted": float(np.mean(aurocs)),
+    }
+    sd = {"macro": float(np.std(macros))}
+    return mean, sd
+
+
+def run_eval(cfg: PregateConfig, *, output_dir: Path) -> dict[str, object]:
+    """Stage `eval`: score every held-out cell under every arm, aggregate, decide, write.
+
+    Pure given `output_dir`'s contents (`corpus.pt`, `b0_scores.npz`, `cache_meta.json`,
+    the six `probe_<variant>_s<seed>.pt` checkpoints written by `run_cache`/`run_train`):
+    CPU-only, deterministic, byte-identical on rerun. Also writes `report.json` and
+    `tables.md` next to those inputs.
+
+    Args:
+        cfg: Experiment constants (`cfg.severities`, `cfg.seeds` drive aggregation).
+        output_dir: Directory holding the cache/train stage outputs.
+
+    Returns:
+        The report payload (see the module's report-schema documentation).
+    """
+    corpus = load_pregate_corpus(output_dir / "corpus.pt")
+    b0_scores, b0_checkpoint_id = load_b0_scores(output_dir / "b0_scores.npz")
+    b0_checkpoint = json.loads((output_dir / "cache_meta.json").read_text())["b0_checkpoint"]
+
+    probes: dict[tuple[str, int], PregateProbe] = {}
+    for variant in ("p", "s"):
+        for seed in cfg.seeds:
+            checkpoint = torch.load(
+                output_dir / f"probe_{variant}_s{seed}.pt", map_location="cpu", weights_only=False
+            )
+            probe = PregateProbe(in_dim=checkpoint["in_dim"])
+            probe.load_state_dict(checkpoint["model"])
+            probe.eval()
+            probes[variant, seed] = probe
+
+    val_idx_set = set(corpus.regions.val_idx)
+    held_out_cells = sorted(key for key in corpus.provenance if key[0] in val_idx_set)
+    cell_size = {idx: len(region) for idx, region in enumerate(corpus.regions.regions)}
+    severities = [name for name, _fraction in cfg.severities]
+
+    per_cell_b0: dict[tuple[int, str], float] = {}
+    per_cell_structure_ra: dict[tuple[int, str], float] = {}
+    per_cell_structure_cn: dict[tuple[int, str], float] = {}
+    per_cell_probe: dict[tuple[str, int], dict[tuple[int, str], float]] = {
+        (variant, seed): {} for variant in ("p", "s") for seed in cfg.seeds
+    }
+
+    trusted_labels_parts: list[NDArray[np.float32]] = []
+    trusted_ra_parts: list[NDArray[np.float32]] = []
+    trusted_cn_parts: list[NDArray[np.float32]] = []
+    trusted_probe_parts: dict[tuple[str, int], list[NDArray[np.float32]]] = {
+        (variant, seed): [] for variant in ("p", "s") for seed in cfg.seeds
+    }
+
+    with torch.no_grad():
+        for key in held_out_cells:
+            region_idx, _severity = key
+            prov = corpus.provenance[key]
+            region = corpus.regions.regions[region_idx]
+            n = len(region)
+            features = corpus.regions.features[list(region)]
+            ctx = build_cell_context(n, corrupted_edges_of(prov), features)
+
+            true_pairs_np, false_pairs_np = quad_comparison_pairs(prov)
+            true_pairs_t = torch.from_numpy(true_pairs_np)
+            false_pairs_t = torch.from_numpy(false_pairs_np)
+
+            true_ids = _pair_ids(region, corpus.regions.node_ids, true_pairs_np)
+            false_ids = _pair_ids(region, corpus.regions.node_ids, false_pairs_np)
+            per_cell_b0[key] = paired_accuracy(
+                _lookup_b0(b0_scores, true_ids), _lookup_b0(b0_scores, false_ids)
+            )
+
+            ra_true, cn_true = structure_scores(ctx, true_pairs_t)
+            ra_false, cn_false = structure_scores(ctx, false_pairs_t)
+            per_cell_structure_ra[key] = paired_accuracy(ra_true, ra_false)
+            per_cell_structure_cn[key] = paired_accuracy(cn_true, cn_false)
+
+            inputs_p_true = probe_pair_inputs(features, true_pairs_t, None)
+            inputs_p_false = probe_pair_inputs(features, false_pairs_t, None)
+            inputs_s_true = probe_pair_inputs(features, true_pairs_t, ctx)
+            inputs_s_false = probe_pair_inputs(features, false_pairs_t, ctx)
+            for seed in cfg.seeds:
+                per_cell_probe["p", seed][key] = paired_accuracy(
+                    probes["p", seed](inputs_p_true), probes["p", seed](inputs_p_false)
+                )
+                per_cell_probe["s", seed][key] = paired_accuracy(
+                    probes["s", seed](inputs_s_true), probes["s", seed](inputs_s_false)
+                )
+
+            trusted_pairs_np, trusted_labels_np = trusted_rows(prov)
+            trusted_pairs_t = torch.from_numpy(trusted_pairs_np)
+            trusted_labels_parts.append(trusted_labels_np)
+
+            ra_trusted, cn_trusted = structure_scores(ctx, trusted_pairs_t)
+            trusted_ra_parts.append(ra_trusted.numpy())
+            trusted_cn_parts.append(cn_trusted.numpy())
+
+            inputs_p_trusted = probe_pair_inputs(features, trusted_pairs_t, None)
+            inputs_s_trusted = probe_pair_inputs(features, trusted_pairs_t, ctx)
+            for seed in cfg.seeds:
+                trusted_probe_parts["p", seed].append(probes["p", seed](inputs_p_trusted).numpy())
+                trusted_probe_parts["s", seed].append(probes["s", seed](inputs_s_trusted).numpy())
+
+    trusted_labels = np.concatenate(trusted_labels_parts)
+    auroc_structure_ra = _auroc(np.concatenate(trusted_ra_parts), trusted_labels)
+    auroc_structure_cn = _auroc(np.concatenate(trusted_cn_parts), trusted_labels)
+    auroc_probe = {
+        key: _auroc(np.concatenate(parts), trusted_labels)
+        for key, parts in trusted_probe_parts.items()
+    }
+
+    arms: dict[str, Any] = {
+        "b0_frozen": _arm_block(per_cell_b0, cell_size, severities, None),
+        "structure_ra": _arm_block(
+            per_cell_structure_ra, cell_size, severities, auroc_structure_ra
+        ),
+        "structure_cn": _arm_block(
+            per_cell_structure_cn, cell_size, severities, auroc_structure_cn
+        ),
+    }
+    for variant in ("p", "s"):
+        per_seed = {
+            str(seed): _arm_block(
+                per_cell_probe[variant, seed], cell_size, severities, auroc_probe[variant, seed]
+            )
+            for seed in cfg.seeds
+        }
+        mean, sd = _mean_sd_over_seeds(per_seed, severities)
+        arms[f"probe_{variant}"] = {"per_seed": per_seed, "mean": mean, "sd": sd}
+
+    probe_s_moderate = cast(dict[str, float], arms["probe_s"]["mean"]["per_severity"])["moderate"]
+    b0_moderate = cast(dict[str, float], arms["b0_frozen"]["per_severity"])["moderate"]
+    structure_ra_moderate = cast(dict[str, float], arms["structure_ra"]["per_severity"])["moderate"]
+    margin_vs_b0 = probe_s_moderate - b0_moderate
+    margin_vs_structure = probe_s_moderate - structure_ra_moderate
+    verdict = (
+        "edge_identity_supported"
+        if margin_vs_b0 >= 0.03 and margin_vs_structure >= 0.03
+        else "edge_identity_killed"
+    )
+    decision = {
+        "rule": (
+            "probe_s (seed-mean, moderate severity, size-macro over held-out regions) must "
+            "exceed BOTH b0_frozen and structure_ra by >= 0.03 paired accuracy"
+        ),
+        "margin": 0.03,
+        "probe_s_moderate": probe_s_moderate,
+        "b0_moderate": b0_moderate,
+        "structure_ra_moderate": structure_ra_moderate,
+        "margin_vs_b0": margin_vs_b0,
+        "margin_vs_structure": margin_vs_structure,
+        "verdict": verdict,
+    }
+
+    meta = {
+        "experiment": "stpd_pregate",
+        "format": "stpd_pregate/report_v1",
+        "evidence_class": "diagnostic",
+        "formal": False,
+        "config": dataclasses.asdict(cfg),
+        "n_regions": len(corpus.regions.regions),
+        "n_train_regions": len(corpus.regions.train_idx),
+        "n_val_regions": len(corpus.regions.val_idx),
+        "dropped_cells": [[region, severity] for region, severity in corpus.dropped_cells],
+        "b0_checkpoint": b0_checkpoint,
+        "b0_checkpoint_id": b0_checkpoint_id,
+        "n_unique_b0_pairs": len(b0_scores),
+        "selection_note": (
+            "probe selection on the same held-out regions as this report; optimism favors "
+            "the probes, so a kill verdict is conservative"
+        ),
+        "auroc_note": "b0_frozen has no trusted-row AUROC (scored on comparison pairs only)",
+        "vval_note": (
+            "synthetic inserted pairs may coincide with quarantined V_val-internal pairs; "
+            "their labels derive from insertion provenance, never from V_val truth"
+        ),
+    }
+
+    payload: dict[str, object] = {"meta": meta, "arms": arms, "decision": decision}
+
+    (output_dir / "report.json").write_text(
+        json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    (output_dir / "tables.md").write_text(render_tables_markdown(payload), encoding="utf-8")
+    return payload
+
+
+# --------------------------------------------------------------------------- report tables
+
+
+def _fmt(value: float | None) -> str:
+    """`""` for `None`/`NaN`, else `f"{value:.6g}"` (the S2 style)."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return ""
+    return f"{value:.6g}"
+
+
+_ARM_NAMES: tuple[str, ...] = ("b0_frozen", "structure_ra", "structure_cn", "probe_p", "probe_s")
+
+
+def _arm_per_severity(entry: dict[str, Any]) -> dict[str, float]:
+    """An arm's `per_severity` dict, seed-mean already applied for probe arms."""
+    if "per_seed" in entry:
+        return cast(dict[str, float], entry["mean"]["per_severity"])
+    return cast(dict[str, float], entry["per_severity"])
+
+
+def _arm_macro(entry: dict[str, Any]) -> float:
+    if "per_seed" in entry:
+        return cast(float, entry["mean"]["macro"])
+    return cast(float, entry["macro"])
+
+
+def _arm_auroc(entry: dict[str, Any]) -> float | None:
+    if "per_seed" in entry:
+        return cast(float, entry["mean"]["auroc_trusted"])
+    return cast(float | None, entry["auroc_trusted"])
+
+
+def _arm_bucket_values(entry: dict[str, Any], columns: list[str]) -> dict[str, float]:
+    """An arm's bucket values by column, seed-averaged at render time for probe arms."""
+    if "per_seed" not in entry:
+        return cast(dict[str, float], entry["buckets"])
+    per_seed = cast(dict[str, dict[str, Any]], entry["per_seed"])
+    result: dict[str, float] = {}
+    for column in columns:
+        values = [
+            value
+            for block in per_seed.values()
+            if (value := cast(dict[str, float], block["buckets"]).get(column)) is not None
+        ]
+        result[column] = float(np.mean(values)) if values else float("nan")
+    return result
+
+
+def render_tables_markdown(payload: dict[str, object]) -> str:
+    """Render the paired-accuracy, per-severity, AUROC, and decision tables.
+
+    Args:
+        payload: A `run_eval` result payload (or an equivalent dict, e.g. loaded back
+            from `report.json`).
+
+    Returns:
+        Markdown text.
+    """
+    data = cast(dict[str, Any], payload)
+    meta = cast(dict[str, Any], data["meta"])
+    config = cast(dict[str, Any], meta["config"])
+    arms = cast(dict[str, Any], data["arms"])
+    decision = cast(dict[str, Any], data["decision"])
+
+    severities = [str(name) for name, _fraction in config["severities"]]
+    sizes = [int(size) for size in config["sizes"]]
+    columns = [f"{severity}|{size}" for severity in severities for size in sizes]
+
+    lines: list[str] = ["# STPD pre-gate evaluation tables", ""]
+
+    lines.append("## Paired accuracy: arm x bucket")
+    lines.append("")
+    lines.append("| arm | " + " | ".join(columns) + " | macro |")
+    lines.append("|" + "---|" * (len(columns) + 2))
+    for arm_name in _ARM_NAMES:
+        entry = arms[arm_name]
+        bucket_values = _arm_bucket_values(entry, columns)
+        row = " | ".join(_fmt(bucket_values.get(column)) for column in columns)
+        lines.append(f"| {arm_name} | {row} | {_fmt(_arm_macro(entry))} |")
+    lines.append("")
+
+    lines.append("## Per-severity summary")
+    lines.append("")
+    lines.append("| arm | " + " | ".join(severities) + " |")
+    lines.append("|" + "---|" * (len(severities) + 1))
+    for arm_name in _ARM_NAMES:
+        per_severity = _arm_per_severity(arms[arm_name])
+        row = " | ".join(_fmt(per_severity.get(severity)) for severity in severities)
+        lines.append(f"| {arm_name} | {row} |")
+    lines.append("")
+
+    lines.append("## AUROC (trusted rows, held-out)")
+    lines.append("")
+    lines.append("| arm | auroc_trusted |")
+    lines.append("|---|---|")
+    for arm_name in _ARM_NAMES:
+        lines.append(f"| {arm_name} | {_fmt(_arm_auroc(arms[arm_name]))} |")
+    lines.append("")
+
+    lines.append("## Decision")
+    lines.append("")
+    lines.append(f"Rule: {decision['rule']}")
+    lines.append("")
+    lines.append(f"- margin threshold: {_fmt(decision['margin'])}")
+    lines.append(f"- probe_s_moderate: {_fmt(decision['probe_s_moderate'])}")
+    lines.append(f"- b0_moderate: {_fmt(decision['b0_moderate'])}")
+    lines.append(f"- structure_ra_moderate: {_fmt(decision['structure_ra_moderate'])}")
+    lines.append(f"- margin_vs_b0: {_fmt(decision['margin_vs_b0'])}")
+    lines.append(f"- margin_vs_structure: {_fmt(decision['margin_vs_structure'])}")
+    lines.append(f"- verdict: {decision['verdict']}")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- CLI
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the `python -m src.experiments.stpd_pregate` argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="python -m src.experiments.stpd_pregate",
+        description="STPD pre-gate diagnostic: cache, train the probes, and evaluate.",
+    )
+    parser.add_argument("--stage", required=True, choices=("cache", "train", "eval", "all"))
+    parser.add_argument("--data-root", type=Path, default=Path("data"))
+    parser.add_argument("--strategy", default="breadth_first")
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--b0-checkpoint", type=Path, default=_DEFAULT_B0_CHECKPOINT)
+    return parser
+
+
+def _require(path: Path, parser: argparse.ArgumentParser, *, prereq_stage: str) -> None:
+    """`parser.error` with the missing-prerequisite convention if `path` is absent."""
+    if not path.exists():
+        parser.error(f"{path} not found (run --stage {prereq_stage} first)")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI entry point: dispatch `--stage {cache,train,eval,all}` against `--output-dir`.
+
+    Args:
+        argv: Argument list (defaults to `sys.argv[1:]`).
+
+    Returns:
+        `0` on success.
+
+    Raises:
+        SystemExit: On argument errors or a missing stage prerequisite (`parser.error`).
+    """
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    output_dir: Path = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device(args.device)
+    cfg = PregateConfig()
+
+    stages = ("cache", "train", "eval") if args.stage == "all" else (args.stage,)
+    for stage in stages:
+        if stage == "cache":
+            run_cache(
+                cfg,
+                data_root=args.data_root,
+                strategy=args.strategy,
+                output_dir=output_dir,
+                b0_checkpoint=args.b0_checkpoint,
+                device=device,
+            )
+        elif stage == "train":
+            _require(output_dir / "corpus.pt", parser, prereq_stage="cache")
+            run_train(cfg, output_dir=output_dir, device=device)
+        else:
+            _require(output_dir / "corpus.pt", parser, prereq_stage="cache")
+            _require(output_dir / "b0_scores.npz", parser, prereq_stage="cache")
+            for variant in ("p", "s"):
+                for seed in cfg.seeds:
+                    _require(
+                        output_dir / f"probe_{variant}_s{seed}.pt", parser, prereq_stage="train"
+                    )
+            run_eval(cfg, output_dir=output_dir)
+
+    return 0
+
+
+__all__ = ["build_parser", "main", "run_cache", "run_eval", "run_train"]
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    raise SystemExit(main())
