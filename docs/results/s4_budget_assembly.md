@@ -93,7 +93,12 @@ with GS → oracle ⇒ a legal budget method exists.
 Implemented and unit-tested; six jobs on the H20, requiring the v3 KD-targets
 artifact (`content_logit` present — a v2 artifact raises). Target
 `Δ = teacher_logit − content_logit`. The split is by **anchor**, never by row:
-every CSR row of a held-out anchor goes to the eval side.
+every CSR row of a held-out anchor goes to the eval side, and every training row
+touching a held-out anchor at *either* endpoint is dropped (count disclosed as
+`n_train_rows_dropped_touching_heldout`). The readout is `abba_max`-symmetric, so
+without that second rule reciprocal rows `(u,v)` and `(v,u)` put the same
+canonical pair on both sides — on a fully reciprocal fixture that leaked 10.3% of
+training rows, which would inflate the very bound this probe exists to establish.
 
 Zero-init control: the final `output_head` linear is zeroed so the first
 prediction is exactly the predict-zero baseline. This required removing the

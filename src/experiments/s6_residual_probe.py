@@ -32,6 +32,12 @@ Data legality: rows come from an already train-side-legal KD-targets artifact;
 node universe (the `content_logit.py` precedent), not as a new gate. The anchor
 split is by *anchor*, never by row: every CSR row of a held-out anchor goes to
 the eval side, so no anchor's neighbourhood is split across the boundary.
+Training rows are further pruned to exclude any row whose *partner* endpoint is
+a held-out anchor: the classifier's symmetric `abba_max` readout makes `(u, v)`
+and `(v, u)` the same pair, so a held-out anchor appearing as a training-row
+partner would leak that anchor into training via its reciprocal row. A held-out
+anchor therefore never appears on the training side, as anchor or as partner;
+the count of rows this drops is disclosed, never silently absorbed.
 
 Precision: fp32 everywhere, no autocast, single GPU, no DDP.
 
@@ -119,28 +125,55 @@ def residual_targets(targets: KDTargets) -> NDArray[np.float32]:
     return delta.astype(np.float32)
 
 
+@dataclass(frozen=True)
+class AnchorSplit:
+    """Anchor-disjoint train/eval row split, plus the training-side leakage guard.
+
+    A held-out anchor never appears on the training side, as anchor or as
+    partner: `train_rows` already excludes rows whose partner endpoint is
+    held out, and `n_dropped_touching_heldout` discloses exactly how many rows
+    that exclusion removed.
+    """
+
+    train_rows: NDArray[np.int64]
+    eval_rows: NDArray[np.int64]
+    heldout_anchors: NDArray[np.int64]
+    n_dropped_touching_heldout: int
+
+
 def anchor_holdout_split(
-    anchor_offsets: NDArray[np.integer], *, seed: int, fraction: float = _HOLDOUT_FRACTION
-) -> tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.int64]]:
+    anchor_offsets: NDArray[np.integer],
+    pair_partner_idx: NDArray[np.integer],
+    *,
+    seed: int,
+    fraction: float = _HOLDOUT_FRACTION,
+) -> AnchorSplit:
     """Split CSR rows by *anchor*, holding out the last `fraction` of a permutation.
 
     Only anchors that actually own rows participate. Every row belonging to a
     held-out anchor lands on the eval side, so an anchor's neighbourhood is
-    never split across the boundary.
+    never split across the boundary. Training rows are then pruned to drop any
+    row whose *partner* endpoint is a held-out anchor -- the symmetric
+    ``abba_max`` readout makes ``(u, v)`` and ``(v, u)`` the same pair, so
+    without this a held-out anchor could still enter training via a reciprocal
+    row, and the held-out anchor's R^2 would partly reflect memorization
+    rather than identifiability from ``(x_u, x_v)`` alone.
 
     Args:
         anchor_offsets: CSR row-start array, ``len(node_ids) + 1`` entries.
+        pair_partner_idx: Per-row partner node position, same indexing space
+            as `anchor_offsets`.
         seed: Seed for `numpy.random.default_rng`.
         fraction: Held-out share of the live anchors.
 
     Returns:
-        ``(train_rows, eval_rows, heldout_anchors)`` -- sorted row-index arrays
-        and the held-out anchor positions.
+        An `AnchorSplit`.
 
     Raises:
         ValueError: If the split would leave either anchor side empty.
     """
     offsets = np.asarray(anchor_offsets, dtype=np.int64)
+    partner_idx = np.asarray(pair_partner_idx, dtype=np.int64)
     live = np.flatnonzero(np.diff(offsets) > 0).astype(np.int64)
     n_heldout = int(round(live.size * fraction))
     if n_heldout < 1 or n_heldout >= live.size:
@@ -159,7 +192,17 @@ def anchor_holdout_split(
             [np.arange(offsets[a], offsets[a + 1], dtype=np.int64) for a in anchors.tolist()]
         )
 
-    return rows_for(train_anchors), rows_for(heldout_anchors), heldout_anchors
+    eval_rows = rows_for(heldout_anchors)
+    candidate_train_rows = rows_for(train_anchors)
+    touches_heldout = np.isin(partner_idx[candidate_train_rows], heldout_anchors)
+    train_rows = candidate_train_rows[~touches_heldout]
+
+    return AnchorSplit(
+        train_rows=train_rows,
+        eval_rows=eval_rows,
+        heldout_anchors=heldout_anchors,
+        n_dropped_touching_heldout=int(np.count_nonzero(touches_heldout)),
+    )
 
 
 # --------------------------------------------------------------------------- model
@@ -329,6 +372,11 @@ def train_residual_probe(
 ) -> tuple[list[EpochRecord], dict[str, float], int, NDArray[np.float64]]:
     """Train the probe on ``Delta`` with early stopping on held-out Spearman.
 
+    On return, ``model`` holds the best epoch's weights, restored from a CPU
+    copy taken when that epoch was selected -- not whatever epoch training
+    happened to stop on -- so a train-side readout computed on ``model`` after
+    this call describes the same checkpoint as ``best_readout``.
+
     Returns:
         ``(history, best_readout, best_epoch, best_predictions)``.
 
@@ -348,6 +396,7 @@ def train_residual_probe(
     best_readout = {"spearman": -np.inf, "r2": 0.0, "mae": 0.0}
     best_epoch = -1
     best_predictions = np.zeros(len(eval_pairs), dtype=np.float64)
+    best_state: dict[str, torch.Tensor] = {}
 
     for epoch in range(max_epochs):
         train_sampler.set_epoch(epoch)
@@ -385,9 +434,14 @@ def train_residual_probe(
             best_readout = readout
             best_epoch = epoch
             best_predictions = predicted
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         elif epoch - best_epoch >= patience:
             logger.info("early stop at epoch %d (best epoch %d)", epoch, best_epoch)
             break
+
+    if best_state:
+        model.load_state_dict(best_state)
+        model.to(device)
 
     return history, best_readout, best_epoch, best_predictions
 
@@ -457,7 +511,12 @@ def run_s6_pipeline(
     assert_training_side_only(targets.node_ids, truth_graph_for_kd(split), split, test_nodes)
 
     store = FeatureStore(data_root / _FEATURES_SUBDIR)
-    train_rows, eval_rows, heldout_anchors = anchor_holdout_split(targets.anchor_offsets, seed=seed)
+    anchor_split = anchor_holdout_split(targets.anchor_offsets, targets.pair_partner_idx, seed=seed)
+    train_rows, eval_rows, heldout_anchors = (
+        anchor_split.train_rows,
+        anchor_split.eval_rows,
+        anchor_split.heldout_anchors,
+    )
     train_pairs = _pairs_for_rows(targets, train_rows)
     eval_pairs = _pairs_for_rows(targets, eval_rows)
     train_delta = delta[train_rows]
@@ -520,6 +579,7 @@ def run_s6_pipeline(
             "n_eval_rows": int(eval_rows.size),
             "n_heldout_anchors": int(heldout_anchors.size),
             "holdout_fraction": _HOLDOUT_FRACTION,
+            "n_train_rows_dropped_touching_heldout": anchor_split.n_dropped_touching_heldout,
         },
         "delta_stats": {
             "mean": float(np.mean(delta)),

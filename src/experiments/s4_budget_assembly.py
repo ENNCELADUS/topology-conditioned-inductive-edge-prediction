@@ -22,8 +22,9 @@ Arms (all read the same frozen candidate-universe artifact):
                         clipped to >= 1e-3, rescaled to sum exactly
                         ``2 * target_edges``, rounded to integer quotas via
                         `largest_remainder_quotas`, then assembled the same
-                        way. ``<variant>`` is the file's stem; two files with
-                        the same stem raise (no silent overwrite).
+                        way. ``<variant>`` is the payload's own ``"variant"``
+                        field; two files carrying the same variant raise (no
+                        silent overwrite).
 
 Self-pairs are never routed into `assemble_degree_quota` (it raises on
 self-pair rows). Instead every arm shares one frozen self-loop set computed
@@ -147,6 +148,30 @@ def load_degree_predictions(path: Path, node_ids: Sequence[str]) -> NDArray[np.f
             f"extra={extra[:5]}{'...' if len(extra) > 5 else ''})"
         )
     return np.array([float(predictions[node]) for node in node_ids], dtype=np.float64)
+
+
+def load_degree_predictions_variant(path: Path) -> str:
+    """Extract and validate the ``"variant"`` field of a ``degree_predictions_v1`` file.
+
+    The arm name is derived from this payload field, not from ``path.stem``:
+    S5's per-variant output layout (``outputs/s5_degree_probe/{warm,scratch}_s{seed}/
+    predictions.json``) means every file is literally named ``predictions.json``,
+    so the stem carries no identity.
+
+    Args:
+        path: Path to the predictions JSON file.
+
+    Returns:
+        The non-empty ``"variant"`` string.
+
+    Raises:
+        ValueError: If ``"variant"`` is missing, blank, or not a string.
+    """
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    variant = payload.get("variant")
+    if not isinstance(variant, str) or not variant.strip():
+        raise ValueError(f"{path}: 'variant' must be a non-empty string, got {variant!r}")
+    return variant
 
 
 def predicted_hard_quotas(raw_degrees: NDArray[np.float64], target_edges: int) -> NDArray[np.int64]:
@@ -357,7 +382,8 @@ def run_s4_pipeline(
         seed: Base seed; recorded for provenance (no randomized step in this
             pipeline consumes it).
         degree_predictions_paths: ``degree_predictions_v1`` JSON files, one
-            ``predicted_hard_<variant>`` arm per file (variant = file stem).
+            ``predicted_hard_<variant>`` arm per file (variant = the file's
+            own ``"variant"`` payload field, not its path).
 
     Returns:
         The JSON-ready results payload (also written to
@@ -365,8 +391,8 @@ def run_s4_pipeline(
 
     Raises:
         ValueError: If the scores artifact fails validation, a predictions
-            file fails its format/node-set contract, or two predictions files
-            share the same stem (duplicate variant).
+            file fails its format/node-set/variant contract, or two
+            predictions files carry the same ``"variant"`` field.
     """
     universe = load_scores(universe_path)
 
@@ -425,7 +451,7 @@ def run_s4_pipeline(
     predicted_sources: dict[str, str] = {}
 
     for path in degree_predictions_paths:
-        variant = path.stem
+        variant = load_degree_predictions_variant(path)
         arm_name = f"predicted_hard_{variant}"
         if arm_name in arm_graphs:
             raise ValueError(f"duplicate degree-predictions variant {variant!r} (from {path})")
@@ -535,7 +561,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help=(
             "degree_predictions_v1 JSON file; repeatable, one predicted_hard_<variant> "
-            "arm per file (variant = file stem)"
+            "arm per file (variant = the payload's own 'variant' field, not the filename, "
+            "so every S5 run's predictions.json can be passed together)"
         ),
     )
     return parser

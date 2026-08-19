@@ -148,51 +148,155 @@ class TestResidualTargets:
 
 
 class TestAnchorHoldoutSplit:
-    """The split is by anchor, never by row."""
+    """The split is by anchor, never by row.
+
+    Training rows never touch a held-out anchor at either endpoint (anchor or
+    partner).
+    """
 
     @staticmethod
     def _offsets(rows_per_anchor: list[int]) -> np.ndarray:
         return np.concatenate([[0], np.cumsum(rows_per_anchor)]).astype(np.int64)
 
+    @staticmethod
+    def _partners(rows_per_anchor: list[int]) -> np.ndarray:
+        """Every row of anchor `a` points at anchor `(a + 1) % n` as its partner.
+
+        Deterministic and simple, and -- because held-out anchors are spread
+        across the permutation -- some train anchors' next-anchor partner
+        lands on a held-out anchor, so the exclusion this class tests actually
+        fires rather than being vacuously true.
+        """
+        n_anchors = len(rows_per_anchor)
+        return np.concatenate(
+            [
+                np.full(count, (a + 1) % n_anchors, dtype=np.int64)
+                for a, count in enumerate(rows_per_anchor)
+            ]
+        )
+
     def test_no_anchor_appears_on_both_sides(self) -> None:
-        offsets = self._offsets([3] * 20)
-        train_rows, eval_rows, heldout = anchor_holdout_split(offsets, seed=0)
+        rows_per_anchor = [3] * 20
+        offsets = self._offsets(rows_per_anchor)
+        partners = self._partners(rows_per_anchor)
+        split = anchor_holdout_split(offsets, partners, seed=0)
         anchor_of = np.repeat(np.arange(20), 3)
-        train_anchors = set(anchor_of[train_rows].tolist())
-        eval_anchors = set(anchor_of[eval_rows].tolist())
+        train_anchors = set(anchor_of[split.train_rows].tolist())
+        eval_anchors = set(anchor_of[split.eval_rows].tolist())
         assert not train_anchors & eval_anchors
-        assert eval_anchors == set(heldout.tolist())
+        assert eval_anchors == set(split.heldout_anchors.tolist())
 
     def test_every_row_of_a_heldout_anchor_is_in_eval(self) -> None:
-        offsets = self._offsets([4] * 20)
-        _, eval_rows, heldout = anchor_holdout_split(offsets, seed=1)
-        expected = {r for a in heldout.tolist() for r in range(offsets[a], offsets[a + 1])}
-        assert set(eval_rows.tolist()) == expected
+        rows_per_anchor = [4] * 20
+        offsets = self._offsets(rows_per_anchor)
+        partners = self._partners(rows_per_anchor)
+        split = anchor_holdout_split(offsets, partners, seed=1)
+        expected = {
+            r for a in split.heldout_anchors.tolist() for r in range(offsets[a], offsets[a + 1])
+        }
+        assert set(split.eval_rows.tolist()) == expected
 
-    def test_rows_partition_completely(self) -> None:
-        offsets = self._offsets([2] * 30)
-        train_rows, eval_rows, _ = anchor_holdout_split(offsets, seed=0)
-        assert set(train_rows.tolist()) | set(eval_rows.tolist()) == set(range(60))
-        assert not set(train_rows.tolist()) & set(eval_rows.tolist())
+    def test_no_training_row_touches_a_heldout_anchor(self) -> None:
+        """P1 regression: neither endpoint of a training row may be held out.
+
+        Neither the anchor nor the partner of a training row may be a
+        held-out anchor.
+        """
+        rows_per_anchor = [3] * 20
+        offsets = self._offsets(rows_per_anchor)
+        partners = self._partners(rows_per_anchor)
+        split = anchor_holdout_split(offsets, partners, seed=0)
+        heldout = set(split.heldout_anchors.tolist())
+        anchor_of = np.repeat(np.arange(20), 3)
+        assert split.n_dropped_touching_heldout > 0, "fixture failed to exercise the exclusion"
+        for row in split.train_rows.tolist():
+            assert int(anchor_of[row]) not in heldout
+            assert int(partners[row]) not in heldout
+
+    def test_dropped_row_accounting_is_correct_and_nonnegative(self) -> None:
+        rows_per_anchor = [2] * 30
+        offsets = self._offsets(rows_per_anchor)
+        partners = self._partners(rows_per_anchor)
+        split = anchor_holdout_split(offsets, partners, seed=0)
+        assert split.n_dropped_touching_heldout >= 0
+        total = int(offsets[-1])
+        assert split.train_rows.size + split.eval_rows.size + split.n_dropped_touching_heldout == (
+            total
+        )
+        assert not set(split.train_rows.tolist()) & set(split.eval_rows.tolist())
 
     def test_anchors_with_no_rows_are_ignored(self) -> None:
         # 10 live anchors interleaved with 10 empty ones.
         rows = [3 if i % 2 == 0 else 0 for i in range(20)]
         offsets = self._offsets(rows)
-        train_rows, eval_rows, heldout = anchor_holdout_split(offsets, seed=0)
-        assert all(a % 2 == 0 for a in heldout.tolist())
-        assert train_rows.size + eval_rows.size == 30
+        partners = self._partners(rows)
+        split = anchor_holdout_split(offsets, partners, seed=0)
+        assert all(a % 2 == 0 for a in split.heldout_anchors.tolist())
+        assert split.train_rows.size + split.eval_rows.size + split.n_dropped_touching_heldout == 30
 
     def test_deterministic_for_a_seed(self) -> None:
-        offsets = self._offsets([3] * 20)
-        a = anchor_holdout_split(offsets, seed=5)
-        b = anchor_holdout_split(offsets, seed=5)
-        for left, right in zip(a, b, strict=True):
-            np.testing.assert_array_equal(left, right)
+        rows_per_anchor = [3] * 20
+        offsets = self._offsets(rows_per_anchor)
+        partners = self._partners(rows_per_anchor)
+        a = anchor_holdout_split(offsets, partners, seed=5)
+        b = anchor_holdout_split(offsets, partners, seed=5)
+        np.testing.assert_array_equal(a.train_rows, b.train_rows)
+        np.testing.assert_array_equal(a.eval_rows, b.eval_rows)
+        np.testing.assert_array_equal(a.heldout_anchors, b.heldout_anchors)
+        assert a.n_dropped_touching_heldout == b.n_dropped_touching_heldout
 
     def test_too_few_anchors_raises(self) -> None:
+        rows_per_anchor = [3, 3]
         with pytest.raises(ValueError, match="non-empty"):
-            anchor_holdout_split(self._offsets([3, 3]), seed=0)
+            anchor_holdout_split(
+                self._offsets(rows_per_anchor), self._partners(rows_per_anchor), seed=0
+            )
+
+
+# --------------------------------------------------------------------------- reciprocal leakage
+
+
+def test_no_reciprocal_leakage_across_train_eval_split(tmp_path: Path) -> None:
+    """P1 regression: a held-out anchor must never appear on the training side.
+
+    Neither as anchor nor as partner, and no canonical (frozenset) pair may
+    appear on both sides.
+
+    The fixture is fully reciprocal -- every anchor has a row to every other
+    node, so `(u, v)` and `(v, u)` both exist -- which is exactly the shape
+    the symmetric `abba_max` readout collapses to the same pair. Before the
+    P1 fix, `anchor_holdout_split` only dropped a held-out anchor's *own*
+    rows, so a train anchor's row back to a held-out partner survived; this
+    test fails against that code and passes once training rows touching a
+    held-out anchor at either endpoint are dropped.
+    """
+    node_ids = [f"n{i}" for i in range(8)]
+    targets_dir = _write_targets(
+        tmp_path / "v3", node_ids=node_ids, rows_per_anchor=len(node_ids) - 1
+    )
+    targets = load_kd_targets(targets_dir)
+
+    split = anchor_holdout_split(
+        targets.anchor_offsets, targets.pair_partner_idx, seed=0, fraction=0.5
+    )
+    heldout = set(split.heldout_anchors.tolist())
+
+    def endpoints(rows: np.ndarray) -> list[tuple[int, int]]:
+        return [
+            (int(targets.pair_anchor_idx[r]), int(targets.pair_partner_idx[r]))
+            for r in rows.tolist()
+        ]
+
+    train_endpoints = endpoints(split.train_rows)
+    eval_endpoints = endpoints(split.eval_rows)
+
+    train_canonical = {frozenset(pair) for pair in train_endpoints}
+    eval_canonical = {frozenset(pair) for pair in eval_endpoints}
+    assert not (train_canonical & eval_canonical), "a canonical pair appears on both sides"
+
+    for anchor, partner in train_endpoints:
+        assert anchor not in heldout, "a held-out anchor appears as a training anchor"
+        assert partner not in heldout, "a held-out anchor appears as a training partner"
 
 
 # --------------------------------------------------------------------------- zeroed head
@@ -310,7 +414,8 @@ def test_smoke_train_runs_and_improves_on_its_own_init(tmp_path: Path) -> None:
     delta = residual_targets(targets)
     store = FeatureStore(_write_feature_root(tmp_path, node_ids))
 
-    train_rows, eval_rows, _ = anchor_holdout_split(targets.anchor_offsets, seed=0)
+    split = anchor_holdout_split(targets.anchor_offsets, targets.pair_partner_idx, seed=0)
+    train_rows, eval_rows = split.train_rows, split.eval_rows
     pairs = [
         (node_ids[int(targets.pair_anchor_idx[r])], node_ids[int(targets.pair_partner_idx[r])])
         for r in range(delta.size)
@@ -352,7 +457,9 @@ def test_zeroed_head_first_eval_equals_predict_zero_baseline(tmp_path: Path) -> 
     targets = load_kd_targets(targets_dir)
     delta = residual_targets(targets)
     store = FeatureStore(_write_feature_root(tmp_path, node_ids))
-    _, eval_rows, _ = anchor_holdout_split(targets.anchor_offsets, seed=0)
+    eval_rows = anchor_holdout_split(
+        targets.anchor_offsets, targets.pair_partner_idx, seed=0
+    ).eval_rows
     eval_pairs = [
         (node_ids[int(targets.pair_anchor_idx[r])], node_ids[int(targets.pair_partner_idx[r])])
         for r in eval_rows.tolist()
@@ -433,3 +540,81 @@ def test_predictions_stay_row_aligned_across_length_buckets(tmp_path: Path) -> N
             expected[i] = float(model(batch)["logits"].squeeze())
 
     np.testing.assert_allclose(predicted, expected, rtol=1e-4, atol=1e-5)
+
+
+# --------------------------------------------------------------------------- best-state restore
+
+
+def test_best_epoch_state_is_restored_not_the_last_epoch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2 regression: the model handed back must be the best epoch's checkpoint.
+
+    Patches only `regression_readout`'s ranking signal (epoch 0 always wins,
+    every later epoch always loses) so early stopping fires with the best
+    epoch earlier than the epoch training stopped on. The predictions and
+    model weights involved are entirely real and unpatched, so if the restore
+    logic is correct, re-scoring `eval_pairs` on the model returned from
+    `train_residual_probe` must reproduce `best_predictions` exactly -- a
+    mismatch can only mean `model` was left at the last epoch, not the best
+    one.
+    """
+    import src.experiments.s6_residual_probe as s6_module
+
+    node_ids = [f"n{i}" for i in range(20)]
+    targets_dir = _write_targets(tmp_path / "v3", node_ids=node_ids, rows_per_anchor=3)
+    targets = load_kd_targets(targets_dir)
+    delta = residual_targets(targets)
+    store = FeatureStore(_write_feature_root(tmp_path, node_ids))
+
+    split = anchor_holdout_split(targets.anchor_offsets, targets.pair_partner_idx, seed=0)
+    pairs = [
+        (node_ids[int(targets.pair_anchor_idx[r])], node_ids[int(targets.pair_partner_idx[r])])
+        for r in range(delta.size)
+    ]
+    train_pairs = [pairs[r] for r in split.train_rows.tolist()]
+    eval_pairs = [pairs[r] for r in split.eval_rows.tolist()]
+
+    torch.manual_seed(0)
+    model = build_model("v3_1", _tiny_v3_1_config())
+    zero_output_head(model)  # type: ignore[arg-type]
+
+    real_readout = s6_module.regression_readout
+    call_count = {"n": 0}
+
+    def forced_readout(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+        out = real_readout(y_true, y_pred)
+        forced_spearman = 1.0 if call_count["n"] == 0 else 0.0
+        call_count["n"] += 1
+        return {**out, "spearman": forced_spearman}
+
+    monkeypatch.setattr(s6_module, "regression_readout", forced_readout)
+
+    history, _best_readout, best_epoch, best_predictions = train_residual_probe(
+        model,  # type: ignore[arg-type]
+        store=store,
+        train_pairs=train_pairs,
+        train_delta=delta[split.train_rows],
+        eval_pairs=eval_pairs,
+        eval_delta=delta[split.eval_rows],
+        device=torch.device("cpu"),
+        learning_rate=1e-2,
+        max_epochs=4,
+        patience=1,
+        token_budget=4096,
+        seed=0,
+    )
+
+    assert best_epoch == 0
+    assert history[-1].epoch != best_epoch, "fixture failed to force early stop past the best epoch"
+
+    from src.experiments.s6_residual_probe import _predict
+
+    restored_predictions = _predict(
+        model,  # type: ignore[arg-type]
+        eval_pairs,
+        store,
+        torch.device("cpu"),
+        4096,
+    )
+    np.testing.assert_allclose(restored_predictions, best_predictions, rtol=1e-6, atol=1e-6)

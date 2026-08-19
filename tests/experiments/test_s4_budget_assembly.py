@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import pickle
+import re
 from pathlib import Path
 from typing import Any, cast
 
@@ -149,12 +150,18 @@ def _toy_inputs(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def _write_predictions(
-    path: Path, degree_predictions: dict[str, float], *, fmt: str = "degree_predictions_v1"
+    path: Path,
+    degree_predictions: dict[str, float],
+    *,
+    fmt: str = "degree_predictions_v1",
+    variant: object = None,
 ) -> None:
+    """Write a ``degree_predictions_v1`` file. ``variant=None`` omits the key entirely."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"format": fmt, "degree_predictions": degree_predictions}), encoding="utf-8"
-    )
+    payload: dict[str, object] = {"format": fmt, "degree_predictions": degree_predictions}
+    if variant is not None:
+        payload["variant"] = variant
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _d(x: object) -> dict[str, Any]:
@@ -183,6 +190,37 @@ class TestLoadDegreePredictions:
         _write_predictions(path, {"a": 1.0, "z": 2.0})
         with pytest.raises(ValueError, match="node set mismatch"):
             s4.load_degree_predictions(path, ["a", "b"])
+
+
+class TestLoadDegreePredictionsVariant:
+    def test_valid_variant_returned(self, tmp_path: Path) -> None:
+        path = tmp_path / "predictions.json"
+        _write_predictions(path, {"a": 1.0}, variant="warm_s0")
+        assert s4.load_degree_predictions_variant(path) == "warm_s0"
+
+    def test_missing_variant_raises_with_path(self, tmp_path: Path) -> None:
+        path = tmp_path / "predictions.json"
+        _write_predictions(path, {"a": 1.0})
+        with pytest.raises(ValueError, match=re.escape(str(path))):
+            s4.load_degree_predictions_variant(path)
+
+    def test_empty_variant_raises_with_path(self, tmp_path: Path) -> None:
+        path = tmp_path / "predictions.json"
+        _write_predictions(path, {"a": 1.0}, variant="")
+        with pytest.raises(ValueError, match=re.escape(str(path))):
+            s4.load_degree_predictions_variant(path)
+
+    def test_blank_variant_raises_with_path(self, tmp_path: Path) -> None:
+        path = tmp_path / "predictions.json"
+        _write_predictions(path, {"a": 1.0}, variant="   ")
+        with pytest.raises(ValueError, match=re.escape(str(path))):
+            s4.load_degree_predictions_variant(path)
+
+    def test_non_string_variant_raises_with_path(self, tmp_path: Path) -> None:
+        path = tmp_path / "predictions.json"
+        _write_predictions(path, {"a": 1.0}, variant=123)
+        with pytest.raises(ValueError, match=re.escape(str(path))):
+            s4.load_degree_predictions_variant(path)
 
 
 class TestPredictedHardQuotas:
@@ -289,6 +327,7 @@ class TestRunS4PipelineNiceToy:
                 "n7": 0.2,
                 "n8": 0.2,
             },
+            variant="gnn_v1",
         )
         payload = s4.run_s4_pipeline(
             universe_path=universe_path,
@@ -324,7 +363,7 @@ class TestRunS4PipelineNiceToy:
         pred_path = tmp_path / "bad_predictions.json"
         bad = dict.fromkeys(_NODES[:-1], 1.0)
         bad["not_a_node"] = 1.0
-        _write_predictions(pred_path, bad)
+        _write_predictions(pred_path, bad, variant="mismatch_v1")
         with pytest.raises(ValueError, match="node set mismatch"):
             s4.run_s4_pipeline(
                 universe_path=universe_path,
@@ -336,12 +375,14 @@ class TestRunS4PipelineNiceToy:
             )
 
     def test_duplicate_variant_raises(self, tmp_path: Path) -> None:
+        # Different directories *and* different basenames -- the duplicate
+        # check must key off the payload's "variant" field, not the path.
         universe_path, data_root = _toy_inputs(tmp_path)
         predictions = dict.fromkeys(_NODES, 1.0)
-        path_a = tmp_path / "a" / "gnn.json"
-        path_b = tmp_path / "b" / "gnn.json"
-        _write_predictions(path_a, predictions)
-        _write_predictions(path_b, predictions)
+        path_a = tmp_path / "a" / "gnn_a.json"
+        path_b = tmp_path / "b" / "gnn_b.json"
+        _write_predictions(path_a, predictions, variant="gnn")
+        _write_predictions(path_b, predictions, variant="gnn")
         with pytest.raises(ValueError, match="duplicate"):
             s4.run_s4_pipeline(
                 universe_path=universe_path,
@@ -350,6 +391,47 @@ class TestRunS4PipelineNiceToy:
                 output_dir=tmp_path / "out",
                 seed=0,
                 degree_predictions_paths=[path_a, path_b],
+            )
+
+    def test_same_basename_different_variant_produces_two_arms(self, tmp_path: Path) -> None:
+        # Regression test for the P1 bug: S5's real output layout names every
+        # file "predictions.json" (outputs/s5_degree_probe/{warm,scratch}_s{seed}/
+        # predictions.json). Two such files, differing only by their payload's
+        # "variant" field, must produce two distinct arms and must not raise
+        # the duplicate-variant error.
+        universe_path, data_root = _toy_inputs(tmp_path)
+        predictions = dict.fromkeys(_NODES, 1.0)
+        path_warm = tmp_path / "warm_s0" / "predictions.json"
+        path_scratch = tmp_path / "scratch_s0" / "predictions.json"
+        _write_predictions(path_warm, predictions, variant="warm_s0")
+        _write_predictions(path_scratch, predictions, variant="scratch_s0")
+        payload = s4.run_s4_pipeline(
+            universe_path=universe_path,
+            data_root=data_root,
+            strategy="toy",
+            output_dir=tmp_path / "out",
+            seed=0,
+            degree_predictions_paths=[path_warm, path_scratch],
+        )
+        assembled = _d(payload["assembled"])
+        assert "predicted_hard_warm_s0" in assembled
+        assert "predicted_hard_scratch_s0" in assembled
+        sources = _d(_d(payload["metadata"])["degree_predictions_sources"])
+        assert sources == {"warm_s0": str(path_warm), "scratch_s0": str(path_scratch)}
+
+    def test_missing_variant_raises_with_path(self, tmp_path: Path) -> None:
+        universe_path, data_root = _toy_inputs(tmp_path)
+        predictions = dict.fromkeys(_NODES, 1.0)
+        pred_path = tmp_path / "predictions.json"
+        _write_predictions(pred_path, predictions)
+        with pytest.raises(ValueError, match=re.escape(str(pred_path))):
+            s4.run_s4_pipeline(
+                universe_path=universe_path,
+                data_root=data_root,
+                strategy="toy",
+                output_dir=tmp_path / "out",
+                seed=0,
+                degree_predictions_paths=[pred_path],
             )
 
     def test_byte_identical_reruns(self, tmp_path: Path) -> None:
