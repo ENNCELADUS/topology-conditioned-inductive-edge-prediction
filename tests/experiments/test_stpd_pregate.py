@@ -15,16 +15,23 @@ from src.data.features import FeatureStore
 from src.distill.heuristic_targets import heuristic_score
 from src.experiments.stpd_pregate import (
     PregateConfig,
+    PregateProbe,
     SwapProvenance,
     _stable_seed,
+    bucketed_macro,
     build_cell_context,
     build_pregate_corpus,
     corrupted_edges_of,
     load_pregate_corpus,
     pair_context_features,
+    paired_accuracy,
+    probe_pair_inputs,
     provenance_swaps,
+    quad_comparison_pairs,
     save_pregate_corpus,
     structure_scores,
+    train_probe,
+    trusted_rows,
 )
 
 pytestmark = pytest.mark.unit
@@ -448,3 +455,222 @@ def test_pair_context_features_masked_degree_zero_isolates_endpoint() -> None:
     mean_v = result[0, 4 + d : 4 + 2 * d]
     assert masked_deg_v.item() == pytest.approx(0.0, abs=1e-6)
     assert torch.allclose(mean_v, torch.zeros(d), atol=1e-6)
+
+
+# --------------------------------------------------------------------------- PregateProbe
+
+
+def test_pregate_probe_shape_and_dtype() -> None:
+    probe = PregateProbe(in_dim=10)
+    x = torch.randn(7, 10, dtype=torch.float32)
+    out = probe(x)
+    assert out.shape == (7,)
+    assert out.dtype == torch.float32
+
+
+# --------------------------------------------------------------------------- probe_pair_inputs
+
+
+def test_probe_pair_inputs_variant_p_shape_and_values() -> None:
+    d = 4
+    features = torch.arange(3 * d, dtype=torch.float32).reshape(3, d)
+    pairs = torch.tensor([[0, 1], [1, 2]], dtype=torch.long)
+    out = probe_pair_inputs(features, pairs, None)
+    assert out.shape == (2, 3 * d)
+
+    x_u, x_v = features[0], features[1]
+    expected_row0 = torch.cat([x_u + x_v, x_u * x_v, (x_u - x_v).abs()])
+    torch.testing.assert_close(out[0], expected_row0)
+
+
+def test_probe_pair_inputs_variant_s_concatenates_context() -> None:
+    n, corrupted_edges, prov, features = _corrupted_cell("probe-pair-inputs-s", d=4)
+    d = features.shape[1]
+    ctx = build_cell_context(n, corrupted_edges, features)
+    sample_pairs = _sample_pairs(prov, corrupted_edges)
+    pairs_tensor = torch.tensor(sample_pairs, dtype=torch.long)
+
+    out = probe_pair_inputs(features, pairs_tensor, ctx)
+    expected_ctx = pair_context_features(ctx, pairs_tensor)
+    assert out.shape == (len(sample_pairs), 3 * d + 4 + 2 * d)
+    torch.testing.assert_close(out[:, 3 * d :], expected_ctx)
+
+
+# --------------------------------------------------------------------------- trusted_rows
+
+
+def test_trusted_rows_labels_and_order() -> None:
+    _n, _corrupted_edges, prov, _features = _corrupted_cell("trusted-rows")
+    pairs, labels = trusted_rows(prov)
+
+    n_deleted = prov.deleted.shape[0]
+    n_inserted = prov.inserted.shape[0]
+    n_kept = prov.kept.shape[0]
+    assert pairs.shape == (n_deleted + n_inserted + n_kept, 2)
+    assert pairs.dtype == np.int64
+    assert labels.dtype == np.float32
+
+    np.testing.assert_array_equal(pairs[:n_deleted], prov.deleted)
+    np.testing.assert_array_equal(pairs[n_deleted : n_deleted + n_inserted], prov.inserted)
+    np.testing.assert_array_equal(pairs[n_deleted + n_inserted :], prov.kept)
+
+    assert np.all(labels[:n_deleted] == 1.0)
+    assert np.all(labels[n_deleted : n_deleted + n_inserted] == 0.0)
+    assert np.all(labels[n_deleted + n_inserted :] == 1.0)
+    assert int(np.sum(labels == 1.0)) == n_deleted + n_kept
+    assert int(np.sum(labels == 0.0)) == n_inserted
+
+
+# --------------------------------------------------------------------------- quad_comparison_pairs
+
+
+def test_quad_comparison_pairs_membership_and_shape() -> None:
+    _n, _corrupted_edges, prov, _features = _corrupted_cell("quad-comparison")
+    true_pairs, false_pairs = quad_comparison_pairs(prov)
+
+    s = prov.quads.shape[0]
+    assert true_pairs.shape == (2 * s, 2)
+    assert false_pairs.shape == (2 * s, 2)
+    assert true_pairs.dtype == np.int64
+    assert false_pairs.dtype == np.int64
+
+    deleted_set = _as_tuple_set(prov.deleted)
+    inserted_set = _as_tuple_set(prov.inserted)
+    for row in true_pairs:
+        assert (int(row[0]), int(row[1])) in deleted_set
+    for row in false_pairs:
+        assert (int(row[0]), int(row[1])) in inserted_set
+
+    # Exact per-quad reconstruction, aligned [A_0, B_0, A_1, B_1, ...].
+    for s_idx, (i, j, k, m) in enumerate(prov.quads.tolist()):
+        a_true = tuple(sorted((i, j)))
+        a_false = tuple(sorted((k, j)))
+        b_true = tuple(sorted((k, m)))
+        b_false = tuple(sorted((i, m)))
+        assert tuple(int(x) for x in true_pairs[2 * s_idx]) == a_true
+        assert tuple(int(x) for x in false_pairs[2 * s_idx]) == a_false
+        assert tuple(int(x) for x in true_pairs[2 * s_idx + 1]) == b_true
+        assert tuple(int(x) for x in false_pairs[2 * s_idx + 1]) == b_false
+
+
+# --------------------------------------------------------------------------- paired_accuracy
+
+
+def test_paired_accuracy_gt_eq_lt_mean() -> None:
+    scores_true = torch.tensor([1.0, 0.5, -1.0, 2.0], dtype=torch.float32)
+    scores_false = torch.tensor([0.0, 0.5, 1.0, 2.0], dtype=torch.float32)
+    # rows: > (1.0), == (0.5), < (0.0), == (0.5) -> mean 0.5
+    acc = paired_accuracy(scores_true, scores_false)
+    assert acc == pytest.approx(0.5)
+
+
+# --------------------------------------------------------------------------- bucketed_macro
+
+
+def test_bucketed_macro_bucket_and_macro_means() -> None:
+    per_cell = {
+        (0, "light"): 0.8,
+        (1, "light"): 0.6,
+        (2, "light"): 1.0,  # size 64 for light: mean(0.8, 0.6) = 0.7; size 32: 1.0
+        (3, "heavy"): 0.0,
+        (4, "heavy"): 0.5,  # size 32 for heavy: mean(0.0, 0.5) = 0.25
+    }
+    cell_size = {0: 64, 1: 64, 2: 32, 3: 32, 4: 32}
+    result = bucketed_macro(per_cell, cell_size)
+
+    assert result["light|64"] == pytest.approx(0.7)
+    assert result["light|32"] == pytest.approx(1.0)
+    assert result["heavy|32"] == pytest.approx(0.25)
+    # macro = unweighted mean over bucket values: (0.7 + 1.0 + 0.25) / 3
+    assert result["macro"] == pytest.approx((0.7 + 1.0 + 0.25) / 3)
+
+
+# --------------------------------------------------------------------------- train_probe
+
+
+@pytest.mark.parametrize("variant", ["p", "s"])
+def test_train_probe_smoke(
+    _pregate_setup: tuple[nx.Graph, FeatureStore, PregateConfig, Path],
+    tmp_path: Path,
+    variant: str,
+) -> None:
+    import dataclasses as dc
+
+    graph, store, cfg, cache_dir = _pregate_setup
+    cfg = dc.replace(cfg, epochs=2)
+    corpus = build_pregate_corpus(graph, store, cfg, cache_dir=cache_dir)
+
+    out_path = tmp_path / f"probe_{variant}.pt"
+    metrics_path = tmp_path / f"metrics_{variant}.jsonl"
+    result = train_probe(
+        corpus,
+        cfg,
+        variant=variant,
+        seed=0,
+        device=torch.device("cpu"),
+        out_path=out_path,
+        metrics_path=metrics_path,
+    )
+
+    assert 0.0 <= result["best_val_macro_paired_acc"] <= 1.0
+    assert result["best_epoch"] >= 1
+
+    lines = metrics_path.read_text().strip().splitlines()
+    assert len(lines) == 2
+    for line_num, line in enumerate(lines, start=1):
+        record = json.loads(line)
+        assert record["epoch"] == line_num
+        assert math.isfinite(record["train_loss"])
+        assert math.isfinite(record["val_loss"])
+        assert 0.0 <= record["val_macro_paired_acc"] <= 1.0
+
+    checkpoint = torch.load(out_path, map_location="cpu", weights_only=False)
+    for key in (
+        "model",
+        "config",
+        "variant",
+        "seed",
+        "in_dim",
+        "best_epoch",
+        "best_val_macro_paired_acc",
+    ):
+        assert key in checkpoint
+    assert checkpoint["variant"] == variant
+    assert checkpoint["seed"] == 0
+
+    probe = PregateProbe(in_dim=checkpoint["in_dim"])
+    probe.load_state_dict(checkpoint["model"])
+
+
+def test_train_probe_deterministic_same_seed(
+    _pregate_setup: tuple[nx.Graph, FeatureStore, PregateConfig, Path],
+    tmp_path: Path,
+) -> None:
+    import dataclasses as dc
+
+    graph, store, cfg, cache_dir = _pregate_setup
+    cfg = dc.replace(cfg, epochs=2)
+    corpus = build_pregate_corpus(graph, store, cfg, cache_dir=cache_dir)
+
+    metrics_a = tmp_path / "metrics_a.jsonl"
+    metrics_b = tmp_path / "metrics_b.jsonl"
+    train_probe(
+        corpus,
+        cfg,
+        variant="p",
+        seed=0,
+        device=torch.device("cpu"),
+        out_path=tmp_path / "probe_a.pt",
+        metrics_path=metrics_a,
+    )
+    train_probe(
+        corpus,
+        cfg,
+        variant="p",
+        seed=0,
+        device=torch.device("cpu"),
+        out_path=tmp_path / "probe_b.pt",
+        metrics_path=metrics_b,
+    )
+
+    assert metrics_a.read_text() == metrics_b.read_text()
