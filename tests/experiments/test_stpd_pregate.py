@@ -40,6 +40,7 @@ from src.experiments.stpd_pregate import (
     save_b0_scores,
     save_pregate_corpus,
     score_b0_pairs,
+    structure_degparity_score,
     structure_scores,
     train_probe,
     trusted_rows,
@@ -400,20 +401,26 @@ def test_pair_context_features_matches_naive_recompute() -> None:
 
     expected_rows = []
     for u, v in sample_pairs:
+        # Degree columns are UNMASKED (the queried edge is NOT removed for them) --
+        # under degree-preserving swap construction this equals the clean degree and
+        # carries no presence information. cn/ra/neighbor-mean still use the edge-removed
+        # (masked) graph.
+        deg_u = corrupted_graph.degree(u)
+        deg_v = corrupted_graph.degree(v)
         g = corrupted_graph.copy()
         if g.has_edge(u, v):
             g.remove_edge(u, v)
-        deg_u = g.degree(u)
-        deg_v = g.degree(v)
+        masked_deg_u = g.degree(u)
+        masked_deg_v = g.degree(v)
         common = set(nx.common_neighbors(g, u, v))
         cn = len(common)
         ra = sum(1.0 / g.degree(w) for w in common if g.degree(w) > 1)
-        if deg_u > 0:
-            mean_u = sum((features[w] for w in g.neighbors(u)), torch.zeros(d)) / deg_u
+        if masked_deg_u > 0:
+            mean_u = sum((features[w] for w in g.neighbors(u)), torch.zeros(d)) / masked_deg_u
         else:
             mean_u = torch.zeros(d)
-        if deg_v > 0:
-            mean_v = sum((features[w] for w in g.neighbors(v)), torch.zeros(d)) / deg_v
+        if masked_deg_v > 0:
+            mean_v = sum((features[w] for w in g.neighbors(v)), torch.zeros(d)) / masked_deg_v
         else:
             mean_v = torch.zeros(d)
         row = torch.cat(
@@ -450,8 +457,25 @@ def test_structure_scores_ra_matches_heuristic_targets_reference() -> None:
         assert ra_scores[row].item() == pytest.approx(expected_ra, abs=1e-5)
 
 
+def test_structure_degparity_score_matches_masked_degree_sum() -> None:
+    n, corrupted_edges, prov, features = _corrupted_cell("context-degparity", d=3)
+    ctx = build_cell_context(n, corrupted_edges, features)
+    sample_pairs = _sample_pairs(prov, corrupted_edges)
+    pairs_tensor = torch.tensor(sample_pairs, dtype=torch.long)
+
+    scores = structure_degparity_score(ctx, pairs_tensor)
+
+    for row, (u, v) in enumerate(sample_pairs):
+        edge_uv = 1.0 if ctx.adj[u, v] > 0 else 0.0
+        expected = math.log1p(ctx.deg[u].item() - edge_uv) + math.log1p(ctx.deg[v].item() - edge_uv)
+        assert scores[row].item() == pytest.approx(expected, abs=1e-5)
+
+
 def test_pair_context_features_masked_degree_zero_isolates_endpoint() -> None:
-    # Node 1's only edge is (0, 1): masking the queried pair isolates it.
+    # Node 1's only edge is (0, 1): masking the queried pair isolates it, so its
+    # leave-one-out neighbor mean is the zero vector. The degree column (col 1), by
+    # contrast, is now UNMASKED (F1's de-leak): it reports node 1's true degree (1),
+    # not 0.
     n = 4
     corrupted_edges = np.array([[0, 1], [0, 2], [0, 3], [2, 3]], dtype=np.int64)
     d = 3
@@ -462,9 +486,9 @@ def test_pair_context_features_masked_degree_zero_isolates_endpoint() -> None:
     pairs = torch.tensor([[0, 1]], dtype=torch.long)
     result = pair_context_features(ctx, pairs)
 
-    masked_deg_v = result[0, 1]
+    deg_v_unmasked = result[0, 1]
     mean_v = result[0, 4 + d : 4 + 2 * d]
-    assert masked_deg_v.item() == pytest.approx(0.0, abs=1e-6)
+    assert deg_v_unmasked.item() == pytest.approx(math.log1p(1), abs=1e-6)
     assert torch.allclose(mean_v, torch.zeros(d), atol=1e-6)
 
 
@@ -882,9 +906,8 @@ def _tiny_v3_1_config_for(input_dim: int) -> dict[str, object]:
     }
 
 
-@pytest.fixture
-def _pregate_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[PregateConfig, Path]:
-    """Cache + train a CPU-tiny end-to-end STPD pre-gate run; returns `(cfg, output_dir)`.
+def _pregate_e2e_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    """Shared CPU-tiny env for STPD pre-gate e2e tests: returns `(data_root, b0_checkpoint)`.
 
     `stpd_pregate._load_val_region_split` is monkeypatched to skip `load_benchmark`'s disk
     I/O, but the `ValRegionSplit` it returns is built by the REAL `derive_val_region_split`
@@ -913,6 +936,13 @@ def _pregate_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Prega
     _write_v3_1_checkpoint(
         checkpoint_path, model=b0_model, model_family="v3_1", model_config=_tiny_v3_1_config_for(8)
     )
+    return data_root, checkpoint_path
+
+
+@pytest.fixture
+def _pregate_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[PregateConfig, Path]:
+    """Cache + train a CPU-tiny end-to-end STPD pre-gate run; returns `(cfg, output_dir)`."""
+    data_root, checkpoint_path = _pregate_e2e_env(tmp_path, monkeypatch)
 
     cfg = PregateConfig(
         sizes=(12, 16),
@@ -936,7 +966,14 @@ def _pregate_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Prega
     return cfg, output_dir
 
 
-_ARM_NAMES = ("b0_frozen", "structure_ra", "structure_cn", "probe_p", "probe_s")
+_ARM_NAMES = (
+    "b0_frozen",
+    "structure_ra",
+    "structure_cn",
+    "structure_degparity",
+    "probe_p",
+    "probe_s",
+)
 
 
 def test_run_cache_train_eval_end_to_end(
@@ -957,7 +994,7 @@ def test_run_cache_train_eval_end_to_end(
     for arm_name in _ARM_NAMES:
         assert arm_name in arms
 
-    for arm_name in ("b0_frozen", "structure_ra", "structure_cn"):
+    for arm_name in ("b0_frozen", "structure_ra", "structure_cn", "structure_degparity"):
         entry = cast(dict[str, object], arms[arm_name])
         assert 0.0 <= cast(float, entry["macro"]) <= 1.0
         for value in cast(dict[str, float], entry["buckets"]).values():
@@ -977,8 +1014,8 @@ def test_run_cache_train_eval_end_to_end(
         "probe_s_moderate",
         "b0_moderate",
         "structure_ra_moderate",
-        "margin_vs_b0",
-        "margin_vs_structure",
+        "structure_degparity_moderate",
+        "margin_vs_best_control",
         "verdict",
     ):
         assert key in decision
@@ -1025,3 +1062,58 @@ def test_main_train_without_cache_errors(
         stpd_pregate.main(["--stage", "train", "--output-dir", str(empty_dir)])
     captured = capsys.readouterr()
     assert "cache" in captured.err
+
+
+def test_main_stage_all_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drives `main(["--stage", "all", ...])` through the real argv path, CPU-tiny.
+
+    `main` builds its own default `PregateConfig()` (no CLI flags for experiment
+    constants by design), so the module-level `PregateConfig` binding is monkeypatched to
+    a zero-arg factory returning a CPU-tiny config -- the minimal patch point that keeps
+    `main`'s own construction call (`cfg = PregateConfig()`) intact while making the run
+    tiny; no CLI config flags are added.
+    """
+    data_root, checkpoint_path = _pregate_e2e_env(tmp_path, monkeypatch)
+
+    def _tiny_cfg() -> PregateConfig:
+        return PregateConfig(
+            sizes=(12, 16),
+            per_size=4,
+            holdout_frac=0.25,
+            seeds=(0, 1),
+            salt="pregate-stage-all-cfg|",
+            epochs=2,
+        )
+
+    monkeypatch.setattr(stpd_pregate, "PregateConfig", _tiny_cfg)
+
+    output_dir = tmp_path / "out"
+    exit_code = stpd_pregate.main(
+        [
+            "--stage",
+            "all",
+            "--data-root",
+            str(data_root),
+            "--strategy",
+            "breadth_first",
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            "cpu",
+            "--b0-checkpoint",
+            str(checkpoint_path),
+        ]
+    )
+    assert exit_code == 0
+
+    report_path = output_dir / "report.json"
+    tables_path = output_dir / "tables.md"
+    assert report_path.exists()
+    assert tables_path.exists()
+
+    payload = json.loads(report_path.read_text())
+    decision = cast(dict[str, object], payload["decision"])
+    assert decision["verdict"] in ("edge_identity_supported", "edge_identity_killed")
+    arms = cast(dict[str, object], payload["arms"])
+    for arm_name in _ARM_NAMES:
+        assert arm_name in arms

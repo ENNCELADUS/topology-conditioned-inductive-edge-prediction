@@ -357,15 +357,23 @@ def build_cell_context(
 
 
 def pair_context_features(ctx: CellContext, pairs: torch.Tensor) -> torch.Tensor:
-    """Per-pair masked structural context features, the queried edge removed first.
+    """Per-pair structural context features: unmasked degree, masked cn/ra/neighbor-mean.
+
+    The degree scalars are deliberately UNMASKED: under this experiment's
+    degree-preserving swap construction the corrupted-graph degree already equals the
+    clean degree, so masking it (as an earlier version did) only encoded whether the
+    queried pair is a live edge -- a presence-parity leak, not structural evidence. `cn`
+    and `ra` are unmasked-equal by construction (see `CellContext`'s docstring) and need
+    no correction; only the neighbor-mean blocks keep the leave-one-out masking, since
+    those genuinely change when the partner feature is excluded.
 
     Args:
         ctx: A cell's precomputed `CellContext`.
         pairs: `(P, 2)` int64 local `(u, v)` indices.
 
     Returns:
-        `(P, 4 + 2d)` fp32: `log1p(masked_deg_u)`, `log1p(masked_deg_v)`,
-        `log1p(cn[u,v])`, `ra[u,v]`, masked neighbor-feature mean of `u`, then of `v`.
+        `(P, 4 + 2d)` fp32: `log1p(deg[u])`, `log1p(deg[v])` (unmasked), `log1p(cn[u,v])`,
+        `ra[u,v]`, masked (leave-one-out) neighbor-feature mean of `u`, then of `v`.
     """
     u, v = pairs[:, 0], pairs[:, 1]
     edge_uv = ctx.adj[u, v]
@@ -379,8 +387,8 @@ def pair_context_features(ctx: CellContext, pairs: torch.Tensor) -> torch.Tensor
 
     return torch.cat(
         [
-            torch.log1p(masked_deg_u).unsqueeze(1),
-            torch.log1p(masked_deg_v).unsqueeze(1),
+            torch.log1p(ctx.deg[u]).unsqueeze(1),
+            torch.log1p(ctx.deg[v]).unsqueeze(1),
             torch.log1p(ctx.cn[u, v]).unsqueeze(1),
             ctx.ra[u, v].unsqueeze(1),
             mean_u,
@@ -402,6 +410,29 @@ def structure_scores(ctx: CellContext, pairs: torch.Tensor) -> tuple[torch.Tenso
     """
     u, v = pairs[:, 0], pairs[:, 1]
     return ctx.ra[u, v], ctx.cn[u, v]
+
+
+def structure_degparity_score(ctx: CellContext, pairs: torch.Tensor) -> torch.Tensor:
+    """Degree-parity control-arm score: reproduces the F1 masked-degree leak channel.
+
+    `log1p(masked_deg_u) + log1p(masked_deg_v)` with `masked_deg = deg - A[u,v]` -- the
+    exact presence-parity signal `pair_context_features` used to leak (true comparison
+    pairs are absent from the corrupted graph so their masking is a no-op; false pairs
+    are present so both endpoints are decremented). Reported as `structure_degparity` so
+    the decision rule can bound `probe_s` against this channel directly.
+
+    Args:
+        ctx: A cell's precomputed `CellContext`.
+        pairs: `(P, 2)` int64 local `(u, v)` indices.
+
+    Returns:
+        `(P,)` fp32 scores.
+    """
+    u, v = pairs[:, 0], pairs[:, 1]
+    edge_uv = ctx.adj[u, v]
+    masked_deg_u = ctx.deg[u] - edge_uv
+    masked_deg_v = ctx.deg[v] - edge_uv
+    return torch.log1p(masked_deg_u) + torch.log1p(masked_deg_v)
 
 
 def save_pregate_corpus(corpus: PregateCorpus, path: Path) -> None:
@@ -584,18 +615,6 @@ def _append_jsonl(path: Path, record: dict[str, object]) -> None:
         handle.write(json.dumps(record) + "\n")
 
 
-def _context_to_device(ctx: CellContext, device: torch.device) -> CellContext:
-    """Move every `CellContext` tensor field to `device` (a no-op when already there)."""
-    return CellContext(
-        features=ctx.features.to(device),
-        adj=ctx.adj.to(device),
-        deg=ctx.deg.to(device),
-        nbr_sum=ctx.nbr_sum.to(device),
-        cn=ctx.cn.to(device),
-        ra=ctx.ra.to(device),
-    )
-
-
 def train_probe(
     corpus: PregateCorpus,
     cfg: PregateConfig,
@@ -611,18 +630,20 @@ def train_probe(
     Every (region, severity) provenance cell whose region is in `corpus.regions.train_idx`
     is a training cell; cells in `val_idx` are validation cells. All trusted-row inputs
     and labels (both splits) and all validation comparison-pair inputs are precomputed
-    once, fp32 on `device`, before the epoch loop -- `CellContext` (variant "s" only) is
-    built on CPU (its internals are unconditionally CPU-constructed) then moved to
-    `device` as a whole.
+    once, fp32, and held entirely on CPU -- at production scale (1800 cells x ~590 edges
+    x 7684 fp32) a device-resident cache would be tens of GB; instead each chunk's
+    concatenated tensors move to `device` just-in-time inside the epoch loop, and nothing
+    cell-sized persists on GPU.
 
     An epoch is one shuffled pass over training cells, one `AdamW` step per chunk of
     `cfg.regions_per_step` cells (loss = `BCEWithLogitsLoss` over the chunk's
     concatenated trusted rows, `pos_weight` fixed for the whole run from every training
     cell's trusted-label class balance). After each epoch, validation trusted-row loss
-    (one pass over every validation cell's concatenated rows) and validation macro
-    paired accuracy (`bucketed_macro` over every validation cell's `paired_accuracy`)
-    are logged to `metrics_path`; the state dict with the best validation macro paired
-    accuracy is kept (ties -> earliest epoch) and saved to `out_path`.
+    and validation macro paired accuracy (`bucketed_macro` over every validation cell's
+    `paired_accuracy`) are computed one validation cell at a time (each cell's cached
+    CPU tensors moved to `device` just-in-time) and logged to `metrics_path`; the state
+    dict with the best validation macro paired accuracy is kept (ties -> earliest epoch)
+    and saved to `out_path`.
 
     Args:
         corpus: The swap-corrupted region corpus.
@@ -638,8 +659,9 @@ def train_probe(
         `{"best_epoch": ..., "best_val_macro_paired_acc": ...}`.
 
     Raises:
-        RuntimeError: If an epoch's aggregate training or validation trusted-row loss
-            is non-finite.
+        RuntimeError: If there are no validation cells, if an epoch's aggregate
+            training or validation trusted-row loss is non-finite, or if every epoch's
+            validation macro paired accuracy is `NaN` (no usable epoch to select).
     """
     torch.manual_seed(_stable_seed(cfg.salt, "train", variant, str(seed)))
     shuffle_rng = np.random.default_rng(_stable_seed(cfg.salt, "shuffle", variant, str(seed)))
@@ -648,6 +670,8 @@ def train_probe(
     val_idx_set = set(corpus.regions.val_idx)
     train_cells = sorted(key for key in corpus.provenance if key[0] in train_idx_set)
     val_cells = sorted(key for key in corpus.provenance if key[0] in val_idx_set)
+    if not val_cells:
+        raise RuntimeError("no validation cells")
     cell_size = {idx: len(region) for idx, region in enumerate(corpus.regions.regions)}
 
     trusted_cache: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
@@ -663,24 +687,21 @@ def train_probe(
 
         ctx: CellContext | None = None
         if variant == "s":
-            ctx_cpu = build_cell_context(n, corrupted_edges_of(prov), local_features)
-            ctx = _context_to_device(ctx_cpu, device)
-
-        features_device = local_features.to(device)
+            ctx = build_cell_context(n, corrupted_edges_of(prov), local_features)
 
         pairs_np, labels_np = trusted_rows(prov)
-        pairs_t = torch.from_numpy(pairs_np).to(device)
-        labels_t = torch.from_numpy(labels_np).to(device)
-        inputs = probe_pair_inputs(features_device, pairs_t, ctx)
+        pairs_t = torch.from_numpy(pairs_np)
+        labels_t = torch.from_numpy(labels_np)
+        inputs = probe_pair_inputs(local_features, pairs_t, ctx)
         trusted_cache[key] = (inputs, labels_t)
 
         if key in val_cell_set:
             true_np, false_np = quad_comparison_pairs(prov)
-            true_t = torch.from_numpy(true_np).to(device)
-            false_t = torch.from_numpy(false_np).to(device)
+            true_t = torch.from_numpy(true_np)
+            false_t = torch.from_numpy(false_np)
             comparison_cache[key] = (
-                probe_pair_inputs(features_device, true_t, ctx),
-                probe_pair_inputs(features_device, false_t, ctx),
+                probe_pair_inputs(local_features, true_t, ctx),
+                probe_pair_inputs(local_features, false_t, ctx),
             )
 
     in_dim = next(iter(trusted_cache.values()))[0].shape[1]
@@ -704,8 +725,8 @@ def train_probe(
         chunk_losses: list[tuple[float, int]] = []
         for start in range(0, len(shuffled), cfg.regions_per_step):
             chunk = shuffled[start : start + cfg.regions_per_step]
-            inputs = torch.cat([trusted_cache[key][0] for key in chunk], dim=0)
-            labels = torch.cat([trusted_cache[key][1] for key in chunk], dim=0)
+            inputs = torch.cat([trusted_cache[key][0] for key in chunk], dim=0).to(device)
+            labels = torch.cat([trusted_cache[key][1] for key in chunk], dim=0).to(device)
 
             optimizer.zero_grad(set_to_none=True)
             logits = model(inputs)
@@ -728,14 +749,21 @@ def train_probe(
 
         model.eval()
         with torch.no_grad():
-            val_inputs = torch.cat([trusted_cache[key][0] for key in val_cells], dim=0)
-            val_labels = torch.cat([trusted_cache[key][1] for key in val_cells], dim=0)
-            val_loss = float(criterion(model(val_inputs), val_labels))
-
+            val_loss_sum = 0.0
+            val_row_count = 0
             per_cell: dict[tuple[int, str], float] = {}
             for key in val_cells:
+                cell_inputs = trusted_cache[key][0].to(device)
+                cell_labels = trusted_cache[key][1].to(device)
+                cell_loss = float(criterion(model(cell_inputs), cell_labels))
+                val_loss_sum += cell_loss * cell_labels.shape[0]
+                val_row_count += cell_labels.shape[0]
+
                 true_inputs, false_inputs = comparison_cache[key]
-                per_cell[key] = paired_accuracy(model(true_inputs), model(false_inputs))
+                per_cell[key] = paired_accuracy(
+                    model(true_inputs.to(device)), model(false_inputs.to(device))
+                )
+            val_loss = val_loss_sum / val_row_count
 
         if not math.isfinite(val_loss):
             raise RuntimeError(f"non-finite val loss: variant={variant} epoch={epoch}")
@@ -756,6 +784,9 @@ def train_probe(
             best_val_macro = val_macro
             best_epoch = epoch
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    if best_state is None:
+        raise RuntimeError("no usable epochs — all-NaN selection metric")
 
     torch.save(
         {
@@ -1117,7 +1148,7 @@ def _mean_sd_over_seeds(
         "macro": float(np.mean(macros)),
         "auroc_trusted": float(np.mean(aurocs)),
     }
-    sd = {"macro": float(np.std(macros))}
+    sd = {"macro": float(np.std(macros, ddof=1))}
     return mean, sd
 
 
@@ -1159,6 +1190,7 @@ def run_eval(cfg: PregateConfig, *, output_dir: Path) -> dict[str, object]:
     per_cell_b0: dict[tuple[int, str], float] = {}
     per_cell_structure_ra: dict[tuple[int, str], float] = {}
     per_cell_structure_cn: dict[tuple[int, str], float] = {}
+    per_cell_structure_degparity: dict[tuple[int, str], float] = {}
     per_cell_probe: dict[tuple[str, int], dict[tuple[int, str], float]] = {
         (variant, seed): {} for variant in ("p", "s") for seed in cfg.seeds
     }
@@ -1166,6 +1198,7 @@ def run_eval(cfg: PregateConfig, *, output_dir: Path) -> dict[str, object]:
     trusted_labels_parts: list[NDArray[np.float32]] = []
     trusted_ra_parts: list[NDArray[np.float32]] = []
     trusted_cn_parts: list[NDArray[np.float32]] = []
+    trusted_degparity_parts: list[NDArray[np.float32]] = []
     trusted_probe_parts: dict[tuple[str, int], list[NDArray[np.float32]]] = {
         (variant, seed): [] for variant in ("p", "s") for seed in cfg.seeds
     }
@@ -1193,6 +1226,9 @@ def run_eval(cfg: PregateConfig, *, output_dir: Path) -> dict[str, object]:
             ra_false, cn_false = structure_scores(ctx, false_pairs_t)
             per_cell_structure_ra[key] = paired_accuracy(ra_true, ra_false)
             per_cell_structure_cn[key] = paired_accuracy(cn_true, cn_false)
+            degparity_true = structure_degparity_score(ctx, true_pairs_t)
+            degparity_false = structure_degparity_score(ctx, false_pairs_t)
+            per_cell_structure_degparity[key] = paired_accuracy(degparity_true, degparity_false)
 
             inputs_p_true = probe_pair_inputs(features, true_pairs_t, None)
             inputs_p_false = probe_pair_inputs(features, false_pairs_t, None)
@@ -1213,6 +1249,7 @@ def run_eval(cfg: PregateConfig, *, output_dir: Path) -> dict[str, object]:
             ra_trusted, cn_trusted = structure_scores(ctx, trusted_pairs_t)
             trusted_ra_parts.append(ra_trusted.numpy())
             trusted_cn_parts.append(cn_trusted.numpy())
+            trusted_degparity_parts.append(structure_degparity_score(ctx, trusted_pairs_t).numpy())
 
             inputs_p_trusted = probe_pair_inputs(features, trusted_pairs_t, None)
             inputs_s_trusted = probe_pair_inputs(features, trusted_pairs_t, ctx)
@@ -1223,6 +1260,7 @@ def run_eval(cfg: PregateConfig, *, output_dir: Path) -> dict[str, object]:
     trusted_labels = np.concatenate(trusted_labels_parts)
     auroc_structure_ra = _auroc(np.concatenate(trusted_ra_parts), trusted_labels)
     auroc_structure_cn = _auroc(np.concatenate(trusted_cn_parts), trusted_labels)
+    auroc_structure_degparity = _auroc(np.concatenate(trusted_degparity_parts), trusted_labels)
     auroc_probe = {
         key: _auroc(np.concatenate(parts), trusted_labels)
         for key, parts in trusted_probe_parts.items()
@@ -1235,6 +1273,9 @@ def run_eval(cfg: PregateConfig, *, output_dir: Path) -> dict[str, object]:
         ),
         "structure_cn": _arm_block(
             per_cell_structure_cn, cell_size, severities, auroc_structure_cn
+        ),
+        "structure_degparity": _arm_block(
+            per_cell_structure_degparity, cell_size, severities, auroc_structure_degparity
         ),
     }
     for variant in ("p", "s"):
@@ -1250,24 +1291,25 @@ def run_eval(cfg: PregateConfig, *, output_dir: Path) -> dict[str, object]:
     probe_s_moderate = cast(dict[str, float], arms["probe_s"]["mean"]["per_severity"])["moderate"]
     b0_moderate = cast(dict[str, float], arms["b0_frozen"]["per_severity"])["moderate"]
     structure_ra_moderate = cast(dict[str, float], arms["structure_ra"]["per_severity"])["moderate"]
-    margin_vs_b0 = probe_s_moderate - b0_moderate
-    margin_vs_structure = probe_s_moderate - structure_ra_moderate
+    structure_degparity_moderate = cast(
+        dict[str, float], arms["structure_degparity"]["per_severity"]
+    )["moderate"]
+    best_control = max(b0_moderate, structure_ra_moderate, structure_degparity_moderate)
+    margin_vs_best_control = probe_s_moderate - best_control
     verdict = (
-        "edge_identity_supported"
-        if margin_vs_b0 >= 0.03 and margin_vs_structure >= 0.03
-        else "edge_identity_killed"
+        "edge_identity_supported" if margin_vs_best_control >= 0.03 else "edge_identity_killed"
     )
     decision = {
         "rule": (
             "probe_s (seed-mean, moderate severity, size-macro over held-out regions) must "
-            "exceed BOTH b0_frozen and structure_ra by >= 0.03 paired accuracy"
+            "exceed max(b0_frozen, structure_ra, structure_degparity) by >= 0.03 paired accuracy"
         ),
         "margin": 0.03,
         "probe_s_moderate": probe_s_moderate,
         "b0_moderate": b0_moderate,
         "structure_ra_moderate": structure_ra_moderate,
-        "margin_vs_b0": margin_vs_b0,
-        "margin_vs_structure": margin_vs_structure,
+        "structure_degparity_moderate": structure_degparity_moderate,
+        "margin_vs_best_control": margin_vs_best_control,
         "verdict": verdict,
     }
 
@@ -1289,6 +1331,12 @@ def run_eval(cfg: PregateConfig, *, output_dir: Path) -> dict[str, object]:
             "the probes, so a kill verdict is conservative"
         ),
         "auroc_note": "b0_frozen has no trusted-row AUROC (scored on comparison pairs only)",
+        "degree_note": (
+            "probe_s degree scalars are unmasked corrupted-graph degrees "
+            "(degree-preserved by swap construction); neighbor-mean blocks keep "
+            "leave-one-out masking and carry a second-order presence residue; "
+            "structure_degparity controls the masked-degree parity channel directly"
+        ),
         "vval_note": (
             "synthetic inserted pairs may coincide with quarantined V_val-internal pairs; "
             "their labels derive from insertion provenance, never from V_val truth"
@@ -1314,7 +1362,14 @@ def _fmt(value: float | None) -> str:
     return f"{value:.6g}"
 
 
-_ARM_NAMES: tuple[str, ...] = ("b0_frozen", "structure_ra", "structure_cn", "probe_p", "probe_s")
+_ARM_NAMES: tuple[str, ...] = (
+    "b0_frozen",
+    "structure_ra",
+    "structure_cn",
+    "structure_degparity",
+    "probe_p",
+    "probe_s",
+)
 
 
 def _arm_per_severity(entry: dict[str, Any]) -> dict[str, float]:
@@ -1411,8 +1466,10 @@ def render_tables_markdown(payload: dict[str, object]) -> str:
     lines.append(f"- probe_s_moderate: {_fmt(decision['probe_s_moderate'])}")
     lines.append(f"- b0_moderate: {_fmt(decision['b0_moderate'])}")
     lines.append(f"- structure_ra_moderate: {_fmt(decision['structure_ra_moderate'])}")
-    lines.append(f"- margin_vs_b0: {_fmt(decision['margin_vs_b0'])}")
-    lines.append(f"- margin_vs_structure: {_fmt(decision['margin_vs_structure'])}")
+    lines.append(
+        f"- structure_degparity_moderate: {_fmt(decision['structure_degparity_moderate'])}"
+    )
+    lines.append(f"- margin_vs_best_control: {_fmt(decision['margin_vs_best_control'])}")
     lines.append(f"- verdict: {decision['verdict']}")
     lines.append("")
 
@@ -1480,6 +1537,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             _require(output_dir / "corpus.pt", parser, prereq_stage="cache")
             _require(output_dir / "b0_scores.npz", parser, prereq_stage="cache")
+            _require(output_dir / "cache_meta.json", parser, prereq_stage="cache")
             for variant in ("p", "s"):
                 for seed in cfg.seeds:
                     _require(
