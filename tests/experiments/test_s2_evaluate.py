@@ -488,7 +488,6 @@ def test_run_s2_eval_end_to_end_and_deterministic(tmp_path: Path) -> None:
         "flow_steps": 4,
         "seed": 0,
         "device": "cpu",
-        "full_region": True,
     }
 
     payload1 = s2eval.run_s2_eval(**kwargs)  # type: ignore[arg-type]
@@ -499,16 +498,24 @@ def test_run_s2_eval_end_to_end_and_deterministic(tmp_path: Path) -> None:
     assert isinstance(arms1, dict)
     for arm_name in ("gen", "unc", "shuf", "det", "ae", "b0", "marg"):
         assert arm_name in arms1
+        entry = arms1[arm_name]
+        assert isinstance(entry, dict)
+        assert "mmd_t05" in entry
+        assert "mmd_t05_macro" in entry
     for arm_name in ("gen", "unc", "shuf"):
         entry = arms1[arm_name]
         assert isinstance(entry, dict)
         assert "coherence" in entry
-    assert "full_region" in payload1
-    full_region = payload1["full_region"]
-    assert isinstance(full_region, dict)
-    ae_block = full_region["ae"]
-    assert isinstance(ae_block, dict)
-    assert ae_block["skipped"] is True
+
+    # The fixed-0.5 readout is defined for every threshold-assembled arm and
+    # disclosed-absent for the quota-assembled MARG arm.
+    gen_macro = arms1["gen"]["macro"]
+    assert gen_macro["gs_t05"] is not None
+    assert gen_macro["rd_t05"] is not None
+    marg_macro = arms1["marg"]["macro"]
+    assert marg_macro["gs_t05"] is None
+    assert marg_macro["rd_t05"] is None
+    assert all(value is None for value in arms1["marg"]["mmd_t05_macro"].values())
 
     _assert_finite_or_none(payload1)
 
@@ -531,14 +538,12 @@ def test_run_s2_eval_without_b0_or_marg_omits_those_arms(tmp_path: Path) -> None
         flow_steps=2,
         seed=1,
         device="cpu",
-        full_region=False,
     )
 
     arms = payload["arms"]
     assert isinstance(arms, dict)
     assert "b0" not in arms
     assert "marg" not in arms
-    assert "full_region" not in payload
     _assert_finite_or_none(payload)
 
 
@@ -558,7 +563,6 @@ def test_render_tables_markdown_contains_every_arm_name(tmp_path: Path) -> None:
         flow_steps=2,
         seed=2,
         device="cpu",
-        full_region=True,
     )
 
     markdown = s2eval.render_tables_markdown(payload)

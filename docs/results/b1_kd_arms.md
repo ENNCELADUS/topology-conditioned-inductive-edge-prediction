@@ -30,8 +30,9 @@ those rows; the row identity never changes, which is what makes all eight arms c
 
 Two stages are reported: **v2** (`outputs/b1_stage_v2/`, 2026-08-16/17 — control, D1, D2, D3) and
 **v3** (`outputs/b1_stage_v3/`, 2026-08-17/18 — D4, D5, D6, D7a), ~2.5 GPU-h each, serial on the
-4-GPU H20 container. An earlier `outputs/b1_stage/` (2026-08-14) predates the V_val split and the v2
-teacher stream and is superseded, not quoted here.
+4-GPU H20 container; both tables re-verified against their `test_report.json` on 2026-08-18. An
+earlier `outputs/b1_stage/` (2026-08-14) predates the V_val split and the v2 teacher stream and is
+superseded, not quoted here.
 
 ## Arms — mechanism, source, and gate
 
@@ -166,9 +167,11 @@ failing to refute it.
   a dead Gram term. Calibrated pointwise accuracy and relational geometry cannot be bought together
   at this recipe, and the listwise objective wins. A paper finding, not a failed run — but it removes
   the "one student wins both reporting families" option.
-- **C2 (no KD class moves edge-set identity) → confirmed.** GS-BFS across all eight arms spans
-  0.4099–0.4192 (control 0.4175); GS-global spans 0.1734–0.1886 (control 0.1864). Five mechanism
-  families move ECE by 0.27 and MMD-degree by 1.7×, and edge-set identity by nothing.
+- **C2 (no KD class moves edge-set identity) → confirmed, and not KD-specific.** GS-BFS across all
+  eight arms spans 0.4099–0.4192 (control 0.4175); GS-global spans 0.1734–0.1886 (control 0.1864).
+  Five mechanism families move ECE by 0.27 and MMD-degree by 1.7×, and edge-set identity by nothing.
+  S3's set-conditioned residual leaves GS equally inert on its own harness (0.282 → 0.287–0.291), so
+  this is a property of the task under these features, not of the KD family.
 - **Mechanism split (the v2 finding, now with v3 evidence).** Output-level KD (D1/D2/D7a) moves
   AUROC/AUPRC/ECE; relational geometry KD (D3, and D5 by proxy) moves MMD ratios and RD-BFS;
   representation alignment (D4) interpolates without adding a mechanism. D1 is the only arm that
@@ -176,9 +179,13 @@ failing to refute it.
 
 ## Caveats and open work
 
-- **Single seed.** Everything above is seed 0. The D1/D4/D5/D6 AUPRC spread is ~0.001 — inside
-  plausible seed noise. Only the ECE and MMD effects are large enough to survive an error bar by
-  inspection. M4 (seeds 1–2 for control, D2, D3, and one v3 arm) remains TODO.
+- **Single seed — and seed noise now has a measured scale.** Everything above is seed 0; the
+  D1/D4/D5/D6 AUPRC spread is ~0.001. S3 (`s2_set_generation.md`), 3 seeds per arm on the same
+  benchmark and the same v3.1-era machinery, spans 0.0093 AUPRC at fixed config on its readout.
+  That is a different metric, so it is not a transferable error bar — but it is the first direct
+  evidence that run-to-run noise on this machinery is the size of this table's whole arm-to-arm
+  AUPRC range (0.7448–0.7484). Only the ECE and MMD effects survive an error bar by inspection.
+  M4 (seeds 1–2 for control, D2, D3, and one v3 arm) is now the highest-value open item.
 - **No v3 control.** All v3 deltas are against `b1_stage_v2/kd_control`. Checkpoint selection changed
   between the stages (commit `9da2ae7`, ball-union V_val scoring), which affects which epoch is
   published, not the test protocol — a comparability caveat for any quoted delta.

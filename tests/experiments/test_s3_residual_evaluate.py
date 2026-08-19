@@ -451,7 +451,6 @@ def test_run_s3_eval_zero_init_sanity_passes(tmp_path: Path) -> None:
         device="cpu",
         shuf=False,
         sanity_zero_init=True,
-        full_region=False,
     )
 
     assert payload["sanity_zero_init"]["ran"] is True
@@ -504,7 +503,6 @@ def test_run_s3_eval_zero_init_sanity_raises_on_violation(
             device="cpu",
             shuf=False,
             sanity_zero_init=True,
-            full_region=False,
         )
 
 
@@ -528,7 +526,6 @@ def test_run_s3_eval_pair_mode_shuf_equals_model_since_x_set_is_ignored(tmp_path
         device="cpu",
         shuf=True,
         sanity_zero_init=False,
-        full_region=False,
     )
 
     model_macro = payload["arms"]["model"]["macro"]
@@ -589,13 +586,12 @@ def test_run_s3_eval_reports_missing_pairs_and_excludes_from_auprc(tmp_path: Pat
         device="cpu",
         shuf=False,
         sanity_zero_init=False,
-        full_region=False,
     )
 
     assert payload["meta"]["missing_pairs_total"] > 0
 
 
-def test_run_s3_eval_full_region_reports_five_numbers(tmp_path: Path) -> None:
+def test_run_s3_eval_reports_fixed_threshold_readouts_per_set(tmp_path: Path) -> None:
     b0_path = _write_b0_universe(tmp_path, NODES)
     ctx = _build_context(tmp_path, b0_path)
     from src.score_universe import load_scores
@@ -615,15 +611,13 @@ def test_run_s3_eval_full_region_reports_five_numbers(tmp_path: Path) -> None:
         device="cpu",
         shuf=False,
         sanity_zero_init=False,
-        full_region=True,
     )
 
-    full = payload["full_region"]
+    assert "full_region" not in payload
     for arm_name in ("b0", "model"):
-        block = full[arm_name]
-        assert "gs_bfs_macro" in block
-        assert "rd_bfs_macro" in block
-        assert set(block["mmd_ratio"]) == {"degree", "clustering", "spectral"}
+        macro = payload["arms"][arm_name]["macro"]
+        assert macro["gs_t05"] is not None
+        assert macro["rd_t05"] is not None
 
 
 def test_run_s3_eval_deterministic_given_same_seed(tmp_path: Path) -> None:
@@ -646,7 +640,6 @@ def test_run_s3_eval_deterministic_given_same_seed(tmp_path: Path) -> None:
         device="cpu",
         shuf=True,
         sanity_zero_init=False,
-        full_region=False,
     )
     payload2 = s3eval.run_s3_eval(
         ctx=ctx,
@@ -657,7 +650,6 @@ def test_run_s3_eval_deterministic_given_same_seed(tmp_path: Path) -> None:
         device="cpu",
         shuf=True,
         sanity_zero_init=False,
-        full_region=False,
     )
 
     assert json.dumps(payload1, sort_keys=True) == json.dumps(payload2, sort_keys=True)
@@ -696,7 +688,6 @@ def test_run_s3_eval_requires_b0_lookup(tmp_path: Path) -> None:
             device="cpu",
             shuf=False,
             sanity_zero_init=False,
-            full_region=False,
         )
     assert ctx_with_b0.b0_lookup is not None  # sanity: the "with b0" context is usable
 

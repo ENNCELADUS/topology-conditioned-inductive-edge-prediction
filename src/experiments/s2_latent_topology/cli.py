@@ -248,7 +248,6 @@ def _stage_eval(
         flow_steps=args.flow_steps,
         seed=args.seed,
         device=args.device,
-        full_region=args.full_region,
     )
     meta = cast(dict[str, object], payload["meta"])
     meta["evidence_class"] = "diagnostic"
@@ -285,7 +284,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--k-draws", type=int, default=32)
     parser.add_argument("--flow-steps", type=int, default=32)
     parser.add_argument("--b0-universe", type=Path, default=None)
-    parser.add_argument("--full-region", action="store_true")
 
     parser.add_argument("--ae-epochs", type=int, default=30)
     parser.add_argument("--prior-epochs", type=int, default=60)

@@ -7,9 +7,12 @@ output) and scores seven arms -- GEN (features-only prior sample), UNC
 (deterministic features-only regressor), AE (encode-then-decode latent ceiling),
 B0 (a frozen classification baseline, if supplied), and MARG (a strictly
 per-node degree baseline, if a B0 artifact and `marg.pt` are supplied) -- over
-every `test_node_buckets.pkl` node set, plus an optional full-test-region pass.
+every `test_node_buckets.pkl` node set. The protocol forwards each 20-200-node
+sampled set on its own; the full test region is never forwarded (set models are
+trained on 20-200-node sets, so a whole-region pass is out of distribution).
 Every readout is edge-level (AUPRC), assembled-graph (GS/RD/MMD-ratio degree,
-clustering, spectral), or degree-alignment (Spearman, hub recall) -- reusing
+clustering, spectral, each at the per-set density-matched threshold and again
+at the fixed threshold 0.5), or degree-alignment (Spearman, hub recall) -- reusing
 `src.eval.graph_metrics`/`src.eval.assembly` throughout rather than
 reimplementing the canonical evaluator.
 
@@ -43,7 +46,6 @@ from src.eval.graph_metrics import (
     compute_graph_similarity,
     compute_relative_density,
     degree_histogram,
-    evaluate_assembled_graph_with_reference,
     laplacian_spectrum_histogram,
     mmd_squared,
     precompute_bucket_reference,
@@ -73,7 +75,12 @@ _METRICS: tuple[str, ...] = (
     "auprc",
     "free_density_expected",
     "free_density_hard",
+    # Fixed-threshold-0.5 readouts appended last so every pre-existing
+    # metric keeps its bootstrap `metric_code` (enumeration order).
+    "gs_t05",
+    "rd_t05",
 )
+_T05_THRESHOLD = 0.5
 _METRIC_CODES: dict[str, int] = {name: code + 1 for code, name in enumerate(_METRICS)}
 _STOCHASTIC_OFFSETS: dict[str, int] = {"gen": 11, "unc": 12, "shuf": 13}
 
@@ -125,7 +132,7 @@ def build_eval_context(
         cache_dir: Directory the F0 feature cache is written to.
         b0_universe: Optional B0 candidate-universe scores `.npz` artifact,
             validated via `validate_artifact_precision`; `None` disables the
-            B0, MARG, and full-region-B0 arms.
+            B0 and MARG arms.
 
     Returns:
         The `EvalContext`.
@@ -463,7 +470,10 @@ class _SetReadout:
             `None` for a single-class set.
         free_density_expected: `sum(probs) / target_edges`.
         free_density_hard: `(probs >= 0.5).sum() / target_edges`.
+        gs_t05: Per-subgraph graph similarity of the fixed-threshold-0.5 graph.
+        rd_t05: Per-subgraph relative density of the fixed-threshold-0.5 graph.
         g_pred: The density-matched assembled graph.
+        g_pred_t05: The fixed-threshold-0.5 assembled graph.
     """
 
     gs: float
@@ -473,7 +483,10 @@ class _SetReadout:
     auprc: float | None
     free_density_expected: float
     free_density_hard: float
+    gs_t05: float
+    rd_t05: float
     g_pred: nx.Graph
+    g_pred_t05: nx.Graph
 
 
 def _safe_spearman(
@@ -521,6 +534,10 @@ def _compute_set_readout(
     gs = compute_graph_similarity(g_pred, ref_subgraph)
     rd = compute_relative_density(g_pred, ref_subgraph)
 
+    g_pred_t05 = assemble_graph(pairs, pair_probs, threshold=_T05_THRESHOLD, nodes=node_ids)
+    gs_t05 = compute_graph_similarity(g_pred_t05, ref_subgraph)
+    rd_t05 = compute_relative_density(g_pred_t05, ref_subgraph)
+
     deg_hat = probs.sum(axis=1)
     true_degree = true_adj.sum(axis=1)
     spearman = _safe_spearman(deg_hat, true_degree)
@@ -541,7 +558,10 @@ def _compute_set_readout(
         auprc=auprc,
         free_density_expected=free_density_expected,
         free_density_hard=free_density_hard,
+        gs_t05=gs_t05,
+        rd_t05=rd_t05,
         g_pred=g_pred,
+        g_pred_t05=g_pred_t05,
     )
 
 
@@ -685,21 +705,22 @@ def _macro_over_sizes(
 
 
 def _mmd_macro_over_sizes(
-    arm_by_size: dict[int, dict[str, Any]], sizes: list[int]
+    arm_by_size: dict[int, dict[str, Any]], sizes: list[int], *, key: str = "mmd"
 ) -> dict[str, float | None]:
     """Canonical macro MMD ratio: mean raw across sizes over mean floor across sizes.
 
     Matches `evaluate_assembled_graph_with_reference`, which averages raw and
     reference MMD separately before dividing; averaging per-size ratios instead
-    would overweight sizes with tiny reference floors.
+    would overweight sizes with tiny reference floors. `key` selects the bank
+    (`"mmd"` density-matched, `"mmd_t05"` fixed threshold 0.5).
     """
-    present = [size for size in sizes if arm_by_size[size]["mmd"]]
+    present = [size for size in sizes if arm_by_size[size][key]]
     if not present:
         return dict.fromkeys(STATISTICS, None)
     macro: dict[str, float | None] = {}
     for stat in STATISTICS:
-        raw = float(np.mean([arm_by_size[size]["mmd"]["raw"][stat] for size in present]))
-        floor = float(np.mean([arm_by_size[size]["mmd"]["floor"][stat] for size in present]))
+        raw = float(np.mean([arm_by_size[size][key]["raw"][stat] for size in present]))
+        floor = float(np.mean([arm_by_size[size][key]["floor"][stat] for size in present]))
         macro[stat] = raw / max(floor, 1e-12)
     return macro
 
@@ -721,16 +742,19 @@ def _process_arm_size(
     all_probs: npt.NDArray[np.float64] | None = None,
     activity: npt.NDArray[np.float64] | None = None,
 ) -> dict[str, Any]:
-    """Compute one arm's readouts, MMD bank, and (stochastic arms only) coherence for one size.
+    """Compute one arm's readouts, MMD banks, and (stochastic arms only) coherence for one size.
 
-    The MMD bank uses `draw0_probs` per set for a stochastic arm (`all_probs`
-    given) and `mean_probs` otherwise, per the house convention. A set whose
-    true induced loopless edge count is 0 is skipped entirely and counted.
+    The MMD banks use `draw0_probs` per set for a stochastic arm (`all_probs`
+    given) and `mean_probs` otherwise, per the house convention; one bank is
+    assembled at the per-set density-matched threshold and one at the fixed
+    threshold 0.5. A set whose true induced loopless edge count is 0 is
+    skipped entirely and counted.
     """
     metrics: dict[str, list[float]] = {name: [] for name in _METRICS}
     none_counts: dict[str, int] = dict.fromkeys(_METRICS, 0)
     n_skipped = 0
     bank_descs: dict[str, list[npt.NDArray[np.float64]]] = {stat: [] for stat in STATISTICS}
+    bank_descs_t05: dict[str, list[npt.NDArray[np.float64]]] = {stat: [] for stat in STATISTICS}
     stochastic = all_probs is not None and activity is not None
     coherence: dict[str, list[float]] | None = (
         {
@@ -763,6 +787,8 @@ def _process_arm_size(
         metrics["rd"].append(readout.rd)
         metrics["free_density_expected"].append(readout.free_density_expected)
         metrics["free_density_hard"].append(readout.free_density_hard)
+        metrics["gs_t05"].append(readout.gs_t05)
+        metrics["rd_t05"].append(readout.rd_t05)
         for name, value in (
             ("spearman", readout.spearman),
             ("hub_recall", readout.hub_recall),
@@ -780,8 +806,13 @@ def _process_arm_size(
             bank_pairs, bank_pair_probs, threshold=bank_threshold, nodes=node_ids
         )
         bank_d = _descriptors(bank_graph)
+        bank_graph_t05 = assemble_graph(
+            bank_pairs, bank_pair_probs, threshold=_T05_THRESHOLD, nodes=node_ids
+        )
+        bank_d_t05 = _descriptors(bank_graph_t05)
         for stat in STATISTICS:
             bank_descs[stat].append(bank_d[stat])
+            bank_descs_t05[stat].append(bank_d_t05[stat])
 
         if coherence is not None and all_probs is not None and activity is not None:
             _accumulate_coherence(
@@ -797,7 +828,11 @@ def _process_arm_size(
     per_size = _aggregate_metrics(metrics, none_counts, seed=seed, arm_code=arm_code, size=size)
     per_size["n_sets"] = len(ordered_sets)
     per_size["n_skipped"] = n_skipped
-    result: dict[str, Any] = {"per_size": per_size, "mmd": _aggregate_mmd(bank_descs, ref_descs)}
+    result: dict[str, Any] = {
+        "per_size": per_size,
+        "mmd": _aggregate_mmd(bank_descs, ref_descs),
+        "mmd_t05": _aggregate_mmd(bank_descs_t05, ref_descs),
+    }
     if coherence is not None:
         result["coherence"] = {
             name: (float(np.mean(values)) if values else None) for name, values in coherence.items()
@@ -843,7 +878,9 @@ def _process_marg_size(
     Reuses B0 probabilities as the quota-assembly score and as the AUPRC row
     (spec: "MARG's AUPRC row = B0's"); the degree-alignment readouts (Spearman,
     hub recall, free density) use the regressor's own `deg_hat`, not the
-    assembled graph's realized degrees.
+    assembled graph's realized degrees. Quota assembly has no threshold, so the
+    fixed-threshold-0.5 readouts (`gs_t05`/`rd_t05`/`mmd_t05`) are undefined
+    for this arm and emitted as absent.
     """
     metrics: dict[str, list[float]] = {name: [] for name in _METRICS}
     none_counts: dict[str, int] = dict.fromkeys(_METRICS, 0)
@@ -909,94 +946,7 @@ def _process_marg_size(
     per_size["quota_shortfall_total"] = shortfall_total
     per_size["quota_residual_total"] = residual_total
     per_size["b0_missing_pairs_total"] = b0_missing_total
-    return {"per_size": per_size, "mmd": _aggregate_mmd(bank_descs, ref_descs)}
-
-
-# --------------------------------------------------------------------------- full region
-
-
-def _run_full_region(
-    *,
-    ctx: EvalContext,
-    ae: RegionAutoencoder,
-    prior: SetDenoiser,
-    det: DetTwin,
-    latent_mean: torch.Tensor,
-    latent_std: torch.Tensor,
-    k_draws: int,
-    flow_steps: int,
-    seed: int,
-    device: torch.device,
-) -> dict[str, Any]:
-    """Run the optional full-test-region GEN/DET/B0 pass and evaluate the house flow.
-
-    AE is skipped (disclosed): it requires the true adjacency, which a
-    features-only full-region pass does not have.
-    """
-    nodes = ctx.nodes
-    x = ctx.features.unsqueeze(0).to(device)
-    mask = torch.ones(1, len(nodes), device=device)
-    target_edges = ctx.g_simple.number_of_edges()
-
-    gen_probs, _, _, _ = _run_stochastic(
-        "gen",
-        prior,
-        ae,
-        x,
-        mask,
-        k_draws=k_draws,
-        flow_steps=flow_steps,
-        seed=seed,
-        size=len(nodes),
-        device=device,
-        latent_mean=latent_mean,
-        latent_std=latent_std,
-    )
-    det_probs = _run_det(det, ae, x, mask, latent_mean=latent_mean, latent_std=latent_std)
-
-    result: dict[str, Any] = {
-        "ae": {
-            "skipped": True,
-            "reason": "AE requires the true adjacency; undefined for the features-only full region",
-        },
-        "gen": _full_region_block(gen_probs[0], target_edges=target_edges, nodes=nodes, ctx=ctx),
-        "det": _full_region_block(det_probs[0], target_edges=target_edges, nodes=nodes, ctx=ctx),
-    }
-    if ctx.b0_probs is not None and ctx.b0_lookup is not None:
-        n = len(nodes)
-        iu, iv = np.triu_indices(n, k=1)
-        flat = iu.astype(np.int64) * n + iv.astype(np.int64)
-        rows = ctx.b0_lookup[flat]
-        pair_probs = np.where(rows >= 0, ctx.b0_probs[np.clip(rows, 0, None)], 0.0)
-        b0_mat = np.zeros((n, n), dtype=np.float64)
-        b0_mat[iu, iv] = pair_probs
-        b0_mat[iv, iu] = pair_probs
-        result["b0"] = _full_region_block(b0_mat, target_edges=target_edges, nodes=nodes, ctx=ctx)
-    return result
-
-
-def _full_region_block(
-    probs: npt.NDArray[np.float64], *, target_edges: int, nodes: list[str], ctx: EvalContext
-) -> dict[str, Any]:
-    """Density-match, assemble, and evaluate one full-region probability matrix.
-
-    Reports the five topology numbers named separately (never aggregated): the
-    BFS-macro GS/RD plus the three MMD ratios, and the global simple-edge GS/RD
-    against `ctx.g_simple`.
-    """
-    pairs, pair_probs = _upper_pairs(probs, nodes)
-    threshold = density_matched_threshold(pair_probs, target_edges)
-    g_pred = assemble_graph(pairs, pair_probs, threshold=threshold, nodes=nodes)
-    report = evaluate_assembled_graph_with_reference(g_pred, ctx.bucket_ref, MMDConfig())
-    g_pred_simple = strip_self_loops(g_pred)
-    return {
-        "threshold": float(threshold),
-        "gs_bfs_macro": report.graph_similarity,
-        "rd_bfs_macro": report.relative_density,
-        "mmd_ratio": dict(report.mmd_ratio),
-        "gs_global": compute_graph_similarity(g_pred_simple, ctx.g_simple),
-        "rd_global": compute_relative_density(g_pred_simple, ctx.g_simple),
-    }
+    return {"per_size": per_size, "mmd": _aggregate_mmd(bank_descs, ref_descs), "mmd_t05": {}}
 
 
 # --------------------------------------------------------------------------- orchestration
@@ -1013,7 +963,6 @@ def run_s2_eval(
     flow_steps: int,
     seed: int,
     device: str,
-    full_region: bool,
 ) -> dict[str, object]:
     """Run every S2 arm over every test-side bucket and return the JSON-ready payload.
 
@@ -1028,10 +977,9 @@ def run_s2_eval(
         flow_steps: Number of Euler integration steps for `sample_prior`.
         seed: Base seed for every randomized step (generators, permutations, bootstrap).
         device: Torch device string (`"cpu"`, `"cuda"`, `"mps"`).
-        full_region: Whether to additionally run the optional full-test-region pass.
 
     Returns:
-        The JSON-serializable results payload (`meta`, `arms`, optionally `full_region`).
+        The JSON-serializable results payload (`meta`, `arms`).
     """
     dev = torch.device(device)
     ae, latent_mean, latent_std = _load_ae(ae_path, dev)
@@ -1156,6 +1104,8 @@ def run_s2_eval(
             "macro": _macro_over_sizes(by_size, sizes),
             "mmd": {str(size): by_size[size]["mmd"] for size in sizes},
             "mmd_macro": _mmd_macro_over_sizes(by_size, sizes),
+            "mmd_t05": {str(size): by_size[size]["mmd_t05"] for size in sizes},
+            "mmd_t05_macro": _mmd_macro_over_sizes(by_size, sizes, key="mmd_t05"),
         }
         if name in ("gen", "unc", "shuf"):
             entry["coherence"] = {str(size): by_size[size]["coherence"] for size in sizes}
@@ -1180,22 +1130,15 @@ def run_s2_eval(
                 "GS/RD compare a self-loop-free predicted subgraph against a self-loop-"
                 "bearing reference subgraph -- a fixed asymmetry, disclosed once here."
             ),
+            "t05_note": (
+                "gs_t05/rd_t05/mmd_t05 assemble the same per-set probabilities at the "
+                "fixed threshold 0.5 (no density oracle); every forward pass is one "
+                "20-200-node sampled set, never the full test region. Undefined for "
+                "the quota-assembled marg arm."
+            ),
         },
         "arms": result_arms,
     }
-    if full_region:
-        payload["full_region"] = _run_full_region(
-            ctx=ctx,
-            ae=ae,
-            prior=prior,
-            det=det,
-            latent_mean=latent_mean,
-            latent_std=latent_std,
-            k_draws=k_draws,
-            flow_steps=flow_steps,
-            seed=seed,
-            device=dev,
-        )
     return payload
 
 
@@ -1260,6 +1203,16 @@ def render_tables_markdown(payload: dict[str, object]) -> str:
         lines.append(f"| {arm_name} | {values} |")
     lines.append("")
 
+    lines.append("## MMD ratio at fixed threshold 0.5 (macro across sizes)")
+    lines.append("")
+    lines.append("| arm | degree | clustering | spectral |")
+    lines.append("|---|---|---|---|")
+    for arm_name, entry in arms.items():
+        mmd_t05_macro = entry["mmd_t05_macro"]
+        values = " | ".join(_fmt(mmd_t05_macro.get(stat, float("nan"))) for stat in STATISTICS)
+        lines.append(f"| {arm_name} | {values} |")
+    lines.append("")
+
     lines.append("## Coherence (GEN / UNC / SHUF)")
     lines.append("")
     lines.append(
@@ -1283,26 +1236,6 @@ def render_tables_markdown(payload: dict[str, object]) -> str:
                 f"| {_fmt(row.get('mean_prob_degree_var'))} | {_fmt(row.get('draw_gs'))} |"
             )
     lines.append("")
-
-    if "full_region" in data:
-        lines.append("## Full region (five numbers, never aggregated)")
-        lines.append("")
-        full = data["full_region"]
-        for arm_name, block in full.items():
-            if block.get("skipped"):
-                lines.append(f"- **{arm_name}**: skipped ({block.get('reason')})")
-                continue
-            mmd_ratio = block["mmd_ratio"]
-            lines.append(
-                f"- **{arm_name}**: GS(BFS-macro)={_fmt(block['gs_bfs_macro'])}, "
-                f"RD(BFS-macro)={_fmt(block['rd_bfs_macro'])}, "
-                f"degree MMD={_fmt(mmd_ratio.get('degree'))}, "
-                f"clustering MMD={_fmt(mmd_ratio.get('clustering'))}, "
-                f"spectral MMD={_fmt(mmd_ratio.get('spectral'))}, "
-                f"GS(global simple)={_fmt(block['gs_global'])}, "
-                f"RD(global simple)={_fmt(block['rd_global'])}"
-            )
-        lines.append("")
 
     return "\n".join(lines) + "\n"
 

@@ -1,12 +1,16 @@
-# S2 — Set-Conditioned Joint Latent Topology Generation: results
+# S2/S3 — set-conditioned topology route: results
 
-**Verdict: negative; route closed.** Conditioning on $X_S$ carries a real but weak
-node-aligned topology signal (GEN > SHUF/UNC), yet the generative set model is
-strictly dominated by the frozen B0 pairwise scorer on every node-aligned metric,
-and its draws exhibit no joint structure beyond their own marginals. The Stage-A
-autoencoder ceiling is high, so the failure lies in the features→topology
-conditional map, not in the latent bottleneck — this is an honest negative, not
-an S0-style weak-proxy artifact.
+**Verdict: negative at both levels; route closed.** Conditioning on $X_S$ carries a
+real but weak node-aligned topology signal (GEN > SHUF/UNC), yet the generative set
+model is strictly dominated by the frozen B0 pairwise scorer on every node-aligned
+metric, and its draws exhibit no joint structure beyond their own marginals. The
+Stage-A autoencoder ceiling is high, so the failure lies in the features→topology
+conditional map, not in the latent bottleneck — this is an honest negative, not an
+S0-style weak-proxy artifact. **S3** then closed the incremental branch the S2 review
+left open: a zero-init set residual *on top of* B0 is matched or beaten by its own
+capacity- and pointwise-controls (§ S3 below).
+
+## S2 — standalone latent-flow generator: results
 
 Design: `docs/tmp/s2_set_generation_experiment.md`. Implementation:
 `src/experiments/s2_latent_topology/` (commit `730d197`). Run: 2026-08-17 on one
@@ -16,7 +20,7 @@ Evaluation: `test_node_buckets.pkl`, 10 sizes × 50 node-disjoint test sets;
 optional full-region eval not run. B0 scores: published v3.1 candidate universe
 (checkpoint `e092537d8cf1e208`), fp32-validated.
 
-## Primary endpoint — node-aligned identification (macro over sizes, full run)
+### Primary endpoint — node-aligned identification (macro over sizes, full run)
 
 | arm | GS↑ | Spearman↑ | hub recall↑ | AUPRC↑ |
 |---|---|---|---|---|
@@ -32,7 +36,7 @@ GEN's GS confidence intervals separate from SHUF's at sizes ≥ 120 (e.g. size 2
 GEN [0.117, 0.191] vs SHUF [0.062, 0.090]); at small sizes they overlap. Per-size
 tables: `s2_set_generation_tables.md` (from `outputs/s2*/s2_tables*.md` on H20).
 
-## Topology five-tuple per arm (GS↑, RD→1, MMD ratios↓; macro, full run)
+### Topology five-tuple per arm (GS↑, RD→1, MMD ratios↓; macro, full run)
 
 | arm | GS | RD | degree | clustering | spectral |
 |---|---|---|---|---|---|
@@ -49,7 +53,7 @@ not an arm-quality signal. Free-running density (secondary): GEN implies 0.52× 
 true edge count, DET 1.72× (its RD 0.513 reflects that miscalibration surviving
 matched assembly).
 
-## Coherence — is the joint model actually joint?
+### Coherence — is the joint model actually joint?
 
 No. Across-draw activity variance stays ≈ 198 at every size (the per-node
 posterior over $a_i$ never sharpens; the unconditional prior spans 119–178).
@@ -59,7 +63,7 @@ independently-thresholded mean-prob statistics closely. The sampled joint carrie
 no coherent structure beyond its marginals — the mechanism S1 could not test,
 now tested directly and dead.
 
-## Activity-only ablation (`outputs/s2_act`)
+### Activity-only ablation (`outputs/s2_act`)
 
 Only the ceiling is interpretable: AE-act GS 0.530 / Spearman 0.992 / AUPRC 0.585
 vs full-decoder AE 0.845 / 0.983 / 0.969 — the 16-dim role geometry
@@ -68,7 +72,7 @@ act-run conditional arms diverged in training (prior best epoch 2, DET best
 epoch 3, later losses ~10¹⁵), so GEN-act/DET-act numbers are from barely-trained
 models and are not evidence.
 
-## Caveats
+### Caveats
 
 - **MARG regressor collapsed:** train/val loss flat to four decimals across all
   20 epochs (val 246.4142 in both runs), Spearman undefined (constant
@@ -78,7 +82,7 @@ models and are not evidence.
 - Bucket GS/RD here use S2's density-matched in-set assembly, not the official
   candidate-universe protocol; compare arms within this table only.
 
-## Interpretation against the pre-registered map
+### Interpretation against the pre-registered map
 
 1. GEN > SHUF/UNC — $X_S$ carries joint-topology signal (real, small).
 2. GEN < B0 everywhere — set-level joint modeling adds nothing over independent
@@ -90,4 +94,103 @@ models and are not evidence.
    the conditional act comparison is void (training instability).
 
 Together with S0/S0-R/S1, both the pair-conditioned and set-conditioned
-generation formulations are now closed at the diagnostic level.
+generation formulations are now closed as *standalone* generators. What that left
+open — whether set context helps *beside* B0 rather than instead of it — is S3.
+
+## S3 — set-conditioned residual on frozen B0: results
+
+**Verdict: negative.** A zero-init set residual does lift the frozen B0 scorer
+(+0.009 AUPRC, +0.005 GS, paired CIs excluding zero), but a parameter-matched
+residual with the set encoder *deleted* buys the same or more, and the set arm's
+residual degenerates to zero variance during training. C1 (uplift) is met
+nominally; C2 (uplift attributable to third-party features) fails.
+
+Design: `docs/tmp/s3_set_residual_plan.md`. Implementation:
+`src/experiments/s3_set_residual/` (commits `394120c` → `1766525`). Run: 2026-08-18
+on the two H20 containers, `outputs/s3/{res,pair,diag}_s{0,1,2}`;
+`evidence_class=diagnostic`, `formal:false`, seeds 0–2, 9 arm runs of ~3 min each
+after a 5 h shared cache build.
+
+### Arms (one change each; frozen B0 v3.1 base `e092537d8cf1e208` everywhere)
+
+Every arm adds `Δ` to the base logit through a zero-initialised final linear layer,
+so at step 0 it reproduces B0 exactly; no arm reads adjacency at inference.
+
+- **RES** — `Δ` from S2's set-transformer backbone; every node's hidden state sees
+  the whole conditioning set (3,845,376 params).
+- **PAIR** — set encoder deleted, replaced by a parameter-matched per-node MLP
+  (3,845,384 params, ratio 1.0000). Capacity and region-density control.
+- **DIAG** — RES's module and weights, each node processed as its own size-1 set so
+  `h_i = f(x_i)`. The pointwise control S2 lacked.
+- **SHUF** (eval-only, on RES checkpoints) — within-set permutation of the rows
+  feeding the set encoder; `x_i,x_j` into B0 and into `Δ`'s pair slots stay true.
+- **B0** — frozen scores, the γ=0 arm.
+
+Training regions: BFS balls on `train_graph`'s loopless giant component with
+V_val-internal pairs masked out of the loss; ≤40 epochs, patience 10, lr 3e-4,
+weight decay 0.01, 32 regions/batch, grad clip 1.0. Selection mean-ranks V_val
+ΔAUPRC plus the five V_val bucket-topology numbers across the top-3 checkpoints.
+Evaluation reuses S2's harness — `test_node_buckets.pkl`, 10 sizes × 50
+node-disjoint sets, density-matched in-set assembly, base logits from the
+fp32-validated B0 candidate universe — so the B0 row below is bit-identical to the
+B0 row in the S2 tables and the two experiments are directly comparable.
+
+### Primary endpoint — arm macro (mean of 3 seeds; GS↑, RD→1, MMD ratios↓)
+
+| arm | AUPRC↑ | GS↑ | RD→1 | degree↓ | clustering↓ | spectral↓ | Spearman↑ | hub recall↑ |
+|---|---|---|---|---|---|---|---|---|
+| B0 (frozen) | 0.3035 | 0.2821 | 0.837 | 3.55 | 2.78 | 5.98 | 0.307 | 0.190 |
+| RES | 0.3120 | 0.2868 | 0.839 | 3.46 | 2.71 | 6.00 | 0.337 | 0.194 |
+| PAIR | 0.3154 | 0.2907 | 0.839 | 3.52 | 2.89 | 5.98 | 0.351 | 0.208 |
+| DIAG | 0.3122 | 0.2897 | 0.839 | 3.35 | 2.90 | 5.91 | 0.347 | 0.204 |
+
+Per-seed AUPRC: RES 0.3152 / 0.3059 / 0.3149, PAIR 0.3144 / 0.3153 / 0.3165,
+DIAG 0.3103 / 0.3137 / 0.3125. The between-seed spread of a single arm (0.0093 for
+RES) exceeds every between-arm gap.
+
+### Paired contrasts (pooled over the 500 buckets, 95% CI, seeds 0 / 1 / 2)
+
+| contrast | ΔAUPRC | ΔGS |
+|---|---|---|
+| RES − B0 | +0.0117 / +0.0024 / +0.0113 — all exclude 0 | +0.0072 / +0.0007 / +0.0061 — all exclude 0 |
+| RES − PAIR | +0.0008 ns / −0.0094 / −0.0017 | −0.0031 / −0.0061 / −0.0024 — RES worse 3/3 |
+| RES − DIAG | +0.0050 / −0.0078 / +0.0023 | +0.0016 / −0.0086 / −0.0018 |
+
+All nine runs share one bucket sample (the B0 arm is bit-identical across them), so
+these delta-of-deltas are paired per bucket. RES never beats both controls in the
+same seed, and loses to the set-free PAIR arm on GS in all three.
+
+### Controls and telemetry
+
+- **Zero-init gate passed exactly.** A fresh zero-init model reproduces B0 with max
+  abs diff 0.0 at every bucket size (`res_s0/sanity_report.json`) — the residual is
+  correctly wired as `base + delta`.
+- **SHUF is vacuous here, by construction.** `_shuffle_features_within_sets`
+  permutes row order *inside* each set and the backbone is permutation-invariant, so
+  SHUF tracks RES to ~4 decimals (AUPRC 0.3153 vs 0.3152 at seed 0). It is a wiring
+  check, not a falsification control; PAIR and DIAG carry the anti-claims.
+- **RES's residual dies; the controls' does not.** `delta_variance` reaches 0.0000
+  by the final epoch in all three RES seeds — published epochs are early (4 / 8 / 3)
+  — while PAIR and DIAG end at 0.5–27.3. RES's best V_val ΔAUPRC (0.0099–0.0161) is
+  about half PAIR's (0.0307–0.0356) and DIAG's (0.0282–0.0295). Set attention
+  optimises *toward reproducing the base scorer*. The plan's C1 asked for a CI
+  covering zero **with healthy training**; that branch was not reached, so the
+  negative rests on the control contrasts, not on a clean null.
+- **Free-running calibration gets worse.** ECE improves (B0 0.106 → 0.088–0.095) but
+  the implied edge count falls to 0.29–0.57× true (B0 0.84×) and free-running
+  density from 0.891 to 0.25–0.58. Matched-assembly RD stays pinned at ≈0.839 for
+  every arm — the same fixed self-loop asymmetry disclosed for S2.
+
+### Interpretation against the claim map
+
+1. **C1 — uplift over B0: nominally yes, mechanically empty.** Every arm, including
+   the ones with no set access, clears the same bar; the lift is capacity plus
+   recalibration.
+2. **C2 — third-party features: refuted.** RES ≤ PAIR and RES ≈ DIAG. Neither the
+   set encoder nor third-party rows explain the gain.
+3. **Topology does not move.** GS 0.282 → 0.287–0.291, RD 0.837 → 0.839, ratios
+   3.55/2.78/5.98 → 3.35–3.52 / 2.71–2.90 / 5.91–6.00. Edge-set identity is as inert
+   here as under every KD mechanism in `b1_kd_arms.md`.
+4. **Downstream gating.** STOCH was gated on a positive C1 and does not earn a run.
+   GRAM (a gauge-invariant retrain of S2's DET twin, answering *why* S2 failed) is
+   the only probe this route still has open.

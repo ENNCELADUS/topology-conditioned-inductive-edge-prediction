@@ -251,6 +251,10 @@ def _compute_set_readout_s3(
     gs = compute_graph_similarity(g_pred, ref_subgraph)
     rd = compute_relative_density(g_pred, ref_subgraph)
 
+    g_pred_t05 = assemble_graph(pairs, pair_probs, threshold=s2eval._T05_THRESHOLD, nodes=node_ids)
+    gs_t05 = compute_graph_similarity(g_pred_t05, ref_subgraph)
+    rd_t05 = compute_relative_density(g_pred_t05, ref_subgraph)
+
     deg_hat = probs.sum(axis=1)
     true_degree = true_adj.sum(axis=1)
     spearman = s2eval._safe_spearman(deg_hat, true_degree)
@@ -275,7 +279,10 @@ def _compute_set_readout_s3(
         auprc=auprc,
         free_density_expected=free_density_expected,
         free_density_hard=free_density_hard,
+        gs_t05=gs_t05,
+        rd_t05=rd_t05,
         g_pred=g_pred,
+        g_pred_t05=g_pred_t05,
     )
 
 
@@ -355,6 +362,8 @@ def _process_size(
             metrics_by_arm[name]["rd"].append(readout.rd)
             metrics_by_arm[name]["free_density_expected"].append(readout.free_density_expected)
             metrics_by_arm[name]["free_density_hard"].append(readout.free_density_hard)
+            metrics_by_arm[name]["gs_t05"].append(readout.gs_t05)
+            metrics_by_arm[name]["rd_t05"].append(readout.rd_t05)
             for metric_name, value in (
                 ("spearman", readout.spearman),
                 ("hub_recall", readout.hub_recall),
@@ -505,71 +514,6 @@ def _calibration_block(
     }
 
 
-# --------------------------------------------------------------------------- full region
-
-
-def _run_full_region(
-    *,
-    ctx: EvalContext,
-    model: SetResidualModel,
-    base_logit: NDArray[np.float32],
-    node_index: dict[str, int],
-    device: torch.device,
-    shuf: bool,
-    seed: int,
-) -> dict[str, Any]:
-    """The optional full 2,018-node test-region secondary readout, B0/MODEL(/SHUF).
-
-    Reuses `s2_latent_topology.evaluate._full_region_block` directly (it only
-    needs a probability matrix, `target_edges`, `nodes`, and `ctx` -- none of
-    it is entangled with S2's own GEN/DET/AE prior-model arms).
-    """
-    nodes = ctx.nodes
-    n = len(nodes)
-    x = ctx.features.unsqueeze(0).to(device)
-    mask = torch.ones(1, n, device=device)
-    target_edges = ctx.g_simple.number_of_edges()
-
-    base_mat, missing_mat, missing_count = _b0_logit_matrix(ctx, base_logit, node_index, nodes)
-    base_stack = base_mat[None, ...]
-    missing_stack = missing_mat[None, ...]
-    pairs_tensor = _all_pairs_tensor(1, n, device)
-
-    b0_probs = np.where(missing_stack, 0.0, _sigmoid(base_stack))[0]
-    model_probs = _run_arm_probs(
-        model,
-        x,
-        mask,
-        pairs_tensor,
-        x_set=None,
-        base_logit_stack=base_stack,
-        missing_stack=missing_stack,
-    )[0]
-
-    result: dict[str, Any] = {
-        "missing_pairs": missing_count,
-        "b0": s2eval._full_region_block(b0_probs, target_edges=target_edges, nodes=nodes, ctx=ctx),
-        "model": s2eval._full_region_block(
-            model_probs, target_edges=target_edges, nodes=nodes, ctx=ctx
-        ),
-    }
-    if shuf:
-        x_shuf = s2eval._shuffle_features_within_sets(x, seed=seed, size=n)
-        shuf_probs = _run_arm_probs(
-            model,
-            x,
-            mask,
-            pairs_tensor,
-            x_set=x_shuf,
-            base_logit_stack=base_stack,
-            missing_stack=missing_stack,
-        )[0]
-        result["shuf"] = s2eval._full_region_block(
-            shuf_probs, target_edges=target_edges, nodes=nodes, ctx=ctx
-        )
-    return result
-
-
 # --------------------------------------------------------------------------- orchestration
 
 
@@ -583,7 +527,6 @@ def run_s3_eval(
     device: str,
     shuf: bool,
     sanity_zero_init: bool,
-    full_region: bool,
 ) -> dict[str, Any]:
     """Run every S3 arm over every test-side bucket and return the JSON-ready report payload.
 
@@ -602,11 +545,10 @@ def run_s3_eval(
         shuf: Whether to additionally run the SHUF eval-only arm.
         sanity_zero_init: Whether to run the M0 sanity gate: a fresh zero-init
             twin of `model` must reproduce the B0 arm's probabilities exactly.
-        full_region: Whether to additionally run the full-test-region secondary readout.
 
     Returns:
         The JSON-serializable report payload (`meta`, `arms`, `paired_deltas`,
-        `calibration`, optionally `sanity_zero_init`/`full_region`).
+        `calibration`, optionally `sanity_zero_init`).
 
     Raises:
         ValueError: If `ctx` has no B0 lookup, or the zero-init sanity gate fails.
@@ -756,17 +698,6 @@ def run_s3_eval(
             "max_abs_diff_by_size": sanity_max_diff,
         }
 
-    if full_region:
-        payload["full_region"] = _run_full_region(
-            ctx=ctx,
-            model=model,
-            base_logit=base_logit,
-            node_index=node_index,
-            device=dev,
-            shuf=shuf,
-            seed=seed,
-        )
-
     return payload
 
 
@@ -860,9 +791,6 @@ def register_eval_args(parser: argparse.ArgumentParser) -> None:
         help="M0 gate: assert a fresh zero-init model reproduces B0 exactly",
     )
     parser.add_argument(
-        "--full-region", action="store_true", help="Also run the full test-region secondary readout"
-    )
-    parser.add_argument(
         "--aggregate",
         type=Path,
         nargs="+",
@@ -925,7 +853,6 @@ def run_eval(args: argparse.Namespace) -> Path:
         device=args.device,
         shuf=args.shuf,
         sanity_zero_init=args.sanity_zero_init,
-        full_region=args.full_region,
     )
     payload["provenance"] = {
         "run_dir": str(args.run_dir),
