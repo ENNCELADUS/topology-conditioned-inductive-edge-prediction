@@ -29,15 +29,22 @@ POOLED_DIM = 4
 # --------------------------------------------------------------------------- fixtures / helpers
 
 
-def _write_feature_root(tmp_path: Path, node_ids: list[str]) -> Path:
-    """Build a tiny synthetic FeatureStore root: metadata.json + index.json + per-node .pt."""
+def _write_feature_root(
+    tmp_path: Path, node_ids: list[str], *, token_lens: list[int] | None = None
+) -> Path:
+    """Build a tiny synthetic FeatureStore root: metadata.json + index.json + per-node .pt.
+
+    `token_lens`, when given, sets a per-node token count so the pairs span more
+    than one `LengthBucketedBatchSampler` bucket.
+    """
     root = tmp_path / "features"
     embeddings_dir = root / "embeddings"
     embeddings_dir.mkdir(parents=True)
     rng = np.random.default_rng(0)
     index: dict[str, str] = {}
-    for node_id in node_ids:
-        tensor = torch.tensor(rng.standard_normal((TOKEN_LEN, INPUT_DIM)), dtype=torch.float32)
+    for position, node_id in enumerate(node_ids):
+        length = TOKEN_LEN if token_lens is None else token_lens[position]
+        tensor = torch.tensor(rng.standard_normal((length, INPUT_DIM)), dtype=torch.float32)
         rel_path = f"embeddings/{node_id}.pt"
         torch.save(tensor, root / rel_path)
         index[node_id] = rel_path
@@ -355,13 +362,14 @@ def test_zeroed_head_first_eval_equals_predict_zero_baseline(tmp_path: Path) -> 
     model = build_model("v3_1", _tiny_v3_1_config(spectral_norm=True))
     zero_output_head(model)  # type: ignore[arg-type]
 
-    from src.experiments.s6_residual_probe import _eval_loader, _predict
+    from src.experiments.s6_residual_probe import _predict
 
     predicted = _predict(
         model,  # type: ignore[arg-type]
-        _eval_loader(eval_pairs, store, 4096),
+        eval_pairs,
+        store,
         torch.device("cpu"),
-        len(eval_pairs),
+        4096,
     )
     np.testing.assert_allclose(predicted, np.zeros_like(predicted))
 
@@ -370,3 +378,58 @@ def test_zeroed_head_first_eval_equals_predict_zero_baseline(tmp_path: Path) -> 
     zero_readout = baseline_readouts(eval_delta, eval_delta)["predict_zero"]
     assert model_readout["r2"] == pytest.approx(zero_readout["r2"])
     assert model_readout["mae"] == pytest.approx(zero_readout["mae"])
+
+
+def test_predictions_stay_row_aligned_across_length_buckets(tmp_path: Path) -> None:
+    """Bucket-major batching must not permute predictions relative to input rows.
+
+    `LengthBucketedBatchSampler` groups by length bucket, so even unshuffled it
+    does not visit rows in order. A sequential write would misalign predictions
+    with targets here while still looking finite -- a silent readout corruption.
+    """
+    node_ids = [f"n{i}" for i in range(24)]
+    # Straddle several bucket boundaries so the visiting order is definitely not 0,1,2,...
+    token_lens = [3 + (i * 37) % 220 for i in range(len(node_ids))]
+    store = FeatureStore(_write_feature_root(tmp_path, node_ids, token_lens=token_lens))
+    pairs = [(node_ids[i], node_ids[(i * 7 + 3) % len(node_ids)]) for i in range(len(node_ids))]
+
+    from src.data.pairs import LengthBucketedBatchSampler, probe_lengths
+    from src.experiments.s6_residual_probe import _predict
+
+    # The sampler really does reorder for this input -- otherwise the test proves nothing.
+    lengths = probe_lengths(store, pairs)
+    visiting_order = [
+        i
+        for batch in LengthBucketedBatchSampler(
+            lengths, token_budget=4096, shuffle=False, seed=0, epoch=0
+        )
+        for i in batch
+    ]
+    assert visiting_order != list(range(len(pairs))), "fixture failed to span buckets"
+
+    torch.manual_seed(0)
+    model = build_model("v3_1", _tiny_v3_1_config())
+    model.eval()
+    predicted = _predict(
+        model,  # type: ignore[arg-type]
+        pairs,
+        store,
+        torch.device("cpu"),
+        4096,
+    )
+
+    # Ground truth: score each pair on its own, in input order.
+    expected = np.zeros(len(pairs), dtype=np.float64)
+    with torch.no_grad():
+        for i, (node_a, node_b) in enumerate(pairs):
+            tokens_a = store.load_tokens(node_a)
+            tokens_b = store.load_tokens(node_b)
+            batch = {
+                "emb_a": tokens_a.unsqueeze(0),
+                "emb_b": tokens_b.unsqueeze(0),
+                "len_a": torch.tensor([tokens_a.size(0)]),
+                "len_b": torch.tensor([tokens_b.size(0)]),
+            }
+            expected[i] = float(model(batch)["logits"].squeeze())
+
+    np.testing.assert_allclose(predicted, expected, rtol=1e-4, atol=1e-5)

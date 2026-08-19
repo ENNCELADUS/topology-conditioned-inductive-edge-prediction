@@ -60,7 +60,6 @@ from numpy.typing import NDArray
 from scipy.stats import spearmanr
 from torch import nn
 from torch.nn.utils import remove_spectral_norm
-from torch.utils.data import DataLoader
 
 from src.data.features import FeatureStore
 from src.data.pairs import (
@@ -281,34 +280,36 @@ def _pairs_for_rows(targets: KDTargets, rows: NDArray[np.int64]) -> list[tuple[s
 
 def _predict(
     model: V3_1,
-    loader: DataLoader[dict[str, torch.Tensor]],
+    pairs: Sequence[tuple[str, str]],
+    store: FeatureStore,
     device: torch.device,
-    n_rows: int,
+    token_budget: int,
 ) -> NDArray[np.float64]:
-    """Run the model over `loader` in eval mode, returning predictions in row order."""
+    """Score `pairs` in eval mode, returning predictions in **input row order**.
+
+    `LengthBucketedBatchSampler` emits bucket-major batches, so even with
+    ``shuffle=False`` the visiting order is not ``0, 1, 2, ...``. Each batch's
+    logits are therefore scattered back to their own row positions (the
+    `score_universe._score_v3_1` convention). A sequential write would silently
+    misalign predictions with targets whenever the pairs span more than one
+    length bucket, corrupting every readout without raising.
+    """
     model.eval()
-    out = np.zeros(n_rows, dtype=np.float64)
-    cursor = 0
-    with torch.no_grad():
-        for batch in loader:
-            moved = {k: v.to(device) for k, v in batch.items()}
-            logits = model(moved)["logits"].squeeze(-1)
-            values = logits.detach().cpu().numpy().astype(np.float64)
-            out[cursor : cursor + values.size] = values
-            cursor += values.size
-    return out
-
-
-def _eval_loader(
-    pairs: Sequence[tuple[str, str]], store: FeatureStore, token_budget: int
-) -> DataLoader[dict[str, torch.Tensor]]:
-    """A deterministic, unshuffled bucketed loader over `pairs` (row order preserved)."""
     lengths = probe_lengths(store, pairs)
     dataset = TokenPairDataset(pairs, None, store, lengths)
     sampler = LengthBucketedBatchSampler(
         lengths, token_budget=token_budget, shuffle=False, seed=0, epoch=0
     )
-    return DataLoader(dataset, batch_sampler=sampler, collate_fn=collate_token_pairs)
+    out = np.zeros(len(pairs), dtype=np.float64)
+    with torch.no_grad():
+        for batch_indices in sampler:
+            batch = collate_token_pairs([dataset[i] for i in batch_indices])
+            moved = {k: v.to(device) for k, v in batch.items()}
+            logits = model(moved)["logits"].squeeze(-1)
+            out[np.asarray(batch_indices, dtype=np.int64)] = (
+                logits.detach().cpu().numpy().astype(np.float64).reshape(-1)
+            )
+    return out
 
 
 def train_residual_probe(
@@ -341,7 +342,6 @@ def train_residual_probe(
     train_sampler = LengthBucketedBatchSampler(
         train_lengths, token_budget=token_budget, shuffle=True, seed=seed, epoch=0
     )
-    eval_loader = _eval_loader(eval_pairs, store, token_budget)
     eval_targets = eval_delta.astype(np.float64)
 
     history: list[EpochRecord] = []
@@ -370,7 +370,7 @@ def train_residual_probe(
             total_loss += float(loss.item()) * len(batch_rows)
             total_rows += len(batch_rows)
 
-        predicted = _predict(model, eval_loader, device, len(eval_pairs))
+        predicted = _predict(model, eval_pairs, store, device, token_budget)
         readout = regression_readout(eval_targets, predicted)
         history.append(
             EpochRecord(
@@ -489,9 +489,7 @@ def run_s6_pipeline(
 
     train_side = regression_readout(
         train_delta.astype(np.float64),
-        _predict(
-            model, _eval_loader(train_pairs, store, token_budget), resolved_device, len(train_pairs)
-        ),
+        _predict(model, train_pairs, store, resolved_device, token_budget),
     )
     baselines = baseline_readouts(eval_delta, train_delta)
 
