@@ -90,6 +90,19 @@ def test_replay_output_is_byte_identical_across_runs(tmp_path: Path) -> None:
     assert (tmp_path / "a.json").read_bytes() == (tmp_path / "b.json").read_bytes()
 
 
+@pytest.mark.parametrize("threshold", [float("nan"), float("inf"), float("-inf")])
+def test_replay_rejects_non_finite_thresholds(tmp_path: Path, threshold: float) -> None:
+    universe_path, data_root = _toy_inputs(tmp_path)
+    with pytest.raises(ValueError, match="finite"):
+        ftr.run_fixed_threshold_replay(
+            universes=[("toy_arm", universe_path)],
+            data_root=data_root,
+            strategy="toy",
+            threshold=threshold,
+            output_path=tmp_path / "out.json",
+        )
+
+
 def test_replay_rejects_duplicate_arm_names(tmp_path: Path) -> None:
     universe_path, data_root = _toy_inputs(tmp_path)
     with pytest.raises(ValueError, match="duplicate arm names"):

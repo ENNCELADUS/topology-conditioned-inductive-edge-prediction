@@ -324,6 +324,9 @@ def _process_size(
     bank_by_arm: dict[str, dict[str, list[NDArray[np.float64]]]] = {
         name: {stat: [] for stat in STATISTICS} for name in arm_names
     }
+    bank_t05_by_arm: dict[str, dict[str, list[NDArray[np.float64]]]] = {
+        name: {stat: [] for stat in STATISTICS} for name in arm_names
+    }
     deltas: dict[str, list[float]] = defaultdict(list)
     calib_probs: dict[str, list[NDArray[np.float64]]] = {name: [] for name in arm_names}
     calib_labels: dict[str, list[NDArray[np.int64]]] = {name: [] for name in arm_names}
@@ -374,8 +377,10 @@ def _process_size(
                 else:
                     metrics_by_arm[name][metric_name].append(value)
             bank_d = s2eval._descriptors(readout.g_pred)
+            bank_d_t05 = s2eval._descriptors(readout.g_pred_t05)
             for stat in STATISTICS:
                 bank_by_arm[name][stat].append(bank_d[stat])
+                bank_t05_by_arm[name][stat].append(bank_d_t05[stat])
 
         if "model" in readouts and "b0" in readouts:
             deltas["model_minus_b0__gs"].append(readouts["model"].gs - readouts["b0"].gs)
@@ -402,6 +407,7 @@ def _process_size(
         arm_blocks[name] = {
             "per_size": per_size,
             "mmd": s2eval._aggregate_mmd(bank_by_arm[name], ref_descs),
+            "mmd_t05": s2eval._aggregate_mmd(bank_t05_by_arm[name], ref_descs),
         }
 
     return _SizeResult(
@@ -653,6 +659,8 @@ def run_s3_eval(
             "macro": s2eval._macro_over_sizes(by_size, sizes),
             "mmd": {str(s): by_size[s]["mmd"] for s in sizes},
             "mmd_macro": s2eval._mmd_macro_over_sizes(by_size, sizes),
+            "mmd_t05": {str(s): by_size[s]["mmd_t05"] for s in sizes},
+            "mmd_t05_macro": s2eval._mmd_macro_over_sizes(by_size, sizes, key="mmd_t05"),
         }
 
     paired_deltas = _build_paired_deltas(delta_raw, arm_names, sizes)

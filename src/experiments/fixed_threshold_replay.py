@@ -32,6 +32,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import math
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -96,9 +97,12 @@ def run_fixed_threshold_replay(
         The JSON-ready results payload (also written to `output_path`).
 
     Raises:
-        ValueError: If two universes share an arm name or an artifact fails
-            the candidate-universe / precision validation.
+        ValueError: If `threshold` is non-finite (fail closed), two universes
+            share an arm name, or an artifact fails the candidate-universe /
+            precision validation.
     """
+    if not math.isfinite(threshold):
+        raise ValueError(f"threshold must be finite, got {threshold!r}")
     names = [arm for arm, _ in universes]
     if len(set(names)) != len(names):
         raise ValueError(f"duplicate arm names in --universe: {names}")

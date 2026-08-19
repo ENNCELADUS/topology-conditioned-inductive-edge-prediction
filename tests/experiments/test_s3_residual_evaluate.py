@@ -615,9 +615,11 @@ def test_run_s3_eval_reports_fixed_threshold_readouts_per_set(tmp_path: Path) ->
 
     assert "full_region" not in payload
     for arm_name in ("b0", "model"):
-        macro = payload["arms"][arm_name]["macro"]
-        assert macro["gs_t05"] is not None
-        assert macro["rd_t05"] is not None
+        arm = payload["arms"][arm_name]
+        assert arm["macro"]["gs_t05"] is not None
+        assert arm["macro"]["rd_t05"] is not None
+        for stat in ("degree", "clustering", "spectral"):
+            assert arm["mmd_t05_macro"][stat] is not None
 
 
 def test_run_s3_eval_deterministic_given_same_seed(tmp_path: Path) -> None:
