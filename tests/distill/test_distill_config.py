@@ -93,6 +93,53 @@ def test_from_mapping_roundtrip() -> None:
     assert cfg.anchors_per_step == 2
 
 
+def test_kd_d9_pattern_maps_and_requires_all_three_weights() -> None:
+    cfg = DistillConfig(targets_path="t", w_seed=1.0, w_geom=0.3, w_kl=0.05)
+    assert cfg.arm == "kd_d9"
+    assert cfg.active
+    for weights in (
+        {"w_seed": 1.0},
+        {"w_seed": 1.0, "w_geom": 0.3},
+        {"w_seed": 1.0, "w_kl": 0.05},
+        {"w_seed": 1.0, "w_geom": 0.3, "w_kl": 0.05, "w_align": 1.0},
+    ):
+        with pytest.raises(ValueError, match="exactly one arm group"):
+            DistillConfig.from_mapping({"targets_path": "t", **weights})
+
+
+def test_kd_d9_from_mapping_roundtrip_parses_int_fields() -> None:
+    cfg = DistillConfig.from_mapping(
+        {
+            "targets_path": "outputs/distill/kd_targets_v4",
+            "w_seed": 1.0,
+            "w_geom": 0.3,
+            "w_kl": 0.05,
+            "kl_warmup_steps": 2000,
+            "joint_start_epoch": 8,
+            "gen_lr_scale": 0.1,
+        }
+    )
+    assert cfg.arm == "kd_d9"
+    assert cfg.kl_warmup_steps == 2000
+    assert cfg.joint_start_epoch == 8
+    assert cfg.gen_lr_scale == 0.1
+
+
+def test_kd_d9_field_bounds() -> None:
+    with pytest.raises(ValueError, match="kl_warmup_steps"):
+        DistillConfig(kl_warmup_steps=-1)
+    with pytest.raises(ValueError, match="joint_start_epoch"):
+        DistillConfig(joint_start_epoch=-1)
+    with pytest.raises(ValueError, match="gen_lr_scale"):
+        DistillConfig(gen_lr_scale=0.0)
+    with pytest.raises(ValueError, match="kl_warmup_steps"):
+        DistillConfig.from_mapping({"kl_warmup_steps": "soon"})
+    with pytest.raises(ValueError, match="joint_start_epoch"):
+        DistillConfig.from_mapping({"joint_start_epoch": 2.5})
+    with pytest.raises(ValueError, match="non-negative"):
+        DistillConfig(w_seed=-0.1)
+
+
 def test_bounds_are_validated() -> None:
     with pytest.raises(ValueError, match="temperature"):
         DistillConfig(temperature=0.0)

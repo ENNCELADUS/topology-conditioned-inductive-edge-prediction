@@ -13,10 +13,13 @@ from src.distill.losses import (
     kd_align_loss,
     kd_dist_loss,
     kd_gram_loss,
+    kd_kl_loss,
     kd_label_loss,
     kd_logit_loss,
     kd_rank_loss,
     kd_residual_loss,
+    kd_seed_gram_loss,
+    kd_seed_loss,
 )
 
 pytestmark = pytest.mark.unit
@@ -438,3 +441,80 @@ def test_residual_loss_handles_bf16_delta_target_input() -> None:
     result = kd_residual_loss(student_residual, delta_target_bf16, mask)
     assert result.dtype == student_residual.dtype
     assert torch.isfinite(result)
+
+
+# --------------------------------------------------------------------------- kd_seed_loss (kd_d9)
+
+
+def test_seed_loss_is_zero_for_identical_directions_and_two_for_opposite() -> None:
+    seeds = torch.randn(3, 4, 8)
+    mask = torch.ones(3)
+    torch.testing.assert_close(
+        kd_seed_loss(seeds, 2.0 * seeds, mask), torch.tensor(0.0), atol=1e-6, rtol=0.0
+    )
+    torch.testing.assert_close(
+        kd_seed_loss(seeds, -seeds, mask), torch.tensor(2.0), atol=1e-6, rtol=0.0
+    )
+
+
+def test_seed_loss_ignores_padded_rows_and_is_zero_on_an_empty_mask() -> None:
+    student = torch.randn(2, 4, 8)
+    teacher = student.clone()
+    teacher[1] = -teacher[1]  # padded row would contribute 2.0 if counted
+    mask = torch.tensor([1.0, 0.0])
+    torch.testing.assert_close(
+        kd_seed_loss(student, teacher, mask), torch.tensor(0.0), atol=1e-6, rtol=0.0
+    )
+    torch.testing.assert_close(kd_seed_loss(student, teacher, torch.zeros(2)), torch.tensor(0.0))
+
+
+# ------------------------------------------------------------------- kd_seed_gram_loss (kd_d9)
+
+
+def test_seed_gram_loss_is_zero_for_identical_seeds_and_scale_sensitive() -> None:
+    seeds = torch.randn(3, 4, 8)
+    mask = torch.ones(3)
+    torch.testing.assert_close(
+        kd_seed_gram_loss(seeds, seeds, mask), torch.tensor(0.0), atol=1e-6, rtol=0.0
+    )
+    # Raw Gram covers norms: a uniform rescale must NOT be free.
+    assert kd_seed_gram_loss(2.0 * seeds, seeds, mask).item() > 0.0
+
+
+def test_seed_gram_loss_is_invariant_to_a_shared_feature_rotation() -> None:
+    torch.manual_seed(0)
+    seeds = torch.randn(2, 4, 8)
+    rotation, _ = torch.linalg.qr(torch.randn(8, 8))
+    rotated = seeds @ rotation
+    mask = torch.ones(2)
+    torch.testing.assert_close(
+        kd_seed_gram_loss(rotated, seeds, mask), torch.tensor(0.0), atol=1e-5, rtol=0.0
+    )
+
+
+def test_seed_gram_loss_ignores_padded_rows() -> None:
+    student = torch.randn(2, 4, 8)
+    teacher = student.clone()
+    teacher[1] = 3.0 * teacher[1]
+    mask = torch.tensor([1.0, 0.0])
+    torch.testing.assert_close(
+        kd_seed_gram_loss(student, teacher, mask), torch.tensor(0.0), atol=1e-6, rtol=0.0
+    )
+
+
+# --------------------------------------------------------------------------- kd_kl_loss (kd_d9)
+
+
+def test_kl_loss_applies_the_free_bits_floor_per_dimension() -> None:
+    kl = torch.tensor([[0.01, 0.2], [0.03, 0.04]])
+    mask = torch.ones(2)
+    # Per row: sum(max(kl_dim, 0.05)) -> [0.05 + 0.2, 0.05 + 0.05]
+    expected = torch.tensor((0.25 + 0.10) / 2.0)
+    torch.testing.assert_close(kd_kl_loss(kl, mask, free_bits=0.05), expected)
+
+
+def test_kl_loss_ignores_padded_rows_and_empty_mask() -> None:
+    kl = torch.tensor([[0.5, 0.5], [100.0, 100.0]])
+    mask = torch.tensor([1.0, 0.0])
+    torch.testing.assert_close(kd_kl_loss(kl, mask, free_bits=0.0), torch.tensor(1.0))
+    torch.testing.assert_close(kd_kl_loss(kl, torch.zeros(2), free_bits=0.0), torch.tensor(0.0))

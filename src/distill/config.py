@@ -4,10 +4,12 @@ Consumed by the simple B0-protocol trainer (`src.train_b0`) as the optional
 top-level ``distill:`` config section. Exactly one arm group's weight(s) may
 be nonzero at a time -- ``kd_control`` (`w_label`), ``kd_d1`` (`w_logit`),
 ``kd_d2`` (`w_rank` and `w_dist` together), ``kd_d3`` (`w_gram`), ``kd_d4``
-(`w_align`), ``kd_d5`` (`w_residual`) -- with one deliberate exception,
+(`w_align`), ``kd_d5`` (`w_residual`) -- with two deliberate exceptions,
 ``kd_d6`` (`w_rank`, `w_dist`, and `w_gram` together, the interaction test of
-`kd_d2` + `kd_d3`) -- so a config can never straddle two KD mechanisms
-outside that one named combination.
+`kd_d2` + `kd_d3`) and ``kd_d9`` (`w_seed`, `w_geom`, and `w_kl` together,
+the pair-latent-generation arm's inseparable reconstruction + KL objective)
+-- so a config can never straddle two KD mechanisms outside those named
+combinations.
 """
 
 from __future__ import annotations
@@ -15,7 +17,19 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 
-_WEIGHT_NAMES = ("w_label", "w_logit", "w_rank", "w_dist", "w_gram", "w_align", "w_residual")
+_WEIGHT_NAMES = (
+    "w_label",
+    "w_logit",
+    "w_rank",
+    "w_dist",
+    "w_gram",
+    "w_align",
+    "w_residual",
+    "w_seed",
+    "w_geom",
+    "w_kl",
+)
+_INT_FIELDS = ("anchors_per_step", "kl_warmup_steps", "joint_start_epoch")
 
 
 @dataclass(frozen=True)
@@ -43,9 +57,24 @@ class DistillConfig:
         w_residual: ``kd_d5`` weight -- Huber loss between the student's
             node-factor residual and the teacher's beyond-content residual
             (`teacher_logit - content_logit`).
+        w_seed: ``kd_d9`` weight -- per-slot cosine reconstruction of the
+            teacher's symmetrized PMA seed tokens by the posterior-path
+            generated seeds (pair-latent generation, D9 design).
+        w_geom: ``kd_d9`` weight -- relative Frobenius match of the raw
+            within-pair seed Gram (slot norms + inter-slot geometry).
+        w_kl: ``kd_d9`` weight -- free-bits KL(q || p) tying the recognition
+            posterior to the deployed prior; warmed up over `kl_warmup_steps`.
         temperature: Softmax/KL temperature for `w_dist` (LLP reference pins 1.0).
         margin: Margin for the `w_rank` pairwise ranking loss.
         anchors_per_step: KD anchor groups drawn per optimizer step per rank.
+        kl_warmup_steps: ``kd_d9`` -- optimizer steps over which the `w_kl`
+            weight ramps linearly 0 -> 1 (0 disables the ramp).
+        joint_start_epoch: ``kd_d9`` -- first epoch of stage-2 joint
+            fine-tuning: the fusion-boundary stop-gradient drops and the
+            generator param group switches to `gen_lr_scale` x base LR
+            (0 = joint from the start).
+        gen_lr_scale: ``kd_d9`` -- stage-2 LR multiplier for the generator
+            param group.
         arm_label: Explicit arm-name override, empty by default (the weight
             pattern names the arm). `kd_d7a` reuses `kd_d2`'s exact pattern
             (`w_rank` + `w_dist`) against a heuristic-teacher targets
@@ -60,9 +89,15 @@ class DistillConfig:
     w_gram: float = 0.0
     w_align: float = 0.0
     w_residual: float = 0.0
+    w_seed: float = 0.0
+    w_geom: float = 0.0
+    w_kl: float = 0.0
     temperature: float = 1.0
     margin: float = 0.1
     anchors_per_step: int = 2
+    kl_warmup_steps: int = 2000
+    joint_start_epoch: int = 0
+    gen_lr_scale: float = 0.1
     arm_label: str = ""
 
     def __post_init__(self) -> None:
@@ -83,6 +118,12 @@ class DistillConfig:
             raise ValueError(f"margin must be positive, got {self.margin}")
         if self.anchors_per_step < 1:
             raise ValueError(f"anchors_per_step must be >= 1, got {self.anchors_per_step}")
+        if self.kl_warmup_steps < 0:
+            raise ValueError(f"kl_warmup_steps must be >= 0, got {self.kl_warmup_steps}")
+        if self.joint_start_epoch < 0:
+            raise ValueError(f"joint_start_epoch must be >= 0, got {self.joint_start_epoch}")
+        if self.gen_lr_scale <= 0.0:
+            raise ValueError(f"gen_lr_scale must be positive, got {self.gen_lr_scale}")
         nonzero = frozenset(name for name in _WEIGHT_NAMES if float(getattr(self, name)) > 0.0)
         legal_patterns: tuple[frozenset[str], ...] = (
             frozenset(),
@@ -93,13 +134,15 @@ class DistillConfig:
             frozenset({"w_align"}),
             frozenset({"w_residual"}),
             frozenset({"w_rank", "w_dist", "w_gram"}),
+            frozenset({"w_seed", "w_geom", "w_kl"}),
         )
         if nonzero not in legal_patterns:
             raise ValueError(
                 "distill weights must follow exactly one arm group -- all zero, only "
                 "w_label (kd_control), only w_logit (kd_d1), w_rank and w_dist together "
                 "(kd_d2), only w_gram (kd_d3), only w_align (kd_d4), only w_residual "
-                "(kd_d5), or w_rank, w_dist, and w_gram together (kd_d6); got nonzero "
+                "(kd_d5), w_rank, w_dist, and w_gram together (kd_d6), or w_seed, "
+                "w_geom, and w_kl together (kd_d9); got nonzero "
                 f"weights {sorted(nonzero)}"
             )
         if nonzero and not self.targets_path:
@@ -134,6 +177,7 @@ class DistillConfig:
             frozenset({"w_align"}): "kd_d4",
             frozenset({"w_residual"}): "kd_d5",
             frozenset({"w_rank", "w_dist", "w_gram"}): "kd_d6",
+            frozenset({"w_seed", "w_geom", "w_kl"}): "kd_d9",
         }[nonzero]
         return self.arm_label if (self.arm_label and self.active) else mapped
 
@@ -157,9 +201,9 @@ class DistillConfig:
                 if not isinstance(raw, str):
                     raise ValueError(f"distill.{field_spec.name} must be a string")
                 kwargs[field_spec.name] = raw
-            elif field_spec.name == "anchors_per_step":
+            elif field_spec.name in _INT_FIELDS:
                 if isinstance(raw, bool) or not isinstance(raw, int):
-                    raise ValueError("distill.anchors_per_step must be an integer")
+                    raise ValueError(f"distill.{field_spec.name} must be an integer")
                 kwargs[field_spec.name] = raw
             else:
                 if isinstance(raw, bool) or not isinstance(raw, (int, float)):

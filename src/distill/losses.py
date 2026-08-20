@@ -23,6 +23,10 @@ contributes exactly zero -- never NaN, regardless of group size.
 - `kd_d7a` is `kd_d2`'s exact losses (`kd_rank_loss` + `kd_dist_loss`) run
   over a heuristic-teacher targets artifact instead of the learned oracle --
   also no new loss code, only a different `teacher_logit` source.
+- `kd_seed_loss` + `kd_seed_gram_loss` + `kd_kl_loss` are `kd_d9`
+  (pair-conditioned oracle latent generation): posterior-path reconstruction
+  of the teacher's symmetrized PMA seed tokens (per-slot cosine + raw
+  within-pair Gram) plus the free-bits CVAE KL tying prior to posterior.
 
 LLP constants, verified against the paper's released code
 (https://github.com/snap-research/linkless-link-prediction/blob/main/src/main.py,
@@ -282,14 +286,84 @@ def kd_residual_loss(
     return _masked_mean(per_row, mask)
 
 
+def kd_seed_loss(
+    student_seeds: torch.Tensor,
+    teacher_seeds: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Masked-mean per-slot cosine distance to the teacher's seed tokens (`kd_d9`).
+
+    ``student_seeds``/``teacher_seeds`` are shape ``(B, K, d)``: the generated
+    posterior-path seeds and the symmetrized teacher PMA seed tokens. Slot
+    ``k`` matches slot ``k`` with no learned projection -- PMA seed queries
+    are fixed learned parameters, so slots correspond across pairs and the
+    student decodes directly in teacher coordinates. Per row: mean over slots
+    of ``1 - cos``; reduced by masked mean over live rows.
+    """
+    student_norm = F.normalize(student_seeds, p=2, dim=-1, eps=eps)
+    teacher_norm = F.normalize(teacher_seeds.to(dtype=student_seeds.dtype), p=2, dim=-1, eps=eps)
+    per_row = (1.0 - (student_norm * teacher_norm).sum(dim=-1)).mean(dim=-1)
+    return _masked_mean(per_row, mask)
+
+
+def kd_seed_gram_loss(
+    student_seeds: torch.Tensor,
+    teacher_seeds: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Relative Frobenius match of the raw within-pair ``K x K`` seed Gram (`kd_d9`).
+
+    Per row: ``||S_s S_s^T - S_t S_t^T||_F^2 / (||S_t S_t^T||_F^2 + eps)``.
+    The Gram is *raw* (unnormalized) on purpose: its diagonal carries slot
+    norms and its off-diagonal the inter-slot geometry, complementing
+    `kd_seed_loss`'s per-slot directions -- together they determine the seed
+    set up to a shared feature-space rotation, which the raw-coordinate
+    cosine term then pins. Unlike `kd_gram_loss` (pair-space, across the
+    batch), this matches slot-slot geometry *within* one pair's seed set.
+    """
+    teacher = teacher_seeds.to(dtype=student_seeds.dtype)
+    gram_student = student_seeds @ student_seeds.transpose(1, 2)
+    gram_teacher = teacher @ teacher.transpose(1, 2)
+    diff2 = (gram_student - gram_teacher).square().sum(dim=(1, 2))
+    scale = gram_teacher.square().sum(dim=(1, 2))
+    per_row = diff2 / (scale + eps)
+    return _masked_mean(per_row, mask)
+
+
+def kd_kl_loss(
+    kl_per_dim: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    free_bits: float,
+) -> torch.Tensor:
+    """Masked-mean free-bits KL reduction (`kd_d9`).
+
+    ``kl_per_dim`` is the model-computed analytic per-dimension
+    ``KL(q(z|c, S*) || p(z|c))``, shape ``(B, z_dim)``. Per row: sum over
+    dimensions of ``max(kl_dim, free_bits)`` -- the floor keeps gradient off
+    dimensions already below budget (posterior-collapse guard) without ever
+    rewarding collapse. The caller owns the warmup schedule; this reduction
+    is schedule-free.
+    """
+    floored = kl_per_dim.clamp_min(free_bits)
+    return _masked_mean(floored.sum(dim=-1), mask)
+
+
 __all__ = [
     "DEFAULT_MARGIN",
     "DEFAULT_TEMPERATURE",
     "kd_align_loss",
     "kd_dist_loss",
     "kd_gram_loss",
+    "kd_kl_loss",
     "kd_label_loss",
     "kd_logit_loss",
     "kd_rank_loss",
     "kd_residual_loss",
+    "kd_seed_gram_loss",
+    "kd_seed_loss",
 ]
