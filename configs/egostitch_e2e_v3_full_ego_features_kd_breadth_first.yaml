@@ -56,7 +56,7 @@ data:
 optim:
   lr: 1.0e-4
   weight_decay: 0.01
-  epochs: 1
+  epochs: 30
   warmup_steps: 500
   grad_clip: 1.0
   gradient_accumulation_steps: 2
@@ -101,7 +101,7 @@ distill:
   warm_start_readout: true
 
 seed: 0
-output_dir: outputs/egostitch_e2e_stage1_v3/full_ego_features_kd_speed_probe_b64_a2
+output_dir: outputs/egostitch_e2e_stage1_v3/full_ego_features_kd_diagnostic
 mixed_precision: "bf16"
 
 runtime:
