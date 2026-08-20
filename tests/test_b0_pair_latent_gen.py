@@ -20,7 +20,7 @@ _SEED_DIM = 12
 _MC = 2
 
 
-def _config(*, with_gen: bool = True) -> dict[str, object]:
+def _config(*, with_gen: bool = True, mc_samples: int = _MC) -> dict[str, object]:
     config: dict[str, object] = {
         "input_dim": 16,
         "d_model": 32,
@@ -37,7 +37,7 @@ def _config(*, with_gen: bool = True) -> dict[str, object]:
             "hidden": 32,
             "seed_count": _SEEDS,
             "seed_dim": _SEED_DIM,
-            "mc_samples": _MC,
+            "mc_samples": mc_samples,
             "kl_free_bits": 0.05,
         }
     return config
@@ -112,10 +112,18 @@ def test_kd_stream_forward_returns_posterior_seeds_kl_and_prior_mean_decode() ->
     assert output["gen_seeds_q"].shape == (4, _SEEDS, _SEED_DIM)
     assert output["gen_seeds_prior_mean"].shape == (4, _SEEDS, _SEED_DIM)
     assert output["gen_kl"].shape == (4, _Z_DIM)
+    assert output["gen_prior_dispersion"].shape == (4,)
     assert torch.isfinite(output["gen_seeds_q"]).all()
     assert torch.isfinite(output["gen_kl"]).all()
     assert (output["gen_kl"] >= 0.0).all()
+    assert (output["gen_prior_dispersion"] >= 0.0).all()
     assert output["gen_delta_std"].shape == (4,)
+
+
+def test_single_mc_sample_reports_zero_prior_dispersion() -> None:
+    model = V3_1(**_config(with_gen=True, mc_samples=1))
+    output = model({**_batch(), "kd_teacher_seeds": _teacher_seeds()})
+    torch.testing.assert_close(output["gen_prior_dispersion"], torch.zeros(4), atol=0.0, rtol=0.0)
 
 
 def _grad_is_live(parameters: list[torch.nn.Parameter]) -> bool:
@@ -202,11 +210,34 @@ def test_generated_latent_is_symmetric_under_endpoint_swap() -> None:
     )
 
 
-def test_generator_parameters_helper_covers_exactly_the_module() -> None:
+def test_prior_dispersion_uses_fixed_samples_in_training_mode() -> None:
+    model = V3_1(**_config(with_gen=True))
+    batch = {**_batch(), "kd_teacher_seeds": _teacher_seeds()}
+    first = model(batch)["gen_prior_dispersion"]
+    second = model(batch)["gen_prior_dispersion"]
+    torch.testing.assert_close(first, second, atol=0.0, rtol=0.0)
+
+
+def test_generator_parameters_helper_excludes_fusion_branch() -> None:
     torch.manual_seed(0)
     model = V3_1(**_config(with_gen=True))
     assert model.pair_latent_gen is not None
     helper_ids = {id(p) for p in model.pair_latent_gen_parameters()}
-    module_ids = {id(p) for p in model.pair_latent_gen.parameters()}
-    assert helper_ids == module_ids
+    generative_ids = {
+        id(p)
+        for component in (
+            model.pair_latent_gen.condition,
+            model.pair_latent_gen.prior,
+            model.pair_latent_gen.recognition,
+            model.pair_latent_gen.decoder,
+        )
+        for p in component.parameters()
+    }
+    fusion_ids = {
+        id(model.pair_latent_gen.alpha),
+        *(id(p) for p in model.pair_latent_gen.adapter.parameters()),
+        *(id(p) for p in model.pair_latent_gen.delta_head.parameters()),
+    }
+    assert helper_ids == generative_ids
+    assert helper_ids.isdisjoint(fusion_ids)
     assert V3_1(**_config(with_gen=False)).pair_latent_gen_parameters() == []

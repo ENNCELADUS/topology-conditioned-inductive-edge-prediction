@@ -1124,13 +1124,15 @@ class PairLatentGenerator(nn.Module):
         lengths_a: torch.Tensor,
         lengths_b: torch.Tensor,
         teacher_seeds: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """The KD-stream path: ``(seeds_q, kl_per_dim, prior_mean_seeds)``, all fp32.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The KD-stream path: posterior seeds, KL, prior mean, and dispersion.
 
         ``seeds_q`` is the posterior-path reconstruction (rsampled once);
         ``kl_per_dim`` the analytic ``KL(q || p)``; ``prior_mean_seeds`` the
         deployed-region decode ``g(c, mu_p)`` for the `kd_prior_cos`
-        telemetry (prior-hole witness).
+        telemetry (prior-hole witness). ``prior_dispersion`` is the per-row
+        seed-space distance between decodes at the first two fixed prior
+        samples; with one MC sample both decodes reuse it and the value is zero.
         """
         with torch.autocast(device_type=teacher_seeds.device.type, enabled=False):
             cond = self._condition(encoded_a, encoded_b, lengths_a, lengths_b)
@@ -1146,7 +1148,20 @@ class PairLatentGenerator(nn.Module):
                 - 0.5
             )
             prior_mean_seeds = self._decode(cond, mu_p)
-        return seeds_q, kl, prior_mean_seeds
+            eval_eps = self.eval_eps
+            assert isinstance(eval_eps, torch.Tensor)
+            eps = eval_eps[:2].to(device=cond.device, dtype=cond.dtype)
+            if eps.size(0) == 1:
+                eps = eps.expand(2, -1)
+            prior_z = mu_p.unsqueeze(1) + (0.5 * logvar_p).exp().unsqueeze(1) * eps.unsqueeze(0)
+            prior_samples = self._decode(
+                cond.unsqueeze(1).expand(-1, 2, -1).reshape(-1, cond.size(-1)),
+                prior_z.reshape(-1, self.z_dim),
+            ).reshape(cond.size(0), 2, self.seed_count, self.seed_dim)
+            prior_dispersion = torch.linalg.vector_norm(
+                prior_samples[:, 0] - prior_samples[:, 1], dim=(1, 2)
+            )
+        return seeds_q, kl, prior_mean_seeds, prior_dispersion
 
 
 class V3_1(nn.Module):
@@ -1374,7 +1389,16 @@ class V3_1(nn.Module):
         """Generator param group for the trainer's stage-2 LR switch (kd_d9)."""
         if self.pair_latent_gen is None:
             return []
-        return list(self.pair_latent_gen.parameters())
+        return [
+            parameter
+            for component in (
+                self.pair_latent_gen.condition,
+                self.pair_latent_gen.prior,
+                self.pair_latent_gen.recognition,
+                self.pair_latent_gen.decoder,
+            )
+            for parameter in component.parameters()
+        ]
 
     def _apply_output_head_spectral_norm(self) -> None:
         """Apply spectral norm to output-head linear layers."""
@@ -1469,12 +1493,13 @@ class V3_1(nn.Module):
             output["gen_delta_std"] = delta_std
             teacher_seeds = merged.get("kd_teacher_seeds")
             if teacher_seeds is not None:
-                seeds_q, kl, prior_mean_seeds = self.pair_latent_gen.forward_kd(
+                seeds_q, kl, prior_mean_seeds, prior_dispersion = self.pair_latent_gen.forward_kd(
                     encoded_a, encoded_b, lengths_a, lengths_b, teacher_seeds
                 )
                 output["gen_seeds_q"] = seeds_q
                 output["gen_kl"] = kl
                 output["gen_seeds_prior_mean"] = prior_mean_seeds
+                output["gen_prior_dispersion"] = prior_dispersion
         if "label" in merged:
             labels = merged["label"].float()
             logits_for_loss = (

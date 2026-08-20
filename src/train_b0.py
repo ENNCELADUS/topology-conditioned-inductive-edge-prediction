@@ -72,16 +72,19 @@ from src.data.val_region import (
     derive_val_region_split,
     val_ball_union_universe,
 )
-from src.distill.artifacts import KDTargets, load_kd_targets
+from src.distill.artifacts import KD_TARGETS_FORMAT_V4, KDTargets, load_kd_targets
 from src.distill.config import DistillConfig
 from src.distill.losses import (
     kd_align_loss,
     kd_dist_loss,
     kd_gram_loss,
+    kd_kl_loss,
     kd_label_loss,
     kd_logit_loss,
     kd_rank_loss,
     kd_residual_loss,
+    kd_seed_gram_loss,
+    kd_seed_loss,
 )
 from src.e2_pipeline import ProbeResult
 from src.eval.checkpoint_selection import (
@@ -119,6 +122,18 @@ class ValidationOutcome(NamedTuple):
 EvaluateFn = Callable[[nn.Module, Iterable[Batch], Accelerator], ValidationOutcome]
 DDP_MODES = ("probe", "epoch-probe", "train")
 T = TypeVar("T")
+D9_TELEMETRY_KEYS = (
+    "kd_prior_cos",
+    "kd_seed_cos",
+    "kd_recon_delta",
+    "kd_geom",
+    "kd_kl_per_dim",
+    "kl_active_units",
+    "gen_alpha",
+    "mc_logit_std",
+    "gen_prior_dispersion",
+    "kl_warmup_scale",
+)
 
 
 # --------------------------------------------------------------------------- config schema
@@ -488,9 +503,12 @@ def _build_scheduler(
         scheduler_cfg.final_div_factor,
         scheduler_cfg.anneal_strategy,
     )
+    max_lr: float | list[float] = scheduler_cfg.max_lr
+    if len(optimizer.param_groups) > 1:
+        max_lr = [scheduler_cfg.max_lr] * len(optimizer.param_groups)
     return torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=scheduler_cfg.max_lr,
+        max_lr=max_lr,
         total_steps=total_steps,
         pct_start=scheduler_cfg.pct_start,
         div_factor=scheduler_cfg.div_factor,
@@ -498,6 +516,76 @@ def _build_scheduler(
         anneal_strategy=cast(Literal["cos", "linear"], scheduler_cfg.anneal_strategy),
         cycle_momentum=False,
     )
+
+
+def _unwrapped_pair_latent_model(model: nn.Module) -> nn.Module:
+    """Return the underlying model when Accelerate/DDP wrapped it."""
+    current = model
+    while isinstance(getattr(current, "module", None), nn.Module):
+        current = cast(nn.Module, current.module)
+    return current
+
+
+def _build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.AdamW:
+    """Build AdamW, isolating D9 generative parameters for its staged LR."""
+    distill = cfg.distill
+    raw_model = _unwrapped_pair_latent_model(model)
+    generator_getter = getattr(raw_model, "pair_latent_gen_parameters", None)
+    generator_params = (
+        list(cast(Callable[[], list[nn.Parameter]], generator_getter)())
+        if distill is not None and distill.arm == "kd_d9" and callable(generator_getter)
+        else []
+    )
+    if not generator_params:
+        return torch.optim.AdamW(
+            model.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
+        )
+    generator_ids = {id(parameter) for parameter in generator_params}
+    base_params = [
+        parameter for parameter in model.parameters() if id(parameter) not in generator_ids
+    ]
+    if not base_params:
+        raise RuntimeError("D9 optimizer has no base/fusion parameters")
+    return torch.optim.AdamW(
+        [
+            {"params": base_params, "name": "base"},
+            {"params": generator_params, "name": "pair_latent_gen"},
+        ],
+        lr=cfg.optim.lr,
+        weight_decay=cfg.optim.weight_decay,
+    )
+
+
+def _sync_pair_latent_generator_lr(
+    optimizer: torch.optim.Optimizer, distill: DistillConfig | None, *, epoch: int
+) -> None:
+    """Keep D9's generator on the base schedule, scaled only in joint stage."""
+    if distill is None or distill.arm != "kd_d9":
+        return
+    groups = {cast(str, group.get("name")): group for group in optimizer.param_groups}
+    base = groups.get("base")
+    generator = groups.get("pair_latent_gen")
+    if base is None or generator is None:
+        raise RuntimeError("D9 optimizer is missing its base or pair_latent_gen parameter group")
+    scale = distill.gen_lr_scale if epoch >= distill.joint_start_epoch else 1.0
+    generator["lr"] = float(base["lr"]) * scale
+
+
+def _set_pair_latent_training_stage(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    distill: DistillConfig | None,
+    *,
+    epoch: int,
+) -> None:
+    """Set the rank-identical D9 stage flag and synchronize its generator LR."""
+    if distill is None or distill.arm != "kd_d9":
+        return
+    pair_latent_gen = getattr(_unwrapped_pair_latent_model(model), "pair_latent_gen", None)
+    if pair_latent_gen is None:
+        raise RuntimeError("kd_d9 requires model.config.pair_latent_gen")
+    pair_latent_gen.joint_stage = epoch >= distill.joint_start_epoch
+    _sync_pair_latent_generator_lr(optimizer, distill, epoch=epoch)
 
 
 def _count_single_process_steps(factory: LoaderFactory, cfg: Config) -> int:
@@ -1216,9 +1304,7 @@ def train_loop(
     Raises:
         RuntimeError: If training ends without a single evaluation.
     """
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
-    )
+    optimizer = _build_optimizer(model, cfg)
     model, optimizer = accelerator.prepare(model, optimizer)
     scheduler = _build_scheduler(
         optimizer,
@@ -1241,6 +1327,7 @@ def train_loop(
     for epoch in range(1, cfg.optim.epochs + 1):
         last_epoch = epoch
         model.train()
+        _set_pair_latent_training_stage(model, optimizer, cfg.distill, epoch=epoch)
         losses: list[float] = []
         for batch in train_loader_factory(epoch):
             batch = _to_device(batch, accelerator.device)
@@ -1252,6 +1339,7 @@ def train_loop(
                 accelerator.clip_grad_norm_(model.parameters(), cfg.optim.grad_clip)
             optimizer.step()
             _step_scheduler(scheduler)
+            _sync_pair_latent_generator_lr(optimizer, cfg.distill, epoch=epoch)
             global_step += 1
             losses.append(float(loss.detach().float().item()))
             if global_step % 50 == 0:
@@ -2428,12 +2516,14 @@ class KDStream:
         seed: int,
         rank: int,
         world_size: int,
+        model: nn.Module | None = None,
     ) -> None:
         self._distill = distill
         self._targets = targets
         self._table = table
         self._seed = seed
         self._rank = rank
+        self.last_telemetry: dict[str, float] = {}
         # Data boundary (fail closed): every teacher-target node — anchors and
         # partners both index `node_ids` — must lie inside the training
         # universe. A stale/foreign artifact must never train on V_val or
@@ -2478,6 +2568,38 @@ class KDStream:
                 "distill.w_residual requires a KD targets artifact with content_logit "
                 "(kd_targets v3)"
             )
+        if distill.w_seed > 0.0:
+            pair_latent_gen = (
+                getattr(_unwrapped_pair_latent_model(model), "pair_latent_gen", None)
+                if model is not None
+                else None
+            )
+            if pair_latent_gen is None:
+                raise RuntimeError("distill.w_seed requires model.config.pair_latent_gen")
+            teacher_seeds = targets.teacher_seeds
+            if teacher_seeds is None or targets.manifest.get("format") != KD_TARGETS_FORMAT_V4:
+                raise RuntimeError(
+                    "distill.w_seed requires a kd_targets_v4 artifact with teacher_seeds"
+                )
+            expected_shape = (
+                len(targets.pair_anchor_idx),
+                int(pair_latent_gen.seed_count),
+                int(pair_latent_gen.seed_dim),
+            )
+            if teacher_seeds.shape != expected_shape:
+                raise RuntimeError(
+                    "KD teacher_seeds shape does not match model pair_latent_gen: "
+                    f"artifact={teacher_seeds.shape}, expected={expected_shape}"
+                )
+            manifest_shape = (
+                targets.manifest.get("seed_count"),
+                targets.manifest.get("seed_dim"),
+            )
+            if manifest_shape != expected_shape[1:]:
+                raise RuntimeError(
+                    "KD v4 seed manifest does not match model pair_latent_gen: "
+                    f"artifact={manifest_shape}, expected={expected_shape[1:]}"
+                )
 
     def _anchor_positions(self, epoch: int, step: int) -> list[int]:
         """This rank's `anchors_per_step` artifact node positions for one step."""
@@ -2495,6 +2617,7 @@ class KDStream:
 
     def loss(self, model: nn.Module, epoch: int, step: int) -> torch.Tensor:
         """Score this step's KD rows and return the weighted KD loss."""
+        self.last_telemetry = {}
         targets = self._targets
         distill = self._distill
         anchor_rows: list[int] = []
@@ -2505,10 +2628,15 @@ class KDStream:
         group: list[int] = []
         mask: list[float] = []
         content_logit_list: list[float] = []
+        teacher_seed_list: list[np.ndarray] = []
         collect_content = distill.w_residual > 0.0
+        collect_seeds = distill.w_seed > 0.0
         content_logit_arr = targets.content_logit
+        teacher_seeds_arr = targets.teacher_seeds
         if collect_content:
             assert content_logit_arr is not None  # validated in __init__
+        if collect_seeds:
+            assert teacher_seeds_arr is not None  # validated in __init__
         pooled_dim = targets.teacher_pooled_ab.shape[-1]
         for anchor_pos in self._anchor_positions(epoch, step):
             start = int(targets.anchor_offsets[anchor_pos])
@@ -2534,6 +2662,9 @@ class KDStream:
                     if collect_content:
                         assert content_logit_arr is not None
                         content_logit_list.append(float(content_logit_arr[csr]))
+                    if collect_seeds:
+                        assert teacher_seeds_arr is not None
+                        teacher_seed_list.append(teacher_seeds_arr[csr].astype(np.float32))
                 else:
                     anchor_rows.append(anchor_row)
                     partner_rows.append(anchor_row)
@@ -2544,12 +2675,22 @@ class KDStream:
                     mask.append(0.0)
                     if collect_content:
                         content_logit_list.append(0.0)
+                    if collect_seeds:
+                        assert teacher_seeds_arr is not None
+                        teacher_seed_list.append(
+                            np.zeros(teacher_seeds_arr.shape[1:], dtype=np.float32)
+                        )
 
         emb_a, len_a = self._gather(anchor_rows)
         emb_b, len_b = self._gather(partner_rows)
+        model_batch = {"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b}
+        if collect_seeds:
+            model_batch["kd_teacher_seeds"] = torch.tensor(
+                np.stack(teacher_seed_list), dtype=torch.float32, device=emb_a.device
+            )
         output = cast(
             dict[str, torch.Tensor],
-            model({"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b}),
+            model(model_batch),
         )
         logits = output["logits"]
         if logits.dim() > 1 and logits.size(-1) == 1:
@@ -2607,6 +2748,75 @@ class KDStream:
             total = total + distill.w_residual * kd_residual_loss(
                 res.float(), teacher - content, kd_mask
             )
+        if collect_seeds:
+            teacher_seeds = model_batch["kd_teacher_seeds"].float()
+            generated = output.get("gen_seeds_q")
+            generated_prior = output.get("gen_seeds_prior_mean")
+            kl = output.get("gen_kl")
+            mc_std = output.get("gen_delta_std")
+            prior_dispersion = output.get("gen_prior_dispersion")
+            if any(
+                value is None
+                for value in (generated, generated_prior, kl, mc_std, prior_dispersion)
+            ):
+                raise RuntimeError("kd_d9 model forward is missing pair-latent outputs")
+            assert generated is not None
+            assert generated_prior is not None
+            assert kl is not None
+            assert mc_std is not None
+            assert prior_dispersion is not None
+            seed_loss = kd_seed_loss(generated.float(), teacher_seeds, kd_mask)
+            geom_loss = kd_seed_gram_loss(generated.float(), teacher_seeds, kd_mask)
+            pair_latent_gen = getattr(_unwrapped_pair_latent_model(model), "pair_latent_gen", None)
+            if pair_latent_gen is None:
+                raise RuntimeError("kd_d9 requires model.config.pair_latent_gen")
+            kl_loss = kd_kl_loss(kl.float(), kd_mask, free_bits=float(pair_latent_gen.kl_free_bits))
+            kl_scale = (
+                1.0 if distill.kl_warmup_steps == 0 else min(1.0, step / distill.kl_warmup_steps)
+            )
+            total = (
+                total
+                + distill.w_seed * seed_loss
+                + distill.w_geom * geom_loss
+                + distill.w_kl * kl_scale * kl_loss
+            )
+
+            def masked_mean(values: torch.Tensor) -> torch.Tensor:
+                weights = kd_mask.to(values.dtype)
+                return (values * weights).sum() / weights.sum().clamp_min(1.0)
+
+            teacher_unit = nn.functional.normalize(teacher_seeds, dim=-1, eps=1e-8)
+            posterior_cos = (
+                (nn.functional.normalize(generated.float(), dim=-1, eps=1e-8) * teacher_unit)
+                .sum(dim=-1)
+                .mean(dim=-1)
+            )
+            prior_cos = (
+                (nn.functional.normalize(generated_prior.float(), dim=-1, eps=1e-8) * teacher_unit)
+                .sum(dim=-1)
+                .mean(dim=-1)
+            )
+            mean_kl_dim = (kl.float() * kd_mask.unsqueeze(-1)).sum(dim=0) / kd_mask.sum().clamp_min(
+                1.0
+            )
+            teacher_norm = torch.linalg.vector_norm(
+                teacher_seeds.reshape(teacher_seeds.size(0), -1), dim=-1
+            ).clamp_min(1e-8)
+            normalized_dispersion = prior_dispersion.float() / teacher_norm
+            seed_cos_value = masked_mean(posterior_cos)
+            prior_cos_value = masked_mean(prior_cos)
+            self.last_telemetry = {
+                "kd_prior_cos": float(prior_cos_value.detach().item()),
+                "kd_seed_cos": float(seed_cos_value.detach().item()),
+                "kd_recon_delta": float((seed_cos_value - prior_cos_value).detach().item()),
+                "kd_geom": float(geom_loss.detach().item()),
+                "kd_kl_per_dim": float(mean_kl_dim.mean().detach().item()),
+                "kl_active_units": float((mean_kl_dim > 0.02).sum().detach().item()),
+                "gen_alpha": float(pair_latent_gen.alpha.detach().float().item()),
+                "mc_logit_std": float(masked_mean(mc_std.float()).detach().item()),
+                "gen_prior_dispersion": float(masked_mean(normalized_dispersion).detach().item()),
+                "kl_warmup_scale": kl_scale,
+            }
         return total
 
     def resume_state(self, *, epoch: int, global_step: int) -> dict[str, int]:
@@ -2694,9 +2904,7 @@ def train_ddp_loop(
     Raises:
         RuntimeError: On a non-finite loss or a per-rank step-count divergence.
     """
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
-    )
+    optimizer = _build_optimizer(model, cfg)
     model, optimizer = accelerator.prepare(model, optimizer)
     scheduler = _build_scheduler(
         optimizer,
@@ -2900,8 +3108,10 @@ def train_ddp_loop(
     last_heartbeat = time.monotonic()
     for epoch in range(start_epoch, cfg.optim.epochs + 1):
         model.train()
+        _set_pair_latent_training_stage(model, optimizer, cfg.distill, epoch=epoch)
         local_loss_sum = 0.0
         epoch_kd_loss_sum = 0.0
+        epoch_kd_telemetry_sums = dict.fromkeys(D9_TELEMETRY_KEYS, 0.0)
         epoch_steps = 0
         epoch_local_pairs = 0
         epoch_global_pairs = 0
@@ -2939,6 +3149,10 @@ def train_ddp_loop(
                 kd_loss = kd_loss_fn(model, epoch, global_step + 1)
                 loss = loss + kd_loss
                 epoch_kd_loss_sum += float(kd_loss.detach().float().item())
+                kd_owner = getattr(kd_loss_fn, "__self__", None)
+                if isinstance(kd_owner, KDStream):
+                    for key, value in kd_owner.last_telemetry.items():
+                        epoch_kd_telemetry_sums[key] += value
 
             if not _all_ranks_loss_finite(loss, accelerator):
                 raise RuntimeError(f"non-finite training loss on at least one rank (epoch {epoch})")
@@ -2949,6 +3163,7 @@ def train_ddp_loop(
                 accelerator.clip_grad_norm_(model.parameters(), cfg.optim.grad_clip)
             optimizer.step()
             _step_scheduler(scheduler)
+            _sync_pair_latent_generator_lr(optimizer, cfg.distill, epoch=epoch)
             if start_event is not None and end_event is not None:
                 end_event.record()  # type: ignore[no-untyped-call]
                 cuda_event_pairs.append((start_event, end_event))
@@ -3051,6 +3266,32 @@ def train_ddp_loop(
             if global_sample_count > 0
             else float("nan")
         )
+        train_kd_loss: float | None = None
+        if kd_loss_fn is not None and epoch_steps > 0:
+            global_kd_loss_sum = accelerator.reduce(
+                torch.tensor(
+                    epoch_kd_loss_sum,
+                    device=accelerator.device,
+                    dtype=torch.float64,
+                ),
+                reduction="sum",
+            )
+            train_kd_loss = float(global_kd_loss_sum.item()) / float(epoch_steps * world_size)
+        epoch_kd_telemetry: dict[str, float] = {}
+        if cfg.distill is not None and cfg.distill.arm == "kd_d9" and epoch_steps > 0:
+            telemetry_totals = accelerator.reduce(
+                torch.tensor(
+                    [epoch_kd_telemetry_sums[key] for key in D9_TELEMETRY_KEYS],
+                    device=accelerator.device,
+                    dtype=torch.float64,
+                ),
+                reduction="sum",
+            )
+            denominator = float(epoch_steps * world_size)
+            epoch_kd_telemetry = {
+                key: float(telemetry_totals[index].item()) / denominator
+                for index, key in enumerate(D9_TELEMETRY_KEYS)
+            }
         validation_start = time.monotonic()
         outcome = evaluate_fn(model, val_loader, accelerator)
         metrics = outcome.metrics
@@ -3073,8 +3314,9 @@ def train_ddp_loop(
             "val_auroc": metrics.auroc,
             "val_auprc": metrics.auprc,
         }
-        if kd_loss_fn is not None and epoch_steps > 0:
-            entry["train_kd_loss"] = epoch_kd_loss_sum / epoch_steps
+        if train_kd_loss is not None:
+            entry["train_kd_loss"] = train_kd_loss
+        entry.update(epoch_kd_telemetry)
         if outcome.topology is not None:
             entry.update(
                 {
@@ -3776,6 +4018,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             seed=cfg.seed,
             rank=accelerator.process_index,
             world_size=accelerator.num_processes,
+            model=model,
         )
         kd_loss_fn = kd_stream.loss
         if accelerator.is_main_process:
