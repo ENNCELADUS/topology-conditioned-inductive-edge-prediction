@@ -179,7 +179,10 @@ def assert_training_side_only(
 
 def require_full_ego_oracle(model: EgoStitchModel) -> FullOracleGenerator:
     """Refuse any generator but `full_ego_oracle` (the B1 plan's only legal teacher)."""
-    if not isinstance(model.generator, FullOracleGenerator):
+    if (
+        model.cfg.generator.name != "full_ego_oracle"
+        or type(model.generator) is not FullOracleGenerator
+    ):
         raise ValueError(
             "KD teacher targets require a checkpoint whose generator is "
             f"'full_ego_oracle'; got {type(model.generator).__name__}. Scoring any "

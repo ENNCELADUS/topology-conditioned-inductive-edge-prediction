@@ -1148,6 +1148,26 @@ def e2e_accumulation_window_sizes(microsteps: int, accumulation_steps: int) -> l
     return [accumulation_steps] * full + ([tail] if tail else [])
 
 
+def e2e_global_live_row_mean(
+    local_sum: torch.Tensor,
+    *,
+    live_rows: torch.Tensor,
+    world_size: int,
+    global_denominator: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Normalize one local KD sum for accumulation plus DDP gradient averaging."""
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    denominator = live_rows if global_denominator is None else global_denominator
+    if not bool(torch.isfinite(denominator)) or float(denominator) < 0.0:
+        raise RuntimeError("global KD live-row denominator must be finite and non-negative")
+    if float(denominator) == 0.0:
+        if float(live_rows) != 0.0 or float(local_sum.detach()) != 0.0:
+            raise RuntimeError("empty global KD population has a non-zero local contribution")
+        return local_sum * 0.0
+    return world_size * local_sum / denominator
+
+
 def e2e_window_effective_weight_denominator(
     batches: Sequence[_CompositeBatch], *, positive_weight: float
 ) -> torch.Tensor:
@@ -2837,6 +2857,8 @@ def _build_kd_runtime(
     generator = model.generator
     if not isinstance(generator, FullEgoFeaturesGenerator):
         raise ValueError("distill requires the full_ego_features generator")
+    if model.cfg.encoder.name != "grit_gmt":
+        raise ValueError("Gate A seed KD requires a grit_gmt student encoder")
     checkpoint = cast(
         Mapping[str, object],
         torch.load(distill.teacher_checkpoint, map_location="cpu", weights_only=True),
@@ -2853,6 +2875,8 @@ def _build_kd_runtime(
     teacher_cfg = E2EConfig.from_mapping(cast(Mapping[str, object], checkpoint["model_config"]))
     if teacher_cfg.generator.name != "full_ego_oracle":
         raise ValueError("teacher checkpoint generator must be full_ego_oracle")
+    if teacher_cfg.encoder.name != "grit_gmt":
+        raise ValueError("Gate A seed KD requires a grit_gmt teacher encoder")
     if (
         teacher_cfg.encoder != model.cfg.encoder
         or teacher_cfg.classifier.d_model != model.cfg.classifier.d_model
@@ -2890,8 +2914,7 @@ def _build_kd_runtime(
         load_result = student_encoder.load_state_dict(readout_state, strict=False)
         if load_result.unexpected_keys:
             raise ValueError(
-                "warm-start keys absent on the student encoder: "
-                f"{load_result.unexpected_keys[:5]}"
+                f"warm-start keys absent on the student encoder: {load_result.unexpected_keys[:5]}"
             )
     teacher_encoder.to(device=device, dtype=torch.float32)
     teacher_encoder.eval()
@@ -2946,8 +2969,8 @@ class _CompositeStep(torch.nn.Module):
         embedding_ab: GraphEmbedding | None,
         embedding_ba: GraphEmbedding | None,
         edge_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute the Gate A seed and set-Gram KD terms for one edge batch.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute local Gate A KD sums and their effective row counts.
 
         The teacher graph is rebuilt from the features generator's stashed
         structural view over the *same* padded node layout the student just
@@ -3007,7 +3030,11 @@ class _CompositeStep(torch.nn.Module):
                     live,
                 )
             )
-        return seed, gram
+        live_rows = live.to(dtype=seed.dtype).sum()
+        gram_live_rows = (
+            (live & (node_mask.to(dtype=torch.bool).sum(dim=1) >= 2)).to(dtype=gram.dtype).sum()
+        )
+        return seed * live_rows, gram * gram_live_rows, live_rows, gram_live_rows
 
     def forward(self, batch: dict[str, object]) -> dict[str, object]:
         node = cast(dict[str, torch.Tensor], batch["node"])
@@ -3168,12 +3195,25 @@ class _CompositeStep(torch.nn.Module):
                 batch.get("recon_factors"),
             ),
         )
+        kd_stats: dict[str, float] | None = None
         if self._kd is not None:
-            kd_seed, kd_gram = self._kd_terms(
+            kd_seed_sum, kd_gram_sum, kd_live_rows, kd_gram_live_rows = self._kd_terms(
                 graph,
                 embedding_ab,
                 cast(GraphEmbedding | None, edge_output.get("embedding_ba")),
                 edge["edge_mask"],
+            )
+            kd_seed = e2e_global_live_row_mean(
+                kd_seed_sum,
+                live_rows=kd_live_rows,
+                world_size=self.world_size,
+                global_denominator=cast(torch.Tensor | None, batch.get("kd_seed_denominator")),
+            )
+            kd_gram = e2e_global_live_row_mean(
+                kd_gram_sum,
+                live_rows=kd_gram_live_rows,
+                world_size=self.world_size,
+                global_denominator=cast(torch.Tensor | None, batch.get("kd_gram_denominator")),
             )
             kd_total = self._kd.lambda_seed * kd_seed + self._kd.lambda_gram * kd_gram
             total = total + kd_total
@@ -3183,6 +3223,12 @@ class _CompositeStep(torch.nn.Module):
             parts["kd_seed"] = float(kd_seed.detach())
             parts["kd_gram"] = float(kd_gram.detach())
             parts["total"] = float(total.detach())
+            kd_stats = {
+                "seed_sum": float(kd_seed_sum.detach()),
+                "gram_sum": float(kd_gram_sum.detach()),
+                "live_rows": float(kd_live_rows.detach()),
+                "gram_live_rows": float(kd_gram_live_rows.detach()),
+            }
         parameter_anchor = (
             0.0
             * torch.stack(
@@ -3199,6 +3245,8 @@ class _CompositeStep(torch.nn.Module):
             "loss": total,
             "parts": parts,
         }
+        if kd_stats is not None:
+            result["kd_stats"] = kd_stats
         if collect_diagnostics:
             result["families"] = families
             result.update(extra)
@@ -4247,6 +4295,8 @@ def _e2e_training_payload(
     total_steps: int,
     device: torch.device,
     edge_loss_denominator: torch.Tensor | None = None,
+    kd_seed_denominator: torch.Tensor | None = None,
+    kd_gram_denominator: torch.Tensor | None = None,
 ) -> dict[str, object]:
     return {
         "node": _to_device(batch.node, device),
@@ -4264,6 +4314,8 @@ def _e2e_training_payload(
         "epoch": epoch,
         "step": micro_step,
         "edge_loss_denominator": edge_loss_denominator,
+        "kd_seed_denominator": kd_seed_denominator,
+        "kd_gram_denominator": kd_gram_denominator,
         "positive_weight": (cfg.training.positive_weight if cfg.training is not None else 5.0),
     }
 
@@ -4817,6 +4869,9 @@ def _train_e2e_stability_loop(
         if cfg.distill is not None
         else None
     )
+    kd_generator = (
+        cast(FullEgoFeaturesGenerator, model.generator) if kd_runtime is not None else None
+    )
     composite = _CompositeStep(model, world, kd=kd_runtime)
     optimizer = torch.optim.AdamW(
         [
@@ -4994,6 +5049,7 @@ def _train_e2e_stability_loop(
         epoch_local_tokens = 0
         epoch_global_pairs = 0
         epoch_parts: dict[str, float] = {}
+        epoch_kd_local = [0.0, 0.0, 0.0, 0.0]
         epoch_probes: list[dict[str, object]] = []
         epoch_validation_seconds = 0.0
         epoch_validation_timing = dict.fromkeys(total_validation_timing, 0.0)
@@ -5035,6 +5091,31 @@ def _train_e2e_stability_loop(
                     raise RuntimeError(
                         "global accumulated weighted-BCE denominator must be finite and positive"
                     )
+                kd_seed_denominator: torch.Tensor | None = None
+                kd_gram_denominator: torch.Tensor | None = None
+                if kd_runtime is not None:
+                    assert kd_generator is not None
+                    local_kd_rows = torch.zeros(2, dtype=torch.float32)
+                    for batch in window:
+                        live = batch.edge["edge_mask"].to(dtype=torch.bool)
+                        candidate_counts = kd_generator.candidate_node_counts(
+                            batch.edge["node_row_i"], batch.edge["node_row_j"]
+                        )
+                        local_kd_rows[0] += live.sum()
+                        local_kd_rows[1] += (live & (candidate_counts >= 2)).sum()
+                    kd_denominators = accelerator.reduce(
+                        local_kd_rows.to(accelerator.device), reduction="sum"
+                    )
+                    kd_seed_denominator = kd_denominators[0]
+                    kd_gram_denominator = kd_denominators[1]
+                    if (
+                        not bool(torch.isfinite(kd_denominators).all())
+                        or float(kd_seed_denominator) <= 0.0
+                        or float(kd_gram_denominator) < 0.0
+                    ):
+                        raise RuntimeError(
+                            "global accumulated KD denominators must be finite with seed rows"
+                        )
                 optimizer.zero_grad(set_to_none=True)
                 out: dict[str, object] | None = None
                 loss: torch.Tensor | None = None
@@ -5050,10 +5131,14 @@ def _train_e2e_stability_loop(
                         total_steps=schedule_total_steps,
                         device=accelerator.device,
                         edge_loss_denominator=edge_loss_denominator,
+                        kd_seed_denominator=kd_seed_denominator,
+                        kd_gram_denominator=kd_gram_denominator,
                     )
                     if fixed_replay is None:
                         fixed_replay = cast(dict[str, object], _detached_clone(payload))
                         fixed_replay.pop("edge_loss_denominator", None)
+                        fixed_replay.pop("kd_seed_denominator", None)
+                        fixed_replay.pop("kd_gram_denominator", None)
                     synchronization = (
                         accelerator.no_sync(wrapped)
                         if micro_index + 1 < len(window)
@@ -5074,6 +5159,12 @@ def _train_e2e_stability_loop(
                         accelerator.backward(loss)
                     for name, value in cast(dict[str, float], out["parts"]).items():
                         window_parts[name] = window_parts.get(name, 0.0) + value
+                    if kd_runtime is not None:
+                        kd_stats = cast(dict[str, float], out["kd_stats"])
+                        epoch_kd_local[0] += kd_stats["seed_sum"]
+                        epoch_kd_local[1] += kd_stats["gram_sum"]
+                        epoch_kd_local[2] += kd_stats["live_rows"]
+                        epoch_kd_local[3] += kd_stats["gram_live_rows"]
                     micro_step_in_epoch += 1
                     epoch_local_pairs += batch.edge_rows_true
                     epoch_local_tokens += batch.f0_rows_gathered
@@ -5344,6 +5435,24 @@ def _train_e2e_stability_loop(
 
         finally:
             batches.close()
+
+        if kd_runtime is not None:
+            epoch_kd_global = accelerator.reduce(
+                torch.tensor(epoch_kd_local, device=accelerator.device, dtype=torch.float64),
+                reduction="sum",
+            )
+            if (
+                not bool(torch.isfinite(epoch_kd_global).all())
+                or float(epoch_kd_global[2]) <= 0.0
+                or float(epoch_kd_global[3]) < 0.0
+            ):
+                raise RuntimeError("global epoch KD telemetry must be finite with live rows")
+            epoch_parts["kd_seed"] = float(epoch_kd_global[0] / epoch_kd_global[2])
+            epoch_parts["kd_gram"] = (
+                float(epoch_kd_global[1] / epoch_kd_global[3])
+                if float(epoch_kd_global[3]) > 0.0
+                else 0.0
+            )
 
         validation_started = time.monotonic()
         validation = _validate_epoch(

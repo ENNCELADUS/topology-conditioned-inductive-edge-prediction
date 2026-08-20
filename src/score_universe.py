@@ -63,7 +63,7 @@ import pickle
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
@@ -2136,6 +2136,19 @@ def _score_cazi_mbn(
     return out
 
 
+def _map_full_ego_graph_tensors(
+    graph: FullEgoGraph, transform: Callable[[torch.Tensor], torch.Tensor]
+) -> FullEgoGraph:
+    """Transform graph tensors without discarding a concrete graph subtype."""
+    return replace(
+        graph,
+        x=transform(graph.x),
+        adj=transform(graph.adj),
+        mask=transform(graph.mask),
+        aux={key: transform(value) for key, value in graph.aux.items()},
+    )
+
+
 def _score_egostitch_e2e(
     model: nn.Module,
     pairs: Sequence[tuple[str, str]],
@@ -2573,24 +2586,12 @@ def _score_egostitch_e2e(
         )
 
     def _pin_graph(graph: FullEgoGraph) -> FullEgoGraph:
-        return FullEgoGraph(
-            x=graph.x.pin_memory(),
-            adj=graph.adj.pin_memory(),
-            mask=graph.mask.pin_memory(),
-            aux={key: value.pin_memory() for key, value in graph.aux.items()},
-            directed=graph.directed,
-        )
+        return _map_full_ego_graph_tensors(graph, torch.Tensor.pin_memory)
 
     def _move_graph(graph: FullEgoGraph, *, non_blocking: bool) -> FullEgoGraph:
-        return FullEgoGraph(
-            x=graph.x.to(device=device, non_blocking=non_blocking),
-            adj=graph.adj.to(device=device, non_blocking=non_blocking),
-            mask=graph.mask.to(device=device, non_blocking=non_blocking),
-            aux={
-                key: value.to(device=device, non_blocking=non_blocking)
-                for key, value in graph.aux.items()
-            },
-            directed=graph.directed,
+        return _map_full_ego_graph_tensors(
+            graph,
+            lambda value: value.to(device=device, non_blocking=non_blocking),
         )
 
     out: dict[str, NDArray[np.float32]] = {
@@ -3200,9 +3201,7 @@ def _run_score(args: argparse.Namespace) -> None:
             is_full_ego_family = isinstance(model.generator, FullOracleGenerator)
             oracle_generator_name = model.cfg.generator.name
     if is_full_ego_family and args.scaffold_control != _SCAFFOLD_CONTROL_NONE:
-        raise ValueError(
-            f"{oracle_generator_name} does not support scoring-time scaffold controls"
-        )
+        raise ValueError(f"{oracle_generator_name} does not support scoring-time scaffold controls")
     if args.allow_oracle_diagnostic and not is_oracle_generator:
         raise ValueError(
             "--allow-oracle-diagnostic is valid only when the checkpoint's "
@@ -3374,9 +3373,7 @@ def _run_score(args: argparse.Namespace) -> None:
             missing_features=frozenset(cazi_cfg.expected_missing_features),
         )
     elif model_family == "egostitch_e2e":
-        thread_count = (
-            _FULL_ORACLE_CPU_THREADS if is_full_ego_family else torch.get_num_threads()
-        )
+        thread_count = _FULL_ORACLE_CPU_THREADS if is_full_ego_family else torch.get_num_threads()
         with _torch_intraop_threads(thread_count):
             decomposed = _score_egostitch_e2e(
                 model,

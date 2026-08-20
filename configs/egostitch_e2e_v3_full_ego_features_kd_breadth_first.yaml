@@ -7,10 +7,13 @@
 # degenerates into a relational set encoder (RRWP collapses to the identity
 # channel; update_e's edge channel becomes a learned pair bias), and the
 # distill block matches its node tokens and 4 PMA seed tokens against the
-# frozen full_ego_oracle teacher encoder on the identical node layout
-# (`train_egostitch._build_kd_runtime`). Everything else -- protocol, budgets,
-# batching -- mirrors the full_ego_oracle diagnostic arm it is compared
-# against; readouts compare to that ceiling and the null-generator control.
+# frozen full_ego_teacher_kd encoder on the identical node layout
+# (`train_egostitch._build_kd_runtime`). `oracle_truth_source:
+# training_structure` follows the KD-teacher arm's load-bearing rule: the
+# student's candidate sets and its stitched KD targets both derive from the
+# V_val-quarantined training graph, so no V_val-internal truth reaches V_val
+# checkpoint selection. Protocol, budgets, and batching mirror the full-ego
+# arms; readouts compare to full_ego_teacher_kd and the null-generator control.
 
 model:
   family: egostitch_e2e
@@ -18,7 +21,7 @@ model:
     generator:
       name: full_ego_features
       oracle_seed: 0
-      oracle_truth_source: training_structure_plus_g_val
+      oracle_truth_source: training_structure
       n_ground: 50
       feature_standardization: row_layernorm
     encoder:
@@ -92,7 +95,7 @@ eval:
   eval_every: 1
 
 distill:
-  teacher_checkpoint: outputs/egostitch_e2e_stage1_v3/full_ego_oracle_grit_pooled_diagnostic/best.pt
+  teacher_checkpoint: outputs/egostitch_e2e_stage1_v3/full_ego_teacher_kd/best.pt
   lambda_seed: 1.0
   lambda_gram: 1.0
   warm_start_readout: true

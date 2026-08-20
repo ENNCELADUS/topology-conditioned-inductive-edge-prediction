@@ -146,6 +146,13 @@ def test_require_full_ego_oracle_refuses_a_null_generator() -> None:
         tt.require_full_ego_oracle(model)
 
 
+def test_require_full_ego_oracle_refuses_the_features_subclass() -> None:
+    model = EgoStitchModel(E2EConfig.from_mapping({"generator": {"name": "full_ego_features"}}))
+
+    with pytest.raises(ValueError, match="full_ego_oracle"):
+        tt.require_full_ego_oracle(model)
+
+
 # --------------------------------------------------------------------------- artifact roundtrip
 
 

@@ -87,6 +87,26 @@ class FullOracleGenerator(NeighborhoodGenerator[GeneratorNodeState, object, Full
             np.concatenate(neighbor_rows) if int(indptr[-1]) else np.empty(0, dtype=np.int64)
         )
 
+    def candidate_node_counts(
+        self, node_rows_a: torch.Tensor, node_rows_b: torch.Tensor
+    ) -> torch.Tensor:
+        """Count the exact oracle candidate nodes for each context-row pair."""
+        if self._node_ids is None or self._neighbors is None:
+            raise RuntimeError("full oracle context is not installed")
+        if node_rows_a.shape != node_rows_b.shape or node_rows_a.ndim != 1:
+            raise ValueError("node row tensors must be matching one-dimensional tensors")
+        rows_a = node_rows_a.detach().to(device="cpu", dtype=torch.int64).tolist()
+        rows_b = node_rows_b.detach().to(device="cpu", dtype=torch.int64).tolist()
+        if any(row < 0 or row >= len(self._node_ids) for row in (*rows_a, *rows_b)):
+            raise ValueError("context-local node rows are out of range")
+        counts = []
+        for row_a, row_b in zip(rows_a, rows_b, strict=True):
+            node_a = self._node_ids[row_a]
+            node_b = self._node_ids[row_b]
+            candidates = self._neighbors[node_a] | self._neighbors[node_b] | {node_a, node_b}
+            counts.append(len(candidates))
+        return torch.tensor(counts, device=node_rows_a.device, dtype=torch.int64)
+
     def encode_node(
         self,
         x: torch.Tensor,
