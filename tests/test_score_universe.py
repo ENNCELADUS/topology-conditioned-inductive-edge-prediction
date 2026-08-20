@@ -156,6 +156,66 @@ def test_packed_scoring_caches_encoder_without_changing_logits(
     np.testing.assert_allclose(actual, reference, rtol=0.0, atol=0.0)
 
 
+def test_packed_scoring_includes_pair_latent_residual(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    torch.manual_seed(0)
+    model_config = _tiny_v3_1_config()
+    model_config["pair_latent_gen"] = {
+        "z_dim": 2,
+        "cond_dim": 4,
+        "hidden": 4,
+        "seed_count": 2,
+        "seed_dim": 3,
+        "mc_samples": 2,
+        "kl_free_bits": 0.05,
+    }
+    model = score_universe.build_model("v3_1", model_config)
+    assert isinstance(model, V3_1)
+    assert model.pair_latent_gen is not None
+    model.pair_latent_gen.alpha.data.fill_(0.75)
+    model.eval()
+
+    feature_root = tmp_path / "features"
+    nodes = {
+        "node_00": torch.randn(3, INPUT_DIM),
+        "node_01": torch.randn(4, INPUT_DIM),
+        "node_02": torch.randn(5, INPUT_DIM),
+    }
+    _write_feature_store(feature_root, nodes)
+    pack_root = tmp_path / "pack"
+    monkeypatch.setattr(packed_features, "ProcessPoolExecutor", ThreadPoolExecutor)
+    build_packed_features(feature_root, pack_root, workers=1)
+    pairs = [("node_00", "node_01"), ("node_02", "node_00")]
+
+    table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
+    node_index = table.manifest.node_index()
+    compact = CompactPairBatch(
+        row_ids=torch.tensor([0, 1]),
+        node_a=torch.tensor([node_index[u] for u, _ in pairs]),
+        node_b=torch.tensor([node_index[v] for _, v in pairs]),
+        labels=torch.zeros(2),
+        bucket_boundary=128,
+        global_pair_count=2,
+    )
+    reference_batch = table.assemble(compact)
+    reference_batch["emb_a"] = reference_batch["emb_a"].float()
+    reference_batch["emb_b"] = reference_batch["emb_b"].float()
+    with torch.inference_mode():
+        reference = model(reference_batch)["logits"].numpy().reshape(-1)
+
+    actual = score_universe._score_v3_1_packed(
+        model,
+        pairs,
+        pack_root,
+        device=torch.device("cpu"),
+        amp="off",
+        token_budget=512,
+    )
+
+    np.testing.assert_allclose(actual, reference, rtol=0.0, atol=0.0)
+
+
 def test_load_bare_legacy_checkpoint_with_explicit_model_metadata(tmp_path: Path) -> None:
     model_config = _tiny_v3_1_config()
     source_model = score_universe.build_model("v3_1", model_config)
