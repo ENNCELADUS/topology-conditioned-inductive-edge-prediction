@@ -32,12 +32,15 @@ pytestmark = pytest.mark.unit
 # selected, so the feature store backing these tests must use that exact
 # node-token width (mirrors tests/test_score_universe.py's `_E2E_NODE_DIM`).
 _NODE_DIM = 1536
+_SEEDS = 4
+# The KD seed dump requires the PMA (grit_gmt) encoder: the seed tokens it
+# appends are the teacher target the D9 arm distills.
 _TINY_FULL_ORACLE_CONFIG: dict[str, object] = {
     "generator": {
         "name": "full_ego_oracle",
         "feature_standardization": "row_layernorm",
     },
-    "encoder": {"dim": 16, "layers": 2},
+    "encoder": {"name": "grit_gmt", "dim": 16, "layers": 2, "seeds": _SEEDS},
     "classifier": {
         "d_model": 32,
         "encoder_layers": 1,
@@ -95,16 +98,18 @@ def test_scoring_core_matches_direct_recomputation_on_a_tiny_fixture(tmp_path: P
 
     context = sample_context_sets(truth, nodes, seed=0, k_near=2, k_rand=2)
     assert len(context.anchor_idx) > 0
-    teacher_logit, pooled_ab, pooled_ba = tt.score_kd_context(
-        model, node_cache, nodes, context, device=device, batch_pairs=3
-    )
-    assert pooled_ab.shape[0] == len(context.anchor_idx)
-    assert pooled_ba.shape == pooled_ab.shape
+    scored = tt.score_kd_context(model, node_cache, nodes, context, device=device, batch_pairs=3)
+    n_rows = len(context.anchor_idx)
+    assert scored.pooled_ab.shape[0] == n_rows
+    assert scored.pooled_ba.shape == scored.pooled_ab.shape
+    assert scored.teacher_seeds.shape == (n_rows, _SEEDS, scored.pooled_ab.shape[1])
+    assert scored.slot_cos.shape == (n_rows, _SEEDS)
+    assert scored.slot_norm_log_ratio.shape == (n_rows, _SEEDS)
 
     # Recompute every row one pair at a time via the same
     # build_pair_context_from_states/score_pair_context path -- the ground
     # truth `score_kd_context`'s batched loop must reproduce exactly.
-    for row in range(len(context.anchor_idx)):
+    for row in range(n_rows):
         node_a = nodes[int(context.anchor_idx[row])]
         node_b = nodes[int(context.partner_idx[row])]
         state_a = tt._move_state(tt._stack_states([node_cache[node_a]]), device)
@@ -113,12 +118,23 @@ def test_scoring_core_matches_direct_recomputation_on_a_tiny_fixture(tmp_path: P
         with torch.inference_mode(), torch.autocast(device_type="cpu", enabled=False):
             pair_context = model.build_pair_context_from_states(state_a, state_b, is_self)
             expected_logit = model.score_pair_context(pair_context)
-        assert teacher_logit[row] == pytest.approx(float(expected_logit.item()), abs=1e-5)
+        assert scored.teacher_logit[row] == pytest.approx(float(expected_logit.item()), abs=1e-5)
         assert pair_context.pooled_ab is not None
+        # GRIT's batched padding width perturbs fp32 reduction order vs the
+        # single-pair recompute; the artifact contract is fp16, so one-ulp
+        # boundary rounding is legal (atol covers it, tighter than fp16 ulp).
         np.testing.assert_allclose(
-            pooled_ab[row],
+            scored.pooled_ab[row],
             pair_context.pooled_ab[0].detach().to(dtype=torch.float16).numpy(),
+            atol=1e-5,
         )
+        assert pair_context.topo_ab is not None and pair_context.topo_ba is not None
+        s_ab = pair_context.topo_ab[0, -_SEEDS:, :].detach().to(dtype=torch.float32)
+        s_ba = pair_context.topo_ba[0, -_SEEDS:, :].detach().to(dtype=torch.float32)
+        expected_seeds = (0.5 * (s_ab + s_ba)).to(dtype=torch.float16).numpy()
+        np.testing.assert_allclose(scored.teacher_seeds[row], expected_seeds, atol=1e-5)
+        expected_cos = torch.nn.functional.cosine_similarity(s_ab, s_ba, dim=-1).numpy()
+        np.testing.assert_allclose(scored.slot_cos[row], expected_cos, atol=1e-5)
 
 
 def test_scoring_core_handles_an_empty_context() -> None:
@@ -131,12 +147,36 @@ def test_scoring_core_handles_an_empty_context() -> None:
         k_rand=1,
         seed=0,
     )
-    teacher_logit, pooled_ab, pooled_ba = tt.score_kd_context(
-        _tiny_model(), {}, ["a", "b"], empty, device=torch.device("cpu")
-    )
-    assert teacher_logit.shape == (0,)
-    assert pooled_ab.shape[0] == 0
-    assert pooled_ba.shape[0] == 0
+    scored = tt.score_kd_context(_tiny_model(), {}, ["a", "b"], empty, device=torch.device("cpu"))
+    assert scored.teacher_logit.shape == (0,)
+    assert scored.pooled_ab.shape[0] == 0
+    assert scored.pooled_ba.shape[0] == 0
+    assert scored.teacher_seeds.shape[0] == 0
+    assert scored.slot_cos.shape[0] == 0
+
+
+def test_scoring_core_refuses_a_non_pma_encoder() -> None:
+    config = dict(_TINY_FULL_ORACLE_CONFIG)
+    config["encoder"] = {"name": "ste_typed", "dim": 16, "layers": 2}
+    torch.manual_seed(0)
+    model = EgoStitchModel(E2EConfig.from_mapping(config))
+    model.eval()
+    with pytest.raises(RuntimeError, match="grit_gmt"):
+        tt.score_kd_context(
+            model,
+            {},
+            ["a", "b"],
+            ContextSets(
+                anchor_idx=np.array([], dtype=np.int32),
+                partner_idx=np.array([], dtype=np.int32),
+                anchor_offsets=np.array([0, 0, 0], dtype=np.int64),
+                is_near=np.array([], dtype=np.uint8),
+                k_near=1,
+                k_rand=1,
+                seed=0,
+            ),
+            device=torch.device("cpu"),
+        )
 
 
 def test_require_full_ego_oracle_refuses_a_null_generator() -> None:
@@ -212,7 +252,7 @@ def test_write_load_roundtrip_with_teacher_seeds(tmp_path: Path) -> None:
     artifact_dir = tmp_path / "artifact"
     rng = np.random.default_rng(1)
     seeds = rng.standard_normal((3, 2, 4)).astype(np.float16)
-    stats = {"slot_cos_mean": [0.9, 0.8], "norm_ratio_mean": [1.0, 1.1]}
+    stats: dict[str, object] = {"slot_cos_mean": [0.9, 0.8], "norm_ratio_mean": [1.0, 1.1]}
     _write_toy_artifact(artifact_dir, teacher_seeds=seeds, seed_symmetry=stats)
 
     loaded = load_kd_targets(artifact_dir)

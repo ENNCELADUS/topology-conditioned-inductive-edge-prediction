@@ -213,7 +213,7 @@ def write_kd_targets(
         format_stamp = KD_TARGETS_FORMAT_V3
     else:
         format_stamp = KD_TARGETS_FORMAT
-    manifest = {
+    manifest: dict[str, object] = {
         "format": format_stamp,
         "truth_source": TRUTH_SOURCE,
         "truth_graph_sha256": truth_graph_sha256,

@@ -44,6 +44,7 @@ import argparse
 import json
 import logging
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -77,6 +78,7 @@ _FEATURES_SUBDIR = Path("features") / "frozen_node_features_1024"
 
 _DEFAULT_TOKEN_BUDGET = 32_768
 _DEFAULT_BATCH_PAIRS = 32
+_SEED_EPS = 1e-8
 
 
 # --------------------------------------------------------------------------- training-side legality
@@ -312,6 +314,35 @@ def _move_state(state: E2ENodeState, device: torch.device) -> E2ENodeState:
 # --------------------------------------------------------------------------- pair scoring
 
 
+@dataclass(frozen=True)
+class ScoredKDContext:
+    """One `score_kd_context` pass, aligned row-for-row with the context.
+
+    ``teacher_seeds`` is the per-slot symmetrization ``½(S_ab + S_ba)`` of the
+    encoder's PMA seed tokens (the last ``seeds`` rows of ``topo_ab/ba``);
+    ``slot_cos``/``slot_norm_log_ratio`` are the AB/BA order-asymmetry audit
+    computed *before* symmetrization -- the artifact stores only the mean, so
+    this is the only place the disagreement is still observable.
+    """
+
+    teacher_logit: NDArray[np.float32]
+    pooled_ab: NDArray[np.float16]
+    pooled_ba: NDArray[np.float16]
+    teacher_seeds: NDArray[np.float16]
+    slot_cos: NDArray[np.float32]
+    slot_norm_log_ratio: NDArray[np.float32]
+
+
+def _encoder_seed_count(model: EgoStitchModel) -> int:
+    seeds = getattr(model.encoder, "seeds", None)
+    if not isinstance(seeds, int) or seeds <= 0:
+        raise RuntimeError(
+            "KD teacher targets require the grit_gmt PMA encoder: the seed "
+            "tokens it appends are the D9 arm's teacher target"
+        )
+    return seeds
+
+
 def score_kd_context(
     model: EgoStitchModel,
     node_cache: Mapping[str, E2ENodeState],
@@ -320,22 +351,22 @@ def score_kd_context(
     *,
     device: torch.device,
     batch_pairs: int = _DEFAULT_BATCH_PAIRS,
-) -> tuple[NDArray[np.float32], NDArray[np.float16], NDArray[np.float16]]:
+) -> ScoredKDContext:
     """Score every context pair fp32, no autocast (see module docstring).
 
     This is the CPU-testable scoring core: given an already-encoded
     `node_cache` (`encode_all_nodes`) and a bound `full_ego_oracle` context
     (`_install_oracle_context`), it only stitches/scores pairs -- no
     FeatureStore or checkpoint I/O.
-
-    Returns:
-        ``(teacher_logit, teacher_pooled_ab, teacher_pooled_ba)``, aligned
-        row-for-row with `context.anchor_idx`/`context.partner_idx`.
     """
+    seeds = _encoder_seed_count(model)
     n_pairs = len(context.anchor_idx)
     teacher_logit = np.empty(n_pairs, dtype=np.float32)
     pooled_ab: NDArray[np.float16] | None = None
     pooled_ba: NDArray[np.float16] | None = None
+    teacher_seeds: NDArray[np.float16] | None = None
+    slot_cos = np.empty((n_pairs, seeds), dtype=np.float32)
+    slot_norm_log_ratio = np.empty((n_pairs, seeds), dtype=np.float32)
     for start in range(0, n_pairs, max(batch_pairs, 1)):
         end = min(start + max(batch_pairs, 1), n_pairs)
         anchors = context.anchor_idx[start:end]
@@ -354,17 +385,39 @@ def score_kd_context(
                 "full-ego oracle pair context carries no pooled embedding -- "
                 "this is a bug, not a legal degraded mode"
             )
+        if pair_context.topo_ab is None or pair_context.topo_ba is None:
+            raise RuntimeError(
+                "full-ego oracle pair context carries no encoder tokens -- "
+                "the KD seed dump needs both orders' PMA seed rows"
+            )
         ab = pair_context.pooled_ab.detach().to(dtype=torch.float16, device="cpu").numpy()
         ba = pair_context.pooled_ba.detach().to(dtype=torch.float16, device="cpu").numpy()
+        s_ab = pair_context.topo_ab[:, -seeds:, :].detach().to(dtype=torch.float32, device="cpu")
+        s_ba = pair_context.topo_ba[:, -seeds:, :].detach().to(dtype=torch.float32, device="cpu")
         if pooled_ab is None:
             pooled_ab = np.empty((n_pairs, ab.shape[-1]), dtype=np.float16)
             pooled_ba = np.empty((n_pairs, ba.shape[-1]), dtype=np.float16)
+            teacher_seeds = np.empty((n_pairs, seeds, s_ab.shape[-1]), dtype=np.float16)
         pooled_ab[start:end] = ab
         cast(NDArray[np.float16], pooled_ba)[start:end] = ba
+        sym = 0.5 * (s_ab + s_ba)
+        cast(NDArray[np.float16], teacher_seeds)[start:end] = sym.to(dtype=torch.float16).numpy()
+        norm_ab = s_ab.norm(dim=-1).clamp_min(_SEED_EPS)
+        norm_ba = s_ba.norm(dim=-1).clamp_min(_SEED_EPS)
+        slot_cos[start:end] = ((s_ab * s_ba).sum(dim=-1) / (norm_ab * norm_ba)).numpy()
+        slot_norm_log_ratio[start:end] = torch.log(norm_ab / norm_ba).numpy()
     if pooled_ab is None:
         pooled_ab = np.empty((0, 0), dtype=np.float16)
         pooled_ba = np.empty((0, 0), dtype=np.float16)
-    return teacher_logit, pooled_ab, cast(NDArray[np.float16], pooled_ba)
+        teacher_seeds = np.empty((0, seeds, 0), dtype=np.float16)
+    return ScoredKDContext(
+        teacher_logit=teacher_logit,
+        pooled_ab=pooled_ab,
+        pooled_ba=cast(NDArray[np.float16], pooled_ba),
+        teacher_seeds=cast(NDArray[np.float16], teacher_seeds),
+        slot_cos=slot_cos,
+        slot_norm_log_ratio=slot_norm_log_ratio,
+    )
 
 
 def pair_labels(
@@ -469,9 +522,7 @@ def _write_shard(
     *,
     pair_anchor_idx: NDArray[np.int32],
     pair_partner_idx: NDArray[np.int32],
-    teacher_logit: NDArray[np.float32],
-    teacher_pooled_ab: NDArray[np.float16],
-    teacher_pooled_ba: NDArray[np.float16],
+    scored: ScoredKDContext,
     is_near: NDArray[np.uint8],
     pair_label: NDArray[np.int8],
 ) -> None:
@@ -481,9 +532,12 @@ def _write_shard(
         path,
         pair_anchor_idx=pair_anchor_idx,
         pair_partner_idx=pair_partner_idx,
-        teacher_logit=teacher_logit,
-        teacher_pooled_ab=teacher_pooled_ab,
-        teacher_pooled_ba=teacher_pooled_ba,
+        teacher_logit=scored.teacher_logit,
+        teacher_pooled_ab=scored.pooled_ab,
+        teacher_pooled_ba=scored.pooled_ba,
+        teacher_seeds=scored.teacher_seeds,
+        slot_cos=scored.slot_cos,
+        slot_norm_log_ratio=scored.slot_norm_log_ratio,
         is_near=is_near,
         pair_label=pair_label,
     )
@@ -495,7 +549,7 @@ def _all_shards_present(output: Path, num_shards: int) -> bool:
 
 def _merge_shards(
     output: Path, node_ids: Sequence[str], context: ContextSets, num_shards: int
-) -> tuple[NDArray[np.float32], NDArray[np.float16], NDArray[np.float16], NDArray[np.int8]]:
+) -> tuple[ScoredKDContext, NDArray[np.int8]]:
     """Concatenate `--anchor-shard` outputs back into the full deterministic pair order.
 
     Every shard invocation resamples the identical `ContextSets` (a pure
@@ -508,6 +562,9 @@ def _merge_shards(
     teacher_logit = np.empty(n_pairs, dtype=np.float32)
     pooled_ab = np.empty((n_pairs, 0), dtype=np.float16)
     pooled_ba = np.empty((n_pairs, 0), dtype=np.float16)
+    teacher_seeds = np.empty((n_pairs, 0, 0), dtype=np.float16)
+    slot_cos = np.empty((n_pairs, 0), dtype=np.float32)
+    slot_norm_log_ratio = np.empty((n_pairs, 0), dtype=np.float32)
     pair_label = np.empty(n_pairs, dtype=np.int8)
     for shard in range(num_shards):
         start, end = _shard_range(len(node_ids), shard, num_shards)
@@ -532,10 +589,27 @@ def _merge_shards(
                 ba_width = archive["teacher_pooled_ba"].shape[1]
                 pooled_ab = np.empty((n_pairs, ab_width), dtype=np.float16)
                 pooled_ba = np.empty((n_pairs, ba_width), dtype=np.float16)
+                seeds_shape = archive["teacher_seeds"].shape
+                teacher_seeds = np.empty(
+                    (n_pairs, seeds_shape[1], seeds_shape[2]), dtype=np.float16
+                )
+                slot_cos = np.empty((n_pairs, seeds_shape[1]), dtype=np.float32)
+                slot_norm_log_ratio = np.empty((n_pairs, seeds_shape[1]), dtype=np.float32)
             pooled_ab[pair_start:pair_end] = archive["teacher_pooled_ab"]
             pooled_ba[pair_start:pair_end] = archive["teacher_pooled_ba"]
+            teacher_seeds[pair_start:pair_end] = archive["teacher_seeds"]
+            slot_cos[pair_start:pair_end] = archive["slot_cos"]
+            slot_norm_log_ratio[pair_start:pair_end] = archive["slot_norm_log_ratio"]
             pair_label[pair_start:pair_end] = archive["pair_label"]
-    return teacher_logit, pooled_ab, pooled_ba, pair_label
+    scored = ScoredKDContext(
+        teacher_logit=teacher_logit,
+        pooled_ab=pooled_ab,
+        pooled_ba=pooled_ba,
+        teacher_seeds=teacher_seeds,
+        slot_cos=slot_cos,
+        slot_norm_log_ratio=slot_norm_log_ratio,
+    )
+    return scored, pair_label
 
 
 # --------------------------------------------------------------------------- verification
@@ -566,9 +640,9 @@ def verify_sample(
         k_rand=context.k_rand,
         seed=context.seed,
     )
-    recomputed, _, _ = score_kd_context(
+    recomputed = score_kd_context(
         model, node_cache, node_ids, sample_context, device=device, batch_pairs=max(len(sample), 1)
-    )
+    ).teacher_logit
     if not np.allclose(recomputed, teacher_logit[sample], atol=1e-5, rtol=1e-5):
         raise ValueError("--verify-sample recomputation does not match the written teacher logits")
     logger.info("verify-sample: %d/%d recomputed pairs match", len(sample), total)
@@ -692,7 +766,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             k_rand=context.k_rand,
             seed=context.seed,
         )
-        teacher_logit, pooled_ab, pooled_ba = score_kd_context(
+        scored = score_kd_context(
             model, node_cache, node_ids, shard_context, device=device, batch_pairs=args.batch_pairs
         )
         labels = pair_labels(node_ids, shard_context, truth_graph)
@@ -703,9 +777,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             num_shards,
             pair_anchor_idx=shard_context.anchor_idx,
             pair_partner_idx=shard_context.partner_idx,
-            teacher_logit=teacher_logit,
-            teacher_pooled_ab=pooled_ab,
-            teacher_pooled_ba=pooled_ba,
+            scored=scored,
             is_near=shard_context.is_near,
             pair_label=labels,
         )
@@ -717,25 +789,22 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         return
 
-    teacher_logit, pooled_ab, pooled_ba = score_kd_context(
+    scored = score_kd_context(
         model, node_cache, node_ids, context, device=device, batch_pairs=args.batch_pairs
     )
     labels = pair_labels(node_ids, context, truth_graph)
     _finalize_artifact(
-        args,
-        node_ids,
-        context,
-        truth_graph,
-        split.v_val,
-        teacher_logit,
-        pooled_ab,
-        pooled_ba,
-        labels,
-        checkpoint_id,
+        args, node_ids, context, truth_graph, split.v_val, scored, labels, checkpoint_id
     )
     if args.verify_sample > 0:
         verify_sample(
-            model, node_cache, node_ids, context, teacher_logit, n=args.verify_sample, device=device
+            model,
+            node_cache,
+            node_ids,
+            context,
+            scored.teacher_logit,
+            n=args.verify_sample,
+            device=device,
         )
 
 
@@ -747,9 +816,7 @@ def _finish_merge(
     *,
     checkpoint_override: tuple[EgoStitchModel, str] | None = None,
 ) -> None:
-    teacher_logit, pooled_ab, pooled_ba, labels = _merge_shards(
-        args.output, node_ids, context, num_shards
-    )
+    scored, labels = _merge_shards(args.output, node_ids, context, num_shards)
     if checkpoint_override is not None:
         _, checkpoint_id = checkpoint_override
     else:
@@ -762,16 +829,7 @@ def _finish_merge(
     truth_graph = truth_graph_for_kd(split)
     assert_training_side_only(node_ids, truth_graph, split, test_nodes)
     _finalize_artifact(
-        args,
-        node_ids,
-        context,
-        truth_graph,
-        split.v_val,
-        teacher_logit,
-        pooled_ab,
-        pooled_ba,
-        labels,
-        checkpoint_id,
+        args, node_ids, context, truth_graph, split.v_val, scored, labels, checkpoint_id
     )
 
 
@@ -801,15 +859,34 @@ def _count_forbidden_internal_rows_excluded(
     return int(np.count_nonzero(anchor_in_v_val & partner_in_v_val))
 
 
+def seed_symmetry_stats(scored: ScoredKDContext) -> dict[str, object]:
+    """Summarize the AB/BA order-asymmetry audit for the artifact manifest.
+
+    Strong disagreement (low `slot_cos`) means the symmetrized `teacher_seeds`
+    mean is itself a blur of two order-specific encodings -- the design's
+    pre-launch inspection gate (operator judgment, never enforced here).
+    """
+    cos64 = scored.slot_cos.astype(np.float64)
+    ratio64 = scored.slot_norm_log_ratio.astype(np.float64)
+    return {
+        "slot_cos": {
+            "per_slot_mean": [float(v) for v in cos64.mean(axis=0)] if cos64.size else [],
+            **_histogram(cos64.reshape(-1)),
+        },
+        "slot_norm_log_ratio": {
+            "per_slot_mean": [float(v) for v in ratio64.mean(axis=0)] if ratio64.size else [],
+            **_histogram(ratio64.reshape(-1)),
+        },
+    }
+
+
 def _finalize_artifact(
     args: argparse.Namespace,
     node_ids: Sequence[str],
     context: ContextSets,
     truth_graph: nx.Graph,
     v_val: frozenset[str],
-    teacher_logit: NDArray[np.float32],
-    pooled_ab: NDArray[np.float16],
-    pooled_ba: NDArray[np.float16],
+    scored: ScoredKDContext,
     labels: NDArray[np.int8],
     checkpoint_id: str | None,
 ) -> None:
@@ -820,9 +897,9 @@ def _finalize_artifact(
         pair_anchor_idx=context.anchor_idx,
         pair_partner_idx=context.partner_idx,
         anchor_offsets=context.anchor_offsets,
-        teacher_logit=teacher_logit,
-        teacher_pooled_ab=pooled_ab,
-        teacher_pooled_ba=pooled_ba,
+        teacher_logit=scored.teacher_logit,
+        teacher_pooled_ab=scored.pooled_ab,
+        teacher_pooled_ba=scored.pooled_ba,
         is_near=context.is_near,
         pair_label=labels,
         truth_graph_sha256=_oracle_truth_graph_sha256(truth_graph),
@@ -832,12 +909,14 @@ def _finalize_artifact(
         k_near=args.k_near,
         k_rand=args.k_rand,
         seed=args.seed,
+        teacher_seeds=scored.teacher_seeds,
+        seed_symmetry=seed_symmetry_stats(scored),
     )
     n_forbidden_internal_rows_excluded = _count_forbidden_internal_rows_excluded(
         truth_graph, node_ids, v_val, seed=args.seed, k_near=args.k_near, k_rand=args.k_rand
     )
     report = build_stats_report(
-        teacher_logit,
+        scored.teacher_logit,
         labels,
         context.is_near,
         n_forbidden_internal_rows_excluded=n_forbidden_internal_rows_excluded,
