@@ -39,12 +39,16 @@ from src.model.egostitch.registry import (
 # --------------------------------------------------------------------------- registry contents
 
 
-def test_generator_registry_has_exactly_the_four_registered_keys() -> None:
-    """`GENERATOR_REGISTRY` resolves the real, null, and two oracle generators.
+def test_generator_registry_has_exactly_the_five_registered_keys() -> None:
+    """`GENERATOR_REGISTRY` resolves the real, null, and three oracle generators.
 
-    (Design §8; `oracle_struct` added by the 2026-08-04 oracle-scaffold wave.)
+    (Design §8; `oracle_struct` added by the 2026-08-04 oracle-scaffold wave,
+    `full_ego_features` by the Gate A set-student wave.)
     """
-    from src.model.egostitch.generator.full_oracle import FullOracleGenerator
+    from src.model.egostitch.generator.full_oracle import (
+        FullEgoFeaturesGenerator,
+        FullOracleGenerator,
+    )
     from src.model.egostitch.generator.oracle import OracleStructGenerator
 
     assert {
@@ -52,6 +56,7 @@ def test_generator_registry_has_exactly_the_four_registered_keys() -> None:
         "null": NullGenerator,
         "oracle_struct": OracleStructGenerator,
         "full_ego_oracle": FullOracleGenerator,
+        "full_ego_features": FullEgoFeaturesGenerator,
     } == GENERATOR_REGISTRY
 
 

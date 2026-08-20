@@ -208,9 +208,10 @@ class GeneratorConfig:
             today's Tokenize-lite + Imagine + Stitch pipeline, ``"null"`` for
             the parameter-free pairwise-baseline generator,
             ``"oracle_struct"`` for the fixed-slot ground-truth-scaffold
-            upper bound (`generator/oracle.py`), or ``"full_ego_oracle"``
+            upper bound (`generator/oracle.py`), ``"full_ego_oracle"``
             for the uncapped ground-truth local-graph diagnostic
-            (`generator/full_oracle.py`).
+            (`generator/full_oracle/`), or ``"full_ego_features"`` for the
+            features-only oracle-candidate-set Gate A diagnostic.
         oracle_seed: Table-wide seed for ``"oracle_struct"``'s per-node hub
             subsample. Folded into every node's
             ``blake2b(f"{node_id}|{seed}|oracle")`` rng, so it selects *which*
@@ -276,10 +277,11 @@ class GeneratorConfig:
         if self.oracle_truth_source != "training_structure" and self.name not in (
             "oracle_struct",
             "full_ego_oracle",
+            "full_ego_features",
         ):
             raise ValueError(
                 "oracle_truth_source='training_structure_plus_g_val' requires "
-                "name='oracle_struct' or name='full_ego_oracle'"
+                "name='oracle_struct', 'full_ego_oracle', or 'full_ego_features'"
             )
         if not 0.0 < self.tau_adj < 1.0:
             raise ValueError(f"tau_adj must be in (0, 1), got {self.tau_adj}")

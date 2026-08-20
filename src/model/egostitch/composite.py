@@ -498,18 +498,21 @@ class EgoStitchModel(nn.Module):
         need_topo: bool,
         scaffold_input_perturbation: ScaffoldInputPerturbation | None = None,
         precomputed_graph: ImaginedGraph | None = None,
-    ) -> tuple[E2EPairContext, ImaginedGraph | None, GraphEmbedding | None]:
+    ) -> tuple[
+        E2EPairContext, ImaginedGraph | None, GraphEmbedding | None, GraphEmbedding | None
+    ]:
         """Shared implementation behind `build_pair_context_from_states`.
 
         `build_pair_context_from_states` keeps its existing narrow
         ``E2EPairContext``-only return type for its other callers
         (`score_universe.py`, `src/experiments/probes.py`, tests) and simply
-        discards the extra two values. `forward` needs the actual
-        `ImaginedGraph` / AB `GraphEmbedding` objects -- not just their
+        discards the extra values. `forward` needs the actual
+        `ImaginedGraph` / AB+BA `GraphEmbedding` objects -- not just their
         derived tensors -- to route auxiliary-loss computation through
         `generator.auxiliary_losses` / `encoder.auxiliary_losses` (design §6)
-        against the *same* stitch+encode pass that produced the scored
-        logits, rather than paying for a second one.
+        and the KD trainer's teacher matching against the *same*
+        stitch+encode pass that produced the scored logits, rather than
+        paying for a second one.
         """
         batch_size = state_a.encoded.size(0)
         if is_self.shape != (batch_size,):
@@ -532,6 +535,7 @@ class EgoStitchModel(nn.Module):
         log_plan: torch.Tensor | None = None
         graph: ImaginedGraph | None = None
         embedding_ab: GraphEmbedding | None = None
+        embedding_ba: GraphEmbedding | None = None
         if need_topo:
             graph, embedding_ab, embedding_ba = self._stitch_and_encode(
                 state_a,
@@ -560,7 +564,7 @@ class EgoStitchModel(nn.Module):
             pooled_ab=pooled_ab,
             pooled_ba=pooled_ba,
         )
-        return context, graph, embedding_ab
+        return context, graph, embedding_ab, embedding_ba
 
     def build_pair_context_from_states(
         self,
@@ -573,7 +577,7 @@ class EgoStitchModel(nn.Module):
         precomputed_graph: ImaginedGraph | None = None,
     ) -> E2EPairContext:
         """Build the shared pair context once from cacheable endpoint states."""
-        context, _, _ = self._build_pair_context_and_graph(
+        context, _, _, _ = self._build_pair_context_and_graph(
             state_a,
             state_b,
             is_self,
@@ -716,9 +720,9 @@ class EgoStitchModel(nn.Module):
 
         Returns:
             ``{"logits": (B,)}`` fused edge logits, plus ``{"graph",
-            "embedding_ab"}`` -- this generator's own most recent
-            `ImaginedGraph` and this encoder's own AB-direction
-            `GraphEmbedding` -- whenever topology was actually computed
+            "embedding_ab", "embedding_ba"}`` -- this generator's own most
+            recent `ImaginedGraph` and this encoder's own AB/BA-direction
+            `GraphEmbedding`s -- whenever topology was actually computed
             (``rel_target`` present, a live topo mask, or distributed
             training). Callers that need `generator.auxiliary_losses` /
             `encoder.auxiliary_losses` (design §6, e.g.
@@ -733,7 +737,7 @@ class EgoStitchModel(nn.Module):
         distributed_training = self.training and dist.is_available() and dist.is_initialized()
         need_topo = bool(masks.topo.any()) or has_relational_targets or distributed_training
         state_a, state_b, is_self = self._pair_node_states(batch)
-        context, graph, embedding_ab = self._build_pair_context_and_graph(
+        context, graph, embedding_ab, embedding_ba = self._build_pair_context_and_graph(
             state_a,
             state_b,
             is_self,
@@ -749,6 +753,8 @@ class EgoStitchModel(nn.Module):
         if graph is not None and embedding_ab is not None:
             output["graph"] = graph
             output["embedding_ab"] = embedding_ab
+            assert embedding_ba is not None
+            output["embedding_ba"] = embedding_ba
         return output
 
     def decompose(self, batch: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:

@@ -1,8 +1,9 @@
 """Contracts for the pure KD loss functions in `src.distill.losses`.
 
-Covers `kd_control`/`kd_d1`/`kd_d2`/`kd_d3`/`kd_d4`/`kd_d5`; `kd_d6` and
-`kd_d7a` reuse `kd_rank_loss`/`kd_dist_loss`/`kd_gram_loss` unchanged and add
-no new loss functions to test here.
+Covers `kd_control`/`kd_d1`/`kd_d2`/`kd_d3`/`kd_d4`/`kd_d5` and the Gate A
+set-student terms (`kd_seed_loss`/`kd_set_gram_loss`); `kd_d6` and `kd_d7a`
+reuse `kd_rank_loss`/`kd_dist_loss`/`kd_gram_loss` unchanged and add no new
+loss functions to test here.
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ from src.distill.losses import (
     kd_logit_loss,
     kd_rank_loss,
     kd_residual_loss,
+    kd_seed_loss,
+    kd_set_gram_loss,
 )
 
 pytestmark = pytest.mark.unit
@@ -438,3 +441,103 @@ def test_residual_loss_handles_bf16_delta_target_input() -> None:
     result = kd_residual_loss(student_residual, delta_target_bf16, mask)
     assert result.dtype == student_residual.dtype
     assert torch.isfinite(result)
+
+
+# --------------------------------------------------------------------------- kd_seed_loss
+
+
+def test_seed_loss_is_zero_for_scaled_copies_and_positive_otherwise() -> None:
+    teacher = torch.randn(4, 3, 8)
+    mask = torch.ones(4)
+
+    torch.testing.assert_close(kd_seed_loss(2.5 * teacher, teacher, mask), torch.tensor(0.0))
+    assert kd_seed_loss(torch.randn(4, 3, 8), teacher, mask) > 0.0
+
+
+def test_seed_loss_matches_seed_for_seed_not_as_a_set() -> None:
+    teacher = torch.randn(2, 3, 8)
+    permuted = teacher[:, [1, 2, 0], :]
+    mask = torch.ones(2)
+
+    torch.testing.assert_close(kd_seed_loss(teacher, teacher, mask), torch.tensor(0.0))
+    assert kd_seed_loss(permuted, teacher, mask) > 0.0
+
+
+def test_seed_loss_ignores_dead_rows_and_is_zero_on_empty_mask() -> None:
+    student = torch.randn(3, 2, 4)
+    teacher = torch.randn(3, 2, 4)
+    base = kd_seed_loss(student[:2], teacher[:2], torch.ones(2))
+
+    mask = torch.tensor([1.0, 1.0, 0.0])
+    torch.testing.assert_close(kd_seed_loss(student, teacher, mask), base)
+    torch.testing.assert_close(kd_seed_loss(student, teacher, torch.zeros(3)), torch.tensor(0.0))
+
+
+def test_seed_loss_casts_teacher_dtype_to_student() -> None:
+    student = torch.randn(2, 2, 4)
+    teacher = torch.randn(2, 2, 4, dtype=torch.float64)
+
+    result = kd_seed_loss(student, teacher, torch.ones(2))
+    assert result.dtype == student.dtype
+    assert torch.isfinite(result)
+
+
+# --------------------------------------------------------------------------- kd_set_gram_loss
+
+
+def test_set_gram_loss_is_zero_under_an_orthogonal_rotation() -> None:
+    teacher = torch.randn(3, 5, 8)
+    rotation, _ = torch.linalg.qr(torch.randn(8, 8))
+    student = teacher @ rotation
+    node_mask = torch.ones(3, 5, dtype=torch.bool)
+    mask = torch.ones(3)
+
+    torch.testing.assert_close(
+        kd_set_gram_loss(student, teacher, node_mask, mask),
+        torch.tensor(0.0),
+        atol=1e-5,
+        rtol=0.0,
+    )
+
+
+def test_set_gram_loss_detects_within_set_geometry_mismatch() -> None:
+    teacher = torch.randn(2, 4, 8)
+    node_mask = torch.ones(2, 4, dtype=torch.bool)
+
+    assert kd_set_gram_loss(torch.randn(2, 4, 8), teacher, node_mask, torch.ones(2)) > 0.0
+
+
+def test_set_gram_loss_ignores_padded_nodes_and_dead_rows() -> None:
+    teacher = torch.randn(2, 3, 6)
+    student = torch.randn(2, 3, 6)
+    node_mask = torch.ones(2, 3, dtype=torch.bool)
+    base = kd_set_gram_loss(student, teacher, node_mask, torch.ones(2))
+
+    padded_student = torch.cat([student, torch.randn(2, 2, 6)], dim=1)
+    padded_teacher = torch.cat([teacher, torch.randn(2, 2, 6)], dim=1)
+    padded_node_mask = torch.cat([node_mask, torch.zeros(2, 2, dtype=torch.bool)], dim=1)
+    torch.testing.assert_close(
+        kd_set_gram_loss(padded_student, padded_teacher, padded_node_mask, torch.ones(2)), base
+    )
+
+    dead_student = torch.cat([student, torch.randn(1, 3, 6)], dim=0)
+    dead_teacher = torch.cat([teacher, torch.randn(1, 3, 6)], dim=0)
+    dead_node_mask = torch.cat([node_mask, torch.ones(1, 3, dtype=torch.bool)], dim=0)
+    torch.testing.assert_close(
+        kd_set_gram_loss(dead_student, dead_teacher, dead_node_mask, torch.tensor([1.0, 1.0, 0.0])),
+        base,
+    )
+
+
+def test_set_gram_loss_excludes_rows_without_off_diagonal_entries() -> None:
+    student = torch.randn(2, 3, 6)
+    teacher = torch.randn(2, 3, 6)
+    node_mask = torch.tensor([[True, True, True], [True, False, False]])
+    base = kd_set_gram_loss(student[:1], teacher[:1], node_mask[:1], torch.ones(1))
+
+    result = kd_set_gram_loss(student, teacher, node_mask, torch.ones(2))
+    torch.testing.assert_close(result, base)
+    torch.testing.assert_close(
+        kd_set_gram_loss(student[1:], teacher[1:], node_mask[1:], torch.ones(1)),
+        torch.tensor(0.0),
+    )

@@ -63,6 +63,7 @@ from src.data.val_region import (
     derive_val_region_split,
     val_ball_union_universe,
 )
+from src.distill.losses import kd_seed_loss, kd_set_gram_loss
 from src.eval.checkpoint_selection import (
     CheckpointCandidate,
     TopologyValidationMetrics,
@@ -86,7 +87,11 @@ from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.encoder.base import GraphEncoder
 from src.model.egostitch.generator import EgoStitchImagineGenerator, StitchedGraph
-from src.model.egostitch.generator.full_oracle import FullOracleGenerator
+from src.model.egostitch.generator.full_oracle import (
+    FullEgoFeaturesGenerator,
+    FullEgoGraph,
+    FullOracleGenerator,
+)
 from src.model.egostitch.generator.imagine import (
     NULL_MODE_ALL,
     NULL_MODE_CONTENT,
@@ -95,7 +100,8 @@ from src.model.egostitch.generator.imagine import (
 )
 from src.model.egostitch.generator.losses import stage1_family_tensors, stage1_total
 from src.model.egostitch.generator.oracle import OracleStructGenerator, build_oracle_table
-from src.model.egostitch.graph import GraphEmbedding
+from src.model.egostitch.graph import GraphEmbedding, ImaginedGraph
+from src.model.egostitch.registry import build_encoder
 from src.train_b0 import (
     EvalConfig,
     ModelConfig,
@@ -268,6 +274,28 @@ class EgoStitchTrainingConfig:
 
 
 @dataclass(frozen=True)
+class EgoDistillConfig:
+    """Gate A set-student distillation controls (``full_ego_features`` arm only).
+
+    Attributes:
+        teacher_checkpoint: A published ``full_ego_oracle`` + ``grit_gmt``
+            ``best.pt`` whose frozen encoder supplies the per-batch KD targets
+            (node tokens and PMA seed tokens over the identical node layout).
+        lambda_seed: Weight of `kd_seed_loss` (per-seed PMA latent cosine).
+        lambda_gram: Weight of `kd_set_gram_loss` (within-set node Gram).
+        warm_start_readout: Copy the teacher encoder's ``project``/``readout``
+            weights into the student encoder at startup so seed ``k`` starts
+            with the teacher's seed-``k`` semantics (identical shapes by the
+            d_model/seeds equality this config enforces at teacher load).
+    """
+
+    teacher_checkpoint: Path
+    lambda_seed: float = 1.0
+    lambda_gram: float = 1.0
+    warm_start_readout: bool = True
+
+
+@dataclass(frozen=True)
 class EgoConfig:
     """The full validated EgoStitch worker configuration.
 
@@ -294,6 +322,7 @@ class EgoConfig:
     runtime: EgoRuntimeConfig | None = None
     training: EgoStitchTrainingConfig | None = None
     run_kind: E2ERunKind | None = None
+    distill: EgoDistillConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -337,6 +366,7 @@ def load_config(path: Path) -> EgoConfig:
             "mixed_precision",
             "runtime",
             "training",
+            "distill",
         ),
         "",
     )
@@ -412,13 +442,12 @@ def load_config(path: Path) -> EgoConfig:
         raise ValueError("optim.epochs must be positive")
     if optim.gradient_accumulation_steps <= 0:
         raise ValueError("optim.gradient_accumulation_steps must be positive")
-    if (
-        optim.gradient_accumulation_steps > 1
-        and E2EConfig.from_mapping(model_kwargs).generator.name != "full_ego_oracle"
-    ):
+    if optim.gradient_accumulation_steps > 1 and E2EConfig.from_mapping(
+        model_kwargs
+    ).generator.name not in ("full_ego_oracle", "full_ego_features"):
         raise ValueError(
             "optim.gradient_accumulation_steps > 1 is only supported for "
-            "model.config.generator.name='full_ego_oracle'"
+            "model.config.generator.name='full_ego_oracle' or 'full_ego_features'"
         )
 
     diagnostics_raw = _as_mapping(_require(raw, "diagnostics", ""), "diagnostics")
@@ -644,6 +673,36 @@ def load_config(path: Path) -> EgoConfig:
             "use a training config or checkout archive/egostitch-e2e-v1"
         )
 
+    distill: EgoDistillConfig | None = None
+    if raw.get("distill") is not None:
+        distill_raw = _as_mapping(raw["distill"], "distill")
+        _check_no_unknown_keys(
+            distill_raw,
+            ("teacher_checkpoint", "lambda_seed", "lambda_gram", "warm_start_readout"),
+            "distill",
+        )
+        warm_start_raw = distill_raw.get("warm_start_readout", True)
+        if not isinstance(warm_start_raw, bool):
+            raise ValueError("distill.warm_start_readout must be a boolean")
+        distill = EgoDistillConfig(
+            teacher_checkpoint=Path(
+                _as_str(
+                    _require(distill_raw, "teacher_checkpoint", "distill."),
+                    "distill.teacher_checkpoint",
+                )
+            ),
+            lambda_seed=_as_float(distill_raw.get("lambda_seed", 1.0), "distill.lambda_seed"),
+            lambda_gram=_as_float(distill_raw.get("lambda_gram", 1.0), "distill.lambda_gram"),
+            warm_start_readout=warm_start_raw,
+        )
+        if distill.lambda_seed < 0.0 or distill.lambda_gram < 0.0:
+            raise ValueError("distill.lambda_seed and distill.lambda_gram must be non-negative")
+        if E2EConfig.from_mapping(model_kwargs).generator.name != "full_ego_features":
+            raise ValueError(
+                "distill requires model.config.generator.name='full_ego_features': the KD "
+                "teacher matches the features generator's stashed structural view"
+            )
+
     return EgoConfig(
         model=model,
         data=data,
@@ -656,6 +715,7 @@ def load_config(path: Path) -> EgoConfig:
         runtime=runtime,
         training=training,
         run_kind=None,
+        distill=distill,
     )
 
 
@@ -689,6 +749,7 @@ E2EArmName = Literal[
     "null_generator",
     "oracle",
     "full_ego_oracle",
+    "full_ego_features",
 ]
 
 
@@ -2738,6 +2799,111 @@ class _BatchFactory:
 # --------------------------------------------------------------------------- composite module
 
 
+@dataclass
+class _KdRuntime:
+    """Frozen Gate A teacher encoder plus KD loss weights.
+
+    Deliberately not an ``nn.Module`` field of `_CompositeStep`: a dataclass
+    attribute stays out of the wrapped module tree, so DDP never syncs the
+    teacher, `_cpu_state_dict` never persists it, and `accelerator.prepare`
+    never touches it -- every rank builds it identically from the same
+    checkpoint file and `_build_kd_runtime` moves it to the device itself.
+    """
+
+    teacher_encoder: GraphEncoder
+    lambda_seed: float
+    lambda_gram: float
+
+
+def _build_kd_runtime(
+    distill: EgoDistillConfig, model: EgoStitchModel, device: torch.device
+) -> _KdRuntime:
+    """Load the frozen full-ego-oracle teacher encoder and prime the student.
+
+    The teacher is the published ``full_ego_oracle`` + ``grit_gmt``
+    checkpoint's encoder, rebuilt at its structural input width (5 role
+    channels, 1 relation) and kept fp32; its KD targets are computed with
+    autocast disabled (`_CompositeStep._kd_terms`), matching the fp32 teacher
+    convention of `src.distill.teacher_targets`. Seed KD is projection-free,
+    so the student's encoder section and ``d_model`` must equal the
+    teacher's exactly; with `EgoDistillConfig.warm_start_readout` the
+    teacher's ``project``/``readout`` weights are copied into the student so
+    seed ``k`` starts with the teacher's seed-``k`` semantics.
+
+    Also flips the features generator's teacher-view stash on: training is
+    the only consumer of ``aux["teacher_x"]``/``aux["teacher_adj"]``, and
+    scoring must not pay for tensors nobody reads.
+    """
+    generator = model.generator
+    if not isinstance(generator, FullEgoFeaturesGenerator):
+        raise ValueError("distill requires the full_ego_features generator")
+    checkpoint = cast(
+        Mapping[str, object],
+        torch.load(distill.teacher_checkpoint, map_location="cpu", weights_only=True),
+    )
+    missing_keys = [
+        key for key in ("model_state", "model_family", "model_config") if key not in checkpoint
+    ]
+    if missing_keys:
+        raise ValueError(
+            f"teacher checkpoint {distill.teacher_checkpoint} is missing keys {missing_keys}"
+        )
+    if checkpoint["model_family"] != _EGOSTITCH_E2E_FAMILY:
+        raise ValueError("teacher checkpoint must be an egostitch_e2e model")
+    teacher_cfg = E2EConfig.from_mapping(cast(Mapping[str, object], checkpoint["model_config"]))
+    if teacher_cfg.generator.name != "full_ego_oracle":
+        raise ValueError("teacher checkpoint generator must be full_ego_oracle")
+    if (
+        teacher_cfg.encoder != model.cfg.encoder
+        or teacher_cfg.classifier.d_model != model.cfg.classifier.d_model
+    ):
+        raise ValueError(
+            "teacher and student encoder sections must match exactly (projection-free "
+            f"seed KD): teacher {teacher_cfg.encoder!r} at d_model "
+            f"{teacher_cfg.classifier.d_model}, student {model.cfg.encoder!r} at d_model "
+            f"{model.cfg.classifier.d_model}"
+        )
+    state = cast(dict[str, torch.Tensor], checkpoint["model_state"])
+    encoder_state = {
+        key[len("encoder.") :]: value for key, value in state.items() if key.startswith("encoder.")
+    }
+    if not encoder_state:
+        raise ValueError("teacher checkpoint carries no encoder parameters")
+    teacher_in_dim, teacher_relations = FullOracleGenerator().graph_dims()
+    teacher_encoder = build_encoder(
+        teacher_cfg.encoder,
+        in_dim=teacher_in_dim,
+        num_relations=teacher_relations,
+        d_model=teacher_cfg.classifier.d_model,
+    )
+    teacher_encoder.load_state_dict(encoder_state, strict=True)
+    if distill.warm_start_readout:
+        student_encoder = model.encoder
+        assert student_encoder is not None, "full_ego_features always constructs an encoder"
+        readout_state = {
+            key: value
+            for key, value in encoder_state.items()
+            if key.startswith(("project.", "readout."))
+        }
+        if not readout_state:
+            raise ValueError("teacher encoder carries no project/readout weights to warm-start")
+        load_result = student_encoder.load_state_dict(readout_state, strict=False)
+        if load_result.unexpected_keys:
+            raise ValueError(
+                "warm-start keys absent on the student encoder: "
+                f"{load_result.unexpected_keys[:5]}"
+            )
+    teacher_encoder.to(device=device, dtype=torch.float32)
+    teacher_encoder.eval()
+    teacher_encoder.requires_grad_(False)
+    generator.set_stash_teacher_view(True)
+    return _KdRuntime(
+        teacher_encoder=teacher_encoder,
+        lambda_seed=distill.lambda_seed,
+        lambda_gram=distill.lambda_gram,
+    )
+
+
 class _CompositeStep(torch.nn.Module):
     """One-forward composite step so DDP sees a single forward per backward.
 
@@ -2765,10 +2931,83 @@ class _CompositeStep(torch.nn.Module):
     `EgoStitchModel.aggregate_losses` exists to do this instead).
     """
 
-    def __init__(self, model: EgoStitchModel, world_size: int) -> None:
+    def __init__(
+        self, model: EgoStitchModel, world_size: int, *, kd: _KdRuntime | None = None
+    ) -> None:
         super().__init__()
         self.model = model
         self.world_size = world_size
+        # Plain attribute, not a submodule: see `_KdRuntime`'s docstring.
+        self._kd = kd
+
+    def _kd_terms(
+        self,
+        graph: ImaginedGraph | None,
+        embedding_ab: GraphEmbedding | None,
+        embedding_ba: GraphEmbedding | None,
+        edge_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute the Gate A seed and set-Gram KD terms for one edge batch.
+
+        The teacher graph is rebuilt from the features generator's stashed
+        structural view over the *same* padded node layout the student just
+        encoded, so node tokens align positionally and the PMA seed tokens
+        align seed-for-seed. Both orientations are matched (AB student to AB
+        teacher, BA to BA) and averaged. The whole computation runs with
+        autocast disabled: the frozen teacher forwards in fp32 under
+        ``no_grad``, and the student tokens are upcast so the cosine/Gram
+        reductions never quantize to the bf16 ulp grid.
+        """
+        kd = self._kd
+        assert kd is not None
+        if graph is None or embedding_ab is None or embedding_ba is None:
+            raise RuntimeError(
+                "KD requires the topology pathway: the features generator must emit a "
+                "graph and both orientation embeddings on every training step"
+            )
+        aux = graph.aux
+        if "teacher_x" not in aux or "teacher_adj" not in aux:
+            raise RuntimeError(
+                "KD requires the features generator's stashed teacher view "
+                "(set_stash_teacher_view(True) at startup)"
+            )
+        teacher_graph = FullEgoGraph(
+            x=aux["teacher_x"],
+            adj=aux["teacher_adj"],
+            mask=graph.mask,
+            aux={"plan": aux["plan"], "log_plan": aux["log_plan"]},
+            directed=True,
+        )
+        nodes = graph.num_nodes
+        node_mask = graph.mask > 0.0
+        live = edge_mask.to(dtype=torch.bool)
+        with torch.autocast(device_type=teacher_graph.x.device.type, enabled=False):
+            with torch.no_grad():
+                teacher_ab = kd.teacher_encoder(teacher_graph)
+                teacher_ba = kd.teacher_encoder(teacher_graph.swapped())
+            seed = 0.5 * (
+                kd_seed_loss(
+                    embedding_ab.tokens[:, nodes:].float(), teacher_ab.tokens[:, nodes:], live
+                )
+                + kd_seed_loss(
+                    embedding_ba.tokens[:, nodes:].float(), teacher_ba.tokens[:, nodes:], live
+                )
+            )
+            gram = 0.5 * (
+                kd_set_gram_loss(
+                    embedding_ab.tokens[:, :nodes].float(),
+                    teacher_ab.tokens[:, :nodes],
+                    node_mask,
+                    live,
+                )
+                + kd_set_gram_loss(
+                    embedding_ba.tokens[:, :nodes].float(),
+                    teacher_ba.tokens[:, :nodes],
+                    node_mask,
+                    live,
+                )
+            )
+        return seed, gram
 
     def forward(self, batch: dict[str, object]) -> dict[str, object]:
         node = cast(dict[str, torch.Tensor], batch["node"])
@@ -2929,6 +3168,21 @@ class _CompositeStep(torch.nn.Module):
                 batch.get("recon_factors"),
             ),
         )
+        if self._kd is not None:
+            kd_seed, kd_gram = self._kd_terms(
+                graph,
+                embedding_ab,
+                cast(GraphEmbedding | None, edge_output.get("embedding_ba")),
+                edge["edge_mask"],
+            )
+            kd_total = self._kd.lambda_seed * kd_seed + self._kd.lambda_gram * kd_gram
+            total = total + kd_total
+            # KD is representation supervision, not an edge-family member:
+            # folded into `total` (and logged via `parts`) rather than into
+            # the frozen stage1 families the gradient probe enumerates.
+            parts["kd_seed"] = float(kd_seed.detach())
+            parts["kd_gram"] = float(kd_gram.detach())
+            parts["total"] = float(total.detach())
         parameter_anchor = (
             0.0
             * torch.stack(
@@ -3869,6 +4123,8 @@ def _e2e_arm_name_from_config(config: E2EConfig) -> E2EArmName:
         return "oracle"
     if config.generator.name == "full_ego_oracle":
         return "full_ego_oracle"
+    if config.generator.name == "full_ego_features":
+        return "full_ego_features"
     if config.classifier.permanent_null == "all_head":
         return "b0_e2e_f_only"
     if config.classifier.p_topo == 0.0:
@@ -4556,7 +4812,12 @@ def _train_e2e_stability_loop(
     use_cuda = accelerator.device.type == "cuda"
 
     parameter_groups = build_e2e_parameter_groups(model)
-    composite = _CompositeStep(model, world)
+    kd_runtime = (
+        _build_kd_runtime(cfg.distill, model, device=accelerator.device)
+        if cfg.distill is not None
+        else None
+    )
+    composite = _CompositeStep(model, world, kd=kd_runtime)
     optimizer = torch.optim.AdamW(
         [
             {"params": parameter_groups.groups[name], "lr": training.lr_peak, "name": name}
@@ -6012,6 +6273,12 @@ def _install_oracle_context(model: EgoStitchModel, data: EgoStitchData, *, run_k
         # isolates in the full-oracle truth context.
         full_truth_graph.add_nodes_from(ordered_node_ids)
         model.generator.set_oracle_context(full_truth_graph, ordered_node_ids)
+        if isinstance(model.generator, FullEgoFeaturesGenerator):
+            # Same rows, same order: `data.f0` is the training-universe F0
+            # matrix `ordered_node_ids` was derived from above. Truth-graph
+            # nodes outside it (featureless survivors) gather zeros with an
+            # explicit has_f0=0 indicator inside the generator.
+            model.generator.set_node_features(data.f0, ordered_node_ids)
     logger.info(
         "installed oracle truth context generator=%s rows=%d truth_source=%s",
         model.cfg.generator.name,
@@ -6052,7 +6319,7 @@ def _run_ddp_worker(cfg: EgoConfig, args: EgoCliArgs) -> None:
     data = assemble_egostitch_data(cfg, pack_dir=args.pack_dir)
     model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
     feature_stats_sha256 = _bind_feature_standardization(model, cfg, data)
-    if model.cfg.generator.name in ("oracle_struct", "full_ego_oracle"):
+    if model.cfg.generator.name in ("oracle_struct", "full_ego_oracle", "full_ego_features"):
         _install_oracle_context(model, data, run_kind=effective_run_kind)
     _run_ddp_dispatch(
         cfg,

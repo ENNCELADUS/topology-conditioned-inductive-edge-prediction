@@ -2234,7 +2234,11 @@ def _score_egostitch_e2e(
         EgoStitchImagineGenerator,
         GeneratorNodeState,
     )
-    from src.model.egostitch.generator.full_oracle import FullEgoGraph, FullOracleGenerator
+    from src.model.egostitch.generator.full_oracle import (
+        FullEgoFeaturesGenerator,
+        FullEgoGraph,
+        FullOracleGenerator,
+    )
     from src.model.egostitch.generator.imagine import SlotSet
     from src.model.egostitch.generator.null import NullGenerator
     from src.model.egostitch.generator.oracle import OracleStructGenerator
@@ -2299,6 +2303,22 @@ def _score_egostitch_e2e(
         _install_oracle_context(model, node_ids, truth_graph=oracle_truth_graph)
     f0_cache.parent.mkdir(parents=True, exist_ok=True)
     matrix, index = build_f0_matrix(store, node_ids, cache_path=f0_cache)
+    if isinstance(model.generator, FullEgoFeaturesGenerator):
+        # Candidate egos routinely reach truth-graph nodes outside the scored
+        # pair universe, so the student's feature table must cover the whole
+        # truth graph's featured nodes, not just `node_ids`. Featureless
+        # truth-graph nodes stay out and gather zeros with has_f0=0 inside
+        # the generator. Cached beside the pair-universe F0 cache under its
+        # own name -- `build_f0_matrix`'s exact-order contract would reject
+        # sharing one file between the two node orderings.
+        assert oracle_truth_graph is not None
+        featured_ids = sorted((set(oracle_truth_graph.nodes) | set(node_ids)) & store.node_ids)
+        ego_matrix, _ego_index = build_f0_matrix(
+            store,
+            featured_ids,
+            cache_path=f0_cache.with_name(f"{f0_cache.stem}_ego_universe.pt"),
+        )
+        model.generator.set_node_features(ego_matrix, featured_ids)
 
     registered_n_ground = model.generator_cfg.n_ground
     if grounding_cache is None:
@@ -3163,6 +3183,7 @@ def _run_score(args: argparse.Namespace) -> None:
     # never pay. For `egostitch_e2e` this is free -- `_load_checkpoint` already
     # imported the same module building the model above.
     is_oracle_generator = False
+    is_full_ego_family = False
     oracle_generator_name: str | None = None
     if model_family == "egostitch_e2e":
         from src.model.egostitch.composite import EgoStitchModel
@@ -3173,12 +3194,15 @@ def _run_score(args: argparse.Namespace) -> None:
             model.generator, (OracleStructGenerator, FullOracleGenerator)
         ):
             is_oracle_generator = True
+            # Covers `full_ego_oracle` and its `full_ego_features` subclass:
+            # both emit unbounded per-pair ego node sets, so both need the
+            # ego-size-aware shard balancing, batching, and telemetry below.
+            is_full_ego_family = isinstance(model.generator, FullOracleGenerator)
             oracle_generator_name = model.cfg.generator.name
-    if (
-        oracle_generator_name == "full_ego_oracle"
-        and args.scaffold_control != _SCAFFOLD_CONTROL_NONE
-    ):
-        raise ValueError("full_ego_oracle does not support scoring-time scaffold controls")
+    if is_full_ego_family and args.scaffold_control != _SCAFFOLD_CONTROL_NONE:
+        raise ValueError(
+            f"{oracle_generator_name} does not support scoring-time scaffold controls"
+        )
     if args.allow_oracle_diagnostic and not is_oracle_generator:
         raise ValueError(
             "--allow-oracle-diagnostic is valid only when the checkpoint's "
@@ -3270,7 +3294,7 @@ def _run_score(args: argparse.Namespace) -> None:
     total_rows = len(pairs)
     logger.info("resolved %d pairs from %s", total_rows, args.pairs)
     all_full_oracle_ego_sizes: list[int] | None = None
-    if oracle_generator_name == "full_ego_oracle":
+    if is_full_ego_family:
         assert oracle_truth_graph is not None
         all_full_oracle_ego_sizes = _full_oracle_ego_sizes(oracle_truth_graph, pairs)
 
@@ -3303,9 +3327,7 @@ def _run_score(args: argparse.Namespace) -> None:
     }
     f_logit: NDArray[np.float32] | None = None
     full_logit: NDArray[np.float32] | None = None
-    full_oracle_telemetry = (
-        _FullOracleScoreTelemetry() if oracle_generator_name == "full_ego_oracle" else None
-    )
+    full_oracle_telemetry = _FullOracleScoreTelemetry() if is_full_ego_family else None
     if full_oracle_telemetry is not None and device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     score_started = perf_counter()
@@ -3353,9 +3375,7 @@ def _run_score(args: argparse.Namespace) -> None:
         )
     elif model_family == "egostitch_e2e":
         thread_count = (
-            _FULL_ORACLE_CPU_THREADS
-            if oracle_generator_name == "full_ego_oracle"
-            else torch.get_num_threads()
+            _FULL_ORACLE_CPU_THREADS if is_full_ego_family else torch.get_num_threads()
         )
         with _torch_intraop_threads(thread_count):
             decomposed = _score_egostitch_e2e(

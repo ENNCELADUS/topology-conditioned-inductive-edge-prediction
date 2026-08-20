@@ -343,7 +343,38 @@ class FullOracleGenerator(NeighborhoodGenerator[GeneratorNodeState, object, Full
                     torch.from_numpy(edge_right_locals[keep]),
                 ] = 1.0
 
-        empty_plan = torch.empty((batch_size, 0, 0), device=device)
+        return self._finalize_graph(
+            x=x,
+            adj=adj,
+            mask=mask,
+            device=device,
+            node_owners=node_owners,
+            node_locals=node_locals,
+            node_values=node_values,
+        )
+
+    def _finalize_graph(
+        self,
+        *,
+        x: torch.Tensor,
+        adj: torch.Tensor,
+        mask: torch.Tensor,
+        device: torch.device,
+        node_owners: NDArray[np.int64],
+        node_locals: NDArray[np.int64],
+        node_values: NDArray[np.int64],
+    ) -> FullEgoGraph:
+        """Assemble the emitted graph from `stitch`'s CPU-built layout.
+
+        The layout arrays give every valid slot's batch row (`node_owners`),
+        local column (`node_locals`), and truth-graph row (`node_values`).
+        This base implementation ignores them and emits the structural
+        oracle graph unchanged; `FullEgoFeaturesGenerator` overrides it to
+        swap the structural channels for gathered node features while
+        reusing every line of the vectorized layout construction above.
+        """
+        del node_owners, node_locals, node_values
+        empty_plan = torch.empty((x.shape[0], 0, 0), device=device)
         return FullEgoGraph(
             x=x.to(device=device),
             adj=adj.to(device=device),

@@ -23,6 +23,9 @@ contributes exactly zero -- never NaN, regardless of group size.
 - `kd_d7a` is `kd_d2`'s exact losses (`kd_rank_loss` + `kd_dist_loss`) run
   over a heuristic-teacher targets artifact instead of the learned oracle --
   also no new loss code, only a different `teacher_logit` source.
+- `kd_seed_loss` + `kd_set_gram_loss` are the Gate A set-student terms
+  (`full_ego_features` arm): per-seed PMA latent matching and within-set
+  node-token Gram geometry against the frozen full-ego oracle encoder.
 
 LLP constants, verified against the paper's released code
 (https://github.com/snap-research/linkless-link-prediction/blob/main/src/main.py,
@@ -282,6 +285,73 @@ def kd_residual_loss(
     return _masked_mean(per_row, mask)
 
 
+def kd_seed_loss(
+    student_seeds: torch.Tensor,
+    teacher_seeds: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Masked-mean per-seed cosine distance to the teacher's PMA seed tokens (Gate A).
+
+    ``student_seeds``/``teacher_seeds`` are shape ``(B, S, d)`` -- the PMA
+    seed tokens both encoders append after their node tokens, matched seed
+    ``k`` to seed ``k`` with no learned projection: student and teacher share
+    ``d_model`` and the same PMA readout by construction, so a projection
+    would only absorb the KD pressure and blur the seed-cosine telemetry's
+    reading as raw latent predictability. The teacher side is cast to the
+    student dtype and is expected to arrive detached (frozen teacher,
+    ``no_grad`` forward). Per row: mean over seeds of ``1 - cos``; reduced by
+    masked mean over live rows.
+    """
+    student_norm = F.normalize(student_seeds, p=2, dim=-1, eps=eps)
+    teacher_norm = F.normalize(teacher_seeds.to(dtype=student_seeds.dtype), p=2, dim=-1, eps=eps)
+    per_row = (1.0 - (student_norm * teacher_norm).sum(dim=-1)).mean(dim=-1)
+    return _masked_mean(per_row, mask)
+
+
+def kd_set_gram_loss(
+    student_tokens: torch.Tensor,
+    teacher_tokens: torch.Tensor,
+    node_mask: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Masked within-set node-token cosine-Gram match, per graph (Gate A).
+
+    ``student_tokens``/``teacher_tokens`` are shape ``(B, N, d)`` per-node
+    token states over the *same* padded node layout (the features generator
+    inherits the oracle's node ordering, so alignment is positional).
+    ``node_mask`` is ``(B, N)`` node validity; ``mask`` is ``(B,)`` row
+    liveness (DDP filler exclusion). Per graph, both token sets are
+    row-normalized, their ``N x N`` cosine Grams differenced, and the squared
+    Frobenius norm averaged over valid off-diagonal entries -- the diagonal
+    is 1 for both by construction and would only dilute. Rows with fewer than
+    two valid nodes have no off-diagonal entries and are excluded from the
+    batch mean. Unlike `kd_gram_loss` (pair-space, across the batch), this
+    matches candidate-candidate geometry *within* one query's set.
+    """
+    valid_nodes = node_mask.to(dtype=torch.bool)
+    node_weight = valid_nodes.to(dtype=student_tokens.dtype).unsqueeze(-1)
+    student_norm = F.normalize(student_tokens, p=2, dim=-1, eps=eps) * node_weight
+    teacher_norm = (
+        F.normalize(teacher_tokens.to(dtype=student_tokens.dtype), p=2, dim=-1, eps=eps)
+        * node_weight
+    )
+    gram_student = student_norm @ student_norm.transpose(1, 2)
+    gram_teacher = teacher_norm @ teacher_norm.transpose(1, 2)
+    nodes = student_tokens.shape[1]
+    off_diagonal = ~torch.eye(nodes, dtype=torch.bool, device=student_tokens.device)
+    valid_entries = valid_nodes.unsqueeze(2) & valid_nodes.unsqueeze(1) & off_diagonal
+    entry_weight = valid_entries.to(dtype=student_tokens.dtype)
+    squared = (gram_student - gram_teacher).square() * entry_weight
+    entry_counts = entry_weight.sum(dim=(1, 2))
+    per_row = squared.sum(dim=(1, 2)) / entry_counts.clamp_min(1.0)
+    live = mask.to(dtype=torch.bool) & (entry_counts > 0)
+    return _masked_mean(per_row, live)
+
+
 __all__ = [
     "DEFAULT_MARGIN",
     "DEFAULT_TEMPERATURE",
@@ -292,4 +362,6 @@ __all__ = [
     "kd_logit_loss",
     "kd_rank_loss",
     "kd_residual_loss",
+    "kd_seed_loss",
+    "kd_set_gram_loss",
 ]
