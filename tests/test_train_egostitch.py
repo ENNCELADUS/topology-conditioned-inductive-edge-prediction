@@ -170,6 +170,52 @@ class TestLoadConfig:
         assert cfg.diagnostics.gradient_probe_interval == 50
         assert cfg.diagnostics.gradient_imbalance_steps == 200
         assert cfg.runtime is None
+        assert cfg.topology_validation == te.EgoTopologyValidationConfig()
+
+    def test_accepts_cascade_topology_validation(self, tmp_path: Path) -> None:
+        cfg = te.load_config(
+            _write_config(
+                tmp_path,
+                topology_validation={
+                    "full_every_epochs": 3,
+                    "cascade_buckets_per_size": 5,
+                    "cascade_complement_sample_size": 20_000,
+                },
+            )
+        )
+        assert cfg.topology_validation.full_every_epochs == 3
+        assert cfg.topology_validation.cascade_buckets_per_size == 5
+        assert cfg.topology_validation.cascade_complement_sample_size == 20_000
+
+    @pytest.mark.parametrize(
+        ("topology_validation", "message"),
+        [
+            ({"full_every_epochs": 0}, "full_every_epochs"),
+            ({"cascade_buckets_per_size": 1}, "cascade_buckets_per_size"),
+            ({"cascade_complement_sample_size": -1}, "complement_sample_size"),
+        ],
+    )
+    def test_rejects_invalid_cascade_topology_validation(
+        self,
+        tmp_path: Path,
+        topology_validation: dict[str, int],
+        message: str,
+    ) -> None:
+        with pytest.raises(ValueError, match=message):
+            te.load_config(_write_config(tmp_path, topology_validation=topology_validation))
+
+    def test_topology_validation_scope_uses_full_cadence_and_final_epoch(self) -> None:
+        config = te.EgoTopologyValidationConfig(full_every_epochs=3)
+        assert [te._e2e_topology_validation_scope(epoch, 8, config) for epoch in range(1, 9)] == [
+            "cascade",
+            "cascade",
+            "full",
+            "cascade",
+            "cascade",
+            "full",
+            "cascade",
+            "full",
+        ]
 
     def test_runtime_accepts_family_specific_token_budget(self, tmp_path: Path) -> None:
         cfg = te.load_config(_write_config(tmp_path, runtime=dict(_RUNTIME)))

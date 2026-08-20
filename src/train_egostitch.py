@@ -296,6 +296,21 @@ class EgoDistillConfig:
 
 
 @dataclass(frozen=True)
+class EgoTopologyValidationConfig:
+    """Two-resolution V_val topology-validation cadence.
+
+    ``full_every_epochs=1`` preserves the existing behavior. Larger intervals
+    use a fixed, smaller bucket panel on intervening epochs while retaining the
+    full 500-ball/200k-complement validation on the configured cadence. Only
+    full-resolution epochs participate in checkpoint selection.
+    """
+
+    full_every_epochs: int = 1
+    cascade_buckets_per_size: int = 5
+    cascade_complement_sample_size: int = 20_000
+
+
+@dataclass(frozen=True)
 class EgoConfig:
     """The full validated EgoStitch worker configuration.
 
@@ -323,6 +338,9 @@ class EgoConfig:
     training: EgoStitchTrainingConfig | None = None
     run_kind: E2ERunKind | None = None
     distill: EgoDistillConfig | None = None
+    topology_validation: EgoTopologyValidationConfig = field(
+        default_factory=EgoTopologyValidationConfig
+    )
 
 
 @dataclass(frozen=True)
@@ -367,6 +385,7 @@ def load_config(path: Path) -> EgoConfig:
             "runtime",
             "training",
             "distill",
+            "topology_validation",
         ),
         "",
     )
@@ -703,6 +722,37 @@ def load_config(path: Path) -> EgoConfig:
                 "teacher matches the features generator's stashed structural view"
             )
 
+    topology_validation = EgoTopologyValidationConfig()
+    if raw.get("topology_validation") is not None:
+        topology_raw = _as_mapping(raw["topology_validation"], "topology_validation")
+        _check_no_unknown_keys(
+            topology_raw,
+            tuple(EgoTopologyValidationConfig.__dataclass_fields__),
+            "topology_validation",
+        )
+        topology_validation = EgoTopologyValidationConfig(
+            full_every_epochs=_as_int(
+                topology_raw.get("full_every_epochs", 1),
+                "topology_validation.full_every_epochs",
+            ),
+            cascade_buckets_per_size=_as_int(
+                topology_raw.get("cascade_buckets_per_size", 5),
+                "topology_validation.cascade_buckets_per_size",
+            ),
+            cascade_complement_sample_size=_as_int(
+                topology_raw.get("cascade_complement_sample_size", 20_000),
+                "topology_validation.cascade_complement_sample_size",
+            ),
+        )
+        if topology_validation.full_every_epochs <= 0:
+            raise ValueError("topology_validation.full_every_epochs must be positive")
+        if topology_validation.cascade_buckets_per_size < 2:
+            raise ValueError("topology_validation.cascade_buckets_per_size must be at least 2")
+        if topology_validation.cascade_complement_sample_size < 0:
+            raise ValueError(
+                "topology_validation.cascade_complement_sample_size must be non-negative"
+            )
+
     return EgoConfig(
         model=model,
         data=data,
@@ -716,6 +766,7 @@ def load_config(path: Path) -> EgoConfig:
         training=training,
         run_kind=None,
         distill=distill,
+        topology_validation=topology_validation,
     )
 
 
@@ -2025,6 +2076,10 @@ class EgoStitchData:
         val_ball_union: The once-per-run ball-union pair universe plus pinned
             complement sample, built from `val_split`, or `None` when
             `val_split` is absent.
+        val_cascade_topology_reference: Reference restricted to the fixed
+            cascade bucket panel, or the full reference when cascading is off.
+        val_cascade_ball_union: Pair universe for the fixed cascade panel, or
+            the full universe when cascading is off.
         feature_stats: Registered training-universe standardization constants.
     """
 
@@ -2042,6 +2097,8 @@ class EgoStitchData:
     val_split: ValRegionSplit | None = None
     val_topology_reference: ValTopologyReference | None = None
     val_ball_union: ValBallUnionUniverse | None = None
+    val_cascade_topology_reference: ValTopologyReference | None = None
+    val_cascade_ball_union: ValBallUnionUniverse | None = None
     validation_role: Literal["V_val"] | None = None
     access_audit: dict[str, object] | None = None
     validation_nodes: tuple[str, ...] = ()
@@ -2296,6 +2353,26 @@ def _assemble_e2e_data(
         )
     val_topology_reference = build_val_topology_reference(split)
     val_ball_union = val_ball_union_universe(split)
+    topology_cfg = cfg.topology_validation
+    if topology_cfg.full_every_epochs == 1:
+        val_cascade_topology_reference = val_topology_reference
+        val_cascade_ball_union = val_ball_union
+    else:
+        cascade_buckets: dict[int, list[set[str]]] = {}
+        for size, balls in split.buckets.items():
+            if len(balls) < topology_cfg.cascade_buckets_per_size:
+                raise ValueError(
+                    "topology_validation.cascade_buckets_per_size exceeds the "
+                    f"available bucket count for size {size}: "
+                    f"{topology_cfg.cascade_buckets_per_size} > {len(balls)}"
+                )
+            cascade_buckets[size] = balls[: topology_cfg.cascade_buckets_per_size]
+        cascade_split = replace(split, buckets=cascade_buckets)
+        val_cascade_topology_reference = build_val_topology_reference(cascade_split)
+        val_cascade_ball_union = val_ball_union_universe(
+            cascade_split,
+            sample_size=topology_cfg.cascade_complement_sample_size,
+        )
     data = EgoStitchData(
         train_nodes=train_nodes,
         training_positives=sorted(split.training_positives),
@@ -2312,6 +2389,8 @@ def _assemble_e2e_data(
         val_split=split,
         val_topology_reference=val_topology_reference,
         val_ball_union=val_ball_union,
+        val_cascade_topology_reference=val_cascade_topology_reference,
+        val_cascade_ball_union=val_cascade_ball_union,
         validation_role=role,
         access_audit=audit,
         validation_nodes=validation_nodes,
@@ -3474,6 +3553,7 @@ class _ValidationResult:
     fidelity: dict[str, float]
     scale_telemetry: dict[str, float] = field(default_factory=dict)
     timing: dict[str, float] = field(default_factory=dict)
+    topology_scope: Literal["cascade", "full"] = "full"
     active_logits: NDArray[np.float32] = field(default_factory=lambda: np.empty(0, dtype="<f4"))
 
 
@@ -3781,6 +3861,7 @@ def _validate_epoch(
     topk_fraction: float,
     token_table: PackedFeatureTable | None = None,
     token_node_index: Mapping[str, int] | None = None,
+    topology_scope: Literal["cascade", "full"] = "full",
 ) -> _ValidationResult | None:
     """Score the validation pairs with exact distributed coverage.
 
@@ -3824,7 +3905,12 @@ def _validate_epoch(
     # The complete V_val region when one was derived; the toy-fixture fallback
     # (no `val_split`) keeps the old shard-local touched-node set, since those
     # fixtures build `val_pairs` by hand with no V_val region behind them.
-    reference = data.val_topology_reference
+    if topology_scope == "full":
+        reference = data.val_topology_reference
+        ball_union = data.val_ball_union
+    else:
+        reference = data.val_cascade_topology_reference
+        ball_union = data.val_cascade_ball_union
     encode_nodes = (
         list(reference.nodes)
         if reference is not None
@@ -4013,6 +4099,7 @@ def _validate_epoch(
     pair_scoring_seconds = float(phase_timing_rows[:, 1].max().item())
     gathered_values = accelerator.gather(local_values)
     gathered_rows = accelerator.gather(local_rows)
+    gather_seconds = time.monotonic() - gather_metrics_started
 
     # Lean topology-universe pass: active-arm logit only, over the
     # deduplicated ball-union pairs U plus a pinned complement sample. Runs on
@@ -4020,7 +4107,6 @@ def _validate_epoch(
     # mirroring the classification pass's DDP-fail-closed discipline -- a
     # partial gather here would silently assemble the topology graph from a
     # subset of the row set.
-    ball_union = data.val_ball_union
     universe_started = time.monotonic()
     universe_logits = (
         _score_val_universe_logits(
@@ -4035,6 +4121,7 @@ def _validate_epoch(
         model.train()
     if not accelerator.is_main_process:
         return None
+    metrics_started = time.monotonic()
     rows_np = gathered_rows.cpu().numpy()
     values_np = gathered_values.cpu().numpy()
     seen: dict[int, list[float]] = {}
@@ -4114,12 +4201,16 @@ def _validate_epoch(
         "spectral_mmd_ratio": validation_topology.spectral_mmd,
         "val_threshold": val_threshold,
         "val_admitted_non_self_fraction": val_admitted_non_self_fraction,
+        "topology_validation_full": float(topology_scope == "full"),
+        "topology_scored_rows": float(
+            0 if ball_union is None else ball_union.u_idx.size + ball_union.sample_u_idx.size
+        ),
         "prevalence": float(np.mean(data.val_labels)),
         **dispersion_summary,
         **e2e_degree_decorrelation_telemetry(endpoint_degree, full_np - f_np),
     }
     active_metrics = compute_edge_metrics(data.val_labels.astype(np.int64), probs)
-    gather_metrics_seconds = time.monotonic() - gather_metrics_started
+    gather_metrics_seconds = gather_seconds + (time.monotonic() - metrics_started)
     return _ValidationResult(
         metrics=active_metrics,
         fidelity=fidelity,
@@ -4130,6 +4221,7 @@ def _validate_epoch(
             "gather_metrics_seconds": gather_metrics_seconds,
             "val_universe_scoring_seconds": universe_seconds,
         },
+        topology_scope=topology_scope,
         active_logits=np.asarray(logits_np, dtype="<f4"),
     )
 
@@ -4151,6 +4243,21 @@ class EgoTrainResult:
     counterfactual_stop_epoch: int | None
     runtime_profile: dict[str, object]
     kendall_state: dict[str, object]
+
+
+def _e2e_topology_validation_scope(
+    epoch: int,
+    total_epochs: int,
+    config: EgoTopologyValidationConfig,
+) -> Literal["cascade", "full"]:
+    """Return the fixed two-resolution validation scope for one epoch."""
+    if epoch <= 0 or total_epochs <= 0 or epoch > total_epochs:
+        raise ValueError(f"invalid epoch position {epoch}/{total_epochs}")
+    if config.full_every_epochs <= 0:
+        raise ValueError("topology full-validation interval must be positive")
+    if epoch % config.full_every_epochs == 0 or epoch == total_epochs:
+        return "full"
+    return "cascade"
 
 
 def _cpu_state_dict(accelerator: Accelerator, wrapped: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -5038,9 +5145,12 @@ def _train_e2e_stability_loop(
         "node_cache_encode_seconds": 0.0,
         "pair_scoring_seconds": 0.0,
         "gather_metrics_seconds": 0.0,
+        "val_universe_scoring_seconds": 0.0,
     }
     global_step = 0
     prefetch_depth = cfg.runtime.prefetch_factor if cfg.runtime is not None else 1
+    full_topology_validations = 0
+    cascade_topology_validations = 0
 
     for epoch, epoch_steps in enumerate(epoch_step_counts, start=1):
         epoch_started = time.monotonic()
@@ -5359,6 +5469,11 @@ def _train_e2e_stability_loop(
                         topk_fraction=cfg.diagnostics.topk_fraction,
                         token_table=factory._token_table,
                         token_node_index=factory._token_node_index,
+                        topology_scope=_e2e_topology_validation_scope(
+                            epoch,
+                            cfg.optim.epochs,
+                            cfg.topology_validation,
+                        ),
                     )
                     epoch_validation_seconds += time.monotonic() - phase_a_validation_started
                     if warm is not None:
@@ -5454,6 +5569,11 @@ def _train_e2e_stability_loop(
                 else 0.0
             )
 
+        topology_scope = _e2e_topology_validation_scope(
+            epoch,
+            cfg.optim.epochs,
+            cfg.topology_validation,
+        )
         validation_started = time.monotonic()
         validation = _validate_epoch(
             model,
@@ -5463,11 +5583,16 @@ def _train_e2e_stability_loop(
             topk_fraction=cfg.diagnostics.topk_fraction,
             token_table=factory._token_table,
             token_node_index=factory._token_node_index,
+            topology_scope=topology_scope,
         )
         epoch_validation_seconds += time.monotonic() - validation_started
         if validation is not None:
             for name in epoch_validation_timing:
                 epoch_validation_timing[name] += validation.timing.get(name, 0.0)
+        if topology_scope == "full":
+            full_topology_validations += 1
+        else:
+            cascade_topology_validations += 1
         record_validation_event("epoch_end", epoch, global_step)
         validation_seconds = epoch_validation_seconds
         epoch_wall = time.monotonic() - epoch_started
@@ -5581,27 +5706,28 @@ def _train_e2e_stability_loop(
                 validation.scale_telemetry.get("h_norm_mean", float("nan")),
                 validation.scale_telemetry.get("h_pairwise_sqdist_mean", float("nan")),
             )
-            record = E2ECheckpointRecord(
-                epoch=epoch,
-                phase=phase.phase,
-                full_joint_epochs_completed=full_joint_epochs,
-                guards_passed=quality_guards_passed,
-                auprc=metrics.auprc,
-                prevalence=fidelity["prevalence"],
-                active_logit_std=fidelity["active_logit_std"],
-                gs=fidelity["gs_bfs"],
-                rd=fidelity["rd_bfs"],
-                degree_mmd=fidelity["degree_mmd_ratio"],
-                clustering_mmd=fidelity["clustering_mmd_ratio"],
-                spectral_mmd=fidelity["spectral_mmd_ratio"],
-                brier=metrics.brier,
-                warm_reference_std=warm_reference_std,
-                warm_reference_auprc=warm_reference_auprc,
-                residual_ratio=fidelity["topology_delta_ratio"],
-                topology_gradient_norm=latest_topology_norm,
-            )
-            records.append(record)
-            metrics_by_epoch[epoch] = metrics
+            if topology_scope == "full":
+                record = E2ECheckpointRecord(
+                    epoch=epoch,
+                    phase=phase.phase,
+                    full_joint_epochs_completed=full_joint_epochs,
+                    guards_passed=quality_guards_passed,
+                    auprc=metrics.auprc,
+                    prevalence=fidelity["prevalence"],
+                    active_logit_std=fidelity["active_logit_std"],
+                    gs=fidelity["gs_bfs"],
+                    rd=fidelity["rd_bfs"],
+                    degree_mmd=fidelity["degree_mmd_ratio"],
+                    clustering_mmd=fidelity["clustering_mmd_ratio"],
+                    spectral_mmd=fidelity["spectral_mmd_ratio"],
+                    brier=metrics.brier,
+                    warm_reference_std=warm_reference_std,
+                    warm_reference_auprc=warm_reference_auprc,
+                    residual_ratio=fidelity["topology_delta_ratio"],
+                    topology_gradient_norm=latest_topology_norm,
+                )
+                records.append(record)
+                metrics_by_epoch[epoch] = metrics
             # Snapshot every completed epoch. Quality predicates remain in the
             # history as telemetry but do not control checkpoint availability.
             if not profile_only:
@@ -5614,6 +5740,7 @@ def _train_e2e_stability_loop(
                     "phase": phase.phase,
                     "auroc": metrics.auroc,
                     "auprc": metrics.auprc,
+                    "topology_validation_scope": topology_scope,
                     "lr": float(optimizer.param_groups[0]["lr"]),
                     "fidelity": fidelity,
                     "quality_thresholds": {
@@ -5654,6 +5781,7 @@ def _train_e2e_stability_loop(
                 "data_wait_seconds": epoch_data_wait,
                 "compute_seconds": max(epoch_wall - epoch_data_wait - validation_seconds, 0.0),
                 "validation_seconds": validation_seconds,
+                "topology_validation_scope": topology_scope,
                 **epoch_validation_timing,
             }
         )
@@ -5816,6 +5944,8 @@ def _train_e2e_stability_loop(
     runtime_profile: dict[str, object] = {
         "epochs_completed": len(epoch_step_counts),
         "validations_completed": len(epoch_step_counts),
+        "full_topology_validations_completed": full_topology_validations,
+        "cascade_topology_validations_completed": cascade_topology_validations,
         "val_region_validation_event_count": len(validation_events),
         "val_region_validation_events": validation_events,
         "peak_memory_gib_per_rank": [float(row[4]) for row in rank_stats],

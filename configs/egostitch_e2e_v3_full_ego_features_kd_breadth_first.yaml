@@ -94,6 +94,11 @@ eval:
   patience: 10
   eval_every: 1
 
+topology_validation:
+  full_every_epochs: 3
+  cascade_buckets_per_size: 5
+  cascade_complement_sample_size: 20000
+
 distill:
   teacher_checkpoint: outputs/egostitch_e2e_stage1_v3/full_ego_teacher_kd/best.pt
   lambda_seed: 1.0
