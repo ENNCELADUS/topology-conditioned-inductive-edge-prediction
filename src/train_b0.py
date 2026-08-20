@@ -122,16 +122,18 @@ class ValidationOutcome(NamedTuple):
 EvaluateFn = Callable[[nn.Module, Iterable[Batch], Accelerator], ValidationOutcome]
 DDP_MODES = ("probe", "epoch-probe", "train")
 T = TypeVar("T")
-D9_TELEMETRY_KEYS = (
+D9_ROW_TELEMETRY_KEYS = (
     "kd_prior_cos",
     "kd_seed_cos",
     "kd_recon_delta",
     "kd_geom",
+    "mc_logit_std",
+    "gen_prior_dispersion",
+)
+D9_TELEMETRY_KEYS = D9_ROW_TELEMETRY_KEYS + (
     "kd_kl_per_dim",
     "kl_active_units",
     "gen_alpha",
-    "mc_logit_std",
-    "gen_prior_dispersion",
     "kl_warmup_scale",
 )
 
@@ -2099,6 +2101,70 @@ def scale_ddp_mean_loss(
     return loss * (float(local_count * world_size) / float(global_count))
 
 
+def _scale_d9_kd_loss_for_ddp(
+    loss: torch.Tensor,
+    *,
+    local_live_rows: int,
+    world_size: int,
+    accelerator: Accelerator,
+) -> torch.Tensor:
+    """Weight a rank-local masked-mean D9 loss as the global live-row mean."""
+    if local_live_rows < 0 or world_size < 1:
+        raise ValueError("invalid D9 live-row loss-scaling counts")
+    global_live = accelerator.reduce(
+        torch.tensor(local_live_rows, device=loss.device, dtype=torch.float64),
+        reduction="sum",
+    )
+    global_live_rows = float(global_live.item())
+    if global_live_rows <= 0.0:
+        raise RuntimeError("D9 KD step has zero live teacher rows across all ranks")
+    if global_live_rows < local_live_rows:
+        raise RuntimeError("D9 global live-row count is smaller than this rank's count")
+    return loss * (float(local_live_rows * world_size) / global_live_rows)
+
+
+def _reduce_d9_epoch_telemetry(
+    accelerator: Accelerator,
+    *,
+    row_weighted_sums: dict[str, float],
+    local_live_rows: int,
+    kl_dim_sum: torch.Tensor,
+    gen_alpha: float,
+    kl_warmup_scale: float,
+) -> dict[str, float]:
+    """Reduce D9 row telemetry over all live rows and KL dimensions exactly."""
+    global_live = accelerator.reduce(
+        torch.tensor(local_live_rows, device=accelerator.device, dtype=torch.float64),
+        reduction="sum",
+    )
+    global_live_rows = float(global_live.item())
+    if global_live_rows <= 0.0:
+        raise RuntimeError("D9 epoch has zero live teacher rows across all ranks")
+    global_row_sums = accelerator.reduce(
+        torch.tensor(
+            [row_weighted_sums[key] for key in D9_ROW_TELEMETRY_KEYS],
+            device=accelerator.device,
+            dtype=torch.float64,
+        ),
+        reduction="sum",
+    )
+    global_kl_dim_sum = accelerator.reduce(kl_dim_sum.to(torch.float64), reduction="sum")
+    mean_kl_dim = global_kl_dim_sum / global_live_rows
+    telemetry = {
+        key: float(global_row_sums[index].item()) / global_live_rows
+        for index, key in enumerate(D9_ROW_TELEMETRY_KEYS)
+    }
+    telemetry.update(
+        {
+            "kd_kl_per_dim": float(mean_kl_dim.mean().item()),
+            "kl_active_units": float((mean_kl_dim > 0.02).sum().item()),
+            "gen_alpha": gen_alpha,
+            "kl_warmup_scale": kl_warmup_scale,
+        }
+    )
+    return telemetry
+
+
 def _all_ranks_loss_finite(loss: torch.Tensor, accelerator: Accelerator) -> bool:
     """Return True iff every rank's loss is finite (checked before ``backward``).
 
@@ -2524,6 +2590,8 @@ class KDStream:
         self._seed = seed
         self._rank = rank
         self.last_telemetry: dict[str, float] = {}
+        self.last_live_rows = 0
+        self.last_kl_dim_sum: torch.Tensor | None = None
         # Data boundary (fail closed): every teacher-target node — anchors and
         # partners both index `node_ids` — must lie inside the training
         # universe. A stale/foreign artifact must never train on V_val or
@@ -2618,6 +2686,8 @@ class KDStream:
     def loss(self, model: nn.Module, epoch: int, step: int) -> torch.Tensor:
         """Score this step's KD rows and return the weighted KD loss."""
         self.last_telemetry = {}
+        self.last_live_rows = 0
+        self.last_kl_dim_sum = None
         targets = self._targets
         distill = self._distill
         anchor_rows: list[int] = []
@@ -2699,6 +2769,7 @@ class KDStream:
         device = logits.device
         teacher = torch.tensor(teacher_logit, dtype=torch.float32, device=device)
         kd_mask = torch.tensor(mask, dtype=torch.float32, device=device)
+        self.last_live_rows = int(kd_mask.sum().item())
         kd_group = torch.tensor(group, dtype=torch.int64, device=device)
         total = logits.new_zeros(())
         if distill.w_label > 0.0:
@@ -2799,6 +2870,7 @@ class KDStream:
             mean_kl_dim = (kl.float() * kd_mask.unsqueeze(-1)).sum(dim=0) / kd_mask.sum().clamp_min(
                 1.0
             )
+            self.last_kl_dim_sum = (kl.float() * kd_mask.unsqueeze(-1)).sum(dim=0).detach()
             teacher_norm = torch.linalg.vector_norm(
                 teacher_seeds.reshape(teacher_seeds.size(0), -1), dim=-1
             ).clamp_min(1e-8)
@@ -2914,6 +2986,7 @@ def train_ddp_loop(
     )
     world_size = accelerator.num_processes
     use_cuda = accelerator.device.type == "cuda"
+    is_d9 = cfg.distill is not None and cfg.distill.arm == "kd_d9"
 
     history: list[dict[str, object]] = []
     metrics_by_epoch: dict[int, EdgeMetrics] = {}
@@ -3111,7 +3184,10 @@ def train_ddp_loop(
         _set_pair_latent_training_stage(model, optimizer, cfg.distill, epoch=epoch)
         local_loss_sum = 0.0
         epoch_kd_loss_sum = 0.0
-        epoch_kd_telemetry_sums = dict.fromkeys(D9_TELEMETRY_KEYS, 0.0)
+        epoch_d9_live_rows = 0
+        epoch_d9_row_sums = dict.fromkeys(D9_ROW_TELEMETRY_KEYS, 0.0)
+        epoch_d9_kl_dim_sum: torch.Tensor | None = None
+        epoch_d9_kl_warmup_scale = 0.0
         epoch_steps = 0
         epoch_local_pairs = 0
         epoch_global_pairs = 0
@@ -3147,12 +3223,30 @@ def train_ddp_loop(
             )
             if kd_loss_fn is not None:
                 kd_loss = kd_loss_fn(model, epoch, global_step + 1)
+                kd_owner = getattr(kd_loss_fn, "__self__", None)
+                if is_d9:
+                    if not isinstance(kd_owner, KDStream):
+                        raise RuntimeError("kd_d9 requires KDStream.loss as its loss hook")
+                    kd_loss = _scale_d9_kd_loss_for_ddp(
+                        kd_loss,
+                        local_live_rows=kd_owner.last_live_rows,
+                        world_size=world_size,
+                        accelerator=accelerator,
+                    )
+                    epoch_d9_live_rows += kd_owner.last_live_rows
+                    for key in D9_ROW_TELEMETRY_KEYS:
+                        epoch_d9_row_sums[key] += (
+                            kd_owner.last_telemetry[key] * kd_owner.last_live_rows
+                        )
+                    if kd_owner.last_kl_dim_sum is None:
+                        raise RuntimeError("kd_d9 KDStream did not expose its KL dimension sums")
+                    if epoch_d9_kl_dim_sum is None:
+                        epoch_d9_kl_dim_sum = kd_owner.last_kl_dim_sum.clone()
+                    else:
+                        epoch_d9_kl_dim_sum.add_(kd_owner.last_kl_dim_sum)
+                    epoch_d9_kl_warmup_scale = kd_owner.last_telemetry["kl_warmup_scale"]
                 loss = loss + kd_loss
                 epoch_kd_loss_sum += float(kd_loss.detach().float().item())
-                kd_owner = getattr(kd_loss_fn, "__self__", None)
-                if isinstance(kd_owner, KDStream):
-                    for key, value in kd_owner.last_telemetry.items():
-                        epoch_kd_telemetry_sums[key] += value
 
             if not _all_ranks_loss_finite(loss, accelerator):
                 raise RuntimeError(f"non-finite training loss on at least one rank (epoch {epoch})")
@@ -3278,20 +3372,20 @@ def train_ddp_loop(
             )
             train_kd_loss = float(global_kd_loss_sum.item()) / float(epoch_steps * world_size)
         epoch_kd_telemetry: dict[str, float] = {}
-        if cfg.distill is not None and cfg.distill.arm == "kd_d9" and epoch_steps > 0:
-            telemetry_totals = accelerator.reduce(
-                torch.tensor(
-                    [epoch_kd_telemetry_sums[key] for key in D9_TELEMETRY_KEYS],
-                    device=accelerator.device,
-                    dtype=torch.float64,
-                ),
-                reduction="sum",
+        if is_d9 and epoch_steps > 0:
+            if epoch_d9_kl_dim_sum is None:
+                raise RuntimeError("kd_d9 epoch completed without KL dimension sums")
+            pair_latent_gen = getattr(_unwrapped_pair_latent_model(model), "pair_latent_gen", None)
+            if pair_latent_gen is None:
+                raise RuntimeError("kd_d9 requires model.config.pair_latent_gen")
+            epoch_kd_telemetry = _reduce_d9_epoch_telemetry(
+                accelerator,
+                row_weighted_sums=epoch_d9_row_sums,
+                local_live_rows=epoch_d9_live_rows,
+                kl_dim_sum=epoch_d9_kl_dim_sum,
+                gen_alpha=float(pair_latent_gen.alpha.detach().float().item()),
+                kl_warmup_scale=epoch_d9_kl_warmup_scale,
             )
-            denominator = float(epoch_steps * world_size)
-            epoch_kd_telemetry = {
-                key: float(telemetry_totals[index].item()) / denominator
-                for index, key in enumerate(D9_TELEMETRY_KEYS)
-            }
         validation_start = time.monotonic()
         outcome = evaluate_fn(model, val_loader, accelerator)
         metrics = outcome.metrics

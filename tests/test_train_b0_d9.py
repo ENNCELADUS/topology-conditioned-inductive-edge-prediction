@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import shutil
+from collections.abc import Iterable
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
@@ -9,12 +13,21 @@ import numpy as np
 import pytest
 import src.train_b0 as train_b0
 import torch
+from accelerate import Accelerator
 from src.data.packed_features import PackedFeatureTable
 from src.distill.artifacts import KD_TARGETS_FORMAT_V4, KDTargets
 from src.distill.config import DistillConfig
 from src.model.egostitch.classifier.b0_v31 import V3_1
-from src.train_b0 import Config, KDStream, SchedulerConfig
+from src.train_b0 import (
+    Config,
+    KDStream,
+    ModelConfig,
+    SchedulerConfig,
+    ValidationOutcome,
+)
 from torch import nn
+
+from tests.test_train_b0 import _constant_metrics, _tiny_config
 
 pytestmark = pytest.mark.unit
 
@@ -23,8 +36,8 @@ class _FakeTable:
     def __init__(self) -> None:
         self.tokens = torch.zeros(1, 8)
         records = [
-            SimpleNamespace(node_id="node_a", length=2),
-            SimpleNamespace(node_id="node_b", length=2),
+            SimpleNamespace(node_id="node_a", length=3),
+            SimpleNamespace(node_id="node_b", length=3),
         ]
         self.manifest = SimpleNamespace(
             nodes=records,
@@ -36,6 +49,32 @@ class _FakeTable:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         values = node_indices.float().view(-1, 1, 1).expand(-1, boundary, 8)
         return values, torch.full((len(node_indices),), boundary, dtype=torch.long)
+
+
+class _GlobalLiveRows:
+    """Two-rank collective simulation returning a pinned global live count."""
+
+    def __init__(self, global_live_rows: float) -> None:
+        self.global_live_rows = global_live_rows
+        self.seen_local_rows: list[float] = []
+
+    def reduce(self, value: torch.Tensor, *, reduction: str) -> torch.Tensor:
+        assert reduction == "sum"
+        self.seen_local_rows.append(float(value.item()))
+        return value.new_tensor(self.global_live_rows)
+
+
+class _TelemetryCollectives:
+    device = torch.device("cpu")
+
+    def reduce(self, value: torch.Tensor, *, reduction: str) -> torch.Tensor:
+        assert reduction == "sum"
+        if value.numel() == 1:
+            return value.new_tensor(4.0)
+        if value.numel() == len(train_b0.D9_ROW_TELEMETRY_KEYS):
+            return torch.arange(1, value.numel() + 1, dtype=value.dtype) * 4.0
+        assert value.numel() == 2
+        return value.new_tensor([0.04, 0.12])
 
 
 class _PairLatentStub(nn.Module):
@@ -151,6 +190,9 @@ def test_d9_stream_gathers_zero_filler_applies_kl_warmup_and_records_telemetry(
     assert model.seen_teacher is not None
     assert torch.all(model.seen_teacher[0] == 1.0)
     assert torch.all(model.seen_teacher[1] == 0.0)
+    assert stream.last_live_rows == 1
+    assert stream.last_kl_dim_sum is not None
+    torch.testing.assert_close(stream.last_kl_dim_sum, torch.ones(4))
     assert stream.last_telemetry["kl_warmup_scale"] == pytest.approx(0.5)
     assert {
         "kd_prior_cos",
@@ -165,16 +207,82 @@ def test_d9_stream_gathers_zero_filler_applies_kl_warmup_and_records_telemetry(
     } <= stream.last_telemetry.keys()
 
 
-def _tiny_model() -> V3_1:
-    return V3_1(
-        input_dim=8,
-        d_model=16,
-        encoder_layers=1,
-        cross_attn_layers=1,
-        n_heads=4,
-        mlp_head={"hidden_dims": [8], "dropout": 0.0},
-        regularization={"dropout": 0.0},
-        pair_latent_gen={
+def test_two_rank_live_row_scaling_recovers_the_global_masked_mean() -> None:
+    # Rank 0 has one live row with mean loss 2; rank 1 has three with mean 6.
+    # The true global masked mean is (1*2 + 3*6) / 4 = 5.
+    rank0 = _GlobalLiveRows(global_live_rows=4.0)
+    rank1 = _GlobalLiveRows(global_live_rows=4.0)
+    parameter = torch.tensor(1.0, requires_grad=True)
+    scaled0 = train_b0._scale_d9_kd_loss_for_ddp(
+        2.0 * parameter,
+        local_live_rows=1,
+        world_size=2,
+        accelerator=cast(Accelerator, rank0),
+    )
+    scaled1 = train_b0._scale_d9_kd_loss_for_ddp(
+        6.0 * parameter,
+        local_live_rows=3,
+        world_size=2,
+        accelerator=cast(Accelerator, rank1),
+    )
+    ddp_objective = (scaled0 + scaled1) / 2.0
+    assert ddp_objective.item() == pytest.approx(5.0)
+    ddp_objective.backward()
+    assert parameter.grad is not None
+    assert parameter.grad.item() == pytest.approx(5.0)
+    assert rank0.seen_local_rows == [1.0]
+    assert rank1.seen_local_rows == [3.0]
+
+
+def test_d9_live_row_scaling_fails_closed_when_every_rank_is_padding() -> None:
+    accelerator = _GlobalLiveRows(global_live_rows=0.0)
+    with pytest.raises(RuntimeError, match="zero live teacher rows"):
+        train_b0._scale_d9_kd_loss_for_ddp(
+            torch.tensor(1.0),
+            local_live_rows=0,
+            world_size=2,
+            accelerator=cast(Accelerator, accelerator),
+        )
+
+
+def test_d9_rank_with_only_padding_contributes_zero_when_other_rank_is_live() -> None:
+    accelerator = _GlobalLiveRows(global_live_rows=3.0)
+    scaled = train_b0._scale_d9_kd_loss_for_ddp(
+        torch.tensor(7.0, requires_grad=True),
+        local_live_rows=0,
+        world_size=2,
+        accelerator=cast(Accelerator, accelerator),
+    )
+    assert scaled.item() == 0.0
+
+
+def test_epoch_telemetry_reduces_row_sums_and_kl_dimensions_globally() -> None:
+    telemetry = train_b0._reduce_d9_epoch_telemetry(
+        cast(Accelerator, _TelemetryCollectives()),
+        row_weighted_sums=dict.fromkeys(train_b0.D9_ROW_TELEMETRY_KEYS, 0.0),
+        local_live_rows=1,
+        kl_dim_sum=torch.zeros(2),
+        gen_alpha=0.3,
+        kl_warmup_scale=0.7,
+    )
+    for index, key in enumerate(train_b0.D9_ROW_TELEMETRY_KEYS, start=1):
+        assert telemetry[key] == pytest.approx(float(index))
+    assert telemetry["kd_kl_per_dim"] == pytest.approx(0.02)
+    assert telemetry["kl_active_units"] == 1.0
+    assert telemetry["gen_alpha"] == pytest.approx(0.3)
+    assert telemetry["kl_warmup_scale"] == pytest.approx(0.7)
+
+
+def _tiny_model_kwargs() -> dict[str, object]:
+    return {
+        "input_dim": 8,
+        "d_model": 16,
+        "encoder_layers": 1,
+        "cross_attn_layers": 1,
+        "n_heads": 4,
+        "mlp_head": {"hidden_dims": [8], "dropout": 0.0},
+        "regularization": {"dropout": 0.0},
+        "pair_latent_gen": {
             "z_dim": 4,
             "cond_dim": 8,
             "hidden": 12,
@@ -183,7 +291,11 @@ def _tiny_model() -> V3_1:
             "mc_samples": 2,
             "kl_free_bits": 0.05,
         },
-    )
+    }
+
+
+def _tiny_model() -> V3_1:
+    return V3_1(**_tiny_model_kwargs())
 
 
 def _cfg() -> Config:
@@ -201,6 +313,43 @@ def _cfg() -> Config:
         ),
     )
     return cast(Config, SimpleNamespace(optim=optim, distill=_distill()))
+
+
+def _training_cfg(tmp_path: Path) -> Config:
+    base = _tiny_config(epochs=4, patience=8)
+    return replace(
+        base,
+        model=ModelConfig(family="v3_1", config=_tiny_model_kwargs()),
+        optim=replace(
+            base.optim,
+            lr=1.0e-3,
+            scheduler=SchedulerConfig(
+                type="onecycle",
+                max_lr=1.0e-3,
+                pct_start=0.5,
+                div_factor=10.0,
+                final_div_factor=100.0,
+                anneal_strategy="cos",
+            ),
+        ),
+        seed=17,
+        output_dir=tmp_path / "unused-output",
+        distill=_distill(),
+    )
+
+
+def _training_batch() -> dict[str, torch.Tensor]:
+    generator = torch.Generator().manual_seed(44)
+    return {
+        "emb_a": torch.randn(2, 3, 8, generator=generator),
+        "emb_b": torch.randn(2, 3, 8, generator=generator),
+        "len_a": torch.tensor([3, 3]),
+        "len_b": torch.tensor([3, 3]),
+        "label": torch.tensor([1.0, 0.0]),
+        "_row_id": torch.tensor([0, 1]),
+        "_local_pair_count": torch.tensor(2),
+        "_global_pair_count": torch.tensor(2),
+    }
 
 
 def test_generator_optimizer_group_excludes_fusion_and_tracks_base_schedule() -> None:
@@ -246,4 +395,122 @@ def test_generator_optimizer_group_excludes_fusion_and_tracks_base_schedule() ->
     train_b0._sync_pair_latent_generator_lr(resumed_optimizer, cfg.distill, epoch=3)
     assert resumed_optimizer.param_groups[1]["lr"] == pytest.approx(
         resumed_optimizer.param_groups[0]["lr"] * cfg.distill.gen_lr_scale
+    )
+
+
+def test_d9_resume_matches_uninterrupted_across_joint_stage(tmp_path: Path) -> None:
+    cfg = _training_cfg(tmp_path)
+    batch = _training_batch()
+    targets = _targets(np.ones((2, 2, 3), dtype=np.float16))
+
+    def evaluate(
+        model: nn.Module,
+        loader: Iterable[dict[str, torch.Tensor]],
+        accelerator: Accelerator,
+    ) -> ValidationOutcome:
+        return ValidationOutcome(_constant_metrics(), None)
+
+    torch.manual_seed(123)
+    uninterrupted_model = _tiny_model()
+    uninterrupted_stream = _stream(uninterrupted_model, targets)
+    uninterrupted_dir = tmp_path / "uninterrupted"
+    uninterrupted = train_b0.train_ddp_loop(
+        uninterrupted_model,
+        lambda epoch: [batch],
+        [batch],
+        cfg,
+        Accelerator(cpu=True),
+        warmup_steps=1,
+        artifact_dir=uninterrupted_dir,
+        schedule_total_steps=4,
+        evaluate_fn=evaluate,
+        kd_loss_fn=uninterrupted_stream.loss,
+    )
+
+    evaluations = 0
+
+    def interrupt_after_two(
+        model: nn.Module,
+        loader: Iterable[dict[str, torch.Tensor]],
+        accelerator: Accelerator,
+    ) -> ValidationOutcome:
+        nonlocal evaluations
+        evaluations += 1
+        if evaluations == 3:
+            raise RuntimeError("interrupted after joint-stage step")
+        return ValidationOutcome(_constant_metrics(), None)
+
+    torch.manual_seed(123)
+    interrupted_model = _tiny_model()
+    interrupted_stream = _stream(interrupted_model, targets)
+    prior_dir = tmp_path / "prior"
+    with pytest.raises(RuntimeError, match="interrupted after joint-stage step"):
+        train_b0.train_ddp_loop(
+            interrupted_model,
+            lambda epoch: [batch],
+            [batch],
+            cfg,
+            Accelerator(cpu=True),
+            warmup_steps=1,
+            artifact_dir=prior_dir,
+            schedule_total_steps=4,
+            evaluate_fn=interrupt_after_two,
+            kd_loss_fn=interrupted_stream.loss,
+        )
+
+    prior_state = torch.load(
+        prior_dir / "training_state.pt", map_location="cpu", weights_only=False
+    )
+    assert prior_state["epoch"] == 2
+    prior_groups = {group["name"]: group for group in prior_state["optimizer"]["param_groups"]}
+    assert prior_groups["pair_latent_gen"]["lr"] == pytest.approx(prior_groups["base"]["lr"])
+
+    resumed_dir = tmp_path / "resumed"
+    (resumed_dir / "checkpoints").mkdir(parents=True)
+    shutil.copy2(prior_dir / "metrics.jsonl", resumed_dir / "metrics.jsonl")
+    for candidate in (prior_dir / "checkpoints").glob("epoch-*.pt"):
+        shutil.copy2(candidate, resumed_dir / "checkpoints" / candidate.name)
+
+    resumed_model = _tiny_model()
+    resumed_stream = _stream(resumed_model, targets)
+    resumed = train_b0.train_ddp_loop(
+        resumed_model,
+        lambda epoch: [batch],
+        [batch],
+        cfg,
+        Accelerator(cpu=True),
+        warmup_steps=1,
+        artifact_dir=resumed_dir,
+        resume_attempt=prior_dir,
+        schedule_total_steps=4,
+        evaluate_fn=evaluate,
+        kd_loss_fn=resumed_stream.loss,
+    )
+
+    assert [row["epoch"] for row in resumed.history] == [1, 2, 3, 4]
+    assert uninterrupted_model.pair_latent_gen is not None
+    assert uninterrupted_model.pair_latent_gen.joint_stage is True
+    assert resumed_model.pair_latent_gen is not None
+    assert resumed_model.pair_latent_gen.joint_stage is True
+    assert uninterrupted.last_state_dict
+    assert resumed.last_state_dict.keys() == uninterrupted.last_state_dict.keys()
+    for name, expected in uninterrupted.last_state_dict.items():
+        torch.testing.assert_close(resumed.last_state_dict[name], expected, rtol=0.0, atol=0.0)
+
+    uninterrupted_state = torch.load(
+        uninterrupted_dir / "training_state.pt", map_location="cpu", weights_only=False
+    )
+    resumed_state = torch.load(
+        resumed_dir / "training_state.pt", map_location="cpu", weights_only=False
+    )
+    for actual_group, expected_group in zip(
+        resumed_state["optimizer"]["param_groups"],
+        uninterrupted_state["optimizer"]["param_groups"],
+        strict=True,
+    ):
+        assert actual_group["name"] == expected_group["name"]
+        assert actual_group["lr"] == pytest.approx(expected_group["lr"], rel=0.0, abs=0.0)
+    resumed_groups = {group["name"]: group for group in resumed_state["optimizer"]["param_groups"]}
+    assert resumed_groups["pair_latent_gen"]["lr"] == pytest.approx(
+        resumed_groups["base"]["lr"] * 0.1
     )
