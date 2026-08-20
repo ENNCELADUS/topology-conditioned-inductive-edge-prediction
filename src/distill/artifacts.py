@@ -17,6 +17,10 @@ indices, ``anchor_offsets`` int64 CSR row starts, ``teacher_logit`` fp32,
 uint8, ``pair_label`` int8. ``content_logit`` fp32 is optional (kd_targets_v3
 only): the same rows scored by a content-only baseline checkpoint, consumed
 by the D5 residual-distillation arm as ``teacher_logit - content_logit``.
+``teacher_seeds`` fp16 ``(n_pairs, K, d_t)`` is optional (kd_targets_v4): the
+symmetrized per-slot PMA seed tokens ``½(S_ab + S_ba)``, consumed by the D9
+pair-latent-generation arm; its presence adds ``seed_count``/``seed_dim`` and
+the dump-side AB/BA ``seed_symmetry`` audit statistics to the manifest.
 """
 
 from __future__ import annotations
@@ -34,12 +38,14 @@ from numpy.typing import NDArray
 
 KD_TARGETS_FORMAT = "kd_targets_v2"
 KD_TARGETS_FORMAT_V3 = "kd_targets_v3"
+KD_TARGETS_FORMAT_V4 = "kd_targets_v4"
 TRUTH_SOURCE = "training_structure"
 
 _NPZ_NAME = "targets.npz"
 _MANIFEST_NAME = "manifest.json"
 _NODE_IDS_NAME = "node_ids.json"
 _CONTENT_LOGIT_KEY = "content_logit"
+_TEACHER_SEEDS_KEY = "teacher_seeds"
 
 # dtype pinned per array (B1 plan "KD sampler + teacher-target artifact"):
 # int32 pair indices, int64 CSR offsets, fp32 teacher logits, fp16 pooled
@@ -71,6 +77,7 @@ class KDTargets:
     pair_label: NDArray[np.int8]
     manifest: dict[str, object]
     content_logit: NDArray[np.float32] | None = None
+    teacher_seeds: NDArray[np.float16] | None = None
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -105,21 +112,27 @@ def write_kd_targets(
     k_rand: int,
     seed: int,
     content_logit: NDArray[np.floating] | None = None,
+    teacher_seeds: NDArray[np.floating] | None = None,
+    seed_symmetry: dict[str, object] | None = None,
 ) -> None:
     """Write one validated KD teacher-target artifact directory.
 
     `content_logit`, when given, is an optional fp32 array (same pair count
     as the other rows) written alongside `teacher_logit`; its presence bumps
     the written manifest ``"format"`` from ``KD_TARGETS_FORMAT`` to
-    ``KD_TARGETS_FORMAT_V3`` (write-side stamp only -- `load_kd_targets`
-    performs no format check).
+    ``KD_TARGETS_FORMAT_V3``. `teacher_seeds`, when given, is an optional
+    fp16 ``(n_pairs, K, d_t)`` array of symmetrized PMA seed tokens; its
+    presence stamps ``KD_TARGETS_FORMAT_V4`` and records `seed_symmetry`
+    (the dump-side AB/BA order-asymmetry audit) in the manifest. All stamps
+    are write-side only -- `load_kd_targets` performs no format check.
 
     Raises:
         ValueError: If the pair arrays disagree on length, `anchor_offsets`
             is not a valid non-decreasing CSR row-start array terminating at
             the pair count, any index is out of range, `teacher_logit`
-            contains a non-finite value, or `content_logit` is given with a
-            mismatched pair count or a non-finite value.
+            contains a non-finite value, `content_logit`/`teacher_seeds` is
+            given with a mismatched pair count, wrong rank, or a non-finite
+            value, or `seed_symmetry` is given without `teacher_seeds`.
     """
     n_pairs = len(pair_anchor_idx)
     if not (
@@ -152,6 +165,16 @@ def write_kd_targets(
             raise ValueError("content_logit must have the same pair count as the other arrays")
         if not np.isfinite(np.asarray(content_logit, dtype=np.float64)).all():
             raise ValueError("content_logit contains non-finite values")
+    if teacher_seeds is not None:
+        seeds_arr = np.asarray(teacher_seeds)
+        if seeds_arr.ndim != 3:
+            raise ValueError("teacher_seeds must be (n_pairs, seed_count, seed_dim)")
+        if len(seeds_arr) != n_pairs:
+            raise ValueError("teacher_seeds must have the same pair count as the other arrays")
+        if not np.isfinite(seeds_arr.astype(np.float64)).all():
+            raise ValueError("teacher_seeds contains non-finite values")
+    elif seed_symmetry is not None:
+        raise ValueError("seed_symmetry requires teacher_seeds")
     label_arr = np.asarray(pair_label)
     if n_pairs and bool(((label_arr != 0) & (label_arr != 1)).any()):
         raise ValueError("pair_label must be binary")
@@ -175,6 +198,8 @@ def write_kd_targets(
     }
     if content_logit is not None:
         arrays[_CONTENT_LOGIT_KEY] = np.asarray(content_logit, dtype=np.float32)
+    if teacher_seeds is not None:
+        arrays[_TEACHER_SEEDS_KEY] = np.asarray(teacher_seeds, dtype=np.float16)
     np.savez(npz_path, **cast(dict[str, Any], arrays))
     npz_sha256 = _sha256_file(npz_path)
 
@@ -182,8 +207,14 @@ def write_kd_targets(
     node_ids_bytes = json.dumps(list(node_ids)).encode("utf-8")
     node_ids_path.write_bytes(node_ids_bytes)
 
+    if teacher_seeds is not None:
+        format_stamp = KD_TARGETS_FORMAT_V4
+    elif content_logit is not None:
+        format_stamp = KD_TARGETS_FORMAT_V3
+    else:
+        format_stamp = KD_TARGETS_FORMAT
     manifest = {
-        "format": KD_TARGETS_FORMAT if content_logit is None else KD_TARGETS_FORMAT_V3,
+        "format": format_stamp,
         "truth_source": TRUTH_SOURCE,
         "truth_graph_sha256": truth_graph_sha256,
         "checkpoint_path": str(checkpoint_path),
@@ -200,6 +231,13 @@ def write_kd_targets(
         "pooled_embedding_dtype": "float16",
         "created_utc": datetime.now(UTC).isoformat(),
     }
+    if teacher_seeds is not None:
+        seeds_arr = np.asarray(teacher_seeds)
+        manifest["seed_count"] = int(seeds_arr.shape[1])
+        manifest["seed_dim"] = int(seeds_arr.shape[2])
+        manifest["teacher_seeds_dtype"] = "float16"
+        if seed_symmetry is not None:
+            manifest["seed_symmetry"] = seed_symmetry
     (output_dir / _MANIFEST_NAME).write_text(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
     )
@@ -228,11 +266,12 @@ def load_kd_targets(path: Path) -> KDTargets:
 
     with np.load(npz_path) as archive:
         required = set(_ARRAY_DTYPES)
-        allowed = (required, required | {_CONTENT_LOGIT_KEY})
-        if set(archive.files) not in allowed:
+        optional = {_CONTENT_LOGIT_KEY, _TEACHER_SEEDS_KEY}
+        present = set(archive.files)
+        if not (required <= present and present - required <= optional):
             raise ValueError(
                 f"KD target artifact {path} arrays must be exactly {sorted(required)} "
-                f"(optionally plus {_CONTENT_LOGIT_KEY!r}), got {sorted(archive.files)}"
+                f"(optionally plus any of {sorted(optional)}), got {sorted(archive.files)}"
             )
         pair_anchor_idx = np.asarray(archive["pair_anchor_idx"], dtype=np.int32)
         pair_partner_idx = np.asarray(archive["pair_partner_idx"], dtype=np.int32)
@@ -245,6 +284,11 @@ def load_kd_targets(path: Path) -> KDTargets:
         content_logit = (
             np.asarray(archive[_CONTENT_LOGIT_KEY], dtype=np.float32)
             if _CONTENT_LOGIT_KEY in archive.files
+            else None
+        )
+        teacher_seeds = (
+            np.asarray(archive[_TEACHER_SEEDS_KEY], dtype=np.float16)
+            if _TEACHER_SEEDS_KEY in archive.files
             else None
         )
 
@@ -260,12 +304,14 @@ def load_kd_targets(path: Path) -> KDTargets:
         pair_label=pair_label,
         manifest=manifest,
         content_logit=content_logit,
+        teacher_seeds=teacher_seeds,
     )
 
 
 __all__ = [
     "KD_TARGETS_FORMAT",
     "KD_TARGETS_FORMAT_V3",
+    "KD_TARGETS_FORMAT_V4",
     "TRUTH_SOURCE",
     "KDTargets",
     "load_kd_targets",

@@ -149,7 +149,13 @@ def test_require_full_ego_oracle_refuses_a_null_generator() -> None:
 # --------------------------------------------------------------------------- artifact roundtrip
 
 
-def _write_toy_artifact(path: Path, *, content_logit: np.ndarray | None = None) -> None:
+def _write_toy_artifact(
+    path: Path,
+    *,
+    content_logit: np.ndarray | None = None,
+    teacher_seeds: np.ndarray | None = None,
+    seed_symmetry: dict[str, object] | None = None,
+) -> None:
     rng = np.random.default_rng(0)
     write_kd_targets(
         path,
@@ -170,6 +176,8 @@ def _write_toy_artifact(path: Path, *, content_logit: np.ndarray | None = None) 
         k_rand=2,
         seed=0,
         content_logit=content_logit,
+        teacher_seeds=teacher_seeds,
+        seed_symmetry=seed_symmetry,
     )
 
 
@@ -198,6 +206,55 @@ def test_write_load_roundtrip_with_content_logit(tmp_path: Path) -> None:
     assert loaded.content_logit is not None
     np.testing.assert_array_equal(loaded.content_logit, content_logit)
     assert loaded.manifest["format"] == "kd_targets_v3"
+
+
+def test_write_load_roundtrip_with_teacher_seeds(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifact"
+    rng = np.random.default_rng(1)
+    seeds = rng.standard_normal((3, 2, 4)).astype(np.float16)
+    stats = {"slot_cos_mean": [0.9, 0.8], "norm_ratio_mean": [1.0, 1.1]}
+    _write_toy_artifact(artifact_dir, teacher_seeds=seeds, seed_symmetry=stats)
+
+    loaded = load_kd_targets(artifact_dir)
+    assert loaded.teacher_seeds is not None
+    assert loaded.teacher_seeds.dtype == np.float16
+    np.testing.assert_array_equal(loaded.teacher_seeds, seeds)
+    assert loaded.manifest["format"] == "kd_targets_v4"
+    assert loaded.manifest["seed_count"] == 2
+    assert loaded.manifest["seed_dim"] == 4
+    assert loaded.manifest["seed_symmetry"] == stats
+
+
+def test_write_load_roundtrip_without_teacher_seeds_loads_none(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifact"
+    _write_toy_artifact(artifact_dir)
+
+    loaded = load_kd_targets(artifact_dir)
+    assert loaded.teacher_seeds is None
+    assert "seed_count" not in loaded.manifest
+
+
+def test_write_rejects_mismatched_teacher_seeds_pair_count(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="teacher_seeds"):
+        _write_toy_artifact(
+            tmp_path / "bad",
+            teacher_seeds=np.zeros((2, 2, 4), dtype=np.float16),
+        )
+
+
+def test_write_rejects_non_3d_teacher_seeds(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="teacher_seeds"):
+        _write_toy_artifact(
+            tmp_path / "bad",
+            teacher_seeds=np.zeros((3, 8), dtype=np.float16),
+        )
+
+
+def test_write_rejects_non_finite_teacher_seeds(tmp_path: Path) -> None:
+    seeds = np.zeros((3, 2, 4), dtype=np.float16)
+    seeds[1, 0, 0] = np.nan
+    with pytest.raises(ValueError, match="teacher_seeds"):
+        _write_toy_artifact(tmp_path / "bad", teacher_seeds=seeds)
 
 
 def test_write_rejects_mismatched_content_logit_length(tmp_path: Path) -> None:
