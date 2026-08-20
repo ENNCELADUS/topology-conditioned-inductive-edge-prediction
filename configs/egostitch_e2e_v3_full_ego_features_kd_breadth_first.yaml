@@ -45,7 +45,7 @@ data:
   strategy: breadth_first
   negative_ratio: 5
   node_batch: 256
-  edge_batch: 16
+  edge_batch: 32
   f0_cache: outputs/feature_packs/egostitch_f0/f0_matrix.pt
   grounding_cache: outputs/feature_packs/egostitch_f0/grounding.npz
   pack_dir: outputs/feature_packs/egostitch_e2e_tokens
@@ -56,10 +56,10 @@ data:
 optim:
   lr: 1.0e-4
   weight_decay: 0.01
-  epochs: 30
+  epochs: 1
   warmup_steps: 500
   grad_clip: 1.0
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 4
 
 training:
   positive_weight: 5.0
@@ -101,7 +101,7 @@ distill:
   warm_start_readout: true
 
 seed: 0
-output_dir: outputs/egostitch_e2e_stage1_v3/full_ego_features_kd_diagnostic
+output_dir: outputs/egostitch_e2e_stage1_v3/full_ego_features_kd_speed_probe_b32_a4
 mixed_precision: "bf16"
 
 runtime:
@@ -109,9 +109,9 @@ runtime:
   pack_dir: outputs/feature_packs/egostitch_e2e_v_val_ng50
   pack_workers: 8
   loader_workers_per_rank: 0
-  # One optimizer step consumes eight physical microbatches. Keep two complete
+  # One optimizer step consumes four physical microbatches. Keep two complete
   # logical windows queued so CPU token/F0 gathers overlap the current GPU step.
-  prefetch_factor: 16
+  prefetch_factor: 8
   token_budget: 128
   max_pairs_per_rank: 1048576
   memory_limit_gib: 85.0
