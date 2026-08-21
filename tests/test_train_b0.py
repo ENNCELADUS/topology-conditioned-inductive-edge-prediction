@@ -1938,6 +1938,19 @@ def test_topology_from_metrics_row_rejects_row_missing_threshold_transfer_fields
     assert _topology_from_metrics_row(row) is None
 
 
+def test_topology_from_metrics_row_rejects_legacy_full_universe_threshold() -> None:
+    row: dict[str, object] = {
+        "val_gs_bfs": 0.5,
+        "val_rd_bfs": 1.0,
+        "val_degree_mmd_ratio": 0.1,
+        "val_clustering_mmd_ratio": 0.2,
+        "val_spectral_mmd_ratio": 0.3,
+        "val_threshold": 0.42,
+        "val_admitted_non_self_fraction": 0.003,
+    }
+    assert _topology_from_metrics_row(row) is None
+
+
 def test_ddp_loop_records_counterfactual_stop_but_runs_all_epochs(tmp_path: Path) -> None:
     config_path = tmp_path / "cfg.yaml"
     _write_yaml_config(config_path, {"optim.epochs": 4, "eval.patience": 1})

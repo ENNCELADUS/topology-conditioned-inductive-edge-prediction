@@ -2521,7 +2521,7 @@ def _topology_from_metrics_row(row: dict[str, object]) -> ValTopologyResult | No
         "val_spectral_mmd_ratio",
         "val_threshold",
     )
-    if not all(key in row for key in keys):
+    if not all(key in row for key in keys) or "val_admitted_non_self_fraction" in row:
         return None
     return ValTopologyResult(
         metrics=TopologyValidationMetrics(

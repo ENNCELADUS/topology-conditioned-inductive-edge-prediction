@@ -29,16 +29,8 @@ from src.data.artifacts import Benchmark, LabeledPairs, load_benchmark, load_can
 from src.data.feature_stats import FeatureStats, feature_stats_for_universe
 from src.data.features import FeatureStore, build_f0_matrix
 from src.data.partition import build_g_struct
-from src.data.val_region import derive_val_region_split, val_universe_arrays
-from src.eval.assembly import assemble_graph, density_matched_threshold
+from src.data.val_region import derive_val_region_split, val_ball_union_universe
 from src.eval.edge_metrics import compute_edge_metrics
-from src.eval.graph_metrics import MMDConfig, strip_self_loops
-from src.experiments.g1_hardened_e2 import (
-    _assembled_row_to_dict,
-    assemble_and_evaluate,
-    load_test_graph,
-    load_test_node_buckets,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -393,7 +385,8 @@ def prepare_data(cfg: CAZIConfig) -> PreparedData:
     teacher_val_labels = np.asarray(val_split.val_cls_labels, dtype=np.int8)
     if not teacher_val_pairs or len(set(teacher_val_labels.tolist())) != 2:
         raise ValueError("CAZI teacher validation must contain both classes on V_val")
-    u_idx, v_idx = val_universe_arrays(val_split.v_val)
+    union = val_ball_union_universe(val_split)
+    u_idx, v_idx = union.u_idx, union.v_idx
     g_val = val_split.build_g_val()
     student_val_pairs = [
         (student_val_nodes[int(u)], student_val_nodes[int(v)])
@@ -726,9 +719,8 @@ def score_and_evaluate(
     student: CAZIStudent,
     *,
     device: torch.device,
-    topology: bool,
 ) -> dict[str, object]:
-    """Score the balanced test and full universe, then run canonical topology metrics."""
+    """Score classification rows; the shared test protocol owns topology evaluation."""
     benchmark_root = cfg.data_root / "benchmark_2025_neurips"
     test_nodes, test_sequence, test_position = _test_features(cfg, data)
     balanced = data.benchmark.split.test_pairs
@@ -772,34 +764,7 @@ def score_and_evaluate(
             "balanced_rows": len(balanced.pairs),
             "full_universe_rows": len(candidate.pairs),
         },
-        "topology": None,
     }
-    if topology:
-        g_ref = load_test_graph(benchmark_root, cfg.strategy)
-        buckets = load_test_node_buckets(benchmark_root, cfg.strategy)
-        non_self_mask = u_idx != v_idx
-        target_edges = strip_self_loops(g_ref).number_of_edges()
-        threshold = density_matched_threshold(universe_probs[non_self_mask], target_edges)
-        g_pred = assemble_graph(
-            candidate.pairs,
-            universe_probs,
-            threshold=threshold,
-            nodes=g_ref.nodes(),
-        )
-        assembled = assemble_and_evaluate(
-            g_pred=g_pred,
-            g_ref=g_ref,
-            buckets=buckets,
-            config=MMDConfig(),
-            seed=cfg.seed,
-            threshold=threshold,
-        )
-        result["topology"] = {
-            "policy": "density matched on non-self pairs; self-pairs assemble at same threshold",
-            "target_simple_edges": target_edges,
-            "predicted_edges": g_pred.number_of_edges(),
-            **_assembled_row_to_dict(assembled),
-        }
     (cfg.output_dir / "results.json").write_text(
         json.dumps(result, indent=2, sort_keys=True, allow_nan=True) + "\n",
         encoding="utf-8",
@@ -840,7 +805,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage", choices=("prepare", "train", "score", "all"), default="all")
     parser.add_argument("--max-teacher-epochs", type=int)
     parser.add_argument("--max-student-epochs", type=int)
-    parser.add_argument("--skip-topology", action="store_true")
     parser.add_argument("--output-dir", type=Path)
     return parser
 
@@ -883,7 +847,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                 data,
                 student,
                 device=device,
-                topology=not args.skip_topology,
             )
             logger.info("results=%s", json.dumps(result["pairwise"], sort_keys=True))
         if args.stage == "all":
