@@ -76,7 +76,7 @@ import yaml
 from numpy.typing import NDArray
 from torch import nn
 
-from src.data.artifacts import canonical_pair, load_candidate_pairs
+from src.data.artifacts import canonical_pair, load_candidate_pairs, load_test_topology_pairs
 from src.data.feature_stats import FeatureStats, load_feature_stats
 from src.data.features import FeatureStore, build_f0_matrix
 from src.data.grounding import POOL_METHOD_ID
@@ -122,7 +122,7 @@ _META_KEYS = (
     "created_utc",
     "torch_version",
 )
-_NAMED_PAIR_SOURCES = ("candidate", "test", "val_region")
+_NAMED_PAIR_SOURCES = ("candidate", "test", "test_topology", "val_region")
 #: `derive_val_region_split`'s parameters for `_load_val_region_split`'s
 #: production re-derivation; the test seam a small monkeypatched value lets
 #: synthetic fixtures satisfy (`ValRegionParams`'s own defaults assume a
@@ -511,7 +511,7 @@ def _is_heldout_universe(meta: Mapping[str, object]) -> bool:
         return False
     pairs_source = meta.get("pairs_source")
     return isinstance(pairs_source, str) and (
-        pairs_source in {"candidate", "test"} or pairs_source.startswith("file:")
+        pairs_source in {"candidate", "test", "test_topology"} or pairs_source.startswith("file:")
     )
 
 
@@ -1700,7 +1700,7 @@ def _oracle_truth_graph_for_scoring(pairs_source: str, data_root: Path, strategy
     Raises:
         ValueError: If `pairs_source` has no defined oracle truth graph.
     """
-    if pairs_source in ("test", "candidate") or pairs_source.startswith("file:"):
+    if pairs_source in ("test", "candidate", "test_topology") or pairs_source.startswith("file:"):
         # Local imports: `src.experiments.g1_hardened_e2` imports back from this
         # module (`ScoresArtifact`/`load_scores`/`validate_score_precision`), so
         # a module-level import here would be circular.
@@ -1712,7 +1712,7 @@ def _oracle_truth_graph_for_scoring(pairs_source: str, data_root: Path, strategy
         return _load_val_region_split(data_root, strategy).build_g_val_simple()
     raise ValueError(
         f"oracle_struct scoring has no diagnostic truth graph for --pairs {pairs_source!r}; "
-        "supported sources are test/candidate/file:<path> (the labeled test graph, "
+        "supported sources are test/candidate/test_topology/file:<path> (the labeled test graph, "
         "oracle-scaffold design doc Row R2) and val_region (V_val validation-region truth)"
     )
 
@@ -1778,7 +1778,7 @@ def _resolve_pairs(
     """Resolve a ``--pairs`` spec to canonical pairs plus labels, in file row order.
 
     Args:
-        pairs_source: ``candidate``, ``test``, ``val_region``, or
+        pairs_source: ``candidate``, ``test``, ``test_topology``, ``val_region``, or
             ``file:<path.tsv>``.
         data_root: Directory containing ``benchmark_2025_neurips/`` and
             ``features/frozen_node_features_1024/``.
@@ -1787,7 +1787,7 @@ def _resolve_pairs(
             is read; ``None`` for non-held-out sources. ``val_region`` is never
             held-out (:func:`_is_heldout_universe`) and must always pass ``None``
             here: it is the internal validation universe, not the benchmark's
-            held-out test/candidate manifests.
+            held-out test/candidate/test_topology manifests.
 
     Returns:
         ``(pairs, labels)``, aligned index-for-index.
@@ -1800,6 +1800,9 @@ def _resolve_pairs(
     benchmark_root = data_root / _BENCHMARK_SUBDIR
     if pairs_source == "candidate":
         labeled = load_candidate_pairs(benchmark_root, strategy)
+        return labeled.pairs, labeled.labels
+    if pairs_source == "test_topology":
+        labeled = load_test_topology_pairs(benchmark_root, strategy)
         return labeled.pairs, labeled.labels
     if pairs_source == "test":
         return _read_pairs_tsv(benchmark_root / strategy / f"{pairs_source}_edges.txt")
@@ -2225,7 +2228,7 @@ def _score_egostitch_e2e(
             when ``None``).
         role_universe: The scored universe's role identity, namespacing the
             grounding-pool cache so it matches the training-side pool: `"test"`
-            for the test/candidate/file sources, `"V_val"` for `val_region`.
+            for the test/candidate/test_topology/file sources, `"V_val"` for `val_region`.
         scaffold_control: Optional registered within-pair scaffold perturbation.
         universe_pairs: Full input universe used to keep grounding pools stable
             when this scorer receives a contiguous shard.
@@ -3224,7 +3227,7 @@ def _run_score(args: argparse.Namespace) -> None:
         # run), so a checkpoint's training provenance cannot be relied on to
         # gate this. What is always true is that *scoring* test/candidate/
         # val_region pairs through an oracle generator means feeding it the true
-        # topology for exactly the pairs being queried -- a truth-consuming
+        # topology for the test/candidate/test_topology/val_region query -- a truth-consuming
         # ceiling diagnostic every time, regardless of how the checkpoint was
         # trained. Requiring an explicit, scoring-time operator flag (rather
         # than an automatic run_kind check) is what keeps this unreachable
@@ -3242,7 +3245,7 @@ def _run_score(args: argparse.Namespace) -> None:
         )
 
     heldout_e2e = model_family == "egostitch_e2e" and (
-        args.pairs in {"candidate", "test"} or args.pairs.startswith("file:")
+        args.pairs in {"candidate", "test", "test_topology"} or args.pairs.startswith("file:")
     )
     # Every E2E `file:` source is conservatively held out. Content-equality
     # detection would itself read the path before ledger recording and would

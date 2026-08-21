@@ -56,12 +56,12 @@ engineering validity, and the scientific verdict are reported separately.
 - Training and test nodes are disjoint. `V_val` is a pair-disjoint (not node-disjoint) BFS-grown internal
   region: cross-boundary edges train; only V_val-internal pairs are withheld, never fully inductive, unlike test.
 - Pairwise metrics use the fixed benchmark test-pair artifact; AUROC and AUPRC are threshold-free; Accuracy, F1, and MCC use threshold 0.5.
-- Graph metrics use the full candidate universe at each scorer's density-matched threshold; S1
-  shares the 30,128 non-self-edge target and self-loop handling. Per-epoch `V_val` topology validation
-  scores the pinned 500-ball pair union plus a pinned complement sample used only to estimate the
-  full-universe density-matched threshold; buckets assemble union rows alone.
+- Test graph metrics score the pair union induced by the 20--200-node sampled sets plus support-only
+  self-pairs that preserve the full test-node grounding pool. Every subgraph selects exactly its
+  reference edge count (self-loops included; canonical order breaks ties), so RD=1 precedes BFS-macro
+  GS/RD and MMD evaluation. There is no full-space score or global threshold; `V_val` is unchanged.
 - Threshold selection, quota construction, and any learned coupling must be fixed on training
-  data or `V_val`; the evaluator-provided reference edge count may define a density-matched
+  data or `V_val`; the evaluator-provided per-sample reference edge count may define the RD-matched
   operating point, other hidden test topology only in explicitly diagnostic oracles. Published
   checkpoints record `val_threshold_transfer` for a future degree-density test operating point.
 
@@ -76,8 +76,8 @@ numbers:
 4. clustering-MMD ratio (lower is better);
 5. spectral-MMD ratio (lower is better).
 
-Name global simple-edge GS/RD separately. Never aggregate the three MMD ratios or call
-an MMD aggregate “graph similarity.” Canonical descriptors retain benchmark self-loops;
+The v3 test protocol reports BFS-macro GS/RD only; global-simple rows are legacy v2 evidence.
+Never aggregate the three MMD ratios or call an MMD aggregate “graph similarity.” Descriptors retain self-loops;
 the MMD denominator is the deterministic real-vs-real floor, so ratio 1 is that floor.
 Detailed edge tables also retain ECE, Brier score, class balance, uncertain-negative
 disclosure, and the completed easy, hard, degree-corrected, full-universe, and PA-null
@@ -112,8 +112,8 @@ checkpoint `48f686df9029cf63`: a fixed oracle scaffold encoded by GRIT and consu
 token cross-attention. **Full-Ego Pooled Oracle** is checkpoint `926dab5c82beca55`
 (epoch 2): variable-length full ego topology is pooled inside GRIT and passed through a
 pooled adapter. Its completed optimized evaluation uses threshold 0.5 for classification
-and a 30,128-edge global density-controlled topology assembly. The table uses the current
-in-repo held-out evaluator and is distinct from archived G1/G3 rows. Existing baseline /
+and a 30,128-edge global density-controlled topology assembly. This is legacy pre-v3
+evidence, not comparable to the current per-subgraph RD-matched protocol. Existing baseline /
 Token-XAttn page and report: [results/results.html](results/results.html) and
 [diagnostic_test_report.json](../outputs/egostitch_e2e_stage1_v3/oracle_grit_xattn_tokens_true_oracle_diagnostic/diagnostic_test_report.json). Full-Ego report: `outputs/full_ego_oracle_scoring_optimization_20260813/protocol/diagnostic_test_report.json` on the H20 checkout.
 
@@ -253,10 +253,10 @@ allocation while retaining the two-endpoint inference contract.
    threshold or aggregate substitutes for a fixed gate.
 2. Preserve provenance. Oracle, S0, S0-R, S1-R, and any test-informed follow-up remain
    `formal:false` even when their execution is valid.
-3. Fit model selection and legal assembly choices on training data or `V_val`, then
-   evaluate test/candidate artifacts once. Never tune on test topology.
-4. Bind every comparison to the same frozen features, node split, candidate universe,
-   self-loop convention, checkpoint, and edge-count policy.
+3. Fit model selection on training data or `V_val`, then evaluate test/test_topology once.
+   Never tune model parameters on test topology.
+4. Bind comparisons to the same frozen features, split, sampled sets, full-node grounding support,
+   self-loop convention, checkpoint, and per-subgraph edge-count policy.
 5. Validate score precision before analysis. Record checkpoint ID, artifact hashes,
    threshold/quota policy, random seed, code commit, and metric implementation.
 6. Require completion markers, no `failure.json`, exited workers, complete outputs, and

@@ -18,6 +18,7 @@ import math
 import pickle
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from itertools import combinations_with_replacement
 from pathlib import Path
 from typing import Any
 
@@ -414,3 +415,37 @@ def load_candidate_pairs(root: Path, strategy: str) -> LabeledPairs:
         The full candidate-pair `LabeledPairs`.
     """
     return _read_labeled_pairs(root / strategy / "candidate_test_edges.txt")
+
+
+def load_test_topology_pairs(root: Path, strategy: str) -> LabeledPairs:
+    """Load the deduplicated pair union needed by sampled topology evaluation.
+
+    The benchmark evaluates topology only on the sampled node sets in
+    ``test_node_buckets.pkl``.  Scoring every pair in the full test-node
+    universe is therefore unnecessary: this loader returns the union of
+    canonical pairs induced by those samples, plus a self-pair for any test
+    node absent from every sample. Those support-only rows preserve the full
+    test-node grounding universe without restoring quadratic scoring.
+    """
+    strategy_dir = root / strategy
+    buckets = _load_pickle(strategy_dir / "test_node_buckets.pkl")
+    test_graph = _load_pickle(strategy_dir / "test_graph.pkl")
+    if not isinstance(buckets, dict):
+        raise TypeError("test_node_buckets.pkl must contain a dict")
+    if not isinstance(test_graph, nx.Graph):
+        raise TypeError("test_graph.pkl must contain a networkx.Graph")
+
+    pair_set = {
+        canonical_pair(u, v)
+        for node_sets in buckets.values()
+        for nodes in node_sets
+        for u, v in combinations_with_replacement(sorted(nodes), 2)
+    }
+    pair_set.update((str(node), str(node)) for node in test_graph.nodes())
+    pairs = sorted(pair_set)
+    labels = np.fromiter(
+        (int(test_graph.has_edge(u, v)) for u, v in pairs),
+        dtype=np.int8,
+        count=len(pairs),
+    )
+    return LabeledPairs(pairs=pairs, labels=labels)

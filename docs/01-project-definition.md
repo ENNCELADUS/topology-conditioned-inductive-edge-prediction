@@ -130,7 +130,7 @@ is [03-experiment-protocol.md](03-experiment-protocol.md).
 |---|---|
 | Topology generation appears to be the task | Anchor every section to $\operatorname{edge}(u,v)$ |
 | Generated topology does not improve edge metrics | Report edge and graph metrics jointly and diagnose with ablations |
-| Graph metrics improve only through threshold changes | Use density-matched operating points and threshold sweeps |
+| Graph metrics improve only through threshold changes | Match RD=1 within each sampled subgraph and report every operating point |
 | Retrieval leaks target information or looks like task input | Separate the arm, freeze its support universe, and audit inference inputs |
 | A scaffold contains the queried-edge answer | Mask or standardize the queried edge |
 | Negative labels or graph truth are biased | Disclose uncertain negatives and observation limits |
