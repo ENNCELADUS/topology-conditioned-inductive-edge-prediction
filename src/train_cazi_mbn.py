@@ -18,7 +18,7 @@ import networkx as nx
 import numpy as np
 import scipy.sparse as sp
 import torch
-import yaml  # type: ignore[import-untyped]
+import yaml
 from numpy.typing import NDArray
 from scipy.sparse.linalg import LinearOperator, svds
 from sklearn.metrics import average_precision_score, roc_auc_score

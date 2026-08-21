@@ -1,22 +1,32 @@
 """KD teacher-target artifact: `targets.npz` + `manifest.json` + `node_ids.json`.
 
-Written by `src.distill.teacher_targets` (and its `src.distill.content_logit`/
-`src.distill.heuristic_targets` derivatives) and read by the KD trainer
-(`src/train_b0.py`'s `KDStream`). Format tag ``"kd_targets_v2"``, or
-``"kd_targets_v3"`` when `content_logit` is written (write-side stamp only;
-`load_kd_targets` performs no format check). `truth_source` is always
-``"training_structure"``: the V_val-quarantined training graph over all train
-nodes (cross-boundary edges included, V_val-internal pairs excluded);
-pre-V_val ``"g_fit_only"`` artifacts carry a different stamp so the two
-teacher semantics stay distinguishable.
+Written by `src.distill.teacher_targets` and read by the KD trainer
+(`src/train_b0.py`). Format tag ``"kd_row_targets_v1"``. `truth_source` is
+always ``"training_structure"``: the V_val-quarantined training graph over
+all train nodes (cross-boundary edges included, V_val-internal pairs
+excluded). Teacher inference applies query-edge masking -- a positive
+training edge is never visible in its own structural context (structural in
+the full-ego oracle generator's stitch).
 
-`targets.npz` arrays, one row per context pair (dtype pinned per array; see
-`_ARRAY_DTYPES`): ``pair_anchor_idx``/``pair_partner_idx`` int32 node
-indices, ``anchor_offsets`` int64 CSR row starts, ``teacher_logit`` fp32,
-``teacher_pooled_ab``/``teacher_pooled_ba`` fp16 (~1 GB budget), ``is_near``
-uint8, ``pair_label`` int8. ``content_logit`` fp32 is optional (kd_targets_v3
-only): the same rows scored by a content-only baseline checkpoint, consumed
-by the D5 residual-distillation arm as ``teacher_logit - content_logit``.
+`targets.npz` holds two row blocks (dtype pinned per array; see
+`_ARRAY_DTYPES`):
+
+- Training block: one row per official training row, in the trainer's exact
+  row order (row_id == array position), directly joinable against it.
+  ``pair_a_idx``/``pair_b_idx`` int32 node indices, ``pair_label`` int8,
+  ``teacher_logit`` fp32, ``teacher_rep`` fp16 ``(n_rows, rep_dim)`` -- the
+  dump-side symmetrized teacher pooled pair embedding
+  ``0.5 * (pooled_ab + pooled_ba)``.
+- Validation block: the same five arrays, ``val_``-prefixed, one row per
+  official V_val classification row in that fixed order, backing
+  validation-only KD diagnostics.
+
+``teacher_seeds`` fp16 ``(n_rows, seed_count, seed_dim)`` and
+``val_teacher_seeds`` fp16 ``(n_val_rows, seed_count, seed_dim)`` are
+optional (both present or both absent): the symmetrized per-slot PMA seed
+tokens ``0.5 * (S_ab + S_ba)``, consumed by the kd_d9 pair-latent-generation
+arm; their presence adds ``seed_count``/``seed_dim`` and the dump-side AB/BA
+``seed_symmetry`` audit statistics to the manifest.
 """
 
 from __future__ import annotations
@@ -32,45 +42,49 @@ from typing import Any, cast
 import numpy as np
 from numpy.typing import NDArray
 
-KD_TARGETS_FORMAT = "kd_targets_v2"
-KD_TARGETS_FORMAT_V3 = "kd_targets_v3"
+KD_ROW_TARGETS_FORMAT = "kd_row_targets_v1"
 TRUTH_SOURCE = "training_structure"
 
 _NPZ_NAME = "targets.npz"
 _MANIFEST_NAME = "manifest.json"
 _NODE_IDS_NAME = "node_ids.json"
-_CONTENT_LOGIT_KEY = "content_logit"
+_TEACHER_SEEDS_KEY = "teacher_seeds"
+_VAL_TEACHER_SEEDS_KEY = "val_teacher_seeds"
 
-# dtype pinned per array (B1 plan "KD sampler + teacher-target artifact"):
-# int32 pair indices, int64 CSR offsets, fp32 teacher logits, fp16 pooled
-# embeddings (~1 GB budget), uint8 near/random flag, int8 binary label.
+# dtype pinned per array: int32 pair indices, int8 binary label, fp32
+# teacher logit, fp16 pooled teacher-rep embedding.
 _ARRAY_DTYPES: dict[str, type] = {
-    "pair_anchor_idx": np.int32,
-    "pair_partner_idx": np.int32,
-    "anchor_offsets": np.int64,
-    "teacher_logit": np.float32,
-    "teacher_pooled_ab": np.float16,
-    "teacher_pooled_ba": np.float16,
-    "is_near": np.uint8,
+    "pair_a_idx": np.int32,
+    "pair_b_idx": np.int32,
     "pair_label": np.int8,
+    "teacher_logit": np.float32,
+    "teacher_rep": np.float16,
+    "val_pair_a_idx": np.int32,
+    "val_pair_b_idx": np.int32,
+    "val_pair_label": np.int8,
+    "val_teacher_logit": np.float32,
+    "val_teacher_rep": np.float16,
 }
 
 
 @dataclass(frozen=True)
-class KDTargets:
-    """One loaded, digest-validated KD teacher-target artifact."""
+class KDRowTargets:
+    """One loaded KD row-targets artifact."""
 
     node_ids: list[str]
-    pair_anchor_idx: NDArray[np.int32]
-    pair_partner_idx: NDArray[np.int32]
-    anchor_offsets: NDArray[np.int64]
-    teacher_logit: NDArray[np.float32]
-    teacher_pooled_ab: NDArray[np.float16]
-    teacher_pooled_ba: NDArray[np.float16]
-    is_near: NDArray[np.uint8]
+    pair_a_idx: NDArray[np.int32]
+    pair_b_idx: NDArray[np.int32]
     pair_label: NDArray[np.int8]
+    teacher_logit: NDArray[np.float32]
+    teacher_rep: NDArray[np.float16]
+    val_pair_a_idx: NDArray[np.int32]
+    val_pair_b_idx: NDArray[np.int32]
+    val_pair_label: NDArray[np.int8]
+    val_teacher_logit: NDArray[np.float32]
+    val_teacher_rep: NDArray[np.float16]
     manifest: dict[str, object]
-    content_logit: NDArray[np.float32] | None = None
+    teacher_seeds: NDArray[np.float16] | None = None
+    val_teacher_seeds: NDArray[np.float16] | None = None
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -85,96 +99,167 @@ def _sha256_file(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def _validate_block(
+    *,
+    block_name: str,
+    n_nodes: int,
+    a_idx: NDArray[np.integer],
+    b_idx: NDArray[np.integer],
+    label: NDArray[np.integer],
+    logit: NDArray[np.floating],
+    rep: NDArray[np.floating],
+) -> int:
+    """Validate one row block's shared row count, indices, labels, and finiteness.
+
+    Returns:
+        The block's row count.
+
+    Raises:
+        ValueError: If the block's arrays disagree on row count, an index is
+            out of range, `logit` contains a non-finite value, `label` is
+            not strictly binary, or `rep` is not a finite rank-2 array.
+    """
+    n_rows = len(a_idx)
+    if not (
+        len(b_idx) == n_rows
+        and len(label) == n_rows
+        and len(logit) == n_rows
+        and len(rep) == n_rows
+    ):
+        raise ValueError(f"{block_name} arrays must share the same row count")
+    if n_rows == 0:
+        raise ValueError(f"artifact must cover the official {block_name} rows")
+    a_arr = np.asarray(a_idx)
+    b_arr = np.asarray(b_idx)
+    if bool(((a_arr < 0) | (a_arr >= n_nodes)).any()) or bool(
+        ((b_arr < 0) | (b_arr >= n_nodes)).any()
+    ):
+        raise ValueError(f"{block_name} pair_a_idx/pair_b_idx contain an out-of-range node index")
+    if not np.isfinite(np.asarray(logit, dtype=np.float64)).all():
+        raise ValueError(f"{block_name} teacher_logit contains non-finite values")
+    label_arr = np.asarray(label)
+    if bool(((label_arr != 0) & (label_arr != 1)).any()):
+        raise ValueError(f"{block_name} pair_label must be binary")
+    rep_arr = np.asarray(rep)
+    if rep_arr.ndim != 2:
+        raise ValueError(f"{block_name} teacher_rep must be rank-2 (n_rows, rep_dim)")
+    if not np.isfinite(rep_arr.astype(np.float64)).all():
+        raise ValueError(f"{block_name} teacher_rep contains non-finite values")
+    return n_rows
+
+
 def write_kd_targets(
     output_dir: Path,
     *,
     node_ids: Sequence[str],
-    pair_anchor_idx: NDArray[np.integer],
-    pair_partner_idx: NDArray[np.integer],
-    anchor_offsets: NDArray[np.integer],
-    teacher_logit: NDArray[np.floating],
-    teacher_pooled_ab: NDArray[np.floating],
-    teacher_pooled_ba: NDArray[np.floating],
-    is_near: NDArray[np.integer],
+    pair_a_idx: NDArray[np.integer],
+    pair_b_idx: NDArray[np.integer],
     pair_label: NDArray[np.integer],
+    teacher_logit: NDArray[np.floating],
+    teacher_rep: NDArray[np.floating],
+    val_pair_a_idx: NDArray[np.integer],
+    val_pair_b_idx: NDArray[np.integer],
+    val_pair_label: NDArray[np.integer],
+    val_teacher_logit: NDArray[np.floating],
+    val_teacher_rep: NDArray[np.floating],
     truth_graph_sha256: str,
     checkpoint_path: Path,
     checkpoint_sha256: str,
     checkpoint_id: str | None,
-    k_near: int,
-    k_rand: int,
-    seed: int,
-    content_logit: NDArray[np.floating] | None = None,
+    teacher_seeds: NDArray[np.floating] | None = None,
+    val_teacher_seeds: NDArray[np.floating] | None = None,
+    seed_symmetry: dict[str, object] | None = None,
 ) -> None:
-    """Write one validated KD teacher-target artifact directory.
+    """Write one validated KD row-targets artifact directory.
 
-    `content_logit`, when given, is an optional fp32 array (same pair count
-    as the other rows) written alongside `teacher_logit`; its presence bumps
-    the written manifest ``"format"`` from ``KD_TARGETS_FORMAT`` to
-    ``KD_TARGETS_FORMAT_V3`` (write-side stamp only -- `load_kd_targets`
-    performs no format check).
+    The training block must cover the official training rows in the
+    trainer's exact row order (row_id == array position); the validation
+    block covers the official V_val classification rows in their fixed
+    order. `teacher_seeds`/`val_teacher_seeds`, when given, must both be
+    present: optional fp16 ``(n_rows, seed_count, seed_dim)`` arrays of
+    symmetrized PMA seed tokens, recording `seed_symmetry` (the dump-side
+    AB/BA order-asymmetry audit) in the manifest when given.
 
     Raises:
-        ValueError: If the pair arrays disagree on length, `anchor_offsets`
-            is not a valid non-decreasing CSR row-start array terminating at
-            the pair count, any index is out of range, `teacher_logit`
-            contains a non-finite value, or `content_logit` is given with a
-            mismatched pair count or a non-finite value.
+        ValueError: If either block's arrays disagree on row count, is
+            empty, contains an out-of-range pair index, a non-finite
+            `teacher_logit`/`teacher_rep` value, a non-binary `pair_label`,
+            or a `teacher_rep`/`val_teacher_rep` rank other than 2; if the
+            two blocks' `rep_dim` disagree; if `teacher_seeds` and
+            `val_teacher_seeds` are not given both-or-neither, either is not
+            rank-3, has a row count mismatched with its block, contains a
+            non-finite value, or the two disagree on `(seed_count,
+            seed_dim)`; or if `seed_symmetry` is given without seeds.
     """
-    n_pairs = len(pair_anchor_idx)
-    if not (
-        len(pair_partner_idx) == n_pairs
-        and len(teacher_logit) == n_pairs
-        and len(teacher_pooled_ab) == n_pairs
-        and len(teacher_pooled_ba) == n_pairs
-        and len(is_near) == n_pairs
-        and len(pair_label) == n_pairs
-    ):
-        raise ValueError("KD target arrays must share the same pair count")
     n_nodes = len(node_ids)
-    if len(anchor_offsets) != n_nodes + 1:
-        raise ValueError("anchor_offsets must have len(node_ids) + 1 entries")
-    if int(anchor_offsets[0]) != 0 or int(anchor_offsets[-1]) != n_pairs:
-        raise ValueError("anchor_offsets must run from 0 to the pair count")
-    if np.any(np.diff(np.asarray(anchor_offsets)) < 0):
-        raise ValueError("anchor_offsets must be non-decreasing")
-    anchor_arr = np.asarray(pair_anchor_idx)
-    partner_arr = np.asarray(pair_partner_idx)
-    if n_pairs and (
-        bool(((anchor_arr < 0) | (anchor_arr >= n_nodes)).any())
-        or bool(((partner_arr < 0) | (partner_arr >= n_nodes)).any())
-    ):
-        raise ValueError("pair_anchor_idx/pair_partner_idx contain an out-of-range node index")
-    if not np.isfinite(np.asarray(teacher_logit, dtype=np.float64)).all():
-        raise ValueError("teacher_logit contains non-finite values")
-    if content_logit is not None:
-        if len(content_logit) != n_pairs:
-            raise ValueError("content_logit must have the same pair count as the other arrays")
-        if not np.isfinite(np.asarray(content_logit, dtype=np.float64)).all():
-            raise ValueError("content_logit contains non-finite values")
-    label_arr = np.asarray(pair_label)
-    if n_pairs and bool(((label_arr != 0) & (label_arr != 1)).any()):
-        raise ValueError("pair_label must be binary")
-    near_arr = np.asarray(is_near)
-    if n_pairs and bool(((near_arr != 0) & (near_arr != 1)).any()):
-        raise ValueError("is_near must be binary")
-    if k_near < 0 or k_rand < 0:
-        raise ValueError("k_near and k_rand must be non-negative")
+    n_rows = _validate_block(
+        block_name="training",
+        n_nodes=n_nodes,
+        a_idx=pair_a_idx,
+        b_idx=pair_b_idx,
+        label=pair_label,
+        logit=teacher_logit,
+        rep=teacher_rep,
+    )
+    n_val_rows = _validate_block(
+        block_name="validation",
+        n_nodes=n_nodes,
+        a_idx=val_pair_a_idx,
+        b_idx=val_pair_b_idx,
+        label=val_pair_label,
+        logit=val_teacher_logit,
+        rep=val_teacher_rep,
+    )
+    rep_dim = np.asarray(teacher_rep).shape[1]
+    if np.asarray(val_teacher_rep).shape[1] != rep_dim:
+        raise ValueError("teacher_rep and val_teacher_rep must share the same rep_dim")
+
+    if (teacher_seeds is None) != (val_teacher_seeds is None):
+        raise ValueError("teacher_seeds and val_teacher_seeds must be given both or neither")
+    seed_count = seed_dim = None
+    if teacher_seeds is not None and val_teacher_seeds is not None:
+        seeds_arr = np.asarray(teacher_seeds)
+        val_seeds_arr = np.asarray(val_teacher_seeds)
+        if seeds_arr.ndim != 3 or val_seeds_arr.ndim != 3:
+            raise ValueError(
+                "teacher_seeds/val_teacher_seeds must be (n_rows, seed_count, seed_dim)"
+            )
+        if len(seeds_arr) != n_rows:
+            raise ValueError("teacher_seeds must have the same row count as the training block")
+        if len(val_seeds_arr) != n_val_rows:
+            raise ValueError(
+                "val_teacher_seeds must have the same row count as the validation block"
+            )
+        if seeds_arr.shape[1:] != val_seeds_arr.shape[1:]:
+            raise ValueError(
+                "teacher_seeds and val_teacher_seeds must share (seed_count, seed_dim)"
+            )
+        if (
+            not np.isfinite(seeds_arr.astype(np.float64)).all()
+            or not np.isfinite(val_seeds_arr.astype(np.float64)).all()
+        ):
+            raise ValueError("teacher_seeds/val_teacher_seeds contains non-finite values")
+        seed_count, seed_dim = int(seeds_arr.shape[1]), int(seeds_arr.shape[2])
+    elif seed_symmetry is not None:
+        raise ValueError("seed_symmetry requires teacher_seeds")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     npz_path = output_dir / _NPZ_NAME
     arrays: dict[str, NDArray[np.generic]] = {
-        "pair_anchor_idx": np.asarray(pair_anchor_idx, dtype=np.int32),
-        "pair_partner_idx": np.asarray(pair_partner_idx, dtype=np.int32),
-        "anchor_offsets": np.asarray(anchor_offsets, dtype=np.int64),
-        "teacher_logit": np.asarray(teacher_logit, dtype=np.float32),
-        "teacher_pooled_ab": np.asarray(teacher_pooled_ab, dtype=np.float16),
-        "teacher_pooled_ba": np.asarray(teacher_pooled_ba, dtype=np.float16),
-        "is_near": np.asarray(is_near, dtype=np.uint8),
+        "pair_a_idx": np.asarray(pair_a_idx, dtype=np.int32),
+        "pair_b_idx": np.asarray(pair_b_idx, dtype=np.int32),
         "pair_label": np.asarray(pair_label, dtype=np.int8),
+        "teacher_logit": np.asarray(teacher_logit, dtype=np.float32),
+        "teacher_rep": np.asarray(teacher_rep, dtype=np.float16),
+        "val_pair_a_idx": np.asarray(val_pair_a_idx, dtype=np.int32),
+        "val_pair_b_idx": np.asarray(val_pair_b_idx, dtype=np.int32),
+        "val_pair_label": np.asarray(val_pair_label, dtype=np.int8),
+        "val_teacher_logit": np.asarray(val_teacher_logit, dtype=np.float32),
+        "val_teacher_rep": np.asarray(val_teacher_rep, dtype=np.float16),
     }
-    if content_logit is not None:
-        arrays[_CONTENT_LOGIT_KEY] = np.asarray(content_logit, dtype=np.float32)
+    if teacher_seeds is not None and val_teacher_seeds is not None:
+        arrays[_TEACHER_SEEDS_KEY] = np.asarray(teacher_seeds, dtype=np.float16)
+        arrays[_VAL_TEACHER_SEEDS_KEY] = np.asarray(val_teacher_seeds, dtype=np.float16)
     np.savez(npz_path, **cast(dict[str, Any], arrays))
     npz_sha256 = _sha256_file(npz_path)
 
@@ -182,37 +267,53 @@ def write_kd_targets(
     node_ids_bytes = json.dumps(list(node_ids)).encode("utf-8")
     node_ids_path.write_bytes(node_ids_bytes)
 
-    manifest = {
-        "format": KD_TARGETS_FORMAT if content_logit is None else KD_TARGETS_FORMAT_V3,
+    label_arr = np.asarray(pair_label)
+    manifest: dict[str, object] = {
+        "format": KD_ROW_TARGETS_FORMAT,
         "truth_source": TRUTH_SOURCE,
         "truth_graph_sha256": truth_graph_sha256,
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_sha256": checkpoint_sha256,
         "checkpoint_id": checkpoint_id,
-        "k_near": k_near,
-        "k_rand": k_rand,
-        "seed": seed,
         "n_nodes": n_nodes,
-        "n_pairs": n_pairs,
-        "n_positive_pairs": int(np.sum(label_arr)) if n_pairs else 0,
+        "n_rows": n_rows,
+        "n_val_rows": n_val_rows,
+        "n_positive_rows": int(np.sum(label_arr)),
+        "rep_dim": int(rep_dim),
+        "teacher_rep_dtype": "float16",
         "npz_sha256": npz_sha256,
         "node_ids_sha256": _sha256_bytes(node_ids_bytes),
-        "pooled_embedding_dtype": "float16",
         "created_utc": datetime.now(UTC).isoformat(),
     }
+    if seed_count is not None and seed_dim is not None:
+        manifest["seed_count"] = seed_count
+        manifest["seed_dim"] = seed_dim
+        manifest["teacher_seeds_dtype"] = "float16"
+        if seed_symmetry is not None:
+            manifest["seed_symmetry"] = seed_symmetry
     (output_dir / _MANIFEST_NAME).write_text(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
     )
 
 
-def load_kd_targets(path: Path) -> KDTargets:
-    """Load one KD teacher-target artifact directory.
+def load_kd_targets(path: Path, *, load_seeds: bool = False) -> KDRowTargets:
+    """Load one KD row-targets artifact directory.
 
     Digest/format verification was deliberately removed (user decision,
     2026-08-13): the manifest is provenance metadata, not a gate.
 
+    Args:
+        path: Artifact directory.
+        load_seeds: When True, also load `teacher_seeds`/`val_teacher_seeds`
+            (raising if the artifact was dumped without them). When False
+            (default), those fields stay None without touching the npz
+            entries, so callers that don't need the kd_d9 seed tokens skip
+            the extra memory.
+
     Raises:
-        ValueError: If a file is missing or the npz array set is wrong.
+        ValueError: If a file is missing, the npz array set is not exactly
+            the ten required names (optionally plus both seed names), or
+            `load_seeds=True` and the artifact has no teacher seeds.
     """
     manifest_path = path / _MANIFEST_NAME
     node_ids_path = path / _NODE_IDS_NAME
@@ -228,46 +329,60 @@ def load_kd_targets(path: Path) -> KDTargets:
 
     with np.load(npz_path) as archive:
         required = set(_ARRAY_DTYPES)
-        allowed = (required, required | {_CONTENT_LOGIT_KEY})
-        if set(archive.files) not in allowed:
+        optional = {_TEACHER_SEEDS_KEY, _VAL_TEACHER_SEEDS_KEY}
+        present = set(archive.files)
+        if not (required <= present and present - required <= optional):
             raise ValueError(
                 f"KD target artifact {path} arrays must be exactly {sorted(required)} "
-                f"(optionally plus {_CONTENT_LOGIT_KEY!r}), got {sorted(archive.files)}"
+                f"(optionally plus both of {sorted(optional)}), got {sorted(archive.files)}"
             )
-        pair_anchor_idx = np.asarray(archive["pair_anchor_idx"], dtype=np.int32)
-        pair_partner_idx = np.asarray(archive["pair_partner_idx"], dtype=np.int32)
-        anchor_offsets = np.asarray(archive["anchor_offsets"], dtype=np.int64)
-        teacher_logit = np.asarray(archive["teacher_logit"], dtype=np.float32)
-        teacher_pooled_ab = np.asarray(archive["teacher_pooled_ab"], dtype=np.float16)
-        teacher_pooled_ba = np.asarray(archive["teacher_pooled_ba"], dtype=np.float16)
-        is_near = np.asarray(archive["is_near"], dtype=np.uint8)
+        pair_a_idx = np.asarray(archive["pair_a_idx"], dtype=np.int32)
+        pair_b_idx = np.asarray(archive["pair_b_idx"], dtype=np.int32)
         pair_label = np.asarray(archive["pair_label"], dtype=np.int8)
-        content_logit = (
-            np.asarray(archive[_CONTENT_LOGIT_KEY], dtype=np.float32)
-            if _CONTENT_LOGIT_KEY in archive.files
-            else None
-        )
+        teacher_logit = np.asarray(archive["teacher_logit"], dtype=np.float32)
+        teacher_rep = np.asarray(archive["teacher_rep"], dtype=np.float16)
+        val_pair_a_idx = np.asarray(archive["val_pair_a_idx"], dtype=np.int32)
+        val_pair_b_idx = np.asarray(archive["val_pair_b_idx"], dtype=np.int32)
+        val_pair_label = np.asarray(archive["val_pair_label"], dtype=np.int8)
+        val_teacher_logit = np.asarray(archive["val_teacher_logit"], dtype=np.float32)
+        val_teacher_rep = np.asarray(archive["val_teacher_rep"], dtype=np.float16)
 
-    return KDTargets(
+        teacher_seeds: NDArray[np.float16] | None = None
+        val_teacher_seeds: NDArray[np.float16] | None = None
+        if load_seeds:
+            has_seeds = (
+                _TEACHER_SEEDS_KEY in archive.files and _VAL_TEACHER_SEEDS_KEY in archive.files
+            )
+            if not has_seeds:
+                raise ValueError(
+                    f"KD target artifact {path} has no teacher_seeds; "
+                    "re-dump with the seed-producing teacher"
+                )
+            teacher_seeds = np.asarray(archive[_TEACHER_SEEDS_KEY], dtype=np.float16)
+            val_teacher_seeds = np.asarray(archive[_VAL_TEACHER_SEEDS_KEY], dtype=np.float16)
+
+    return KDRowTargets(
         node_ids=node_ids,
-        pair_anchor_idx=pair_anchor_idx,
-        pair_partner_idx=pair_partner_idx,
-        anchor_offsets=anchor_offsets,
-        teacher_logit=teacher_logit,
-        teacher_pooled_ab=teacher_pooled_ab,
-        teacher_pooled_ba=teacher_pooled_ba,
-        is_near=is_near,
+        pair_a_idx=pair_a_idx,
+        pair_b_idx=pair_b_idx,
         pair_label=pair_label,
+        teacher_logit=teacher_logit,
+        teacher_rep=teacher_rep,
+        val_pair_a_idx=val_pair_a_idx,
+        val_pair_b_idx=val_pair_b_idx,
+        val_pair_label=val_pair_label,
+        val_teacher_logit=val_teacher_logit,
+        val_teacher_rep=val_teacher_rep,
         manifest=manifest,
-        content_logit=content_logit,
+        teacher_seeds=teacher_seeds,
+        val_teacher_seeds=val_teacher_seeds,
     )
 
 
 __all__ = [
-    "KD_TARGETS_FORMAT",
-    "KD_TARGETS_FORMAT_V3",
+    "KD_ROW_TARGETS_FORMAT",
     "TRUTH_SOURCE",
-    "KDTargets",
+    "KDRowTargets",
     "load_kd_targets",
     "write_kd_targets",
 ]

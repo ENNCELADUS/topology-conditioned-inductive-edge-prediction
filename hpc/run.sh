@@ -52,13 +52,12 @@ controls (`structure_control_6a_v3`, `structure_control_6e_v1`), which reuse
 the `full` arm's checkpoint and have no pipeline run of their own.
 
 The kd-targets command is a thin passthrough to `python -m
-src.distill.teacher_targets` (B1 plan), which dumps the Full-Ego Pooled Oracle
-KD teacher-target artifact over the training universe's anchor/context pairs
-(V_val-internal pairs quarantined) from one published `full_ego_oracle`
-checkpoint. It scores on a single GPU -- there is
-no world-size fan-out to size, unlike `train`/`score` -- so pass `--device
-cuda` explicitly; `--data-root`/`--strategy` default to this repository's data
-root and `breadth_first` but may be overridden after the command's own args.
+src.distill.teacher_targets`, which dumps full-training-row + V_val-row KD
+teacher targets (logit, symmetrized pooled pair embedding, PMA seed tokens)
+from one published `full_ego_oracle` checkpoint, driven by a training
+`--config` so the artifact rows join the trainer's rows exactly. It scores on
+a single GPU -- there is no world-size fan-out to size, unlike `train`/`score`
+-- so pass `--device cuda` explicitly.
 
 merge/g1/g2/kd-targets remain single-process while train uses all visible
 NVIDIA H20 GPUs. Use nohup in the calling shell when a run must survive
@@ -165,8 +164,7 @@ print(cfg.output_dir, cfg.strategy, cfg.seed)
     exec "${PYTHON_BIN}" -m src.experiments.g2_ceiling "$@"
     ;;
   kd-targets)
-    exec "${PYTHON_BIN}" -m src.distill.teacher_targets \
-      --data-root "${DATA_ROOT}" --strategy breadth_first "$@"
+    exec "${PYTHON_BIN}" -m src.distill.teacher_targets "$@"
     ;;
   *)
     usage >&2

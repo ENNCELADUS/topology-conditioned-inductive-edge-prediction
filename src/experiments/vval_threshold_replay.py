@@ -257,8 +257,7 @@ def _load_val_region_split(data_root: Path, strategy: str) -> ValRegionSplit:
     Mirrors `src.score_universe._load_val_region_split`'s derivation (same
     `train_graph.pkl` edges, `train_edges.txt` + `val_edges.txt` label-0 rows,
     `positive_edges.txt` global positive set, default `ValRegionParams()`) via
-    the house `load_benchmark` loader, matching the established pattern in
-    `src.distill.teacher_targets._load_val_region_split`.
+    the house `load_benchmark` loader.
     """
     benchmark = load_benchmark(data_root / _BENCHMARK_SUBDIR, strategy)
     truth_edges = list(benchmark.split.train_graph.edges())

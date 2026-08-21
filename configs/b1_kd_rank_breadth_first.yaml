@@ -1,9 +1,6 @@
-# B1 KD-D2 (primary) arm on the simple B0 protocol: V3.1 student + zero-init
-# NodeFactorBottleneck (node_factor_dim: 64) + the shared KD anchor-context
-# stream from outputs/distill/kd_targets_breadth_first_seed0_v2
-# (python -m src.distill.teacher_targets). Arms differ ONLY in the distill
-# weights below (variable-control protocol); run one arm at a time via
-# hpc/run.sh train <this config>.
+# B1 KD-rank arm: D2 anchor ranking + distribution KD over only the official
+# rows in each normal task batch. Every non-self row participates under both
+# endpoint anchors; no partner sampler or second student forward is used.
 model:
   family: v3_1
   config:
@@ -31,12 +28,11 @@ model:
       spectral_norm: false
     mixing:
       mode: none
-    node_factor_dim: 64
-    label_smoothing: 0.05 # symmetric BCE smoothing, fixed V3.1 recipe
+    label_smoothing: 0.05
 data:
   root: data
   strategy: breadth_first
-  negative_ratio: 1 # F0-only; V3.1 trains on fixed balanced train_edges.txt rows
+  negative_ratio: 1
   token_budget: 131072
   batch_pairs: 1024
   num_workers: 0
@@ -46,7 +42,7 @@ optim:
   lr: 1.0e-4
   weight_decay: 0.05
   epochs: 25
-  warmup_steps: 500 # unused while a onecycle scheduler is configured
+  warmup_steps: 500
   grad_clip: 1.0
   scheduler:
     type: onecycle
@@ -70,12 +66,11 @@ runtime:
   probe_warmup_steps: 10
   probe_timed_steps: 30
 seed: 0
-output_dir: outputs/b1_stage_v2/kd_d2
-mixed_precision: "bf16" # pinned for the H20 E2 target
+output_dir: outputs/b1_row_kd/kd_rank
+mixed_precision: "bf16"
 distill:
-  targets_path: outputs/distill/kd_targets_breadth_first_seed0_v2
-  w_rank: 1.0                      # LLP_R margin-rank over per-anchor teacher rows
-  w_dist: 1.0                      # LLP_D temperature-KL over per-anchor teacher rows
-  temperature: 1.0                 # LLP reference pins T=1 (see src/distill/losses.py)
-  margin: 0.1                      # LLP argparse default
-  anchors_per_step: 2
+  targets_path: outputs/distill/kd_row_targets_breadth_first
+  w_rank: 1.0
+  w_dist: 1.0
+  margin: 0.1
+  temperature: 1.0

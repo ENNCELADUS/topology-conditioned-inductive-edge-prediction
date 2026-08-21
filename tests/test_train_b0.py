@@ -42,6 +42,7 @@ from src.train_b0 import (
     CliArgs,
     Config,
     GpuBatchIterable,
+    KDRowBank,
     TrainResult,
     ValidationOutcome,
     ValThresholdTransfer,
@@ -84,9 +85,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SHIPPED_B0_KD_CONFIGS = (
     "b0_v31_breadth_first.yaml",
     "b1_kd_control_breadth_first.yaml",
-    "b1_kd_d1_breadth_first.yaml",
-    "b1_kd_d2_breadth_first.yaml",
-    "b1_kd_d3_breadth_first.yaml",
+    "b1_kd_logit_breadth_first.yaml",
+    "b1_kd_rank_breadth_first.yaml",
+    "b1_kd_gram_breadth_first.yaml",
+    "b1_kd_rep_breadth_first.yaml",
+    "b1_kd_d9_breadth_first.yaml",
 )
 
 # Tiny V_val seam: n_regions=1 keeps growth on the fixture's single path
@@ -2125,16 +2128,53 @@ def test_ddp_loop_reports_global_sample_weighted_train_loss(tmp_path: Path) -> N
 
 
 def test_ddp_loop_adds_kd_loss_and_logs_epoch_mean(tmp_path: Path) -> None:
-    """The KD hook joins the step loss and lands as `train_kd_loss` in history."""
+    """The KD bank joins the step loss and lands as `train_kd_loss` in history."""
     config_path = tmp_path / "cfg.yaml"
     _write_yaml_config(config_path, {"optim.epochs": 1})
     cfg = load_config(config_path)
     batches = [_loss_batch(1.0, [0]), _loss_batch(3.0, [1, 2, 3])]
     kd_calls: list[tuple[int, int]] = []
 
-    def kd_loss_fn(model: nn.Module, epoch: int, step: int) -> torch.Tensor:
-        kd_calls.append((epoch, step))
-        return torch.tensor(0.25)
+    class _StubKDBank:
+        """Minimal duck-typed stand-in for `KDRowBank` (single-epoch test run)."""
+
+        def attach(self, batch: dict[str, torch.Tensor]) -> None:
+            return None
+
+        def loss(
+            self,
+            batch: dict[str, torch.Tensor],
+            output: dict[str, torch.Tensor],
+            *,
+            global_step: int,
+            world_size: int = 1,
+        ) -> tuple[torch.Tensor, dict[str, float], torch.Tensor | None]:
+            kd_calls.append((1, global_step))
+            return (
+                torch.tensor(0.25),
+                {
+                    "rows": float(batch["label"].shape[0]),
+                    "sum_s": 0.0,
+                    "sum_t": 0.0,
+                    "sum_s2": 0.0,
+                    "sum_t2": 0.0,
+                    "sum_st": 0.0,
+                    "sum_prob_err": 0.0,
+                },
+                None,
+            )
+
+        @property
+        def global_relational(self) -> bool:
+            return False
+
+        def epoch_telemetry(
+            self,
+            accelerator: Accelerator,
+            sums: dict[str, float],
+            kl_dim_sum: torch.Tensor | None,
+        ) -> dict[str, float]:
+            return {}
 
     result = train_ddp_loop(
         _BatchValueLossModel(),
@@ -2146,7 +2186,7 @@ def test_ddp_loop_adds_kd_loss_and_logs_epoch_mean(tmp_path: Path) -> None:
         artifact_dir=tmp_path / "attempt",
         profile_output=tmp_path / "attempt" / "worker_profile.json",
         evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(_constant_metrics(), None),
-        kd_loss_fn=kd_loss_fn,
+        kd_bank=cast(KDRowBank, _StubKDBank()),
     )
 
     assert kd_calls == [(1, 1), (1, 2)]
@@ -2289,7 +2329,6 @@ def test_ddp_loop_persists_completed_epochs_before_later_failure(tmp_path: Path)
     assert recovery["optimizer"]
     assert recovery["scheduler"] is not None
     assert len(recovery["rng_by_rank"]) == 1
-    assert recovery["kd_by_rank"] == [None]
     assert set(metrics[-1]) >= {
         "attempt_id",
         "epoch",

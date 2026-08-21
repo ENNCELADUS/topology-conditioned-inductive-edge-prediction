@@ -72,7 +72,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 import networkx as nx
 import numpy as np
 import torch
-import yaml  # type: ignore[import-untyped]
+import yaml
 from numpy.typing import NDArray
 from torch import nn
 
@@ -1982,13 +1982,21 @@ def _score_v3_1_packed(
         len_a = packed_lengths.index_select(0, pair_a)
         len_b = packed_lengths.index_select(0, pair_b)
         with torch.inference_mode(), _autocast_context(device, pair_amp or amp):
+            encoded_a = encoded.index_select(0, pair_a)[:, :boundary]
+            encoded_b = encoded.index_select(0, pair_b)[:, :boundary]
             pair_repr = model._pair_representation(
-                encoded.index_select(0, pair_a)[:, :boundary],
-                encoded.index_select(0, pair_b)[:, :boundary],
+                encoded_a,
+                encoded_b,
                 len_a,
                 len_b,
             )
             logits = model.output_head(pair_repr)
+            if model.pair_latent_gen is not None:
+                delta, _ = model.pair_latent_gen.forward_task(
+                    encoded_a, encoded_b, len_a, len_b, pair_repr
+                )
+                gated = (model.pair_latent_gen.alpha * delta).reshape(logits.shape)
+                logits = logits + gated.to(dtype=logits.dtype)
         out[np.asarray(batch_indices, dtype=np.int64)] = (
             logits.detach().to(torch.float32).cpu().numpy().reshape(-1)
         )

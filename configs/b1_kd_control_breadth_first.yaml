@@ -1,9 +1,7 @@
-# B1 KD-control arm on the simple B0 protocol: V3.1 student + zero-init
-# NodeFactorBottleneck (node_factor_dim: 64) + the shared KD anchor-context
-# stream from outputs/distill/kd_targets_breadth_first_seed0_v2
-# (python -m src.distill.teacher_targets). Arms differ ONLY in the distill
-# weights below (variable-control protocol); run one arm at a time via
-# hpc/run.sh train <this config>.
+# B1 matched control for the full-row KD arms: V3.1 student, no `distill:`
+# section. Identical student, init, seed, training rows, batch order,
+# optimizer, and schedule to the KD arms below -- only the KD term differs
+# across arms, and zero KD weight reproduces this run exactly.
 model:
   family: v3_1
   config:
@@ -31,7 +29,6 @@ model:
       spectral_norm: false
     mixing:
       mode: none
-    node_factor_dim: 64
     label_smoothing: 0.05 # symmetric BCE smoothing, fixed V3.1 recipe
 data:
   root: data
@@ -70,9 +67,5 @@ runtime:
   probe_warmup_steps: 10
   probe_timed_steps: 30
 seed: 0
-output_dir: outputs/b1_stage_v2/kd_control
+output_dir: outputs/b1_row_kd/kd_control
 mixed_precision: "bf16" # pinned for the H20 E2 target
-distill:
-  targets_path: outputs/distill/kd_targets_breadth_first_seed0_v2
-  w_label: 1.0                     # matched control: ground-truth BCE on the KD stream
-  anchors_per_step: 2

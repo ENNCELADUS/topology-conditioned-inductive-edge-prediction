@@ -1,9 +1,9 @@
-# B1 KD-D1 arm on the simple B0 protocol: V3.1 student + zero-init
-# NodeFactorBottleneck (node_factor_dim: 64) + the shared KD anchor-context
-# stream from outputs/distill/kd_targets_breadth_first_seed0_v2
-# (python -m src.distill.teacher_targets). Arms differ ONLY in the distill
-# weights below (variable-control protocol); run one arm at a time via
-# hpc/run.sh train <this config>.
+# B1 KD-D9 arm on the simple B0 protocol: V3.1 student + pair-conditioned
+# oracle latent generation (CVAE) trained on the full-row teacher-target
+# artifact's symmetrized PMA seed tokens (`teacher_seeds`), joined to the
+# training batch by `_row_id` -- one student forward, no separate KD stream.
+# The deployed residual reads only endpoint encodings and uses fixed-epsilon
+# prior marginalization. Matched control is `b1_kd_control_breadth_first.yaml`.
 model:
   family: v3_1
   config:
@@ -31,7 +31,14 @@ model:
       spectral_norm: false
     mixing:
       mode: none
-    node_factor_dim: 64
+    pair_latent_gen:
+      z_dim: 64
+      cond_dim: 256
+      hidden: 512
+      seed_count: 4
+      seed_dim: 512
+      mc_samples: 4
+      kl_free_bits: 0.05
     label_smoothing: 0.05 # symmetric BCE smoothing, fixed V3.1 recipe
 data:
   root: data
@@ -70,9 +77,13 @@ runtime:
   probe_warmup_steps: 10
   probe_timed_steps: 30
 seed: 0
-output_dir: outputs/b1_stage_v2/kd_d1
+output_dir: outputs/b1_row_kd/kd_d9
 mixed_precision: "bf16" # pinned for the H20 E2 target
 distill:
-  targets_path: outputs/distill/kd_targets_breadth_first_seed0_v2
-  w_logit: 1.0                     # GLNN-style pointwise soft-label KD
-  anchors_per_step: 2
+  targets_path: outputs/distill/kd_row_targets_breadth_first
+  w_seed: 1.0
+  w_geom: 0.3
+  w_kl: 0.05
+  kl_warmup_steps: 2000
+  joint_start_epoch: 13 # 12 pretrain epochs, then 13 joint epochs
+  gen_lr_scale: 0.1

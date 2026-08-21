@@ -43,7 +43,7 @@ import networkx as nx
 import numpy as np
 import torch
 import torch.nn.functional as F
-import yaml  # type: ignore[import-untyped,unused-ignore]
+import yaml
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 from numpy.typing import NDArray
@@ -63,7 +63,7 @@ from src.data.val_region import (
     derive_val_region_split,
     val_ball_union_universe,
 )
-from src.distill.losses import kd_seed_loss, kd_set_gram_loss
+from src.distill.losses import kd_set_gram_loss, kd_set_seed_loss
 from src.eval.checkpoint_selection import (
     CheckpointCandidate,
     TopologyValidationMetrics,
@@ -281,7 +281,7 @@ class EgoDistillConfig:
         teacher_checkpoint: A published ``full_ego_oracle`` + ``grit_gmt``
             ``best.pt`` whose frozen encoder supplies the per-batch KD targets
             (node tokens and PMA seed tokens over the identical node layout).
-        lambda_seed: Weight of `kd_seed_loss` (per-seed PMA latent cosine).
+        lambda_seed: Weight of `kd_set_seed_loss` (per-seed PMA latent cosine).
         lambda_gram: Weight of `kd_set_gram_loss` (within-set node Gram).
         warm_start_readout: Copy the teacher encoder's ``project``/``readout``
             weights into the student encoder at startup so seed ``k`` starts
@@ -3088,10 +3088,10 @@ class _CompositeStep(torch.nn.Module):
                 teacher_ab = kd.teacher_encoder(teacher_graph)
                 teacher_ba = kd.teacher_encoder(teacher_graph.swapped())
             seed = 0.5 * (
-                kd_seed_loss(
+                kd_set_seed_loss(
                     embedding_ab.tokens[:, nodes:].float(), teacher_ab.tokens[:, nodes:], live
                 )
-                + kd_seed_loss(
+                + kd_set_seed_loss(
                     embedding_ba.tokens[:, nodes:].float(), teacher_ba.tokens[:, nodes:], live
                 )
             )
