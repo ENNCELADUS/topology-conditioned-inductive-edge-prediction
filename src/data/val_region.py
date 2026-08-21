@@ -433,25 +433,6 @@ def derive_val_region_split(
     )
 
 
-def val_universe_arrays(v_val: Iterable[str]) -> tuple[NDArray[np.int32], NDArray[np.int32]]:
-    """Return the complete C(n,2)+n row universe over `sorted(v_val)`, as int32 index arrays.
-
-    Args:
-        v_val: The validation node region.
-
-    Returns:
-        `(u_idx, v_idx)`: non-self rows in `itertools.combinations` order
-        (`np.triu_indices(n, k=1)`), followed by the n self rows `(i, i)`.
-    """
-    nodes = sorted(v_val)
-    n = len(nodes)
-    tri_u, tri_v = np.triu_indices(n, k=1)
-    diag = np.arange(n)
-    u_idx = np.concatenate([tri_u, diag]).astype(np.int32)
-    v_idx = np.concatenate([tri_v, diag]).astype(np.int32)
-    return u_idx, v_idx
-
-
 @dataclass(frozen=True)
 class ValBallUnionUniverse:
     """The deduplicated within-ball pair union used by topology validation.
@@ -476,8 +457,7 @@ def val_ball_union_universe(split: ValRegionSplit) -> ValBallUnionUniverse:
     deployable threshold is selected against the sampled-subgraph evaluation
     distribution rather than a full-region graph-reconstruction objective.
 
-    Indices are int32 positions into `sorted(split.v_val)`, the same index
-    space `val_universe_arrays` uses.
+    Indices are int32 positions into `sorted(split.v_val)`.
 
     Args:
         split: The derived V_val region split; `split.buckets` must be
@@ -750,5 +730,4 @@ __all__ = [
     "region_fidelity_stats",
     "sample_bfs_ball_buckets",
     "val_ball_union_universe",
-    "val_universe_arrays",
 ]

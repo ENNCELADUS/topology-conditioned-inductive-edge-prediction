@@ -8,7 +8,6 @@ from src.data.val_region import (
     region_fidelity_stats,
     sample_bfs_ball_buckets,
     val_ball_union_universe,
-    val_universe_arrays,
 )
 
 __all__ = [
@@ -19,5 +18,4 @@ __all__ = [
     "region_fidelity_stats",
     "sample_bfs_ball_buckets",
     "val_ball_union_universe",
-    "val_universe_arrays",
 ]

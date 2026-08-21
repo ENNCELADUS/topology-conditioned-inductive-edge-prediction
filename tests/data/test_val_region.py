@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import itertools
 import json
-import math
 import os
 import pickle
 import subprocess
@@ -27,7 +26,6 @@ from src.data.val_region import (
     main,
     sample_bfs_ball_buckets,
     val_ball_union_universe,
-    val_universe_arrays,
 )
 
 pytestmark = pytest.mark.unit
@@ -283,19 +281,6 @@ class TestSampleBfsBallBuckets:
 
         with pytest.raises(ValueError, match="no component"):
             sample_bfs_ball_buckets(g, sizes=(5,), per_size=1, salt="x|")
-
-
-class TestValUniverseArrays:
-    def test_row_count_canonical_order_and_dtype(self) -> None:
-        v_val = {"c", "a", "b"}
-
-        u_idx, v_idx = val_universe_arrays(v_val)
-
-        assert u_idx.dtype == np.int32
-        assert v_idx.dtype == np.int32
-        assert len(u_idx) == math.comb(3, 2) + 3
-        rows = list(zip(u_idx.tolist(), v_idx.tolist(), strict=True))
-        assert rows == [(0, 1), (0, 2), (1, 2), (0, 0), (1, 1), (2, 2)]
 
 
 def _make_split(v_val: set[str], buckets: dict[int, list[set[str]]]) -> ValRegionSplit:
