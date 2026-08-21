@@ -227,10 +227,13 @@ class EvalConfig:
     Attributes:
         patience: Early stop after this many evals without val-AUPRC improvement.
         eval_every: Evaluate every N epochs.
+        classification_only: Skip topology validation, select the checkpoint by
+            validation AUPRC, and stop when ``patience`` is exhausted.
     """
 
     patience: int
     eval_every: int
+    classification_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -343,6 +346,13 @@ def _as_str(value: object, name: str) -> str:
     """Validate that a config value is a string."""
     if not isinstance(value, str):
         raise ValueError(f"config key '{name}' must be a string, got {value!r}")
+    return value
+
+
+def _as_bool(value: object, name: str) -> bool:
+    """Validate that a config value is a boolean."""
+    if not isinstance(value, bool):
+        raise ValueError(f"config key '{name}' must be a bool, got {value!r}")
     return value
 
 
@@ -715,10 +725,15 @@ def load_config(path: Path) -> Config:
         raise ValueError(f"optim.epochs must be >= 1, got {optim.epochs}")
 
     eval_raw = _as_mapping(_require(raw, "eval", ""), "eval")
-    _check_no_unknown_keys(eval_raw, ("patience", "eval_every"), "eval")
+    _check_no_unknown_keys(
+        eval_raw, ("patience", "eval_every", "classification_only"), "eval"
+    )
     eval_cfg = EvalConfig(
         patience=_as_int(_require(eval_raw, "patience", "eval."), "eval.patience"),
         eval_every=_as_int(_require(eval_raw, "eval_every", "eval."), "eval.eval_every"),
+        classification_only=_as_bool(
+            eval_raw.get("classification_only", False), "eval.classification_only"
+        ),
     )
 
     mixed_precision_raw = _require(raw, "mixed_precision", "")
@@ -3297,10 +3312,10 @@ def train_ddp_loop(
 ) -> TrainResult:
     """Run fixed-epoch E2 DDP training and return rank-consistent metrics.
 
-    Trains exactly ``cfg.optim.epochs`` epochs with a validation after every
-    epoch. Patience is evaluated counterfactually only: the first epoch at which
-    it would have stopped is recorded in ``TrainResult.counterfactual_stop_epoch``
-    but the run never stops early. Tail batches are loss-scaled with
+    Normally trains exactly ``cfg.optim.epochs`` epochs with a validation after
+    every epoch and records patience counterfactually. When
+    ``eval.classification_only`` is enabled, patience performs real early stopping
+    and checkpoint selection uses validation AUPRC alone. Tail batches are loss-scaled with
     :func:`scale_ddp_mean_loss`; a non-finite loss on any rank aborts all ranks;
     and every epoch boundary asserts all ranks ran the same number of steps.
     Rank zero persists the completed epoch before the next epoch begins.
@@ -3356,6 +3371,7 @@ def train_ddp_loop(
     last_metrics: EdgeMetrics | None = None
     evals_without_improvement = 0
     counterfactual_stop_epoch: int | None = None
+    stopped_early = False
     global_step = 0
 
     per_epoch_profiles: list[dict[str, object]] = []
@@ -3529,6 +3545,9 @@ def train_ddp_loop(
         last_metrics = metrics_by_epoch[completed_epoch]
         best_auprc = max(metrics.auprc for metrics in metrics_by_epoch.values())
         start_epoch = completed_epoch + 1
+        if cfg.eval.classification_only and counterfactual_stop_epoch is not None:
+            stopped_early = True
+            start_epoch = cfg.optim.epochs + 1
 
     last_heartbeat = time.monotonic()
     for epoch in range(start_epoch, cfg.optim.epochs + 1):
@@ -3921,6 +3940,15 @@ def train_ddp_loop(
         broadcast_object_list(io_error, from_process=0)
         if io_error[0] is not None:
             raise RuntimeError(f"rank-zero epoch artifact write failed: {io_error[0]}")
+        if cfg.eval.classification_only and counterfactual_stop_epoch == epoch:
+            stopped_early = True
+            if accelerator.is_main_process:
+                logger.info(
+                    "early stopping at epoch %d (%d evals without val-AUPRC improvement)",
+                    epoch,
+                    cfg.eval.patience,
+                )
+            break
     if not metrics_by_epoch or last_metrics is None:
         raise RuntimeError("DDP training ended without a single evaluation")
 
@@ -3963,11 +3991,12 @@ def train_ddp_loop(
     slowest_train_seconds = max(float(values[3]) for values in rank_totals.tolist())
     global_tokens = int(rank_totals[:, 2].sum().item())
     steady_state_data_wait_fraction = max(data_wait_fractions, default=0.0)
+    last_epoch = max(metrics_by_epoch)
     runtime_profile: dict[str, object] = {
         "status": "trained",
         "global_step": global_step,
-        "epochs_completed": cfg.optim.epochs,
-        "validations_completed": cfg.optim.epochs,
+        "epochs_completed": last_epoch,
+        "validations_completed": last_epoch,
         "peak_memory_gib_per_rank": peak_memory_gib_per_rank,
         "steady_state_data_wait_fraction": steady_state_data_wait_fraction,
         "training_coverage_exact": True,
@@ -3984,6 +4013,7 @@ def train_ddp_loop(
             global_tokens / slowest_train_seconds if slowest_train_seconds > 0 else 0.0
         ),
         "validation_seconds": total_validation_seconds,
+        "stopped_early": stopped_early,
         "per_epoch": per_epoch_profiles,
     }
 
@@ -4009,10 +4039,16 @@ def train_ddp_loop(
             "resume across the V_val protocol change unsupported; start a fresh attempt dir"
         )
     else:
-        best_epoch = max(
-            sorted(metrics_by_epoch),
-            key=lambda epoch: (metrics_by_epoch[epoch].auprc, epoch),
-        )
+        if cfg.eval.classification_only:
+            best_epoch = max(
+                sorted(metrics_by_epoch),
+                key=lambda epoch: metrics_by_epoch[epoch].auprc,
+            )
+        else:
+            best_epoch = max(
+                sorted(metrics_by_epoch),
+                key=lambda epoch: (metrics_by_epoch[epoch].auprc, epoch),
+            )
     best_metrics = metrics_by_epoch[best_epoch]
 
     val_threshold_transfer: ValThresholdTransfer | None = None
@@ -4042,7 +4078,7 @@ def train_ddp_loop(
                 artifact_dir / "progress.json",
                 {
                     "status": "trained",
-                    "last_completed_epoch": cfg.optim.epochs,
+                    "last_completed_epoch": last_epoch,
                     "epochs_total": cfg.optim.epochs,
                     "global_step": global_step,
                     "selected_epoch": best_epoch,
@@ -4062,10 +4098,10 @@ def train_ddp_loop(
         best_epoch=best_epoch,
         best_val_metrics=best_metrics,
         last_state_dict=last_state,
-        last_epoch=cfg.optim.epochs,
+        last_epoch=last_epoch,
         last_val_metrics=last_metrics,
         history=history,
-        stopped_early=False,
+        stopped_early=stopped_early,
         counterfactual_stop_epoch=counterfactual_stop_epoch,
         runtime_profile=runtime_profile,
         val_threshold_transfer=val_threshold_transfer,
@@ -4410,18 +4446,6 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         return
 
     val_split = assembled.val_split
-    reference = build_val_topology_reference(val_split)
-    universe = val_ball_union_universe(val_split)
-    u_idx, v_idx = universe.u_idx, universe.v_idx
-    n_u = len(u_idx)
-    node_index = table.manifest.node_index()
-    lengths_by_node = {record.node_id: record.length for record in table.manifest.nodes}
-    node_positions = np.array([node_index[node] for node in reference.nodes], dtype=np.int64)
-    all_u_idx = np.concatenate([universe.u_idx, universe.sample_u_idx])
-    all_v_idx = np.concatenate([universe.v_idx, universe.sample_v_idx])
-    node_a_all = torch.from_numpy(node_positions[all_u_idx]).to(torch.int64)
-    node_b_all = torch.from_numpy(node_positions[all_v_idx]).to(torch.int64)
-    universe_boundary = max(lengths_by_node[node] for node in reference.nodes)
 
     val_cls_pairs, val_cls_labels = _val_cls_rows(val_split, assembled.exclude_nodes)
     num_val_rows = len(val_cls_pairs)
@@ -4452,30 +4476,49 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                 cfg.distill.targets_path,
             )
 
-    evaluate_fn = cast(
-        EvaluateFn,
-        functools.partial(
-            _evaluate_two_pass,
-            expected_row_ids=np.arange(num_val_rows, dtype=np.int64),
-            topology_eval_fn=cast(
-                TopologyEvalFn,
-                functools.partial(
-                    _evaluate_val_universe,
-                    table=table,
-                    node_a_all=node_a_all,
-                    node_b_all=node_b_all,
-                    boundary=universe_boundary,
-                    batch_pairs=runtime.max_pairs_per_rank,
-                    u_idx=u_idx,
-                    v_idx=v_idx,
-                    n_u=n_u,
-                    complement_total=universe.complement_total,
-                    reference=reference,
-                ),
+    reference: ValTopologyReference | None = None
+    if cfg.eval.classification_only:
+        evaluate_fn = cast(
+            EvaluateFn,
+            functools.partial(
+                _evaluate_distributed,
+                expected_row_ids=np.arange(num_val_rows, dtype=np.int64),
+                kd_val=kd_val,
             ),
-            kd_val=kd_val,
-        ),
-    )
+        )
+    else:
+        reference = build_val_topology_reference(val_split)
+        universe = val_ball_union_universe(val_split)
+        u_idx, v_idx = universe.u_idx, universe.v_idx
+        node_index = table.manifest.node_index()
+        lengths_by_node = {record.node_id: record.length for record in table.manifest.nodes}
+        node_positions = np.array([node_index[node] for node in reference.nodes], dtype=np.int64)
+        all_u_idx = np.concatenate([universe.u_idx, universe.sample_u_idx])
+        all_v_idx = np.concatenate([universe.v_idx, universe.sample_v_idx])
+        evaluate_fn = cast(
+            EvaluateFn,
+            functools.partial(
+                _evaluate_two_pass,
+                expected_row_ids=np.arange(num_val_rows, dtype=np.int64),
+                topology_eval_fn=cast(
+                    TopologyEvalFn,
+                    functools.partial(
+                        _evaluate_val_universe,
+                        table=table,
+                        node_a_all=torch.from_numpy(node_positions[all_u_idx]).to(torch.int64),
+                        node_b_all=torch.from_numpy(node_positions[all_v_idx]).to(torch.int64),
+                        boundary=max(lengths_by_node[node] for node in reference.nodes),
+                        batch_pairs=runtime.max_pairs_per_rank,
+                        u_idx=u_idx,
+                        v_idx=v_idx,
+                        n_u=len(u_idx),
+                        complement_total=universe.complement_total,
+                        reference=reference,
+                    ),
+                ),
+                kd_val=kd_val,
+            ),
+        )
 
     if args.ddp_mode == "epoch-probe":
         one_epoch_cfg = replace(cfg, optim=replace(cfg.optim, epochs=1))
@@ -4509,7 +4552,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                     schedule_total_steps=schedule_total_steps,
                     evaluate_fn=evaluate_fn,
                     kd_bank=kd_bank,
-                    require_topology=True,
+                    require_topology=not cfg.eval.classification_only,
                 ),
             )
         except BaseException:
@@ -4548,7 +4591,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         schedule_total_steps=schedule_total_steps,
         evaluate_fn=evaluate_fn,
         kd_bank=kd_bank,
-        require_topology=True,
+        require_topology=not cfg.eval.classification_only,
         val_topology_reference=reference,
     )
     finalization_error: list[str | None] = [None]

@@ -33,6 +33,7 @@ from src.e2_pipeline import (
     _rollback_publication,
     _test_stage_filenames,
     _validate_staged_artifacts,
+    _validate_worker_profile,
     build_accelerate_command,
     detect_visible_gpu_count,
     main,
@@ -690,6 +691,35 @@ def _valid_worker_profile() -> dict[str, object]:
             for epoch in (1, 2)
         ],
     }
+
+
+def test_worker_profile_accepts_completed_early_stop_prefix() -> None:
+    profile = _valid_worker_profile()
+    profile["epochs_completed"] = 1
+    profile["validations_completed"] = 1
+    profile["per_epoch"] = cast(list[object], profile["per_epoch"])[:1]
+
+    validated = _validate_worker_profile(
+        profile,
+        epochs=2,
+        world_size=4,
+        memory_limit_gib=85.0,
+    )
+
+    assert validated["epochs_completed"] == 1
+
+
+def test_worker_profile_rejects_mismatched_epoch_and_validation_counts() -> None:
+    profile = _valid_worker_profile()
+    profile["epochs_completed"] = 1
+
+    with pytest.raises(ValueError, match="must match"):
+        _validate_worker_profile(
+            profile,
+            epochs=2,
+            world_size=4,
+            memory_limit_gib=85.0,
+        )
 
 
 def _make_fake_runner(
