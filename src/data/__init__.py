@@ -1,7 +1,6 @@
 """Benchmark artifact loading, feature access, partitions, and pair sampling."""
 
 from src.data.val_region import (
-    BALL_UNION_COMPLEMENT_SAMPLE_SIZE,
     ValBallUnionUniverse,
     ValRegionParams,
     ValRegionSplit,
@@ -13,7 +12,6 @@ from src.data.val_region import (
 )
 
 __all__ = [
-    "BALL_UNION_COMPLEMENT_SAMPLE_SIZE",
     "ValBallUnionUniverse",
     "ValRegionParams",
     "ValRegionSplit",

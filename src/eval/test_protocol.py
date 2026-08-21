@@ -2,14 +2,16 @@
 
 Owns the whole post-train sequence for one arm and nothing else::
 
-    score test      -> edge metrics at fixed threshold 0.5
-    score test_topology -> per-sample RD-matched assembled-graph metrics
+    score val_topology -> select one fixed threshold on validation samples
+    score test          -> edge metrics at fixed threshold 0.5
+    score test_topology -> fixed-threshold and per-sample RD-matched graph metrics
         -> test_report.json
 
 Classification and topology use separate operating points: the former is
-fixed at 0.5, while the latter independently matches RD=1 in every sampled
-20--200-node evaluation subgraph. Both metric families are always reported
-together; a partial report is never written.
+fixed at 0.5. Topology reports both a validation-selected fixed threshold that
+is replayed unchanged on every test sample and the per-subgraph RD=1 diagnostic.
+Both metric families are always reported together; a partial report is never
+written.
 
 This module composes existing analysis primitives; it never rescores a pair or
 reimplements a metric. It never calls ``validate_score_precision`` directly on
@@ -39,6 +41,7 @@ from scipy.special import expit
 
 from src.data.artifacts import canonical_pair
 from src.eval.assembly import assemble_rank_matched_graph
+from src.eval.fixed_threshold import evaluate_fixed_threshold, select_fixed_threshold
 from src.eval.graph_metrics import (
     MMDConfig,
     evaluate_sampled_subgraphs,
@@ -53,6 +56,7 @@ from src.score_universe import (
     MODEL_BUILDERS,
     ScoresArtifact,
     _checkpoint_id,
+    _load_val_region_split,
     load_scores,
     validate_artifact_precision,
 )
@@ -61,7 +65,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["ScoreRunner", "TestProtocolResult", "build_parser", "main", "run_test_protocol"]
 
-_SCHEMA_VERSION = "test_protocol_v3"
+_SCHEMA_VERSION = "test_protocol_v4"
 #: The filename `src.e2_pipeline` (and `src.train_egostitch`/`src.train_b0`)
 #: publish training provenance into: checkpoint identity, publication status,
 #: and access-audit fields no scoring call may destroy. This module never
@@ -126,17 +130,17 @@ def _require_full_universe(artifact: ScoresArtifact, *, label: str) -> None:
         )
 
 
-def _require_same_checkpoint(*, test: ScoresArtifact, topology: ScoresArtifact) -> None:
-    """Raise unless both held-out passes scored the same checkpoint and family."""
-    checkpoint_ids = {artifact.meta.get("checkpoint_id") for artifact in (test, topology)}
+def _require_same_checkpoint(*artifacts: ScoresArtifact) -> None:
+    """Raise unless all protocol passes scored the same checkpoint and family."""
+    checkpoint_ids = {artifact.meta.get("checkpoint_id") for artifact in artifacts}
     if len(checkpoint_ids) != 1:
         raise ValueError(
-            f"test and test_topology scoring passes used different checkpoints: {checkpoint_ids}"
+            f"protocol scoring passes used different checkpoints: {checkpoint_ids}"
         )
-    model_families = {artifact.meta.get("model_family") for artifact in (test, topology)}
+    model_families = {artifact.meta.get("model_family") for artifact in artifacts}
     if len(model_families) != 1:
         raise ValueError(
-            f"test and test_topology scoring passes disagree on model_family: {model_families}"
+            f"protocol scoring passes disagree on model_family: {model_families}"
         )
 
 
@@ -557,13 +561,13 @@ def run_test_protocol(
     def _score(
         pairs_source: str,
         *,
+        support_namespace: str,
         allow_rescore_reason: bool,
         include_scoring_run_id: bool,
     ) -> Path:
-        # Both passes deliberately expose the complete sorted test-node support:
-        # test_topology adds support-only self-pairs for nodes absent from the
-        # sampled sets. Their exact F0/grounding state is therefore identical
-        # and can be built once without `allow_cache_subset=True`.
+        # The two held-out passes expose identical complete test-node support;
+        # validation has its own complete V_val support. Never cross caches
+        # between those role universes.
         output = scores_dir / f"{pairs_source}.npz"
         if reuse_existing_scores and output.is_file():
             # Opt-in only. A scoring pass costs hours, so a rerun after a later
@@ -581,8 +585,8 @@ def run_test_protocol(
             data_root=data_root,
             strategy=strategy,
             run_metadata=scoring_identity_path,
-            f0_cache=scores_dir / "f0_cache_test_support.pt",
-            grounding_cache=scores_dir / "grounding_cache_test_support.npz",
+            f0_cache=scores_dir / f"f0_cache_{support_namespace}_support.pt",
+            grounding_cache=scores_dir / f"grounding_cache_{support_namespace}_support.npz",
             pack_dir=pack_dir,
             scaffold_control=scaffold_control,
             rescore_reason=rescore_reason if allow_rescore_reason else None,
@@ -593,18 +597,51 @@ def run_test_protocol(
         )
         return score_runner(args)
 
-    # 1. Score test, then only the union needed by sampled topology evaluation.
-    # Both held-out passes share one scoring run,
+    # 1. Select the fixed operating point before any held-out pair is read.
+    validation_path = _score(
+        "val_topology",
+        support_namespace="vval",
+        allow_rescore_reason=False,
+        include_scoring_run_id=False,
+    )
+    validation_artifact = load_scores(validation_path)
+    validate_artifact_precision(validation_artifact, label=str(validation_path))
+    _require_pairs_source(validation_artifact, "val_topology", label=str(validation_path))
+    _require_full_universe(validation_artifact, label=str(validation_path))
+    _require_scoring_identity(
+        artifact=validation_artifact,
+        checkpoint_id=expected_checkpoint_id,
+        strategy=strategy,
+        label=str(validation_path),
+    )
+    validation_split = _load_val_region_split(data_root, strategy)
+    config = MMDConfig()
+    fixed_selection = select_fixed_threshold(
+        pairs=list(validation_artifact.pairs()),
+        logits=validation_artifact.logit.astype(np.float64),
+        g_ref=validation_split.build_g_val(),
+        buckets=validation_split.buckets,
+        config=config,
+    )
+
+    # 2. Only after threshold freeze, score the held-out classification and
+    # sampled-topology unions. Both passes share one scoring run,
     # sharing one scoring-run id (when this checkpoint is egostitch_e2e) so
     # they join the SAME test-access-ledger epoch.
     test_path = _score(
-        "test", allow_rescore_reason=True, include_scoring_run_id=is_egostitch_e2e_family
+        "test",
+        support_namespace="test",
+        allow_rescore_reason=True,
+        include_scoring_run_id=is_egostitch_e2e_family,
     )
     topology_path = _score(
-        "test_topology", allow_rescore_reason=True, include_scoring_run_id=is_egostitch_e2e_family
+        "test_topology",
+        support_namespace="test",
+        allow_rescore_reason=True,
+        include_scoring_run_id=is_egostitch_e2e_family,
     )
 
-    # 2. Classification uses the fixed 0.5 decision threshold for every arm.
+    # 3. Classification uses the fixed 0.5 decision threshold for every arm.
     edge_report = report_edge_metrics(test_path, expect_pairs_source="test", threshold=0.5)
 
     # Reload test/topology directly (report_edge_metrics only returns a
@@ -631,16 +668,28 @@ def run_test_protocol(
         label=str(topology_path),
     )
 
-    _require_same_checkpoint(test=test_artifact, topology=topology_artifact)
+    _require_same_checkpoint(validation_artifact, test_artifact, topology_artifact)
 
-    # 3. Topology independently matches the reference edge count in each
-    # sampled subgraph. Self-loops participate in both the quota and metrics.
+    # 4. Replay the frozen validation threshold without test recalibration, and
+    # retain the per-subgraph RD=1 result as an explicitly oracle-calibrated
+    # diagnostic. Self-loops participate in both rules and all metrics.
     benchmark_root = data_root / _BENCHMARK_SUBDIR
     g_ref = load_test_graph(benchmark_root, strategy)
     buckets = load_test_node_buckets(benchmark_root, strategy)
-    config = MMDConfig()
+    _, fixed_test_report = evaluate_fixed_threshold(
+        pairs=list(topology_artifact.pairs()),
+        logits=topology_artifact.logit.astype(np.float64),
+        g_ref=g_ref,
+        buckets=buckets,
+        threshold=fixed_selection.logit_threshold,
+        config=config,
+    )
 
     graph_report: dict[str, object] = {
+        "fixed_threshold": {
+            "validation_selection": fixed_selection.report,
+            "test": fixed_test_report,
+        },
         "per_subgraph_rd_matched": _rd_matched_graph_block(
             pairs=list(topology_artifact.pairs()),
             logits=topology_artifact.logit.astype(np.float64),
@@ -650,7 +699,7 @@ def run_test_protocol(
         )
     }
 
-    # 4. Arm identity: config-independent, sourced from the topology artifact.
+    # 5. Arm identity: config-independent, sourced from the topology artifact.
     meta = topology_artifact.meta
     arm_report: dict[str, object] = {
         "arm": arm,
@@ -682,6 +731,11 @@ def run_test_protocol(
     }
 
     provenance: dict[str, object] = {
+        "val_topology": {
+            "path": str(validation_path),
+            "sha256": _sha256_file(validation_path),
+            "test_access_ledger_record_sha256": None,
+        },
         "test": {
             "path": str(test_path),
             "sha256": _sha256_file(test_path),
@@ -694,7 +748,7 @@ def run_test_protocol(
         },
     }
 
-    # 5. Assemble and write. Every block above must already exist in memory --
+    # 6. Assemble and write. Every block above must already exist in memory --
     # nothing is written incrementally -- so a failure anywhere above (a
     # topology-pass score_runner error, a graph-evaluation ValueError, ...)
     # leaves no report file at all. Edge and graph metrics are always reported
@@ -721,9 +775,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m src.eval.test_protocol",
         description=(
-            "Run the post-train test protocol for one arm: score test and test_topology, "
-            "report test classification at threshold 0.5 and sampled topology "
-            "after independent per-subgraph RD matching."
+            "Run the post-train test protocol for one arm: select a fixed topology "
+            "threshold on sampled V_val subgraphs, then score test/test_topology and "
+            "report both fixed-threshold and per-subgraph RD-matched topology."
         ),
     )
     parser.add_argument("--checkpoint", type=Path, required=True, help="published checkpoint")

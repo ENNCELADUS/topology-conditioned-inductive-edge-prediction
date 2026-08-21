@@ -102,10 +102,10 @@ fail-closed.
 ## Claim rules
 
 - Report edge-level and assembled-graph metrics together — never one family alone.
-- The topology result is five numbers, always together and never aggregated: GS, RD, and the degree /
-  clustering / spectral MMD ratios (GS↑, RD→1, ratios↓). GS is edge-set Dice/F1
-  (`src/eval/graph_metrics.py`), not an MMD summary; test topology reports BFS-macro GS/RD only after
-  every sampled subgraph is independently matched to RD=1.
+- Each topology operating point reports five numbers together: BFS-macro GS/RD and degree /
+  clustering / spectral MMD ratios (GS↑, RD→1, ratios↓). The primary deployable result uses one
+  V_val-selected fixed threshold on every test subgraph; per-subgraph RD=1 matching is named
+  separately as an oracle-calibrated diagnostic. GS is edge-set Dice/F1, not an MMD summary.
   
 ## Data-contract traps
 

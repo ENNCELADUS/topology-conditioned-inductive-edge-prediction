@@ -10,10 +10,10 @@ one criterion whenever an arm's AUPRC spread is smaller than the tolerance —
 which is exactly how kd_d2 published its untrained epoch-1 snapshot.
 
 The five numbers come from the V_val bucket evaluation
-(`src.eval.val_topology.val_region_topology_metrics`): density-matched global
-assembly over the complete V_val-internal pair universe, then the test
-evaluator over the pinned 500-ball bucket bank — BFS-macro GS, BFS-macro RD,
-and the three odd/even-floor-normalized MMD ratios.
+(`src.eval.val_topology.val_region_topology_metrics`): the same sampled-only
+fixed-threshold selector used by the held-out protocol over the pinned 500-ball
+bucket bank — BFS-macro GS, BFS-macro RD, and the three
+odd/even-floor-normalized MMD ratios.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ class TopologyValidationMetrics:
 
     Attributes:
         gs: BFS-macro edge-set Dice similarity across the bucket bank.
-        rd: BFS-macro relative density at the density-matched assembly.
+        rd: BFS-macro relative density at the sampled-only fixed threshold.
         degree_mmd: Degree-histogram MMD ratio over the odd/even floor.
         clustering_mmd: Clustering-histogram MMD ratio over the odd/even floor.
         spectral_mmd: Laplacian-spectrum MMD ratio over the odd/even floor.

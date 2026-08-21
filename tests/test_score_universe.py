@@ -12,6 +12,7 @@ import pickle
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
+from itertools import combinations_with_replacement
 from pathlib import Path
 from typing import cast
 
@@ -28,7 +29,7 @@ from src.data.feature_stats import compute_feature_stats
 from src.data.features import FeatureStore, build_f0_matrix
 from src.data.grounding import build_grounding_pool
 from src.data.packed_features import PackedFeatureTable, build_packed_features
-from src.data.val_region import ValRegionParams, derive_val_region_split, val_universe_arrays
+from src.data.val_region import ValRegionParams
 from src.model.egostitch.classifier.b0_v31 import V3_1, B0V31PairClassifier, GatedCrossAttention
 from src.model.egostitch.composite import E2ENodeState, E2EPairContext, EgoStitchModel
 from src.model.egostitch.config import E2EConfig, GeneratorConfig
@@ -2168,63 +2169,34 @@ def _val_region_e2e_setup(
     return data_root, checkpoint_path
 
 
-def test_resolve_val_region_pairs_matches_direct_derivation_bit_for_bit(
+def test_val_topology_is_exact_sample_union_with_full_vval_support(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`--pairs val_region` must reproduce a from-scratch derivation exactly.
-
-    Both the universe (pairs, row order) and the labels must match.
-    """
     monkeypatch.setattr(score_universe, "_VAL_REGION_PARAMS", _VAL_REGION_TEST_PARAMS)
     data_root = _write_val_region_benchmark_package(tmp_path)
+    split = score_universe._load_val_region_split(data_root, "breadth_first")
 
-    pairs, labels = score_universe._resolve_pairs("val_region", data_root, "breadth_first")
+    pairs, labels = score_universe._resolve_pairs("val_topology", data_root, "breadth_first")
 
-    strategy_dir = data_root / "benchmark_2025_neurips" / "breadth_first"
-    with (strategy_dir / "split.pkl").open("rb") as handle:
-        split_payload = pickle.load(handle)  # noqa: S301
-    with (strategy_dir / "train_graph.pkl").open("rb") as handle:
-        train_graph = pickle.load(handle)  # noqa: S301
-    train_pairs, train_labels = score_universe._read_pairs_tsv(strategy_dir / "train_edges.txt")
-    val_pairs_raw, val_labels_raw = score_universe._read_pairs_tsv(strategy_dir / "val_edges.txt")
-    benchmark_negatives = [
-        pair for pair, label in zip(train_pairs, train_labels.tolist(), strict=True) if label == 0
-    ] + [
-        pair
-        for pair, label in zip(val_pairs_raw, val_labels_raw.tolist(), strict=True)
-        if label == 0
-    ]
-    positive_pairs, _ = score_universe._read_pairs_tsv(
-        data_root / "benchmark_2025_neurips" / "positive_edges.txt"
+    expected = {
+        canonical_pair(u, v)
+        for node_sets in split.buckets.values()
+        for nodes in node_sets
+        for u, v in combinations_with_replacement(sorted(nodes), 2)
+    }
+    expected.update((node, node) for node in split.v_val)
+    assert pairs == sorted(expected)
+    assert {node for pair in pairs for node in pair} == set(split.v_val)
+    positives = frozenset(split.val_positives)
+    np.testing.assert_array_equal(
+        labels, np.array([int(pair in positives) for pair in pairs], dtype=np.int8)
     )
 
-    expected_split = derive_val_region_split(
-        sorted(split_payload["train"]),
-        list(train_graph.edges()),
-        benchmark_negatives,
-        frozenset(positive_pairs),
-        params=_VAL_REGION_TEST_PARAMS,
-    )
-    expected_nodes = sorted(expected_split.v_val)
-    expected_u, expected_v = val_universe_arrays(expected_split.v_val)
-    expected_pairs = [
-        (expected_nodes[u], expected_nodes[v])
-        for u, v in zip(expected_u.tolist(), expected_v.tolist(), strict=True)
-    ]
-    expected_positives = frozenset(expected_split.val_positives)
-    expected_labels = np.array(
-        [1 if pair in expected_positives else 0 for pair in expected_pairs], dtype=np.int8
-    )
 
-    assert pairs == expected_pairs
-    np.testing.assert_array_equal(labels, expected_labels)
-    assert len(expected_split.val_positives) > 0, "fixture must produce a real V_val topology"
-
-
-def test_val_region_pairs_source_is_never_a_heldout_universe() -> None:
+def test_val_topology_pairs_source_is_never_a_heldout_universe() -> None:
     assert (
         score_universe._is_heldout_universe(
-            {"model_family": "egostitch_e2e", "pairs_source": "val_region"}
+            {"model_family": "egostitch_e2e", "pairs_source": "val_topology"}
         )
         is False
     )
@@ -2236,13 +2208,13 @@ def test_test_topology_pairs_source_is_a_heldout_universe() -> None:
     )
 
 
-def test_val_region_scoring_never_writes_a_ledger_record(
+def test_val_topology_scoring_never_writes_a_ledger_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`--pairs val_region` needs no `--run-metadata` and never touches the test-access ledger."""
+    """`val_topology` needs no run metadata and never touches the test-access ledger."""
     monkeypatch.setattr(score_universe, "_VAL_REGION_PARAMS", _VAL_REGION_TEST_PARAMS)
     data_root, checkpoint = _val_region_e2e_setup(tmp_path)
-    output = tmp_path / "val_region.npz"
+    output = tmp_path / "val_topology.npz"
 
     score_universe.main(
         [
@@ -2250,7 +2222,7 @@ def test_val_region_scoring_never_writes_a_ledger_record(
             "--checkpoint",
             str(checkpoint),
             "--pairs",
-            "val_region",
+            "val_topology",
             "--data-root",
             str(data_root),
             "--output",
@@ -2265,18 +2237,20 @@ def test_val_region_scoring_never_writes_a_ledger_record(
     )
 
     artifact = score_universe.load_scores(output)
-    assert artifact.meta["pairs_source"] == "val_region"
+    assert artifact.meta["pairs_source"] == "val_topology"
     assert artifact.meta["heldout"] is False
     assert "test_access_ledger" not in artifact.meta
     assert not list(tmp_path.rglob("test_access_ledger.jsonl")), (
-        "val_region scoring must never append to any test-access ledger"
+        "val_topology scoring must never append to any test-access ledger"
     )
 
 
 def test_val_pairs_source_no_longer_resolves(tmp_path: Path) -> None:
-    """`val` (val_edges.txt) is retired; only `val_region` names the validation universe."""
+    """Full-region validation sources are retired; only `val_topology` remains."""
     with pytest.raises(ValueError, match=r"unsupported --pairs value 'val'"):
         score_universe._resolve_pairs("val", tmp_path / "data", "breadth_first")
+    with pytest.raises(ValueError, match=r"unsupported --pairs value 'val_region'"):
+        score_universe._resolve_pairs("val_region", tmp_path / "data", "breadth_first")
 
 
 # --------------------------------------------------------------------------- cazi_mbn scoring
@@ -2824,13 +2798,13 @@ def test_oracle_generator_scoring_is_unreachable_without_the_diagnostic_flag(
     assert np.isfinite(artifact.logit).all()
 
 
-def test_oracle_val_region_truth_diagnostic_still_writes_no_ledger_record(
+def test_oracle_val_topology_truth_diagnostic_still_writes_no_ledger_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The `val_region`-truth oracle diagnostic combines fixes 1 and 4: still no ledger access."""
+    """The `val_topology` oracle diagnostic still writes no ledger record."""
     monkeypatch.setattr(score_universe, "_VAL_REGION_PARAMS", _VAL_REGION_TEST_PARAMS)
     data_root, checkpoint = _val_region_e2e_setup(tmp_path, model_config=_TINY_ORACLE_E2E_CONFIG)
-    output = tmp_path / "oracle_val_region.npz"
+    output = tmp_path / "oracle_val_topology.npz"
 
     score_universe.main(
         [
@@ -2838,7 +2812,7 @@ def test_oracle_val_region_truth_diagnostic_still_writes_no_ledger_record(
             "--checkpoint",
             str(checkpoint),
             "--pairs",
-            "val_region",
+            "val_topology",
             "--data-root",
             str(data_root),
             "--output",
@@ -2855,6 +2829,6 @@ def test_oracle_val_region_truth_diagnostic_still_writes_no_ledger_record(
 
     artifact = score_universe.load_scores(output)
     oracle_diagnostic = cast(dict[str, object], artifact.meta["oracle_diagnostic"])
-    assert oracle_diagnostic["truth_source"] == "val_region_g_val"
+    assert oracle_diagnostic["truth_source"] == "val_topology_g_val"
     assert artifact.meta["heldout"] is False
     assert not list(tmp_path.rglob("test_access_ledger.jsonl"))

@@ -56,19 +56,17 @@ engineering validity, and the scientific verdict are reported separately.
 - Training and test nodes are disjoint. `V_val` is a pair-disjoint (not node-disjoint) BFS-grown internal
   region: cross-boundary edges train; only V_val-internal pairs are withheld, never fully inductive, unlike test.
 - Pairwise metrics use the fixed benchmark test-pair artifact; AUROC and AUPRC are threshold-free; Accuracy, F1, and MCC use threshold 0.5.
-- Test graph metrics score the pair union induced by the 20--200-node sampled sets plus support-only
-  self-pairs that preserve the full test-node grounding pool. Every subgraph selects exactly its
-  reference edge count (self-loops included; canonical order breaks ties), so RD=1 precedes BFS-macro
-  GS/RD and MMD evaluation. There is no full-space score or global threshold; `V_val` is unchanged.
-- Threshold selection, quota construction, and any learned coupling must be fixed on training
-  data or `V_val`; the evaluator-provided per-sample reference edge count may define the RD-matched
-  operating point, other hidden test topology only in explicitly diagnostic oracles. Published
-  checkpoints record `val_threshold_transfer` for a future degree-density test operating point.
+- Fixed-threshold topology first scores only the V_val 20--200-node sampled-set pair union. Across
+  every atomic logit tie-group boundary, size-stratified paired-bootstrap 1-SE sets maximize BFS-macro
+  GS, then minimize mean `|RD-1|`; degree, clustering, then spectral MMD ratio select lexicographically,
+  with a larger-threshold complete-tie break. The threshold freezes before test and replays unchanged.
+- Test topology scores only its sampled-set pair union plus support-only rows for full grounding.
+  Report the deployable fixed-threshold result first; separately report per-subgraph exact-edge-count
+  RD=1 matching (self-loops included, canonical tie-break) as an oracle-calibrated diagnostic.
 
 ### 2.3 Required metrics
 
-Report edge and topology metrics together. The topology result is always these five
-numbers:
+Report edge and topology metrics together. Each fixed or diagnostic topology result has five numbers:
 
 1. BFS-macro graph similarity (GS, edge-set Dice/F1; higher is better);
 2. BFS-macro relative density (RD; closer to 1 is better);
@@ -253,10 +251,10 @@ allocation while retaining the two-endpoint inference contract.
    threshold or aggregate substitutes for a fixed gate.
 2. Preserve provenance. Oracle, S0, S0-R, S1-R, and any test-informed follow-up remain
    `formal:false` even when their execution is valid.
-3. Fit model selection on training data or `V_val`, then evaluate test/test_topology once.
-   Never tune model parameters on test topology.
+3. Select the fixed topology threshold on sampled `V_val`, freeze it, then evaluate
+   test/test_topology once. Never tune model parameters or that threshold on test topology.
 4. Bind comparisons to the same frozen features, split, sampled sets, full-node grounding support,
-   self-loop convention, checkpoint, and per-subgraph edge-count policy.
+   self-loop convention, checkpoint, fixed-threshold rule, and diagnostic RD=1 policy.
 5. Validate score precision before analysis. Record checkpoint ID, artifact hashes,
    threshold/quota policy, random seed, code commit, and metric implementation.
 6. Require completion markers, no `failure.json`, exited workers, complete outputs, and

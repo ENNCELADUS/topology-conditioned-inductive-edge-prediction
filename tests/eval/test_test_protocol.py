@@ -90,6 +90,25 @@ class _Fixture:
     artifacts: dict[str, Path]
 
 
+@dataclass(frozen=True)
+class _ToyValidationSplit:
+    buckets: dict[int, list[set[str]]]
+
+    def build_g_val(self) -> nx.Graph:
+        return _make_reference_graph()
+
+
+@pytest.fixture(autouse=True)
+def _sampled_validation_split(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep protocol tests focused on orchestration, not V_val disk derivation."""
+    buckets = _small_buckets(_NODES, size=5, n_samples=4, seed=0)
+    monkeypatch.setattr(
+        test_protocol,
+        "_load_val_region_split",
+        lambda _data_root, _strategy: _ToyValidationSplit(buckets=buckets),
+    )
+
+
 def _build_test_topology_and_test_probs(pairs: list[tuple[str, str]]) -> NDArray[np.float64]:
     """High prob on the five true edges, moderate on self-pairs, low elsewhere.
 
@@ -136,10 +155,28 @@ def _build_fixture(tmp_path: Path) -> _Fixture:
         pairs_source="test",
         checkpoint_id=_CHECKPOINT_ID,
     )
+    val_topology_path = scores_dir / "val_topology.npz"
+    _write_universe_npz(
+        val_topology_path,
+        node_ids=_NODES,
+        pairs=pairs,
+        # Deliberately shift validation above test. The selected fixed threshold
+        # therefore predicts an empty test graph; if test were recalibrated,
+        # the happy-path reference ranking would instead recover GS=1.
+        logits=logits + 1.0,
+        labels=labels,
+        strategy=_STRATEGY,
+        pairs_source="val_topology",
+        checkpoint_id=_CHECKPOINT_ID,
+    )
 
     return _Fixture(
         data_root=data_root,
-        artifacts={"test": test_path, "test_topology": test_topology_path},
+        artifacts={
+            "val_topology": val_topology_path,
+            "test": test_path,
+            "test_topology": test_topology_path,
+        },
     )
 
 
@@ -188,15 +225,15 @@ class TestRunTestProtocol:
             score_runner=runner,
         )
 
-        # 1. No V_hold pass: test classification and test_topology topology use
-        # independent fixed/density-controlled operating points.
-        assert runner.pairs_order == ["test", "test_topology"]
+        # 1. Validation freezes the deployable topology threshold before either
+        # held-out pass is allowed to run.
+        assert runner.pairs_order == ["val_topology", "test", "test_topology"]
         assert not (output_dir / "operating_point.json").exists()
 
         # 3. --data-root/--strategy/--checkpoint and --run-metadata forwarded to every
         # pass, pointed at this module's own scoring-identity file (never the
         # published run_metadata.json -- see test_never_overwrites_published_run_metadata).
-        for pairs_source in ("test", "test_topology"):
+        for pairs_source in ("val_topology", "test", "test_topology"):
             call = runner.call_for(pairs_source)
             assert _arg_value(call, "--checkpoint") == str(checkpoint)
             assert _arg_value(call, "--data-root") == str(fixture.data_root)
@@ -218,7 +255,7 @@ class TestRunTestProtocol:
             "graph",
             "provenance",
         ]
-        assert report["schema_version"] == "test_protocol_v3"
+        assert report["schema_version"] == "test_protocol_v4"
 
         arm_block = report["arm"]
         assert isinstance(arm_block, dict)
@@ -248,7 +285,14 @@ class TestRunTestProtocol:
         # only the official BFS-macro topology view is reported.
         graph = report["graph"]
         assert isinstance(graph, dict)
-        assert set(graph.keys()) == {"per_subgraph_rd_matched"}
+        assert set(graph.keys()) == {"fixed_threshold", "per_subgraph_rd_matched"}
+        fixed = graph["fixed_threshold"]
+        assert fixed["validation_selection"]["rule"] == "sampled_subgraph_gs_rd_mmd_1se_v2"
+        assert fixed["test"]["matching"] == "fixed_threshold_selected_on_validation"
+        assert fixed["test"]["logit_threshold"] == pytest.approx(
+            fixed["validation_selection"]["selected"]["logit_threshold"]
+        )
+        assert fixed["test"]["graph_similarity"]["bfs_macro"] == pytest.approx(0.0)
         block = graph["per_subgraph_rd_matched"]
         assert isinstance(block, dict)
         assert block["matching"] == "per_subgraph_rd_1"
@@ -291,8 +335,27 @@ class TestRunTestProtocol:
                 score_runner=runner,
             )
 
-        assert runner.pairs_order == ["test", "test_topology"]
+        assert runner.pairs_order == ["val_topology", "test", "test_topology"]
         assert not (output_dir / "operating_point.json").exists()
+        assert not (output_dir / "test_report.json").exists()
+
+    def test_failing_validation_pass_never_opens_test(self, tmp_path: Path) -> None:
+        fixture = _build_fixture(tmp_path)
+        output_dir = tmp_path / "outputs" / "validation_failure"
+        runner = _FakeScoreRunner(fixture.artifacts, fail_on="val_topology")
+
+        with pytest.raises(RuntimeError, match="val_topology"):
+            run_test_protocol(
+                checkpoint=_write_checkpoint(tmp_path),
+                output_dir=output_dir,
+                data_root=fixture.data_root,
+                strategy=_STRATEGY,
+                arm="full",
+                seed=0,
+                score_runner=runner,
+            )
+
+        assert runner.pairs_order == ["val_topology"]
         assert not (output_dir / "test_report.json").exists()
 
     def test_failing_test_pass_leaves_no_report_written(self, tmp_path: Path) -> None:
@@ -312,7 +375,7 @@ class TestRunTestProtocol:
                 score_runner=runner,
             )
 
-        assert runner.pairs_order == ["test"]
+        assert runner.pairs_order == ["val_topology", "test"]
         assert not (output_dir / "operating_point.json").exists()
         assert not (output_dir / "test_report.json").exists()
 
@@ -339,7 +402,7 @@ class TestRunTestProtocol:
             rescore_reason="repeat scoring for gate re-run",
         )
 
-        for pairs_source in ("test", "test_topology"):
+        for pairs_source in ("val_topology", "test", "test_topology"):
             call = runner.call_for(pairs_source)
             assert _arg_value(call, "--pack-dir") == str(pack_dir)
             assert _arg_value(call, "--scaffold-control") == "shuffle_within_pair_v3"
@@ -347,6 +410,7 @@ class TestRunTestProtocol:
         for pairs_source in ("test", "test_topology"):
             call = runner.call_for(pairs_source)
             assert _arg_value(call, "--rescore-reason") == "repeat scoring for gate re-run"
+        assert "--rescore-reason" not in runner.call_for("val_topology")
 
     def test_omitted_optional_flags_are_never_forwarded(self, tmp_path: Path) -> None:
         fixture = _build_fixture(tmp_path)
@@ -412,11 +476,12 @@ class TestRunTestProtocol:
             score_runner=runner,
         )
 
-        # run_test_protocol validates the reloaded test artifact and test_topology;
+        # run_test_protocol validates validation plus both held-out artifacts;
         # report_edge_metrics validates test a second time
         # through its own bound import, which this spy (patched only on
         # test_protocol's namespace) does not observe.
         assert calls == [
+            str(fixture.artifacts["val_topology"]),
             str(fixture.artifacts["test"]),
             str(fixture.artifacts["test_topology"]),
         ]
@@ -524,7 +589,7 @@ class TestReuseExistingScores:
             reuse_existing_scores=True,
         )
 
-        assert runner.pairs_order == ["test_topology"]
+        assert runner.pairs_order == ["val_topology", "test_topology"]
 
     def test_reuse_is_opt_in(self, tmp_path: Path) -> None:
         """Implicit reuse would silently serve stale scores after a code fix."""
@@ -546,7 +611,7 @@ class TestReuseExistingScores:
             score_runner=runner,
         )
 
-        assert runner.pairs_order == ["test", "test_topology"]
+        assert runner.pairs_order == ["val_topology", "test", "test_topology"]
 
 
 class TestPublishedRunMetadataNeverClobbered:
@@ -831,7 +896,7 @@ class TestPublishedRunMetadataNeverClobbered:
         )
 
         assert published_path.read_bytes() == published_bytes_before
-        assert runner.pairs_order == ["test", "test_topology"]
+        assert runner.pairs_order == ["val_topology", "test", "test_topology"]
 
 
 class TestUniverseScopedCaches:
@@ -871,6 +936,15 @@ class TestUniverseScopedCaches:
         assert grounding_path is not None and grounding_path.endswith(
             "grounding_cache_test_support.npz"
         )
+        validation_call = runner.call_for("val_topology")
+        validation_f0 = _arg_value(validation_call, "--f0-cache")
+        validation_grounding = _arg_value(validation_call, "--grounding-cache")
+        assert validation_f0 is not None
+        assert validation_f0.endswith("f0_cache_vval_support.pt")
+        assert validation_grounding is not None
+        assert validation_grounding.endswith("grounding_cache_vval_support.npz")
+        assert validation_f0 != f0_path
+        assert validation_grounding != grounding_path
 
 
 class TestOneLedgerEpochPerProtocolRun:

@@ -1941,9 +1941,8 @@ class EgoStitchData:
             that build validation pairs by hand.
         val_topology_reference: The once-per-run topology-validation reference
             built from `val_split`, or `None` when `val_split` is absent.
-        val_ball_union: The once-per-run ball-union pair universe plus pinned
-            complement sample, built from `val_split`, or `None` when
-            `val_split` is absent.
+        val_ball_union: The exact once-per-run ball-union pair universe, built
+            from `val_split`, or `None` when `val_split` is absent.
         feature_stats: Registered training-universe standardization constants.
     """
 
@@ -3394,25 +3393,23 @@ def _score_val_universe_logits(
     *,
     edge_batch: int,
 ) -> NDArray[np.float64] | None:
-    """Score the ball-union U plus pinned complement sample's active-arm logits, exact DDP coverage.
+    """Score the exact ball-union active-arm logits with DDP coverage checks.
 
-    Rank-strided over the concatenation of `universe`'s U rows followed by its
-    complement-sample rows; every rank gathers and checks coverage identically
-    (DDP fail-closed -- a partial gather must never silently assemble the
-    topology graph from a subset of the universe). Active-arm logit only: no
+    Rank-strided over `universe`'s sampled-pair rows; every rank gathers and
+    checks coverage identically (DDP fail-closed -- a partial gather must never
+    silently assemble the topology graph from a subset of the universe). Active-arm logit only: no
     full/f_logit/dispersion columns, since only the assembled graph is read
     from this pass.
 
     Returns:
-        The row-ordered logit array (U rows then sample rows) on the main
-        process; ``None`` elsewhere.
+        The row-ordered ball-union logits on the main process; ``None`` elsewhere.
 
     Raises:
         ValueError: If the gathered rows do not cover the complete row set
             exactly once, on every rank.
     """
-    u_idx = np.concatenate([universe.u_idx, universe.sample_u_idx])
-    v_idx = np.concatenate([universe.v_idx, universe.sample_v_idx])
+    u_idx = universe.u_idx
+    v_idx = universe.v_idx
     n_rows = u_idx.shape[0]
     rank, world = accelerator.process_index, accelerator.num_processes
     row_ids = np.arange(rank, n_rows, world, dtype=np.int64)
@@ -3501,9 +3498,9 @@ def _validate_epoch(
     A second, lean pass follows the classification one when
     `data.val_topology_reference`/`data.val_ball_union` are set (absent only
     for toy fixtures that hand-build `val_pairs` with no derived V_val
-    region): it scores the deduplicated ball-union pairs U plus a pinned
-    complement sample's active-arm logit (`_score_val_universe_logits`) and
-    feeds `val_region_topology_metrics` for the five topology metrics. Both
+    region): it scores the exact deduplicated ball-union pairs U
+    (`_score_val_universe_logits`) and feeds `val_region_topology_metrics` for
+    sampled-only threshold selection and the five topology metrics. Both
     passes share one node-encoding cache built once over the complete V_val
     region.
     """
@@ -3712,8 +3709,8 @@ def _validate_epoch(
     gathered_values = accelerator.gather(local_values)
     gathered_rows = accelerator.gather(local_rows)
 
-    # Lean topology-universe pass: active-arm logit only, over the
-    # deduplicated ball-union pairs U plus a pinned complement sample. Runs on
+    # Lean topology-universe pass: active-arm logit only, over the exact
+    # deduplicated ball-union pairs U. Runs on
     # every rank (its own rank-strided gather and exact-coverage check),
     # mirroring the classification pass's DDP-fail-closed discipline -- a
     # partial gather here would silently assemble the topology graph from a
@@ -3780,20 +3777,15 @@ def _validate_epoch(
     }
     endpoint_degree = _e2e_validation_endpoint_degrees(data)
     val_threshold = 0.0
-    val_admitted_non_self_fraction = 0.0
     if reference is not None and ball_union is not None and universe_logits is not None:
-        n_u = ball_union.u_idx.shape[0]
         topology_result = val_region_topology_metrics(
             u_idx=ball_union.u_idx,
             v_idx=ball_union.v_idx,
-            logits=universe_logits[:n_u],
-            sample_logits=universe_logits[n_u:],
-            complement_total=ball_union.complement_total,
+            logits=universe_logits,
             reference=reference,
         )
         validation_topology = topology_result.metrics
         val_threshold = topology_result.threshold
-        val_admitted_non_self_fraction = topology_result.admitted_non_self_fraction
     else:
         validation_topology = TopologyValidationMetrics(
             gs=0.0, rd=0.0, degree_mmd=0.0, clustering_mmd=0.0, spectral_mmd=0.0
@@ -3811,7 +3803,6 @@ def _validate_epoch(
         "clustering_mmd_ratio": validation_topology.clustering_mmd,
         "spectral_mmd_ratio": validation_topology.spectral_mmd,
         "val_threshold": val_threshold,
-        "val_admitted_non_self_fraction": val_admitted_non_self_fraction,
         "prevalence": float(np.mean(data.val_labels)),
         **dispersion_summary,
         **e2e_degree_decorrelation_telemetry(endpoint_degree, full_np - f_np),
@@ -4459,7 +4450,7 @@ def _enforce_e2e_initial_slot_health(
             off the main process, so a rank-0-only raise is a DDP hang.
     """
     # This guard measures learned SlotSet geometry. FullOracleGenerator has no
-    # slots, plan, or trainable generator state, so running a complete V_val
+    # slots, plan, or trainable generator state, so running a V_val sampled-union
     # scoring pass here cannot evaluate the guard. Return before touching the
     # validation population or model state; ordinary epoch validation remains
     # unchanged and still supplies the diagnostic's selection metrics.
@@ -4630,7 +4621,7 @@ def _train_e2e_stability_loop(
     #
     # It is deliberately not gated on `profile_only`: a guard a flag can skip
     # is a guard that fails open. The cost is one extra full validation pass
-    # over the complete V_val pair universe per run, charged before the
+    # over the V_val sampled-pair union per run, charged before the
     # peak-memory counter is reset below and therefore outside the measured
     # training peak.
     initial_slot_health = _enforce_e2e_initial_slot_health(

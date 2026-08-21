@@ -12,7 +12,7 @@ CLI::
 
     python -m src.score_universe score \
         --checkpoint outputs/b0_v31/best.pt \
-        --pairs candidate|test|val_region|file:<path.tsv> \
+        --pairs candidate|test|test_topology|val_topology|file:<path.tsv> \
         --data-root data --strategy breadth_first \
         --output scores/b0_v31_candidate.npz \
         [--batch-pairs 8192] [--token-budget 131072] [--device auto|cpu|cuda|mps] \
@@ -65,6 +65,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from itertools import combinations_with_replacement
 from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -92,7 +93,6 @@ from src.data.val_region import (
     ValRegionParams,
     ValRegionSplit,
     derive_val_region_split,
-    val_universe_arrays,
 )
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.model.egostitch.generator.assemble import make_scaffold_input_perturbation
@@ -122,7 +122,7 @@ _META_KEYS = (
     "created_utc",
     "torch_version",
 )
-_NAMED_PAIR_SOURCES = ("candidate", "test", "test_topology", "val_region")
+_NAMED_PAIR_SOURCES = ("candidate", "test", "test_topology", "val_topology")
 #: `derive_val_region_split`'s parameters for `_load_val_region_split`'s
 #: production re-derivation; the test seam a small monkeypatched value lets
 #: synthetic fixtures satisfy (`ValRegionParams`'s own defaults assume a
@@ -491,7 +491,7 @@ def _is_heldout_universe(meta: Mapping[str, object]) -> bool:
     Held-out access is a data-boundary property of the family and pairs
     source, not of registration: family ``egostitch_e2e`` scoring the
     ``candidate``/``test`` manifests or an arbitrary ``file:`` source reads
-    from the held-out universe. Everything else (``val_region``, other
+    from the held-out universe. Everything else (``val_topology``, other
     families) is not a held-out claim.
 
     An ``oracle_diagnostic`` artifact is excluded unconditionally, even when
@@ -1595,9 +1595,8 @@ def _load_val_region_split(data_root: Path, strategy: str) -> ValRegionSplit:
     validation topology -- is exactly what training validates against and
     never a re-derivation that could quietly drift from it.
 
-    Shared by the ``val_region`` pairs source (the real validation-region
-    universe EgoStitch trains against) and the ``val_region``-truth oracle
-    diagnostic graph.
+    Shared by the sampled-union ``val_topology`` source and its V_val-truth
+    oracle diagnostic graph.
 
     Args:
         data_root: Directory containing ``benchmark_2025_neurips/``.
@@ -1638,35 +1637,27 @@ def _load_val_region_split(data_root: Path, strategy: str) -> ValRegionSplit:
     )
 
 
-def _resolve_val_region_pairs(
+def _resolve_val_topology_pairs(
     data_root: Path, strategy: str
 ) -> tuple[list[tuple[str, str]], NDArray[np.int8]]:
-    """Materialize the complete labeled ``V_val`` pair universe EgoStitch trains against.
+    """Materialize only the pair union used by sampled V_val topology balls.
 
-    This is *not* ``val_edges.txt`` (the benchmark's own model-selection
-    manifest): it is the complete ``C(n,2)+n`` pair/label universe over the
-    validation-region ``V_val`` node set (:func:`_load_val_region_split`'s
-    ``v_val``, in :func:`~src.data.val_region.val_universe_arrays`'s
-    canonical row order), the actual validation topology EgoStitch's training
-    loop scores -- self rows included, mirroring the candidate universe's own
-    ``C(n,2)+n`` convention rather than the old self-loop-free ``V_hold``
-    universe. A row is positive exactly when it is a member of
-    :meth:`~src.data.val_region.ValRegionSplit.build_g_val`'s edge set (a self
-    row is positive exactly where the truth graph carries that self-loop).
-
-    Args:
-        data_root: Directory containing ``benchmark_2025_neurips/``.
-        strategy: Split strategy name (e.g. ``breadth_first``).
-
-    Returns:
-        ``(pairs, labels)``, aligned index-for-index, in canonical row order.
+    A support-only self row is retained for every V_val node so EgoStitch's F0
+    and grounding pool remain identical to the complete V_val role universe.
     """
     split = _load_val_region_split(data_root, strategy)
-    nodes = sorted(split.v_val)
-    u_idx, v_idx = val_universe_arrays(split.v_val)
-    pairs = [(nodes[u], nodes[v]) for u, v in zip(u_idx.tolist(), v_idx.tolist(), strict=True)]
+    pair_set = {
+        canonical_pair(u, v)
+        for node_sets in split.buckets.values()
+        for nodes in node_sets
+        for u, v in combinations_with_replacement(sorted(nodes), 2)
+    }
+    pair_set.update((node, node) for node in split.v_val)
+    pairs = sorted(pair_set)
     positives = frozenset(split.val_positives)
-    labels = np.array([1 if pair in positives else 0 for pair in pairs], dtype=np.int8)
+    labels = np.fromiter(
+        (int(pair in positives) for pair in pairs), dtype=np.int8, count=len(pairs)
+    )
     return pairs, labels
 
 
@@ -1682,7 +1673,7 @@ def _oracle_truth_graph_for_scoring(pairs_source: str, data_root: Path, strategy
     - ``test``/``candidate``/``file:*``: the labeled benchmark test graph
       (self-loop-stripped, matching ``EgoTargetBuilder``'s self-loop-free
       requirement) -- the R2 diagnostic ceiling.
-    - ``val_region``: the V_val validation-region truth topology
+    - ``val_topology``: the V_val validation-region truth topology
       (:func:`_load_val_region_split`'s ``build_g_val_simple()``), already
       self-loop-free by construction.
 
@@ -1708,12 +1699,13 @@ def _oracle_truth_graph_for_scoring(pairs_source: str, data_root: Path, strategy
         from src.experiments.g1_hardened_e2 import load_test_graph
 
         return strip_self_loops(load_test_graph(data_root / _BENCHMARK_SUBDIR, strategy))
-    if pairs_source == "val_region":
+    if pairs_source == "val_topology":
         return _load_val_region_split(data_root, strategy).build_g_val_simple()
     raise ValueError(
         f"oracle_struct scoring has no diagnostic truth graph for --pairs {pairs_source!r}; "
         "supported sources are test/candidate/test_topology/file:<path> (the labeled test graph, "
-        "oracle-scaffold design doc Row R2) and val_region (V_val validation-region truth)"
+        "oracle-scaffold design doc Row R2) and val_topology "
+        "(V_val validation-region truth)"
     )
 
 
@@ -1778,16 +1770,13 @@ def _resolve_pairs(
     """Resolve a ``--pairs`` spec to canonical pairs plus labels, in file row order.
 
     Args:
-        pairs_source: ``candidate``, ``test``, ``test_topology``, ``val_region``, or
+        pairs_source: ``candidate``, ``test``, ``test_topology``, ``val_topology``, or
             ``file:<path.tsv>``.
         data_root: Directory containing ``benchmark_2025_neurips/`` and
             ``features/frozen_node_features_1024/``.
         strategy: Split strategy name (e.g. ``breadth_first``).
         test_access: Held-out scoring identity to append before the pair manifest
-            is read; ``None`` for non-held-out sources. ``val_region`` is never
-            held-out (:func:`_is_heldout_universe`) and must always pass ``None``
-            here: it is the internal validation universe, not the benchmark's
-            held-out test/candidate/test_topology manifests.
+            is read; ``None`` for the non-held-out ``val_topology`` source.
 
     Returns:
         ``(pairs, labels)``, aligned index-for-index.
@@ -1806,8 +1795,8 @@ def _resolve_pairs(
         return labeled.pairs, labeled.labels
     if pairs_source == "test":
         return _read_pairs_tsv(benchmark_root / strategy / f"{pairs_source}_edges.txt")
-    if pairs_source == "val_region":
-        return _resolve_val_region_pairs(data_root, strategy)
+    if pairs_source == "val_topology":
+        return _resolve_val_topology_pairs(data_root, strategy)
     if pairs_source.startswith("file:"):
         return _read_pairs_tsv(Path(pairs_source[len("file:") :]))
     raise ValueError(
@@ -2215,7 +2204,8 @@ def _score_egostitch_e2e(
             when ``None``).
         role_universe: The scored universe's role identity, namespacing the
             grounding-pool cache so it matches the training-side pool: `"test"`
-            for the test/candidate/test_topology/file sources, `"V_val"` for `val_region`.
+            for test/candidate/test_topology/file sources, `"V_val"` for
+            val_topology.
         scaffold_control: Optional registered within-pair scaffold perturbation.
         universe_pairs: Full input universe used to keep grounding pools stable
             when this scorer receives a contiguous shard.
@@ -3004,7 +2994,10 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument(
         "--pairs",
         required=True,
-        help="candidate | test | val_region | file:<path.tsv> (TSV rows: u\\tv[\\tlabel])",
+        help=(
+            "candidate | test | test_topology | val_topology | "
+            "file:<path.tsv> (TSV rows: u\\tv[\\tlabel])"
+        ),
     )
     score.add_argument("--data-root", type=Path, default=Path("data"))
     score.add_argument("--strategy", default="breadth_first")
@@ -3203,8 +3196,9 @@ def _run_score(args: argparse.Namespace) -> None:
         # whose generator was already `oracle_struct` (the pre-correction R1
         # run), so a checkpoint's training provenance cannot be relied on to
         # gate this. What is always true is that *scoring* test/candidate/
-        # val_region pairs through an oracle generator means feeding it the true
-        # topology for the test/candidate/test_topology/val_region query -- a truth-consuming
+        # val_topology pairs through an oracle generator means feeding it the true
+        # topology for the test/candidate/test_topology/val_topology query -- a
+        # truth-consuming
         # ceiling diagnostic every time, regardless of how the checkpoint was
         # trained. Requiring an explicit, scoring-time operator flag (rather
         # than an automatic run_kind check) is what keeps this unreachable
@@ -3377,7 +3371,7 @@ def _run_score(args: argparse.Namespace) -> None:
                 token_budget=args.token_budget,
                 f0_cache=args.f0_cache,
                 grounding_cache=args.grounding_cache,
-                role_universe="V_val" if args.pairs == "val_region" else "test",
+                role_universe="V_val" if args.pairs == "val_topology" else "test",
                 scaffold_control=args.scaffold_control,
                 universe_pairs=pairs,
                 row_start=start,
@@ -3426,7 +3420,7 @@ def _run_score(args: argparse.Namespace) -> None:
             meta_extra["oracle_diagnostic"] = {
                 "generator": oracle_generator_name,
                 "truth_source": (
-                    "val_region_g_val" if args.pairs == "val_region" else "test_graph"
+                    "val_topology_g_val" if args.pairs == "val_topology" else "test_graph"
                 ),
                 "diagnostic_only": True,
                 "formal": False,

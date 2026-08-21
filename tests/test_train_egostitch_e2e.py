@@ -82,7 +82,6 @@ _EXPECTED_FIDELITY_KEYS = {
     "clustering_mmd_ratio",
     "spectral_mmd_ratio",
     "val_threshold",
-    "val_admitted_non_self_fraction",
     "prevalence",
     "pi_slot_std",
     "h_pairwise_cosine_mean",

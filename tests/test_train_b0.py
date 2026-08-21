@@ -812,9 +812,7 @@ class TestWriteOutputs:
             last_val_metrics=metrics,
             history=[{"epoch": 1, "train_loss": 0.5, "val_auroc": 0.8, "val_auprc": 0.75}],
             stopped_early=False,
-            val_threshold_transfer=ValThresholdTransfer(
-                n_val=17, gold_loopless_edges=42, threshold=0.37, admitted_non_self_fraction=0.021
-            ),
+            val_threshold_transfer=ValThresholdTransfer(n_val=17, threshold=0.37),
         )
         output_dir.mkdir(parents=True)
         (output_dir / "metrics.jsonl").write_text('{"epoch": 1}\n', encoding="utf-8")
@@ -824,9 +822,7 @@ class TestWriteOutputs:
         run_metadata = json.loads((output_dir / "run_metadata.json").read_text())
         assert run_metadata["val_threshold_transfer"] == {
             "n_val": 17,
-            "gold_loopless_edges": 42,
             "threshold": 0.37,
-            "admitted_non_self_fraction": 0.021,
         }
 
 
@@ -1216,14 +1212,11 @@ def test_two_pass_evaluate_fn_produces_cls_metrics_and_finite_topology(
     reference = build_val_topology_reference(val_split)
     universe = val_ball_union_universe(val_split)
     u_idx, v_idx = universe.u_idx, universe.v_idx
-    n_u = len(u_idx)
     node_index = table.manifest.node_index()
     lengths_by_node = {record.node_id: record.length for record in table.manifest.nodes}
     node_positions = np.array([node_index[node] for node in reference.nodes], dtype=np.int64)
-    all_u_idx = np.concatenate([universe.u_idx, universe.sample_u_idx])
-    all_v_idx = np.concatenate([universe.v_idx, universe.sample_v_idx])
-    node_a_all = torch.from_numpy(node_positions[all_u_idx]).to(torch.int64)
-    node_b_all = torch.from_numpy(node_positions[all_v_idx]).to(torch.int64)
+    node_a_all = torch.from_numpy(node_positions[universe.u_idx]).to(torch.int64)
+    node_b_all = torch.from_numpy(node_positions[universe.v_idx]).to(torch.int64)
     boundary = max(lengths_by_node[node] for node in reference.nodes)
 
     val_cls_pairs, _val_cls_labels = _val_cls_rows(val_split, assembled.exclude_nodes)
@@ -1239,8 +1232,6 @@ def test_two_pass_evaluate_fn_produces_cls_metrics_and_finite_topology(
             batch_pairs=8,
             u_idx=u_idx,
             v_idx=v_idx,
-            n_u=n_u,
-            complement_total=universe.complement_total,
             reference=reference,
         ),
     )
@@ -1266,7 +1257,6 @@ def test_two_pass_evaluate_fn_produces_cls_metrics_and_finite_topology(
             outcome.topology.metrics.clustering_mmd,
             outcome.topology.metrics.spectral_mmd,
             outcome.topology.threshold,
-            outcome.topology.admitted_non_self_fraction,
         )
     )
 
@@ -1581,9 +1571,6 @@ def test_epoch_probe_uses_disposable_artifact_directory(
         lambda val_split, **kwargs: SimpleNamespace(
             u_idx=np.array([0], dtype=np.int32),
             v_idx=np.array([0], dtype=np.int32),
-            sample_u_idx=np.array([], dtype=np.int32),
-            sample_v_idx=np.array([], dtype=np.int32),
-            complement_total=0,
         ),
     )
     monkeypatch.setattr(
@@ -1835,18 +1822,12 @@ def test_evaluate_val_universe_coverage_failure_raises_on_non_main_rank() -> Non
             batch_pairs=4,
             u_idx=u_idx,
             v_idx=v_idx,
-            n_u=4,
-            complement_total=0,
             reference=cast(ValTopologyReference, None),
         )
 
 
 class _EchoUniverseTable:
-    """Duck-typed packed-table stand-in whose embedding echoes the node index.
-
-    Lets a test recover exactly which node each scored row carried, so the
-    U-vs-complement-sample split point (`n_u`) can be checked directly.
-    """
+    """Duck-typed packed-table stand-in whose embedding echoes the node index."""
 
     def gather_nodes(
         self, node_indices: torch.Tensor, boundary: int
@@ -1862,16 +1843,10 @@ class _EchoUniverseModel(nn.Module):
         return {"logits": batch["emb_a"][:, 0, 0]}
 
 
-def test_evaluate_val_universe_splits_gathered_logits_at_n_u(
+def test_evaluate_val_universe_forwards_only_ball_union_logits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The gathered, row-ID-sorted logits must split U-rows-first at `n_u`.
-
-    `node_a_all` concatenates 3 U rows then 2 pinned complement-sample rows;
-    the echo model reports each row's node index as its logit, so the split
-    is verified by which values reach `val_region_topology_metrics` as
-    `logits` (U) vs `sample_logits` (complement).
-    """
+    """The gathered, row-ID-sorted logits are exactly the sampled union."""
     captured: dict[str, object] = {}
 
     def fake_val_region_topology_metrics(
@@ -1879,21 +1854,16 @@ def test_evaluate_val_universe_splits_gathered_logits_at_n_u(
         u_idx: np.ndarray,
         v_idx: np.ndarray,
         logits: np.ndarray,
-        sample_logits: np.ndarray,
-        complement_total: int,
         reference: object,
     ) -> ValTopologyResult:
         captured["u_idx"] = u_idx
         captured["v_idx"] = v_idx
         captured["logits"] = logits
-        captured["sample_logits"] = sample_logits
-        captured["complement_total"] = complement_total
         return ValTopologyResult(
             metrics=TopologyValidationMetrics(
                 gs=1.0, rd=1.0, degree_mmd=0.0, clustering_mmd=0.0, spectral_mmd=0.0
             ),
             threshold=0.5,
-            admitted_non_self_fraction=0.1,
         )
 
     monkeypatch.setattr(
@@ -1902,9 +1872,8 @@ def test_evaluate_val_universe_splits_gathered_logits_at_n_u(
 
     model = _EchoUniverseModel()
     table = cast(PackedFeatureTable, _EchoUniverseTable())
-    # U rows carry node indices 10, 20, 30; the complement sample carries 900, 901.
-    node_a_all = torch.tensor([10, 20, 30, 900, 901], dtype=torch.int64)
-    node_b_all = torch.zeros(5, dtype=torch.int64)
+    node_a_all = torch.tensor([10, 20, 30], dtype=torch.int64)
+    node_b_all = torch.zeros(3, dtype=torch.int64)
     u_idx = np.array([0, 1, 2], dtype=np.int32)
     v_idx = np.array([0, 1, 2], dtype=np.int32)
 
@@ -1915,19 +1884,14 @@ def test_evaluate_val_universe_splits_gathered_logits_at_n_u(
         node_a_all=node_a_all,
         node_b_all=node_b_all,
         boundary=1,
-        batch_pairs=5,
+        batch_pairs=3,
         u_idx=u_idx,
         v_idx=v_idx,
-        n_u=3,
-        complement_total=2,
         reference=cast(ValTopologyReference, None),
     )
 
     np.testing.assert_array_equal(cast(np.ndarray, captured["logits"]), [10.0, 20.0, 30.0])
-    np.testing.assert_array_equal(cast(np.ndarray, captured["sample_logits"]), [900.0, 901.0])
-    assert captured["complement_total"] == 2
     assert result.threshold == pytest.approx(0.5)
-    assert result.admitted_non_self_fraction == pytest.approx(0.1)
     assert result.metrics.gs == pytest.approx(1.0)
 
 
@@ -1950,20 +1914,18 @@ def test_topology_from_metrics_row_parses_new_keys() -> None:
         "val_clustering_mmd_ratio": 0.2,
         "val_spectral_mmd_ratio": 0.3,
         "val_threshold": 0.42,
-        "val_admitted_non_self_fraction": 0.01,
     }
     assert _topology_from_metrics_row(row) == ValTopologyResult(
         metrics=TopologyValidationMetrics(
             gs=0.5, rd=1.0, degree_mmd=0.1, clustering_mmd=0.2, spectral_mmd=0.3
         ),
         threshold=0.42,
-        admitted_non_self_fraction=0.01,
     )
 
 
 def test_topology_from_metrics_row_rejects_row_missing_threshold_transfer_fields() -> None:
     # A pre-ball-union-universe V_val row: the five topology metrics are
-    # present but `val_threshold`/`val_admitted_non_self_fraction` are not.
+    # present but the sampled-only `val_threshold` is not.
     # This must fail closed the same way an old-style (pre-V_val) row does,
     # never silently parse a stale-schema row.
     row: dict[str, object] = {
@@ -2457,7 +2419,7 @@ def test_ddp_loop_resume_matches_uninterrupted_epoch_boundary(tmp_path: Path) ->
 
 
 def test_ddp_loop_resume_round_trips_threshold_transfer_fields(tmp_path: Path) -> None:
-    """Check `val_threshold`/`val_admitted_non_self_fraction` survive a resume.
+    """Check the sampled-only `val_threshold` survives a resume.
 
     Round-tripped through metrics.jsonl and reconstructed by
     `_topology_from_metrics_row`.
@@ -2477,7 +2439,6 @@ def test_ddp_loop_resume_round_trips_threshold_transfer_fields(tmp_path: Path) -
                 spectral_mmd=0.1,
             ),
             threshold=0.3 + 0.01 * epoch,
-            admitted_non_self_fraction=0.02 + 0.001 * epoch,
         )
 
     prior_dir = tmp_path / "prior"
@@ -2509,9 +2470,6 @@ def test_ddp_loop_resume_round_trips_threshold_transfer_fields(tmp_path: Path) -
         json.loads(line) for line in (prior_dir / "metrics.jsonl").read_text().splitlines()
     ]
     assert prior_rows[0]["val_threshold"] == pytest.approx(topology_for(1).threshold)
-    assert prior_rows[0]["val_admitted_non_self_fraction"] == pytest.approx(
-        topology_for(1).admitted_non_self_fraction
-    )
 
     resumed_dir = tmp_path / "resumed"
     (resumed_dir / "checkpoints").mkdir(parents=True)
@@ -2544,18 +2502,12 @@ def test_ddp_loop_resume_round_trips_threshold_transfer_fields(tmp_path: Path) -
     assert [row["epoch"] for row in resumed.history] == [1, 2, 3]
     for epoch, entry in enumerate(resumed.history, start=1):
         assert entry["val_threshold"] == pytest.approx(topology_for(epoch).threshold)
-        assert entry["val_admitted_non_self_fraction"] == pytest.approx(
-            topology_for(epoch).admitted_non_self_fraction
-        )
     resumed_rows = [
         json.loads(line) for line in (resumed_dir / "metrics.jsonl").read_text().splitlines()
     ]
     assert len(resumed_rows) == 3
     for epoch, row in enumerate(resumed_rows, start=1):
         assert row["val_threshold"] == pytest.approx(topology_for(epoch).threshold)
-        assert row["val_admitted_non_self_fraction"] == pytest.approx(
-            topology_for(epoch).admitted_non_self_fraction
-        )
 
 
 def test_ddp_loop_resume_rejects_epoch_missing_threshold_transfer_fields(

@@ -1156,25 +1156,15 @@ def assemble_data(
 
 @dataclass(frozen=True)
 class ValThresholdTransfer:
-    """V_val threshold-transfer metadata for the selected checkpoint's epoch.
-
-    Lets a future test-time operating point be derived by degree-density
-    transfer without re-scoring V_val.
+    """Sampled-only V_val threshold metadata for the selected checkpoint.
 
     Attributes:
         n_val: `len(reference.nodes)` — the V_val node-region size.
-        gold_loopless_edges: The V_val gold loopless edge count (the
-            density-match target).
-        threshold: The selected epoch's estimated full-universe
-            density-matched assembly threshold.
-        admitted_non_self_fraction: The selected epoch's estimated admitted
-            non-self-pair fraction at that threshold.
+        threshold: The selected epoch's deployable sampled-subgraph threshold.
     """
 
     n_val: int
-    gold_loopless_edges: int
     threshold: float
-    admitted_non_self_fraction: float
 
 
 @dataclass
@@ -2393,40 +2383,30 @@ def _evaluate_val_universe(
     batch_pairs: int,
     u_idx: np.ndarray,
     v_idx: np.ndarray,
-    n_u: int,
-    complement_total: int,
     reference: ValTopologyReference,
 ) -> ValTopologyResult:
-    """Score the ball-union U rows plus the pinned complement sample and compute topology.
+    """Score the exact ball-union rows and select sampled-only topology threshold.
 
     Mirrors `_evaluate_distributed`'s DDP fail-closed gather discipline: every
-    rank scores its `range(rank, n, world)` shard of the concatenated
-    `node_a_all`/`node_b_all` rows (U rows first, then the complement sample)
+    rank scores its `range(rank, n, world)` shard of the ball-union
+    `node_a_all`/`node_b_all` rows
     through the same packed-table forward path as the cls pairs, the padded
     logits are gathered onto every rank, and `validate_gathered_validation`
-    enforces exact once-per-row coverage on every rank. Rank zero then splits
-    the gathered logits at `n_u` into the U-row logits and the complement
-    sample logits, computes `val_region_topology_metrics`, and broadcasts the
-    result so every rank agrees.
+    enforces exact once-per-row coverage on every rank. Rank zero computes
+    `val_region_topology_metrics` and broadcasts the result so every rank agrees.
 
     Args:
         model: The scorer (restored to train mode before returning).
         accelerator: The DDP accelerator.
         table: Packed feature table resident on the training device.
-        node_a_all: `(n_u + n_sample,)` packed row index of the concatenated
-            U-then-complement-sample row set, row-ID order.
-        node_b_all: `(n_u + n_sample,)` packed row index, aligned with
-            `node_a_all`.
+        node_a_all: Packed row index of the exact sampled-pair union.
+        node_b_all: Packed row index aligned with `node_a_all`.
         boundary: Token-sequence padding boundary shared by every V_val node.
         batch_pairs: Rows scored per no-grad forward call.
         u_idx: `(n_u,)` `reference.nodes` index for the U rows only, row-ID
             order (from `val_ball_union_universe`).
         v_idx: `(n_u,)` `reference.nodes` index for the U rows only, aligned
             with `u_idx`.
-        n_u: Row count of U — the split point between U logits and complement
-            sample logits in the gathered, row-ID-sorted logits.
-        complement_total: True size of the out-of-ball non-self complement
-            population the pinned sample was drawn from.
         reference: The once-per-run `ValTopologyReference`.
 
     Returns:
@@ -2487,14 +2467,10 @@ def _evaluate_val_universe(
 
     payload: list[dict[str, Any] | None] = [None]
     if accelerator.is_main_process:
-        u_logits = logits_sorted[:n_u].astype(np.float64)
-        sample_logits = logits_sorted[n_u:].astype(np.float64)
         result = val_region_topology_metrics(
             u_idx=u_idx,
             v_idx=v_idx,
-            logits=u_logits,
-            sample_logits=sample_logits,
-            complement_total=complement_total,
+            logits=logits_sorted.astype(np.float64),
             reference=reference,
         )
         payload[0] = asdict(result)
@@ -2507,7 +2483,6 @@ def _evaluate_val_universe(
     return ValTopologyResult(
         metrics=TopologyValidationMetrics(**metrics_payload),
         threshold=cast(float, result_payload["threshold"]),
-        admitted_non_self_fraction=cast(float, result_payload["admitted_non_self_fraction"]),
     )
 
 
@@ -2532,9 +2507,8 @@ def _topology_from_metrics_row(row: dict[str, object]) -> ValTopologyResult | No
     """Reconstruct the selector's V_val topology result from one persisted epoch row.
 
     Returns `None` for a row missing any of the five topology metrics or the
-    threshold-transfer fields (`val_threshold`, `val_admitted_non_self_fraction`)
-    added by the ball-union-universe protocol — a pre-V_val row (old key
-    names) or a pre-ball-union V_val row alike: resume then falls back to
+    sampled-only `val_threshold` field. A row from an older validation protocol
+    then falls back to
     `require_topology`'s fail-closed behavior ("resume across the V_val
     protocol change unsupported") rather than silently mixing metric
     semantics.
@@ -2546,7 +2520,6 @@ def _topology_from_metrics_row(row: dict[str, object]) -> ValTopologyResult | No
         "val_clustering_mmd_ratio",
         "val_spectral_mmd_ratio",
         "val_threshold",
-        "val_admitted_non_self_fraction",
     )
     if not all(key in row for key in keys):
         return None
@@ -2559,7 +2532,6 @@ def _topology_from_metrics_row(row: dict[str, object]) -> ValTopologyResult | No
             spectral_mmd=float(cast(float, row["val_spectral_mmd_ratio"])),
         ),
         threshold=float(cast(float, row["val_threshold"])),
-        admitted_non_self_fraction=float(cast(float, row["val_admitted_non_self_fraction"])),
     )
 
 
@@ -3072,9 +3044,8 @@ def train_ddp_loop(
             e.g. a resume across the V_val protocol change). Unit-test stubs
             that inject an `evaluate_fn` without topology keep `False`.
         val_topology_reference: The once-per-run `ValTopologyReference`, used
-            only to attach `TrainResult.val_threshold_transfer` (node count,
-            gold edge count) alongside the selected epoch's threshold and
-            admitted-fraction. `None` leaves that field unset.
+            only to attach `TrainResult.val_threshold_transfer` (node count
+            and sampled-only threshold). `None` leaves that field unset.
 
     Returns:
         The `TrainResult`, identical across ranks except for the main-rank-only
@@ -3523,7 +3494,6 @@ def train_ddp_loop(
                     "val_clustering_mmd_ratio": outcome.topology.metrics.clustering_mmd,
                     "val_spectral_mmd_ratio": outcome.topology.metrics.spectral_mmd,
                     "val_threshold": outcome.topology.threshold,
-                    "val_admitted_non_self_fraction": outcome.topology.admitted_non_self_fraction,
                 }
             )
         history.append(entry)
@@ -3762,9 +3732,7 @@ def train_ddp_loop(
         if selected_topology is not None:
             val_threshold_transfer = ValThresholdTransfer(
                 n_val=len(val_topology_reference.nodes),
-                gold_loopless_edges=val_topology_reference.target_edges,
                 threshold=selected_topology.threshold,
-                admitted_non_self_fraction=selected_topology.admitted_non_self_fraction,
             )
 
     last_state: dict[str, torch.Tensor] = {}
@@ -4154,14 +4122,11 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
     reference = build_val_topology_reference(val_split)
     universe = val_ball_union_universe(val_split)
     u_idx, v_idx = universe.u_idx, universe.v_idx
-    n_u = len(u_idx)
     node_index = table.manifest.node_index()
     lengths_by_node = {record.node_id: record.length for record in table.manifest.nodes}
     node_positions = np.array([node_index[node] for node in reference.nodes], dtype=np.int64)
-    all_u_idx = np.concatenate([universe.u_idx, universe.sample_u_idx])
-    all_v_idx = np.concatenate([universe.v_idx, universe.sample_v_idx])
-    node_a_all = torch.from_numpy(node_positions[all_u_idx]).to(torch.int64)
-    node_b_all = torch.from_numpy(node_positions[all_v_idx]).to(torch.int64)
+    node_a_all = torch.from_numpy(node_positions[universe.u_idx]).to(torch.int64)
+    node_b_all = torch.from_numpy(node_positions[universe.v_idx]).to(torch.int64)
     universe_boundary = max(lengths_by_node[node] for node in reference.nodes)
 
     val_cls_pairs, val_cls_labels = _val_cls_rows(val_split, assembled.exclude_nodes)
@@ -4209,8 +4174,6 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                     batch_pairs=runtime.max_pairs_per_rank,
                     u_idx=u_idx,
                     v_idx=v_idx,
-                    n_u=n_u,
-                    complement_total=universe.complement_total,
                     reference=reference,
                 ),
             ),

@@ -365,82 +365,25 @@ class TestValBallUnionUniverse:
         assert self_pair_indices == covered
         assert covered != set(range(len(nodes))), "fixture must leave some nodes uncovered"
 
-    def test_complement_correctness(self) -> None:
-        split, v_val = self._tiny_split()
-        n = len(v_val)
-        result = val_ball_union_universe(split, sample_size=1000)
-
-        union_rows = set(zip(result.u_idx.tolist(), result.v_idx.tolist(), strict=True))
-        nonself_union_count = sum(1 for u, v in union_rows if u != v)
-        assert result.complement_total == math.comb(n, 2) - nonself_union_count
-
-        sample_rows = list(
-            zip(result.sample_u_idx.tolist(), result.sample_v_idx.tolist(), strict=True)
-        )
-        assert len(sample_rows) == min(1000, result.complement_total)
-        assert len(set(sample_rows)) == len(sample_rows), "sample must have no duplicates"
-        for u, v in sample_rows:
-            assert u != v
-            assert (u, v) not in union_rows
-            assert 0 <= u < n
-            assert 0 <= v < n
-
     def test_determinism_across_calls(self) -> None:
         split, _ = self._tiny_split()
 
-        result1 = val_ball_union_universe(split, sample_size=5)
-        result2 = val_ball_union_universe(split, sample_size=5)
+        result1 = val_ball_union_universe(split)
+        result2 = val_ball_union_universe(split)
 
         assert np.array_equal(result1.u_idx, result2.u_idx)
         assert np.array_equal(result1.v_idx, result2.v_idx)
-        assert np.array_equal(result1.sample_u_idx, result2.sample_u_idx)
-        assert np.array_equal(result1.sample_v_idx, result2.sample_v_idx)
-
-    def test_sample_size_at_least_complement_returns_entire_complement_sorted(self) -> None:
-        split, v_val = self._tiny_split()
-        n = len(v_val)
-        result = val_ball_union_universe(split, sample_size=10_000)
-
-        union_rows = set(zip(result.u_idx.tolist(), result.v_idx.tolist(), strict=True))
-        full_nonself = {(u, v) for u in range(n) for v in range(u + 1, n)}
-        expected_complement = sorted(full_nonself - union_rows)
-
-        sample_rows = list(
-            zip(result.sample_u_idx.tolist(), result.sample_v_idx.tolist(), strict=True)
-        )
-        assert sample_rows == expected_complement
-        assert len(sample_rows) == result.complement_total
-
-    def test_sample_size_zero_gives_empty_typed_arrays(self) -> None:
-        split, _ = self._tiny_split()
-
-        result = val_ball_union_universe(split, sample_size=0)
-
-        assert result.sample_u_idx.shape == (0,)
-        assert result.sample_v_idx.shape == (0,)
-        assert result.sample_u_idx.dtype == np.int32
-        assert result.sample_v_idx.dtype == np.int32
 
     def test_canonical_order_and_dtype(self) -> None:
         split, _ = self._tiny_split()
 
-        result = val_ball_union_universe(split, sample_size=1000)
+        result = val_ball_union_universe(split)
 
-        for u_idx, v_idx in (
-            (result.u_idx, result.v_idx),
-            (result.sample_u_idx, result.sample_v_idx),
-        ):
-            assert u_idx.dtype == np.int32
-            assert v_idx.dtype == np.int32
-            assert np.all(u_idx <= v_idx)
-            rows = list(zip(u_idx.tolist(), v_idx.tolist(), strict=True))
-            assert rows == sorted(rows)
-
-    def test_raises_on_negative_sample_size(self) -> None:
-        split, _ = self._tiny_split()
-
-        with pytest.raises(ValueError, match="sample_size"):
-            val_ball_union_universe(split, sample_size=-1)
+        assert result.u_idx.dtype == np.int32
+        assert result.v_idx.dtype == np.int32
+        assert np.all(result.u_idx <= result.v_idx)
+        rows = list(zip(result.u_idx.tolist(), result.v_idx.tolist(), strict=True))
+        assert rows == sorted(rows)
 
     def test_raises_on_empty_buckets(self) -> None:
         split = _make_split({"a", "b"}, {})
