@@ -14,6 +14,7 @@ from src.data.artifacts import (
     canonical_pair,
     load_benchmark,
     load_candidate_pairs,
+    load_test_topology_pairs,
     verify_benchmark,
 )
 
@@ -232,3 +233,18 @@ class TestSyntheticBenchmarkPackage:
         ]
         np.testing.assert_array_equal(candidate_pairs.labels, np.array([1, 0, 1, 1, 0, 0]))
         assert candidate_pairs.labels.dtype == np.int8
+
+    def test_load_test_topology_pairs_is_exact_sample_union(self, synthetic_package: Path) -> None:
+        strategy_dir = synthetic_package / "synthetic"
+        with (strategy_dir / "test_node_buckets.pkl").open("wb") as handle:
+            pickle.dump({2: [{"n5", "n6"}]}, handle)
+
+        topology_pairs = load_test_topology_pairs(synthetic_package, "synthetic")
+
+        assert topology_pairs.pairs == [
+            ("n5", "n5"),
+            ("n5", "n6"),
+            ("n6", "n6"),
+            ("n7", "n7"),
+        ]
+        np.testing.assert_array_equal(topology_pairs.labels, np.array([1, 1, 0, 0]))

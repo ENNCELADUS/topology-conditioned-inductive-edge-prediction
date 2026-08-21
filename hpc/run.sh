@@ -29,7 +29,7 @@ after the config path to train a formal EgoStitch E2E config, or use
 (`model.family: egostitch_e2e`) instead. Direct `python -m src.train_b0
 --max-steps N` remains debug-only (bounded smoke runs); it is never a formal E2
 training run. `src.e2_pipeline` runs four stages, `pack -> train -> publish ->
-test`: the test stage scores this checkpoint's held-out test/candidate
+test`: the test stage scores this checkpoint's held-out test/test_topology
 universes and writes `test_report.json` immediately after publish, so scoring
 is never a separate manual follow-up command; `--max-steps` debug runs skip it.
 Only `egostitch_e2e` is ledgered against repeat scoring — re-running an
@@ -45,7 +45,7 @@ shard per visible GPU, waits for every shard, and strictly merges them into the
 requested output; this runner does not duplicate that sharding or validation.
 The test command is a thin passthrough to `python -m src.eval.test_protocol`
 for one published checkpoint: score test -> fixed-0.5 edge metrics -> score
-candidate -> global density-matched graph metrics -> `test_report.json`.
+test_topology -> per-subgraph RD-matched graph metrics -> `test_report.json`.
 `train` already runs this automatically
 for every trained arm; call `test` directly only for the two scoring-time
 controls (`structure_control_6a_v3`, `structure_control_6e_v1`), which reuse

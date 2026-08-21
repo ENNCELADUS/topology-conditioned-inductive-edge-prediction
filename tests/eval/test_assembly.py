@@ -7,6 +7,7 @@ from src.eval.assembly import (
     SweepPoint,
     assemble_degree_quota,
     assemble_graph,
+    assemble_rank_matched_graph,
     density_matched_threshold,
     estimated_density_matched_threshold,
     rank_matched_degree_quotas,
@@ -49,6 +50,42 @@ class TestAssembleGraph:
         probs = np.array([0.4999])
         g = assemble_graph(pairs, probs, threshold=0.5, nodes=["a", "b"])
         assert not g.has_edge("a", "b")
+
+
+@pytest.mark.unit
+class TestAssembleRankMatchedGraph:
+    def test_boundary_ties_are_broken_deterministically_at_exact_quota(self) -> None:
+        pairs = [("b", "c"), ("a", "c"), ("a", "b"), ("a", "a")]
+        probs = np.array([0.8, 0.8, 0.8, 0.1])
+
+        graph, threshold = assemble_rank_matched_graph(
+            pairs, probs, target_edges=2, nodes=["a", "b", "c"]
+        )
+
+        assert threshold == pytest.approx(0.8)
+        assert set(graph.edges()) == {("a", "b"), ("a", "c")}
+        assert graph.number_of_edges() == 2
+
+    def test_duplicate_undirected_pairs_cannot_silently_underfill_quota(self) -> None:
+        with pytest.raises(ValueError, match="unique"):
+            assemble_rank_matched_graph(
+                [("a", "b"), ("b", "a")],
+                np.array([0.9, 0.8]),
+                target_edges=2,
+                nodes=["a", "b"],
+            )
+
+    def test_raw_logits_preserve_order_when_sigmoid_would_saturate(self) -> None:
+        pairs = [("a", "b"), ("a", "c"), ("b", "c")]
+        graph, threshold = assemble_rank_matched_graph(
+            pairs,
+            np.array([39.0, 41.0, 40.0]),
+            target_edges=2,
+            nodes=["a", "b", "c"],
+        )
+
+        assert threshold == pytest.approx(40.0)
+        assert set(graph.edges()) == {("a", "c"), ("b", "c")}
 
 
 @pytest.mark.unit

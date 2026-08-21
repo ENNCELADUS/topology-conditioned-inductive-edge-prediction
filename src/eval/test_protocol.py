@@ -3,13 +3,13 @@
 Owns the whole post-train sequence for one arm and nothing else::
 
     score test      -> edge metrics at fixed threshold 0.5
-    score candidate -> assembled-graph metrics at global density control
+    score test_topology -> per-sample RD-matched assembled-graph metrics
         -> test_report.json
 
 Classification and topology use separate operating points: the former is
-fixed at 0.5, while the latter matches the global simple-edge reference density
-over the candidate universe. Both metric families are always reported together;
-a partial report is never written.
+fixed at 0.5, while the latter independently matches RD=1 in every sampled
+20--200-node evaluation subgraph. Both metric families are always reported
+together; a partial report is never written.
 
 This module composes existing analysis primitives; it never rescores a pair or
 reimplements a metric. It never calls ``validate_score_precision`` directly on
@@ -27,26 +27,25 @@ import json
 import logging
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
+from itertools import combinations_with_replacement
 from pathlib import Path
 from typing import Protocol, cast
 
 import networkx as nx
 import numpy as np
 from numpy.typing import NDArray
+from scipy.special import expit
 
-from src.eval.assembly import assemble_graph, density_matched_threshold, threshold_sweep
+from src.data.artifacts import canonical_pair
+from src.eval.assembly import assemble_rank_matched_graph
 from src.eval.graph_metrics import (
     MMDConfig,
-    compute_graph_similarity,
-    compute_relative_density,
-    evaluate_assembled_graph,
-    strip_self_loops,
+    evaluate_sampled_subgraphs,
 )
 from src.eval.report_edge_metrics import report_edge_metrics
 from src.experiments.g1_hardened_e2 import (
     _BENCHMARK_SUBDIR,
-    build_threshold_grid,
     load_test_graph,
     load_test_node_buckets,
 )
@@ -62,7 +61,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["ScoreRunner", "TestProtocolResult", "build_parser", "main", "run_test_protocol"]
 
-_SCHEMA_VERSION = "test_protocol_v2"
+_SCHEMA_VERSION = "test_protocol_v3"
 #: The filename `src.e2_pipeline` (and `src.train_egostitch`/`src.train_b0`)
 #: publish training provenance into: checkpoint identity, publication status,
 #: and access-audit fields no scoring call may destroy. This module never
@@ -127,17 +126,17 @@ def _require_full_universe(artifact: ScoresArtifact, *, label: str) -> None:
         )
 
 
-def _require_same_checkpoint(*, test: ScoresArtifact, candidate: ScoresArtifact) -> None:
+def _require_same_checkpoint(*, test: ScoresArtifact, topology: ScoresArtifact) -> None:
     """Raise unless both held-out passes scored the same checkpoint and family."""
-    checkpoint_ids = {artifact.meta.get("checkpoint_id") for artifact in (test, candidate)}
+    checkpoint_ids = {artifact.meta.get("checkpoint_id") for artifact in (test, topology)}
     if len(checkpoint_ids) != 1:
         raise ValueError(
-            f"test/candidate scoring passes used different checkpoints: {checkpoint_ids}"
+            f"test and test_topology scoring passes used different checkpoints: {checkpoint_ids}"
         )
-    model_families = {artifact.meta.get("model_family") for artifact in (test, candidate)}
+    model_families = {artifact.meta.get("model_family") for artifact in (test, topology)}
     if len(model_families) != 1:
         raise ValueError(
-            f"test/candidate scoring passes disagree on model_family: {model_families}"
+            f"test and test_topology scoring passes disagree on model_family: {model_families}"
         )
 
 
@@ -216,7 +215,7 @@ def _derive_scoring_run_id(*, arm: str, seed: int, checkpoint_sha256: str) -> st
 
     Stable across repeated calls with the same ``(arm, seed, checkpoint)`` so a
     resumed or re-run protocol invocation joins the SAME test-access-ledger
-    epoch across its test and candidate passes (the P1 defect this fixes: those
+    epoch across its test and test_topology passes (the P1 defect this fixes: those
     two passes used to open two separate epochs, so a first-time run without
     ``--rescore-reason`` failed on the second pass). Never derived from
     wall-clock time or randomness -- either would break reproducibility and the
@@ -357,43 +356,84 @@ def _build_score_args(
     return args
 
 
-def _graph_block(
+def _rd_matched_graph_block(
     *,
-    threshold: float,
     pairs: Sequence[tuple[str, str]],
-    probs: NDArray[np.float64],
-    nodes: Sequence[str],
+    logits: NDArray[np.float64],
     g_ref: nx.Graph,
-    g_ref_simple: nx.Graph,
     buckets: dict[int, list[set[str]]],
     config: MMDConfig,
 ) -> dict[str, object]:
-    """Evaluate the five topology numbers at one assembly threshold.
+    """Match RD=1 independently in every sampled subgraph, then evaluate."""
+    if len(pairs) != logits.size:
+        raise ValueError("pairs and logits must be aligned")
+    if not np.isfinite(logits).all():
+        raise ValueError("topology logits must be finite")
+    score_by_pair: dict[tuple[str, str], float] = {}
+    for pair, logit in zip(pairs, logits, strict=True):
+        canonical = canonical_pair(*pair)
+        if canonical in score_by_pair:
+            raise ValueError(f"duplicate topology score for pair {canonical!r}")
+        score_by_pair[canonical] = float(logit)
 
-    Reports GS and RD both ways, named separately (CLAUDE.md claim rule):
-    ``global_simple_edge`` (the whole assembled graph, self-loops stripped,
-    :func:`compute_graph_similarity`/:func:`compute_relative_density`) and
-    ``bfs_macro`` (the official per-subgraph macro mean over benchmark buckets,
-    self-loops retained, :func:`evaluate_assembled_graph`). The three MMD
-    ratios (degree/clustering/spectral) have no global analogue -- they are
-    defined only as a bucketed reference-normalized statistic -- so only the
-    ``bfs_macro`` evaluation produces them.
-    """
-    g_pred = assemble_graph(pairs, probs, threshold=threshold, nodes=nodes)
-    bucketed = evaluate_assembled_graph(g_pred, g_ref, buckets, config)
-    g_pred_simple = strip_self_loops(g_pred)
+    pred_subgraphs: dict[int, list[nx.Graph]] = {}
+    per_size: dict[str, dict[str, object]] = {}
+    for size, node_sets in buckets.items():
+        predictions: list[nx.Graph] = []
+        operating_points: list[dict[str, object]] = []
+        for sample_index, nodes in enumerate(node_sets):
+            local_pairs = [
+                canonical_pair(u, v) for u, v in combinations_with_replacement(sorted(nodes), 2)
+            ]
+            try:
+                local_logits = np.array(
+                    [score_by_pair[pair] for pair in local_pairs], dtype=np.float64
+                )
+            except KeyError as error:
+                raise ValueError(f"missing topology score for pair {error.args[0]!r}") from error
+            reference = g_ref.subgraph(nodes)
+            target_edges = reference.number_of_edges()
+            prediction, logit_boundary = assemble_rank_matched_graph(
+                local_pairs,
+                local_logits,
+                target_edges=target_edges,
+                nodes=nodes,
+            )
+            predictions.append(prediction)
+            boundary_tie_count = int(np.count_nonzero(local_logits == logit_boundary))
+            selected_above_boundary = int(np.count_nonzero(local_logits > logit_boundary))
+            operating_points.append(
+                {
+                    "sample": sample_index,
+                    "probability_boundary": float(expit(logit_boundary)),
+                    "logit_boundary": logit_boundary,
+                    "boundary_tie_count": boundary_tie_count,
+                    "selected_from_boundary_tie": target_edges - selected_above_boundary,
+                    "target_edges": target_edges,
+                    "predicted_edges": prediction.number_of_edges(),
+                }
+            )
+        pred_subgraphs[size] = predictions
+        per_size[str(size)] = {"operating_points": operating_points}
+
+    bucketed = evaluate_sampled_subgraphs(pred_subgraphs, g_ref, buckets, config)
+    for size in buckets:
+        block = per_size[str(size)]
+        block["graph_similarity"] = float(np.mean(bucketed.per_size_graph_similarity[size]))
+        block["relative_density"] = float(np.mean(bucketed.per_size_relative_density[size]))
     return {
-        "threshold": threshold,
-        "graph_similarity": {
-            "global_simple_edge": compute_graph_similarity(g_pred_simple, g_ref_simple),
-            "bfs_macro": bucketed.graph_similarity,
-        },
-        "relative_density": {
-            "global_simple_edge": compute_relative_density(g_pred_simple, g_ref_simple),
-            "bfs_macro": bucketed.relative_density,
-        },
+        "matching": "per_subgraph_rd_1",
+        "selection": "top_k_by_logit_with_canonical_tiebreak",
+        "boundary_tie_break": "canonical_pair_ascending",
+        "graph_similarity": {"bfs_macro": bucketed.graph_similarity},
+        "relative_density": {"bfs_macro": bucketed.relative_density},
         "mmd_ratio": dict(bucketed.mmd_ratio),
-        "self_loops": {"predicted": bucketed.self_loops_pred, "reference": bucketed.self_loops_ref},
+        "per_size": per_size,
+        "self_loop_occurrences": {
+            "aggregation": "sum_over_sample_occurrences",
+            "predicted": bucketed.self_loops_pred,
+            "reference": bucketed.self_loops_ref,
+        },
     }
 
 
@@ -440,7 +480,7 @@ def run_test_protocol(
             self-describe). Leave ``None`` for a self-describing Task-4
             checkpoint (``v3_1``/``egostitch_e2e``): this function reads the
             checkpoint's own embedded ``model_family`` in that case, both to
-            decide whether the test/candidate passes may carry
+            decide whether the test and test_topology passes may carry
             ``--scoring-run-id`` (egostitch_e2e held-out scoring only) and,
             when both `model_family` and `model_config` are given, to forward
             ``--model-family``/``--model-config`` on every pass.
@@ -496,7 +536,7 @@ def run_test_protocol(
     checkpoint_sha256 = _sha256_file(checkpoint)
     expected_checkpoint_id = _expected_checkpoint_id(checkpoint)
 
-    # egostitch_e2e held-out scoring (test/candidate) is the only case
+    # egostitch_e2e held-out scoring (test and test_topology) is the only case
     # `--scoring-run-id` is valid for; every other family/pairs-source
     # combination has `src.score_universe` reject it outright. A Task-4
     # checkpoint self-describes its family, so this reads that rather than
@@ -505,7 +545,7 @@ def run_test_protocol(
     # wire at all -- see `_build_score_args`).
     resolved_model_family = model_family or _self_described_model_family(checkpoint)
     is_egostitch_e2e_family = resolved_model_family == "egostitch_e2e"
-    # One ledger epoch per protocol run (P1 fix): the test and candidate
+    # One ledger epoch per protocol run (P1 fix): the test and test_topology
     # passes below share this single, deterministic identity instead of each
     # opening its own epoch (which made an initial run without
     # `--rescore-reason` fail on the second pass). Computed unconditionally --
@@ -520,13 +560,10 @@ def run_test_protocol(
         allow_rescore_reason: bool,
         include_scoring_run_id: bool,
     ) -> Path:
-        # Universe-scoped F0/grounding caches (P1 fix): each pairs source gets
-        # its own cache file, so test and candidate never collide despite
-        # using different benchmark-universe node sets --
-        # the exact-match `build_f0_matrix(..., allow_cache_subset=False)`
-        # collision this used to hit. Deliberately not relying on
-        # `allow_cache_subset=True` (CLAUDE.md trap: silently gathers a
-        # superset cache into a different node set with no content check).
+        # Both passes deliberately expose the complete sorted test-node support:
+        # test_topology adds support-only self-pairs for nodes absent from the
+        # sampled sets. Their exact F0/grounding state is therefore identical
+        # and can be built once without `allow_cache_subset=True`.
         output = scores_dir / f"{pairs_source}.npz"
         if reuse_existing_scores and output.is_file():
             # Opt-in only. A scoring pass costs hours, so a rerun after a later
@@ -544,8 +581,8 @@ def run_test_protocol(
             data_root=data_root,
             strategy=strategy,
             run_metadata=scoring_identity_path,
-            f0_cache=scores_dir / f"f0_cache_{pairs_source}.pt",
-            grounding_cache=scores_dir / f"grounding_cache_{pairs_source}.npz",
+            f0_cache=scores_dir / "f0_cache_test_support.pt",
+            grounding_cache=scores_dir / "grounding_cache_test_support.npz",
             pack_dir=pack_dir,
             scaffold_control=scaffold_control,
             rescore_reason=rescore_reason if allow_rescore_reason else None,
@@ -556,22 +593,23 @@ def run_test_protocol(
         )
         return score_runner(args)
 
-    # 1. Score test, then candidate. Both held-out passes share one scoring run,
+    # 1. Score test, then only the union needed by sampled topology evaluation.
+    # Both held-out passes share one scoring run,
     # sharing one scoring-run id (when this checkpoint is egostitch_e2e) so
     # they join the SAME test-access-ledger epoch.
     test_path = _score(
         "test", allow_rescore_reason=True, include_scoring_run_id=is_egostitch_e2e_family
     )
-    candidate_path = _score(
-        "candidate", allow_rescore_reason=True, include_scoring_run_id=is_egostitch_e2e_family
+    topology_path = _score(
+        "test_topology", allow_rescore_reason=True, include_scoring_run_id=is_egostitch_e2e_family
     )
 
     # 2. Classification uses the fixed 0.5 decision threshold for every arm.
     edge_report = report_edge_metrics(test_path, expect_pairs_source="test", threshold=0.5)
 
-    # Reload test/candidate directly (report_edge_metrics only returns a
+    # Reload test/topology directly (report_edge_metrics only returns a
     # metrics summary, not the raw artifact) so their meta is available for the
-    # arm/provenance blocks, and so graph assembly has candidate's probs/pairs.
+    # arm/provenance blocks, and so graph assembly has topology logits/pairs.
     test_artifact = load_scores(test_path)
     validate_artifact_precision(test_artifact, label=str(test_path))
     _require_full_universe(test_artifact, label=str(test_path))
@@ -582,65 +620,38 @@ def run_test_protocol(
         label=str(test_path),
     )
 
-    candidate_artifact = load_scores(candidate_path)
-    validate_artifact_precision(candidate_artifact, label=str(candidate_path))
-    _require_pairs_source(candidate_artifact, "candidate", label=str(candidate_path))
-    _require_full_universe(candidate_artifact, label=str(candidate_path))
+    topology_artifact = load_scores(topology_path)
+    validate_artifact_precision(topology_artifact, label=str(topology_path))
+    _require_pairs_source(topology_artifact, "test_topology", label=str(topology_path))
+    _require_full_universe(topology_artifact, label=str(topology_path))
     _require_scoring_identity(
-        artifact=candidate_artifact,
+        artifact=topology_artifact,
         checkpoint_id=expected_checkpoint_id,
         strategy=strategy,
-        label=str(candidate_path),
+        label=str(topology_path),
     )
 
-    _require_same_checkpoint(test=test_artifact, candidate=candidate_artifact)
+    _require_same_checkpoint(test=test_artifact, topology=topology_artifact)
 
-    # 3. Topology uses only the global density-matched assembly threshold.
+    # 3. Topology independently matches the reference edge count in each
+    # sampled subgraph. Self-loops participate in both the quota and metrics.
     benchmark_root = data_root / _BENCHMARK_SUBDIR
     g_ref = load_test_graph(benchmark_root, strategy)
     buckets = load_test_node_buckets(benchmark_root, strategy)
-    g_ref_simple = strip_self_loops(g_ref)
     config = MMDConfig()
 
-    nodes = list(g_ref.nodes())
-    pairs = list(candidate_artifact.pairs())
-    probs = candidate_artifact.probs()
-
-    # Density-matched reference: non-self candidate rows only, matched against
-    # the SIMPLE (self-loop-stripped) reference edge count. Self-pairs never
-    # consume this quota but still assemble as self-loops at whatever threshold
-    # is chosen -- mirrors src.experiments.g1_hardened_e2.run_threshold_sweep
-    # exactly (CLAUDE.md: "Self-loop handling ... mirror g1_hardened_e2.py").
-    target_edges = g_ref_simple.number_of_edges()
-    non_self_mask = candidate_artifact.u_idx != candidate_artifact.v_idx
-    density_threshold = density_matched_threshold(probs[non_self_mask], target_edges)
-
     graph_report: dict[str, object] = {
-        "density_matched_threshold": {
-            **_graph_block(
-                threshold=density_threshold,
-                pairs=pairs,
-                probs=probs,
-                nodes=nodes,
-                g_ref=g_ref,
-                g_ref_simple=g_ref_simple,
-                buckets=buckets,
-                config=config,
-            ),
-            "target_edges": target_edges,
-        },
+        "per_subgraph_rd_matched": _rd_matched_graph_block(
+            pairs=list(topology_artifact.pairs()),
+            logits=topology_artifact.logit.astype(np.float64),
+            g_ref=g_ref,
+            buckets=buckets,
+            config=config,
+        )
     }
 
-    # 4. Threshold-sweep secondary view contains the density-matched point and
-    # pinned percentiles of the candidate probability distribution.
-    grid = build_threshold_grid(probs, density_threshold)
-    sweep_points = threshold_sweep(
-        pairs, probs, thresholds=grid, g_ref=g_ref, buckets=buckets, config=config
-    )
-    sweep_report: list[dict[str, object]] = [asdict(point) for point in sweep_points]
-
-    # 5. Arm identity: config-independent, sourced from the candidate artifact.
-    meta = candidate_artifact.meta
+    # 4. Arm identity: config-independent, sourced from the topology artifact.
+    meta = topology_artifact.meta
     arm_report: dict[str, object] = {
         "arm": arm,
         "seed": seed,
@@ -676,16 +687,16 @@ def run_test_protocol(
             "sha256": _sha256_file(test_path),
             "test_access_ledger_record_sha256": _ledger_record_sha256(test_artifact.meta),
         },
-        "candidate": {
-            "path": str(candidate_path),
-            "sha256": _sha256_file(candidate_path),
-            "test_access_ledger_record_sha256": _ledger_record_sha256(candidate_artifact.meta),
+        "test_topology": {
+            "path": str(topology_path),
+            "sha256": _sha256_file(topology_path),
+            "test_access_ledger_record_sha256": _ledger_record_sha256(topology_artifact.meta),
         },
     }
 
-    # 6. Assemble and write. Every block above must already exist in memory --
+    # 5. Assemble and write. Every block above must already exist in memory --
     # nothing is written incrementally -- so a failure anywhere above (a
-    # candidate-pass score_runner error, a graph-evaluation ValueError, ...)
+    # topology-pass score_runner error, a graph-evaluation ValueError, ...)
     # leaves no report file at all. Edge and graph metrics are always reported
     # together (CLAUDE.md claim rule); there is no code path that writes one
     # without the other.
@@ -694,7 +705,6 @@ def run_test_protocol(
         "arm": arm_report,
         "edge": edge_report,
         "graph": graph_report,
-        "sweep": sweep_report,
         "provenance": provenance,
     }
     report_path = output_dir / report_filename
@@ -711,9 +721,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m src.eval.test_protocol",
         description=(
-            "Run the post-train test protocol for one arm: score test/candidate, "
-            "report test classification at threshold 0.5 and candidate topology "
-            "at the global density-matched assembly threshold."
+            "Run the post-train test protocol for one arm: score test and test_topology, "
+            "report test classification at threshold 0.5 and sampled topology "
+            "after independent per-subgraph RD matching."
         ),
     )
     parser.add_argument("--checkpoint", type=Path, required=True, help="published checkpoint")

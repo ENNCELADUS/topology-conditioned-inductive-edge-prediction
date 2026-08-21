@@ -1,6 +1,6 @@
 """Tests for src.eval.test_protocol: the per-arm held-out test protocol.
 
-Builds synthetic test/candidate artifacts and a tiny benchmark fixture
+Builds synthetic test and test_topology artifacts and a tiny benchmark fixture
 (reusing the artifact/graph builders already committed for
 `tests.test_g1_hardened_e2`), then drives `run_test_protocol` with a fake
 `score_runner` so nothing here depends on `src.score_fanout.score_sharded`
@@ -9,7 +9,7 @@ Builds synthetic test/candidate artifacts and a tiny benchmark fixture
 `_write_checkpoint` writes a real (if minimal) torch checkpoint -- not just
 arbitrary bytes -- because `run_test_protocol` now reads a checkpoint's own
 embedded ``model_family`` (the Task-4 self-describing contract) to decide
-whether the test/candidate passes may carry ``--scoring-run-id``.
+whether the test and test_topology passes may carry ``--scoring-run-id``.
 """
 
 from __future__ import annotations
@@ -19,11 +19,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import networkx as nx
 import numpy as np
 import pytest
 import torch
 from numpy.typing import NDArray
 from src.eval import test_protocol
+from src.eval.graph_metrics import MMDConfig
 from src.eval.test_protocol import run_test_protocol
 from src.score_universe import ScoresArtifact, validate_artifact_precision
 
@@ -88,12 +90,11 @@ class _Fixture:
     artifacts: dict[str, Path]
 
 
-def _build_candidate_and_test_probs(pairs: list[tuple[str, str]]) -> NDArray[np.float64]:
+def _build_test_topology_and_test_probs(pairs: list[tuple[str, str]]) -> NDArray[np.float64]:
     """High prob on the five true edges, moderate on self-pairs, low elsewhere.
 
-    Chosen so the density-matched threshold (target_edges=5, the reference's
-    non-self edge count) lands exactly on the clean 0.9/0.1 gap and reproduces
-    the reference graph exactly -- a hand-checkable happy path.
+    Chosen so every sample's exact-edge-count ranking follows the reference
+    graph -- a hand-checkable happy path.
     """
     positive_set = {frozenset(edge) for edge in _POSITIVE_EDGES}
     probs = [
@@ -103,25 +104,25 @@ def _build_candidate_and_test_probs(pairs: list[tuple[str, str]]) -> NDArray[np.
 
 
 def _build_fixture(tmp_path: Path) -> _Fixture:
-    """Build a full test/candidate + benchmark fixture sharing one node universe."""
+    """Build a full test and test_topology + benchmark fixture sharing one node universe."""
     g_ref = _make_reference_graph()
     buckets = _small_buckets(_NODES, size=5, n_samples=4, seed=0)
     data_root = _write_benchmark(tmp_path, _STRATEGY, g_ref, buckets)
 
     pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
-    probs = _build_candidate_and_test_probs(pairs)
+    probs = _build_test_topology_and_test_probs(pairs)
     logits = np.array([_logit_for_prob(p) for p in probs], dtype=np.float32)
 
     scores_dir = tmp_path / "prebuilt_scores"
-    candidate_path = scores_dir / "candidate.npz"
+    test_topology_path = scores_dir / "test_topology.npz"
     _write_universe_npz(
-        candidate_path,
+        test_topology_path,
         node_ids=_NODES,
         pairs=pairs,
         logits=logits,
         labels=labels,
         strategy=_STRATEGY,
-        pairs_source="candidate",
+        pairs_source="test_topology",
         checkpoint_id=_CHECKPOINT_ID,
     )
     test_path = scores_dir / "test.npz"
@@ -138,7 +139,7 @@ def _build_fixture(tmp_path: Path) -> _Fixture:
 
     return _Fixture(
         data_root=data_root,
-        artifacts={"test": test_path, "candidate": candidate_path},
+        artifacts={"test": test_path, "test_topology": test_topology_path},
     )
 
 
@@ -147,7 +148,7 @@ def _write_checkpoint(tmp_path: Path, *, model_family: str = "v3_1") -> Path:
 
     `run_test_protocol` reads this checkpoint's own embedded `model_family` (a
     plain torch.load, no model construction) to decide whether the
-    test/candidate passes may carry `--scoring-run-id`; a bare byte blob is no
+    test and test_topology passes may carry `--scoring-run-id`; a bare byte blob is no
     longer a valid fixture checkpoint.
     """
     checkpoint = tmp_path / "checkpoint.pt"
@@ -159,6 +160,18 @@ def _write_checkpoint(tmp_path: Path, *, model_family: str = "v3_1") -> Path:
 
 
 class TestRunTestProtocol:
+    def test_nonfinite_support_only_logit_fails_closed(self) -> None:
+        g_ref = nx.Graph([("a", "b")])
+        g_ref.add_node("c")
+        with pytest.raises(ValueError, match="finite"):
+            test_protocol._rd_matched_graph_block(
+                pairs=[("a", "a"), ("a", "b"), ("b", "b"), ("c", "c")],
+                logits=np.array([0.0, 1.0, 0.0, np.nan]),
+                g_ref=g_ref,
+                buckets={2: [{"a", "b"}, {"a", "b"}]},
+                config=MMDConfig(),
+            )
+
     def test_full_report_shape_ordering_and_leakage_guarantee(self, tmp_path: Path) -> None:
         fixture = _build_fixture(tmp_path)
         checkpoint = _write_checkpoint(tmp_path)
@@ -175,15 +188,15 @@ class TestRunTestProtocol:
             score_runner=runner,
         )
 
-        # 1. No V_hold pass: test classification and candidate topology use
+        # 1. No V_hold pass: test classification and test_topology topology use
         # independent fixed/density-controlled operating points.
-        assert runner.pairs_order == ["test", "candidate"]
+        assert runner.pairs_order == ["test", "test_topology"]
         assert not (output_dir / "operating_point.json").exists()
 
         # 3. --data-root/--strategy/--checkpoint and --run-metadata forwarded to every
         # pass, pointed at this module's own scoring-identity file (never the
         # published run_metadata.json -- see test_never_overwrites_published_run_metadata).
-        for pairs_source in ("test", "candidate"):
+        for pairs_source in ("test", "test_topology"):
             call = runner.call_for(pairs_source)
             assert _arg_value(call, "--checkpoint") == str(checkpoint)
             assert _arg_value(call, "--data-root") == str(fixture.data_root)
@@ -203,10 +216,9 @@ class TestRunTestProtocol:
             "arm",
             "edge",
             "graph",
-            "sweep",
             "provenance",
         ]
-        assert report["schema_version"] == "test_protocol_v2"
+        assert report["schema_version"] == "test_protocol_v3"
 
         arm_block = report["arm"]
         assert isinstance(arm_block, dict)
@@ -232,35 +244,27 @@ class TestRunTestProtocol:
         assert edge["metrics_non_self"] is not None
         assert edge["metrics"]["threshold"] == pytest.approx(0.5)
 
-        # 6. Graph block: only global density control, with five numbers;
-        # GS/RD are named separately at the global-simple-edge and
-        # BFS-macro granularity, never aggregated into a summary score.
+        # 6. Every sampled subgraph receives its own exact-RD operating point;
+        # only the official BFS-macro topology view is reported.
         graph = report["graph"]
         assert isinstance(graph, dict)
-        assert set(graph.keys()) == {"density_matched_threshold"}
-        block = graph["density_matched_threshold"]
+        assert set(graph.keys()) == {"per_subgraph_rd_matched"}
+        block = graph["per_subgraph_rd_matched"]
         assert isinstance(block, dict)
-        assert set(block["graph_similarity"]) == {"global_simple_edge", "bfs_macro"}
-        assert set(block["relative_density"]) == {"global_simple_edge", "bfs_macro"}
+        assert block["matching"] == "per_subgraph_rd_1"
+        assert block["selection"] == "top_k_by_logit_with_canonical_tiebreak"
+        assert block["boundary_tie_break"] == "canonical_pair_ascending"
+        assert set(block["graph_similarity"]) == {"bfs_macro"}
+        assert set(block["relative_density"]) == {"bfs_macro"}
         assert set(block["mmd_ratio"]) == {"degree", "clustering", "spectral"}
+        assert block["self_loop_occurrences"]["aggregation"] == "sum_over_sample_occurrences"
+        assert block["graph_similarity"]["bfs_macro"] == pytest.approx(1.0)
+        assert block["relative_density"]["bfs_macro"] == pytest.approx(1.0)
+        operating_points = block["per_size"]["5"]["operating_points"]
+        assert len(operating_points) == 4
+        assert all(point["predicted_edges"] == point["target_edges"] for point in operating_points)
 
-        dm = graph["density_matched_threshold"]
-        assert dm["target_edges"] == 5
-        # A clean 0.9/0.1 gap at exactly 5 true edges: the density-matched
-        # assembly reproduces the reference graph exactly.
-        assert dm["threshold"] == pytest.approx(0.9)
-        assert dm["graph_similarity"]["global_simple_edge"] == pytest.approx(1.0)
-        assert dm["relative_density"]["global_simple_edge"] == pytest.approx(1.0)
-
-        # 7. Sweep rows present.
-        assert isinstance(report["sweep"], list)
-        assert len(report["sweep"]) > 0
-        for row in report["sweep"]:
-            assert {"threshold", "recall", "graph_similarity", "relative_density", "mmd_ratio"} <= (
-                set(row)
-            )
-
-        # 8. Provenance: two artifact paths, sha256, and ledger digests
+        # 7. Provenance: two artifact paths, sha256, and ledger digests
         # (null here -- v3_1 never claims the held-out E2E universe).
         provenance = report["provenance"]
         assert isinstance(provenance, dict)
@@ -270,13 +274,13 @@ class TestRunTestProtocol:
             assert entry["sha256"] == test_protocol._sha256_file(path)
             assert entry["test_access_ledger_record_sha256"] is None
 
-    def test_failing_candidate_pass_leaves_no_report_written(self, tmp_path: Path) -> None:
+    def test_failing_test_topology_pass_leaves_no_report_written(self, tmp_path: Path) -> None:
         fixture = _build_fixture(tmp_path)
         checkpoint = _write_checkpoint(tmp_path)
         output_dir = tmp_path / "outputs" / "full_seed0"
-        runner = _FakeScoreRunner(fixture.artifacts, fail_on="candidate")
+        runner = _FakeScoreRunner(fixture.artifacts, fail_on="test_topology")
 
-        with pytest.raises(RuntimeError, match="candidate"):
+        with pytest.raises(RuntimeError, match="test_topology"):
             run_test_protocol(
                 checkpoint=checkpoint,
                 output_dir=output_dir,
@@ -287,7 +291,7 @@ class TestRunTestProtocol:
                 score_runner=runner,
             )
 
-        assert runner.pairs_order == ["test", "candidate"]
+        assert runner.pairs_order == ["test", "test_topology"]
         assert not (output_dir / "operating_point.json").exists()
         assert not (output_dir / "test_report.json").exists()
 
@@ -335,12 +339,12 @@ class TestRunTestProtocol:
             rescore_reason="repeat scoring for gate re-run",
         )
 
-        for pairs_source in ("test", "candidate"):
+        for pairs_source in ("test", "test_topology"):
             call = runner.call_for(pairs_source)
             assert _arg_value(call, "--pack-dir") == str(pack_dir)
             assert _arg_value(call, "--scaffold-control") == "shuffle_within_pair_v3"
 
-        for pairs_source in ("test", "candidate"):
+        for pairs_source in ("test", "test_topology"):
             call = runner.call_for(pairs_source)
             assert _arg_value(call, "--rescore-reason") == "repeat scoring for gate re-run"
 
@@ -408,13 +412,13 @@ class TestRunTestProtocol:
             score_runner=runner,
         )
 
-        # run_test_protocol validates the reloaded test artifact and candidate;
+        # run_test_protocol validates the reloaded test artifact and test_topology;
         # report_edge_metrics validates test a second time
         # through its own bound import, which this spy (patched only on
         # test_protocol's namespace) does not observe.
         assert calls == [
             str(fixture.artifacts["test"]),
-            str(fixture.artifacts["candidate"]),
+            str(fixture.artifacts["test_topology"]),
         ]
 
     def test_rejects_mismatched_checkpoint_across_passes(self, tmp_path: Path) -> None:
@@ -422,23 +426,23 @@ class TestRunTestProtocol:
         checkpoint = _write_checkpoint(tmp_path)
         output_dir = tmp_path / "outputs" / "full_seed0"
 
-        # Re-write the candidate artifact under a different checkpoint_id.
+        # Re-write the test_topology artifact under a different checkpoint_id.
         pairs, labels = _universe_rows(_NODES, _POSITIVE_EDGES)
-        probs = _build_candidate_and_test_probs(pairs)
+        probs = _build_test_topology_and_test_probs(pairs)
         logits = np.array([_logit_for_prob(p) for p in probs], dtype=np.float32)
-        mismatched_candidate = tmp_path / "prebuilt_scores" / "candidate_mismatched.npz"
+        mismatched_test_topology = tmp_path / "prebuilt_scores" / "test_topology_mismatched.npz"
         _write_universe_npz(
-            mismatched_candidate,
+            mismatched_test_topology,
             node_ids=_NODES,
             pairs=pairs,
             logits=logits,
             labels=labels,
             strategy=_STRATEGY,
-            pairs_source="candidate",
+            pairs_source="test_topology",
             checkpoint_id="0000000000000000",
         )
         artifacts = dict(fixture.artifacts)
-        artifacts["candidate"] = mismatched_candidate
+        artifacts["test_topology"] = mismatched_test_topology
         runner = _FakeScoreRunner(artifacts)
 
         with pytest.raises(ValueError, match="different checkpoints"):
@@ -500,7 +504,7 @@ class TestReuseExistingScores:
     """Resuming a run whose later pass failed must not redo the finished ones."""
 
     def test_reuses_written_artifacts_and_only_scores_what_is_missing(self, tmp_path: Path) -> None:
-        """Mimics the real failure: test finished, candidate did not."""
+        """Mimics the real failure: test finished, test_topology did not."""
         fixture = _build_fixture(tmp_path)
         checkpoint = _write_checkpoint(tmp_path)
         output_dir = tmp_path / "outputs" / "resume"
@@ -520,7 +524,7 @@ class TestReuseExistingScores:
             reuse_existing_scores=True,
         )
 
-        assert runner.pairs_order == ["candidate"]
+        assert runner.pairs_order == ["test_topology"]
 
     def test_reuse_is_opt_in(self, tmp_path: Path) -> None:
         """Implicit reuse would silently serve stale scores after a code fix."""
@@ -542,7 +546,7 @@ class TestReuseExistingScores:
             score_runner=runner,
         )
 
-        assert runner.pairs_order == ["test", "candidate"]
+        assert runner.pairs_order == ["test", "test_topology"]
 
 
 class TestPublishedRunMetadataNeverClobbered:
@@ -581,7 +585,7 @@ class TestPublishedRunMetadataNeverClobbered:
         scoring_identity_path = output_dir / "test_protocol_run_metadata.json"
         assert scoring_identity_path.exists()
         assert scoring_identity_path != published_path
-        for pairs_source in ("test", "candidate"):
+        for pairs_source in ("test", "test_topology"):
             call = runner.call_for(pairs_source)
             assert _arg_value(call, "--run-metadata") == str(scoring_identity_path)
         assert json.loads(scoring_identity_path.read_text(encoding="utf-8")) == {
@@ -827,13 +831,13 @@ class TestPublishedRunMetadataNeverClobbered:
         )
 
         assert published_path.read_bytes() == published_bytes_before
-        assert runner.pairs_order == ["test", "candidate"]
+        assert runner.pairs_order == ["test", "test_topology"]
 
 
 class TestUniverseScopedCaches:
-    """P1 fix #3: test/candidate must never share an F0/grounding cache."""
+    """Both passes share the exact complete test-node support and its caches."""
 
-    def test_three_passes_get_three_distinct_cache_paths(self, tmp_path: Path) -> None:
+    def test_two_passes_share_test_support_cache_paths(self, tmp_path: Path) -> None:
         fixture = _build_fixture(tmp_path)
         checkpoint = _write_checkpoint(tmp_path)
         output_dir = tmp_path / "outputs" / "full_seed0"
@@ -851,30 +855,28 @@ class TestUniverseScopedCaches:
 
         f0_caches = {
             pairs_source: _arg_value(runner.call_for(pairs_source), "--f0-cache")
-            for pairs_source in ("test", "candidate")
+            for pairs_source in ("test", "test_topology")
         }
         grounding_caches = {
             pairs_source: _arg_value(runner.call_for(pairs_source), "--grounding-cache")
-            for pairs_source in ("test", "candidate")
+            for pairs_source in ("test", "test_topology")
         }
         assert None not in f0_caches.values()
         assert None not in grounding_caches.values()
-        assert len(set(f0_caches.values())) == 2
-        assert len(set(grounding_caches.values())) == 2
-        # Namespaced by pairs source, not merely random/unique, so the mapping
-        # from cache file to universe is auditable from the filename alone.
-        for pairs_source, path in f0_caches.items():
-            assert path is not None
-            assert pairs_source in path
-        for pairs_source, path in grounding_caches.items():
-            assert path is not None
-            assert pairs_source in path
+        assert len(set(f0_caches.values())) == 1
+        assert len(set(grounding_caches.values())) == 1
+        f0_path = next(iter(f0_caches.values()))
+        grounding_path = next(iter(grounding_caches.values()))
+        assert f0_path is not None and f0_path.endswith("f0_cache_test_support.pt")
+        assert grounding_path is not None and grounding_path.endswith(
+            "grounding_cache_test_support.npz"
+        )
 
 
 class TestOneLedgerEpochPerProtocolRun:
-    """P1 fix #4: test and candidate must share one scoring-run id."""
+    """P1 fix #4: test and test_topology must share one scoring-run id."""
 
-    def test_scoring_run_id_shared_by_test_and_candidate_only_for_egostitch_e2e(
+    def test_scoring_run_id_shared_by_test_and_test_topology_only_for_egostitch_e2e(
         self, tmp_path: Path
     ) -> None:
         fixture = _build_fixture(tmp_path)
@@ -894,11 +896,11 @@ class TestOneLedgerEpochPerProtocolRun:
         )
 
         test_call = runner.call_for("test")
-        candidate_call = runner.call_for("candidate")
+        test_topology_call = runner.call_for("test_topology")
         test_run_id = _arg_value(test_call, "--scoring-run-id")
-        candidate_run_id = _arg_value(candidate_call, "--scoring-run-id")
+        test_topology_run_id = _arg_value(test_topology_call, "--scoring-run-id")
         assert test_run_id is not None
-        assert test_run_id == candidate_run_id
+        assert test_run_id == test_topology_run_id
 
     def test_scoring_run_id_never_forwarded_for_a_non_egostitch_e2e_checkpoint(
         self, tmp_path: Path
@@ -945,9 +947,9 @@ class TestOneLedgerEpochPerProtocolRun:
         )
 
         test_run_id = _arg_value(runner.call_for("test"), "--scoring-run-id")
-        candidate_run_id = _arg_value(runner.call_for("candidate"), "--scoring-run-id")
+        test_topology_run_id = _arg_value(runner.call_for("test_topology"), "--scoring-run-id")
         assert test_run_id is not None
-        assert test_run_id == candidate_run_id
+        assert test_run_id == test_topology_run_id
 
     def test_scoring_run_id_is_stable_across_two_identical_calls(self, tmp_path: Path) -> None:
         fixture = _build_fixture(tmp_path)
@@ -1007,7 +1009,7 @@ class TestOracleAndCaziForwarding:
             allow_oracle_diagnostic=True,
         )
 
-        for pairs_source in ("test", "candidate"):
+        for pairs_source in ("test", "test_topology"):
             assert "--allow-oracle-diagnostic" in runner.call_for(pairs_source)
 
     def test_model_family_and_model_config_forwarded_to_every_pass(self, tmp_path: Path) -> None:
@@ -1030,7 +1032,7 @@ class TestOracleAndCaziForwarding:
             model_config=model_config,
         )
 
-        for pairs_source in ("test", "candidate"):
+        for pairs_source in ("test", "test_topology"):
             call = runner.call_for(pairs_source)
             assert _arg_value(call, "--model-family") == "cazi_mbn"
             assert _arg_value(call, "--model-config") == str(model_config)

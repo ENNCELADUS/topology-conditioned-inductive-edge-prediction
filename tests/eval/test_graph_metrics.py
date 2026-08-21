@@ -17,6 +17,7 @@ from src.eval.graph_metrics import (
     compute_relative_density,
     degree_histogram,
     evaluate_assembled_graph,
+    evaluate_sampled_subgraphs,
     laplacian_spectrum_histogram,
     mmd_squared,
     noise_floor,
@@ -43,6 +44,27 @@ def _manual_mmd(samples1: list[np.ndarray], samples2: list[np.ndarray]) -> float
         + mean_kernel(normalized2, normalized2)
         - 2.0 * mean_kernel(normalized1, normalized2)
     )
+
+
+@pytest.mark.unit
+def test_sampled_subgraphs_keep_overlapping_pair_decisions_independent() -> None:
+    g_ref = nx.Graph([("a", "b"), ("b", "c"), ("b", "d")])
+    g_ref.add_nodes_from(["a", "b", "c", "d"])
+    buckets = {3: [{"a", "b", "c"}, {"b", "c", "d"}]}
+
+    first = nx.Graph([("a", "b"), ("b", "c")])
+    first.add_nodes_from(buckets[3][0])
+    second = nx.Graph([("b", "d"), ("c", "d")])
+    second.add_nodes_from(buckets[3][1])
+
+    report = evaluate_sampled_subgraphs({3: [first, second]}, g_ref, buckets, MMDConfig())
+
+    assert report.per_size_graph_similarity[3] == pytest.approx([1.0, 0.5])
+    assert report.per_size_relative_density[3] == pytest.approx([1.0, 1.0])
+    assert report.graph_similarity == pytest.approx(0.75)
+    assert report.relative_density == pytest.approx(1.0)
+    assert set(report.mmd_ratio) == set(STATISTICS)
+    assert all(np.isfinite(value) for value in report.mmd_ratio.values())
 
 
 @pytest.mark.unit

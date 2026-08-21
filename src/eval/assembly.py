@@ -41,6 +41,43 @@ def assemble_graph(
     return g
 
 
+def assemble_rank_matched_graph(
+    pairs: Sequence[tuple[str, str]],
+    scores: np.ndarray,
+    *,
+    target_edges: int,
+    nodes: Iterable[str],
+) -> tuple[nx.Graph, float]:
+    """Assemble exactly `target_edges` highest-scoring pairs.
+
+    The returned value is the score at the selected boundary.
+    Canonical pair order breaks boundary ties, so the realized edge count (and
+    hence RD) remains exact even when multiple rows share that score.
+    """
+    scores = np.asarray(scores, dtype=float)
+    if scores.ndim != 1 or scores.size != len(pairs):
+        raise ValueError("scores must be 1-D and aligned with pairs")
+    if scores.size == 0:
+        raise ValueError("pairs and scores must be non-empty")
+    if not np.isfinite(scores).all():
+        raise ValueError("scores must be finite")
+    if target_edges < 0 or target_edges > len(pairs):
+        raise ValueError(f"target_edges must be in [0, {len(pairs)}], got {target_edges}")
+
+    canonical_pairs = [(u, v) if u <= v else (v, u) for u, v in pairs]
+    if len(set(canonical_pairs)) != len(canonical_pairs):
+        raise ValueError("pairs must be unique after canonicalization")
+    order = sorted(range(len(pairs)), key=lambda i: (-float(scores[i]), canonical_pairs[i]))
+    selected = order[:target_edges]
+    boundary = (
+        float(scores[selected[-1]]) if selected else float(np.nextafter(np.max(scores), np.inf))
+    )
+    graph = nx.Graph()
+    graph.add_nodes_from(nodes)
+    graph.add_edges_from(canonical_pairs[i] for i in selected)
+    return graph, boundary
+
+
 def density_matched_threshold(probs: np.ndarray, target_edges: int) -> float:
     """Find the smallest threshold `t` such that `#(probs >= t) <= target_edges`.
 

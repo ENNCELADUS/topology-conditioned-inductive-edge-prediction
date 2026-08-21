@@ -2230,6 +2230,12 @@ def test_val_region_pairs_source_is_never_a_heldout_universe() -> None:
     )
 
 
+def test_test_topology_pairs_source_is_a_heldout_universe() -> None:
+    assert score_universe._is_heldout_universe(
+        {"model_family": "egostitch_e2e", "pairs_source": "test_topology"}
+    )
+
+
 def test_val_region_scoring_never_writes_a_ledger_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -2,6 +2,7 @@
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import cast
 
 import networkx as nx
 import numpy as np
@@ -253,6 +254,47 @@ def evaluate_assembled_graph(
         relative_density=relative_density,
         self_loops_pred=self_loops_pred,
         self_loops_ref=self_loops_ref,
+    )
+
+
+def evaluate_sampled_subgraphs(
+    pred_subgraphs: dict[int, list[nx.Graph]],
+    g_ref: nx.Graph,
+    buckets: dict[int, list[set[str]]],
+    config: MMDConfig,
+) -> BucketedMMDReport:
+    """Evaluate independently assembled predictions for every sampled node set.
+
+    Nodes are namespaced by sample before delegating to the canonical evaluator.
+    This preserves the existing metric definitions while allowing overlapping
+    benchmark samples to use different assembly thresholds.
+    """
+    if pred_subgraphs.keys() != buckets.keys():
+        raise ValueError("predicted subgraph sizes must match bucket sizes")
+
+    combined_pred = nx.Graph()
+    combined_ref = nx.Graph()
+    namespaced_buckets: dict[int, list[set[tuple[int, int, str]]]] = {}
+    for size, node_sets in buckets.items():
+        predictions = pred_subgraphs[size]
+        if len(predictions) != len(node_sets):
+            raise ValueError(f"bucket {size} prediction count does not match reference samples")
+        namespaced_buckets[size] = []
+        for sample_index, (nodes, prediction) in enumerate(
+            zip(node_sets, predictions, strict=True)
+        ):
+            reference = _induced_subgraph(g_ref, nodes)
+            _require_same_nodes(prediction, reference)
+            mapping = {node: (size, sample_index, node) for node in nodes}
+            combined_pred.update(nx.relabel_nodes(prediction, mapping, copy=True))
+            combined_ref.update(nx.relabel_nodes(reference, mapping, copy=True))
+            namespaced_buckets[size].append(set(mapping.values()))
+
+    return evaluate_assembled_graph(
+        combined_pred,
+        combined_ref,
+        cast(dict[int, list[set[str]]], namespaced_buckets),
+        config,
     )
 
 
