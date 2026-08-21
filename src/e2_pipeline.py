@@ -526,7 +526,6 @@ def _validate_worker_profile(
     epochs: int,
     world_size: int,
     memory_limit_gib: float,
-    allow_partial: bool = False,
     enforce_engineering_limits: bool = True,
 ) -> dict[str, object]:
     """Validate worker completeness, integrity, and optional engineering limits."""
@@ -549,8 +548,10 @@ def _validate_worker_profile(
         value = data[key]
         if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(f"{key} must be an integer")
-        if value != epochs and not (allow_partial and 1 <= value <= epochs):
-            raise ValueError(f"{key} must equal configured epochs ({epochs})")
+        if not 1 <= value <= epochs:
+            raise ValueError(f"{key} must be within configured epochs (1..{epochs})")
+    if data["epochs_completed"] != data["validations_completed"]:
+        raise ValueError("epochs_completed and validations_completed must match")
     for key in ("training_coverage_exact", "validation_coverage_exact"):
         if data[key] is not True:
             raise ValueError(f"{key} must be exactly true")
@@ -652,7 +653,6 @@ def _validate_staged_artifacts(
     *,
     epochs: int,
     model_family: str,
-    allow_partial: bool = False,
     require_val_region_validation_events: bool = False,
     expected_run_kind: str | None = None,
 ) -> None:
@@ -1227,15 +1227,13 @@ def _run_pipeline_unlocked(
             epochs=cfg.optim.epochs,
             world_size=runtime.world_size,
             memory_limit_gib=runtime.memory_limit_gib,
-            allow_partial=debug_run,
             enforce_engineering_limits=not diagnostic_run,
         )
         completed_epochs = cast(int, worker_runtime_profile["epochs_completed"])
         _validate_staged_artifacts(
             attempt_dir,
-            epochs=completed_epochs if debug_run else cfg.optim.epochs,
+            epochs=completed_epochs,
             model_family=cfg.model.family,
-            allow_partial=debug_run,
             require_val_region_validation_events=(
                 not debug_run and args.worker_module == "src.train_egostitch"
             ),

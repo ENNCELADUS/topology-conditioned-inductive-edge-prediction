@@ -8,8 +8,8 @@ up a class here, and the matching `build_*` helper turns that class plus the
 rest of the section's fields into a constructed component -- the same
 translation `EgoStitchModel.__init__` did inline before this module existed.
 
-Four generators, two encoders and one classifier are registered today: one
-learned generator, one null control, and two diagnostic oracle generators.
+Five generators, two encoders and one classifier are registered today: one
+learned generator, one null control, and three diagnostic oracle generators.
 Registering a new component later is adding one dict entry and, if its
 constructor needs a translation the existing `build_*` helper does not
 already provide, extending that helper -- never a change to `composite.py`'s
@@ -37,7 +37,7 @@ from src.model.egostitch.generator import (
     OracleStructGenerator,
 )
 from src.model.egostitch.generator.base import NeighborhoodGenerator
-from src.model.egostitch.generator.full_oracle import FullOracleGenerator
+from src.model.egostitch.generator.full_oracle import FullEgoFeaturesGenerator, FullOracleGenerator
 from src.model.egostitch.generator.imagine import FeatureStandardizationMode
 
 GENERATOR_REGISTRY: dict[str, type[NeighborhoodGenerator[Any, Any, Any]]] = {
@@ -45,6 +45,7 @@ GENERATOR_REGISTRY: dict[str, type[NeighborhoodGenerator[Any, Any, Any]]] = {
     "null": NullGenerator,
     "oracle_struct": OracleStructGenerator,
     "full_ego_oracle": FullOracleGenerator,
+    "full_ego_features": FullEgoFeaturesGenerator,
 }
 """Generator name -> class. ``egostitch_imagine`` is today's Tokenize-lite +
 Imagine + Stitch pipeline (`generator/egostitch.py`); ``null`` imagines
@@ -53,7 +54,10 @@ is what makes the pure pairwise baseline reachable by config alone;
 ``oracle_struct`` emits the *true* local scaffold from a precomputed table
 (`generator/oracle.py`), the upper bound the learned generator is measured
 against; ``full_ego_oracle`` emits the uncapped true induced local graph
-(`generator/full_oracle/`) for the diagnostic topology-information ceiling."""
+(`generator/full_oracle/`) for the diagnostic topology-information ceiling;
+``full_ego_features`` emits the same oracle node set as content features with
+no edges (`generator/full_oracle/features.py`), the Gate A set-student
+diagnostic."""
 
 ENCODER_REGISTRY: dict[str, type[GraphEncoder]] = {
     "ste_typed": TypedMessagePassingEncoder,
@@ -164,7 +168,8 @@ def build_generator(
             nothing to cache, and nothing to stitch (`generator/null.py`).
             `OracleStructGenerator` reads only its ``slots``, since the
             scaffold comes from a table rather than from a decoder;
-            `FullOracleGenerator` takes no learned-generator arguments.
+            `FullOracleGenerator` takes no learned-generator arguments;
+            `FullEgoFeaturesGenerator` reads only ``input_dim``.
 
     Returns:
         The constructed generator, not yet moved to any device. For
@@ -183,6 +188,10 @@ def build_generator(
         return OracleStructGenerator(slots=generator_cfg.slots)
     if cls is FullOracleGenerator:
         return FullOracleGenerator()
+    if cls is FullEgoFeaturesGenerator:
+        # The emitted feature width is the frozen F0 dim, needed by
+        # `graph_dims` before any truth context or feature table is bound.
+        return FullEgoFeaturesGenerator(input_dim=generator_cfg.input_dim)
     return cast(
         NeighborhoodGenerator[Any, Any, Any],
         cls(

@@ -98,6 +98,14 @@ def dense_rrwp(adj: torch.Tensor, k: int, mask: torch.Tensor | None = None) -> t
     nodes = collapsed.shape[-1]
     identity = torch.eye(nodes, device=adj.device, dtype=adj.dtype)
     powers = [identity.expand(collapsed.shape[0], nodes, nodes)]
+    # Exact fast path for a hard-zero adjacency (the `full_ego_features`
+    # edgeless set student): every power of the zero transition matrix is
+    # zero, so the k-1 dense bmms would only multiply zeros. Guarded on
+    # `requires_grad` so a learned generator's exactly-zero soft adjacency
+    # keeps its autograd connection through the bmm chain.
+    if k > 1 and not adj.requires_grad and not bool(collapsed.any()):
+        zero = torch.zeros_like(powers[0])
+        return torch.stack(powers + [zero] * (k - 1), dim=-1)
     current = transition
     for _ in range(1, k):
         powers.append(current)

@@ -82,6 +82,8 @@ _EXPECTED_FIDELITY_KEYS = {
     "clustering_mmd_ratio",
     "spectral_mmd_ratio",
     "val_threshold",
+    "topology_validation_full",
+    "topology_scored_rows",
     "prevalence",
     "pi_slot_std",
     "h_pairwise_cosine_mean",
@@ -2450,6 +2452,69 @@ class TestPrepareAndAssembleE2E:
             data.train_nodes,
         )
         assert data.feature_stats.digest == expected.digest
+
+    def test_assembly_builds_a_fixed_smaller_cascade_topology_panel(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = replace(
+            _holdout_e2e_cfg(tmp_path, monkeypatch),
+            topology_validation=te.EgoTopologyValidationConfig(
+                full_every_epochs=3,
+                cascade_buckets_per_size=2,
+            ),
+        )
+        data = te.assemble_egostitch_data(
+            cfg,
+            val_region_params=replace(_TOY_VAL_REGION_PARAMS, buckets_per_size=3),
+        )
+
+        assert data.val_topology_reference is not None
+        assert data.val_cascade_topology_reference is not None
+        assert data.val_ball_union is not None
+        assert data.val_cascade_ball_union is not None
+        assert all(
+            len(balls) == 2
+            for balls in data.val_cascade_topology_reference.buckets.values()
+        )
+        assert data.val_cascade_ball_union.u_idx.size < data.val_ball_union.u_idx.size
+
+    def test_cascade_validation_scores_only_the_cascade_panel(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = replace(
+            _holdout_e2e_cfg(tmp_path, monkeypatch),
+            topology_validation=te.EgoTopologyValidationConfig(
+                full_every_epochs=3,
+                cascade_buckets_per_size=2,
+            ),
+        )
+        assert cfg.data.pack_dir is not None
+        _write_tiny_token_pack(cfg.data.pack_dir, _E2E_PIPELINE_NODES, min_length=3)
+        data = te.assemble_egostitch_data(
+            cfg,
+            val_region_params=replace(_TOY_VAL_REGION_PARAMS, buckets_per_size=3),
+        )
+        model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
+        te._bind_feature_standardization(model, cfg, data)
+        table = PackedFeatureTable.from_pack(cfg.data.pack_dir, torch.device("cpu"))
+
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            result = te._validate_epoch(
+                model,
+                data,
+                Accelerator(cpu=True),
+                edge_batch=8,
+                topk_fraction=0.1,
+                token_table=table,
+                token_node_index=table.manifest.node_index(),
+                topology_scope="cascade",
+            )
+
+        assert result is not None
+        assert result.topology_scope == "cascade"
+        assert data.val_cascade_ball_union is not None
+        assert result.fidelity["topology_validation_full"] == 0.0
+        assert result.fidelity["topology_scored_rows"] == data.val_cascade_ball_union.u_idx.size
 
     def test_assembly_rejects_an_f0_cache_superset(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

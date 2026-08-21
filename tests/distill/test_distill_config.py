@@ -23,6 +23,18 @@ def test_kd_logit_arm_pattern() -> None:
     assert cfg.arm == "kd_logit"
 
 
+def test_kd_rank_arm_pattern() -> None:
+    cfg = DistillConfig(targets_path="t", w_rank=1.0, w_dist=1.0)
+    assert cfg.active
+    assert cfg.arm == "kd_rank"
+
+
+def test_kd_gram_arm_pattern() -> None:
+    cfg = DistillConfig(targets_path="t", w_gram=1.0)
+    assert cfg.active
+    assert cfg.arm == "kd_gram"
+
+
 def test_kd_rep_arm_pattern() -> None:
     cfg = DistillConfig(targets_path="t", w_rep=1.0)
     assert cfg.active
@@ -43,6 +55,12 @@ def test_mixed_arm_groups_are_rejected() -> None:
         DistillConfig(targets_path="t", w_logit=1.0, w_rep=1.0)
     with pytest.raises(ValueError, match="exactly one arm group"):
         DistillConfig(targets_path="t", w_logit=1.0, w_seed=1.0)
+    with pytest.raises(ValueError, match="exactly one arm group"):
+        DistillConfig(targets_path="t", w_rank=1.0)
+    with pytest.raises(ValueError, match="exactly one arm group"):
+        DistillConfig(targets_path="t", w_dist=1.0)
+    with pytest.raises(ValueError, match="exactly one arm group"):
+        DistillConfig(targets_path="t", w_gram=1.0, w_rep=1.0)
 
 
 @pytest.mark.parametrize(
@@ -63,7 +81,9 @@ def test_partial_kd_d9_patterns_are_rejected(weights: dict[str, float]) -> None:
 # --------------------------------------------------------------------------- bounds
 
 
-@pytest.mark.parametrize("name", ["w_logit", "w_rep", "w_seed", "w_geom", "w_kl"])
+@pytest.mark.parametrize(
+    "name", ["w_logit", "w_rank", "w_dist", "w_gram", "w_rep", "w_seed", "w_geom", "w_kl"]
+)
 def test_negative_weights_are_rejected(name: str) -> None:
     with pytest.raises(ValueError, match="non-negative"):
         DistillConfig(**{name: -0.1})  # type: ignore[arg-type]
@@ -86,9 +106,20 @@ def test_non_positive_gen_lr_scale_is_rejected() -> None:
         DistillConfig(gen_lr_scale=-0.1)
 
 
+def test_invalid_rank_hyperparameters_are_rejected() -> None:
+    with pytest.raises(ValueError, match="margin"):
+        DistillConfig(margin=-0.1)
+    with pytest.raises(ValueError, match="temperature"):
+        DistillConfig(temperature=0.0)
+
+
 def test_nonzero_weight_without_targets_path_is_rejected() -> None:
     with pytest.raises(ValueError, match="targets_path"):
         DistillConfig(w_logit=1.0)
+    with pytest.raises(ValueError, match="targets_path"):
+        DistillConfig(w_rank=1.0, w_dist=1.0)
+    with pytest.raises(ValueError, match="targets_path"):
+        DistillConfig(w_gram=1.0)
     with pytest.raises(ValueError, match="targets_path"):
         DistillConfig(w_rep=1.0)
     with pytest.raises(ValueError, match="targets_path"):

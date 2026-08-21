@@ -86,6 +86,8 @@ SHIPPED_B0_KD_CONFIGS = (
     "b0_v31_breadth_first.yaml",
     "b1_kd_control_breadth_first.yaml",
     "b1_kd_logit_breadth_first.yaml",
+    "b1_kd_rank_breadth_first.yaml",
+    "b1_kd_gram_breadth_first.yaml",
     "b1_kd_rep_breadth_first.yaml",
     "b1_kd_d9_breadth_first.yaml",
 )
@@ -2003,6 +2005,51 @@ def test_ddp_loop_records_counterfactual_stop_but_runs_all_epochs(tmp_path: Path
     assert len(cast(list[object], result.runtime_profile["per_epoch"])) == 4
 
 
+def test_classification_only_ddp_loop_stops_and_selects_by_auprc(tmp_path: Path) -> None:
+    config_path = tmp_path / "cfg.yaml"
+    _write_yaml_config(
+        config_path,
+        {
+            "optim.epochs": 4,
+            "eval.patience": 1,
+            "eval.classification_only": True,
+        },
+    )
+    cfg = load_config(config_path)
+    model = _TinyPairMLP(input_dim=4, hidden_dims=(8,), dropout=0.0)
+    batch = _batch_of(_make_synthetic_pair_dataset(8))
+    batch["_local_pair_count"] = torch.tensor(8)
+    batch["_global_pair_count"] = torch.tensor(8)
+    batch["_row_id"] = torch.arange(8)
+    evaluations = iter((0.6, 0.6, 0.9, 1.0))
+
+    def evaluate(
+        model: nn.Module,
+        loader: Iterable[dict[str, torch.Tensor]],
+        accelerator: Accelerator,
+    ) -> ValidationOutcome:
+        return ValidationOutcome(replace(_constant_metrics(), auprc=next(evaluations)), None)
+
+    result = train_ddp_loop(
+        model,
+        lambda epoch: [batch],
+        [batch],
+        cfg,
+        Accelerator(),
+        warmup_steps=1,
+        artifact_dir=tmp_path / "attempt",
+        evaluate_fn=evaluate,
+    )
+
+    assert result.stopped_early is True
+    assert result.last_epoch == 2
+    assert result.best_epoch == 1
+    assert result.counterfactual_stop_epoch == 2
+    assert [entry["epoch"] for entry in result.history] == [1, 2]
+    assert result.runtime_profile["epochs_completed"] == 2
+    assert result.runtime_profile["stopped_early"] is True
+
+
 def test_ddp_loop_require_topology_raises_when_an_epoch_has_no_topology(tmp_path: Path) -> None:
     config_path = tmp_path / "cfg.yaml"
     _write_yaml_config(config_path, {"optim.epochs": 2, "eval.patience": 5})
@@ -2120,6 +2167,7 @@ def test_ddp_loop_adds_kd_loss_and_logs_epoch_mean(tmp_path: Path) -> None:
             output: dict[str, torch.Tensor],
             *,
             global_step: int,
+            world_size: int = 1,
         ) -> tuple[torch.Tensor, dict[str, float], torch.Tensor | None]:
             kd_calls.append((1, global_step))
             return (
@@ -2135,6 +2183,10 @@ def test_ddp_loop_adds_kd_loss_and_logs_epoch_mean(tmp_path: Path) -> None:
                 },
                 None,
             )
+
+        @property
+        def global_relational(self) -> bool:
+            return False
 
         def epoch_telemetry(
             self,

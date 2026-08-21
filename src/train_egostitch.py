@@ -63,6 +63,7 @@ from src.data.val_region import (
     derive_val_region_split,
     val_ball_union_universe,
 )
+from src.distill.losses import kd_set_gram_loss, kd_set_seed_loss
 from src.eval.checkpoint_selection import (
     CheckpointCandidate,
     TopologyValidationMetrics,
@@ -86,7 +87,11 @@ from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.encoder.base import GraphEncoder
 from src.model.egostitch.generator import EgoStitchImagineGenerator, StitchedGraph
-from src.model.egostitch.generator.full_oracle import FullOracleGenerator
+from src.model.egostitch.generator.full_oracle import (
+    FullEgoFeaturesGenerator,
+    FullEgoGraph,
+    FullOracleGenerator,
+)
 from src.model.egostitch.generator.imagine import (
     NULL_MODE_ALL,
     NULL_MODE_CONTENT,
@@ -95,7 +100,8 @@ from src.model.egostitch.generator.imagine import (
 )
 from src.model.egostitch.generator.losses import stage1_family_tensors, stage1_total
 from src.model.egostitch.generator.oracle import OracleStructGenerator, build_oracle_table
-from src.model.egostitch.graph import GraphEmbedding
+from src.model.egostitch.graph import GraphEmbedding, ImaginedGraph
+from src.model.egostitch.registry import build_encoder
 from src.train_b0 import (
     EvalConfig,
     ModelConfig,
@@ -268,6 +274,42 @@ class EgoStitchTrainingConfig:
 
 
 @dataclass(frozen=True)
+class EgoDistillConfig:
+    """Gate A set-student distillation controls (``full_ego_features`` arm only).
+
+    Attributes:
+        teacher_checkpoint: A published ``full_ego_oracle`` + ``grit_gmt``
+            ``best.pt`` whose frozen encoder supplies the per-batch KD targets
+            (node tokens and PMA seed tokens over the identical node layout).
+        lambda_seed: Weight of `kd_set_seed_loss` (per-seed PMA latent cosine).
+        lambda_gram: Weight of `kd_set_gram_loss` (within-set node Gram).
+        warm_start_readout: Copy the teacher encoder's ``project``/``readout``
+            weights into the student encoder at startup so seed ``k`` starts
+            with the teacher's seed-``k`` semantics (identical shapes by the
+            d_model/seeds equality this config enforces at teacher load).
+    """
+
+    teacher_checkpoint: Path
+    lambda_seed: float = 1.0
+    lambda_gram: float = 1.0
+    warm_start_readout: bool = True
+
+
+@dataclass(frozen=True)
+class EgoTopologyValidationConfig:
+    """Two-resolution V_val topology-validation cadence.
+
+    ``full_every_epochs=1`` preserves the existing behavior. Larger intervals
+    use a fixed, smaller bucket panel on intervening epochs while retaining the
+    full 500-ball sampled bank on the configured cadence. Only full-resolution
+    epochs participate in checkpoint selection.
+    """
+
+    full_every_epochs: int = 1
+    cascade_buckets_per_size: int = 5
+
+
+@dataclass(frozen=True)
 class EgoConfig:
     """The full validated EgoStitch worker configuration.
 
@@ -294,6 +336,10 @@ class EgoConfig:
     runtime: EgoRuntimeConfig | None = None
     training: EgoStitchTrainingConfig | None = None
     run_kind: E2ERunKind | None = None
+    distill: EgoDistillConfig | None = None
+    topology_validation: EgoTopologyValidationConfig = field(
+        default_factory=EgoTopologyValidationConfig
+    )
 
 
 @dataclass(frozen=True)
@@ -337,6 +383,8 @@ def load_config(path: Path) -> EgoConfig:
             "mixed_precision",
             "runtime",
             "training",
+            "distill",
+            "topology_validation",
         ),
         "",
     )
@@ -412,13 +460,12 @@ def load_config(path: Path) -> EgoConfig:
         raise ValueError("optim.epochs must be positive")
     if optim.gradient_accumulation_steps <= 0:
         raise ValueError("optim.gradient_accumulation_steps must be positive")
-    if (
-        optim.gradient_accumulation_steps > 1
-        and E2EConfig.from_mapping(model_kwargs).generator.name != "full_ego_oracle"
-    ):
+    if optim.gradient_accumulation_steps > 1 and E2EConfig.from_mapping(
+        model_kwargs
+    ).generator.name not in ("full_ego_oracle", "full_ego_features"):
         raise ValueError(
             "optim.gradient_accumulation_steps > 1 is only supported for "
-            "model.config.generator.name='full_ego_oracle'"
+            "model.config.generator.name='full_ego_oracle' or 'full_ego_features'"
         )
 
     diagnostics_raw = _as_mapping(_require(raw, "diagnostics", ""), "diagnostics")
@@ -644,6 +691,59 @@ def load_config(path: Path) -> EgoConfig:
             "use a training config or checkout archive/egostitch-e2e-v1"
         )
 
+    distill: EgoDistillConfig | None = None
+    if raw.get("distill") is not None:
+        distill_raw = _as_mapping(raw["distill"], "distill")
+        _check_no_unknown_keys(
+            distill_raw,
+            ("teacher_checkpoint", "lambda_seed", "lambda_gram", "warm_start_readout"),
+            "distill",
+        )
+        warm_start_raw = distill_raw.get("warm_start_readout", True)
+        if not isinstance(warm_start_raw, bool):
+            raise ValueError("distill.warm_start_readout must be a boolean")
+        distill = EgoDistillConfig(
+            teacher_checkpoint=Path(
+                _as_str(
+                    _require(distill_raw, "teacher_checkpoint", "distill."),
+                    "distill.teacher_checkpoint",
+                )
+            ),
+            lambda_seed=_as_float(distill_raw.get("lambda_seed", 1.0), "distill.lambda_seed"),
+            lambda_gram=_as_float(distill_raw.get("lambda_gram", 1.0), "distill.lambda_gram"),
+            warm_start_readout=warm_start_raw,
+        )
+        if distill.lambda_seed < 0.0 or distill.lambda_gram < 0.0:
+            raise ValueError("distill.lambda_seed and distill.lambda_gram must be non-negative")
+        if E2EConfig.from_mapping(model_kwargs).generator.name != "full_ego_features":
+            raise ValueError(
+                "distill requires model.config.generator.name='full_ego_features': the KD "
+                "teacher matches the features generator's stashed structural view"
+            )
+
+    topology_validation = EgoTopologyValidationConfig()
+    if raw.get("topology_validation") is not None:
+        topology_raw = _as_mapping(raw["topology_validation"], "topology_validation")
+        _check_no_unknown_keys(
+            topology_raw,
+            tuple(EgoTopologyValidationConfig.__dataclass_fields__),
+            "topology_validation",
+        )
+        topology_validation = EgoTopologyValidationConfig(
+            full_every_epochs=_as_int(
+                topology_raw.get("full_every_epochs", 1),
+                "topology_validation.full_every_epochs",
+            ),
+            cascade_buckets_per_size=_as_int(
+                topology_raw.get("cascade_buckets_per_size", 5),
+                "topology_validation.cascade_buckets_per_size",
+            ),
+        )
+        if topology_validation.full_every_epochs <= 0:
+            raise ValueError("topology_validation.full_every_epochs must be positive")
+        if topology_validation.cascade_buckets_per_size < 2:
+            raise ValueError("topology_validation.cascade_buckets_per_size must be at least 2")
+
     return EgoConfig(
         model=model,
         data=data,
@@ -656,6 +756,8 @@ def load_config(path: Path) -> EgoConfig:
         runtime=runtime,
         training=training,
         run_kind=None,
+        distill=distill,
+        topology_validation=topology_validation,
     )
 
 
@@ -689,6 +791,7 @@ E2EArmName = Literal[
     "null_generator",
     "oracle",
     "full_ego_oracle",
+    "full_ego_features",
 ]
 
 
@@ -1085,6 +1188,26 @@ def e2e_accumulation_window_sizes(microsteps: int, accumulation_steps: int) -> l
         raise ValueError("accumulation_steps must be positive")
     full, tail = divmod(microsteps, accumulation_steps)
     return [accumulation_steps] * full + ([tail] if tail else [])
+
+
+def e2e_global_live_row_mean(
+    local_sum: torch.Tensor,
+    *,
+    live_rows: torch.Tensor,
+    world_size: int,
+    global_denominator: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Normalize one local KD sum for accumulation plus DDP gradient averaging."""
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    denominator = live_rows if global_denominator is None else global_denominator
+    if not bool(torch.isfinite(denominator)) or float(denominator) < 0.0:
+        raise RuntimeError("global KD live-row denominator must be finite and non-negative")
+    if float(denominator) == 0.0:
+        if float(live_rows) != 0.0 or float(local_sum.detach()) != 0.0:
+            raise RuntimeError("empty global KD population has a non-zero local contribution")
+        return local_sum * 0.0
+    return world_size * local_sum / denominator
 
 
 def e2e_window_effective_weight_denominator(
@@ -1943,6 +2066,10 @@ class EgoStitchData:
             built from `val_split`, or `None` when `val_split` is absent.
         val_ball_union: The exact once-per-run ball-union pair universe, built
             from `val_split`, or `None` when `val_split` is absent.
+        val_cascade_topology_reference: Reference restricted to the fixed
+            cascade bucket panel, or the full reference when cascading is off.
+        val_cascade_ball_union: Pair universe for the fixed cascade panel, or
+            the full universe when cascading is off.
         feature_stats: Registered training-universe standardization constants.
     """
 
@@ -1960,6 +2087,8 @@ class EgoStitchData:
     val_split: ValRegionSplit | None = None
     val_topology_reference: ValTopologyReference | None = None
     val_ball_union: ValBallUnionUniverse | None = None
+    val_cascade_topology_reference: ValTopologyReference | None = None
+    val_cascade_ball_union: ValBallUnionUniverse | None = None
     validation_role: Literal["V_val"] | None = None
     access_audit: dict[str, object] | None = None
     validation_nodes: tuple[str, ...] = ()
@@ -2214,6 +2343,23 @@ def _assemble_e2e_data(
         )
     val_topology_reference = build_val_topology_reference(split)
     val_ball_union = val_ball_union_universe(split)
+    topology_cfg = cfg.topology_validation
+    if topology_cfg.full_every_epochs == 1:
+        val_cascade_topology_reference = val_topology_reference
+        val_cascade_ball_union = val_ball_union
+    else:
+        cascade_buckets: dict[int, list[set[str]]] = {}
+        for size, balls in split.buckets.items():
+            if len(balls) < topology_cfg.cascade_buckets_per_size:
+                raise ValueError(
+                    "topology_validation.cascade_buckets_per_size exceeds the "
+                    f"available bucket count for size {size}: "
+                    f"{topology_cfg.cascade_buckets_per_size} > {len(balls)}"
+                )
+            cascade_buckets[size] = balls[: topology_cfg.cascade_buckets_per_size]
+        cascade_split = replace(split, buckets=cascade_buckets)
+        val_cascade_topology_reference = build_val_topology_reference(cascade_split)
+        val_cascade_ball_union = val_ball_union_universe(cascade_split)
     data = EgoStitchData(
         train_nodes=train_nodes,
         training_positives=sorted(split.training_positives),
@@ -2230,6 +2376,8 @@ def _assemble_e2e_data(
         val_split=split,
         val_topology_reference=val_topology_reference,
         val_ball_union=val_ball_union,
+        val_cascade_topology_reference=val_cascade_topology_reference,
+        val_cascade_ball_union=val_cascade_ball_union,
         validation_role=role,
         access_audit=audit,
         validation_nodes=validation_nodes,
@@ -2737,6 +2885,114 @@ class _BatchFactory:
 # --------------------------------------------------------------------------- composite module
 
 
+@dataclass
+class _KdRuntime:
+    """Frozen Gate A teacher encoder plus KD loss weights.
+
+    Deliberately not an ``nn.Module`` field of `_CompositeStep`: a dataclass
+    attribute stays out of the wrapped module tree, so DDP never syncs the
+    teacher, `_cpu_state_dict` never persists it, and `accelerator.prepare`
+    never touches it -- every rank builds it identically from the same
+    checkpoint file and `_build_kd_runtime` moves it to the device itself.
+    """
+
+    teacher_encoder: GraphEncoder
+    lambda_seed: float
+    lambda_gram: float
+
+
+def _build_kd_runtime(
+    distill: EgoDistillConfig, model: EgoStitchModel, device: torch.device
+) -> _KdRuntime:
+    """Load the frozen full-ego-oracle teacher encoder and prime the student.
+
+    The teacher is the published ``full_ego_oracle`` + ``grit_gmt``
+    checkpoint's encoder, rebuilt at its structural input width (5 role
+    channels, 1 relation) and kept fp32; its KD targets are computed with
+    autocast disabled (`_CompositeStep._kd_terms`), matching the fp32 teacher
+    convention of `src.distill.teacher_targets`. Seed KD is projection-free,
+    so the student's encoder section and ``d_model`` must equal the
+    teacher's exactly; with `EgoDistillConfig.warm_start_readout` the
+    teacher's ``project``/``readout`` weights are copied into the student so
+    seed ``k`` starts with the teacher's seed-``k`` semantics.
+
+    Also flips the features generator's teacher-view stash on: training is
+    the only consumer of ``aux["teacher_x"]``/``aux["teacher_adj"]``, and
+    scoring must not pay for tensors nobody reads.
+    """
+    generator = model.generator
+    if not isinstance(generator, FullEgoFeaturesGenerator):
+        raise ValueError("distill requires the full_ego_features generator")
+    if model.cfg.encoder.name != "grit_gmt":
+        raise ValueError("Gate A seed KD requires a grit_gmt student encoder")
+    checkpoint = cast(
+        Mapping[str, object],
+        torch.load(distill.teacher_checkpoint, map_location="cpu", weights_only=True),
+    )
+    missing_keys = [
+        key for key in ("model_state", "model_family", "model_config") if key not in checkpoint
+    ]
+    if missing_keys:
+        raise ValueError(
+            f"teacher checkpoint {distill.teacher_checkpoint} is missing keys {missing_keys}"
+        )
+    if checkpoint["model_family"] != _EGOSTITCH_E2E_FAMILY:
+        raise ValueError("teacher checkpoint must be an egostitch_e2e model")
+    teacher_cfg = E2EConfig.from_mapping(cast(Mapping[str, object], checkpoint["model_config"]))
+    if teacher_cfg.generator.name != "full_ego_oracle":
+        raise ValueError("teacher checkpoint generator must be full_ego_oracle")
+    if teacher_cfg.encoder.name != "grit_gmt":
+        raise ValueError("Gate A seed KD requires a grit_gmt teacher encoder")
+    if (
+        teacher_cfg.encoder != model.cfg.encoder
+        or teacher_cfg.classifier.d_model != model.cfg.classifier.d_model
+    ):
+        raise ValueError(
+            "teacher and student encoder sections must match exactly (projection-free "
+            f"seed KD): teacher {teacher_cfg.encoder!r} at d_model "
+            f"{teacher_cfg.classifier.d_model}, student {model.cfg.encoder!r} at d_model "
+            f"{model.cfg.classifier.d_model}"
+        )
+    state = cast(dict[str, torch.Tensor], checkpoint["model_state"])
+    encoder_state = {
+        key[len("encoder.") :]: value for key, value in state.items() if key.startswith("encoder.")
+    }
+    if not encoder_state:
+        raise ValueError("teacher checkpoint carries no encoder parameters")
+    teacher_in_dim, teacher_relations = FullOracleGenerator().graph_dims()
+    teacher_encoder = build_encoder(
+        teacher_cfg.encoder,
+        in_dim=teacher_in_dim,
+        num_relations=teacher_relations,
+        d_model=teacher_cfg.classifier.d_model,
+    )
+    teacher_encoder.load_state_dict(encoder_state, strict=True)
+    if distill.warm_start_readout:
+        student_encoder = model.encoder
+        assert student_encoder is not None, "full_ego_features always constructs an encoder"
+        readout_state = {
+            key: value
+            for key, value in encoder_state.items()
+            if key.startswith(("project.", "readout."))
+        }
+        if not readout_state:
+            raise ValueError("teacher encoder carries no project/readout weights to warm-start")
+        load_result = student_encoder.load_state_dict(readout_state, strict=False)
+        if load_result.unexpected_keys:
+            raise ValueError(
+                f"warm-start keys absent on the student encoder: {load_result.unexpected_keys[:5]}"
+            )
+    teacher_encoder.to(device=device, dtype=torch.float32)
+    teacher_encoder.eval()
+    teacher_encoder.requires_grad_(False)
+    generator.set_stash_teacher_view(True)
+    return _KdRuntime(
+        teacher_encoder=teacher_encoder,
+        lambda_seed=distill.lambda_seed,
+        lambda_gram=distill.lambda_gram,
+    )
+
+
 class _CompositeStep(torch.nn.Module):
     """One-forward composite step so DDP sees a single forward per backward.
 
@@ -2764,10 +3020,87 @@ class _CompositeStep(torch.nn.Module):
     `EgoStitchModel.aggregate_losses` exists to do this instead).
     """
 
-    def __init__(self, model: EgoStitchModel, world_size: int) -> None:
+    def __init__(
+        self, model: EgoStitchModel, world_size: int, *, kd: _KdRuntime | None = None
+    ) -> None:
         super().__init__()
         self.model = model
         self.world_size = world_size
+        # Plain attribute, not a submodule: see `_KdRuntime`'s docstring.
+        self._kd = kd
+
+    def _kd_terms(
+        self,
+        graph: ImaginedGraph | None,
+        embedding_ab: GraphEmbedding | None,
+        embedding_ba: GraphEmbedding | None,
+        edge_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute local Gate A KD sums and their effective row counts.
+
+        The teacher graph is rebuilt from the features generator's stashed
+        structural view over the *same* padded node layout the student just
+        encoded, so node tokens align positionally and the PMA seed tokens
+        align seed-for-seed. Both orientations are matched (AB student to AB
+        teacher, BA to BA) and averaged. The whole computation runs with
+        autocast disabled: the frozen teacher forwards in fp32 under
+        ``no_grad``, and the student tokens are upcast so the cosine/Gram
+        reductions never quantize to the bf16 ulp grid.
+        """
+        kd = self._kd
+        assert kd is not None
+        if graph is None or embedding_ab is None or embedding_ba is None:
+            raise RuntimeError(
+                "KD requires the topology pathway: the features generator must emit a "
+                "graph and both orientation embeddings on every training step"
+            )
+        aux = graph.aux
+        if "teacher_x" not in aux or "teacher_adj" not in aux:
+            raise RuntimeError(
+                "KD requires the features generator's stashed teacher view "
+                "(set_stash_teacher_view(True) at startup)"
+            )
+        teacher_graph = FullEgoGraph(
+            x=aux["teacher_x"],
+            adj=aux["teacher_adj"],
+            mask=graph.mask,
+            aux={"plan": aux["plan"], "log_plan": aux["log_plan"]},
+            directed=True,
+        )
+        nodes = graph.num_nodes
+        node_mask = graph.mask > 0.0
+        live = edge_mask.to(dtype=torch.bool)
+        with torch.autocast(device_type=teacher_graph.x.device.type, enabled=False):
+            with torch.no_grad():
+                teacher_ab = kd.teacher_encoder(teacher_graph)
+                teacher_ba = kd.teacher_encoder(teacher_graph.swapped())
+            seed = 0.5 * (
+                kd_set_seed_loss(
+                    embedding_ab.tokens[:, nodes:].float(), teacher_ab.tokens[:, nodes:], live
+                )
+                + kd_set_seed_loss(
+                    embedding_ba.tokens[:, nodes:].float(), teacher_ba.tokens[:, nodes:], live
+                )
+            )
+            gram = 0.5 * (
+                kd_set_gram_loss(
+                    embedding_ab.tokens[:, :nodes].float(),
+                    teacher_ab.tokens[:, :nodes],
+                    node_mask,
+                    live,
+                )
+                + kd_set_gram_loss(
+                    embedding_ba.tokens[:, :nodes].float(),
+                    teacher_ba.tokens[:, :nodes],
+                    node_mask,
+                    live,
+                )
+            )
+        live_rows = live.to(dtype=seed.dtype).sum()
+        gram_live_rows = (
+            (live & (node_mask.to(dtype=torch.bool).sum(dim=1) >= 2)).to(dtype=gram.dtype).sum()
+        )
+        return seed * live_rows, gram * gram_live_rows, live_rows, gram_live_rows
 
     def forward(self, batch: dict[str, object]) -> dict[str, object]:
         node = cast(dict[str, torch.Tensor], batch["node"])
@@ -2928,6 +3261,40 @@ class _CompositeStep(torch.nn.Module):
                 batch.get("recon_factors"),
             ),
         )
+        kd_stats: dict[str, float] | None = None
+        if self._kd is not None:
+            kd_seed_sum, kd_gram_sum, kd_live_rows, kd_gram_live_rows = self._kd_terms(
+                graph,
+                embedding_ab,
+                cast(GraphEmbedding | None, edge_output.get("embedding_ba")),
+                edge["edge_mask"],
+            )
+            kd_seed = e2e_global_live_row_mean(
+                kd_seed_sum,
+                live_rows=kd_live_rows,
+                world_size=self.world_size,
+                global_denominator=cast(torch.Tensor | None, batch.get("kd_seed_denominator")),
+            )
+            kd_gram = e2e_global_live_row_mean(
+                kd_gram_sum,
+                live_rows=kd_gram_live_rows,
+                world_size=self.world_size,
+                global_denominator=cast(torch.Tensor | None, batch.get("kd_gram_denominator")),
+            )
+            kd_total = self._kd.lambda_seed * kd_seed + self._kd.lambda_gram * kd_gram
+            total = total + kd_total
+            # KD is representation supervision, not an edge-family member:
+            # folded into `total` (and logged via `parts`) rather than into
+            # the frozen stage1 families the gradient probe enumerates.
+            parts["kd_seed"] = float(kd_seed.detach())
+            parts["kd_gram"] = float(kd_gram.detach())
+            parts["total"] = float(total.detach())
+            kd_stats = {
+                "seed_sum": float(kd_seed_sum.detach()),
+                "gram_sum": float(kd_gram_sum.detach()),
+                "live_rows": float(kd_live_rows.detach()),
+                "gram_live_rows": float(kd_gram_live_rows.detach()),
+            }
         parameter_anchor = (
             0.0
             * torch.stack(
@@ -2944,6 +3311,8 @@ class _CompositeStep(torch.nn.Module):
             "loss": total,
             "parts": parts,
         }
+        if kd_stats is not None:
+            result["kd_stats"] = kd_stats
         if collect_diagnostics:
             result["families"] = families
             result.update(extra)
@@ -3171,6 +3540,7 @@ class _ValidationResult:
     fidelity: dict[str, float]
     scale_telemetry: dict[str, float] = field(default_factory=dict)
     timing: dict[str, float] = field(default_factory=dict)
+    topology_scope: Literal["cascade", "full"] = "full"
     active_logits: NDArray[np.float32] = field(default_factory=lambda: np.empty(0, dtype="<f4"))
 
 
@@ -3476,6 +3846,7 @@ def _validate_epoch(
     topk_fraction: float,
     token_table: PackedFeatureTable | None = None,
     token_node_index: Mapping[str, int] | None = None,
+    topology_scope: Literal["cascade", "full"] = "full",
 ) -> _ValidationResult | None:
     """Score the validation pairs with exact distributed coverage.
 
@@ -3519,7 +3890,12 @@ def _validate_epoch(
     # The complete V_val region when one was derived; the toy-fixture fallback
     # (no `val_split`) keeps the old shard-local touched-node set, since those
     # fixtures build `val_pairs` by hand with no V_val region behind them.
-    reference = data.val_topology_reference
+    if topology_scope == "full":
+        reference = data.val_topology_reference
+        ball_union = data.val_ball_union
+    else:
+        reference = data.val_cascade_topology_reference
+        ball_union = data.val_cascade_ball_union
     encode_nodes = (
         list(reference.nodes)
         if reference is not None
@@ -3708,6 +4084,7 @@ def _validate_epoch(
     pair_scoring_seconds = float(phase_timing_rows[:, 1].max().item())
     gathered_values = accelerator.gather(local_values)
     gathered_rows = accelerator.gather(local_rows)
+    gather_seconds = time.monotonic() - gather_metrics_started
 
     # Lean topology-universe pass: active-arm logit only, over the exact
     # deduplicated ball-union pairs U. Runs on
@@ -3715,7 +4092,6 @@ def _validate_epoch(
     # mirroring the classification pass's DDP-fail-closed discipline -- a
     # partial gather here would silently assemble the topology graph from a
     # subset of the row set.
-    ball_union = data.val_ball_union
     universe_started = time.monotonic()
     universe_logits = (
         _score_val_universe_logits(
@@ -3730,6 +4106,7 @@ def _validate_epoch(
         model.train()
     if not accelerator.is_main_process:
         return None
+    metrics_started = time.monotonic()
     rows_np = gathered_rows.cpu().numpy()
     values_np = gathered_values.cpu().numpy()
     seen: dict[int, list[float]] = {}
@@ -3803,12 +4180,14 @@ def _validate_epoch(
         "clustering_mmd_ratio": validation_topology.clustering_mmd,
         "spectral_mmd_ratio": validation_topology.spectral_mmd,
         "val_threshold": val_threshold,
+        "topology_validation_full": float(topology_scope == "full"),
+        "topology_scored_rows": float(0 if ball_union is None else ball_union.u_idx.size),
         "prevalence": float(np.mean(data.val_labels)),
         **dispersion_summary,
         **e2e_degree_decorrelation_telemetry(endpoint_degree, full_np - f_np),
     }
     active_metrics = compute_edge_metrics(data.val_labels.astype(np.int64), probs)
-    gather_metrics_seconds = time.monotonic() - gather_metrics_started
+    gather_metrics_seconds = gather_seconds + (time.monotonic() - metrics_started)
     return _ValidationResult(
         metrics=active_metrics,
         fidelity=fidelity,
@@ -3819,6 +4198,7 @@ def _validate_epoch(
             "gather_metrics_seconds": gather_metrics_seconds,
             "val_universe_scoring_seconds": universe_seconds,
         },
+        topology_scope=topology_scope,
         active_logits=np.asarray(logits_np, dtype="<f4"),
     )
 
@@ -3842,6 +4222,21 @@ class EgoTrainResult:
     kendall_state: dict[str, object]
 
 
+def _e2e_topology_validation_scope(
+    epoch: int,
+    total_epochs: int,
+    config: EgoTopologyValidationConfig,
+) -> Literal["cascade", "full"]:
+    """Return the fixed two-resolution validation scope for one epoch."""
+    if epoch <= 0 or total_epochs <= 0 or epoch > total_epochs:
+        raise ValueError(f"invalid epoch position {epoch}/{total_epochs}")
+    if config.full_every_epochs <= 0:
+        raise ValueError("topology full-validation interval must be positive")
+    if epoch % config.full_every_epochs == 0 or epoch == total_epochs:
+        return "full"
+    return "cascade"
+
+
 def _cpu_state_dict(accelerator: Accelerator, wrapped: torch.nn.Module) -> dict[str, torch.Tensor]:
     """Detached CPU copy of the *inner* EgoStitch model's state dict."""
     inner = accelerator.unwrap_model(wrapped)
@@ -3860,6 +4255,8 @@ def _e2e_arm_name_from_config(config: E2EConfig) -> E2EArmName:
         return "oracle"
     if config.generator.name == "full_ego_oracle":
         return "full_ego_oracle"
+    if config.generator.name == "full_ego_features":
+        return "full_ego_features"
     if config.classifier.permanent_null == "all_head":
         return "b0_e2e_f_only"
     if config.classifier.p_topo == 0.0:
@@ -3982,6 +4379,8 @@ def _e2e_training_payload(
     total_steps: int,
     device: torch.device,
     edge_loss_denominator: torch.Tensor | None = None,
+    kd_seed_denominator: torch.Tensor | None = None,
+    kd_gram_denominator: torch.Tensor | None = None,
 ) -> dict[str, object]:
     return {
         "node": _to_device(batch.node, device),
@@ -3999,6 +4398,8 @@ def _e2e_training_payload(
         "epoch": epoch,
         "step": micro_step,
         "edge_loss_denominator": edge_loss_denominator,
+        "kd_seed_denominator": kd_seed_denominator,
+        "kd_gram_denominator": kd_gram_denominator,
         "positive_weight": (cfg.training.positive_weight if cfg.training is not None else 5.0),
     }
 
@@ -4547,7 +4948,15 @@ def _train_e2e_stability_loop(
     use_cuda = accelerator.device.type == "cuda"
 
     parameter_groups = build_e2e_parameter_groups(model)
-    composite = _CompositeStep(model, world)
+    kd_runtime = (
+        _build_kd_runtime(cfg.distill, model, device=accelerator.device)
+        if cfg.distill is not None
+        else None
+    )
+    kd_generator = (
+        cast(FullEgoFeaturesGenerator, model.generator) if kd_runtime is not None else None
+    )
+    composite = _CompositeStep(model, world, kd=kd_runtime)
     optimizer = torch.optim.AdamW(
         [
             {"params": parameter_groups.groups[name], "lr": training.lr_peak, "name": name}
@@ -4713,9 +5122,12 @@ def _train_e2e_stability_loop(
         "node_cache_encode_seconds": 0.0,
         "pair_scoring_seconds": 0.0,
         "gather_metrics_seconds": 0.0,
+        "val_universe_scoring_seconds": 0.0,
     }
     global_step = 0
     prefetch_depth = cfg.runtime.prefetch_factor if cfg.runtime is not None else 1
+    full_topology_validations = 0
+    cascade_topology_validations = 0
 
     for epoch, epoch_steps in enumerate(epoch_step_counts, start=1):
         epoch_started = time.monotonic()
@@ -4724,6 +5136,7 @@ def _train_e2e_stability_loop(
         epoch_local_tokens = 0
         epoch_global_pairs = 0
         epoch_parts: dict[str, float] = {}
+        epoch_kd_local = [0.0, 0.0, 0.0, 0.0]
         epoch_probes: list[dict[str, object]] = []
         epoch_validation_seconds = 0.0
         epoch_validation_timing = dict.fromkeys(total_validation_timing, 0.0)
@@ -4765,6 +5178,31 @@ def _train_e2e_stability_loop(
                     raise RuntimeError(
                         "global accumulated weighted-BCE denominator must be finite and positive"
                     )
+                kd_seed_denominator: torch.Tensor | None = None
+                kd_gram_denominator: torch.Tensor | None = None
+                if kd_runtime is not None:
+                    assert kd_generator is not None
+                    local_kd_rows = torch.zeros(2, dtype=torch.float32)
+                    for batch in window:
+                        live = batch.edge["edge_mask"].to(dtype=torch.bool)
+                        candidate_counts = kd_generator.candidate_node_counts(
+                            batch.edge["node_row_i"], batch.edge["node_row_j"]
+                        )
+                        local_kd_rows[0] += live.sum()
+                        local_kd_rows[1] += (live & (candidate_counts >= 2)).sum()
+                    kd_denominators = accelerator.reduce(
+                        local_kd_rows.to(accelerator.device), reduction="sum"
+                    )
+                    kd_seed_denominator = kd_denominators[0]
+                    kd_gram_denominator = kd_denominators[1]
+                    if (
+                        not bool(torch.isfinite(kd_denominators).all())
+                        or float(kd_seed_denominator) <= 0.0
+                        or float(kd_gram_denominator) < 0.0
+                    ):
+                        raise RuntimeError(
+                            "global accumulated KD denominators must be finite with seed rows"
+                        )
                 optimizer.zero_grad(set_to_none=True)
                 out: dict[str, object] | None = None
                 loss: torch.Tensor | None = None
@@ -4780,10 +5218,14 @@ def _train_e2e_stability_loop(
                         total_steps=schedule_total_steps,
                         device=accelerator.device,
                         edge_loss_denominator=edge_loss_denominator,
+                        kd_seed_denominator=kd_seed_denominator,
+                        kd_gram_denominator=kd_gram_denominator,
                     )
                     if fixed_replay is None:
                         fixed_replay = cast(dict[str, object], _detached_clone(payload))
                         fixed_replay.pop("edge_loss_denominator", None)
+                        fixed_replay.pop("kd_seed_denominator", None)
+                        fixed_replay.pop("kd_gram_denominator", None)
                     synchronization = (
                         accelerator.no_sync(wrapped)
                         if micro_index + 1 < len(window)
@@ -4804,6 +5246,12 @@ def _train_e2e_stability_loop(
                         accelerator.backward(loss)
                     for name, value in cast(dict[str, float], out["parts"]).items():
                         window_parts[name] = window_parts.get(name, 0.0) + value
+                    if kd_runtime is not None:
+                        kd_stats = cast(dict[str, float], out["kd_stats"])
+                        epoch_kd_local[0] += kd_stats["seed_sum"]
+                        epoch_kd_local[1] += kd_stats["gram_sum"]
+                        epoch_kd_local[2] += kd_stats["live_rows"]
+                        epoch_kd_local[3] += kd_stats["gram_live_rows"]
                     micro_step_in_epoch += 1
                     epoch_local_pairs += batch.edge_rows_true
                     epoch_local_tokens += batch.f0_rows_gathered
@@ -4998,6 +5446,11 @@ def _train_e2e_stability_loop(
                         topk_fraction=cfg.diagnostics.topk_fraction,
                         token_table=factory._token_table,
                         token_node_index=factory._token_node_index,
+                        topology_scope=_e2e_topology_validation_scope(
+                            epoch,
+                            cfg.optim.epochs,
+                            cfg.topology_validation,
+                        ),
                     )
                     epoch_validation_seconds += time.monotonic() - phase_a_validation_started
                     if warm is not None:
@@ -5075,6 +5528,29 @@ def _train_e2e_stability_loop(
         finally:
             batches.close()
 
+        if kd_runtime is not None:
+            epoch_kd_global = accelerator.reduce(
+                torch.tensor(epoch_kd_local, device=accelerator.device, dtype=torch.float64),
+                reduction="sum",
+            )
+            if (
+                not bool(torch.isfinite(epoch_kd_global).all())
+                or float(epoch_kd_global[2]) <= 0.0
+                or float(epoch_kd_global[3]) < 0.0
+            ):
+                raise RuntimeError("global epoch KD telemetry must be finite with live rows")
+            epoch_parts["kd_seed"] = float(epoch_kd_global[0] / epoch_kd_global[2])
+            epoch_parts["kd_gram"] = (
+                float(epoch_kd_global[1] / epoch_kd_global[3])
+                if float(epoch_kd_global[3]) > 0.0
+                else 0.0
+            )
+
+        topology_scope = _e2e_topology_validation_scope(
+            epoch,
+            cfg.optim.epochs,
+            cfg.topology_validation,
+        )
         validation_started = time.monotonic()
         validation = _validate_epoch(
             model,
@@ -5084,11 +5560,16 @@ def _train_e2e_stability_loop(
             topk_fraction=cfg.diagnostics.topk_fraction,
             token_table=factory._token_table,
             token_node_index=factory._token_node_index,
+            topology_scope=topology_scope,
         )
         epoch_validation_seconds += time.monotonic() - validation_started
         if validation is not None:
             for name in epoch_validation_timing:
                 epoch_validation_timing[name] += validation.timing.get(name, 0.0)
+        if topology_scope == "full":
+            full_topology_validations += 1
+        else:
+            cascade_topology_validations += 1
         record_validation_event("epoch_end", epoch, global_step)
         validation_seconds = epoch_validation_seconds
         epoch_wall = time.monotonic() - epoch_started
@@ -5202,27 +5683,28 @@ def _train_e2e_stability_loop(
                 validation.scale_telemetry.get("h_norm_mean", float("nan")),
                 validation.scale_telemetry.get("h_pairwise_sqdist_mean", float("nan")),
             )
-            record = E2ECheckpointRecord(
-                epoch=epoch,
-                phase=phase.phase,
-                full_joint_epochs_completed=full_joint_epochs,
-                guards_passed=quality_guards_passed,
-                auprc=metrics.auprc,
-                prevalence=fidelity["prevalence"],
-                active_logit_std=fidelity["active_logit_std"],
-                gs=fidelity["gs_bfs"],
-                rd=fidelity["rd_bfs"],
-                degree_mmd=fidelity["degree_mmd_ratio"],
-                clustering_mmd=fidelity["clustering_mmd_ratio"],
-                spectral_mmd=fidelity["spectral_mmd_ratio"],
-                brier=metrics.brier,
-                warm_reference_std=warm_reference_std,
-                warm_reference_auprc=warm_reference_auprc,
-                residual_ratio=fidelity["topology_delta_ratio"],
-                topology_gradient_norm=latest_topology_norm,
-            )
-            records.append(record)
-            metrics_by_epoch[epoch] = metrics
+            if topology_scope == "full":
+                record = E2ECheckpointRecord(
+                    epoch=epoch,
+                    phase=phase.phase,
+                    full_joint_epochs_completed=full_joint_epochs,
+                    guards_passed=quality_guards_passed,
+                    auprc=metrics.auprc,
+                    prevalence=fidelity["prevalence"],
+                    active_logit_std=fidelity["active_logit_std"],
+                    gs=fidelity["gs_bfs"],
+                    rd=fidelity["rd_bfs"],
+                    degree_mmd=fidelity["degree_mmd_ratio"],
+                    clustering_mmd=fidelity["clustering_mmd_ratio"],
+                    spectral_mmd=fidelity["spectral_mmd_ratio"],
+                    brier=metrics.brier,
+                    warm_reference_std=warm_reference_std,
+                    warm_reference_auprc=warm_reference_auprc,
+                    residual_ratio=fidelity["topology_delta_ratio"],
+                    topology_gradient_norm=latest_topology_norm,
+                )
+                records.append(record)
+                metrics_by_epoch[epoch] = metrics
             # Snapshot every completed epoch. Quality predicates remain in the
             # history as telemetry but do not control checkpoint availability.
             if not profile_only:
@@ -5235,6 +5717,7 @@ def _train_e2e_stability_loop(
                     "phase": phase.phase,
                     "auroc": metrics.auroc,
                     "auprc": metrics.auprc,
+                    "topology_validation_scope": topology_scope,
                     "lr": float(optimizer.param_groups[0]["lr"]),
                     "fidelity": fidelity,
                     "quality_thresholds": {
@@ -5275,6 +5758,7 @@ def _train_e2e_stability_loop(
                 "data_wait_seconds": epoch_data_wait,
                 "compute_seconds": max(epoch_wall - epoch_data_wait - validation_seconds, 0.0),
                 "validation_seconds": validation_seconds,
+                "topology_validation_scope": topology_scope,
                 **epoch_validation_timing,
             }
         )
@@ -5437,6 +5921,8 @@ def _train_e2e_stability_loop(
     runtime_profile: dict[str, object] = {
         "epochs_completed": len(epoch_step_counts),
         "validations_completed": len(epoch_step_counts),
+        "full_topology_validations_completed": full_topology_validations,
+        "cascade_topology_validations_completed": cascade_topology_validations,
         "val_region_validation_event_count": len(validation_events),
         "val_region_validation_events": validation_events,
         "peak_memory_gib_per_rank": [float(row[4]) for row in rank_stats],
@@ -6003,6 +6489,12 @@ def _install_oracle_context(model: EgoStitchModel, data: EgoStitchData, *, run_k
         # isolates in the full-oracle truth context.
         full_truth_graph.add_nodes_from(ordered_node_ids)
         model.generator.set_oracle_context(full_truth_graph, ordered_node_ids)
+        if isinstance(model.generator, FullEgoFeaturesGenerator):
+            # Same rows, same order: `data.f0` is the training-universe F0
+            # matrix `ordered_node_ids` was derived from above. Truth-graph
+            # nodes outside it (featureless survivors) gather zeros with an
+            # explicit has_f0=0 indicator inside the generator.
+            model.generator.set_node_features(data.f0, ordered_node_ids)
     logger.info(
         "installed oracle truth context generator=%s rows=%d truth_source=%s",
         model.cfg.generator.name,
@@ -6043,7 +6535,7 @@ def _run_ddp_worker(cfg: EgoConfig, args: EgoCliArgs) -> None:
     data = assemble_egostitch_data(cfg, pack_dir=args.pack_dir)
     model = EgoStitchModel(E2EConfig.from_mapping(cfg.model.config))
     feature_stats_sha256 = _bind_feature_standardization(model, cfg, data)
-    if model.cfg.generator.name in ("oracle_struct", "full_ego_oracle"):
+    if model.cfg.generator.name in ("oracle_struct", "full_ego_oracle", "full_ego_features"):
         _install_oracle_context(model, data, run_kind=effective_run_kind)
     _run_ddp_dispatch(
         cfg,

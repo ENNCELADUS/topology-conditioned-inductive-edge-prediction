@@ -2669,6 +2669,23 @@ def test_full_oracle_batched_scoring_matches_singleton_and_inline_prefetch(
         np.testing.assert_array_equal(prefetched[key], inline[key])
 
 
+def test_full_ego_graph_tensor_transfer_preserves_feature_subtype() -> None:
+    from src.model.egostitch.generator.full_oracle import FeatureEgoGraph
+
+    graph = FeatureEgoGraph(
+        x=torch.randn(2, 3, 9),
+        adj=torch.zeros(2, 1, 3, 3),
+        mask=torch.ones(2, 3),
+        aux={"plan": torch.ones(2, 3, 3)},
+        directed=True,
+    )
+
+    transferred = score_universe._map_full_ego_graph_tensors(graph, torch.clone)
+
+    assert type(transferred) is FeatureEgoGraph
+    assert transferred.swapped().x.shape == graph.x.shape
+
+
 def test_full_oracle_balanced_shards_merge_to_unsharded_with_empty_shard(
     tmp_path: Path,
 ) -> None:

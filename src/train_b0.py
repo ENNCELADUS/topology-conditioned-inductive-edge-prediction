@@ -42,10 +42,12 @@ from typing import Any, Literal, NamedTuple, TypeVar, cast
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import yaml
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import broadcast_object_list, gather_object, set_seed
+from torch.distributed.nn.functional import all_gather as differentiable_all_gather
 from torch.utils.data import DataLoader, Sampler
 
 from src.data.artifacts import ArtifactVerificationError, Benchmark, load_benchmark
@@ -75,8 +77,11 @@ from src.data.val_region import (
 from src.distill.artifacts import KDRowTargets, load_kd_targets
 from src.distill.config import DistillConfig
 from src.distill.losses import (
+    kd_dist_loss,
+    kd_gram_loss,
     kd_kl_loss,
     kd_logit_loss,
+    kd_rank_loss,
     kd_rep_loss,
     kd_seed_gram_loss,
     kd_seed_loss,
@@ -222,10 +227,13 @@ class EvalConfig:
     Attributes:
         patience: Early stop after this many evals without val-AUPRC improvement.
         eval_every: Evaluate every N epochs.
+        classification_only: Skip topology validation, select the checkpoint by
+            validation AUPRC, and stop when ``patience`` is exhausted.
     """
 
     patience: int
     eval_every: int
+    classification_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -338,6 +346,13 @@ def _as_str(value: object, name: str) -> str:
     """Validate that a config value is a string."""
     if not isinstance(value, str):
         raise ValueError(f"config key '{name}' must be a string, got {value!r}")
+    return value
+
+
+def _as_bool(value: object, name: str) -> bool:
+    """Validate that a config value is a boolean."""
+    if not isinstance(value, bool):
+        raise ValueError(f"config key '{name}' must be a bool, got {value!r}")
     return value
 
 
@@ -710,10 +725,15 @@ def load_config(path: Path) -> Config:
         raise ValueError(f"optim.epochs must be >= 1, got {optim.epochs}")
 
     eval_raw = _as_mapping(_require(raw, "eval", ""), "eval")
-    _check_no_unknown_keys(eval_raw, ("patience", "eval_every"), "eval")
+    _check_no_unknown_keys(
+        eval_raw, ("patience", "eval_every", "classification_only"), "eval"
+    )
     eval_cfg = EvalConfig(
         patience=_as_int(_require(eval_raw, "patience", "eval."), "eval.patience"),
         eval_every=_as_int(_require(eval_raw, "eval_every", "eval."), "eval.eval_every"),
+        classification_only=_as_bool(
+            eval_raw.get("classification_only", False), "eval.classification_only"
+        ),
     )
 
     mixed_precision_raw = _require(raw, "mixed_precision", "")
@@ -2202,9 +2222,10 @@ def _evaluate_distributed(
     label_parts: list[torch.Tensor] = []
     logit_parts: list[torch.Tensor] = []
     diag_parts: list[torch.Tensor] = []
+    relational_block = torch.zeros(3, dtype=torch.float64, device=accelerator.device)
     inject_seeds = kd_val is not None and kd_val.teacher_seeds is not None
     collect_diag = kd_val is not None and (
-        kd_val.teacher_rep is not None or kd_val.teacher_seeds is not None
+        kd_val.arm == "kd_rep" or kd_val.teacher_seeds is not None
     )
     # Injected seeds make `forward_kd`'s posterior path draw `torch.randn_like`
     # even under eval/no_grad; fork the RNG so this diagnostic-only pass never
@@ -2224,6 +2245,43 @@ def _evaluate_distributed(
             row_id_parts.append(batch["_row_id"].detach().to(torch.int64))
             label_parts.append(batch["label"].detach().to(torch.float32))
             logit_parts.append(logits.detach().to(torch.float32))
+            if kd_val is not None and kd_val.arm == "kd_rank":
+                assert kd_val.endpoint_a is not None and kd_val.endpoint_b is not None
+                rows = batch["_row_id"]
+                teacher = kd_val.teacher_logit[rows].float()
+                endpoint_a = kd_val.endpoint_a[rows]
+                endpoint_b = kd_val.endpoint_b[rows]
+                non_self = endpoint_a != endpoint_b
+                groups = torch.cat([endpoint_a, endpoint_b[non_self]])
+                counts = torch.unique(groups, return_counts=True)[1]
+                if bool((counts >= 2).any()):
+                    grouped_student = torch.cat([logits.float(), logits.float()[non_self]])
+                    grouped_teacher = torch.cat([teacher, teacher[non_self]])
+                    relational_block[0] += kd_rank_loss(
+                        grouped_student,
+                        grouped_teacher,
+                        groups,
+                        margin=kd_val.margin,
+                    ).double()
+                    relational_block[1] += kd_dist_loss(
+                        grouped_student,
+                        grouped_teacher,
+                        groups,
+                        temperature=kd_val.temperature,
+                    ).double()
+                    relational_block[2] += 1.0
+            if kd_val is not None and kd_val.arm == "kd_gram":
+                rows = batch["_row_id"]
+                student_rep = output.get("pair_repr")
+                if student_rep is None or kd_val.teacher_rep is None:
+                    raise RuntimeError(
+                        "kd_gram validation block diagnostics require pair_repr and teacher_rep"
+                    )
+                if rows.numel() >= 2:
+                    relational_block[0] += kd_gram_loss(
+                        student_rep.float(), kd_val.teacher_rep[rows].float()
+                    ).double()
+                    relational_block[2] += 1.0
             if collect_diag:
                 assert kd_val is not None
                 rows = batch["_row_id"]
@@ -2292,6 +2350,9 @@ def _evaluate_distributed(
     if collect_diag:
         padded_diag = accelerator.pad_across_processes(local_diag, dim=0, pad_index=0)
         gathered_diag = accelerator.gather(padded_diag)
+    reduced_relational_block = relational_block
+    if kd_val is not None and kd_val.arm in {"kd_rank", "kd_gram"}:
+        reduced_relational_block = accelerator.reduce(relational_block, reduction="sum")
 
     # Coverage must be validated symmetrically: accelerator.gather returns the
     # full gathered tensors on EVERY rank, so every rank masks the padding and
@@ -2344,6 +2405,18 @@ def _evaluate_distributed(
                 )
                 prob_err = np.abs(_stable_sigmoid(logits64) - _stable_sigmoid(teacher64))
                 kd_metrics["val_kd_prob_mae"] = float(prob_err.mean())
+            block_count = float(reduced_relational_block[2].item())
+            if block_count > 0.0 and kd_val.arm == "kd_rank":
+                kd_metrics["val_kd_rank_block_loss"] = (
+                    float(reduced_relational_block[0].item()) / block_count
+                )
+                kd_metrics["val_kd_dist_block_loss"] = (
+                    float(reduced_relational_block[1].item()) / block_count
+                )
+            if block_count > 0.0 and kd_val.arm == "kd_gram":
+                kd_metrics["val_kd_gram_block_loss"] = (
+                    float(reduced_relational_block[0].item()) / block_count
+                )
             outcome_dict["kd"] = kd_metrics
         outcome_payload[0] = outcome_dict
 
@@ -2556,6 +2629,10 @@ class KDValDiagnostics:
     teacher_logit_np: np.ndarray
     teacher_rep: torch.Tensor | None
     teacher_seeds: torch.Tensor | None
+    endpoint_a: torch.Tensor | None = None
+    endpoint_b: torch.Tensor | None = None
+    margin: float = 0.1
+    temperature: float = 1.0
 
 
 def _pearson_from_moments(
@@ -2571,6 +2648,75 @@ def _pearson_from_moments(
         return 0.0
     cov = sum_st / n - mean_s * mean_t
     return float(cov / denom)
+
+
+class GlobalRelationalRows(NamedTuple):
+    """One global optimizer step's row-aligned inputs for D2/D3."""
+
+    student: torch.Tensor
+    teacher: torch.Tensor
+    endpoint_a: torch.Tensor
+    endpoint_b: torch.Tensor
+    row_ids: torch.Tensor
+
+
+def _pad_first_dim(tensor: torch.Tensor, size: int) -> torch.Tensor:
+    """Pad ``tensor`` with zero rows to ``size`` without detaching live rows."""
+    if tensor.shape[0] == size:
+        return tensor
+    padding = tensor.new_zeros((size - tensor.shape[0], *tensor.shape[1:]))
+    return torch.cat([tensor, padding], dim=0)
+
+
+def _gather_global_relational_rows(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    endpoint_a: torch.Tensor,
+    endpoint_b: torch.Tensor,
+    row_ids: torch.Tensor,
+    *,
+    world_size: int,
+) -> GlobalRelationalRows:
+    """Differentiably gather a variable-length official-row batch across ranks.
+
+    Student values use ``torch.distributed.nn.functional.all_gather`` so the
+    global D2/D3 loss propagates to every rank's one local forward. Teacher
+    values, endpoints, and row IDs are detached metadata. Every rank computes
+    the same global scalar; differentiable all-gather's SUM reduce-scatter in
+    backward followed by DDP's parameter-gradient mean gives the gradient of
+    that scalar exactly, so callers must not apply row-count scaling again.
+    """
+    if world_size == 1:
+        return GlobalRelationalRows(student, teacher, endpoint_a, endpoint_b, row_ids)
+    if not dist.is_initialized() or dist.get_world_size() != world_size:
+        raise RuntimeError("global relational KD requires the initialized DDP process group")
+
+    local_size = torch.tensor([student.shape[0]], dtype=torch.int64, device=student.device)
+    size_parts = [torch.empty_like(local_size) for _ in range(world_size)]
+    dist.all_gather(size_parts, local_size)
+    sizes = [int(part.item()) for part in size_parts]
+    max_size = max(sizes)
+
+    student_parts = differentiable_all_gather(  # type: ignore[no-untyped-call]
+        _pad_first_dim(student, max_size)
+    )
+    global_student = torch.cat(
+        [part[:size] for part, size in zip(student_parts, sizes, strict=True)], dim=0
+    )
+
+    def gather_metadata(tensor: torch.Tensor) -> torch.Tensor:
+        padded = _pad_first_dim(tensor.detach(), max_size)
+        parts = [torch.empty_like(padded) for _ in range(world_size)]
+        dist.all_gather(parts, padded)
+        return torch.cat([part[:size] for part, size in zip(parts, sizes, strict=True)], dim=0)
+
+    global_teacher = gather_metadata(teacher)
+    global_a = gather_metadata(endpoint_a)
+    global_b = gather_metadata(endpoint_b)
+    global_row_ids = gather_metadata(row_ids)
+    if torch.unique(global_row_ids).numel() != global_row_ids.numel():
+        raise ValueError("duplicate official training row IDs in one global relational KD step")
+    return GlobalRelationalRows(global_student, global_teacher, global_a, global_b, global_row_ids)
 
 
 class KDRowBank:
@@ -2633,11 +2779,16 @@ class KDRowBank:
         """
         self.arm = distill.arm
         self._w_logit = distill.w_logit
+        self._w_rank = distill.w_rank
+        self._w_dist = distill.w_dist
+        self._w_gram = distill.w_gram
         self._w_rep = distill.w_rep
         self._w_seed = distill.w_seed
         self._w_geom = distill.w_geom
         self._w_kl = distill.w_kl
         self._kl_warmup_steps = distill.kl_warmup_steps
+        self._margin = distill.margin
+        self._temperature = distill.temperature
         self.last_kl_warmup_scale = 1.0
 
         node_ids_arr = np.asarray(targets.node_ids, dtype=object)
@@ -2710,8 +2861,13 @@ class KDRowBank:
         self.train_logit = torch.as_tensor(
             targets.teacher_logit, dtype=torch.float32, device=device
         )
+        self.train_a_idx: torch.Tensor | None = None
+        self.train_b_idx: torch.Tensor | None = None
+        if self.arm in {"kd_rank", "kd_gram"}:
+            self.train_a_idx = torch.as_tensor(targets.pair_a_idx, dtype=torch.int64, device=device)
+            self.train_b_idx = torch.as_tensor(targets.pair_b_idx, dtype=torch.int64, device=device)
         self.train_rep: torch.Tensor | None = None
-        if distill.w_rep > 0.0:
+        if distill.w_rep > 0.0 or distill.w_gram > 0.0:
             self.train_rep = torch.as_tensor(
                 targets.teacher_rep, dtype=torch.float16, device=device
             )
@@ -2723,7 +2879,7 @@ class KDRowBank:
             )
 
         val_teacher_rep: torch.Tensor | None = None
-        if self.arm == "kd_rep":
+        if self.arm in {"kd_rep", "kd_gram"}:
             val_teacher_rep = torch.as_tensor(
                 targets.val_teacher_rep, dtype=torch.float16, device=device
             )
@@ -2741,6 +2897,18 @@ class KDRowBank:
             teacher_logit_np=np.asarray(targets.val_teacher_logit, dtype=np.float64),
             teacher_rep=val_teacher_rep,
             teacher_seeds=val_teacher_seeds,
+            endpoint_a=(
+                torch.as_tensor(targets.val_pair_a_idx, dtype=torch.int64, device=device)
+                if self.arm == "kd_rank"
+                else None
+            ),
+            endpoint_b=(
+                torch.as_tensor(targets.val_pair_b_idx, dtype=torch.int64, device=device)
+                if self.arm == "kd_rank"
+                else None
+            ),
+            margin=distill.margin,
+            temperature=distill.temperature,
         )
 
     @staticmethod
@@ -2788,7 +2956,12 @@ class KDRowBank:
         batch["kd_teacher_seeds"] = self.train_seeds.index_select(0, rows).float()
 
     def loss(
-        self, batch: Batch, output: dict[str, torch.Tensor], *, global_step: int
+        self,
+        batch: Batch,
+        output: dict[str, torch.Tensor],
+        *,
+        global_step: int,
+        world_size: int = 1,
     ) -> tuple[torch.Tensor, dict[str, float], torch.Tensor | None]:
         """Compute this step's KD loss and per-batch telemetry sums from the shared forward."""
         rows = batch["_row_id"]
@@ -2799,8 +2972,43 @@ class KDRowBank:
         teacher_logit = self.train_logit.index_select(0, rows)
 
         total = student_logit.new_zeros(())
+        rank_group_counts: torch.Tensor | None = None
         if self.arm == "kd_logit":
             total = total + self._w_logit * kd_logit_loss(student_logit, teacher_logit)
+
+        if self.arm == "kd_rank":
+            assert self.train_a_idx is not None and self.train_b_idx is not None
+            anchor_a = self.train_a_idx.index_select(0, rows)
+            anchor_b = self.train_b_idx.index_select(0, rows)
+            global_rows = _gather_global_relational_rows(
+                student_logit,
+                teacher_logit,
+                anchor_a,
+                anchor_b,
+                rows,
+                world_size=world_size,
+            )
+            student_logit_global = global_rows.student
+            teacher_logit_global = global_rows.teacher
+            anchor_a = global_rows.endpoint_a
+            anchor_b = global_rows.endpoint_b
+            non_self = anchor_a != anchor_b
+            anchor_group = torch.cat([anchor_a, anchor_b[non_self]])
+            rank_group_counts = torch.unique(anchor_group, return_counts=True)[1]
+            grouped_student = torch.cat([student_logit_global, student_logit_global[non_self]])
+            grouped_teacher = torch.cat([teacher_logit_global, teacher_logit_global[non_self]])
+            total = total + self._w_rank * kd_rank_loss(
+                grouped_student,
+                grouped_teacher,
+                anchor_group,
+                margin=self._margin,
+            )
+            total = total + self._w_dist * kd_dist_loss(
+                grouped_student,
+                grouped_teacher,
+                anchor_group,
+                temperature=self._temperature,
+            )
 
         with torch.no_grad():
             student_d = student_logit.detach().double()
@@ -2816,6 +3024,12 @@ class KDRowBank:
                     (torch.sigmoid(student_d) - torch.sigmoid(teacher_d)).abs().sum().item()
                 ),
             }
+            if rank_group_counts is not None:
+                eligible = rank_group_counts >= 2
+                stats["rank_groups"] = float(rank_group_counts.numel())
+                stats["rank_eligible_groups"] = float(eligible.sum().item())
+                stats["rank_roles"] = float(rank_group_counts.sum().item())
+                stats["rank_eligible_roles"] = float(rank_group_counts[eligible].sum().item())
 
         kl_dim_sum: torch.Tensor | None = None
 
@@ -2833,6 +3047,28 @@ class KDRowBank:
                     student_rep.float(), teacher_rep, dim=-1, eps=1e-8
                 )
                 stats["sum_rep_cos"] = float(cos.sum().item())
+
+        if self.arm == "kd_gram":
+            student_rep = output.get("pair_repr")
+            if student_rep is None:
+                raise RuntimeError("kd_gram requires the model forward to emit pair_repr")
+            assert (
+                self.train_rep is not None
+                and self.train_a_idx is not None
+                and self.train_b_idx is not None
+            )
+            teacher_rep = self.train_rep.index_select(0, rows).float()
+            global_rows = _gather_global_relational_rows(
+                student_rep.float(),
+                teacher_rep,
+                self.train_a_idx.index_select(0, rows),
+                self.train_b_idx.index_select(0, rows),
+                rows,
+                world_size=world_size,
+            )
+            gram_loss = kd_gram_loss(global_rows.student, global_rows.teacher)
+            total = total + self._w_gram * gram_loss
+            stats["sum_gram"] = float(gram_loss.detach().item()) * stats["rows"]
 
         if self.arm == "kd_d9":
             teacher_seeds = batch.get("kd_teacher_seeds")
@@ -2923,6 +3159,15 @@ class KDRowBank:
         }
         if self.arm == "kd_rep":
             telemetry["kd_rep_cos"] = reduced_sums["sum_rep_cos"] / n
+        if self.arm == "kd_rank":
+            telemetry["kd_rank_eligible_group_fraction"] = (
+                reduced_sums["rank_eligible_groups"] / reduced_sums["rank_groups"]
+            )
+            telemetry["kd_rank_eligible_role_fraction"] = (
+                reduced_sums["rank_eligible_roles"] / reduced_sums["rank_roles"]
+            )
+        if self.arm == "kd_gram":
+            telemetry["kd_gram"] = reduced_sums["sum_gram"] / n
         if self.arm == "kd_d9":
             if kl_dim_sum is None:
                 raise RuntimeError("kd_d9 epoch completed without KL dimension sums")
@@ -2953,6 +3198,11 @@ class KDRowBank:
         """Return the staged validation-row teacher targets for `_evaluate_distributed`."""
         return self._val
 
+    @property
+    def global_relational(self) -> bool:
+        """Whether the arm's KD scalar already covers the global DDP step."""
+        return self.arm in {"kd_rank", "kd_gram"}
+
 
 def _batch_pair_counts(batch: Batch, world_size: int) -> tuple[int, int]:
     """Return ``(local_count, global_count)`` for a batch, tolerating plain batches."""
@@ -2967,6 +3217,25 @@ def _batch_pair_counts(batch: Batch, world_size: int) -> tuple[int, int]:
     return local_count, global_count
 
 
+def _scale_kd_loss(
+    kd_bank: KDRowBank,
+    kd_loss: torch.Tensor,
+    *,
+    local_count: int,
+    global_count: int,
+    world_size: int,
+) -> torch.Tensor:
+    """Scale row-local KD means, leaving global D2/D3 objectives unchanged."""
+    if kd_bank.global_relational:
+        return kd_loss
+    return scale_ddp_mean_loss(
+        kd_loss,
+        local_count=local_count,
+        global_count=global_count,
+        world_size=world_size,
+    )
+
+
 def _term_grad_norms(
     task_loss: torch.Tensor, kd_loss: torch.Tensor, model: nn.Module
 ) -> tuple[float, float]:
@@ -2976,10 +3245,11 @@ def _term_grad_norms(
     reducer hooks are attached to (those only fire inside `Tensor.backward`),
     so this probe leaves the subsequent shared `accelerator.backward(loss)`
     call's graph and DDP's gradient-sync hooks untouched -- `retain_graph=True`
-    keeps both terms' graphs alive for that later call. The probe runs
-    identically (no collectives) on every rank, so there is no cross-rank
-    divergence risk. A term with no grad_fn (e.g. a constant KD loss from a
-    test double) reports a 0.0 norm rather than raising.
+    keeps both terms' graphs alive for that later call. D2/D3 KD graphs do
+    execute differentiable-all-gather backward collectives during this probe,
+    so every rank must enter `_term_grad_norms` in the same order; the training
+    loop guarantees that rank-symmetric call. A term with no grad_fn (e.g. a
+    constant KD loss from a test double) reports a 0.0 norm rather than raising.
     """
     params = [p for p in model.parameters() if p.requires_grad]
 
@@ -3014,10 +3284,10 @@ def train_ddp_loop(
 ) -> TrainResult:
     """Run fixed-epoch E2 DDP training and return rank-consistent metrics.
 
-    Trains exactly ``cfg.optim.epochs`` epochs with a validation after every
-    epoch. Patience is evaluated counterfactually only: the first epoch at which
-    it would have stopped is recorded in ``TrainResult.counterfactual_stop_epoch``
-    but the run never stops early. Tail batches are loss-scaled with
+    Normally trains exactly ``cfg.optim.epochs`` epochs with a validation after
+    every epoch and records patience counterfactually. When
+    ``eval.classification_only`` is enabled, patience performs real early stopping
+    and checkpoint selection uses validation AUPRC alone. Tail batches are loss-scaled with
     :func:`scale_ddp_mean_loss`; a non-finite loss on any rank aborts all ranks;
     and every epoch boundary asserts all ranks ran the same number of steps.
     Rank zero persists the completed epoch before the next epoch begins.
@@ -3072,6 +3342,7 @@ def train_ddp_loop(
     last_metrics: EdgeMetrics | None = None
     evals_without_improvement = 0
     counterfactual_stop_epoch: int | None = None
+    stopped_early = False
     global_step = 0
 
     per_epoch_profiles: list[dict[str, object]] = []
@@ -3245,6 +3516,9 @@ def train_ddp_loop(
         last_metrics = metrics_by_epoch[completed_epoch]
         best_auprc = max(metrics.auprc for metrics in metrics_by_epoch.values())
         start_epoch = completed_epoch + 1
+        if cfg.eval.classification_only and counterfactual_stop_epoch is not None:
+            stopped_early = True
+            start_epoch = cfg.optim.epochs + 1
 
     last_heartbeat = time.monotonic()
     for epoch in range(start_epoch, cfg.optim.epochs + 1):
@@ -3293,9 +3567,13 @@ def train_ddp_loop(
             )
             if kd_bank is not None:
                 kd_local, kd_stats, kd_kl_dims = kd_bank.loss(
-                    batch, output, global_step=global_step + 1
+                    batch,
+                    output,
+                    global_step=global_step + 1,
+                    world_size=world_size,
                 )
-                kd_loss = scale_ddp_mean_loss(
+                kd_loss = _scale_kd_loss(
+                    kd_bank,
                     kd_local,
                     local_count=local_count,
                     global_count=global_count,
@@ -3632,6 +3910,15 @@ def train_ddp_loop(
         broadcast_object_list(io_error, from_process=0)
         if io_error[0] is not None:
             raise RuntimeError(f"rank-zero epoch artifact write failed: {io_error[0]}")
+        if cfg.eval.classification_only and counterfactual_stop_epoch == epoch:
+            stopped_early = True
+            if accelerator.is_main_process:
+                logger.info(
+                    "early stopping at epoch %d (%d evals without val-AUPRC improvement)",
+                    epoch,
+                    cfg.eval.patience,
+                )
+            break
     if not metrics_by_epoch or last_metrics is None:
         raise RuntimeError("DDP training ended without a single evaluation")
 
@@ -3674,11 +3961,12 @@ def train_ddp_loop(
     slowest_train_seconds = max(float(values[3]) for values in rank_totals.tolist())
     global_tokens = int(rank_totals[:, 2].sum().item())
     steady_state_data_wait_fraction = max(data_wait_fractions, default=0.0)
+    last_epoch = max(metrics_by_epoch)
     runtime_profile: dict[str, object] = {
         "status": "trained",
         "global_step": global_step,
-        "epochs_completed": cfg.optim.epochs,
-        "validations_completed": cfg.optim.epochs,
+        "epochs_completed": last_epoch,
+        "validations_completed": last_epoch,
         "peak_memory_gib_per_rank": peak_memory_gib_per_rank,
         "steady_state_data_wait_fraction": steady_state_data_wait_fraction,
         "training_coverage_exact": True,
@@ -3695,6 +3983,7 @@ def train_ddp_loop(
             global_tokens / slowest_train_seconds if slowest_train_seconds > 0 else 0.0
         ),
         "validation_seconds": total_validation_seconds,
+        "stopped_early": stopped_early,
         "per_epoch": per_epoch_profiles,
     }
 
@@ -3720,10 +4009,16 @@ def train_ddp_loop(
             "resume across the V_val protocol change unsupported; start a fresh attempt dir"
         )
     else:
-        best_epoch = max(
-            sorted(metrics_by_epoch),
-            key=lambda epoch: (metrics_by_epoch[epoch].auprc, epoch),
-        )
+        if cfg.eval.classification_only:
+            best_epoch = max(
+                sorted(metrics_by_epoch),
+                key=lambda epoch: metrics_by_epoch[epoch].auprc,
+            )
+        else:
+            best_epoch = max(
+                sorted(metrics_by_epoch),
+                key=lambda epoch: (metrics_by_epoch[epoch].auprc, epoch),
+            )
     best_metrics = metrics_by_epoch[best_epoch]
 
     val_threshold_transfer: ValThresholdTransfer | None = None
@@ -3751,7 +4046,7 @@ def train_ddp_loop(
                 artifact_dir / "progress.json",
                 {
                     "status": "trained",
-                    "last_completed_epoch": cfg.optim.epochs,
+                    "last_completed_epoch": last_epoch,
                     "epochs_total": cfg.optim.epochs,
                     "global_step": global_step,
                     "selected_epoch": best_epoch,
@@ -3771,10 +4066,10 @@ def train_ddp_loop(
         best_epoch=best_epoch,
         best_val_metrics=best_metrics,
         last_state_dict=last_state,
-        last_epoch=cfg.optim.epochs,
+        last_epoch=last_epoch,
         last_val_metrics=last_metrics,
         history=history,
-        stopped_early=False,
+        stopped_early=stopped_early,
         counterfactual_stop_epoch=counterfactual_stop_epoch,
         runtime_profile=runtime_profile,
         val_threshold_transfer=val_threshold_transfer,
@@ -4119,15 +4414,6 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         return
 
     val_split = assembled.val_split
-    reference = build_val_topology_reference(val_split)
-    universe = val_ball_union_universe(val_split)
-    u_idx, v_idx = universe.u_idx, universe.v_idx
-    node_index = table.manifest.node_index()
-    lengths_by_node = {record.node_id: record.length for record in table.manifest.nodes}
-    node_positions = np.array([node_index[node] for node in reference.nodes], dtype=np.int64)
-    node_a_all = torch.from_numpy(node_positions[universe.u_idx]).to(torch.int64)
-    node_b_all = torch.from_numpy(node_positions[universe.v_idx]).to(torch.int64)
-    universe_boundary = max(lengths_by_node[node] for node in reference.nodes)
 
     val_cls_pairs, val_cls_labels = _val_cls_rows(val_split, assembled.exclude_nodes)
     num_val_rows = len(val_cls_pairs)
@@ -4158,28 +4444,45 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                 cfg.distill.targets_path,
             )
 
-    evaluate_fn = cast(
-        EvaluateFn,
-        functools.partial(
-            _evaluate_two_pass,
-            expected_row_ids=np.arange(num_val_rows, dtype=np.int64),
-            topology_eval_fn=cast(
-                TopologyEvalFn,
-                functools.partial(
-                    _evaluate_val_universe,
-                    table=table,
-                    node_a_all=node_a_all,
-                    node_b_all=node_b_all,
-                    boundary=universe_boundary,
-                    batch_pairs=runtime.max_pairs_per_rank,
-                    u_idx=u_idx,
-                    v_idx=v_idx,
-                    reference=reference,
-                ),
+    reference: ValTopologyReference | None = None
+    if cfg.eval.classification_only:
+        evaluate_fn = cast(
+            EvaluateFn,
+            functools.partial(
+                _evaluate_distributed,
+                expected_row_ids=np.arange(num_val_rows, dtype=np.int64),
+                kd_val=kd_val,
             ),
-            kd_val=kd_val,
-        ),
-    )
+        )
+    else:
+        reference = build_val_topology_reference(val_split)
+        universe = val_ball_union_universe(val_split)
+        u_idx, v_idx = universe.u_idx, universe.v_idx
+        node_index = table.manifest.node_index()
+        lengths_by_node = {record.node_id: record.length for record in table.manifest.nodes}
+        node_positions = np.array([node_index[node] for node in reference.nodes], dtype=np.int64)
+        evaluate_fn = cast(
+            EvaluateFn,
+            functools.partial(
+                _evaluate_two_pass,
+                expected_row_ids=np.arange(num_val_rows, dtype=np.int64),
+                topology_eval_fn=cast(
+                    TopologyEvalFn,
+                    functools.partial(
+                        _evaluate_val_universe,
+                        table=table,
+                        node_a_all=torch.from_numpy(node_positions[universe.u_idx]).to(torch.int64),
+                        node_b_all=torch.from_numpy(node_positions[universe.v_idx]).to(torch.int64),
+                        boundary=max(lengths_by_node[node] for node in reference.nodes),
+                        batch_pairs=runtime.max_pairs_per_rank,
+                        u_idx=u_idx,
+                        v_idx=v_idx,
+                        reference=reference,
+                    ),
+                ),
+                kd_val=kd_val,
+            ),
+        )
 
     if args.ddp_mode == "epoch-probe":
         one_epoch_cfg = replace(cfg, optim=replace(cfg.optim, epochs=1))
@@ -4213,7 +4516,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                     schedule_total_steps=schedule_total_steps,
                     evaluate_fn=evaluate_fn,
                     kd_bank=kd_bank,
-                    require_topology=True,
+                    require_topology=not cfg.eval.classification_only,
                 ),
             )
         except BaseException:
@@ -4252,7 +4555,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         schedule_total_steps=schedule_total_steps,
         evaluate_fn=evaluate_fn,
         kd_bank=kd_bank,
-        require_topology=True,
+        require_topology=not cfg.eval.classification_only,
         val_topology_reference=reference,
     )
     finalization_error: list[str | None] = [None]

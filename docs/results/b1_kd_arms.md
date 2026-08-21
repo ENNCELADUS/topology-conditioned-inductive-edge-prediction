@@ -1,7 +1,7 @@
 # B1 training-time KD arms: definitions and results
 
 **Status:** the nine `kd_control`/D1–D8 anchor-context runs below are retired as confounded and support
-no method claim, kept only as history. The active full-row protocol (`kd_control`/`kd_logit`/`kd_rep`/`kd_d9`) is defined in the final section and has no results yet.
+no method claim. The active full-row protocol (`kd_control`/`kd_logit`/`kd_rank`/`kd_gram`/`kd_rep`/`kd_d9`) is defined in the final section and has no results yet.
 
 ## Retired: sampled anchor-context KD arms (historical)
 
@@ -85,12 +85,13 @@ KD losses from one student forward on identical rows, joined by `_row_id`; there
 
 - `kd_control` -- no `distill:` section; matched control that zero KD weight must reproduce.
 - `kd_logit` -- `w_logit`: binary soft-target BCE to `sigmoid(teacher_logit)` (GLNN family).
+- `kd_rank` -- `w_rank`+`w_dist`: D2 margin ranking and per-anchor distribution KL; each official
+  non-self row participates under both endpoint anchors, without adding rows or another forward.
+- `kd_gram` -- `w_gram`: D3 cosine-Gram matching across all distinct batch rows, including rows that share an endpoint.
 - `kd_rep` -- `w_rep`: per-row cosine alignment of the student pair representation to `teacher_rep`.
-- `kd_d9` -- `w_seed`+`w_geom`+`w_kl`: CVAE pair-latent generation of `teacher_seeds`; design in
-  `docs/tmp/b1_kd_d9_pair_latent_generation_design.md`.
-
+- `kd_d9` -- `w_seed`+`w_geom`+`w_kl`: CVAE pair-latent generation of `teacher_seeds`; see `docs/tmp/b1_kd_d9_pair_latent_generation_design.md`.
 ### Telemetry
 
-Task/KD loss split, student-teacher logit correlation and probability error, representation cosine,
+Task/KD loss split, logit correlation/error, representation cosine, D2/D3 validation-block losses,
 per-term gradient norms, val AUPRC/ECE/Brier, and the five-number topology result (GS, RD, and the
 degree/clustering/spectral MMD ratios). **No results yet.**

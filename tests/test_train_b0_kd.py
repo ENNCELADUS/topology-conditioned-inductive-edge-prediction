@@ -19,20 +19,25 @@ import numpy as np
 import pytest
 import src.train_b0 as train_b0
 import torch
+import torch.distributed as dist
 from accelerate import Accelerator
 from src.distill.artifacts import KDRowTargets, load_kd_targets, write_kd_targets
 from src.distill.config import DistillConfig
-from src.distill.losses import kd_logit_loss
+from src.distill.losses import kd_dist_loss, kd_gram_loss, kd_logit_loss, kd_rank_loss
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.train_b0 import (
     KDRowBank,
     KDValDiagnostics,
     ValidationOutcome,
     _evaluate_distributed,
+    _gather_global_relational_rows,
     _pearson_from_moments,
+    _scale_kd_loss,
     train_ddp_loop,
 )
 from torch import nn
+from torch.multiprocessing.spawn import spawn
+from torch.nn.parallel import DistributedDataParallel
 
 from tests.test_train_b0 import (
     _batch_of,
@@ -45,6 +50,161 @@ from tests.test_train_b0 import (
 pytestmark = pytest.mark.unit
 
 Pair = tuple[str, str]
+
+
+class _ProductionRankToy(nn.Module):
+    """One-parameter scorer used by the production-seam DDP regression."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(0.25))
+        self.forward_calls = 0
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        self.forward_calls += 1
+        return {"logits": self.weight * batch["x"]}
+
+
+def _relational_ddp_worker(
+    rank: int, world_size: int, init_file: str, result_dir: str, arm: str
+) -> None:
+    """Run one real gloo DDP step where each rank alone has one relation-free row."""
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
+    )
+    try:
+        if arm.startswith("rank"):
+            base = nn.Linear(1, 1, bias=False)
+            with torch.no_grad():
+                base.weight.fill_(0.25)
+            model = DistributedDataParallel(base)
+            if arm == "rank_uneven" and rank == 1:
+                x = torch.tensor([[-1.0], [-0.5]])
+                teacher = torch.tensor([1.0, 0.5])
+                endpoint_a = torch.tensor([1, 2])
+                endpoint_b = torch.tensor([3, 4])
+                row_ids = torch.tensor([1, 2])
+            else:
+                x = torch.tensor([[1.0 if rank == 0 else -1.0]])
+                teacher = torch.tensor([-1.0 if rank == 0 else 1.0])
+                endpoint_a = torch.tensor([rank])
+                endpoint_b = torch.tensor([2 if arm == "rank" else 3])
+                row_ids = torch.tensor([rank])
+            student = model(x).squeeze(-1)
+            gathered = _gather_global_relational_rows(
+                student,
+                teacher,
+                endpoint_a,
+                endpoint_b,
+                row_ids,
+                world_size=world_size,
+            )
+            non_self = gathered.endpoint_a != gathered.endpoint_b
+            groups = torch.cat([gathered.endpoint_a, gathered.endpoint_b[non_self]])
+            grouped_student = torch.cat([gathered.student, gathered.student[non_self]])
+            grouped_teacher = torch.cat([gathered.teacher, gathered.teacher[non_self]])
+            loss = kd_rank_loss(grouped_student, grouped_teacher, groups) + kd_dist_loss(
+                grouped_student, grouped_teacher, groups
+            )
+        else:
+            base = nn.Linear(2, 2, bias=False)
+            with torch.no_grad():
+                base.weight.copy_(torch.eye(2))
+            model = DistributedDataParallel(base)
+            x = torch.tensor([[1.0, 0.0]]) if rank == 0 else torch.tensor([[1.0, 1.0]])
+            student = model(x)
+            teacher = torch.tensor([[1.0, 0.0]]) if rank == 0 else torch.tensor([[0.0, 1.0]])
+            gathered = _gather_global_relational_rows(
+                student,
+                teacher,
+                torch.tensor([rank]),
+                torch.tensor([2]),
+                torch.tensor([rank]),
+                world_size=world_size,
+            )
+            loss = kd_gram_loss(gathered.student, gathered.teacher)
+        probe = torch.autograd.grad(loss, tuple(base.parameters()), retain_graph=True)
+        assert all(torch.isfinite(gradient).all() for gradient in probe)
+        loss.backward()  # type: ignore[no-untyped-call]
+        gradient = base.weight.grad
+        assert gradient is not None
+        torch.save(
+            {"loss": loss.detach(), "grad": gradient.detach()},
+            Path(result_dir) / f"{arm}-{rank}.pt",
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def _production_rank_bank_worker(
+    rank: int, world_size: int, init_file: str, result_dir: str
+) -> None:
+    """Exercise KDRowBank.loss plus the production relational scaling decision."""
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
+    )
+    try:
+        targets = KDRowTargets(
+            node_ids=["n0", "n1", "n2", "n3", "n4"],
+            pair_a_idx=np.array([0, 1, 2], dtype=np.int32),
+            pair_b_idx=np.array([3, 3, 4], dtype=np.int32),
+            pair_label=np.array([1, 0, 0], dtype=np.int8),
+            teacher_logit=np.array([-1.0, 1.0, 0.5], dtype=np.float32),
+            teacher_rep=np.zeros((3, 2), dtype=np.float16),
+            val_pair_a_idx=np.array([0], dtype=np.int32),
+            val_pair_b_idx=np.array([3], dtype=np.int32),
+            val_pair_label=np.array([1], dtype=np.int8),
+            val_teacher_logit=np.array([-1.0], dtype=np.float32),
+            val_teacher_rep=np.zeros((1, 2), dtype=np.float16),
+            manifest={},
+        )
+        base = _ProductionRankToy()
+        backward_calls: list[int] = []
+
+        def count_backward(gradient: torch.Tensor) -> torch.Tensor:
+            backward_calls.append(1)
+            return gradient
+
+        base.weight.register_hook(count_backward)  # type: ignore[no-untyped-call]
+        bank = KDRowBank(
+            DistillConfig(targets_path="t", w_rank=1.0, w_dist=1.0),
+            targets,
+            train_pairs=[("n0", "n3"), ("n1", "n3"), ("n2", "n4")],
+            train_labels=[1, 0, 0],
+            val_pairs=[("n0", "n3")],
+            val_labels=[1],
+            model=base,
+            device=torch.device("cpu"),
+        )
+        model = DistributedDataParallel(base)
+        batch = (
+            {"x": torch.tensor([1.0]), "_row_id": torch.tensor([0])}
+            if rank == 0
+            else {"x": torch.tensor([-1.0, -0.5]), "_row_id": torch.tensor([1, 2])}
+        )
+        output = model(batch)
+        kd_global, _, _ = bank.loss(batch, output, global_step=1, world_size=world_size)
+        loss = _scale_kd_loss(
+            bank,
+            kd_global,
+            local_count=int(batch["_row_id"].numel()),
+            global_count=3,
+            world_size=world_size,
+        )
+        loss.backward()  # type: ignore[no-untyped-call]
+        gradient = base.weight.grad
+        assert gradient is not None
+        torch.save(
+            {
+                "loss": loss.detach(),
+                "grad": gradient.detach(),
+                "forward_calls": base.forward_calls,
+                "backward_calls": len(backward_calls),
+            },
+            Path(result_dir) / f"rank-bank-{rank}.pt",
+        )
+    finally:
+        dist.destroy_process_group()
 
 
 # --------------------------------------------------------------------------- artifact helpers
@@ -243,6 +403,163 @@ def test_kd_loss_uses_exact_row_ids(tmp_path: Path) -> None:
     assert not torch.allclose(loss_a, loss_b)
 
 
+def test_kd_rank_groups_each_official_row_under_both_endpoint_roles(tmp_path: Path) -> None:
+    node_ids = ["n0", "n1", "n2"]
+    train_pairs = [("n0", "n2"), ("n1", "n2")]
+    train_labels = [1, 0]
+    _write_targets(
+        tmp_path / "targets",
+        node_ids=node_ids,
+        train_pairs=train_pairs,
+        train_labels=train_labels,
+        teacher_logit=np.array([1.0, -1.0], dtype=np.float32),
+    )
+    bank = KDRowBank(
+        DistillConfig(targets_path="t", w_rank=1.0, w_dist=1.0),
+        load_kd_targets(tmp_path / "targets"),
+        train_pairs=train_pairs,
+        train_labels=train_labels,
+        val_pairs=train_pairs[:1],
+        val_labels=train_labels[:1],
+        model=nn.Module(),
+        device=torch.device("cpu"),
+    )
+    student = torch.tensor([-1.0, 1.0], requires_grad=True)
+    loss, stats, _ = bank.loss(
+        {"_row_id": torch.tensor([0, 1])}, {"logits": student}, global_step=1
+    )
+    # The shared node is pair_b for both rows. A pair_a-only implementation
+    # would see two singleton groups and incorrectly return zero.
+    assert loss.item() > 0.0
+    assert stats["rank_eligible_groups"] == 1.0
+    assert stats["rank_eligible_roles"] == 2.0
+    loss.backward()  # type: ignore[no-untyped-call]
+    assert student.grad is not None and torch.isfinite(student.grad).all()
+
+
+def test_kd_gram_uses_shared_forward_pair_representations(tmp_path: Path) -> None:
+    node_ids = ["n0", "n1", "n2"]
+    train_pairs = [("n0", "n2"), ("n1", "n2")]
+    train_labels = [1, 0]
+    teacher_rep = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    _write_targets(
+        tmp_path / "targets",
+        node_ids=node_ids,
+        train_pairs=train_pairs,
+        train_labels=train_labels,
+        teacher_logit=np.zeros(2, dtype=np.float32),
+        teacher_rep=teacher_rep,
+    )
+    bank = KDRowBank(
+        DistillConfig(targets_path="t", w_gram=1.0),
+        load_kd_targets(tmp_path / "targets"),
+        train_pairs=train_pairs,
+        train_labels=train_labels,
+        val_pairs=train_pairs[:1],
+        val_labels=train_labels[:1],
+        model=nn.Module(),
+        device=torch.device("cpu"),
+    )
+    pair_repr = torch.tensor([[1.0, 0.0], [1.0, 0.0]], requires_grad=True)
+    loss, stats, _ = bank.loss(
+        {"_row_id": torch.tensor([0, 1])},
+        {"logits": torch.zeros(2), "pair_repr": pair_repr},
+        global_step=1,
+    )
+    assert loss.item() > 0.0
+    assert stats["sum_gram"] > 0.0
+    loss.backward()  # type: ignore[no-untyped-call]
+    assert pair_repr.grad is not None and torch.isfinite(pair_repr.grad).all()
+
+
+@pytest.mark.parametrize("arm", ["rank", "rank_uneven", "gram"])
+def test_relational_kd_gathers_cross_rank_rows_with_exact_ddp_gradient(
+    tmp_path: Path, arm: str
+) -> None:
+    world_size = 2
+    spawn(  # type: ignore[no-untyped-call]
+        _relational_ddp_worker,
+        args=(world_size, str(tmp_path / f"{arm}-init"), str(tmp_path), arm),
+        nprocs=world_size,
+        join=True,
+    )
+    observed = [
+        torch.load(tmp_path / f"{arm}-{rank}.pt", weights_only=True) for rank in range(world_size)
+    ]
+
+    if arm.startswith("rank"):
+        weight = torch.tensor(0.25, requires_grad=True)
+        if arm == "rank":
+            student = torch.stack([weight, -weight])
+            teacher = torch.tensor([-1.0, 1.0])
+            endpoint_a = torch.tensor([0, 1])
+            endpoint_b = torch.tensor([2, 2])
+        else:
+            student = torch.stack([weight, -weight, -0.5 * weight])
+            teacher = torch.tensor([-1.0, 1.0, 0.5])
+            endpoint_a = torch.tensor([0, 1, 2])
+            endpoint_b = torch.tensor([3, 3, 4])
+        groups = torch.cat([endpoint_a, endpoint_b])
+        grouped_student = torch.cat([student, student])
+        grouped_teacher = torch.cat([teacher, teacher])
+        expected_loss = kd_rank_loss(grouped_student, grouped_teacher, groups) + kd_dist_loss(
+            grouped_student, grouped_teacher, groups
+        )
+        expected_loss.backward()  # type: ignore[no-untyped-call]
+        assert weight.grad is not None
+        expected_grad = weight.grad.reshape(1, 1)
+    else:
+        weight = torch.eye(2, requires_grad=True)
+        inputs = torch.tensor([[1.0, 0.0], [1.0, 1.0]])
+        teacher = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        expected_loss = kd_gram_loss(inputs @ weight.T, teacher)
+        expected_loss.backward()  # type: ignore[no-untyped-call]
+        assert weight.grad is not None
+        expected_grad = weight.grad
+
+    assert expected_loss.item() > 0.0
+    for result in observed:
+        torch.testing.assert_close(result["loss"], expected_loss.detach())
+        torch.testing.assert_close(result["grad"], expected_grad, atol=1e-6, rtol=1e-6)
+
+
+def test_production_kd_row_bank_keeps_global_loss_unscaled_and_one_pass(
+    tmp_path: Path,
+) -> None:
+    world_size = 2
+    spawn(  # type: ignore[no-untyped-call]
+        _production_rank_bank_worker,
+        args=(world_size, str(tmp_path / "rank-bank-init"), str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
+    observed = [
+        torch.load(tmp_path / f"rank-bank-{rank}.pt", weights_only=True)
+        for rank in range(world_size)
+    ]
+
+    weight = torch.tensor(0.25, requires_grad=True)
+    student = torch.stack([weight, -weight, -0.5 * weight])
+    teacher = torch.tensor([-1.0, 1.0, 0.5])
+    endpoint_a = torch.tensor([0, 1, 2])
+    endpoint_b = torch.tensor([3, 3, 4])
+    groups = torch.cat([endpoint_a, endpoint_b])
+    grouped_student = torch.cat([student, student])
+    grouped_teacher = torch.cat([teacher, teacher])
+    expected_loss = kd_rank_loss(grouped_student, grouped_teacher, groups) + kd_dist_loss(
+        grouped_student, grouped_teacher, groups
+    )
+    expected_loss.backward()  # type: ignore[no-untyped-call]
+    assert weight.grad is not None
+    expected_grad = weight.grad.reshape(())
+
+    for result in observed:
+        torch.testing.assert_close(result["loss"], expected_loss.detach())
+        torch.testing.assert_close(result["grad"], expected_grad, atol=1e-6, rtol=1e-6)
+        assert result["forward_calls"] == 1
+        assert result["backward_calls"] == 1
+
+
 # --------------------------------------------------------------------------- (c) one fwd/one bwd
 
 
@@ -395,9 +712,7 @@ def test_kd_row_targets_has_no_obsolete_fields() -> None:
 
 def test_distill_config_has_no_obsolete_fields() -> None:
     field_names = {field.name for field in dataclasses.fields(DistillConfig)}
-    assert field_names.isdisjoint(
-        {"anchors_per_step", "temperature", "margin", "arm_label", "w_rank"}
-    )
+    assert field_names.isdisjoint({"anchors_per_step", "arm_label"})
 
 
 # --------------------------------------------------------------------------- (f) telemetry
@@ -558,6 +873,62 @@ def test_evaluate_distributed_kd_rep_diagnostics() -> None:
     assert outcome.kd is not None
     assert {"val_kd_rep_cos", "val_kd_logit_corr", "val_kd_prob_mae"} <= outcome.kd.keys()
     assert outcome.kd["val_kd_rep_cos"] == pytest.approx(1.0, abs=1e-3)
+
+
+def test_evaluate_distributed_kd_rank_reports_deterministic_block_losses() -> None:
+    batch = {
+        "label": torch.tensor([1.0, 0.0]),
+        "_row_id": torch.tensor([0, 1]),
+        "logit_seed": torch.tensor([-1.0, 1.0]),
+        "rep_seed": torch.randn(2, 3),
+    }
+    teacher_logit = torch.tensor([1.0, -1.0])
+    kd_val = KDValDiagnostics(
+        arm="kd_rank",
+        teacher_logit=teacher_logit,
+        teacher_logit_np=teacher_logit.double().numpy(),
+        teacher_rep=None,
+        teacher_seeds=None,
+        endpoint_a=torch.tensor([0, 1]),
+        endpoint_b=torch.tensor([2, 2]),
+    )
+    outcome = _evaluate_distributed(
+        _RepDiagModel(),
+        [batch],
+        Accelerator(cpu=True),
+        expected_row_ids=np.arange(2),
+        kd_val=kd_val,
+    )
+    assert outcome.kd is not None
+    assert outcome.kd["val_kd_rank_block_loss"] > 0.0
+    assert outcome.kd["val_kd_dist_block_loss"] > 0.0
+
+
+def test_evaluate_distributed_kd_gram_reports_deterministic_block_loss() -> None:
+    rep_seed = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+    batch = {
+        "label": torch.tensor([1.0, 0.0]),
+        "_row_id": torch.tensor([0, 1]),
+        "logit_seed": torch.tensor([0.0, 0.0]),
+        "rep_seed": rep_seed,
+    }
+    teacher_logit = torch.zeros(2)
+    kd_val = KDValDiagnostics(
+        arm="kd_gram",
+        teacher_logit=teacher_logit,
+        teacher_logit_np=teacher_logit.double().numpy(),
+        teacher_rep=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        teacher_seeds=None,
+    )
+    outcome = _evaluate_distributed(
+        _RepDiagModel(),
+        [batch],
+        Accelerator(cpu=True),
+        expected_row_ids=np.arange(2),
+        kd_val=kd_val,
+    )
+    assert outcome.kd is not None
+    assert outcome.kd["val_kd_gram_block_loss"] > 0.0
 
 
 def test_evaluate_distributed_without_kd_val_leaves_kd_field_none() -> None:

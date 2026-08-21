@@ -1,0 +1,121 @@
+# Gate A set-student DIAGNOSTIC arm. Launch only with `--run-kind diagnostic`;
+# these artifacts are never formal. For each query pair the generator emits the
+# full-ego oracle's exact candidate node set (both endpoints plus every true
+# one-hop neighbor, queried edge removed) as content features only: no
+# adjacency, no neighbor-role channels -- x = [f0 | has_f0 | root_u | root_v |
+# exists] with adj identically zero. grit_gmt over that edgeless graph
+# degenerates into a relational set encoder (RRWP collapses to the identity
+# channel; update_e's edge channel becomes a learned pair bias), and the
+# distill block matches its node tokens and 4 PMA seed tokens against the
+# frozen full_ego_teacher_kd encoder on the identical node layout
+# (`train_egostitch._build_kd_runtime`). `oracle_truth_source:
+# training_structure` follows the KD-teacher arm's load-bearing rule: the
+# student's candidate sets and its stitched KD targets both derive from the
+# V_val-quarantined training graph, so no V_val-internal truth reaches V_val
+# checkpoint selection. Protocol, budgets, and batching mirror the full-ego
+# arms; readouts compare to full_ego_teacher_kd and the null-generator control.
+
+model:
+  family: egostitch_e2e
+  config:
+    generator:
+      name: full_ego_features
+      oracle_seed: 0
+      oracle_truth_source: training_structure
+      n_ground: 50
+      feature_standardization: row_layernorm
+    encoder:
+      name: grit_gmt
+      dim: 96
+      layers: 4
+      rrwp_k: 8
+      n_heads: 8
+      seeds: 4
+      w_rel: 0.0
+    classifier:
+      name: b0_v31
+      xattn_heads: 8
+      n_inj: 1
+      p_topo: 0.15
+      permanent_null: none
+      conditioning_mode: pooled_adapter
+
+data:
+  root: data
+  strategy: breadth_first
+  negative_ratio: 5
+  node_batch: 256
+  edge_batch: 32
+  f0_cache: outputs/feature_packs/egostitch_f0/f0_matrix.pt
+  grounding_cache: outputs/feature_packs/egostitch_f0/grounding.npz
+  pack_dir: outputs/feature_packs/egostitch_e2e_tokens
+  expected_missing_features:
+    - node_004764
+    - node_007050
+
+optim:
+  lr: 1.0e-4
+  weight_decay: 0.01
+  epochs: 30
+  warmup_steps: 500
+  grad_clip: 1.0
+  gradient_accumulation_steps: 4
+
+training:
+  positive_weight: 5.0
+  phase_a_fraction: 0.0
+  phase_b_fraction: 0.1
+  lr_peak: 1.0e-4
+  min_lr: 1.0e-5
+  warmup_steps: 500
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  clip_norm: 1.0
+  pair_encoder_clip_norm: 3.0
+  generator_clip_norm: 3.0
+  clip_immediate_abort: 1.0e-3
+  clip_persistent_threshold: 0.1
+  clip_persistent_steps: 10
+  family_ratio_abort: 50.0
+  family_ratio_probes: 4
+  collapse_fraction: 0.25
+  collapse_floor: 1.0e-4
+  collapse_validations: 2
+  residual_ratio_min: 1.0e-3
+
+diagnostics:
+  gradient_probe_interval: 50
+  gradient_imbalance_ratio: 50.0
+  gradient_imbalance_steps: 200
+  probe_s1_abs_mean_max: 1000.0
+  topk_fraction: 0.01
+
+eval:
+  patience: 10
+  eval_every: 1
+
+topology_validation:
+  full_every_epochs: 3
+  cascade_buckets_per_size: 5
+
+distill:
+  teacher_checkpoint: outputs/egostitch_e2e_stage1_v3/full_ego_teacher_kd/best.pt
+  lambda_seed: 1.0
+  lambda_gram: 1.0
+  warm_start_readout: true
+
+seed: 0
+output_dir: outputs/egostitch_e2e_stage1_v3/full_ego_features_kd_diagnostic
+mixed_precision: "bf16"
+
+runtime:
+  world_size: auto
+  pack_dir: outputs/feature_packs/egostitch_e2e_v_val_ng50
+  pack_workers: 8
+  loader_workers_per_rank: 0
+  # One optimizer step consumes four physical microbatches. Keep two complete
+  # logical windows queued so CPU token/F0 gathers overlap the current GPU step.
+  prefetch_factor: 8
+  token_budget: 128
+  max_pairs_per_rank: 1048576
+  memory_limit_gib: 85.0

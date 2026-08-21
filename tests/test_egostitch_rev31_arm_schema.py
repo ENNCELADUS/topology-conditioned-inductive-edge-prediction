@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 from src import score_universe
 from src import train_egostitch as te
 
@@ -50,6 +50,10 @@ FULL_EGO_ORACLE_CONFIG = (
     REPO_ROOT / "configs/egostitch_e2e_v3_full_ego_oracle_grit_pooled_breadth_first.yaml"
 )
 FULL_EGO_TEACHER_CONFIG = REPO_ROOT / "configs/egostitch_e2e_v3_full_ego_teacher_breadth_first.yaml"
+# Gate A set-student diagnostic (features-only oracle candidate sets + KD).
+FULL_EGO_FEATURES_CONFIG = (
+    REPO_ROOT / "configs/egostitch_e2e_v3_full_ego_features_kd_breadth_first.yaml"
+)
 
 
 def test_wave1_oracle_runtime_and_supervision_contracts() -> None:
@@ -67,14 +71,19 @@ def test_v3_live_arms_share_one_ng50_pack_and_grounding_cache() -> None:
     # The retired cosine_pool config stays on disk as history; no live arm uses it.
     assert set(config_paths) == (
         set(V3_CONFIGS.values())
-        | {RETIRED_COSINE_POOL_CONFIG, FULL_EGO_ORACLE_CONFIG, FULL_EGO_TEACHER_CONFIG}
+        | {
+            RETIRED_COSINE_POOL_CONFIG,
+            FULL_EGO_ORACLE_CONFIG,
+            FULL_EGO_TEACHER_CONFIG,
+            FULL_EGO_FEATURES_CONFIG,
+        }
         | set(WAVE1_ORACLE_CONFIGS.values())
     )
     configs = []
     for path in sorted(
         set(V3_CONFIGS.values())
         | set(WAVE1_ORACLE_CONFIGS.values())
-        | {FULL_EGO_ORACLE_CONFIG, FULL_EGO_TEACHER_CONFIG}
+        | {FULL_EGO_ORACLE_CONFIG, FULL_EGO_TEACHER_CONFIG, FULL_EGO_FEATURES_CONFIG}
     ):
         payload = yaml.safe_load(path.read_text(encoding="utf-8"))
         configs.append(
