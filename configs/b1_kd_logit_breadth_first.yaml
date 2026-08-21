@@ -1,9 +1,8 @@
-# B1 KD-D1 arm on the simple B0 protocol: V3.1 student + zero-init
-# NodeFactorBottleneck (node_factor_dim: 64) + the shared KD anchor-context
-# stream from outputs/distill/kd_targets_breadth_first_seed0_v2
-# (python -m src.distill.teacher_targets). Arms differ ONLY in the distill
-# weights below (variable-control protocol); run one arm at a time via
-# hpc/run.sh train <this config>.
+# B1 KD-logit arm on the simple B0 protocol: V3.1 student, binary soft-target
+# logit KD (GLNN family) -- BCE(student_logit, sigmoid(teacher_logit)) --
+# against the full-row teacher-target artifact. Task and KD losses share one
+# student forward on identical rows (joined by `_row_id`); matched control is
+# `b1_kd_control_breadth_first.yaml`.
 model:
   family: v3_1
   config:
@@ -31,7 +30,6 @@ model:
       spectral_norm: false
     mixing:
       mode: none
-    node_factor_dim: 64
     label_smoothing: 0.05 # symmetric BCE smoothing, fixed V3.1 recipe
 data:
   root: data
@@ -70,9 +68,8 @@ runtime:
   probe_warmup_steps: 10
   probe_timed_steps: 30
 seed: 0
-output_dir: outputs/b1_stage_v2/kd_d1
+output_dir: outputs/b1_row_kd/kd_logit
 mixed_precision: "bf16" # pinned for the H20 E2 target
 distill:
-  targets_path: outputs/distill/kd_targets_breadth_first_seed0_v2
-  w_logit: 1.0                     # GLNN-style pointwise soft-label KD
-  anchors_per_step: 2
+  targets_path: outputs/distill/kd_row_targets_breadth_first
+  w_logit: 1.0 # GLNN-style pointwise soft-label KD

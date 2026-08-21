@@ -1,4 +1,15 @@
-"""Focused Wave-5 trainer wiring contracts for the D9 pair latent arm."""
+"""Focused trainer wiring contracts for the D9 pair-latent-generation KD arm.
+
+The D9 KD term now rides the main student forward via `KDRowBank`/`attach()`
+(no separate sampled anchor-context stream, no DDP-live-row scaling -- every
+training row carries a teacher seed target, so there is no padding to weight
+around). What remains worth testing here, on top of the generic `KDRowBank`
+coverage in `tests/test_train_b0_kd.py`, is D9-specific: the staged joint
+fine-tune (`joint_start_epoch` gating), the generator's separate LR schedule,
+KL warmup scaling, D9 telemetry keys, that `attach()` injects
+`kd_teacher_seeds` before the model forward, and that a teacher-seed shape
+mismatch against `model.config.pair_latent_gen` fails closed.
+"""
 
 from __future__ import annotations
 
@@ -14,13 +25,13 @@ import pytest
 import src.train_b0 as train_b0
 import torch
 from accelerate import Accelerator
-from src.data.packed_features import PackedFeatureTable
-from src.distill.artifacts import KD_TARGETS_FORMAT_V4, KDTargets
+from src.data.val_region import Pair
+from src.distill.artifacts import KDRowTargets, load_kd_targets, write_kd_targets
 from src.distill.config import DistillConfig
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.train_b0 import (
     Config,
-    KDStream,
+    KDRowBank,
     ModelConfig,
     SchedulerConfig,
     ValidationOutcome,
@@ -31,104 +42,55 @@ from tests.test_train_b0 import _constant_metrics, _tiny_config
 
 pytestmark = pytest.mark.unit
 
-
-class _FakeTable:
-    def __init__(self) -> None:
-        self.tokens = torch.zeros(1, 8)
-        records = [
-            SimpleNamespace(node_id="node_a", length=3),
-            SimpleNamespace(node_id="node_b", length=3),
-        ]
-        self.manifest = SimpleNamespace(
-            nodes=records,
-            node_index=lambda: {record.node_id: row for row, record in enumerate(records)},
-        )
-
-    def gather_nodes(
-        self, node_indices: torch.Tensor, boundary: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        values = node_indices.float().view(-1, 1, 1).expand(-1, boundary, 8)
-        return values, torch.full((len(node_indices),), boundary, dtype=torch.long)
+_NODE_IDS = ["node_a", "node_b"]
+_TRAIN_PAIRS: list[Pair] = [("node_a", "node_b"), ("node_b", "node_a")]
+_TRAIN_LABELS = [1, 0]
 
 
-class _GlobalLiveRows:
-    """Two-rank collective simulation returning a pinned global live count."""
-
-    def __init__(self, global_live_rows: float) -> None:
-        self.global_live_rows = global_live_rows
-        self.seen_local_rows: list[float] = []
-
-    def reduce(self, value: torch.Tensor, *, reduction: str) -> torch.Tensor:
-        assert reduction == "sum"
-        self.seen_local_rows.append(float(value.item()))
-        return value.new_tensor(self.global_live_rows)
+# --------------------------------------------------------------------------- artifact helper
 
 
-class _TelemetryCollectives:
-    device = torch.device("cpu")
-
-    def reduce(self, value: torch.Tensor, *, reduction: str) -> torch.Tensor:
-        assert reduction == "sum"
-        if value.numel() == 1:
-            return value.new_tensor(4.0)
-        if value.numel() == len(train_b0.D9_ROW_TELEMETRY_KEYS):
-            return torch.arange(1, value.numel() + 1, dtype=value.dtype) * 4.0
-        assert value.numel() == 2
-        return value.new_tensor([0.04, 0.12])
-
-
-class _PairLatentStub(nn.Module):
-    def __init__(self, seed_count: int = 2, seed_dim: int = 3) -> None:
-        super().__init__()
-        self.seed_count = seed_count
-        self.seed_dim = seed_dim
-        self.kl_free_bits = 0.05
-        self.alpha = nn.Parameter(torch.tensor(0.25))
-
-
-class _D9StubModel(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.scale = nn.Parameter(torch.tensor(1.0))
-        self.pair_latent_gen = _PairLatentStub()
-        self.seen_teacher: torch.Tensor | None = None
-
-    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        teacher = batch["kd_teacher_seeds"]
-        self.seen_teacher = teacher.detach().clone()
-        batch_size = teacher.shape[0]
-        seeds_q = teacher + self.scale
-        return {
-            "logits": self.scale.expand(batch_size, 1),
-            "gen_seeds_q": seeds_q,
-            "gen_seeds_prior_mean": teacher + 0.5 * self.scale,
-            "gen_kl": self.scale.expand(batch_size, 4).square(),
-            "gen_delta_std": self.scale.expand(batch_size) * 0.2,
-            "gen_prior_dispersion": self.scale.expand(batch_size) * 0.3,
-        }
-
-
-def _targets(teacher_seeds: np.ndarray | None) -> KDTargets:
-    manifest: dict[str, object] = {
-        "format": KD_TARGETS_FORMAT_V4,
-        "k_near": 1,
-        "k_rand": 1,
-        "seed_count": 2,
-        "seed_dim": 3,
-    }
-    return KDTargets(
-        node_ids=["node_a", "node_b"],
-        pair_anchor_idx=np.array([0, 1], dtype=np.int32),
-        pair_partner_idx=np.array([1, 0], dtype=np.int32),
-        anchor_offsets=np.array([0, 1, 2], dtype=np.int64),
-        teacher_logit=np.zeros(2, dtype=np.float32),
-        teacher_pooled_ab=np.ones((2, 3), dtype=np.float16),
-        teacher_pooled_ba=np.ones((2, 3), dtype=np.float16),
-        is_near=np.ones(2, dtype=np.uint8),
-        pair_label=np.ones(2, dtype=np.int8),
+def _write_seed_targets(
+    out_dir: Path,
+    *,
+    teacher_seeds: np.ndarray,
+    train_pairs: list[Pair] = _TRAIN_PAIRS,
+    train_labels: list[int] = _TRAIN_LABELS,
+    n_val: int = 1,
+) -> None:
+    """Write one minimal KD row-targets artifact carrying `teacher_seeds`."""
+    index = {node: position for position, node in enumerate(_NODE_IDS)}
+    a_idx = np.array([index[a] for a, _ in train_pairs], dtype=np.int32)
+    b_idx = np.array([index[b] for _, b in train_pairs], dtype=np.int32)
+    n = len(train_pairs)
+    val_teacher_seeds = teacher_seeds[:n_val]
+    write_kd_targets(
+        out_dir,
+        node_ids=_NODE_IDS,
+        pair_a_idx=a_idx,
+        pair_b_idx=b_idx,
+        pair_label=np.asarray(train_labels, dtype=np.int8),
+        teacher_logit=np.zeros(n, dtype=np.float32),
+        teacher_rep=np.zeros((n, 4), dtype=np.float32),
+        val_pair_a_idx=a_idx[:n_val],
+        val_pair_b_idx=b_idx[:n_val],
+        val_pair_label=np.asarray(train_labels[:n_val], dtype=np.int8),
+        val_teacher_logit=np.zeros(n_val, dtype=np.float32),
+        val_teacher_rep=np.zeros((n_val, 4), dtype=np.float32),
+        truth_graph_sha256="0" * 64,
+        checkpoint_path=out_dir / "ckpt.pt",
+        checkpoint_sha256="1" * 64,
+        checkpoint_id=None,
         teacher_seeds=teacher_seeds,
-        manifest=manifest,
+        val_teacher_seeds=val_teacher_seeds,
     )
+
+
+def _load_seed_targets(tmp_path: Path, *, seed_dim: int = 3, n_val: int = 1) -> KDRowTargets:
+    teacher_seeds = np.ones((2, 2, seed_dim), dtype=np.float16)
+    out_dir = tmp_path / "targets"
+    _write_seed_targets(out_dir, teacher_seeds=teacher_seeds, n_val=n_val)
+    return load_kd_targets(out_dir, load_seeds=True)
 
 
 def _distill(**overrides: object) -> DistillConfig:
@@ -137,7 +99,6 @@ def _distill(**overrides: object) -> DistillConfig:
         "w_seed": 1.0,
         "w_geom": 1.0,
         "w_kl": 1.0,
-        "anchors_per_step": 1,
         "kl_warmup_steps": 10,
         "joint_start_epoch": 3,
         "gen_lr_scale": 0.1,
@@ -146,131 +107,23 @@ def _distill(**overrides: object) -> DistillConfig:
     return DistillConfig.from_mapping(values)
 
 
-def _stream(model: nn.Module, targets: KDTargets) -> KDStream:
-    return KDStream(
-        _distill(),
+def _kd_bank(
+    model: nn.Module,
+    targets: KDRowTargets,
+    *,
+    distill: DistillConfig | None = None,
+    n_val: int = 1,
+) -> KDRowBank:
+    return KDRowBank(
+        distill if distill is not None else _distill(),
         targets,
-        cast(PackedFeatureTable, _FakeTable()),
-        allowed_nodes=frozenset({"node_a", "node_b"}),
-        forbidden_internal_nodes=frozenset(),
-        seed=0,
-        rank=0,
-        world_size=1,
+        train_pairs=_TRAIN_PAIRS,
+        train_labels=_TRAIN_LABELS,
+        val_pairs=_TRAIN_PAIRS[:n_val],
+        val_labels=_TRAIN_LABELS[:n_val],
         model=model,
+        device=torch.device("cpu"),
     )
-
-
-def test_d9_stream_requires_v4_teacher_seeds_matching_model_shape() -> None:
-    model = _D9StubModel()
-    with pytest.raises(RuntimeError, match="kd_targets_v4"):
-        _stream(model, _targets(None))
-    with pytest.raises(RuntimeError, match="teacher_seeds shape"):
-        _stream(model, _targets(np.ones((2, 3, 3), dtype=np.float16)))
-
-
-def test_d9_stream_gathers_zero_filler_applies_kl_warmup_and_records_telemetry(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model = _D9StubModel()
-    targets = _targets(np.ones((2, 2, 3), dtype=np.float16))
-    stream = _stream(model, targets)
-
-    monkeypatch.setattr(train_b0, "kd_seed_loss", lambda student, teacher, mask: model.scale * 1.0)
-    monkeypatch.setattr(
-        train_b0, "kd_seed_gram_loss", lambda student, teacher, mask: model.scale * 2.0
-    )
-    monkeypatch.setattr(
-        train_b0,
-        "kd_kl_loss",
-        lambda kl, mask, *, free_bits: model.scale * 4.0,
-    )
-
-    loss = stream.loss(model, epoch=1, step=5)
-    assert loss.detach().item() == pytest.approx(5.0)
-    assert model.seen_teacher is not None
-    assert torch.all(model.seen_teacher[0] == 1.0)
-    assert torch.all(model.seen_teacher[1] == 0.0)
-    assert stream.last_live_rows == 1
-    assert stream.last_kl_dim_sum is not None
-    torch.testing.assert_close(stream.last_kl_dim_sum, torch.ones(4))
-    assert stream.last_telemetry["kl_warmup_scale"] == pytest.approx(0.5)
-    assert {
-        "kd_prior_cos",
-        "kd_seed_cos",
-        "kd_recon_delta",
-        "kd_geom",
-        "kd_kl_per_dim",
-        "kl_active_units",
-        "gen_alpha",
-        "mc_logit_std",
-        "gen_prior_dispersion",
-    } <= stream.last_telemetry.keys()
-
-
-def test_two_rank_live_row_scaling_recovers_the_global_masked_mean() -> None:
-    # Rank 0 has one live row with mean loss 2; rank 1 has three with mean 6.
-    # The true global masked mean is (1*2 + 3*6) / 4 = 5.
-    rank0 = _GlobalLiveRows(global_live_rows=4.0)
-    rank1 = _GlobalLiveRows(global_live_rows=4.0)
-    parameter = torch.tensor(1.0, requires_grad=True)
-    scaled0 = train_b0._scale_d9_kd_loss_for_ddp(
-        2.0 * parameter,
-        local_live_rows=1,
-        world_size=2,
-        accelerator=cast(Accelerator, rank0),
-    )
-    scaled1 = train_b0._scale_d9_kd_loss_for_ddp(
-        6.0 * parameter,
-        local_live_rows=3,
-        world_size=2,
-        accelerator=cast(Accelerator, rank1),
-    )
-    ddp_objective = (scaled0 + scaled1) / 2.0
-    assert ddp_objective.item() == pytest.approx(5.0)
-    ddp_objective.backward()
-    assert parameter.grad is not None
-    assert parameter.grad.item() == pytest.approx(5.0)
-    assert rank0.seen_local_rows == [1.0]
-    assert rank1.seen_local_rows == [3.0]
-
-
-def test_d9_live_row_scaling_fails_closed_when_every_rank_is_padding() -> None:
-    accelerator = _GlobalLiveRows(global_live_rows=0.0)
-    with pytest.raises(RuntimeError, match="zero live teacher rows"):
-        train_b0._scale_d9_kd_loss_for_ddp(
-            torch.tensor(1.0),
-            local_live_rows=0,
-            world_size=2,
-            accelerator=cast(Accelerator, accelerator),
-        )
-
-
-def test_d9_rank_with_only_padding_contributes_zero_when_other_rank_is_live() -> None:
-    accelerator = _GlobalLiveRows(global_live_rows=3.0)
-    scaled = train_b0._scale_d9_kd_loss_for_ddp(
-        torch.tensor(7.0, requires_grad=True),
-        local_live_rows=0,
-        world_size=2,
-        accelerator=cast(Accelerator, accelerator),
-    )
-    assert scaled.item() == 0.0
-
-
-def test_epoch_telemetry_reduces_row_sums_and_kl_dimensions_globally() -> None:
-    telemetry = train_b0._reduce_d9_epoch_telemetry(
-        cast(Accelerator, _TelemetryCollectives()),
-        row_weighted_sums=dict.fromkeys(train_b0.D9_ROW_TELEMETRY_KEYS, 0.0),
-        local_live_rows=1,
-        kl_dim_sum=torch.zeros(2),
-        gen_alpha=0.3,
-        kl_warmup_scale=0.7,
-    )
-    for index, key in enumerate(train_b0.D9_ROW_TELEMETRY_KEYS, start=1):
-        assert telemetry[key] == pytest.approx(float(index))
-    assert telemetry["kd_kl_per_dim"] == pytest.approx(0.02)
-    assert telemetry["kl_active_units"] == 1.0
-    assert telemetry["gen_alpha"] == pytest.approx(0.3)
-    assert telemetry["kl_warmup_scale"] == pytest.approx(0.7)
 
 
 def _tiny_model_kwargs() -> dict[str, object]:
@@ -315,8 +168,8 @@ def _cfg() -> Config:
     return cast(Config, SimpleNamespace(optim=optim, distill=_distill()))
 
 
-def _training_cfg(tmp_path: Path) -> Config:
-    base = _tiny_config(epochs=4, patience=8)
+def _training_cfg(tmp_path: Path, *, epochs: int = 4) -> Config:
+    base = _tiny_config(epochs=epochs, patience=8)
     return replace(
         base,
         model=ModelConfig(family="v3_1", config=_tiny_model_kwargs()),
@@ -350,6 +203,64 @@ def _training_batch() -> dict[str, torch.Tensor]:
         "_local_pair_count": torch.tensor(2),
         "_global_pair_count": torch.tensor(2),
     }
+
+
+# --------------------------------------------------------------------------- join + arch checks
+
+
+def test_seed_shape_mismatch_against_model_raises(tmp_path: Path) -> None:
+    # model.pair_latent_gen expects (seed_count=2, seed_dim=3); the artifact
+    # carries seed_dim=4 instead.
+    targets = _load_seed_targets(tmp_path, seed_dim=4)
+    model = _tiny_model()
+    with pytest.raises(RuntimeError, match="teacher_seeds shape"):
+        _kd_bank(model, targets)
+
+
+def test_attach_injects_teacher_seeds_before_forward(tmp_path: Path) -> None:
+    targets = _load_seed_targets(tmp_path, seed_dim=3)
+    model = _tiny_model()
+    bank = _kd_bank(model, targets)
+
+    batch: dict[str, torch.Tensor] = {"_row_id": torch.tensor([1, 0])}
+    assert "kd_teacher_seeds" not in batch
+    bank.attach(batch)
+    assert "kd_teacher_seeds" in batch
+    expected = torch.as_tensor(np.ones((2, 2, 3), dtype=np.float16)[[1, 0]], dtype=torch.float32)
+    torch.testing.assert_close(batch["kd_teacher_seeds"], expected)
+
+
+def test_d9_validation_diagnostics_preserve_training_rng(tmp_path: Path) -> None:
+    """Injected val seeds must never advance the training RNG stream.
+
+    `forward_kd` draws `randn_like` even under eval; the fork_rng guard keeps
+    the diagnostic-only validation pass from altering the trajectory.
+    """
+    targets = _load_seed_targets(tmp_path, seed_dim=3, n_val=2)
+    model = _tiny_model()
+    bank = _kd_bank(model, targets, n_val=2)
+    kd_val = bank.val_diagnostics()
+    assert kd_val.teacher_seeds is not None
+    generator = torch.Generator().manual_seed(7)
+    batch = {
+        "emb_a": torch.randn(2, 3, 8, generator=generator),
+        "emb_b": torch.randn(2, 3, 8, generator=generator),
+        "len_a": torch.tensor([3, 3]),
+        "len_b": torch.tensor([3, 3]),
+        "label": torch.tensor([1.0, 0.0]),
+        "_row_id": torch.tensor([0, 1]),
+    }
+    accelerator = Accelerator(cpu=True)
+    state_before = torch.get_rng_state()
+    outcome = train_b0._evaluate_distributed(
+        model, [batch], accelerator, expected_row_ids=np.arange(2), kd_val=kd_val
+    )
+    assert outcome.kd is not None
+    assert "val_kd_prior_cos" in outcome.kd
+    assert torch.equal(torch.get_rng_state(), state_before)
+
+
+# --------------------------------------------------------------------------- optimizer staging
 
 
 def test_generator_optimizer_group_excludes_fusion_and_tracks_base_schedule() -> None:
@@ -398,10 +309,56 @@ def test_generator_optimizer_group_excludes_fusion_and_tracks_base_schedule() ->
     )
 
 
+# --------------------------------------------------------------------------- telemetry + KL warmup
+
+
+def test_ddp_loop_kd_d9_telemetry_and_kl_warmup(tmp_path: Path) -> None:
+    targets = _load_seed_targets(tmp_path, seed_dim=3)
+    model = _tiny_model()
+    distill = _distill(kl_warmup_steps=10, joint_start_epoch=0)
+    bank = _kd_bank(model, targets, distill=distill)
+    batch = _training_batch()
+    cfg = _training_cfg(tmp_path, epochs=1)
+    cfg = replace(cfg, distill=distill)
+
+    result = train_b0.train_ddp_loop(
+        model,
+        lambda epoch: [batch],
+        [batch],
+        cfg,
+        Accelerator(cpu=True),
+        warmup_steps=1,
+        artifact_dir=tmp_path / "attempt",
+        schedule_total_steps=1,
+        evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(_constant_metrics(), None),
+        kd_bank=bank,
+    )
+
+    entry = result.history[0]
+    for key in (
+        "kd_prior_cos",
+        "kd_seed_cos",
+        "kd_recon_delta",
+        "kd_geom",
+        "mc_logit_std",
+        "gen_prior_dispersion",
+        "kd_kl_per_dim",
+        "kl_active_units",
+        "gen_alpha",
+        "kl_warmup_scale",
+    ):
+        assert key in entry, f"missing D9 telemetry key {key!r} in {sorted(entry)}"
+    # One optimizer step out of a 10-step warmup: scale == 1 / 10.
+    assert entry["kl_warmup_scale"] == pytest.approx(0.1)
+
+
+# --------------------------------------------------------------------------- staged resume
+
+
 def test_d9_resume_matches_uninterrupted_across_joint_stage(tmp_path: Path) -> None:
     cfg = _training_cfg(tmp_path)
     batch = _training_batch()
-    targets = _targets(np.ones((2, 2, 3), dtype=np.float16))
+    targets = _load_seed_targets(tmp_path, seed_dim=3)
 
     def evaluate(
         model: nn.Module,
@@ -412,7 +369,7 @@ def test_d9_resume_matches_uninterrupted_across_joint_stage(tmp_path: Path) -> N
 
     torch.manual_seed(123)
     uninterrupted_model = _tiny_model()
-    uninterrupted_stream = _stream(uninterrupted_model, targets)
+    uninterrupted_bank = _kd_bank(uninterrupted_model, targets)
     uninterrupted_dir = tmp_path / "uninterrupted"
     uninterrupted = train_b0.train_ddp_loop(
         uninterrupted_model,
@@ -424,7 +381,7 @@ def test_d9_resume_matches_uninterrupted_across_joint_stage(tmp_path: Path) -> N
         artifact_dir=uninterrupted_dir,
         schedule_total_steps=4,
         evaluate_fn=evaluate,
-        kd_loss_fn=uninterrupted_stream.loss,
+        kd_bank=uninterrupted_bank,
     )
 
     evaluations = 0
@@ -442,7 +399,7 @@ def test_d9_resume_matches_uninterrupted_across_joint_stage(tmp_path: Path) -> N
 
     torch.manual_seed(123)
     interrupted_model = _tiny_model()
-    interrupted_stream = _stream(interrupted_model, targets)
+    interrupted_bank = _kd_bank(interrupted_model, targets)
     prior_dir = tmp_path / "prior"
     with pytest.raises(RuntimeError, match="interrupted after joint-stage step"):
         train_b0.train_ddp_loop(
@@ -455,7 +412,7 @@ def test_d9_resume_matches_uninterrupted_across_joint_stage(tmp_path: Path) -> N
             artifact_dir=prior_dir,
             schedule_total_steps=4,
             evaluate_fn=interrupt_after_two,
-            kd_loss_fn=interrupted_stream.loss,
+            kd_bank=interrupted_bank,
         )
 
     prior_state = torch.load(
@@ -472,7 +429,7 @@ def test_d9_resume_matches_uninterrupted_across_joint_stage(tmp_path: Path) -> N
         shutil.copy2(candidate, resumed_dir / "checkpoints" / candidate.name)
 
     resumed_model = _tiny_model()
-    resumed_stream = _stream(resumed_model, targets)
+    resumed_bank = _kd_bank(resumed_model, targets)
     resumed = train_b0.train_ddp_loop(
         resumed_model,
         lambda epoch: [batch],
@@ -484,7 +441,7 @@ def test_d9_resume_matches_uninterrupted_across_joint_stage(tmp_path: Path) -> N
         resume_attempt=prior_dir,
         schedule_total_steps=4,
         evaluate_fn=evaluate,
-        kd_loss_fn=resumed_stream.loss,
+        kd_bank=resumed_bank,
     )
 
     assert [row["epoch"] for row in resumed.history] == [1, 2, 3, 4]

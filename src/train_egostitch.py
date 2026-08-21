@@ -43,7 +43,7 @@ import networkx as nx
 import numpy as np
 import torch
 import torch.nn.functional as F
-import yaml  # type: ignore[import-untyped,unused-ignore]
+import yaml
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 from numpy.typing import NDArray

@@ -63,7 +63,7 @@ src.train_b0` is debug-only. Runbook: `hpc/README.md` and the `hpc-execution` sk
 
 ```bash
 hpc/run.sh train configs/b0_v31_breadth_first.yaml                  # baseline
-hpc/run.sh train configs/b1_kd_d2_breadth_first.yaml                # B1 KD arm (simple protocol)
+hpc/run.sh train configs/b1_kd_logit_breadth_first.yaml             # B1 KD arm (simple protocol)
 ```
 EgoStitch e2e (`--worker-module src.train_egostitch`) remains only for oracle diagnostics.
 

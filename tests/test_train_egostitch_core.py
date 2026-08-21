@@ -12,7 +12,7 @@ from typing import get_args
 import numpy as np
 import pytest
 import torch
-import yaml  # type: ignore[import-untyped]
+import yaml
 from src import train_egostitch as te
 from src.data.feature_stats import compute_feature_stats
 from src.eval.edge_metrics import EdgeMetrics

@@ -15,7 +15,7 @@ import networkx as nx
 import numpy as np
 import pytest
 import torch
-import yaml  # type: ignore[import-untyped]
+import yaml
 from accelerate import Accelerator
 from src import train_egostitch as te
 from src.data.prefetch import _prefetch_batches

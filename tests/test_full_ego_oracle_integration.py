@@ -10,7 +10,7 @@ import networkx as nx
 import pytest
 import src.score_universe as score_universe
 import src.train_egostitch as train_egostitch
-import yaml  # type: ignore[import-untyped]
+import yaml
 from src.model.egostitch.composite import EgoStitchModel
 from src.model.egostitch.config import E2EConfig, GeneratorConfig
 from src.model.egostitch.generator.full_oracle import FullOracleGenerator

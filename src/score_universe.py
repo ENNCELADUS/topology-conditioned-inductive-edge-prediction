@@ -72,7 +72,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 import networkx as nx
 import numpy as np
 import torch
-import yaml  # type: ignore[import-untyped]
+import yaml
 from numpy.typing import NDArray
 from torch import nn
 

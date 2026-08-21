@@ -22,7 +22,7 @@ import networkx as nx
 import numpy as np
 import pytest
 import torch
-import yaml  # type: ignore[import-untyped]
+import yaml
 from src import train_egostitch as te
 from src.data.artifacts import canonical_pair
 from src.data.ego_targets import EgoTargetBuilder

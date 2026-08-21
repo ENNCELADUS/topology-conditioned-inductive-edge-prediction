@@ -1,41 +1,57 @@
-r"""Dump Full-Ego Pooled Oracle KD teacher targets over the training universe.
+r"""Dump Full-Ego Pooled Oracle KD teacher targets over the trainer's official rows.
 
-CLI (design B1 plan, "KD sampler + teacher-target artifact"):
+CLI (full-row KD rework -- replaces the sampled anchor-context stream):
 
     python -m src.distill.teacher_targets \\
-        --checkpoint outputs/.../best.pt --data-root data --strategy breadth_first \\
-        --seed 0 --k-near 10 --k-rand 10 --output outputs/distill/kd_targets_breadth_first_seed0
+        --config configs/b0_v31_breadth_first.yaml \\
+        --checkpoint outputs/.../best.pt \\
+        --output outputs/distill/kd_row_targets_breadth_first --device cuda
 
-Architecture (see the B1 plan's "Architecture decisions" -- why this is a
-dedicated module, not a `score_universe.py` extension): `score_universe.py`'s
-``file:``/``candidate``/``test`` pair sources are held-out-ledgered and its
-grounding pools are rebuilt with ``role_universe="test"``, both wrong for a
-training-side teacher pass. This module instead reuses `score_universe.py`'s
-lower-level, universe-agnostic building blocks directly (`_load_checkpoint`,
+Row universe: this module re-derives the trainer's own row lists
+(`src.train_b0.assemble_data` + `_training_rows`/`_val_cls_rows`) from the
+same training YAML rather than sampling anchor/context pairs -- the training
+block covers every official training row exactly once, in the trainer's
+exact row order (row_id == array position), so the artifact is directly
+joinable against it by position; the validation block covers the official
+V_val classification rows. See `src.distill.artifacts` for the resulting
+`kd_row_targets_v1` format.
+
+Query-edge masking (structural, not reimplemented here): the teacher is the
+`full_ego_oracle` generator, and its `stitch`
+(`src/model/egostitch/generator/full_oracle/generator.py`) already excludes
+the queried edge from both endpoints' structural context per pair -- the
+endpoints' neighbor channels drop the partner (``keep = values !=
+partners[owners]``) and the adjacency skips the query edge (``keep = found &
+~query_edge``). A positive training edge is therefore never visible in its
+own structural context, and because this masking is applied per pair inside
+`stitch`, not by mutating the underlying graph, the per-node encode-once
+cache (`encode_all_nodes`) -- which carries only row identity, never
+edge-masked state -- stays masking-safe: the same cached node state is
+correctly reusable across every row touching that node.
+
+Legality (never bind anything but a truth graph free of V_val-internal
+edges): the truth graph is `ValRegionSplit.build_training_graph()` --
+loopless training positives over every train node, so V_val nodes appear
+only through their cross-boundary neighbors, never through a V_val-internal
+edge, by construction. `assert_training_side_only` hard-refuses if a
+benchmark test-split node reaches the truth graph or the node universe, or if
+the truth graph somehow carries a V_val-internal edge.
+`assert_no_val_internal_training_rows` additionally hard-refuses a *training*
+row with both endpoints inside V_val (the validation block is exempt: those
+rows are the held-out V_val classification rows, scored only for
+validation-side diagnostics).
+
+Architecture: this module reuses `score_universe.py`'s lower-level,
+universe-agnostic building blocks directly (`_load_checkpoint`,
 `_install_oracle_context`, `_file_sha256`, `_shard_range`,
 `_oracle_truth_graph_sha256`) and mirrors its per-node encode-once cache +
 `build_pair_context_from_states`/`score_pair_context` pattern
-(``_score_egostitch_e2e``, score_universe.py:2330-2399) rather than duplicating
-either.
-
-Every pair is scored fp32 with no autocast on the pair pass, matching the
-``egostitch_e2e_pair_fp32_v1`` contract `_score_egostitch_e2e` itself uses
-(score_universe.py:2696) -- this artifact's `teacher_logit` must be numerically
-consistent with what a training-time rescoring of the same checkpoint would
-produce, not merely close.
-
-Legality (never bind anything but a truth graph free of V_val-internal edges):
-the truth graph is `ValRegionSplit.build_training_graph()` -- loopless training
-positives over every train node, so V_val nodes appear only through their
-cross-boundary neighbors, never through a V_val-internal edge, by construction.
-`assert_training_side_only` hard-refuses if a benchmark test-split node reaches
-the truth graph or the sampled node universe, or if the truth graph somehow
-carries a V_val-internal edge. `sample_context_sets`' `forbidden_internal`
-(this module always passes `split.v_val`) additionally keeps a V_val anchor
-from drawing another V_val node into its near/random context pool through a
-cross-boundary relay: the quarantine this module enforces is pair-level, not
-node-level -- V_val nodes are a legitimate, expected part of the sampled node
-universe. No pre-existing oracle cache is ever read.
+(``_score_egostitch_e2e``) rather than duplicating either. Every pair is
+scored fp32 with no autocast on the pair pass, matching the
+``egostitch_e2e_pair_fp32_v1`` contract `_score_egostitch_e2e` itself uses --
+this artifact's `teacher_logit` must be numerically consistent with what a
+training-time rescoring of the same checkpoint would produce, not merely
+close.
 """
 
 from __future__ import annotations
@@ -53,12 +69,10 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
-from src.data.artifacts import load_benchmark
 from src.data.features import FeatureStore, build_f0_matrix
 from src.data.pairs import BUCKET_BOUNDARIES, probe_lengths
-from src.data.val_region import ValRegionSplit, derive_val_region_split
+from src.data.val_region import Pair, ValRegionSplit
 from src.distill.artifacts import write_kd_targets
-from src.distill.context_sampler import ContextSets, sample_context_sets
 from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
 from src.model.egostitch.generator.full_oracle import FullOracleGenerator
 from src.model.egostitch.generator.imagine import SlotSet
@@ -70,11 +84,9 @@ from src.score_universe import (
     _oracle_truth_graph_sha256,
     _shard_range,
 )
+from src.train_b0 import _training_rows, _val_cls_rows, assemble_data, load_config
 
 logger = logging.getLogger(__name__)
-
-_BENCHMARK_SUBDIR = "benchmark_2025_neurips"
-_FEATURES_SUBDIR = Path("features") / "frozen_node_features_1024"
 
 _DEFAULT_TOKEN_BUDGET = 32_768
 _DEFAULT_BATCH_PAIRS = 32
@@ -82,36 +94,6 @@ _SEED_EPS = 1e-8
 
 
 # --------------------------------------------------------------------------- training-side legality
-
-
-def _load_val_region_split(data_root: Path, strategy: str) -> tuple[ValRegionSplit, frozenset[str]]:
-    """Load `ValRegionSplit` exactly as the training path derives it.
-
-    Returns:
-        The split and the benchmark's held-out test-split nodes (a second,
-        separate universe `assert_training_side_only` must also refuse).
-    """
-    benchmark = load_benchmark(data_root / _BENCHMARK_SUBDIR, strategy)
-    truth_edges = list(benchmark.split.train_graph.edges())
-    benchmark_negatives = [
-        pair
-        for pair, label in zip(
-            benchmark.split.train_pairs.pairs,
-            benchmark.split.train_pairs.labels.tolist(),
-            strict=True,
-        )
-        if int(label) == 0
-    ] + [
-        pair
-        for pair, label in zip(
-            benchmark.split.val_pairs.pairs, benchmark.split.val_pairs.labels.tolist(), strict=True
-        )
-        if int(label) == 0
-    ]
-    split = derive_val_region_split(
-        benchmark.split.train_nodes, truth_edges, benchmark_negatives, benchmark.positive_edges
-    )
-    return split, frozenset(benchmark.split.test_nodes)
 
 
 def truth_graph_for_kd(split: ValRegionSplit) -> nx.Graph:
@@ -135,8 +117,7 @@ def assert_training_side_only(
 
     V_val nodes are legitimately part of `split.train_nodes` and `truth_graph`
     (cross-boundary edges are not quarantined); only a V_val-*internal* edge
-    or pair is illegal, so this check is pair-level, not node-level, for the
-    V_val boundary specifically.
+    is illegal here (row-level quarantine is `assert_no_val_internal_training_rows`).
 
     Raises:
         ValueError: If `node_ids` overlaps the benchmark test split; `node_ids`
@@ -180,15 +161,54 @@ def assert_training_side_only(
 
 
 def require_full_ego_oracle(model: EgoStitchModel) -> FullOracleGenerator:
-    """Refuse any generator but `full_ego_oracle` (the B1 plan's only legal teacher)."""
+    """Refuse any generator but `full_ego_oracle` (the only legal KD teacher)."""
     if not isinstance(model.generator, FullOracleGenerator):
         raise ValueError(
             "KD teacher targets require a checkpoint whose generator is "
             f"'full_ego_oracle'; got {type(model.generator).__name__}. Scoring any "
-            "other generator would not be the Full-Ego Pooled Oracle teacher the "
-            "B1 plan distills from."
+            "other generator would not be the Full-Ego Pooled Oracle teacher this "
+            "KD pipeline distills from."
         )
     return model.generator
+
+
+# --------------------------------------------------------------------------- row universe
+
+
+def assert_no_val_internal_training_rows(train_rows: Sequence[Pair], v_val: frozenset[str]) -> None:
+    """Hard-refuse a training row with both endpoints inside V_val.
+
+    The validation block is exempt: `_val_cls_rows` rows are the held-out
+    V_val classification rows, scored only for validation-side diagnostics.
+
+    Raises:
+        ValueError: If any training row has both endpoints inside `v_val`.
+    """
+    violations = [(u, v) for u, v in train_rows if u in v_val and v in v_val]
+    if violations:
+        raise ValueError(
+            f"{len(violations)} training row(s) have both endpoints inside V_val "
+            f"(quarantined from supervision; first few: {violations[:5]})"
+        )
+
+
+def _row_positions(
+    rows: Sequence[Pair], position: Mapping[str, int]
+) -> tuple[NDArray[np.int32], NDArray[np.int32]]:
+    """Map row endpoints to `node_ids` positions, refusing an off-universe endpoint.
+
+    Raises:
+        ValueError: If any row endpoint is missing from `position`.
+    """
+    missing = sorted({node for pair in rows for node in pair if node not in position})
+    if missing:
+        raise ValueError(
+            f"{len(missing)} row endpoint(s) are outside the training node universe "
+            f"(first few: {missing[:5]})"
+        )
+    a_idx = np.array([position[u] for u, _ in rows], dtype=np.int32)
+    b_idx = np.array([position[v] for _, v in rows], dtype=np.int32)
+    return a_idx, b_idx
 
 
 # --------------------------------------------------------------------------- node encoding
@@ -206,9 +226,9 @@ def encode_all_nodes(
     """Encode every node in `node_ids` exactly once.
 
     Mirrors `score_universe._score_egostitch_e2e`'s bucketed encode-once
-    node-state cache (score_universe.py:2315-2399). `ground` is a dummy zero
-    tensor: `FullOracleGenerator.encode_node` reads only its batch dimension
-    (`del ground`), never its content, so a real grounding pool -- and the
+    node-state cache. `ground` is a dummy zero tensor:
+    `FullOracleGenerator.encode_node` reads only its batch dimension (`del
+    ground`), never its content, so a real grounding pool -- and the
     `build_grounding_pool` cache it would otherwise require -- is unneeded
     for this generator.
     """
@@ -315,19 +335,21 @@ def _move_state(state: E2ENodeState, device: torch.device) -> E2ENodeState:
 
 
 @dataclass(frozen=True)
-class ScoredKDContext:
-    """One `score_kd_context` pass, aligned row-for-row with the context.
+class ScoredRows:
+    """One `score_rows` pass, aligned row-for-row with its `(a_idx, b_idx)` input.
 
-    ``teacher_seeds`` is the per-slot symmetrization ``½(S_ab + S_ba)`` of the
-    encoder's PMA seed tokens (the last ``seeds`` rows of ``topo_ab/ba``);
-    ``slot_cos``/``slot_norm_log_ratio`` are the AB/BA order-asymmetry audit
-    computed *before* symmetrization -- the artifact stores only the mean, so
-    this is the only place the disagreement is still observable.
+    ``teacher_rep`` is the dump-side symmetrized teacher pooled pair embedding
+    ``0.5 * (pooled_ab + pooled_ba)``, formed in fp32 then cast to fp16.
+    ``teacher_seeds`` is the analogous per-slot symmetrization ``0.5 * (S_ab +
+    S_ba)`` of the encoder's PMA seed tokens (the last ``seeds`` rows of
+    ``topo_ab/ba``). ``slot_cos``/``slot_norm_log_ratio`` are the AB/BA
+    order-asymmetry audit computed *before* symmetrization -- the artifact
+    stores only the symmetrized mean, so this is the only place the
+    disagreement is still observable.
     """
 
     teacher_logit: NDArray[np.float32]
-    pooled_ab: NDArray[np.float16]
-    pooled_ba: NDArray[np.float16]
+    teacher_rep: NDArray[np.float16]
     teacher_seeds: NDArray[np.float16]
     slot_cos: NDArray[np.float32]
     slot_norm_log_ratio: NDArray[np.float32]
@@ -343,39 +365,39 @@ def _encoder_seed_count(model: EgoStitchModel) -> int:
     return seeds
 
 
-def score_kd_context(
+def score_rows(
     model: EgoStitchModel,
     node_cache: Mapping[str, E2ENodeState],
     node_ids: Sequence[str],
-    context: ContextSets,
+    a_positions: NDArray[np.int32],
+    b_positions: NDArray[np.int32],
     *,
     device: torch.device,
     batch_pairs: int = _DEFAULT_BATCH_PAIRS,
-) -> ScoredKDContext:
-    """Score every context pair fp32, no autocast (see module docstring).
+) -> ScoredRows:
+    """Score every `(a_positions[i], b_positions[i])` row fp32, no autocast (see module docstring).
 
     This is the CPU-testable scoring core: given an already-encoded
     `node_cache` (`encode_all_nodes`) and a bound `full_ego_oracle` context
-    (`_install_oracle_context`), it only stitches/scores pairs -- no
+    (`_install_oracle_context`), it only stitches/scores rows -- no
     FeatureStore or checkpoint I/O.
     """
     seeds = _encoder_seed_count(model)
-    n_pairs = len(context.anchor_idx)
-    teacher_logit = np.empty(n_pairs, dtype=np.float32)
-    pooled_ab: NDArray[np.float16] | None = None
-    pooled_ba: NDArray[np.float16] | None = None
+    n_rows = len(a_positions)
+    teacher_logit = np.empty(n_rows, dtype=np.float32)
+    teacher_rep: NDArray[np.float16] | None = None
     teacher_seeds: NDArray[np.float16] | None = None
-    slot_cos = np.empty((n_pairs, seeds), dtype=np.float32)
-    slot_norm_log_ratio = np.empty((n_pairs, seeds), dtype=np.float32)
-    for start in range(0, n_pairs, max(batch_pairs, 1)):
-        end = min(start + max(batch_pairs, 1), n_pairs)
-        anchors = context.anchor_idx[start:end]
-        partners = context.partner_idx[start:end]
-        nodes_a = [node_ids[i] for i in anchors]
-        nodes_b = [node_ids[j] for j in partners]
+    slot_cos = np.empty((n_rows, seeds), dtype=np.float32)
+    slot_norm_log_ratio = np.empty((n_rows, seeds), dtype=np.float32)
+    for start in range(0, n_rows, max(batch_pairs, 1)):
+        end = min(start + max(batch_pairs, 1), n_rows)
+        a_batch = a_positions[start:end]
+        b_batch = b_positions[start:end]
+        nodes_a = [node_ids[i] for i in a_batch]
+        nodes_b = [node_ids[j] for j in b_batch]
         state_a = _move_state(_stack_states([node_cache[n] for n in nodes_a]), device)
         state_b = _move_state(_stack_states([node_cache[n] for n in nodes_b]), device)
-        is_self = torch.from_numpy(anchors == partners).to(device=device, dtype=torch.bool)
+        is_self = torch.from_numpy(a_batch == b_batch).to(device=device, dtype=torch.bool)
         with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=False):
             pair_context = model.build_pair_context_from_states(state_a, state_b, is_self)
             logits = model.score_pair_context(pair_context)
@@ -390,89 +412,63 @@ def score_kd_context(
                 "full-ego oracle pair context carries no encoder tokens -- "
                 "the KD seed dump needs both orders' PMA seed rows"
             )
-        ab = pair_context.pooled_ab.detach().to(dtype=torch.float16, device="cpu").numpy()
-        ba = pair_context.pooled_ba.detach().to(dtype=torch.float16, device="cpu").numpy()
+        ab = pair_context.pooled_ab.detach().to(dtype=torch.float32, device="cpu")
+        ba = pair_context.pooled_ba.detach().to(dtype=torch.float32, device="cpu")
+        rep = (0.5 * (ab + ba)).to(dtype=torch.float16).numpy()
         s_ab = pair_context.topo_ab[:, -seeds:, :].detach().to(dtype=torch.float32, device="cpu")
         s_ba = pair_context.topo_ba[:, -seeds:, :].detach().to(dtype=torch.float32, device="cpu")
-        if pooled_ab is None:
-            pooled_ab = np.empty((n_pairs, ab.shape[-1]), dtype=np.float16)
-            pooled_ba = np.empty((n_pairs, ba.shape[-1]), dtype=np.float16)
-            teacher_seeds = np.empty((n_pairs, seeds, s_ab.shape[-1]), dtype=np.float16)
-        pooled_ab[start:end] = ab
-        cast(NDArray[np.float16], pooled_ba)[start:end] = ba
+        if teacher_rep is None:
+            teacher_rep = np.empty((n_rows, rep.shape[-1]), dtype=np.float16)
+            teacher_seeds = np.empty((n_rows, seeds, s_ab.shape[-1]), dtype=np.float16)
+        teacher_rep[start:end] = rep
         sym = 0.5 * (s_ab + s_ba)
         cast(NDArray[np.float16], teacher_seeds)[start:end] = sym.to(dtype=torch.float16).numpy()
         norm_ab = s_ab.norm(dim=-1).clamp_min(_SEED_EPS)
         norm_ba = s_ba.norm(dim=-1).clamp_min(_SEED_EPS)
         slot_cos[start:end] = ((s_ab * s_ba).sum(dim=-1) / (norm_ab * norm_ba)).numpy()
         slot_norm_log_ratio[start:end] = torch.log(norm_ab / norm_ba).numpy()
-    if pooled_ab is None:
-        pooled_ab = np.empty((0, 0), dtype=np.float16)
-        pooled_ba = np.empty((0, 0), dtype=np.float16)
+    if teacher_rep is None:
+        teacher_rep = np.empty((0, 0), dtype=np.float16)
         teacher_seeds = np.empty((0, seeds, 0), dtype=np.float16)
-    return ScoredKDContext(
+    return ScoredRows(
         teacher_logit=teacher_logit,
-        pooled_ab=pooled_ab,
-        pooled_ba=cast(NDArray[np.float16], pooled_ba),
+        teacher_rep=teacher_rep,
         teacher_seeds=cast(NDArray[np.float16], teacher_seeds),
         slot_cos=slot_cos,
         slot_norm_log_ratio=slot_norm_log_ratio,
     )
 
 
-def pair_labels(
-    node_ids: Sequence[str], context: ContextSets, truth_graph: nx.Graph
-) -> NDArray[np.int8]:
-    """Return 1 for a context pair that is a `truth_graph` edge, else 0."""
-    labels = np.zeros(len(context.anchor_idx), dtype=np.int8)
-    for row, (anchor, partner) in enumerate(
-        zip(context.anchor_idx.tolist(), context.partner_idx.tolist(), strict=True)
-    ):
-        labels[row] = int(truth_graph.has_edge(node_ids[anchor], node_ids[partner]))
-    return labels
-
-
 # --------------------------------------------------------------------------- pre-check stats gate
+
+_STATS_EPS = 1e-12
 
 
 def build_stats_report(
-    teacher_logit: NDArray[np.float32],
-    pair_label: NDArray[np.int8],
-    is_near: NDArray[np.uint8],
-    *,
-    n_forbidden_internal_rows_excluded: int,
+    train_logit: NDArray[np.float32],
+    train_label: NDArray[np.int8],
+    val_logit: NDArray[np.float32],
+    val_label: NDArray[np.int8],
 ) -> dict[str, object]:
-    """The B1 plan's pre-check gate: entropy/calibration/hop-stratified summary stats.
+    """Per-block (train, val) entropy/calibration pre-check summary stats."""
+    return {
+        "train": _block_stats(train_logit, train_label),
+        "val": _block_stats(val_logit, val_label),
+    }
 
-    `n_forbidden_internal_rows_excluded` is provenance only (never gates): the
-    number of V_val-internal candidate rows `sample_context_sets`'
-    `forbidden_internal` kept out of this artifact.
-    """
-    logit64 = teacher_logit.astype(np.float64)
+
+def _block_stats(logit: NDArray[np.float32], label: NDArray[np.int8]) -> dict[str, object]:
+    logit64 = logit.astype(np.float64)
     prob = 1.0 / (1.0 + np.exp(-logit64))
     entropy = -(prob * np.log(prob + _STATS_EPS) + (1 - prob) * np.log(1 - prob + _STATS_EPS))
-
-    report: dict[str, object] = {
-        "n_pairs": int(len(teacher_logit)),
-        "n_forbidden_internal_rows_excluded": n_forbidden_internal_rows_excluded,
+    return {
+        "n_rows": int(len(logit)),
+        "label_prevalence": float(label.mean()) if len(label) else 0.0,
         "teacher_logit_overall": _histogram(logit64),
-        "teacher_logit_negatives": _histogram(logit64[pair_label == 0]),
+        "teacher_logit_positives": _histogram(logit64[label == 1]),
+        "teacher_logit_negatives": _histogram(logit64[label == 0]),
         "sigmoid_entropy": _histogram(entropy),
-        "hop_stratified": {},
     }
-    hop_stratified = cast(dict[str, object], report["hop_stratified"])
-    for near_flag, name in ((1, "near"), (0, "random")):
-        row_mask = is_near == near_flag
-        hop_stratified[name] = {
-            "count": int(row_mask.sum()),
-            "label_prevalence": float(pair_label[row_mask].mean()) if row_mask.any() else 0.0,
-            "mean_sigmoid": float(prob[row_mask].mean()) if row_mask.any() else 0.0,
-            "teacher_logit": _histogram(logit64[row_mask]),
-        }
-    return report
-
-
-_STATS_EPS = 1e-12
 
 
 def _histogram(values: NDArray[np.float64]) -> dict[str, float]:
@@ -501,13 +497,13 @@ def write_stats_report(output_dir: Path, report: Mapping[str, object]) -> None:
 def _parse_shard(spec: str) -> tuple[int, int]:
     parts = spec.split("/")
     if len(parts) != 2:
-        raise ValueError(f"--anchor-shard must be 'I/N', got {spec!r}")
+        raise ValueError(f"--row-shard must be 'I/N', got {spec!r}")
     try:
         index, total = int(parts[0]), int(parts[1])
     except ValueError as error:
-        raise ValueError(f"--anchor-shard must be 'I/N', got {spec!r}") from error
+        raise ValueError(f"--row-shard must be 'I/N', got {spec!r}") from error
     if total <= 0 or not 0 <= index < total:
-        raise ValueError(f"--anchor-shard index must satisfy 0 <= I < N, got {spec!r}")
+        raise ValueError(f"--row-shard index must satisfy 0 <= I < N, got {spec!r}")
     return index, total
 
 
@@ -520,26 +516,21 @@ def _write_shard(
     shard: int,
     num_shards: int,
     *,
-    pair_anchor_idx: NDArray[np.int32],
-    pair_partner_idx: NDArray[np.int32],
-    scored: ScoredKDContext,
-    is_near: NDArray[np.uint8],
-    pair_label: NDArray[np.int8],
+    a_idx: NDArray[np.int32],
+    b_idx: NDArray[np.int32],
+    scored: ScoredRows,
 ) -> None:
     path = _shard_path(output, shard, num_shards)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         path,
-        pair_anchor_idx=pair_anchor_idx,
-        pair_partner_idx=pair_partner_idx,
+        a_idx=a_idx,
+        b_idx=b_idx,
         teacher_logit=scored.teacher_logit,
-        teacher_pooled_ab=scored.pooled_ab,
-        teacher_pooled_ba=scored.pooled_ba,
+        teacher_rep=scored.teacher_rep,
         teacher_seeds=scored.teacher_seeds,
         slot_cos=scored.slot_cos,
         slot_norm_log_ratio=scored.slot_norm_log_ratio,
-        is_near=is_near,
-        pair_label=pair_label,
     )
 
 
@@ -548,68 +539,55 @@ def _all_shards_present(output: Path, num_shards: int) -> bool:
 
 
 def _merge_shards(
-    output: Path, node_ids: Sequence[str], context: ContextSets, num_shards: int
-) -> tuple[ScoredKDContext, NDArray[np.int8]]:
-    """Concatenate `--anchor-shard` outputs back into the full deterministic pair order.
+    output: Path, a_idx: NDArray[np.int32], b_idx: NDArray[np.int32], num_shards: int
+) -> ScoredRows:
+    """Concatenate `--row-shard` outputs back into the full deterministic row order.
 
-    Every shard invocation resamples the identical `ContextSets` (a pure
-    function of `node_ids`/seed/k values), so shards need not carry offsets
-    of their own: shard `i`'s pair-row range is exactly
-    ``[anchor_offsets[start_i], anchor_offsets[end_i])`` for its
-    `_shard_range`-derived anchor range.
+    Every shard invocation re-derives the identical combined row list (a pure
+    function of `--config`), so shards need not carry offsets of their own:
+    shard `i`'s row range is exactly its `_shard_range`-derived range over
+    ``len(a_idx)``.
     """
-    n_pairs = len(context.anchor_idx)
-    teacher_logit = np.empty(n_pairs, dtype=np.float32)
-    pooled_ab = np.empty((n_pairs, 0), dtype=np.float16)
-    pooled_ba = np.empty((n_pairs, 0), dtype=np.float16)
-    teacher_seeds = np.empty((n_pairs, 0, 0), dtype=np.float16)
-    slot_cos = np.empty((n_pairs, 0), dtype=np.float32)
-    slot_norm_log_ratio = np.empty((n_pairs, 0), dtype=np.float32)
-    pair_label = np.empty(n_pairs, dtype=np.int8)
+    n_total = len(a_idx)
+    teacher_logit = np.empty(n_total, dtype=np.float32)
+    teacher_rep = np.empty((n_total, 0), dtype=np.float16)
+    teacher_seeds = np.empty((n_total, 0, 0), dtype=np.float16)
+    slot_cos = np.empty((n_total, 0), dtype=np.float32)
+    slot_norm_log_ratio = np.empty((n_total, 0), dtype=np.float32)
     for shard in range(num_shards):
-        start, end = _shard_range(len(node_ids), shard, num_shards)
-        pair_start = int(context.anchor_offsets[start])
-        pair_end = int(context.anchor_offsets[end])
+        start, end = _shard_range(n_total, shard, num_shards)
         path = _shard_path(output, shard, num_shards)
         if not path.is_file():
             raise ValueError(f"missing shard file for merge: {path}")
         with np.load(path) as archive:
-            if not np.array_equal(
-                archive["pair_anchor_idx"], context.anchor_idx[pair_start:pair_end]
-            ) or not np.array_equal(
-                archive["pair_partner_idx"], context.partner_idx[pair_start:pair_end]
+            if not np.array_equal(archive["a_idx"], a_idx[start:end]) or not np.array_equal(
+                archive["b_idx"], b_idx[start:end]
             ):
                 raise ValueError(
-                    f"shard {shard} pair identity does not match the deterministic context "
-                    "(re-run with the same --seed/--k-near/--k-rand)"
+                    f"shard {shard} row identity does not match the deterministic row list "
+                    "(re-run with the same --config)"
                 )
-            teacher_logit[pair_start:pair_end] = archive["teacher_logit"]
-            if pooled_ab.shape[1] == 0 and archive["teacher_pooled_ab"].shape[0]:
-                ab_width = archive["teacher_pooled_ab"].shape[1]
-                ba_width = archive["teacher_pooled_ba"].shape[1]
-                pooled_ab = np.empty((n_pairs, ab_width), dtype=np.float16)
-                pooled_ba = np.empty((n_pairs, ba_width), dtype=np.float16)
+            teacher_logit[start:end] = archive["teacher_logit"]
+            if teacher_rep.shape[1] == 0 and archive["teacher_rep"].shape[0]:
+                rep_width = archive["teacher_rep"].shape[1]
+                teacher_rep = np.empty((n_total, rep_width), dtype=np.float16)
                 seeds_shape = archive["teacher_seeds"].shape
                 teacher_seeds = np.empty(
-                    (n_pairs, seeds_shape[1], seeds_shape[2]), dtype=np.float16
+                    (n_total, seeds_shape[1], seeds_shape[2]), dtype=np.float16
                 )
-                slot_cos = np.empty((n_pairs, seeds_shape[1]), dtype=np.float32)
-                slot_norm_log_ratio = np.empty((n_pairs, seeds_shape[1]), dtype=np.float32)
-            pooled_ab[pair_start:pair_end] = archive["teacher_pooled_ab"]
-            pooled_ba[pair_start:pair_end] = archive["teacher_pooled_ba"]
-            teacher_seeds[pair_start:pair_end] = archive["teacher_seeds"]
-            slot_cos[pair_start:pair_end] = archive["slot_cos"]
-            slot_norm_log_ratio[pair_start:pair_end] = archive["slot_norm_log_ratio"]
-            pair_label[pair_start:pair_end] = archive["pair_label"]
-    scored = ScoredKDContext(
+                slot_cos = np.empty((n_total, seeds_shape[1]), dtype=np.float32)
+                slot_norm_log_ratio = np.empty((n_total, seeds_shape[1]), dtype=np.float32)
+            teacher_rep[start:end] = archive["teacher_rep"]
+            teacher_seeds[start:end] = archive["teacher_seeds"]
+            slot_cos[start:end] = archive["slot_cos"]
+            slot_norm_log_ratio[start:end] = archive["slot_norm_log_ratio"]
+    return ScoredRows(
         teacher_logit=teacher_logit,
-        pooled_ab=pooled_ab,
-        pooled_ba=pooled_ba,
+        teacher_rep=teacher_rep,
         teacher_seeds=teacher_seeds,
         slot_cos=slot_cos,
         slot_norm_log_ratio=slot_norm_log_ratio,
     )
-    return scored, pair_label
 
 
 # --------------------------------------------------------------------------- verification
@@ -619,33 +597,31 @@ def verify_sample(
     model: EgoStitchModel,
     node_cache: Mapping[str, E2ENodeState],
     node_ids: Sequence[str],
-    context: ContextSets,
+    a_idx: NDArray[np.int32],
+    b_idx: NDArray[np.int32],
     teacher_logit: NDArray[np.float32],
     *,
     n: int,
     device: torch.device,
 ) -> None:
-    """Recompute `n` random pairs directly and assert they match the written logits."""
-    total = len(context.anchor_idx)
+    """Recompute `n` random combined rows directly and assert they match the written logits."""
+    total = len(a_idx)
     if total == 0 or n <= 0:
         return
-    rng = np.random.default_rng(context.seed)
+    rng = np.random.default_rng(total)
     sample = rng.choice(total, size=min(n, total), replace=False)
-    sample_context = ContextSets(
-        anchor_idx=context.anchor_idx[sample],
-        partner_idx=context.partner_idx[sample],
-        anchor_offsets=np.array([0, len(sample)], dtype=np.int64),
-        is_near=context.is_near[sample],
-        k_near=context.k_near,
-        k_rand=context.k_rand,
-        seed=context.seed,
-    )
-    recomputed = score_kd_context(
-        model, node_cache, node_ids, sample_context, device=device, batch_pairs=max(len(sample), 1)
+    recomputed = score_rows(
+        model,
+        node_cache,
+        node_ids,
+        a_idx[sample],
+        b_idx[sample],
+        device=device,
+        batch_pairs=max(len(sample), 1),
     ).teacher_logit
     if not np.allclose(recomputed, teacher_logit[sample], atol=1e-5, rtol=1e-5):
         raise ValueError("--verify-sample recomputation does not match the written teacher logits")
-    logger.info("verify-sample: %d/%d recomputed pairs match", len(sample), total)
+    logger.info("verify-sample: %d/%d recomputed rows match", len(sample), total)
 
 
 # --------------------------------------------------------------------------- CLI
@@ -665,12 +641,10 @@ def _load_teacher_checkpoint(args: argparse.Namespace) -> tuple[torch.nn.Module,
 def build_parser() -> argparse.ArgumentParser:
     """Build the `python -m src.distill.teacher_targets` argument parser."""
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config", type=Path, required=True, help="Training YAML whose rows this artifact joins"
+    )
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--data-root", type=Path, required=True)
-    parser.add_argument("--strategy", type=str, default="breadth_first")
-    parser.add_argument("--seed", type=int, required=True)
-    parser.add_argument("--k-near", type=int, required=True)
-    parser.add_argument("--k-rand", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument(
@@ -686,56 +660,58 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-pairs", type=int, default=_DEFAULT_BATCH_PAIRS)
     parser.add_argument("--f0-cache", type=Path, default=None)
     parser.add_argument(
-        "--anchor-shard",
+        "--row-shard",
         type=str,
         default=None,
-        help="'I/N': score only the pairs of node-position shard I of N (resume sharding)",
+        help="'I/N': score only row shard I of N of the combined train+val row list "
+        "(resume sharding)",
     )
     parser.add_argument(
         "--merge",
         action="store_true",
-        help="Merge previously written --anchor-shard outputs into the final artifact",
+        help="Merge previously written --row-shard outputs into the final artifact",
     )
     parser.add_argument("--verify-sample", type=int, default=0)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """Run the KD teacher-target dumper CLI (score, `--anchor-shard`, or `--merge`)."""
+    """Run the KD teacher-target dumper CLI (score, `--row-shard`, or `--merge`)."""
     logging.basicConfig(level=logging.INFO)
     args = build_parser().parse_args(argv)
 
-    split, test_nodes = _load_val_region_split(args.data_root, args.strategy)
-    truth_graph = truth_graph_for_kd(split)
-    store = FeatureStore(args.data_root / _FEATURES_SUBDIR)
-    featureless = sorted(set(split.train_nodes) - store.node_ids)
-    if featureless:
-        # exclude_nodes filters only the pair files, so featureless nodes
-        # survive in the graph; they cannot be scored or trained on.
-        logger.info("dropping %d training nodes without stored features", len(featureless))
-    node_ids = sorted(set(split.train_nodes) - set(featureless))
-    assert_training_side_only(node_ids, truth_graph, split, test_nodes)
+    cfg = load_config(args.config)
+    assembled = assemble_data(cfg, verify=True)
+    split = assembled.val_split
+    positives, negatives = _training_rows(split, assembled.exclude_nodes)
+    train_rows = positives + negatives
+    train_labels = [1] * len(positives) + [0] * len(negatives)
+    val_rows, val_labels = _val_cls_rows(split, assembled.exclude_nodes)
 
-    context = sample_context_sets(
-        truth_graph,
-        node_ids,
-        seed=args.seed,
-        k_near=args.k_near,
-        k_rand=args.k_rand,
-        forbidden_internal=split.v_val,
-    )
+    truth_graph = truth_graph_for_kd(split)
+    node_ids = sorted(split.train_nodes - assembled.exclude_nodes)
+    test_nodes = frozenset(assembled.benchmark.split.test_nodes)
+    assert_training_side_only(node_ids, truth_graph, split, test_nodes)
+    assert_no_val_internal_training_rows(train_rows, split.v_val)
+
+    position = {node_id: i for i, node_id in enumerate(node_ids)}
+    combined_rows = train_rows + val_rows
+    a_idx, b_idx = _row_positions(combined_rows, position)
+    labels = np.array(train_labels + val_labels, dtype=np.int8)
+    n_train = len(train_rows)
+    n_total = len(combined_rows)
 
     if args.merge:
-        if args.anchor_shard is None:
-            raise ValueError("--merge requires --anchor-shard I/N to know the shard count")
-        _, num_shards = _parse_shard(args.anchor_shard)
-        _finish_merge(args, node_ids, context, num_shards)
+        if args.row_shard is None:
+            raise ValueError("--merge requires --row-shard I/N to know the shard count")
+        _, num_shards = _parse_shard(args.row_shard)
+        _finish_merge(args, node_ids, truth_graph, a_idx, b_idx, labels, n_train, num_shards)
         return
 
     shard_range: tuple[int, int, int] | None = None
-    if args.anchor_shard is not None:
-        shard_index, num_shards = _parse_shard(args.anchor_shard)
-        start, end = _shard_range(len(node_ids), shard_index, num_shards)
+    if args.row_shard is not None:
+        shard_index, num_shards = _parse_shard(args.row_shard)
+        start, end = _shard_range(n_total, shard_index, num_shards)
         shard_range = (start, end, num_shards)
 
     device = torch.device(args.device)
@@ -751,57 +727,63 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     f0_cache = args.f0_cache if args.f0_cache is not None else args.output / "f0_cache.pt"
     node_cache = encode_all_nodes(
-        model, store, node_ids, device=device, token_budget=args.token_budget, f0_cache=f0_cache
+        model,
+        assembled.store,
+        node_ids,
+        device=device,
+        token_budget=args.token_budget,
+        f0_cache=f0_cache,
     )
 
     if shard_range is not None:
         start, end, num_shards = shard_range
-        pair_start, pair_end = int(context.anchor_offsets[start]), int(context.anchor_offsets[end])
-        shard_context = ContextSets(
-            anchor_idx=context.anchor_idx[pair_start:pair_end],
-            partner_idx=context.partner_idx[pair_start:pair_end],
-            anchor_offsets=context.anchor_offsets[start : end + 1] - context.anchor_offsets[start],
-            is_near=context.is_near[pair_start:pair_end],
-            k_near=context.k_near,
-            k_rand=context.k_rand,
-            seed=context.seed,
+        scored = score_rows(
+            model,
+            node_cache,
+            node_ids,
+            a_idx[start:end],
+            b_idx[start:end],
+            device=device,
+            batch_pairs=args.batch_pairs,
         )
-        scored = score_kd_context(
-            model, node_cache, node_ids, shard_context, device=device, batch_pairs=args.batch_pairs
-        )
-        labels = pair_labels(node_ids, shard_context, truth_graph)
-        shard_index = _parse_shard(args.anchor_shard)[0]
+        shard_index = _parse_shard(args.row_shard)[0]
         _write_shard(
             args.output,
             shard_index,
             num_shards,
-            pair_anchor_idx=shard_context.anchor_idx,
-            pair_partner_idx=shard_context.partner_idx,
+            a_idx=a_idx[start:end],
+            b_idx=b_idx[start:end],
             scored=scored,
-            is_near=shard_context.is_near,
-            pair_label=labels,
         )
         logger.info("wrote shard %d/%d", shard_index, num_shards)
         if _all_shards_present(args.output, num_shards):
             logger.info("all %d shards present; auto-merging", num_shards)
             _finish_merge(
-                args, node_ids, context, num_shards, checkpoint_override=(model, checkpoint_id)
+                args,
+                node_ids,
+                truth_graph,
+                a_idx,
+                b_idx,
+                labels,
+                n_train,
+                num_shards,
+                checkpoint_id_override=checkpoint_id,
             )
         return
 
-    scored = score_kd_context(
-        model, node_cache, node_ids, context, device=device, batch_pairs=args.batch_pairs
+    scored = score_rows(
+        model, node_cache, node_ids, a_idx, b_idx, device=device, batch_pairs=args.batch_pairs
     )
-    labels = pair_labels(node_ids, context, truth_graph)
     _finalize_artifact(
-        args, node_ids, context, truth_graph, split.v_val, scored, labels, checkpoint_id
+        args, node_ids, truth_graph, a_idx, b_idx, labels, n_train, scored, checkpoint_id
     )
     if args.verify_sample > 0:
         verify_sample(
             model,
             node_cache,
             node_ids,
-            context,
+            a_idx,
+            b_idx,
             scored.teacher_logit,
             n=args.verify_sample,
             device=device,
@@ -811,55 +793,30 @@ def main(argv: Sequence[str] | None = None) -> None:
 def _finish_merge(
     args: argparse.Namespace,
     node_ids: Sequence[str],
-    context: ContextSets,
+    truth_graph: nx.Graph,
+    a_idx: NDArray[np.int32],
+    b_idx: NDArray[np.int32],
+    labels: NDArray[np.int8],
+    n_train: int,
     num_shards: int,
     *,
-    checkpoint_override: tuple[EgoStitchModel, str] | None = None,
+    checkpoint_id_override: str | None = None,
 ) -> None:
-    scored, labels = _merge_shards(args.output, node_ids, context, num_shards)
-    if checkpoint_override is not None:
-        _, checkpoint_id = checkpoint_override
+    scored = _merge_shards(args.output, a_idx, b_idx, num_shards)
+    if checkpoint_id_override is not None:
+        checkpoint_id = checkpoint_id_override
     else:
         _, model_family, checkpoint_id = _load_teacher_checkpoint(args)
         if model_family != "egostitch_e2e":
             raise ValueError(
                 f"KD teacher targets require model_family 'egostitch_e2e', got {model_family!r}"
             )
-    split, test_nodes = _load_val_region_split(args.data_root, args.strategy)
-    truth_graph = truth_graph_for_kd(split)
-    assert_training_side_only(node_ids, truth_graph, split, test_nodes)
     _finalize_artifact(
-        args, node_ids, context, truth_graph, split.v_val, scored, labels, checkpoint_id
+        args, node_ids, truth_graph, a_idx, b_idx, labels, n_train, scored, checkpoint_id
     )
 
 
-def _count_forbidden_internal_rows_excluded(
-    truth_graph: nx.Graph,
-    node_ids: Sequence[str],
-    v_val: frozenset[str],
-    *,
-    seed: int,
-    k_near: int,
-    k_rand: int,
-) -> int:
-    """Count V_val-internal rows `forbidden_internal=v_val` kept out of context sampling.
-
-    Provenance-only diagnostic (never gates): re-samples the identical
-    deterministic context with no exclusion and counts the rows both of whose
-    endpoints fall inside `v_val` -- exactly the rows a `forbidden_internal=v_val`
-    pass structurally cannot produce.
-    """
-    unguarded = sample_context_sets(truth_graph, node_ids, seed=seed, k_near=k_near, k_rand=k_rand)
-    anchor_in_v_val = np.fromiter(
-        (node_ids[i] in v_val for i in unguarded.anchor_idx.tolist()), dtype=bool
-    )
-    partner_in_v_val = np.fromiter(
-        (node_ids[j] in v_val for j in unguarded.partner_idx.tolist()), dtype=bool
-    )
-    return int(np.count_nonzero(anchor_in_v_val & partner_in_v_val))
-
-
-def seed_symmetry_stats(scored: ScoredKDContext) -> dict[str, object]:
+def seed_symmetry_stats(scored: ScoredRows) -> dict[str, object]:
     """Summarize the AB/BA order-asymmetry audit for the artifact manifest.
 
     Strong disagreement (low `slot_cos`) means the symmetrized `teacher_seeds`
@@ -883,43 +840,41 @@ def seed_symmetry_stats(scored: ScoredKDContext) -> dict[str, object]:
 def _finalize_artifact(
     args: argparse.Namespace,
     node_ids: Sequence[str],
-    context: ContextSets,
     truth_graph: nx.Graph,
-    v_val: frozenset[str],
-    scored: ScoredKDContext,
+    a_idx: NDArray[np.int32],
+    b_idx: NDArray[np.int32],
     labels: NDArray[np.int8],
+    n_train: int,
+    scored: ScoredRows,
     checkpoint_id: str | None,
 ) -> None:
     checkpoint_sha256 = _file_sha256(args.checkpoint)
     write_kd_targets(
         args.output,
         node_ids=node_ids,
-        pair_anchor_idx=context.anchor_idx,
-        pair_partner_idx=context.partner_idx,
-        anchor_offsets=context.anchor_offsets,
-        teacher_logit=scored.teacher_logit,
-        teacher_pooled_ab=scored.pooled_ab,
-        teacher_pooled_ba=scored.pooled_ba,
-        is_near=context.is_near,
-        pair_label=labels,
+        pair_a_idx=a_idx[:n_train],
+        pair_b_idx=b_idx[:n_train],
+        pair_label=labels[:n_train],
+        teacher_logit=scored.teacher_logit[:n_train],
+        teacher_rep=scored.teacher_rep[:n_train],
+        val_pair_a_idx=a_idx[n_train:],
+        val_pair_b_idx=b_idx[n_train:],
+        val_pair_label=labels[n_train:],
+        val_teacher_logit=scored.teacher_logit[n_train:],
+        val_teacher_rep=scored.teacher_rep[n_train:],
         truth_graph_sha256=_oracle_truth_graph_sha256(truth_graph),
         checkpoint_path=args.checkpoint,
         checkpoint_sha256=checkpoint_sha256,
         checkpoint_id=checkpoint_id,
-        k_near=args.k_near,
-        k_rand=args.k_rand,
-        seed=args.seed,
-        teacher_seeds=scored.teacher_seeds,
+        teacher_seeds=scored.teacher_seeds[:n_train],
+        val_teacher_seeds=scored.teacher_seeds[n_train:],
         seed_symmetry=seed_symmetry_stats(scored),
     )
-    n_forbidden_internal_rows_excluded = _count_forbidden_internal_rows_excluded(
-        truth_graph, node_ids, v_val, seed=args.seed, k_near=args.k_near, k_rand=args.k_rand
-    )
     report = build_stats_report(
-        scored.teacher_logit,
-        labels,
-        context.is_near,
-        n_forbidden_internal_rows_excluded=n_forbidden_internal_rows_excluded,
+        scored.teacher_logit[:n_train],
+        labels[:n_train],
+        scored.teacher_logit[n_train:],
+        labels[n_train:],
     )
     write_stats_report(args.output, report)
 

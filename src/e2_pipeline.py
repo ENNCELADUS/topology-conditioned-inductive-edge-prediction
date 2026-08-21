@@ -1059,7 +1059,6 @@ def _run_pipeline_unlocked(
                 "epoch",
                 "global_step",
                 "rng_by_rank",
-                "kd_by_rank",
                 "runtime_by_rank",
                 "per_epoch_profiles",
                 "evals_without_improvement",
@@ -1078,7 +1077,7 @@ def _run_pipeline_unlocked(
                 raise ValueError("training_state.pt epoch is not resumable for this config")
             if not isinstance(state["global_step"], int) or state["global_step"] <= 0:
                 raise ValueError("training_state.pt global_step is invalid")
-            for field in ("rng_by_rank", "kd_by_rank", "runtime_by_rank"):
+            for field in ("rng_by_rank", "runtime_by_rank"):
                 value = state[field]
                 if not isinstance(value, list) or len(value) != runtime.world_size:
                     raise ValueError(f"training_state.pt {field} does not match world size")

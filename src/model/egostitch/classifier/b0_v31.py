@@ -60,7 +60,6 @@ from src.model.egostitch.classifier.layers import (
     _build_padding_mask,
     _parse_rich_pooling_components,
 )
-from src.model.egostitch.classifier.node_factor import NodeFactorBottleneck, NodeFactorOutputs
 from src.model.egostitch.config import CONDITIONING_MODES
 from src.model.egostitch.graph import PairConditioning, PairInputs
 
@@ -1333,24 +1332,6 @@ class V3_1(nn.Module):
         )
         if self.mlp_spectral_norm:
             self._apply_output_head_spectral_norm()
-        # B1 student path: zero-init low-rank node-factor residual on the pair
-        # logit. `node_factor_dim: 0` (the default and BEST_V3_1_CONFIG) keeps
-        # the baseline bit-identical; the KD arms set 64.
-        node_factor_dim = _to_int(
-            model_config.get("node_factor_dim", 0), "model_config.node_factor_dim"
-        )
-        # Optional embedding-KD alignment head riding the same bottleneck;
-        # meaningless without a node-factor path to project out of.
-        node_factor_align_dim = _to_int(
-            model_config.get("node_factor_align_dim", 0), "model_config.node_factor_align_dim"
-        )
-        if node_factor_align_dim > 0 and node_factor_dim == 0:
-            raise ValueError("model_config.node_factor_align_dim > 0 requires node_factor_dim > 0")
-        self.node_factor: NodeFactorBottleneck | None = (
-            NodeFactorBottleneck(self.d_model, node_factor_dim, node_factor_align_dim)
-            if node_factor_dim > 0
-            else None
-        )
         # D9 pair-latent generation: absent section => module not built, the
         # baseline stays bit-identical (`node_factor_dim: 0` pattern). Built
         # last so the trunk's RNG init stream is unchanged by its presence.
@@ -1384,6 +1365,18 @@ class V3_1(nn.Module):
                     plg_cfg.get("kl_free_bits", 0.05), "pair_latent_gen.kl_free_bits"
                 ),
             )
+        # kd_rep: train-time projection for representation KD, used only when
+        # the teacher's pair-embedding width differs from `d_model`
+        # (`kd_rep_dim: 0`, the default, aligns `pair_repr` directly). Built
+        # last so its presence leaves every other module's RNG init stream
+        # unchanged (same rationale as the `pair_latent_gen` build-order
+        # comment above it).
+        kd_rep_dim = _to_int(model_config.get("kd_rep_dim", 0), "model_config.kd_rep_dim")
+        if kd_rep_dim < 0:
+            raise ValueError(f"model_config.kd_rep_dim must be >= 0, got {kd_rep_dim}")
+        self.kd_rep_head: nn.Linear | None = (
+            nn.Linear(self.d_model, kd_rep_dim) if kd_rep_dim > 0 else None
+        )
 
     def pair_latent_gen_parameters(self) -> list[nn.Parameter]:
         """Generator param group for the trainer's stage-2 LR switch (kd_d9)."""
@@ -1470,19 +1463,9 @@ class V3_1(nn.Module):
         logits = self.output_head(pair_repr)
 
         output: dict[str, torch.Tensor] = {"logits": logits}
-        if self.node_factor is not None:
-            factors = cast(
-                NodeFactorOutputs,
-                self.node_factor(encoded_a, encoded_b, lengths_a, lengths_b),
-            )
-            residual = factors.residual.reshape(logits.shape).to(dtype=logits.dtype)
-            logits = logits + residual
-            output["logits"] = logits
-            pair_factor = factors.z_a * factors.z_b
-            output["node_factor_pair"] = pair_factor
-            output["node_factor_residual"] = factors.residual
-            if self.node_factor.align_head is not None:
-                output["node_factor_align"] = self.node_factor.align_head(pair_factor)
+        output["pair_repr"] = pair_repr
+        if self.kd_rep_head is not None:
+            output["kd_rep"] = self.kd_rep_head(pair_repr)
         if self.pair_latent_gen is not None:
             delta, delta_std = self.pair_latent_gen.forward_task(
                 encoded_a, encoded_b, lengths_a, lengths_b, pair_repr
