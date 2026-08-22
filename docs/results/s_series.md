@@ -1,9 +1,8 @@
 # S-series topology diagnostics: definitions and results
 
-**Current result:** S2–S6 consistently find learnable topology correlates, but none establishes a
-useful set-conditioned or node-budget mechanism beyond strong endpoint pair scoring. S3's pair-only
-control beats its set-conditioned model, S4's predicted budgets worsen descriptor MMD, S6 residual
-R² stays low, and the related STPD pre-gate returns `edge_identity_killed`.
+**Current result:** S2 finds feature-aligned topology signal but its standalone generator loses to
+B0; S3's pair-only control beats its set-conditioned residual. New S4 now tests the missing route:
+generated joint graph latents augment frozen B0 representation instead of replacing B0.
 
 All numbers are diagnostic (`formal=false`). S0/S0-R/S1 belong to the retired `V_hold` protocol and are archived lineage evidence, not current `V_val` results. S2/S3 use sampled test-node sets, so their density-matched GS/RD are comparable only within their tables, not to the official full-candidate protocol.
 
@@ -16,9 +15,7 @@ All numbers are diagnostic (`formal=false`). S0/S0-R/S1 belong to the retired `V
 | S1 | post-process frozen B0 scores with IPF/greedy degree quotas or CN updates | archived; tests frozen-score allocation, not joint learning |
 | S2 | generate an induced set topology from all node features: conditional GEN, unconditional UNC, shuffled-condition SHUF, deterministic DET; AE is reconstruction ceiling, B0 pair-score baseline, MARG quota baseline | completed, seed 0 |
 | S3 | learn zero-init residual `logit=B0+delta`: RES uses a Set Transformer; PAIR uses parameter-matched independent node MLPs; DIAG runs the same set backbone on singleton sets; SHUF permutes set context | completed, three seeds |
-| S4 | no training: replay frozen B0 candidate scores under hard degree quotas from S5; compare exact-N control and true-degree oracle | completed |
-| S5 | full B0 trunk regresses `log1p(loopless degree)` from one node's features; warm vs scratch | completed, three seeds; held-out-node targets share graph edges and are not independent generalization |
-| S6 | full V3.1 regresses `teacher_logit-content_logit` on anchor-disjoint KD rows; warm vs scratch, zero-output-head control | completed, three seeds |
+| S4 | Set Transformer OT rectified flow generates GAE node latents; a zero-init adapter adds them to frozen B0 `pair_repr` | planned, three seeds; S2 size/test substrate plus S3 V_val boundary |
 | STPD | degree-preserving edge-swap regions; distinguish deleted true edges from inserted false edges using pair features (P), pair+corrupted-graph context (S), B0 and RA/CN/degree-parity controls | completed pre-gate, three seeds |
 
 ## Archived S0–S1 results (`V_hold`; invalid for current-result comparison)
@@ -60,32 +57,17 @@ Mean ± sample SD across three seeds; B0 is fixed. MMD triplets are degree/clust
 
 PAIR outperforms RES, while RES and RES-SHUF are effectively identical; no measurable incremental set-context gain is shown here.
 
-## S4 hard-budget assembly
+## S4 graph-latent flow residual
 
-`P/R` are simple-edge precision/recall; then global/BFS GS, global/BFS RD and the MMD triplet.
+S4 keeps frozen B0 intact and learns one set-conditioned generative residual. It uses S2's
+20–200 size/test substrate with S3's V_val boundary. A feature-conditioned Set Transformer
+OT rectified flow generates aligned GAE node latents; a symmetric zero-init adapter adds those
+latents to B0's pre-head `pair_repr`, and the original B0 output head makes the edge decision.
+The complete data, architecture, objective, and terminal rule are fixed in
+[`S4 latent-flow residual design`](../superpowers/specs/2026-08-21-s4-latent-flow-residual-design.md).
 
-| arm | P/R | GS global/BFS | RD global/BFS | degree/clustering/spectral MMD ratios | quota shortfall |
-|---|---|---|---|---|---|
-| B0 exact-N | .137/.137 | .137/.390 | 1.000/.423 | 13.03/11.86/18.07 | — |
-| true-degree oracle | .216/.212 | .214/.439 | .984/.622 | 4.06/5.44/7.65 | 1.62% |
-| scratch s0/s1/s2 | .175/.154; .176/.150; .184/.157 | .164/.397; .162/.395; .169/.398 | .882/.399; .852/.397; .849/.390 | 15.33/14.46/19.25; 15.35/14.61/19.16; 17.05/15.34/21.41 | 11.8/14.8/15.1% (LB) |
-| warm s0/s1/s2 | .177/.155; .168/.148; .174/.155 | .165/.401; .158/.397; .164/.399 | .879/.402; .883/.400; .891/.402 | 15.49/14.43/19.77; 14.70/13.98/18.53; 15.04/14.15/18.77 | 12.1/11.7/10.9% (LB) |
+## STPD pre-gate
 
-Predicted quotas slightly improve GS over B0 but worsen RD and all three MMD ratios. Their 10.9–15.1% shortfalls make every predicted row `lower_bound_only=true`: S4 therefore fails to establish a usable predicted-budget method because degree prediction and greedy quota realization are confounded.
+STPD moderate paired accuracy: B0 0.911, Probe-S 0.728, Probe-P 0.714, RA 0.674, CN 0.672 and degree-parity 0.609. Its rule required Probe-S to beat the best control by 0.03; observed margin was −0.182, so the terminal verdict is **`edge_identity_killed`**. This verdict does not test S4's generated-latent residual.
 
-## S5/S6 probes and STPD pre-gate
-
-| probe | init | held-out MAE | R² | Spearman |
-|---|---|---:|---:|---:|
-| S5 degree | scratch | 0.775±0.031 | 0.256±0.043 | 0.474±0.026 |
-| S5 degree | warm | **0.766±0.028** | **0.290±0.045** | **0.484±0.035** |
-| S6 residual | scratch | 1.918±0.046 | −0.010±0.043 | 0.243±0.074 |
-| S6 residual | warm | **1.801±0.027** | **0.071±0.032** | **0.475±0.002** |
-
-Warm representations contain rank signal, but S5's degree accuracy is insufficient for S4 and S6's
-residual explains only 7% of held-out variance. The initial S6 smoke failed on spectral-norm state
-keys; the corrected six full runs produced the table above.
-
-STPD moderate paired accuracy: B0 0.911, Probe-S 0.728, Probe-P 0.714, RA 0.674, CN 0.672 and degree-parity 0.609. Its rule required Probe-S to beat the best control by 0.03; observed margin was −0.182, so the terminal verdict is **`edge_identity_killed`**. Overall, S2–S6 expose weak structural correlates but do not support a selected topology-conditioned method.
-
-Provenance: H20 reports are `outputs/s2/s2_results.json`, `outputs/s3/*/report.json`, `outputs/s4/pass_b/s4_results.json`, `outputs/s5_degree_probe/*/report.json`, `outputs/s6_residual_probe/*/report.json` and `outputs/stpd_pregate/report.json`. S4–S6 come from `s4-s6-budget-probes-d8` at `da6f5a5`; STPD from `design/2026-08-19-stpd` at `d916d48`.
+Provenance: completed H20 reports are `outputs/s2/s2_results.json`, `outputs/s3/*/report.json`, and `outputs/stpd_pregate/report.json`. STPD comes from `design/2026-08-19-stpd` at `d916d48`; new S4 has no result yet.

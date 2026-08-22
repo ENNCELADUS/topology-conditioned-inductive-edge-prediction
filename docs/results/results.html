@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Topology oracle vs. pairwise baseline — held-out test protocol</title>
+<title>Topology oracle vs. pairwise baseline — sampled-subgraph test protocol</title>
 <style>
   :root {
     --bg: #ffffff;
@@ -12,7 +12,7 @@
     --rule: #16181d;
     --hair: #d3d7de;
     --band: #f6f7f9;
-    --h1: rgba(28, 92, 184, 0.62);
+    --best: rgba(28, 92, 184, 0.62);
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -22,18 +22,18 @@
       --rule: #e7e9ee;
       --hair: #333842;
       --band: #1b1e24;
-      --h1: rgba(122, 168, 236, 0.55);
+      --best: rgba(122, 168, 236, 0.55);
     }
   }
   :root[data-theme="light"] {
     --bg: #ffffff; --fg: #16181d; --muted: #5c6370; --rule: #16181d; --hair: #d3d7de;
     --band: #f6f7f9;
-    --h1: rgba(28, 92, 184, 0.62);
+    --best: rgba(28, 92, 184, 0.62);
   }
   :root[data-theme="dark"] {
     --bg: #14161a; --fg: #e7e9ee; --muted: #9aa2b1; --rule: #e7e9ee; --hair: #333842;
     --band: #1b1e24;
-    --h1: rgba(122, 168, 236, 0.55);
+    --best: rgba(122, 168, 236, 0.55);
   }
 
   html { background: var(--bg); }
@@ -69,7 +69,7 @@
   tbody tr + tr td { border-top: 1px solid var(--hair); }
   tbody tr.band td { background: var(--band); }
 
-  .h1c { background: var(--h1); }
+  td.best { background: var(--best) !important; }
   td.fixed { color: var(--muted); }
 
   .legend { color: var(--muted); font-size: .85rem; margin-top: .35rem; }
@@ -79,118 +79,66 @@
 
 <h1>Topology oracle vs. pairwise baseline</h1>
 
-<h2>1. Headline table</h2>
-
-<div class="scroll">
-<table>
-  <caption>
-    Pairwise columns are computed on the 64,038 benchmark test pairs (self-loops included first,
-    per spec &sect;9.4): AUROC/AUPRC are threshold-free, while Accuracy/F1/MCC use a fixed 0.5 threshold.
-    Topology columns come from the predicted graph
-    assembled over the full 2,037,171-row candidate universe at each scorer's own
-    <em>density-matched assembly threshold</em>. The two blocks therefore share no threshold &mdash; see &sect;2.
-    Shading marks the better value per column.
-  </caption>
-  <thead>
-    <tr>
-      <th class="cat" rowspan="2">Category</th>
-      <th class="lbl" rowspan="2">Model</th>
-      <th class="grp sep" colspan="5">Pairwise classification &mdash; all test pairs<span class="gsub">ranking + fixed-0.5 decisions</span></th>
-      <th class="grp sep" colspan="2">Topology &mdash; global simple-edge<span class="gsub">density-matched assembly</span></th>
-      <th class="grp sep" colspan="5">Topology &mdash; BFS-macro (official)<span class="gsub">density-matched assembly</span></th>
-    </tr>
-    <tr>
-      <th class="sep">AUROC&uarr;</th><th>AUPRC&uarr;</th><th>Accuracy&uarr;</th><th>F1&uarr;</th><th>MCC&uarr;</th>
-      <th class="sep">GS&uarr;</th><th>RD&rarr;1</th>
-      <th class="sep">GS&uarr;</th><th>RD&rarr;1</th><th>Deg.&darr;</th><th>Clus.&darr;</th><th>Spectral&darr;</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr class="band">
-      <td class="cat">Baseline</td>
-      <td class="lbl">Pairwise baseline</td>
-      <td class="sep">0.7067</td><td>0.7315</td><td>0.6083</td><td>0.3987</td><td>0.3020</td>
-      <td class="sep">0.1365</td><td class="fixed">0.9977</td>
-      <td class="sep">0.3896</td><td>0.4223</td><td>13.08</td><td>11.93</td><td>18.09</td>
-    </tr>
-    <tr>
-      <td class="cat">True-oracle<br>diagnostic</td>
-      <td class="lbl">Full-Ego oracle</td>
-      <td class="sep h1c">0.9356</td><td class="h1c">0.9396</td><td class="h1c">0.8521</td><td class="h1c">0.8451</td><td class="h1c">0.7071</td>
-      <td class="sep h1c">0.4635</td><td class="fixed h1c">1.0000</td>
-      <td class="sep h1c">0.5904</td><td class="h1c">0.9027</td><td class="h1c">5.434</td><td class="h1c">5.176</td><td class="h1c">11.668</td>
-    </tr>
-  </tbody>
-</table>
-</div>
-<p class="legend">
-  GS&uarr; = graph similarity (edge-set Dice/F1, PRING Eq.&nbsp;4); RD&rarr;1 = relative density;
-  Deg./Clus./Spectral = MMD ratios against the real-vs-real floor. The five topology numbers are reported
-  together and never aggregated; global simple-edge and BFS-macro GS/RD are named separately and are not
-  interchangeable.
-</p>
-
 <h2>2. Operating points</h2>
+<p class="legend">B0 = pairwise baseline (checkpoint <code>48ccc9029239d270</code>); D1 = Logit KD; D2 = Rank KD; D3 = Gram KD; D4 = Representation KD. Blue cells mark the best non-oracle arm in each metric column; RD is ranked by distance to 1.</p>
 
-<h3>2.1 Threshold A &mdash; pairwise classification at a fixed 0.5</h3>
+<h3>2.1 Fixed probability threshold 0.5</h3>
 
-<div class="scroll">
-<table>
-  <caption>Threshold fixed at 0.5 for every row. Shading marks the better value per column.</caption>
-  <thead>
-    <tr>
-      <th class="lbl" rowspan="2">Model</th>
-      <th class="grp sep" colspan="7">All test pairs</th>
-      <th class="grp sep" colspan="7">Non-self only</th>
-    </tr>
-    <tr>
-      <th class="sep">AUROC&uarr;</th><th>AUPRC&uarr;</th><th>Accuracy&uarr;</th><th>Precision</th><th>Recall</th><th>F1&uarr;</th><th>MCC&uarr;</th>
-      <th class="sep">AUROC&uarr;</th><th>AUPRC&uarr;</th><th>Accuracy&uarr;</th><th>Precision</th><th>Recall</th><th>F1&uarr;</th><th>MCC&uarr;</th>
-    </tr>
-  </thead>
+<div class="scroll"><table>
+  <caption>Classification on all 64,038 test pairs. AUROC/AUPRC are threshold-free; all other columns use probability &ge; 0.5.</caption>
+  <thead><tr><th class="lbl">Arm</th><th class="sep">AUROC&uarr;</th><th>AUPRC&uarr;</th><th>Accuracy&uarr;</th><th>Precision&uarr;</th><th>Recall&uarr;</th><th>F1&uarr;</th><th>MCC&uarr;</th></tr></thead>
   <tbody>
-    <tr class="band">
-      <td class="lbl">Pairwise baseline</td>
-      <td class="sep">0.7067</td><td>0.7315</td><td>0.6083</td><td class="h1c">0.8574</td><td>0.2598</td><td>0.3987</td><td>0.3020</td>
-      <td class="sep">0.6883</td><td>0.6893</td><td>0.5964</td><td class="h1c">0.8229</td><td>0.2133</td><td>0.3388</td><td>0.2565</td>
-    </tr>
-    <tr>
-      <td class="lbl">Full-Ego oracle</td>
-      <td class="sep h1c">0.9356</td><td class="h1c">0.9396</td><td class="h1c">0.8521</td><td class="h1c">0.8871</td><td class="h1c">0.8069</td><td class="h1c">0.8451</td><td class="h1c">0.7071</td>
-      <td class="sep h1c">0.9316</td><td class="h1c">0.9315</td><td class="h1c">0.8476</td><td class="h1c">0.8792</td><td class="h1c">0.7948</td><td class="h1c">0.8349</td><td class="h1c">0.6971</td>
-    </tr>
+    <tr class="band"><td class="lbl">B0 Pairwise baseline</td><td class="sep">0.7141</td><td>0.7454</td><td class="best">0.6569</td><td>0.6990</td><td>0.5511</td><td>0.6163</td><td class="best">0.3211</td></tr>
+    <tr><td class="lbl">D1 Logit KD</td><td class="sep">0.7062</td><td>0.7388</td><td>0.6484</td><td>0.7079</td><td>0.5052</td><td>0.5896</td><td>0.3097</td></tr>
+    <tr class="band"><td class="lbl">D2 Rank KD</td><td class="sep">0.7194</td><td>0.7411</td><td>0.6563</td><td>0.6938</td><td class="best">0.5596</td><td class="best">0.6195</td><td>0.3186</td></tr>
+    <tr><td class="lbl">D3 Gram KD</td><td class="sep">0.7108</td><td>0.7360</td><td>0.6506</td><td>0.7033</td><td>0.5209</td><td>0.5985</td><td>0.3118</td></tr>
+    <tr class="band"><td class="lbl">D4 Representation KD</td><td class="sep best">0.7202</td><td class="best">0.7454</td><td>0.6547</td><td class="best">0.7088</td><td>0.5251</td><td>0.6033</td><td>0.3203</td></tr>
+    <tr><td class="lbl">Full-Ego oracle <span class="cat">(diagnostic)</span></td><td class="sep">0.9356</td><td>0.9396</td><td>0.8521</td><td>0.8871</td><td>0.8069</td><td>0.8451</td><td>0.7071</td></tr>
   </tbody>
-</table>
-</div>
+</table></div>
 
-<h3>2.2 Threshold B &mdash; graph assembly</h3>
-
-<div class="scroll">
-<table>
-  <thead>
-    <tr>
-      <th class="lbl">Model</th>
-      <th>Assembly threshold</th>
-      <th>Target non-self edges</th>
-      <th>Realized non-self edges</th>
-      <th>Global RD</th>
-      <th class="sep">Self-loops predicted</th><th>Self-loops in reference</th>
-    </tr>
-  </thead>
+<div class="scroll"><table>
+  <caption>Topology from the same fixed 0.5 decision rule, macro-averaged over 500 deterministic BFS subgraphs.</caption>
+  <thead><tr><th class="lbl">Arm</th><th class="sep">GS&uarr;</th><th>RD&rarr;1</th><th>Degree MMD&darr;</th><th>Clustering MMD&darr;</th><th>Spectral MMD&darr;</th></tr></thead>
   <tbody>
-    <tr class="band">
-      <td class="lbl">Pairwise baseline</td>
-      <td>0.794385</td><td>30,128</td><td>30,059</td><td>0.9977</td>
-      <td class="sep">2,018</td><td>1,891</td>
-    </tr>
-    <tr>
-      <td class="lbl">Full-Ego oracle</td>
-      <td>0.989099</td><td>30,128</td><td>30,128</td><td>1.0000</td>
-      <td class="sep">2,011</td><td>1,891</td>
-    </tr>
+    <tr class="band"><td class="lbl">B0 Pairwise baseline</td><td class="sep">0.3891</td><td>2.6105</td><td>16.0985</td><td>15.6737</td><td>10.5826</td></tr>
+    <tr><td class="lbl">D1 Logit KD</td><td class="sep best">0.4023</td><td class="best">2.0726</td><td class="best">11.5269</td><td class="best">11.5635</td><td>8.3375</td></tr>
+    <tr class="band"><td class="lbl">D2 Rank KD</td><td class="sep">0.3895</td><td>2.6102</td><td>16.8291</td><td>15.6503</td><td>10.1487</td></tr>
+    <tr><td class="lbl">D3 Gram KD</td><td class="sep">0.3934</td><td>2.2103</td><td>13.5198</td><td>12.8637</td><td class="best">8.0161</td></tr>
+    <tr class="band"><td class="lbl">D4 Representation KD</td><td class="sep">0.3904</td><td>2.3760</td><td>14.5929</td><td>14.2693</td><td>9.3974</td></tr>
+    <tr><td class="lbl">Full-Ego oracle <span class="cat">(diagnostic)</span></td><td class="sep">0.4508</td><td>3.7489</td><td>21.2187</td><td>15.2623</td><td>14.0005</td></tr>
   </tbody>
-</table>
-</div>
+</table></div>
+<p class="legend">B0 is an exact fixed-0.5 replay of checkpoint <code>48ccc9029239d270</code>'s 2,037,171-row candidate artifact. The Full-Ego row likewise replays checkpoint <code>926dab5c82beca55</code>'s surviving legacy candidate artifact; neither row uses model rescoring or test-side calibration.</p>
+
+<h3>2.2 V_val-selected deployable threshold</h3>
+
+<div class="scroll"><table>
+  <caption>Classification with each arm's topology threshold selected on V_val and transferred unchanged to all test pairs.</caption>
+  <thead><tr><th class="lbl">Arm</th><th class="sep">Threshold</th><th>AUROC&uarr;</th><th>AUPRC&uarr;</th><th>Accuracy&uarr;</th><th>Precision&uarr;</th><th>Recall&uarr;</th><th>F1&uarr;</th><th>MCC&uarr;</th></tr></thead>
+  <tbody>
+    <tr class="band"><td class="lbl">B0 Pairwise baseline</td><td class="sep" colspan="8">Unavailable &mdash; current checkpoint has no V_val topology score artifact</td></tr>
+    <tr><td class="lbl">D1 Logit KD</td><td class="sep">0.890294</td><td>0.7062</td><td>0.7388</td><td>0.5855</td><td class="best">0.9327</td><td>0.1844</td><td>0.3079</td><td>0.2866</td></tr>
+    <tr class="band"><td class="lbl">D2 Rank KD</td><td class="sep">0.926304</td><td>0.7194</td><td>0.7411</td><td>0.5830</td><td>0.9095</td><td>0.1842</td><td>0.3064</td><td>0.2749</td></tr>
+    <tr><td class="lbl">D3 Gram KD</td><td class="sep">0.964321</td><td>0.7108</td><td>0.7360</td><td>0.5929</td><td>0.8925</td><td>0.2112</td><td>0.3416</td><td>0.2876</td></tr>
+    <tr class="band"><td class="lbl">D4 Representation KD</td><td class="sep">0.950411</td><td class="best">0.7202</td><td class="best">0.7454</td><td class="best">0.6058</td><td>0.8731</td><td class="best">0.2475</td><td class="best">0.3857</td><td class="best">0.3032</td></tr>
+    <tr><td class="lbl">Full-Ego oracle <span class="cat">(diagnostic)</span></td><td class="sep" colspan="8">Unavailable &mdash; original checkpoint and V_val score artifact are absent</td></tr>
+  </tbody>
+</table></div>
+
+<div class="scroll"><table>
+  <caption>Topology under the same single V_val-selected threshold, macro-averaged over the 500 test subgraphs.</caption>
+  <thead><tr><th class="lbl">Arm</th><th class="sep">Threshold</th><th>GS&uarr;</th><th>RD&rarr;1</th><th>Degree MMD&darr;</th><th>Clustering MMD&darr;</th><th>Spectral MMD&darr;</th></tr></thead>
+  <tbody>
+    <tr class="band"><td class="lbl">B0 Pairwise baseline</td><td class="sep" colspan="6">Unavailable &mdash; current checkpoint has no V_val topology score artifact</td></tr>
+    <tr><td class="lbl">D1 Logit KD</td><td class="sep">0.890294</td><td>0.3939</td><td>0.3473</td><td>21.6379</td><td>18.0483</td><td>31.0142</td></tr>
+    <tr class="band"><td class="lbl">D2 Rank KD</td><td class="sep">0.926304</td><td>0.3827</td><td>0.4433</td><td>11.9394</td><td>10.9509</td><td>16.6328</td></tr>
+    <tr><td class="lbl">D3 Gram KD</td><td class="sep">0.964321</td><td>0.3937</td><td>0.5096</td><td>8.8426</td><td>7.8795</td><td>13.6932</td></tr>
+    <tr class="band"><td class="lbl">D4 Representation KD</td><td class="sep">0.950411</td><td class="best">0.4093</td><td class="best">0.6067</td><td class="best">6.6718</td><td class="best">5.9491</td><td class="best">10.8577</td></tr>
+    <tr><td class="lbl">Full-Ego oracle <span class="cat">(diagnostic)</span></td><td class="sep" colspan="6">Unavailable &mdash; original checkpoint and V_val score artifact are absent</td></tr>
+  </tbody>
+</table></div>
+<p class="legend">Deployable thresholds are selected only from V_val; no test recalibration is allowed. B0 checkpoint <code>48ccc9029239d270</code> has no V_val topology score artifact; the available <code>e092537d8cf1e208</code> report is a different checkpoint and is excluded. Full-Ego's historical threshold <code>0.989099</code> was test-density matched, and its surviving artifacts contain no V_val scores, so a same-checkpoint deployable result cannot be reconstructed.</p>
 
 </body>
 </html>
