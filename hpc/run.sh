@@ -45,7 +45,7 @@ shard per visible GPU, waits for every shard, and strictly merges them into the
 requested output; this runner does not duplicate that sharding or validation.
 The test command is a thin passthrough to `python -m src.eval.test_protocol`
 for one checkpoint: val_topology fixed-threshold selection -> test fixed-0.5 edge metrics ->
-test_topology fixed-threshold metrics plus the per-subgraph RD diagnostic -> `test_report.json`.
+test_topology fixed-0.5, validation-fixed, and per-subgraph RD metrics -> `test_report.json`.
 `train` already runs this automatically
 for every trained arm; call `test` directly only for the two scoring-time
 controls (`structure_control_6a_v3`, `structure_control_6e_v1`), which reuse

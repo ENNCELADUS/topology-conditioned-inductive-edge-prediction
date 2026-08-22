@@ -197,9 +197,7 @@ def _stratified_paired_se_curve(
         for sample in stratum:
             curve = _sample_metric_curve(sample, thresholds, metric=metric)
             reference = float(
-                _sample_metric_curve(
-                    sample, np.array([reference_threshold]), metric=metric
-                )[0]
+                _sample_metric_curve(sample, np.array([reference_threshold]), metric=metric)[0]
             )
             differences = curve - reference if candidate_minus_reference else reference - curve
             sum_diff += differences
@@ -307,6 +305,7 @@ def evaluate_fixed_threshold(
     buckets: dict[int, list[set[str]]],
     threshold: float,
     config: MMDConfig,
+    matching: str = "fixed_threshold_selected_on_validation",
 ) -> tuple[BucketedMMDReport, dict[str, object]]:
     """Apply one raw-logit threshold unchanged to every sampled subgraph."""
     if not np.isfinite(threshold):
@@ -326,7 +325,7 @@ def evaluate_fixed_threshold(
         offset += count
     assert offset == len(samples)
     report = {
-        "matching": "fixed_threshold_selected_on_validation",
+        "matching": matching,
         "selection": "logit_greater_than_or_equal",
         "logit_threshold": float(threshold),
         "probability_threshold": float(expit(threshold)),

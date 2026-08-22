@@ -255,7 +255,7 @@ class TestRunTestProtocol:
             "graph",
             "provenance",
         ]
-        assert report["schema_version"] == "test_protocol_v4"
+        assert report["schema_version"] == "test_protocol_v5"
 
         arm_block = report["arm"]
         assert isinstance(arm_block, dict)
@@ -285,7 +285,23 @@ class TestRunTestProtocol:
         # only the official BFS-macro topology view is reported.
         graph = report["graph"]
         assert isinstance(graph, dict)
-        assert set(graph.keys()) == {"fixed_threshold", "per_subgraph_rd_matched"}
+        assert set(graph.keys()) == {
+            "fixed_0_5",
+            "fixed_threshold",
+            "per_subgraph_rd_matched",
+        }
+        fixed_0_5 = graph["fixed_0_5"]
+        assert fixed_0_5["matching"] == "fixed_probability_threshold_0_5"
+        assert fixed_0_5["selection"] == "logit_greater_than_or_equal"
+        assert fixed_0_5["logit_threshold"] == pytest.approx(0.0)
+        assert fixed_0_5["probability_threshold"] == pytest.approx(0.5)
+        assert fixed_0_5["graph_similarity"]["bfs_macro"] > 0.0
+        assert fixed_0_5["relative_density"]["bfs_macro"] > 1.0
+        assert fixed_0_5["self_loop_occurrences"] == {
+            "aggregation": "sum_over_sample_occurrences",
+            "predicted": 20,
+            "reference": 0,
+        }
         fixed = graph["fixed_threshold"]
         assert fixed["validation_selection"]["rule"] == "sampled_subgraph_gs_rd_mmd_1se_v2"
         assert fixed["test"]["matching"] == "fixed_threshold_selected_on_validation"

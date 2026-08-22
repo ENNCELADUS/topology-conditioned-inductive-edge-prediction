@@ -86,7 +86,7 @@ the command returns. Nothing further is required to get an arm's held-out number
 
 Only `egostitch_e2e` is ledgered against repeat scoring. Validation threshold selection is
 non-held-out; its two held-out passes share one ledger epoch and report fixed-0.5 classification,
-validation-fixed sampled topology, and the separate per-subgraph RD-matched diagnostic.
+fixed-0.5 and validation-fixed topology, and the separate per-subgraph RD-matched diagnostic.
 Re-running an already-scored `(arm, seed)` fails with "repeat scoring requires
 --rescore-reason"; pass `--rescore-reason "<why>"` after the config path (and any
 `--worker-module`/`--run-kind` flags) to `hpc/run.sh train` to intentionally re-open it.

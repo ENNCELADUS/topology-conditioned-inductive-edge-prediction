@@ -61,7 +61,7 @@ engineering validity, and the scientific verdict are reported separately.
   GS, then minimize mean `|RD-1|`; degree, clustering, then spectral MMD ratio select lexicographically,
   with a larger-threshold complete-tie break. The threshold freezes before test and replays unchanged.
 - Test topology scores only its sampled-set pair union plus support-only rows for full grounding.
-  Report the deployable fixed-threshold result first; separately report per-subgraph exact-edge-count
+  Report the deployable V_val-fixed result first, the probability-0.5 diagnostic, then per-subgraph
   RD=1 matching (self-loops included, canonical tie-break) as an oracle-calibrated diagnostic.
 
 ### 2.3 Required metrics

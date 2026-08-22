@@ -4,12 +4,12 @@ Owns the whole post-train sequence for one arm and nothing else::
 
     score val_topology -> select one fixed threshold on validation samples
     score test          -> edge metrics at fixed threshold 0.5
-    score test_topology -> fixed-threshold and per-sample RD-matched graph metrics
+    score test_topology -> fixed-0.5, validation-fixed, and RD-matched graph metrics
         -> test_report.json
 
 Classification and topology use separate operating points: the former is
-fixed at 0.5. Topology reports both a validation-selected fixed threshold that
-is replayed unchanged on every test sample and the per-subgraph RD=1 diagnostic.
+fixed at 0.5. Topology reports probability threshold 0.5, a validation-selected
+fixed threshold replayed unchanged on every test sample, and the per-subgraph RD=1 diagnostic.
 Both metric families are always reported together; a partial report is never
 written.
 
@@ -65,7 +65,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["ScoreRunner", "TestProtocolResult", "build_parser", "main", "run_test_protocol"]
 
-_SCHEMA_VERSION = "test_protocol_v4"
+_SCHEMA_VERSION = "test_protocol_v5"
 #: The filename `src.e2_pipeline` (and `src.train_egostitch`/`src.train_b0`)
 #: publish training provenance into: checkpoint identity, publication status,
 #: and access-audit fields no scoring call may destroy. This module never
@@ -134,14 +134,10 @@ def _require_same_checkpoint(*artifacts: ScoresArtifact) -> None:
     """Raise unless all protocol passes scored the same checkpoint and family."""
     checkpoint_ids = {artifact.meta.get("checkpoint_id") for artifact in artifacts}
     if len(checkpoint_ids) != 1:
-        raise ValueError(
-            f"protocol scoring passes used different checkpoints: {checkpoint_ids}"
-        )
+        raise ValueError(f"protocol scoring passes used different checkpoints: {checkpoint_ids}")
     model_families = {artifact.meta.get("model_family") for artifact in artifacts}
     if len(model_families) != 1:
-        raise ValueError(
-            f"protocol scoring passes disagree on model_family: {model_families}"
-        )
+        raise ValueError(f"protocol scoring passes disagree on model_family: {model_families}")
 
 
 def _expected_checkpoint_id(checkpoint: Path) -> str | None:
@@ -670,9 +666,9 @@ def run_test_protocol(
 
     _require_same_checkpoint(validation_artifact, test_artifact, topology_artifact)
 
-    # 4. Replay the frozen validation threshold without test recalibration, and
-    # retain the per-subgraph RD=1 result as an explicitly oracle-calibrated
-    # diagnostic. Self-loops participate in both rules and all metrics.
+    # 4. Report the common probability threshold 0.5, replay the frozen validation
+    # threshold without test recalibration, and retain the per-subgraph RD=1 result
+    # as an explicitly oracle-calibrated diagnostic. Self-loops participate in all.
     benchmark_root = data_root / _BENCHMARK_SUBDIR
     g_ref = load_test_graph(benchmark_root, strategy)
     buckets = load_test_node_buckets(benchmark_root, strategy)
@@ -684,8 +680,18 @@ def run_test_protocol(
         threshold=fixed_selection.logit_threshold,
         config=config,
     )
+    _, fixed_0_5_report = evaluate_fixed_threshold(
+        pairs=list(topology_artifact.pairs()),
+        logits=topology_artifact.logit.astype(np.float64),
+        g_ref=g_ref,
+        buckets=buckets,
+        threshold=0.0,
+        config=config,
+        matching="fixed_probability_threshold_0_5",
+    )
 
     graph_report: dict[str, object] = {
+        "fixed_0_5": fixed_0_5_report,
         "fixed_threshold": {
             "validation_selection": fixed_selection.report,
             "test": fixed_test_report,
@@ -696,7 +702,7 @@ def run_test_protocol(
             g_ref=g_ref,
             buckets=buckets,
             config=config,
-        )
+        ),
     }
 
     # 5. Arm identity: config-independent, sourced from the topology artifact.
