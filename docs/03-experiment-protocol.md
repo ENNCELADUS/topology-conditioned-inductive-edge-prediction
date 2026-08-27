@@ -55,14 +55,14 @@ engineering validity, and the scientific verdict are reported separately.
 
 - Training and test nodes are disjoint. `V_val` is a pair-disjoint (not node-disjoint) BFS-grown internal
   region: cross-boundary edges train; only V_val-internal pairs are withheld, never fully inductive, unlike test.
-- Pairwise metrics use the fixed benchmark test-pair artifact; AUROC and AUPRC are threshold-free; Accuracy, F1, and MCC use threshold 0.5.
-- Fixed-threshold topology first scores only the V_val 20--200-node sampled-set pair union. Across
-  every atomic logit tie-group boundary, size-stratified paired-bootstrap 1-SE sets maximize BFS-macro
-  GS, then minimize mean `|RD-1|`; degree, clustering, then spectral MMD ratio select lexicographically,
-  with a larger-threshold complete-tie break. The threshold freezes before test and replays unchanged.
-- Test topology scores only its sampled-set pair union plus support-only rows for full grounding.
-  Report the deployable V_val-fixed result first, the probability-0.5 diagnostic, then per-subgraph
-  RD=1 matching (self-loops included, canonical tie-break) as an oracle-calibrated diagnostic.
+- Pairwise metrics use the fixed benchmark test-pair artifact; AUROC and AUPRC are threshold-free;
+  Accuracy, F1, and MCC use probability 0.5 on calibrated logits (shifted by minus the selected threshold).
+- The single fixed threshold selects on the V_val 20--200-node sampled-set pair union. Across every
+  atomic logit tie-group boundary, minimize `D_RD` (macro over size buckets of mean `|log RD|`;
+  empty-prediction candidates are +inf); within its paired-bootstrap 1-SE set, minimize `D_shape`
+  (mean log degree/clustering/spectral MMD ratio), larger-threshold tie break. Freeze before test.
+- Test topology scores only its sampled-set pair union plus support-only rows for full grounding;
+  the frozen threshold replays unchanged as the one reported operating point (self-loops included).
 
 ### 2.3 Required metrics
 
@@ -111,7 +111,7 @@ token cross-attention. **Full-Ego Pooled Oracle** is checkpoint `926dab5c82beca5
 (epoch 2): variable-length full ego topology is pooled inside GRIT and passed through a
 pooled adapter. Its completed optimized evaluation uses threshold 0.5 for classification
 and a 30,128-edge global density-controlled topology assembly. This is legacy pre-v3
-evidence, not comparable to the current per-subgraph RD-matched protocol. Existing baseline /
+evidence, not comparable to the current single fixed-threshold protocol. Existing baseline /
 Token-XAttn page and report: [results/results.html](results/results.html) and
 [diagnostic_test_report.json](../outputs/egostitch_e2e_stage1_v3/oracle_grit_xattn_tokens_true_oracle_diagnostic/diagnostic_test_report.json). Full-Ego report: `outputs/full_ego_oracle_scoring_optimization_20260813/protocol/diagnostic_test_report.json` on the H20 checkout.
 
@@ -251,10 +251,10 @@ allocation while retaining the two-endpoint inference contract.
    threshold or aggregate substitutes for a fixed gate.
 2. Preserve provenance. Oracle, S0, S0-R, S1-R, and any test-informed follow-up remain
    `formal:false` even when their execution is valid.
-3. Select the fixed topology threshold on sampled `V_val`, freeze it, then evaluate
-   test/test_topology once. Never tune model parameters or that threshold on test topology.
+3. Select the single fixed threshold on sampled `V_val`, freeze it, calibrate test logits so it
+   sits at probability 0.5, then evaluate test/test_topology once. Never tune it on test.
 4. Bind comparisons to the same frozen features, split, sampled sets, full-node grounding support,
-   self-loop convention, checkpoint, fixed-threshold rule, and diagnostic RD=1 policy.
+   self-loop convention, checkpoint, and fixed-threshold rule.
 5. Validate score precision before analysis. Record checkpoint ID, artifact hashes,
    threshold/quota policy, random seed, code commit, and metric implementation.
 6. Require completion markers, no `failure.json`, exited workers, complete outputs, and

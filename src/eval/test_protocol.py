@@ -3,13 +3,13 @@
 Owns the whole post-train sequence for one arm and nothing else::
 
     score val_topology -> select one fixed threshold on validation samples
-    score test          -> edge metrics at fixed threshold 0.5
-    score test_topology -> fixed-0.5, validation-fixed, and RD-matched graph metrics
+    score test          -> edge metrics, logits calibrated so that threshold
+                           sits at probability 0.5
+    score test_topology -> the validation-fixed threshold replayed unchanged
         -> test_report.json
 
-Classification and topology use separate operating points: the former is
-fixed at 0.5. Topology reports probability threshold 0.5, a validation-selected
-fixed threshold replayed unchanged on every test sample, and the per-subgraph RD=1 diagnostic.
+One operating point serves both metric families: the validation-selected logit
+threshold, shifted to probability 0.5 by test-time logit calibration.
 Both metric families are always reported together; a partial report is never
 written.
 
@@ -30,22 +30,14 @@ import logging
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from itertools import combinations_with_replacement
 from pathlib import Path
 from typing import Protocol, cast
 
-import networkx as nx
 import numpy as np
-from numpy.typing import NDArray
 from scipy.special import expit
 
-from src.data.artifacts import canonical_pair
-from src.eval.assembly import assemble_rank_matched_graph
 from src.eval.fixed_threshold import evaluate_fixed_threshold, select_fixed_threshold
-from src.eval.graph_metrics import (
-    MMDConfig,
-    evaluate_sampled_subgraphs,
-)
+from src.eval.graph_metrics import MMDConfig
 from src.eval.report_edge_metrics import report_edge_metrics
 from src.experiments.g1_hardened_e2 import (
     _BENCHMARK_SUBDIR,
@@ -65,7 +57,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["ScoreRunner", "TestProtocolResult", "build_parser", "main", "run_test_protocol"]
 
-_SCHEMA_VERSION = "test_protocol_v5"
+_SCHEMA_VERSION = "test_protocol_v6"
 #: The filename `src.e2_pipeline` (and `src.train_egostitch`/`src.train_b0`)
 #: publish training provenance into: checkpoint identity, publication status,
 #: and access-audit fields no scoring call may destroy. This module never
@@ -356,87 +348,6 @@ def _build_score_args(
     return args
 
 
-def _rd_matched_graph_block(
-    *,
-    pairs: Sequence[tuple[str, str]],
-    logits: NDArray[np.float64],
-    g_ref: nx.Graph,
-    buckets: dict[int, list[set[str]]],
-    config: MMDConfig,
-) -> dict[str, object]:
-    """Match RD=1 independently in every sampled subgraph, then evaluate."""
-    if len(pairs) != logits.size:
-        raise ValueError("pairs and logits must be aligned")
-    if not np.isfinite(logits).all():
-        raise ValueError("topology logits must be finite")
-    score_by_pair: dict[tuple[str, str], float] = {}
-    for pair, logit in zip(pairs, logits, strict=True):
-        canonical = canonical_pair(*pair)
-        if canonical in score_by_pair:
-            raise ValueError(f"duplicate topology score for pair {canonical!r}")
-        score_by_pair[canonical] = float(logit)
-
-    pred_subgraphs: dict[int, list[nx.Graph]] = {}
-    per_size: dict[str, dict[str, object]] = {}
-    for size, node_sets in buckets.items():
-        predictions: list[nx.Graph] = []
-        operating_points: list[dict[str, object]] = []
-        for sample_index, nodes in enumerate(node_sets):
-            local_pairs = [
-                canonical_pair(u, v) for u, v in combinations_with_replacement(sorted(nodes), 2)
-            ]
-            try:
-                local_logits = np.array(
-                    [score_by_pair[pair] for pair in local_pairs], dtype=np.float64
-                )
-            except KeyError as error:
-                raise ValueError(f"missing topology score for pair {error.args[0]!r}") from error
-            reference = g_ref.subgraph(nodes)
-            target_edges = reference.number_of_edges()
-            prediction, logit_boundary = assemble_rank_matched_graph(
-                local_pairs,
-                local_logits,
-                target_edges=target_edges,
-                nodes=nodes,
-            )
-            predictions.append(prediction)
-            boundary_tie_count = int(np.count_nonzero(local_logits == logit_boundary))
-            selected_above_boundary = int(np.count_nonzero(local_logits > logit_boundary))
-            operating_points.append(
-                {
-                    "sample": sample_index,
-                    "probability_boundary": float(expit(logit_boundary)),
-                    "logit_boundary": logit_boundary,
-                    "boundary_tie_count": boundary_tie_count,
-                    "selected_from_boundary_tie": target_edges - selected_above_boundary,
-                    "target_edges": target_edges,
-                    "predicted_edges": prediction.number_of_edges(),
-                }
-            )
-        pred_subgraphs[size] = predictions
-        per_size[str(size)] = {"operating_points": operating_points}
-
-    bucketed = evaluate_sampled_subgraphs(pred_subgraphs, g_ref, buckets, config)
-    for size in buckets:
-        block = per_size[str(size)]
-        block["graph_similarity"] = float(np.mean(bucketed.per_size_graph_similarity[size]))
-        block["relative_density"] = float(np.mean(bucketed.per_size_relative_density[size]))
-    return {
-        "matching": "per_subgraph_rd_1",
-        "selection": "top_k_by_logit_with_canonical_tiebreak",
-        "boundary_tie_break": "canonical_pair_ascending",
-        "graph_similarity": {"bfs_macro": bucketed.graph_similarity},
-        "relative_density": {"bfs_macro": bucketed.relative_density},
-        "mmd_ratio": dict(bucketed.mmd_ratio),
-        "per_size": per_size,
-        "self_loop_occurrences": {
-            "aggregation": "sum_over_sample_occurrences",
-            "predicted": bucketed.self_loops_pred,
-            "reference": bucketed.self_loops_ref,
-        },
-    }
-
-
 # --------------------------------------------------------------------------- orchestration
 
 
@@ -637,8 +548,20 @@ def run_test_protocol(
         include_scoring_run_id=is_egostitch_e2e_family,
     )
 
-    # 3. Classification uses the fixed 0.5 decision threshold for every arm.
-    edge_report = report_edge_metrics(test_path, expect_pairs_source="test", threshold=0.5)
+    # 3. Classification uses the same validation-selected operating point:
+    # logits shift by -t* so the frozen threshold sits at probability 0.5
+    # (sigma(l - t*) >= 0.5 iff l >= t*), and ECE/Brier describe the
+    # calibrated, deployed probabilities.
+    logit_shift = -fixed_selection.logit_threshold
+    edge_report = report_edge_metrics(
+        test_path, expect_pairs_source="test", threshold=0.5, logit_shift=logit_shift
+    )
+    calibration_report: dict[str, object] = {
+        "method": "logit_shift_to_validation_selected_threshold",
+        "logit_shift": logit_shift,
+        "selected_logit_threshold": fixed_selection.logit_threshold,
+        "selected_probability_threshold": float(expit(fixed_selection.logit_threshold)),
+    }
 
     # Reload test/topology directly (report_edge_metrics only returns a
     # metrics summary, not the raw artifact) so their meta is available for the
@@ -666,9 +589,8 @@ def run_test_protocol(
 
     _require_same_checkpoint(validation_artifact, test_artifact, topology_artifact)
 
-    # 4. Report the common probability threshold 0.5, replay the frozen validation
-    # threshold without test recalibration, and retain the per-subgraph RD=1 result
-    # as an explicitly oracle-calibrated diagnostic. Self-loops participate in all.
+    # 4. Replay the frozen validation threshold unchanged on every test sample
+    # -- the single reported topology operating point. Self-loops participate.
     benchmark_root = data_root / _BENCHMARK_SUBDIR
     g_ref = load_test_graph(benchmark_root, strategy)
     buckets = load_test_node_buckets(benchmark_root, strategy)
@@ -680,29 +602,12 @@ def run_test_protocol(
         threshold=fixed_selection.logit_threshold,
         config=config,
     )
-    _, fixed_0_5_report = evaluate_fixed_threshold(
-        pairs=list(topology_artifact.pairs()),
-        logits=topology_artifact.logit.astype(np.float64),
-        g_ref=g_ref,
-        buckets=buckets,
-        threshold=0.0,
-        config=config,
-        matching="fixed_probability_threshold_0_5",
-    )
 
     graph_report: dict[str, object] = {
-        "fixed_0_5": fixed_0_5_report,
         "fixed_threshold": {
             "validation_selection": fixed_selection.report,
             "test": fixed_test_report,
         },
-        "per_subgraph_rd_matched": _rd_matched_graph_block(
-            pairs=list(topology_artifact.pairs()),
-            logits=topology_artifact.logit.astype(np.float64),
-            g_ref=g_ref,
-            buckets=buckets,
-            config=config,
-        ),
     }
 
     # 5. Arm identity: config-independent, sourced from the topology artifact.
@@ -764,6 +669,7 @@ def run_test_protocol(
         "schema_version": _SCHEMA_VERSION,
         "arm": arm_report,
         "edge": edge_report,
+        "calibration": calibration_report,
         "graph": graph_report,
         "provenance": provenance,
     }
@@ -783,7 +689,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Run the post-train test protocol for one arm: select a fixed topology "
             "threshold on sampled V_val subgraphs, then score test/test_topology and "
-            "report both fixed-threshold and per-subgraph RD-matched topology."
+            "report edge metrics calibrated to it plus its replayed topology."
         ),
     )
     parser.add_argument("--checkpoint", type=Path, required=True, help="published checkpoint")

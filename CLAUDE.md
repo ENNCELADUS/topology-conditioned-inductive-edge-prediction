@@ -103,9 +103,9 @@ fail-closed.
 
 - Report edge-level and assembled-graph metrics together — never one family alone.
 - Each topology operating point reports five numbers together: BFS-macro GS/RD and degree /
-  clustering / spectral MMD ratios (GS↑, RD→1, ratios↓). The primary deployable result uses one
-  V_val-selected fixed threshold on every test subgraph; per-subgraph RD=1 matching is named
-  separately as an oracle-calibrated diagnostic. GS is edge-set Dice/F1, not an MMD summary.
+  clustering / spectral MMD ratios (GS↑, RD→1, ratios↓). The primary deployable result is the ONE
+  V_val-selected fixed threshold (density-first cascade) on every test subgraph, calibrated by
+  logit shift to sit at probability 0.5 on test. GS is edge-set Dice/F1, not an MMD summary.
   
 ## Data-contract traps
 

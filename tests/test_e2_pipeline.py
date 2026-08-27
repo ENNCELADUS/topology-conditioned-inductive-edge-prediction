@@ -1793,6 +1793,14 @@ def test_parse_pipeline_args_rescore_reason_defaults_to_none_and_is_never_synthe
     assert with_reason.rescore_reason == "replace corrupt artifact"
 
 
+def test_parse_pipeline_args_skip_test_defaults_false(tmp_path: Path) -> None:
+    args = parse_pipeline_args(["--config", str(tmp_path / "cfg.yaml")])
+    assert args.skip_test is False
+
+    skipping = parse_pipeline_args(["--config", str(tmp_path / "cfg.yaml"), "--skip-test"])
+    assert skipping.skip_test is True
+
+
 class TestRunPipelineTestStage:
     def test_test_stage_runs_after_publish_and_sees_the_completed_publication(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1954,6 +1962,58 @@ class TestRunPipelineTestStage:
         assert exit_code == 0
         assert stage_calls == 3  # pack, artifacts, test
         assert (output_dir / "test_complete.json").is_file()
+
+    def test_skip_test_publishes_without_a_held_out_scoring_call(
+        self, tmp_path: Path, _fake_test_protocol_succeeds: dict[str, object]
+    ) -> None:
+        """`--skip-test` ends the run at publish: no test artifacts, no scoring."""
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        args = PipelineArgs(**{**vars(args), "skip_test": True})
+
+        exit_code = run_pipeline(
+            args,
+            training_command_runner=_make_fake_runner(),
+            stage_runner=lambda operation: operation(),
+        )
+
+        assert exit_code == 0
+        assert _fake_test_protocol_succeeds == {}  # run_test_protocol never called
+        complete = json.loads((output_dir / "complete.json").read_text())
+        assert complete["status"] == "complete"
+        assert (output_dir / "best.pt").is_file()
+        assert not (output_dir / "test_report.json").exists()
+        assert not (output_dir / "test_complete.json").exists()
+        assert not (output_dir / "failure.json").exists()
+        profile = json.loads((output_dir / "profile.json").read_text())
+        assert profile["test"] == "skipped"
+        assert set(profile["stage_seconds"]) == {"pack", "train", "artifacts"}
+        # The profile is final before the manifest digest: no post-publish rewrite.
+        manifest = json.loads((output_dir / "artifact_manifest.json").read_text())
+        profile_bytes = (output_dir / "profile.json").read_bytes()
+        assert manifest["profile.json"]["sha256"] == hashlib.sha256(profile_bytes).hexdigest()
+        attempt_status = json.loads(
+            (output_dir / "attempts" / complete["attempt_id"] / "status.json").read_text()
+        )
+        assert attempt_status["status"] == "complete"
+        assert attempt_status["test"] == "skipped"
+
+    def test_skip_test_republish_clears_the_prior_runs_test_sentinel(self, tmp_path: Path) -> None:
+        """A skip-test republish must not leave a stale sentinel certifying it."""
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "test_report.json").write_text('{"status": "ok"}')
+        (output_dir / "test_complete.json").write_text('{"status": "test_complete"}')
+        args = PipelineArgs(**{**vars(args), "skip_test": True})
+
+        # Default forked stage_runner: the skip marker must land in the
+        # published profile through the real child-process artifact stage.
+        exit_code = run_pipeline(args, training_command_runner=_make_fake_runner())
+
+        assert exit_code == 0
+        assert (output_dir / "complete.json").is_file()
+        assert not (output_dir / "test_report.json").exists()
+        assert not (output_dir / "test_complete.json").exists()
+        assert json.loads((output_dir / "profile.json").read_text())["test"] == "skipped"
 
     def test_max_steps_debug_run_never_reaches_the_test_stage(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

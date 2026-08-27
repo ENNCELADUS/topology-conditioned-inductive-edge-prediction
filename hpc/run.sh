@@ -44,8 +44,8 @@ auto-detects GPU count, pins --device cuda --amp bf16, launches one contiguous
 shard per visible GPU, waits for every shard, and strictly merges them into the
 requested output; this runner does not duplicate that sharding or validation.
 The test command is a thin passthrough to `python -m src.eval.test_protocol`
-for one checkpoint: val_topology fixed-threshold selection -> test fixed-0.5 edge metrics ->
-test_topology fixed-0.5, validation-fixed, and per-subgraph RD metrics -> `test_report.json`.
+for one checkpoint: val_topology fixed-threshold selection -> test edge metrics
+calibrated to that threshold -> test_topology at the frozen threshold -> `test_report.json`.
 `train` already runs this automatically
 for every trained arm; call `test` directly only for the two scoring-time
 controls (`structure_control_6a_v3`, `structure_control_6e_v1`), which reuse
@@ -91,8 +91,14 @@ assert_runtime() {
     [[ " ${EXPECTED_GPU_NAMES} " == *" ${gpu_name} "* ]] || \
       fail "expected all GPUs to be one of ${EXPECTED_GPU_NAMES}, found ${gpu_name}"
   done
-  GPU_COUNT="${#gpu_names[@]}"
-  GPU_IDS="$(seq -s, 0 "$((GPU_COUNT - 1))")"
+  if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    IFS=',' read -r -a lane_ids <<< "${CUDA_VISIBLE_DEVICES}"
+    GPU_COUNT="${#lane_ids[@]}"
+    GPU_IDS="${CUDA_VISIBLE_DEVICES}"
+  else
+    GPU_COUNT="${#gpu_names[@]}"
+    GPU_IDS="$(seq -s, 0 "$((GPU_COUNT - 1))")"
+  fi
   export GPU_COUNT GPU_IDS CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 }
 

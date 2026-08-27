@@ -118,6 +118,7 @@ class ValidationOutcome(NamedTuple):
     metrics: EdgeMetrics
     topology: ValTopologyResult | None
     kd: dict[str, float] | None = None
+    task_loss: float | None = None
 
 
 EvaluateFn = Callable[[nn.Module, Iterable[Batch], Accelerator], ValidationOutcome]
@@ -725,9 +726,7 @@ def load_config(path: Path) -> Config:
         raise ValueError(f"optim.epochs must be >= 1, got {optim.epochs}")
 
     eval_raw = _as_mapping(_require(raw, "eval", ""), "eval")
-    _check_no_unknown_keys(
-        eval_raw, ("patience", "eval_every", "classification_only"), "eval"
-    )
+    _check_no_unknown_keys(eval_raw, ("patience", "eval_every", "classification_only"), "eval")
     eval_cfg = EvalConfig(
         patience=_as_int(_require(eval_raw, "patience", "eval."), "eval.patience"),
         eval_every=_as_int(_require(eval_raw, "eval_every", "eval."), "eval.eval_every"),
@@ -2187,6 +2186,7 @@ def _evaluate_distributed(
     *,
     expected_row_ids: np.ndarray | None = None,
     kd_val: KDValDiagnostics | None = None,
+    label_smoothing: float = 0.0,
 ) -> ValidationOutcome:
     """Score the fixed cls validation set across all ranks and agree on the metrics.
 
@@ -2210,6 +2210,8 @@ def _evaluate_distributed(
         kd_val: Validation-row teacher targets for the KD diagnostics; ``None``
             leaves `ValidationOutcome.kd` unset. For `kd_d9`, injects
             `kd_teacher_seeds` into every scored batch before the forward.
+        label_smoothing: Symmetric binary smoothing ε applied to the labels for
+            `ValidationOutcome.task_loss`, matching the training objective.
 
     Returns:
         The `ValidationOutcome` with `topology=None`, identical on every rank.
@@ -2387,11 +2389,20 @@ def _evaluate_distributed(
         probs = _stable_sigmoid(logits_sorted.astype(np.float64))
         metrics = compute_edge_metrics(labels_sorted.astype(np.float64), probs)
         outcome_dict: dict[str, object] = {"metrics": asdict(metrics)}
+        if labels_sorted.shape[0] > 0:
+            smoothed = (
+                labels_sorted.astype(np.float64) * (1.0 - label_smoothing) + 0.5 * label_smoothing
+            )
+            outcome_dict["task_loss"] = _stable_bce_with_logits(
+                logits_sorted.astype(np.float64), smoothed
+            )
         if kd_val is not None:
             kd_metrics: dict[str, float] = {}
             if diag_np is not None and diag_np.size > 0:
                 key = "val_kd_rep_cos" if kd_val.arm == "kd_rep" else "val_kd_prior_cos"
                 kd_metrics[key] = float(diag_np.mean())
+                if kd_val.arm == "kd_rep":
+                    kd_metrics["val_kd_rep_loss"] = 1.0 - kd_metrics[key]
             logits64 = logits_sorted.astype(np.float64)
             teacher64 = kd_val.teacher_logit_np
             if logits64.shape[0] > 0:
@@ -2405,6 +2416,9 @@ def _evaluate_distributed(
                 )
                 prob_err = np.abs(_stable_sigmoid(logits64) - _stable_sigmoid(teacher64))
                 kd_metrics["val_kd_prob_mae"] = float(prob_err.mean())
+                kd_metrics["val_kd_logit_loss"] = _stable_bce_with_logits(
+                    logits64, _stable_sigmoid(teacher64)
+                )
             block_count = float(reduced_relational_block[2].item())
             if block_count > 0.0 and kd_val.arm == "kd_rank":
                 kd_metrics["val_kd_rank_block_loss"] = (
@@ -2429,6 +2443,7 @@ def _evaluate_distributed(
         metrics=EdgeMetrics(**cast(dict[str, Any], payload["metrics"])),
         topology=None,
         kd=kd_result,
+        task_loss=cast(float | None, payload.get("task_loss")),
     )
 
 
@@ -2440,6 +2455,11 @@ def _stable_sigmoid(logit: np.ndarray) -> np.ndarray:
     exp_l = np.exp(logit[~positive])
     out[~positive] = exp_l / (1.0 + exp_l)
     return out
+
+
+def _stable_bce_with_logits(logit: np.ndarray, target_prob: np.ndarray) -> float:
+    """Mean float64 BCE of logits against probability targets via softplus(x) - y*x."""
+    return float(np.mean(np.logaddexp(0.0, logit) - target_prob * logit))
 
 
 TopologyEvalFn = Callable[[nn.Module, Accelerator], ValTopologyResult]
@@ -2567,13 +2587,24 @@ def _evaluate_two_pass(
     expected_row_ids: np.ndarray,
     topology_eval_fn: TopologyEvalFn,
     kd_val: KDValDiagnostics | None = None,
+    label_smoothing: float = 0.0,
 ) -> ValidationOutcome:
     """Run the cls and V_val-topology validation passes and merge their outcomes."""
     cls_outcome = _evaluate_distributed(
-        model, val_loader, accelerator, expected_row_ids=expected_row_ids, kd_val=kd_val
+        model,
+        val_loader,
+        accelerator,
+        expected_row_ids=expected_row_ids,
+        kd_val=kd_val,
+        label_smoothing=label_smoothing,
     )
     topology = topology_eval_fn(model, accelerator)
-    return ValidationOutcome(metrics=cls_outcome.metrics, topology=topology, kd=cls_outcome.kd)
+    return ValidationOutcome(
+        metrics=cls_outcome.metrics,
+        topology=topology,
+        kd=cls_outcome.kd,
+        task_loss=cls_outcome.task_loss,
+    )
 
 
 def _topology_from_metrics_row(row: dict[str, object]) -> ValTopologyResult | None:
@@ -2973,8 +3004,12 @@ class KDRowBank:
 
         total = student_logit.new_zeros(())
         rank_group_counts: torch.Tensor | None = None
+        logit_term: torch.Tensor | None = None
+        rank_term: torch.Tensor | None = None
+        dist_term: torch.Tensor | None = None
         if self.arm == "kd_logit":
-            total = total + self._w_logit * kd_logit_loss(student_logit, teacher_logit)
+            logit_term = kd_logit_loss(student_logit, teacher_logit)
+            total = total + self._w_logit * logit_term
 
         if self.arm == "kd_rank":
             assert self.train_a_idx is not None and self.train_b_idx is not None
@@ -2997,18 +3032,20 @@ class KDRowBank:
             rank_group_counts = torch.unique(anchor_group, return_counts=True)[1]
             grouped_student = torch.cat([student_logit_global, student_logit_global[non_self]])
             grouped_teacher = torch.cat([teacher_logit_global, teacher_logit_global[non_self]])
-            total = total + self._w_rank * kd_rank_loss(
+            rank_term = kd_rank_loss(
                 grouped_student,
                 grouped_teacher,
                 anchor_group,
                 margin=self._margin,
             )
-            total = total + self._w_dist * kd_dist_loss(
+            total = total + self._w_rank * rank_term
+            dist_term = kd_dist_loss(
                 grouped_student,
                 grouped_teacher,
                 anchor_group,
                 temperature=self._temperature,
             )
+            total = total + self._w_dist * dist_term
 
         with torch.no_grad():
             student_d = student_logit.detach().double()
@@ -3030,6 +3067,12 @@ class KDRowBank:
                 stats["rank_eligible_groups"] = float(eligible.sum().item())
                 stats["rank_roles"] = float(rank_group_counts.sum().item())
                 stats["rank_eligible_roles"] = float(rank_group_counts[eligible].sum().item())
+            if logit_term is not None:
+                stats["sum_logit_bce"] = float(logit_term.detach().item()) * stats["rows"]
+            if rank_term is not None:
+                stats["sum_rank"] = float(rank_term.detach().item()) * stats["rows"]
+            if dist_term is not None:
+                stats["sum_dist"] = float(dist_term.detach().item()) * stats["rows"]
 
         kl_dim_sum: torch.Tensor | None = None
 
@@ -3157,8 +3200,11 @@ class KDRowBank:
             ),
             "kd_prob_mae": reduced_sums["sum_prob_err"] / n,
         }
+        if self.arm == "kd_logit":
+            telemetry["kd_logit_loss"] = reduced_sums["sum_logit_bce"] / n
         if self.arm == "kd_rep":
             telemetry["kd_rep_cos"] = reduced_sums["sum_rep_cos"] / n
+            telemetry["kd_rep_loss"] = 1.0 - telemetry["kd_rep_cos"]
         if self.arm == "kd_rank":
             telemetry["kd_rank_eligible_group_fraction"] = (
                 reduced_sums["rank_eligible_groups"] / reduced_sums["rank_groups"]
@@ -3166,6 +3212,8 @@ class KDRowBank:
             telemetry["kd_rank_eligible_role_fraction"] = (
                 reduced_sums["rank_eligible_roles"] / reduced_sums["rank_roles"]
             )
+            telemetry["kd_rank_loss"] = reduced_sums["sum_rank"] / n
+            telemetry["kd_dist_loss"] = reduced_sums["sum_dist"] / n
         if self.arm == "kd_gram":
             telemetry["kd_gram"] = reduced_sums["sum_gram"] / n
         if self.arm == "kd_d9":
@@ -3749,6 +3797,8 @@ def train_ddp_loop(
             "val_ece": metrics.ece,
             "val_brier": metrics.brier,
         }
+        if outcome.task_loss is not None:
+            entry["val_task_loss"] = outcome.task_loss
         if train_kd_loss is not None:
             entry["train_kd_loss"] = train_kd_loss
         entry.update(epoch_kd_telemetry)
@@ -4444,6 +4494,9 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                 cfg.distill.targets_path,
             )
 
+    val_label_smoothing = float(
+        cast(float, resolve_model_kwargs(cfg.model).get("label_smoothing", 0.0))
+    )
     reference: ValTopologyReference | None = None
     if cfg.eval.classification_only:
         evaluate_fn = cast(
@@ -4452,6 +4505,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                 _evaluate_distributed,
                 expected_row_ids=np.arange(num_val_rows, dtype=np.int64),
                 kd_val=kd_val,
+                label_smoothing=val_label_smoothing,
             ),
         )
     else:
@@ -4481,6 +4535,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                     ),
                 ),
                 kd_val=kd_val,
+                label_smoothing=val_label_smoothing,
             ),
         )
 

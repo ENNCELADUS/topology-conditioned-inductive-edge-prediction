@@ -24,8 +24,8 @@ import numpy as np
 import pytest
 import torch
 from numpy.typing import NDArray
+from scipy.special import expit
 from src.eval import test_protocol
-from src.eval.graph_metrics import MMDConfig
 from src.eval.test_protocol import run_test_protocol
 from src.score_universe import ScoresArtifact, validate_artifact_precision
 
@@ -197,18 +197,6 @@ def _write_checkpoint(tmp_path: Path, *, model_family: str = "v3_1") -> Path:
 
 
 class TestRunTestProtocol:
-    def test_nonfinite_support_only_logit_fails_closed(self) -> None:
-        g_ref = nx.Graph([("a", "b")])
-        g_ref.add_node("c")
-        with pytest.raises(ValueError, match="finite"):
-            test_protocol._rd_matched_graph_block(
-                pairs=[("a", "a"), ("a", "b"), ("b", "b"), ("c", "c")],
-                logits=np.array([0.0, 1.0, 0.0, np.nan]),
-                g_ref=g_ref,
-                buckets={2: [{"a", "b"}, {"a", "b"}]},
-                config=MMDConfig(),
-            )
-
     def test_full_report_shape_ordering_and_leakage_guarantee(self, tmp_path: Path) -> None:
         fixture = _build_fixture(tmp_path)
         checkpoint = _write_checkpoint(tmp_path)
@@ -252,10 +240,11 @@ class TestRunTestProtocol:
             "schema_version",
             "arm",
             "edge",
+            "calibration",
             "graph",
             "provenance",
         ]
-        assert report["schema_version"] == "test_protocol_v5"
+        assert report["schema_version"] == "test_protocol_v6"
 
         arm_block = report["arm"]
         assert isinstance(arm_block, dict)
@@ -265,7 +254,7 @@ class TestRunTestProtocol:
         assert arm_block["checkpoint_id"] == _CHECKPOINT_ID
         assert arm_block["checkpoint_sha256"] == test_protocol._sha256_file(checkpoint)
 
-        # 5. Edge block: fixed 0.5 decisions, self-loop headline first.
+        # 5. Edge block: calibrated to the selected threshold, headline first.
         edge = report["edge"]
         assert isinstance(edge, dict)
         assert edge["pairs_source"] == "test"
@@ -281,48 +270,26 @@ class TestRunTestProtocol:
         assert edge["metrics_non_self"] is not None
         assert edge["metrics"]["threshold"] == pytest.approx(0.5)
 
-        # 6. Every sampled subgraph receives its own exact-RD operating point;
-        # only the official BFS-macro topology view is reported.
+        # 6. The single operating point: the validation-selected threshold,
+        # shifted to probability 0.5 on test by logit calibration.
         graph = report["graph"]
         assert isinstance(graph, dict)
-        assert set(graph.keys()) == {
-            "fixed_0_5",
-            "fixed_threshold",
-            "per_subgraph_rd_matched",
-        }
-        fixed_0_5 = graph["fixed_0_5"]
-        assert fixed_0_5["matching"] == "fixed_probability_threshold_0_5"
-        assert fixed_0_5["selection"] == "logit_greater_than_or_equal"
-        assert fixed_0_5["logit_threshold"] == pytest.approx(0.0)
-        assert fixed_0_5["probability_threshold"] == pytest.approx(0.5)
-        assert fixed_0_5["graph_similarity"]["bfs_macro"] > 0.0
-        assert fixed_0_5["relative_density"]["bfs_macro"] > 1.0
-        assert fixed_0_5["self_loop_occurrences"] == {
-            "aggregation": "sum_over_sample_occurrences",
-            "predicted": 20,
-            "reference": 0,
-        }
+        assert set(graph.keys()) == {"fixed_threshold"}
         fixed = graph["fixed_threshold"]
-        assert fixed["validation_selection"]["rule"] == "sampled_subgraph_gs_rd_mmd_1se_v2"
+        assert fixed["validation_selection"]["rule"] == "sampled_subgraph_density_shape_1se_v3"
         assert fixed["test"]["matching"] == "fixed_threshold_selected_on_validation"
-        assert fixed["test"]["logit_threshold"] == pytest.approx(
-            fixed["validation_selection"]["selected"]["logit_threshold"]
-        )
+        selected_threshold = fixed["validation_selection"]["selected"]["logit_threshold"]
+        assert fixed["test"]["logit_threshold"] == pytest.approx(selected_threshold)
         assert fixed["test"]["graph_similarity"]["bfs_macro"] == pytest.approx(0.0)
-        block = graph["per_subgraph_rd_matched"]
-        assert isinstance(block, dict)
-        assert block["matching"] == "per_subgraph_rd_1"
-        assert block["selection"] == "top_k_by_logit_with_canonical_tiebreak"
-        assert block["boundary_tie_break"] == "canonical_pair_ascending"
-        assert set(block["graph_similarity"]) == {"bfs_macro"}
-        assert set(block["relative_density"]) == {"bfs_macro"}
-        assert set(block["mmd_ratio"]) == {"degree", "clustering", "spectral"}
-        assert block["self_loop_occurrences"]["aggregation"] == "sum_over_sample_occurrences"
-        assert block["graph_similarity"]["bfs_macro"] == pytest.approx(1.0)
-        assert block["relative_density"]["bfs_macro"] == pytest.approx(1.0)
-        operating_points = block["per_size"]["5"]["operating_points"]
-        assert len(operating_points) == 4
-        assert all(point["predicted_edges"] == point["target_edges"] for point in operating_points)
+        calibration = report["calibration"]
+        assert isinstance(calibration, dict)
+        assert calibration == {
+            "method": "logit_shift_to_validation_selected_threshold",
+            "logit_shift": -selected_threshold,
+            "selected_logit_threshold": selected_threshold,
+            "selected_probability_threshold": pytest.approx(float(expit(selected_threshold))),
+        }
+        assert edge["logit_shift"] == pytest.approx(-selected_threshold)
 
         # 7. Provenance: two artifact paths, sha256, and ledger digests
         # (null here -- v3_1 never claims the held-out E2E universe).

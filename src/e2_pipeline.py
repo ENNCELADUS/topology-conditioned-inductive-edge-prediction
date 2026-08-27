@@ -175,6 +175,8 @@ class PipelineArgs:
             ``run_test_protocol`` call. Required only when this ``(arm,
             seed)`` has already opened a held-out scoring epoch; absent here
             means absent there — this pipeline never synthesizes one.
+        skip_test: End the run after publish without the held-out test stage
+            (sweep runs select on V_val only; per-arm winners are tested later).
     """
 
     config: Path
@@ -186,6 +188,7 @@ class PipelineArgs:
     run_kind: str | None = None
     rescore_reason: str | None = None
     resume_attempt: Path | None = None
+    skip_test: bool = False
 
 
 def build_accelerate_command(
@@ -328,6 +331,14 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
             "loudly instead of silently reusing a prior epoch"
         ),
     )
+    parser.add_argument(
+        "--skip-test",
+        action="store_true",
+        help=(
+            "publish without running the held-out test protocol (sweep runs "
+            "select on V_val only; per-arm winners run the test stage later)"
+        ),
+    )
     namespace = parser.parse_args(argv)
     return PipelineArgs(
         config=namespace.config,
@@ -339,6 +350,7 @@ def parse_pipeline_args(argv: Sequence[str] | None = None) -> PipelineArgs:
         run_kind=namespace.run_kind,
         rescore_reason=namespace.rescore_reason,
         resume_attempt=namespace.resume_attempt,
+        skip_test=namespace.skip_test,
     )
 
 
@@ -882,7 +894,9 @@ def _run_pipeline_unlocked(
     path leaves ``complete.json`` and every published artifact untouched and
     reports through ``failure.json`` alone). A bounded debug run
     (``--max-steps``) returns before publication is even attempted, so it
-    never spends a held-out scoring epoch.
+    never spends a held-out scoring epoch. ``--skip-test`` ends the run after
+    (7): the profile records ``"test": "skipped"``, stale same-kind test
+    artifacts are still cleared, and no test artifacts are written.
 
     Every scoring subprocess call goes through ``command_runner`` with
     ``check=False``. Training goes through ``training_command_runner`` so worker
@@ -1299,6 +1313,8 @@ def _run_pipeline_unlocked(
             **stage_seconds,
             "artifacts": cutoff - artifacts_started,
         }
+        if args.skip_test:
+            final_profile["test"] = "skipped"
         final_profile["total_seconds"] = cutoff - pipeline_started
         _write_json_atomic(profile_path, final_profile)
         manifest["profile.json"] = {
@@ -1357,6 +1373,22 @@ def _run_pipeline_unlocked(
     shutil.rmtree(publication_dir, ignore_errors=True)
     logger.info("E2 pipeline published: %.1fs elapsed", total_elapsed)
 
+    report_filename, test_complete_name = _test_stage_filenames(args.run_kind)
+    if args.skip_test:
+        # Sweep runs select on V_val only; the held-out test stage is spent
+        # later on per-arm winners. Stale same-kind test artifacts are still
+        # cleared so the freshly published checkpoint never sits beside a
+        # sentinel that certified the checkpoint it replaced.
+        _clear_stale_test_artifacts(
+            output_dir, report_filename=report_filename, test_complete_name=test_complete_name
+        )
+        terminal_status = {**attempt_status, "status": "complete", "test": "skipped"}
+        _write_json_atomic(attempt_dir / "complete.json", terminal_status)
+        _write_json_atomic(attempt_status_path, terminal_status)
+        _write_json_atomic(current_attempt_path, terminal_status)
+        logger.info("E2 pipeline complete without test stage: %.1fs elapsed", total_elapsed)
+        return 0
+
     # --- test: run the published checkpoint through the held-out test protocol ---
     # Deferred imports, matching the import-cycle precedent at the top of this
     # function: a bounded debug run never reaches this branch (it already
@@ -1365,7 +1397,6 @@ def _run_pipeline_unlocked(
     from src.eval.test_protocol import run_test_protocol
     from src.score_fanout import score_sharded
 
-    report_filename, test_complete_name = _test_stage_filenames(args.run_kind)
     test_started = time.monotonic()
 
     def score_runner(score_args: Sequence[str]) -> Path:

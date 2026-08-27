@@ -117,77 +117,42 @@ def _candidate_thresholds(samples: tuple[_LocalSample, ...]) -> NDArray[np.float
     )
 
 
-def _metric_state(
-    samples: tuple[_LocalSample, ...], threshold: float
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    predicted = np.array(
-        [np.count_nonzero(sample.logits >= threshold) for sample in samples], dtype=np.float64
-    )
-    target = np.array([np.count_nonzero(sample.truth) for sample in samples], dtype=np.float64)
-    true_positive = np.array(
-        [np.count_nonzero((sample.logits >= threshold) & sample.truth) for sample in samples],
-        dtype=np.float64,
-    )
-    graph_similarity = 2.0 * true_positive / (predicted + target)
-    rd_error = np.abs(predicted / target - 1.0)
-    return graph_similarity, rd_error
-
-
-def _stratified_paired_bootstrap_se(
-    differences: NDArray[np.float64], strata: NDArray[np.int64]
-) -> float:
-    """Exact paired-bootstrap mean SE for resampling within fixed strata."""
-    if differences.ndim != 1 or strata.ndim != 1 or differences.size != strata.size:
-        raise ValueError("paired bootstrap differences and strata must be aligned vectors")
-    if differences.size < 2 or not np.isfinite(differences).all():
-        raise ValueError("paired bootstrap requires at least two finite differences")
-    total = differences.size
-    variance = 0.0
-    for stratum in np.unique(strata):
-        values = differences[strata == stratum]
-        weight = values.size / total
-        variance += weight * weight * float(np.var(values, ddof=0)) / values.size
-    return float(np.sqrt(variance))
-
-
-def _sample_metric_curve(
-    sample: _LocalSample,
-    thresholds: NDArray[np.float64],
-    *,
-    metric: str,
+def _sample_abs_log_rd_curve(
+    sample: _LocalSample, thresholds: NDArray[np.float64]
 ) -> NDArray[np.float64]:
+    """Return ``|log RD|`` per candidate; a zero-edge prediction gives ``+inf``."""
     sorted_logits = np.sort(sample.logits)
-    truth_logits = np.sort(sample.logits[sample.truth])
     predicted = sorted_logits.size - np.searchsorted(sorted_logits, thresholds, side="left")
-    true_positive = truth_logits.size - np.searchsorted(truth_logits, thresholds, side="left")
-    if metric == "gs":
-        return 2.0 * true_positive / (predicted + truth_logits.size)
-    if metric == "rd_error":
-        return np.abs(predicted / truth_logits.size - 1.0)
-    raise ValueError(f"unknown fixed-threshold metric {metric!r}")
+    target = float(np.count_nonzero(sample.truth))
+    with np.errstate(divide="ignore"):
+        curve: NDArray[np.float64] = np.abs(np.log(predicted / target))
+    return curve
 
 
-def _mean_metric_curve(
-    samples: tuple[_LocalSample, ...],
-    thresholds: NDArray[np.float64],
-    *,
-    metric: str,
+def _macro_abs_log_rd_curve(
+    samples: tuple[_LocalSample, ...], thresholds: NDArray[np.float64]
 ) -> NDArray[np.float64]:
-    mean = np.zeros(thresholds.size, dtype=np.float64)
-    for sample in samples:
-        mean += _sample_metric_curve(sample, thresholds, metric=metric) / len(samples)
-    return mean
+    """Macro-average over size buckets of each bucket's mean ``|log RD|`` curve."""
+    sizes = sorted({sample.size for sample in samples})
+    macro = np.zeros(thresholds.size, dtype=np.float64)
+    for size in sizes:
+        stratum = [sample for sample in samples if sample.size == size]
+        bucket = np.zeros(thresholds.size, dtype=np.float64)
+        for sample in stratum:
+            bucket += _sample_abs_log_rd_curve(sample, thresholds)
+        macro += bucket / len(stratum) / len(sizes)
+    return macro
 
 
 def _stratified_paired_se_curve(
     samples: tuple[_LocalSample, ...],
     thresholds: NDArray[np.float64],
     reference_threshold: float,
-    *,
-    metric: str,
-    candidate_minus_reference: bool,
 ) -> NDArray[np.float64]:
-    """Exact infinite-bootstrap SE with paired resampling inside size strata."""
+    """Exact infinite-bootstrap SE of the paired per-sample ``|log RD|`` difference.
+
+    Paired resampling inside size strata, candidate minus `reference_threshold`.
+    """
     total = len(samples)
     variance = np.zeros(thresholds.size, dtype=np.float64)
     for size in sorted({sample.size for sample in samples}):
@@ -195,11 +160,9 @@ def _stratified_paired_se_curve(
         sum_diff = np.zeros(thresholds.size, dtype=np.float64)
         sum_sq_diff = np.zeros(thresholds.size, dtype=np.float64)
         for sample in stratum:
-            curve = _sample_metric_curve(sample, thresholds, metric=metric)
-            reference = float(
-                _sample_metric_curve(sample, np.array([reference_threshold]), metric=metric)[0]
-            )
-            differences = curve - reference if candidate_minus_reference else reference - curve
+            curve = _sample_abs_log_rd_curve(sample, thresholds)
+            reference = float(_sample_abs_log_rd_curve(sample, np.array([reference_threshold]))[0])
+            differences = curve - reference
             sum_diff += differences
             sum_sq_diff += differences * differences
         count = len(stratum)
@@ -305,7 +268,6 @@ def evaluate_fixed_threshold(
     buckets: dict[int, list[set[str]]],
     threshold: float,
     config: MMDConfig,
-    matching: str = "fixed_threshold_selected_on_validation",
 ) -> tuple[BucketedMMDReport, dict[str, object]]:
     """Apply one raw-logit threshold unchanged to every sampled subgraph."""
     if not np.isfinite(threshold):
@@ -325,7 +287,7 @@ def evaluate_fixed_threshold(
         offset += count
     assert offset == len(samples)
     report = {
-        "matching": matching,
+        "matching": "fixed_threshold_selected_on_validation",
         "selection": "logit_greater_than_or_equal",
         "logit_threshold": float(threshold),
         "probability_threshold": float(expit(threshold)),
@@ -350,51 +312,36 @@ def select_fixed_threshold(
     buckets: dict[int, list[set[str]]],
     config: MMDConfig,
 ) -> FixedThresholdSelection:
-    """Select one deployable threshold using GS, RD calibration, then MMD.
+    """Select one deployable threshold: density first, then shape, one 1-SE band.
 
     Candidate thresholds are every atomic validation-logit tie-group boundary
     plus the empty-graph boundary immediately above the maximum logit. Stage 1
-    keeps candidates whose paired GS loss from the best-GS threshold is within
-    one size-stratified bootstrap SE. Stage 2 applies the same rule to mean
-    ``|RD-1|``. Stage 3 lexicographically minimizes degree, clustering, then
-    spectral MMD ratio without aggregating them. Exact ties prefer the larger
-    logit threshold.
+    minimizes ``D_RD``, the macro-average over size buckets of each bucket's
+    mean ``|log RD|``; a candidate that empties any sample has ``D_RD = +inf``
+    and is excluded by ordinary masking (the empty-graph boundary always is).
+    Stage 2 keeps candidates whose paired ``D_RD`` excess over the density
+    optimum is within one size-stratified bootstrap SE. Stage 3 picks the
+    feasible candidate minimizing ``D_shape``, the mean of the three log MMD
+    ratios (each clamped at ``config.reference_epsilon`` before the log).
+    Exact ties prefer the larger logit threshold.
     """
     samples = _local_samples(pairs=pairs, logits=logits, g_ref=g_ref, buckets=buckets)
     thresholds = _candidate_thresholds(samples)
-    mean_gs = _mean_metric_curve(samples, thresholds, metric="gs")
-    mean_rd_error = _mean_metric_curve(samples, thresholds, metric="rd_error")
+    d_rd = _macro_abs_log_rd_curve(samples, thresholds)
 
-    best_gs_index = int(np.argmax(mean_gs))
-    gs_se = _stratified_paired_se_curve(
+    finite_indices = np.flatnonzero(np.isfinite(d_rd))
+    best_density_index = int(finite_indices[np.argmin(d_rd[finite_indices])])
+    density_se = _stratified_paired_se_curve(
         samples,
-        thresholds,
-        float(thresholds[best_gs_index]),
-        metric="gs",
-        candidate_minus_reference=False,
+        thresholds[finite_indices],
+        float(thresholds[best_density_index]),
     )
-    near_gs = mean_gs[best_gs_index] - mean_gs <= gs_se + 1e-12
+    feasible_local = d_rd[finite_indices] - d_rd[best_density_index] <= density_se + 1e-12
+    feasible_indices = finite_indices[feasible_local]
 
-    gs_indices = np.flatnonzero(near_gs)
-    best_rd_index = int(gs_indices[np.argmin(mean_rd_error[gs_indices])])
-    rd_se = _stratified_paired_se_curve(
-        samples,
-        thresholds,
-        float(thresholds[best_rd_index]),
-        metric="rd_error",
-        candidate_minus_reference=True,
-    )
-    near_rd = near_gs & (mean_rd_error - mean_rd_error[best_rd_index] <= rd_se + 1e-12)
-
-    mmd_indices = np.flatnonzero(near_rd)
-    if mmd_indices.size == 0:
-        raise ValueError("fixed-threshold selection produced an empty near-optimal RD set")
     reference_by_stat_size, reference_mmd2 = _precompute_reference_descriptors(samples, config)
-    surviving_indices = mmd_indices
-    stage_counts: dict[str, int] = {}
-    selected_objectives: dict[str, float] = {}
-    for statistic in STATISTICS:
-        objectives = np.array(
+    ratios = np.array(
+        [
             [
                 _mmd_ratio_for_statistic(
                     samples,
@@ -404,18 +351,20 @@ def select_fixed_threshold(
                     reference_mmd2,
                     config,
                 )
-                for index in surviving_indices
-            ],
-            dtype=np.float64,
-        )
-        if not np.isfinite(objectives).all():
-            raise ValueError("validation topology MMD ratios must be finite")
-        best_objective = float(np.min(objectives))
-        surviving_indices = surviving_indices[objectives == best_objective]
-        stage_counts[statistic] = int(surviving_indices.size)
-        selected_objectives[statistic] = best_objective
-    best_index = int(surviving_indices[0])
+                for statistic in STATISTICS
+            ]
+            for index in feasible_indices
+        ],
+        dtype=np.float64,
+    )
+    if not np.isfinite(ratios).all():
+        raise ValueError("validation topology MMD ratios must be finite")
+    log_ratios = np.log(np.maximum(ratios, config.reference_epsilon))
+    d_shape = log_ratios.mean(axis=1)
+    best_shape_local = int(np.argmin(d_shape))
+    best_index = int(feasible_indices[best_shape_local])
     threshold = float(thresholds[best_index])
+    selected_se = float(density_se[int(np.flatnonzero(finite_indices == best_index)[0])])
     predictions = _fixed_predictions(samples, threshold)
     selected_metrics = evaluate_sampled_subgraphs(predictions, g_ref, buckets, config)
     score_by_pair = {
@@ -430,7 +379,7 @@ def select_fixed_threshold(
         for index, nodes in enumerate(node_sets)
     )
     report = {
-        "rule": "sampled_subgraph_gs_rd_mmd_1se_v2",
+        "rule": "sampled_subgraph_density_shape_1se_v3",
         "threshold_candidates": "every_unique_validation_sample_union_logit_plus_empty",
         "candidate_threshold_sha256": hashlib.sha256(thresholds.tobytes()).hexdigest(),
         "candidate_count": int(thresholds.size),
@@ -442,25 +391,28 @@ def select_fixed_threshold(
         "sampled_bucket_sha256": hashlib.sha256(bucket_identity.encode()).hexdigest(),
         "standard_error": "exact_paired_nonparametric_bootstrap_se_within_size_strata",
         "resampling_unit": "sampled_ball_paired_within_size; overlapping_balls_not_independent",
-        "gs_stage": {
-            "objective": "maximize_bfs_macro_graph_similarity",
-            "best_logit_threshold": float(thresholds[best_gs_index]),
-            "best_mean": float(mean_gs[best_gs_index]),
-            "near_optimal_count": int(np.count_nonzero(near_gs)),
-            "criterion": "best_mean_minus_candidate_mean_lte_paired_1se",
+        "density_stage": {
+            "objective": "minimize_macro_mean_abs_log_relative_density",
+            "best_logit_threshold": float(thresholds[best_density_index]),
+            "min_d_rd": float(d_rd[best_density_index]),
+            "finite_candidate_count": int(finite_indices.size),
+            "feasible_count": int(feasible_indices.size),
+            "d_rd_se_at_selected": selected_se,
+            "criterion": "candidate_d_rd_minus_min_lte_paired_1se",
         },
-        "rd_stage": {
-            "objective": "minimize_mean_abs_relative_density_minus_1",
-            "best_logit_threshold": float(thresholds[best_rd_index]),
-            "best_mean_abs_error": float(mean_rd_error[best_rd_index]),
-            "near_optimal_count": int(np.count_nonzero(near_rd)),
-            "criterion": "candidate_mean_minus_best_mean_lte_paired_1se",
-        },
-        "mmd_stage": {
-            "objective": "lexicographic_minimize_degree_then_clustering_then_spectral_mmd_ratio",
-            "candidate_count": int(mmd_indices.size),
-            "surviving_count_by_statistic": stage_counts,
-            "selected_mmd_ratio_by_statistic": selected_objectives,
+        "shape_stage": {
+            "objective": "minimize_mean_log_mmd_ratio",
+            "log_ratio_epsilon": config.reference_epsilon,
+            "candidate_count": int(feasible_indices.size),
+            "selected_d_shape": float(d_shape[best_shape_local]),
+            "selected_log_mmd_ratio_by_statistic": {
+                statistic: float(log_ratios[best_shape_local, column])
+                for column, statistic in enumerate(STATISTICS)
+            },
+            "selected_mmd_ratio_by_statistic": {
+                statistic: float(ratios[best_shape_local, column])
+                for column, statistic in enumerate(STATISTICS)
+            },
             "config": {
                 "sigma": config.sigma,
                 "reference_epsilon": config.reference_epsilon,

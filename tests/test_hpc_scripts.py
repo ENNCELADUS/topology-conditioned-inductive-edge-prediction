@@ -32,6 +32,7 @@ def test_hpc_layer_has_only_runners_and_documentation() -> None:
     assert sorted(path.name for path in HPC_DIR.iterdir()) == [
         "README.md",
         "run.sh",
+        "sweep_kd_hpo.sh",
     ]
     assert not (REPO_ROOT / "slurm").exists()
 

@@ -83,8 +83,8 @@ class TestSelectCheckpoint:
         with pytest.raises(ValueError, match="non-finite"):
             select_checkpoint([bad])
 
-    def test_rd_ranked_by_distance_to_one(self) -> None:
-        """RD 1.05 beats RD 0.5: closeness to 1, not magnitude, is ranked."""
+    def test_rd_ranked_by_abs_log_distance_to_one(self) -> None:
+        """RD 1.05 beats RD 0.5: |log RD| closeness to 0, not magnitude, is ranked."""
         near_one = CheckpointCandidate(
             epoch=1, auprc=0.10, topology=_topo(0.30, 1.05, 0.10, 0.10, 0.10)
         )
@@ -93,3 +93,25 @@ class TestSelectCheckpoint:
         )
         selected = select_checkpoint([near_one, sparse])
         assert selected is not None and selected.epoch == 1
+
+    def test_log_rd_orders_ratios_symmetrically_unlike_abs_rd_minus_one(self) -> None:
+        """RD 1.6 beats RD 0.5: |log 1.6| < |log 0.5| although |RD-1| says otherwise."""
+        halved = CheckpointCandidate(
+            epoch=1, auprc=0.10, topology=_topo(0.30, 0.50, 0.10, 0.10, 0.10)
+        )
+        dense = CheckpointCandidate(
+            epoch=2, auprc=0.10, topology=_topo(0.30, 1.60, 0.10, 0.10, 0.10)
+        )
+        selected = select_checkpoint([halved, dense])
+        assert selected is not None and selected.epoch == 2
+
+    def test_rd_zero_is_a_legitimate_worst_rank_not_an_error(self) -> None:
+        """A finite RD of 0 derives |log RD| = +inf and simply ranks last."""
+        empty = CheckpointCandidate(
+            epoch=9, auprc=0.10, topology=_topo(0.30, 0.0, 0.10, 0.10, 0.10)
+        )
+        sparse = CheckpointCandidate(
+            epoch=2, auprc=0.10, topology=_topo(0.30, 0.10, 0.10, 0.10, 0.10)
+        )
+        selected = select_checkpoint([empty, sparse])
+        assert selected is not None and selected.epoch == 2

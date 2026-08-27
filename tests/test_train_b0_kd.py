@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.util
+import math
 from dataclasses import replace
 from pathlib import Path
 
@@ -782,7 +783,9 @@ def test_ddp_loop_kd_logit_telemetry_keys(tmp_path: Path) -> None:
         Accelerator(cpu=True),
         warmup_steps=1,
         artifact_dir=tmp_path / "attempt",
-        evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(_constant_metrics(), None),
+        evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(
+            _constant_metrics(), None, None, 0.5
+        ),
         kd_bank=bank,
     )
 
@@ -790,6 +793,7 @@ def test_ddp_loop_kd_logit_telemetry_keys(tmp_path: Path) -> None:
     for key in (
         "train_kd_loss",
         "kd_logit_corr",
+        "kd_logit_loss",
         "kd_prob_mae",
         "grad_norm_task",
         "grad_norm_kd",
@@ -797,6 +801,129 @@ def test_ddp_loop_kd_logit_telemetry_keys(tmp_path: Path) -> None:
         "val_brier",
     ):
         assert key in entry, f"missing telemetry key {key!r} in {sorted(entry)}"
+    assert entry["val_task_loss"] == 0.5
+
+
+def test_epoch_telemetry_kd_logit_loss_is_unweighted_rows_weighted_mean(tmp_path: Path) -> None:
+    node_ids = [f"n{i}" for i in range(6)]
+    train_pairs = _ring_pairs(node_ids)
+    train_labels = [i % 2 for i in range(6)]
+    teacher_logit = np.linspace(-1.0, 1.0, 6).astype(np.float32)
+    _write_targets(
+        tmp_path / "targets",
+        node_ids=node_ids,
+        train_pairs=train_pairs,
+        train_labels=train_labels,
+        teacher_logit=teacher_logit,
+    )
+    bank = KDRowBank(
+        DistillConfig(targets_path="t", w_logit=2.5),
+        load_kd_targets(tmp_path / "targets"),
+        train_pairs=train_pairs,
+        train_labels=train_labels,
+        val_pairs=train_pairs[:1],
+        val_labels=train_labels[:1],
+        model=nn.Linear(1, 1),
+        device=torch.device("cpu"),
+    )
+
+    student_a = torch.tensor([0.5, -0.2, 0.9, 0.1])
+    student_b = torch.tensor([-0.4, 0.3])
+    batches = ((torch.tensor([0, 1, 2, 3]), student_a), (torch.tensor([4, 5]), student_b))
+    sums: dict[str, float] = {}
+    totals: list[float] = []
+    for rows, student in batches:
+        total, stats, _ = bank.loss({"_row_id": rows}, {"logits": student}, global_step=1)
+        totals.append(float(total.item()))
+        for key, value in stats.items():
+            sums[key] = sums.get(key, 0.0) + value
+
+    telemetry = bank.epoch_telemetry(Accelerator(cpu=True), sums, None)
+    bce_a = kd_logit_loss(student_a, torch.tensor(teacher_logit[:4])).item()
+    bce_b = kd_logit_loss(student_b, torch.tensor(teacher_logit[4:])).item()
+    assert telemetry["kd_logit_loss"] == pytest.approx((4.0 * bce_a + 2.0 * bce_b) / 6.0)
+    # The step losses stay weighted; the telemetry term stays unweighted.
+    assert totals[0] == pytest.approx(2.5 * bce_a)
+    assert totals[1] == pytest.approx(2.5 * bce_b)
+
+
+def test_epoch_telemetry_kd_rank_separates_unweighted_rank_and_dist(tmp_path: Path) -> None:
+    node_ids = ["n0", "n1", "n2"]
+    train_pairs = [("n0", "n2"), ("n1", "n2")]
+    train_labels = [1, 0]
+    teacher = torch.tensor([1.0, -1.0])
+    _write_targets(
+        tmp_path / "targets",
+        node_ids=node_ids,
+        train_pairs=train_pairs,
+        train_labels=train_labels,
+        teacher_logit=teacher.numpy().astype(np.float32),
+    )
+    bank = KDRowBank(
+        DistillConfig(targets_path="t", w_rank=2.0, w_dist=3.0),
+        load_kd_targets(tmp_path / "targets"),
+        train_pairs=train_pairs,
+        train_labels=train_labels,
+        val_pairs=train_pairs[:1],
+        val_labels=train_labels[:1],
+        model=nn.Module(),
+        device=torch.device("cpu"),
+    )
+
+    student = torch.tensor([-1.0, 1.0])
+    total, stats, _ = bank.loss(
+        {"_row_id": torch.tensor([0, 1])}, {"logits": student}, global_step=1
+    )
+    telemetry = bank.epoch_telemetry(Accelerator(cpu=True), dict(stats), None)
+
+    # Both rows share n2 as pair_b: groups [a0, a1, b0, b1] = [0, 1, 2, 2].
+    groups = torch.tensor([0, 1, 2, 2])
+    grouped_student = torch.cat([student, student])
+    grouped_teacher = torch.cat([teacher, teacher])
+    rank_expected = kd_rank_loss(grouped_student, grouped_teacher, groups).item()
+    dist_expected = kd_dist_loss(grouped_student, grouped_teacher, groups).item()
+    assert telemetry["kd_rank_loss"] == pytest.approx(rank_expected)
+    assert telemetry["kd_dist_loss"] == pytest.approx(dist_expected)
+    assert total.item() == pytest.approx(2.0 * rank_expected + 3.0 * dist_expected)
+
+
+def test_epoch_telemetry_kd_rep_loss_derived_from_cos(tmp_path: Path) -> None:
+    node_ids = [f"n{i}" for i in range(4)]
+    train_pairs = _ring_pairs(node_ids)
+    train_labels = [1, 0, 1, 0]
+    _write_targets(
+        tmp_path / "targets",
+        node_ids=node_ids,
+        train_pairs=train_pairs,
+        train_labels=train_labels,
+        teacher_logit=np.zeros(4, dtype=np.float32),
+    )
+    model = nn.Module()
+    model.d_model = 4  # type: ignore[assignment]
+    bank = KDRowBank(
+        DistillConfig(targets_path="t", w_rep=1.0),
+        load_kd_targets(tmp_path / "targets"),
+        train_pairs=train_pairs,
+        train_labels=train_labels,
+        val_pairs=train_pairs[:1],
+        val_labels=train_labels[:1],
+        model=model,
+        device=torch.device("cpu"),
+    )
+
+    sums = {
+        "rows": 4.0,
+        "sum_s": 0.0,
+        "sum_t": 0.0,
+        "sum_s2": 0.0,
+        "sum_t2": 0.0,
+        "sum_st": 0.0,
+        "sum_prob_err": 0.0,
+        "sum_rep_cos": 3.0,
+    }
+    telemetry = bank.epoch_telemetry(Accelerator(cpu=True), sums, None)
+    assert telemetry["kd_rep_cos"] == pytest.approx(0.75)
+    assert telemetry["kd_rep_loss"] == pytest.approx(0.25)
 
 
 def test_pearson_from_moments_perfect_positive_correlation() -> None:
@@ -871,8 +998,15 @@ def test_evaluate_distributed_kd_rep_diagnostics() -> None:
         kd_val=kd_val,
     )
     assert outcome.kd is not None
-    assert {"val_kd_rep_cos", "val_kd_logit_corr", "val_kd_prob_mae"} <= outcome.kd.keys()
+    assert {
+        "val_kd_rep_cos",
+        "val_kd_rep_loss",
+        "val_kd_logit_corr",
+        "val_kd_logit_loss",
+        "val_kd_prob_mae",
+    } <= outcome.kd.keys()
     assert outcome.kd["val_kd_rep_cos"] == pytest.approx(1.0, abs=1e-3)
+    assert outcome.kd["val_kd_rep_loss"] == pytest.approx(1.0 - outcome.kd["val_kd_rep_cos"])
 
 
 def test_evaluate_distributed_kd_rank_reports_deterministic_block_losses() -> None:
@@ -929,6 +1063,62 @@ def test_evaluate_distributed_kd_gram_reports_deterministic_block_loss() -> None
     )
     assert outcome.kd is not None
     assert outcome.kd["val_kd_gram_block_loss"] > 0.0
+
+
+def _smoothed_bce(logits: list[float], targets: list[float]) -> float:
+    """Hand-rolled mean BCE-with-logits against probability targets."""
+    per_row = [
+        max(logit, 0.0) + math.log1p(math.exp(-abs(logit))) - target * logit
+        for logit, target in zip(logits, targets, strict=True)
+    ]
+    return sum(per_row) / len(per_row)
+
+
+def test_evaluate_distributed_reports_smoothed_task_bce() -> None:
+    batch = {
+        "label": torch.tensor([1.0, 0.0]),
+        "_row_id": torch.tensor([0, 1]),
+        "logit_seed": torch.tensor([0.5, -0.25]),
+        "rep_seed": torch.randn(2, 3),
+    }
+    outcome = _evaluate_distributed(
+        _RepDiagModel(),
+        [batch],
+        Accelerator(cpu=True),
+        expected_row_ids=np.arange(2),
+        kd_val=None,
+        label_smoothing=0.05,
+    )
+    smoothed = [1.0 * 0.95 + 0.025, 0.0 * 0.95 + 0.025]
+    assert outcome.task_loss == pytest.approx(_smoothed_bce([0.5, -0.25], smoothed))
+
+
+def test_evaluate_distributed_kd_logit_loss_matches_teacher_prob_bce() -> None:
+    batch = {
+        "label": torch.tensor([1.0, 0.0]),
+        "_row_id": torch.tensor([0, 1]),
+        "logit_seed": torch.tensor([0.5, -0.5]),
+        "rep_seed": torch.randn(2, 3),
+    }
+    teacher_logit = torch.tensor([0.4, -0.6])
+    kd_val = KDValDiagnostics(
+        arm="kd_logit",
+        teacher_logit=teacher_logit,
+        teacher_logit_np=teacher_logit.double().numpy(),
+        teacher_rep=None,
+        teacher_seeds=None,
+    )
+    outcome = _evaluate_distributed(
+        _RepDiagModel(),
+        [batch],
+        Accelerator(cpu=True),
+        expected_row_ids=np.arange(2),
+        kd_val=kd_val,
+    )
+    assert outcome.kd is not None
+    teacher_prob = [1.0 / (1.0 + math.exp(-0.4)), 1.0 / (1.0 + math.exp(0.6))]
+    expected = _smoothed_bce([0.5, -0.5], teacher_prob)
+    assert outcome.kd["val_kd_logit_loss"] == pytest.approx(expected)
 
 
 def test_evaluate_distributed_without_kd_val_leaves_kd_field_none() -> None:

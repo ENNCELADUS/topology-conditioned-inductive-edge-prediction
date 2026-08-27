@@ -83,10 +83,14 @@ Every arm's formal run is now one sequence, not train followed by separate manua
 scoring commands: `hpc/run.sh train <config> ...` packs, trains, publishes, and then
 selects on val_topology, scores test/test_topology, and writes the combined `test_report.json` before
 the command returns. Nothing further is required to get an arm's held-out numbers.
+`--skip-test` publishes without the held-out stage (profile records `"test": "skipped"`);
+sweep points use it so only per-arm winners open test. `hpc/sweep_kd_hpo.sh <lane 0|1>`
+runs the KD loss-weight grid serially per lane, pinning `CUDA_VISIBLE_DEVICES` to `0,1`
+or `2,3` (run.sh honors a pre-set mask) — launch each lane under nohup, kill by PID.
 
 Only `egostitch_e2e` is ledgered against repeat scoring. Validation threshold selection is
-non-held-out; its two held-out passes share one ledger epoch and report fixed-0.5 classification,
-fixed-0.5 and validation-fixed topology, and the separate per-subgraph RD-matched diagnostic.
+non-held-out; its two held-out passes share one ledger epoch and report the single validation-fixed
+operating point: topology at the frozen threshold, classification at calibrated probability 0.5.
 Re-running an already-scored `(arm, seed)` fails with "repeat scoring requires
 --rescore-reason"; pass `--rescore-reason "<why>"` after the config path (and any
 `--worker-module`/`--run-kind` flags) to `hpc/run.sh train` to intentionally re-open it.

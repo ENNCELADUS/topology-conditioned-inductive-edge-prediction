@@ -133,6 +133,54 @@ class TestReportEdgeMetrics:
         assert high["threshold"] == 0.9
 
 
+class TestLogitShiftCalibration:
+    """Test-time calibration: sigma(l + shift) >= 0.5 iff l >= -shift."""
+
+    def test_thresholded_metrics_are_shift_invariant(self, tmp_path: Path) -> None:
+        """Shifting to 0.5 equals thresholding raw probs at sigma(t*)."""
+        path = tmp_path / "test.npz"
+        _write_artifact(path)
+        t_star = 0.4
+
+        shifted = report_edge_metrics(path, logit_shift=-t_star)["metrics"]
+        raw = report_edge_metrics(path, threshold=float(1.0 / (1.0 + np.exp(-t_star))))["metrics"]
+
+        assert isinstance(shifted, dict) and isinstance(raw, dict)
+        for name in ("accuracy", "f1", "mcc", "sensitivity", "specificity", "auroc"):
+            assert shifted[name] == pytest.approx(raw[name])
+
+    def test_ece_and_brier_describe_the_calibrated_probabilities(self, tmp_path: Path) -> None:
+        path = tmp_path / "test.npz"
+        _write_artifact(path)
+
+        unshifted = report_edge_metrics(path)["metrics"]
+        shifted = report_edge_metrics(path, logit_shift=-3.0)["metrics"]
+
+        assert isinstance(shifted, dict) and isinstance(unshifted, dict)
+        assert shifted["brier"] != pytest.approx(unshifted["brier"])
+        assert shifted["ece"] != pytest.approx(unshifted["ece"])
+
+    def test_logit_shift_is_echoed_beside_threshold(self, tmp_path: Path) -> None:
+        path = tmp_path / "test.npz"
+        _write_artifact(path)
+
+        report = report_edge_metrics(path, logit_shift=-0.4)
+
+        assert report["threshold"] == 0.5
+        assert report["logit_shift"] == -0.4
+        assert report_edge_metrics(path)["logit_shift"] == 0.0
+
+    def test_cli_accepts_logit_shift(self, tmp_path: Path) -> None:
+        scores = tmp_path / "test.npz"
+        _write_artifact(scores)
+        output = tmp_path / "out.json"
+
+        main(["--scores", str(scores), "--output", str(output), "--logit-shift", "-0.4"])
+
+        payload = json.loads(output.read_text())
+        assert payload["logit_shift"] == -0.4
+
+
 class TestSelfNonSelfSplit:
     """Spec §9.4 rule 3: overall metrics *and* the self / non-self split."""
 

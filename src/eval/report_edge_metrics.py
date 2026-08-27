@@ -51,6 +51,21 @@ _UNLABELED = -1
 _SPLIT_REPORTING_SOURCES = ("test",)
 
 
+def _shifted_probs(logit: NDArray[np.floating], logit_shift: float) -> NDArray[np.float64]:
+    """Return the stable sigmoid of ``logit + logit_shift`` in float64.
+
+    Mirrors ``ScoresArtifact.probs()`` exactly, so a shift of ``0.0`` is
+    numerically identical to the unshifted artifact probabilities.
+    """
+    shifted = logit.astype(np.float64) + logit_shift
+    out = np.empty_like(shifted)
+    positive = shifted >= 0
+    out[positive] = 1.0 / (1.0 + np.exp(-shifted[positive]))
+    exp_l = np.exp(shifted[~positive])
+    out[~positive] = exp_l / (1.0 + exp_l)
+    return out
+
+
 def _stratum_metrics(
     labels: NDArray[np.int64],
     probs: NDArray[np.float64],
@@ -85,6 +100,7 @@ def report_edge_metrics(
     expect_pairs_source: str | None = None,
     threshold: float = 0.5,
     ece_bins: int = 15,
+    logit_shift: float = 0.0,
 ) -> dict[str, object]:
     """Load a scores artifact and compute its edge-level classification metrics.
 
@@ -105,6 +121,10 @@ def report_edge_metrics(
             balanced test view, or vice versa.
         threshold: Decision threshold for the thresholded metrics.
         ece_bins: Bin count for expected calibration error.
+        logit_shift: Added to every raw logit before the sigmoid, so calibration
+            (e.g. shifting a validation-selected threshold to probability 0.5)
+            is applied here rather than by rescoring; ECE/Brier then describe
+            the calibrated, deployed probabilities.
 
     Returns:
         A JSON-serializable dict carrying the self-loop-including ``metrics``
@@ -150,7 +170,7 @@ def report_edge_metrics(
         )
 
     labels64 = labels.astype(np.int64)
-    probs = artifact.probs()
+    probs = _shifted_probs(artifact.logit, logit_shift)
     is_self = artifact.u_idx == artifact.v_idx
 
     metrics = compute_edge_metrics(labels64, probs, threshold=threshold, ece_bins=ece_bins)
@@ -175,6 +195,7 @@ def report_edge_metrics(
         "num_rows": n_rows,
         "self_rows": int(is_self.sum()),
         "threshold": threshold,
+        "logit_shift": logit_shift,
         "ece_bins": ece_bins,
         "self_loops_included": True,
         "metrics": asdict(metrics),
@@ -223,6 +244,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="require this pairs_source; omit to accept whatever the artifact carries",
     )
     parser.add_argument("--threshold", type=float, default=0.5, help="decision threshold")
+    parser.add_argument(
+        "--logit-shift",
+        type=float,
+        default=0.0,
+        help="added to every raw logit before the sigmoid (test-time calibration)",
+    )
     parser.add_argument("--ece-bins", type=int, default=15, help="calibration bin count")
     return parser
 
@@ -241,6 +268,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         expect_pairs_source=args.expect_pairs_source,
         threshold=args.threshold,
         ece_bins=args.ece_bins,
+        logit_shift=args.logit_shift,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     # Not sort_keys: the insertion order puts the self-loop-including headline
