@@ -272,6 +272,24 @@ def _descriptor_kernel(
     return float(np.exp(-(distance * distance) / (2.0 * sigma * sigma)))
 
 
+def _descriptor_kernel_row(
+    left: NDArray[np.float64],
+    right: Sequence[NDArray[np.float64]],
+    sigma: float,
+) -> NDArray[np.float64]:
+    """Vectorize one canonical Gaussian-TV kernel row over descriptor samples."""
+    support_size = max(len(left), *(len(values) for values in right))
+    right_values = np.zeros((len(right), support_size), dtype=np.float64)
+    for index, values in enumerate(right):
+        right_values[index, : len(values)] = values
+    left_values = np.pad(left, (0, support_size - len(left)))
+    distances = np.abs(right_values - left_values).sum(axis=1) / 2.0
+    kernel_values: NDArray[np.float64] = np.exp(
+        -(distances * distances) / (2.0 * sigma * sigma)
+    )
+    return kernel_values
+
+
 def _initialize_mmd_state(
     predicted: list[NDArray[np.float64]],
     reference: list[NDArray[np.float64]],
@@ -308,16 +326,20 @@ def _update_mmd_state(
     for index in sorted(updates):
         descriptor = updates[index]
         state.predicted[index] = descriptor
-        for other_index, other in enumerate(state.predicted):
+        predicted_count = len(state.predicted)
+        values = _descriptor_kernel_row(
+            descriptor, [*state.predicted, *state.reference], config.sigma
+        )
+        predicted_values = values[:predicted_count]
+        reference_values = values[predicted_count:]
+        for other_index, value in enumerate(predicted_values):
             if other_index == index:
                 continue
-            value = _descriptor_kernel(descriptor, other, config.sigma)
             previous = float(state.predicted_kernel[index, other_index])
             state.predicted_sum += 2.0 * (value - previous)
             state.predicted_kernel[index, other_index] = value
             state.predicted_kernel[other_index, index] = value
-        for reference_index, reference in enumerate(state.reference):
-            value = _descriptor_kernel(descriptor, reference, config.sigma)
+        for reference_index, value in enumerate(reference_values):
             previous = float(state.cross_kernel[index, reference_index])
             state.cross_sum += value - previous
             state.cross_kernel[index, reference_index] = value

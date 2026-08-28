@@ -2,10 +2,8 @@
 
 import os
 import shutil
-import signal
 import stat
 import subprocess
-import time
 from pathlib import Path
 
 import pytest
@@ -66,66 +64,14 @@ def test_sweep_runner_is_valid_executable_bash(bash_exe: str) -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_sweep_nohup_guidance_records_and_controls_the_session_pgid(
-    tmp_path: Path, bash_exe: str
-) -> None:
+def test_sweep_stop_guidance_requires_live_verified_process_tree() -> None:
     text = SWEEP_RUNNER.read_text()
-    assert "setsid bash -c 'echo $$" in text
-    assert "exec hpc/sweep_kd_hpo.sh 0" in text
-    assert "echo $!" not in text
-    assert 'kill -- -"$(cat outputs/b1_row_kd_hpo/lane0.pgid)"' in text
-
-    fake_setsid = tmp_path / "setsid"
-    _write_executable(
-        fake_setsid,
-        """#!/usr/bin/env python3
-import os
-import sys
-os.setsid()
-os.execvp(sys.argv[1], sys.argv[1:])
-""",
-    )
-    fake_lane = tmp_path / "lane.sh"
-    _write_executable(
-        fake_lane,
-        """#!/usr/bin/env bash
-set -euo pipefail
-sleep 30 &
-echo "$!" > "${CHILD_PID}"
-wait
-""",
-    )
-    pgid_path = tmp_path / "lane.pgid"
-    child_path = tmp_path / "child.pid"
-    env = os.environ.copy()
-    env["CHILD_PID"] = str(child_path)
-    process = subprocess.Popen(
-        [
-            str(fake_setsid),
-            bash_exe,
-            "-c",
-            f'echo $$ > "{pgid_path}"; exec "{fake_lane}"',
-        ],
-        env=env,
-    )
-    pgid: int | None = None
-    try:
-        for _ in range(200):
-            if pgid_path.is_file() and child_path.is_file():
-                break
-            time.sleep(0.01)
-        assert pgid_path.is_file() and child_path.is_file()
-        pgid = int(pgid_path.read_text())
-        child_pid = int(child_path.read_text())
-        assert pgid == process.pid
-        assert os.getpgid(child_pid) == pgid
-        os.killpg(pgid, signal.SIGTERM)
-        process.wait(timeout=2)
-        assert process.returncode != 0
-    finally:
-        if process.poll() is None and pgid is not None:
-            os.killpg(pgid, signal.SIGKILL)
-            process.wait(timeout=2)
+    assert "wrapper PID: liveness only" in text
+    assert "inspect the exact descendant tree" in text
+    assert "Accelerate creates independent child process groups" in text
+    assert "kill -- -" not in text
+    assert "stop_lane" not in text
+    assert "collect_descendants" not in text
 
 
 def _write_executable(path: Path, text: str) -> None:

@@ -8,8 +8,10 @@
 #
 # The operator launches each lane with nohup from the H20 checkout root, e.g.:
 #   mkdir -p outputs/b1_row_kd_hpo
-#   nohup setsid bash -c 'echo $$ > outputs/b1_row_kd_hpo/lane0.pgid; exec hpc/sweep_kd_hpo.sh 0' > outputs/b1_row_kd_hpo/lane0.nohup 2>&1 &
-# Stop the lane process group with: kill -- -"$(cat outputs/b1_row_kd_hpo/lane0.pgid)"
+#   nohup hpc/sweep_kd_hpo.sh 0 > outputs/b1_row_kd_hpo/lane0.nohup 2>&1 &
+#   echo $! > outputs/b1_row_kd_hpo/lane0.pid  # wrapper PID: liveness only
+# Before stopping, inspect the exact descendant tree and terminate only verified
+# lane wrapper/launcher/workers; Accelerate creates independent child process groups.
 #
 # Every run is `hpc/run.sh train <cfg> --skip-test`: sweep selection is
 # V_val-only; the held-out test protocol is spent later on per-arm winners.

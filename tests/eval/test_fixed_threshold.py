@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import inspect
+from collections.abc import Sequence
 from itertools import combinations_with_replacement
 from typing import cast
 
@@ -10,12 +12,17 @@ import pytest
 import src.eval.fixed_threshold as fixed_threshold
 from src.eval.fixed_threshold import (
     _candidate_thresholds,
+    _descriptor_kernel,
+    _descriptor_kernel_row,
     _incremental_mmd_ratio_curve,
+    _initialize_mmd_state,
     _local_samples,
     _macro_abs_log_rd_curve,
     _mmd_ratio_for_statistic,
+    _normalized_descriptor,
     _precompute_reference_descriptors,
     _stratified_paired_se_curve,
+    _update_mmd_state,
     evaluate_fixed_threshold,
     select_fixed_threshold,
 )
@@ -294,6 +301,74 @@ def test_incremental_shape_curve_matches_brute_force_with_unequal_buckets_and_ti
     assert thresholds[feasible_indices[incremental_best]] == thresholds[
         feasible_indices[brute_force_best]
     ]
+
+
+def test_vectorized_kernel_row_matches_scalar_variable_support() -> None:
+    rng = np.random.default_rng(481)
+    left = rng.random(17)
+    right = [rng.random(size) for size in (3, 17, 29, 7, 21)]
+
+    vectorized = _descriptor_kernel_row(left, right, sigma=0.73)
+    scalar = np.array([_descriptor_kernel(left, values, 0.73) for values in right])
+
+    np.testing.assert_allclose(vectorized, scalar, rtol=1e-15, atol=0.0)
+
+
+def test_vectorized_mmd_update_matches_scalar_and_batches_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rng = np.random.default_rng(982)
+    config = MMDConfig(sigma=0.61)
+    predicted = [_normalized_descriptor(rng.random(size)) for size in (11, 17, 23, 29, 31)]
+    reference = [_normalized_descriptor(rng.random(size)) for size in (7, 13, 19, 27, 31)]
+    state = _initialize_mmd_state(predicted, reference, config)
+    expected = copy.deepcopy(state)
+    updates = {
+        1: _normalized_descriptor(rng.random(25)),
+        3: _normalized_descriptor(rng.random(15)),
+    }
+
+    for index in sorted(updates):
+        descriptor = updates[index]
+        expected.predicted[index] = descriptor
+        for other_index, other in enumerate(expected.predicted):
+            if other_index == index:
+                continue
+            value = _descriptor_kernel(descriptor, other, config.sigma)
+            previous = float(expected.predicted_kernel[index, other_index])
+            expected.predicted_sum += 2.0 * (value - previous)
+            expected.predicted_kernel[index, other_index] = value
+            expected.predicted_kernel[other_index, index] = value
+        for reference_index, values in enumerate(expected.reference):
+            value = _descriptor_kernel(descriptor, values, config.sigma)
+            previous = float(expected.cross_kernel[index, reference_index])
+            expected.cross_sum += value - previous
+            expected.cross_kernel[index, reference_index] = value
+
+    row_calls = 0
+    kernel_row = fixed_threshold._descriptor_kernel_row
+
+    def counted_row(
+        left: np.ndarray, right: Sequence[np.ndarray], sigma: float
+    ) -> np.ndarray:
+        nonlocal row_calls
+        row_calls += 1
+        return kernel_row(left, right, sigma)
+
+    monkeypatch.setattr(fixed_threshold, "_descriptor_kernel_row", counted_row)
+    _update_mmd_state(state, updates, config)
+
+    assert row_calls == len(updates)
+    np.testing.assert_allclose(state.predicted_kernel, expected.predicted_kernel, rtol=1e-15)
+    np.testing.assert_allclose(state.cross_kernel, expected.cross_kernel, rtol=1e-15)
+    assert state.predicted_sum == pytest.approx(expected.predicted_sum, rel=1e-15)
+    assert state.cross_sum == pytest.approx(expected.cross_sum, rel=1e-15)
+    assert state.predicted_sum == pytest.approx(
+        sum(float(value) for row in state.predicted_kernel for value in row), rel=1e-15
+    )
+    assert state.cross_sum == pytest.approx(
+        sum(float(value) for row in state.cross_kernel for value in row), rel=1e-15
+    )
 
 
 def test_incremental_sweep_refreshes_a_tied_sample_once(
