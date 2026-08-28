@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Serial two-lane driver for the B1 KD loss-weight sweep (configs/sweep/b1_kd_hpo).
+# Serial driver for the B1 KD loss-weight sweep (configs/sweep/b1_kd_hpo).
 #
-# Usage: hpc/sweep_kd_hpo.sh <lane>       lane 0 or 1
+# Usage: hpc/sweep_kd_hpo.sh <lane>       lane all, 0, or 1
+#   lane all -> CUDA_VISIBLE_DEVICES=0,1,2,3 and every config (sorted order)
 #   lane 0 -> CUDA_VISIBLE_DEVICES=0,1 and the even-indexed configs (sorted order)
 #   lane 1 -> CUDA_VISIBLE_DEVICES=2,3 and the odd-indexed configs
-# Two GPUs per run pins world_size=2 for comparability with the original KD runs.
+# The all lane uses all four GPUs sequentially; numbered lanes preserve the two-GPU split.
 #
-# The operator launches each lane with nohup from the H20 checkout root, e.g.:
+# The operator launches the full grid with nohup from the H20 checkout root, e.g.:
 #   mkdir -p outputs/b1_row_kd_hpo
-#   nohup hpc/sweep_kd_hpo.sh 0 > outputs/b1_row_kd_hpo/lane0.nohup 2>&1 &
-#   echo $! > outputs/b1_row_kd_hpo/lane0.pid  # wrapper PID: liveness only
+#   nohup hpc/sweep_kd_hpo.sh all > outputs/b1_row_kd_hpo/all.nohup 2>&1 &
+#   echo $! > outputs/b1_row_kd_hpo/all.pid  # wrapper PID: liveness only
 # Before stopping, inspect the exact descendant tree and terminate only verified
 # lane wrapper/launcher/workers; Accelerate creates independent child process groups.
 #
@@ -18,11 +19,12 @@
 # A config whose output dir already holds complete.json is skipped (resume).
 set -euo pipefail
 
-LANE="${1:?usage: hpc/sweep_kd_hpo.sh <lane 0|1>}"
+LANE="${1:?usage: hpc/sweep_kd_hpo.sh <lane all|0|1>}"
 case "${LANE}" in
+  all) export CUDA_VISIBLE_DEVICES=0,1,2,3 ;;
   0) export CUDA_VISIBLE_DEVICES=0,1 ;;
   1) export CUDA_VISIBLE_DEVICES=2,3 ;;
-  *) echo "ERROR: lane must be 0 or 1, got ${LANE}" >&2; exit 1 ;;
+  *) echo "ERROR: lane must be all, 0, or 1, got ${LANE}" >&2; exit 1 ;;
 esac
 # The 224-core H20 box spin-waits concurrent torch jobs into a 12x slowdown
 # without a thread cap.
@@ -42,7 +44,7 @@ index=0
 for cfg in "${CONFIGS[@]}"; do
   lane_of_cfg=$(( index % 2 ))
   index=$(( index + 1 ))
-  (( lane_of_cfg == LANE )) || continue
+  [[ "${LANE}" == all ]] || (( lane_of_cfg == LANE )) || continue
   stem="$(basename "${cfg}" .yaml)"
   out_dir="${SWEEP_ROOT}/${stem}"
   if [[ -f "${out_dir}/failure.json" ]]; then

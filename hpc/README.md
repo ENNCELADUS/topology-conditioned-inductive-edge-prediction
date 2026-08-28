@@ -81,8 +81,8 @@ shapes); test suites run locally, never as an HPC recheck.
 
 `hpc/run.sh train <config> ...` packs, trains, publishes, selects on val_topology, and writes
 the combined `test_report.json`; `--skip-test` publishes with `"test": "skipped"`, so sweep
-points reserve held-out test for winners. `hpc/sweep_kd_hpo.sh <lane 0|1>` runs lanes on GPUs
-`0,1` and `2,3`; record its PID for liveness, then inspect the exact tree before stopping verified lane processes because Accelerate creates child groups.
+points reserve held-out test for winners. `hpc/sweep_kd_hpo.sh all` runs all points sequentially on GPUs
+`0,1,2,3`; numbered lanes retain the split mode. Record its PID for liveness and inspect the exact tree before stopping verified processes because Accelerate creates child groups.
 
 Only `egostitch_e2e` is ledgered against repeat scoring. Validation threshold selection is
 non-held-out; its two held-out passes share one ledger epoch and report the single validation-fixed

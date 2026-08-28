@@ -66,6 +66,8 @@ def test_sweep_runner_is_valid_executable_bash(bash_exe: str) -> None:
 
 def test_sweep_stop_guidance_requires_live_verified_process_tree() -> None:
     text = SWEEP_RUNNER.read_text()
+    assert "nohup hpc/sweep_kd_hpo.sh all" in text
+    assert "outputs/b1_row_kd_hpo/all.pid" in text
     assert "wrapper PID: liveness only" in text
     assert "inspect the exact descendant tree" in text
     assert "Accelerate creates independent child process groups" in text
@@ -151,6 +153,31 @@ def test_sweep_mock_contract_covers_lanes_resume_quoting_and_overlap(
         "run\t2,3\tconfigs/sweep/b1_kd_hpo/b second.yaml\t--skip-test",
         "run\t2,3\tconfigs/sweep/b1_kd_hpo/d fourth.yaml\t--skip-test",
     }
+
+
+def test_sweep_all_lane_runs_every_config_sequentially_on_four_gpus(
+    tmp_path: Path, bash_exe: str
+) -> None:
+    env, call_log = _mock_sweep_checkout(tmp_path)
+    completed = tmp_path / "outputs" / "b1_row_kd_hpo" / "c third"
+    completed.mkdir(parents=True)
+    (completed / "complete.json").write_text("{}\n")
+
+    result = subprocess.run(
+        [bash_exe, str(SWEEP_RUNNER), "all"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert call_log.read_text().splitlines() == [
+        "run\t0,1,2,3\tconfigs/sweep/b1_kd_hpo/a first.yaml\t--skip-test",
+        "run\t0,1,2,3\tconfigs/sweep/b1_kd_hpo/b second.yaml\t--skip-test",
+        "run\t0,1,2,3\tconfigs/sweep/b1_kd_hpo/d fourth.yaml\t--skip-test",
+    ]
 
 
 def test_sweep_failure_marker_wins_over_stale_completion(tmp_path: Path, bash_exe: str) -> None:
