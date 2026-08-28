@@ -1,8 +1,11 @@
 """Static contract tests for the auto-sized H20 execution layer."""
 
+import os
 import shutil
+import signal
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -10,6 +13,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HPC_DIR = REPO_ROOT / "hpc"
 RUNNER = HPC_DIR / "run.sh"
+SWEEP_RUNNER = HPC_DIR / "sweep_kd_hpo.sh"
 
 
 @pytest.fixture(scope="module")
@@ -50,6 +54,205 @@ def test_runner_is_valid_executable_bash(bash_exe: str) -> None:
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_sweep_runner_is_valid_executable_bash(bash_exe: str) -> None:
+    result = subprocess.run(
+        [bash_exe, "-n", str(SWEEP_RUNNER)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_sweep_nohup_guidance_records_and_controls_the_session_pgid(
+    tmp_path: Path, bash_exe: str
+) -> None:
+    text = SWEEP_RUNNER.read_text()
+    assert "setsid bash -c 'echo $$" in text
+    assert "exec hpc/sweep_kd_hpo.sh 0" in text
+    assert "echo $!" not in text
+    assert 'kill -- -"$(cat outputs/b1_row_kd_hpo/lane0.pgid)"' in text
+
+    fake_setsid = tmp_path / "setsid"
+    _write_executable(
+        fake_setsid,
+        """#!/usr/bin/env python3
+import os
+import sys
+os.setsid()
+os.execvp(sys.argv[1], sys.argv[1:])
+""",
+    )
+    fake_lane = tmp_path / "lane.sh"
+    _write_executable(
+        fake_lane,
+        """#!/usr/bin/env bash
+set -euo pipefail
+sleep 30 &
+echo "$!" > "${CHILD_PID}"
+wait
+""",
+    )
+    pgid_path = tmp_path / "lane.pgid"
+    child_path = tmp_path / "child.pid"
+    env = os.environ.copy()
+    env["CHILD_PID"] = str(child_path)
+    process = subprocess.Popen(
+        [
+            str(fake_setsid),
+            bash_exe,
+            "-c",
+            f'echo $$ > "{pgid_path}"; exec "{fake_lane}"',
+        ],
+        env=env,
+    )
+    pgid: int | None = None
+    try:
+        for _ in range(200):
+            if pgid_path.is_file() and child_path.is_file():
+                break
+            time.sleep(0.01)
+        assert pgid_path.is_file() and child_path.is_file()
+        pgid = int(pgid_path.read_text())
+        child_pid = int(child_path.read_text())
+        assert pgid == process.pid
+        assert os.getpgid(child_pid) == pgid
+        os.killpg(pgid, signal.SIGTERM)
+        process.wait(timeout=2)
+        assert process.returncode != 0
+    finally:
+        if process.poll() is None and pgid is not None:
+            os.killpg(pgid, signal.SIGKILL)
+            process.wait(timeout=2)
+
+
+def _write_executable(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def _mock_sweep_checkout(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    configs = tmp_path / "configs" / "sweep" / "b1_kd_hpo"
+    configs.mkdir(parents=True)
+    for name in ("a first.yaml", "b second.yaml", "c third.yaml", "d fourth.yaml"):
+        (configs / name).write_text("{}\n")
+
+    call_log = tmp_path / "calls.log"
+    _write_executable(
+        tmp_path / "hpc" / "run.sh",
+        """#!/usr/bin/env bash
+set -euo pipefail
+[[ $# -eq 3 && "$1" == train && "$3" == --skip-test ]] || exit 31
+printf 'run\\t%s\\t%s\\t%s\\n' "${CUDA_VISIBLE_DEVICES}" "$2" "$3" >> "${CALL_LOG}"
+if [[ "${EXPECT_OVERLAP:-}" == 1 ]]; then
+  touch "${RUN_BARRIER}.${CUDA_VISIBLE_DEVICES}"
+  for _ in {1..100}; do
+    [[ -f "${RUN_BARRIER}.0,1" && -f "${RUN_BARRIER}.2,3" ]] && break
+    sleep 0.01
+  done
+  [[ -f "${RUN_BARRIER}.0,1" && -f "${RUN_BARRIER}.2,3" ]] || exit 32
+fi
+stem="$(basename "$2" .yaml)"
+if [[ "${FAIL_CONFIG:-}" == "$2" && "${FAIL_MODE:-}" == exit ]]; then
+  exit 7
+fi
+if [[ "${FAIL_CONFIG:-}" == "$2" && "${FAIL_MODE:-}" == marker ]]; then
+  mkdir -p "outputs/b1_row_kd_hpo/${stem}"
+  touch "outputs/b1_row_kd_hpo/${stem}/failure.json"
+fi
+""",
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "CALL_LOG": str(call_log),
+            "RUN_BARRIER": str(tmp_path / "run-active"),
+        }
+    )
+    return env, call_log
+
+
+def test_sweep_mock_contract_covers_lanes_resume_quoting_and_overlap(
+    tmp_path: Path, bash_exe: str
+) -> None:
+    env, call_log = _mock_sweep_checkout(tmp_path)
+    env["EXPECT_OVERLAP"] = "1"
+    completed = tmp_path / "outputs" / "b1_row_kd_hpo" / "c third"
+    completed.mkdir(parents=True)
+    (completed / "complete.json").write_text("{}\n")
+
+    processes = [
+        subprocess.Popen(
+            [bash_exe, str(SWEEP_RUNNER), lane],
+            cwd=tmp_path,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for lane in ("0", "1")
+    ]
+    results = [process.communicate() for process in processes]
+    assert [process.returncode for process in processes] == [0, 0], results
+
+    calls = call_log.read_text().splitlines()
+    run_calls = {line for line in calls if line.startswith("run\t")}
+    assert run_calls == {
+        "run\t0,1\tconfigs/sweep/b1_kd_hpo/a first.yaml\t--skip-test",
+        "run\t2,3\tconfigs/sweep/b1_kd_hpo/b second.yaml\t--skip-test",
+        "run\t2,3\tconfigs/sweep/b1_kd_hpo/d fourth.yaml\t--skip-test",
+    }
+
+
+def test_sweep_failure_marker_wins_over_stale_completion(tmp_path: Path, bash_exe: str) -> None:
+    env, call_log = _mock_sweep_checkout(tmp_path)
+    stale_output = tmp_path / "outputs" / "b1_row_kd_hpo" / "a first"
+    stale_output.mkdir(parents=True)
+    (stale_output / "complete.json").write_text("{}\n")
+    (stale_output / "failure.json").write_text("{}\n")
+
+    result = subprocess.run(
+        [bash_exe, str(SWEEP_RUNNER), "0"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert not call_log.exists()
+    assert "aborting at a first (failure.json exists)" in result.stderr
+
+
+@pytest.mark.parametrize("failure_mode", ["exit", "marker"])
+def test_sweep_mock_contract_aborts_lane_on_failure(
+    tmp_path: Path, bash_exe: str, failure_mode: str
+) -> None:
+    env, call_log = _mock_sweep_checkout(tmp_path)
+    env.update(
+        {
+            "FAIL_CONFIG": "configs/sweep/b1_kd_hpo/a first.yaml",
+            "FAIL_MODE": failure_mode,
+        }
+    )
+    result = subprocess.run(
+        [bash_exe, str(SWEEP_RUNNER), "0"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    calls = call_log.read_text()
+    assert "a first.yaml\t--skip-test" in calls
+    assert "c third.yaml\t--skip-test" not in calls
+    assert "aborting at a first" in result.stderr
 
 
 def test_help_is_available_without_the_remote_container(bash_exe: str) -> None:

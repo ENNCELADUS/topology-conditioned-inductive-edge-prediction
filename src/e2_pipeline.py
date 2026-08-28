@@ -25,6 +25,7 @@ import logging
 import math
 import multiprocessing
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -34,7 +35,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from dataclasses import asdict, dataclass, replace
 from io import BufferedReader
 from multiprocessing.connection import Connection
@@ -747,8 +748,9 @@ def _publish_staged(
     output_dir: Path,
     *,
     optional_filenames: Sequence[str] = _OPTIONAL_PUBLISHED_FILENAMES,
+    revoke_filenames: Sequence[str] = (),
 ) -> tuple[Path, list[str]]:
-    """Publish validated files with rollback-capable per-file atomic replaces."""
+    """Publish validated files and revoke stale verdicts with atomic rollback."""
     optional_names = tuple(optional_filenames)
     backup_dir = Path(tempfile.mkdtemp(prefix=".e2-backup-", dir=output_dir))
     published: list[str] = []
@@ -765,7 +767,7 @@ def _publish_staged(
         # Every optional name is backed up whether or not this run staged one, so
         # a prior run's verdict is removed rather than left to masquerade as this
         # run's; rollback restores it from the backup.
-        for filename in _PUBLISHED_FILENAMES + optional_names:
+        for filename in _PUBLISHED_FILENAMES + optional_names + tuple(revoke_filenames):
             canonical = output_dir / filename
             if canonical.exists():
                 os.replace(canonical, backup_dir / filename)
@@ -1145,7 +1147,6 @@ def _run_pipeline_unlocked(
         return fail(stage="pack", message=f"required pack path resolution failed: {error}")
     if not pack_paths or any(not isinstance(path, Path) for path in pack_paths):
         return fail(stage="pack", message="worker returned invalid required pack paths")
-    cold_cache = any(not path.exists() for path in pack_paths)
     pack_started = time.monotonic()
     pack_validation_path = attempt_dir / "pack_validation.json"
     pack_temp_prefix = f".{pack_dir.name}.{attempt_id}.pack-"
@@ -1158,6 +1159,20 @@ def _run_pipeline_unlocked(
                 if path.is_dir():
                     shutil.rmtree(path, ignore_errors=True)
 
+    stale_pack_temp_pattern = re.compile(
+        rf"\.{re.escape(pack_dir.name)}\."
+        rf"(?P<attempt>[0-9a-f]{{32}})\.pack-.+"
+    )
+
+    def cleanup_stale_pack_temps() -> None:
+        for parent in {path.parent for path in pack_paths}:
+            if not parent.exists():
+                continue
+            for path in parent.iterdir():
+                match = stale_pack_temp_pattern.fullmatch(path.name)
+                if path.is_dir() and match is not None and match.group("attempt") != attempt_id:
+                    shutil.rmtree(path)
+
     def pack_operation() -> None:
         payload = worker.prepare_pack(
             cfg, pack_dir, cold_cache=cold_cache, temp_prefix=pack_temp_prefix
@@ -1165,9 +1180,26 @@ def _run_pipeline_unlocked(
         _write_json_atomic(pack_validation_path, cast(dict[str, object], payload))
 
     try:
-        stage_runner(pack_operation)
+        lock_paths = sorted(
+            {path.parent / f".{path.name}.pack.lock" for path in pack_paths},
+            key=lambda path: str(path.resolve()),
+        )
+        for lock_path in lock_paths:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with ExitStack() as lock_stack:
+            lock_handles = [
+                lock_stack.enter_context(lock_path.open("a+b")) for lock_path in lock_paths
+            ]
+            for lock_handle in lock_handles:
+                fcntl.flock(lock_handle, fcntl.LOCK_EX)
+            cleanup_stale_pack_temps()
+            cold_cache = any(not path.exists() for path in pack_paths)
+            try:
+                stage_runner(pack_operation)
+            except Exception:
+                cleanup_owned_pack_temps()
+                raise
     except Exception as error:
-        cleanup_owned_pack_temps()
         return fail(stage="pack", message=f"feature pack stage failed: {error}")
     stage_seconds["pack"] = time.monotonic() - pack_started
     try:
@@ -1329,6 +1361,8 @@ def _run_pipeline_unlocked(
         _write_json_atomic(profile_path, final_profile)
         return fail(stage="artifacts", message=f"artifact merge/manifest failed: {error}")
 
+    report_filename, test_complete_name = _test_stage_filenames(args.run_kind)
+
     # Publish hardlinks from a temporary tree, leaving the complete attempt
     # evidence untouched. Publication remains reversible until its sentinel lands.
     publication_dir = Path(tempfile.mkdtemp(prefix=".e2-publish-", dir=output_dir))
@@ -1347,6 +1381,7 @@ def _run_pipeline_unlocked(
             publication_dir,
             output_dir,
             optional_filenames=optional_published_filenames,
+            revoke_filenames=(test_complete_name, report_filename),
         )
     except Exception as error:
         shutil.rmtree(publication_dir, ignore_errors=True)
@@ -1373,12 +1408,10 @@ def _run_pipeline_unlocked(
     shutil.rmtree(publication_dir, ignore_errors=True)
     logger.info("E2 pipeline published: %.1fs elapsed", total_elapsed)
 
-    report_filename, test_complete_name = _test_stage_filenames(args.run_kind)
     if args.skip_test:
         # Sweep runs select on V_val only; the held-out test stage is spent
-        # later on per-arm winners. Stale same-kind test artifacts are still
-        # cleared so the freshly published checkpoint never sits beside a
-        # sentinel that certified the checkpoint it replaced.
+        # later on per-arm winners. Publication already revoked stale same-kind
+        # test artifacts before making the replacement checkpoint visible.
         _clear_stale_test_artifacts(
             output_dir, report_filename=report_filename, test_complete_name=test_complete_name
         )

@@ -4,6 +4,7 @@ import importlib
 import inspect
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -180,6 +181,50 @@ def test_failed_completion_sentinel_backup_does_not_delete_the_old_sentinel(
         _publish_staged(staging_dir, output_dir)
 
     assert (output_dir / "complete.json").read_text() == "old-complete"
+
+
+def test_publication_revokes_test_certification_before_publish_and_restores_on_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_dir = tmp_path / "out"
+    staging_dir = tmp_path / "staging"
+    output_dir.mkdir()
+    staging_dir.mkdir()
+    for filename in _PUBLISHED_FILENAMES:
+        (output_dir / filename).write_text(f"old-{filename}")
+        (staging_dir / filename).write_text(f"new-{filename}")
+    (output_dir / "test_complete.json").write_text("old-test-complete")
+    (output_dir / "test_report.json").write_text("old-test-report")
+    real_replace = os.replace
+    moves: list[tuple[Path, Path]] = []
+
+    def recording_replace(source: str | Path, destination: str | Path) -> None:
+        moves.append((Path(source), Path(destination)))
+        real_replace(source, destination)
+
+    monkeypatch.setattr("src.e2_pipeline.os.replace", recording_replace)
+    backup_dir, published = _publish_staged(
+        staging_dir,
+        output_dir,
+        revoke_filenames=("test_complete.json", "test_report.json"),
+    )
+
+    first_publish = next(index for index, move in enumerate(moves) if move[0].parent == staging_dir)
+    assert (
+        moves.index((output_dir / "test_complete.json", backup_dir / "test_complete.json"))
+        < first_publish
+    )
+    assert moves.index((output_dir / "test_report.json", backup_dir / "test_report.json")) < (
+        first_publish
+    )
+    assert not (output_dir / "test_complete.json").exists()
+    assert not (output_dir / "test_report.json").exists()
+
+    _rollback_publication(output_dir, backup_dir, published, restore_dir=staging_dir)
+
+    assert (output_dir / "best.pt").read_text() == "old-best.pt"
+    assert (output_dir / "test_complete.json").read_text() == "old-test-complete"
+    assert (output_dir / "test_report.json").read_text() == "old-test-report"
 
 
 def test_diagnostic_cannot_replace_a_formal_output_directory(tmp_path: Path) -> None:
@@ -989,6 +1034,165 @@ class TestRunPipelineSuccess:
         warm_profile = json.loads((output_dir / "profile.json").read_text())
         assert warm_profile["cold_cache"] is False
         assert warm_profile["pack_evidence"]["raw_tokens"]["cold"] is False
+
+    def test_concurrent_outputs_lock_every_declared_shared_pack(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Different primary packs cannot race a shared secondary pack."""
+        from src import train_b0
+
+        data_root = tmp_path / "data"
+        source_root = _write_feature_root(
+            data_root / "features" / "frozen_node_features_1024", {"node_a": (3, 4)}
+        )
+        shared_pack = tmp_path / "shared-raw-pack"
+        configs: list[Path] = []
+        for lane in (0, 1):
+            config_path = tmp_path / f"cfg-{lane}.yaml"
+            _write_pipeline_config(
+                config_path,
+                _pipeline_config_dict(
+                    data_root=data_root,
+                    pack_dir=tmp_path / f"primary-pack-{lane}",
+                    output_dir=tmp_path / f"out-{lane}",
+                ),
+            )
+            configs.append(config_path)
+
+        shared_cold_states: list[bool] = []
+        state_lock = threading.Lock()
+
+        def required_pack_paths(_cfg: train_b0.Config, primary_pack: Path) -> tuple[Path, Path]:
+            return primary_pack, shared_pack
+
+        def prepare_pack(
+            cfg: train_b0.Config,
+            primary_pack: Path,
+            *,
+            cold_cache: bool,
+            temp_prefix: str = "",
+        ) -> dict[str, object]:
+            primary = train_b0.prepare_pack(
+                cfg,
+                primary_pack,
+                cold_cache=not primary_pack.exists(),
+                temp_prefix=temp_prefix,
+            )
+            shared_cold = not shared_pack.exists()
+            with state_lock:
+                shared_cold_states.append(shared_cold)
+            if shared_cold:
+                time.sleep(0.05)
+                shared_manifest = packed_features.build_packed_features(
+                    source_root, shared_pack, workers=1, temp_prefix=temp_prefix
+                )
+            else:
+                shared_manifest = packed_features.validate_packed_manifest(shared_pack, source_root)
+            return {
+                **primary,
+                "packs": {
+                    "shared": {
+                        "cold": shared_cold,
+                        "format": shared_manifest.format,
+                    }
+                },
+            }
+
+        class DualWorker:
+            pass
+
+        DualWorker.load_config = staticmethod(train_b0.load_config)  # type: ignore[attr-defined]
+        DualWorker.prepare_pack = staticmethod(prepare_pack)  # type: ignore[attr-defined]
+        DualWorker.required_pack_paths = staticmethod(  # type: ignore[attr-defined]
+            required_pack_paths
+        )
+
+        original_import = importlib.import_module
+        monkeypatch.setattr(
+            importlib,
+            "import_module",
+            lambda name: DualWorker if name == "fake.concurrent_worker" else original_import(name),
+        )
+        start = threading.Barrier(2)
+
+        def run(config: Path) -> int:
+            start.wait()
+            return run_pipeline(
+                PipelineArgs(config, None, None, worker_module="fake.concurrent_worker"),
+                training_command_runner=_make_fake_runner(),
+                stage_runner=lambda operation: operation(),
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(run, configs))
+
+        assert results == [0, 0]
+        assert sorted(shared_cold_states) == [False, True]
+        assert (shared_pack / "manifest.json").is_file()
+        assert all(
+            (tmp_path / f"primary-pack-{lane}" / "manifest.json").is_file() for lane in (0, 1)
+        )
+
+    def test_pack_stage_removes_only_exact_stale_attempt_temps_under_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        data_root = tmp_path / "data"
+        _write_feature_root(
+            data_root / "features" / "frozen_node_features_1024", {"node_a": (3, 4)}
+        )
+        pack_dir = tmp_path / "shared-pack"
+        config_path = tmp_path / "cfg.yaml"
+        _write_pipeline_config(
+            config_path,
+            _pipeline_config_dict(
+                data_root=data_root,
+                pack_dir=pack_dir,
+                output_dir=tmp_path / "out",
+            ),
+        )
+
+        stale = tmp_path / f".{pack_dir.name}.{'a' * 32}.pack-orphan"
+        stale.mkdir()
+        (stale / "partial.bin").write_bytes(b"partial")
+        near_miss = tmp_path / f".{pack_dir.name}.{'b' * 31}.pack-orphan"
+        near_miss.mkdir()
+        matching_file = tmp_path / f".{pack_dir.name}.{'c' * 32}.pack-file"
+        matching_file.write_text("keep\n")
+        nested_parent = tmp_path / "nested"
+        nested_parent.mkdir()
+        nested = nested_parent / f".{pack_dir.name}.{'d' * 32}.pack-orphan"
+        nested.mkdir()
+
+        original_rmtree = shutil.rmtree
+        stale_removed_under_lock = False
+
+        def checked_rmtree(path: Path, ignore_errors: bool = False) -> None:
+            nonlocal stale_removed_under_lock
+            if path == stale:
+                lock_path = tmp_path / f".{pack_dir.name}.pack.lock"
+                with (
+                    lock_path.open("a+b") as lock_handle,
+                    pytest.raises(BlockingIOError),
+                ):
+                    fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                stale_removed_under_lock = True
+            original_rmtree(path, ignore_errors=ignore_errors)
+
+        monkeypatch.setattr(shutil, "rmtree", checked_rmtree)
+
+        assert (
+            run_pipeline(
+                PipelineArgs(config_path, None, None),
+                training_command_runner=_make_fake_runner(),
+                stage_runner=lambda operation: operation(),
+            )
+            == 0
+        )
+        assert stale_removed_under_lock
+        assert not stale.exists()
+        assert near_miss.is_dir()
+        assert matching_file.is_file()
+        assert nested.is_dir()
 
     def test_bounded_debug_pipeline_completes_in_debug_root_only(self, tmp_path: Path) -> None:
         data_root = tmp_path / "data"
@@ -1997,19 +2201,36 @@ class TestRunPipelineTestStage:
         assert attempt_status["status"] == "complete"
         assert attempt_status["test"] == "skipped"
 
-    def test_skip_test_republish_clears_the_prior_runs_test_sentinel(self, tmp_path: Path) -> None:
+    def test_skip_test_republish_clears_the_prior_runs_test_sentinel(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A skip-test republish must not leave a stale sentinel certifying it."""
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "test_report.json").write_text('{"status": "ok"}')
         (output_dir / "test_complete.json").write_text('{"status": "test_complete"}')
         args = PipelineArgs(**{**vars(args), "skip_test": True})
+        real_replace = os.replace
+        moves: list[tuple[Path, Path]] = []
+
+        def recording_replace(source: str | Path, destination: str | Path) -> None:
+            moves.append((Path(source), Path(destination)))
+            real_replace(source, destination)
+
+        monkeypatch.setattr("src.e2_pipeline.os.replace", recording_replace)
 
         # Default forked stage_runner: the skip marker must land in the
         # published profile through the real child-process artifact stage.
         exit_code = run_pipeline(args, training_command_runner=_make_fake_runner())
 
         assert exit_code == 0
+        stale_revoked = moves.index(
+            next(move for move in moves if move[0] == output_dir / "test_complete.json")
+        )
+        checkpoint_published = moves.index(
+            next(move for move in moves if move[1] == output_dir / "best.pt")
+        )
+        assert stale_revoked < checkpoint_published
         assert (output_dir / "complete.json").is_file()
         assert not (output_dir / "test_report.json").exists()
         assert not (output_dir / "test_complete.json").exists()

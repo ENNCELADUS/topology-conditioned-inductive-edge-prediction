@@ -83,6 +83,13 @@ class TestSelectCheckpoint:
         with pytest.raises(ValueError, match="non-finite"):
             select_checkpoint([bad])
 
+    def test_negative_rd_fails_closed(self) -> None:
+        bad = CheckpointCandidate(
+            epoch=1, auprc=0.1, topology=_topo(0.3, -0.1, 0.1, 0.1, 0.1)
+        )
+        with pytest.raises(ValueError, match="RD must be non-negative"):
+            select_checkpoint([bad])
+
     def test_rd_ranked_by_abs_log_distance_to_one(self) -> None:
         """RD 1.05 beats RD 0.5: |log RD| closeness to 0, not magnitude, is ranked."""
         near_one = CheckpointCandidate(

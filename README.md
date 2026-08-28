@@ -65,7 +65,7 @@ hpc/run.sh train configs/egostitch_e2e_v3_full_breadth_first.yaml \
 
 The run trains topology and classification on the train-side positive edges minus
 V_val-internal pairs, validates on the V_val region split (pair-disjoint BFS growth to
-the nearest 20% induced edges), and executes `pack → train → publish` through the
+the nearest 20% induced edges), and executes `pack → train → publish → test` through the
 shared orchestrator. Quality telemetry (eligibility, liveness, slot collapse, margins)
 is recorded but never blocks completion, publication, scoring, or evaluation.
 
@@ -228,7 +228,7 @@ src/
   experiments/                   G1/G2/G3 analyses + observe_e2e_formal telemetry
   train_b0.py                    baseline training CLI
   train_egostitch.py             auto-sized DDP EgoStitch e2e training worker
-  e2_pipeline.py                 production orchestrator: pack → train → publish
+  e2_pipeline.py                 production orchestrator: pack → train → publish → test
   score_universe.py              score-once artifact CLI
 hpc/
   run.sh                         direct auto-sized H20 runner (check / B0 + EgoStitch e2e train / score / merge / G1 / G2)
@@ -299,7 +299,7 @@ The required target environment is a container with one or more NVIDIA H20 GPUs.
 over the cached candidate universe. Formal E2
 (B0 V3.1) training runs **only** through `hpc/run.sh train
 configs/b0_v31_breadth_first.yaml`, which drives the production
-`python -m src.e2_pipeline` entry (pack → train → publish, with the 30-epoch DDP train
+`python -m src.e2_pipeline` entry (pack → train → publish → test, with the 30-epoch DDP train
 launched by an auto-detected `accelerate launch --num_processes N` across all visible
 GPUs at the config's pinned `runtime.token_budget`); direct
 `python -m src.train_b0 --max-steps N` is debug-only. `B0-alt` no longer has a training
@@ -312,8 +312,8 @@ that exact hardware shape. There is no job scheduler (e.g. Slurm).
 **EgoStitch e2e training runs through the same `hpc/run.sh train` branch as the
 baselines**, over the five active trained arms (`full`, `f_only`, `p0`, `no_l_rel`,
 `row_layernorm`). It uses the auto-detected multi-GPU orchestrator and
-`src.train_egostitch`, runs `pack → train → publish`, trains on train positives outside
-V_val, validates on the V_val split, and may not open the held-out test path.
+`src.train_egostitch`, runs `pack → train → publish → test`, trains on train positives outside
+V_val, and validates on V_val. Validation-only sweeps add `--skip-test` and may not open held-out test.
 
 ```bash
 hpc/run.sh train configs/egostitch_e2e_v3_full_breadth_first.yaml \

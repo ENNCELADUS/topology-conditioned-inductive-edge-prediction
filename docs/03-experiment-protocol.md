@@ -1,7 +1,6 @@
 # Experiment Protocol: Topology-Conditioned Inductive Edge Prediction
 
-**Status (2026-08-13):** current forward protocol and selected evidence. Method
-selection remains open. Historical gates are archived by reference rather than repeated.
+**Status (2026-08-27):** current forward protocol and selected evidence. Method selection remains open; historical gates are archived by reference rather than repeated.
 
 ## 1. Locked task contract
 
@@ -57,25 +56,26 @@ engineering validity, and the scientific verdict are reported separately.
   region: cross-boundary edges train; only V_val-internal pairs are withheld, never fully inductive, unlike test.
 - Pairwise metrics use the fixed benchmark test-pair artifact; AUROC and AUPRC are threshold-free;
   Accuracy, F1, and MCC use probability 0.5 on calibrated logits (shifted by minus the selected threshold).
-- The single fixed threshold selects on the V_val 20--200-node sampled-set pair union. Across every
-  atomic logit tie-group boundary, minimize `D_RD` (macro over size buckets of mean `|log RD|`;
-  empty-prediction candidates are +inf); within its paired-bootstrap 1-SE set, minimize `D_shape`
-  (mean log degree/clustering/spectral MMD ratio), larger-threshold tie break. Freeze before test.
+- The single fixed threshold selects on the V_val 20--200-node sampled-set pair union. Define
+  `D_RD(t)` as the size-bucket macro-average of mean `|log RD|`; among finite atomic candidates, let
+  `t_min=argmin_t D_RD(t)` and retain exactly those with `D_RD(t) <= D_RD(t_min) + SE_t`, where
+  `SE_t` is the size-stratified paired-bootstrap SE of the difference. Minimize
+  `D_shape=(1/3) sum_s log(max(r_s(t), epsilon))`, `epsilon=1e-12`, then break ties
+  toward the larger threshold; empty-prediction candidates have `D_RD=+inf`. Freeze before test.
 - Test topology scores only its sampled-set pair union plus support-only rows for full grounding;
   the frozen threshold replays unchanged as the one reported operating point (self-loops included).
 
 ### 2.3 Required metrics
 
 Report edge and topology metrics together. Each fixed or diagnostic topology result has five numbers:
-
 1. BFS-macro graph similarity (GS, edge-set Dice/F1; higher is better);
 2. BFS-macro relative density (RD; closer to 1 is better);
 3. degree-MMD ratio (lower is better);
 4. clustering-MMD ratio (lower is better);
 5. spectral-MMD ratio (lower is better).
 
-The v3 test protocol reports BFS-macro GS/RD only; global-simple rows are legacy v2 evidence.
-Never aggregate the three MMD ratios or call an MMD aggregate “graph similarity.” Descriptors retain self-loops;
+The v6 test protocol reports exactly one V_val-selected threshold with all five numbers above.
+Never call the three MMD ratios or their shape objective “graph similarity.” Descriptors retain self-loops;
 the MMD denominator is the deterministic real-vs-real floor, so ratio 1 is that floor.
 Detailed edge tables also retain ECE, Brier score, class balance, uncertain-negative
 disclosure, and the completed easy, hard, degree-corrected, full-universe, and PA-null

@@ -6,6 +6,7 @@ removal of ``eval.classification_only`` (uniform topology-aware validation),
 and its sweep ``output_dir``.
 """
 
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -23,17 +24,33 @@ _BASE_CONFIGS = {
     "kd_gram": _REPO_ROOT / "configs" / "b1_kd_gram_breadth_first.yaml",
     "kd_rep": _REPO_ROOT / "configs" / "b1_kd_rep_breadth_first.yaml",
 }
-_WEIGHT_TAGS = ("w0p01", "w0p1", "w1", "w10", "w100")
-EXPECTED_STEMS = frozenset(
-    [f"{arm}_{tag}" for arm in _BASE_CONFIGS for tag in _WEIGHT_TAGS]
-    + ["kd_rank_wr0p1_wd10", "kd_rank_wr0p1_wd1", "kd_rank_wr1_wd0p1", "kd_rank_wr0p01_wd10"]
-)
-
-
-def _arm_prefix(stem: str) -> str:
-    matches = [arm for arm in _BASE_CONFIGS if stem.startswith(f"{arm}_")]
-    assert len(matches) == 1, f"{stem} does not map to exactly one base arm"
-    return matches[0]
+EXPECTED_SWEEPS: dict[str, tuple[str, dict[str, float]]] = {
+    "kd_logit_w0p01": ("kd_logit", {"w_logit": 0.01}),
+    "kd_logit_w0p1": ("kd_logit", {"w_logit": 0.1}),
+    "kd_logit_w1": ("kd_logit", {"w_logit": 1.0}),
+    "kd_logit_w10": ("kd_logit", {"w_logit": 10.0}),
+    "kd_logit_w100": ("kd_logit", {"w_logit": 100.0}),
+    "kd_rank_w0p01": ("kd_rank", {"w_rank": 0.01, "w_dist": 0.01}),
+    "kd_rank_w0p1": ("kd_rank", {"w_rank": 0.1, "w_dist": 0.1}),
+    "kd_rank_w1": ("kd_rank", {"w_rank": 1.0, "w_dist": 1.0}),
+    "kd_rank_w10": ("kd_rank", {"w_rank": 10.0, "w_dist": 10.0}),
+    "kd_rank_w100": ("kd_rank", {"w_rank": 100.0, "w_dist": 100.0}),
+    "kd_rank_wr0p1_wd10": ("kd_rank", {"w_rank": 0.1, "w_dist": 10.0}),
+    "kd_rank_wr0p1_wd1": ("kd_rank", {"w_rank": 0.1, "w_dist": 1.0}),
+    "kd_rank_wr1_wd0p1": ("kd_rank", {"w_rank": 1.0, "w_dist": 0.1}),
+    "kd_rank_wr0p01_wd10": ("kd_rank", {"w_rank": 0.01, "w_dist": 10.0}),
+    "kd_gram_w0p01": ("kd_gram", {"w_gram": 0.01}),
+    "kd_gram_w0p1": ("kd_gram", {"w_gram": 0.1}),
+    "kd_gram_w1": ("kd_gram", {"w_gram": 1.0}),
+    "kd_gram_w10": ("kd_gram", {"w_gram": 10.0}),
+    "kd_gram_w100": ("kd_gram", {"w_gram": 100.0}),
+    "kd_rep_w0p01": ("kd_rep", {"w_rep": 0.01}),
+    "kd_rep_w0p1": ("kd_rep", {"w_rep": 0.1}),
+    "kd_rep_w1": ("kd_rep", {"w_rep": 1.0}),
+    "kd_rep_w10": ("kd_rep", {"w_rep": 10.0}),
+    "kd_rep_w100": ("kd_rep", {"w_rep": 100.0}),
+}
+EXPECTED_STEMS = frozenset(EXPECTED_SWEEPS)
 
 
 def _load(path: Path) -> dict[str, object]:
@@ -48,7 +65,7 @@ def test_all_expected_sweep_stems_exist_exactly() -> None:
 
 @pytest.mark.parametrize("stem", sorted(EXPECTED_STEMS))
 def test_sweep_config_differs_from_base_only_in_distill_eval_and_output_dir(stem: str) -> None:
-    arm = _arm_prefix(stem)
+    arm, expected_weights = EXPECTED_SWEEPS[stem]
     sweep = _load(_SWEEP_DIR / f"{stem}.yaml")
     base = _load(_BASE_CONFIGS[arm])
 
@@ -64,6 +81,12 @@ def test_sweep_config_differs_from_base_only_in_distill_eval_and_output_dir(stem
         assert "classification_only" in base_eval
     assert sweep["eval"] == expected_eval
 
+    base_distill_mapping = cast(dict[str, object], base["distill"])
+    expected_distill_mapping = base_distill_mapping | expected_weights
+    assert sweep["distill"] == expected_distill_mapping
+
+    base_distill = DistillConfig.from_mapping(base_distill_mapping)
     distill = DistillConfig.from_mapping(cast(dict[str, object], sweep["distill"]))
     assert distill.arm == arm
+    assert distill == replace(base_distill, **expected_weights)
     assert sweep["output_dir"] == f"outputs/b1_row_kd_hpo/{stem}"

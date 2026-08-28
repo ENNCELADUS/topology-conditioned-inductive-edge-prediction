@@ -56,7 +56,7 @@ Use `-n0` when debugging — xdist swallows breakpoints. Tests in one file share
 GPU work runs only in the H20 container via `hpc/run.sh`
 (`check | train | score | test | merge | g1 | g2`); world size and score shards are
 auto-detected from visible GPUs, and there is no scheduler. `train` runs the held-out
-test protocol automatically after publish (skipped by `--max-steps` debug runs); `test`
+test protocol automatically after publish unless `--max-steps` or `--skip-test` is passed; `test`
 is also callable directly for the two scoring-time controls, which have no training run
 of their own. Config keys change meaning per `model.family`; direct `python -m
 src.train_b0` is debug-only. Runbook: `hpc/README.md` and the `hpc-execution` skill.
@@ -142,6 +142,6 @@ fail-closed.
 - Packed-feature manifests depend on `index.json` insertion order; sorting or reserializing it
   invalidates the pack. Its F0 cache holds fp32 means taken before bf16 conversion, so it is not
   reproducible from the shards.
-- Density-matched thresholds are computed on non-self rows against a self-loop-stripped reference edge
+- Legacy G1 only: density-matched thresholds use non-self rows and a self-loop-stripped reference edge
   count, yet self-pairs still assemble as self-loops at that threshold (`g1_hardened_e2.py`); changing
   either side moves every operating point.

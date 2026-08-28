@@ -30,13 +30,14 @@ import argparse
 import json
 import logging
 from collections.abc import Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
+from sklearn.metrics import average_precision_score, roc_auc_score
 
-from src.eval.edge_metrics import compute_edge_metrics
+from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.score_universe import load_scores, validate_artifact_precision
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,7 @@ def _shifted_probs(logit: NDArray[np.floating], logit_shift: float) -> NDArray[n
 
 def _stratum_metrics(
     labels: NDArray[np.int64],
+    rank_scores: NDArray[np.float64],
     probs: NDArray[np.float64],
     *,
     threshold: float,
@@ -91,7 +93,32 @@ def _stratum_metrics(
             "%s stratum: single-class (%d/%d positive); metrics undefined", name, n_pos, n_rows
         )
         return None
-    return asdict(compute_edge_metrics(labels, probs, threshold=threshold, ece_bins=ece_bins))
+    return asdict(
+        _metrics_with_rank_scores(
+            labels,
+            rank_scores,
+            probs,
+            threshold=threshold,
+            ece_bins=ece_bins,
+        )
+    )
+
+
+def _metrics_with_rank_scores(
+    labels: NDArray[np.int64],
+    rank_scores: NDArray[np.float64],
+    probs: NDArray[np.float64],
+    *,
+    threshold: float,
+    ece_bins: int,
+) -> EdgeMetrics:
+    """Use raw logits for ranking and calibrated probabilities otherwise."""
+    metrics = compute_edge_metrics(labels, probs, threshold=threshold, ece_bins=ece_bins)
+    return replace(
+        metrics,
+        auroc=float(roc_auc_score(labels, rank_scores)),
+        auprc=float(average_precision_score(labels, rank_scores)),
+    )
 
 
 def report_edge_metrics(
@@ -124,7 +151,8 @@ def report_edge_metrics(
         logit_shift: Added to every raw logit before the sigmoid, so calibration
             (e.g. shifting a validation-selected threshold to probability 0.5)
             is applied here rather than by rescoring; ECE/Brier then describe
-            the calibrated, deployed probabilities.
+            the calibrated, deployed probabilities. AUROC/AUPRC use raw logits
+            and therefore remain invariant to the shift.
 
     Returns:
         A JSON-serializable dict carrying the self-loop-including ``metrics``
@@ -170,10 +198,17 @@ def report_edge_metrics(
         )
 
     labels64 = labels.astype(np.int64)
+    rank_scores = artifact.logit.astype(np.float64)
     probs = _shifted_probs(artifact.logit, logit_shift)
     is_self = artifact.u_idx == artifact.v_idx
 
-    metrics = compute_edge_metrics(labels64, probs, threshold=threshold, ece_bins=ece_bins)
+    metrics = _metrics_with_rank_scores(
+        labels64,
+        rank_scores,
+        probs,
+        threshold=threshold,
+        ece_bins=ece_bins,
+    )
     logger.info(
         "%s: %d rows (%d self), AUROC %.6f AUPRC %.6f ECE %.6f",
         scores_path,
@@ -209,6 +244,7 @@ def report_edge_metrics(
     # headline metrics above.
     report["metrics_self"] = _stratum_metrics(
         labels64[is_self],
+        rank_scores[is_self],
         probs[is_self],
         threshold=threshold,
         ece_bins=ece_bins,
@@ -216,6 +252,7 @@ def report_edge_metrics(
     )
     report["metrics_non_self"] = _stratum_metrics(
         labels64[~is_self],
+        rank_scores[~is_self],
         probs[~is_self],
         threshold=threshold,
         ece_bins=ece_bins,

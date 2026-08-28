@@ -2,10 +2,10 @@
 
 This directory is the only HPC execution layer. It runs the implemented baseline, gate,
 and EgoStitch CLIs directly inside the pinned container; there is no scheduler, job
-array, or cluster-specific environment file. One tracked runner:
+array, or cluster-specific environment file. It has one launcher plus one thin driver:
 
-- `hpc/run.sh` — the single launcher: baselines, EgoStitch E2E training, held-out
-  testing, cached scoring, and the G1/G2 gates all go through it.
+- `hpc/run.sh` is the single launcher for training, testing, scoring, and gates.
+- `hpc/sweep_kd_hpo.sh` partitions KD lanes through `run.sh`; it never launches training.
 
 Formal E2 training (`B0`, `configs/b0_v31_breadth_first.yaml`) runs **only** through
 `hpc/run.sh train configs/b0_v31_breadth_first.yaml`, the runner's single `train` branch,
@@ -58,11 +58,11 @@ to the exact count in their retained artifacts.
 
 Do not store the SSH password in this repository. The runner fails before executing any
 command unless at least one visible GPU is named `NVIDIA H20` or `NVIDIA H20-3e`, the fixed paths exist, and
-both benchmark and feature directories are present. The runner automatically exports
-all detected GPU indices. `score` is a thin passthrough to `python -m src.score_fanout`,
+both benchmark and feature directories are present. With no preset `CUDA_VISIBLE_DEVICES`, the
+runner exports all detected GPU indices; otherwise it preserves the mask. `score` passes through to `src.score_fanout`,
 which owns GPU-count detection, `--device cuda --amp bf16`, sharding, and the strict merge;
 `merge`, `g1`, and `g2` are single-process. `test` is a thin passthrough to
-`python -m src.eval.test_protocol`. `train` uses all visible GPUs via a matching
+`python -m src.eval.test_protocol`. `train` uses the resulting GPU set via a matching
 Accelerate world size. G3 is a direct single-process cached-score analysis command
 outside `run.sh`.
 
@@ -79,14 +79,10 @@ hpc/run.sh check
 The check is fast environment/data validation only (uv, GPUs, benchmark, feature
 shapes); test suites run locally, never as an HPC recheck.
 
-Every arm's formal run is now one sequence, not train followed by separate manual
-scoring commands: `hpc/run.sh train <config> ...` packs, trains, publishes, and then
-selects on val_topology, scores test/test_topology, and writes the combined `test_report.json` before
-the command returns. Nothing further is required to get an arm's held-out numbers.
-`--skip-test` publishes without the held-out stage (profile records `"test": "skipped"`);
-sweep points use it so only per-arm winners open test. `hpc/sweep_kd_hpo.sh <lane 0|1>`
-runs the KD loss-weight grid serially per lane, pinning `CUDA_VISIBLE_DEVICES` to `0,1`
-or `2,3` (run.sh honors a pre-set mask) — launch each lane under nohup, kill by PID.
+`hpc/run.sh train <config> ...` packs, trains, publishes, selects on val_topology, and writes
+the combined `test_report.json`; `--skip-test` publishes with `"test": "skipped"`, so sweep
+points reserve held-out test for winners. `hpc/sweep_kd_hpo.sh <lane 0|1>` runs lanes on GPUs
+`0,1` and `2,3`; the pipeline locks shared-pack warm-up. Record the nohup process group.
 
 Only `egostitch_e2e` is ledgered against repeat scoring. Validation threshold selection is
 non-held-out; its two held-out passes share one ledger epoch and report the single validation-fixed

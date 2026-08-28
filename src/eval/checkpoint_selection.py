@@ -71,7 +71,7 @@ def select_checkpoint(
         The winning candidate, or `None` for an empty sequence.
 
     Raises:
-        ValueError: If any candidate carries a non-finite metric.
+        ValueError: If any candidate carries a non-finite metric or negative RD.
     """
     if not candidates:
         return None
@@ -91,6 +91,8 @@ def select_checkpoint(
     )
     if not np.all(np.isfinite(raw)):
         raise ValueError("non-finite checkpoint-selection metric")
+    if np.any(raw[:, 2] < 0):
+        raise ValueError("checkpoint-selection RD must be non-negative")
     with np.errstate(divide="ignore"):
         rd_criterion = np.abs(np.log(raw[:, 2]))
     columns = np.column_stack(

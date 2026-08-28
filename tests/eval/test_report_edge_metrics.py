@@ -160,6 +160,25 @@ class TestLogitShiftCalibration:
         assert shifted["brier"] != pytest.approx(unshifted["brier"])
         assert shifted["ece"] != pytest.approx(unshifted["ece"])
 
+    def test_ranking_metrics_survive_shifted_sigmoid_saturation(self, tmp_path: Path) -> None:
+        """AUROC/AUPRC use raw logits even when shifted probabilities all round to one."""
+        path = tmp_path / "candidate.npz"
+        _write_artifact(
+            path,
+            pairs_source="candidate",
+            labels=np.array([0, 1, 0, 1], dtype=np.int8),
+            logits=np.array([35.0, 36.0, 37.0, 38.0], dtype=np.float32),
+        )
+
+        unshifted = report_edge_metrics(path)["metrics"]
+        saturated = report_edge_metrics(path, logit_shift=10.0)["metrics"]
+
+        assert isinstance(unshifted, dict) and isinstance(saturated, dict)
+        assert saturated["auroc"] == pytest.approx(0.75)
+        assert saturated["auprc"] == pytest.approx(5 / 6)
+        assert saturated["auroc"] == pytest.approx(unshifted["auroc"])
+        assert saturated["auprc"] == pytest.approx(unshifted["auprc"])
+
     def test_logit_shift_is_echoed_beside_threshold(self, tmp_path: Path) -> None:
         path = tmp_path / "test.npz"
         _write_artifact(path)

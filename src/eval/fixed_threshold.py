@@ -43,6 +43,17 @@ class _LocalSample:
     truth: NDArray[np.bool_]
 
 
+@dataclass
+class _MMDSizeState:
+    predicted: list[NDArray[np.float64]]
+    reference: list[NDArray[np.float64]]
+    predicted_kernel: NDArray[np.float64]
+    cross_kernel: NDArray[np.float64]
+    predicted_sum: float
+    reference_sum: float
+    cross_sum: float
+
+
 def _score_map(
     pairs: Sequence[tuple[str, str]], logits: NDArray[np.float64]
 ) -> dict[tuple[str, str], float]:
@@ -151,11 +162,12 @@ def _stratified_paired_se_curve(
 ) -> NDArray[np.float64]:
     """Exact infinite-bootstrap SE of the paired per-sample ``|log RD|`` difference.
 
-    Paired resampling inside size strata, candidate minus `reference_threshold`.
+    Paired resampling inside size strata, candidate minus `reference_threshold`,
+    with equal weight for every size stratum to match the macro objective.
     """
-    total = len(samples)
+    sizes = sorted({sample.size for sample in samples})
     variance = np.zeros(thresholds.size, dtype=np.float64)
-    for size in sorted({sample.size for sample in samples}):
+    for size in sizes:
         stratum = [sample for sample in samples if sample.size == size]
         sum_diff = np.zeros(thresholds.size, dtype=np.float64)
         sum_sq_diff = np.zeros(thresholds.size, dtype=np.float64)
@@ -167,7 +179,7 @@ def _stratified_paired_se_curve(
             sum_sq_diff += differences * differences
         count = len(stratum)
         population_variance = np.maximum(sum_sq_diff / count - (sum_diff / count) ** 2, 0.0)
-        weight = count / total
+        weight = 1.0 / len(sizes)
         variance += weight * weight * population_variance / count
     return np.sqrt(variance)
 
@@ -242,6 +254,169 @@ def _mmd_ratio_for_statistic(
         )
     )
     return raw / max(reference_mmd2[statistic], config.reference_epsilon)
+
+
+def _normalized_descriptor(values: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Match ``graph_metrics.mmd_squared`` histogram normalization exactly."""
+    return values / (float(np.sum(values)) + 1e-6)
+
+
+def _descriptor_kernel(
+    left: NDArray[np.float64], right: NDArray[np.float64], sigma: float
+) -> float:
+    """Match the canonical Gaussian total-variation MMD kernel exactly."""
+    support_size = max(len(left), len(right))
+    left_values = np.pad(left, (0, support_size - len(left)))
+    right_values = np.pad(right, (0, support_size - len(right)))
+    distance = float(np.abs(left_values - right_values).sum() / 2.0)
+    return float(np.exp(-(distance * distance) / (2.0 * sigma * sigma)))
+
+
+def _initialize_mmd_state(
+    predicted: list[NDArray[np.float64]],
+    reference: list[NDArray[np.float64]],
+    config: MMDConfig,
+) -> _MMDSizeState:
+    predicted_kernel = np.array(
+        [[_descriptor_kernel(x, y, config.sigma) for y in predicted] for x in predicted],
+        dtype=np.float64,
+    )
+    cross_kernel = np.array(
+        [[_descriptor_kernel(x, y, config.sigma) for y in reference] for x in predicted],
+        dtype=np.float64,
+    )
+    reference_sum = sum(
+        _descriptor_kernel(x, y, config.sigma) for x in reference for y in reference
+    )
+    return _MMDSizeState(
+        predicted=predicted,
+        reference=reference,
+        predicted_kernel=predicted_kernel,
+        cross_kernel=cross_kernel,
+        predicted_sum=sum(float(value) for row in predicted_kernel for value in row),
+        reference_sum=float(reference_sum),
+        cross_sum=sum(float(value) for row in cross_kernel for value in row),
+    )
+
+
+def _update_mmd_state(
+    state: _MMDSizeState,
+    updates: dict[int, NDArray[np.float64]],
+    config: MMDConfig,
+) -> None:
+    """Update biased MMD kernel sums after descriptors change in one size bucket."""
+    for index in sorted(updates):
+        descriptor = updates[index]
+        state.predicted[index] = descriptor
+        for other_index, other in enumerate(state.predicted):
+            if other_index == index:
+                continue
+            value = _descriptor_kernel(descriptor, other, config.sigma)
+            previous = float(state.predicted_kernel[index, other_index])
+            state.predicted_sum += 2.0 * (value - previous)
+            state.predicted_kernel[index, other_index] = value
+            state.predicted_kernel[other_index, index] = value
+        for reference_index, reference in enumerate(state.reference):
+            value = _descriptor_kernel(descriptor, reference, config.sigma)
+            previous = float(state.cross_kernel[index, reference_index])
+            state.cross_sum += value - previous
+            state.cross_kernel[index, reference_index] = value
+
+
+def _mmd_ratio_from_states(
+    states: dict[int, _MMDSizeState], denominator: float, config: MMDConfig
+) -> float:
+    raw_by_size = []
+    for state in states.values():
+        predicted_count = len(state.predicted)
+        reference_count = len(state.reference)
+        raw_by_size.append(
+            state.predicted_sum / (predicted_count * predicted_count)
+            + state.reference_sum / (reference_count * reference_count)
+            - 2.0 * state.cross_sum / (predicted_count * reference_count)
+        )
+    return float(np.mean(raw_by_size)) / max(denominator, config.reference_epsilon)
+
+
+def _incremental_mmd_ratio_curve(
+    samples: tuple[_LocalSample, ...],
+    thresholds: NDArray[np.float64],
+    feasible_indices: NDArray[np.intp],
+    reference_by_stat_size: dict[str, dict[int, list[NDArray[np.float64]]]],
+    reference_mmd2: dict[str, float],
+    config: MMDConfig,
+) -> NDArray[np.float64]:
+    """Return exact MMD ratios while admitting each threshold tie group once."""
+    sizes = list(dict.fromkeys(sample.size for sample in samples))
+    sample_indices_by_size: dict[int, dict[int, int]] = {size: {} for size in sizes}
+    graphs: list[nx.Graph] = []
+    event_order: list[NDArray[np.intp]] = []
+    for sample_index, sample in enumerate(samples):
+        sample_indices_by_size[sample.size][sample_index] = len(
+            sample_indices_by_size[sample.size]
+        )
+        graph = nx.Graph()
+        graph.add_nodes_from(sample.nodes)
+        graphs.append(graph)
+        event_order.append(np.argsort(sample.logits, kind="stable")[::-1])
+
+    event_offsets = np.zeros(len(samples), dtype=np.intp)
+
+    def admit_until(threshold: float) -> set[int]:
+        touched: set[int] = set()
+        for sample_index, sample in enumerate(samples):
+            order = event_order[sample_index]
+            offset = int(event_offsets[sample_index])
+            while offset < order.size and sample.logits[order[offset]] >= threshold:
+                graphs[sample_index].add_edge(*sample.pairs[int(order[offset])])
+                offset += 1
+                touched.add(sample_index)
+            event_offsets[sample_index] = offset
+        return touched
+
+    first_feasible = int(feasible_indices[0])
+    admit_until(float(thresholds[first_feasible]))
+
+    states_by_stat: dict[str, dict[int, _MMDSizeState]] = {
+        statistic: {} for statistic in STATISTICS
+    }
+    for statistic in STATISTICS:
+        for size in sizes:
+            sample_indices = sample_indices_by_size[size]
+            predicted = [
+                _normalized_descriptor(_descriptor(graphs[index], statistic))
+                for index in sample_indices
+            ]
+            reference = [
+                _normalized_descriptor(values)
+                for values in reference_by_stat_size[statistic][size]
+            ]
+            states_by_stat[statistic][size] = _initialize_mmd_state(
+                predicted, reference, config
+            )
+
+    ratios = np.empty((feasible_indices.size, len(STATISTICS)), dtype=np.float64)
+    for statistic_index, statistic in enumerate(STATISTICS):
+        ratios[0, statistic_index] = _mmd_ratio_from_states(
+            states_by_stat[statistic], reference_mmd2[statistic], config
+        )
+    for position, feasible_index_value in enumerate(feasible_indices[1:], start=1):
+        feasible_index = int(feasible_index_value)
+        touched = admit_until(float(thresholds[feasible_index]))
+        for statistic_index, statistic in enumerate(STATISTICS):
+            updates_by_size: dict[int, dict[int, NDArray[np.float64]]] = {}
+            for sample_index in sorted(touched):
+                size = samples[sample_index].size
+                local_index = sample_indices_by_size[size][sample_index]
+                updates_by_size.setdefault(size, {})[local_index] = _normalized_descriptor(
+                    _descriptor(graphs[sample_index], statistic)
+                )
+            for size, updates in updates_by_size.items():
+                _update_mmd_state(states_by_stat[statistic][size], updates, config)
+            ratios[position, statistic_index] = _mmd_ratio_from_states(
+                states_by_stat[statistic], reference_mmd2[statistic], config
+            )
+    return ratios
 
 
 def _fixed_predictions(
@@ -340,22 +515,13 @@ def select_fixed_threshold(
     feasible_indices = finite_indices[feasible_local]
 
     reference_by_stat_size, reference_mmd2 = _precompute_reference_descriptors(samples, config)
-    ratios = np.array(
-        [
-            [
-                _mmd_ratio_for_statistic(
-                    samples,
-                    float(thresholds[index]),
-                    statistic,
-                    reference_by_stat_size,
-                    reference_mmd2,
-                    config,
-                )
-                for statistic in STATISTICS
-            ]
-            for index in feasible_indices
-        ],
-        dtype=np.float64,
+    ratios = _incremental_mmd_ratio_curve(
+        samples,
+        thresholds,
+        feasible_indices,
+        reference_by_stat_size,
+        reference_mmd2,
+        config,
     )
     if not np.isfinite(ratios).all():
         raise ValueError("validation topology MMD ratios must be finite")

@@ -7,8 +7,9 @@
 # Two GPUs per run pins world_size=2 for comparability with the original KD runs.
 #
 # The operator launches each lane with nohup from the H20 checkout root, e.g.:
-#   nohup hpc/sweep_kd_hpo.sh 0 > outputs/b1_row_kd_hpo/lane0.nohup 2>&1 &
-# Kill a lane by its PID only (kill <pid>), never pkill -f.
+#   mkdir -p outputs/b1_row_kd_hpo
+#   nohup setsid bash -c 'echo $$ > outputs/b1_row_kd_hpo/lane0.pgid; exec hpc/sweep_kd_hpo.sh 0' > outputs/b1_row_kd_hpo/lane0.nohup 2>&1 &
+# Stop the lane process group with: kill -- -"$(cat outputs/b1_row_kd_hpo/lane0.pgid)"
 #
 # Every run is `hpc/run.sh train <cfg> --skip-test`: sweep selection is
 # V_val-only; the held-out test protocol is spent later on per-arm winners.
@@ -29,7 +30,10 @@ SWEEP_ROOT="outputs/b1_row_kd_hpo"
 LOG_DIR="${SWEEP_ROOT}/logs"
 mkdir -p "${LOG_DIR}"
 
-mapfile -t CONFIGS < <(printf '%s\n' configs/sweep/b1_kd_hpo/*.yaml | sort)
+CONFIGS=()
+while IFS= read -r cfg; do
+  CONFIGS+=("${cfg}")
+done < <(printf '%s\n' configs/sweep/b1_kd_hpo/*.yaml | sort)
 [[ -f "${CONFIGS[0]:-}" ]] || { echo "ERROR: no sweep configs found" >&2; exit 1; }
 
 index=0
@@ -39,6 +43,10 @@ for cfg in "${CONFIGS[@]}"; do
   (( lane_of_cfg == LANE )) || continue
   stem="$(basename "${cfg}" .yaml)"
   out_dir="${SWEEP_ROOT}/${stem}"
+  if [[ -f "${out_dir}/failure.json" ]]; then
+    echo "ERROR: lane ${LANE} aborting at ${stem} (failure.json exists)" >&2
+    exit 1
+  fi
   if [[ -f "${out_dir}/complete.json" ]]; then
     echo "lane ${LANE}: skipping ${stem} (complete.json exists)"
     continue
