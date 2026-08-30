@@ -3,7 +3,8 @@
 Every YAML in ``configs/sweep/b1_kd_hpo/`` must be a copy of its base arm
 config differing only in the ``distill:`` weight/temperature values, the
 removal of ``eval.classification_only`` (uniform topology-aware validation),
-and its sweep ``output_dir``.
+and its sweep ``output_dir``. ``kd_control`` has no ``distill:`` section and
+differs from its base in ``output_dir`` alone.
 """
 
 from dataclasses import replace
@@ -23,6 +24,7 @@ _BASE_CONFIGS = {
     "kd_rank": _REPO_ROOT / "configs" / "b1_kd_rank_breadth_first.yaml",
     "kd_gram": _REPO_ROOT / "configs" / "b1_kd_gram_breadth_first.yaml",
     "kd_rep": _REPO_ROOT / "configs" / "b1_kd_rep_breadth_first.yaml",
+    "kd_control": _REPO_ROOT / "configs" / "b1_kd_control_breadth_first.yaml",
 }
 EXPECTED_SWEEPS: dict[str, tuple[str, dict[str, float]]] = {
     "kd_logit_w0p01": ("kd_logit", {"w_logit": 0.01}),
@@ -49,6 +51,7 @@ EXPECTED_SWEEPS: dict[str, tuple[str, dict[str, float]]] = {
     "kd_rep_w1": ("kd_rep", {"w_rep": 1.0}),
     "kd_rep_w10": ("kd_rep", {"w_rep": 10.0}),
     "kd_rep_w100": ("kd_rep", {"w_rep": 100.0}),
+    "kd_control": ("kd_control", {}),
 }
 EXPECTED_STEMS = frozenset(EXPECTED_SWEEPS)
 
@@ -75,18 +78,22 @@ def test_sweep_config_differs_from_base_only_in_distill_eval_and_output_dir(stem
 
     base_eval = cast(dict[str, object], base["eval"])
     expected_eval = {key: value for key, value in base_eval.items() if key != "classification_only"}
-    if arm == "kd_logit":
-        assert expected_eval == base_eval  # kd_logit's base eval stays byte-identical
+    if arm in {"kd_logit", "kd_control"}:
+        assert expected_eval == base_eval  # these base evals stay byte-identical
     else:
         assert "classification_only" in base_eval
     assert sweep["eval"] == expected_eval
 
-    base_distill_mapping = cast(dict[str, object], base["distill"])
-    expected_distill_mapping = base_distill_mapping | expected_weights
-    assert sweep["distill"] == expected_distill_mapping
+    if arm == "kd_control":
+        assert "distill" not in base
+        assert "distill" not in sweep
+    else:
+        base_distill_mapping = cast(dict[str, object], base["distill"])
+        expected_distill_mapping = base_distill_mapping | expected_weights
+        assert sweep["distill"] == expected_distill_mapping
 
-    base_distill = DistillConfig.from_mapping(base_distill_mapping)
-    distill = DistillConfig.from_mapping(cast(dict[str, object], sweep["distill"]))
-    assert distill.arm == arm
-    assert distill == replace(base_distill, **expected_weights)
+        base_distill = DistillConfig.from_mapping(base_distill_mapping)
+        distill = DistillConfig.from_mapping(cast(dict[str, object], sweep["distill"]))
+        assert distill.arm == arm
+        assert distill == replace(base_distill, **expected_weights)
     assert sweep["output_dir"] == f"outputs/b1_row_kd_hpo/{stem}"
