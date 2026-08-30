@@ -14,8 +14,8 @@ summary, refuse-keep), AIDE (debug-depth cap), Cerebras (single-experiment disci
 - **Verdict:** strict no-regression, frozen code only: keep iff ≥1 topology metric strictly
   improves vs the incumbent and none degrades. Zero-width bands by default (fixed seed, no
   replicates); optional `bands.json` widens tolerances — written only by the human.
-- **Trial:** one full grid-protocol run — 25 epochs, seed 0, `--skip-test`, topology-aware
-  selection every epoch — sequential, auto world size, one container; grid winners = incumbents.
+- **Trial:** one grid-protocol run — 25 epochs, seed 0, `--skip-test`, auto world size, topology
+  cadence `eval.topology_every: 2` (+ final; cls metrics every epoch); grid winners = incumbents.
 - **Substrate:** local Claude Code operator via git + ssh. All loop state lives in git plus the
   ledger; any fresh session cold-starts from files alone.
 - **Scope:** four campaigns — kd_logit, kd_rank, kd_gram, kd_rep — prioritized by grid results.

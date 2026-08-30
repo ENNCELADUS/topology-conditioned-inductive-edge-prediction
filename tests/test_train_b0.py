@@ -59,6 +59,7 @@ from src.train_b0 import (
     _run_probe_mode,
     _run_rank_symmetric,
     _run_timed_epoch_probe,
+    _topology_due,
     _topology_from_metrics_row,
     _training_rows,
     _val_cls_rows,
@@ -257,6 +258,33 @@ class TestLoadConfig:
         assert cfg.seed == 47
         assert cfg.output_dir == Path("outputs/b0_alt")
         assert cfg.mixed_precision == "no"
+
+    def test_topology_every_defaults_to_one(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "cfg.yaml"
+        _write_yaml_config(config_path)
+
+        assert load_config(config_path).eval.topology_every == 1
+
+    def test_topology_every_accepts_two(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "cfg.yaml"
+        _write_yaml_config(config_path, {"eval.topology_every": 2})
+
+        assert load_config(config_path).eval.topology_every == 2
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_topology_every_rejects_non_positive(self, tmp_path: Path, value: int) -> None:
+        config_path = tmp_path / "cfg.yaml"
+        _write_yaml_config(config_path, {"eval.topology_every": value})
+
+        with pytest.raises(ValueError, match="eval.topology_every must be >= 1"):
+            load_config(config_path)
+
+    def test_topology_every_rejects_non_int(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "cfg.yaml"
+        _write_yaml_config(config_path, {"eval.topology_every": 1.5})
+
+        with pytest.raises(ValueError, match="eval.topology_every"):
+            load_config(config_path)
 
     def test_loads_four_h20_runtime_config(self, tmp_path: Path) -> None:
         config_path = tmp_path / "cfg.yaml"
@@ -2003,6 +2031,90 @@ def test_ddp_loop_records_counterfactual_stop_but_runs_all_epochs(tmp_path: Path
     assert len(result.history) == 4
     assert [entry["epoch"] for entry in result.history] == [1, 2, 3, 4]
     assert len(cast(list[object], result.runtime_profile["per_epoch"])) == 4
+
+
+def test_topology_due_gates_epochs_and_forces_final() -> None:
+    due = [
+        epoch
+        for epoch in range(1, 6)
+        if _topology_due(epoch, epochs=5, topology_every=2, classification_only=False)
+    ]
+    assert due == [2, 4, 5]
+    assert _topology_due(3, epochs=5, topology_every=1, classification_only=False)
+    assert not _topology_due(4, epochs=5, topology_every=2, classification_only=True)
+
+
+def test_ddp_loop_topology_every_skips_rows_and_selects_topology_epochs(tmp_path: Path) -> None:
+    config_path = tmp_path / "cfg.yaml"
+    _write_yaml_config(
+        config_path, {"optim.epochs": 5, "eval.patience": 8, "eval.topology_every": 2}
+    )
+    cfg = load_config(config_path)
+    batch = _loss_batch(1.0, [0, 1, 2, 3])
+    auprc_by_epoch = {1: 0.5, 2: 0.6, 3: 0.99, 4: 0.7, 5: 0.6}
+    gs_by_epoch = {2: 0.5, 4: 0.8, 5: 0.6}
+    epoch_seen = 0
+
+    def next_epoch() -> int:
+        nonlocal epoch_seen
+        epoch_seen += 1
+        return epoch_seen
+
+    def evaluate_topology(
+        model: nn.Module, loader: Iterable[dict[str, torch.Tensor]], accelerator: Accelerator
+    ) -> ValidationOutcome:
+        epoch = next_epoch()
+        assert epoch in gs_by_epoch, f"topology pass ran on non-due epoch {epoch}"
+        return ValidationOutcome(
+            replace(_constant_metrics(), auprc=auprc_by_epoch[epoch]),
+            ValTopologyResult(
+                metrics=TopologyValidationMetrics(
+                    gs=gs_by_epoch[epoch],
+                    rd=1.0,
+                    degree_mmd=0.1,
+                    clustering_mmd=0.1,
+                    spectral_mmd=0.1,
+                ),
+                threshold=0.3,
+            ),
+        )
+
+    def evaluate_cls(
+        model: nn.Module, loader: Iterable[dict[str, torch.Tensor]], accelerator: Accelerator
+    ) -> ValidationOutcome:
+        epoch = next_epoch()
+        assert epoch not in gs_by_epoch, f"cls-only pass ran on due epoch {epoch}"
+        return ValidationOutcome(replace(_constant_metrics(), auprc=auprc_by_epoch[epoch]), None)
+
+    result = train_ddp_loop(
+        _StochasticLossModel(),
+        lambda epoch: [batch],
+        [batch],
+        cfg,
+        Accelerator(cpu=True),
+        warmup_steps=1,
+        artifact_dir=tmp_path / "attempt",
+        evaluate_fn=evaluate_topology,
+        evaluate_cls_fn=evaluate_cls,
+        require_topology=True,
+    )
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "attempt" / "metrics.jsonl").read_text().splitlines()
+    ]
+    topology_keys = {
+        "val_gs_bfs",
+        "val_rd_bfs",
+        "val_degree_mmd_ratio",
+        "val_clustering_mmd_ratio",
+        "val_spectral_mmd_ratio",
+        "val_threshold",
+    }
+    assert [row["epoch"] for row in rows if topology_keys <= row.keys()] == [2, 4, 5]
+    assert [row["epoch"] for row in rows if not (topology_keys & row.keys())] == [1, 3]
+    # Epoch 3 holds the best AUPRC but no topology pass; selection must ignore it.
+    assert result.best_epoch == 4
 
 
 def test_classification_only_ddp_loop_stops_and_selects_by_auprc(tmp_path: Path) -> None:

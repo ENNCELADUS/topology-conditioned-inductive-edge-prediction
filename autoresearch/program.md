@@ -15,7 +15,7 @@ keep/revert input.
 kd_logit, kd_rank, kd_gram, kd_rep — one at a time; order set by the human from grid results.
 Each campaign starts from its arm's grid winner (human-recorded `baseline` ledger row, picked
 from `src.autoresearch.verdict.undominated`). No campaign begins until Phase 0 is complete and the
-human materializes that winner as `configs/autoresearch/<arm>.yaml` and records its baseline row; the operator never invents it.
+human materializes that winner as `configs/autoresearch/<arm>.yaml` (with `eval.topology_every: 2` baked in) and records its baseline row; the operator never invents it.
 
 ## The trial loop
 

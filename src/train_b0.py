@@ -228,12 +228,16 @@ class EvalConfig:
     Attributes:
         patience: Early stop after this many evals without val-AUPRC improvement.
         eval_every: Evaluate every N epochs.
+        topology_every: Run the V_val topology pass only on epochs divisible by
+            N (the final epoch always runs it); classification metrics keep the
+            ``eval_every`` cadence.
         classification_only: Skip topology validation, select the checkpoint by
             validation AUPRC, and stop when ``patience`` is exhausted.
     """
 
     patience: int
     eval_every: int
+    topology_every: int = 1
     classification_only: bool = False
 
 
@@ -726,14 +730,19 @@ def load_config(path: Path) -> Config:
         raise ValueError(f"optim.epochs must be >= 1, got {optim.epochs}")
 
     eval_raw = _as_mapping(_require(raw, "eval", ""), "eval")
-    _check_no_unknown_keys(eval_raw, ("patience", "eval_every", "classification_only"), "eval")
+    _check_no_unknown_keys(
+        eval_raw, ("patience", "eval_every", "topology_every", "classification_only"), "eval"
+    )
     eval_cfg = EvalConfig(
         patience=_as_int(_require(eval_raw, "patience", "eval."), "eval.patience"),
         eval_every=_as_int(_require(eval_raw, "eval_every", "eval."), "eval.eval_every"),
+        topology_every=_as_int(eval_raw.get("topology_every", 1), "eval.topology_every"),
         classification_only=_as_bool(
             eval_raw.get("classification_only", False), "eval.classification_only"
         ),
     )
+    if eval_cfg.topology_every < 1:
+        raise ValueError(f"eval.topology_every must be >= 1, got {eval_cfg.topology_every}")
 
     mixed_precision_raw = _require(raw, "mixed_precision", "")
     # YAML 1.1 parses an unquoted `no` as boolean False; map it back.
@@ -3313,6 +3322,15 @@ def _term_grad_norms(
     return _term_norm(task_loss), _term_norm(kd_loss)
 
 
+def _topology_due(
+    epoch: int, *, epochs: int, topology_every: int, classification_only: bool
+) -> bool:
+    """Whether the V_val topology pass runs at ``epoch``; the final epoch is always due."""
+    if classification_only:
+        return False
+    return epoch % topology_every == 0 or epoch == epochs
+
+
 def train_ddp_loop(
     model: nn.Module,
     train_loader_factory: PackedLoaderFactory,
@@ -3326,6 +3344,7 @@ def train_ddp_loop(
     resume_attempt: Path | None = None,
     schedule_total_steps: int | None = None,
     evaluate_fn: EvaluateFn = _evaluate_distributed,
+    evaluate_cls_fn: EvaluateFn | None = None,
     kd_bank: KDRowBank | None = None,
     require_topology: bool = False,
     val_topology_reference: ValTopologyReference | None = None,
@@ -3333,7 +3352,8 @@ def train_ddp_loop(
     """Run fixed-epoch E2 DDP training and return rank-consistent metrics.
 
     Normally trains exactly ``cfg.optim.epochs`` epochs with a validation after
-    every epoch and records patience counterfactually. When
+    every epoch (the V_val topology pass on the ``eval.topology_every`` cadence)
+    and records patience counterfactually. When
     ``eval.classification_only`` is enabled, patience performs real early stopping
     and checkpoint selection uses validation AUPRC alone. Tail batches are loss-scaled with
     :func:`scale_ddp_mean_loss`; a non-finite loss on any rank aborts all ranks;
@@ -3354,13 +3374,17 @@ def train_ddp_loop(
             size a ``optim.scheduler`` OneCycle schedule; unused otherwise.
         evaluate_fn: Validation function; defaults to distributed validation.
             Unit tests inject a deterministic metric source.
+        evaluate_cls_fn: Classification-only validation used on epochs where
+            ``eval.topology_every`` skips the V_val topology pass; ``None``
+            evaluates with ``evaluate_fn`` on every epoch.
         kd_bank: Optional row-aligned KD teacher targets (`KDRowBank`); its
             per-step loss is added to the scaled supervised loss before the
             shared backward, computed from the SAME student forward pass.
         require_topology: When True, selection raises instead of falling back
-            to max-AUPRC if any epoch has no topology metrics (production,
-            e.g. a resume across the V_val protocol change). Unit-test stubs
-            that inject an `evaluate_fn` without topology keep `False`.
+            to max-AUPRC if any topology-due epoch has no topology metrics
+            (production, e.g. a resume across the V_val protocol change).
+            Unit-test stubs that inject an `evaluate_fn` without topology keep
+            `False`.
         val_topology_reference: The once-per-run `ValTopologyReference`, used
             only to attach `TrainResult.val_threshold_transfer` (node count
             and sampled-only threshold). `None` leaves that field unset.
@@ -3774,7 +3798,16 @@ def train_ddp_loop(
                 accelerator, epoch_kd_sums, epoch_kd_kl_dim_sum
             )
         validation_start = time.monotonic()
-        outcome = evaluate_fn(model, val_loader, accelerator)
+        run_topology = _topology_due(
+            epoch,
+            epochs=cfg.optim.epochs,
+            topology_every=cfg.eval.topology_every,
+            classification_only=cfg.eval.classification_only,
+        )
+        epoch_evaluate_fn = (
+            evaluate_fn if run_topology or evaluate_cls_fn is None else evaluate_cls_fn
+        )
+        outcome = epoch_evaluate_fn(model, val_loader, accelerator)
         metrics = outcome.metrics
         if use_cuda:
             torch.cuda.synchronize(accelerator.device)
@@ -4038,20 +4071,31 @@ def train_ddp_loop(
     }
 
     # Selection over the whole run: mean rank on AUPRC plus all five topology
-    # metrics when every epoch carries them (production), best AUPRC otherwise
+    # metrics over the epochs whose due V_val pass ran (production; the
+    # eval.topology_every cadence skips the rest), best AUPRC otherwise
     # (unit tests inject evaluate_fn stubs without a topology context).
-    topologies = [topology_by_epoch[epoch] for epoch in sorted(topology_by_epoch)]
-    if topologies and all(topology is not None for topology in topologies):
-        selected = select_checkpoint(
-            [
-                CheckpointCandidate(
-                    epoch=epoch,
-                    auprc=metrics_by_epoch[epoch].auprc,
-                    topology=cast(ValTopologyResult, topology_by_epoch[epoch]).metrics,
-                )
-                for epoch in sorted(metrics_by_epoch)
-            ]
+    if require_topology and any(
+        topology_by_epoch.get(epoch) is None
+        for epoch in metrics_by_epoch
+        if _topology_due(
+            epoch,
+            epochs=cfg.optim.epochs,
+            topology_every=cfg.eval.topology_every,
+            classification_only=cfg.eval.classification_only,
         )
+    ):
+        raise RuntimeError(
+            "resume across the V_val protocol change unsupported; start a fresh attempt dir"
+        )
+    candidates = [
+        CheckpointCandidate(
+            epoch=epoch, auprc=metrics_by_epoch[epoch].auprc, topology=topology.metrics
+        )
+        for epoch in sorted(metrics_by_epoch)
+        if (topology := topology_by_epoch.get(epoch)) is not None
+    ]
+    if candidates:
+        selected = select_checkpoint(candidates)
         assert selected is not None
         best_epoch = selected.epoch
     elif require_topology:
@@ -4498,17 +4542,20 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         cast(float, resolve_model_kwargs(cfg.model).get("label_smoothing", 0.0))
     )
     reference: ValTopologyReference | None = None
+    cls_evaluate_fn = cast(
+        EvaluateFn,
+        functools.partial(
+            _evaluate_distributed,
+            expected_row_ids=np.arange(num_val_rows, dtype=np.int64),
+            kd_val=kd_val,
+            label_smoothing=val_label_smoothing,
+        ),
+    )
+    evaluate_cls_fn: EvaluateFn | None = None
     if cfg.eval.classification_only:
-        evaluate_fn = cast(
-            EvaluateFn,
-            functools.partial(
-                _evaluate_distributed,
-                expected_row_ids=np.arange(num_val_rows, dtype=np.int64),
-                kd_val=kd_val,
-                label_smoothing=val_label_smoothing,
-            ),
-        )
+        evaluate_fn = cls_evaluate_fn
     else:
+        evaluate_cls_fn = cls_evaluate_fn
         reference = build_val_topology_reference(val_split)
         universe = val_ball_union_universe(val_split)
         u_idx, v_idx = universe.u_idx, universe.v_idx
@@ -4570,6 +4617,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                     artifact_dir=probe_artifact_dir,
                     schedule_total_steps=schedule_total_steps,
                     evaluate_fn=evaluate_fn,
+                    evaluate_cls_fn=evaluate_cls_fn,
                     kd_bank=kd_bank,
                     require_topology=not cfg.eval.classification_only,
                 ),
@@ -4609,6 +4657,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         resume_attempt=args.resume_attempt,
         schedule_total_steps=schedule_total_steps,
         evaluate_fn=evaluate_fn,
+        evaluate_cls_fn=evaluate_cls_fn,
         kd_bank=kd_bank,
         require_topology=not cfg.eval.classification_only,
         val_topology_reference=reference,

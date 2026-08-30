@@ -40,6 +40,34 @@ def test_missing_keys_become_empty_cells(
     assert parsed[0]["grad_norm_kd"] == ""
 
 
+def test_topology_gap_rows_render_with_empty_cells(
+    make_run_dir: RunDirFactory, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Rows from epochs whose eval.topology_every skipped the V_val pass stay blank."""
+    out_dir = tmp_path_factory.mktemp("curves-gaps")
+    topology_keys = (
+        "val_gs_bfs",
+        "val_rd_bfs",
+        "val_degree_mmd_ratio",
+        "val_clustering_mmd_ratio",
+        "val_spectral_mmd_ratio",
+        "val_threshold",
+    )
+    gap_row = make_metric_row(2)
+    for key in topology_keys:
+        del gap_row[key]
+    rows = [make_metric_row(1), gap_row, make_metric_row(3)]
+    run_dir = make_run_dir(rows=rows, selected_epoch=3)
+    csv_path, png_path = write_curves(run_dir, out_dir)
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        parsed = list(csv.DictReader(handle))
+    assert parsed[1]["val_gs_bfs"] == ""
+    assert parsed[1]["val_spectral_mmd_ratio"] == ""
+    assert float(parsed[2]["val_gs_bfs"]) == pytest.approx(0.53)
+    assert png_path.exists()
+    assert png_path.stat().st_size > 0
+
+
 def test_curves_cli_writes_both_artifacts(
     make_run_dir: RunDirFactory, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
