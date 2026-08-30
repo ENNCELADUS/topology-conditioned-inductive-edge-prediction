@@ -3,9 +3,37 @@ from pathlib import Path
 import pytest
 from src.autoresearch.metrics_io import RunFailure, read_metric_rows, read_run
 
-from tests.autoresearch.conftest import RunDirFactory, make_metric_row
+from tests.autoresearch.conftest import RunDirFactory, make_cadence_rows, make_metric_row
 
 pytestmark = pytest.mark.unit
+
+
+def test_read_run_reselects_at_campaign_cadence(make_run_dir: RunDirFactory) -> None:
+    run_dir = make_run_dir(rows=make_cadence_rows(), selected_epoch=3)
+    assert read_run(run_dir).selected_epoch == 3
+    reselected = read_run(run_dir, topology_every=2)
+    assert reselected.selected_epoch == 4
+    assert reselected.auprc == pytest.approx(0.90)
+    assert reselected.topology.degree_mmd == pytest.approx(0.60)
+
+
+def test_read_run_cadence_one_reselects_over_all_epochs(make_run_dir: RunDirFactory) -> None:
+    run_dir = make_run_dir(rows=make_cadence_rows(), selected_epoch=1)
+    assert read_run(run_dir, topology_every=1).selected_epoch == 3
+
+
+def test_read_run_rejects_non_positive_topology_every(make_run_dir: RunDirFactory) -> None:
+    with pytest.raises(ValueError, match="topology_every must be >= 1"):
+        read_run(make_run_dir(), topology_every=0)
+
+
+def test_read_run_reselect_fails_on_due_epoch_without_topology(
+    make_run_dir: RunDirFactory,
+) -> None:
+    rows = make_cadence_rows()
+    del rows[1]["val_gs_bfs"]
+    with pytest.raises(ValueError, match="val_gs_bfs"):
+        read_run(make_run_dir(rows=rows), topology_every=2)
 
 
 def test_read_run_returns_selected_epoch_surface(make_run_dir: RunDirFactory) -> None:

@@ -7,7 +7,7 @@ from src.autoresearch.metrics_io import RunMetrics
 from src.autoresearch.verdict import judge_runs, undominated
 from src.eval.checkpoint_selection import TopologyValidationMetrics
 
-from tests.autoresearch.conftest import RunDirFactory, make_metric_row
+from tests.autoresearch.conftest import RunDirFactory, make_cadence_rows, make_metric_row
 
 pytestmark = pytest.mark.unit
 
@@ -122,6 +122,18 @@ def test_judge_cli_emits_verdict_json(
     assert payload["deltas"]["gs"] == pytest.approx(-0.09)
     assert payload["trial"]["gs"] == pytest.approx(0.60)
     assert payload["incumbent"]["auprc"] == pytest.approx(0.81)
+
+
+def test_judge_cli_reselects_incumbent_at_campaign_cadence(
+    make_run_dir: RunDirFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    incumbent = make_run_dir(name="incumbent", rows=make_cadence_rows(), selected_epoch=3)
+    trial = make_run_dir(name="trial")
+    args = ["--incumbent", str(incumbent), "--trial", str(trial)]
+    assert judge_main([*args, "--incumbent-topology-every", "2"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["incumbent"]["selected_epoch"] == 4
+    assert payload["incumbent"]["auprc"] == pytest.approx(0.90)
 
 
 @pytest.mark.parametrize(

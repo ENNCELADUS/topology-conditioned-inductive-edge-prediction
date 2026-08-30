@@ -40,6 +40,28 @@ def make_metric_row(epoch: int, **overrides: object) -> dict[str, Any]:
     return row
 
 
+def make_cadence_rows() -> list[dict[str, Any]]:
+    """Five epochs where 3 dominates overall but 4 dominates the cadence-2 due set."""
+    rows = [make_metric_row(epoch) for epoch in range(1, 6)]
+    rows[2].update(
+        val_auprc=0.95,
+        val_gs_bfs=0.90,
+        val_rd_bfs=1.00,
+        val_degree_mmd_ratio=0.50,
+        val_clustering_mmd_ratio=0.50,
+        val_spectral_mmd_ratio=0.50,
+    )
+    rows[3].update(
+        val_auprc=0.90,
+        val_gs_bfs=0.80,
+        val_rd_bfs=1.02,
+        val_degree_mmd_ratio=0.60,
+        val_clustering_mmd_ratio=0.60,
+        val_spectral_mmd_ratio=0.60,
+    )
+    return rows
+
+
 @pytest.fixture()
 def make_run_dir(tmp_path: Path) -> RunDirFactory:
     """Factory building a published-run directory under ``tmp_path``."""

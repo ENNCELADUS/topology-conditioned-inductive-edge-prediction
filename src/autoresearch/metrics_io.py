@@ -9,7 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeGuard
 
-from src.eval.checkpoint_selection import TopologyValidationMetrics
+from src.eval.checkpoint_selection import (
+    CheckpointCandidate,
+    TopologyValidationMetrics,
+    select_checkpoint,
+)
 
 
 class RunFailure(RuntimeError):
@@ -45,8 +49,14 @@ def read_metric_rows(metrics_path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def read_run(run_dir: Path) -> RunMetrics:
+def read_run(run_dir: Path, topology_every: int | None = None) -> RunMetrics:
     """Load the six-metric surface at the selected epoch of ``run_dir``.
+
+    ``topology_every`` reselects the epoch with the frozen checkpoint selector
+    restricted to that cadence's due epochs (divisible by it, plus the final
+    epoch), so a run measured at a denser cadence yields the surface a
+    campaign at that cadence compares against; ``None`` trusts
+    ``run_metadata.json``.
 
     Raises:
         RunFailure: If ``failure.json`` is present (the run must count as a crash).
@@ -56,20 +66,17 @@ def read_run(run_dir: Path) -> RunMetrics:
     if failure_path.exists():
         detail = failure_path.read_text(encoding="utf-8").strip()
         raise RunFailure(f"{run_dir} failed: {detail}")
-    metadata = _load_json(run_dir / "run_metadata.json")
-    selected_epoch = metadata.get("selected_epoch")
-    if not _positive_int(selected_epoch):
-        raise ValueError(f"{run_dir}: selected_epoch must be a positive int")
-    row = _selected_row(run_dir / "metrics.jsonl", selected_epoch)
+    if topology_every is None:
+        metadata = _load_json(run_dir / "run_metadata.json")
+        selected_epoch = metadata.get("selected_epoch")
+        if not _positive_int(selected_epoch):
+            raise ValueError(f"{run_dir}: selected_epoch must be a positive int")
+        row = _selected_row(run_dir / "metrics.jsonl", selected_epoch)
+    else:
+        selected_epoch, row = _reselect(run_dir, topology_every)
     auprc = _finite(row, "val_auprc", run_dir)
-    gs = _finite(row, "val_gs_bfs", run_dir)
-    rd = _finite(row, "val_rd_bfs", run_dir)
-    degree_mmd = _finite(row, "val_degree_mmd_ratio", run_dir)
-    clustering_mmd = _finite(row, "val_clustering_mmd_ratio", run_dir)
-    spectral_mmd = _finite(row, "val_spectral_mmd_ratio", run_dir)
+    topology = _topology(row, run_dir)
     threshold = _finite(row, "val_threshold", run_dir)
-    if rd <= 0.0:
-        raise ValueError(f"{run_dir}: val_rd_bfs must be positive, got {rd}")
     complete = _load_json(run_dir / "complete.json")
     if complete.get("status") != "complete":
         raise ValueError(f"{run_dir}: complete.json status must be 'complete'")
@@ -80,10 +87,67 @@ def read_run(run_dir: Path) -> RunMetrics:
         run_dir=run_dir,
         selected_epoch=selected_epoch,
         auprc=auprc,
-        topology=TopologyValidationMetrics(gs, rd, degree_mmd, clustering_mmd, spectral_mmd),
+        topology=topology,
         threshold=threshold,
         total_seconds=total_seconds,
     )
+
+
+def surface(run: RunMetrics) -> dict[str, Any]:
+    """Flatten one run's judge-facing surface for a JSON payload."""
+    return {
+        "run_dir": str(run.run_dir),
+        "selected_epoch": run.selected_epoch,
+        "auprc": run.auprc,
+        "gs": run.topology.gs,
+        "rd": run.topology.rd,
+        "degree_mmd": run.topology.degree_mmd,
+        "clustering_mmd": run.topology.clustering_mmd,
+        "spectral_mmd": run.topology.spectral_mmd,
+        "threshold": run.threshold,
+        "total_seconds": run.total_seconds,
+    }
+
+
+def _reselect(run_dir: Path, topology_every: int) -> tuple[int, dict[str, Any]]:
+    """Re-run frozen selection over the epochs due at ``topology_every``."""
+    if topology_every < 1:
+        raise ValueError(f"{run_dir}: topology_every must be >= 1, got {topology_every}")
+    rows_by_epoch: dict[int, dict[str, Any]] = {}
+    for row in read_metric_rows(run_dir / "metrics.jsonl"):
+        epoch = row.get("epoch")
+        if not _positive_int(epoch):
+            raise ValueError(f"{run_dir}: metrics row epoch must be a positive int")
+        if epoch in rows_by_epoch:
+            raise ValueError(f"{run_dir}: duplicate metrics row for epoch {epoch}")
+        rows_by_epoch[epoch] = row
+    if not rows_by_epoch:
+        raise ValueError(f"{run_dir}: metrics.jsonl has no rows")
+    final = max(rows_by_epoch)
+    candidates = [
+        CheckpointCandidate(
+            epoch=epoch,
+            auprc=_finite(row, "val_auprc", run_dir),
+            topology=_topology(row, run_dir),
+        )
+        for epoch, row in sorted(rows_by_epoch.items())
+        if epoch % topology_every == 0 or epoch == final
+    ]
+    selected = select_checkpoint(candidates)
+    assert selected is not None  # the final epoch is always due, so never empty
+    return selected.epoch, rows_by_epoch[selected.epoch]
+
+
+def _topology(row: Mapping[str, Any], run_dir: Path) -> TopologyValidationMetrics:
+    """Validate and extract the five topology metrics of one row."""
+    gs = _finite(row, "val_gs_bfs", run_dir)
+    rd = _finite(row, "val_rd_bfs", run_dir)
+    degree_mmd = _finite(row, "val_degree_mmd_ratio", run_dir)
+    clustering_mmd = _finite(row, "val_clustering_mmd_ratio", run_dir)
+    spectral_mmd = _finite(row, "val_spectral_mmd_ratio", run_dir)
+    if rd <= 0.0:
+        raise ValueError(f"{run_dir}: val_rd_bfs must be positive, got {rd}")
+    return TopologyValidationMetrics(gs, rd, degree_mmd, clustering_mmd, spectral_mmd)
 
 
 def _load_json(path: Path) -> dict[str, Any]:

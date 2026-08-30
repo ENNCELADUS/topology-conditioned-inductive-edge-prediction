@@ -15,7 +15,7 @@ keep/revert input.
 kd_logit, kd_rank, kd_gram, kd_rep — one at a time; order set by the human from grid results.
 Each campaign starts from its arm's grid winner (human-recorded `baseline` ledger row, picked
 from `src.autoresearch.verdict.undominated`). No campaign begins until Phase 0 is complete and the
-human materializes that winner as `configs/autoresearch/<arm>.yaml` (with `eval.topology_every: 2` baked in) and records its baseline row; the operator never invents it.
+human materializes that winner as `configs/autoresearch/<arm>.yaml` (with `eval.topology_every: 2` baked in) and records its baseline row from `.venv/bin/python -m src.autoresearch.baseline <run_dir> --topology-every 2` (cadence-aligned reselection of the every-epoch grid run); the operator never invents it.
 
 ## The trial loop
 
@@ -34,8 +34,8 @@ human materializes that winner as `configs/autoresearch/<arm>.yaml` (with `eval.
 8. Diagnose fit from the CSV and PNG — train vs val task loss, KD terms, grad norms, topology
    trajectory, selected epoch vs loss minimum. Verdict one of overfit / underfit / healthy with
    one sentence of evidence; this goes into the ledger row's `asi`.
-9. Run `.venv/bin/python -m src.autoresearch.judge --incumbent <dir> --trial <dir>`
-   (add `--bands autoresearch/bands.json` only if the human has created that file).
+9. Run `.venv/bin/python -m src.autoresearch.judge --incumbent <dir> --trial <dir>`, adding
+   `--incumbent-topology-every 2` while the incumbent is the every-epoch Phase-0 grid run and `--bands autoresearch/bands.json` only if the human has created that file.
 10. Append the ledger row via `.venv/bin/python -m src.autoresearch.ledger autoresearch/ledger.jsonl <row.json>`;
     commit the row, curve artifacts, and any changed `ideas.md` together (separate from the
     trial's config commit); every per-trial state commit includes changed `ideas.md`.
