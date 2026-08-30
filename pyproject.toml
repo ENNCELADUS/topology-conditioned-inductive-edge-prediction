@@ -17,6 +17,7 @@ classifiers = [
 ]
 dependencies = [
     "accelerate==1.13.0",
+    "matplotlib==3.11.1",
     "networkx==3.6.1",
     "numpy==2.3.5",
     "optuna==4.7.0",
