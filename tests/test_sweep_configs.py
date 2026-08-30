@@ -56,7 +56,7 @@ EXPECTED_SWEEPS: dict[str, tuple[str, dict[str, float]]] = {
     "kd_control": ("kd_control", {}),
 }
 EXPECTED_STEMS = frozenset(EXPECTED_SWEEPS)
-_CADENCE_2_STEMS = frozenset({"kd_rep_w1", "kd_rep_w10", "kd_rep_w100", "kd_control"})
+_CADENCE_2_STEMS = frozenset({"kd_rep_w10", "kd_rep_w100", "kd_control"})
 
 
 def _load(path: Path) -> dict[str, object]:
