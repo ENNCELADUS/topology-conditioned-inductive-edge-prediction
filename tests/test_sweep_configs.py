@@ -3,8 +3,10 @@
 Every YAML in ``configs/sweep/b1_kd_hpo/`` must be a copy of its base arm
 config differing only in the ``distill:`` weight/temperature values, the
 removal of ``eval.classification_only`` (uniform topology-aware validation),
-and its sweep ``output_dir``. ``kd_control`` has no ``distill:`` section and
-differs from its base in ``output_dir`` alone.
+``eval.topology_every: 2`` on the pinned late points (runs launched after
+the cadence change; earlier points completed at cadence 1 and are compared
+via cadence-2 reselection), and its sweep ``output_dir``. ``kd_control``
+has no ``distill:`` section.
 """
 
 from dataclasses import replace
@@ -54,6 +56,7 @@ EXPECTED_SWEEPS: dict[str, tuple[str, dict[str, float]]] = {
     "kd_control": ("kd_control", {}),
 }
 EXPECTED_STEMS = frozenset(EXPECTED_SWEEPS)
+_CADENCE_2_STEMS = frozenset({"kd_rep_w1", "kd_rep_w10", "kd_rep_w100", "kd_control"})
 
 
 def _load(path: Path) -> dict[str, object]:
@@ -77,11 +80,13 @@ def test_sweep_config_differs_from_base_only_in_distill_eval_and_output_dir(stem
         assert sweep[key] == base[key], f"{stem} drifts from base in top-level key {key!r}"
 
     base_eval = cast(dict[str, object], base["eval"])
-    expected_eval = {key: value for key, value in base_eval.items() if key != "classification_only"}
     if arm in {"kd_logit", "kd_control"}:
-        assert expected_eval == base_eval  # these base evals stay byte-identical
+        assert "classification_only" not in base_eval  # these base evals carry no flag to strip
     else:
         assert "classification_only" in base_eval
+    expected_eval = {key: value for key, value in base_eval.items() if key != "classification_only"}
+    if stem in _CADENCE_2_STEMS:
+        expected_eval["topology_every"] = 2
     assert sweep["eval"] == expected_eval
 
     if arm == "kd_control":
