@@ -66,8 +66,20 @@ def test_summary_honors_last_limit(tmp_path: Path) -> None:
     assert "#2 " not in text
 
 
-def test_summary_of_empty_ledger(tmp_path: Path) -> None:
+def test_summary_of_empty_ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
     assert render_summary(tmp_path / "missing.jsonl") == "ledger empty; no trials recorded\n"
+
+
+def test_empty_ledger_includes_default_open_ideas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ideas_dir = tmp_path / "autoresearch"
+    ideas_dir.mkdir()
+    (ideas_dir / "ideas.md").write_text("# Ideas backlog\n\n- cold start idea\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    text = render_summary(tmp_path / "missing.jsonl")
+    assert text == "ledger empty; no trials recorded\nopen ideas:\n- cold start idea\n"
 
 
 def test_summary_includes_default_open_ideas(

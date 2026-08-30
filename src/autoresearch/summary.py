@@ -22,14 +22,21 @@ def _open_ideas() -> list[str]:
     path = Path("autoresearch/ideas.md")
     if not path.is_file():
         return []
-    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip().startswith(("- ", "* "))
+    ]
 
 
 def render_summary(ledger_path: Path, last: int = 10) -> str:
     """Render campaign standings plus the last ``last`` trials, one line each."""
     rows = read_rows(ledger_path)
     if not rows:
-        return "ledger empty; no trials recorded\n"
+        ideas = _open_ideas()
+        if not ideas:
+            return "ledger empty; no trials recorded\n"
+        return "\n".join(["ledger empty; no trials recorded", "open ideas:", *ideas]) + "\n"
 
     lines = ["# autoresearch summary"]
     campaigns: dict[str, list[dict[str, Any]]] = {}
