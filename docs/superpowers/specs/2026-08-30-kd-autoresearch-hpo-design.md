@@ -1,23 +1,19 @@
 # KD Autoresearch HPO — Design
 
 Karpathy-autoresearch-style optimization loop for the B1 KD arms. The human optimizes the
-research organization code (`autoresearch/program.md`); a local Claude Code operator session
-executes one frozen-protocol trial at a time on the H20 container; a frozen judge decides
-keep/revert; an append-only ledger records every proposal. Patterns adopted from
-karpathy/autoresearch (three-layer split: frozen judge / one modifiable surface / human-owned
-program), pi-autoresearch (replay-tolerant JSONL ledger, deterministic cold-start summary,
-refuse-keep enforcement), AIDE (debug-depth cap), and the Cerebras retrospective
-(single-experiment discipline, frequent human checkpoints, frozen measurable objective).
+research organization code (`autoresearch/program.md`); a local Claude Code operator runs one
+frozen-protocol trial at a time on the H20 container; a frozen judge decides keep/revert; an
+append-only ledger records every proposal. Patterns: karpathy/autoresearch (frozen judge / one
+modifiable surface / human-owned program), pi-autoresearch (replay-tolerant ledger, cold-start
+summary, refuse-keep), AIDE (debug-depth cap), Cerebras (single-experiment discipline).
 
 ## Frozen decisions
 
-- **Objective (topology-first):** the five V_val topology numbers at the run's selected epoch —
-  BFS-macro GS, RD, degree/clustering/spectral MMD ratios. AUPRC is logged every trial and never
-  enforced or optimized.
-- **Verdict:** strict no-regression, computed only by frozen code. Keep iff at least one topology
-  metric strictly improves versus the incumbent and none degrades. Zero-width tolerance bands by
-  default (fixed-seed runs; no replicate measurement). An optional `autoresearch/bands.json` can
-  widen per-metric tolerances later — written only by the human, never by the agent.
+- **Objective (topology-first):** the five V_val topology numbers at the selected epoch —
+  BFS-macro GS, RD, degree/clustering/spectral MMD ratios. AUPRC logged, never enforced.
+- **Verdict:** strict no-regression, frozen code only: keep iff ≥1 topology metric strictly
+  improves vs the incumbent and none degrades. Zero-width bands by default (fixed seed, no
+  replicates); optional `bands.json` widens tolerances — written only by the human.
 - **Trial:** one full grid-protocol run — 25 epochs, seed 0, `--skip-test`, topology-aware
   selection every epoch — sequential, auto world size, one container; grid winners = incumbents.
 - **Substrate:** local Claude Code operator via git + ssh. All loop state lives in git plus the
@@ -30,9 +26,8 @@ refuse-keep enforcement), AIDE (debug-depth cap), and the Cerebras retrospective
 
 ## Phases
 
-- **Phase 0 — grid + control (no agent modification of code):** run the 24-point grid via
-  `hpc/sweep_kd_hpo.sh all`; add the matched control as a 25th sweep point; identify per-arm
-  incumbents with the frozen judge's own metric reader.
+- **Phase 0 — grid + control (no agent code changes):** run the 24-point grid via
+  `hpc/sweep_kd_hpo.sh all`; add the control as a 25th point; identify per-arm incumbents.
 - **Phase 1 — toolkit:** build and test `src/autoresearch/`, write `autoresearch/program.md`.
 - **Phase 2 — campaigns:** one arm at a time, protocol below.
 
@@ -46,6 +41,8 @@ State, committed to git:
 - `autoresearch/ledger.jsonl` — append-only, one JSON object per trial across all campaigns.
 - `autoresearch/bands.json` — optional per-metric tolerances; absent means zero-width.
 - `autoresearch/ideas.md` — agent-maintained backlog of deferred hypotheses; survives reverts.
+- `autoresearch/runs/<campaign>/trial_NNN/` — per-trial `learning_curves.csv` + `.png`,
+  committed with the ledger row, so the curve record survives config reverts.
 
 Code, `src/autoresearch/` (mypy strict, ruff, tested):
 
@@ -53,6 +50,9 @@ Code, `src/autoresearch/` (mypy strict, ruff, tested):
   `metrics.jsonl` → the six-tuple (`val_auprc`, `val_gs_bfs`, `val_rd_bfs`, three
   `val_*_mmd_ratio`) plus `val_threshold`, `total_seconds` from `complete.json`. Raises on
   non-finite values, missing rows, or a present `failure.json`.
+- `curves.py` + CLI — distill a pulled `metrics.jsonl` into `learning_curves.csv` (per epoch:
+  task/KD losses, grad norms, LR, AUPRC, the five topology metrics) and `learning_curves.png`
+  marking the selected epoch — the KD1–KD4 curve convention with the topology trajectory added.
 - `verdict.py` + `python -m src.autoresearch.judge` — incumbent dir, trial dir, optional bands →
   verdict JSON: per-metric deltas, `keep` / `revert`, reasons. Improvement directions: GS higher,
   |log RD| lower, MMD ratios lower. AUPRC appears in the output as telemetry only.
@@ -83,9 +83,9 @@ trial bumps `output_dir` to `outputs/b1_row_kd_ar/<arm>/trial_NNN`. The test-pin
 4. Launch over ssh: `hpc/run.sh train configs/autoresearch/<arm>.yaml --skip-test` with the sweep
    script's thread caps (`OMP_NUM_THREADS=16 MKL_NUM_THREADS=16`).
 5. Poll `complete.json` / `failure.json`; on completion pull back the small JSON artifacts.
-6. Run `judge`; diagnose fit from the full per-epoch curve (train vs val task loss, KD terms,
-   grad norms, topology trajectory, selected epoch vs loss minimum) — verdict overfit /
-   underfit / healthy, written into `asi`; append the ledger row; commit the ledger.
+6. Run `curves` (CSV + plot into `autoresearch/runs/`), then `judge`; diagnose fit from the CSV
+   and plot (train vs val task loss, KD terms, grad norms, topology trajectory, selected epoch
+   vs loss minimum) — overfit / underfit / healthy into `asi`; append + commit the ledger.
 7. Keep → incumbent becomes this trial's run dir. Revert → `git revert` the trial commit
    (history preserved; every proposal stays countable).
 8. Crash (`failure.json` or judge gate): one config-level fix commit maximum, relaunched as the
@@ -144,7 +144,7 @@ together per the claim rules — AUPRC included even though never optimized.
 
 ## Testing
 
-Toolkit is TDD'd: `metrics_io` against fixture run dirs (including failure/non-finite cases),
-`verdict` against hand-built metric tables (all keep/revert branches, band widening), `ledger`
-append validation + replay (torn final line, duplicate output_dir, contradicted keep),
-`summary` golden output. No test touches the network or the container.
+Toolkit is TDD'd: `metrics_io` against fixture run dirs (failure/non-finite cases), `curves`
+CSV golden output from a fixture `metrics.jsonl`, `verdict` against hand-built metric tables
+(all keep/revert branches, band widening), `ledger` append validation + replay (torn final
+line, duplicate output_dir, contradicted keep), `summary` golden output. No network access.
