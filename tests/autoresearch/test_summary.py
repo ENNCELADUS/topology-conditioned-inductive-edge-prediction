@@ -7,11 +7,27 @@ from src.autoresearch.summary import render_summary
 
 pytestmark = pytest.mark.unit
 
+DELTA_KEYS = ("gs", "log_rd", "degree_mmd", "clustering_mmd", "spectral_mmd")
+
 
 def row(trial: int, status: str, campaign: str = "kd_logit", **overrides: object) -> dict[str, Any]:
     verdict: dict[str, Any] | None = None
     if status in {"keep", "revert"}:
-        verdict = {"decision": status, "improved": ["gs"] if status == "keep" else []}
+        improved = ["gs"] if status == "keep" else []
+        verdict = {
+            "decision": status,
+            "improved": improved,
+            "regressed": [],
+            "deltas": {
+                name: 0.52 - 0.60 if name == "gs" and improved else 0.0 for name in DELTA_KEYS
+            },
+            "auprc_delta": 0.0,
+            "reasons": (
+                ["improved without regression: gs"]
+                if status == "keep"
+                else ["no topology metric improved beyond tolerance"]
+            ),
+        }
     base: dict[str, Any] = {
         "trial": trial,
         "campaign": campaign,
@@ -42,7 +58,7 @@ def test_summary_reports_standings_and_recent_trials(tmp_path: Path) -> None:
     path = tmp_path / "ledger.jsonl"
     append_row(path, row(1, "baseline"))
     append_row(path, row(2, "keep", metrics=dict(row(1, "baseline")["metrics"], gs=0.60)))
-    append_row(path, row(3, "revert"))
+    append_row(path, row(3, "revert", metrics=dict(row(1, "baseline")["metrics"], gs=0.60)))
     text = render_summary(path)
     lines = text.splitlines()
     assert lines[0] == "# autoresearch summary"
@@ -50,9 +66,20 @@ def test_summary_reports_standings_and_recent_trials(tmp_path: Path) -> None:
     assert "trial_002" in lines[1]
     assert "gs=0.6" in lines[1]
     assert lines[2] == "last 3 trials:"
-    assert lines[3].startswith("#1 [kd_logit] baseline | hypothesis 1")
-    assert "improved:gs" in lines[4]
-    assert lines[5].startswith("#3 [kd_logit] revert")
+    assert lines[3] == (
+        "#1 [kd_logit] baseline | hypothesis 1 | improved:- regressed:-"
+        " | deltas:- | asi:healthy fit"
+    )
+    assert lines[4] == (
+        "#2 [kd_logit] keep | hypothesis 2 | improved:gs regressed:-"
+        " | deltas:gs=-0.08 log_rd=+0 degree_mmd=+0 clustering_mmd=+0"
+        " spectral_mmd=+0 | asi:healthy fit"
+    )
+    assert lines[5] == (
+        "#3 [kd_logit] revert | hypothesis 3 | improved:- regressed:-"
+        " | deltas:gs=+0 log_rd=+0 degree_mmd=+0 clustering_mmd=+0"
+        " spectral_mmd=+0 | asi:healthy fit"
+    )
 
 
 def test_summary_honors_last_limit(tmp_path: Path) -> None:

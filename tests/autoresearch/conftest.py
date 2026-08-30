@@ -47,9 +47,10 @@ def make_run_dir(tmp_path: Path) -> RunDirFactory:
     def _make(
         name: str = "run",
         epochs: int = 3,
-        selected_epoch: int = 2,
+        selected_epoch: object = 2,
         rows: list[dict[str, Any]] | None = None,
-        total_seconds: float = 123.0,
+        total_seconds: object = 123.0,
+        complete_status: object = "complete",
         failure: dict[str, Any] | None = None,
     ) -> Path:
         run_dir = tmp_path / name
@@ -71,7 +72,7 @@ def make_run_dir(tmp_path: Path) -> RunDirFactory:
         )
         (run_dir / "complete.json").write_text(
             json.dumps(
-                {"status": "complete", "attempt_id": "fixture", "total_seconds": total_seconds}
+                {"status": complete_status, "attempt_id": "fixture", "total_seconds": total_seconds}
             ),
             encoding="utf-8",
         )

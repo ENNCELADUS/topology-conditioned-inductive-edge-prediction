@@ -52,6 +52,11 @@ ckpts/
 outputs/
 /scores/
 runs/
+!autoresearch/runs/
+autoresearch/runs/**
+!autoresearch/runs/**/
+!autoresearch/runs/**/learning_curves.csv
+!autoresearch/runs/**/learning_curves.png
 logs/
 wandb/
 mlruns/

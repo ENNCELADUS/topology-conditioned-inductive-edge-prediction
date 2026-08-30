@@ -27,12 +27,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bands", type=Path, default=None)
     args = parser.parse_args(argv)
 
-    bands: dict[str, float] | None = None
+    bands: dict[str, Any] | None = None
     if args.bands is not None:
         loaded = json.loads(args.bands.read_text(encoding="utf-8"))
         if not isinstance(loaded, dict):
             raise ValueError(f"{args.bands}: bands file must be a JSON object")
-        bands = {str(key): float(value) for key, value in loaded.items()}
+        bands = loaded
 
     incumbent = read_run(args.incumbent)
     trial = read_run(args.trial)

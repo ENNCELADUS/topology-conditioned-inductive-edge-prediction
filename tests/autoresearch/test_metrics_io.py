@@ -36,6 +36,58 @@ def test_read_run_rejects_non_finite_total_seconds(make_run_dir: RunDirFactory) 
         read_run(make_run_dir(total_seconds=float("inf")))
 
 
+@pytest.mark.parametrize("status", ["running", None, True])
+def test_read_run_requires_complete_status(make_run_dir: RunDirFactory, status: object) -> None:
+    with pytest.raises(ValueError, match="status must be 'complete'"):
+        read_run(make_run_dir(complete_status=status))
+
+
+@pytest.mark.parametrize("selected_epoch", [0, -1, True, 2.0])
+def test_read_run_requires_positive_integer_selected_epoch(
+    make_run_dir: RunDirFactory, selected_epoch: object
+) -> None:
+    with pytest.raises(ValueError, match="selected_epoch must be a positive int"):
+        read_run(make_run_dir(selected_epoch=selected_epoch))
+
+
+@pytest.mark.parametrize("epoch", [True, 1.0])
+def test_read_run_requires_genuine_integer_epoch_on_selected_row(
+    make_run_dir: RunDirFactory, epoch: object
+) -> None:
+    row = make_metric_row(1)
+    row["epoch"] = epoch
+    with pytest.raises(ValueError, match="selected row epoch must be a positive int"):
+        read_run(make_run_dir(rows=[row], selected_epoch=1))
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("val_auprc", True),
+        ("val_gs_bfs", "0.5"),
+        ("val_rd_bfs", None),
+        ("val_degree_mmd_ratio", False),
+        ("val_clustering_mmd_ratio", "0.5"),
+        ("val_spectral_mmd_ratio", True),
+        ("val_threshold", "2.5"),
+    ],
+)
+def test_read_run_rejects_non_numeric_surface_values(
+    make_run_dir: RunDirFactory, key: str, value: object
+) -> None:
+    rows = [make_metric_row(1, **{key: value})]
+    with pytest.raises(ValueError, match=key):
+        read_run(make_run_dir(rows=rows, selected_epoch=1))
+
+
+@pytest.mark.parametrize("total_seconds", [-1.0, True, "123"])
+def test_read_run_requires_nonnegative_numeric_timing(
+    make_run_dir: RunDirFactory, total_seconds: object
+) -> None:
+    with pytest.raises(ValueError, match="total_seconds"):
+        read_run(make_run_dir(total_seconds=total_seconds))
+
+
 def test_read_run_rejects_non_positive_rd(make_run_dir: RunDirFactory) -> None:
     rows = [make_metric_row(1, val_rd_bfs=0.0)]
     with pytest.raises(ValueError, match="val_rd_bfs"):

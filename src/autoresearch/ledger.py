@@ -6,7 +6,8 @@ Row schema (all keys required on every row): ``trial`` (int, strictly
 ``STATUSES``), ``metrics`` (exactly ``METRIC_KEYS``, all finite; ``None`` for
 ``crash``), ``selected_epoch``, ``total_seconds``, ``verdict`` (dict whose
 ``decision`` equals the status for ``keep``/``revert``; ``None`` for
-``baseline``/``crash``), ``asi`` (free-form), ``timestamp``.
+``baseline``/``crash``; otherwise the exact frozen-judge evidence schema),
+``asi`` (free-form), ``timestamp``.
 """
 
 from __future__ import annotations
@@ -14,13 +15,18 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from src.autoresearch.verdict import METRIC_NAMES, verdict_reasons
+
 STATUSES = frozenset({"baseline", "keep", "revert", "crash"})
+CAMPAIGNS = frozenset({"kd_logit", "kd_rank", "kd_gram", "kd_rep"})
 METRIC_KEYS = frozenset({"auprc", "gs", "rd", "degree_mmd", "clustering_mmd", "spectral_mmd"})
+VERDICT_KEYS = frozenset({"decision", "improved", "regressed", "deltas", "auprc_delta", "reasons"})
 REQUIRED_KEYS = frozenset(
     {
         "trial",
@@ -74,6 +80,8 @@ def append_row(path: Path, row: Mapping[str, Any]) -> None:
         if raw and not raw.endswith(b"\n"):
             handle.write("\n")
         handle.write(json.dumps(dict(row), sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _validate(row: Mapping[str, Any], existing: list[dict[str, Any]]) -> None:
@@ -109,6 +117,14 @@ def _validate(row: Mapping[str, Any], existing: list[dict[str, Any]]) -> None:
     status = row["status"]
     if not isinstance(status, str) or status not in STATUSES:
         raise ValueError(f"unknown status {status!r}")
+    campaign = row["campaign"]
+    if campaign not in CAMPAIGNS:
+        raise ValueError(f"unknown campaign {campaign!r}")
+    campaign_rows = [entry for entry in existing if entry.get("campaign") == campaign]
+    if not campaign_rows and status != "baseline":
+        raise ValueError(f"campaign {campaign!r} must start with exactly one baseline")
+    if campaign_rows and status == "baseline":
+        raise ValueError(f"campaign {campaign!r} already has its baseline")
 
     selected_epoch = row["selected_epoch"]
     if status != "crash" and (
@@ -138,16 +154,14 @@ def _validate(row: Mapping[str, Any], existing: list[dict[str, Any]]) -> None:
     ):
         raise ValueError(f"total_seconds must be a finite number or None, got {total_seconds!r}")
 
-    verdict = row["verdict"]
-    if status in {"keep", "revert"}:
-        if not isinstance(verdict, Mapping) or verdict.get("decision") != status:
-            raise ValueError(f"status {status!r} requires a verdict with decision={status!r}")
-    elif verdict is not None:
-        raise ValueError(f"status {status!r} must carry verdict=None")
-
     metrics = row["metrics"]
     if status == "crash":
-        if metrics is not None or selected_epoch is not None or total_seconds is not None:
+        if (
+            metrics is not None
+            or selected_epoch is not None
+            or total_seconds is not None
+            or row["verdict"] is not None
+        ):
             raise ValueError("crash rows must carry metrics, selected_epoch, total_seconds=None")
         return
     if not isinstance(metrics, Mapping) or set(metrics) != METRIC_KEYS:
@@ -160,6 +174,95 @@ def _validate(row: Mapping[str, Any], existing: list[dict[str, Any]]) -> None:
             or not math.isfinite(float(value))
         ):
             raise ValueError(f"metric {key} must be finite, got {value!r}")
+    if metrics["rd"] <= 0:
+        raise ValueError(f"metric rd must be positive, got {metrics['rd']!r}")
+
+    verdict = row["verdict"]
+    if status == "baseline":
+        if verdict is not None:
+            raise ValueError("status 'baseline' must carry verdict=None")
+        return
+    incumbent = next(
+        entry.get("metrics")
+        for entry in reversed(campaign_rows)
+        if entry.get("status") in {"baseline", "keep"}
+    )
+    if not isinstance(incumbent, Mapping):
+        raise ValueError(f"campaign {campaign!r} has no valid incumbent metrics")
+    _validate_verdict(verdict, status, metrics, incumbent)
+
+
+def _validate_verdict(
+    verdict: object,
+    status: str,
+    metrics: Mapping[str, Any],
+    incumbent: Mapping[str, Any],
+) -> None:
+    """Validate the complete frozen-judge evidence embedded in a ledger row."""
+    if not isinstance(verdict, Mapping):
+        raise ValueError(f"status {status!r} requires a complete verdict")
+    if set(verdict) != VERDICT_KEYS:
+        raise ValueError(f"verdict must carry exactly {sorted(VERDICT_KEYS)}")
+    decision = verdict["decision"]
+    if decision not in {"keep", "revert"} or decision != status:
+        raise ValueError(f"status {status!r} requires verdict decision={status!r}")
+
+    improved = _metric_names(verdict["improved"], "improved")
+    regressed = _metric_names(verdict["regressed"], "regressed")
+    if set(improved) & set(regressed):
+        raise ValueError("verdict improved and regressed metrics must be disjoint")
+    expected_decision = "keep" if improved and not regressed else "revert"
+    if decision != expected_decision:
+        raise ValueError("verdict decision contradicts improved/regressed evidence")
+
+    deltas = verdict["deltas"]
+    if not isinstance(deltas, Mapping) or set(deltas) != set(METRIC_NAMES):
+        raise ValueError(f"verdict deltas must carry exactly {list(METRIC_NAMES)}")
+    expected_deltas = _oriented_deltas(incumbent, metrics)
+    for name in METRIC_NAMES:
+        actual = _finite_number(deltas[name], f"verdict delta {name}")
+        if actual != expected_deltas[name]:
+            raise ValueError(
+                f"verdict delta {name} must equal exact oriented delta {expected_deltas[name]!r}"
+            )
+    if any(float(deltas[name]) >= 0.0 for name in improved):
+        raise ValueError("improved metrics must carry negative oriented deltas")
+    if any(float(deltas[name]) <= 0.0 for name in regressed):
+        raise ValueError("regressed metrics must carry positive oriented deltas")
+    auprc_delta = _finite_number(verdict["auprc_delta"], "verdict auprc_delta")
+    expected_auprc_delta = float(metrics["auprc"]) - float(incumbent["auprc"])
+    if auprc_delta != expected_auprc_delta:
+        raise ValueError(f"verdict auprc_delta must equal {expected_auprc_delta!r}")
+
+    reasons = verdict["reasons"]
+    expected_reasons = list(verdict_reasons(decision, improved, regressed))
+    if reasons != expected_reasons:
+        raise ValueError(f"verdict reasons must equal {expected_reasons!r}")
+
+
+def _metric_names(value: object, label: str) -> list[str]:
+    if not isinstance(value, list) or any(not isinstance(name, str) for name in value):
+        raise ValueError(f"verdict {label} must be a metric-name list")
+    expected = [name for name in METRIC_NAMES if name in value]
+    if value != expected:
+        raise ValueError(f"verdict {label} must contain known metrics in frozen order")
+    return value
+
+
+def _finite_number(value: object, label: str) -> float:
+    if not isinstance(value, int | float) or isinstance(value, bool) or not math.isfinite(value):
+        raise ValueError(f"{label} must be a finite number, got {value!r}")
+    return float(value)
+
+
+def _oriented_deltas(incumbent: Mapping[str, Any], trial: Mapping[str, Any]) -> dict[str, float]:
+    return {
+        "gs": float(incumbent["gs"]) - float(trial["gs"]),
+        "log_rd": abs(math.log(float(trial["rd"]))) - abs(math.log(float(incumbent["rd"]))),
+        "degree_mmd": float(trial["degree_mmd"]) - float(incumbent["degree_mmd"]),
+        "clustering_mmd": float(trial["clustering_mmd"]) - float(incumbent["clustering_mmd"]),
+        "spectral_mmd": float(trial["spectral_mmd"]) - float(incumbent["spectral_mmd"]),
+    }
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1,7 +1,6 @@
 # KD Autoresearch Program
 
-Human-owned research organization code. The operator agent follows this file exactly and never
-edits it; proposed program changes go to `ideas.md`. Spec:
+Human-owned research organization code. The operator follows this file and never edits it; proposed program changes go to `ideas.md`. Spec:
 `docs/superpowers/specs/2026-08-30-kd-autoresearch-hpo-design.md`.
 
 ## Objective
@@ -15,7 +14,8 @@ keep/revert input.
 
 kd_logit, kd_rank, kd_gram, kd_rep — one at a time; order set by the human from grid results.
 Each campaign starts from its arm's grid winner (human-recorded `baseline` ledger row, picked
-from the Pareto-undominated grid points via `src.autoresearch.verdict.undominated`).
+from `src.autoresearch.verdict.undominated`). No campaign begins until Phase 0 is complete and the
+human materializes that winner as `configs/autoresearch/<arm>.yaml` and records its baseline row; the operator never invents it.
 
 ## The trial loop
 
@@ -37,12 +37,12 @@ from the Pareto-undominated grid points via `src.autoresearch.verdict.undominate
 9. Run `.venv/bin/python -m src.autoresearch.judge --incumbent <dir> --trial <dir>`
    (add `--bands autoresearch/bands.json` only if the human has created that file).
 10. Append the ledger row via `.venv/bin/python -m src.autoresearch.ledger autoresearch/ledger.jsonl <row.json>`;
-    commit the row and the curve artifacts together (separate commit from the trial's config
-    commit).
+    commit the row, curve artifacts, and any changed `ideas.md` together (separate from the
+    trial's config commit); every per-trial state commit includes changed `ideas.md`.
 11. keep → the incumbent becomes this trial's run. revert → `git revert` the trial's config
     commit.
-12. Crash (`failure.json`, or the judge raises): at most one config-level fix commit, relaunched
-    as the same trial; a second failure is logged as `crash` (metrics null, both shas in `asi`).
+12. Crash (`failure.json`, or the judge raises): one repair commit maximum, then relaunch the same
+    trial. On a second failure, log `crash`, record proposal/repair SHAs in `asi`, then revert repair and proposal commits in reverse order before the next trial.
 13. Post a one-paragraph digest to the human; continue with the next trial.
 
 ## Stage-1 whitelist (config keys the agent may edit)

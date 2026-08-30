@@ -41,6 +41,8 @@ def test_keep_when_one_metric_strictly_improves() -> None:
     assert verdict.decision == "keep"
     assert verdict.improved == ("gs",)
     assert verdict.regressed == ()
+    assert verdict.reasons == ("improved without regression: gs",)
+    assert verdict.deltas["gs"] == pytest.approx(-0.10)
 
 
 def test_revert_on_exact_tie() -> None:
@@ -48,6 +50,7 @@ def test_revert_on_exact_tie() -> None:
     assert verdict.decision == "revert"
     assert verdict.improved == ()
     assert verdict.regressed == ()
+    assert verdict.reasons == ("no topology metric improved beyond tolerance",)
 
 
 def test_revert_when_any_metric_regresses() -> None:
@@ -55,6 +58,7 @@ def test_revert_when_any_metric_regresses() -> None:
     assert verdict.decision == "revert"
     assert verdict.improved == ("gs",)
     assert verdict.regressed == ("degree_mmd",)
+    assert verdict.reasons == ("regressed beyond tolerance: degree_mmd",)
 
 
 def test_rd_is_judged_by_absolute_log_distance_from_one() -> None:
@@ -78,9 +82,22 @@ def test_auprc_never_enters_the_decision() -> None:
     assert verdict.auprc_delta == pytest.approx(-0.72)
 
 
-def test_negative_band_rejected() -> None:
-    with pytest.raises(ValueError, match="non-negative"):
-        judge_runs(run_with(), run_with(), {"gs": -0.1})
+@pytest.mark.parametrize(
+    "bands",
+    [
+        {"unknown": 0.1},
+        {"gs": True},
+        {"gs": "0.1"},
+        {"gs": None},
+        {"gs": float("nan")},
+        {"gs": float("inf")},
+        {"gs": -0.1},
+    ],
+)
+def test_invalid_band_rejected_by_api(bands: dict[str, object]) -> None:
+    regression = run_with(gs=0.60, degree_mmd=0.95)
+    with pytest.raises(ValueError, match="band"):
+        judge_runs(run_with(), regression, bands)  # type: ignore[arg-type]
 
 
 def test_undominated_filters_pareto_dominated_runs() -> None:
@@ -101,5 +118,43 @@ def test_judge_cli_emits_verdict_json(
     payload = json.loads(capsys.readouterr().out)
     assert payload["decision"] == "keep"
     assert payload["improved"] == ["gs"]
+    assert payload["reasons"] == ["improved without regression: gs"]
+    assert payload["deltas"]["gs"] == pytest.approx(-0.09)
     assert payload["trial"]["gs"] == pytest.approx(0.60)
     assert payload["incumbent"]["auprc"] == pytest.approx(0.81)
+
+
+@pytest.mark.parametrize(
+    "bands",
+    [
+        {"unknown": 0.1},
+        {"degree_mmd": True},
+        {"degree_mmd": "0.1"},
+        {"degree_mmd": None},
+        {"degree_mmd": float("nan")},
+        {"degree_mmd": float("inf")},
+        {"degree_mmd": -0.1},
+    ],
+)
+def test_invalid_band_rejected_by_cli_without_suppressing_regression(
+    make_run_dir: RunDirFactory, tmp_path: Path, bands: dict[str, object]
+) -> None:
+    incumbent = make_run_dir(name="incumbent", selected_epoch=1)
+    trial = make_run_dir(
+        name="trial",
+        rows=[make_metric_row(1, val_gs_bfs=0.60, val_degree_mmd_ratio=0.95)],
+        selected_epoch=1,
+    )
+    bands_path = tmp_path / "bands.json"
+    bands_path.write_text(json.dumps(bands), encoding="utf-8")
+    with pytest.raises(ValueError, match="band"):
+        judge_main(
+            [
+                "--incumbent",
+                str(incumbent),
+                "--trial",
+                str(trial),
+                "--bands",
+                str(bands_path),
+            ]
+        )

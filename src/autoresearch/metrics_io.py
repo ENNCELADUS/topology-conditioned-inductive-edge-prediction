@@ -7,7 +7,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 from src.eval.checkpoint_selection import TopologyValidationMetrics
 
@@ -58,8 +58,8 @@ def read_run(run_dir: Path) -> RunMetrics:
         raise RunFailure(f"{run_dir} failed: {detail}")
     metadata = _load_json(run_dir / "run_metadata.json")
     selected_epoch = metadata.get("selected_epoch")
-    if not isinstance(selected_epoch, int) or isinstance(selected_epoch, bool):
-        raise ValueError(f"{run_dir}: selected_epoch must be an int")
+    if not _positive_int(selected_epoch):
+        raise ValueError(f"{run_dir}: selected_epoch must be a positive int")
     row = _selected_row(run_dir / "metrics.jsonl", selected_epoch)
     auprc = _finite(row, "val_auprc", run_dir)
     gs = _finite(row, "val_gs_bfs", run_dir)
@@ -71,7 +71,11 @@ def read_run(run_dir: Path) -> RunMetrics:
     if rd <= 0.0:
         raise ValueError(f"{run_dir}: val_rd_bfs must be positive, got {rd}")
     complete = _load_json(run_dir / "complete.json")
+    if complete.get("status") != "complete":
+        raise ValueError(f"{run_dir}: complete.json status must be 'complete'")
     total_seconds = _finite(complete, "total_seconds", run_dir)
+    if total_seconds < 0.0:
+        raise ValueError(f"{run_dir}: total_seconds must be nonnegative, got {total_seconds}")
     return RunMetrics(
         run_dir=run_dir,
         selected_epoch=selected_epoch,
@@ -91,7 +95,10 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 def _selected_row(metrics_path: Path, selected_epoch: int) -> dict[str, Any]:
     for row in read_metric_rows(metrics_path):
-        if row.get("epoch") == selected_epoch:
+        epoch = row.get("epoch")
+        if epoch == selected_epoch:
+            if not _positive_int(epoch):
+                raise ValueError(f"{metrics_path}: selected row epoch must be a positive int")
             return row
     raise ValueError(f"{metrics_path}: no row for selected epoch {selected_epoch}")
 
@@ -99,10 +106,14 @@ def _selected_row(metrics_path: Path, selected_epoch: int) -> dict[str, Any]:
 def _finite(row: Mapping[str, Any], key: str, run_dir: Path) -> float:
     if key not in row:
         raise ValueError(f"{run_dir}: metrics row missing {key!r}")
-    try:
-        value = float(row[key])
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{run_dir}: {key} must be numeric") from exc
+    raw = row[key]
+    if not isinstance(raw, int | float) or isinstance(raw, bool):
+        raise ValueError(f"{run_dir}: {key} must be numeric")
+    value = float(raw)
     if not math.isfinite(value):
         raise ValueError(f"{run_dir}: non-finite {key}={value}")
     return value
+
+
+def _positive_int(value: object) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0

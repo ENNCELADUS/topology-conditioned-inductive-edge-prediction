@@ -2,7 +2,7 @@
 
 Usage: ``python -m src.autoresearch.summary LEDGER_PATH [--last N]``. Renders
 campaign standings (trials, keeps, incumbent surface) plus the last N trials,
-one line each — no LLM content, so any fresh session resumes from files alone.
+one line each with ordered topology deltas — no LLM content.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from src.autoresearch.ledger import read_rows
+from src.autoresearch.verdict import METRIC_NAMES
 
 _INCUMBENT_METRIC_ORDER = ("gs", "rd", "degree_mmd", "clustering_mmd", "spectral_mmd", "auprc")
 
@@ -60,9 +61,16 @@ def render_summary(ledger_path: Path, last: int = 10) -> str:
         verdict = row.get("verdict") or {}
         improved = ",".join(verdict.get("improved", [])) or "-"
         regressed = ",".join(verdict.get("regressed", [])) or "-"
+        deltas = verdict.get("deltas")
+        topology_deltas = "-"
+        if isinstance(deltas, dict):
+            topology_deltas = " ".join(
+                f"{name}={float(deltas[name]):+.12g}" for name in METRIC_NAMES
+            )
         lines.append(
             f"#{row.get('trial')} [{row.get('campaign')}] {row.get('status')}"
             f" | {row.get('hypothesis')} | improved:{improved} regressed:{regressed}"
+            f" | deltas:{topology_deltas}"
             f" | asi:{row.get('asi') or '-'}"
         )
 
