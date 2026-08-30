@@ -236,7 +236,7 @@ import pytest
 RunDirFactory = Callable[..., Path]
 
 
-def make_metric_row(epoch: int, **overrides: Any) -> dict[str, Any]:
+def make_metric_row(epoch: int, **overrides: object) -> dict[str, Any]:
     """One synthetic metrics.jsonl row in the B1 KD schema."""
     row: dict[str, Any] = {
         "epoch": epoch,
@@ -1054,7 +1054,7 @@ from src.autoresearch.ledger import append_row, read_rows
 pytestmark = pytest.mark.unit
 
 
-def valid_row(trial: int = 1, **overrides: Any) -> dict[str, Any]:
+def valid_row(trial: int = 1, **overrides: object) -> dict[str, Any]:
     row: dict[str, Any] = {
         "trial": trial,
         "campaign": "kd_logit",
@@ -1330,7 +1330,7 @@ from src.autoresearch.summary import render_summary
 pytestmark = pytest.mark.unit
 
 
-def row(trial: int, status: str, campaign: str = "kd_logit", **overrides: Any) -> dict[str, Any]:
+def row(trial: int, status: str, campaign: str = "kd_logit", **overrides: object) -> dict[str, Any]:
     verdict: dict[str, Any] | None = None
     if status in {"keep", "revert"}:
         verdict = {"decision": status, "improved": ["gs"] if status == "keep" else []}
