@@ -131,3 +131,19 @@ def test_non_finite_metric_and_timing_rejected(tmp_path: Path) -> None:
         )
     with pytest.raises(ValueError, match="total_seconds"):
         append_row(tmp_path / "timing.jsonl", valid_row(total_seconds=float("nan")))
+
+
+@pytest.mark.parametrize("selected_epoch", [None, 0, -1, True])
+def test_non_crash_requires_positive_selected_epoch(tmp_path: Path, selected_epoch: object) -> None:
+    row = valid_row(selected_epoch=selected_epoch)
+    with pytest.raises(ValueError, match="selected_epoch"):
+        append_row(tmp_path / "epoch.jsonl", row)
+
+
+@pytest.mark.parametrize("total_seconds", [None, -1, True])
+def test_non_crash_requires_nonnegative_total_seconds(
+    tmp_path: Path, total_seconds: object
+) -> None:
+    row = valid_row(total_seconds=total_seconds)
+    with pytest.raises(ValueError, match="total_seconds"):
+        append_row(tmp_path / "timing.jsonl", row)

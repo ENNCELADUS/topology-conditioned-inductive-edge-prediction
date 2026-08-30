@@ -111,15 +111,30 @@ def _validate(row: Mapping[str, Any], existing: list[dict[str, Any]]) -> None:
         raise ValueError(f"unknown status {status!r}")
 
     selected_epoch = row["selected_epoch"]
-    if selected_epoch is not None and (
-        not isinstance(selected_epoch, int) or isinstance(selected_epoch, bool)
+    if status != "crash" and (
+        not isinstance(selected_epoch, int)
+        or isinstance(selected_epoch, bool)
+        or selected_epoch <= 0
     ):
-        raise ValueError(f"selected_epoch must be an int or None, got {selected_epoch!r}")
+        raise ValueError(f"non-crash selected_epoch must be a positive int, got {selected_epoch!r}")
     total_seconds = row["total_seconds"]
-    if total_seconds is not None and (
+    if status != "crash" and (
         not isinstance(total_seconds, int | float)
         or isinstance(total_seconds, bool)
         or not math.isfinite(float(total_seconds))
+        or total_seconds < 0
+    ):
+        raise ValueError(
+            f"non-crash total_seconds must be a finite nonnegative number, got {total_seconds!r}"
+        )
+    if (
+        status == "crash"
+        and total_seconds is not None
+        and (
+            not isinstance(total_seconds, int | float)
+            or isinstance(total_seconds, bool)
+            or not math.isfinite(float(total_seconds))
+        )
     ):
         raise ValueError(f"total_seconds must be a finite number or None, got {total_seconds!r}")
 
