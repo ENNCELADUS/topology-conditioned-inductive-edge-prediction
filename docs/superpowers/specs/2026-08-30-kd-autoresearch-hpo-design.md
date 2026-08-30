@@ -18,9 +18,8 @@ refuse-keep enforcement), AIDE (debug-depth cap), and the Cerebras retrospective
   metric strictly improves versus the incumbent and none degrades. Zero-width tolerance bands by
   default (fixed-seed runs; no replicate measurement). An optional `autoresearch/bands.json` can
   widen per-metric tolerances later — written only by the human, never by the agent.
-- **Trial:** one full grid-protocol training run — 25 epochs, seed 0, `--skip-test`, topology-aware
-  selection every epoch — sequential, auto-detected world size, one HPC container. The grid runs
-  the same way so its winners are the campaign incumbents.
+- **Trial:** one full grid-protocol run — 25 epochs, seed 0, `--skip-test`, topology-aware
+  selection every epoch — sequential, auto world size, one container; grid winners = incumbents.
 - **Substrate:** local Claude Code operator via git + ssh. All loop state lives in git plus the
   ledger; any fresh session cold-starts from files alone.
 - **Scope:** four campaigns — kd_logit, kd_rank, kd_gram, kd_rep — prioritized by grid results.
@@ -42,8 +41,8 @@ refuse-keep enforcement), AIDE (debug-depth cap), and the Cerebras retrospective
 State, committed to git:
 
 - `autoresearch/program.md` — human-owned research organization code: objective, protocol,
-  stage-1 key whitelist, campaign order, stall rule, contract clauses (below). The agent never
-  edits it; it proposes program changes in `ideas.md`.
+  stage-1 key whitelist, named agent duties (per-trial fit diagnosis), campaign order, stall
+  rule, contract clauses (below). The agent never edits it; program changes go via `ideas.md`.
 - `autoresearch/ledger.jsonl` — append-only, one JSON object per trial across all campaigns.
 - `autoresearch/bands.json` — optional per-metric tolerances; absent means zero-width.
 - `autoresearch/ideas.md` — agent-maintained backlog of deferred hypotheses; survives reverts.
@@ -84,7 +83,9 @@ trial bumps `output_dir` to `outputs/b1_row_kd_ar/<arm>/trial_NNN`. The test-pin
 4. Launch over ssh: `hpc/run.sh train configs/autoresearch/<arm>.yaml --skip-test` with the sweep
    script's thread caps (`OMP_NUM_THREADS=16 MKL_NUM_THREADS=16`).
 5. Poll `complete.json` / `failure.json`; on completion pull back the small JSON artifacts.
-6. Run `judge`; append the ledger row; commit the ledger.
+6. Run `judge`; diagnose fit from the full per-epoch curve (train vs val task loss, KD terms,
+   grad norms, topology trajectory, selected epoch vs loss minimum) — verdict overfit /
+   underfit / healthy, written into `asi`; append the ledger row; commit the ledger.
 7. Keep → incumbent becomes this trial's run dir. Revert → `git revert` the trial commit
    (history preserved; every proposal stays countable).
 8. Crash (`failure.json` or judge gate): one config-level fix commit maximum, relaunched as the
@@ -94,10 +95,11 @@ trial bumps `output_dir` to `outputs/b1_row_kd_ar/<arm>/trial_NNN`. The test-pin
 
 ## Modifiable surface
 
-- **Stage 1 (config only):** `distill.*` (weights, `margin`, `temperature`) plus arm-specific KD
-  model keys (`model.config.kd_rep_dim` for kd_rep). Frozen: `seed`, `optim.*`, data, eval,
-  `targets_path`, model family — preserving the protocol invariant that only the KD term differs
-  from the control, so results stay attributable to the mechanism.
+- **Stage 1 (config only):** `distill.*` (weights, `margin`, `temperature`), arm-specific KD
+  model keys (`model.config.kd_rep_dim`), all `optim.*` except `epochs`/`patience`, and model
+  regularization keys (e.g. dropout) — so a fit diagnosis can be acted on directly. Frozen:
+  `seed`, `epochs`, `patience`, data, eval, `targets_path`, model family — the budget and the
+  measurement, never the recipe.
 - **Stage 2 (after plateau, human sign-off):** widen to that arm's loss implementation in
   `src/distill/losses.py` (and its wiring), same budget and verdict, normal review gates
   (codex review per wave).
@@ -136,9 +138,9 @@ together per the claim rules — AUPRC included even though never optimized.
   or widens bands itself.
 - The 4-rank grid is not comparable to the published 2-rank KD1–KD4 references; campaign claims
   compare only against the grid, the control, and other campaign trials.
-- Config-only stage 1 has few levers beyond the grid's weight axis (margin, temperature,
-  `kd_rep_dim`, weight interpolation); plateau may arrive quickly — that is the designed signal
-  to escalate to stage 2, not a loop failure.
+- With `optim.*` open, campaign winners differ from the control by more than the KD term; the
+  campaign report must present the full config diff vs baseline (the ledger captures it), and
+  mechanism-isolation claims stay pinned to the grid + control, never to campaign winners.
 
 ## Testing
 
