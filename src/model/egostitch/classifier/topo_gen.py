@@ -316,6 +316,77 @@ class EdmTopoGen(TopoGenBase):
         return loss, {"sigma_bin_loss": bin_loss, "sigma_bin_count": bin_count}
 
 
+class ImfTopoGen(TopoGenBase):
+    """Conditional MeanFlow: average-velocity field u(x_t, r, t, c), 1-NFE sampling.
+
+    Convention: x_t = (1 - t) * x0 + t * eps, v = eps - x0. The MeanFlow
+    identity target is u_tgt = v - (t - r) * du/dt with du/dt taken by JVP
+    along (v, 0, 1). Improved-MeanFlow stability modifications are folded in
+    from the released reference before the H20 run (see plan Task 9 note).
+    """
+
+    family = "imf"
+
+    def _u(
+        self, x: torch.Tensor, r: torch.Tensor, t: torch.Tensor, cond: torch.Tensor
+    ) -> torch.Tensor:
+        # Two 32-d Fourier halves (t and t-r) fill the 64-d noise-embed slot;
+        # averaging the two embeddings would be symmetric in (t, r) and lose
+        # the interval identity the MeanFlow field depends on.
+        time_embed = torch.cat(
+            (
+                _fourier_embed(t, _NOISE_EMBED_DIM // 2),
+                _fourier_embed(t - r, _NOISE_EMBED_DIM // 2),
+            ),
+            dim=-1,
+        )
+        cond_vec = self.cond_embed(torch.cat((cond, time_embed), dim=-1))
+        return cast(torch.Tensor, self.core(x, cond_vec))
+
+    def _sample_from_eps(self, cond: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
+        batch, samples, dim = eps.shape
+        flat_eps = eps.reshape(-1, dim)
+        flat_cond = cond.unsqueeze(1).expand(-1, samples, -1).reshape(-1, cond.size(-1))
+        zeros = flat_eps.new_zeros(flat_eps.size(0))
+        ones = flat_eps.new_ones(flat_eps.size(0))
+        return (flat_eps - self._u(flat_eps, zeros, ones, flat_cond)).reshape(batch, samples, dim)
+
+    def gen_loss(
+        self, cond: torch.Tensor, target: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Compute the MeanFlow identity loss with adaptive row weighting."""
+        with torch.autocast(device_type=cond.device.type, enabled=False):
+            x0 = target.float()
+            eps = torch.randn_like(x0)
+            draws = torch.rand(x0.size(0), 2, device=x0.device)
+            t = draws.max(dim=1).values
+            r = torch.where(
+                torch.rand(x0.size(0), device=x0.device) < 0.25,
+                t,
+                draws.min(dim=1).values,
+            )
+            x_t = (1.0 - t).unsqueeze(-1) * x0 + t.unsqueeze(-1) * eps
+            v = eps - x0
+
+            def _u_fn(x_in: torch.Tensor, r_in: torch.Tensor, t_in: torch.Tensor) -> torch.Tensor:
+                return self._u(x_in, r_in, t_in, cond)
+
+            u, dudt = cast(
+                tuple[torch.Tensor, torch.Tensor],
+                torch.autograd.functional.jvp(  # type: ignore[no-untyped-call]
+                    _u_fn,
+                    (x_t, r, t),
+                    (v, torch.zeros_like(r), torch.ones_like(t)),
+                    create_graph=self.training,
+                ),
+            )
+            u_target = (v - (t - r).unsqueeze(-1) * dudt).detach()
+            sq = (u - u_target).square().mean(dim=-1)
+            weight = (sq.detach() + 1e-3).pow(-0.5)
+            loss = (weight * sq).mean()
+        return loss, {}
+
+
 class DetMseTopoGen(TopoGenBase):
     """Plain-MSE conditional-mean control: h_hat = f(c), M forced to 1 (spec §5)."""
 
@@ -351,6 +422,7 @@ class DetMseTopoGen(TopoGenBase):
 
 _FAMILY_CLASSES: dict[str, type[TopoGenBase]] = {
     "edm": EdmTopoGen,
+    "imf": ImfTopoGen,
     "det_mse": DetMseTopoGen,
 }
 
@@ -389,6 +461,7 @@ __all__ = [
     "FAMILIES",
     "DetMseTopoGen",
     "EdmTopoGen",
+    "ImfTopoGen",
     "TopoGenBase",
     "build_topo_gen",
     "marginal_logit",

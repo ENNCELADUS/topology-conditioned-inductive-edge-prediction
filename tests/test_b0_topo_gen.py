@@ -3,10 +3,15 @@
 Spec: docs/superpowers/specs/2026-08-30-kd-gen-arm-design.md.
 """
 
+from pathlib import Path
+from typing import cast
+
 import pytest
 import torch
+import yaml
 from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
 from src.model.egostitch.classifier.topo_gen import (
+    ImfTopoGen,
     TopoGenBase,
     build_topo_gen,
     marginal_logit,
@@ -45,6 +50,7 @@ def test_build_rejects_unknown_family_and_keys() -> None:
     with pytest.raises(ValueError, match="unknown topo_gen keys"):
         build_topo_gen({**CFG, "z_dim": 4}, D_MODEL)
     assert _module("edm").family == "edm"
+    assert _module("imf").family == "imf"
     assert _module("det_mse").family == "det_mse"
 
 
@@ -63,7 +69,7 @@ def test_marginal_logit_identities() -> None:
 
 def test_marginal_logit_equal_samples_preserves_gradient() -> None:
     logits = torch.full((2, 3), 0.3, dtype=torch.float64, requires_grad=True)
-    marginal_logit(logits).sum().backward()
+    marginal_logit(logits).sum().backward()  # type: ignore[no-untyped-call]
     torch.testing.assert_close(logits.grad, torch.full_like(logits, 1.0 / 3.0))
 
 
@@ -95,7 +101,7 @@ def test_branch_zero_identity_and_gradients_nonzero_at_init() -> None:
     # Saddle guard: task gradient into W_up is nonzero at init (g=1, delta pre-act live).
     module.train()
     out = module.marginal_forward(enc_a, enc_b, len_a, len_b, pair_repr, head)
-    out["logits"].sum().backward()
+    out["logits"].sum().backward()  # type: ignore[no-untyped-call]
     grad = module.adapter_up.weight.grad
     assert grad is not None and float(grad.abs().sum()) > 0
 
@@ -116,11 +122,68 @@ def test_eval_sampling_is_deterministic_and_train_is_not() -> None:
     assert not torch.allclose(third, fourth)
 
 
+def test_imf_one_nfe_sampling_is_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = cast(ImfTopoGen, _module("imf")).eval()
+    enc_a, enc_b, len_a, len_b, _ = _inputs()
+    cond = module.condition(enc_a, enc_b, len_a, len_b)
+    original_u = module._u
+    calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def counted_u(
+        x: torch.Tensor, r: torch.Tensor, t: torch.Tensor, condition: torch.Tensor
+    ) -> torch.Tensor:
+        calls.append((r.detach().clone(), t.detach().clone()))
+        return original_u(x, r, t, condition)
+
+    monkeypatch.setattr(module, "_u", counted_u)
+    first = module.sample_latents(cond)
+    assert first.shape == (4, CFG["mc_samples"], CFG["latent_dim"])
+    assert len(calls) == 1
+    assert torch.count_nonzero(calls[0][0]) == 0
+    assert torch.all(calls[0][1] == 1)
+    second = module.sample_latents(cond)
+    assert len(calls) == 2
+    torch.testing.assert_close(first, second)
+
+
+def test_imf_fp32_autocast_loss_and_jvp_gradients() -> None:
+    module = _module("imf").train()
+    enc_a, enc_b, len_a, len_b, _ = _inputs()
+    target = torch.randn(4, cast(int, CFG["latent_dim"]))
+    torch.manual_seed(7)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        cond = module.condition(enc_a, enc_b, len_a, len_b)
+        latents = module.sample_latents(cond)
+        loss, stats = module.gen_loss(cond, target)
+    assert cond.dtype == torch.float32
+    assert latents.dtype == torch.float32 and torch.isfinite(latents).all()
+    assert loss.dtype == torch.float32 and torch.isfinite(loss) and loss.requires_grad
+    assert stats == {}
+    loss.backward()  # type: ignore[no-untyped-call]
+    gradients = [parameter.grad for parameter in module.generator_parameters()]
+    assert any(gradient is not None for gradient in gradients)
+    assert all(gradient is None or torch.isfinite(gradient).all() for gradient in gradients)
+    core_gradients = [parameter.grad for parameter in module.core.parameters()]
+    assert any(
+        gradient is not None and torch.count_nonzero(gradient) > 0 for gradient in core_gradients
+    )
+
+
+def test_imf_config_builds_without_sampler_steps() -> None:
+    path = Path("configs/b1_kd_gen_imf_breadth_first.yaml")
+    raw = yaml.safe_load(path.read_text())
+    topo_cfg = raw["model"]["config"]["topo_gen"]
+    assert topo_cfg["name"] == "imf"
+    assert "sampler_steps" not in topo_cfg
+    assert raw["output_dir"] == "outputs/b1_row_kd/kd_gen_imf"
+    assert build_topo_gen(topo_cfg, int(raw["model"]["config"]["d_model"])).family == "imf"
+
+
 @pytest.mark.parametrize("family", ["edm", "det_mse"])
 def test_gen_loss_finite_and_decreases(family: str) -> None:
     module = _module(family).train()
     enc_a, enc_b, len_a, len_b, _ = _inputs(8)
-    target = torch.randn(8, CFG["latent_dim"])
+    target = torch.randn(8, cast(int, CFG["latent_dim"]))
     opt = torch.optim.Adam(module.generator_parameters(), lr=1e-2)
     torch.manual_seed(4)
     first_loss, stats = module.gen_loss(module.condition(enc_a, enc_b, len_a, len_b), target)
@@ -133,7 +196,7 @@ def test_gen_loss_finite_and_decreases(family: str) -> None:
         torch.manual_seed(100 + step)
         loss, _ = module.gen_loss(module.condition(enc_a, enc_b, len_a, len_b), target)
         opt.zero_grad()
-        loss.backward()
+        loss.backward()  # type: ignore[no-untyped-call]
         opt.step()
         losses.append(float(loss))
     assert sum(losses[-10:]) < sum(losses[:10])
@@ -148,7 +211,8 @@ def test_controls_branch_zero_and_shuffle() -> None:
     module = _module().eval()
     head = torch.nn.Linear(D_MODEL, 1)
     assert not hasattr(module.core, "cond_in")
-    torch.nn.init.normal_(module.core.blocks[0].mod.weight, std=0.1)
+    modulation = cast(torch.nn.Linear, module.core.blocks[0].get_submodule("mod"))
+    torch.nn.init.normal_(modulation.weight, std=0.1)
     # Give the branch real weight so controls have something to remove.
     torch.nn.init.normal_(module.adapter_up.weight, std=0.5)
     enc_a, enc_b, len_a, len_b, pair_repr = _inputs()
