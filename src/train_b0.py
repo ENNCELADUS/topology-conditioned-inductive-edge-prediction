@@ -26,6 +26,7 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import os
 import pickle
 import random
@@ -543,10 +544,61 @@ def _validate_topo_gen_distill_contract(
 
 
 def _build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.AdamW:
-    """Build the ordinary AdamW optimizer over all model parameters."""
-    return torch.optim.AdamW(
-        model.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
+    """Build AdamW, separating the kd_gen core from base/fusion parameters."""
+    raw_model = _unwrapped_model(model)
+    generator_getter = getattr(raw_model, "topo_gen_parameters", None)
+    generator_params = (
+        list(cast(Callable[[], list[nn.Parameter]], generator_getter)())
+        if cfg.distill is not None and cfg.distill.arm == "kd_gen" and callable(generator_getter)
+        else []
     )
+    if not generator_params:
+        return torch.optim.AdamW(
+            model.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
+        )
+
+    generator_ids = {id(param) for param in generator_params}
+    base_params = [param for param in model.parameters() if id(param) not in generator_ids]
+    if not base_params:
+        raise RuntimeError("kd_gen optimizer group leaves no base parameters")
+    return torch.optim.AdamW(
+        [
+            {"name": "base", "params": base_params, "lr": cfg.optim.lr},
+            {"name": "topo_gen", "params": generator_params, "lr": cfg.optim.lr},
+        ],
+        lr=cfg.optim.lr,
+        weight_decay=cfg.optim.weight_decay,
+    )
+
+
+def _set_topo_gen_training_stage(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    distill: DistillConfig | None,
+    *,
+    epoch: int,
+    total_epochs: int,
+) -> None:
+    """Set the kd_gen stop-gradient phase and its epoch-relative learning rate."""
+    if distill is None or distill.arm != "kd_gen":
+        return
+    topo_gen = _validate_topo_gen_distill_contract(model, distill)
+    if topo_gen is None:
+        raise RuntimeError("kd_gen training stage requires model.config.topo_gen")
+
+    base_group = next(
+        (group for group in optimizer.param_groups if group.get("name") == "base"), None
+    )
+    generator_group = next(
+        (group for group in optimizer.param_groups if group.get("name") == "topo_gen"), None
+    )
+    if base_group is None or generator_group is None:
+        raise RuntimeError("kd_gen optimizer requires named base and topo_gen parameter groups")
+
+    warmup_epochs = math.ceil(distill.joint_warmup_frac * total_epochs)
+    topo_gen.joint_stage = epoch > warmup_epochs
+    base_lr = float(base_group["lr"])
+    generator_group["lr"] = base_lr * (distill.gen_lr_scale if topo_gen.joint_stage else 1.0)
 
 
 def _count_single_process_steps(factory: LoaderFactory, cfg: Config) -> int:
@@ -1288,6 +1340,13 @@ def train_loop(
     last_epoch = 0
 
     for epoch in range(1, cfg.optim.epochs + 1):
+        _set_topo_gen_training_stage(
+            model,
+            optimizer,
+            cfg.distill,
+            epoch=epoch,
+            total_epochs=cfg.optim.epochs,
+        )
         last_epoch = epoch
         model.train()
         losses: list[float] = []
@@ -3496,6 +3555,13 @@ def train_ddp_loop(
 
     last_heartbeat = time.monotonic()
     for epoch in range(start_epoch, cfg.optim.epochs + 1):
+        _set_topo_gen_training_stage(
+            model,
+            optimizer,
+            cfg.distill,
+            epoch=epoch,
+            total_epochs=cfg.optim.epochs,
+        )
         model.train()
         local_loss_sum = 0.0
         epoch_kd_loss_sum = 0.0

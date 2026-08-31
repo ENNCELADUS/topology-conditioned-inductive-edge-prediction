@@ -17,8 +17,10 @@ from src.train_b0 import (
     KDRowBank,
     ModelConfig,
     RuntimeConfig,
+    _build_optimizer,
     _evaluate_distributed,
     _run_probe_mode,
+    _set_topo_gen_training_stage,
     _term_grad_norms,
     build_model,
 )
@@ -153,6 +155,83 @@ def _train_batch() -> dict[str, torch.Tensor]:
         "len_b": torch.full((2,), 4, dtype=torch.long),
         "label": torch.tensor([1.0, 0.0]),
     }
+
+
+def _kd_gen_config(*, joint_warmup_frac: float = 0.1, gen_lr_scale: float = 0.1) -> Config:
+    cfg = _production_config(topo=True, w_gen=True)
+    return replace(
+        cfg,
+        optim=replace(cfg.optim, lr=1.0e-3, weight_decay=0.0),
+        distill=DistillConfig(
+            targets_path="x",
+            w_gen=1.0,
+            joint_warmup_frac=joint_warmup_frac,
+            gen_lr_scale=gen_lr_scale,
+        ),
+    )
+
+
+def test_kd_gen_optimizer_groups_and_epoch_boundary() -> None:
+    model = _model()
+    cfg = _kd_gen_config(joint_warmup_frac=0.1, gen_lr_scale=0.1)
+    optimizer = _build_optimizer(model, cfg)
+
+    groups = {group["name"]: group for group in optimizer.param_groups}
+    assert set(groups) == {"base", "topo_gen"}
+    assert {id(param) for param in groups["topo_gen"]["params"]} == {
+        id(param) for param in model.topo_gen_parameters()
+    }
+    assert model.topo_gen is not None
+    assert id(model.topo_gen.gate) in {id(param) for param in groups["base"]["params"]}
+
+    _set_topo_gen_training_stage(model, optimizer, cfg.distill, epoch=3, total_epochs=25)
+    assert model.topo_gen.joint_stage is False
+    assert groups["base"]["lr"] == pytest.approx(1.0e-3)
+    assert groups["topo_gen"]["lr"] == pytest.approx(1.0e-3)
+
+    _set_topo_gen_training_stage(model, optimizer, cfg.distill, epoch=4, total_epochs=25)
+    assert model.topo_gen.joint_stage is True
+    assert groups["base"]["lr"] == pytest.approx(1.0e-3)
+    assert groups["topo_gen"]["lr"] == pytest.approx(1.0e-4)
+
+
+def test_kd_gen_warmup_stops_task_gradient_then_joint_enables_it() -> None:
+    model = _model().train()
+    cfg = _kd_gen_config()
+    optimizer = _build_optimizer(model, cfg)
+    assert model.topo_gen is not None
+    torch.nn.init.normal_(model.topo_gen.adapter_up.weight, std=0.1)
+    generator_params = model.topo_gen_parameters()
+
+    _set_topo_gen_training_stage(model, optimizer, cfg.distill, epoch=1, total_epochs=10)
+    model(_train_batch())["loss"].backward()
+    assert all(param.grad is None for param in generator_params)
+
+    model.zero_grad(set_to_none=True)
+    _set_topo_gen_training_stage(model, optimizer, cfg.distill, epoch=2, total_epochs=10)
+    model(_train_batch())["loss"].backward()
+    assert (
+        sum(float(param.grad.abs().sum()) for param in generator_params if param.grad is not None)
+        > 0
+    )
+
+
+@pytest.mark.parametrize("epoch", [1, 2])
+def test_kd_gen_task_plus_generator_loss_reaches_all_parameters(epoch: int) -> None:
+    model = _model().train()
+    cfg = _kd_gen_config()
+    optimizer = _build_optimizer(model, cfg)
+    bank = _bank(model)
+    _set_topo_gen_training_stage(model, optimizer, cfg.distill, epoch=epoch, total_epochs=10)
+    batch = _train_batch()
+    bank.attach(batch)
+    output = model(batch)
+    kd_loss, _ = bank.loss(batch, output)
+
+    (output["loss"] + kd_loss).backward()
+
+    missing = [name for name, param in model.named_parameters() if param.grad is None]
+    assert missing == []
 
 
 def test_kd_gen_requires_topo_gen_both_directions() -> None:
