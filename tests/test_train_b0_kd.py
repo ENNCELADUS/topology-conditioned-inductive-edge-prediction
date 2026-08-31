@@ -644,9 +644,7 @@ def test_ddp_loop_one_forward_one_backward_per_batch_with_real_kd_bank(tmp_path:
 def test_distill_config_default_and_all_zero_are_inactive_none_arm() -> None:
     assert DistillConfig().arm == "none"
     assert DistillConfig().active is False
-    zero = DistillConfig.from_mapping(
-        {"w_logit": 0.0, "w_rep": 0.0}
-    )
+    zero = DistillConfig.from_mapping({"w_logit": 0.0, "w_rep": 0.0})
     assert zero.arm == "none"
     assert zero.active is False
 
@@ -677,9 +675,7 @@ def test_ddp_loop_distill_none_and_all_zero_are_bit_identical(tmp_path: Path) ->
 
     none_state = _run(None, "none")
     zero_state = _run(
-        DistillConfig.from_mapping(
-            {"w_logit": 0.0, "w_rep": 0.0}
-        ),
+        DistillConfig.from_mapping({"w_logit": 0.0, "w_rep": 0.0}),
         "zero",
     )
 

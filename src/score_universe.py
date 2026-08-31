@@ -998,9 +998,7 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
                 f"merge input {shard.path} is missing required meta 'topo_gen_control'"
             )
     reference_topo_gen_control = reference.meta["topo_gen_control"]
-    if any(
-        shard.meta["topo_gen_control"] != reference_topo_gen_control for shard in shards[1:]
-    ):
+    if any(shard.meta["topo_gen_control"] != reference_topo_gen_control for shard in shards[1:]):
         raise ValueError(
             "merge inputs disagree on meta 'topo_gen_control': "
             f"{[shard.meta['topo_gen_control'] for shard in shards]} "
@@ -3202,9 +3200,7 @@ def _run_score(args: argparse.Namespace) -> None:
     if args.topo_gen_control is not None:
         topo_gen = getattr(model, "topo_gen", None)
         if topo_gen is None:
-            raise SystemExit(
-                "--topo-gen-control requires a checkpoint with model.config.topo_gen"
-            )
+            raise SystemExit("--topo-gen-control requires a checkpoint with model.config.topo_gen")
         cast(TopoGenBase, topo_gen).control = args.topo_gen_control
 
     cazi_context = _resolve_cazi_context(args) if model_family == "cazi_mbn" else None

@@ -202,9 +202,7 @@ def test_forward_matches_direct_marginal_for_topo_gen() -> None:
         forward_logits = model(dict(batch))["logits"].float()
         encoded_a = model.encoder(batch["emb_a"], batch["len_a"])
         encoded_b = model.encoder(batch["emb_b"], batch["len_b"])
-        pair_repr = model._pair_representation(
-            encoded_a, encoded_b, batch["len_a"], batch["len_b"]
-        )
+        pair_repr = model._pair_representation(encoded_a, encoded_b, batch["len_a"], batch["len_b"])
         marginal_logits = model.topo_gen.marginal_forward(
             encoded_a,
             encoded_b,
@@ -339,9 +337,7 @@ def test_run_score_assigns_topo_gen_control_after_checkpoint_load(
         model_family: str | None = None,
         model_config: dict[str, object] | None = None,
     ) -> tuple[nn.Module, str, str]:
-        loaded = load_checkpoint(
-            path, model_family=model_family, model_config=model_config
-        )
+        loaded = load_checkpoint(path, model_family=model_family, model_config=model_config)
         assigned_model["model"] = loaded[0]
         return loaded
 
@@ -382,9 +378,7 @@ def test_run_score_rejects_topo_gen_control_without_generator(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize("control", [None, "branch_zero"])
-def test_score_metadata_records_topo_gen_control(
-    tmp_path: Path, control: str | None
-) -> None:
+def test_score_metadata_records_topo_gen_control(tmp_path: Path, control: str | None) -> None:
     nodes = {
         "node_00": torch.randn(3, INPUT_DIM),
         "node_01": torch.randn(4, INPUT_DIM),

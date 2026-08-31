@@ -93,6 +93,7 @@ def _write_bound_score_artifact(
         meta={
             "checkpoint_id": "checkpoint",
             "model_family": "egostitch_e2e",
+            "topo_gen_control": None,
             "pairs_source": pairs_source,
             "strategy": "toy",
             "num_rows": num_shards,
