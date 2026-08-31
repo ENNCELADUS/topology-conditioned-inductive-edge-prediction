@@ -1,7 +1,7 @@
 # B1 training-time KD arms: definitions and results
 
 **Status:** the nine `kd_control`/D1–D8 anchor-context runs below are retired as confounded and support
-no method claim. The active full-row protocol (`kd_control`/`kd_logit`/`kd_rank`/`kd_gram`/`kd_rep`/`kd_d9`) is defined in the final section and has no results yet.
+no method claim. Current full-row reports: [`KD1`](kd1_kd_logit/README.md), [`KD2`](kd2_kd_rank/README.md), [`KD3`](kd3_kd_gram/README.md), [`KD4`](kd4_kd_rep/README.md); loss-weight HPO grid and campaign plan: [`kd_hpo_grid`](kd_hpo_grid/README.md).
 
 ## Retired: sampled anchor-context KD arms (historical)
 
@@ -94,4 +94,4 @@ KD losses from one student forward on identical rows, joined by `_row_id`; there
 
 Task/KD loss split, logit correlation/error, representation cosine, D2/D3 validation-block losses,
 per-term gradient norms, val AUPRC/ECE/Brier, and the five-number topology result (GS, RD, and the
-degree/clustering/spectral MMD ratios). **No results yet.**
+degree/clustering/spectral MMD ratios). KD1–KD4 reports are linked in the status line above.

@@ -5,8 +5,8 @@ config differing only in the ``distill:`` weight/temperature values, the
 removal of ``eval.classification_only`` (uniform topology-aware validation),
 ``eval.topology_every: 2`` on the pinned late points (runs launched after
 the cadence change; earlier points completed at cadence 1 and are compared
-via cadence-2 reselection), and its sweep ``output_dir``. ``kd_control``
-has no ``distill:`` section.
+via cadence-2 reselection), and its sweep ``output_dir``. The zero-KD
+control anchor is the published B0 run, not a sweep point.
 """
 
 from dataclasses import replace
@@ -26,7 +26,6 @@ _BASE_CONFIGS = {
     "kd_rank": _REPO_ROOT / "configs" / "b1_kd_rank_breadth_first.yaml",
     "kd_gram": _REPO_ROOT / "configs" / "b1_kd_gram_breadth_first.yaml",
     "kd_rep": _REPO_ROOT / "configs" / "b1_kd_rep_breadth_first.yaml",
-    "kd_control": _REPO_ROOT / "configs" / "b1_kd_control_breadth_first.yaml",
 }
 EXPECTED_SWEEPS: dict[str, tuple[str, dict[str, float]]] = {
     "kd_logit_w0p01": ("kd_logit", {"w_logit": 0.01}),
@@ -53,10 +52,9 @@ EXPECTED_SWEEPS: dict[str, tuple[str, dict[str, float]]] = {
     "kd_rep_w1": ("kd_rep", {"w_rep": 1.0}),
     "kd_rep_w10": ("kd_rep", {"w_rep": 10.0}),
     "kd_rep_w100": ("kd_rep", {"w_rep": 100.0}),
-    "kd_control": ("kd_control", {}),
 }
 EXPECTED_STEMS = frozenset(EXPECTED_SWEEPS)
-_CADENCE_2_STEMS = frozenset({"kd_rep_w10", "kd_rep_w100", "kd_control"})
+_CADENCE_2_STEMS = frozenset({"kd_rep_w10", "kd_rep_w100"})
 
 
 def _load(path: Path) -> dict[str, object]:
@@ -80,8 +78,8 @@ def test_sweep_config_differs_from_base_only_in_distill_eval_and_output_dir(stem
         assert sweep[key] == base[key], f"{stem} drifts from base in top-level key {key!r}"
 
     base_eval = cast(dict[str, object], base["eval"])
-    if arm in {"kd_logit", "kd_control"}:
-        assert "classification_only" not in base_eval  # these base evals carry no flag to strip
+    if arm == "kd_logit":
+        assert "classification_only" not in base_eval  # this base eval carries no flag to strip
     else:
         assert "classification_only" in base_eval
     expected_eval = {key: value for key, value in base_eval.items() if key != "classification_only"}
@@ -89,16 +87,12 @@ def test_sweep_config_differs_from_base_only_in_distill_eval_and_output_dir(stem
         expected_eval["topology_every"] = 2
     assert sweep["eval"] == expected_eval
 
-    if arm == "kd_control":
-        assert "distill" not in base
-        assert "distill" not in sweep
-    else:
-        base_distill_mapping = cast(dict[str, object], base["distill"])
-        expected_distill_mapping = base_distill_mapping | expected_weights
-        assert sweep["distill"] == expected_distill_mapping
+    base_distill_mapping = cast(dict[str, object], base["distill"])
+    expected_distill_mapping = base_distill_mapping | expected_weights
+    assert sweep["distill"] == expected_distill_mapping
 
-        base_distill = DistillConfig.from_mapping(base_distill_mapping)
-        distill = DistillConfig.from_mapping(cast(dict[str, object], sweep["distill"]))
-        assert distill.arm == arm
-        assert distill == replace(base_distill, **expected_weights)
+    base_distill = DistillConfig.from_mapping(base_distill_mapping)
+    distill = DistillConfig.from_mapping(cast(dict[str, object], sweep["distill"]))
+    assert distill.arm == arm
+    assert distill == replace(base_distill, **expected_weights)
     assert sweep["output_dir"] == f"outputs/b1_row_kd_hpo/{stem}"
