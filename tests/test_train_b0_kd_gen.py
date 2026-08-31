@@ -1,0 +1,253 @@
+"""KDRowBank kd_gen arm: join, guards, loss wiring, and diagnostics."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import torch
+from accelerate import Accelerator
+from src.distill.artifacts import KDRowTargets
+from src.distill.config import DistillConfig
+from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
+from src.train_b0 import KDRowBank, _evaluate_distributed, _term_grad_norms
+from torch import nn
+
+LATENT_DIM = 8
+
+
+def _model(topo: bool = True, latent_dim: int = LATENT_DIM) -> V3_1:
+    torch.manual_seed(0)
+    config = {**BEST_V3_1_CONFIG, "input_dim": 24, "d_model": 16, "n_heads": 2}
+    if topo:
+        config["topo_gen"] = {
+            "name": "edm",
+            "latent_dim": latent_dim,
+            "cond_dim": 8,
+            "blocks": 1,
+            "adapter_dim": 4,
+            "mc_samples": 2,
+            "sampler_steps": 2,
+        }
+    return V3_1(**config)
+
+
+def _targets(
+    rep_dim: int = LATENT_DIM, *, zeros: bool = False, two_val_classes: bool = False
+) -> tuple[
+    KDRowTargets,
+    list[tuple[str, str]],
+    list[int],
+    list[tuple[str, str]],
+    list[int],
+]:
+    node_ids = ["n0", "n1", "n2", "n3"]
+    pairs = [("n0", "n1"), ("n2", "n3")]
+    val_pairs = [("n0", "n2"), ("n1", "n3")] if two_val_classes else [("n0", "n2")]
+    val_labels = [1, 0] if two_val_classes else [1]
+    rng = np.random.default_rng(0)
+    train_rep = rng.normal(size=(2, rep_dim)).astype(np.float16)
+    val_rep = rng.normal(size=(len(val_pairs), rep_dim)).astype(np.float16)
+    if zeros:
+        train_rep.fill(0)
+        val_rep.fill(0)
+    targets = KDRowTargets(
+        node_ids=node_ids,
+        pair_a_idx=np.array([0, 2], dtype=np.int32),
+        pair_b_idx=np.array([1, 3], dtype=np.int32),
+        pair_label=np.array([1, 0], dtype=np.int8),
+        teacher_logit=np.array([1.0, -1.0], dtype=np.float32),
+        teacher_rep=train_rep,
+        val_pair_a_idx=np.array([0, 1] if two_val_classes else [0], dtype=np.int32),
+        val_pair_b_idx=np.array([2, 3] if two_val_classes else [2], dtype=np.int32),
+        val_pair_label=np.array(val_labels, dtype=np.int8),
+        val_teacher_logit=np.array([0.5, -0.5] if two_val_classes else [0.5], dtype=np.float32),
+        val_teacher_rep=val_rep,
+        manifest={},
+    )
+    return targets, pairs, [1, 0], val_pairs, val_labels
+
+
+def _bank(
+    model: nn.Module,
+    *,
+    targets: KDRowTargets | None = None,
+    w_gen: float = 1.0,
+) -> KDRowBank:
+    default_targets, pairs, labels, val_pairs, val_labels = _targets()
+    if targets is not None:
+        node_ids = np.asarray(targets.node_ids, dtype=object)
+        pairs = list(
+            zip(
+                node_ids[targets.pair_a_idx].tolist(),
+                node_ids[targets.pair_b_idx].tolist(),
+                strict=True,
+            )
+        )
+        labels = targets.pair_label.astype(np.int64).tolist()
+        val_pairs = list(
+            zip(
+                node_ids[targets.val_pair_a_idx].tolist(),
+                node_ids[targets.val_pair_b_idx].tolist(),
+                strict=True,
+            )
+        )
+        val_labels = targets.val_pair_label.astype(np.int64).tolist()
+    return KDRowBank(
+        DistillConfig(targets_path="x", w_gen=w_gen),
+        default_targets if targets is None else targets,
+        train_pairs=pairs,
+        train_labels=labels,
+        val_pairs=val_pairs,
+        val_labels=val_labels,
+        model=model,
+        device=torch.device("cpu"),
+    )
+
+
+def _train_batch() -> dict[str, torch.Tensor]:
+    return {
+        "_row_id": torch.tensor([0, 1]),
+        "emb_a": torch.randn(2, 4, 24),
+        "emb_b": torch.randn(2, 4, 24),
+        "len_a": torch.full((2,), 4, dtype=torch.long),
+        "len_b": torch.full((2,), 4, dtype=torch.long),
+        "label": torch.tensor([1.0, 0.0]),
+    }
+
+
+def test_kd_gen_requires_topo_gen_both_directions() -> None:
+    with pytest.raises(RuntimeError, match="topo_gen"):
+        _bank(_model(topo=False))
+
+    targets, pairs, labels, val_pairs, val_labels = _targets()
+    with pytest.raises(RuntimeError, match="w_gen"):
+        KDRowBank(
+            DistillConfig(targets_path="x", w_logit=1.0),
+            targets,
+            train_pairs=pairs,
+            train_labels=labels,
+            val_pairs=val_pairs,
+            val_labels=val_labels,
+            model=_model(topo=True),
+            device=torch.device("cpu"),
+        )
+
+
+def test_kd_gen_accepts_prepared_model_wrapper() -> None:
+    model = _model()
+    bank = _bank(nn.DataParallel(model))
+    assert bank._topo_gen is model.topo_gen
+
+
+def test_latent_dim_mismatch_raises() -> None:
+    with pytest.raises(RuntimeError, match="latent_dim"):
+        _bank(_model(latent_dim=4))
+
+
+def test_rms_scale_is_all_elements_fp64_and_stamped_on_model() -> None:
+    model = _model()
+    targets, *_ = _targets()
+    _bank(model, targets=targets)
+    assert model.topo_gen is not None
+    expected = float(np.sqrt(np.mean(np.square(targets.teacher_rep.astype(np.float64)))))
+    state = model.state_dict()
+    assert float(state["topo_gen.latent_rms_scale"].item()) == pytest.approx(expected)
+
+
+def test_invalid_rms_scale_fails_closed() -> None:
+    targets, *_ = _targets(zeros=True)
+    with pytest.raises((RuntimeError, ValueError), match="latent_rms_scale|RMS"):
+        _bank(_model(), targets=targets)
+
+
+def test_attach_injects_normalized_latent_and_loss_produces_telemetry() -> None:
+    model = _model().train()
+    bank = _bank(model, w_gen=0.4)
+    batch = _train_batch()
+    bank.attach(batch)
+    latent = batch["kd_teacher_latent"]
+    assert latent.shape == (2, LATENT_DIM) and latent.dtype == torch.float32
+    assert float(latent.square().mean().sqrt()) == pytest.approx(1.0, rel=1e-5)
+
+    output = model(batch)
+    total, stats = bank.loss(batch, output)
+    assert total.requires_grad
+    assert float(total.detach().item()) == pytest.approx(
+        0.4 * float(output["gen_loss"].detach().item())
+    )
+    for key in (
+        "sum_latent_cos",
+        "sum_prob_std",
+        "sum_dispersion",
+        "sum_branch_ratio",
+        "sum_gen_loss",
+    ):
+        assert key in stats
+    for quartile in range(1, 5):
+        assert f"sum_sigma_q{quartile}" in stats
+        assert f"count_sigma_q{quartile}" in stats
+
+
+def test_epoch_telemetry_aggregates_generator_and_sigma_sums() -> None:
+    model = _model().train()
+    bank = _bank(model)
+    batch = _train_batch()
+    bank.attach(batch)
+    _, stats = bank.loss(batch, model(batch))
+
+    telemetry = bank.epoch_telemetry(Accelerator(cpu=True), stats)
+    assert {
+        "kd_gen_loss",
+        "kd_latent_cos",
+        "mc_prob_std",
+        "gen_sample_dispersion",
+        "gen_branch_ratio",
+        "gen_gate",
+    } <= telemetry.keys()
+    for quartile in range(1, 5):
+        count = stats[f"count_sigma_q{quartile}"]
+        key = f"kd_gen_sigma_q{quartile}"
+        if count > 0:
+            assert telemetry[key] == pytest.approx(stats[f"sum_sigma_q{quartile}"] / count)
+        else:
+            assert key not in telemetry
+
+
+def test_first_step_gradient_probe_sees_generator_loss() -> None:
+    model = _model().train()
+    bank = _bank(model)
+    batch = _train_batch()
+    bank.attach(batch)
+    output = model(batch)
+    kd_loss, _ = bank.loss(batch, output)
+
+    task_norm, kd_norm = _term_grad_norms(output["loss"], kd_loss, model)
+    assert task_norm > 0.0
+    assert kd_norm > 0.0
+
+
+def test_validation_injects_normalized_latent_preserves_rng_and_reports_cosine() -> None:
+    model = _model().train()
+    targets, *_ = _targets(two_val_classes=True)
+    bank = _bank(model, targets=targets)
+    batch = {
+        "_row_id": torch.tensor([0, 1]),
+        "emb_a": torch.randn(2, 4, 24),
+        "emb_b": torch.randn(2, 4, 24),
+        "len_a": torch.full((2,), 4, dtype=torch.long),
+        "len_b": torch.full((2,), 4, dtype=torch.long),
+        "label": torch.tensor([1.0, 0.0]),
+    }
+    rng_before = torch.random.get_rng_state().clone()
+    outcome = _evaluate_distributed(
+        model,
+        [batch],
+        Accelerator(cpu=True),
+        expected_row_ids=np.array([0, 1], dtype=np.int64),
+        kd_val=bank.val_diagnostics(),
+    )
+    assert torch.equal(torch.random.get_rng_state(), rng_before)
+    assert outcome.kd is not None
+    assert "val_kd_latent_cos" in outcome.kd
+    assert "val_kd_rep_cos" not in outcome.kd
+    assert "val_kd_rep_loss" not in outcome.kd

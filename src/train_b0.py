@@ -97,6 +97,7 @@ from src.eval.val_topology import (
     val_region_topology_metrics,
 )
 from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
+from src.model.egostitch.classifier.topo_gen import TopoGenBase
 
 logger = logging.getLogger(__name__)
 
@@ -519,7 +520,7 @@ def _build_scheduler(
     )
 
 
-def _unwrapped_pair_latent_model(model: nn.Module) -> nn.Module:
+def _unwrapped_model(model: nn.Module) -> nn.Module:
     """Return the underlying model when Accelerate/DDP wrapped it."""
     current = model
     while isinstance(getattr(current, "module", None), nn.Module):
@@ -2157,7 +2158,8 @@ def _evaluate_distributed(
             fallback that still catches duplicates and interior gaps; production
             binds the true set so truncation is caught too.
         kd_val: Validation-row teacher targets for the KD diagnostics; ``None``
-            leaves `ValidationOutcome.kd` unset.
+            leaves `ValidationOutcome.kd` unset. For ``kd_gen``, injects the
+            normalized teacher latent before the diagnostic forward.
         label_smoothing: Symmetric binary smoothing ε applied to the labels for
             `ValidationOutcome.task_loss`, matching the training objective.
 
@@ -2173,10 +2175,18 @@ def _evaluate_distributed(
     logit_parts: list[torch.Tensor] = []
     diag_parts: list[torch.Tensor] = []
     relational_block = torch.zeros(3, dtype=torch.float64, device=accelerator.device)
-    collect_diag = kd_val is not None and kd_val.arm == "kd_rep"
-    with torch.no_grad():
+    inject_latent = kd_val is not None and kd_val.teacher_latent is not None
+    collect_diag = kd_val is not None and (kd_val.arm == "kd_rep" or inject_latent)
+    rng_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+    with torch.random.fork_rng(devices=rng_devices, enabled=inject_latent), torch.no_grad():
         for batch in val_loader:
             batch = _to_device(batch, accelerator.device)
+            if inject_latent:
+                assert kd_val is not None and kd_val.teacher_latent is not None
+                rows = batch["_row_id"]
+                batch["kd_teacher_latent"] = (
+                    kd_val.teacher_latent[rows].float() / kd_val.latent_scale
+                )
             output = model(batch)
             logits = output["logits"]
             if logits.dim() > 1 and logits.size(-1) == 1:
@@ -2224,19 +2234,30 @@ def _evaluate_distributed(
             if collect_diag:
                 assert kd_val is not None
                 rows = batch["_row_id"]
-                student_rep = output.get("kd_rep")
-                if student_rep is None:
-                    student_rep = output.get("pair_repr")
-                if student_rep is None:
-                    raise RuntimeError(
-                        "kd_rep validation diagnostics require kd_rep or pair_repr in "
-                        "the model forward output"
+                if kd_val.arm == "kd_rep":
+                    student_rep = output.get("kd_rep")
+                    if student_rep is None:
+                        student_rep = output.get("pair_repr")
+                    if student_rep is None:
+                        raise RuntimeError(
+                            "kd_rep validation diagnostics require kd_rep or pair_repr in "
+                            "the model forward output"
+                        )
+                    assert kd_val.teacher_rep is not None
+                    teacher_rep = kd_val.teacher_rep[rows].float()
+                    diag = nn.functional.cosine_similarity(
+                        student_rep.float(), teacher_rep, dim=-1, eps=1e-8
                     )
-                assert kd_val.teacher_rep is not None
-                teacher_rep = kd_val.teacher_rep[rows].float()
-                diag = nn.functional.cosine_similarity(
-                    student_rep.float(), teacher_rep, dim=-1, eps=1e-8
-                )
+                else:  # kd_gen
+                    latent_sample = output.get("gen_latent_sample")
+                    if latent_sample is None:
+                        raise RuntimeError(
+                            "kd_gen validation diagnostics require gen_latent_sample"
+                        )
+                    teacher_latent = batch["kd_teacher_latent"]
+                    diag = nn.functional.cosine_similarity(
+                        latent_sample.float(), teacher_latent.float(), dim=-1, eps=1e-8
+                    )
                 diag_parts.append(diag.detach().to(torch.float32))
     model.train()
 
@@ -2318,8 +2339,10 @@ def _evaluate_distributed(
         if kd_val is not None:
             kd_metrics: dict[str, float] = {}
             if diag_np is not None and diag_np.size > 0:
-                kd_metrics["val_kd_rep_cos"] = float(diag_np.mean())
-                kd_metrics["val_kd_rep_loss"] = 1.0 - kd_metrics["val_kd_rep_cos"]
+                key = "val_kd_rep_cos" if kd_val.arm == "kd_rep" else "val_kd_latent_cos"
+                kd_metrics[key] = float(diag_np.mean())
+                if kd_val.arm == "kd_rep":
+                    kd_metrics["val_kd_rep_loss"] = 1.0 - kd_metrics[key]
             logits64 = logits_sorted.astype(np.float64)
             teacher64 = kd_val.teacher_logit_np
             if logits64.shape[0] > 0:
@@ -2567,16 +2590,18 @@ class KDValDiagnostics:
             classification row ids ``0..n_val-1`` -- the row order
             `validate_gathered_validation` sorts scored logits into.
         teacher_rep: ``(n_val, rep_dim)`` fp16 teacher pooled embeddings, on
-            the training device; populated only for the ``kd_rep`` arm.
-        teacher_seeds: Reserved for Task 4's explicit field rename; always
-            ``None`` in this trainer state.
+            the training device; populated for ``kd_rep`` and ``kd_gram``.
+        teacher_latent: ``(n_val, latent_dim)`` fp16 teacher latents, on the
+            training device; populated only for ``kd_gen`` and normalized at use.
+        latent_scale: Artifact-wide teacher latent RMS used for normalization.
     """
 
     arm: str
     teacher_logit: torch.Tensor
     teacher_logit_np: np.ndarray
     teacher_rep: torch.Tensor | None
-    teacher_seeds: torch.Tensor | None
+    teacher_latent: torch.Tensor | None
+    latent_scale: float = 1.0
     endpoint_a: torch.Tensor | None = None
     endpoint_b: torch.Tensor | None = None
     margin: float = 0.1
@@ -2727,6 +2752,7 @@ class KDRowBank:
         self._w_dist = distill.w_dist
         self._w_gram = distill.w_gram
         self._w_rep = distill.w_rep
+        self._w_gen = distill.w_gen
         self._margin = distill.margin
         self._temperature = distill.temperature
 
@@ -2750,7 +2776,7 @@ class KDRowBank:
             labels=val_labels,
         )
 
-        raw_model = _unwrapped_pair_latent_model(model)
+        raw_model = _unwrapped_model(model)
         kd_rep_head = getattr(raw_model, "kd_rep_head", None)
 
         if distill.w_rep > 0.0:
@@ -2772,6 +2798,32 @@ class KDRowBank:
                 "never-grad'ed kd_rep_head parameters otherwise"
             )
 
+        self._topo_gen: TopoGenBase | None = None
+        self._latent_scale = 1.0
+        topo_gen = cast(TopoGenBase | None, getattr(raw_model, "topo_gen", None))
+        if distill.w_gen > 0.0:
+            if topo_gen is None:
+                raise RuntimeError("distill.w_gen requires model.config.topo_gen")
+            rep_dim = int(targets.teacher_rep.shape[1])
+            if topo_gen.latent_dim != rep_dim:
+                raise RuntimeError(
+                    f"topo_gen.latent_dim ({topo_gen.latent_dim}) does not match the "
+                    f"KD targets rep_dim ({rep_dim})"
+                )
+            scale = float(np.sqrt(np.mean(np.square(targets.teacher_rep.astype(np.float64)))))
+            if not np.isfinite(scale) or scale <= 0.0:
+                raise RuntimeError(
+                    f"KD teacher latent RMS must be finite and positive, got {scale}"
+                )
+            topo_gen.set_rms_scale(scale)
+            self._topo_gen = topo_gen
+            self._latent_scale = scale
+        elif topo_gen is not None:
+            raise RuntimeError(
+                "model.config.topo_gen requires distill.w_gen > 0 -- DDP would see "
+                "never-grad'ed generator parameters otherwise"
+            )
+
         self.train_logit = torch.as_tensor(
             targets.teacher_logit, dtype=torch.float32, device=device
         )
@@ -2781,13 +2833,18 @@ class KDRowBank:
             self.train_a_idx = torch.as_tensor(targets.pair_a_idx, dtype=torch.int64, device=device)
             self.train_b_idx = torch.as_tensor(targets.pair_b_idx, dtype=torch.int64, device=device)
         self.train_rep: torch.Tensor | None = None
-        if distill.w_rep > 0.0 or distill.w_gram > 0.0:
+        if distill.w_rep > 0.0 or distill.w_gram > 0.0 or distill.w_gen > 0.0:
             self.train_rep = torch.as_tensor(
                 targets.teacher_rep, dtype=torch.float16, device=device
             )
         val_teacher_rep: torch.Tensor | None = None
         if self.arm in {"kd_rep", "kd_gram"}:
             val_teacher_rep = torch.as_tensor(
+                targets.val_teacher_rep, dtype=torch.float16, device=device
+            )
+        val_teacher_latent: torch.Tensor | None = None
+        if self.arm == "kd_gen":
+            val_teacher_latent = torch.as_tensor(
                 targets.val_teacher_rep, dtype=torch.float16, device=device
             )
         self._val = KDValDiagnostics(
@@ -2797,7 +2854,8 @@ class KDRowBank:
             ),
             teacher_logit_np=np.asarray(targets.val_teacher_logit, dtype=np.float64),
             teacher_rep=val_teacher_rep,
-            teacher_seeds=None,
+            teacher_latent=val_teacher_latent,
+            latent_scale=self._latent_scale,
             endpoint_a=(
                 torch.as_tensor(targets.val_pair_a_idx, dtype=torch.int64, device=device)
                 if self.arm == "kd_rank"
@@ -2845,8 +2903,14 @@ class KDRowBank:
             )
 
     def attach(self, batch: Batch) -> None:
-        """Leave the shared task batch unchanged."""
-        return
+        """Inject this step's normalized teacher latent for ``kd_gen``."""
+        if self.arm != "kd_gen":
+            return
+        assert self.train_rep is not None
+        rows = batch["_row_id"]
+        batch["kd_teacher_latent"] = (
+            self.train_rep.index_select(0, rows).float() / self._latent_scale
+        )
 
     def loss(
         self,
@@ -2972,6 +3036,46 @@ class KDRowBank:
             total = total + self._w_gram * gram_loss
             stats["sum_gram"] = float(gram_loss.detach().item()) * stats["rows"]
 
+        if self.arm == "kd_gen":
+            gen_loss = output.get("gen_loss")
+            latent_sample = output.get("gen_latent_sample")
+            prob_std = output.get("gen_prob_std")
+            dispersion = output.get("gen_sample_dispersion")
+            branch_ratio = output.get("gen_branch_ratio")
+            teacher_latent = batch.get("kd_teacher_latent")
+            if gen_loss is None or any(
+                value is None
+                for value in (
+                    latent_sample,
+                    prob_std,
+                    dispersion,
+                    branch_ratio,
+                    teacher_latent,
+                )
+            ):
+                raise RuntimeError("kd_gen model forward is missing generator outputs")
+            assert latent_sample is not None
+            assert prob_std is not None
+            assert dispersion is not None
+            assert branch_ratio is not None
+            assert teacher_latent is not None
+            total = total + self._w_gen * gen_loss
+            with torch.no_grad():
+                cos = nn.functional.cosine_similarity(
+                    latent_sample.float(), teacher_latent.float(), dim=-1, eps=1e-8
+                )
+                stats["sum_gen_loss"] = float(gen_loss.detach().item()) * stats["rows"]
+                stats["sum_latent_cos"] = float(cos.sum().item())
+                stats["sum_prob_std"] = float(prob_std.float().sum().item())
+                stats["sum_dispersion"] = float(dispersion.float().sum().item())
+                stats["sum_branch_ratio"] = float(branch_ratio.float().sum().item())
+                bin_loss = output.get("gen_sigma_bin_loss")
+                bin_count = output.get("gen_sigma_bin_count")
+                if bin_loss is not None and bin_count is not None:
+                    for quartile in range(4):
+                        stats[f"sum_sigma_q{quartile + 1}"] = float(bin_loss[quartile].item())
+                        stats[f"count_sigma_q{quartile + 1}"] = float(bin_count[quartile].item())
+
         return total, stats
 
     def epoch_telemetry(
@@ -3017,6 +3121,25 @@ class KDRowBank:
             telemetry["kd_dist_loss"] = reduced_sums["sum_dist"] / n
         if self.arm == "kd_gram":
             telemetry["kd_gram"] = reduced_sums["sum_gram"] / n
+        if self.arm == "kd_gen":
+            if self._topo_gen is None:
+                raise RuntimeError("kd_gen requires model.config.topo_gen")
+            telemetry.update(
+                {
+                    "kd_gen_loss": reduced_sums["sum_gen_loss"] / n,
+                    "kd_latent_cos": reduced_sums["sum_latent_cos"] / n,
+                    "mc_prob_std": reduced_sums["sum_prob_std"] / n,
+                    "gen_sample_dispersion": reduced_sums["sum_dispersion"] / n,
+                    "gen_branch_ratio": reduced_sums["sum_branch_ratio"] / n,
+                    "gen_gate": float(torch.tanh(self._topo_gen.gate).item()),
+                }
+            )
+            for quartile in range(4):
+                count = reduced_sums.get(f"count_sigma_q{quartile + 1}", 0.0)
+                if count > 0.0:
+                    telemetry[f"kd_gen_sigma_q{quartile + 1}"] = (
+                        reduced_sums[f"sum_sigma_q{quartile + 1}"] / count
+                    )
         return telemetry
 
     def val_diagnostics(self) -> KDValDiagnostics:

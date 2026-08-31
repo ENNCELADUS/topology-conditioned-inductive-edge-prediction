@@ -983,7 +983,7 @@ def test_evaluate_distributed_kd_rep_diagnostics() -> None:
         teacher_logit=teacher_logit,
         teacher_logit_np=teacher_logit.double().numpy(),
         teacher_rep=rep_seed.clone().to(torch.float16),
-        teacher_seeds=None,
+        teacher_latent=None,
     )
     outcome = _evaluate_distributed(
         _RepDiagModel(),
@@ -1017,7 +1017,7 @@ def test_evaluate_distributed_kd_rank_reports_deterministic_block_losses() -> No
         teacher_logit=teacher_logit,
         teacher_logit_np=teacher_logit.double().numpy(),
         teacher_rep=None,
-        teacher_seeds=None,
+        teacher_latent=None,
         endpoint_a=torch.tensor([0, 1]),
         endpoint_b=torch.tensor([2, 2]),
     )
@@ -1047,7 +1047,7 @@ def test_evaluate_distributed_kd_gram_reports_deterministic_block_loss() -> None
         teacher_logit=teacher_logit,
         teacher_logit_np=teacher_logit.double().numpy(),
         teacher_rep=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-        teacher_seeds=None,
+        teacher_latent=None,
     )
     outcome = _evaluate_distributed(
         _RepDiagModel(),
@@ -1101,7 +1101,7 @@ def test_evaluate_distributed_kd_logit_loss_matches_teacher_prob_bce() -> None:
         teacher_logit=teacher_logit,
         teacher_logit_np=teacher_logit.double().numpy(),
         teacher_rep=None,
-        teacher_seeds=None,
+        teacher_latent=None,
     )
     outcome = _evaluate_distributed(
         _RepDiagModel(),
