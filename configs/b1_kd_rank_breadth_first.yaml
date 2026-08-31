@@ -67,7 +67,7 @@ runtime:
   probe_warmup_steps: 10
   probe_timed_steps: 30
 seed: 0
-output_dir: outputs/b1_row_kd/kd_rank
+output_dir: outputs/b1_row_kd/kd_rank_strict_llp
 mixed_precision: "bf16"
 distill:
   targets_path: outputs/distill/kd_row_targets_breadth_first
