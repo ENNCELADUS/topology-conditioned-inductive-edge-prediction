@@ -84,9 +84,7 @@ class TestSelectCheckpoint:
             select_checkpoint([bad])
 
     def test_negative_rd_fails_closed(self) -> None:
-        bad = CheckpointCandidate(
-            epoch=1, auprc=0.1, topology=_topo(0.3, -0.1, 0.1, 0.1, 0.1)
-        )
+        bad = CheckpointCandidate(epoch=1, auprc=0.1, topology=_topo(0.3, -0.1, 0.1, 0.1, 0.1))
         with pytest.raises(ValueError, match="RD must be non-negative"):
             select_checkpoint([bad])
 

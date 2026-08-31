@@ -60,6 +60,7 @@ from src.model.egostitch.classifier.layers import (
     _build_padding_mask,
     _parse_rich_pooling_components,
 )
+from src.model.egostitch.classifier.topo_gen import TopoGenBase, build_topo_gen
 from src.model.egostitch.config import CONDITIONING_MODES
 from src.model.egostitch.graph import PairConditioning, PairInputs
 
@@ -946,223 +947,6 @@ def _to_bool(value: object, field_name: str) -> bool:
 # --------------------------------------------------------------------------- V3_1 top-level model
 
 
-# --------------------------------------------------------------------------- pair-latent generator
-
-_GEN_EPS_SEED = 0xD9
-_GEN_LOGVAR_MIN = -6.0
-_GEN_LOGVAR_MAX = 2.0
-
-
-def _masked_token_mean(tokens: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-    """Mean of the first ``lengths`` token rows per batch element."""
-    positions = torch.arange(tokens.size(1), device=tokens.device)
-    valid = (positions.unsqueeze(0) < lengths.unsqueeze(1)).to(dtype=tokens.dtype)
-    total = (tokens * valid.unsqueeze(-1)).sum(dim=1)
-    return total / valid.sum(dim=1).clamp_min(1.0).unsqueeze(-1)
-
-
-class _SeedRecognition(nn.Module):
-    """q(z | c, S*): train-only posterior over the pair latent (kd_d9)."""
-
-    def __init__(self, cond_dim: int, seed_flat: int, z_dim: int) -> None:
-        super().__init__()
-        self.teacher_proj = nn.Linear(seed_flat, cond_dim)
-        self.net = nn.Sequential(
-            nn.Linear(2 * cond_dim, cond_dim),
-            nn.GELU(),
-            nn.Linear(cond_dim, 2 * z_dim),
-        )
-
-    def forward(self, cond: torch.Tensor, teacher_flat: torch.Tensor) -> torch.Tensor:
-        projected = self.teacher_proj(teacher_flat)
-        return cast(torch.Tensor, self.net(torch.cat((cond, projected), dim=-1)))
-
-
-class PairLatentGenerator(nn.Module):
-    """CVAE generating the pair's oracle PMA seed tokens from ``(x_u, x_v)`` (kd_d9).
-
-    Deployed path: ``mc_samples`` prior samples decoded and marginalized at
-    the logit level through ``delta_head``; the B0 head stays untouched and
-    the zero-init ``alpha`` gate makes the model exactly the bare trunk at
-    init (and under the alpha=0 scoring control). Training samples fresh
-    reparameterized noise; eval uses the fixed ``eval_eps`` buffer (drawn
-    once from a dedicated generator, checkpointed), so scoring is RNG-free.
-    ``joint_stage`` is trainer-owned: False keeps the fusion-boundary
-    stop-gradient (stage 1, generator trained by the KD objective alone);
-    True lets task gradients reach decoder/prior/conditioning (stage 2).
-    The whole module is an fp32 island (`generator/assemble.py` precedent) --
-    cosine/Gram geometry formed on the bf16 ulp grid silently quantizes.
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        *,
-        z_dim: int,
-        cond_dim: int,
-        hidden: int,
-        seed_count: int,
-        seed_dim: int,
-        mc_samples: int,
-        kl_free_bits: float,
-    ) -> None:
-        super().__init__()
-        for name, value in (
-            ("z_dim", z_dim),
-            ("cond_dim", cond_dim),
-            ("hidden", hidden),
-            ("seed_count", seed_count),
-            ("seed_dim", seed_dim),
-            ("mc_samples", mc_samples),
-        ):
-            if value <= 0:
-                raise ValueError(f"pair_latent_gen.{name} must be positive, got {value}")
-        if kl_free_bits < 0.0:
-            raise ValueError(f"pair_latent_gen.kl_free_bits must be >= 0, got {kl_free_bits}")
-        self.z_dim = z_dim
-        self.seed_count = seed_count
-        self.seed_dim = seed_dim
-        self.mc_samples = mc_samples
-        self.kl_free_bits = kl_free_bits
-        self.joint_stage = False
-        seed_flat = seed_count * seed_dim
-        self.condition = nn.Sequential(
-            nn.Linear(3 * d_model, cond_dim),
-            nn.GELU(),
-            nn.LayerNorm(cond_dim),
-        )
-        self.prior = nn.Linear(cond_dim, 2 * z_dim)
-        self.recognition = _SeedRecognition(cond_dim, seed_flat, z_dim)
-        self.decoder = nn.Sequential(
-            nn.Linear(cond_dim + z_dim, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, seed_flat),
-        )
-        self.adapter = nn.Sequential(
-            nn.LayerNorm(seed_flat),
-            nn.Linear(seed_flat, cond_dim),
-            nn.GELU(),
-        )
-        self.delta_head = nn.Sequential(
-            nn.Linear(d_model + cond_dim, 128),
-            nn.GELU(),
-            nn.Linear(128, 1),
-        )
-        self.alpha = nn.Parameter(torch.zeros(()))
-        eps_generator = torch.Generator().manual_seed(_GEN_EPS_SEED)
-        self.register_buffer("eval_eps", torch.randn(mc_samples, z_dim, generator=eps_generator))
-
-    def _condition(
-        self,
-        encoded_a: torch.Tensor,
-        encoded_b: torch.Tensor,
-        lengths_a: torch.Tensor,
-        lengths_b: torch.Tensor,
-    ) -> torch.Tensor:
-        """Symmetric fp32 conditioning from *detached* trunk endpoint encodings.
-
-        The detach is permanent (the D4 lesson): KD gradients must never
-        reshape the trunk, and in stage 2 the task gradient entering through
-        the generator stops at this boundary too.
-        """
-        e_u = _masked_token_mean(encoded_a.detach().float(), lengths_a)
-        e_v = _masked_token_mean(encoded_b.detach().float(), lengths_b)
-        features = torch.cat((e_u * e_v, e_u + e_v, (e_u - e_v).abs()), dim=-1)
-        return cast(torch.Tensor, self.condition(features))
-
-    def _prior_params(self, cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        mu, logvar = self.prior(cond).chunk(2, dim=-1)
-        return mu, logvar.clamp(_GEN_LOGVAR_MIN, _GEN_LOGVAR_MAX)
-
-    def _decode(self, cond: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        flat = self.decoder(torch.cat((cond, z), dim=-1))
-        return cast(torch.Tensor, flat.reshape(*flat.shape[:-1], self.seed_count, self.seed_dim))
-
-    def forward_task(
-        self,
-        encoded_a: torch.Tensor,
-        encoded_b: torch.Tensor,
-        lengths_a: torch.Tensor,
-        lengths_b: torch.Tensor,
-        pair_repr: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The deployed path: fp32 ``(delta (B, 1), delta_std (B,))``."""
-        with torch.autocast(device_type=pair_repr.device.type, enabled=False):
-            cond = self._condition(encoded_a, encoded_b, lengths_a, lengths_b)
-            mu_p, logvar_p = self._prior_params(cond)
-            sigma_p = (0.5 * logvar_p).exp()
-            if self.training:
-                eps = torch.randn(
-                    cond.size(0), self.mc_samples, self.z_dim, device=cond.device, dtype=cond.dtype
-                )
-            else:
-                eval_eps = self.eval_eps
-                assert isinstance(eval_eps, torch.Tensor)
-                eps = eval_eps.to(device=cond.device, dtype=cond.dtype).unsqueeze(0)
-            z = mu_p.unsqueeze(1) + sigma_p.unsqueeze(1) * eps
-            seeds = self._decode(
-                cond.unsqueeze(1).expand(-1, self.mc_samples, -1).reshape(-1, cond.size(-1)),
-                z.reshape(-1, self.z_dim),
-            ).reshape(cond.size(0), self.mc_samples, self.seed_count, self.seed_dim)
-            flat = seeds.reshape(cond.size(0), self.mc_samples, -1)
-            if not self.joint_stage:
-                flat = flat.detach()
-            adapted = self.adapter(flat)
-            repeated = pair_repr.float().unsqueeze(1).expand(-1, self.mc_samples, -1)
-            per_sample = self.delta_head(torch.cat((repeated, adapted), dim=-1)).squeeze(-1)
-            delta = per_sample.mean(dim=1, keepdim=True)
-            delta_std = per_sample.std(dim=1, unbiased=False)
-        return delta, delta_std
-
-    def forward_kd(
-        self,
-        encoded_a: torch.Tensor,
-        encoded_b: torch.Tensor,
-        lengths_a: torch.Tensor,
-        lengths_b: torch.Tensor,
-        teacher_seeds: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """The KD-stream path: posterior seeds, KL, prior mean, and dispersion.
-
-        ``seeds_q`` is the posterior-path reconstruction (rsampled once);
-        ``kl_per_dim`` the analytic ``KL(q || p)``; ``prior_mean_seeds`` the
-        deployed-region decode ``g(c, mu_p)`` for the `kd_prior_cos`
-        telemetry (prior-hole witness). ``prior_dispersion`` is the per-row
-        seed-space distance between decodes at the first two fixed prior
-        samples; with one MC sample both decodes reuse it and the value is zero.
-        """
-        with torch.autocast(device_type=teacher_seeds.device.type, enabled=False):
-            cond = self._condition(encoded_a, encoded_b, lengths_a, lengths_b)
-            mu_p, logvar_p = self._prior_params(cond)
-            teacher_flat = teacher_seeds.float().reshape(teacher_seeds.size(0), -1)
-            mu_q, logvar_q = self.recognition(cond, teacher_flat).chunk(2, dim=-1)
-            logvar_q = logvar_q.clamp(_GEN_LOGVAR_MIN, _GEN_LOGVAR_MAX)
-            z_q = mu_q + (0.5 * logvar_q).exp() * torch.randn_like(mu_q)
-            seeds_q = self._decode(cond, z_q)
-            kl = (
-                0.5 * (logvar_p - logvar_q)
-                + (logvar_q.exp() + (mu_q - mu_p).square()) / (2.0 * logvar_p.exp())
-                - 0.5
-            )
-            prior_mean_seeds = self._decode(cond, mu_p)
-            eval_eps = self.eval_eps
-            assert isinstance(eval_eps, torch.Tensor)
-            eps = eval_eps[:2].to(device=cond.device, dtype=cond.dtype)
-            if eps.size(0) == 1:
-                eps = eps.expand(2, -1)
-            prior_z = mu_p.unsqueeze(1) + (0.5 * logvar_p).exp().unsqueeze(1) * eps.unsqueeze(0)
-            prior_samples = self._decode(
-                cond.unsqueeze(1).expand(-1, 2, -1).reshape(-1, cond.size(-1)),
-                prior_z.reshape(-1, self.z_dim),
-            ).reshape(cond.size(0), 2, self.seed_count, self.seed_dim)
-            prior_dispersion = torch.linalg.vector_norm(
-                prior_samples[:, 0] - prior_samples[:, 1], dim=(1, 2)
-            )
-        return seeds_q, kl, prior_mean_seeds, prior_dispersion
-
-
 class V3_1(nn.Module):
     """V3.1 model — V3 with rich per-item pooling (CLS+mean+attn+max+gate).
 
@@ -1173,6 +957,8 @@ class V3_1(nn.Module):
 
     def __init__(self, **model_config: object) -> None:
         super().__init__()
+        if "pair_latent_gen" in model_config:
+            raise ValueError("model_config.pair_latent_gen was removed; use model_config.topo_gen")
         required_fields = [
             "input_dim",
             "d_model",
@@ -1332,45 +1118,11 @@ class V3_1(nn.Module):
         )
         if self.mlp_spectral_norm:
             self._apply_output_head_spectral_norm()
-        # D9 pair-latent generation: absent section => module not built, the
-        # baseline stays bit-identical (`node_factor_dim: 0` pattern). Built
-        # last so the trunk's RNG init stream is unchanged by its presence.
-        plg_raw = model_config.get("pair_latent_gen")
-        self.pair_latent_gen: PairLatentGenerator | None = None
-        if plg_raw is not None:
-            if not isinstance(plg_raw, dict) or not plg_raw:
-                raise ValueError("model_config.pair_latent_gen must be a non-empty mapping")
-            plg_cfg = _to_mapping(plg_raw, "model_config.pair_latent_gen")
-            known_keys = {
-                "z_dim",
-                "cond_dim",
-                "hidden",
-                "seed_count",
-                "seed_dim",
-                "mc_samples",
-                "kl_free_bits",
-            }
-            unknown_keys = sorted(set(plg_cfg) - known_keys)
-            if unknown_keys:
-                raise ValueError(f"unknown pair_latent_gen keys: {unknown_keys}")
-            self.pair_latent_gen = PairLatentGenerator(
-                self.d_model,
-                z_dim=_to_int(plg_cfg.get("z_dim", 64), "pair_latent_gen.z_dim"),
-                cond_dim=_to_int(plg_cfg.get("cond_dim", 256), "pair_latent_gen.cond_dim"),
-                hidden=_to_int(plg_cfg.get("hidden", 512), "pair_latent_gen.hidden"),
-                seed_count=_to_int(plg_cfg.get("seed_count", 4), "pair_latent_gen.seed_count"),
-                seed_dim=_to_int(plg_cfg.get("seed_dim", 512), "pair_latent_gen.seed_dim"),
-                mc_samples=_to_int(plg_cfg.get("mc_samples", 4), "pair_latent_gen.mc_samples"),
-                kl_free_bits=_to_float(
-                    plg_cfg.get("kl_free_bits", 0.05), "pair_latent_gen.kl_free_bits"
-                ),
-            )
         # kd_rep: train-time projection for representation KD, used only when
         # the teacher's pair-embedding width differs from `d_model`
         # (`kd_rep_dim: 0`, the default, aligns `pair_repr` directly). Built
         # last so its presence leaves every other module's RNG init stream
-        # unchanged (same rationale as the `pair_latent_gen` build-order
-        # comment above it).
+        # unchanged.
         kd_rep_dim = _to_int(model_config.get("kd_rep_dim", 0), "model_config.kd_rep_dim")
         if kd_rep_dim < 0:
             raise ValueError(f"model_config.kd_rep_dim must be >= 0, got {kd_rep_dim}")
@@ -1378,20 +1130,21 @@ class V3_1(nn.Module):
             nn.Linear(self.d_model, kd_rep_dim) if kd_rep_dim > 0 else None
         )
 
-    def pair_latent_gen_parameters(self) -> list[nn.Parameter]:
-        """Generator param group for the trainer's stage-2 LR switch (kd_d9)."""
-        if self.pair_latent_gen is None:
-            return []
-        return [
-            parameter
-            for component in (
-                self.pair_latent_gen.condition,
-                self.pair_latent_gen.prior,
-                self.pair_latent_gen.recognition,
-                self.pair_latent_gen.decoder,
+        # kd_gen topology-latent generation: absent section => module not
+        # built, the baseline stays identical. Built after the trunk and
+        # optional head construction so their RNG init stream is unchanged.
+        topo_raw = model_config.get("topo_gen")
+        self.topo_gen: TopoGenBase | None = None
+        if topo_raw is not None:
+            if not isinstance(topo_raw, dict) or not topo_raw:
+                raise ValueError("model_config.topo_gen must be a non-empty mapping")
+            self.topo_gen = build_topo_gen(
+                _to_mapping(topo_raw, "model_config.topo_gen"), self.d_model
             )
-            for parameter in component.parameters()
-        ]
+
+    def topo_gen_parameters(self) -> list[nn.Parameter]:
+        """Generator param group for the trainer's warmup/joint LR switch (kd_gen)."""
+        return [] if self.topo_gen is None else self.topo_gen.generator_parameters()
 
     def _apply_output_head_spectral_norm(self) -> None:
         """Apply spectral norm to output-head linear layers."""
@@ -1460,29 +1213,27 @@ class V3_1(nn.Module):
         encoded_a = self.encoder(emb_a, lengths_a)
         encoded_b = self.encoder(emb_b, lengths_b)
         pair_repr = self._pair_representation(encoded_a, encoded_b, lengths_a, lengths_b)
-        logits = self.output_head(pair_repr)
-
-        output: dict[str, torch.Tensor] = {"logits": logits}
-        output["pair_repr"] = pair_repr
+        output: dict[str, torch.Tensor] = {"pair_repr": pair_repr}
         if self.kd_rep_head is not None:
             output["kd_rep"] = self.kd_rep_head(pair_repr)
-        if self.pair_latent_gen is not None:
-            delta, delta_std = self.pair_latent_gen.forward_task(
-                encoded_a, encoded_b, lengths_a, lengths_b, pair_repr
+        if self.topo_gen is None:
+            logits = self.output_head(pair_repr)
+        else:
+            gen_out = self.topo_gen.marginal_forward(
+                encoded_a, encoded_b, lengths_a, lengths_b, pair_repr, self.output_head
             )
-            gated = (self.pair_latent_gen.alpha * delta).reshape(logits.shape)
-            logits = logits + gated.to(dtype=logits.dtype)
-            output["logits"] = logits
-            output["gen_delta_std"] = delta_std
-            teacher_seeds = merged.get("kd_teacher_seeds")
-            if teacher_seeds is not None:
-                seeds_q, kl, prior_mean_seeds, prior_dispersion = self.pair_latent_gen.forward_kd(
-                    encoded_a, encoded_b, lengths_a, lengths_b, teacher_seeds
-                )
-                output["gen_seeds_q"] = seeds_q
-                output["gen_kl"] = kl
-                output["gen_seeds_prior_mean"] = prior_mean_seeds
-                output["gen_prior_dispersion"] = prior_dispersion
+            logits = gen_out["logits"]
+            output["gen_prob_std"] = gen_out["gen_prob_std"]
+            output["gen_branch_ratio"] = gen_out["gen_branch_ratio"]
+            output["gen_sample_dispersion"] = gen_out["gen_sample_dispersion"]
+            output["gen_latent_sample"] = gen_out["gen_latent_sample"]
+            teacher_latent = merged.get("kd_teacher_latent")
+            if teacher_latent is not None:
+                gen_loss, gen_stats = self.topo_gen.gen_loss(gen_out["gen_cond"], teacher_latent)
+                output["gen_loss"] = gen_loss
+                for key, value in gen_stats.items():
+                    output[f"gen_{key}"] = value
+        output["logits"] = logits
         if "label" in merged:
             labels = merged["label"].float()
             logits_for_loss = (

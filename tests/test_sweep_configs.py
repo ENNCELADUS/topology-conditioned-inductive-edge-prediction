@@ -9,7 +9,6 @@ via cadence-2 reselection), and its sweep ``output_dir``. The zero-KD
 control anchor is the published B0 run, not a sweep point.
 """
 
-from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -91,8 +90,8 @@ def test_sweep_config_differs_from_base_only_in_distill_eval_and_output_dir(stem
     expected_distill_mapping = base_distill_mapping | expected_weights
     assert sweep["distill"] == expected_distill_mapping
 
-    base_distill = DistillConfig.from_mapping(base_distill_mapping)
     distill = DistillConfig.from_mapping(cast(dict[str, object], sweep["distill"]))
+    expected_distill = DistillConfig.from_mapping(expected_distill_mapping)
     assert distill.arm == arm
-    assert distill == replace(base_distill, **expected_weights)
+    assert distill == expected_distill
     assert sweep["output_dir"] == f"outputs/b1_row_kd_hpo/{stem}"

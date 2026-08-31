@@ -156,7 +156,12 @@ def _expected_checkpoint_id(checkpoint: Path) -> str | None:
 
 
 def _require_scoring_identity(
-    *, artifact: ScoresArtifact, checkpoint_id: str | None, strategy: str, label: str
+    *,
+    artifact: ScoresArtifact,
+    checkpoint_id: str | None,
+    strategy: str,
+    topo_gen_control: str | None,
+    label: str,
 ) -> None:
     """Bind a scored or reused artifact to this invocation's checkpoint and split."""
     if checkpoint_id is not None and artifact.meta.get("checkpoint_id") != checkpoint_id:
@@ -167,6 +172,11 @@ def _require_scoring_identity(
     if artifact.meta.get("strategy") != strategy:
         raise ValueError(
             f"{label}: strategy {artifact.meta.get('strategy')!r} does not match {strategy!r}"
+        )
+    if artifact.meta.get("topo_gen_control") != topo_gen_control:
+        raise ValueError(
+            f"{label}: topo_gen_control {artifact.meta.get('topo_gen_control')!r} "
+            f"does not match {topo_gen_control!r}"
         )
 
 
@@ -298,6 +308,7 @@ def _build_score_args(
     grounding_cache: Path,
     pack_dir: Path | None,
     scaffold_control: str | None,
+    topo_gen_control: str | None,
     rescore_reason: str | None,
     scoring_run_id: str | None,
     allow_oracle_diagnostic: bool,
@@ -336,6 +347,8 @@ def _build_score_args(
         args += ["--pack-dir", str(pack_dir)]
     if scaffold_control is not None:
         args += ["--scaffold-control", scaffold_control]
+    if topo_gen_control is not None:
+        args += ["--topo-gen-control", topo_gen_control]
     if rescore_reason is not None:
         args += ["--rescore-reason", rescore_reason]
     if scoring_run_id is not None:
@@ -362,6 +375,7 @@ def run_test_protocol(
     score_runner: ScoreRunner,
     pack_dir: Path | None = None,
     scaffold_control: str | None = None,
+    topo_gen_control: str | None = None,
     rescore_reason: str | None = None,
     model_family: str | None = None,
     model_config: Path | None = None,
@@ -383,6 +397,7 @@ def run_test_protocol(
         score_runner: Seam that performs one scoring pass.
         pack_dir: Optional GPU-resident packed BF16 feature directory.
         scaffold_control: Optional scoring-time structure control.
+        topo_gen_control: Optional topology-generator scoring-time control.
         rescore_reason: Required by the test-access ledger when this
             ``(arm, seed)`` has already opened held-out data.
         model_family: Explicit model family for a bare legacy checkpoint (only
@@ -496,6 +511,7 @@ def run_test_protocol(
             grounding_cache=scores_dir / f"grounding_cache_{support_namespace}_support.npz",
             pack_dir=pack_dir,
             scaffold_control=scaffold_control,
+            topo_gen_control=topo_gen_control,
             rescore_reason=rescore_reason if allow_rescore_reason else None,
             scoring_run_id=scoring_run_id if include_scoring_run_id else None,
             allow_oracle_diagnostic=allow_oracle_diagnostic,
@@ -519,6 +535,7 @@ def run_test_protocol(
         artifact=validation_artifact,
         checkpoint_id=expected_checkpoint_id,
         strategy=strategy,
+        topo_gen_control=topo_gen_control,
         label=str(validation_path),
     )
     validation_split = _load_val_region_split(data_root, strategy)
@@ -541,12 +558,36 @@ def run_test_protocol(
         allow_rescore_reason=True,
         include_scoring_run_id=is_egostitch_e2e_family,
     )
+    test_artifact = load_scores(test_path)
+    validate_artifact_precision(test_artifact, label=str(test_path))
+    _require_full_universe(test_artifact, label=str(test_path))
+    _require_scoring_identity(
+        artifact=test_artifact,
+        checkpoint_id=expected_checkpoint_id,
+        strategy=strategy,
+        topo_gen_control=topo_gen_control,
+        label=str(test_path),
+    )
+
     topology_path = _score(
         "test_topology",
         support_namespace="test",
         allow_rescore_reason=True,
         include_scoring_run_id=is_egostitch_e2e_family,
     )
+    topology_artifact = load_scores(topology_path)
+    validate_artifact_precision(topology_artifact, label=str(topology_path))
+    _require_pairs_source(topology_artifact, "test_topology", label=str(topology_path))
+    _require_full_universe(topology_artifact, label=str(topology_path))
+    _require_scoring_identity(
+        artifact=topology_artifact,
+        checkpoint_id=expected_checkpoint_id,
+        strategy=strategy,
+        topo_gen_control=topo_gen_control,
+        label=str(topology_path),
+    )
+
+    _require_same_checkpoint(validation_artifact, test_artifact, topology_artifact)
 
     # 3. Classification uses the same validation-selected operating point:
     # logits shift by -t* so the frozen threshold sits at probability 0.5
@@ -562,32 +603,6 @@ def run_test_protocol(
         "selected_logit_threshold": fixed_selection.logit_threshold,
         "selected_probability_threshold": float(expit(fixed_selection.logit_threshold)),
     }
-
-    # Reload test/topology directly (report_edge_metrics only returns a
-    # metrics summary, not the raw artifact) so their meta is available for the
-    # arm/provenance blocks, and so graph assembly has topology logits/pairs.
-    test_artifact = load_scores(test_path)
-    validate_artifact_precision(test_artifact, label=str(test_path))
-    _require_full_universe(test_artifact, label=str(test_path))
-    _require_scoring_identity(
-        artifact=test_artifact,
-        checkpoint_id=expected_checkpoint_id,
-        strategy=strategy,
-        label=str(test_path),
-    )
-
-    topology_artifact = load_scores(topology_path)
-    validate_artifact_precision(topology_artifact, label=str(topology_path))
-    _require_pairs_source(topology_artifact, "test_topology", label=str(topology_path))
-    _require_full_universe(topology_artifact, label=str(topology_path))
-    _require_scoring_identity(
-        artifact=topology_artifact,
-        checkpoint_id=expected_checkpoint_id,
-        strategy=strategy,
-        label=str(topology_path),
-    )
-
-    _require_same_checkpoint(validation_artifact, test_artifact, topology_artifact)
 
     # 4. Replay the frozen validation threshold unchanged on every test sample
     # -- the single reported topology operating point. Self-loops participate.
@@ -616,6 +631,7 @@ def run_test_protocol(
         "arm": arm,
         "seed": seed,
         "model_family": meta.get("model_family"),
+        "topo_gen_control": meta.get("topo_gen_control"),
         # `score_universe` never writes `run_kind` into score metadata, so the
         # artifact's own value is always absent. The published training
         # metadata is the only place a run's formal/diagnostic classification
@@ -705,6 +721,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--scaffold-control", default=None, help="egostitch_e2e scoring-time structure control"
     )
     parser.add_argument(
+        "--topo-gen-control",
+        choices=["branch_zero", "shuffle"],
+        default=None,
+        help="v3_1 topology-generator scoring-time control",
+    )
+    parser.add_argument(
         "--rescore-reason",
         default=None,
         help="required reason for a repeated egostitch_e2e held-out scoring epoch",
@@ -791,6 +813,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         score_runner=_score_runner,
         pack_dir=args.pack_dir,
         scaffold_control=args.scaffold_control,
+        topo_gen_control=args.topo_gen_control,
         rescore_reason=args.rescore_reason,
         model_family=args.model_family,
         model_config=args.model_config,

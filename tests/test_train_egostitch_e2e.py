@@ -2473,8 +2473,7 @@ class TestPrepareAndAssembleE2E:
         assert data.val_ball_union is not None
         assert data.val_cascade_ball_union is not None
         assert all(
-            len(balls) == 2
-            for balls in data.val_cascade_topology_reference.buckets.values()
+            len(balls) == 2 for balls in data.val_cascade_topology_reference.buckets.values()
         )
         assert data.val_cascade_ball_union.u_idx.size < data.val_ball_union.u_idx.size
 

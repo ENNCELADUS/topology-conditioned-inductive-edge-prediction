@@ -144,38 +144,6 @@ def kd_gram_loss(
     return _masked_mean((gram_student - gram_teacher).square(), off_diagonal)
 
 
-def kd_seed_loss(
-    student_seeds: torch.Tensor,
-    teacher_seeds: torch.Tensor,
-    *,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """D9 mean per-slot cosine distance to the teacher's seed tokens."""
-    student_norm = F.normalize(student_seeds, p=2, dim=-1, eps=eps)
-    teacher_norm = F.normalize(teacher_seeds.to(dtype=student_seeds.dtype), p=2, dim=-1, eps=eps)
-    return (1.0 - (student_norm * teacher_norm).sum(dim=-1)).mean()
-
-
-def kd_seed_gram_loss(
-    student_seeds: torch.Tensor,
-    teacher_seeds: torch.Tensor,
-    *,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """D9 relative Frobenius match of the raw within-pair seed Gram."""
-    teacher = teacher_seeds.to(dtype=student_seeds.dtype)
-    gram_student = student_seeds @ student_seeds.transpose(1, 2)
-    gram_teacher = teacher @ teacher.transpose(1, 2)
-    diff2 = (gram_student - gram_teacher).square().sum(dim=(1, 2))
-    scale = gram_teacher.square().sum(dim=(1, 2))
-    return (diff2 / (scale + eps)).mean()
-
-
-def kd_kl_loss(kl_per_dim: torch.Tensor, *, free_bits: float) -> torch.Tensor:
-    """D9 mean free-bits KL reduction."""
-    return kl_per_dim.clamp_min(free_bits).sum(dim=-1).mean()
-
-
 def kd_set_seed_loss(
     student_seeds: torch.Tensor,
     teacher_seeds: torch.Tensor,
@@ -224,12 +192,9 @@ __all__ = [
     "DEFAULT_TEMPERATURE",
     "kd_dist_loss",
     "kd_gram_loss",
-    "kd_kl_loss",
     "kd_logit_loss",
     "kd_rank_loss",
     "kd_rep_loss",
-    "kd_seed_gram_loss",
-    "kd_seed_loss",
     "kd_set_gram_loss",
     "kd_set_seed_loss",
 ]

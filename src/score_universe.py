@@ -95,6 +95,7 @@ from src.data.val_region import (
     derive_val_region_split,
 )
 from src.model.egostitch.classifier.b0_v31 import V3_1
+from src.model.egostitch.classifier.topo_gen import CONTROLS, TopoGenBase
 from src.model.egostitch.generator.assemble import make_scaffold_input_perturbation
 
 if TYPE_CHECKING:
@@ -991,6 +992,18 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
     shards = [_load_shard(path) for path in inputs]
 
     reference = shards[0]
+    for shard in shards:
+        if "topo_gen_control" not in shard.meta:
+            raise ValueError(
+                f"merge input {shard.path} is missing required meta 'topo_gen_control'"
+            )
+    reference_topo_gen_control = reference.meta["topo_gen_control"]
+    if any(shard.meta["topo_gen_control"] != reference_topo_gen_control for shard in shards[1:]):
+        raise ValueError(
+            "merge inputs disagree on meta 'topo_gen_control': "
+            f"{[shard.meta['topo_gen_control'] for shard in shards]} "
+            f"(files: {[str(shard.path) for shard in shards]})"
+        )
     for key in (
         "checkpoint_id",
         "model_family",
@@ -1982,13 +1995,12 @@ def _score_v3_1_packed(
                 len_a,
                 len_b,
             )
-            logits = model.output_head(pair_repr)
-            if model.pair_latent_gen is not None:
-                delta, _ = model.pair_latent_gen.forward_task(
-                    encoded_a, encoded_b, len_a, len_b, pair_repr
-                )
-                gated = (model.pair_latent_gen.alpha * delta).reshape(logits.shape)
-                logits = logits + gated.to(dtype=logits.dtype)
+            if model.topo_gen is None:
+                logits = model.output_head(pair_repr)
+            else:
+                logits = model.topo_gen.marginal_forward(
+                    encoded_a, encoded_b, len_a, len_b, pair_repr, model.output_head
+                )["logits"]
         out[np.asarray(batch_indices, dtype=np.int64)] = (
             logits.detach().to(torch.float32).cpu().numpy().reshape(-1)
         )
@@ -3058,6 +3070,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=_SCAFFOLD_CONTROL_NONE,
         help="egostitch_e2e scoring-time scaffold control",
     )
+    score.add_argument(
+        "--topo-gen-control",
+        choices=CONTROLS,
+        default=None,
+        help="v3_1 topology-generator scoring-time control",
+    )
     score.add_argument("--shard", type=int, default=None, help="shard index K (with --num-shards)")
     score.add_argument("--num-shards", type=int, default=None, help="total shard count N")
     score.add_argument(
@@ -3179,6 +3197,11 @@ def _run_score(args: argparse.Namespace) -> None:
         model_family=args.model_family,
         model_config=model_config,
     )
+    if args.topo_gen_control is not None:
+        topo_gen = getattr(model, "topo_gen", None)
+        if topo_gen is None:
+            raise SystemExit("--topo-gen-control requires a checkpoint with model.config.topo_gen")
+        cast(TopoGenBase, topo_gen).control = args.topo_gen_control
 
     cazi_context = _resolve_cazi_context(args) if model_family == "cazi_mbn" else None
 
@@ -3327,7 +3350,8 @@ def _run_score(args: argparse.Namespace) -> None:
             "encode_autocast": args.amp,
             "pair_autocast": args.pair_amp or args.amp,
             "logit_storage_dtype": "float32",
-        }
+        },
+        "topo_gen_control": args.topo_gen_control,
     }
     f_logit: NDArray[np.float32] | None = None
     full_logit: NDArray[np.float32] | None = None
@@ -3419,6 +3443,7 @@ def _run_score(args: argparse.Namespace) -> None:
                 "pair_autocast": False,
                 "logit_storage_dtype": "float32",
             },
+            "topo_gen_control": args.topo_gen_control,
             "scaffold_control": {
                 "mode": args.scaffold_control,
                 "seed": _SCAFFOLD_CONTROL_SEED,

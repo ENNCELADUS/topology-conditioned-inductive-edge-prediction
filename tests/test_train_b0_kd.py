@@ -184,7 +184,7 @@ def _production_rank_bank_worker(
             else {"x": torch.tensor([-1.0, -0.5]), "_row_id": torch.tensor([1, 2])}
         )
         output = model(batch)
-        kd_global, _, _ = bank.loss(batch, output, global_step=1, world_size=world_size)
+        kd_global, _ = bank.loss(batch, output, world_size=world_size)
         loss = _scale_kd_loss(
             bank,
             kd_global,
@@ -392,13 +392,13 @@ def test_kd_loss_uses_exact_row_ids(tmp_path: Path) -> None:
     output = {"logits": student_logit}
 
     rows_a = torch.tensor([4, 1, 3])
-    loss_a, stats_a, _ = bank.loss({"_row_id": rows_a}, output, global_step=1)
+    loss_a, stats_a = bank.loss({"_row_id": rows_a}, output)
     expected_a = kd_logit_loss(student_logit, torch.tensor(teacher_logit[[4, 1, 3]]))
     assert torch.allclose(loss_a, expected_a, atol=1e-6)
     assert stats_a["rows"] == 3.0
 
     rows_b = torch.tensor([0, 2, 5])
-    loss_b, _, _ = bank.loss({"_row_id": rows_b}, output, global_step=1)
+    loss_b, _ = bank.loss({"_row_id": rows_b}, output)
     expected_b = kd_logit_loss(student_logit, torch.tensor(teacher_logit[[0, 2, 5]]))
     assert torch.allclose(loss_b, expected_b, atol=1e-6)
     assert not torch.allclose(loss_a, loss_b)
@@ -426,9 +426,7 @@ def test_kd_rank_groups_each_official_row_under_both_endpoint_roles(tmp_path: Pa
         device=torch.device("cpu"),
     )
     student = torch.tensor([-1.0, 1.0], requires_grad=True)
-    loss, stats, _ = bank.loss(
-        {"_row_id": torch.tensor([0, 1])}, {"logits": student}, global_step=1
-    )
+    loss, stats = bank.loss({"_row_id": torch.tensor([0, 1])}, {"logits": student})
     # The shared node is pair_b for both rows. A pair_a-only implementation
     # would see two singleton groups and incorrectly return zero.
     assert loss.item() > 0.0
@@ -462,10 +460,9 @@ def test_kd_gram_uses_shared_forward_pair_representations(tmp_path: Path) -> Non
         device=torch.device("cpu"),
     )
     pair_repr = torch.tensor([[1.0, 0.0], [1.0, 0.0]], requires_grad=True)
-    loss, stats, _ = bank.loss(
+    loss, stats = bank.loss(
         {"_row_id": torch.tensor([0, 1])},
         {"logits": torch.zeros(2), "pair_repr": pair_repr},
-        global_step=1,
     )
     assert loss.item() > 0.0
     assert stats["sum_gram"] > 0.0
@@ -647,9 +644,7 @@ def test_ddp_loop_one_forward_one_backward_per_batch_with_real_kd_bank(tmp_path:
 def test_distill_config_default_and_all_zero_are_inactive_none_arm() -> None:
     assert DistillConfig().arm == "none"
     assert DistillConfig().active is False
-    zero = DistillConfig.from_mapping(
-        {"w_logit": 0.0, "w_rep": 0.0, "w_seed": 0.0, "w_geom": 0.0, "w_kl": 0.0}
-    )
+    zero = DistillConfig.from_mapping({"w_logit": 0.0, "w_rep": 0.0})
     assert zero.arm == "none"
     assert zero.active is False
 
@@ -680,9 +675,7 @@ def test_ddp_loop_distill_none_and_all_zero_are_bit_identical(tmp_path: Path) ->
 
     none_state = _run(None, "none")
     zero_state = _run(
-        DistillConfig.from_mapping(
-            {"w_logit": 0.0, "w_rep": 0.0, "w_seed": 0.0, "w_geom": 0.0, "w_kl": 0.0}
-        ),
+        DistillConfig.from_mapping({"w_logit": 0.0, "w_rep": 0.0}),
         "zero",
     )
 
@@ -833,12 +826,12 @@ def test_epoch_telemetry_kd_logit_loss_is_unweighted_rows_weighted_mean(tmp_path
     sums: dict[str, float] = {}
     totals: list[float] = []
     for rows, student in batches:
-        total, stats, _ = bank.loss({"_row_id": rows}, {"logits": student}, global_step=1)
+        total, stats = bank.loss({"_row_id": rows}, {"logits": student})
         totals.append(float(total.item()))
         for key, value in stats.items():
             sums[key] = sums.get(key, 0.0) + value
 
-    telemetry = bank.epoch_telemetry(Accelerator(cpu=True), sums, None)
+    telemetry = bank.epoch_telemetry(Accelerator(cpu=True), sums)
     bce_a = kd_logit_loss(student_a, torch.tensor(teacher_logit[:4])).item()
     bce_b = kd_logit_loss(student_b, torch.tensor(teacher_logit[4:])).item()
     assert telemetry["kd_logit_loss"] == pytest.approx((4.0 * bce_a + 2.0 * bce_b) / 6.0)
@@ -871,10 +864,8 @@ def test_epoch_telemetry_kd_rank_separates_unweighted_rank_and_dist(tmp_path: Pa
     )
 
     student = torch.tensor([-1.0, 1.0])
-    total, stats, _ = bank.loss(
-        {"_row_id": torch.tensor([0, 1])}, {"logits": student}, global_step=1
-    )
-    telemetry = bank.epoch_telemetry(Accelerator(cpu=True), dict(stats), None)
+    total, stats = bank.loss({"_row_id": torch.tensor([0, 1])}, {"logits": student})
+    telemetry = bank.epoch_telemetry(Accelerator(cpu=True), dict(stats))
 
     # Both rows share n2 as pair_b: groups [a0, a1, b0, b1] = [0, 1, 2, 2].
     groups = torch.tensor([0, 1, 2, 2])
@@ -921,7 +912,7 @@ def test_epoch_telemetry_kd_rep_loss_derived_from_cos(tmp_path: Path) -> None:
         "sum_prob_err": 0.0,
         "sum_rep_cos": 3.0,
     }
-    telemetry = bank.epoch_telemetry(Accelerator(cpu=True), sums, None)
+    telemetry = bank.epoch_telemetry(Accelerator(cpu=True), sums)
     assert telemetry["kd_rep_cos"] == pytest.approx(0.75)
     assert telemetry["kd_rep_loss"] == pytest.approx(0.25)
 
@@ -988,7 +979,7 @@ def test_evaluate_distributed_kd_rep_diagnostics() -> None:
         teacher_logit=teacher_logit,
         teacher_logit_np=teacher_logit.double().numpy(),
         teacher_rep=rep_seed.clone().to(torch.float16),
-        teacher_seeds=None,
+        teacher_latent=None,
     )
     outcome = _evaluate_distributed(
         _RepDiagModel(),
@@ -1022,7 +1013,7 @@ def test_evaluate_distributed_kd_rank_reports_deterministic_block_losses() -> No
         teacher_logit=teacher_logit,
         teacher_logit_np=teacher_logit.double().numpy(),
         teacher_rep=None,
-        teacher_seeds=None,
+        teacher_latent=None,
         endpoint_a=torch.tensor([0, 1]),
         endpoint_b=torch.tensor([2, 2]),
     )
@@ -1052,7 +1043,7 @@ def test_evaluate_distributed_kd_gram_reports_deterministic_block_loss() -> None
         teacher_logit=teacher_logit,
         teacher_logit_np=teacher_logit.double().numpy(),
         teacher_rep=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-        teacher_seeds=None,
+        teacher_latent=None,
     )
     outcome = _evaluate_distributed(
         _RepDiagModel(),
@@ -1106,7 +1097,7 @@ def test_evaluate_distributed_kd_logit_loss_matches_teacher_prob_bce() -> None:
         teacher_logit=teacher_logit,
         teacher_logit_np=teacher_logit.double().numpy(),
         teacher_rep=None,
-        teacher_seeds=None,
+        teacher_latent=None,
     )
     outcome = _evaluate_distributed(
         _RepDiagModel(),
@@ -1185,19 +1176,4 @@ class TestKDRowBankArchChecks:
         model = nn.Module()
         model.kd_rep_head = nn.Linear(4, 4)
         with pytest.raises(RuntimeError, match=r"distill\.w_rep > 0"):
-            self._build(distill, targets, model)
-
-    def test_kd_d9_without_pair_latent_gen_raises(self, tmp_path: Path) -> None:
-        targets = self._targets(tmp_path)
-        distill = DistillConfig(targets_path="t", w_seed=1.0, w_geom=1.0, w_kl=1.0)
-        model = nn.Module()
-        with pytest.raises(RuntimeError, match="pair_latent_gen"):
-            self._build(distill, targets, model)
-
-    def test_pair_latent_gen_present_with_w_seed_zero_raises(self, tmp_path: Path) -> None:
-        targets = self._targets(tmp_path)
-        distill = DistillConfig(targets_path="t", w_logit=1.0)  # w_seed == 0
-        model = nn.Module()
-        model.pair_latent_gen = nn.Module()
-        with pytest.raises(RuntimeError, match=r"distill\.w_seed > 0"):
             self._build(distill, targets, model)

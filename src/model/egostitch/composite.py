@@ -498,9 +498,7 @@ class EgoStitchModel(nn.Module):
         need_topo: bool,
         scaffold_input_perturbation: ScaffoldInputPerturbation | None = None,
         precomputed_graph: ImaginedGraph | None = None,
-    ) -> tuple[
-        E2EPairContext, ImaginedGraph | None, GraphEmbedding | None, GraphEmbedding | None
-    ]:
+    ) -> tuple[E2EPairContext, ImaginedGraph | None, GraphEmbedding | None, GraphEmbedding | None]:
         """Shared implementation behind `build_pair_context_from_states`.
 
         `build_pair_context_from_states` keeps its existing narrow

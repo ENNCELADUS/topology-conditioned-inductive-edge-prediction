@@ -187,7 +187,9 @@ _RRWP_K = 8
 _N_HEADS = 8
 
 
-def _build_encoder(*, d_model: int = _D_MODEL, layers: int = 2) -> GritGmtEncoder:
+def _build_encoder(
+    *, d_model: int = _D_MODEL, layers: int = 2, seeds: int = _SEEDS
+) -> GritGmtEncoder:
     return GritGmtEncoder(
         in_dim=FEAT_DIM,
         num_relations=EDGE_TYPES,
@@ -197,7 +199,7 @@ def _build_encoder(*, d_model: int = _D_MODEL, layers: int = 2) -> GritGmtEncode
         w_rel=0.0,
         rrwp_k=_RRWP_K,
         n_heads=_N_HEADS,
-        seeds=_SEEDS,
+        seeds=seeds,
     )
 
 
@@ -237,6 +239,16 @@ def test_pooled_is_exactly_the_mean_of_the_seed_tokens() -> None:
         out = encoder(graph)
     seed_tokens = out.tokens[:, -_SEEDS:, :]
     torch.testing.assert_close(out.pooled, seed_tokens.mean(dim=1))
+
+
+def test_single_seed_pooled_equals_seed_token() -> None:
+    """PMA(1) appends one seed token and uses it verbatim as pooled output."""
+    encoder = _build_encoder(seeds=1).eval()
+    graph = _random_graph(2, 12)
+    with torch.no_grad():
+        out = encoder(graph)
+    assert out.tokens.shape == (2, 13, _D_MODEL)
+    torch.testing.assert_close(out.pooled, out.tokens[:, -1, :])
 
 
 def test_permutation_of_valid_nodes_leaves_pooled_and_seed_tokens_invariant() -> None:

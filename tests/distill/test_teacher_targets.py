@@ -44,8 +44,8 @@ pytestmark = pytest.mark.unit
 # `_E2E_NODE_DIM`).
 _NODE_DIM = 1536
 _SEEDS = 4
-# The KD seed dump requires the PMA (grit_gmt) encoder: the seed tokens it
-# appends are the teacher target the D9 arm distills.
+# The KD dump requires the PMA (grit_gmt) encoder: its pooled embedding is
+# the kd_gen latent target.
 _TINY_FULL_ORACLE_CONFIG: dict[str, object] = {
     "generator": {
         "name": "full_ego_oracle",
@@ -308,8 +308,6 @@ def test_score_rows_handles_an_empty_row_list() -> None:
     )
     assert scored.teacher_logit.shape == (0,)
     assert scored.teacher_rep.shape[0] == 0
-    assert scored.teacher_seeds.shape[0] == 0
-    assert scored.slot_cos.shape[0] == 0
 
 
 def test_score_rows_is_invariant_to_the_batch_pairs_chunk_size(tmp_path: Path) -> None:
@@ -348,31 +346,19 @@ def test_score_rows_is_invariant_to_the_batch_pairs_chunk_size(tmp_path: Path) -
     n_rows = len(a_positions)
     assert batched.teacher_logit.shape == (n_rows,)
     assert batched.teacher_rep.shape[0] == n_rows
-    assert batched.teacher_seeds.shape == (n_rows, _SEEDS, batched.teacher_rep.shape[1])
-    assert batched.slot_cos.shape == (n_rows, _SEEDS)
     np.testing.assert_allclose(batched.teacher_logit, single.teacher_logit, atol=1e-5, rtol=1e-5)
     np.testing.assert_allclose(
         batched.teacher_rep.astype(np.float32), single.teacher_rep.astype(np.float32), atol=1e-3
-    )
-    np.testing.assert_allclose(
-        batched.teacher_seeds.astype(np.float32),
-        single.teacher_seeds.astype(np.float32),
-        atol=1e-3,
     )
 
 
 # --------------------------------------------------------------------------- shard/merge round-trip
 
 
-def _synthetic_scored_rows(
-    n_rows: int, *, rep_dim: int, seed_count: int, seed_dim: int, rng: np.random.Generator
-) -> tt.ScoredRows:
+def _synthetic_scored_rows(n_rows: int, *, rep_dim: int, rng: np.random.Generator) -> tt.ScoredRows:
     return tt.ScoredRows(
         teacher_logit=rng.standard_normal(n_rows).astype(np.float32),
         teacher_rep=rng.standard_normal((n_rows, rep_dim)).astype(np.float16),
-        teacher_seeds=rng.standard_normal((n_rows, seed_count, seed_dim)).astype(np.float16),
-        slot_cos=rng.standard_normal((n_rows, seed_count)).astype(np.float32),
-        slot_norm_log_ratio=rng.standard_normal((n_rows, seed_count)).astype(np.float32),
     )
 
 
@@ -381,7 +367,7 @@ def test_write_shard_and_merge_shards_round_trip(tmp_path: Path) -> None:
     n_total, num_shards = 7, 3
     a_idx = np.arange(n_total, dtype=np.int32)
     b_idx = ((np.arange(n_total, dtype=np.int32) + 1) % n_total).astype(np.int32)
-    full = _synthetic_scored_rows(n_total, rep_dim=4, seed_count=2, seed_dim=3, rng=rng)
+    full = _synthetic_scored_rows(n_total, rep_dim=4, rng=rng)
 
     output = tmp_path / "kd_targets"
     for shard in range(num_shards):
@@ -389,9 +375,6 @@ def test_write_shard_and_merge_shards_round_trip(tmp_path: Path) -> None:
         shard_scored = tt.ScoredRows(
             teacher_logit=full.teacher_logit[start:end],
             teacher_rep=full.teacher_rep[start:end],
-            teacher_seeds=full.teacher_seeds[start:end],
-            slot_cos=full.slot_cos[start:end],
-            slot_norm_log_ratio=full.slot_norm_log_ratio[start:end],
         )
         tt._write_shard(
             output,
@@ -405,9 +388,6 @@ def test_write_shard_and_merge_shards_round_trip(tmp_path: Path) -> None:
     merged = tt._merge_shards(output, a_idx, b_idx, num_shards)
     np.testing.assert_array_equal(merged.teacher_logit, full.teacher_logit)
     np.testing.assert_array_equal(merged.teacher_rep, full.teacher_rep)
-    np.testing.assert_array_equal(merged.teacher_seeds, full.teacher_seeds)
-    np.testing.assert_array_equal(merged.slot_cos, full.slot_cos)
-    np.testing.assert_array_equal(merged.slot_norm_log_ratio, full.slot_norm_log_ratio)
 
 
 def test_merge_shards_raises_on_a_row_identity_mismatch(tmp_path: Path) -> None:
@@ -419,9 +399,7 @@ def test_merge_shards_raises_on_a_row_identity_mismatch(tmp_path: Path) -> None:
     output = tmp_path / "kd_targets"
     for shard in range(num_shards):
         start, end = _shard_range(n_total, shard, num_shards)
-        shard_scored = _synthetic_scored_rows(
-            end - start, rep_dim=2, seed_count=1, seed_dim=2, rng=rng
-        )
+        shard_scored = _synthetic_scored_rows(end - start, rep_dim=2, rng=rng)
         write_a_idx = a_idx[start:end].copy()
         if shard == 1:
             write_a_idx[0] = 999  # corrupt row identity in the second shard
@@ -497,13 +475,7 @@ def test_build_stats_report_histograms_are_empty_safe() -> None:
 # --------------------------------------------------------------------------- artifact round-trip
 
 
-def _write_toy_artifact(
-    path: Path,
-    *,
-    teacher_seeds: np.ndarray | None = None,
-    val_teacher_seeds: np.ndarray | None = None,
-    seed_symmetry: dict[str, object] | None = None,
-) -> None:
+def _write_toy_artifact(path: Path) -> None:
     rng = np.random.default_rng(0)
     write_kd_targets(
         path,
@@ -522,13 +494,10 @@ def _write_toy_artifact(
         checkpoint_path=Path("checkpoint.pt"),
         checkpoint_sha256="cafebabe",
         checkpoint_id="abc123",
-        teacher_seeds=teacher_seeds,
-        val_teacher_seeds=val_teacher_seeds,
-        seed_symmetry=seed_symmetry,
     )
 
 
-def test_write_load_round_trip_without_seeds(tmp_path: Path) -> None:
+def test_load_kd_targets_has_no_seeds_surface(tmp_path: Path) -> None:
     artifact_dir = tmp_path / "artifact"
     _write_toy_artifact(artifact_dir)
 
@@ -537,45 +506,22 @@ def test_write_load_round_trip_without_seeds(tmp_path: Path) -> None:
     np.testing.assert_array_equal(loaded.pair_a_idx, [0, 0, 1])
     np.testing.assert_array_equal(loaded.pair_b_idx, [1, 2, 2])
     np.testing.assert_array_equal(loaded.pair_label, [1, 0, 1])
+    np.testing.assert_array_equal(
+        loaded.teacher_logit, np.array([0.5, -0.3, 1.2], dtype=np.float32)
+    )
+    assert loaded.teacher_rep.shape == (3, 4)
     np.testing.assert_array_equal(loaded.val_pair_a_idx, [0])
     np.testing.assert_array_equal(loaded.val_pair_b_idx, [2])
+    np.testing.assert_array_equal(loaded.val_pair_label, [0])
+    np.testing.assert_array_equal(loaded.val_teacher_logit, np.array([0.1], dtype=np.float32))
+    assert loaded.val_teacher_rep.shape == (1, 4)
     assert loaded.manifest["format"] == "kd_row_targets_v1"
     assert loaded.manifest["truth_source"] == "training_structure"
     assert loaded.manifest["checkpoint_id"] == "abc123"
-    assert loaded.teacher_seeds is None  # load_seeds defaults to False
-    assert loaded.val_teacher_seeds is None
-    assert "seed_count" not in loaded.manifest
-
-
-def test_write_load_round_trip_with_seeds_and_the_load_seeds_flag(tmp_path: Path) -> None:
-    artifact_dir = tmp_path / "artifact"
-    rng = np.random.default_rng(1)
-    seeds = rng.standard_normal((3, 2, 4)).astype(np.float16)
-    val_seeds = rng.standard_normal((1, 2, 4)).astype(np.float16)
-    stats: dict[str, object] = {"slot_cos": {"per_slot_mean": [0.9, 0.8]}}
-    _write_toy_artifact(
-        artifact_dir, teacher_seeds=seeds, val_teacher_seeds=val_seeds, seed_symmetry=stats
-    )
-
-    loaded_default = load_kd_targets(artifact_dir)
-    assert loaded_default.teacher_seeds is None  # load_seeds=False skips the arrays
-
-    loaded = load_kd_targets(artifact_dir, load_seeds=True)
-    assert loaded.teacher_seeds is not None
-    assert loaded.val_teacher_seeds is not None
-    np.testing.assert_array_equal(loaded.teacher_seeds, seeds)
-    np.testing.assert_array_equal(loaded.val_teacher_seeds, val_seeds)
-    assert loaded.manifest["seed_count"] == 2
-    assert loaded.manifest["seed_dim"] == 4
-    assert loaded.manifest["seed_symmetry"] == stats
-
-
-def test_load_seeds_true_without_seeds_in_the_artifact_raises(tmp_path: Path) -> None:
-    artifact_dir = tmp_path / "artifact"
-    _write_toy_artifact(artifact_dir)
-
-    with pytest.raises(ValueError, match="teacher_seeds"):
-        load_kd_targets(artifact_dir, load_seeds=True)
+    assert not hasattr(loaded, "teacher_seeds")
+    assert not hasattr(loaded, "val_teacher_seeds")
+    for key in ("seed_count", "seed_dim", "teacher_seeds_dtype", "seed_symmetry"):
+        assert key not in loaded.manifest
 
 
 def test_load_rejects_a_missing_npz(tmp_path: Path) -> None:

@@ -261,9 +261,7 @@ def test_incremental_shape_curve_matches_brute_force_with_unequal_buckets_and_ti
     config = MMDConfig(sigma=0.7, reference_epsilon=1e-10)
     samples = _local_samples(pairs=pairs, logits=logits, g_ref=graph, buckets=buckets)
     thresholds = _candidate_thresholds(samples)
-    feasible_indices = np.unique(
-        np.array([2, 4, thresholds.size - 1], dtype=np.intp)
-    )
+    feasible_indices = np.unique(np.array([2, 4, thresholds.size - 1], dtype=np.intp))
     assert np.any(np.diff(feasible_indices) > 1)
     assert np.unique(logits).size < logits.size
     assert sum(("n1", "n1") in sample.pairs for sample in samples) > 1
@@ -298,9 +296,10 @@ def test_incremental_shape_curve_matches_brute_force_with_unequal_buckets_and_ti
     )
     incremental_best = int(np.argmin(np.log(np.maximum(incremental, 1e-10)).mean(axis=1)))
     brute_force_best = int(np.argmin(np.log(np.maximum(brute_force, 1e-10)).mean(axis=1)))
-    assert thresholds[feasible_indices[incremental_best]] == thresholds[
-        feasible_indices[brute_force_best]
-    ]
+    assert (
+        thresholds[feasible_indices[incremental_best]]
+        == thresholds[feasible_indices[brute_force_best]]
+    )
 
 
 def test_vectorized_kernel_row_matches_scalar_variable_support() -> None:
@@ -348,9 +347,7 @@ def test_vectorized_mmd_update_matches_scalar_and_batches_rows(
     row_calls = 0
     kernel_row = fixed_threshold._descriptor_kernel_row
 
-    def counted_row(
-        left: np.ndarray, right: Sequence[np.ndarray], sigma: float
-    ) -> np.ndarray:
+    def counted_row(left: np.ndarray, right: Sequence[np.ndarray], sigma: float) -> np.ndarray:
         nonlocal row_calls
         row_calls += 1
         return kernel_row(left, right, sigma)
@@ -391,9 +388,7 @@ def test_incremental_sweep_refreshes_a_tied_sample_once(
         ),
     )
     thresholds = np.array([np.nextafter(2.0, np.inf), 2.0, 1.0])
-    references = {
-        statistic: {2: [np.ones(1), np.ones(1)]} for statistic in STATISTICS
-    }
+    references = {statistic: {2: [np.ones(1), np.ones(1)]} for statistic in STATISTICS}
     descriptor_calls = 0
 
     def counted_descriptor(graph: nx.Graph, statistic: str) -> np.ndarray:
@@ -452,8 +447,7 @@ def test_incremental_sweep_descriptor_work_scales_with_events_not_candidates(
     )
     feasible_indices = np.arange(nonfeasible_prefix + 1, thresholds.size, dtype=np.intp)
     references = {
-        statistic: {size: [np.ones(1)] * 50 for size in sizes}
-        for statistic in STATISTICS
+        statistic: {size: [np.ones(1)] * 50 for size in sizes} for statistic in STATISTICS
     }
     descriptor_calls = 0
 

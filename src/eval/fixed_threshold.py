@@ -284,9 +284,7 @@ def _descriptor_kernel_row(
         right_values[index, : len(values)] = values
     left_values = np.pad(left, (0, support_size - len(left)))
     distances = np.abs(right_values - left_values).sum(axis=1) / 2.0
-    kernel_values: NDArray[np.float64] = np.exp(
-        -(distances * distances) / (2.0 * sigma * sigma)
-    )
+    kernel_values: NDArray[np.float64] = np.exp(-(distances * distances) / (2.0 * sigma * sigma))
     return kernel_values
 
 
@@ -374,9 +372,7 @@ def _incremental_mmd_ratio_curve(
     graphs: list[nx.Graph] = []
     event_order: list[NDArray[np.intp]] = []
     for sample_index, sample in enumerate(samples):
-        sample_indices_by_size[sample.size][sample_index] = len(
-            sample_indices_by_size[sample.size]
-        )
+        sample_indices_by_size[sample.size][sample_index] = len(sample_indices_by_size[sample.size])
         graph = nx.Graph()
         graph.add_nodes_from(sample.nodes)
         graphs.append(graph)
@@ -410,12 +406,9 @@ def _incremental_mmd_ratio_curve(
                 for index in sample_indices
             ]
             reference = [
-                _normalized_descriptor(values)
-                for values in reference_by_stat_size[statistic][size]
+                _normalized_descriptor(values) for values in reference_by_stat_size[statistic][size]
             ]
-            states_by_stat[statistic][size] = _initialize_mmd_state(
-                predicted, reference, config
-            )
+            states_by_stat[statistic][size] = _initialize_mmd_state(predicted, reference, config)
 
     ratios = np.empty((feasible_indices.size, len(STATISTICS)), dtype=np.float64)
     for statistic_index, statistic in enumerate(STATISTICS):

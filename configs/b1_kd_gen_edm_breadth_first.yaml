@@ -1,9 +1,8 @@
-# B1 KD-D9 arm on the simple B0 protocol: V3.1 student + pair-conditioned
-# oracle latent generation (CVAE) trained on the full-row teacher-target
-# artifact's symmetrized PMA seed tokens (`teacher_seeds`), joined to the
-# training batch by `_row_id` -- one student forward, no separate KD stream.
-# The deployed residual reads only endpoint encodings and uses fixed-epsilon
-# prior marginalization. Matched control is `b1_kd_control_breadth_first.yaml`.
+# B1 kd_gen EDM arm -- V3.1 student + EDM topology-latent
+# generator on the PMA(1) teacher's 512-D pooled latent (kd_row_targets_pma1),
+# pooled residual adapter fusion, probability-space M-sample marginalization.
+# Matched control run: b1_kd_gen_det (det_mse family). Spec:
+# docs/superpowers/specs/2026-08-30-kd-gen-arm-design.md
 model:
   family: v3_1
   config:
@@ -31,15 +30,15 @@ model:
       spectral_norm: false
     mixing:
       mode: none
-    pair_latent_gen:
-      z_dim: 64
-      cond_dim: 256
-      hidden: 512
-      seed_count: 4
-      seed_dim: 512
-      mc_samples: 4
-      kl_free_bits: 0.05
     label_smoothing: 0.05 # symmetric BCE smoothing, fixed V3.1 recipe
+    topo_gen:
+      name: edm
+      latent_dim: 512
+      cond_dim: 256
+      blocks: 4
+      adapter_dim: 128
+      mc_samples: 4
+      sampler_steps: 4
 data:
   root: data
   strategy: breadth_first
@@ -77,13 +76,10 @@ runtime:
   probe_warmup_steps: 10
   probe_timed_steps: 30
 seed: 0
-output_dir: outputs/b1_row_kd/kd_d9
+output_dir: outputs/b1_row_kd/kd_gen_edm
 mixed_precision: "bf16" # pinned for the H20 E2 target
 distill:
-  targets_path: outputs/distill/kd_row_targets_breadth_first
-  w_seed: 1.0
-  w_geom: 0.3
-  w_kl: 0.05
-  kl_warmup_steps: 2000
-  joint_start_epoch: 13 # 12 pretrain epochs, then 13 joint epochs
+  targets_path: outputs/distill/kd_row_targets_pma1_breadth_first
+  w_gen: 1.0
+  joint_warmup_frac: 0.1
   gen_lr_scale: 0.1
