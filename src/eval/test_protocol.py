@@ -156,7 +156,12 @@ def _expected_checkpoint_id(checkpoint: Path) -> str | None:
 
 
 def _require_scoring_identity(
-    *, artifact: ScoresArtifact, checkpoint_id: str | None, strategy: str, label: str
+    *,
+    artifact: ScoresArtifact,
+    checkpoint_id: str | None,
+    strategy: str,
+    topo_gen_control: str | None,
+    label: str,
 ) -> None:
     """Bind a scored or reused artifact to this invocation's checkpoint and split."""
     if checkpoint_id is not None and artifact.meta.get("checkpoint_id") != checkpoint_id:
@@ -167,6 +172,11 @@ def _require_scoring_identity(
     if artifact.meta.get("strategy") != strategy:
         raise ValueError(
             f"{label}: strategy {artifact.meta.get('strategy')!r} does not match {strategy!r}"
+        )
+    if artifact.meta.get("topo_gen_control") != topo_gen_control:
+        raise ValueError(
+            f"{label}: topo_gen_control {artifact.meta.get('topo_gen_control')!r} "
+            f"does not match {topo_gen_control!r}"
         )
 
 
@@ -525,6 +535,7 @@ def run_test_protocol(
         artifact=validation_artifact,
         checkpoint_id=expected_checkpoint_id,
         strategy=strategy,
+        topo_gen_control=topo_gen_control,
         label=str(validation_path),
     )
     validation_split = _load_val_region_split(data_root, strategy)
@@ -579,6 +590,7 @@ def run_test_protocol(
         artifact=test_artifact,
         checkpoint_id=expected_checkpoint_id,
         strategy=strategy,
+        topo_gen_control=topo_gen_control,
         label=str(test_path),
     )
 
@@ -590,6 +602,7 @@ def run_test_protocol(
         artifact=topology_artifact,
         checkpoint_id=expected_checkpoint_id,
         strategy=strategy,
+        topo_gen_control=topo_gen_control,
         label=str(topology_path),
     )
 
@@ -622,6 +635,7 @@ def run_test_protocol(
         "arm": arm,
         "seed": seed,
         "model_family": meta.get("model_family"),
+        "topo_gen_control": meta.get("topo_gen_control"),
         # `score_universe` never writes `run_kind` into score metadata, so the
         # artifact's own value is always absent. The published training
         # metadata is the only place a run's formal/diagnostic classification

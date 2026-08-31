@@ -27,7 +27,7 @@ from numpy.typing import NDArray
 from scipy.special import expit
 from src.eval import test_protocol
 from src.eval.test_protocol import run_test_protocol
-from src.score_universe import ScoresArtifact, validate_artifact_precision
+from src.score_universe import ScoresArtifact, load_scores, save_scores, validate_artifact_precision
 
 from tests.test_g1_hardened_e2 import (
     _NODES,
@@ -193,6 +193,20 @@ def _write_checkpoint(tmp_path: Path, *, model_family: str = "v3_1") -> Path:
     return checkpoint
 
 
+def _copy_with_topo_gen_control(source: Path, destination: Path, control: str | None) -> None:
+    artifact = load_scores(source)
+    save_scores(
+        destination,
+        node_ids=artifact.node_ids,
+        u_idx=artifact.u_idx,
+        v_idx=artifact.v_idx,
+        logit=artifact.logit,
+        label=artifact.label,
+        row_start=0,
+        meta={**artifact.meta, "topo_gen_control": control},
+    )
+
+
 # --------------------------------------------------------------------------- tests
 
 
@@ -225,7 +239,12 @@ class TestRunTestProtocol:
         self, tmp_path: Path, control: str
     ) -> None:
         fixture = _build_fixture(tmp_path)
-        runner = _FakeScoreRunner(fixture.artifacts)
+        controlled_artifacts: dict[str, Path] = {}
+        for pairs_source, source in fixture.artifacts.items():
+            destination = tmp_path / "controlled_scores" / f"{pairs_source}.npz"
+            _copy_with_topo_gen_control(source, destination, control)
+            controlled_artifacts[pairs_source] = destination
+        runner = _FakeScoreRunner(controlled_artifacts)
 
         run_test_protocol(
             checkpoint=_write_checkpoint(tmp_path),
@@ -595,6 +614,85 @@ class TestRunTestProtocol:
 
 class TestReuseExistingScores:
     """Resuming a run whose later pass failed must not redo the finished ones."""
+
+    @pytest.mark.parametrize("mismatched_control", [None, "branch_zero"])
+    @pytest.mark.parametrize("mismatched_source", ["val_topology", "test", "test_topology"])
+    def test_rejects_reused_topo_gen_control_mismatch(
+        self, tmp_path: Path, mismatched_control: str | None, mismatched_source: str
+    ) -> None:
+        fixture = _build_fixture(tmp_path)
+        output_dir = tmp_path / "outputs" / f"mismatch_{mismatched_source}_{mismatched_control}"
+        scores_dir = output_dir / "scores"
+        for pairs_source, source in fixture.artifacts.items():
+            control = mismatched_control if pairs_source == mismatched_source else "shuffle"
+            _copy_with_topo_gen_control(source, scores_dir / f"{pairs_source}.npz", control)
+
+        runner = _FakeScoreRunner(fixture.artifacts)
+        with pytest.raises(ValueError, match="topo_gen_control.*does not match"):
+            run_test_protocol(
+                checkpoint=_write_checkpoint(tmp_path),
+                output_dir=output_dir,
+                data_root=fixture.data_root,
+                strategy=_STRATEGY,
+                arm="kd_gen_shuffle",
+                seed=0,
+                score_runner=runner,
+                topo_gen_control="shuffle",
+                reuse_existing_scores=True,
+            )
+
+        assert runner.calls == []
+        assert not (output_dir / "test_report.json").exists()
+
+    def test_accepts_matching_reused_topo_gen_control(self, tmp_path: Path) -> None:
+        fixture = _build_fixture(tmp_path)
+        output_dir = tmp_path / "outputs" / "matching_shuffle"
+        scores_dir = output_dir / "scores"
+        for pairs_source, source in fixture.artifacts.items():
+            _copy_with_topo_gen_control(source, scores_dir / f"{pairs_source}.npz", "shuffle")
+
+        runner = _FakeScoreRunner(fixture.artifacts)
+        result = run_test_protocol(
+            checkpoint=_write_checkpoint(tmp_path),
+            output_dir=output_dir,
+            data_root=fixture.data_root,
+            strategy=_STRATEGY,
+            arm="kd_gen_shuffle",
+            seed=0,
+            score_runner=runner,
+            topo_gen_control="shuffle",
+            reuse_existing_scores=True,
+        )
+
+        assert runner.calls == []
+        arm_block = result.report["arm"]
+        assert isinstance(arm_block, dict)
+        assert arm_block["topo_gen_control"] == "shuffle"
+
+    def test_accepts_missing_control_for_default_live_reuse(self, tmp_path: Path) -> None:
+        fixture = _build_fixture(tmp_path)
+        output_dir = tmp_path / "outputs" / "matching_live"
+        scores_dir = output_dir / "scores"
+        scores_dir.mkdir(parents=True)
+        for pairs_source, source in fixture.artifacts.items():
+            (scores_dir / f"{pairs_source}.npz").write_bytes(source.read_bytes())
+
+        runner = _FakeScoreRunner(fixture.artifacts)
+        result = run_test_protocol(
+            checkpoint=_write_checkpoint(tmp_path),
+            output_dir=output_dir,
+            data_root=fixture.data_root,
+            strategy=_STRATEGY,
+            arm="full",
+            seed=0,
+            score_runner=runner,
+            reuse_existing_scores=True,
+        )
+
+        assert runner.calls == []
+        arm_block = result.report["arm"]
+        assert isinstance(arm_block, dict)
+        assert arm_block["topo_gen_control"] is None
 
     def test_reuses_written_artifacts_and_only_scores_what_is_missing(self, tmp_path: Path) -> None:
         """Mimics the real failure: test finished, test_topology did not."""
