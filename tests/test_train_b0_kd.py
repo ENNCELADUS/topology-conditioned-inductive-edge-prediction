@@ -648,7 +648,7 @@ def test_distill_config_default_and_all_zero_are_inactive_none_arm() -> None:
     assert DistillConfig().arm == "none"
     assert DistillConfig().active is False
     zero = DistillConfig.from_mapping(
-        {"w_logit": 0.0, "w_rep": 0.0, "w_seed": 0.0, "w_geom": 0.0, "w_kl": 0.0}
+        {"w_logit": 0.0, "w_rep": 0.0}
     )
     assert zero.arm == "none"
     assert zero.active is False
@@ -681,7 +681,7 @@ def test_ddp_loop_distill_none_and_all_zero_are_bit_identical(tmp_path: Path) ->
     none_state = _run(None, "none")
     zero_state = _run(
         DistillConfig.from_mapping(
-            {"w_logit": 0.0, "w_rep": 0.0, "w_seed": 0.0, "w_geom": 0.0, "w_kl": 0.0}
+            {"w_logit": 0.0, "w_rep": 0.0}
         ),
         "zero",
     )
@@ -1185,19 +1185,4 @@ class TestKDRowBankArchChecks:
         model = nn.Module()
         model.kd_rep_head = nn.Linear(4, 4)
         with pytest.raises(RuntimeError, match=r"distill\.w_rep > 0"):
-            self._build(distill, targets, model)
-
-    def test_kd_d9_without_pair_latent_gen_raises(self, tmp_path: Path) -> None:
-        targets = self._targets(tmp_path)
-        distill = DistillConfig(targets_path="t", w_seed=1.0, w_geom=1.0, w_kl=1.0)
-        model = nn.Module()
-        with pytest.raises(RuntimeError, match="pair_latent_gen"):
-            self._build(distill, targets, model)
-
-    def test_pair_latent_gen_present_with_w_seed_zero_raises(self, tmp_path: Path) -> None:
-        targets = self._targets(tmp_path)
-        distill = DistillConfig(targets_path="t", w_logit=1.0)  # w_seed == 0
-        model = nn.Module()
-        model.pair_latent_gen = nn.Module()
-        with pytest.raises(RuntimeError, match=r"distill\.w_seed > 0"):
             self._build(distill, targets, model)

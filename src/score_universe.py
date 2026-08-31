@@ -1982,13 +1982,12 @@ def _score_v3_1_packed(
                 len_a,
                 len_b,
             )
-            logits = model.output_head(pair_repr)
-            if model.pair_latent_gen is not None:
-                delta, _ = model.pair_latent_gen.forward_task(
-                    encoded_a, encoded_b, len_a, len_b, pair_repr
-                )
-                gated = (model.pair_latent_gen.alpha * delta).reshape(logits.shape)
-                logits = logits + gated.to(dtype=logits.dtype)
+            if model.topo_gen is None:
+                logits = model.output_head(pair_repr)
+            else:
+                logits = model.topo_gen.marginal_forward(
+                    encoded_a, encoded_b, len_a, len_b, pair_repr, model.output_head
+                )["logits"]
         out[np.asarray(batch_indices, dtype=np.int64)] = (
             logits.detach().to(torch.float32).cpu().numpy().reshape(-1)
         )

@@ -5,6 +5,7 @@ Spec: docs/superpowers/specs/2026-08-30-kd-gen-arm-design.md.
 
 import pytest
 import torch
+from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
 from src.model.egostitch.classifier.topo_gen import (
     TopoGenBase,
     build_topo_gen,
@@ -167,3 +168,65 @@ def test_generator_parameters_exclude_fusion() -> None:
     assert id(module.gate) not in gen_ids
     assert id(module.adapter_up.weight) not in gen_ids
     assert gen_ids  # condition + core are present
+
+
+def _v31(topo: bool) -> V3_1:
+    torch.manual_seed(0)
+    config = {**BEST_V3_1_CONFIG, "input_dim": 24, "d_model": 16, "n_heads": 2}
+    if topo:
+        config["topo_gen"] = {
+            "name": "edm",
+            "latent_dim": 8,
+            "cond_dim": 8,
+            "blocks": 1,
+            "adapter_dim": 4,
+            "mc_samples": 2,
+            "sampler_steps": 2,
+        }
+    return V3_1(**config)
+
+
+def _v31_batch(batch: int = 3) -> dict[str, torch.Tensor]:
+    torch.manual_seed(5)
+    return {
+        "emb_a": torch.randn(batch, 4, 24),
+        "emb_b": torch.randn(batch, 4, 24),
+        "len_a": torch.full((batch,), 4, dtype=torch.long),
+        "len_b": torch.full((batch,), 4, dtype=torch.long),
+    }
+
+
+def test_v31_rejects_pair_latent_gen_key() -> None:
+    with pytest.raises(ValueError):
+        _ = V3_1(
+            **{**BEST_V3_1_CONFIG, "input_dim": 24, "d_model": 16, "n_heads": 2},
+            pair_latent_gen={"z_dim": 4},
+        )
+
+
+def test_v31_topo_gen_eval_branch_zero_equals_control() -> None:
+    fused = _v31(topo=True).eval()
+    control = _v31(topo=False).eval()
+    # Same seed + build-last ordering => identical trunk weights.
+    batch = _v31_batch()
+    with torch.no_grad():
+        fused_out = fused(dict(batch))
+        control_out = control(dict(batch))
+    torch.testing.assert_close(
+        fused_out["logits"].float(), control_out["logits"].float(), atol=1e-5, rtol=1e-5
+    )
+    assert "gen_prob_std" in fused_out and "gen_latent_sample" in fused_out
+
+
+def test_v31_topo_gen_kd_outputs_present_with_teacher_latent() -> None:
+    model = _v31(topo=True).train()
+    batch = _v31_batch()
+    batch["kd_teacher_latent"] = torch.randn(3, 8)
+    out = model(batch)
+    assert out["gen_loss"].requires_grad
+    assert out["gen_sigma_bin_loss"].shape == (4,)
+
+
+def test_v31_topo_gen_parameters_nonempty() -> None:
+    assert _v31(topo=True).topo_gen_parameters()
+    assert _v31(topo=False).topo_gen_parameters() == []
