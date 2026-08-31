@@ -156,3 +156,130 @@ No blocking Task 3 concern remains. As explicitly staged by the brief,
 optimizer groups/warmup behavior (Task 5), and loader keyword removal (Task 7)
 land. This commit does not claim a runnable standalone `kd_gen` training arm
 until those later tasks are integrated.
+
+---
+
+## Fix round 1/5: remove residual D9 loss API plumbing
+
+### Review finding and ruling
+
+The Important review finding was valid: after the D9 behavior was removed,
+`KDRowBank.loss` still required an unused `global_step` and returned a third
+permanent `None`; `epoch_telemetry` still accepted an unused KL argument; and
+production plus ordinary-KD tests mirrored those obsolete contracts. This fix
+applies the ruling immediately rather than preserving Task 4's dated
+triple-return snippet.
+
+### TDD RED
+
+`tests/test_train_b0_kd.py` was changed first to call `loss` without
+`global_step` and destructure only `(loss, stats)`, and to call
+`epoch_telemetry(accelerator, sums)` without a KL argument.
+
+Command:
+
+```text
+.venv/bin/python -m pytest \
+  tests/test_train_b0_kd.py::test_kd_loss_uses_exact_row_ids -n0 -q
+```
+
+Exact result: exit 1.
+
+```text
+F                                                                        [100%]
+E       TypeError: KDRowBank.loss() missing 1 required keyword-only argument: 'global_step'
+FAILED tests/test_train_b0_kd.py::test_kd_loss_uses_exact_row_ids - TypeError...
+```
+
+This is the expected old-signature failure after moving the test to the clean
+contract.
+
+### Implementation
+
+- Removed `global_step` from `KDRowBank.loss`.
+- Changed its return type and value from
+  `(torch.Tensor, dict[str, float], None)` to
+  `(torch.Tensor, dict[str, float])`.
+- Removed the unused third argument from `KDRowBank.epoch_telemetry`.
+- Updated the production `train_ddp_loop` call to destructure two values and
+  stop passing `global_step`.
+- Updated every ordinary-KD call/destructure and telemetry call in
+  `tests/test_train_b0_kd.py`.
+- Updated the duck-typed KD bank in `tests/test_train_b0.py` to the same clean
+  interface while preserving its two calls and `0.25` KD-loss behavior.
+- No KD loss formulas, weights, row selection, telemetry calculations, or DDP
+  scaling behavior changed.
+
+### GREEN evidence
+
+Focused GREEN, same test:
+
+```text
+.venv/bin/python -m pytest \
+  tests/test_train_b0_kd.py::test_kd_loss_uses_exact_row_ids -n0 -q
+.                                                                        [100%]
+```
+
+Production-loop contract coverage:
+
+```text
+.venv/bin/python -m pytest \
+  tests/test_train_b0.py::test_ddp_loop_adds_kd_loss_and_logs_epoch_mean \
+  -n0 -q
+.                                                                        [100%]
+```
+
+Task 3 affected suite with the user-authorized socket-based local DDP cases
+excluded:
+
+```text
+.venv/bin/python -m pytest \
+  tests/distill tests/test_train_b0_kd.py tests/test_b0_topo_gen.py \
+  -n0 -q \
+  -k "not relational_kd_gathers_cross_rank_rows_with_exact_ddp_gradient and not production_kd_row_bank_keeps_global_loss_unscaled_and_one_pass"
+........................................................................ [ 66%]
+.....................................                                    [100%]
+```
+
+Result: exit 0; 109 selected tests passed. The four excluded cases are the
+three parameterizations of the Gloo cross-rank relational test and the Gloo
+production row-bank test. Their call sites were still updated to the clean
+contract. Warnings remained limited to the existing TorchScript deprecation
+and `float(loss)` warning in `test_b0_topo_gen.py`.
+
+### Formatting and static evidence
+
+```text
+.venv/bin/python -m ruff format \
+  src/train_b0.py tests/test_train_b0.py tests/test_train_b0_kd.py
+1 file reformatted, 2 files left unchanged
+```
+
+Two unrelated pre-existing line wraps changed by the formatter were restored
+to keep the diff surgical.
+
+```text
+.venv/bin/python -m ruff check \
+  src/train_b0.py tests/test_train_b0.py tests/test_train_b0_kd.py
+All checks passed!
+
+.venv/bin/python -m mypy \
+  src/train_b0.py tests/test_train_b0.py tests/test_train_b0_kd.py
+Success: no issues found in 3 source files
+
+git diff --check
+PASS
+```
+
+### Self-review and concerns
+
+- Searched production and the two touched test files for old three-value
+  destructuring, `global_step` loss arguments, three-value return annotations,
+  and `epoch_telemetry(..., None)` calls; none remain.
+- Final code/test diff before this report is 26 insertions and 40 deletions
+  across `src/train_b0.py`, `tests/test_train_b0.py`, and
+  `tests/test_train_b0_kd.py`.
+- Ordinary KD numerics and behavior are covered by the 109-test affected run
+  plus the production-loop test.
+- No blocking concern remains. Task 4 should consume the clean two-value
+  contract established here.

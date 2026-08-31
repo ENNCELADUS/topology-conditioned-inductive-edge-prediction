@@ -2853,9 +2853,8 @@ class KDRowBank:
         batch: Batch,
         output: dict[str, torch.Tensor],
         *,
-        global_step: int,
         world_size: int = 1,
-    ) -> tuple[torch.Tensor, dict[str, float], torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute this step's KD loss and per-batch telemetry sums from the shared forward."""
         rows = batch["_row_id"]
         student_logit = output["logits"]
@@ -2973,13 +2972,12 @@ class KDRowBank:
             total = total + self._w_gram * gram_loss
             stats["sum_gram"] = float(gram_loss.detach().item()) * stats["rows"]
 
-        return total, stats, None
+        return total, stats
 
     def epoch_telemetry(
         self,
         accelerator: Accelerator,
         sums: dict[str, float],
-        _unused: torch.Tensor | None = None,
     ) -> dict[str, float]:
         """Reduce this epoch's accumulated per-batch sums into epoch-level telemetry."""
         keys = sorted(sums)
@@ -3406,10 +3404,9 @@ def train_ddp_loop(
                 world_size=world_size,
             )
             if kd_bank is not None:
-                kd_local, kd_stats, _ = kd_bank.loss(
+                kd_local, kd_stats = kd_bank.loss(
                     batch,
                     output,
-                    global_step=global_step + 1,
                     world_size=world_size,
                 )
                 kd_loss = _scale_kd_loss(

@@ -2264,7 +2264,7 @@ def test_ddp_loop_adds_kd_loss_and_logs_epoch_mean(tmp_path: Path) -> None:
     _write_yaml_config(config_path, {"optim.epochs": 1})
     cfg = load_config(config_path)
     batches = [_loss_batch(1.0, [0]), _loss_batch(3.0, [1, 2, 3])]
-    kd_calls: list[tuple[int, int]] = []
+    kd_calls: list[int] = []
 
     class _StubKDBank:
         """Minimal duck-typed stand-in for `KDRowBank` (single-epoch test run)."""
@@ -2277,23 +2277,18 @@ def test_ddp_loop_adds_kd_loss_and_logs_epoch_mean(tmp_path: Path) -> None:
             batch: dict[str, torch.Tensor],
             output: dict[str, torch.Tensor],
             *,
-            global_step: int,
             world_size: int = 1,
-        ) -> tuple[torch.Tensor, dict[str, float], torch.Tensor | None]:
-            kd_calls.append((1, global_step))
-            return (
-                torch.tensor(0.25),
-                {
-                    "rows": float(batch["label"].shape[0]),
-                    "sum_s": 0.0,
-                    "sum_t": 0.0,
-                    "sum_s2": 0.0,
-                    "sum_t2": 0.0,
-                    "sum_st": 0.0,
-                    "sum_prob_err": 0.0,
-                },
-                None,
-            )
+        ) -> tuple[torch.Tensor, dict[str, float]]:
+            kd_calls.append(1)
+            return torch.tensor(0.25), {
+                "rows": float(batch["label"].shape[0]),
+                "sum_s": 0.0,
+                "sum_t": 0.0,
+                "sum_s2": 0.0,
+                "sum_t2": 0.0,
+                "sum_st": 0.0,
+                "sum_prob_err": 0.0,
+            }
 
         @property
         def global_relational(self) -> bool:
@@ -2303,7 +2298,6 @@ def test_ddp_loop_adds_kd_loss_and_logs_epoch_mean(tmp_path: Path) -> None:
             self,
             accelerator: Accelerator,
             sums: dict[str, float],
-            kl_dim_sum: torch.Tensor | None,
         ) -> dict[str, float]:
             return {}
 
@@ -2320,7 +2314,7 @@ def test_ddp_loop_adds_kd_loss_and_logs_epoch_mean(tmp_path: Path) -> None:
         kd_bank=cast(KDRowBank, _StubKDBank()),
     )
 
-    assert kd_calls == [(1, 1), (1, 2)]
+    assert kd_calls == [1, 1]
     assert result.history[0]["train_kd_loss"] == pytest.approx(0.25)
 
 
