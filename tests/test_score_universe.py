@@ -381,6 +381,48 @@ def test_run_score_rejects_topo_gen_control_without_generator(tmp_path: Path) ->
         score_universe._run_score(args)
 
 
+@pytest.mark.parametrize("control", [None, "branch_zero"])
+def test_score_metadata_records_topo_gen_control(
+    tmp_path: Path, control: str | None
+) -> None:
+    nodes = {
+        "node_00": torch.randn(3, INPUT_DIM),
+        "node_01": torch.randn(4, INPUT_DIM),
+    }
+    data_root = _data_root_with_features(tmp_path, nodes)
+    pairs_path = tmp_path / "pairs.tsv"
+    _write_tsv(pairs_path, [("node_00", "node_01", None)])
+    checkpoint = tmp_path / "topo.pt"
+    _write_checkpoint(
+        checkpoint,
+        model=_v31_with_topo_gen(),
+        model_family="v3_1",
+        model_config=_topo_v3_1_config(),
+    )
+    output = tmp_path / "scores.npz"
+    argv = [
+        "score",
+        "--checkpoint",
+        str(checkpoint),
+        "--pairs",
+        f"file:{pairs_path}",
+        "--data-root",
+        str(data_root),
+        "--output",
+        str(output),
+        "--device",
+        "cpu",
+    ]
+    if control is not None:
+        argv.extend(["--topo-gen-control", control])
+
+    score_universe.main(argv)
+
+    meta = score_universe.load_scores(output).meta
+    assert "topo_gen_control" in meta
+    assert meta["topo_gen_control"] == control
+
+
 def test_load_bare_legacy_checkpoint_with_explicit_model_metadata(tmp_path: Path) -> None:
     model_config = _tiny_v3_1_config()
     source_model = score_universe.build_model("v3_1", model_config)
@@ -1004,6 +1046,7 @@ def _write_fake_shard(
     n_rows: int,
     num_rows: int,
     checkpoint_id: str = "abc123abc123abcd",
+    topo_gen_control: str | None = None,
 ) -> None:
     node_ids = ["node_a", "node_b"]
     score_universe.save_scores(
@@ -1022,6 +1065,7 @@ def _write_fake_shard(
             "num_rows": num_rows,
             "created_utc": "2026-07-09T00:00:00+00:00",
             "torch_version": torch.__version__,
+            "topo_gen_control": topo_gen_control,
         },
     )
 
@@ -1055,6 +1099,28 @@ def test_merge_mismatched_checkpoint_id_raises_clear_error(tmp_path: Path) -> No
     )
 
     with pytest.raises(ValueError, match="checkpoint_id"):
+        score_universe.merge_scores([shard0, shard1])
+
+
+def test_merge_mismatched_topo_gen_control_raises_clear_error(tmp_path: Path) -> None:
+    shard0 = tmp_path / "s0.npz"
+    shard1 = tmp_path / "s1.npz"
+    _write_fake_shard(
+        shard0,
+        row_start=0,
+        n_rows=10,
+        num_rows=20,
+        topo_gen_control="branch_zero",
+    )
+    _write_fake_shard(
+        shard1,
+        row_start=10,
+        n_rows=10,
+        num_rows=20,
+        topo_gen_control="shuffle",
+    )
+
+    with pytest.raises(ValueError, match="topo_gen_control"):
         score_universe.merge_scores([shard0, shard1])
 
 

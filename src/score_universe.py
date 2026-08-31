@@ -1000,6 +1000,7 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
         "num_rows",
         "score_precision",
         "scaffold_control",
+        "topo_gen_control",
         "permanent_null",
         "primary_logit",
         "scores_meta_version",
@@ -3340,7 +3341,8 @@ def _run_score(args: argparse.Namespace) -> None:
             "encode_autocast": args.amp,
             "pair_autocast": args.pair_amp or args.amp,
             "logit_storage_dtype": "float32",
-        }
+        },
+        "topo_gen_control": args.topo_gen_control,
     }
     f_logit: NDArray[np.float32] | None = None
     full_logit: NDArray[np.float32] | None = None

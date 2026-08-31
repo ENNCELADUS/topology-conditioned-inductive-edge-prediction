@@ -44,3 +44,15 @@ Focused GREEN: the same command passed 7 tests.
 - No DDP or H20 execution was performed, as required.
 - The control is intentionally unavailable through `src.eval.test_protocol` / `hpc/run.sh test`;
   the progress-ledger ruling limits Task 6 to direct score-universe scoring.
+
+## Fix round 1 — scoring-control provenance
+
+- Added score-artifact provenance for `topo_gen_control`: controlled runs record the selected mode,
+  while live runs record explicit JSON `null`.
+- Added `topo_gen_control` to shard merge agreement. Existing artifacts without the key retain the
+  prior backfill behavior because merge comparison continues to use `meta.get(...)`.
+- RED: focused metadata/merge tests failed 3 tests before implementation (both missing metadata
+  cases and the missing mismatch rejection).
+- GREEN: the same focused selection passed 3 tests after implementation.
+- Final verification: `tests/test_score_universe.py -n0 -q` passed 76 tests; Ruff passed; focused
+  mypy passed; `git diff --check` passed. No DDP or H20 execution was performed.
