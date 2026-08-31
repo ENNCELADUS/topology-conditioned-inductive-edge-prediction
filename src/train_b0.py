@@ -1360,6 +1360,13 @@ def train_loop(
                 accelerator.clip_grad_norm_(model.parameters(), cfg.optim.grad_clip)
             optimizer.step()
             _step_scheduler(scheduler)
+            _set_topo_gen_training_stage(
+                model,
+                optimizer,
+                cfg.distill,
+                epoch=epoch,
+                total_epochs=cfg.optim.epochs,
+            )
             global_step += 1
             losses.append(float(loss.detach().float().item()))
             if global_step % 50 == 0:
@@ -3638,6 +3645,13 @@ def train_ddp_loop(
                 accelerator.clip_grad_norm_(model.parameters(), cfg.optim.grad_clip)
             optimizer.step()
             _step_scheduler(scheduler)
+            _set_topo_gen_training_stage(
+                model,
+                optimizer,
+                cfg.distill,
+                epoch=epoch,
+                total_epochs=cfg.optim.epochs,
+            )
             if start_event is not None and end_event is not None:
                 end_event.record()  # type: ignore[no-untyped-call]
                 cuda_event_pairs.append((start_event, end_event))

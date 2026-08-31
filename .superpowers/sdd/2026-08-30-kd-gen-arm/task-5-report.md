@@ -104,3 +104,51 @@ Result: exit 0 with no whitespace errors.
 
 - Per instruction, no local DDP tests were run. The DDP loop was verified by source inspection and receives the same tested stage helper, but multi-rank runtime behavior remains for the authorized environment.
 - No Task 5 blocker or API ambiguity remains.
+
+## Fix round 1 — scheduler ratio resynchronization
+
+Independent review identified that both supported per-step schedulers write every parameter-group
+LR during `scheduler.step()`, undoing the kd_gen generator/base ratio set at epoch start. The
+single-process and DDP loops now call `_set_topo_gen_training_stage` immediately after every
+scheduler step, with the current 1-based epoch and configured total epoch count unchanged.
+
+Strict RED used the production single-process loop and its supported default `LambdaLR`. The test
+observed the scheduler overwrite the generator/base ratio to 1.0 in both warmup and joint epochs,
+then failed because no post-step stage resynchronization occurred:
+
+```text
+rtk proxy uv run python -m pytest tests/test_train_b0_kd_gen.py::test_kd_gen_train_loop_resyncs_lr_ratio_after_lambda_scheduler_step -n0 -q
+FAILED: synced ratios contained only epoch-start values [(1, 1.0), (2, 0.1)], not post-step values
+```
+
+Focused GREEN passed after the two loop call-site changes. The regression verifies ratio 1.0 after
+the warmup scheduler step and ratio `gen_lr_scale == 0.1` after the joint-stage scheduler step:
+
+```text
+rtk proxy uv run python -m pytest tests/test_train_b0_kd_gen.py::test_kd_gen_train_loop_resyncs_lr_ratio_after_lambda_scheduler_step -n0 -q
+1 passed; 2 pre-existing TorchScript deprecation warnings
+```
+
+Task 5 non-DDP suites and focused checks:
+
+```text
+rtk proxy uv run python -m pytest tests/test_train_b0_kd_gen.py tests/test_train_b0.py -n0 -q
+all collected tests passed; 2 pre-existing TorchScript deprecation warnings
+
+rtk proxy uv run ruff format --check src/train_b0.py tests/test_train_b0_kd_gen.py
+2 files already formatted
+
+rtk proxy uv run ruff check src/train_b0.py tests/test_train_b0_kd_gen.py
+All checks passed!
+
+rtk proxy uv run mypy src/train_b0.py tests/test_train_b0_kd_gen.py
+Success: no issues found in 2 source files
+
+rtk git diff --check
+exit 0 with no whitespace errors
+```
+
+Per instruction, no local DDP or H20 run was performed. The DDP loop receives the same tested stage
+helper immediately after its scheduler step; runtime multi-rank behavior remains unexecuted here.
+The deferred `no_grad` minor was not changed because the shared differentiable sample is required
+for generator-loss liveness and the detached task branch already enforces warmup stop-gradient.

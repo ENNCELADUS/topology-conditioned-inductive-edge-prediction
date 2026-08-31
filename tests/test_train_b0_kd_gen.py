@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import src.train_b0 as train_b0_module
 import torch
 from accelerate import Accelerator
 from src.distill.artifacts import KDRowTargets
@@ -23,6 +24,7 @@ from src.train_b0 import (
     _set_topo_gen_training_stage,
     _term_grad_norms,
     build_model,
+    train_loop,
 )
 from torch import nn
 
@@ -193,6 +195,56 @@ def test_kd_gen_optimizer_groups_and_epoch_boundary() -> None:
     assert model.topo_gen.joint_stage is True
     assert groups["base"]["lr"] == pytest.approx(1.0e-3)
     assert groups["topo_gen"]["lr"] == pytest.approx(1.0e-4)
+
+
+def test_kd_gen_train_loop_resyncs_lr_ratio_after_lambda_scheduler_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _model()
+    cfg = _kd_gen_config(joint_warmup_frac=0.5, gen_lr_scale=0.1)
+    cfg = replace(cfg, optim=replace(cfg.optim, epochs=2, warmup_steps=4))
+    accelerator = Accelerator(cpu=True)
+    batch = _train_batch()
+    scheduler_ratios: list[tuple[int, float]] = []
+    synced_ratios: list[tuple[int, float]] = []
+    current_epoch = 0
+    real_set_stage = train_b0_module._set_topo_gen_training_stage
+    real_step_scheduler = train_b0_module._step_scheduler
+
+    def track_stage(
+        tracked_model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        distill: DistillConfig | None,
+        *,
+        epoch: int,
+        total_epochs: int,
+    ) -> None:
+        nonlocal current_epoch
+        current_epoch = epoch
+        real_set_stage(
+            tracked_model,
+            optimizer,
+            distill,
+            epoch=epoch,
+            total_epochs=total_epochs,
+        )
+        groups = {group["name"]: group for group in optimizer.param_groups}
+        synced_ratios.append((epoch, float(groups["topo_gen"]["lr"]) / groups["base"]["lr"]))
+
+    def track_scheduler_step(scheduler: torch.optim.lr_scheduler.LRScheduler) -> None:
+        real_step_scheduler(scheduler)
+        groups = {group["name"]: group for group in scheduler.optimizer.param_groups}
+        scheduler_ratios.append(
+            (current_epoch, float(groups["topo_gen"]["lr"]) / groups["base"]["lr"])
+        )
+
+    monkeypatch.setattr(train_b0_module, "_set_topo_gen_training_stage", track_stage)
+    monkeypatch.setattr(train_b0_module, "_step_scheduler", track_scheduler_step)
+
+    train_loop(model, lambda epoch: [batch], [batch], cfg, accelerator)
+
+    assert scheduler_ratios == pytest.approx([(1, 1.0), (2, 1.0)])
+    assert synced_ratios == pytest.approx([(1, 1.0), (1, 1.0), (2, 0.1), (2, 0.1)])
 
 
 def test_kd_gen_warmup_stops_task_gradient_then_joint_enables_it() -> None:
