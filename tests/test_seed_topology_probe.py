@@ -70,6 +70,17 @@ def test_probe_removes_query_edge_per_row_without_mutating_caller(
     assert graph.degree["u"] == 3
 
 
+def test_topology_targets_removes_query_self_loop_without_mutating_caller() -> None:
+    graph = nx.Graph([("u", "u"), ("u", "a")])
+
+    targets = seed_topology_probe._topology_targets(graph, [("u", "u")])
+
+    assert targets["deg_u"].tolist() == [1.0]
+    assert targets["deg_v"].tolist() == [1.0]
+    assert graph.has_edge("u", "u")
+    assert graph.degree["u"] == 3
+
+
 @pytest.mark.parametrize(
     ("latents", "target", "message"),
     [

@@ -57,24 +57,28 @@ def test_kd_gen_configs_parse(
     assert topo_config.get("sampler_steps") == sampler_steps
 
 
-def _model_config(topo: bool = True, latent_dim: int = LATENT_DIM) -> dict[str, object]:
+def _model_config(
+    topo: bool = True, latent_dim: int = LATENT_DIM, family: str = "edm"
+) -> dict[str, object]:
     config = {**BEST_V3_1_CONFIG, "input_dim": 24, "d_model": 16, "n_heads": 2}
     if topo:
-        config["topo_gen"] = {
-            "name": "edm",
+        topo_gen: dict[str, object] = {
+            "name": family,
             "latent_dim": latent_dim,
             "cond_dim": 8,
             "blocks": 1,
             "adapter_dim": 4,
-            "mc_samples": 2,
-            "sampler_steps": 2,
+            "mc_samples": 1 if family == "det_mse" else 2,
         }
+        if family == "edm":
+            topo_gen["sampler_steps"] = 2
+        config["topo_gen"] = topo_gen
     return config
 
 
-def _model(topo: bool = True, latent_dim: int = LATENT_DIM) -> V3_1:
+def _model(topo: bool = True, latent_dim: int = LATENT_DIM, family: str = "edm") -> V3_1:
     torch.manual_seed(0)
-    config = _model_config(topo=topo, latent_dim=latent_dim)
+    config = _model_config(topo=topo, latent_dim=latent_dim, family=family)
     return V3_1(**config)
 
 
@@ -292,13 +296,18 @@ def test_kd_gen_warmup_stops_task_gradient_then_joint_enables_it() -> None:
     )
 
 
-@pytest.mark.parametrize("epoch", [1, 2])
-def test_kd_gen_task_plus_generator_loss_reaches_all_parameters(epoch: int) -> None:
-    model = _model().train()
+@pytest.mark.parametrize("family", ["edm", "det_mse", "imf"])
+@pytest.mark.parametrize(("joint_stage", "epoch"), [(False, 1), (True, 2)])
+def test_kd_gen_task_plus_generator_loss_reaches_all_parameters(
+    family: str, joint_stage: bool, epoch: int
+) -> None:
+    model = _model(family=family).train()
     cfg = _kd_gen_config()
     optimizer = _build_optimizer(model, cfg)
     bank = _bank(model)
     _set_topo_gen_training_stage(model, optimizer, cfg.distill, epoch=epoch, total_epochs=10)
+    assert model.topo_gen is not None
+    assert model.topo_gen.joint_stage is joint_stage
     batch = _train_batch()
     bank.attach(batch)
     output = model(batch)

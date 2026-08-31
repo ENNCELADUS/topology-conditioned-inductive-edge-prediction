@@ -89,7 +89,7 @@ def _topology_targets(
     values = {name: np.empty(len(pairs), dtype=np.float64) for name in _STAT_NAMES}
     for row, (u, v) in enumerate(pairs):
         row_graph = graph.copy()
-        if u != v and row_graph.has_edge(u, v):
+        if row_graph.has_edge(u, v):
             row_graph.remove_edge(u, v)
         values["deg_u"][row] = float(row_graph.degree[u])
         values["deg_v"][row] = float(row_graph.degree[v])
