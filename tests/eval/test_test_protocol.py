@@ -246,7 +246,7 @@ class TestRunTestProtocol:
             controlled_artifacts[pairs_source] = destination
         runner = _FakeScoreRunner(controlled_artifacts)
 
-        run_test_protocol(
+        result = run_test_protocol(
             checkpoint=_write_checkpoint(tmp_path),
             output_dir=tmp_path / "outputs" / control,
             data_root=fixture.data_root,
@@ -259,6 +259,9 @@ class TestRunTestProtocol:
 
         for pairs_source in ("val_topology", "test", "test_topology"):
             assert _arg_value(runner.call_for(pairs_source), "--topo-gen-control") == control
+        arm_block = result.report["arm"]
+        assert isinstance(arm_block, dict)
+        assert arm_block["topo_gen_control"] == control
 
     def test_full_report_shape_ordering_and_leakage_guarantee(self, tmp_path: Path) -> None:
         fixture = _build_fixture(tmp_path)
@@ -614,6 +617,39 @@ class TestRunTestProtocol:
 
 class TestReuseExistingScores:
     """Resuming a run whose later pass failed must not redo the finished ones."""
+
+    def test_rejects_stale_reused_test_before_scoring_missing_topology(
+        self, tmp_path: Path
+    ) -> None:
+        fixture = _build_fixture(tmp_path)
+        output_dir = tmp_path / "outputs" / "stale_partial_shuffle"
+        scores_dir = output_dir / "scores"
+        scores_dir.mkdir(parents=True)
+        (scores_dir / "test.npz").write_bytes(fixture.artifacts["test"].read_bytes())
+
+        controlled_artifacts: dict[str, Path] = {}
+        for pairs_source in ("val_topology", "test_topology"):
+            destination = tmp_path / "controlled_scores" / f"{pairs_source}.npz"
+            _copy_with_topo_gen_control(fixture.artifacts[pairs_source], destination, "shuffle")
+            controlled_artifacts[pairs_source] = destination
+        runner = _FakeScoreRunner(controlled_artifacts)
+
+        with pytest.raises(ValueError, match="topo_gen_control.*does not match"):
+            run_test_protocol(
+                checkpoint=_write_checkpoint(tmp_path),
+                output_dir=output_dir,
+                data_root=fixture.data_root,
+                strategy=_STRATEGY,
+                arm="kd_gen_shuffle",
+                seed=0,
+                score_runner=runner,
+                topo_gen_control="shuffle",
+                reuse_existing_scores=True,
+            )
+
+        assert runner.pairs_order == ["val_topology"]
+        assert not (scores_dir / "test_topology.npz").exists()
+        assert not (output_dir / "test_report.json").exists()
 
     @pytest.mark.parametrize("mismatched_control", [None, "branch_zero"])
     @pytest.mark.parametrize("mismatched_source", ["val_topology", "test", "test_topology"])

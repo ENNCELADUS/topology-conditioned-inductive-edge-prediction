@@ -558,12 +558,36 @@ def run_test_protocol(
         allow_rescore_reason=True,
         include_scoring_run_id=is_egostitch_e2e_family,
     )
+    test_artifact = load_scores(test_path)
+    validate_artifact_precision(test_artifact, label=str(test_path))
+    _require_full_universe(test_artifact, label=str(test_path))
+    _require_scoring_identity(
+        artifact=test_artifact,
+        checkpoint_id=expected_checkpoint_id,
+        strategy=strategy,
+        topo_gen_control=topo_gen_control,
+        label=str(test_path),
+    )
+
     topology_path = _score(
         "test_topology",
         support_namespace="test",
         allow_rescore_reason=True,
         include_scoring_run_id=is_egostitch_e2e_family,
     )
+    topology_artifact = load_scores(topology_path)
+    validate_artifact_precision(topology_artifact, label=str(topology_path))
+    _require_pairs_source(topology_artifact, "test_topology", label=str(topology_path))
+    _require_full_universe(topology_artifact, label=str(topology_path))
+    _require_scoring_identity(
+        artifact=topology_artifact,
+        checkpoint_id=expected_checkpoint_id,
+        strategy=strategy,
+        topo_gen_control=topo_gen_control,
+        label=str(topology_path),
+    )
+
+    _require_same_checkpoint(validation_artifact, test_artifact, topology_artifact)
 
     # 3. Classification uses the same validation-selected operating point:
     # logits shift by -t* so the frozen threshold sits at probability 0.5
@@ -579,34 +603,6 @@ def run_test_protocol(
         "selected_logit_threshold": fixed_selection.logit_threshold,
         "selected_probability_threshold": float(expit(fixed_selection.logit_threshold)),
     }
-
-    # Reload test/topology directly (report_edge_metrics only returns a
-    # metrics summary, not the raw artifact) so their meta is available for the
-    # arm/provenance blocks, and so graph assembly has topology logits/pairs.
-    test_artifact = load_scores(test_path)
-    validate_artifact_precision(test_artifact, label=str(test_path))
-    _require_full_universe(test_artifact, label=str(test_path))
-    _require_scoring_identity(
-        artifact=test_artifact,
-        checkpoint_id=expected_checkpoint_id,
-        strategy=strategy,
-        topo_gen_control=topo_gen_control,
-        label=str(test_path),
-    )
-
-    topology_artifact = load_scores(topology_path)
-    validate_artifact_precision(topology_artifact, label=str(topology_path))
-    _require_pairs_source(topology_artifact, "test_topology", label=str(topology_path))
-    _require_full_universe(topology_artifact, label=str(topology_path))
-    _require_scoring_identity(
-        artifact=topology_artifact,
-        checkpoint_id=expected_checkpoint_id,
-        strategy=strategy,
-        topo_gen_control=topo_gen_control,
-        label=str(topology_path),
-    )
-
-    _require_same_checkpoint(validation_artifact, test_artifact, topology_artifact)
 
     # 4. Replay the frozen validation threshold unchanged on every test sample
     # -- the single reported topology operating point. Self-loops participate.
