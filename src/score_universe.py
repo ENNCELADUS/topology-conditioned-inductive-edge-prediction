@@ -95,6 +95,7 @@ from src.data.val_region import (
     derive_val_region_split,
 )
 from src.model.egostitch.classifier.b0_v31 import V3_1
+from src.model.egostitch.classifier.topo_gen import CONTROLS, TopoGenBase
 from src.model.egostitch.generator.assemble import make_scaffold_input_perturbation
 
 if TYPE_CHECKING:
@@ -3057,6 +3058,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=_SCAFFOLD_CONTROL_NONE,
         help="egostitch_e2e scoring-time scaffold control",
     )
+    score.add_argument(
+        "--topo-gen-control",
+        choices=CONTROLS,
+        default=None,
+        help="v3_1 topology-generator scoring-time control",
+    )
     score.add_argument("--shard", type=int, default=None, help="shard index K (with --num-shards)")
     score.add_argument("--num-shards", type=int, default=None, help="total shard count N")
     score.add_argument(
@@ -3178,6 +3185,13 @@ def _run_score(args: argparse.Namespace) -> None:
         model_family=args.model_family,
         model_config=model_config,
     )
+    if args.topo_gen_control is not None:
+        topo_gen = getattr(model, "topo_gen", None)
+        if topo_gen is None:
+            raise SystemExit(
+                "--topo-gen-control requires a checkpoint with model.config.topo_gen"
+            )
+        cast(TopoGenBase, topo_gen).control = args.topo_gen_control
 
     cazi_context = _resolve_cazi_context(args) if model_family == "cazi_mbn" else None
 

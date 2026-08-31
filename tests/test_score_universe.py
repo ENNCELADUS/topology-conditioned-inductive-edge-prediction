@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from itertools import combinations_with_replacement
 from pathlib import Path
-from typing import cast
+from typing import NoReturn, cast
 
 import networkx as nx
 import numpy as np
@@ -95,6 +95,43 @@ def _tiny_v3_1_config() -> dict[str, object]:
     }
 
 
+def _topo_v3_1_config() -> dict[str, object]:
+    return {
+        **_tiny_v3_1_config(),
+        "topo_gen": {
+            "name": "edm",
+            "latent_dim": 8,
+            "cond_dim": 8,
+            "blocks": 1,
+            "adapter_dim": 4,
+            "mc_samples": 2,
+            "sampler_steps": 2,
+        },
+    }
+
+
+def _v31_with_topo_gen() -> V3_1:
+    torch.manual_seed(0)
+    model = score_universe.build_model("v3_1", _topo_v3_1_config())
+    assert isinstance(model, V3_1)
+    assert model.topo_gen is not None
+    modulation = dict(model.topo_gen.named_modules())["core.blocks.0.mod"]
+    assert isinstance(modulation, nn.Linear)
+    torch.nn.init.normal_(modulation.weight, std=0.1)
+    torch.nn.init.normal_(model.topo_gen.adapter_up.weight, std=0.5)
+    return model
+
+
+def _v31_batch(batch: int = 3) -> dict[str, torch.Tensor]:
+    torch.manual_seed(5)
+    return {
+        "emb_a": torch.randn(batch, 4, INPUT_DIM),
+        "emb_b": torch.randn(batch, 4, INPUT_DIM),
+        "len_a": torch.full((batch,), 4, dtype=torch.long),
+        "len_b": torch.full((batch,), 4, dtype=torch.long),
+    }
+
+
 def _write_checkpoint(
     path: Path, *, model: nn.Module, model_family: str, model_config: dict[str, object]
 ) -> None:
@@ -155,6 +192,193 @@ def test_packed_scoring_caches_encoder_without_changing_logits(
     )
 
     np.testing.assert_allclose(actual, reference, rtol=0.0, atol=0.0)
+
+
+def test_forward_matches_direct_marginal_for_topo_gen() -> None:
+    model = _v31_with_topo_gen().eval()
+    batch = _v31_batch()
+    assert model.topo_gen is not None
+    with torch.no_grad():
+        forward_logits = model(dict(batch))["logits"].float()
+        encoded_a = model.encoder(batch["emb_a"], batch["len_a"])
+        encoded_b = model.encoder(batch["emb_b"], batch["len_b"])
+        pair_repr = model._pair_representation(
+            encoded_a, encoded_b, batch["len_a"], batch["len_b"]
+        )
+        marginal_logits = model.topo_gen.marginal_forward(
+            encoded_a,
+            encoded_b,
+            batch["len_a"],
+            batch["len_b"],
+            pair_repr,
+            model.output_head,
+        )["logits"].float()
+
+    torch.testing.assert_close(marginal_logits, forward_logits, atol=1e-6, rtol=1e-6)
+
+
+def test_packed_path_matches_forward_for_live_topo_gen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = _v31_with_topo_gen().eval()
+    feature_root = tmp_path / "features"
+    nodes = {
+        "node_00": torch.randn(3, INPUT_DIM),
+        "node_01": torch.randn(4, INPUT_DIM),
+        "node_02": torch.randn(5, INPUT_DIM),
+    }
+    _write_feature_store(feature_root, nodes)
+    pack_root = tmp_path / "pack"
+    monkeypatch.setattr(packed_features, "ProcessPoolExecutor", ThreadPoolExecutor)
+    build_packed_features(feature_root, pack_root, workers=1)
+    pairs = [("node_00", "node_01"), ("node_02", "node_00")]
+
+    table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
+    node_index = table.manifest.node_index()
+    compact = CompactPairBatch(
+        row_ids=torch.tensor([0, 1]),
+        node_a=torch.tensor([node_index[u] for u, _ in pairs]),
+        node_b=torch.tensor([node_index[v] for _, v in pairs]),
+        labels=torch.zeros(2),
+        bucket_boundary=128,
+        global_pair_count=2,
+    )
+    reference_batch = table.assemble(compact)
+    reference_batch["emb_a"] = reference_batch["emb_a"].float()
+    reference_batch["emb_b"] = reference_batch["emb_b"].float()
+    with torch.inference_mode():
+        reference = model(reference_batch)["logits"].numpy().reshape(-1)
+        encoded_a = model.encoder(reference_batch["emb_a"], reference_batch["len_a"])
+        encoded_b = model.encoder(reference_batch["emb_b"], reference_batch["len_b"])
+        pair_repr = model._pair_representation(
+            encoded_a,
+            encoded_b,
+            reference_batch["len_a"],
+            reference_batch["len_b"],
+        )
+        legacy = model.output_head(pair_repr).numpy().reshape(-1)
+    assert not np.allclose(reference, legacy)
+
+    actual = score_universe._score_v3_1_packed(
+        model,
+        pairs,
+        pack_root,
+        device=torch.device("cpu"),
+        amp="off",
+        token_budget=512,
+    )
+
+    np.testing.assert_allclose(actual, reference, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("control", ["branch_zero", "shuffle"])
+def test_parser_accepts_topo_gen_control(control: str) -> None:
+    args = score_universe.build_parser().parse_args(
+        [
+            "score",
+            "--checkpoint",
+            "checkpoint.pt",
+            "--pairs",
+            "candidate",
+            "--output",
+            "scores.npz",
+            "--topo-gen-control",
+            control,
+        ]
+    )
+
+    assert args.topo_gen_control == control
+
+
+@pytest.mark.parametrize("control", ["branch_zero", "shuffle"])
+def test_run_score_assigns_topo_gen_control_after_checkpoint_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control: str
+) -> None:
+    checkpoint = tmp_path / "topo.pt"
+    _write_checkpoint(
+        checkpoint,
+        model=_v31_with_topo_gen(),
+        model_family="v3_1",
+        model_config=_topo_v3_1_config(),
+    )
+    args = score_universe.build_parser().parse_args(
+        [
+            "score",
+            "--checkpoint",
+            str(checkpoint),
+            "--pairs",
+            "candidate",
+            "--output",
+            str(tmp_path / "scores.npz"),
+            "--device",
+            "cpu",
+            "--topo-gen-control",
+            control,
+        ]
+    )
+
+    def stop_after_assignment(
+        _pairs_source: str,
+        _data_root: Path,
+        _strategy: str,
+        *,
+        test_access: object = None,
+    ) -> NoReturn:
+        del test_access
+        loaded = cast(V3_1, assigned_model["model"])
+        assert loaded.topo_gen is not None
+        assert loaded.topo_gen.control == control
+        raise RuntimeError("control assignment observed")
+
+    assigned_model: dict[str, nn.Module] = {}
+    load_checkpoint = score_universe._load_checkpoint
+
+    def capture_loaded_model(
+        path: Path,
+        *,
+        model_family: str | None = None,
+        model_config: dict[str, object] | None = None,
+    ) -> tuple[nn.Module, str, str]:
+        loaded = load_checkpoint(
+            path, model_family=model_family, model_config=model_config
+        )
+        assigned_model["model"] = loaded[0]
+        return loaded
+
+    monkeypatch.setattr(score_universe, "_load_checkpoint", capture_loaded_model)
+    monkeypatch.setattr(score_universe, "_resolve_pairs", stop_after_assignment)
+
+    with pytest.raises(RuntimeError, match="control assignment observed"):
+        score_universe._run_score(args)
+
+
+def test_run_score_rejects_topo_gen_control_without_generator(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "plain.pt"
+    model_config = _tiny_v3_1_config()
+    _write_checkpoint(
+        checkpoint,
+        model=score_universe.build_model("v3_1", model_config),
+        model_family="v3_1",
+        model_config=model_config,
+    )
+    args = score_universe.build_parser().parse_args(
+        [
+            "score",
+            "--checkpoint",
+            str(checkpoint),
+            "--pairs",
+            "candidate",
+            "--output",
+            str(tmp_path / "scores.npz"),
+            "--device",
+            "cpu",
+            "--topo-gen-control",
+            "branch_zero",
+        ]
+    )
+
+    with pytest.raises(SystemExit, match="requires a checkpoint with model.config.topo_gen"):
+        score_universe._run_score(args)
 
 
 def test_load_bare_legacy_checkpoint_with_explicit_model_metadata(tmp_path: Path) -> None:
