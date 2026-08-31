@@ -24,7 +24,7 @@ def test_kd_logit_arm_pattern() -> None:
 
 
 def test_kd_rank_arm_pattern() -> None:
-    cfg = DistillConfig(targets_path="t", w_rank=1.0, w_dist=1.0)
+    cfg = DistillConfig(targets_path="t", context_targets_path="c", w_rank=1.0, w_dist=1.0)
     assert cfg.active
     assert cfg.arm == "kd_rank"
 
@@ -54,9 +54,9 @@ def test_mixed_arm_groups_are_rejected() -> None:
     with pytest.raises(ValueError, match="exactly one arm group"):
         DistillConfig(targets_path="t", w_logit=1.0, w_rep=1.0)
     with pytest.raises(ValueError, match="exactly one arm group"):
-        DistillConfig(targets_path="t", w_rank=1.0)
+        DistillConfig(targets_path="t", context_targets_path="c", w_rank=1.0)
     with pytest.raises(ValueError, match="exactly one arm group"):
-        DistillConfig(targets_path="t", w_dist=1.0)
+        DistillConfig(targets_path="t", context_targets_path="c", w_dist=1.0)
     with pytest.raises(ValueError, match="exactly one arm group"):
         DistillConfig(targets_path="t", w_gram=1.0, w_rep=1.0)
 
@@ -93,21 +93,28 @@ def test_non_positive_gen_lr_scale_is_rejected() -> None:
 def test_invalid_rank_hyperparameters_are_rejected() -> None:
     with pytest.raises(ValueError, match="margin"):
         DistillConfig(margin=-0.1)
-    with pytest.raises(ValueError, match="temperature"):
-        DistillConfig(temperature=0.0)
 
 
 def test_nonzero_weight_without_targets_path_is_rejected() -> None:
     with pytest.raises(ValueError, match="targets_path"):
         DistillConfig(w_logit=1.0)
     with pytest.raises(ValueError, match="targets_path"):
-        DistillConfig(w_rank=1.0, w_dist=1.0)
+        DistillConfig(context_targets_path="c", w_rank=1.0, w_dist=1.0)
     with pytest.raises(ValueError, match="targets_path"):
         DistillConfig(w_gram=1.0)
     with pytest.raises(ValueError, match="targets_path"):
         DistillConfig(w_rep=1.0)
     with pytest.raises(ValueError, match="targets_path"):
         DistillConfig(w_gen=1.0)
+
+
+def test_context_targets_path_is_required_exactly_for_kd_rank() -> None:
+    with pytest.raises(ValueError, match="context_targets_path is required"):
+        DistillConfig(targets_path="t", w_rank=1.0, w_dist=1.0)
+    with pytest.raises(ValueError, match="context_targets_path is only valid"):
+        DistillConfig(targets_path="t", context_targets_path="c", w_logit=1.0)
+    with pytest.raises(ValueError, match="context_targets_path is only valid"):
+        DistillConfig(context_targets_path="c")
 
 
 # --------------------------------------------------------------------------- from_mapping
@@ -126,6 +133,8 @@ def test_from_mapping_rejects_removed_legacy_keys() -> None:
         DistillConfig.from_mapping({"anchors_per_step": 2})
     with pytest.raises(ValueError, match="unknown distill config keys"):
         DistillConfig.from_mapping({"w_align": 1.0})
+    with pytest.raises(ValueError, match="unknown distill config keys"):
+        DistillConfig.from_mapping({"temperature": 1.0})
 
 
 def test_w_seed_is_gone() -> None:
@@ -143,6 +152,8 @@ def test_from_mapping_rejects_bool_for_number_fields() -> None:
 def test_from_mapping_rejects_non_string_targets_path() -> None:
     with pytest.raises(ValueError, match="targets_path"):
         DistillConfig.from_mapping({"targets_path": 7})
+    with pytest.raises(ValueError, match="context_targets_path"):
+        DistillConfig.from_mapping({"context_targets_path": 7})
 
 
 def test_from_mapping_accepts_int_for_float_fields() -> None:

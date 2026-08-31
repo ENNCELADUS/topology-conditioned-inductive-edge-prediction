@@ -93,6 +93,14 @@ def test_summary_honors_last_limit(tmp_path: Path) -> None:
     assert "#2 " not in text
 
 
+def test_retired_only_campaign_has_no_incumbent(tmp_path: Path) -> None:
+    path = tmp_path / "ledger.jsonl"
+    append_row(path, row(1, "retired", campaign="kd_rank"))
+    line = render_summary(path).splitlines()[1]
+    assert line == "campaign kd_rank: trials=1 keeps=0"
+    assert "incumbent=" not in line
+
+
 def test_summary_of_empty_ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     assert render_summary(tmp_path / "missing.jsonl") == "ledger empty; no trials recorded\n"

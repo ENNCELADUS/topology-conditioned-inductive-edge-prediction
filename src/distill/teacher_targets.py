@@ -71,7 +71,15 @@ from numpy.typing import NDArray
 from src.data.features import FeatureStore, build_f0_matrix
 from src.data.pairs import BUCKET_BOUNDARIES, probe_lengths
 from src.data.val_region import Pair, ValRegionSplit
-from src.distill.artifacts import write_kd_targets
+from src.distill.artifacts import KDContextBank, write_kd_context_targets, write_kd_targets
+from src.distill.context_sampler import (
+    DEFAULT_HOPS,
+    DEFAULT_NS_RATE,
+    DEFAULT_RW_STEP,
+    ContextBank,
+    sample_context_banks,
+    sample_v_val_context_bank,
+)
 from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
 from src.model.egostitch.generator.full_oracle import FullOracleGenerator
 from src.model.egostitch.generator.imagine import SlotSet
@@ -89,6 +97,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TOKEN_BUDGET = 32_768
 _DEFAULT_BATCH_PAIRS = 32
+_CONTEXT_SEED = 0
 
 
 # --------------------------------------------------------------------------- training-side legality
@@ -210,6 +219,46 @@ def _row_positions(
     a_idx = np.array([position[u] for u, _ in rows], dtype=np.int32)
     b_idx = np.array([position[v] for _, v in rows], dtype=np.int32)
     return a_idx, b_idx
+
+
+def index_context_banks(
+    banks: Sequence[ContextBank], val_bank: ContextBank
+) -> tuple[NDArray[np.int32], NDArray[np.int32], tuple[KDContextBank, ...], KDContextBank]:
+    """Stable-deduplicate all context pairs and join each CSR row to its score row."""
+    pair_to_score: dict[tuple[int, int], int] = {}
+    pair_a: list[int] = []
+    pair_b: list[int] = []
+
+    def index_bank(bank: ContextBank) -> KDContextBank:
+        anchors = np.repeat(bank.anchor_idx, np.diff(bank.anchor_offsets))
+        score_idx = np.empty(len(bank.partner_idx), dtype=np.int32)
+        for row, (anchor, partner) in enumerate(
+            zip(anchors.tolist(), bank.partner_idx.tolist(), strict=True)
+        ):
+            pair = (anchor, partner)
+            score = pair_to_score.get(pair)
+            if score is None:
+                score = len(pair_a)
+                pair_to_score[pair] = score
+                pair_a.append(anchor)
+                pair_b.append(partner)
+            score_idx[row] = score
+        return KDContextBank(
+            anchor_idx=bank.anchor_idx,
+            anchor_offsets=bank.anchor_offsets,
+            partner_idx=bank.partner_idx,
+            score_idx=score_idx,
+            is_near=bank.is_near,
+        )
+
+    indexed_banks = tuple(index_bank(bank) for bank in banks)
+    indexed_val_bank = index_bank(val_bank)
+    return (
+        np.asarray(pair_a, dtype=np.int32),
+        np.asarray(pair_b, dtype=np.int32),
+        indexed_banks,
+        indexed_val_bank,
+    )
 
 
 # --------------------------------------------------------------------------- node encoding
@@ -543,6 +592,60 @@ def _merge_shards(
     )
 
 
+def _context_shard_path(output: Path, shard: int, num_shards: int) -> Path:
+    return output.parent / f"{output.name}.contexts.shard-{shard}-of-{num_shards}.npz"
+
+
+def _write_context_shard(
+    output: Path,
+    shard: int,
+    num_shards: int,
+    *,
+    a_idx: NDArray[np.int32],
+    b_idx: NDArray[np.int32],
+    teacher_logit: NDArray[np.float32],
+) -> None:
+    """Write an identity-carrying context shard with logits only."""
+    path = _context_shard_path(output, shard, num_shards)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, a_idx=a_idx, b_idx=b_idx, teacher_logit=teacher_logit)
+
+
+def _all_context_shards_present(output: Path, num_shards: int) -> bool:
+    return all(
+        _context_shard_path(output, shard, num_shards).is_file() for shard in range(num_shards)
+    )
+
+
+def _merge_context_shards(
+    output: Path, a_idx: NDArray[np.int32], b_idx: NDArray[np.int32], num_shards: int
+) -> NDArray[np.float32]:
+    """Merge context shards after exact pair-identity and schema validation."""
+    teacher_logit = np.empty(len(a_idx), dtype=np.float32)
+    for shard in range(num_shards):
+        start, end = _shard_range(len(a_idx), shard, num_shards)
+        path = _context_shard_path(output, shard, num_shards)
+        if not path.is_file():
+            raise ValueError(f"missing context shard file for merge: {path}")
+        with np.load(path) as archive:
+            if set(archive.files) != {"a_idx", "b_idx", "teacher_logit"}:
+                raise ValueError(f"context shard {shard} has an invalid array schema")
+            if not np.array_equal(archive["a_idx"], a_idx[start:end]) or not np.array_equal(
+                archive["b_idx"], b_idx[start:end]
+            ):
+                raise ValueError(
+                    f"context shard {shard} row identity does not match the deterministic "
+                    "deduplicated pair list (re-run with the same --config)"
+                )
+            shard_logits = np.asarray(archive["teacher_logit"])
+            if shard_logits.dtype != np.float32 or shard_logits.shape != (end - start,):
+                raise ValueError(f"context shard {shard} teacher_logit shape/dtype is invalid")
+            if not np.isfinite(shard_logits).all():
+                raise ValueError(f"context shard {shard} teacher_logit contains non-finite values")
+            teacher_logit[start:end] = shard_logits
+    return teacher_logit
+
+
 # --------------------------------------------------------------------------- verification
 
 
@@ -599,6 +702,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--contexts",
+        action="store_true",
+        help="Dump epoch-indexed strict-LLP context targets instead of official row targets",
+    )
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument(
         "--model-config",
@@ -628,6 +736,71 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _finalize_context_artifact(
+    args: argparse.Namespace,
+    node_ids: Sequence[str],
+    truth_graph: nx.Graph,
+    pair_a_idx: NDArray[np.int32],
+    pair_b_idx: NDArray[np.int32],
+    teacher_logit: NDArray[np.float32],
+    banks: Sequence[KDContextBank],
+    val_bank: KDContextBank,
+    checkpoint_id: str | None,
+) -> None:
+    write_kd_context_targets(
+        args.output,
+        node_ids=node_ids,
+        pair_a_idx=pair_a_idx,
+        pair_b_idx=pair_b_idx,
+        teacher_logit=teacher_logit,
+        banks=banks,
+        val_bank=val_bank,
+        sampler_params={
+            "rw_step": DEFAULT_RW_STEP,
+            "hops": DEFAULT_HOPS,
+            "ns_rate": DEFAULT_NS_RATE,
+        },
+        seed=_CONTEXT_SEED,
+        truth_graph_sha256=_oracle_truth_graph_sha256(truth_graph),
+        checkpoint_path=args.checkpoint,
+        checkpoint_sha256=_file_sha256(args.checkpoint),
+        checkpoint_id=checkpoint_id,
+    )
+
+
+def _finish_context_merge(
+    args: argparse.Namespace,
+    node_ids: Sequence[str],
+    truth_graph: nx.Graph,
+    pair_a_idx: NDArray[np.int32],
+    pair_b_idx: NDArray[np.int32],
+    banks: Sequence[KDContextBank],
+    val_bank: KDContextBank,
+    num_shards: int,
+    *,
+    checkpoint_id_override: str | None = None,
+) -> None:
+    teacher_logit = _merge_context_shards(args.output, pair_a_idx, pair_b_idx, num_shards)
+    checkpoint_id = checkpoint_id_override
+    if checkpoint_id is None:
+        _, model_family, checkpoint_id = _load_teacher_checkpoint(args)
+        if model_family != "egostitch_e2e":
+            raise ValueError(
+                f"KD teacher targets require model_family 'egostitch_e2e', got {model_family!r}"
+            )
+    _finalize_context_artifact(
+        args,
+        node_ids,
+        truth_graph,
+        pair_a_idx,
+        pair_b_idx,
+        teacher_logit,
+        banks,
+        val_bank,
+        checkpoint_id,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Run the KD teacher-target dumper CLI (score, `--row-shard`, or `--merge`)."""
     logging.basicConfig(level=logging.INFO)
@@ -645,6 +818,135 @@ def main(argv: Sequence[str] | None = None) -> None:
     node_ids = sorted(split.train_nodes - assembled.exclude_nodes)
     test_nodes = frozenset(assembled.benchmark.split.test_nodes)
     assert_training_side_only(node_ids, truth_graph, split, test_nodes)
+
+    if args.contexts:
+        banks = sample_context_banks(
+            truth_graph,
+            anchor_ids=node_ids,
+            node_ids=node_ids,
+            forbidden_internal=split.v_val,
+            seed=_CONTEXT_SEED,
+            n_banks=cfg.optim.epochs,
+        )
+        val_bank = sample_v_val_context_bank(
+            truth_graph,
+            v_val=split.v_val,
+            node_ids=node_ids,
+        )
+        pair_a_idx, pair_b_idx, indexed_banks, indexed_val_bank = index_context_banks(
+            banks, val_bank
+        )
+        if args.merge:
+            if args.row_shard is None:
+                raise ValueError("--merge requires --row-shard I/N to know the shard count")
+            _, num_shards = _parse_shard(args.row_shard)
+            _finish_context_merge(
+                args,
+                node_ids,
+                truth_graph,
+                pair_a_idx,
+                pair_b_idx,
+                indexed_banks,
+                indexed_val_bank,
+                num_shards,
+            )
+            return
+
+        context_shard_range: tuple[int, int, int] | None = None
+        if args.row_shard is not None:
+            shard_index, num_shards = _parse_shard(args.row_shard)
+            start, end = _shard_range(len(pair_a_idx), shard_index, num_shards)
+            context_shard_range = (start, end, num_shards)
+
+        device = torch.device(args.device)
+        model, model_family, checkpoint_id = _load_teacher_checkpoint(args)
+        if model_family != "egostitch_e2e" or not isinstance(model, EgoStitchModel):
+            raise ValueError(
+                f"KD teacher targets require model_family 'egostitch_e2e', got {model_family!r}"
+            )
+        require_full_ego_oracle(model)
+        model.to(device)
+        model.eval()
+        _install_oracle_context(model, node_ids, truth_graph=truth_graph)
+        f0_cache = args.f0_cache if args.f0_cache is not None else args.output / "f0_cache.pt"
+        node_cache = encode_all_nodes(
+            model,
+            assembled.store,
+            node_ids,
+            device=device,
+            token_budget=args.token_budget,
+            f0_cache=f0_cache,
+        )
+
+        if context_shard_range is not None:
+            start, end, num_shards = context_shard_range
+            teacher_logit = score_rows(
+                model,
+                node_cache,
+                node_ids,
+                pair_a_idx[start:end],
+                pair_b_idx[start:end],
+                device=device,
+                batch_pairs=args.batch_pairs,
+            ).teacher_logit
+            shard_index = _parse_shard(args.row_shard)[0]
+            _write_context_shard(
+                args.output,
+                shard_index,
+                num_shards,
+                a_idx=pair_a_idx[start:end],
+                b_idx=pair_b_idx[start:end],
+                teacher_logit=teacher_logit,
+            )
+            logger.info("wrote context shard %d/%d", shard_index, num_shards)
+            if _all_context_shards_present(args.output, num_shards):
+                logger.info("all %d context shards present; auto-merging", num_shards)
+                _finish_context_merge(
+                    args,
+                    node_ids,
+                    truth_graph,
+                    pair_a_idx,
+                    pair_b_idx,
+                    indexed_banks,
+                    indexed_val_bank,
+                    num_shards,
+                    checkpoint_id_override=checkpoint_id,
+                )
+            return
+
+        scored = score_rows(
+            model,
+            node_cache,
+            node_ids,
+            pair_a_idx,
+            pair_b_idx,
+            device=device,
+            batch_pairs=args.batch_pairs,
+        )
+        _finalize_context_artifact(
+            args,
+            node_ids,
+            truth_graph,
+            pair_a_idx,
+            pair_b_idx,
+            scored.teacher_logit,
+            indexed_banks,
+            indexed_val_bank,
+            checkpoint_id,
+        )
+        if args.verify_sample > 0:
+            verify_sample(
+                model,
+                node_cache,
+                node_ids,
+                pair_a_idx,
+                pair_b_idx,
+                scored.teacher_logit,
+                n=args.verify_sample,
+                device=device,
+            )
+        return
+
     assert_no_val_internal_training_rows(train_rows, split.v_val)
 
     position = {node_id: i for i, node_id in enumerate(node_ids)}

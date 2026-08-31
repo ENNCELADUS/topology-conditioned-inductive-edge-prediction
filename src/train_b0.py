@@ -62,6 +62,7 @@ from src.data.distributed_pairs import (
 from src.data.features import FeatureStore, build_f0_matrix
 from src.data.packed_features import PackedFeatureTable
 from src.data.pairs import (
+    BUCKET_BOUNDARIES,
     LengthBucketedBatchSampler,
     NegativeSampler,
     TokenPairDataset,
@@ -75,7 +76,13 @@ from src.data.val_region import (
     derive_val_region_split,
     val_ball_union_universe,
 )
-from src.distill.artifacts import KDRowTargets, load_kd_targets
+from src.distill.artifacts import (
+    KDContextBank,
+    KDContextTargets,
+    KDRowTargets,
+    load_kd_context_targets,
+    load_kd_targets,
+)
 from src.distill.config import DistillConfig
 from src.distill.losses import (
     kd_dist_loss,
@@ -1763,6 +1770,12 @@ class GpuBatchIterable:
         for compact in self._source:
             yield self._table.assemble(compact)
 
+    def __len__(self) -> int:
+        """Return the compact source length used by deterministic KD schedules."""
+        if not isinstance(self._source, Sized):
+            raise TypeError("compact batch source has no known length")
+        return len(self._source)
+
 
 def compute_sample_warmup_steps(
     baseline_batch_sizes: Sequence[int],
@@ -2278,31 +2291,6 @@ def _evaluate_distributed(
             row_id_parts.append(batch["_row_id"].detach().to(torch.int64))
             label_parts.append(batch["label"].detach().to(torch.float32))
             logit_parts.append(logits.detach().to(torch.float32))
-            if kd_val is not None and kd_val.arm == "kd_rank":
-                assert kd_val.endpoint_a is not None and kd_val.endpoint_b is not None
-                rows = batch["_row_id"]
-                teacher = kd_val.teacher_logit[rows].float()
-                endpoint_a = kd_val.endpoint_a[rows]
-                endpoint_b = kd_val.endpoint_b[rows]
-                non_self = endpoint_a != endpoint_b
-                groups = torch.cat([endpoint_a, endpoint_b[non_self]])
-                counts = torch.unique(groups, return_counts=True)[1]
-                if bool((counts >= 2).any()):
-                    grouped_student = torch.cat([logits.float(), logits.float()[non_self]])
-                    grouped_teacher = torch.cat([teacher, teacher[non_self]])
-                    relational_block[0] += kd_rank_loss(
-                        grouped_student,
-                        grouped_teacher,
-                        groups,
-                        margin=kd_val.margin,
-                    ).double()
-                    relational_block[1] += kd_dist_loss(
-                        grouped_student,
-                        grouped_teacher,
-                        groups,
-                        temperature=kd_val.temperature,
-                    ).double()
-                    relational_block[2] += 1.0
             if kd_val is not None and kd_val.arm == "kd_gram":
                 rows = batch["_row_id"]
                 student_rep = output.get("pair_repr")
@@ -2343,6 +2331,11 @@ def _evaluate_distributed(
                         latent_sample.float(), teacher_latent.float(), dim=-1, eps=1e-8
                     )
                 diag_parts.append(diag.detach().to(torch.float32))
+        context_metrics = (
+            kd_val.context_stream.validation_diagnostics(model)
+            if kd_val is not None and kd_val.context_stream is not None
+            else None
+        )
     model.train()
 
     device = accelerator.device
@@ -2377,7 +2370,7 @@ def _evaluate_distributed(
         padded_diag = accelerator.pad_across_processes(local_diag, dim=0, pad_index=0)
         gathered_diag = accelerator.gather(padded_diag)
     reduced_relational_block = relational_block
-    if kd_val is not None and kd_val.arm in {"kd_rank", "kd_gram"}:
+    if kd_val is not None and kd_val.arm == "kd_gram":
         reduced_relational_block = accelerator.reduce(relational_block, reduction="sum")
 
     # Coverage must be validated symmetrically: accelerator.gather returns the
@@ -2444,13 +2437,8 @@ def _evaluate_distributed(
                     logits64, _stable_sigmoid(teacher64)
                 )
             block_count = float(reduced_relational_block[2].item())
-            if block_count > 0.0 and kd_val.arm == "kd_rank":
-                kd_metrics["val_kd_rank_block_loss"] = (
-                    float(reduced_relational_block[0].item()) / block_count
-                )
-                kd_metrics["val_kd_dist_block_loss"] = (
-                    float(reduced_relational_block[1].item()) / block_count
-                )
+            if context_metrics is not None:
+                kd_metrics.update(context_metrics)
             if block_count > 0.0 and kd_val.arm == "kd_gram":
                 kd_metrics["val_kd_gram_block_loss"] = (
                     float(reduced_relational_block[0].item()) / block_count
@@ -2678,6 +2666,8 @@ class KDValDiagnostics:
         teacher_latent: ``(n_val, latent_dim)`` fp16 teacher latents, on the
             training device; populated only for ``kd_gen`` and normalized at use.
         latent_scale: Artifact-wide teacher latent RMS used for normalization.
+        context_stream: Fixed V_val context bank used only for ``kd_rank``
+            rank/distribution/tie diagnostics.
     """
 
     arm: str
@@ -2686,10 +2676,7 @@ class KDValDiagnostics:
     teacher_rep: torch.Tensor | None
     teacher_latent: torch.Tensor | None
     latent_scale: float = 1.0
-    endpoint_a: torch.Tensor | None = None
-    endpoint_b: torch.Tensor | None = None
-    margin: float = 0.1
-    temperature: float = 1.0
+    context_stream: KDContextStream | None = None
 
 
 def _pearson_from_moments(
@@ -2708,7 +2695,7 @@ def _pearson_from_moments(
 
 
 class GlobalRelationalRows(NamedTuple):
-    """One global optimizer step's row-aligned inputs for D2/D3."""
+    """One global optimizer step's row-aligned inputs for Gram KD."""
 
     student: torch.Tensor
     teacher: torch.Tensor
@@ -2776,16 +2763,274 @@ def _gather_global_relational_rows(
     return GlobalRelationalRows(global_student, global_teacher, global_a, global_b, global_row_ids)
 
 
+class KDContextStream:
+    """Deterministic epoch-banked anchor/context stream for reference-faithful KD2."""
+
+    def __init__(
+        self,
+        distill: DistillConfig,
+        targets: KDContextTargets,
+        table: PackedFeatureTable,
+        *,
+        allowed_nodes: frozenset[str],
+        forbidden_internal_nodes: frozenset[str],
+        epochs: int,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        if distill.arm != "kd_rank":
+            raise ValueError("KDContextStream requires the active kd_rank arm")
+        if epochs > len(targets.banks):
+            raise ValueError(
+                f"training epochs ({epochs}) exceed context banks ({len(targets.banks)})"
+            )
+        if rank < 0 or rank >= world_size or world_size < 1:
+            raise ValueError(f"invalid KD context rank/world size: {rank}/{world_size}")
+        outside = sorted(set(targets.node_ids) - allowed_nodes)
+        if outside:
+            raise ValueError(
+                f"KD context target nodes outside the training universe: {outside[:5]}"
+            )
+        node_index = table.manifest.node_index()
+        missing = [node for node in targets.node_ids if node not in node_index]
+        if missing:
+            raise ValueError(
+                f"KD context target nodes missing from the feature pack: {missing[:5]}"
+            )
+        nodes = np.asarray(targets.node_ids, dtype=object)
+        forbidden = list(forbidden_internal_nodes)
+        for bank_index, bank in enumerate(targets.banks):
+            anchors = np.repeat(bank.anchor_idx, np.diff(bank.anchor_offsets))
+            if bool(
+                (
+                    np.isin(nodes[anchors], forbidden) & np.isin(nodes[bank.partner_idx], forbidden)
+                ).any()
+            ):
+                raise ValueError(f"KD context bank {bank_index} contains a V_val-internal pair")
+        expected_val = np.asarray(
+            [i for i, node in enumerate(targets.node_ids) if node in forbidden_internal_nodes],
+            dtype=np.int32,
+        )
+        if not np.array_equal(targets.val_bank.anchor_idx, expected_val):
+            raise ValueError("KD context validation anchors do not match the V_val identity")
+
+        self._distill = distill
+        self._targets = targets
+        self._table = table
+        self._rank = rank
+        self._world_size = world_size
+        self._packed_rows = np.asarray(
+            [node_index[node] for node in targets.node_ids], dtype=np.int64
+        )
+        self.last_anchor_idx: tuple[int, ...] = ()
+        self.last_bank_index = -1
+
+    @staticmethod
+    def _step_slice(size: int, steps: int, step: int) -> tuple[int, int]:
+        """Partition ``size`` rows exactly once, placing the remainder at the end."""
+        if steps < 1 or step < 0 or step >= steps:
+            raise ValueError(f"invalid KD context step {step} for {steps} steps")
+        base, remainder = divmod(size, steps)
+        extra_start = steps - remainder
+        start = step * base + max(0, step - extra_start)
+        count = base + int(step >= extra_start)
+        return start, start + count
+
+    def _anchor_positions(
+        self, bank: KDContextBank, *, rank: int, steps: int, step: int
+    ) -> list[int]:
+        shard = list(range(rank, len(bank.anchor_idx), self._world_size))
+        start, stop = self._step_slice(len(shard), steps, step)
+        return shard[start:stop]
+
+    @staticmethod
+    def _live_counts(bank: KDContextBank, positions: Sequence[int]) -> tuple[int, int]:
+        lengths = np.diff(bank.anchor_offsets)
+        live_lengths = lengths[np.asarray(positions, dtype=np.int64)] if positions else np.empty(0)
+        pairs = int(sum(int(length) * (int(length) - 1) // 2 for length in live_lengths))
+        anchors = int((live_lengths > 0).sum())
+        return pairs, anchors
+
+    def _global_step_counts(self, bank: KDContextBank, *, steps: int, step: int) -> tuple[int, int]:
+        pairs = 0
+        anchors = 0
+        for rank in range(self._world_size):
+            rank_pairs, rank_anchors = self._live_counts(
+                bank, self._anchor_positions(bank, rank=rank, steps=steps, step=step)
+            )
+            pairs += rank_pairs
+            anchors += rank_anchors
+        return pairs, anchors
+
+    def _score(
+        self, model: nn.Module, bank: KDContextBank, positions: Sequence[int]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        anchor_rows: list[int] = []
+        partner_rows: list[int] = []
+        teacher_rows: list[int] = []
+        groups: list[int] = []
+        for group, position in enumerate(positions):
+            start = int(bank.anchor_offsets[position])
+            stop = int(bank.anchor_offsets[position + 1])
+            anchor_idx = int(bank.anchor_idx[position])
+            for context_row in range(start, stop):
+                anchor_rows.append(int(self._packed_rows[anchor_idx]))
+                partner_rows.append(int(self._packed_rows[int(bank.partner_idx[context_row])]))
+                teacher_rows.append(int(bank.score_idx[context_row]))
+                groups.append(group)
+        device = self._table.tokens.device
+        if not anchor_rows:
+            empty_float = torch.empty(0, dtype=torch.float32, device=device)
+            empty_long = torch.empty(0, dtype=torch.int64, device=device)
+            return empty_float, empty_float, empty_long
+
+        lengths = self._table.manifest.nodes
+        buckets: dict[int, list[int]] = {boundary: [] for boundary in BUCKET_BOUNDARIES}
+        for row, (anchor_row, partner_row) in enumerate(
+            zip(anchor_rows, partner_rows, strict=True)
+        ):
+            max_length = max(lengths[anchor_row].length, lengths[partner_row].length)
+            boundary = next((value for value in BUCKET_BOUNDARIES if max_length <= value), None)
+            if boundary is None:
+                raise ValueError(
+                    f"KD context packed length {max_length} exceeds {BUCKET_BOUNDARIES[-1]}"
+                )
+            buckets[boundary].append(row)
+
+        student_parts: list[torch.Tensor] = []
+        teacher_parts: list[torch.Tensor] = []
+        group_parts: list[torch.Tensor] = []
+        for boundary, rows in buckets.items():
+            if not rows:
+                continue
+            anchor = torch.as_tensor(
+                [anchor_rows[row] for row in rows], dtype=torch.int64, device=device
+            )
+            partner = torch.as_tensor(
+                [partner_rows[row] for row in rows], dtype=torch.int64, device=device
+            )
+            emb_a, len_a = self._table.gather_nodes(anchor, boundary)
+            emb_b, len_b = self._table.gather_nodes(partner, boundary)
+            output = cast(
+                dict[str, torch.Tensor],
+                model({"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b}),
+            )
+            logits = output["logits"]
+            if logits.dim() > 1 and logits.size(-1) == 1:
+                logits = logits.squeeze(-1)
+            student_parts.append(logits.float())
+            score_rows = np.asarray([teacher_rows[row] for row in rows], dtype=np.int64)
+            teacher_parts.append(
+                torch.as_tensor(
+                    self._targets.teacher_logit[score_rows], dtype=torch.float32, device=device
+                )
+            )
+            group_parts.append(
+                torch.as_tensor([groups[row] for row in rows], dtype=torch.int64, device=device)
+            )
+        return torch.cat(student_parts), torch.cat(teacher_parts), torch.cat(group_parts)
+
+    @staticmethod
+    def _tie_counts(teacher: torch.Tensor, groups: torch.Tensor, margin: float) -> tuple[int, int]:
+        ties = 0
+        pairs = 0
+        teacher_prob = torch.sigmoid(teacher.detach())
+        for group in torch.unique(groups):
+            values = teacher_prob[groups == group]
+            if values.numel() < 2:
+                continue
+            left, right = torch.triu_indices(values.numel(), values.numel(), offset=1)
+            diff = (values[left] - values[right]).abs()
+            ties += int((diff <= margin).sum().item())
+            pairs += int(diff.numel())
+        return ties, pairs
+
+    def loss(
+        self, model: nn.Module, *, epoch: int, step: int, steps: int
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Return separately count-scaled rank/dist losses for one optimizer step."""
+        bank_index = epoch - 1
+        if bank_index < 0 or bank_index >= len(self._targets.banks):
+            raise ValueError(f"KD context epoch {epoch} has no bank")
+        bank = self._targets.banks[bank_index]
+        positions = self._anchor_positions(bank, rank=self._rank, steps=steps, step=step)
+        self.last_anchor_idx = tuple(int(bank.anchor_idx[position]) for position in positions)
+        self.last_bank_index = bank_index
+        local_pairs, local_anchors = self._live_counts(bank, positions)
+        global_pairs, global_anchors = self._global_step_counts(bank, steps=steps, step=step)
+        student, teacher, groups = self._score(model, bank, positions)
+        zero = next(model.parameters()).sum() * 0.0
+        rank_term = (
+            kd_rank_loss(student, teacher, groups, margin=self._distill.margin)
+            if local_pairs
+            else zero
+        )
+        dist_term = kd_dist_loss(student, teacher, groups) if local_anchors else zero
+        rank_scale = self._world_size * local_pairs / global_pairs if global_pairs else 0.0
+        dist_scale = self._world_size * local_anchors / global_anchors if global_anchors else 0.0
+        total = (
+            self._distill.w_rank * rank_term * rank_scale
+            + self._distill.w_dist * dist_term * dist_scale
+        )
+        ties, counted_pairs = self._tie_counts(teacher, groups, self._distill.margin)
+        return total, {
+            "context_pairs": float(local_pairs),
+            "context_anchors": float(local_anchors),
+            "context_ties": float(ties),
+            "context_tie_pairs": float(counted_pairs),
+            "sum_rank": float(rank_term.detach().item()) * local_pairs,
+            "sum_dist": float(dist_term.detach().item()) * local_anchors,
+        }
+
+    def epoch_telemetry(self, accelerator: Accelerator, sums: dict[str, float]) -> dict[str, float]:
+        """Reduce rank-local context counts and loss numerators for one epoch."""
+        keys = sorted(sums)
+        reduced = accelerator.reduce(
+            torch.tensor(
+                [sums[key] for key in keys], device=accelerator.device, dtype=torch.float64
+            ),
+            reduction="sum",
+        )
+        values = {key: float(reduced[index].item()) for index, key in enumerate(keys)}
+        pairs = values.get("context_pairs", 0.0)
+        anchors = values.get("context_anchors", 0.0)
+        tie_pairs = values.get("context_tie_pairs", 0.0)
+        return {
+            "kd_rank_loss": values.get("sum_rank", 0.0) / max(pairs, 1.0),
+            "kd_dist_loss": values.get("sum_dist", 0.0) / max(anchors, 1.0),
+            "kd_rank_tie_fraction": values.get("context_ties", 0.0) / max(tie_pairs, 1.0),
+            "kd_rank_live_pairs": pairs,
+            "kd_dist_live_anchors": anchors,
+        }
+
+    def validation_diagnostics(self, model: nn.Module) -> dict[str, float]:
+        """Score the fixed V_val context bank without gradients."""
+        bank = self._targets.val_bank
+        with torch.no_grad():
+            student, teacher, groups = self._score(model, bank, range(len(bank.anchor_idx)))
+            pair_count, anchor_count = self._live_counts(bank, range(len(bank.anchor_idx)))
+            rank = kd_rank_loss(student, teacher, groups, margin=self._distill.margin)
+            distribution = kd_dist_loss(student, teacher, groups)
+            ties, tie_pairs = self._tie_counts(teacher, groups, self._distill.margin)
+        return {
+            "val_kd_rank_loss": float(rank.item()),
+            "val_kd_dist_loss": float(distribution.item()),
+            "val_kd_rank_tie_fraction": ties / max(tie_pairs, 1),
+            "val_kd_rank_live_pairs": float(pair_count),
+            "val_kd_dist_live_anchors": float(anchor_count),
+        }
+
+
 class KDRowBank:
-    """Row-aligned teacher targets for same-batch KD: one forward, one backward per step.
+    """Official-row targets for telemetry and non-rank same-batch KD terms.
 
     Replaces the old `KDStream` sampled anchor-context second forward: a
     teacher target exists for every official training row
     (`src/distill/teacher_targets.py`, format ``kd_row_targets_v1``), joined
-    to the trainer's own rows by ``batch["_row_id"]``, so the task loss and
-    the KD loss are computed from the exact same student forward pass over
-    the exact same rows -- there is no separate KD stream and no second
-    forward.
+    to the trainer's own rows by ``batch["_row_id"]``. Non-rank KD terms use
+    the task forward; ``kd_rank`` keeps this bank only for official-row
+    logit-correlation and probability-error telemetry while its relational
+    losses come from :class:`KDContextStream`.
 
     The matched-control invariant: with ``cfg.distill`` absent or every
     weight zero, the caller never constructs a `KDRowBank`, and the training
@@ -2832,13 +3077,9 @@ class KDRowBank:
         """
         self.arm = distill.arm
         self._w_logit = distill.w_logit
-        self._w_rank = distill.w_rank
-        self._w_dist = distill.w_dist
         self._w_gram = distill.w_gram
         self._w_rep = distill.w_rep
         self._w_gen = distill.w_gen
-        self._margin = distill.margin
-        self._temperature = distill.temperature
 
         node_ids_arr = np.asarray(targets.node_ids, dtype=object)
         self._verify_join(
@@ -2906,7 +3147,7 @@ class KDRowBank:
         )
         self.train_a_idx: torch.Tensor | None = None
         self.train_b_idx: torch.Tensor | None = None
-        if self.arm in {"kd_rank", "kd_gram"}:
+        if self.arm == "kd_gram":
             self.train_a_idx = torch.as_tensor(targets.pair_a_idx, dtype=torch.int64, device=device)
             self.train_b_idx = torch.as_tensor(targets.pair_b_idx, dtype=torch.int64, device=device)
         self.train_rep: torch.Tensor | None = None
@@ -2933,18 +3174,6 @@ class KDRowBank:
             teacher_rep=val_teacher_rep,
             teacher_latent=val_teacher_latent,
             latent_scale=self._latent_scale,
-            endpoint_a=(
-                torch.as_tensor(targets.val_pair_a_idx, dtype=torch.int64, device=device)
-                if self.arm == "kd_rank"
-                else None
-            ),
-            endpoint_b=(
-                torch.as_tensor(targets.val_pair_b_idx, dtype=torch.int64, device=device)
-                if self.arm == "kd_rank"
-                else None
-            ),
-            margin=distill.margin,
-            temperature=distill.temperature,
         )
 
     @staticmethod
@@ -3005,49 +3234,10 @@ class KDRowBank:
         teacher_logit = self.train_logit.index_select(0, rows)
 
         total = student_logit.new_zeros(())
-        rank_group_counts: torch.Tensor | None = None
         logit_term: torch.Tensor | None = None
-        rank_term: torch.Tensor | None = None
-        dist_term: torch.Tensor | None = None
         if self.arm == "kd_logit":
             logit_term = kd_logit_loss(student_logit, teacher_logit)
             total = total + self._w_logit * logit_term
-
-        if self.arm == "kd_rank":
-            assert self.train_a_idx is not None and self.train_b_idx is not None
-            anchor_a = self.train_a_idx.index_select(0, rows)
-            anchor_b = self.train_b_idx.index_select(0, rows)
-            global_rows = _gather_global_relational_rows(
-                student_logit,
-                teacher_logit,
-                anchor_a,
-                anchor_b,
-                rows,
-                world_size=world_size,
-            )
-            student_logit_global = global_rows.student
-            teacher_logit_global = global_rows.teacher
-            anchor_a = global_rows.endpoint_a
-            anchor_b = global_rows.endpoint_b
-            non_self = anchor_a != anchor_b
-            anchor_group = torch.cat([anchor_a, anchor_b[non_self]])
-            rank_group_counts = torch.unique(anchor_group, return_counts=True)[1]
-            grouped_student = torch.cat([student_logit_global, student_logit_global[non_self]])
-            grouped_teacher = torch.cat([teacher_logit_global, teacher_logit_global[non_self]])
-            rank_term = kd_rank_loss(
-                grouped_student,
-                grouped_teacher,
-                anchor_group,
-                margin=self._margin,
-            )
-            total = total + self._w_rank * rank_term
-            dist_term = kd_dist_loss(
-                grouped_student,
-                grouped_teacher,
-                anchor_group,
-                temperature=self._temperature,
-            )
-            total = total + self._w_dist * dist_term
 
         with torch.no_grad():
             student_d = student_logit.detach().double()
@@ -3063,18 +3253,8 @@ class KDRowBank:
                     (torch.sigmoid(student_d) - torch.sigmoid(teacher_d)).abs().sum().item()
                 ),
             }
-            if rank_group_counts is not None:
-                eligible = rank_group_counts >= 2
-                stats["rank_groups"] = float(rank_group_counts.numel())
-                stats["rank_eligible_groups"] = float(eligible.sum().item())
-                stats["rank_roles"] = float(rank_group_counts.sum().item())
-                stats["rank_eligible_roles"] = float(rank_group_counts[eligible].sum().item())
             if logit_term is not None:
                 stats["sum_logit_bce"] = float(logit_term.detach().item()) * stats["rows"]
-            if rank_term is not None:
-                stats["sum_rank"] = float(rank_term.detach().item()) * stats["rows"]
-            if dist_term is not None:
-                stats["sum_dist"] = float(dist_term.detach().item()) * stats["rows"]
 
         if self.arm == "kd_rep":
             student_rep = output.get("kd_rep")
@@ -3187,15 +3367,6 @@ class KDRowBank:
         if self.arm == "kd_rep":
             telemetry["kd_rep_cos"] = reduced_sums["sum_rep_cos"] / n
             telemetry["kd_rep_loss"] = 1.0 - telemetry["kd_rep_cos"]
-        if self.arm == "kd_rank":
-            telemetry["kd_rank_eligible_group_fraction"] = (
-                reduced_sums["rank_eligible_groups"] / reduced_sums["rank_groups"]
-            )
-            telemetry["kd_rank_eligible_role_fraction"] = (
-                reduced_sums["rank_eligible_roles"] / reduced_sums["rank_roles"]
-            )
-            telemetry["kd_rank_loss"] = reduced_sums["sum_rank"] / n
-            telemetry["kd_dist_loss"] = reduced_sums["sum_dist"] / n
         if self.arm == "kd_gram":
             telemetry["kd_gram"] = reduced_sums["sum_gram"] / n
         if self.arm == "kd_gen":
@@ -3226,7 +3397,7 @@ class KDRowBank:
     @property
     def global_relational(self) -> bool:
         """Whether the arm's KD scalar already covers the global DDP step."""
-        return self.arm in {"kd_rank", "kd_gram"}
+        return self.arm == "kd_gram"
 
 
 def _batch_pair_counts(batch: Batch, world_size: int) -> tuple[int, int]:
@@ -3250,7 +3421,7 @@ def _scale_kd_loss(
     global_count: int,
     world_size: int,
 ) -> torch.Tensor:
-    """Scale row-local KD means, leaving global D2/D3 objectives unchanged."""
+    """Scale row-local KD means, leaving the global Gram objective unchanged."""
     if kd_bank.global_relational:
         return kd_loss
     return scale_ddp_mean_loss(
@@ -3314,6 +3485,7 @@ def train_ddp_loop(
     evaluate_fn: EvaluateFn = _evaluate_distributed,
     evaluate_cls_fn: EvaluateFn | None = None,
     kd_bank: KDRowBank | None = None,
+    kd_context_stream: KDContextStream | None = None,
     require_topology: bool = False,
     val_topology_reference: ValTopologyReference | None = None,
 ) -> TrainResult:
@@ -3348,6 +3520,7 @@ def train_ddp_loop(
         kd_bank: Optional row-aligned KD teacher targets (`KDRowBank`); its
             per-step loss is added to the scaled supervised loss before the
             shared backward, computed from the SAME student forward pass.
+        kd_context_stream: Optional rank-sharded context targets for `kd_rank`.
         require_topology: When True, selection raises instead of falling back
             to max-AUPRC if any topology-due epoch has no topology metrics
             (production, e.g. a resume across the V_val protocol change).
@@ -3587,7 +3760,11 @@ def train_ddp_loop(
             torch.cuda.reset_peak_memory_stats(accelerator.device)
 
         epoch_wall_start = time.monotonic()
-        iterator = iter(train_loader_factory(epoch))
+        epoch_loader = train_loader_factory(epoch)
+        if kd_context_stream is not None and not isinstance(epoch_loader, Sized):
+            raise TypeError("kd_rank requires a training loader with a known step count")
+        epoch_step_count = len(epoch_loader) if isinstance(epoch_loader, Sized) else 0
+        iterator = iter(epoch_loader)
         while True:
             wait_start = time.monotonic()
             try:
@@ -3610,6 +3787,7 @@ def train_ddp_loop(
                 global_count=global_count,
                 world_size=world_size,
             )
+            kd_loss: torch.Tensor | None = None
             if kd_bank is not None:
                 kd_local, kd_stats = kd_bank.loss(
                     batch,
@@ -3623,6 +3801,19 @@ def train_ddp_loop(
                     global_count=global_count,
                     world_size=world_size,
                 )
+                for key, value in kd_stats.items():
+                    epoch_kd_sums[key] = epoch_kd_sums.get(key, 0.0) + value
+            if kd_context_stream is not None:
+                context_loss, context_stats = kd_context_stream.loss(
+                    model,
+                    epoch=epoch,
+                    step=epoch_steps,
+                    steps=epoch_step_count,
+                )
+                kd_loss = context_loss if kd_loss is None else kd_loss + context_loss
+                for key, value in context_stats.items():
+                    epoch_kd_sums[key] = epoch_kd_sums.get(key, 0.0) + value
+            if kd_loss is not None:
                 if epoch_steps == 0:
                     # Per-epoch gradient-norm probe, before the shared backward:
                     # `torch.autograd.grad` never executes the `AccumulateGrad`
@@ -3633,8 +3824,6 @@ def train_ddp_loop(
                     grad_norm_task, grad_norm_kd = _term_grad_norms(loss, kd_loss, model)
                 loss = loss + kd_loss
                 epoch_kd_loss_sum += float(kd_loss.detach().float().item())
-                for key, value in kd_stats.items():
-                    epoch_kd_sums[key] = epoch_kd_sums.get(key, 0.0) + value
 
             if not _all_ranks_loss_finite(loss, accelerator):
                 raise RuntimeError(f"non-finite training loss on at least one rank (epoch {epoch})")
@@ -3755,7 +3944,7 @@ def train_ddp_loop(
             else float("nan")
         )
         train_kd_loss: float | None = None
-        if kd_bank is not None and epoch_steps > 0:
+        if (kd_bank is not None or kd_context_stream is not None) and epoch_steps > 0:
             global_kd_loss_sum = accelerator.reduce(
                 torch.tensor(
                     epoch_kd_loss_sum,
@@ -3768,6 +3957,8 @@ def train_ddp_loop(
         epoch_kd_telemetry: dict[str, float] = {}
         if kd_bank is not None and epoch_steps > 0:
             epoch_kd_telemetry = kd_bank.epoch_telemetry(accelerator, epoch_kd_sums)
+        if kd_context_stream is not None and epoch_steps > 0:
+            epoch_kd_telemetry.update(kd_context_stream.epoch_telemetry(accelerator, epoch_kd_sums))
         validation_start = time.monotonic()
         run_topology = _topology_due(
             epoch,
@@ -3806,7 +3997,7 @@ def train_ddp_loop(
         if train_kd_loss is not None:
             entry["train_kd_loss"] = train_kd_loss
         entry.update(epoch_kd_telemetry)
-        if kd_bank is not None:
+        if kd_bank is not None or kd_context_stream is not None:
             grad_norm_tensor = accelerator.reduce(
                 torch.tensor(
                     [grad_norm_task, grad_norm_kd], device=accelerator.device, dtype=torch.float64
@@ -4489,6 +4680,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
     num_val_rows = len(val_cls_pairs)
 
     kd_bank: KDRowBank | None = None
+    kd_context_stream: KDContextStream | None = None
     kd_val: KDValDiagnostics | None = None
     if cfg.distill is not None and cfg.distill.active:
         positives, negatives = _training_rows(val_split, assembled.exclude_nodes)
@@ -4504,12 +4696,25 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             device=accelerator.device,
         )
         kd_val = kd_bank.val_diagnostics()
+        if cfg.distill.arm == "kd_rank":
+            context_targets = load_kd_context_targets(Path(cfg.distill.context_targets_path))
+            kd_context_stream = KDContextStream(
+                cfg.distill,
+                context_targets,
+                table,
+                allowed_nodes=frozenset(val_split.train_nodes - assembled.exclude_nodes),
+                forbidden_internal_nodes=val_split.v_val,
+                epochs=cfg.optim.epochs,
+                rank=accelerator.process_index,
+                world_size=accelerator.num_processes,
+            )
+            kd_val = replace(kd_val, context_stream=kd_context_stream)
         if accelerator.is_main_process:
             logger.info(
-                "KD active: arm=%s targets=%s (task and KD share the training rows; "
-                "one forward per step)",
+                "KD active: arm=%s targets=%s context_targets=%s",
                 cfg.distill.arm,
                 cfg.distill.targets_path,
+                cfg.distill.context_targets_path or None,
             )
 
     val_label_smoothing = float(
@@ -4593,6 +4798,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                     evaluate_fn=evaluate_fn,
                     evaluate_cls_fn=evaluate_cls_fn,
                     kd_bank=kd_bank,
+                    kd_context_stream=kd_context_stream,
                     require_topology=not cfg.eval.classification_only,
                 ),
             )
@@ -4633,6 +4839,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         evaluate_fn=evaluate_fn,
         evaluate_cls_fn=evaluate_cls_fn,
         kd_bank=kd_bank,
+        kd_context_stream=kd_context_stream,
         require_topology=not cfg.eval.classification_only,
         val_topology_reference=reference,
     )

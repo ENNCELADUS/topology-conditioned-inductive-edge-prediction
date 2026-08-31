@@ -1,5 +1,5 @@
-# Autoresearch campaign surface for kd_rank: materialized from the Phase-0 grid
-# winner (kd_rank_wr0p1_wd1), cadence-2 topology validation.
+# Autoresearch campaign surface for strict-LLP kd_rank: fresh reference baseline
+# (not comparable to the retired incidental-batch grid), cadence-2 validation.
 # Operator edits stage-1 whitelisted keys only and bumps output_dir per trial.
 model:
   family: v3_1
@@ -71,7 +71,7 @@ output_dir: outputs/b1_row_kd_ar/kd_rank/trial_001
 mixed_precision: "bf16"
 distill:
   targets_path: outputs/distill/kd_row_targets_breadth_first
-  w_rank: 0.1
+  context_targets_path: outputs/distill/kd_ctx_targets_breadth_first
+  w_rank: 1.0
   w_dist: 1.0
   margin: 0.1
-  temperature: 1.0

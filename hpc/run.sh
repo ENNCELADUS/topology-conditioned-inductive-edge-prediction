@@ -52,12 +52,17 @@ controls (`structure_control_6a_v3`, `structure_control_6e_v1`), which reuse
 the `full` arm's checkpoint and have no pipeline run of their own.
 
 The kd-targets command is a thin passthrough to `python -m
-src.distill.teacher_targets`, which dumps full-training-row + V_val-row KD
-teacher targets (logit, symmetrized pooled pair embedding, PMA seed tokens)
-from one published `full_ego_oracle` checkpoint, driven by a training
-`--config` so the artifact rows join the trainer's rows exactly. It scores on
-a single GPU -- there is no world-size fan-out to size, unlike `train`/`score`
--- so pass `--device cuda` explicitly.
+src.distill.teacher_targets`. By default it dumps full-training-row + V_val-row
+targets; pass `--contexts` to dump the shared epoch-indexed KD2 context banks.
+Both modes take one published `full_ego_oracle` checkpoint and a training
+`--config`. Use a fresh unique `--output` for every dump so stale shards cannot
+be mixed.
+
+  CUDA_VISIBLE_DEVICES=0 hpc/run.sh kd-targets --contexts --device cuda --config CONFIG --checkpoint CHECKPOINT --output UNIQUE_OUTPUT --row-shard 0/4
+  CUDA_VISIBLE_DEVICES=1 hpc/run.sh kd-targets --contexts --device cuda --config CONFIG --checkpoint CHECKPOINT --output UNIQUE_OUTPUT --row-shard 1/4
+  CUDA_VISIBLE_DEVICES=2 hpc/run.sh kd-targets --contexts --device cuda --config CONFIG --checkpoint CHECKPOINT --output UNIQUE_OUTPUT --row-shard 2/4
+  CUDA_VISIBLE_DEVICES=3 hpc/run.sh kd-targets --contexts --device cuda --config CONFIG --checkpoint CHECKPOINT --output UNIQUE_OUTPUT --row-shard 3/4
+  hpc/run.sh kd-targets --contexts --config CONFIG --checkpoint CHECKPOINT --output UNIQUE_OUTPUT --merge --row-shard 0/4
 
 merge/g1/g2/kd-targets remain single-process while train uses all visible
 NVIDIA H20 GPUs. Use nohup in the calling shell when a run must survive

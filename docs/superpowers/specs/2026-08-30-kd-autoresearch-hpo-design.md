@@ -15,7 +15,7 @@ summary, refuse-keep), AIDE (debug-depth cap), Cerebras (single-experiment disci
   improves vs the incumbent and none degrades. Zero-width bands by default (fixed seed, no
   replicates); optional `bands.json` widens tolerances — written only by the human.
 - **Trial:** one grid-protocol run — 25 epochs, seed 0, `--skip-test`, auto world size, cadence
-  `eval.topology_every: 2` (+ final; cls every epoch); incumbents = grid winners reselected at cadence 2 (`src.autoresearch.baseline`, judge `--incumbent-topology-every 2`).
+  `eval.topology_every: 2` (+ final; cls every epoch); active `baseline`/`keep` rows are incumbents; kd_rank starts from a fresh strict-LLP context-target baseline.
 - **Substrate:** local Claude Code operator via git + ssh. All loop state lives in git plus the
   ledger; any fresh session cold-starts from files alone.
 - **Scope:** four campaigns — kd_logit, kd_rank, kd_gram, kd_rep — prioritized by grid results.
@@ -69,10 +69,10 @@ trial bumps `output_dir` to `outputs/b1_row_kd_ar/<arm>/trial_NNN`. The test-pin
 ## Ledger row
 
 `trial` (global int), `campaign`, `commit` (post-commit sha), `config_hash`, `output_dir`,
-`hypothesis` (one sentence), `status` ∈ {`baseline`, `keep`, `revert`, `crash`}, six metrics,
-`selected_epoch`, `total_seconds`, `verdict` (deltas + reasons; null for baseline/crash),
+`hypothesis` (one sentence), `status` ∈ {`baseline`, `keep`, `revert`, `crash`, `retired`}, six metrics,
+`selected_epoch`, `total_seconds`, `verdict` (deltas + reasons; null for baseline/retired/crash),
 `asi` (free-form diagnostics worth remembering), `timestamp`. Each campaign opens with a
-`baseline` row for its grid-winner incumbent.
+`baseline` row for its active incumbent; retired history does not fill that slot.
 
 ## Trial protocol (one hypothesis per trial)
 
@@ -95,11 +95,11 @@ trial bumps `output_dir` to `outputs/b1_row_kd_ar/<arm>/trial_NNN`. The test-pin
 
 ## Modifiable surface
 
-- **Stage 1 (config only):** `distill.*` (weights, `margin`, `temperature`), arm-specific KD
+- **Stage 1 (config only):** `distill.*` (weights and `margin`), arm-specific KD
   model keys (`model.config.kd_rep_dim`), all `optim.*` except `epochs`/`patience`, and model
   regularization keys (e.g. dropout) — so a fit diagnosis can be acted on directly. Frozen:
-  `seed`, `epochs`, `patience`, data, eval, `targets_path`, model family — the budget and the
-  measurement, never the recipe.
+  `seed`, `epochs`, `patience`, data, eval, `targets_path`, `context_targets_path`, model family —
+  the budget and the measurement, never the recipe.
 - **Stage 2 (after plateau, human sign-off):** widen to that arm's loss implementation in
   `src/distill/losses.py` (and its wiring), same budget and verdict, normal review gates
   (codex review per wave).
@@ -121,8 +121,8 @@ trial bumps `output_dir` to `outputs/b1_row_kd_ar/<arm>/trial_NNN`. The test-pin
   `EXPECTED_SWEEPS` in `tests/test_sweep_configs.py` and give the per-stem test a control branch
   (no `distill:` section to compare).
 - Incumbent identification: for each arm, take the Pareto-undominated grid points on the five
-  topology metrics (GS↑, |log RD|↓, ratios↓); a sole survivor is the incumbent, otherwise the
-  human picks among survivors; the choice lands in the ledger's baseline row.
+  topology metrics (GS↑, |log RD|↓, ratios↓); the human records each active choice as a baseline.
+  kd_rank's incidental-batch winner is `retired`; after dumping strict-LLP context targets, freeze `context_targets_path` and record a fresh, non-grid-comparable baseline.
 
 ## Finalization (per campaign, human-triggered)
 

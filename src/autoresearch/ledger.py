@@ -6,7 +6,7 @@ Row schema (all keys required on every row): ``trial`` (int, strictly
 ``STATUSES``), ``metrics`` (exactly ``METRIC_KEYS``, all finite; ``None`` for
 ``crash``), ``selected_epoch``, ``total_seconds``, ``verdict`` (dict whose
 ``decision`` equals the status for ``keep``/``revert``; ``None`` for
-``baseline``/``crash``; otherwise the exact frozen-judge evidence schema),
+``baseline``/``retired``/``crash``; otherwise the exact frozen-judge evidence schema),
 ``asi`` (free-form), ``timestamp``.
 """
 
@@ -23,7 +23,7 @@ from typing import Any
 
 from src.autoresearch.verdict import METRIC_NAMES, verdict_reasons
 
-STATUSES = frozenset({"baseline", "keep", "revert", "crash"})
+STATUSES = frozenset({"baseline", "keep", "revert", "crash", "retired"})
 CAMPAIGNS = frozenset({"kd_logit", "kd_rank", "kd_gram", "kd_rep", "kd_gen"})
 METRIC_KEYS = frozenset({"auprc", "gs", "rd", "degree_mmd", "clustering_mmd", "spectral_mmd"})
 VERDICT_KEYS = frozenset({"decision", "improved", "regressed", "deltas", "auprc_delta", "reasons"})
@@ -121,9 +121,10 @@ def _validate(row: Mapping[str, Any], existing: list[dict[str, Any]]) -> None:
     if campaign not in CAMPAIGNS:
         raise ValueError(f"unknown campaign {campaign!r}")
     campaign_rows = [entry for entry in existing if entry.get("campaign") == campaign]
-    if not campaign_rows and status != "baseline":
+    has_baseline = any(entry.get("status") == "baseline" for entry in campaign_rows)
+    if not has_baseline and status not in {"baseline", "retired"}:
         raise ValueError(f"campaign {campaign!r} must start with exactly one baseline")
-    if campaign_rows and status == "baseline":
+    if has_baseline and status == "baseline":
         raise ValueError(f"campaign {campaign!r} already has its baseline")
 
     selected_epoch = row["selected_epoch"]
@@ -178,9 +179,9 @@ def _validate(row: Mapping[str, Any], existing: list[dict[str, Any]]) -> None:
         raise ValueError(f"metric rd must be positive, got {metrics['rd']!r}")
 
     verdict = row["verdict"]
-    if status == "baseline":
+    if status in {"baseline", "retired"}:
         if verdict is not None:
-            raise ValueError("status 'baseline' must carry verdict=None")
+            raise ValueError(f"status {status!r} must carry verdict=None")
         return
     incumbent = next(
         entry.get("metrics")

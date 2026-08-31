@@ -1,7 +1,7 @@
 """Drift guard for the checked-in KD loss-weight sweep configs.
 
 Every YAML in ``configs/sweep/b1_kd_hpo/`` must be a copy of its base arm
-config differing only in the ``distill:`` weight/temperature values, the
+config differing only in the ``distill:`` weight values, the
 removal of ``eval.classification_only`` (uniform topology-aware validation),
 ``eval.topology_every: 2`` on the pinned late points (runs launched after
 the cadence change; earlier points completed at cadence 1 and are compared
@@ -22,7 +22,6 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SWEEP_DIR = _REPO_ROOT / "configs" / "sweep" / "b1_kd_hpo"
 _BASE_CONFIGS = {
     "kd_logit": _REPO_ROOT / "configs" / "b1_kd_logit_breadth_first.yaml",
-    "kd_rank": _REPO_ROOT / "configs" / "b1_kd_rank_breadth_first.yaml",
     "kd_gram": _REPO_ROOT / "configs" / "b1_kd_gram_breadth_first.yaml",
     "kd_rep": _REPO_ROOT / "configs" / "b1_kd_rep_breadth_first.yaml",
 }
@@ -32,15 +31,6 @@ EXPECTED_SWEEPS: dict[str, tuple[str, dict[str, float]]] = {
     "kd_logit_w1": ("kd_logit", {"w_logit": 1.0}),
     "kd_logit_w10": ("kd_logit", {"w_logit": 10.0}),
     "kd_logit_w100": ("kd_logit", {"w_logit": 100.0}),
-    "kd_rank_w0p01": ("kd_rank", {"w_rank": 0.01, "w_dist": 0.01}),
-    "kd_rank_w0p1": ("kd_rank", {"w_rank": 0.1, "w_dist": 0.1}),
-    "kd_rank_w1": ("kd_rank", {"w_rank": 1.0, "w_dist": 1.0}),
-    "kd_rank_w10": ("kd_rank", {"w_rank": 10.0, "w_dist": 10.0}),
-    "kd_rank_w100": ("kd_rank", {"w_rank": 100.0, "w_dist": 100.0}),
-    "kd_rank_wr0p1_wd10": ("kd_rank", {"w_rank": 0.1, "w_dist": 10.0}),
-    "kd_rank_wr0p1_wd1": ("kd_rank", {"w_rank": 0.1, "w_dist": 1.0}),
-    "kd_rank_wr1_wd0p1": ("kd_rank", {"w_rank": 1.0, "w_dist": 0.1}),
-    "kd_rank_wr0p01_wd10": ("kd_rank", {"w_rank": 0.01, "w_dist": 10.0}),
     "kd_gram_w0p01": ("kd_gram", {"w_gram": 0.01}),
     "kd_gram_w0p1": ("kd_gram", {"w_gram": 0.1}),
     "kd_gram_w1": ("kd_gram", {"w_gram": 1.0}),

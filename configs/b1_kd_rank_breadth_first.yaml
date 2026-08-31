@@ -1,6 +1,6 @@
-# B1 KD-rank arm: D2 anchor ranking + distribution KD over only the official
-# rows in each normal task batch. Every non-self row participates under both
-# endpoint anchors; no partner sampler or second student forward is used.
+# B1 KD-rank arm: strict LLP anchor ranking + distribution KD over the shared
+# K=12 per-epoch context bank. margin is the shared teacher tie-band and hinge
+# delta; distribution softmax temperature is fixed at 1 by the reference loss.
 model:
   family: v3_1
   config:
@@ -71,7 +71,7 @@ output_dir: outputs/b1_row_kd/kd_rank
 mixed_precision: "bf16"
 distill:
   targets_path: outputs/distill/kd_row_targets_breadth_first
+  context_targets_path: outputs/distill/kd_ctx_targets_breadth_first
   w_rank: 1.0
   w_dist: 1.0
   margin: 0.1
-  temperature: 1.0

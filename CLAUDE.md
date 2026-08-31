@@ -87,7 +87,7 @@ training → score-once artifacts → evaluation. Endpoint-only families need no
   slot is chosen by the `name` field of its config section, so adding a component is one registry
   entry, never a change to `composite.py`. No encoder may read `ImaginedGraph.aux`: it is
   generator-private, and a generator swap invalidates it wholesale.
-- `src/train_{egostitch,b0,cazi_mbn}.py` DDP workers — B1 KD arms ride `train_b0` + `src/distill/`;
+- `src/train_{egostitch,b0,cazi_mbn}.py` DDP workers — B1 KD uses row targets, plus a separate strict-LLP context-target artifact and extra KD-only forwards for `kd_rank`, through `train_b0` + `src/distill/`;
   `src/e2_pipeline.py` runs pack → train → publish → test; `src/score_universe.py` score-once artifacts;
   `src/score_fanout.py` fans a score pass across visible GPUs and merges the shards (owns `hpc/run.sh
   score`); `src/eval/test_protocol.py` runs one published checkpoint's test → candidate sequence into

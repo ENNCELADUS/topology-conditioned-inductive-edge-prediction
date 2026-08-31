@@ -17,6 +17,7 @@ fixture.
 from __future__ import annotations
 
 import json
+from argparse import Namespace
 from pathlib import Path
 
 import networkx as nx
@@ -27,7 +28,8 @@ from src.data.artifacts import canonical_pair
 from src.data.features import FeatureStore
 from src.data.val_region import Pair, ValRegionParams, ValRegionSplit, derive_val_region_split
 from src.distill import teacher_targets as tt
-from src.distill.artifacts import load_kd_targets, write_kd_targets
+from src.distill.artifacts import KDContextBank, load_kd_targets, write_kd_targets
+from src.distill.context_sampler import ContextBank
 from src.model.egostitch.composite import EgoStitchModel
 from src.model.egostitch.config import E2EConfig
 from src.model.egostitch.generator.egostitch import GeneratorNodeState
@@ -575,3 +577,121 @@ def test_parse_shard_accepts_a_valid_spec() -> None:
 def test_parse_shard_rejects_invalid_specs(spec: str) -> None:
     with pytest.raises(ValueError, match="row-shard"):
         tt._parse_shard(spec)
+
+
+def _context_bank(
+    anchors: list[int], offsets: list[int], partners: list[int], near: list[bool]
+) -> ContextBank:
+    return ContextBank(
+        anchor_idx=np.asarray(anchors, dtype=np.int32),
+        anchor_offsets=np.asarray(offsets, dtype=np.int64),
+        partner_idx=np.asarray(partners, dtype=np.int32),
+        is_near=np.asarray(near, dtype=np.bool_),
+    )
+
+
+def test_parser_accepts_context_mode() -> None:
+    args = tt.build_parser().parse_args(
+        [
+            "--config",
+            "train.yaml",
+            "--checkpoint",
+            "teacher.pt",
+            "--output",
+            "targets",
+            "--contexts",
+            "--row-shard",
+            "2/4",
+        ]
+    )
+    assert args.contexts is True
+    assert args.row_shard == "2/4"
+
+
+def test_index_context_banks_stably_deduplicates_and_preserves_csr_identity() -> None:
+    banks = (
+        _context_bank([0, 1], [0, 2, 3], [1, 1, 2], [True, False, True]),
+        _context_bank([0, 1], [0, 1, 3], [2, 2, 0], [False, True, False]),
+    )
+    val_bank = _context_bank([2], [0, 2], [0, 1], [True, False])
+
+    pair_a, pair_b, indexed, indexed_val = tt.index_context_banks(banks, val_bank)
+
+    np.testing.assert_array_equal(pair_a, [0, 1, 0, 1, 2, 2])
+    np.testing.assert_array_equal(pair_b, [1, 2, 2, 0, 0, 1])
+    np.testing.assert_array_equal(indexed[0].score_idx, [0, 0, 1])
+    np.testing.assert_array_equal(indexed[1].score_idx, [2, 1, 3])
+    np.testing.assert_array_equal(indexed_val.score_idx, [4, 5])
+    for source, joined in zip((*banks, val_bank), (*indexed, indexed_val), strict=True):
+        anchors = np.repeat(joined.anchor_idx, np.diff(joined.anchor_offsets))
+        np.testing.assert_array_equal(pair_a[joined.score_idx], anchors)
+        np.testing.assert_array_equal(pair_b[joined.score_idx], source.partner_idx)
+
+
+def test_context_shards_store_only_logits_and_merge_by_exact_identity(tmp_path: Path) -> None:
+    pair_a = np.array([0, 0, 1, 2, 2], dtype=np.int32)
+    pair_b = np.array([1, 2, 2, 0, 1], dtype=np.int32)
+    logits = np.linspace(-1.0, 1.0, len(pair_a), dtype=np.float32)
+    output = tmp_path / "contexts"
+    for shard in range(2):
+        start, end = _shard_range(len(pair_a), shard, 2)
+        tt._write_context_shard(
+            output,
+            shard,
+            2,
+            a_idx=pair_a[start:end],
+            b_idx=pair_b[start:end],
+            teacher_logit=logits[start:end],
+        )
+        with np.load(tt._context_shard_path(output, shard, 2)) as archive:
+            assert set(archive.files) == {"a_idx", "b_idx", "teacher_logit"}
+
+    np.testing.assert_array_equal(tt._merge_context_shards(output, pair_a, pair_b, 2), logits)
+
+    corrupt_path = tt._context_shard_path(output, 1, 2)
+    with np.load(corrupt_path) as archive:
+        corrupt_a = archive["a_idx"].copy()
+        corrupt_b = archive["b_idx"].copy()
+        corrupt_logits = archive["teacher_logit"].copy()
+    corrupt_a[0] = 999
+    np.savez(corrupt_path, a_idx=corrupt_a, b_idx=corrupt_b, teacher_logit=corrupt_logits)
+    with pytest.raises(ValueError, match="row identity"):
+        tt._merge_context_shards(output, pair_a, pair_b, 2)
+
+
+def test_finalize_context_artifact_has_no_teacher_rep(tmp_path: Path) -> None:
+    output = tmp_path / "contexts"
+    checkpoint = tmp_path / "teacher.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    pair_a = np.array([0, 1], dtype=np.int32)
+    pair_b = np.array([1, 0], dtype=np.int32)
+    bank = KDContextBank(
+        anchor_idx=np.array([0, 1], dtype=np.int32),
+        anchor_offsets=np.array([0, 1, 2], dtype=np.int64),
+        partner_idx=pair_b.copy(),
+        score_idx=np.array([0, 1], dtype=np.int32),
+        is_near=np.array([True, False], dtype=np.bool_),
+    )
+    val_bank = KDContextBank(
+        anchor_idx=np.array([0], dtype=np.int32),
+        anchor_offsets=np.array([0, 1], dtype=np.int64),
+        partner_idx=np.array([1], dtype=np.int32),
+        score_idx=np.array([0], dtype=np.int32),
+        is_near=np.array([False], dtype=np.bool_),
+    )
+    truth = nx.Graph([("a", "b")])
+    tt._finalize_context_artifact(
+        Namespace(output=output, checkpoint=checkpoint),
+        ["a", "b"],
+        truth,
+        pair_a,
+        pair_b,
+        np.array([0.25, -0.5], dtype=np.float32),
+        [bank],
+        val_bank,
+        "checkpoint-id",
+    )
+
+    with np.load(output / "targets.npz") as archive:
+        assert "teacher_logit" in archive.files
+        assert all("teacher_rep" not in name for name in archive.files)

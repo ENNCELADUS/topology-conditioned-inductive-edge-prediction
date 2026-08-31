@@ -8,12 +8,12 @@ threshold); no grid run has held-out test results — winners are tested once, a
 
 ## 1. Protocol
 
-Every point is the V3.1 student on the full-row `kd_row_targets_v1` bank (4-seed GMT Full-Ego teacher
-`c390709fb7070c62`): 25 epochs, seed 0, 4 H20 ranks, bf16, `--skip-test`. 22 points validated topology
-every epoch; `kd_rep_w10`/`kd_rep_w100` ran at `eval.topology_every: 2`. For comparability, every
-surface below is the **cadence-2 reselection** (`src.autoresearch.metrics_io.read_run(...,
-topology_every=2)`), the same convention campaign trials are judged under. The 4-rank grid is not
-comparable to the published 2-rank KD1–KD4 reports (`../b1_kd_arms.md`).
+Every point used the V3.1 student and full-row `kd_row_targets_v1` bank: 25 epochs, seed 0, 4 H20
+ranks, bf16, `--skip-test`. The nine `kd_rank*` rows are the retired incidental-batch KD2 objective;
+they are historical and non-comparable to the new strict-LLP KD2 family. Of 24 points, 22 validated
+topology every epoch; `kd_rep_w10`/`kd_rep_w100` used `eval.topology_every: 2`. Every surface is the
+**cadence-2 reselection** (`src.autoresearch.metrics_io.read_run(..., topology_every=2)`). The grid is
+also not comparable to the published 2-rank KD1–KD4 reports (`../b1_kd_arms.md`).
 
 ## 2. Control anchor
 
@@ -25,7 +25,7 @@ via `outputs/deployable_topology_v4/b0_v31_e092537d/test_report.json`: test AUPR
 degree/clustering/spectral MMD ratios 20.92/18.38/28.25. Caveats: different rank count and training
 vintage — mechanism-isolation claims against this anchor carry both confounds.
 
-## 3. Cadence-2 surfaces (selected epoch; AUPRC telemetry, never optimized)
+## 3. Cadence-2 historical surfaces (selected epoch; AUPRC telemetry, never optimized)
 
 | run | ep | AUPRC | GS ↑ | RD → 1 | deg MMD ↓ | clu MMD ↓ | spec MMD ↓ |
 |---|--:|--:|--:|--:|--:|--:|--:|

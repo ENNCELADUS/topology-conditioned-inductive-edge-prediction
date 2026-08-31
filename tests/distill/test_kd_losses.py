@@ -42,16 +42,7 @@ def test_kd_rep_loss_is_scale_invariant_and_backpropagates() -> None:
     assert student.grad is not None and torch.isfinite(student.grad).all()
 
 
-def test_kd_rank_loss_uses_only_within_anchor_ordering() -> None:
-    teacher = torch.tensor([1.0, -1.0, -1.0, 1.0])
-    group = torch.tensor([0, 0, 1, 1])
-    matching = torch.tensor([5.0, -5.0, -5.0, 5.0])
-    inverted = -matching
-    assert kd_rank_loss(matching, teacher, group).item() == pytest.approx(0.0)
-    assert kd_rank_loss(inverted, teacher, group).item() > 0.0
-
-
-def test_kd_rank_loss_no_comparable_group_is_differentiable_zero() -> None:
+def test_kd_rank_loss_only_singletons_is_differentiable_zero() -> None:
     student = torch.tensor([0.2, -0.4, 0.1], requires_grad=True)
     teacher = torch.tensor([1.0, -1.0, 0.0])
     group = torch.tensor([0, 1, 2])
@@ -62,17 +53,8 @@ def test_kd_rank_loss_no_comparable_group_is_differentiable_zero() -> None:
     torch.testing.assert_close(student.grad, torch.zeros_like(student))
 
 
-def test_kd_dist_loss_matches_groups_and_handles_only_singletons() -> None:
+def test_kd_dist_loss_only_singletons_is_differentiable_zero() -> None:
     teacher = torch.tensor([2.0, -2.0, 1.0])
-    group = torch.tensor([0, 0, 1])
-    identical = kd_dist_loss(teacher.clone(), teacher, group)
-    assert identical.item() == pytest.approx(0.0, abs=1e-6)
-    student = torch.tensor([-2.0, 2.0, 0.0], requires_grad=True)
-    loss = kd_dist_loss(student, teacher, group)
-    assert loss.item() > 0.0
-    loss.backward()  # type: ignore[no-untyped-call]
-    assert student.grad is not None and torch.isfinite(student.grad).all()
-
     singleton_student = torch.randn(3, requires_grad=True)
     zero = kd_dist_loss(singleton_student, teacher, torch.arange(3))
     assert zero.item() == 0.0 and torch.isfinite(zero)

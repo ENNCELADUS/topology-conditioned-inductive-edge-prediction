@@ -139,6 +139,22 @@ def test_each_campaign_starts_with_exactly_one_baseline(tmp_path: Path) -> None:
     )
 
 
+def test_retired_history_allows_first_active_baseline(tmp_path: Path) -> None:
+    path = tmp_path / "ledger.jsonl"
+    append_row(path, valid_row(1, campaign="kd_rank", status="retired", verdict=None))
+    append_row(
+        path,
+        valid_row(
+            2,
+            campaign="kd_rank",
+            status="baseline",
+            verdict=None,
+            output_dir="outputs/kd_rank/strict_llp_baseline",
+        ),
+    )
+    assert [row["status"] for row in read_rows(path)] == ["retired", "baseline"]
+
+
 @pytest.mark.parametrize(
     ("field", "value", "match"),
     [

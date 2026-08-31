@@ -1,11 +1,11 @@
 """`DistillConfig`: the B1 training-time knowledge-distillation knobs.
 
 Consumed by the simple B0-protocol trainer (`src.train_b0`) as the optional
-top-level ``distill:`` config section. Teacher targets are dumped once for
-every official training row (`src/distill/teacher_targets.py`, format
-``kd_row_targets_v1``); task and KD losses then share one student forward
-pass over exactly those same rows -- there is no separate KD-only stream or
-second forward. Exactly one arm group's weight(s) may be nonzero at a time:
+top-level ``distill:`` config section. Teacher row targets are dumped once
+for every official training row (`src/distill/teacher_targets.py`, format
+``kd_row_targets_v1``). ``kd_rank`` also consumes a separately dumped context
+bank (``kd_ctx_targets_v1``); other arms share the task-row forward. Exactly
+one arm group's weight(s) may be nonzero at a time:
 ``kd_logit`` (`w_logit`, pointwise soft-target logit KD), ``kd_rank``
 (`w_rank` + `w_dist`, anchor ranking/distribution KD), ``kd_gram`` (`w_gram`,
 batch-relational Gram KD), ``kd_rep`` (`w_rep`, per-row representation
@@ -38,13 +38,15 @@ class DistillConfig:
         targets_path: Path to the dumped full-row teacher-target artifact
             (`src/distill/teacher_targets.py`, format ``kd_row_targets_v1``).
             Required whenever any weight below is nonzero.
+        context_targets_path: Path to the dumped ``kd_ctx_targets_v1`` artifact.
+            Required exactly when the ``kd_rank`` arm is active.
         w_logit: ``kd_logit`` weight -- pointwise binary soft-target KD,
             BCE(student_logit, sigmoid(teacher_logit)), on the training
             batch's own rows (GLNN family).
-        w_rank: ``kd_rank`` margin-ranking weight over official batch rows
-            sharing either endpoint as an anchor.
-        w_dist: ``kd_rank`` per-anchor distribution-KL weight over the same
-            official batch rows.
+        w_rank: ``kd_rank`` margin-ranking weight over the separately sampled
+            per-epoch anchor/context groups.
+        w_dist: ``kd_rank`` per-anchor distribution-KL weight over those same
+            context groups.
         w_gram: ``kd_gram`` cosine-Gram weight over pair representations from
             all official rows in the task batch.
         w_rep: ``kd_rep`` weight -- per-row cosine alignment of the student
@@ -55,11 +57,11 @@ class DistillConfig:
         joint_warmup_frac: ``kd_gen`` fraction of training spent with ``sg``
             at the adapter before joint optimization.
         gen_lr_scale: ``kd_gen`` joint-phase generator LR multiplier.
-        margin: ``kd_rank`` ranking margin.
-        temperature: ``kd_rank`` distribution-softmax temperature.
+        margin: ``kd_rank`` shared teacher tie-band and hinge margin delta.
     """
 
     targets_path: str = ""
+    context_targets_path: str = ""
     w_logit: float = 0.0
     w_rank: float = 0.0
     w_dist: float = 0.0
@@ -69,7 +71,6 @@ class DistillConfig:
     joint_warmup_frac: float = 0.1
     gen_lr_scale: float = 0.1
     margin: float = 0.1
-    temperature: float = 1.0
 
     def __post_init__(self) -> None:
         """Validate weight signs/ranges and the single-arm-group pattern.
@@ -89,8 +90,6 @@ class DistillConfig:
             raise ValueError(f"gen_lr_scale must be positive, got {self.gen_lr_scale}")
         if self.margin < 0.0:
             raise ValueError(f"margin must be non-negative, got {self.margin}")
-        if self.temperature <= 0.0:
-            raise ValueError(f"temperature must be positive, got {self.temperature}")
         nonzero = frozenset(name for name in _WEIGHT_NAMES if float(getattr(self, name)) > 0.0)
         legal_patterns: tuple[frozenset[str], ...] = (
             frozenset(),
@@ -109,6 +108,11 @@ class DistillConfig:
             )
         if nonzero and not self.targets_path:
             raise ValueError("distill.targets_path is required when any weight is nonzero")
+        kd_rank_active = nonzero == frozenset({"w_rank", "w_dist"})
+        if kd_rank_active and not self.context_targets_path:
+            raise ValueError("distill.context_targets_path is required when kd_rank is active")
+        if not kd_rank_active and self.context_targets_path:
+            raise ValueError("distill.context_targets_path is only valid when kd_rank is active")
 
     @property
     def active(self) -> bool:
@@ -145,7 +149,7 @@ class DistillConfig:
             if field_spec.name not in mapping:
                 continue
             raw = mapping[field_spec.name]
-            if field_spec.name == "targets_path":
+            if field_spec.name in {"targets_path", "context_targets_path"}:
                 if not isinstance(raw, str):
                     raise ValueError(f"distill.{field_spec.name} must be a string")
                 kwargs[field_spec.name] = raw

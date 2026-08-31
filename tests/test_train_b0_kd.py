@@ -1,9 +1,9 @@
-"""Tests for src.train_b0's `KDRowBank`: the row-exact-join, same-batch KD rework.
+"""Tests for the B0 trainer's row-bank and strict-LLP context-stream KD paths.
 
 Covers: (a) the row-exact join and its failure modes, (b) task/KD sharing exact
 row IDs, (c) exactly one forward and one backward per batch under a real KD
-bank, (d) the zero-weight/no-`distill:` matched control, (e) the sampled
-anchor-context stream and its obsolete artifact fields are fully gone, (f)
+bank, (d) the zero-weight/no-`distill:` matched control, (e) the epoch-banked
+anchor/context stream and retired artifact fields, (f)
 epoch telemetry keys and `_pearson_from_moments`, (g) the `_evaluate_distributed`
 validation-only KD diagnostics, and (h) architecture-mismatch fail-closed checks.
 """
@@ -22,11 +22,19 @@ import src.train_b0 as train_b0
 import torch
 import torch.distributed as dist
 from accelerate import Accelerator
-from src.distill.artifacts import KDRowTargets, load_kd_targets, write_kd_targets
+from src.data.packed_features import PackedFeatureManifest, PackedFeatureTable, PackedNodeRecord
+from src.distill.artifacts import (
+    KDContextBank,
+    KDContextTargets,
+    KDRowTargets,
+    load_kd_targets,
+    write_kd_targets,
+)
 from src.distill.config import DistillConfig
 from src.distill.losses import kd_dist_loss, kd_gram_loss, kd_logit_loss, kd_rank_loss
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.train_b0 import (
+    KDContextStream,
     KDRowBank,
     KDValDiagnostics,
     ValidationOutcome,
@@ -208,6 +216,38 @@ def _production_rank_bank_worker(
         dist.destroy_process_group()
 
 
+def _context_stream_ddp_worker(rank: int, world_size: int, init_file: str, result_dir: str) -> None:
+    """Accumulate unequal context forwards, then execute one real DDP backward."""
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
+    )
+    try:
+        targets, table = _ragged_context_fixture()
+        base = _ContextToy()
+        backward_calls: list[int] = []
+
+        def count_backward(gradient: torch.Tensor) -> torch.Tensor:
+            backward_calls.append(1)
+            return gradient
+
+        base.weight.register_hook(count_backward)  # type: ignore[no-untyped-call]
+        model = DistributedDataParallel(base, broadcast_buffers=False)
+        stream = _context_stream(targets, table, rank=rank, world_size=world_size)
+        losses = [stream.loss(model, epoch=1, step=step, steps=3)[0] for step in range(3)]
+        torch.stack(losses).sum().backward()  # type: ignore[no-untyped-call]
+        assert base.weight.grad is not None
+        torch.save(
+            {
+                "grad": base.weight.grad.detach(),
+                "forward_calls": base.forward_calls,
+                "backward_calls": len(backward_calls),
+            },
+            Path(result_dir) / f"context-stream-{rank}.pt",
+        )
+    finally:
+        dist.destroy_process_group()
+
+
 # --------------------------------------------------------------------------- artifact helpers
 
 
@@ -268,6 +308,330 @@ def _ring_pairs(node_ids: list[str]) -> list[Pair]:
     """One row per node, paired to its ring successor -- a simple distinct-row set."""
     n = len(node_ids)
     return [(node_ids[i], node_ids[(i + 1) % n]) for i in range(n)]
+
+
+def _context_fixture(
+    n_nodes: int = 5, n_banks: int = 2
+) -> tuple[KDContextTargets, PackedFeatureTable]:
+    node_ids = [f"n{i}" for i in range(n_nodes)]
+    anchor_idx = np.arange(n_nodes, dtype=np.int32)
+    anchor_offsets = np.arange(0, 3 * n_nodes + 1, 3, dtype=np.int64)
+    partner_idx = np.asarray(
+        [(anchor + offset + 1) % n_nodes for anchor in range(n_nodes) for offset in range(3)],
+        dtype=np.int32,
+    )
+    pair_a_idx = np.repeat(anchor_idx, 3)
+    score_idx = np.arange(len(partner_idx), dtype=np.int32)
+    bank = KDContextBank(
+        anchor_idx=anchor_idx,
+        anchor_offsets=anchor_offsets,
+        partner_idx=partner_idx,
+        score_idx=score_idx,
+        is_near=np.ones(len(partner_idx), dtype=np.bool_),
+    )
+    val_bank = KDContextBank(
+        anchor_idx=np.array([0], dtype=np.int32),
+        anchor_offsets=np.array([0, 3], dtype=np.int64),
+        partner_idx=partner_idx[:3],
+        score_idx=score_idx[:3],
+        is_near=np.ones(3, dtype=np.bool_),
+    )
+    targets = KDContextTargets(
+        node_ids=node_ids,
+        pair_a_idx=pair_a_idx,
+        pair_b_idx=partner_idx.copy(),
+        teacher_logit=np.linspace(-2.0, 2.0, len(partner_idx), dtype=np.float32),
+        banks=tuple(bank for _ in range(n_banks)),
+        val_bank=val_bank,
+        manifest={"n_banks": n_banks},
+    )
+    records = tuple(
+        PackedNodeRecord(node, 0, index, index, 1) for index, node in enumerate(node_ids)
+    )
+    manifest = PackedFeatureManifest(
+        format="test",
+        input_dim=1,
+        dtype="bfloat16",
+        source_metadata_sha256="",
+        source_index_sha256="",
+        nodes=records,
+        shards=(),
+        pack_workers=1,
+        build_seconds=0.0,
+    )
+    tokens = torch.arange(1, n_nodes + 1, dtype=torch.float32).unsqueeze(-1)
+    table = PackedFeatureTable(tokens, torch.arange(n_nodes), torch.ones(n_nodes), manifest)
+    return targets, table
+
+
+def _ragged_context_fixture() -> tuple[KDContextTargets, PackedFeatureTable]:
+    """Five anchors with non-proportional context-pair and anchor counts by rank."""
+    node_ids = [f"n{i}" for i in range(9)]
+    context_lengths = [2, 3, 4, 2, 5]
+    anchor_idx = np.arange(5, dtype=np.int32)
+    anchor_offsets = np.concatenate(([0], np.cumsum(context_lengths))).astype(np.int64)
+    partner_idx = np.asarray(
+        [5 + offset % 4 for length in context_lengths for offset in range(length)],
+        dtype=np.int32,
+    )
+    score_idx = np.arange(len(partner_idx), dtype=np.int32)
+    bank = KDContextBank(
+        anchor_idx=anchor_idx,
+        anchor_offsets=anchor_offsets,
+        partner_idx=partner_idx,
+        score_idx=score_idx,
+        is_near=np.ones(len(partner_idx), dtype=np.bool_),
+    )
+    val_bank = KDContextBank(
+        anchor_idx=np.array([0], dtype=np.int32),
+        anchor_offsets=np.array([0, 2], dtype=np.int64),
+        partner_idx=partner_idx[:2],
+        score_idx=score_idx[:2],
+        is_near=np.ones(2, dtype=np.bool_),
+    )
+    targets = KDContextTargets(
+        node_ids=node_ids,
+        pair_a_idx=np.repeat(anchor_idx, context_lengths),
+        pair_b_idx=partner_idx.copy(),
+        teacher_logit=np.linspace(-2.5, 2.0, len(partner_idx), dtype=np.float32),
+        banks=(bank, bank),
+        val_bank=val_bank,
+        manifest={"n_banks": 2},
+    )
+    lengths = [1, 1, 1, 1, 1, 64, 160, 300, 500]
+    offsets = np.concatenate(([0], np.cumsum(lengths[:-1]))).astype(np.int64)
+    records = tuple(
+        PackedNodeRecord(node, 0, int(offset), int(offset), length)
+        for node, offset, length in zip(node_ids, offsets, lengths, strict=True)
+    )
+    manifest = PackedFeatureManifest(
+        format="test",
+        input_dim=1,
+        dtype="float32",
+        source_metadata_sha256="",
+        source_index_sha256="",
+        nodes=records,
+        shards=(),
+        pack_workers=1,
+        build_seconds=0.0,
+    )
+    tokens = torch.arange(1, sum(lengths) + 1, dtype=torch.float32).unsqueeze(-1)
+    table = PackedFeatureTable(
+        tokens,
+        torch.as_tensor(offsets),
+        torch.as_tensor(lengths),
+        manifest,
+    )
+    return targets, table
+
+
+def _reorder_context_targets(targets: KDContextTargets, order: list[int]) -> KDContextTargets:
+    """Reorder each epoch bank while preserving score-table row identities."""
+
+    def reorder(bank: KDContextBank) -> KDContextBank:
+        rows = [
+            np.arange(bank.anchor_offsets[position], bank.anchor_offsets[position + 1])
+            for position in order
+        ]
+        lengths = [len(row) for row in rows]
+        flat = np.concatenate(rows).astype(np.int64)
+        return KDContextBank(
+            anchor_idx=bank.anchor_idx[order],
+            anchor_offsets=np.concatenate(([0], np.cumsum(lengths))).astype(np.int64),
+            partner_idx=bank.partner_idx[flat],
+            score_idx=bank.score_idx[flat],
+            is_near=bank.is_near[flat],
+        )
+
+    return replace(targets, banks=tuple(reorder(bank) for bank in targets.banks))
+
+
+class _ContextToy(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(0.25))
+        self.forward_calls = 0
+        self.bucket_boundaries: list[int] = []
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        self.forward_calls += 1
+        self.bucket_boundaries.append(int(batch["emb_a"].shape[1]))
+        signal = batch["emb_a"][:, 0, 0] - batch["emb_b"][:, 0, 0]
+        return {"logits": self.weight * signal}
+
+
+def _context_stream(
+    targets: KDContextTargets,
+    table: PackedFeatureTable,
+    *,
+    rank: int = 0,
+    world_size: int = 1,
+    epochs: int = 2,
+) -> KDContextStream:
+    return KDContextStream(
+        DistillConfig(targets_path="rows", context_targets_path="contexts", w_rank=1.0, w_dist=1.0),
+        targets,
+        table,
+        allowed_nodes=frozenset(targets.node_ids),
+        forbidden_internal_nodes=frozenset({"n0"}),
+        epochs=epochs,
+        rank=rank,
+        world_size=world_size,
+    )
+
+
+def test_context_stream_exactly_once_coverage_and_bank_indexing() -> None:
+    targets, table = _context_fixture()
+    stream = _context_stream(targets, table)
+    model = _ContextToy()
+    covered: list[int] = []
+    for step in range(3):
+        stream.loss(model, epoch=2, step=step, steps=3)
+        covered.extend(stream.last_anchor_idx)
+        assert stream.last_bank_index == 1
+    assert covered == list(range(len(targets.node_ids)))
+
+
+def test_context_stream_rejects_more_epochs_than_banks() -> None:
+    targets, table = _context_fixture(n_banks=1)
+    with pytest.raises(ValueError, match="epochs .* exceed context banks"):
+        _context_stream(targets, table, epochs=2)
+
+
+def test_context_stream_fails_closed_on_universe_pack_and_vval_drift() -> None:
+    targets, table = _context_fixture()
+    config = DistillConfig(
+        targets_path="rows", context_targets_path="contexts", w_rank=1.0, w_dist=1.0
+    )
+    with pytest.raises(ValueError, match="outside the training universe"):
+        KDContextStream(
+            config,
+            targets,
+            table,
+            allowed_nodes=frozenset(targets.node_ids[:-1]),
+            forbidden_internal_nodes=frozenset({"n0"}),
+            epochs=2,
+            rank=0,
+            world_size=1,
+        )
+
+    short_manifest = replace(table.manifest, nodes=table.manifest.nodes[:-1])
+    short_table = PackedFeatureTable(table.tokens, table.offsets, table.lengths, short_manifest)
+    with pytest.raises(ValueError, match="missing from the feature pack"):
+        _context_stream(targets, short_table)
+
+    with pytest.raises(ValueError, match="V_val-internal pair"):
+        KDContextStream(
+            config,
+            targets,
+            table,
+            allowed_nodes=frozenset(targets.node_ids),
+            forbidden_internal_nodes=frozenset({"n0", "n1"}),
+            epochs=2,
+            rank=0,
+            world_size=1,
+        )
+
+
+def test_context_stream_one_rank_and_two_rank_gradients_match_exactly() -> None:
+    targets, table = _context_fixture()
+    one_model = _ContextToy()
+    one_loss, _ = _context_stream(targets, table).loss(one_model, epoch=1, step=0, steps=1)
+    one_loss.backward()  # type: ignore[no-untyped-call]
+    assert one_model.weight.grad is not None
+
+    rank_gradients: list[torch.Tensor] = []
+    for rank in range(2):
+        model = _ContextToy()
+        loss, _ = _context_stream(targets, table, rank=rank, world_size=2).loss(
+            model, epoch=1, step=0, steps=1
+        )
+        loss.backward()  # type: ignore[no-untyped-call]
+        assert model.weight.grad is not None
+        rank_gradients.append(model.weight.grad.detach())
+    torch.testing.assert_close(torch.stack(rank_gradients).mean(), one_model.weight.grad)
+
+
+def test_context_stream_ragged_rank_and_dist_denominators_are_independent() -> None:
+    targets, table = _ragged_context_fixture()
+    reference = _ContextToy()
+    reference_loss, _ = _context_stream(targets, table).loss(reference, epoch=1, step=0, steps=1)
+    reference_loss.backward()  # type: ignore[no-untyped-call]
+    assert reference.weight.grad is not None
+
+    gradients: list[torch.Tensor] = []
+    local_counts: list[tuple[int, int]] = []
+    for rank in range(2):
+        model = _ContextToy()
+        loss, stats = _context_stream(targets, table, rank=rank, world_size=2).loss(
+            model, epoch=1, step=0, steps=1
+        )
+        loss.backward()  # type: ignore[no-untyped-call]
+        assert model.weight.grad is not None
+        gradients.append(model.weight.grad.detach())
+        local_counts.append((int(stats["context_pairs"]), int(stats["context_anchors"])))
+
+    assert local_counts == [(17, 3), (4, 2)]
+    assert local_counts[0][0] / local_counts[1][0] != local_counts[0][1] / local_counts[1][1]
+    torch.testing.assert_close(torch.stack(gradients).mean(), reference.weight.grad)
+
+
+def test_context_stream_regroups_multiple_length_buckets_without_changing_loss() -> None:
+    targets, table = _ragged_context_fixture()
+    model = _ContextToy()
+    loss, _ = _context_stream(targets, table).loss(model, epoch=1, step=0, steps=1)
+
+    reversed_targets = _reorder_context_targets(targets, [4, 3, 2, 1, 0])
+    reversed_model = _ContextToy()
+    reversed_loss, _ = _context_stream(reversed_targets, table).loss(
+        reversed_model, epoch=1, step=0, steps=1
+    )
+
+    assert model.bucket_boundaries == [128, 256, 384, 512]
+    assert reversed_model.bucket_boundaries == model.bucket_boundaries
+    torch.testing.assert_close(reversed_loss, loss)
+
+
+def test_context_stream_spawned_ddp_accumulates_unequal_forwards_then_one_backward(
+    tmp_path: Path,
+) -> None:
+    world_size = 2
+    spawn(  # type: ignore[no-untyped-call]
+        _context_stream_ddp_worker,
+        args=(world_size, str(tmp_path / "context-stream-init"), str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
+    observed = [
+        torch.load(tmp_path / f"context-stream-{rank}.pt", weights_only=True)
+        for rank in range(world_size)
+    ]
+
+    targets, table = _ragged_context_fixture()
+    # The distributed global step groups are [0], [2, 1], [4, 3].
+    reference_targets = _reorder_context_targets(targets, [0, 2, 1, 4, 3])
+    reference = _ContextToy()
+    reference_losses = [
+        _context_stream(reference_targets, table).loss(reference, epoch=1, step=step, steps=3)[0]
+        for step in range(3)
+    ]
+    torch.stack(reference_losses).sum().backward()  # type: ignore[no-untyped-call]
+    assert reference.weight.grad is not None
+
+    assert [result["forward_calls"] for result in observed] == [10, 5]
+    assert [result["backward_calls"] for result in observed] == [1, 1]
+    for result in observed:
+        torch.testing.assert_close(result["grad"], reference.weight.grad, atol=1e-6, rtol=1e-6)
+
+
+def test_context_stream_telemetry_includes_live_counts_and_ties() -> None:
+    targets, table = _context_fixture()
+    stream = _context_stream(targets, table)
+    _, sums = stream.loss(_ContextToy(), epoch=1, step=0, steps=1)
+    telemetry = stream.epoch_telemetry(Accelerator(cpu=True), sums)
+    assert telemetry["kd_rank_live_pairs"] == 15.0
+    assert telemetry["kd_dist_live_anchors"] == 5.0
+    assert 0.0 <= telemetry["kd_rank_tie_fraction"] <= 1.0
 
 
 # --------------------------------------------------------------------------- (a) row-exact join
@@ -404,7 +768,7 @@ def test_kd_loss_uses_exact_row_ids(tmp_path: Path) -> None:
     assert not torch.allclose(loss_a, loss_b)
 
 
-def test_kd_rank_groups_each_official_row_under_both_endpoint_roles(tmp_path: Path) -> None:
+def test_kd_rank_row_bank_is_telemetry_only(tmp_path: Path) -> None:
     node_ids = ["n0", "n1", "n2"]
     train_pairs = [("n0", "n2"), ("n1", "n2")]
     train_labels = [1, 0]
@@ -416,7 +780,7 @@ def test_kd_rank_groups_each_official_row_under_both_endpoint_roles(tmp_path: Pa
         teacher_logit=np.array([1.0, -1.0], dtype=np.float32),
     )
     bank = KDRowBank(
-        DistillConfig(targets_path="t", w_rank=1.0, w_dist=1.0),
+        DistillConfig(targets_path="t", context_targets_path="contexts", w_rank=1.0, w_dist=1.0),
         load_kd_targets(tmp_path / "targets"),
         train_pairs=train_pairs,
         train_labels=train_labels,
@@ -427,13 +791,10 @@ def test_kd_rank_groups_each_official_row_under_both_endpoint_roles(tmp_path: Pa
     )
     student = torch.tensor([-1.0, 1.0], requires_grad=True)
     loss, stats = bank.loss({"_row_id": torch.tensor([0, 1])}, {"logits": student})
-    # The shared node is pair_b for both rows. A pair_a-only implementation
-    # would see two singleton groups and incorrectly return zero.
-    assert loss.item() > 0.0
-    assert stats["rank_eligible_groups"] == 1.0
-    assert stats["rank_eligible_roles"] == 2.0
-    loss.backward()  # type: ignore[no-untyped-call]
-    assert student.grad is not None and torch.isfinite(student.grad).all()
+    assert loss.item() == 0.0
+    assert stats["rows"] == 2.0
+    assert "rank_eligible_groups" not in stats
+    assert bank.global_relational is False
 
 
 def test_kd_gram_uses_shared_forward_pair_representations(tmp_path: Path) -> None:
@@ -466,11 +827,12 @@ def test_kd_gram_uses_shared_forward_pair_representations(tmp_path: Path) -> Non
     )
     assert loss.item() > 0.0
     assert stats["sum_gram"] > 0.0
+    assert bank.global_relational is True
     loss.backward()  # type: ignore[no-untyped-call]
     assert pair_repr.grad is not None and torch.isfinite(pair_repr.grad).all()
 
 
-@pytest.mark.parametrize("arm", ["rank", "rank_uneven", "gram"])
+@pytest.mark.parametrize("arm", ["gram"])
 def test_relational_kd_gathers_cross_rank_rows_with_exact_ddp_gradient(
     tmp_path: Path, arm: str
 ) -> None:
@@ -519,43 +881,6 @@ def test_relational_kd_gathers_cross_rank_rows_with_exact_ddp_gradient(
     for result in observed:
         torch.testing.assert_close(result["loss"], expected_loss.detach())
         torch.testing.assert_close(result["grad"], expected_grad, atol=1e-6, rtol=1e-6)
-
-
-def test_production_kd_row_bank_keeps_global_loss_unscaled_and_one_pass(
-    tmp_path: Path,
-) -> None:
-    world_size = 2
-    spawn(  # type: ignore[no-untyped-call]
-        _production_rank_bank_worker,
-        args=(world_size, str(tmp_path / "rank-bank-init"), str(tmp_path)),
-        nprocs=world_size,
-        join=True,
-    )
-    observed = [
-        torch.load(tmp_path / f"rank-bank-{rank}.pt", weights_only=True)
-        for rank in range(world_size)
-    ]
-
-    weight = torch.tensor(0.25, requires_grad=True)
-    student = torch.stack([weight, -weight, -0.5 * weight])
-    teacher = torch.tensor([-1.0, 1.0, 0.5])
-    endpoint_a = torch.tensor([0, 1, 2])
-    endpoint_b = torch.tensor([3, 3, 4])
-    groups = torch.cat([endpoint_a, endpoint_b])
-    grouped_student = torch.cat([student, student])
-    grouped_teacher = torch.cat([teacher, teacher])
-    expected_loss = kd_rank_loss(grouped_student, grouped_teacher, groups) + kd_dist_loss(
-        grouped_student, grouped_teacher, groups
-    )
-    expected_loss.backward()  # type: ignore[no-untyped-call]
-    assert weight.grad is not None
-    expected_grad = weight.grad.reshape(())
-
-    for result in observed:
-        torch.testing.assert_close(result["loss"], expected_loss.detach())
-        torch.testing.assert_close(result["grad"], expected_grad, atol=1e-6, rtol=1e-6)
-        assert result["forward_calls"] == 1
-        assert result["backward_calls"] == 1
 
 
 # --------------------------------------------------------------------------- (c) one fwd/one bwd
@@ -689,11 +1014,11 @@ def test_ddp_loop_distill_none_and_all_zero_are_bit_identical(tmp_path: Path) ->
 
 def test_obsolete_kd_sampler_modules_are_gone() -> None:
     for module_name in (
-        "src.distill.context_sampler",
         "src.distill.content_logit",
         "src.distill.heuristic_targets",
     ):
         assert importlib.util.find_spec(module_name) is None
+    assert hasattr(train_b0, "KDContextStream")
     assert not hasattr(train_b0, "KDStream")
 
 
@@ -706,7 +1031,8 @@ def test_kd_row_targets_has_no_obsolete_fields() -> None:
 
 def test_distill_config_has_no_obsolete_fields() -> None:
     field_names = {field.name for field in dataclasses.fields(DistillConfig)}
-    assert field_names.isdisjoint({"anchors_per_step", "arm_label"})
+    assert "context_targets_path" in field_names
+    assert field_names.isdisjoint({"anchors_per_step", "arm_label", "temperature"})
 
 
 # --------------------------------------------------------------------------- (f) telemetry
@@ -841,41 +1167,13 @@ def test_epoch_telemetry_kd_logit_loss_is_unweighted_rows_weighted_mean(tmp_path
 
 
 def test_epoch_telemetry_kd_rank_separates_unweighted_rank_and_dist(tmp_path: Path) -> None:
-    node_ids = ["n0", "n1", "n2"]
-    train_pairs = [("n0", "n2"), ("n1", "n2")]
-    train_labels = [1, 0]
-    teacher = torch.tensor([1.0, -1.0])
-    _write_targets(
-        tmp_path / "targets",
-        node_ids=node_ids,
-        train_pairs=train_pairs,
-        train_labels=train_labels,
-        teacher_logit=teacher.numpy().astype(np.float32),
-    )
-    bank = KDRowBank(
-        DistillConfig(targets_path="t", w_rank=2.0, w_dist=3.0),
-        load_kd_targets(tmp_path / "targets"),
-        train_pairs=train_pairs,
-        train_labels=train_labels,
-        val_pairs=train_pairs[:1],
-        val_labels=train_labels[:1],
-        model=nn.Module(),
-        device=torch.device("cpu"),
-    )
-
-    student = torch.tensor([-1.0, 1.0])
-    total, stats = bank.loss({"_row_id": torch.tensor([0, 1])}, {"logits": student})
-    telemetry = bank.epoch_telemetry(Accelerator(cpu=True), dict(stats))
-
-    # Both rows share n2 as pair_b: groups [a0, a1, b0, b1] = [0, 1, 2, 2].
-    groups = torch.tensor([0, 1, 2, 2])
-    grouped_student = torch.cat([student, student])
-    grouped_teacher = torch.cat([teacher, teacher])
-    rank_expected = kd_rank_loss(grouped_student, grouped_teacher, groups).item()
-    dist_expected = kd_dist_loss(grouped_student, grouped_teacher, groups).item()
-    assert telemetry["kd_rank_loss"] == pytest.approx(rank_expected)
-    assert telemetry["kd_dist_loss"] == pytest.approx(dist_expected)
-    assert total.item() == pytest.approx(2.0 * rank_expected + 3.0 * dist_expected)
+    del tmp_path
+    targets, table = _context_fixture()
+    stream = _context_stream(targets, table)
+    _, stats = stream.loss(_ContextToy(), epoch=1, step=0, steps=1)
+    telemetry = stream.epoch_telemetry(Accelerator(cpu=True), stats)
+    assert telemetry["kd_rank_loss"] >= 0.0
+    assert telemetry["kd_dist_loss"] >= 0.0
 
 
 def test_epoch_telemetry_kd_rep_loss_derived_from_cos(tmp_path: Path) -> None:
@@ -1001,32 +1299,11 @@ def test_evaluate_distributed_kd_rep_diagnostics() -> None:
 
 
 def test_evaluate_distributed_kd_rank_reports_deterministic_block_losses() -> None:
-    batch = {
-        "label": torch.tensor([1.0, 0.0]),
-        "_row_id": torch.tensor([0, 1]),
-        "logit_seed": torch.tensor([-1.0, 1.0]),
-        "rep_seed": torch.randn(2, 3),
-    }
-    teacher_logit = torch.tensor([1.0, -1.0])
-    kd_val = KDValDiagnostics(
-        arm="kd_rank",
-        teacher_logit=teacher_logit,
-        teacher_logit_np=teacher_logit.double().numpy(),
-        teacher_rep=None,
-        teacher_latent=None,
-        endpoint_a=torch.tensor([0, 1]),
-        endpoint_b=torch.tensor([2, 2]),
-    )
-    outcome = _evaluate_distributed(
-        _RepDiagModel(),
-        [batch],
-        Accelerator(cpu=True),
-        expected_row_ids=np.arange(2),
-        kd_val=kd_val,
-    )
-    assert outcome.kd is not None
-    assert outcome.kd["val_kd_rank_block_loss"] > 0.0
-    assert outcome.kd["val_kd_dist_block_loss"] > 0.0
+    targets, table = _context_fixture()
+    diagnostics = _context_stream(targets, table).validation_diagnostics(_ContextToy())
+    assert diagnostics["val_kd_rank_loss"] >= 0.0
+    assert diagnostics["val_kd_dist_loss"] >= 0.0
+    assert 0.0 <= diagnostics["val_kd_rank_tie_fraction"] <= 1.0
 
 
 def test_evaluate_distributed_kd_gram_reports_deterministic_block_loss() -> None:

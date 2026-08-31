@@ -1,7 +1,9 @@
 # B1 training-time KD arms: definitions and results
 
-**Status:** the nine `kd_control`/D1–D8 anchor-context runs below are retired as confounded and support
-no method claim. Current full-row reports: [`KD1`](kd1_kd_logit/README.md), [`KD2`](kd2_kd_rank/README.md), [`KD3`](kd3_kd_gram/README.md), [`KD4`](kd4_kd_rep/README.md); loss-weight HPO grid and campaign plan: [`kd_hpo_grid`](kd_hpo_grid/README.md).
+**Status:** the 2026-08-20 confound verdict remains valid for the retired incidental-batch design comparisons below. Operator decision reopens KD2 only as a KD-only, strict-LLP stream; it starts a
+fresh, non-comparable result family. Reports: [`KD1`](kd1_kd_logit/README.md), [`KD2`](kd2_kd_rank/README.md),
+[`KD3`](kd3_kd_gram/README.md), [`KD4`](kd4_kd_rep/README.md), and the
+retired loss-weight [`HPO grid`](kd_hpo_grid/README.md).
 
 ## Retired: sampled anchor-context KD arms (historical)
 
@@ -72,21 +74,19 @@ Historical notes (retired): D8 led AUROC/ECE, D3 led all three MMD ratios; BFS G
 0.4036–0.4192 around control 0.4175, so edge-set identity stayed flat under every mechanism. All runs
 are seed 0 only. Reports: `outputs/b1_stage_v{2,3}/kd_*/test_report.json`; D8 on branch `s4-s6-budget-probes-d8` at `da6f5a500cfd043a715e7c04ddb16b9d410eb0a5`.
 
-## Full-row KD protocol (current)
+## Current row/context KD protocol
 
-Teacher targets are dumped once for every official training row (plus the V_val classification rows,
-validation-only) into artifact `kd_row_targets_v1` (`src/distill/teacher_targets.py`): pair identity,
-row id by position, teacher logit, and symmetrized PMA(1) pooled latent target `teacher_rep`. Teacher
-inference applies query-edge masking -- a
-positive training edge is never visible in its own structural context. The trainer computes task and
-KD losses from one student forward on identical rows, joined by `_row_id`; there is no KD-only stream.
+`kd_row_targets_v1` holds frozen targets for official task rows (plus validation-only V_val rows).
+KD2 additionally uses `kd_ctx_targets_v1`: per-epoch strict-LLP anchor/context groups scored offline
+with query-edge masking. Its extra forwards optimize only relational KD; supervised task BCE remains
+on the official rows, and deployed input remains exactly `(x_u,x_v)`.
 
 ### Arms
 
 - `kd_control` -- no `distill:` section; matched control that zero KD weight must reproduce.
 - `kd_logit` -- `w_logit`: binary soft-target BCE to `sigmoid(teacher_logit)` (GLNN family).
-- `kd_rank` -- `w_rank`+`w_dist`: D2 margin ranking and per-anchor distribution KL; each official
-  non-self row participates under both endpoint anchors, without adding rows or another forward.
+- `kd_rank` -- `w_rank`+`w_dist`: strict-LLP probability-space rank and distribution losses over the
+  separate K=12 context bank; this new KD2 is not comparable to retired incidental-batch KD2 rows.
 - `kd_gram` -- `w_gram`: D3 cosine-Gram matching across all distinct batch rows, including rows that share an endpoint.
 - `kd_rep` -- `w_rep`: per-row cosine alignment of the student pair representation to `teacher_rep`.
 - `kd_gen` -- `w_gen`: endpoint-conditioned generation of the PMA(1) pooled topology latent; see `docs/superpowers/specs/2026-08-30-kd-gen-arm-design.md`.

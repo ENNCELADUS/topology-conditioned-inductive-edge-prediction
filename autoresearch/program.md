@@ -12,10 +12,10 @@ keep/revert input.
 
 ## Campaigns
 
-kd_logit, kd_rank, kd_gram, kd_rep — one at a time; order set by the human from grid results.
-Each campaign starts from its arm's grid winner (human-recorded `baseline` ledger row, picked
-from `src.autoresearch.verdict.undominated`). No campaign begins until Phase 0 is complete and the
-human materializes that winner as `configs/autoresearch/<arm>.yaml` (with `eval.topology_every: 2` baked in) and records its baseline row from `.venv/bin/python -m src.autoresearch.baseline <run_dir> --topology-every 2` (cadence-aligned reselection of the every-epoch grid run); the operator never invents it.
+kd_logit, kd_rank, kd_gram, kd_rep — one at a time; order set by the human. No campaign begins until Phase 0 is complete.
+For kd_logit, kd_gram, and kd_rep, the human materializes that winner from `src.autoresearch.verdict.undominated` and records its grid-winner `baseline`.
+kd_rank's grid row is retired, non-comparable history; after its context-target dump, the human freezes `distill.context_targets_path`, runs the strict-LLP config,
+and records that fresh result as kd_rank's first active `baseline`. The operator never invents a baseline.
 
 ## The trial loop
 
@@ -47,7 +47,7 @@ human materializes that winner as `configs/autoresearch/<arm>.yaml` (with `eval.
 
 ## Stage-1 whitelist (config keys the agent may edit)
 
-- `distill.*` (weights, `margin`, `temperature`)
+- `distill.*` (weights and `margin`)
 - arm-specific KD model keys (`model.config.kd_rep_dim` for kd_rep)
 - all `optim.*` EXCEPT `epochs`
 - model regularization keys (`model.config.regularization.*`, `model.config.mlp_head.dropout`,
@@ -55,7 +55,7 @@ human materializes that winner as `configs/autoresearch/<arm>.yaml` (with `eval.
 - `output_dir` (mandatory bump every trial)
 
 Frozen — never edit: `seed`, `optim.epochs`, `eval.*` (including `patience`), `data.*`,
-`runtime.*`, `distill.targets_path`, `model.family`, `mixed_precision`.
+`runtime.*`, `distill.targets_path`, `distill.context_targets_path`, `model.family`, `mixed_precision`.
 
 ## Named duties
 

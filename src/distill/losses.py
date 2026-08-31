@@ -1,8 +1,7 @@
-"""Pure tensor losses for full-row B1 KD and Gate A set-student training.
+"""Pure tensor losses for B1 KD and Gate A set-student training.
 
-The B1 losses operate only on rows from the normal task batch. D2 forms
-anchor groups from the endpoints of those rows; D3 matches pair-representation
-geometry across those rows. No loss samples or scores an additional pair.
+The D2 losses operate on explicit per-anchor context pairs; D3 matches
+pair-representation geometry across rows from the normal task batch.
 """
 
 from __future__ import annotations
@@ -11,7 +10,6 @@ import torch
 from torch.nn import functional as F
 
 DEFAULT_MARGIN = 0.1
-DEFAULT_TEMPERATURE = 1.0
 _EPS = 1e-12
 _NEG_SENTINEL = -1.0e9
 
@@ -47,11 +45,11 @@ def kd_rank_loss(
     *,
     margin: float = DEFAULT_MARGIN,
 ) -> torch.Tensor:
-    """D2 margin ranking over teacher-distinct rows sharing an anchor group.
+    """LLP margin ranking over unordered context pairs within each anchor group.
 
-    ``group_idx`` is explicit: the caller constructs both endpoint roles from
-    the official task rows. Ordered within-group comparisons are averaged;
-    singleton groups and all-tied groups contribute a differentiable zero.
+    Teacher and student logits are converted to probabilities. ``margin`` is
+    both the strict teacher-probability tie band and the hinge margin. Tied
+    pairs retain their constant-margin loss, as in the LLP reference.
     """
     order = torch.argsort(group_idx)
     sorted_groups = group_idx[order]
@@ -70,25 +68,28 @@ def kd_rank_loss(
         group_offsets[pair_group] + torch.div(relative, group_width, rounding_mode="floor")
     ]
     right = order[group_offsets[pair_group] + torch.remainder(relative, group_width)]
-    teacher_diff = teacher_logit[left] - teacher_logit[right]
-    valid = (left != right) & (teacher_diff != 0)
-    target = torch.sign(teacher_diff)
-    student_diff = student_logit[left] - student_logit[right]
-    return _masked_mean(F.relu(margin - target * student_diff), valid)
+    teacher_prob = torch.sigmoid(teacher_logit.to(dtype=student_logit.dtype))
+    student_prob = torch.sigmoid(student_logit)
+    teacher_diff = teacher_prob[left] - teacher_prob[right]
+    target = torch.where(
+        teacher_diff > margin,
+        torch.ones_like(teacher_diff),
+        torch.where(teacher_diff < -margin, -torch.ones_like(teacher_diff), 0.0),
+    )
+    student_diff = student_prob[left] - student_prob[right]
+    return _masked_mean(F.relu(-target * student_diff + margin), left < right)
 
 
 def kd_dist_loss(
     student_logit: torch.Tensor,
     teacher_logit: torch.Tensor,
     group_idx: torch.Tensor,
-    *,
-    temperature: float = DEFAULT_TEMPERATURE,
 ) -> torch.Tensor:
-    """D2 mean per-anchor KL between teacher and student row distributions.
+    """LLP mean per-anchor KL between context-probability distributions.
 
-    Softmaxes contain only official task rows in each explicit anchor group.
-    Groups with fewer than two rows are excluded; an empty set of eligible
-    groups returns a differentiable zero.
+    Each anchor's student and teacher logits are first converted to
+    probabilities, then softmaxed across contexts at the fixed reference
+    temperature of one. KL is summed over contexts and averaged over anchors.
     """
     if student_logit.numel() == 0:
         return student_logit.sum() * 0.0
@@ -96,16 +97,16 @@ def kd_dist_loss(
     device = student_logit.device
     _, inverse = torch.unique(group_idx, return_inverse=True)
     n_groups = int(inverse.max().item()) + 1
-    student_scaled = student_logit / temperature
-    teacher_scaled = teacher_logit.to(dtype=dtype) / temperature
+    student_prob = torch.sigmoid(student_logit)
+    teacher_prob = torch.sigmoid(teacher_logit.to(dtype=dtype))
 
     max_student = torch.full((n_groups,), _NEG_SENTINEL, dtype=dtype, device=device)
-    max_student.scatter_reduce_(0, inverse, student_scaled, reduce="amax", include_self=True)
+    max_student.scatter_reduce_(0, inverse, student_prob, reduce="amax", include_self=True)
     max_teacher = torch.full((n_groups,), _NEG_SENTINEL, dtype=dtype, device=device)
-    max_teacher.scatter_reduce_(0, inverse, teacher_scaled, reduce="amax", include_self=True)
+    max_teacher.scatter_reduce_(0, inverse, teacher_prob, reduce="amax", include_self=True)
 
-    exp_student = torch.exp(student_scaled - max_student[inverse])
-    exp_teacher = torch.exp(teacher_scaled - max_teacher[inverse])
+    exp_student = torch.exp(student_prob - max_student[inverse])
+    exp_teacher = torch.exp(teacher_prob - max_teacher[inverse])
     sum_student = torch.zeros(n_groups, dtype=dtype, device=device).scatter_add_(
         0, inverse, exp_student
     )
@@ -118,10 +119,7 @@ def kd_dist_loss(
         torch.log(teacher_prob.clamp_min(_EPS)) - torch.log(student_prob.clamp_min(_EPS))
     )
     group_kl = torch.zeros(n_groups, dtype=dtype, device=device).scatter_add_(0, inverse, row_kl)
-    group_size = torch.zeros(n_groups, dtype=dtype, device=device).scatter_add_(
-        0, inverse, torch.ones_like(student_logit)
-    )
-    return _masked_mean(group_kl, group_size >= 2)
+    return group_kl.mean()
 
 
 def kd_gram_loss(
@@ -189,7 +187,6 @@ def kd_set_gram_loss(
 
 __all__ = [
     "DEFAULT_MARGIN",
-    "DEFAULT_TEMPERATURE",
     "kd_dist_loss",
     "kd_gram_loss",
     "kd_logit_loss",
