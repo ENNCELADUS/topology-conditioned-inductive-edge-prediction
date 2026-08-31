@@ -197,6 +197,50 @@ def _write_checkpoint(tmp_path: Path, *, model_family: str = "v3_1") -> Path:
 
 
 class TestRunTestProtocol:
+    @pytest.mark.parametrize("control", ["branch_zero", "shuffle"])
+    def test_parser_accepts_topo_gen_control(self, control: str) -> None:
+        args = test_protocol.build_parser().parse_args(
+            [
+                "--checkpoint",
+                "checkpoint.pt",
+                "--output-dir",
+                "outputs/control",
+                "--data-root",
+                "data",
+                "--strategy",
+                _STRATEGY,
+                "--arm",
+                "kd_gen_control",
+                "--seed",
+                "0",
+                "--topo-gen-control",
+                control,
+            ]
+        )
+
+        assert args.topo_gen_control == control
+
+    @pytest.mark.parametrize("control", ["branch_zero", "shuffle"])
+    def test_forwards_topo_gen_control_to_every_score_pass(
+        self, tmp_path: Path, control: str
+    ) -> None:
+        fixture = _build_fixture(tmp_path)
+        runner = _FakeScoreRunner(fixture.artifacts)
+
+        run_test_protocol(
+            checkpoint=_write_checkpoint(tmp_path),
+            output_dir=tmp_path / "outputs" / control,
+            data_root=fixture.data_root,
+            strategy=_STRATEGY,
+            arm=f"kd_gen_{control}",
+            seed=0,
+            score_runner=runner,
+            topo_gen_control=control,
+        )
+
+        for pairs_source in ("val_topology", "test", "test_topology"):
+            assert _arg_value(runner.call_for(pairs_source), "--topo-gen-control") == control
+
     def test_full_report_shape_ordering_and_leakage_guarantee(self, tmp_path: Path) -> None:
         fixture = _build_fixture(tmp_path)
         checkpoint = _write_checkpoint(tmp_path)
@@ -414,6 +458,7 @@ class TestRunTestProtocol:
         for call in runner.calls:
             assert "--pack-dir" not in call
             assert "--scaffold-control" not in call
+            assert "--topo-gen-control" not in call
             assert "--rescore-reason" not in call
             assert "--scoring-run-id" not in call
             assert "--allow-oracle-diagnostic" not in call

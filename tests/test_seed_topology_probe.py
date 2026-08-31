@@ -81,6 +81,38 @@ def test_topology_targets_removes_query_self_loop_without_mutating_caller() -> N
     assert graph.degree["u"] == 3
 
 
+def test_topology_targets_use_exact_local_masking_without_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = nx.Graph(
+        [
+            ("u", "v"),
+            ("u", "a"),
+            ("u", "b"),
+            ("v", "a"),
+            ("v", "c"),
+            ("a", "b"),
+            ("u", "u"),
+        ]
+    )
+    original_edges = set(graph.edges())
+
+    def reject_copy(*_args: object, **_kwargs: object) -> nx.Graph:
+        raise AssertionError("topology targets must not copy the full graph")
+
+    monkeypatch.setattr(graph, "copy", reject_copy)
+
+    targets = seed_topology_probe._topology_targets(graph, [("u", "v"), ("u", "u")])
+
+    np.testing.assert_array_equal(targets["deg_u"], [4.0, 3.0])
+    np.testing.assert_array_equal(targets["deg_v"], [2.0, 3.0])
+    np.testing.assert_array_equal(targets["common_neighbors"], [1.0, 3.0])
+    np.testing.assert_allclose(targets["clustering_u"], [1.0, 2.0 / 3.0])
+    np.testing.assert_allclose(targets["clustering_v"], [0.0, 2.0 / 3.0])
+    assert set(graph.edges()) == original_edges
+    assert graph.degree["u"] == 5
+
+
 @pytest.mark.parametrize(
     ("latents", "target", "message"),
     [

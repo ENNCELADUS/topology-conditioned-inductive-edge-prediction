@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections.abc import Sequence
+from itertools import combinations
 from pathlib import Path
 
 import networkx as nx
@@ -88,14 +89,26 @@ def _topology_targets(
 ) -> dict[str, NDArray[np.float64]]:
     values = {name: np.empty(len(pairs), dtype=np.float64) for name in _STAT_NAMES}
     for row, (u, v) in enumerate(pairs):
-        row_graph = graph.copy()
-        if row_graph.has_edge(u, v):
-            row_graph.remove_edge(u, v)
-        values["deg_u"][row] = float(row_graph.degree[u])
-        values["deg_v"][row] = float(row_graph.degree[v])
-        values["common_neighbors"][row] = float(len(list(nx.common_neighbors(row_graph, u, v))))
-        values["clustering_u"][row] = float(nx.clustering(row_graph, u))
-        values["clustering_v"][row] = float(nx.clustering(row_graph, v))
+        has_query_edge = graph.has_edge(u, v)
+        degree_decrement = 2 if u == v else 1
+        if not has_query_edge:
+            degree_decrement = 0
+        values["deg_u"][row] = float(graph.degree[u] - degree_decrement)
+        values["deg_v"][row] = float(graph.degree[v] - degree_decrement)
+
+        neighbors_u = set(graph[u]) - {u}
+        neighbors_v = set(graph[v]) - {v}
+        if has_query_edge and u != v:
+            neighbors_u.remove(v)
+            neighbors_v.remove(u)
+        values["common_neighbors"][row] = float(len(neighbors_u & neighbors_v))
+        for name, neighbors in (
+            ("clustering_u", neighbors_u),
+            ("clustering_v", neighbors_v),
+        ):
+            degree = len(neighbors)
+            links = sum(graph.has_edge(a, b) for a, b in combinations(neighbors, 2))
+            values[name][row] = 0.0 if degree < 2 else 2.0 * links / (degree * (degree - 1))
     return values
 
 
