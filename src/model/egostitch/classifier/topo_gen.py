@@ -37,10 +37,15 @@ CONTROLS = ("branch_zero", "shuffle")
 
 def marginal_logit(per_sample: torch.Tensor) -> torch.Tensor:
     """``logit(mean_m sigmoid(l_m))`` computed stably: (B, M) -> (B,)."""
+    if per_sample.size(1) == 1:
+        return per_sample[:, 0]
     log_m = math.log(per_sample.size(1))
     log_p = torch.logsumexp(-nn.functional.softplus(-per_sample), dim=1) - log_m
     log_q = torch.logsumexp(-nn.functional.softplus(per_sample), dim=1) - log_m
-    return log_p - log_q
+    stable = log_p - log_q
+    equal = (per_sample == per_sample[:, :1]).all(dim=1)
+    exact_equal = stable + (per_sample[:, 0] - stable).detach()
+    return torch.where(equal, exact_equal, stable)
 
 
 def _masked_token_mean(tokens: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
@@ -85,12 +90,10 @@ class _ResidualCore(nn.Module):
 
     def __init__(self, latent_dim: int, cond_dim: int, blocks: int) -> None:
         super().__init__()
-        self.cond_in = nn.Linear(cond_dim, latent_dim)
         self.blocks = nn.ModuleList(_AdaLNBlock(latent_dim, cond_dim) for _ in range(blocks))
         self.out = nn.Linear(latent_dim, latent_dim)
 
     def forward(self, x: torch.Tensor, cond_vec: torch.Tensor) -> torch.Tensor:
-        x = x + self.cond_in(cond_vec)
         for block in self.blocks:
             x = block(x, cond_vec)
         return cast(torch.Tensor, self.out(x))
@@ -163,10 +166,11 @@ class TopoGenBase(nn.Module):
         lengths_b: torch.Tensor,
     ) -> torch.Tensor:
         """Symmetric fp32 conditioning from *detached* trunk encodings (D4 boundary)."""
-        e_u = _masked_token_mean(encoded_a.detach().float(), lengths_a)
-        e_v = _masked_token_mean(encoded_b.detach().float(), lengths_b)
-        features = torch.cat((e_u * e_v, e_u + e_v, (e_u - e_v).abs()), dim=-1)
-        return cast(torch.Tensor, self.condition_net(features))
+        with torch.autocast(device_type=encoded_a.device.type, enabled=False):
+            e_u = _masked_token_mean(encoded_a.detach().float(), lengths_a)
+            e_v = _masked_token_mean(encoded_b.detach().float(), lengths_b)
+            features = torch.cat((e_u * e_v, e_u + e_v, (e_u - e_v).abs()), dim=-1)
+            return cast(torch.Tensor, self.condition_net(features))
 
     def _noise_draws(self, batch: int, device: torch.device) -> torch.Tensor:
         if self.training:
@@ -179,8 +183,10 @@ class TopoGenBase(nn.Module):
 
     def sample_latents(self, cond: torch.Tensor) -> torch.Tensor:
         """(B, cond_dim) -> (B, M, latent_dim) normalized-space samples."""
-        eps = self._noise_draws(cond.size(0), cond.device)
-        return self._sample_from_eps(cond, eps)
+        with torch.autocast(device_type=cond.device.type, enabled=False):
+            cond = cond.float()
+            eps = self._noise_draws(cond.size(0), cond.device)
+            return self._sample_from_eps(cond, eps)
 
     def gen_loss(
         self, cond: torch.Tensor, target: torch.Tensor
@@ -245,6 +251,8 @@ class TopoGenBase(nn.Module):
 
 class EdmTopoGen(TopoGenBase):
     """EDM-preconditioned denoiser at sigma_data == 1, deterministic Heun sampler."""
+
+    family = "edm"
 
     def _denoise(
         self, x_sigma: torch.Tensor, sigma: torch.Tensor, cond: torch.Tensor
