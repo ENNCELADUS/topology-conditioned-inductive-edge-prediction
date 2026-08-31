@@ -61,3 +61,21 @@ pre-existing, unassigned reasons recorded above. The Task 10 surface and the
 non-DDP remainder are green. The first literal full-suite run unexpectedly
 entered four local Gloo tests despite the documented single-file exclusion;
 subsequent verification explicitly deselected them.
+
+## Parent final-gate correction
+
+The worker's first full command incorrectly allowed four local Gloo/DDP cases in
+`tests/test_train_b0_kd.py`; they attempted and failed on macOS loopback resolution. This violated
+the user's local no-DDP boundary. No H20 or remote command ran. The parent then fixed the one real
+non-DDP regression by stamping `topo_gen_control: null` in the legacy score fixture, applied the
+plan-required repository-wide Ruff formatting, and committed both as `396dceb`.
+
+All post-cleanup gates used the required `.venv/bin/python -m ...` surface:
+
+- Full non-DDP pytest with `tests/test_e2_ddp_integration.py` ignored and the three parameterized
+  relational-Gloo cases plus one production-Gloo case explicitly deselected:
+  `1854 passed, 6 skipped, 21 warnings` in 60.72 s.
+- Ruff: `All checks passed!`; format check: `203 files already formatted`.
+- Mypy: `Found 98 errors in 14 files (checked 203 source files)`, meeting the required ceiling;
+  no changed kd_gen/probe surface appears in the output.
+- `git diff --check` and worktree status: clean.
