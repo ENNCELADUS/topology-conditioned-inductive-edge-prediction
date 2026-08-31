@@ -1,4 +1,5 @@
 import csv
+from pathlib import Path
 
 import pytest
 from src.autoresearch.curves import CSV_COLUMNS, write_curves
@@ -76,3 +77,21 @@ def test_curves_cli_writes_both_artifacts(
     assert curves_main([str(run_dir), str(out_dir)]) == 0
     assert (out_dir / "learning_curves.csv").exists()
     assert (out_dir / "learning_curves.png").exists()
+
+
+def test_selected_epoch_override_reaches_plot(
+    make_run_dir: RunDirFactory,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_dir = tmp_path_factory.mktemp("curves-selected-epoch")
+    run_dir = make_run_dir(epochs=2, selected_epoch=2)
+    plotted: list[int] = []
+
+    def capture_plot(rows: list[dict[str, object]], selected_epoch: int, png_path: Path) -> None:
+        plotted.append(selected_epoch)
+        png_path.touch()
+
+    monkeypatch.setattr("src.autoresearch.curves._plot", capture_plot)
+    assert curves_main([str(run_dir), str(out_dir), "--selected-epoch", "1"]) == 0
+    assert plotted == [1]

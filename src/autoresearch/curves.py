@@ -48,11 +48,16 @@ _PANELS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
-def write_curves(run_dir: Path, out_dir: Path) -> tuple[Path, Path]:
+def write_curves(
+    run_dir: Path, out_dir: Path, *, selected_epoch: int | None = None
+) -> tuple[Path, Path]:
     """Write ``learning_curves.csv`` and ``learning_curves.png`` for one run."""
     rows = read_metric_rows(run_dir / "metrics.jsonl")
     metadata = json.loads((run_dir / "run_metadata.json").read_text(encoding="utf-8"))
-    selected_epoch = int(metadata["selected_epoch"])
+    if selected_epoch is None:
+        selected_epoch = int(metadata["selected_epoch"])
+    if selected_epoch not in {int(row["epoch"]) for row in rows}:
+        raise ValueError(f"selected epoch {selected_epoch} is absent from metrics.jsonl")
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "learning_curves.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
@@ -98,8 +103,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="autoresearch-curves")
     parser.add_argument("run_dir", type=Path)
     parser.add_argument("out_dir", type=Path)
+    parser.add_argument("--selected-epoch", type=int)
     args = parser.parse_args(argv)
-    csv_path, png_path = write_curves(args.run_dir, args.out_dir)
+    csv_path, png_path = write_curves(
+        args.run_dir, args.out_dir, selected_epoch=args.selected_epoch
+    )
     sys.stdout.write(f"{csv_path}\n{png_path}\n")
     return 0
 
