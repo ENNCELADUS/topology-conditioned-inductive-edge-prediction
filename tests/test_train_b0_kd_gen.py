@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -9,14 +12,24 @@ from accelerate import Accelerator
 from src.distill.artifacts import KDRowTargets
 from src.distill.config import DistillConfig
 from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
-from src.train_b0 import KDRowBank, _evaluate_distributed, _term_grad_norms
+from src.train_b0 import (
+    Config,
+    KDRowBank,
+    ModelConfig,
+    RuntimeConfig,
+    _evaluate_distributed,
+    _run_probe_mode,
+    _term_grad_norms,
+    build_model,
+)
 from torch import nn
+
+from tests.test_train_b0 import _tiny_config
 
 LATENT_DIM = 8
 
 
-def _model(topo: bool = True, latent_dim: int = LATENT_DIM) -> V3_1:
-    torch.manual_seed(0)
+def _model_config(topo: bool = True, latent_dim: int = LATENT_DIM) -> dict[str, object]:
     config = {**BEST_V3_1_CONFIG, "input_dim": 24, "d_model": 16, "n_heads": 2}
     if topo:
         config["topo_gen"] = {
@@ -28,7 +41,34 @@ def _model(topo: bool = True, latent_dim: int = LATENT_DIM) -> V3_1:
             "mc_samples": 2,
             "sampler_steps": 2,
         }
+    return config
+
+
+def _model(topo: bool = True, latent_dim: int = LATENT_DIM) -> V3_1:
+    torch.manual_seed(0)
+    config = _model_config(topo=topo, latent_dim=latent_dim)
     return V3_1(**config)
+
+
+def _production_config(*, topo: bool, w_gen: bool) -> Config:
+    distill = DistillConfig(targets_path="x", w_gen=1.0) if w_gen else None
+    return replace(
+        _tiny_config(),
+        model=ModelConfig(family="v3_1", config=_model_config(topo=topo)),
+        runtime=RuntimeConfig(
+            world_size=1,
+            pack_dir=Path("pack"),
+            pack_workers=1,
+            loader_workers_per_rank=1,
+            prefetch_factor=2,
+            token_budget=1024,
+            max_pairs_per_rank=8,
+            memory_limit_gib=1.0,
+            probe_warmup_steps=1,
+            probe_timed_steps=1,
+        ),
+        distill=distill,
+    )
 
 
 def _targets(
@@ -131,6 +171,42 @@ def test_kd_gen_requires_topo_gen_both_directions() -> None:
             model=_model(topo=True),
             device=torch.device("cpu"),
         )
+
+
+def test_production_model_build_rejects_topo_gen_without_w_gen() -> None:
+    with pytest.raises(RuntimeError, match="w_gen"):
+        build_model(_production_config(topo=True, w_gen=False))
+
+
+def test_production_model_build_rejects_w_gen_without_topo_gen() -> None:
+    with pytest.raises(RuntimeError, match="topo_gen"):
+        build_model(_production_config(topo=False, w_gen=True))
+
+
+def test_kd_gen_ddp_probe_rejects_before_accelerator_prepare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _production_config(topo=True, w_gen=True)
+    model = build_model(cfg)
+    accelerator = Accelerator(cpu=True)
+    prepare_called = False
+
+    def fail_prepare(*args: object) -> None:
+        nonlocal prepare_called
+        prepare_called = True
+        raise AssertionError("accelerator.prepare must not run for kd_gen probe mode")
+
+    monkeypatch.setattr(accelerator, "prepare", fail_prepare)
+    with pytest.raises(RuntimeError, match="probe.*kd_gen|kd_gen.*probe"):
+        _run_probe_mode(
+            model,
+            lambda epoch: [],
+            cfg,
+            accelerator,
+            token_budget_per_rank=1024,
+            profile_output=Path("probe.json"),
+        )
+    assert prepare_called is False
 
 
 def test_kd_gen_accepts_prepared_model_wrapper() -> None:

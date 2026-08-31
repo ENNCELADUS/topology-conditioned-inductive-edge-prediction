@@ -143,3 +143,107 @@ excluded exactly as authorized and were not claimed as freshly run. Task 5's
 generator optimizer groups and warmup/joint-stage switch remain intentionally
 unimplemented, so this report does not claim the later full staged-training
 contract or any H20 execution.
+
+---
+
+## Fix round 1/5: enforce the production pre-DDP arm contract
+
+### Important finding
+
+The finding was valid: the `topo_gen` iff positive-`w_gen` guard existed only
+inside `KDRowBank`, so production paths that built a model without a bank could
+bypass it. In particular, `ddp-mode probe` prepared a `topo_gen` model without
+the teacher-latent attachment or `gen_loss` path, leaving generator-core
+parameters unused during warmup.
+
+### TDD RED
+
+Three focused tests were added first: production build with `topo_gen` but no
+positive `w_gen`, production build with positive `w_gen` but no `topo_gen`, and
+valid `kd_gen` probe rejection before `accelerator.prepare`.
+
+```text
+rtk proxy .venv/bin/python -m pytest tests/test_train_b0_kd_gen.py \
+  -n0 -q -k 'production_model_build or kd_gen_ddp_probe'
+```
+
+Exact result: exit 1, three failures.
+
+```text
+FAILED test_production_model_build_rejects_topo_gen_without_w_gen
+E       Failed: DID NOT RAISE <class 'RuntimeError'>
+
+FAILED test_production_model_build_rejects_w_gen_without_topo_gen
+E       Failed: DID NOT RAISE <class 'RuntimeError'>
+
+FAILED test_kd_gen_ddp_probe_rejects_before_accelerator_prepare
+E       AssertionError: accelerator.prepare must not run for kd_gen probe mode
+```
+
+The third failure proves the old path crossed the preparation boundary.
+
+### Implementation
+
+- Added `_validate_topo_gen_distill_contract(model, distill)`, which unwraps a
+  prepared model and requires `model.topo_gen` exactly when
+  `distill.w_gen > 0`.
+- Called the preflight from `build_model`, making it apply to every production
+  model build before DDP preparation or optional bank construction.
+- Reused the same preflight in `KDRowBank`; retained the bank-owned latent-width,
+  finite positive fp64 RMS, and checkpoint-buffer stamping checks.
+- Called the preflight at `_run_probe_mode` entry and rejected valid `kd_gen`
+  with a clear instruction to use `epoch-probe` or `train`, before optimizer
+  preparation. Those two supported modes continue through bank construction and
+  teacher-latent attachment.
+- Did not implement or modify any of the three Minor findings.
+
+### GREEN and regression evidence
+
+Focused bypass tests:
+
+```text
+rtk proxy .venv/bin/python -m pytest tests/test_train_b0_kd_gen.py \
+  -n0 -q -k 'production_model_build or kd_gen_ddp_probe'
+...                                                                      [100%]
+```
+
+Final Task 4 plus ordinary-KD non-DDP selection:
+
+```text
+rtk proxy .venv/bin/python -m pytest \
+  tests/test_train_b0_kd_gen.py tests/test_train_b0_kd.py -n0 \
+  -k 'not test_relational_kd_gathers_cross_rank_rows_with_exact_ddp_gradient and not test_production_kd_row_bank_keeps_global_loss_unscaled_and_one_pass'
+42 passed, 4 deselected, 2 warnings in 1.47s
+```
+
+The two warnings remain the existing TorchScript deprecations.
+
+### Formatting and static evidence
+
+```text
+rtk proxy .venv/bin/python -m ruff format \
+  src/train_b0.py tests/test_train_b0_kd_gen.py
+2 files left unchanged
+
+rtk proxy .venv/bin/python -m ruff check \
+  src/train_b0.py tests/test_train_b0_kd_gen.py tests/test_train_b0_kd.py
+All checks passed!
+
+rtk proxy .venv/bin/python -m mypy \
+  src/train_b0.py tests/test_train_b0_kd_gen.py
+Success: no issues found in 2 source files
+
+rtk proxy git diff --check
+PASS
+```
+
+### Files, self-review, and concerns
+
+- Changed `src/train_b0.py`, `tests/test_train_b0_kd_gen.py`, and this report.
+- Confirmed valid matched `kd_gen` builds successfully; only plain probe mode is
+  rejected, and rejection occurs before `accelerator.prepare`.
+- Confirmed the bank has one source of truth for the two-direction arm contract
+  and still owns target-dependent latent validation/stamping.
+- Confirmed ordinary KD and row-exact scaling code is untouched.
+- No blocking concern remains. The four authorized socket-based DDP cases were
+  excluded and are not claimed as freshly run; no H20 work was performed.

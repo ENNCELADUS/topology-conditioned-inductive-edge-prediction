@@ -528,6 +528,20 @@ def _unwrapped_model(model: nn.Module) -> nn.Module:
     return current
 
 
+def _validate_topo_gen_distill_contract(
+    model: nn.Module, distill: DistillConfig | None
+) -> TopoGenBase | None:
+    """Require ``model.topo_gen`` exactly when distillation has positive ``w_gen``."""
+    raw_model = _unwrapped_model(model)
+    topo_gen = cast(TopoGenBase | None, getattr(raw_model, "topo_gen", None))
+    has_w_gen = distill is not None and distill.w_gen > 0.0
+    if topo_gen is None and has_w_gen:
+        raise RuntimeError("distill.w_gen > 0 requires model.config.topo_gen")
+    if topo_gen is not None and not has_w_gen:
+        raise RuntimeError("model.config.topo_gen requires distill.w_gen > 0")
+    return topo_gen
+
+
 def _build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.AdamW:
     """Build the ordinary AdamW optimizer over all model parameters."""
     return torch.optim.AdamW(
@@ -930,6 +944,8 @@ def build_model(cfg: Config) -> nn.Module:
         A `V3_1` instance.
 
     Raises:
+        RuntimeError: If ``model.config.topo_gen`` and positive
+            ``cfg.distill.w_gen`` are not configured together.
         ValueError: If the model family is unknown, or is ``f0_mlp`` (the B0-alt
             baseline): ``src/model/b0_alt.py`` (``F0PairMLP``) was removed 2026-08-03
             by owner decision and has no replacement. See
@@ -937,7 +953,9 @@ def build_model(cfg: Config) -> nn.Module:
     """
     kwargs = resolve_model_kwargs(cfg.model)
     if cfg.model.family == "v3_1":
-        return V3_1(**kwargs)
+        model = V3_1(**kwargs)
+        _validate_topo_gen_distill_contract(model, cfg.distill)
+        return model
     raise ValueError(
         f"model family '{cfg.model.family}' has no buildable model: "
         "src/model/b0_alt.py (F0PairMLP) was removed 2026-08-03 by owner decision"
@@ -2800,10 +2818,8 @@ class KDRowBank:
 
         self._topo_gen: TopoGenBase | None = None
         self._latent_scale = 1.0
-        topo_gen = cast(TopoGenBase | None, getattr(raw_model, "topo_gen", None))
-        if distill.w_gen > 0.0:
-            if topo_gen is None:
-                raise RuntimeError("distill.w_gen requires model.config.topo_gen")
+        topo_gen = _validate_topo_gen_distill_contract(model, distill)
+        if topo_gen is not None:
             rep_dim = int(targets.teacher_rep.shape[1])
             if topo_gen.latent_dim != rep_dim:
                 raise RuntimeError(
@@ -2818,11 +2834,6 @@ class KDRowBank:
             topo_gen.set_rms_scale(scale)
             self._topo_gen = topo_gen
             self._latent_scale = scale
-        elif topo_gen is not None:
-            raise RuntimeError(
-                "model.config.topo_gen requires distill.w_gen > 0 -- DDP would see "
-                "never-grad'ed generator parameters otherwise"
-            )
 
         self.train_logit = torch.as_tensor(
             targets.teacher_logit, dtype=torch.float32, device=device
@@ -4227,6 +4238,11 @@ def _run_probe_mode(
     runtime = cfg.runtime
     if runtime is None:
         raise ValueError("probe mode requires a configured cfg.runtime")
+    if _validate_topo_gen_distill_contract(model, cfg.distill) is not None:
+        raise RuntimeError(
+            "ddp-mode probe does not support kd_gen because it has no KDRowBank "
+            "teacher-latent/gen-loss path; use epoch-probe or train"
+        )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
     )
