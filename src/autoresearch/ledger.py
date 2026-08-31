@@ -24,7 +24,7 @@ from typing import Any
 from src.autoresearch.verdict import METRIC_NAMES, verdict_reasons
 
 STATUSES = frozenset({"baseline", "keep", "revert", "crash"})
-CAMPAIGNS = frozenset({"kd_logit", "kd_rank", "kd_gram", "kd_rep"})
+CAMPAIGNS = frozenset({"kd_logit", "kd_rank", "kd_gram", "kd_rep", "kd_gen"})
 METRIC_KEYS = frozenset({"auprc", "gs", "rd", "degree_mmd", "clustering_mmd", "spectral_mmd"})
 VERDICT_KEYS = frozenset({"decision", "improved", "regressed", "deltas", "auprc_delta", "reasons"})
 REQUIRED_KEYS = frozenset(

@@ -76,8 +76,8 @@ are seed 0 only. Reports: `outputs/b1_stage_v{2,3}/kd_*/test_report.json`; D8 on
 
 Teacher targets are dumped once for every official training row (plus the V_val classification rows,
 validation-only) into artifact `kd_row_targets_v1` (`src/distill/teacher_targets.py`): pair identity,
-row id by position, teacher logit, symmetrized teacher pooled pair embedding `teacher_rep`, and
-symmetrized teacher PMA seed tokens `teacher_seeds`. Teacher inference applies query-edge masking -- a
+row id by position, teacher logit, and symmetrized PMA(1) pooled latent target `teacher_rep`. Teacher
+inference applies query-edge masking -- a
 positive training edge is never visible in its own structural context. The trainer computes task and
 KD losses from one student forward on identical rows, joined by `_row_id`; there is no KD-only stream.
 
@@ -89,7 +89,7 @@ KD losses from one student forward on identical rows, joined by `_row_id`; there
   non-self row participates under both endpoint anchors, without adding rows or another forward.
 - `kd_gram` -- `w_gram`: D3 cosine-Gram matching across all distinct batch rows, including rows that share an endpoint.
 - `kd_rep` -- `w_rep`: per-row cosine alignment of the student pair representation to `teacher_rep`.
-- `kd_d9` -- `w_seed`+`w_geom`+`w_kl`: CVAE pair-latent generation of `teacher_seeds`; see `docs/tmp/b1_kd_d9_pair_latent_generation_design.md`.
+- `kd_gen` -- `w_gen`: endpoint-conditioned generation of the PMA(1) pooled topology latent; see `docs/superpowers/specs/2026-08-30-kd-gen-arm-design.md`.
 ### Telemetry
 
 Task/KD loss split, logit correlation/error, representation cosine, D2/D3 validation-block losses,

@@ -9,10 +9,12 @@ import numpy as np
 import pytest
 import src.train_b0 as train_b0_module
 import torch
+import yaml
 from accelerate import Accelerator
 from src.distill.artifacts import KDRowTargets
 from src.distill.config import DistillConfig
 from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
+from src.model.egostitch.classifier.topo_gen import build_topo_gen
 from src.train_b0 import (
     Config,
     KDRowBank,
@@ -31,6 +33,28 @@ from torch import nn
 from tests.test_train_b0 import _tiny_config
 
 LATENT_DIM = 8
+
+
+@pytest.mark.parametrize(
+    ("path", "family", "mc_samples", "sampler_steps"),
+    [
+        ("configs/b1_kd_gen_edm_breadth_first.yaml", "edm", 4, 4),
+        ("configs/b1_kd_gen_det_breadth_first.yaml", "det_mse", 1, None),
+    ],
+)
+def test_kd_gen_configs_parse(
+    path: str, family: str, mc_samples: int, sampler_steps: int | None
+) -> None:
+    raw = yaml.safe_load(Path(path).read_text())
+    distill = DistillConfig.from_mapping(raw["distill"])
+    topo_config = raw["model"]["config"]["topo_gen"]
+    module = build_topo_gen(topo_config, raw["model"]["config"]["d_model"])
+
+    assert distill.arm == "kd_gen"
+    assert module.family == family
+    assert module.latent_dim == 512
+    assert module.mc_samples == mc_samples
+    assert topo_config.get("sampler_steps") == sampler_steps
 
 
 def _model_config(topo: bool = True, latent_dim: int = LATENT_DIM) -> dict[str, object]:

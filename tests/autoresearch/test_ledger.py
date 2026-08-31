@@ -109,14 +109,14 @@ def test_keep_row_contradicting_verdict_rejected(tmp_path: Path) -> None:
         append_row(path, valid_row(2, verdict=valid_verdict("revert")))
 
 
-@pytest.mark.parametrize("campaign", ["kd_d9", "KD_LOGIT", "", True])
+@pytest.mark.parametrize("campaign", ["kd_unknown", "KD_LOGIT", "", True])
 def test_unknown_campaign_rejected(tmp_path: Path, campaign: object) -> None:
     with pytest.raises(ValueError, match="campaign"):
         append_row(tmp_path / "ledger.jsonl", valid_row(campaign=campaign))
 
 
-@pytest.mark.parametrize("campaign", ["kd_logit", "kd_rank", "kd_gram", "kd_rep"])
-def test_each_frozen_campaign_name_is_accepted(tmp_path: Path, campaign: str) -> None:
+@pytest.mark.parametrize("campaign", ["kd_logit", "kd_rank", "kd_gram", "kd_rep", "kd_gen"])
+def test_each_campaign_name_is_accepted(tmp_path: Path, campaign: str) -> None:
     append_row(tmp_path / "ledger.jsonl", valid_row(campaign=campaign))
 
 
