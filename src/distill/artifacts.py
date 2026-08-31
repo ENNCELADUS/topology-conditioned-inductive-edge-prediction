@@ -20,13 +20,6 @@ the full-ego oracle generator's stitch).
 - Validation block: the same five arrays, ``val_``-prefixed, one row per
   official V_val classification row in that fixed order, backing
   validation-only KD diagnostics.
-
-``teacher_seeds`` fp16 ``(n_rows, seed_count, seed_dim)`` and
-``val_teacher_seeds`` fp16 ``(n_val_rows, seed_count, seed_dim)`` are
-optional (both present or both absent): the symmetrized per-slot PMA seed
-tokens ``0.5 * (S_ab + S_ba)``, consumed by the kd_d9 pair-latent-generation
-arm; their presence adds ``seed_count``/``seed_dim`` and the dump-side AB/BA
-``seed_symmetry`` audit statistics to the manifest.
 """
 
 from __future__ import annotations
@@ -48,8 +41,6 @@ TRUTH_SOURCE = "training_structure"
 _NPZ_NAME = "targets.npz"
 _MANIFEST_NAME = "manifest.json"
 _NODE_IDS_NAME = "node_ids.json"
-_TEACHER_SEEDS_KEY = "teacher_seeds"
-_VAL_TEACHER_SEEDS_KEY = "val_teacher_seeds"
 
 # dtype pinned per array: int32 pair indices, int8 binary label, fp32
 # teacher logit, fp16 pooled teacher-rep embedding.
@@ -83,8 +74,6 @@ class KDRowTargets:
     val_teacher_logit: NDArray[np.float32]
     val_teacher_rep: NDArray[np.float16]
     manifest: dict[str, object]
-    teacher_seeds: NDArray[np.float16] | None = None
-    val_teacher_seeds: NDArray[np.float16] | None = None
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -166,30 +155,20 @@ def write_kd_targets(
     checkpoint_path: Path,
     checkpoint_sha256: str,
     checkpoint_id: str | None,
-    teacher_seeds: NDArray[np.floating] | None = None,
-    val_teacher_seeds: NDArray[np.floating] | None = None,
-    seed_symmetry: dict[str, object] | None = None,
 ) -> None:
     """Write one validated KD row-targets artifact directory.
 
     The training block must cover the official training rows in the
     trainer's exact row order (row_id == array position); the validation
     block covers the official V_val classification rows in their fixed
-    order. `teacher_seeds`/`val_teacher_seeds`, when given, must both be
-    present: optional fp16 ``(n_rows, seed_count, seed_dim)`` arrays of
-    symmetrized PMA seed tokens, recording `seed_symmetry` (the dump-side
-    AB/BA order-asymmetry audit) in the manifest when given.
+    order.
 
     Raises:
         ValueError: If either block's arrays disagree on row count, is
             empty, contains an out-of-range pair index, a non-finite
             `teacher_logit`/`teacher_rep` value, a non-binary `pair_label`,
             or a `teacher_rep`/`val_teacher_rep` rank other than 2; if the
-            two blocks' `rep_dim` disagree; if `teacher_seeds` and
-            `val_teacher_seeds` are not given both-or-neither, either is not
-            rank-3, has a row count mismatched with its block, contains a
-            non-finite value, or the two disagree on `(seed_count,
-            seed_dim)`; or if `seed_symmetry` is given without seeds.
+            two blocks' `rep_dim` disagree.
     """
     n_nodes = len(node_ids)
     n_rows = _validate_block(
@@ -214,35 +193,6 @@ def write_kd_targets(
     if np.asarray(val_teacher_rep).shape[1] != rep_dim:
         raise ValueError("teacher_rep and val_teacher_rep must share the same rep_dim")
 
-    if (teacher_seeds is None) != (val_teacher_seeds is None):
-        raise ValueError("teacher_seeds and val_teacher_seeds must be given both or neither")
-    seed_count = seed_dim = None
-    if teacher_seeds is not None and val_teacher_seeds is not None:
-        seeds_arr = np.asarray(teacher_seeds)
-        val_seeds_arr = np.asarray(val_teacher_seeds)
-        if seeds_arr.ndim != 3 or val_seeds_arr.ndim != 3:
-            raise ValueError(
-                "teacher_seeds/val_teacher_seeds must be (n_rows, seed_count, seed_dim)"
-            )
-        if len(seeds_arr) != n_rows:
-            raise ValueError("teacher_seeds must have the same row count as the training block")
-        if len(val_seeds_arr) != n_val_rows:
-            raise ValueError(
-                "val_teacher_seeds must have the same row count as the validation block"
-            )
-        if seeds_arr.shape[1:] != val_seeds_arr.shape[1:]:
-            raise ValueError(
-                "teacher_seeds and val_teacher_seeds must share (seed_count, seed_dim)"
-            )
-        if (
-            not np.isfinite(seeds_arr.astype(np.float64)).all()
-            or not np.isfinite(val_seeds_arr.astype(np.float64)).all()
-        ):
-            raise ValueError("teacher_seeds/val_teacher_seeds contains non-finite values")
-        seed_count, seed_dim = int(seeds_arr.shape[1]), int(seeds_arr.shape[2])
-    elif seed_symmetry is not None:
-        raise ValueError("seed_symmetry requires teacher_seeds")
-
     output_dir.mkdir(parents=True, exist_ok=True)
     npz_path = output_dir / _NPZ_NAME
     arrays: dict[str, NDArray[np.generic]] = {
@@ -257,9 +207,6 @@ def write_kd_targets(
         "val_teacher_logit": np.asarray(val_teacher_logit, dtype=np.float32),
         "val_teacher_rep": np.asarray(val_teacher_rep, dtype=np.float16),
     }
-    if teacher_seeds is not None and val_teacher_seeds is not None:
-        arrays[_TEACHER_SEEDS_KEY] = np.asarray(teacher_seeds, dtype=np.float16)
-        arrays[_VAL_TEACHER_SEEDS_KEY] = np.asarray(val_teacher_seeds, dtype=np.float16)
     np.savez(npz_path, **cast(dict[str, Any], arrays))
     npz_sha256 = _sha256_file(npz_path)
 
@@ -285,18 +232,12 @@ def write_kd_targets(
         "node_ids_sha256": _sha256_bytes(node_ids_bytes),
         "created_utc": datetime.now(UTC).isoformat(),
     }
-    if seed_count is not None and seed_dim is not None:
-        manifest["seed_count"] = seed_count
-        manifest["seed_dim"] = seed_dim
-        manifest["teacher_seeds_dtype"] = "float16"
-        if seed_symmetry is not None:
-            manifest["seed_symmetry"] = seed_symmetry
     (output_dir / _MANIFEST_NAME).write_text(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
     )
 
 
-def load_kd_targets(path: Path, *, load_seeds: bool = False) -> KDRowTargets:
+def load_kd_targets(path: Path) -> KDRowTargets:
     """Load one KD row-targets artifact directory.
 
     Digest/format verification was deliberately removed (user decision,
@@ -304,16 +245,10 @@ def load_kd_targets(path: Path, *, load_seeds: bool = False) -> KDRowTargets:
 
     Args:
         path: Artifact directory.
-        load_seeds: When True, also load `teacher_seeds`/`val_teacher_seeds`
-            (raising if the artifact was dumped without them). When False
-            (default), those fields stay None without touching the npz
-            entries, so callers that don't need the kd_d9 seed tokens skip
-            the extra memory.
 
     Raises:
         ValueError: If a file is missing, the npz array set is not exactly
-            the ten required names (optionally plus both seed names), or
-            `load_seeds=True` and the artifact has no teacher seeds.
+            the ten required names.
     """
     manifest_path = path / _MANIFEST_NAME
     node_ids_path = path / _NODE_IDS_NAME
@@ -329,12 +264,11 @@ def load_kd_targets(path: Path, *, load_seeds: bool = False) -> KDRowTargets:
 
     with np.load(npz_path) as archive:
         required = set(_ARRAY_DTYPES)
-        optional = {_TEACHER_SEEDS_KEY, _VAL_TEACHER_SEEDS_KEY}
         present = set(archive.files)
-        if not (required <= present and present - required <= optional):
+        if present != required:
             raise ValueError(
                 f"KD target artifact {path} arrays must be exactly {sorted(required)} "
-                f"(optionally plus both of {sorted(optional)}), got {sorted(archive.files)}"
+                f"got {sorted(archive.files)}"
             )
         pair_a_idx = np.asarray(archive["pair_a_idx"], dtype=np.int32)
         pair_b_idx = np.asarray(archive["pair_b_idx"], dtype=np.int32)
@@ -346,20 +280,6 @@ def load_kd_targets(path: Path, *, load_seeds: bool = False) -> KDRowTargets:
         val_pair_label = np.asarray(archive["val_pair_label"], dtype=np.int8)
         val_teacher_logit = np.asarray(archive["val_teacher_logit"], dtype=np.float32)
         val_teacher_rep = np.asarray(archive["val_teacher_rep"], dtype=np.float16)
-
-        teacher_seeds: NDArray[np.float16] | None = None
-        val_teacher_seeds: NDArray[np.float16] | None = None
-        if load_seeds:
-            has_seeds = (
-                _TEACHER_SEEDS_KEY in archive.files and _VAL_TEACHER_SEEDS_KEY in archive.files
-            )
-            if not has_seeds:
-                raise ValueError(
-                    f"KD target artifact {path} has no teacher_seeds; "
-                    "re-dump with the seed-producing teacher"
-                )
-            teacher_seeds = np.asarray(archive[_TEACHER_SEEDS_KEY], dtype=np.float16)
-            val_teacher_seeds = np.asarray(archive[_VAL_TEACHER_SEEDS_KEY], dtype=np.float16)
 
     return KDRowTargets(
         node_ids=node_ids,
@@ -374,8 +294,6 @@ def load_kd_targets(path: Path, *, load_seeds: bool = False) -> KDRowTargets:
         val_teacher_logit=val_teacher_logit,
         val_teacher_rep=val_teacher_rep,
         manifest=manifest,
-        teacher_seeds=teacher_seeds,
-        val_teacher_seeds=val_teacher_seeds,
     )
 
 

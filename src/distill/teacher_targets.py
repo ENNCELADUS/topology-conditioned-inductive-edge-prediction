@@ -62,7 +62,6 @@ import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 
 import networkx as nx
 import numpy as np
@@ -90,7 +89,6 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TOKEN_BUDGET = 32_768
 _DEFAULT_BATCH_PAIRS = 32
-_SEED_EPS = 1e-8
 
 
 # --------------------------------------------------------------------------- training-side legality
@@ -343,27 +341,18 @@ class ScoredRows:
 
     ``teacher_rep`` is the dump-side symmetrized teacher pooled pair embedding
     ``0.5 * (pooled_ab + pooled_ba)``, formed in fp32 then cast to fp16.
-    ``teacher_seeds`` is the analogous per-slot symmetrization ``0.5 * (S_ab +
-    S_ba)`` of the encoder's PMA seed tokens (the last ``seeds`` rows of
-    ``topo_ab/ba``). ``slot_cos``/``slot_norm_log_ratio`` are the AB/BA
-    order-asymmetry audit computed *before* symmetrization -- the artifact
-    stores only the symmetrized mean, so this is the only place the
-    disagreement is still observable.
     """
 
     teacher_logit: NDArray[np.float32]
     teacher_rep: NDArray[np.float16]
-    teacher_seeds: NDArray[np.float16]
-    slot_cos: NDArray[np.float32]
-    slot_norm_log_ratio: NDArray[np.float32]
 
 
 def _encoder_seed_count(model: EgoStitchModel) -> int:
     seeds = getattr(model.encoder, "seeds", None)
     if not isinstance(seeds, int) or seeds <= 0:
         raise RuntimeError(
-            "KD teacher targets require the grit_gmt PMA encoder: the seed "
-            "tokens it appends are the D9 arm's teacher target"
+            "KD teacher targets require the grit_gmt PMA encoder: the PMA "
+            "pooled embedding is the kd_gen latent target"
         )
     return seeds
 
@@ -385,13 +374,10 @@ def score_rows(
     (`_install_oracle_context`), it only stitches/scores rows -- no
     FeatureStore or checkpoint I/O.
     """
-    seeds = _encoder_seed_count(model)
+    _encoder_seed_count(model)
     n_rows = len(a_positions)
     teacher_logit = np.empty(n_rows, dtype=np.float32)
     teacher_rep: NDArray[np.float16] | None = None
-    teacher_seeds: NDArray[np.float16] | None = None
-    slot_cos = np.empty((n_rows, seeds), dtype=np.float32)
-    slot_norm_log_ratio = np.empty((n_rows, seeds), dtype=np.float32)
     for start in range(0, n_rows, max(batch_pairs, 1)):
         end = min(start + max(batch_pairs, 1), n_rows)
         a_batch = a_positions[start:end]
@@ -410,35 +396,17 @@ def score_rows(
                 "full-ego oracle pair context carries no pooled embedding -- "
                 "this is a bug, not a legal degraded mode"
             )
-        if pair_context.topo_ab is None or pair_context.topo_ba is None:
-            raise RuntimeError(
-                "full-ego oracle pair context carries no encoder tokens -- "
-                "the KD seed dump needs both orders' PMA seed rows"
-            )
         ab = pair_context.pooled_ab.detach().to(dtype=torch.float32, device="cpu")
         ba = pair_context.pooled_ba.detach().to(dtype=torch.float32, device="cpu")
         rep = (0.5 * (ab + ba)).to(dtype=torch.float16).numpy()
-        s_ab = pair_context.topo_ab[:, -seeds:, :].detach().to(dtype=torch.float32, device="cpu")
-        s_ba = pair_context.topo_ba[:, -seeds:, :].detach().to(dtype=torch.float32, device="cpu")
         if teacher_rep is None:
             teacher_rep = np.empty((n_rows, rep.shape[-1]), dtype=np.float16)
-            teacher_seeds = np.empty((n_rows, seeds, s_ab.shape[-1]), dtype=np.float16)
         teacher_rep[start:end] = rep
-        sym = 0.5 * (s_ab + s_ba)
-        cast(NDArray[np.float16], teacher_seeds)[start:end] = sym.to(dtype=torch.float16).numpy()
-        norm_ab = s_ab.norm(dim=-1).clamp_min(_SEED_EPS)
-        norm_ba = s_ba.norm(dim=-1).clamp_min(_SEED_EPS)
-        slot_cos[start:end] = ((s_ab * s_ba).sum(dim=-1) / (norm_ab * norm_ba)).numpy()
-        slot_norm_log_ratio[start:end] = torch.log(norm_ab / norm_ba).numpy()
     if teacher_rep is None:
         teacher_rep = np.empty((0, 0), dtype=np.float16)
-        teacher_seeds = np.empty((0, seeds, 0), dtype=np.float16)
     return ScoredRows(
         teacher_logit=teacher_logit,
         teacher_rep=teacher_rep,
-        teacher_seeds=cast(NDArray[np.float16], teacher_seeds),
-        slot_cos=slot_cos,
-        slot_norm_log_ratio=slot_norm_log_ratio,
     )
 
 
@@ -531,9 +499,6 @@ def _write_shard(
         b_idx=b_idx,
         teacher_logit=scored.teacher_logit,
         teacher_rep=scored.teacher_rep,
-        teacher_seeds=scored.teacher_seeds,
-        slot_cos=scored.slot_cos,
-        slot_norm_log_ratio=scored.slot_norm_log_ratio,
     )
 
 
@@ -554,9 +519,6 @@ def _merge_shards(
     n_total = len(a_idx)
     teacher_logit = np.empty(n_total, dtype=np.float32)
     teacher_rep = np.empty((n_total, 0), dtype=np.float16)
-    teacher_seeds = np.empty((n_total, 0, 0), dtype=np.float16)
-    slot_cos = np.empty((n_total, 0), dtype=np.float32)
-    slot_norm_log_ratio = np.empty((n_total, 0), dtype=np.float32)
     for shard in range(num_shards):
         start, end = _shard_range(n_total, shard, num_shards)
         path = _shard_path(output, shard, num_shards)
@@ -574,22 +536,10 @@ def _merge_shards(
             if teacher_rep.shape[1] == 0 and archive["teacher_rep"].shape[0]:
                 rep_width = archive["teacher_rep"].shape[1]
                 teacher_rep = np.empty((n_total, rep_width), dtype=np.float16)
-                seeds_shape = archive["teacher_seeds"].shape
-                teacher_seeds = np.empty(
-                    (n_total, seeds_shape[1], seeds_shape[2]), dtype=np.float16
-                )
-                slot_cos = np.empty((n_total, seeds_shape[1]), dtype=np.float32)
-                slot_norm_log_ratio = np.empty((n_total, seeds_shape[1]), dtype=np.float32)
             teacher_rep[start:end] = archive["teacher_rep"]
-            teacher_seeds[start:end] = archive["teacher_seeds"]
-            slot_cos[start:end] = archive["slot_cos"]
-            slot_norm_log_ratio[start:end] = archive["slot_norm_log_ratio"]
     return ScoredRows(
         teacher_logit=teacher_logit,
         teacher_rep=teacher_rep,
-        teacher_seeds=teacher_seeds,
-        slot_cos=slot_cos,
-        slot_norm_log_ratio=slot_norm_log_ratio,
     )
 
 
@@ -819,27 +769,6 @@ def _finish_merge(
     )
 
 
-def seed_symmetry_stats(scored: ScoredRows) -> dict[str, object]:
-    """Summarize the AB/BA order-asymmetry audit for the artifact manifest.
-
-    Strong disagreement (low `slot_cos`) means the symmetrized `teacher_seeds`
-    mean is itself a blur of two order-specific encodings -- the design's
-    pre-launch inspection gate (operator judgment, never enforced here).
-    """
-    cos64 = scored.slot_cos.astype(np.float64)
-    ratio64 = scored.slot_norm_log_ratio.astype(np.float64)
-    return {
-        "slot_cos": {
-            "per_slot_mean": [float(v) for v in cos64.mean(axis=0)] if cos64.size else [],
-            **_histogram(cos64.reshape(-1)),
-        },
-        "slot_norm_log_ratio": {
-            "per_slot_mean": [float(v) for v in ratio64.mean(axis=0)] if ratio64.size else [],
-            **_histogram(ratio64.reshape(-1)),
-        },
-    }
-
-
 def _finalize_artifact(
     args: argparse.Namespace,
     node_ids: Sequence[str],
@@ -869,9 +798,6 @@ def _finalize_artifact(
         checkpoint_path=args.checkpoint,
         checkpoint_sha256=checkpoint_sha256,
         checkpoint_id=checkpoint_id,
-        teacher_seeds=scored.teacher_seeds[:n_train],
-        val_teacher_seeds=scored.teacher_seeds[n_train:],
-        seed_symmetry=seed_symmetry_stats(scored),
     )
     report = build_stats_report(
         scored.teacher_logit[:n_train],

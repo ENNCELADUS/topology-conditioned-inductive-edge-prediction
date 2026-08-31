@@ -4492,7 +4492,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
     kd_val: KDValDiagnostics | None = None
     if cfg.distill is not None and cfg.distill.active:
         positives, negatives = _training_rows(val_split, assembled.exclude_nodes)
-        targets = load_kd_targets(Path(cfg.distill.targets_path), load_seeds=False)
+        targets = load_kd_targets(Path(cfg.distill.targets_path))
         kd_bank = KDRowBank(
             cfg.distill,
             targets,
