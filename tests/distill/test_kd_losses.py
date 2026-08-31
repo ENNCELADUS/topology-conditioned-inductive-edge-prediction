@@ -7,12 +7,9 @@ import torch
 from src.distill.losses import (
     kd_dist_loss,
     kd_gram_loss,
-    kd_kl_loss,
     kd_logit_loss,
     kd_rank_loss,
     kd_rep_loss,
-    kd_seed_gram_loss,
-    kd_seed_loss,
     kd_set_gram_loss,
     kd_set_seed_loss,
 )
@@ -111,19 +108,6 @@ def test_kd_gram_loss_is_zero_under_independent_feature_width_rotation() -> None
     torch.testing.assert_close(
         kd_gram_loss(teacher @ rotation, teacher), torch.tensor(0.0), atol=1e-5, rtol=0.0
     )
-
-
-def test_d9_seed_losses_and_kl_keep_original_unmasked_api() -> None:
-    torch.manual_seed(4)
-    seeds = torch.randn(3, 4, 8)
-    torch.testing.assert_close(
-        kd_seed_loss(seeds, 2.0 * seeds), torch.tensor(0.0), atol=1e-6, rtol=0.0
-    )
-    torch.testing.assert_close(
-        kd_seed_gram_loss(seeds, seeds), torch.tensor(0.0), atol=1e-6, rtol=0.0
-    )
-    kl = torch.tensor([[0.01, 0.2], [0.03, 0.04]])
-    torch.testing.assert_close(kd_kl_loss(kl, free_bits=0.05), torch.tensor(0.175))
 
 
 def test_gate_set_seed_loss_masks_dead_rows_and_backpropagates() -> None:
