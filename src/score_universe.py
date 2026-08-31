@@ -992,6 +992,20 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
     shards = [_load_shard(path) for path in inputs]
 
     reference = shards[0]
+    for shard in shards:
+        if "topo_gen_control" not in shard.meta:
+            raise ValueError(
+                f"merge input {shard.path} is missing required meta 'topo_gen_control'"
+            )
+    reference_topo_gen_control = reference.meta["topo_gen_control"]
+    if any(
+        shard.meta["topo_gen_control"] != reference_topo_gen_control for shard in shards[1:]
+    ):
+        raise ValueError(
+            "merge inputs disagree on meta 'topo_gen_control': "
+            f"{[shard.meta['topo_gen_control'] for shard in shards]} "
+            f"(files: {[str(shard.path) for shard in shards]})"
+        )
     for key in (
         "checkpoint_id",
         "model_family",
@@ -1000,7 +1014,6 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
         "num_rows",
         "score_precision",
         "scaffold_control",
-        "topo_gen_control",
         "permanent_null",
         "primary_logit",
         "scores_meta_version",
@@ -3434,6 +3447,7 @@ def _run_score(args: argparse.Namespace) -> None:
                 "pair_autocast": False,
                 "logit_storage_dtype": "float32",
             },
+            "topo_gen_control": args.topo_gen_control,
             "scaffold_control": {
                 "mode": args.scaffold_control,
                 "seed": _SCAFFOLD_CONTROL_SEED,

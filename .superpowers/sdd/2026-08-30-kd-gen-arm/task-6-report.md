@@ -56,3 +56,19 @@ Focused GREEN: the same command passed 7 tests.
 - GREEN: the same focused selection passed 3 tests after implementation.
 - Final verification: `tests/test_score_universe.py -n0 -q` passed 76 tests; Ruff passed; focused
   mypy passed; `git diff --check` passed. No DDP or H20 execution was performed.
+
+## Fix round 2 — reject unstamped scoring-control shards
+
+- Added a regression proving a shard missing `topo_gen_control` cannot merge with a shard carrying
+  explicit JSON `null`.
+- Merge now requires every shard to contain `topo_gen_control` and compares the recorded values
+  directly; pre-fix unstamped shards fail closed.
+- Current EgoStitch scoring also records explicit `null`, preserving the common score-metadata
+  convention for newly written shards.
+- RED: the focused missing-key test failed because merge did not raise. The first invocation was
+  blocked by uv's global-cache permissions; rerunning with `UV_CACHE_DIR` under `/tmp` established
+  RED.
+- GREEN: the missing-key and controlled-value focused tests passed (2 tests), and the broader merge
+  regression selection passed (6 tests).
+- Final verification: `tests/test_score_universe.py -n0 -q` passed 77 tests; Ruff passed; focused
+  mypy passed. No DDP or H20 execution was performed.

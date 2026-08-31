@@ -1124,6 +1124,30 @@ def test_merge_mismatched_topo_gen_control_raises_clear_error(tmp_path: Path) ->
         score_universe.merge_scores([shard0, shard1])
 
 
+def test_merge_missing_topo_gen_control_rejects_explicit_null(tmp_path: Path) -> None:
+    unstamped = tmp_path / "unstamped.npz"
+    explicit_null = tmp_path / "explicit-null.npz"
+    _write_fake_shard(unstamped, row_start=0, n_rows=10, num_rows=20)
+    _write_fake_shard(explicit_null, row_start=10, n_rows=10, num_rows=20)
+
+    raw = score_universe._load_shard(unstamped)
+    meta = dict(raw.meta)
+    del meta["topo_gen_control"]
+    score_universe.save_scores(
+        unstamped,
+        node_ids=raw.node_ids,
+        u_idx=raw.u_idx,
+        v_idx=raw.v_idx,
+        logit=raw.logit,
+        label=raw.label,
+        row_start=raw.row_start,
+        meta=meta,
+    )
+
+    with pytest.raises(ValueError, match="topo_gen_control"):
+        score_universe.merge_scores([unstamped, explicit_null])
+
+
 def test_merge_aggregates_concurrent_score_profiles(tmp_path: Path) -> None:
     shard0 = tmp_path / "s0.npz"
     shard1 = tmp_path / "s1.npz"
@@ -2048,6 +2072,7 @@ def test_merge_rejects_conflicting_scaffold_control_provenance(tmp_path: Path) -
             "seed": 0,
             "keying": "canonical_pair_v1",
         },
+        "topo_gen_control": None,
         "permanent_null": "none",
         "primary_logit": "full",
     }
