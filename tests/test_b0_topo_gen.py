@@ -3,6 +3,8 @@
 Spec: docs/superpowers/specs/2026-08-30-kd-gen-arm-design.md.
 """
 
+import math
+from copy import deepcopy
 from pathlib import Path
 from typing import cast
 
@@ -146,6 +148,109 @@ def test_imf_one_nfe_sampling_is_deterministic(monkeypatch: pytest.MonkeyPatch) 
     torch.testing.assert_close(first, second)
 
 
+def test_imf_u_uses_ordered_time_and_interval_fourier_tail() -> None:
+    module = cast(ImfTopoGen, _module("imf"))
+    x = torch.zeros(2, cast(int, CFG["latent_dim"]))
+    cond = torch.zeros(2, cast(int, CFG["cond_dim"]))
+    r = torch.tensor([0.1, 0.6])
+    t = torch.tensor([0.8, 0.9])
+    captured: list[torch.Tensor] = []
+    hook = module.cond_embed.register_forward_pre_hook(
+        lambda _module, args: captured.append(args[0].detach().clone())
+    )
+    _ = module._u(x, r, t, cond)
+    hook.remove()
+
+    def fourier(values: torch.Tensor, dim: int) -> torch.Tensor:
+        half = dim // 2
+        frequencies = torch.exp(
+            torch.arange(half, dtype=values.dtype) * (-math.log(10_000.0) / max(half - 1, 1))
+        )
+        angles = values.unsqueeze(-1) * frequencies
+        return torch.cat((torch.sin(angles), torch.cos(angles)), dim=-1)
+
+    t_embed = fourier(t, 32)
+    interval_embed = fourier(t - r, 32)
+    time_tail = captured[0][:, -64:]
+    expected = torch.cat((t_embed, interval_embed), dim=-1)
+    assert torch.equal(time_tail, expected)
+    averaged = 0.5 * (t_embed + interval_embed)
+    assert not torch.allclose(time_tail, torch.cat((averaged, averaged), dim=-1))
+
+
+def test_imf_gen_loss_pins_sampling_jvp_target_and_adaptive_weight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = cast(ImfTopoGen, _module("imf")).train()
+    batch = 3
+    latent_dim = cast(int, CFG["latent_dim"])
+    cond = torch.arange(batch * cast(int, CFG["cond_dim"]), dtype=torch.float32).reshape(batch, -1)
+    target = torch.arange(batch * latent_dim, dtype=torch.float32).reshape(batch, -1) / 10.0
+    eps = torch.flip(target, dims=(1,)) + 0.5
+    pair_draws = torch.tensor([[0.2, 0.8], [0.7, 0.1], [0.4, 0.6]])
+    branch_draws = torch.tensor([0.1, 0.25, 0.9])
+    rand_calls: list[tuple[int, ...]] = []
+
+    def fake_randn_like(value: torch.Tensor) -> torch.Tensor:
+        assert value.shape == target.shape
+        return eps.clone()
+
+    def fake_rand(*size: int, **kwargs: object) -> torch.Tensor:
+        assert kwargs == {"device": target.device}
+        rand_calls.append(size)
+        if size == (batch, 2):
+            return pair_draws.clone()
+        assert size == (batch,)
+        return branch_draws.clone()
+
+    u = torch.linspace(-0.3, 0.6, batch * latent_dim).reshape(batch, -1).requires_grad_()
+    dudt = torch.linspace(0.2, 0.8, batch * latent_dim).reshape(batch, -1).requires_grad_()
+    jvp_call: dict[str, object] = {}
+
+    def fake_jvp(
+        function: object,
+        inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        tangents: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        *,
+        create_graph: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert callable(function)
+        jvp_call.update(inputs=inputs, tangents=tangents, create_graph=create_graph)
+        return u, dudt
+
+    monkeypatch.setattr(torch, "randn_like", fake_randn_like)
+    monkeypatch.setattr(torch, "rand", fake_rand)
+    monkeypatch.setattr(torch.autograd.functional, "jvp", fake_jvp)
+
+    loss, stats = module.gen_loss(cond, target)
+
+    assert rand_calls == [(batch, 2), (batch,)]
+    expected_t = torch.tensor([0.8, 0.7, 0.6])
+    expected_r = torch.tensor([0.8, 0.1, 0.4])
+    expected_v = eps - target
+    expected_x_t = (1.0 - expected_t).unsqueeze(-1) * target + expected_t.unsqueeze(-1) * eps
+    x_t, r, t = cast(tuple[torch.Tensor, ...], jvp_call["inputs"])
+    tangent_x, tangent_r, tangent_t = cast(tuple[torch.Tensor, ...], jvp_call["tangents"])
+    assert torch.equal(t, expected_t)
+    assert torch.equal(r, expected_r)
+    assert torch.equal(x_t, expected_x_t)
+    assert torch.equal(tangent_x, expected_v)
+    assert torch.equal(tangent_r, torch.zeros_like(expected_r))
+    assert torch.equal(tangent_t, torch.ones_like(expected_t))
+    assert jvp_call["create_graph"] is True
+
+    expected_target = expected_v - (expected_t - expected_r).unsqueeze(-1) * dudt.detach()
+    expected_sq = (u - expected_target).square().mean(dim=-1)
+    expected_weight = (expected_sq.detach() + 1e-3).pow(-0.5)
+    expected_loss = (expected_weight * expected_sq).mean()
+    assert stats == {}
+    assert torch.equal(loss, expected_loss)
+    assert not torch.equal(loss, expected_sq.mean())
+    loss.backward()  # type: ignore[no-untyped-call]
+    assert u.grad is not None and torch.count_nonzero(u.grad) > 0
+    assert dudt.requires_grad and dudt.grad is None
+
+
 def test_imf_fp32_autocast_loss_and_jvp_gradients() -> None:
     module = _module("imf").train()
     enc_a, enc_b, len_a, len_b, _ = _inputs()
@@ -169,14 +274,18 @@ def test_imf_fp32_autocast_loss_and_jvp_gradients() -> None:
     )
 
 
-def test_imf_config_builds_without_sampler_steps() -> None:
-    path = Path("configs/b1_kd_gen_imf_breadth_first.yaml")
-    raw = yaml.safe_load(path.read_text())
-    topo_cfg = raw["model"]["config"]["topo_gen"]
+def test_imf_config_is_exact_edm_delta() -> None:
+    edm = yaml.safe_load(Path("configs/b1_kd_gen_edm_breadth_first.yaml").read_text())
+    imf = yaml.safe_load(Path("configs/b1_kd_gen_imf_breadth_first.yaml").read_text())
+    expected = deepcopy(edm)
+    expected["model"]["config"]["topo_gen"]["name"] = "imf"
+    del expected["model"]["config"]["topo_gen"]["sampler_steps"]
+    expected["output_dir"] = "outputs/b1_row_kd/kd_gen_imf"
+    assert imf == expected
+    topo_cfg = imf["model"]["config"]["topo_gen"]
     assert topo_cfg["name"] == "imf"
     assert "sampler_steps" not in topo_cfg
-    assert raw["output_dir"] == "outputs/b1_row_kd/kd_gen_imf"
-    assert build_topo_gen(topo_cfg, int(raw["model"]["config"]["d_model"])).family == "imf"
+    assert build_topo_gen(topo_cfg, int(imf["model"]["config"]["d_model"])).family == "imf"
 
 
 @pytest.mark.parametrize("family", ["edm", "det_mse"])
