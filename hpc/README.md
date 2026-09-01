@@ -236,20 +236,14 @@ python -m src.experiments.g3_oracle \
 
 ## Disconnect-safe runs
 
-The commands above run in the foreground. For a disconnect-safe run, keep the same
-runner and add only shell-level logging/backgrounding:
+The commands above run in the foreground; for disconnect safety keep the same runner
+and add only shell-level logging/backgrounding (or tmux):
 
 ```bash
-mkdir -p outputs/logs
-nohup hpc/run.sh train configs/b0_v31_breadth_first.yaml \
-  > outputs/logs/b0_v31_train.log 2>&1 &
+mkdir -p outputs/logs && nohup hpc/run.sh train configs/b0_v31_breadth_first.yaml > outputs/logs/b0_v31_train.log 2>&1 &
+# unattended strict-LLP kd_rank HPO sweep: dumps missing context banks, then 16 trials
+.venv/bin/python -m src.experiments.kd_rank_strict_hpo --teacher-checkpoint <full_ego_oracle best.pt>
 ```
 
 `--max-steps` remains debug-only, skips the test stage, and must not be used for a
 reported experiment; attempt `train.log` is authoritative and the redirect records launcher output.
-
-Strict-LLP kd_rank HPO sweep (unattended; run inside tmux, dumps missing context banks first):
-
-```bash
-.venv/bin/python -m src.experiments.kd_rank_strict_hpo --teacher-checkpoint <full_ego_oracle best.pt>
-```
