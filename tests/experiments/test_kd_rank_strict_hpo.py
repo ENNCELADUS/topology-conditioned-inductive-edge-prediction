@@ -6,6 +6,7 @@ import json
 import math
 from pathlib import Path
 
+import optuna
 import pytest
 import yaml
 from src.autoresearch.metrics_io import RunFailure
@@ -112,3 +113,32 @@ def test_trial_outcome_rejects_nonpositive_mmd_ratio(tmp_path: Path) -> None:
     run_dir = _publish_run(tmp_path / "trial_003", rows)
     with pytest.raises(ValueError):
         hpo.trial_outcome(run_dir, rd_band=0.05)
+
+
+def test_build_study_directions_and_priors(tmp_path: Path) -> None:
+    study = hpo.build_study(tmp_path / "optuna.db")
+    assert study.study_name == "kd_rank_strict_llp"
+    assert [d.name.lower() for d in study.directions] == ["maximize", "minimize"]
+    assert len(study.get_trials(deepcopy=False)) == 6
+
+
+def test_build_study_enqueue_is_idempotent(tmp_path: Path) -> None:
+    hpo.build_study(tmp_path / "optuna.db")
+    study = hpo.build_study(tmp_path / "optuna.db")
+    assert len(study.get_trials(deepcopy=False)) == 6
+
+
+def test_suggest_params_consumes_priors_in_order(tmp_path: Path) -> None:
+    study = hpo.build_study(tmp_path / "optuna.db")
+    first = hpo.suggest_params(study.ask())
+    second = hpo.suggest_params(study.ask())
+    assert first == hpo.ENQUEUED_PRIORS[0]
+    assert second == hpo.ENQUEUED_PRIORS[1]
+
+
+def test_constraints_default_to_infeasible() -> None:
+    study = optuna.create_study(directions=["maximize", "minimize"])
+    study.add_trial(
+        optuna.trial.create_trial(params={}, distributions={}, values=[0.5, 1.0], user_attrs={})
+    )
+    assert hpo._constraints(study.get_trials(deepcopy=False)[0]) == (float("inf"),)

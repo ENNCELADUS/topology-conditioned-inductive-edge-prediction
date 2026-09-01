@@ -12,10 +12,11 @@ Spec: ``docs/superpowers/specs/2026-09-01-kd-rank-strict-llp-optuna-hpo-design.m
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import optuna
 import yaml
 
 from src.autoresearch.metrics_io import RunMetrics, read_run
@@ -106,3 +107,45 @@ def trial_outcome(run_dir: Path, rd_band: float) -> TrialOutcome:
         "selected_epoch": float(run.selected_epoch),
     }
     return TrialOutcome(topo.gs, geo_mmd, abs(math.log(topo.rd)) - rd_band, surface)
+
+
+STUDY_NAME = "kd_rank_strict_llp"
+N_STARTUP_TRIALS = 6
+
+
+def _constraints(trial: optuna.trial.FrozenTrial) -> Sequence[float]:
+    constraint = trial.user_attrs.get("constraint")
+    if not isinstance(constraint, list) or len(constraint) != 1:
+        return (float("inf"),)
+    return (float(constraint[0]),)
+
+
+def build_study(db_path: Path) -> optuna.Study:
+    """Create-or-load the sweep study and (re-)enqueue the prior trials."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    sampler = optuna.samplers.TPESampler(
+        seed=0,
+        multivariate=True,
+        n_startup_trials=N_STARTUP_TRIALS,
+        constraints_func=_constraints,
+    )
+    study = optuna.create_study(
+        study_name=STUDY_NAME,
+        storage=f"sqlite:///{db_path}",
+        directions=["maximize", "minimize"],
+        sampler=sampler,
+        load_if_exists=True,
+    )
+    for params in ENQUEUED_PRIORS:
+        study.enqueue_trial(dict(params), skip_if_exists=True)
+    return study
+
+
+def suggest_params(trial: optuna.Trial) -> dict[str, object]:
+    """Draw one point of the spec's search space (enqueued values pass through)."""
+    return {
+        "w_rank": float(trial.suggest_float("w_rank", 0.01, 1.0, log=True)),
+        "w_dist": float(trial.suggest_float("w_dist", 0.1, 100.0, log=True)),
+        "bank": str(trial.suggest_categorical("bank", sorted(BANKS))),
+        "margin": float(trial.suggest_categorical("margin", [0.05, 0.1, 0.2])),
+    }
