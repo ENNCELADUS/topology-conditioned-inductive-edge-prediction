@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 from pathlib import Path
@@ -176,3 +177,127 @@ def test_reconcile_failed_and_vanished_runs_are_failed(tmp_path: Path) -> None:
     assert states[failed.number] == TrialState.FAIL
     assert states[vanished.number] == TrialState.FAIL
     assert TrialState.COMPLETE not in states.values()
+
+
+def _fabricate_run(config_path: Path) -> None:
+    cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+    _publish_run(Path(cfg["output_dir"]), make_cadence_rows())
+
+
+def _sweep_args(tmp_path: Path, **overrides: object) -> argparse.Namespace:
+    argv = [
+        "--teacher-checkpoint",
+        str(tmp_path / "teacher.pt"),
+        "--sweep-dir",
+        str(tmp_path),
+        "--n-trials",
+        "2",
+    ]
+    for key, value in overrides.items():
+        argv += [f"--{key.replace('_', '-')}", str(value)]
+    return hpo.build_parser().parse_args(argv)
+
+
+def test_run_sweep_completes_n_trials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, spec in list(hpo.BANKS.items()):  # pre-existing banks: no dumps expected
+        bank = tmp_path / Path(spec.path).name
+        bank.mkdir()
+        monkeypatch.setitem(
+            hpo.BANKS, name, hpo.BankSpec(spec.rw_step, spec.hops, spec.ns_rate, str(bank))
+        )
+    launched: list[list[str]] = []
+
+    def fake_run(cmd: list[str]) -> int:
+        launched.append(cmd)
+        assert cmd[:3] == ["bash", "hpc/run.sh", "train"]
+        assert cmd[-1] == "--skip-test"
+        _fabricate_run(Path(cmd[3]))
+        return 0
+
+    monkeypatch.setattr(hpo, "run_command", fake_run)
+    monkeypatch.setattr(
+        hpo, "run_commands_parallel", lambda commands: pytest.fail("no dumps expected")
+    )
+    hpo.run_sweep(_sweep_args(tmp_path))
+    study = hpo.build_study(tmp_path / "optuna.db")
+    complete = [t for t in study.get_trials(deepcopy=False) if t.state == TrialState.COMPLETE]
+    assert len(complete) == 2
+    assert [t.params for t in complete] == [dict(p) for p in hpo.ENQUEUED_PRIORS[:2]]
+    assert all(t.user_attrs["surface"]["gs"] == pytest.approx(0.80) for t in complete)
+    assert len(launched) == 2
+
+
+def test_run_sweep_marks_failed_run_and_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name, spec in list(hpo.BANKS.items()):
+        bank = tmp_path / Path(spec.path).name
+        bank.mkdir()
+        monkeypatch.setitem(
+            hpo.BANKS, name, hpo.BankSpec(spec.rw_step, spec.hops, spec.ns_rate, str(bank))
+        )
+    calls = {"n": 0}
+
+    def fake_run(cmd: list[str]) -> int:
+        calls["n"] += 1
+        cfg = yaml.safe_load(Path(cmd[3]).read_text(encoding="utf-8"))
+        _publish_run(Path(cfg["output_dir"]), make_cadence_rows(), failure=calls["n"] == 1)
+        return 0
+
+    monkeypatch.setattr(hpo, "run_command", fake_run)
+    monkeypatch.setattr(hpo, "run_commands_parallel", lambda commands: [])
+    hpo.run_sweep(_sweep_args(tmp_path, n_trials=1))
+    states = [t.state for t in hpo.build_study(tmp_path / "optuna.db").get_trials(deepcopy=False)]
+    assert states.count(TrialState.FAIL) == 1
+    assert states.count(TrialState.COMPLETE) == 1
+
+
+def test_dump_missing_banks_shards_and_merges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    existing = tmp_path / "kd_ctx_targets_breadth_first"
+    existing.mkdir()
+    monkeypatch.setitem(hpo.BANKS, "h2ns1", hpo.BankSpec(3, 2, 1, str(existing)))
+    monkeypatch.setitem(hpo.BANKS, "h2ns3", hpo.BankSpec(3, 2, 3, str(tmp_path / "b_h2ns3")))
+    monkeypatch.setitem(hpo.BANKS, "h2ns5", hpo.BankSpec(3, 2, 5, str(existing)))
+    monkeypatch.setitem(hpo.BANKS, "h3ns3", hpo.BankSpec(3, 3, 3, str(existing)))
+    parallel_calls: list[list[tuple[list[str], dict[str, str]]]] = []
+    merges: list[list[str]] = []
+
+    def fake_run_commands_parallel(
+        commands: list[tuple[list[str], dict[str, str]]],
+    ) -> list[int]:
+        parallel_calls.append(commands)
+        return [0] * len(commands)
+
+    def fake_run_command(cmd: list[str]) -> int:
+        merges.append(cmd)
+        return 0
+
+    monkeypatch.setattr(hpo, "run_commands_parallel", fake_run_commands_parallel)
+    monkeypatch.setattr(hpo, "run_command", fake_run_command)
+    hpo.dump_missing_banks(_sweep_args(tmp_path, dump_shards=2))
+    assert len(parallel_calls) == 1 and len(parallel_calls[0]) == 2
+    shard_cmd, shard_env = parallel_calls[0][0]
+    assert shard_cmd[:3] == ["bash", "hpc/run.sh", "kd-targets"]
+    assert "--contexts" in shard_cmd and "--row-shard" in shard_cmd
+    for flag, value in (("--rw-step", "3"), ("--hops", "2"), ("--ns-rate", "3")):
+        assert shard_cmd[shard_cmd.index(flag) + 1] == value
+    assert shard_env == {"CUDA_VISIBLE_DEVICES": "0"}
+    assert len(merges) == 1 and "--merge" in merges[0]
+
+
+def test_dump_missing_banks_raises_on_shard_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(hpo.BANKS, "h2ns3", hpo.BankSpec(3, 2, 3, str(tmp_path / "missing")))
+    for name in ("h2ns1", "h2ns5", "h3ns3"):
+        spec = hpo.BANKS[name]
+        existing = tmp_path / f"bank_{name}"
+        existing.mkdir()
+        monkeypatch.setitem(
+            hpo.BANKS, name, hpo.BankSpec(spec.rw_step, spec.hops, spec.ns_rate, str(existing))
+        )
+    monkeypatch.setattr(hpo, "run_commands_parallel", lambda commands: [0, 1])
+    with pytest.raises(RuntimeError):
+        hpo.dump_missing_banks(_sweep_args(tmp_path, dump_shards=2))

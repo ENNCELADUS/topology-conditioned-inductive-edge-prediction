@@ -11,7 +11,10 @@ Spec: ``docs/superpowers/specs/2026-09-01-kd-rank-strict-llp-optuna-hpo-design.m
 
 from __future__ import annotations
 
+import argparse
 import math
+import os
+import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -176,3 +179,145 @@ def reconcile_running(study: optuna.Study, sweep_dir: Path, rd_band: float) -> N
         study.tell(stale.number, state=TrialState.FAIL)
         if twin is not None:
             study.add_trial(twin)
+
+
+_THREAD_CAPS = {"OMP_NUM_THREADS": "16", "MKL_NUM_THREADS": "16"}
+
+
+def run_command(cmd: list[str]) -> int:
+    """Run one foreground container command with the H20 thread caps."""
+    return subprocess.run(cmd, env={**os.environ, **_THREAD_CAPS}, check=False).returncode
+
+
+def run_commands_parallel(commands: list[tuple[list[str], dict[str, str]]]) -> list[int]:
+    """Run commands concurrently; each tuple is (argv, extra env)."""
+    procs = [
+        subprocess.Popen(cmd, env={**os.environ, **_THREAD_CAPS, **extra})
+        for cmd, extra in commands
+    ]
+    return [proc.wait() for proc in procs]
+
+
+def _dump_cmd(args: argparse.Namespace, spec: BankSpec) -> list[str]:
+    return [
+        "bash",
+        "hpc/run.sh",
+        "kd-targets",
+        "--contexts",
+        "--config",
+        str(args.base_config),
+        "--checkpoint",
+        str(args.teacher_checkpoint),
+        "--output",
+        spec.path,
+        "--rw-step",
+        str(spec.rw_step),
+        "--hops",
+        str(spec.hops),
+        "--ns-rate",
+        str(spec.ns_rate),
+    ]
+
+
+def dump_missing_banks(args: argparse.Namespace) -> None:
+    """Dump every context bank whose artifact is absent (sharded, then merged).
+
+    Raises:
+        RuntimeError: If any shard or merge exits nonzero (fail-closed
+            before any training budget is spent).
+    """
+    for name in sorted(BANKS):
+        spec = BANKS[name]
+        if Path(spec.path).exists():
+            continue
+        shards = [
+            (
+                _dump_cmd(args, spec)
+                + ["--device", "cuda", "--row-shard", f"{index}/{args.dump_shards}"],
+                {"CUDA_VISIBLE_DEVICES": str(index)},
+            )
+            for index in range(args.dump_shards)
+        ]
+        codes = run_commands_parallel(shards)
+        if any(code != 0 for code in codes):
+            raise RuntimeError(f"bank {name}: shard exit codes {codes}")
+        merge_code = run_command(
+            _dump_cmd(args, spec) + ["--merge", "--row-shard", f"0/{args.dump_shards}"]
+        )
+        if merge_code != 0:
+            raise RuntimeError(f"bank {name}: merge exited {merge_code}")
+
+
+def _n_complete(study: optuna.Study) -> int:
+    return len(study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,)))
+
+
+def run_sweep(args: argparse.Namespace) -> None:
+    """Drive the whole sweep: reconcile, dump banks, ask/tell until budget."""
+    study = build_study(args.sweep_dir / "optuna.db")
+    reconcile_running(study, args.sweep_dir, args.rd_band)
+    dump_missing_banks(args)
+    while _n_complete(study) < args.n_trials:
+        trial = study.ask()
+        params = suggest_params(trial)
+        config_path = materialize_trial_config(
+            args.base_config, params, trial.number, args.sweep_dir
+        )
+        run_command(["bash", "hpc/run.sh", "train", str(config_path), "--skip-test"])
+        run_dir = args.sweep_dir / f"trial_{trial.number:03d}"
+        try:
+            outcome = trial_outcome(run_dir, args.rd_band)
+        except RunFailure:
+            study.tell(trial, state=TrialState.FAIL)
+            continue
+        trial.set_user_attr("constraint", [outcome.constraint])
+        trial.set_user_attr("surface", outcome.surface)
+        study.tell(trial, values=[outcome.gs, outcome.geo_mmd])
+    print_report(study)
+
+
+def print_report(study: optuna.Study) -> None:
+    """Print the full trial table, then the feasible Pareto front."""
+    columns = [
+        "auprc",
+        "gs",
+        "rd",
+        "degree_mmd",
+        "clustering_mmd",
+        "spectral_mmd",
+        "selected_epoch",
+    ]
+    print("number state w_rank w_dist bank margin " + " ".join(columns))  # noqa: T201 -- CLI report goes to stdout
+    for t in study.get_trials(deepcopy=False):
+        surface = t.user_attrs.get("surface", {})
+        values = " ".join(f"{surface[c]:.4f}" if c in surface else "-" for c in columns)
+        print(  # noqa: T201 -- CLI report goes to stdout
+            f"{t.number} {t.state.name} {t.params.get('w_rank', '-')} "
+            f"{t.params.get('w_dist', '-')} {t.params.get('bank', '-')} "
+            f"{t.params.get('margin', '-')} {values}"
+        )
+    front = ", ".join(str(t.number) for t in study.best_trials)
+    print(f"feasible Pareto front (advisory): trials [{front}]")  # noqa: T201 -- CLI report goes to stdout
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the `python -m src.experiments.kd_rank_strict_hpo` parser."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--base-config", type=Path, default=Path("configs/autoresearch/kd_rank.yaml")
+    )
+    parser.add_argument("--teacher-checkpoint", type=Path, required=True)
+    parser.add_argument("--sweep-dir", type=Path, default=Path("outputs/b1_kd_rank_strict_hpo"))
+    parser.add_argument("--n-trials", type=int, default=16)
+    parser.add_argument("--rd-band", type=float, default=0.05)
+    parser.add_argument("--dump-shards", type=int, default=4)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Entry point for the unattended container sweep."""
+    run_sweep(build_parser().parse_args(argv))
+
+
+if __name__ == "__main__":
+    main()
