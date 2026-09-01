@@ -707,6 +707,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Dump epoch-indexed strict-LLP context targets instead of official row targets",
     )
+    parser.add_argument(
+        "--rw-step",
+        type=int,
+        default=DEFAULT_RW_STEP,
+        help="Context-sampler override; shard and merge invocations of one dump must pass "
+        "identical values",
+    )
+    parser.add_argument(
+        "--hops",
+        type=int,
+        default=DEFAULT_HOPS,
+        help="Context-sampler override; shard and merge invocations of one dump must pass "
+        "identical values",
+    )
+    parser.add_argument(
+        "--ns-rate",
+        type=int,
+        default=DEFAULT_NS_RATE,
+        help="Context-sampler override; shard and merge invocations of one dump must pass "
+        "identical values",
+    )
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument(
         "--model-config",
@@ -756,9 +777,9 @@ def _finalize_context_artifact(
         banks=banks,
         val_bank=val_bank,
         sampler_params={
-            "rw_step": DEFAULT_RW_STEP,
-            "hops": DEFAULT_HOPS,
-            "ns_rate": DEFAULT_NS_RATE,
+            "rw_step": args.rw_step,
+            "hops": args.hops,
+            "ns_rate": args.ns_rate,
         },
         seed=_CONTEXT_SEED,
         truth_graph_sha256=_oracle_truth_graph_sha256(truth_graph),
@@ -827,11 +848,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             forbidden_internal=split.v_val,
             seed=_CONTEXT_SEED,
             n_banks=cfg.optim.epochs,
+            rw_step=args.rw_step,
+            hops=args.hops,
+            ns_rate=args.ns_rate,
         )
         val_bank = sample_v_val_context_bank(
             truth_graph,
             v_val=split.v_val,
             node_ids=node_ids,
+            rw_step=args.rw_step,
+            hops=args.hops,
+            ns_rate=args.ns_rate,
         )
         pair_a_idx, pair_b_idx, indexed_banks, indexed_val_bank = index_context_banks(
             banks, val_bank

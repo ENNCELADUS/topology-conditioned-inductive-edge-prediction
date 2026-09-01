@@ -681,7 +681,7 @@ def test_finalize_context_artifact_has_no_teacher_rep(tmp_path: Path) -> None:
     )
     truth = nx.Graph([("a", "b")])
     tt._finalize_context_artifact(
-        Namespace(output=output, checkpoint=checkpoint),
+        Namespace(output=output, checkpoint=checkpoint, rw_step=3, hops=2, ns_rate=1),
         ["a", "b"],
         truth,
         pair_a,
@@ -695,3 +695,84 @@ def test_finalize_context_artifact_has_no_teacher_rep(tmp_path: Path) -> None:
     with np.load(output / "targets.npz") as archive:
         assert "teacher_logit" in archive.files
         assert all("teacher_rep" not in name for name in archive.files)
+
+
+# --------------------------------------------------------------------------- sampler flags
+
+
+def test_parser_sampler_flags_default_to_reference_values() -> None:
+    args = tt.build_parser().parse_args(
+        ["--config", "cfg.yaml", "--checkpoint", "ckpt.pt", "--output", "out"]
+    )
+    assert (args.rw_step, args.hops, args.ns_rate) == (3, 2, 1)
+
+
+def test_parser_sampler_flags_accept_overrides() -> None:
+    args = tt.build_parser().parse_args(
+        [
+            "--config",
+            "cfg.yaml",
+            "--checkpoint",
+            "ckpt.pt",
+            "--output",
+            "out",
+            "--contexts",
+            "--rw-step",
+            "3",
+            "--hops",
+            "3",
+            "--ns-rate",
+            "5",
+        ]
+    )
+    assert (args.rw_step, args.hops, args.ns_rate) == (3, 3, 5)
+
+
+def test_finalize_context_artifact_records_cli_sampler_params(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = tmp_path / "ckpt.pt"
+    checkpoint.write_bytes(b"fixture")
+    captured: dict[str, object] = {}
+
+    def fake_write(output: Path, **kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(tt, "write_kd_context_targets", fake_write)
+    args = tt.build_parser().parse_args(
+        [
+            "--config",
+            "cfg.yaml",
+            "--checkpoint",
+            str(checkpoint),
+            "--output",
+            str(tmp_path / "o"),
+            "--contexts",
+            "--rw-step",
+            "3",
+            "--hops",
+            "3",
+            "--ns-rate",
+            "5",
+        ]
+    )
+    graph = nx.Graph([("a", "b")])
+    empty_bank = KDContextBank(
+        anchor_idx=np.zeros(0, dtype=np.int32),
+        anchor_offsets=np.zeros(1, dtype=np.int64),
+        partner_idx=np.zeros(0, dtype=np.int32),
+        score_idx=np.zeros(0, dtype=np.int32),
+        is_near=np.zeros(0, dtype=np.bool_),
+    )
+    tt._finalize_context_artifact(
+        args,
+        ["a", "b"],
+        graph,
+        np.zeros(1, dtype=np.int32),
+        np.zeros(1, dtype=np.int32),
+        np.zeros(1, dtype=np.float32),
+        [],
+        empty_bank,
+        "cafe0000",
+    )
+    assert captured["sampler_params"] == {"rw_step": 3, "hops": 3, "ns_rate": 5}
