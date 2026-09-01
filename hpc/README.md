@@ -247,3 +247,9 @@ nohup hpc/run.sh train configs/b0_v31_breadth_first.yaml \
 
 `--max-steps` remains debug-only, skips the test stage, and must not be used for a
 reported experiment; attempt `train.log` is authoritative and the redirect records launcher output.
+
+Strict-LLP kd_rank HPO sweep (unattended; run inside tmux, dumps missing context banks first):
+
+```bash
+.venv/bin/python -m src.experiments.kd_rank_strict_hpo --teacher-checkpoint <full_ego_oracle best.pt>
+```
