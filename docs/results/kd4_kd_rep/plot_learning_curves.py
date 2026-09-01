@@ -1,7 +1,7 @@
 """Publication learning curves for KD4 (kd_rep), run kd_rep_w0p1.
 
-Reads learning_curves.csv next to this file and renders
-learning_curves.png next to it. Raw (unweighted) loss terms are
+Reads learning_curves.csv next to this file and renders the loss and
+validation-topology PNGs next to it. Raw (unweighted) loss terms are
 plotted; KD weights appear in the panel captions only. The total
 panel is task + sum(w * raw KD term), composed identically for
 train and validation from the per-row-mean telemetry.
@@ -21,7 +21,7 @@ from matplotlib.lines import Line2D
 
 ARM = "KD4 (kd_rep)"
 RUN = "kd_rep_w0p1"
-KD_WEIGHTS = {'w_rep': 0.1}
+KD_WEIGHTS = {"w_rep": 0.1}
 SELECTED_EPOCH = 14
 # Panels: (caption, ylabel, train_column, val_column).
 PANELS: tuple[tuple[str, str, str, str], ...] = (
@@ -30,9 +30,18 @@ PANELS: tuple[tuple[str, str, str, str], ...] = (
     ("(c) Total (task + w·KD)", "Total loss", "train_total", "val_total"),
 )
 
+TOPOLOGY_PANELS: tuple[tuple[str, str, str, float | None], ...] = (
+    ("(a) BFS-macro GS (higher)", "GS", "val_gs_bfs", None),
+    ("(b) BFS-macro RD (target 1)", "RD", "val_rd_bfs", 1.0),
+    ("(c) Degree MMD ratio (lower)", "MMD ratio", "val_degree_mmd_ratio", None),
+    ("(d) Clustering MMD ratio (lower)", "MMD ratio", "val_clustering_mmd_ratio", None),
+    ("(e) Spectral MMD ratio (lower)", "MMD ratio", "val_spectral_mmd_ratio", None),
+)
+
 HERE = Path(__file__).resolve().parent
 DATA_PATH = HERE / "learning_curves.csv"
 OUTPUT_PATH = HERE / "learning_curves.png"
+TOPOLOGY_OUTPUT_PATH = HERE / "validation_topology_curves.png"
 
 TRAIN_COLOR = "#0072B2"
 VAL_COLOR = "#D55E00"
@@ -45,7 +54,11 @@ def load_curves() -> dict[str, list[float]]:
         rows = list(csv.DictReader(handle))
     if [int(row["epoch"]) for row in rows] != list(range(1, 26)):
         raise ValueError("learning_curves.csv must contain epochs 1..25 exactly once")
-    columns = ["epoch"] + [key for panel in PANELS for key in panel[2:]]
+    columns = (
+        ["epoch"]
+        + [key for panel in PANELS for key in panel[2:]]
+        + [panel[2] for panel in TOPOLOGY_PANELS]
+    )
     curves = {name: [float(row[name]) for row in rows] for name in columns}
     for name, values in curves.items():
         if not all(math.isfinite(value) for value in values):
@@ -127,6 +140,76 @@ def plot_panel(
     ax.set_axisbelow(True)
 
 
+def plot_topology_panel(
+    ax: Axes,
+    epochs: list[float],
+    values: list[float],
+    caption: str,
+    ylabel: str,
+    target: float | None,
+    label_selected: bool,
+) -> None:
+    """Draw one validation-topology metric across epochs."""
+    ax.plot(
+        epochs,
+        values,
+        color=VAL_COLOR,
+        linewidth=1.6,
+        marker="s",
+        markersize=2.8,
+        markevery=2,
+    )
+    if target is not None:
+        ax.axhline(target, color="#999999", linewidth=0.9, linestyle="--", zorder=0)
+    ax.axvline(SELECTED_EPOCH, color=GRAY, linewidth=1.0, linestyle=":", zorder=0)
+    if label_selected:
+        blend = mtransforms.blended_transform_factory(ax.transData, ax.transAxes)
+        ax.text(
+            SELECTED_EPOCH - 0.5,
+            0.97,
+            "selected",
+            transform=blend,
+            rotation=90,
+            ha="right",
+            va="top",
+            fontsize=7,
+            color=GRAY,
+        )
+    ax.set_title(caption, loc="left")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(ylabel)
+    ax.set_xlim(0.5, 25.5)
+    ax.set_xticks([1, 5, 10, 15, 20, 25])
+    ax.grid(axis="y", color="#D9D9D9", linewidth=0.55, alpha=0.75)
+    ax.set_axisbelow(True)
+
+
+def render_topology_curves(curves: dict[str, list[float]]) -> None:
+    """Render the five validation-topology metrics as a 300-DPI PNG."""
+    epochs = curves["epoch"]
+    fig, axes = plt.subplots(
+        2,
+        3,
+        figsize=(9.6, 5.6),
+        constrained_layout=True,
+    )
+    flat_axes = list(axes.flat)
+    for index, (caption, ylabel, key, target) in enumerate(TOPOLOGY_PANELS):
+        plot_topology_panel(
+            flat_axes[index],
+            epochs,
+            curves[key],
+            caption,
+            ylabel,
+            target,
+            index == 0,
+        )
+    for ax in flat_axes[len(TOPOLOGY_PANELS) :]:
+        ax.set_visible(False)
+    fig.savefig(TOPOLOGY_OUTPUT_PATH, dpi=300)
+    plt.close(fig)
+
+
 def main() -> None:
     """Render the learning-curve figure for this arm as a 300-DPI PNG."""
     configure_style()
@@ -179,6 +262,7 @@ def main() -> None:
     )
     fig.savefig(OUTPUT_PATH, dpi=300)
     plt.close(fig)
+    render_topology_curves(curves)
 
 
 if __name__ == "__main__":

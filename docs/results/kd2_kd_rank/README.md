@@ -19,13 +19,13 @@ Accepted deviations from the LLP reference:
 - One context bank is shared across runs: this controls sampler variance.
 - V_val-internal pairs and featureless nodes are excluded: the repository data contract requires it.
 
-## Learning curves
+## Learning and validation-topology curves
 
 ![KD2 train and validation learning curves](learning_curves.png)
-
-The figure plots raw train/validation task, rank, and distribution losses plus the weighted total. The dotted line marks epoch 22, the checkpoint used for the winner's V_val surface; it is not a
-minimum-loss selection rule. [CSV](learning_curves.csv) contains the exact 25-epoch values, and
-[plot script](plot_learning_curves.py) reproduces the PNG directly from it.
+![KD2 validation topology curves](validation_topology_curves.png)
+The first figure plots train/validation losses; the second plots BFS-macro GS/RD and all three MMD
+ratios on V_val. The dotted line marks selected epoch 22. [CSV](learning_curves.csv) and the
+[plot script](plot_learning_curves.py) contain the exact values and reproduce both PNGs.
 
 ## Campaign provenance
 

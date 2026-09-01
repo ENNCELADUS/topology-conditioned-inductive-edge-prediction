@@ -1,10 +1,8 @@
 # KD loss-weight HPO grid (Phase 0): results and campaign plan
 
-**Status (verified 2026-08-31):** all 24 grid runs under `outputs/b1_row_kd_hpo/` completed on the
-4-GPU H20 container with no `failure.json`. Design and literature grounding: `docs/tmp/kd_hpo_grid.md`;
-harness spec: `docs/superpowers/specs/2026-08-30-kd-autoresearch-hpo-design.md`. All numbers here are
-**V_val selection surfaces** (AUPRC plus the five topology metrics at each run's selected-epoch V_val
-threshold); no grid run has held-out test results — winners are tested once, at campaign finalization.
+**Status (verified 2026-09-01):** all 24 KD grid runs, matched `kd_control`, and follow-up `kd_gen_det`/`kd_gen_edm` completed on
+4 H20s without `failure.json`; design: `docs/tmp/kd_hpo_grid.md`; harness: `docs/superpowers/specs/2026-08-30-kd-autoresearch-hpo-design.md`.
+The 24 grid rows remain **V_val selection surfaces**; the control and KD-Gen follow-ups additionally completed held-out tests after selection.
 
 ## 1. Protocol
 
@@ -15,15 +13,11 @@ topology every epoch; `kd_rep_w10`/`kd_rep_w100` used `eval.topology_every: 2`. 
 **cadence-2 reselection** (`src.autoresearch.metrics_io.read_run(..., topology_every=2)`). The grid is
 also not comparable to the published 2-rank KD1–KD4 reports (`../b1_kd_arms.md`).
 
-## 2. Control anchor
+## 2. Completed matched control
 
-Per operator decision (2026-08-31), the zero-KD control is the **published B0 V3.1 run** (checkpoint
-`e092537d8cf1e208`); the never-launched `kd_control` sweep point is retired. B0 predates per-epoch
-topology validation, so it has no judge-comparable V_val surface; it anchors at the protocol level
-via `outputs/deployable_topology_v4/b0_v31_e092537d/test_report.json`: test AUPRC/AUROC
-0.7315/0.7067, ECE/Brier 0.3396/0.3520; fixed V_val threshold (logit 2.125): GS 0.3675, RD 0.3236,
-degree/clustering/spectral MMD ratios 20.92/18.38/28.25. Caveats: different rank count and training
-vintage — mechanism-isolation claims against this anchor carry both confounds.
+Phase-0 selection used published B0 `e092537d8cf1e208` as proxy control: held-out AUPRC/AUROC 0.7315/0.7067, ECE/Brier 0.3396/0.3520, GS/RD 0.3675/0.3236, and MMD 20.92/18.38/28.25.
+The later zero-KD `kd_control` matches the 25-epoch seed-0 4-H20 recipe; its selected V_val row is below. Held-out AUPRC/AUROC was 0.7360/0.7056, ECE/Brier 0.3581/0.3461, GS/RD 0.3849/0.5572, and MMD 8.73/7.79/13.54.
+Its direct test wrote merged scores and `outputs/b1_row_kd_hpo/kd_control/test_report.json`, but no pipeline-owned `test_complete.json` sentinel.
 
 ## 3. Cadence-2 historical surfaces (selected epoch; AUPRC telemetry, never optimized)
 
@@ -56,14 +50,19 @@ vintage — mechanism-isolation claims against this anchor carry both confounds.
 
 ## 4. Winner selection
 
-Pareto-undominated sets on the five oriented topology metrics (`src.autoresearch.verdict.undominated`):
-kd_logit 5/5, kd_rank 7/9 (dropping `w10`, `wr1_wd0p1`), kd_gram 4/5 (dropping `w0p01`), kd_rep 5/5.
-The metrics trade off, so the human pick among survivors (bold rows) used a select_checkpoint-style
-mean rank of AUPRC plus the five oriented metrics across each arm's points. Findings: weight
-sensitivity is term-specific, matching the literature extraction — `kd_logit` trades ~+0.04 GS and
-best AUPRC/RD for ~+2 degree MMD as w→100; `kd_rank`'s heavy weights buy the grid's best degree and
-spectral MMD at GS/clustering cost, with the LLP-style dist-heavy `wr0p1_wd1` most balanced;
-`kd_gram` peaks at w=1; `kd_rep` at w=0.1.
+| selected model | ep | AUPRC | GS ↑ | RD → 1 | deg MMD ↓ | clu MMD ↓ | spec MMD ↓ |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| `kd_control` (zero KD) | 18 | 0.9193 | 0.4867 | 1.0396 | 14.26 | 2.45 | 10.31 |
+| PMA(1) Full-Ego oracle (seed 0; diagnostic) | 9 | **0.9727** | **0.7643** | **0.9980** | 16.34 | **1.88** | 14.81 |
+| KD1 `kd_logit_w100` | 25 | 0.9274 | 0.5459 | 1.0318 | 15.96 | 2.58 | 11.65 |
+| KD2 `kd_rank_wr0p1_wd1` | 22 | 0.9205 | 0.5263 | 1.0490 | 13.95 | 2.50 | 10.09 |
+| KD3 `kd_gram_w1` | 10 | 0.9180 | 0.5311 | 1.0484 | 13.47 | 2.55 | 11.27 |
+| KD4 `kd_rep_w0p1` | 14 | 0.9158 | 0.5048 | 1.0405 | **12.98** | 2.47 | **10.04** |
+| KD-Gen `kd_gen_det` (PMA1 latent) | 14 | 0.9220 | 0.5309 | 1.0089 | 14.63 | 2.83 | 11.62 |
+| KD-Gen `kd_gen_edm` (PMA1 latent) | 14 | 0.9222 | 0.5290 | 1.0126 | 15.12 | 2.68 | 11.36 |
+
+The six KD rows are selected checkpoints under the same six-metric rule; the PMA(1) oracle is diagnostic. Relative to `kd_control`, AUPRC/GS deltas are oracle +0.0534/+0.2776, KD1 +0.0081/+0.0592, KD2 +0.0012/+0.0396, KD3 −0.0013/+0.0444, KD4 −0.0035/+0.0180, KD-Gen det +0.0027/+0.0442, and KD-Gen EDM +0.0029/+0.0423.
+Held-out EDM AUPRC/AUROC was 0.7446/0.7246, ECE/Brier 0.3366/0.3299, GS/RD 0.4078/0.5976, and MMD 7.23/6.30/11.48; it beat det and matched `kd_control` on every listed test metric in this single-seed comparison.
 
 ## 5. Autoresearch campaigns
 
