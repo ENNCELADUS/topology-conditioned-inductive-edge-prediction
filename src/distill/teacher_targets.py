@@ -611,12 +611,6 @@ def _write_context_shard(
     np.savez(path, a_idx=a_idx, b_idx=b_idx, teacher_logit=teacher_logit)
 
 
-def _all_context_shards_present(output: Path, num_shards: int) -> bool:
-    return all(
-        _context_shard_path(output, shard, num_shards).is_file() for shard in range(num_shards)
-    )
-
-
 def _merge_context_shards(
     output: Path, a_idx: NDArray[np.int32], b_idx: NDArray[np.int32], num_shards: int
 ) -> NDArray[np.float32]:
@@ -926,19 +920,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                 teacher_logit=teacher_logit,
             )
             logger.info("wrote context shard %d/%d", shard_index, num_shards)
-            if _all_context_shards_present(args.output, num_shards):
-                logger.info("all %d context shards present; auto-merging", num_shards)
-                _finish_context_merge(
-                    args,
-                    node_ids,
-                    truth_graph,
-                    pair_a_idx,
-                    pair_b_idx,
-                    indexed_banks,
-                    indexed_val_bank,
-                    num_shards,
-                    checkpoint_id_override=checkpoint_id,
-                )
             return
 
         scored = score_rows(
