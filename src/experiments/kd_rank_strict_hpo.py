@@ -175,6 +175,11 @@ def reconcile_running(study: optuna.Study, sweep_dir: Path, rd_band: float) -> N
                     distributions=dict(stale.distributions),
                     values=[outcome.gs, outcome.geo_mmd],
                     user_attrs={"constraint": [outcome.constraint], "surface": outcome.surface},
+                    # "constraints" is where samplers materialize constraints_func
+                    # results; add_trial bypasses after_trial, so without it the
+                    # constrained TPE and best_trials would treat the twin as
+                    # infeasible.
+                    system_attrs={"constraints": [outcome.constraint]},
                 )
         study.tell(stale.number, state=TrialState.FAIL)
         if twin is not None:
@@ -228,7 +233,9 @@ def dump_missing_banks(args: argparse.Namespace) -> None:
     """
     for name in sorted(BANKS):
         spec = BANKS[name]
-        if Path(spec.path).exists():
+        # A partial dump leaves the directory (shards, f0_cache.pt) without the
+        # manifest, which the artifact writer emits last.
+        if (Path(spec.path) / "manifest.json").exists():
             continue
         shards = [
             (

@@ -165,6 +165,7 @@ def test_reconcile_completed_run_is_retold_with_values(tmp_path: Path) -> None:
     assert twins[0].values == pytest.approx([0.80, 0.60])
     assert twins[0].user_attrs["constraint"][0] < 0.0
     assert twins[0].user_attrs["surface"]["selected_epoch"] == 4.0
+    assert [t.number for t in study.best_trials] == [twins[0].number]
 
 
 def test_reconcile_failed_and_vanished_runs_are_failed(tmp_path: Path) -> None:
@@ -184,6 +185,12 @@ def _fabricate_run(config_path: Path) -> None:
     _publish_run(Path(cfg["output_dir"]), make_cadence_rows())
 
 
+def _fabricate_bank(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "manifest.json").write_text("{}", encoding="utf-8")
+    return path
+
+
 def _sweep_args(tmp_path: Path, **overrides: object) -> argparse.Namespace:
     argv = [
         "--teacher-checkpoint",
@@ -200,8 +207,7 @@ def _sweep_args(tmp_path: Path, **overrides: object) -> argparse.Namespace:
 
 def test_run_sweep_completes_n_trials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     for name, spec in list(hpo.BANKS.items()):  # pre-existing banks: no dumps expected
-        bank = tmp_path / Path(spec.path).name
-        bank.mkdir()
+        bank = _fabricate_bank(tmp_path / Path(spec.path).name)
         monkeypatch.setitem(
             hpo.BANKS, name, hpo.BankSpec(spec.rw_step, spec.hops, spec.ns_rate, str(bank))
         )
@@ -231,8 +237,7 @@ def test_run_sweep_marks_failed_run_and_continues(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     for name, spec in list(hpo.BANKS.items()):
-        bank = tmp_path / Path(spec.path).name
-        bank.mkdir()
+        bank = _fabricate_bank(tmp_path / Path(spec.path).name)
         monkeypatch.setitem(
             hpo.BANKS, name, hpo.BankSpec(spec.rw_step, spec.hops, spec.ns_rate, str(bank))
         )
@@ -255,10 +260,11 @@ def test_run_sweep_marks_failed_run_and_continues(
 def test_dump_missing_banks_shards_and_merges(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    existing = tmp_path / "kd_ctx_targets_breadth_first"
-    existing.mkdir()
+    existing = _fabricate_bank(tmp_path / "kd_ctx_targets_breadth_first")
     monkeypatch.setitem(hpo.BANKS, "h2ns1", hpo.BankSpec(3, 2, 1, str(existing)))
-    monkeypatch.setitem(hpo.BANKS, "h2ns3", hpo.BankSpec(3, 2, 3, str(tmp_path / "b_h2ns3")))
+    partial = tmp_path / "b_h2ns3"  # dir exists but no manifest: dump must run
+    partial.mkdir()
+    monkeypatch.setitem(hpo.BANKS, "h2ns3", hpo.BankSpec(3, 2, 3, str(partial)))
     monkeypatch.setitem(hpo.BANKS, "h2ns5", hpo.BankSpec(3, 2, 5, str(existing)))
     monkeypatch.setitem(hpo.BANKS, "h3ns3", hpo.BankSpec(3, 3, 3, str(existing)))
     parallel_calls: list[list[tuple[list[str], dict[str, str]]]] = []
@@ -293,8 +299,7 @@ def test_dump_missing_banks_raises_on_shard_failure(
     monkeypatch.setitem(hpo.BANKS, "h2ns3", hpo.BankSpec(3, 2, 3, str(tmp_path / "missing")))
     for name in ("h2ns1", "h2ns5", "h3ns3"):
         spec = hpo.BANKS[name]
-        existing = tmp_path / f"bank_{name}"
-        existing.mkdir()
+        existing = _fabricate_bank(tmp_path / f"bank_{name}")
         monkeypatch.setitem(
             hpo.BANKS, name, hpo.BankSpec(spec.rw_step, spec.hops, spec.ns_rate, str(existing))
         )
