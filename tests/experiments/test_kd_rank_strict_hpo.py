@@ -9,6 +9,7 @@ from pathlib import Path
 import optuna
 import pytest
 import yaml
+from optuna.trial import TrialState
 from src.autoresearch.metrics_io import RunFailure
 from src.experiments import kd_rank_strict_hpo as hpo
 
@@ -142,3 +143,36 @@ def test_constraints_default_to_infeasible() -> None:
         optuna.trial.create_trial(params={}, distributions={}, values=[0.5, 1.0], user_attrs={})
     )
     assert hpo._constraints(study.get_trials(deepcopy=False)[0]) == (float("inf"),)
+
+
+def _ask_running_trial(study: optuna.Study) -> optuna.Trial:
+    trial = study.ask()
+    hpo.suggest_params(trial)
+    return trial
+
+
+def test_reconcile_completed_run_is_retold_with_values(tmp_path: Path) -> None:
+    study = hpo.build_study(tmp_path / "optuna.db")
+    trial = _ask_running_trial(study)
+    _publish_run(tmp_path / f"trial_{trial.number:03d}", make_cadence_rows())
+    hpo.reconcile_running(study, tmp_path, rd_band=0.05)
+    trials = study.get_trials(deepcopy=False)
+    assert [t.state for t in trials if t.number == trial.number] == [TrialState.FAIL]
+    twins = [t for t in trials if t.state == TrialState.COMPLETE]
+    assert len(twins) == 1
+    assert twins[0].params == dict(hpo.ENQUEUED_PRIORS[0])
+    assert twins[0].values == pytest.approx([0.80, 0.60])
+    assert twins[0].user_attrs["constraint"][0] < 0.0
+    assert twins[0].user_attrs["surface"]["selected_epoch"] == 4.0
+
+
+def test_reconcile_failed_and_vanished_runs_are_failed(tmp_path: Path) -> None:
+    study = hpo.build_study(tmp_path / "optuna.db")
+    failed = _ask_running_trial(study)
+    _publish_run(tmp_path / f"trial_{failed.number:03d}", make_cadence_rows(), failure=True)
+    vanished = _ask_running_trial(study)
+    hpo.reconcile_running(study, tmp_path, rd_band=0.05)
+    states = {t.number: t.state for t in study.get_trials(deepcopy=False)}
+    assert states[failed.number] == TrialState.FAIL
+    assert states[vanished.number] == TrialState.FAIL
+    assert TrialState.COMPLETE not in states.values()

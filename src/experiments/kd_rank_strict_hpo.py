@@ -18,8 +18,9 @@ from pathlib import Path
 
 import optuna
 import yaml
+from optuna.trial import TrialState
 
-from src.autoresearch.metrics_io import RunMetrics, read_run
+from src.autoresearch.metrics_io import RunFailure, RunMetrics, read_run
 from src.distill.config import DistillConfig
 
 
@@ -149,3 +150,29 @@ def suggest_params(trial: optuna.Trial) -> dict[str, object]:
         "bank": str(trial.suggest_categorical("bank", sorted(BANKS))),
         "margin": float(trial.suggest_categorical("margin", [0.05, 0.1, 0.2])),
     }
+
+
+def reconcile_running(study: optuna.Study, sweep_dir: Path, rd_band: float) -> None:
+    """Resolve trials left RUNNING by an interrupted driver.
+
+    The stale trial is always failed; a run that actually completed is
+    re-added as a COMPLETE twin with its real objectives and constraint.
+    """
+    for stale in study.get_trials(deepcopy=False, states=(TrialState.RUNNING,)):
+        run_dir = sweep_dir / f"trial_{stale.number:03d}"
+        twin: optuna.trial.FrozenTrial | None = None
+        if (run_dir / "complete.json").exists():
+            try:
+                outcome = trial_outcome(run_dir, rd_band)
+            except RunFailure:
+                outcome = None
+            if outcome is not None:
+                twin = optuna.trial.create_trial(
+                    params=dict(stale.params),
+                    distributions=dict(stale.distributions),
+                    values=[outcome.gs, outcome.geo_mmd],
+                    user_attrs={"constraint": [outcome.constraint], "surface": outcome.surface},
+                )
+        study.tell(stale.number, state=TrialState.FAIL)
+        if twin is not None:
+            study.add_trial(twin)
