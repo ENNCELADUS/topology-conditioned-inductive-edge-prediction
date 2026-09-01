@@ -863,9 +863,7 @@ def dump_missing_banks(args: argparse.Namespace) -> None:
 
 
 def _n_complete(study: optuna.Study) -> int:
-    return sum(
-        1 for t in study.get_trials(deepcopy=False) if t.state == TrialState.COMPLETE
-    )
+    return len(study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,)))
 
 
 def run_sweep(args: argparse.Namespace) -> None:
