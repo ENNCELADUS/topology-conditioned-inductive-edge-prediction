@@ -205,7 +205,7 @@ CLAUDE.md                        binding constraints for agents (read this first
 docs/
   01-project-definition.md       research definition, plan, hypotheses, and related work
   02-methodology.md              method-selection constraints; no formal design yet
-  03-experiment-protocol.md      run/eval contract: baselines, E1–E7, metrics, gates G1–G5
+  03-experiments.md              paper-style experiment protocol, compared arms, and evidence
   04-model-proposal.md           historical EgoStitch candidate rationale
   05-egostitch-spec.md           retrieval-grounded arm reproduction contract
   results/
@@ -250,7 +250,7 @@ candidate uses that label before selection. Don't substitute real dataset names 
 |---|---|---|
 | 1 | [`docs/01-project-definition.md`](docs/01-project-definition.md) | Fixed endpoint-only task, research plan, and related work |
 | 2 | [`docs/02-methodology.md`](docs/02-methodology.md) | Open design status and method-selection constraints |
-| 3 | [`docs/03-experiment-protocol.md`](docs/03-experiment-protocol.md) | **Source of truth** for evaluation |
+| 3 | [`docs/03-experiments.md`](docs/03-experiments.md) | **Source of truth** for evaluation |
 | 4 | [`docs/04-model-proposal.md`](docs/04-model-proposal.md) | Historical EgoStitch candidate rationale |
 | 5 | [`docs/05-egostitch-spec.md`](docs/05-egostitch-spec.md) | EgoStitch reproduction contract |
 | 6 | [`docs/results/E2-pair-to-topology-gap.md`](docs/results/E2-pair-to-topology-gap.md) | Motivating result |
@@ -269,7 +269,7 @@ assembled-graph metrics** (graph similarity, relative density, degree/clustering
 MMD) *together* — never one family alone. Non-negotiable gates (part of the contribution):
 node-disjoint splits; input exactly `(x_u,x_v)`; retrieval arms disclose support and
 never use target edges/labels; queried edges are masked from topology context. See
-[`docs/03-experiment-protocol.md`](docs/03-experiment-protocol.md) §E5.
+[`docs/03-experiments.md`](docs/03-experiments.md) §1.2.
 
 ## Status & Roadmap
 

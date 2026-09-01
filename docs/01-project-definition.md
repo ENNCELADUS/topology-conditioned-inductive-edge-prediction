@@ -109,7 +109,7 @@ The task requires only a symmetric mapping from $(x_u,x_v)$ to an edge probabili
 topology conditioning remains a hypothesis to test rather than a formal design.
 Method-selection constraints and the requirements for a future formal design are recorded in
 [02-methodology.md](02-methodology.md). The binding evaluation and reporting contract
-is [03-experiment-protocol.md](03-experiment-protocol.md).
+is [03-experiments.md](03-experiments.md).
 
 ## Determine the Method Ceiling with Oracle Topology
 

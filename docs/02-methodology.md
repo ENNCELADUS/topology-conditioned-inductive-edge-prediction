@@ -64,6 +64,6 @@ proposals or diagnostics rather than the project method.
 
 - [01-project-definition.md](01-project-definition.md) defines the research problem,
   hypotheses, and related-work boundaries.
-- [03-experiment-protocol.md](03-experiment-protocol.md) defines evidence classes,
+- [03-experiments.md](03-experiments.md) defines evidence classes,
   evaluation, reporting, and the current experimental record.
 - Historical proposals and implemented comparison arms do not override either document.

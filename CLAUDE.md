@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Research code for an ICLR 2027 paper, *Topology-Conditioned Inductive Edge Prediction*. `README.md`
 orients, `docs/` holds the specs, this file holds the constraints. `01-project-definition` and
-`03-experiment-protocol` govern the task/evaluation; `02-methodology` records open method-selection
+`03-experiments` govern the task/evaluation; `02-methodology` records open method-selection
 constraints. Keep code and its relevant spec aligned.
 
 **Core thesis — do not let it drift:** the strict task input is exactly `(x_u,x_v)` and the output
