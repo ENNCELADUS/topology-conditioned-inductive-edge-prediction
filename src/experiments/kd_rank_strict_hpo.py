@@ -11,12 +11,14 @@ Spec: ``docs/superpowers/specs/2026-09-01-kd-rank-strict-llp-optuna-hpo-design.m
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
+from src.autoresearch.metrics_io import RunMetrics, read_run
 from src.distill.config import DistillConfig
 
 
@@ -69,3 +71,38 @@ def materialize_trial_config(
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
     return config_path
+
+
+@dataclass(frozen=True)
+class TrialOutcome:
+    """Objectives, constraint, and telemetry surface of one completed trial."""
+
+    gs: float
+    geo_mmd: float
+    constraint: float
+    surface: dict[str, float]
+
+
+def trial_outcome(run_dir: Path, rd_band: float) -> TrialOutcome:
+    """Score one run at its cadence-2 selected epoch.
+
+    Raises:
+        RunFailure: If the run wrote ``failure.json``.
+        ValueError: On missing/non-finite metrics or a non-positive MMD ratio.
+    """
+    run: RunMetrics = read_run(run_dir, topology_every=2)
+    topo = run.topology
+    ratios = (topo.degree_mmd, topo.clustering_mmd, topo.spectral_mmd)
+    if any(ratio <= 0.0 for ratio in ratios):
+        raise ValueError(f"{run_dir}: MMD ratios must be positive, got {ratios}")
+    geo_mmd = math.exp(sum(math.log(ratio) for ratio in ratios) / 3.0)
+    surface = {
+        "auprc": run.auprc,
+        "gs": topo.gs,
+        "rd": topo.rd,
+        "degree_mmd": topo.degree_mmd,
+        "clustering_mmd": topo.clustering_mmd,
+        "spectral_mmd": topo.spectral_mmd,
+        "selected_epoch": float(run.selected_epoch),
+    }
+    return TrialOutcome(topo.gs, geo_mmd, abs(math.log(topo.rd)) - rd_band, surface)
