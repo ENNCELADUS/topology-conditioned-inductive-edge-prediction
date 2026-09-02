@@ -71,20 +71,19 @@ full-universe, and PA-null negative-regime controls, which qualify every edge cl
 Topology (five numbers, always reported together, directions in headers): BFS-macro
 graph similarity (GS ↑, edge-set Dice/F1), BFS-macro relative density (RD → 1), and
 degree / clustering / spectral MMD ratios (↓; the denominator is the deterministic
-real-vs-real floor, so ratio 1 is that floor). The MMD ratios and the shape objective
-are never called "graph similarity". Descriptors retain self-loops.
+real-vs-real floor, so ratio 1 is that floor). Descriptors retain self-loops.
 
 ### 1.4 Compared methods
 
 | Arm | KD signal | Teacher | Role |
 |---|---|---|---|
 | control (B0) | none | — | frozen endpoint-only comparator |
-| kd_logit | GLNN-style pointwise soft-target BCE | full-ego oracle | attribution control |
-| kd_rank | LLP-style rank + distribution matching over context banks | full-ego oracle | primary transfer test (RQ2) |
-| kd_rep | pair-representation cosine | PMA(1) bank | representation-matching arm |
-| kd_gram | Gram-matrix relational match | PMA(1) bank | relational-geometry arm |
-| kd_gen | pair-latent generative head | frozen PMA(1) | generative candidate (RQ3); pending |
-| Oracles | observed hidden topology | — | diagnostic ceilings, `formal:false` |
+| kd_logit | GLNN-style pointwise soft-target BCE | PMA(4) Full-Ego Oracle row bank | attribution control |
+| kd_rank | LLP-style rank + distribution matching over context banks | PMA(4) Full-Ego Oracle context bank | primary transfer test (RQ2) |
+| kd_rep | pair-representation cosine | PMA(4) Full-Ego Oracle row bank | representation-matching arm |
+| kd_gram | Gram-matrix relational match | PMA(4) Full-Ego Oracle row bank | relational-geometry arm |
+| kd_gen | pair-latent generative head | PMA(1) Full-Ego Oracle latent bank | generative test (RQ3); det/EDM complete |
+| Oracles | observed hidden topology | — | diagnostic ceilings |
 
 All arms share the identical V3.1 student, data, feature packs, and threshold rule;
 only the KD signal differs. Teachers read hidden topology at training time only, and
@@ -132,41 +131,38 @@ unacceptable edge-metric loss and survive its coupling ablation.
 | kd_rep | — | — | — | — | — |
 | kd_gram | — | — | — | — | — |
 
-**Status.** All rows await fresh runs under the protocol above. The published B0 and
-oracle numbers in §3.1 are legacy pre-v3 evidence and not comparable to the single
-fixed-threshold protocol; the earlier D1--D8 KD results are retired as confounded by
-the removed anchor-context sampler and never enter these tables.
+**Status.** All rows await fresh formal runs under the protocol above. The PMA(1)
+oracle in §3.1 is a current-protocol diagnostic and never enters these formal tables;
+the earlier D1--D8 KD results are retired as confounded by the removed anchor-context
+sampler.
 
 ## 3. Topology headroom and diagnostics
 
 ### 3.1 Oracle ceilings
 
-| Model | Evidence | AUROC | AUPRC | Accuracy | F1 | MCC |
-|---|---|---:|---:|---:|---:|---:|
-| Pairwise baseline | Frozen comparator | 0.7067 | 0.7315 | 0.6083 | 0.3987 | 0.3020 |
-| Token-XAttn Oracle | True-topology diagnostic | 0.8524 | 0.8698 | 0.7713 | 0.7599 | 0.5451 |
-| Full-Ego Pooled Oracle | True-topology diagnostic | 0.9356 | 0.9396 | 0.8521 | 0.8451 | 0.7071 |
+| Model | AUROC | AUPRC | Accuracy | F1 | MCC |
+|---|---:|---:|---:|---:|---:|
+| Pairwise baseline | 0.7067 | 0.7315 | 0.6083 | 0.3987 | 0.3020 |
+| PMA(1) Full-Ego Oracle | 0.9519 | 0.9566 | 0.7783 | 0.7184 | 0.6151 |
 
-| Model | Global GS | Global RD | BFS GS | BFS RD | Degree | Clustering | Spectral |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Pairwise baseline | 0.1365 | 0.9977 | 0.3896 | 0.4223 | 13.08 | 11.93 | 18.09 |
-| Token-XAttn Oracle | 0.3076 | 1.0000 | 0.4886 | 0.7542 | 5.825 | 5.288 | 9.302 |
-| Full-Ego Pooled Oracle | 0.4635 | 1.0000 | 0.5904 | 0.9027 | 5.434 | 5.176 | 11.668 |
+| Model | BFS GS | BFS RD | Degree | Clustering | Spectral |
+|---|---:|---:|---:|---:|---:|
+| Pairwise baseline | 0.3896 | 0.4223 | 13.08 | 11.93 | 18.09 |
+| PMA(1) Full-Ego Oracle | 0.6429 | 0.9955 | 2.667 | 1.875 | 5.207 |
 
-**Finding.** Full-Ego Pooled Oracle gives the strongest edge discrimination and GS
-while matching global density, but its MMD ratios stay far above the real-vs-real floor
-and its spectral ratio is worse than Token-XAttn. Hidden relational topology supplies
-substantial headroom; neither oracle is a formal result or a fair baseline.
+**Finding.** PMA(1) preserves strong edge discrimination and assembled-graph fidelity
+at the fixed `V_val`-selected threshold, but all three MMD ratios remain above the
+real-vs-real floor. Hidden relational topology supplies substantial headroom; this
+truth-consuming oracle is neither a formal result nor a fair baseline.
 
-Identities: the baseline is frozen V3.1 checkpoint `e092537d8cf1e208`
-(`outputs/deliverables/b0_v31_breadth_first_20260711`). **Token-XAttn Oracle**
-(`48f686df9029cf63`) encodes a fixed oracle scaffold with GRIT consumed by token
-cross-attention; **Full-Ego Pooled Oracle** (`926dab5c82beca55`, epoch 2) pools
-variable-length full ego topology inside GRIT. Their optimized evaluation used
-threshold 0.5 and a 30,128-edge global density-controlled assembly — legacy pre-v3
-evidence. Reports: [results/results.html](results/results.html),
-[diagnostic_test_report.json](../outputs/egostitch_e2e_stage1_v3/oracle_grit_xattn_tokens_true_oracle_diagnostic/diagnostic_test_report.json),
-and `outputs/full_ego_oracle_scoring_optimization_20260813/protocol/diagnostic_test_report.json` (H20).
+The Pairwise baseline is the legacy frozen V3.1 checkpoint `e092537d8cf1e208` and is
+retained only as historical context, not as a protocol-matched comparator. **PMA(1)
+Full-Ego Oracle** checkpoint `ea3e3ac37772acb2` (seed 0, selected epoch 9) pools
+variable-length full ego topology inside GRIT with one PMA seed. `test_protocol_v6`
+replays the fixed `V_val` logit threshold 4.4397 on held-out test and calibrates it to
+probability 0.5. Its selected-epoch `V_val` AUPRC/GS/RD was 0.9727/0.7643/0.9980 with
+MMD 16.34/1.88/14.81. Report:
+`outputs/egostitch_e2e_stage1_v3/full_ego_teacher_pma1/diagnostic_test_report.json` (H20).
 
 ### 3.2 Feature-to-topology value (S0, S0-R)
 
