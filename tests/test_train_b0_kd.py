@@ -233,6 +233,10 @@ def _context_stream_ddp_worker(rank: int, world_size: int, init_file: str, resul
         base.weight.register_hook(count_backward)  # type: ignore[no-untyped-call]
         model = DistributedDataParallel(base, broadcast_buffers=False)
         stream = _context_stream(targets, table, rank=rank, world_size=world_size)
+        # Production's task forward runs through the DDP wrapper and arms its
+        # reducer; the context forwards bypass the wrapper.
+        model({"emb_a": table.tokens[:1, None], "emb_b": table.tokens[1:2, None]})
+        base.forward_calls = 0
         losses = [stream.loss(model, epoch=1, step=step, steps=3)[0] for step in range(3)]
         torch.stack(losses).sum().backward()  # type: ignore[no-untyped-call]
         assert base.weight.grad is not None
@@ -241,6 +245,7 @@ def _context_stream_ddp_worker(rank: int, world_size: int, init_file: str, resul
                 "grad": base.weight.grad.detach(),
                 "forward_calls": base.forward_calls,
                 "backward_calls": len(backward_calls),
+                "validation": stream.validation_diagnostics(model),
             },
             Path(result_dir) / f"context-stream-{rank}.pt",
         )
@@ -452,10 +457,12 @@ class _ContextToy(nn.Module):
         self.weight = nn.Parameter(torch.tensor(0.25))
         self.forward_calls = 0
         self.bucket_boundaries: list[int] = []
+        self.batch_sizes: list[int] = []
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         self.forward_calls += 1
         self.bucket_boundaries.append(int(batch["emb_a"].shape[1]))
+        self.batch_sizes.append(int(batch["emb_a"].shape[0]))
         signal = batch["emb_a"][:, 0, 0] - batch["emb_b"][:, 0, 0]
         return {"logits": self.weight * signal}
 
@@ -467,6 +474,7 @@ def _context_stream(
     rank: int = 0,
     world_size: int = 1,
     epochs: int = 2,
+    token_budget: int = 1 << 20,
 ) -> KDContextStream:
     return KDContextStream(
         DistillConfig(targets_path="rows", context_targets_path="contexts", w_rank=1.0, w_dist=1.0),
@@ -477,6 +485,7 @@ def _context_stream(
         epochs=epochs,
         rank=rank,
         world_size=world_size,
+        token_budget=token_budget,
     )
 
 
@@ -513,6 +522,7 @@ def test_context_stream_fails_closed_on_universe_pack_and_vval_drift() -> None:
             epochs=2,
             rank=0,
             world_size=1,
+            token_budget=1 << 20,
         )
 
     short_manifest = replace(table.manifest, nodes=table.manifest.nodes[:-1])
@@ -530,6 +540,7 @@ def test_context_stream_fails_closed_on_universe_pack_and_vval_drift() -> None:
             epochs=2,
             rank=0,
             world_size=1,
+            token_budget=1 << 20,
         )
 
 
@@ -618,10 +629,44 @@ def test_context_stream_spawned_ddp_accumulates_unequal_forwards_then_one_backwa
     torch.stack(reference_losses).sum().backward()  # type: ignore[no-untyped-call]
     assert reference.weight.grad is not None
 
-    assert [result["forward_calls"] for result in observed] == [10, 5]
+    # Checkpointed context forwards recompute once inside the single backward.
+    assert [result["forward_calls"] for result in observed] == [20, 10]
     assert [result["backward_calls"] for result in observed] == [1, 1]
     for result in observed:
         torch.testing.assert_close(result["grad"], reference.weight.grad, atol=1e-6, rtol=1e-6)
+    expected = _context_stream(targets, table).validation_diagnostics(_ContextToy())
+    for result in observed:
+        assert result["validation"] == pytest.approx(expected)
+
+
+def test_context_stream_chunks_every_bucket_to_the_token_budget() -> None:
+    targets, table = _ragged_context_fixture()
+    reference = _ContextToy()
+    reference_loss, _ = _context_stream(targets, table).loss(reference, epoch=1, step=0, steps=1)
+
+    model = _ContextToy()
+    loss, _ = _context_stream(targets, table, token_budget=256).loss(
+        model, epoch=1, step=0, steps=1
+    )
+    # Buckets hold 6/5/3/2 rows at 128/256/384/512 tokens: 2 rows fit at 128,
+    # one row everywhere else (a row never splits, even above the budget).
+    assert model.forward_calls == 13
+    assert all(
+        size * boundary <= max(256, boundary)
+        for size, boundary in zip(model.batch_sizes, model.bucket_boundaries, strict=True)
+    )
+    torch.testing.assert_close(loss, reference_loss)
+
+    validation = _context_stream(targets, table, token_budget=256).validation_diagnostics(model)
+    assert validation == pytest.approx(
+        _context_stream(targets, table).validation_diagnostics(_ContextToy())
+    )
+
+
+def test_context_stream_validation_refuses_sharding_without_a_process_group() -> None:
+    targets, table = _ragged_context_fixture()
+    with pytest.raises(RuntimeError, match="process group"):
+        _context_stream(targets, table, rank=0, world_size=2).validation_diagnostics(_ContextToy())
 
 
 def test_context_stream_telemetry_includes_live_counts_and_ties() -> None:

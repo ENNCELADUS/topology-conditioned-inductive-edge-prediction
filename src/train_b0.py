@@ -49,6 +49,7 @@ import yaml
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import broadcast_object_list, gather_object, set_seed
 from torch.distributed.nn.functional import all_gather as differentiable_all_gather
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, Sampler
 
 from src.data.artifacts import ArtifactVerificationError, Benchmark, load_benchmark
@@ -2818,9 +2819,12 @@ class KDContextStream:
         epochs: int,
         rank: int,
         world_size: int,
+        token_budget: int,
     ) -> None:
         if distill.arm != "kd_rank":
             raise ValueError("KDContextStream requires the active kd_rank arm")
+        if token_budget < 1:
+            raise ValueError(f"KD context token budget must be positive, got {token_budget}")
         if epochs > len(targets.banks):
             raise ValueError(
                 f"training epochs ({epochs}) exceed context banks ({len(targets.banks)})"
@@ -2860,6 +2864,7 @@ class KDContextStream:
         self._table = table
         self._rank = rank
         self._world_size = world_size
+        self._token_budget = token_budget
         self._packed_rows = np.asarray(
             [node_index[node] for node in targets.node_ids], dtype=np.int64
         )
@@ -2938,37 +2943,56 @@ class KDContextStream:
                 )
             buckets[boundary].append(row)
 
+        # The context forward is a second, unbudgeted batch on top of the task
+        # batch: chunk each bucket to the per-rank token budget and checkpoint
+        # every training chunk so one step never holds every chunk's
+        # activations. Chunks bypass the DDP wrapper (the task forward already
+        # armed its reducer) so recompute never re-enters DDP mid-backward.
+        raw_model = _unwrapped_model(model)
         student_parts: list[torch.Tensor] = []
         teacher_parts: list[torch.Tensor] = []
         group_parts: list[torch.Tensor] = []
         for boundary, rows in buckets.items():
-            if not rows:
-                continue
-            anchor = torch.as_tensor(
-                [anchor_rows[row] for row in rows], dtype=torch.int64, device=device
-            )
-            partner = torch.as_tensor(
-                [partner_rows[row] for row in rows], dtype=torch.int64, device=device
-            )
-            emb_a, len_a = self._table.gather_nodes(anchor, boundary)
-            emb_b, len_b = self._table.gather_nodes(partner, boundary)
-            output = cast(
-                dict[str, torch.Tensor],
-                model({"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b}),
-            )
-            logits = output["logits"]
-            if logits.dim() > 1 and logits.size(-1) == 1:
-                logits = logits.squeeze(-1)
-            student_parts.append(logits.float())
-            score_rows = np.asarray([teacher_rows[row] for row in rows], dtype=np.int64)
-            teacher_parts.append(
-                torch.as_tensor(
-                    self._targets.teacher_logit[score_rows], dtype=torch.float32, device=device
+            per_chunk = max(1, self._token_budget // boundary)
+            for start in range(0, len(rows), per_chunk):
+                chunk = rows[start : start + per_chunk]
+                anchor = torch.as_tensor(
+                    [anchor_rows[row] for row in chunk], dtype=torch.int64, device=device
                 )
-            )
-            group_parts.append(
-                torch.as_tensor([groups[row] for row in rows], dtype=torch.int64, device=device)
-            )
+                partner = torch.as_tensor(
+                    [partner_rows[row] for row in chunk], dtype=torch.int64, device=device
+                )
+
+                def forward(anchor: torch.Tensor, partner: torch.Tensor) -> torch.Tensor:
+                    emb_a, len_a = self._table.gather_nodes(anchor, boundary)  # noqa: B023
+                    emb_b, len_b = self._table.gather_nodes(partner, boundary)  # noqa: B023
+                    output = cast(
+                        dict[str, torch.Tensor],
+                        raw_model({"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b}),
+                    )
+                    logits = output["logits"]
+                    if logits.dim() > 1 and logits.size(-1) == 1:
+                        logits = logits.squeeze(-1)
+                    return logits.float()
+
+                if torch.is_grad_enabled():
+                    logits = cast(
+                        torch.Tensor, checkpoint(forward, anchor, partner, use_reentrant=False)
+                    )
+                else:
+                    logits = forward(anchor, partner)
+                student_parts.append(logits)
+                score_rows = np.asarray([teacher_rows[row] for row in chunk], dtype=np.int64)
+                teacher_parts.append(
+                    torch.as_tensor(
+                        self._targets.teacher_logit[score_rows], dtype=torch.float32, device=device
+                    )
+                )
+                group_parts.append(
+                    torch.as_tensor(
+                        [groups[row] for row in chunk], dtype=torch.int64, device=device
+                    )
+                )
         return torch.cat(student_parts), torch.cat(teacher_parts), torch.cat(group_parts)
 
     @staticmethod
@@ -3044,12 +3068,46 @@ class KDContextStream:
             "kd_dist_live_anchors": anchors,
         }
 
+    def _gather_val_rows(self, bank: KDContextBank, local: torch.Tensor) -> torch.Tensor:
+        """Concatenate every rank's stripe of V_val context rows, rank order."""
+        counts = [
+            int(
+                np.diff(bank.anchor_offsets)[
+                    self._anchor_positions(bank, rank=r, steps=1, step=0)
+                ].sum()
+            )
+            for r in range(self._world_size)
+        ]
+        width = max(counts)  # collectives need equal shapes: pad, gather, trim
+        padded = torch.zeros(width, dtype=local.dtype, device=local.device)
+        padded[: local.numel()] = local
+        parts = [torch.empty_like(padded) for _ in counts]
+        dist.all_gather(parts, padded)
+        return torch.cat([part[:n] for part, n in zip(parts, counts, strict=True)])
+
     def validation_diagnostics(self, model: nn.Module) -> dict[str, float]:
-        """Score the fixed V_val context bank without gradients."""
+        """Score the fixed V_val context bank without gradients.
+
+        Anchors are striped across ranks and the rows all-gathered, so every
+        rank returns identical values.
+
+        Raises:
+            RuntimeError: If ``world_size > 1`` without an initialized
+                process group (a partial bank would score silently).
+        """
         bank = self._targets.val_bank
+        every = range(len(bank.anchor_idx))
+        positions = self._anchor_positions(bank, rank=self._rank, steps=1, step=0)
+        if self._world_size > 1 and not (dist.is_available() and dist.is_initialized()):
+            raise RuntimeError("sharded KD context validation needs a process group")
         with torch.no_grad():
-            student, teacher, groups = self._score(model, bank, range(len(bank.anchor_idx)))
-            pair_count, anchor_count = self._live_counts(bank, range(len(bank.anchor_idx)))
+            student, teacher, groups = self._score(model, bank, positions)
+            groups = torch.as_tensor(positions, dtype=torch.int64, device=groups.device)[groups]
+            if self._world_size > 1:
+                student = self._gather_val_rows(bank, student)
+                teacher = self._gather_val_rows(bank, teacher)
+                groups = self._gather_val_rows(bank, groups)
+            pair_count, anchor_count = self._live_counts(bank, every)
             rank = kd_rank_loss(student, teacher, groups, margin=self._distill.margin)
             distribution = kd_dist_loss(student, teacher, groups)
             ties, tie_pairs = self._tie_counts(teacher, groups, self._distill.margin)
@@ -4777,6 +4835,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                 epochs=cfg.optim.epochs,
                 rank=accelerator.process_index,
                 world_size=accelerator.num_processes,
+                token_budget=cfg.data.token_budget,
             )
             kd_val = replace(kd_val, context_stream=kd_context_stream)
         if accelerator.is_main_process:
