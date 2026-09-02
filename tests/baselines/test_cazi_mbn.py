@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import scipy.sparse as sp
 import torch
 from src.baselines.cazi_mbn import CAZIStudent, CAZITeacher
 from src.data.feature_stats import compute_feature_stats
-from src.train_cazi_mbn import _standardize_f0, compute_ugt_projection
+from src.train_cazi_mbn import _standardize_f0, _validation_metrics, compute_ugt_projection
 
 
 def test_teacher_and_student_contracts() -> None:
@@ -83,3 +84,42 @@ def test_sparse_ugt_matches_released_dense_operator_subspace() -> None:
         dense_projection @ dense_projection.T,
         atol=1e-4,
     )
+
+
+def test_validation_metrics_returns_the_bce_both_loops_stop_on() -> None:
+    """`_validation_metrics` third value is the monitored total validation loss.
+
+    Both CAZI loops keep `best_state` on AUROC and count patience on this
+    number, so it has to be the plain validation BCE -- unweighted, and matching
+    a direct torch computation over the same logits.
+    """
+    torch.manual_seed(0)
+    sequence = torch.randn(6, 10)
+    student = CAZIStudent(10, latent_dim=3, network_layers=1)
+    student.eval()
+    nodes = [f"n{i}" for i in range(6)]
+    position = {node: index for index, node in enumerate(nodes)}
+    pairs = [(nodes[i], nodes[(i + 1) % 6]) for i in range(6)]
+    labels = np.array([1, 0, 1, 0, 1, 0], dtype=np.int8)
+
+    auroc, auprc, task_loss = _validation_metrics(
+        student,
+        sequence,
+        pairs,
+        labels,
+        position,
+        batch_size=4,
+        device=torch.device("cpu"),
+    )
+
+    latent = student.node_latent(sequence)
+    u = torch.tensor([position[a] for a, _ in pairs])
+    v = torch.tensor([position[b] for _, b in pairs])
+    with torch.no_grad():
+        logits = student.classifier(latent[u], latent[v]).squeeze(1)
+        expected = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, torch.as_tensor(labels, dtype=logits.dtype)
+        )
+    assert task_loss == pytest.approx(float(expected), rel=1e-6)
+    assert 0.0 <= auroc <= 1.0
+    assert 0.0 <= auprc <= 1.0

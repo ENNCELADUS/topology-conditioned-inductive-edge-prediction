@@ -1103,7 +1103,7 @@ def test_ddp_loop_kd_logit_telemetry_keys(tmp_path: Path) -> None:
         warmup_steps=1,
         artifact_dir=tmp_path / "attempt",
         evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(
-            _constant_metrics(), None, None, 0.5
+            _constant_metrics(), None, {"val_kd_logit_loss": 0.7}, 0.5
         ),
         kd_bank=bank,
     )
@@ -1121,6 +1121,8 @@ def test_ddp_loop_kd_logit_telemetry_keys(tmp_path: Path) -> None:
     ):
         assert key in entry, f"missing telemetry key {key!r} in {sorted(entry)}"
     assert entry["val_task_loss"] == 0.5
+    # The monitored total mirrors the training objective: task + w_logit * KD.
+    assert entry["val_total_loss"] == pytest.approx(0.5 + 1.0 * 0.7)
 
 
 def test_epoch_telemetry_kd_logit_loss_is_unweighted_rows_weighted_mean(tmp_path: Path) -> None:

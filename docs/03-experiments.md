@@ -39,10 +39,10 @@ context, never the prediction target and never generic graph generation.
 without changing its checkpoint or opening new test-dependent choices; a *formal result*
 follows this fixed pre-test protocol and can carry paper claims.
 
-**Model selection.** Training early-stops on val AUPRC (patience 10). The published
-checkpoint is chosen by mean rank over V_val AUPRC plus the five bucket-topology
-metrics (§1.3). There is no eligibility predicate; usability is judged from
-`metrics.jsonl`.
+**Model selection.** Training early-stops on total val loss (patience 10): the val
+task BCE plus each active KD term's val counterpart at its training weight. The
+published checkpoint is chosen independently, by mean rank over V_val AUPRC plus the
+five bucket-topology metrics (§1.3); usability is judged from `metrics.jsonl`.
 
 **Threshold rule.** The single fixed threshold selects on the `V_val` 20--200-node
 sampled-set pair union. Define `D_RD(t)` as the size-bucket macro-average of mean
@@ -226,8 +226,8 @@ implementation difference is reconciled.
 
 ## 5. Analysis
 
-- **Learning curves:** per arm, val AUPRC and the five val topology metrics per epoch
-  from `metrics.jsonl` — the joint-selection trajectory, not loss curves alone.
+- **Learning curves:** per arm, val AUPRC, `val_total_loss` (the stopping signal) and the
+  five val topology metrics per epoch from `metrics.jsonl` — the joint-selection trajectory.
 - **Calibration:** ECE and Brier before/after the calibrating logit shift.
 - **Inference cost:** the student scores a pair from $(x_u,x_v)$ alone — no graph,
   retrieval, or neighbor access at inference — while every teacher requires hidden ego

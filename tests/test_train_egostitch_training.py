@@ -199,7 +199,7 @@ def test_formal_output_metadata_matches_scorer_contract(tmp_path: Path) -> None:
         last_epoch=30,
         last_val_metrics=metrics,
         history=[{"epoch": 10.0, "fidelity": {"topology_delta_ratio": 0.01}}],
-        counterfactual_stop_epoch=None,
+        stop_epoch=None,
         runtime_profile={
             "selected_epoch": 10,
             "epochs_completed": 30,

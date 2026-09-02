@@ -608,11 +608,11 @@ def _validate_worker_profile(
             _positive_int(entry.get(field), field=f"per_epoch.{field}")
         for field in duration_fields:
             _finite_number(entry.get(field), field=f"per_epoch.{field}")
-    counterfactual = data.get("counterfactual_stop_epoch")
-    if counterfactual is not None:
-        stop_epoch = _positive_int(counterfactual, field="counterfactual_stop_epoch")
-        if stop_epoch > expected_epochs:
-            raise ValueError("counterfactual_stop_epoch exceeds configured epochs")
+    reported_stop = data.get("stop_epoch")
+    if reported_stop is not None and (
+        _positive_int(reported_stop, field="stop_epoch") > expected_epochs
+    ):
+        raise ValueError("stop_epoch exceeds configured epochs")
     per_rank = data.get("per_rank")
     if per_rank is not None:
         if not isinstance(per_rank, list) or len(per_rank) != world_size:
@@ -1078,7 +1078,7 @@ def _run_pipeline_unlocked(
                 "runtime_by_rank",
                 "per_epoch_profiles",
                 "evals_without_improvement",
-                "counterfactual_stop_epoch",
+                "stop_epoch",
             }
             if not required_state.issubset(state):
                 raise ValueError("training_state.pt is incomplete")

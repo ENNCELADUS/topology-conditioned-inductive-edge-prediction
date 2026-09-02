@@ -97,6 +97,7 @@ from src.eval.checkpoint_selection import (
     TopologyValidationMetrics,
     select_checkpoint,
 )
+from src.eval.early_stopping import compose_val_total, val_total_terms
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.eval.val_topology import (
     ValTopologyReference,
@@ -232,13 +233,14 @@ class EvalConfig:
     """The ``eval:`` config section.
 
     Attributes:
-        patience: Early stop after this many evals without val-AUPRC improvement.
+        patience: Early stop after this many evals without a lower total
+            validation loss (:func:`~src.eval.early_stopping.compose_val_total`).
         eval_every: Evaluate every N epochs.
         topology_every: Run the V_val topology pass only on epochs divisible by
             N (the final epoch always runs it); classification metrics keep the
             ``eval_every`` cadence.
-        classification_only: Skip topology validation, select the checkpoint by
-            validation AUPRC, and stop when ``patience`` is exhausted.
+        classification_only: Skip topology validation and select the checkpoint
+            by validation AUPRC alone. Patience is unaffected by this flag.
     """
 
     patience: int
@@ -1220,7 +1222,9 @@ class TrainResult:
     """Outcome of a full training run.
 
     Attributes:
-        best_state_dict: CPU state dict of the best-val-AUPRC checkpoint.
+        best_state_dict: CPU state dict of the selected checkpoint (mean rank, or
+            val AUPRC when no topology candidates exist) -- never the patience
+            monitor, which counts on the total validation loss instead.
         best_epoch: Epoch (1-based) of the best checkpoint.
         best_val_metrics: Full val metrics of the best checkpoint.
         last_state_dict: CPU state dict at the end of training.
@@ -1228,10 +1232,9 @@ class TrainResult:
         last_val_metrics: Full val metrics of the final evaluation.
         history: One entry per evaluation: epoch, train_loss, val_auroc, val_auprc.
         stopped_early: Whether early stopping fired before ``optim.epochs``.
-        counterfactual_stop_epoch: Epoch at which patience *would* have stopped the
-            run, recorded without ever stopping it (``None`` on the direct debug
-            single-GPU :func:`train_loop`, which really does stop early). The
-            fixed-epoch DDP loop always trains ``optim.epochs`` epochs.
+        stop_epoch: Epoch at which patience exhausted on the total validation
+            loss and stopped the run; ``None`` when the run reached
+            ``optim.epochs``.
         runtime_profile: Rank-zero timing/coverage payload for the fixed-epoch DDP
             run (empty on the direct debug :func:`train_loop`). Keys are pinned by the
             Task-12 acceptance test.
@@ -1248,7 +1251,7 @@ class TrainResult:
     last_val_metrics: EdgeMetrics
     history: list[dict[str, object]]
     stopped_early: bool
-    counterfactual_stop_epoch: int | None = None
+    stop_epoch: int | None = None
     runtime_profile: dict[str, object] = field(default_factory=dict)
     val_threshold_transfer: ValThresholdTransfer | None = None
 
@@ -1265,12 +1268,31 @@ def _cpu_state_dict(accelerator: Accelerator, model: nn.Module) -> dict[str, tor
 
 
 def _evaluate(
-    model: nn.Module, val_loader: Iterable[Batch], accelerator: Accelerator
-) -> EdgeMetrics:
-    """Compute full edge metrics over the validation loader (model left in train mode)."""
+    model: nn.Module,
+    val_loader: Iterable[Batch],
+    accelerator: Accelerator,
+    *,
+    label_smoothing: float = 0.0,
+) -> ValidationOutcome:
+    """Score the validation loader for edge metrics and the task loss.
+
+    The single-process debug counterpart of :func:`_evaluate_distributed`: same
+    stable float64 sigmoid/BCE, same smoothed labels, no topology or KD terms.
+    The model is left in train mode.
+
+    Args:
+        model: The scorer.
+        val_loader: Validation batches.
+        accelerator: Supplies the device.
+        label_smoothing: Symmetric binary smoothing applied to the labels for
+            `ValidationOutcome.task_loss`, matching the training objective.
+
+    Returns:
+        A `ValidationOutcome` with `topology` and `kd` unset.
+    """
     model.eval()
     labels_parts: list[np.ndarray] = []
-    probs_parts: list[np.ndarray] = []
+    logits_parts: list[np.ndarray] = []
     with torch.no_grad():
         for batch in val_loader:
             batch = _to_device(batch, accelerator.device)
@@ -1278,12 +1300,17 @@ def _evaluate(
             logits = output["logits"]
             if logits.dim() > 1 and logits.size(-1) == 1:
                 logits = logits.squeeze(-1)
-            probs_parts.append(torch.sigmoid(logits).detach().float().cpu().numpy())
+            logits_parts.append(logits.detach().float().cpu().numpy())
             labels_parts.append(batch["label"].detach().float().cpu().numpy())
     model.train()
-    labels = np.concatenate(labels_parts)
-    probs = np.concatenate(probs_parts)
-    return compute_edge_metrics(labels, probs)
+    labels = np.concatenate(labels_parts).astype(np.float64)
+    logits64 = np.concatenate(logits_parts).astype(np.float64)
+    metrics = compute_edge_metrics(labels, _stable_sigmoid(logits64))
+    task_loss: float | None = None
+    if labels.shape[0] > 0:
+        smoothed = labels * (1.0 - label_smoothing) + 0.5 * label_smoothing
+        task_loss = _stable_bce_with_logits(logits64, smoothed)
+    return ValidationOutcome(metrics=metrics, topology=None, task_loss=task_loss)
 
 
 def train_loop(
@@ -1303,9 +1330,10 @@ def train_loop(
     computed by the models themselves when ``label`` is present in the batch.
     Every ``eval_every`` epochs the val set is scored with
     :func:`~src.eval.edge_metrics.compute_edge_metrics` on ``sigmoid(logits)``;
-    the best checkpoint is kept by val AUPRC and training stops early after
-    ``patience`` evals without improvement. A final-epoch eval always runs so at
-    least one checkpoint exists.
+    the best checkpoint is kept by val AUPRC while patience counts separately on
+    the total validation loss (:func:`~src.eval.early_stopping.compose_val_total`)
+    and stops training after ``patience`` evals without a lower total. A
+    final-epoch eval always runs so at least one checkpoint exists.
 
     Args:
         model: The scorer to train (not yet prepared by the accelerator).
@@ -1335,11 +1363,15 @@ def train_loop(
         total_steps=schedule_total_steps,
     )
 
+    val_label_smoothing = float(
+        cast(float, resolve_model_kwargs(cfg.model).get("label_smoothing", 0.0))
+    )
     history: list[dict[str, object]] = []
     best_state: dict[str, torch.Tensor] | None = None
     best_metrics: EdgeMetrics | None = None
     best_epoch = 0
     last_metrics: EdgeMetrics | None = None
+    best_val_total = float("inf")
     evals_without_improvement = 0
     stopped_early = False
     reached_max_steps = False
@@ -1392,7 +1424,8 @@ def train_loop(
         train_loss = float(np.mean(losses)) if losses else float("nan")
         is_final = epoch == cfg.optim.epochs or reached_max_steps
         if epoch % cfg.eval.eval_every == 0 or is_final:
-            metrics = _evaluate(model, val_loader, accelerator)
+            outcome = _evaluate(model, val_loader, accelerator, label_smoothing=val_label_smoothing)
+            metrics = outcome.metrics
             last_metrics = metrics
             entry: dict[str, object] = {
                 "epoch": epoch,
@@ -1400,21 +1433,29 @@ def train_loop(
                 "val_auroc": metrics.auroc,
                 "val_auprc": metrics.auprc,
             }
+            val_total: float | None = None
+            if outcome.task_loss is not None:
+                val_total = compose_val_total(outcome.task_loss, outcome.kd, cfg.distill)
+                entry["val_task_loss"] = outcome.task_loss
+                entry["val_total_loss"] = val_total
             history.append(entry)
             improved = best_metrics is None or metrics.auprc > best_metrics.auprc
             if improved:
                 best_metrics = metrics
                 best_epoch = epoch
                 best_state = _cpu_state_dict(accelerator, model)
+            if val_total is not None and val_total < best_val_total:
+                best_val_total = val_total
                 evals_without_improvement = 0
-            else:
+            elif val_total is not None:
                 evals_without_improvement += 1
             logger.info(
-                "eval epoch %d: train_loss %.4f val_auroc %.4f val_auprc %.4f%s",
+                "eval epoch %d: train_loss %.4f val_auroc %.4f val_auprc %.4f val_total %s%s",
                 epoch,
                 train_loss,
                 metrics.auroc,
                 metrics.auprc,
+                "n/a" if val_total is None else f"{val_total:.4f}",
                 " (new best)" if improved else "",
             )
             if on_eval is not None:
@@ -1422,7 +1463,7 @@ def train_loop(
             if evals_without_improvement >= cfg.eval.patience:
                 stopped_early = True
                 logger.info(
-                    "early stopping at epoch %d (%d evals without val-AUPRC improvement)",
+                    "early stopping at epoch %d (%d evals without val-total-loss improvement)",
                     epoch,
                     evals_without_improvement,
                 )
@@ -3491,11 +3532,13 @@ def train_ddp_loop(
 ) -> TrainResult:
     """Run fixed-epoch E2 DDP training and return rank-consistent metrics.
 
-    Normally trains exactly ``cfg.optim.epochs`` epochs with a validation after
-    every epoch (the V_val topology pass on the ``eval.topology_every`` cadence)
-    and records patience counterfactually. When
-    ``eval.classification_only`` is enabled, patience performs real early stopping
-    and checkpoint selection uses validation AUPRC alone. Tail batches are loss-scaled with
+    Trains up to ``cfg.optim.epochs`` epochs with a validation after every epoch
+    (the V_val topology pass on the ``eval.topology_every`` cadence). Patience
+    counts on the total validation loss
+    (:func:`~src.eval.early_stopping.compose_val_total`) and really stops the run;
+    checkpoint selection stays independent -- the six-criterion mean rank, or
+    validation AUPRC alone when ``eval.classification_only`` skips the topology
+    pass. Tail batches are loss-scaled with
     :func:`scale_ddp_mean_loss`; a non-finite loss on any rank aborts all ranks;
     and every epoch boundary asserts all ranks ran the same number of steps.
     Rank zero persists the completed epoch before the next epoch begins.
@@ -3551,10 +3594,10 @@ def train_ddp_loop(
     history: list[dict[str, object]] = []
     metrics_by_epoch: dict[int, EdgeMetrics] = {}
     topology_by_epoch: dict[int, ValTopologyResult | None] = {}
-    best_auprc: float | None = None
+    best_val_total = float("inf")
     last_metrics: EdgeMetrics | None = None
     evals_without_improvement = 0
-    counterfactual_stop_epoch: int | None = None
+    stop_epoch: int | None = None
     stopped_early = False
     global_step = 0
 
@@ -3668,7 +3711,7 @@ def train_ddp_loop(
         global_step = cast(int, snapshot["global_step"])
         per_epoch_profiles = cast(list[dict[str, object]], snapshot["per_epoch_profiles"])
         evals_without_improvement = cast(int, snapshot["evals_without_improvement"])
-        counterfactual_stop_epoch = cast(int | None, snapshot["counterfactual_stop_epoch"])
+        stop_epoch = cast(int | None, snapshot["stop_epoch"])
         metrics_rows = _run_rank_symmetric(
             accelerator,
             "resume metrics load",
@@ -3727,9 +3770,19 @@ def train_ddp_loop(
             metrics_by_epoch[prior_epoch] = prior_metrics
             topology_by_epoch[prior_epoch] = _topology_from_metrics_row(prior_entry)
         last_metrics = metrics_by_epoch[completed_epoch]
-        best_auprc = max(metrics.auprc for metrics in metrics_by_epoch.values())
+        # The persisted rows are the monitor's only state; an attempt written
+        # before this key existed cannot reach here at all, because its
+        # `training_state.pt` lacks `stop_epoch` and the load above raises.
+        best_val_total = min(
+            (
+                float(cast(float, value))
+                for row in metrics_rows
+                if (value := row.get("val_total_loss")) is not None
+            ),
+            default=float("inf"),
+        )
         start_epoch = completed_epoch + 1
-        if cfg.eval.classification_only and counterfactual_stop_epoch is not None:
+        if stop_epoch is not None:
             stopped_early = True
             start_epoch = cfg.optim.epochs + 1
 
@@ -3992,8 +4045,11 @@ def train_ddp_loop(
             "val_ece": metrics.ece,
             "val_brier": metrics.brier,
         }
+        val_total: float | None = None
         if outcome.task_loss is not None:
+            val_total = compose_val_total(outcome.task_loss, outcome.kd, cfg.distill)
             entry["val_task_loss"] = outcome.task_loss
+            entry["val_total_loss"] = val_total
         if train_kd_loss is not None:
             entry["train_kd_loss"] = train_kd_loss
         entry.update(epoch_kd_telemetry)
@@ -4022,24 +4078,38 @@ def train_ddp_loop(
         history.append(entry)
         metrics_by_epoch[epoch] = metrics
         topology_by_epoch[epoch] = outcome.topology
-        improved = best_auprc is None or metrics.auprc > best_auprc
+        # No monitor value (zero validation rows) leaves patience untouched: a
+        # missing measurement is not evidence of stagnation.
+        improved = val_total is not None and val_total < best_val_total
         if improved:
-            best_auprc = metrics.auprc
+            assert val_total is not None
+            best_val_total = val_total
             evals_without_improvement = 0
-        else:
+        elif val_total is not None:
             evals_without_improvement += 1
-            if evals_without_improvement >= cfg.eval.patience and counterfactual_stop_epoch is None:
-                counterfactual_stop_epoch = epoch
+            # Defer an exhausted patience to the next topology-due epoch: only
+            # those epochs produce a `CheckpointCandidate`, so stopping between
+            # them would hand `select_checkpoint` a candidate set that excludes
+            # the epoch training actually ended on. `classification_only` has no
+            # topology candidates at all, so it stops immediately.
+            if (
+                evals_without_improvement >= cfg.eval.patience
+                and stop_epoch is None
+                and (cfg.eval.classification_only or run_topology)
+            ):
+                stop_epoch = epoch
 
         if accelerator.is_main_process:
             logger.info(
-                "ddp eval epoch %d/%d: train_loss %.4f val_auroc %.4f val_auprc %.4f%s",
+                "ddp eval epoch %d/%d: train_loss %.4f val_auroc %.4f val_auprc %.4f "
+                "val_total %s%s",
                 epoch,
                 cfg.optim.epochs,
                 train_loss,
                 metrics.auroc,
                 metrics.auprc,
-                " (new AUPRC high)" if improved else "",
+                "n/a" if val_total is None else f"{val_total:.4f}",
+                " (new val-total low)" if improved else "",
             )
         per_epoch_profiles.append(
             {
@@ -4108,7 +4178,7 @@ def train_ddp_loop(
                             "epochs_completed": epoch,
                             "validations_completed": epoch,
                             "global_step": global_step,
-                            "counterfactual_stop_epoch": counterfactual_stop_epoch,
+                            "stop_epoch": stop_epoch,
                             "per_epoch": per_epoch_profiles,
                         },
                     )
@@ -4146,7 +4216,7 @@ def train_ddp_loop(
                         "runtime_by_rank": runtime_by_rank,
                         "per_epoch_profiles": per_epoch_profiles,
                         "evals_without_improvement": evals_without_improvement,
-                        "counterfactual_stop_epoch": counterfactual_stop_epoch,
+                        "stop_epoch": stop_epoch,
                     },
                     artifact_dir / "training_state.pt",
                 )
@@ -4155,11 +4225,11 @@ def train_ddp_loop(
         broadcast_object_list(io_error, from_process=0)
         if io_error[0] is not None:
             raise RuntimeError(f"rank-zero epoch artifact write failed: {io_error[0]}")
-        if cfg.eval.classification_only and counterfactual_stop_epoch == epoch:
+        if stop_epoch == epoch:
             stopped_early = True
             if accelerator.is_main_process:
                 logger.info(
-                    "early stopping at epoch %d (%d evals without val-AUPRC improvement)",
+                    "early stopping at epoch %d (%d evals without val-total-loss improvement)",
                     epoch,
                     cfg.eval.patience,
                 )
@@ -4217,7 +4287,7 @@ def train_ddp_loop(
         "training_coverage_exact": True,
         "validation_coverage_exact": True,
         "feature_cache_hit_rate": 1.0,
-        "counterfactual_stop_epoch": counterfactual_stop_epoch,
+        "stop_epoch": stop_epoch,
         "per_rank": per_rank,
         "global_pairs": total_global_pairs,
         "global_pairs_per_second": (
@@ -4326,7 +4396,7 @@ def train_ddp_loop(
         last_val_metrics=last_metrics,
         history=history,
         stopped_early=stopped_early,
-        counterfactual_stop_epoch=counterfactual_stop_epoch,
+        stop_epoch=stop_epoch,
         runtime_profile=runtime_profile,
         val_threshold_transfer=val_threshold_transfer,
     )
@@ -4720,6 +4790,12 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
     val_label_smoothing = float(
         cast(float, resolve_model_kwargs(cfg.model).get("label_smoothing", 0.0))
     )
+    if accelerator.is_main_process:
+        logger.info(
+            "early-stop monitor: val_total_loss = %s (patience %d)",
+            " + ".join(val_total_terms(cfg.distill)),
+            cfg.eval.patience,
+        )
     reference: ValTopologyReference | None = None
     cls_evaluate_fn = cast(
         EvaluateFn,
@@ -4867,10 +4943,10 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         raise RuntimeError(f"rank-zero final artifact write failed: {finalization_error[0]}")
     if accelerator.is_main_process:
         logger.info(
-            "ddp train complete: best epoch %d val AUPRC %.4f (counterfactual_stop_epoch=%s)",
+            "ddp train complete: best epoch %d val AUPRC %.4f (stop_epoch=%s)",
             result.best_epoch,
             result.best_val_metrics.auprc,
-            result.counterfactual_stop_epoch,
+            result.stop_epoch,
         )
 
 

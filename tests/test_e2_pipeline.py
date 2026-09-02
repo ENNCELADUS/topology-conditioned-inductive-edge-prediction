@@ -874,7 +874,7 @@ class TestRunPipelineSuccess:
                 "runtime_by_rank": [{} for _ in range(4)],
                 "per_epoch_profiles": [{}],
                 "evals_without_improvement": 0,
-                "counterfactual_stop_epoch": None,
+                "stop_epoch": None,
             },
             prior / "training_state.pt",
         )
@@ -928,7 +928,7 @@ class TestRunPipelineSuccess:
                 "runtime_by_rank": [{} for _ in range(4)],
                 "per_epoch_profiles": [{}, {}],
                 "evals_without_improvement": 0,
-                "counterfactual_stop_epoch": None,
+                "stop_epoch": None,
             },
             prior / "training_state.pt",
         )

@@ -441,7 +441,7 @@ def _batched_logits(
     return torch.cat(parts)
 
 
-def _validation_auroc(
+def _validation_metrics(
     model: CAZITeacher | CAZIStudent,
     sequence: torch.Tensor,
     pairs: Sequence[tuple[str, str]],
@@ -450,7 +450,15 @@ def _validation_auroc(
     *,
     batch_size: int,
     device: torch.device,
-) -> tuple[float, float]:
+) -> tuple[float, float, float]:
+    """Return ``(auroc, auprc, task_loss)`` over the validation pairs.
+
+    ``task_loss`` is the unweighted validation BCE: the total validation loss
+    both loops count patience on. Neither the teacher's graph terms nor the
+    student's distillation term has a validation counterpart, and the student's
+    ``supervised_weight`` is a positive constant that cannot change a monotone
+    comparison, so the raw BCE is the whole monitored total.
+    """
     u_idx, v_idx = _pair_indices(pairs, position)
     model.eval()
     with torch.no_grad():
@@ -461,8 +469,17 @@ def _validation_auroc(
             v_idx.to(device),
             batch_size=batch_size,
         )
+        task_loss = float(
+            nn.functional.binary_cross_entropy_with_logits(
+                logits, torch.as_tensor(labels, dtype=logits.dtype, device=logits.device)
+            )
+        )
     probs = torch.sigmoid(logits).cpu().numpy()
-    return float(roc_auc_score(labels, probs)), float(average_precision_score(labels, probs))
+    return (
+        float(roc_auc_score(labels, probs)),
+        float(average_precision_score(labels, probs)),
+        task_loss,
+    )
 
 
 def _clone_state(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -504,6 +521,7 @@ def train_teacher(
     )
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=75, gamma=0.75)
     best_auroc = -math.inf
+    best_val_loss = math.inf
     best_state = _clone_state(model)
     patience = 0
     history_path = cfg.output_dir / "teacher_history.jsonl"
@@ -530,7 +548,7 @@ def train_teacher(
             classification_sum += float(loss.detach()) * len(batch)
         optimizer.step()
         scheduler.step()
-        val_auroc, val_auprc = _validation_auroc(
+        val_auroc, val_auprc, val_total_loss = _validation_metrics(
             model,
             sequence,
             data.teacher_val_pairs,
@@ -546,12 +564,21 @@ def train_teacher(
             "classification_loss": classification_sum / len(train_u),
             "val_auroc": val_auroc,
             "val_auprc": val_auprc,
+            "val_total_loss": val_total_loss,
         }
         _write_history(history_path, row)
-        logger.info("teacher epoch=%d val_auroc=%.6f val_auprc=%.6f", epoch, val_auroc, val_auprc)
+        logger.info(
+            "teacher epoch=%d val_auroc=%.6f val_auprc=%.6f val_total=%.6f",
+            epoch,
+            val_auroc,
+            val_auprc,
+            val_total_loss,
+        )
         if val_auroc > best_auroc:
             best_auroc = val_auroc
             best_state = _clone_state(model)
+        if val_total_loss < best_val_loss:
+            best_val_loss = val_total_loss
             patience = 0
         else:
             patience += 1
@@ -594,6 +621,7 @@ def train_student(
     )
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.95)
     best_auroc = -math.inf
+    best_val_loss = math.inf
     best_state = _clone_state(model)
     patience = 0
     history_path = cfg.output_dir / "student_history.jsonl"
@@ -624,7 +652,7 @@ def train_student(
         total_loss.backward()  # type: ignore[no-untyped-call]
         optimizer.step()
         scheduler.step()
-        val_auroc, val_auprc = _validation_auroc(
+        val_auroc, val_auprc, val_total_loss = _validation_metrics(
             model,
             student_val_sequence,
             data.student_val_pairs,
@@ -639,12 +667,21 @@ def train_student(
             "classification_loss": float(classification_loss.detach()),
             "val_auroc": val_auroc,
             "val_auprc": val_auprc,
+            "val_total_loss": val_total_loss,
         }
         _write_history(history_path, row)
-        logger.info("student epoch=%d val_auroc=%.6f val_auprc=%.6f", epoch, val_auroc, val_auprc)
+        logger.info(
+            "student epoch=%d val_auroc=%.6f val_auprc=%.6f val_total=%.6f",
+            epoch,
+            val_auroc,
+            val_auprc,
+            val_total_loss,
+        )
         if val_auroc > best_auroc:
             best_auroc = val_auroc
             best_state = _clone_state(model)
+        if val_total_loss < best_val_loss:
+            best_val_loss = val_total_loss
             patience = 0
         else:
             patience += 1

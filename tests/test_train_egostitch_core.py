@@ -78,7 +78,7 @@ def _stub_result(*, selected_epoch: int | None = 1) -> te.EgoTrainResult:
                 "gradient_norm_probes": [],
             }
         ],
-        counterfactual_stop_epoch=None,
+        stop_epoch=None,
         runtime_profile={
             "gradient_norm_series": [],
             "optimizer_step_gradients": [],

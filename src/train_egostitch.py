@@ -112,6 +112,7 @@ from src.train_b0 import (
     _as_str_list,
     _check_no_unknown_keys,
     _require,
+    _stable_bce_with_logits,
     _state_digest,
     _write_json_rank_zero,
     validate_gathered_validation,
@@ -203,7 +204,8 @@ class EgoOptimConfig:
     Attributes:
         lr: AdamW learning rate (post-warmup constant).
         weight_decay: AdamW weight decay.
-        epochs: Fixed epoch count (counterfactual early stop is bookkeeping).
+        epochs: Maximum epoch count; patience on the total validation loss may
+            stop the run earlier.
         warmup_steps: Linear LR warmup steps.
         grad_clip: Gradient-norm clip; 0 disables.
         gradient_accumulation_steps: Physical microbatches per optimizer step.
@@ -3538,6 +3540,7 @@ def _enforce_probe_s1_scale(s1_abs_mean: float, limit: float) -> None:
 class _ValidationResult:
     metrics: EdgeMetrics
     fidelity: dict[str, float]
+    task_loss: float = float("nan")
     scale_telemetry: dict[str, float] = field(default_factory=dict)
     timing: dict[str, float] = field(default_factory=dict)
     topology_scope: Literal["cascade", "full"] = "full"
@@ -4191,6 +4194,7 @@ def _validate_epoch(
     return _ValidationResult(
         metrics=active_metrics,
         fidelity=fidelity,
+        task_loss=_stable_bce_with_logits(logits_np, data.val_labels.astype(np.float64)),
         scale_telemetry=scale_telemetry,
         timing={
             "node_cache_encode_seconds": node_cache_seconds,
@@ -4217,7 +4221,7 @@ class EgoTrainResult:
     last_epoch: int
     last_val_metrics: EdgeMetrics
     history: list[dict[str, object]]
-    counterfactual_stop_epoch: int | None
+    stop_epoch: int | None
     runtime_profile: dict[str, object]
     kendall_state: dict[str, object]
 
@@ -5059,8 +5063,6 @@ def _train_e2e_stability_loop(
         production_epoch_step_counts[:1] if profile_only else production_epoch_step_counts
     )
     schedule_total_steps = steps_per_epoch * cfg.optim.epochs
-    executed_steps = sum(epoch_step_counts)
-    executed_microbatches = microsteps_per_epoch * len(epoch_step_counts)
     phase_a_end, phase_b_end = e2e_phase_boundaries(
         schedule_total_steps,
         phase_a_fraction=training.phase_a_fraction,
@@ -5095,6 +5097,11 @@ def _train_e2e_stability_loop(
 
     warm_reference_std: float | None = None
     warm_reference_auprc: float | None = None
+    # EgoStitch scores no validation counterpart for its recon/real/ssl terms,
+    # so the monitored total validation loss is the edge BCE alone.
+    best_val_total = float("inf")
+    evals_without_improvement = 0
+    stop_epoch: int | None = None
     collapse_streak = 0
     slot_collapse_guard = E2ESlotCollapseGuard()
     last_metrics: EdgeMetrics | None = None
@@ -5128,6 +5135,7 @@ def _train_e2e_stability_loop(
     prefetch_depth = cfg.runtime.prefetch_factor if cfg.runtime is not None else 1
     full_topology_validations = 0
     cascade_topology_validations = 0
+    completed_epochs = len(epoch_step_counts)
 
     for epoch, epoch_steps in enumerate(epoch_step_counts, start=1):
         epoch_started = time.monotonic()
@@ -5588,6 +5596,11 @@ def _train_e2e_stability_loop(
             fidelity = validation.fidelity
             last_metrics = metrics
             last_fidelity = fidelity
+            if validation.task_loss < best_val_total:
+                best_val_total = validation.task_loss
+                evals_without_improvement = 0
+            else:
+                evals_without_improvement += 1
             full_joint_epochs = max(0, epoch - first_eligible_epoch + 1)
             validation_quality_values = {
                 "auprc": metrics.auprc,
@@ -5717,6 +5730,8 @@ def _train_e2e_stability_loop(
                     "phase": phase.phase,
                     "auroc": metrics.auroc,
                     "auprc": metrics.auprc,
+                    "val_task_loss": validation.task_loss,
+                    "val_total_loss": validation.task_loss,
                     "topology_validation_scope": topology_scope,
                     "lr": float(optimizer.param_groups[0]["lr"]),
                     "fidelity": fidelity,
@@ -5769,7 +5784,38 @@ def _train_e2e_stability_loop(
         total_validation_seconds += validation_seconds
         for name in total_validation_timing:
             total_validation_timing[name] += epoch_validation_timing[name]
+        # Patience lives on the main rank (only it holds the gathered metrics),
+        # so the decision is reduced before any rank leaves the loop -- a
+        # rank-local break would deadlock the survivors in the next collective.
+        # The stop is deferred to the next full-topology epoch (`topology_scope`
+        # is a pure function of the epoch, identical on every rank): only those
+        # epochs produce `E2ECheckpointRecord`s, and stopping on a cascade epoch
+        # would drop selection into the `telemetry_miss_last_epoch` fallback
+        # instead of the six-criterion mean rank.
+        stop_now = accelerator.reduce(
+            torch.tensor(
+                int(
+                    topology_scope == "full"
+                    and accelerator.is_main_process
+                    and evals_without_improvement >= cfg.eval.patience
+                ),
+                device=accelerator.device,
+            ),
+            reduction="sum",
+        )
+        if int(stop_now.item()) > 0:
+            stop_epoch = epoch
+            completed_epochs = epoch
+            logger.info(
+                "egostitch early stopping at epoch %d (%d evals without "
+                "val-total-loss improvement)",
+                epoch,
+                cfg.eval.patience,
+            )
+            break
 
+    executed_steps = sum(epoch_step_counts[:completed_epochs])
+    executed_microbatches = microsteps_per_epoch * completed_epochs
     if global_step != executed_steps:
         raise RuntimeError(f"E2E execution coverage broken: {global_step} != {executed_steps}")
     last_state = _cpu_state_dict(accelerator, wrapped) if accelerator.is_main_process else {}
@@ -5779,7 +5825,7 @@ def _train_e2e_stability_loop(
     if accelerator.is_main_process:
         assert last_metrics is not None and last_fidelity is not None
         if profile_only:
-            selected_epoch_local = len(epoch_step_counts)
+            selected_epoch_local = completed_epochs
             best_state = last_state
             best_metrics = last_metrics
         else:
@@ -5800,7 +5846,7 @@ def _train_e2e_stability_loop(
     diagnostic_epoch: int | None = None
     if selected_epoch <= 0:
         selection_status = "telemetry_miss_last_epoch"
-        diagnostic_epoch = len(epoch_step_counts)
+        diagnostic_epoch = completed_epochs
         if accelerator.is_main_process:
             best_state = last_state
             best_metrics = last_metrics
@@ -5919,8 +5965,8 @@ def _train_e2e_stability_loop(
     global_pairs = int(sum(int(cast(int, entry["global_pairs"])) for entry in per_epoch_profiles))
     global_tokens = int(sum(float(row[1]) for row in rank_stats))
     runtime_profile: dict[str, object] = {
-        "epochs_completed": len(epoch_step_counts),
-        "validations_completed": len(epoch_step_counts),
+        "epochs_completed": completed_epochs,
+        "validations_completed": completed_epochs,
         "full_topology_validations_completed": full_topology_validations,
         "cascade_topology_validations_completed": cascade_topology_validations,
         "val_region_validation_event_count": len(validation_events),
@@ -5932,7 +5978,7 @@ def _train_e2e_stability_loop(
         "training_coverage_exact": True,
         "validation_coverage_exact": True,
         "feature_cache_hit_rate": 1.0,
-        "counterfactual_stop_epoch": None,
+        "stop_epoch": stop_epoch,
         "per_rank": [
             {
                 "rank": index,
@@ -6015,10 +6061,10 @@ def _train_e2e_stability_loop(
         best_epoch=result_epoch,
         best_val_metrics=best_metrics,
         last_state_dict=last_state,
-        last_epoch=len(epoch_step_counts),
+        last_epoch=completed_epochs,
         last_val_metrics=last_metrics,
         history=history,
-        counterfactual_stop_epoch=None,
+        stop_epoch=stop_epoch,
         runtime_profile=runtime_profile,
         kendall_state={"active": False, "activated_step": None, "log_variances": {}},
     )
@@ -6615,10 +6661,10 @@ def _run_ddp_dispatch(
         write_outputs(result, cfg, data, debug=args.max_steps is not None)
     _write_json_rank_zero(accelerator, profile_output, result.runtime_profile)
     logger.info(
-        "egostitch ddp train complete: best epoch %d val AUPRC %.4f (counterfactual_stop_epoch=%s)",
+        "egostitch ddp train complete: best epoch %d val AUPRC %.4f (stop_epoch=%s)",
         result.best_epoch,
         result.best_val_metrics.auprc,
-        result.counterfactual_stop_epoch,
+        result.stop_epoch,
     )
 
 

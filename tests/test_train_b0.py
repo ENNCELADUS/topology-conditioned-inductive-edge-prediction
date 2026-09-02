@@ -600,7 +600,14 @@ class TestTrainLoopSyntheticPairMlp:
         result = train_loop(model, lambda epoch: [train_batch], [val_batch], cfg, accelerator)
 
         for entry in result.history:
-            assert set(entry.keys()) == {"epoch", "train_loss", "val_auroc", "val_auprc"}
+            assert set(entry.keys()) == {
+                "epoch",
+                "train_loss",
+                "val_auroc",
+                "val_auprc",
+                "val_task_loss",
+                "val_total_loss",
+            }
 
     def test_checkpoint_save_reload_reproduces_logits_exactly(self) -> None:
         torch.manual_seed(0)
@@ -1980,7 +1987,8 @@ def test_topology_from_metrics_row_rejects_legacy_full_universe_threshold() -> N
     assert _topology_from_metrics_row(row) is None
 
 
-def test_ddp_loop_records_counterfactual_stop_but_runs_all_epochs(tmp_path: Path) -> None:
+def test_ddp_loop_topology_path_really_stops_on_val_total_loss(tmp_path: Path) -> None:
+    """The topology path stops for real; patience is no longer counterfactual."""
     config_path = tmp_path / "cfg.yaml"
     _write_yaml_config(config_path, {"optim.epochs": 4, "eval.patience": 1})
     cfg = load_config(config_path)
@@ -1991,7 +1999,7 @@ def test_ddp_loop_records_counterfactual_stop_but_runs_all_epochs(tmp_path: Path
     batch["_row_id"] = torch.arange(8)
 
     def factory(epoch: int) -> list[dict[str, torch.Tensor]]:
-        assert 1 <= epoch <= 4
+        assert 1 <= epoch <= 2
         return [batch]
 
     metrics = EdgeMetrics(
@@ -2010,6 +2018,7 @@ def test_ddp_loop_records_counterfactual_stop_but_runs_all_epochs(tmp_path: Path
         n_pos=4,
         n_neg=4,
     )
+    losses = iter((0.3, 0.4, 0.5, 0.6))
     result = train_ddp_loop(
         model,
         factory,
@@ -2019,17 +2028,18 @@ def test_ddp_loop_records_counterfactual_stop_but_runs_all_epochs(tmp_path: Path
         warmup_steps=1,
         artifact_dir=tmp_path / "attempt",
         profile_output=tmp_path / "attempt" / "worker_profile.json",
-        evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(metrics, None),
+        evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(
+            metrics, None, task_loss=next(losses)
+        ),
     )
-    assert result.last_epoch == 4
-    assert result.stopped_early is False
-    assert result.counterfactual_stop_epoch == 2
+    assert result.last_epoch == 2
+    assert result.stopped_early is True
+    assert result.stop_epoch == 2
     # Count epochs that actually executed (one history entry and one per-epoch
-    # profile per epoch), not the returned last_epoch constant: a hypothetical
-    # early break under fired patience must fail these.
-    assert len(result.history) == 4
-    assert [entry["epoch"] for entry in result.history] == [1, 2, 3, 4]
-    assert len(cast(list[object], result.runtime_profile["per_epoch"])) == 4
+    # profile per epoch), not the returned last_epoch constant.
+    assert len(result.history) == 2
+    assert [entry["epoch"] for entry in result.history] == [1, 2]
+    assert len(cast(list[object], result.runtime_profile["per_epoch"])) == 2
 
 
 def test_topology_due_gates_epochs_and_forces_final() -> None:
@@ -2041,6 +2051,70 @@ def test_topology_due_gates_epochs_and_forces_final() -> None:
     assert due == [2, 4, 5]
     assert _topology_due(3, epochs=5, topology_every=1, classification_only=False)
     assert not _topology_due(4, epochs=5, topology_every=2, classification_only=True)
+
+
+def test_ddp_loop_defers_the_stop_to_the_next_topology_due_epoch(tmp_path: Path) -> None:
+    """An exhausted patience waits for a topology epoch, so the selector keeps it.
+
+    With ``topology_every: 2`` and ``patience: 1`` the loss falls through epoch 2
+    and then rises, so patience is exhausted at epoch 3 -- a cls-only epoch that
+    produces no `CheckpointCandidate`. Stopping there would end training on an
+    epoch the selector cannot see, so the break waits for epoch 4.
+    """
+    config_path = tmp_path / "cfg.yaml"
+    _write_yaml_config(
+        config_path, {"optim.epochs": 6, "eval.patience": 1, "eval.topology_every": 2}
+    )
+    cfg = load_config(config_path)
+    batch = _loss_batch(1.0, [0, 1, 2, 3])
+    losses = {1: 0.10, 2: 0.05, 3: 0.30, 4: 0.40}
+    epoch_seen = 0
+
+    def next_epoch() -> int:
+        nonlocal epoch_seen
+        epoch_seen += 1
+        return epoch_seen
+
+    def evaluate_topology(
+        model: nn.Module, loader: Iterable[dict[str, torch.Tensor]], accelerator: Accelerator
+    ) -> ValidationOutcome:
+        epoch = next_epoch()
+        return ValidationOutcome(
+            _constant_metrics(),
+            ValTopologyResult(
+                metrics=TopologyValidationMetrics(
+                    gs=0.5, rd=1.0, degree_mmd=0.1, clustering_mmd=0.1, spectral_mmd=0.1
+                ),
+                threshold=0.3,
+            ),
+            None,
+            losses[epoch],
+        )
+
+    def evaluate_cls(
+        model: nn.Module, loader: Iterable[dict[str, torch.Tensor]], accelerator: Accelerator
+    ) -> ValidationOutcome:
+        epoch = next_epoch()
+        return ValidationOutcome(_constant_metrics(), None, None, losses[epoch])
+
+    result = train_ddp_loop(
+        _StochasticLossModel(),
+        lambda epoch: [batch],
+        [batch],
+        cfg,
+        Accelerator(cpu=True),
+        warmup_steps=1,
+        artifact_dir=tmp_path / "attempt",
+        evaluate_fn=evaluate_topology,
+        evaluate_cls_fn=evaluate_cls,
+        require_topology=True,
+    )
+
+    assert result.stop_epoch == 4
+    assert result.stopped_early is True
+    assert [entry["epoch"] for entry in result.history] == [1, 2, 3, 4]
+    # The stop epoch carries a topology pass, so it is a selection candidate.
+    assert result.best_epoch in {2, 4}
 
 
 def test_ddp_loop_topology_every_skips_rows_and_selects_topology_epochs(tmp_path: Path) -> None:
@@ -2116,7 +2190,14 @@ def test_ddp_loop_topology_every_skips_rows_and_selects_topology_epochs(tmp_path
     assert result.best_epoch == 4
 
 
-def test_classification_only_ddp_loop_stops_and_selects_by_auprc(tmp_path: Path) -> None:
+def test_classification_only_ddp_loop_stops_on_loss_and_selects_by_auprc(tmp_path: Path) -> None:
+    """Patience counts on val_total_loss; the published epoch is still the AUPRC argmax.
+
+    AUPRC rises every epoch while the loss rises after epoch 1, so a monitor that
+    had not been swapped would run the full schedule. The selected epoch is the
+    best AUPRC *among the epochs that ran*, which is not the epoch that set the
+    loss low-water mark.
+    """
     config_path = tmp_path / "cfg.yaml"
     _write_yaml_config(
         config_path,
@@ -2132,14 +2213,17 @@ def test_classification_only_ddp_loop_stops_and_selects_by_auprc(tmp_path: Path)
     batch["_local_pair_count"] = torch.tensor(8)
     batch["_global_pair_count"] = torch.tensor(8)
     batch["_row_id"] = torch.arange(8)
-    evaluations = iter((0.6, 0.6, 0.9, 1.0))
+    evaluations = iter(((0.6, 0.30), (0.7, 0.40), (0.9, 0.20), (1.0, 0.10)))
 
     def evaluate(
         model: nn.Module,
         loader: Iterable[dict[str, torch.Tensor]],
         accelerator: Accelerator,
     ) -> ValidationOutcome:
-        return ValidationOutcome(replace(_constant_metrics(), auprc=next(evaluations)), None)
+        auprc, task_loss = next(evaluations)
+        return ValidationOutcome(
+            replace(_constant_metrics(), auprc=auprc), None, task_loss=task_loss
+        )
 
     result = train_ddp_loop(
         model,
@@ -2154,11 +2238,50 @@ def test_classification_only_ddp_loop_stops_and_selects_by_auprc(tmp_path: Path)
 
     assert result.stopped_early is True
     assert result.last_epoch == 2
-    assert result.best_epoch == 1
-    assert result.counterfactual_stop_epoch == 2
+    assert result.best_epoch == 2
+    assert result.stop_epoch == 2
     assert [entry["epoch"] for entry in result.history] == [1, 2]
+    assert [entry["val_total_loss"] for entry in result.history] == [0.30, 0.40]
     assert result.runtime_profile["epochs_completed"] == 2
     assert result.runtime_profile["stopped_early"] is True
+
+
+def test_ddp_loop_keeps_training_while_loss_falls_and_auprc_is_flat(tmp_path: Path) -> None:
+    """A flat AUPRC no longer exhausts patience -- only a non-falling loss does."""
+    config_path = tmp_path / "cfg.yaml"
+    _write_yaml_config(
+        config_path,
+        {"optim.epochs": 4, "eval.patience": 1, "eval.classification_only": True},
+    )
+    cfg = load_config(config_path)
+    model = _TinyPairMLP(input_dim=4, hidden_dims=(8,), dropout=0.0)
+    batch = _batch_of(_make_synthetic_pair_dataset(8))
+    batch["_local_pair_count"] = torch.tensor(8)
+    batch["_global_pair_count"] = torch.tensor(8)
+    batch["_row_id"] = torch.arange(8)
+    losses = iter((0.4, 0.3, 0.2, 0.1))
+
+    def evaluate(
+        model: nn.Module,
+        loader: Iterable[dict[str, torch.Tensor]],
+        accelerator: Accelerator,
+    ) -> ValidationOutcome:
+        return ValidationOutcome(_constant_metrics(), None, task_loss=next(losses))
+
+    result = train_ddp_loop(
+        model,
+        lambda epoch: [batch],
+        [batch],
+        cfg,
+        Accelerator(),
+        warmup_steps=1,
+        artifact_dir=tmp_path / "attempt",
+        evaluate_fn=evaluate,
+    )
+
+    assert result.stopped_early is False
+    assert result.stop_epoch is None
+    assert [entry["epoch"] for entry in result.history] == [1, 2, 3, 4]
 
 
 def test_ddp_loop_require_topology_raises_when_an_epoch_has_no_topology(tmp_path: Path) -> None:
@@ -2387,7 +2510,7 @@ def test_ddp_loop_runtime_profile_has_task12_keys(tmp_path: Path) -> None:
         "validation_coverage_exact",
         "feature_cache_hit_rate",
         "per_epoch",
-        "counterfactual_stop_epoch",
+        "stop_epoch",
         "per_rank",
         "global_pairs_per_second",
         "global_tokens",
@@ -2586,6 +2709,71 @@ def test_ddp_loop_resume_matches_uninterrupted_epoch_boundary(tmp_path: Path) ->
     )
     assert [row["epoch"] for row in finalization_only.history] == [1, 2, 3, 4]
     assert finalization_only.best_epoch == uninterrupted.best_epoch
+
+
+def test_ddp_loop_resume_restores_the_val_total_loss_low_water_mark(tmp_path: Path) -> None:
+    """Patience must not reset across a resume.
+
+    The prior attempt sets the low-water mark at epoch 1 (0.10) and burns one
+    patience unit at epoch 2 (0.50). The resumed attempt sees a loss that is
+    lower than epoch 2's but still above the mark, so it must burn the second
+    unit and stop at epoch 3 -- a monitor that came back as ``+inf`` would call
+    epoch 3 an improvement and run the full schedule instead.
+    """
+    config_path = tmp_path / "cfg.yaml"
+    _write_yaml_config(
+        config_path,
+        {"optim.epochs": 4, "eval.patience": 2, "eval.classification_only": True},
+    )
+    cfg = load_config(config_path)
+    batch = _loss_batch(1.0, [0, 1, 2, 3])
+    prior_dir = tmp_path / "prior"
+    prior_losses = iter((0.10, 0.50, 0.20))
+
+    def fail_after_two(
+        model: nn.Module, loader: Iterable[dict[str, torch.Tensor]], accelerator: Accelerator
+    ) -> ValidationOutcome:
+        task_loss = next(prior_losses)
+        if task_loss == 0.20:
+            raise RuntimeError("interrupted after two epochs")
+        return ValidationOutcome(_constant_metrics(), None, task_loss=task_loss)
+
+    with pytest.raises(RuntimeError, match="interrupted after two epochs"):
+        train_ddp_loop(
+            _StochasticLossModel(),
+            lambda epoch: [batch],
+            [batch],
+            cfg,
+            Accelerator(),
+            warmup_steps=1,
+            artifact_dir=prior_dir,
+            evaluate_fn=fail_after_two,
+        )
+
+    resumed_dir = tmp_path / "resumed"
+    (resumed_dir / "checkpoints").mkdir(parents=True)
+    shutil.copy2(prior_dir / "metrics.jsonl", resumed_dir / "metrics.jsonl")
+    for candidate in (prior_dir / "checkpoints").glob("epoch-*.pt"):
+        shutil.copy2(candidate, resumed_dir / "checkpoints" / candidate.name)
+
+    resumed = train_ddp_loop(
+        _StochasticLossModel(),
+        lambda epoch: [batch],
+        [batch],
+        cfg,
+        Accelerator(),
+        warmup_steps=1,
+        artifact_dir=resumed_dir,
+        resume_attempt=prior_dir,
+        evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(
+            _constant_metrics(), None, task_loss=0.20
+        ),
+    )
+
+    assert [row["epoch"] for row in resumed.history] == [1, 2, 3]
+    assert [row["val_total_loss"] for row in resumed.history] == [0.10, 0.50, 0.20]
+    assert resumed.stopped_early is True
+    assert resumed.stop_epoch == 3
 
 
 def test_ddp_loop_resume_round_trips_threshold_transfer_fields(tmp_path: Path) -> None:
