@@ -33,7 +33,7 @@ better).
 | `kd_control` | label BCE on the KD rows (`w_label=1`) | matched sampler/capacity control; no teacher signal |
 | D1 | BCE to `sigmoid(teacher_logit)` (`w_logit=1`) | pointwise soft-logit KD (GLNN family) |
 | D2 | within-anchor margin rank + `KL(softmax(T)||softmax(S))`, T=1 (`w_rank=w_dist=1`) | LLP listwise partner ordering/distribution |
-| D3 | cosine-Gram match of student pair factors to teacher pooled embeddings (`w_gram=1`) | pair-space relational geometry (Graph2Feat/CAZI family) |
+| D3 | cosine-Gram match of student pair factors to teacher pooled embeddings (`w_gram=1`) | pair-space relational geometry (SPKD-style, Tung & Mori ICCV 2019; cosine-normalized variant) |
 | D4 | `1-cos(P(z_a*z_b), 0.5(t_ab+t_ba))` (`w_align=1`) | projected representation alignment; projection is train-only |
 | D5 | Huber on student node-factor residual vs `teacher_logit-content_logit` (`w_residual=1`) | beyond-content topology-residual distillation |
 | D6 | D2 + D3 (`w_rank=w_dist=w_gram=1`) | additivity/interference between listwise and Gram KD |

@@ -4,9 +4,9 @@ The active PDF library lives under `literature/models/`. Filenames use
 `year_venue_arxiv_<id>_title.pdf` when an arXiv ID is known and
 `year_venue_title.pdf` otherwise.
 
-- Active PDFs: 115
+- Active PDFs: 116
 - PDFs with arXiv IDs in filenames: 112
-- PDFs without confirmed arXiv IDs: 3
+- PDFs without confirmed arXiv IDs: 4
 
 ## Folder map
 

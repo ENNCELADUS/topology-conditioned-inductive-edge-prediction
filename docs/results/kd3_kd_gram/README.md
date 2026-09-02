@@ -14,7 +14,7 @@ V3.1 student still receives exactly `(x_u, x_v)` at inference.
 L_total = L_task + 1.0 · L_gram
 ```
 
-`L_task` is smoothed-label BCE and `L_gram` is cosine-Gram MSE. All other KD weights are zero.
+`L_task` is smoothed-label BCE and `L_gram` is cosine-Gram MSE (similarity-preserving KD, Tung & Mori ICCV 2019, with feature-cosine instead of row normalization). All other KD weights are zero.
 
 ## Learning and validation-topology curves
 

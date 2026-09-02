@@ -128,7 +128,7 @@ def kd_gram_loss(
     *,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """D3 cosine-Gram matching across every distinct pair of task rows.
+    """SPKD-style (Tung & Mori 2019) cosine-Gram matching across every distinct pair of task rows.
 
     Rows sharing an endpoint remain eligible. A batch with fewer than two
     rows returns a differentiable zero.
