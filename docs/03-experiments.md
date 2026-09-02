@@ -123,9 +123,47 @@ frozen V_val-selected threshold) are reported together.
 
 ## 4. Analysis
 
-**Learning curves.** Completed seed-0 HPO-winner `V_val`。
+**Learning curves.** Completed seed-0 HPO-winner `V_val` surfaces (not held-out); the dotted marker is the selected epoch.
+
+Each arm was audited line-by-line against its reference on 2026-09-02 (row join, DDP gather and
+scaling, precision, teacher scoring); no engineering error was found, so the per-arm readings below
+describe the objectives and the teacher, not reproduction. Single-seed V_val GS deltas between arms
+(+0.018 to +0.059 over control) lie within plausible seed noise; only KD1 has a held-out row.
 
 **KD1 `kd_logit_w100` (selected epoch 25)** ![KD1 loss curves](results/kd1_kd_logit/learning_curves.png) ![KD1 V_val topology curves](results/kd1_kd_logit/validation_topology_curves.png)
+Faithful to GLNN (Zhang et al. ICLR 2022): BCE to the teacher sigmoid equals the paper's KL up to the
+teacher entropy. The teacher is near-perfect on its own rows (AUPRC 0.984 train / 0.978 V_val, mean
+Bernoulli entropy 0.159 / 0.134 nats). The student reaches logit correlation 0.913 on train rows but
+0.866 on V_val, with KL above the entropy floor of 0.10 vs 0.23 nats; `w_logit` 1 and 100 give the
+same V_val AUPRC (0.927), so the weight is not the limit. It fits the teacher where it has seen the
+rows and cannot elsewhere: GLNN's own low-$I(X;Y\mid E)$ regime, in which soft labels transfer only
+what $(x_u,x_v)$ already reveals. Held-out: AUPRC +0.010 and GS +0.02 over control, RD and all MMD worse.
+
 **KD2 `kd_rank_wr0p1_wd1` (selected epoch 22)** ![KD2 loss curves](results/kd2_kd_rank/learning_curves.png) ![KD2 V_val topology curves](results/kd2_kd_rank/validation_topology_curves.png)
+Retired incidental-batch objective, not strict LLP; the strict-LLP MO-TPE study (§1.5) supersedes it
+and has not been audited. No reading is drawn from this surface.
+
 **KD3 `kd_gram_w1` (selected epoch 10)** ![KD3 loss curves](results/kd3_kd_gram/learning_curves.png) ![KD3 V_val topology curves](results/kd3_kd_gram/validation_topology_curves.png)
+SPKD-style (Tung & Mori ICCV 2019) with feature-cosine instead of row normalization and an
+off-diagonal mean; the weight grid `w_gram` 0.01--100 spans KD-gradient dominance from 0.03× to well
+above the task gradient, so the paper's γ has no untested analogue. The target is the teacher's pooled
+pair representation $0.5\,(\text{pooled}_{ab}+\text{pooled}_{ba})$, and the row bank (86,498 train /
+22,804 V_val rows) is nearly one-dimensional: one centered axis carries 93% of the variance, a rank-2
+reconstruction reproduces the cosine Gram with $R^2=0.996$, that axis correlates $-0.96$ with the
+teacher logit, the Gram correlates $-0.86$ with teacher probability differences, and the discarded
+norm correlates 0.77 with the logit. The PMA(1) bank is the same (0.93 / 0.990 / 0.88 / $-0.76$).
+Cause: the pooled summary reaches the teacher loss only through the zero-init `pooled_adapter`
+bottleneck into edge BCE, so it collapses to a logit-like scalar and the Gram is a relational
+re-encoding of the KD1 target. Fit: the converged Gram loss (0.066 train / 0.074 V_val) equals a
+label-block-mean predictor (0.067 / 0.074) against a constant predictor's 0.119 / 0.138, so label-level
+fit is reached and nothing beyond it is demonstrated.
+
 **KD4 `kd_rep_w0p1` (selected epoch 14)** ![KD4 loss curves](results/kd4_kd_rep/learning_curves.png) ![KD4 V_val topology curves](results/kd4_kd_rep/validation_topology_curves.png)
+Per-row cosine alignment to the same pooled target as KD3, so the same collapse applies: the vector
+is the KD1 scalar in vector form. The cosine loss plateaus at 0.195--0.206 on train and V_val alike
+(cosine ≈ 0.80), the level a constant vector along the teacher mean direction already scores (median
+row cosine to that direction 0.82 / 0.83); the student has learned the shared offset, not the rows.
+Consequence for KD3/KD4: the planned PMA(1) reruns are dropped. Representation-family KD needs a
+teacher whose representation is verifiably multi-axis (bank rank and logit-correlation checks before
+any student run), e.g. token-level targets from an `xattn_tokens` teacher or an auxiliary structural
+objective on the pooled summary.
