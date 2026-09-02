@@ -1,6 +1,6 @@
 # Experiments: Topology-Conditioned Inductive Edge Prediction
 
-**Status (2026-09-02):** paper-style protocol and evidence record. Section 2 records the Pairwise baseline, Full-Ego Oracle ceiling, and completed KD1; KD2--KD4 and kd_struct await held-out tests.
+**Status (2026-09-02):** paper-style protocol and evidence record. Section 2 records the Pairwise baseline, Full-Ego Oracle ceiling, completed KD1, and kd_struct; KD2--KD4 await held-out tests.
 
 ## 1. Experimental setup
 
@@ -15,36 +15,27 @@
 | Test graph | disjoint 2,018 | 30,128 | held out until final evaluation |
 | Loopless test candidate universe | same 2,018 | — | all 2,035,153 unordered distinct-node pairs |
 
-Train and test nodes are disjoint; the primary split strategy is `breadth_first`.
-`V_val` is grown by K=5 dispersed-seed hashed-frontier BFS on the substrate's loopless giant component, stopped at 20% induced loopless edges; all graph-edge counts are loopless positives.
-Raw train-side, `V_val`, and test labeled sets are balanced 1:1; effective train need not be. `V_val` is only pair-disjoint; test is node-disjoint.
+Train and test nodes are disjoint; the primary split strategy is `breadth_first`. `V_val` is grown by K=5 dispersed-seed hashed-frontier BFS on the substrate's loopless giant component, stopped at 20% induced loopless edges; all graph-edge counts are loopless positives. Raw train-side, `V_val`, and test labeled sets are balanced 1:1; effective train need not be. `V_val` is only pair-disjoint; test is node-disjoint.
 
-Each node carries a frozen intrinsic token sequence (≤1024 tokens × 1536 dims); F0 is
-its fp32 mean-pooled vector. Negatives are the fixed benchmark's balanced samples. Graph truth is observation-biased, so uncertain negatives are disclosed.
+Each node carries a frozen intrinsic token sequence (≤1024 tokens × 1536 dims); F0 is its fp32 mean-pooled vector. Negatives are the fixed benchmark's balanced samples. Graph truth is observation-biased, so uncertain negatives are disclosed.
 
 ### 1.2 Evaluation protocol
 
-**Task contract.** For a queried pair $u,v\in V_{\mathrm{test}}$ the model receives
-exactly $(x_u,x_v)$ and returns the symmetric probability
-$\widehat A_{uv}=P(Y_{uv}=1\mid x_u,x_v)$. No observed test edge, neighbor identity,
-retrieval result, degree, or graph statistic is task input; training topology may
-supervise a representation or objective. After scoring a pair universe, predictions are
-assembled into $\widehat G_\tau$ only for evaluation. Inferred topology is intermediate
-context, never the prediction target and never generic graph generation.
+**Task contract.** For a queried pair $u,v\in V_{\mathrm{test}}$ the model receives exactly $(x_u,x_v)$ and returns
+the symmetric probability $\widehat A_{uv}=P(Y_{uv}=1\mid x_u,x_v)$. No observed test edge, neighbor identity, retrieval
+result, degree, or graph statistic is task input; training topology may supervise a representation or objective. After scoring
+a pair universe, predictions are assembled into $\widehat G_\tau$ only for evaluation. Inferred topology is intermediate context, never the prediction target and never generic graph generation.
 
-**Evidence classes.** A *comparator* is a frozen model or score artifact evaluated without changing
-its checkpoint or opening new test-dependent choices; a *formal result* follows this fixed pre-test protocol.
+**Evidence classes.** A *comparator* is a frozen model or score artifact evaluated without changing its checkpoint or opening new test-dependent choices; a *formal result* follows this fixed pre-test protocol.
 
 **Model selection.** Training early-stops on total val loss (patience 10): the val task BCE plus
 each active KD term's val counterpart at its training weight. The published checkpoint is chosen
 independently, by mean rank over V_val AUPRC plus the five bucket-topology metrics (§1.3).
 
-**Topology threshold.** Selected on the `V_val` 20--200-node sampled-set pair union. Define
-`D_RD(t)` as the size-bucket macro-average of mean `|log RD|`; among finite atomic candidates,
-let `t_min=argmin_t D_RD(t)` and retain exactly those with `D_RD(t) <= D_RD(t_min) + SE_t`,
-where `SE_t` is the size-stratified paired-bootstrap SE of the difference. Among survivors
-minimize `D_shape=(1/3) sum_s log(max(r_s(t), epsilon))`, `epsilon=1e-12`, then break ties
-toward the larger threshold; empty-prediction candidates have `D_RD=+inf`. Freeze before test.
+**Topology threshold.** Selected on the `V_val` 20--200-node sampled-set pair union. Define `D_RD(t)` as the size-bucket
+macro-average of mean `|log RD|`; among finite atomic candidates, let `t_min=argmin_t D_RD(t)` and retain exactly those with
+`D_RD(t) <= D_RD(t_min) + SE_t`, where `SE_t` is the size-stratified paired-bootstrap SE of the difference. Among survivors minimize
+`D_shape=(1/3) sum_s log(max(r_s(t), epsilon))`, `epsilon=1e-12`, then break ties toward the larger threshold; empty-prediction candidates have `D_RD=+inf`. Freeze before test.
 
 **Classification threshold.** Selected separately as the max-F1 logit threshold on the balanced
 `V_val` classification rows (`val_cls`) and frozen before test. It serves only Accuracy/F1/MCC;
@@ -55,8 +46,7 @@ stands in for calibration.
 the grounded arm; the frozen topology threshold replays unchanged as the one reported operating
 point (self-loops included), and the frozen classification threshold replays on the balanced test rows.
 
-**Uncertainty.** Runs are single-seed (disclosed). Arm-versus-baseline deltas report
-size-stratified paired-bootstrap intervals over test sampled sets and test rows.
+**Uncertainty.** Runs are single-seed (disclosed). Arm-versus-baseline deltas report size-stratified paired-bootstrap intervals over test sampled sets and test rows.
 
 ### 1.3 Metrics
 
@@ -72,16 +62,16 @@ real-vs-real floor, so ratio 1 is that floor). Descriptors retain self-loops.
 
 ### 1.4 Compared methods
 
-| Arm | KD signal | Teacher | Role |
-|---|---|---|---|
-| Pairwise baseline (B0) | none | — | frozen endpoint-only comparator |
-| kd_logit | GLNN-style pointwise soft-target BCE | PMA(4) Full-Ego Oracle row bank | attribution control |
-| kd_ranking | LLP-style rank + distribution matching over context banks | PMA(4) Full-Ego Oracle context bank | primary transfer test (RQ2) |
-| kd_representation | pair-representation cosine | PMA(4) Full-Ego Oracle row bank | representation-matching arm |
-| kd_gram | SPKD-style cosine-Gram relational match (Tung & Mori 2019) | PMA(4) Full-Ego Oracle row bank | relational-geometry arm |
-| kd_generation | pair-latent generative head | PMA(1) Full-Ego Oracle latent bank | generative test |
-| kd_struct | auxiliary head, MSE to z-scored truth-graph descriptors (CN, degrees, Jaccard, Adamic-Adar; queried partner masked) | none: training graph (val rows: substrate) | descriptor arm and content→structure ceiling |
-| Oracles | observed topology | Full-Ego graph → GRIT → PMA | diagnostic ceilings |
+| Arm | KD signal | Teacher | Searched hyperparameters | Role |
+|---|---|---|---|---|
+| Pairwise baseline (B0) | none | — | none (frozen) | frozen endpoint-only comparator |
+| kd_logit | GLNN-style pointwise soft-target BCE | PMA(4) Full-Ego Oracle row bank | `w_logit ∈ {0.01, 0.1, 1, 10, 100}` | attribution control |
+| kd_ranking | LLP-style rank + distribution matching over context banks | PMA(4) Full-Ego Oracle context bank | `w_rank` log-uniform [0.01, 1]; `w_dist` log-uniform [0.1, 100]; bank ∈ {h2ns1, h2ns3, h2ns5, h3ns3}; margin ∈ {0.05, 0.1, 0.2} | primary transfer test (RQ2) |
+| kd_representation | pair-representation cosine | PMA(4) Full-Ego Oracle row bank | `w_rep ∈ {0.01, 0.1, 1, 10, 100}` | representation-matching arm |
+| kd_gram | SPKD-style cosine-Gram relational match (Tung & Mori 2019) | PMA(4) Full-Ego Oracle row bank | `w_gram ∈ {0.01, 0.1, 1, 10, 100}` | relational-geometry arm |
+| kd_generation | pair-latent generative head | PMA(1) Full-Ego Oracle latent bank | none; `w_gen=1` fixed (det/EDM variants compared) | generative test |
+| kd_struct | auxiliary head, MSE to z-scored truth-graph descriptors (CN, degrees, Jaccard, Adamic-Adar; queried partner masked) | none: training graph (val rows: substrate) | none; `w_struct=1` fixed | descriptor arm; nonlinear content→structure lower bound |
+| Oracles | observed topology | Full-Ego graph → GRIT → PMA | none (diagnostic only) | diagnostic ceilings |
 
 ![Teacher and student architecture](results/kd_rep_audit/teacher_architecture.svg)
 
@@ -91,16 +81,13 @@ The student is V3.1: d_model 512, 3 encoder + 3 cross-attention layers, 8 heads,
 (mean/attn/max/gated), pair_context_gated readout with abba_max order aggregation, label smoothing
 0.05. Optimization: AdamW, lr 1e-4, weight decay 0.05, onecycle, 25 epochs, 1,024 pairs per batch, clip 1.0, bf16 DDP.
 
-HPO: a Phase-0 grid (24 runs) fixed per-arm incumbents (kd_logit_w100, kd_rank_wr0p1_wd1,
-kd_gram_w1, kd_rep_w0p1); kd_rank continues with a 16-trial constrained MO-TPE study
-(GS ↑, geometric-mean MMD ↓, soft constraint `|log RD| <= 0.05`) over w_rank × w_dist ×
-context bank (hops × negative-sampling rate) × margin. The best configuration per arm runs
-the held-out test protocol exactly once; provenance and HPC completion are rules 5--6 (§5).
+HPO: a Phase-0 grid (24 runs) fixed per-arm incumbents (kd_logit_w100, kd_rank_wr0p1_wd1, kd_gram_w1, kd_rep_w0p1); kd_rank
+continues with a 16-trial constrained MO-TPE study (GS ↑, geometric-mean MMD ↓, soft constraint `|log RD| <= 0.05`) over w_rank ×
+w_dist × context bank (hops × negative-sampling rate) × margin. The best configuration per arm runs the held-out test protocol exactly once; provenance and HPC completion are rules 5--6 (§5).
 
 ## 2. Main results — edge and assembled topology
 
-Table 2 (pairwise, best HPO per arm) and Table 3 (the five topology numbers at each arm's single
-frozen V_val-selected threshold) are reported together.
+Table 2 (pairwise, best HPO per arm) and Table 3 (the five topology numbers at each arm's single frozen V_val-selected threshold) are reported together.
 
 | Arm | AUROC | AUPRC | Accuracy | F1 | MCC |
 |---|---:|---:|---:|---:|---:|
@@ -108,8 +95,9 @@ frozen V_val-selected threshold) are reported together.
 | Pairwise baseline | 0.7067 | 0.7316 | 0.6261 | 0.4769 | 0.3072 |
 | kd_logit (`kd_logit_w100`) | 0.7195 | 0.7417 | 0.6459 | 0.6670 | 0.2941 |
 | kd_ranking | — | — | — | — | — |
-| kd_representation | — | — | — | — | — |
-| kd_gram | — | — | — | — | — |
+| kd_representation (`kd_rep_w0p1`) | 0.7108 | 0.7402 | 0.6234 | 0.6760 | 0.2610 |
+| kd_gram (`kd_gram_w1`) | 0.7169 | 0.7428 | 0.6426 | 0.6713 | 0.2897 |
+| kd_struct (`w_struct=1`) | 0.7241 | 0.7489 | 0.6513 | 0.6820 | 0.3084 |
 
 | Arm | BFS GS | BFS RD | Degree | Clustering | Spectral |
 |---|---:|---:|---:|---:|---:|
@@ -117,44 +105,41 @@ frozen V_val-selected threshold) are reported together.
 | Pairwise baseline | 0.3672 | 0.3221 | 21.03 | 18.49 | 28.39 |
 | kd_logit (`kd_logit_w100`) | 0.4048 | 0.4248 | 15.63 | 13.07 | 22.06 |
 | kd_ranking | — | — | — | — | — |
-| kd_representation | — | — | — | — | — |
-| kd_gram | — | — | — | — | — |
+| kd_representation (`kd_rep_w0p1`) | 0.4121 | 0.5626 | 8.725 | 7.552 | 13.15 |
+| kd_gram (`kd_gram_w1`) | 0.3959 | 0.4989 | 10.16 | 8.851 | 15.43 |
+| kd_struct (`w_struct=1`) | 0.4072 | 0.5025 | 9.655 | 8.335 | 14.79 |
 
 ## 3. Ablations and sensitivity
 
 ## 4. Analysis
 
-**Learning curves.** Completed seed-0 HPO-winner `V_val` surfaces; the dotted marker is the selected epoch..
+Learning curves are the seed-0 HPO-winner `V_val` surfaces; the dotted marker is the selected epoch. Every arm answers one question: did the KD signal move anything that $(x_u,x_v)$ alone does not already reveal?
 
-**KD1 `kd_logit_w100` (selected epoch 25)** ![KD1 loss curves](results/kd1_kd_logit/learning_curves.png) ![KD1 V_val topology curves](results/kd1_kd_logit/validation_topology_curves.png)
-Faithful to GLNN (Zhang et al. ICLR 2022): BCE to the teacher sigmoid equals the paper's KL up to the teacher entropy.
+### 4.1 KD1: soft logits (`kd_logit`, selected epoch 25)
+![KD1 loss curves](results/kd1_kd_logit/learning_curves.png) ![KD1 V_val topology curves](results/kd1_kd_logit/validation_topology_curves.png)
+- Faithful to GLNN (Zhang et al. ICLR 2022): BCE to the teacher sigmoid equals the paper's KL up to the teacher entropy. The teacher is near-perfect on its own rows (AUPRC 0.984 train / 0.978 V_val).
+- The student matches the teacher where it has seen the rows (logit correlation 0.913 train) and less elsewhere (0.866 V_val; KL above the entropy floor 0.10 vs 0.23 nats). Raising the KD weight leaves V_val AUPRC unchanged, so the weight is not the limit.
+- Reading: GLNN's own low-$I(X;Y\mid E)$ regime. Soft labels transfer only what $(x_u,x_v)$ already reveals.
+- Held-out: AUPRC +0.010 and GS +0.02 over control; RD and all three MMD ratios worse.
 
-The teacher is near-perfect on its own rows (AUPRC 0.984 train / 0.978 V_val, mean Bernoulli entropy 0.159 / 0.134 nats).
+### 4.2 KD2: ranking over context banks (`kd_rank`, selected epoch 22)
+![KD2 loss curves](results/kd2_kd_rank/learning_curves.png) ![KD2 V_val topology curves](results/kd2_kd_rank/validation_topology_curves.png)
+- Retired incidental-batch objective, not strict LLP; the strict-LLP study (§1.5) supersedes it and is unaudited. No reading is drawn from this surface.
 
-The student reaches logit correlation 0.913 on train rows but 0.866 on V_val, with KL above the entropy floor of 0.10 vs
-0.23 nats; `w_logit` 1 and 100 give the same V_val AUPRC (0.927), so the weight is not the limit. It fits the teacher where
-it has seen the rows and cannot elsewhere: GLNN's own low-$I(X;Y\mid E)$ regime, in which soft labels transfer only what
-$(x_u,x_v)$ already reveals. Held-out: AUPRC +0.010 and GS +0.02 over control, RD and all MMD worse.
+### 4.3 KD3: relational Gram (`kd_gram`, selected epoch 10)
+![KD3 loss curves](results/kd3_kd_gram/learning_curves.png) ![KD3 V_val topology curves](results/kd3_kd_gram/validation_topology_curves.png)
+- SPKD-style (Tung & Mori ICCV 2019) feature-cosine Gram with an off-diagonal mean; the swept weights span KD-gradient dominance from far below to above the task gradient, so the paper's γ has no untested analogue.
+- The target's cosine Gram is rank-2 ($R^2=0.996$) and correlates $-0.86$ with teacher probability differences: KD3 relationally re-encodes KD1's target.
+- The converged Gram loss (0.066 train / 0.074 V_val) equals a label-block-mean predictor (0.067 / 0.074; constant predictor 0.119 / 0.138). Label-level fit is reached; nothing beyond it is demonstrated.
 
-**KD2 `kd_rank_wr0p1_wd1` (selected epoch 22)** ![KD2 loss curves](results/kd2_kd_rank/learning_curves.png) ![KD2 V_val topology curves](results/kd2_kd_rank/validation_topology_curves.png)
-Retired incidental-batch objective, not strict LLP; the strict-LLP MO-TPE study (§1.5) supersedes it and has not been audited. No reading is drawn from this surface.
+### 4.4 KD4: per-row representation cosine (`kd_rep`, selected epoch 14)
+![KD4 loss curves](results/kd4_kd_rep/learning_curves.png) ![KD4 V_val topology curves](results/kd4_kd_rep/validation_topology_curves.png)
+- Same target $t_{uv}$ as KD3, so the same loss geometry applies. The cosine loss plateaus at 0.195--0.206 on train and V_val alike (cosine ≈ 0.80).
+- That is the score of a constant vector along the teacher mean direction (median row cosine to it 0.82 / 0.83): the student learned the shared offset, not the rows.
+- The fused pre-head vector is no better: more logit-aligned (top-axis correlation 0.99) and its structural probe equals content plus logit (CN 0.90 vs 0.85). Distilling it is KD1 plus content self-distillation; no rerun.
 
-**KD3 `kd_gram_w1` (selected epoch 10)** ![KD3 loss curves](results/kd3_kd_gram/learning_curves.png) ![KD3 V_val topology curves](results/kd3_kd_gram/validation_topology_curves.png)
-SPKD-style (Tung & Mori ICCV 2019) with feature-cosine rows and an off-diagonal mean; `w_gram` 0.01--100 spans KD-gradient
-dominance from 0.03× to above the task gradient, so the paper's γ has no untested analogue. 
-
-The target $t_{uv}$ (below) has a rank-2 cosine Gram ($R^2=0.996$) that correlates $-0.86$ with teacher probability differences, so KD3 relationally
-re-encodes KD1's target. The converged Gram loss (0.066 train / 0.074 V_val) equals a label-block-mean
-predictor (0.067 / 0.074; constant predictor 0.119 / 0.138): label-level fit is reached and nothing beyond it is demonstrated.
-
-**KD4 `kd_rep_w0p1` (selected epoch 14)** ![KD4 loss curves](results/kd4_kd_rep/learning_curves.png) ![KD4 V_val topology curves](results/kd4_kd_rep/validation_topology_curves.png)
-Per-row cosine to the same $t_{uv}$, so the same loss geometry applies. The cosine loss plateaus at 0.195--0.206 on train
-and V_val alike (cosine ≈ 0.80), the score of a constant vector along the teacher mean direction (median row cosine to it
-0.82 / 0.83): the student learned the shared offset, not the rows. The fused pre-head vector is no better: more logit-aligned
-(top-axis corr 0.99), structural probe equal to content+logit (CN 0.90 vs 0.85), so distilling it is KD1 plus content self-distillation; no PMA(1) or fused rerun.
-
-**What $t_{uv}$ carries, and what the student can reach.** $t_{uv}$ is the teacher's topology-branch pooled vector before
-fusion (§1.4 figure). Linear ridge probes on held-out train rows ([audit](results/kd_rep_audit/README.md); V_val within 0.02) answer two questions.
+### 4.5 What $t_{uv}$ carries, and what the student can reach
+$t_{uv}$ is the teacher's topology-branch pooled vector before fusion (§1.4 figure). Linear ridge probes on held-out train rows ([audit](results/kd_rep_audit/README.md); V_val within 0.02):
 
 | Probe | Value | Reading |
 |---|---:|---|
@@ -163,9 +148,15 @@ fusion (§1.4 figure). Linear ridge probes on held-out train rows ([audit](resul
 | $R^2$ of $(x_u,x_v)\to t_{uv}$ | 0.40--0.47 | under half of the vector is a function of the student's input |
 | $R^2$ of $(x_u,x_v)\to$ the same descriptors | 0.2--0.7 | lower bound on the structure any student can recover from content |
 
-1. *The structure is there, on axes the losses ignore.* $t_{uv}$ passes the hidden ego graph's descriptors through almost
-   losslessly (input pass-through, not learned abstraction), but cosine and Gram losses weight directions by variance, so
-   they match the logit axis and miss the tail. KD3/KD4 failed on loss geometry, not on missing information.
-2. *Only the content-predictable part can transfer.* The student never sees $t_{uv}$ at test time; representation KD moves
-   at most the part of $t_{uv}$ that is a function of $(x_u,x_v)$: linearly 0.40--0.47 of the vector, 0.2--0.7 per descriptor.
-   Being linear, these lower-bound the nonlinear ceiling, measured next; near these numbers, no whitened or descriptor-level KD can move topology.
+- *The structure is there, on axes the losses ignore.* $t_{uv}$ passes the hidden ego graph's descriptors through almost losslessly (input pass-through, not learned abstraction), but cosine and Gram losses weight directions by variance, so they match the logit axis and miss the tail. KD3/KD4 failed on loss geometry, not on missing information.
+- *Only the content-predictable part can transfer.* The student never sees $t_{uv}$ at test time, so representation KD moves at most the part of $t_{uv}$ that is a function of $(x_u,x_v)$: linearly 0.40--0.47 of the vector, 0.2--0.7 per descriptor. Being linear, these are lower bounds; kd_struct measures the nonlinear reach next.
+
+### 4.6 kd_struct: descriptor targets without a teacher (selected epoch 11)
+![kd_struct loss curves](results/kd_struct/learning_curves.png) ![kd_struct V_val topology curves](results/kd_struct/validation_topology_curves.png)
+- *Design.* An auxiliary head on the student's pair representation regresses the row's truth-graph descriptors (queried partner masked). Its V_val $R^2$ is the nonlinear readout of the second point above ([run record](results/kd_struct/README.md)).
+- *Recovery.* Selected-epoch V_val $R^2$: CN 0.62, degree sum 0.44, degree difference 0.39, Jaccard 0.72, Adamic-Adar 0.59 (best epochs 0.65 / 0.61 / 0.50 / 0.77 / 0.62). Against the linear probe (0.52 / 0.70 / 0.22 / 0.58 / 0.52), overlap descriptors gain 0.1--0.2, degree difference 0.2--0.3, degree sum nothing.
+- *Degree sum is unstable* (0.04--0.61 across epochs): degree is a node-level quantity, so V_val rows are correlated through their nodes and any drift in the head's offset swings the whole column.
+- *The rest is memorization.* Train $R^2$ reaches about 0.85 while the four stable val columns plateau from epoch 9. The plateau is a higher lower bound, not the ceiling: one joint schedule, a task-coupled encoder, and self-pairs that inflate CN and Jaccard.
+- *Held-out.* Edge metrics lead this one-seed comparison (AUPRC +0.013 over control, ECE 0.128 vs 0.219); topology does not (GS +0.02, RD farther from 1, all three MMD ratios above control).
+- *Attribution.* At matched epochs 10--12, control and kd_struct sit within 0.005 V_val AUPRC and 0.01 GS. The control's selection landed on epoch 18 after its val task loss had risen; kd_struct's on 11. The test gaps exceed every matched-epoch V_val gap, so they read as selected-epoch difference plus seed noise, not descriptor transfer.
+- *Conclusion.* The structure the student can encode is already in its decision; what it cannot encode is absent from $(x_u,x_v)$. No descriptor-level gain is claimed without a matched-epoch control test.
