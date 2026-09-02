@@ -115,6 +115,7 @@ def trial_outcome(run_dir: Path, rd_band: float) -> TrialOutcome:
 
 STUDY_NAME = "kd_rank_strict_llp"
 N_STARTUP_TRIALS = 6
+MAX_CONSECUTIVE_FAILURES = 3
 
 
 def _constraints(trial: optuna.trial.FrozenTrial) -> Sequence[float]:
@@ -125,7 +126,7 @@ def _constraints(trial: optuna.trial.FrozenTrial) -> Sequence[float]:
 
 
 def build_study(db_path: Path) -> optuna.Study:
-    """Create-or-load the sweep study and (re-)enqueue the prior trials."""
+    """Create-or-load the sweep study."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     sampler = optuna.samplers.TPESampler(
         seed=0,
@@ -140,9 +141,24 @@ def build_study(db_path: Path) -> optuna.Study:
         sampler=sampler,
         load_if_exists=True,
     )
-    for params in ENQUEUED_PRIORS:
-        study.enqueue_trial(dict(params), skip_if_exists=True)
     return study
+
+
+def enqueue_priors(study: optuna.Study) -> None:
+    """Enqueue every prior that has no waiting, running, or completed trial.
+
+    A prior whose trial failed is re-enqueued, so a fixed environment gets
+    the full prior set on restart (``skip_if_exists`` would treat the failed
+    twin as done).
+    """
+    live = (TrialState.WAITING, TrialState.RUNNING, TrialState.COMPLETE)
+    seen = [
+        t.system_attrs.get("fixed_params", t.params)
+        for t in study.get_trials(deepcopy=False, states=live)
+    ]
+    for params in ENQUEUED_PRIORS:
+        if dict(params) not in seen:
+            study.enqueue_trial(dict(params))
 
 
 def suggest_params(trial: optuna.Trial) -> dict[str, object]:
@@ -263,7 +279,9 @@ def run_sweep(args: argparse.Namespace) -> None:
     """Drive the whole sweep: reconcile, dump banks, ask/tell until budget."""
     study = build_study(args.sweep_dir / "optuna.db")
     reconcile_running(study, args.sweep_dir, args.rd_band)
+    enqueue_priors(study)
     dump_missing_banks(args)
+    failures = 0
     while _n_complete(study) < args.n_trials:
         trial = study.ask()
         params = suggest_params(trial)
@@ -276,7 +294,14 @@ def run_sweep(args: argparse.Namespace) -> None:
             outcome = trial_outcome(run_dir, args.rd_band)
         except RunFailure:
             study.tell(trial, state=TrialState.FAIL)
+            failures += 1
+            if failures >= MAX_CONSECUTIVE_FAILURES:
+                raise RuntimeError(
+                    f"{failures} consecutive failed trials, last {run_dir}: fix the "
+                    "environment and restart the sweep"
+                ) from None
             continue
+        failures = 0
         trial.set_user_attr("constraint", [outcome.constraint])
         trial.set_user_attr("surface", outcome.surface)
         study.tell(trial, values=[outcome.gs, outcome.geo_mmd])

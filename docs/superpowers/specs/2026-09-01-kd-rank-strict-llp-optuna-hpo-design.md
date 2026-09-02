@@ -77,8 +77,8 @@ results doc); code and the base config reach the container by git pull as always
 
 ## Failure and resume semantics
 
-- `failure.json` → the trial is told FAILED and the sweep continues; no auto-repair. Repeated
-  FAILs in one region are a human signal, not a driver problem.
+- `failure.json` → the trial is told FAILED and the sweep continues; no auto-repair. Three
+  consecutive FAILs stop the sweep (systemic fault); failed priors re-enqueue on restart.
 - Non-finite objective or constraint values from a *completed* run stop the sweep (fail-closed).
 - On startup the driver reconciles stale RUNNING trials: run dir has `complete.json` → tell its
   real result; has `failure.json` → tell FAILED; neither → mark FAILED and let TPE re-propose.

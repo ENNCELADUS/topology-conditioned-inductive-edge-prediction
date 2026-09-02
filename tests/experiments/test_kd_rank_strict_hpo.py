@@ -121,17 +121,32 @@ def test_build_study_directions_and_priors(tmp_path: Path) -> None:
     study = hpo.build_study(tmp_path / "optuna.db")
     assert study.study_name == "kd_rank_strict_llp"
     assert [d.name.lower() for d in study.directions] == ["maximize", "minimize"]
+    hpo.enqueue_priors(study)
     assert len(study.get_trials(deepcopy=False)) == 6
 
 
-def test_build_study_enqueue_is_idempotent(tmp_path: Path) -> None:
-    hpo.build_study(tmp_path / "optuna.db")
+def test_enqueue_priors_is_idempotent(tmp_path: Path) -> None:
     study = hpo.build_study(tmp_path / "optuna.db")
+    hpo.enqueue_priors(study)
+    hpo.enqueue_priors(hpo.build_study(tmp_path / "optuna.db"))
     assert len(study.get_trials(deepcopy=False)) == 6
+
+
+def test_enqueue_priors_retries_a_failed_prior(tmp_path: Path) -> None:
+    study = hpo.build_study(tmp_path / "optuna.db")
+    hpo.enqueue_priors(study)
+    trial = study.ask()
+    assert hpo.suggest_params(trial) == hpo.ENQUEUED_PRIORS[0]
+    study.tell(trial, state=TrialState.FAIL)
+    hpo.enqueue_priors(study)
+    waiting = study.get_trials(deepcopy=False, states=(TrialState.WAITING,))
+    assert len(waiting) == 6
+    assert hpo.suggest_params(study.ask()) == hpo.ENQUEUED_PRIORS[1]
 
 
 def test_suggest_params_consumes_priors_in_order(tmp_path: Path) -> None:
     study = hpo.build_study(tmp_path / "optuna.db")
+    hpo.enqueue_priors(study)
     first = hpo.suggest_params(study.ask())
     second = hpo.suggest_params(study.ask())
     assert first == hpo.ENQUEUED_PRIORS[0]
@@ -154,6 +169,7 @@ def _ask_running_trial(study: optuna.Study) -> optuna.Trial:
 
 def test_reconcile_completed_run_is_retold_with_values(tmp_path: Path) -> None:
     study = hpo.build_study(tmp_path / "optuna.db")
+    hpo.enqueue_priors(study)
     trial = _ask_running_trial(study)
     _publish_run(tmp_path / f"trial_{trial.number:03d}", make_cadence_rows())
     hpo.reconcile_running(study, tmp_path, rd_band=0.05)
@@ -255,6 +271,32 @@ def test_run_sweep_marks_failed_run_and_continues(
     states = [t.state for t in hpo.build_study(tmp_path / "optuna.db").get_trials(deepcopy=False)]
     assert states.count(TrialState.FAIL) == 1
     assert states.count(TrialState.COMPLETE) == 1
+
+
+def test_run_sweep_stops_after_consecutive_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name, spec in list(hpo.BANKS.items()):
+        bank = _fabricate_bank(tmp_path / Path(spec.path).name)
+        monkeypatch.setitem(
+            hpo.BANKS, name, hpo.BankSpec(spec.rw_step, spec.hops, spec.ns_rate, str(bank))
+        )
+    launched: list[list[str]] = []
+
+    def fake_run(cmd: list[str]) -> int:
+        launched.append(cmd)
+        cfg = yaml.safe_load(Path(cmd[3]).read_text(encoding="utf-8"))
+        _publish_run(Path(cfg["output_dir"]), make_cadence_rows(), failure=True)
+        return 0
+
+    monkeypatch.setattr(hpo, "run_command", fake_run)
+    monkeypatch.setattr(hpo, "run_commands_parallel", lambda commands: [])
+    with pytest.raises(RuntimeError, match="consecutive"):
+        hpo.run_sweep(_sweep_args(tmp_path, n_trials=16))
+    assert len(launched) == hpo.MAX_CONSECUTIVE_FAILURES
+    states = [t.state for t in hpo.build_study(tmp_path / "optuna.db").get_trials(deepcopy=False)]
+    assert states.count(TrialState.FAIL) == hpo.MAX_CONSECUTIVE_FAILURES
+    assert TrialState.RUNNING not in states
 
 
 def test_dump_missing_banks_shards_and_merges(
