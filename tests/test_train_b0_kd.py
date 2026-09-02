@@ -305,6 +305,7 @@ def _write_targets(
         truth_graph_sha256="0" * 64,
         checkpoint_path=out_dir / "ckpt.pt",
         checkpoint_sha256="1" * 64,
+        rep_source="topo",
         checkpoint_id=None,
     )
 

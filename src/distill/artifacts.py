@@ -184,8 +184,13 @@ def write_kd_targets(
     checkpoint_path: Path,
     checkpoint_sha256: str,
     checkpoint_id: str | None,
+    rep_source: str,
 ) -> None:
     """Write one validated KD row-targets artifact directory.
+
+    ``rep_source`` records which teacher vector ``teacher_rep`` holds
+    (``topo``: the encoder's pooled summary; ``fused``: the classifier's
+    pre-head pair feature).
 
     The training block must cover the official training rows in the
     trainer's exact row order (row_id == array position); the validation
@@ -256,6 +261,7 @@ def write_kd_targets(
         "n_val_rows": n_val_rows,
         "n_positive_rows": int(np.sum(label_arr)),
         "rep_dim": int(rep_dim),
+        "rep_source": rep_source,
         "teacher_rep_dtype": "float16",
         "npz_sha256": npz_sha256,
         "node_ids_sha256": _sha256_bytes(node_ids_bytes),

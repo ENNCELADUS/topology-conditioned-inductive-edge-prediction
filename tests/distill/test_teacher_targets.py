@@ -312,11 +312,14 @@ def test_score_rows_handles_an_empty_row_list() -> None:
     assert scored.teacher_rep.shape[0] == 0
 
 
-def test_score_rows_is_invariant_to_the_batch_pairs_chunk_size(tmp_path: Path) -> None:
+@pytest.mark.parametrize("rep_source", ["topo", "fused"])
+def test_score_rows_is_invariant_to_the_batch_pairs_chunk_size(
+    tmp_path: Path, rep_source: str
+) -> None:
     """`score_rows` must reproduce the same per-row values however the row list is chunked.
 
     The trainer-side artifact contract depends on this (`verify_sample`
-    itself leans on the same batch-invariance).
+    itself leans on the same batch-invariance), for both teacher vectors.
     """
     torch.manual_seed(0)
     nodes = [f"n{i}" for i in range(5)]
@@ -339,15 +342,37 @@ def test_score_rows_is_invariant_to_the_batch_pairs_chunk_size(tmp_path: Path) -
     b_positions = np.array([1, 2, 2, 3], dtype=np.int32)  # row 3 is a self-pair
 
     batched = tt.score_rows(
-        model, node_cache, nodes, a_positions, b_positions, device=device, batch_pairs=3
+        model,
+        node_cache,
+        nodes,
+        a_positions,
+        b_positions,
+        device=device,
+        batch_pairs=3,
+        rep_source=rep_source,
     )
     single = tt.score_rows(
-        model, node_cache, nodes, a_positions, b_positions, device=device, batch_pairs=1
+        model,
+        node_cache,
+        nodes,
+        a_positions,
+        b_positions,
+        device=device,
+        batch_pairs=1,
+        rep_source=rep_source,
     )
 
     n_rows = len(a_positions)
     assert batched.teacher_logit.shape == (n_rows,)
     assert batched.teacher_rep.shape[0] == n_rows
+    if rep_source == "fused":
+        topo = tt.score_rows(
+            model, node_cache, nodes, a_positions, b_positions, device=device, batch_pairs=3
+        )
+        assert batched.teacher_rep.shape == topo.teacher_rep.shape
+        assert not np.allclose(
+            batched.teacher_rep.astype(np.float32), topo.teacher_rep.astype(np.float32)
+        )
     np.testing.assert_allclose(batched.teacher_logit, single.teacher_logit, atol=1e-5, rtol=1e-5)
     np.testing.assert_allclose(
         batched.teacher_rep.astype(np.float32), single.teacher_rep.astype(np.float32), atol=1e-3
@@ -495,6 +520,7 @@ def _write_toy_artifact(path: Path) -> None:
         truth_graph_sha256="deadbeef",
         checkpoint_path=Path("checkpoint.pt"),
         checkpoint_sha256="cafebabe",
+        rep_source="topo",
         checkpoint_id="abc123",
     )
 

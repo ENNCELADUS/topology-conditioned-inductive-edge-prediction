@@ -5,7 +5,8 @@ CLI (full-row KD rework -- replaces the sampled anchor-context stream):
     python -m src.distill.teacher_targets \\
         --config configs/b0_v31_breadth_first.yaml \\
         --checkpoint outputs/.../best.pt \\
-        --output outputs/distill/kd_row_targets_breadth_first --device cuda
+        --output outputs/distill/kd_row_targets_breadth_first --device cuda \\
+        [--rep-source topo|fused]
 
 Row universe: this module re-derives the trainer's own row lists
 (`src.train_b0.assemble_data` + `_training_rows`/`_val_cls_rows`) from the
@@ -62,6 +63,7 @@ import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import networkx as nx
 import numpy as np
@@ -388,8 +390,11 @@ def _move_state(state: E2ENodeState, device: torch.device) -> E2ENodeState:
 class ScoredRows:
     """One `score_rows` pass, aligned row-for-row with its `(a_idx, b_idx)` input.
 
-    ``teacher_rep`` is the dump-side symmetrized teacher pooled pair embedding
-    ``0.5 * (pooled_ab + pooled_ba)``, formed in fp32 then cast to fp16.
+    ``teacher_rep`` is one of two fp32-formed, fp16-stored teacher vectors
+    selected by ``rep_source``: ``topo`` is the symmetrized encoder pooled
+    summary ``0.5 * (pooled_ab + pooled_ba)`` (the topology branch before
+    fusion); ``fused`` is the classifier's pre-head pair feature, i.e. the
+    AB/BA-max trunk output after the conditioning rung has injected topology.
     """
 
     teacher_logit: NDArray[np.float32]
@@ -415,6 +420,7 @@ def score_rows(
     *,
     device: torch.device,
     batch_pairs: int = _DEFAULT_BATCH_PAIRS,
+    rep_source: str = "topo",
 ) -> ScoredRows:
     """Score every `(a_positions[i], b_positions[i])` row fp32, no autocast (see module docstring).
 
@@ -424,9 +430,21 @@ def score_rows(
     FeatureStore or checkpoint I/O.
     """
     _encoder_seed_count(model)
+    if rep_source not in ("topo", "fused"):
+        raise ValueError(f"rep_source must be 'topo' or 'fused', got {rep_source!r}")
     n_rows = len(a_positions)
     teacher_logit = np.empty(n_rows, dtype=np.float32)
     teacher_rep: NDArray[np.float16] | None = None
+    head_inputs: list[torch.Tensor] = []
+    # The classifier hands its head exactly the fused pre-head feature (fp32
+    # island); capturing that input is the fused target with no classifier change.
+    hook = (
+        cast(torch.nn.Module, model.classifier.head).register_forward_hook(
+            lambda _module, inputs, _output: head_inputs.append(inputs[0])
+        )
+        if rep_source == "fused"
+        else None
+    )
     for start in range(0, n_rows, max(batch_pairs, 1)):
         end = min(start + max(batch_pairs, 1), n_rows)
         a_batch = a_positions[start:end]
@@ -445,12 +463,19 @@ def score_rows(
                 "full-ego oracle pair context carries no pooled embedding -- "
                 "this is a bug, not a legal degraded mode"
             )
-        ab = pair_context.pooled_ab.detach().to(dtype=torch.float32, device="cpu")
-        ba = pair_context.pooled_ba.detach().to(dtype=torch.float32, device="cpu")
-        rep = (0.5 * (ab + ba)).to(dtype=torch.float16).numpy()
+        if rep_source == "fused":
+            (fused,) = head_inputs
+            head_inputs.clear()
+            rep = fused.detach().to(dtype=torch.float32, device="cpu").to(torch.float16).numpy()
+        else:
+            ab = pair_context.pooled_ab.detach().to(dtype=torch.float32, device="cpu")
+            ba = pair_context.pooled_ba.detach().to(dtype=torch.float32, device="cpu")
+            rep = (0.5 * (ab + ba)).to(dtype=torch.float16).numpy()
         if teacher_rep is None:
             teacher_rep = np.empty((n_rows, rep.shape[-1]), dtype=np.float16)
         teacher_rep[start:end] = rep
+    if hook is not None:
+        hook.remove()
     if teacher_rep is None:
         teacher_rep = np.empty((0, 0), dtype=np.float16)
     return ScoredRows(
@@ -721,6 +746,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_NS_RATE,
         help="Context-sampler override; shard and merge invocations of one dump must pass "
         "identical values",
+    )
+    parser.add_argument(
+        "--rep-source",
+        choices=("topo", "fused"),
+        default="topo",
+        help="teacher_rep: encoder pooled summary (topo) or classifier pre-head feature (fused)",
     )
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument(
@@ -1008,6 +1039,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             b_idx[start:end],
             device=device,
             batch_pairs=args.batch_pairs,
+            rep_source=args.rep_source,
         )
         shard_index = _parse_shard(args.row_shard)[0]
         _write_shard(
@@ -1035,7 +1067,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     scored = score_rows(
-        model, node_cache, node_ids, a_idx, b_idx, device=device, batch_pairs=args.batch_pairs
+        model,
+        node_cache,
+        node_ids,
+        a_idx,
+        b_idx,
+        device=device,
+        batch_pairs=args.batch_pairs,
+        rep_source=args.rep_source,
     )
     _finalize_artifact(
         args, node_ids, truth_graph, a_idx, b_idx, labels, n_train, scored, checkpoint_id
@@ -1108,6 +1147,7 @@ def _finalize_artifact(
         checkpoint_path=args.checkpoint,
         checkpoint_sha256=checkpoint_sha256,
         checkpoint_id=checkpoint_id,
+        rep_source=args.rep_source,
     )
     report = build_stats_report(
         scored.teacher_logit[:n_train],
