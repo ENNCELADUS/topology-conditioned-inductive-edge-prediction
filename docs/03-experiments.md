@@ -80,7 +80,7 @@ real-vs-real floor, so ratio 1 is that floor). Descriptors retain self-loops.
 | kd_representation | pair-representation cosine | PMA(4) Full-Ego Oracle row bank | representation-matching arm |
 | kd_gram | SPKD-style cosine-Gram relational match (Tung & Mori 2019) | PMA(4) Full-Ego Oracle row bank | relational-geometry arm |
 | kd_generation | pair-latent generative head | PMA(1) Full-Ego Oracle latent bank | generative test |
-| kd_struct | auxiliary head, MSE to z-scored truth-graph descriptors (CN, degrees, Jaccard, Adamic-Adar; queried partner masked) | none: targets from the training graph | descriptor arm and content→structure ceiling (§4) |
+| kd_struct | auxiliary head, MSE to z-scored truth-graph descriptors (CN, degrees, Jaccard, Adamic-Adar; queried partner masked) | none: training graph (val rows: substrate) | descriptor arm and content→structure ceiling |
 | Oracles | observed topology | Full-Ego graph → GRIT → PMA | diagnostic ceilings |
 
 ![Teacher and student architecture](results/kd_rep_audit/teacher_architecture.svg)

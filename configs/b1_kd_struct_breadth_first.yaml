@@ -61,7 +61,6 @@ optim:
 eval:
   patience: 10
   eval_every: 1
-  classification_only: true
 runtime:
   world_size: auto
   pack_dir: outputs/feature_packs/b0_v31_bf16
