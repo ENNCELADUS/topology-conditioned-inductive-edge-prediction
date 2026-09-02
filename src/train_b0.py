@@ -2963,9 +2963,13 @@ class KDContextStream:
                     [partner_rows[row] for row in chunk], dtype=torch.int64, device=device
                 )
 
-                def forward(anchor: torch.Tensor, partner: torch.Tensor) -> torch.Tensor:
-                    emb_a, len_a = self._table.gather_nodes(anchor, boundary)  # noqa: B023
-                    emb_b, len_b = self._table.gather_nodes(partner, boundary)  # noqa: B023
+                def forward(
+                    anchor: torch.Tensor, partner: torch.Tensor, boundary: int
+                ) -> torch.Tensor:
+                    # `boundary` is an explicit argument: a closure over the loop
+                    # variable would recompute every chunk at the last bucket.
+                    emb_a, len_a = self._table.gather_nodes(anchor, boundary)
+                    emb_b, len_b = self._table.gather_nodes(partner, boundary)
                     output = cast(
                         dict[str, torch.Tensor],
                         raw_model({"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b}),
@@ -2977,10 +2981,11 @@ class KDContextStream:
 
                 if torch.is_grad_enabled():
                     logits = cast(
-                        torch.Tensor, checkpoint(forward, anchor, partner, use_reentrant=False)
+                        torch.Tensor,
+                        checkpoint(forward, anchor, partner, boundary, use_reentrant=False),
                     )
                 else:
-                    logits = forward(anchor, partner)
+                    logits = forward(anchor, partner, boundary)
                 student_parts.append(logits)
                 score_rows = np.asarray([teacher_rows[row] for row in chunk], dtype=np.int64)
                 teacher_parts.append(

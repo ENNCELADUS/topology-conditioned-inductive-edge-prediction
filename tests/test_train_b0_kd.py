@@ -463,8 +463,11 @@ class _ContextToy(nn.Module):
         self.forward_calls += 1
         self.bucket_boundaries.append(int(batch["emb_a"].shape[1]))
         self.batch_sizes.append(int(batch["emb_a"].shape[0]))
-        signal = batch["emb_a"][:, 0, 0] - batch["emb_b"][:, 0, 0]
-        return {"logits": self.weight * signal}
+        # Scale the padded embeddings so autograd saves boundary-shaped
+        # tensors: a checkpoint recompute at the wrong bucket boundary raises.
+        scaled_a = (self.weight * batch["emb_a"]).sum(dim=(1, 2))
+        scaled_b = (self.weight * batch["emb_b"]).sum(dim=(1, 2))
+        return {"logits": scaled_a - scaled_b}
 
 
 def _context_stream(
@@ -656,6 +659,10 @@ def test_context_stream_chunks_every_bucket_to_the_token_budget() -> None:
         for size, boundary in zip(model.batch_sizes, model.bucket_boundaries, strict=True)
     )
     torch.testing.assert_close(loss, reference_loss)
+    reference_loss.backward()  # type: ignore[no-untyped-call]
+    loss.backward()  # type: ignore[no-untyped-call]
+    assert reference.weight.grad is not None and model.weight.grad is not None
+    torch.testing.assert_close(model.weight.grad, reference.weight.grad)
 
     validation = _context_stream(targets, table, token_budget=256).validation_diagnostics(model)
     assert validation == pytest.approx(
