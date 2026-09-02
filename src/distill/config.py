@@ -9,8 +9,9 @@ one arm group's weight(s) may be nonzero at a time:
 ``kd_logit`` (`w_logit`, pointwise soft-target logit KD), ``kd_rank``
 (`w_rank` + `w_dist`, anchor ranking/distribution KD), ``kd_gram`` (`w_gram`,
 batch-relational Gram KD), ``kd_rep`` (`w_rep`, per-row representation
-alignment), or ``kd_gen`` (`w_gen`, generator distillation). The matched
-control is a config with no
+alignment), ``kd_gen`` (`w_gen`, generator distillation), or ``kd_struct``
+(`w_struct`, descriptor-level structural auxiliary head with in-process
+targets and no teacher artifact). The matched control is a config with no
 ``distill:`` section at all, or one with every weight left at zero; either
 must reproduce the undistilled baseline exactly.
 """
@@ -27,6 +28,7 @@ _WEIGHT_NAMES = (
     "w_gram",
     "w_rep",
     "w_gen",
+    "w_struct",
 )
 
 
@@ -54,6 +56,10 @@ class DistillConfig:
             when the student and teacher widths differ) to the symmetrized
             teacher pooled embedding.
         w_gen: ``kd_gen`` generator-loss weight.
+        w_struct: ``kd_struct`` weight -- MSE of ``model.config.kd_struct_dim``
+            auxiliary-head outputs against z-scored ego-graph descriptors of
+            the truth graph (`src/distill/struct_targets.py`); needs no
+            ``targets_path``.
         joint_warmup_frac: ``kd_gen`` fraction of training spent with ``sg``
             at the adapter before joint optimization.
         gen_lr_scale: ``kd_gen`` joint-phase generator LR multiplier.
@@ -68,6 +74,7 @@ class DistillConfig:
     w_gram: float = 0.0
     w_rep: float = 0.0
     w_gen: float = 0.0
+    w_struct: float = 0.0
     joint_warmup_frac: float = 0.1
     gen_lr_scale: float = 0.1
     margin: float = 0.1
@@ -98,16 +105,20 @@ class DistillConfig:
             frozenset({"w_gram"}),
             frozenset({"w_rep"}),
             frozenset({"w_gen"}),
+            frozenset({"w_struct"}),
         )
         if nonzero not in legal_patterns:
             raise ValueError(
                 "distill weights must follow exactly one arm group -- all zero, only "
                 "w_logit (kd_logit), w_rank and w_dist (kd_rank), only w_gram "
-                "(kd_gram), only w_rep (kd_rep), or only w_gen (kd_gen); got "
-                f"nonzero weights {sorted(nonzero)}"
+                "(kd_gram), only w_rep (kd_rep), only w_gen (kd_gen), or only w_struct "
+                f"(kd_struct); got nonzero weights {sorted(nonzero)}"
             )
-        if nonzero and not self.targets_path:
-            raise ValueError("distill.targets_path is required when any weight is nonzero")
+        kd_struct_active = nonzero == frozenset({"w_struct"})
+        if nonzero and not kd_struct_active and not self.targets_path:
+            raise ValueError("distill.targets_path is required when a teacher arm is active")
+        if kd_struct_active and self.targets_path:
+            raise ValueError("kd_struct derives its targets in-process; drop distill.targets_path")
         kd_rank_active = nonzero == frozenset({"w_rank", "w_dist"})
         if kd_rank_active and not self.context_targets_path:
             raise ValueError("distill.context_targets_path is required when kd_rank is active")
@@ -130,6 +141,7 @@ class DistillConfig:
             frozenset({"w_gram"}): "kd_gram",
             frozenset({"w_rep"}): "kd_rep",
             frozenset({"w_gen"}): "kd_gen",
+            frozenset({"w_struct"}): "kd_struct",
         }
         return mapped[nonzero]
 

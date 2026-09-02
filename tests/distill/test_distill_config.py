@@ -177,3 +177,13 @@ def test_from_mapping_full_kd_gen_roundtrip() -> None:
     assert cfg.w_gen == 1.0
     assert cfg.joint_warmup_frac == 0.2
     assert cfg.gen_lr_scale == 0.1
+
+
+def test_kd_struct_arm_pattern_needs_no_targets_path() -> None:
+    cfg = DistillConfig(w_struct=1.0)
+    assert cfg.active
+    assert cfg.arm == "kd_struct"
+    with pytest.raises(ValueError, match="in-process"):
+        DistillConfig(targets_path="t", w_struct=1.0)
+    with pytest.raises(ValueError, match="exactly one arm group"):
+        DistillConfig(targets_path="t", w_struct=1.0, w_logit=1.0)

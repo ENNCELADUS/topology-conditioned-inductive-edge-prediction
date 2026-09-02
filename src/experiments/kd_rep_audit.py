@@ -33,40 +33,16 @@ import torch
 from numpy.typing import NDArray
 
 from src.distill.artifacts import KDRowTargets, load_kd_targets
+from src.distill.struct_targets import STRUCT_NAMES, structural_targets
 from src.distill.teacher_targets import truth_graph_for_kd
 from src.train_b0 import assemble_data, load_config
 
 logger = logging.getLogger(__name__)
 
 F64 = NDArray[np.float64]
-_STRUCT_NAMES = ("log1p_cn", "log1p_deg_sum", "log1p_deg_absdiff", "jaccard", "log1p_adamic_adar")
 _TOP_K = (1, 2, 4, 8, 32)
 _GRAM_ROWS = 4096
 _PROBE_PCS = 8
-
-
-def structural_targets(
-    graph: nx.Graph, node_ids: list[str], a_idx: NDArray[np.int32], b_idx: NDArray[np.int32]
-) -> F64:
-    """Per-row ``(n, 5)`` structural descriptors with the queried partner masked out."""
-    neigh = {node: set(graph.neighbors(node)) for node in node_ids}
-    degree = {node: len(members) for node, members in neigh.items()}
-    out = np.zeros((len(a_idx), len(_STRUCT_NAMES)), dtype=np.float64)
-    for row, (a, b) in enumerate(zip(a_idx.tolist(), b_idx.tolist(), strict=True)):
-        u, v = node_ids[a], node_ids[b]
-        n_u = neigh[u] - {v}
-        n_v = neigh[v] - {u}
-        common = n_u & n_v
-        union = len(n_u | n_v)
-        aa = sum(1.0 / np.log1p(degree[w]) for w in common if degree[w] > 0)
-        out[row] = (
-            np.log1p(len(common)),
-            np.log1p(len(n_u)) + np.log1p(len(n_v)),
-            abs(np.log1p(len(n_u)) - np.log1p(len(n_v))),
-            len(common) / union if union else 0.0,
-            np.log1p(aa),
-        )
-    return out
 
 
 def content_features(
@@ -162,7 +138,7 @@ def audit_bank(
     content_va = content_features(f0, f0_index, node_ids, bank.val_pair_a_idx, bank.val_pair_b_idx)
     targets_tr = np.concatenate([struct_tr, logit_tr[:, None]], axis=1)
     targets_va = np.concatenate([struct_va, logit_va[:, None]], axis=1)
-    target_names = (*_STRUCT_NAMES, "teacher_logit")
+    target_names = (*STRUCT_NAMES, "teacher_logit")
 
     # V_val rows see only cross-boundary structure, so a random 20% slice of the
     # training block is the in-distribution held-out set; V_val is the shifted one.

@@ -1129,6 +1129,23 @@ class V3_1(nn.Module):
         self.kd_rep_head: nn.Linear | None = (
             nn.Linear(self.d_model, kd_rep_dim) if kd_rep_dim > 0 else None
         )
+        # kd_struct: auxiliary descriptor head on `pair_repr` (one hidden layer
+        # of `d_model`, no dropout); absent unless `kd_struct_dim > 0`.
+        kd_struct_dim = _to_int(model_config.get("kd_struct_dim", 0), "model_config.kd_struct_dim")
+        if kd_struct_dim < 0:
+            raise ValueError(f"model_config.kd_struct_dim must be >= 0, got {kd_struct_dim}")
+        self.kd_struct_head: MLPHead | None = (
+            MLPHead(
+                input_dim=self.d_model,
+                hidden_dims=[self.d_model],
+                output_dim=kd_struct_dim,
+                dropout=0.0,
+                activation=self.mlp_activation,
+                norm=self.mlp_norm,
+            )
+            if kd_struct_dim > 0
+            else None
+        )
 
         # kd_gen topology-latent generation: absent section => module not
         # built, the baseline stays identical. Built after the trunk and
@@ -1216,6 +1233,8 @@ class V3_1(nn.Module):
         output: dict[str, torch.Tensor] = {"pair_repr": pair_repr}
         if self.kd_rep_head is not None:
             output["kd_rep"] = self.kd_rep_head(pair_repr)
+        if self.kd_struct_head is not None:
+            output["kd_struct"] = self.kd_struct_head(pair_repr)
         if self.topo_gen is None:
             logits = self.output_head(pair_repr)
         else:

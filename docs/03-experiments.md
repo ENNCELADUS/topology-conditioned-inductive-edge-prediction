@@ -1,7 +1,6 @@
 # Experiments: Topology-Conditioned Inductive Edge Prediction
 
-**Status (2026-09-02):** paper-style experiment protocol and evidence record. Section 2 records the
-Pairwise baseline, Full-Ego Oracle ceiling, and completed KD1; KD2--KD4 await held-out tests.
+**Status (2026-09-02):** paper-style protocol and evidence record. Section 2 records the Pairwise baseline, Full-Ego Oracle ceiling, and completed KD1; KD2--KD4 and kd_struct await held-out tests.
 
 ## 1. Experimental setup
 
@@ -81,6 +80,7 @@ real-vs-real floor, so ratio 1 is that floor). Descriptors retain self-loops.
 | kd_representation | pair-representation cosine | PMA(4) Full-Ego Oracle row bank | representation-matching arm |
 | kd_gram | SPKD-style cosine-Gram relational match (Tung & Mori 2019) | PMA(4) Full-Ego Oracle row bank | relational-geometry arm |
 | kd_generation | pair-latent generative head | PMA(1) Full-Ego Oracle latent bank | generative test |
+| kd_struct | auxiliary head, MSE to z-scored truth-graph descriptors (CN, degrees, Jaccard, Adamic-Adar; queried partner masked) | none: targets from the training graph | descriptor arm and content→structure ceiling (§4) |
 | Oracles | observed topology | Full-Ego graph → GRIT → PMA | diagnostic ceilings |
 
 ![Teacher and student architecture](results/kd_rep_audit/teacher_architecture.svg)
@@ -141,8 +141,9 @@ Retired incidental-batch objective, not strict LLP; the strict-LLP MO-TPE study 
 
 **KD3 `kd_gram_w1` (selected epoch 10)** ![KD3 loss curves](results/kd3_kd_gram/learning_curves.png) ![KD3 V_val topology curves](results/kd3_kd_gram/validation_topology_curves.png)
 SPKD-style (Tung & Mori ICCV 2019) with feature-cosine rows and an off-diagonal mean; `w_gram` 0.01--100 spans KD-gradient
-dominance from 0.03× to above the task gradient, so the paper's γ has no untested analogue. The target $t_{uv}$ (below) has
-a rank-2 cosine Gram ($R^2=0.996$) that correlates $-0.86$ with teacher probability differences, so KD3 relationally
+dominance from 0.03× to above the task gradient, so the paper's γ has no untested analogue. 
+
+The target $t_{uv}$ (below) has a rank-2 cosine Gram ($R^2=0.996$) that correlates $-0.86$ with teacher probability differences, so KD3 relationally
 re-encodes KD1's target. The converged Gram loss (0.066 train / 0.074 V_val) equals a label-block-mean
 predictor (0.067 / 0.074; constant predictor 0.119 / 0.138): label-level fit is reached and nothing beyond it is demonstrated.
 

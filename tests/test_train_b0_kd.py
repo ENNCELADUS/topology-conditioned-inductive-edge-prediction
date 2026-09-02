@@ -16,6 +16,7 @@ import math
 from dataclasses import replace
 from pathlib import Path
 
+import networkx as nx
 import numpy as np
 import pytest
 import src.train_b0 as train_b0
@@ -32,6 +33,8 @@ from src.distill.artifacts import (
 )
 from src.distill.config import DistillConfig
 from src.distill.losses import kd_dist_loss, kd_gram_loss, kd_logit_loss, kd_rank_loss
+from src.distill.struct_targets import STRUCT_NAMES, structural_row_targets
+from src.eval.early_stopping import compose_val_total
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.train_b0 import (
     KDContextStream,
@@ -1509,3 +1512,174 @@ class TestKDRowBankArchChecks:
         model.kd_rep_head = nn.Linear(4, 4)
         with pytest.raises(RuntimeError, match=r"distill\.w_rep > 0"):
             self._build(distill, targets, model)
+
+
+# --------------------------------------------------------------------------- (h) kd_struct
+
+
+def _struct_targets(
+    node_ids: list[str], train_pairs: list[Pair], train_labels: list[int]
+) -> KDRowTargets:
+    graph = nx.Graph()
+    graph.add_nodes_from(node_ids)
+    graph.add_edges_from(
+        pair for pair, label in zip(train_pairs, train_labels, strict=True) if label
+    )
+    return structural_row_targets(
+        train_graph=graph,
+        val_graph=graph,
+        train_pairs=train_pairs,
+        train_labels=train_labels,
+        val_pairs=train_pairs[:2],
+        val_labels=train_labels[:2],
+    )
+
+
+def test_kd_struct_bank_requires_matching_head_and_uses_mse_on_exact_rows() -> None:
+    node_ids = [f"n{i}" for i in range(6)]
+    train_pairs = _ring_pairs(node_ids)
+    train_labels = [1, 0, 1, 0, 1, 1]
+    targets = _struct_targets(node_ids, train_pairs, train_labels)
+    distill = DistillConfig(w_struct=2.0)
+
+    def build(model: nn.Module) -> KDRowBank:
+        return KDRowBank(
+            distill,
+            targets,
+            train_pairs=train_pairs,
+            train_labels=train_labels,
+            val_pairs=train_pairs[:2],
+            val_labels=train_labels[:2],
+            model=model,
+            device=torch.device("cpu"),
+        )
+
+    with pytest.raises(RuntimeError, match="kd_struct_dim: 5"):
+        build(V3_1(**_tiny_v31_kwargs()))
+    with pytest.raises(RuntimeError, match="kd_struct_dim: 5"):
+        build(V3_1(**_tiny_v31_kwargs(), kd_struct_dim=3))
+    model = V3_1(**_tiny_v31_kwargs(), kd_struct_dim=5)
+    bank = build(model)
+    assert bank.global_relational is False
+
+    pred = torch.randn(3, 5, requires_grad=True)
+    rows = torch.tensor([4, 1, 3])
+    loss, stats = bank.loss({"_row_id": rows}, {"logits": torch.zeros(3), "kd_struct": pred})
+    expected = torch.nn.functional.mse_loss(
+        pred, torch.as_tensor(targets.teacher_rep[[4, 1, 3]]).float()
+    )
+    assert torch.allclose(loss, 2.0 * expected, atol=1e-6)
+    assert stats["rows"] == 3.0 and "sum_s" not in stats
+    assert stats["sum_struct_mse"] == pytest.approx(3.0 * expected.item(), rel=1e-5)
+    loss.backward()  # type: ignore[no-untyped-call]
+    assert pred.grad is not None and torch.isfinite(pred.grad).all()
+    telemetry = bank.epoch_telemetry(Accelerator(cpu=True), stats)
+    assert telemetry == {"kd_struct_loss": pytest.approx(expected.item(), rel=1e-5)}
+    with pytest.raises(RuntimeError, match="emit kd_struct"):
+        bank.loss({"_row_id": rows}, {"logits": torch.zeros(3)})
+
+
+def test_kd_struct_head_present_without_weight_raises() -> None:
+    node_ids = [f"n{i}" for i in range(4)]
+    train_pairs = _ring_pairs(node_ids)
+    targets = _struct_targets(node_ids, train_pairs, [1, 0, 1, 0])
+    with pytest.raises(RuntimeError, match=r"distill\.w_struct > 0"):
+        KDRowBank(
+            DistillConfig(),
+            targets,
+            train_pairs=train_pairs,
+            train_labels=[1, 0, 1, 0],
+            val_pairs=train_pairs[:2],
+            val_labels=[1, 0],
+            model=V3_1(**_tiny_v31_kwargs(), kd_struct_dim=5),
+            device=torch.device("cpu"),
+        )
+
+
+class _StructDiagModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {
+            "logits": self.scale * batch["logit_seed"],
+            "kd_struct": self.scale * batch["struct_seed"],
+        }
+
+
+def test_evaluate_distributed_kd_struct_reports_mse_and_per_descriptor_r2() -> None:
+    n = 4
+    target = torch.randn(n, 5)
+    # Rows arrive out of order; the diagnostics must re-align them by row id.
+    order = torch.tensor([2, 0, 3, 1])
+    pred = target[order] + torch.tensor([0.0, 0.1, 0.0, 0.0, 0.0])
+    batch = {
+        "label": torch.tensor([1.0, 0.0, 1.0, 0.0]),
+        "_row_id": order,
+        "logit_seed": torch.tensor([0.5, -0.5, 1.0, 0.0]),
+        "struct_seed": pred,
+    }
+    kd_val = KDValDiagnostics(
+        arm="kd_struct",
+        teacher_logit=torch.zeros(n),
+        teacher_logit_np=np.zeros(n),
+        teacher_rep=target.to(torch.float16),
+        teacher_latent=None,
+    )
+    outcome = _evaluate_distributed(
+        _StructDiagModel(),
+        [batch],
+        Accelerator(cpu=True),
+        expected_row_ids=np.arange(n),
+        kd_val=kd_val,
+    )
+    assert outcome.kd is not None
+    assert "val_kd_logit_corr" not in outcome.kd
+    assert outcome.kd["val_kd_struct_loss"] == pytest.approx(0.01 / 5, abs=1e-4)
+    r2 = {name: outcome.kd[f"val_kd_struct_r2_{name}"] for name in STRUCT_NAMES}
+    assert r2["log1p_cn"] == pytest.approx(1.0, abs=1e-3)
+    var_col1 = float(target[:, 1].var(unbiased=False))
+    assert r2["log1p_deg_sum"] == pytest.approx(1.0 - 0.01 / var_col1, abs=1e-2)
+    assert outcome.kd["val_kd_struct_loss"] == compose_val_total(
+        0.0, outcome.kd, DistillConfig(w_struct=1.0)
+    )
+
+
+def test_ddp_loop_kd_struct_end_to_end_on_cpu(tmp_path: Path) -> None:
+    node_ids = [f"n{i}" for i in range(4)]
+    train_pairs = _ring_pairs(node_ids)
+    train_labels = [1, 0, 1, 0]
+    targets = _struct_targets(node_ids, train_pairs, train_labels)
+    distill = DistillConfig(w_struct=1.0)
+    model = V3_1(**_tiny_v31_kwargs(), kd_struct_dim=5)
+    bank = KDRowBank(
+        distill,
+        targets,
+        train_pairs=train_pairs,
+        train_labels=train_labels,
+        val_pairs=train_pairs[:2],
+        val_labels=train_labels[:2],
+        model=model,
+        device=torch.device("cpu"),
+    )
+    batch = _v31_batch([0, 1, 2, 3], train_labels)
+    cfg = replace(_tiny_config(epochs=1), distill=distill)
+    result = train_ddp_loop(
+        model,
+        lambda epoch: [batch],
+        [batch],
+        cfg,
+        Accelerator(cpu=True),
+        warmup_steps=1,
+        artifact_dir=tmp_path / "attempt",
+        evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(
+            _constant_metrics(), None, {"val_kd_struct_loss": 0.7}, 0.5
+        ),
+        kd_bank=bank,
+    )
+    entry = result.history[0]
+    for key in ("train_kd_loss", "kd_struct_loss", "grad_norm_task", "grad_norm_kd"):
+        assert key in entry, f"missing telemetry key {key!r} in {sorted(entry)}"
+    assert "kd_logit_corr" not in entry
+    assert entry["val_total_loss"] == pytest.approx(0.5 + 0.7)

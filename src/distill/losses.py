@@ -38,6 +38,11 @@ def kd_rep_loss(
     return (1.0 - (student_norm * teacher_norm).sum(dim=-1)).mean()
 
 
+def kd_struct_loss(student_pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Mean squared error of the auxiliary head against z-scored structural descriptors."""
+    return F.mse_loss(student_pred, target.to(dtype=student_pred.dtype))
+
+
 def kd_rank_loss(
     student_logit: torch.Tensor,
     teacher_logit: torch.Tensor,
@@ -194,4 +199,5 @@ __all__ = [
     "kd_rep_loss",
     "kd_set_gram_loss",
     "kd_set_seed_loss",
+    "kd_struct_loss",
 ]

@@ -91,7 +91,9 @@ from src.distill.losses import (
     kd_logit_loss,
     kd_rank_loss,
     kd_rep_loss,
+    kd_struct_loss,
 )
+from src.distill.struct_targets import STRUCT_NAMES, structural_row_targets, substrate_graph
 from src.e2_pipeline import ProbeResult
 from src.eval.checkpoint_selection import (
     CheckpointCandidate,
@@ -2315,7 +2317,7 @@ def _evaluate_distributed(
     diag_parts: list[torch.Tensor] = []
     relational_block = torch.zeros(3, dtype=torch.float64, device=accelerator.device)
     inject_latent = kd_val is not None and kd_val.teacher_latent is not None
-    collect_diag = kd_val is not None and (kd_val.arm == "kd_rep" or inject_latent)
+    collect_diag = kd_val is not None and (kd_val.arm in {"kd_rep", "kd_struct"} or inject_latent)
     rng_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
     with torch.random.fork_rng(devices=rng_devices, enabled=inject_latent), torch.no_grad():
         for batch in val_loader:
@@ -2362,6 +2364,11 @@ def _evaluate_distributed(
                     diag = nn.functional.cosine_similarity(
                         student_rep.float(), teacher_rep, dim=-1, eps=1e-8
                     )
+                elif kd_val.arm == "kd_struct":
+                    struct_pred = output.get("kd_struct")
+                    if struct_pred is None:
+                        raise RuntimeError("kd_struct validation diagnostics require kd_struct")
+                    diag = struct_pred
                 else:  # kd_gen
                     latent_sample = output.get("gen_latent_sample")
                     if latent_sample is None:
@@ -2457,14 +2464,25 @@ def _evaluate_distributed(
             )
         if kd_val is not None:
             kd_metrics: dict[str, float] = {}
-            if diag_np is not None and diag_np.size > 0:
+            if diag_np is not None and diag_np.size > 0 and kd_val.arm == "kd_struct":
+                assert kd_val.teacher_rep is not None
+                pred = diag_np[np.argsort(row_ids_np)].astype(np.float64)
+                target = kd_val.teacher_rep.float().cpu().numpy().astype(np.float64)
+                resid = ((pred - target) ** 2).sum(axis=0)
+                total = ((target - target.mean(axis=0)) ** 2).sum(axis=0)
+                kd_metrics["val_kd_struct_loss"] = float(resid.sum() / pred.size)
+                for name, r2 in zip(
+                    STRUCT_NAMES, 1.0 - resid / np.maximum(total, 1e-12), strict=True
+                ):
+                    kd_metrics[f"val_kd_struct_r2_{name}"] = float(r2)
+            elif diag_np is not None and diag_np.size > 0:
                 key = "val_kd_rep_cos" if kd_val.arm == "kd_rep" else "val_kd_latent_cos"
                 kd_metrics[key] = float(diag_np.mean())
                 if kd_val.arm == "kd_rep":
                     kd_metrics["val_kd_rep_loss"] = 1.0 - kd_metrics[key]
             logits64 = logits_sorted.astype(np.float64)
             teacher64 = kd_val.teacher_logit_np
-            if logits64.shape[0] > 0:
+            if logits64.shape[0] > 0 and kd_val.arm != "kd_struct":
                 kd_metrics["val_kd_logit_corr"] = _pearson_from_moments(
                     float(logits64.sum()),
                     float(teacher64.sum()),
@@ -2703,8 +2721,9 @@ class KDValDiagnostics:
         teacher_logit_np: ``(n_val,)`` fp64 CPU copy, aligned with V_val
             classification row ids ``0..n_val-1`` -- the row order
             `validate_gathered_validation` sorts scored logits into.
-        teacher_rep: ``(n_val, rep_dim)`` fp16 teacher pooled embeddings, on
-            the training device; populated for ``kd_rep`` and ``kd_gram``.
+        teacher_rep: ``(n_val, rep_dim)`` fp16 teacher pooled embeddings (or
+            z-scored descriptors for ``kd_struct``), on the training device;
+            populated for ``kd_rep``, ``kd_gram``, and ``kd_struct``.
         teacher_latent: ``(n_val, latent_dim)`` fp16 teacher latents, on the
             training device; populated only for ``kd_gen`` and normalized at use.
         latent_scale: Artifact-wide teacher latent RMS used for normalization.
@@ -3184,6 +3203,7 @@ class KDRowBank:
         self._w_gram = distill.w_gram
         self._w_rep = distill.w_rep
         self._w_gen = distill.w_gen
+        self._w_struct = distill.w_struct
 
         node_ids_arr = np.asarray(targets.node_ids, dtype=object)
         self._verify_join(
@@ -3226,6 +3246,18 @@ class KDRowBank:
                 "model.config.kd_rep_dim > 0 requires distill.w_rep > 0 -- DDP would see "
                 "never-grad'ed kd_rep_head parameters otherwise"
             )
+        kd_struct_head = getattr(raw_model, "kd_struct_head", None)
+        if distill.w_struct > 0.0:
+            rep_dim = int(targets.teacher_rep.shape[1])
+            if kd_struct_head is None or int(kd_struct_head.layers[-1].out_features) != rep_dim:
+                raise RuntimeError(
+                    f"distill.w_struct > 0 requires model.config.kd_struct_dim: {rep_dim}"
+                )
+        elif kd_struct_head is not None:
+            raise RuntimeError(
+                "model.config.kd_struct_dim > 0 requires distill.w_struct > 0 -- DDP would "
+                "see never-grad'ed kd_struct_head parameters otherwise"
+            )
 
         self._topo_gen: TopoGenBase | None = None
         self._latent_scale = 1.0
@@ -3255,12 +3287,12 @@ class KDRowBank:
             self.train_a_idx = torch.as_tensor(targets.pair_a_idx, dtype=torch.int64, device=device)
             self.train_b_idx = torch.as_tensor(targets.pair_b_idx, dtype=torch.int64, device=device)
         self.train_rep: torch.Tensor | None = None
-        if distill.w_rep > 0.0 or distill.w_gram > 0.0 or distill.w_gen > 0.0:
+        if self.arm in {"kd_rep", "kd_gram", "kd_gen", "kd_struct"}:
             self.train_rep = torch.as_tensor(
                 targets.teacher_rep, dtype=torch.float16, device=device
             )
         val_teacher_rep: torch.Tensor | None = None
-        if self.arm in {"kd_rep", "kd_gram"}:
+        if self.arm in {"kd_rep", "kd_gram", "kd_struct"}:
             val_teacher_rep = torch.as_tensor(
                 targets.val_teacher_rep, dtype=torch.float16, device=device
             )
@@ -3343,20 +3375,21 @@ class KDRowBank:
             logit_term = kd_logit_loss(student_logit, teacher_logit)
             total = total + self._w_logit * logit_term
 
+        stats: dict[str, float] = {"rows": float(student_logit.numel())}
         with torch.no_grad():
             student_d = student_logit.detach().double()
             teacher_d = teacher_logit.detach().double()
-            stats: dict[str, float] = {
-                "rows": float(student_d.numel()),
-                "sum_s": float(student_d.sum().item()),
-                "sum_t": float(teacher_d.sum().item()),
-                "sum_s2": float((student_d * student_d).sum().item()),
-                "sum_t2": float((teacher_d * teacher_d).sum().item()),
-                "sum_st": float((student_d * teacher_d).sum().item()),
-                "sum_prob_err": float(
-                    (torch.sigmoid(student_d) - torch.sigmoid(teacher_d)).abs().sum().item()
-                ),
-            }
+            if self.arm != "kd_struct":
+                stats |= {
+                    "sum_s": float(student_d.sum().item()),
+                    "sum_t": float(teacher_d.sum().item()),
+                    "sum_s2": float((student_d * student_d).sum().item()),
+                    "sum_t2": float((teacher_d * teacher_d).sum().item()),
+                    "sum_st": float((student_d * teacher_d).sum().item()),
+                    "sum_prob_err": float(
+                        (torch.sigmoid(student_d) - torch.sigmoid(teacher_d)).abs().sum().item()
+                    ),
+                }
             if logit_term is not None:
                 stats["sum_logit_bce"] = float(logit_term.detach().item()) * stats["rows"]
 
@@ -3374,6 +3407,17 @@ class KDRowBank:
                     student_rep.float(), teacher_rep, dim=-1, eps=1e-8
                 )
                 stats["sum_rep_cos"] = float(cos.sum().item())
+
+        if self.arm == "kd_struct":
+            struct_pred = output.get("kd_struct")
+            if struct_pred is None:
+                raise RuntimeError("kd_struct requires the model forward to emit kd_struct")
+            assert self.train_rep is not None
+            struct_loss = kd_struct_loss(
+                struct_pred.float(), self.train_rep.index_select(0, rows).float()
+            )
+            total = total + self._w_struct * struct_loss
+            stats["sum_struct_mse"] = float(struct_loss.detach().item()) * stats["rows"]
 
         if self.arm == "kd_gram":
             student_rep = output.get("pair_repr")
@@ -3455,17 +3499,19 @@ class KDRowBank:
         if n <= 0.0:
             raise RuntimeError("KD epoch telemetry has zero rows across all ranks")
 
-        telemetry: dict[str, float] = {
-            "kd_logit_corr": _pearson_from_moments(
+        telemetry: dict[str, float] = {}
+        if self.arm == "kd_struct":
+            telemetry["kd_struct_loss"] = reduced_sums["sum_struct_mse"] / n
+        else:
+            telemetry["kd_logit_corr"] = _pearson_from_moments(
                 reduced_sums["sum_s"],
                 reduced_sums["sum_t"],
                 reduced_sums["sum_s2"],
                 reduced_sums["sum_t2"],
                 reduced_sums["sum_st"],
                 n,
-            ),
-            "kd_prob_mae": reduced_sums["sum_prob_err"] / n,
-        }
+            )
+            telemetry["kd_prob_mae"] = reduced_sums["sum_prob_err"] / n
         if self.arm == "kd_logit":
             telemetry["kd_logit_loss"] = reduced_sums["sum_logit_bce"] / n
         if self.arm == "kd_rep":
@@ -4817,7 +4863,17 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
     kd_val: KDValDiagnostics | None = None
     if cfg.distill is not None and cfg.distill.active:
         positives, negatives = _training_rows(val_split, assembled.exclude_nodes)
-        targets = load_kd_targets(Path(cfg.distill.targets_path))
+        if cfg.distill.arm == "kd_struct":
+            targets = structural_row_targets(
+                train_graph=val_split.build_training_graph(),
+                val_graph=substrate_graph(val_split, assembled.benchmark.split.train_graph),
+                train_pairs=positives + negatives,
+                train_labels=[1] * len(positives) + [0] * len(negatives),
+                val_pairs=val_cls_pairs,
+                val_labels=val_cls_labels,
+            )
+        else:
+            targets = load_kd_targets(Path(cfg.distill.targets_path))
         kd_bank = KDRowBank(
             cfg.distill,
             targets,
@@ -4847,7 +4903,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             logger.info(
                 "KD active: arm=%s targets=%s context_targets=%s",
                 cfg.distill.arm,
-                cfg.distill.targets_path,
+                cfg.distill.targets_path or targets.manifest.get("rep_source"),
                 cfg.distill.context_targets_path or None,
             )
 
