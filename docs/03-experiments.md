@@ -1,8 +1,7 @@
 # Experiments: Topology-Conditioned Inductive Edge Prediction
 
-**Status (2026-09-01):** paper-style experiment protocol and evidence record. Section 2
-numbers await fresh runs under the current protocol; legacy and diagnostic evidence is
-labeled wherever cited.
+**Status (2026-09-02):** paper-style experiment protocol and evidence record. Section 2 records the
+Pairwise baseline, Full-Ego Oracle ceiling, and completed KD1; KD2--KD4 await held-out tests.
 
 ## 1. Experimental setup
 
@@ -58,7 +57,7 @@ rows for the grounded arm; the frozen threshold replays unchanged as the one rep
 operating point (self-loops included). Test logits are calibrated by subtracting the
 frozen threshold so it sits at probability 0.5.
 
-**Uncertainty.** Runs are single-seed (disclosed). Arm-versus-control deltas report
+**Uncertainty.** Runs are single-seed (disclosed). Arm-versus-baseline deltas report
 size-stratified paired-bootstrap intervals over test sampled sets and test rows.
 
 ### 1.3 Metrics
@@ -77,7 +76,7 @@ real-vs-real floor, so ratio 1 is that floor). Descriptors retain self-loops.
 
 | Arm | KD signal | Teacher | Role |
 |---|---|---|---|
-| control (B0) | none | — | frozen endpoint-only comparator |
+| Pairwise baseline (B0) | none | — | frozen endpoint-only comparator |
 | kd_logit | GLNN-style pointwise soft-target BCE | PMA(4) Full-Ego Oracle row bank | attribution control |
 | kd_rank | LLP-style rank + distribution matching over context banks | PMA(4) Full-Ego Oracle context bank | primary transfer test (RQ2) |
 | kd_rep | pair-representation cosine | PMA(4) Full-Ego Oracle row bank | representation-matching arm |
@@ -87,10 +86,9 @@ real-vs-real floor, so ratio 1 is that floor). Descriptors retain self-loops.
 
 All arms share the identical V3.1 student, data, feature packs, and threshold rule;
 only the KD signal differs. Teachers read hidden topology at training time only, and
-the queried edge is always masked from its own structural context. Ladder status:
-B2/B3 latent arms are unrun; the B4 retrieval-grounded scaffold is implemented as a
-separately labeled support condition with a disclosed support universe and has no
-current formal result.
+the queried edge is always masked from its own structural context. B2/B3 latent arms
+are unrun; the B4 retrieval-grounded scaffold exists only as a separately labeled
+support condition with a disclosed support universe and no current formal result.
 
 ### 1.5 Training, HPO, and reproducibility
 
@@ -99,139 +97,67 @@ pooling (mean/attn/max/gated), pair_context_gated readout with abba_max order
 aggregation, label smoothing 0.05. Optimization: AdamW, lr 1e-4, weight decay 0.05,
 onecycle schedule, 25 epochs, 1,024 pairs per batch, gradient clip 1.0, bf16 DDP.
 
-HPO: a Phase-0 grid (24 runs) fixed per-arm incumbents (kd_logit_w100,
-kd_rank_wr0p1_wd1, kd_gram_w1, kd_rep_w0p1). kd_rank continues with a 16-trial
-constrained MO-TPE study (objectives GS ↑ and geometric-mean MMD ↓; soft constraint
-`|log RD| <= 0.05`) over w_rank × w_dist × context-bank configuration (hops ×
-negative-sampling rate) × margin. The best configuration per arm runs the held-out test
-protocol exactly once. Provenance recording and HPC completion requirements are
-protocol rules 5--6 (§6).
+HPO: a Phase-0 grid (24 runs) fixed per-arm incumbents (kd_logit_w100, kd_rank_wr0p1_wd1,
+kd_gram_w1, kd_rep_w0p1); kd_rank continues with a 16-trial constrained MO-TPE study
+(GS ↑, geometric-mean MMD ↓, soft constraint `|log RD| <= 0.05`) over w_rank × w_dist ×
+context bank (hops × negative-sampling rate) × margin. The best configuration per arm runs
+the held-out test protocol exactly once; provenance and HPC completion are rules 5--6 (§5).
 
 ## 2. Main results — edge and assembled topology
 
-Table 2 (pairwise, best HPO per arm) and Table 3 (the five topology numbers at each
-arm's single frozen V_val-selected threshold) are reported together, never one family
-alone. Prose reports per-arm deltas against the control and the joint verdict of
-protocol rule 7: a selected method must improve assembled topology without an
-unacceptable edge-metric loss and survive its coupling ablation.
+Table 2 (pairwise, best HPO per arm) and Table 3 (the five topology numbers at each arm's single
+frozen V_val-selected threshold) are reported together, never one family alone. Prose reports per-arm
+deltas against the Pairwise baseline and the joint verdict of protocol rule 7: a selected method must
+improve assembled topology without an unacceptable edge-metric loss and survive its coupling ablation.
 
 | Arm | AUROC | AUPRC | Accuracy | F1 | MCC |
 |---|---:|---:|---:|---:|---:|
-| control (B0) | — | — | — | — | — |
-| kd_logit | — | — | — | — | — |
+| Full-Ego Oracle | 0.9519 | 0.9566 | 0.7783 | 0.7184 | 0.6151 |
+| Pairwise baseline | 0.7067 | 0.7315 | 0.6083 | 0.3987 | 0.3020 |
+| kd_logit (`kd_logit_w100`) | 0.7195 | 0.7417 | 0.5950 | 0.3473 | 0.2917 |
 | kd_rank | — | — | — | — | — |
 | kd_rep | — | — | — | — | — |
 | kd_gram | — | — | — | — | — |
 
 | Arm | BFS GS | BFS RD | Degree | Clustering | Spectral |
 |---|---:|---:|---:|---:|---:|
-| control (B0) | — | — | — | — | — |
-| kd_logit | — | — | — | — | — |
+| Full-Ego Oracle | 0.6429 | 0.9955 | 2.667 | 1.875 | 5.207 |
+| Pairwise baseline | 0.3896 | 0.4223 | 13.08 | 11.93 | 18.09 |
+| kd_logit (`kd_logit_w100`) | 0.4048 | 0.4248 | 15.63 | 13.07 | 22.06 |
 | kd_rank | — | — | — | — | — |
 | kd_rep | — | — | — | — | — |
 | kd_gram | — | — | — | — | — |
 
-**Status.** All rows await fresh formal runs under the protocol above. The PMA(1)
-oracle in §3.1 is a current-protocol diagnostic and never enters these formal tables;
-the earlier D1--D8 KD results are retired as confounded by the removed anchor-context
-sampler.
+**Status.** KD1 epoch 25 (`7038fe0cd79ee244`) supplies the completed held-out
+`test_protocol_v6` row. Versus Pairwise: AUROC +0.013, AUPRC +0.010, GS +0.015;
+RD is unchanged at 0.42 while all MMD ratios worsen. KD2--KD4 remain selection-only.
 
-## 3. Topology headroom and diagnostics
+## 3. Ablations and sensitivity
 
-### 3.1 Oracle ceilings
-
-| Model | AUROC | AUPRC | Accuracy | F1 | MCC |
-|---|---:|---:|---:|---:|---:|
-| Pairwise baseline | 0.7067 | 0.7315 | 0.6083 | 0.3987 | 0.3020 |
-| PMA(1) Full-Ego Oracle | 0.9519 | 0.9566 | 0.7783 | 0.7184 | 0.6151 |
-
-| Model | BFS GS | BFS RD | Degree | Clustering | Spectral |
-|---|---:|---:|---:|---:|---:|
-| Pairwise baseline | 0.3896 | 0.4223 | 13.08 | 11.93 | 18.09 |
-| PMA(1) Full-Ego Oracle | 0.6429 | 0.9955 | 2.667 | 1.875 | 5.207 |
-
-**Finding.** PMA(1) preserves strong edge discrimination and assembled-graph fidelity
-at the fixed `V_val`-selected threshold, but all three MMD ratios remain above the
-real-vs-real floor. Hidden relational topology supplies substantial headroom; this
-truth-consuming oracle is neither a formal result nor a fair baseline.
-
-The Pairwise baseline is the legacy frozen V3.1 checkpoint `e092537d8cf1e208` and is
-retained only as historical context, not as a protocol-matched comparator. **PMA(1)
-Full-Ego Oracle** checkpoint `ea3e3ac37772acb2` (seed 0, selected epoch 9) pools
-variable-length full ego topology inside GRIT with one PMA seed. `test_protocol_v6`
-replays the fixed `V_val` logit threshold 4.4397 on held-out test and calibrates it to
-probability 0.5. Its selected-epoch `V_val` AUPRC/GS/RD was 0.9727/0.7643/0.9980 with
-MMD 16.34/1.88/14.81. Report:
-`outputs/egostitch_e2e_stage1_v3/full_ego_teacher_pma1/diagnostic_test_report.json` (H20).
-
-### 3.2 Feature-to-topology value (S0, S0-R)
-
-S0 asked whether endpoint features predict per-node structural summaries and whether
-those summaries help a pair classifier; S0-R asked the same for relational CN/AA.
-Oracle node summaries lift held-out AUPRC by +0.0237 and feature-predicted summaries by
-+0.0034 (CI includes 0); oracle CN/AA lifts it by +0.2438 (95% CI [0.2163, 0.2706])
-while feature-predicted CN/AA changes it by $2.3\times10^{-8}$. Predictability is
-uneven (degree $R^2=0.435$, clustering $R^2=0.051$, ego density ≈ unpredictable).
-**Finding:** the relational ceiling is large but is not recoverable as extra per-pair
-information from endpoint features — a deterministic predicted statistic is already a
-function of $(x_u,x_v)$. This motivates training-time transfer (the KD arms) over
-feature-derived statistics. Artifacts:
-[s0_results.json](../outputs/s0/s0_results.json),
-[s0r_results.json](../outputs/s0r/s0r_results.json).
-
-### 3.3 Assembly coherence (S1-R, S1-H)
-
-S1-R held frozen B0 scores fixed and tested node-coupled assembly: the corrected hard
-node-aligned degree oracle reached BFS GS 0.439 / RD 0.622 / MMD 4.06/5.44/7.65 versus
-0.390 / 0.423 / 13.03/11.86/18.07 for exact-count B0, closing 73.2% of the
-frozen-B0-to-oracle clustering gap without changing pair scores (1.62% quota shortfall,
-under the 2% limit); every legal post-hoc arm tested (predicted degrees, training-prior
-multiset, CN updates, V_hold-fit coupling) failed. S1-H reran the hard-quota assembler
-with no node-aligned identity: all three degree sources worsened the clustering gap
-(closure −0.150 / −0.280 / −0.319), so the true degree multiset is insufficient and
-node identity is the crux. **Finding:** coherent allocation of existing pairwise
-evidence can close much of the pair-to-graph gap, but only with node-specific budgets —
-motivating learned, non-factorized structure, not a legal post-hoc transform.
-Diagnostics only; jointly trained models remain untested. Artifacts:
-[s1_results.json](../outputs/s1/s1_results.json),
-[s1_hard_decomposition.json](../outputs/s1/s1_hard_decomposition.json).
-
-### 3.4 Archived evidence
-
-G1 (B0, B0-alt, PA-null, hard/degree-corrected controls): the pair-to-topology gap
-survives architecture and negative-regime checks. G2: edge-independent allocation has
-measurable structural limits. G3 (`oracle_topo`, `oracle_blend`): hidden relational
-topology provides assembled-graph headroom. The E2 report was retired in commit
-`bd465f2` and remains in version history. Prior EgoStitch screens were cut and
-carry no current formal result. GS provenance: §3.1 and S1 use the in-repo GS
-implementation; archived G1 used the official evaluator (B0 GS 0.312151). RD and MMD
-reproduce, but GS values must never be mixed across those provenances until the
-implementation difference is reconciled.
-
-## 4. Ablations and sensitivity
-
-- **KD components (winning arm):** w_rank vs w_dist, margin, and context-bank
-  configuration, harvested from the MO-TPE study surfaces — the LLP-style
-  rank-loss/distribution-loss decomposition.
+- **KD components (winning arm):** w_rank vs w_dist, margin, and context-bank configuration,
+  harvested from the MO-TPE study surfaces — the LLP-style rank-loss/distribution-loss decomposition.
 - **Threshold protocol:** the raw probability-0.5 operating point versus the frozen
   V_val-selected threshold, re-measured per sampled set on current arms. Historical
-  free-run densities (retired KD arms 5.7--16.2× over-dense at 0.5) are motivation
-  only and never comparison evidence.
-- **Control equivalence:** the all-zero KD configuration is bit-identical to the
-  control (tested), so ablation deltas are exact.
+  free-run densities (retired arms 5.7--16.2× over-dense at 0.5) are motivation, never evidence.
 
-## 5. Analysis
+## 4. Analysis
 
-- **Learning curves:** per arm, val AUPRC, `val_total_loss` (the stopping signal) and the
-  five val topology metrics per epoch from `metrics.jsonl` — the joint-selection trajectory.
+**Learning curves.** Completed seed-0 HPO-winner `V_val` surfaces (not held-out), one arm per block:
+losses, then the five topology metrics; the dotted marker is the selected epoch. KD2 is the retired
+incidental-batch objective, not strict LLP. KD1 ran all 25 epochs: train task loss 0.709→0.341, val
+AUPRC 0.781→0.927, logit correlation to the teacher 0.16→0.91 (train) / 0.52→0.87 (`V_val`), val
+soft-target BCE 0.604→0.365 against the 0.134 teacher-entropy floor, BFS GS 0.339→0.546 at RD 1.032.
+**KD1 `kd_logit_w100` (selected epoch 25)** ![KD1 loss curves](results/kd1_kd_logit/learning_curves.png) ![KD1 V_val topology curves](results/kd1_kd_logit/validation_topology_curves.png)
+**KD2 `kd_rank_wr0p1_wd1` (selected epoch 22)** ![KD2 loss curves](results/kd2_kd_rank/learning_curves.png) ![KD2 V_val topology curves](results/kd2_kd_rank/validation_topology_curves.png)
+**KD3 `kd_gram_w1` (selected epoch 10)** ![KD3 loss curves](results/kd3_kd_gram/learning_curves.png) ![KD3 V_val topology curves](results/kd3_kd_gram/validation_topology_curves.png)
+**KD4 `kd_rep_w0p1` (selected epoch 14)** ![KD4 loss curves](results/kd4_kd_rep/learning_curves.png) ![KD4 V_val topology curves](results/kd4_kd_rep/validation_topology_curves.png)
 - **Calibration:** ECE and Brier before/after the calibrating logit shift.
-- **Inference cost:** the student scores a pair from $(x_u,x_v)$ alone — no graph,
-  retrieval, or neighbor access at inference — while every teacher requires hidden ego
-  topology; report parameter counts and per-pair scoring throughput.
+- **Inference cost:** the student scores a pair from $(x_u,x_v)$ alone (no graph, retrieval, or
+  neighbor access) while every teacher requires hidden ego topology; report parameters and throughput.
 - **Failure modes:** MMD ratios remain above the real-vs-real floor even for oracles;
   uncertain negatives bound achievable edge metrics.
 
-## 6. Protocol rules
+## 5. Protocol rules
 
 1. Report pairwise and all five topology metrics together; no favorable nearby
    threshold or aggregate substitutes for the fixed rule.
