@@ -4688,10 +4688,12 @@ def _run_probe_mode(
     runtime = cfg.runtime
     if runtime is None:
         raise ValueError("probe mode requires a configured cfg.runtime")
-    if _validate_topo_gen_distill_contract(model, cfg.distill) is not None:
+    if _validate_topo_gen_distill_contract(model, cfg.distill) is not None or (
+        cfg.distill is not None and cfg.distill.arm == "kd_struct"
+    ):
         raise RuntimeError(
-            "ddp-mode probe does not support kd_gen because it has no KDRowBank "
-            "teacher-latent/gen-loss path; use epoch-probe or train"
+            "ddp-mode probe does not support kd_gen or kd_struct: their extra heads get no "
+            "gradient from the probe loss; use epoch-probe or train"
         )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
@@ -4937,6 +4939,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         node_index = table.manifest.node_index()
         lengths_by_node = {record.node_id: record.length for record in table.manifest.nodes}
         node_positions = np.array([node_index[node] for node in reference.nodes], dtype=np.int64)
+        universe_boundary = max(lengths_by_node[node] for node in reference.nodes)
         evaluate_fn = cast(
             EvaluateFn,
             functools.partial(
@@ -4949,8 +4952,16 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                         table=table,
                         node_a_all=torch.from_numpy(node_positions[universe.u_idx]).to(torch.int64),
                         node_b_all=torch.from_numpy(node_positions[universe.v_idx]).to(torch.int64),
-                        boundary=max(lengths_by_node[node] for node in reference.nodes),
-                        batch_pairs=runtime.max_pairs_per_rank,
+                        boundary=universe_boundary,
+                        # Every row pads to `universe_boundary`, so cap the no-grad
+                        # forward by the runtime token budget, not only by pairs.
+                        batch_pairs=max(
+                            1,
+                            min(
+                                runtime.max_pairs_per_rank,
+                                runtime.token_budget // (2 * universe_boundary),
+                            ),
+                        ),
                         u_idx=u_idx,
                         v_idx=v_idx,
                         reference=reference,
