@@ -120,48 +120,53 @@ class TestReportEdgeMetrics:
         with pytest.raises(ValueError, match="both classes"):
             report_edge_metrics(path)
 
-    def test_threshold_is_honored(self, tmp_path: Path) -> None:
-        """A non-default threshold changes the thresholded fields."""
+    def test_logit_threshold_is_honored(self, tmp_path: Path) -> None:
+        """A non-default logit threshold changes the thresholded fields."""
         path = tmp_path / "test.npz"
         _write_artifact(path)
 
-        low = report_edge_metrics(path, threshold=0.1)
-        high = report_edge_metrics(path, threshold=0.9)
+        low = report_edge_metrics(path, logit_threshold=-2.0)
+        high = report_edge_metrics(path, logit_threshold=2.0)
 
         assert low["metrics"]["sensitivity"] >= high["metrics"]["sensitivity"]
-        assert low["threshold"] == 0.1
-        assert high["threshold"] == 0.9
+        assert low["logit_threshold"] == -2.0
+        assert high["logit_threshold"] == 2.0
+        assert low["threshold"] == pytest.approx(1.0 / (1.0 + np.exp(2.0)))
+        assert high["threshold"] == pytest.approx(1.0 / (1.0 + np.exp(-2.0)))
 
 
-class TestLogitShiftCalibration:
-    """Test-time calibration: sigma(l + shift) >= 0.5 iff l >= -shift."""
+class TestLogitThresholdAndRawProbabilities:
+    """Thresholded fields decide on ``logit >= t``; ECE/Brier never see a shift."""
 
-    def test_thresholded_metrics_are_shift_invariant(self, tmp_path: Path) -> None:
-        """Shifting to 0.5 equals thresholding raw probs at sigma(t*)."""
+    def test_thresholded_metrics_match_compute_edge_metrics_at_sigmoid(
+        self, tmp_path: Path
+    ) -> None:
         path = tmp_path / "test.npz"
-        _write_artifact(path)
+        labels = _write_artifact(path)
         t_star = 0.4
+        logits = np.array([2.0, -1.5, 0.5, -0.25, 3.0, -2.0], dtype=np.float64)
+        probs = 1.0 / (1.0 + np.exp(-logits))
 
-        shifted = report_edge_metrics(path, logit_shift=-t_star)["metrics"]
-        raw = report_edge_metrics(path, threshold=float(1.0 / (1.0 + np.exp(-t_star))))["metrics"]
+        reported = report_edge_metrics(path, logit_threshold=t_star)["metrics"]
+        direct = compute_edge_metrics(labels, probs, threshold=float(1.0 / (1.0 + np.exp(-t_star))))
 
-        assert isinstance(shifted, dict) and isinstance(raw, dict)
-        for name in ("accuracy", "f1", "mcc", "sensitivity", "specificity", "auroc"):
-            assert shifted[name] == pytest.approx(raw[name])
+        assert isinstance(reported, dict)
+        for name in ("accuracy", "f1", "mcc", "sensitivity", "specificity"):
+            assert reported[name] == pytest.approx(getattr(direct, name))
 
-    def test_ece_and_brier_describe_the_calibrated_probabilities(self, tmp_path: Path) -> None:
+    def test_ece_and_brier_are_threshold_invariant(self, tmp_path: Path) -> None:
         path = tmp_path / "test.npz"
         _write_artifact(path)
 
-        unshifted = report_edge_metrics(path)["metrics"]
-        shifted = report_edge_metrics(path, logit_shift=-3.0)["metrics"]
+        default = report_edge_metrics(path)["metrics"]
+        moved = report_edge_metrics(path, logit_threshold=3.0)["metrics"]
 
-        assert isinstance(shifted, dict) and isinstance(unshifted, dict)
-        assert shifted["brier"] != pytest.approx(unshifted["brier"])
-        assert shifted["ece"] != pytest.approx(unshifted["ece"])
+        assert isinstance(moved, dict) and isinstance(default, dict)
+        assert moved["brier"] == pytest.approx(default["brier"])
+        assert moved["ece"] == pytest.approx(default["ece"])
 
-    def test_ranking_metrics_survive_shifted_sigmoid_saturation(self, tmp_path: Path) -> None:
-        """AUROC/AUPRC use raw logits even when shifted probabilities all round to one."""
+    def test_ranking_metrics_use_raw_logits_under_saturation(self, tmp_path: Path) -> None:
+        """AUROC/AUPRC use raw logits even when every probability rounds to one."""
         path = tmp_path / "candidate.npz"
         _write_artifact(
             path,
@@ -170,34 +175,31 @@ class TestLogitShiftCalibration:
             logits=np.array([35.0, 36.0, 37.0, 38.0], dtype=np.float32),
         )
 
-        unshifted = report_edge_metrics(path)["metrics"]
-        saturated = report_edge_metrics(path, logit_shift=10.0)["metrics"]
+        metrics = report_edge_metrics(path)["metrics"]
 
-        assert isinstance(unshifted, dict) and isinstance(saturated, dict)
-        assert saturated["auroc"] == pytest.approx(0.75)
-        assert saturated["auprc"] == pytest.approx(5 / 6)
-        assert saturated["auroc"] == pytest.approx(unshifted["auroc"])
-        assert saturated["auprc"] == pytest.approx(unshifted["auprc"])
+        assert isinstance(metrics, dict)
+        assert metrics["auroc"] == pytest.approx(0.75)
+        assert metrics["auprc"] == pytest.approx(5 / 6)
 
-    def test_logit_shift_is_echoed_beside_threshold(self, tmp_path: Path) -> None:
+    def test_default_is_probability_half(self, tmp_path: Path) -> None:
         path = tmp_path / "test.npz"
         _write_artifact(path)
 
-        report = report_edge_metrics(path, logit_shift=-0.4)
+        report = report_edge_metrics(path)
 
+        assert report["logit_threshold"] == 0.0
         assert report["threshold"] == 0.5
-        assert report["logit_shift"] == -0.4
-        assert report_edge_metrics(path)["logit_shift"] == 0.0
+        assert "logit_shift" not in report
 
-    def test_cli_accepts_logit_shift(self, tmp_path: Path) -> None:
+    def test_cli_accepts_logit_threshold(self, tmp_path: Path) -> None:
         scores = tmp_path / "test.npz"
         _write_artifact(scores)
         output = tmp_path / "out.json"
 
-        main(["--scores", str(scores), "--output", str(output), "--logit-shift", "-0.4"])
+        main(["--scores", str(scores), "--output", str(output), "--logit-threshold", "0.4"])
 
         payload = json.loads(output.read_text())
-        assert payload["logit_shift"] == -0.4
+        assert payload["logit_threshold"] == 0.4
 
 
 class TestSelfNonSelfSplit:

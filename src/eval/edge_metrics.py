@@ -55,6 +55,74 @@ class EdgeMetrics:
     n_neg: int
 
 
+@dataclass(frozen=True)
+class F1ThresholdSelection:
+    """The max-F1 decision threshold selected on one labeled score set.
+
+    Attributes:
+        logit_threshold: Decision rule ``score >= logit_threshold`` (a score value
+            from the selection set; ties in F1 resolve toward the larger value).
+        f1: F1 at that threshold on the selection set.
+        precision: Precision at that threshold on the selection set.
+        recall: Recall at that threshold on the selection set.
+        n_rows: Number of rows the threshold was selected on.
+    """
+
+    logit_threshold: float
+    f1: float
+    precision: float
+    recall: float
+    n_rows: int
+
+
+def select_max_f1_threshold(labels: np.ndarray, scores: np.ndarray) -> F1ThresholdSelection:
+    """Select the ``score >= t`` threshold maximizing F1 on a labeled score set.
+
+    Every distinct score value is a candidate ``t``; the rule is the same
+    ``>=`` comparison :func:`compute_edge_metrics` applies, so replaying the
+    returned threshold on the selection set reproduces ``f1`` exactly.
+
+    Args:
+        labels: 1-D array of binary labels (0/1).
+        scores: 1-D array of raw scores (logits), same length as `labels`.
+
+    Returns:
+        The selected threshold and its selection-set precision/recall/F1.
+
+    Raises:
+        ValueError: On a shape mismatch or single-class `labels`.
+    """
+    labels = np.asarray(labels)
+    scores = np.asarray(scores, dtype=np.float64)
+    if labels.shape != scores.shape or labels.ndim != 1:
+        raise ValueError(f"labels {labels.shape} and scores {scores.shape} must be 1-D and aligned")
+    n_pos = int((labels == 1).sum())
+    n_neg = int((labels == 0).sum())
+    if n_pos == 0 or n_neg == 0:
+        raise ValueError(
+            f"labels must contain both classes to select an F1 threshold; got n_pos={n_pos}, "
+            f"n_neg={n_neg}"
+        )
+    order = np.argsort(-scores, kind="stable")
+    sorted_scores = scores[order]
+    positive = (labels[order] == 1).astype(np.int64)
+    # Predicting positive for every row with score >= v, for each distinct v:
+    # the cumulative counts at the last row of each equal-score run.
+    last_of_run = np.append(sorted_scores[1:] != sorted_scores[:-1], True)
+    tp = np.cumsum(positive)[last_of_run]
+    predicted = (np.arange(1, sorted_scores.size + 1))[last_of_run]
+    thresholds = sorted_scores[last_of_run]
+    f1 = 2.0 * tp / (predicted + n_pos)
+    best = int(np.flatnonzero(f1 == f1.max())[0])  # thresholds descend, so first = largest
+    return F1ThresholdSelection(
+        logit_threshold=float(thresholds[best]),
+        f1=float(f1[best]),
+        precision=float(tp[best] / predicted[best]),
+        recall=float(tp[best] / n_pos),
+        n_rows=int(labels.size),
+    )
+
+
 def _expected_calibration_error(labels: np.ndarray, probs: np.ndarray, ece_bins: int) -> float:
     """Compute expected calibration error over equal-width bins on [0, 1].
 

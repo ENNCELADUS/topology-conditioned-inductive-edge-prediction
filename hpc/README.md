@@ -85,8 +85,8 @@ points reserve held-out test for winners. `hpc/sweep_kd_hpo.sh all` runs all poi
 `0,1,2,3`; numbered lanes retain the split mode. Record its PID for liveness and inspect the exact tree before stopping verified processes because Accelerate creates child groups.
 
 Only `egostitch_e2e` is ledgered against repeat scoring. Validation threshold selection is
-non-held-out; its two held-out passes share one ledger epoch and report the single validation-fixed
-operating point: topology at the frozen threshold, classification at calibrated probability 0.5.
+non-held-out; its two held-out passes share one ledger epoch and replay two validation-frozen
+thresholds: the topology cascade threshold and the `val_cls` max-F1 threshold for Accuracy/F1/MCC.
 Re-running an already-scored `(arm, seed)` fails with "repeat scoring requires
 --rescore-reason"; pass `--rescore-reason "<why>"` after the config path (and any
 `--worker-module`/`--run-kind` flags) to `hpc/run.sh train` to intentionally re-open it.
@@ -139,7 +139,7 @@ parsing before any scoring happens, because that flag's choices are mode names o
 Each control also needs its own `--output-dir`, distinct from the `full` arm's own
 directory and from each other's. `run_test_protocol` unconditionally (over)writes
 `test_protocol_run_metadata.json`, `test_report.json`, and
-`scores/{val_topology,test,test_topology}.npz`, V_val support caches, and shared
+`scores/{val_topology,val_cls,test,test_topology}.npz`, V_val support caches, and shared
 `f0_cache_test_support.pt`/`grounding_cache_test_support.npz` into `--output-dir`. It never writes a
 published `run_metadata.json` — it validates an existing one instead — but pointing a
 control at `outputs/egostitch_e2e_v3_full` would clobber the trained `full` arm's

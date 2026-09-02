@@ -2442,6 +2442,30 @@ def test_val_topology_is_exact_sample_union_with_full_vval_support(
     )
 
 
+def test_val_cls_is_the_balanced_vval_classification_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(score_universe, "_VAL_REGION_PARAMS", _VAL_REGION_TEST_PARAMS)
+    data_root = _write_val_region_benchmark_package(tmp_path)
+    split = score_universe._load_val_region_split(data_root, "breadth_first")
+
+    pairs, labels = score_universe._resolve_pairs("val_cls", data_root, "breadth_first")
+
+    assert pairs == list(split.val_cls_pairs)
+    np.testing.assert_array_equal(labels, np.array(split.val_cls_labels, dtype=np.int8))
+    assert {node for pair in pairs for node in pair} <= set(split.v_val)
+    assert labels.sum() == labels.size - labels.sum()
+
+
+def test_val_cls_pairs_source_is_never_a_heldout_universe() -> None:
+    assert (
+        score_universe._is_heldout_universe(
+            {"model_family": "egostitch_e2e", "pairs_source": "val_cls"}
+        )
+        is False
+    )
+
+
 def test_val_topology_pairs_source_is_never_a_heldout_universe() -> None:
     assert (
         score_universe._is_heldout_universe(

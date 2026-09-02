@@ -2,7 +2,7 @@
 
 import numpy as np
 import pytest
-from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
+from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics, select_max_f1_threshold
 
 
 @pytest.mark.unit
@@ -93,3 +93,48 @@ class TestEdgeCaseConventions:
         result = compute_edge_metrics(labels, probs)
         with pytest.raises(Exception):  # noqa: B017, PT011 - frozen dataclass raises FrozenInstanceError
             result.auroc = 0.0  # type: ignore[misc]
+
+
+@pytest.mark.unit
+class TestSelectMaxF1Threshold:
+    labels = np.array([1, 1, 1, 0, 1, 0, 0, 0])
+    scores = np.array([3.0, 2.0, 1.0, 0.5, 0.0, -1.0, -2.0, -3.0])
+
+    def test_hand_computed_optimum(self) -> None:
+        # t=1.0: tp=3, fp=0, fn=1 -> F1 6/7; t=0.0: tp=4, fp=1 -> F1 8/9 (best);
+        # t=-1.0: tp=4, fp=2 -> 0.8.
+        selection = select_max_f1_threshold(self.labels, self.scores)
+        assert selection.logit_threshold == 0.0
+        assert selection.f1 == pytest.approx(8 / 9)
+        assert selection.precision == pytest.approx(0.8)
+        assert selection.recall == pytest.approx(1.0)
+        assert selection.n_rows == 8
+
+    def test_replaying_threshold_reproduces_f1(self) -> None:
+        selection = select_max_f1_threshold(self.labels, self.scores)
+        probs = 1.0 / (1.0 + np.exp(-self.scores))
+        replay = compute_edge_metrics(
+            self.labels, probs, threshold=1.0 / (1.0 + np.exp(-selection.logit_threshold))
+        )
+        assert replay.f1 == pytest.approx(selection.f1)
+
+    def test_ties_resolve_to_the_larger_threshold(self) -> None:
+        # Both t=3.0 (tp=1, fp=0, fn=1) and t=0.0 (tp=2, fp=2) give F1 = 2/3.
+        labels = np.array([1, 0, 0, 1])
+        scores = np.array([3.0, 2.0, 1.0, 0.0])
+        assert select_max_f1_threshold(labels, scores).logit_threshold == 3.0
+
+    def test_equal_scores_are_one_candidate(self) -> None:
+        labels = np.array([1, 0, 1, 0])
+        scores = np.array([1.0, 1.0, 1.0, 0.0])
+        selection = select_max_f1_threshold(labels, scores)
+        assert selection.logit_threshold == 1.0
+        assert selection.f1 == pytest.approx(0.8)
+
+    def test_single_class_raises(self) -> None:
+        with pytest.raises(ValueError, match="both classes"):
+            select_max_f1_threshold(np.array([1, 1]), np.array([0.1, 0.2]))
+
+    def test_shape_mismatch_raises(self) -> None:
+        with pytest.raises(ValueError, match="aligned"):
+            select_max_f1_threshold(np.array([1, 0, 1]), np.array([0.1, 0.2]))

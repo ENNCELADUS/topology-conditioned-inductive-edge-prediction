@@ -104,8 +104,8 @@ fail-closed.
 - Report edge-level and assembled-graph metrics together — never one family alone.
 - Each topology operating point reports five numbers together: BFS-macro GS/RD and degree /
   clustering / spectral MMD ratios (GS↑, RD→1, ratios↓). The primary deployable result is the ONE
-  V_val-selected fixed threshold (density-first cascade) on every test subgraph, calibrated by
-  logit shift to sit at probability 0.5 on test. GS is edge-set Dice/F1, not an MMD summary.
+  V_val-selected fixed threshold (density-first cascade) on every test subgraph; Accuracy/F1/MCC use
+  a separate max-F1 threshold frozen on `val_cls`; ECE/Brier use raw probabilities. GS is edge-set Dice/F1.
   
 ## Data-contract traps
 

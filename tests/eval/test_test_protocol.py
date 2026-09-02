@@ -155,6 +155,19 @@ def _build_fixture(tmp_path: Path) -> _Fixture:
         pairs_source="test",
         checkpoint_id=_CHECKPOINT_ID,
     )
+    val_cls_path = scores_dir / "val_cls.npz"
+    _write_universe_npz(
+        val_cls_path,
+        node_ids=_NODES,
+        pairs=pairs,
+        # Same separable scores as test: the max-F1 threshold is logit(0.9), the
+        # smallest positive score, and replaying it on test gives F1 = 1.
+        logits=logits,
+        labels=labels,
+        strategy=_STRATEGY,
+        pairs_source="val_cls",
+        checkpoint_id=_CHECKPOINT_ID,
+    )
     val_topology_path = scores_dir / "val_topology.npz"
     _write_universe_npz(
         val_topology_path,
@@ -174,6 +187,7 @@ def _build_fixture(tmp_path: Path) -> _Fixture:
         data_root=data_root,
         artifacts={
             "val_topology": val_topology_path,
+            "val_cls": val_cls_path,
             "test": test_path,
             "test_topology": test_topology_path,
         },
@@ -257,7 +271,7 @@ class TestRunTestProtocol:
             topo_gen_control=control,
         )
 
-        for pairs_source in ("val_topology", "test", "test_topology"):
+        for pairs_source in ("val_topology", "val_cls", "test", "test_topology"):
             assert _arg_value(runner.call_for(pairs_source), "--topo-gen-control") == control
         arm_block = result.report["arm"]
         assert isinstance(arm_block, dict)
@@ -279,15 +293,14 @@ class TestRunTestProtocol:
             score_runner=runner,
         )
 
-        # 1. Validation freezes the deployable topology threshold before either
-        # held-out pass is allowed to run.
-        assert runner.pairs_order == ["val_topology", "test", "test_topology"]
-        assert not (output_dir / "operating_point.json").exists()
+        # 1. Validation freezes both thresholds (topology on val_topology, max-F1
+        # on val_cls) before either held-out pass is allowed to run.
+        assert runner.pairs_order == ["val_topology", "val_cls", "test", "test_topology"]
 
         # 3. --data-root/--strategy/--checkpoint and --run-metadata forwarded to every
         # pass, pointed at this module's own scoring-identity file (never the
         # published run_metadata.json -- see test_never_overwrites_published_run_metadata).
-        for pairs_source in ("val_topology", "test", "test_topology"):
+        for pairs_source in ("val_topology", "val_cls", "test", "test_topology"):
             call = runner.call_for(pairs_source)
             assert _arg_value(call, "--checkpoint") == str(checkpoint)
             assert _arg_value(call, "--data-root") == str(fixture.data_root)
@@ -306,11 +319,11 @@ class TestRunTestProtocol:
             "schema_version",
             "arm",
             "edge",
-            "calibration",
+            "classification_threshold",
             "graph",
             "provenance",
         ]
-        assert report["schema_version"] == "test_protocol_v6"
+        assert report["schema_version"] == "test_protocol_v7"
 
         arm_block = report["arm"]
         assert isinstance(arm_block, dict)
@@ -320,7 +333,7 @@ class TestRunTestProtocol:
         assert arm_block["checkpoint_id"] == _CHECKPOINT_ID
         assert arm_block["checkpoint_sha256"] == test_protocol._sha256_file(checkpoint)
 
-        # 5. Edge block: calibrated to the selected threshold, headline first.
+        # 5. Edge block: the frozen max-F1 threshold, raw probabilities, headline first.
         edge = report["edge"]
         assert isinstance(edge, dict)
         assert edge["pairs_source"] == "test"
@@ -334,10 +347,26 @@ class TestRunTestProtocol:
         # explicit null rather than dropping the key.
         assert edge["metrics_self"] is None
         assert edge["metrics_non_self"] is not None
-        assert edge["metrics"]["threshold"] == pytest.approx(0.5)
+        f1_logit = float(np.float32(_logit_for_prob(0.9)))
+        assert edge["logit_threshold"] == pytest.approx(f1_logit)
+        assert edge["metrics"]["threshold"] == pytest.approx(float(expit(f1_logit)))
+        assert edge["metrics"]["f1"] == pytest.approx(1.0)
+        assert "logit_shift" not in edge
+        classification = report["classification_threshold"]
+        assert isinstance(classification, dict)
+        assert classification == {
+            "method": "max_f1_selected_on_val_cls",
+            "logit_threshold": pytest.approx(f1_logit),
+            "probability_threshold": pytest.approx(float(expit(f1_logit))),
+            "val_rows": len(_universe_rows(_NODES, _POSITIVE_EDGES)[0]),
+            "val_f1": pytest.approx(1.0),
+            "val_precision": pytest.approx(1.0),
+            "val_recall": pytest.approx(1.0),
+            "probabilities": "raw_sigmoid",
+        }
 
-        # 6. The single operating point: the validation-selected threshold,
-        # shifted to probability 0.5 on test by logit calibration.
+        # 6. The topology operating point: the validation-selected threshold
+        # replayed unchanged on test.
         graph = report["graph"]
         assert isinstance(graph, dict)
         assert set(graph.keys()) == {"fixed_threshold"}
@@ -347,17 +376,8 @@ class TestRunTestProtocol:
         selected_threshold = fixed["validation_selection"]["selected"]["logit_threshold"]
         assert fixed["test"]["logit_threshold"] == pytest.approx(selected_threshold)
         assert fixed["test"]["graph_similarity"]["bfs_macro"] == pytest.approx(0.0)
-        calibration = report["calibration"]
-        assert isinstance(calibration, dict)
-        assert calibration == {
-            "method": "logit_shift_to_validation_selected_threshold",
-            "logit_shift": -selected_threshold,
-            "selected_logit_threshold": selected_threshold,
-            "selected_probability_threshold": pytest.approx(float(expit(selected_threshold))),
-        }
-        assert edge["logit_shift"] == pytest.approx(-selected_threshold)
 
-        # 7. Provenance: two artifact paths, sha256, and ledger digests
+        # 7. Provenance: four artifact paths, sha256, and ledger digests
         # (null here -- v3_1 never claims the held-out E2E universe).
         provenance = report["provenance"]
         assert isinstance(provenance, dict)
@@ -384,8 +404,7 @@ class TestRunTestProtocol:
                 score_runner=runner,
             )
 
-        assert runner.pairs_order == ["val_topology", "test", "test_topology"]
-        assert not (output_dir / "operating_point.json").exists()
+        assert runner.pairs_order == ["val_topology", "val_cls", "test", "test_topology"]
         assert not (output_dir / "test_report.json").exists()
 
     def test_failing_validation_pass_never_opens_test(self, tmp_path: Path) -> None:
@@ -424,8 +443,7 @@ class TestRunTestProtocol:
                 score_runner=runner,
             )
 
-        assert runner.pairs_order == ["val_topology", "test"]
-        assert not (output_dir / "operating_point.json").exists()
+        assert runner.pairs_order == ["val_topology", "val_cls", "test"]
         assert not (output_dir / "test_report.json").exists()
 
     def test_forwards_optional_flags_with_rescore_reason_only_on_heldout_passes(
@@ -451,7 +469,7 @@ class TestRunTestProtocol:
             rescore_reason="repeat scoring for gate re-run",
         )
 
-        for pairs_source in ("val_topology", "test", "test_topology"):
+        for pairs_source in ("val_topology", "val_cls", "test", "test_topology"):
             call = runner.call_for(pairs_source)
             assert _arg_value(call, "--pack-dir") == str(pack_dir)
             assert _arg_value(call, "--scaffold-control") == "shuffle_within_pair_v3"
@@ -460,6 +478,7 @@ class TestRunTestProtocol:
             call = runner.call_for(pairs_source)
             assert _arg_value(call, "--rescore-reason") == "repeat scoring for gate re-run"
         assert "--rescore-reason" not in runner.call_for("val_topology")
+        assert "--rescore-reason" not in runner.call_for("val_cls")
 
     def test_omitted_optional_flags_are_never_forwarded(self, tmp_path: Path) -> None:
         fixture = _build_fixture(tmp_path)
@@ -532,6 +551,7 @@ class TestRunTestProtocol:
         # test_protocol's namespace) does not observe.
         assert calls == [
             str(fixture.artifacts["val_topology"]),
+            str(fixture.artifacts["val_cls"]),
             str(fixture.artifacts["test"]),
             str(fixture.artifacts["test_topology"]),
         ]
@@ -595,25 +615,6 @@ class TestRunTestProtocol:
                 reuse_existing_scores=True,
             )
 
-    def test_rejects_legacy_max_f1_artifacts_before_scoring(self, tmp_path: Path) -> None:
-        fixture = _build_fixture(tmp_path)
-        output_dir = tmp_path / "outputs" / "legacy"
-        output_dir.mkdir(parents=True)
-        (output_dir / "operating_point.json").write_text("{}\n", encoding="utf-8")
-        runner = _FakeScoreRunner(fixture.artifacts)
-
-        with pytest.raises(ValueError, match="obsolete max-F1"):
-            run_test_protocol(
-                checkpoint=_write_checkpoint(tmp_path),
-                output_dir=output_dir,
-                data_root=fixture.data_root,
-                strategy=_STRATEGY,
-                arm="full",
-                seed=0,
-                score_runner=runner,
-            )
-        assert runner.calls == []
-
 
 class TestReuseExistingScores:
     """Resuming a run whose later pass failed must not redo the finished ones."""
@@ -628,7 +629,7 @@ class TestReuseExistingScores:
         (scores_dir / "test.npz").write_bytes(fixture.artifacts["test"].read_bytes())
 
         controlled_artifacts: dict[str, Path] = {}
-        for pairs_source in ("val_topology", "test_topology"):
+        for pairs_source in ("val_topology", "val_cls", "test_topology"):
             destination = tmp_path / "controlled_scores" / f"{pairs_source}.npz"
             _copy_with_topo_gen_control(fixture.artifacts[pairs_source], destination, "shuffle")
             controlled_artifacts[pairs_source] = destination
@@ -647,12 +648,14 @@ class TestReuseExistingScores:
                 reuse_existing_scores=True,
             )
 
-        assert runner.pairs_order == ["val_topology"]
+        assert runner.pairs_order == ["val_topology", "val_cls"]
         assert not (scores_dir / "test_topology.npz").exists()
         assert not (output_dir / "test_report.json").exists()
 
     @pytest.mark.parametrize("mismatched_control", [None, "branch_zero"])
-    @pytest.mark.parametrize("mismatched_source", ["val_topology", "test", "test_topology"])
+    @pytest.mark.parametrize(
+        "mismatched_source", ["val_topology", "val_cls", "test", "test_topology"]
+    )
     def test_rejects_reused_topo_gen_control_mismatch(
         self, tmp_path: Path, mismatched_control: str | None, mismatched_source: str
     ) -> None:
@@ -751,7 +754,7 @@ class TestReuseExistingScores:
             reuse_existing_scores=True,
         )
 
-        assert runner.pairs_order == ["val_topology", "test_topology"]
+        assert runner.pairs_order == ["val_topology", "val_cls", "test_topology"]
 
     def test_reuse_is_opt_in(self, tmp_path: Path) -> None:
         """Implicit reuse would silently serve stale scores after a code fix."""
@@ -773,7 +776,7 @@ class TestReuseExistingScores:
             score_runner=runner,
         )
 
-        assert runner.pairs_order == ["val_topology", "test", "test_topology"]
+        assert runner.pairs_order == ["val_topology", "val_cls", "test", "test_topology"]
 
 
 class TestPublishedRunMetadataNeverClobbered:
@@ -1058,7 +1061,7 @@ class TestPublishedRunMetadataNeverClobbered:
         )
 
         assert published_path.read_bytes() == published_bytes_before
-        assert runner.pairs_order == ["val_topology", "test", "test_topology"]
+        assert runner.pairs_order == ["val_topology", "val_cls", "test", "test_topology"]
 
 
 class TestUniverseScopedCaches:
@@ -1107,6 +1110,9 @@ class TestUniverseScopedCaches:
         assert validation_grounding.endswith("grounding_cache_vval_support.npz")
         assert validation_f0 != f0_path
         assert validation_grounding != grounding_path
+        val_cls_call = runner.call_for("val_cls")
+        assert _arg_value(val_cls_call, "--f0-cache") == validation_f0
+        assert _arg_value(val_cls_call, "--grounding-cache") == validation_grounding
 
 
 class TestOneLedgerEpochPerProtocolRun:

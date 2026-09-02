@@ -37,6 +37,7 @@ import numpy as np
 from numpy.typing import NDArray
 from sklearn.metrics import average_precision_score, roc_auc_score
 
+from src.eval.calibration import stable_sigmoid
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.score_universe import load_scores, validate_artifact_precision
 
@@ -50,21 +51,6 @@ _UNLABELED = -1
 #: the split exists to expose self-loop behavior in the final reported result, not
 #: to re-cut model-selection numbers.
 _SPLIT_REPORTING_SOURCES = ("test",)
-
-
-def _shifted_probs(logit: NDArray[np.floating], logit_shift: float) -> NDArray[np.float64]:
-    """Return the stable sigmoid of ``logit + logit_shift`` in float64.
-
-    Mirrors ``ScoresArtifact.probs()`` exactly, so a shift of ``0.0`` is
-    numerically identical to the unshifted artifact probabilities.
-    """
-    shifted = logit.astype(np.float64) + logit_shift
-    out = np.empty_like(shifted)
-    positive = shifted >= 0
-    out[positive] = 1.0 / (1.0 + np.exp(-shifted[positive]))
-    exp_l = np.exp(shifted[~positive])
-    out[~positive] = exp_l / (1.0 + exp_l)
-    return out
 
 
 def _stratum_metrics(
@@ -112,7 +98,7 @@ def _metrics_with_rank_scores(
     threshold: float,
     ece_bins: int,
 ) -> EdgeMetrics:
-    """Use raw logits for ranking and calibrated probabilities otherwise."""
+    """Use raw logits for ranking and raw sigmoid probabilities otherwise."""
     metrics = compute_edge_metrics(labels, probs, threshold=threshold, ece_bins=ece_bins)
     return replace(
         metrics,
@@ -125,9 +111,8 @@ def report_edge_metrics(
     scores_path: Path,
     *,
     expect_pairs_source: str | None = None,
-    threshold: float = 0.5,
+    logit_threshold: float = 0.0,
     ece_bins: int = 15,
-    logit_shift: float = 0.0,
 ) -> dict[str, object]:
     """Load a scores artifact and compute its edge-level classification metrics.
 
@@ -146,13 +131,11 @@ def report_edge_metrics(
         expect_pairs_source: When set, require ``meta["pairs_source"]`` to equal
             it. Guards against reporting a candidate-universe artifact as the
             balanced test view, or vice versa.
-        threshold: Decision threshold for the thresholded metrics.
+        logit_threshold: Decision rule ``logit >= logit_threshold`` for the
+            thresholded metrics (0.0 is probability 0.5). Probabilities are the
+            raw sigmoid of the logits: ECE/Brier describe the model's own
+            outputs, and AUROC/AUPRC use raw logits.
         ece_bins: Bin count for expected calibration error.
-        logit_shift: Added to every raw logit before the sigmoid, so calibration
-            (e.g. shifting a validation-selected threshold to probability 0.5)
-            is applied here rather than by rescoring; ECE/Brier then describe
-            the calibrated, deployed probabilities. AUROC/AUPRC use raw logits
-            and therefore remain invariant to the shift.
 
     Returns:
         A JSON-serializable dict carrying the self-loop-including ``metrics``
@@ -199,7 +182,10 @@ def report_edge_metrics(
 
     labels64 = labels.astype(np.int64)
     rank_scores = artifact.logit.astype(np.float64)
-    probs = _shifted_probs(artifact.logit, logit_shift)
+    probs = artifact.probs()
+    # sigmoid is strictly increasing, so `probs >= threshold` is exactly
+    # `logit >= logit_threshold` under the same float64 map.
+    threshold = float(stable_sigmoid(np.array([logit_threshold], dtype=np.float64))[0])
     is_self = artifact.u_idx == artifact.v_idx
 
     metrics = _metrics_with_rank_scores(
@@ -229,8 +215,8 @@ def report_edge_metrics(
         "strategy": artifact.meta.get("strategy"),
         "num_rows": n_rows,
         "self_rows": int(is_self.sum()),
+        "logit_threshold": logit_threshold,
         "threshold": threshold,
-        "logit_shift": logit_shift,
         "ece_bins": ece_bins,
         "self_loops_included": True,
         "metrics": asdict(metrics),
@@ -261,7 +247,7 @@ def report_edge_metrics(
     report["self_loop_rate"] = {
         "self_rows": int(is_self.sum()),
         "reference_positive": int((labels64[is_self] == 1).sum()),
-        "predicted_positive": int((probs[is_self] >= threshold).sum()),
+        "predicted_positive": int((rank_scores[is_self] >= logit_threshold).sum()),
     }
     return report
 
@@ -280,12 +266,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="require this pairs_source; omit to accept whatever the artifact carries",
     )
-    parser.add_argument("--threshold", type=float, default=0.5, help="decision threshold")
     parser.add_argument(
-        "--logit-shift",
+        "--logit-threshold",
         type=float,
         default=0.0,
-        help="added to every raw logit before the sigmoid (test-time calibration)",
+        help="decision rule logit >= threshold (0.0 is probability 0.5)",
     )
     parser.add_argument("--ece-bins", type=int, default=15, help="calibration bin count")
     return parser
@@ -303,9 +288,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     report = report_edge_metrics(
         args.scores,
         expect_pairs_source=args.expect_pairs_source,
-        threshold=args.threshold,
+        logit_threshold=args.logit_threshold,
         ece_bins=args.ece_bins,
-        logit_shift=args.logit_shift,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     # Not sort_keys: the insertion order puts the self-loop-including headline

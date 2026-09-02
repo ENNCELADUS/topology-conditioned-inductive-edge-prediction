@@ -2,16 +2,17 @@
 
 Owns the whole post-train sequence for one arm and nothing else::
 
-    score val_topology -> select one fixed threshold on validation samples
-    score test          -> edge metrics, logits calibrated so that threshold
-                           sits at probability 0.5
-    score test_topology -> the validation-fixed threshold replayed unchanged
+    score val_topology -> select the topology threshold (density-first cascade)
+    score val_cls       -> select the classification threshold (max F1)
+    score test          -> AUROC/AUPRC on raw logits; Accuracy/F1/MCC at the
+                           frozen max-F1 threshold; ECE/Brier on raw sigmoid
+    score test_topology -> the topology threshold replayed unchanged
         -> test_report.json
 
-One operating point serves both metric families: the validation-selected logit
-threshold, shifted to probability 0.5 by test-time logit calibration.
-Both metric families are always reported together; a partial report is never
-written.
+The two thresholds are selected on V_val, frozen before any held-out pair is
+read, and never substituted for one another: no logit shift stands in for
+probability calibration. Both metric families are always reported together;
+a partial report is never written.
 
 This module composes existing analysis primitives; it never rescores a pair or
 reimplements a metric. It never calls ``validate_score_precision`` directly on
@@ -36,6 +37,7 @@ from typing import Protocol, cast
 import numpy as np
 from scipy.special import expit
 
+from src.eval.edge_metrics import select_max_f1_threshold
 from src.eval.fixed_threshold import evaluate_fixed_threshold, select_fixed_threshold
 from src.eval.graph_metrics import MMDConfig
 from src.eval.report_edge_metrics import report_edge_metrics
@@ -57,7 +59,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["ScoreRunner", "TestProtocolResult", "build_parser", "main", "run_test_protocol"]
 
-_SCHEMA_VERSION = "test_protocol_v6"
+_SCHEMA_VERSION = "test_protocol_v7"
 #: The filename `src.e2_pipeline` (and `src.train_egostitch`/`src.train_b0`)
 #: publish training provenance into: checkpoint identity, publication status,
 #: and access-audit fields no scoring call may destroy. This module never
@@ -446,10 +448,6 @@ def run_test_protocol(
     output_dir.mkdir(parents=True, exist_ok=True)
     scores_dir = output_dir / "scores"
     scores_dir.mkdir(parents=True, exist_ok=True)
-    legacy_artifacts = [output_dir / "operating_point.json"]
-    stale = [str(path) for path in legacy_artifacts if path.exists()]
-    if stale:
-        raise ValueError(f"remove obsolete max-F1 test artifacts before scoring: {stale}")
 
     # Fix for the P1 defect where this module clobbered a published
     # run_metadata.json: validate it in place (if present) and write this
@@ -520,7 +518,9 @@ def run_test_protocol(
         )
         return score_runner(args)
 
-    # 1. Select the fixed operating point before any held-out pair is read.
+    # 1. Select both frozen thresholds before any held-out pair is read: the
+    # topology operating point on the sampled V_val union, the classification
+    # operating point (max F1) on the balanced V_val classification rows.
     validation_path = _score(
         "val_topology",
         support_namespace="vval",
@@ -548,7 +548,28 @@ def run_test_protocol(
         config=config,
     )
 
-    # 2. Only after threshold freeze, score the held-out classification and
+    val_cls_path = _score(
+        "val_cls",
+        support_namespace="vval",
+        allow_rescore_reason=False,
+        include_scoring_run_id=False,
+    )
+    val_cls_artifact = load_scores(val_cls_path)
+    validate_artifact_precision(val_cls_artifact, label=str(val_cls_path))
+    _require_pairs_source(val_cls_artifact, "val_cls", label=str(val_cls_path))
+    _require_full_universe(val_cls_artifact, label=str(val_cls_path))
+    _require_scoring_identity(
+        artifact=val_cls_artifact,
+        checkpoint_id=expected_checkpoint_id,
+        strategy=strategy,
+        topo_gen_control=topo_gen_control,
+        label=str(val_cls_path),
+    )
+    f1_selection = select_max_f1_threshold(
+        val_cls_artifact.label.astype(np.int64), val_cls_artifact.logit.astype(np.float64)
+    )
+
+    # 2. Only after both thresholds freeze, score the held-out classification and
     # sampled-topology unions. Both passes share one scoring run,
     # sharing one scoring-run id (when this checkpoint is egostitch_e2e) so
     # they join the SAME test-access-ledger epoch.
@@ -587,21 +608,25 @@ def run_test_protocol(
         label=str(topology_path),
     )
 
-    _require_same_checkpoint(validation_artifact, test_artifact, topology_artifact)
-
-    # 3. Classification uses the same validation-selected operating point:
-    # logits shift by -t* so the frozen threshold sits at probability 0.5
-    # (sigma(l - t*) >= 0.5 iff l >= t*), and ECE/Brier describe the
-    # calibrated, deployed probabilities.
-    logit_shift = -fixed_selection.logit_threshold
-    edge_report = report_edge_metrics(
-        test_path, expect_pairs_source="test", threshold=0.5, logit_shift=logit_shift
+    _require_same_checkpoint(
+        validation_artifact, val_cls_artifact, test_artifact, topology_artifact
     )
-    calibration_report: dict[str, object] = {
-        "method": "logit_shift_to_validation_selected_threshold",
-        "logit_shift": logit_shift,
-        "selected_logit_threshold": fixed_selection.logit_threshold,
-        "selected_probability_threshold": float(expit(fixed_selection.logit_threshold)),
+
+    # 3. Classification replays the frozen max-F1 threshold; AUROC/AUPRC use raw
+    # logits and ECE/Brier the raw sigmoid probabilities (no calibration is
+    # fitted, and no threshold shift is passed off as one).
+    edge_report = report_edge_metrics(
+        test_path, expect_pairs_source="test", logit_threshold=f1_selection.logit_threshold
+    )
+    classification_report: dict[str, object] = {
+        "method": "max_f1_selected_on_val_cls",
+        "logit_threshold": f1_selection.logit_threshold,
+        "probability_threshold": float(expit(f1_selection.logit_threshold)),
+        "val_rows": f1_selection.n_rows,
+        "val_f1": f1_selection.f1,
+        "val_precision": f1_selection.precision,
+        "val_recall": f1_selection.recall,
+        "probabilities": "raw_sigmoid",
     }
 
     # 4. Replay the frozen validation threshold unchanged on every test sample
@@ -663,6 +688,11 @@ def run_test_protocol(
             "sha256": _sha256_file(validation_path),
             "test_access_ledger_record_sha256": None,
         },
+        "val_cls": {
+            "path": str(val_cls_path),
+            "sha256": _sha256_file(val_cls_path),
+            "test_access_ledger_record_sha256": None,
+        },
         "test": {
             "path": str(test_path),
             "sha256": _sha256_file(test_path),
@@ -685,7 +715,7 @@ def run_test_protocol(
         "schema_version": _SCHEMA_VERSION,
         "arm": arm_report,
         "edge": edge_report,
-        "calibration": calibration_report,
+        "classification_threshold": classification_report,
         "graph": graph_report,
         "provenance": provenance,
     }
@@ -703,9 +733,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m src.eval.test_protocol",
         description=(
-            "Run the post-train test protocol for one arm: select a fixed topology "
-            "threshold on sampled V_val subgraphs, then score test/test_topology and "
-            "report edge metrics calibrated to it plus its replayed topology."
+            "Run the post-train test protocol for one arm: freeze the topology "
+            "threshold on sampled V_val subgraphs and the max-F1 threshold on V_val "
+            "classification rows, then score test/test_topology and report both."
         ),
     )
     parser.add_argument("--checkpoint", type=Path, required=True, help="published checkpoint")

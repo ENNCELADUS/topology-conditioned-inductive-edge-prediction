@@ -34,36 +34,36 @@ supervise a representation or objective. After scoring a pair universe, predicti
 assembled into $\widehat G_\tau$ only for evaluation. Inferred topology is intermediate
 context, never the prediction target and never generic graph generation.
 
-**Evidence classes.** A *comparator* is a frozen model or score artifact evaluated
-without changing its checkpoint or opening new test-dependent choices; a *formal result*
-follows this fixed pre-test protocol and can carry paper claims.
+**Evidence classes.** A *comparator* is a frozen model or score artifact evaluated without changing
+its checkpoint or opening new test-dependent choices; a *formal result* follows this fixed pre-test protocol.
 
-**Model selection.** Training early-stops on total val loss (patience 10): the val
-task BCE plus each active KD term's val counterpart at its training weight. The
-published checkpoint is chosen independently, by mean rank over V_val AUPRC plus the
-five bucket-topology metrics (§1.3); usability is judged from `metrics.jsonl`.
+**Model selection.** Training early-stops on total val loss (patience 10): the val task BCE plus
+each active KD term's val counterpart at its training weight. The published checkpoint is chosen
+independently, by mean rank over V_val AUPRC plus the five bucket-topology metrics (§1.3).
 
-**Threshold rule.** The single fixed threshold selects on the `V_val` 20--200-node
-sampled-set pair union. Define `D_RD(t)` as the size-bucket macro-average of mean
-`|log RD|`; among finite atomic candidates, let `t_min=argmin_t D_RD(t)` and retain
-exactly those with `D_RD(t) <= D_RD(t_min) + SE_t`, where `SE_t` is the size-stratified
-paired-bootstrap SE of the difference. Among survivors minimize
-`D_shape=(1/3) sum_s log(max(r_s(t), epsilon))`, `epsilon=1e-12`, then break ties
-toward the larger threshold; empty-prediction candidates have `D_RD=+inf`. Freeze
-before test.
+**Topology threshold.** Selected on the `V_val` 20--200-node sampled-set pair union. Define
+`D_RD(t)` as the size-bucket macro-average of mean `|log RD|`; among finite atomic candidates,
+let `t_min=argmin_t D_RD(t)` and retain exactly those with `D_RD(t) <= D_RD(t_min) + SE_t`,
+where `SE_t` is the size-stratified paired-bootstrap SE of the difference. Among survivors
+minimize `D_shape=(1/3) sum_s log(max(r_s(t), epsilon))`, `epsilon=1e-12`, then break ties
+toward the larger threshold; empty-prediction candidates have `D_RD=+inf`. Freeze before test.
 
-**Test replay.** Test topology scores only its sampled-set pair union plus support-only
-rows for the grounded arm; the frozen threshold replays unchanged as the one reported
-operating point (self-loops included). Test logits are calibrated by subtracting the
-frozen threshold so it sits at probability 0.5.
+**Classification threshold.** Selected separately as the max-F1 logit threshold on the balanced
+`V_val` classification rows (`val_cls`) and frozen before test. It serves only Accuracy/F1/MCC;
+AUROC/AUPRC use raw logits, ECE/Brier use the raw sigmoid probabilities, and no logit shift
+stands in for calibration.
+
+**Test replay.** Test topology scores only its sampled-set pair union plus support-only rows for
+the grounded arm; the frozen topology threshold replays unchanged as the one reported operating
+point (self-loops included), and the frozen classification threshold replays on the balanced test rows.
 
 **Uncertainty.** Runs are single-seed (disclosed). Arm-versus-baseline deltas report
 size-stratified paired-bootstrap intervals over test sampled sets and test rows.
 
 ### 1.3 Metrics
 
-Pairwise: AUROC and AUPRC (threshold-free); Accuracy, F1, and MCC at calibrated
-probability 0.5; ECE and Brier for calibration. Detailed edge tables also retain class
+Pairwise: AUROC and AUPRC (threshold-free); Accuracy, F1, and MCC at the frozen max-F1
+threshold; ECE and Brier on raw probabilities. Detailed edge tables also retain class
 balance, uncertain-negative disclosure, and the completed easy, hard, degree-corrected,
 full-universe, and PA-null negative-regime controls, which qualify every edge claim.
 
@@ -151,7 +151,7 @@ soft-target BCE 0.604→0.365 against the 0.134 teacher-entropy floor, BFS GS 0.
 **KD2 `kd_rank_wr0p1_wd1` (selected epoch 22)** ![KD2 loss curves](results/kd2_kd_rank/learning_curves.png) ![KD2 V_val topology curves](results/kd2_kd_rank/validation_topology_curves.png)
 **KD3 `kd_gram_w1` (selected epoch 10)** ![KD3 loss curves](results/kd3_kd_gram/learning_curves.png) ![KD3 V_val topology curves](results/kd3_kd_gram/validation_topology_curves.png)
 **KD4 `kd_rep_w0p1` (selected epoch 14)** ![KD4 loss curves](results/kd4_kd_rep/learning_curves.png) ![KD4 V_val topology curves](results/kd4_kd_rep/validation_topology_curves.png)
-- **Calibration:** ECE and Brier before/after the calibrating logit shift.
+- **Calibration:** ECE and Brier on raw probabilities; any fitted temperature/Platt map is a separate, disclosed row.
 - **Inference cost:** the student scores a pair from $(x_u,x_v)$ alone (no graph, retrieval, or
   neighbor access) while every teacher requires hidden ego topology; report parameters and throughput.
 - **Failure modes:** MMD ratios remain above the real-vs-real floor even for oracles;
@@ -163,8 +163,8 @@ soft-target BCE 0.604→0.365 against the 0.134 teacher-entropy floor, BFS GS 0.
    threshold or aggregate substitutes for the fixed rule.
 2. Preserve provenance: Oracle, S0, S0-R, S1, and any test-informed follow-up remain
    `formal:false` even when their execution is valid.
-3. Select the single fixed threshold on sampled `V_val`, freeze it, calibrate test
-   logits so it sits at probability 0.5, then evaluate test once; never tune it on test.
+3. Freeze both `V_val` thresholds (topology cascade; max-F1 classification) before test,
+   evaluate test once, and never tune either on test or pass a logit shift off as calibration.
 4. Bind comparisons to the same frozen features, split, sampled sets, grounding
    support, self-loop convention, checkpoint, and fixed-threshold rule.
 5. Validate score precision before analysis. Record checkpoint ID, artifact hashes,
