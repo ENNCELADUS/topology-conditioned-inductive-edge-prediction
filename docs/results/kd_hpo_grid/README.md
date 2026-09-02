@@ -15,8 +15,8 @@ also not comparable to the published 2-rank KD1–KD4 reports (`../b1_kd_arms.md
 
 ## 2. Completed matched control
 
-Phase-0 selection used published B0 `e092537d8cf1e208` as proxy control: held-out AUPRC/AUROC 0.7315/0.7067, ECE/Brier 0.3396/0.3520, GS/RD 0.3675/0.3236, and MMD 20.92/18.38/28.25.
-The later zero-KD `kd_control` matches the 25-epoch seed-0 4-H20 recipe; its selected V_val row is below. Held-out AUPRC/AUROC was 0.7360/0.7056, ECE/Brier 0.3581/0.3461, GS/RD 0.3849/0.5572, and MMD 8.73/7.79/13.54.
+Phase-0 selection used published B0 `e092537d8cf1e208` as proxy control: held-out (`test_protocol_v7` replay) AUPRC/AUROC 0.7316/0.7067, ECE/Brier 0.3396/0.3520, GS/RD 0.3672/0.3221, and MMD 21.03/18.49/28.39.
+The later zero-KD `kd_control` matches the 25-epoch seed-0 4-H20 recipe; its selected V_val row is below. Held-out (`test_protocol_v7` replay) AUPRC/AUROC was 0.7360/0.7056, ECE/Brier 0.2194/0.2705 on raw probabilities, GS/RD 0.3849/0.5572, and MMD 8.73/7.79/13.54.
 Its direct test wrote merged scores and `outputs/b1_row_kd_hpo/kd_control/test_report.json`, but no pipeline-owned `test_complete.json` sentinel.
 
 ## 3. Cadence-2 historical surfaces (selected epoch; AUPRC telemetry, never optimized)

@@ -18,8 +18,7 @@ Pairwise baseline, Full-Ego Oracle ceiling, and completed KD1; KD2--KD4 await he
 
 Train and test nodes are disjoint; the primary split strategy is `breadth_first`.
 `V_val` is grown by K=5 dispersed-seed hashed-frontier BFS on the substrate's loopless giant component, stopped at 20% induced loopless edges; all graph-edge counts are loopless positives.
-Raw train-side, `V_val`, and test labeled sets are balanced 1:1; effective train need not be. `V_val`
-is only pair-disjoint; test is node-disjoint.
+Raw train-side, `V_val`, and test labeled sets are balanced 1:1; effective train need not be. `V_val` is only pair-disjoint; test is node-disjoint.
 
 Each node carries a frozen intrinsic token sequence (≤1024 tokens × 1536 dims); F0 is
 its fp32 mean-pooled vector. Negatives are the fixed benchmark's balanced samples. Graph truth is observation-biased, so uncertain negatives are disclosed.
@@ -80,7 +79,7 @@ real-vs-real floor, so ratio 1 is that floor). Descriptors retain self-loops.
 | kd_logit | GLNN-style pointwise soft-target BCE | PMA(4) Full-Ego Oracle row bank | attribution control |
 | kd_rank | LLP-style rank + distribution matching over context banks | PMA(4) Full-Ego Oracle context bank | primary transfer test (RQ2) |
 | kd_rep | pair-representation cosine | PMA(4) Full-Ego Oracle row bank | representation-matching arm |
-| kd_gram | Gram-matrix relational match | PMA(4) Full-Ego Oracle row bank | relational-geometry arm |
+| kd_gram | SPKD-style cosine-Gram relational match (Tung & Mori 2019) | PMA(4) Full-Ego Oracle row bank | relational-geometry arm |
 | kd_gen | pair-latent generative head | PMA(1) Full-Ego Oracle latent bank | generative test (RQ3); det/EDM complete |
 | Oracles | observed hidden topology | — | diagnostic ceilings |
 
@@ -92,10 +91,9 @@ support condition with a disclosed support universe and no current formal result
 
 ### 1.5 Training, HPO, and reproducibility
 
-The student is V3.1: d_model 512, 3 encoder + 3 cross-attention layers, 8 heads, rich
-pooling (mean/attn/max/gated), pair_context_gated readout with abba_max order
-aggregation, label smoothing 0.05. Optimization: AdamW, lr 1e-4, weight decay 0.05,
-onecycle schedule, 25 epochs, 1,024 pairs per batch, gradient clip 1.0, bf16 DDP.
+The student is V3.1: d_model 512, 3 encoder + 3 cross-attention layers, 8 heads, rich pooling
+(mean/attn/max/gated), pair_context_gated readout with abba_max order aggregation, label smoothing
+0.05. Optimization: AdamW, lr 1e-4, weight decay 0.05, onecycle, 25 epochs, 1,024 pairs per batch, clip 1.0, bf16 DDP.
 
 HPO: a Phase-0 grid (24 runs) fixed per-arm incumbents (kd_logit_w100, kd_rank_wr0p1_wd1,
 kd_gram_w1, kd_rep_w0p1); kd_rank continues with a 16-trial constrained MO-TPE study
@@ -112,9 +110,9 @@ improve assembled topology without an unacceptable edge-metric loss and survive 
 
 | Arm | AUROC | AUPRC | Accuracy | F1 | MCC |
 |---|---:|---:|---:|---:|---:|
-| Full-Ego Oracle | 0.9519 | 0.9566 | 0.7783 | 0.7184 | 0.6151 |
-| Pairwise baseline | 0.7067 | 0.7315 | 0.6083 | 0.3987 | 0.3020 |
-| kd_logit (`kd_logit_w100`) | 0.7195 | 0.7417 | 0.5950 | 0.3473 | 0.2917 |
+| Full-Ego Oracle | 0.9519 | 0.9566 | 0.8711 | 0.8776 | 0.7464 |
+| Pairwise baseline | 0.7067 | 0.7316 | 0.6261 | 0.4769 | 0.3072 |
+| kd_logit (`kd_logit_w100`) | 0.7195 | 0.7417 | 0.6459 | 0.6670 | 0.2941 |
 | kd_rank | — | — | — | — | — |
 | kd_rep | — | — | — | — | — |
 | kd_gram | — | — | — | — | — |
@@ -122,15 +120,17 @@ improve assembled topology without an unacceptable edge-metric loss and survive 
 | Arm | BFS GS | BFS RD | Degree | Clustering | Spectral |
 |---|---:|---:|---:|---:|---:|
 | Full-Ego Oracle | 0.6429 | 0.9955 | 2.667 | 1.875 | 5.207 |
-| Pairwise baseline | 0.3896 | 0.4223 | 13.08 | 11.93 | 18.09 |
+| Pairwise baseline | 0.3672 | 0.3221 | 21.03 | 18.49 | 28.39 |
 | kd_logit (`kd_logit_w100`) | 0.4048 | 0.4248 | 15.63 | 13.07 | 22.06 |
 | kd_rank | — | — | — | — | — |
 | kd_rep | — | — | — | — | — |
 | kd_gram | — | — | — | — | — |
 
-**Status.** KD1 epoch 25 (`7038fe0cd79ee244`) supplies the completed held-out
-`test_protocol_v6` row. Versus Pairwise: AUROC +0.013, AUPRC +0.010, GS +0.015;
-RD is unchanged at 0.42 while all MMD ratios worsen. KD2--KD4 remain selection-only.
+**Status.** All rows are `test_protocol_v7` replays (2026-09-02): Full-Ego Oracle `ea3e3ac37772acb2`
+(diagnostic), Pairwise baseline `e092537d8cf1e208` (seed 47), KD1 epoch 25 `7038fe0cd79ee244`; max-F1
+thresholds at probability 0.66/0.20/0.15 and raw ECE/Brier 0.092/0.108, 0.340/0.352, 0.221/0.268. KD1 vs
+Pairwise: AUROC +0.013, AUPRC +0.010, F1 +0.190, MCC −0.013, GS +0.038, RD 0.42 vs 0.32, all MMD lower;
+matched seed-0 `kd_control` replays to AUPRC 0.7360, F1 0.6609, GS/RD 0.3849/0.5572. KD2--KD4 remain selection-only.
 
 ## 3. Ablations and sensitivity
 
