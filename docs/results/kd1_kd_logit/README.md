@@ -22,7 +22,7 @@ and the frozen teacher probability. All other KD weights are zero.
 ![KD1 train and validation learning curves](learning_curves.png)
 ![KD1 validation topology curves](validation_topology_curves.png)
 The first figure plots train/validation losses; the second plots BFS-macro GS/RD and all three MMD
-ratios on V_val. The dotted line marks selected epoch 25, not a minimum-loss selection rule.
+ratios on V_val, with Oracle V_val references. The dotted line marks selected epoch 25.
 [CSV](learning_curves.csv) contains all exact 25-epoch values, and the
 [plot script](plot_learning_curves.py) reproduces both PNGs directly from it.
 

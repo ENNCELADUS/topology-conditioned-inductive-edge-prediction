@@ -42,9 +42,11 @@ HERE = Path(__file__).resolve().parent
 DATA_PATH = HERE / "learning_curves.csv"
 OUTPUT_PATH = HERE / "learning_curves.png"
 TOPOLOGY_OUTPUT_PATH = HERE / "validation_topology_curves.png"
+ORACLE_REFERENCE_PATH = HERE.parent / "oracle_vval_reference.csv"
 
 TRAIN_COLOR = "#0072B2"
 VAL_COLOR = "#D55E00"
+ORACLE_COLOR = "#009E73"
 GRAY = "#666666"
 
 
@@ -64,6 +66,16 @@ def load_curves() -> dict[str, list[float]]:
         if not all(math.isfinite(value) for value in values):
             raise ValueError(f"non-finite value in column {name!r}")
     return curves
+
+
+def load_oracle_reference() -> dict[str, float]:
+    """Load the shared selected-epoch Oracle V_val metrics."""
+    with ORACLE_REFERENCE_PATH.open(newline="", encoding="utf-8") as handle:
+        values = {row["metric"]: float(row["value"]) for row in csv.DictReader(handle)}
+    required = {panel[2] for panel in TOPOLOGY_PANELS}
+    if missing := required - values.keys():
+        raise ValueError(f"missing Oracle V_val metrics: {sorted(missing)}")
+    return values
 
 
 def configure_style() -> None:
@@ -147,6 +159,7 @@ def plot_topology_panel(
     caption: str,
     ylabel: str,
     target: float | None,
+    oracle: float,
     label_selected: bool,
 ) -> None:
     """Draw one validation-topology metric across epochs."""
@@ -161,6 +174,7 @@ def plot_topology_panel(
     )
     if target is not None:
         ax.axhline(target, color="#999999", linewidth=0.9, linestyle="--", zorder=0)
+    ax.axhline(oracle, color=ORACLE_COLOR, linewidth=1.2, linestyle="-.", zorder=0)
     ax.axvline(SELECTED_EPOCH, color=GRAY, linewidth=1.0, linestyle=":", zorder=0)
     if label_selected:
         blend = mtransforms.blended_transform_factory(ax.transData, ax.transAxes)
@@ -184,7 +198,9 @@ def plot_topology_panel(
     ax.set_axisbelow(True)
 
 
-def render_topology_curves(curves: dict[str, list[float]]) -> None:
+def render_topology_curves(
+    curves: dict[str, list[float]], oracle_reference: dict[str, float]
+) -> None:
     """Render the five validation-topology metrics as a 300-DPI PNG."""
     epochs = curves["epoch"]
     fig, axes = plt.subplots(
@@ -202,10 +218,28 @@ def render_topology_curves(curves: dict[str, list[float]]) -> None:
             caption,
             ylabel,
             target,
+            oracle_reference[key],
             index == 0,
         )
-    for ax in flat_axes[len(TOPOLOGY_PANELS) :]:
-        ax.set_visible(False)
+    legend_ax = flat_axes[-1]
+    legend_ax.axis("off")
+    legend_ax.legend(
+        handles=[
+            Line2D([0], [0], color=VAL_COLOR, marker="s", linewidth=1.6, label="KD V_val"),
+            Line2D(
+                [0],
+                [0],
+                color=ORACLE_COLOR,
+                linewidth=1.2,
+                linestyle="-.",
+                label="Oracle V_val",
+            ),
+            Line2D([0], [0], color=GRAY, linewidth=1.0, linestyle=":", label="Selected epoch"),
+            Line2D([0], [0], color="#999999", linewidth=0.9, linestyle="--", label="RD target 1"),
+        ],
+        loc="center",
+        frameon=False,
+    )
     fig.savefig(TOPOLOGY_OUTPUT_PATH, dpi=300)
     plt.close(fig)
 
@@ -214,6 +248,7 @@ def main() -> None:
     """Render the learning-curve figure for this arm as a 300-DPI PNG."""
     configure_style()
     curves = load_curves()
+    oracle_reference = load_oracle_reference()
     epochs = curves["epoch"]
     fig, axes = plt.subplots(
         1,
@@ -262,7 +297,7 @@ def main() -> None:
     )
     fig.savefig(OUTPUT_PATH, dpi=300)
     plt.close(fig)
-    render_topology_curves(curves)
+    render_topology_curves(curves, oracle_reference)
 
 
 if __name__ == "__main__":

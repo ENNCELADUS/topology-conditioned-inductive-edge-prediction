@@ -21,7 +21,7 @@ L_total = L_task + 1.0 · L_gram
 ![KD3 train and validation learning curves](learning_curves.png)
 ![KD3 validation topology curves](validation_topology_curves.png)
 The first figure plots train/validation losses; the second plots BFS-macro GS/RD and all three MMD
-ratios on V_val. The dotted line marks selected epoch 10, not a minimum-loss selection rule.
+ratios on V_val, with Oracle V_val references. The dotted line marks selected epoch 10.
 [CSV](learning_curves.csv) contains all exact 25-epoch values, and the
 [plot script](plot_learning_curves.py) reproduces both PNGs directly from it.
 

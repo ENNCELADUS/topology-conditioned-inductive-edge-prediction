@@ -24,7 +24,7 @@ Accepted deviations from the LLP reference:
 ![KD2 train and validation learning curves](learning_curves.png)
 ![KD2 validation topology curves](validation_topology_curves.png)
 The first figure plots train/validation losses; the second plots BFS-macro GS/RD and all three MMD
-ratios on V_val. The dotted line marks selected epoch 22. [CSV](learning_curves.csv) and the
+ratios on V_val, with Oracle V_val references. The dotted line marks selected epoch 22. [CSV](learning_curves.csv) and the
 [plot script](plot_learning_curves.py) contain the exact values and reproduce both PNGs.
 
 ## Campaign provenance

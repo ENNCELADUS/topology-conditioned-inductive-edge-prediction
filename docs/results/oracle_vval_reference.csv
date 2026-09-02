@@ -1,0 +1,7 @@
+metric,value
+val_auprc,0.9726975030804059
+val_gs_bfs,0.7643265204340748
+val_rd_bfs,0.998012895590686
+val_degree_mmd_ratio,16.335595921251613
+val_clustering_mmd_ratio,1.8827650727398784
+val_spectral_mmd_ratio,14.808572924690981
