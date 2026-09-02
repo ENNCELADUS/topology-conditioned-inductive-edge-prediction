@@ -14,8 +14,9 @@ which bounds what any representation KD can transfer.
 
 Structural probe targets use the same training-side truth graph the teacher
 saw, with the queried partner dropped from both endpoints' neighbour sets.
-Probes are ridge regressions fit on the training block and scored (R^2) on
-the V_val block; the content control is ``[f_u + f_v, |f_u - f_v|]`` on F0.
+Probes are ridge regressions fit on 80% of the training block and scored
+(R^2) on the held-out 20% and on the V_val block; the content control is
+``[f_u + f_v, |f_u - f_v|]`` on F0.
 """
 
 from __future__ import annotations
@@ -163,7 +164,13 @@ def audit_bank(
     targets_va = np.concatenate([struct_va, logit_va[:, None]], axis=1)
     target_names = (*_STRUCT_NAMES, "teacher_logit")
 
-    probes: dict[str, dict[str, float]] = {}
+    # V_val rows see only cross-boundary structure, so a random 20% slice of the
+    # training block is the in-distribution held-out set; V_val is the shifted one.
+    holdout = np.zeros(rep_tr.shape[0], dtype=bool)
+    holdout[rng.choice(rep_tr.shape[0], rep_tr.shape[0] // 5, replace=False)] = True
+    fit = ~holdout
+
+    probes: dict[str, dict[str, dict[str, float]]] = {"train_holdout": {}, "val": {}}
     inputs = {
         "rep": (rep_tr, rep_va),
         "content": (content_tr, content_va),
@@ -173,23 +180,33 @@ def audit_bank(
         ),
     }
     for name, (x_tr, x_va) in inputs.items():
-        probe = RidgeProbe(x_tr, targets_tr)
-        r2 = r2_columns(targets_va, probe.predict(x_va))
-        probes[name] = dict(zip(target_names, r2.tolist(), strict=True))
+        probe = RidgeProbe(x_tr[fit], targets_tr[fit])
+        for split, x_eval, y_eval in (
+            ("train_holdout", x_tr[holdout], targets_tr[holdout]),
+            ("val", x_va, targets_va),
+        ):
+            r2 = r2_columns(y_eval, probe.predict(x_eval))
+            probes[split][name] = dict(zip(target_names, r2.tolist(), strict=True))
 
     # Content -> rep predictability: the transferable fraction of the target.
-    mu = rep_tr.mean(axis=0)
+    mu = rep_tr[fit].mean(axis=0)
     _, _, vt = np.linalg.svd(
-        rep_tr[rng.choice(rep_tr.shape[0], 20000, replace=False)] - mu, full_matrices=False
+        rep_tr[fit][rng.choice(int(fit.sum()), 20000, replace=False)] - mu, full_matrices=False
     )
-    pcs_tr = (rep_tr - mu) @ vt[:_PROBE_PCS].T
-    pcs_va = (rep_va - mu) @ vt[:_PROBE_PCS].T
-    rep_probe = RidgeProbe(content_tr, rep_tr)
-    pred_va = rep_probe.predict(content_va)
-    resid = ((rep_va - pred_va) ** 2).sum()
-    total = ((rep_va - rep_va.mean(axis=0)) ** 2).sum()
-    pc_probe = RidgeProbe(content_tr, pcs_tr)
-    pc_r2 = r2_columns(pcs_va, pc_probe.predict(content_va))
+    rep_probe = RidgeProbe(content_tr[fit], rep_tr[fit])
+    pc_probe = RidgeProbe(content_tr[fit], (rep_tr[fit] - mu) @ vt[:_PROBE_PCS].T)
+    content_to_rep: dict[str, object] = {}
+    for split, x_eval, rep_eval in (
+        ("train_holdout", content_tr[holdout], rep_tr[holdout]),
+        ("val", content_va, rep_va),
+    ):
+        resid = ((rep_eval - rep_probe.predict(x_eval)) ** 2).sum()
+        total = ((rep_eval - rep_eval.mean(axis=0)) ** 2).sum()
+        pc_r2 = r2_columns((rep_eval - mu) @ vt[:_PROBE_PCS].T, pc_probe.predict(x_eval))
+        content_to_rep[split] = {
+            "overall": float(1.0 - resid / total),
+            "top_pcs": [float(v) for v in pc_r2],
+        }
 
     return {
         "n_rows": int(rep_tr.shape[0]),
@@ -202,9 +219,8 @@ def audit_bank(
         "spectrum_val": spectrum_report(
             rep_va, logit_va, bank.val_pair_label.astype(np.float64), rng
         ),
-        "probe_r2_val": probes,
-        "content_to_rep_r2_val_overall": float(1.0 - resid / total),
-        "content_to_rep_r2_val_top_pcs": [float(v) for v in pc_r2],
+        "probe_r2": probes,
+        "content_to_rep_r2": content_to_rep,
     }
 
 
