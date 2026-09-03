@@ -99,6 +99,7 @@ Table 2 (pairwise, current selected result per arm) and Table 3 (the five topolo
 | kd_representation (`kd_rep_w0p1`) | 0.7108 | 0.7402 | 0.6234 | 0.6760 | 0.2610 |
 | kd_gram (`kd_gram_w1`) | 0.7169 | 0.7428 | 0.6426 | 0.6713 | 0.2897 |
 | kd_struct (`w_struct=1`) | 0.7241 | 0.7489 | 0.6513 | 0.6820 | 0.3084 |
+| kd_white (`w_white=1`, pma1 axes 2--8) | 0.7186 | 0.7429 | 0.6453 | 0.6754 | 0.2958 |
 
 | Arm | BFS GS | BFS RD | Degree | Clustering | Spectral |
 |---|---:|---:|---:|---:|---:|
@@ -109,6 +110,7 @@ Table 2 (pairwise, current selected result per arm) and Table 3 (the five topolo
 | kd_representation (`kd_rep_w0p1`) | 0.4121 | 0.5626 | 8.725 | 7.552 | 13.15 |
 | kd_gram (`kd_gram_w1`) | 0.3959 | 0.4989 | 10.16 | 8.851 | 15.43 |
 | kd_struct (`w_struct=1`) | 0.4072 | 0.5025 | 9.655 | 8.335 | 14.79 |
+| kd_white (`w_white=1`, pma1 axes 2--8) | 0.3939 | 0.5696 | 8.660 | 7.418 | 13.06 |
 
 ## 3. Ablations and sensitivity
 
@@ -162,3 +164,8 @@ $t_{uv}$ is the teacher's topology-branch pooled vector before fusion (§1.4 fig
 - *Attribution.* At matched epochs 10--12, control and kd_struct sit within 0.005 V_val AUPRC and 0.01 GS. The control's selection landed on epoch 18 after its val task loss had risen; kd_struct's on 11. The test gaps exceed every matched-epoch V_val gap, so they read as selected-epoch difference plus seed noise, not descriptor transfer.
 - *Bound run.* At `w_struct=100` ([record](results/kd_struct/README.md)) the near-task-free head plateaus at 0.61--0.65 / 0.42--0.52 / 0.58--0.64 / 0.68--0.71 / 0.57--0.60: degree difference rises from 0.50 to 0.64, the overlap descriptors do not move, and held-out AUPRC 0.7405 / GS 0.4012 / RD 0.4426 sit between control and the w=1 run.
 - *Conclusion.* The structure the student can encode is already in its decision; what it cannot encode is absent from $(x_u,x_v)$, and a task-free head raises that bound only on degree difference. No descriptor-level gain is claimed without a matched-epoch control test.
+
+### 4.7 kd_white: whitened teacher axes without the logit (selected epoch 10)
+- *Design.* The same auxiliary head regresses whitened PCA axes 2--8 of the PMA(1) topology vector, chosen by the [whitened-axis audit](results/kd_whiten_audit/README.md): axis 1 is the teacher logit, axis 2 the degree axis, the tail is structure the linear content probe reads at ≤0.19 ([run record](results/kd_white/README.md)).
+- *Reach.* Head V_val R² over epochs 10--15: pc2 0.63--0.66 (linear 0.62), pc7 0.18--0.31 (0.10), pc8 0.28--0.33 (0.19), pc5/pc6 ≤0.09, pc4 diverging with the V_val block shift. Nonlinear reach beyond the linear probe is real but small, and confined to two axes.
+- *Held-out.* AUPRC +0.007 over control, GS +0.009, RD 0.57 and MMD 8.66/7.42/13.06 on the density line. Same band as every other KD arm; the matched-epoch control decides whether the edge margin is the arm or the epoch.

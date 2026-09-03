@@ -2,7 +2,7 @@
 
 **Status:** the 2026-08-20 confound verdict remains valid for the retired incidental-batch design comparisons below. Operator decision reopens KD2 only as a KD-only, strict-LLP stream; it starts a
 fresh, non-comparable result family. Reports: [`KD1`](kd1_kd_logit/README.md), [`KD2`](kd2_kd_rank/README.md),
-[`KD3`](kd3_kd_gram/README.md), [`KD4`](kd4_kd_rep/README.md), and the
+[`KD3`](kd3_kd_gram/README.md), [`KD4`](kd4_kd_rep/README.md), [`kd_white`](kd_white/README.md), and the
 retired loss-weight [`HPO grid`](kd_hpo_grid/README.md).
 
 ## Retired: sampled anchor-context KD arms (historical)
