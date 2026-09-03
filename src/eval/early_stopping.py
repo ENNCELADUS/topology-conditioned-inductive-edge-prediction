@@ -42,6 +42,7 @@ _VAL_TERMS: dict[str, tuple[tuple[str, str], ...]] = {
     "kd_rep": (("w_rep", "val_kd_rep_loss"),),
     "kd_gen": (),
     "kd_struct": (("w_struct", "val_kd_struct_loss"),),
+    "kd_white": (("w_white", "val_kd_struct_loss"),),
 }
 
 

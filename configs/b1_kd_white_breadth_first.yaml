@@ -1,0 +1,78 @@
+# B1 kd_white arm on the simple B0 protocol: V3.1 student plus the auxiliary
+# head (`model.config.kd_struct_dim: 7`) regressing the whitened PCA axes 2-8 of
+# the PMA(1) Full-Ego teacher's topology vector (axis 1 is the teacher logit and
+# is dropped so the arm stays orthogonal to kd_logit). Targets come from
+# `python -m src.distill.whiten_targets --bank <pma1 bank> --axes 2-8`; per-axis
+# V_val R^2 is logged as `val_kd_struct_r2_pc<k>`. Matched control is
+# `b1_kd_control_breadth_first.yaml`; the descriptor sibling is `b1_kd_struct_breadth_first.yaml`.
+model:
+  family: v3_1
+  config:
+    input_dim: 1536
+    d_model: 512
+    encoder_layers: 3
+    cross_attn_layers: 3
+    n_heads: 8
+    mlp_head:
+      hidden_dims: [512, 256, 128]
+      dropout: 0.2
+      activation: gelu
+      norm: layernorm
+      spectral_norm: false
+    regularization:
+      dropout: 0.1
+      token_dropout: 0.1
+      cross_attention_dropout: 0.1
+      stochastic_depth: 0.1
+    rich_pooling:
+      components: [mean, attn, max, gated]
+    pair_readout:
+      mode: pair_context_gated
+      order_aggregation: abba_max
+      spectral_norm: false
+    mixing:
+      mode: none
+    label_smoothing: 0.05 # symmetric BCE smoothing, fixed V3.1 recipe
+    kd_struct_dim: 7 # auxiliary head width: whitened teacher axes pc2..pc8
+data:
+  root: data
+  strategy: breadth_first
+  negative_ratio: 1 # F0-only; V3.1 trains on fixed balanced train_edges.txt rows
+  token_budget: 131072
+  batch_pairs: 1024
+  num_workers: 0
+  f0_cache: outputs/f0_cache/f0_matrix.pt
+  expected_missing_features: [node_004764, node_007050]
+optim:
+  lr: 1.0e-4
+  weight_decay: 0.05
+  epochs: 25
+  warmup_steps: 500 # unused while a onecycle scheduler is configured
+  grad_clip: 1.0
+  scheduler:
+    type: onecycle
+    max_lr: 1.0e-4
+    pct_start: 0.1
+    div_factor: 25
+    final_div_factor: 10000
+    anneal_strategy: cos
+eval:
+  patience: 10
+  eval_every: 1
+runtime:
+  world_size: auto
+  pack_dir: outputs/feature_packs/b0_v31_bf16
+  pack_workers: 16
+  loader_workers_per_rank: 4
+  prefetch_factor: 4
+  token_budget: 524288
+  max_pairs_per_rank: 4096
+  memory_limit_gib: 85.0
+  probe_warmup_steps: 10
+  probe_timed_steps: 30
+seed: 0
+output_dir: outputs/b1_row_kd/kd_white
+mixed_precision: "bf16" # pinned for the H20 E2 target
+distill:
+  targets_path: outputs/distill/kd_row_targets_pma1_white_breadth_first
+  w_white: 1.0 # MSE of the auxiliary head against the whitened teacher axes

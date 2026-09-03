@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -38,45 +37,13 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from src.distill.artifacts import KDRowTargets, load_kd_targets
 from src.distill.struct_targets import STRUCT_NAMES, structural_targets
 from src.distill.teacher_targets import truth_graph_for_kd
+from src.distill.whiten_targets import whiten_axes
 from src.experiments.kd_rep_audit import RidgeProbe, content_features, r2_columns
 from src.train_b0 import assemble_data, load_config
 
 logger = logging.getLogger(__name__)
 
 F64 = NDArray[np.float64]
-
-
-@dataclass(frozen=True)
-class WhitenedAxes:
-    """Top-``k`` PCA coordinates, unit variance on the training block."""
-
-    train: F64
-    val: F64
-    axis_std: F64
-    var_share: F64
-    val_shift: F64
-    val_std: F64
-
-
-def whiten_axes(rep_tr: F64, rep_va: F64, *, k: int) -> WhitenedAxes:
-    """Project both blocks onto the training block's top-``k`` centered PCA axes.
-
-    Raises:
-        ValueError: If ``k`` exceeds the bank's dimensions or numerical rank.
-    """
-    if k < 1 or k > min(rep_tr.shape):
-        raise ValueError(f"k must be in [1, {min(rep_tr.shape)}], got {k}")
-    mu = rep_tr.mean(axis=0)
-    _, sing, vt = np.linalg.svd(rep_tr - mu, full_matrices=False)
-    var = sing**2 / rep_tr.shape[0]
-    axis_std = np.sqrt(var[:k])
-    if not np.all(axis_std > 0.0):
-        raise ValueError(f"k={k} exceeds the bank's numerical rank")
-    train = ((rep_tr - mu) @ vt[:k].T) / axis_std
-    val = ((rep_va - mu) @ vt[:k].T) / axis_std
-    return WhitenedAxes(
-        train, val, axis_std, var[:k] / var.sum(), val.mean(axis=0), val.std(axis=0)
-    )
 
 
 def fp16_noise_floor(rep: F64) -> float:

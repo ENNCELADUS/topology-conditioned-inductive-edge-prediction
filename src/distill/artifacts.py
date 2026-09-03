@@ -185,6 +185,7 @@ def write_kd_targets(
     checkpoint_sha256: str,
     checkpoint_id: str | None,
     rep_source: str,
+    manifest_extra: Mapping[str, object] | None = None,
 ) -> None:
     """Write one validated KD row-targets artifact directory.
 
@@ -266,6 +267,7 @@ def write_kd_targets(
         "npz_sha256": npz_sha256,
         "node_ids_sha256": _sha256_bytes(node_ids_bytes),
         "created_utc": datetime.now(UTC).isoformat(),
+        **(dict(manifest_extra) if manifest_extra else {}),
     }
     (output_dir / _MANIFEST_NAME).write_text(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"

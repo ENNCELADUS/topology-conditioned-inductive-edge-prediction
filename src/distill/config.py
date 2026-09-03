@@ -11,7 +11,9 @@ one arm group's weight(s) may be nonzero at a time:
 batch-relational Gram KD), ``kd_rep`` (`w_rep`, per-row representation
 alignment), ``kd_gen`` (`w_gen`, generator distillation), or ``kd_struct``
 (`w_struct`, descriptor-level structural auxiliary head with in-process
-targets and no teacher artifact). The matched control is a config with no
+targets and no teacher artifact), or ``kd_white`` (`w_white`, the same
+auxiliary head regressing whitened teacher-vector axes from a dumped
+`src/distill/whiten_targets.py` bank). The matched control is a config with no
 ``distill:`` section at all, or one with every weight left at zero; either
 must reproduce the undistilled baseline exactly.
 """
@@ -29,6 +31,7 @@ _WEIGHT_NAMES = (
     "w_rep",
     "w_gen",
     "w_struct",
+    "w_white",
 )
 
 
@@ -60,6 +63,8 @@ class DistillConfig:
             auxiliary-head outputs against z-scored ego-graph descriptors of
             the truth graph (`src/distill/struct_targets.py`); needs no
             ``targets_path``.
+        w_white: ``kd_white`` weight -- MSE of the same auxiliary head against
+            the whitened teacher axes held by ``targets_path``.
         joint_warmup_frac: ``kd_gen`` fraction of training spent with ``sg``
             at the adapter before joint optimization.
         gen_lr_scale: ``kd_gen`` joint-phase generator LR multiplier.
@@ -75,6 +80,7 @@ class DistillConfig:
     w_rep: float = 0.0
     w_gen: float = 0.0
     w_struct: float = 0.0
+    w_white: float = 0.0
     joint_warmup_frac: float = 0.1
     gen_lr_scale: float = 0.1
     margin: float = 0.1
@@ -106,13 +112,14 @@ class DistillConfig:
             frozenset({"w_rep"}),
             frozenset({"w_gen"}),
             frozenset({"w_struct"}),
+            frozenset({"w_white"}),
         )
         if nonzero not in legal_patterns:
             raise ValueError(
                 "distill weights must follow exactly one arm group -- all zero, only "
                 "w_logit (kd_logit), w_rank and w_dist (kd_rank), only w_gram "
-                "(kd_gram), only w_rep (kd_rep), only w_gen (kd_gen), or only w_struct "
-                f"(kd_struct); got nonzero weights {sorted(nonzero)}"
+                "(kd_gram), only w_rep (kd_rep), only w_gen (kd_gen), only w_struct "
+                f"(kd_struct), or only w_white (kd_white); got nonzero weights {sorted(nonzero)}"
             )
         kd_struct_active = nonzero == frozenset({"w_struct"})
         if nonzero and not kd_struct_active and not self.targets_path:
@@ -131,6 +138,11 @@ class DistillConfig:
         return any(float(getattr(self, name)) > 0.0 for name in _WEIGHT_NAMES)
 
     @property
+    def aux_weight(self) -> float:
+        """Weight of the auxiliary regression head (``kd_struct`` or ``kd_white``)."""
+        return float(self.w_struct or self.w_white)
+
+    @property
     def arm(self) -> str:
         """The KD arm this weight pattern names (``none`` when inactive)."""
         nonzero = frozenset(name for name in _WEIGHT_NAMES if float(getattr(self, name)) > 0.0)
@@ -142,6 +154,7 @@ class DistillConfig:
             frozenset({"w_rep"}): "kd_rep",
             frozenset({"w_gen"}): "kd_gen",
             frozenset({"w_struct"}): "kd_struct",
+            frozenset({"w_white"}): "kd_white",
         }
         return mapped[nonzero]
 

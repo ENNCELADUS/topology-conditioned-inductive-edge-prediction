@@ -1683,3 +1683,97 @@ def test_ddp_loop_kd_struct_end_to_end_on_cpu(tmp_path: Path) -> None:
         assert key in entry, f"missing telemetry key {key!r} in {sorted(entry)}"
     assert "kd_logit_corr" not in entry
     assert entry["val_total_loss"] == pytest.approx(0.5 + 0.7)
+
+
+def _whitened_targets(
+    node_ids: list[str], train_pairs: list[Pair], train_labels: list[int]
+) -> KDRowTargets:
+    base = _struct_targets(node_ids, train_pairs, train_labels)
+    rng = np.random.default_rng(7)
+    return dataclasses.replace(
+        base,
+        teacher_rep=rng.normal(size=(len(train_pairs), 3)).astype(np.float16),
+        val_teacher_rep=rng.normal(size=(2, 3)).astype(np.float16),
+        manifest={"rep_source": "whitened_axes", "descriptors": ["pc2", "pc3", "pc4"]},
+    )
+
+
+def test_kd_white_config_is_an_artifact_backed_auxiliary_arm() -> None:
+    with pytest.raises(ValueError, match="targets_path"):
+        DistillConfig(w_white=1.0)
+    with pytest.raises(ValueError, match="one arm group"):
+        DistillConfig(w_white=1.0, w_struct=1.0, targets_path="bank")
+    cfg = DistillConfig(w_white=1.0, targets_path="bank")
+    assert cfg.arm == "kd_white" and cfg.active and cfg.aux_weight == 1.0
+    assert DistillConfig(w_struct=2.0).aux_weight == 2.0
+    assert compose_val_total(0.5, {"val_kd_struct_loss": 0.25}, cfg) == pytest.approx(0.75)
+
+
+def test_kd_white_bank_regresses_artifact_axes_through_the_aux_head() -> None:
+    node_ids = [f"n{i}" for i in range(6)]
+    train_pairs = _ring_pairs(node_ids)
+    train_labels = [1, 0, 1, 0, 1, 1]
+    targets = _whitened_targets(node_ids, train_pairs, train_labels)
+    distill = DistillConfig(w_white=2.0, targets_path="bank")
+
+    def build(model: nn.Module) -> KDRowBank:
+        return KDRowBank(
+            distill,
+            targets,
+            train_pairs=train_pairs,
+            train_labels=train_labels,
+            val_pairs=train_pairs[:2],
+            val_labels=train_labels[:2],
+            model=model,
+            device=torch.device("cpu"),
+        )
+
+    with pytest.raises(RuntimeError, match="kd_struct_dim: 3"):
+        build(V3_1(**_tiny_v31_kwargs(), kd_struct_dim=5))
+    bank = build(V3_1(**_tiny_v31_kwargs(), kd_struct_dim=3))
+    pred = torch.randn(2, 3, requires_grad=True)
+    rows = torch.tensor([5, 0])
+    loss, stats = bank.loss({"_row_id": rows}, {"logits": torch.zeros(2), "kd_struct": pred})
+    expected = torch.nn.functional.mse_loss(
+        pred, torch.as_tensor(targets.teacher_rep[[5, 0]]).float()
+    )
+    assert torch.allclose(loss, 2.0 * expected, atol=1e-6)
+    assert "sum_s" not in stats
+    assert bank.epoch_telemetry(Accelerator(cpu=True), stats) == {
+        "kd_struct_loss": pytest.approx(expected.item(), rel=1e-5)
+    }
+    assert bank.val_diagnostics().rep_names == ("pc2", "pc3", "pc4")
+
+
+def test_evaluate_distributed_kd_white_names_r2_by_artifact_axes() -> None:
+    n = 4
+    target = torch.randn(n, 3)
+    batch = {
+        "label": torch.tensor([1.0, 0.0, 1.0, 0.0]),
+        "_row_id": torch.arange(n),
+        "logit_seed": torch.zeros(n),
+        "struct_seed": target,
+    }
+    kd_val = KDValDiagnostics(
+        arm="kd_white",
+        teacher_logit=torch.zeros(n),
+        teacher_logit_np=np.zeros(n),
+        teacher_rep=target.to(torch.float16),
+        teacher_latent=None,
+        rep_names=("pc2", "pc3", "pc4"),
+    )
+    outcome = _evaluate_distributed(
+        _StructDiagModel(),
+        [batch],
+        Accelerator(cpu=True),
+        expected_row_ids=np.arange(n),
+        kd_val=kd_val,
+    )
+    assert outcome.kd is not None
+    assert outcome.kd["val_kd_struct_loss"] == pytest.approx(0.0, abs=1e-5)
+    assert {k for k in outcome.kd if k.startswith("val_kd_struct_r2_")} == {
+        "val_kd_struct_r2_pc2",
+        "val_kd_struct_r2_pc3",
+        "val_kd_struct_r2_pc4",
+    }
+    assert "val_kd_logit_corr" not in outcome.kd

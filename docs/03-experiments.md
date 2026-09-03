@@ -71,6 +71,7 @@ real-vs-real floor, so ratio 1 is that floor). Descriptors retain self-loops.
 | kd_gram | SPKD-style cosine-Gram relational match (Tung & Mori 2019) | PMA(4) Full-Ego Oracle row bank | `w_gram ∈ {0.01, 0.1, 1, 10, 100}` | relational-geometry arm |
 | kd_generation | pair-latent generative head | PMA(1) Full-Ego Oracle latent bank | none; `w_gen=1` fixed (det/EDM variants compared) | generative test |
 | kd_struct | auxiliary head, MSE to z-scored truth-graph descriptors (CN, degrees, Jaccard, Adamic-Adar; queried partner masked) | none: training graph (val rows: substrate) | none; `w_struct=1` fixed | descriptor arm; nonlinear content→structure lower bound |
+| kd_white | same auxiliary head, MSE to the whitened PCA axes 2--8 of the teacher topology vector (axis 1 = teacher logit, dropped) | PMA(1) Full-Ego Oracle row bank, whitened offline | none; `w_white=1` fixed | whitened representation arm; tests the teacher's own coordinates beyond the descriptors ([audit](results/kd_whiten_audit/README.md)) |
 | Oracles | observed topology | Full-Ego graph → GRIT → PMA | none (diagnostic only) | diagnostic ceilings |
 
 ![Teacher and student architecture](results/kd_rep_audit/teacher_architecture.svg)

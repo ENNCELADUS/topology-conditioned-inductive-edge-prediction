@@ -4,11 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from src.experiments.kd_whiten_audit import (
-    fp16_noise_floor,
-    probe_axes,
-    whiten_axes,
-)
+from src.distill.whiten_targets import whiten_axes
+from src.experiments.kd_whiten_audit import fp16_noise_floor, probe_axes
 
 
 def _low_rank_bank(rng: np.random.Generator, n: int = 2000, d: int = 32, k: int = 3) -> np.ndarray:

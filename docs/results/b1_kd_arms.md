@@ -90,6 +90,7 @@ on the official rows, and deployed input remains exactly `(x_u,x_v)`.
 - `kd_gram` -- `w_gram`: D3 cosine-Gram matching across all distinct batch rows, including rows that share an endpoint.
 - `kd_rep` -- `w_rep`: per-row cosine alignment of the student pair representation to `teacher_rep`.
 - `kd_gen` -- `w_gen`: endpoint-conditioned generation of the PMA(1) pooled topology latent; see `docs/superpowers/specs/2026-08-30-kd-gen-arm-design.md`.
+- `kd_white` -- `w_white`: MSE of the kd_struct auxiliary head to the whitened PCA axes 2--8 of the PMA(1) topology vector (`src/distill/whiten_targets.py`); per-axis V_val R² telemetry.
 ### Telemetry
 
 Task/KD loss split, logit correlation/error, representation cosine, D2/D3 validation-block losses,

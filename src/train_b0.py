@@ -111,6 +111,9 @@ from src.eval.val_topology import (
 from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
 from src.model.egostitch.classifier.topo_gen import TopoGenBase
 
+# Arms that regress the auxiliary head (`kd_struct_head`) onto ``teacher_rep`` by MSE.
+_AUX_HEAD_ARMS = frozenset({"kd_struct", "kd_white"})
+
 logger = logging.getLogger(__name__)
 
 MODEL_FAMILIES = ("v3_1", "f0_mlp")
@@ -2317,7 +2320,9 @@ def _evaluate_distributed(
     diag_parts: list[torch.Tensor] = []
     relational_block = torch.zeros(3, dtype=torch.float64, device=accelerator.device)
     inject_latent = kd_val is not None and kd_val.teacher_latent is not None
-    collect_diag = kd_val is not None and (kd_val.arm in {"kd_rep", "kd_struct"} or inject_latent)
+    collect_diag = kd_val is not None and (
+        kd_val.arm == "kd_rep" or kd_val.arm in _AUX_HEAD_ARMS or inject_latent
+    )
     rng_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
     with torch.random.fork_rng(devices=rng_devices, enabled=inject_latent), torch.no_grad():
         for batch in val_loader:
@@ -2364,7 +2369,7 @@ def _evaluate_distributed(
                     diag = nn.functional.cosine_similarity(
                         student_rep.float(), teacher_rep, dim=-1, eps=1e-8
                     )
-                elif kd_val.arm == "kd_struct":
+                elif kd_val.arm in _AUX_HEAD_ARMS:
                     struct_pred = output.get("kd_struct")
                     if struct_pred is None:
                         raise RuntimeError("kd_struct validation diagnostics require kd_struct")
@@ -2464,7 +2469,7 @@ def _evaluate_distributed(
             )
         if kd_val is not None:
             kd_metrics: dict[str, float] = {}
-            if diag_np is not None and diag_np.size > 0 and kd_val.arm == "kd_struct":
+            if diag_np is not None and diag_np.size > 0 and kd_val.arm in _AUX_HEAD_ARMS:
                 assert kd_val.teacher_rep is not None
                 pred = diag_np[np.argsort(row_ids_np)].astype(np.float64)
                 target = kd_val.teacher_rep.float().cpu().numpy().astype(np.float64)
@@ -2472,7 +2477,7 @@ def _evaluate_distributed(
                 total = ((target - target.mean(axis=0)) ** 2).sum(axis=0)
                 kd_metrics["val_kd_struct_loss"] = float(resid.sum() / pred.size)
                 for name, r2 in zip(
-                    STRUCT_NAMES, 1.0 - resid / np.maximum(total, 1e-12), strict=True
+                    kd_val.rep_names, 1.0 - resid / np.maximum(total, 1e-12), strict=True
                 ):
                     kd_metrics[f"val_kd_struct_r2_{name}"] = float(r2)
             elif diag_np is not None and diag_np.size > 0:
@@ -2482,7 +2487,7 @@ def _evaluate_distributed(
                     kd_metrics["val_kd_rep_loss"] = 1.0 - kd_metrics[key]
             logits64 = logits_sorted.astype(np.float64)
             teacher64 = kd_val.teacher_logit_np
-            if logits64.shape[0] > 0 and kd_val.arm != "kd_struct":
+            if logits64.shape[0] > 0 and kd_val.arm not in _AUX_HEAD_ARMS:
                 kd_metrics["val_kd_logit_corr"] = _pearson_from_moments(
                     float(logits64.sum()),
                     float(teacher64.sum()),
@@ -2727,6 +2732,8 @@ class KDValDiagnostics:
         teacher_latent: ``(n_val, latent_dim)`` fp16 teacher latents, on the
             training device; populated only for ``kd_gen`` and normalized at use.
         latent_scale: Artifact-wide teacher latent RMS used for normalization.
+        rep_names: Per-column names of ``teacher_rep`` for the auxiliary-head
+            R^2 telemetry (descriptors for ``kd_struct``, whitened axes for ``kd_white``).
         context_stream: Fixed V_val context bank used only for ``kd_rank``
             rank/distribution/tie diagnostics.
     """
@@ -2738,6 +2745,7 @@ class KDValDiagnostics:
     teacher_latent: torch.Tensor | None
     latent_scale: float = 1.0
     context_stream: KDContextStream | None = None
+    rep_names: tuple[str, ...] = STRUCT_NAMES
 
 
 def _pearson_from_moments(
@@ -3203,7 +3211,7 @@ class KDRowBank:
         self._w_gram = distill.w_gram
         self._w_rep = distill.w_rep
         self._w_gen = distill.w_gen
-        self._w_struct = distill.w_struct
+        self._w_struct = distill.aux_weight
 
         node_ids_arr = np.asarray(targets.node_ids, dtype=object)
         self._verify_join(
@@ -3247,15 +3255,18 @@ class KDRowBank:
                 "never-grad'ed kd_rep_head parameters otherwise"
             )
         kd_struct_head = getattr(raw_model, "kd_struct_head", None)
-        if distill.w_struct > 0.0:
+        if distill.aux_weight > 0.0:
             rep_dim = int(targets.teacher_rep.shape[1])
             if kd_struct_head is None or int(kd_struct_head.layers[-1].out_features) != rep_dim:
                 raise RuntimeError(
-                    f"distill.w_struct > 0 requires model.config.kd_struct_dim: {rep_dim}"
+                    f"distill.{'w_white' if self.arm == 'kd_white' else 'w_struct'} "
+                    "> 0 "
+                    f"requires model.config.kd_struct_dim: {rep_dim}"
                 )
         elif kd_struct_head is not None:
             raise RuntimeError(
-                "model.config.kd_struct_dim > 0 requires distill.w_struct > 0 -- DDP would "
+                "model.config.kd_struct_dim > 0 requires distill.w_struct > 0 or "
+                "distill.w_white > 0 -- DDP would "
                 "see never-grad'ed kd_struct_head parameters otherwise"
             )
 
@@ -3287,12 +3298,12 @@ class KDRowBank:
             self.train_a_idx = torch.as_tensor(targets.pair_a_idx, dtype=torch.int64, device=device)
             self.train_b_idx = torch.as_tensor(targets.pair_b_idx, dtype=torch.int64, device=device)
         self.train_rep: torch.Tensor | None = None
-        if self.arm in {"kd_rep", "kd_gram", "kd_gen", "kd_struct"}:
+        if self.arm in {"kd_rep", "kd_gram", "kd_gen"} or self.arm in _AUX_HEAD_ARMS:
             self.train_rep = torch.as_tensor(
                 targets.teacher_rep, dtype=torch.float16, device=device
             )
         val_teacher_rep: torch.Tensor | None = None
-        if self.arm in {"kd_rep", "kd_gram", "kd_struct"}:
+        if self.arm in {"kd_rep", "kd_gram"} or self.arm in _AUX_HEAD_ARMS:
             val_teacher_rep = torch.as_tensor(
                 targets.val_teacher_rep, dtype=torch.float16, device=device
             )
@@ -3310,6 +3321,11 @@ class KDRowBank:
             teacher_rep=val_teacher_rep,
             teacher_latent=val_teacher_latent,
             latent_scale=self._latent_scale,
+            rep_names=(
+                tuple(str(n) for n in cast(list[object], targets.manifest["descriptors"]))
+                if self.arm in _AUX_HEAD_ARMS
+                else STRUCT_NAMES
+            ),
         )
 
     @staticmethod
@@ -3379,7 +3395,7 @@ class KDRowBank:
         with torch.no_grad():
             student_d = student_logit.detach().double()
             teacher_d = teacher_logit.detach().double()
-            if self.arm != "kd_struct":
+            if self.arm not in _AUX_HEAD_ARMS:
                 stats |= {
                     "sum_s": float(student_d.sum().item()),
                     "sum_t": float(teacher_d.sum().item()),
@@ -3408,10 +3424,10 @@ class KDRowBank:
                 )
                 stats["sum_rep_cos"] = float(cos.sum().item())
 
-        if self.arm == "kd_struct":
+        if self.arm in _AUX_HEAD_ARMS:
             struct_pred = output.get("kd_struct")
             if struct_pred is None:
-                raise RuntimeError("kd_struct requires the model forward to emit kd_struct")
+                raise RuntimeError(f"{self.arm} requires the model forward to emit kd_struct")
             assert self.train_rep is not None
             struct_loss = kd_struct_loss(
                 struct_pred.float(), self.train_rep.index_select(0, rows).float()
@@ -3500,7 +3516,7 @@ class KDRowBank:
             raise RuntimeError("KD epoch telemetry has zero rows across all ranks")
 
         telemetry: dict[str, float] = {}
-        if self.arm == "kd_struct":
+        if self.arm in _AUX_HEAD_ARMS:
             telemetry["kd_struct_loss"] = reduced_sums["sum_struct_mse"] / n
         else:
             telemetry["kd_logit_corr"] = _pearson_from_moments(
@@ -4689,10 +4705,11 @@ def _run_probe_mode(
     if runtime is None:
         raise ValueError("probe mode requires a configured cfg.runtime")
     if _validate_topo_gen_distill_contract(model, cfg.distill) is not None or (
-        cfg.distill is not None and cfg.distill.arm == "kd_struct"
+        cfg.distill is not None and cfg.distill.arm in _AUX_HEAD_ARMS
     ):
         raise RuntimeError(
-            "ddp-mode probe does not support kd_gen or kd_struct: their extra heads get no "
+            "ddp-mode probe does not support kd_gen, kd_struct, or kd_white: their extra "
+            "heads get no "
             "gradient from the probe loss; use epoch-probe or train"
         )
     optimizer = torch.optim.AdamW(
