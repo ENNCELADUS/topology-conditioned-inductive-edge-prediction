@@ -87,14 +87,14 @@ w_dist × context bank (hops × negative-sampling rate) × margin. The best conf
 
 ## 2. Main results — edge and assembled topology
 
-Table 2 (pairwise, best HPO per arm) and Table 3 (the five topology numbers at each arm's single frozen V_val-selected threshold) are reported together.
+Table 2 (pairwise, current selected result per arm) and Table 3 (the five topology numbers at each arm's single frozen V_val-selected threshold) are reported together; KD2 Trial 8 is provisional while its HPO remains unfinished.
 
 | Arm | AUROC | AUPRC | Accuracy | F1 | MCC |
 |---|---:|---:|---:|---:|---:|
 | Full-Ego Oracle | 0.9519 | 0.9566 | 0.8711 | 0.8776 | 0.7464 |
 | Pairwise baseline | 0.7067 | 0.7316 | 0.6261 | 0.4769 | 0.3072 |
 | kd_logit (`kd_logit_w100`) | 0.7195 | 0.7417 | 0.6459 | 0.6670 | 0.2941 |
-| kd_ranking | — | — | — | — | — |
+| kd_ranking (strict Trial 8; provisional) | 0.7183 | 0.7457 | 0.6477 | 0.6656 | 0.2970 |
 | kd_representation (`kd_rep_w0p1`) | 0.7108 | 0.7402 | 0.6234 | 0.6760 | 0.2610 |
 | kd_gram (`kd_gram_w1`) | 0.7169 | 0.7428 | 0.6426 | 0.6713 | 0.2897 |
 | kd_struct (`w_struct=1`) | 0.7241 | 0.7489 | 0.6513 | 0.6820 | 0.3084 |
@@ -104,7 +104,7 @@ Table 2 (pairwise, best HPO per arm) and Table 3 (the five topology numbers at e
 | Full-Ego Oracle | 0.6429 | 0.9955 | 2.667 | 1.875 | 5.207 |
 | Pairwise baseline | 0.3672 | 0.3221 | 21.03 | 18.49 | 28.39 |
 | kd_logit (`kd_logit_w100`) | 0.4048 | 0.4248 | 15.63 | 13.07 | 22.06 |
-| kd_ranking | — | — | — | — | — |
+| kd_ranking (strict Trial 8; provisional) | 0.4143 | 0.4399 | 14.56 | 12.41 | 21.03 |
 | kd_representation (`kd_rep_w0p1`) | 0.4121 | 0.5626 | 8.725 | 7.552 | 13.15 |
 | kd_gram (`kd_gram_w1`) | 0.3959 | 0.4989 | 10.16 | 8.851 | 15.43 |
 | kd_struct (`w_struct=1`) | 0.4072 | 0.5025 | 9.655 | 8.335 | 14.79 |
@@ -113,7 +113,7 @@ Table 2 (pairwise, best HPO per arm) and Table 3 (the five topology numbers at e
 
 ## 4. Analysis
 
-Learning curves are the seed-0 HPO-winner `V_val` surfaces; the dotted marker is the selected epoch. Every arm answers one question: did the KD signal move anything that $(x_u,x_v)$ alone does not already reveal?
+Learning curves are seed-0 `V_val` selection surfaces (final HPO winners except provisional KD2 Trial 8); the dotted marker is the selected epoch. Every arm asks whether KD moves anything that $(x_u,x_v)$ alone does not reveal.
 
 ### 4.1 KD1: soft logits (`kd_logit`, selected epoch 25)
 ![KD1 loss curves](results/kd1_kd_logit/learning_curves.png) ![KD1 V_val topology curves](results/kd1_kd_logit/validation_topology_curves.png)
@@ -122,9 +122,9 @@ Learning curves are the seed-0 HPO-winner `V_val` surfaces; the dotted marker is
 - Reading: GLNN's own low-$I(X;Y\mid E)$ regime. Soft labels transfer only what $(x_u,x_v)$ already reveals.
 - Held-out: AUPRC +0.010 and GS +0.02 over control; RD and all three MMD ratios worse.
 
-### 4.2 KD2: ranking over context banks (`kd_rank`, selected epoch 22)
+### 4.2 KD2: ranking over context banks (`kd_rank`, selected epoch 18)
 ![KD2 loss curves](results/kd2_kd_rank/learning_curves.png) ![KD2 V_val topology curves](results/kd2_kd_rank/validation_topology_curves.png)
-- Retired incidental-batch objective, not strict LLP; the strict-LLP study (§1.5) supersedes it and is unaudited. No reading is drawn from this surface.
+- Current provisional strict-LLP Trial 8 (`w_rank=0.1`, `w_dist=10`, `h2ns3`, margin 0.1): held-out AUPRC/AUROC 0.7457/0.7183 and GS/RD 0.4143/0.4399, but MMD 14.56/12.41/21.03. HPO is unfinished, so this early test is diagnostic unless Trial 8 later wins by V_val alone and must not influence selection.
 
 ### 4.3 KD3: relational Gram (`kd_gram`, selected epoch 10)
 ![KD3 loss curves](results/kd3_kd_gram/learning_curves.png) ![KD3 V_val topology curves](results/kd3_kd_gram/validation_topology_curves.png)

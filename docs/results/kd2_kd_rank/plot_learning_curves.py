@@ -1,4 +1,4 @@
-"""Publication learning curves for KD2 (kd_rank), run kd_rank_wr0p1_wd1.
+"""Publication learning curves for provisional strict-LLP KD2 Trial 8.
 
 Reads learning_curves.csv next to this file and renders the loss and
 validation-topology PNGs next to it. Raw (unweighted) loss terms are
@@ -20,9 +20,9 @@ from matplotlib.axes import Axes
 from matplotlib.lines import Line2D
 
 ARM = "KD2 (kd_rank)"
-RUN = "kd_rank_wr0p1_wd1"
-KD_WEIGHTS = {"w_rank": 0.1, "w_dist": 1.0}
-SELECTED_EPOCH = 22
+RUN = "strict_trial_008_h2ns3"
+KD_WEIGHTS = {"w_rank": 0.1, "w_dist": 10.0}
+SELECTED_EPOCH = 18
 # Panels: (caption, ylabel, train_column, val_column).
 PANELS: tuple[tuple[str, str, str, str], ...] = (
     ("(a) Task BCE", "BCE", "train_loss", "val_task_loss"),
@@ -30,9 +30,9 @@ PANELS: tuple[tuple[str, str, str, str], ...] = (
         "(b) KD rank margin (w = 0.1)",
         "Margin-ranking loss",
         "kd_rank_loss",
-        "val_kd_rank_block_loss",
+        "val_kd_rank_loss",
     ),
-    ("(c) KD distribution KL (w = 1)", "KL divergence", "kd_dist_loss", "val_kd_dist_block_loss"),
+    ("(c) KD distribution KL (w = 10)", "KL divergence", "kd_dist_loss", "val_kd_dist_loss"),
     ("(d) Total (task + w·KD)", "Total loss", "train_total", "val_total"),
 )
 
@@ -67,10 +67,24 @@ def load_curves() -> dict[str, list[float]]:
         + [key for panel in PANELS for key in panel[2:]]
         + [panel[2] for panel in TOPOLOGY_PANELS]
     )
-    curves = {name: [float(row[name]) for row in rows] for name in columns}
+    topology_columns = {panel[2] for panel in TOPOLOGY_PANELS}
+    curves = {
+        name: [float(row[name]) if row[name] else math.nan for row in rows] for name in columns
+    }
     for name, values in curves.items():
-        if not all(math.isfinite(value) for value in values):
+        if name not in topology_columns and not all(math.isfinite(value) for value in values):
             raise ValueError(f"non-finite value in column {name!r}")
+    expected_topology_epochs = set(range(2, 26, 2)) | {25}
+    for name in topology_columns:
+        observed = {
+            int(epoch)
+            for epoch, value in zip(curves["epoch"], curves[name], strict=True)
+            if math.isfinite(value)
+        }
+        if observed != expected_topology_epochs:
+            raise ValueError(
+                f"{name!r} must contain cadence-2 epochs plus epoch 25, got {sorted(observed)}"
+            )
     return curves
 
 
@@ -169,9 +183,12 @@ def plot_topology_panel(
     label_selected: bool,
 ) -> None:
     """Draw one validation-topology metric across epochs."""
+    finite_points = [
+        (epoch, value) for epoch, value in zip(epochs, values, strict=True) if math.isfinite(value)
+    ]
     ax.plot(
-        epochs,
-        values,
+        [point[0] for point in finite_points],
+        [point[1] for point in finite_points],
         color=VAL_COLOR,
         linewidth=1.6,
         marker="s",
