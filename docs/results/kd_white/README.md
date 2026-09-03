@@ -42,4 +42,7 @@ dropped, so the loss is orthogonal to kd_logit. Axis choice follows the
 - V_val AUPRC 0.925--0.927 from epoch 9 on sits above the control's selected 0.9193 by the same
   margin as kd_logit; held-out AUPRC +0.007 over control, GS +0.009, RD 0.57 (nearest to 1 among the
   KD arms bar kd_gen_edm) and MMD ratios on the same density line as every arm.
-- Whether the edge margin survives a matched-epoch control (epoch 10 checkpoint, tested separately) decides the arm.
+- Matched-epoch control (`kd_control` epoch-0010 checkpoint through the same protocol, report in
+  `outputs/b1_row_kd_hpo/kd_control/matched_epoch_0010`): AUROC/AUPRC 0.7249/0.7515, F1 0.6852, ECE 0.134,
+  GS/RD 0.4261/0.5765, MMD 9.16/8.01/14.41. kd_white trails it on every edge metric and on GS; the
+  arm's margin over the published control was its epoch. Option 2 is closed at w=1.

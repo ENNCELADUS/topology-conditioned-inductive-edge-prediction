@@ -44,3 +44,10 @@ task-free. Early-stopped at epoch 19 (best total val loss at 9), selected epoch 
 sum stays node-level unstable (-0.12 at epoch 11). V_val AUPRC 0.914, GS 0.554. Held-out: AUROC/AUPRC
 0.7215/0.7405, Accuracy/F1/MCC 0.6486/0.6740/0.3008, ECE/Brier 0.1223/0.2297; GS/RD 0.4012/0.4426, MMD
 14.14/11.97/19.50 (RD-ordered like every arm). Heavier descriptor supervision moves neither the decision nor the assembled graph.
+
+## Matched-epoch control (2026-09-03)
+
+`kd_control` epoch-0011 checkpoint through the held-out protocol (`outputs/b1_row_kd_hpo/kd_control/matched_epoch_0011`):
+AUROC/AUPRC 0.7157/0.7463, Accuracy/F1/MCC 0.6342/0.6738/0.2767, ECE/Brier 0.138/0.235; GS/RD 0.4114/0.4462,
+MMD 13.97/12.25/20.82. Against kd_struct's epoch 11 the edge margin is +0.003 AUPRC and the topology
+differences track RD; the epoch-10 checkpoint of the same control run scores 0.7515 AUPRC.
